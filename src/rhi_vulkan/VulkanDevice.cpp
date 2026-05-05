@@ -22,6 +22,10 @@
 extern "C" {
 extern const unsigned char shader_Clear_spirv_data[];
 extern const unsigned long shader_Clear_spirv_size;
+extern const unsigned char shader_Scene_spirv_data[];
+extern const unsigned long shader_Scene_spirv_size;
+extern const unsigned char shader_PathTrace_spirv_data[];
+extern const unsigned long shader_PathTrace_spirv_size;
 }
 
 namespace pt::rhi::vk {
@@ -99,8 +103,34 @@ void VulkanCommandBuffer::PushConstants(const void* data, std::size_t size) {
 void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
                                    std::uint32_t gz) {
     if (cb_ == VK_NULL_HANDLE || !bound_pipeline_) return;
-    auto layout = device_->LookupPipelineLayout(bound_pipeline_);
+    VkPipelineLayout layout = device_->SharedPipelineLayout();
     if (layout == VK_NULL_HANDLE) return;
+
+    // Update current frame's descriptor set with bound storage textures.
+    // Slots 0 and 1 are storage-image bindings in the shared layout;
+    // anything else is currently a no-op.
+    VkDescriptorImageInfo dii[2] {};
+    VkWriteDescriptorSet  writes[2] {};
+    std::uint32_t writeCount = 0;
+    auto dset = device_->CurrentDescriptorSet();
+    for (std::uint32_t slot = 0; slot < 2; ++slot) {
+        VkImageView v = device_->LookupImageView(bound_tex_[slot]);
+        if (v == VK_NULL_HANDLE) continue;
+        dii[writeCount].imageView   = v;
+        dii[writeCount].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        writes[writeCount].sType    = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[writeCount].dstSet   = dset;
+        writes[writeCount].dstBinding = slot;
+        writes[writeCount].descriptorCount = 1;
+        writes[writeCount].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[writeCount].pImageInfo      = &dii[writeCount];
+        ++writeCount;
+    }
+    if (writeCount > 0) {
+        vkUpdateDescriptorSets(device_->RawDevice(), writeCount, writes, 0, nullptr);
+    }
+    vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, layout,
+                            0, 1, &dset, 0, nullptr);
 
     if (push_size_ > 0) {
         vkCmdPushConstants(cb_, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
@@ -228,12 +258,20 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // MoltenVK requires the portability_subset extension on the device.
     dexts.push_back("VK_KHR_portability_subset");
 
+    // Slang's SPIR-V output uses StorageImageReadWithoutFormat /
+    // StorageImageWriteWithoutFormat capabilities. Enable the matching
+    // device features or vkCreateShaderModule fails validation.
+    VkPhysicalDeviceFeatures feats{};
+    feats.shaderStorageImageReadWithoutFormat  = VK_TRUE;
+    feats.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+
     VkDeviceCreateInfo dci{};
     dci.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dci.queueCreateInfoCount    = 1;
     dci.pQueueCreateInfos       = &qci;
     dci.enabledExtensionCount   = static_cast<std::uint32_t>(dexts.size());
     dci.ppEnabledExtensionNames = dexts.data();
+    dci.pEnabledFeatures        = &feats;
     if (vkCreateDevice(phys_device_, &dci, nullptr, &device_) != VK_SUCCESS) {
         LOG_ERROR("vkCreateDevice failed");
         return;
@@ -261,9 +299,9 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     for (int i = 0; i < kFramesInFlight; ++i) {
         vkCreateSemaphore(device_, &sci, nullptr, &sem_image_avail_[i]);
-        vkCreateSemaphore(device_, &sci, nullptr, &sem_render_done_[i]);
         vkCreateFence(device_,     &fci, nullptr, &fence_in_flight_[i]);
     }
+    // sem_render_done_ is per-swapchain-image, sized in RecreateSwapchain.
 
     // ---- Descriptor pool: 1 storage image per frame -------------------
     VkDescriptorPoolSize ps{};
@@ -277,65 +315,37 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     dpci.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
     vkCreateDescriptorPool(device_, &dpci, nullptr, &dpool_);
 
-    // ---- Build the "clear" pipeline ----------------------------------
+    // ---- Build shared layouts (used by all 3 pipelines) ---------------
     {
-        // 1 storage image at binding 0
-        VkDescriptorSetLayoutBinding b{};
-        b.binding         = 0;
-        b.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        b.descriptorCount = 1;
-        b.stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
-
+        // 2 storage-image bindings (output + accum). Pipelines whose
+        // shader doesn't read binding 1 simply ignore it.
+        VkDescriptorSetLayoutBinding b[2] {};
+        for (int i = 0; i < 2; ++i) {
+            b[i].binding         = i;
+            b[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            b[i].descriptorCount = 1;
+            b[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
         VkDescriptorSetLayoutCreateInfo dslci{};
-        dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        dslci.bindingCount = 1;
-        dslci.pBindings    = &b;
-        VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
-        vkCreateDescriptorSetLayout(device_, &dslci, nullptr, &dsl);
+        dslci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        dslci.bindingCount = 2;
+        dslci.pBindings    = b;
+        vkCreateDescriptorSetLayout(device_, &dslci, nullptr, &shared_dset_layout_);
 
         VkPushConstantRange pcr{};
         pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         pcr.offset     = 0;
-        pcr.size       = 128;       // matches our push_buf_
+        pcr.size       = 128;
         VkPipelineLayoutCreateInfo plci{};
         plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         plci.setLayoutCount         = 1;
-        plci.pSetLayouts            = &dsl;
+        plci.pSetLayouts            = &shared_dset_layout_;
         plci.pushConstantRangeCount = 1;
         plci.pPushConstantRanges    = &pcr;
-        VkPipelineLayout layout = VK_NULL_HANDLE;
-        vkCreatePipelineLayout(device_, &plci, nullptr, &layout);
+        vkCreatePipelineLayout(device_, &plci, nullptr, &shared_pipe_layout_);
 
-        auto mod = MakeShaderModule(device_, shader_Clear_spirv_data,
-                                    shader_Clear_spirv_size);
-        if (mod != VK_NULL_HANDLE) {
-            VkPipelineShaderStageCreateInfo stage{};
-            stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-            stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-            stage.module = mod;
-            stage.pName  = "main";
-
-            VkComputePipelineCreateInfo cpci2{};
-            cpci2.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-            cpci2.layout = layout;
-            cpci2.stage  = stage;
-            VkPipeline pipe = VK_NULL_HANDLE;
-            if (vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &cpci2,
-                                         nullptr, &pipe) == VK_SUCCESS) {
-                std::lock_guard lock(resource_mutex_);
-                auto id = next_id_++;
-                pipelines_.emplace(id, PipelineEntry{pipe, layout, dsl});
-                named_pipelines_.emplace("clear", id);
-            } else {
-                LOG_ERROR("vkCreateComputePipelines(clear) failed");
-                vkDestroyDescriptorSetLayout(device_, dsl, nullptr);
-                vkDestroyPipelineLayout(device_, layout, nullptr);
-            }
-            vkDestroyShaderModule(device_, mod, nullptr);
-        }
-
-        // Allocate per-frame descriptor sets bound to the same layout.
-        std::vector<VkDescriptorSetLayout> layouts(kFramesInFlight, dsl);
+        // Per-frame descriptor sets.
+        std::vector<VkDescriptorSetLayout> layouts(kFramesInFlight, shared_dset_layout_);
         VkDescriptorSetAllocateInfo dsai{};
         dsai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         dsai.descriptorPool     = dpool_;
@@ -343,6 +353,38 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         dsai.pSetLayouts        = layouts.data();
         vkAllocateDescriptorSets(device_, &dsai, dsets_);
     }
+
+    // ---- Build the three compute pipelines ---------------------------
+    auto build_pipeline = [&](const char* name,
+                              const unsigned char* spirv,
+                              std::size_t          spirv_size) {
+        auto mod = MakeShaderModule(device_, spirv, spirv_size);
+        if (mod == VK_NULL_HANDLE) return;
+        VkPipelineShaderStageCreateInfo stage{};
+        stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+        stage.module = mod;
+        stage.pName  = "main";
+        VkComputePipelineCreateInfo cpci2{};
+        cpci2.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        cpci2.layout = shared_pipe_layout_;
+        cpci2.stage  = stage;
+        VkPipeline pipe = VK_NULL_HANDLE;
+        if (vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &cpci2,
+                                     nullptr, &pipe) == VK_SUCCESS) {
+            std::lock_guard lock(resource_mutex_);
+            auto id = next_id_++;
+            pipelines_.emplace(id, PipelineEntry{pipe});
+            named_pipelines_.emplace(name, id);
+        } else {
+            LOG_ERROR("vkCreateComputePipelines({}) failed", name);
+        }
+        vkDestroyShaderModule(device_, mod, nullptr);
+    };
+
+    build_pipeline("clear",     shader_Clear_spirv_data,     shader_Clear_spirv_size);
+    build_pipeline("scene",     shader_Scene_spirv_data,     shader_Scene_spirv_size);
+    build_pipeline("pathtrace", shader_PathTrace_spirv_data, shader_PathTrace_spirv_size);
 
     if (!RecreateSwapchain()) return;
 
@@ -361,21 +403,32 @@ void VulkanDevice::DestroyDevice() {
         if (swapchain_ != VK_NULL_HANDLE) vkDestroySwapchainKHR(device_, swapchain_, nullptr);
         for (int i = 0; i < kFramesInFlight; ++i) {
             if (sem_image_avail_[i]) vkDestroySemaphore(device_, sem_image_avail_[i], nullptr);
-            if (sem_render_done_[i]) vkDestroySemaphore(device_, sem_render_done_[i], nullptr);
             if (fence_in_flight_[i]) vkDestroyFence(device_, fence_in_flight_[i], nullptr);
         }
+        for (auto s : sem_render_done_) {
+            if (s) vkDestroySemaphore(device_, s, nullptr);
+        }
+        sem_render_done_.clear();
         if (cmd_pool_ != VK_NULL_HANDLE) vkDestroyCommandPool(device_, cmd_pool_, nullptr);
 
         {
             std::lock_guard lock(resource_mutex_);
             for (auto& [id, e] : pipelines_) {
-                if (e.pipeline)    vkDestroyPipeline(device_, e.pipeline, nullptr);
-                if (e.layout)      vkDestroyPipelineLayout(device_, e.layout, nullptr);
-                if (e.dset_layout) vkDestroyDescriptorSetLayout(device_, e.dset_layout, nullptr);
+                if (e.pipeline) vkDestroyPipeline(device_, e.pipeline, nullptr);
             }
             pipelines_.clear();
             named_pipelines_.clear();
+            for (auto& [id, im] : images_) {
+                if (im.view)   vkDestroyImageView(device_, im.view, nullptr);
+                if (im.image)  vkDestroyImage(device_, im.image, nullptr);
+                if (im.memory) vkFreeMemory(device_, im.memory, nullptr);
+            }
+            images_.clear();
         }
+        if (shared_pipe_layout_ != VK_NULL_HANDLE)
+            vkDestroyPipelineLayout(device_, shared_pipe_layout_, nullptr);
+        if (shared_dset_layout_ != VK_NULL_HANDLE)
+            vkDestroyDescriptorSetLayout(device_, shared_dset_layout_, nullptr);
         if (dpool_ != VK_NULL_HANDLE) vkDestroyDescriptorPool(device_, dpool_, nullptr);
 
         vkDestroyDevice(device_, nullptr);
@@ -479,6 +532,17 @@ bool VulkanDevice::RecreateSwapchain() {
         vci.subresourceRange.levelCount = 1;
         vkCreateImageView(device_, &vci, nullptr, &swap_views_[i]);
     }
+
+    // Resize per-image render-finished semaphores.
+    for (auto s : sem_render_done_) {
+        if (s) vkDestroySemaphore(device_, s, nullptr);
+    }
+    sem_render_done_.assign(ic, VK_NULL_HANDLE);
+    VkSemaphoreCreateInfo rsci{};
+    rsci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    for (std::uint32_t i = 0; i < ic; ++i) {
+        vkCreateSemaphore(device_, &rsci, nullptr, &sem_render_done_[i]);
+    }
     return true;
 }
 
@@ -487,18 +551,163 @@ VkPipeline VulkanDevice::LookupPipeline(PipelineHandle h) {
     auto it = pipelines_.find(h.id);
     return (it == pipelines_.end()) ? VK_NULL_HANDLE : it->second.pipeline;
 }
-VkPipelineLayout VulkanDevice::LookupPipelineLayout(PipelineHandle h) {
-    std::lock_guard lock(resource_mutex_);
-    auto it = pipelines_.find(h.id);
-    return (it == pipelines_.end()) ? VK_NULL_HANDLE : it->second.layout;
+VkPipelineLayout VulkanDevice::LookupPipelineLayout(PipelineHandle) {
+    return shared_pipe_layout_;
 }
 VkImageView VulkanDevice::CurrentSwapchainImageView() const {
     if (current_swap_index_ >= swap_views_.size()) return VK_NULL_HANDLE;
     return swap_views_[current_swap_index_];
 }
 
+VkImageView VulkanDevice::LookupImageView(TextureHandle h) {
+    if (h.id == 0) return VK_NULL_HANDLE;
+    if (h.id == kSwapchainTextureId) return CurrentSwapchainImageView();
+    std::lock_guard lock(resource_mutex_);
+    auto it = images_.find(h.id);
+    return (it == images_.end()) ? VK_NULL_HANDLE : it->second.view;
+}
+VkImage VulkanDevice::LookupImage(TextureHandle h) {
+    if (h.id == 0) return VK_NULL_HANDLE;
+    if (h.id == kSwapchainTextureId) {
+        return current_swap_index_ < swap_images_.size()
+                 ? swap_images_[current_swap_index_] : VK_NULL_HANDLE;
+    }
+    std::lock_guard lock(resource_mutex_);
+    auto it = images_.find(h.id);
+    return (it == images_.end()) ? VK_NULL_HANDLE : it->second.image;
+}
+
 BufferHandle  VulkanDevice::CreateBuffer(const BufferDesc&)        { return {0}; }
-TextureHandle VulkanDevice::CreateTexture(const TextureDesc&)      { return {0}; }
+
+TextureHandle VulkanDevice::CreateTexture(const TextureDesc& d) {
+    if (device_ == VK_NULL_HANDLE) return {0};
+    pt::mem::TagScope scope(pt::MemTag::GpuBuffers);
+
+    VkFormat fmt = VK_FORMAT_R8G8B8A8_UNORM;
+    switch (d.format) {
+        case TextureFormat::RGBA8_UNORM: fmt = VK_FORMAT_R8G8B8A8_UNORM;     break;
+        case TextureFormat::RGBA8_SRGB:  fmt = VK_FORMAT_R8G8B8A8_SRGB;       break;
+        case TextureFormat::RGBA16F:     fmt = VK_FORMAT_R16G16B16A16_SFLOAT; break;
+        case TextureFormat::RGBA32F:     fmt = VK_FORMAT_R32G32B32A32_SFLOAT; break;
+        case TextureFormat::R32_UINT:    fmt = VK_FORMAT_R32_UINT;             break;
+        default: break;
+    }
+
+    VkImageCreateInfo ici{};
+    ici.sType        = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ici.imageType    = VK_IMAGE_TYPE_2D;
+    ici.format       = fmt;
+    ici.extent       = { d.width, d.height, 1 };
+    ici.mipLevels    = 1;
+    ici.arrayLayers  = 1;
+    ici.samples      = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling       = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage        = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ici.sharingMode  = VK_SHARING_MODE_EXCLUSIVE;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImage img = VK_NULL_HANDLE;
+    if (vkCreateImage(device_, &ici, nullptr, &img) != VK_SUCCESS) return {0};
+
+    VkMemoryRequirements mr{};
+    vkGetImageMemoryRequirements(device_, img, &mr);
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(phys_device_, &mp);
+    std::uint32_t mem_type = 0;
+    bool found_mt = false;
+    for (std::uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+        if ((mr.memoryTypeBits & (1u << i)) &&
+            (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            mem_type = i;
+            found_mt = true;
+            break;
+        }
+    }
+    if (!found_mt) {
+        vkDestroyImage(device_, img, nullptr);
+        return {0};
+    }
+    VkMemoryAllocateInfo mai{};
+    mai.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize  = mr.size;
+    mai.memoryTypeIndex = mem_type;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (vkAllocateMemory(device_, &mai, nullptr, &mem) != VK_SUCCESS) {
+        vkDestroyImage(device_, img, nullptr);
+        return {0};
+    }
+    vkBindImageMemory(device_, img, mem, 0);
+
+    VkImageViewCreateInfo vci{};
+    vci.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vci.image    = img;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format   = fmt;
+    vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    vci.subresourceRange.layerCount = 1;
+    vci.subresourceRange.levelCount = 1;
+    VkImageView view = VK_NULL_HANDLE;
+    vkCreateImageView(device_, &vci, nullptr, &view);
+
+    // One-shot transition UNDEFINED -> GENERAL so the storage-image
+    // descriptor write is valid the first time we use it.
+    {
+        VkCommandBufferAllocateInfo cbai{};
+        cbai.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cbai.commandPool        = cmd_pool_;
+        cbai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbai.commandBufferCount = 1;
+        VkCommandBuffer once = VK_NULL_HANDLE;
+        vkAllocateCommandBuffers(device_, &cbai, &once);
+
+        VkCommandBufferBeginInfo bi{};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(once, &bi);
+
+        VkImageMemoryBarrier b{};
+        b.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.oldLayout     = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout     = VK_IMAGE_LAYOUT_GENERAL;
+        b.srcAccessMask = 0;
+        b.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image         = img;
+        b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        b.subresourceRange.layerCount = 1;
+        b.subresourceRange.levelCount = 1;
+        vkCmdPipelineBarrier(once,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &b);
+
+        vkEndCommandBuffer(once);
+        VkSubmitInfo si{};
+        si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers    = &once;
+        vkQueueSubmit(graphics_queue_, 1, &si, VK_NULL_HANDLE);
+        vkQueueWaitIdle(graphics_queue_);
+        vkFreeCommandBuffers(device_, cmd_pool_, 1, &once);
+    }
+
+    std::lock_guard lock(resource_mutex_);
+    auto id = next_id_++;
+    images_[id] = ImageEntry{ img, mem, view, fmt, { d.width, d.height } };
+    return TextureHandle{ id };
+}
+
+void VulkanDevice::DestroyTexture(TextureHandle h) {
+    if (h.id == 0 || h.id == kSwapchainTextureId) return;
+    std::lock_guard lock(resource_mutex_);
+    auto it = images_.find(h.id);
+    if (it == images_.end()) return;
+    if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
+    if (it->second.view)   vkDestroyImageView(device_, it->second.view, nullptr);
+    if (it->second.image)  vkDestroyImage(device_, it->second.image, nullptr);
+    if (it->second.memory) vkFreeMemory(device_, it->second.memory, nullptr);
+    images_.erase(it);
+}
 PipelineHandle VulkanDevice::CreateComputePipeline(const ComputePipelineDesc& d) {
     std::lock_guard lock(resource_mutex_);
     auto it = named_pipelines_.find(std::string(d.kernel_name));
@@ -558,32 +767,10 @@ CommandBuffer* VulkanDevice::AcquireCommandBuffer() {
         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0, 0, nullptr, 0, nullptr, 1, &toGen);
 
-    // Bind descriptor set for this frame's swapchain image.
-    {
-        VkDescriptorImageInfo dii{};
-        dii.imageView   = swap_views_[current_swap_index_];
-        dii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-
-        VkWriteDescriptorSet w{};
-        w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet          = dsets_[current_frame_];
-        w.dstBinding      = 0;
-        w.descriptorCount = 1;
-        w.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        w.pImageInfo      = &dii;
-        vkUpdateDescriptorSets(device_, 1, &w, 0, nullptr);
-
-        // Bind to the "clear" pipeline's layout.  All our pipelines use the
-        // same set 0 binding for the storage texture in P4.
-        std::lock_guard lock(resource_mutex_);
-        auto it = named_pipelines_.find("clear");
-        if (it != named_pipelines_.end()) {
-            auto& e = pipelines_.at(it->second);
-            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                    e.layout, 0, 1, &dsets_[current_frame_],
-                                    0, nullptr);
-        }
-    }
+    // VulkanCommandBuffer::Dispatch handles descriptor updates + binding
+    // now (post-P4 parity refactor). Nothing else to do here -- the
+    // engine binds the pipeline + textures + push constants then calls
+    // Dispatch which does the rest.
 
     wrapped_cb_->Reset(cb);
     return wrapped_cb_.get();
@@ -623,13 +810,13 @@ void VulkanDevice::Submit(CommandBuffer* cb) {
     si.commandBufferCount   = 1;
     si.pCommandBuffers      = &cmd;
     si.signalSemaphoreCount = 1;
-    si.pSignalSemaphores    = &sem_render_done_[current_frame_];
+    si.pSignalSemaphores    = &sem_render_done_[current_swap_index_];
     vkQueueSubmit(graphics_queue_, 1, &si, fence_in_flight_[current_frame_]);
 
     VkPresentInfoKHR pi{};
     pi.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     pi.waitSemaphoreCount = 1;
-    pi.pWaitSemaphores    = &sem_render_done_[current_frame_];
+    pi.pWaitSemaphores    = &sem_render_done_[current_swap_index_];
     pi.swapchainCount     = 1;
     pi.pSwapchains        = &swapchain_;
     pi.pImageIndices      = &current_swap_index_;

@@ -128,6 +128,14 @@ FetchContent_MakeAvailable(glm fmt mimalloc glfw enkits civetweb tomlplusplus nl
 if(PT_ENABLE_VULKAN_BACKEND)
     FetchContent_MakeAvailable(vma)
 endif()
+
+# civetweb prints a flood of "*** ... worker_thread_run:..." trace lines
+# whenever its `DEBUG` macro is defined (which CMake's Debug build type
+# turns on). NDEBUG doesn't help -- the gate is `#if defined(DEBUG)`.
+# Pass -UDEBUG to undefine it for this target only.
+if(TARGET civetweb-c-library)
+    target_compile_options(civetweb-c-library PRIVATE -UDEBUG)
+endif()
 if(PT_ENABLE_TRACY)
     FetchContent_MakeAvailable(tracy)
 endif()

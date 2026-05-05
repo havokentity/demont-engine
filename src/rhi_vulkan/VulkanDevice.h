@@ -56,7 +56,7 @@ public:
     AccelStructHandle CreateTLAS(const TLASDesc&) override { return {0}; }
 
     void DestroyBuffer(BufferHandle) override {}
-    void DestroyTexture(TextureHandle) override {}
+    void DestroyTexture(TextureHandle h) override;
     void DestroyPipeline(PipelineHandle) override {}
     void DestroyAccelStruct(AccelStructHandle) override {}
 
@@ -117,25 +117,52 @@ private:
     VkCommandPool             cmd_pool_ = VK_NULL_HANDLE;
     VkCommandBuffer           cmds_[kFramesInFlight] {};
     VkSemaphore               sem_image_avail_[kFramesInFlight] {};
-    VkSemaphore               sem_render_done_[kFramesInFlight] {};
     VkFence                   fence_in_flight_[kFramesInFlight] {};
+    // Render-finished semaphore is keyed by SWAPCHAIN IMAGE INDEX, not
+    // frame-in-flight, because the semaphore stays in use until the
+    // present completes; if we keyed by frame we'd risk reusing a
+    // semaphore that's still pending on the previous present of the
+    // same image.
+    std::vector<VkSemaphore>  sem_render_done_;
 
     std::unique_ptr<VulkanCommandBuffer> wrapped_cb_;
 
-    // Pipelines + descriptors
+    // Pipelines.  All three (clear, scene, pathtrace) share a single
+    // pipeline layout (2 storage-image bindings + 128B push range);
+    // unused bindings are tolerated by Vulkan when the shader doesn't
+    // reference them.
     struct PipelineEntry {
-        VkPipeline       pipeline;
-        VkPipelineLayout layout;
-        VkDescriptorSetLayout dset_layout;
+        VkPipeline pipeline;
     };
     std::mutex resource_mutex_;
     std::uint64_t next_id_ = kSwapchainTextureId + 1;
     std::unordered_map<std::uint64_t, PipelineEntry>     pipelines_;
     std::unordered_map<std::string, std::uint64_t>       named_pipelines_;
 
+    // Shared layouts -- created once at construction.
+    VkDescriptorSetLayout shared_dset_layout_ = VK_NULL_HANDLE;
+    VkPipelineLayout      shared_pipe_layout_ = VK_NULL_HANDLE;
+
     // One descriptor pool, one set per frame, updated each dispatch.
     VkDescriptorPool dpool_ = VK_NULL_HANDLE;
     VkDescriptorSet  dsets_[kFramesInFlight] {};
+
+    // Allocated textures (CreateTexture). Each has its own image, memory,
+    // and view. Looked up by id from CommandBuffer's bound_tex_ slots.
+    struct ImageEntry {
+        VkImage        image  = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView    view   = VK_NULL_HANDLE;
+        VkFormat       format = VK_FORMAT_UNDEFINED;
+        VkExtent2D     extent { 0, 0 };
+    };
+    std::unordered_map<std::uint64_t, ImageEntry> images_;
+
+public:
+    VkImageView         LookupImageView(TextureHandle h);
+    VkImage             LookupImage(TextureHandle h);
+    VkDescriptorSet     CurrentDescriptorSet() const { return dsets_[current_frame_]; }
+    VkPipelineLayout    SharedPipelineLayout() const { return shared_pipe_layout_; }
 };
 
 }  // namespace pt::rhi::vk
