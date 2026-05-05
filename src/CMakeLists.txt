@@ -1,7 +1,10 @@
 add_subdirectory(core)
 add_subdirectory(console)
 add_subdirectory(rhi_software)
+if(APPLE)
+    add_subdirectory(rhi_metal)
+endif()
 add_subdirectory(rhi)
 add_subdirectory(app)
 add_subdirectory(engine)
-# rhi_metal / rhi_vulkan / renderer dirs come online in later phases.
+# rhi_vulkan / renderer dirs come online in later phases.

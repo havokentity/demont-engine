@@ -35,6 +35,9 @@ option(PT_ENABLE_SANITIZERS     "Enable -fsanitize=address,undefined in Debug" O
 include(cmake/CompilerWarnings.cmake)
 include(cmake/EmbedResource.cmake)
 
+# --- Binary toolchain bits (slangc, metal-cpp) -----------------------------
+include(cmake/SetupBinaries.cmake)
+
 # --- Third party (FetchContent) --------------------------------------------
 include(cmake/Dependencies.cmake)
 

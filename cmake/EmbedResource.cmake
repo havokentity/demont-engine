@@ -5,13 +5,20 @@
 #   extern "C" const unsigned long <symbol>_size;
 
 function(pt_embed_resource target)
-    cmake_parse_arguments(EMB "" "SYMBOL;FILE" "" ${ARGN})
+    cmake_parse_arguments(EMB "" "SYMBOL;FILE;FULL_PATH" "" ${ARGN})
 
-    if(NOT EMB_SYMBOL OR NOT EMB_FILE)
-        message(FATAL_ERROR "pt_embed_resource needs SYMBOL and FILE")
+    if(NOT EMB_SYMBOL)
+        message(FATAL_ERROR "pt_embed_resource needs SYMBOL")
     endif()
 
-    set(input_full ${CMAKE_SOURCE_DIR}/${EMB_FILE})
+    if(EMB_FULL_PATH)
+        set(input_full "${EMB_FULL_PATH}")
+    elseif(EMB_FILE)
+        set(input_full "${CMAKE_SOURCE_DIR}/${EMB_FILE}")
+    else()
+        message(FATAL_ERROR "pt_embed_resource needs FILE or FULL_PATH")
+    endif()
+
     set(generated_dir ${CMAKE_BINARY_DIR}/embedded)
     set(output_path ${generated_dir}/${EMB_SYMBOL}.cpp)
 

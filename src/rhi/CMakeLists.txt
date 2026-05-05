@@ -8,4 +8,9 @@ target_link_libraries(pt_rhi
     PUBLIC pt_rhi_software
 )
 
+if(APPLE)
+    target_link_libraries(pt_rhi PUBLIC pt_rhi_metal)
+    target_compile_definitions(pt_rhi PUBLIC PT_HAS_METAL_BACKEND=1)
+endif()
+
 pt_set_compiler_options(pt_rhi)
