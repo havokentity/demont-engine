@@ -2,12 +2,14 @@
 add_library(pt_app_window STATIC
     Window.cpp
     Window_Cocoa.mm
+    ConsoleOverlay.mm
 )
 
 target_include_directories(pt_app_window PUBLIC ${CMAKE_SOURCE_DIR}/src)
 
 target_link_libraries(pt_app_window
     PUBLIC  pt_core
+    PUBLIC  pt_console
     PUBLIC  glfw
 )
 
@@ -17,12 +19,12 @@ if(APPLE)
         "-framework IOKit"
         "-framework CoreFoundation"
         "-framework QuartzCore"
+        "-framework CoreText"
+        "-framework CoreGraphics"
     )
-    # The Cocoa bridge is Objective-C++; do NOT apply -fno-rtti / -fno-exceptions
-    # to it (clang complains about rtti for ObjC selectors). Set per-source.
-    set_source_files_properties(Window_Cocoa.mm PROPERTIES
-        COMPILE_FLAGS "-fobjc-arc"
-    )
+    # Objective-C++ files use ARC. Do not apply -fno-rtti to them.
+    set_source_files_properties(Window_Cocoa.mm  PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    set_source_files_properties(ConsoleOverlay.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 endif()
 
 pt_set_compiler_options(pt_app_window)

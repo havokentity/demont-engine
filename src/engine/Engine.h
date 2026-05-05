@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <memory>
 
-namespace pt::app    { class Window; }
+namespace pt::app    { class Window; class ConsoleOverlay; }
 namespace pt::jobs   { class JobSystem; }
 namespace pt::console{ class ConsoleServer; }
 namespace pt::rhi    { class Device; struct PipelineHandle; }
@@ -48,6 +48,7 @@ private:
     pt::app::GraphicsApi ApiFor(BackendType t);
 
     std::unique_ptr<pt::app::Window>            window_;
+    std::unique_ptr<pt::app::ConsoleOverlay>    overlay_;
     std::unique_ptr<pt::jobs::JobSystem>        jobs_;
     std::unique_ptr<pt::console::ConsoleServer> server_;
     std::unique_ptr<pt::rhi::Device>            device_;

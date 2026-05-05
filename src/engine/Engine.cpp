@@ -1,5 +1,6 @@
 #include "Engine.h"
 
+#include "../app/ConsoleOverlay.h"
 #include "../app/Window.h"
 #include "../console/Console.h"
 #include "../console/ConsoleServer.h"
@@ -34,6 +35,8 @@ namespace cvar {
     PT_CVAR(app_vsync,         "1",    "Swapchain vsync (1=on)",         CVAR_ARCHIVE);
     PT_CVAR(app_auto_open_console, "1",
             "Open the web console in the default browser at startup",     CVAR_ARCHIVE);
+    PT_CVAR(app_overlay_enabled, "1",
+            "Enable the in-window native console overlay (backtick toggles)", CVAR_ARCHIVE);
     PT_CVAR(r_backend,         "software", "One of none|software|metal|vulkan",CVAR_ARCHIVE);
     PT_CVAR(r_clear_color,     "0.18 0.05 0.28", "Background clear colour (R G B)", 0);
     PT_CVAR(dev_cheats,        "0",    "Gate for CHEAT-flagged cvars",   0);
@@ -117,11 +120,26 @@ bool Engine::Init() {
         if (t != BackendType::None) RequestBackendSwitch(t);
     }
 
-    // Backtick toggles the web console (HARD: no in-app GUI).
+    // Native in-window console overlay (uses macOS AppKit -- not a GUI
+    // library; AppKit ships with the OS). Backtick toggles it.
     if (window_) {
+        if (auto* ov = C.FindCVar("app_overlay_enabled"); ov && ov->GetBool()) {
+            overlay_ = std::make_unique<pt::app::ConsoleOverlay>();
+            if (overlay_->Init(window_->NativeHandle())) {
+                pt::log::AddSink(&pt::app::ConsoleOverlay::OnLog);
+            } else {
+                overlay_.reset();
+            }
+        }
+
         window_->SetKeyHandler([this](int key, int /*mods*/) {
             constexpr int kGrave = 96;  // GLFW_KEY_GRAVE_ACCENT
-            if (key == kGrave) OpenWebConsole();
+            if (key != kGrave) return;
+            if (overlay_) {
+                overlay_->Toggle();
+            } else {
+                OpenWebConsole();
+            }
         });
     }
 
@@ -160,6 +178,8 @@ void Engine::Shutdown() {
     TearDownDevice();
 
     pt::log::RemoveAllSinks();
+    if (overlay_) overlay_->Shutdown();
+    overlay_.reset();
     if (server_) server_->Stop();
     server_.reset();
     pt::console::ConsoleServer::SetGlobalInstance(nullptr);
