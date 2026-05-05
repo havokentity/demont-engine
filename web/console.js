@@ -190,7 +190,30 @@
       status.textContent = `connected · ${location.host}`;
       status.className = 'status ok';
       send({ type: 'subscribe', topics: ['log'] });
-      append(`<span class="ts">${ts()}</span><span class="out">connected. type "list_commands", "sys_info", or hit Tab to complete.</span>`);
+      // Trippy hex banner -- same shape as overlay / boot-terminal.
+      // 13 lines, cyan frame, magenta ray bounces, bright letters.
+      const banner = [
+        ['frame',   '        ░▒▓██████████▓▒░'],
+        ['frame',   '     ░▒▓██╔═══════════╗▓▒░'],
+        ['letters', '   ░▓██╔═╝   D · M · T   ╚═╗██▓░'],
+        ['ray',     '  ▒█░  ╔╝  ╲     ◉     ╱  ╚╗  ░█▒'],
+        ['ray',     '  ▓█░ ║    ╲   ◉│◉   ╱    ║ ░█▓'],
+        ['ray',     '  █░  ║     ╲  ─•─  ╱     ║  ░█'],
+        ['ray',     '  ▓█░ ║      ╳  •  ╳      ║ ░█▓'],
+        ['ray',     '  █░  ║     ╱  ─•─  ╲     ║  ░█'],
+        ['ray',     '  ▓█░ ║    ╱   ◉│◉   ╲    ║ ░█▓'],
+        ['ray',     '  ▒█░  ╚╗  ╱     ◉     ╲  ╔╝  ░█▒'],
+        ['letters', '   ░▓██╚═╗   P · A · T   ╔═╝██▓░'],
+        ['frame',   '     ░▒▓██╚═══════════╝▓▒░'],
+        ['frame',   '        ░▒▓██████████▓▒░'],
+      ];
+      let block = '';
+      for (const [kind, ln] of banner) {
+        block += `<div class="banner-${kind}">${escape(ln)}</div>`;
+      }
+      block += `<div class="banner-tag">DeMonT PathTracer · v0.1.0 · De Monte Carlo-esque Tracer</div>`;
+      block += `<div class="out"><span class="ts">${ts()}</span>console attached. type "list_commands", "sys_info", or hit Tab to complete.</div>`;
+      append(block);
       await refreshNames();
       refreshCvars();
     };

@@ -252,10 +252,58 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
     [self addSubview:in];
     self.inputField = in;
 
+    // Trippy hex banner -- same shape as the SVG / boot-terminal logos,
+    // rendered through appendBannerLine which fixes a colour per role
+    // (frame / letters / ray) instead of going through the standard
+    // log-level palette.
+    NSArray<NSArray<NSString*>*>* banner = @[
+        @[@"frame",   @"        ░▒▓██████████▓▒░"],
+        @[@"frame",   @"     ░▒▓██╔═══════════╗▓▒░"],
+        @[@"letters", @"   ░▓██╔═╝   D · M · T   ╚═╗██▓░"],
+        @[@"ray",     @"  ▒█░  ╔╝  ╲     ◉     ╱  ╚╗  ░█▒"],
+        @[@"ray",     @"  ▓█░ ║    ╲   ◉│◉   ╱    ║ ░█▓"],
+        @[@"ray",     @"  █░  ║     ╲  ─•─  ╱     ║  ░█"],
+        @[@"ray",     @"  ▓█░ ║      ╳  •  ╳      ║ ░█▓"],
+        @[@"ray",     @"  █░  ║     ╱  ─•─  ╲     ║  ░█"],
+        @[@"ray",     @"  ▓█░ ║    ╱   ◉│◉   ╲    ║ ░█▓"],
+        @[@"ray",     @"  ▒█░  ╚╗  ╱     ◉     ╲  ╔╝  ░█▒"],
+        @[@"letters", @"   ░▓██╚═╗   P · A · T   ╔═╝██▓░"],
+        @[@"frame",   @"     ░▒▓██╚═══════════╝▓▒░"],
+        @[@"frame",   @"        ░▒▓██████████▓▒░"],
+    ];
+    for (NSArray<NSString*>* row in banner) {
+        [self appendBannerLine:row[1] level:row[0]];
+    }
+    [self appendLine:@"" level:@"info"];
+    [self appendLine:@"DeMonT PathTracer · v0.1.0  ·  De Monte Carlo-esque Tracer"
+              level:@"out"];
     [self appendLine:@"console attached. type \"list_commands\" or hit Tab."
               level:@"info"];
 
     return self;
+}
+
+// Special-case bannered ASCII line -- one fixed colour per role.
+- (void)appendBannerLine:(NSString*)line level:(NSString*)role {
+    NSColor* col = [NSColor colorWithCalibratedRed:0.0 green:0.94 blue:1.0 alpha:1.0];      // cyan frame
+    if ([role isEqualToString:@"letters"]) {
+        col = [NSColor colorWithCalibratedRed:0.95 green:0.97 blue:1.0 alpha:1.0];          // bright fg
+    } else if ([role isEqualToString:@"ray"]) {
+        col = [NSColor colorWithCalibratedRed:1.0 green:0.36 blue:0.70 alpha:1.0];          // magenta-pink
+    }
+    NSShadow* shadow = [[NSShadow alloc] init];
+    shadow.shadowColor = [NSColor colorWithCalibratedWhite:0.0 alpha:0.85];
+    shadow.shadowOffset = NSMakeSize(0, -1);
+    shadow.shadowBlurRadius = 3.0;
+    NSDictionary* attrs = @{
+        NSFontAttributeName: [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular],
+        NSForegroundColorAttributeName: col,
+        NSShadowAttributeName: shadow,
+    };
+    NSString* withNewline = [line stringByAppendingString:@"\n"];
+    NSAttributedString* a = [[NSAttributedString alloc]
+        initWithString:withNewline attributes:attrs];
+    [self.outputView.textStorage appendAttributedString:a];
 }
 
 - (NSColor*)colorForLevel:(NSString*)level {

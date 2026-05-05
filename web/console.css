@@ -181,6 +181,43 @@ body::after {
   user-select: none;
 }
 
+/* ASCII banner lines -- same glyph language as the boot terminal
+   logo and the in-window overlay. */
+.output .banner-frame {
+  color: var(--accent);
+  text-shadow: 0 0 6px var(--accent-glow);
+  font-size: 11px;
+  line-height: 1.1;
+  letter-spacing: 0;
+  font-feature-settings: "calt" 0;
+  white-space: pre;
+}
+.output .banner-letters {
+  color: var(--fg);
+  text-shadow: 0 0 6px var(--accent-glow);
+  font-size: 11px;
+  line-height: 1.1;
+  letter-spacing: 0;
+  font-feature-settings: "calt" 0;
+  white-space: pre;
+}
+.output .banner-ray {
+  color: var(--magenta);
+  text-shadow: 0 0 6px rgba(255, 58, 140, 0.4);
+  font-size: 11px;
+  line-height: 1.1;
+  letter-spacing: 0;
+  font-feature-settings: "calt" 0;
+  white-space: pre;
+}
+.output .banner-tag {
+  color: var(--fg-muted);
+  margin: 6px 0 4px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-size: 10px;
+}
+
 /* ---------- input ---------- */
 #input-form {
   display: flex; align-items: center;
