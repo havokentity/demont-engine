@@ -31,7 +31,7 @@ namespace cvar {
     PT_CVAR(app_window_width,  "1280", "Initial window width",           CVAR_ARCHIVE);
     PT_CVAR(app_window_height, "720",  "Initial window height",          CVAR_ARCHIVE);
     PT_CVAR(app_vsync,         "1",    "Swapchain vsync (1=on)",         CVAR_ARCHIVE);
-    PT_CVAR(r_backend,         "none", "One of none|software|metal|vulkan",CVAR_ARCHIVE);
+    PT_CVAR(r_backend,         "software", "One of none|software|metal|vulkan",CVAR_ARCHIVE);
     PT_CVAR(r_clear_color,     "0.05 0.05 0.06", "Background clear colour (R G B)", 0);
     PT_CVAR(dev_cheats,        "0",    "Gate for CHEAT-flagged cvars",   0);
     PT_CVAR(dev_log_level,     "info", "error|warn|info|debug",          0);
@@ -96,6 +96,16 @@ bool Engine::Init() {
     if (auto* p = C.FindCVar("net_line_port"))    sc.line_port = static_cast<std::uint16_t>(p->GetInt());
     if (auto* p = C.FindCVar("net_bind_address")) sc.bind_address = p->value;
     server_->Start(sc, &C);
+
+    // Boot the requested backend so the window renders something on
+    // startup (defaults to "software" -- the only one online today).
+    if (auto* v = C.FindCVar("r_backend")) {
+        BackendType t = BackendType::None;
+        if      (v->value == "software") t = BackendType::Software;
+        else if (v->value == "metal")    t = BackendType::Metal;
+        else if (v->value == "vulkan")   t = BackendType::Vulkan;
+        if (t != BackendType::None) RequestBackendSwitch(t);
+    }
 
     LOG_INFO("Engine initialized.");
     return true;
