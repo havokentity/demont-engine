@@ -4,6 +4,7 @@
 #include "engine/Engine.h"
 
 int main() {
+    LOG_INFO("DeMonT PathTracer -- De Monte Carlo-esque Tracer");
     pt::engine::Engine engine;
     if (!engine.Init()) {
         LOG_ERROR("Engine init failed");

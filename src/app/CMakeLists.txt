@@ -32,11 +32,11 @@ endif()
 pt_set_compiler_options(pt_app_window)
 
 # --- Executable ------------------------------------------------------------
-add_executable(pathtracer
+add_executable(demont
     main.cpp
 )
 
-target_link_libraries(pathtracer PRIVATE
+target_link_libraries(demont PRIVATE
     pt_core
     pt_console
     pt_engine
@@ -44,4 +44,4 @@ target_link_libraries(pathtracer PRIVATE
     pt_rhi
 )
 
-pt_set_compiler_options(pathtracer)
+pt_set_compiler_options(demont)

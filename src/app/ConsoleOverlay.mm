@@ -140,7 +140,7 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
     [self addSubview:prompt];
     self.promptLabel = prompt;
 
-    NSTextField* status = [NSTextField labelWithString:@"path tracer · console"];
+    NSTextField* status = [NSTextField labelWithString:@"DeMonT PathTracer · console"];
     status.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
     status.textColor = [NSColor colorWithWhite:0.55 alpha:1.0];
     status.frame = NSMakeRect(frame.size.width - 220, frame.size.height - 22, 200, 16);

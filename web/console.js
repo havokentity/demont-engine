@@ -1,4 +1,4 @@
-// PathTracer console UI -- vanilla JS, no build step.
+// DeMonT PathTracer console UI -- vanilla JS, no build step.
 (function () {
   const out        = document.getElementById('output');
   const form       = document.getElementById('input-form');

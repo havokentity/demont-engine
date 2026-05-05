@@ -10,9 +10,9 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
         "Configure out of source. Use a preset, e.g. `cmake --preset mac-debug`.")
 endif()
 
-project(pathtracer
+project(demont
     VERSION 0.1.0
-    DESCRIPTION "Real-time GPU path tracer with mesh CSG"
+    DESCRIPTION "DeMonT PathTracer -- De Monte Carlo-esque Tracer (real-time GPU path tracer with mesh CSG)"
     LANGUAGES C CXX
 )
 
