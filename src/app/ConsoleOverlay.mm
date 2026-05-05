@@ -252,23 +252,24 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
     [self addSubview:in];
     self.inputField = in;
 
-    // Trippy hex banner -- same shape as the SVG / boot-terminal logos,
-    // rendered through appendBannerLine which fixes a colour per role
-    // (frame / letters / ray) instead of going through the standard
-    // log-level palette.
+    // Trippy hex banner -- DMT as a triangle inscribed in the hex.
+    // Triangle is *the* fundamental primitive of ray tracing, so the
+    // shape is on-brand. D at the apex, M and T anchoring the base,
+    // bouncing-ray path packed inside the triangle. Triangle edges
+    // and bounces in PINK; hex frame in cyan; letters in bright fg.
     NSArray<NSArray<NSString*>*>* banner = @[
         @[@"frame",   @"        ░▒▓██████████▓▒░"],
-        @[@"frame",   @"     ░▒▓██╔═══════════╗▓▒░"],
-        @[@"letters", @"   ░▓██╔═╝   D · M · T   ╚═╗██▓░"],
-        @[@"ray",     @"  ▒█░  ╔╝  ╲     ◉     ╱  ╚╗  ░█▒"],
-        @[@"ray",     @"  ▓█░ ║    ╲   ◉│◉   ╱    ║ ░█▓"],
-        @[@"ray",     @"  █░  ║     ╲  ─•─  ╱     ║  ░█"],
-        @[@"ray",     @"  ▓█░ ║      ╳  •  ╳      ║ ░█▓"],
-        @[@"ray",     @"  █░  ║     ╱  ─•─  ╲     ║  ░█"],
-        @[@"ray",     @"  ▓█░ ║    ╱   ◉│◉   ╲    ║ ░█▓"],
-        @[@"ray",     @"  ▒█░  ╚╗  ╱     ◉     ╲  ╔╝  ░█▒"],
-        @[@"letters", @"   ░▓██╚═╗   P · A · T   ╔═╝██▓░"],
-        @[@"frame",   @"     ░▒▓██╚═══════════╝▓▒░"],
+        @[@"frame",   @"     ░▒▓██████████████▓▒░"],
+        @[@"letters", @"   ░▓██░         D         ░██▓░"],
+        @[@"ray",     @"   ▒█░          ╱ ╲          ░█▒"],
+        @[@"ray",     @"   ▓█░         ╱ ◉ ╲          ░█▓"],
+        @[@"ray",     @"   █░         ╱ ─•─ ╲          ░█"],
+        @[@"ray",     @"   ▓█░       ╱   ◉│◉  ╲        ░█▓"],
+        @[@"ray",     @"   █░       ╱  ─◉ • ◉─  ╲       ░█"],
+        @[@"ray",     @"   ▓█░     ╱     ◉│◉      ╲      ░█▓"],
+        @[@"letters", @"   ▒█░    M━━━━━━━━━━━━━━━━T     ░█▒"],
+        @[@"letters", @"     ░▓██░         P · T        ░██▓░"],
+        @[@"frame",   @"     ░▒▓██████████████▓▒░"],
         @[@"frame",   @"        ░▒▓██████████▓▒░"],
     ];
     for (NSArray<NSString*>* row in banner) {
@@ -289,7 +290,8 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
     if ([role isEqualToString:@"letters"]) {
         col = [NSColor colorWithCalibratedRed:0.95 green:0.97 blue:1.0 alpha:1.0];          // bright fg
     } else if ([role isEqualToString:@"ray"]) {
-        col = [NSColor colorWithCalibratedRed:1.0 green:0.36 blue:0.70 alpha:1.0];          // magenta-pink
+        // Hotter pink so the triangle edges + bounces really pop.
+        col = [NSColor colorWithCalibratedRed:1.0 green:0.37 blue:0.64 alpha:1.0];
     }
     NSShadow* shadow = [[NSShadow alloc] init];
     shadow.shadowColor = [NSColor colorWithCalibratedWhite:0.0 alpha:0.85];

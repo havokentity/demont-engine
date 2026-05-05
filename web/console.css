@@ -202,8 +202,10 @@ body::after {
   white-space: pre;
 }
 .output .banner-ray {
-  color: var(--magenta);
-  text-shadow: 0 0 6px rgba(255, 58, 140, 0.4);
+  /* Hot pink for the triangle edges + ray bounces. Brighter than the
+     subtler magenta used elsewhere -- this is the logo's accent. */
+  color: #ff5fa3;
+  text-shadow: 0 0 8px rgba(255, 95, 163, 0.55);
   font-size: 11px;
   line-height: 1.1;
   letter-spacing: 0;
