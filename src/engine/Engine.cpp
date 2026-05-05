@@ -510,7 +510,7 @@ void Engine::UpdateCamera(double dt) {
         window_->ConsumeMouseDelta(dx, dy);
         float sens = 0.12f;
         if (auto* v = C.FindCVar("cam_sensitivity")) sens = v->GetFloat();
-        camera_->yaw   -= glm::radians(static_cast<float>(dx) * sens);
+        camera_->yaw   += glm::radians(static_cast<float>(dx) * sens);
         camera_->pitch -= glm::radians(static_cast<float>(dy) * sens);
         camera_->ClampPitch();
     }
