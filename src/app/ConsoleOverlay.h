@@ -33,6 +33,10 @@ public:
     void Toggle();
     bool IsShown() const;
 
+    // Called by Engine on the GLFW resize callback so the floating panel
+    // tracks the renderer window.
+    void NotifyParentResized(int width, int height);
+
     // Forwarded by pt::log -> our sink so log lines appear in the overlay.
     static void OnLog(pt::log::Level level, const std::string& body);
     static void SetGlobalInstance(ConsoleOverlay* o);

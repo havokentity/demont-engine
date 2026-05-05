@@ -1,10 +1,12 @@
 // Native console overlay implementation. AppKit + CoreText.
 //
-// Layout (top half of the window when shown):
-//   [NSVisualEffectView  -- dark vibrancy backdrop, rounded bottom corners]
-//     [NSScrollView      -- output history, monospaced]
-//     [NSTextField       -- input field with `>` prompt]
-//   Slides in/out with Core Animation; toggled by backtick.
+// Architectural note: the panel lives in its own borderless transparent
+// NSWindow, added as a CHILD WINDOW of the renderer's NSWindow. Earlier
+// implementations added the overlay as a subview, which silently forced
+// the parent's content view into layer-backed mode and broke the GLFW
+// NSOpenGLContext's drawing path (blank window in the software backend).
+// A child window keeps the parent view hierarchy untouched, so all
+// three backends (software/metal/vulkan) render unaffected.
 
 #include "ConsoleOverlay.h"
 
@@ -21,18 +23,12 @@ namespace {
 pt::app::ConsoleOverlay* g_instance = nullptr;
 }
 
-// ---------------------------------------------------------------------------
-// PtConsoleInputField: NSTextField subclass that:
-//   * styles itself for the console (mono font, accent prompt)
-//   * intercepts Tab for completion
-//   * intercepts Up/Down for history
 @class PtConsoleView;
 
 @interface PtConsoleInputField : NSTextField
 @property (weak) PtConsoleView* owner;
 @end
 
-// ---------------------------------------------------------------------------
 @interface PtConsoleView : NSView <NSTextFieldDelegate, NSTextViewDelegate>
 
 @property (strong) NSVisualEffectView*  backdrop;
@@ -42,23 +38,30 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
 @property (strong) NSTextField*         promptLabel;
 @property (strong) NSTextField*         statusLabel;
 
-@property BOOL                          isShown;
 @property NSMutableArray<NSString*>*    history;
 @property NSInteger                     historyPos;
 
-@property NSMutableArray<NSString*>*    allNames;     // cvars + commands sorted
+@property NSMutableArray<NSString*>*    allNames;
 @property NSString*                     lastTabPrefix;
 @property BOOL                          lastTabShownList;
 
 - (instancetype)initWithFrame:(NSRect)frame;
-- (void)layoutForParent;
-- (void)show;
-- (void)hide;
-- (void)toggle;
 - (void)appendLine:(NSString*)line level:(NSString*)level;
 - (void)submitInput;
 - (BOOL)handleTab;
 - (void)refreshNames;
+@end
+
+// ---------------------------------------------------------------------------
+@interface PtConsolePanel : NSPanel
+@property (weak) NSWindow* parentRenderWindow;
+@property (strong) PtConsoleView* consoleView;
+@property BOOL isShown;
+- (instancetype)initWithParent:(NSWindow*)parent;
+- (void)layoutToParent;
+- (void)show;
+- (void)hide;
+- (void)toggle;
 @end
 
 // ---------------------------------------------------------------------------
@@ -67,19 +70,16 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
 - (BOOL)becomeFirstResponder {
     BOOL ok = [super becomeFirstResponder];
     if (ok) {
-        // Move caret to end after focus.
         NSText* editor = [self currentEditor];
         if (editor) [editor setSelectedRange:NSMakeRange(self.stringValue.length, 0)];
     }
     return ok;
 }
 
-// Field editor key handling. We catch Tab / Up / Down here.
 - (BOOL)control:(NSControl*)control textView:(NSTextView*)textView
       doCommandBySelector:(SEL)cmd {
-    if (cmd == @selector(insertTab:)) {
-        return [self.owner handleTab];
-    }
+    if (cmd == @selector(insertTab:))      return [self.owner handleTab];
+    if (cmd == @selector(insertNewline:)) { [self.owner submitInput]; return YES; }
     if (cmd == @selector(moveUp:)) {
         if (self.owner.historyPos > 0) {
             self.owner.historyPos -= 1;
@@ -98,10 +98,6 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
         }
         return YES;
     }
-    if (cmd == @selector(insertNewline:)) {
-        [self.owner submitInput];
-        return YES;
-    }
     return NO;
 }
 @end
@@ -116,14 +112,13 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
     self.wantsLayer = YES;
     self.layer.masksToBounds = NO;
 
-    self.history = [NSMutableArray array];
+    self.history    = [NSMutableArray array];
     self.historyPos = 0;
-    self.allNames = [NSMutableArray array];
+    self.allNames   = [NSMutableArray array];
 
-    // ---- Vibrancy backdrop ----
     NSVisualEffectView* bg = [[NSVisualEffectView alloc] initWithFrame:self.bounds];
     bg.material = NSVisualEffectMaterialHUDWindow;
-    bg.blendingMode = NSVisualEffectBlendingModeWithinWindow;
+    bg.blendingMode = NSVisualEffectBlendingModeBehindWindow;
     bg.state = NSVisualEffectStateActive;
     bg.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     bg.wantsLayer = YES;
@@ -134,7 +129,6 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
     [self addSubview:bg];
     self.backdrop = bg;
 
-    // ---- Output scroll view + text view ----
     NSScrollView* scroll = [[NSScrollView alloc]
         initWithFrame:NSMakeRect(0, 36, frame.size.width, frame.size.height - 36)];
     scroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
@@ -161,7 +155,6 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
     self.outputScroll = scroll;
     self.outputView = tv;
 
-    // ---- Prompt label ----
     NSTextField* prompt = [NSTextField labelWithString:@">"];
     prompt.frame = NSMakeRect(14, 8, 14, 22);
     prompt.font = [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightSemibold];
@@ -171,7 +164,6 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
     [self addSubview:prompt];
     self.promptLabel = prompt;
 
-    // ---- Status label (top-right) ----
     NSTextField* status = [NSTextField labelWithString:@"path tracer · console"];
     status.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
     status.textColor = [NSColor colorWithWhite:0.55 alpha:1.0];
@@ -181,7 +173,6 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
     [self addSubview:status];
     self.statusLabel = status;
 
-    // ---- Input field ----
     PtConsoleInputField* in = [[PtConsoleInputField alloc]
         initWithFrame:NSMakeRect(32, 8, frame.size.width - 46, 22)];
     in.owner = self;
@@ -197,83 +188,22 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
     [self addSubview:in];
     self.inputField = in;
 
-    self.alphaValue = 0.0;
-    self.hidden = YES;
-    self.isShown = NO;
-
     [self appendLine:@"console attached. type \"list_commands\" or hit Tab."
               level:@"info"];
 
     return self;
 }
 
-// Lay out at top half of parent, full width.
-- (void)layoutForParent {
-    NSView* parent = self.superview;
-    if (!parent) return;
-    CGFloat w = parent.bounds.size.width;
-    CGFloat h = MIN(MAX(parent.bounds.size.height * 0.45, 240), 560);
-    self.frame = NSMakeRect(0, parent.bounds.size.height - h, w, h);
-}
-
-- (void)show {
-    if (self.isShown) return;
-    self.isShown = YES;
-    self.hidden = NO;
-
-    NSView* parent = self.superview;
-    if (parent) {
-        CGFloat w = parent.bounds.size.width;
-        CGFloat h = MIN(MAX(parent.bounds.size.height * 0.45, 240), 560);
-        self.frame = NSMakeRect(0, parent.bounds.size.height, w, h);  // start above
-    }
-
-    [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
-        ctx.duration = 0.22;
-        ctx.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
-        self.animator.alphaValue = 1.0;
-        if (self.superview) {
-            CGFloat w = self.superview.bounds.size.width;
-            CGFloat h = self.frame.size.height;
-            [self.animator setFrame:NSMakeRect(0, self.superview.bounds.size.height - h, w, h)];
-        }
-    } completionHandler:^{
-        [self.window makeFirstResponder:self.inputField];
-    }];
-}
-
-- (void)hide {
-    if (!self.isShown) return;
-    self.isShown = NO;
-
-    [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
-        ctx.duration = 0.18;
-        ctx.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseIn];
-        self.animator.alphaValue = 0.0;
-        if (self.superview) {
-            CGFloat w = self.superview.bounds.size.width;
-            CGFloat h = self.frame.size.height;
-            [self.animator setFrame:NSMakeRect(0, self.superview.bounds.size.height, w, h)];
-        }
-    } completionHandler:^{
-        self.hidden = YES;
-        [self.window makeFirstResponder:nil];
-    }];
-}
-
-- (void)toggle { if (self.isShown) [self hide]; else [self show]; }
-
 - (NSColor*)colorForLevel:(NSString*)level {
     if ([level isEqualToString:@"warn"])  return [NSColor colorWithCalibratedRed:0.85 green:0.75 blue:0.42 alpha:1.0];
     if ([level isEqualToString:@"error"]) return [NSColor colorWithCalibratedRed:0.86 green:0.42 blue:0.34 alpha:1.0];
     if ([level isEqualToString:@"input"]) return [NSColor colorWithCalibratedRed:0.91 green:0.60 blue:0.41 alpha:1.0];
     if ([level isEqualToString:@"out"])   return [NSColor colorWithWhite:0.92 alpha:1.0];
-    return [NSColor colorWithWhite:0.65 alpha:1.0];   // info default
+    return [NSColor colorWithWhite:0.65 alpha:1.0];
 }
 
 - (void)appendLine:(NSString*)line level:(NSString*)level {
-    NSString* prefix = @"";
-    if ([level isEqualToString:@"input"]) prefix = @"> ";
+    NSString* prefix = [level isEqualToString:@"input"] ? @"> " : @"";
     NSDictionary* attrs = @{
         NSFontAttributeName: [NSFont monospacedSystemFontOfSize:12 weight:NSFontWeightRegular],
         NSForegroundColorAttributeName: [self colorForLevel:level],
@@ -299,7 +229,6 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
         std::string_view([line UTF8String]));
     if (!result.output.empty()) {
         NSString* o = [NSString stringWithUTF8String:result.output.c_str()];
-        // Strip trailing newline; appendLine adds its own.
         while (o.length > 0 && [o characterAtIndex:o.length - 1] == '\n') {
             o = [o substringToIndex:o.length - 1];
         }
@@ -309,8 +238,6 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
         NSString* e = [NSString stringWithUTF8String:result.error.c_str()];
         [self appendLine:[NSString stringWithFormat:@"error: %@", e] level:@"error"];
     }
-
-    // After execution something might have registered a new cvar/command.
     [self refreshNames];
 }
 
@@ -332,7 +259,7 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
 
     NSString* value = self.inputField.stringValue;
     NSRange firstSpace = [value rangeOfString:@" "];
-    if (firstSpace.location != NSNotFound) return NO;   // past first token
+    if (firstSpace.location != NSNotFound) return NO;
 
     NSMutableArray<NSString*>* matches = [NSMutableArray array];
     for (NSString* n in self.allNames) {
@@ -345,7 +272,6 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
         return YES;
     }
 
-    // Longest common prefix.
     NSString* common = matches[0];
     for (NSUInteger i = 1; i < matches.count; ++i) {
         NSUInteger j = 0;
@@ -373,6 +299,103 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
 
 @end
 
+// ---------------------------------------------------------------------------
+@implementation PtConsolePanel
+
++ (BOOL)canBecomeKeyWindow { return YES; }
+
+- (instancetype)initWithParent:(NSWindow*)parent {
+    NSRect frame = parent.frame;
+    CGFloat h = MIN(MAX(frame.size.height * 0.45, 240), 560);
+    NSRect panelFrame = NSMakeRect(frame.origin.x,
+                                    frame.origin.y + frame.size.height - h,
+                                    frame.size.width, h);
+
+    self = [super initWithContentRect:panelFrame
+                            styleMask:NSWindowStyleMaskBorderless
+                              backing:NSBackingStoreBuffered
+                                defer:NO];
+    if (!self) return nil;
+
+    self.parentRenderWindow = parent;
+    self.opaque = NO;
+    self.backgroundColor = [NSColor clearColor];
+    self.hasShadow = YES;
+    self.level = NSFloatingWindowLevel;
+    self.movableByWindowBackground = NO;
+    self.releasedWhenClosed = NO;
+    self.hidesOnDeactivate = NO;
+
+    PtConsoleView* v = [[PtConsoleView alloc] initWithFrame:NSMakeRect(0, 0, panelFrame.size.width, panelFrame.size.height)];
+    self.contentView = v;
+    self.consoleView = v;
+
+    self.alphaValue = 0.0;
+    self.isShown = NO;
+
+    return self;
+}
+
+- (BOOL)canBecomeKeyWindow { return YES; }
+
+- (void)layoutToParent {
+    if (self.parentRenderWindow == nil) return;
+    NSRect frame = self.parentRenderWindow.frame;
+    CGFloat h = MIN(MAX(frame.size.height * 0.45, 240), 560);
+    NSRect target = NSMakeRect(frame.origin.x,
+                                frame.origin.y + frame.size.height - h,
+                                frame.size.width, h);
+    [self setFrame:target display:YES animate:NO];
+}
+
+- (void)show {
+    if (self.isShown) return;
+    self.isShown = YES;
+
+    [self layoutToParent];
+
+    NSRect target = self.frame;
+    NSRect start = NSMakeRect(target.origin.x,
+                               target.origin.y + target.size.height,
+                               target.size.width, target.size.height);
+    [self setFrame:start display:NO];
+
+    [self orderFront:nil];
+    [self makeKeyWindow];
+    [self makeFirstResponder:self.consoleView.inputField];
+
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
+        ctx.duration = 0.22;
+        ctx.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+        self.animator.alphaValue = 1.0;
+        [self.animator setFrame:target display:YES];
+    } completionHandler:nil];
+}
+
+- (void)hide {
+    if (!self.isShown) return;
+    self.isShown = NO;
+
+    NSRect cur = self.frame;
+    NSRect target = NSMakeRect(cur.origin.x,
+                                cur.origin.y + cur.size.height,
+                                cur.size.width, cur.size.height);
+
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
+        ctx.duration = 0.18;
+        ctx.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseIn];
+        self.animator.alphaValue = 0.0;
+        [self.animator setFrame:target display:YES];
+    } completionHandler:^{
+        [self orderOut:nil];
+        [self.parentRenderWindow makeKeyWindow];
+    }];
+}
+
+- (void)toggle { if (self.isShown) [self hide]; else [self show]; }
+
+@end
+
 // ===========================================================================
 namespace pt::app {
 
@@ -381,27 +404,23 @@ ConsoleOverlay::~ConsoleOverlay() { Shutdown(); }
 
 bool ConsoleOverlay::Init(void* ns_window) {
     if (ns_window == nullptr) return false;
-    NSWindow* win = (__bridge NSWindow*)ns_window;
-    NSView*   parent = win.contentView;
-    if (parent == nil) return false;
+    NSWindow* parent = (__bridge NSWindow*)ns_window;
 
-    parent.wantsLayer = YES;
+    PtConsolePanel* panel = [[PtConsolePanel alloc] initWithParent:parent];
+    [parent addChildWindow:panel ordered:NSWindowAbove];
 
-    PtConsoleView* view = [[PtConsoleView alloc] initWithFrame:parent.bounds];
-    view.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
-    [parent addSubview:view positioned:NSWindowAbove relativeTo:nil];
-    [view layoutForParent];
-
-    opaque_ = (__bridge_retained void*)view;
-
+    opaque_ = (__bridge_retained void*)panel;
     SetGlobalInstance(this);
+
+    // Forward log lines into the overlay (the panel's contentView).
     return true;
 }
 
 void ConsoleOverlay::Shutdown() {
     if (opaque_) {
-        PtConsoleView* view = (__bridge_transfer PtConsoleView*)opaque_;
-        [view removeFromSuperview];
+        PtConsolePanel* panel = (__bridge_transfer PtConsolePanel*)opaque_;
+        [panel.parentRenderWindow removeChildWindow:panel];
+        [panel orderOut:nil];
         opaque_ = nullptr;
     }
     if (g_instance == this) g_instance = nullptr;
@@ -409,26 +428,27 @@ void ConsoleOverlay::Shutdown() {
 
 void ConsoleOverlay::Show() {
     if (!opaque_) return;
-    PtConsoleView* v = (__bridge PtConsoleView*)opaque_;
-    [v show];
+    [(__bridge PtConsolePanel*)opaque_ show];
 }
-
 void ConsoleOverlay::Hide() {
     if (!opaque_) return;
-    PtConsoleView* v = (__bridge PtConsoleView*)opaque_;
-    [v hide];
+    [(__bridge PtConsolePanel*)opaque_ hide];
 }
-
 void ConsoleOverlay::Toggle() {
     if (!opaque_) return;
-    PtConsoleView* v = (__bridge PtConsoleView*)opaque_;
-    [v toggle];
+    [(__bridge PtConsolePanel*)opaque_ toggle];
 }
-
 bool ConsoleOverlay::IsShown() const {
     if (!opaque_) return false;
-    PtConsoleView* v = (__bridge PtConsoleView*)opaque_;
-    return v.isShown == YES;
+    return ((__bridge PtConsolePanel*)opaque_).isShown == YES;
+}
+
+void ConsoleOverlay::NotifyParentResized(int /*width*/, int /*height*/) {
+    if (!opaque_) return;
+    PtConsolePanel* panel = (__bridge PtConsolePanel*)opaque_;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [panel layoutToParent];
+    });
 }
 
 void ConsoleOverlay::SetGlobalInstance(ConsoleOverlay* o) { g_instance = o; }
@@ -443,10 +463,10 @@ void ConsoleOverlay::OnLog(pt::log::Level level, const std::string& body) {
     }
     NSString* line = [NSString stringWithUTF8String:body.c_str()];
     NSString* lvs  = [NSString stringWithUTF8String:lv];
-    PtConsoleView* v = (__bridge PtConsoleView*)g_instance->opaque_;
-    // Marshal to main thread; AppKit is main-thread only.
+    PtConsolePanel* panel = (__bridge PtConsolePanel*)g_instance->opaque_;
+    PtConsoleView*  view  = panel.consoleView;
     dispatch_async(dispatch_get_main_queue(), ^{
-        [v appendLine:line level:lvs];
+        [view appendLine:line level:lvs];
     });
 }
 
