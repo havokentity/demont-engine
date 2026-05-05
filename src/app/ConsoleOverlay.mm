@@ -15,6 +15,63 @@
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>
 
+// Tiny logo-drawing NSView. Same glyph as the web console: a hexagon
+// (mesh primitive) framing a three-bounce ray with hit-point dots.
+@interface PtLogoView : NSView
+@end
+
+@implementation PtLogoView
+
+- (void)drawRect:(NSRect)dirtyRect {
+    (void)dirtyRect;
+    NSGraphicsContext* gc = [NSGraphicsContext currentContext];
+    if (gc == nil) return;
+
+    // Source-of-truth design space is 32x32; scale to whatever frame we got.
+    CGFloat s = MIN(self.bounds.size.width, self.bounds.size.height) / 32.0;
+    NSAffineTransform* xform = [NSAffineTransform transform];
+    [xform translateXBy:(self.bounds.size.width - 32 * s) * 0.5
+                    yBy:(self.bounds.size.height - 32 * s) * 0.5];
+    [xform scaleBy:s];
+    [xform concat];
+
+    NSColor* cyan = [NSColor colorWithCalibratedRed:0.0 green:0.94 blue:1.0 alpha:1.0];
+    [cyan setStroke];
+    [cyan setFill];
+
+    // Hex frame.
+    NSBezierPath* hex = [NSBezierPath bezierPath];
+    [hex moveToPoint:NSMakePoint(16.0, 2.5)];
+    [hex lineToPoint:NSMakePoint(27.5, 9.0)];
+    [hex lineToPoint:NSMakePoint(27.5, 23.0)];
+    [hex lineToPoint:NSMakePoint(16.0, 29.5)];
+    [hex lineToPoint:NSMakePoint(4.5, 23.0)];
+    [hex lineToPoint:NSMakePoint(4.5, 9.0)];
+    [hex closePath];
+    hex.lineWidth = 1.6;
+    hex.lineJoinStyle = NSLineJoinStyleRound;
+    [hex stroke];
+
+    // Three-bounce ray path.
+    NSBezierPath* ray = [NSBezierPath bezierPath];
+    [ray moveToPoint:NSMakePoint(7.5, 11.0)];
+    [ray lineToPoint:NSMakePoint(13.0, 19.0)];
+    [ray lineToPoint:NSMakePoint(21.5, 14.0)];
+    [ray lineToPoint:NSMakePoint(24.5, 22.0)];
+    ray.lineWidth = 1.6;
+    ray.lineCapStyle = NSLineCapStyleRound;
+    ray.lineJoinStyle = NSLineJoinStyleRound;
+    [ray stroke];
+
+    // Hit-point dots.
+    NSBezierPath* d1 = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(13.0 - 1.4, 19.0 - 1.4, 2.8, 2.8)];
+    NSBezierPath* d2 = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(21.5 - 1.4, 14.0 - 1.4, 2.8, 2.8)];
+    [d1 fill];
+    [d2 fill];
+}
+
+@end
+
 #include <atomic>
 #include <mutex>
 #include <vector>
@@ -144,11 +201,17 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
     NSTextField* status = [NSTextField labelWithString:@"DEMONT · PATHTRACER · CONSOLE"];
     status.font = [NSFont monospacedSystemFontOfSize:9 weight:NSFontWeightSemibold];
     status.textColor = [NSColor colorWithCalibratedRed:0.0 green:0.94 blue:1.0 alpha:0.65];
-    status.frame = NSMakeRect(frame.size.width - 220, frame.size.height - 22, 200, 16);
+    status.frame = NSMakeRect(frame.size.width - 240, frame.size.height - 24, 200, 16);
     status.alignment = NSTextAlignmentRight;
     status.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
     [self addSubview:status];
     self.statusLabel = status;
+
+    // Top-left corner logo glyph -- same design as the web console.
+    PtLogoView* logo = [[PtLogoView alloc] initWithFrame:NSMakeRect(14, frame.size.height - 28, 18, 18)];
+    logo.autoresizingMask = NSViewMinYMargin;
+    logo.wantsLayer = YES;
+    [self addSubview:logo];
 
     PtConsoleInputField* in = [[PtConsoleInputField alloc]
         initWithFrame:NSMakeRect(32, 8, frame.size.width - 46, 22)];
