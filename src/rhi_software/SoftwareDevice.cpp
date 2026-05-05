@@ -78,7 +78,11 @@ SoftwareDevice::SoftwareDevice(const NativeWindowHandle& window) {
     mtl_layer_->retain();
     mtl_layer_->setDevice(mtl_device_);
     mtl_layer_->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
-    mtl_layer_->setFramebufferOnly(true);  // pure present, no shader writes
+    // Match the metal backend's storage layout exactly so brightness
+    // doesn't drift between backends (framebufferOnly enables tiled
+    // compressed internal formats on Apple Silicon, which round 8-bit
+    // values slightly differently from plain BGRA8Unorm).
+    mtl_layer_->setFramebufferOnly(false);
     mtl_layer_->setDrawableSize(CGSize{static_cast<CGFloat>(width_),
                                        static_cast<CGFloat>(height_)});
 
