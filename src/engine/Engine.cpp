@@ -9,6 +9,7 @@
 #include "../core/Log.h"
 #include "../core/Memory/Memory.h"
 #include "../renderer/Camera.h"
+#include "../renderer/MeshGen.h"
 #include "../rhi/CommandBuffer.h"
 #include "../rhi/Device.h"
 
@@ -230,6 +231,13 @@ void Engine::TearDownDevice() {
     accum_texture_id_ = 0;
     accum_w_ = accum_h_ = 0;
     if (device_) {
+        if (scene_tlas_id_ != 0) device_->DestroyAccelStruct(pt::rhi::AccelStructHandle{scene_tlas_id_});
+        if (box_blas_id_   != 0) device_->DestroyAccelStruct(pt::rhi::AccelStructHandle{box_blas_id_});
+    }
+    scene_tlas_id_ = 0;
+    box_blas_id_   = 0;
+    mesh_pipeline_id_ = 0;
+    if (device_) {
         // Final frame clears the drawable to black so the window doesn't
         // freeze on whatever colour was last presented (the layer keeps
         // showing its last contents until something else writes to it).
@@ -307,6 +315,56 @@ void Engine::RequestBackendSwitch(BackendType to) {
         };
         pathtrace_pipeline_id_ = device_->CreateComputePipeline(desc).id;
     }
+    {
+        pt::rhi::ComputePipelineDesc desc{
+            .kernel_name = "mesh", .bytecode = {}, .debug_name = "mesh",
+        };
+        mesh_pipeline_id_ = device_->CreateComputePipeline(desc).id;
+    }
+
+    // Build a procedural box BLAS + TLAS so r_mode mesh has something
+    // to render against. The box sits 0.5 above the ground (so its
+    // bottom rests on the plane), centered at the origin.
+    if (current_backend_ == BackendType::Metal) {
+        auto box = pt::renderer::GenerateBoxCCW(1.0f, 1.0f, 1.0f);
+        std::vector<float> verts(box.vertices.size() * 3);
+        for (std::size_t i = 0; i < box.vertices.size(); ++i) {
+            verts[i*3 + 0] = box.vertices[i].pos.x;
+            verts[i*3 + 1] = box.vertices[i].pos.y;
+            verts[i*3 + 2] = box.vertices[i].pos.z;
+        }
+        pt::rhi::BLASDesc blas_desc{
+            .vertex_positions = verts.data(),
+            .vertex_count     = static_cast<std::uint32_t>(box.vertices.size()),
+            .indices          = box.indices.data(),
+            .index_count      = static_cast<std::uint32_t>(box.indices.size()),
+            .debug_name       = "box",
+        };
+        auto blas = device_->CreateBLAS(blas_desc);
+        box_blas_id_ = blas.id;
+        if (blas.id != 0) {
+            // Single instance translated to (0, 0.5, 0) so the box
+            // sits on the ground plane at y=0.
+            pt::rhi::TLASInstance inst{};
+            inst.blas = blas;
+            // 4x3 row-major: columns 0..2 = upper-left 3x3, column 3 = translation.
+            inst.transform[0] = 1; inst.transform[1] = 0; inst.transform[2] = 0; inst.transform[3]  = 0.0f;
+            inst.transform[4] = 0; inst.transform[5] = 1; inst.transform[6] = 0; inst.transform[7]  = 0.5f;
+            inst.transform[8] = 0; inst.transform[9] = 0; inst.transform[10]= 1; inst.transform[11] = 0.0f;
+            inst.instance_id = 0;
+            inst.mask        = 0xFF;
+            std::vector<pt::rhi::TLASInstance> insts{inst};
+            pt::rhi::TLASDesc tlas_desc{
+                .instances = insts,
+                .debug_name = "scene",
+            };
+            auto tlas = device_->CreateTLAS(tlas_desc);
+            scene_tlas_id_ = tlas.id;
+            if (scene_tlas_id_ != 0) {
+                LOG_INFO("Mesh: built BLAS+TLAS (1 box instance). r_mode mesh available.");
+            }
+        }
+    }
 }
 
 namespace {
@@ -350,6 +408,8 @@ void Engine::RenderFrame() {
     std::uint64_t pipeline = clear_pipeline_id_;
     if      (mode == "pathtrace" && pathtrace_pipeline_id_ != 0) pipeline = pathtrace_pipeline_id_;
     else if (mode == "scene"     && scene_pipeline_id_     != 0) pipeline = scene_pipeline_id_;
+    else if (mode == "mesh"      && mesh_pipeline_id_      != 0 && scene_tlas_id_ != 0)
+                                                                  pipeline = mesh_pipeline_id_;
     else if (mode != "clear") {
         // Mode requires a pipeline this backend doesn't have (most often:
         // software backend can't run scene/pathtrace yet -- they live on
@@ -383,7 +443,8 @@ void Engine::RenderFrame() {
     // Lazily (re)create the HDR accumulation texture.  Only used for
     // pathtrace mode; allocate once it's needed and re-allocate when the
     // swapchain size changes.
-    bool needs_accum = (pipeline == pathtrace_pipeline_id_);
+    bool needs_accum = (pipeline == pathtrace_pipeline_id_) || (pipeline == mesh_pipeline_id_);
+    bool needs_tlas  = (pipeline == mesh_pipeline_id_);
     if (needs_accum && (accum_texture_id_ == 0 ||
                         accum_w_ != static_cast<int>(fc.width) ||
                         accum_h_ != static_cast<int>(fc.height))) {
@@ -416,6 +477,9 @@ void Engine::RenderFrame() {
     if (needs_accum && accum_texture_id_ != 0) {
         cb->BindStorageTexture(1, pt::rhi::TextureHandle{accum_texture_id_});
     }
+    if (needs_tlas && scene_tlas_id_ != 0) {
+        cb->BindAccelStruct(2, pt::rhi::AccelStructHandle{scene_tlas_id_});
+    }
 
     glm::vec3 bg = ParseRGB(C.FindCVar("r_clear_color") ? C.FindCVar("r_clear_color")->value
                                                         : std::string_view{},
@@ -435,6 +499,7 @@ void Engine::RenderFrame() {
                                ? float(fc.width) / float(fc.height) : 1.0f;
 
         if (pipeline == scene_pipeline_id_) {
+            // 64-byte scene push (no frame_index/reset/bounces).
             struct ScenePush {
                 float pos_fovtan[4];
                 float fwd_aspect[4];
@@ -452,7 +517,9 @@ void Engine::RenderFrame() {
             static_assert(sizeof(push) == 64);
             cb->PushConstants(&push, sizeof(push));
         } else {
-            // pathtrace
+            // pathtrace OR mesh: same 80-byte push with camera + frame
+            // index + reset + bounces. The two shaders read the same
+            // layout.
             std::uint32_t bounces = 8;
             if (auto* v = C.FindCVar("r_max_bounces")) bounces = (std::uint32_t)v->GetInt();
             struct PtPush {
@@ -702,9 +769,9 @@ void Engine::RegisterCommands() {
             RequestBackendSwitch(t);
         };
     }
-    // r_mode: clear|scene|pathtrace.
+    // r_mode: clear|scene|pathtrace|mesh.
     if (auto* v = C.FindCVar("r_mode")) {
-        v->allowed_values = {"clear", "scene", "pathtrace"};
+        v->allowed_values = {"clear", "scene", "pathtrace", "mesh"};
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
     if (auto* v = C.FindCVar("r_clear_color")) {

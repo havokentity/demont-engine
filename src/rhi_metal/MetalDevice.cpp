@@ -23,6 +23,8 @@ extern const unsigned char shader_Scene_metal_data[];
 extern const unsigned long shader_Scene_metal_size;
 extern const unsigned char shader_PathTrace_metal_data[];
 extern const unsigned long shader_PathTrace_metal_size;
+extern const unsigned char shader_MeshTrace_metal_data[];
+extern const unsigned long shader_MeshTrace_metal_size;
 }
 
 // Defined in MetalAttach.mm.
@@ -51,8 +53,9 @@ void MetalCommandBuffer::Reset(MTL::CommandBuffer* cb) {
     encoder_  = nullptr;
     bound_pso_ = PipelineHandle{0};
     push_size_ = 0;
-    for (auto& t : bound_tex_) t = TextureHandle{0};
-    for (auto& b : bound_buf_) b = BufferHandle{0};
+    for (auto& t : bound_tex_)   t = TextureHandle{0};
+    for (auto& b : bound_buf_)   b = BufferHandle{0};
+    for (auto& a : bound_accel_) a = AccelStructHandle{0};
 }
 
 void MetalCommandBuffer::EnsureEncoder() {
@@ -80,6 +83,9 @@ void MetalCommandBuffer::BindBuffer(std::uint32_t slot, BufferHandle b,
 }
 void MetalCommandBuffer::BindStorageTexture(std::uint32_t slot, TextureHandle t) {
     if (slot < std::size(bound_tex_)) bound_tex_[slot] = t;
+}
+void MetalCommandBuffer::BindAccelStruct(std::uint32_t slot, AccelStructHandle a) {
+    if (slot < std::size(bound_accel_)) bound_accel_[slot] = a;
 }
 void MetalCommandBuffer::PushConstants(const void* data, std::size_t size) {
     if (size > sizeof(push_buf_)) size = sizeof(push_buf_);
@@ -112,6 +118,17 @@ void MetalCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     // [[vk::push_constant]] -> Metal mapping.
     if (push_size_ > 0) {
         encoder_->setBytes(push_buf_, push_size_, 0);
+    }
+    // Acceleration structures.  Slang puts [[vk::binding(N, 0)]]
+    // RaytracingAccelerationStructure at Metal accel-struct slot N.
+    for (std::uint32_t i = 0; i < std::size(bound_accel_); ++i) {
+        if (!bound_accel_[i]) continue;
+        auto* as = device_->LookupAccelStruct(bound_accel_[i]);
+        if (as != nullptr) {
+            encoder_->setAccelerationStructure(as, i);
+            // Mark dependency so the GPU sees the AS as in use.
+            encoder_->useResource(as, MTL::ResourceUsageRead);
+        }
     }
 
     // dispatchThreads handles the remainder; pso threadExecutionWidth tells
@@ -208,6 +225,7 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
     build_pso("clear",     shader_Clear_metal_data);
     build_pso("scene",     shader_Scene_metal_data);
     build_pso("pathtrace", shader_PathTrace_metal_data);
+    build_pso("mesh",      shader_MeshTrace_metal_data);
 
     cmd_ = std::make_unique<MetalCommandBuffer>(this);
 }
@@ -219,9 +237,11 @@ MetalDevice::~MetalDevice() {
         for (auto& [_, p] : pipelines_) if (p) p->release();
         for (auto& [_, t] : textures_)  if (t) t->release();
         for (auto& [_, b] : buffers_)   if (b) b->release();
+        for (auto& [_, a] : accels_)    if (a) a->release();
         pipelines_.clear();
         textures_.clear();
         buffers_.clear();
+        accels_.clear();
     }
     if (current_drawable_) { current_drawable_->release(); current_drawable_ = nullptr; }
     if (layer_)            { layer_->release();            layer_ = nullptr; }
@@ -302,6 +322,140 @@ void MetalDevice::DestroyPipeline(PipelineHandle h) {
         if (it->second) it->second->release();
         pipelines_.erase(it);
     }
+}
+
+// ---- Acceleration structures ---------------------------------------------
+
+AccelStructHandle MetalDevice::CreateBLAS(const BLASDesc& d) {
+    if (device_ == nullptr || d.vertex_count == 0 || d.index_count == 0) return {0};
+    pt::mem::TagScope scope(pt::MemTag::GpuBuffers);
+    auto* pool = NS::AutoreleasePool::alloc()->init();
+
+    std::size_t vbytes = sizeof(float) * 3 * d.vertex_count;
+    std::size_t ibytes = sizeof(std::uint32_t) * d.index_count;
+    auto* vbuf = device_->newBuffer(d.vertex_positions, vbytes, MTL::ResourceStorageModeShared);
+    auto* ibuf = device_->newBuffer(d.indices,          ibytes, MTL::ResourceStorageModeShared);
+
+    auto* geom = MTL::AccelerationStructureTriangleGeometryDescriptor::descriptor();
+    geom->setVertexBuffer(vbuf);
+    geom->setVertexBufferOffset(0);
+    geom->setVertexStride(sizeof(float) * 3);
+    geom->setIndexBuffer(ibuf);
+    geom->setIndexBufferOffset(0);
+    geom->setIndexType(MTL::IndexTypeUInt32);
+    geom->setTriangleCount(d.index_count / 3);
+
+    const NS::Object* descs[1] = { geom };
+    NS::Array* geoms = NS::Array::array(descs, 1);
+    auto* desc = MTL::PrimitiveAccelerationStructureDescriptor::descriptor();
+    desc->setGeometryDescriptors(geoms);
+
+    auto sizes = device_->accelerationStructureSizes(desc);
+    auto* as = device_->newAccelerationStructure(sizes.accelerationStructureSize);
+    auto* scratch = device_->newBuffer(sizes.buildScratchBufferSize,
+                                        MTL::ResourceStorageModePrivate);
+
+    auto* cb = queue_->commandBuffer();
+    auto* enc = cb->accelerationStructureCommandEncoder();
+    enc->buildAccelerationStructure(as, desc, scratch, 0);
+    enc->endEncoding();
+    cb->commit();
+    cb->waitUntilCompleted();
+
+    vbuf->release();
+    ibuf->release();
+    scratch->release();
+    pool->release();
+
+    if (as == nullptr) return {0};
+    std::lock_guard lock(resource_mutex_);
+    auto id = next_id_++;
+    accels_[id] = as;
+    return AccelStructHandle{id};
+}
+
+AccelStructHandle MetalDevice::CreateTLAS(const TLASDesc& d) {
+    if (device_ == nullptr || d.instances.empty()) return {0};
+    pt::mem::TagScope scope(pt::MemTag::GpuBuffers);
+    auto* pool = NS::AutoreleasePool::alloc()->init();
+
+    std::vector<MTL::AccelerationStructure*> blas_array;
+    blas_array.reserve(d.instances.size());
+
+    struct InstDesc {
+        MTL::PackedFloat4x3 transform;
+        MTL::AccelerationStructureInstanceOptions options;
+        std::uint32_t mask;
+        std::uint32_t intersection_function_table_offset;
+        std::uint32_t accel_struct_index;
+    };
+    std::vector<InstDesc> instance_buf;
+    instance_buf.reserve(d.instances.size());
+
+    for (std::uint32_t i = 0; i < d.instances.size(); ++i) {
+        auto* as = LookupAccelStruct(d.instances[i].blas);
+        if (as == nullptr) continue;
+        blas_array.push_back(as);
+        InstDesc id{};
+        std::memcpy(&id.transform, d.instances[i].transform, sizeof(float) * 12);
+        id.options = MTL::AccelerationStructureInstanceOptionOpaque;
+        id.mask    = d.instances[i].mask;
+        id.intersection_function_table_offset = 0;
+        id.accel_struct_index                  = static_cast<std::uint32_t>(blas_array.size() - 1);
+        instance_buf.push_back(id);
+    }
+    if (instance_buf.empty()) { pool->release(); return {0}; }
+
+    auto* ibuf = device_->newBuffer(instance_buf.data(),
+                                    instance_buf.size() * sizeof(InstDesc),
+                                    MTL::ResourceStorageModeShared);
+
+    NS::Array* nsBlasArr = NS::Array::array(
+        reinterpret_cast<const NS::Object* const*>(blas_array.data()),
+        blas_array.size());
+
+    auto* desc = MTL::InstanceAccelerationStructureDescriptor::descriptor();
+    desc->setInstanceCount(static_cast<NS::UInteger>(instance_buf.size()));
+    desc->setInstanceDescriptorBuffer(ibuf);
+    desc->setInstanceDescriptorStride(sizeof(InstDesc));
+    desc->setInstancedAccelerationStructures(nsBlasArr);
+
+    auto sizes = device_->accelerationStructureSizes(desc);
+    auto* tlas = device_->newAccelerationStructure(sizes.accelerationStructureSize);
+    auto* scratch = device_->newBuffer(sizes.buildScratchBufferSize,
+                                        MTL::ResourceStorageModePrivate);
+
+    auto* cb = queue_->commandBuffer();
+    auto* enc = cb->accelerationStructureCommandEncoder();
+    for (auto* b : blas_array) enc->useResource(b, MTL::ResourceUsageRead);
+    enc->buildAccelerationStructure(tlas, desc, scratch, 0);
+    enc->endEncoding();
+    cb->commit();
+    cb->waitUntilCompleted();
+
+    ibuf->release();
+    scratch->release();
+    pool->release();
+
+    if (tlas == nullptr) return {0};
+    std::lock_guard lock(resource_mutex_);
+    auto id = next_id_++;
+    accels_[id] = tlas;
+    return AccelStructHandle{id};
+}
+
+void MetalDevice::DestroyAccelStruct(AccelStructHandle h) {
+    std::lock_guard lock(resource_mutex_);
+    auto it = accels_.find(h.id);
+    if (it == accels_.end()) return;
+    if (it->second) it->second->release();
+    accels_.erase(it);
+}
+
+MTL::AccelerationStructure* MetalDevice::LookupAccelStruct(AccelStructHandle h) {
+    std::lock_guard lock(resource_mutex_);
+    auto it = accels_.find(h.id);
+    return (it == accels_.end()) ? nullptr : it->second;
 }
 
 // ---- Frame ---------------------------------------------------------------

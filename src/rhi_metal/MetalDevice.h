@@ -22,6 +22,7 @@ class ComputePipelineState;
 class Library;
 class Texture;
 class Buffer;
+class AccelerationStructure;
 }
 namespace CA {
 class MetalLayer;
@@ -42,7 +43,7 @@ public:
     void BindComputePipeline(PipelineHandle p) override;
     void BindBuffer(std::uint32_t slot, BufferHandle b, std::size_t off) override;
     void BindStorageTexture(std::uint32_t slot, TextureHandle t) override;
-    void BindAccelStruct(std::uint32_t, AccelStructHandle) override {}
+    void BindAccelStruct(std::uint32_t slot, AccelStructHandle a) override;
     void PushConstants(const void* data, std::size_t size) override;
     void Dispatch(std::uint32_t gx, std::uint32_t gy, std::uint32_t gz) override;
     void CopyBufferToTexture(BufferHandle, TextureHandle) override {}
@@ -63,6 +64,7 @@ private:
     TextureHandle              bound_tex_[8] {};
     BufferHandle               bound_buf_[8] {};
     std::size_t                bound_buf_off_[8] {};
+    AccelStructHandle          bound_accel_[4] {};
 
     std::uint8_t  push_buf_[128] {};
     std::size_t   push_size_ = 0;
@@ -77,13 +79,13 @@ public:
     BufferHandle      CreateBuffer(const BufferDesc&) override;
     TextureHandle     CreateTexture(const TextureDesc&) override;
     PipelineHandle    CreateComputePipeline(const ComputePipelineDesc&) override;
-    AccelStructHandle CreateBLAS(const BLASDesc&) override { return {0}; }
-    AccelStructHandle CreateTLAS(const TLASDesc&) override { return {0}; }
+    AccelStructHandle CreateBLAS(const BLASDesc&) override;
+    AccelStructHandle CreateTLAS(const TLASDesc&) override;
 
     void DestroyBuffer(BufferHandle h) override;
     void DestroyTexture(TextureHandle h) override;
     void DestroyPipeline(PipelineHandle h) override;
-    void DestroyAccelStruct(AccelStructHandle) override {}
+    void DestroyAccelStruct(AccelStructHandle h) override;
 
     void WriteBuffer(BufferHandle, const void*, std::size_t,
                      std::size_t) override {}
@@ -106,6 +108,7 @@ public:
     MTL::ComputePipelineState* LookupPipeline(PipelineHandle h);
     MTL::Texture*              LookupTexture(TextureHandle h);
     MTL::Buffer*               LookupBuffer(BufferHandle h);
+    MTL::AccelerationStructure* LookupAccelStruct(AccelStructHandle h);
 
     static constexpr std::uint64_t kSwapchainTextureId = 1;
 
@@ -124,9 +127,10 @@ private:
 
     std::mutex                                         resource_mutex_;
     std::uint64_t                                      next_id_ = kSwapchainTextureId + 1;
-    std::unordered_map<std::uint64_t, MTL::ComputePipelineState*> pipelines_;
-    std::unordered_map<std::uint64_t, MTL::Texture*>             textures_;
-    std::unordered_map<std::uint64_t, MTL::Buffer*>              buffers_;
+    std::unordered_map<std::uint64_t, MTL::ComputePipelineState*>  pipelines_;
+    std::unordered_map<std::uint64_t, MTL::Texture*>               textures_;
+    std::unordered_map<std::uint64_t, MTL::Buffer*>                buffers_;
+    std::unordered_map<std::uint64_t, MTL::AccelerationStructure*> accels_;
     // Built-in pipelines indexed by Slang kernel name.  P3+ shaders are
     // pre-compiled at device construction; CreateComputePipeline looks up
     // by name.

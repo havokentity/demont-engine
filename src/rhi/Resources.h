@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Handles.h"
 #include "Types.h"
 
 #include <cstddef>
@@ -32,18 +33,33 @@ struct ComputePipelineDesc {
     std::string_view debug_name;
 };
 
-// Acceleration-structure descriptors land in P8+.  Defined now so the RHI
-// interface compiles at full shape.
+// Acceleration-structure descriptors.
+//
+// BLAS: a single triangle geometry built from CPU-provided arrays. The
+// backend uploads them into device memory itself (so this struct holds
+// raw pointers + counts rather than RHI buffer handles -- meshes don't
+// need to be CPU-readable after the build).
 struct BLASDesc {
-    BufferHandle vertex_buffer;
-    std::uint32_t vertex_stride = 0;
-    std::uint32_t vertex_count  = 0;
-    BufferHandle index_buffer;
-    std::uint32_t index_count   = 0;
+    const float* vertex_positions = nullptr;  // tightly packed float3 per vertex
+    std::uint32_t vertex_count    = 0;
+    const std::uint32_t* indices  = nullptr;  // 3 per triangle
+    std::uint32_t index_count     = 0;
+    std::string_view debug_name;
+};
+
+// One TLAS instance: a 4x3 row-major transform + which BLAS to instance.
+// instance_id is delivered to the shader as InstanceCustomIndex / its
+// equivalent so the shader can look up materials.
+struct TLASInstance {
+    AccelStructHandle blas;
+    float             transform[12] {1,0,0,0, 0,1,0,0, 0,0,1,0};
+    std::uint32_t     instance_id   = 0;
+    std::uint32_t     mask          = 0xFF;
 };
 
 struct TLASDesc {
-    std::span<const AccelStructHandle> blas_instances;
+    std::span<const TLASInstance> instances;
+    std::string_view debug_name;
 };
 
 struct BarrierDesc {
