@@ -41,7 +41,7 @@ namespace cvar {
             "Open the web console in the default browser at startup",     CVAR_ARCHIVE);
     PT_CVAR(app_overlay_enabled, "1",
             "Enable the in-window native console overlay (backtick toggles)", CVAR_ARCHIVE);
-    PT_CVAR(r_backend,         "software", "One of none|software|metal|vulkan",CVAR_ARCHIVE);
+    PT_CVAR(r_backend,         "metal",    "One of none|software|metal|vulkan",CVAR_ARCHIVE);
     PT_CVAR(r_clear_color,     "0.18 0.05 0.28", "Background clear colour (R G B)", 0);
     PT_CVAR(r_mode,            "pathtrace",
             "What to render: clear|scene|pathtrace",
@@ -350,6 +350,20 @@ void Engine::RenderFrame() {
     std::uint64_t pipeline = clear_pipeline_id_;
     if      (mode == "pathtrace" && pathtrace_pipeline_id_ != 0) pipeline = pathtrace_pipeline_id_;
     else if (mode == "scene"     && scene_pipeline_id_     != 0) pipeline = scene_pipeline_id_;
+    else if (mode != "clear") {
+        // Mode requires a pipeline this backend doesn't have (most often:
+        // software backend can't run scene/pathtrace yet -- they live on
+        // Metal).  Warn once so the user knows what they're seeing.
+        static bool warned_this_mode = false;
+        static std::string last_warned_mode;
+        if (!warned_this_mode || last_warned_mode != mode) {
+            LOG_WARN("r_mode '{}' isn't available on backend '{}' -- "
+                     "falling back to clear. Try `r_backend metal`.",
+                     mode, pt::rhi::BackendName(current_backend_));
+            warned_this_mode = true;
+            last_warned_mode = mode;
+        }
+    }
     if (pipeline == 0) return;
 
     auto fc = device_->BeginFrame();
