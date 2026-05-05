@@ -149,8 +149,13 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
     self.historyPos = 0;
     self.allNames   = [NSMutableArray array];
 
+    // Two-layer backdrop. NSVisualEffectView gives the blurred-edge
+    // vibrancy; a dark tint sub-layer on TOP of it guarantees text
+    // contrast even when the renderer behind is mid-tone. Without the
+    // tint, light cyan/white text washed out against the gray scene
+    // background visible through the vibrancy.
     NSVisualEffectView* bg = [[NSVisualEffectView alloc] initWithFrame:self.bounds];
-    bg.material = NSVisualEffectMaterialHUDWindow;
+    bg.material = NSVisualEffectMaterialPopover;     // more opaque than HUDWindow
     bg.blendingMode = NSVisualEffectBlendingModeBehindWindow;
     bg.state = NSVisualEffectStateActive;
     bg.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
@@ -158,9 +163,28 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
     bg.layer.cornerRadius = 8.0;
     bg.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
     bg.layer.borderWidth = 1.0;
-    bg.layer.borderColor = [NSColor colorWithCalibratedRed:0.0 green:0.94 blue:1.0 alpha:0.35].CGColor;
+    bg.layer.borderColor = [NSColor colorWithCalibratedRed:0.0 green:0.94 blue:1.0 alpha:0.45].CGColor;
     [self addSubview:bg];
     self.backdrop = bg;
+
+    // Dark tint sub-layer on top of the vibrancy so text always has
+    // adequate contrast. Fades out slightly at the bottom so the input
+    // row sits closer to the rendered scene below.
+    NSView* tint = [[NSView alloc] initWithFrame:bg.bounds];
+    tint.wantsLayer = YES;
+    tint.layer.cornerRadius = 8.0;
+    tint.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
+    CAGradientLayer* gradient = [CAGradientLayer layer];
+    gradient.frame = tint.bounds;
+    gradient.colors = @[
+        (id)[NSColor colorWithCalibratedRed:0.024 green:0.031 blue:0.051 alpha:0.86].CGColor,
+        (id)[NSColor colorWithCalibratedRed:0.024 green:0.031 blue:0.051 alpha:0.78].CGColor,
+    ];
+    gradient.startPoint = CGPointMake(0.5, 1.0);
+    gradient.endPoint   = CGPointMake(0.5, 0.0);
+    tint.layer = gradient;
+    tint.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [bg addSubview:tint];
 
     NSScrollView* scroll = [[NSScrollView alloc]
         initWithFrame:NSMakeRect(0, 36, frame.size.width, frame.size.height - 36)];
@@ -245,9 +269,14 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
 
 - (void)appendLine:(NSString*)line level:(NSString*)level {
     NSString* prefix = [level isEqualToString:@"input"] ? @"> " : @"";
+    NSShadow* shadow = [[NSShadow alloc] init];
+    shadow.shadowColor = [NSColor colorWithCalibratedWhite:0.0 alpha:0.85];
+    shadow.shadowOffset = NSMakeSize(0, -1);
+    shadow.shadowBlurRadius = 2.5;
     NSDictionary* attrs = @{
         NSFontAttributeName: [NSFont monospacedSystemFontOfSize:12 weight:NSFontWeightRegular],
         NSForegroundColorAttributeName: [self colorForLevel:level],
+        NSShadowAttributeName: shadow,
     };
     NSString* withNewline = [NSString stringWithFormat:@"%@%@\n", prefix, line];
     NSAttributedString* a = [[NSAttributedString alloc]
