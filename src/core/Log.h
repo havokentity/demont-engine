@@ -8,6 +8,12 @@ enum class Level { Info, Warn, Error };
 
 void Emit(Level level, fmt::string_view fmt_str, fmt::format_args args);
 
+// A sink receives every log line in addition to stderr.  Used by the
+// console server to push log events to subscribed WebSocket clients.
+using Sink = void(*)(Level, const std::string&);
+void AddSink(Sink sink);
+void RemoveAllSinks();
+
 template <typename... Args>
 inline void Info(fmt::format_string<Args...> f, Args&&... args) {
     Emit(Level::Info, f, fmt::make_format_args(args...));

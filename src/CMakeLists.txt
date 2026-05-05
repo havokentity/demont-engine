@@ -1,3 +1,5 @@
 add_subdirectory(core)
-# RHI / renderer / console / engine dirs come online in later phases.
+add_subdirectory(console)
+add_subdirectory(engine)
 add_subdirectory(app)
+# RHI / renderer dirs come online in later phases.

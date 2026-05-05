@@ -1,0 +1,83 @@
+:root {
+  --bg: #0e0d0c;
+  --bg-elev: #15130f;
+  --fg: #e8e3d6;
+  --fg-muted: #8a8478;
+  --fg-dim: #5a5650;
+  --border: #2a2722;
+  --accent: #e89968;
+  --warn:   #d6c060;
+  --error:  #d97757;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  display: flex; flex-direction: column;
+}
+.bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 18px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.brand { font-style: italic; color: var(--fg); font-size: 14px; }
+.brand em { color: var(--accent); }
+.brand .dim { color: var(--fg-muted); }
+.status { color: var(--fg-muted); }
+.status.ok    { color: var(--accent); }
+.status.bad   { color: var(--error); }
+.layout {
+  flex: 1; display: grid;
+  grid-template-columns: 1fr 320px;
+  min-height: 0;
+}
+.panel {
+  display: flex; flex-direction: column; min-height: 0;
+  border-right: 1px solid var(--border);
+}
+.panel:last-child { border-right: none; }
+.panel-head {
+  padding: 6px 14px;
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.18em;
+  color: var(--fg-dim);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elev);
+}
+.output {
+  flex: 1; overflow-y: auto;
+  padding: 10px 14px;
+  white-space: pre-wrap; word-break: break-word;
+}
+.output .you   { color: var(--accent); }
+.output .out   { color: var(--fg); }
+.output .err   { color: var(--error); }
+.output .log-info  { color: var(--fg-muted); }
+.output .log-warn  { color: var(--warn); }
+.output .log-error { color: var(--error); }
+.output .ts        { color: var(--fg-dim); margin-right: 6px; }
+#input-form {
+  display: flex; align-items: center;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-elev);
+}
+.prompt { color: var(--accent); margin-right: 8px; }
+#input {
+  flex: 1; background: transparent; border: none; outline: none;
+  color: var(--fg); font: inherit;
+}
+.kv-list { padding: 8px 14px; overflow-y: auto; flex: 1; }
+.kv {
+  display: flex; align-items: baseline;
+  border-bottom: 1px dotted var(--border);
+  padding: 4px 0; font-size: 12px;
+}
+.kv .k { color: var(--accent); flex: 1; min-width: 0;
+         overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kv .v { color: var(--fg); margin-left: 8px;
+         overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 50%; }

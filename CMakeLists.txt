@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.27)
 
+# Several FetchContent deps (enkiTS, civetweb) ship CMakeLists pinned to
+# pre-3.5 minimums that CMake 4.x rejects. This forces a sane floor for
+# them without us touching upstream files.
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
+
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
     message(FATAL_ERROR
         "Configure out of source. Use a preset, e.g. `cmake --preset mac-debug`.")
@@ -28,6 +33,7 @@ option(PT_ENABLE_SANITIZERS     "Enable -fsanitize=address,undefined in Debug" O
 
 # --- Compiler/warning helper -----------------------------------------------
 include(cmake/CompilerWarnings.cmake)
+include(cmake/EmbedResource.cmake)
 
 # --- Third party (FetchContent) --------------------------------------------
 include(cmake/Dependencies.cmake)

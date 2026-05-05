@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PathTracer Console</title>
+<link rel="stylesheet" href="/console.css">
+</head>
+<body>
+<header class="bar">
+  <div class="brand"><em>PathTracer</em> &nbsp;<span class="dim">console</span></div>
+  <div class="status" id="status">connecting&hellip;</div>
+</header>
+<main class="layout">
+  <section class="panel" id="output-panel">
+    <div class="panel-head">output</div>
+    <div class="output" id="output"></div>
+    <form id="input-form" autocomplete="off">
+      <span class="prompt">&gt;</span>
+      <input id="input" type="text" placeholder='try "sys_info" or "mem_report"' spellcheck="false" autofocus>
+    </form>
+  </section>
+  <aside class="panel" id="side-panel">
+    <div class="panel-head">cvars</div>
+    <div id="cvars" class="kv-list"></div>
+  </aside>
+</main>
+<script src="/console.js"></script>
+</body>
+</html>
