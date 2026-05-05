@@ -196,12 +196,18 @@
     exec(line);
   });
 
+  // Capture Tab at the document level so the browser never gets a chance
+  // to move focus to the address bar -- preventDefault on the input alone
+  // is unreliable because focus drifts whenever the user clicks the cvars
+  // panel or the output area.
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Tab') return;
+    e.preventDefault();
+    if (document.activeElement !== input) input.focus();
+    handleTab();
+  });
+
   input.addEventListener('keydown', (e) => {
-    if (e.key === 'Tab') {
-      e.preventDefault();
-      handleTab();
-      return;
-    }
     if (e.key !== 'Tab') lastTabState = null;
     if (e.key === 'ArrowUp') {
       if (histPos > 0) { histPos--; input.value = history[histPos] || ''; }
@@ -213,6 +219,15 @@
       }
       e.preventDefault();
     }
+  });
+
+  // Clicking anywhere in the console returns focus to the input so the
+  // next keystroke (and the next Tab) lands where the user expects.
+  document.addEventListener('mousedown', (e) => {
+    const t = e.target;
+    if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' ||
+        t.tagName === 'BUTTON' || t.tagName === 'A') return;
+    setTimeout(() => input.focus(), 0);
   });
 
   // Refresh names occasionally so newly-registered cvars show up.
