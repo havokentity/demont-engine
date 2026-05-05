@@ -101,7 +101,7 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
     bg.layer.cornerRadius = 8.0;
     bg.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
     bg.layer.borderWidth = 1.0;
-    bg.layer.borderColor = [NSColor colorWithWhite:0.2 alpha:0.5].CGColor;
+    bg.layer.borderColor = [NSColor colorWithCalibratedRed:0.0 green:0.94 blue:1.0 alpha:0.35].CGColor;
     [self addSubview:bg];
     self.backdrop = bg;
 
@@ -134,15 +134,16 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
     NSTextField* prompt = [NSTextField labelWithString:@">"];
     prompt.frame = NSMakeRect(14, 8, 14, 22);
     prompt.font = [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightSemibold];
-    prompt.textColor = [NSColor colorWithCalibratedRed:0.91 green:0.60 blue:0.41 alpha:1.0];
+    // Electric cyan to match the web console.
+    prompt.textColor = [NSColor colorWithCalibratedRed:0.0 green:0.94 blue:1.0 alpha:1.0];
     prompt.bezeled = NO;
     prompt.drawsBackground = NO;
     [self addSubview:prompt];
     self.promptLabel = prompt;
 
-    NSTextField* status = [NSTextField labelWithString:@"DeMonT PathTracer · console"];
-    status.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
-    status.textColor = [NSColor colorWithWhite:0.55 alpha:1.0];
+    NSTextField* status = [NSTextField labelWithString:@"DEMONT · PATHTRACER · CONSOLE"];
+    status.font = [NSFont monospacedSystemFontOfSize:9 weight:NSFontWeightSemibold];
+    status.textColor = [NSColor colorWithCalibratedRed:0.0 green:0.94 blue:1.0 alpha:0.65];
     status.frame = NSMakeRect(frame.size.width - 220, frame.size.height - 22, 200, 16);
     status.alignment = NSTextAlignmentRight;
     status.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
@@ -171,11 +172,12 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
 }
 
 - (NSColor*)colorForLevel:(NSString*)level {
-    if ([level isEqualToString:@"warn"])  return [NSColor colorWithCalibratedRed:0.85 green:0.75 blue:0.42 alpha:1.0];
-    if ([level isEqualToString:@"error"]) return [NSColor colorWithCalibratedRed:0.86 green:0.42 blue:0.34 alpha:1.0];
-    if ([level isEqualToString:@"input"]) return [NSColor colorWithCalibratedRed:0.91 green:0.60 blue:0.41 alpha:1.0];
-    if ([level isEqualToString:@"out"])   return [NSColor colorWithWhite:0.92 alpha:1.0];
-    return [NSColor colorWithWhite:0.65 alpha:1.0];
+    // Match the web console palette: cyan, magenta, amber, hot red.
+    if ([level isEqualToString:@"warn"])  return [NSColor colorWithCalibratedRed:1.00 green:0.78 blue:0.23 alpha:1.0];
+    if ([level isEqualToString:@"error"]) return [NSColor colorWithCalibratedRed:1.00 green:0.29 blue:0.37 alpha:1.0];
+    if ([level isEqualToString:@"input"]) return [NSColor colorWithCalibratedRed:1.00 green:0.23 blue:0.55 alpha:1.0];
+    if ([level isEqualToString:@"out"])   return [NSColor colorWithWhite:0.95 alpha:1.0];
+    return [NSColor colorWithWhite:0.52 alpha:1.0];
 }
 
 - (void)appendLine:(NSString*)line level:(NSString*)level {
