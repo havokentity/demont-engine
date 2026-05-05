@@ -1,0 +1,1053 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Modern C++ Cheatsheet · Path Tracer Project</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;0,9..144,800;1,9..144,400;1,9..144,600&family=Geist:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0e0d0c;
+  --bg-elev: #15130f;
+  --fg: #e8e3d6;
+  --fg-muted: #8a8478;
+  --fg-dim: #5a5650;
+  --border: #2a2722;
+  --border-strong: #3a3630;
+  --accent: #e89968;
+  --accent-dim: #a06d44;
+  --accent-glow: rgba(232, 153, 104, 0.15);
+  --code-fg: #d4b888;
+  --hard: #d97757;
+  --soft: #b8a868;
+  --good: #88a878;
+  --bad: #d97757;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: 'Geist', system-ui, sans-serif;
+  font-size: 16px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+  opacity: 0.04;
+  background-image: radial-gradient(circle at 1px 1px, var(--fg) 1px, transparent 0);
+  background-size: 3px 3px;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  max-width: 1400px;
+  margin: 0 auto;
+  position: relative;
+  z-index: 2;
+}
+
+.sidebar {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  border-right: 1px solid var(--border);
+  padding: 3rem 2rem;
+  overflow-y: auto;
+  font-size: 0.875rem;
+}
+
+.sidebar-brand { font-family: 'Fraunces', serif; font-style: italic; font-size: 1.5rem; font-variation-settings: "opsz" 60; margin-bottom: 0.25rem; }
+.sidebar-tagline { font-family: 'JetBrains Mono', monospace; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.15em; color: var(--fg-muted); margin-bottom: 2.5rem; }
+.doc-nav { margin-bottom: 2.5rem; padding-bottom: 2rem; border-bottom: 1px solid var(--border); }
+.doc-nav-label, .toc-label { font-family: 'JetBrains Mono', monospace; font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.2em; color: var(--fg-dim); margin-bottom: 0.75rem; }
+.toc-label { margin-bottom: 1rem; }
+.doc-nav a { display: block; font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--fg-muted); text-decoration: none; padding: 0.4rem 0; border-left: 2px solid transparent; padding-left: 0.75rem; margin-left: -0.75rem; transition: all 0.15s ease; }
+.doc-nav a:hover { color: var(--accent); border-left-color: var(--accent); }
+.doc-nav a.current { color: var(--fg); border-left-color: var(--accent); }
+.doc-nav a .num { color: var(--fg-dim); margin-right: 0.5rem; }
+.toc { list-style: none; }
+.toc li { margin-bottom: 0.4rem; }
+.toc a { color: var(--fg-muted); text-decoration: none; font-size: 0.8rem; display: block; padding: 0.15rem 0; transition: color 0.15s ease; }
+.toc a:hover { color: var(--accent); }
+.toc .num { font-family: 'JetBrains Mono', monospace; font-size: 0.7rem; color: var(--fg-dim); margin-right: 0.6rem; display: inline-block; min-width: 1.2rem; }
+
+main { padding: 4rem 5rem 6rem; max-width: 920px; }
+
+.hero { margin-bottom: 5rem; padding-bottom: 3rem; border-bottom: 1px solid var(--border); }
+.hero-meta { display: flex; gap: 1.5rem; font-family: 'JetBrains Mono', monospace; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.18em; color: var(--fg-muted); margin-bottom: 1.5rem; }
+.hero-meta span::before { content: "▸ "; color: var(--accent); }
+.hero h1 { font-family: 'Fraunces', serif; font-weight: 400; font-size: clamp(3rem, 7vw, 5.5rem); line-height: 0.95; letter-spacing: -0.02em; font-variation-settings: "opsz" 144; margin-bottom: 1.5rem; }
+.hero h1 em { font-style: italic; color: var(--accent); }
+.hero-subtitle { font-family: 'Fraunces', serif; font-style: italic; font-size: 1.25rem; color: var(--fg-muted); font-variation-settings: "opsz" 36; max-width: 640px; line-height: 1.5; }
+
+section { margin-bottom: 4.5rem; scroll-margin-top: 2rem; }
+.section-marker { display: flex; align-items: baseline; gap: 1.25rem; margin-bottom: 1.5rem; }
+.section-num { font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--accent); letter-spacing: 0.1em; }
+.section-rule { flex: 1; height: 1px; background: var(--border); }
+
+h2 { font-family: 'Fraunces', serif; font-weight: 400; font-size: 2.25rem; line-height: 1.15; letter-spacing: -0.015em; font-variation-settings: "opsz" 96; margin-bottom: 1.5rem; }
+h3 { font-family: 'Fraunces', serif; font-weight: 600; font-size: 1.35rem; line-height: 1.3; margin-top: 2.5rem; margin-bottom: 0.85rem; font-variation-settings: "opsz" 36; }
+h4 { font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.12em; color: var(--accent); margin-top: 2rem; margin-bottom: 0.75rem; }
+p { margin-bottom: 1.25rem; max-width: 70ch; }
+p.lead { font-family: 'Fraunces', serif; font-size: 1.2rem; line-height: 1.55; font-variation-settings: "opsz" 36; margin-bottom: 2rem; max-width: 64ch; }
+
+a { color: var(--accent); text-decoration: none; border-bottom: 1px solid var(--accent-dim); transition: all 0.15s ease; }
+a:hover { color: var(--fg); border-bottom-color: var(--fg); }
+strong { color: var(--fg); font-weight: 600; }
+em { font-style: italic; color: var(--fg); }
+ul, ol { margin-bottom: 1.25rem; padding-left: 1.5rem; max-width: 70ch; }
+li { margin-bottom: 0.5rem; }
+ul li::marker { color: var(--accent); }
+ol li::marker { color: var(--fg-muted); font-family: 'JetBrains Mono', monospace; font-size: 0.85em; }
+
+code { font-family: 'JetBrains Mono', monospace; font-size: 0.88em; color: var(--code-fg); background: rgba(232, 153, 104, 0.08); padding: 0.1em 0.4em; border-radius: 2px; }
+pre { font-family: 'JetBrains Mono', monospace; font-size: 0.82rem; line-height: 1.55; background: var(--bg-elev); border: 1px solid var(--border); border-left: 2px solid var(--accent); padding: 1.25rem 1.5rem; overflow-x: auto; margin-bottom: 1.5rem; color: var(--code-fg); }
+pre code { background: none; padding: 0; color: inherit; font-size: inherit; }
+
+.principle { font-family: 'Fraunces', serif; font-style: italic; font-size: 1.4rem; line-height: 1.45; font-variation-settings: "opsz" 60; border-left: 2px solid var(--accent); padding: 0.5rem 0 0.5rem 1.5rem; margin: 2rem 0; max-width: 60ch; }
+.principle::before { content: "Note "; display: block; font-family: 'JetBrains Mono', monospace; font-style: normal; font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.2em; color: var(--accent); margin-bottom: 0.5rem; }
+
+table { width: 100%; border-collapse: collapse; margin-bottom: 1.5rem; font-size: 0.9rem; }
+th, td { text-align: left; padding: 0.75rem 1rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { font-family: 'JetBrains Mono', monospace; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.12em; color: var(--fg-muted); font-weight: 500; border-bottom: 1px solid var(--border-strong); }
+td code { font-size: 0.82em; }
+
+.callout { border: 1px solid var(--border); border-left: 2px solid var(--accent); background: var(--bg-elev); padding: 1.25rem 1.5rem; margin: 1.5rem 0; }
+.callout-label { font-family: 'JetBrains Mono', monospace; font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.2em; color: var(--accent); margin-bottom: 0.5rem; }
+.callout p:last-child { margin-bottom: 0; }
+.callout.warning { border-left-color: var(--hard); }
+.callout.warning .callout-label { color: var(--hard); }
+
+/* Old vs new pair */
+.compare {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  margin: 1rem 0 1.5rem;
+}
+
+.compare-block {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  padding: 1rem 1.25rem;
+}
+
+.compare-block.old { border-left: 2px solid var(--bad); }
+.compare-block.new { border-left: 2px solid var(--good); }
+
+.compare-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  margin-bottom: 0.5rem;
+}
+
+.compare-block.old .compare-label { color: var(--bad); }
+.compare-block.new .compare-label { color: var(--good); }
+
+.compare-block pre {
+  background: transparent;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font-size: 0.78rem;
+  border-left: none;
+}
+
+/* Feature card */
+.feature {
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  padding: 1.5rem 1.75rem;
+  margin-bottom: 2rem;
+  scroll-margin-top: 2rem;
+}
+
+.feature-header {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  margin-bottom: 0.5rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.feature-num {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  letter-spacing: 0.15em;
+  color: var(--accent);
+}
+
+.feature-name {
+  font-family: 'Fraunces', serif;
+  font-weight: 500;
+  font-size: 1.4rem;
+  line-height: 1.2;
+  font-variation-settings: "opsz" 60;
+  flex: 1;
+}
+
+.feature-name code {
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 500;
+  font-size: 0.9em;
+  background: transparent;
+  color: var(--accent);
+  padding: 0;
+}
+
+.feature-since {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--fg-dim);
+  border: 1px solid var(--border-strong);
+  padding: 0.15em 0.5em;
+  border-radius: 2px;
+}
+
+.feature h4 { margin-top: 1.25rem; }
+
+.feature pre {
+  margin-bottom: 1rem;
+}
+
+.tldr {
+  font-family: 'Fraunces', serif;
+  font-style: italic;
+  font-size: 1.05rem;
+  color: var(--fg);
+  margin-bottom: 1rem;
+  padding: 0.5rem 0 0.5rem 1.25rem;
+  border-left: 2px solid var(--accent-dim);
+  font-variation-settings: "opsz" 36;
+}
+
+.tldr::before {
+  content: "TL;DR — ";
+  font-style: normal;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  color: var(--accent);
+  margin-right: 0.4em;
+}
+
+.pitfalls {
+  background: rgba(217, 119, 87, 0.06);
+  border-left: 2px solid var(--bad);
+  padding: 0.85rem 1.25rem;
+  margin-top: 1rem;
+}
+
+.pitfalls-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--bad);
+  margin-bottom: 0.4rem;
+}
+
+.pitfalls ul { margin-bottom: 0; padding-left: 1.25rem; }
+.pitfalls li { margin-bottom: 0.3rem; font-size: 0.92rem; }
+.pitfalls li::marker { color: var(--bad); }
+
+.tag-pill {
+  display: inline-block;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  padding: 0.1em 0.45em;
+  border-radius: 2px;
+  border: 1px solid;
+}
+
+.tag-pill.really-new { color: var(--accent); border-color: var(--accent); background: rgba(232, 153, 104, 0.08); }
+.tag-pill.syntax { color: var(--soft); border-color: var(--soft); background: rgba(184, 168, 104, 0.08); }
+.tag-pill.subtle { color: var(--bad); border-color: var(--bad); background: rgba(217, 119, 87, 0.08); }
+
+.footer { margin-top: 6rem; padding-top: 3rem; border-top: 1px solid var(--border); display: flex; justify-content: space-between; font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--fg-muted); }
+.footer a { color: var(--fg-muted); border: none; }
+.footer a:hover { color: var(--accent); }
+
+@media (max-width: 1024px) {
+  .layout { grid-template-columns: 1fr; }
+  .sidebar { position: static; height: auto; border-right: none; border-bottom: 1px solid var(--border); }
+  main { padding: 3rem 2rem; }
+  .compare { grid-template-columns: 1fr; }
+}
+
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border-strong); }
+::-webkit-scrollbar-thumb:hover { background: var(--accent-dim); }
+::selection { background: var(--accent-glow); color: var(--fg); }
+</style>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar">
+  <div class="sidebar-brand">Path Tracer</div>
+  <div class="sidebar-tagline">Project Documentation</div>
+
+  <nav class="doc-nav">
+    <div class="doc-nav-label">Documents</div>
+    <a href="index.html"><span class="num">↑</span>Home</a>
+    <a href="01_architecture_principles.html"><span class="num">01</span>Architecture Principles</a>
+    <a href="02_design.html"><span class="num">02</span>Design</a>
+    <a href="03_implementation_plan.html"><span class="num">03</span>Implementation Plan</a>
+    <a href="04_console_protocol.html"><span class="num">04</span>Console Protocol</a>
+    <a href="05_cpp_cheatsheet.html" class="current"><span class="num">05</span>C++ Cheatsheet</a>
+  </nav>
+
+  <div class="toc-label">In this document</div>
+  <ul class="toc">
+    <li><a href="#preface"><span class="num">§</span>Preface</a></li>
+    <li><a href="#mental-model"><span class="num">1</span>The mental model shift</a></li>
+    <li><a href="#auto"><span class="num">2</span>auto &amp; structured bindings</a></li>
+    <li><a href="#unique"><span class="num">3</span>unique_ptr &amp; RAII</a></li>
+    <li><a href="#move"><span class="num">4</span>Move semantics</a></li>
+    <li><a href="#range-for"><span class="num">5</span>Range-based for</a></li>
+    <li><a href="#lambdas"><span class="num">6</span>Lambdas</a></li>
+    <li><a href="#expected"><span class="num">7</span>std::expected</a></li>
+    <li><a href="#span"><span class="num">8</span>std::span &amp; string_view</a></li>
+    <li><a href="#designated"><span class="num">9</span>Designated init</a></li>
+    <li><a href="#enum-class"><span class="num">10</span>enum class</a></li>
+    <li><a href="#strong-types"><span class="num">11</span>Strong types</a></li>
+    <li><a href="#if-constexpr"><span class="num">12</span>if constexpr</a></li>
+    <li><a href="#fmt"><span class="num">13</span>fmt::print</a></li>
+    <li><a href="#optional"><span class="num">14</span>std::optional</a></li>
+    <li><a href="#concepts-skip"><span class="num">15</span>What we skip</a></li>
+    <li><a href="#minimal-translation"><span class="num">§</span>Minimal translation</a></li>
+  </ul>
+</aside>
+
+<main>
+
+<header class="hero">
+  <div class="hero-meta">
+    <span>v1.0</span>
+    <span>Document 05 / 05</span>
+    <span>Reference</span>
+  </div>
+  <h1>Modern <em>C++</em><br>Cheatsheet</h1>
+  <p class="hero-subtitle">A reference for experienced C/C++ engineers reconnecting with the modern dialect. Covers the 14 features you'll see across this codebase, with examples that focus on what's genuinely new versus what just looks new.</p>
+</header>
+
+<section id="preface">
+  <div class="section-marker"><span class="section-num">§ 00</span><span class="section-rule"></span></div>
+  <h2>Preface — who this is for</h2>
+
+  <p class="lead">If you wrote C++ in the Quake III / Doom 3 era and have been away since, modern C++ looks like a different language. It mostly isn't. The instincts that mattered then — memory ownership, cache behavior, what's actually happening at the assembly level — still matter, and they're still the hard part.</p>
+
+  <p>What changed is mostly syntax sugar (lambdas, range-based for, <code>auto</code>) and one genuinely new idea (move semantics). Everything else is library additions you can adopt as you encounter them.</p>
+
+  <p>This doc walks through the features used across this project, marked by what they actually are:</p>
+
+  <ul>
+    <li><span class="tag-pill really-new">REALLY NEW</span> — actual new ideas, not just syntax. Update your mental model.</li>
+    <li><span class="tag-pill syntax">SYNTAX</span> — same idea you've always done, expressed cleaner.</li>
+    <li><span class="tag-pill subtle">SUBTLE</span> — looks innocent, has a sharp edge worth knowing about.</li>
+  </ul>
+
+  <p>This is a reference, not a tutorial. Skim the section that matches the syntax you just saw in the code; come back when something else looks unfamiliar.</p>
+</section>
+
+<section id="mental-model">
+  <div class="section-marker"><span class="section-num">§ 01</span><span class="section-rule"></span></div>
+  <h2>The mental model shift, in one paragraph</h2>
+
+  <p>The single biggest change between C++03 and modern C++ is <strong>move semantics</strong>. Pre-C++11, every assignment and return was a copy unless you took a pointer or reference. Post-C++11, the language understands "transfer ownership" as a first-class operation, and the standard library uses it everywhere. This is what makes <code>std::vector&lt;Mesh&gt;</code> as a return type efficient, what makes <code>unique_ptr</code> work, and what makes RAII finally <em>nice</em> instead of just correct.</p>
+
+  <p>Everything else — lambdas, <code>auto</code>, range-based for, structured bindings — is convenience that you'll absorb in a week of actual coding. Move semantics is the one piece that needs deliberate attention. We'll cover it in §4.</p>
+
+  <div class="principle">If you only internalize one new thing from modern C++, make it move semantics. The rest is gravy.</div>
+</section>
+
+<div class="feature" id="auto">
+  <div class="feature-header">
+    <span class="feature-num">02</span>
+    <span class="feature-name"><code>auto</code> and structured bindings</span>
+    <span class="feature-since">C++11 / 17 · <span class="tag-pill syntax" style="margin-left: 0.5rem;">SYNTAX</span></span>
+  </div>
+
+  <p class="tldr"><code>auto</code> means "compiler, figure it out." Structured bindings let you destructure into named variables.</p>
+
+  <div class="compare">
+    <div class="compare-block old">
+      <div class="compare-label">Pre-modern</div>
+<pre><code>std::map&lt;std::string, int&gt;::iterator
+    it = scores.find("alice");
+
+for (size_t i = 0;
+     i &lt; pairs.size(); ++i) {
+    int   key   = pairs[i].first;
+    float value = pairs[i].second;
+    use(key, value);
+}</code></pre>
+    </div>
+    <div class="compare-block new">
+      <div class="compare-label">Modern</div>
+<pre><code>auto it = scores.find("alice");
+
+for (auto&amp; [key, value] : pairs) {
+    use(key, value);
+}</code></pre>
+    </div>
+  </div>
+
+  <h4>Rules of thumb</h4>
+  <ul>
+    <li><strong>Use <code>auto</code></strong> when the type is obvious from the right side, or when the type doesn't matter (iterators, lambdas).</li>
+    <li><strong>Spell out the type</strong> when it documents intent or catches errors. <code>float</code> not <code>auto</code> when the right side is <code>1.0</code>.</li>
+    <li><strong><code>auto&amp;</code></strong> for references, <strong><code>const auto&amp;</code></strong> for read-only refs, <strong><code>auto*</code></strong> for pointers (mostly cosmetic but reads better).</li>
+  </ul>
+
+  <div class="pitfalls">
+    <div class="pitfalls-label">Pitfalls</div>
+    <ul>
+      <li><code>auto x = vec[0];</code> <em>copies</em>. Use <code>auto&amp; x = vec[0];</code> if you don't want a copy.</li>
+      <li><code>auto</code> on integer literals gives you <code>int</code>, even where you'd expect <code>size_t</code>. Prefer <code>size_t</code> spelled out for indices.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="feature" id="unique">
+  <div class="feature-header">
+    <span class="feature-num">03</span>
+    <span class="feature-name"><code>std::unique_ptr</code> and RAII</span>
+    <span class="feature-since">C++11 · <span class="tag-pill really-new" style="margin-left: 0.5rem;">REALLY NEW</span></span>
+  </div>
+
+  <p class="tldr">Heap allocation that frees itself when it goes out of scope. The single best feature of modern C++.</p>
+
+  <div class="compare">
+    <div class="compare-block old">
+      <div class="compare-label">Pre-modern</div>
+<pre><code>Renderer* r = new Renderer(device);
+// ... 200 lines later ...
+if (error_path)
+    return;     // leaked
+delete r;</code></pre>
+    </div>
+    <div class="compare-block new">
+      <div class="compare-label">Modern</div>
+<pre><code>auto r = std::make_unique&lt;Renderer&gt;(device);
+// ...
+if (error_path)
+    return;     // r is destroyed cleanly
+// also destroyed at end of scope</code></pre>
+    </div>
+  </div>
+
+  <h4>How it actually works</h4>
+  <p>A <code>unique_ptr&lt;T&gt;</code> is a struct that holds a <code>T*</code>. Its destructor calls <code>delete</code> on that pointer. It's non-copyable (you can't have two of them owning the same thing) but movable (you can transfer ownership). Sizeof is the same as a raw pointer.</p>
+
+  <h4>Passing around</h4>
+  <p>The thing you'll do almost always:</p>
+
+<pre><code>// Take by reference if you don't transfer ownership
+void RenderFrame(Renderer&amp; r);
+
+// Take by unique_ptr-by-value (with std::move at the call site)
+//   if you DO transfer ownership
+void StoreRenderer(std::unique_ptr&lt;Renderer&gt; r);
+
+// Caller:
+auto r = std::make_unique&lt;Renderer&gt;(device);
+RenderFrame(*r);                  // by reference
+StoreRenderer(std::move(r));      // hand off ownership
+// after move, r is empty (nullptr)</code></pre>
+
+  <div class="pitfalls">
+    <div class="pitfalls-label">Pitfalls</div>
+    <ul>
+      <li>Never write <code>new</code> in modern C++ outside of <code>make_unique</code>'s implementation. If you find yourself reaching for <code>new</code>, you've forgotten the rules.</li>
+      <li>Don't pass <code>const unique_ptr&lt;T&gt;&amp;</code> when you mean <code>const T&amp;</code>. The unique_ptr-ness is irrelevant to the callee; pass the underlying reference.</li>
+      <li>Don't <code>std::move</code> a <code>unique_ptr</code> on the way out of a function (<code>return std::move(p);</code>). Just <code>return p;</code> — the compiler does the right thing, and explicit move can defeat NRVO.</li>
+    </ul>
+  </div>
+
+  <h4>The rest of the smart pointer family</h4>
+  <p>Modern C++ has three smart pointers in the standard library, plus <code>weak_ptr</code> as a companion to <code>shared_ptr</code>. They are <em>not interchangeable</em>. This project's policy on each:</p>
+
+  <table>
+    <thead><tr><th>Type</th><th>Policy</th><th>Cost</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>std::unique_ptr&lt;T&gt;</code></td>
+        <td><strong>Default for owned heap allocations.</strong> Use freely.</td>
+        <td>Zero — same size as <code>T*</code>, no atomic ops, no separate allocation.</td>
+      </tr>
+      <tr>
+        <td><code>std::shared_ptr&lt;T&gt;</code></td>
+        <td><strong>Requires justification.</strong> Default is no.</td>
+        <td>Atomic inc/dec on copy/destroy. Separate control block (unless <code>make_shared</code>). Cycle leaks if you're not careful.</td>
+      </tr>
+      <tr>
+        <td><code>std::weak_ptr&lt;T&gt;</code></td>
+        <td><strong>Requires justification.</strong> Existence usually indicates a design problem.</td>
+        <td>Cheap on its own; only exists alongside <code>shared_ptr</code>.</td>
+      </tr>
+      <tr>
+        <td>Raw <code>T*</code></td>
+        <td><strong>Fine for non-owning references.</strong> Modern C++ didn't kill raw pointers; it killed raw <em>owning</em> pointers.</td>
+        <td>Zero.</td>
+      </tr>
+      <tr>
+        <td><code>T&amp;</code> reference</td>
+        <td><strong>Fine when null doesn't make sense.</strong> Function parameters mostly.</td>
+        <td>Zero.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h4>Why <code>shared_ptr</code> is policy-restricted</h4>
+  <p>Three independent reasons, and they compound:</p>
+
+  <ul>
+    <li><strong>Atomic refcount cost.</strong> Every copy of a <code>shared_ptr</code> does an atomic increment. Every destruction does an atomic decrement. Atomics aren't free — they prevent compiler reordering and force memory-barrier-style synchronization. On contended atomics across cores, this gets expensive faster than people expect.</li>
+    <li><strong>Cycles leak silently.</strong> If <code>A</code> shared_ptrs <code>B</code> and <code>B</code> shared_ptrs <code>A</code>, neither's count ever hits zero. You need a <code>weak_ptr</code> to break the cycle. This is a real bug class, not a theoretical one — it's how observer patterns and parent/child graphs leak.</li>
+    <li><strong>It's usually a design smell.</strong> Reaching for <code>shared_ptr</code> as a default often means ownership wasn't thought through. "Eh, multiple things might own this" is the smell. A well-designed system has clear ownership: one place owns each object, others reference it non-owningly. <code>unique_ptr</code> + raw pointers/references express this. <code>shared_ptr</code> obscures it.</li>
+  </ul>
+
+  <p>There are real cases where <code>shared_ptr</code> is right — caches with unpredictable consumer lifetimes, async tasks that need to keep their inputs alive past the originator's scope, certain graph structures with no clear owning root. But those should be deliberate decisions with a comment explaining the choice, not the default.</p>
+
+  <h4>What this project actually uses</h4>
+  <p>Roughly, the distribution you'll see across the codebase:</p>
+
+  <table>
+    <thead><tr><th>Pattern</th><th>Used for</th></tr></thead>
+    <tbody>
+      <tr><td><code>std::unique_ptr&lt;T&gt;</code></td><td><code>Engine</code> owning <code>Device</code>, <code>Renderer</code>, <code>Console</code>, <code>JobSystem</code>. CSG tree nodes. Anything else with a clear single owner.</td></tr>
+      <tr><td>Raw <code>T*</code> (non-owning)</td><td>RHI hands <code>CommandBuffer*</code> back from <code>AcquireCommandBuffer</code> — the device owns it, you borrow.</td></tr>
+      <tr><td><code>T&amp;</code> reference</td><td>Function parameters where null doesn't make sense. <code>RenderFrame(const Camera&amp; cam, ...)</code>.</td></tr>
+      <tr><td>Integer handles</td><td>RHI resources (<code>BufferHandle</code>, <code>TextureHandle</code>). Better than pointers for opaque IDs that cross backend boundaries.</td></tr>
+      <tr><td><code>std::shared_ptr&lt;T&gt;</code></td><td>Likely <strong>zero places</strong>. If one shows up, it'll be deliberate and commented.</td></tr>
+      <tr><td><code>std::weak_ptr&lt;T&gt;</code></td><td>Zero places.</td></tr>
+    </tbody>
+  </table>
+
+  <p>The mental shift from pre-C++11: when you see <code>new Foo</code>, your old instinct was "where's the matching delete." The new instinct is "<strong>that <code>new</code> shouldn't exist</strong>; this should be <code>make_unique&lt;Foo&gt;</code>." References for parameters, raw pointers for non-owning references, smart pointers for ownership, integer handles for opaque resources — and the language stops being a memory management language at all.</p>
+</div>
+
+<div class="feature" id="move">
+  <div class="feature-header">
+    <span class="feature-num">04</span>
+    <span class="feature-name">Move semantics</span>
+    <span class="feature-since">C++11 · <span class="tag-pill really-new" style="margin-left: 0.5rem;">REALLY NEW</span></span>
+  </div>
+
+  <p class="tldr">"I'm done with this object — you can steal its guts." Cheap ownership transfer instead of a deep copy.</p>
+
+  <p>This is the one C++ idea you didn't have in 2003 and need to actually internalize. It's how <code>vector</code> returns are efficient, how <code>unique_ptr</code> hands off, how containers grow without quadratic copying.</p>
+
+<pre><code>std::vector&lt;Mesh&gt; source = LoadMeshes();          // owns its contents
+std::vector&lt;Mesh&gt; dest   = std::move(source);    // ownership transferred
+// no copy happened — just pointer ownership swap inside the vector
+// source is now in a valid-but-unspecified state (typically empty)
+// source's destructor will still run — moving doesn't change lifetime</code></pre>
+
+  <h4>What <code>std::move</code> actually is</h4>
+  <p>It's a <em>cast</em>, not a function that does anything. It says "treat this lvalue as an rvalue" — i.e., "I'm done with this, you can steal from it." The actual stealing happens in the move constructor or move assignment operator of the receiving type.</p>
+
+  <h4>The 90% rule</h4>
+  <ul>
+    <li><strong>Return values by value.</strong> Compiler does the right thing (NRVO + move).</li>
+    <li><strong>Take parameters by const reference</strong> for read-only, <strong>by value</strong> when you'll store a copy.</li>
+    <li><strong>Use <code>std::move</code> explicitly</strong> only when transferring ownership (handing a <code>unique_ptr</code> off, putting a vector into a member variable in a constructor).</li>
+    <li><strong>Don't <code>std::move</code> on return.</strong> <code>return std::move(x);</code> often <em>prevents</em> compiler optimization. Just <code>return x;</code>.</li>
+  </ul>
+
+<pre><code>// Constructor taking a vector and storing it
+class Mesh {
+    std::vector&lt;Vertex&gt; vertices_;
+public:
+    explicit Mesh(std::vector&lt;Vertex&gt; v) : vertices_(std::move(v)) {}
+    // Take by value, move into member.
+    // Caller: Mesh m(LoadVerts());        — efficient, one move
+    // Caller: Mesh m(my_verts);           — one copy + one move (acceptable)
+};</code></pre>
+
+  <div class="pitfalls">
+    <div class="pitfalls-label">Pitfalls</div>
+    <ul>
+      <li><strong>"Moved-from" objects are still alive.</strong> Their destructor runs. They're "valid but unspecified" — usually means empty for STL types.</li>
+      <li><strong>Don't use a moved-from object</strong> except to assign to it or destroy it.</li>
+      <li><code>std::move</code> on a primitive (<code>int</code>, <code>float</code>, raw pointer) does nothing — those types just copy. No harm done, but no benefit either.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="feature" id="range-for">
+  <div class="feature-header">
+    <span class="feature-num">05</span>
+    <span class="feature-name">Range-based <code>for</code></span>
+    <span class="feature-since">C++11 · <span class="tag-pill syntax" style="margin-left: 0.5rem;">SYNTAX</span></span>
+  </div>
+
+  <p class="tldr">Iterate without indices or iterators. The default loop in modern code.</p>
+
+<pre><code>for (auto&amp; mesh : meshes)        { mesh.transform *= 2.0f; }   // mutate
+for (const auto&amp; mesh : meshes)  { Process(mesh); }            // read-only
+for (auto mesh : meshes)         { /* COPIED — usually wrong */ }
+
+// With index when needed (C++20 init):
+for (size_t i = 0; auto&amp; mesh : meshes) {
+    Process(i, mesh);
+    ++i;
+}</code></pre>
+
+  <p>Works on any container with <code>begin()</code>/<code>end()</code>, including C arrays and your own types if you provide them.</p>
+
+  <div class="pitfalls">
+    <div class="pitfalls-label">Pitfalls</div>
+    <ul>
+      <li>The <code>auto mesh</code> form (no <code>&amp;</code>) silently copies every element. For trivial types fine; for anything with a non-trivial copy, costly.</li>
+      <li>Modifying the container inside the loop (push_back, erase) invalidates iterators. Same as always. Take an indexed loop or copy the container if you need that.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="feature" id="lambdas">
+  <div class="feature-header">
+    <span class="feature-num">06</span>
+    <span class="feature-name">Lambdas</span>
+    <span class="feature-since">C++11 · <span class="tag-pill syntax" style="margin-left: 0.5rem;">SYNTAX</span></span>
+  </div>
+
+  <p class="tldr">Anonymous functions you can declare inline. Replaces functor structs and most callback boilerplate.</p>
+
+<pre><code>// Syntax: [capture](args) -&gt; ret { body }
+// Return type usually deduced; specify when needed.
+
+auto square = [](int x) { return x * x; };
+int y = square(5);  // 25
+
+// Capture by value, by reference, or specific things
+int  base = 10;
+auto add_base    = [base](int x)    { return x + base; };       // copies base
+auto inc_base    = [&amp;base](int x)   { base += x; };             // captures ref
+auto with_both   = [&amp;base, mul=2](int x) { return base * mul + x; };
+
+// Use in algorithms
+std::sort(meshes.begin(), meshes.end(),
+    [](const Mesh&amp; a, const Mesh&amp; b) { return a.tri_count &lt; b.tri_count; });</code></pre>
+
+  <h4>Captures</h4>
+  <ul>
+    <li><code>[]</code> — capture nothing</li>
+    <li><code>[x]</code> — capture <code>x</code> by value</li>
+    <li><code>[&amp;x]</code> — capture <code>x</code> by reference</li>
+    <li><code>[=]</code> — capture everything used by value (avoid; explicit is better)</li>
+    <li><code>[&amp;]</code> — capture everything used by reference (acceptable in tight scope)</li>
+    <li><code>[name = expression]</code> — init capture (C++14), useful for moving things in</li>
+  </ul>
+
+  <div class="pitfalls">
+    <div class="pitfalls-label">Pitfalls</div>
+    <ul>
+      <li><strong>Capturing by reference and outliving the captured.</strong> A lambda that captures a stack variable by reference and is stored in a vector that survives the function: dangling reference, undefined behavior.</li>
+      <li>Don't pass lambdas as <code>std::function</code> in hot paths. Type-erasure heap-allocates and prevents inlining. For algorithm callbacks, pass them as templates (<code>std::sort</code> already does this).</li>
+    </ul>
+  </div>
+</div>
+
+<div class="feature" id="expected">
+  <div class="feature-header">
+    <span class="feature-num">07</span>
+    <span class="feature-name"><code>std::expected&lt;T, E&gt;</code></span>
+    <span class="feature-since">C++23 · <span class="tag-pill really-new" style="margin-left: 0.5rem;">REALLY NEW</span></span>
+  </div>
+
+  <p class="tldr">A return type that's either a <code>T</code> or an <code>E</code>. Errors without exceptions.</p>
+
+  <p>This is Rust's <code>Result</code> finally landing in C++. For us, it's the standard error-handling mechanism — exceptions are forbidden (see <a href="01_architecture_principles.html#code-style">principles §8</a>), and bool-out-pointer is ugly.</p>
+
+  <div class="compare">
+    <div class="compare-block old">
+      <div class="compare-label">Pre-modern</div>
+<pre><code>bool LoadMesh(const char* path,
+              Mesh* out_mesh,
+              char* out_err, size_t err_len);
+// caller manages buffers,
+// checks return, juggles strings</code></pre>
+    </div>
+    <div class="compare-block new">
+      <div class="compare-label">Modern</div>
+<pre><code>std::expected&lt;Mesh, std::string&gt;
+LoadMesh(std::string_view path);
+
+auto result = LoadMesh("bunny.glb");
+if (!result) {
+    LOG_ERROR("{}", result.error());
+    return;
+}
+Mesh m = std::move(*result);</code></pre>
+    </div>
+  </div>
+
+  <h4>Common patterns</h4>
+
+<pre><code>// Constructing
+std::expected&lt;Mesh, std::string&gt; LoadMesh(std::string_view path) {
+    auto file = OpenFile(path);
+    if (!file)  return std::unexpected(fmt::format("can't open {}", path));
+
+    auto bytes = ReadAll(*file);
+    if (!bytes) return std::unexpected("read failed");
+
+    return ParseMesh(*bytes);  // Mesh implicitly wraps as expected
+}
+
+// Consuming
+auto result = LoadMesh(path);
+if (!result) {
+    return std::unexpected(result.error());  // forward the error
+}
+auto&amp; mesh = *result;  // or: Mesh m = std::move(*result);
+
+// Boolean check, dereference, .error() — that's the whole API for daily use.</code></pre>
+
+  <div class="pitfalls">
+    <div class="pitfalls-label">Pitfalls</div>
+    <ul>
+      <li>Don't ignore the return value. <code>[[nodiscard]]</code> on the function makes the compiler warn; we mark all <code>expected</code>-returning functions with it.</li>
+      <li>Don't dereference an expected without checking. Same shape as null-pointer-deref bugs in C.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="feature" id="span">
+  <div class="feature-header">
+    <span class="feature-num">08</span>
+    <span class="feature-name"><code>std::span</code> &amp; <code>std::string_view</code></span>
+    <span class="feature-since">C++17 / 20 · <span class="tag-pill really-new" style="margin-left: 0.5rem;">REALLY NEW</span></span>
+  </div>
+
+  <p class="tldr">Non-owning views over contiguous data. Replaces every <code>(T*, size_t)</code> pair you've ever passed.</p>
+
+<pre><code>// Pre-modern: pointer + length, easy to mis-pair
+void ProcessVertices(const Vertex* verts, size_t count);
+
+// Modern: span carries both
+void ProcessVertices(std::span&lt;const Vertex&gt; verts);
+
+// Caller — span constructs from anything contiguous
+std::vector&lt;Vertex&gt; v = ...;
+ProcessVertices(v);                     // implicit conversion
+ProcessVertices({v.data(), 100});       // first 100 only
+ProcessVertices(v.subspan(10, 50));     // sub-range
+
+// In the function:
+for (const auto&amp; vert : verts) { ... }  // works
+verts.size();                           // 100
+verts[3];                               // bounds-checked in debug</code></pre>
+
+  <p><code>string_view</code> is the same idea for strings: a <code>(const char*, size_t)</code> pair that doesn't own its memory. Use as a function parameter when you don't need the callee to own the string.</p>
+
+<pre><code>// Old:    void Log(const char* msg);  or  void Log(const std::string&amp; msg);
+// Modern: void Log(std::string_view msg);
+//   accepts both C strings and std::string without conversion</code></pre>
+
+  <div class="pitfalls">
+    <div class="pitfalls-label">Pitfalls</div>
+    <ul>
+      <li><strong>Don't store a span/string_view as a member of a long-lived object.</strong> The underlying memory might go away. They're parameter types, not storage types.</li>
+      <li><code>string_view</code> is <em>not</em> null-terminated. Don't pass <code>.data()</code> to C APIs expecting null-termination.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="feature" id="designated">
+  <div class="feature-header">
+    <span class="feature-num">09</span>
+    <span class="feature-name">Designated initializers</span>
+    <span class="feature-since">C++20 · <span class="tag-pill syntax" style="margin-left: 0.5rem;">SYNTAX</span></span>
+  </div>
+
+  <p class="tldr">Initialize struct fields by name at the call site. Self-documenting.</p>
+
+  <div class="compare">
+    <div class="compare-block old">
+      <div class="compare-label">Pre-modern</div>
+<pre><code>TextureDesc desc(2048, 2048,
+    Format::RGBA8,
+    Usage::Storage, 1);
+// what was the 4th arg again?</code></pre>
+    </div>
+    <div class="compare-block new">
+      <div class="compare-label">Modern</div>
+<pre><code>TextureDesc desc{
+    .width  = 2048,
+    .height = 2048,
+    .format = Format::RGBA8,
+    .usage  = Usage::Storage,
+    .mips   = 1,
+};</code></pre>
+    </div>
+  </div>
+
+  <p>Use it for any aggregate (struct without user-defined constructors) with more than two fields. Fields must be in declaration order (unlike C, where any order is allowed).</p>
+</div>
+
+<div class="feature" id="enum-class">
+  <div class="feature-header">
+    <span class="feature-num">10</span>
+    <span class="feature-name"><code>enum class</code></span>
+    <span class="feature-since">C++11 · <span class="tag-pill syntax" style="margin-left: 0.5rem;">SYNTAX</span></span>
+  </div>
+
+  <p class="tldr">Scoped, type-safe enums. Use these always, never plain <code>enum</code>.</p>
+
+  <div class="compare">
+    <div class="compare-block old">
+      <div class="compare-label">Pre-modern</div>
+<pre><code>enum BackendType {
+    Software, Metal, Vulkan
+};
+// pollutes namespace; implicit
+// converts to int; collisions
+// with other enums
+BackendType b = Software;
+int x = b;        // works, ugh
+if (b == 0) ...   // works, ugh</code></pre>
+    </div>
+    <div class="compare-block new">
+      <div class="compare-label">Modern</div>
+<pre><code>enum class BackendType {
+    Software, Metal, Vulkan
+};
+BackendType b = BackendType::Software;
+// int x = b;     // compile error
+// b == 0         // compile error
+if (b == BackendType::Software) ...
+
+// Specify underlying type if needed:
+enum class Flags : uint32_t {
+    None = 0, Archive = 1, ReadOnly = 2,
+};</code></pre>
+    </div>
+  </div>
+
+  <p>If you actually <em>want</em> the integer conversion (e.g., using as an array index), it's an explicit cast: <code>static_cast&lt;size_t&gt;(BackendType::Metal)</code>. Slightly more typing, much fewer bugs.</p>
+</div>
+
+<div class="feature" id="strong-types">
+  <div class="feature-header">
+    <span class="feature-num">11</span>
+    <span class="feature-name">Strong-typed IDs</span>
+    <span class="feature-since">Idiom · <span class="tag-pill syntax" style="margin-left: 0.5rem;">SYNTAX</span></span>
+  </div>
+
+  <p class="tldr">Wrap integer IDs in single-member structs to make them distinct types. Catches whole bug classes for free.</p>
+
+  <div class="compare">
+    <div class="compare-block old">
+      <div class="compare-label">Loose</div>
+<pre><code>using MeshId     = uint32_t;
+using MaterialId = uint32_t;
+
+void Render(MeshId m, MaterialId mat);
+
+MeshId mesh = 5;
+MaterialId mat = 7;
+Render(mat, mesh);  // compiles, wrong</code></pre>
+    </div>
+    <div class="compare-block new">
+      <div class="compare-label">Strong</div>
+<pre><code>struct MeshId     { uint32_t v; };
+struct MaterialId { uint32_t v; };
+
+void Render(MeshId m, MaterialId mat);
+
+MeshId mesh{5};
+MaterialId mat{7};
+Render(mat, mesh);  // COMPILE ERROR
+Render(mesh, mat);  // OK</code></pre>
+    </div>
+  </div>
+
+  <p>Zero runtime cost — <code>sizeof(MeshId) == sizeof(uint32_t)</code>. The compiler optimizes away the wrapper. We use this everywhere we have integer handles: <code>MeshId</code>, <code>MaterialId</code>, all the RHI handles (<code>BufferHandle</code>, <code>TextureHandle</code>, <code>PipelineHandle</code>).</p>
+
+  <p>Add helpers as needed (comparison, hashing for use as map keys), but keep the type itself tiny.</p>
+</div>
+
+<div class="feature" id="if-constexpr">
+  <div class="feature-header">
+    <span class="feature-num">12</span>
+    <span class="feature-name"><code>if constexpr</code></span>
+    <span class="feature-since">C++17 · <span class="tag-pill syntax" style="margin-left: 0.5rem;">SYNTAX</span></span>
+  </div>
+
+  <p class="tldr">Compile-time branching inside templates. Replaces 80% of cases that needed SFINAE in the bad old days.</p>
+
+<pre><code>template&lt;typename T&gt;
+void Serialize(T value) {
+    if constexpr (std::is_integral_v&lt;T&gt;) {
+        WriteInt(value);
+    } else if constexpr (std::is_floating_point_v&lt;T&gt;) {
+        WriteFloat(value);
+    } else {
+        WriteBytes(&amp;value, sizeof(value));
+    }
+}</code></pre>
+
+  <p>The branch not taken doesn't have to compile. So this works even when, say, <code>WriteInt(value)</code> wouldn't make sense for a <code>float</code> — that branch is removed at compile time.</p>
+
+  <p>Use it for the simple cases where you'd previously write three function overloads with <code>std::enable_if</code>. For anything more complex than this, the principles doc forbids template metaprogramming — write three named functions instead.</p>
+</div>
+
+<div class="feature" id="fmt">
+  <div class="feature-header">
+    <span class="feature-num">13</span>
+    <span class="feature-name"><code>fmt::print</code> &amp; <code>std::format</code></span>
+    <span class="feature-since">C++20 / lib · <span class="tag-pill syntax" style="margin-left: 0.5rem;">SYNTAX</span></span>
+  </div>
+
+  <p class="tldr">Python-style format strings, type-safe. <code>printf</code>'s ergonomics with <code>iostream</code>'s safety, finally.</p>
+
+<pre><code>fmt::print("hello {}\n", name);
+fmt::print("frame {}: {:.2f} ms\n", frame_idx, frame_time_ms);
+fmt::print("backend: {}\n", backend);  // works for any type with operator&lt;&lt;
+
+// Format to a string instead of printing
+std::string s = fmt::format("{} = {}", key, value);
+
+// Width, precision, alignment
+fmt::print("{:&gt;10}\n", "right");      // right-aligned in 10 chars
+fmt::print("{:08x}\n", 255);          // hex, zero-padded to 8
+fmt::print("{:.3f}\n", 3.14159);      // 3 decimal places</code></pre>
+
+  <p>We use <a href="https://github.com/fmtlib/fmt">fmt library</a> rather than <code>std::format</code> directly because compiler support for <code>std::format</code> is still uneven on Apple Clang. Same syntax; switch to standard later if it stabilizes.</p>
+
+  <p>Wrapped in our log macros: <code>LOG_INFO("loaded {} meshes", count);</code>. No more <code>printf</code> format-string mismatches at runtime.</p>
+</div>
+
+<div class="feature" id="optional">
+  <div class="feature-header">
+    <span class="feature-num">14</span>
+    <span class="feature-name"><code>std::optional&lt;T&gt;</code></span>
+    <span class="feature-since">C++17 · <span class="tag-pill syntax" style="margin-left: 0.5rem;">SYNTAX</span></span>
+  </div>
+
+  <p class="tldr">A value that might or might not exist. Self-documenting nullability without using a sentinel pointer.</p>
+
+<pre><code>std::optional&lt;CVar&gt; FindCVar(std::string_view name);
+
+if (auto cvar = FindCVar("r_max_bounces")) {
+    LOG_INFO("found: {}", cvar-&gt;value);
+} else {
+    LOG_WARN("not found");
+}
+
+// Default if missing
+auto cvar = FindCVar("r_max_bounces").value_or(default_cvar);</code></pre>
+
+  <p>When to use <code>optional</code> vs <code>expected</code>:</p>
+  <ul>
+    <li><strong><code>optional&lt;T&gt;</code></strong> — failure is normal, no error info needed. "Is this thing here? Yes/no."</li>
+    <li><strong><code>expected&lt;T, E&gt;</code></strong> — failure has reasons that matter. File didn't load, parse failed, etc.</li>
+  </ul>
+
+  <div class="pitfalls">
+    <div class="pitfalls-label">Pitfalls</div>
+    <ul>
+      <li>Don't use <code>optional</code> as a "lazy initialize" hack. If something is constructed lazily, say so explicitly.</li>
+      <li><code>*opt</code> on an empty optional is undefined behavior. Check first or use <code>.value_or()</code>.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="feature" id="concepts-skip">
+  <div class="feature-header">
+    <span class="feature-num">15</span>
+    <span class="feature-name">What we skip</span>
+    <span class="feature-since">— · <span class="tag-pill subtle" style="margin-left: 0.5rem;">CONTEXT</span></span>
+  </div>
+
+  <p class="tldr">A short list of celebrated modern C++ features that this project deliberately doesn't use, and why.</p>
+
+  <table>
+    <thead><tr><th>Feature</th><th>Why we skip</th></tr></thead>
+    <tbody>
+      <tr><td><code>concepts</code> / <code>requires</code></td><td>Cool but rarely earn their cost in practice. If you find yourself writing one, you're probably overengineering the template.</td></tr>
+      <tr><td>Ranges (<code>std::ranges</code>, views)</td><td>Compile-time cost is real; readability gains over plain loops are debatable. Plain for loops win.</td></tr>
+      <tr><td>Coroutines (<code>co_await</code>)</td><td>Designed for async I/O. We don't have async I/O. Job system handles parallelism.</td></tr>
+      <tr><td>Modules</td><td>Compiler and build-system support still patchy in 2026. Headers and .cpp files for now.</td></tr>
+      <tr><td>Templated lambdas (<code>[]&lt;typename T&gt;</code>)</td><td>Niche; readable equivalents exist. Pulls toward template metaprogramming, which is forbidden.</td></tr>
+      <tr><td><code>std::variant</code></td><td>Useful in theory but visitor pattern with <code>std::visit</code> + lambdas is awkward. Tagged unions written by hand are clearer for our cases (Material, AST nodes).</td></tr>
+      <tr><td><code>std::any</code></td><td>Type-erased storage with heap allocation. Solves problems we don't have.</td></tr>
+      <tr><td>Exceptions</td><td>Forbidden by build flag <code>-fno-exceptions</code>. <code>std::expected</code> handles errors.</td></tr>
+      <tr><td>RTTI</td><td>Forbidden by build flag <code>-fno-rtti</code>. Tagged unions or type IDs handle runtime type queries.</td></tr>
+    </tbody>
+  </table>
+
+  <p>This is a deliberate aesthetic. Modern C++ has too many features for any one project to use them all coherently; we pick a subset and stay there. See <a href="01_architecture_principles.html#code-style">principles §8</a> for the full enforcement list.</p>
+</div>
+
+<section id="minimal-translation">
+  <div class="section-marker"><span class="section-num">§ ZZ</span><span class="section-rule"></span></div>
+  <h2>Minimal translation table</h2>
+
+  <p>If you're staring at modern code and trying to map it back to what you know:</p>
+
+  <table>
+    <thead><tr><th>You're used to writing</th><th>Modern equivalent</th></tr></thead>
+    <tbody>
+      <tr><td><code>NULL</code></td><td><code>nullptr</code></td></tr>
+      <tr><td><code>typedef int Id;</code></td><td><code>using Id = int;</code> (or strong type)</td></tr>
+      <tr><td><code>new Foo(...)</code></td><td><code>std::make_unique&lt;Foo&gt;(...)</code></td></tr>
+      <tr><td><code>delete x;</code></td><td>(unique_ptr handles it)</td></tr>
+      <tr><td><code>const char*</code> param</td><td><code>std::string_view</code></td></tr>
+      <tr><td><code>T*, size_t</code> param pair</td><td><code>std::span&lt;T&gt;</code></td></tr>
+      <tr><td><code>printf("%d\n", x)</code></td><td><code>fmt::print("{}\n", x)</code></td></tr>
+      <tr><td><code>strcpy</code> etc.</td><td><code>std::string</code> or <code>fmt::format</code></td></tr>
+      <tr><td><code>enum Foo { ... };</code></td><td><code>enum class Foo { ... };</code></td></tr>
+      <tr><td>bool-out-pointer return</td><td><code>std::expected&lt;T, E&gt;</code></td></tr>
+      <tr><td>functor structs for callbacks</td><td>lambdas</td></tr>
+      <tr><td><code>for (size_t i = 0; ...)</code> over container</td><td><code>for (auto&amp; x : container)</code></td></tr>
+      <tr><td><code>std::pair</code> destructuring with <code>.first</code> / <code>.second</code></td><td><code>auto [a, b] = pair;</code></td></tr>
+      <tr><td>"sentinel value" for nothing-here</td><td><code>std::optional&lt;T&gt;</code></td></tr>
+      <tr><td>Manual virtual destructor everywhere</td><td>only on actual base classes</td></tr>
+      <tr><td><code>0</code> for false</td><td><code>false</code></td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <div class="callout-label">When in doubt</div>
+    <p>Read it as if it's the C++ you already know. Mostly it is. Then, when something looks alien, find it in this doc. After two weeks of actual coding, you won't need this page anymore.</p>
+  </div>
+</section>
+
+<div class="footer">
+  <span>Document 05 of 05 · C++ Cheatsheet</span>
+  <span><a href="04_console_protocol.html">← Console Protocol</a> &nbsp;·&nbsp; <a href="index.html">↑ Documents</a></span>
+</div>
+
+</main>
+</div>
+
+</body>
+</html>

@@ -1,0 +1,1010 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Design · Path Tracer Project</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;0,9..144,800;1,9..144,400;1,9..144,600&family=Geist:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0e0d0c;
+  --bg-elev: #15130f;
+  --bg-code: #18151000;
+  --fg: #e8e3d6;
+  --fg-muted: #8a8478;
+  --fg-dim: #5a5650;
+  --border: #2a2722;
+  --border-strong: #3a3630;
+  --accent: #e89968;
+  --accent-dim: #a06d44;
+  --accent-glow: rgba(232, 153, 104, 0.15);
+  --code-fg: #d4b888;
+  --code-keyword: #e89968;
+  --code-string: #a8b87a;
+  --code-comment: #5a5650;
+  --hard: #d97757;
+  --soft: #b8a868;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: 'Geist', system-ui, sans-serif;
+  font-weight: 400;
+  font-size: 16px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+  opacity: 0.04;
+  background-image: radial-gradient(circle at 1px 1px, var(--fg) 1px, transparent 0);
+  background-size: 3px 3px;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  max-width: 1400px;
+  margin: 0 auto;
+  position: relative;
+  z-index: 2;
+}
+
+.sidebar {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  border-right: 1px solid var(--border);
+  padding: 3rem 2rem;
+  overflow-y: auto;
+  font-size: 0.875rem;
+}
+
+.sidebar-brand {
+  font-family: 'Fraunces', serif;
+  font-style: italic;
+  font-weight: 400;
+  font-size: 1.5rem;
+  font-variation-settings: "opsz" 60;
+  margin-bottom: 0.25rem;
+}
+
+.sidebar-tagline {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  color: var(--fg-muted);
+  margin-bottom: 2.5rem;
+}
+
+.doc-nav { margin-bottom: 2.5rem; padding-bottom: 2rem; border-bottom: 1px solid var(--border); }
+
+.doc-nav-label, .toc-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: var(--fg-dim);
+  margin-bottom: 0.75rem;
+}
+
+.toc-label { margin-bottom: 1rem; }
+
+.doc-nav a {
+  display: block;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  color: var(--fg-muted);
+  text-decoration: none;
+  padding: 0.4rem 0;
+  border-left: 2px solid transparent;
+  padding-left: 0.75rem;
+  margin-left: -0.75rem;
+  transition: all 0.15s ease;
+}
+
+.doc-nav a:hover { color: var(--accent); border-left-color: var(--accent); }
+.doc-nav a.current { color: var(--fg); border-left-color: var(--accent); }
+.doc-nav a .num { color: var(--fg-dim); margin-right: 0.5rem; }
+
+.toc { list-style: none; }
+.toc li { margin-bottom: 0.4rem; }
+.toc a {
+  color: var(--fg-muted);
+  text-decoration: none;
+  font-size: 0.8rem;
+  display: block;
+  padding: 0.15rem 0;
+  transition: color 0.15s ease;
+}
+.toc a:hover { color: var(--accent); }
+.toc .num {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  color: var(--fg-dim);
+  margin-right: 0.6rem;
+  display: inline-block;
+  min-width: 1.2rem;
+}
+
+main { padding: 4rem 5rem 6rem; max-width: 920px; }
+
+.hero {
+  margin-bottom: 5rem;
+  padding-bottom: 3rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.hero-meta {
+  display: flex;
+  gap: 1.5rem;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--fg-muted);
+  margin-bottom: 1.5rem;
+}
+
+.hero-meta span::before { content: "▸ "; color: var(--accent); }
+
+.hero h1 {
+  font-family: 'Fraunces', serif;
+  font-weight: 400;
+  font-size: clamp(3rem, 7vw, 5.5rem);
+  line-height: 0.95;
+  letter-spacing: -0.02em;
+  font-variation-settings: "opsz" 144;
+  margin-bottom: 1.5rem;
+}
+
+.hero h1 em {
+  font-style: italic;
+  font-weight: 400;
+  color: var(--accent);
+  font-variation-settings: "opsz" 144;
+}
+
+.hero-subtitle {
+  font-family: 'Fraunces', serif;
+  font-style: italic;
+  font-size: 1.25rem;
+  color: var(--fg-muted);
+  font-variation-settings: "opsz" 36;
+  max-width: 640px;
+  line-height: 1.5;
+}
+
+section { margin-bottom: 4.5rem; scroll-margin-top: 2rem; }
+
+.section-marker {
+  display: flex;
+  align-items: baseline;
+  gap: 1.25rem;
+  margin-bottom: 1.5rem;
+}
+
+.section-num {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  color: var(--accent);
+  letter-spacing: 0.1em;
+}
+
+.section-rule { flex: 1; height: 1px; background: var(--border); }
+
+h2 {
+  font-family: 'Fraunces', serif;
+  font-weight: 400;
+  font-size: 2.25rem;
+  line-height: 1.15;
+  letter-spacing: -0.015em;
+  font-variation-settings: "opsz" 96;
+  margin-bottom: 1.5rem;
+}
+
+h3 {
+  font-family: 'Fraunces', serif;
+  font-weight: 600;
+  font-size: 1.35rem;
+  line-height: 1.3;
+  margin-top: 2.5rem;
+  margin-bottom: 0.85rem;
+  font-variation-settings: "opsz" 36;
+}
+
+h4 {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--accent);
+  margin-top: 2rem;
+  margin-bottom: 0.75rem;
+}
+
+p { margin-bottom: 1.25rem; max-width: 70ch; }
+
+p.lead {
+  font-family: 'Fraunces', serif;
+  font-size: 1.2rem;
+  line-height: 1.55;
+  font-variation-settings: "opsz" 36;
+  margin-bottom: 2rem;
+  max-width: 64ch;
+}
+
+a { color: var(--accent); text-decoration: none; border-bottom: 1px solid var(--accent-dim); transition: all 0.15s ease; }
+a:hover { color: var(--fg); border-bottom-color: var(--fg); }
+
+strong { color: var(--fg); font-weight: 600; }
+em { font-style: italic; color: var(--fg); }
+
+ul, ol { margin-bottom: 1.25rem; padding-left: 1.5rem; max-width: 70ch; }
+li { margin-bottom: 0.5rem; }
+ul li::marker { color: var(--accent); }
+ol li::marker { color: var(--fg-muted); font-family: 'JetBrains Mono', monospace; font-size: 0.85em; }
+
+code {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.88em;
+  color: var(--code-fg);
+  background: rgba(232, 153, 104, 0.08);
+  padding: 0.1em 0.4em;
+  border-radius: 2px;
+}
+
+pre {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.82rem;
+  line-height: 1.55;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
+  padding: 1.25rem 1.5rem;
+  overflow-x: auto;
+  margin-bottom: 1.5rem;
+  color: var(--code-fg);
+}
+
+pre code { background: none; padding: 0; color: inherit; font-size: inherit; }
+
+.principle {
+  font-family: 'Fraunces', serif;
+  font-style: italic;
+  font-size: 1.4rem;
+  line-height: 1.45;
+  font-variation-settings: "opsz" 60;
+  border-left: 2px solid var(--accent);
+  padding: 0.5rem 0 0.5rem 1.5rem;
+  margin: 2rem 0;
+  max-width: 60ch;
+}
+
+.principle::before {
+  content: "Note ";
+  display: block;
+  font-family: 'JetBrains Mono', monospace;
+  font-style: normal;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: var(--accent);
+  margin-bottom: 0.5rem;
+}
+
+table { width: 100%; border-collapse: collapse; margin-bottom: 1.5rem; font-size: 0.9rem; }
+th, td { text-align: left; padding: 0.75rem 1rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+th {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--fg-muted);
+  font-weight: 500;
+  border-bottom: 1px solid var(--border-strong);
+}
+td code { font-size: 0.82em; }
+
+.callout {
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
+  background: var(--bg-elev);
+  padding: 1.25rem 1.5rem;
+  margin: 1.5rem 0;
+}
+
+.callout-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: var(--accent);
+  margin-bottom: 0.5rem;
+}
+
+.callout p:last-child { margin-bottom: 0; }
+
+/* Architecture diagram */
+.arch-diagram {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  line-height: 1.6;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  padding: 2rem;
+  margin: 2rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.arch-layer {
+  border: 1px solid var(--border-strong);
+  padding: 0.75rem 1.5rem;
+  min-width: 60%;
+  text-align: center;
+  background: var(--bg);
+  position: relative;
+}
+
+.arch-layer.app { border-color: var(--accent); color: var(--accent); }
+.arch-layer.renderer { border-color: var(--fg-muted); }
+.arch-layer.rhi { border-color: var(--accent); color: var(--accent); border-style: dashed; }
+.arch-layer.backends {
+  display: flex;
+  justify-content: space-around;
+  gap: 1rem;
+  border: none;
+  padding: 0;
+  width: 100%;
+}
+
+.arch-backend {
+  flex: 1;
+  border: 1px solid var(--border-strong);
+  padding: 0.75rem 1rem;
+  background: var(--bg);
+  text-align: center;
+}
+
+.arch-arrow {
+  color: var(--fg-dim);
+  font-size: 1.2rem;
+}
+
+/* Engine flow */
+.flow {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  padding: 1.5rem;
+  margin: 1.5rem 0;
+  white-space: pre;
+  overflow-x: auto;
+  color: var(--fg-muted);
+  line-height: 1.5;
+}
+
+.flow .accent { color: var(--accent); }
+.flow .key { color: var(--fg); }
+
+.footer {
+  margin-top: 6rem;
+  padding-top: 3rem;
+  border-top: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  color: var(--fg-muted);
+}
+.footer a { color: var(--fg-muted); border: none; }
+.footer a:hover { color: var(--accent); }
+
+@media (max-width: 1024px) {
+  .layout { grid-template-columns: 1fr; }
+  .sidebar { position: static; height: auto; border-right: none; border-bottom: 1px solid var(--border); }
+  main { padding: 3rem 2rem; }
+}
+
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border-strong); }
+::-webkit-scrollbar-thumb:hover { background: var(--accent-dim); }
+::selection { background: var(--accent-glow); color: var(--fg); }
+</style>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar">
+  <div class="sidebar-brand">Path Tracer</div>
+  <div class="sidebar-tagline">Project Documentation</div>
+
+  <nav class="doc-nav">
+    <div class="doc-nav-label">Documents</div>
+    <a href="index.html"><span class="num">↑</span>Home</a>
+    <a href="01_architecture_principles.html"><span class="num">01</span>Architecture Principles</a>
+    <a href="02_design.html" class="current"><span class="num">02</span>Design</a>
+    <a href="03_implementation_plan.html"><span class="num">03</span>Implementation Plan</a>
+    <a href="04_console_protocol.html"><span class="num">04</span>Console Protocol</a>
+    <a href="05_cpp_cheatsheet.html"><span class="num">05</span>C++ Cheatsheet</a>
+  </nav>
+
+  <div class="toc-label">In this document</div>
+  <ul class="toc">
+    <li><a href="#goals"><span class="num">1</span>Goals & non-goals</a></li>
+    <li><a href="#overview"><span class="num">2</span>Architecture overview</a></li>
+    <li><a href="#engine"><span class="num">3</span>Engine & runtime switching</a></li>
+    <li><a href="#rhi"><span class="num">4</span>RHI interface</a></li>
+    <li><a href="#shaders"><span class="num">5</span>Shader stack: Slang</a></li>
+    <li><a href="#renderer"><span class="num">6</span>Renderer architecture</a></li>
+    <li><a href="#features"><span class="num">7</span>Feature plan</a></li>
+    <li><a href="#mesh-csg"><span class="num">8</span>Mesh CSG (headline)</a></li>
+    <li><a href="#sdf"><span class="num">9</span>Future: SDF objects</a></li>
+    <li><a href="#memory-hw"><span class="num">10</span>Memory & introspection</a></li>
+    <li><a href="#console"><span class="num">11</span>Network console</a></li>
+    <li><a href="#deps"><span class="num">12</span>Dependencies</a></li>
+    <li><a href="#open"><span class="num">13</span>Open questions</a></li>
+  </ul>
+</aside>
+
+<main>
+
+<header class="hero">
+  <div class="hero-meta">
+    <span>v1.0</span>
+    <span>Document 02 / 04</span>
+    <span>The Why</span>
+  </div>
+  <h1>Design <em>Document</em></h1>
+  <p class="hero-subtitle">A real-time GPU path tracer with mesh CSG as the headline feature. Three backends, runtime switchable, on a single C++ codebase. macOS / Apple Silicon for now.</p>
+</header>
+
+<p class="lead">This document explains <em>what</em> we're building and <em>why</em> the architecture is shaped the way it is. The <a href="03_implementation_plan.html">implementation plan</a> tells you the order of operations; the <a href="01_architecture_principles.html">principles doc</a> tells you the constraints. Read those after this one.</p>
+
+<section id="goals">
+  <div class="section-marker"><span class="section-num">§ 01</span><span class="section-rule"></span></div>
+  <h2>Goals & non-goals</h2>
+
+  <h3>Goals</h3>
+  <ul>
+    <li>GPU-accelerated path tracer running interactively (≥30 FPS at 1080p with denoising) on M4 Max via Metal.</li>
+    <li>Three backends — <strong>Software</strong> (CPU reference via Embree), <strong>Metal</strong> (native), <strong>Vulkan</strong> (via MoltenVK on Mac, native on Windows later) — runtime-switchable mid-app.</li>
+    <li>Single C++ codebase, single shader source via <a href="https://shader-slang.com">Slang</a> cross-compilation.</li>
+    <li><strong>Three render modes</strong>: <code>pathtrace</code> (Monte Carlo with accumulation, headline quality), <code>raytrace</code> (Whitted-style real-time reflections + refractions + hard shadows), <code>preview</code> (primary rays + direct light, fastest). Switchable at runtime via cvar.</li>
+    <li>Hardware ray tracing on Metal and (when available) Vulkan; Embree-based BVH on Software.</li>
+    <li><strong>First-class mesh CSG</strong>: union, intersect, subtract on imported triangle meshes, baked via <a href="https://github.com/elalish/manifold">Manifold</a>, edits feel real-time.</li>
+    <li>Standard physically-based materials: Lambert, conductor, dielectric. Per-face material preservation through CSG.</li>
+    <li>FPS camera, free-fly controls.</li>
+    <li>Progressive accumulation when camera is still in <code>pathtrace</code> mode; 1-spp + denoiser when moving (later phase).</li>
+    <li><strong>Resolution decoupled from window size.</strong> The window is always at the configured size (default 1080p). Internal render resolution is <code>window × r_resolution_scale</code>, upscaled to fill the window with aspect ratio preserved. A 256×144 internal render fills a 1920×1080 window cleanly — no letterboxing, no distortion. Lets the slow software backend stay usable without shrinking the window.</li>
+    <li>Network-only console for control: WebSocket + JSON, vanilla JS frontend embedded in binary.</li>
+    <li>Tagged memory manager with per-category budgets; full hardware introspection.</li>
+  </ul>
+
+  <h3>Non-goals (initial)</h3>
+  <ul>
+    <li>Scene graph or visual editor beyond the network console UI.</li>
+    <li>Audio, physics, networking-for-multiplayer, embedded scripting language.</li>
+    <li>Linux / mobile / web (Linux comes free with Vulkan but isn't a target).</li>
+    <li>Animated booleans (boolean ops driven by per-frame animation rather than user edits) — possible later via interval CSG, not in v1.</li>
+    <li>Cross-system CSG (subtracting an SDF from a mesh body or vice versa).</li>
+    <li><strong>SDF objects.</strong> Discussed in §9 as future work. Hardware ray tracing accelerates triangle BVHs only — SDFs are software sphere-tracing, which throws away the M4 Max's biggest hardware advantage. Out of v1 scope. The architecture is designed to accommodate them later as a parallel geometry path.</li>
+    <li>Native Windows build until Phase 12 — Mac-only for now.</li>
+  </ul>
+</section>
+
+<section id="overview">
+  <div class="section-marker"><span class="section-num">§ 02</span><span class="section-rule"></span></div>
+  <h2>Architecture overview</h2>
+
+  <p>Four layers. The <strong>App</strong> owns the window and main loop. The <strong>Engine</strong> orchestrates the renderer, scene, and console; it owns the current Device and can swap it. The <strong>Renderer</strong> contains the path tracer, scene representation, and frame logic — it knows what to render but never how the GPU is commanded. The <strong>RHI</strong> is the abstraction line; below it live the three backend implementations.</p>
+
+  <div class="arch-diagram">
+    <div class="arch-layer app">App · Window · Input · Main loop</div>
+    <div class="arch-arrow">↓</div>
+    <div class="arch-layer">Engine · Scene · Console · Backend orchestration</div>
+    <div class="arch-arrow">↓</div>
+    <div class="arch-layer">Renderer · Path tracer · Camera · Frame graph</div>
+    <div class="arch-arrow">↓</div>
+    <div class="arch-layer rhi">RHI · Device · CommandBuffer · Resources · AccelStruct</div>
+    <div class="arch-arrow">↓</div>
+    <div class="arch-layer backends">
+      <div class="arch-backend">Software<br><span style="color:var(--fg-dim);font-size:0.8em">Embree + CPU</span></div>
+      <div class="arch-backend">Metal<br><span style="color:var(--fg-dim);font-size:0.8em">metal-cpp</span></div>
+      <div class="arch-backend">Vulkan<br><span style="color:var(--fg-dim);font-size:0.8em">via MoltenVK</span></div>
+    </div>
+  </div>
+
+  <p>Shaders flow through a parallel pipeline: <code>.slang</code> sources → <code>slangc</code> → MSL bytecode (Metal), SPIR-V (Vulkan), or generated C++ (Software). The Renderer doesn't know which target it's loading; the RHI does.</p>
+</section>
+
+<section id="engine">
+  <div class="section-marker"><span class="section-num">§ 03</span><span class="section-rule"></span></div>
+  <h2>Engine & runtime switching</h2>
+
+  <p>The Engine class is the top-level orchestrator. It owns: the current Device, the Renderer, the Scene (CPU-side), the Console, the JobSystem. The App constructs an Engine and ticks it once per frame.</p>
+
+  <p>Critically: <strong>the Renderer does not own its Device</strong>. The Engine does. This separation enables Quake-style runtime backend switching (<code>vid_restart</code>): drain the old device, destroy the renderer, destroy the device, create a new device against the same window's native handle, recreate the renderer, upload scene, continue. Brief pause (~0.5–2 seconds), no zero-cost hot swap promise.</p>
+
+  <pre><code>class Engine {
+public:
+    void Tick(float dt);                    // called every frame by App
+    void SwitchBackend(BackendType target); // triggers Rebuild
+    Console&amp; GetConsole();
+    Scene&amp; GetScene();
+
+private:
+    void Rebuild(BackendType target);       // teardown + recreate
+
+    NativeWindowHandle window_;
+    std::unique_ptr&lt;rhi::Device&gt;   device_;
+    std::unique_ptr&lt;Renderer&gt;      renderer_;
+    std::unique_ptr&lt;Scene&gt;         scene_;        // CPU-side, survives switch
+    std::unique_ptr&lt;Console&gt;       console_;
+    std::unique_ptr&lt;ConsoleServer&gt; console_server_;
+    std::unique_ptr&lt;JobSystem&gt;     jobs_;
+};</code></pre>
+
+  <p>The Scene survives backend switches because it's CPU-side data. The Renderer is reconstructed from the Scene on each Rebuild. GPU resources (BLAS, TLAS, vertex buffers, textures, accumulation buffer) are derived state — destroyed with the old device, re-uploaded into the new one.</p>
+
+  <div class="callout">
+    <div class="callout-label">This is also the right architecture for...</div>
+    <p>Hot reload of shaders, scene file reload, GPU device reset recovery, swapchain recreation on resize, debug feature toggles ("disable hardware RT, fall back to compute"). Backend switching is just one of many uses of the Rebuild path.</p>
+  </div>
+</section>
+
+<section id="rhi">
+  <div class="section-marker"><span class="section-num">§ 04</span><span class="section-rule"></span></div>
+  <h2>RHI interface</h2>
+
+  <p>The RHI ("Render Hardware Interface") is a thin C++ abstraction over the three backends. Design principle: <strong>lowest common denominator of Metal, Vulkan, and CPU compute, with explicit escape hatches</strong>. We don't try to hide everything — acceleration structures, for example, are exposed directly because they're a real concept on all three.</p>
+
+  <h3>Handles</h3>
+  <p>All RHI resources are referenced by 64-bit opaque handles, not raw backend pointers. Cheap to copy, debuggable, decouples lifetime from C++ object identity. The backend keeps a slot allocator internally.</p>
+
+  <pre><code>struct BufferHandle      { uint64_t id = 0; };
+struct TextureHandle     { uint64_t id = 0; };
+struct PipelineHandle    { uint64_t id = 0; };
+struct AccelStructHandle { uint64_t id = 0; };
+struct ShaderHandle      { uint64_t id = 0; };</code></pre>
+
+  <h3>Device</h3>
+  <p>The factory entry point. Creates resources, pipelines, acceleration structures. Acquires command buffers. Manages the swapchain.</p>
+
+  <pre><code>class Device {
+public:
+    static std::unique_ptr&lt;Device&gt; Create(BackendType, NativeWindowHandle);
+
+    BufferHandle    CreateBuffer(const BufferDesc&amp;);
+    TextureHandle   CreateTexture(const TextureDesc&amp;);
+    PipelineHandle  CreateComputePipeline(const ComputePipelineDesc&amp;);
+    AccelStructHandle CreateBLAS(const BLASDesc&amp;);
+    AccelStructHandle CreateTLAS(const TLASDesc&amp;);
+
+    CommandBuffer*  AcquireCommandBuffer();
+    void            Submit(CommandBuffer*);
+    void            WaitIdle();
+
+    bool SupportsHardwareRT() const;
+    const char* GetDeviceName() const;
+    size_t GetCurrentAllocatedBytes() const;  // for memory introspection
+};</code></pre>
+
+  <h3>Command buffer</h3>
+  <p>Records work to be submitted to the GPU. The same shape works for compute dispatches and ray tracing dispatches; both are expressed as compute kernels with optional acceleration structure binding.</p>
+
+  <pre><code>class CommandBuffer {
+public:
+    void BindComputePipeline(PipelineHandle);
+    void BindBuffer(uint32_t slot, BufferHandle, size_t offset = 0);
+    void BindStorageTexture(uint32_t slot, TextureHandle);
+    void BindAccelStruct(uint32_t slot, AccelStructHandle);
+    void PushConstants(const void* data, size_t size);
+
+    void Dispatch(uint32_t gx, uint32_t gy, uint32_t gz);
+
+    void CopyBufferToTexture(BufferHandle, TextureHandle);
+    void Barrier(const BarrierDesc&amp;);  // explicit; we don't auto-track
+};</code></pre>
+
+  <h3>Why this shape</h3>
+  <ul>
+    <li><strong>No render passes.</strong> We're a compute / ray-tracing renderer — no rasterization in v1. Add later only if needed for hybrid rendering.</li>
+    <li><strong>Flat binding table</strong> rather than emulating Vulkan descriptor sets or Metal argument buffers. Slang controls layout; binding slots line up across backends naturally.</li>
+    <li><strong>Explicit barriers.</strong> Metal and Vulkan both want them. Auto-tracking is a tarpit.</li>
+    <li><strong>Acceleration structures are first-class.</strong> Hiding them costs more than it saves.</li>
+  </ul>
+
+  <h3>What we deliberately don't abstract</h3>
+  <p>Multi-queue / async compute. Sparse resources. Mesh shaders. Bindless resources. Add when proven necessary, not before.</p>
+</section>
+
+<section id="shaders">
+  <div class="section-marker"><span class="section-num">§ 05</span><span class="section-rule"></span></div>
+  <h2>Shader stack: Slang</h2>
+
+  <p>Slang is the load-bearing decision in this architecture. One <code>.slang</code> source compiles to MSL (Metal), SPIR-V (Vulkan), and (via Slang's CPU target) a C++ function for the Software backend. Without it we'd write every shader three times.</p>
+
+  <ul>
+    <li><strong>Modules and <code>import</code></strong> — split BRDFs, sampling, intersection, CSG ops into separate <code>.slang</code> files. No giant single-file shader.</li>
+    <li><strong>Generics</strong> — interface-based material dispatch without per-ray switches.</li>
+    <li><strong>ParameterBlock&lt;T&gt;</strong> — matches the RHI's flat binding table cleanly.</li>
+    <li><strong>RayQuery / TraceRayInline</strong> — Slang's inline ray query intrinsics map to Metal's intersector and Vulkan's <code>rayQueryEXT</code>. Same shader code, both backends.</li>
+  </ul>
+
+  <p>Compilation strategy: <strong>build-time</strong> for release (CMake invokes <code>slangc</code>, embeds bytecode as binary blobs in the executable), <strong>runtime</strong> in debug for hot-reload during development (link the Slang runtime, recompile on save).</p>
+</section>
+
+<section id="renderer">
+  <div class="section-marker"><span class="section-num">§ 06</span><span class="section-rule"></span></div>
+  <h2>Renderer architecture</h2>
+
+  <p>The Renderer is a sequence of compute kernel dispatches per frame. The kernel itself has three modes — chosen by cvar — that share intersection and material logic but differ in their inner loop. Tone mapping and presentation are common to all three.</p>
+
+  <h3>The three render modes</h3>
+
+  <table>
+    <thead><tr><th>Mode</th><th>Inner loop</th><th>Cost / pixel</th><th>Quality</th></tr></thead>
+    <tbody>
+      <tr><td><code>preview</code></td><td>Primary ray, hit, direct light from one source, write radiance, done.</td><td>1 ray</td><td>Diffuse + specular shading. No reflections. Hard shadows optional. Looks like a flat-shaded modeler.</td></tr>
+      <tr><td><code>raytrace</code></td><td>Primary ray + recursive reflection/refraction up to <code>r_raytrace_depth</code>. Deterministic — no Monte Carlo, no noise.</td><td>2–8 rays typically</td><td>Whitted-style. Mirror reflections, glass refraction, sharp shadows. Looks like a clean offline raytracer. <strong>Real-time on hardware RT.</strong></td></tr>
+      <tr><td><code>pathtrace</code></td><td>Monte Carlo path. Sample BRDF, spawn next ray, accumulate throughput, Russian-roulette terminate.</td><td>Many rays, accumulated over frames</td><td>Physically correct global illumination. Soft shadows from area lights, indirect bounce, color bleeding. The headline mode.</td></tr>
+    </tbody>
+  </table>
+
+  <p>Switching modes resets the accumulation buffer (since accumulation is meaningless for <code>raytrace</code> and <code>preview</code>). Camera movement still resets accumulation in <code>pathtrace</code> mode as before. Implementation is a single <code>switch</code> on the mode constant inside the kernel — three code paths, one shader, shared intersection.</p>
+
+  <h3>Renderer interface</h3>
+
+  <pre><code>class Renderer {
+public:
+    Renderer(rhi::Device* device, uint32_t window_w, uint32_t window_h);
+    void SetScene(const Scene&amp; scene);
+    void SetMode(RenderMode mode);                 // pathtrace | raytrace | preview
+    void SetResolutionScale(float scale);          // applied to internal render target
+    void RenderFrame(const Camera&amp; camera, rhi::TextureHandle output);
+    void ResetAccumulation();
+    uint32_t GetSampleCount() const;
+
+private:
+    rhi::Device* device_;
+    uint32_t           window_w_, window_h_;        // swapchain dims
+    uint32_t           internal_w_, internal_h_;    // = window × scale, aspect preserved
+    RenderMode         mode_ = RenderMode::PathTrace;
+    rhi::TextureHandle accum_hdr_;                  // RGBA32F at internal res
+    rhi::PipelineHandle render_pipeline_;           // single kernel, mode-switched
+    rhi::PipelineHandle tonemap_pipeline_;          // also handles upscale
+    rhi::BufferHandle  scene_buffer_;
+    rhi::BufferHandle  camera_buffer_;
+    uint32_t           sample_count_ = 0;
+};</code></pre>
+
+  <h3>Resolution decoupling — the window stays at 1080p</h3>
+
+  <p>The render path uses two distinct resolutions:</p>
+
+  <ul>
+    <li><strong>Window resolution</strong>: set by <code>app_window_width</code> / <code>app_window_height</code>, default 1920×1080. The swapchain matches this. The window the user sees is always this size.</li>
+    <li><strong>Internal resolution</strong>: <code>window × r_resolution_scale</code>, applied to <em>both</em> dimensions. Aspect ratio always preserved. <code>r_resolution_scale 0.5</code> on a 1920×1080 window gives 960×540 internal. <code>r_resolution_scale ≈ 0.13</code> gives ~256×144 internal.</li>
+  </ul>
+
+  <p>Per frame: the render kernel writes to an HDR accumulation texture at internal resolution. The tonemap pass reads the accumulation, applies ACES, gamma-corrects, and <em>upscales</em> to the swapchain via bilinear filtering on the sample. The user sees a 1080p image; the work happened at internal resolution. No letterboxing, no aspect mismatch — both dimensions scaled by the same factor against a window with the same aspect.</p>
+
+  <p>This is what makes the software backend usable: it can render at 256×144 internal while still presenting a 1080p window. The image will look low-resolution (because it is), but it won't look broken or stretched.</p>
+
+  <h3>Performance targets, by mode and backend</h3>
+
+  <p>Restated honestly. The software backend is a correctness reference, not an interactive target — see <a href="01_architecture_principles.html#abstraction">principles §7</a>.</p>
+
+  <table>
+    <thead><tr><th>Backend</th><th>Mode</th><th>Internal resolution</th><th>Target</th></tr></thead>
+    <tbody>
+      <tr><td>Metal</td><td>pathtrace, 1 spp + accumulation</td><td>1920×1080</td><td>≥ 60 FPS</td></tr>
+      <tr><td>Metal</td><td>raytrace</td><td>1920×1080</td><td>≥ 120 FPS</td></tr>
+      <tr><td>Metal</td><td>preview</td><td>1920×1080</td><td>≥ 240 FPS</td></tr>
+      <tr><td>Vulkan (MoltenVK)</td><td>pathtrace</td><td>1920×1080</td><td>≥ 45 FPS (~25% behind native Metal is normal)</td></tr>
+      <tr><td>Vulkan (MoltenVK)</td><td>raytrace</td><td>1920×1080</td><td>≥ 90 FPS</td></tr>
+      <tr><td>Software</td><td>preview</td><td>480×270 (scale 0.25)</td><td>~5–10 FPS — usable for verification</td></tr>
+      <tr><td>Software</td><td>raytrace</td><td>256×144 (scale ≈0.13)</td><td>~2–5 FPS — verification only</td></tr>
+      <tr><td>Software</td><td>pathtrace</td><td>any</td><td>Seconds-to-minutes per frame; correctness reference, not interactive</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="features">
+  <div class="section-marker"><span class="section-num">§ 07</span><span class="section-rule"></span></div>
+  <h2>Feature plan</h2>
+
+  <h3>FPS camera</h3>
+  <p>Standard free-fly: WASD + mouse look, Shift to sprint, Space/Ctrl for vertical. Stored as position + yaw + pitch (avoids gimbal issues at the cost of no roll, which we don't need). Pitch clamped to ±85°.</p>
+
+  <p>Camera state changes reset path tracer accumulation. The accumulation reset is also the trigger for "stop denoising and re-converge."</p>
+
+  <h3>Analytic primitives</h3>
+  <p>Three primitive types in the early phases, intersected analytically in the kernel without an acceleration structure:</p>
+
+  <table>
+    <thead>
+      <tr><th>Primitive</th><th>Intersection</th><th>Storage</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Sphere</td><td>Quadratic, closed-form</td><td>center, radius, material</td></tr>
+      <tr><td>Plane</td><td>Single dot product</td><td>point, normal, material</td></tr>
+      <tr><td>Triangle</td><td>Möller-Trumbore</td><td>three vertices, material</td></tr>
+    </tbody>
+  </table>
+
+  <p>Used early for testing the path tracer before mesh loading exists. Stays useful for procedural test scenes after meshes arrive.</p>
+
+  <h3>Materials</h3>
+  <p>Three BRDFs in v1, stored as a tagged union on the GPU:</p>
+
+  <ul>
+    <li><strong>Lambert</strong> — albedo / π, cosine-weighted hemisphere sampling.</li>
+    <li><strong>Metal (conductor)</strong> — perfect or glossy reflection via GGX importance sampling. Albedo tints reflectance.</li>
+    <li><strong>Dielectric</strong> — Fresnel-weighted reflect/refract using Snell's law and Schlick's approximation. Parameterized by IOR (1.5 = glass, 1.33 = water).</li>
+  </ul>
+
+  <p>Path tracing loop: bounce up to N times (N=8 in v1), break on miss (return env color or zero) or emissive hit, multiply throughput each bounce, Russian-roulette terminate after depth 4.</p>
+</section>
+
+<section id="mesh-csg">
+  <div class="section-marker"><span class="section-num">§ 08</span><span class="section-rule"></span></div>
+  <h2>Mesh CSG via Manifold — the headline</h2>
+
+  <p>The library that makes this feasible: <a href="https://github.com/elalish/manifold">Manifold</a>, Google's MIT-licensed mesh boolean library. Robust by construction (always produces manifold output from manifold input), exact, fast — single-digit milliseconds for moderate operands. OpenSCAD switched to it. That's the budget that makes interactive editing work.</p>
+
+  <h3>Strategy: bake on CPU, render via hardware RT on GPU</h3>
+
+  <p>The CSG layer is a tree on the CPU side:</p>
+  <ul>
+    <li><em>Leaves</em> are imported triangle meshes (glTF/OBJ) with optional transforms.</li>
+    <li><em>Inner nodes</em> are boolean ops (union / intersect / subtract) over their children.</li>
+  </ul>
+
+  <p>When the user edits a parameter (slider drags a leaf transform, toggles an op), we walk the dirty path up to the root, recomputing affected subtrees with Manifold. The result is one flat triangle mesh per "CSG body". That mesh becomes a BLAS in the hardware RT pipeline like any other mesh.</p>
+
+  <pre><code>namespace csg {
+
+enum class Op { Leaf, Union, Intersect, Subtract };
+
+struct Node {
+    Op       op;
+    glm::mat4 transform = glm::mat4(1);
+
+    // Leaf-only
+    MeshAssetId leaf_mesh;
+    uint32_t    leaf_material_id;
+
+    // Inner-node-only
+    std::unique_ptr&lt;Node&gt; left;
+    std::unique_ptr&lt;Node&gt; right;
+
+    // Cache
+    manifold::Manifold cached_result;
+    bool dirty = true;
+};
+
+class Evaluator {
+public:
+    BakedMesh Evaluate(Node&amp; root);
+    void      MarkDirty(Node&amp; node);
+};
+
+struct BakedMesh {
+    std::vector&lt;glm::vec3&gt; positions;
+    std::vector&lt;glm::vec3&gt; normals;
+    std::vector&lt;uint32_t&gt;  indices;
+    std::vector&lt;uint32_t&gt;  face_material_ids;
+};
+
+}</code></pre>
+
+  <h3>Materials through CSG</h3>
+  <p>Manifold tracks per-triangle "originalIDs" through boolean ops. We map originalID → material via a side table built at leaf-conversion time. In the hardware-RT closest-hit path, the shader does a single buffer lookup with <code>primitiveID</code> to get the material.</p>
+
+  <p>Effect: subtract a metal sphere from a glass box → walls of the resulting hole render as metal, outer surface as glass, no special-casing.</p>
+
+  <h3>GPU update path on edit</h3>
+  <ol>
+    <li>CPU re-evaluates dirty subtree on a <strong>worker thread</strong> → new BakedMesh.</li>
+    <li>Upload positions/normals/indices to GPU buffers (reuse if size unchanged).</li>
+    <li>Rebuild BLAS (full rebuild — topology changed; refit only valid for vertex-position-only changes).</li>
+    <li>Update the affected TLAS instance entry; rebuild TLAS (cheap).</li>
+    <li>Reset path-tracer accumulation.</li>
+    <li>Continue tracing next frame.</li>
+  </ol>
+
+  <p>For a slider drag on a moderately complex CSG node: ~5–15 ms total. Feels real-time.</p>
+
+  <h3>Why bake instead of trace-time CSG?</h3>
+
+  <table>
+    <thead>
+      <tr><th></th><th>Bake (Manifold)</th><th>Interval-based</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Per-ray cost</td><td>Normal closest-hit (cheap)</td><td>All-hits enumeration (expensive)</td></tr>
+      <tr><td>Edit cost</td><td>5–15 ms (Manifold + BLAS)</td><td>Zero</td></tr>
+      <tr><td>Animated booleans</td><td>Painful</td><td>Fine</td></tr>
+      <tr><td>Nested CSG</td><td>Free at trace time</td><td>Shader complexity grows with depth</td></tr>
+      <tr><td>Code complexity</td><td>Moderate (mostly host-side)</td><td>High (shader interval logic)</td></tr>
+    </tbody>
+  </table>
+
+  <p>We start with bake. If interactive edit lag ever becomes the bottleneck for a specific use case, interval-based CSG can be added as an opt-in mode for the body currently being edited.</p>
+
+  <h3>Practical caveats</h3>
+  <ul>
+    <li>Operand meshes <strong>must be manifold and watertight</strong>. Manifold rejects malformed input. Imported assets often need a repair pass — Blender's "Mesh: Clean Up" operators handle this offline, or Manifold's basic repair.</li>
+    <li>Self-intersecting input meshes break things. Same answer: clean before import.</li>
+    <li>Manifold uses exact arithmetic for predicates that matter. This is why it's the right choice over libigl/CGAL (slower) or Cork (less robust).</li>
+    <li><strong>Run Manifold evaluation on a worker thread.</strong> Don't block the render loop on a 50ms worst-case bake.</li>
+  </ul>
+</section>
+
+<section id="sdf">
+  <div class="section-marker"><span class="section-num">§ 09</span><span class="section-rule"></span></div>
+  <h2>Future: SDF objects</h2>
+
+  <p>An earlier draft of this design had SDFs (Signed Distance Functions) as a parallel geometry path alongside hardware-RT meshes. They were dropped from v1 scope after weighing the hardware tradeoff: <strong>hardware ray tracing accelerates only triangle BVHs</strong>. Sphere tracing — the SDF traversal model — is uniform compute work with no fixed-function acceleration on any GPU.</p>
+
+  <p>For a Mac M4 Max specifically, the calculus is sharp: the M4's standout hardware feature is its ray tracing cores. A renderer that uses them runs well above what raw FLOPS would predict. A renderer that skips them competes on compute alone, where dedicated GPUs win. Building around SDFs trades away the part of the machine that makes this project interesting.</p>
+
+  <p>That said, SDFs remain attractive for things meshes can't easily express: smooth-blended shapes (<code>smoothUnion(d1, d2, k)</code>), procedural surfaces (gyroids, fractals), domain warping, infinite repetition. The architecture leaves the door open to add them as a parallel geometry path in a future version, where every ray would query both the mesh BVH and a list of SDF objects, taking the closest hit. Concretely, the path tracer's intersection function is the only place the change would land — the renderer, scene, and console plumbing don't need to know the difference.</p>
+
+  <h3>What an SDF addition would look like</h3>
+  <ul>
+    <li><strong>Primitives</strong>: sphere, box, cylinder, torus, plane (analytic SDF formulas, e.g. <a href="https://iquilezles.org/articles/distfunctions/">Inigo Quilez's catalog</a>).</li>
+    <li><strong>Operations</strong>: union/intersect/subtract via <code>min</code>/<code>max</code>/<code>max-negate</code>; smooth variants via softmin with parameter <code>k</code>.</li>
+    <li><strong>Storage</strong>: small SDF tree per object (primitives + ops + transforms), packed into a structured buffer.</li>
+    <li><strong>Traversal</strong>: sphere tracing with central-difference normal estimation.</li>
+    <li><strong>Interaction with meshes</strong>: each ray queries mesh TLAS and each SDF object, takes closest hit. The two systems shadow each other and reflect off each other for free.</li>
+    <li><strong>Limitation</strong>: cross-system CSG (mesh ⊖ SDF or vice versa) remains out of scope. The two representations don't combine without either meshing the SDF or building a hybrid interval tracer — large work for niche payoff.</li>
+  </ul>
+
+  <p>Roughly a one-phase addition when prioritized. Not in v1.</p>
+</section>
+
+<section id="memory-hw">
+  <div class="section-marker"><span class="section-num">§ 10</span><span class="section-rule"></span></div>
+  <h2>Memory manager & hardware introspection</h2>
+
+  <p>See <a href="01_architecture_principles.html#memory">§3 of the principles doc</a> for the rules. Brief summary of the architecture:</p>
+
+  <h3>Allocator stack</h3>
+  <ul>
+    <li><strong>Frame arena</strong> — bump allocator, triple-buffered, reset at frame end. Per-frame transient data.</li>
+    <li><strong>Pool allocators</strong> — fixed-size object pools for jobs, BVH nodes, log entries. Free-list inside, O(1) alloc/free.</li>
+    <li><strong>Persistent heap</strong> — mimalloc-backed, default for long-lived heap allocations.</li>
+    <li><strong>GPU heap allocator</strong> — wraps Metal <code>MTLHeap</code> / Vulkan VMA. Sub-allocates from large heap blocks to avoid per-allocation API cost.</li>
+  </ul>
+
+  <h3>Tagging</h3>
+  <p>Every allocation tagged with a <code>MemTag</code> (<code>Scene</code>, <code>MeshAssets</code>, <code>Textures</code>, <code>GpuBuffers</code>, <code>Csg</code>, <code>Console</code>, <code>JobSystem</code>, <code>Render</code>, <code>Misc</code>). Per-tag stats: total bytes, peak bytes, alloc count. Each tag has a configurable hard budget (cvar <code>mem_budget_&lt;tag&gt;_mb</code>).</p>
+
+  <h3>Hardware introspection</h3>
+  <p>Gathered once at startup, exposed as read-only cvars:</p>
+
+  <table>
+    <thead><tr><th>Info</th><th>cvar</th><th>Source on macOS</th></tr></thead>
+    <tbody>
+      <tr><td>CPU model</td><td><code>sys_cpu_model</code></td><td><code>sysctl machdep.cpu.brand_string</code></td></tr>
+      <tr><td>Performance cores</td><td><code>sys_cpu_pcores</code></td><td><code>hw.perflevel0.physicalcpu</code></td></tr>
+      <tr><td>Efficiency cores</td><td><code>sys_cpu_ecores</code></td><td><code>hw.perflevel1.physicalcpu</code></td></tr>
+      <tr><td>SIMD features</td><td><code>sys_cpu_features</code></td><td><code>hw.optional.*</code></td></tr>
+      <tr><td>RAM total</td><td><code>sys_ram_total_mb</code></td><td><code>hw.memsize</code></td></tr>
+      <tr><td>OS version</td><td><code>sys_os</code></td><td><code>NSProcessInfo</code></td></tr>
+      <tr><td>GPU name</td><td><code>sys_gpu_name</code></td><td><code>MTL::Device::name()</code></td></tr>
+      <tr><td>VRAM (unified)</td><td><code>sys_gpu_vram_mb</code></td><td><code>recommendedMaxWorkingSetSize</code></td></tr>
+      <tr><td>Hardware RT</td><td><code>sys_gpu_hwrt</code></td><td>Metal capability flag</td></tr>
+    </tbody>
+  </table>
+
+  <p>Live stats streamed once per frame to subscribed console clients via WebSocket events: FPS, frame time breakdown, sample count, current backend, per-tag memory bytes, GPU current allocated size.</p>
+</section>
+
+<section id="console">
+  <div class="section-marker"><span class="section-num">§ 11</span><span class="section-rule"></span></div>
+  <h2>Network console</h2>
+
+  <p>The renderer process is a server. It opens a TCP port (default 27960) speaking WebSocket + JSON, plus a separate line-protocol port (default 27961) for shell scripting. Commands and queries arrive from clients; results and event streams flow back.</p>
+
+  <p>Two primitives, both inspired by Quake/Source:</p>
+  <ul>
+    <li><strong>CVars</strong> — named, typed variables with a value, default, flags (<code>ARCHIVE</code>, <code>READONLY</code>, <code>CHEAT</code>), and an optional <code>OnChange</code> callback. <code>r_max_bounces 8</code>, <code>cam_fov 60</code>.</li>
+    <li><strong>Commands</strong> — named functions that take string arguments. <code>screenshot</code>, <code>scene_load mybox.toml</code>, <code>r_backend metal</code>.</li>
+  </ul>
+
+  <p>Built on top: aliases, keybindings, <code>exec &lt;file&gt;</code> for running <code>.cfg</code> scripts, <code>autoexec.cfg</code> at startup. The full list of cvars and commands lives in the <a href="04_console_protocol.html">protocol doc</a>.</p>
+
+  <h3>Frontend</h3>
+  <p>A single <code>index.html</code> + small vanilla JS file embedded in the binary, served over the same port at <code>http://localhost:27960/</code>. No React, no build step, no node. The web UI opens a WebSocket back to the server and renders a console + dashboard. Embed via CMake's <code>file(READ ... HEX)</code> or a small <code>bin2c</code>-style step.</p>
+
+  <h3>Security</h3>
+  <ul>
+    <li>Bind to <code>127.0.0.1</code> only by default.</li>
+    <li>Origin check WebSocket upgrades — only accept <code>http://localhost:&lt;port&gt;</code> or <code>null</code> (raw WS).</li>
+    <li>Optional token auth (cvar <code>net_require_auth 1</code>); token printed at startup.</li>
+    <li>No HTTPS for localhost — would require self-signed certs and gives nothing useful.</li>
+    <li>For LAN/remote use: SSH tunnel (<code>ssh -L 27960:localhost:27960 box</code>), don't bind to a public interface.</li>
+  </ul>
+</section>
+
+<section id="deps">
+  <div class="section-marker"><span class="section-num">§ 12</span><span class="section-rule"></span></div>
+  <h2>Dependencies</h2>
+
+  <p>All via CMake <code>FetchContent</code> unless they require system install (Vulkan SDK on Mac).</p>
+
+  <table>
+    <thead><tr><th>Dependency</th><th>Purpose</th><th>License</th></tr></thead>
+    <tbody>
+      <tr><td><a href="https://github.com/g-truc/glm">glm</a></td><td>Vector/matrix math</td><td>MIT</td></tr>
+      <tr><td><a href="https://www.glfw.org">GLFW</a></td><td>Window + input</td><td>zlib</td></tr>
+      <tr><td><a href="https://github.com/microsoft/mimalloc">mimalloc</a></td><td>General allocator backing</td><td>MIT</td></tr>
+      <tr><td><a href="https://github.com/wolfpld/tracy">Tracy</a></td><td>Profiler (CPU + GPU + memory)</td><td>BSD-3</td></tr>
+      <tr><td><a href="https://shader-slang.com">Slang</a></td><td>Shading language + compiler</td><td>Apache-2</td></tr>
+      <tr><td>metal-cpp</td><td>Apple's C++ Metal bindings</td><td>Apache-2 (Apple)</td></tr>
+      <tr><td>Vulkan SDK + MoltenVK</td><td>Vulkan API on Mac</td><td>Apache-2</td></tr>
+      <tr><td><a href="https://gpuopen.com/vulkan-memory-allocator/">VMA</a></td><td>Vulkan memory allocator</td><td>MIT</td></tr>
+      <tr><td><a href="https://www.embree.org/">Embree</a></td><td>Software backend ray tracing</td><td>Apache-2</td></tr>
+      <tr><td><a href="https://github.com/elalish/manifold">Manifold</a></td><td>Mesh CSG (load-bearing)</td><td>MIT</td></tr>
+      <tr><td>tinygltf</td><td>glTF asset loading</td><td>MIT</td></tr>
+      <tr><td>stb_image</td><td>Texture loading</td><td>Public domain</td></tr>
+      <tr><td>toml++</td><td>Scene file parsing</td><td>MIT</td></tr>
+      <tr><td>civetweb</td><td>WebSocket server</td><td>MIT</td></tr>
+      <tr><td>fmt</td><td>Logging / formatting</td><td>MIT</td></tr>
+      <tr><td><a href="https://github.com/dougbinks/enkiTS">enkiTS</a></td><td>Job system</td><td>zlib</td></tr>
+      <tr><td><a href="https://github.com/google/highway">highway</a></td><td>Portable SIMD (when needed)</td><td>Apache-2</td></tr>
+    </tbody>
+  </table>
+
+  <p>No engine framework. No Boost. No Eigen. No Qt.</p>
+</section>
+
+<section id="open">
+  <div class="section-marker"><span class="section-num">§ 13</span><span class="section-rule"></span></div>
+  <h2>Open questions</h2>
+
+  <ul>
+    <li><strong>MoltenVK ray tracing extension status.</strong> Verify at the start of Phase 4 (Vulkan backend bringup). If incomplete, fallback path: Vulkan backend uses a compute-shader software ray tracer instead of <code>VK_KHR_ray_tracing_pipeline</code>. Slower, but the abstraction stays valid.</li>
+    <li><strong>Slang CPU target maturity.</strong> Spike at start of Phase 2 (Software backend) — confirm Slang generates usable C++ for our shader patterns. If not, fallback: write the path tracer twice (once in Slang for GPU, once in C++ for CPU). Significant cost; we want to avoid this.</li>
+    <li><strong>Bindless resources.</strong> Likely needed when material count grows past ~16. Add lazily; not a Phase 0 commitment.</li>
+    <li><strong>Mesh repair on import.</strong> Manifold rejects non-manifold input. v1 errors out and tells the user to fix in Blender; v2 might integrate a basic repair pass.</li>
+    <li><strong>Animated booleans / interval-based CSG.</strong> Not in v1. If interactive edit lag becomes bottlenecked on Manifold for any specific use case, add interval CSG as an opt-in mode.</li>
+    <li><strong>SDF objects.</strong> Discussed in §9. Not in v1. Trades away hardware RT advantage; revisit when the v1 feature set is solid and the desire for procedural / smooth-blended geometry is concrete.</li>
+    <li><strong>Cross-system CSG</strong> (mesh ⊖ SDF or vice versa). Out of scope even if SDFs are added. Would need either meshing the SDF (marching cubes) or a hybrid interval tracer across both systems.</li>
+    <li><strong>Windows bringup.</strong> Phase 12. Same Vulkan backend, native this time. Validates the abstraction against a real driver instead of MoltenVK.</li>
+  </ul>
+</section>
+
+<div class="footer">
+  <span>Document 02 of 04 · Design</span>
+  <span><a href="01_architecture_principles.html">← Principles</a> &nbsp;·&nbsp; <a href="03_implementation_plan.html">Next: Implementation Plan →</a></span>
+</div>
+
+</main>
+</div>
+
+</body>
+</html>

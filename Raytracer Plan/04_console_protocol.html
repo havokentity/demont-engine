@@ -1,0 +1,979 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Console Protocol · Path Tracer Project</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;0,9..144,800;1,9..144,400;1,9..144,600&family=Geist:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0e0d0c;
+  --bg-elev: #15130f;
+  --fg: #e8e3d6;
+  --fg-muted: #8a8478;
+  --fg-dim: #5a5650;
+  --border: #2a2722;
+  --border-strong: #3a3630;
+  --accent: #e89968;
+  --accent-dim: #a06d44;
+  --accent-glow: rgba(232, 153, 104, 0.15);
+  --code-fg: #d4b888;
+  --hard: #d97757;
+  --soft: #b8a868;
+  --done: #88a878;
+  --client: #b8a868;
+  --server: #6da6c4;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: 'Geist', system-ui, sans-serif;
+  font-size: 16px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+  opacity: 0.04;
+  background-image: radial-gradient(circle at 1px 1px, var(--fg) 1px, transparent 0);
+  background-size: 3px 3px;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  max-width: 1400px;
+  margin: 0 auto;
+  position: relative;
+  z-index: 2;
+}
+
+.sidebar {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  border-right: 1px solid var(--border);
+  padding: 3rem 2rem;
+  overflow-y: auto;
+  font-size: 0.875rem;
+}
+
+.sidebar-brand { font-family: 'Fraunces', serif; font-style: italic; font-size: 1.5rem; font-variation-settings: "opsz" 60; margin-bottom: 0.25rem; }
+.sidebar-tagline { font-family: 'JetBrains Mono', monospace; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.15em; color: var(--fg-muted); margin-bottom: 2.5rem; }
+.doc-nav { margin-bottom: 2.5rem; padding-bottom: 2rem; border-bottom: 1px solid var(--border); }
+.doc-nav-label, .toc-label { font-family: 'JetBrains Mono', monospace; font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.2em; color: var(--fg-dim); margin-bottom: 0.75rem; }
+.toc-label { margin-bottom: 1rem; }
+.doc-nav a { display: block; font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--fg-muted); text-decoration: none; padding: 0.4rem 0; border-left: 2px solid transparent; padding-left: 0.75rem; margin-left: -0.75rem; transition: all 0.15s ease; }
+.doc-nav a:hover { color: var(--accent); border-left-color: var(--accent); }
+.doc-nav a.current { color: var(--fg); border-left-color: var(--accent); }
+.doc-nav a .num { color: var(--fg-dim); margin-right: 0.5rem; }
+.toc { list-style: none; }
+.toc li { margin-bottom: 0.4rem; }
+.toc a { color: var(--fg-muted); text-decoration: none; font-size: 0.8rem; display: block; padding: 0.15rem 0; transition: color 0.15s ease; }
+.toc a:hover { color: var(--accent); }
+.toc .num { font-family: 'JetBrains Mono', monospace; font-size: 0.7rem; color: var(--fg-dim); margin-right: 0.6rem; display: inline-block; min-width: 1.2rem; }
+
+main { padding: 4rem 5rem 6rem; max-width: 960px; }
+
+.hero { margin-bottom: 5rem; padding-bottom: 3rem; border-bottom: 1px solid var(--border); }
+.hero-meta { display: flex; gap: 1.5rem; font-family: 'JetBrains Mono', monospace; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.18em; color: var(--fg-muted); margin-bottom: 1.5rem; }
+.hero-meta span::before { content: "▸ "; color: var(--accent); }
+.hero h1 { font-family: 'Fraunces', serif; font-weight: 400; font-size: clamp(3rem, 7vw, 5.5rem); line-height: 0.95; letter-spacing: -0.02em; font-variation-settings: "opsz" 144; margin-bottom: 1.5rem; }
+.hero h1 em { font-style: italic; color: var(--accent); }
+.hero-subtitle { font-family: 'Fraunces', serif; font-style: italic; font-size: 1.25rem; color: var(--fg-muted); font-variation-settings: "opsz" 36; max-width: 640px; line-height: 1.5; }
+
+section { margin-bottom: 4.5rem; scroll-margin-top: 2rem; }
+.section-marker { display: flex; align-items: baseline; gap: 1.25rem; margin-bottom: 1.5rem; }
+.section-num { font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--accent); letter-spacing: 0.1em; }
+.section-rule { flex: 1; height: 1px; background: var(--border); }
+
+h2 { font-family: 'Fraunces', serif; font-weight: 400; font-size: 2.25rem; line-height: 1.15; letter-spacing: -0.015em; font-variation-settings: "opsz" 96; margin-bottom: 1.5rem; }
+h3 { font-family: 'Fraunces', serif; font-weight: 600; font-size: 1.35rem; line-height: 1.3; margin-top: 2.5rem; margin-bottom: 0.85rem; font-variation-settings: "opsz" 36; }
+h4 { font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.12em; color: var(--accent); margin-top: 2rem; margin-bottom: 0.75rem; }
+p { margin-bottom: 1.25rem; max-width: 70ch; }
+p.lead { font-family: 'Fraunces', serif; font-size: 1.2rem; line-height: 1.55; font-variation-settings: "opsz" 36; margin-bottom: 2rem; max-width: 64ch; }
+
+a { color: var(--accent); text-decoration: none; border-bottom: 1px solid var(--accent-dim); transition: all 0.15s ease; }
+a:hover { color: var(--fg); border-bottom-color: var(--fg); }
+strong { color: var(--fg); font-weight: 600; }
+em { font-style: italic; color: var(--fg); }
+ul, ol { margin-bottom: 1.25rem; padding-left: 1.5rem; max-width: 70ch; }
+li { margin-bottom: 0.5rem; }
+ul li::marker { color: var(--accent); }
+ol li::marker { color: var(--fg-muted); font-family: 'JetBrains Mono', monospace; font-size: 0.85em; }
+
+code { font-family: 'JetBrains Mono', monospace; font-size: 0.88em; color: var(--code-fg); background: rgba(232, 153, 104, 0.08); padding: 0.1em 0.4em; border-radius: 2px; }
+pre { font-family: 'JetBrains Mono', monospace; font-size: 0.82rem; line-height: 1.55; background: var(--bg-elev); border: 1px solid var(--border); border-left: 2px solid var(--accent); padding: 1.25rem 1.5rem; overflow-x: auto; margin-bottom: 1.5rem; color: var(--code-fg); }
+pre code { background: none; padding: 0; color: inherit; font-size: inherit; }
+
+.principle { font-family: 'Fraunces', serif; font-style: italic; font-size: 1.4rem; line-height: 1.45; font-variation-settings: "opsz" 60; border-left: 2px solid var(--accent); padding: 0.5rem 0 0.5rem 1.5rem; margin: 2rem 0; max-width: 60ch; }
+.principle::before { content: "Note "; display: block; font-family: 'JetBrains Mono', monospace; font-style: normal; font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.2em; color: var(--accent); margin-bottom: 0.5rem; }
+
+table { width: 100%; border-collapse: collapse; margin-bottom: 1.5rem; font-size: 0.88rem; }
+th, td { text-align: left; padding: 0.65rem 0.9rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { font-family: 'JetBrains Mono', monospace; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.12em; color: var(--fg-muted); font-weight: 500; border-bottom: 1px solid var(--border-strong); }
+td code { font-size: 0.85em; }
+td:first-child code { color: var(--accent); }
+
+.callout { border: 1px solid var(--border); border-left: 2px solid var(--accent); background: var(--bg-elev); padding: 1.25rem 1.5rem; margin: 1.5rem 0; }
+.callout-label { font-family: 'JetBrains Mono', monospace; font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.2em; color: var(--accent); margin-bottom: 0.5rem; }
+.callout p:last-child { margin-bottom: 0; }
+.callout.warning { border-left-color: var(--hard); }
+.callout.warning .callout-label { color: var(--hard); }
+
+/* Message pair: client → server side by side */
+.msg-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  margin: 1rem 0 1.5rem;
+}
+
+.msg-pair.stacked { grid-template-columns: 1fr; }
+
+.msg-block {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  padding: 1rem 1.25rem;
+  position: relative;
+}
+
+.msg-block.client { border-left: 2px solid var(--client); }
+.msg-block.server { border-left: 2px solid var(--server); }
+
+.msg-direction {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  margin-bottom: 0.5rem;
+}
+
+.msg-block.client .msg-direction { color: var(--client); }
+.msg-block.server .msg-direction { color: var(--server); }
+
+.msg-block pre {
+  background: transparent;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font-size: 0.78rem;
+  border-left: none;
+}
+
+/* Namespace block for cvar/command catalog */
+.ns {
+  margin-top: 2.5rem;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  padding: 1.25rem 1.5rem;
+}
+
+.ns-header {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  margin-bottom: 1rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.ns-prefix {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.ns-title {
+  font-family: 'Fraunces', serif;
+  font-size: 1.1rem;
+  font-style: italic;
+  color: var(--fg);
+  font-variation-settings: "opsz" 36;
+}
+
+.ns table { margin-bottom: 0; font-size: 0.85rem; }
+.ns th { font-size: 0.65rem; }
+.ns td { padding: 0.5rem 0.75rem; }
+
+.flag {
+  display: inline-block;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  padding: 0.1em 0.4em;
+  border-radius: 2px;
+  margin-right: 0.3em;
+  vertical-align: 0.05em;
+  border: 1px solid;
+}
+.flag.archive { color: var(--soft); border-color: var(--soft); }
+.flag.readonly { color: var(--fg-muted); border-color: var(--fg-muted); }
+.flag.cheat { color: var(--hard); border-color: var(--hard); }
+
+.tag-inline {
+  display: inline-block;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  padding: 0.1em 0.45em;
+  border-radius: 2px;
+  margin-right: 0.4em;
+  vertical-align: 0.05em;
+  border: 1px solid;
+}
+.tag-inline.hard { color: var(--hard); border-color: var(--hard); background: rgba(217, 119, 87, 0.1); }
+.tag-inline.soft { color: var(--soft); border-color: var(--soft); background: rgba(184, 168, 104, 0.08); }
+
+.footer { margin-top: 6rem; padding-top: 3rem; border-top: 1px solid var(--border); display: flex; justify-content: space-between; font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--fg-muted); }
+.footer a { color: var(--fg-muted); border: none; }
+.footer a:hover { color: var(--accent); }
+
+@media (max-width: 1024px) {
+  .layout { grid-template-columns: 1fr; }
+  .sidebar { position: static; height: auto; border-right: none; border-bottom: 1px solid var(--border); }
+  main { padding: 3rem 2rem; }
+  .msg-pair { grid-template-columns: 1fr; }
+}
+
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border-strong); }
+::-webkit-scrollbar-thumb:hover { background: var(--accent-dim); }
+::selection { background: var(--accent-glow); color: var(--fg); }
+</style>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar">
+  <div class="sidebar-brand">Path Tracer</div>
+  <div class="sidebar-tagline">Project Documentation</div>
+
+  <nav class="doc-nav">
+    <div class="doc-nav-label">Documents</div>
+    <a href="index.html"><span class="num">↑</span>Home</a>
+    <a href="01_architecture_principles.html"><span class="num">01</span>Architecture Principles</a>
+    <a href="02_design.html"><span class="num">02</span>Design</a>
+    <a href="03_implementation_plan.html"><span class="num">03</span>Implementation Plan</a>
+    <a href="04_console_protocol.html" class="current"><span class="num">04</span>Console Protocol</a>
+    <a href="05_cpp_cheatsheet.html"><span class="num">05</span>C++ Cheatsheet</a>
+  </nav>
+
+  <div class="toc-label">In this document</div>
+  <ul class="toc">
+    <li><a href="#concepts"><span class="num">1</span>CVars & Commands</a></li>
+    <li><a href="#transport"><span class="num">2</span>Transport: WS + line</a></li>
+    <li><a href="#ws-format"><span class="num">3</span>WebSocket message format</a></li>
+    <li><a href="#line-format"><span class="num">4</span>Line protocol</a></li>
+    <li><a href="#events"><span class="num">5</span>Event stream</a></li>
+    <li><a href="#cvars"><span class="num">6</span>CVar catalog</a></li>
+    <li><a href="#commands"><span class="num">7</span>Command catalog</a></li>
+    <li><a href="#cfg"><span class="num">8</span>.cfg scripts & aliases</a></li>
+    <li><a href="#security"><span class="num">9</span>Security</a></li>
+    <li><a href="#examples"><span class="num">10</span>Connection examples</a></li>
+  </ul>
+</aside>
+
+<main>
+
+<header class="hero">
+  <div class="hero-meta">
+    <span>v1.0</span>
+    <span>Document 04 / 04</span>
+    <span>The Wire</span>
+  </div>
+  <h1>Console <em>Protocol</em></h1>
+  <p class="hero-subtitle">The wire format and command catalog. Every external tool — the embedded web UI, shell scripts, custom Python automation — speaks one of the protocols defined here. There is no other API.</p>
+</header>
+
+<p class="lead">The renderer process opens two sockets at startup. WebSocket on port 27960 speaks JSON for the rich console UI. Plain TCP on 27961 speaks newline-delimited text for shell pipelines (<code>echo screenshot | nc localhost 27961</code>). Both surfaces dispatch into the same CVar/Command system. Anything you can do from one, you can do from the other.</p>
+
+<section id="concepts">
+  <div class="section-marker"><span class="section-num">§ 01</span><span class="section-rule"></span></div>
+  <h2>CVars & Commands — the two primitives</h2>
+
+  <p>Every external interaction reduces to one of two operations: <strong>read or write a CVar</strong>, or <strong>invoke a Command</strong>. These two concepts are inherited from the Quake/Source console lineage and they cover every interactive engine surface we need.</p>
+
+  <h3>CVars</h3>
+
+  <p>A CVar is a named variable with a string-stored value, a default, optional flags, and an optional change callback. The string storage is deliberate — keeps the protocol uniform — and we coerce on access (<code>GetInt()</code>, <code>GetFloat()</code>, <code>GetBool()</code>).</p>
+
+<pre><code>struct CVar {
+    std::string         name;
+    std::string         value;
+    std::string         default_value;
+    std::string         description;
+    uint32_t            flags;        // ARCHIVE | READONLY | CHEAT
+    std::function&lt;void(const CVar&amp;)&gt; on_change;
+};</code></pre>
+
+  <p>Flags:</p>
+  <table>
+    <thead><tr><th>Flag</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><span class="flag archive">ARCHIVE</span></td><td>Persisted to <code>config.cfg</code> on shutdown; reloaded on startup. User preferences.</td></tr>
+      <tr><td><span class="flag readonly">READONLY</span></td><td>Set by the engine, not the user. <code>sys_*</code> introspection cvars.</td></tr>
+      <tr><td><span class="flag cheat">CHEAT</span></td><td>Requires <code>dev_cheats 1</code> before mutation is allowed. Debug-only knobs.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Commands</h3>
+
+  <p>A Command is a named function with a callback that takes a list of string arguments. Argument parsing is the command's responsibility.</p>
+
+<pre><code>struct Command {
+    std::string name;
+    std::string description;
+    std::function&lt;void(std::span&lt;std::string_view&gt;)&gt; callback;
+};</code></pre>
+
+  <h3>Naming convention</h3>
+
+  <p>Names are <code>snake_case</code> with a namespace prefix matching the subsystem:</p>
+
+  <table>
+    <thead><tr><th>Prefix</th><th>Owner</th></tr></thead>
+    <tbody>
+      <tr><td><code>r_</code></td><td>Renderer (bounces, samples, backend, debug visualizations)</td></tr>
+      <tr><td><code>sys_</code></td><td>Hardware introspection (read-only)</td></tr>
+      <tr><td><code>mem_</code></td><td>Memory budgets and reports</td></tr>
+      <tr><td><code>cam_</code></td><td>Camera controls</td></tr>
+      <tr><td><code>csg_</code></td><td>Mesh CSG editing (Phase 9)</td></tr>
+      <tr><td><code>net_</code></td><td>Console server config</td></tr>
+      <tr><td><code>dev_</code></td><td>Developer / debug toggles</td></tr>
+      <tr><td><code>app_</code></td><td>App-level (window, vsync, target FPS)</td></tr>
+    </tbody>
+  </table>
+
+  <div class="principle">CVars and commands are the engine's only API to the outside world. Every tweakable becomes a CVar; every action becomes a Command. There are no other configuration mechanisms.</div>
+</section>
+
+<section id="transport">
+  <div class="section-marker"><span class="section-num">§ 02</span><span class="section-rule"></span></div>
+  <h2>Transport layer</h2>
+
+  <table>
+    <thead><tr><th>Surface</th><th>Port</th><th>Wire format</th><th>Use case</th></tr></thead>
+    <tbody>
+      <tr><td>WebSocket</td><td><code>net_port</code> (default 27960)</td><td>JSON messages</td><td>Web UI, rich clients, event subscriptions</td></tr>
+      <tr><td>HTTP (same port)</td><td>27960</td><td>Static files</td><td>Serves the embedded <code>index.html</code> + JS</td></tr>
+      <tr><td>Plain TCP</td><td><code>net_line_port</code> (default 27961)</td><td>Newline-delimited text</td><td>Shell pipelines, <code>nc</code>, simple scripts</td></tr>
+    </tbody>
+  </table>
+
+  <p>Both sockets bind to <code>127.0.0.1</code> by default. See <a href="#security">§9 Security</a>.</p>
+
+  <h3>Threading model</h3>
+  <p>Network I/O runs on dedicated threads inside civetweb. Incoming commands queue onto a lock-free SPSC ring; the main thread drains the ring once per frame and dispatches into the Console. Replies and events queue back through a second ring to the network thread. This means console execution always happens on the main thread, in sync with the renderer — a command can mutate any engine state without locking.</p>
+</section>
+
+<section id="ws-format">
+  <div class="section-marker"><span class="section-num">§ 03</span><span class="section-rule"></span></div>
+  <h2>WebSocket message format</h2>
+
+  <p>Every message is a JSON object with a <code>type</code> field. Optional <code>id</code> field correlates requests to responses; if the client supplies it, the server echoes it back in the response.</p>
+
+  <h3>Client → Server</h3>
+
+  <p><strong><code>exec</code></strong> — execute a console line (the universal escape hatch; equivalent to typing into the console).</p>
+  <div class="msg-pair">
+    <div class="msg-block client">
+      <div class="msg-direction">→ client</div>
+<pre><code>{
+  "type": "exec",
+  "id": "req-42",
+  "line": "r_max_bounces 12"
+}</code></pre>
+    </div>
+    <div class="msg-block server">
+      <div class="msg-direction">← server</div>
+<pre><code>{
+  "type": "result",
+  "id": "req-42",
+  "ok": true,
+  "output": "r_max_bounces: 8 -> 12"
+}</code></pre>
+    </div>
+  </div>
+
+  <p><strong><code>get_cvar</code></strong> — read a CVar's current value and metadata.</p>
+  <div class="msg-pair">
+    <div class="msg-block client">
+      <div class="msg-direction">→ client</div>
+<pre><code>{
+  "type": "get_cvar",
+  "id": "req-43",
+  "name": "r_max_bounces"
+}</code></pre>
+    </div>
+    <div class="msg-block server">
+      <div class="msg-direction">← server</div>
+<pre><code>{
+  "type": "result",
+  "id": "req-43",
+  "ok": true,
+  "cvar": {
+    "name": "r_max_bounces",
+    "value": "12",
+    "default": "8",
+    "flags": ["ARCHIVE"],
+    "description": "Maximum path tracer bounce depth"
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <p><strong><code>set_cvar</code></strong> — write a CVar. Functionally identical to <code>exec "name value"</code>, but explicit.</p>
+  <div class="msg-pair">
+    <div class="msg-block client">
+      <div class="msg-direction">→ client</div>
+<pre><code>{
+  "type": "set_cvar",
+  "id": "req-44",
+  "name": "cam_fov",
+  "value": "90"
+}</code></pre>
+    </div>
+    <div class="msg-block server">
+      <div class="msg-direction">← server</div>
+<pre><code>{
+  "type": "result",
+  "id": "req-44",
+  "ok": true
+}</code></pre>
+    </div>
+  </div>
+
+  <p><strong><code>list_cvars</code></strong> / <strong><code>list_commands</code></strong> — enumeration. Optional <code>prefix</code> filter for tab completion.</p>
+  <div class="msg-pair">
+    <div class="msg-block client">
+      <div class="msg-direction">→ client</div>
+<pre><code>{
+  "type": "list_cvars",
+  "id": "req-45",
+  "prefix": "r_"
+}</code></pre>
+    </div>
+    <div class="msg-block server">
+      <div class="msg-direction">← server</div>
+<pre><code>{
+  "type": "result",
+  "id": "req-45",
+  "ok": true,
+  "cvars": [
+    { "name": "r_backend", "value": "metal", ... },
+    { "name": "r_max_bounces", "value": "8", ... },
+    ...
+  ]
+}</code></pre>
+    </div>
+  </div>
+
+  <p><strong><code>subscribe</code></strong> / <strong><code>unsubscribe</code></strong> — start or stop receiving events on named topics.</p>
+  <div class="msg-pair">
+    <div class="msg-block client">
+      <div class="msg-direction">→ client</div>
+<pre><code>{
+  "type": "subscribe",
+  "topics": ["log", "frame_stats", "mem_stats"]
+}</code></pre>
+    </div>
+    <div class="msg-block server">
+      <div class="msg-direction">← server</div>
+<pre><code>{
+  "type": "result",
+  "ok": true,
+  "subscribed": ["log", "frame_stats", "mem_stats"]
+}</code></pre>
+    </div>
+  </div>
+
+  <h3>Server → Client</h3>
+
+  <p><strong><code>result</code></strong> — response to a request, correlated by <code>id</code>. Shown above.</p>
+
+  <p><strong><code>event</code></strong> — pushed message on a subscribed topic. No <code>id</code>.</p>
+
+  <div class="msg-pair stacked">
+    <div class="msg-block server">
+      <div class="msg-direction">← server (push)</div>
+<pre><code>{
+  "type": "event",
+  "topic": "frame_stats",
+  "ts": 1714754321.482,
+  "data": {
+    "fps": 142.3,
+    "frame_ms": 7.03,
+    "trace_ms": 5.61,
+    "tonemap_ms": 0.42,
+    "spp": 487,
+    "backend": "metal",
+    "resolution": [2560, 1440]
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <h3>Error responses</h3>
+
+  <div class="msg-pair stacked">
+    <div class="msg-block server">
+      <div class="msg-direction">← server</div>
+<pre><code>{
+  "type": "result",
+  "id": "req-46",
+  "ok": false,
+  "error": "unknown cvar: r_potato"
+}</code></pre>
+    </div>
+  </div>
+</section>
+
+<section id="line-format">
+  <div class="section-marker"><span class="section-num">§ 04</span><span class="section-rule"></span></div>
+  <h2>Line protocol (port 27961)</h2>
+
+  <p>The line protocol is the WebSocket protocol with the JSON peeled away. Every input line is treated as if wrapped in <code>{"type":"exec", "line": "..."}</code>; output is the rendered <code>output</code> string from the result.</p>
+
+  <p>Why have it: <code>echo</code>, <code>nc</code>, <code>xargs</code>, shell loops. WebSocket needs a client library; line protocol needs nothing but a TCP socket.</p>
+
+<pre><code>$ nc localhost 27961
+sys_info
+CPU: Apple M4 Max (12P + 4E)
+RAM: 64 GB
+GPU: Apple M4 Max (40 cores, 64 GB unified, hardware RT)
+OS:  macOS 15.1
+
+r_max_bounces
+r_max_bounces = 8
+
+r_max_bounces 16
+r_max_bounces: 8 -&gt; 16
+
+screenshot
+saved screenshots/2026-05-03_17-23-04.png
+^D
+$</code></pre>
+
+  <p>Errors come back prefixed <code>error: </code>:</p>
+
+<pre><code>$ echo "r_potato" | nc localhost 27961
+error: unknown cvar: r_potato</code></pre>
+
+  <p>The line protocol does <em>not</em> push events. Subscribe to topics via WebSocket if you want a stream. This is a deliberate limitation — keeps the line port stateless and pipeable.</p>
+</section>
+
+<section id="events">
+  <div class="section-marker"><span class="section-num">§ 05</span><span class="section-rule"></span></div>
+  <h2>Event stream topics</h2>
+
+  <p>Topics are subscribed individually. Each emits at its own cadence.</p>
+
+  <table>
+    <thead><tr><th>Topic</th><th>Cadence</th><th>Payload sketch</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>log</code></td>
+        <td>On every log call</td>
+        <td><code>{ level, source, message, ts }</code> where level is <code>info|warn|error</code></td>
+      </tr>
+      <tr>
+        <td><code>frame_stats</code></td>
+        <td>Once per frame (capped to ~10 Hz over the wire to avoid flooding)</td>
+        <td><code>{ fps, frame_ms, trace_ms, tonemap_ms, spp, backend, resolution }</code></td>
+      </tr>
+      <tr>
+        <td><code>mem_stats</code></td>
+        <td>1 Hz</td>
+        <td><code>{ tags: { Scene: { bytes, peak, count }, Csg: {...}, ... } }</code></td>
+      </tr>
+      <tr>
+        <td><code>gpu_stats</code></td>
+        <td>1 Hz</td>
+        <td><code>{ allocated_bytes, budget_bytes, device_name }</code></td>
+      </tr>
+      <tr>
+        <td><code>backend_change</code></td>
+        <td>On Rebuild</td>
+        <td><code>{ from, to, rebuild_ms }</code></td>
+      </tr>
+      <tr>
+        <td><code>csg_change</code></td>
+        <td>On CSG re-bake (Phase 9+)</td>
+        <td><code>{ root_node_id, bake_ms, blas_rebuild_ms, tri_count }</code></td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="cvars">
+  <div class="section-marker"><span class="section-num">§ 06</span><span class="section-rule"></span></div>
+  <h2>CVar catalog</h2>
+
+  <p>Canonical list. New cvars added to this doc as phases land. Defaults shown are the <em>compiled-in</em> defaults; <code>config.cfg</code> may override on startup for <code>ARCHIVE</code> cvars.</p>
+
+  <div class="ns" id="cvars-r">
+    <div class="ns-header">
+      <span class="ns-prefix">r_*</span>
+      <span class="ns-title">Renderer</span>
+    </div>
+    <table>
+      <thead><tr><th>Name</th><th>Default</th><th>Flags</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>r_backend</code></td><td><code>metal</code></td><td><span class="flag archive">A</span></td><td>One of <code>none</code>, <code>software</code>, <code>metal</code>, <code>vulkan</code>. Mutating triggers Rebuild.</td></tr>
+        <tr><td><code>r_mode</code></td><td><code>pathtrace</code></td><td><span class="flag archive">A</span></td><td>Render mode. One of <code>pathtrace</code> (Monte Carlo, accumulates), <code>raytrace</code> (Whitted-style: reflections + refractions + hard shadows, no GI, real-time), <code>preview</code> (primary rays + direct light, cheapest). Switching resets accumulation.</td></tr>
+        <tr><td><code>r_max_bounces</code></td><td><code>8</code></td><td><span class="flag archive">A</span></td><td>Maximum path depth in <code>pathtrace</code> mode.</td></tr>
+        <tr><td><code>r_raytrace_depth</code></td><td><code>4</code></td><td><span class="flag archive">A</span></td><td>Maximum reflection/refraction recursion in <code>raytrace</code> mode. Each bounce is a deterministic ray, not Monte Carlo.</td></tr>
+        <tr><td><code>r_samples_per_pixel</code></td><td><code>1</code></td><td><span class="flag archive">A</span></td><td>Samples per pixel per frame in <code>pathtrace</code> mode (typically 1; rely on accumulation). Ignored in <code>raytrace</code> and <code>preview</code>.</td></tr>
+        <tr><td><code>r_resolution_scale</code></td><td><code>1.0</code></td><td><span class="flag archive">A</span></td><td>Internal render resolution multiplier, applied to <em>both</em> dimensions of the swapchain. Aspect ratio is always preserved. <code>0.5</code> = quarter pixel count (e.g. 960×540 internal upscaled to 1920×1080 swapchain). <code>0.13</code> ≈ 256×144 internal. Window resolution itself is unaffected; the upscale fills the window with no distortion or letterboxing.</td></tr>
+        <tr><td><code>r_denoiser</code></td><td><code>auto</code></td><td><span class="flag archive">A</span></td><td><code>off</code>, <code>auto</code>, <code>metalfx</code>, <code>svgf</code>. Phase 11+.</td></tr>
+        <tr><td><code>r_clear_color</code></td><td><code>"0.05 0.05 0.06"</code></td><td></td><td>Background / sky fallback color.</td></tr>
+        <tr><td><code>r_show_normals</code></td><td><code>0</code></td><td><span class="flag cheat">C</span></td><td>Debug visualization: write hit normals to output.</td></tr>
+        <tr><td><code>r_show_albedo</code></td><td><code>0</code></td><td><span class="flag cheat">C</span></td><td>Debug visualization: write material albedo only.</td></tr>
+        <tr><td><code>r_show_material_id</code></td><td><code>0</code></td><td><span class="flag cheat">C</span></td><td>Debug visualization: false-color by material ID.</td></tr>
+        <tr><td><code>r_russian_roulette_depth</code></td><td><code>4</code></td><td></td><td>Bounce depth at which RR termination begins.</td></tr>
+        <tr><td><code>r_use_hardware_rt</code></td><td><code>1</code></td><td></td><td>If <code>0</code> on Metal/Vulkan, fall back to compute-shader BVH.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="ns" id="cvars-sys">
+    <div class="ns-header">
+      <span class="ns-prefix">sys_*</span>
+      <span class="ns-title">Hardware introspection (read-only)</span>
+    </div>
+    <table>
+      <thead><tr><th>Name</th><th>Example value</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>sys_cpu_model</code></td><td><code>"Apple M4 Max"</code></td><td>From <code>sysctl machdep.cpu.brand_string</code></td></tr>
+        <tr><td><code>sys_cpu_pcores</code></td><td><code>12</code></td><td>Performance cores</td></tr>
+        <tr><td><code>sys_cpu_ecores</code></td><td><code>4</code></td><td>Efficiency cores</td></tr>
+        <tr><td><code>sys_cpu_features</code></td><td><code>"NEON FP16"</code></td><td>SIMD capabilities present</td></tr>
+        <tr><td><code>sys_ram_total_mb</code></td><td><code>65536</code></td><td>Physical memory</td></tr>
+        <tr><td><code>sys_os</code></td><td><code>"macOS 15.1"</code></td><td>OS name + version</td></tr>
+        <tr><td><code>sys_gpu_name</code></td><td><code>"Apple M4 Max"</code></td><td>GPU model</td></tr>
+        <tr><td><code>sys_gpu_vram_mb</code></td><td><code>49152</code></td><td>GPU working set (unified memory budget)</td></tr>
+        <tr><td><code>sys_gpu_unified</code></td><td><code>1</code></td><td>1 if unified memory architecture</td></tr>
+        <tr><td><code>sys_gpu_hwrt</code></td><td><code>1</code></td><td>1 if hardware ray tracing is supported on the current backend</td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top: 1rem; margin-bottom: 0; font-size: 0.85rem; color: var(--fg-muted);">All <code>sys_*</code> cvars are <span class="flag readonly">READONLY</span>.</p>
+  </div>
+
+  <div class="ns" id="cvars-mem">
+    <div class="ns-header">
+      <span class="ns-prefix">mem_*</span>
+      <span class="ns-title">Memory budgets</span>
+    </div>
+    <table>
+      <thead><tr><th>Name</th><th>Default (MB)</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>mem_budget_scene_mb</code></td><td><code>256</code></td><td>Scene + entity arrays</td></tr>
+        <tr><td><code>mem_budget_meshassets_mb</code></td><td><code>1024</code></td><td>Imported mesh CPU storage</td></tr>
+        <tr><td><code>mem_budget_textures_mb</code></td><td><code>2048</code></td><td>Texture CPU staging + assets</td></tr>
+        <tr><td><code>mem_budget_gpubuffers_mb</code></td><td><code>4096</code></td><td>GPU-resident buffers (BLAS, TLAS, vertex)</td></tr>
+        <tr><td><code>mem_budget_csg_mb</code></td><td><code>512</code></td><td>Manifold trees + caches</td></tr>
+        <tr><td><code>mem_budget_console_mb</code></td><td><code>16</code></td><td>Console history, log ring, command buffers</td></tr>
+        <tr><td><code>mem_budget_jobsystem_mb</code></td><td><code>32</code></td><td>Per-thread job pools</td></tr>
+        <tr><td><code>mem_budget_render_mb</code></td><td><code>64</code></td><td>Frame arenas across triple buffer</td></tr>
+        <tr><td><code>mem_budget_misc_mb</code></td><td><code>128</code></td><td>Catch-all (untagged STL allocations etc.)</td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top: 1rem; margin-bottom: 0; font-size: 0.85rem; color: var(--fg-muted);">All <code>mem_budget_*</code> cvars are <span class="flag archive">ARCHIVE</span>. Exceeding a budget aborts in debug, returns null in release, always logs.</p>
+  </div>
+
+  <div class="ns" id="cvars-cam">
+    <div class="ns-header">
+      <span class="ns-prefix">cam_*</span>
+      <span class="ns-title">Camera</span>
+    </div>
+    <table>
+      <thead><tr><th>Name</th><th>Default</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>cam_pos</code></td><td><code>"0 1 4"</code></td><td>World-space position</td></tr>
+        <tr><td><code>cam_yaw</code></td><td><code>0</code></td><td>Yaw in degrees</td></tr>
+        <tr><td><code>cam_pitch</code></td><td><code>0</code></td><td>Pitch in degrees, clamped ±85°</td></tr>
+        <tr><td><code>cam_fov</code></td><td><code>60</code></td><td>Vertical FOV in degrees</td></tr>
+        <tr><td><code>cam_speed</code></td><td><code>3.0</code></td><td>Movement speed (units/sec)</td></tr>
+        <tr><td><code>cam_sprint_mult</code></td><td><code>3.0</code></td><td>Speed multiplier when shift is held</td></tr>
+        <tr><td><code>cam_sensitivity</code></td><td><code>0.1</code></td><td>Mouse-look sensitivity</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="ns" id="cvars-net">
+    <div class="ns-header">
+      <span class="ns-prefix">net_*</span>
+      <span class="ns-title">Console server</span>
+    </div>
+    <table>
+      <thead><tr><th>Name</th><th>Default</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>net_port</code></td><td><code>27960</code></td><td>WebSocket / HTTP port</td></tr>
+        <tr><td><code>net_line_port</code></td><td><code>27961</code></td><td>Plain-text TCP port</td></tr>
+        <tr><td><code>net_bind_address</code></td><td><code>"127.0.0.1"</code></td><td>Bind interface. Override at your own risk — see §9.</td></tr>
+        <tr><td><code>net_require_auth</code></td><td><code>0</code></td><td>If 1, require <code>?token=...</code> on WS connect and as first line on TCP.</td></tr>
+        <tr><td><code>net_lan_mode</code></td><td><code>0</code></td><td>Convenience: bind to <code>0.0.0.0</code> and force <code>net_require_auth 1</code>. For SSH-tunneled remote work prefer leaving this off.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="ns" id="cvars-csg">
+    <div class="ns-header">
+      <span class="ns-prefix">csg_*</span>
+      <span class="ns-title">Mesh CSG (Phase 9)</span>
+    </div>
+    <table>
+      <thead><tr><th>Name</th><th>Default</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>csg_root</code></td><td><code>0</code></td><td>Currently active root node ID. <code>0</code> = no CSG body.</td></tr>
+        <tr><td><code>csg_async_bake</code></td><td><code>1</code></td><td>If 1, run Manifold on worker thread (default). Set 0 only for debugging hangs.</td></tr>
+        <tr><td><code>csg_max_bake_ms</code></td><td><code>50</code></td><td>Soft warning threshold. Logs if a bake exceeds this.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="ns" id="cvars-app">
+    <div class="ns-header">
+      <span class="ns-prefix">app_ &amp; dev_*</span>
+      <span class="ns-title">App and developer toggles</span>
+    </div>
+    <table>
+      <thead><tr><th>Name</th><th>Default</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>app_window_width</code></td><td><code>1920</code></td><td>Initial window width <span class="flag archive">A</span></td></tr>
+        <tr><td><code>app_window_height</code></td><td><code>1080</code></td><td>Initial window height <span class="flag archive">A</span></td></tr>
+        <tr><td><code>app_vsync</code></td><td><code>1</code></td><td>Swapchain present mode <span class="flag archive">A</span></td></tr>
+        <tr><td><code>dev_cheats</code></td><td><code>0</code></td><td>Gate for <span class="flag cheat">CHEAT</span>-flagged cvars.</td></tr>
+        <tr><td><code>dev_log_level</code></td><td><code>info</code></td><td>One of <code>error</code>, <code>warn</code>, <code>info</code>, <code>debug</code>.</td></tr>
+        <tr><td><code>dev_validation</code></td><td><code>1</code> debug / <code>0</code> release</td><td>Vulkan validation layers, Metal API validation.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="commands">
+  <div class="section-marker"><span class="section-num">§ 07</span><span class="section-rule"></span></div>
+  <h2>Command catalog</h2>
+
+  <h3>App / system</h3>
+  <table>
+    <thead><tr><th>Command</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>quit</code></td><td>Exit the app cleanly.</td></tr>
+      <tr><td><code>sys_info</code></td><td>Print summary of <code>sys_*</code> cvars.</td></tr>
+      <tr><td><code>echo &lt;text...&gt;</code></td><td>Print arguments back. Useful in <code>.cfg</code> scripts.</td></tr>
+      <tr><td><code>exec &lt;file.cfg&gt;</code></td><td>Run each line of a config script.</td></tr>
+      <tr><td><code>alias &lt;name&gt; &lt;line&gt;</code></td><td>Define a command alias. <code>alias gpfast "r_max_bounces 4; r_resolution_scale 0.5"</code></td></tr>
+      <tr><td><code>bind &lt;key&gt; &lt;line&gt;</code></td><td>Bind a key to a console line. Phase 5+.</td></tr>
+      <tr><td><code>watch &lt;cvar&gt;</code></td><td>Pin a cvar in the web UI for live monitoring.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Memory & profiling</h3>
+  <table>
+    <thead><tr><th>Command</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>mem_report</code></td><td>Print bytes allocated per <code>MemTag</code>, with peak and count.</td></tr>
+      <tr><td><code>mem_report_top &lt;n&gt;</code></td><td>Top N allocation sites by current bytes (debug builds only).</td></tr>
+      <tr><td><code>mem_leaks</code></td><td>Diff against startup snapshot. Debug-only.</td></tr>
+      <tr><td><code>gpu_mem_report</code></td><td>Print GPU memory usage from the active backend.</td></tr>
+      <tr><td><code>perf_report</code></td><td>Print last 60 frames of frame_ms, trace_ms, tonemap_ms.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Render</h3>
+  <table>
+    <thead><tr><th>Command</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>reload_shaders</code></td><td>Recompile Slang sources and rebuild pipelines without rebuilding the device.</td></tr>
+      <tr><td><code>screenshot [path]</code></td><td>Save current swapchain to PNG. Default path <code>screenshots/&lt;timestamp&gt;.png</code>.</td></tr>
+      <tr><td><code>dump_frame</code></td><td>Save HDR accumulation buffer to EXR. Useful for debugging tone mapping.</td></tr>
+      <tr><td><code>scene_load &lt;file.toml&gt;</code></td><td>Load a scene description.</td></tr>
+      <tr><td><code>scene_save &lt;file.toml&gt;</code></td><td>Serialize current scene to TOML.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Mesh CSG (Phase 9)</h3>
+  <table>
+    <thead><tr><th>Command</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>csg_create_leaf &lt;node_id&gt; &lt;mesh_asset&gt; &lt;material_id&gt;</code></td><td>Create a leaf node referencing a mesh asset.</td></tr>
+      <tr><td><code>csg_create_op &lt;node_id&gt; &lt;union|intersect|subtract&gt; &lt;left_id&gt; &lt;right_id&gt;</code></td><td>Create an inner node.</td></tr>
+      <tr><td><code>csg_set_transform &lt;node_id&gt; &lt;tx ty tz&gt; &lt;rx ry rz&gt; &lt;sx sy sz&gt;</code></td><td>Update transform; triggers re-bake of subtree.</td></tr>
+      <tr><td><code>csg_set_op &lt;node_id&gt; &lt;new_op&gt;</code></td><td>Change a node's boolean operation.</td></tr>
+      <tr><td><code>csg_delete &lt;node_id&gt;</code></td><td>Remove a node and its descendants.</td></tr>
+      <tr><td><code>csg_set_root &lt;node_id&gt;</code></td><td>Make a node the active scene root.</td></tr>
+      <tr><td><code>csg_dump</code></td><td>Print the current tree.</td></tr>
+    </tbody>
+  </table>
+
+</section>
+
+<section id="cfg">
+  <div class="section-marker"><span class="section-num">§ 08</span><span class="section-rule"></span></div>
+  <h2>.cfg scripts & aliases</h2>
+
+  <p>A <code>.cfg</code> file is plain text, one console line per row, comments with <code>//</code>. <code>exec foo.cfg</code> runs each line through the same parser as a typed command.</p>
+
+  <p><code>autoexec.cfg</code> in the working directory runs at startup automatically (after <code>config.cfg</code> is loaded for ARCHIVE cvars). Use it to script your favorite scene loadout, key bindings, or perf presets.</p>
+
+<pre><code>// autoexec.cfg
+r_backend metal
+r_max_bounces 12
+cam_fov 65
+
+alias quality "r_resolution_scale 1.0; r_max_bounces 16; r_denoiser off"
+alias fast    "r_resolution_scale 0.5; r_max_bounces 4;  r_denoiser metalfx"
+
+bind F5 screenshot
+bind F9 reload_shaders
+
+scene_load assets/scenes/cornell_drilled.toml
+echo "ready"</code></pre>
+
+  <p>Aliases are evaluated at invocation time, so they pick up later cvar changes. They can chain commands using <code>;</code> as a separator.</p>
+</section>
+
+<section id="security">
+  <div class="section-marker"><span class="section-num">§ 09</span><span class="section-rule"></span></div>
+  <h2>Security</h2>
+
+  <p>The console exposes total control over the renderer process — backend switches, file I/O via <code>scene_load</code>, screenshot paths. Treat it like an admin shell, because that's what it is.</p>
+
+  <h3>Defaults that protect you</h3>
+  <ul>
+    <li><span class="tag-inline hard">HARD</span> Both sockets bind to <code>127.0.0.1</code> only. Other machines on your network cannot reach them. <code>net_bind_address</code> can override; don't, unless you read this whole section.</li>
+    <li><span class="tag-inline hard">HARD</span> WebSocket upgrades reject any <code>Origin</code> header that isn't <code>http://localhost:&lt;port&gt;</code>, <code>http://127.0.0.1:&lt;port&gt;</code>, or absent (raw clients like wscat). This blocks DNS-rebinding attacks where a malicious website tries to reach your local renderer through a browser tab.</li>
+    <li><span class="tag-inline hard">HARD</span> No HTTPS, no WSS. Localhost loopback doesn't traverse a network; encryption adds nothing useful and would require self-signed certs that browsers hate.</li>
+  </ul>
+
+  <h3>Optional token auth</h3>
+
+  <p>Set <code>net_require_auth 1</code> and the server prints a randomly-generated token at startup:</p>
+
+<pre><code>[net] WebSocket   ws://127.0.0.1:27960/?token=8f3c2e1a0b9d
+[net] Line proto  127.0.0.1:27961  (first line: AUTH 8f3c2e1a0b9d)
+[net] HTTP UI     http://127.0.0.1:27960/?token=8f3c2e1a0b9d</code></pre>
+
+  <p>WS clients must present the token as the <code>?token=</code> query parameter; line clients must send <code>AUTH &lt;token&gt;\n</code> as their first line. Without auth, the server closes the connection.</p>
+
+  <p>You generally don't need this for local-only use — loopback bind + Origin check covers the realistic attack surface. Turn it on when you bind to a non-loopback interface, run untrusted browser extensions, or work in a shared-machine environment.</p>
+
+  <h3>Remote access — do this, not that</h3>
+
+  <div class="callout">
+    <div class="callout-label">The right way</div>
+    <p>SSH tunnel:</p>
+<pre style="margin-bottom:0; background: transparent; border: none; padding-left: 0; border-left: none;"><code>ssh -L 27960:localhost:27960 -L 27961:localhost:27961 my-mac.local</code></pre>
+    <p>Then visit <code>http://localhost:27960</code> on the local machine. The renderer keeps binding to loopback only; SSH handles authentication, encryption, and remote reachability. This is the supported remote workflow.</p>
+  </div>
+
+  <div class="callout warning">
+    <div class="callout-label">The wrong way</div>
+    <p>Setting <code>net_bind_address 0.0.0.0</code> exposes the console to every device on your LAN. If you ever do this, you must also set <code>net_require_auth 1</code>, and you should still expect that anyone who can reach your machine can crash, reconfigure, or exfiltrate from your renderer. The convenience cvar <code>net_lan_mode 1</code> does both at once with a warning. Use only on isolated dev networks.</p>
+  </div>
+
+  <h3>Startup banner</h3>
+
+  <p>The server prints connection info every startup. The agent should make sure this is unmissable in the log.</p>
+
+<pre><code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ Console listening
+   Web UI    http://127.0.0.1:27960/
+   WebSocket ws://127.0.0.1:27960/
+   Line TCP  127.0.0.1:27961
+   Auth      disabled
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code></pre>
+</section>
+
+<section id="examples">
+  <div class="section-marker"><span class="section-num">§ 10</span><span class="section-rule"></span></div>
+  <h2>Connection examples</h2>
+
+  <h3>Embedded web UI</h3>
+  <p>Open <code>http://localhost:27960/</code> while the renderer is running. The page loads the embedded JS, opens a WebSocket to the same origin, subscribes to <code>log</code> + <code>frame_stats</code> + <code>mem_stats</code>, and presents a console + dashboard. No build step, no install — vanilla JS straight out of the binary.</p>
+
+  <h3>wscat</h3>
+
+<pre><code>$ npm install -g wscat
+$ wscat -c ws://localhost:27960/
+&gt; {"type":"exec","line":"sys_info"}
+&lt; {"type":"result","ok":true,"output":"CPU: Apple M4 Max...\n..."}
+&gt; {"type":"subscribe","topics":["frame_stats"]}
+&lt; {"type":"result","ok":true,"subscribed":["frame_stats"]}
+&lt; {"type":"event","topic":"frame_stats","ts":...,"data":{"fps":141.7,...}}
+&lt; {"type":"event","topic":"frame_stats","ts":...,"data":{"fps":142.1,...}}
+...</code></pre>
+
+  <h3>nc (line protocol)</h3>
+
+<pre><code># One-shot
+$ echo "screenshot" | nc localhost 27961
+saved screenshots/2026-05-03_17-31-08.png
+
+# Interactive
+$ nc localhost 27961
+sys_info
+...
+quit
+</code></pre>
+
+  <h3>Python WebSocket client</h3>
+
+<pre><code>import asyncio, json, websockets
+
+async def main():
+    async with websockets.connect("ws://localhost:27960/") as ws:
+        # one-shot command
+        await ws.send(json.dumps({"type": "exec", "id": "1",
+                                  "line": "r_max_bounces 12"}))
+        print(await ws.recv())
+
+        # subscribe + stream stats
+        await ws.send(json.dumps({"type": "subscribe",
+                                  "topics": ["frame_stats"]}))
+        async for msg in ws:
+            evt = json.loads(msg)
+            if evt.get("topic") == "frame_stats":
+                print(f"{evt['data']['fps']:.1f} fps")
+
+asyncio.run(main())</code></pre>
+
+  <h3>Shell loop driving an animation</h3>
+
+<pre><code>for i in $(seq 0 360); do
+  echo "csg_set_transform 5 0 0 0 0 $i 0 1 1 1" | nc localhost 27961
+  sleep 0.016
+done</code></pre>
+
+  <p>(That's the "we don't need an embedded scripting language" argument made concrete. Animations are a shell loop. Procedural scene generation is a Python script. Hot reload of materials is a file watcher piping into <code>nc</code>. The console is the API.)</p>
+</section>
+
+<div class="footer">
+  <span>Document 04 of 04 · Console Protocol</span>
+  <span><a href="03_implementation_plan.html">← Implementation Plan</a> &nbsp;·&nbsp; <a href="01_architecture_principles.html">↻ Documents</a></span>
+</div>
+
+</main>
+</div>
+
+</body>
+</html>

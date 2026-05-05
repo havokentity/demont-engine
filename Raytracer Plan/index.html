@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Path Tracer Project · Documentation</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;0,9..144,800;1,9..144,400;1,9..144,600&family=Geist:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0e0d0c;
+  --bg-elev: #15130f;
+  --fg: #e8e3d6;
+  --fg-muted: #8a8478;
+  --fg-dim: #5a5650;
+  --border: #2a2722;
+  --border-strong: #3a3630;
+  --accent: #e89968;
+  --accent-dim: #a06d44;
+  --accent-glow: rgba(232, 153, 104, 0.15);
+  --code-fg: #d4b888;
+  --hard: #d97757;
+  --soft: #b8a868;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: 'Geist', system-ui, sans-serif;
+  font-size: 16px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+  opacity: 0.04;
+  background-image: radial-gradient(circle at 1px 1px, var(--fg) 1px, transparent 0);
+  background-size: 3px 3px;
+}
+
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background:
+    radial-gradient(ellipse 80% 50% at 70% 0%, rgba(232, 153, 104, 0.07), transparent 70%),
+    radial-gradient(ellipse 60% 40% at 0% 100%, rgba(217, 119, 87, 0.04), transparent 70%);
+}
+
+.container {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 0 3rem;
+  position: relative;
+  z-index: 2;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Top bar */
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  font-family: 'Fraunces', serif;
+  font-style: italic;
+  font-size: 1.5rem;
+  font-variation-settings: "opsz" 60;
+  color: var(--fg);
+  text-decoration: none;
+  border: none;
+}
+
+.brand-meta {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--fg-muted);
+}
+
+.brand-meta span { color: var(--accent); }
+
+/* Hero */
+.hero {
+  padding: 6rem 0 4rem;
+  max-width: 880px;
+}
+
+.hero-eyebrow {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: var(--accent);
+  margin-bottom: 1.5rem;
+}
+
+.hero-eyebrow::before { content: "▸ "; }
+
+.hero h1 {
+  font-family: 'Fraunces', serif;
+  font-weight: 400;
+  font-size: clamp(3.5rem, 9vw, 6.5rem);
+  line-height: 0.95;
+  letter-spacing: -0.025em;
+  font-variation-settings: "opsz" 144;
+  margin-bottom: 1.75rem;
+}
+
+.hero h1 em {
+  font-style: italic;
+  color: var(--accent);
+}
+
+.hero-subtitle {
+  font-family: 'Fraunces', serif;
+  font-style: italic;
+  font-size: 1.4rem;
+  color: var(--fg-muted);
+  font-variation-settings: "opsz" 60;
+  line-height: 1.45;
+  max-width: 720px;
+  margin-bottom: 2rem;
+}
+
+.hero-summary {
+  font-size: 1.05rem;
+  line-height: 1.65;
+  max-width: 64ch;
+  color: var(--fg);
+}
+
+.hero-summary p { margin-bottom: 1rem; }
+
+.hero-summary strong { color: var(--fg); font-weight: 600; }
+.hero-summary em { font-style: italic; color: var(--accent); }
+
+/* Section header */
+.section-header {
+  display: flex;
+  align-items: baseline;
+  gap: 1.25rem;
+  margin: 4rem 0 2rem;
+}
+
+.section-num {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  color: var(--accent);
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+}
+
+.section-title {
+  font-family: 'Fraunces', serif;
+  font-weight: 400;
+  font-size: 1.4rem;
+  font-style: italic;
+  font-variation-settings: "opsz" 60;
+  color: var(--fg);
+}
+
+.section-rule { flex: 1; height: 1px; background: var(--border); }
+
+/* Doc grid */
+.doc-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 1rem;
+  margin-bottom: 2rem;
+}
+
+.doc-card {
+  display: block;
+  padding: 1.75rem 2rem;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  text-decoration: none;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg);
+  transition: all 0.2s ease;
+  position: relative;
+  overflow: hidden;
+}
+
+.doc-card::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 2px;
+  background: var(--accent);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 0.3s ease;
+}
+
+.doc-card:hover {
+  border-color: var(--accent-dim);
+  background: rgba(232, 153, 104, 0.04);
+  color: var(--fg);
+}
+
+.doc-card:hover::before { transform: scaleX(1); }
+
+.doc-card-num {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  color: var(--accent);
+  letter-spacing: 0.15em;
+  margin-bottom: 0.75rem;
+  display: block;
+}
+
+.doc-card-title {
+  font-family: 'Fraunces', serif;
+  font-size: 1.6rem;
+  font-weight: 500;
+  line-height: 1.15;
+  margin-bottom: 0.5rem;
+  font-variation-settings: "opsz" 60;
+}
+
+.doc-card-title em {
+  font-style: italic;
+  color: var(--accent);
+}
+
+.doc-card-desc {
+  font-size: 0.95rem;
+  color: var(--fg-muted);
+  line-height: 1.55;
+  max-width: 50ch;
+}
+
+.doc-card-meta {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--fg-dim);
+  margin-top: 1rem;
+  display: flex;
+  gap: 1rem;
+}
+
+.doc-card.headline {
+  border-left: 2px solid var(--accent);
+}
+
+.doc-card.featured {
+  grid-column: span 2;
+}
+
+/* Path / how to read */
+.read-path {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
+  padding: 1.75rem 2rem;
+  margin-bottom: 2rem;
+}
+
+.read-path-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: var(--accent);
+  margin-bottom: 1rem;
+}
+
+.read-path h3 {
+  font-family: 'Fraunces', serif;
+  font-size: 1.3rem;
+  font-weight: 500;
+  margin-bottom: 0.75rem;
+  font-variation-settings: "opsz" 36;
+}
+
+.read-path p { color: var(--fg-muted); margin-bottom: 0.75rem; line-height: 1.6; max-width: 64ch; }
+.read-path p:last-child { margin-bottom: 0; }
+.read-path strong { color: var(--fg); font-weight: 600; }
+.read-path code {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.88em;
+  color: var(--code-fg);
+  background: rgba(232, 153, 104, 0.08);
+  padding: 0.1em 0.4em;
+  border-radius: 2px;
+}
+
+.path-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  margin-bottom: 2rem;
+}
+
+@media (max-width: 720px) {
+  .path-pair, .doc-grid { grid-template-columns: 1fr; }
+  .doc-card.featured { grid-column: span 1; }
+  .container { padding: 0 1.5rem; }
+}
+
+/* Spec strip */
+.spec-strip {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0;
+  border: 1px solid var(--border);
+  margin-bottom: 2rem;
+  background: var(--bg-elev);
+}
+
+.spec {
+  padding: 1.25rem 1.5rem;
+  border-right: 1px solid var(--border);
+}
+
+.spec:last-child { border-right: none; }
+
+.spec-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--fg-dim);
+  margin-bottom: 0.4rem;
+}
+
+.spec-value {
+  font-family: 'Fraunces', serif;
+  font-size: 1.15rem;
+  font-weight: 500;
+  color: var(--fg);
+  font-variation-settings: "opsz" 36;
+}
+
+.spec-value em { font-style: italic; color: var(--accent); }
+
+@media (max-width: 720px) {
+  .spec-strip { grid-template-columns: repeat(2, 1fr); }
+  .spec { border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+  .spec:nth-child(2n) { border-right: none; }
+  .spec:nth-last-child(-n+2) { border-bottom: none; }
+}
+
+/* Footer */
+.footer {
+  margin-top: 6rem;
+  padding: 2rem 0;
+  border-top: 1px solid var(--border);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  color: var(--fg-muted);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.footer a {
+  color: var(--fg-muted);
+  text-decoration: none;
+  border: none;
+  transition: color 0.15s ease;
+}
+.footer a:hover { color: var(--accent); }
+
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border-strong); }
+::-webkit-scrollbar-thumb:hover { background: var(--accent-dim); }
+::selection { background: var(--accent-glow); color: var(--fg); }
+</style>
+</head>
+<body>
+
+<div class="container">
+
+<header class="topbar">
+  <a href="index.html" class="brand">Path Tracer</a>
+  <span class="brand-meta">v1.0 · <span>5 documents</span></span>
+</header>
+
+<section class="hero">
+  <div class="hero-eyebrow">A hobby project · Apple Silicon · 2026</div>
+  <h1>A real-time<br><em>path tracer</em>.</h1>
+  <p class="hero-subtitle">Three backends. One C++ codebase. Mesh CSG as the headline feature, hardware ray tracing as the through-line.</p>
+
+  <div class="hero-summary">
+    <p>This is the documentation set for a GPU path tracer being built for the M4 Max. The renderer runs interactively at 1080p with hardware ray tracing on Metal, falls back to Vulkan via MoltenVK, and has a CPU reference backend via Embree. All three are switchable at runtime.</p>
+    <p>The headline feature is <strong>interactive mesh CSG</strong> — boolean operations on imported triangle meshes via <em>Manifold</em>, baked on a worker thread, rendered through hardware RT. Slider drag on a leaf transform updates a drilled hole in 5–15 ms.</p>
+    <p>There is no GUI library, no embedded scripting language, no engine framework. The renderer is a server: every interaction goes through a network console (WebSocket + JSON, or plain TCP for shell scripting). The web UI is vanilla JavaScript embedded in the binary.</p>
+  </div>
+</section>
+
+<div class="spec-strip">
+  <div class="spec">
+    <div class="spec-label">Language</div>
+    <div class="spec-value">C++<em>23</em></div>
+  </div>
+  <div class="spec">
+    <div class="spec-label">Backends</div>
+    <div class="spec-value">Software · Metal · <em>Vulkan</em></div>
+  </div>
+  <div class="spec">
+    <div class="spec-label">Shader stack</div>
+    <div class="spec-value"><em>Slang</em></div>
+  </div>
+  <div class="spec">
+    <div class="spec-label">Headline</div>
+    <div class="spec-value">Mesh <em>CSG</em></div>
+  </div>
+</div>
+
+<section>
+  <div class="section-header">
+    <span class="section-num">§ 01</span>
+    <span class="section-title">How to read these docs</span>
+    <span class="section-rule"></span>
+  </div>
+
+  <div class="path-pair">
+    <div class="read-path">
+      <div class="read-path-label">For humans</div>
+      <h3>Read in order, top to bottom</h3>
+      <p>Start with <a href="01_architecture_principles.html" style="color: var(--accent); border-bottom: 1px solid var(--accent-dim);">Architecture Principles</a> to understand the constraints. Then <a href="02_design.html" style="color: var(--accent); border-bottom: 1px solid var(--accent-dim);">Design</a> for the why. <a href="03_implementation_plan.html" style="color: var(--accent); border-bottom: 1px solid var(--accent-dim);">Implementation Plan</a> is the build sequence; <a href="04_console_protocol.html" style="color: var(--accent); border-bottom: 1px solid var(--accent-dim);">Console Protocol</a> is the wire format.</p>
+      <p>The <a href="05_cpp_cheatsheet.html" style="color: var(--accent); border-bottom: 1px solid var(--accent-dim);">C++ Cheatsheet</a> is a reference, not part of the linear read. Glance at it when modern syntax looks unfamiliar.</p>
+    </div>
+
+    <div class="read-path">
+      <div class="read-path-label">For Claude Code</div>
+      <h3>Principles is the foundation</h3>
+      <p>Re-read the <a href="01_architecture_principles.html" style="color: var(--accent); border-bottom: 1px solid var(--accent-dim);">principles doc</a> before every phase. It contains the <code>HARD</code> and <code>SOFT</code> rules that other docs cite. When in doubt, principles wins.</p>
+      <p>Each phase in the <a href="03_implementation_plan.html" style="color: var(--accent); border-bottom: 1px solid var(--accent-dim);">implementation plan</a> has explicit acceptance criteria. Don't move on until they pass. Don't pull features forward.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="section-header">
+    <span class="section-num">§ 02</span>
+    <span class="section-title">Documents</span>
+    <span class="section-rule"></span>
+  </div>
+
+  <div class="doc-grid">
+    <a href="01_architecture_principles.html" class="doc-card">
+      <span class="doc-card-num">Document 01</span>
+      <div class="doc-card-title">Architecture <em>Principles</em></div>
+      <div class="doc-card-desc">The rules of the road. <code style="font-family: 'JetBrains Mono', monospace; font-size: 0.85em; color: var(--code-fg);">HARD</code> and <code style="font-family: 'JetBrains Mono', monospace; font-size: 0.85em; color: var(--code-fg);">SOFT</code> rules across performance, memory, parallelism, data layout, code style, and scope. Every other doc cites this one.</div>
+      <div class="doc-card-meta">
+        <span>10 sections</span>
+        <span>Foundational</span>
+      </div>
+    </a>
+
+    <a href="02_design.html" class="doc-card">
+      <span class="doc-card-num">Document 02</span>
+      <div class="doc-card-title">Design</div>
+      <div class="doc-card-desc">The <em style="font-style: italic; color: var(--accent);">why</em>. Goals, architecture overview, RHI interface, Slang shader stack, renderer architecture, mesh CSG strategy, dependencies, open questions.</div>
+      <div class="doc-card-meta">
+        <span>13 sections</span>
+        <span>The why</span>
+      </div>
+    </a>
+
+    <a href="03_implementation_plan.html" class="doc-card headline">
+      <span class="doc-card-num">Document 03</span>
+      <div class="doc-card-title">Implementation <em>Plan</em></div>
+      <div class="doc-card-desc">The <em style="font-style: italic; color: var(--accent);">how</em>. Phase by phase from toolchain bringup to the headline mesh CSG feature, each with acceptance criteria and a commit message. Written for an AI agent to execute.</div>
+      <div class="doc-card-meta">
+        <span>13 phases</span>
+        <span>The how</span>
+      </div>
+    </a>
+
+    <a href="04_console_protocol.html" class="doc-card">
+      <span class="doc-card-num">Document 04</span>
+      <div class="doc-card-title">Console <em>Protocol</em></div>
+      <div class="doc-card-desc">The wire format and command catalog. WebSocket message format, line protocol, full CVar and Command list by namespace, security model, connection examples.</div>
+      <div class="doc-card-meta">
+        <span>10 sections</span>
+        <span>The wire</span>
+      </div>
+    </a>
+
+    <a href="05_cpp_cheatsheet.html" class="doc-card featured">
+      <span class="doc-card-num">Document 05</span>
+      <div class="doc-card-title">Modern C++ <em>Cheatsheet</em></div>
+      <div class="doc-card-desc">A reference for the modern C++ features used across the codebase. Targeted at experienced C/C++ engineers syncing back up after a long break. The 15 features that matter, with one-line examples and pitfalls.</div>
+      <div class="doc-card-meta">
+        <span>Reference</span>
+        <span>For C++ veterans</span>
+      </div>
+    </a>
+  </div>
+</section>
+
+<section>
+  <div class="section-header">
+    <span class="section-num">§ 03</span>
+    <span class="section-title">Project at a glance</span>
+    <span class="section-rule"></span>
+  </div>
+
+  <div class="hero-summary" style="max-width: 72ch;">
+    <p><strong>Headline</strong> — Mesh CSG via Manifold. Boolean operations (union, intersect, subtract) on imported triangle meshes, baked on a worker thread, rendered through hardware ray tracing. Per-face materials preserved through booleans.</p>
+    <p><strong>Three backends, one source</strong> — Software (Embree-based CPU reference), Metal (native via metal-cpp), Vulkan (via MoltenVK on Mac, native on Windows later). Shaders written once in Slang, cross-compiled to MSL, SPIR-V, and CPU C++. Backend switching at runtime, Quake-style.</p>
+    <p><strong>No GUI</strong> — All control flows through a network console: WebSocket on port 27960 for the rich web UI, plain TCP on 27961 for shell pipelines. Cvars and commands are the engine's only API.</p>
+    <p><strong>Memory-aware from day zero</strong> — Tagged allocator with per-category budgets, frame arenas, pool allocators, hardware introspection at startup. <code>mem_report</code> tells you exactly where every byte is.</p>
+    <p><strong>Mac-only initially</strong> — M4 Max is the target. Windows is a deferred phase, not a parallel track. The Vulkan backend is built on Mac via MoltenVK from the start; native Windows comes later as a validation pass on the abstraction.</p>
+  </div>
+</section>
+
+<footer class="footer">
+  <span>Path Tracer Project · v1.0 documentation</span>
+  <a href="01_architecture_principles.html">Start reading →</a>
+</footer>
+
+</div>
+
+</body>
+</html>

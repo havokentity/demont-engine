@@ -1,0 +1,1028 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Architecture Principles · Path Tracer Project</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;0,9..144,800;1,9..144,400;1,9..144,600&family=Geist:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0e0d0c;
+  --bg-elev: #15130f;
+  --bg-code: #18151000;
+  --fg: #e8e3d6;
+  --fg-muted: #8a8478;
+  --fg-dim: #5a5650;
+  --border: #2a2722;
+  --border-strong: #3a3630;
+  --accent: #e89968;
+  --accent-dim: #a06d44;
+  --accent-glow: rgba(232, 153, 104, 0.15);
+  --code-fg: #d4b888;
+  --code-keyword: #e89968;
+  --code-string: #a8b87a;
+  --code-comment: #5a5650;
+  --hard: #d97757;
+  --soft: #b8a868;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: 'Geist', system-ui, sans-serif;
+  font-weight: 400;
+  font-size: 16px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow-x: hidden;
+}
+
+/* Subtle grain texture */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+  opacity: 0.04;
+  background-image:
+    radial-gradient(circle at 1px 1px, var(--fg) 1px, transparent 0);
+  background-size: 3px 3px;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  max-width: 1400px;
+  margin: 0 auto;
+  position: relative;
+  z-index: 2;
+}
+
+/* Sidebar */
+.sidebar {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  border-right: 1px solid var(--border);
+  padding: 3rem 2rem;
+  overflow-y: auto;
+  font-size: 0.875rem;
+}
+
+.sidebar-brand {
+  font-family: 'Fraunces', serif;
+  font-style: italic;
+  font-weight: 400;
+  font-size: 1.5rem;
+  font-variation-settings: "opsz" 60;
+  margin-bottom: 0.25rem;
+  color: var(--fg);
+}
+
+.sidebar-tagline {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  color: var(--fg-muted);
+  margin-bottom: 2.5rem;
+}
+
+.doc-nav {
+  margin-bottom: 2.5rem;
+  padding-bottom: 2rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.doc-nav-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: var(--fg-dim);
+  margin-bottom: 0.75rem;
+}
+
+.doc-nav a {
+  display: block;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  color: var(--fg-muted);
+  text-decoration: none;
+  padding: 0.4rem 0;
+  border-left: 2px solid transparent;
+  padding-left: 0.75rem;
+  margin-left: -0.75rem;
+  transition: all 0.15s ease;
+}
+
+.doc-nav a:hover {
+  color: var(--accent);
+  border-left-color: var(--accent);
+}
+
+.doc-nav a.current {
+  color: var(--fg);
+  border-left-color: var(--accent);
+}
+
+.doc-nav a .num {
+  color: var(--fg-dim);
+  margin-right: 0.5rem;
+}
+
+.toc-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: var(--fg-dim);
+  margin-bottom: 1rem;
+}
+
+.toc {
+  list-style: none;
+}
+
+.toc li { margin-bottom: 0.4rem; }
+
+.toc a {
+  color: var(--fg-muted);
+  text-decoration: none;
+  font-size: 0.8rem;
+  display: block;
+  padding: 0.15rem 0;
+  transition: color 0.15s ease;
+}
+
+.toc a:hover { color: var(--accent); }
+
+.toc .num {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  color: var(--fg-dim);
+  margin-right: 0.6rem;
+  display: inline-block;
+  min-width: 1.2rem;
+}
+
+/* Main content */
+main {
+  padding: 4rem 5rem 6rem;
+  max-width: 920px;
+}
+
+/* Header / hero */
+.hero {
+  margin-bottom: 5rem;
+  padding-bottom: 3rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.hero-meta {
+  display: flex;
+  gap: 1.5rem;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--fg-muted);
+  margin-bottom: 1.5rem;
+}
+
+.hero-meta span::before {
+  content: "▸ ";
+  color: var(--accent);
+}
+
+.hero h1 {
+  font-family: 'Fraunces', serif;
+  font-weight: 400;
+  font-size: clamp(3rem, 7vw, 5.5rem);
+  line-height: 0.95;
+  letter-spacing: -0.02em;
+  font-variation-settings: "opsz" 144;
+  margin-bottom: 1.5rem;
+}
+
+.hero h1 em {
+  font-style: italic;
+  font-weight: 400;
+  color: var(--accent);
+  font-variation-settings: "opsz" 144;
+}
+
+.hero-subtitle {
+  font-family: 'Fraunces', serif;
+  font-style: italic;
+  font-size: 1.25rem;
+  color: var(--fg-muted);
+  font-variation-settings: "opsz" 36;
+  max-width: 640px;
+  line-height: 1.5;
+}
+
+/* Sections */
+section {
+  margin-bottom: 4.5rem;
+  scroll-margin-top: 2rem;
+}
+
+.section-marker {
+  display: flex;
+  align-items: baseline;
+  gap: 1.25rem;
+  margin-bottom: 1.5rem;
+}
+
+.section-num {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  color: var(--accent);
+  letter-spacing: 0.1em;
+}
+
+.section-rule {
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+h2 {
+  font-family: 'Fraunces', serif;
+  font-weight: 400;
+  font-size: 2.25rem;
+  line-height: 1.15;
+  letter-spacing: -0.015em;
+  font-variation-settings: "opsz" 96;
+  margin-bottom: 1.5rem;
+  color: var(--fg);
+}
+
+h3 {
+  font-family: 'Fraunces', serif;
+  font-weight: 600;
+  font-size: 1.35rem;
+  line-height: 1.3;
+  margin-top: 2.5rem;
+  margin-bottom: 0.85rem;
+  color: var(--fg);
+  font-variation-settings: "opsz" 36;
+}
+
+h4 {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--accent);
+  margin-top: 2rem;
+  margin-bottom: 0.75rem;
+}
+
+p {
+  margin-bottom: 1.25rem;
+  max-width: 70ch;
+}
+
+p.lead {
+  font-family: 'Fraunces', serif;
+  font-size: 1.2rem;
+  font-weight: 400;
+  line-height: 1.55;
+  color: var(--fg);
+  font-variation-settings: "opsz" 36;
+  margin-bottom: 2rem;
+  max-width: 64ch;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px solid var(--accent-dim);
+  transition: all 0.15s ease;
+}
+
+a:hover {
+  color: var(--fg);
+  border-bottom-color: var(--fg);
+}
+
+strong {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+em {
+  font-style: italic;
+  color: var(--fg);
+}
+
+ul, ol {
+  margin-bottom: 1.25rem;
+  padding-left: 1.5rem;
+  max-width: 70ch;
+}
+
+li {
+  margin-bottom: 0.5rem;
+}
+
+ul li::marker { color: var(--accent); }
+ol li::marker { color: var(--fg-muted); font-family: 'JetBrains Mono', monospace; font-size: 0.85em; }
+
+/* Code */
+code {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.88em;
+  color: var(--code-fg);
+  background: rgba(232, 153, 104, 0.08);
+  padding: 0.1em 0.4em;
+  border-radius: 2px;
+}
+
+pre {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85rem;
+  line-height: 1.55;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
+  padding: 1.25rem 1.5rem;
+  overflow-x: auto;
+  margin-bottom: 1.5rem;
+  color: var(--code-fg);
+}
+
+pre code {
+  background: none;
+  padding: 0;
+  color: inherit;
+  font-size: inherit;
+}
+
+/* Rule tags */
+.tag {
+  display: inline-block;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  padding: 0.15em 0.5em;
+  border-radius: 2px;
+  margin-right: 0.4em;
+  vertical-align: 0.05em;
+}
+
+.tag.hard {
+  background: rgba(217, 119, 87, 0.15);
+  color: var(--hard);
+  border: 1px solid var(--hard);
+}
+
+.tag.soft {
+  background: rgba(184, 168, 104, 0.1);
+  color: var(--soft);
+  border: 1px solid var(--soft);
+}
+
+/* Rule list */
+.rules {
+  list-style: none;
+  padding: 0;
+  margin-bottom: 1.5rem;
+}
+
+.rules > li {
+  border-left: 2px solid var(--border);
+  padding-left: 1.25rem;
+  margin-bottom: 1.25rem;
+  position: relative;
+}
+
+.rules > li:has(.tag.hard) {
+  border-left-color: var(--hard);
+}
+
+.rules > li:has(.tag.soft) {
+  border-left-color: var(--soft);
+}
+
+.rules > li::marker { content: none; }
+
+/* Pull quote / principle */
+.principle {
+  font-family: 'Fraunces', serif;
+  font-style: italic;
+  font-weight: 400;
+  font-size: 1.4rem;
+  line-height: 1.45;
+  color: var(--fg);
+  font-variation-settings: "opsz" 60;
+  border-left: 2px solid var(--accent);
+  padding: 0.5rem 0 0.5rem 1.5rem;
+  margin: 2rem 0;
+  max-width: 60ch;
+}
+
+.principle::before {
+  content: "Principle ";
+  display: block;
+  font-family: 'JetBrains Mono', monospace;
+  font-style: normal;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: var(--accent);
+  margin-bottom: 0.5rem;
+}
+
+/* Tables */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 1.5rem;
+  font-size: 0.9rem;
+}
+
+th, td {
+  text-align: left;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+th {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--fg-muted);
+  font-weight: 500;
+  border-bottom: 1px solid var(--border-strong);
+}
+
+td code { font-size: 0.82em; }
+
+/* Two-column box */
+.two-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+  margin: 1.5rem 0;
+}
+
+.col {
+  border: 1px solid var(--border);
+  padding: 1.25rem 1.5rem;
+  background: var(--bg-elev);
+}
+
+.col h4 {
+  margin-top: 0;
+  margin-bottom: 0.75rem;
+}
+
+/* Callouts */
+.callout {
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
+  background: var(--bg-elev);
+  padding: 1.25rem 1.5rem;
+  margin: 1.5rem 0;
+}
+
+.callout-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: var(--accent);
+  margin-bottom: 0.5rem;
+}
+
+.callout p:last-child { margin-bottom: 0; }
+
+/* Footer */
+.footer {
+  margin-top: 6rem;
+  padding-top: 3rem;
+  border-top: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  color: var(--fg-muted);
+}
+
+.footer a { color: var(--fg-muted); border: none; }
+.footer a:hover { color: var(--accent); }
+
+/* Responsive */
+@media (max-width: 1024px) {
+  .layout { grid-template-columns: 1fr; }
+  .sidebar {
+    position: static;
+    height: auto;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+  main { padding: 3rem 2rem; }
+  .two-col { grid-template-columns: 1fr; }
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border-strong); }
+::-webkit-scrollbar-thumb:hover { background: var(--accent-dim); }
+
+/* Selection */
+::selection {
+  background: var(--accent-glow);
+  color: var(--fg);
+}
+</style>
+</head>
+<body>
+
+<div class="layout">
+
+<aside class="sidebar">
+  <div class="sidebar-brand">Path Tracer</div>
+  <div class="sidebar-tagline">Project Documentation</div>
+
+  <nav class="doc-nav">
+    <div class="doc-nav-label">Documents</div>
+    <a href="index.html"><span class="num">↑</span>Home</a>
+    <a href="01_architecture_principles.html" class="current"><span class="num">01</span>Architecture Principles</a>
+    <a href="02_design.html"><span class="num">02</span>Design</a>
+    <a href="03_implementation_plan.html"><span class="num">03</span>Implementation Plan</a>
+    <a href="04_console_protocol.html"><span class="num">04</span>Console Protocol</a>
+    <a href="05_cpp_cheatsheet.html"><span class="num">05</span>C++ Cheatsheet</a>
+  </nav>
+
+  <div class="toc-label">In this document</div>
+  <ul class="toc">
+    <li><a href="#identity"><span class="num">1</span>Project identity</a></li>
+    <li><a href="#performance"><span class="num">2</span>Performance discipline</a></li>
+    <li><a href="#memory"><span class="num">3</span>Memory management</a></li>
+    <li><a href="#parallelism"><span class="num">4</span>Parallelism</a></li>
+    <li><a href="#data"><span class="num">5</span>Data layout</a></li>
+    <li><a href="#dispatch"><span class="num">6</span>Virtual dispatch</a></li>
+    <li><a href="#abstraction"><span class="num">7</span>The three-backend rule</a></li>
+    <li><a href="#code-style"><span class="num">8</span>Code style</a></li>
+    <li><a href="#observability"><span class="num">9</span>Observability</a></li>
+    <li><a href="#scope"><span class="num">10</span>Scope discipline</a></li>
+  </ul>
+</aside>
+
+<main>
+
+<header class="hero">
+  <div class="hero-meta">
+    <span>v1.0</span>
+    <span>Document 01 / 04</span>
+    <span>Foundational</span>
+  </div>
+  <h1>Architecture <em>Principles</em></h1>
+  <p class="hero-subtitle">The rules of the road. Every other document cites this one. When in doubt, this document wins.</p>
+</header>
+
+<p class="lead">This is a constraints document, not a tutorial. It tells you what the project commits to and — equally important — what it explicitly rejects. The rejections matter, because they prevent the architecture from drifting toward whatever pattern is locally convenient.</p>
+
+<p>Rules are tagged <span class="tag hard">HARD</span> (do not violate, ever) or <span class="tag soft">SOFT</span> (default — exceptions need a comment explaining why). Rules without tags are descriptive context, not enforcement.</p>
+
+<section id="identity">
+  <div class="section-marker">
+    <span class="section-num">§ 01</span>
+    <span class="section-rule"></span>
+  </div>
+  <h2>Project identity</h2>
+
+  <p>This is a <strong>real-time GPU path tracer</strong> with <strong>mesh CSG as the headline feature</strong>. Three backends — Software, Metal, Vulkan-via-MoltenVK — runtime-switchable. macOS / Apple Silicon (M4 Max) is the only target platform until further notice; Windows is a deferred phase, not a parallel track.</p>
+
+  <p>It is not a game engine. Not a scene editor. Not a shader playground. Not a vehicle for learning every graphics concept. Features that don't serve the path tracer — audio, physics, networking other than the console, embedded scripting, asset pipelines beyond glTF/OBJ load — stay out.</p>
+
+  <div class="principle">The simplest project that ships the headline feature is the right project. Every additional system has to earn its place against the cost of carrying it.</div>
+</section>
+
+<section id="performance">
+  <div class="section-marker">
+    <span class="section-num">§ 02</span>
+    <span class="section-rule"></span>
+  </div>
+  <h2>Performance discipline</h2>
+
+  <p>"Hardcore performance" means optimizing what matters and leaving alone what doesn't. The per-frame hot path and the GPU shader code are the things that matter. Startup, asset loading, console parsing, scene save/load — they don't, and we do not spend cycles on them.</p>
+
+  <ul class="rules">
+    <li>
+      <span class="tag hard">HARD</span>
+      Performance work is profile-driven. No optimization lands without a Tracy trace or a measurement showing it helps. <em>"I think this might be faster"</em> is not justification.
+    </li>
+    <li>
+      <span class="tag hard">HARD</span>
+      Premature SIMD intrinsics are forbidden. We do not write <code>_mm_*</code>, <code>vld1q_*</code>, or any architecture-specific intrinsic until the profiler points at a specific loop <em>and</em> compiler auto-vectorization has been tried and proven insufficient.
+    </li>
+    <li>
+      <span class="tag hard">HARD</span>
+      Allocations in the per-frame hot path are forbidden outside the frame arena. Heap allocations during a frame are a build-error-tier bug.
+    </li>
+    <li>
+      <span class="tag soft">SOFT</span>
+      Prefer libraries written by people who know more than us about their domain: <a href="https://www.embree.org/">Embree</a> for CPU ray tracing, <a href="https://github.com/microsoft/mimalloc">mimalloc</a> for general allocation, <a href="https://github.com/g-truc/glm">glm</a> for vector math, <a href="https://github.com/elalish/manifold">Manifold</a> for mesh booleans, <a href="https://github.com/google/highway">highway</a> for portable SIMD when we eventually need it.
+    </li>
+  </ul>
+
+  <div class="principle">Optimize where the profiler points, never where instinct does. The hardcore flex is using the right libraries, not writing assembly.</div>
+
+  <h3>What "fast" means here</h3>
+  <p>Targets, not promises:</p>
+  <table>
+    <thead>
+      <tr><th>Workload</th><th>Target on M4 Max</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Path tracer (<code>pathtrace</code>), 1080p, 1 spp, no denoiser</td><td>≥ 60 FPS on Metal</td></tr>
+      <tr><td>Path tracer (<code>pathtrace</code>), 1080p, 1 spp, with denoiser</td><td>≥ 30 FPS on Metal</td></tr>
+      <tr><td>Whitted raytrace (<code>raytrace</code>), 1080p</td><td>≥ 120 FPS on Metal — real-time and clean</td></tr>
+      <tr><td>Manifold CSG re-bake, moderate operands</td><td>&lt; 15 ms</td></tr>
+      <tr><td>BLAS rebuild after CSG re-bake</td><td>&lt; 5 ms</td></tr>
+      <tr><td>Console command latency (round-trip)</td><td>&lt; 10 ms</td></tr>
+      <tr><td>Software backend, internal 480×270 upscaled to 1080p, <code>preview</code> mode</td><td>~5–10 FPS — usable for correctness verification, not interactive work</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="memory">
+  <div class="section-marker">
+    <span class="section-num">§ 03</span>
+    <span class="section-rule"></span>
+  </div>
+  <h2>Memory management</h2>
+
+  <p>The project commits to a real memory manager from Phase 0. This is non-negotiable — retrofitting allocators after the fact is the kind of work that consumes weeks for nothing.</p>
+
+  <h3>Allocator categories</h3>
+  <p>Different lifetimes want different allocators. We do not try to write one allocator that's good at everything.</p>
+
+  <table>
+    <thead>
+      <tr><th>Allocator</th><th>Lifetime</th><th>Cost</th><th>Used for</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Frame arena</td><td>One frame</td><td>Atomic add</td><td>Per-frame transient: command staging, debug strings, upload prep</td></tr>
+      <tr><td>Pool</td><td>Object-by-object</td><td>O(1) free-list</td><td>Same-size objects, frequent alloc/free: jobs, BVH nodes, log entries</td></tr>
+      <tr><td>Persistent heap</td><td>Long-lived</td><td>Mimalloc</td><td>Scene data, asset storage, anything not transient</td></tr>
+      <tr><td>GPU heap</td><td>Resource-by-resource</td><td>Sub-allocation</td><td>Wraps Metal MTLHeap / Vulkan VMA. One MTLBuffer/VkBuffer per heap, sub-allocated</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Tagging is mandatory</h3>
+  <p>Every allocation through our system is tagged with a <code>MemTag</code> at the call site. Tags are something like <code>Scene</code>, <code>MeshAssets</code>, <code>Textures</code>, <code>GpuBuffers</code>, <code>Csg</code>, <code>Console</code>, <code>JobSystem</code>, <code>Render</code>, <code>Misc</code>. The allocator records: total bytes per tag, peak bytes per tag, allocation count per tag.</p>
+
+  <pre><code>{
+    MemTagScope scope(MemTag::Csg);
+    auto* tree = heap.New&lt;CsgTree&gt;(...);  // tagged Csg
+    // any allocation made inside this scope inherits the tag
+}</code></pre>
+
+  <ul class="rules">
+    <li>
+      <span class="tag hard">HARD</span>
+      Global <code>operator new</code> and <code>operator delete</code> are overridden in our code path to route through the persistent heap with a <code>Misc</code> tag, with a warning logged in debug. Untracked allocation does not exist in our code.
+    </li>
+    <li>
+      <span class="tag hard">HARD</span>
+      Each tag has a configurable hard budget (cvar <code>mem_budget_&lt;tag&gt;_mb</code>). Exceeding the budget aborts in debug, returns null in release, always logs.
+    </li>
+    <li>
+      <span class="tag soft">SOFT</span>
+      STL containers default to system allocator and that's fine for now. If a specific container shows up in <code>mem_report</code> as significant and untagged, we either replace it with a custom container that takes an explicit allocator, or we accept the imprecision.
+    </li>
+    <li>
+      <span class="tag soft">SOFT</span>
+      Third-party libraries use whatever allocator they want. Our visibility is into <em>our</em> code. Library allocations are opaque, which is fine.
+    </li>
+  </ul>
+
+  <div class="principle">Every byte we allocate has a name and a budget. Memory we cannot see is memory we cannot reason about.</div>
+</section>
+
+<section id="parallelism">
+  <div class="section-marker">
+    <span class="section-num">§ 04</span>
+    <span class="section-rule"></span>
+  </div>
+  <h2>Parallelism</h2>
+
+  <p>Parallel from Phase 1, not retrofitted later. A real job system from day one — <a href="https://github.com/dougbinks/enkiTS">enkiTS</a> or <a href="https://github.com/google/marl">marl</a> are good choices, hand-rolled is also fine if it stays under ~400 lines.</p>
+
+  <ul class="rules">
+    <li>
+      <span class="tag hard">HARD</span>
+      The render loop is single-threaded. GPU command submission is sequential. We do not multi-thread render submission. <em>Everything feeding the render</em> is parallel.
+    </li>
+    <li>
+      <span class="tag hard">HARD</span>
+      All CPU work that takes longer than ~1 ms is expressed as a job: CSG evaluation, BVH build, scene upload preparation, asset loading, screenshot encoding.
+    </li>
+    <li>
+      <span class="tag hard">HARD</span>
+      Thread communication is via lock-free SPSC ring buffers. No <code>std::mutex</code> in the per-frame path. Mutex-guarded structures live in setup code only.
+    </li>
+    <li>
+      <span class="tag soft">SOFT</span>
+      One worker per performance core. The M4 Max has 12 P-cores; the efficiency cores stay idle by default. Don't oversubscribe.
+    </li>
+    <li>
+      <span class="tag soft">SOFT</span>
+      Use <code>alignas(64)</code> on contended atomics and shared cache lines to avoid false sharing.
+    </li>
+  </ul>
+</section>
+
+<section id="data">
+  <div class="section-marker">
+    <span class="section-num">§ 05</span>
+    <span class="section-rule"></span>
+  </div>
+  <h2>Data layout</h2>
+
+  <p>Data-oriented where it matters, pragmatic where it doesn't. We are not building a pure ECS; we're building a renderer that respects cache locality in the places it shows up in the profiler.</p>
+
+  <h3>Where DOTS-style design wins here</h3>
+  <ul>
+    <li><strong>Scene as struct-of-arrays.</strong> Meshes, materials, CSG nodes, instance transforms each in their own flat arrays. Uploads to GPU buffers without marshaling.</li>
+    <li><strong>Hot/cold splitting.</strong> Per-mesh "always touched per frame" data (transform, AABB, BLAS handle) in one struct; "only touched on edit" data (source path, debug name, original CPU vertex data) in a separate structure indexed by the same ID.</li>
+    <li><strong>Integer IDs, not pointers.</strong> Strong-typed IDs (<code>MeshId</code>, <code>MaterialId</code> as distinct types) → zero runtime cost, big readability win, prevents whole bug class.</li>
+  </ul>
+
+  <h3>Where it doesn't</h3>
+  <ul>
+    <li><strong>No ECS framework.</strong> We have dozens-to-low-hundreds of scene entities. Frameworks like entt only earn their cost at tens of thousands. Typed arenas + integer IDs do the same job at our scale.</li>
+    <li><strong>Engine, Console, Window, Camera</strong> are plain classes. Forcing them into ECS components is busywork.</li>
+  </ul>
+
+  <ul class="rules">
+    <li>
+      <span class="tag hard">HARD</span>
+      Scene data is SoA. Multiple flat <code>std::vector&lt;T&gt;</code> arrays per type, indexed by typed ID. Not array-of-structs.
+    </li>
+    <li>
+      <span class="tag soft">SOFT</span>
+      Strong types for IDs: <code>struct MeshId { uint32_t v; };</code> not <code>uint32_t</code>.
+    </li>
+  </ul>
+</section>
+
+<section id="dispatch">
+  <div class="section-marker">
+    <span class="section-num">§ 06</span>
+    <span class="section-rule"></span>
+  </div>
+  <h2>Virtual dispatch policy</h2>
+
+  <p>OOP is not the enemy. Pointer-chasing inheritance hierarchies and unnecessary indirection are. The rule is <strong>frequency-aware</strong>: virtual dispatch is fine when the call rate is low; data layout matters when the call rate is high.</p>
+
+  <div class="two-col">
+    <div class="col">
+      <h4>Virtual is fine</h4>
+      <ul>
+        <li>RHI <code>Device</code>, <code>CommandBuffer</code> — called O(100) per frame</li>
+        <li>Material <code>SampleBSDF</code> when only a handful of types — but on the GPU side this becomes a tagged-union switch in the shader anyway</li>
+        <li>Console <code>Command</code> dispatch — called from human input</li>
+      </ul>
+    </div>
+    <div class="col">
+      <h4>Virtual is wrong</h4>
+      <ul>
+        <li>Anything called per ray, per pixel, per vertex</li>
+        <li>Inner loops of acceleration structure traversal</li>
+        <li>Per-allocation hooks (use templates / CRTP / direct dispatch)</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section id="abstraction">
+  <div class="section-marker">
+    <span class="section-num">§ 07</span>
+    <span class="section-rule"></span>
+  </div>
+  <h2>The three-backend rule</h2>
+
+  <p>The project supports three backends — Software, Metal, Vulkan-via-MoltenVK — and they all run on the same M4 Max for now. Windows comes online much later as a Vulkan target.</p>
+
+  <ul class="rules">
+    <li>
+      <span class="tag hard">HARD</span>
+      Every renderer feature lands on all three backends in the same phase. We do not ship a feature on Metal first and "port to Vulkan later." That promise has killed every cross-platform engine project that's tried it.
+    </li>
+    <li>
+      <span class="tag hard">HARD</span>
+      No backend-specific code outside <code>src/rhi_metal/</code>, <code>src/rhi_vulkan/</code>, <code>src/rhi_software/</code>. The renderer never includes a Metal or Vulkan header.
+    </li>
+    <li>
+      <span class="tag hard">HARD</span>
+      Shaders are written once in Slang and cross-compiled. We do not maintain parallel MSL/GLSL/HLSL sources.
+    </li>
+    <li>
+      <span class="tag soft">SOFT</span>
+      The Software backend is a correctness reference, not a perf target. It is allowed to be 100× slower than the GPU backends. Its job is to catch bugs the GPU is hiding.
+    </li>
+  </ul>
+
+  <div class="principle">An abstraction is only as good as the number of concrete things it abstracts over. Three is enough to keep us honest; one is not.</div>
+
+  <h3>The Engine/Rebuild model</h3>
+  <p>Backend switching at runtime requires that GPU resources be derivable from a CPU-side scene description. The CPU scene is the source of truth; the GPU state is built from it on demand. Switching backends is: drain the old device → destroy the renderer → destroy the old device → create the new device → create the renderer → upload scene → continue. Quake-style <code>vid_restart</code>. Brief pause, no zero-cost hot swap promise.</p>
+</section>
+
+<section id="code-style">
+  <div class="section-marker">
+    <span class="section-num">§ 08</span>
+    <span class="section-rule"></span>
+  </div>
+  <h2>Code style and dependencies</h2>
+
+  <h3>Things this project does not include</h3>
+  <ul class="rules">
+    <li>
+      <span class="tag hard">HARD</span>
+      <strong>No GUI library.</strong> No Dear ImGui, no Qt, no anything. Tooling lives in the network console.
+    </li>
+    <li>
+      <span class="tag hard">HARD</span>
+      <strong>No embedded scripting language.</strong> No Lua, no Python via pybind11, no AngelScript. If we need scripting, the WebSocket console allows external scripts (in any language) to drive the renderer.
+    </li>
+    <li>
+      <span class="tag hard">HARD</span>
+      <strong>No engine framework.</strong> No Unreal, no Unity, no O3DE, no Filament. Everything is hand-built on the RHI.
+    </li>
+    <li>
+      <span class="tag soft">SOFT</span>
+      No Boost. No Eigen. No QtCore types. We use the standard library, glm, and a small set of carefully chosen libraries listed in the design doc.
+    </li>
+  </ul>
+
+  <h3>Things this project does use</h3>
+  <p>The full dependency list lives in the <a href="02_design.html">design doc</a>. Briefly: glm for math, GLFW for windowing, mimalloc for allocation, Tracy for profiling, Slang for shaders, metal-cpp for Metal bindings, Vulkan SDK + VMA for Vulkan, Embree for software ray tracing, Manifold for mesh CSG, tinygltf for asset loading, toml++ for scene files, civetweb (or similar single-header WS server) for the network console, fmt for logging.</p>
+
+  <h3>C++ dialect: orthodox C++23</h3>
+
+  <p>"C++" is a family of dialects. Pick one and stick to it. The dialect for this project is sometimes called <strong>Orthodox C++</strong> — modern features used where they pay rent, pre-C++11 baroque excess kept out. Think id Software's later codebases, AAA game engines, the demoscene's pragmatic C++ — not Sean Parent's GoingNative talks.</p>
+
+  <p>The <a href="05_cpp_cheatsheet.html">C++ Cheatsheet</a> walks through the modern features with examples. The lists below are the enforcement specification.</p>
+
+  <h4>Use freely</h4>
+  <ul class="rules">
+    <li><span class="tag soft">SOFT</span><strong>C++23</strong> baseline. <code>std::expected</code>, <code>std::print</code>, deducing this where useful.</li>
+    <li><span class="tag soft">SOFT</span><strong>RAII for ownership.</strong> <code>std::unique_ptr</code> as the default. <code>std::shared_ptr</code> only when ownership is genuinely shared (rare). Raw owning pointers forbidden.</li>
+    <li><span class="tag soft">SOFT</span><strong>Strong types via single-member structs.</strong> <code>struct MeshId { uint32_t v; };</code> not <code>using MeshId = uint32_t;</code>.</li>
+    <li><span class="tag soft">SOFT</span><strong><code>std::expected&lt;T, E&gt;</code></strong> for fallible returns. Replaces both bool-out-pointer and exception throwing.</li>
+    <li><span class="tag soft">SOFT</span><strong><code>std::span</code> and <code>std::string_view</code></strong> for non-owning views. Replace pointer + length pairs.</li>
+    <li><span class="tag soft">SOFT</span><strong>Designated initializers</strong> (C++20) for any struct with more than two fields.</li>
+    <li><span class="tag soft">SOFT</span><strong><code>enum class</code></strong> always. Plain <code>enum</code> never.</li>
+    <li><span class="tag soft">SOFT</span><strong>Range-based <code>for</code></strong>, <code>auto</code> when the type is obvious or doesn't matter, <code>const auto&amp;</code> for read-only iteration.</li>
+    <li><span class="tag soft">SOFT</span><strong><code>constexpr</code></strong> wherever it's free.</li>
+    <li><span class="tag soft">SOFT</span><strong><code>fmt::print</code> / <code>std::print</code></strong> for output. No <code>iostream</code>.</li>
+    <li><span class="tag soft">SOFT</span><strong>Lambdas</strong> for one-shot local callbacks. Capture explicitly (<code>[&amp;x, y]</code>) when reasonable; <code>[&amp;]</code> is fine for short bodies.</li>
+  </ul>
+
+  <h4>Use carefully (with a comment justifying)</h4>
+  <ul class="rules">
+    <li><span class="tag soft">SOFT</span><strong>Templates for generic data structures</strong> (<code>PoolAllocator&lt;T&gt;</code>, <code>RingBuffer&lt;T&gt;</code>). One template parameter, one obvious purpose. No template metaprogramming dressed up as a generic container.</li>
+    <li><span class="tag soft">SOFT</span><strong>STL containers</strong> (<code>std::vector</code>, <code>std::string</code>, <code>std::array</code>) in cold code (config parsing, asset loading, console). Not in the per-frame hot path.</li>
+    <li><span class="tag soft">SOFT</span><strong>Operator overloading</strong> only for math types (vector add, matrix multiply). Never for control flow or "clever" DSLs.</li>
+    <li><span class="tag soft">SOFT</span><strong>Method functions on structs</strong> when there's clear cohesion (<code>camera.move(dir, dt)</code>). Free functions are also fine — pick one per type and stay consistent.</li>
+    <li><span class="tag soft">SOFT</span><strong><code>if constexpr</code></strong> for compile-time branching. Replaces 80% of cases that needed SFINAE in older C++.</li>
+  </ul>
+
+  <h4>Forbidden</h4>
+  <ul class="rules">
+    <li><span class="tag hard">HARD</span><strong>Exceptions.</strong> Build with <code>-fno-exceptions</code>. Errors via <code>std::expected</code> or explicit return codes. Wrap third-party libs that throw at the boundary.</li>
+    <li><span class="tag hard">HARD</span><strong>RTTI.</strong> Build with <code>-fno-rtti</code>. No <code>dynamic_cast</code>, no <code>typeid</code>.</li>
+    <li><span class="tag hard">HARD</span><strong>Multiple inheritance.</strong> No exceptions.</li>
+    <li><span class="tag hard">HARD</span><strong>Class hierarchies more than 2 levels deep.</strong> RHI's <code>Device</code> with three concrete implementations is the entire inheritance budget.</li>
+    <li><span class="tag hard">HARD</span><strong>Template metaprogramming.</strong> No SFINAE, no <code>enable_if</code> chains, no constexpr-if recursion, no type lists, no compile-time dispatch tables.</li>
+    <li><span class="tag hard">HARD</span><strong><code>std::iostream</code>.</strong> Slow, ugly syntax, incomprehensible errors. Use fmt.</li>
+    <li><span class="tag hard">HARD</span><strong><code>std::regex</code>.</strong> Notoriously slow and bloated. Hand-write parsers for the small grammars we have.</li>
+    <li><span class="tag hard">HARD</span><strong><code>std::function</code> in hot paths.</strong> Heap allocates, type-erases, can't inline. Fine for command callbacks (called from human input). Forbidden inside the renderer per-frame loop.</li>
+    <li><span class="tag hard">HARD</span><strong>STL algorithms with cute lambdas in hot paths.</strong> <code>std::sort</code> is fine. <code>std::transform_reduce</code> with inline lambdas in a per-frame loop is harder to read and harder to optimize than a plain for loop.</li>
+    <li><span class="tag hard">HARD</span><strong>C++ modules.</strong> Compiler and build-system support is still patchy in 2026, gains for a project this size are marginal. Headers and <code>.cpp</code> files.</li>
+    <li><span class="tag hard">HARD</span><strong>Coroutines</strong> (<code>co_await</code>, etc.). Excellent for async I/O — we don't have async I/O. Job system handles parallelism.</li>
+    <li><span class="tag hard">HARD</span><strong>Concepts as a primary tool.</strong> <code>requires</code> clauses are cool but rarely earn their cost. If you find yourself writing one, you're probably overengineering the template.</li>
+    <li><span class="tag hard">HARD</span><strong>Boost. Eigen. Qt. Anything that brings its own world.</strong></li>
+  </ul>
+
+  <h4>Smart pointer policy</h4>
+  <p>Smart pointers are not interchangeable. The defaults matter.</p>
+
+  <ul class="rules">
+    <li><span class="tag soft">SOFT</span><strong><code>std::unique_ptr&lt;T&gt;</code> is the default</strong> for any heap-allocated object. Zero runtime cost (same size as a raw pointer, no atomic ops), eliminates the entire class of "who deletes this" bugs, makes ownership visible in the type. Construct via <code>std::make_unique&lt;T&gt;(args...)</code>.</li>
+    <li><span class="tag hard">HARD</span><strong><code>new</code> never appears in our code</strong> outside of <code>make_unique</code>'s implementation. Seeing <code>new Foo(...)</code> in a code review is a defect.</li>
+    <li><span class="tag hard">HARD</span><strong><code>std::shared_ptr&lt;T&gt;</code> requires written justification</strong> at the declaration site. Reference counting has real costs (atomic increment/decrement on every copy, separate control block allocation, cycle leak risk) and "multiple things might own this" is usually a sign that ownership wasn't thought through. Default is no shared_ptr in this project.</li>
+    <li><span class="tag hard">HARD</span><strong><code>std::weak_ptr&lt;T&gt;</code> requires written justification</strong>, same reasoning. Existence of a weak_ptr usually indicates a shared_ptr cycle that should have been a unique_ptr + raw pointer.</li>
+    <li><span class="tag soft">SOFT</span><strong>Raw pointers are fine for non-owning references.</strong> Modern C++ didn't kill raw pointers — it killed raw <em>owning</em> pointers. <code>T*</code> means "I refer to this, someone else owns it and keeps it alive longer than me." Use <code>T&amp;</code> when null doesn't make sense.</li>
+    <li><span class="tag soft">SOFT</span><strong>Integer handles for opaque resources.</strong> RHI handles (<code>BufferHandle</code>, <code>TextureHandle</code>) are integer IDs, not pointers. Better debugability, clean lifetime, usable across backend boundaries. See <a href="02_design.html#rhi">design §4</a>.</li>
+  </ul>
+
+  <p>See the <a href="05_cpp_cheatsheet.html#unique">cheatsheet §3</a> for the full discussion of why the defaults are what they are.</p>
+
+  <h4>Build flags this implies</h4>
+  <pre><code># Common
+-std=c++23 -fno-exceptions -fno-rtti
+-Wall -Wextra -Wpedantic -Werror=return-type -Wshadow
+
+# Debug
+-O0 -g -fsanitize=address,undefined
+
+# Release
+-O3 -ffast-math -DNDEBUG</code></pre>
+  <p>Note on <code>-ffast-math</code>: it allows the compiler to assume no NaNs/Infs, which can matter in path tracer numerical paths. Revisit if it bites; per-translation-unit override is fine for shader-adjacent C++.</p>
+
+  <div class="principle">Modern C++, used as a better C with strong types and RAII. Boring on purpose.</div>
+</section>
+
+<section id="observability">
+  <div class="section-marker">
+    <span class="section-num">§ 09</span>
+    <span class="section-rule"></span>
+  </div>
+  <h2>Observability</h2>
+
+  <p>You cannot fix what you cannot see. Observability is foundational, not optional, and it's wired up in Phase 1 alongside the console.</p>
+
+  <ul class="rules">
+    <li>
+      <span class="tag hard">HARD</span>
+      Tracy profiler integrated from Phase 1. Every job, every render phase, every allocation hook instrumented.
+    </li>
+    <li>
+      <span class="tag hard">HARD</span>
+      Hardware introspection at startup: CPU model, core counts, RAM, GPU, VRAM, OS version. Exposed as read-only cvars (<code>sys_*</code>).
+    </li>
+    <li>
+      <span class="tag hard">HARD</span>
+      Per-frame stats streamed to the network console: FPS, frame time breakdown, sample count, current backend, per-tag memory usage, GPU memory usage.
+    </li>
+    <li>
+      <span class="tag soft">SOFT</span>
+      Every backend exposes <code>currentAllocatedSize()</code>-equivalent for GPU memory: Metal native, Vulkan via <code>VK_EXT_memory_budget</code>.
+    </li>
+  </ul>
+
+  <div class="callout">
+    <div class="callout-label">Console as universal control surface</div>
+    <p>Cvars and commands are the engine's API to the outside world. Every internal state worth tweaking gets a cvar. Every action worth triggering gets a command. The web UI, CLI tools, and external scripts all share this surface. See <a href="04_console_protocol.html">document 04</a>.</p>
+  </div>
+</section>
+
+<section id="scope">
+  <div class="section-marker">
+    <span class="section-num">§ 10</span>
+    <span class="section-rule"></span>
+  </div>
+  <h2>Scope discipline</h2>
+
+  <p>The single biggest threat to this project is scope creep — adding "while we're at it" features that compound into a never-shipping engine. The phased plan exists to fight that. Each phase has acceptance criteria; we don't move on until they pass; we don't pull features forward from later phases just because they sound interesting.</p>
+
+  <ul class="rules">
+    <li>
+      <span class="tag hard">HARD</span>
+      One milestone at a time. No starting Phase N+1 work while Phase N is incomplete.
+    </li>
+    <li>
+      <span class="tag hard">HARD</span>
+      Acceptance criteria for a phase are the <em>only</em> bar. "Quality" improvements that don't move the criteria forward are feature creep.
+    </li>
+    <li>
+      <span class="tag soft">SOFT</span>
+      When tempted to add something not in the plan, write it down in a "future" list and keep going. Revisit at the end of the current phase.
+    </li>
+  </ul>
+
+  <div class="principle">Shipping the headline feature on one platform is a better outcome than a half-built engine on three.</div>
+
+  <p>That said: the architecture is designed so that extending — adding a fourth backend, adding new material models, adding new geometry types — is a localized change, not a rewrite. Discipline now buys flexibility later.</p>
+</section>
+
+<div class="footer">
+  <span>Document 01 of 04 · Architecture Principles</span>
+  <span><a href="02_design.html">Next: Design →</a></span>
+</div>
+
+</main>
+</div>
+
+</body>
+</html>

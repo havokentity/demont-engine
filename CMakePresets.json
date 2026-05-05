@@ -1,0 +1,40 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 27, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "mac-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_OSX_ARCHITECTURES": "arm64",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "14.0",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++"
+      }
+    },
+    {
+      "name": "mac-debug",
+      "displayName": "Mac · Debug",
+      "inherits": "mac-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "PT_ENABLE_TRACY": "ON"
+      }
+    },
+    {
+      "name": "mac-release",
+      "displayName": "Mac · Release",
+      "inherits": "mac-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "PT_ENABLE_TRACY": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "mac-debug",   "configurePreset": "mac-debug"   },
+    { "name": "mac-release", "configurePreset": "mac-release" }
+  ]
+}
