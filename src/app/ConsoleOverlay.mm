@@ -252,24 +252,21 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
     [self addSubview:in];
     self.inputField = in;
 
-    // Trippy hex banner -- DMT as a triangle inscribed in the hex.
-    // Triangle is *the* fundamental primitive of ray tracing, so the
-    // shape is on-brand. D at the apex, M and T anchoring the base,
-    // bouncing-ray path packed inside the triangle. Triangle edges
-    // and bounces in PINK; hex frame in cyan; letters in bright fg.
+    // Hex banner with chevroned inner box and a bouncing-ray scaffold.
+    // Cyan frame, magenta-pink rays + hit dots, bright white letters.
     NSArray<NSArray<NSString*>*>* banner = @[
         @[@"frame",   @"        ░▒▓██████████▓▒░"],
-        @[@"frame",   @"     ░▒▓██████████████▓▒░"],
-        @[@"letters", @"   ░▓██░         D         ░██▓░"],
-        @[@"ray",     @"   ▒█░          ╱ ╲          ░█▒"],
-        @[@"ray",     @"   ▓█░         ╱ ◉ ╲          ░█▓"],
-        @[@"ray",     @"   █░         ╱ ─•─ ╲          ░█"],
-        @[@"ray",     @"   ▓█░       ╱   ◉│◉  ╲        ░█▓"],
-        @[@"ray",     @"   █░       ╱  ─◉ • ◉─  ╲       ░█"],
-        @[@"ray",     @"   ▓█░     ╱     ◉│◉      ╲      ░█▓"],
-        @[@"letters", @"   ▒█░    M━━━━━━━━━━━━━━━━T     ░█▒"],
-        @[@"letters", @"     ░▓██░         P · T        ░██▓░"],
-        @[@"frame",   @"     ░▒▓██████████████▓▒░"],
+        @[@"frame",   @"     ░▒▓██╔═══════════╗▓▒░"],
+        @[@"letters", @"   ░▓██╔═╝   D · M · T   ╚═╗██▓░"],
+        @[@"ray",     @"  ▒█░  ╔╝  ╲     ◉     ╱  ╚╗  ░█▒"],
+        @[@"ray",     @"  ▓█░ ║    ╲   ◉│◉   ╱    ║ ░█▓"],
+        @[@"ray",     @"  █░  ║     ╲  ─•─  ╱     ║  ░█"],
+        @[@"ray",     @"  ▓█░ ║      ╳  •  ╳      ║ ░█▓"],
+        @[@"ray",     @"  █░  ║     ╱  ─•─  ╲     ║  ░█"],
+        @[@"ray",     @"  ▓█░ ║    ╱   ◉│◉   ╲    ║ ░█▓"],
+        @[@"ray",     @"  ▒█░  ╚╗  ╱     ◉     ╲  ╔╝  ░█▒"],
+        @[@"letters", @"   ░▓██╚═╗   P · A · T   ╔═╝██▓░"],
+        @[@"frame",   @"     ░▒▓██╚═══════════╝▓▒░"],
         @[@"frame",   @"        ░▒▓██████████▓▒░"],
     ];
     for (NSArray<NSString*>* row in banner) {

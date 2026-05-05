@@ -66,12 +66,18 @@ void Emit(Level level, fmt::string_view fmt_str, fmt::format_args args) {
     auto body = fmt::vformat(fmt_str, args);
 
     if (TtyEnabled()) {
+        // Pre-render the bracketed timestamp so the outer print uses
+        // only named args (fmt 11 forbids mixing manual & auto indexing).
+        auto ts = fmt::format("[{:02d}:{:02d}:{:02d}]",
+                              tm.tm_hour, tm.tm_min, tm.tm_sec);
         fmt::print(stderr,
-                   "{ts_col}[{:02d}:{:02d}:{:02d}]{rs} {tag_col}[{}]{rs} {body_col}{}{rs}\n",
-                   tm.tm_hour, tm.tm_min, tm.tm_sec, tag, body,
+                   "{ts_col}{ts}{rs} {tag_col}[{tag}]{rs} {body_col}{body}{rs}\n",
                    fmt::arg("ts_col",   kDim),
+                   fmt::arg("ts",       ts),
                    fmt::arg("tag_col",  tag_col),
+                   fmt::arg("tag",      tag),
                    fmt::arg("body_col", body_col),
+                   fmt::arg("body",     body),
                    fmt::arg("rs",       kReset));
     } else {
         fmt::print(stderr, "[{:02d}:{:02d}:{:02d}] [{}] {}\n",

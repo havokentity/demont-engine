@@ -190,22 +190,21 @@
       status.textContent = `connected · ${location.host}`;
       status.className = 'status ok';
       send({ type: 'subscribe', topics: ['log'] });
-      // Trippy hex banner -- DMT as a triangle inscribed inside the
-      // hex (triangle = the fundamental ray-tracing primitive). Same
-      // shape across overlay / web / boot terminal.
+      // Hex banner with chevroned inner box and bouncing-ray scaffold.
+      // Cyan frame, hot-pink ray + hit dots, bright letters.
       const banner = [
         ['frame',   '        ░▒▓██████████▓▒░'],
-        ['frame',   '     ░▒▓██████████████▓▒░'],
-        ['letters', '   ░▓██░         D         ░██▓░'],
-        ['ray',     '   ▒█░          ╱ ╲          ░█▒'],
-        ['ray',     '   ▓█░         ╱ ◉ ╲          ░█▓'],
-        ['ray',     '   █░         ╱ ─•─ ╲          ░█'],
-        ['ray',     '   ▓█░       ╱   ◉│◉  ╲        ░█▓'],
-        ['ray',     '   █░       ╱  ─◉ • ◉─  ╲       ░█'],
-        ['ray',     '   ▓█░     ╱     ◉│◉      ╲      ░█▓'],
-        ['letters', '   ▒█░    M━━━━━━━━━━━━━━━━T     ░█▒'],
-        ['letters', '     ░▓██░         P · T        ░██▓░'],
-        ['frame',   '     ░▒▓██████████████▓▒░'],
+        ['frame',   '     ░▒▓██╔═══════════╗▓▒░'],
+        ['letters', '   ░▓██╔═╝   D · M · T   ╚═╗██▓░'],
+        ['ray',     '  ▒█░  ╔╝  ╲     ◉     ╱  ╚╗  ░█▒'],
+        ['ray',     '  ▓█░ ║    ╲   ◉│◉   ╱    ║ ░█▓'],
+        ['ray',     '  █░  ║     ╲  ─•─  ╱     ║  ░█'],
+        ['ray',     '  ▓█░ ║      ╳  •  ╳      ║ ░█▓'],
+        ['ray',     '  █░  ║     ╱  ─•─  ╲     ║  ░█'],
+        ['ray',     '  ▓█░ ║    ╱   ◉│◉   ╲    ║ ░█▓'],
+        ['ray',     '  ▒█░  ╚╗  ╱     ◉     ╲  ╔╝  ░█▒'],
+        ['letters', '   ░▓██╚═╗   P · A · T   ╔═╝██▓░'],
+        ['frame',   '     ░▒▓██╚═══════════╝▓▒░'],
         ['frame',   '        ░▒▓██████████▓▒░'],
       ];
       let block = '';

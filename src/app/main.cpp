@@ -22,41 +22,41 @@ void PrintBootLogo() {
     const char* DM  = tty ? "\033[2;38;2;111;120;146m" : "";  // dim grey
     const char* RS  = tty ? "\033[0m"                  : "";
 
-    // 13 lines: hex frame (cyan, shaded ░▒▓█), DMT triangle inscribed
-    // inside (pink edges + bounces), letters (bright white).
+    // 13-line hex with shaded edges, chevroned inner box, nested ray
+    // bounces. Same layout as the overlay + web banners.
     fmt::print(stderr, "\n");
     fmt::print(stderr, "        {CD}░▒▓{CY}██████████{CD}▓▒░{RS}\n",
                fmt::arg("CY", CY), fmt::arg("CD", CD), fmt::arg("RS", RS));
-    fmt::print(stderr, "     {CD}░▒▓{CY}██████████████{CD}▓▒░{RS}\n",
+    fmt::print(stderr, "     {CD}░▒▓{CY}██╔═══════════╗{CD}▓▒░{RS}\n",
                fmt::arg("CY", CY), fmt::arg("CD", CD), fmt::arg("RS", RS));
-    fmt::print(stderr, "   {CD}░▓{CY}██░{RS}         {WT}D{RS}         {CD}░{CY}██{CD}▓░{RS}\n",
-               fmt::arg("CY", CY), fmt::arg("CD", CD),
-               fmt::arg("WT", WT), fmt::arg("RS", RS));
-    fmt::print(stderr, "   {CD}▒{CY}█{CD}░{RS}          {MG}╱ ╲{RS}          {CD}░{CY}█{CD}▒{RS}\n",
-               fmt::arg("CY", CY), fmt::arg("CD", CD),
-               fmt::arg("MG", MG), fmt::arg("RS", RS));
-    fmt::print(stderr, "   {CD}▓{CY}█{CD}░{RS}         {MG}╱ {MB}◉{MG} ╲{RS}          {CD}░{CY}█{CD}▓{RS}\n",
-               fmt::arg("CY", CY), fmt::arg("CD", CD),
-               fmt::arg("MG", MG), fmt::arg("MB", MB), fmt::arg("RS", RS));
-    fmt::print(stderr, "   {CY}█{CD}░{RS}         {MG}╱ {WT}─{MB}•{WT}─{MG} ╲{RS}          {CD}░{CY}█{RS}\n",
-               fmt::arg("CY", CY), fmt::arg("CD", CD), fmt::arg("MG", MG),
-               fmt::arg("MB", MB), fmt::arg("WT", WT), fmt::arg("RS", RS));
-    fmt::print(stderr, "   {CD}▓{CY}█{CD}░{RS}       {MG}╱{RS}   {MB}◉{WT}│{MB}◉{RS}  {MG}╲{RS}        {CD}░{CY}█{CD}▓{RS}\n",
-               fmt::arg("CY", CY), fmt::arg("CD", CD), fmt::arg("MG", MG),
-               fmt::arg("MB", MB), fmt::arg("WT", WT), fmt::arg("RS", RS));
-    fmt::print(stderr, "   {CY}█{CD}░{RS}       {MG}╱  ─{MB}◉{WT} • {MB}◉{MG}─  ╲{RS}       {CD}░{CY}█{RS}\n",
-               fmt::arg("CY", CY), fmt::arg("CD", CD), fmt::arg("MG", MG),
-               fmt::arg("MB", MB), fmt::arg("WT", WT), fmt::arg("RS", RS));
-    fmt::print(stderr, "   {CD}▓{CY}█{CD}░{RS}     {MG}╱{RS}     {MB}◉{WT}│{MB}◉{RS}      {MG}╲{RS}      {CD}░{CY}█{CD}▓{RS}\n",
-               fmt::arg("CY", CY), fmt::arg("CD", CD), fmt::arg("MG", MG),
-               fmt::arg("MB", MB), fmt::arg("WT", WT), fmt::arg("RS", RS));
-    fmt::print(stderr, "   {CD}▒{CY}█{CD}░{RS}    {WT}M{MG}━━━━━━━━━━━━━━━━{WT}T{RS}     {CD}░{CY}█{CD}▒{RS}\n",
-               fmt::arg("CY", CY), fmt::arg("CD", CD),
-               fmt::arg("MG", MG), fmt::arg("WT", WT), fmt::arg("RS", RS));
-    fmt::print(stderr, "     {CD}░▓{CY}██░{RS}         {WT}P{RS} {MB}·{RS} {WT}T{RS}        {CD}░{CY}██{CD}▓░{RS}\n",
+    fmt::print(stderr, "   {CD}░▓{CY}██╔═╝{RS}   {WT}D{RS} {MB}·{RS} {WT}M{RS} {MB}·{RS} {WT}T{RS}   {CY}╚═╗██{CD}▓░{RS}\n",
                fmt::arg("CY", CY), fmt::arg("CD", CD), fmt::arg("MB", MB),
                fmt::arg("WT", WT), fmt::arg("RS", RS));
-    fmt::print(stderr, "     {CD}░▒▓{CY}██████████████{CD}▓▒░{RS}\n",
+    fmt::print(stderr, "  {CD}▒{CY}█{CD}░{RS}  {CY}╔╝{RS}  {MG}╲{RS}     {MB}◉{RS}     {MG}╱{RS}  {CY}╚╗{RS}  {CD}░{CY}█{CD}▒{RS}\n",
+               fmt::arg("CY", CY), fmt::arg("CD", CD), fmt::arg("MG", MG),
+               fmt::arg("MB", MB), fmt::arg("RS", RS));
+    fmt::print(stderr, "  {CD}▓{CY}█{CD}░{RS} {CY}║{RS}    {MG}╲{RS}   {MB}◉{WT}│{MB}◉{RS}   {MG}╱{RS}    {CY}║{RS} {CD}░{CY}█{CD}▓{RS}\n",
+               fmt::arg("CY", CY), fmt::arg("CD", CD), fmt::arg("MG", MG),
+               fmt::arg("MB", MB), fmt::arg("WT", WT), fmt::arg("RS", RS));
+    fmt::print(stderr, "  {CY}█{CD}░{RS}  {CY}║{RS}     {MG}╲{RS}  {WT}─{MB}•{WT}─{RS}  {MG}╱{RS}     {CY}║{RS}  {CD}░{CY}█{RS}\n",
+               fmt::arg("CY", CY), fmt::arg("CD", CD), fmt::arg("MG", MG),
+               fmt::arg("MB", MB), fmt::arg("WT", WT), fmt::arg("RS", RS));
+    fmt::print(stderr, "  {CD}▓{CY}█{CD}░{RS} {CY}║{RS}      {MG}╳{RS}  {MB}•{RS}  {MG}╳{RS}      {CY}║{RS} {CD}░{CY}█{CD}▓{RS}\n",
+               fmt::arg("CY", CY), fmt::arg("CD", CD), fmt::arg("MG", MG),
+               fmt::arg("MB", MB), fmt::arg("RS", RS));
+    fmt::print(stderr, "  {CY}█{CD}░{RS}  {CY}║{RS}     {MG}╱{RS}  {WT}─{MB}•{WT}─{RS}  {MG}╲{RS}     {CY}║{RS}  {CD}░{CY}█{RS}\n",
+               fmt::arg("CY", CY), fmt::arg("CD", CD), fmt::arg("MG", MG),
+               fmt::arg("MB", MB), fmt::arg("WT", WT), fmt::arg("RS", RS));
+    fmt::print(stderr, "  {CD}▓{CY}█{CD}░{RS} {CY}║{RS}    {MG}╱{RS}   {MB}◉{WT}│{MB}◉{RS}   {MG}╲{RS}    {CY}║{RS} {CD}░{CY}█{CD}▓{RS}\n",
+               fmt::arg("CY", CY), fmt::arg("CD", CD), fmt::arg("MG", MG),
+               fmt::arg("MB", MB), fmt::arg("WT", WT), fmt::arg("RS", RS));
+    fmt::print(stderr, "  {CD}▒{CY}█{CD}░{RS}  {CY}╚╗{RS}  {MG}╱{RS}     {MB}◉{RS}     {MG}╲{RS}  {CY}╔╝{RS}  {CD}░{CY}█{CD}▒{RS}\n",
+               fmt::arg("CY", CY), fmt::arg("CD", CD), fmt::arg("MG", MG),
+               fmt::arg("MB", MB), fmt::arg("RS", RS));
+    fmt::print(stderr, "   {CD}░▓{CY}██╚═╗{RS}   {WT}P{RS} {MB}·{RS} {WT}A{RS} {MB}·{RS} {WT}T{RS}   {CY}╔═╝██{CD}▓░{RS}\n",
+               fmt::arg("CY", CY), fmt::arg("CD", CD), fmt::arg("MB", MB),
+               fmt::arg("WT", WT), fmt::arg("RS", RS));
+    fmt::print(stderr, "     {CD}░▒▓{CY}██╚═══════════╝{CD}▓▒░{RS}\n",
                fmt::arg("CY", CY), fmt::arg("CD", CD), fmt::arg("RS", RS));
     fmt::print(stderr, "        {CD}░▒▓{CY}██████████{CD}▓▒░{RS}\n",
                fmt::arg("CY", CY), fmt::arg("CD", CD), fmt::arg("RS", RS));
