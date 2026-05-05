@@ -110,6 +110,12 @@ public:
     MTL::Buffer*               LookupBuffer(BufferHandle h);
     MTL::AccelerationStructure* LookupAccelStruct(AccelStructHandle h);
 
+    // Mark all known acceleration structures as used by the current
+    // encoder. Required because a TLAS internally references its BLASes
+    // and Metal needs every one declared as a dependency on the encoder
+    // that ray-queries the TLAS.
+    void UseAllAccelStructs(MTL::ComputeCommandEncoder* enc);
+
     static constexpr std::uint64_t kSwapchainTextureId = 1;
 
 private:

@@ -114,20 +114,27 @@ void MetalCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
         auto* buf = device_->LookupBuffer(bound_buf_[i]);
         if (buf != nullptr) encoder_->setBuffer(buf, bound_buf_off_[i], i);
     }
-    // Push constants land in buffer slot 0 by Slang's convention for
-    // [[vk::push_constant]] -> Metal mapping.
-    if (push_size_ > 0) {
-        encoder_->setBytes(push_buf_, push_size_, 0);
+    // Slang's MSL output puts the AS at [[buffer(0)]] and pushes the
+    // push-constant block to [[buffer(1)]] when any AS is referenced;
+    // when there's no AS, push lands at [[buffer(0)]]. We compensate
+    // here so the same Engine binding code works for both cases.
+    bool has_accel = false;
+    AccelStructHandle accel_handle{0};
+    for (auto& a : bound_accel_) {
+        if (a.id != 0) { has_accel = true; accel_handle = a; break; }
     }
-    // Acceleration structures.  Slang puts [[vk::binding(N, 0)]]
-    // RaytracingAccelerationStructure at Metal accel-struct slot N.
-    for (std::uint32_t i = 0; i < std::size(bound_accel_); ++i) {
-        if (!bound_accel_[i]) continue;
-        auto* as = device_->LookupAccelStruct(bound_accel_[i]);
+
+    std::uint32_t push_slot = has_accel ? 1u : 0u;
+    if (push_size_ > 0) {
+        encoder_->setBytes(push_buf_, push_size_, push_slot);
+    }
+    if (has_accel) {
+        auto* as = device_->LookupAccelStruct(accel_handle);
         if (as != nullptr) {
-            encoder_->setAccelerationStructure(as, i);
-            // Mark dependency so the GPU sees the AS as in use.
-            encoder_->useResource(as, MTL::ResourceUsageRead);
+            encoder_->setAccelerationStructure(as, 0);
+            // useResource on every known AS so the BLAS instances
+            // referenced by the TLAS are also visible to this encoder.
+            device_->UseAllAccelStructs(encoder_);
         }
     }
 
@@ -456,6 +463,14 @@ MTL::AccelerationStructure* MetalDevice::LookupAccelStruct(AccelStructHandle h) 
     std::lock_guard lock(resource_mutex_);
     auto it = accels_.find(h.id);
     return (it == accels_.end()) ? nullptr : it->second;
+}
+
+void MetalDevice::UseAllAccelStructs(MTL::ComputeCommandEncoder* enc) {
+    if (enc == nullptr) return;
+    std::lock_guard lock(resource_mutex_);
+    for (auto& [_, a] : accels_) {
+        if (a != nullptr) enc->useResource(a, MTL::ResourceUsageRead);
+    }
 }
 
 // ---- Frame ---------------------------------------------------------------
