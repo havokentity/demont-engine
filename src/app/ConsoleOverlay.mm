@@ -409,6 +409,20 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
     [self makeKeyWindow];
     [self makeFirstResponder:self.consoleView.inputField];
 
+    // The backtick keystroke that triggered show was caught by GLFW's
+    // poll, but AppKit re-dispatches the same NSEvent to the new key
+    // window's first responder -- so the character gets inserted into
+    // the input field after we focus it. Clear it on the next run-loop
+    // tick (after the in-flight keyDown is delivered) and stash the
+    // history position so Up arrow still works.
+    PtConsoleView* view = self.consoleView;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSString* v = view.inputField.stringValue;
+        if (v.length == 1 && [v characterAtIndex:0] == '`') {
+            view.inputField.stringValue = @"";
+        }
+    });
+
     // Backtick toggles when the panel is the key window.  An NSEvent
     // monitor catches the keystroke before the field editor inserts it,
     // so the user can press ` to close even with the input focused.
