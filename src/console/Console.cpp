@@ -198,6 +198,27 @@ ExecuteResult Console::Execute(std::string_view line) {
             if (i > 1) new_value.push_back(' ');
             new_value.append(tokens[i]);
         }
+
+        // Enforce allowed_values when defined.
+        if (!v->allowed_values.empty()) {
+            bool ok2 = false;
+            for (const auto& a : v->allowed_values) {
+                if (a == new_value) { ok2 = true; break; }
+            }
+            if (!ok2) {
+                std::string allowed;
+                for (std::size_t i = 0; i < v->allowed_values.size(); ++i) {
+                    if (i) allowed += '|';
+                    allowed += v->allowed_values[i];
+                }
+                result.ok = false;
+                result.error = fmt::format(
+                    "{}: invalid value '{}' (expected one of: {})",
+                    v->name, new_value, allowed);
+                return result;
+            }
+        }
+
         std::string old_value = v->value;
         v->value = std::move(new_value);
         if (v->on_change) v->on_change(*v);

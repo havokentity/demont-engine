@@ -413,9 +413,9 @@ void Engine::RegisterCommands() {
             if (!r.ok) out.FormatLine("exec error: {}", r.error);
         });
 
-    // r_backend reacts to changes (Phase 1: just log; Phase 2+ triggers
-    // RequestBackendSwitch).
+    // r_backend: validate against the known set + react to changes.
     if (auto* v = C.FindCVar("r_backend")) {
+        v->allowed_values = {"none", "software", "metal", "vulkan"};
         v->on_change = [this](const pt::console::CVar& cv) {
             BackendType t = BackendType::None;
             if      (cv.value == "software") t = BackendType::Software;
@@ -423,6 +423,16 @@ void Engine::RegisterCommands() {
             else if (cv.value == "vulkan")   t = BackendType::Vulkan;
             RequestBackendSwitch(t);
         };
+    }
+    // dev_log_level: validate
+    if (auto* v = C.FindCVar("dev_log_level")) {
+        v->allowed_values = {"error", "warn", "info", "debug"};
+    }
+    // app_vsync / app_overlay_enabled / app_auto_open_console / dev_cheats:
+    // boolean toggles -- accept 0|1.
+    for (const char* n : {"app_vsync", "app_overlay_enabled",
+                          "app_auto_open_console", "dev_cheats"}) {
+        if (auto* v = C.FindCVar(n)) v->allowed_values = {"0", "1"};
     }
 }
 

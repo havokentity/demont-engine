@@ -275,16 +275,44 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
     if (self.allNames.count == 0) [self refreshNames];
 
     NSString* value = self.inputField.stringValue;
-    NSRange firstSpace = [value rangeOfString:@" "];
-    if (firstSpace.location != NSNotFound) return NO;
+    NSRange lastSpace = [value rangeOfString:@" " options:NSBackwardsSearch];
+
+    NSString* prefix;
+    NSArray<NSString*>* candidates;
+
+    if (lastSpace.location == NSNotFound) {
+        // Token 0: cvar / command name.
+        prefix = value;
+        candidates = self.allNames;
+    } else {
+        // Value position: complete from the cvar's allowed_values.
+        NSString* cvarName = [value substringToIndex:[value rangeOfString:@" "].location];
+        auto* cv = pt::console::Console::Get().FindCVar(
+            std::string_view([cvarName UTF8String]));
+        if (cv == nullptr || cv->allowed_values.empty()) return YES;
+        NSMutableArray* allowed = [NSMutableArray array];
+        for (auto& a : cv->allowed_values) {
+            [allowed addObject:[NSString stringWithUTF8String:a.c_str()]];
+        }
+        candidates = allowed;
+        prefix = [value substringFromIndex:lastSpace.location + 1];
+    }
 
     NSMutableArray<NSString*>* matches = [NSMutableArray array];
-    for (NSString* n in self.allNames) {
-        if ([n hasPrefix:value]) [matches addObject:n];
+    for (NSString* n in candidates) {
+        if ([n hasPrefix:prefix]) [matches addObject:n];
     }
     if (matches.count == 0) return YES;
+
+    NSString* before = (lastSpace.location == NSNotFound)
+                         ? @""
+                         : [value substringToIndex:lastSpace.location + 1];
+
     if (matches.count == 1) {
-        self.inputField.stringValue = [matches[0] stringByAppendingString:@" "];
+        NSString* tail = (lastSpace.location == NSNotFound)
+                            ? [matches[0] stringByAppendingString:@" "]
+                            : matches[0];
+        self.inputField.stringValue = [before stringByAppendingString:tail];
         self.lastTabPrefix = nil;
         return YES;
     }
@@ -297,18 +325,18 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
         common = [common substringToIndex:j];
         if (common.length == 0) break;
     }
-    if (common.length > value.length) {
-        self.inputField.stringValue = common;
+    if (common.length > prefix.length) {
+        self.inputField.stringValue = [before stringByAppendingString:common];
         self.lastTabPrefix = common;
         self.lastTabShownList = NO;
         return YES;
     }
 
-    if (self.lastTabPrefix && [self.lastTabPrefix isEqualToString:value] && !self.lastTabShownList) {
+    if (self.lastTabPrefix && [self.lastTabPrefix isEqualToString:prefix] && !self.lastTabShownList) {
         [self appendLine:[matches componentsJoinedByString:@"  "] level:@"out"];
         self.lastTabShownList = YES;
     } else {
-        self.lastTabPrefix = value;
+        self.lastTabPrefix = prefix;
         self.lastTabShownList = NO;
     }
     return YES;

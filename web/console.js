@@ -18,6 +18,7 @@
   // identifiers; pressing Tab once completes to the longest common prefix,
   // pressing it again prints the candidate list.
   let allNames = [];
+  let cvarMeta = {};   // name -> { allowed_values: [...] }
   let lastTabState = null;  // {prefix, matches, shownList} for Tab cycling
 
   // ---------- helpers --------------------------------------------------------
@@ -105,7 +106,13 @@
       sendAndWait({ type: 'list_commands' }),
     ]);
     const names = new Set();
-    if (c && c.ok && c.cvars)    for (const v of c.cvars)    names.add(v.name);
+    cvarMeta = {};
+    if (c && c.ok && c.cvars) {
+      for (const v of c.cvars) {
+        names.add(v.name);
+        cvarMeta[v.name] = { allowed_values: v.allowed_values || [] };
+      }
+    }
     if (k && k.ok && k.commands) for (const v of k.commands) names.add(v.name);
     allNames = Array.from(names).sort();
   }
@@ -124,22 +131,33 @@
   }
 
   function handleTab() {
-    // Only complete the FIRST token (the command/cvar name).  Value
-    // completion (e.g. r_backend <Tab> -> software|metal|...) is a
-    // future enhancement.
     const value = input.value;
     const cursor = input.selectionStart;
-    if (cursor !== value.length) return;        // only complete at end
+    if (cursor !== value.length) return;
     const beforeCursor = value.slice(0, cursor);
-    if (/\s/.test(beforeCursor)) return;        // already past first token
+    const lastSpace = beforeCursor.lastIndexOf(' ');
 
-    const prefix = beforeCursor;
-    const matches = allNames.filter(n => n.startsWith(prefix));
+    let prefix, candidates;
+    if (lastSpace === -1) {
+      // Token 0: cvar / command name.
+      prefix = beforeCursor;
+      candidates = allNames;
+    } else {
+      // Value position: complete from the named cvar's allowed_values.
+      const cvarName = beforeCursor.split(/\s+/)[0];
+      const meta = cvarMeta[cvarName];
+      if (!meta || !meta.allowed_values || meta.allowed_values.length === 0) return;
+      prefix = beforeCursor.slice(lastSpace + 1);
+      candidates = meta.allowed_values;
+    }
 
+    const matches = candidates.filter(n => n.startsWith(prefix));
     if (matches.length === 0) return;
 
     if (matches.length === 1) {
-      input.value = matches[0] + ' ';
+      const replaced = beforeCursor.slice(0, lastSpace + 1) + matches[0]
+                     + (lastSpace === -1 ? ' ' : '');
+      input.value = replaced;
       input.setSelectionRange(input.value.length, input.value.length);
       lastTabState = null;
       return;
@@ -147,13 +165,13 @@
 
     const common = commonPrefix(matches);
     if (common.length > prefix.length) {
-      input.value = common;
-      input.setSelectionRange(common.length, common.length);
+      const replaced = beforeCursor.slice(0, lastSpace + 1) + common;
+      input.value = replaced;
+      input.setSelectionRange(replaced.length, replaced.length);
       lastTabState = { prefix: common, matches, shownList: false };
       return;
     }
 
-    // Same prefix as before: show the candidate list once.
     if (lastTabState && lastTabState.prefix === prefix && !lastTabState.shownList) {
       append(`<span class="ts">${ts()}</span><span class="out">${escape(matches.join('  '))}</span>`);
       lastTabState.shownList = true;

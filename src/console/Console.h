@@ -27,6 +27,13 @@ struct CVar {
     std::string default_value;
     std::string description;
     std::uint32_t flags = 0;
+
+    // Optional set of accepted values.  When non-empty, Console::Execute
+    // rejects writes whose value isn't in the set (free-form cvars like
+    // r_clear_color leave it empty).  Also drives tab-completion of the
+    // value position in both UIs.
+    std::vector<std::string> allowed_values;
+
     std::function<void(const CVar&)> on_change;
 
     // Coerced accessors.  All values are stored as strings; these parse on

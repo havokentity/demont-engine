@@ -294,14 +294,17 @@ void ConsoleServer::HandleWsMessage(mg_connection* conn, std::string_view payloa
                        {"error", fmt::format("unknown cvar: {}", name)}});
             return;
         }
-        reply(json{{"ok", true},
-                   {"cvar", json{
-                       {"name",        v->name},
-                       {"value",       v->value},
-                       {"default",     v->default_value},
-                       {"description", v->description},
-                       {"flags",       v->flags},
-                   }}});
+        json cvarObj{
+            {"name",        v->name},
+            {"value",       v->value},
+            {"default",     v->default_value},
+            {"description", v->description},
+            {"flags",       v->flags},
+        };
+        if (!v->allowed_values.empty()) {
+            cvarObj["allowed_values"] = v->allowed_values;
+        }
+        reply(json{{"ok", true}, {"cvar", cvarObj}});
         return;
     }
 
@@ -326,13 +329,17 @@ void ConsoleServer::HandleWsMessage(mg_connection* conn, std::string_view payloa
         std::string prefix = msg.value("prefix", std::string{});
         json arr = json::array();
         Console::Get().EnumerateCVars(prefix, [&arr](CVar& v) {
-            arr.push_back(json{
+            json entry{
                 {"name",        v.name},
                 {"value",       v.value},
                 {"default",     v.default_value},
                 {"description", v.description},
                 {"flags",       v.flags},
-            });
+            };
+            if (!v.allowed_values.empty()) {
+                entry["allowed_values"] = v.allowed_values;
+            }
+            arr.push_back(entry);
         });
         reply(json{{"ok", true}, {"cvars", arr}});
         return;
