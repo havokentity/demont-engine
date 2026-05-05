@@ -1,17 +1,26 @@
 // PathTracer console UI -- vanilla JS, no build step.
 (function () {
-  const out = document.getElementById('output');
-  const form = document.getElementById('input-form');
-  const input = document.getElementById('input');
-  const status = document.getElementById('status');
+  const out        = document.getElementById('output');
+  const form       = document.getElementById('input-form');
+  const input      = document.getElementById('input');
+  const status     = document.getElementById('status');
   const cvarsPanel = document.getElementById('cvars');
 
   let ws = null;
   let nextId = 1;
   const pending = new Map();
+
+  // History (Up/Down keys).
   const history = [];
   let histPos = -1;
 
+  // Tab-completion state. allNames is a sorted array of cvar+command
+  // identifiers; pressing Tab once completes to the longest common prefix,
+  // pressing it again prints the candidate list.
+  let allNames = [];
+  let lastTabState = null;  // {prefix, matches, shownList} for Tab cycling
+
+  // ---------- helpers --------------------------------------------------------
   function escape(s) {
     return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
   }
@@ -71,7 +80,7 @@
       return;
     }
     if (msg.type === 'event' && msg.topic === 'log') {
-      const lvl = (msg.data && msg.data.level) || 'info';
+      const lvl  = (msg.data && msg.data.level)   || 'info';
       const text = (msg.data && msg.data.message) || '';
       append(`<span class="ts">${ts()}</span><span class="log-${escape(lvl)}">[${escape(lvl).toUpperCase()}] ${escape(text)}</span>`);
       return;
@@ -90,6 +99,70 @@
     }
   }
 
+  async function refreshNames() {
+    const [c, k] = await Promise.all([
+      sendAndWait({ type: 'list_cvars' }),
+      sendAndWait({ type: 'list_commands' }),
+    ]);
+    const names = new Set();
+    if (c && c.ok && c.cvars)    for (const v of c.cvars)    names.add(v.name);
+    if (k && k.ok && k.commands) for (const v of k.commands) names.add(v.name);
+    allNames = Array.from(names).sort();
+  }
+
+  // ---------- Tab completion -------------------------------------------------
+  function commonPrefix(strs) {
+    if (strs.length === 0) return '';
+    let p = strs[0];
+    for (let i = 1; i < strs.length; ++i) {
+      let j = 0;
+      while (j < p.length && j < strs[i].length && p[j] === strs[i][j]) ++j;
+      p = p.slice(0, j);
+      if (!p) break;
+    }
+    return p;
+  }
+
+  function handleTab() {
+    // Only complete the FIRST token (the command/cvar name).  Value
+    // completion (e.g. r_backend <Tab> -> software|metal|...) is a
+    // future enhancement.
+    const value = input.value;
+    const cursor = input.selectionStart;
+    if (cursor !== value.length) return;        // only complete at end
+    const beforeCursor = value.slice(0, cursor);
+    if (/\s/.test(beforeCursor)) return;        // already past first token
+
+    const prefix = beforeCursor;
+    const matches = allNames.filter(n => n.startsWith(prefix));
+
+    if (matches.length === 0) return;
+
+    if (matches.length === 1) {
+      input.value = matches[0] + ' ';
+      input.setSelectionRange(input.value.length, input.value.length);
+      lastTabState = null;
+      return;
+    }
+
+    const common = commonPrefix(matches);
+    if (common.length > prefix.length) {
+      input.value = common;
+      input.setSelectionRange(common.length, common.length);
+      lastTabState = { prefix: common, matches, shownList: false };
+      return;
+    }
+
+    // Same prefix as before: show the candidate list once.
+    if (lastTabState && lastTabState.prefix === prefix && !lastTabState.shownList) {
+      append(`<span class="ts">${ts()}</span><span class="out">${escape(matches.join('  '))}</span>`);
+      lastTabState.shownList = true;
+    } else if (!lastTabState || lastTabState.prefix !== prefix) {
+      lastTabState = { prefix, matches, shownList: false };
+    }
+  }
+
+  // ---------- Connect / wiring ----------------------------------------------
   function connect() {
     const url = `ws://${location.host}/ws`;
     status.textContent = 'connecting…';
@@ -98,9 +171,9 @@
     ws.onopen = async () => {
       status.textContent = `connected · ${location.host}`;
       status.className = 'status ok';
-      // Subscribe to log push.
       send({ type: 'subscribe', topics: ['log'] });
-      append(`<span class="ts">${ts()}</span><span class="out">connected. type "list_commands" or "sys_info".</span>`);
+      append(`<span class="ts">${ts()}</span><span class="out">connected. type "list_commands", "sys_info", or hit Tab to complete.</span>`);
+      await refreshNames();
       refreshCvars();
     };
     ws.onmessage = onMessage;
@@ -119,9 +192,17 @@
     e.preventDefault();
     const line = input.value;
     input.value = '';
+    lastTabState = null;
     exec(line);
   });
+
   input.addEventListener('keydown', (e) => {
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      handleTab();
+      return;
+    }
+    if (e.key !== 'Tab') lastTabState = null;
     if (e.key === 'ArrowUp') {
       if (histPos > 0) { histPos--; input.value = history[histPos] || ''; }
       e.preventDefault();
@@ -133,6 +214,9 @@
       e.preventDefault();
     }
   });
+
+  // Refresh names occasionally so newly-registered cvars show up.
+  setInterval(refreshNames, 10_000);
 
   connect();
 })();

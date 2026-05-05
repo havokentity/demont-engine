@@ -24,6 +24,10 @@ public:
     bool Init();
     void Shutdown();
 
+    // Launches the user's default browser at the running web console URL.
+    // No-op (with a warning) if the platform launcher fails.
+    void OpenWebConsole();
+
     // Main loop.  Returns when the window is closed or `quit` runs.
     void Run();
 

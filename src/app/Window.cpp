@@ -122,9 +122,17 @@ void Window::OnResize(GLFWwindow* w, int width, int height) {
     self->height_ = height;
 }
 
-void Window::OnKey(GLFWwindow* w, int key, int /*scancode*/, int action, int /*mods*/) {
-    if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS) {
+void Window::SetKeyHandler(KeyHandler h) { key_handler_ = std::move(h); }
+
+void Window::OnKey(GLFWwindow* w, int key, int /*scancode*/, int action, int mods) {
+    if (action != GLFW_PRESS) return;
+    if (key == GLFW_KEY_ESCAPE) {
         glfwSetWindowShouldClose(w, GLFW_TRUE);
+        return;
+    }
+    auto* self = static_cast<Window*>(glfwGetWindowUserPointer(w));
+    if (self != nullptr && self->key_handler_) {
+        self->key_handler_(key, mods);
     }
 }
 

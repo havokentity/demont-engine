@@ -13,6 +13,7 @@
 #include <fmt/format.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 #include <charconv>
 
@@ -31,8 +32,10 @@ namespace cvar {
     PT_CVAR(app_window_width,  "1280", "Initial window width",           CVAR_ARCHIVE);
     PT_CVAR(app_window_height, "720",  "Initial window height",          CVAR_ARCHIVE);
     PT_CVAR(app_vsync,         "1",    "Swapchain vsync (1=on)",         CVAR_ARCHIVE);
+    PT_CVAR(app_auto_open_console, "1",
+            "Open the web console in the default browser at startup",     CVAR_ARCHIVE);
     PT_CVAR(r_backend,         "software", "One of none|software|metal|vulkan",CVAR_ARCHIVE);
-    PT_CVAR(r_clear_color,     "0.05 0.05 0.06", "Background clear colour (R G B)", 0);
+    PT_CVAR(r_clear_color,     "0.18 0.05 0.28", "Background clear colour (R G B)", 0);
     PT_CVAR(dev_cheats,        "0",    "Gate for CHEAT-flagged cvars",   0);
     PT_CVAR(dev_log_level,     "info", "error|warn|info|debug",          0);
 
@@ -75,13 +78,20 @@ bool Engine::Init() {
     jobs_->Init();
     pt::jobs::JobSystem::SetInstance(jobs_.get());
 
-    // Window.
+    // Window. Decide the GraphicsApi hint up front from r_backend so the
+    // window comes up with the right context on first show -- otherwise
+    // we create with NO_API, then RequestBackendSwitch destroys and
+    // rebuilds it with OpenGL, and the user sees a brief blank frame.
     auto* ww = C.FindCVar("app_window_width");
     auto* wh = C.FindCVar("app_window_height");
+    auto* rb = C.FindCVar("r_backend");
     int win_w = ww ? ww->GetInt() : 1280;
     int win_h = wh ? wh->GetInt() : 720;
+    auto api  = (rb && rb->value == "software")
+                  ? pt::app::GraphicsApi::OpenGL
+                  : pt::app::GraphicsApi::None;
     window_ = std::make_unique<pt::app::Window>();
-    if (!window_->Create(win_w, win_h, "PathTracer")) {
+    if (!window_->Create(win_w, win_h, "PathTracer", api)) {
         LOG_ERROR("Failed to open window");
         return false;
     }
@@ -107,8 +117,43 @@ bool Engine::Init() {
         if (t != BackendType::None) RequestBackendSwitch(t);
     }
 
+    // Backtick toggles the web console (HARD: no in-app GUI).
+    if (window_) {
+        window_->SetKeyHandler([this](int key, int /*mods*/) {
+            constexpr int kGrave = 96;  // GLFW_KEY_GRAVE_ACCENT
+            if (key == kGrave) OpenWebConsole();
+        });
+    }
+
+    if (auto* v = C.FindCVar("app_auto_open_console"); v && v->GetBool()) {
+        OpenWebConsole();
+    }
+
     LOG_INFO("Engine initialized.");
     return true;
+}
+
+void Engine::OpenWebConsole() {
+    auto* C  = &pt::console::Console::Get();
+    auto* p  = C->FindCVar("net_port");
+    auto* a  = C->FindCVar("net_bind_address");
+    int  port = p ? p->GetInt() : 27960;
+    std::string host = (a && !a->value.empty() && a->value != "0.0.0.0")
+                       ? a->value : std::string("localhost");
+    auto url = fmt::format("http://{}:{}/", host, port);
+    LOG_INFO("Opening console: {}", url);
+
+#if defined(__APPLE__)
+    auto cmd = fmt::format("/usr/bin/open '{}' >/dev/null 2>&1", url);
+    int rc = std::system(cmd.c_str());
+    if (rc != 0) LOG_WARN("`open` returned {} -- visit {} manually", rc, url);
+#elif defined(_WIN32)
+    auto cmd = fmt::format("cmd /c start \"\" \"{}\"", url);
+    std::system(cmd.c_str());
+#else
+    auto cmd = fmt::format("xdg-open '{}' >/dev/null 2>&1 &", url);
+    std::system(cmd.c_str());
+#endif
 }
 
 void Engine::Shutdown() {

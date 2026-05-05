@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 
 struct GLFWwindow;
@@ -41,6 +42,12 @@ public:
     // Windows).  Currently unused outside of future RHI backends.
     void* NativeHandle() const;
 
+    // Engine-installed handler for hotkeys. Called for press events with
+    // (key, mods) using the GLFW_KEY_* enums.  Esc-to-close is handled
+    // before this hook fires.
+    using KeyHandler = std::function<void(int key, int mods)>;
+    void SetKeyHandler(KeyHandler h);
+
 private:
     static void OnResize(GLFWwindow* w, int width, int height);
     static void OnKey(GLFWwindow* w, int key, int scancode, int action, int mods);
@@ -50,6 +57,7 @@ private:
     int height_ = 0;
     GraphicsApi api_ = GraphicsApi::None;
     std::string title_;
+    KeyHandler  key_handler_;
 };
 
 }  // namespace pt::app
