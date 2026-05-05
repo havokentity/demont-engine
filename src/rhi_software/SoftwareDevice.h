@@ -47,7 +47,7 @@ public:
     void Barrier(const BarrierDesc&) override {}
 
     PipelineHandle bound_pipeline{0};
-    std::uint8_t   push_constants_buf[64] {};
+    std::uint8_t   push_constants_buf[128] {};
     std::size_t    push_constants_size = 0;
 
 private:

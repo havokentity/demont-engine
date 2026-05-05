@@ -43,9 +43,10 @@ namespace cvar {
             "Enable the in-window native console overlay (backtick toggles)", CVAR_ARCHIVE);
     PT_CVAR(r_backend,         "software", "One of none|software|metal|vulkan",CVAR_ARCHIVE);
     PT_CVAR(r_clear_color,     "0.18 0.05 0.28", "Background clear colour (R G B)", 0);
-    PT_CVAR(r_mode,            "scene",
-            "What to render: clear|scene (preview/raytrace/pathtrace land in P7)",
+    PT_CVAR(r_mode,            "pathtrace",
+            "What to render: clear|scene|pathtrace",
             CVAR_ARCHIVE);
+    PT_CVAR(r_max_bounces,     "8",  "Max path bounces in pathtrace mode",   CVAR_ARCHIVE);
 
     // Camera controls.  Mouse-look engages while RIGHT mouse is held.
     PT_CVAR(cam_speed,         "3.0", "Movement speed (units/sec)",        CVAR_ARCHIVE);
@@ -226,6 +227,8 @@ void Engine::Shutdown() {
 }
 
 void Engine::TearDownDevice() {
+    accum_texture_id_ = 0;
+    accum_w_ = accum_h_ = 0;
     if (device_) {
         // Final frame clears the drawable to black so the window doesn't
         // freeze on whatever colour was last presented (the layer keeps
@@ -298,6 +301,12 @@ void Engine::RequestBackendSwitch(BackendType to) {
         };
         scene_pipeline_id_ = device_->CreateComputePipeline(desc).id;
     }
+    {
+        pt::rhi::ComputePipelineDesc desc{
+            .kernel_name = "pathtrace", .bytecode = {}, .debug_name = "pathtrace",
+        };
+        pathtrace_pipeline_id_ = device_->CreateComputePipeline(desc).id;
+    }
 }
 
 namespace {
@@ -335,21 +344,64 @@ void Engine::RenderFrame() {
     if (!device_) return;
 
     auto& C = pt::console::Console::Get();
-    bool scene_mode = false;
-    if (auto* v = C.FindCVar("r_mode")) scene_mode = (v->value == "scene");
+    std::string mode = "clear";
+    if (auto* v = C.FindCVar("r_mode")) mode = v->value;
 
-    std::uint64_t pipeline = scene_mode ? scene_pipeline_id_ : clear_pipeline_id_;
-    if (pipeline == 0) {
-        // Fall back to clear if the requested pipeline isn't built (e.g.
-        // software backend doesn't ship a scene shader yet).
-        pipeline = clear_pipeline_id_;
-    }
+    std::uint64_t pipeline = clear_pipeline_id_;
+    if      (mode == "pathtrace" && pathtrace_pipeline_id_ != 0) pipeline = pathtrace_pipeline_id_;
+    else if (mode == "scene"     && scene_pipeline_id_     != 0) pipeline = scene_pipeline_id_;
     if (pipeline == 0) return;
 
     auto fc = device_->BeginFrame();
+
+    // Camera-movement detection -> reset accumulation.
+    auto& cam = *camera_;
+    bool cam_moved = (cam.pos.x != last_cam_pos_[0]) ||
+                     (cam.pos.y != last_cam_pos_[1]) ||
+                     (cam.pos.z != last_cam_pos_[2]) ||
+                     (cam.yaw   != last_cam_yaw_)    ||
+                     (cam.pitch != last_cam_pitch_)  ||
+                     (cam.fov_deg != last_cam_fov_);
+    if (cam_moved) accum_dirty_ = true;
+    last_cam_pos_[0] = cam.pos.x; last_cam_pos_[1] = cam.pos.y; last_cam_pos_[2] = cam.pos.z;
+    last_cam_yaw_   = cam.yaw;   last_cam_pitch_  = cam.pitch;  last_cam_fov_  = cam.fov_deg;
+
+    // Lazily (re)create the HDR accumulation texture.  Only used for
+    // pathtrace mode; allocate once it's needed and re-allocate when the
+    // swapchain size changes.
+    bool needs_accum = (pipeline == pathtrace_pipeline_id_);
+    if (needs_accum && (accum_texture_id_ == 0 ||
+                        accum_w_ != static_cast<int>(fc.width) ||
+                        accum_h_ != static_cast<int>(fc.height))) {
+        if (accum_texture_id_ != 0) {
+            device_->DestroyTexture(pt::rhi::TextureHandle{accum_texture_id_});
+        }
+        pt::rhi::TextureDesc td{
+            .width  = fc.width,
+            .height = fc.height,
+            .format = pt::rhi::TextureFormat::RGBA32F,
+            .usage  = pt::rhi::TextureUsage::Storage,
+            .debug_name = "accum_hdr",
+        };
+        auto h = device_->CreateTexture(td);
+        accum_texture_id_ = h.id;
+        if (accum_texture_id_ == 0) {
+            LOG_WARN("CreateTexture(RGBA32F {}x{}) failed -- falling back to scene mode",
+                     fc.width, fc.height);
+            pipeline = scene_pipeline_id_ ? scene_pipeline_id_ : clear_pipeline_id_;
+            needs_accum = false;
+        } else {
+            accum_w_ = static_cast<int>(fc.width);
+            accum_h_ = static_cast<int>(fc.height);
+            accum_dirty_ = true;
+        }
+    }
     auto* cb = device_->AcquireCommandBuffer();
     cb->BindComputePipeline(pt::rhi::PipelineHandle{pipeline});
     cb->BindStorageTexture(0, fc.swapchain_image);
+    if (needs_accum && accum_texture_id_ != 0) {
+        cb->BindStorageTexture(1, pt::rhi::TextureHandle{accum_texture_id_});
+    }
 
     glm::vec3 bg = ParseRGB(C.FindCVar("r_clear_color") ? C.FindCVar("r_clear_color")->value
                                                         : std::string_view{},
@@ -360,37 +412,61 @@ void Engine::RenderFrame() {
         const float color[4] = {bg.r, bg.g, bg.b, 1.0f};
         cb->PushConstants(color, sizeof(color));
     } else {
-        // Scene path: 64-byte push containing the camera basis + sky.
-        const auto& cam   = *camera_;
+        // Scene + pathtrace share a 64- or 80-byte push: camera basis,
+        // plus (for pathtrace) frame_index / reset_accum / max_bounces.
         const auto fwd   = cam.Forward();
         const auto right = cam.Right();
         const auto up    = cam.Up();
         const float aspect = (fc.height > 0)
                                ? float(fc.width) / float(fc.height) : 1.0f;
-        struct Push {
-            float pos_fovtan[4];
-            float fwd_aspect[4];
-            float right_xyz[4];
-            float up_bg_pack[4];
-        } push{};
-        push.pos_fovtan[0] = cam.pos.x;
-        push.pos_fovtan[1] = cam.pos.y;
-        push.pos_fovtan[2] = cam.pos.z;
-        push.pos_fovtan[3] = cam.FovYTan();
-        push.fwd_aspect[0] = fwd.x;
-        push.fwd_aspect[1] = fwd.y;
-        push.fwd_aspect[2] = fwd.z;
-        push.fwd_aspect[3] = aspect;
-        push.right_xyz[0]  = right.x;
-        push.right_xyz[1]  = right.y;
-        push.right_xyz[2]  = right.z;
-        push.right_xyz[3]  = 0.0f;
-        push.up_bg_pack[0] = up.x;
-        push.up_bg_pack[1] = up.y;
-        push.up_bg_pack[2] = up.z;
-        push.up_bg_pack[3] = PackBgRGB(bg);
-        static_assert(sizeof(push) == 64, "push must fit in 64 bytes");
-        cb->PushConstants(&push, sizeof(push));
+
+        if (pipeline == scene_pipeline_id_) {
+            struct ScenePush {
+                float pos_fovtan[4];
+                float fwd_aspect[4];
+                float right_xyz[4];
+                float up_bg_pack[4];
+            } push{};
+            push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
+            push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
+            push.fwd_aspect[0] = fwd.x; push.fwd_aspect[1] = fwd.y;
+            push.fwd_aspect[2] = fwd.z; push.fwd_aspect[3] = aspect;
+            push.right_xyz[0]  = right.x; push.right_xyz[1] = right.y;
+            push.right_xyz[2]  = right.z; push.right_xyz[3] = 0.0f;
+            push.up_bg_pack[0] = up.x; push.up_bg_pack[1] = up.y;
+            push.up_bg_pack[2] = up.z; push.up_bg_pack[3] = PackBgRGB(bg);
+            static_assert(sizeof(push) == 64);
+            cb->PushConstants(&push, sizeof(push));
+        } else {
+            // pathtrace
+            std::uint32_t bounces = 8;
+            if (auto* v = C.FindCVar("r_max_bounces")) bounces = (std::uint32_t)v->GetInt();
+            struct PtPush {
+                float pos_fovtan[4];
+                float fwd_aspect[4];
+                float right_xyz[4];
+                float up_xyz[4];
+                std::uint32_t frame_index;
+                std::uint32_t reset_accum;
+                std::uint32_t max_bounces;
+                std::uint32_t pad0;
+            } push{};
+            push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
+            push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
+            push.fwd_aspect[0] = fwd.x; push.fwd_aspect[1] = fwd.y;
+            push.fwd_aspect[2] = fwd.z; push.fwd_aspect[3] = aspect;
+            push.right_xyz[0]  = right.x; push.right_xyz[1] = right.y;
+            push.right_xyz[2]  = right.z; push.right_xyz[3] = 0.0f;
+            push.up_xyz[0]     = up.x; push.up_xyz[1] = up.y;
+            push.up_xyz[2]     = up.z; push.up_xyz[3] = 0.0f;
+            push.frame_index   = frame_index_++;
+            push.reset_accum   = accum_dirty_ ? 1u : 0u;
+            push.max_bounces   = bounces;
+            push.pad0          = 0;
+            static_assert(sizeof(push) == 80);
+            cb->PushConstants(&push, sizeof(push));
+            accum_dirty_ = false;
+        }
     }
 
     auto wg_x = (fc.width  + 7) / 8;
@@ -612,9 +688,13 @@ void Engine::RegisterCommands() {
             RequestBackendSwitch(t);
         };
     }
-    // r_mode: clear|scene for now (preview/raytrace/pathtrace land in P7).
+    // r_mode: clear|scene|pathtrace.
     if (auto* v = C.FindCVar("r_mode")) {
-        v->allowed_values = {"clear", "scene"};
+        v->allowed_values = {"clear", "scene", "pathtrace"};
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    if (auto* v = C.FindCVar("r_clear_color")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
     // dev_log_level: validate
     if (auto* v = C.FindCVar("dev_log_level")) {

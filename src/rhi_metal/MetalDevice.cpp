@@ -21,6 +21,8 @@ extern const unsigned char shader_Clear_metal_data[];
 extern const unsigned long shader_Clear_metal_size;
 extern const unsigned char shader_Scene_metal_data[];
 extern const unsigned long shader_Scene_metal_size;
+extern const unsigned char shader_PathTrace_metal_data[];
+extern const unsigned long shader_PathTrace_metal_size;
 }
 
 // Defined in MetalAttach.mm.
@@ -203,8 +205,9 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
         named_pipelines_.emplace(kernel_name, id);
     };
 
-    build_pso("clear", shader_Clear_metal_data);
-    build_pso("scene", shader_Scene_metal_data);
+    build_pso("clear",     shader_Clear_metal_data);
+    build_pso("scene",     shader_Scene_metal_data);
+    build_pso("pathtrace", shader_PathTrace_metal_data);
 
     cmd_ = std::make_unique<MetalCommandBuffer>(this);
 }
@@ -242,11 +245,28 @@ BufferHandle MetalDevice::CreateBuffer(const BufferDesc& d) {
 TextureHandle MetalDevice::CreateTexture(const TextureDesc& d) {
     if (device_ == nullptr) return {0};
     pt::mem::TagScope scope(pt::MemTag::GpuBuffers);
+
+    MTL::PixelFormat fmt = MTL::PixelFormatRGBA8Unorm;
+    switch (d.format) {
+        case TextureFormat::RGBA8_UNORM: fmt = MTL::PixelFormatRGBA8Unorm;       break;
+        case TextureFormat::RGBA8_SRGB:  fmt = MTL::PixelFormatRGBA8Unorm_sRGB;  break;
+        case TextureFormat::RGBA16F:     fmt = MTL::PixelFormatRGBA16Float;      break;
+        case TextureFormat::RGBA32F:     fmt = MTL::PixelFormatRGBA32Float;      break;
+        case TextureFormat::R32_UINT:    fmt = MTL::PixelFormatR32Uint;          break;
+        default: break;
+    }
+
+    // texture2DDescriptor returns an AUTORELEASED descriptor.  Wrap in a
+    // local pool so it gets cleaned up at function exit -- calling
+    // release() on it directly was an over-release that crashed once the
+    // implicit pool drained.  newTexture(...) is a `new`-prefixed call
+    // and returns retained; we own it.
+    auto* pool = NS::AutoreleasePool::alloc()->init();
     auto* td = MTL::TextureDescriptor::texture2DDescriptor(
-        MTL::PixelFormatRGBA8Unorm, d.width, d.height, false);
+        fmt, d.width, d.height, false);
     td->setUsage(MTL::TextureUsageShaderRead | MTL::TextureUsageShaderWrite);
     auto* tex = device_->newTexture(td);
-    td->release();
+    pool->release();
     if (tex == nullptr) return {0};
     std::lock_guard lock(resource_mutex_);
     auto id = next_id_++;

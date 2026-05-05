@@ -64,7 +64,7 @@ private:
     BufferHandle               bound_buf_[8] {};
     std::size_t                bound_buf_off_[8] {};
 
-    std::uint8_t  push_buf_[64] {};
+    std::uint8_t  push_buf_[128] {};
     std::size_t   push_size_ = 0;
 };
 

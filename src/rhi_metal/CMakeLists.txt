@@ -35,6 +35,13 @@ pt_compile_slang(
     ENTRY   main
     TARGETS metal
 )
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+)
 
 pt_set_compiler_options(pt_rhi_metal)
 
