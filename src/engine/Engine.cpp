@@ -189,6 +189,21 @@ void Engine::Shutdown() {
 
 void Engine::TearDownDevice() {
     if (device_) {
+        // Final frame clears the drawable to black so the window doesn't
+        // freeze on whatever colour was last presented (the layer keeps
+        // showing its last contents until something else writes to it).
+        if (clear_pipeline_id_ != 0) {
+            auto fc = device_->BeginFrame();
+            if (auto* cb = device_->AcquireCommandBuffer()) {
+                cb->BindComputePipeline(pt::rhi::PipelineHandle{clear_pipeline_id_});
+                cb->BindStorageTexture(0, fc.swapchain_image);
+                const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                cb->PushConstants(black, sizeof(black));
+                cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
+                device_->Submit(cb);
+                device_->EndFrame(cb);
+            }
+        }
         device_->WaitIdle();
         device_.reset();
     }
