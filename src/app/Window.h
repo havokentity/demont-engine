@@ -40,6 +40,21 @@ public:
     using KeyHandler = std::function<void(int key, int mods)>;
     void SetKeyHandler(KeyHandler h);
 
+    // Polled input state.  All key/button codes are GLFW_KEY_* / GLFW_MOUSE_*
+    // constants -- see GLFW/glfw3.h.
+    bool IsKeyDown(int glfw_key) const;
+    bool IsMouseButtonDown(int glfw_button) const;
+
+    // Cursor mode: GLFW_CURSOR_NORMAL, GLFW_CURSOR_HIDDEN, GLFW_CURSOR_DISABLED.
+    // DISABLED locks the cursor and feeds unbounded delta -- used for
+    // mouse-look while right-click is held.
+    void SetCursorMode(int mode);
+    int  CursorMode() const;
+
+    // Returns (dx, dy) since the last call.  First call after mode change
+    // returns 0 to avoid a one-frame jump.
+    void ConsumeMouseDelta(double& dx, double& dy);
+
 private:
     static void OnResize(GLFWwindow* w, int width, int height);
     static void OnKey(GLFWwindow* w, int key, int scancode, int action, int mods);
@@ -49,6 +64,11 @@ private:
     int height_ = 0;
     std::string title_;
     KeyHandler  key_handler_;
+
+    // Mouse delta accumulators
+    double cursor_last_x_ = 0.0;
+    double cursor_last_y_ = 0.0;
+    bool   cursor_have_baseline_ = false;
 };
 
 }  // namespace pt::app

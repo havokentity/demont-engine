@@ -46,6 +46,15 @@ namespace cvar {
     PT_CVAR(r_mode,            "scene",
             "What to render: clear|scene (preview/raytrace/pathtrace land in P7)",
             CVAR_ARCHIVE);
+
+    // Camera controls.  Mouse-look engages while RIGHT mouse is held.
+    PT_CVAR(cam_speed,         "3.0", "Movement speed (units/sec)",        CVAR_ARCHIVE);
+    PT_CVAR(cam_sprint_mult,   "3.0", "Speed multiplier with shift",       CVAR_ARCHIVE);
+    PT_CVAR(cam_sensitivity,   "0.12","Mouse-look sensitivity (deg/pixel)", CVAR_ARCHIVE);
+    PT_CVAR(cam_fov,           "60.0","Vertical field of view (degrees)",  CVAR_ARCHIVE);
+    PT_CVAR(cam_pos,           "0 1.5 4", "Camera position (x y z)",       CVAR_ARCHIVE);
+    PT_CVAR(cam_yaw,           "0",       "Yaw in degrees",                CVAR_ARCHIVE);
+    PT_CVAR(cam_pitch,         "-11.5",   "Pitch in degrees (clamped +/- 85)", CVAR_ARCHIVE);
     PT_CVAR(dev_cheats,        "0",    "Gate for CHEAT-flagged cvars",   0);
     PT_CVAR(dev_log_level,     "info", "error|warn|info|debug",          0);
 
@@ -70,6 +79,8 @@ Engine* Engine::Instance() { return g_instance; }
 
 bool Engine::Init() {
     pt::mem::Init();
+
+    camera_ = std::make_unique<pt::renderer::Camera>();
 
     pt::hw::Populate();
     auto& hi = pt::hw::GetInfo();
@@ -148,6 +159,26 @@ bool Engine::Init() {
     if (auto* v = C.FindCVar("app_auto_open_console"); v && v->GetBool()) {
         OpenWebConsole();
     }
+
+    // Seed camera from cvars (so cam_pos / cam_yaw / cam_pitch persist
+    // across runs once we save archived cvars in P11).
+    if (auto* v = C.FindCVar("cam_pos")) {
+        std::string_view sv = v->value;
+        std::size_t i = 0;
+        glm::vec3 p = camera_->pos;
+        for (int k = 0; k < 3; ++k) {
+            while (i < sv.size() && sv[i] == ' ') ++i;
+            char* end = nullptr;
+            p[k] = std::strtof(sv.data() + i, &end);
+            if (!end || end == sv.data() + i) break;
+            i = static_cast<std::size_t>(end - sv.data());
+        }
+        camera_->pos = p;
+    }
+    if (auto* v = C.FindCVar("cam_yaw"))   camera_->yaw   = glm::radians(v->GetFloat());
+    if (auto* v = C.FindCVar("cam_pitch")) camera_->pitch = glm::radians(v->GetFloat());
+    if (auto* v = C.FindCVar("cam_fov"))   camera_->fov_deg = v->GetFloat();
+    camera_->ClampPitch();
 
     LOG_INFO("Engine initialized.");
     return true;
@@ -330,9 +361,7 @@ void Engine::RenderFrame() {
         cb->PushConstants(color, sizeof(color));
     } else {
         // Scene path: 64-byte push containing the camera basis + sky.
-        // Camera is hardcoded for now -- WASD / mouse-look land in the
-        // rest of P5.
-        pt::renderer::Camera cam;   // defaults: pos=(0,1.5,4), pitch=-0.2
+        const auto& cam   = *camera_;
         const auto fwd   = cam.Forward();
         const auto right = cam.Right();
         const auto up    = cam.Up();
@@ -372,8 +401,65 @@ void Engine::RenderFrame() {
     device_->EndFrame(cb);
 }
 
+void Engine::UpdateCamera(double dt) {
+    if (!camera_ || !window_) return;
+    auto& C = pt::console::Console::Get();
+
+    // Mouse-look: hold right mouse to capture, release to free the cursor.
+    bool rmb = window_->IsMouseButtonDown(1);   // GLFW_MOUSE_BUTTON_RIGHT == 1
+    if (rmb && !mouse_look_active_) {
+        window_->SetCursorMode(0x00034003);     // GLFW_CURSOR_DISABLED
+        mouse_look_active_ = true;
+    } else if (!rmb && mouse_look_active_) {
+        window_->SetCursorMode(0x00034001);     // GLFW_CURSOR_NORMAL
+        mouse_look_active_ = false;
+    }
+
+    if (mouse_look_active_) {
+        double dx = 0.0, dy = 0.0;
+        window_->ConsumeMouseDelta(dx, dy);
+        float sens = 0.12f;
+        if (auto* v = C.FindCVar("cam_sensitivity")) sens = v->GetFloat();
+        camera_->yaw   -= glm::radians(static_cast<float>(dx) * sens);
+        camera_->pitch -= glm::radians(static_cast<float>(dy) * sens);
+        camera_->ClampPitch();
+    }
+
+    // WASD + Space/Ctrl movement.  Speed in units/sec; shift sprints.
+    float speed   = 3.0f;
+    float sprint  = 3.0f;
+    if (auto* v = C.FindCVar("cam_speed"))       speed  = v->GetFloat();
+    if (auto* v = C.FindCVar("cam_sprint_mult")) sprint = v->GetFloat();
+
+    bool shift = window_->IsKeyDown(340) || window_->IsKeyDown(344);  // L/R Shift
+    if (shift) speed *= sprint;
+
+    glm::vec3 fwd   = camera_->Forward();
+    glm::vec3 right = camera_->Right();
+    glm::vec3 wm{0.0f};
+    if (window_->IsKeyDown(87))  wm += fwd;            // W
+    if (window_->IsKeyDown(83))  wm -= fwd;            // S
+    if (window_->IsKeyDown(68))  wm += right;          // D
+    if (window_->IsKeyDown(65))  wm -= right;          // A
+    if (window_->IsKeyDown(32))  wm += glm::vec3(0,1,0);  // Space
+    if (window_->IsKeyDown(341)) wm -= glm::vec3(0,1,0);  // L Ctrl
+    if (glm::dot(wm, wm) > 0.0f) {
+        camera_->pos += glm::normalize(wm) * (speed * static_cast<float>(dt));
+    }
+
+    // Pull live overrides from cvars if the user typed them.  The
+    // simplest UX is "if cvar string differs from camera state, apply".
+    // We push back the camera state to the cvars on every frame too so
+    // the panel reflects current values.
+    if (auto* v = C.FindCVar("cam_fov")) {
+        float new_fov = v->GetFloat();
+        if (std::abs(new_fov - camera_->fov_deg) > 1e-3f) camera_->fov_deg = new_fov;
+    }
+}
+
 void Engine::Tick(double dt) {
     pt::console::Console::Get().Drain();
+    UpdateCamera(dt);
 
     auto t0 = std::chrono::steady_clock::now();
     RenderFrame();

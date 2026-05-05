@@ -99,6 +99,44 @@ void Window::OnResize(GLFWwindow* w, int width, int height) {
 
 void Window::SetKeyHandler(KeyHandler h) { key_handler_ = std::move(h); }
 
+bool Window::IsKeyDown(int key) const {
+    return handle_ != nullptr && glfwGetKey(handle_, key) == GLFW_PRESS;
+}
+
+bool Window::IsMouseButtonDown(int btn) const {
+    return handle_ != nullptr && glfwGetMouseButton(handle_, btn) == GLFW_PRESS;
+}
+
+void Window::SetCursorMode(int mode) {
+    if (handle_ == nullptr) return;
+    int cur = glfwGetInputMode(handle_, GLFW_CURSOR);
+    if (cur == mode) return;
+    glfwSetInputMode(handle_, GLFW_CURSOR, mode);
+    cursor_have_baseline_ = false;   // re-baseline on next ConsumeMouseDelta
+}
+
+int Window::CursorMode() const {
+    if (handle_ == nullptr) return GLFW_CURSOR_NORMAL;
+    return glfwGetInputMode(handle_, GLFW_CURSOR);
+}
+
+void Window::ConsumeMouseDelta(double& dx, double& dy) {
+    dx = dy = 0.0;
+    if (handle_ == nullptr) return;
+    double x, y;
+    glfwGetCursorPos(handle_, &x, &y);
+    if (!cursor_have_baseline_) {
+        cursor_last_x_ = x;
+        cursor_last_y_ = y;
+        cursor_have_baseline_ = true;
+        return;
+    }
+    dx = x - cursor_last_x_;
+    dy = y - cursor_last_y_;
+    cursor_last_x_ = x;
+    cursor_last_y_ = y;
+}
+
 void Window::OnKey(GLFWwindow* w, int key, int /*scancode*/, int action, int mods) {
     if (action != GLFW_PRESS) return;
     if (key == GLFW_KEY_ESCAPE) {

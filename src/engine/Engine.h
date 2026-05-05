@@ -7,10 +7,11 @@
 #include <cstdint>
 #include <memory>
 
-namespace pt::app    { class Window; class ConsoleOverlay; }
-namespace pt::jobs   { class JobSystem; }
-namespace pt::console{ class ConsoleServer; }
-namespace pt::rhi    { class Device; struct PipelineHandle; }
+namespace pt::app      { class Window; class ConsoleOverlay; }
+namespace pt::jobs     { class JobSystem; }
+namespace pt::console  { class ConsoleServer; }
+namespace pt::rhi      { class Device; struct PipelineHandle; }
+namespace pt::renderer { struct Camera; }
 
 namespace pt::engine {
 
@@ -46,14 +47,18 @@ private:
     void TearDownDevice();
     void RenderFrame();
 
+    void UpdateCamera(double dt);
+
     std::unique_ptr<pt::app::Window>            window_;
     std::unique_ptr<pt::app::ConsoleOverlay>    overlay_;
     std::unique_ptr<pt::jobs::JobSystem>        jobs_;
     std::unique_ptr<pt::console::ConsoleServer> server_;
     std::unique_ptr<pt::rhi::Device>            device_;
+    std::unique_ptr<pt::renderer::Camera>       camera_;
     std::uint64_t                               clear_pipeline_id_ = 0;
     std::uint64_t                               scene_pipeline_id_ = 0;
     BackendType                                 current_backend_   = BackendType::None;
+    bool                                        mouse_look_active_ = false;
     std::atomic<bool>                           wants_quit_{false};
 };
 
