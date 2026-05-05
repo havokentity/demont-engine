@@ -7,11 +7,14 @@
 #include "../core/Jobs/JobSystem.h"
 #include "../core/Log.h"
 #include "../core/Memory/Memory.h"
+#include "../rhi/CommandBuffer.h"
+#include "../rhi/Device.h"
 
 #include <fmt/format.h>
 
 #include <chrono>
 #include <thread>
+#include <charconv>
 
 namespace pt::engine {
 
@@ -29,6 +32,7 @@ namespace cvar {
     PT_CVAR(app_window_height, "720",  "Initial window height",          CVAR_ARCHIVE);
     PT_CVAR(app_vsync,         "1",    "Swapchain vsync (1=on)",         CVAR_ARCHIVE);
     PT_CVAR(r_backend,         "none", "One of none|software|metal|vulkan",CVAR_ARCHIVE);
+    PT_CVAR(r_clear_color,     "0.05 0.05 0.06", "Background clear colour (R G B)", 0);
     PT_CVAR(dev_cheats,        "0",    "Gate for CHEAT-flagged cvars",   0);
     PT_CVAR(dev_log_level,     "info", "error|warn|info|debug",          0);
 
@@ -98,6 +102,8 @@ bool Engine::Init() {
 }
 
 void Engine::Shutdown() {
+    TearDownDevice();
+
     pt::log::RemoveAllSinks();
     if (server_) server_->Stop();
     server_.reset();
@@ -111,19 +117,125 @@ void Engine::Shutdown() {
     jobs_.reset();
 }
 
-void Engine::RequestBackendSwitch(BackendType to) {
-    const char* name = "?";
-    switch (to) {
-        case BackendType::None:     name = "none";     break;
-        case BackendType::Software: name = "software"; break;
-        case BackendType::Metal:    name = "metal";    break;
-        case BackendType::Vulkan:   name = "vulkan";   break;
-    }
-    LOG_INFO("backend rebuild requested: {} (no-op until P2)", name);
+pt::app::GraphicsApi Engine::ApiFor(BackendType t) {
+    return t == BackendType::Software ? pt::app::GraphicsApi::OpenGL
+                                      : pt::app::GraphicsApi::None;
 }
 
-void Engine::Tick(double /*dt*/) {
+void Engine::TearDownDevice() {
+    if (device_) {
+        device_->WaitIdle();
+        device_.reset();
+    }
+    clear_pipeline_id_ = 0;
+}
+
+void Engine::RequestBackendSwitch(BackendType to) {
+    if (to == current_backend_ && (to == BackendType::None || device_)) return;
+    LOG_INFO("backend switch: {} -> {}",
+             pt::rhi::BackendName(current_backend_),
+             pt::rhi::BackendName(to));
+
+    TearDownDevice();
+
+    if (to == BackendType::None) {
+        current_backend_ = BackendType::None;
+        return;
+    }
+
+    // Recreate the window with the right graphics-API hint if needed.
+    auto api_needed = ApiFor(to);
+    if (window_) window_->Recreate(api_needed);
+
+    pt::rhi::NativeWindowHandle nw{
+        .opaque = window_ ? static_cast<void*>(window_->Handle()) : nullptr,
+        .width  = window_ ? window_->Width()  : 0,
+        .height = window_ ? window_->Height() : 0,
+    };
+    device_ = pt::rhi::Device::Create(to, nw);
+    if (!device_) {
+        LOG_ERROR("failed to create {} device", pt::rhi::BackendName(to));
+        current_backend_ = BackendType::None;
+        return;
+    }
+
+    current_backend_ = to;
+    pt::console::Console::Get().SetCVarOverride(
+        "sys_gpu_name", device_->DeviceName());
+    pt::console::Console::Get().SetCVarOverride(
+        "sys_gpu_hwrt", device_->SupportsHardwareRT() ? "1" : "0");
+
+    // Build the per-backend "clear" compute pipeline.  In P2 the software
+    // backend looks it up by name only; from P3 on this carries Slang
+    // bytecode.
+    pt::rhi::ComputePipelineDesc desc{
+        .kernel_name = "clear",
+        .bytecode    = {},
+        .debug_name  = "clear",
+    };
+    auto h = device_->CreateComputePipeline(desc);
+    clear_pipeline_id_ = h.id;
+}
+
+void Engine::RenderFrame() {
+    if (!device_ || clear_pipeline_id_ == 0) return;
+    auto fc = device_->BeginFrame();
+    auto* cb = device_->AcquireCommandBuffer();
+    cb->BindComputePipeline(pt::rhi::PipelineHandle{clear_pipeline_id_});
+
+    // Parse r_clear_color "R G B" each frame -- cheap, safe, lets the user
+    // see updates without jumping through cvar hooks.
+    float color[4] { 0.05f, 0.05f, 0.06f, 1.0f };
+    if (auto* v = pt::console::Console::Get().FindCVar("r_clear_color")) {
+        std::string_view sv = v->value;
+        std::size_t i = 0;
+        for (int k = 0; k < 3; ++k) {
+            while (i < sv.size() && sv[i] == ' ') ++i;
+            char* end = nullptr;
+            color[k] = std::strtof(sv.data() + i, &end);
+            i = end ? static_cast<std::size_t>(end - sv.data()) : i + 1;
+        }
+    }
+    cb->PushConstants(color, sizeof(color));
+
+    auto wg_x = (fc.width  + 7) / 8;
+    auto wg_y = (fc.height + 7) / 8;
+    cb->Dispatch(wg_x, wg_y, 1);
+
+    device_->Submit(cb);
+    device_->EndFrame(cb);
+}
+
+void Engine::Tick(double dt) {
     pt::console::Console::Get().Drain();
+
+    auto t0 = std::chrono::steady_clock::now();
+    RenderFrame();
+    auto frame_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    // Broadcast frame_stats throttled to ~10 Hz so the network doesn't
+    // get spammed at 240+ fps.
+    static double accum_s = 0.0;
+    static int    accum_frames = 0;
+    static double accum_render_ms = 0.0;
+    accum_s         += dt;
+    accum_frames    += 1;
+    accum_render_ms += frame_ms;
+    if (accum_s >= 0.1 && server_) {
+        double fps = accum_frames / accum_s;
+        double avg_render = accum_render_ms / accum_frames;
+        int w = window_ ? window_->Width()  : 0;
+        int h = window_ ? window_->Height() : 0;
+        auto data = fmt::format(
+            R"({{"fps":{:.1f},"frame_ms":{:.3f},"trace_ms":{:.3f},"backend":"{}","resolution":[{},{}]}})",
+            fps, accum_render_ms / accum_frames, avg_render,
+            pt::rhi::BackendName(current_backend_), w, h);
+        server_->BroadcastEvent("frame_stats", data);
+        accum_s = 0.0;
+        accum_frames = 0;
+        accum_render_ms = 0.0;
+    }
 }
 
 void Engine::Run() {
@@ -137,8 +249,11 @@ void Engine::Run() {
         window_->PollEvents();
         Tick(dt);
 
-        // No renderer yet -- yield so we don't busy-loop.
-        std::this_thread::sleep_for(std::chrono::milliseconds(8));
+        // If no device is bound yet we'd busy-loop; throttle.  With a
+        // device, the swapchain present already paces us via vsync.
+        if (!device_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(8));
+        }
     }
     LOG_INFO("Run loop exited.");
 }

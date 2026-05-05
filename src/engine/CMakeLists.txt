@@ -8,6 +8,7 @@ target_link_libraries(pt_engine
     PUBLIC pt_core
     PUBLIC pt_console
     PUBLIC pt_app_window
+    PUBLIC pt_rhi
 )
 
 pt_set_compiler_options(pt_engine)

@@ -37,6 +37,7 @@ target_link_libraries(pathtracer PRIVATE
     pt_console
     pt_engine
     pt_app_window
+    pt_rhi
 )
 
 pt_set_compiler_options(pathtracer)
