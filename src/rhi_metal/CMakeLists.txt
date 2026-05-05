@@ -19,11 +19,18 @@ if(APPLE)
     )
 endif()
 
-# Compile the clear shader (Slang -> MSL source) and embed.
+# Compile the clear + scene shaders (Slang -> MSL source) and embed.
 include(${CMAKE_SOURCE_DIR}/cmake/Slang.cmake)
 pt_compile_slang(
     TARGET  pt_rhi_metal
     SOURCE  ${CMAKE_SOURCE_DIR}/shaders/Clear.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+)
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/Scene.slang
     STAGE   compute
     ENTRY   main
     TARGETS metal

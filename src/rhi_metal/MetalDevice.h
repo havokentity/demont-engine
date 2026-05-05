@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 // Forward declares for metal-cpp pointer types so this header doesn't drag
@@ -126,6 +127,10 @@ private:
     std::unordered_map<std::uint64_t, MTL::ComputePipelineState*> pipelines_;
     std::unordered_map<std::uint64_t, MTL::Texture*>             textures_;
     std::unordered_map<std::uint64_t, MTL::Buffer*>              buffers_;
+    // Built-in pipelines indexed by Slang kernel name.  P3+ shaders are
+    // pre-compiled at device construction; CreateComputePipeline looks up
+    // by name.
+    std::unordered_map<std::string, std::uint64_t>     named_pipelines_;
 
     std::unique_ptr<MetalCommandBuffer> cmd_;
 };

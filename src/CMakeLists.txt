@@ -5,6 +5,7 @@ if(APPLE)
     add_subdirectory(rhi_metal)
 endif()
 add_subdirectory(rhi)
+add_subdirectory(renderer)
 add_subdirectory(app)
 add_subdirectory(engine)
-# rhi_vulkan / renderer dirs come online in later phases.
+# rhi_vulkan dir comes online in P4.

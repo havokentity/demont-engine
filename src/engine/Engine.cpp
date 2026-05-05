@@ -8,8 +8,12 @@
 #include "../core/Jobs/JobSystem.h"
 #include "../core/Log.h"
 #include "../core/Memory/Memory.h"
+#include "../renderer/Camera.h"
 #include "../rhi/CommandBuffer.h"
 #include "../rhi/Device.h"
+
+#include <glm/glm.hpp>
+#include <cstdint>
 
 #include <fmt/format.h>
 
@@ -39,6 +43,9 @@ namespace cvar {
             "Enable the in-window native console overlay (backtick toggles)", CVAR_ARCHIVE);
     PT_CVAR(r_backend,         "software", "One of none|software|metal|vulkan",CVAR_ARCHIVE);
     PT_CVAR(r_clear_color,     "0.18 0.05 0.28", "Background clear colour (R G B)", 0);
+    PT_CVAR(r_mode,            "scene",
+            "What to render: clear|scene (preview/raytrace/pathtrace land in P7)",
+            CVAR_ARCHIVE);
     PT_CVAR(dev_cheats,        "0",    "Gate for CHEAT-flagged cvars",   0);
     PT_CVAR(dev_log_level,     "info", "error|warn|info|debug",          0);
 
@@ -244,42 +251,118 @@ void Engine::RequestBackendSwitch(BackendType to) {
     pt::console::Console::Get().SetCVarOverride(
         "sys_gpu_hwrt", device_->SupportsHardwareRT() ? "1" : "0");
 
-    // Build the per-backend "clear" compute pipeline.  In P2 the software
-    // backend looks it up by name only; from P3 on this carries Slang
-    // bytecode.
-    pt::rhi::ComputePipelineDesc desc{
-        .kernel_name = "clear",
-        .bytecode    = {},
-        .debug_name  = "clear",
-    };
-    auto h = device_->CreateComputePipeline(desc);
-    clear_pipeline_id_ = h.id;
+    // Build per-backend pipelines.  Software backend tracks them by name
+    // only (CPU fallback in P5+); Metal returns the precompiled Slang->MSL
+    // PSO.  Both kernels expose `main` and route through the same
+    // CreateComputePipeline interface.
+    {
+        pt::rhi::ComputePipelineDesc desc{
+            .kernel_name = "clear", .bytecode = {}, .debug_name = "clear",
+        };
+        clear_pipeline_id_ = device_->CreateComputePipeline(desc).id;
+    }
+    {
+        pt::rhi::ComputePipelineDesc desc{
+            .kernel_name = "scene", .bytecode = {}, .debug_name = "scene",
+        };
+        scene_pipeline_id_ = device_->CreateComputePipeline(desc).id;
+    }
 }
 
+namespace {
+
+// Parse a "R G B" cvar into a float3 (clamped to 0..1 for safety).
+glm::vec3 ParseRGB(std::string_view sv, glm::vec3 fallback) {
+    glm::vec3 c = fallback;
+    std::size_t i = 0;
+    for (int k = 0; k < 3; ++k) {
+        while (i < sv.size() && sv[i] == ' ') ++i;
+        if (i >= sv.size()) return c;
+        char* end = nullptr;
+        c[k] = std::strtof(sv.data() + i, &end);
+        if (end == sv.data() + i) return c;
+        i = static_cast<std::size_t>(end - sv.data());
+    }
+    return glm::clamp(c, 0.0f, 1.0f);
+}
+
+// Pack an rgb triple in 0..1 into the low 24 bits of a float (raw bits).
+float PackBgRGB(glm::vec3 c) {
+    auto r = static_cast<std::uint32_t>(glm::clamp(c.r, 0.0f, 1.0f) * 255.0f + 0.5f);
+    auto g = static_cast<std::uint32_t>(glm::clamp(c.g, 0.0f, 1.0f) * 255.0f + 0.5f);
+    auto b = static_cast<std::uint32_t>(glm::clamp(c.b, 0.0f, 1.0f) * 255.0f + 0.5f);
+    std::uint32_t packed = (b << 16) | (g << 8) | r;
+    float out;
+    static_assert(sizeof(float) == sizeof(std::uint32_t));
+    std::memcpy(&out, &packed, sizeof(out));
+    return out;
+}
+
+}  // namespace
+
 void Engine::RenderFrame() {
-    if (!device_ || clear_pipeline_id_ == 0) return;
+    if (!device_) return;
+
+    auto& C = pt::console::Console::Get();
+    bool scene_mode = false;
+    if (auto* v = C.FindCVar("r_mode")) scene_mode = (v->value == "scene");
+
+    std::uint64_t pipeline = scene_mode ? scene_pipeline_id_ : clear_pipeline_id_;
+    if (pipeline == 0) {
+        // Fall back to clear if the requested pipeline isn't built (e.g.
+        // software backend doesn't ship a scene shader yet).
+        pipeline = clear_pipeline_id_;
+    }
+    if (pipeline == 0) return;
+
     auto fc = device_->BeginFrame();
     auto* cb = device_->AcquireCommandBuffer();
-    cb->BindComputePipeline(pt::rhi::PipelineHandle{clear_pipeline_id_});
-    // Storage texture binding -- Metal/Vulkan need this to know what the
-    // shader is writing into; the Software backend ignores it (it tracks
-    // the clear colour separately and clears via a render pass).
+    cb->BindComputePipeline(pt::rhi::PipelineHandle{pipeline});
     cb->BindStorageTexture(0, fc.swapchain_image);
 
-    // Parse r_clear_color "R G B" each frame -- cheap, safe, lets the user
-    // see updates without jumping through cvar hooks.
-    float color[4] { 0.05f, 0.05f, 0.06f, 1.0f };
-    if (auto* v = pt::console::Console::Get().FindCVar("r_clear_color")) {
-        std::string_view sv = v->value;
-        std::size_t i = 0;
-        for (int k = 0; k < 3; ++k) {
-            while (i < sv.size() && sv[i] == ' ') ++i;
-            char* end = nullptr;
-            color[k] = std::strtof(sv.data() + i, &end);
-            i = end ? static_cast<std::size_t>(end - sv.data()) : i + 1;
-        }
+    glm::vec3 bg = ParseRGB(C.FindCVar("r_clear_color") ? C.FindCVar("r_clear_color")->value
+                                                        : std::string_view{},
+                            glm::vec3{0.18f, 0.05f, 0.28f});
+
+    if (pipeline == clear_pipeline_id_) {
+        // Clear path: 16-byte push of the colour.
+        const float color[4] = {bg.r, bg.g, bg.b, 1.0f};
+        cb->PushConstants(color, sizeof(color));
+    } else {
+        // Scene path: 64-byte push containing the camera basis + sky.
+        // Camera is hardcoded for now -- WASD / mouse-look land in the
+        // rest of P5.
+        pt::renderer::Camera cam;   // defaults: pos=(0,1.5,4), pitch=-0.2
+        const auto fwd   = cam.Forward();
+        const auto right = cam.Right();
+        const auto up    = cam.Up();
+        const float aspect = (fc.height > 0)
+                               ? float(fc.width) / float(fc.height) : 1.0f;
+        struct Push {
+            float pos_fovtan[4];
+            float fwd_aspect[4];
+            float right_xyz[4];
+            float up_bg_pack[4];
+        } push{};
+        push.pos_fovtan[0] = cam.pos.x;
+        push.pos_fovtan[1] = cam.pos.y;
+        push.pos_fovtan[2] = cam.pos.z;
+        push.pos_fovtan[3] = cam.FovYTan();
+        push.fwd_aspect[0] = fwd.x;
+        push.fwd_aspect[1] = fwd.y;
+        push.fwd_aspect[2] = fwd.z;
+        push.fwd_aspect[3] = aspect;
+        push.right_xyz[0]  = right.x;
+        push.right_xyz[1]  = right.y;
+        push.right_xyz[2]  = right.z;
+        push.right_xyz[3]  = 0.0f;
+        push.up_bg_pack[0] = up.x;
+        push.up_bg_pack[1] = up.y;
+        push.up_bg_pack[2] = up.z;
+        push.up_bg_pack[3] = PackBgRGB(bg);
+        static_assert(sizeof(push) == 64, "push must fit in 64 bytes");
+        cb->PushConstants(&push, sizeof(push));
     }
-    cb->PushConstants(color, sizeof(color));
 
     auto wg_x = (fc.width  + 7) / 8;
     auto wg_y = (fc.height + 7) / 8;
@@ -442,6 +525,10 @@ void Engine::RegisterCommands() {
             else if (cv.value == "vulkan")   t = BackendType::Vulkan;
             RequestBackendSwitch(t);
         };
+    }
+    // r_mode: clear|scene for now (preview/raytrace/pathtrace land in P7).
+    if (auto* v = C.FindCVar("r_mode")) {
+        v->allowed_values = {"clear", "scene"};
     }
     // dev_log_level: validate
     if (auto* v = C.FindCVar("dev_log_level")) {

@@ -15,10 +15,12 @@
 #include <fmt/format.h>
 #include <cstring>
 
-// Embedded shader (Slang -> MSL source, compiled to a library at runtime).
+// Embedded shaders (Slang -> MSL source, compiled to a library at runtime).
 extern "C" {
 extern const unsigned char shader_Clear_metal_data[];
 extern const unsigned long shader_Clear_metal_size;
+extern const unsigned char shader_Scene_metal_data[];
+extern const unsigned long shader_Scene_metal_size;
 }
 
 // Defined in MetalAttach.mm.
@@ -164,35 +166,45 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
 
     pt_metal_attach_layer(ns_window_, layer_);
 
-    // Compile the embedded MSL clear shader at runtime.
-    {
+    // Build all known compute pipelines up front.  P3 had only "clear";
+    // P5 adds "scene". Each Slang source becomes one MTLLibrary +
+    // MTLComputePipelineState, looked up later by kernel name.
+    auto build_pso = [&](const char* kernel_name,
+                         const unsigned char* src_data) {
         NS::Error* err = nullptr;
-        auto* src = NsStr(reinterpret_cast<const char*>(shader_Clear_metal_data));
+        auto* src  = NsStr(reinterpret_cast<const char*>(src_data));
         auto* opts = MTL::CompileOptions::alloc()->init();
-        auto* lib = device_->newLibrary(src, opts, &err);
+        auto* lib  = device_->newLibrary(src, opts, &err);
         opts->release();
         if (lib == nullptr) {
-            LOG_ERROR("Slang clear shader: newLibrary failed: {}",
+            LOG_ERROR("Slang '{}' shader: newLibrary failed: {}", kernel_name,
                       err ? err->localizedDescription()->utf8String() : "?");
-        } else {
-            auto* fn = lib->newFunction(NsStr(kClearEntryPoint));
-            if (fn == nullptr) {
-                LOG_ERROR("entry '{}' not found in MSL", kClearEntryPoint);
-            } else {
-                NS::Error* psoErr = nullptr;
-                auto* pso = device_->newComputePipelineState(fn, &psoErr);
-                fn->release();
-                if (pso != nullptr) {
-                    std::lock_guard lock(resource_mutex_);
-                    pipelines_.emplace(next_id_++, pso);
-                } else {
-                    LOG_ERROR("newComputePipelineState failed: {}",
-                              psoErr ? psoErr->localizedDescription()->utf8String() : "?");
-                }
-            }
-            lib->release();
+            return;
         }
-    }
+        auto* fn = lib->newFunction(NsStr(kClearEntryPoint));  // Slang renames `main` -> `main_0`
+        if (fn == nullptr) {
+            LOG_ERROR("entry '{}' not found in MSL for '{}'",
+                      kClearEntryPoint, kernel_name);
+            lib->release();
+            return;
+        }
+        NS::Error* psoErr = nullptr;
+        auto* pso = device_->newComputePipelineState(fn, &psoErr);
+        fn->release();
+        lib->release();
+        if (pso == nullptr) {
+            LOG_ERROR("'{}' newComputePipelineState failed: {}", kernel_name,
+                      psoErr ? psoErr->localizedDescription()->utf8String() : "?");
+            return;
+        }
+        std::lock_guard lock(resource_mutex_);
+        auto id = next_id_++;
+        pipelines_.emplace(id, pso);
+        named_pipelines_.emplace(kernel_name, id);
+    };
+
+    build_pso("clear", shader_Clear_metal_data);
+    build_pso("scene", shader_Scene_metal_data);
 
     cmd_ = std::make_unique<MetalCommandBuffer>(this);
 }
@@ -243,15 +255,11 @@ TextureHandle MetalDevice::CreateTexture(const TextureDesc& d) {
 }
 
 PipelineHandle MetalDevice::CreateComputePipeline(const ComputePipelineDesc& d) {
-    // For P3 the only kernel is "clear", which we built up front during
-    // device construction. Future phases will add a bytecode payload.
-    if (d.kernel_name == "clear") {
-        std::lock_guard lock(resource_mutex_);
-        for (auto& [id, p] : pipelines_) {
-            if (p) return PipelineHandle{id};
-        }
-    }
-    return {0};
+    std::lock_guard lock(resource_mutex_);
+    std::string key(d.kernel_name);
+    auto it = named_pipelines_.find(key);
+    if (it == named_pipelines_.end()) return {0};
+    return PipelineHandle{ it->second };
 }
 
 void MetalDevice::DestroyBuffer(BufferHandle h) {

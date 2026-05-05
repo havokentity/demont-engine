@@ -52,6 +52,7 @@ private:
     std::unique_ptr<pt::console::ConsoleServer> server_;
     std::unique_ptr<pt::rhi::Device>            device_;
     std::uint64_t                               clear_pipeline_id_ = 0;
+    std::uint64_t                               scene_pipeline_id_ = 0;
     BackendType                                 current_backend_   = BackendType::None;
     std::atomic<bool>                           wants_quit_{false};
 };
