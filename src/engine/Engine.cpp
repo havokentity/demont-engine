@@ -246,6 +246,10 @@ void Engine::RenderFrame() {
     auto fc = device_->BeginFrame();
     auto* cb = device_->AcquireCommandBuffer();
     cb->BindComputePipeline(pt::rhi::PipelineHandle{clear_pipeline_id_});
+    // Storage texture binding -- Metal/Vulkan need this to know what the
+    // shader is writing into; the Software backend ignores it (it tracks
+    // the clear colour separately and clears via a render pass).
+    cb->BindStorageTexture(0, fc.swapchain_image);
 
     // Parse r_clear_color "R G B" each frame -- cheap, safe, lets the user
     // see updates without jumping through cvar hooks.
