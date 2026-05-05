@@ -4,6 +4,9 @@
    orange / dark cream, the original) or "synthwave" (deep purple +
    neon pink + electric blue grid). */
 
+/* All themes define a --logo-ray colour; the ASCII banner's "ray"
+   lines (.banner-ray) pick it up so the logo recolours per theme. */
+
 :root,
 :root[data-theme="hardcore"] {
   --bg:        #06080d;
@@ -19,14 +22,17 @@
   --accent-dim:    #007a85;
   --accent-glow:   rgba(0, 240, 255, 0.18);
 
-  --magenta:       #ff3a8c;     /* hot magenta -- secondary highlights */
-  --warn:          #ffc73a;     /* amber */
-  --error:         #ff4a5e;     /* hot red */
-  --ok:            #4afc92;     /* mint */
+  --magenta:       #ff3a8c;
+  --warn:          #ffc73a;
+  --error:         #ff4a5e;
+  --ok:            #4afc92;
 
   --grain-color:   rgba(0, 240, 255, 0.06);
   --scan-color:    rgba(0, 0, 0, 0.06);
   --bar-tint:      rgba(0, 240, 255, 0.04);
+
+  --logo-ray:      #ff5fa3;     /* hot pink -- contrasts cyan */
+  --logo-ray-glow: rgba(255, 95, 163, 0.55);
 }
 
 :root[data-theme="amber"] {
@@ -51,6 +57,9 @@
   --grain-color:   rgba(232, 153, 104, 0.06);
   --scan-color:    rgba(0, 0, 0, 0.04);
   --bar-tint:      rgba(232, 153, 104, 0.04);
+
+  --logo-ray:      #d97757;     /* deep red-orange complements amber */
+  --logo-ray-glow: rgba(217, 119, 87, 0.45);
 }
 
 :root[data-theme="synthwave"] {
@@ -68,13 +77,127 @@
   --accent-glow:   rgba(255, 95, 191, 0.22);
 
   --magenta:       #b46cff;     /* neon purple */
-  --warn:          #ffa040;     /* sunset orange */
+  --warn:          #ffa040;
   --error:         #ff3060;
   --ok:            #4cf0a8;
 
   --grain-color:   rgba(180, 108, 255, 0.07);
   --scan-color:    rgba(0, 0, 0, 0.10);
   --bar-tint:      rgba(255, 95, 191, 0.06);
+
+  --logo-ray:      #b46cff;     /* neon purple -- contrasts hot pink brand */
+  --logo-ray-glow: rgba(180, 108, 255, 0.55);
+}
+
+:root[data-theme="matrix"] {
+  --bg:        #000000;
+  --bg-elev:   #050a05;
+  --bg-glass:  rgba(0, 8, 0, 0.75);
+  --fg:        #b8e8b8;
+  --fg-muted:  #5a8a5a;
+  --fg-dim:    #2a4a2a;
+  --border:    #0a3a0a;
+  --border-strong: #145514;
+
+  --accent:        #00ff41;     /* matrix terminal green */
+  --accent-dim:    #008820;
+  --accent-glow:   rgba(0, 255, 65, 0.22);
+
+  --magenta:       #00ff41;
+  --warn:          #cfff00;
+  --error:         #ff5050;
+  --ok:            #00ff41;
+
+  --grain-color:   rgba(0, 255, 65, 0.05);
+  --scan-color:    rgba(0, 0, 0, 0.18);
+  --bar-tint:      rgba(0, 255, 65, 0.03);
+
+  --logo-ray:      #50ff80;     /* lighter green for the ray accents */
+  --logo-ray-glow: rgba(80, 255, 128, 0.55);
+}
+
+:root[data-theme="vault"] {
+  /* Fallout-ish CRT amber phosphor on pure black. Heavy scan lines. */
+  --bg:        #050300;
+  --bg-elev:   #0d0700;
+  --bg-glass:  rgba(13, 7, 0, 0.75);
+  --fg:        #ffb800;
+  --fg-muted:  #aa7d10;
+  --fg-dim:    #5a4108;
+  --border:    #3a2a06;
+  --border-strong: #5e4408;
+
+  --accent:        #ffd56b;
+  --accent-dim:    #b08820;
+  --accent-glow:   rgba(255, 213, 107, 0.30);
+
+  --magenta:       #ff8855;
+  --warn:          #ffe070;
+  --error:         #ff6040;
+  --ok:            #ffd56b;
+
+  --grain-color:   rgba(255, 184, 0, 0.05);
+  --scan-color:    rgba(0, 0, 0, 0.30);
+  --bar-tint:      rgba(255, 213, 107, 0.05);
+
+  --logo-ray:      #ff8855;     /* coral against amber */
+  --logo-ray-glow: rgba(255, 136, 85, 0.55);
+}
+
+:root[data-theme="sakura"] {
+  /* Light theme. Soft pink-cream bg, deep plum text, cherry accent. */
+  --bg:        #fff0f5;
+  --bg-elev:   #ffe1ec;
+  --bg-glass:  rgba(255, 224, 235, 0.85);
+  --fg:        #4a1f3a;
+  --fg-muted:  #8a5570;
+  --fg-dim:    #c89cb0;
+  --border:    #f0c0d0;
+  --border-strong: #d590a8;
+
+  --accent:        #d4407a;     /* cherry */
+  --accent-dim:    #a02858;
+  --accent-glow:   rgba(212, 64, 122, 0.28);
+
+  --magenta:       #b8537a;
+  --warn:          #d68030;
+  --error:         #c83048;
+  --ok:            #6a9a52;
+
+  --grain-color:   rgba(212, 64, 122, 0.04);
+  --scan-color:    rgba(80, 30, 60, 0.025);
+  --bar-tint:      rgba(212, 64, 122, 0.05);
+
+  --logo-ray:      #d2691e;     /* warm cinnamon */
+  --logo-ray-glow: rgba(210, 105, 30, 0.40);
+}
+
+:root[data-theme="mono"] {
+  /* Brutalist grayscale. One small splash of red on errors only. */
+  --bg:        #0a0a0a;
+  --bg-elev:   #161616;
+  --bg-glass:  rgba(20, 20, 20, 0.75);
+  --fg:        #f5f5f5;
+  --fg-muted:  #888888;
+  --fg-dim:    #444444;
+  --border:    #1f1f1f;
+  --border-strong: #2e2e2e;
+
+  --accent:        #ffffff;     /* pure white brand */
+  --accent-dim:    #888888;
+  --accent-glow:   rgba(255, 255, 255, 0.12);
+
+  --magenta:       #cccccc;     /* light grey input */
+  --warn:          #cccccc;
+  --error:         #ff3030;     /* the only colour anywhere */
+  --ok:            #aaaaaa;
+
+  --grain-color:   rgba(255, 255, 255, 0.04);
+  --scan-color:    rgba(0, 0, 0, 0.10);
+  --bar-tint:      rgba(255, 255, 255, 0.03);
+
+  --logo-ray:      #888888;     /* mid grey for the ray glyphs */
+  --logo-ray-glow: rgba(170, 170, 170, 0.40);
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -268,10 +391,8 @@ body::after {
   white-space: pre;
 }
 .output .banner-ray {
-  /* Hot pink for the triangle edges + ray bounces. Brighter than the
-     subtler magenta used elsewhere -- this is the logo's accent. */
-  color: #ff5fa3;
-  text-shadow: 0 0 8px rgba(255, 95, 163, 0.55);
+  color: var(--logo-ray);
+  text-shadow: 0 0 8px var(--logo-ray-glow);
   font-size: 11px;
   line-height: 1.1;
   letter-spacing: 0;

@@ -33,6 +33,13 @@ public:
     void Toggle();
     bool IsShown() const;
 
+    // Apply one of the named themes (matches the r_theme cvar values:
+    // hardcore | amber | synthwave | matrix | vault | sakura | mono).
+    // Updates the panel border, prompt, status label colour, and
+    // re-renders the ASCII banner with the theme's accent palette;
+    // future appended lines also use the new palette.
+    void ApplyTheme(std::string_view name);
+
     // Called by Engine on the GLFW resize callback so the floating panel
     // tracks the renderer window.
     void NotifyParentResized(int width, int height);

@@ -43,7 +43,8 @@ namespace cvar {
     PT_CVAR(app_overlay_enabled, "1",
             "Enable the in-window native console overlay (backtick toggles)", CVAR_ARCHIVE);
     PT_CVAR(r_theme, "hardcore",
-            "Web console theme: hardcore | amber | synthwave",            CVAR_ARCHIVE);
+            "Web console theme: hardcore|amber|synthwave|matrix|vault|sakura|mono",
+            CVAR_ARCHIVE);
     PT_CVAR(r_backend,         "metal",    "One of none|software|metal|vulkan",CVAR_ARCHIVE);
     PT_CVAR(r_clear_color,     "0.18 0.05 0.28", "Background clear colour (R G B)", 0);
     PT_CVAR(r_mode,            "pathtrace",
@@ -811,12 +812,14 @@ void Engine::RegisterCommands() {
     // r_theme: validate + push the new theme to every WS client so the
     // browser console flips live without a page reload.
     if (auto* v = C.FindCVar("r_theme")) {
-        v->allowed_values = {"hardcore", "amber", "synthwave"};
+        v->allowed_values = {"hardcore", "amber", "synthwave",
+                             "matrix", "vault", "sakura", "mono"};
         v->on_change = [this](const pt::console::CVar& cv) {
             if (server_) {
                 auto data = fmt::format(R"({{"name":"{}"}})", cv.value);
                 server_->BroadcastEvent("theme_change", data);
             }
+            if (overlay_) overlay_->ApplyTheme(cv.value);
         };
     }
     // dev_log_level: validate

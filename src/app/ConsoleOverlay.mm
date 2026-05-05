@@ -86,6 +86,119 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
 @property (weak) PtConsoleView* owner;
 @end
 
+// One palette per theme. Mirrors the CSS variables in web/console.css.
+typedef struct {
+    NSColor* border;          // backdrop hairline outline
+    NSColor* accent;          // brand / prompt
+    NSColor* status;          // status label tint
+    NSColor* logoFrame;       // ASCII frame ░▒▓█ + ╔═╝
+    NSColor* logoLetters;     // ASCII letters D M T P A T
+    NSColor* logoRay;         // ASCII ray ╲ ╱ ╳ ◉ • ─
+    NSColor* warn;            // log warn
+    NSColor* error;           // log error
+    NSColor* input;           // user input echo
+    NSColor* out;             // command output
+    NSColor* info;            // muted info
+} PtThemePalette;
+
+static NSColor* PtRGB(double r, double g, double b) {
+    return [NSColor colorWithCalibratedRed:r green:g blue:b alpha:1.0];
+}
+static NSColor* PtRGBA(double r, double g, double b, double a) {
+    return [NSColor colorWithCalibratedRed:r green:g blue:b alpha:a];
+}
+
+static PtThemePalette PtPaletteForTheme(NSString* name) {
+    PtThemePalette p{};
+    if ([name isEqualToString:@"amber"]) {
+        p.border       = PtRGBA(0.91, 0.60, 0.41, 0.45);
+        p.accent       = PtRGB(0.91, 0.60, 0.41);
+        p.status       = PtRGBA(0.91, 0.60, 0.41, 0.65);
+        p.logoFrame    = PtRGB(0.91, 0.60, 0.41);
+        p.logoLetters  = PtRGB(0.95, 0.93, 0.86);
+        p.logoRay      = PtRGB(0.85, 0.47, 0.34);
+        p.warn         = PtRGB(0.72, 0.66, 0.41);
+        p.error        = PtRGB(0.85, 0.47, 0.34);
+        p.input        = PtRGB(0.91, 0.60, 0.41);
+        p.out          = PtRGBA(0.95, 0.95, 0.95, 1.0);
+        p.info         = PtRGBA(0.55, 0.55, 0.55, 1.0);
+    } else if ([name isEqualToString:@"synthwave"]) {
+        p.border       = PtRGBA(1.00, 0.37, 0.75, 0.45);
+        p.accent       = PtRGB(1.00, 0.37, 0.75);
+        p.status       = PtRGBA(1.00, 0.37, 0.75, 0.65);
+        p.logoFrame    = PtRGB(1.00, 0.37, 0.75);
+        p.logoLetters  = PtRGB(0.94, 0.90, 1.00);
+        p.logoRay      = PtRGB(0.71, 0.42, 1.00);
+        p.warn         = PtRGB(1.00, 0.63, 0.25);
+        p.error        = PtRGB(1.00, 0.19, 0.38);
+        p.input        = PtRGB(1.00, 0.37, 0.75);
+        p.out          = PtRGBA(0.95, 0.95, 0.95, 1.0);
+        p.info         = PtRGBA(0.55, 0.55, 0.55, 1.0);
+    } else if ([name isEqualToString:@"matrix"]) {
+        p.border       = PtRGBA(0.00, 1.00, 0.25, 0.45);
+        p.accent       = PtRGB(0.00, 1.00, 0.25);
+        p.status       = PtRGBA(0.00, 1.00, 0.25, 0.70);
+        p.logoFrame    = PtRGB(0.00, 1.00, 0.25);
+        p.logoLetters  = PtRGB(0.72, 1.00, 0.72);
+        p.logoRay      = PtRGB(0.31, 1.00, 0.50);
+        p.warn         = PtRGB(0.81, 1.00, 0.00);
+        p.error        = PtRGB(1.00, 0.31, 0.31);
+        p.input        = PtRGB(0.00, 1.00, 0.25);
+        p.out          = PtRGB(0.72, 0.91, 0.72);
+        p.info         = PtRGB(0.35, 0.54, 0.35);
+    } else if ([name isEqualToString:@"vault"]) {
+        p.border       = PtRGBA(1.00, 0.84, 0.42, 0.55);
+        p.accent       = PtRGB(1.00, 0.84, 0.42);
+        p.status       = PtRGBA(1.00, 0.72, 0.00, 0.85);
+        p.logoFrame    = PtRGB(1.00, 0.72, 0.00);
+        p.logoLetters  = PtRGB(1.00, 0.84, 0.42);
+        p.logoRay      = PtRGB(1.00, 0.53, 0.33);
+        p.warn         = PtRGB(1.00, 0.88, 0.44);
+        p.error        = PtRGB(1.00, 0.38, 0.25);
+        p.input        = PtRGB(1.00, 0.84, 0.42);
+        p.out          = PtRGB(1.00, 0.72, 0.00);
+        p.info         = PtRGB(0.67, 0.49, 0.06);
+    } else if ([name isEqualToString:@"sakura"]) {
+        p.border       = PtRGBA(0.83, 0.25, 0.48, 0.55);
+        p.accent       = PtRGB(0.83, 0.25, 0.48);
+        p.status       = PtRGBA(0.54, 0.33, 0.44, 0.85);
+        p.logoFrame    = PtRGB(0.83, 0.25, 0.48);
+        p.logoLetters  = PtRGB(0.29, 0.12, 0.23);
+        p.logoRay      = PtRGB(0.82, 0.41, 0.12);
+        p.warn         = PtRGB(0.84, 0.50, 0.19);
+        p.error        = PtRGB(0.78, 0.19, 0.28);
+        p.input        = PtRGB(0.83, 0.25, 0.48);
+        p.out          = PtRGB(0.29, 0.12, 0.23);
+        p.info         = PtRGB(0.54, 0.33, 0.44);
+    } else if ([name isEqualToString:@"mono"]) {
+        p.border       = PtRGBA(1.00, 1.00, 1.00, 0.40);
+        p.accent       = PtRGB(0.96, 0.96, 0.96);
+        p.status       = PtRGBA(0.96, 0.96, 0.96, 0.65);
+        p.logoFrame    = PtRGB(0.96, 0.96, 0.96);
+        p.logoLetters  = PtRGB(1.00, 1.00, 1.00);
+        p.logoRay      = PtRGB(0.55, 0.55, 0.55);
+        p.warn         = PtRGB(0.80, 0.80, 0.80);
+        p.error        = PtRGB(1.00, 0.19, 0.19);
+        p.input        = PtRGB(0.80, 0.80, 0.80);
+        p.out          = PtRGB(0.96, 0.96, 0.96);
+        p.info         = PtRGB(0.53, 0.53, 0.53);
+    } else {
+        // hardcore (default)
+        p.border       = PtRGBA(0.00, 0.94, 1.00, 0.45);
+        p.accent       = PtRGB(0.00, 0.94, 1.00);
+        p.status       = PtRGBA(0.00, 0.94, 1.00, 0.65);
+        p.logoFrame    = PtRGB(0.00, 0.94, 1.00);
+        p.logoLetters  = PtRGB(0.95, 0.97, 1.00);
+        p.logoRay      = PtRGB(1.00, 0.37, 0.64);
+        p.warn         = PtRGB(1.00, 0.78, 0.23);
+        p.error        = PtRGB(1.00, 0.29, 0.37);
+        p.input        = PtRGB(1.00, 0.23, 0.55);
+        p.out          = PtRGBA(0.95, 0.95, 0.95, 1.0);
+        p.info         = PtRGBA(0.52, 0.52, 0.52, 1.0);
+    }
+    return p;
+}
+
 @interface PtConsoleView : NSView <NSTextFieldDelegate, NSTextViewDelegate>
 
 @property (strong) NSVisualEffectView*  backdrop;
@@ -94,6 +207,8 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
 @property (strong) PtConsoleInputField* inputField;
 @property (strong) NSTextField*         promptLabel;
 @property (strong) NSTextField*         statusLabel;
+@property NSUInteger                    bannerEndLocation;
+@property (assign) PtThemePalette       palette;
 
 @property NSMutableArray<NSString*>*    history;
 @property NSInteger                     historyPos;
@@ -148,6 +263,7 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
     self.history    = [NSMutableArray array];
     self.historyPos = 0;
     self.allNames   = [NSMutableArray array];
+    self.palette    = PtPaletteForTheme(@"hardcore");
 
     // Two-layer backdrop. NSVisualEffectView gives the blurred-edge
     // vibrancy; a dark tint sub-layer on TOP of it guarantees text
@@ -163,7 +279,7 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
     bg.layer.cornerRadius = 8.0;
     bg.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
     bg.layer.borderWidth = 1.0;
-    bg.layer.borderColor = [NSColor colorWithCalibratedRed:0.0 green:0.94 blue:1.0 alpha:0.45].CGColor;
+    bg.layer.borderColor = self.palette.border.CGColor;
     [self addSubview:bg];
     self.backdrop = bg;
 
@@ -215,8 +331,7 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
     NSTextField* prompt = [NSTextField labelWithString:@">"];
     prompt.frame = NSMakeRect(14, 8, 14, 22);
     prompt.font = [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightSemibold];
-    // Electric cyan to match the web console.
-    prompt.textColor = [NSColor colorWithCalibratedRed:0.0 green:0.94 blue:1.0 alpha:1.0];
+    prompt.textColor = self.palette.accent;
     prompt.bezeled = NO;
     prompt.drawsBackground = NO;
     [self addSubview:prompt];
@@ -224,7 +339,7 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
 
     NSTextField* status = [NSTextField labelWithString:@"DEMONT · PATHTRACER · CONSOLE"];
     status.font = [NSFont monospacedSystemFontOfSize:9 weight:NSFontWeightSemibold];
-    status.textColor = [NSColor colorWithCalibratedRed:0.0 green:0.94 blue:1.0 alpha:0.65];
+    status.textColor = self.palette.status;
     status.frame = NSMakeRect(frame.size.width - 240, frame.size.height - 24, 200, 16);
     status.alignment = NSTextAlignmentRight;
     status.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
@@ -275,21 +390,85 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
     [self appendLine:@"" level:@"info"];
     [self appendLine:@"DeMonT PathTracer · v0.1.0  ·  De Monte Carlo-esque Tracer"
               level:@"out"];
+    self.bannerEndLocation = self.outputView.textStorage.length;
     [self appendLine:@"console attached. type \"list_commands\" or hit Tab."
               level:@"info"];
 
     return self;
 }
 
-// Special-case bannered ASCII line -- one fixed colour per role.
-- (void)appendBannerLine:(NSString*)line level:(NSString*)role {
-    NSColor* col = [NSColor colorWithCalibratedRed:0.0 green:0.94 blue:1.0 alpha:1.0];      // cyan frame
-    if ([role isEqualToString:@"letters"]) {
-        col = [NSColor colorWithCalibratedRed:0.95 green:0.97 blue:1.0 alpha:1.0];          // bright fg
-    } else if ([role isEqualToString:@"ray"]) {
-        // Hotter pink so the triangle edges + bounces really pop.
-        col = [NSColor colorWithCalibratedRed:1.0 green:0.37 blue:0.64 alpha:1.0];
+// Re-render the logo banner only (preserves any later log lines below
+// it). Called on theme change.
+- (void)rebuildBanner {
+    NSArray<NSArray<NSString*>*>* banner = @[
+        @[@"frame",   @"        ░▒▓██████████▓▒░"],
+        @[@"frame",   @"     ░▒▓██╔═══════════╗▓▒░"],
+        @[@"letters", @"   ░▓██╔═╝   D · M · T   ╚═╗██▓░"],
+        @[@"ray",     @"  ▒█░  ╔╝  ╲     ◉     ╱  ╚╗  ░█▒"],
+        @[@"ray",     @"  ▓█░ ║    ╲   ◉│◉   ╱    ║ ░█▓"],
+        @[@"ray",     @"  █░  ║     ╲  ─•─  ╱     ║  ░█"],
+        @[@"ray",     @"  ▓█░ ║      ╳  •  ╳      ║ ░█▓"],
+        @[@"ray",     @"  █░  ║     ╱  ─•─  ╲     ║  ░█"],
+        @[@"ray",     @"  ▓█░ ║    ╱   ◉│◉   ╲    ║ ░█▓"],
+        @[@"ray",     @"  ▒█░  ╚╗  ╱     ◉     ╲  ╔╝  ░█▒"],
+        @[@"letters", @"   ░▓██╚═╗   P · A · T   ╔═╝██▓░"],
+        @[@"frame",   @"     ░▒▓██╚═══════════╝▓▒░"],
+        @[@"frame",   @"        ░▒▓██████████▓▒░"],
+    ];
+    NSTextStorage* ts = self.outputView.textStorage;
+    [ts beginEditing];
+    if (self.bannerEndLocation > 0 && self.bannerEndLocation <= ts.length) {
+        [ts deleteCharactersInRange:NSMakeRange(0, self.bannerEndLocation)];
     }
+    [ts endEditing];
+    // Move insertion to the start so newly appended banner sits above
+    // pre-existing later text. We'll do this by inserting at index 0.
+    NSAttributedString* (^lineAttr)(NSString*, NSColor*) = ^NSAttributedString*(NSString* s, NSColor* c) {
+        NSDictionary* attrs = @{
+            NSFontAttributeName: [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular],
+            NSForegroundColorAttributeName: c,
+        };
+        return [[NSAttributedString alloc] initWithString:[s stringByAppendingString:@"\n"] attributes:attrs];
+    };
+    PtThemePalette p = self.palette;
+    NSUInteger insertAt = 0;
+    [ts beginEditing];
+    for (NSArray<NSString*>* row in banner) {
+        NSString* role = row[0];
+        NSColor* c = p.logoFrame;
+        if ([role isEqualToString:@"letters"]) c = p.logoLetters;
+        else if ([role isEqualToString:@"ray"]) c = p.logoRay;
+        NSAttributedString* a = lineAttr(row[1], c);
+        [ts insertAttributedString:a atIndex:insertAt];
+        insertAt += a.length;
+    }
+    NSAttributedString* blank = lineAttr(@"", p.info);
+    [ts insertAttributedString:blank atIndex:insertAt];
+    insertAt += blank.length;
+    NSAttributedString* tag = lineAttr(@"DeMonT PathTracer · v0.1.0  ·  De Monte Carlo-esque Tracer", p.out);
+    [ts insertAttributedString:tag atIndex:insertAt];
+    insertAt += tag.length;
+    [ts endEditing];
+    self.bannerEndLocation = insertAt;
+}
+
+- (void)applyTheme:(NSString*)name {
+    self.palette = PtPaletteForTheme(name);
+    PtThemePalette p = self.palette;
+    self.backdrop.layer.borderColor = p.border.CGColor;
+    self.promptLabel.textColor      = p.accent;
+    self.statusLabel.textColor      = p.status;
+    self.inputField.textColor       = (p.out != nil) ? p.out : [NSColor whiteColor];
+    [self rebuildBanner];
+}
+
+// Special-case bannered ASCII line -- colour per role pulled from the
+// active theme palette so the banner recolours on theme switch.
+- (void)appendBannerLine:(NSString*)line level:(NSString*)role {
+    PtThemePalette p = self.palette;
+    NSColor* col = p.logoFrame;
+    if      ([role isEqualToString:@"letters"]) col = p.logoLetters;
+    else if ([role isEqualToString:@"ray"])     col = p.logoRay;
     NSShadow* shadow = [[NSShadow alloc] init];
     shadow.shadowColor = [NSColor colorWithCalibratedWhite:0.0 alpha:0.85];
     shadow.shadowOffset = NSMakeSize(0, -1);
@@ -306,12 +485,12 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
 }
 
 - (NSColor*)colorForLevel:(NSString*)level {
-    // Match the web console palette: cyan, magenta, amber, hot red.
-    if ([level isEqualToString:@"warn"])  return [NSColor colorWithCalibratedRed:1.00 green:0.78 blue:0.23 alpha:1.0];
-    if ([level isEqualToString:@"error"]) return [NSColor colorWithCalibratedRed:1.00 green:0.29 blue:0.37 alpha:1.0];
-    if ([level isEqualToString:@"input"]) return [NSColor colorWithCalibratedRed:1.00 green:0.23 blue:0.55 alpha:1.0];
-    if ([level isEqualToString:@"out"])   return [NSColor colorWithWhite:0.95 alpha:1.0];
-    return [NSColor colorWithWhite:0.52 alpha:1.0];
+    PtThemePalette p = self.palette;
+    if ([level isEqualToString:@"warn"])  return p.warn;
+    if ([level isEqualToString:@"error"]) return p.error;
+    if ([level isEqualToString:@"input"]) return p.input;
+    if ([level isEqualToString:@"out"])   return p.out;
+    return p.info;
 }
 
 - (void)appendLine:(NSString*)line level:(NSString*)level {
@@ -662,6 +841,15 @@ void ConsoleOverlay::Toggle() {
 bool ConsoleOverlay::IsShown() const {
     if (!opaque_) return false;
     return ((__bridge PtConsolePanel*)opaque_).isShown == YES;
+}
+
+void ConsoleOverlay::ApplyTheme(std::string_view name) {
+    if (!opaque_) return;
+    PtConsolePanel* panel = (__bridge PtConsolePanel*)opaque_;
+    NSString* nm = [NSString stringWithUTF8String:std::string(name).c_str()];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [panel.consoleView applyTheme:nm];
+    });
 }
 
 void ConsoleOverlay::NotifyParentResized(int /*width*/, int /*height*/) {
