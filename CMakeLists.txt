@@ -26,7 +26,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # --- Project options --------------------------------------------------------
-option(PT_ENABLE_VULKAN_BACKEND "Build Vulkan/MoltenVK backend (P4+)"   OFF)
+option(PT_ENABLE_VULKAN_BACKEND "Build Vulkan/MoltenVK backend (P4+)"   ON)
 option(PT_ENABLE_TRACY          "Enable Tracy profiler client"          ON)
 # ASan + mimalloc do not coexist cleanly without MI_TRACK_ASAN; opt-in only.
 option(PT_ENABLE_SANITIZERS     "Enable -fsanitize=address,undefined in Debug" OFF)
@@ -34,6 +34,14 @@ option(PT_ENABLE_SANITIZERS     "Enable -fsanitize=address,undefined in Debug" O
 # --- Compiler/warning helper -----------------------------------------------
 include(cmake/CompilerWarnings.cmake)
 include(cmake/EmbedResource.cmake)
+
+# --- Vulkan (LunarG SDK installed system-wide on Mac) ----------------------
+if(PT_ENABLE_VULKAN_BACKEND)
+    find_package(Vulkan REQUIRED)
+    if(Vulkan_FOUND)
+        message(STATUS "Vulkan: ${Vulkan_LIBRARIES} (headers: ${Vulkan_INCLUDE_DIRS})")
+    endif()
+endif()
 
 # --- Binary toolchain bits (slangc, metal-cpp) -----------------------------
 include(cmake/SetupBinaries.cmake)

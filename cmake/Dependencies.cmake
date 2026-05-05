@@ -103,6 +103,15 @@ FetchContent_Declare(tomlplusplus
     SYSTEM
 )
 
+# --- VulkanMemoryAllocator: simplifies Vk allocation lifetime --------------
+# Header-only.  Used by the Vulkan backend (P4+).
+FetchContent_Declare(vma
+    GIT_REPOSITORY https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
+    GIT_TAG        v3.1.0
+    GIT_SHALLOW    ON
+    SYSTEM
+)
+
 # --- nlohmann_json: WS protocol payloads -----------------------------------
 # JSON_NOEXCEPTION turns throws into abort() so the library plays nice with
 # our -fno-exceptions build.
@@ -116,6 +125,9 @@ FetchContent_Declare(nlohmann_json
 )
 
 FetchContent_MakeAvailable(glm fmt mimalloc glfw enkits civetweb tomlplusplus nlohmann_json)
+if(PT_ENABLE_VULKAN_BACKEND)
+    FetchContent_MakeAvailable(vma)
+endif()
 if(PT_ENABLE_TRACY)
     FetchContent_MakeAvailable(tracy)
 endif()

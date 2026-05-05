@@ -13,4 +13,9 @@ if(APPLE)
     target_compile_definitions(pt_rhi PUBLIC PT_HAS_METAL_BACKEND=1)
 endif()
 
+if(PT_ENABLE_VULKAN_BACKEND)
+    target_link_libraries(pt_rhi PUBLIC pt_rhi_vulkan)
+    target_compile_definitions(pt_rhi PUBLIC PT_HAS_VULKAN_BACKEND=1)
+endif()
+
 pt_set_compiler_options(pt_rhi)
