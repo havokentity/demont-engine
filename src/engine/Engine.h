@@ -62,6 +62,8 @@ private:
     std::uint64_t                               accum_texture_id_      = 0;
     std::uint64_t                               box_blas_id_           = 0;
     std::uint64_t                               scene_tlas_id_         = 0;
+    std::uint64_t                               box_vbuf_id_           = 0;
+    std::uint64_t                               box_ibuf_id_           = 0;
     int                                         accum_w_               = 0;
     int                                         accum_h_               = 0;
     std::uint32_t                               frame_index_           = 0;

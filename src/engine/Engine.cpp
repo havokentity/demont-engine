@@ -42,6 +42,8 @@ namespace cvar {
             "Open the web console in the default browser at startup",     CVAR_ARCHIVE);
     PT_CVAR(app_overlay_enabled, "1",
             "Enable the in-window native console overlay (backtick toggles)", CVAR_ARCHIVE);
+    PT_CVAR(r_theme, "hardcore",
+            "Web console theme: hardcore | amber | synthwave",            CVAR_ARCHIVE);
     PT_CVAR(r_backend,         "metal",    "One of none|software|metal|vulkan",CVAR_ARCHIVE);
     PT_CVAR(r_clear_color,     "0.18 0.05 0.28", "Background clear colour (R G B)", 0);
     PT_CVAR(r_mode,            "pathtrace",
@@ -233,9 +235,13 @@ void Engine::TearDownDevice() {
     if (device_) {
         if (scene_tlas_id_ != 0) device_->DestroyAccelStruct(pt::rhi::AccelStructHandle{scene_tlas_id_});
         if (box_blas_id_   != 0) device_->DestroyAccelStruct(pt::rhi::AccelStructHandle{box_blas_id_});
+        if (box_vbuf_id_   != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{box_vbuf_id_});
+        if (box_ibuf_id_   != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{box_ibuf_id_});
     }
     scene_tlas_id_ = 0;
     box_blas_id_   = 0;
+    box_vbuf_id_   = 0;
+    box_ibuf_id_   = 0;
     mesh_pipeline_id_ = 0;
     if (device_) {
         // Final frame clears the drawable to black so the window doesn't
@@ -324,7 +330,9 @@ void Engine::RequestBackendSwitch(BackendType to) {
 
     // Build a procedural box BLAS + TLAS so r_mode mesh has something
     // to render against. The box sits 0.5 above the ground (so its
-    // bottom rests on the plane), centered at the origin.
+    // bottom rests on the plane), centered at the origin. We also
+    // create separate vertex / index buffers for the shader to read
+    // (the BLAS-internal copies aren't accessible from compute).
     if (current_backend_ == BackendType::Metal) {
         auto box = pt::renderer::GenerateBoxCCW(1.0f, 1.0f, 1.0f);
         std::vector<float> verts(box.vertices.size() * 3);
@@ -333,6 +341,23 @@ void Engine::RequestBackendSwitch(BackendType to) {
             verts[i*3 + 1] = box.vertices[i].pos.y;
             verts[i*3 + 2] = box.vertices[i].pos.z;
         }
+
+        // Shader-readable vertex + index storage buffers.
+        const std::size_t vbytes = sizeof(float) * verts.size();
+        const std::size_t ibytes = sizeof(std::uint32_t) * box.indices.size();
+        auto vbuf = device_->CreateBuffer({
+            .size = vbytes, .usage = pt::rhi::BufferUsage::Storage,
+            .debug_name = "box_vbuf",
+        });
+        auto ibuf = device_->CreateBuffer({
+            .size = ibytes, .usage = pt::rhi::BufferUsage::Storage,
+            .debug_name = "box_ibuf",
+        });
+        if (vbuf.id != 0) device_->WriteBuffer(vbuf, verts.data(), vbytes);
+        if (ibuf.id != 0) device_->WriteBuffer(ibuf, box.indices.data(), ibytes);
+        box_vbuf_id_ = vbuf.id;
+        box_ibuf_id_ = ibuf.id;
+
         pt::rhi::BLASDesc blas_desc{
             .vertex_positions = verts.data(),
             .vertex_count     = static_cast<std::uint32_t>(box.vertices.size()),
@@ -479,6 +504,12 @@ void Engine::RenderFrame() {
     }
     if (needs_tlas && scene_tlas_id_ != 0) {
         cb->BindAccelStruct(2, pt::rhi::AccelStructHandle{scene_tlas_id_});
+        // Vertex + index buffers at slots 1, 2 (Slang assigns those
+        // when a TLAS is at buffer 0). The shader uses
+        // CommittedPrimitiveIndex + the indices to find the triangle's
+        // three vertices and computes a geometric normal.
+        if (box_vbuf_id_ != 0) cb->BindBuffer(1, pt::rhi::BufferHandle{box_vbuf_id_}, 0);
+        if (box_ibuf_id_ != 0) cb->BindBuffer(2, pt::rhi::BufferHandle{box_ibuf_id_}, 0);
     }
 
     glm::vec3 bg = ParseRGB(C.FindCVar("r_clear_color") ? C.FindCVar("r_clear_color")->value
@@ -776,6 +807,17 @@ void Engine::RegisterCommands() {
     }
     if (auto* v = C.FindCVar("r_clear_color")) {
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    // r_theme: validate + push the new theme to every WS client so the
+    // browser console flips live without a page reload.
+    if (auto* v = C.FindCVar("r_theme")) {
+        v->allowed_values = {"hardcore", "amber", "synthwave"};
+        v->on_change = [this](const pt::console::CVar& cv) {
+            if (server_) {
+                auto data = fmt::format(R"({{"name":"{}"}})", cv.value);
+                server_->BroadcastEvent("theme_change", data);
+            }
+        };
     }
     // dev_log_level: validate
     if (auto* v = C.FindCVar("dev_log_level")) {

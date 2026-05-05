@@ -114,28 +114,38 @@ void MetalCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
         auto* buf = device_->LookupBuffer(bound_buf_[i]);
         if (buf != nullptr) encoder_->setBuffer(buf, bound_buf_off_[i], i);
     }
-    // Slang's MSL output puts the AS at [[buffer(0)]] and pushes the
-    // push-constant block to [[buffer(1)]] when any AS is referenced;
-    // when there's no AS, push lands at [[buffer(0)]]. We compensate
-    // here so the same Engine binding code works for both cases.
+    // Slang's MSL output assigns Metal buffer slots in this order:
+    //   AS (if present)        -> slot 0
+    //   storage buffers        -> next slots, in declaration order
+    //   push constant block    -> next slot after all the above
+    // The Engine binds AS via BindAccelStruct and buffers via
+    // BindBuffer(slot, ...) using the SAME slot number Slang assigned
+    // (no abstraction here yet); push_slot is computed as max(bound
+    // buffer/AS slot) + 1 so it lands wherever Slang put it.
     bool has_accel = false;
     AccelStructHandle accel_handle{0};
     for (auto& a : bound_accel_) {
         if (a.id != 0) { has_accel = true; accel_handle = a; break; }
     }
 
-    std::uint32_t push_slot = has_accel ? 1u : 0u;
-    if (push_size_ > 0) {
-        encoder_->setBytes(push_buf_, push_size_, push_slot);
+    std::int32_t max_slot = -1;   // -1 = nothing yet
+    if (has_accel) max_slot = 0;
+    for (std::uint32_t i = 0; i < std::size(bound_buf_); ++i) {
+        if (bound_buf_[i]) max_slot = std::max(max_slot, static_cast<std::int32_t>(i));
     }
+
     if (has_accel) {
         auto* as = device_->LookupAccelStruct(accel_handle);
         if (as != nullptr) {
             encoder_->setAccelerationStructure(as, 0);
-            // useResource on every known AS so the BLAS instances
-            // referenced by the TLAS are also visible to this encoder.
             device_->UseAllAccelStructs(encoder_);
         }
+    }
+
+    std::uint32_t push_slot = (max_slot < 0) ? 0u
+                                             : static_cast<std::uint32_t>(max_slot + 1);
+    if (push_size_ > 0) {
+        encoder_->setBytes(push_buf_, push_size_, push_slot);
     }
 
     // dispatchThreads handles the remainder; pso threadExecutionWidth tells
@@ -315,6 +325,16 @@ void MetalDevice::DestroyBuffer(BufferHandle h) {
         if (it->second) it->second->release();
         buffers_.erase(it);
     }
+}
+
+void MetalDevice::WriteBuffer(BufferHandle h, const void* src, std::size_t size,
+                              std::size_t dst_offset) {
+    if (src == nullptr || size == 0) return;
+    auto* buf = LookupBuffer(h);
+    if (buf == nullptr) return;
+    auto* dst = static_cast<std::uint8_t*>(buf->contents());
+    if (dst == nullptr) return;   // not shared / not CPU-mapped
+    std::memcpy(dst + dst_offset, src, size);
 }
 void MetalDevice::DestroyTexture(TextureHandle h) {
     std::lock_guard lock(resource_mutex_);

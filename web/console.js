@@ -5,6 +5,26 @@
   const input      = document.getElementById('input');
   const status     = document.getElementById('status');
   const cvarsPanel = document.getElementById('cvars');
+  const themeSelect = document.getElementById('theme-select');
+
+  // Theme: source of truth is the r_theme cvar on the engine.
+  // localStorage is a quick UI cache for the moment before WS connects.
+  function applyTheme(t) {
+    if (!t) return;
+    document.documentElement.setAttribute('data-theme', t);
+    if (themeSelect && themeSelect.value !== t) themeSelect.value = t;
+    localStorage.setItem('demont.theme', t);
+  }
+  applyTheme(localStorage.getItem('demont.theme') || 'hardcore');
+  if (themeSelect) {
+    themeSelect.addEventListener('change', () => {
+      const t = themeSelect.value;
+      applyTheme(t);
+      // Push to engine; cvar's on_change will then BroadcastEvent
+      // back so other connected clients also flip.
+      send({ type: 'exec', line: 'r_theme ' + t });
+    });
+  }
 
   let ws = null;
   let nextId = 1;
@@ -84,6 +104,10 @@
       const lvl  = (msg.data && msg.data.level)   || 'info';
       const text = (msg.data && msg.data.message) || '';
       append(`<span class="ts">${ts()}</span><span class="log-${escape(lvl)}">[${escape(lvl).toUpperCase()}] ${escape(text)}</span>`);
+      return;
+    }
+    if (msg.type === 'event' && msg.topic === 'theme_change') {
+      applyTheme(msg.data && msg.data.name);
       return;
     }
   }
@@ -189,7 +213,11 @@
     ws.onopen = async () => {
       status.textContent = `connected · ${location.host}`;
       status.className = 'status ok';
-      send({ type: 'subscribe', topics: ['log'] });
+      send({ type: 'subscribe', topics: ['log', 'theme_change'] });
+      // Pull the engine's current r_theme and apply.
+      sendAndWait({ type: 'get_cvar', name: 'r_theme' }).then((r) => {
+        if (r && r.ok && r.cvar && r.cvar.value) applyTheme(r.cvar.value);
+      });
       // Hex banner with chevroned inner box and bouncing-ray scaffold.
       // Cyan frame, hot-pink ray + hit dots, bright letters.
       const banner = [

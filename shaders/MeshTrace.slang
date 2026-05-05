@@ -17,6 +17,12 @@
 [[vk::binding(0, 0)]] RWTexture2D<float4> output;
 [[vk::binding(1, 0)]] RWTexture2D<float4> accum_hdr;
 [[vk::binding(2, 0)]] RaytracingAccelerationStructure scene_tlas;
+// Vertex + index buffers for the single mesh, used to compute the
+// geometric normal at the ray-triangle hit point. Slang's RayQuery
+// doesn't expose a per-triangle normal directly; we look up the
+// triangle vertices via CommittedPrimitiveIndex and cross product.
+[[vk::binding(3, 0)]] StructuredBuffer<float3> mesh_positions;
+[[vk::binding(4, 0)]] StructuredBuffer<uint>   mesh_indices;
 
 [[vk::push_constant]]
 cbuffer Push {
@@ -133,13 +139,19 @@ void main(uint2 tid : SV_DispatchThreadID) {
         if (tlas_hit && (!plane_hit || t_mesh < t_plane)) {
             t_hit = t_mesh;
             hit_pt = ro + rd * t_hit;
-            // RayQuery doesn't expose a per-triangle normal directly --
-            // we'd need the vertex buffer bound to compute a real
-            // geometric normal. For P8 use the negated ray direction
-            // as a stand-in (flat camera-facing). P9+ binds the vertex
-            // buffer + does proper geometric normal from primitive
-            // index + barycentrics.
-            nf = -rd;
+            // Geometric normal from the hit triangle's three vertices.
+            uint prim = q.CommittedPrimitiveIndex();
+            uint i0 = mesh_indices[prim * 3 + 0];
+            uint i1 = mesh_indices[prim * 3 + 1];
+            uint i2 = mesh_indices[prim * 3 + 2];
+            float3 v0 = mesh_positions[i0];
+            float3 v1 = mesh_positions[i1];
+            float3 v2 = mesh_positions[i2];
+            float3 obj_n = normalize(cross(v1 - v0, v2 - v0));
+            // Transform to world space using the instance's transform.
+            float3x3 wfm = (float3x3)q.CommittedObjectToWorld4x3();
+            nf = normalize(mul(wfm, obj_n));
+            if (dot(nf, rd) > 0.0) nf = -nf;
             albedo    = float3(1.00, 0.85, 0.45);   // gold metal
             metal_mat = true;
         } else {

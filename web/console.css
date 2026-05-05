@@ -1,9 +1,11 @@
-/* DeMonT PathTracer console -- "hardcore" theme.
-   Deep near-black bg, electric cyan primary, hot magenta accent,
-   amber for warns, blood for errors. Tight mono everywhere, hard 1px
-   borders, faint scan-line/dot grid texture. */
+/* DeMonT PathTracer console -- three themes.
+   Default "hardcore": deep near-black + electric cyan + hot magenta
+   accent. Switchable via the topbar selector to "amber" (warm
+   orange / dark cream, the original) or "synthwave" (deep purple +
+   neon pink + electric blue grid). */
 
-:root {
+:root,
+:root[data-theme="hardcore"] {
   --bg:        #06080d;
   --bg-elev:   #0c1018;
   --bg-glass:  rgba(12, 16, 24, 0.7);
@@ -21,6 +23,58 @@
   --warn:          #ffc73a;     /* amber */
   --error:         #ff4a5e;     /* hot red */
   --ok:            #4afc92;     /* mint */
+
+  --grain-color:   rgba(0, 240, 255, 0.06);
+  --scan-color:    rgba(0, 0, 0, 0.06);
+  --bar-tint:      rgba(0, 240, 255, 0.04);
+}
+
+:root[data-theme="amber"] {
+  --bg:        #0e0d0c;
+  --bg-elev:   #15130f;
+  --bg-glass:  rgba(21, 19, 15, 0.7);
+  --fg:        #e8e3d6;
+  --fg-muted:  #8a8478;
+  --fg-dim:    #5a5650;
+  --border:    #2a2722;
+  --border-strong: #3a3630;
+
+  --accent:        #e89968;
+  --accent-dim:    #a06d44;
+  --accent-glow:   rgba(232, 153, 104, 0.15);
+
+  --magenta:       #d97757;
+  --warn:          #b8a868;
+  --error:         #d97757;
+  --ok:            #88a878;
+
+  --grain-color:   rgba(232, 153, 104, 0.06);
+  --scan-color:    rgba(0, 0, 0, 0.04);
+  --bar-tint:      rgba(232, 153, 104, 0.04);
+}
+
+:root[data-theme="synthwave"] {
+  --bg:        #0c0820;
+  --bg-elev:   #16102f;
+  --bg-glass:  rgba(22, 16, 47, 0.7);
+  --fg:        #f0e6ff;
+  --fg-muted:  #8c7eb8;
+  --fg-dim:    #4a4080;
+  --border:    #2a2150;
+  --border-strong: #3d3170;
+
+  --accent:        #ff5fbf;     /* hot pink */
+  --accent-dim:    #aa3088;
+  --accent-glow:   rgba(255, 95, 191, 0.22);
+
+  --magenta:       #b46cff;     /* neon purple */
+  --warn:          #ffa040;     /* sunset orange */
+  --error:         #ff3060;
+  --ok:            #4cf0a8;
+
+  --grain-color:   rgba(180, 108, 255, 0.07);
+  --scan-color:    rgba(0, 0, 0, 0.10);
+  --bar-tint:      rgba(255, 95, 191, 0.06);
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -45,7 +99,7 @@ body::before {
   position: fixed; inset: 0;
   pointer-events: none;
   background-image: radial-gradient(circle at 1px 1px,
-                    rgba(0, 240, 255, 0.06) 1px, transparent 0);
+                    var(--grain-color) 1px, transparent 0);
   background-size: 4px 4px;
   z-index: 0;
 }
@@ -57,7 +111,7 @@ body::after {
   background: repeating-linear-gradient(
     to bottom,
     transparent 0px, transparent 2px,
-    rgba(0, 0, 0, 0.06) 2px, rgba(0, 0, 0, 0.06) 3px);
+    var(--scan-color) 2px, var(--scan-color) 3px);
   z-index: 1;
 }
 
@@ -65,16 +119,28 @@ body::after {
 
 /* ---------- top bar ---------- */
 .bar {
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex; align-items: center; gap: 12px;
   padding: 10px 18px;
   border-bottom: 1px solid var(--border-strong);
-  background: linear-gradient(180deg,
-                              rgba(0, 240, 255, 0.04) 0%,
-                              transparent 100%);
+  background: linear-gradient(180deg, var(--bar-tint) 0%, transparent 100%);
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.16em;
 }
+.brand { flex: 1; }
+.theme-select {
+  background: var(--bg-elev);
+  color: var(--accent);
+  border: 1px solid var(--border-strong);
+  font-family: inherit;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  padding: 4px 8px;
+  cursor: pointer;
+  outline: none;
+}
+.theme-select:focus { border-color: var(--accent); }
 
 .brand {
   display: flex; align-items: center; gap: 10px;

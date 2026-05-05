@@ -87,8 +87,8 @@ public:
     void DestroyPipeline(PipelineHandle h) override;
     void DestroyAccelStruct(AccelStructHandle h) override;
 
-    void WriteBuffer(BufferHandle, const void*, std::size_t,
-                     std::size_t) override {}
+    void WriteBuffer(BufferHandle h, const void* src, std::size_t size,
+                     std::size_t dst_offset = 0) override;
 
     // ---- Frame ----------------------------------------------------------
     FrameContext   BeginFrame() override;
