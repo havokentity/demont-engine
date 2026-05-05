@@ -283,9 +283,23 @@ body::after {
 }
 .logo {
   width: 22px; height: 22px;
-  color: var(--accent);
-  filter: drop-shadow(0 0 4px var(--accent-glow));
   flex-shrink: 0;
+}
+/* Frame in the brand accent; rays + dots in the per-theme ray colour
+   so the SVG mirrors the ASCII banner's two-tone scheme. */
+.logo .logo-frame {
+  stroke: var(--accent);
+  fill: none;
+  filter: drop-shadow(0 0 4px var(--accent-glow));
+}
+.logo .logo-ray {
+  stroke: var(--logo-ray);
+  fill: none;
+  filter: drop-shadow(0 0 4px var(--logo-ray-glow));
+}
+.logo .logo-dot {
+  fill: var(--logo-ray);
+  filter: drop-shadow(0 0 3px var(--logo-ray-glow));
 }
 .brand .dim { color: var(--fg-muted); }
 
