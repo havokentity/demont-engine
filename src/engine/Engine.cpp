@@ -81,20 +81,15 @@ bool Engine::Init() {
     jobs_->Init();
     pt::jobs::JobSystem::SetInstance(jobs_.get());
 
-    // Window. Decide the GraphicsApi hint up front from r_backend so the
-    // window comes up with the right context on first show -- otherwise
-    // we create with NO_API, then RequestBackendSwitch destroys and
-    // rebuilds it with OpenGL, and the user sees a brief blank frame.
+    // Window. Always created with no graphics-API context; each backend
+    // attaches its own CAMetalLayer (or VkSurface for Vulkan) to the
+    // NSWindow content view, so no recreate is needed on backend switch.
     auto* ww = C.FindCVar("app_window_width");
     auto* wh = C.FindCVar("app_window_height");
-    auto* rb = C.FindCVar("r_backend");
     int win_w = ww ? ww->GetInt() : 1280;
     int win_h = wh ? wh->GetInt() : 720;
-    auto api  = (rb && rb->value == "software")
-                  ? pt::app::GraphicsApi::OpenGL
-                  : pt::app::GraphicsApi::None;
     window_ = std::make_unique<pt::app::Window>();
-    if (!window_->Create(win_w, win_h, "PathTracer", api)) {
+    if (!window_->Create(win_w, win_h, "PathTracer")) {
         LOG_ERROR("Failed to open window");
         return false;
     }
@@ -192,11 +187,6 @@ void Engine::Shutdown() {
     jobs_.reset();
 }
 
-pt::app::GraphicsApi Engine::ApiFor(BackendType t) {
-    return t == BackendType::Software ? pt::app::GraphicsApi::OpenGL
-                                      : pt::app::GraphicsApi::None;
-}
-
 void Engine::TearDownDevice() {
     if (device_) {
         device_->WaitIdle();
@@ -218,9 +208,8 @@ void Engine::RequestBackendSwitch(BackendType to) {
         return;
     }
 
-    // Recreate the window with the right graphics-API hint if needed.
-    auto api_needed = ApiFor(to);
-    if (window_) window_->Recreate(api_needed);
+    // No window recreate needed: window is always NO_API and each backend
+    // attaches its own surface (CAMetalLayer / VkSurface) to it.
 
     pt::rhi::NativeWindowHandle nw{
         .opaque = window_ ? static_cast<void*>(window_->Handle()) : nullptr,

@@ -1,16 +1,23 @@
+// Software backend: CPU work (currently just stash-clear-color), then
+// present via a Metal render pass with loadAction=Clear. No OpenGL
+// anywhere -- we share the Metal layer attachment with the metal backend.
+
 #include "SoftwareDevice.h"
 
 #include "../core/Log.h"
 #include "../core/Memory/MemTag.h"
 #include "../core/Memory/Memory.h"
 
-#define GLFW_INCLUDE_NONE
-#include <GLFW/glfw3.h>
-
-#define GL_SILENCE_DEPRECATION
-#include <OpenGL/gl3.h>
+// Headers only -- the metal-cpp PRIVATE_IMPLEMENTATION TU lives in
+// rhi_metal/MetalDevice.cpp and supplies the impl symbols we need.
+#include <Foundation/Foundation.hpp>
+#include <Metal/Metal.hpp>
+#include <QuartzCore/QuartzCore.hpp>
 
 #include <cstring>
+
+extern "C" void  pt_metal_attach_layer(void* ns_window, void* metal_layer);
+extern "C" void* pt_window_native_cocoa(void* glfw_window);
 
 namespace pt::rhi::sw {
 
@@ -37,8 +44,7 @@ void SoftwareCommandBuffer::PushConstants(const void* data, std::size_t size) {
     push_constants_size = size;
 }
 
-void SoftwareCommandBuffer::Dispatch(std::uint32_t /*gx*/, std::uint32_t /*gy*/,
-                                     std::uint32_t /*gz*/) {
+void SoftwareCommandBuffer::Dispatch(std::uint32_t, std::uint32_t, std::uint32_t) {
     auto* pl = device_->GetPipeline(bound_pipeline);
     if (pl == nullptr) return;
     if (pl->Name() == "clear" && push_constants_size >= sizeof(float) * 4) {
@@ -49,24 +55,48 @@ void SoftwareCommandBuffer::Dispatch(std::uint32_t /*gx*/, std::uint32_t /*gy*/,
 
 // ---------- SoftwareDevice -------------------------------------------------
 
-SoftwareDevice::SoftwareDevice(GLFWwindow* window) : window_(window) {
+SoftwareDevice::SoftwareDevice(const NativeWindowHandle& window) {
     pt::mem::TagScope scope(pt::MemTag::GpuBuffers);
     cmd_buf_ = std::make_unique<SoftwareCommandBuffer>(this);
 
-    if (window_ != nullptr) {
-        glfwGetFramebufferSize(window_, &width_, &height_);
-        // The window must have been created with an OpenGL context for
-        // this backend.  The Engine handles that on backend switch.
-        glfwMakeContextCurrent(window_);
-        glfwSwapInterval(1);
-        LOG_INFO("Software device online: {}x{} via GL context", width_, height_);
+    ns_window_ = pt_window_native_cocoa(window.opaque);
+    width_  = window.width;
+    height_ = window.height;
+
+    mtl_device_ = MTL::CreateSystemDefaultDevice();
+    if (mtl_device_ == nullptr) {
+        LOG_ERROR("Software backend: MTL::CreateSystemDefaultDevice failed");
+        return;
     }
+    mtl_queue_ = mtl_device_->newCommandQueue();
+    if (mtl_queue_ == nullptr) {
+        LOG_ERROR("Software backend: newCommandQueue failed");
+        return;
+    }
+
+    mtl_layer_ = CA::MetalLayer::layer();
+    mtl_layer_->retain();
+    mtl_layer_->setDevice(mtl_device_);
+    mtl_layer_->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
+    mtl_layer_->setFramebufferOnly(true);  // pure present, no shader writes
+    mtl_layer_->setDrawableSize(CGSize{static_cast<CGFloat>(width_),
+                                       static_cast<CGFloat>(height_)});
+
+    pt_metal_attach_layer(ns_window_, mtl_layer_);
+
+    LOG_INFO("Software backend online (CPU compute, Metal present): {}x{}",
+             width_, height_);
 }
 
 SoftwareDevice::~SoftwareDevice() {
-    if (window_ != nullptr) {
-        glfwMakeContextCurrent(nullptr);
+    cmd_buf_.reset();
+    {
+        std::lock_guard lock(resource_mutex_);
+        pipelines_.clear();
     }
+    if (mtl_layer_)  { mtl_layer_->release();  mtl_layer_  = nullptr; }
+    if (mtl_queue_)  { mtl_queue_->release();  mtl_queue_  = nullptr; }
+    if (mtl_device_) { mtl_device_->release(); mtl_device_ = nullptr; }
 }
 
 BufferHandle SoftwareDevice::CreateBuffer(const BufferDesc& d) {
@@ -76,7 +106,7 @@ BufferHandle SoftwareDevice::CreateBuffer(const BufferDesc& d) {
 }
 
 TextureHandle SoftwareDevice::CreateTexture(const TextureDesc& d) {
-    auto bytes = static_cast<std::size_t>(d.width) * d.height * 4;  // assume RGBA8
+    auto bytes = static_cast<std::size_t>(d.width) * d.height * 4;
     bytes_held_.fetch_add(bytes, std::memory_order_relaxed);
     std::lock_guard lock(resource_mutex_);
     return TextureHandle{ next_id_++ };
@@ -100,12 +130,10 @@ void SoftwareDevice::DestroyPipeline(PipelineHandle h) {
 }
 
 FrameContext SoftwareDevice::BeginFrame() {
-    if (window_ != nullptr) {
-        int w, h;
-        glfwGetFramebufferSize(window_, &w, &h);
-        if (w != width_ || h != height_) {
-            width_ = w; height_ = h;
-        }
+    if (mtl_layer_) {
+        auto sz = mtl_layer_->drawableSize();
+        width_  = static_cast<int>(sz.width);
+        height_ = static_cast<int>(sz.height);
     }
     return FrameContext{
         .swapchain_image = TextureHandle{0},
@@ -116,20 +144,43 @@ FrameContext SoftwareDevice::BeginFrame() {
 }
 
 void SoftwareDevice::EndFrame(CommandBuffer*) {
-    if (window_ == nullptr) return;
-    glViewport(0, 0, width_, height_);
-    glClearColor(pending_clear_[0], pending_clear_[1],
-                 pending_clear_[2], pending_clear_[3]);
-    glClear(GL_COLOR_BUFFER_BIT);
-    glfwSwapBuffers(window_);
+    if (mtl_layer_ == nullptr || mtl_queue_ == nullptr) return;
+
+    auto* pool = NS::AutoreleasePool::alloc()->init();
+
+    auto* drawable = mtl_layer_->nextDrawable();
+    if (drawable == nullptr) { pool->release(); return; }
+
+    auto* rpd = MTL::RenderPassDescriptor::renderPassDescriptor();
+    auto* attachment = rpd->colorAttachments()->object(0);
+    attachment->setTexture(drawable->texture());
+    attachment->setLoadAction(MTL::LoadActionClear);
+    attachment->setStoreAction(MTL::StoreActionStore);
+    attachment->setClearColor(MTL::ClearColor::Make(
+        pending_clear_[0], pending_clear_[1],
+        pending_clear_[2], pending_clear_[3]));
+
+    auto* cb  = mtl_queue_->commandBuffer();
+    auto* enc = cb->renderCommandEncoder(rpd);
+    enc->endEncoding();
+    cb->presentDrawable(drawable);
+    cb->commit();
+
+    pool->release();
     ++frame_index_;
 }
 
 CommandBuffer* SoftwareDevice::AcquireCommandBuffer() { return cmd_buf_.get(); }
 
-void SoftwareDevice::Submit(CommandBuffer*) { /* command played back at Dispatch */ }
+void SoftwareDevice::Submit(CommandBuffer*) { /* clear color already stashed */ }
 
-void SoftwareDevice::Resize(int w, int h) { width_ = w; height_ = h; }
+void SoftwareDevice::Resize(int w, int h) {
+    width_  = w; height_ = h;
+    if (mtl_layer_) {
+        mtl_layer_->setDrawableSize(CGSize{static_cast<CGFloat>(w),
+                                           static_cast<CGFloat>(h)});
+    }
+}
 
 std::size_t SoftwareDevice::CurrentAllocatedBytes() const {
     return bytes_held_.load(std::memory_order_relaxed);
@@ -149,10 +200,7 @@ SoftwarePipeline* SoftwareDevice::GetPipeline(PipelineHandle h) {
 }  // namespace pt::rhi::sw
 
 namespace pt::rhi {
-
 std::unique_ptr<Device> CreateSoftwareDevice(const NativeWindowHandle& w) {
-    auto* gw = static_cast<GLFWwindow*>(w.opaque);
-    return std::make_unique<sw::SoftwareDevice>(gw);
+    return std::make_unique<sw::SoftwareDevice>(w);
 }
-
-}  // namespace pt::rhi
+}

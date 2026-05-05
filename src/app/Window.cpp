@@ -31,26 +31,16 @@ bool EnsureGlfw() {
 Window::Window() = default;
 Window::~Window() { Destroy(); }
 
-bool Window::Create(int w, int h, std::string_view title, GraphicsApi api) {
+bool Window::Create(int w, int h, std::string_view title) {
     if (!EnsureGlfw()) return false;
     Destroy();
     title_.assign(title);
-    api_ = api;
 
     glfwDefaultWindowHints();
-    glfwWindowHint(GLFW_RESIZABLE,  GLFW_TRUE);
-    glfwWindowHint(GLFW_VISIBLE,    GLFW_TRUE);
+    glfwWindowHint(GLFW_CLIENT_API,               GLFW_NO_API);
+    glfwWindowHint(GLFW_RESIZABLE,                GLFW_TRUE);
+    glfwWindowHint(GLFW_VISIBLE,                  GLFW_TRUE);
     glfwWindowHint(GLFW_COCOA_RETINA_FRAMEBUFFER, GLFW_TRUE);
-
-    if (api == GraphicsApi::OpenGL) {
-        glfwWindowHint(GLFW_CLIENT_API,         GLFW_OPENGL_API);
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-        glfwWindowHint(GLFW_OPENGL_PROFILE,     GLFW_OPENGL_CORE_PROFILE);
-        glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
-    } else {
-        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    }
 
     handle_ = glfwCreateWindow(w, h, title_.c_str(), nullptr, nullptr);
     if (handle_ == nullptr) {
@@ -64,21 +54,6 @@ bool Window::Create(int w, int h, std::string_view title, GraphicsApi api) {
     glfwSetKeyCallback(handle_, &Window::OnKey);
 
     ++g_window_count;
-    return true;
-}
-
-bool Window::Recreate(GraphicsApi api) {
-    if (api == api_ && handle_ != nullptr) return true;
-    int x = 0, y = 0;
-    if (handle_ != nullptr) {
-        glfwGetWindowPos(handle_, &x, &y);
-    }
-    int w = width_, h = height_;
-    Destroy();
-    if (!Create(w, h, title_, api)) return false;
-    if (handle_ != nullptr) {
-        glfwSetWindowPos(handle_, x, y);
-    }
     return true;
 }
 

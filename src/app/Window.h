@@ -8,11 +8,6 @@ struct GLFWwindow;
 
 namespace pt::app {
 
-enum class GraphicsApi {
-    None,    // backend will attach its own surface (Metal / Vulkan)
-    OpenGL,  // GLFW manages an OpenGL Core 3.3 context (software backend)
-};
-
 class Window {
 public:
     Window();
@@ -20,14 +15,11 @@ public:
     Window(const Window&) = delete;
     Window& operator=(const Window&) = delete;
 
-    bool Create(int w, int h, std::string_view title,
-                GraphicsApi api = GraphicsApi::None);
+    // Always created with no graphics API context attached -- backends
+    // attach their own CAMetalLayer (Metal, Software-via-Metal-present)
+    // or VkSurface (Vulkan via MoltenVK).
+    bool Create(int w, int h, std::string_view title);
     void Destroy();
-
-    // Tear down and recreate with a new graphics-API hint, preserving the
-    // current size + (best effort) position.  Used by the Engine on
-    // backend switch.
-    bool Recreate(GraphicsApi api);
 
     void PollEvents();
     bool ShouldClose() const;
@@ -55,7 +47,6 @@ private:
     GLFWwindow* handle_ = nullptr;
     int width_  = 0;
     int height_ = 0;
-    GraphicsApi api_ = GraphicsApi::None;
     std::string title_;
     KeyHandler  key_handler_;
 };

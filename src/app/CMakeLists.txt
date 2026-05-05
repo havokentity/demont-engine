@@ -2,6 +2,7 @@
 add_library(pt_app_window STATIC
     Window.cpp
     Window_Cocoa.mm
+    MetalLayerAttach.mm
     ConsoleOverlay.mm
 )
 
@@ -23,8 +24,9 @@ if(APPLE)
         "-framework CoreGraphics"
     )
     # Objective-C++ files use ARC. Do not apply -fno-rtti to them.
-    set_source_files_properties(Window_Cocoa.mm  PROPERTIES COMPILE_FLAGS "-fobjc-arc")
-    set_source_files_properties(ConsoleOverlay.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    set_source_files_properties(Window_Cocoa.mm     PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    set_source_files_properties(MetalLayerAttach.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    set_source_files_properties(ConsoleOverlay.mm   PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 endif()
 
 pt_set_compiler_options(pt_app_window)

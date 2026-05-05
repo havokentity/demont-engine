@@ -6,17 +6,20 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
-#include <unordered_map>
-#include <vector>
 #include <mutex>
+#include <string>
+#include <unordered_map>
 
-struct GLFWwindow;
+// Forward decls for metal-cpp pointer types.  Real defs come from
+// <Metal/Metal.hpp> in the .cpp.
+namespace MTL {
+class Device;
+class CommandQueue;
+}
+namespace CA { class MetalLayer; class MetalDrawable; }
 
 namespace pt::rhi::sw {
 
-// Per-pipeline kernel.  P2 supports just "clear" -- writes a 4-float
-// push-constant colour into the rendering state.  P5+ will extend this
-// to host the path-tracer integrator.
 class SoftwarePipeline {
 public:
     explicit SoftwarePipeline(std::string name);
@@ -53,10 +56,9 @@ private:
 
 class SoftwareDevice : public Device {
 public:
-    explicit SoftwareDevice(GLFWwindow* window);
+    explicit SoftwareDevice(const NativeWindowHandle& window);
     ~SoftwareDevice() override;
 
-    // ---- Resources -------------------------------------------------------
     BufferHandle      CreateBuffer(const BufferDesc&) override;
     TextureHandle     CreateTexture(const TextureDesc&) override;
     PipelineHandle    CreateComputePipeline(const ComputePipelineDesc&) override;
@@ -71,7 +73,6 @@ public:
     void WriteBuffer(BufferHandle, const void*, std::size_t,
                      std::size_t) override {}
 
-    // ---- Frame -----------------------------------------------------------
     FrameContext   BeginFrame() override;
     void           EndFrame(CommandBuffer*) override;
     CommandBuffer* AcquireCommandBuffer() override;
@@ -79,34 +80,36 @@ public:
     void           WaitIdle() override {}
     void           Resize(int w, int h) override;
 
-    // ---- Introspection ---------------------------------------------------
     BackendType  Type()             const override { return BackendType::Software; }
     bool         SupportsHardwareRT() const override { return false; }
     const char*  DeviceName()       const override { return "PathTracer Software (CPU)"; }
     std::size_t  CurrentAllocatedBytes() const override;
 
-    // Internal: command buffer feeds back the clear color for the next
-    // present.
     void StashClear(float r, float g, float b, float a);
-
     SoftwarePipeline* GetPipeline(PipelineHandle h);
 
 private:
-    GLFWwindow* window_ = nullptr;
-    int         width_  = 0;
-    int         height_ = 0;
+    void* ns_window_ = nullptr;
+    int   width_  = 0;
+    int   height_ = 0;
     std::uint32_t frame_index_ = 0;
 
-    float pending_clear_[4] { 0.05f, 0.05f, 0.06f, 1.0f };
+    float pending_clear_[4] { 0.18f, 0.05f, 0.28f, 1.0f };
+
+    // Metal is used only for the present blit -- the rendering work itself
+    // is meant to be CPU-side (P5+ will fill a CPU framebuffer here and
+    // upload to a Metal texture). For P3 the kernel is just "clear", so
+    // we use a render pass with loadAction=Clear, no upload needed yet.
+    MTL::Device*       mtl_device_ = nullptr;
+    MTL::CommandQueue* mtl_queue_  = nullptr;
+    CA::MetalLayer*    mtl_layer_  = nullptr;
 
     std::unique_ptr<SoftwareCommandBuffer> cmd_buf_;
 
-    // Resource tables.  Trivial id allocator.
     std::mutex resource_mutex_;
     std::uint64_t next_id_ = 1;
     std::unordered_map<std::uint64_t, std::unique_ptr<SoftwarePipeline>> pipelines_;
 
-    // For CurrentAllocatedBytes -- sum of CPU buffers/textures we own.
     std::atomic<std::size_t> bytes_held_{0};
 };
 
@@ -114,4 +117,4 @@ private:
 
 namespace pt::rhi {
 std::unique_ptr<Device> CreateSoftwareDevice(const NativeWindowHandle& w);
-}  // namespace pt::rhi
+}

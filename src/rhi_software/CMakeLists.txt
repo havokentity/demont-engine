@@ -6,12 +6,18 @@ target_include_directories(pt_rhi_software PUBLIC ${CMAKE_SOURCE_DIR}/src)
 
 target_link_libraries(pt_rhi_software
     PUBLIC pt_core
-    PUBLIC glfw
+    PUBLIC pt_app_window     # for pt_metal_attach_layer / pt_window_native_cocoa
 )
 
 if(APPLE)
+    # Software backend uses Metal for the present blit. The metal-cpp
+    # PRIVATE_IMPLEMENTATION lives in pt_rhi_metal; we just consume the
+    # headers and the same Metal frameworks.
     target_link_libraries(pt_rhi_software PUBLIC
-        "-framework OpenGL"
+        metal_cpp
+        "-framework Metal"
+        "-framework Foundation"
+        "-framework QuartzCore"
     )
 endif()
 

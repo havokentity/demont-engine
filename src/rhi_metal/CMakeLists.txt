@@ -1,12 +1,12 @@
 add_library(pt_rhi_metal STATIC
     MetalDevice.cpp
-    MetalAttach.mm
 )
 
 target_include_directories(pt_rhi_metal PUBLIC ${CMAKE_SOURCE_DIR}/src)
 
 target_link_libraries(pt_rhi_metal
     PUBLIC pt_core
+    PUBLIC pt_app_window     # for pt_metal_attach_layer + pt_window_native_cocoa
     PUBLIC metal_cpp
 )
 
@@ -16,11 +16,7 @@ if(APPLE)
         "-framework MetalKit"
         "-framework Foundation"
         "-framework QuartzCore"
-        "-framework AppKit"
-        "-framework CoreGraphics"
     )
-    set_source_files_properties(MetalAttach.mm
-        PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 endif()
 
 # Compile the clear shader (Slang -> MSL source) and embed.

@@ -155,6 +155,7 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
 
     // Create the CAMetalLayer and attach it to the NSWindow content view.
     layer_ = CA::MetalLayer::layer();
+    layer_->retain();   // CA::MetalLayer::layer() returns autoreleased
     layer_->setDevice(device_);
     layer_->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
     layer_->setFramebufferOnly(false);  // we need read-write storage access

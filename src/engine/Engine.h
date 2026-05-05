@@ -45,7 +45,6 @@ private:
     void RegisterCommands();
     void TearDownDevice();
     void RenderFrame();
-    pt::app::GraphicsApi ApiFor(BackendType t);
 
     std::unique_ptr<pt::app::Window>            window_;
     std::unique_ptr<pt::app::ConsoleOverlay>    overlay_;

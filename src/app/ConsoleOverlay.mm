@@ -57,6 +57,7 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
 @property (weak) NSWindow* parentRenderWindow;
 @property (strong) PtConsoleView* consoleView;
 @property BOOL isShown;
+@property id eventMonitor;
 - (instancetype)initWithParent:(NSWindow*)parent;
 - (void)layoutToParent;
 - (void)show;
@@ -74,31 +75,6 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
         if (editor) [editor setSelectedRange:NSMakeRange(self.stringValue.length, 0)];
     }
     return ok;
-}
-
-- (BOOL)control:(NSControl*)control textView:(NSTextView*)textView
-      doCommandBySelector:(SEL)cmd {
-    if (cmd == @selector(insertTab:))      return [self.owner handleTab];
-    if (cmd == @selector(insertNewline:)) { [self.owner submitInput]; return YES; }
-    if (cmd == @selector(moveUp:)) {
-        if (self.owner.historyPos > 0) {
-            self.owner.historyPos -= 1;
-            self.stringValue = self.owner.history[self.owner.historyPos];
-        }
-        return YES;
-    }
-    if (cmd == @selector(moveDown:)) {
-        if (self.owner.historyPos < (NSInteger)self.owner.history.count) {
-            self.owner.historyPos += 1;
-            if (self.owner.historyPos == (NSInteger)self.owner.history.count) {
-                self.stringValue = @"";
-            } else {
-                self.stringValue = self.owner.history[self.owner.historyPos];
-            }
-        }
-        return YES;
-    }
-    return NO;
 }
 @end
 
@@ -254,6 +230,47 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
     [self.allNames sortUsingSelector:@selector(compare:)];
 }
 
+// NSControlTextEditingDelegate dispatch.  The field's `delegate` is set
+// to this PtConsoleView, so AppKit calls the method on us (not on the
+// field subclass).  We map insertTab:/insertNewline:/moveUp:/moveDown:
+// to our completion / submit / history hooks.
+- (BOOL)control:(NSControl*)control textView:(NSTextView*)textView
+      doCommandBySelector:(SEL)cmd {
+    if (cmd == @selector(insertTab:))      return [self handleTab];
+    if (cmd == @selector(insertNewline:)) { [self submitInput]; return YES; }
+    if (cmd == @selector(moveUp:)) {
+        if (self.historyPos > 0) {
+            self.historyPos -= 1;
+            self.inputField.stringValue = self.history[self.historyPos];
+        }
+        return YES;
+    }
+    if (cmd == @selector(moveDown:)) {
+        if (self.historyPos < (NSInteger)self.history.count) {
+            self.historyPos += 1;
+            if (self.historyPos == (NSInteger)self.history.count) {
+                self.inputField.stringValue = @"";
+            } else {
+                self.inputField.stringValue = self.history[self.historyPos];
+            }
+        }
+        return YES;
+    }
+    if (cmd == @selector(cancelOperation:)) {
+        // Esc with empty field hides the panel; otherwise clears the field.
+        if (self.inputField.stringValue.length == 0) {
+            id win = self.window;
+            if ([win respondsToSelector:@selector(hide)]) {
+                [win performSelector:@selector(hide)];
+            }
+        } else {
+            self.inputField.stringValue = @"";
+        }
+        return YES;
+    }
+    return NO;
+}
+
 - (BOOL)handleTab {
     if (self.allNames.count == 0) [self refreshNames];
 
@@ -364,6 +381,22 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
     [self makeKeyWindow];
     [self makeFirstResponder:self.consoleView.inputField];
 
+    // Backtick toggles when the panel is the key window.  An NSEvent
+    // monitor catches the keystroke before the field editor inserts it,
+    // so the user can press ` to close even with the input focused.
+    __weak PtConsolePanel* weakSelf = self;
+    self.eventMonitor = [NSEvent
+        addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+        handler:^NSEvent*(NSEvent* e) {
+            if (e.window != weakSelf) return e;
+            NSString* chars = e.charactersIgnoringModifiers;
+            if (chars.length == 1 && [chars characterAtIndex:0] == '`') {
+                [weakSelf toggle];
+                return nil;          // swallow it -- don't insert into field
+            }
+            return e;
+        }];
+
     [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
         ctx.duration = 0.22;
         ctx.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
@@ -375,6 +408,11 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
 - (void)hide {
     if (!self.isShown) return;
     self.isShown = NO;
+
+    if (self.eventMonitor) {
+        [NSEvent removeMonitor:self.eventMonitor];
+        self.eventMonitor = nil;
+    }
 
     NSRect cur = self.frame;
     NSRect target = NSMakeRect(cur.origin.x,
