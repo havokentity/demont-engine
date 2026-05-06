@@ -73,6 +73,7 @@ namespace cvar {
     PT_CVAR(r_lens_flare_intensity, "0.15", "Linear blend strength of the flare layer. Real-camera lens flare is typically 0.1-0.3 of the bright source.", CVAR_ARCHIVE);
     PT_CVAR(r_lens_flare_dispersion, "0.012", "Per-channel scale offset for chromatic aberration on ghosts. 0 = achromatic (white ghosts), >0 = colourful rainbow fringe along ghost edges. Real lenses 0.01-0.03.", CVAR_ARCHIVE);
     PT_CVAR(r_lens_flare_count,"4",   "Number of ghost reflections to render (1..6). Each ghost has a different scale + colour tint hardcoded in the shader.", CVAR_ARCHIVE);
+    PT_CVAR(r_lens_flare_threshold, "3.0", "Per-ghost luminance gate (linear HDR). Each bloom-mip sample is killed below this threshold so only the *brightest* sources (sun, very hot speculars) trigger flare. Bloom keeps its own lower r_bloom_threshold for halos. Drop to 1.0 to make every bright pixel flare; raise to 5+ for sun-only flare.", CVAR_ARCHIVE);
     PT_CVAR(r_exposure,        "1.5","Manual HDR exposure multiplier applied before ACES tonemap. Used when r_auto_exposure = 0.", CVAR_ARCHIVE);
     PT_CVAR(r_auto_exposure,   "1",  "Auto-exposure: 0 = use r_exposure manual value, 1 = sample accum_hdr each frame and adapt exposure toward r_exposure_target (eye-adaptation feel).", CVAR_ARCHIVE);
     PT_CVAR(r_exposure_min,    "0.05",  "Minimum exposure scalar that auto-exposure can settle on. Stops a nuclear-bright scene from being crushed below this value.", CVAR_ARCHIVE);
@@ -1446,12 +1447,13 @@ void Engine::RenderFrame() {
         bool hdr_pipeline = true;
         if (auto* v = C.FindCVar("r_hdr_pipeline")) hdr_pipeline = v->GetBool();
         bool flare_on = false;
-        float flare_int = 0.15f, flare_disp = 0.012f;
+        float flare_int = 0.15f, flare_disp = 0.012f, flare_thresh = 3.0f;
         int   flare_count = 4;
-        if (auto* v = C.FindCVar("r_lens_flare"))            flare_on    = v->GetBool();
-        if (auto* v = C.FindCVar("r_lens_flare_intensity"))  flare_int   = v->GetFloat();
-        if (auto* v = C.FindCVar("r_lens_flare_dispersion")) flare_disp  = v->GetFloat();
-        if (auto* v = C.FindCVar("r_lens_flare_count"))      flare_count = v->GetInt();
+        if (auto* v = C.FindCVar("r_lens_flare"))            flare_on     = v->GetBool();
+        if (auto* v = C.FindCVar("r_lens_flare_intensity"))  flare_int    = v->GetFloat();
+        if (auto* v = C.FindCVar("r_lens_flare_dispersion")) flare_disp   = v->GetFloat();
+        if (auto* v = C.FindCVar("r_lens_flare_count"))      flare_count  = v->GetInt();
+        if (auto* v = C.FindCVar("r_lens_flare_threshold"))  flare_thresh = v->GetFloat();
         if (flare_count < 1) flare_count = 1;
         if (flare_count > 6) flare_count = 6;
         struct TonePush {
@@ -1461,7 +1463,8 @@ void Engine::RenderFrame() {
             float        flare_intensity;
             float        flare_dispersion;
             std::uint32_t flare_count;
-            float        pad[2];
+            float        flare_threshold;
+            float        pad;
         } tp{};
         tp.exposure         = push.exposure_pad[0];
         tp.passthrough      = hdr_pipeline ? 0u : 1u;
@@ -1475,6 +1478,7 @@ void Engine::RenderFrame() {
         tp.flare_intensity  = (flare_on && bloom_ran) ? flare_int : 0.0f;
         tp.flare_dispersion = flare_disp;
         tp.flare_count      = static_cast<std::uint32_t>(flare_count);
+        tp.flare_threshold  = flare_thresh;
         cb->PushConstants(&tp, sizeof(tp));
         cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
     }
@@ -2412,6 +2416,7 @@ void Engine::RegisterCommands() {
     set_slider("r_lens_flare_intensity",      0.0f, 1.0f,  0.005f);
     set_slider("r_lens_flare_dispersion",     0.0f, 0.05f, 0.001f);
     set_slider("r_lens_flare_count",          1.0f, 6.0f,  1.0f);
+    set_slider("r_lens_flare_threshold",      0.5f, 10.0f, 0.05f);
 
     RegisterCsgCommands();
     RegisterPrimCommands();

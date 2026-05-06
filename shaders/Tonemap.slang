@@ -38,7 +38,13 @@ cbuffer Push {
     // Number of ghost reflections (1..6). The shader has 6
     // hardcoded ghost scales; this caps how many to use.
     uint  flare_count;
-    float pad[2];
+    // Per-ghost luminance gate. Each bloom sample is killed below
+    // this threshold so only the brightest sources (sun, hot
+    // speculars) trigger flare -- bloom keeps its own lower
+    // threshold for halos. With this gate flare reads as a "real
+    // lens" effect rather than every-bright-pixel-ghosts.
+    float flare_threshold;
+    float pad;
 };
 
 float3 acesTonemap(float3 c) {
@@ -176,11 +182,21 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 b3 = lerp(lerp(c00, c10, t.x), lerp(c01, c11, t.x), t.y);
             }
             float3 ghost = float3(r3.r, g3.g, b3.b);
+            // Per-ghost luminance gate. Real lens coatings absorb
+            // low-amplitude reflections; only sources bright enough
+            // to overwhelm them produce visible ghosts. We emulate
+            // by killing bloom samples whose luminance falls below
+            // flare_threshold (with a smoothstep knee for a soft
+            // transition rather than a hard cliff).
+            float lum = dot(ghost, float3(0.2126, 0.7152, 0.0722));
+            float gate_knee = max(flare_threshold * 0.25, 0.1);
+            float gate = smoothstep(flare_threshold,
+                                    flare_threshold + gate_knee, lum);
             // Radial fade: ghosts fade out as they near the screen
             // edge so we don't get a hard rectangle of flare on
             // wide-aperture shots.
             float fade = saturate(1.0 - length(uv - 0.5) * 1.5);
-            flare += ghost * kTints[gi] * fade;
+            flare += ghost * kTints[gi] * fade * gate;
         }
         c += flare_intensity * flare;
     }
