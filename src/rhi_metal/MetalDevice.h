@@ -72,9 +72,14 @@ private:
     AccelStructHandle          bound_accel_[4] {};
 
     // Push-constant buffer. Sized to fit the unified PathTrace push
-    // plus growth headroom for upcoming features (procedural sky
-    // params, more lights, etc.). 320 bytes.
-    std::uint8_t  push_buf_[320] {};
+    // plus growth headroom for upcoming features (DOF, MIS PDFs,
+    // bloom params, ...). PathTrace push is currently 336 bytes; the
+    // 512-byte buffer leaves room without forcing another resize.
+    // PushConstants() silently truncates beyond this size, so when
+    // adding push fields make sure the buffer is still big enough --
+    // a too-small buffer manifests as the last fields being all-zero
+    // at runtime (e.g. DOF appearing to do nothing).
+    std::uint8_t  push_buf_[512] {};
     std::size_t   push_size_ = 0;
 };
 
