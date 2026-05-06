@@ -645,6 +645,100 @@ body::after {
   padding-right: 4px;
 }
 
+/* ---------- side-panel tabs (modern mode) ---------- */
+.side-tabs {
+  display: flex;
+  gap: 0;
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border-strong);
+  padding: 0 6px;
+  flex: 0 0 auto;
+}
+.side-tab {
+  flex: 1 1 auto;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--accent-dim);
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding: 8px 4px;
+  cursor: pointer;
+  outline: none;
+  transition: color 0.08s ease, border-color 0.08s ease, background 0.08s ease;
+  white-space: nowrap;
+}
+.side-tab:hover { color: var(--accent); background: var(--bg); }
+.side-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  background: var(--bg);
+}
+
+/* Classic mode: no tabs visible, single scrollable list (the original UX). */
+#side-panel[data-mode="classic"] .side-tabs { display: none; }
+#mode-toggle { font-size: 11px; }
+#side-panel[data-mode="modern"] #mode-toggle { color: var(--accent); border-color: var(--accent); }
+
+/* ---------- pin button per row ---------- */
+.kv .pin-btn {
+  flex: 0 0 auto;
+  background: transparent;
+  border: none;
+  color: var(--border-strong);
+  font-size: 11px;
+  line-height: 1;
+  padding: 0 4px 0 0;
+  margin-right: 2px;
+  cursor: pointer;
+  outline: none;
+  opacity: 0;
+  transition: opacity 0.08s ease, color 0.08s ease;
+}
+.kv:hover .pin-btn { opacity: 0.7; }
+.kv .pin-btn:hover { color: var(--accent); opacity: 1; }
+.kv .pin-btn.pinned { opacity: 1; color: var(--accent); }
+
+/* ---------- stats tab ---------- */
+.stats {
+  padding: 12px;
+  display: flex; flex-direction: column; gap: 12px;
+  font-feature-settings: "calt" 0;
+}
+.stats .stat-block {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
+  padding: 8px 10px;
+  border-radius: 2px;
+}
+.stats .stat-label {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--accent-dim);
+  margin-bottom: 4px;
+}
+.stats .stat-value {
+  font-size: 18px;
+  color: var(--accent);
+  font-weight: 600;
+}
+.stats .stat-sub {
+  font-size: 10px;
+  color: var(--fg);
+  opacity: 0.7;
+  margin-top: 2px;
+}
+.stats .stat-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
 /* Command rows: differentiate from cvars with a small marker + dim
    "cmd" tag so the eye can scan the panel by type. */
 .kv-cmd .k { color: var(--accent-dim); }

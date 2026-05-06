@@ -6,11 +6,23 @@
   const status     = document.getElementById('status');
   const cvarsPanel = document.getElementById('cvars');
   const sideSearch = document.getElementById('side-search');
+  const sidePanel  = document.getElementById('side-panel');
   const themeSelect = document.getElementById('theme-select');
 
   // Cached side-panel data so the search input can re-render without
   // refetching from the engine. Refilled by refreshCvars().
   let sidePanelData = null;
+
+  // Tab + mode + pinned state. All persisted in localStorage.
+  //   mode    : "modern" (tabs) or "classic" (single scrollable list)
+  //   activeTab : one of pinned | cvars | commands | stats (modern only)
+  //   pinned  : Set<string> of cvar/command names
+  let activeTab = localStorage.getItem('demont.activeTab') || 'pinned';
+  const pinned  = new Set(JSON.parse(localStorage.getItem('demont.pinned') || '[]'));
+  const savePinned = () =>
+    localStorage.setItem('demont.pinned', JSON.stringify(Array.from(pinned)));
+  // Latest frame_stats payload (broadcast at ~10 Hz by the engine).
+  let lastStats = null;
 
   // Theme: source of truth is the r_theme cvar on the engine.
   // localStorage is a quick UI cache for the moment before WS connects.
@@ -115,6 +127,14 @@
       applyTheme(msg.data && msg.data.name);
       return;
     }
+    if (msg.type === 'event' && msg.topic === 'frame_stats') {
+      lastStats = msg.data || null;
+      // Only re-render the panel if the user is actually looking at
+      // the stats tab (otherwise we'd thrash the DOM at 10 Hz).
+      const mode = sidePanel?.getAttribute('data-mode') || 'modern';
+      if (mode === 'modern' && activeTab === 'stats') renderSidePanel();
+      return;
+    }
   }
 
   // Group both cvars and commands by their prefix (everything before
@@ -163,10 +183,29 @@
   //   - no allowed_values, value is num  -> number input
   //   - everything else                  -> text input
   // Setting the widget value writes the cvar via the WS exec channel.
+  // Build a small pin button for a cvar/command name. Toggles membership
+  // in the pinned set; the panel re-renders to reflect the change.
+  function makePinButton(name) {
+    const btn = document.createElement('button');
+    btn.className = 'pin-btn' + (pinned.has(name) ? ' pinned' : '');
+    btn.title = pinned.has(name) ? 'Unpin from quick access' : 'Pin for quick access';
+    btn.textContent = pinned.has(name) ? '★' : '☆';
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (pinned.has(name)) pinned.delete(name);
+      else                  pinned.add(name);
+      savePinned();
+      renderSidePanel();
+    });
+    return btn;
+  }
+
   function renderCvarRow(v, fillInput) {
     const row = document.createElement('div');
     row.className = 'kv';
     if (v.description) row.title = v.description;
+
+    row.appendChild(makePinButton(v.name));
 
     // Name (clickable to prefill the main input -- preserves the prior
     // "tap to inspect" UX even now that there's an inline editor).
@@ -242,12 +281,88 @@
     return row;
   }
 
-  // Re-render the side panel using `sidePanelData` and the current
-  // search filter. Filter is a case-insensitive substring match against
-  // the cvar / command name; groups whose items all get filtered out
-  // are hidden. Cheap enough that we re-render on every keystroke.
+  function renderCommandRow(cmd, fillInput) {
+    const row = document.createElement('div');
+    row.className = 'kv kv-cmd';
+    row.title = cmd.description || '';
+    row.appendChild(makePinButton(cmd.name));
+    const k = document.createElement('span');
+    k.className = 'k';
+    k.textContent = cmd.name;
+    k.addEventListener('click', () => fillInput(cmd.name));
+    row.appendChild(k);
+    const v = document.createElement('span');
+    v.className = 'v';
+    v.textContent = 'cmd';
+    row.appendChild(v);
+    return row;
+  }
+
+  // Render a flat (no grouping) list of pinned cvars + commands.
+  function renderPinned(fillInput) {
+    if (pinned.size === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'grp-head';
+      empty.textContent = 'pin items via the ☆ button';
+      cvarsPanel.appendChild(empty);
+      return;
+    }
+    if (!sidePanelData) return;
+    const allCvars = [];
+    const allCmds  = [];
+    for (const g of sidePanelData.names) {
+      const items = sidePanelData.groups.get(g);
+      for (const v of items.cvars)    if (pinned.has(v.name))    allCvars.push(v);
+      for (const c of items.commands) if (pinned.has(c.name))    allCmds.push(c);
+    }
+    const filter = (sideSearch && sideSearch.value || '').trim().toLowerCase();
+    const ok = (n) => !filter || n.toLowerCase().includes(filter);
+    for (const v of allCvars) if (ok(v.name)) cvarsPanel.appendChild(renderCvarRow(v, fillInput));
+    for (const c of allCmds)  if (ok(c.name)) cvarsPanel.appendChild(renderCommandRow(c, fillInput));
+  }
+
+  // Render the live engine telemetry tab.
+  function renderStats() {
+    const wrap = document.createElement('div');
+    wrap.className = 'stats';
+
+    const block = (label, value, sub) => {
+      const b = document.createElement('div'); b.className = 'stat-block';
+      const l = document.createElement('div'); l.className = 'stat-label'; l.textContent = label;
+      const v = document.createElement('div'); v.className = 'stat-value'; v.textContent = value;
+      b.appendChild(l); b.appendChild(v);
+      if (sub) {
+        const s = document.createElement('div'); s.className = 'stat-sub'; s.textContent = sub;
+        b.appendChild(s);
+      }
+      return b;
+    };
+
+    if (!lastStats) {
+      wrap.appendChild(block('FPS', '—', 'waiting for frame_stats…'));
+    } else {
+      const row = document.createElement('div'); row.className = 'stat-row';
+      row.appendChild(block('FPS',      lastStats.fps?.toFixed?.(1) ?? '—'));
+      row.appendChild(block('FRAME MS', lastStats.frame_ms?.toFixed?.(2) ?? '—'));
+      wrap.appendChild(row);
+      wrap.appendChild(block('BACKEND',    lastStats.backend ?? '—',
+        `trace ${lastStats.trace_ms?.toFixed?.(2) ?? '—'} ms`));
+      const r = lastStats.resolution || [];
+      wrap.appendChild(block('RESOLUTION', r.length === 2 ? `${r[0]} × ${r[1]}` : '—'));
+    }
+    cvarsPanel.appendChild(wrap);
+  }
+
+  // Re-render the side panel using `sidePanelData`, the current search
+  // filter, the active tab, and the current mode (modern vs classic).
+  // - classic: one big scrollable list grouped by prefix (no tabs).
+  // - modern + pinned   : flat list of pinned items.
+  // - modern + cvars    : grouped cvars only (no commands).
+  // - modern + commands : grouped commands only (no cvars).
+  // - modern + stats    : live frame_stats blocks.
   function renderSidePanel() {
     if (!sidePanelData) return;
+    const mode = sidePanel?.getAttribute('data-mode') || 'modern';
     const filter = (sideSearch && sideSearch.value || '').trim().toLowerCase();
     const matches = (n) => !filter || n.toLowerCase().includes(filter);
 
@@ -258,10 +373,23 @@
       input.setSelectionRange(input.value.length, input.value.length);
     };
 
+    if (mode === 'modern' && activeTab === 'stats') {
+      renderStats();
+      return;
+    }
+    if (mode === 'modern' && activeTab === 'pinned') {
+      renderPinned(fillInput);
+      return;
+    }
+
+    // For modern cvars/commands tabs we suppress the other type.
+    const showCvars    = (mode === 'classic') || activeTab === 'cvars';
+    const showCommands = (mode === 'classic') || activeTab === 'commands';
+
     for (const g of sidePanelData.names) {
       const items = sidePanelData.groups.get(g);
-      const cvarsHere = items.cvars.filter(v => matches(v.name));
-      const cmdsHere  = items.commands.filter(v => matches(v.name));
+      const cvarsHere = showCvars    ? items.cvars.filter(v => matches(v.name))    : [];
+      const cmdsHere  = showCommands ? items.commands.filter(v => matches(v.name)) : [];
       if (cvarsHere.length === 0 && cmdsHere.length === 0) continue;
 
       const head = document.createElement('div');
@@ -269,17 +397,8 @@
       head.textContent = g;
       cvarsPanel.appendChild(head);
 
-      for (const v of cvarsHere) {
-        cvarsPanel.appendChild(renderCvarRow(v, fillInput));
-      }
-      for (const cmd of cmdsHere) {
-        const row = document.createElement('div');
-        row.className = 'kv kv-cmd';
-        row.title = cmd.description || '';
-        row.innerHTML = `<span class="k">${escape(cmd.name)}</span><span class="v">cmd</span>`;
-        row.addEventListener('click', () => fillInput(cmd.name));
-        cvarsPanel.appendChild(row);
-      }
+      for (const v of cvarsHere)   cvarsPanel.appendChild(renderCvarRow(v, fillInput));
+      for (const cmd of cmdsHere)  cvarsPanel.appendChild(renderCommandRow(cmd, fillInput));
     }
   }
 
@@ -381,7 +500,7 @@
     ws.onopen = async () => {
       status.textContent = `connected · ${location.host}`;
       status.className = 'status ok';
-      send({ type: 'subscribe', topics: ['log', 'theme_change'] });
+      send({ type: 'subscribe', topics: ['log', 'theme_change', 'frame_stats'] });
       // Pull the engine's current r_theme and apply.
       sendAndWait({ type: 'get_cvar', name: 'r_theme' }).then((r) => {
         if (r && r.ok && r.cvar && r.cvar.value) applyTheme(r.cvar.value);
@@ -502,8 +621,7 @@
   // Density toggle (BMC-inspired): two settings, persisted via localStorage.
   // Compact mode crunches scope rows so more cvars fit on screen at once;
   // comfy is the default with normal padding.
-  const densityBtn   = document.getElementById('density-toggle');
-  const sidePanel    = document.getElementById('side-panel');
+  const densityBtn = document.getElementById('density-toggle');
   const applyDensity = (d) => {
     if (sidePanel) sidePanel.setAttribute('data-density', d);
     localStorage.setItem('demont.density', d);
@@ -515,6 +633,33 @@
       applyDensity(cur === 'compact' ? 'comfy' : 'compact');
     });
   }
+
+  // Mode toggle: classic (single scrollable list) vs modern (tabbed).
+  const modeBtn = document.getElementById('mode-toggle');
+  const applyMode = (m) => {
+    if (sidePanel) sidePanel.setAttribute('data-mode', m);
+    localStorage.setItem('demont.mode', m);
+    renderSidePanel();
+  };
+  applyMode(localStorage.getItem('demont.mode') || 'modern');
+  if (modeBtn) {
+    modeBtn.addEventListener('click', () => {
+      const cur = sidePanel?.getAttribute('data-mode') || 'modern';
+      applyMode(cur === 'modern' ? 'classic' : 'modern');
+    });
+  }
+
+  // Tab clicks (modern mode). Active state is reflected on the buttons
+  // and on the activeTab variable; renderSidePanel branches on it.
+  const sideTabs = document.querySelectorAll('.side-tab');
+  const setActiveTab = (name) => {
+    activeTab = name;
+    localStorage.setItem('demont.activeTab', name);
+    sideTabs.forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+    renderSidePanel();
+  };
+  sideTabs.forEach(t => t.addEventListener('click', () => setActiveTab(t.dataset.tab)));
+  setActiveTab(activeTab);   // sync visual state on first load
 
   // Refresh names occasionally so newly-registered cvars show up.
   setInterval(refreshNames, 10_000);

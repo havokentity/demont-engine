@@ -45,12 +45,19 @@
       <input id="input" type="text" placeholder='sys_info  ·  mem_report  ·  Tab to complete' spellcheck="false" autofocus>
     </form>
   </section>
-  <aside class="panel" id="side-panel">
+  <aside class="panel" id="side-panel" data-mode="modern">
     <div class="panel-head">
       <span>scope</span>
       <input id="side-search" type="text" placeholder="filter…" spellcheck="false" autocomplete="off">
+      <button id="mode-toggle"    class="density-btn" title="Toggle classic / modern view">▦</button>
       <button id="density-toggle" class="density-btn" title="Toggle compact / comfy density">⇅</button>
     </div>
+    <nav id="side-tabs" class="side-tabs">
+      <button class="side-tab active" data-tab="pinned">★ pinned</button>
+      <button class="side-tab"        data-tab="cvars">cvars</button>
+      <button class="side-tab"        data-tab="commands">commands</button>
+      <button class="side-tab"        data-tab="stats">stats</button>
+    </nav>
     <div id="cvars" class="kv-list"></div>
   </aside>
 </main>
