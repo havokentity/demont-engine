@@ -38,13 +38,23 @@ cbuffer Push {
     // Number of ghost reflections (1..6). The shader has 6
     // hardcoded ghost scales; this caps how many to use.
     uint  flare_count;
-    // Per-ghost luminance gate. Each bloom sample is killed below
-    // this threshold so only the brightest sources (sun, hot
-    // speculars) trigger flare -- bloom keeps its own lower
-    // threshold for halos. With this gate flare reads as a "real
-    // lens" effect rather than every-bright-pixel-ghosts.
+    // (image mode only) Per-ghost luminance gate against the
+    // bloom-mip sample. 0 = no gate.
     float flare_threshold;
-    float pad;
+    // 1 = 'sun' mode: project the sun's screen UV (passed in
+    // sun_uv) and draw discrete soft Gaussian-disc ghosts at
+    // its mirrored positions. Clean, no scene-mirror artefacts.
+    // 0 = 'image' mode: mirror-sample the bloom mip at every
+    // output pixel (the legacy code path).
+    uint  flare_mode_sun;
+    // (sun mode) base Gaussian disc radius in normalised screen
+    // units. Each ghost scales this by its own size factor so
+    // mirrors-near-centre are tighter than mirrors-far-out.
+    float flare_size;
+    // Sun's screen UV (computed engine-side from sun_dir + camera
+    // basis). Sentinel (-2, -2) means sun is behind / off-screen
+    // so the flare loop is skipped.
+    float2 sun_uv;
 };
 
 float3 acesTonemap(float3 c) {
@@ -109,10 +119,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // channel scale offsets give the rainbow chromatic aberration
     // you see on cheap lenses.
     if (flare_intensity > 0.0) {
-        // 6 ghost scales + tints. The scales spread inwards (< 1)
-        // and outwards (> 1) of the centre, the tints rotate around
-        // the colour wheel so a single bright source spawns a
-        // varied flare rather than 6 identical copies.
+        // 6 ghost scales + tints shared between modes.
         const float kScales[6] = {0.55, 0.78, 1.20, 1.45, 1.85, 2.40};
         const float3 kTints[6] = {
             float3(1.00, 0.55, 0.55),  // red
@@ -126,6 +133,54 @@ void main(uint3 tid : SV_DispatchThreadID) {
         float2 cv = uv - 0.5;
         uint   n  = min(flare_count, 6u);
         float3 flare = float3(0.0);
+
+        // 'sun' mode: explicit sun-position flare. Project sun's
+        // screen UV (engine-side); draw discrete soft Gaussian-disc
+        // ghosts at its mirrored positions. No bloom sampling --
+        // this is what people mean by lens flare.
+        if (flare_mode_sun != 0u) {
+            // Skip if sun is behind camera or off-screen -- engine
+            // sentinels with (-2, -2) so any out-of-[-0.5, 1.5]
+            // value means "no flare".
+            if (sun_uv.x > -1.0 && sun_uv.x < 2.0 &&
+                sun_uv.y > -1.0 && sun_uv.y < 2.0) {
+                for (uint gi = 0u; gi < n; ++gi) {
+                    float scale = kScales[gi];
+                    // Ghost centre = mirror sun across screen centre,
+                    // scaled. scale=1 places it exactly opposite the
+                    // sun; <1 closer to centre; >1 past centre.
+                    float2 ghost_c = 0.5 - (sun_uv - 0.5) * scale;
+                    float2 d = uv - ghost_c;
+                    // Per-ghost radius scales with sub/super-magnif.
+                    // Ghosts near centre are tight; far ones diffuse.
+                    float r = flare_size * (0.4 + 0.6 * scale);
+                    // Chromatic aberration: each channel gets a
+                    // slightly different radius. Bigger r = wider
+                    // halo, so R/G/B come out at different sizes
+                    // and produce coloured fringes on disc edges.
+                    float r_R = r * (1.0 + flare_dispersion * 8.0);
+                    float r_G = r;
+                    float r_B = r * (1.0 - flare_dispersion * 8.0);
+                    float d2 = dot(d, d);
+                    float i_R = exp(-d2 / max(r_R * r_R, 1e-6));
+                    float i_G = exp(-d2 / max(r_G * r_G, 1e-6));
+                    float i_B = exp(-d2 / max(r_B * r_B, 1e-6));
+                    float3 ghost = float3(i_R, i_G, i_B) * kTints[gi];
+                    // Radial fade so ghosts fall off near the
+                    // edge of the screen (real lens vignette).
+                    float fade = saturate(1.0 - length(uv - 0.5) * 1.2);
+                    flare += ghost * fade;
+                }
+                c += flare_intensity * flare;
+            }
+            float3 ldr_sun = (passthrough != 0u) ? c : acesTonemap(c * exposure);
+            ldr_out[tid.xy] = float4(ldr_sun, 1.0);
+            return;
+        }
+
+        // 'image' mode (legacy): mirror-sample the bloom mip at
+        // every output pixel. Looks cinematic but reflects the
+        // whole scene -- not what a real lens does.
         for (uint gi = 0u; gi < n; ++gi) {
             float scale = kScales[gi];
             // Per-channel scale offset for chromatic dispersion.
@@ -209,13 +264,23 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 float3 src = lerp(lerp(s00, s10, t.x),
                                   lerp(s01, s11, t.x), t.y);
                 float src_lum = dot(src, float3(0.2126, 0.7152, 0.0722));
-                // Reinhard-style soft gate: smoothly rolls off below
-                // threshold without a hard cliff (preserves the
-                // pretty halo softness on the things that *do*
-                // pass). Sun at lum=30 with threshold=5 -> gate=0.86;
-                // moderate spec at lum=3 -> gate=0.375; dim wall at
-                // lum=0.5 -> gate=0.09.
-                gate = src_lum / (src_lum + flare_threshold);
+                // Higher-order Reinhard: lum^16 / (lum^16 + t^16).
+                // Steep cliff right at `t`, smooth math (no branch),
+                // and -- unlike linear Reinhard -- doesn't dim the
+                // *passing* samples. Sun at lum=50 with t=30 ->
+                // ratio=1.67, ratio^16 ~= 3600, gate ~= 1.0 (full
+                // brightness). Wall at lum=25 with t=30 -> ratio=0.83,
+                // ratio^16 ~= 0.05, gate ~= 0.05 (killed). The previous
+                // linear gate forced thresholds in the 100s to filter
+                // walls and shredded the sun; this one separates them
+                // cleanly at threshold values near the actual luminance
+                // boundary you want.
+                float L = src_lum / max(flare_threshold, 1e-4);
+                L = L * L;  // ^2
+                L = L * L;  // ^4
+                L = L * L;  // ^8
+                L = L * L;  // ^16
+                gate = L / (L + 1.0);
             }
             // Radial fade: ghosts fade out as they near the screen
             // edge so we don't get a hard rectangle of flare on

@@ -73,7 +73,9 @@ namespace cvar {
     PT_CVAR(r_lens_flare_intensity, "0.15", "Linear blend strength of the flare layer. Real-camera lens flare is typically 0.1-0.3 of the bright source.", CVAR_ARCHIVE);
     PT_CVAR(r_lens_flare_dispersion, "0.012", "Per-channel scale offset for chromatic aberration on ghosts. 0 = achromatic (white ghosts), >0 = colourful rainbow fringe along ghost edges. Real lenses 0.01-0.03.", CVAR_ARCHIVE);
     PT_CVAR(r_lens_flare_count,"4",   "Number of ghost reflections to render (1..6). Each ghost has a different scale + colour tint hardcoded in the shader.", CVAR_ARCHIVE);
-    PT_CVAR(r_lens_flare_threshold, "0.0", "Per-ghost luminance gate (linear HDR). 0 = no gate (the *full* soft bloom around bright sources contributes to ghosts -- gives the cinematic look most people want). >0 enables a soft luminance modulation that progressively kills dim ghost samples; e.g. 3.0 = only sun + hot speculars, 6+ = sun only. Bloom keeps its own r_bloom_threshold for halos.", CVAR_ARCHIVE);
+    PT_CVAR(r_lens_flare_threshold, "0.0", "(image mode only) Per-ghost luminance gate. 0 = no gate. 'sun' mode ignores this and draws clean sun-only flare.", CVAR_ARCHIVE);
+    PT_CVAR(r_lens_flare_mode, "sun", "Lens flare algorithm. 'sun' = explicit sun-position flare: projects the sun direction to screen and draws soft Gaussian-disc ghosts at its mirrored positions (clean, no scene mirroring, the production-correct approach). 'image' = old image-based flare: mirror-samples the full bloom mip at every output pixel (looks dreamy but reflects the whole scene as flare, which isn't physically what a lens does).", CVAR_ARCHIVE);
+    PT_CVAR(r_lens_flare_size, "0.10", "(sun mode) Gaussian disc radius in normalised screen units. 0.05 = tight, 0.20 = soft and wide. Each ghost's radius scales with its distance from centre, so smaller scales naturally make tighter discs.", CVAR_ARCHIVE);
     PT_CVAR(r_exposure,        "1.5","Manual HDR exposure multiplier applied before ACES tonemap. Used when r_auto_exposure = 0.", CVAR_ARCHIVE);
     PT_CVAR(r_auto_exposure,   "1",  "Auto-exposure: 0 = use r_exposure manual value, 1 = sample accum_hdr each frame and adapt exposure toward r_exposure_target (eye-adaptation feel).", CVAR_ARCHIVE);
     PT_CVAR(r_exposure_min,    "0.05",  "Minimum exposure scalar that auto-exposure can settle on. Stops a nuclear-bright scene from being crushed below this value.", CVAR_ARCHIVE);
@@ -1447,15 +1449,42 @@ void Engine::RenderFrame() {
         bool hdr_pipeline = true;
         if (auto* v = C.FindCVar("r_hdr_pipeline")) hdr_pipeline = v->GetBool();
         bool flare_on = false;
-        float flare_int = 0.15f, flare_disp = 0.012f, flare_thresh = 3.0f;
+        float flare_int = 0.15f, flare_disp = 0.012f, flare_thresh = 3.0f, flare_size = 0.10f;
         int   flare_count = 4;
+        std::string flare_mode = "sun";
         if (auto* v = C.FindCVar("r_lens_flare"))            flare_on     = v->GetBool();
         if (auto* v = C.FindCVar("r_lens_flare_intensity"))  flare_int    = v->GetFloat();
         if (auto* v = C.FindCVar("r_lens_flare_dispersion")) flare_disp   = v->GetFloat();
         if (auto* v = C.FindCVar("r_lens_flare_count"))      flare_count  = v->GetInt();
         if (auto* v = C.FindCVar("r_lens_flare_threshold"))  flare_thresh = v->GetFloat();
+        if (auto* v = C.FindCVar("r_lens_flare_mode"))       flare_mode   = v->value;
+        if (auto* v = C.FindCVar("r_lens_flare_size"))       flare_size   = v->GetFloat();
         if (flare_count < 1) flare_count = 1;
         if (flare_count > 6) flare_count = 6;
+
+        // Project sun direction to screen-space UV. Used by 'sun'
+        // mode to draw discrete ghost discs at the sun's mirrored
+        // screen position. Sentinel (-2, -2) means sun is behind
+        // the camera or the cvars are missing -- shader skips the
+        // flare loop in that case.
+        float sun_uv_x = -2.0f, sun_uv_y = -2.0f;
+        {
+            const float sx = push.sun_and_mode[0];
+            const float sy = push.sun_and_mode[1];
+            const float sz = push.sun_and_mode[2];
+            const glm::vec3 sun_world{sx, sy, sz};
+            const float fwd_dot = glm::dot(sun_world, fwd);
+            if (fwd_dot > 1e-3f) {
+                const float right_dot = glm::dot(sun_world, right);
+                const float up_dot    = glm::dot(sun_world, up);
+                const float ft = cam.FovYTan();
+                const float xs = (right_dot / fwd_dot) / (ft * aspect);
+                const float ys = (up_dot    / fwd_dot) / ft;
+                sun_uv_x = xs * 0.5f + 0.5f;
+                sun_uv_y = -ys * 0.5f + 0.5f;
+            }
+        }
+
         struct TonePush {
             float        exposure;
             std::uint32_t passthrough;
@@ -1464,6 +1493,9 @@ void Engine::RenderFrame() {
             float        flare_dispersion;
             std::uint32_t flare_count;
             float        flare_threshold;
+            std::uint32_t flare_mode_sun;   // 1 = explicit sun-position flare
+            float        flare_size;        // sun mode: ghost disc base radius
+            float        sun_uv[2];         // sun's screen UV
             float        pad;
         } tp{};
         tp.exposure         = push.exposure_pad[0];
@@ -1475,10 +1507,18 @@ void Engine::RenderFrame() {
         // the 1x1 placeholder and the flare loop would just sample
         // zeros -- gate it explicitly to skip the loop entirely.
         const bool bloom_ran = bloom_on && bloom_h.id == bloom_mip_tex_id_[0];
-        tp.flare_intensity  = (flare_on && bloom_ran) ? flare_int : 0.0f;
+        // 'sun' mode draws explicit ghosts (no bloom needed); 'image'
+        // mode samples bloom and therefore needs bloom_ran.
+        const bool flare_sun_mode = (flare_mode == "sun");
+        tp.flare_intensity  = (flare_on && (flare_sun_mode || bloom_ran))
+                                ? flare_int : 0.0f;
         tp.flare_dispersion = flare_disp;
         tp.flare_count      = static_cast<std::uint32_t>(flare_count);
         tp.flare_threshold  = flare_thresh;
+        tp.flare_mode_sun   = flare_sun_mode ? 1u : 0u;
+        tp.flare_size       = flare_size;
+        tp.sun_uv[0]        = sun_uv_x;
+        tp.sun_uv[1]        = sun_uv_y;
         cb->PushConstants(&tp, sizeof(tp));
         cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
     }
@@ -2133,6 +2173,9 @@ void Engine::RegisterCommands() {
     }
     if (auto* v = C.FindCVar("r_lens_flare")) {
         v->allowed_values = {"0", "1"};
+    }
+    if (auto* v = C.FindCVar("r_lens_flare_mode")) {
+        v->allowed_values = {"sun", "image"};
     }
     // Bloom + flare intensity / threshold / mips / count / dispersion
     // don't reset accumulation: they're applied in the post-tonemap
