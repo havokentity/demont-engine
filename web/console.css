@@ -754,6 +754,20 @@ body::after {
   padding-right: 4px;
 }
 
+/* Sub-heading inside a top group (e.g. R > Sky / Camera / ...). Same
+   accent rail but dimmer + indented, italicised + smaller so the
+   visual hierarchy reads as `top -> sub -> rows` at a glance. */
+.grp-subhead {
+  border-left: 1px solid var(--accent-dim);
+  padding: 3px 4px 3px 14px;
+  margin: 6px 0 2px -4px;
+  color: var(--fg-muted);
+  font-size: 10px;
+  font-style: italic;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
 /* ---------- side-panel two-column body (modern mode) ---------- */
 /* Modern mode splits the panel body into two columns: a persistent
    "★ pinned" column on the left, and the tabs (cvars/commands/stats)

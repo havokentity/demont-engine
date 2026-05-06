@@ -28,7 +28,8 @@
   const DEFAULT_PINS = [
     'r_sky_animate', 'r_sky_animate_rate', 'r_sky_hour',
     'r_sky_use_astronomical', 'r_sky_city',
-    'r_exposure', 'r_auto_exposure',
+    'r_exposure', 'r_auto_exposure', 'r_eye_model',
+    'r_quality', 'r_dof', 'r_dof_aperture', 'r_dof_focal_distance',
   ];
   const pinnedRaw = localStorage.getItem('demont.pinned');
   const pinned = new Set(pinnedRaw === null
@@ -155,11 +156,23 @@
 
   // Group both cvars and commands by their prefix (everything before
   // the first underscore). Items with no underscore go into "general".
-  // Within each group, cvars list first, then commands. Click any row
-  // to prefill the input with `<name> ` and focus it.
+  // The renderer prefix `r` is huge (sky, camera, integrator, denoiser,
+  // ...), so we further split it into themed sub-groups for sanity.
+  // Click any row to prefill the input with `<name> ` and focus it.
   function groupOf(name) {
     const u = name.indexOf('_');
-    return u === -1 ? 'general' : name.slice(0, u);
+    if (u === -1) return { top: 'general', sub: '' };
+    const top = name.slice(0, u);
+    if (top !== 'r') return { top, sub: '' };
+    const tail = name.slice(u + 1);
+    if (/^sky_/.test(tail))                                                 return { top: 'r', sub: 'sky' };
+    if (/^sun_/.test(tail))                                                 return { top: 'r', sub: 'sky' };
+    if (/^stars_|^show_stars$/.test(tail))                                  return { top: 'r', sub: 'stars' };
+    if (/^env_/.test(tail))                                                 return { top: 'r', sub: 'env' };
+    if (/^exposure|^auto_exposure$|^eye_/.test(tail))                       return { top: 'r', sub: 'camera' };
+    if (/^caustics$|^refract|^quality$|^spp$|^max_bounces$/.test(tail))     return { top: 'r', sub: 'integrator' };
+    if (/^denoiser$|^hdr_/.test(tail))                                      return { top: 'r', sub: 'post' };
+    return { top: 'r', sub: 'display' };
   }
 
   async function refreshCvars() {
@@ -169,18 +182,44 @@
     ]);
     if (!c || !c.ok) return;
 
+    // Two-level grouping. groups: top -> { subs: Map<sub, {cvars, cmds}> }.
+    // Top-level keys are the cvar prefix (sky, app, net, sys, dev, r,
+    // cam, ...). Items inside the renderer prefix `r` get a second
+    // level (sky / stars / camera / integrator / post / env / display)
+    // so the panel doesn't dump all 30+ render cvars into one wall.
     const groups = new Map();
-    const ensure = (g) => {
-      if (!groups.has(g)) groups.set(g, { cvars: [], commands: [] });
-      return groups.get(g);
+    const ensure = (top, sub) => {
+      if (!groups.has(top)) groups.set(top, { subs: new Map() });
+      const g = groups.get(top);
+      if (!g.subs.has(sub)) g.subs.set(sub, { cvars: [], commands: [] });
+      return g.subs.get(sub);
     };
-    for (const v of (c.cvars || []))     ensure(groupOf(v.name)).cvars.push(v);
-    for (const v of (k && k.commands) || []) ensure(groupOf(v.name)).commands.push(v);
+    for (const v of (c.cvars || [])) {
+      const { top, sub } = groupOf(v.name);
+      ensure(top, sub).cvars.push(v);
+    }
+    for (const v of (k && k.commands) || []) {
+      const { top, sub } = groupOf(v.name);
+      ensure(top, sub).commands.push(v);
+    }
 
-    // Stable order: alpha groups, with "general" pushed to the end.
+    // Stable top-level order: alpha, with "general" pushed to the end.
     const names = Array.from(groups.keys()).sort();
     const gi = names.indexOf('general');
     if (gi !== -1) { names.splice(gi, 1); names.push('general'); }
+
+    // Stable sub-order inside each top group.
+    const SUB_ORDER = [
+      'integrator', 'post', 'camera', 'sky', 'stars', 'env', 'display', '',
+    ];
+    for (const top of names) {
+      const g = groups.get(top);
+      const ordered = new Map();
+      for (const s of SUB_ORDER) if (g.subs.has(s)) ordered.set(s, g.subs.get(s));
+      // Sweep up any leftover subs we didn't list in SUB_ORDER.
+      for (const [s, payload] of g.subs) if (!ordered.has(s)) ordered.set(s, payload);
+      g.subs = ordered;
+    }
 
     sidePanelData = { names, groups };
     renderSidePanel();
@@ -453,19 +492,36 @@
     const showCvars    = (mode === 'classic') || activeTab === 'cvars';
     const showCommands = (mode === 'classic') || activeTab === 'commands';
 
-    for (const g of sidePanelData.names) {
-      const items = sidePanelData.groups.get(g);
-      const cvarsHere = showCvars    ? items.cvars.filter(v => matches(v.name))    : [];
-      const cmdsHere  = showCommands ? items.commands.filter(v => matches(v.name)) : [];
-      if (cvarsHere.length === 0 && cmdsHere.length === 0) continue;
+    for (const top of sidePanelData.names) {
+      const g = sidePanelData.groups.get(top);
+      // First scan: are there any matching items under this top group?
+      // We render the top heading lazily so a group with no surviving
+      // children (after the search filter) doesn't leave a stranded
+      // header.
+      let topHeadEmitted = false;
+      const emitTopHead = () => {
+        if (topHeadEmitted) return;
+        const head = document.createElement('div');
+        head.className = 'grp-head';
+        head.textContent = top;
+        cvarsPanel.appendChild(head);
+        topHeadEmitted = true;
+      };
 
-      const head = document.createElement('div');
-      head.className = 'grp-head';
-      head.textContent = g;
-      cvarsPanel.appendChild(head);
-
-      for (const v of cvarsHere)   cvarsPanel.appendChild(renderCvarRow(v, fillInput));
-      for (const cmd of cmdsHere)  cvarsPanel.appendChild(renderCommandRow(cmd, fillInput));
+      for (const [sub, items] of g.subs) {
+        const cvarsHere = showCvars    ? items.cvars.filter(v => matches(v.name))    : [];
+        const cmdsHere  = showCommands ? items.commands.filter(v => matches(v.name)) : [];
+        if (cvarsHere.length === 0 && cmdsHere.length === 0) continue;
+        emitTopHead();
+        if (sub) {
+          const sh = document.createElement('div');
+          sh.className = 'grp-subhead';
+          sh.textContent = sub;
+          cvarsPanel.appendChild(sh);
+        }
+        for (const v of cvarsHere)   cvarsPanel.appendChild(renderCvarRow(v, fillInput));
+        for (const cmd of cmdsHere)  cvarsPanel.appendChild(renderCommandRow(cmd, fillInput));
+      }
     }
   }
 

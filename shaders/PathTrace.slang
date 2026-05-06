@@ -88,6 +88,13 @@ cbuffer Push {
     float4 w2j_row0;
     float4 w2j_row1;
     float4 w2j_row2;
+    // Thin-lens DOF parameters.
+    //   .x = aperture radius (0 = pinhole, no DOF).
+    //   .y = focal distance (world units).
+    //   .z = aperture blade count (0 = round disk; 3..16 = polygonal
+    //        iris -> polygonal bokeh).
+    //   .w reserved.
+    float4 dof_params;
 };
 
 static const uint MAT_LAMBERT    = 0u;
@@ -593,6 +600,56 @@ void main(uint2 tid : SV_DispatchThreadID) {
         float3 rd = normalize(fwd_aspect.xyz
                            + right_xyz.xyz * (uv.x * fwd_aspect.w * pos_fovtan.w)
                            + up_xyz.xyz    * (uv.y * pos_fovtan.w));
+
+        // Thin-lens DOF. Sample a point on the aperture, recompute
+        // the ray to pass through the focal-plane intersection of
+        // the original pinhole ray. Aperture sampling shape =
+        // round disk for circular bokeh, regular polygon for
+        // polygonal-iris bokeh (matching real lens aperture blades).
+        // dof_params.x = aperture radius (0 = skip, pinhole).
+        if (dof_params.x > 0.0) {
+            float aperture = dof_params.x;
+            float focal_d  = dof_params.y;
+            int   blades   = int(dof_params.z + 0.5);
+            float u1 = randf(seed), u2 = randf(seed);
+            float2 ap;
+            if (blades < 3) {
+                // Concentric-disk mapping (Shirley-Chiu): square
+                // (u1,u2) -> uniformly distributed unit disk.
+                float a = 2.0 * u1 - 1.0;
+                float b = 2.0 * u2 - 1.0;
+                float r, phi;
+                if (abs(a) > abs(b)) {
+                    r = a;
+                    phi = (3.14159265358979 / 4.0) * (b / max(abs(a), 1e-6));
+                } else {
+                    r = b;
+                    phi = (3.14159265358979 / 2.0) -
+                          (3.14159265358979 / 4.0) * (a / max(abs(b), 1e-6));
+                }
+                ap = r * float2(cos(phi), sin(phi));
+            } else {
+                // Polygon sampling: pick a triangular wedge of the
+                // regular n-gon, sample uniformly inside it. Bokeh
+                // gets that classic 5-/6-/8-sided look.
+                float n = float(blades);
+                float wedge = 6.28318530717958 / n;
+                int   i = int(floor(u1 * n));
+                float r1 = frac(u1 * n);
+                float r2 = u2;
+                if (r1 + r2 > 1.0) { r1 = 1.0 - r1; r2 = 1.0 - r2; }
+                float a0 = float(i) * wedge;
+                float a1 = a0 + wedge;
+                float2 p0 = float2(cos(a0), sin(a0));
+                float2 p1 = float2(cos(a1), sin(a1));
+                ap = r1 * p0 + r2 * p1;
+            }
+            float3 lens_off = right_xyz.xyz * (ap.x * aperture)
+                            + up_xyz.xyz    * (ap.y * aperture);
+            float3 focus_p  = ro + rd * focal_d;
+            ro = ro + lens_off;
+            rd = normalize(focus_p - ro);
+        }
 
         float3 throughput = float3(1.0);
         float3 radiance   = float3(0.0);

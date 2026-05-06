@@ -111,6 +111,14 @@ namespace cvar {
     PT_CVAR(cam_pos,           "0 1.5 4", "Camera position (x y z)",       CVAR_ARCHIVE);
     PT_CVAR(cam_yaw,           "0",       "Yaw in degrees",                CVAR_ARCHIVE);
     PT_CVAR(cam_pitch,         "-11.5",   "Pitch in degrees (clamped +/- 85)", CVAR_ARCHIVE);
+    // Depth-of-field (thin-lens camera). Each primary ray originates
+    // at a random sample on the aperture and aims through the focal-
+    // plane intersection of the pinhole ray. Bokeh shape comes from
+    // the aperture sampling distribution (round disk vs polygon).
+    PT_CVAR(r_dof,             "0",   "Depth of field. 0 = pinhole camera (everything sharp). 1 = thin-lens with r_dof_aperture / r_dof_focal_distance.", CVAR_ARCHIVE);
+    PT_CVAR(r_dof_aperture,    "0.05","Aperture radius in world units. Bigger = more blur on out-of-focus pixels. Real-camera analogue: focal_length / f_number; e.g. 50mm at f/2.8 ~= 0.018 (assuming the scene is in metres).", CVAR_ARCHIVE);
+    PT_CVAR(r_dof_focal_distance, "5.0", "Distance from camera (world units) where the scene is in perfect focus. Closer / farther pixels get bokeh proportional to their distance from this plane.", CVAR_ARCHIVE);
+    PT_CVAR(r_dof_blades,      "0",   "Aperture blade count. 0 = perfectly round disk (circular bokeh). 5/6/8 = polygonal iris (matching real lens aperture blades) -- gives polygonal bokeh on out-of-focus highlights.", CVAR_ARCHIVE);
     PT_CVAR(dev_cheats,        "0",    "Gate for CHEAT-flagged cvars",   0);
     PT_CVAR(dev_log_level,     "info", "error|warn|info|debug",          0);
 
@@ -1079,6 +1087,10 @@ void Engine::RenderFrame() {
         float w2j_row0[4];
         float w2j_row1[4];
         float w2j_row2[4];
+        // .x = aperture radius (0 = pinhole, no DOF). .y = focal
+        // distance (world units). .z = aperture blade count (0 =
+        // round disk, 3..16 = polygonal iris). .w reserved.
+        float dof_params[4];
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -1249,7 +1261,20 @@ void Engine::RenderFrame() {
         push.w2j_row1[3] = caustics ? float(refract_bounces) : 0.0f;
     }
 
-    static_assert(sizeof(PtPush) == 272 + 48);
+    {
+        bool dof_on = false;
+        if (auto* v = C.FindCVar("r_dof")) dof_on = v->GetBool();
+        float aperture = 0.0f, focal_dist = 5.0f, blades = 0.0f;
+        if (auto* v = C.FindCVar("r_dof_aperture"))        aperture   = v->GetFloat();
+        if (auto* v = C.FindCVar("r_dof_focal_distance"))  focal_dist = v->GetFloat();
+        if (auto* v = C.FindCVar("r_dof_blades"))          blades     = float(v->GetInt());
+        push.dof_params[0] = dof_on ? aperture : 0.0f;
+        push.dof_params[1] = focal_dist;
+        push.dof_params[2] = blades;
+        push.dof_params[3] = 0.0f;
+    }
+
+    static_assert(sizeof(PtPush) == 272 + 48 + 16);
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
 
@@ -1895,6 +1920,19 @@ void Engine::RegisterCommands() {
     if (auto* v = C.FindCVar("r_refract_bounces")) {
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
+    if (auto* v = C.FindCVar("r_dof")) {
+        v->allowed_values = {"0", "1"};
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    if (auto* v = C.FindCVar("r_dof_aperture")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    if (auto* v = C.FindCVar("r_dof_focal_distance")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    if (auto* v = C.FindCVar("r_dof_blades")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
     // r_quality: master preset that bulk-edits the per-feature cvars.
     // Ranges chosen so 'low' is comfortably fast at 1080p on M-series
     // GPUs, 'high' is the headline-correct path, and 'ultra' bumps
@@ -2144,6 +2182,9 @@ void Engine::RegisterCommands() {
     set_slider("cam_speed",         0.1f,   30.0f,  0.1f);
     set_slider("cam_sprint_mult",   1.0f,   10.0f,  0.1f);
     set_slider("cam_sensitivity",   0.01f,   1.0f,  0.01f);
+    set_slider("r_dof_aperture",        0.0f,   1.0f,  0.001f);
+    set_slider("r_dof_focal_distance",  0.1f, 100.0f,  0.1f);
+    set_slider("r_dof_blades",          0.0f,  16.0f,  1.0f);
 
     RegisterCsgCommands();
     RegisterPrimCommands();
