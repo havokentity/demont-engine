@@ -44,7 +44,12 @@ extern "C" void* pt_metalfx_create(void* mtl_device,
         desc.colorTextureFormat  = MTLPixelFormatRGBA16Float;
         desc.depthTextureFormat  = MTLPixelFormatR32Float;
         desc.motionTextureFormat = MTLPixelFormatRG16Float;
-        desc.outputTextureFormat = MTLPixelFormatBGRA8Unorm;
+        // Match the swapchain's sRGB format so the post-MetalFX blit
+        // is a same-format copy. MetalFX TemporalDenoisedScaler treats
+        // the output format as the storage-side format; gamma encoding
+        // happens implicitly on the sRGB store the same way it does
+        // for the path tracer's swapchain write.
+        desc.outputTextureFormat = MTLPixelFormatBGRA8Unorm_sRGB;
         desc.inputWidth          = width;
         desc.inputHeight         = height;
         desc.outputWidth         = width;
@@ -61,7 +66,7 @@ extern "C" void* pt_metalfx_create(void* mtl_device,
         // BGRA8Unorm so a subsequent blit to the swapchain is a
         // same-format copy.
         MTLTextureDescriptor* td = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB
                                           width:width
                                          height:height
                                       mipmapped:NO];

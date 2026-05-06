@@ -203,7 +203,13 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
     layer_ = CA::MetalLayer::layer();
     layer_->retain();   // CA::MetalLayer::layer() returns autoreleased
     layer_->setDevice(device_);
-    layer_->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
+    // sRGB swapchain: the shader writes ACES-tonemapped *linear* [0,1]
+    // values; the GPU does the linear -> sRGB gamma encode for free on
+    // store, so the display sees properly gamma-encoded pixels. Without
+    // this we had to either pow(c, 1/2.2) in the shader or live with a
+    // dim/desaturated look on the no-denoiser path (MetalFX did the
+    // gamma internally, hence the asymmetry).
+    layer_->setPixelFormat(MTL::PixelFormatBGRA8Unorm_sRGB);
     layer_->setFramebufferOnly(false);  // we need read-write storage access
     layer_->setDrawableSize(CGSize{static_cast<CGFloat>(width_),
                                    static_cast<CGFloat>(height_)});
@@ -404,7 +410,9 @@ bool MetalDevice::WriteTexture(TextureHandle h, const void* src, std::size_t src
         case MTL::PixelFormatRGBA32Float: bpp = 16; break;
         case MTL::PixelFormatRGBA16Float: bpp = 8;  break;
         case MTL::PixelFormatRGBA8Unorm:
-        case MTL::PixelFormatBGRA8Unorm:  bpp = 4;  break;
+        case MTL::PixelFormatRGBA8Unorm_sRGB:
+        case MTL::PixelFormatBGRA8Unorm:
+        case MTL::PixelFormatBGRA8Unorm_sRGB: bpp = 4; break;
         case MTL::PixelFormatR32Float:    bpp = 4;  break;
         case MTL::PixelFormatRG16Float:   bpp = 4;  break;
         default: return false;
@@ -650,7 +658,9 @@ bool MetalDevice::ReadbackTexture(TextureHandle h, void* dst, std::size_t dst_si
         case MTL::PixelFormatRGBA32Float: bpp = 16; break;
         case MTL::PixelFormatRGBA16Float: bpp = 8;  break;
         case MTL::PixelFormatRGBA8Unorm:
-        case MTL::PixelFormatBGRA8Unorm:  bpp = 4;  break;
+        case MTL::PixelFormatRGBA8Unorm_sRGB:
+        case MTL::PixelFormatBGRA8Unorm:
+        case MTL::PixelFormatBGRA8Unorm_sRGB: bpp = 4; break;
         case MTL::PixelFormatR32Float:    bpp = 4;  break;
         case MTL::PixelFormatRG16Float:   bpp = 4;  break;
         default: return false;

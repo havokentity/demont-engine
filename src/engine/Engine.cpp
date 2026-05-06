@@ -57,7 +57,8 @@ namespace cvar {
     PT_CVAR(r_max_bounces,     "8",  "Max path bounces per ray",          CVAR_ARCHIVE);
     PT_CVAR(r_spp,             "1",  "Samples per pixel per dispatch (>=1). Higher = cleaner motion frames at proportional GPU cost.", CVAR_ARCHIVE);
     PT_CVAR(r_denoiser,        "off","Denoiser: off|metalfx (Mac MetalFX TemporalDenoisedScaler).", CVAR_ARCHIVE);
-    PT_CVAR(r_exposure,        "1.5","Manual HDR exposure multiplier applied before ACES tonemap. Bump up when scenes look washed out (denoiser-off path). MetalFX denoiser does its own auto-exposure so this is mostly a no-denoiser knob.", CVAR_ARCHIVE);
+    PT_CVAR(r_exposure,        "1.5","Manual HDR exposure multiplier applied before ACES tonemap. Used when r_auto_exposure = 0.", CVAR_ARCHIVE);
+    PT_CVAR(r_auto_exposure,   "1",  "Auto-exposure: 0 = use r_exposure manual value, 1 = sample accum_hdr each frame and adapt exposure toward middle-grey (eye-adaptation feel).", CVAR_ARCHIVE);
     PT_CVAR(r_env_map,         "assets/hdri/sunset.hdr",
             "Path to a Radiance .hdr environment map. Used when r_sky_mode = hdri. "
             "Default points at the bundled CC0 sunset HDRI; resolves relative to CWD.",
@@ -996,9 +997,11 @@ void Engine::RenderFrame() {
     push.sun_and_mode[3] = float(sky_mode_id);
     push.env_map_present = (sky_mode_id == 1u) ? 1u : 0u;
 
-    float exposure = 1.5f;
-    if (auto* v = C.FindCVar("r_exposure")) exposure = v->GetFloat();
-    push.exposure_pad[0] = exposure;     // pad[1..3] already zero-initialised
+    bool auto_exp = false;
+    if (auto* v = C.FindCVar("r_auto_exposure")) auto_exp = v->GetBool();
+    float manual_exp = 1.5f;
+    if (auto* v = C.FindCVar("r_exposure")) manual_exp = v->GetFloat();
+    push.exposure_pad[0] = auto_exp ? current_exposure_ : manual_exp;
 
     static_assert(sizeof(PtPush) == 272);
     cb->PushConstants(&push, sizeof(push));
@@ -1034,6 +1037,43 @@ void Engine::RenderFrame() {
 
     prev_view_proj_       = curr_view_proj;
     prev_view_proj_valid_ = true;
+
+    // Auto-exposure: every 8 frames, sample accum_hdr's central region
+    // and nudge the exposure scalar toward 0.18 / scene_avg_luminance.
+    // accum_hdr is shared-storage on Apple Silicon so the readback is
+    // a memcpy; we step every 16th pixel for speed (~3.6k samples on a
+    // 1280x720 frame). Smoothing factor controls eye-adaptation rate.
+    if (auto_exp && accum_texture_id_ != 0 && ++autoexpose_counter_ >= 8) {
+        autoexpose_counter_ = 0;
+        std::uint32_t w = 0, h = 0;
+        const std::size_t bytes = std::size_t(accum_w_) * accum_h_ * 16;
+        std::vector<float> rgba(bytes / sizeof(float));
+        if (device_->ReadbackTexture(pt::rhi::TextureHandle{accum_texture_id_},
+                                     rgba.data(), bytes, &w, &h) && w > 0 && h > 0) {
+            double accum_lum = 0.0;
+            std::size_t n = 0;
+            for (std::uint32_t y = 0; y < h; y += 16) {
+                for (std::uint32_t x = 0; x < w; x += 16) {
+                    const float* p = rgba.data() + (std::size_t(y) * w + x) * 4;
+                    const float lum = 0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2];
+                    if (lum > 0.0f) { accum_lum += lum; ++n; }
+                }
+            }
+            if (n > 0) {
+                const float avg_lum = float(accum_lum / double(n));
+                const float key     = 0.18f;          // middle-grey target
+                float target_exp    = key / std::max(avg_lum, 1e-3f);
+                if (target_exp < 0.05f) target_exp = 0.05f;
+                if (target_exp > 50.0f) target_exp = 50.0f;
+                // Geometric smoothing in log space gives a more
+                // perceptually uniform fade than linear lerp.
+                const float k = 0.20f;
+                current_exposure_ = std::exp(
+                    std::log(current_exposure_) * (1.0f - k) +
+                    std::log(target_exp)        * k);
+            }
+        }
+    }
 }
 
 void Engine::UpdateCamera(double dt) {
