@@ -499,6 +499,23 @@
     });
   }
 
+  // Density toggle (BMC-inspired): two settings, persisted via localStorage.
+  // Compact mode crunches scope rows so more cvars fit on screen at once;
+  // comfy is the default with normal padding.
+  const densityBtn   = document.getElementById('density-toggle');
+  const sidePanel    = document.getElementById('side-panel');
+  const applyDensity = (d) => {
+    if (sidePanel) sidePanel.setAttribute('data-density', d);
+    localStorage.setItem('demont.density', d);
+  };
+  applyDensity(localStorage.getItem('demont.density') || 'comfy');
+  if (densityBtn) {
+    densityBtn.addEventListener('click', () => {
+      const cur = sidePanel?.getAttribute('data-density') || 'comfy';
+      applyDensity(cur === 'compact' ? 'comfy' : 'compact');
+    });
+  }
+
   // Refresh names occasionally so newly-registered cvars show up.
   setInterval(refreshNames, 10_000);
 
