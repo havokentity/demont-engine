@@ -417,14 +417,19 @@
     const ok = (n) => !filter || n.toLowerCase().includes(filter);
 
     // Walk groups in alphabetical order (matches main panel ordering),
-    // emit only items that are in the pinned set.
+    // emit only items that are in the pinned set. groups now have
+    // a `subs` Map (top -> sub -> {cvars, commands}); iterate the
+    // subs to find pinned items.
     for (const g of sidePanelData.names) {
-      const items = sidePanelData.groups.get(g);
-      for (const v of items.cvars) {
-        if (pinned.has(v.name) && ok(v.name)) list.appendChild(renderCvarRow(v, fillInput));
-      }
-      for (const c of items.commands) {
-        if (pinned.has(c.name) && ok(c.name)) list.appendChild(renderCommandRow(c, fillInput));
+      const grp = sidePanelData.groups.get(g);
+      if (!grp || !grp.subs) continue;
+      for (const [, items] of grp.subs) {
+        for (const v of items.cvars) {
+          if (pinned.has(v.name) && ok(v.name)) list.appendChild(renderCvarRow(v, fillInput));
+        }
+        for (const c of items.commands) {
+          if (pinned.has(c.name) && ok(c.name)) list.appendChild(renderCommandRow(c, fillInput));
+        }
       }
     }
   }
