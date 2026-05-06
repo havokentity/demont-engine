@@ -307,6 +307,24 @@ void main(uint3 tid : SV_DispatchThreadID) {
         c += flare_intensity * flare;
     }
 
+    // Debug: when r_lens_flare_intensity is exactly negative,
+    // overlay a green crosshair at sun_uv so the user can see
+    // where the engine projects the sun. (Normal mode never sets
+    // negative intensity; engine sets a sentinel of -1.0 when
+    // dump_sun_uv_overlay = 1.)
+    if (flare_intensity < 0.0 &&
+        sun_uv.x > -1.0 && sun_uv.x < 2.0 &&
+        sun_uv.y > -1.0 && sun_uv.y < 2.0) {
+        float2 uvN = (float2(tid.xy) + 0.5) / float2(dim);
+        float2 d = (uvN - sun_uv) * float2(dim) / 2.0;
+        // 24-px arms, 2-px thick.
+        bool on_h = abs(d.y) < 1.0 && abs(d.x) < 24.0;
+        bool on_v = abs(d.x) < 1.0 && abs(d.y) < 24.0;
+        if (on_h || on_v) {
+            ldr_out[tid.xy] = float4(0.0, 1.0, 0.0, 1.0);
+            return;
+        }
+    }
     float3 ldr = (passthrough != 0u) ? c : acesTonemap(c * exposure);
     ldr_out[tid.xy] = float4(ldr, 1.0);
 }

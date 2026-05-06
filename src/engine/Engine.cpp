@@ -76,6 +76,7 @@ namespace cvar {
     PT_CVAR(r_lens_flare_threshold, "0.0", "(image mode only) Per-ghost luminance gate. 0 = no gate. 'sun' mode ignores this and draws clean sun-only flare.", CVAR_ARCHIVE);
     PT_CVAR(r_lens_flare_mode, "sun", "Lens flare algorithm. 'sun' = explicit sun-position flare: projects the sun direction to screen and draws soft Gaussian-disc ghosts at its mirrored positions (clean, no scene mirroring, the production-correct approach). 'image' = old image-based flare: mirror-samples the full bloom mip at every output pixel (looks dreamy but reflects the whole scene as flare, which isn't physically what a lens does).", CVAR_ARCHIVE);
     PT_CVAR(r_lens_flare_size, "0.04", "(sun mode) Ghost disc radius in normalised screen units. 0.02 = tight points, 0.08 = soft halos. Default 0.04 gives discrete ~4%-screen-radius discs that read as lens-flare ghosts rather than overlapping blobs.", CVAR_ARCHIVE);
+    PT_CVAR(r_debug_sun_overlay, "0", "Debug: when 1, the tonemap pass overlays a green crosshair at the engine-projected sun_uv. Useful for verifying the lens-flare projection lines up with the rendered sun. Sets r_lens_flare_intensity to a sentinel internally; remember to disable when done.", 0);
     PT_CVAR(r_exposure,        "1.5","Manual HDR exposure multiplier applied before ACES tonemap. Used when r_auto_exposure = 0.", CVAR_ARCHIVE);
     PT_CVAR(r_auto_exposure,   "1",  "Auto-exposure: 0 = use r_exposure manual value, 1 = sample accum_hdr each frame and adapt exposure toward r_exposure_target (eye-adaptation feel).", CVAR_ARCHIVE);
     PT_CVAR(r_exposure_min,    "0.05",  "Minimum exposure scalar that auto-exposure can settle on. Stops a nuclear-bright scene from being crushed below this value.", CVAR_ARCHIVE);
@@ -1512,6 +1513,13 @@ void Engine::RenderFrame() {
         const bool flare_sun_mode = (flare_mode == "sun");
         tp.flare_intensity  = (flare_on && (flare_sun_mode || bloom_ran))
                                 ? flare_int : 0.0f;
+        // Debug overlay sentinel: -1 in flare_intensity tells the
+        // shader to skip the flare loop and instead draw a green
+        // crosshair at sun_uv. Lets the user visually verify the
+        // engine-side projection.
+        bool debug_sun = false;
+        if (auto* v = C.FindCVar("r_debug_sun_overlay")) debug_sun = v->GetBool();
+        if (debug_sun) tp.flare_intensity = -1.0f;
         tp.flare_dispersion = flare_disp;
         tp.flare_count      = static_cast<std::uint32_t>(flare_count);
         tp.flare_threshold  = flare_thresh;
@@ -2222,6 +2230,9 @@ void Engine::RegisterCommands() {
     }
     if (auto* v = C.FindCVar("r_lens_flare_mode")) {
         v->allowed_values = {"sun", "image"};
+    }
+    if (auto* v = C.FindCVar("r_debug_sun_overlay")) {
+        v->allowed_values = {"0", "1"};
     }
     // Bloom + flare intensity / threshold / mips / count / dispersion
     // don't reset accumulation: they're applied in the post-tonemap
