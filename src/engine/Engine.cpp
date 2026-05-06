@@ -58,14 +58,17 @@ namespace cvar {
     PT_CVAR(r_spp,             "1",  "Samples per pixel per dispatch (>=1). Higher = cleaner motion frames at proportional GPU cost.", CVAR_ARCHIVE);
     PT_CVAR(r_denoiser,        "off","Denoiser: off|metalfx (Mac MetalFX TemporalDenoisedScaler).", CVAR_ARCHIVE);
     PT_CVAR(r_exposure,        "1.5","Manual HDR exposure multiplier applied before ACES tonemap. Bump up when scenes look washed out (denoiser-off path). MetalFX denoiser does its own auto-exposure so this is mostly a no-denoiser knob.", CVAR_ARCHIVE);
-    PT_CVAR(r_env_map,         "",   "Path to a Radiance .hdr environment map. Used when r_sky_mode = hdri.", CVAR_ARCHIVE);
+    PT_CVAR(r_env_map,         "assets/hdri/sunset.hdr",
+            "Path to a Radiance .hdr environment map. Used when r_sky_mode = hdri. "
+            "Default points at the bundled CC0 sunset HDRI; resolves relative to CWD.",
+            CVAR_ARCHIVE);
     PT_CVAR(r_env_intensity,   "1.0","Scalar multiplier on env-map samples. Useful for darkening/brightening the IBL without re-authoring the HDRI.", CVAR_ARCHIVE);
 
     // Procedural sky (Preetham-lite analytic). Used when r_sky_mode is
     // "procedural". The sun position drives both the sky colour gradient
     // and the disk; positive elevation = above horizon (day), negative =
     // below (night); azimuth in degrees, 0 = -Z (north), 90 = +X (east).
-    PT_CVAR(r_sky_mode,        "procedural", "Sky rendering: gradient (cheap fallback) | hdri (sample r_env_map) | procedural (analytic with sun position).", CVAR_ARCHIVE);
+    PT_CVAR(r_sky_mode,        "hdri", "Sky rendering: gradient (cheap fallback) | hdri (sample r_env_map) | procedural (analytic with sun position). Defaults to hdri so the bundled sunset.hdr is visible out of the box.", CVAR_ARCHIVE);
     PT_CVAR(r_sun_elevation,   "30.0", "Sun elevation in degrees above horizon (-90..90). Drives day/sunset/night blend in procedural sky.", CVAR_ARCHIVE);
     PT_CVAR(r_sun_azimuth,     "135.0","Sun azimuth in degrees (0=north, 90=east, 180=south, 270=west).", CVAR_ARCHIVE);
 
