@@ -840,15 +840,22 @@ void Engine::RenderFrame() {
     if (prim_buffer_id_ != 0) {
         cb->BindBuffer(3, pt::rhi::BufferHandle{prim_buffer_id_}, 0);
     }
-    // P11 MIS CDFs (only meaningful with env_map_present, but bind
-    // unconditionally if available so the shader's declarations stay
-    // bound to valid memory).
-    if (env_marginal_cdf_id_ != 0) {
-        cb->BindBuffer(4, pt::rhi::BufferHandle{env_marginal_cdf_id_}, 0);
-    }
-    if (env_conditional_cdf_id_ != 0) {
-        cb->BindBuffer(5, pt::rhi::BufferHandle{env_conditional_cdf_id_}, 0);
-    }
+    // P11 MIS CDFs at MSL slots 4/5. CRITICAL: always bind something
+    // here even if no env map is loaded -- the shader declares these
+    // buffers, so leaving slots 4/5 unbound shifts the dynamically-
+    // assigned push-constant slot to the wrong index (Metal computes
+    // it as max-bound + 1) and the shader reads garbage push fields
+    // -> all-black render. When env CDFs aren't available we re-use
+    // the prim_buffer as a harmless placeholder; the shader never
+    // reads from slots 4/5 when env_map_present == 0.
+    pt::rhi::BufferHandle slot4 = (env_marginal_cdf_id_ != 0)
+        ? pt::rhi::BufferHandle{env_marginal_cdf_id_}
+        : pt::rhi::BufferHandle{prim_buffer_id_};
+    pt::rhi::BufferHandle slot5 = (env_conditional_cdf_id_ != 0)
+        ? pt::rhi::BufferHandle{env_conditional_cdf_id_}
+        : pt::rhi::BufferHandle{prim_buffer_id_};
+    if (slot4.id != 0) cb->BindBuffer(4, slot4, 0);
+    if (slot5.id != 0) cb->BindBuffer(5, slot5, 0);
     // P10 G-buffer texture binds. The shader's vk::binding numbers (6/7/8)
     // are Vulkan descriptor slots; on Metal Slang assigns texture(N) in
     // declaration order, so output/accum/denoise_color/depth/motion/env

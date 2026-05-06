@@ -150,6 +150,98 @@
     renderSidePanel();
   }
 
+  // CVar flag bits (must match src/console/Console.h CVarFlag enum).
+  const CVAR_ARCHIVE  = 1 << 0;
+  const CVAR_READONLY = 1 << 1;
+  const CVAR_CHEAT    = 1 << 2;
+
+  // Build an interactive row for a cvar. Detects the cvar's "shape"
+  // from its allowed_values + flags and chooses the right widget:
+  //   - read-only   -> static value text
+  //   - allowed = ["0","1"]              -> toggle switch
+  //   - allowed_values.length >= 2       -> <select> dropdown
+  //   - no allowed_values, value is num  -> number input
+  //   - everything else                  -> text input
+  // Setting the widget value writes the cvar via the WS exec channel.
+  function renderCvarRow(v, fillInput) {
+    const row = document.createElement('div');
+    row.className = 'kv';
+    if (v.description) row.title = v.description;
+
+    // Name (clickable to prefill the main input -- preserves the prior
+    // "tap to inspect" UX even now that there's an inline editor).
+    const k = document.createElement('span');
+    k.className = 'k';
+    k.textContent = v.name;
+    k.addEventListener('click', () => fillInput(v.name));
+    row.appendChild(k);
+
+    const setCvar = (newVal) => {
+      send({ type: 'exec', line: `${v.name} ${newVal}` });
+      v.value = String(newVal);   // optimistic; will be re-synced on next refresh
+    };
+
+    const flags = (v.flags || 0) >>> 0;
+    const isReadOnly = (flags & CVAR_READONLY) !== 0;
+    const allowed = v.allowed_values || [];
+    const isBoolean =
+      allowed.length === 2 &&
+      ((allowed[0] === '0' && allowed[1] === '1') ||
+       (allowed[0] === '1' && allowed[1] === '0'));
+
+    let widget;
+    if (isReadOnly) {
+      widget = document.createElement('span');
+      widget.className = 'v v-readonly';
+      widget.textContent = v.value;
+    } else if (isBoolean) {
+      widget = document.createElement('div');
+      widget.className = 'v toggle' + (v.value === '1' ? ' on' : '');
+      widget.setAttribute('role', 'switch');
+      widget.setAttribute('aria-checked', v.value === '1' ? 'true' : 'false');
+      widget.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const next = (v.value === '1') ? '0' : '1';
+        widget.classList.toggle('on', next === '1');
+        widget.setAttribute('aria-checked', next === '1' ? 'true' : 'false');
+        setCvar(next);
+      });
+    } else if (allowed.length >= 2) {
+      widget = document.createElement('select');
+      widget.className = 'v v-select';
+      for (const opt of allowed) {
+        const o = document.createElement('option');
+        o.value = opt; o.textContent = opt;
+        if (opt === v.value) o.selected = true;
+        widget.appendChild(o);
+      }
+      widget.addEventListener('change', (e) => {
+        e.stopPropagation();
+        setCvar(widget.value);
+      });
+      widget.addEventListener('click', (e) => e.stopPropagation());
+    } else {
+      // Free-form: text input that commits on Enter or blur.
+      widget = document.createElement('input');
+      widget.type  = 'text';
+      widget.className = 'v v-input';
+      widget.value = v.value;
+      widget.spellcheck = false;
+      widget.autocomplete = 'off';
+      const commit = () => {
+        if (widget.value !== v.value) setCvar(widget.value);
+      };
+      widget.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { commit(); widget.blur(); }
+        if (e.key === 'Escape') { widget.value = v.value; widget.blur(); }
+      });
+      widget.addEventListener('blur',  commit);
+      widget.addEventListener('click', (e) => e.stopPropagation());
+    }
+    row.appendChild(widget);
+    return row;
+  }
+
   // Re-render the side panel using `sidePanelData` and the current
   // search filter. Filter is a case-insensitive substring match against
   // the cvar / command name; groups whose items all get filtered out
@@ -178,12 +270,7 @@
       cvarsPanel.appendChild(head);
 
       for (const v of cvarsHere) {
-        const row = document.createElement('div');
-        row.className = 'kv';
-        row.title = v.description || '';
-        row.innerHTML = `<span class="k">${escape(v.name)}</span><span class="v">${escape(v.value)}</span>`;
-        row.addEventListener('click', () => fillInput(v.name));
-        cvarsPanel.appendChild(row);
+        cvarsPanel.appendChild(renderCvarRow(v, fillInput));
       }
       for (const cmd of cmdsHere) {
         const row = document.createElement('div');
