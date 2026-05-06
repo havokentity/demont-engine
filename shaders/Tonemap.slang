@@ -144,19 +144,30 @@ void main(uint3 tid : SV_DispatchThreadID) {
             // value means "no flare".
             if (sun_uv.x > -1.0 && sun_uv.x < 2.0 &&
                 sun_uv.y > -1.0 && sun_uv.y < 2.0) {
+                // Aspect-correct distance: normalised UV is [0,1]x[0,1]
+                // regardless of physical pixel count. A 16:9 screen
+                // has 1.78x more pixels along X than Y, so 1 unit
+                // of UV-X is geometrically *shorter* on screen than
+                // 1 unit of UV-Y. Distance in raw UV = ellipse on
+                // screen. Scale Y up by aspect so distance is in
+                // X-screen-units, giving circular discs.
+                float aspect = float(dim.x) / max(float(dim.y), 1.0);
                 for (uint gi = 0u; gi < n; ++gi) {
                     float scale = kScales[gi];
                     // Ghost centre = mirror sun across screen centre,
                     // scaled. scale=1 places it exactly opposite the
                     // sun; <1 closer to centre; >1 past centre.
                     float2 ghost_c = 0.5 - (sun_uv - 0.5) * scale;
-                    float2 d = uv - ghost_c;
-                    // Slight per-ghost size variation -- close-in
-                    // ghosts a touch tighter, far ones a touch
-                    // wider. Much smaller variation than before
-                    // (was 0.4..2.4x); the previous spread made
-                    // far ghosts ~5x bigger than the sun and they
-                    // overlapped into one big blob.
+                    float2 d_uv = uv - ghost_c;
+                    // Stretch Y by aspect -> the metric is now in
+                    // "X-equivalents" so a unit-radius circle in
+                    // (d_uv.x, d_uv.y * aspect) is a real circle
+                    // on screen.
+                    float2 d = float2(d_uv.x, d_uv.y * aspect);
+                    // Slight per-ghost size variation. flare_size is
+                    // measured in UV-X units (which == screen-X
+                    // fraction since UV-X already spans the full
+                    // physical width).
                     float r = flare_size * (0.7 + 0.3 * scale);
                     // Chromatic aberration: each channel gets a
                     // slightly different radius -> coloured fringe
@@ -165,26 +176,20 @@ void main(uint3 tid : SV_DispatchThreadID) {
                     float r_G = r;
                     float r_B = r * (1.0 - flare_dispersion * 8.0);
                     float d2 = dot(d, d);
-                    // Super-Gaussian (exp(-(d/r)^4)) instead of
-                    // plain Gaussian. Sharper edges, the ghost
-                    // reads as a discrete disc with a clean
-                    // boundary rather than a wide soft blob that
-                    // bleeds into its neighbours.
+                    // Super-Gaussian (exp(-(d/r)^4)) for a clean
+                    // disc edge instead of a soft halo bleed.
                     float qR = d2 / max(r_R * r_R, 1e-6);
                     float qG = d2 / max(r_G * r_G, 1e-6);
                     float qB = d2 / max(r_B * r_B, 1e-6);
                     float i_R = exp(-qR * qR);
                     float i_G = exp(-qG * qG);
                     float i_B = exp(-qB * qB);
-                    // Sun-mode ghost peak boost. With the tighter
-                    // discs the per-pixel area is much smaller, so
-                    // a smaller boost (4x vs 8x earlier) reads
-                    // correctly against typical flare_intensity
-                    // values (0.1-0.3).
                     float3 ghost = float3(i_R, i_G, i_B) * kTints[gi] * 4.0;
-                    // Radial fade so ghosts fall off near the
-                    // edge of the screen (real lens vignette).
-                    float fade = saturate(1.0 - length(uv - 0.5) * 1.2);
+                    // Radial fade also wants aspect correction so
+                    // the vignette is circular not elliptical.
+                    float2 cd = float2((uv.x - 0.5),
+                                       (uv.y - 0.5) * aspect);
+                    float fade = saturate(1.0 - length(cd) * 1.2);
                     flare += ghost * fade;
                 }
                 c += flare_intensity * flare;
