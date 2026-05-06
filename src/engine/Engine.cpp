@@ -1496,8 +1496,15 @@ void Engine::RenderFrame() {
             float        flare_threshold;
             std::uint32_t flare_mode_sun;   // 1 = explicit sun-position flare
             float        flare_size;        // sun mode: ghost disc base radius
-            float        sun_uv[2];         // sun's screen UV
-            float        pad;
+            // CRITICAL: 4-byte alignment padding so the following
+            // float2 sun_uv lands at an 8-byte boundary on Metal.
+            // Without this, the MSL compiler inserts implicit padding
+            // before float2 -- but the C++ side doesn't, so the
+            // shader reads bytes from the wrong offset (got
+            // sun_uv = (engine.y, 0), making the crosshair stick to
+            // the top-left edge regardless of where the sun is).
+            float        _pad_sun_align;
+            float        sun_uv[2];         // 8-byte aligned; matches MSL float2
         } tp{};
         tp.exposure         = push.exposure_pad[0];
         tp.passthrough      = hdr_pipeline ? 0u : 1u;
