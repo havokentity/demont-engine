@@ -2039,6 +2039,52 @@ void Engine::RegisterCommands() {
     // CPU BVH or a GPU depth_tex read-back). In practice the default
     // scene uses analytic primitives so this works for the common
     // case; extend later when mesh-aware focus matters.
+    C.RegisterCommand("dump_sun_uv",
+        "Print where the engine thinks the sun lands on screen "
+        "(used by r_lens_flare_mode = sun). Sentinel like (-2, -2) "
+        "means the sun is behind the camera.",
+        [this](auto, pt::console::Output& out) {
+            if (!camera_) { out.PrintLine("no camera"); return; }
+            const auto& cam = *camera_;
+            const glm::vec3 fwd   = cam.Forward();
+            const glm::vec3 right = cam.Right();
+            const glm::vec3 up    = cam.Up();
+            auto& C2 = pt::console::Console::Get();
+            float elev = 0.0f, azim = 0.0f;
+            if (auto* v = C2.FindCVar("r_sun_elevation")) elev = v->GetFloat();
+            if (auto* v = C2.FindCVar("r_sun_azimuth"))   azim = v->GetFloat();
+            float er = glm::radians(elev), ar = glm::radians(azim);
+            glm::vec3 sun{
+                std::cos(er) * std::sin(ar),
+                std::sin(er),
+                -std::cos(er) * std::cos(ar),
+            };
+            float fwd_dot = glm::dot(sun, fwd);
+            float ft = cam.FovYTan();
+            float aspect = 16.0f / 9.0f;
+            if (auto* v = C2.FindCVar("app_window_width")) {
+                int w = v->GetInt();
+                if (auto* h = C2.FindCVar("app_window_height")) {
+                    int hh = h->GetInt();
+                    if (hh > 0) aspect = float(w) / float(hh);
+                }
+            }
+            if (fwd_dot <= 1e-3f) {
+                out.FormatLine("sun is behind/sideways: fwd_dot={:.3f} (sentinel)",
+                               fwd_dot);
+                return;
+            }
+            float xs = (glm::dot(sun, right) / fwd_dot) / (ft * aspect);
+            float ys = (glm::dot(sun, up)    / fwd_dot) / ft;
+            float ux = xs * 0.5f + 0.5f;
+            float uy = -ys * 0.5f + 0.5f;
+            out.FormatLine("sun_dir=({:.3f},{:.3f},{:.3f}) "
+                           "fwd_dot={:.3f} screen_uv=({:.3f},{:.3f}) {}",
+                           sun.x, sun.y, sun.z, fwd_dot, ux, uy,
+                           (ux >= 0 && ux <= 1 && uy >= 0 && uy <= 1)
+                               ? "(on-screen)" : "(off-screen)");
+        });
+
     C.RegisterCommand("dof_focus_here",
         "Auto-focus DOF on whatever's at the centre of the screen. "
         "Writes the hit distance into r_dof_focal_distance and turns "

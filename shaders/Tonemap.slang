@@ -165,7 +165,13 @@ void main(uint3 tid : SV_DispatchThreadID) {
                     float i_R = exp(-d2 / max(r_R * r_R, 1e-6));
                     float i_G = exp(-d2 / max(r_G * r_G, 1e-6));
                     float i_B = exp(-d2 / max(r_B * r_B, 1e-6));
-                    float3 ghost = float3(i_R, i_G, i_B) * kTints[gi];
+                    // Boost ghost peak so flare_intensity tunes the
+                    // SAME way as image mode (where bloom samples
+                    // are 5-10x brighter than 1.0 by themselves).
+                    // Without this multiplier sun-mode discs are
+                    // ~5x dimmer than image-mode at the same
+                    // r_lens_flare_intensity value.
+                    float3 ghost = float3(i_R, i_G, i_B) * kTints[gi] * 8.0;
                     // Radial fade so ghosts fall off near the
                     // edge of the screen (real lens vignette).
                     float fade = saturate(1.0 - length(uv - 0.5) * 1.2);
