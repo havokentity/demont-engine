@@ -1834,6 +1834,63 @@ void Engine::RegisterCommands() {
             out.PrintLine("opening web console...");
         });
 
+    // Auto-focus: trace a ray through the screen centre and write the
+    // hit distance into r_dof_focal_distance. Like tap-to-focus on a
+    // phone camera. CPU-side intersection against the analytic
+    // primitives only -- mesh hits aren't checked yet (would need a
+    // CPU BVH or a GPU depth_tex read-back). In practice the default
+    // scene uses analytic primitives so this works for the common
+    // case; extend later when mesh-aware focus matters.
+    C.RegisterCommand("dof_focus_here",
+        "Auto-focus DOF on whatever's at the centre of the screen. "
+        "Writes the hit distance into r_dof_focal_distance and turns "
+        "r_dof on if it wasn't already.",
+        [this](auto args, pt::console::Output& out) {
+            (void)args;
+            if (!camera_) { out.PrintLine("no camera"); return; }
+            const auto& cam = *camera_;
+            const glm::vec3 ro = cam.pos;
+            const glm::vec3 rd = cam.Forward();   // already unit length
+
+            float best_t = 1e30f;
+            for (const auto& [id, p] : primitives_) {
+                float t = best_t;
+                if (p.type == AnalyticPrim::Sphere) {
+                    // Standard ray-sphere intersection.
+                    glm::vec3 c{p.pos_or_n[0], p.pos_or_n[1], p.pos_or_n[2]};
+                    glm::vec3 oc = ro - c;
+                    float b = glm::dot(oc, rd);
+                    float disc = b * b - (glm::dot(oc, oc) - p.radius_or_d * p.radius_or_d);
+                    if (disc < 0.0f) continue;
+                    float sq = std::sqrt(disc);
+                    float t0 = -b - sq;
+                    float t1 = -b + sq;
+                    t = (t0 > 1e-3f) ? t0 : ((t1 > 1e-3f) ? t1 : best_t);
+                } else { // Plane
+                    glm::vec3 n{p.pos_or_n[0], p.pos_or_n[1], p.pos_or_n[2]};
+                    float ndotd = glm::dot(n, rd);
+                    if (std::fabs(ndotd) < 1e-6f) continue;
+                    float th = -(glm::dot(n, ro) + p.radius_or_d) / ndotd;
+                    if (th > 1e-3f) t = th;
+                }
+                if (t < best_t) best_t = t;
+            }
+
+            if (best_t >= 1e29f) {
+                out.PrintLine("dof_focus_here: nothing in the centre of the "
+                              "frame (no analytic primitive hit). Mesh hits "
+                              "aren't checked yet.");
+                return;
+            }
+
+            auto& C2 = pt::console::Console::Get();
+            C2.SetCVarOverride("r_dof_focal_distance", std::to_string(best_t));
+            C2.SetCVarOverride("r_dof", "1");
+            accum_dirty_ = true;
+            out.FormatLine("dof_focus_here: focal distance set to {:.3f} (r_dof on)",
+                           best_t);
+        });
+
     C.RegisterCommand("toggle",
         "toggle <cvar>: cycle a cvar through its allowed_values (great for A/B testing).",
         [](auto args, pt::console::Output& out) {
