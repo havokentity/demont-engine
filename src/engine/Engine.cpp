@@ -115,7 +115,7 @@ bool Engine::Init() {
     int win_w = ww ? ww->GetInt() : 1280;
     int win_h = wh ? wh->GetInt() : 720;
     window_ = std::make_unique<pt::app::Window>();
-    if (!window_->Create(win_w, win_h, "DeMonT PathTracer")) {
+    if (!window_->Create(win_w, win_h, "DeMonT Engine")) {
         LOG_ERROR("Failed to open window");
         return false;
     }

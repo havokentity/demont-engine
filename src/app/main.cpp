@@ -61,10 +61,10 @@ void PrintBootLogo() {
     fmt::print(stderr, "        {CD}░▒▓{CY}██████████{CD}▓▒░{RS}\n",
                fmt::arg("CY", CY), fmt::arg("CD", CD), fmt::arg("RS", RS));
     fmt::print(stderr, "\n");
-    fmt::print(stderr, "  {WT}DeMonT{RS} {CY}PathTracer{RS}   {DM}v0.1.0{RS}\n",
+    fmt::print(stderr, "  {WT}DeMonT{RS} {CY}Engine{RS}   {DM}v0.1.0{RS}\n",
                fmt::arg("WT", WT), fmt::arg("CY", CY),
                fmt::arg("DM", DM), fmt::arg("RS", RS));
-    fmt::print(stderr, "  {DM}De Monte Carlo-esque Tracer{RS}\n",
+    fmt::print(stderr, "  {DM}De Monte Carlo-esque Tracer (no rasterizer){RS}\n",
                fmt::arg("DM", DM), fmt::arg("RS", RS));
     fmt::print(stderr, "\n");
 }

@@ -149,7 +149,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // ---- Instance ------------------------------------------------------
     VkApplicationInfo ai{};
     ai.sType            = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    ai.pApplicationName = "DeMonT PathTracer";
+    ai.pApplicationName = "DeMonT Engine";
     ai.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
     ai.pEngineName      = "DeMonT";
     ai.apiVersion       = VK_API_VERSION_1_2;

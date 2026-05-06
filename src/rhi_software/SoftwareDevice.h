@@ -82,7 +82,7 @@ public:
 
     BackendType  Type()             const override { return BackendType::Software; }
     bool         SupportsHardwareRT() const override { return false; }
-    const char*  DeviceName()       const override { return "PathTracer Software (CPU)"; }
+    const char*  DeviceName()       const override { return "DeMonT Software (CPU)"; }
     std::size_t  CurrentAllocatedBytes() const override;
 
     void StashClear(float r, float g, float b, float a);

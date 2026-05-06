@@ -405,7 +405,7 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
         [self appendBannerLine:row[1] level:row[0]];
     }
     [self appendLine:@"" level:@"info"];
-    [self appendLine:@"DeMonT PathTracer · v0.1.0  ·  De Monte Carlo-esque Tracer"
+    [self appendLine:@"DeMonT Engine · v0.1.0  ·  non-rasterized · path-traced"
               level:@"out"];
     self.bannerEndLocation = self.outputView.textStorage.length;
     [self appendLine:@"console attached. type \"list_commands\" or hit Tab."
@@ -462,7 +462,7 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     NSAttributedString* blank = lineAttr(@"", p.info);
     [ts insertAttributedString:blank atIndex:insertAt];
     insertAt += blank.length;
-    NSAttributedString* tag = lineAttr(@"DeMonT PathTracer · v0.1.0  ·  De Monte Carlo-esque Tracer", p.out);
+    NSAttributedString* tag = lineAttr(@"DeMonT Engine · v0.1.0  ·  non-rasterized · path-traced", p.out);
     [ts insertAttributedString:tag atIndex:insertAt];
     insertAt += tag.length;
     [ts endEditing];

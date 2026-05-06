@@ -320,7 +320,7 @@
       for (const [kind, ln] of banner) {
         block += `<div class="banner-${kind}">${escape(ln)}</div>`;
       }
-      block += `<div class="banner-tag">DeMonT PathTracer · v0.1.0 · De Monte Carlo-esque Tracer</div>`;
+      block += `<div class="banner-tag">DeMonT Engine · v0.1.0 · non-rasterized · path-traced</div>`;
       block += `<div class="out"><span class="ts">${ts()}</span>console attached. type "list_commands", "sys_info", or hit Tab to complete.</div>`;
       append(block);
       await refreshNames();

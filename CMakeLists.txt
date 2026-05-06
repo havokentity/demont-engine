@@ -12,7 +12,7 @@ endif()
 
 project(demont
     VERSION 0.1.0
-    DESCRIPTION "DeMonT PathTracer -- De Monte Carlo-esque Tracer (real-time GPU path tracer with mesh CSG)"
+    DESCRIPTION "DeMonT Engine -- non-rasterized real-time game engine for Apple Silicon (path-traced, mesh CSG, MetalFX denoiser)"
     LANGUAGES C CXX
 )
 
