@@ -182,16 +182,41 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 b3 = lerp(lerp(c00, c10, t.x), lerp(c01, c11, t.x), t.y);
             }
             float3 ghost = float3(r3.r, g3.g, b3.b);
-            // Per-ghost luminance gate. Real lens coatings absorb
-            // low-amplitude reflections; only sources bright enough
-            // to overwhelm them produce visible ghosts. We emulate
-            // by killing bloom samples whose luminance falls below
-            // flare_threshold (with a smoothstep knee for a soft
-            // transition rather than a hard cliff).
-            float lum = dot(ghost, float3(0.2126, 0.7152, 0.0722));
-            float gate_knee = max(flare_threshold * 0.25, 0.1);
-            float gate = smoothstep(flare_threshold,
-                                    flare_threshold + gate_knee, lum);
+            // Optional source-luminance gate. CRUCIAL: we measure
+            // luminance against the *original* hdr_in at the ghost's
+            // position, not the post-pyramid bloom sample. The
+            // bloom-chain upsample stage amplifies values (each mip
+            // adds the upper mip's halo into the lower one) so a
+            // moderately bright source ends up at higher luminance
+            // in bloom mip 0 than its original brightness -- gating
+            // against the bloom sample lets things slip through that
+            // shouldn't. Sampling hdr_in at the same ghost UV gives
+            // the truthful "is this position actually the sun?" gate.
+            float gate = 1.0;
+            if (flare_threshold > 0.0) {
+                int2 idim = int2(dim);
+                float2 fb = g_uv_g * float2(dim) - 0.5;
+                int2 i0 = int2(floor(fb));
+                float2 t = frac(fb);
+                int2 p00 = clamp(i0,             int2(0,0), idim - int2(1,1));
+                int2 p10 = clamp(i0 + int2(1,0), int2(0,0), idim - int2(1,1));
+                int2 p01 = clamp(i0 + int2(0,1), int2(0,0), idim - int2(1,1));
+                int2 p11 = clamp(i0 + int2(1,1), int2(0,0), idim - int2(1,1));
+                float3 s00 = hdr_in[uint2(p00)].rgb;
+                float3 s10 = hdr_in[uint2(p10)].rgb;
+                float3 s01 = hdr_in[uint2(p01)].rgb;
+                float3 s11 = hdr_in[uint2(p11)].rgb;
+                float3 src = lerp(lerp(s00, s10, t.x),
+                                  lerp(s01, s11, t.x), t.y);
+                float src_lum = dot(src, float3(0.2126, 0.7152, 0.0722));
+                // Reinhard-style soft gate: smoothly rolls off below
+                // threshold without a hard cliff (preserves the
+                // pretty halo softness on the things that *do*
+                // pass). Sun at lum=30 with threshold=5 -> gate=0.86;
+                // moderate spec at lum=3 -> gate=0.375; dim wall at
+                // lum=0.5 -> gate=0.09.
+                gate = src_lum / (src_lum + flare_threshold);
+            }
             // Radial fade: ghosts fade out as they near the screen
             // edge so we don't get a hard rectangle of flare on
             // wide-aperture shots.
