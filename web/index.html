@@ -45,6 +45,7 @@
       <input id="input" type="text" placeholder='sys_info  ·  mem_report  ·  Tab to complete' spellcheck="false" autofocus>
     </form>
   </section>
+  <div id="panel-resize" class="panel-resize" title="Drag to resize"></div>
   <aside class="panel" id="side-panel" data-mode="modern">
     <div class="panel-head">
       <span>scope</span>
@@ -52,13 +53,21 @@
       <button id="mode-toggle"    class="density-btn" title="Toggle classic / modern view">▦</button>
       <button id="density-toggle" class="density-btn" title="Toggle compact / comfy density">⇅</button>
     </div>
-    <nav id="side-tabs" class="side-tabs">
-      <button class="side-tab active" data-tab="pinned">★ pinned</button>
-      <button class="side-tab"        data-tab="cvars">cvars</button>
-      <button class="side-tab"        data-tab="commands">commands</button>
-      <button class="side-tab"        data-tab="stats">stats</button>
-    </nav>
-    <div id="cvars" class="kv-list"></div>
+    <div class="panel-body">
+      <section class="pinned-col">
+        <div class="col-head">★ pinned</div>
+        <div id="pinned-list" class="kv-list pinned-list"></div>
+      </section>
+      <div id="inner-resize" class="inner-resize" title="Drag to resize pinned column"></div>
+      <section class="tabs-col">
+        <nav id="side-tabs" class="side-tabs">
+          <button class="side-tab active" data-tab="cvars">cvars</button>
+          <button class="side-tab"        data-tab="commands">commands</button>
+          <button class="side-tab"        data-tab="stats">stats</button>
+        </nav>
+        <div id="cvars" class="kv-list"></div>
+      </section>
+    </div>
   </aside>
 </main>
 <script src="/console.js"></script>

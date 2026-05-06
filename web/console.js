@@ -14,10 +14,13 @@
   let sidePanelData = null;
 
   // Tab + mode + pinned state. All persisted in localStorage.
-  //   mode    : "modern" (tabs) or "classic" (single scrollable list)
-  //   activeTab : one of pinned | cvars | commands | stats (modern only)
-  //   pinned  : Set<string> of cvar/command names
-  let activeTab = localStorage.getItem('demont.activeTab') || 'pinned';
+  //   mode      : "modern" (split + tabs) or "classic" (single scrollable list)
+  //   activeTab : one of cvars | commands | stats (modern only;
+  //               pinned is its own always-visible left column now,
+  //               not a tab)
+  //   pinned    : Set<string> of cvar/command names
+  let activeTab = localStorage.getItem('demont.activeTab') || 'cvars';
+  if (activeTab === 'pinned') activeTab = 'cvars';   // migrate old pref
   const pinned  = new Set(JSON.parse(localStorage.getItem('demont.pinned') || '[]'));
   const savePinned = () =>
     localStorage.setItem('demont.pinned', JSON.stringify(Array.from(pinned)));
@@ -298,27 +301,29 @@
     return row;
   }
 
-  // Render a flat (no grouping) list of pinned cvars + commands.
-  function renderPinned(fillInput) {
-    if (pinned.size === 0) {
-      const empty = document.createElement('div');
-      empty.className = 'grp-head';
-      empty.textContent = 'pin items via the ☆ button';
-      cvarsPanel.appendChild(empty);
-      return;
-    }
+  // Render the persistent "★ pinned" column on the left of the panel
+  // body in modern mode. Always shown alongside whatever tab is active.
+  // In classic mode this column is hidden via CSS, but we still keep
+  // it in sync (cheap) so toggling modes doesn't lose state.
+  function renderPinnedColumn(fillInput) {
+    const list = document.getElementById('pinned-list');
+    if (!list) return;
+    list.innerHTML = '';
     if (!sidePanelData) return;
-    const allCvars = [];
-    const allCmds  = [];
-    for (const g of sidePanelData.names) {
-      const items = sidePanelData.groups.get(g);
-      for (const v of items.cvars)    if (pinned.has(v.name))    allCvars.push(v);
-      for (const c of items.commands) if (pinned.has(c.name))    allCmds.push(c);
-    }
     const filter = (sideSearch && sideSearch.value || '').trim().toLowerCase();
     const ok = (n) => !filter || n.toLowerCase().includes(filter);
-    for (const v of allCvars) if (ok(v.name)) cvarsPanel.appendChild(renderCvarRow(v, fillInput));
-    for (const c of allCmds)  if (ok(c.name)) cvarsPanel.appendChild(renderCommandRow(c, fillInput));
+
+    // Walk groups in alphabetical order (matches main panel ordering),
+    // emit only items that are in the pinned set.
+    for (const g of sidePanelData.names) {
+      const items = sidePanelData.groups.get(g);
+      for (const v of items.cvars) {
+        if (pinned.has(v.name) && ok(v.name)) list.appendChild(renderCvarRow(v, fillInput));
+      }
+      for (const c of items.commands) {
+        if (pinned.has(c.name) && ok(c.name)) list.appendChild(renderCommandRow(c, fillInput));
+      }
+    }
   }
 
   // Render the live engine telemetry tab.
@@ -373,12 +378,12 @@
       input.setSelectionRange(input.value.length, input.value.length);
     };
 
+    // The persistent left column shows pinned items in modern mode.
+    // Always re-render it -- cost is trivial and keeps it in sync.
+    renderPinnedColumn(fillInput);
+
     if (mode === 'modern' && activeTab === 'stats') {
       renderStats();
-      return;
-    }
-    if (mode === 'modern' && activeTab === 'pinned') {
-      renderPinned(fillInput);
       return;
     }
 
@@ -660,6 +665,51 @@
   };
   sideTabs.forEach(t => t.addEventListener('click', () => setActiveTab(t.dataset.tab)));
   setActiveTab(activeTab);   // sync visual state on first load
+
+  // -- Drag-to-resize: panel boundary + pinned/tabs split inside the panel.
+  // Both store their last width in localStorage and apply it on load
+  // via CSS custom properties. The drag handler updates the same
+  // property so the layout reflows live.
+  const setupResize = (handleId, cssVar, storageKey, defaultPx, minPx, maxPx, getStartFromEvent) => {
+    const handle = document.getElementById(handleId);
+    if (!handle) return;
+    const stored = parseInt(localStorage.getItem(storageKey) || defaultPx, 10);
+    document.documentElement.style.setProperty(cssVar, stored + 'px');
+
+    let dragging = false;
+    let startX = 0, startW = 0;
+    handle.addEventListener('mousedown', (e) => {
+      dragging = true;
+      startX = e.clientX;
+      startW = parseInt(getComputedStyle(document.documentElement).getPropertyValue(cssVar), 10) || stored;
+      handle.classList.add('dragging');
+      document.body.style.cursor = 'col-resize';
+      document.body.style.userSelect = 'none';
+      e.preventDefault();
+    });
+    window.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      const dx = getStartFromEvent(e, startX);
+      let w = startW + dx;
+      w = Math.max(minPx, Math.min(maxPx, w));
+      document.documentElement.style.setProperty(cssVar, w + 'px');
+    });
+    window.addEventListener('mouseup', () => {
+      if (!dragging) return;
+      dragging = false;
+      handle.classList.remove('dragging');
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      const w = parseInt(getComputedStyle(document.documentElement).getPropertyValue(cssVar), 10);
+      if (w) localStorage.setItem(storageKey, String(w));
+    });
+  };
+  // Outer panel resize: dragging LEFT widens the panel. Inverted dx.
+  setupResize('panel-resize', '--side-panel-w', 'demont.panelW',
+              480, 280, 900, (e, sx) => sx - e.clientX);
+  // Inner column resize: dragging RIGHT widens the pinned column.
+  setupResize('inner-resize', '--pinned-col-w', 'demont.pinnedW',
+              180, 100, 500, (e, sx) => e.clientX - sx);
 
   // Refresh names occasionally so newly-registered cvars show up.
   setInterval(refreshNames, 10_000);
