@@ -290,4 +290,25 @@ void Console::EnumerateCommands(std::string_view prefix,
     }
 }
 
+int Console::SaveArchivedCvars(const std::string& path) {
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f.is_open()) return -1;
+
+    f << "// DeMonT Engine -- archived cvars (auto-generated on quit)\n";
+    f << "// Hand edits get overwritten on the next clean exit.\n\n";
+
+    int n = 0;
+    for (auto& [name, cv] : cvars_) {
+        if ((cv.flags & CVAR_ARCHIVE) == 0) continue;
+        if (cv.value == cv.default_value)   continue;       // don't bloat with defaults
+        const bool needs_quotes = (cv.value.find(' ') != std::string::npos);
+        f << cv.name << ' ';
+        if (needs_quotes) f << '"' << cv.value << '"';
+        else              f << cv.value;
+        f << '\n';
+        ++n;
+    }
+    return n;
+}
+
 }  // namespace pt::console

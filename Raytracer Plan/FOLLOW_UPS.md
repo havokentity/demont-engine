@@ -7,18 +7,104 @@ by priority.
 
 ---
 
-## P10: MetalFX TemporalDenoisedScaler — Mac path
+## Engine vision: soft-body + voxel destruction (post-P11)
 
-**Status:** `r_denoiser` cvar exists (`off | metalfx`) but only `off`
-is wired today. `r_spp` cvar exists for super-sampling-per-dispatch as
-a stopgap (set `r_spp 4` for cleaner motion frames at 4x GPU cost).
+**Status:** A coherent identity for "non-rasterized real-time game engine"
+that the path tracer is a perfect rendering substrate for. Three pillars:
 
-**Why deferred from this session:** correct integration requires a
-G-buffer (depth + motion vectors), prev-frame camera tracking, and an
-ObjC++ shim around `MetalFX.framework`. Half-baked it produces ghosting
-artifacts that are hard to debug. Leaving it for a focused session.
+1. **Path-traced beautiful soft balls.** XPBD (Extended Position-Based
+   Dynamics, Müller et al. 2016) for cloth, ropes, jelly, soft-bodied
+   characters. Modern Verlet's successor — same integration scheme +
+   constraint projection (distance, volume, bending, shape-matching).
+   Mesh BLAS rebuild/refit each frame; path tracing already handles the
+   subsurface-y look of squishy materials beautifully.
 
-**Implementation checklist:**
+2. **BeamNG-style continuous deformation.** Node-and-beam soft body for
+   vehicles. Each car is a 3D mesh of mass nodes connected by stiff
+   beams with breakage thresholds. When a beam breaks, the structure
+   permanently deforms — *no scripted destruction, no pre-fractured
+   meshes*. Path tracer just sees an updated triangle mesh per frame.
+
+3. **Teardown-style voxel destruction.** Voxelized destructible objects
+   ray-trace via DDA (a perfect axis-aligned grid is the cheapest
+   acceleration structure). Destruction = `voxel[i] = 0`. Stress
+   propagation across voxel chunks gives the "structural integrity
+   collapses when too much support is gone" behaviour. Rigid chunks
+   that detach become physics objects (Jolt later).
+
+**Why no rasterizer is the headline:** all three of these techniques
+benefit hugely from path tracing's natural handling of arbitrary
+geometry, secondary rays, and HDR lighting. Voxels in particular are
+*better* in a path tracer than a rasterizer because there's no
+rasterization-cost penalty for millions of small primitives — just a
+DDA traversal cost that scales with effective surface area.
+
+**Order of operations when picked up:**
+
+1. **Voxel module + ray-trace path** (no physics yet). DDA traversal
+   shader, sparse 3D grid representation, brick / chunk layout.
+2. **XPBD soft-body solver** as a separate `pt::physics::Xpbd` module.
+   Tested first against a hanging cloth, then a bouncing jelly cube.
+3. **Voxel destruction**: stress graph over voxel chunks, fracture on
+   threshold, freed chunks become rigid bodies.
+4. **BeamNG-style node+beam solver** for vehicles, on top of XPBD.
+5. **Jolt** for general rigid contact + raycasting. Bridges the gap
+   between voxel chunks (rigid post-fracture) and the wider physics
+   world. Last priority — Jolt's main strength is fast general rigid
+   contact, which we don't need until we have a mature scene.
+
+**Why Jolt over PhysX (when we get there):** Jolt is BSD, ~2× faster
+on modern multicore CPUs (it's what Horizon Forbidden West uses).
+PhysX 5 closed some of the gap with its newer solver but Jolt still
+wins on raw throughput, plus it has cleaner licensing.
+
+---
+
+## P11 remainder: HDRI env maps + MIS
+
+**Status:** P11 partially landed (cvar persistence + scene_save/load).
+The remaining items are bigger lifts that need shader work and a tiny
+bit of CPU-side math.
+
+**HDRI environment map (image-based lighting):**
+- Load a `.hdr` lat-long image (Radiance RGBE format, well-documented).
+- Upload as RGBA32F texture, sample by direction → spherical UV.
+- Replace the fixed `skyColor()` lerp in `PathTrace.slang` with a sample
+  from the env map when one is bound.
+- Importance sampling: build a luminance CDF (1D rows + 2D total) on
+  CPU at load time so direct-light samples bias toward bright sky regions.
+- New cvar `r_env_map <path>` (CVAR_ARCHIVE) + `r_env_intensity`.
+
+**MIS (multiple importance sampling) for direct lighting:**
+- Sample two distributions per shading point: BRDF and lights. Weight
+  via the balance heuristic to combine without bias.
+- Lights are the env map (sampled via the CDF above) and any explicit
+  area lights. Right now we have no lights — env map is the whole
+  source.
+- Visibility ray to the sampled direction; add `throughput * Le * BRDF *
+  cos / (pdf_brdf + pdf_light)` per the heuristic.
+- This noticeably reduces variance on Lambert + rough metal surfaces.
+
+**Acceptance:** loading a Sunny Day HDRI and rendering the default
+scene at 1 spp with `r_denoiser metalfx` should look photographically
+clean within seconds. Try `r_env_map assets/sunny.hdr` — the gold
+sphere should pick up sky reflection convincingly.
+
+---
+
+## P10: MetalFX TemporalDenoisedScaler — Mac path  ✓ DONE
+
+**Status:** Fully wired and verified. `r_denoiser metalfx` produces
+cleanly denoised 1-spp output at >30 FPS at 1080p on M4 Max, with
+per-frame Halton sub-pixel jitter for proper TAA-style reconstruction.
+Three real bugs uncovered + fixed along the way (Metal TLAS row→col
+transpose, Slang→MSL `float3` stride mismatch, MetalCommandBuffer push
+buffer overflow). Original implementation checklist preserved below
+for reference (and as a template for the Vulkan denoiser).
+
+---
+
+### Original P10 implementation checklist (kept for reference):
 
 1. **Texture formats** — add to `src/rhi/Types.h`:
    - `R32F` (single-channel float — view-space linear depth).

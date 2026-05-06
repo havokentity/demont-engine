@@ -120,6 +120,12 @@ public:
     void EnumerateCommands(std::string_view prefix,
                            const std::function<void(Command&)>& visitor);
 
+    // Persistence (P11). Writes every CVAR_ARCHIVE cvar whose current
+    // value differs from its default as `<name> <value>` lines to `path`.
+    // Returns the number of lines written, or -1 on file error. Quoting
+    // for values that contain spaces is wrapped in double quotes.
+    int SaveArchivedCvars(const std::string& path);
+
 private:
     Console() = default;
 
