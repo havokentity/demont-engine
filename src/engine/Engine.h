@@ -1,10 +1,14 @@
 #pragma once
 
 #include "../app/Window.h"
+#include "../core/Jobs/JobSystem.h"
 #include "../rhi/Types.h"
+
+#include <glm/glm.hpp>
 
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <memory>
 
 namespace pt::app      { class Window; class ConsoleOverlay; }
@@ -12,6 +16,7 @@ namespace pt::jobs     { class JobSystem; }
 namespace pt::console  { class ConsoleServer; }
 namespace pt::rhi      { class Device; struct PipelineHandle; }
 namespace pt::renderer { struct Camera; }
+namespace pt::csg      { class CsgScene; struct BakedMesh; }
 
 namespace pt::engine {
 
@@ -42,12 +47,53 @@ public:
 
     static Engine* Instance();
 
+public:
+    // Analytic primitive description, mirrors the GPU layout (3 float4s per
+    // primitive). The engine maintains a map of these and rebuilds the GPU
+    // buffer whenever the set changes.
+    struct AnalyticPrim {
+        enum Type     : std::uint8_t { Sphere = 0, Plane = 1 };
+        enum Material : std::uint8_t { Lambert = 0, Metal = 1, Dielectric = 2 };
+        Type     type      = Sphere;
+        Material material  = Lambert;
+        float    pos_or_n[3] {0, 0, 0};   // sphere center / plane normal
+        float    radius_or_d = 0.5f;      // sphere radius / plane d
+        float    albedo[3]   {1, 1, 1};
+        float    roughness   = 0.0f;
+        float    ior         = 1.5f;
+    };
+
 private:
     void RegisterCommands();
+    void RegisterCsgCommands();
+    void RegisterPrimCommands();
     void TearDownDevice();
     void RenderFrame();
 
     void UpdateCamera(double dt);
+
+    // Drains any in-flight CSG bake job, keeps the engine's vertex/index
+    // buffers + BLAS + TLAS in sync with the current scene, and -- if the
+    // scene has been mutated since the last bake -- fires a new bake on a
+    // worker thread. Called every frame before pipeline binding.
+    void EnsureMeshUpdated();
+
+    // Re-upload the analytic-primitive storage buffer from the in-memory
+    // map. Called from RenderFrame whenever primitives_dirty_ is set.
+    void EnsurePrimitivesUploaded();
+
+    // Replace the current mesh-path resources (vertex/index buffers,
+    // BLAS, TLAS) with one built from `baked`. Called from EnsureMesh*
+    // on the main thread once a worker bake has completed.
+    void RebuildMeshResources(const pt::csg::BakedMesh& baked);
+
+    // Seed CsgScene with the headline drilled-cube scene so first-frame
+    // mesh-mode renders something interesting. Idempotent.
+    void SeedDefaultCsgScene();
+
+    // Seed the analytic-primitive set with the canonical 3-sphere +
+    // ground-plane scene (Lambert red, gold metal, glass dielectric).
+    void SeedDefaultPrimitives();
 
     std::unique_ptr<pt::app::Window>            window_;
     std::unique_ptr<pt::app::ConsoleOverlay>    overlay_;
@@ -55,15 +101,37 @@ private:
     std::unique_ptr<pt::console::ConsoleServer> server_;
     std::unique_ptr<pt::rhi::Device>            device_;
     std::unique_ptr<pt::renderer::Camera>       camera_;
-    std::uint64_t                               clear_pipeline_id_     = 0;
-    std::uint64_t                               scene_pipeline_id_     = 0;
+    std::unique_ptr<pt::csg::CsgScene>          csg_scene_;
+    std::unique_ptr<pt::csg::BakedMesh>         pending_baked_;
+    pt::jobs::JobSystem::Handle                 bake_handle_{};
+    std::atomic<int>                            bake_phase_{0};   // 0 idle, 1 baking, 2 ready
+
+    // Analytic primitives (sphere/plane) -- ordered by user id, uploaded
+    // to a storage buffer when dirty. Mesh CSG and analytic primitives
+    // are independent; the unified renderer takes the closest hit.
+    std::map<std::uint32_t, AnalyticPrim>       primitives_;
+    bool                                        primitives_dirty_      = true;
+    std::uint64_t                               prim_buffer_id_        = 0;
+    std::uint32_t                               prim_buffer_capacity_  = 0;  // primitives that fit
+
     std::uint64_t                               pathtrace_pipeline_id_ = 0;
-    std::uint64_t                               mesh_pipeline_id_      = 0;
     std::uint64_t                               accum_texture_id_      = 0;
     std::uint64_t                               box_blas_id_           = 0;
     std::uint64_t                               scene_tlas_id_         = 0;
     std::uint64_t                               box_vbuf_id_           = 0;
     std::uint64_t                               box_ibuf_id_           = 0;
+
+    // P10 denoiser G-buffer textures. Allocated lazily when r_denoiser
+    // moves off "off" and freed on backend teardown / when denoiser is
+    // disabled. Re-allocated on swapchain resize alongside accum_hdr.
+    std::uint64_t                               denoise_color_tex_id_  = 0;
+    std::uint64_t                               depth_tex_id_          = 0;
+    std::uint64_t                               motion_tex_id_         = 0;
+    glm::mat4                                   prev_view_proj_        { 1.0f };  // identity
+    bool                                        prev_view_proj_valid_  = false;
+    bool                                        denoiser_active_       = false;
+    float                                       last_jitter_x_         = 0.0f;
+    float                                       last_jitter_y_         = 0.0f;
     int                                         accum_w_               = 0;
     int                                         accum_h_               = 0;
     std::uint32_t                               frame_index_           = 0;

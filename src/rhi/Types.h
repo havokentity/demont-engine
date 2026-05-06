@@ -29,6 +29,8 @@ enum class TextureFormat : std::uint8_t {
     RGBA16F,
     RGBA32F,
     R32_UINT,
+    R32F,         // P10 denoiser depth
+    RG16F,        // P10 denoiser motion vectors
 };
 
 enum class TextureUsage : std::uint32_t {

@@ -1,5 +1,6 @@
 add_library(pt_rhi_metal STATIC
     MetalDevice.cpp
+    MetalFXDenoiser.mm
 )
 
 target_include_directories(pt_rhi_metal PUBLIC ${CMAKE_SOURCE_DIR}/src)
@@ -14,37 +15,18 @@ if(APPLE)
     target_link_libraries(pt_rhi_metal PUBLIC
         "-framework Metal"
         "-framework MetalKit"
+        "-framework MetalFX"      # P10 TemporalDenoisedScaler (macOS 15+)
         "-framework Foundation"
         "-framework QuartzCore"
     )
 endif()
 
-# Compile the clear + scene shaders (Slang -> MSL source) and embed.
+# Single unified shader: dynamic analytic primitives (spheres, planes)
+# plus triangle meshes via TLAS, all in one path-tracer kernel.
 include(${CMAKE_SOURCE_DIR}/cmake/Slang.cmake)
 pt_compile_slang(
     TARGET  pt_rhi_metal
-    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/Clear.slang
-    STAGE   compute
-    ENTRY   main
-    TARGETS metal
-)
-pt_compile_slang(
-    TARGET  pt_rhi_metal
-    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/Scene.slang
-    STAGE   compute
-    ENTRY   main
-    TARGETS metal
-)
-pt_compile_slang(
-    TARGET  pt_rhi_metal
     SOURCE  ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
-    STAGE   compute
-    ENTRY   main
-    TARGETS metal
-)
-pt_compile_slang(
-    TARGET  pt_rhi_metal
-    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/MeshTrace.slang
     STAGE   compute
     ENTRY   main
     TARGETS metal

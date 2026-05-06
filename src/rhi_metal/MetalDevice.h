@@ -52,6 +52,11 @@ public:
     void Reset(MTL::CommandBuffer* cb);
     MTL::CommandBuffer* RawCmdBuf() const { return mtl_cb_; }
 
+    // Forces the currently-open compute encoder closed. Required before
+    // any non-RHI code (e.g. MetalFX) wants to attach its own encoder
+    // to the same MTLCommandBuffer.
+    void FlushEncoder();
+
 private:
     void EnsureEncoder();
     void EndEncoderIfActive();
@@ -66,7 +71,10 @@ private:
     std::size_t                bound_buf_off_[8] {};
     AccelStructHandle          bound_accel_[4] {};
 
-    std::uint8_t  push_buf_[128] {};
+    // Push-constant buffer. Sized to fit the unified PathTrace push
+    // (224 bytes: camera basis + flags + curr/prev view*proj). Round
+    // up to 256 for headroom and 16-byte alignment.
+    std::uint8_t  push_buf_[256] {};
     std::size_t   push_size_ = 0;
 };
 
@@ -103,6 +111,13 @@ public:
     bool         SupportsHardwareRT() const override { return true; }
     const char*  DeviceName()       const override { return device_name_.c_str(); }
     std::size_t  CurrentAllocatedBytes() const override;
+
+    // ---- P10 denoiser ---------------------------------------------------
+    bool SupportsDenoise() const override { return true; }
+    void Denoise(const DenoiseDesc& d) override;
+
+    bool ReadbackTexture(TextureHandle h, void* dst, std::size_t dst_size,
+                         std::uint32_t* out_w, std::uint32_t* out_h) override;
 
     // ---- Internal lookup ------------------------------------------------
     MTL::ComputePipelineState* LookupPipeline(PipelineHandle h);
@@ -143,6 +158,12 @@ private:
     std::unordered_map<std::string, std::uint64_t>     named_pipelines_;
 
     std::unique_ptr<MetalCommandBuffer> cmd_;
+
+    // MetalFX TemporalDenoisedScaler. Allocated lazily on first
+    // Denoise() call; recreated when the swapchain size changes.
+    void*         metalfx_scaler_   = nullptr;
+    std::uint32_t metalfx_width_    = 0;
+    std::uint32_t metalfx_height_   = 0;
 };
 
 }  // namespace pt::rhi::mtl

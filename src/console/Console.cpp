@@ -147,11 +147,14 @@ bool Console::SetCVarOverride(std::string_view name, std::string_view value) {
 ExecuteResult Console::Execute(std::string_view line) {
     ExecuteResult result;
 
-    // Strip leading whitespace and skip blank/comment lines.
+    // Strip leading whitespace and skip blank/comment lines. We accept
+    // both `//` (Quake-style) and `#` (shell-style) so users can paste
+    // mixed-source snippets without stripping comments first.
     while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) {
         line.remove_prefix(1);
     }
     if (line.empty()) return result;
+    if (line[0] == '#') return result;
     if (line.size() >= 2 && line[0] == '/' && line[1] == '/') return result;
 
     std::string storage;

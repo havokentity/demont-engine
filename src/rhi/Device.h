@@ -57,11 +57,46 @@ public:
     // Swapchain control.
     virtual void Resize(int w, int h) = 0;
 
+    // Read a texture back to CPU. The destination buffer must be at
+    // least width * height * bytes_per_pixel(format). Returns true on
+    // success. Implementations may stall the GPU (waitUntilCompleted)
+    // since this is intended for screenshot / debug use only.
+    // `out_w` / `out_h` get the texture's dimensions so the caller can
+    // size the buffer correctly without a separate query.
+    virtual bool ReadbackTexture(TextureHandle, void* /*dst*/, std::size_t /*dst_size*/,
+                                 std::uint32_t* /*out_w*/, std::uint32_t* /*out_h*/) {
+        return false;
+    }
+
     // Capability + introspection.
     virtual BackendType  Type()             const = 0;
     virtual bool         SupportsHardwareRT() const = 0;
     virtual const char*  DeviceName()       const = 0;
     virtual std::size_t  CurrentAllocatedBytes() const = 0;
+
+    // P10 denoiser hook. Backends without a denoiser implementation
+    // (software / vulkan today) leave the default no-op. The Metal
+    // backend implements it via MTLFXTemporalDenoisedScaler. Must be
+    // called AFTER the path-tracer Submit so the input textures are
+    // ready, and BEFORE EndFrame so it can encode into the same
+    // command buffer flow.
+    struct DenoiseDesc {
+        TextureHandle color_in;       // RGBA16F linear (per-frame, not accumulated)
+        TextureHandle depth_in;       // R32F clip-space depth (z/w in [0,1])
+        TextureHandle motion_in;      // RG16F pixel-space (prev - curr)
+        TextureHandle output;         // typically the swapchain image
+        float jitter_x       = 0.0f;
+        float jitter_y       = 0.0f;
+        bool  reset_history  = false; // true on backend switch / scene reset
+        // Required by MetalFX TemporalDenoisedScaler. Column-major 4x4
+        // (16 floats each). Pass nullptr only if the backend doesn't need
+        // them (currently: nothing -- both Metal and any future Vulkan
+        // denoiser need motion math).
+        const float* world_to_view = nullptr;
+        const float* view_to_clip  = nullptr;
+    };
+    virtual bool SupportsDenoise() const { return false; }
+    virtual void Denoise(const DenoiseDesc& /*d*/) {}
 };
 
 }  // namespace pt::rhi

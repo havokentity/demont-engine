@@ -11,14 +11,8 @@ target_link_libraries(pt_rhi_vulkan
     PUBLIC glfw                    # for glfwCreateWindowSurface
 )
 
-# Compile all three compute shaders to SPIR-V via Slang.
+# Single unified shader: dynamic analytic primitives + triangle meshes.
 include(${CMAKE_SOURCE_DIR}/cmake/Slang.cmake)
-pt_compile_slang(
-    TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/Clear.slang
-    STAGE compute ENTRY main TARGETS spirv)
-pt_compile_slang(
-    TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/Scene.slang
-    STAGE compute ENTRY main TARGETS spirv)
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
     STAGE compute ENTRY main TARGETS spirv)

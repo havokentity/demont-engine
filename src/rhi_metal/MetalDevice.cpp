@@ -15,17 +15,23 @@
 #include <fmt/format.h>
 #include <cstring>
 
-// Embedded shaders (Slang -> MSL source, compiled to a library at runtime).
+// Embedded shader (the unified PathTrace kernel: analytic primitives +
+// triangle meshes via TLAS + materials + accumulation, all in one).
 extern "C" {
-extern const unsigned char shader_Clear_metal_data[];
-extern const unsigned long shader_Clear_metal_size;
-extern const unsigned char shader_Scene_metal_data[];
-extern const unsigned long shader_Scene_metal_size;
 extern const unsigned char shader_PathTrace_metal_data[];
 extern const unsigned long shader_PathTrace_metal_size;
-extern const unsigned char shader_MeshTrace_metal_data[];
-extern const unsigned long shader_MeshTrace_metal_size;
 }
+
+// MetalFXDenoiser.mm: ObjC++ shim around MTLFXTemporalDenoisedScaler.
+extern "C" void* pt_metalfx_create(void* mtl_device, std::uint32_t w, std::uint32_t h);
+extern "C" void  pt_metalfx_destroy(void* scaler);
+extern "C" void  pt_metalfx_encode(void* scaler, void* mtl_cb,
+                                    void* color_in, void* depth_in,
+                                    void* motion_in, void* color_out,
+                                    float jitter_x, float jitter_y,
+                                    const float* world_to_view_4x4,
+                                    const float* view_to_clip_4x4,
+                                    int reset);
 
 // Defined in MetalAttach.mm.
 extern "C" void pt_metal_attach_layer(void* ns_window, void* metal_layer);
@@ -70,6 +76,8 @@ void MetalCommandBuffer::EndEncoderIfActive() {
         encoder_ = nullptr;
     }
 }
+
+void MetalCommandBuffer::FlushEncoder() { EndEncoderIfActive(); }
 
 void MetalCommandBuffer::BindComputePipeline(PipelineHandle p) {
     bound_pso_ = p;
@@ -239,16 +247,14 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
         named_pipelines_.emplace(kernel_name, id);
     };
 
-    build_pso("clear",     shader_Clear_metal_data);
-    build_pso("scene",     shader_Scene_metal_data);
     build_pso("pathtrace", shader_PathTrace_metal_data);
-    build_pso("mesh",      shader_MeshTrace_metal_data);
 
     cmd_ = std::make_unique<MetalCommandBuffer>(this);
 }
 
 MetalDevice::~MetalDevice() {
     cmd_.reset();
+    if (metalfx_scaler_) { pt_metalfx_destroy(metalfx_scaler_); metalfx_scaler_ = nullptr; }
     {
         std::lock_guard lock(resource_mutex_);
         for (auto& [_, p] : pipelines_) if (p) p->release();
@@ -264,6 +270,53 @@ MetalDevice::~MetalDevice() {
     if (layer_)            { layer_->release();            layer_ = nullptr; }
     if (queue_)            { queue_->release();            queue_ = nullptr; }
     if (device_)           { device_->release();           device_ = nullptr; }
+}
+
+void MetalDevice::Denoise(const DenoiseDesc& d) {
+    if (device_ == nullptr) return;
+    if (cmd_ == nullptr || cmd_->RawCmdBuf() == nullptr) {
+        // No active command buffer -- caller forgot to AcquireCommandBuffer
+        // before Denoise. Silently skip; the path tracer's swapchain write
+        // will still be visible.
+        return;
+    }
+    auto* color_in  = LookupTexture(d.color_in);
+    auto* depth_in  = LookupTexture(d.depth_in);
+    auto* motion_in = LookupTexture(d.motion_in);
+    auto* color_out = LookupTexture(d.output);
+    if (color_in == nullptr || depth_in == nullptr ||
+        motion_in == nullptr || color_out == nullptr) {
+        LOG_WARN("MetalDevice::Denoise: missing input textures");
+        return;
+    }
+    const std::uint32_t w = static_cast<std::uint32_t>(color_in->width());
+    const std::uint32_t h = static_cast<std::uint32_t>(color_in->height());
+    if (metalfx_scaler_ == nullptr ||
+        metalfx_width_  != w ||
+        metalfx_height_ != h) {
+        if (metalfx_scaler_) { pt_metalfx_destroy(metalfx_scaler_); metalfx_scaler_ = nullptr; }
+        metalfx_scaler_ = pt_metalfx_create(static_cast<void*>(device_), w, h);
+        if (metalfx_scaler_ == nullptr) {
+            LOG_ERROR("MetalFX scaler creation failed (size {}x{})", w, h);
+            return;
+        }
+        metalfx_width_  = w;
+        metalfx_height_ = h;
+    }
+
+    // Encode the denoise pass on the SAME command buffer as the path
+    // tracer dispatch. The compute encoder (if any) must be ended first
+    // since MetalFX wants to attach its own encoders.
+    cmd_->FlushEncoder();
+    pt_metalfx_encode(metalfx_scaler_,
+                      static_cast<void*>(cmd_->RawCmdBuf()),
+                      static_cast<void*>(color_in),
+                      static_cast<void*>(depth_in),
+                      static_cast<void*>(motion_in),
+                      static_cast<void*>(color_out),
+                      d.jitter_x, d.jitter_y,
+                      d.world_to_view, d.view_to_clip,
+                      d.reset_history ? 1 : 0);
 }
 
 // ---- Resources -----------------------------------------------------------
@@ -290,6 +343,8 @@ TextureHandle MetalDevice::CreateTexture(const TextureDesc& d) {
         case TextureFormat::RGBA16F:     fmt = MTL::PixelFormatRGBA16Float;      break;
         case TextureFormat::RGBA32F:     fmt = MTL::PixelFormatRGBA32Float;      break;
         case TextureFormat::R32_UINT:    fmt = MTL::PixelFormatR32Uint;          break;
+        case TextureFormat::R32F:        fmt = MTL::PixelFormatR32Float;         break;
+        case TextureFormat::RG16F:       fmt = MTL::PixelFormatRG16Float;        break;
         default: break;
     }
 
@@ -424,7 +479,18 @@ AccelStructHandle MetalDevice::CreateTLAS(const TLASDesc& d) {
         if (as == nullptr) continue;
         blas_array.push_back(as);
         InstDesc id{};
-        std::memcpy(&id.transform, d.instances[i].transform, sizeof(float) * 12);
+        // The public TLASInstance.transform is row-major 3x4 (column 3 is
+        // translation), but MTLPackedFloat4x3 stores 4 columns of float3
+        // -- column-major. Flat memcpy garbles the matrix (it produces a
+        // singular 3x3 with translation in the wrong slot), so every ray
+        // misses. Transpose explicitly here.
+        const float* src = d.instances[i].transform;
+        float*       dst = reinterpret_cast<float*>(&id.transform);
+        for (int c = 0; c < 4; ++c) {
+            for (int r = 0; r < 3; ++r) {
+                dst[c * 3 + r] = src[r * 4 + c];
+            }
+        }
         id.options = MTL::AccelerationStructureInstanceOptionOpaque;
         id.mask    = d.instances[i].mask;
         id.intersection_function_table_offset = 0;
@@ -542,6 +608,65 @@ void MetalDevice::Submit(CommandBuffer* cb) {
     }
     mtl_cb->commit();
     mcb->Reset(nullptr);
+}
+
+bool MetalDevice::ReadbackTexture(TextureHandle h, void* dst, std::size_t dst_size,
+                                  std::uint32_t* out_w, std::uint32_t* out_h) {
+    if (device_ == nullptr || dst == nullptr) return false;
+    auto* src = LookupTexture(h);
+    if (src == nullptr) return false;
+
+    const std::uint32_t w = static_cast<std::uint32_t>(src->width());
+    const std::uint32_t hgt = static_cast<std::uint32_t>(src->height());
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = hgt;
+
+    // Bytes-per-pixel from format. Caller must ensure dst_size matches.
+    std::size_t bpp = 0;
+    switch (src->pixelFormat()) {
+        case MTL::PixelFormatRGBA32Float: bpp = 16; break;
+        case MTL::PixelFormatRGBA16Float: bpp = 8;  break;
+        case MTL::PixelFormatRGBA8Unorm:
+        case MTL::PixelFormatBGRA8Unorm:  bpp = 4;  break;
+        case MTL::PixelFormatR32Float:    bpp = 4;  break;
+        case MTL::PixelFormatRG16Float:   bpp = 4;  break;
+        default: return false;
+    }
+    if (dst_size < std::size_t(w) * hgt * bpp) return false;
+
+    // Storage mode determines whether we can getBytes directly. Shared
+    // (the default for our CreateTexture) is fine. Private requires a
+    // blit to a managed-storage temp first.
+    bool need_temp = (src->storageMode() == MTL::StorageModePrivate);
+
+    pt::mem::TagScope scope(pt::MemTag::GpuBuffers);
+    auto* pool = NS::AutoreleasePool::alloc()->init();
+
+    MTL::Texture* readable = src;
+    if (need_temp) {
+        auto* td = MTL::TextureDescriptor::texture2DDescriptor(
+            src->pixelFormat(), w, hgt, false);
+        td->setUsage(MTL::TextureUsageShaderRead);
+        td->setStorageMode(MTL::StorageModeShared);
+        readable = device_->newTexture(td);
+        if (readable == nullptr) { pool->release(); return false; }
+
+        auto* cb = queue_->commandBuffer();
+        auto* enc = cb->blitCommandEncoder();
+        MTL::Origin origin = {0, 0, 0};
+        MTL::Size   size   = {w, hgt, 1};
+        enc->copyFromTexture(src, 0, 0, origin, size, readable, 0, 0, origin);
+        enc->endEncoding();
+        cb->commit();
+        cb->waitUntilCompleted();
+    }
+
+    MTL::Region region = MTL::Region::Make2D(0, 0, w, hgt);
+    readable->getBytes(dst, w * bpp, region, 0);
+
+    if (need_temp) readable->release();
+    pool->release();
+    return true;
 }
 
 void MetalDevice::WaitIdle() {

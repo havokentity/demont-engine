@@ -124,10 +124,41 @@ FetchContent_Declare(nlohmann_json
     SYSTEM
 )
 
+# --- manifold: mesh CSG (P9 headline) --------------------------------------
+# Robust manifold-mesh boolean ops (union/intersect/subtract). Builds with
+# CMake via FetchContent. We disable everything except the core C++ lib --
+# no python bindings, no tests, no fuzzing, no native parallelism (TBB)
+# since the job system will run booleans on a worker thread anyway.
+set(MANIFOLD_TEST       OFF CACHE BOOL "" FORCE)
+set(MANIFOLD_PYBIND     OFF CACHE BOOL "" FORCE)
+set(MANIFOLD_CBIND      OFF CACHE BOOL "" FORCE)
+set(MANIFOLD_JSBIND     OFF CACHE BOOL "" FORCE)
+set(MANIFOLD_DEBUG      OFF CACHE BOOL "" FORCE)
+set(MANIFOLD_EXPORT     OFF CACHE BOOL "" FORCE)
+set(MANIFOLD_DOWNLOADS  OFF CACHE BOOL "" FORCE)
+set(MANIFOLD_PAR            OFF CACHE BOOL "" FORCE)
+set(MANIFOLD_CROSS_SECTION  OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(manifold
+    GIT_REPOSITORY https://github.com/elalish/manifold.git
+    GIT_TAG        v3.1.1
+    GIT_SHALLOW    ON
+    SYSTEM
+)
+
 FetchContent_MakeAvailable(glm fmt mimalloc glfw enkits civetweb tomlplusplus nlohmann_json)
 if(PT_ENABLE_VULKAN_BACKEND)
     FetchContent_MakeAvailable(vma)
 endif()
+
+# Manifold reads the global TRACY_ENABLE cache var (same one we set for our
+# Tracy fetch) and tries to download its own copy of tracy when it sees ON.
+# Shadow it OFF for just manifold's configure step -- our renderer doesn't
+# need manifold-internal profiling, and tracy still ships normally for our
+# own targets via the unconditional fetch below.
+block()
+    set(TRACY_ENABLE OFF)
+    FetchContent_MakeAvailable(manifold)
+endblock()
 
 # civetweb prints a flood of "*** ... worker_thread_run:..." trace lines
 # whenever its `DEBUG` macro is defined (which CMake's Debug build type

@@ -265,6 +265,26 @@ body::after {
 }
 .theme-select:focus { border-color: var(--accent); }
 
+/* Top-bar action button (used by the hard-reload glyph). Matches the
+   theme-select visual weight so the bar stays balanced. */
+.bar-btn {
+  background: var(--bg-elev);
+  color: var(--accent);
+  border: 1px solid var(--border-strong);
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1;
+  padding: 3px 9px;
+  cursor: pointer;
+  outline: none;
+  transition: border-color 0.08s ease, box-shadow 0.08s ease, transform 0.08s ease;
+}
+.bar-btn:hover {
+  border-color: var(--accent);
+  box-shadow: 0 0 6px var(--accent-glow);
+}
+.bar-btn:active { transform: rotate(180deg); }
+
 .brand {
   display: flex; align-items: center; gap: 10px;
   font-style: normal;
@@ -351,7 +371,32 @@ body::after {
   border-bottom: 1px solid var(--border);
   background: var(--bg-elev);
   position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
+
+/* Inline filter input shown in the side-panel head. Clicking a row in
+   the list still prefills the main input (see console.js); this just
+   trims what's visible. */
+#side-search {
+  flex: 1; min-width: 0;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 11px;
+  letter-spacing: 0;
+  text-transform: none;
+  padding: 2px 6px;
+  outline: none;
+}
+#side-search:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 4px var(--accent-glow);
+}
+#side-search::placeholder { color: var(--accent-dim); opacity: 0.6; }
 .panel-head::after {
   content: '';
   position: absolute; left: 0; bottom: -1px;
@@ -443,17 +488,37 @@ body::after {
 }
 #input::placeholder { color: var(--fg-dim); font-style: normal; }
 
-/* ---------- cvars sidebar ---------- */
+/* ---------- cvars + commands sidebar ---------- */
 .kv-list {
   padding: 6px 12px; overflow-y: auto; flex: 1;
 }
+
+/* Auto-grouped subheading (one per name prefix: csg, prim, r, cam, ...). */
+.grp-head {
+  margin: 14px 0 4px;
+  padding: 2px 0 3px;
+  font-size: 10px;
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+  color: var(--accent);
+  border-bottom: 1px solid var(--border-strong);
+  font-weight: 600;
+  position: sticky; top: 0;
+  background: var(--bg-elev);
+  z-index: 1;
+}
+.grp-head:first-child { margin-top: 0; }
+
 .kv {
   display: flex; align-items: baseline;
   padding: 5px 0;
   border-bottom: 1px dashed var(--border);
   font-size: 12px;
   font-feature-settings: "calt" 0;
+  cursor: pointer;
+  transition: background 0.06s ease;
 }
+.kv:hover { background: var(--border); }
 .kv:last-child { border-bottom: none; }
 .kv .k {
   color: var(--accent);
@@ -465,6 +530,22 @@ body::after {
   margin-left: 12px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   max-width: 55%; text-align: right;
+}
+
+/* Command rows: differentiate from cvars with a small marker + dim
+   "cmd" tag so the eye can scan the panel by type. */
+.kv-cmd .k { color: var(--accent-dim); }
+.kv-cmd .k::before {
+  content: "▸ ";
+  color: var(--accent);
+  margin-right: 2px;
+}
+.kv-cmd .v {
+  color: var(--accent-dim);
+  font-size: 9px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  opacity: 0.55;
 }
 
 /* ---------- selection + scrollbars ---------- */

@@ -17,10 +17,24 @@
 
 // Tiny logo-drawing NSView. Same glyph as the web console: a hexagon
 // (mesh primitive) framing a three-bounce ray with hit-point dots.
+// Frame strokes in --accent; ray + dots in --logo-ray (the magenta-pink
+// contrast colour) so the icon mirrors the ASCII banner two-tone scheme.
 @interface PtLogoView : NSView
+@property (strong) NSColor* frameColor;
+@property (strong) NSColor* rayColor;
 @end
 
 @implementation PtLogoView
+
+- (instancetype)initWithFrame:(NSRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+    // Sensible defaults; PtConsoleView pushes the real palette colours
+    // immediately after construction and again on every theme change.
+    self.frameColor = [NSColor colorWithCalibratedRed:0.0 green:0.94 blue:1.0 alpha:1.0];
+    self.rayColor   = [NSColor colorWithCalibratedRed:1.0 green:0.37 blue:0.64 alpha:1.0];
+    return self;
+}
 
 - (void)drawRect:(NSRect)dirtyRect {
     (void)dirtyRect;
@@ -35,11 +49,8 @@
     [xform scaleBy:s];
     [xform concat];
 
-    NSColor* cyan = [NSColor colorWithCalibratedRed:0.0 green:0.94 blue:1.0 alpha:1.0];
-    [cyan setStroke];
-    [cyan setFill];
-
-    // Hex frame.
+    // Hex frame (accent colour).
+    [self.frameColor setStroke];
     NSBezierPath* hex = [NSBezierPath bezierPath];
     [hex moveToPoint:NSMakePoint(16.0, 2.5)];
     [hex lineToPoint:NSMakePoint(27.5, 9.0)];
@@ -52,7 +63,9 @@
     hex.lineJoinStyle = NSLineJoinStyleRound;
     [hex stroke];
 
-    // Three-bounce ray path.
+    // Three-bounce ray + hit dots (ray colour).
+    [self.rayColor setStroke];
+    [self.rayColor setFill];
     NSBezierPath* ray = [NSBezierPath bezierPath];
     [ray moveToPoint:NSMakePoint(7.5, 11.0)];
     [ray lineToPoint:NSMakePoint(13.0, 19.0)];
@@ -63,7 +76,6 @@
     ray.lineJoinStyle = NSLineJoinStyleRound;
     [ray stroke];
 
-    // Hit-point dots.
     NSBezierPath* d1 = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(13.0 - 1.4, 19.0 - 1.4, 2.8, 2.8)];
     NSBezierPath* d2 = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(21.5 - 1.4, 14.0 - 1.4, 2.8, 2.8)];
     [d1 fill];
@@ -207,6 +219,7 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
 @property (strong) PtConsoleInputField* inputField;
 @property (strong) NSTextField*         promptLabel;
 @property (strong) NSTextField*         statusLabel;
+@property (strong) PtLogoView*          logoView;
 @property NSUInteger                    bannerEndLocation;
 @property (assign) PtThemePalette       palette;
 
@@ -220,6 +233,7 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
 - (instancetype)initWithFrame:(NSRect)frame;
 - (void)appendLine:(NSString*)line level:(NSString*)level;
 - (void)submitInput;
+- (void)submitLine:(NSString*)line;
 - (BOOL)handleTab;
 - (void)refreshNames;
 @end
@@ -350,7 +364,10 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     PtLogoView* logo = [[PtLogoView alloc] initWithFrame:NSMakeRect(14, frame.size.height - 28, 18, 18)];
     logo.autoresizingMask = NSViewMinYMargin;
     logo.wantsLayer = YES;
+    logo.frameColor = self.palette.accent;
+    logo.rayColor   = self.palette.logoRay;
     [self addSubview:logo];
+    self.logoView = logo;
 
     PtConsoleInputField* in = [[PtConsoleInputField alloc]
         initWithFrame:NSMakeRect(32, 8, frame.size.width - 46, 22)];
@@ -459,6 +476,9 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     self.promptLabel.textColor      = p.accent;
     self.statusLabel.textColor      = p.status;
     self.inputField.textColor       = (p.out != nil) ? p.out : [NSColor whiteColor];
+    self.logoView.frameColor        = p.accent;
+    self.logoView.rayColor          = p.logoRay;
+    [self.logoView setNeedsDisplay:YES];
     [self rebuildBanner];
 }
 
@@ -511,10 +531,8 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     [self.outputView scrollRangeToVisible:NSMakeRange(self.outputView.textStorage.length, 0)];
 }
 
-- (void)submitInput {
-    NSString* line = [self.inputField.stringValue copy];
+- (void)submitLine:(NSString*)line {
     if (line.length == 0) return;
-    self.inputField.stringValue = @"";
     [self.history addObject:line];
     if (self.history.count > 200) [self.history removeObjectAtIndex:0];
     self.historyPos = self.history.count;
@@ -533,6 +551,44 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     if (!result.ok) {
         NSString* e = [NSString stringWithUTF8String:result.error.c_str()];
         [self appendLine:[NSString stringWithFormat:@"error: %@", e] level:@"error"];
+    }
+}
+
+- (void)submitInput {
+    NSString* line = [self.inputField.stringValue copy];
+    if (line.length == 0) return;
+    self.inputField.stringValue = @"";
+    [self submitLine:line];
+    [self refreshNames];
+}
+
+// Paste-to-multiline: when the user pastes text containing newlines, run
+// each complete line as its own command and leave the trailing partial
+// (anything after the last newline) in the input. Fires from the field
+// editor whenever stringValue changes from a user action -- programmatic
+// setStringValue: does not re-trigger this, so the writeback below is safe.
+- (void)controlTextDidChange:(NSNotification*)note {
+    if (note.object != self.inputField) return;
+    NSString* value = self.inputField.stringValue;
+
+    // Backtick is the show/hide toggle; stripping it here catches the
+    // case where the user presses ` to open AND starts typing fast
+    // -- the original ` event arrives at the field editor before the
+    // panel becomes the key window, so the NSEvent monitor that's
+    // supposed to swallow it doesn't get a chance.
+    if ([value rangeOfString:@"`"].location != NSNotFound) {
+        value = [value stringByReplacingOccurrencesOfString:@"`" withString:@""];
+        self.inputField.stringValue = value;
+    }
+
+    if ([value rangeOfString:@"\n"].location == NSNotFound) return;
+
+    NSArray<NSString*>* parts = [value componentsSeparatedByString:@"\n"];
+    NSString* trailing = parts.lastObject ? parts.lastObject : @"";
+    self.inputField.stringValue = trailing;
+
+    for (NSUInteger i = 0; i + 1 < parts.count; ++i) {
+        [self submitLine:parts[i]];
     }
     [self refreshNames];
 }
@@ -605,17 +661,31 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
         prefix = value;
         candidates = self.allNames;
     } else {
-        // Value position: complete from the cvar's allowed_values.
-        NSString* cvarName = [value substringToIndex:[value rangeOfString:@" "].location];
-        auto* cv = pt::console::Console::Get().FindCVar(
-            std::string_view([cvarName UTF8String]));
-        if (cv == nullptr || cv->allowed_values.empty()) return YES;
-        NSMutableArray* allowed = [NSMutableArray array];
-        for (auto& a : cv->allowed_values) {
-            [allowed addObject:[NSString stringWithUTF8String:a.c_str()]];
-        }
-        candidates = allowed;
+        // Value position. `toggle <cvar>` is special-cased: token 1 is a
+        // cvar name (only those with allowed_values are useful). Otherwise
+        // we complete from the named cvar's allowed_values.
+        NSString* firstTok = [value substringToIndex:[value rangeOfString:@" "].location];
         prefix = [value substringFromIndex:lastSpace.location + 1];
+        if ([firstTok isEqualToString:@"toggle"]) {
+            NSMutableArray* toggleables = [NSMutableArray array];
+            pt::console::Console::Get().EnumerateCVars("",
+                [&](pt::console::CVar& v) {
+                    if (!v.allowed_values.empty()) {
+                        [toggleables addObject:[NSString stringWithUTF8String:v.name.c_str()]];
+                    }
+                });
+            [toggleables sortUsingSelector:@selector(compare:)];
+            candidates = toggleables;
+        } else {
+            auto* cv = pt::console::Console::Get().FindCVar(
+                std::string_view([firstTok UTF8String]));
+            if (cv == nullptr || cv->allowed_values.empty()) return YES;
+            NSMutableArray* allowed = [NSMutableArray array];
+            for (auto& a : cv->allowed_values) {
+                [allowed addObject:[NSString stringWithUTF8String:a.c_str()]];
+            }
+            candidates = allowed;
+        }
     }
 
     NSMutableArray<NSString*>* matches = [NSMutableArray array];

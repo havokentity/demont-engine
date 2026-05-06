@@ -20,10 +20,6 @@
 #include <cstring>
 
 extern "C" {
-extern const unsigned char shader_Clear_spirv_data[];
-extern const unsigned long shader_Clear_spirv_size;
-extern const unsigned char shader_Scene_spirv_data[];
-extern const unsigned long shader_Scene_spirv_size;
 extern const unsigned char shader_PathTrace_spirv_data[];
 extern const unsigned long shader_PathTrace_spirv_size;
 }
@@ -382,8 +378,6 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         vkDestroyShaderModule(device_, mod, nullptr);
     };
 
-    build_pipeline("clear",     shader_Clear_spirv_data,     shader_Clear_spirv_size);
-    build_pipeline("scene",     shader_Scene_spirv_data,     shader_Scene_spirv_size);
     build_pipeline("pathtrace", shader_PathTrace_spirv_data, shader_PathTrace_spirv_size);
 
     if (!RecreateSwapchain()) return;
@@ -590,6 +584,8 @@ TextureHandle VulkanDevice::CreateTexture(const TextureDesc& d) {
         case TextureFormat::RGBA16F:     fmt = VK_FORMAT_R16G16B16A16_SFLOAT; break;
         case TextureFormat::RGBA32F:     fmt = VK_FORMAT_R32G32B32A32_SFLOAT; break;
         case TextureFormat::R32_UINT:    fmt = VK_FORMAT_R32_UINT;             break;
+        case TextureFormat::R32F:        fmt = VK_FORMAT_R32_SFLOAT;           break;
+        case TextureFormat::RG16F:       fmt = VK_FORMAT_R16G16_SFLOAT;        break;
         default: break;
     }
 

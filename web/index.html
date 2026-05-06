@@ -33,6 +33,7 @@
     <option value="sakura">sakura</option>
     <option value="mono">mono</option>
   </select>
+  <button id="reload-btn" class="bar-btn" title="Hard reload (busts cache so embedded UI updates show up)">&#x21bb;</button>
   <div class="status" id="status">connecting&hellip;</div>
 </header>
 <main class="layout">
@@ -45,7 +46,10 @@
     </form>
   </section>
   <aside class="panel" id="side-panel">
-    <div class="panel-head">cvars</div>
+    <div class="panel-head">
+      <span>scope</span>
+      <input id="side-search" type="text" placeholder="filter…" spellcheck="false" autocomplete="off">
+    </div>
     <div id="cvars" class="kv-list"></div>
   </aside>
 </main>
