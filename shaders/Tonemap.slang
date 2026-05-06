@@ -151,27 +151,37 @@ void main(uint3 tid : SV_DispatchThreadID) {
                     // sun; <1 closer to centre; >1 past centre.
                     float2 ghost_c = 0.5 - (sun_uv - 0.5) * scale;
                     float2 d = uv - ghost_c;
-                    // Per-ghost radius scales with sub/super-magnif.
-                    // Ghosts near centre are tight; far ones diffuse.
-                    float r = flare_size * (0.4 + 0.6 * scale);
+                    // Slight per-ghost size variation -- close-in
+                    // ghosts a touch tighter, far ones a touch
+                    // wider. Much smaller variation than before
+                    // (was 0.4..2.4x); the previous spread made
+                    // far ghosts ~5x bigger than the sun and they
+                    // overlapped into one big blob.
+                    float r = flare_size * (0.7 + 0.3 * scale);
                     // Chromatic aberration: each channel gets a
-                    // slightly different radius. Bigger r = wider
-                    // halo, so R/G/B come out at different sizes
-                    // and produce coloured fringes on disc edges.
+                    // slightly different radius -> coloured fringe
+                    // on disc edges.
                     float r_R = r * (1.0 + flare_dispersion * 8.0);
                     float r_G = r;
                     float r_B = r * (1.0 - flare_dispersion * 8.0);
                     float d2 = dot(d, d);
-                    float i_R = exp(-d2 / max(r_R * r_R, 1e-6));
-                    float i_G = exp(-d2 / max(r_G * r_G, 1e-6));
-                    float i_B = exp(-d2 / max(r_B * r_B, 1e-6));
-                    // Boost ghost peak so flare_intensity tunes the
-                    // SAME way as image mode (where bloom samples
-                    // are 5-10x brighter than 1.0 by themselves).
-                    // Without this multiplier sun-mode discs are
-                    // ~5x dimmer than image-mode at the same
-                    // r_lens_flare_intensity value.
-                    float3 ghost = float3(i_R, i_G, i_B) * kTints[gi] * 8.0;
+                    // Super-Gaussian (exp(-(d/r)^4)) instead of
+                    // plain Gaussian. Sharper edges, the ghost
+                    // reads as a discrete disc with a clean
+                    // boundary rather than a wide soft blob that
+                    // bleeds into its neighbours.
+                    float qR = d2 / max(r_R * r_R, 1e-6);
+                    float qG = d2 / max(r_G * r_G, 1e-6);
+                    float qB = d2 / max(r_B * r_B, 1e-6);
+                    float i_R = exp(-qR * qR);
+                    float i_G = exp(-qG * qG);
+                    float i_B = exp(-qB * qB);
+                    // Sun-mode ghost peak boost. With the tighter
+                    // discs the per-pixel area is much smaller, so
+                    // a smaller boost (4x vs 8x earlier) reads
+                    // correctly against typical flare_intensity
+                    // values (0.1-0.3).
+                    float3 ghost = float3(i_R, i_G, i_B) * kTints[gi] * 4.0;
                     // Radial fade so ghosts fall off near the
                     // edge of the screen (real lens vignette).
                     float fade = saturate(1.0 - length(uv - 0.5) * 1.2);
