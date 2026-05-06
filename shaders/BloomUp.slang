@@ -1,17 +1,48 @@
-// Bloom upsample (additive).
+// Bloom upsample (additive, bilinear).
 //
-// Reads `src` (the smaller mip), expands it 2x via a 3x3 tent kernel,
-// and adds the result to `dst` (the larger mip). The tent gives a
-// smoother halo than a box upsample without needing more samples.
-// Repeated up the pyramid the result is a wide soft glow with a
-// sharp HDR core -- the standard dual-filter bloom.
+// Reads `src` (the smaller mip) and adds a smoothly-resampled copy
+// to `dst` (the larger mip). For each dst pixel we map back to a
+// floating-point source position and take 9 BILINEAR samples on a
+// 3x3 grid centred there. Each bilinear sample is 4 source texels
+// blended by sub-pixel weights, so a sharp single-pixel highlight
+// in `src` shows up as a softly-shaded disk in `dst` instead of a
+// stepped square.
+//
+// (Earlier draft used point-sampled int-texel reads -- visibly boxy
+// around point-light sources like the sun, which the user spotted.
+// Bilinear is the standard dual-filter fix and adds 3x reads per
+// tap, which is fine since the upsample runs on already-shrunken
+// mips.)
 
 [[vk::binding(0, 0)]] RWTexture2D<float4> src;
 [[vk::binding(1, 0)]] RWTexture2D<float4> dst;
 
-float3 sampleSrc(int2 p, int2 dim) {
-    p = clamp(p, int2(0, 0), dim - int2(1, 1));
-    return src[uint2(p)].rgb;
+[[vk::push_constant]]
+cbuffer Push {
+    // Spread multiplier on the 3x3 sample positions. 1.0 = textbook
+    // dual-filter blur; > 1 = wider, more diffuse halo; < 1 = tight,
+    // sharp core. Engine plumbs r_bloom_radius into here.
+    float radius;
+    float pad[3];
+};
+
+float3 sampleBilinear(float2 sxy, int2 sd) {
+    // sxy is the source-pixel-space float position; sample 4
+    // surrounding integer texels and lerp by fractional offset.
+    float2 fxy = sxy - 0.5;
+    int2   i0  = int2(floor(fxy));
+    float2 t   = fxy - float2(i0);
+    int2 p00 = clamp(i0,             int2(0, 0), sd - int2(1, 1));
+    int2 p10 = clamp(i0 + int2(1,0), int2(0, 0), sd - int2(1, 1));
+    int2 p01 = clamp(i0 + int2(0,1), int2(0, 0), sd - int2(1, 1));
+    int2 p11 = clamp(i0 + int2(1,1), int2(0, 0), sd - int2(1, 1));
+    float3 c00 = src[uint2(p00)].rgb;
+    float3 c10 = src[uint2(p10)].rgb;
+    float3 c01 = src[uint2(p01)].rgb;
+    float3 c11 = src[uint2(p11)].rgb;
+    float3 a = lerp(c00, c10, t.x);
+    float3 b = lerp(c01, c11, t.x);
+    return lerp(a, b, t.y);
 }
 
 [shader("compute")]
@@ -22,19 +53,27 @@ void main(uint3 tid : SV_DispatchThreadID) {
     src.GetDimensions(src_dim.x, src_dim.y);
     if (tid.x >= dst_dim.x || tid.y >= dst_dim.y) return;
 
-    // 3x3 tent in source space. Source pixel for this dst pixel is
-    // (tid / 2). Tent is { {1,2,1}, {2,4,2}, {1,2,1} } / 16.
-    int2 sp = int2(tid.xy >> 1u);
-    int2 sd = int2(src_dim);
-    float3 a = sampleSrc(sp + int2(-1, -1), sd);
-    float3 b = sampleSrc(sp + int2( 0, -1), sd);
-    float3 c = sampleSrc(sp + int2( 1, -1), sd);
-    float3 d = sampleSrc(sp + int2(-1,  0), sd);
-    float3 e = sampleSrc(sp + int2( 0,  0), sd);
-    float3 f = sampleSrc(sp + int2( 1,  0), sd);
-    float3 g = sampleSrc(sp + int2(-1,  1), sd);
-    float3 h = sampleSrc(sp + int2( 0,  1), sd);
-    float3 i = sampleSrc(sp + int2( 1,  1), sd);
+    int2  sd  = int2(src_dim);
+    // Centre this dst pixel's source position. dst is 2x larger than
+    // src, so source pos = (tid + 0.5) / 2 in source-pixel units.
+    float2 sp = (float2(tid.xy) + 0.5) * 0.5;
+    float  r  = max(radius, 0.0);
+
+    // 3x3 sample grid spaced `radius` source pixels apart, bilinear
+    // at each sample so the kernel is effectively a 4x4 Gaussian-ish
+    // blur. Tent weights (1,2,1) / 16 give a smoother falloff than a
+    // uniform 3x3 box. Increasing radius widens the per-mip spread,
+    // which (compounded over the 5 upsamples) gives a noticeably
+    // wider, softer halo without changing mip count.
+    float3 a = sampleBilinear(sp + float2(-r, -r), sd);
+    float3 b = sampleBilinear(sp + float2( 0, -r), sd);
+    float3 c = sampleBilinear(sp + float2( r, -r), sd);
+    float3 d = sampleBilinear(sp + float2(-r,  0), sd);
+    float3 e = sampleBilinear(sp,                  sd);
+    float3 f = sampleBilinear(sp + float2( r,  0), sd);
+    float3 g = sampleBilinear(sp + float2(-r,  r), sd);
+    float3 h = sampleBilinear(sp + float2( 0,  r), sd);
+    float3 i = sampleBilinear(sp + float2( r,  r), sd);
     float3 tent = (a + c + g + i) * (1.0 / 16.0)
                 + (b + d + f + h) * (2.0 / 16.0)
                 +  e              * (4.0 / 16.0);

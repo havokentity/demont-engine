@@ -68,6 +68,7 @@ namespace cvar {
     PT_CVAR(r_bloom_threshold, "1.0","Linear-HDR luminance threshold for the bloom extract. Pixels below this value contribute nothing to the pyramid; pixels above contribute proportional to (lum - threshold). The path tracer's pixels are in tonemap-relative units (sun ~30, env ~3) so a threshold of 1.0 picks up only HDR highlights.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom_intensity, "0.05","Linear blend factor of the bloom layer added on top of the HDR image before tonemap. 0 disables, 1 makes the bloom layer dominate. Realistic camera lens flare is in the 0.02-0.10 range.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom_mips,      "5",  "How many mip levels the bloom pyramid uses (1..5). More mips = a softer / wider halo; fewer mips = a tighter glow. Capped to kBloomMips at compile time.", CVAR_ARCHIVE);
+    PT_CVAR(r_bloom_radius,    "1.0","Per-mip upsample 'spread' multiplier. 1.0 = pixel-accurate dual-filter blur; >1 widens each upsample tap (softer, more diffuse halo); <1 tightens it (sharper core, less spread). Real range 0.5..3.0.", CVAR_ARCHIVE);
     PT_CVAR(r_exposure,        "1.5","Manual HDR exposure multiplier applied before ACES tonemap. Used when r_auto_exposure = 0.", CVAR_ARCHIVE);
     PT_CVAR(r_auto_exposure,   "1",  "Auto-exposure: 0 = use r_exposure manual value, 1 = sample accum_hdr each frame and adapt exposure toward r_exposure_target (eye-adaptation feel).", CVAR_ARCHIVE);
     PT_CVAR(r_exposure_min,    "0.05",  "Minimum exposure scalar that auto-exposure can settle on. Stops a nuclear-bright scene from being crushed below this value.", CVAR_ARCHIVE);
@@ -1408,11 +1409,17 @@ void Engine::RenderFrame() {
             // Upsample chain: mip[N-1] -> mip[N-2] (additive),
             // mip[N-2] -> mip[N-3], ..., mip 1 -> mip 0. Result
             // accumulates into mip 0 which is the layer the tonemap
-            // pass samples.
+            // pass samples. r_bloom_radius widens the per-mip
+            // sample spread for a softer halo.
+            float bloom_radius = 1.0f;
+            if (auto* v = C.FindCVar("r_bloom_radius")) bloom_radius = v->GetFloat();
             for (int i = bloom_mips - 1; i > 0; --i) {
                 cb->BindComputePipeline(pt::rhi::PipelineHandle{bloom_up_pipeline_id_});
                 cb->BindStorageTexture(0, pt::rhi::TextureHandle{bloom_mip_tex_id_[i]});
                 cb->BindStorageTexture(1, pt::rhi::TextureHandle{bloom_mip_tex_id_[i - 1]});
+                struct UpPush { float radius; float pad[3]; } up{};
+                up.radius = bloom_radius;
+                cb->PushConstants(&up, sizeof(up));
                 cb->Dispatch((bloom_mip_w_[i - 1] + 7) / 8,
                              (bloom_mip_h_[i - 1] + 7) / 8, 1);
             }
@@ -2374,6 +2381,7 @@ void Engine::RegisterCommands() {
     set_slider("r_bloom_threshold",     0.0f,  10.0f,  0.05f);
     set_slider("r_bloom_intensity",     0.0f,   1.0f,  0.005f);
     set_slider("r_bloom_mips",          1.0f,   5.0f,  1.0f);
+    set_slider("r_bloom_radius",        0.5f,   3.0f,  0.05f);
 
     RegisterCsgCommands();
     RegisterPrimCommands();

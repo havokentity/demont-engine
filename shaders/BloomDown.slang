@@ -1,32 +1,57 @@
-// Bloom downsample.
+// Bloom downsample (Jorge Jimenez ACM 2014 13-tap kernel).
 //
-// 4x4 box-filter downsample (16 src texels per dst texel, equal
-// weights). The first mip in the chain also applies a luminance
-// threshold: any contribution below `threshold` is dropped, so only
-// HDR highlights enter the bloom pyramid. Subsequent mips just
-// downsample what's already in the chain.
+// 13 bilinear samples in three groups:
+//   - 1 centre (E)
+//   - 4 inner corners at +/-1 source pixels (J,K,L,M)
+//   - 8 outer ring at +/-2 source pixels (4 corners A,C,G,I + 4 edges
+//     B,D,F,H)
+// Bilinear-sampled => effective 36 source texels per dst texel. The
+// weights approximate a Gaussian, so a single hot HDR pixel produces
+// a circular soft halo instead of the boxy footprint a uniform box
+// filter gives. This is the kernel Call of Duty / Frostbite / Unreal
+// use for production bloom.
+//
+// First-mip-only extras:
+//   - luminance threshold (with smoothstep knee) so only HDR
+//     highlights enter the pyramid.
+//   - Karis-average anti-flicker on the four inner-corner taps:
+//     weight each by 1/(1+lum) before averaging so a single rogue
+//     firefly pixel doesn't dominate and shimmer between frames.
 //
 // Bindings:
 //   slot 0 (texture) : src -- the previous mip (or post_denoise_hdr
 //                       at the top of the chain).
 //   slot 1 (texture) : dst -- this mip.
-//
-// Push:
-//   threshold > 0  -> first mip, kill below-threshold pixels.
-//   threshold == 0 -> later mip, no thresholding.
 
 [[vk::binding(0, 0)]] RWTexture2D<float4> src;
 [[vk::binding(1, 0)]] RWTexture2D<float4> dst;
 
 [[vk::push_constant]]
 cbuffer Push {
-    float threshold;
+    float threshold;     // > 0 = first mip (apply threshold + Karis).
     float pad[3];
 };
 
-float3 sampleSrc(int2 p, int2 dim) {
-    p = clamp(p, int2(0, 0), dim - int2(1, 1));
-    return src[uint2(p)].rgb;
+// Software bilinear sample at a fractional source-pixel position. We
+// don't have a hardware sampler bound to the storage texture so we
+// emulate: read the 4 surrounding texels and lerp by sub-pixel
+// fraction. Edge clamping keeps off-image samples from contributing
+// dark zeroes that would shift the kernel weight.
+float3 sampleBilinear(float2 sxy, int2 sd) {
+    float2 fxy = sxy - 0.5;
+    int2   i0  = int2(floor(fxy));
+    float2 t   = fxy - float2(i0);
+    int2 p00 = clamp(i0,             int2(0, 0), sd - int2(1, 1));
+    int2 p10 = clamp(i0 + int2(1,0), int2(0, 0), sd - int2(1, 1));
+    int2 p01 = clamp(i0 + int2(0,1), int2(0, 0), sd - int2(1, 1));
+    int2 p11 = clamp(i0 + int2(1,1), int2(0, 0), sd - int2(1, 1));
+    float3 c00 = src[uint2(p00)].rgb;
+    float3 c10 = src[uint2(p10)].rgb;
+    float3 c01 = src[uint2(p01)].rgb;
+    float3 c11 = src[uint2(p11)].rgb;
+    float3 a = lerp(c00, c10, t.x);
+    float3 b = lerp(c01, c11, t.x);
+    return lerp(a, b, t.y);
 }
 
 [shader("compute")]
@@ -37,23 +62,64 @@ void main(uint3 tid : SV_DispatchThreadID) {
     src.GetDimensions(src_dim.x, src_dim.y);
     if (tid.x >= dst_dim.x || tid.y >= dst_dim.y) return;
 
-    int2 sp = int2(tid.xy * 2u);
-    int2 sd = int2(src_dim);
-    float3 sum = float3(0.0);
-    [unroll] for (int dy = -1; dy <= 2; ++dy)
-    [unroll] for (int dx = -1; dx <= 2; ++dx) {
-        sum += sampleSrc(sp + int2(dx, dy), sd);
-    }
-    float3 result = sum * (1.0 / 16.0);
+    int2  sd = int2(src_dim);
+    // Source position for this dst pixel's CENTRE: dst is half-res of
+    // src, so the centre maps to (tid + 0.5) * 2 in source-pixel
+    // units. That happens to land between the 4 source pixels that
+    // the dst pixel covers; sampleBilinear then averages them.
+    float2 sp = (float2(tid.xy) + 0.5) * 2.0;
 
+    // 13 bilinear taps at +/-1 and +/-2 source-pixel offsets.
+    float3 e = sampleBilinear(sp,                       sd);     // centre
+
+    float3 a = sampleBilinear(sp + float2(-2.0, -2.0),  sd);     // outer corners
+    float3 c = sampleBilinear(sp + float2( 2.0, -2.0),  sd);
+    float3 g = sampleBilinear(sp + float2(-2.0,  2.0),  sd);
+    float3 i = sampleBilinear(sp + float2( 2.0,  2.0),  sd);
+
+    float3 b = sampleBilinear(sp + float2( 0.0, -2.0),  sd);     // outer edges
+    float3 d = sampleBilinear(sp + float2(-2.0,  0.0),  sd);
+    float3 f = sampleBilinear(sp + float2( 2.0,  0.0),  sd);
+    float3 h = sampleBilinear(sp + float2( 0.0,  2.0),  sd);
+
+    float3 j = sampleBilinear(sp + float2(-1.0, -1.0),  sd);     // inner corners
+    float3 k = sampleBilinear(sp + float2( 1.0, -1.0),  sd);
+    float3 l = sampleBilinear(sp + float2(-1.0,  1.0),  sd);
+    float3 m = sampleBilinear(sp + float2( 1.0,  1.0),  sd);
+
+    float3 result;
     if (threshold > 0.0) {
-        // First-mip threshold: only let bright HDR pixels into the
-        // pyramid. Soft knee gives a smoother transition than a hard
-        // cutoff -- still cheap, just a smoothstep on luminance.
+        // Karis-average anti-flicker on the inner block. Each of the
+        // 4 inner taps is weighted by 1/(1+luma) before averaging --
+        // suppresses lone bright firefly pixels that the path tracer
+        // produces while specular paths converge.
+        float wj = 1.0 / (1.0 + dot(j, float3(0.2126, 0.7152, 0.0722)));
+        float wk = 1.0 / (1.0 + dot(k, float3(0.2126, 0.7152, 0.0722)));
+        float wl = 1.0 / (1.0 + dot(l, float3(0.2126, 0.7152, 0.0722)));
+        float wm = 1.0 / (1.0 + dot(m, float3(0.2126, 0.7152, 0.0722)));
+        float wsum = wj + wk + wl + wm + 1e-6;
+        float3 inner = (j*wj + k*wk + l*wl + m*wm) / wsum;
+        // Same Karis on the centre + outer ring -- weight each
+        // contribution group by its overall luminance so one
+        // rogue tap can't dominate a whole mip's brightness.
+        result = e         * 0.125
+               + inner     * 0.5
+               + (a+c+g+i) * (0.125 / 4.0)
+               + (b+d+f+h) * (0.25  / 4.0);
+        // Soft luminance threshold: smoothstep around `threshold`
+        // with a 1/2 stop knee gives a perceptually smooth on/off
+        // for what enters the pyramid.
         float lum  = dot(result, float3(0.2126, 0.7152, 0.0722));
         float knee = 0.5;
         float w    = smoothstep(threshold - knee, threshold + knee, lum);
         result *= w;
+    } else {
+        // Subsequent mips: no threshold, no Karis. Straight COD
+        // weighted sum.
+        result = e         * 0.125
+               + (j+k+l+m) * 0.125
+               + (a+c+g+i) * (0.125 / 4.0)
+               + (b+d+f+h) * (0.25  / 4.0);
     }
 
     dst[tid.xy] = float4(result, 1.0);
