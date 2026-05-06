@@ -8,6 +8,7 @@
 #include "../core/Jobs/JobSystem.h"
 #include "../core/Log.h"
 #include "../core/Memory/Memory.h"
+#include "../renderer/Astronomy.h"
 #include "../renderer/Camera.h"
 #include "../renderer/Csg/CsgScene.h"
 #include "../renderer/HdrImage.h"
@@ -28,6 +29,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstdlib>
+#include <ctime>
 #include <thread>
 
 namespace pt::engine {
@@ -70,8 +72,20 @@ namespace cvar {
     // and the disk; positive elevation = above horizon (day), negative =
     // below (night); azimuth in degrees, 0 = -Z (north), 90 = +X (east).
     PT_CVAR(r_sky_mode,        "hdri", "Sky rendering: gradient (cheap fallback) | hdri (sample r_env_map) | procedural (analytic with sun position). Defaults to hdri so the bundled sunset.hdr is visible out of the box.", CVAR_ARCHIVE);
-    PT_CVAR(r_sun_elevation,   "30.0", "Sun elevation in degrees above horizon (-90..90). Drives day/sunset/night blend in procedural sky.", CVAR_ARCHIVE);
-    PT_CVAR(r_sun_azimuth,     "135.0","Sun azimuth in degrees (0=north, 90=east, 180=south, 270=west).", CVAR_ARCHIVE);
+    PT_CVAR(r_sun_elevation,   "30.0", "Sun elevation in degrees above horizon (-90..90). Drives day/sunset/night blend in procedural sky. Overridden when r_sky_use_astronomical = 1.", CVAR_ARCHIVE);
+    PT_CVAR(r_sun_azimuth,     "135.0","Sun azimuth in degrees (0=north, 90=east, 180=south, 270=west). Overridden when r_sky_use_astronomical = 1.", CVAR_ARCHIVE);
+
+    // Astronomical sky parameters. r_sky_use_astronomical=1 overrides
+    // the manual sun cvars with positions computed from observer
+    // lat/lon and current UTC time. Default location: Chennai, India.
+    PT_CVAR(r_sky_use_astronomical, "0",
+            "1 = compute sun position from r_sky_lat/r_sky_lon and current UTC, ignoring r_sun_elevation/r_sun_azimuth. 0 = use manual sun cvars.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_sky_lat,         "13.0827", "Observer latitude in degrees (+N). Default: Chennai, India.", CVAR_ARCHIVE);
+    PT_CVAR(r_sky_lon,         "80.2707", "Observer longitude in degrees (+E). Default: Chennai, India.", CVAR_ARCHIVE);
+    PT_CVAR(r_sky_time_offset, "0.0",     "Hours to add to current UTC when computing astronomical sun (negative = past, positive = future). Useful for testing different times of day.", CVAR_ARCHIVE);
+    PT_CVAR(r_sky_city,        "chennai", "Preset observer location. Selecting one writes r_sky_lat / r_sky_lon to that city's coordinates. 'custom' leaves them as-is.", CVAR_ARCHIVE);
+    PT_CVAR(r_show_stars,      "1",       "Render a procedural starfield at night (sun below horizon). Procedural for now; real BSC catalog later.", CVAR_ARCHIVE);
 
     // Camera controls.  Mouse-look engages while RIGHT mouse is held.
     PT_CVAR(cam_speed,         "3.0", "Movement speed (units/sec)",        CVAR_ARCHIVE);
@@ -975,10 +989,32 @@ void Engine::RenderFrame() {
     std::memcpy(push.prev_view_proj, glm::value_ptr(prev_vp),        sizeof(push.prev_view_proj));
 
     // Sun direction from elevation/azimuth (degrees). Convention:
-    // +Y up, -Z forward (north), +X right (east).
+    // +Y up, -Z forward (north), +X right (east). When
+    // r_sky_use_astronomical is on, override with computed positions
+    // from the observer lat/lon and current UTC.
     float sun_elev_deg = 30.0f, sun_azim_deg = 135.0f;
-    if (auto* v = C.FindCVar("r_sun_elevation")) sun_elev_deg = v->GetFloat();
-    if (auto* v = C.FindCVar("r_sun_azimuth"))   sun_azim_deg = v->GetFloat();
+    bool astro_on = false;
+    if (auto* v = C.FindCVar("r_sky_use_astronomical")) astro_on = v->GetBool();
+    if (astro_on) {
+        double lat = 13.0827, lon = 80.2707, off_h = 0.0;
+        if (auto* v = C.FindCVar("r_sky_lat"))         lat   = v->GetFloat();
+        if (auto* v = C.FindCVar("r_sky_lon"))         lon   = v->GetFloat();
+        if (auto* v = C.FindCVar("r_sky_time_offset")) off_h = v->GetFloat();
+        const std::time_t now = std::time(nullptr);
+        const double jd = pt::astro::julianDateFromTimeT(now)
+                        + off_h / 24.0;
+        auto sun_eq = pt::astro::sunPosition(jd);
+        auto sun_h  = pt::astro::equatorialToHorizon(sun_eq, lat, lon, jd);
+        sun_elev_deg = static_cast<float>(sun_h.altitude_deg);
+        sun_azim_deg = static_cast<float>(sun_h.azimuth_deg);
+        // Reflect computed values back to the manual cvars so the
+        // settings panel shows the real numbers (read-only feel).
+        C.SetCVarOverride("r_sun_elevation", std::to_string(sun_elev_deg));
+        C.SetCVarOverride("r_sun_azimuth",   std::to_string(sun_azim_deg));
+    } else {
+        if (auto* v = C.FindCVar("r_sun_elevation")) sun_elev_deg = v->GetFloat();
+        if (auto* v = C.FindCVar("r_sun_azimuth"))   sun_azim_deg = v->GetFloat();
+    }
     const float elev_r = glm::radians(sun_elev_deg);
     const float azim_r = glm::radians(sun_azim_deg);
     const float ce = std::cos(elev_r), se = std::sin(elev_r);
@@ -1002,6 +1038,9 @@ void Engine::RenderFrame() {
     float manual_exp = 1.5f;
     if (auto* v = C.FindCVar("r_exposure")) manual_exp = v->GetFloat();
     push.exposure_pad[0] = auto_exp ? current_exposure_ : manual_exp;
+    bool show_stars = true;
+    if (auto* v = C.FindCVar("r_show_stars")) show_stars = v->GetBool();
+    push.exposure_pad[1] = show_stars ? 1.0f : 0.0f;
 
     static_assert(sizeof(PtPush) == 272);
     cb->PushConstants(&push, sizeof(push));
@@ -1603,6 +1642,73 @@ void Engine::RegisterCommands() {
     }
     if (auto* v = C.FindCVar("r_exposure")) {
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    if (auto* v = C.FindCVar("r_sky_use_astronomical")) {
+        v->allowed_values = {"0", "1"};
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    if (auto* v = C.FindCVar("r_show_stars")) {
+        v->allowed_values = {"0", "1"};
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    if (auto* v = C.FindCVar("r_sky_lat") ) v->on_change = [this](const pt::console::CVar&){ accum_dirty_ = true; };
+    if (auto* v = C.FindCVar("r_sky_lon") ) v->on_change = [this](const pt::console::CVar&){ accum_dirty_ = true; };
+    if (auto* v = C.FindCVar("r_sky_time_offset")) v->on_change = [this](const pt::console::CVar&){ accum_dirty_ = true; };
+
+    // City preset dropdown. Each entry is (name, lat, lon). Selecting
+    // one writes lat/lon to the geographic cvars; "custom" leaves
+    // them as-is so the user can dial in arbitrary coordinates.
+    if (auto* v = C.FindCVar("r_sky_city")) {
+        v->allowed_values = {
+            "chennai", "mumbai", "delhi", "bangalore",
+            "tokyo", "singapore", "beijing", "seoul",
+            "london", "paris", "berlin", "moscow",
+            "new_york", "san_francisco", "los_angeles", "chicago",
+            "sao_paulo", "buenos_aires",
+            "sydney", "auckland",
+            "cairo", "cape_town",
+            "reykjavik", "anchorage",
+            "custom",
+        };
+        v->on_change = [this](const pt::console::CVar& cv) {
+            struct CityRow { const char* name; double lat; double lon; };
+            static const CityRow cities[] = {
+                {"chennai",        13.0827,   80.2707},
+                {"mumbai",         19.0760,   72.8777},
+                {"delhi",          28.6139,   77.2090},
+                {"bangalore",      12.9716,   77.5946},
+                {"tokyo",          35.6762,  139.6503},
+                {"singapore",       1.3521,  103.8198},
+                {"beijing",        39.9042,  116.4074},
+                {"seoul",          37.5665,  126.9780},
+                {"london",         51.5074,   -0.1278},
+                {"paris",          48.8566,    2.3522},
+                {"berlin",         52.5200,   13.4050},
+                {"moscow",         55.7558,   37.6173},
+                {"new_york",       40.7128,  -74.0060},
+                {"san_francisco",  37.7749, -122.4194},
+                {"los_angeles",    34.0522, -118.2437},
+                {"chicago",        41.8781,  -87.6298},
+                {"sao_paulo",     -23.5505,  -46.6333},
+                {"buenos_aires",  -34.6037,  -58.3816},
+                {"sydney",        -33.8688,  151.2093},
+                {"auckland",      -36.8485,  174.7633},
+                {"cairo",          30.0444,   31.2357},
+                {"cape_town",     -33.9249,   18.4241},
+                {"reykjavik",      64.1466,  -21.9426},
+                {"anchorage",      61.2181, -149.9003},
+            };
+            if (cv.value == "custom") { accum_dirty_ = true; return; }
+            for (const auto& c : cities) {
+                if (cv.value == c.name) {
+                    auto& C2 = pt::console::Console::Get();
+                    C2.SetCVarOverride("r_sky_lat", std::to_string(c.lat));
+                    C2.SetCVarOverride("r_sky_lon", std::to_string(c.lon));
+                    accum_dirty_ = true;
+                    return;
+                }
+            }
+        };
     }
     // app_vsync / app_overlay_enabled / app_auto_open_console / dev_cheats:
     // boolean toggles -- accept 0|1.

@@ -65,7 +65,8 @@ cbuffer Push {
     // after a float3 in MSL.
     float4 sun_and_mode;
     // .x = manual HDR exposure multiplier applied before ACES tonemap.
-    // .yzw reserved for future scalar tweaks (white balance, gamma...).
+    // .y = 1.0 if procedural starfield should render (sun-below-horizon).
+    // .zw reserved.
     float4 exposure_pad;
 };
 
@@ -256,6 +257,38 @@ float3 procSky(float3 rd, float3 sun) {
     float3 night = float3(0.005, 0.010, 0.030) +
                    smoothstep(0.0, 0.05, abs(cosTheta - 0.0)) * 0.0;
     sky = lerp(night, sky, day);
+
+    // Procedural starfield. Hash-based scatter -- not real stars (no
+    // BSC catalog yet), but visually convincing. Bright enough to
+    // punch through the dim night sky but invisible during day. Cells
+    // are ~2000x1000 lat-long units; a small fraction host a visible
+    // star whose brightness is pow(hash, 5) so we get a few bright
+    // points and many dim ones.
+    if (cosTheta > -0.05 && exposure_pad.y > 0.5 && day < 0.6) {
+        // Cells sized so each one is ~3-5 pixels wide on a 1080p frame
+        // -- smaller cells make stars sub-pixel and they vanish.
+        float2 ll = float2(atan2(rd.z, rd.x) * (1.0 / 6.28318530718) + 0.5,
+                           acos(clamp(rd.y, -1.0, 1.0)) * (1.0 / 3.14159265359));
+        ll *= float2(700.0, 350.0);
+        float2 cellI = floor(ll);
+        float2 cellF = ll - cellI;
+        float h  = frac(sin(dot(cellI, float2(127.1, 311.7))) * 43758.5453);
+        float h2 = frac(sin(dot(cellI, float2(269.5, 183.3)))  * 91842.1417);
+        if (h > 0.96) {
+            float2 starPos = float2(0.30 + h2 * 0.40,
+                                    0.30 + frac(h * 7.91) * 0.40);
+            float dist = length(cellF - starPos);
+            float brightness = pow(frac(h * 13.7), 4.0) * 4.0 + 0.5;
+            float intensity = brightness * exp(-dist * dist * 100.0);
+            float colorMix = frac(h * 5.31);
+            float3 hot  = float3(0.85, 0.92, 1.10);
+            float3 mid  = float3(1.00, 0.98, 0.95);
+            float3 cool = float3(1.05, 0.85, 0.70);
+            float3 starColor = (colorMix < 0.33) ? hot
+                              : (colorMix < 0.80) ? mid : cool;
+            sky += intensity * starColor * (1.0 - day);
+        }
+    }
 
     // Sun disk: very tight angular radius (~0.25 deg ~= cos > 0.99996).
     float disk = smoothstep(0.99996, 0.99999, cosGamma);
