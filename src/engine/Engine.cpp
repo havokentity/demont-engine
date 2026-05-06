@@ -57,6 +57,7 @@ namespace cvar {
     PT_CVAR(r_max_bounces,     "8",  "Max path bounces per ray",          CVAR_ARCHIVE);
     PT_CVAR(r_spp,             "1",  "Samples per pixel per dispatch (>=1). Higher = cleaner motion frames at proportional GPU cost.", CVAR_ARCHIVE);
     PT_CVAR(r_denoiser,        "off","Denoiser: off|metalfx (Mac MetalFX TemporalDenoisedScaler).", CVAR_ARCHIVE);
+    PT_CVAR(r_exposure,        "1.5","Manual HDR exposure multiplier applied before ACES tonemap. Bump up when scenes look washed out (denoiser-off path). MetalFX denoiser does its own auto-exposure so this is mostly a no-denoiser knob.", CVAR_ARCHIVE);
     PT_CVAR(r_env_map,         "",   "Path to a Radiance .hdr environment map. Used when r_sky_mode = hdri.", CVAR_ARCHIVE);
     PT_CVAR(r_env_intensity,   "1.0","Scalar multiplier on env-map samples. Useful for darkening/brightening the IBL without re-authoring the HDRI.", CVAR_ARCHIVE);
 
@@ -920,6 +921,7 @@ void Engine::RenderFrame() {
         float curr_view_proj[16];
         float prev_view_proj[16];
         float sun_and_mode[4];            // .xyz = sun_dir, .w = float(sky_mode)
+        float exposure_pad[4];            // .x = manual exposure, .yzw reserved
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -991,7 +993,11 @@ void Engine::RenderFrame() {
     push.sun_and_mode[3] = float(sky_mode_id);
     push.env_map_present = (sky_mode_id == 1u) ? 1u : 0u;
 
-    static_assert(sizeof(PtPush) == 256);
+    float exposure = 1.5f;
+    if (auto* v = C.FindCVar("r_exposure")) exposure = v->GetFloat();
+    push.exposure_pad[0] = exposure;     // pad[1..3] already zero-initialised
+
+    static_assert(sizeof(PtPush) == 272);
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
 
@@ -1550,6 +1556,9 @@ void Engine::RegisterCommands() {
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
     if (auto* v = C.FindCVar("r_sun_azimuth")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    if (auto* v = C.FindCVar("r_exposure")) {
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
     // app_vsync / app_overlay_enabled / app_auto_open_console / dev_cheats:

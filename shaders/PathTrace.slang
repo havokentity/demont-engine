@@ -64,6 +64,9 @@ cbuffer Push {
     // host's uint sky_mode follows the 16-byte alignment Slang puts
     // after a float3 in MSL.
     float4 sun_and_mode;
+    // .x = manual HDR exposure multiplier applied before ACES tonemap.
+    // .yzw reserved for future scalar tweaks (white balance, gamma...).
+    float4 exposure_pad;
 };
 
 static const uint MAT_LAMBERT    = 0u;
@@ -568,5 +571,5 @@ void main(uint2 tid : SV_DispatchThreadID) {
         denoise_color[tid] = float4(frame_radiance, 1.0);
     }
 
-    output[tid] = float4(acesTonemap(avg), 1.0);
+    output[tid] = float4(acesTonemap(avg * exposure_pad.x), 1.0);
 }
