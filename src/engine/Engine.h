@@ -126,6 +126,8 @@ private:
 
     std::uint64_t                               pathtrace_pipeline_id_ = 0;
     std::uint64_t                               tonemap_pipeline_id_   = 0;
+    std::uint64_t                               bloom_down_pipeline_id_ = 0;
+    std::uint64_t                               bloom_up_pipeline_id_   = 0;
     std::uint64_t                               accum_texture_id_      = 0;
     std::uint64_t                               box_blas_id_           = 0;
     std::uint64_t                               scene_tlas_id_         = 0;
@@ -143,6 +145,17 @@ private:
     // exposure+ACES-encoded sRGB into the swapchain. Co-allocated +
     // resized with the other denoiser-related textures.
     std::uint64_t                               post_denoise_hdr_tex_id_ = 0;
+
+    // Bloom mip chain. mip 0 is half-res of the swapchain; each
+    // subsequent mip halves again. Built every frame from
+    // post_denoise_hdr_tex_ via threshold + downsample + upsample
+    // passes; sampled by the tonemap kernel before ACES so bloom
+    // gets the same curve compression as the rest of the image.
+    static constexpr int                        kBloomMips = 5;
+    std::uint64_t                               bloom_mip_tex_id_[kBloomMips] {};
+    std::uint32_t                               bloom_mip_w_[kBloomMips] {};
+    std::uint32_t                               bloom_mip_h_[kBloomMips] {};
+    std::uint64_t                               bloom_dummy_tex_id_ = 0;   // 1x1 RGBA16F when bloom off
 
     // P11 environment map. Allocated when r_env_map cvar points at a
     // valid .hdr file; freed on cvar change or device teardown. The

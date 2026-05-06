@@ -30,6 +30,7 @@
     'r_sky_use_astronomical', 'r_sky_city',
     'r_exposure', 'r_auto_exposure', 'r_eye_model',
     'r_quality', 'r_dof', 'r_dof_aperture', 'r_dof_focal_distance',
+    'r_bloom', 'r_bloom_intensity', 'r_bloom_threshold',
   ];
   const pinnedRaw = localStorage.getItem('demont.pinned');
   const pinned = new Set(pinnedRaw === null
@@ -171,7 +172,7 @@
     if (/^env_/.test(tail))                                                 return { top: 'r', sub: 'env' };
     if (/^exposure|^auto_exposure$|^eye_/.test(tail))                       return { top: 'r', sub: 'camera' };
     if (/^caustics$|^refract|^quality$|^spp$|^max_bounces$/.test(tail))     return { top: 'r', sub: 'integrator' };
-    if (/^denoiser$|^hdr_/.test(tail))                                      return { top: 'r', sub: 'post' };
+    if (/^denoiser$|^hdr_|^bloom/.test(tail))                               return { top: 'r', sub: 'post' };
     return { top: 'r', sub: 'display' };
   }
 

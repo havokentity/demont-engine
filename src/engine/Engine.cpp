@@ -64,6 +64,10 @@ namespace cvar {
     PT_CVAR(r_refract_bounces, "4",  "Maximum dielectric refractions a single shadow ray may chain through before giving up (returns no contribution). Higher catches more multi-facet caustics; lower is faster.", CVAR_ARCHIVE);
     PT_CVAR(r_denoiser,        "off","Denoiser: off|metalfx (Mac MetalFX TemporalDenoisedScaler).", CVAR_ARCHIVE);
     PT_CVAR(r_hdr_pipeline,    "1",  "Linear-HDR pipeline through MetalFX. 1 = path tracer writes raw HDR, MetalFX denoises in HDR, post-pass applies exposure+ACES (recommended). 0 = path tracer pre-applies exposure+ACES, MetalFX denoises LDR, tonemap pass is a passthrough copy. Only affects the denoiser-on path.", CVAR_ARCHIVE);
+    PT_CVAR(r_bloom,           "1",  "HDR bloom (downsample/upsample pyramid, additive composite before ACES). 0 disables; tonemap then samples a 1x1 zero buffer.", CVAR_ARCHIVE);
+    PT_CVAR(r_bloom_threshold, "1.0","Linear-HDR luminance threshold for the bloom extract. Pixels below this value contribute nothing to the pyramid; pixels above contribute proportional to (lum - threshold). The path tracer's pixels are in tonemap-relative units (sun ~30, env ~3) so a threshold of 1.0 picks up only HDR highlights.", CVAR_ARCHIVE);
+    PT_CVAR(r_bloom_intensity, "0.05","Linear blend factor of the bloom layer added on top of the HDR image before tonemap. 0 disables, 1 makes the bloom layer dominate. Realistic camera lens flare is in the 0.02-0.10 range.", CVAR_ARCHIVE);
+    PT_CVAR(r_bloom_mips,      "5",  "How many mip levels the bloom pyramid uses (1..5). More mips = a softer / wider halo; fewer mips = a tighter glow. Capped to kBloomMips at compile time.", CVAR_ARCHIVE);
     PT_CVAR(r_exposure,        "1.5","Manual HDR exposure multiplier applied before ACES tonemap. Used when r_auto_exposure = 0.", CVAR_ARCHIVE);
     PT_CVAR(r_auto_exposure,   "1",  "Auto-exposure: 0 = use r_exposure manual value, 1 = sample accum_hdr each frame and adapt exposure toward r_exposure_target (eye-adaptation feel).", CVAR_ARCHIVE);
     PT_CVAR(r_exposure_min,    "0.05",  "Minimum exposure scalar that auto-exposure can settle on. Stops a nuclear-bright scene from being crushed below this value.", CVAR_ARCHIVE);
@@ -347,6 +351,11 @@ void Engine::TearDownDevice() {
         if (depth_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
         if (motion_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
         if (post_denoise_hdr_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
+        for (auto& id : bloom_mip_tex_id_) {
+            if (id != 0) device_->DestroyTexture(pt::rhi::TextureHandle{id});
+            id = 0;
+        }
+        if (bloom_dummy_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{bloom_dummy_tex_id_});
         if (env_map_tex_id_         != 0) device_->DestroyTexture(pt::rhi::TextureHandle{env_map_tex_id_});
         if (env_marginal_cdf_id_    != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{env_marginal_cdf_id_});
         if (env_conditional_cdf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{env_conditional_cdf_id_});
@@ -363,6 +372,12 @@ void Engine::TearDownDevice() {
     motion_tex_id_           = 0;
     post_denoise_hdr_tex_id_ = 0;
     tonemap_pipeline_id_     = 0;
+    bloom_down_pipeline_id_  = 0;
+    bloom_up_pipeline_id_    = 0;
+    bloom_dummy_tex_id_      = 0;
+    for (auto& id : bloom_mip_tex_id_) id = 0;
+    for (auto& w  : bloom_mip_w_)      w  = 0;
+    for (auto& h  : bloom_mip_h_)      h  = 0;
     env_map_tex_id_       = 0;
     env_marginal_cdf_id_      = 0;
     env_conditional_cdf_id_   = 0;
@@ -429,6 +444,18 @@ void Engine::RequestBackendSwitch(BackendType to) {
             .kernel_name = "tonemap", .bytecode = {}, .debug_name = "tonemap",
         };
         tonemap_pipeline_id_ = device_->CreateComputePipeline(desc).id;
+    }
+    {
+        pt::rhi::ComputePipelineDesc desc{
+            .kernel_name = "bloom_down", .bytecode = {}, .debug_name = "bloom_down",
+        };
+        bloom_down_pipeline_id_ = device_->CreateComputePipeline(desc).id;
+    }
+    {
+        pt::rhi::ComputePipelineDesc desc{
+            .kernel_name = "bloom_up", .bytecode = {}, .debug_name = "bloom_up",
+        };
+        bloom_up_pipeline_id_ = device_->CreateComputePipeline(desc).id;
     }
 
     // Mark the analytic-primitive buffer dirty so it gets uploaded on
@@ -891,6 +918,10 @@ void Engine::RenderFrame() {
             if (depth_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
             if (motion_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
             if (post_denoise_hdr_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
+            for (auto& id : bloom_mip_tex_id_) {
+                if (id != 0) device_->DestroyTexture(pt::rhi::TextureHandle{id});
+                id = 0;
+            }
             denoise_color_tex_id_ = depth_tex_id_ = motion_tex_id_ = post_denoise_hdr_tex_id_ = 0;
         }
     }
@@ -980,6 +1011,42 @@ void Engine::RenderFrame() {
             motion_tex_id_        == 0 || post_denoise_hdr_tex_id_ == 0) {
             LOG_ERROR("denoiser G-buffer allocation failed at {}x{}", fc.width, fc.height);
             denoiser_active_ = false;
+        }
+        // Bloom mip chain. mip[0] is half-res; each subsequent mip
+        // halves again. Caps at 1x1 if the swapchain is tiny. Always
+        // allocated alongside the denoiser textures since bloom is
+        // bound through the tonemap pass.
+        for (int i = 0; i < kBloomMips; ++i) {
+            if (bloom_mip_tex_id_[i] != 0) {
+                device_->DestroyTexture(pt::rhi::TextureHandle{bloom_mip_tex_id_[i]});
+                bloom_mip_tex_id_[i] = 0;
+            }
+            std::uint32_t bw = std::max(1u, fc.width  >> (i + 1));
+            std::uint32_t bh = std::max(1u, fc.height >> (i + 1));
+            auto bm = device_->CreateTexture({
+                .width = bw, .height = bh,
+                .format = pt::rhi::TextureFormat::RGBA16F,
+                .usage  = pt::rhi::TextureUsage::Storage,
+                .debug_name = "bloom_mip",
+            });
+            bloom_mip_tex_id_[i] = bm.id;
+            bloom_mip_w_[i]      = bw;
+            bloom_mip_h_[i]      = bh;
+        }
+        // 1x1 zero-filled placeholder bound to the tonemap pass when
+        // bloom is disabled. Tonemap's bloom_intensity push is set to
+        // 0 in that case, but Metal still demands the slot be bound;
+        // a tiny dummy avoids leaving the slot empty.
+        if (bloom_dummy_tex_id_ == 0) {
+            auto dh = device_->CreateTexture({
+                .width = 1, .height = 1,
+                .format = pt::rhi::TextureFormat::RGBA16F,
+                .usage  = pt::rhi::TextureUsage::Storage,
+                .debug_name = "bloom_dummy",
+            });
+            bloom_dummy_tex_id_ = dh.id;
+            std::uint16_t zero[4] {0,0,0,0};
+            if (dh.id != 0) device_->WriteTexture(dh, zero, sizeof(zero));
         }
     }
 
@@ -1304,23 +1371,79 @@ void Engine::RenderFrame() {
         dd.view_to_clip  = glm::value_ptr(proj);
         device_->Denoise(dd);
 
+        // Bloom pyramid: extract bright HDR pixels into bloom_mip[0]
+        // (with luminance threshold), then progressively downsample
+        // through the chain, then upsample additively back up to mip
+        // 0. The result in mip 0 is sampled by the tonemap kernel
+        // and added pre-ACES so the bloom gets the same curve squash
+        // as the rest of the image.
+        bool bloom_on = false;
+        if (auto* v = C.FindCVar("r_bloom")) bloom_on = v->GetBool();
+        float bloom_thresh = 1.0f, bloom_intensity = 0.05f;
+        int   bloom_mips   = kBloomMips;
+        if (auto* v = C.FindCVar("r_bloom_threshold")) bloom_thresh    = v->GetFloat();
+        if (auto* v = C.FindCVar("r_bloom_intensity")) bloom_intensity = v->GetFloat();
+        if (auto* v = C.FindCVar("r_bloom_mips"))      bloom_mips      = v->GetInt();
+        if (bloom_mips < 1) bloom_mips = 1;
+        if (bloom_mips > kBloomMips) bloom_mips = kBloomMips;
+
+        if (bloom_on && bloom_mip_tex_id_[0] != 0 && bloom_intensity > 0.0f) {
+            // Downsample chain: post_denoise_hdr -> mip0 (with
+            // threshold), mip0 -> mip1, ..., mip[N-2] -> mip[N-1].
+            for (int i = 0; i < bloom_mips; ++i) {
+                cb->BindComputePipeline(pt::rhi::PipelineHandle{bloom_down_pipeline_id_});
+                pt::rhi::TextureHandle src_h{
+                    (i == 0) ? post_denoise_hdr_tex_id_ : bloom_mip_tex_id_[i - 1]};
+                pt::rhi::TextureHandle dst_h{bloom_mip_tex_id_[i]};
+                cb->BindStorageTexture(0, src_h);
+                cb->BindStorageTexture(1, dst_h);
+                struct DownPush { float threshold; float pad[3]; } dp{};
+                // Threshold only applies on the first mip; later mips
+                // are downsampling already-extracted bright pixels.
+                dp.threshold = (i == 0) ? bloom_thresh : 0.0f;
+                cb->PushConstants(&dp, sizeof(dp));
+                cb->Dispatch((bloom_mip_w_[i] + 7) / 8,
+                             (bloom_mip_h_[i] + 7) / 8, 1);
+            }
+            // Upsample chain: mip[N-1] -> mip[N-2] (additive),
+            // mip[N-2] -> mip[N-3], ..., mip 1 -> mip 0. Result
+            // accumulates into mip 0 which is the layer the tonemap
+            // pass samples.
+            for (int i = bloom_mips - 1; i > 0; --i) {
+                cb->BindComputePipeline(pt::rhi::PipelineHandle{bloom_up_pipeline_id_});
+                cb->BindStorageTexture(0, pt::rhi::TextureHandle{bloom_mip_tex_id_[i]});
+                cb->BindStorageTexture(1, pt::rhi::TextureHandle{bloom_mip_tex_id_[i - 1]});
+                cb->Dispatch((bloom_mip_w_[i - 1] + 7) / 8,
+                             (bloom_mip_h_[i - 1] + 7) / 8, 1);
+            }
+        }
+
         // Post-denoise tonemap: linear HDR -> exposure -> ACES -> sRGB
         // swapchain (gamma encode is implicit on store of the BGRA8_sRGB
-        // surface). One push float for exposure; the kernel infers
-        // dispatch size from the swapchain texture dimensions.
+        // surface).
         cb->BindComputePipeline(pt::rhi::PipelineHandle{tonemap_pipeline_id_});
         cb->BindStorageTexture(0, pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
         cb->BindStorageTexture(1, fc.swapchain_image);
+        // Bind bloom mip 0 (built above) when bloom is on, else a
+        // 1x1 zero texture so the slot has *something* and the
+        // shader's branch on bloom_intensity > 0 keeps it skipped.
+        pt::rhi::TextureHandle bloom_h{
+            (bloom_on && bloom_intensity > 0.0f && bloom_mip_tex_id_[0] != 0)
+                ? bloom_mip_tex_id_[0]
+                : bloom_dummy_tex_id_};
+        if (bloom_h.id != 0) cb->BindStorageTexture(2, bloom_h);
         bool hdr_pipeline = true;
         if (auto* v = C.FindCVar("r_hdr_pipeline")) hdr_pipeline = v->GetBool();
         struct TonePush {
             float        exposure;
-            std::uint32_t passthrough;   // 1 = copy hdr_in -> ldr_out (path
-                                         //     tracer already tonemapped)
-            float        pad[2];
+            std::uint32_t passthrough;
+            float        bloom_intensity;
+            float        pad;
         } tp{};
-        tp.exposure    = push.exposure_pad[0];     // mirrors path-tracer exposure
-        tp.passthrough = hdr_pipeline ? 0u : 1u;
+        tp.exposure        = push.exposure_pad[0];
+        tp.passthrough     = hdr_pipeline ? 0u : 1u;
+        tp.bloom_intensity = (bloom_on && bloom_h.id == bloom_mip_tex_id_[0])
+                                ? bloom_intensity : 0.0f;
         cb->PushConstants(&tp, sizeof(tp));
         cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
     }
@@ -1970,6 +2093,12 @@ void Engine::RegisterCommands() {
         v->allowed_values = {"0", "1"};
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
+    if (auto* v = C.FindCVar("r_bloom")) {
+        v->allowed_values = {"0", "1"};
+    }
+    // Bloom intensity / threshold / mips don't reset accumulation:
+    // they're applied in the post-tonemap pass each frame, no
+    // dependency on path-tracer state.
     if (auto* v = C.FindCVar("r_caustics")) {
         v->allowed_values = {"0", "1"};
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
@@ -2242,6 +2371,9 @@ void Engine::RegisterCommands() {
     set_slider("r_dof_aperture",        0.0f,   1.0f,  0.001f);
     set_slider("r_dof_focal_distance",  0.1f, 100.0f,  0.1f);
     set_slider("r_dof_blades",          0.0f,  16.0f,  1.0f);
+    set_slider("r_bloom_threshold",     0.0f,  10.0f,  0.05f);
+    set_slider("r_bloom_intensity",     0.0f,   1.0f,  0.005f);
+    set_slider("r_bloom_mips",          1.0f,   5.0f,  1.0f);
 
     RegisterCsgCommands();
     RegisterPrimCommands();
