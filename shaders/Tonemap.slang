@@ -25,14 +25,20 @@
 [[vk::push_constant]]
 cbuffer Push {
     float exposure;
-    // 1 = passthrough copy (the path tracer already applied exposure +
-    // ACES). 0 = apply exposure + ACES here. The engine drives this
-    // off r_hdr_pipeline so users can A/B the two paths.
     uint  passthrough;
-    // Linear scale on the bloom layer added pre-tonemap. 0 = no
-    // bloom (skip the sample entirely so a dummy 1x1 binding works).
     float bloom_intensity;
-    float pad;
+    // Lens flare. Samples the bloom mip at mirrored-across-centre
+    // screen positions to fake internal lens reflections. 0 = no
+    // flare (skip the loop).
+    float flare_intensity;
+    // Per-channel offset between R/G/B sample scales -- creates the
+    // chromatic-aberration rainbow fringe along ghost edges. 0 = no
+    // dispersion (achromatic ghosts). Real range 0.0..0.05.
+    float flare_dispersion;
+    // Number of ghost reflections (1..6). The shader has 6
+    // hardcoded ghost scales; this caps how many to use.
+    uint  flare_count;
+    float pad[2];
 };
 
 float3 acesTonemap(float3 c) {
@@ -54,19 +60,25 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
     float3 c = hdr_in[tid.xy].rgb;
 
-    // Add bloom (linear, pre-tonemap) so highlights get the same
-    // ACES curve squash as the rest of the image. Bilinear sample
-    // from the half-res mip-0 of the bloom pyramid; the engine
-    // zero-fills the texture when r_bloom is off so this branch
-    // costs ~4 texel reads either way -- skip them entirely when
-    // intensity is zero to keep the no-bloom path branch-free.
+    // Bloom + lens flare both bilinear-sample the bloom pyramid;
+    // factor the bilinear sampler into a helper so the flare loop
+    // doesn't repeat the math six times.
+    uint2 bdim;
+    bloom_tex.GetDimensions(bdim.x, bdim.y);
+    int2  bd = int2(bdim);
+
+    // sampleBloomUV(uv): bilinear bloom_tex sample at normalised UV.
+    // (out-of-range UVs clamp to edges -- ghost positions can land
+    // off-screen and should fade rather than wrap or sample garbage.)
+    // No anonymous helpers in Slang/HLSL profile we ship, so keep
+    // this inlined per call site.
+
+    // Bloom (linear, pre-tonemap) so highlights get the same
+    // ACES curve squash as the rest of the image.
     if (bloom_intensity > 0.0) {
-        uint2 bdim;
-        bloom_tex.GetDimensions(bdim.x, bdim.y);
         float2 fb = (float2(tid.xy) + 0.5) * float2(bdim) / float2(dim) - 0.5;
         int2  i0  = int2(floor(fb));
         float2 t  = frac(fb);
-        int2  bd  = int2(bdim);
         int2 p00 = clamp(i0,                  int2(0,0), bd - int2(1,1));
         int2 p10 = clamp(i0 + int2(1,0),      int2(0,0), bd - int2(1,1));
         int2 p01 = clamp(i0 + int2(0,1),      int2(0,0), bd - int2(1,1));
@@ -78,6 +90,99 @@ void main(uint3 tid : SV_DispatchThreadID) {
         float3 b0  = lerp(b00, b10, t.x);
         float3 b1  = lerp(b01, b11, t.x);
         c += bloom_intensity * lerp(b0, b1, t.y);
+    }
+
+    // Lens flare. Reflections off internal lens elements appear in a
+    // real camera as ghost copies of bright sources placed
+    // approximately mirrored across the lens centre, with various
+    // sub-/super-magnifications. We fake the effect by sampling the
+    // already-extracted bloom layer at N "mirror scale" positions:
+    //   sample_uv = -(uv - 0.5) * scale + 0.5
+    // and adding the result back, tinted per ghost so the artefact
+    // reads as colourful flare rather than a duplicate sun. Per-
+    // channel scale offsets give the rainbow chromatic aberration
+    // you see on cheap lenses.
+    if (flare_intensity > 0.0) {
+        // 6 ghost scales + tints. The scales spread inwards (< 1)
+        // and outwards (> 1) of the centre, the tints rotate around
+        // the colour wheel so a single bright source spawns a
+        // varied flare rather than 6 identical copies.
+        const float kScales[6] = {0.55, 0.78, 1.20, 1.45, 1.85, 2.40};
+        const float3 kTints[6] = {
+            float3(1.00, 0.55, 0.55),  // red
+            float3(0.55, 1.00, 0.55),  // green
+            float3(0.55, 0.55, 1.00),  // blue
+            float3(1.00, 0.75, 0.40),  // amber
+            float3(0.65, 0.40, 1.00),  // purple
+            float3(0.40, 0.95, 0.80),  // teal
+        };
+        float2 uv = (float2(tid.xy) + 0.5) / float2(dim);
+        float2 cv = uv - 0.5;
+        uint   n  = min(flare_count, 6u);
+        float3 flare = float3(0.0);
+        for (uint gi = 0u; gi < n; ++gi) {
+            float scale = kScales[gi];
+            // Per-channel scale offset for chromatic dispersion.
+            // Flipping sign for B vs R puts blue and red on opposite
+            // sides of the green ghost -- canonical lens-flare look.
+            float disp = flare_dispersion;
+            float2 g_uv_r = -cv * (scale + disp) + 0.5;
+            float2 g_uv_g = -cv *  scale         + 0.5;
+            float2 g_uv_b = -cv * (scale - disp) + 0.5;
+            // Bilinear sample on each channel's UV. Ghosts that
+            // land off-screen clamp to the edge tint -- visually
+            // they fade because the bloom tex is mostly zero there.
+            float3 r3, g3, b3;
+            {
+                float2 fb = g_uv_r * float2(bdim) - 0.5;
+                int2 i0 = int2(floor(fb));
+                float2 t = frac(fb);
+                int2 p00 = clamp(i0,             int2(0,0), bd - int2(1,1));
+                int2 p10 = clamp(i0 + int2(1,0), int2(0,0), bd - int2(1,1));
+                int2 p01 = clamp(i0 + int2(0,1), int2(0,0), bd - int2(1,1));
+                int2 p11 = clamp(i0 + int2(1,1), int2(0,0), bd - int2(1,1));
+                float3 c00 = bloom_tex[uint2(p00)].rgb;
+                float3 c10 = bloom_tex[uint2(p10)].rgb;
+                float3 c01 = bloom_tex[uint2(p01)].rgb;
+                float3 c11 = bloom_tex[uint2(p11)].rgb;
+                r3 = lerp(lerp(c00, c10, t.x), lerp(c01, c11, t.x), t.y);
+            }
+            {
+                float2 fb = g_uv_g * float2(bdim) - 0.5;
+                int2 i0 = int2(floor(fb));
+                float2 t = frac(fb);
+                int2 p00 = clamp(i0,             int2(0,0), bd - int2(1,1));
+                int2 p10 = clamp(i0 + int2(1,0), int2(0,0), bd - int2(1,1));
+                int2 p01 = clamp(i0 + int2(0,1), int2(0,0), bd - int2(1,1));
+                int2 p11 = clamp(i0 + int2(1,1), int2(0,0), bd - int2(1,1));
+                float3 c00 = bloom_tex[uint2(p00)].rgb;
+                float3 c10 = bloom_tex[uint2(p10)].rgb;
+                float3 c01 = bloom_tex[uint2(p01)].rgb;
+                float3 c11 = bloom_tex[uint2(p11)].rgb;
+                g3 = lerp(lerp(c00, c10, t.x), lerp(c01, c11, t.x), t.y);
+            }
+            {
+                float2 fb = g_uv_b * float2(bdim) - 0.5;
+                int2 i0 = int2(floor(fb));
+                float2 t = frac(fb);
+                int2 p00 = clamp(i0,             int2(0,0), bd - int2(1,1));
+                int2 p10 = clamp(i0 + int2(1,0), int2(0,0), bd - int2(1,1));
+                int2 p01 = clamp(i0 + int2(0,1), int2(0,0), bd - int2(1,1));
+                int2 p11 = clamp(i0 + int2(1,1), int2(0,0), bd - int2(1,1));
+                float3 c00 = bloom_tex[uint2(p00)].rgb;
+                float3 c10 = bloom_tex[uint2(p10)].rgb;
+                float3 c01 = bloom_tex[uint2(p01)].rgb;
+                float3 c11 = bloom_tex[uint2(p11)].rgb;
+                b3 = lerp(lerp(c00, c10, t.x), lerp(c01, c11, t.x), t.y);
+            }
+            float3 ghost = float3(r3.r, g3.g, b3.b);
+            // Radial fade: ghosts fade out as they near the screen
+            // edge so we don't get a hard rectangle of flare on
+            // wide-aperture shots.
+            float fade = saturate(1.0 - length(uv - 0.5) * 1.5);
+            flare += ghost * kTints[gi] * fade;
+        }
+        c += flare_intensity * flare;
     }
 
     float3 ldr = (passthrough != 0u) ? c : acesTonemap(c * exposure);

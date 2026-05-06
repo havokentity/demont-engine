@@ -69,6 +69,10 @@ namespace cvar {
     PT_CVAR(r_bloom_intensity, "0.05","Linear blend factor of the bloom layer added on top of the HDR image before tonemap. 0 disables, 1 makes the bloom layer dominate. Realistic camera lens flare is in the 0.02-0.10 range.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom_mips,      "5",  "How many mip levels the bloom pyramid uses (1..5). More mips = a softer / wider halo; fewer mips = a tighter glow. Capped to kBloomMips at compile time.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom_radius,    "1.0","Per-mip upsample 'spread' multiplier. 1.0 = pixel-accurate dual-filter blur; >1 widens each upsample tap (softer, more diffuse halo); <1 tightens it (sharper core, less spread). Real range 0.5..3.0.", CVAR_ARCHIVE);
+    PT_CVAR(r_lens_flare,      "0",   "Lens flare. Image-based ghost reflections sampled from the bloom layer at mirror-across-centre positions. 0 disables.", CVAR_ARCHIVE);
+    PT_CVAR(r_lens_flare_intensity, "0.15", "Linear blend strength of the flare layer. Real-camera lens flare is typically 0.1-0.3 of the bright source.", CVAR_ARCHIVE);
+    PT_CVAR(r_lens_flare_dispersion, "0.012", "Per-channel scale offset for chromatic aberration on ghosts. 0 = achromatic (white ghosts), >0 = colourful rainbow fringe along ghost edges. Real lenses 0.01-0.03.", CVAR_ARCHIVE);
+    PT_CVAR(r_lens_flare_count,"4",   "Number of ghost reflections to render (1..6). Each ghost has a different scale + colour tint hardcoded in the shader.", CVAR_ARCHIVE);
     PT_CVAR(r_exposure,        "1.5","Manual HDR exposure multiplier applied before ACES tonemap. Used when r_auto_exposure = 0.", CVAR_ARCHIVE);
     PT_CVAR(r_auto_exposure,   "1",  "Auto-exposure: 0 = use r_exposure manual value, 1 = sample accum_hdr each frame and adapt exposure toward r_exposure_target (eye-adaptation feel).", CVAR_ARCHIVE);
     PT_CVAR(r_exposure_min,    "0.05",  "Minimum exposure scalar that auto-exposure can settle on. Stops a nuclear-bright scene from being crushed below this value.", CVAR_ARCHIVE);
@@ -1441,16 +1445,36 @@ void Engine::RenderFrame() {
         if (bloom_h.id != 0) cb->BindStorageTexture(2, bloom_h);
         bool hdr_pipeline = true;
         if (auto* v = C.FindCVar("r_hdr_pipeline")) hdr_pipeline = v->GetBool();
+        bool flare_on = false;
+        float flare_int = 0.15f, flare_disp = 0.012f;
+        int   flare_count = 4;
+        if (auto* v = C.FindCVar("r_lens_flare"))            flare_on    = v->GetBool();
+        if (auto* v = C.FindCVar("r_lens_flare_intensity"))  flare_int   = v->GetFloat();
+        if (auto* v = C.FindCVar("r_lens_flare_dispersion")) flare_disp  = v->GetFloat();
+        if (auto* v = C.FindCVar("r_lens_flare_count"))      flare_count = v->GetInt();
+        if (flare_count < 1) flare_count = 1;
+        if (flare_count > 6) flare_count = 6;
         struct TonePush {
             float        exposure;
             std::uint32_t passthrough;
             float        bloom_intensity;
-            float        pad;
+            float        flare_intensity;
+            float        flare_dispersion;
+            std::uint32_t flare_count;
+            float        pad[2];
         } tp{};
-        tp.exposure        = push.exposure_pad[0];
-        tp.passthrough     = hdr_pipeline ? 0u : 1u;
-        tp.bloom_intensity = (bloom_on && bloom_h.id == bloom_mip_tex_id_[0])
+        tp.exposure         = push.exposure_pad[0];
+        tp.passthrough      = hdr_pipeline ? 0u : 1u;
+        tp.bloom_intensity  = (bloom_on && bloom_h.id == bloom_mip_tex_id_[0])
                                 ? bloom_intensity : 0.0f;
+        // Flare also samples the bloom mip, so it depends on bloom
+        // having actually run. If bloom is off the bloom_tex slot is
+        // the 1x1 placeholder and the flare loop would just sample
+        // zeros -- gate it explicitly to skip the loop entirely.
+        const bool bloom_ran = bloom_on && bloom_h.id == bloom_mip_tex_id_[0];
+        tp.flare_intensity  = (flare_on && bloom_ran) ? flare_int : 0.0f;
+        tp.flare_dispersion = flare_disp;
+        tp.flare_count      = static_cast<std::uint32_t>(flare_count);
         cb->PushConstants(&tp, sizeof(tp));
         cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
     }
@@ -2103,9 +2127,12 @@ void Engine::RegisterCommands() {
     if (auto* v = C.FindCVar("r_bloom")) {
         v->allowed_values = {"0", "1"};
     }
-    // Bloom intensity / threshold / mips don't reset accumulation:
-    // they're applied in the post-tonemap pass each frame, no
-    // dependency on path-tracer state.
+    if (auto* v = C.FindCVar("r_lens_flare")) {
+        v->allowed_values = {"0", "1"};
+    }
+    // Bloom + flare intensity / threshold / mips / count / dispersion
+    // don't reset accumulation: they're applied in the post-tonemap
+    // pass each frame, no dependency on path-tracer state.
     if (auto* v = C.FindCVar("r_caustics")) {
         v->allowed_values = {"0", "1"};
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
@@ -2382,6 +2409,9 @@ void Engine::RegisterCommands() {
     set_slider("r_bloom_intensity",     0.0f,   1.0f,  0.005f);
     set_slider("r_bloom_mips",          1.0f,   5.0f,  1.0f);
     set_slider("r_bloom_radius",        0.5f,   3.0f,  0.05f);
+    set_slider("r_lens_flare_intensity",      0.0f, 1.0f,  0.005f);
+    set_slider("r_lens_flare_dispersion",     0.0f, 0.05f, 0.001f);
+    set_slider("r_lens_flare_count",          1.0f, 6.0f,  1.0f);
 
     RegisterCsgCommands();
     RegisterPrimCommands();
