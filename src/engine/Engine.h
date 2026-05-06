@@ -137,6 +137,14 @@ private:
     // size matches the HDR file (typical 2048x1024 lat-long).
     std::uint64_t                               env_map_tex_id_        = 0;
     std::string                                 env_map_path_;
+
+    // P11 env-map MIS / NEE: precomputed CDFs over luminance. Marginal
+    // is a 1D CDF over rows (length H); conditional is a 2D CDF over
+    // columns within each row (length H*W). Both built when an HDR is
+    // loaded so the path tracer can importance-sample bright regions.
+    std::uint64_t                               env_marginal_cdf_id_   = 0;
+    std::uint64_t                               env_conditional_cdf_id_ = 0;
+    float                                       env_total_luminance_   = 0.0f;
     glm::mat4                                   prev_view_proj_        { 1.0f };  // identity
     bool                                        prev_view_proj_valid_  = false;
     bool                                        denoiser_active_       = false;

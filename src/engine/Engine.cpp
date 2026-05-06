@@ -295,7 +295,9 @@ void Engine::TearDownDevice() {
         if (denoise_color_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
         if (depth_tex_id_         != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
         if (motion_tex_id_        != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
-        if (env_map_tex_id_       != 0) device_->DestroyTexture(pt::rhi::TextureHandle{env_map_tex_id_});
+        if (env_map_tex_id_         != 0) device_->DestroyTexture(pt::rhi::TextureHandle{env_map_tex_id_});
+        if (env_marginal_cdf_id_    != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{env_marginal_cdf_id_});
+        if (env_conditional_cdf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{env_conditional_cdf_id_});
     }
     scene_tlas_id_        = 0;
     box_blas_id_          = 0;
@@ -307,6 +309,9 @@ void Engine::TearDownDevice() {
     depth_tex_id_         = 0;
     motion_tex_id_        = 0;
     env_map_tex_id_       = 0;
+    env_marginal_cdf_id_      = 0;
+    env_conditional_cdf_id_   = 0;
+    env_total_luminance_      = 0.0f;
     denoiser_active_      = false;
     prev_view_proj_valid_ = false;
     primitives_dirty_     = true;        // re-upload on next device
@@ -542,11 +547,19 @@ void Engine::ReloadEnvMap(const std::string& path) {
         return;
     }
 
-    if (env_map_tex_id_ != 0) {
-        device_->WaitIdle();
-        device_->DestroyTexture(pt::rhi::TextureHandle{env_map_tex_id_});
-        env_map_tex_id_ = 0;
-    }
+    auto destroy_env = [this]() {
+        if (env_map_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{env_map_tex_id_});
+        if (env_marginal_cdf_id_      != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{env_marginal_cdf_id_});
+        if (env_conditional_cdf_id_   != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{env_conditional_cdf_id_});
+        env_map_tex_id_         = 0;
+        env_marginal_cdf_id_    = 0;
+        env_conditional_cdf_id_ = 0;
+        env_total_luminance_    = 0.0f;
+    };
+
+    device_->WaitIdle();
+    destroy_env();
+
     env_map_path_ = path;
     if (path.empty()) {
         accum_dirty_ = true;     // sky changed -> pixel values change
@@ -561,45 +574,84 @@ void Engine::ReloadEnvMap(const std::string& path) {
         return;
     }
 
-    auto h = device_->CreateTexture({
-        .width  = img.width,
-        .height = img.height,
+    // Repack RGB -> RGBA + compute luminance per pixel for the CDF.
+    const std::uint32_t W = img.width, H = img.height;
+    std::vector<float> rgba(std::size_t(W) * H * 4);
+    std::vector<float> conditional(std::size_t(W) * H);     // CDF per row
+    std::vector<float> marginal(H);                          // CDF over rows
+    double total = 0.0;
+    for (std::uint32_t v = 0; v < H; ++v) {
+        const double sin_theta = std::sin(M_PI * (double(v) + 0.5) / double(H));
+        double row_sum = 0.0;
+        for (std::uint32_t u = 0; u < W; ++u) {
+            const std::size_t pi = std::size_t(v) * W + u;
+            float r = img.rgb[pi * 3 + 0];
+            float g = img.rgb[pi * 3 + 1];
+            float b = img.rgb[pi * 3 + 2];
+            rgba[pi * 4 + 0] = r;
+            rgba[pi * 4 + 1] = g;
+            rgba[pi * 4 + 2] = b;
+            rgba[pi * 4 + 3] = 1.0f;
+            const float lum = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+            const double weight = double(lum) * sin_theta;
+            row_sum += weight;
+            conditional[pi] = float(row_sum);   // unnormalized prefix sum within row
+        }
+        // Normalize within row to [0, 1].
+        const double norm = (row_sum > 0.0) ? (1.0 / row_sum) : 0.0;
+        for (std::uint32_t u = 0; u < W; ++u) {
+            conditional[std::size_t(v) * W + u] = float(double(conditional[std::size_t(v) * W + u]) * norm);
+        }
+        marginal[v] = float(row_sum);
+        total += row_sum;
+    }
+    // Marginal: prefix-sum + normalize so marginal[H-1] == 1.0.
+    {
+        const double norm = (total > 0.0) ? (1.0 / total) : 0.0;
+        double prefix = 0.0;
+        for (std::uint32_t v = 0; v < H; ++v) {
+            prefix += marginal[v];
+            marginal[v] = float(prefix * norm);
+        }
+        if (H > 0) marginal[H - 1] = 1.0f;       // guard against fp drift
+    }
+    env_total_luminance_ = float(total);
+
+    auto tex = device_->CreateTexture({
+        .width  = W, .height = H,
         .format = pt::rhi::TextureFormat::RGBA32F,
         .usage  = pt::rhi::TextureUsage::Storage,
         .debug_name = "env_map",
     });
-    if (h.id == 0) {
-        LOG_ERROR("env_map: CreateTexture({}x{}) failed", img.width, img.height);
+    if (tex.id == 0 || !device_->WriteTexture(tex, rgba.data(), rgba.size() * sizeof(float))) {
+        LOG_ERROR("env_map: texture create/upload failed ({}x{})", W, H);
+        if (tex.id != 0) device_->DestroyTexture(tex);
         return;
     }
-    // Repack RGB -> RGBA (the texture format is 4-channel; alpha unused).
-    std::vector<float> rgba(std::size_t(img.width) * img.height * 4);
-    for (std::size_t i = 0; i < std::size_t(img.width) * img.height; ++i) {
-        rgba[i * 4 + 0] = img.rgb[i * 3 + 0];
-        rgba[i * 4 + 1] = img.rgb[i * 3 + 1];
-        rgba[i * 4 + 2] = img.rgb[i * 3 + 2];
-        rgba[i * 4 + 3] = 1.0f;
-    }
-    // No WriteTexture in the RHI yet -- piggyback on a temp staging buffer
-    // copy via the buffer-to-texture path. For now, we have no such path
-    // for textures either, so reuse the same trick the accum_hdr does:
-    // since CreateTexture allocates shared storage on Apple Silicon, we
-    // can use the read-back path's inverse if it existed. Simpler: add
-    // a dedicated upload via the device.
-    // TODO(rhi): proper UploadTexture() in the RHI; for now use the
-    // backend-specific raw write via a one-off blit through a staging
-    // buffer. We'll do this inline as a follow-up. For the moment,
-    // upload via the existing WriteBuffer path is not applicable to
-    // textures, so we must add a small helper. Doing it via a dedicated
-    // call below.
-    if (!device_->WriteTexture(h, rgba.data(), rgba.size() * sizeof(float))) {
-        LOG_ERROR("env_map: WriteTexture failed");
-        device_->DestroyTexture(h);
+    env_map_tex_id_ = tex.id;
+
+    auto m_buf = device_->CreateBuffer({
+        .size = sizeof(float) * H, .usage = pt::rhi::BufferUsage::Storage,
+        .debug_name = "env_marginal_cdf",
+    });
+    auto c_buf = device_->CreateBuffer({
+        .size = sizeof(float) * std::size_t(W) * H, .usage = pt::rhi::BufferUsage::Storage,
+        .debug_name = "env_conditional_cdf",
+    });
+    if (m_buf.id == 0 || c_buf.id == 0) {
+        LOG_ERROR("env_map: CDF buffer creation failed");
+        device_->DestroyTexture(tex); env_map_tex_id_ = 0;
+        if (m_buf.id != 0) device_->DestroyBuffer(m_buf);
+        if (c_buf.id != 0) device_->DestroyBuffer(c_buf);
         return;
     }
-    env_map_tex_id_ = h.id;
+    device_->WriteBuffer(m_buf, marginal.data(),    sizeof(float) * H);
+    device_->WriteBuffer(c_buf, conditional.data(), sizeof(float) * std::size_t(W) * H);
+    env_marginal_cdf_id_    = m_buf.id;
+    env_conditional_cdf_id_ = c_buf.id;
+
     accum_dirty_ = true;
-    LOG_INFO("env_map: loaded {} ({}x{} HDR)", path, img.width, img.height);
+    LOG_INFO("env_map: loaded {} ({}x{} HDR, total luminance {:.2f})", path, W, H, env_total_luminance_);
 }
 
 void Engine::EnsurePrimitivesUploaded() {
@@ -788,6 +840,15 @@ void Engine::RenderFrame() {
     if (prim_buffer_id_ != 0) {
         cb->BindBuffer(3, pt::rhi::BufferHandle{prim_buffer_id_}, 0);
     }
+    // P11 MIS CDFs (only meaningful with env_map_present, but bind
+    // unconditionally if available so the shader's declarations stay
+    // bound to valid memory).
+    if (env_marginal_cdf_id_ != 0) {
+        cb->BindBuffer(4, pt::rhi::BufferHandle{env_marginal_cdf_id_}, 0);
+    }
+    if (env_conditional_cdf_id_ != 0) {
+        cb->BindBuffer(5, pt::rhi::BufferHandle{env_conditional_cdf_id_}, 0);
+    }
     // P10 G-buffer texture binds. The shader's vk::binding numbers (6/7/8)
     // are Vulkan descriptor slots; on Metal Slang assigns texture(N) in
     // declaration order, so output/accum/denoise_color/depth/motion/env
@@ -840,7 +901,7 @@ void Engine::RenderFrame() {
         std::uint32_t env_map_present;
         float halton_jitter[2];
         float env_intensity;
-        float pad3;
+        float env_total_luminance;
         float curr_view_proj[16];
         float prev_view_proj[16];
     } push{};
@@ -869,7 +930,7 @@ void Engine::RenderFrame() {
         if (auto* v = C.FindCVar("r_env_intensity")) intensity = v->GetFloat();
         push.env_intensity = intensity;
     }
-    push.pad3 = 0.0f;
+    push.env_total_luminance = env_total_luminance_;
 
     // Halton(2,3) sub-pixel jitter sequence in [-0.5, 0.5] each axis.
     // 16-sample period before repeating; ample for the denoiser's

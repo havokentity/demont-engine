@@ -33,6 +33,13 @@
 // indirect lighting in one place (path tracing collapses skybox + IBL).
 [[vk::binding(9, 0)]] RWTexture2D<float4> env_map;
 
+// P11 MIS / NEE: precomputed CDFs over env_map luminance. marginal_cdf
+// is length H (one entry per row); conditional_cdf is length H*W
+// (per-row CDF over columns). Both monotonic, ending at 1.0. Used for
+// importance-sampled direct-light samples at Lambert hits.
+[[vk::binding(10, 0)]] StructuredBuffer<float> marginal_cdf;
+[[vk::binding(11, 0)]] StructuredBuffer<float> conditional_cdf;
+
 [[vk::push_constant]]
 cbuffer Push {
     float4 pos_fovtan;
@@ -49,7 +56,7 @@ cbuffer Push {
     uint   env_map_present;  // 1 -> sample env_map for sky; 0 -> procedural gradient
     float2 halton_jitter;    // per-frame sub-pixel offset in [-0.5,0.5]
     float  env_intensity;    // scalar multiplier on env_map samples
-    float  pad3;
+    float  env_total_luminance;  // sum of luminance(u,v)*sin(theta) -- PDF normalizer
     float4x4 curr_view_proj;
     float4x4 prev_view_proj;
 };
@@ -235,6 +242,95 @@ float3 acesTonemap(float3 c) {
     return saturate((c*(a*c+b))/(c*(d*c+e)+f));
 }
 
+// ---------- env-map importance sampling (NEE for Lambert) ----------------
+struct EnvSample {
+    float3 dir;
+    float3 color;     // env_map sample value times env_intensity
+    float  pdf;       // solid-angle PDF for this direction
+};
+
+// Binary search a monotonically-non-decreasing CDF in [base, base+count) for
+// the smallest index i such that cdf[base+i] >= u. CDF expected to end at 1.0.
+uint cdfSearch(uint base, uint count, float u) {
+    uint lo = 0, hi = count;
+    while (lo < hi) {
+        uint mid = (lo + hi) >> 1;
+        if (conditional_cdf[base + mid] < u) lo = mid + 1;
+        else                                  hi = mid;
+    }
+    return min(lo, count - 1);
+}
+uint cdfSearchMarginal(uint count, float u) {
+    uint lo = 0, hi = count;
+    while (lo < hi) {
+        uint mid = (lo + hi) >> 1;
+        if (marginal_cdf[mid] < u) lo = mid + 1;
+        else                        hi = mid;
+    }
+    return min(lo, count - 1);
+}
+
+EnvSample sampleEnvMap(float2 xi) {
+    EnvSample s;
+    s.dir = float3(0,1,0); s.color = float3(0); s.pdf = 0.0;
+    if (env_map_present == 0u || env_total_luminance <= 0.0) return s;
+
+    uint W, H;
+    env_map.GetDimensions(W, H);
+
+    uint v_idx = cdfSearchMarginal(H, xi.y);
+    uint u_idx = cdfSearch(v_idx * W, W, xi.x);
+
+    float u = (float(u_idx) + 0.5) / float(W);
+    float v = (float(v_idx) + 0.5) / float(H);
+
+    float theta = v * 3.14159265358979;
+    float phi   = u * 6.28318530717958 - 3.14159265358979;
+    float sin_theta = sin(theta);
+
+    s.dir = float3(sin_theta * cos(phi), cos(theta), sin_theta * sin(phi));
+
+    float3 raw  = env_map[uint2(u_idx, v_idx)].rgb;
+    s.color     = raw * env_intensity;
+
+    float lum   = 0.2126 * raw.r + 0.7152 * raw.g + 0.0722 * raw.b;
+    // p(u,v) in pixel-space = lum*sin / total. Solid-angle Jacobian for
+    // lat-long: dω = (2π² / (W*H)) * sin(θ) du dv. So p(ω) = p(u,v) /
+    // jacobian = (lum * W * H) / (2π² * total).
+    if (sin_theta > 1e-6) {
+        s.pdf = (float(lum) * float(W * H)) /
+                (2.0 * 3.14159265358979 * 3.14159265358979 * env_total_luminance);
+    }
+    return s;
+}
+
+// Cheap "is this direction occluded?" test. Returns true if any of the
+// active scene primitives or the mesh TLAS is hit before TMax.
+bool occluded(float3 ro, float3 rd, float t_max) {
+    // Analytic primitives.
+    for (uint i = 0u; i < prim_count; ++i) {
+        float4 v0 = primitives[i * 3u + 0u];
+        float4 v2 = primitives[i * 3u + 2u];
+        uint type = uint(v2.x);
+        float t;
+        if (type == PRIM_SPHERE) {
+            if (intersectSphere(ro, rd, v0.xyz, v0.w, t) && t < t_max) return true;
+        } else if (type == PRIM_PLANE) {
+            if (intersectPlane(ro, rd, v0.xyz, v0.w, t) && t < t_max) return true;
+        }
+    }
+    // Mesh TLAS.
+    if (tlas_present != 0u) {
+        RayDesc r;
+        r.Origin = ro; r.Direction = rd; r.TMin = 1e-3; r.TMax = t_max;
+        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
+        q.TraceRayInline(scene_tlas, RAY_FLAG_NONE, 0xFFu, r);
+        while (q.Proceed()) {}
+        if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) return true;
+    }
+    return false;
+}
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void main(uint2 tid : SV_DispatchThreadID) {
@@ -308,11 +404,17 @@ void main(uint2 tid : SV_DispatchThreadID) {
 
         float3 throughput = float3(1.0);
         float3 radiance   = float3(0.0);
+        // After a Lambert bounce we did NEE for direct env-map lighting,
+        // so the next BRDF-bounce ray's miss contribution is already
+        // counted -- skip on miss to avoid double counting.
+        bool   skip_sky_on_miss = false;
 
         for (uint b = 0u; b < max_bounces; ++b) {
         HitInfo h = traceScene(ro, rd);
         if (!h.hit) {
-            radiance += throughput * skyColor(rd);
+            if (!skip_sky_on_miss) {
+                radiance += throughput * skyColor(rd);
+            }
             break;
         }
 
@@ -321,9 +423,25 @@ void main(uint2 tid : SV_DispatchThreadID) {
         float3 nf  = (ndi < 0.0) ? h.normal : -h.normal;
 
         if (h.mat == MAT_LAMBERT) {
-            float3 L  = normalize(LIGHT_DIR);
-            float  nl = max(0.0, dot(nf, L));
-            radiance += throughput * h.albedo * nl * 0.6;
+            // NEE: importance-sampled env-map direct light. When no env
+            // map is bound, fall back to the fake directional fill.
+            if (env_map_present != 0u) {
+                float2 xi = float2(randf(seed), randf(seed));
+                EnvSample env = sampleEnvMap(xi);
+                float n_dot_l = dot(nf, env.dir);
+                if (env.pdf > 0.0 && n_dot_l > 0.0) {
+                    if (!occluded(hit_pt + nf * 1e-3, env.dir, 1e30)) {
+                        float3 brdf = h.albedo / 3.14159265358979;
+                        radiance += throughput * env.color * brdf * n_dot_l / env.pdf;
+                    }
+                }
+                skip_sky_on_miss = true;
+            } else {
+                float3 L  = normalize(LIGHT_DIR);
+                float  nl = max(0.0, dot(nf, L));
+                radiance += throughput * h.albedo * nl * 0.6;
+                skip_sky_on_miss = false;
+            }
             throughput *= h.albedo;
             ro = hit_pt + nf * 1e-3;
             rd = sampleCosineHemisphere(nf, seed);
@@ -334,6 +452,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
             throughput *= h.albedo;
             ro = hit_pt + nf * 1e-3;
             rd = r;
+            skip_sky_on_miss = false;   // metal didn't NEE; sky on miss is real
         }
         else {  // dielectric
             float ior_a = (ndi < 0.0) ? 1.0   : h.ior;
@@ -353,6 +472,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 rd = normalize(refracted);
                 ro = hit_pt - nf * 1e-3;
             }
+            skip_sky_on_miss = false;   // dielectric didn't NEE either
         }
 
             if (b >= 2u) {
