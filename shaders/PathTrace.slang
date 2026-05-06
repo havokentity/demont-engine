@@ -75,11 +75,16 @@ cbuffer Push {
     // .z = 1.0 if BSC starmap should be sampled.
     // .w = 1.0 if stars should twinkle (atmospheric scintillation fake).
     float4 exposure_pad;
-    // World->J2000 rotation, row-major. row1.w / row2.w are unused; the
-    // matrix only needs the 3x3 block. row0.w is repurposed as the
-    // HDR-pipeline flag: 1.0 -> path tracer writes raw HDR to
-    // denoise_color (post-MetalFX tonemap kernel applies exposure +
-    // ACES); 0.0 -> path tracer pre-applies exposure + ACES (legacy).
+    // World->J2000 rotation, row-major. The 3x3 rotation only uses
+    // 9 floats; the .w lanes are repurposed as engine flags:
+    //   row0.w = HDR pipeline flag (1 = path tracer writes raw HDR
+    //            to denoise_color, post-pass applies exposure+ACES;
+    //            0 = legacy pre-tonemap).
+    //   row1.w = refractive-shadow-ray budget for caustics
+    //            (0 = treat dielectrics as opaque blockers,
+    //            positive = max dielectric bounces a NEE shadow ray
+    //            may chain through). Capped to 16 by the engine.
+    //   row2.w = unused / reserved.
     float4 w2j_row0;
     float4 w2j_row1;
     float4 w2j_row2;
@@ -459,31 +464,63 @@ EnvSample sampleEnvMap(float2 xi) {
     return s;
 }
 
-// Cheap "is this direction occluded?" test. Returns true if any of the
-// active scene primitives or the mesh TLAS is hit before TMax.
+// RGB transmittance along a shadow ray. 1.0 = unoccluded, 0.0 = blocked
+// by an opaque hit. Dielectric hits don't block: the ray refracts
+// through (in -> out), continuing toward the light, multiplied by the
+// dielectric's tint (cheap stand-in for Beer's-law absorption). This
+// is what turns "shadow under a glass diamond" into actual caustic
+// patterns -- the focal lensing emerges from the geometry the
+// refracted shadow ray traces, not from any fancy sampling.
+//
+// Up to kMaxRefract dielectric bounces; beyond that the ray gives up
+// (returns 0) so a pathological all-glass scene can't loop forever.
+// TIR also returns 0 (light can't pass that interface).
+float3 transmittance(float3 ro, float3 rd, float t_max) {
+    // Engine packs the per-frame refraction budget into w2j_row1.w
+    // (0 = caustics disabled, treat dielectrics as opaque shadow
+    // blockers; >0 = max dielectric bounces a single shadow ray may
+    // chain through). Capped to 16 in the engine for safety.
+    int kMaxRefract = int(w2j_row1.w);
+    float3 t = float3(1.0);
+    float3 o = ro;
+    float3 d = rd;
+    for (int i = 0; i <= kMaxRefract; ++i) {
+        HitInfo h = traceScene(o, d);
+        if (!h.hit || h.t >= t_max) return t;     // unoccluded path to light
+        if (h.mat != MAT_DIELECTRIC) return float3(0.0);    // opaque blocker
+        if (i == kMaxRefract)        return float3(0.0);    // budget hit
+
+        // Refract through the dielectric face. Same Snell + Fresnel
+        // logic as the path-tracer's dielectric BRDF, but we keep
+        // only the transmitted lobe (the reflected lobe doesn't reach
+        // the light along this path). Fresnel is folded into the
+        // transmittance so glancing angles correctly attenuate.
+        float ndi   = dot(h.normal, d);
+        float3 nf   = (ndi < 0.0) ? h.normal : -h.normal;
+        float ior_a = (ndi < 0.0) ? 1.0   : h.ior;
+        float ior_b = (ndi < 0.0) ? h.ior : 1.0;
+        float eta   = ior_a / ior_b;
+        float cos_i = abs(dot(nf, -d));
+        float r0    = (ior_a - ior_b) / (ior_a + ior_b);
+        r0 = r0 * r0;
+        float fr    = fresnelSchlick(cos_i, r0);   // reflected fraction
+        float3 refracted = refract(d, nf, eta);
+        if (length(refracted) < 1e-3) return float3(0.0);   // TIR
+        // Transmitted fraction times Beer-ish tint.
+        t *= (1.0 - fr) * h.albedo;
+        // Step past the interface, continue in the refracted direction.
+        float advance = h.t + 1e-3;
+        o = o + d * advance;
+        d = normalize(refracted);
+        t_max = max(t_max - advance, 0.0);
+    }
+    return float3(0.0);
+}
+
+// Convenience predicate around transmittance() for the metal /
+// dielectric branches that just want the legacy boolean answer.
 bool occluded(float3 ro, float3 rd, float t_max) {
-    // Analytic primitives.
-    for (uint i = 0u; i < prim_count; ++i) {
-        float4 v0 = primitives[i * 3u + 0u];
-        float4 v2 = primitives[i * 3u + 2u];
-        uint type = uint(v2.x);
-        float t;
-        if (type == PRIM_SPHERE) {
-            if (intersectSphere(ro, rd, v0.xyz, v0.w, t) && t < t_max) return true;
-        } else if (type == PRIM_PLANE) {
-            if (intersectPlane(ro, rd, v0.xyz, v0.w, t) && t < t_max) return true;
-        }
-    }
-    // Mesh TLAS.
-    if (tlas_present != 0u) {
-        RayDesc r;
-        r.Origin = ro; r.Direction = rd; r.TMin = 1e-3; r.TMax = t_max;
-        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
-        q.TraceRayInline(scene_tlas, RAY_FLAG_NONE, 0xFFu, r);
-        while (q.Proceed()) {}
-        if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) return true;
-    }
-    return false;
+    return all(transmittance(ro, rd, t_max) <= float3(0.0));
 }
 
 [shader("compute")]
@@ -584,9 +621,14 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 EnvSample env = sampleEnvMap(xi);
                 float n_dot_l = dot(nf, env.dir);
                 if (env.pdf > 0.0 && n_dot_l > 0.0) {
-                    if (!occluded(hit_pt + nf * 1e-3, env.dir, 1e30)) {
+                    // RGB transmittance through any dielectrics
+                    // between this hit and the light -- 1.0 free path,
+                    // 0.0 fully blocked, in-between for refraction
+                    // through glass / diamond meshes (caustics).
+                    float3 trans = transmittance(hit_pt + nf * 1e-3, env.dir, 1e30);
+                    if (any(trans > float3(0.0))) {
                         float3 brdf = h.albedo / 3.14159265358979;
-                        radiance += throughput * env.color * brdf * n_dot_l / env.pdf;
+                        radiance += throughput * env.color * trans * brdf * n_dot_l / env.pdf;
                     }
                 }
                 skip_sky_on_miss = true;
@@ -601,8 +643,10 @@ void main(uint2 tid : SV_DispatchThreadID) {
 
                 if (sun_elev > 0.0) {
                     float n_dot_l = max(0.0, dot(nf, sun_dir));
-                    if (n_dot_l > 0.0 &&
-                        !occluded(hit_pt + nf * 1e-3, sun_dir, 1e30)) {
+                    float3 trans  = (n_dot_l > 0.0)
+                        ? transmittance(hit_pt + nf * 1e-3, sun_dir, 1e30)
+                        : float3(0.0);
+                    if (n_dot_l > 0.0 && any(trans > float3(0.0))) {
                         // Atmospheric attenuation: optical depth times
                         // air mass. Air mass = 1/sin(elev) (thin-slab
                         // approximation, accurate down to ~5 deg). The
@@ -611,7 +655,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         // elev < 5 deg, but stays bright through midday.
                         float am  = 1.0 / max(sun_elev, 0.04);
                         float tau = 0.30;             // tunable haze
-                        float trans = exp(-tau * am);
+                        float trans_atm = exp(-tau * am);
                         // Wavelength-dependent attenuation: blue
                         // scatters more, so colour reddens with air
                         // mass. Wavelength weights mimic Rayleigh
@@ -624,10 +668,14 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         // I0 in tonemap-relative units. 80 is tuned so
                         // a noon sun on a Lambert white wall reads
                         // ~1.0 after exposure*ACES at typical exposure.
-                        float strength = 80.0 * trans;
+                        float strength = 80.0 * trans_atm;
                         float3 sun_rad = sun_col * strength;
                         float3 brdf    = h.albedo / 3.14159265358979;
-                        radiance += throughput * sun_rad * brdf * n_dot_l;
+                        // Multiply by per-channel transmittance through
+                        // any dielectrics on the shadow ray, so glass
+                        // tint / diamond focal lensing modulate the
+                        // direct light correctly.
+                        radiance += throughput * sun_rad * trans * brdf * n_dot_l;
                     }
                 }
                 // Diffuse skylight ambient. Tracks the day/night blend

@@ -59,6 +59,9 @@ namespace cvar {
     PT_CVAR(r_backend,         "metal",    "One of none|software|metal|vulkan",CVAR_ARCHIVE);
     PT_CVAR(r_max_bounces,     "8",  "Max path bounces per ray",          CVAR_ARCHIVE);
     PT_CVAR(r_spp,             "1",  "Samples per pixel per dispatch (>=1). Higher = cleaner motion frames at proportional GPU cost.", CVAR_ARCHIVE);
+    PT_CVAR(r_quality,         "high",  "Master quality preset that drives r_spp, r_max_bounces, r_caustics, r_refract_bounces, etc. Options: low (fast, no caustics), medium (default-ish), high (caustics, more bounces), ultra (max). 'custom' leaves per-feature cvars as-is.", CVAR_ARCHIVE);
+    PT_CVAR(r_caustics,        "1",  "Refractive shadow rays. 1 = NEE rays refract through dielectrics so glass/diamond produce caustic patterns; 0 = treat all dielectrics as opaque shadow blockers (faster, blocks any caustic). Path-tracer-correct in both modes.", CVAR_ARCHIVE);
+    PT_CVAR(r_refract_bounces, "4",  "Maximum dielectric refractions a single shadow ray may chain through before giving up (returns no contribution). Higher catches more multi-facet caustics; lower is faster.", CVAR_ARCHIVE);
     PT_CVAR(r_denoiser,        "off","Denoiser: off|metalfx (Mac MetalFX TemporalDenoisedScaler).", CVAR_ARCHIVE);
     PT_CVAR(r_hdr_pipeline,    "1",  "Linear-HDR pipeline through MetalFX. 1 = path tracer writes raw HDR, MetalFX denoises in HDR, post-pass applies exposure+ACES (recommended). 0 = path tracer pre-applies exposure+ACES, MetalFX denoises LDR, tonemap pass is a passthrough copy. Only affects the denoiser-on path.", CVAR_ARCHIVE);
     PT_CVAR(r_exposure,        "1.5","Manual HDR exposure multiplier applied before ACES tonemap. Used when r_auto_exposure = 0.", CVAR_ARCHIVE);
@@ -1224,14 +1227,26 @@ void Engine::RenderFrame() {
         float m[9];
         pt::astro::worldToJ2000Matrix(lat, lon, jd, m);
         push.w2j_row0[0] = m[0]; push.w2j_row0[1] = m[1]; push.w2j_row0[2] = m[2];
-        push.w2j_row1[0] = m[3]; push.w2j_row1[1] = m[4]; push.w2j_row1[2] = m[5]; push.w2j_row1[3] = 0.0f;
+        push.w2j_row1[0] = m[3]; push.w2j_row1[1] = m[4]; push.w2j_row1[2] = m[5];
         push.w2j_row2[0] = m[6]; push.w2j_row2[1] = m[7]; push.w2j_row2[2] = m[8]; push.w2j_row2[3] = 0.0f;
-        // Repurpose w2j_row0.w as the HDR-pipeline flag (the rotation
-        // matrix only needs the 3x3 part). 1.0 = path tracer writes
-        // raw HDR to denoise_color; 0.0 = legacy pre-tonemap.
+        // The 3x3 rotation only fills 9 floats; the w-lanes are
+        // available scratch. Pack engine flags here:
+        //   row0.w = HDR-pipeline (1 = raw HDR through MetalFX).
+        //   row1.w = refractive-shadow-ray budget. 0 disables caustics
+        //     entirely (NEE rays treat dielectrics as opaque); positive
+        //     = max number of dielectric bounces a shadow ray may chain
+        //     before giving up. Stored as a float because Slang push
+        //     constants are easier to align that way.
         bool hdr_pipeline = true;
         if (auto* v = C.FindCVar("r_hdr_pipeline")) hdr_pipeline = v->GetBool();
         push.w2j_row0[3] = hdr_pipeline ? 1.0f : 0.0f;
+        bool caustics = true;
+        if (auto* v = C.FindCVar("r_caustics")) caustics = v->GetBool();
+        int refract_bounces = 4;
+        if (auto* v = C.FindCVar("r_refract_bounces")) refract_bounces = v->GetInt();
+        if (refract_bounces < 0)  refract_bounces = 0;
+        if (refract_bounces > 16) refract_bounces = 16;
+        push.w2j_row1[3] = caustics ? float(refract_bounces) : 0.0f;
     }
 
     static_assert(sizeof(PtPush) == 272 + 48);
@@ -1872,6 +1887,52 @@ void Engine::RegisterCommands() {
     if (auto* v = C.FindCVar("r_hdr_pipeline")) {
         v->allowed_values = {"0", "1"};
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    if (auto* v = C.FindCVar("r_caustics")) {
+        v->allowed_values = {"0", "1"};
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    if (auto* v = C.FindCVar("r_refract_bounces")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    // r_quality: master preset that bulk-edits the per-feature cvars.
+    // Ranges chosen so 'low' is comfortably fast at 1080p on M-series
+    // GPUs, 'high' is the headline-correct path, and 'ultra' bumps
+    // sample counts past convergence + max refraction depth for static
+    // showcase shots. 'custom' is the escape hatch that leaves the
+    // sub-cvars whatever the user / autoexec last set.
+    if (auto* v = C.FindCVar("r_quality")) {
+        v->allowed_values = {"low", "medium", "high", "ultra", "custom"};
+        v->on_change = [this](const pt::console::CVar& cv) {
+            struct QPreset {
+                const char* name;
+                int spp, max_bounces, refract_bounces;
+                bool caustics;
+            };
+            static const QPreset presets[] = {
+                // SPP / bounces tuned for M4 Max @ 1080p; soft denoiser
+                // already covers the noise on top.
+                {"low",    1,  3, 1, false},  // no caustics, single shadow ray
+                {"medium", 1,  6, 2, true},   // caustics on, modest depth
+                {"high",   1,  8, 4, true},   // current default
+                {"ultra",  4, 16, 8, true},   // showcase / stills
+            };
+            if (cv.value == "custom") { accum_dirty_ = true; return; }
+            for (const auto& p : presets) {
+                if (cv.value == p.name) {
+                    auto& C2 = pt::console::Console::Get();
+                    C2.SetCVarOverride("r_spp",             std::to_string(p.spp));
+                    C2.SetCVarOverride("r_max_bounces",     std::to_string(p.max_bounces));
+                    C2.SetCVarOverride("r_refract_bounces", std::to_string(p.refract_bounces));
+                    C2.SetCVarOverride("r_caustics",        p.caustics ? "1" : "0");
+                    accum_dirty_ = true;
+                    LOG_INFO("r_quality: '{}' -> spp={} bounces={} refract={} caustics={}",
+                             p.name, p.spp, p.max_bounces, p.refract_bounces,
+                             p.caustics ? 1 : 0);
+                    return;
+                }
+            }
+        };
     }
     // r_eye_model: presets that shove sensible defaults into the
     // exposure clamp / target / adapt-speed cvars. Picked so the
