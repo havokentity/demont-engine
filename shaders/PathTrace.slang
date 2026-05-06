@@ -598,10 +598,18 @@ void main(uint2 tid : SV_DispatchThreadID) {
     float3 avg  = (prev.rgb * prev.a + frame_radiance) / n_new;
     accum_hdr[tid] = float4(avg, n_new);
 
-    // Per-frame HDR linear color goes to the denoiser (no tonemap, no
-    // accumulation -- MetalFX does its own temporal reuse).
+    // Per-frame radiance feeds the denoiser. We pre-multiply by our
+    // exposure scalar AND apply the ACES tonemap so the denoiser-on
+    // and denoiser-off paths produce visually-matched output (same
+    // brightness AND same highlight rolloff). The "right" path would
+    // keep linear HDR through the denoiser and tonemap last, but that
+    // requires a separate tonemap pass between MetalFX and the
+    // swapchain -- queued as polish. With the temporary tonemap-here
+    // approach the temporal reuse is biased on HDR extremes but the
+    // visual match between modes is exact.
     if (denoiser_enabled != 0u) {
-        denoise_color[tid] = float4(frame_radiance, 1.0);
+        float3 mapped = acesTonemap(frame_radiance * exposure_pad.x);
+        denoise_color[tid] = float4(mapped, 1.0);
     }
 
     output[tid] = float4(acesTonemap(avg * exposure_pad.x), 1.0);

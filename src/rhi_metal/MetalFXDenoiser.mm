@@ -54,7 +54,13 @@ extern "C" void* pt_metalfx_create(void* mtl_device,
         desc.inputHeight         = height;
         desc.outputWidth         = width;
         desc.outputHeight        = height;
-        desc.autoExposureEnabled = YES;
+        // Auto-exposure is OFF here -- the engine pre-multiplies the
+        // input by its own r_exposure / r_auto_exposure so the
+        // denoiser-on and denoiser-off paths render at the same
+        // brightness. With autoExposureEnabled = YES, MetalFX would
+        // re-scale on top, producing a brighter image than the
+        // no-denoiser path.
+        desc.autoExposureEnabled = NO;
         desc.requiresSynchronousInitialization = YES;
 
         id<MTLFXTemporalDenoisedScaler> scaler =
