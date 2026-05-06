@@ -59,6 +59,11 @@ cbuffer Push {
     float  env_total_luminance;  // sum of luminance(u,v)*sin(theta) -- PDF normalizer
     float4x4 curr_view_proj;
     float4x4 prev_view_proj;
+    // .xyz = unit vector toward sun, .w = sky mode encoded as a float
+    // (0 = gradient, 1 = hdri, 2 = procedural). Packed as float4 so the
+    // host's uint sky_mode follows the 16-byte alignment Slang puts
+    // after a float3 in MSL.
+    float4 sun_and_mode;
 };
 
 static const uint MAT_LAMBERT    = 0u;
@@ -209,7 +214,69 @@ HitInfo traceScene(float3 ro, float3 rd) {
     return h;
 }
 
+// Hand-tuned analytic sky inspired by Preetham/Hosek-Wilkie but ~30
+// lines instead of ~150. Drives day/sunset/night transitions from
+// `sun_dir.y` (sun's vertical component above horizon). Result is HDR
+// linear; the sun disk is around 50x normal sky brightness so it
+// punches through ACES tonemap and reads as "the sun" rather than a
+// bright dot.
+float3 procSky(float3 rd, float3 sun) {
+    float cosTheta = clamp(rd.y, -1.0, 1.0);    // 1=zenith, 0=horizon, -1=nadir
+    float cosGamma = clamp(dot(rd, sun), -1.0, 1.0);
+    float sun_elev = sun.y;                     // sin(elevation)
+
+    // Day vs night blend: smoothstep on sun elevation across the
+    // civil-twilight band.
+    float day = smoothstep(-0.10, 0.20, sun_elev);
+
+    // Sunset glow: peaks when sun is just at the horizon.
+    float sunset = smoothstep(0.30, -0.05, sun_elev) *
+                   smoothstep(-0.20, 0.05, sun_elev);
+
+    // Day sky palette.
+    float3 zenith_day  = float3(0.32, 0.55, 0.92);
+    float3 horizon_day = float3(0.78, 0.88, 1.00);
+    // Sunset palette pulls toward orange/red on the side of the sun.
+    float side_factor  = smoothstep(0.0, 0.7, dot(normalize(float3(rd.x, 0, rd.z)),
+                                                  normalize(float3(sun.x, 0, sun.z))));
+    float3 horizon_sunset = lerp(float3(0.95, 0.45, 0.20),
+                                 float3(1.00, 0.65, 0.30), side_factor);
+    float3 horizon_col    = lerp(horizon_day, horizon_sunset, sunset);
+    float3 zenith_col     = lerp(zenith_day,  float3(0.18, 0.18, 0.30), sunset * 0.6);
+
+    // Vertical gradient from horizon to zenith.
+    float t = smoothstep(0.0, 0.40, cosTheta);
+    float3 sky = lerp(horizon_col, zenith_col, t);
+
+    // Apply day/night brightness curve. Night is a deep navy with
+    // a faint horizon line, no sun.
+    float3 night = float3(0.005, 0.010, 0.030) +
+                   smoothstep(0.0, 0.05, abs(cosTheta - 0.0)) * 0.0;
+    sky = lerp(night, sky, day);
+
+    // Sun disk: very tight angular radius (~0.25 deg ~= cos > 0.99996).
+    float disk = smoothstep(0.99996, 0.99999, cosGamma);
+    float3 sun_color_high = float3(1.00, 0.95, 0.85);
+    float3 sun_color_low  = float3(1.00, 0.55, 0.20);
+    float3 sun_col = lerp(sun_color_low, sun_color_high, day);
+    sky += disk * 50.0 * sun_col * day;
+
+    // Soft halo around the sun (Mie-ish, falls off rapidly).
+    float halo = pow(max(0.0, cosGamma), 80.0);
+    sky += halo * sun_col * 0.30 * day;
+    // Wider, dimmer secondary scatter (Rayleigh-tinted) extends the
+    // sunset orange across more of the sky.
+    float wide = pow(max(0.0, cosGamma), 6.0);
+    sky += wide * sun_col * sunset * 0.50;
+
+    return max(sky, float3(0.0));
+}
+
 float3 skyColor(float3 rd) {
+    uint mode = uint(sun_and_mode.w);
+    if (mode == 2u) {
+        return procSky(rd, sun_and_mode.xyz);
+    }
     if (env_map_present != 0u) {
         // Lat-long lookup: u from atan2 of horizontal plane, v from
         // arccos of vertical component. (u, v) in [0,1].

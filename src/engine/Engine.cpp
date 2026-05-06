@@ -57,8 +57,16 @@ namespace cvar {
     PT_CVAR(r_max_bounces,     "8",  "Max path bounces per ray",          CVAR_ARCHIVE);
     PT_CVAR(r_spp,             "1",  "Samples per pixel per dispatch (>=1). Higher = cleaner motion frames at proportional GPU cost.", CVAR_ARCHIVE);
     PT_CVAR(r_denoiser,        "off","Denoiser: off|metalfx (Mac MetalFX TemporalDenoisedScaler).", CVAR_ARCHIVE);
-    PT_CVAR(r_env_map,         "",   "Path to a Radiance .hdr environment map. Empty = procedural gradient sky.", CVAR_ARCHIVE);
+    PT_CVAR(r_env_map,         "",   "Path to a Radiance .hdr environment map. Used when r_sky_mode = hdri.", CVAR_ARCHIVE);
     PT_CVAR(r_env_intensity,   "1.0","Scalar multiplier on env-map samples. Useful for darkening/brightening the IBL without re-authoring the HDRI.", CVAR_ARCHIVE);
+
+    // Procedural sky (Preetham-lite analytic). Used when r_sky_mode is
+    // "procedural". The sun position drives both the sky colour gradient
+    // and the disk; positive elevation = above horizon (day), negative =
+    // below (night); azimuth in degrees, 0 = -Z (north), 90 = +X (east).
+    PT_CVAR(r_sky_mode,        "procedural", "Sky rendering: gradient (cheap fallback) | hdri (sample r_env_map) | procedural (analytic with sun position).", CVAR_ARCHIVE);
+    PT_CVAR(r_sun_elevation,   "30.0", "Sun elevation in degrees above horizon (-90..90). Drives day/sunset/night blend in procedural sky.", CVAR_ARCHIVE);
+    PT_CVAR(r_sun_azimuth,     "135.0","Sun azimuth in degrees (0=north, 90=east, 180=south, 270=west).", CVAR_ARCHIVE);
 
     // Camera controls.  Mouse-look engages while RIGHT mouse is held.
     PT_CVAR(cam_speed,         "3.0", "Movement speed (units/sec)",        CVAR_ARCHIVE);
@@ -911,6 +919,7 @@ void Engine::RenderFrame() {
         float env_total_luminance;
         float curr_view_proj[16];
         float prev_view_proj[16];
+        float sun_and_mode[4];            // .xyz = sun_dir, .w = float(sky_mode)
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -958,7 +967,31 @@ void Engine::RenderFrame() {
     const glm::mat4 prev_vp = prev_view_proj_valid_ ? prev_view_proj_ : curr_view_proj;
     std::memcpy(push.curr_view_proj, glm::value_ptr(curr_view_proj), sizeof(push.curr_view_proj));
     std::memcpy(push.prev_view_proj, glm::value_ptr(prev_vp),        sizeof(push.prev_view_proj));
-    static_assert(sizeof(PtPush) == 240);
+
+    // Sun direction from elevation/azimuth (degrees). Convention:
+    // +Y up, -Z forward (north), +X right (east).
+    float sun_elev_deg = 30.0f, sun_azim_deg = 135.0f;
+    if (auto* v = C.FindCVar("r_sun_elevation")) sun_elev_deg = v->GetFloat();
+    if (auto* v = C.FindCVar("r_sun_azimuth"))   sun_azim_deg = v->GetFloat();
+    const float elev_r = glm::radians(sun_elev_deg);
+    const float azim_r = glm::radians(sun_azim_deg);
+    const float ce = std::cos(elev_r), se = std::sin(elev_r);
+    push.sun_and_mode[0] =  ce * std::sin(azim_r);
+    push.sun_and_mode[1] =  se;
+    push.sun_and_mode[2] = -ce * std::cos(azim_r);
+
+    // Sky mode resolution. "hdri" with no env map loaded falls back
+    // to gradient so the shader doesn't read an unbound texture.
+    std::string sky_mode_str = "procedural";
+    if (auto* v = C.FindCVar("r_sky_mode")) sky_mode_str = v->value;
+    std::uint32_t sky_mode_id = 2;
+    if      (sky_mode_str == "gradient")   sky_mode_id = 0;
+    else if (sky_mode_str == "hdri")       sky_mode_id = (env_map_tex_id_ != 0) ? 1u : 0u;
+    else /* procedural (default) */        sky_mode_id = 2;
+    push.sun_and_mode[3] = float(sky_mode_id);
+    push.env_map_present = (sky_mode_id == 1u) ? 1u : 0u;
+
+    static_assert(sizeof(PtPush) == 256);
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
 
@@ -1506,6 +1539,17 @@ void Engine::RegisterCommands() {
         };
     }
     if (auto* v = C.FindCVar("r_env_intensity")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    // Sky cvars: changing any of them invalidates accumulation.
+    if (auto* v = C.FindCVar("r_sky_mode")) {
+        v->allowed_values = {"gradient", "hdri", "procedural"};
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    if (auto* v = C.FindCVar("r_sun_elevation")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    if (auto* v = C.FindCVar("r_sun_azimuth")) {
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
     // app_vsync / app_overlay_enabled / app_auto_open_console / dev_cheats:

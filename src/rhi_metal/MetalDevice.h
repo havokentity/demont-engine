@@ -72,9 +72,9 @@ private:
     AccelStructHandle          bound_accel_[4] {};
 
     // Push-constant buffer. Sized to fit the unified PathTrace push
-    // (224 bytes: camera basis + flags + curr/prev view*proj). Round
-    // up to 256 for headroom and 16-byte alignment.
-    std::uint8_t  push_buf_[256] {};
+    // plus growth headroom for upcoming features (procedural sky
+    // params, more lights, etc.). 320 bytes.
+    std::uint8_t  push_buf_[320] {};
     std::size_t   push_size_ = 0;
 };
 
