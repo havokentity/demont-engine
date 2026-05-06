@@ -45,6 +45,16 @@ public:
     virtual void WriteBuffer(BufferHandle, const void* src, std::size_t size,
                              std::size_t dst_offset = 0) = 0;
 
+    // CPU-side write of an entire 2D texture (mip 0). `src_size` is the
+    // total bytes of the source: width * height * bytes_per_pixel for
+    // the texture's pixel format. Returns false if the texture isn't
+    // CPU-writable (private storage) or sizes mismatch. Used for
+    // one-shot uploads like env maps.
+    virtual bool WriteTexture(TextureHandle, const void* /*src*/,
+                              std::size_t /*src_size*/) {
+        return false;
+    }
+
     // Per-frame contract: BeginFrame returns the swapchain image to render
     // into, EndFrame submits and presents.
     virtual FrameContext BeginFrame() = 0;

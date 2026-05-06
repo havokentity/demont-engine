@@ -28,6 +28,10 @@
 [[vk::binding(6, 0)]] RWTexture2D<float4> denoise_color;   // RGBA16F per-frame HDR (NOT accumulated)
 [[vk::binding(7, 0)]] RWTexture2D<float>  depth_tex;       // R32F  linear camera-space depth
 [[vk::binding(8, 0)]] RWTexture2D<float2> motion_tex;      // RG16F pixel-space (prev - curr) delta
+// P11 environment map. RGBA32F lat-long HDR; sampled by ray direction
+// when env_map_present != 0. Used for both skybox visibility and
+// indirect lighting in one place (path tracing collapses skybox + IBL).
+[[vk::binding(9, 0)]] RWTexture2D<float4> env_map;
 
 [[vk::push_constant]]
 cbuffer Push {
@@ -42,9 +46,10 @@ cbuffer Push {
     uint   prim_count;       // number of analytic primitives in `primitives`
     uint   spp;              // samples per pixel this dispatch (>=1)
     uint   denoiser_enabled; // 1 -> write G-buffer + denoise_color for MetalFX
-    uint   pad2;
+    uint   env_map_present;  // 1 -> sample env_map for sky; 0 -> procedural gradient
     float2 halton_jitter;    // per-frame sub-pixel offset in [-0.5,0.5]
-    float2 pad3;
+    float  env_intensity;    // scalar multiplier on env_map samples
+    float  pad3;
     float4x4 curr_view_proj;
     float4x4 prev_view_proj;
 };
@@ -198,6 +203,29 @@ HitInfo traceScene(float3 ro, float3 rd) {
 }
 
 float3 skyColor(float3 rd) {
+    if (env_map_present != 0u) {
+        // Lat-long lookup: u from atan2 of horizontal plane, v from
+        // arccos of vertical component. (u, v) in [0,1].
+        uint2 dim;
+        env_map.GetDimensions(dim.x, dim.y);
+        float u = atan2(rd.z, rd.x) * (1.0 / 6.28318530718) + 0.5;
+        float v = acos(clamp(rd.y, -1.0, 1.0)) * (1.0 / 3.14159265359);
+        // Bilinear by hand: nearest-neighbour gives visible quantisation
+        // around the sun where the env-map is brightest.
+        float2 fpix = float2(u * float(dim.x), v * float(dim.y)) - 0.5;
+        int2  ipix = int2(floor(fpix));
+        float2 f   = fpix - float2(ipix);
+        int x0 = (ipix.x % int(dim.x) + int(dim.x)) % int(dim.x);
+        int x1 = (x0 + 1) % int(dim.x);
+        int y0 = clamp(ipix.y, 0, int(dim.y) - 1);
+        int y1 = clamp(ipix.y + 1, 0, int(dim.y) - 1);
+        float3 c00 = env_map[uint2(x0, y0)].rgb;
+        float3 c10 = env_map[uint2(x1, y0)].rgb;
+        float3 c01 = env_map[uint2(x0, y1)].rgb;
+        float3 c11 = env_map[uint2(x1, y1)].rgb;
+        float3 sky = lerp(lerp(c00, c10, f.x), lerp(c01, c11, f.x), f.y);
+        return sky * env_intensity;
+    }
     float t = clamp(0.5 * (rd.y + 1.0), 0.0, 1.0);
     return lerp(float3(0.50, 0.55, 0.62), float3(1.0, 1.0, 1.0), t);
 }

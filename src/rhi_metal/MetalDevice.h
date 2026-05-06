@@ -97,6 +97,7 @@ public:
 
     void WriteBuffer(BufferHandle h, const void* src, std::size_t size,
                      std::size_t dst_offset = 0) override;
+    bool WriteTexture(TextureHandle h, const void* src, std::size_t src_size) override;
 
     // ---- Frame ----------------------------------------------------------
     FrameContext   BeginFrame() override;

@@ -10,6 +10,7 @@
 #include "../core/Memory/Memory.h"
 #include "../renderer/Camera.h"
 #include "../renderer/Csg/CsgScene.h"
+#include "../renderer/HdrImage.h"
 #include "../renderer/MeshGen.h"
 #include "../rhi/CommandBuffer.h"
 #include "../rhi/Device.h"
@@ -55,7 +56,9 @@ namespace cvar {
     PT_CVAR(r_backend,         "metal",    "One of none|software|metal|vulkan",CVAR_ARCHIVE);
     PT_CVAR(r_max_bounces,     "8",  "Max path bounces per ray",          CVAR_ARCHIVE);
     PT_CVAR(r_spp,             "1",  "Samples per pixel per dispatch (>=1). Higher = cleaner motion frames at proportional GPU cost.", CVAR_ARCHIVE);
-    PT_CVAR(r_denoiser,        "off","Denoiser: off|metalfx (metalfx not yet wired -- see FOLLOW_UPS.md)", CVAR_ARCHIVE);
+    PT_CVAR(r_denoiser,        "off","Denoiser: off|metalfx (Mac MetalFX TemporalDenoisedScaler).", CVAR_ARCHIVE);
+    PT_CVAR(r_env_map,         "",   "Path to a Radiance .hdr environment map. Empty = procedural gradient sky.", CVAR_ARCHIVE);
+    PT_CVAR(r_env_intensity,   "1.0","Scalar multiplier on env-map samples. Useful for darkening/brightening the IBL without re-authoring the HDRI.", CVAR_ARCHIVE);
 
     // Camera controls.  Mouse-look engages while RIGHT mouse is held.
     PT_CVAR(cam_speed,         "3.0", "Movement speed (units/sec)",        CVAR_ARCHIVE);
@@ -292,6 +295,7 @@ void Engine::TearDownDevice() {
         if (denoise_color_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
         if (depth_tex_id_         != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
         if (motion_tex_id_        != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
+        if (env_map_tex_id_       != 0) device_->DestroyTexture(pt::rhi::TextureHandle{env_map_tex_id_});
     }
     scene_tlas_id_        = 0;
     box_blas_id_          = 0;
@@ -302,6 +306,7 @@ void Engine::TearDownDevice() {
     denoise_color_tex_id_ = 0;
     depth_tex_id_         = 0;
     motion_tex_id_        = 0;
+    env_map_tex_id_       = 0;
     denoiser_active_      = false;
     prev_view_proj_valid_ = false;
     primitives_dirty_     = true;        // re-upload on next device
@@ -360,6 +365,12 @@ void Engine::RequestBackendSwitch(BackendType to) {
     // the first frame against this device. The mesh BLAS + TLAS are
     // driven by CsgScene -- EnsureMeshUpdated() handles the bake job.
     primitives_dirty_ = true;
+
+    // Reload env map on the new device so its texture handle is valid.
+    if (auto* v = pt::console::Console::Get().FindCVar("r_env_map");
+        v && !v->value.empty()) {
+        ReloadEnvMap(v->value);
+    }
 }
 
 void Engine::SeedDefaultCsgScene() {
@@ -521,6 +532,74 @@ void Engine::SeedDefaultPrimitives() {
     add_plane (4,  0.0f, 1.0f,  0.0f, 0.0f, AnalyticPrim::Lambert,    rgb(0.55f, 0.55f, 0.55f));
     primitives_dirty_ = true;
     accum_dirty_      = true;
+}
+
+void Engine::ReloadEnvMap(const std::string& path) {
+    if (!device_) {
+        // Defer: cvar set before backend is up. Stash the path and apply
+        // on the next RequestBackendSwitch.
+        env_map_path_ = path;
+        return;
+    }
+
+    if (env_map_tex_id_ != 0) {
+        device_->WaitIdle();
+        device_->DestroyTexture(pt::rhi::TextureHandle{env_map_tex_id_});
+        env_map_tex_id_ = 0;
+    }
+    env_map_path_ = path;
+    if (path.empty()) {
+        accum_dirty_ = true;     // sky changed -> pixel values change
+        return;
+    }
+
+    std::string err;
+    auto img = pt::renderer::LoadRadianceHdr(path, &err);
+    if (img.Empty()) {
+        LOG_WARN("env_map: failed to load '{}': {}", path, err);
+        accum_dirty_ = true;
+        return;
+    }
+
+    auto h = device_->CreateTexture({
+        .width  = img.width,
+        .height = img.height,
+        .format = pt::rhi::TextureFormat::RGBA32F,
+        .usage  = pt::rhi::TextureUsage::Storage,
+        .debug_name = "env_map",
+    });
+    if (h.id == 0) {
+        LOG_ERROR("env_map: CreateTexture({}x{}) failed", img.width, img.height);
+        return;
+    }
+    // Repack RGB -> RGBA (the texture format is 4-channel; alpha unused).
+    std::vector<float> rgba(std::size_t(img.width) * img.height * 4);
+    for (std::size_t i = 0; i < std::size_t(img.width) * img.height; ++i) {
+        rgba[i * 4 + 0] = img.rgb[i * 3 + 0];
+        rgba[i * 4 + 1] = img.rgb[i * 3 + 1];
+        rgba[i * 4 + 2] = img.rgb[i * 3 + 2];
+        rgba[i * 4 + 3] = 1.0f;
+    }
+    // No WriteTexture in the RHI yet -- piggyback on a temp staging buffer
+    // copy via the buffer-to-texture path. For now, we have no such path
+    // for textures either, so reuse the same trick the accum_hdr does:
+    // since CreateTexture allocates shared storage on Apple Silicon, we
+    // can use the read-back path's inverse if it existed. Simpler: add
+    // a dedicated upload via the device.
+    // TODO(rhi): proper UploadTexture() in the RHI; for now use the
+    // backend-specific raw write via a one-off blit through a staging
+    // buffer. We'll do this inline as a follow-up. For the moment,
+    // upload via the existing WriteBuffer path is not applicable to
+    // textures, so we must add a small helper. Doing it via a dedicated
+    // call below.
+    if (!device_->WriteTexture(h, rgba.data(), rgba.size() * sizeof(float))) {
+        LOG_ERROR("env_map: WriteTexture failed");
+        device_->DestroyTexture(h);
+        return;
+    }
+    env_map_tex_id_ = h.id;
+    accum_dirty_ = true;
+    LOG_INFO("env_map: loaded {} ({}x{} HDR)", path, img.width, img.height);
 }
 
 void Engine::EnsurePrimitivesUploaded() {
@@ -711,13 +790,16 @@ void Engine::RenderFrame() {
     }
     // P10 G-buffer texture binds. The shader's vk::binding numbers (6/7/8)
     // are Vulkan descriptor slots; on Metal Slang assigns texture(N) in
-    // declaration order, so output/accum/denoise_color/depth/motion become
-    // texture(0..4). The Metal RHI treats the slot arg as the MSL texture
-    // index, so we bind them at 2/3/4 here.
+    // declaration order, so output/accum/denoise_color/depth/motion/env
+    // become texture(0..5). The Metal RHI treats the slot arg as the MSL
+    // texture index, so we bind them at 2/3/4/5 here.
     if (denoiser_active_) {
         cb->BindStorageTexture(2, pt::rhi::TextureHandle{denoise_color_tex_id_});
         cb->BindStorageTexture(3, pt::rhi::TextureHandle{depth_tex_id_});
         cb->BindStorageTexture(4, pt::rhi::TextureHandle{motion_tex_id_});
+    }
+    if (env_map_tex_id_ != 0) {
+        cb->BindStorageTexture(5, pt::rhi::TextureHandle{env_map_tex_id_});
     }
 
     std::uint32_t bounces = 8;
@@ -755,9 +837,10 @@ void Engine::RenderFrame() {
         std::uint32_t prim_count;
         std::uint32_t spp;
         std::uint32_t denoiser_enabled;
-        std::uint32_t pad2;
+        std::uint32_t env_map_present;
         float halton_jitter[2];
-        float pad3[2];
+        float env_intensity;
+        float pad3;
         float curr_view_proj[16];
         float prev_view_proj[16];
     } push{};
@@ -780,7 +863,13 @@ void Engine::RenderFrame() {
     push.prim_count    = static_cast<std::uint32_t>(primitives_.size());
     push.spp           = spp;
     push.denoiser_enabled = denoiser_active_ ? 1u : 0u;
-    push.pad2          = 0;
+    push.env_map_present  = (env_map_tex_id_ != 0) ? 1u : 0u;
+    {
+        float intensity = 1.0f;
+        if (auto* v = C.FindCVar("r_env_intensity")) intensity = v->GetFloat();
+        push.env_intensity = intensity;
+    }
+    push.pad3 = 0.0f;
 
     // Halton(2,3) sub-pixel jitter sequence in [-0.5, 0.5] each axis.
     // 16-sample period before repeating; ample for the denoiser's
@@ -797,7 +886,7 @@ void Engine::RenderFrame() {
     last_jitter_x_ = push.halton_jitter[0];
     last_jitter_y_ = push.halton_jitter[1];
 
-    push.pad3[0] = push.pad3[1] = 0.0f;
+    // pad3 already 0.0f from value-init
     const glm::mat4 prev_vp = prev_view_proj_valid_ ? prev_view_proj_ : curr_view_proj;
     std::memcpy(push.curr_view_proj, glm::value_ptr(curr_view_proj), sizeof(push.curr_view_proj));
     std::memcpy(push.prev_view_proj, glm::value_ptr(prev_vp),        sizeof(push.prev_view_proj));
@@ -1339,11 +1428,17 @@ void Engine::RegisterCommands() {
     if (auto* v = C.FindCVar("dev_log_level")) {
         v->allowed_values = {"error", "warn", "info", "debug"};
     }
-    // r_denoiser: only off is wired today; metalfx is queued for a follow-up
-    // (see Raytracer Plan/FOLLOW_UPS.md). Accept the value list so tab
-    // completion shows what's coming.
     if (auto* v = C.FindCVar("r_denoiser")) {
         v->allowed_values = {"off", "metalfx"};
+    }
+    // r_env_map: hot-reload on change. Empty -> unload (procedural sky).
+    if (auto* v = C.FindCVar("r_env_map")) {
+        v->on_change = [this](const pt::console::CVar& cv) {
+            ReloadEnvMap(cv.value);
+        };
+    }
+    if (auto* v = C.FindCVar("r_env_intensity")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
     // app_vsync / app_overlay_enabled / app_auto_open_console / dev_cheats:
     // boolean toggles -- accept 0|1.

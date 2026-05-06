@@ -82,6 +82,10 @@ private:
     // map. Called from RenderFrame whenever primitives_dirty_ is set.
     void EnsurePrimitivesUploaded();
 
+    // Load (or unload) the env map from disk. Called from the r_env_map
+    // cvar's on_change. Sets env_map_tex_id_ and env_map_path_.
+    void ReloadEnvMap(const std::string& path);
+
     // Replace the current mesh-path resources (vertex/index buffers,
     // BLAS, TLAS) with one built from `baked`. Called from EnsureMesh*
     // on the main thread once a worker bake has completed.
@@ -127,6 +131,12 @@ private:
     std::uint64_t                               denoise_color_tex_id_  = 0;
     std::uint64_t                               depth_tex_id_          = 0;
     std::uint64_t                               motion_tex_id_         = 0;
+
+    // P11 environment map. Allocated when r_env_map cvar points at a
+    // valid .hdr file; freed on cvar change or device teardown. The
+    // size matches the HDR file (typical 2048x1024 lat-long).
+    std::uint64_t                               env_map_tex_id_        = 0;
+    std::string                                 env_map_path_;
     glm::mat4                                   prev_view_proj_        { 1.0f };  // identity
     bool                                        prev_view_proj_valid_  = false;
     bool                                        denoiser_active_       = false;

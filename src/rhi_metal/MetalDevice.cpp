@@ -391,6 +391,29 @@ void MetalDevice::WriteBuffer(BufferHandle h, const void* src, std::size_t size,
     if (dst == nullptr) return;   // not shared / not CPU-mapped
     std::memcpy(dst + dst_offset, src, size);
 }
+
+bool MetalDevice::WriteTexture(TextureHandle h, const void* src, std::size_t src_size) {
+    if (src == nullptr || src_size == 0) return false;
+    auto* tex = LookupTexture(h);
+    if (tex == nullptr) return false;
+    if (tex->storageMode() == MTL::StorageModePrivate) return false;
+    const std::size_t w   = static_cast<std::size_t>(tex->width());
+    const std::size_t hgt = static_cast<std::size_t>(tex->height());
+    std::size_t bpp = 0;
+    switch (tex->pixelFormat()) {
+        case MTL::PixelFormatRGBA32Float: bpp = 16; break;
+        case MTL::PixelFormatRGBA16Float: bpp = 8;  break;
+        case MTL::PixelFormatRGBA8Unorm:
+        case MTL::PixelFormatBGRA8Unorm:  bpp = 4;  break;
+        case MTL::PixelFormatR32Float:    bpp = 4;  break;
+        case MTL::PixelFormatRG16Float:   bpp = 4;  break;
+        default: return false;
+    }
+    if (src_size != w * hgt * bpp) return false;
+    MTL::Region region = MTL::Region::Make2D(0, 0, w, hgt);
+    tex->replaceRegion(region, 0, src, w * bpp);
+    return true;
+}
 void MetalDevice::DestroyTexture(TextureHandle h) {
     std::lock_guard lock(resource_mutex_);
     if (auto it = textures_.find(h.id); it != textures_.end()) {
