@@ -658,6 +658,93 @@ body::after {
   box-shadow: 0 0 4px var(--accent-glow);
 }
 
+/* Slider widget: range input + small numeric readout box. The track is
+   themed off --border-strong; the thumb + filled portion adopt the
+   palette accent so each theme stays consistent. The slider row claims
+   most of the value column (75% min) and lets the .k label shrink so
+   the draggable track is long enough for fine-grained control. */
+.kv .v.v-slider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 220px;
+  max-width: 78%;
+}
+.kv .v-slider input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  width: 100%;
+  flex: 1 1 auto;
+  height: 16px;
+  margin: 0;
+  cursor: pointer;
+  outline: none;
+}
+.kv .v-slider input[type="range"]::-webkit-slider-runnable-track {
+  height: 3px;
+  background: var(--border-strong);
+  border-radius: 1px;
+}
+.kv .v-slider input[type="range"]::-moz-range-track {
+  height: 3px;
+  background: var(--border-strong);
+  border-radius: 1px;
+}
+.kv .v-slider input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 11px;
+  height: 11px;
+  margin-top: -4px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 1px solid var(--bg);
+  box-shadow: 0 0 4px var(--accent-glow);
+  cursor: grab;
+}
+.kv .v-slider input[type="range"]::-moz-range-thumb {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 1px solid var(--bg);
+  box-shadow: 0 0 4px var(--accent-glow);
+  cursor: grab;
+}
+.kv .v-slider input[type="range"]:hover::-webkit-slider-thumb {
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent-glow), 0 0 0 1px var(--accent-dim);
+}
+.kv .v-slider input[type="range"]:hover::-moz-range-thumb {
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent-glow), 0 0 0 1px var(--accent-dim);
+}
+.kv .v-slider input[type="range"]:active::-webkit-slider-thumb { cursor: grabbing; }
+.kv .v-slider input[type="range"]:active::-moz-range-thumb     { cursor: grabbing; }
+.kv .v-slider .v-slider-readout {
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid transparent;
+  border-bottom: 1px dotted var(--border-strong);
+  border-radius: 0;
+  font-family: inherit;
+  font-size: 11px;
+  padding: 1px 2px;
+  outline: none;
+  text-align: right;
+  width: 4.5em;
+  flex: 0 0 auto;
+  font-feature-settings: "calt" 0;
+}
+.kv .v-slider .v-slider-readout:hover { border-bottom-color: var(--accent-dim); }
+.kv .v-slider .v-slider-readout:focus {
+  border: 1px solid var(--accent);
+  background: var(--bg);
+  box-shadow: 0 0 4px var(--accent-glow);
+}
+
 /* Section header gets a subtle accent bar on the left -- a tiny BMC-
    inspired touch that gives each prefix group a visual anchor. */
 .grp-head {

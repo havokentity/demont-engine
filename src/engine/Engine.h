@@ -86,6 +86,12 @@ private:
     // cvar's on_change. Sets env_map_tex_id_ and env_map_path_.
     void ReloadEnvMap(const std::string& path);
 
+    // Load BSC5 + rasterise the J2000 starmap GPU texture once. Idempotent
+    // (safe to call after a backend switch -- it skips if the texture
+    // already exists). Failures are non-fatal: star_map_tex_id_ stays 0
+    // and the path tracer's r_show_stars output silently drops to nothing.
+    void EnsureStarMapUploaded();
+
     // Replace the current mesh-path resources (vertex/index buffers,
     // BLAS, TLAS) with one built from `baked`. Called from EnsureMesh*
     // on the main thread once a worker bake has completed.
@@ -119,6 +125,7 @@ private:
     std::uint32_t                               prim_buffer_capacity_  = 0;  // primitives that fit
 
     std::uint64_t                               pathtrace_pipeline_id_ = 0;
+    std::uint64_t                               tonemap_pipeline_id_   = 0;
     std::uint64_t                               accum_texture_id_      = 0;
     std::uint64_t                               box_blas_id_           = 0;
     std::uint64_t                               scene_tlas_id_         = 0;
@@ -131,6 +138,11 @@ private:
     std::uint64_t                               denoise_color_tex_id_  = 0;
     std::uint64_t                               depth_tex_id_          = 0;
     std::uint64_t                               motion_tex_id_         = 0;
+    // Linear HDR intermediate that MetalFX writes to instead of the
+    // swapchain. The `tonemap` compute kernel reads this and writes
+    // exposure+ACES-encoded sRGB into the swapchain. Co-allocated +
+    // resized with the other denoiser-related textures.
+    std::uint64_t                               post_denoise_hdr_tex_id_ = 0;
 
     // P11 environment map. Allocated when r_env_map cvar points at a
     // valid .hdr file; freed on cvar change or device teardown. The
@@ -145,6 +157,16 @@ private:
     std::uint64_t                               env_marginal_cdf_id_   = 0;
     std::uint64_t                               env_conditional_cdf_id_ = 0;
     float                                       env_total_luminance_   = 0.0f;
+
+    // P11 BSC starmap. RGBA16F equirectangular in J2000, rasterised once
+    // at startup from assets/stars/BSC5.dat. The shader rotates incoming
+    // ray directions into J2000 (using the per-frame world->J2000
+    // matrix the engine pushes) and samples this texture additively
+    // when the sun is below the horizon. Created lazily on first
+    // backend init; reused across vid_restarts. star_map_present_ is
+    // 0 if the load + rasterise failed (so the shader skips sampling).
+    std::uint64_t                               star_map_tex_id_       = 0;
+    std::uint32_t                               star_map_present_      = 0;
     glm::mat4                                   prev_view_proj_        { 1.0f };  // identity
     bool                                        prev_view_proj_valid_  = false;
     bool                                        denoiser_active_       = false;

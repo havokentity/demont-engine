@@ -92,4 +92,39 @@ HorizonPos equatorialToHorizon(EquatorialPos eq,
     return HorizonPos{ normDeg(az_deg), alt_r * kRad2Deg };
 }
 
+void worldToJ2000Matrix(double observer_lat_deg,
+                        double observer_lon_deg,
+                        double jd,
+                        float  out[9]) {
+    // World frame in this engine: +X east, +Y up, +Z south.
+    // ENU (east, north, up) and J2000 (x toward vernal equinox, z toward
+    // celestial north pole) relate via three rotations parameterised by
+    // observer lat (phi) and Local Sidereal Time (theta = GMST + lon).
+    //
+    // Composing { J2000 -> ENU -> world } and inverting gives the matrix
+    // below. See the derivation in the design notes; spot-check: the
+    // zenith vector (0,1,0) -> (cos phi*cos theta, cos phi*sin theta,
+    // sin phi), which has RA=theta=LST and Dec=phi (lat) -- the local
+    // zenith's celestial coordinates. Looking due north on the horizon
+    // (0,0,-1) at the equator (phi=0) yields (0,0,1), the north
+    // celestial pole, as it should be on the equator's north horizon.
+    const double theta = (gmstDegrees(jd) + observer_lon_deg) * kDeg2Rad;
+    const double phi   = observer_lat_deg * kDeg2Rad;
+    const double ct = std::cos(theta), st = std::sin(theta);
+    const double cp = std::cos(phi),   sp = std::sin(phi);
+
+    // Row 0
+    out[0] = float(-st);
+    out[1] = float( cp * ct);
+    out[2] = float( sp * ct);
+    // Row 1
+    out[3] = float( ct);
+    out[4] = float( cp * st);
+    out[5] = float( sp * st);
+    // Row 2
+    out[6] = 0.0f;
+    out[7] = float( sp);
+    out[8] = float(-cp);
+}
+
 }  // namespace pt::astro

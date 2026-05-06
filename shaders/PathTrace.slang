@@ -40,6 +40,12 @@
 [[vk::binding(10, 0)]] StructuredBuffer<float> marginal_cdf;
 [[vk::binding(11, 0)]] StructuredBuffer<float> conditional_cdf;
 
+// Yale BSC starmap: an RGBA16F equirectangular texture in the J2000
+// equatorial frame, rasterised once at startup from BSC5.dat. The host
+// pushes a per-frame world->J2000 rotation matrix; the shader samples
+// this texture additively when the sun is below the horizon.
+[[vk::binding(12, 0)]] RWTexture2D<float4> star_map;
+
 [[vk::push_constant]]
 cbuffer Push {
     float4 pos_fovtan;
@@ -65,9 +71,18 @@ cbuffer Push {
     // after a float3 in MSL.
     float4 sun_and_mode;
     // .x = manual HDR exposure multiplier applied before ACES tonemap.
-    // .y = 1.0 if procedural starfield should render (sun-below-horizon).
-    // .zw reserved.
+    // .y = 1.0 if legacy procedural starfield is active.
+    // .z = 1.0 if BSC starmap should be sampled.
+    // .w = 1.0 if stars should twinkle (atmospheric scintillation fake).
     float4 exposure_pad;
+    // World->J2000 rotation, row-major. row1.w / row2.w are unused; the
+    // matrix only needs the 3x3 block. row0.w is repurposed as the
+    // HDR-pipeline flag: 1.0 -> path tracer writes raw HDR to
+    // denoise_color (post-MetalFX tonemap kernel applies exposure +
+    // ACES); 0.0 -> path tracer pre-applies exposure + ACES (legacy).
+    float4 w2j_row0;
+    float4 w2j_row1;
+    float4 w2j_row2;
 };
 
 static const uint MAT_LAMBERT    = 0u;
@@ -258,13 +273,50 @@ float3 procSky(float3 rd, float3 sun) {
                    smoothstep(0.0, 0.05, abs(cosTheta - 0.0)) * 0.0;
     sky = lerp(night, sky, day);
 
-    // Procedural starfield. Hash-based scatter -- not real stars (no
-    // BSC catalog yet), but visually convincing. Bright enough to
-    // punch through the dim night sky but invisible during day. Cells
-    // are ~2000x1000 lat-long units; a small fraction host a visible
-    // star whose brightness is pow(hash, 5) so we get a few bright
-    // points and many dim ones.
-    if (cosTheta > -0.05 && exposure_pad.y > 0.5 && day < 0.6) {
+    // BSC starmap (real Yale Bright Star Catalog, J2000 frame). Sampled
+    // additively whenever the host has uploaded the texture and we're
+    // looking above the horizon. Falls back to the procedural cell-hash
+    // scatter below when the starmap isn't available -- the host gates
+    // exposure_pad.z (BSC) and .y (procedural) to be mutually exclusive.
+    if (cosTheta > -0.05 && exposure_pad.z > 0.5 && day < 0.6) {
+        // World ray -> J2000 unit vector via the per-frame rotation.
+        float3 j;
+        j.x = dot(w2j_row0.xyz, rd);
+        j.y = dot(w2j_row1.xyz, rd);
+        j.z = dot(w2j_row2.xyz, rd);
+        // Equirectangular: u from atan2(y, x) (RA), v from asin(z) (dec).
+        // Match the host rasteriser: u = ra/360 wraps, v = (90-dec)/180.
+        float u = atan2(j.y, j.x) * (1.0 / 6.28318530718);
+        if (u < 0.0) u += 1.0;
+        float v = (1.5707963267948966 - asin(clamp(j.z, -1.0, 1.0))) * (1.0 / 3.14159265358979);
+        uint2 dim;
+        star_map.GetDimensions(dim.x, dim.y);
+        int xi = int(floor(u * float(dim.x))) % int(dim.x);
+        if (xi < 0) xi += int(dim.x);
+        int yi = clamp(int(floor(v * float(dim.y))), 0, int(dim.y) - 1);
+        float3 stars = star_map[uint2(uint(xi), uint(yi))].rgb;
+        // Twinkle. Hash on a coarse-quantised J2000 direction (~1.5
+        // deg bins) so every texel covering a single star agrees on
+        // phase + frequency, and the whole star modulates as one
+        // unit. (Hashing on raw texel coords made adjacent texels of
+        // a multi-texel bright star twinkle out-of-phase, which
+        // averaged flat to the eye.) +/-45%% amplitude over a 3-8 Hz
+        // sinusoid; reads as broadband atmospheric scintillation.
+        if (exposure_pad.w > 0.5) {
+            int3 q  = int3(floor(j * 38.0));   // ~1.5 deg bins
+            uint qh = uint(q.x + 128) * 65536u
+                    + uint(q.y + 128) * 256u
+                    + uint(q.z + 128);
+            uint h    = pcgHash(qh + 0xb7e1u);
+            float ph  = float(h & 0xFFFFu) * (1.0 / 65536.0);
+            float fhz = 3.0 + float((h >> 16) & 0xFFu) * (5.0 / 256.0);
+            float t   = float(frame_index) * (1.0 / 60.0);
+            float w   = 0.55 + 0.45 * sin(6.28318530718 * (ph + t * fhz));
+            stars *= w;
+        }
+        // Fade with day so stars vanish at sunrise.
+        sky += stars * (1.0 - day);
+    } else if (cosTheta > -0.05 && exposure_pad.y > 0.5 && day < 0.6) {
         // Cells sized so each one is ~3-5 pixels wide on a 1080p frame
         // -- smaller cells make stars sub-pixel and they vanish.
         float2 ll = float2(atan2(rd.z, rd.x) * (1.0 / 6.28318530718) + 0.5,
@@ -526,9 +578,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
         float3 nf  = (ndi < 0.0) ? h.normal : -h.normal;
 
         if (h.mat == MAT_LAMBERT) {
-            // NEE: importance-sampled env-map direct light. When no env
-            // map is bound, fall back to the fake directional fill.
             if (env_map_present != 0u) {
+                // NEE: importance-sampled env-map direct light.
                 float2 xi = float2(randf(seed), randf(seed));
                 EnvSample env = sampleEnvMap(xi);
                 float n_dot_l = dot(nf, env.dir);
@@ -540,10 +591,54 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 }
                 skip_sky_on_miss = true;
             } else {
-                float3 L  = normalize(LIGHT_DIR);
-                float  nl = max(0.0, dot(nf, L));
-                radiance += throughput * h.albedo * nl * 0.6;
-                skip_sky_on_miss = false;
+                // Procedural sun NEE + skylight ambient. Drives the
+                // procedural / gradient sky modes -- the scene's
+                // directional light follows the actual sun position
+                // (so it goes dark at night) and a small diffuse term
+                // emulates skylight so unlit faces aren't pure black.
+                float3 sun_dir  = sun_and_mode.xyz;
+                float  sun_elev = sun_dir.y;            // sin(elevation)
+
+                if (sun_elev > 0.0) {
+                    float n_dot_l = max(0.0, dot(nf, sun_dir));
+                    if (n_dot_l > 0.0 &&
+                        !occluded(hit_pt + nf * 1e-3, sun_dir, 1e30)) {
+                        // Atmospheric attenuation: optical depth times
+                        // air mass. Air mass = 1/sin(elev) (thin-slab
+                        // approximation, accurate down to ~5 deg). The
+                        // exp(-tau*am) curve matches real sunset
+                        // behaviour: brightness drops off a cliff once
+                        // elev < 5 deg, but stays bright through midday.
+                        float am  = 1.0 / max(sun_elev, 0.04);
+                        float tau = 0.30;             // tunable haze
+                        float trans = exp(-tau * am);
+                        // Wavelength-dependent attenuation: blue
+                        // scatters more, so colour reddens with air
+                        // mass. Wavelength weights mimic Rayleigh
+                        // (~1/lambda^4) without doing a full spectral
+                        // walk -- enough to read as "warm at sunset".
+                        float warmth = saturate((am - 1.0) * 0.18);
+                        float3 sun_col = lerp(float3(1.00, 0.97, 0.92),
+                                              float3(1.55, 0.55, 0.20),
+                                              warmth);
+                        // I0 in tonemap-relative units. 80 is tuned so
+                        // a noon sun on a Lambert white wall reads
+                        // ~1.0 after exposure*ACES at typical exposure.
+                        float strength = 80.0 * trans;
+                        float3 sun_rad = sun_col * strength;
+                        float3 brdf    = h.albedo / 3.14159265358979;
+                        radiance += throughput * sun_rad * brdf * n_dot_l;
+                    }
+                }
+                // Diffuse skylight ambient. Tracks the day/night blend
+                // procSky uses for its background gradient -- not
+                // physically derived but visually consistent with the
+                // sky the camera sees behind the scene.
+                float day = smoothstep(-0.10, 0.20, sun_elev);
+                float3 sky_amb = lerp(float3(0.005, 0.010, 0.025),
+                                      float3(0.30, 0.40, 0.60), day);
+                radiance += throughput * h.albedo * sky_amb;
+                skip_sky_on_miss = true;
             }
             throughput *= h.albedo;
             ro = hit_pt + nf * 1e-3;
@@ -598,18 +693,21 @@ void main(uint2 tid : SV_DispatchThreadID) {
     float3 avg  = (prev.rgb * prev.a + frame_radiance) / n_new;
     accum_hdr[tid] = float4(avg, n_new);
 
-    // Per-frame radiance feeds the denoiser. We pre-multiply by our
-    // exposure scalar AND apply the ACES tonemap so the denoiser-on
-    // and denoiser-off paths produce visually-matched output (same
-    // brightness AND same highlight rolloff). The "right" path would
-    // keep linear HDR through the denoiser and tonemap last, but that
-    // requires a separate tonemap pass between MetalFX and the
-    // swapchain -- queued as polish. With the temporary tonemap-here
-    // approach the temporal reuse is biased on HDR extremes but the
-    // visual match between modes is exact.
+    // Per-frame radiance feeds the denoiser. With the HDR pipeline
+    // (w2j_row0.w = 1) we hand MetalFX raw linear HDR and the
+    // post-pass `tonemap` kernel applies exposure + ACES at the very
+    // end -- this preserves highlight detail through temporal reuse.
+    // With the legacy LDR pipeline (= 0) we pre-tonemap here and the
+    // post-pass kernel runs as a passthrough copy. The toggle exists
+    // so r_hdr_pipeline can be flipped for A/B comparison without a
+    // rebuild.
     if (denoiser_enabled != 0u) {
-        float3 mapped = acesTonemap(frame_radiance * exposure_pad.x);
-        denoise_color[tid] = float4(mapped, 1.0);
+        if (w2j_row0.w > 0.5) {
+            denoise_color[tid] = float4(frame_radiance, 1.0);
+        } else {
+            float3 mapped = acesTonemap(frame_radiance * exposure_pad.x);
+            denoise_color[tid] = float4(mapped, 1.0);
+        }
     }
 
     output[tid] = float4(acesTonemap(avg * exposure_pad.x), 1.0);

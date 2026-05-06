@@ -20,6 +20,8 @@
 extern "C" {
 extern const unsigned char shader_PathTrace_metal_data[];
 extern const unsigned long shader_PathTrace_metal_size;
+extern const unsigned char shader_Tonemap_metal_data[];
+extern const unsigned long shader_Tonemap_metal_size;
 }
 
 // MetalFXDenoiser.mm: ObjC++ shim around MTLFXTemporalDenoisedScaler.
@@ -81,6 +83,17 @@ void MetalCommandBuffer::FlushEncoder() { EndEncoderIfActive(); }
 
 void MetalCommandBuffer::BindComputePipeline(PipelineHandle p) {
     bound_pso_ = p;
+    // Clear all binding state so each pipeline starts fresh. Without
+    // this, the previous pipeline's leftover buffer/AS slots would
+    // skew the push-constant slot calculation in Dispatch() (which is
+    // computed as max-bound-buffer + 1) and the new pipeline's push
+    // constants would land at the wrong Metal buffer index. Anything
+    // the new pipeline needs must be re-bound after this call.
+    push_size_ = 0;
+    for (auto& t : bound_tex_)     t = TextureHandle{0};
+    for (auto& b : bound_buf_)     b = BufferHandle{0};
+    for (auto& o : bound_buf_off_) o = 0;
+    for (auto& a : bound_accel_)   a = AccelStructHandle{0};
 }
 void MetalCommandBuffer::BindBuffer(std::uint32_t slot, BufferHandle b,
                                     std::size_t off) {
@@ -219,10 +232,24 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
     // Build all known compute pipelines up front.  P3 had only "clear";
     // P5 adds "scene". Each Slang source becomes one MTLLibrary +
     // MTLComputePipelineState, looked up later by kernel name.
+    //
+    // NB: the embedded MSL blob is a raw byte array, NOT NUL-terminated
+    // (cmake/EmbedFile.cmake emits `0x..,` bytes only). We MUST pass the
+    // explicit size to NSString so it doesn't read whatever rodata
+    // happens to follow in the linker layout -- when the trailing bytes
+    // happened to start with high-bit unicode (e.g. `0xD8 0xAE` -> `خ`)
+    // the Metal compiler choked with `unknown type name 'خ'`.
     auto build_pso = [&](const char* kernel_name,
-                         const unsigned char* src_data) {
+                         const unsigned char* src_data,
+                         unsigned long        src_size) {
+        // metal-cpp's NS::String::string only takes a C string, so we
+        // build a one-shot NUL-terminated copy here. Cheap (44 KB once
+        // at backend init) and avoids reaching into the ObjC runtime
+        // for initWithBytes:length:encoding:.
+        std::string nul_terminated(reinterpret_cast<const char*>(src_data),
+                                   src_size);
         NS::Error* err = nullptr;
-        auto* src  = NsStr(reinterpret_cast<const char*>(src_data));
+        auto* src  = NsStr(nul_terminated.c_str());
         auto* opts = MTL::CompileOptions::alloc()->init();
         auto* lib  = device_->newLibrary(src, opts, &err);
         opts->release();
@@ -253,7 +280,8 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
         named_pipelines_.emplace(kernel_name, id);
     };
 
-    build_pso("pathtrace", shader_PathTrace_metal_data);
+    build_pso("pathtrace", shader_PathTrace_metal_data, shader_PathTrace_metal_size);
+    build_pso("tonemap",   shader_Tonemap_metal_data,   shader_Tonemap_metal_size);
 
     cmd_ = std::make_unique<MetalCommandBuffer>(this);
 }

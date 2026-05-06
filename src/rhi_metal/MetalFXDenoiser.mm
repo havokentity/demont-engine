@@ -44,12 +44,11 @@ extern "C" void* pt_metalfx_create(void* mtl_device,
         desc.colorTextureFormat  = MTLPixelFormatRGBA16Float;
         desc.depthTextureFormat  = MTLPixelFormatR32Float;
         desc.motionTextureFormat = MTLPixelFormatRG16Float;
-        // Match the swapchain's sRGB format so the post-MetalFX blit
-        // is a same-format copy. MetalFX TemporalDenoisedScaler treats
-        // the output format as the storage-side format; gamma encoding
-        // happens implicitly on the sRGB store the same way it does
-        // for the path tracer's swapchain write.
-        desc.outputTextureFormat = MTLPixelFormatBGRA8Unorm_sRGB;
+        // Linear HDR all the way through MetalFX. Output is RGBA16F so
+        // temporal reuse can see the full HDR range; the engine runs
+        // a dedicated `tonemap` compute kernel after this pass to
+        // apply exposure + ACES and write the sRGB swapchain.
+        desc.outputTextureFormat = MTLPixelFormatRGBA16Float;
         desc.inputWidth          = width;
         desc.inputHeight         = height;
         desc.outputWidth         = width;
@@ -69,10 +68,12 @@ extern "C" void* pt_metalfx_create(void* mtl_device,
 
         // Private-storage output texture for MetalFX. Apple's docs
         // explicitly require .outputTexture be storageMode == private.
-        // BGRA8Unorm so a subsequent blit to the swapchain is a
-        // same-format copy.
+        // RGBA16F (linear HDR) so the post-MetalFX tonemap pass has
+        // headroom for exposure + ACES; the engine's color_out
+        // (passed to pt_metalfx_encode) is also RGBA16F so the blit
+        // below is a same-format copy.
         MTLTextureDescriptor* td = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
                                           width:width
                                          height:height
                                       mipmapped:NO];

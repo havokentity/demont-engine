@@ -21,7 +21,19 @@
   //   pinned    : Set<string> of cvar/command names
   let activeTab = localStorage.getItem('demont.activeTab') || 'cvars';
   if (activeTab === 'pinned') activeTab = 'cvars';   // migrate old pref
-  const pinned  = new Set(JSON.parse(localStorage.getItem('demont.pinned') || '[]'));
+  // First-run default pins. Stuff that's almost always handy: the
+  // sky-animation toggle + rate, the time-of-day slider, and exposure.
+  // Once the user changes their pin set this gets persisted and the
+  // default no longer applies.
+  const DEFAULT_PINS = [
+    'r_sky_animate', 'r_sky_animate_rate', 'r_sky_hour',
+    'r_sky_use_astronomical', 'r_sky_city',
+    'r_exposure', 'r_auto_exposure',
+  ];
+  const pinnedRaw = localStorage.getItem('demont.pinned');
+  const pinned = new Set(pinnedRaw === null
+    ? DEFAULT_PINS
+    : JSON.parse(pinnedRaw));
   const savePinned = () =>
     localStorage.setItem('demont.pinned', JSON.stringify(Array.from(pinned)));
   // Latest frame_stats payload (broadcast at ~10 Hz by the engine).
@@ -132,10 +144,11 @@
     }
     if (msg.type === 'event' && msg.topic === 'frame_stats') {
       lastStats = msg.data || null;
-      // Only re-render the panel if the user is actually looking at
-      // the stats tab (otherwise we'd thrash the DOM at 10 Hz).
+      // Only redraw the stats section -- a full renderSidePanel() also
+      // rebuilds the pinned column, and at 10 Hz that yanks pinned
+      // widgets out from under the user mid-drag/mid-pick.
       const mode = sidePanel?.getAttribute('data-mode') || 'modern';
-      if (mode === 'modern' && activeTab === 'stats') renderSidePanel();
+      if (mode === 'modern' && activeTab === 'stats') renderStats();
       return;
     }
   }
@@ -220,7 +233,13 @@
 
     const setCvar = (newVal) => {
       send({ type: 'exec', line: `${v.name} ${newVal}` });
-      v.value = String(newVal);   // optimistic; will be re-synced on next refresh
+      v.value = String(newVal);   // optimistic; reconciled on the refresh below
+      // Refetch the full cvar list so cascade updates (e.g. r_sky_city
+      // mutating r_sky_lat / r_sky_lon via on_change) get reflected in
+      // every panel column. Debounced so rapid drags coalesce into one
+      // round-trip.
+      clearTimeout(setCvar._t);
+      setCvar._t = setTimeout(refreshCvars, 60);
     };
 
     const flags = (v.flags || 0) >>> 0;
@@ -262,6 +281,49 @@
         setCvar(widget.value);
       });
       widget.addEventListener('click', (e) => e.stopPropagation());
+    } else if (typeof v.slider_min === 'number' &&
+               typeof v.slider_max === 'number' &&
+               v.slider_max > v.slider_min) {
+      // Slider: range input + a numeric readout. Drag commits live (each
+      // 'input' event sends the cvar update); typing in the readout box
+      // commits on Enter/blur. The renderSidePanel debounce in setCvar
+      // keeps drag-while-rendering from thrashing.
+      widget = document.createElement('div');
+      widget.className = 'v v-slider';
+      const range = document.createElement('input');
+      range.type = 'range';
+      range.min  = v.slider_min;
+      range.max  = v.slider_max;
+      range.step = v.slider_step || 0.01;
+      const cur = parseFloat(v.value);
+      range.value = Number.isFinite(cur) ? cur : v.slider_min;
+      const readout = document.createElement('input');
+      readout.type = 'text';
+      readout.className = 'v-slider-readout';
+      readout.value = v.value;
+      readout.spellcheck = false;
+      readout.autocomplete = 'off';
+      range.addEventListener('input', (e) => {
+        e.stopPropagation();
+        readout.value = range.value;
+        setCvar(range.value);
+      });
+      range.addEventListener('click', (e) => e.stopPropagation());
+      const commitReadout = () => {
+        if (readout.value === v.value) return;
+        const n = parseFloat(readout.value);
+        if (!Number.isFinite(n)) { readout.value = v.value; return; }
+        range.value = n;
+        setCvar(readout.value);
+      };
+      readout.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter')  { commitReadout(); readout.blur(); }
+        if (e.key === 'Escape') { readout.value = v.value; readout.blur(); }
+      });
+      readout.addEventListener('blur',  commitReadout);
+      readout.addEventListener('click', (e) => e.stopPropagation());
+      widget.appendChild(range);
+      widget.appendChild(readout);
     } else {
       // Free-form: text input that commits on Enter or blur.
       widget = document.createElement('input');
@@ -417,7 +479,12 @@
     if (c && c.ok && c.cvars) {
       for (const v of c.cvars) {
         names.add(v.name);
-        cvarMeta[v.name] = { allowed_values: v.allowed_values || [] };
+        cvarMeta[v.name] = {
+          allowed_values: v.allowed_values || [],
+          slider_min:     v.slider_min,
+          slider_max:     v.slider_max,
+          slider_step:    v.slider_step,
+        };
       }
     }
     if (k && k.ok && k.commands) for (const v of k.commands) names.add(v.name);
@@ -713,6 +780,29 @@
 
   // Refresh names occasionally so newly-registered cvars show up.
   setInterval(refreshNames, 10_000);
+  // Periodic value refresh so engine-driven cvar changes (sky-time
+  // animation, auto-exposure, sun position auto-update under
+  // r_sky_use_astronomical) are visible without a user click. 1 Hz is
+  // enough for sliders to track without flooding the WS.
+  //
+  // Pause refresh during any pointer-down or focused-widget state so
+  // the DOM rebuild doesn't tear out a slider being dragged or a
+  // dropdown being picked. The pointer flag covers pointer drags
+  // (range inputs may not retain focus during drag on every browser);
+  // the activeElement check covers keyboard editing in <input>s and
+  // open <select>s.
+  let pointerActive = false;
+  if (sidePanel) {
+    sidePanel.addEventListener('pointerdown', () => { pointerActive = true; });
+  }
+  window.addEventListener('pointerup',     () => { pointerActive = false; });
+  window.addEventListener('pointercancel', () => { pointerActive = false; });
+  setInterval(() => {
+    if (pointerActive) return;
+    const ae = document.activeElement;
+    if (ae && (ae.tagName === 'SELECT' || ae.tagName === 'INPUT')) return;
+    refreshCvars();
+  }, 1000);
 
   connect();
 })();

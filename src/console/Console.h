@@ -34,6 +34,15 @@ struct CVar {
     // value position in both UIs.
     std::vector<std::string> allowed_values;
 
+    // Optional numeric range. When slider_max > slider_min, the web UI
+    // renders a draggable range slider for the cvar (with a numeric
+    // readout). slider_step controls the granularity (defaults to a
+    // sensible value if 0). Leave both at 0 for cvars that aren't
+    // numeric.
+    float slider_min  = 0.0f;
+    float slider_max  = 0.0f;
+    float slider_step = 0.0f;
+
     std::function<void(const CVar&)> on_change;
 
     // Coerced accessors.  All values are stored as strings; these parse on

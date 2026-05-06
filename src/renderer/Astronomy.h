@@ -44,4 +44,17 @@ HorizonPos equatorialToHorizon(EquatorialPos eq,
                                double observer_lon_deg,
                                double jd);
 
+// Build the 3x3 rotation that maps a unit vector in the engine's world
+// frame (+X east, +Y up, +Z south) into J2000 equatorial coordinates
+// (+X = vernal equinox, +Z = north celestial pole). Used by the path
+// tracer to look up a star at a given world ray direction inside a
+// J2000-frame starmap texture: e_j = M * w. Output is row-major:
+// out[0..2] = row 0, out[3..5] = row 1, out[6..8] = row 2. Precession
+// from J2000 to current epoch is ignored (worth ~0.4 deg over 26 years
+// — invisible at our angular resolution).
+void worldToJ2000Matrix(double observer_lat_deg,
+                        double observer_lon_deg,
+                        double jd,
+                        float  out_row_major[9]);
+
 }  // namespace pt::astro

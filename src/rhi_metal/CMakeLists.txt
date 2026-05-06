@@ -21,12 +21,20 @@ if(APPLE)
     )
 endif()
 
-# Single unified shader: dynamic analytic primitives (spheres, planes)
-# plus triangle meshes via TLAS, all in one path-tracer kernel.
+# Compute kernels: the unified path tracer + the post-denoise tonemap
+# pass. Both compile Slang -> MSL source which the runtime feeds into
+# Metal's newLibrary() at backend init.
 include(${CMAKE_SOURCE_DIR}/cmake/Slang.cmake)
 pt_compile_slang(
     TARGET  pt_rhi_metal
     SOURCE  ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+)
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/Tonemap.slang
     STAGE   compute
     ENTRY   main
     TARGETS metal

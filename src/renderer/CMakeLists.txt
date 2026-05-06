@@ -1,5 +1,6 @@
 add_library(pt_renderer STATIC
     Astronomy.cpp
+    BscCatalog.cpp
     Csg/CsgScene.cpp
     HdrImage.cpp
 )

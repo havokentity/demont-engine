@@ -304,6 +304,11 @@ void ConsoleServer::HandleWsMessage(mg_connection* conn, std::string_view payloa
         if (!v->allowed_values.empty()) {
             cvarObj["allowed_values"] = v->allowed_values;
         }
+        if (v->slider_max > v->slider_min) {
+            cvarObj["slider_min"]  = v->slider_min;
+            cvarObj["slider_max"]  = v->slider_max;
+            cvarObj["slider_step"] = v->slider_step;
+        }
         reply(json{{"ok", true}, {"cvar", cvarObj}});
         return;
     }
@@ -338,6 +343,11 @@ void ConsoleServer::HandleWsMessage(mg_connection* conn, std::string_view payloa
             };
             if (!v.allowed_values.empty()) {
                 entry["allowed_values"] = v.allowed_values;
+            }
+            if (v.slider_max > v.slider_min) {
+                entry["slider_min"]  = v.slider_min;
+                entry["slider_max"]  = v.slider_max;
+                entry["slider_step"] = v.slider_step;
             }
             arr.push_back(entry);
         });

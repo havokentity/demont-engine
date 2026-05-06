@@ -9,6 +9,7 @@
 #include "../core/Log.h"
 #include "../core/Memory/Memory.h"
 #include "../renderer/Astronomy.h"
+#include "../renderer/BscCatalog.h"
 #include "../renderer/Camera.h"
 #include "../renderer/Csg/CsgScene.h"
 #include "../renderer/HdrImage.h"
@@ -59,8 +60,14 @@ namespace cvar {
     PT_CVAR(r_max_bounces,     "8",  "Max path bounces per ray",          CVAR_ARCHIVE);
     PT_CVAR(r_spp,             "1",  "Samples per pixel per dispatch (>=1). Higher = cleaner motion frames at proportional GPU cost.", CVAR_ARCHIVE);
     PT_CVAR(r_denoiser,        "off","Denoiser: off|metalfx (Mac MetalFX TemporalDenoisedScaler).", CVAR_ARCHIVE);
+    PT_CVAR(r_hdr_pipeline,    "1",  "Linear-HDR pipeline through MetalFX. 1 = path tracer writes raw HDR, MetalFX denoises in HDR, post-pass applies exposure+ACES (recommended). 0 = path tracer pre-applies exposure+ACES, MetalFX denoises LDR, tonemap pass is a passthrough copy. Only affects the denoiser-on path.", CVAR_ARCHIVE);
     PT_CVAR(r_exposure,        "1.5","Manual HDR exposure multiplier applied before ACES tonemap. Used when r_auto_exposure = 0.", CVAR_ARCHIVE);
-    PT_CVAR(r_auto_exposure,   "1",  "Auto-exposure: 0 = use r_exposure manual value, 1 = sample accum_hdr each frame and adapt exposure toward middle-grey (eye-adaptation feel).", CVAR_ARCHIVE);
+    PT_CVAR(r_auto_exposure,   "1",  "Auto-exposure: 0 = use r_exposure manual value, 1 = sample accum_hdr each frame and adapt exposure toward r_exposure_target (eye-adaptation feel).", CVAR_ARCHIVE);
+    PT_CVAR(r_exposure_min,    "0.05",  "Minimum exposure scalar that auto-exposure can settle on. Stops a nuclear-bright scene from being crushed below this value.", CVAR_ARCHIVE);
+    PT_CVAR(r_exposure_max,    "4.0",   "Maximum exposure scalar that auto-exposure can settle on. The reason nights stay dark instead of being boosted to look like day -- bumping this lets the eye adapt further into the dark, lowering it caps the boost.", CVAR_ARCHIVE);
+    PT_CVAR(r_exposure_target, "0.18",  "Middle-grey target for auto-exposure. 0.18 matches the Zone-V/Munsell middle-grey convention; lower values aim for a darker overall look.", CVAR_ARCHIVE);
+    PT_CVAR(r_eye_adapt_speed, "0.20",  "Per-update interpolation factor for auto-exposure (0..1). Smaller = slower eye adaptation. The update fires every 8 frames, so 0.20 is roughly 'fully adapted in 1 second at 60fps'.", CVAR_ARCHIVE);
+    PT_CVAR(r_eye_model,       "human", "Preset 'iris/lens' tuning: human (default), cat (better dim-light dynamic range), owl (nocturnal -- huge max), dslr_iso100 (locked, narrow), dslr_iso6400 (locked, high gain), phone (auto, modest range), linear (no tonemap, debug). Selecting a preset writes r_exposure_min/max/target/r_eye_adapt_speed; 'custom' leaves them as-is.", CVAR_ARCHIVE);
     PT_CVAR(r_env_map,         "assets/hdri/sunset.hdr",
             "Path to a Radiance .hdr environment map. Used when r_sky_mode = hdri. "
             "Default points at the bundled CC0 sunset HDRI; resolves relative to CWD.",
@@ -83,9 +90,15 @@ namespace cvar {
             CVAR_ARCHIVE);
     PT_CVAR(r_sky_lat,         "13.0827", "Observer latitude in degrees (+N). Default: Chennai, India.", CVAR_ARCHIVE);
     PT_CVAR(r_sky_lon,         "80.2707", "Observer longitude in degrees (+E). Default: Chennai, India.", CVAR_ARCHIVE);
-    PT_CVAR(r_sky_time_offset, "0.0",     "Hours to add to current UTC when computing astronomical sun (negative = past, positive = future). Useful for testing different times of day.", CVAR_ARCHIVE);
+    PT_CVAR(r_sky_hour,        "12.0",    "Hour of day (0..24) for the astronomical sun + starmap. Interpreted in UTC if r_sky_hour_local = 0, else in the selected city's local time. r_sky_animate = 1 advances this every frame.", CVAR_ARCHIVE);
+    PT_CVAR(r_sky_hour_local,  "1",       "If 1, r_sky_hour is the city's local time (using r_sky_tz_offset_hours, set by r_sky_city). If 0, UTC.", CVAR_ARCHIVE);
+    PT_CVAR(r_sky_tz_offset_hours, "5.5", "Selected city's UTC offset in hours (positive east). Updated when r_sky_city changes; you generally don't write this directly.", CVAR_READONLY);
+    PT_CVAR(r_sky_animate,     "0",       "If 1, advance r_sky_hour every frame at r_sky_animate_rate hours per real-time second. Wraps at 24.", CVAR_ARCHIVE);
+    PT_CVAR(r_sky_animate_rate,"0.5",     "Hours of sim time per real-time second when r_sky_animate = 1. 0.5 = half-hour/s (a full day in 48s). 24 = compress a day into 1s. 1/3600 ≈ live-time.", CVAR_ARCHIVE);
     PT_CVAR(r_sky_city,        "chennai", "Preset observer location. Selecting one writes r_sky_lat / r_sky_lon to that city's coordinates. 'custom' leaves them as-is.", CVAR_ARCHIVE);
-    PT_CVAR(r_show_stars,      "1",       "Render a procedural starfield at night (sun below horizon). Procedural for now; real BSC catalog later.", CVAR_ARCHIVE);
+    PT_CVAR(r_show_stars,      "1",       "Render stars at night (sun below horizon). 0 disables.", CVAR_ARCHIVE);
+    PT_CVAR(r_stars_mode,      "bsc",     "Star source: 'bsc' = real Yale Bright Star Catalog (J2000-frame map rotated to local horizon per frame, requires assets/stars/BSC5.dat), 'procedural' = hash-based random starfield (fast, no catalog needed). Falls back to procedural when 'bsc' is requested but the catalog failed to load.", CVAR_ARCHIVE);
+    PT_CVAR(r_stars_twinkle,   "1",       "Per-star atmospheric scintillation. 0 = static field, 1 = each star modulates +/-30%% at 4-8 Hz with a per-texel phase (cheap shader noise, no extra texture lookups).", CVAR_ARCHIVE);
 
     // Camera controls.  Mouse-look engages while RIGHT mouse is held.
     PT_CVAR(cam_speed,         "3.0", "Movement speed (units/sec)",        CVAR_ARCHIVE);
@@ -319,12 +332,14 @@ void Engine::TearDownDevice() {
         if (box_vbuf_id_          != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{box_vbuf_id_});
         if (box_ibuf_id_          != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{box_ibuf_id_});
         if (prim_buffer_id_       != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{prim_buffer_id_});
-        if (denoise_color_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
-        if (depth_tex_id_         != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
-        if (motion_tex_id_        != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
+        if (denoise_color_tex_id_    != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
+        if (depth_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
+        if (motion_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
+        if (post_denoise_hdr_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
         if (env_map_tex_id_         != 0) device_->DestroyTexture(pt::rhi::TextureHandle{env_map_tex_id_});
         if (env_marginal_cdf_id_    != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{env_marginal_cdf_id_});
         if (env_conditional_cdf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{env_conditional_cdf_id_});
+        if (star_map_tex_id_        != 0) device_->DestroyTexture(pt::rhi::TextureHandle{star_map_tex_id_});
     }
     scene_tlas_id_        = 0;
     box_blas_id_          = 0;
@@ -332,13 +347,17 @@ void Engine::TearDownDevice() {
     box_ibuf_id_          = 0;
     prim_buffer_id_       = 0;
     prim_buffer_capacity_ = 0;
-    denoise_color_tex_id_ = 0;
-    depth_tex_id_         = 0;
-    motion_tex_id_        = 0;
+    denoise_color_tex_id_    = 0;
+    depth_tex_id_            = 0;
+    motion_tex_id_           = 0;
+    post_denoise_hdr_tex_id_ = 0;
+    tonemap_pipeline_id_     = 0;
     env_map_tex_id_       = 0;
     env_marginal_cdf_id_      = 0;
     env_conditional_cdf_id_   = 0;
     env_total_luminance_      = 0.0f;
+    star_map_tex_id_      = 0;
+    star_map_present_     = 0;
     denoiser_active_      = false;
     prev_view_proj_valid_ = false;
     primitives_dirty_     = true;        // re-upload on next device
@@ -384,13 +403,21 @@ void Engine::RequestBackendSwitch(BackendType to) {
     pt::console::Console::Get().SetCVarOverride(
         "sys_gpu_hwrt", device_->SupportsHardwareRT() ? "1" : "0");
 
-    // The unified path-tracer pipeline is the only kernel from here on.
-    // Both Metal and Vulkan backends expose it under the name "pathtrace".
+    // Two compute kernels: the path tracer ("pathtrace") and the
+    // post-denoise tonemap ("tonemap"). Both are pre-built at backend
+    // init in MetalDevice; CreateComputePipeline just looks them up
+    // by name and hands back a handle.
     {
         pt::rhi::ComputePipelineDesc desc{
             .kernel_name = "pathtrace", .bytecode = {}, .debug_name = "pathtrace",
         };
         pathtrace_pipeline_id_ = device_->CreateComputePipeline(desc).id;
+    }
+    {
+        pt::rhi::ComputePipelineDesc desc{
+            .kernel_name = "tonemap", .bytecode = {}, .debug_name = "tonemap",
+        };
+        tonemap_pipeline_id_ = device_->CreateComputePipeline(desc).id;
     }
 
     // Mark the analytic-primitive buffer dirty so it gets uploaded on
@@ -403,6 +430,9 @@ void Engine::RequestBackendSwitch(BackendType to) {
         v && !v->value.empty()) {
         ReloadEnvMap(v->value);
     }
+
+    // BSC starmap: load + rasterise once on this device.
+    EnsureStarMapUploaded();
 }
 
 void Engine::SeedDefaultCsgScene() {
@@ -681,6 +711,87 @@ void Engine::ReloadEnvMap(const std::string& path) {
     LOG_INFO("env_map: loaded {} ({}x{} HDR, total luminance {:.2f})", path, W, H, env_total_luminance_);
 }
 
+void Engine::EnsureStarMapUploaded() {
+    if (!device_) return;
+    if (star_map_tex_id_ != 0) return;          // already uploaded on this device
+
+    constexpr const char*  kPath = "assets/stars/BSC5.dat";
+    constexpr std::uint32_t kW   = 4096;
+    constexpr std::uint32_t kH   = 2048;
+
+    std::string err;
+    auto stars = pt::stars::LoadBsc5(kPath, &err);
+    if (stars.empty()) {
+        LOG_WARN("starmap: BSC load failed ({}); stars disabled", err);
+        star_map_present_ = 0;
+        return;
+    }
+
+    std::vector<float> rgba;
+    pt::stars::RasteriseJ2000Map(stars, kW, kH, rgba);
+
+    // GPU expects RGBA16F. The rasteriser hands us float-RGBA already in
+    // half-friendly range (brightest entries ~25), so we let the RHI
+    // convert on upload (Metal's WriteTexture for RGBA16F packs the
+    // float32 source into half-precision). If the RHI can't accept
+    // float32 source for an RGBA16F texture it will fail upload and
+    // we'll fall back to no-stars.
+    auto tex = device_->CreateTexture({
+        .width  = kW, .height = kH,
+        .format = pt::rhi::TextureFormat::RGBA16F,
+        .usage  = pt::rhi::TextureUsage::Storage,
+        .debug_name = "star_map_j2000",
+    });
+    if (tex.id == 0) {
+        LOG_WARN("starmap: texture create failed; stars disabled");
+        star_map_present_ = 0;
+        return;
+    }
+    // RGBA16F upload: the Metal RHI's WriteTexture path expects bytes
+    // matching the texture format. Pack to half manually (cheap).
+    std::vector<std::uint16_t> half(rgba.size());
+    auto f32_to_f16 = [](float f) -> std::uint16_t {
+        // Standard IEEE-754 half conversion. Branchless path for the
+        // normalised range, with a flush-to-zero fallback for tiny
+        // values; star fluxes never overflow half max (~65504).
+        std::uint32_t u; std::memcpy(&u, &f, sizeof(u));
+        std::uint32_t sign = (u >> 16) & 0x8000;
+        std::int32_t  exp  = static_cast<std::int32_t>((u >> 23) & 0xFF) - 127 + 15;
+        std::uint32_t mant = u & 0x7FFFFF;
+        if (exp <= 0)  return static_cast<std::uint16_t>(sign);                 // underflow -> 0
+        if (exp >= 31) return static_cast<std::uint16_t>(sign | 0x7C00);        // overflow -> inf
+        return static_cast<std::uint16_t>(sign | (exp << 10) | (mant >> 13));
+    };
+    for (std::size_t i = 0; i < rgba.size(); ++i) half[i] = f32_to_f16(rgba[i]);
+    if (!device_->WriteTexture(tex, half.data(), half.size() * sizeof(std::uint16_t))) {
+        LOG_WARN("starmap: texture upload failed; stars disabled");
+        device_->DestroyTexture(tex);
+        star_map_present_ = 0;
+        return;
+    }
+    star_map_tex_id_  = tex.id;
+    star_map_present_ = 1;
+    // Diagnostics: how much of the rasterised map actually has flux?
+    // If nonzero count is low or peak is tiny something has gone wrong
+    // in the splatter (clamps, magnitude scaling, etc.).
+    {
+        std::size_t nonzero = 0;
+        float peak = 0.0f;
+        const std::size_t N = std::size_t(kW) * kH;
+        for (std::size_t i = 0; i < N; ++i) {
+            float r = rgba[i * 4 + 0];
+            float g = rgba[i * 4 + 1];
+            float b = rgba[i * 4 + 2];
+            float lum = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+            if (lum > 0.0f) ++nonzero;
+            if (lum > peak) peak = lum;
+        }
+        LOG_INFO("starmap: loaded {} stars (BSC5), {}x{} J2000 RGBA16F "
+                 "(nonzero texels {}/{}, peak luminance {:.3f})",
+                 stars.size(), kW, kH, nonzero, N, peak);
+    }
+}
+
 void Engine::EnsurePrimitivesUploaded() {
     if (!device_) return;
     if (!primitives_dirty_) return;
@@ -765,10 +876,11 @@ void Engine::RenderFrame() {
         denoiser_active_      = want_denoiser;
         prev_view_proj_valid_ = false;
         if (!want_denoiser && device_) {
-            if (denoise_color_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
-            if (depth_tex_id_         != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
-            if (motion_tex_id_        != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
-            denoise_color_tex_id_ = depth_tex_id_ = motion_tex_id_ = 0;
+            if (denoise_color_tex_id_    != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
+            if (depth_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
+            if (motion_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
+            if (post_denoise_hdr_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
+            denoise_color_tex_id_ = depth_tex_id_ = motion_tex_id_ = post_denoise_hdr_tex_id_ = 0;
         }
     }
 
@@ -814,12 +926,16 @@ void Engine::RenderFrame() {
 
     // P10: G-buffer textures for the denoiser. Allocate (and re-allocate
     // on resize) only while r_denoiser is on -- saves ~32MB at 1080p when
-    // denoising is off.
+    // denoising is off. The post-denoise HDR intermediate is the linear
+    // RGBA16F MetalFX writes to; the `tonemap` compute kernel reads it
+    // and writes the swapchain.
     if (denoiser_active_ &&
-        (denoise_color_tex_id_ == 0 || depth_tex_id_ == 0 || motion_tex_id_ == 0 || size_changed)) {
-        if (denoise_color_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
-        if (depth_tex_id_         != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
-        if (motion_tex_id_        != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
+        (denoise_color_tex_id_ == 0 || depth_tex_id_ == 0 || motion_tex_id_ == 0 ||
+         post_denoise_hdr_tex_id_ == 0 || size_changed)) {
+        if (denoise_color_tex_id_     != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
+        if (depth_tex_id_             != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
+        if (motion_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
+        if (post_denoise_hdr_tex_id_  != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
         auto color_h = device_->CreateTexture({
             .width = fc.width, .height = fc.height,
             .format = pt::rhi::TextureFormat::RGBA16F,
@@ -838,11 +954,19 @@ void Engine::RenderFrame() {
             .usage  = pt::rhi::TextureUsage::Storage,
             .debug_name = "denoise_motion",
         });
-        denoise_color_tex_id_ = color_h.id;
-        depth_tex_id_         = depth_h.id;
-        motion_tex_id_        = motion_h.id;
+        auto post_h = device_->CreateTexture({
+            .width = fc.width, .height = fc.height,
+            .format = pt::rhi::TextureFormat::RGBA16F,
+            .usage  = pt::rhi::TextureUsage::Storage,
+            .debug_name = "post_denoise_hdr",
+        });
+        denoise_color_tex_id_    = color_h.id;
+        depth_tex_id_            = depth_h.id;
+        motion_tex_id_           = motion_h.id;
+        post_denoise_hdr_tex_id_ = post_h.id;
         prev_view_proj_valid_ = false;        // history is invalid after resize
-        if (denoise_color_tex_id_ == 0 || depth_tex_id_ == 0 || motion_tex_id_ == 0) {
+        if (denoise_color_tex_id_ == 0 || depth_tex_id_ == 0 ||
+            motion_tex_id_        == 0 || post_denoise_hdr_tex_id_ == 0) {
             LOG_ERROR("denoiser G-buffer allocation failed at {}x{}", fc.width, fc.height);
             denoiser_active_ = false;
         }
@@ -896,6 +1020,12 @@ void Engine::RenderFrame() {
     if (env_map_tex_id_ != 0) {
         cb->BindStorageTexture(5, pt::rhi::TextureHandle{env_map_tex_id_});
     }
+    // BSC starmap (always bind when present so the shader's binding is
+    // satisfied; sampling is gated by star_map_present in the push so
+    // the texture being a black 1x1 placeholder is not a problem).
+    if (star_map_tex_id_ != 0) {
+        cb->BindStorageTexture(6, pt::rhi::TextureHandle{star_map_tex_id_});
+    }
 
     std::uint32_t bounces = 8;
     if (auto* v = C.FindCVar("r_max_bounces")) bounces = (std::uint32_t)v->GetInt();
@@ -939,7 +1069,13 @@ void Engine::RenderFrame() {
         float curr_view_proj[16];
         float prev_view_proj[16];
         float sun_and_mode[4];            // .xyz = sun_dir, .w = float(sky_mode)
-        float exposure_pad[4];            // .x = manual exposure, .yzw reserved
+        float exposure_pad[4];            // .x = exposure, .y = procedural-stars on, .z = bsc-stars on
+        // World->J2000 rotation, row-major. Each row stored as float4 so
+        // Slang's std430 layout (which pads vec3 to vec4 anyway) lines up
+        // with the host. .w of each row is unused.
+        float w2j_row0[4];
+        float w2j_row1[4];
+        float w2j_row2[4];
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -995,14 +1131,34 @@ void Engine::RenderFrame() {
     float sun_elev_deg = 30.0f, sun_azim_deg = 135.0f;
     bool astro_on = false;
     if (auto* v = C.FindCVar("r_sky_use_astronomical")) astro_on = v->GetBool();
-    if (astro_on) {
-        double lat = 13.0827, lon = 80.2707, off_h = 0.0;
-        if (auto* v = C.FindCVar("r_sky_lat"))         lat   = v->GetFloat();
-        if (auto* v = C.FindCVar("r_sky_lon"))         lon   = v->GetFloat();
-        if (auto* v = C.FindCVar("r_sky_time_offset")) off_h = v->GetFloat();
+    // Compute JD from r_sky_hour (UTC hour of day on today's date). The
+    // cvar is the only time knob -- animation just drives this value
+    // forward over wall-clock seconds.
+    auto compute_jd = [&]() -> double {
+        float hour = 12.0f;
+        if (auto* v = C.FindCVar("r_sky_hour")) hour = v->GetFloat();
+        bool local = true;
+        if (auto* v = C.FindCVar("r_sky_hour_local")) local = v->GetBool();
+        float tz = 0.0f;
+        if (local) {
+            if (auto* v = C.FindCVar("r_sky_tz_offset_hours")) tz = v->GetFloat();
+        }
+        // r_sky_hour interpreted in local civil time -> subtract the
+        // city's UTC offset to get UTC hour. May go negative or above
+        // 24 if the user's local hour straddles a UTC day boundary;
+        // dividing by 24 below handles that automatically.
+        const float hour_utc = hour - tz;
         const std::time_t now = std::time(nullptr);
-        const double jd = pt::astro::julianDateFromTimeT(now)
-                        + off_h / 24.0;
+        const double jd_inst = pt::astro::julianDateFromTimeT(now);
+        // JD's day rolls over at noon UTC; floor(jd-0.5)+0.5 is the
+        // UTC midnight that opened the *current* civil day.
+        return std::floor(jd_inst - 0.5) + 0.5 + double(hour_utc) / 24.0;
+    };
+    if (astro_on) {
+        double lat = 13.0827, lon = 80.2707;
+        if (auto* v = C.FindCVar("r_sky_lat")) lat = v->GetFloat();
+        if (auto* v = C.FindCVar("r_sky_lon")) lon = v->GetFloat();
+        const double jd = compute_jd();
         auto sun_eq = pt::astro::sunPosition(jd);
         auto sun_h  = pt::astro::equatorialToHorizon(sun_eq, lat, lon, jd);
         sun_elev_deg = static_cast<float>(sun_h.altitude_deg);
@@ -1040,9 +1196,45 @@ void Engine::RenderFrame() {
     push.exposure_pad[0] = auto_exp ? current_exposure_ : manual_exp;
     bool show_stars = true;
     if (auto* v = C.FindCVar("r_show_stars")) show_stars = v->GetBool();
-    push.exposure_pad[1] = show_stars ? 1.0f : 0.0f;
+    std::string stars_mode = "bsc";
+    if (auto* v = C.FindCVar("r_stars_mode")) stars_mode = v->value;
+    // BSC requested + catalog loaded -> sample the J2000 starmap (.z).
+    // Otherwise procedural hash starfield (.y). r_show_stars=0 zeroes both.
+    const bool want_bsc =
+        show_stars && stars_mode == "bsc" && star_map_present_ != 0u;
+    const bool want_procedural =
+        show_stars && (stars_mode == "procedural" ||
+                       (stars_mode == "bsc" && star_map_present_ == 0u));
+    push.exposure_pad[1] = want_procedural ? 1.0f : 0.0f;
+    push.exposure_pad[2] = want_bsc        ? 1.0f : 0.0f;
+    bool twinkle = true;
+    if (auto* v = C.FindCVar("r_stars_twinkle")) twinkle = v->GetBool();
+    push.exposure_pad[3] = twinkle ? 1.0f : 0.0f;
 
-    static_assert(sizeof(PtPush) == 272);
+    // World->J2000 rotation. Always computed; the shader scales the
+    // starmap sample by exposure_pad.z so when stars are off the
+    // matrix is just unused work. lat/lon come from the geographic
+    // cvars even when r_sky_use_astronomical = 0 -- stars still need
+    // the observer's actual location to be in the right place.
+    {
+        double lat = 13.0827, lon = 80.2707;
+        if (auto* v = C.FindCVar("r_sky_lat")) lat = v->GetFloat();
+        if (auto* v = C.FindCVar("r_sky_lon")) lon = v->GetFloat();
+        const double jd = compute_jd();
+        float m[9];
+        pt::astro::worldToJ2000Matrix(lat, lon, jd, m);
+        push.w2j_row0[0] = m[0]; push.w2j_row0[1] = m[1]; push.w2j_row0[2] = m[2];
+        push.w2j_row1[0] = m[3]; push.w2j_row1[1] = m[4]; push.w2j_row1[2] = m[5]; push.w2j_row1[3] = 0.0f;
+        push.w2j_row2[0] = m[6]; push.w2j_row2[1] = m[7]; push.w2j_row2[2] = m[8]; push.w2j_row2[3] = 0.0f;
+        // Repurpose w2j_row0.w as the HDR-pipeline flag (the rotation
+        // matrix only needs the 3x3 part). 1.0 = path tracer writes
+        // raw HDR to denoise_color; 0.0 = legacy pre-tonemap.
+        bool hdr_pipeline = true;
+        if (auto* v = C.FindCVar("r_hdr_pipeline")) hdr_pipeline = v->GetBool();
+        push.w2j_row0[3] = hdr_pipeline ? 1.0f : 0.0f;
+    }
+
+    static_assert(sizeof(PtPush) == 272 + 48);
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
 
@@ -1059,7 +1251,9 @@ void Engine::RenderFrame() {
         dd.color_in      = pt::rhi::TextureHandle{denoise_color_tex_id_};
         dd.depth_in      = pt::rhi::TextureHandle{depth_tex_id_};
         dd.motion_in     = pt::rhi::TextureHandle{motion_tex_id_};
-        dd.output        = fc.swapchain_image;
+        // MetalFX writes to the linear-HDR intermediate; the tonemap
+        // dispatch below converts that to sRGB and writes the swapchain.
+        dd.output        = pt::rhi::TextureHandle{post_denoise_hdr_tex_id_};
         dd.jitter_x      = last_jitter_x_;
         dd.jitter_y      = last_jitter_y_;
         dd.reset_history = !prev_view_proj_valid_;
@@ -1069,6 +1263,26 @@ void Engine::RenderFrame() {
         dd.world_to_view = glm::value_ptr(view);
         dd.view_to_clip  = glm::value_ptr(proj);
         device_->Denoise(dd);
+
+        // Post-denoise tonemap: linear HDR -> exposure -> ACES -> sRGB
+        // swapchain (gamma encode is implicit on store of the BGRA8_sRGB
+        // surface). One push float for exposure; the kernel infers
+        // dispatch size from the swapchain texture dimensions.
+        cb->BindComputePipeline(pt::rhi::PipelineHandle{tonemap_pipeline_id_});
+        cb->BindStorageTexture(0, pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
+        cb->BindStorageTexture(1, fc.swapchain_image);
+        bool hdr_pipeline = true;
+        if (auto* v = C.FindCVar("r_hdr_pipeline")) hdr_pipeline = v->GetBool();
+        struct TonePush {
+            float        exposure;
+            std::uint32_t passthrough;   // 1 = copy hdr_in -> ldr_out (path
+                                         //     tracer already tonemapped)
+            float        pad[2];
+        } tp{};
+        tp.exposure    = push.exposure_pad[0];     // mirrors path-tracer exposure
+        tp.passthrough = hdr_pipeline ? 0u : 1u;
+        cb->PushConstants(&tp, sizeof(tp));
+        cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
     }
 
     device_->Submit(cb);
@@ -1100,16 +1314,30 @@ void Engine::RenderFrame() {
             }
             if (n > 0) {
                 const float avg_lum = float(accum_lum / double(n));
-                const float key     = 0.18f;          // middle-grey target
-                float target_exp    = key / std::max(avg_lum, 1e-3f);
-                if (target_exp < 0.05f) target_exp = 0.05f;
-                if (target_exp > 50.0f) target_exp = 50.0f;
+                float key      = 0.18f;
+                float exp_min  = 0.05f;
+                float exp_max  = 4.0f;
+                float k        = 0.20f;
+                auto& Cx = pt::console::Console::Get();
+                if (auto* v = Cx.FindCVar("r_exposure_target")) key     = v->GetFloat();
+                if (auto* v = Cx.FindCVar("r_exposure_min"))    exp_min = v->GetFloat();
+                if (auto* v = Cx.FindCVar("r_exposure_max"))    exp_max = v->GetFloat();
+                if (auto* v = Cx.FindCVar("r_eye_adapt_speed")) k       = v->GetFloat();
+                float target_exp = key / std::max(avg_lum, 1e-3f);
+                if (target_exp < exp_min) target_exp = exp_min;
+                if (target_exp > exp_max) target_exp = exp_max;
                 // Geometric smoothing in log space gives a more
-                // perceptually uniform fade than linear lerp.
-                const float k = 0.20f;
-                current_exposure_ = std::exp(
-                    std::log(current_exposure_) * (1.0f - k) +
-                    std::log(target_exp)        * k);
+                // perceptually uniform fade than a linear lerp.
+                if (k <= 0.0f) {
+                    // Locked-exposure presets (DSLR / linear): jump
+                    // straight to target without smoothing so the
+                    // user sees the locked value immediately.
+                    current_exposure_ = target_exp;
+                } else {
+                    current_exposure_ = std::exp(
+                        std::log(current_exposure_) * (1.0f - k) +
+                        std::log(target_exp)        * k);
+                }
             }
         }
     }
@@ -1174,6 +1402,27 @@ void Engine::UpdateCamera(double dt) {
 void Engine::Tick(double dt) {
     pt::console::Console::Get().Drain();
     UpdateCamera(dt);
+
+    // Sky animation: advance r_sky_hour by `rate * dt` real-time
+    // seconds. Wraps modulo 24. Marks accumulation dirty so the path
+    // tracer drops its history each frame the time is actually moving.
+    {
+        auto& C = pt::console::Console::Get();
+        bool animate = false;
+        if (auto* v = C.FindCVar("r_sky_animate")) animate = v->GetBool();
+        if (animate) {
+            float rate = 0.0f;
+            if (auto* v = C.FindCVar("r_sky_animate_rate")) rate = v->GetFloat();
+            float hour = 12.0f;
+            if (auto* v = C.FindCVar("r_sky_hour")) hour = v->GetFloat();
+            hour += rate * float(dt);
+            // Wrap into [0, 24).
+            hour = std::fmod(hour, 24.0f);
+            if (hour < 0.0f) hour += 24.0f;
+            C.SetCVarOverride("r_sky_hour", std::to_string(hour));
+            accum_dirty_ = true;
+        }
+    }
 
     auto t0 = std::chrono::steady_clock::now();
     RenderFrame();
@@ -1620,6 +1869,61 @@ void Engine::RegisterCommands() {
     if (auto* v = C.FindCVar("r_denoiser")) {
         v->allowed_values = {"off", "metalfx"};
     }
+    if (auto* v = C.FindCVar("r_hdr_pipeline")) {
+        v->allowed_values = {"0", "1"};
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    // r_eye_model: presets that shove sensible defaults into the
+    // exposure clamp / target / adapt-speed cvars. Picked so the
+    // visual differences are obvious: cats see further into the
+    // dark (higher max) than humans; DSLR locks the auto loop;
+    // linear is a debug pass-through.
+    if (auto* v = C.FindCVar("r_eye_model")) {
+        v->allowed_values = {
+            "human", "cat", "owl",
+            "dslr_iso100", "dslr_iso6400",
+            "phone", "linear", "custom",
+        };
+        v->on_change = [](const pt::console::CVar& cv) {
+            struct Preset {
+                const char* name;
+                float exp_min, exp_max, target, adapt;
+                bool  auto_exposure;       // 0 forces manual r_exposure
+                float manual_exp;
+            };
+            static const Preset presets[] = {
+                // Human eye: comfortable adaptation range, ~1s adapt time.
+                {"human",        0.05f,  4.0f,  0.18f, 0.20f, true,  1.5f},
+                // Cats: rod-rich retina, ~6x dim-light sensitivity.
+                {"cat",          0.05f, 12.0f,  0.18f, 0.30f, true,  1.5f},
+                // Owls: nocturnal extreme, ~100x rod density of humans.
+                {"owl",          0.05f, 30.0f,  0.18f, 0.35f, true,  1.5f},
+                // DSLR locked at ISO 100: no auto, fixed exposure.
+                {"dslr_iso100",  1.0f,   1.0f,  0.18f, 0.0f,  false, 1.0f},
+                // DSLR locked at ISO 6400: 64x more gain.
+                {"dslr_iso6400", 8.0f,   8.0f,  0.18f, 0.0f,  false, 8.0f},
+                // Smartphone: auto, modest range.
+                {"phone",        0.10f,  6.0f,  0.18f, 0.25f, true,  1.5f},
+                // Linear: bypass exposure entirely (debug).
+                {"linear",       1.0f,   1.0f,  0.18f, 0.0f,  false, 1.0f},
+            };
+            if (cv.value == "custom") return;
+            auto& C2 = pt::console::Console::Get();
+            for (const auto& p : presets) {
+                if (cv.value == p.name) {
+                    C2.SetCVarOverride("r_exposure_min",    std::to_string(p.exp_min));
+                    C2.SetCVarOverride("r_exposure_max",    std::to_string(p.exp_max));
+                    C2.SetCVarOverride("r_exposure_target", std::to_string(p.target));
+                    C2.SetCVarOverride("r_eye_adapt_speed", std::to_string(p.adapt));
+                    C2.SetCVarOverride("r_auto_exposure",   p.auto_exposure ? "1" : "0");
+                    if (!p.auto_exposure) {
+                        C2.SetCVarOverride("r_exposure", std::to_string(p.manual_exp));
+                    }
+                    return;
+                }
+            }
+        };
+    }
     // r_env_map: hot-reload on change. Empty -> unload (procedural sky).
     if (auto* v = C.FindCVar("r_env_map")) {
         v->on_change = [this](const pt::console::CVar& cv) {
@@ -1647,9 +1951,29 @@ void Engine::RegisterCommands() {
         v->allowed_values = {"0", "1"};
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
+    if (auto* v = C.FindCVar("r_sky_hour")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    if (auto* v = C.FindCVar("r_sky_animate")) {
+        v->allowed_values = {"0", "1"};
+        // No accum reset on toggle: turning animation on/off doesn't
+        // change the current hour; the next Tick handles continuity.
+    }
+    // r_sky_animate_rate has no validation/on_change wiring -- it's a
+    // free-form float consumed by Tick(); changing it is felt the
+    // next frame without any rebind.
     if (auto* v = C.FindCVar("r_show_stars")) {
         v->allowed_values = {"0", "1"};
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    if (auto* v = C.FindCVar("r_stars_mode")) {
+        v->allowed_values = {"bsc", "procedural"};
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    if (auto* v = C.FindCVar("r_stars_twinkle")) {
+        v->allowed_values = {"0", "1"};
+        // Twinkle is per-frame in the shader; toggling doesn't need an
+        // accum reset because the change is felt the next frame anyway.
     }
     if (auto* v = C.FindCVar("r_sky_lat") ) v->on_change = [this](const pt::console::CVar&){ accum_dirty_ = true; };
     if (auto* v = C.FindCVar("r_sky_lon") ) v->on_change = [this](const pt::console::CVar&){ accum_dirty_ = true; };
@@ -1671,32 +1995,36 @@ void Engine::RegisterCommands() {
             "custom",
         };
         v->on_change = [this](const pt::console::CVar& cv) {
-            struct CityRow { const char* name; double lat; double lon; };
+            // tz is the city's standard-time UTC offset in hours
+            // (positive east). DST is intentionally ignored: this is
+            // a sky simulator, not a clock app, and DST switches add
+            // complexity that would obscure the astronomy.
+            struct CityRow { const char* name; double lat; double lon; double tz; };
             static const CityRow cities[] = {
-                {"chennai",        13.0827,   80.2707},
-                {"mumbai",         19.0760,   72.8777},
-                {"delhi",          28.6139,   77.2090},
-                {"bangalore",      12.9716,   77.5946},
-                {"tokyo",          35.6762,  139.6503},
-                {"singapore",       1.3521,  103.8198},
-                {"beijing",        39.9042,  116.4074},
-                {"seoul",          37.5665,  126.9780},
-                {"london",         51.5074,   -0.1278},
-                {"paris",          48.8566,    2.3522},
-                {"berlin",         52.5200,   13.4050},
-                {"moscow",         55.7558,   37.6173},
-                {"new_york",       40.7128,  -74.0060},
-                {"san_francisco",  37.7749, -122.4194},
-                {"los_angeles",    34.0522, -118.2437},
-                {"chicago",        41.8781,  -87.6298},
-                {"sao_paulo",     -23.5505,  -46.6333},
-                {"buenos_aires",  -34.6037,  -58.3816},
-                {"sydney",        -33.8688,  151.2093},
-                {"auckland",      -36.8485,  174.7633},
-                {"cairo",          30.0444,   31.2357},
-                {"cape_town",     -33.9249,   18.4241},
-                {"reykjavik",      64.1466,  -21.9426},
-                {"anchorage",      61.2181, -149.9003},
+                {"chennai",        13.0827,   80.2707,   5.5},
+                {"mumbai",         19.0760,   72.8777,   5.5},
+                {"delhi",          28.6139,   77.2090,   5.5},
+                {"bangalore",      12.9716,   77.5946,   5.5},
+                {"tokyo",          35.6762,  139.6503,   9.0},
+                {"singapore",       1.3521,  103.8198,   8.0},
+                {"beijing",        39.9042,  116.4074,   8.0},
+                {"seoul",          37.5665,  126.9780,   9.0},
+                {"london",         51.5074,   -0.1278,   0.0},
+                {"paris",          48.8566,    2.3522,   1.0},
+                {"berlin",         52.5200,   13.4050,   1.0},
+                {"moscow",         55.7558,   37.6173,   3.0},
+                {"new_york",       40.7128,  -74.0060,  -5.0},
+                {"san_francisco",  37.7749, -122.4194,  -8.0},
+                {"los_angeles",    34.0522, -118.2437,  -8.0},
+                {"chicago",        41.8781,  -87.6298,  -6.0},
+                {"sao_paulo",     -23.5505,  -46.6333,  -3.0},
+                {"buenos_aires",  -34.6037,  -58.3816,  -3.0},
+                {"sydney",        -33.8688,  151.2093,  10.0},
+                {"auckland",      -36.8485,  174.7633,  12.0},
+                {"cairo",          30.0444,   31.2357,   2.0},
+                {"cape_town",     -33.9249,   18.4241,   2.0},
+                {"reykjavik",      64.1466,  -21.9426,   0.0},
+                {"anchorage",      61.2181, -149.9003,  -9.0},
             };
             if (cv.value == "custom") { accum_dirty_ = true; return; }
             for (const auto& c : cities) {
@@ -1704,11 +2032,20 @@ void Engine::RegisterCommands() {
                     auto& C2 = pt::console::Console::Get();
                     C2.SetCVarOverride("r_sky_lat", std::to_string(c.lat));
                     C2.SetCVarOverride("r_sky_lon", std::to_string(c.lon));
+                    C2.SetCVarOverride("r_sky_tz_offset_hours", std::to_string(c.tz));
                     accum_dirty_ = true;
+                    LOG_INFO("r_sky_city: '{}' -> lat={:.4f} lon={:.4f} tz={:+.1f}",
+                             c.name, c.lat, c.lon, c.tz);
                     return;
                 }
             }
+            LOG_WARN("r_sky_city: '{}' has no preset; lat/lon unchanged",
+                     std::string(cv.value));
         };
+    }
+    if (auto* v = C.FindCVar("r_sky_hour_local")) {
+        v->allowed_values = {"0", "1"};
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
     // app_vsync / app_overlay_enabled / app_auto_open_console / dev_cheats:
     // boolean toggles -- accept 0|1.
@@ -1716,6 +2053,36 @@ void Engine::RegisterCommands() {
                           "app_auto_open_console", "dev_cheats"}) {
         if (auto* v = C.FindCVar(n)) v->allowed_values = {"0", "1"};
     }
+
+    // Slider ranges for numeric cvars. The web UI checks slider_max >
+    // slider_min and renders a draggable range input + numeric readout
+    // instead of a free-form text box. Pick ranges that cover the
+    // useful design space, not the full numeric domain (e.g. r_spp
+    // tops out at 32 even though the renderer accepts more) -- a
+    // slider that needs a microscope to land on a sane value defeats
+    // the purpose. Free-form input is still possible from the command
+    // line for power users.
+    auto set_slider = [&C](const char* name, float lo, float hi, float step) {
+        if (auto* v = C.FindCVar(name)) {
+            v->slider_min  = lo;
+            v->slider_max  = hi;
+            v->slider_step = step;
+        }
+    };
+    set_slider("r_spp",             1.0f,   32.0f,  1.0f);
+    set_slider("r_max_bounces",     1.0f,   16.0f,  1.0f);
+    set_slider("r_exposure",        0.1f,    5.0f,  0.05f);
+    set_slider("r_env_intensity",   0.0f,    5.0f,  0.05f);
+    set_slider("r_sun_elevation", -90.0f,   90.0f,  0.5f);
+    set_slider("r_sun_azimuth",     0.0f,  360.0f,  1.0f);
+    set_slider("r_sky_hour",          0.0f,  24.0f,  0.01f);
+    set_slider("r_sky_animate_rate",  0.0f,  24.0f,  0.05f);
+    set_slider("r_sky_lat",         -90.0f,  90.0f,  0.1f);
+    set_slider("r_sky_lon",      -180.0f,  180.0f,  0.1f);
+    set_slider("cam_fov",          20.0f,  120.0f,  0.5f);
+    set_slider("cam_speed",         0.1f,   30.0f,  0.1f);
+    set_slider("cam_sprint_mult",   1.0f,   10.0f,  0.1f);
+    set_slider("cam_sensitivity",   0.01f,   1.0f,  0.01f);
 
     RegisterCsgCommands();
     RegisterPrimCommands();
