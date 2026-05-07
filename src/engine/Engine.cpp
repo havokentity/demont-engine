@@ -2497,7 +2497,7 @@ void Engine::RegisterCommands() {
                 // name        cov   base    top    dens    freq      detail
                 { "clear",     0.0f,  200.0f,  500.0f, 0.0f,   0.005f,  0.0f  },
                 { "cumulus",   0.45f, 200.0f,  500.0f, 0.06f,  0.005f,  0.35f },
-                { "stratus",   0.92f, 100.0f,  300.0f, 0.04f,  0.0025f, 0.15f },
+                { "stratus",   0.95f, 120.0f,  220.0f, 0.05f,  0.008f,  0.10f },
                 { "cirrus",    0.30f, 8000.0f, 9500.0f, 0.015f, 0.0035f, 0.55f },
                 { "overcast",  0.98f, 200.0f,  700.0f, 0.05f,  0.0035f, 0.20f },
                 { "storm",     0.85f, 150.0f, 2000.0f, 0.18f,  0.0045f, 0.45f },
