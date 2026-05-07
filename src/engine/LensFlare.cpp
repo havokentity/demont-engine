@@ -277,15 +277,19 @@ int trace_ghosts(const LensSystem& lens, Ghost* out, int max_count) {
         gh.M_b[0] = c.M_b.a; gh.M_b[1] = c.M_b.b;
         gh.M_b[2] = c.M_b.c; gh.M_b[3] = c.M_b.d;
         gh.intensity = c.intensity / max_int;
-        // Footprint radius approximation: a parallel bundle of radius
-        // pupil_radius enters the lens and exits with sensor-plane
-        // radius |B| * pupil_radius (the B coefficient is the y-vs-u
-        // off-diagonal). For ghosts that focus to a point (small B)
-        // this gives a tight disc; for divergent ghosts a soft halo.
-        gh.radius_mm = std::fabs(c.M_g.b) * lens.pupil_radius_mm;
-        // Clamp absurd values from near-singular paths.
-        if (gh.radius_mm < 1.0f)   gh.radius_mm = 1.0f;
-        if (gh.radius_mm > 30.0f)  gh.radius_mm = 30.0f;
+        // Footprint radius. A parallel bundle (u_in = sun angle) of
+        // height range [-r_p, r_p] passes through the ghost transfer
+        // matrix to (A*h_in + B*u_in, ...), so the bundle's HEIGHT
+        // SPREAD on the sensor is |A| * r_p (the A coefficient is the
+        // y-vs-y on-diagonal). Earlier this used |B| which has units
+        // of mm and produces a dimensional mistake (mm * mm).
+        gh.radius_mm = std::fabs(c.M_g.a) * lens.pupil_radius_mm;
+        // Clamp to a visually-reasonable band. Real lens flare ghosts
+        // are 30-200px on a 1080p frame; the lower cap keeps near-
+        // focused paths visible, the upper cap stops a near-singular
+        // ghost from filling the screen.
+        if (gh.radius_mm < 0.3f) gh.radius_mm = 0.3f;
+        if (gh.radius_mm > 4.0f) gh.radius_mm = 4.0f;
     }
     return n_out;
 }
@@ -344,11 +348,12 @@ int prepare_shader_ghosts(const LensSystem& lens,
         sg.scale_b   = gh.M_b[1] / B_main_b;
         sg.intensity = gh.intensity;
         sg.radius_px = gh.radius_mm * px_per_mm;
-        // Clamp radius to sensible visual range so a numerical
-        // singularity in the paraxial trace can't blow up to a
-        // screen-filling disc.
-        if (sg.radius_px < 4.0f)    sg.radius_px = 4.0f;
-        if (sg.radius_px > 256.0f)  sg.radius_px = 256.0f;
+        // Cap pixel radius so even an unlucky paraxial path can't
+        // produce a screen-filling disc. 96 px on 1080p ≈ 0.5 deg
+        // on a 50mm lens, which matches how big real flare ghosts
+        // look in lens reviews.
+        if (sg.radius_px < 4.0f)   sg.radius_px = 4.0f;
+        if (sg.radius_px > 96.0f)  sg.radius_px = 96.0f;
         sg._pad[0] = sg._pad[1] = sg._pad[2] = 0.0f;
     }
     return n_out;

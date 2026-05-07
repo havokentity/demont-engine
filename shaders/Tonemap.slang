@@ -293,7 +293,14 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 // a 1.2 multiplier to fade slightly inside the corners.
                 float diag = 0.5 * length(dimf);
                 float fade = saturate(1.0 - length(cv * dimf) / diag * 1.2);
-                c += flare_intensity * flare * fade * vis;
+                // On-axis fade: when the sun is at screen centre, every
+                // ghost lands at sun_uv too (sum of ghost = sun_c *
+                // scale, sun_c = 0 means all ghosts overlap with the
+                // source). Real lens flare separation is proportional
+                // to off-axis angle. Without this fade the ghosts pile
+                // up into one giant blob centred on the sun.
+                float sun_off = saturate(length(sun_uv - 0.5) * 4.0);
+                c += flare_intensity * flare * fade * vis * sun_off;
             }
             float3 ldr_phys = (passthrough != 0u) ? c : acesTonemap(c * exposure);
             ldr_out[tid.xy] = float4(ldr_phys, 1.0);
