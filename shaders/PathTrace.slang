@@ -97,6 +97,14 @@ cbuffer Push {
     //        iris -> polygonal bokeh).
     //   .w reserved.
     float4 dof_params;
+    // Volumetric single-scatter parameters.
+    //   .x = extinction coefficient (per world unit). 0 disables.
+    //   .y = Henyey-Greenstein anisotropy g in [-1, 1]. +0.7 gives
+    //        forward-scattering atmosphere; 0 = isotropic (fog);
+    //        -0.5 = back-scattering (rare materials).
+    //   .z = intensity multiplier on the final scatter contribution.
+    //   .w = march sample count (cast to int; 4..64 typical).
+    float4 vol_params;
 };
 
 static const uint MAT_LAMBERT    = 0u;
@@ -660,8 +668,22 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // counted -- skip on miss to avoid double counting.
         bool   skip_sky_on_miss = false;
 
+        // Save primary-ray params for the volumetric march (single
+        // scatter along the camera ray, evaluated after the bounce
+        // loop). primary_t is the depth at which the camera ray hits
+        // something; sky-miss defaults to 1000m so we still get
+        // atmospheric haze along the full visible distance.
+        float3 primary_ro = ro;
+        float3 primary_rd = rd;
+        float  primary_t  = 1000.0;
+        bool   primary_t_recorded = false;
+
         for (uint b = 0u; b < max_bounces; ++b) {
         HitInfo h = traceScene(ro, rd);
+        if (b == 0u) {
+            primary_t = h.hit ? h.t : 1000.0;
+            primary_t_recorded = true;
+        }
         if (!h.hit) {
             if (!skip_sky_on_miss) {
                 radiance += throughput * skyColor(rd);
@@ -787,6 +809,64 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 throughput /= p;
             }
         }
+        // Volumetric single-scatter along the primary ray. For each
+        // march sample, NEE-shadow-ray to the sun and add
+        //   sun_radiance * HG_phase(cos(view, -sun)) * sigma_s * dt
+        //   * transmittance_to_camera * transmittance_to_sun
+        // Beer's law transmittance accumulates as we walk away from
+        // the camera. Per-pixel jitter on the march start breaks
+        // banding from regular sampling.
+        if (vol_params.x > 0.0 && primary_t_recorded) {
+            float  sigma_t   = vol_params.x;     // extinction = scattering for haze
+            float  g         = vol_params.y;
+            float  vol_int   = vol_params.z;
+            int    N         = max(1, int(vol_params.w));
+            float3 sun_dir   = sun_and_mode.xyz;
+            float  sun_elev  = sun_dir.y;
+            float3 v_color   = float3(0.0);
+            float  trans_eye = 1.0;
+            float  dt        = primary_t / float(N);
+            float  jitter    = randf(seed) * dt;
+            // Sun radiance at this elevation (matches Lambert sun
+            // colour so beams + lit surfaces agree on tint).
+            float3 sun_rad = float3(0.0);
+            if (sun_elev > 0.0) {
+                float am  = 1.0 / max(sun_elev, 0.04);
+                float tau = 0.30;
+                float t_atm = exp(-tau * am);
+                float warmth = saturate((am - 1.0) * 0.18);
+                sun_rad = lerp(float3(1.00, 0.97, 0.92),
+                               float3(1.55, 0.55, 0.20), warmth)
+                        * (80.0 * t_atm);
+            }
+            // HG phase(cos): forward-peak when g > 0. cos_theta is
+            // between view ray and the direction OUT OF THE SUN
+            // (i.e. -sun_dir, since sun_dir points TOWARD the sun).
+            float cos_theta = dot(primary_rd, -sun_dir);
+            float g2 = g * g;
+            float phase = (1.0 - g2)
+                        / (4.0 * 3.14159265358979
+                                * pow(max(1.0 + g2 - 2.0 * g * cos_theta, 1e-4), 1.5));
+
+            for (int vi = 0; vi < N; ++vi) {
+                float t = (float(vi) + 0.5) * dt + jitter;
+                if (t >= primary_t) break;
+                float3 sp = primary_ro + primary_rd * t;
+                // NEE toward sun: refractive-shadow-ray transmittance
+                // gives a tinted attenuation through any glass on
+                // the path, plus full kill if blocked by opaque.
+                if (sun_elev > 0.0) {
+                    float3 trans_sun = transmittance(sp, sun_dir, 1e30);
+                    if (any(trans_sun > float3(0.0))) {
+                        v_color += sun_rad * trans_sun * phase
+                                 * sigma_t * dt * trans_eye;
+                    }
+                }
+                trans_eye *= exp(-sigma_t * dt);
+            }
+            radiance += v_color * vol_int;
+        }
+
         frame_radiance += radiance;
     }
     frame_radiance /= float(sample_count);

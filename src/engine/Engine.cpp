@@ -134,6 +134,14 @@ namespace cvar {
     PT_CVAR(r_dof_aperture,    "0.05","Aperture radius in world units. Bigger = more blur on out-of-focus pixels. Real-camera analogue: focal_length / f_number; e.g. 50mm at f/2.8 ~= 0.018 (assuming the scene is in metres).", CVAR_ARCHIVE);
     PT_CVAR(r_dof_focal_distance, "5.0", "Distance from camera (world units) where the scene is in perfect focus. Closer / farther pixels get bokeh proportional to their distance from this plane.", CVAR_ARCHIVE);
     PT_CVAR(r_dof_blades,      "0",   "Aperture blade count. 0 = perfectly round disk (circular bokeh). 5/6/8 = polygonal iris (matching real lens aperture blades) -- gives polygonal bokeh on out-of-focus highlights.", CVAR_ARCHIVE);
+    // Volumetrics: single-scatter ray march along primary rays, NEE
+    // toward sun at each sample. Atmospheric haze + god rays through
+    // gaps in geometry (sun shafts).
+    PT_CVAR(r_volumetric,           "0",    "Volumetric single-scatter (atmospheric haze + sun shafts). 0 disables; otherwise march r_volumetric_samples points along each primary ray and NEE-shadow-test toward the sun at each.", CVAR_ARCHIVE);
+    PT_CVAR(r_volumetric_density,   "0.02", "Extinction coefficient (per world unit). Higher = thicker haze + brighter god rays. Realistic atmospheric values are 0.005..0.05.", CVAR_ARCHIVE);
+    PT_CVAR(r_volumetric_anisotropy,"0.7",  "Henyey-Greenstein phase g in [-0.95, 0.95]. +0.7 = forward-peaked atmosphere, 0 = isotropic fog, negative = back-scattering. Higher g makes the sun's halo much brighter when the camera looks near it.", CVAR_ARCHIVE);
+    PT_CVAR(r_volumetric_intensity, "1.0",  "Linear scale on the volumetric contribution. Useful to dial god rays up/down without changing the underlying density.", CVAR_ARCHIVE);
+    PT_CVAR(r_volumetric_samples,   "16",   "March sample count per primary ray (4..64). More = smoother shafts at proportional GPU cost. 16 is a comfortable default with the denoiser on.", CVAR_ARCHIVE);
     PT_CVAR(dev_cheats,        "0",    "Gate for CHEAT-flagged cvars",   0);
     PT_CVAR(dev_log_level,     "info", "error|warn|info|debug",          0);
 
@@ -1169,6 +1177,9 @@ void Engine::RenderFrame() {
         // distance (world units). .z = aperture blade count (0 =
         // round disk, 3..16 = polygonal iris). .w reserved.
         float dof_params[4];
+        // .x = density (0 disables). .y = HG anisotropy. .z =
+        // intensity. .w = march sample count (cast to int in shader).
+        float vol_params[4];
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -1352,7 +1363,24 @@ void Engine::RenderFrame() {
         push.dof_params[3] = 0.0f;
     }
 
-    static_assert(sizeof(PtPush) == 272 + 48 + 16);
+    {
+        bool  vol_on  = false;
+        float density = 0.02f, anisotropy = 0.7f, intensity = 1.0f;
+        int   samples = 16;
+        if (auto* v = C.FindCVar("r_volumetric"))            vol_on     = v->GetBool();
+        if (auto* v = C.FindCVar("r_volumetric_density"))    density    = v->GetFloat();
+        if (auto* v = C.FindCVar("r_volumetric_anisotropy")) anisotropy = v->GetFloat();
+        if (auto* v = C.FindCVar("r_volumetric_intensity"))  intensity  = v->GetFloat();
+        if (auto* v = C.FindCVar("r_volumetric_samples"))    samples    = v->GetInt();
+        if (samples < 4)  samples = 4;
+        if (samples > 64) samples = 64;
+        push.vol_params[0] = vol_on ? density : 0.0f;
+        push.vol_params[1] = anisotropy;
+        push.vol_params[2] = intensity;
+        push.vol_params[3] = float(samples);
+    }
+
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16);
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
 
@@ -2268,6 +2296,16 @@ void Engine::RegisterCommands() {
     if (auto* v = C.FindCVar("r_dof_blades")) {
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
+    if (auto* v = C.FindCVar("r_volumetric")) {
+        v->allowed_values = {"0", "1"};
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    for (const char* n : {"r_volumetric_density", "r_volumetric_anisotropy",
+                          "r_volumetric_intensity", "r_volumetric_samples"}) {
+        if (auto* v = C.FindCVar(n)) {
+            v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+        }
+    }
     // r_quality: master preset that bulk-edits the per-feature cvars.
     // Ranges chosen so 'low' is comfortably fast at 1080p on M-series
     // GPUs, 'high' is the headline-correct path, and 'ultra' bumps
@@ -2520,6 +2558,10 @@ void Engine::RegisterCommands() {
     set_slider("r_dof_aperture",        0.0f,   1.0f,  0.001f);
     set_slider("r_dof_focal_distance",  0.1f, 100.0f,  0.1f);
     set_slider("r_dof_blades",          0.0f,  16.0f,  1.0f);
+    set_slider("r_volumetric_density",     0.0f,  0.20f, 0.001f);
+    set_slider("r_volumetric_anisotropy", -0.95f, 0.95f, 0.01f);
+    set_slider("r_volumetric_intensity",   0.0f,  4.0f,  0.05f);
+    set_slider("r_volumetric_samples",     4.0f, 64.0f,  1.0f);
     set_slider("r_bloom_threshold",     0.0f,  10.0f,  0.05f);
     set_slider("r_bloom_intensity",     0.0f,   1.0f,  0.005f);
     set_slider("r_bloom_mips",          1.0f,   5.0f,  1.0f);
