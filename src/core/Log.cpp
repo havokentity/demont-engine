@@ -9,7 +9,19 @@
 #include <ctime>
 #include <mutex>
 #include <string>
+
+// Portable isatty: POSIX uses <unistd.h>::isatty + ::fileno; MSVC's
+// runtime exposes _isatty + _fileno in <io.h>. Both check whether
+// the given C stdio FILE* is bound to a terminal.
+#if defined(_WIN32)
+#include <io.h>
+#define PT_ISATTY(fd) (_isatty(fd) != 0)
+#define PT_FILENO(f)  _fileno(f)
+#else
 #include <unistd.h>
+#define PT_ISATTY(fd) (::isatty(fd) != 0)
+#define PT_FILENO(f)  fileno(f)
+#endif
 
 namespace pt::log {
 
@@ -22,7 +34,7 @@ std::mutex  g_sink_mutex;
 
 // Cache the tty check; stderr won't change handle types mid-run.
 bool TtyEnabled() {
-    static const bool v = ::isatty(fileno(stderr)) != 0;
+    static const bool v = PT_ISATTY(PT_FILENO(stderr));
     return v;
 }
 
@@ -63,7 +75,13 @@ void Emit(Level level, fmt::string_view fmt_str, fmt::format_args args) {
     auto now = std::chrono::system_clock::now();
     auto t   = std::chrono::system_clock::to_time_t(now);
     std::tm tm{};
+    // Portable localtime: POSIX has localtime_r(time_t*, tm*); MSVC has
+    // localtime_s(tm*, time_t*) -- note the reversed argument order.
+#if defined(_WIN32)
+    localtime_s(&tm, &t);
+#else
     localtime_r(&t, &tm);
+#endif
 
     auto body = fmt::vformat(fmt_str, args);
 

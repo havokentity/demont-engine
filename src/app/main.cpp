@@ -6,7 +6,19 @@
 #include "engine/Engine.h"
 
 #include <fmt/format.h>
+
+// Portable isatty: POSIX uses <unistd.h>::isatty + ::fileno; MSVC's
+// runtime exposes _isatty + _fileno in <io.h>. Both check whether
+// the given C stdio FILE* is bound to a terminal.
+#if defined(_WIN32)
+#include <io.h>
+#define PT_ISATTY(fd) (_isatty(fd) != 0)
+#define PT_FILENO(f)  _fileno(f)
+#else
 #include <unistd.h>
+#define PT_ISATTY(fd) (::isatty(fd) != 0)
+#define PT_FILENO(f)  fileno(f)
+#endif
 
 namespace {
 
@@ -15,7 +27,7 @@ namespace {
 // shows up in the in-window overlay and the web console too -- this
 // version just adds 24-bit ANSI colour for terminals.
 void PrintBootLogo() {
-    const bool tty  = ::isatty(fileno(stderr)) != 0;
+    const bool tty  = PT_ISATTY(PT_FILENO(stderr));
     const char* CY  = tty ? "\033[38;2;0;240;255m"     : "";  // electric cyan
     const char* CD  = tty ? "\033[38;2;0;130;160m"     : "";  // dim cyan
     const char* MG  = tty ? "\033[38;2;255;58;140m"    : "";  // magenta

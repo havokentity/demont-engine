@@ -20,6 +20,19 @@ namespace pt::log { enum class Level; }
 
 namespace pt::console {
 
+// Portable socket handle: POSIX uses signed int (-1 = invalid); Winsock
+// uses SOCKET (UINT_PTR). Pulling <winsock2.h> into a public header is
+// noisy, so we declare a uintptr_t-shaped opaque type here and let the
+// .cpp do the real reinterpretation. On POSIX it's still effectively an
+// int; on Windows the upper bits hold the kernel handle.
+#if defined(_WIN32)
+using socket_handle_t = std::uintptr_t;
+inline constexpr socket_handle_t kInvalidSocket = static_cast<socket_handle_t>(~0ULL);
+#else
+using socket_handle_t = int;
+inline constexpr socket_handle_t kInvalidSocket = -1;
+#endif
+
 class Console;
 
 // Hosts the WebSocket+HTTP server (civetweb) and the raw line-protocol TCP
@@ -71,7 +84,7 @@ private:
 
     // ----- Line protocol thread -------------------------------------------
     void LineAcceptLoop();
-    void LineClientLoop(int fd);
+    void LineClientLoop(socket_handle_t fd);
 
     // ----- State ----------------------------------------------------------
     Config                config_;
@@ -82,7 +95,7 @@ private:
     std::unordered_map<mg_connection*, WsClient> ws_clients_;
 
     std::atomic<bool>     line_run_{false};
-    int                   line_fd_  = -1;
+    socket_handle_t       line_fd_  = kInvalidSocket;
     std::thread           line_thread_;
     std::vector<std::thread> line_workers_;
 };
