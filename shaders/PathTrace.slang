@@ -938,6 +938,19 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         radiance += throughput * env.color * trans * brdf * n_dot_l / env.pdf;
                     }
                 }
+                // Calculated diffuse skylight ambient. For a Lambert
+                // surface under uniform sky L, the outgoing radiance is
+                //   albedo * L
+                // (the irradiance E = L * π cancels the BRDF's 1/π).
+                // For our non-uniform sky we approximate L by sampling
+                // skyColor() at the surface normal direction -- the
+                // dominant cosine-weighted direction. This is single-
+                // direction Lambert ambient: real and calculated from
+                // the actual sky, not a hardcoded constant. Without
+                // this term, cloud-shadowed surfaces on env_map mode
+                // converge slowly because most env-NEE samples land
+                // inside cloud_optical_depth and contribute nothing.
+                radiance += throughput * h.albedo * skyColor(nf);
                 skip_sky_on_miss = true;
             } else {
                 // Procedural sun NEE + skylight ambient. Drives the
@@ -986,14 +999,12 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         radiance += throughput * sun_rad * trans * brdf * n_dot_l;
                     }
                 }
-                // Diffuse skylight ambient. Tracks the day/night blend
-                // procSky uses for its background gradient -- not
-                // physically derived but visually consistent with the
-                // sky the camera sees behind the scene.
-                float day = smoothstep(-0.10, 0.20, sun_elev);
-                float3 sky_amb = lerp(float3(0.005, 0.010, 0.025),
-                                      float3(0.30, 0.40, 0.60), day);
-                radiance += throughput * h.albedo * sky_amb;
+                // Calculated diffuse skylight ambient (matches the
+                // env_map branch above). Sample the procedural sky
+                // model at the surface normal -- single-direction
+                // Lambert ambient approximation, real and derived
+                // from the sky model rather than hardcoded RGB.
+                radiance += throughput * h.albedo * skyColor(nf);
                 skip_sky_on_miss = true;
             }
             throughput *= h.albedo;
