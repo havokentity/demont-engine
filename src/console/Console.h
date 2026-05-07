@@ -137,6 +137,18 @@ public:
     // for values that contain spaces is wrapped in double quotes.
     int SaveArchivedCvars(const std::string& path);
 
+    // Cvar undo / redo. Each ExecuteScript transaction captures the
+    // pre-values of every cvar it touched and pushes them as one
+    // entry on the undo stack. Undo() pops the top and restores;
+    // Redo() reapplies. Stack capped at kMaxHistory entries. Returns
+    // a 0-based count of entries actually rolled back; 0 means the
+    // stack was empty.
+    static constexpr std::size_t kMaxHistory = 50;
+    std::size_t Undo();
+    std::size_t Redo();
+    std::size_t UndoDepth() const { return undo_stack_.size(); }
+    std::size_t RedoDepth() const { return redo_stack_.size(); }
+
 private:
     Console() = default;
 
@@ -149,6 +161,12 @@ private:
     };
     std::mutex                queue_mutex_;
     std::deque<PendingExec>   queue_;
+
+    // Single transaction snapshot: name -> pre-transaction value.
+    using CvarSnapshot = std::map<std::string, std::string>;
+    std::deque<CvarSnapshot>  undo_stack_;
+    std::deque<CvarSnapshot>  redo_stack_;
+    bool                      in_undo_redo_ = false;   // suppress nested capture
 };
 
 // Tokenize a single console line.  Quote-aware ("a b" stays one token).

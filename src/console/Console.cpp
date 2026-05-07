@@ -239,6 +239,34 @@ ExecuteResult Console::Execute(std::string_view line) {
 
 ExecuteResult Console::ExecuteScript(std::string_view body) {
     ExecuteResult agg;
+    // Capture pre-transaction values of every cvar that the script
+    // tries to set. Implemented by parsing the first token of each
+    // statement; if that token names a known cvar, snapshot its
+    // current value. Statements that target commands (no cvar match)
+    // contribute nothing to the snapshot.
+    CvarSnapshot pre;
+    if (!in_undo_redo_) {
+        std::size_t i = 0;
+        while (i < body.size()) {
+            std::size_t end = i;
+            while (end < body.size() && body[end] != '\n' && body[end] != ';') ++end;
+            auto line = body.substr(i, end - i);
+            // Find first non-whitespace, then first whitespace (token end).
+            std::size_t a = 0;
+            while (a < line.size() && (line[a] == ' ' || line[a] == '\t')) ++a;
+            std::size_t b = a;
+            while (b < line.size() && line[b] != ' ' && line[b] != '\t') ++b;
+            if (b > a) {
+                std::string_view name = line.substr(a, b - a);
+                auto it = cvars_.find(std::string(name));
+                if (it != cvars_.end() && pre.find(it->first) == pre.end()) {
+                    pre[it->first] = it->second.value;
+                }
+            }
+            i = (end < body.size()) ? end + 1 : end;
+        }
+    }
+
     std::size_t i = 0;
     while (i < body.size()) {
         std::size_t end = i;
@@ -258,7 +286,69 @@ ExecuteResult Console::ExecuteScript(std::string_view body) {
         }
         i = (end < body.size()) ? end + 1 : end;
     }
+
+    // Build the actual diff: only push cvars whose value really
+    // changed during this script. Skip the entry entirely if nothing
+    // changed (typing a no-op or a query).
+    if (!in_undo_redo_) {
+        CvarSnapshot diff;
+        for (auto& [name, old] : pre) {
+            auto it = cvars_.find(name);
+            if (it != cvars_.end() && it->second.value != old) {
+                diff[name] = old;
+            }
+        }
+        if (!diff.empty()) {
+            undo_stack_.push_back(std::move(diff));
+            if (undo_stack_.size() > kMaxHistory) undo_stack_.pop_front();
+            // Any new edit invalidates the redo branch.
+            redo_stack_.clear();
+        }
+    }
     return agg;
+}
+
+std::size_t Console::Undo() {
+    if (undo_stack_.empty()) return 0;
+    in_undo_redo_ = true;
+    CvarSnapshot snap = std::move(undo_stack_.back());
+    undo_stack_.pop_back();
+    // Capture the current state of these same cvars so Redo can
+    // reapply the forward edit.
+    CvarSnapshot fwd;
+    for (auto& [name, old] : snap) {
+        auto it = cvars_.find(name);
+        if (it == cvars_.end()) continue;
+        fwd[name] = it->second.value;
+        // Set value via Execute so any allowed_values check, on_change
+        // hook, and cascading on_change side effects fire as if the
+        // user typed the rollback.
+        std::string line = name + " " + old;
+        Execute(line);
+    }
+    redo_stack_.push_back(std::move(fwd));
+    if (redo_stack_.size() > kMaxHistory) redo_stack_.pop_front();
+    in_undo_redo_ = false;
+    return snap.size();
+}
+
+std::size_t Console::Redo() {
+    if (redo_stack_.empty()) return 0;
+    in_undo_redo_ = true;
+    CvarSnapshot snap = std::move(redo_stack_.back());
+    redo_stack_.pop_back();
+    CvarSnapshot back;
+    for (auto& [name, val] : snap) {
+        auto it = cvars_.find(name);
+        if (it == cvars_.end()) continue;
+        back[name] = it->second.value;
+        std::string line = name + " " + val;
+        Execute(line);
+    }
+    undo_stack_.push_back(std::move(back));
+    if (undo_stack_.size() > kMaxHistory) undo_stack_.pop_front();
+    in_undo_redo_ = false;
+    return snap.size();
 }
 
 void Console::QueueExecute(std::string line, Responder responder) {

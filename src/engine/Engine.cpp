@@ -2439,6 +2439,36 @@ void Engine::RegisterCommands() {
                                ? "(on-screen)" : "(off-screen)");
         });
 
+    C.RegisterCommand("undo",
+        "Roll back the most recent cvar change (or semicolon-bundle "
+        "of changes) made via the console. Pre-transaction values "
+        "are restored; the rollback itself is recorded for redo. "
+        "History stack holds the last 50 transactions.",
+        [](auto, pt::console::Output& out) {
+            auto& C2 = pt::console::Console::Get();
+            std::size_t n = C2.Undo();
+            if (n == 0) {
+                out.PrintLine("undo: history is empty");
+            } else {
+                out.FormatLine("undo: rolled back {} cvar change{}",
+                               n, n == 1 ? "" : "s");
+            }
+        });
+
+    C.RegisterCommand("redo",
+        "Reapply the most recently undone cvar change. Cleared by "
+        "any new edit.",
+        [](auto, pt::console::Output& out) {
+            auto& C2 = pt::console::Console::Get();
+            std::size_t n = C2.Redo();
+            if (n == 0) {
+                out.PrintLine("redo: nothing to redo");
+            } else {
+                out.FormatLine("redo: reapplied {} cvar change{}",
+                               n, n == 1 ? "" : "s");
+            }
+        });
+
     C.RegisterCommand("dump_moon_pos",
         "Print the engine's computed moon position (alt/az/phase) "
         "and whether the engine thinks it should be lighting the "
