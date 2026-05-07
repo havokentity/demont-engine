@@ -132,7 +132,14 @@ private:
     std::uint64_t                               tonemap_pipeline_id_   = 0;
     std::uint64_t                               bloom_down_pipeline_id_ = 0;
     std::uint64_t                               bloom_up_pipeline_id_   = 0;
+    std::uint64_t                               autoexpose_pipeline_id_ = 0;
     std::uint64_t                               accum_texture_id_      = 0;
+    // GPU-side exposure scalar: AutoExposure.slang updates this when
+    // r_auto_exposure=1; engine WriteBuffer's the manual r_exposure
+    // value when r_auto_exposure=0. PathTrace.slang reads this in
+    // its final tonemap, replacing the per-frame readback path that
+    // stalled the GPU on dGPU.
+    std::uint64_t                               exposure_state_id_     = 0;
     std::uint64_t                               box_blas_id_           = 0;
     std::uint64_t                               scene_tlas_id_         = 0;
     std::uint64_t                               box_vbuf_id_           = 0;

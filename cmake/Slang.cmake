@@ -34,12 +34,18 @@ function(pt_compile_slang)
     file(MAKE_DIRECTORY "${out_dir}")
 
     foreach(t ${SLG_TARGETS})
+        set(slang_defs "")
         if(t STREQUAL "metal")
             set(ext "metal")
             set(slang_target "metal")
+            list(APPEND slang_defs "-DPT_TARGET_METAL")
         elseif(t STREQUAL "spirv")
             set(ext "spv")
             set(slang_target "spirv")
+            # Path tracer's push-constant block is too large for native
+            # Vulkan's 256B hw limit; the shader checks PT_TARGET_SPIRV
+            # to spill the tail into a UBO at vk::binding(14, 0).
+            list(APPEND slang_defs "-DPT_TARGET_SPIRV")
         elseif(t STREQUAL "cpp")
             set(ext "cpp")
             set(slang_target "cpp")
@@ -59,6 +65,7 @@ function(pt_compile_slang)
                     -target  ${slang_target}
                     -entry   ${SLG_ENTRY}
                     -stage   ${SLG_STAGE}
+                    ${slang_defs}
                     -Wno-40100
                     -o       "${out}"
             DEPENDS "${slg_full}" "${PT_SLANGC_BIN}"

@@ -530,6 +530,39 @@ void Engine::RequestBackendSwitch(BackendType to) {
         };
         bloom_up_pipeline_id_ = device_->CreateComputePipeline(desc).id;
     }
+    {
+        pt::rhi::ComputePipelineDesc desc{
+            .kernel_name = "autoexpose", .bytecode = {}, .debug_name = "autoexpose",
+        };
+        autoexpose_pipeline_id_ = device_->CreateComputePipeline(desc).id;
+    }
+
+    // GPU-resident exposure scalar (1 float). AutoExposure.slang
+    // updates this each tick when r_auto_exposure=1; engine writes the
+    // manual r_exposure value here when r_auto_exposure=0. PathTrace.slang
+    // reads from it in the final tonemap, replacing the per-frame
+    // accum_hdr readback path.
+    //
+    // Seed with r_exposure if manual mode is the user's current state,
+    // otherwise 1.0 (auto mode kernel will overwrite on first frame).
+    {
+        auto buf = device_->CreateBuffer({
+            .size = sizeof(float),
+            .usage = pt::rhi::BufferUsage::Storage,
+            .debug_name = "exposure_state",
+        });
+        exposure_state_id_ = buf.id;
+        if (exposure_state_id_ != 0) {
+            float init_exposure = 1.0f;
+            auto& Cx = pt::console::Console::Get();
+            bool auto_exp = true;
+            if (auto* av = Cx.FindCVar("r_auto_exposure")) auto_exp = av->GetBool();
+            if (!auto_exp) {
+                if (auto* ev = Cx.FindCVar("r_exposure")) init_exposure = ev->GetFloat();
+            }
+            device_->WriteBuffer(buf, &init_exposure, sizeof(float), 0);
+        }
+    }
 
     // Mark the analytic-primitive buffer dirty so it gets uploaded on
     // the first frame against this device. The mesh BLAS + TLAS are
@@ -556,7 +589,12 @@ void Engine::SeedDefaultCsgScene() {
 }
 
 void Engine::EnsureMeshUpdated() {
-    if (!device_ || current_backend_ != BackendType::Metal) return;
+    if (!device_) return;
+    // Any backend that supports hardware ray tracing can host the CSG
+    // mesh -- not just Metal. Vulkan got real CreateBLAS/CreateTLAS in
+    // P12 (the Windows bringup). The software backend has no AS path
+    // and stays gated out via SupportsHardwareRT() = false.
+    if (!device_->SupportsHardwareRT()) return;
     if (!csg_scene_) return;
 
     // Phase 2: the worker has a result waiting. Pull it onto the main
@@ -1207,6 +1245,13 @@ void Engine::RenderFrame() {
         : pt::rhi::BufferHandle{prim_buffer_id_};
     if (slot4.id != 0) cb->BindBuffer(4, slot4, 0);
     if (slot5.id != 0) cb->BindBuffer(5, slot5, 0);
+    // GPU-driven exposure scalar at slot 6. PathTrace reads it for
+    // the final tonemap; AutoExposure (dispatched later this frame)
+    // updates it. Replaces the per-frame readback path that stalled
+    // the GPU on dGPU.
+    if (exposure_state_id_ != 0) {
+        cb->BindBuffer(6, pt::rhi::BufferHandle{exposure_state_id_}, 0);
+    }
     // P10 G-buffer texture binds. The shader's vk::binding numbers (6/7/8)
     // are Vulkan descriptor slots; on Metal Slang assigns texture(N) in
     // declaration order, so output/accum/denoise_color/depth/motion/env
@@ -1645,6 +1690,44 @@ void Engine::RenderFrame() {
     auto wg_y = (fc.height + 7) / 8;
     cb->Dispatch(wg_x, wg_y, 1);
 
+    // GPU-side auto-exposure: tiny reduction pass that samples
+    // accum_hdr (which the path tracer just wrote) and updates the
+    // exposure_state buffer the next frame's PathTrace reads. One
+    // frame of latency, zero CPU readback, zero queue-drain stall.
+    // Replaces the legacy per-8-frames CPU readback that on dGPU
+    // forced a vkQueueWaitIdle and tanked fps to ~18.
+    if (auto_exp && autoexpose_pipeline_id_ != 0 && exposure_state_id_ != 0
+        && accum_texture_id_ != 0) {
+        struct AePush {
+            std::uint32_t width;
+            std::uint32_t height;
+            std::uint32_t stride;
+            std::uint32_t pad0;
+            float key;
+            float exp_min;
+            float exp_max;
+            float adapt_speed;
+        } ae{};
+        ae.width  = fc.width;
+        ae.height = fc.height;
+        ae.stride = 16;
+        ae.key    = 0.18f;
+        ae.exp_min = 0.05f;
+        ae.exp_max = 4.0f;
+        ae.adapt_speed = 0.20f;
+        if (auto* v = C.FindCVar("r_exposure_target")) ae.key         = v->GetFloat();
+        if (auto* v = C.FindCVar("r_exposure_min"))    ae.exp_min     = v->GetFloat();
+        if (auto* v = C.FindCVar("r_exposure_max"))    ae.exp_max     = v->GetFloat();
+        if (auto* v = C.FindCVar("r_eye_adapt_speed")) ae.adapt_speed = v->GetFloat();
+
+        cb->BindComputePipeline(pt::rhi::PipelineHandle{autoexpose_pipeline_id_});
+        // accum_hdr stays bound at slot 1 from the path-trace dispatch;
+        // exposure_state at slot 6. The autoexpose shader only reads
+        // those two -- other slots stay bound but are ignored.
+        cb->PushConstants(&ae, sizeof(ae));
+        cb->Dispatch(1, 1, 1);  // single workgroup of 64 threads
+    }
+
     // P10 denoise pass: encoded onto the same command buffer between
     // the path tracer dispatch and Submit. MetalFX reads the G-buffer
     // textures the shader just wrote and outputs to the swapchain
@@ -1881,56 +1964,15 @@ void Engine::RenderFrame() {
     prev_view_proj_       = curr_view_proj;
     prev_view_proj_valid_ = true;
 
-    // Auto-exposure: every 8 frames, sample accum_hdr's central region
-    // and nudge the exposure scalar toward 0.18 / scene_avg_luminance.
-    // accum_hdr is shared-storage on Apple Silicon so the readback is
-    // a memcpy; we step every 16th pixel for speed (~3.6k samples on a
-    // 1280x720 frame). Smoothing factor controls eye-adaptation rate.
-    if (auto_exp && accum_texture_id_ != 0 && ++autoexpose_counter_ >= 8) {
-        autoexpose_counter_ = 0;
-        std::uint32_t w = 0, h = 0;
-        const std::size_t bytes = std::size_t(accum_w_) * accum_h_ * 16;
-        std::vector<float> rgba(bytes / sizeof(float));
-        if (device_->ReadbackTexture(pt::rhi::TextureHandle{accum_texture_id_},
-                                     rgba.data(), bytes, &w, &h) && w > 0 && h > 0) {
-            double accum_lum = 0.0;
-            std::size_t n = 0;
-            for (std::uint32_t y = 0; y < h; y += 16) {
-                for (std::uint32_t x = 0; x < w; x += 16) {
-                    const float* p = rgba.data() + (std::size_t(y) * w + x) * 4;
-                    const float lum = 0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2];
-                    if (lum > 0.0f) { accum_lum += lum; ++n; }
-                }
-            }
-            if (n > 0) {
-                const float avg_lum = float(accum_lum / double(n));
-                float key      = 0.18f;
-                float exp_min  = 0.05f;
-                float exp_max  = 4.0f;
-                float k        = 0.20f;
-                auto& Cx = pt::console::Console::Get();
-                if (auto* v = Cx.FindCVar("r_exposure_target")) key     = v->GetFloat();
-                if (auto* v = Cx.FindCVar("r_exposure_min"))    exp_min = v->GetFloat();
-                if (auto* v = Cx.FindCVar("r_exposure_max"))    exp_max = v->GetFloat();
-                if (auto* v = Cx.FindCVar("r_eye_adapt_speed")) k       = v->GetFloat();
-                float target_exp = key / std::max(avg_lum, 1e-3f);
-                if (target_exp < exp_min) target_exp = exp_min;
-                if (target_exp > exp_max) target_exp = exp_max;
-                // Geometric smoothing in log space gives a more
-                // perceptually uniform fade than a linear lerp.
-                if (k <= 0.0f) {
-                    // Locked-exposure presets (DSLR / linear): jump
-                    // straight to target without smoothing so the
-                    // user sees the locked value immediately.
-                    current_exposure_ = target_exp;
-                } else {
-                    current_exposure_ = std::exp(
-                        std::log(current_exposure_) * (1.0f - k) +
-                        std::log(target_exp)        * k);
-                }
-            }
-        }
-    }
+    // Auto-exposure was a per-frame CPU readback of accum_hdr,
+    // which on dGPU stalls the GPU queue (vkQueueWaitIdle every 8
+    // frames -> ~18 fps). It's now done entirely on GPU by the
+    // AutoExposure compute pass dispatched right after the path
+    // tracer above; the result lives in the exposure_state buffer
+    // and PathTrace.slang reads it on the next frame. Manual-mode
+    // (r_auto_exposure=0) value updates are done via on_change
+    // cvar hooks below in BindCvars(), so no per-frame work happens
+    // for that path either.
 }
 
 void Engine::UpdateCamera(double dt) {
@@ -2070,6 +2112,13 @@ void Engine::Run() {
         last = now;
 
         window_->PollEvents();
+        // Child overlay HWND on Win32 doesn't auto-resize when the
+        // parent does; push the latest client size each frame (no-op
+        // unless changed). Also matches Mac's NSWindow setFrame logic
+        // which is driven by AppKit's resize, not the engine loop.
+        if (overlay_) {
+            overlay_->NotifyParentResized(window_->Width(), window_->Height());
+        }
         Tick(dt);
 
         // If no device is bound yet we'd busy-loop; throttle.  With a
@@ -2490,30 +2539,39 @@ void Engine::RegisterCommands() {
     C.RegisterCommand("undo",
         "Roll back the most recent cvar change (or semicolon-bundle "
         "of changes) made via the console. Pre-transaction values "
-        "are restored; the rollback itself is recorded for redo. "
-        "History stack holds the last 50 transactions.",
+        "are restored as a single atomic step; the rollback itself "
+        "is recorded for redo. Output lists every cvar reverted with "
+        "before -> after values. History stack holds the last 50 "
+        "transactions.",
         [](auto, pt::console::Output& out) {
             auto& C2 = pt::console::Console::Get();
-            std::size_t n = C2.Undo();
-            if (n == 0) {
+            auto changes = C2.Undo();
+            if (changes.empty()) {
                 out.PrintLine("undo: history is empty");
-            } else {
-                out.FormatLine("undo: rolled back {} cvar change{}",
-                               n, n == 1 ? "" : "s");
+                return;
+            }
+            out.FormatLine("undo: rolled back {} cvar change{}",
+                           changes.size(), changes.size() == 1 ? "" : "s");
+            for (const auto& c : changes) {
+                out.FormatLine("  {}: \"{}\" -> \"{}\"", c.name, c.from, c.to);
             }
         });
 
     C.RegisterCommand("redo",
-        "Reapply the most recently undone cvar change. Cleared by "
-        "any new edit.",
+        "Reapply the most recently undone cvar change (or bundle). "
+        "Output lists every cvar reapplied with before -> after "
+        "values. Cleared by any new edit.",
         [](auto, pt::console::Output& out) {
             auto& C2 = pt::console::Console::Get();
-            std::size_t n = C2.Redo();
-            if (n == 0) {
+            auto changes = C2.Redo();
+            if (changes.empty()) {
                 out.PrintLine("redo: nothing to redo");
-            } else {
-                out.FormatLine("redo: reapplied {} cvar change{}",
-                               n, n == 1 ? "" : "s");
+                return;
+            }
+            out.FormatLine("redo: reapplied {} cvar change{}",
+                           changes.size(), changes.size() == 1 ? "" : "s");
+            for (const auto& c : changes) {
+                out.FormatLine("  {}: \"{}\" -> \"{}\"", c.name, c.from, c.to);
             }
         });
 
@@ -2939,7 +2997,36 @@ void Engine::RegisterCommands() {
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
     if (auto* v = C.FindCVar("r_exposure")) {
-        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+        v->on_change = [this](const pt::console::CVar& cv) {
+            accum_dirty_ = true;
+            // Manual mode: push the new value straight to the GPU
+            // exposure_state buffer so the next frame's PathTrace
+            // tonemap picks it up. In auto mode, AutoExposure.slang
+            // overwrites it each frame so we don't bother.
+            if (exposure_state_id_ == 0 || !device_) return;
+            bool auto_exp = false;
+            if (auto* av = pt::console::Console::Get().FindCVar("r_auto_exposure"))
+                auto_exp = av->GetBool();
+            if (!auto_exp) {
+                float val = cv.GetFloat();
+                device_->WriteBuffer(pt::rhi::BufferHandle{exposure_state_id_},
+                                     &val, sizeof(float), 0);
+            }
+        };
+    }
+    if (auto* v = C.FindCVar("r_auto_exposure")) {
+        v->on_change = [this](const pt::console::CVar& cv) {
+            // Switching auto -> manual: seed the GPU buffer with the
+            // current r_exposure value so the path tracer doesn't
+            // briefly use whatever the auto pass last wrote.
+            if (cv.GetBool()) return;
+            if (exposure_state_id_ == 0 || !device_) return;
+            float val = 1.5f;
+            if (auto* ev = pt::console::Console::Get().FindCVar("r_exposure"))
+                val = ev->GetFloat();
+            device_->WriteBuffer(pt::rhi::BufferHandle{exposure_state_id_},
+                                 &val, sizeof(float), 0);
+        };
     }
     if (auto* v = C.FindCVar("r_sky_use_astronomical")) {
         v->allowed_values = {"0", "1"};

@@ -53,6 +53,23 @@
 // moonDisc() to give the disc real mare + crater detail.
 [[vk::binding(13, 0)]] RWTexture2D<float4> moon_map;
 
+// GPU-resident exposure scalar. Updated each frame by AutoExposure.slang
+// (when r_auto_exposure = 1) or written once by the engine via
+// WriteBuffer (when r_auto_exposure = 0, holding the manual r_exposure
+// value). Replaces the per-frame CPU readback of accum_hdr that
+// stalled the GPU on dGPU paths -- now read directly here in the
+// final tonemap, no host round-trip.
+[[vk::binding(15, 0)]] RWStructuredBuffer<float> exposure_state;
+
+// The full PtPush is 448 bytes. Native Vulkan / NVIDIA caps push
+// constants at 256B, so on SPIR-V we keep only the small per-dispatch
+// prefix (camera basis + flags + jitter, 112B) in [[vk::push_constant]]
+// and spill the rest into a UBO at binding(14, 0). On Metal,
+// [[vk::push_constant]] lowers to a regular setBytes buffer slot
+// (no hw size cap), so we keep the full struct there for simplicity.
+// VulkanCommandBuffer::Dispatch byte-splits the contiguous host
+// PtPush struct: bytes [0..112] -> vkCmdPushConstants, bytes
+// [112..448] -> the per-frame Frame UBO upload.
 [[vk::push_constant]]
 cbuffer Push {
     float4 pos_fovtan;
@@ -70,6 +87,7 @@ cbuffer Push {
     float2 halton_jitter;    // per-frame sub-pixel offset in [-0.5,0.5]
     float  env_intensity;    // scalar multiplier on env_map samples
     float  env_total_luminance;  // sum of luminance(u,v)*sin(theta) -- PDF normalizer
+#ifndef PT_TARGET_SPIRV
     float4x4 curr_view_proj;
     float4x4 prev_view_proj;
     // .xyz = unit vector toward sun, .w = sky mode encoded as a float
@@ -150,7 +168,33 @@ cbuffer Push {
     // Sun extras. .x = r_sun_size, .y = Earth-Sun distance ratio
     // (mean/current; perihelion ~1.017, aphelion ~0.984).
     float4 sun_extra;
+#endif  // !PT_TARGET_SPIRV
 };
+
+#ifdef PT_TARGET_SPIRV
+// Spilled tail of PtPush — see the comments in the (Metal) Push cbuffer
+// above for per-field semantics. Layout is byte-equivalent to bytes
+// [112..448] of the host PtPush struct in Engine.cpp. Bound by
+// VulkanCommandBuffer::Dispatch from a per-frame ring-buffer UBO.
+[[vk::binding(14, 0)]]
+cbuffer Frame {
+    float4x4 curr_view_proj;
+    float4x4 prev_view_proj;
+    float4 sun_and_mode;
+    float4 exposure_pad;
+    float4 w2j_row0;
+    float4 w2j_row1;
+    float4 w2j_row2;
+    float4 dof_params;
+    float4 vol_params;
+    float4 clouds_p1;
+    float4 clouds_p2;
+    float4 clouds_p3;
+    float4 moon_dir_phase;
+    float4 moon_extra;
+    float4 sun_extra;
+};
+#endif  // PT_TARGET_SPIRV
 
 // --- Procedural cloud field --------------------------------------------
 //
@@ -1619,14 +1663,21 @@ void main(uint2 tid : SV_DispatchThreadID) {
     // post-pass kernel runs as a passthrough copy. The toggle exists
     // so r_hdr_pipeline can be flipped for A/B comparison without a
     // rebuild.
+    // Pull the live exposure scalar from the GPU-side state buffer.
+    // AutoExposure.slang updates this each frame (auto mode); the
+    // engine WriteBuffer's it once when manual mode toggles. Reading
+    // here avoids a CPU readback round-trip that on dGPU stalls
+    // the queue once per N frames.
+    float exposure = exposure_state[0];
+
     if (denoiser_enabled != 0u) {
         if (w2j_row0.w > 0.5) {
             denoise_color[tid] = float4(frame_radiance, 1.0);
         } else {
-            float3 mapped = acesTonemap(frame_radiance * exposure_pad.x);
+            float3 mapped = acesTonemap(frame_radiance * exposure);
             denoise_color[tid] = float4(mapped, 1.0);
         }
     }
 
-    output[tid] = float4(acesTonemap(avg * exposure_pad.x), 1.0);
+    output[tid] = float4(acesTonemap(avg * exposure), 1.0);
 }

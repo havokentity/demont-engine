@@ -22,6 +22,8 @@
 extern "C" {
 extern const unsigned char shader_PathTrace_metal_data[];
 extern const unsigned long shader_PathTrace_metal_size;
+extern const unsigned char shader_AutoExposure_metal_data[];
+extern const unsigned long shader_AutoExposure_metal_size;
 extern const unsigned char shader_Tonemap_metal_data[];
 extern const unsigned long shader_Tonemap_metal_size;
 extern const unsigned char shader_BloomDown_metal_data[];
@@ -286,10 +288,11 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
         named_pipelines_.emplace(kernel_name, id);
     };
 
-    build_pso("pathtrace",  shader_PathTrace_metal_data,  shader_PathTrace_metal_size);
-    build_pso("tonemap",    shader_Tonemap_metal_data,    shader_Tonemap_metal_size);
-    build_pso("bloom_down", shader_BloomDown_metal_data,  shader_BloomDown_metal_size);
-    build_pso("bloom_up",   shader_BloomUp_metal_data,    shader_BloomUp_metal_size);
+    build_pso("pathtrace",  shader_PathTrace_metal_data,    shader_PathTrace_metal_size);
+    build_pso("autoexpose", shader_AutoExposure_metal_data, shader_AutoExposure_metal_size);
+    build_pso("tonemap",    shader_Tonemap_metal_data,      shader_Tonemap_metal_size);
+    build_pso("bloom_down", shader_BloomDown_metal_data,    shader_BloomDown_metal_size);
+    build_pso("bloom_up",   shader_BloomUp_metal_data,      shader_BloomUp_metal_size);
 
     cmd_ = std::make_unique<MetalCommandBuffer>(this);
 }

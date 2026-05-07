@@ -31,5 +31,8 @@ pt_compile_slang(
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/BloomUp.slang
     STAGE compute ENTRY main TARGETS spirv)
+pt_compile_slang(
+    TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/AutoExposure.slang
+    STAGE compute ENTRY main TARGETS spirv)
 
 pt_set_compiler_options(pt_rhi_vulkan)
