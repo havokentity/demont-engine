@@ -110,6 +110,13 @@ namespace cvar {
     PT_CVAR(r_sky_lon,         "80.2707", "Observer longitude in degrees (+E). Default: Chennai, India.", CVAR_ARCHIVE);
     PT_CVAR(r_sky_hour,        "12.0",    "Hour of day (0..24) for the astronomical sun + starmap. Interpreted in UTC if r_sky_hour_local = 0, else in the selected city's local time. r_sky_animate = 1 advances this every frame.", CVAR_ARCHIVE);
     PT_CVAR(r_sky_hour_local,  "1",       "If 1, r_sky_hour is the city's local time (using r_sky_tz_offset_hours, set by r_sky_city). If 0, UTC.", CVAR_ARCHIVE);
+    // Date selector. All three at 0 means "use current date" (default). Set
+    // to a real date to back-date the sun, moon, stars, and any seasonal
+    // effects. Year 1900-2100 covers any reasonable interactive use; the
+    // Meeus formulas degrade slowly past that band but stay within ~1 deg.
+    PT_CVAR(r_sky_year,        "0",       "Year for astronomical date (1900..2100). 0 = use today's UTC year. Combined with r_sky_month + r_sky_day to set sun/moon/star positions for any date.", CVAR_ARCHIVE);
+    PT_CVAR(r_sky_month,       "0",       "Month for astronomical date (1..12). 0 = use today's month.", CVAR_ARCHIVE);
+    PT_CVAR(r_sky_day,         "0",       "Day of month for astronomical date (1..31). 0 = use today's day.", CVAR_ARCHIVE);
     PT_CVAR(r_sky_tz_offset_hours, "5.5", "Selected city's UTC offset in hours (positive east). Updated when r_sky_city changes; you generally don't write this directly.", CVAR_READONLY);
     PT_CVAR(r_sky_animate,     "0",       "If 1, advance r_sky_hour every frame at r_sky_animate_rate hours per real-time second. Wraps at 24.", CVAR_ARCHIVE);
     PT_CVAR(r_sky_animate_rate,"0.5",     "Hours of sim time per real-time second when r_sky_animate = 1. 0.5 = half-hour/s (a full day in 48s). 24 = compress a day into 1s. 1/3600 ≈ live-time.", CVAR_ARCHIVE);
@@ -1289,15 +1296,28 @@ void Engine::RenderFrame() {
             if (auto* v = C.FindCVar("r_sky_tz_offset_hours")) tz = v->GetFloat();
         }
         // r_sky_hour interpreted in local civil time -> subtract the
-        // city's UTC offset to get UTC hour. May go negative or above
-        // 24 if the user's local hour straddles a UTC day boundary;
-        // dividing by 24 below handles that automatically.
+        // city's UTC offset to get UTC hour.
         const float hour_utc = hour - tz;
-        const std::time_t now = std::time(nullptr);
-        const double jd_inst = pt::astro::julianDateFromTimeT(now);
-        // JD's day rolls over at noon UTC; floor(jd-0.5)+0.5 is the
-        // UTC midnight that opened the *current* civil day.
-        return std::floor(jd_inst - 0.5) + 0.5 + double(hour_utc) / 24.0;
+        // Date: r_sky_{year,month,day} = 0 falls back to system today.
+        // Any nonzero combination overrides individually.
+        int yr = 0, mo = 0, dy = 0;
+        if (auto* v = C.FindCVar("r_sky_year"))  yr = v->GetInt();
+        if (auto* v = C.FindCVar("r_sky_month")) mo = v->GetInt();
+        if (auto* v = C.FindCVar("r_sky_day"))   dy = v->GetInt();
+        if (yr == 0 || mo == 0 || dy == 0) {
+            const std::time_t now = std::time(nullptr);
+            std::tm gm = *std::gmtime(&now);
+            if (yr == 0) yr = gm.tm_year + 1900;
+            if (mo == 0) mo = gm.tm_mon + 1;
+            if (dy == 0) dy = gm.tm_mday;
+        }
+        // Construct JD at UTC midnight of the chosen date, then add
+        // the requested hour-of-day. Hour may be 24+ or negative if
+        // the local-time conversion crossed a UTC day boundary; the
+        // hour/24 fraction handles the rollover automatically.
+        const double jd_midnight = pt::astro::julianDateFromUtc(
+            yr, mo, dy, 0, 0, 0.0);
+        return jd_midnight + double(hour_utc) / 24.0;
     };
     if (astro_on) {
         double lat = 13.0827, lon = 80.2707;
@@ -1323,12 +1343,12 @@ void Engine::RenderFrame() {
     push.sun_and_mode[1] =  se;
     push.sun_and_mode[2] = -ce * std::cos(azim_r);
 
-    // Moon direction + phase. Always computed (cheap), regardless of
-    // r_sky_use_astronomical -- when astronomical is off the moon goes
-    // wherever Meeus says relative to the manual sun (not physically
-    // consistent but better than nothing). When astronomical is on the
-    // moon and sun share the same epoch and observer.
-    {
+    // Moon. Only meaningful in astronomical mode -- the phase angle
+    // requires sun + moon at the same epoch / observer, which only
+    // makes physical sense when both come from the date driver. When
+    // r_sky_use_astronomical = 0 the moon is hidden (.y < 0 sentinel,
+    // both moonDisc and moon NEE skip it).
+    if (astro_on) {
         double lat = 13.0827, lon = 80.2707;
         if (auto* v = C.FindCVar("r_sky_lat")) lat = v->GetFloat();
         if (auto* v = C.FindCVar("r_sky_lon")) lon = v->GetFloat();
@@ -1341,10 +1361,14 @@ void Engine::RenderFrame() {
         push.moon_dir_phase[0] =  mce * std::sin(ma_r);
         push.moon_dir_phase[1] =  mse;
         push.moon_dir_phase[2] = -mce * std::cos(ma_r);
-        // Phase angle from same-epoch sun + moon.
         auto sun_eq_for_phase = pt::astro::sunPosition(jd_moon);
         push.moon_dir_phase[3] = static_cast<float>(
             pt::astro::moonPhaseAngle(sun_eq_for_phase, moon_eq));
+    } else {
+        push.moon_dir_phase[0] = 0.0f;
+        push.moon_dir_phase[1] = -1.0f;   // below-horizon sentinel
+        push.moon_dir_phase[2] = 0.0f;
+        push.moon_dir_phase[3] = 0.0f;
     }
 
     // Sky mode resolution. "hdri" with no env map loaded falls back
@@ -2703,6 +2727,9 @@ void Engine::RegisterCommands() {
     if (auto* v = C.FindCVar("r_sky_lat") ) v->on_change = [this](const pt::console::CVar&){ accum_dirty_ = true; };
     if (auto* v = C.FindCVar("r_sky_lon") ) v->on_change = [this](const pt::console::CVar&){ accum_dirty_ = true; };
     if (auto* v = C.FindCVar("r_sky_time_offset")) v->on_change = [this](const pt::console::CVar&){ accum_dirty_ = true; };
+    if (auto* v = C.FindCVar("r_sky_year")) v->on_change = [this](const pt::console::CVar&){ accum_dirty_ = true; };
+    if (auto* v = C.FindCVar("r_sky_month")) v->on_change = [this](const pt::console::CVar&){ accum_dirty_ = true; };
+    if (auto* v = C.FindCVar("r_sky_day")) v->on_change = [this](const pt::console::CVar&){ accum_dirty_ = true; };
 
     // City preset dropdown. Each entry is (name, lat, lon). Selecting
     // one writes lat/lon to the geographic cvars; "custom" leaves
@@ -2802,6 +2829,9 @@ void Engine::RegisterCommands() {
     set_slider("r_sun_azimuth",     0.0f,  360.0f,  1.0f);
     set_slider("r_sky_hour",          0.0f,  24.0f,  0.01f);
     set_slider("r_sky_animate_rate",  0.0f,  24.0f,  0.05f);
+    set_slider("r_sky_year",         0.0f,  2100.0f,  1.0f);
+    set_slider("r_sky_month",        0.0f,    12.0f,  1.0f);
+    set_slider("r_sky_day",          0.0f,    31.0f,  1.0f);
     set_slider("r_sky_lat",         -90.0f,  90.0f,  0.1f);
     set_slider("r_sky_lon",      -180.0f,  180.0f,  0.1f);
     set_slider("cam_fov",          20.0f,  120.0f,  0.5f);

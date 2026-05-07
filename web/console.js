@@ -29,6 +29,7 @@
   // default no longer applies.
   const DEFAULT_PINS = [
     'r_sky_animate', 'r_sky_animate_rate', 'r_sky_hour',
+    'r_sky_year', 'r_sky_month', 'r_sky_day',
     'r_sky_use_astronomical', 'r_sky_city',
     'r_exposure', 'r_auto_exposure', 'r_eye_model',
     'r_quality', 'r_dof', 'r_dof_aperture', 'r_dof_focal_distance',
