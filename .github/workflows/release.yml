@@ -35,7 +35,10 @@ jobs:
           fi
 
       - name: Install build tools
-        run: brew install ninja cmake || true
+        # vulkan-headers + vulkan-loader give CMake's FindVulkan a
+        # discoverable Vulkan::Vulkan target so the Vk backend builds.
+        # molten-vk supplies the runtime ICD for full release coverage.
+        run: brew install ninja cmake vulkan-headers vulkan-loader molten-vk || true
 
       - name: Configure (release)
         run: cmake --preset mac-release
