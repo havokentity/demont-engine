@@ -2329,7 +2329,8 @@ void Engine::RegisterCommands() {
             // Convert to 8-bit RGB. ACES tonemap for HDR; depth gets a
             // grayscale ramp (0=black, 1=white); motion encodes (R = +x
             // mapped to [0..1], G = +y mapped, B=0) so directionality
-            // is visible. Half-float decode is via __fp16 (Apple Clang).
+            // is visible. Half-float decode is a portable IEEE 754
+            // binary16 unpack (see lambda below) -- works on MSVC too.
             auto tonemap = [](float c) -> std::uint8_t {
                 const float a = 2.51f, b = 0.03f, d = 2.43f, e = 0.59f, f = 0.14f;
                 float x = (c * (a * c + b)) / (c * (d * c + e) + f);
@@ -2337,10 +2338,41 @@ void Engine::RegisterCommands() {
                 if (x > 1.0f) x = 1.0f;
                 return static_cast<std::uint8_t>(x * 255.0f + 0.5f);
             };
+            // Portable IEEE 754 binary16 -> binary32 decode. Apple Clang
+            // and GCC have __fp16 as an extension and we used to lean on
+            // it here, but MSVC has no equivalent (and _Float16 has
+            // partial support), so do the bit-shuffle manually. Handles
+            // ±0, subnormals, normals, Inf/NaN.
             auto half_to_float = [](std::uint16_t h_) -> float {
-                __fp16 v;
-                std::memcpy(&v, &h_, 2);
-                return float(v);
+                const std::uint32_t sign = (h_ >> 15) & 0x1u;
+                const std::uint32_t exp  = (h_ >> 10) & 0x1Fu;
+                const std::uint32_t mant = h_ & 0x3FFu;
+                std::uint32_t f;
+                if (exp == 0) {
+                    if (mant == 0) {
+                        f = sign << 31;  // signed zero
+                    } else {
+                        // Subnormal: renormalise into a regular float32.
+                        std::uint32_t e = 1;
+                        std::uint32_t m = mant;
+                        while ((m & 0x400u) == 0) { m <<= 1; ++e; }
+                        m &= 0x3FFu;
+                        f = (sign << 31)
+                          | ((127u - 15u - e + 1u) << 23)
+                          | (m << 13);
+                    }
+                } else if (exp == 31) {
+                    // Inf or NaN -- propagate via mantissa.
+                    f = (sign << 31) | (0xFFu << 23) | (mant << 13);
+                } else {
+                    // Normal: rebias exponent (15 -> 127) and shift mantissa.
+                    f = (sign << 31)
+                      | ((exp - 15u + 127u) << 23)
+                      | (mant << 13);
+                }
+                float result;
+                std::memcpy(&result, &f, sizeof(result));
+                return result;
             };
 
             std::vector<std::uint8_t> rgb(std::size_t(w) * hgt * 3);
