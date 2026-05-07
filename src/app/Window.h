@@ -57,9 +57,15 @@ public:
     // returns 0 to avoid a one-frame jump.
     void ConsumeMouseDelta(double& dx, double& dy);
 
+    // Returns scroll-wheel delta accumulated since the last call. +Y =
+    // scroll up (toward user). Engines typically map this to camera
+    // speed adjustment or zoom.
+    void ConsumeScrollDelta(double& dx, double& dy);
+
 private:
     static void OnResize(GLFWwindow* w, int width, int height);
     static void OnKey(GLFWwindow* w, int key, int scancode, int action, int mods);
+    static void OnScroll(GLFWwindow* w, double dx, double dy);
 
     GLFWwindow* handle_ = nullptr;
     int width_  = 0;
@@ -71,6 +77,11 @@ private:
     double cursor_last_x_ = 0.0;
     double cursor_last_y_ = 0.0;
     bool   cursor_have_baseline_ = false;
+
+    // Scroll-wheel accumulators. GLFW callback adds the per-event
+    // delta; ConsumeScrollDelta returns the sum and resets.
+    double scroll_accum_x_ = 0.0;
+    double scroll_accum_y_ = 0.0;
 };
 
 }  // namespace pt::app

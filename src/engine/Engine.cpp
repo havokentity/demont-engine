@@ -1783,6 +1783,24 @@ void Engine::UpdateCamera(double dt) {
         camera_->ClampPitch();
     }
 
+    // Scroll wheel adjusts cam_speed multiplicatively (1.1x per notch
+    // up, /1.1x per notch down). Exponential feel makes it easy to
+    // span the 0.1..30 m/s slider range without dozens of clicks.
+    {
+        double sx = 0.0, sy = 0.0;
+        window_->ConsumeScrollDelta(sx, sy);
+        if (sy != 0.0) {
+            if (auto* v = C.FindCVar("cam_speed")) {
+                float cur = v->GetFloat();
+                cur *= std::pow(1.1f, static_cast<float>(sy));
+                if (cur < 0.1f)  cur = 0.1f;
+                if (cur > 30.0f) cur = 30.0f;
+                v->value = std::to_string(cur);
+                if (v->on_change) v->on_change(*v);
+            }
+        }
+    }
+
     // WASD + Space/Ctrl movement.  Speed in units/sec; shift sprints.
     float speed   = 3.0f;
     float sprint  = 3.0f;

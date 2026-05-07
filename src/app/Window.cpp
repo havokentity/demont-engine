@@ -54,6 +54,7 @@ bool Window::Create(int w, int h, std::string_view title) {
     glfwSetWindowUserPointer(handle_, this);
     glfwSetFramebufferSizeCallback(handle_, &Window::OnResize);
     glfwSetKeyCallback(handle_, &Window::OnKey);
+    glfwSetScrollCallback(handle_, &Window::OnScroll);
 
     ++g_window_count;
     return true;
@@ -137,6 +138,20 @@ void Window::ConsumeMouseDelta(double& dx, double& dy) {
     dy = y - cursor_last_y_;
     cursor_last_x_ = x;
     cursor_last_y_ = y;
+}
+
+void Window::ConsumeScrollDelta(double& dx, double& dy) {
+    dx = scroll_accum_x_;
+    dy = scroll_accum_y_;
+    scroll_accum_x_ = 0.0;
+    scroll_accum_y_ = 0.0;
+}
+
+void Window::OnScroll(GLFWwindow* w, double dx, double dy) {
+    auto* self = static_cast<Window*>(glfwGetWindowUserPointer(w));
+    if (self == nullptr) return;
+    self->scroll_accum_x_ += dx;
+    self->scroll_accum_y_ += dy;
 }
 
 void Window::OnKey(GLFWwindow* w, int key, int /*scancode*/, int action, int mods) {
