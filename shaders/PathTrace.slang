@@ -1168,6 +1168,21 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     float jitc = randf(seed) * dtc;
                     float trans_eye_c = 1.0;
                     float3 v_color_c  = float3(0.0);
+                    // Skylight ambient term: integrating the sky hemisphere
+                    // around a cloud sample gives ~15% of sun irradiance at
+                    // the surface (real-Earth ratio of skylight/sun
+                    // irradiance is ~0.15-0.20). The sky is also slightly
+                    // blue from Rayleigh, so the ambient tint is a touch
+                    // bluer than sun_rad. Without this term cloud cores go
+                    // pitch-black under sun self-shadow -- correct
+                    // single-scatter direct-sun-only physics, but real
+                    // clouds get filled in by the surrounding sky.
+                    // 1/π factor folds the hemisphere integral in (the same
+                    // factor that turns Lambert irradiance into radiance).
+                    float3 sky_ambient = (sun_elev > 0.0)
+                        ? sun_rad * float3(0.7, 0.85, 1.0) * 0.15
+                                  * (1.0 / 3.14159265358979)
+                        : float3(0.0);
                     for (int vi = 0; vi < Nc; ++vi) {
                         float t = t_in + (float(vi) + 0.5) * dtc + jitc;
                         if (t > t_out) break;
@@ -1175,6 +1190,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         float dens = cloud_density_at(sp, clouds_p1,
                                                       clouds_p2, clouds_p3, 6);
                         if (dens <= 0.0) continue;
+                        // Direct sun (single-scatter NEE).
                         if (sun_elev > 0.0) {
                             float3 sun_jit = sampleSunDisc(sun_dir, seed);
                             float3 trans_sun = transmittance(sp, sun_jit, 1e30);
@@ -1183,6 +1199,9 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                            * dens * dtc * trans_eye_c;
                             }
                         }
+                        // Diffuse skylight (hemisphere integral). No phase
+                        // function -- ambient is by definition omnidirectional.
+                        v_color_c += sky_ambient * dens * dtc * trans_eye_c;
                         trans_eye_c *= exp(-dens * dtc);
                     }
                     radiance += v_color_c * vol_int;
