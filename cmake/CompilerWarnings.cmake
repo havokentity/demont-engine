@@ -17,12 +17,17 @@ function(pt_set_compiler_options target)
         # /permissive- : tighten conformance (closer to -Wpedantic)
         # /wd4100  : unused parameter (mirrors -Wno-unused-parameter)
         # /Zc:__cplusplus : report the real __cplusplus value (MSVC defaults to 199711L)
+        # /Zc:preprocessor : standards-conformant preprocessor. Required
+        #     for __VA_OPT__ (C++20) which the LOG_INFO/PT_CVAR macros
+        #     rely on -- the legacy MSVC preprocessor doesn't recognise
+        #     __VA_OPT__ at all and chokes with C2146 / C2059.
         target_compile_options(${target} PRIVATE
             /EHs-c-
             /GR-
             /W4
             /permissive-
             /Zc:__cplusplus
+            /Zc:preprocessor
             /wd4100   # unused formal parameter
             /wd4324   # struct padded due to alignment
         )
