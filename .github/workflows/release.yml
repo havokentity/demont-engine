@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Rajesh D'Monte
+
+name: Release
+
+on:
+  # Tag-driven releases: push v0.1.0, v0.2.0-rc1, etc.
+  push:
+    tags: [ "v*" ]
+  # Allow ad-hoc release builds from the Actions tab too.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (eg v0.2.0)"
+        required: true
+
+jobs:
+  macos-release:
+    name: macOS (Apple Silicon) -- release artefact
+    runs-on: macos-15
+    permissions:
+      contents: write   # needed to attach artefacts to a Release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "value=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${GITHUB_REF##*/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install build tools
+        run: brew install ninja cmake || true
+
+      - name: Configure (release)
+        run: cmake --preset mac-release
+
+      - name: Build
+        run: cmake --build build/mac-release --parallel
+
+      - name: Stage artefact tree
+        # Stage just what an end-user actually needs to run the engine
+        # -- the binary plus the data files it loads (HDRI, BSC star
+        # catalog, etc). Skip object files, archives, third-party
+        # source. Tag-named so the release page sees a meaningful
+        # download name.
+        run: |
+          STAGE="demont-${{ steps.tag.outputs.value }}-macos-arm64"
+          mkdir -p "dist/$STAGE"
+          cp build/mac-release/src/app/demont "dist/$STAGE/"
+          cp -R assets                        "dist/$STAGE/"
+          cp LICENSE README.md                "dist/$STAGE/"
+          cd dist
+          # tar.gz preserves the executable bit; zip on macOS strips it.
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+          ls -lh "$STAGE.tar.gz"
+          echo "ARCHIVE=dist/$STAGE.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Upload artefact (always)
+        uses: actions/upload-artifact@v4
+        with:
+          name: demont-macos-arm64
+          path: ${{ env.ARCHIVE }}
+
+      - name: Attach to GitHub Release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ARCHIVE }}
+          fail_on_unmatched_files: true
+          generate_release_notes: true

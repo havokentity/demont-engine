@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Rajesh D'Monte
+
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  # Allow running from the Actions tab manually.
+  workflow_dispatch:
+
+# Cancel in-flight runs for the same branch when a newer push lands.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macOS (Apple Silicon)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          # cmake + ninja are pre-installed on the macOS-15 runner image,
+          # but pin via brew in case the runner image strips them later.
+          brew install ninja cmake || true
+          cmake --version
+          ninja --version
+
+      - name: Cache CMake build directory
+        uses: actions/cache@v4
+        with:
+          path: build/mac-debug
+          # Bust on CMakeLists / Dependencies changes since those drive
+          # what FetchContent pulls. Source-only changes hit the cache.
+          key: macos-build-${{ hashFiles('CMakeLists.txt', 'cmake/**', '**/CMakeLists.txt') }}
+          restore-keys: |
+            macos-build-
+
+      - name: Configure
+        run: cmake --preset mac-debug
+
+      - name: Build
+        run: cmake --build build/mac-debug --parallel
+
+      - name: Verify zero warnings
+        # Fails the job if a build line printed `warning`. Catches
+        # regressions on the warning hygiene work.
+        run: |
+          cmake --build build/mac-debug 2>&1 | tee build.log
+          if grep -qE "^.*warning" build.log; then
+            echo "::error::Build emitted warnings -- check build.log"
+            exit 1
+          fi
+
+      - name: Sanity boot-test
+        # Run the binary briefly. If it crashes during init the build
+        # is broken even if compile + link succeeded.
+        run: |
+          ./build/mac-debug/src/app/demont > smoke.log 2>&1 &
+          PID=$!
+          sleep 3
+          kill $PID 2>/dev/null || true
+          wait $PID 2>/dev/null || true
+          if grep -qE "ERROR|FATAL|Assertion" smoke.log; then
+            cat smoke.log
+            echo "::error::Engine logged an error during smoke boot"
+            exit 1
+          fi
+          echo "Smoke test OK."

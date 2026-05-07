@@ -1,16 +1,28 @@
 # DeMonT Engine
 
-> A real-time game engine for Apple Silicon that **never rasterizes**.
-> Every pixel is a ray. Path tracing is the renderer; mesh CSG via
-> Manifold is the headline; MetalFX (and later NRD on Vulkan) keeps
-> the frame interactive at 1 sample per pixel.
+[![Build](https://github.com/havokentity/demont-engine/actions/workflows/build.yml/badge.svg)](https://github.com/havokentity/demont-engine/actions/workflows/build.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+> A real-time game engine that **never rasterizes**. Every pixel is a
+> ray. Path tracing is the renderer; mesh CSG via Manifold is the
+> headline; modern temporal denoisers (MetalFX on Apple, NRD on Vulkan)
+> keep the frame interactive at 1 sample per pixel.
 >
 > **DeMonT** = **De** **Mon**te Carlo-esque **T**racer — *-esque*
 > because the algorithm will keep evolving (MIS, ReSTIR, bidirectional
 > later) without ever falling back to a rasterizer.
 
-C++23, three-backend RHI (Software / Metal / Vulkan), Slang shaders,
-unified path-tracing kernel that intersects analytic primitives **and**
+## Supported platforms
+
+| Platform | Backend | Denoiser | Status |
+|---|---|---|---|
+| **Apple Silicon** (M-series, macOS 26+) | Metal (hardware RT) | MetalFX TemporalDenoisedScaler | ✓ primary |
+| **NVIDIA RTX** (Windows / Linux, RTX 2000-series and up) | Vulkan (`VK_KHR_ray_query` + `VK_KHR_acceleration_structure`) | NRD or SVGF | queued — see [`FOLLOW_UPS.md`](Raytracer%20Plan/FOLLOW_UPS.md) |
+| Software fallback (any) | CPU compute | none | bring-up only |
+
+Built on C++23 with a three-backend RHI (Software / Metal / Vulkan),
+Slang shaders that cross-compile to MSL and SPIR-V, and a unified
+path-tracing kernel that intersects analytic primitives **and**
 triangle meshes (via hardware ray query) in one pass.
 
 The full design lives in [`Raytracer Plan/`](Raytracer%20Plan/) — five
@@ -55,14 +67,32 @@ accumulation when the camera is stationary.
 
 ## Build
 
+### macOS (Apple Silicon)
+
 Requires macOS 26+ (for MetalFX TemporalDenoisedScaler), CMake ≥ 3.27,
-Ninja, Apple's clang, Vulkan SDK (optional but recommended).
+Ninja, Apple's clang, Vulkan SDK (optional but recommended for the
+Vulkan backend on Mac via MoltenVK).
 
 ```sh
 cmake --preset mac-debug
 cmake --build build/mac-debug
 ./build/mac-debug/src/app/demont
 ```
+
+### Windows (NVIDIA RTX)
+
+Requires Windows 10/11 with current NVIDIA drivers (RTX 2000-series
+or newer for hardware ray-tracing), Vulkan SDK 1.3+, CMake ≥ 3.27,
+Ninja, MSVC 2022 or later (clang-cl also works).
+
+```pwsh
+cmake --preset win-debug
+cmake --build build/win-debug
+./build/win-debug/src/app/demont.exe
+```
+
+The Windows preset ships in `CMakePresets.json`; the Vulkan backend
+auto-detects RT extensions and falls back to a non-RT path if missing.
 
 CMake auto-downloads Slang and Apple's metal-cpp into `third_party/` on
 first configure. Manifold, fmt, glm, glfw, mimalloc, enkiTS, civetweb,
