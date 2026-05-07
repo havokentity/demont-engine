@@ -75,20 +75,25 @@ void generateMoonTexture(int width, int height, std::vector<float>& rgba_out) {
             float py = std::sin(lat);
             float pz = cl * std::sin(lon);
 
-            // Highland base: medium-frequency mottled grey-tan.
-            float base = 0.65f + 0.20f * fbm(px * 8.0f, py * 8.0f, pz * 8.0f, 4);
+            // Highland base: bright mottled grey-tan (real lunar
+            // highlands have albedo ~0.13-0.16 but we render them
+            // brighter for visibility -- the moon disc multiplier
+            // is dim by design).
+            float base = 0.85f + 0.13f * fbm(px * 8.0f, py * 8.0f, pz * 8.0f, 4);
 
-            // Mare ("seas") -- large dark basaltic basins. Threshold a
-            // low-frequency noise; values below 0.50 become dark patches.
+            // Mare ("seas") -- large dark basaltic basins. Real mare
+            // albedo is half the highlands; we drop them to 0.20 for
+            // dramatic visible contrast against the bright highlands.
             float mare_n = fbm(px * 1.5f, py * 1.5f, pz * 1.5f, 3);
             float mare_factor = std::clamp((0.55f - mare_n) * 4.0f, 0.0f, 1.0f);
-            base = base + (0.30f - base) * mare_factor;     // toward 0.30
+            base = base + (0.20f - base) * mare_factor;     // toward 0.20
 
-            // Crater detail -- dimples + bright ejecta rays at high freq.
+            // Crater detail -- dimples (dark floors) + bright ejecta
+            // rays at high freq. Wider stops so craters are obvious.
             float crater_n = fbm(px * 40.0f, py * 40.0f, pz * 40.0f, 2);
-            float crater_dark   = std::clamp(crater_n - 0.55f, 0.0f, 1.0f) * 0.20f;
-            float crater_bright = std::clamp(0.40f - crater_n, 0.0f, 1.0f) * 0.10f;
-            base = std::clamp(base - crater_dark + crater_bright, 0.05f, 0.98f);
+            float crater_dark   = std::clamp(crater_n - 0.55f, 0.0f, 1.0f) * 0.30f;
+            float crater_bright = std::clamp(0.40f - crater_n, 0.0f, 1.0f) * 0.20f;
+            base = std::clamp(base - crater_dark + crater_bright, 0.10f, 1.00f);
 
             // Lunar regolith tint: slightly warm grey (sandy / tan).
             float r = base * 1.00f;

@@ -1472,10 +1472,22 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     // clouds get filled in by the surrounding sky.
                     // 1/π factor folds the hemisphere integral in (the same
                     // factor that turns Lambert irradiance into radiance).
-                    float3 sky_ambient = (sun_elev > 0.0)
-                        ? sun_rad * float3(0.7, 0.85, 1.0) * 0.15
-                                  * (1.0 / 3.14159265358979)
-                        : float3(0.0);
+                    float3 sky_ambient = float3(0.0);
+                    if (sun_elev > 0.0) {
+                        sky_ambient = sun_rad * float3(0.7, 0.85, 1.0) * 0.15
+                                    * (1.0 / 3.14159265358979);
+                    } else if (moon_dir_phase.y > 0.0) {
+                        // Moonlight skylight on the cloud at night.
+                        // Without this term, clouds at night go pitch
+                        // black -- they're correctly receiving zero
+                        // sun in shadow but missing the diffuse moon-
+                        // hemisphere contribution that real moonlit
+                        // clouds actually receive.
+                        float phb = 0.5 * (1.0 - cos(moon_dir_phase.w));
+                        float ma  = 1.0 / max(moon_dir_phase.y, 0.04);
+                        float mat = exp(-0.30 * ma);
+                        sky_ambient = float3(0.55, 0.70, 1.00) * (0.04 * phb * mat);
+                    }
                     for (int vi = 0; vi < Nc; ++vi) {
                         float t = t_in + (float(vi) + 0.5) * dtc + jitc;
                         if (t > t_out) break;
