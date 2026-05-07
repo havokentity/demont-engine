@@ -3,6 +3,13 @@
 [![Build](https://github.com/havokentity/demont-engine/actions/workflows/build.yml/badge.svg)](https://github.com/havokentity/demont-engine/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+> **Note on CI coverage:** CI runs on `macos-26` so the full MetalFX
+> `TemporalDenoisedScaler` path is built and exercised. The shim is
+> also SDK-version-gated (`__MAC_OS_X_VERSION_MAX_ALLOWED >= 260000`),
+> so contributors on macOS 14/15 dev boxes can still build — the
+> denoiser compiles to no-op stubs and the engine falls back to the
+> un-denoised path tracer at runtime.
+
 > A real-time game engine that **never rasterizes**. Every pixel is a
 > ray. Path tracing is the renderer; mesh CSG via Manifold is the
 > headline; modern temporal denoisers (MetalFX on Apple, NRD on Vulkan)

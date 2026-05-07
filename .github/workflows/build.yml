@@ -19,7 +19,12 @@ concurrency:
 jobs:
   macos:
     name: macOS (Apple Silicon)
-    runs-on: macos-15
+    # macos-26 ships the macOS 26 SDK which declares MTLFXTemporalDenoisedScaler
+    # (the API the engine's MetalFX denoiser uses). Earlier runner images
+    # (macos-15 / Sequoia SDK) lack it; the engine's MetalFXDenoiser.mm is
+    # SDK-version-gated to compile to no-op stubs on those, but using
+    # macos-26 here means CI actually exercises the denoiser code path.
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
 

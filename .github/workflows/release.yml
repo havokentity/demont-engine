@@ -17,7 +17,9 @@ on:
 jobs:
   macos-release:
     name: macOS (Apple Silicon) -- release artefact
-    runs-on: macos-15
+    # macos-26 SDK has MTLFXTemporalDenoisedScaler; releases include the
+    # full MetalFX denoiser path, not the SDK-stubbed fallback.
+    runs-on: macos-26
     permissions:
       contents: write   # needed to attach artefacts to a Release
     steps:
