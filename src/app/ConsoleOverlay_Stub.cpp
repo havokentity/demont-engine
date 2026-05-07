@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Rajesh D'Monte
-// Cross-platform no-op implementation of the Cocoa overlay + Metal
-// layer attachment shims. Compiled on every non-Apple build so the
-// engine can keep including ConsoleOverlay.h and calling these C
-// shims unconditionally; they just do nothing on Windows / Linux.
+// No-op implementation of the Cocoa overlay + Metal layer attachment
+// shims for non-Apple, non-Windows targets. This stub lets the engine
+// keep including ConsoleOverlay.h and calling these C shims
+// unconditionally where no native overlay implementation exists.
 //
-// On non-Apple targets the Vulkan backend handles surface creation
-// itself (vkCreateXcbSurfaceKHR / vkCreateWin32SurfaceKHR), so the
-// pt_metal_attach_layer hook never has work to do. The overlay is a
-// macOS-native NSView feature; on other platforms we lean on the web
-// console (http://127.0.0.1:27960) for live cvar editing and use the
-// engine's terminal logging instead.
+// On these targets the Vulkan backend handles surface creation itself
+// (for example, via platform-specific vkCreate*SurfaceKHR entry
+// points), so the pt_metal_attach_layer hook never has work to do.
+// The overlay is a macOS-native NSView feature; elsewhere we lean on
+// the web console (http://127.0.0.1:27960) for live cvar editing and
+// use the engine's terminal logging instead.
 
 #include "ConsoleOverlay.h"
 
