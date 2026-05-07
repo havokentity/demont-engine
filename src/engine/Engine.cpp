@@ -161,7 +161,7 @@ namespace cvar {
     PT_CVAR(r_clouds_wind_x,         "5.0",      "Wind speed along +X in metres/second. Drifts the cloud field over time. Light breeze 2-3, fresh wind 8-12, gale 20+.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_wind_z,         "0.0",      "Wind speed along +Z in metres/second.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_seed,           "0",        "Per-day noise seed (any float). Same preset + different seed = visually distinct cloud pattern. Use one seed per in-game day so each day has its own weather pattern.", CVAR_ARCHIVE);
-    PT_CVAR(r_rayleigh,              "1.0",      "Atmospheric Rayleigh scattering intensity. 1.0 = real per-channel sea-level sigma (R 5.8e-6, G 13.5e-6, B 33.1e-6 per metre). Makes the noon sky blue and sunsets red without changing Mie/haze. 0 disables (then noon sky goes white). Real atmosphere is 1.0; bump to 1.5-2.0 for more saturated planetary look.", CVAR_ARCHIVE);
+    PT_CVAR(r_rayleigh,              "30.0",     "Atmospheric Rayleigh scattering scale on the per-channel sea-level sigma (R 5.8e-6, G 13.5e-6, B 33.1e-6 per metre). 1.0 = real Earth atmosphere -- but our typical r_volumetric_density (Mie haze) is ~30x stronger than real-Earth haze, so bumping this to 30 keeps the sky visibly blue at typical haze settings. Drop to 1.0 if you also drop r_volumetric_density to 0.0001-0.0005 (real haze). 0 disables Rayleigh.", CVAR_ARCHIVE);
 
     PT_CVAR(dev_cheats,        "0",    "Gate for CHEAT-flagged cvars",   0);
     PT_CVAR(dev_log_level,     "info", "error|warn|info|debug",          0);
@@ -2788,6 +2788,7 @@ void Engine::RegisterCommands() {
     set_slider("r_volumetric_anisotropy", -0.95f, 0.95f, 0.01f);
     set_slider("r_volumetric_intensity",   0.0f,  4.0f,  0.05f);
     set_slider("r_volumetric_samples",     4.0f, 64.0f,  1.0f);
+    set_slider("r_rayleigh",               0.0f, 100.0f,  0.5f);
     set_slider("r_clouds_coverage",         0.0f,    1.0f,   0.01f);
     set_slider("r_clouds_base_height",      0.0f, 12000.0f, 25.0f);
     set_slider("r_clouds_top_height",      50.0f, 14000.0f, 25.0f);
