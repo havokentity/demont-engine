@@ -559,6 +559,55 @@ float3 procSky(float3 rd, float3 sun) {
     return max(sky, float3(0.0));
 }
 
+// Sun disc + atmospheric halo. Real solar angular diameter is 0.53deg
+// (almost identical to the moon -- the reason solar eclipses work).
+// Render with an actual disc + a halo whose extent grows at low sun
+// elevation, matching the bright bloom you see around the sun at
+// sunset/sunrise (more atmospheric thickness + dust = more scatter).
+//
+// The disc itself stays the same physical 0.55deg half-angle; what
+// changes between noon and sunset is the colour (warm/red at low
+// elev) and the halo size (much bigger at low elev, fading toward
+// a tight halo at zenith). This matches real photos: sunset sun
+// SEEMS bigger because the bright halo reads as part of the disc.
+float3 sunDisc(float3 rd, float3 sun_dir) {
+    if (sun_dir.y < -0.10) return float3(0.0);
+    float ang = dot(rd, sun_dir);
+    const float kCosR = 0.99995;          // cos(0.55 deg)
+    // Halo extent grows from cos(2deg) at zenith to cos(8deg) near
+    // horizon. The horizon halo is what you see as the "bigger" sun
+    // at sunset -- it's atmospheric scattering, not the disc itself.
+    float halo_deg   = lerp(2.0, 8.0, saturate(1.0 - sun_dir.y));
+    float halo_rad   = halo_deg * 0.0174533;
+    float kCosHalo   = cos(halo_rad);
+    if (ang <= kCosHalo) return float3(0.0);
+
+    // Atmospheric attenuation + warmth, matching sun_rad in NEE.
+    float am  = 1.0 / max(sun_dir.y, 0.04);
+    float atm = exp(-0.30 * am);
+    float warmth = saturate((am - 1.0) * 0.18);
+    float3 col = lerp(float3(1.00, 0.98, 0.94),
+                      float3(1.55, 0.55, 0.20), warmth);
+
+    // Halo: soft bloom around the disc.
+    float halo = 0.0;
+    if (ang > kCosHalo) {
+        float t_h = (ang - kCosHalo) / (1.0 - kCosHalo);
+        // Steeper falloff at zenith (tight halo), wider at horizon.
+        float falloff = lerp(8.0, 3.0, saturate(1.0 - sun_dir.y));
+        halo = pow(t_h, falloff);
+    }
+
+    if (ang > kCosR) {
+        // Bright disc -- sun is enormously brighter than anything
+        // else; ACES will clip the centre to white but the limb +
+        // halo carry the warmth.
+        return col * (250.0 * atm)
+             + col * halo * atm * 4.0;
+    }
+    return col * halo * atm * 4.0;
+}
+
 // Moon disc + halo. Real lunar angular radius is 0.00465 rad (~0.27deg
 // half-angle = 0.54deg full).
 //   - terminator: per-pixel lit/unlit check via dot(surface_normal,
@@ -684,7 +733,8 @@ float3 skyColor(float3 rd) {
         base = lerp(float3(0.50, 0.55, 0.62), float3(1.0, 1.0, 1.0), t);
     }
     if (mode == 2u) {
-        return base + moonDisc(rd, moon_dir_phase, sun_and_mode.xyz);
+        return base + moonDisc(rd, moon_dir_phase, sun_and_mode.xyz)
+             + sunDisc(rd, sun_and_mode.xyz);
     }
     if (env_map_present != 0u) {
         // Lat-long lookup: u from atan2 of horizontal plane, v from
@@ -707,9 +757,11 @@ float3 skyColor(float3 rd) {
         float3 c01 = env_map[uint2(x0, y1)].rgb;
         float3 c11 = env_map[uint2(x1, y1)].rgb;
         float3 sky = lerp(lerp(c00, c10, f.x), lerp(c01, c11, f.x), f.y);
-        return sky * env_intensity + moonDisc(rd, moon_dir_phase, sun_and_mode.xyz);
+        return sky * env_intensity + moonDisc(rd, moon_dir_phase, sun_and_mode.xyz)
+             + sunDisc(rd, sun_and_mode.xyz);
     }
-    return base + moonDisc(rd, moon_dir_phase, sun_and_mode.xyz);
+    return base + moonDisc(rd, moon_dir_phase, sun_and_mode.xyz)
+             + sunDisc(rd, sun_and_mode.xyz);
 }
 
 float3 acesTonemap(float3 c) {
