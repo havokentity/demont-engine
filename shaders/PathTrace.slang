@@ -180,8 +180,14 @@ float cloud_fbm(float3 p, int octaves) {
 // Density at a world-space point. Returns 0 outside the cloud layer
 // or where the noise threshold isn't met. The volumetric march
 // multiplies this by sigma_t to vary extinction along the ray.
+//
+// `octaves` parameterises the fbm complexity: the primary cloud march
+// uses 6 (full visual quality), shadow rays use 3 (rough density
+// estimate for Beer-Lambert is enough; saves ~50% of noise lookups
+// on the dominant shadow path).
 float cloud_density_at(float3 pos,
-                       float4 cp1, float4 cp2, float4 cp3) {
+                       float4 cp1, float4 cp2, float4 cp3,
+                       int octaves) {
     if (cp1.w <= 0.0) return 0.0;
     float base_y = cp1.x;
     float top_y  = cp1.y;
@@ -198,8 +204,9 @@ float cloud_density_at(float3 pos,
               + float3(cp2.x * cp2.w, 0.0, cp2.y * cp2.w)
               + float3(cp3.x, 0.0, cp3.y);
     sp *= cp2.z;
-    // Cumulus body: 6 octaves of quintic-interpolated value-noise fbm.
-    float low = cloud_fbm(sp, 6);
+    // Cumulus body: caller-controlled octaves of quintic-interpolated
+    // value-noise fbm. Higher octaves -> more wispy detail, more cost.
+    float low = cloud_fbm(sp, octaves);
     // Smooth coverage transition. smoothstep(1-cov, 1, low) gives a
     // soft S-curve from 0 (no cloud) to 1 (max cloud) over the
     // noise-value band, instead of the hard linear ramp the previous
@@ -661,16 +668,22 @@ float cloud_optical_depth(float3 ro, float3 rd, float t_max) {
         }
     }
     t_out = min(t_out, t_max);
+    // Cap shadow march distance: a near-horizon ray crossing the cloud
+    // layer at very shallow elevation can span hundreds of kilometres,
+    // far more than the cloud field's coherence length. 20km is plenty
+    // to capture the shadow of any reasonable cloud bank in front of
+    // the sun, and limits the sample budget.
+    if (t_out - t_in > 20000.0) t_in = t_out - 20000.0;
     if (t_out <= t_in) return 0.0;
-    // 8 coarse samples are plenty for a shadow ray -- we just need
-    // to know roughly how dense the cloud is along this line.
-    const int Ns = 8;
+    // 4 coarse samples + 3 fbm octaves for the shadow ray. Beer-Lambert
+    // exp(-OD) only needs a rough density estimate to look right.
+    const int Ns = 4;
     float dt = (t_out - t_in) / float(Ns);
     float od = 0.0;
     [unroll] for (int i = 0; i < Ns; ++i) {
         float t = t_in + (float(i) + 0.5) * dt;
         float3 sp = ro + rd * t;
-        od += cloud_density_at(sp, clouds_p1, clouds_p2, clouds_p3) * dt;
+        od += cloud_density_at(sp, clouds_p1, clouds_p2, clouds_p3, 3) * dt;
     }
     return od;
 }
@@ -866,11 +879,13 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // atmospheric haze along the full visible distance.
         float3 primary_ro = ro;
         float3 primary_rd = rd;
-        // Sky-pixel default extends to ~50km so distant cloud layers
-        // (cumulus 200-500m) are reachable by low-elevation rays
-        // (5deg above horizon needs t ~ 6km to enter the layer).
-        // Object hits override this with the actual scene t.
-        float  primary_t  = 50000.0;
+        // Sky-pixel default extends to ~500km so cirrus near the
+        // horizon (8000-9500m altitude, needs ~500km horizontal travel
+        // for 1 deg elevation rays) is reachable. The cloud march
+        // separately caps its span at 30km, so this just unlocks the
+        // ray-slab intersection to find the layer in the first place;
+        // it doesn't multiply the actual march cost.
+        float  primary_t  = 500000.0;
         bool   primary_t_recorded = false;
         bool   primary_hit = false;
 
@@ -1092,8 +1107,15 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     t_in = 1.0; t_out = 0.0;   // miss
                 }
                 t_out = min(t_out, primary_t);
+                // Cap the cloud march span at 30km. For low-elevation
+                // rays the layer can span hundreds of km; uniform
+                // sampling that range produces samples spaced wider
+                // than cloud features and looks worse than just
+                // marching the closer 30km. Beyond 30km the sky
+                // gradient takes over visually.
+                if (t_out - t_in > 30000.0) t_in = t_out - 30000.0;
                 if (t_out > t_in) {
-                    int   Nc = max(N, 24);    // clouds need finer detail
+                    int   Nc = max(N, 12);    // user slider can ask for more
                     float dtc = (t_out - t_in) / float(Nc);
                     float jitc = randf(seed) * dtc;
                     float trans_eye_c = 1.0;
@@ -1103,7 +1125,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         if (t > t_out) break;
                         float3 sp = primary_ro + primary_rd * t;
                         float dens = cloud_density_at(sp, clouds_p1,
-                                                      clouds_p2, clouds_p3);
+                                                      clouds_p2, clouds_p3, 6);
                         if (dens <= 0.0) continue;
                         if (sun_elev > 0.0) {
                             float3 sun_jit = sampleSunDisc(sun_dir, seed);
