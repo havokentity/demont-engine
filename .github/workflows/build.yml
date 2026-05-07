@@ -8,8 +8,14 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-  # Allow running from the Actions tab manually.
+  # Allow running from the Actions tab manually -- also useful for
+  # forcing a nightly build outside the schedule.
   workflow_dispatch:
+  # Nightly build trigger: 23:00 Asia/Kolkata (IST, UTC+5:30) = 17:30 UTC.
+  # Cron is in UTC. GHA may delay scheduled runs by ~5-15min during
+  # peak load; treat 11pm IST as a target, not a guarantee.
+  schedule:
+    - cron: '30 17 * * *'
 
 # Cancel in-flight runs for the same branch when a newer push lands.
 concurrency:
@@ -77,15 +83,17 @@ jobs:
       # create a window without a display. Local devs already run the
       # binary; CI's job is to catch compile + link regressions.
 
-  # Rolling nightly release: every successful build on main updates the
-  # `nightly` pre-release tag with a fresh release-config artifact. Lets
-  # users grab a always-latest binary without waiting for a versioned tag.
-  # Versioned releases (v0.1.0, v1.0.0, ...) still flow through release.yml
-  # on a tag push; this is purely the "what's on main today" download.
+  # Scheduled nightly release: at 23:00 IST (cron at top, in UTC) the
+  # macos build runs and -- if it passes -- this job repackages the
+  # release-config artefact and updates the `nightly` pre-release tag.
+  # PRs and ad-hoc pushes do NOT churn the nightly tag (gated by
+  # event_name); workflow_dispatch is allowed for manual nightlies
+  # outside the schedule. Versioned releases (v0.1.0, ...) still flow
+  # through release.yml on a tag push.
   nightly-release:
-    name: Nightly release (rolling)
+    name: Nightly release (scheduled)
     needs: macos
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: macos-26
     permissions:
       contents: write   # required to update the rolling tag's release
@@ -118,11 +126,11 @@ jobs:
           echo "SHA_SHORT=$SHA_SHORT" >> "$GITHUB_ENV"
 
       - name: Update rolling 'nightly' release
-        # action-gh-release force-updates the tag to the current commit
-        # and replaces the attached artefact, so users hitting the
-        # 'nightly' release page always get the freshest main build.
-        # `prerelease: true` keeps it out of the "latest" picker for
-        # users who only want versioned releases.
+        # action-gh-release force-updates the tag to whatever commit
+        # main points to at run time and replaces the attached artefact,
+        # so users hitting the 'nightly' release page always get the
+        # latest scheduled build. `prerelease: true` keeps it out of the
+        # "Latest" picker for users who only want versioned releases.
         uses: softprops/action-gh-release@v2
         with:
           tag_name: nightly
@@ -132,9 +140,10 @@ jobs:
           files: ${{ env.ARCHIVE }}
           fail_on_unmatched_files: true
           body: |
-            Auto-built from `main` after every successful CI run.
+            Scheduled nightly build of `main` -- runs at 23:00 IST
+            (Asia/Kolkata, UTC+5:30) every day.
             Commit: `${{ env.SHA_SHORT }}` (${{ github.sha }}).
 
             For versioned, stable releases see the [tagged releases](https://github.com/havokentity/demont-engine/releases?q=v).
-            This tag is force-updated on every push to main; the artefact
-            attached to this release reflects the latest commit.
+            This tag is force-updated on each scheduled run; the
+            attached artefact reflects whatever was on `main` at run time.
