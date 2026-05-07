@@ -263,7 +263,72 @@
     return btn;
   }
 
+  // Look up a cvar in the cached sidePanelData by name. Used by the
+  // date-picker widget to pull r_sky_month / r_sky_day when rendering
+  // the combined picker for r_sky_year.
+  function getCvarByName(name) {
+    if (!sidePanelData) return null;
+    for (const g of sidePanelData.names) {
+      const grp = sidePanelData.groups.get(g);
+      if (!grp || !grp.subs) continue;
+      for (const [, items] of grp.subs) {
+        for (const v of items.cvars) {
+          if (v.name === name) return v;
+        }
+      }
+    }
+    return null;
+  }
+
+  // r_sky_year becomes a calendar date picker that combines year /
+  // month / day. r_sky_month and r_sky_day are folded into it (we
+  // hide their separate rows in renderCvarRow). When all three are
+  // 0, the picker shows today's date and the underlying cvars stay
+  // 0 = "use system date".
+  function makeDatePicker(v, setCvar) {
+    const widget = document.createElement('input');
+    widget.type = 'date';
+    widget.className = 'v v-date';
+    const yr = parseInt(v.value, 10) || 0;
+    const moV = getCvarByName('r_sky_month');
+    const dyV = getCvarByName('r_sky_day');
+    const mo = (moV && parseInt(moV.value, 10)) || 0;
+    const dy = (dyV && parseInt(dyV.value, 10)) || 0;
+    const today = new Date();
+    const fy = yr || today.getUTCFullYear();
+    const fm = mo || (today.getUTCMonth() + 1);
+    const fd = dy || today.getUTCDate();
+    widget.value = `${String(fy).padStart(4, '0')}-`
+                 + `${String(fm).padStart(2, '0')}-`
+                 + `${String(fd).padStart(2, '0')}`;
+    widget.addEventListener('change', (e) => {
+      e.stopPropagation();
+      const m = widget.value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      if (!m) return;
+      const ny = parseInt(m[1], 10);
+      const nm = parseInt(m[2], 10);
+      const nd = parseInt(m[3], 10);
+      // Send all three; refreshCvars debounce in setCvar coalesces.
+      send({ type: 'exec', line: `r_sky_year ${ny}` });
+      send({ type: 'exec', line: `r_sky_month ${nm}` });
+      send({ type: 'exec', line: `r_sky_day ${nd}` });
+      v.value = String(ny);
+      if (moV) moV.value = String(nm);
+      if (dyV) dyV.value = String(nd);
+      clearTimeout(makeDatePicker._t);
+      makeDatePicker._t = setTimeout(refreshCvars, 60);
+    });
+    widget.addEventListener('click', (e) => e.stopPropagation());
+    return widget;
+  }
+
   function renderCvarRow(v, fillInput) {
+    // r_sky_month / r_sky_day are folded into r_sky_year's date
+    // picker; hide their separate rows.
+    if (v.name === 'r_sky_month' || v.name === 'r_sky_day') {
+      return null;
+    }
+
     const row = document.createElement('div');
     row.className = 'kv';
     if (v.description) row.title = v.description;
@@ -298,7 +363,9 @@
        (allowed[0] === '1' && allowed[1] === '0'));
 
     let widget;
-    if (isReadOnly) {
+    if (v.name === 'r_sky_year') {
+      widget = makeDatePicker(v, setCvar);
+    } else if (isReadOnly) {
       widget = document.createElement('span');
       widget.className = 'v v-readonly';
       widget.textContent = v.value;
@@ -431,7 +498,10 @@
       if (!grp || !grp.subs) continue;
       for (const [, items] of grp.subs) {
         for (const v of items.cvars) {
-          if (pinned.has(v.name) && ok(v.name)) list.appendChild(renderCvarRow(v, fillInput));
+          if (pinned.has(v.name) && ok(v.name)) {
+            const row = renderCvarRow(v, fillInput);
+            if (row) list.appendChild(row);
+          }
         }
         for (const c of items.commands) {
           if (pinned.has(c.name) && ok(c.name)) list.appendChild(renderCommandRow(c, fillInput));
@@ -532,7 +602,10 @@
           sh.textContent = sub;
           cvarsPanel.appendChild(sh);
         }
-        for (const v of cvarsHere)   cvarsPanel.appendChild(renderCvarRow(v, fillInput));
+        for (const v of cvarsHere) {
+          const row = renderCvarRow(v, fillInput);
+          if (row) cvarsPanel.appendChild(row);
+        }
         for (const cmd of cmdsHere)  cvarsPanel.appendChild(renderCommandRow(cmd, fillInput));
       }
     }
