@@ -736,10 +736,17 @@ float3 moonDisc(float3 rd, float4 mph, float3 sun_dir_world) {
         // Limb darkening (real lunar limb is darker due to roughness).
         float limb = 0.55 + 0.45 * sqrt(saturate(t_d));
 
-        // Normal moon-lit colour.
+        // Normal moon-lit colour. Disc multiplier 3.5 (was 12.0):
+        // anything above ~10 hits the ACES knee and clips to flat
+        // white, so the surface texture's 0.05-0.98 range collapses.
+        // 3.5 keeps the disc bright at night exposure (auto-exp ~4
+        // -> ~14 raw -> 0.83 post-ACES) while preserving 0.5-0.85
+        // post-ACES range for the actual texture variation. Halo
+        // brightness also dropped proportionally so the surrounding
+        // bloom doesn't overwhelm the disc.
         float3 lit_col = col_tint * col_atm * surface
-                       * (12.0 * lit * limb * moon_atm)
-                       + col_tint * col_atm * halo * lit * moon_atm * 0.3;
+                       * (3.5 * lit * limb * moon_atm)
+                       + col_tint * col_atm * halo * lit * moon_atm * 0.6;
 
         // Blood-moon colour during eclipse: deep red-orange (the
         // refracted-through-Earth-atmosphere light tone). Surface
@@ -747,7 +754,7 @@ float3 moonDisc(float3 rd, float4 mph, float3 sun_dir_world) {
         // Brightness drops a lot -- a typical totality has the moon
         // ~1/10000 of normal full-moon brightness.
         float3 eclipse_col = float3(0.55, 0.15, 0.04) * surface
-                           * (limb * moon_atm * 1.5);
+                           * (limb * moon_atm * 1.2);
         return lerp(lit_col, eclipse_col, eclipse);
     }
     // Halo only -- no surface here. Halo dims toward new-moon by the
