@@ -76,3 +76,65 @@ jobs:
       # Smoke boot-test is skipped on the runner because GLFW can't
       # create a window without a display. Local devs already run the
       # binary; CI's job is to catch compile + link regressions.
+
+  # Rolling nightly release: every successful build on main updates the
+  # `nightly` pre-release tag with a fresh release-config artifact. Lets
+  # users grab a always-latest binary without waiting for a versioned tag.
+  # Versioned releases (v0.1.0, v1.0.0, ...) still flow through release.yml
+  # on a tag push; this is purely the "what's on main today" download.
+  nightly-release:
+    name: Nightly release (rolling)
+    needs: macos
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: macos-26
+    permissions:
+      contents: write   # required to update the rolling tag's release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: brew install ninja cmake vulkan-headers vulkan-loader molten-vk || true
+
+      - name: Configure (release)
+        run: cmake --preset mac-release
+
+      - name: Build
+        run: cmake --build build/mac-release --parallel
+
+      - name: Stage artefact tree
+        # Same layout as release.yml's tag-driven flow, just with a
+        # 'nightly' filename + commit SHA so users can correlate.
+        run: |
+          SHA_SHORT="${GITHUB_SHA:0:7}"
+          STAGE="demont-nightly-${SHA_SHORT}-macos-arm64"
+          mkdir -p "dist/$STAGE"
+          cp build/mac-release/src/app/demont "dist/$STAGE/"
+          cp -R assets                        "dist/$STAGE/"
+          cp LICENSE README.md                "dist/$STAGE/"
+          cd dist
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+          ls -lh "$STAGE.tar.gz"
+          echo "ARCHIVE=dist/$STAGE.tar.gz" >> "$GITHUB_ENV"
+          echo "SHA_SHORT=$SHA_SHORT" >> "$GITHUB_ENV"
+
+      - name: Update rolling 'nightly' release
+        # action-gh-release force-updates the tag to the current commit
+        # and replaces the attached artefact, so users hitting the
+        # 'nightly' release page always get the freshest main build.
+        # `prerelease: true` keeps it out of the "latest" picker for
+        # users who only want versioned releases.
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: "Nightly (latest main)"
+          prerelease: true
+          make_latest: false
+          files: ${{ env.ARCHIVE }}
+          fail_on_unmatched_files: true
+          body: |
+            Auto-built from `main` after every successful CI run.
+            Commit: `${{ env.SHA_SHORT }}` (${{ github.sha }}).
+
+            For versioned, stable releases see the [tagged releases](https://github.com/havokentity/demont-engine/releases?q=v).
+            This tag is force-updated on every push to main; the artefact
+            attached to this release reflects the latest commit.
