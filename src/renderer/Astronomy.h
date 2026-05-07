@@ -39,6 +39,15 @@ struct HorizonPos {
 // formulas; accurate to ~1 arcminute through the 21st century.
 EquatorialPos sunPosition(double jd);
 
+// Moon position at the given Julian date. Meeus chapter 47 simplified
+// formulas keeping the dominant ELP-2000/82 periodic terms; accurate
+// to ~10 arcminutes for ra/dec, ~1 day for phase calculations.
+EquatorialPos moonPosition(double jd);
+
+// Phase angle of the moon (Sun-Earth-Moon angle), radians. 0 = new
+// (moon between sun and earth, dark side facing earth), pi = full.
+double moonPhaseAngle(EquatorialPos sun, EquatorialPos moon);
+
 // Convert equatorial (ra, dec) to local horizon (az, alt) for an
 // observer at lat/lon (degrees, +N / +E) and the given JD.
 HorizonPos equatorialToHorizon(EquatorialPos eq,

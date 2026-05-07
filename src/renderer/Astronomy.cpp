@@ -67,6 +67,75 @@ EquatorialPos sunPosition(double jd) {
     return EquatorialPos{ normDeg(ra), dec };
 }
 
+EquatorialPos moonPosition(double jd) {
+    // Meeus chapter 47 simplified, keeping the largest periodic terms.
+    // Accurate to ~10 arcmin for ra/dec, plenty for "moon is roughly
+    // there in the sky." For sub-arcminute precision we'd need the
+    // full ELP-2000/82 series (~70 longitude terms, ~30 latitude).
+    double T = (jd - 2451545.0) / 36525.0;            // Julian centuries
+
+    // Fundamental arguments, all in degrees.
+    double L  = 218.3164591 + 481267.88134236 * T;    // moon mean longitude
+    double D  = 297.8502042 + 445267.1115168 * T;     // mean elongation
+    double M  = 357.5291092 + 35999.0502909 * T;      // sun mean anomaly
+    double Mm = 134.9634114 + 477198.8676313 * T;     // moon mean anomaly
+    double F  =  93.2720993 + 483202.0175273 * T;     // argument of latitude
+
+    L  = normDeg(L);  D = normDeg(D);  M = normDeg(M);
+    Mm = normDeg(Mm); F = normDeg(F);
+
+    double Mr  = M * kDeg2Rad;
+    double Mmr = Mm * kDeg2Rad;
+    double Dr  = D * kDeg2Rad;
+    double Fr  = F * kDeg2Rad;
+
+    // Six dominant longitude terms (deg).
+    double dL =  6.289 * std::sin(Mmr)
+              - 1.274 * std::sin(Mmr - 2.0 * Dr)
+              + 0.658 * std::sin(2.0 * Dr)
+              - 0.186 * std::sin(Mr)
+              - 0.114 * std::sin(2.0 * Fr)
+              + 0.059 * std::sin(2.0 * Mmr - 2.0 * Dr);
+
+    // Three dominant latitude terms (deg).
+    double dB =  5.128 * std::sin(Fr)
+              + 0.281 * std::sin(Mmr + Fr)
+              + 0.278 * std::sin(Mmr - Fr)
+              - 0.173 * std::sin(2.0 * Dr - Fr);
+
+    double lambda = L + dL;                    // ecliptic longitude
+    double beta   = dB;                        // ecliptic latitude
+    double epsilon = 23.439 - 0.0000004 * (jd - 2451545.0);
+
+    double l_r = lambda  * kDeg2Rad;
+    double b_r = beta    * kDeg2Rad;
+    double e_r = epsilon * kDeg2Rad;
+
+    // Ecliptic -> equatorial.
+    double sin_a = std::sin(l_r) * std::cos(e_r) - std::tan(b_r) * std::sin(e_r);
+    double cos_a = std::cos(l_r);
+    double ra    = std::atan2(sin_a, cos_a) * kRad2Deg;
+    double dec   = std::asin(std::sin(b_r) * std::cos(e_r)
+                           + std::cos(b_r) * std::sin(e_r) * std::sin(l_r)) * kRad2Deg;
+    return EquatorialPos{ normDeg(ra), dec };
+}
+
+double moonPhaseAngle(EquatorialPos sun, EquatorialPos moon) {
+    // Phase angle = angle Sun-Earth-Moon. cos(phase) = -cos(angular
+    // separation between sun and moon as seen from earth) (because
+    // when sun and moon are on opposite sides -- 180deg apart in the
+    // sky -- the moon is full = phase pi, when together it's new = 0).
+    double s_ra = sun.ra_deg * kDeg2Rad;
+    double s_dec = sun.dec_deg * kDeg2Rad;
+    double m_ra = moon.ra_deg * kDeg2Rad;
+    double m_dec = moon.dec_deg * kDeg2Rad;
+    double cos_sep = std::sin(s_dec) * std::sin(m_dec)
+                   + std::cos(s_dec) * std::cos(m_dec)
+                       * std::cos(s_ra - m_ra);
+    cos_sep = std::clamp(cos_sep, -1.0, 1.0);
+    return std::acos(-cos_sep);    // 0 at new moon, pi at full
+}
+
 HorizonPos equatorialToHorizon(EquatorialPos eq,
                                double observer_lat_deg,
                                double observer_lon_deg,

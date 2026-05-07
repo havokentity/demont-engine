@@ -132,6 +132,12 @@ cbuffer Push {
     float4 clouds_p1;
     float4 clouds_p2;
     float4 clouds_p3;
+    // Moon. .xyz = unit vector toward the moon (engine computes via
+    // Meeus simplified moon-position formulas + observer lat/lon).
+    // .w = phase angle in radians (0 = new, π = full); used for both
+    // the moon disc's brightness in skyColor and for moonlight NEE
+    // contribution amplitude on cloud / surface BRDF rays.
+    float4 moon_dir_phase;
 };
 
 // --- Procedural cloud field --------------------------------------------
@@ -548,10 +554,45 @@ float3 procSky(float3 rd, float3 sun) {
     return max(sky, float3(0.0));
 }
 
+// Bright disc for the moon. Real lunar angular radius is 0.00465 rad
+// (~16 arcmin). Phase shading: brightness scales with (1 - cos(phase))/2
+// so full moon = 1, new = 0, half = 0.5. The disc is added on top of
+// whatever the underlying sky returns (procedural / env_map / gradient)
+// so it shows through the night sky AND through cloud-mip thin spots.
+float3 moonDisc(float3 rd, float4 mph) {
+    if (mph.y < -0.10) return float3(0.0);     // moon below horizon
+    float3 m_dir = mph.xyz;
+    float ang = dot(rd, m_dir);
+    const float kCosR = 0.99998918;            // cos(0.00465 rad)
+    if (ang <= kCosR) return float3(0.0);
+    // Phase brightness: 0.5 (1 - cos(phase)) maps 0->0, π->1, π/2->0.5.
+    // Dirty single-direction approximation — no terminator curvature.
+    float phase = mph.w;
+    float bright = 0.5 * (1.0 - cos(phase));
+    // Slightly cool tint for moonlight (real moonlight is mostly
+    // sun-reflected so it's actually warm white, but eyes interpret
+    // it as cool against night-adapted vision; viewer expectation).
+    float3 col = float3(0.85, 0.90, 1.00);
+    // Limb darkening: dimmer near the disc edge.
+    float t_edge = (ang - kCosR) / (1.0 - kCosR);
+    float limb = 0.55 + 0.45 * sqrt(saturate(t_edge));
+    return col * (12.0 * bright * limb);
+}
+
 float3 skyColor(float3 rd) {
+    float3 base;
     uint mode = uint(sun_and_mode.w);
     if (mode == 2u) {
-        return procSky(rd, sun_and_mode.xyz);
+        base = procSky(rd, sun_and_mode.xyz);
+    } else if (env_map_present != 0u) {
+        // Original env_map path follows.
+        base = float3(0.0);   // filled below
+    } else {
+        float t = clamp(0.5 * (rd.y + 1.0), 0.0, 1.0);
+        base = lerp(float3(0.50, 0.55, 0.62), float3(1.0, 1.0, 1.0), t);
+    }
+    if (mode == 2u) {
+        return base + moonDisc(rd, moon_dir_phase);
     }
     if (env_map_present != 0u) {
         // Lat-long lookup: u from atan2 of horizontal plane, v from
@@ -574,10 +615,9 @@ float3 skyColor(float3 rd) {
         float3 c01 = env_map[uint2(x0, y1)].rgb;
         float3 c11 = env_map[uint2(x1, y1)].rgb;
         float3 sky = lerp(lerp(c00, c10, f.x), lerp(c01, c11, f.x), f.y);
-        return sky * env_intensity;
+        return sky * env_intensity + moonDisc(rd, moon_dir_phase);
     }
-    float t = clamp(0.5 * (rd.y + 1.0), 0.0, 1.0);
-    return lerp(float3(0.50, 0.55, 0.62), float3(1.0, 1.0, 1.0), t);
+    return base + moonDisc(rd, moon_dir_phase);
 }
 
 float3 acesTonemap(float3 c) {
@@ -938,6 +978,26 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         radiance += throughput * env.color * trans * brdf * n_dot_l / env.pdf;
                     }
                 }
+                // Moon NEE. Env-map importance sampling will mostly
+                // pick the bright sun pixel during the day; at night
+                // the env-map pixel for the moon is dim (HDRIs rarely
+                // include the moon at full intensity), so we add an
+                // explicit moon NEE to ensure scenes are lit at night.
+                if (moon_dir_phase.y > 0.0) {
+                    float phase_b = 0.5 * (1.0 - cos(moon_dir_phase.w));
+                    if (phase_b > 0.01) {
+                        float3 moon_jit = sampleSunDisc(moon_dir_phase.xyz, seed);
+                        float ndl = max(0.0, dot(nf, moon_jit));
+                        if (ndl > 0.0) {
+                            float3 t_m = transmittance(hit_pt + nf * 1e-3, moon_jit, 1e30);
+                            if (any(t_m > float3(0.0))) {
+                                float3 moon_rad = float3(0.85, 0.90, 1.00) * (4.0 * phase_b);
+                                float3 brdf = h.albedo / 3.14159265358979;
+                                radiance += throughput * moon_rad * t_m * brdf * ndl;
+                            }
+                        }
+                    }
+                }
                 // Calculated diffuse skylight ambient. For a Lambert
                 // surface under uniform sky L, the outgoing radiance is
                 //   albedo * L
@@ -997,6 +1057,23 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         // tint / diamond focal lensing modulate the
                         // direct light correctly.
                         radiance += throughput * sun_rad * trans * brdf * n_dot_l;
+                    }
+                }
+                // Moon NEE for the procedural-sky path (see env_map
+                // branch above for the rationale).
+                if (moon_dir_phase.y > 0.0) {
+                    float phase_b = 0.5 * (1.0 - cos(moon_dir_phase.w));
+                    if (phase_b > 0.01) {
+                        float3 moon_jit = sampleSunDisc(moon_dir_phase.xyz, seed);
+                        float ndl = max(0.0, dot(nf, moon_jit));
+                        if (ndl > 0.0) {
+                            float3 t_m = transmittance(hit_pt + nf * 1e-3, moon_jit, 1e30);
+                            if (any(t_m > float3(0.0))) {
+                                float3 moon_rad = float3(0.85, 0.90, 1.00) * (4.0 * phase_b);
+                                float3 brdf = h.albedo / 3.14159265358979;
+                                radiance += throughput * moon_rad * t_m * brdf * ndl;
+                            }
+                        }
                     }
                 }
                 // Calculated diffuse skylight ambient (matches the
@@ -1208,6 +1285,30 @@ void main(uint2 tid : SV_DispatchThreadID) {
                             if (any(trans_sun > float3(0.0))) {
                                 v_color_c += sun_rad * trans_sun * phase
                                            * dens * dtc * trans_eye_c;
+                            }
+                        }
+                        // Direct moon (single-scatter NEE). Moon is the
+                        // night sky's key light; without this clouds go
+                        // pitch-black after sunset. Phase shading via
+                        // 0.5 * (1 - cos(phase)) so new moon contributes
+                        // nothing, full moon is full-strength.
+                        if (moon_dir_phase.y > 0.0) {
+                            float phase_b = 0.5 * (1.0 - cos(moon_dir_phase.w));
+                            if (phase_b > 0.01) {
+                                float3 moon_jit = sampleSunDisc(moon_dir_phase.xyz, seed);
+                                float3 trans_moon = transmittance(sp, moon_jit, 1e30);
+                                if (any(trans_moon > float3(0.0))) {
+                                    float c_t_m = dot(primary_rd, -moon_dir_phase.xyz);
+                                    float g2 = g * g;
+                                    float phase_m = (1.0 - g2) / (4.0 * 3.14159265358979
+                                        * pow(max(1.0 + g2 - 2.0 * g * c_t_m, 1e-4), 1.5));
+                                    // ~1/20 of sun strength at full;
+                                    // dim enough to read as "moonlit"
+                                    // but visible after auto-exposure.
+                                    float3 moon_rad = float3(0.85, 0.90, 1.00) * (4.0 * phase_b);
+                                    v_color_c += moon_rad * trans_moon * phase_m
+                                               * dens * dtc * trans_eye_c;
+                                }
                             }
                         }
                         // Diffuse skylight (hemisphere integral). No phase

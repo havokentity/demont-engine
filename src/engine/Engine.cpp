@@ -1217,7 +1217,10 @@ void Engine::RenderFrame() {
         // the field-by-field layout. Three float4s = 48 bytes.
         float clouds_p1[4];   // (base_y, top_y, coverage, peak_density)
         float clouds_p2[4];   // (wind_x, wind_z, freq, time_seconds)
-        float clouds_p3[4];   // (seed_offset_x, seed_offset_z, detail_amount, _)
+        float clouds_p3[4];   // (seed_offset_x, seed_offset_z, detail_amount, rayleigh_int)
+        // Moon. .xyz = unit vector toward moon (computed from astro),
+        // .w = phase angle radians (0 = new, π = full).
+        float moon_dir_phase[4];
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -1319,6 +1322,30 @@ void Engine::RenderFrame() {
     push.sun_and_mode[0] =  ce * std::sin(azim_r);
     push.sun_and_mode[1] =  se;
     push.sun_and_mode[2] = -ce * std::cos(azim_r);
+
+    // Moon direction + phase. Always computed (cheap), regardless of
+    // r_sky_use_astronomical -- when astronomical is off the moon goes
+    // wherever Meeus says relative to the manual sun (not physically
+    // consistent but better than nothing). When astronomical is on the
+    // moon and sun share the same epoch and observer.
+    {
+        double lat = 13.0827, lon = 80.2707;
+        if (auto* v = C.FindCVar("r_sky_lat")) lat = v->GetFloat();
+        if (auto* v = C.FindCVar("r_sky_lon")) lon = v->GetFloat();
+        const double jd_moon = compute_jd();
+        auto moon_eq = pt::astro::moonPosition(jd_moon);
+        auto moon_h  = pt::astro::equatorialToHorizon(moon_eq, lat, lon, jd_moon);
+        const float me_r = glm::radians(static_cast<float>(moon_h.altitude_deg));
+        const float ma_r = glm::radians(static_cast<float>(moon_h.azimuth_deg));
+        const float mce = std::cos(me_r), mse = std::sin(me_r);
+        push.moon_dir_phase[0] =  mce * std::sin(ma_r);
+        push.moon_dir_phase[1] =  mse;
+        push.moon_dir_phase[2] = -mce * std::cos(ma_r);
+        // Phase angle from same-epoch sun + moon.
+        auto sun_eq_for_phase = pt::astro::sunPosition(jd_moon);
+        push.moon_dir_phase[3] = static_cast<float>(
+            pt::astro::moonPhaseAngle(sun_eq_for_phase, moon_eq));
+    }
 
     // Sky mode resolution. "hdri" with no env map loaded falls back
     // to gradient so the shader doesn't read an unbound texture.
@@ -1466,7 +1493,7 @@ void Engine::RenderFrame() {
         push.clouds_p3[3] = rayleigh;
     }
 
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48);
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16);
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
 
