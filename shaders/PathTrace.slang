@@ -1187,7 +1187,13 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                 float3 m_col = lerp(float3(0.92, 0.94, 1.00),
                                                     float3(1.20, 0.65, 0.40),
                                                     m_warmth);
-                                float3 moon_rad = m_col * (0.8 * phase_b * m_atm);
+                                // 0.3x of sun (was 0.8) -- night feels
+                                // genuinely dim. Auto-exposure still
+                                // amplifies for visibility, but the
+                                // ground / clouds stay readably night
+                                // (~1/3 of daylight luminance) instead
+                                // of looking like a slightly cool day.
+                                float3 moon_rad = m_col * (0.3 * phase_b * m_atm);
                                 float3 brdf = h.albedo / 3.14159265358979;
                                 radiance += throughput * moon_rad * t_m * brdf * ndl;
                             }
@@ -1274,7 +1280,13 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                 float3 m_col = lerp(float3(0.92, 0.94, 1.00),
                                                     float3(1.20, 0.65, 0.40),
                                                     m_warmth);
-                                float3 moon_rad = m_col * (0.8 * phase_b * m_atm);
+                                // 0.3x of sun (was 0.8) -- night feels
+                                // genuinely dim. Auto-exposure still
+                                // amplifies for visibility, but the
+                                // ground / clouds stay readably night
+                                // (~1/3 of daylight luminance) instead
+                                // of looking like a slightly cool day.
+                                float3 moon_rad = m_col * (0.3 * phase_b * m_atm);
                                 float3 brdf = h.albedo / 3.14159265358979;
                                 radiance += throughput * moon_rad * t_m * brdf * ndl;
                             }
@@ -1348,15 +1360,22 @@ void main(uint2 tid : SV_DispatchThreadID) {
             float3 sun_dir   = sun_and_mode.xyz;
             float  sun_elev  = sun_dir.y;
             // Sun radiance at this elevation (matches Lambert sun
-            // colour so beams + lit surfaces agree on tint).
+            // colour so beams + lit surfaces agree on tint). Warmth
+            // saturates more aggressively (0.30 instead of 0.18) and
+            // the warm endpoint is a deeper red, so sunset clouds
+            // actually read as "blood orange" rather than "tinted
+            // beige". am stored separately so the cloud march can
+            // re-scale per-sample altitude (high clouds catch less-
+            // attenuated, brighter / less-red sunlight than ground).
             float3 sun_rad = float3(0.0);
+            float  sun_am  = 0.0;
             if (sun_elev > 0.0) {
-                float am  = 1.0 / max(sun_elev, 0.04);
+                sun_am = 1.0 / max(sun_elev, 0.04);
                 float tau = 0.30;
-                float t_atm = exp(-tau * am);
-                float warmth = saturate((am - 1.0) * 0.18);
+                float t_atm = exp(-tau * sun_am);
+                float warmth = saturate((sun_am - 1.0) * 0.30);
                 sun_rad = lerp(float3(1.00, 0.97, 0.92),
-                               float3(1.55, 0.55, 0.20), warmth)
+                               float3(1.55, 0.40, 0.12), warmth)
                         * (80.0 * t_atm);
             }
             float cos_theta = dot(primary_rd, -sun_dir);
@@ -1495,12 +1514,25 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         float dens = cloud_density_at(sp, clouds_p1,
                                                       clouds_p2, clouds_p3, 6);
                         if (dens <= 0.0) continue;
-                        // Direct sun (single-scatter NEE).
+                        // Direct sun (single-scatter NEE). Scale
+                        // sun_rad by altitude-dependent atmospheric
+                        // attenuation: high clouds (cirrus at 8km)
+                        // sit ABOVE most of the absorbing atmosphere
+                        // and catch much brighter / less-reddened
+                        // light than the ground does. Approximation:
+                        // boost = exp(tau * sun_am * (h / H_atm))
+                        // where H_atm ~ 8km is the atmospheric scale
+                        // height. For ground-level cumulus the factor
+                        // is ~1.05; for cirrus at 8km it's ~5x.
                         if (sun_elev > 0.0) {
+                            float h_alt   = max(sp.y, 0.0);
+                            float h_norm  = saturate(h_alt / 8000.0);
+                            float boost   = exp(0.30 * sun_am * h_norm);
+                            float3 sun_at = sun_rad * boost;
                             float3 sun_jit = sampleSunDisc(sun_dir, seed);
                             float3 trans_sun = transmittance(sp, sun_jit, 1e30);
                             if (any(trans_sun > float3(0.0))) {
-                                v_color_c += sun_rad * trans_sun * phase
+                                v_color_c += sun_at * trans_sun * phase
                                            * dens * dtc * trans_eye_c;
                             }
                         }
@@ -1535,7 +1567,13 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                     float3 m_col   = lerp(float3(0.92, 0.94, 1.00),
                                                           float3(1.20, 0.65, 0.40),
                                                           m_warmth);
-                                    float3 moon_rad = m_col * (0.8 * phase_b * m_atm);
+                                    // 0.3x of sun (was 0.8) -- night feels
+                                // genuinely dim. Auto-exposure still
+                                // amplifies for visibility, but the
+                                // ground / clouds stay readably night
+                                // (~1/3 of daylight luminance) instead
+                                // of looking like a slightly cool day.
+                                float3 moon_rad = m_col * (0.3 * phase_b * m_atm);
                                     v_color_c += moon_rad * trans_moon * phase_m
                                                * dens * dtc * trans_eye_c;
                                 }
