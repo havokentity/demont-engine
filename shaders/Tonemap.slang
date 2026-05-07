@@ -167,12 +167,52 @@ void main(uint3 tid : SV_DispatchThreadID) {
         // independently so chromatic dispersion (different scale per
         // wavelength, derived from glass Abbe numbers) shows up as a
         // rainbow fringe along ghost edges. No bloom sampling.
+        //
+        // Three physical effects layered on top:
+        //   - sun-visibility gate from sampling hdr_in at sun_uv (so
+        //     the flare disappears when the sun is below the horizon
+        //     or occluded by scene geometry -- no explicit night-time
+        //     gate needed)
+        //   - hexagonal ghost silhouettes from approximating the
+        //     aperture stop's blade shape (real lenses have blade
+        //     count = 5..8; we hardcode 6)
+        //   - procedural aperture diffraction starburst at the sun
+        //     itself (Fraunhofer pattern of a 6-blade aperture is a
+        //     6-pointed star)
         if (flare_mode_physical != 0u && physical_ghost_count > 0u) {
             // Skip when sun is off-screen / behind camera (sentinel uv).
             if (sun_uv.x > -1.0 && sun_uv.x < 2.0 &&
                 sun_uv.y > -1.0 && sun_uv.y < 2.0) {
                 float2 dimf = float2(dim);
                 float2 sun_c = sun_uv - 0.5;
+
+                // Sun-visibility gate. Sample hdr_in around sun_uv with
+                // a 3x3 max so we don't miss bright sub-pixel sources.
+                // The path tracer's sky integrator writes night-sky
+                // luminance (~0.001) when the sun is below the horizon
+                // and writes building/terrain luminance when occluded;
+                // both naturally collapse the gate.
+                float sun_lum = 0.0;
+                if (sun_uv.x >= 0.0 && sun_uv.x <= 1.0 &&
+                    sun_uv.y >= 0.0 && sun_uv.y <= 1.0) {
+                    int2 sc = int2(sun_uv * dimf);
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        for (int dx = -1; dx <= 1; ++dx) {
+                            int2 p = clamp(sc + int2(dx, dy),
+                                           int2(0, 0), int2(dim) - int2(1, 1));
+                            float3 s = hdr_in[uint2(p)].rgb;
+                            float lm = dot(s, float3(0.2126, 0.7152, 0.0722));
+                            sun_lum = max(sun_lum, lm);
+                        }
+                    }
+                }
+                // Higher-order Reinhard centred on sun_lum = 5 (between
+                // a bright wall ~1 and the un-occluded sun ~50). Smooth
+                // transition: ~0 below threshold, ~1 above.
+                float L = sun_lum / 5.0;
+                L = L * L; L = L * L; L = L * L; L = L * L;   // ^16
+                float vis = L / (L + 1.0);
+
                 // Cap by both the engine-side ghost count and the user-
                 // controlled r_lens_flare_count slider so the slider
                 // still works in physical mode.
@@ -195,10 +235,26 @@ void main(uint3 tid : SV_DispatchThreadID) {
                     float2 d_R = (uv - c_R) * dimf;
                     float2 d_G = (uv - c_G) * dimf;
                     float2 d_B = (uv - c_B) * dimf;
+                    // Hexagonal aperture: warp distance by the boundary
+                    // distance of a regular hexagon at the ray angle.
+                    // For a hex with circumradius r, boundary at angle
+                    // theta is r * cos(30deg) / cos((theta mod 60deg) -
+                    // 30deg). We divide d by hex_factor so the splat
+                    // falls off faster along the flat edges of the
+                    // hexagon, giving a 6-pointed silhouette.
+                    const float kPi3 = 1.0471975512;   // 60deg
+                    const float kPi6 = 0.5235987756;   // 30deg
+                    const float kCos30 = 0.8660254038;
+                    float a_R = atan2(d_R.y, d_R.x);
+                    float a_G = atan2(d_G.y, d_G.x);
+                    float a_B = atan2(d_B.y, d_B.x);
+                    float h_R = kCos30 / cos((a_R - floor(a_R / kPi3) * kPi3) - kPi6);
+                    float h_G = kCos30 / cos((a_G - floor(a_G / kPi3) * kPi3) - kPi6);
+                    float h_B = kCos30 / cos((a_B - floor(a_B / kPi3) * kPi3) - kPi6);
                     float r2  = max(r_px * r_px, 1e-6);
-                    float qR = dot(d_R, d_R) / r2;
-                    float qG = dot(d_G, d_G) / r2;
-                    float qB = dot(d_B, d_B) / r2;
+                    float qR = dot(d_R, d_R) / (r2 * h_R * h_R);
+                    float qG = dot(d_G, d_G) / (r2 * h_G * h_G);
+                    float qB = dot(d_B, d_B) / (r2 * h_B * h_B);
                     // Super-Gaussian for a clean disc edge.
                     float iR = exp(-qR * qR);
                     float iG = exp(-qG * qG);
@@ -208,12 +264,36 @@ void main(uint3 tid : SV_DispatchThreadID) {
                     // are visible at typical r_lens_flare_intensity.
                     flare += float3(iR, iG, iB) * (gi_int * 4.0);
                 }
+
+                // Aperture diffraction starburst: 6-pointed star at the
+                // sun position. Real Fraunhofer diffraction of a
+                // hexagonal aperture has 2*N_blades = 12 spikes for a
+                // 6-blade iris (because each blade's edge contributes
+                // two opposite spikes), but visually 6 dominate -- we
+                // get those by using cos(N*theta/2). The pattern fades
+                // exponentially with distance from the sun.
+                if (sun_uv.x >= 0.0 && sun_uv.x <= 1.0 &&
+                    sun_uv.y >= 0.0 && sun_uv.y <= 1.0) {
+                    float2 d_sun  = (uv - sun_uv) * dimf;
+                    float dist_s  = length(d_sun);
+                    float ang_s   = atan2(d_sun.y, d_sun.x);
+                    // 6 spikes (cos(3*theta) is 6-fold symmetric).
+                    float spike   = pow(abs(cos(3.0 * ang_s)), 12.0);
+                    float fall    = exp(-dist_s / (0.10 * dimf.y));
+                    // Slight blue tint: Rayleigh-scattered diffraction
+                    // is wavelength dependent, blue dominates short-r
+                    // and fades faster than red at longer distances.
+                    float3 starburst = float3(0.95, 0.97, 1.05)
+                                     * spike * fall * 1.8;
+                    flare += starburst;
+                }
+
                 // Radial fade so ghosts wash off at the screen edges.
                 // Diagonal-normalised pixel distance from centre, with
                 // a 1.2 multiplier to fade slightly inside the corners.
                 float diag = 0.5 * length(dimf);
                 float fade = saturate(1.0 - length(cv * dimf) / diag * 1.2);
-                c += flare_intensity * flare * fade;
+                c += flare_intensity * flare * fade * vis;
             }
             float3 ldr_phys = (passthrough != 0u) ? c : acesTonemap(c * exposure);
             ldr_out[tid.xy] = float4(ldr_phys, 1.0);
