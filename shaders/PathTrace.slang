@@ -919,8 +919,13 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // Beer's law transmittance accumulates as we walk away from
         // the camera. Per-pixel jitter on the march start breaks
         // banding from regular sampling.
-        if (vol_params.x > 0.0 && primary_t_recorded) {
-            float  sigma_t   = vol_params.x;     // extinction = scattering for haze
+        // Clouds ride the same march; if either haze or clouds is on,
+        // the march runs. sigma_t base is just the haze coefficient
+        // (clouds add their density per-step).
+        bool march_enabled = (vol_params.x > 0.0 || clouds_p1.w > 0.0)
+                          && primary_t_recorded;
+        if (march_enabled) {
+            float  sigma_t   = vol_params.x;     // haze extinction (0 = clouds-only)
             float  g         = vol_params.y;
             float  vol_int   = vol_params.z;
             int    N         = max(1, int(vol_params.w));

@@ -2,6 +2,10 @@
 
 [![Build](https://github.com/havokentity/demont-engine/actions/workflows/build.yml/badge.svg)](https://github.com/havokentity/demont-engine/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![C++23](https://img.shields.io/badge/C%2B%2B-23-00599C?logo=cplusplus&logoColor=white)](https://en.cppreference.com/w/cpp/23)
+[![Shaders: Slang](https://img.shields.io/badge/shaders-Slang-2D75A0)](https://shader-slang.org/)
+[![Metal 4](https://img.shields.io/badge/Metal-4-000000?logo=apple&logoColor=white)](https://developer.apple.com/metal/)
+[![Vulkan](https://img.shields.io/badge/Vulkan-1.3-AC162C?logo=vulkan&logoColor=white)](https://vulkan.org/)
 
 > **Note on CI coverage:** CI runs on `macos-26` so the full MetalFX
 > `TemporalDenoisedScaler` path is built and exercised. The shim is

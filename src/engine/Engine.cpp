@@ -150,17 +150,17 @@ namespace cvar {
     // weather looks; the per-day seed (`r_clouds_seed`) shifts the
     // noise hash so the same preset can produce visually distinct
     // patterns each day.
-    PT_CVAR(r_clouds,                "0",        "Volumetric clouds on top of the homogeneous haze. 0 disables (haze stays). Requires r_volumetric to be on -- the cloud field rides the same ray march.", CVAR_ARCHIVE);
-    PT_CVAR(r_clouds_preset,         "cumulus",  "Cloud preset name. One of clear|cumulus|stratus|cirrus|overcast|storm. Setting this snaps r_clouds_coverage / _base / _top / _density / _detail to canonical values for that weather.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds,                "0",        "Volumetric clouds. Activates the volumetric march even if r_volumetric is off (the march just samples cloud density without homogeneous haze in that case). Camera primary rays must traverse the cloud altitude band to see anything -- check r_clouds_base_height and r_clouds_top_height vs your scene scale.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_preset,         "cumulus",  "Cloud preset name. One of clear|cumulus|stratus|cirrus|overcast|storm|custom. Setting this snaps r_clouds_coverage / _base / _top / _density / _freq / _detail to canonical values; 'custom' leaves them alone for manual tuning.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_coverage,       "0.45",     "Sky coverage fraction [0..1]. 0 = clear, 1 = full overcast. Subtracted from the noise threshold so only high-noise regions become cloud.", CVAR_ARCHIVE);
-    PT_CVAR(r_clouds_base_height,    "200.0",    "World-space height (Y) of the cloud layer's bottom, in metres. Cumulus 100-300m, stratus 100-200m, cirrus 6000-12000m.", CVAR_ARCHIVE);
-    PT_CVAR(r_clouds_top_height,     "500.0",    "World-space height of the cloud layer's top. Cloud volume is base..top; outside this band density = 0.", CVAR_ARCHIVE);
-    PT_CVAR(r_clouds_density,        "12.0",     "Peak extinction at the densest interior point. Multiplied into the volumetric sigma_t so values stack with r_volumetric_density. 8-15 reads as solid cumulus, 25+ reads as storm.", CVAR_ARCHIVE);
-    PT_CVAR(r_clouds_freq,           "0.005",    "Noise frequency in cycles per world unit. 0.003 = ~330m features (slow undulating clouds), 0.01 = ~100m features (smaller puffy cumulus).", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_base_height,    "30.0",     "World-space Y of the cloud layer's bottom. Default 30 puts clouds well above a typical eye-level (y=2) scene; raise toward realistic 200m+ if your scene uses metric units and you want real-altitude clouds.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_top_height,     "80.0",     "World-space Y of the cloud layer's top. Cloud volume is base..top; outside this band density = 0.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_density,        "12.0",     "Peak extinction at the densest interior point. 8-15 reads as solid cumulus, 25+ reads as storm.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_freq,           "0.05",     "Noise frequency in cycles per world unit. Larger = smaller cloud features. Match to your scene scale: 0.005 for km-scale scenes, 0.05 for ~100-unit scenes.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_detail,         "0.35",     "High-frequency detail amount [0..1]. 0 = soft blobby clouds, 1 = wispy/eroded edges. Adds a 4x-frequency fbm subtract.", CVAR_ARCHIVE);
-    PT_CVAR(r_clouds_wind_x,         "5.0",      "Wind velocity along world X, m/s. Drifts the noise field over time so clouds appear to move with the weather.", CVAR_ARCHIVE);
-    PT_CVAR(r_clouds_wind_z,         "0.0",      "Wind velocity along world Z, m/s.", CVAR_ARCHIVE);
-    PT_CVAR(r_clouds_seed,           "0",        "Per-day noise seed (any float). Same preset + different seed = visually distinct cloud pattern. Use to give each in-game day its own weather. Try 1, 2, 3, ... or hash from a date.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_wind_x,         "0.5",      "Wind velocity along world X (units/s in the noise space). Drifts the field over time so clouds appear to move.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_wind_z,         "0.0",      "Wind velocity along world Z.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_seed,           "0",        "Per-day noise seed (any float). Same preset + different seed = visually distinct cloud pattern. Use to give each in-game day its own weather.", CVAR_ARCHIVE);
 
     PT_CVAR(dev_cheats,        "0",    "Gate for CHEAT-flagged cvars",   0);
     PT_CVAR(dev_log_level,     "info", "error|warn|info|debug",          0);
@@ -2469,14 +2469,19 @@ void Engine::RegisterCommands() {
                 float freq;
                 float detail;
             };
+            // Heights are scaled to a typical engine scene (camera at
+            // y=2, world extent ~50). For metric scenes (1 unit = 1m,
+            // realistic city/landscape) multiply each by 10x manually
+            // and bump freq down 10x to keep the same proportional
+            // feature count.
             static const CloudPreset presets[] = {
-                // name        cov   base    top    dens  freq    detail
-                { "clear",     0.0f, 200.0f, 500.0f, 0.0f,  0.005f, 0.0f  },
-                { "cumulus",   0.45f,200.0f, 500.0f, 12.0f, 0.005f, 0.35f },
-                { "stratus",   0.92f,150.0f, 280.0f, 6.0f,  0.0025f,0.15f },
-                { "cirrus",    0.30f,800.0f, 950.0f, 3.0f,  0.0035f,0.55f },
-                { "overcast",  0.98f,200.0f, 600.0f, 9.0f,  0.0035f,0.20f },
-                { "storm",     0.85f,150.0f, 1500.0f,22.0f, 0.0045f,0.45f },
+                // name        cov   base   top   dens  freq   detail
+                { "clear",     0.0f, 30.0f,  80.0f, 0.0f,  0.05f,  0.0f  },
+                { "cumulus",   0.45f,30.0f,  80.0f, 12.0f, 0.05f,  0.35f },
+                { "stratus",   0.92f,18.0f,  35.0f, 6.0f,  0.025f, 0.15f },
+                { "cirrus",    0.30f,80.0f, 100.0f, 3.0f,  0.035f, 0.55f },
+                { "overcast",  0.98f,25.0f,  70.0f, 9.0f,  0.035f, 0.20f },
+                { "storm",     0.85f,18.0f, 180.0f, 22.0f, 0.045f, 0.45f },
             };
             const std::string& name = cv.value;
             if (name == "custom") return;   // leave individual cvars alone
