@@ -1060,11 +1060,24 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                 * pow(max(1.0 + g2 - 2.0 * g * cos_theta, 1e-4), 1.5));
 
             // --- Haze march -------------------------------------------------
-            // Bounded at 5km because at typical density 0.005-0.05 the haze
-            // is fully attenuated by then; marching further wastes samples.
+            // Real atmosphere is exponential: sigma_t(h) = sigma_0 * exp(-h/H)
+            // where H is the aerosol scale height (~1.5km for haze; the
+            // troposphere's tropospheric scale height is ~8km but most of
+            // the aerosol is in the bottom ~1.5km). This gives:
+            //   - dense haze near the ground (god rays visible there)
+            //   - thinning rapidly with altitude (sky stays clear)
+            // Uniform sigma_t (the previous behaviour) over-illuminated the
+            // sky into a whitewash when r_volumetric_density was cranked up;
+            // exponential falloff naturally separates "near-ground god ray
+            // territory" from "high sky".
+            //
+            // Bounded at 8km (twice the scale height): at H=1.5km the haze
+            // contribution from beyond 8km is exp(-8/1.5) = 0.5%, so far
+            // samples don't matter.
             if (vol_params.x > 0.0) {
-                float sigma_t = vol_params.x;
-                float t_far   = min(primary_t, 5000.0);
+                float sigma_0 = vol_params.x;
+                const float kScaleHeight = 1500.0;   // metres
+                float t_far   = min(primary_t, 8000.0);
                 float dt      = t_far / float(N);
                 float jitter  = randf(seed) * dt;
                 float trans_eye = 1.0;
@@ -1073,6 +1086,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     float t = (float(vi) + 0.5) * dt + jitter;
                     if (t >= t_far) break;
                     float3 sp = primary_ro + primary_rd * t;
+                    float h = max(sp.y, 0.0);
+                    float sigma_t = sigma_0 * exp(-h / kScaleHeight);
                     if (sun_elev > 0.0) {
                         float3 sun_jit = sampleSunDisc(sun_dir, seed);
                         float3 trans_sun = transmittance(sp, sun_jit, 1e30);
