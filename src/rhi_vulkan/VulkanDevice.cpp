@@ -412,6 +412,74 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     bool has_robustness2      = DeviceSupportsExtension(phys_device_, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
     rt_supported_ = has_ray_query && has_accel_struct && has_deferred_host_op;
 
+    // Query feature support before enabling anything in vkCreateDevice.
+    VkPhysicalDeviceFeatures2 f2_supported{};
+    f2_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+
+    VkPhysicalDeviceVulkan12Features v12_supported{};
+    v12_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    f2_supported.pNext = &v12_supported;
+
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR as_supported{};
+    as_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+    VkPhysicalDeviceRayQueryFeaturesKHR rq_supported{};
+    rq_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+    VkPhysicalDeviceRobustness2FeaturesEXT rob2_supported{};
+    rob2_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT;
+
+    void** supported_next = &v12_supported.pNext;
+    auto chain_supported = [&](void* node, void** node_next) {
+        *supported_next = node;
+        supported_next = node_next;
+    };
+    if (rt_supported_) {
+        chain_supported(&as_supported, reinterpret_cast<void**>(&as_supported.pNext));
+        chain_supported(&rq_supported, reinterpret_cast<void**>(&rq_supported.pNext));
+    }
+    if (has_robustness2) {
+        chain_supported(&rob2_supported, reinterpret_cast<void**>(&rob2_supported.pNext));
+    }
+    vkGetPhysicalDeviceFeatures2(phys_device_, &f2_supported);
+
+    const bool supports_storage_image_rw_wo_format =
+        f2_supported.features.shaderStorageImageReadWithoutFormat == VK_TRUE &&
+        f2_supported.features.shaderStorageImageWriteWithoutFormat == VK_TRUE;
+    const bool supports_uab_storage_image =
+        v12_supported.descriptorBindingStorageImageUpdateAfterBind == VK_TRUE;
+    const bool supports_uab_storage_buffer =
+        v12_supported.descriptorBindingStorageBufferUpdateAfterBind == VK_TRUE;
+    const bool supports_uab_uniform_buffer =
+        v12_supported.descriptorBindingUniformBufferUpdateAfterBind == VK_TRUE;
+    const bool supports_update_after_bind =
+        supports_uab_storage_image && supports_uab_storage_buffer && supports_uab_uniform_buffer;
+    const bool supports_buffer_device_address = v12_supported.bufferDeviceAddress == VK_TRUE;
+    const bool supports_null_descriptor = has_robustness2 && (rob2_supported.nullDescriptor == VK_TRUE);
+
+    if (!supports_storage_image_rw_wo_format) {
+        LOG_ERROR("Vulkan: missing shaderStorageImageRead/WriteWithoutFormat feature");
+        return;
+    }
+    if (!supports_update_after_bind) {
+        LOG_ERROR("Vulkan: UPDATE_AFTER_BIND features are required for shared descriptor-set dispatch");
+        return;
+    }
+    if (!supports_null_descriptor) {
+        LOG_ERROR("Vulkan: VK_EXT_robustness2 nullDescriptor is required by Vulkan descriptor binding strategy");
+        return;
+    }
+
+    if (rt_supported_) {
+        const bool supports_rt_features =
+            supports_buffer_device_address &&
+            as_supported.accelerationStructure == VK_TRUE &&
+            as_supported.descriptorBindingAccelerationStructureUpdateAfterBind == VK_TRUE &&
+            rq_supported.rayQuery == VK_TRUE;
+        if (!supports_rt_features) {
+            LOG_WARN("Vulkan: RT extensions present but required RT features are missing; disabling hardware RT");
+            rt_supported_ = false;
+        }
+    }
+
     float qprio = 1.0f;
     VkDeviceQueueCreateInfo qci{};
     qci.sType            = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -429,7 +497,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         dexts.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
         dexts.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
     }
-    if (has_robustness2) {
+    if (supports_null_descriptor) {
         dexts.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
     }
 
@@ -438,20 +506,21 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // doesn't matter.
     VkPhysicalDeviceFeatures2 f2{};
     f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-    f2.features.shaderStorageImageReadWithoutFormat  = VK_TRUE;
-    f2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+    f2.features.shaderStorageImageReadWithoutFormat  = supports_storage_image_rw_wo_format ? VK_TRUE : VK_FALSE;
+    f2.features.shaderStorageImageWriteWithoutFormat = supports_storage_image_rw_wo_format ? VK_TRUE : VK_FALSE;
 
     VkPhysicalDeviceVulkan12Features v12{};
     v12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-    v12.bufferDeviceAddress = VK_TRUE;  // required by accel-struct
+    v12.bufferDeviceAddress = (rt_supported_ && supports_buffer_device_address) ? VK_TRUE : VK_FALSE;
     // UPDATE_AFTER_BIND for the shared descriptor set: lets us record
     // multiple Dispatch calls in one cmd buffer (path-trace then auto-
     // expose then bloom etc.) where each rewrites the descriptor set
     // with different bindings -- without invalidating earlier draws.
-    v12.descriptorBindingStorageImageUpdateAfterBind  = VK_TRUE;
-    v12.descriptorBindingStorageBufferUpdateAfterBind = VK_TRUE;
-    v12.descriptorBindingUniformBufferUpdateAfterBind = VK_TRUE;
-    v12.descriptorBindingPartiallyBound               = VK_TRUE;
+    v12.descriptorBindingStorageImageUpdateAfterBind  = supports_uab_storage_image ? VK_TRUE : VK_FALSE;
+    v12.descriptorBindingStorageBufferUpdateAfterBind = supports_uab_storage_buffer ? VK_TRUE : VK_FALSE;
+    v12.descriptorBindingUniformBufferUpdateAfterBind = supports_uab_uniform_buffer ? VK_TRUE : VK_FALSE;
+    v12.descriptorBindingPartiallyBound               =
+        (v12_supported.descriptorBindingPartiallyBound == VK_TRUE) ? VK_TRUE : VK_FALSE;
 
     VkPhysicalDeviceVulkan13Features v13{};
     v13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
@@ -480,7 +549,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         chain(&as_feat, reinterpret_cast<void**>(&as_feat.pNext));
         chain(&rq_feat, reinterpret_cast<void**>(&rq_feat.pNext));
     }
-    if (has_robustness2) {
+    if (supports_null_descriptor) {
         chain(&rob2_feat, reinterpret_cast<void**>(&rob2_feat.pNext));
     }
 
