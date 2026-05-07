@@ -101,7 +101,7 @@ Requires:
 
 ```pwsh
 cmake --preset win-debug
-cmake --build build --preset win-debug
+cmake --build --preset win-debug
 .\build\win-debug\src\app\demont.exe
 ```
 
