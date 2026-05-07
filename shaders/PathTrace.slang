@@ -577,7 +577,11 @@ float3 moonDisc(float3 rd, float4 mph, float3 sun_dir_world) {
     if (mph.y < -0.10) return float3(0.0);
     float3 m_dir = mph.xyz;
     float ang = dot(rd, m_dir);
-    const float kCosR    = 0.99998918;   // cos(0.27 deg) -- disc edge
+    // Real lunar angular radius is 0.27 deg, but at typical 60deg-FOV
+    // 1080p that's only ~9 px wide -- correct but tiny. Boosting to
+    // 0.55 deg (~2x real) keeps it close to physical and reads better
+    // on screen, matching what film + game engines typically do.
+    const float kCosR    = 0.99995;      // cos(0.55 deg) -- disc edge
     const float kCosHalo = 0.99965;      // cos(1.5 deg)  -- halo extent
     if (ang <= kCosHalo) return float3(0.0);
 
@@ -604,16 +608,23 @@ float3 moonDisc(float3 rd, float4 mph, float3 sun_dir_world) {
         float3 ax = abs(m_dir.y) < 0.99 ? float3(0, 1, 0) : float3(1, 0, 0);
         float3 t_a = normalize(cross(ax, m_dir));
         float3 t_b = cross(m_dir, t_a);
-        float du = dot(rd, t_a) * 215.0;     // ~1/sin(0.27deg) on unit disc
-        float dv = dot(rd, t_b) * 215.0;
+        // Scale factor 1/sin(disc half-angle) to map disc-tangent
+        // projection to [-1, 1] across the visible diameter.
+        float du = dot(rd, t_a) * 104.0;     // 1/sin(0.55deg)
+        float dv = dot(rd, t_b) * 104.0;
         float r2 = du * du + dv * dv;
         float zz = sqrt(max(1.0 - r2, 0.0));
 
         // Outward surface normal in WORLD frame for this visible point.
-        // Used both for terminator (compare to sun) and as the moon-
-        // texture lookup vector (the moon is tidally locked, so the
-        // visible hemisphere's UV maps from the local frame).
-        float3 n_world = du * t_a + dv * t_b + zz * m_dir;
+        // The visible hemisphere of a sphere at distance D in direction
+        // m_dir, viewed from origin, has surface normals pointing back
+        // TOWARD the observer (i.e. the -m_dir half), with tangential
+        // offsets parameterised by (du, dv). At the disc centre the
+        // normal is -m_dir (closest point); at the limb it lies in the
+        // tangent plane. Previous + sign on the m_dir term picked the
+        // far hemisphere -- caused the terminator to invert and full
+        // moon to read as fully unlit.
+        float3 n_world = du * t_a + dv * t_b - zz * m_dir;
 
         // Terminator: lit-fraction at this surface point. Smooth
         // transition over a few percent for an aliasing-free edge.
