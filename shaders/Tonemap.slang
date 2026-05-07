@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Rajesh D'Monte
 // Post-denoise tonemap.
 //
 // Reads a per-pixel linear HDR colour (the MetalFX output, RGBA16F)

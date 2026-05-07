@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Rajesh D'Monte
 # Apply orthodox-C++23 compile/link flags to a single target.
 # Per principles doc §08: -fno-exceptions, -fno-rtti, hard warnings.
 # ASan is opt-in via PT_ENABLE_SANITIZERS (mimalloc + ASan needs MI_TRACK_ASAN).

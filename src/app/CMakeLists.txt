@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Rajesh D'Monte
 # --- Window library (separate from the executable so engine can link it) ---
 add_library(pt_app_window STATIC
     Window.cpp

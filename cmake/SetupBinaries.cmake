@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Rajesh D'Monte
 # Auto-downloads the binary toolchain bits that don't fit in FetchContent
 # (slangc is a binary release; Apple's metal-cpp is a single zip on the
 # developer site).  Both extract into third_party/, gitignored, populated

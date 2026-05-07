@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Rajesh D'Monte
 // Compute kernel that fills the bound storage texture with a uniform colour.
 // Bound at runtime to slot 0 (texture) and a 16-byte push-constant buffer at
 // slot 0 (color). Used by the Metal/Vulkan backends as the P3 smoke test.

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Rajesh D'Monte
 add_subdirectory(core)
 add_subdirectory(console)
 add_subdirectory(rhi_software)

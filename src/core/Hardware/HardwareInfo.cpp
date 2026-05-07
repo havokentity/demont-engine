@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Rajesh D'Monte
 #include "HardwareInfo.h"
 #include "../Log.h"
 

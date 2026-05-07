@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Rajesh D'Monte
 // macOS-only bridge from GLFWwindow* to NSWindow*. Kept in a separate .mm
 // translation unit so the rest of the app can compile as plain C++.
 

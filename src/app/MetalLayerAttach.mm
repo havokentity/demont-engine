@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Rajesh D'Monte
 // AppKit bridge for attaching a CAMetalLayer to a GLFW NSWindow's content
 // view. Lives in pt_app_window so any backend (software, metal, vulkan)
 // can use the same helper without each pulling its own .mm.

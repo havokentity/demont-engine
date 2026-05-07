@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Rajesh D'Monte
 // Native console overlay implementation. AppKit + CoreText.
 //
 // Architectural note: the panel lives in its own borderless transparent

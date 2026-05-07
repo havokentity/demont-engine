@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Rajesh D'Monte
 # Third-party dependencies via FetchContent.
 # Pin versions; use SYSTEM to suppress warnings from foreign headers.
 

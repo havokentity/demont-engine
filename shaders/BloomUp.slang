@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Rajesh D'Monte
 // Bloom upsample (additive, bilinear).
 //
 // Reads `src` (the smaller mip) and adds a smoothly-resampled copy

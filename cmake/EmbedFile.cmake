@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Rajesh D'Monte
 # Helper invoked by add_custom_command. Reads ${INPUT}, writes a C++ source
 # at ${OUTPUT} exposing two extern symbols:
 #   const unsigned char ${SYMBOL}_data[];

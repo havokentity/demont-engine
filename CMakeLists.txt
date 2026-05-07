@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Rajesh D'Monte
 cmake_minimum_required(VERSION 3.27)
 
 # Several FetchContent deps (enkiTS, civetweb) ship CMakeLists pinned to

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Rajesh D'Monte
 # pt_compile_slang(TARGET <tgt>
 #                  SOURCE <file.slang>
 #                  STAGE  <compute|vertex|fragment>   default: compute

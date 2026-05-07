@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Rajesh D'Monte
 # pt_embed_resource(target SYMBOL symbol_name FILE relative_path)
 # Generates an auto-built .cpp containing the file's bytes and adds it to
 # the target. Two extern symbols become available at link time:

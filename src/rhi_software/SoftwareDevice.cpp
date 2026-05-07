@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Rajesh D'Monte
 // Software backend: CPU work (currently just stash-clear-color), then
 // present via a Metal render pass with loadAction=Clear. No OpenGL
 // anywhere -- we share the Metal layer attachment with the metal backend.

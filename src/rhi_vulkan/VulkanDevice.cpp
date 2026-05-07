@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Rajesh D'Monte
 // Vulkan backend.  Single-file impl (~600 LOC) covering instance creation,
 // swapchain, one compute pipeline ("clear"), per-frame descriptor sets,
 // and the command-buffer wrapper.  No VMA yet -- we don't allocate any

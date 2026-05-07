@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Rajesh D'Monte
 // Unified path tracer.
 //
 // One kernel renders everything: a dynamic list of analytic primitives

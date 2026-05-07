@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Rajesh D'Monte
 // Thin C wrapper around MTLFXTemporalDenoisedScaler. metal-cpp doesn't
 // bridge MetalFX, so this is a tiny ObjC++ TU that the C++ code calls
 // through extern "C". Same pattern as MetalLayerAttach.mm.

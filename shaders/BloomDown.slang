@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Rajesh D'Monte
 // Bloom downsample (Jorge Jimenez ACM 2014 13-tap kernel).
 //
 // 13 bilinear samples in three groups:

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Rajesh D'Monte
 #pragma once
 
 // Yale Bright Star Catalog (BSC5) loader + J2000 equirectangular

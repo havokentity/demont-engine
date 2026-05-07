@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Rajesh D'Monte
 // metal-cpp single-implementation TU. The PRIVATE_IMPLEMENTATION defines
 // must appear in exactly one source file across the whole project.
 #define NS_PRIVATE_IMPLEMENTATION

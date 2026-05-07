@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Rajesh D'Monte
 // DeMonT PathTracer console UI -- vanilla JS, no build step.
 (function () {
   const out        = document.getElementById('output');

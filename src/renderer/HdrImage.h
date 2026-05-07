@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Rajesh D'Monte
 #pragma once
 
 // Radiance .hdr (RGBE) image loader. Single-purpose: enough to support

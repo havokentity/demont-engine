@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Rajesh D'Monte
 #include "core/Jobs/JobSystem.h"
 #include "core/Log.h"
 #include "core/Memory/Memory.h"

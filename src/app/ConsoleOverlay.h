@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Rajesh D'Monte
 #pragma once
 
 // Native macOS console overlay.  Implemented as an NSView subclass that

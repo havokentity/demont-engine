@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Rajesh D'Monte
 // P5-early: analytic intersection of a small hardcoded scene.
 //   * 3 spheres (red / green / blue) sitting on a grey ground plane
 //   * single directional light + ambient
