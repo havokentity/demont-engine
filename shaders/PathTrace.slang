@@ -48,6 +48,11 @@
 // this texture additively when the sun is below the horizon.
 [[vk::binding(12, 0)]] RWTexture2D<float4> star_map;
 
+// Procedural moon surface texture, equirectangular RGBA16F generated
+// once at engine init by pt::moon::generateMoonTexture. Sampled in
+// moonDisc() to give the disc real mare + crater detail.
+[[vk::binding(13, 0)]] RWTexture2D<float4> moon_map;
+
 [[vk::push_constant]]
 cbuffer Push {
     float4 pos_fovtan;
@@ -555,17 +560,20 @@ float3 procSky(float3 rd, float3 sun) {
 }
 
 // Moon disc + halo. Real lunar angular radius is 0.00465 rad (~0.27deg
-// half-angle = 0.54deg full). Brightness shading:
-//   - phase: 0.5*(1 - cos(phase)) maps new->0, full->1, half->0.5
-//   - limb darkening: edge of disc dimmer than centre (real lunar effect)
-//   - atmospheric attenuation: dims with airmass when moon is near horizon
-//     (same physics as sun reddening at sunset)
-//   - procedural surface noise: faint cratered look so the disc isn't
-//     a flat-shaded circle. Anchored to a moon-local frame so the
-//     "craters" stay put as the camera turns rather than swimming.
-//   - subtle outer halo: light scatters off cirrus + atmosphere around
-//     the moon (real "moon halo"), reading as a soft ring out to ~1.5deg.
-float3 moonDisc(float3 rd, float4 mph) {
+// half-angle = 0.54deg full).
+//   - terminator: per-pixel lit/unlit check via dot(surface_normal,
+//     sun_dir). Replaces the previous flat phase-brightness scalar so
+//     half-moon shows a curved terminator splitting the disc instead
+//     of dimming the whole thing uniformly. New moon -> all unlit.
+//   - moon_map texture: real surface (mare + crater) sampled in the
+//     moon's tangent frame. Tidally locked, so tangent UV maps
+//     directly to near-side surface coordinates.
+//   - limb darkening: edge of disc dimmer than centre.
+//   - atmospheric attenuation: same model as sun_rad (dims with airmass
+//     when moon is near horizon, warms toward red).
+//   - subtle halo: soft ring extending to ~1.5deg, simulating
+//     atmospheric scattering around the moon.
+float3 moonDisc(float3 rd, float4 mph, float3 sun_dir_world) {
     if (mph.y < -0.10) return float3(0.0);
     float3 m_dir = mph.xyz;
     float ang = dot(rd, m_dir);
@@ -573,16 +581,16 @@ float3 moonDisc(float3 rd, float4 mph) {
     const float kCosHalo = 0.99965;      // cos(1.5 deg)  -- halo extent
     if (ang <= kCosHalo) return float3(0.0);
 
-    float phase  = mph.w;
-    float bright = 0.5 * (1.0 - cos(phase));
-    float3 col   = float3(0.92, 0.94, 1.00);
+    float3 col_tint = float3(0.92, 0.94, 1.00);
 
-    // Atmospheric attenuation. air_mass = 1/sin(elev), capped to handle
-    // near-horizon edge cases. Same model as sun_rad uses.
-    float moon_am  = 1.0 / max(mph.y, 0.04);
-    float moon_atm = exp(-0.30 * moon_am);
+    // Atmospheric attenuation matching sun_rad.
+    float moon_am   = 1.0 / max(mph.y, 0.04);
+    float moon_atm  = exp(-0.30 * moon_am);
+    float warmth_m  = saturate((moon_am - 1.0) * 0.18);
+    float3 col_atm  = lerp(float3(1.00, 1.00, 1.00),
+                           float3(1.20, 0.65, 0.40), warmth_m);
 
-    // Halo ring (extends beyond the disc).
+    // Halo ring extends beyond the disc.
     float halo = 0.0;
     if (ang > kCosHalo) {
         float t_h = (ang - kCosHalo) / (1.0 - kCosHalo);
@@ -591,25 +599,65 @@ float3 moonDisc(float3 rd, float4 mph) {
 
     if (ang > kCosR) {
         float t_d = (ang - kCosR) / (1.0 - kCosR);
-        // Build a tangent frame around the moon and project the view
-        // ray into (u, v) on the disc. Sampled noise becomes the
-        // cratered surface texture that's static relative to the
-        // moon's apparent direction.
+        // Tangent frame around the moon. (du, dv) project the view ray
+        // onto the disc plane in moon-local coords.
         float3 ax = abs(m_dir.y) < 0.99 ? float3(0, 1, 0) : float3(1, 0, 0);
         float3 t_a = normalize(cross(ax, m_dir));
         float3 t_b = cross(m_dir, t_a);
-        float du = dot(rd, t_a) * 215.0;     // ~1/sin(0.27deg) for unit disc
+        float du = dot(rd, t_a) * 215.0;     // ~1/sin(0.27deg) on unit disc
         float dv = dot(rd, t_b) * 215.0;
-        // Two octaves of value noise for "mare + crater" detail.
-        float n_lo = cloud_value_noise(float3(du * 0.6, dv * 0.6, 0.0));
-        float n_hi = cloud_value_noise(float3(du * 2.2, dv * 2.2, 7.7));
-        float surface = 0.70 + 0.30 * (0.65 * n_lo + 0.35 * n_hi);
+        float r2 = du * du + dv * dv;
+        float zz = sqrt(max(1.0 - r2, 0.0));
+
+        // Outward surface normal in WORLD frame for this visible point.
+        // Used both for terminator (compare to sun) and as the moon-
+        // texture lookup vector (the moon is tidally locked, so the
+        // visible hemisphere's UV maps from the local frame).
+        float3 n_world = du * t_a + dv * t_b + zz * m_dir;
+
+        // Terminator: lit-fraction at this surface point. Smooth
+        // transition over a few percent for an aliasing-free edge.
+        float lit = saturate(dot(n_world, sun_dir_world) * 10.0 + 0.05);
+        if (lit <= 0.0) return col_tint * col_atm * halo * moon_atm * 0.05;
+
+        // Sample the procedural moon map. Equirectangular UV from
+        // local (du, dv, zz). Latitude from dv (north/south of moon
+        // equator); longitude from du / zz (east/west of moon center).
+        const float kHalfPi = 1.57079632679;
+        float lon = atan2(du, zz);                              // [-pi/2, pi/2]
+        float lat = asin(clamp(dv, -1.0, 1.0));                 // [-pi/2, pi/2]
+        // Moon texture is full sphere (2pi wide, pi tall); near side
+        // maps to roughly the centre half. u in [0.25, 0.75] keeps
+        // texture variation across the visible disc.
+        float u_tex = 0.5 + lon / 6.28318530718;
+        float v_tex = 0.5 - lat / 3.14159265358979;
+        u_tex = saturate(u_tex);
+        v_tex = saturate(v_tex);
+        uint2 mdim;
+        moon_map.GetDimensions(mdim.x, mdim.y);
+        float2 fpix = float2(u_tex * float(mdim.x), v_tex * float(mdim.y)) - 0.5;
+        int2 ipix = int2(floor(fpix));
+        float2 f = fpix - float2(ipix);
+        int x0 = clamp(ipix.x,     0, int(mdim.x) - 1);
+        int x1 = clamp(ipix.x + 1, 0, int(mdim.x) - 1);
+        int y0 = clamp(ipix.y,     0, int(mdim.y) - 1);
+        int y1 = clamp(ipix.y + 1, 0, int(mdim.y) - 1);
+        float3 c00 = moon_map[uint2(x0, y0)].rgb;
+        float3 c10 = moon_map[uint2(x1, y0)].rgb;
+        float3 c01 = moon_map[uint2(x0, y1)].rgb;
+        float3 c11 = moon_map[uint2(x1, y1)].rgb;
+        float3 surface = lerp(lerp(c00, c10, f.x), lerp(c01, c11, f.x), f.y);
+
         // Limb darkening (real lunar limb is darker due to roughness).
         float limb = 0.55 + 0.45 * sqrt(saturate(t_d));
-        return col * (10.0 * bright * limb * surface * moon_atm)
-             + col *  halo * bright * moon_atm * 0.3;
+
+        return col_tint * col_atm * surface * (12.0 * lit * limb * moon_atm)
+             + col_tint * col_atm * halo * lit * moon_atm * 0.3;
     }
-    return col * halo * bright * moon_atm * 0.3;
+    // Halo only -- no surface here. Halo dims toward new-moon by the
+    // average disc lit fraction, approximated by phase brightness.
+    float phase_b = 0.5 * (1.0 - cos(mph.w));
+    return col_tint * col_atm * halo * phase_b * moon_atm * 0.3;
 }
 
 float3 skyColor(float3 rd) {
@@ -625,7 +673,7 @@ float3 skyColor(float3 rd) {
         base = lerp(float3(0.50, 0.55, 0.62), float3(1.0, 1.0, 1.0), t);
     }
     if (mode == 2u) {
-        return base + moonDisc(rd, moon_dir_phase);
+        return base + moonDisc(rd, moon_dir_phase, sun_and_mode.xyz);
     }
     if (env_map_present != 0u) {
         // Lat-long lookup: u from atan2 of horizontal plane, v from
@@ -648,9 +696,9 @@ float3 skyColor(float3 rd) {
         float3 c01 = env_map[uint2(x0, y1)].rgb;
         float3 c11 = env_map[uint2(x1, y1)].rgb;
         float3 sky = lerp(lerp(c00, c10, f.x), lerp(c01, c11, f.x), f.y);
-        return sky * env_intensity + moonDisc(rd, moon_dir_phase);
+        return sky * env_intensity + moonDisc(rd, moon_dir_phase, sun_and_mode.xyz);
     }
-    return base + moonDisc(rd, moon_dir_phase);
+    return base + moonDisc(rd, moon_dir_phase, sun_and_mode.xyz);
 }
 
 float3 acesTonemap(float3 c) {

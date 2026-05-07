@@ -94,6 +94,7 @@ private:
     // already exists). Failures are non-fatal: star_map_tex_id_ stays 0
     // and the path tracer's r_show_stars output silently drops to nothing.
     void EnsureStarMapUploaded();
+    void EnsureMoonMapUploaded();
 
     // Replace the current mesh-path resources (vertex/index buffers,
     // BLAS, TLAS) with one built from `baked`. Called from EnsureMesh*
@@ -195,6 +196,13 @@ private:
     // 0 if the load + rasterise failed (so the shader skips sampling).
     std::uint64_t                               star_map_tex_id_       = 0;
     std::uint32_t                               star_map_present_      = 0;
+
+    // Moon surface texture (procedural, generated at engine init).
+    // Equirectangular RGBA16F, 512x256. Sampled in moonDisc() when the
+    // ray hits the moon's angular footprint; combined with
+    // moon_dir_phase to give the disc actual mare + crater detail and
+    // a true terminator curve from the lit-hemisphere check.
+    std::uint64_t                               moon_map_tex_id_       = 0;
     glm::mat4                                   prev_view_proj_        { 1.0f };  // identity
     bool                                        prev_view_proj_valid_  = false;
     bool                                        denoiser_active_       = false;

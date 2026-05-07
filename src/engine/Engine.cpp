@@ -12,6 +12,7 @@
 #include "../core/Memory/Memory.h"
 #include "../renderer/Astronomy.h"
 #include "../renderer/BscCatalog.h"
+#include "../renderer/MoonTexture.h"
 #include "../renderer/Camera.h"
 #include "../renderer/Csg/CsgScene.h"
 #include "../renderer/HdrImage.h"
@@ -419,6 +420,7 @@ void Engine::TearDownDevice() {
         if (env_marginal_cdf_id_    != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{env_marginal_cdf_id_});
         if (env_conditional_cdf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{env_conditional_cdf_id_});
         if (star_map_tex_id_        != 0) device_->DestroyTexture(pt::rhi::TextureHandle{star_map_tex_id_});
+        if (moon_map_tex_id_        != 0) device_->DestroyTexture(pt::rhi::TextureHandle{moon_map_tex_id_});
     }
     scene_tlas_id_        = 0;
     box_blas_id_          = 0;
@@ -443,6 +445,7 @@ void Engine::TearDownDevice() {
     env_total_luminance_      = 0.0f;
     star_map_tex_id_      = 0;
     star_map_present_     = 0;
+    moon_map_tex_id_      = 0;
     denoiser_active_      = false;
     prev_view_proj_valid_ = false;
     primitives_dirty_     = true;        // re-upload on next device
@@ -530,6 +533,7 @@ void Engine::RequestBackendSwitch(BackendType to) {
 
     // BSC starmap: load + rasterise once on this device.
     EnsureStarMapUploaded();
+    EnsureMoonMapUploaded();
 }
 
 void Engine::SeedDefaultCsgScene() {
@@ -806,6 +810,44 @@ void Engine::ReloadEnvMap(const std::string& path) {
 
     accum_dirty_ = true;
     LOG_INFO("env_map: loaded {} ({}x{} HDR, total luminance {:.2f})", path, W, H, env_total_luminance_);
+}
+
+void Engine::EnsureMoonMapUploaded() {
+    if (!device_) return;
+    if (moon_map_tex_id_ != 0) return;
+    constexpr std::uint32_t kW = 512;
+    constexpr std::uint32_t kH = 256;
+    std::vector<float> rgba;
+    pt::moon::generateMoonTexture(int(kW), int(kH), rgba);
+    auto tex = device_->CreateTexture({
+        .width  = kW, .height = kH,
+        .format = pt::rhi::TextureFormat::RGBA16F,
+        .usage  = pt::rhi::TextureUsage::Storage,
+        .debug_name = "moon_map",
+    });
+    if (tex.id == 0) {
+        LOG_WARN("moonmap: texture create failed");
+        return;
+    }
+    // Pack to half precision (same path as the BSC starmap upload).
+    std::vector<std::uint16_t> half(rgba.size());
+    auto f32_to_f16 = [](float f) -> std::uint16_t {
+        std::uint32_t u; std::memcpy(&u, &f, sizeof(u));
+        std::uint32_t sign = (u >> 16) & 0x8000;
+        std::int32_t  exp  = static_cast<std::int32_t>((u >> 23) & 0xFF) - 127 + 15;
+        std::uint32_t mant = u & 0x7FFFFF;
+        if (exp <= 0)  return static_cast<std::uint16_t>(sign);
+        if (exp >= 31) return static_cast<std::uint16_t>(sign | 0x7C00);
+        return static_cast<std::uint16_t>(sign | (exp << 10) | (mant >> 13));
+    };
+    for (std::size_t i = 0; i < rgba.size(); ++i) half[i] = f32_to_f16(rgba[i]);
+    if (!device_->WriteTexture(tex, half.data(), half.size() * sizeof(std::uint16_t))) {
+        LOG_WARN("moonmap: texture upload failed");
+        device_->DestroyTexture(tex);
+        return;
+    }
+    moon_map_tex_id_ = tex.id;
+    LOG_INFO("moonmap: procedural lunar surface generated, {}x{} RGBA16F", kW, kH);
 }
 
 void Engine::EnsureStarMapUploaded() {
@@ -1160,6 +1202,12 @@ void Engine::RenderFrame() {
     // BSC starmap (always bind when present so the shader's binding is
     // satisfied; sampling is gated by star_map_present in the push so
     // the texture being a black 1x1 placeholder is not a problem).
+    if (moon_map_tex_id_ != 0) {
+        // Slot 13 in the shader; engine uses slot 7 in the local
+        // bind list (slot 6 was already taken by star_map). The RHI
+        // maps these to the path-tracer pipeline's binding indices.
+        cb->BindStorageTexture(7, pt::rhi::TextureHandle{moon_map_tex_id_});
+    }
     if (star_map_tex_id_ != 0) {
         cb->BindStorageTexture(6, pt::rhi::TextureHandle{star_map_tex_id_});
     }
