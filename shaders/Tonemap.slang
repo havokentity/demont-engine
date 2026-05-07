@@ -144,38 +144,33 @@ void main(uint3 tid : SV_DispatchThreadID) {
             // value means "no flare".
             if (sun_uv.x > -1.0 && sun_uv.x < 2.0 &&
                 sun_uv.y > -1.0 && sun_uv.y < 2.0) {
-                // Aspect-correct distance: normalised UV is [0,1]x[0,1]
-                // regardless of physical pixel count. A 16:9 screen
-                // has 1.78x more pixels along X than Y, so 1 unit
-                // of UV-X is geometrically *shorter* on screen than
-                // 1 unit of UV-Y. Distance in raw UV = ellipse on
-                // screen. Scale Y up by aspect so distance is in
-                // X-screen-units, giving circular discs.
-                float aspect = float(dim.x) / max(float(dim.y), 1.0);
+                // Distance in PIXEL space so ghosts read as real
+                // circles regardless of aspect ratio. UV is
+                // [0,1] x [0,1] but a 16:9 screen has 1.78x more
+                // pixels along X than Y -- using raw UV distance
+                // gave horizontally-stretched ellipses. Multiplying
+                // d_uv by float2(dim) puts both axes in pixels;
+                // r is then a pixel radius derived from flare_size
+                // (which is fraction-of-screen-height, the more
+                // intuitive author-time scale).
+                float2 dimf = float2(dim);
+                float r_h = flare_size * float(dim.y);   // in pixels
                 for (uint gi = 0u; gi < n; ++gi) {
                     float scale = kScales[gi];
                     // Ghost centre = mirror sun across screen centre,
                     // scaled. scale=1 places it exactly opposite the
                     // sun; <1 closer to centre; >1 past centre.
                     float2 ghost_c = 0.5 - (sun_uv - 0.5) * scale;
-                    float2 d_uv = uv - ghost_c;
-                    // Stretch Y by aspect -> the metric is now in
-                    // "X-equivalents" so a unit-radius circle in
-                    // (d_uv.x, d_uv.y * aspect) is a real circle
-                    // on screen.
-                    float2 d = float2(d_uv.x, d_uv.y * aspect);
-                    // Slight per-ghost size variation. flare_size is
-                    // measured in UV-X units (which == screen-X
-                    // fraction since UV-X already spans the full
-                    // physical width).
-                    float r = flare_size * (0.7 + 0.3 * scale);
-                    // Chromatic aberration: each channel gets a
-                    // slightly different radius -> coloured fringe
-                    // on disc edges.
+                    float2 d_px = (uv - ghost_c) * dimf;
+                    // Slight per-ghost size variation. Far-side
+                    // ghosts a touch larger than near-side.
+                    float r = r_h * (0.7 + 0.3 * scale);
+                    // Chromatic aberration: per-channel radius
+                    // offset gives the rainbow fringe on edges.
                     float r_R = r * (1.0 + flare_dispersion * 8.0);
                     float r_G = r;
                     float r_B = r * (1.0 - flare_dispersion * 8.0);
-                    float d2 = dot(d, d);
+                    float d2 = dot(d_px, d_px);
                     // Super-Gaussian (exp(-(d/r)^4)) for a clean
                     // disc edge instead of a soft halo bleed.
                     float qR = d2 / max(r_R * r_R, 1e-6);
@@ -185,11 +180,11 @@ void main(uint3 tid : SV_DispatchThreadID) {
                     float i_G = exp(-qG * qG);
                     float i_B = exp(-qB * qB);
                     float3 ghost = float3(i_R, i_G, i_B) * kTints[gi] * 4.0;
-                    // Radial fade also wants aspect correction so
-                    // the vignette is circular not elliptical.
-                    float2 cd = float2((uv.x - 0.5),
-                                       (uv.y - 0.5) * aspect);
-                    float fade = saturate(1.0 - length(cd) * 1.2);
+                    // Radial fade in pixel space too, so the
+                    // vignette is circular.
+                    float2 cd_px = (uv - 0.5) * dimf;
+                    float diag   = 0.5 * length(dimf);
+                    float fade   = saturate(1.0 - length(cd_px) / diag * 1.2);
                     flare += ghost * fade;
                 }
                 c += flare_intensity * flare;
