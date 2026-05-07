@@ -75,25 +75,26 @@ void generateMoonTexture(int width, int height, std::vector<float>& rgba_out) {
             float py = std::sin(lat);
             float pz = cl * std::sin(lon);
 
-            // Highland base: bright mottled grey-tan (real lunar
-            // highlands have albedo ~0.13-0.16 but we render them
-            // brighter for visibility -- the moon disc multiplier
-            // is dim by design).
+            // Highland base: bright mottled grey-tan.
             float base = 0.85f + 0.13f * fbm(px * 8.0f, py * 8.0f, pz * 8.0f, 4);
 
-            // Mare ("seas") -- large dark basaltic basins. Real mare
-            // albedo is half the highlands; we drop them to 0.20 for
-            // dramatic visible contrast against the bright highlands.
-            float mare_n = fbm(px * 1.5f, py * 1.5f, pz * 1.5f, 3);
-            float mare_factor = std::clamp((0.55f - mare_n) * 4.0f, 0.0f, 1.0f);
-            base = base + (0.20f - base) * mare_factor;     // toward 0.20
+            // Mare ("seas") -- large dark basaltic basins. Frequency
+            // 0.6 (was 1.5) gives features that span a meaningful
+            // fraction of the visible disc even at default r_moon_size,
+            // so the dark patches don't average out under bilinear
+            // filtering when the on-screen disc is only ~9-15px wide.
+            // Mare albedo dropped to 0.10 for stronger contrast vs the
+            // 0.85-0.98 highlands.
+            float mare_n = fbm(px * 0.6f, py * 0.6f, pz * 0.6f, 3);
+            float mare_factor = std::clamp((0.55f - mare_n) * 5.0f, 0.0f, 1.0f);
+            base = base + (0.10f - base) * mare_factor;
 
-            // Crater detail -- dimples (dark floors) + bright ejecta
-            // rays at high freq. Wider stops so craters are obvious.
-            float crater_n = fbm(px * 40.0f, py * 40.0f, pz * 40.0f, 2);
-            float crater_dark   = std::clamp(crater_n - 0.55f, 0.0f, 1.0f) * 0.30f;
-            float crater_bright = std::clamp(0.40f - crater_n, 0.0f, 1.0f) * 0.20f;
-            base = std::clamp(base - crater_dark + crater_bright, 0.10f, 1.00f);
+            // Mid-frequency crater fields -- wider features so they
+            // survive the bilinear average at small disc sizes.
+            float crater_n = fbm(px * 14.0f, py * 14.0f, pz * 14.0f, 3);
+            float crater_dark   = std::clamp(crater_n - 0.55f, 0.0f, 1.0f) * 0.35f;
+            float crater_bright = std::clamp(0.40f - crater_n, 0.0f, 1.0f) * 0.25f;
+            base = std::clamp(base - crater_dark + crater_bright, 0.08f, 1.00f);
 
             // Lunar regolith tint: slightly warm grey (sandy / tan).
             float r = base * 1.00f;

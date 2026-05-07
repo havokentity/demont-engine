@@ -816,8 +816,11 @@ void Engine::ReloadEnvMap(const std::string& path) {
 void Engine::EnsureMoonMapUploaded() {
     if (!device_) return;
     if (moon_map_tex_id_ != 0) return;
-    constexpr std::uint32_t kW = 512;
-    constexpr std::uint32_t kH = 256;
+    // 1024x512 gives ~2 texture pixels per screen pixel even at
+    // default r_moon_size, so bilinear sampling preserves mare and
+    // crater detail instead of averaging them into uniform grey.
+    constexpr std::uint32_t kW = 1024;
+    constexpr std::uint32_t kH = 512;
     std::vector<float> rgba;
     pt::moon::generateMoonTexture(int(kW), int(kH), rgba);
     auto tex = device_->CreateTexture({
@@ -856,8 +859,12 @@ void Engine::EnsureStarMapUploaded() {
     if (star_map_tex_id_ != 0) return;          // already uploaded on this device
 
     constexpr const char*  kPath = "assets/stars/BSC5.dat";
-    constexpr std::uint32_t kW   = 4096;
-    constexpr std::uint32_t kH   = 2048;
+    // 8192x4096 RGBA16F = 256MB. Trades VRAM for star crispness:
+    // each star's pixel splat covers fewer screen pixels at typical
+    // FOVs, so the bilinear sampling doesn't blur points into puffs.
+    // Earlier 4096x2048 produced visible "filter haze" around stars.
+    constexpr std::uint32_t kW   = 8192;
+    constexpr std::uint32_t kH   = 4096;
 
     std::string err;
     auto stars = pt::stars::LoadBsc5(kPath, &err);
