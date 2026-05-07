@@ -59,7 +59,14 @@ namespace cvar {
     PT_CVAR(r_theme, "hardcore",
             "Web console theme: hardcore|amber|synthwave|matrix|vault|sakura|mono",
             CVAR_ARCHIVE);
+    // Default backend: Metal on Apple Silicon, Vulkan everywhere else
+    // (Windows + Linux use Vulkan + RT extensions; the Metal backend
+    // doesn't compile off Apple).
+#if defined(__APPLE__)
     PT_CVAR(r_backend,         "metal",    "One of none|software|metal|vulkan",CVAR_ARCHIVE);
+#else
+    PT_CVAR(r_backend,         "vulkan",   "One of none|vulkan",               CVAR_ARCHIVE);
+#endif
     PT_CVAR(r_max_bounces,     "8",  "Max path bounces per ray",          CVAR_ARCHIVE);
     PT_CVAR(r_spp,             "1",  "Samples per pixel per dispatch (>=1). Higher = cleaner motion frames at proportional GPU cost.", CVAR_ARCHIVE);
     PT_CVAR(r_quality,         "high",  "Master quality preset that drives r_spp, r_max_bounces, r_caustics, r_refract_bounces, etc. Options: low (fast, no caustics), medium (default-ish), high (caustics, more bounces), ultra (max). 'custom' leaves per-feature cvars as-is.", CVAR_ARCHIVE);

@@ -83,6 +83,47 @@ jobs:
       # create a window without a display. Local devs already run the
       # binary; CI's job is to catch compile + link regressions.
 
+  windows:
+    name: Windows (NVIDIA RTX target)
+    # Compile-test only -- the runner has no NVIDIA hardware so we can't
+    # actually exercise the Vulkan path, but link errors and Windows-
+    # specific compilation breakage get caught here. Same purpose as
+    # the macos job: regression gate on PRs.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        # Configures the build environment (cl, link, etc.) so the Ninja
+        # generator can find them. Required on windows-latest -- the
+        # MSVC toolchain isn't on PATH by default.
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install build tools
+        # Choco-install ninja + the LunarG Vulkan SDK. Vulkan SDK is a
+        # ~600 MB install but ships the headers + loader CMake's
+        # FindVulkan needs, plus the validation layers + glslang/spirv
+        # tools we may want for diagnostics.
+        shell: pwsh
+        run: |
+          choco install ninja --no-progress -y
+          choco install vulkan-sdk --no-progress -y
+          # Make ninja + vulkan tools visible on PATH for the rest of
+          # the job. choco usually installs to known locations.
+          $env:Path = "$env:VULKAN_SDK\Bin;$env:Path"
+          ninja --version
+          cmake --version
+
+      - name: Configure
+        shell: pwsh
+        run: cmake --preset win-debug
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build/win-debug --parallel
+
   # Scheduled nightly release: at 23:00 IST (cron at top, in UTC) the
   # macos build runs and -- if it passes -- this job repackages the
   # release-config artefact and updates the `nightly` pre-release tag.

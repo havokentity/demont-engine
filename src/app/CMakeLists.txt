@@ -1,12 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Rajesh D'Monte
 # --- Window library (separate from the executable so engine can link it) ---
-add_library(pt_app_window STATIC
-    Window.cpp
-    Window_Cocoa.mm
-    MetalLayerAttach.mm
-    ConsoleOverlay.mm
-)
+# Cocoa-specific .mm files build only on Apple. On other platforms we
+# compile a stub TU that provides the same C-extern symbols as no-ops
+# so the Vulkan backend's link is satisfied without a Cocoa runtime.
+set(_pt_window_sources Window.cpp)
+if(APPLE)
+    list(APPEND _pt_window_sources
+        Window_Cocoa.mm
+        MetalLayerAttach.mm
+        ConsoleOverlay.mm)
+else()
+    list(APPEND _pt_window_sources
+        ConsoleOverlay_Stub.cpp)
+endif()
+
+add_library(pt_app_window STATIC ${_pt_window_sources})
 
 target_include_directories(pt_app_window PUBLIC ${CMAKE_SOURCE_DIR}/src)
 

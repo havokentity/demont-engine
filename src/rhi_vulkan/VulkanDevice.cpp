@@ -159,9 +159,14 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     std::uint32_t glfw_ext_n = 0;
     const char** glfw_exts = glfwGetRequiredInstanceExtensions(&glfw_ext_n);
     std::vector<const char*> exts(glfw_exts, glfw_exts + glfw_ext_n);
+#if defined(__APPLE__)
     // MoltenVK-on-Mac is a portability driver, has to be enumerated.
+    // On Windows / Linux native Vulkan loaders advertise the GPU
+    // directly so the portability extensions are unavailable AND
+    // unnecessary.
     exts.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
     exts.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+#endif
     if (kEnableValidation) {
         exts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     }
@@ -174,7 +179,11 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     VkInstanceCreateInfo ici{};
     ici.sType                   = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     ici.pApplicationInfo        = &ai;
+#if defined(__APPLE__)
     ici.flags                   = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+#else
+    ici.flags                   = 0;
+#endif
     ici.enabledExtensionCount   = static_cast<std::uint32_t>(exts.size());
     ici.ppEnabledExtensionNames = exts.data();
     ici.enabledLayerCount       = static_cast<std::uint32_t>(layers.size());
@@ -216,7 +225,19 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     }
     std::vector<VkPhysicalDevice> pds(pd_count);
     vkEnumeratePhysicalDevices(instance_, &pd_count, pds.data());
-    phys_device_ = pds[0];   // first one -- only MoltenVK presents on Mac
+    // Prefer a discrete GPU (NVIDIA / AMD dGPU) over an integrated one
+    // when multiple are present. On Mac there's only MoltenVK so the
+    // first device is fine; on Windows boxes with Intel iGPU + NVIDIA
+    // RTX dGPU we want the RTX.
+    phys_device_ = pds[0];
+    for (auto pd : pds) {
+        VkPhysicalDeviceProperties pp{};
+        vkGetPhysicalDeviceProperties(pd, &pp);
+        if (pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+            phys_device_ = pd;
+            break;
+        }
+    }
 
     VkPhysicalDeviceProperties props{};
     vkGetPhysicalDeviceProperties(phys_device_, &props);
@@ -253,8 +274,11 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
 
     std::vector<const char*> dexts;
     dexts.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+#if defined(__APPLE__)
     // MoltenVK requires the portability_subset extension on the device.
+    // Native Vulkan drivers (NVIDIA / AMD on Windows/Linux) don't.
     dexts.push_back("VK_KHR_portability_subset");
+#endif
 
     // Slang's SPIR-V output uses StorageImageReadWithoutFormat /
     // StorageImageWriteWithoutFormat capabilities. Enable the matching

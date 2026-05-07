@@ -7,7 +7,9 @@ namespace pt::rhi {
 
 // Each linked backend provides one of these factories.  We dispatch by
 // type.  If a backend isn't compiled in, the call returns nullptr.
+#if defined(PT_HAS_SOFTWARE_BACKEND)
 extern std::unique_ptr<Device> CreateSoftwareDevice(const NativeWindowHandle&);
+#endif
 #if defined(PT_HAS_METAL_BACKEND)
 extern std::unique_ptr<Device> CreateMetalDevice(const NativeWindowHandle&);
 #endif
@@ -21,7 +23,12 @@ std::unique_ptr<Device> Device::Create(BackendType type,
         case BackendType::None:
             return nullptr;
         case BackendType::Software:
+#if defined(PT_HAS_SOFTWARE_BACKEND)
             return CreateSoftwareDevice(w);
+#else
+            LOG_ERROR("Software backend not built into this binary");
+            return nullptr;
+#endif
         case BackendType::Metal:
 #if defined(PT_HAS_METAL_BACKEND)
             return CreateMetalDevice(w);

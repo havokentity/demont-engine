@@ -5,14 +5,15 @@ add_library(pt_rhi STATIC
 )
 
 target_include_directories(pt_rhi PUBLIC ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(pt_rhi
-    PUBLIC pt_core
-    PUBLIC pt_rhi_software
-)
+target_link_libraries(pt_rhi PUBLIC pt_core)
 
 if(APPLE)
-    target_link_libraries(pt_rhi PUBLIC pt_rhi_metal)
-    target_compile_definitions(pt_rhi PUBLIC PT_HAS_METAL_BACKEND=1)
+    # Software backend's present path is Metal-layer based, so it
+    # only builds on Apple. Tied to Metal availability.
+    target_link_libraries(pt_rhi PUBLIC pt_rhi_software pt_rhi_metal)
+    target_compile_definitions(pt_rhi PUBLIC
+        PT_HAS_SOFTWARE_BACKEND=1
+        PT_HAS_METAL_BACKEND=1)
 endif()
 
 if(PT_ENABLE_VULKAN_BACKEND)
