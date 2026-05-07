@@ -108,7 +108,7 @@ cmake --build --preset win-debug
 (or `win-release` for an optimised build, `win-clang-debug` for clang-cl.)
 
 The Windows build:
-- Skips the Metal RHI + macOS-native overlay entirely (Cocoa stubs link as no-ops)
+- Skips the Metal RHI and the macOS Cocoa overlay path (Cocoa shims link as no-ops), while using a native Win32 console overlay on Windows
 - Auto-selects Vulkan as the default backend (`r_backend vulkan`)
 - Uses native Vulkan (no MoltenVK portability extensions)
 - Picks a discrete GPU when both iGPU + dGPU are present
