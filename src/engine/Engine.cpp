@@ -155,7 +155,7 @@ namespace cvar {
     PT_CVAR(r_clouds_coverage,       "0.45",     "Sky coverage fraction [0..1]. 0 = clear, 1 = full overcast. Subtracted from the noise threshold so only high-noise regions become cloud.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_base_height,    "200.0",    "Cloud layer bottom altitude in metres (1 unit = 1m). Cumulus 200-500m, stratus 100-300m, cirrus 6000-12000m. Real meteorology, not engine-scaled.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_top_height,     "500.0",    "Cloud layer top altitude in metres.", CVAR_ARCHIVE);
-    PT_CVAR(r_clouds_density,        "12.0",     "Peak extinction inside the cloud (per metre). 8-15 reads as solid cumulus, 25+ as storm.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_density,        "0.06",     "Peak extinction inside the cloud, in per-metre sigma_t. Real meteorology: light cumulus 0.03-0.05, typical cumulus 0.05-0.10, stratus 0.04-0.08, storm/cumulonimbus 0.10-0.30. Across a 300m cumulus layer, sigma=0.05 gives optical depth ~15 -- mostly opaque core, translucent edges.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_freq,           "0.005",    "Noise frequency in cycles per metre. 0.003 -> ~330m features (slow undulating cumulus), 0.01 -> ~100m features (smaller puffy cumulus). Match to typical horizontal cloud size, not vertical layer thickness.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_detail,         "0.35",     "High-frequency detail amount [0..1]. 0 = soft blobby clouds, 1 = wispy/eroded edges.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_wind_x,         "5.0",      "Wind speed along +X in metres/second. Drifts the cloud field over time. Light breeze 2-3, fresh wind 8-12, gale 20+.", CVAR_ARCHIVE);
@@ -2490,15 +2490,17 @@ void Engine::RegisterCommands() {
             // Real-meteorology values. Heights are metres above ground
             // (1 world unit = 1 metre). Frequencies are cycles per
             // metre, so feature_size = 1/freq metres. Densities are
-            // per-metre extinction.
+            // per-metre sigma_t (extinction): light cumulus ~0.04,
+            // typical cumulus 0.05-0.10, stratus 0.04-0.08, storm
+            // 0.10-0.30.
             static const CloudPreset presets[] = {
                 // name        cov   base    top    dens    freq      detail
-                { "clear",     0.0f,  200.0f,  500.0f, 0.0f,  0.005f,  0.0f  },
-                { "cumulus",   0.45f, 200.0f,  500.0f, 12.0f, 0.005f,  0.35f },
-                { "stratus",   0.92f, 100.0f,  300.0f, 6.0f,  0.0025f, 0.15f },
-                { "cirrus",    0.30f, 8000.0f, 9500.0f, 3.0f, 0.0035f, 0.55f },
-                { "overcast",  0.98f, 200.0f,  700.0f, 9.0f,  0.0035f, 0.20f },
-                { "storm",     0.85f, 150.0f, 2000.0f, 22.0f, 0.0045f, 0.45f },
+                { "clear",     0.0f,  200.0f,  500.0f, 0.0f,   0.005f,  0.0f  },
+                { "cumulus",   0.45f, 200.0f,  500.0f, 0.06f,  0.005f,  0.35f },
+                { "stratus",   0.92f, 100.0f,  300.0f, 0.04f,  0.0025f, 0.15f },
+                { "cirrus",    0.30f, 8000.0f, 9500.0f, 0.015f, 0.0035f, 0.55f },
+                { "overcast",  0.98f, 200.0f,  700.0f, 0.05f,  0.0035f, 0.20f },
+                { "storm",     0.85f, 150.0f, 2000.0f, 0.18f,  0.0045f, 0.45f },
             };
             const std::string& name = cv.value;
             if (name == "custom") return;   // leave individual cvars alone
@@ -2786,7 +2788,7 @@ void Engine::RegisterCommands() {
     set_slider("r_clouds_coverage",         0.0f,    1.0f,   0.01f);
     set_slider("r_clouds_base_height",      0.0f, 12000.0f, 25.0f);
     set_slider("r_clouds_top_height",      50.0f, 14000.0f, 25.0f);
-    set_slider("r_clouds_density",          0.0f,   50.0f,   0.1f);
+    set_slider("r_clouds_density",          0.0f,    0.5f,   0.005f);
     set_slider("r_clouds_freq",          0.0005f,   0.02f,  0.0005f);
     set_slider("r_clouds_detail",           0.0f,    1.0f,   0.01f);
     set_slider("r_clouds_wind_x",         -25.0f,   25.0f,   0.5f);

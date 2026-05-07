@@ -199,23 +199,32 @@ float cloud_density_at(float3 pos,
               + float3(cp3.x, 0.0, cp3.y);
     sp *= cp2.z;
     // Cumulus body: 6 octaves of quintic-interpolated value-noise fbm.
-    // Following IQ's Clouds shader (shadertoy XslGRr) -- pure fbm with
-    // smooth interpolation produces softer, less grainy clouds than
-    // any Worley/cellular mix would. The 6th octave caps detail at
-    // about 1/32 of the base frequency.
     float low = cloud_fbm(sp, 6);
-    // Coverage threshold: subtract (1 - coverage) so only high-noise
-    // regions become cloud. coverage = 1 -> all-cloud, 0 -> no cloud.
+    // Smooth coverage transition. smoothstep(1-cov, 1, low) gives a
+    // soft S-curve from 0 (no cloud) to 1 (max cloud) over the
+    // noise-value band, instead of the hard linear ramp the previous
+    // saturate((low - (1-cov)) / cov) produced. Soft edges = light
+    // partially passes through wispy outer regions.
     float coverage = saturate(cp1.z);
-    float density  = saturate((low - (1.0 - coverage)) / max(coverage, 0.01));
+    float density  = smoothstep(1.0 - coverage, 1.0, low);
     if (density <= 0.0) return 0.0;
     // Detail subtract: a higher-frequency fbm erodes edges so the
     // cloud silhouette has wispy fingers rather than smooth blobs.
-    // cp3.z = 0 disables; 0.3 is a comfortable cumulus default.
     if (cp3.z > 0.0) {
         float hi = cloud_fbm(sp * 4.0, 3);
         density = saturate(density - hi * cp3.z);
     }
+    // Internal variation: secondary fbm modulates density inside the
+    // cloud so a thick body isn't uniform white. Real cumulus has
+    // brighter rims and darker cores; this gives the volume some
+    // texture without being noisy.
+    float internal = 0.55 + 0.45 * cloud_fbm(sp * 1.7, 3);
+    density *= internal;
+    // cp1.w is peak sigma_t per metre. Real meteorology:
+    //   light cumulus    ~0.03-0.05 /m
+    //   typical cumulus  ~0.05-0.10
+    //   stratus / nimbus ~0.04-0.08
+    //   storm / Cb       ~0.10-0.30
     return density * h_profile * cp1.w;
 }
 
@@ -251,6 +260,32 @@ float3 sampleCosineHemisphere(float3 n, inout uint seed) {
     float3 t  = normalize(cross(n, ax));
     float3 b  = cross(n, t);
     return normalize(t * x + b * y + n * z);
+}
+
+// The sun is a disc, not a point. Half-angular-radius from Earth is
+// 0.00465 rad (~0.266 deg). Shadow rays should sample a random
+// direction inside that disc instead of the centre direction; over
+// the temporal accumulator this gives soft penumbrae naturally
+// (clouds, foliage, hard objects all gain real-physics-soft edges).
+//
+// This is *not* a softening hack -- the sun really is a disc and a
+// point sample is the wrong physics. We're just doing the integral
+// the path tracer was missing.
+static const float kSunAngularRadius = 0.00465;
+
+float3 sampleSunDisc(float3 sun_dir, inout uint seed) {
+    float u1  = randf(seed);
+    float u2  = randf(seed);
+    // Uniform disc sample, scaled by sun's angular radius (small angle
+    // so this approximates a uniform solid-angle sample on the disc).
+    float r   = sqrt(u1) * kSunAngularRadius;
+    float phi = 6.28318530718 * u2;
+    float2 d  = float2(cos(phi), sin(phi)) * r;
+    // Build an orthonormal basis around sun_dir and offset.
+    float3 ax = abs(sun_dir.y) < 0.99 ? float3(0, 1, 0) : float3(1, 0, 0);
+    float3 t  = normalize(cross(ax, sun_dir));
+    float3 b  = cross(sun_dir, t);
+    return normalize(sun_dir + t * d.x + b * d.y);
 }
 
 float fresnelSchlick(float cos_theta, float r0) {
@@ -888,8 +923,9 @@ void main(uint2 tid : SV_DispatchThreadID) {
 
                 if (sun_elev > 0.0) {
                     float n_dot_l = max(0.0, dot(nf, sun_dir));
+                    float3 sun_jit = sampleSunDisc(sun_dir, seed);
                     float3 trans  = (n_dot_l > 0.0)
-                        ? transmittance(hit_pt + nf * 1e-3, sun_dir, 1e30)
+                        ? transmittance(hit_pt + nf * 1e-3, sun_jit, 1e30)
                         : float3(0.0);
                     if (n_dot_l > 0.0 && any(trans > float3(0.0))) {
                         // Atmospheric attenuation: optical depth times
@@ -1023,7 +1059,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     if (t >= t_far) break;
                     float3 sp = primary_ro + primary_rd * t;
                     if (sun_elev > 0.0) {
-                        float3 trans_sun = transmittance(sp, sun_dir, 1e30);
+                        float3 sun_jit = sampleSunDisc(sun_dir, seed);
+                        float3 trans_sun = transmittance(sp, sun_jit, 1e30);
                         if (any(trans_sun > float3(0.0))) {
                             v_color += sun_rad * trans_sun * phase
                                      * sigma_t * dt * trans_eye;
@@ -1069,7 +1106,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                                       clouds_p2, clouds_p3);
                         if (dens <= 0.0) continue;
                         if (sun_elev > 0.0) {
-                            float3 trans_sun = transmittance(sp, sun_dir, 1e30);
+                            float3 sun_jit = sampleSunDisc(sun_dir, seed);
+                            float3 trans_sun = transmittance(sp, sun_jit, 1e30);
                             if (any(trans_sun > float3(0.0))) {
                                 v_color_c += sun_rad * trans_sun * phase
                                            * dens * dtc * trans_eye_c;
