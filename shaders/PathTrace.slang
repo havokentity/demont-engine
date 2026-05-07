@@ -173,6 +173,32 @@ float cloud_fbm(float3 p, int octaves) {
     return v;
 }
 
+// Cellular / Worley-like noise: distance to the closest of three jittered
+// feature points per integer cell. Returns 1 - d (so higher = closer to
+// a feature centre = thicker puff core), giving the cauliflower-cumulus
+// structure that pure fbm can't produce.
+float cloud_worley(float3 p) {
+    float3 i = floor(p);
+    float3 f = frac(p);
+    float min_d = 1.0;
+    [unroll] for (int dz = -1; dz <= 1; ++dz)
+    [unroll] for (int dy = -1; dy <= 1; ++dy)
+    [unroll] for (int dx = -1; dx <= 1; ++dx) {
+        float3 nb  = float3(float(dx), float(dy), float(dz));
+        float3 cell = i + nb;
+        // Three feature points per cell (tri-Worley) for richer pattern.
+        for (int k = 0; k < 3; ++k) {
+            float3 jk = float3(cloud_hash(cell + float3(float(k) * 17.0, 0, 0)),
+                               cloud_hash(cell + float3(0, float(k) * 23.0, 0)),
+                               cloud_hash(cell + float3(0, 0, float(k) * 31.0)));
+            float3 fp = nb + jk - f;
+            float  d  = dot(fp, fp);
+            min_d = min(min_d, d);
+        }
+    }
+    return 1.0 - sqrt(saturate(min_d));
+}
+
 // Density at a world-space point. Returns 0 outside the cloud layer
 // or where the noise threshold isn't met. The volumetric march
 // multiplies this by sigma_t to vary extinction along the ray.
@@ -194,17 +220,24 @@ float cloud_density_at(float3 pos,
               + float3(cp2.x * cp2.w, 0.0, cp2.y * cp2.w)
               + float3(cp3.x, 0.0, cp3.y);
     sp *= cp2.z;
-    // Low-frequency cloud body (4 fbm octaves).
-    float low = cloud_fbm(sp, 4);
+    // Cumulus structure: fbm Perlin gives the smooth shape, Worley
+    // gives the cellular cauliflower bumps that real thermal-driven
+    // cumulus shows. Mix biases toward Worley for a puffy look at
+    // larger scales.
+    float fbm_low  = cloud_fbm(sp, 5);
+    float worley   = cloud_worley(sp * 0.6);
+    float low      = saturate(0.45 * fbm_low + 0.55 * worley);
     // Coverage threshold: subtract (1 - coverage) so only high-noise
     // regions become cloud. coverage = 1 -> all-cloud, 0 -> no cloud.
     float coverage = saturate(cp1.z);
     float density  = saturate((low - (1.0 - coverage)) / max(coverage, 0.01));
     if (density <= 0.0) return 0.0;
-    // Detail subtract: high-frequency noise erodes edges so clouds
-    // look wispy rather than blobby. cp3.z = 0 disables.
+    // Detail subtract: high-frequency Worley + fbm erodes edges so
+    // clouds look wispy rather than blobby. cp3.z = 0 disables.
     if (cp3.z > 0.0) {
-        float hi = cloud_fbm(sp * 4.0, 2);
+        float hi_w = cloud_worley(sp * 3.0);
+        float hi_f = cloud_fbm(sp * 4.0, 2);
+        float hi   = 0.5 * hi_w + 0.5 * hi_f;
         density = saturate(density - hi * cp3.z);
     }
     return density * h_profile * cp1.w;
@@ -592,10 +625,54 @@ EnvSample sampleEnvMap(float2 xi) {
 // patterns -- the focal lensing emerges from the geometry the
 // refracted shadow ray traces, not from any fancy sampling.
 //
+// Optical depth through the cloud layer along [ro, ro + rd*t_max].
+// Returns 0 when clouds are off or the ray misses the layer; otherwise
+// integrates cloud_density_at across the ray-slab intersection. Used
+// by transmittance() to give clouds genuine shadow-casting behaviour:
+// any NEE shadow ray that grazes a dense cloud loses light.
+float cloud_optical_depth(float3 ro, float3 rd, float t_max) {
+    if (clouds_p1.w <= 0.0) return 0.0;
+    float base_y = clouds_p1.x;
+    float top_y  = clouds_p1.y;
+    float ry = rd.y;
+    float t_in, t_out;
+    if (abs(ry) > 1e-6) {
+        float t_b = (base_y - ro.y) / ry;
+        float t_t = (top_y  - ro.y) / ry;
+        t_in  = max(0.0, min(t_b, t_t));
+        t_out = max(t_b, t_t);
+    } else {
+        if (ro.y >= base_y && ro.y <= top_y) {
+            t_in  = 0.0;
+            t_out = t_max;
+        } else {
+            return 0.0;
+        }
+    }
+    t_out = min(t_out, t_max);
+    if (t_out <= t_in) return 0.0;
+    // 8 coarse samples are plenty for a shadow ray -- we just need
+    // to know roughly how dense the cloud is along this line.
+    const int Ns = 8;
+    float dt = (t_out - t_in) / float(Ns);
+    float od = 0.0;
+    [unroll] for (int i = 0; i < Ns; ++i) {
+        float t = t_in + (float(i) + 0.5) * dt;
+        float3 sp = ro + rd * t;
+        od += cloud_density_at(sp, clouds_p1, clouds_p2, clouds_p3) * dt;
+    }
+    return od;
+}
+
 // Up to kMaxRefract dielectric bounces; beyond that the ray gives up
 // (returns 0) so a pathological all-glass scene can't loop forever.
 // TIR also returns 0 (light can't pass that interface).
 float3 transmittance(float3 ro, float3 rd, float t_max) {
+    // Cloud optical depth along the original (un-refracted) ray. Real
+    // clouds live in a layer high above the scene -- approximating the
+    // shadow as the straight-line cloud path is fine because no glass
+    // sits inside the cloud layer for the refracted segment to matter.
+    float3 cloud_t = float3(exp(-cloud_optical_depth(ro, rd, t_max)));
     // Engine packs the per-frame refraction budget into w2j_row1.w
     // (0 = caustics disabled, treat dielectrics as opaque shadow
     // blockers; >0 = max dielectric bounces a single shadow ray may
@@ -606,7 +683,7 @@ float3 transmittance(float3 ro, float3 rd, float t_max) {
     float3 d = rd;
     for (int i = 0; i <= kMaxRefract; ++i) {
         HitInfo h = traceScene(o, d);
-        if (!h.hit || h.t >= t_max) return t;     // unoccluded path to light
+        if (!h.hit || h.t >= t_max) return t * cloud_t;     // unoccluded
         if (h.mat != MAT_DIELECTRIC) return float3(0.0);    // opaque blocker
         if (i == kMaxRefract)        return float3(0.0);    // budget hit
 
@@ -778,13 +855,21 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // atmospheric haze along the full visible distance.
         float3 primary_ro = ro;
         float3 primary_rd = rd;
-        float  primary_t  = 1000.0;
+        // Sky-pixel default extends to ~50km so distant cloud layers
+        // (cumulus 200-500m) are reachable by low-elevation rays
+        // (5deg above horizon needs t ~ 6km to enter the layer).
+        // Object hits override this with the actual scene t.
+        float  primary_t  = 50000.0;
         bool   primary_t_recorded = false;
+        bool   primary_hit = false;
 
         for (uint b = 0u; b < max_bounces; ++b) {
         HitInfo h = traceScene(ro, rd);
         if (b == 0u) {
-            primary_t = h.hit ? h.t : 1000.0;
+            // Sky pixels (no hit) keep the 50km default so cloud
+            // marches reach the layer; object hits override.
+            primary_t = h.hit ? h.t : primary_t;
+            primary_hit = h.hit;
             primary_t_recorded = true;
         }
         if (!h.hit) {
@@ -912,29 +997,23 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 throughput /= p;
             }
         }
-        // Volumetric single-scatter along the primary ray. For each
-        // march sample, NEE-shadow-ray to the sun and add
-        //   sun_radiance * HG_phase(cos(view, -sun)) * sigma_s * dt
-        //   * transmittance_to_camera * transmittance_to_sun
-        // Beer's law transmittance accumulates as we walk away from
-        // the camera. Per-pixel jitter on the march start breaks
-        // banding from regular sampling.
-        // Clouds ride the same march; if either haze or clouds is on,
-        // the march runs. sigma_t base is just the haze coefficient
-        // (clouds add their density per-step).
-        bool march_enabled = (vol_params.x > 0.0 || clouds_p1.w > 0.0)
-                          && primary_t_recorded;
-        if (march_enabled) {
-            float  sigma_t   = vol_params.x;     // haze extinction (0 = clouds-only)
+        // Volumetric single-scatter along the primary ray. Two
+        // independent marches because the natural sampling rates
+        // differ:
+        //   - Haze: dense near the camera, attenuates exp(-density*t)
+        //     so beyond ~5km it contributes nothing. Cap the march
+        //     range at 5km to keep dt small.
+        //   - Clouds: live in a thin altitude band (e.g. 200-500m).
+        //     Clip the march to the actual ray-slab intersection so
+        //     all N samples land inside the cloud, not in empty air.
+        // The two contributions add into `radiance`. Both share the
+        // sun radiance and HG phase setup below.
+        if ((vol_params.x > 0.0 || clouds_p1.w > 0.0) && primary_t_recorded) {
             float  g         = vol_params.y;
             float  vol_int   = vol_params.z;
             int    N         = max(1, int(vol_params.w));
             float3 sun_dir   = sun_and_mode.xyz;
             float  sun_elev  = sun_dir.y;
-            float3 v_color   = float3(0.0);
-            float  trans_eye = 1.0;
-            float  dt        = primary_t / float(N);
-            float  jitter    = randf(seed) * dt;
             // Sun radiance at this elevation (matches Lambert sun
             // colour so beams + lit surfaces agree on tint).
             float3 sun_rad = float3(0.0);
@@ -947,41 +1026,84 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                float3(1.55, 0.55, 0.20), warmth)
                         * (80.0 * t_atm);
             }
-            // HG phase(cos): forward-peak when g > 0. cos_theta is
-            // between view ray and the direction OUT OF THE SUN
-            // (i.e. -sun_dir, since sun_dir points TOWARD the sun).
             float cos_theta = dot(primary_rd, -sun_dir);
             float g2 = g * g;
             float phase = (1.0 - g2)
                         / (4.0 * 3.14159265358979
                                 * pow(max(1.0 + g2 - 2.0 * g * cos_theta, 1e-4), 1.5));
 
-            // If clouds are enabled (clouds_p1.w > 0), the per-step
-            // sigma_t is the homogeneous haze plus a position-sampled
-            // cloud density. Outside the cloud layer the cloud term
-            // evaluates to 0 so we collapse back to plain haze.
-            bool clouds_on = clouds_p1.w > 0.0;
-            for (int vi = 0; vi < N; ++vi) {
-                float t = (float(vi) + 0.5) * dt + jitter;
-                if (t >= primary_t) break;
-                float3 sp = primary_ro + primary_rd * t;
-                float sigma_t_step = sigma_t;
-                if (clouds_on) {
-                    sigma_t_step += cloud_density_at(sp, clouds_p1, clouds_p2, clouds_p3);
-                }
-                // NEE toward sun: refractive-shadow-ray transmittance
-                // gives a tinted attenuation through any glass on
-                // the path, plus full kill if blocked by opaque.
-                if (sun_elev > 0.0) {
-                    float3 trans_sun = transmittance(sp, sun_dir, 1e30);
-                    if (any(trans_sun > float3(0.0))) {
-                        v_color += sun_rad * trans_sun * phase
-                                 * sigma_t_step * dt * trans_eye;
+            // --- Haze march -------------------------------------------------
+            // Bounded at 5km because at typical density 0.005-0.05 the haze
+            // is fully attenuated by then; marching further wastes samples.
+            if (vol_params.x > 0.0) {
+                float sigma_t = vol_params.x;
+                float t_far   = min(primary_t, 5000.0);
+                float dt      = t_far / float(N);
+                float jitter  = randf(seed) * dt;
+                float trans_eye = 1.0;
+                float3 v_color = float3(0.0);
+                for (int vi = 0; vi < N; ++vi) {
+                    float t = (float(vi) + 0.5) * dt + jitter;
+                    if (t >= t_far) break;
+                    float3 sp = primary_ro + primary_rd * t;
+                    if (sun_elev > 0.0) {
+                        float3 trans_sun = transmittance(sp, sun_dir, 1e30);
+                        if (any(trans_sun > float3(0.0))) {
+                            v_color += sun_rad * trans_sun * phase
+                                     * sigma_t * dt * trans_eye;
+                        }
                     }
+                    trans_eye *= exp(-sigma_t * dt);
                 }
-                trans_eye *= exp(-sigma_t_step * dt);
+                radiance += v_color * vol_int;
             }
-            radiance += v_color * vol_int;
+
+            // --- Cloud march ------------------------------------------------
+            // Layer-clip [t_in, t_out] to the ray-slab intersection of the
+            // cloud altitude band. For object-hit primary rays we also
+            // clip at primary_t so clouds don't shine through walls. For
+            // sky pixels primary_t = 50km, so the layer is fully visible.
+            if (clouds_p1.w > 0.0) {
+                float base_y = clouds_p1.x;
+                float top_y  = clouds_p1.y;
+                float ry = primary_rd.y;
+                float t_in, t_out;
+                if (abs(ry) > 1e-6) {
+                    float t_b = (base_y - primary_ro.y) / ry;
+                    float t_t = (top_y  - primary_ro.y) / ry;
+                    t_in  = max(0.0, min(t_b, t_t));
+                    t_out = max(t_b, t_t);
+                } else if (primary_ro.y >= base_y && primary_ro.y <= top_y) {
+                    t_in = 0.0; t_out = primary_t;
+                } else {
+                    t_in = 1.0; t_out = 0.0;   // miss
+                }
+                t_out = min(t_out, primary_t);
+                if (t_out > t_in) {
+                    int   Nc = max(N, 24);    // clouds need finer detail
+                    float dtc = (t_out - t_in) / float(Nc);
+                    float jitc = randf(seed) * dtc;
+                    float trans_eye_c = 1.0;
+                    float3 v_color_c  = float3(0.0);
+                    for (int vi = 0; vi < Nc; ++vi) {
+                        float t = t_in + (float(vi) + 0.5) * dtc + jitc;
+                        if (t > t_out) break;
+                        float3 sp = primary_ro + primary_rd * t;
+                        float dens = cloud_density_at(sp, clouds_p1,
+                                                      clouds_p2, clouds_p3);
+                        if (dens <= 0.0) continue;
+                        if (sun_elev > 0.0) {
+                            float3 trans_sun = transmittance(sp, sun_dir, 1e30);
+                            if (any(trans_sun > float3(0.0))) {
+                                v_color_c += sun_rad * trans_sun * phase
+                                           * dens * dtc * trans_eye_c;
+                            }
+                        }
+                        trans_eye_c *= exp(-dens * dtc);
+                    }
+                    radiance += v_color_c * vol_int;
+                }
+            }
         }
 
         frame_radiance += radiance;

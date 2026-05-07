@@ -150,17 +150,17 @@ namespace cvar {
     // weather looks; the per-day seed (`r_clouds_seed`) shifts the
     // noise hash so the same preset can produce visually distinct
     // patterns each day.
-    PT_CVAR(r_clouds,                "0",        "Volumetric clouds. Activates the volumetric march even if r_volumetric is off (the march just samples cloud density without homogeneous haze in that case). Camera primary rays must traverse the cloud altitude band to see anything -- check r_clouds_base_height and r_clouds_top_height vs your scene scale.", CVAR_ARCHIVE);
-    PT_CVAR(r_clouds_preset,         "cumulus",  "Cloud preset name. One of clear|cumulus|stratus|cirrus|overcast|storm|custom. Setting this snaps r_clouds_coverage / _base / _top / _density / _freq / _detail to canonical values; 'custom' leaves them alone for manual tuning.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds,                "0",        "Volumetric clouds (real-meteorology altitudes, 1 unit = 1 metre). Activates the volumetric march even if r_volumetric is off. Cumulus 200-500m, stratus 100-300m, cirrus 6000-12000m. The march clips to the cloud altitude band, so distant low-elevation rays still hit the layer when the sky-pixel march range is large enough.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_preset,         "cumulus",  "Cloud preset name. One of clear|cumulus|stratus|cirrus|overcast|storm|custom. Setting this snaps r_clouds_coverage / _base / _top / _density / _freq / _detail to real meteorological values; 'custom' leaves them alone for manual tuning.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_coverage,       "0.45",     "Sky coverage fraction [0..1]. 0 = clear, 1 = full overcast. Subtracted from the noise threshold so only high-noise regions become cloud.", CVAR_ARCHIVE);
-    PT_CVAR(r_clouds_base_height,    "30.0",     "World-space Y of the cloud layer's bottom. Default 30 puts clouds well above a typical eye-level (y=2) scene; raise toward realistic 200m+ if your scene uses metric units and you want real-altitude clouds.", CVAR_ARCHIVE);
-    PT_CVAR(r_clouds_top_height,     "80.0",     "World-space Y of the cloud layer's top. Cloud volume is base..top; outside this band density = 0.", CVAR_ARCHIVE);
-    PT_CVAR(r_clouds_density,        "12.0",     "Peak extinction at the densest interior point. 8-15 reads as solid cumulus, 25+ reads as storm.", CVAR_ARCHIVE);
-    PT_CVAR(r_clouds_freq,           "0.05",     "Noise frequency in cycles per world unit. Larger = smaller cloud features. Match to your scene scale: 0.005 for km-scale scenes, 0.05 for ~100-unit scenes.", CVAR_ARCHIVE);
-    PT_CVAR(r_clouds_detail,         "0.35",     "High-frequency detail amount [0..1]. 0 = soft blobby clouds, 1 = wispy/eroded edges. Adds a 4x-frequency fbm subtract.", CVAR_ARCHIVE);
-    PT_CVAR(r_clouds_wind_x,         "0.5",      "Wind velocity along world X (units/s in the noise space). Drifts the field over time so clouds appear to move.", CVAR_ARCHIVE);
-    PT_CVAR(r_clouds_wind_z,         "0.0",      "Wind velocity along world Z.", CVAR_ARCHIVE);
-    PT_CVAR(r_clouds_seed,           "0",        "Per-day noise seed (any float). Same preset + different seed = visually distinct cloud pattern. Use to give each in-game day its own weather.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_base_height,    "200.0",    "Cloud layer bottom altitude in metres (1 unit = 1m). Cumulus 200-500m, stratus 100-300m, cirrus 6000-12000m. Real meteorology, not engine-scaled.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_top_height,     "500.0",    "Cloud layer top altitude in metres.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_density,        "12.0",     "Peak extinction inside the cloud (per metre). 8-15 reads as solid cumulus, 25+ as storm.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_freq,           "0.005",    "Noise frequency in cycles per metre. 0.003 -> ~330m features (slow undulating cumulus), 0.01 -> ~100m features (smaller puffy cumulus). Match to typical horizontal cloud size, not vertical layer thickness.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_detail,         "0.35",     "High-frequency detail amount [0..1]. 0 = soft blobby clouds, 1 = wispy/eroded edges.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_wind_x,         "5.0",      "Wind speed along +X in metres/second. Drifts the cloud field over time. Light breeze 2-3, fresh wind 8-12, gale 20+.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_wind_z,         "0.0",      "Wind speed along +Z in metres/second.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_seed,           "0",        "Per-day noise seed (any float). Same preset + different seed = visually distinct cloud pattern. Use one seed per in-game day so each day has its own weather pattern.", CVAR_ARCHIVE);
 
     PT_CVAR(dev_cheats,        "0",    "Gate for CHEAT-flagged cvars",   0);
     PT_CVAR(dev_log_level,     "info", "error|warn|info|debug",          0);
@@ -2469,19 +2469,18 @@ void Engine::RegisterCommands() {
                 float freq;
                 float detail;
             };
-            // Heights are scaled to a typical engine scene (camera at
-            // y=2, world extent ~50). For metric scenes (1 unit = 1m,
-            // realistic city/landscape) multiply each by 10x manually
-            // and bump freq down 10x to keep the same proportional
-            // feature count.
+            // Real-meteorology values. Heights are metres above ground
+            // (1 world unit = 1 metre). Frequencies are cycles per
+            // metre, so feature_size = 1/freq metres. Densities are
+            // per-metre extinction.
             static const CloudPreset presets[] = {
-                // name        cov   base   top   dens  freq   detail
-                { "clear",     0.0f, 30.0f,  80.0f, 0.0f,  0.05f,  0.0f  },
-                { "cumulus",   0.45f,30.0f,  80.0f, 12.0f, 0.05f,  0.35f },
-                { "stratus",   0.92f,18.0f,  35.0f, 6.0f,  0.025f, 0.15f },
-                { "cirrus",    0.30f,80.0f, 100.0f, 3.0f,  0.035f, 0.55f },
-                { "overcast",  0.98f,25.0f,  70.0f, 9.0f,  0.035f, 0.20f },
-                { "storm",     0.85f,18.0f, 180.0f, 22.0f, 0.045f, 0.45f },
+                // name        cov   base    top    dens    freq      detail
+                { "clear",     0.0f,  200.0f,  500.0f, 0.0f,  0.005f,  0.0f  },
+                { "cumulus",   0.45f, 200.0f,  500.0f, 12.0f, 0.005f,  0.35f },
+                { "stratus",   0.92f, 100.0f,  300.0f, 6.0f,  0.0025f, 0.15f },
+                { "cirrus",    0.30f, 8000.0f, 9500.0f, 3.0f, 0.0035f, 0.55f },
+                { "overcast",  0.98f, 200.0f,  700.0f, 9.0f,  0.0035f, 0.20f },
+                { "storm",     0.85f, 150.0f, 2000.0f, 22.0f, 0.0045f, 0.45f },
             };
             const std::string& name = cv.value;
             if (name == "custom") return;   // leave individual cvars alone
@@ -2766,15 +2765,15 @@ void Engine::RegisterCommands() {
     set_slider("r_volumetric_anisotropy", -0.95f, 0.95f, 0.01f);
     set_slider("r_volumetric_intensity",   0.0f,  4.0f,  0.05f);
     set_slider("r_volumetric_samples",     4.0f, 64.0f,  1.0f);
-    set_slider("r_clouds_coverage",        0.0f,  1.0f,  0.01f);
-    set_slider("r_clouds_base_height",     0.0f, 2000.0f, 5.0f);
-    set_slider("r_clouds_top_height",      1.0f, 5000.0f, 5.0f);
-    set_slider("r_clouds_density",         0.0f, 50.0f,  0.1f);
-    set_slider("r_clouds_freq",         0.0005f, 0.05f, 0.0005f);
-    set_slider("r_clouds_detail",          0.0f,  1.0f,  0.01f);
-    set_slider("r_clouds_wind_x",        -50.0f, 50.0f,  0.5f);
-    set_slider("r_clouds_wind_z",        -50.0f, 50.0f,  0.5f);
-    set_slider("r_clouds_seed",            0.0f, 100.0f, 1.0f);
+    set_slider("r_clouds_coverage",         0.0f,    1.0f,   0.01f);
+    set_slider("r_clouds_base_height",      0.0f, 12000.0f, 25.0f);
+    set_slider("r_clouds_top_height",      50.0f, 14000.0f, 25.0f);
+    set_slider("r_clouds_density",          0.0f,   50.0f,   0.1f);
+    set_slider("r_clouds_freq",          0.0005f,   0.02f,  0.0005f);
+    set_slider("r_clouds_detail",           0.0f,    1.0f,   0.01f);
+    set_slider("r_clouds_wind_x",         -25.0f,   25.0f,   0.5f);
+    set_slider("r_clouds_wind_z",         -25.0f,   25.0f,   0.5f);
+    set_slider("r_clouds_seed",             0.0f,  100.0f,   1.0f);
     set_slider("r_bloom_threshold",     0.0f,  10.0f,  0.05f);
     set_slider("r_bloom_intensity",     0.0f,   1.0f,  0.005f);
     set_slider("r_bloom_mips",          1.0f,   5.0f,  1.0f);
