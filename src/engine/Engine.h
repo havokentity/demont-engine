@@ -216,11 +216,11 @@ private:
     float                                       last_jitter_x_         = 0.0f;
     float                                       last_jitter_y_         = 0.0f;
 
-    // Auto-exposure (P11 polish). Smoothly nudged toward
-    // 0.18 / scene_avg_luminance every few frames; used as the
-    // exposure multiplier when r_auto_exposure = 1.
-    float                                       current_exposure_      = 1.5f;
-    int                                         autoexpose_counter_    = 0;
+    // Auto-exposure now lives entirely on the GPU (see exposure_state_id_
+    // above + AutoExposure.slang). The legacy CPU-side `current_exposure_`
+    // / `autoexpose_counter_` fields drove a per-N-frames readback path
+    // that's been replaced; nothing on the host needs to mirror the value
+    // anymore -- PathTrace.slang reads `exposure_state[0]` directly.
     int                                         accum_w_               = 0;
     int                                         accum_h_               = 0;
     std::uint32_t                               frame_index_           = 0;

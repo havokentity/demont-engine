@@ -93,7 +93,7 @@ namespace cvar {
     PT_CVAR(r_exposure_min,    "0.05",  "Minimum exposure scalar that auto-exposure can settle on. Stops a nuclear-bright scene from being crushed below this value.", CVAR_ARCHIVE);
     PT_CVAR(r_exposure_max,    "4.0",   "Maximum exposure scalar that auto-exposure can settle on. The reason nights stay dark instead of being boosted to look like day -- bumping this lets the eye adapt further into the dark, lowering it caps the boost.", CVAR_ARCHIVE);
     PT_CVAR(r_exposure_target, "0.18",  "Middle-grey target for auto-exposure. 0.18 matches the Zone-V/Munsell middle-grey convention; lower values aim for a darker overall look.", CVAR_ARCHIVE);
-    PT_CVAR(r_eye_adapt_speed, "0.20",  "Per-update interpolation factor for auto-exposure (0..1). Smaller = slower eye adaptation. The update fires every 8 frames, so 0.20 is roughly 'fully adapted in 1 second at 60fps'.", CVAR_ARCHIVE);
+    PT_CVAR(r_eye_adapt_speed, "0.20",  "Per-update interpolation factor for auto-exposure (0..1). Smaller = slower eye adaptation. The update fires every frame on the GPU (single-workgroup reduction over accum_hdr), so 0.20 settles ~80% in 5 frames, ~95% in 16 frames -- roughly 'eye-adapted in a quarter second at 60fps'.", CVAR_ARCHIVE);
     PT_CVAR(r_eye_model,       "human", "Preset 'iris/lens' tuning: human (default), cat (better dim-light dynamic range), owl (nocturnal -- huge max), dslr_iso100 (locked, narrow), dslr_iso6400 (locked, high gain), phone (auto, modest range), linear (no tonemap, debug). Selecting a preset writes r_exposure_min/max/target/r_eye_adapt_speed; 'custom' leaves them as-is.", CVAR_ARCHIVE);
     PT_CVAR(r_env_map,         "assets/hdri/sunset.hdr",
             "Path to a Radiance .hdr environment map. Used when r_sky_mode = hdri. "
@@ -1549,9 +1549,12 @@ void Engine::RenderFrame() {
 
     bool auto_exp = false;
     if (auto* v = C.FindCVar("r_auto_exposure")) auto_exp = v->GetBool();
-    float manual_exp = 1.5f;
-    if (auto* v = C.FindCVar("r_exposure")) manual_exp = v->GetFloat();
-    push.exposure_pad[0] = auto_exp ? current_exposure_ : manual_exp;
+    // exposure_pad.x is dead in the shader -- PathTrace.slang reads the
+    // live exposure scalar straight from `exposure_state[0]` (updated
+    // every frame by AutoExposure.slang, or seeded by the engine on
+    // r_exposure on_change when r_auto_exposure=0). Zero this slot so
+    // tooling that dumps the push doesn't see a stale 1.5f.
+    push.exposure_pad[0] = 0.0f;
     bool show_stars = true;
     if (auto* v = C.FindCVar("r_show_stars")) show_stars = v->GetBool();
     std::string stars_mode = "bsc";
