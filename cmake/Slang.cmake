@@ -46,14 +46,19 @@ function(pt_compile_slang)
         endif()
 
         set(out "${out_dir}/${slg_name}.${ext}")
+        # -Wno-40100 silences slangc's harmless "entry point 'main' has
+        # been renamed to 'main_0'" notice -- it's a side effect of
+        # Slang's mangling rules and not something we can avoid in
+        # the source.
         add_custom_command(
             OUTPUT  "${out}"
             COMMAND ${PT_SLANGC_BIN}
                     "${slg_full}"
-                    -target ${slang_target}
-                    -entry  ${SLG_ENTRY}
-                    -stage  ${SLG_STAGE}
-                    -o      "${out}"
+                    -target  ${slang_target}
+                    -entry   ${SLG_ENTRY}
+                    -stage   ${SLG_STAGE}
+                    -Wno-40100
+                    -o       "${out}"
             DEPENDS "${slg_full}" "${PT_SLANGC_BIN}"
             VERBATIM
             COMMENT "slangc ${slg_name}.slang -> ${ext}"

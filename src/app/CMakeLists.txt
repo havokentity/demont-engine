@@ -37,11 +37,11 @@ add_executable(demont
 )
 
 target_link_libraries(demont PRIVATE
-    pt_core
-    pt_console
+    # pt_engine PUBLIC-links to pt_core, pt_console, pt_app_window,
+    # pt_rhi, pt_renderer, so they propagate transitively. Listing
+    # them here AS WELL was producing the linker's "ignoring
+    # duplicate libraries" warning every build.
     pt_engine
-    pt_app_window
-    pt_rhi
 )
 
 pt_set_compiler_options(demont)

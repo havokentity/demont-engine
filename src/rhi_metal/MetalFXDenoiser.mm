@@ -100,10 +100,17 @@ extern "C" void* pt_metalfx_create(void* mtl_device,
 
 extern "C" void pt_metalfx_destroy(void* state) {
     if (state == nullptr) return;
-    PtMetalFXState* st = static_cast<PtMetalFXState*>(state);
-    st->scaler      = nil;     // ARC releases
-    st->output_priv = nil;
-    delete st;
+    // PtMetalFXState is API_AVAILABLE(macos(26.0)) -- the only way to
+    // hold a pointer to one is to have called pt_metalfx_create which
+    // already runs an @available check, so by the time we land here
+    // we're definitely on macOS 26+. The @available block here is just
+    // to satisfy the compiler's deployment-target check.
+    if (@available(macOS 26.0, *)) {
+        PtMetalFXState* st = static_cast<PtMetalFXState*>(state);
+        st->scaler      = nil;     // ARC releases
+        st->output_priv = nil;
+        delete st;
+    }
 }
 
 // Diagnostic mode picker. PT_METALFX_DEBUG controls what pt_metalfx_encode

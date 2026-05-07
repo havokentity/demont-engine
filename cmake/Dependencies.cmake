@@ -164,11 +164,32 @@ endblock()
 # whenever its `DEBUG` macro is defined (which CMake's Debug build type
 # turns on). NDEBUG doesn't help -- the gate is `#if defined(DEBUG)`.
 # Pass -UDEBUG to undefine it for this target only.
+#
+# civetweb uses C11 features (_Static_assert, etc.) but its CMakeLists
+# doesn't request C11, so Apple Clang warns -Wpre-c11-compat on every
+# build. Right fix is to give it the standard it actually uses, not
+# silence the warning. C_STANDARD_REQUIRED ensures the compile fails
+# loudly if a future bump pulls in an even newer C feature.
 if(TARGET civetweb-c-library)
-    target_compile_options(civetweb-c-library PRIVATE -UDEBUG)
+    # -UDEBUG: kill civetweb's worker-thread trace flood under cmake Debug.
+    # C_STANDARD 11: civetweb uses _Static_assert (a C11 feature).
+    # -w: civetweb's source has ~100 warnings (extra-semis in sha1.inl,
+    #     sprintf deprecation, format mismatches, alloca usage) we
+    #     can't fix without forking. Target-scoped -w suppresses only
+    #     for this library; our own targets stay strict.
+    target_compile_options(civetweb-c-library PRIVATE -UDEBUG -w)
+    set_target_properties(civetweb-c-library PROPERTIES
+        C_STANDARD          11
+        C_STANDARD_REQUIRED ON)
 endif()
 if(PT_ENABLE_TRACY)
     FetchContent_MakeAvailable(tracy)
+    # Tracy uses deprecated sprintf in TracyProfiler/TracySocket/...
+    # Same policy as civetweb -- vendored third-party C++ we don't
+    # maintain, suppress at target scope.
+    if(TARGET TracyClient)
+        target_compile_options(TracyClient PRIVATE -w)
+    endif()
 endif()
 
 # enkiTS publishes its include path via the directory-scope command

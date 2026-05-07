@@ -160,10 +160,14 @@ std::vector<std::string_view> TokenizeLine(std::string_view line,
 // the registered object so that subsystem code can call back into them
 // (e.g. read GetInt() at runtime).  Static-init order is safe: Console::Get
 // uses Construct-On-First-Use.
+// Use C++20's __VA_OPT__ instead of GCC's `, ##__VA_ARGS__` extension --
+// both elide the trailing comma when the variadic pack is empty, but
+// __VA_OPT__ is standard so Apple Clang doesn't warn -Wgnu-zero-variadic-
+// macro-arguments on every PT_CVAR call (~50 warnings before this).
 #define PT_CVAR(varname, default_value, description, ...)                     \
     static ::pt::console::CVar* varname =                                     \
         ::pt::console::Console::Get().RegisterCVar(                           \
-            #varname, default_value, description, ##__VA_ARGS__)
+            #varname, default_value, description __VA_OPT__(,) __VA_ARGS__)
 
 #define PT_COMMAND(varname, description, lambda)                              \
     static ::pt::console::Command* varname =                                  \

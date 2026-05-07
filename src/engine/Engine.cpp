@@ -1425,9 +1425,11 @@ void Engine::RenderFrame() {
                 cb->BindComputePipeline(pt::rhi::PipelineHandle{bloom_up_pipeline_id_});
                 cb->BindStorageTexture(0, pt::rhi::TextureHandle{bloom_mip_tex_id_[i]});
                 cb->BindStorageTexture(1, pt::rhi::TextureHandle{bloom_mip_tex_id_[i - 1]});
-                struct UpPush { float radius; float pad[3]; } up{};
-                up.radius = bloom_radius;
-                cb->PushConstants(&up, sizeof(up));
+                // Renamed from `up` to `up_push` to avoid shadowing
+                // the function-scope `up = cam.Up()` camera vector.
+                struct UpPush { float radius; float pad[3]; } up_push{};
+                up_push.radius = bloom_radius;
+                cb->PushConstants(&up_push, sizeof(up_push));
                 cb->Dispatch((bloom_mip_w_[i - 1] + 7) / 8,
                              (bloom_mip_h_[i - 1] + 7) / 8, 1);
             }
