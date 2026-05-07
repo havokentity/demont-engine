@@ -161,6 +161,7 @@ namespace cvar {
     PT_CVAR(r_clouds_wind_x,         "5.0",      "Wind speed along +X in metres/second. Drifts the cloud field over time. Light breeze 2-3, fresh wind 8-12, gale 20+.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_wind_z,         "0.0",      "Wind speed along +Z in metres/second.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_seed,           "0",        "Per-day noise seed (any float). Same preset + different seed = visually distinct cloud pattern. Use one seed per in-game day so each day has its own weather pattern.", CVAR_ARCHIVE);
+    PT_CVAR(r_rayleigh,              "1.0",      "Atmospheric Rayleigh scattering intensity. 1.0 = real per-channel sea-level sigma (R 5.8e-6, G 13.5e-6, B 33.1e-6 per metre). Makes the noon sky blue and sunsets red without changing Mie/haze. 0 disables (then noon sky goes white). Real atmosphere is 1.0; bump to 1.5-2.0 for more saturated planetary look.", CVAR_ARCHIVE);
 
     PT_CVAR(dev_cheats,        "0",    "Gate for CHEAT-flagged cvars",   0);
     PT_CVAR(dev_log_level,     "info", "error|warn|info|debug",          0);
@@ -1460,7 +1461,9 @@ void Engine::RenderFrame() {
         push.clouds_p3[0] = seed * 137.137f;
         push.clouds_p3[1] = seed * 271.951f;
         push.clouds_p3[2] = detail;
-        push.clouds_p3[3] = 0.0f;
+        float rayleigh = 1.0f;
+        if (auto* v = C.FindCVar("r_rayleigh")) rayleigh = v->GetFloat();
+        push.clouds_p3[3] = rayleigh;
     }
 
     static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48);

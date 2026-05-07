@@ -105,9 +105,9 @@ cbuffer Push {
     //   .z = intensity multiplier on the final scatter contribution.
     //   .w = march sample count (cast to int; 4..64 typical).
     float4 vol_params;
-    // Volumetric cloud parameters. When clouds_p1.w > 0 the volumetric
-    // march multiplies sigma_t by a position-dependent cloud density
-    // sampled from a procedural fbm noise field.
+    // Volumetric cloud parameters and atmospheric Rayleigh intensity
+    // (clouds_p3.w). When clouds_p1.w > 0 the volumetric march
+    // samples a position-dependent cloud density.
     //   clouds_p1: (base_y, top_y, coverage[0..1], peak_density)
     //              base_y / top_y are world-space heights bracketing
     //              the cloud layer; pos.y outside this range = 0.
@@ -118,12 +118,17 @@ cbuffer Push {
     //              the cloud field drifts. freq is cycles per world
     //              unit (~0.005 = ~200m features). time advances per
     //              frame to animate the field.
-    //   clouds_p3: (seed_offset_x, seed_offset_z, detail_amount, _)
+    //   clouds_p3: (seed_offset_x, seed_offset_z, detail_amount,
+    //               rayleigh_intensity)
     //              seed shifts the noise hash so different seeds
     //              produce visually distinct cloud patterns at the
-    //              same preset (each "day" can have its own seed).
+    //              same preset.
     //              detail_amount in [0,1] blends in a higher-frequency
     //              octave for wispy edges.
+    //              rayleigh_intensity is a uniform scalar on the real
+    //              per-channel Rayleigh sigma (5.8/13.5/33.1 ×1e-6 m^-1
+    //              for R/G/B at sea level). 1.0 = real atmosphere; >1
+    //              boosts the blue tint, 0 disables Rayleigh.
     float4 clouds_p1;
     float4 clouds_p2;
     float4 clouds_p3;
@@ -1035,7 +1040,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
         //     all N samples land inside the cloud, not in empty air.
         // The two contributions add into `radiance`. Both share the
         // sun radiance and HG phase setup below.
-        if ((vol_params.x > 0.0 || clouds_p1.w > 0.0) && primary_t_recorded) {
+        if ((vol_params.x > 0.0 || clouds_p1.w > 0.0 || clouds_p3.w > 0.0)
+            && primary_t_recorded) {
             float  g         = vol_params.y;
             float  vol_int   = vol_params.z;
             int    N         = max(1, int(vol_params.w));
@@ -1059,44 +1065,64 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         / (4.0 * 3.14159265358979
                                 * pow(max(1.0 + g2 - 2.0 * g * cos_theta, 1e-4), 1.5));
 
-            // --- Haze march -------------------------------------------------
-            // Real atmosphere is exponential: sigma_t(h) = sigma_0 * exp(-h/H)
-            // where H is the aerosol scale height (~1.5km for haze; the
-            // troposphere's tropospheric scale height is ~8km but most of
-            // the aerosol is in the bottom ~1.5km). This gives:
-            //   - dense haze near the ground (god rays visible there)
-            //   - thinning rapidly with altitude (sky stays clear)
-            // Uniform sigma_t (the previous behaviour) over-illuminated the
-            // sky into a whitewash when r_volumetric_density was cranked up;
-            // exponential falloff naturally separates "near-ground god ray
-            // territory" from "high sky".
+            // --- Atmospheric (Mie + Rayleigh) march -------------------------
+            // Real atmosphere has two scattering populations:
+            //   Mie (haze, dust, water droplets): grey, forward-peaked HG
+            //     phase, scale height ~1.5km, sigma controlled by
+            //     vol_params.x. Gives god rays and sunset warmth.
+            //   Rayleigh (gas molecules): wavelength-dependent, blue is
+            //     scattered ~6x more than red. Phase is 3/(16π)*(1+cos²θ).
+            //     Scale height ~8km. Real per-channel sea-level sigma:
+            //       R 5.8e-6  G 13.5e-6  B 33.1e-6  m^-1.
+            //     Rayleigh is what makes the daytime sky blue and the
+            //     sunset red (long path attenuates blue out, leaving
+            //     red); without it, the sky bleaches white at noon.
             //
-            // Bounded at 8km (twice the scale height): at H=1.5km the haze
-            // contribution from beyond 8km is exp(-8/1.5) = 0.5%, so far
-            // samples don't matter.
-            if (vol_params.x > 0.0) {
-                float sigma_0 = vol_params.x;
-                const float kScaleHeight = 1500.0;   // metres
-                float t_far   = min(primary_t, 8000.0);
-                float dt      = t_far / float(N);
-                float jitter  = randf(seed) * dt;
-                float trans_eye = 1.0;
+            // Per channel transmittance through the column is the product
+            // of Mie and Rayleigh exp(-sigma*dt), so trans_eye is a
+            // float3 (Mie alone is grey; Rayleigh tints the column).
+            //
+            // Bounded at 60km because Rayleigh's 8km scale height means
+            // most of its contribution lives in the bottom ~25km, and
+            // 60km is plenty of headroom while keeping dt manageable.
+            const float3 kSigmaR = float3(5.8e-6, 13.5e-6, 33.1e-6);
+            const float kHmie = 1500.0;
+            const float kHrayleigh = 8000.0;
+            const float kPi = 3.14159265358979;
+            float rayleigh_int = clouds_p3.w;   // 0 disables, 1 = real
+            bool march_mie = vol_params.x > 0.0;
+            bool march_ray = rayleigh_int > 0.0;
+            if (march_mie || march_ray) {
+                float  sigma_0 = vol_params.x;
+                float  t_far   = min(primary_t, 60000.0);
+                float  dt      = t_far / float(N);
+                float  jitter  = randf(seed) * dt;
+                float3 trans_eye = float3(1.0);
                 float3 v_color = float3(0.0);
+                float phase_mie_v = phase;   // HG, computed earlier
+                float phase_ray_v = (3.0 / (16.0 * kPi)) * (1.0 + cos_theta * cos_theta);
                 for (int vi = 0; vi < N; ++vi) {
                     float t = (float(vi) + 0.5) * dt + jitter;
                     if (t >= t_far) break;
                     float3 sp = primary_ro + primary_rd * t;
                     float h = max(sp.y, 0.0);
-                    float sigma_t = sigma_0 * exp(-h / kScaleHeight);
+                    float  sigma_mie = march_mie ? sigma_0 * exp(-h / kHmie) : 0.0;
+                    float3 sigma_ray = march_ray
+                        ? kSigmaR * rayleigh_int * exp(-h / kHrayleigh)
+                        : float3(0.0);
+                    float3 sigma_total = sigma_ray + float3(sigma_mie);
                     if (sun_elev > 0.0) {
                         float3 sun_jit = sampleSunDisc(sun_dir, seed);
                         float3 trans_sun = transmittance(sp, sun_jit, 1e30);
                         if (any(trans_sun > float3(0.0))) {
-                            v_color += sun_rad * trans_sun * phase
-                                     * sigma_t * dt * trans_eye;
+                            float3 in_scatter =
+                                  float3(sigma_mie) * phase_mie_v
+                                + sigma_ray         * phase_ray_v;
+                            v_color += sun_rad * trans_sun * in_scatter
+                                     * dt * trans_eye;
                         }
                     }
-                    trans_eye *= exp(-sigma_t * dt);
+                    trans_eye *= exp(-sigma_total * dt);
                 }
                 radiance += v_color * vol_int;
             }
