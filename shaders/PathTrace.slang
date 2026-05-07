@@ -147,7 +147,11 @@ float cloud_hash(float3 p) {
 float cloud_value_noise(float3 p) {
     float3 i = floor(p);
     float3 f = frac(p);
-    f = f * f * (3.0 - 2.0 * f);   // smoothstep interpolation
+    // Quintic Hermite interpolation: f^3 (6f^2 - 15f + 10). Zero
+    // first AND second derivatives at f=0 and f=1, so the noise has
+    // no visible cell boundaries even at heavy fbm summation. Cubic
+    // smoothstep (3f^2 - 2f^3) leaks a faint grid through the haze.
+    f = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
     float a = cloud_hash(i + float3(0, 0, 0));
     float b = cloud_hash(i + float3(1, 0, 0));
     float c = cloud_hash(i + float3(0, 1, 0));
@@ -173,32 +177,6 @@ float cloud_fbm(float3 p, int octaves) {
     return v;
 }
 
-// Cellular / Worley-like noise: distance to the closest of three jittered
-// feature points per integer cell. Returns 1 - d (so higher = closer to
-// a feature centre = thicker puff core), giving the cauliflower-cumulus
-// structure that pure fbm can't produce.
-float cloud_worley(float3 p) {
-    float3 i = floor(p);
-    float3 f = frac(p);
-    float min_d = 1.0;
-    [unroll] for (int dz = -1; dz <= 1; ++dz)
-    [unroll] for (int dy = -1; dy <= 1; ++dy)
-    [unroll] for (int dx = -1; dx <= 1; ++dx) {
-        float3 nb  = float3(float(dx), float(dy), float(dz));
-        float3 cell = i + nb;
-        // Three feature points per cell (tri-Worley) for richer pattern.
-        for (int k = 0; k < 3; ++k) {
-            float3 jk = float3(cloud_hash(cell + float3(float(k) * 17.0, 0, 0)),
-                               cloud_hash(cell + float3(0, float(k) * 23.0, 0)),
-                               cloud_hash(cell + float3(0, 0, float(k) * 31.0)));
-            float3 fp = nb + jk - f;
-            float  d  = dot(fp, fp);
-            min_d = min(min_d, d);
-        }
-    }
-    return 1.0 - sqrt(saturate(min_d));
-}
-
 // Density at a world-space point. Returns 0 outside the cloud layer
 // or where the noise threshold isn't met. The volumetric march
 // multiplies this by sigma_t to vary extinction along the ray.
@@ -220,24 +198,22 @@ float cloud_density_at(float3 pos,
               + float3(cp2.x * cp2.w, 0.0, cp2.y * cp2.w)
               + float3(cp3.x, 0.0, cp3.y);
     sp *= cp2.z;
-    // Cumulus structure: fbm Perlin gives the smooth shape, Worley
-    // gives the cellular cauliflower bumps that real thermal-driven
-    // cumulus shows. Mix biases toward Worley for a puffy look at
-    // larger scales.
-    float fbm_low  = cloud_fbm(sp, 5);
-    float worley   = cloud_worley(sp * 0.6);
-    float low      = saturate(0.45 * fbm_low + 0.55 * worley);
+    // Cumulus body: 6 octaves of quintic-interpolated value-noise fbm.
+    // Following IQ's Clouds shader (shadertoy XslGRr) -- pure fbm with
+    // smooth interpolation produces softer, less grainy clouds than
+    // any Worley/cellular mix would. The 6th octave caps detail at
+    // about 1/32 of the base frequency.
+    float low = cloud_fbm(sp, 6);
     // Coverage threshold: subtract (1 - coverage) so only high-noise
     // regions become cloud. coverage = 1 -> all-cloud, 0 -> no cloud.
     float coverage = saturate(cp1.z);
     float density  = saturate((low - (1.0 - coverage)) / max(coverage, 0.01));
     if (density <= 0.0) return 0.0;
-    // Detail subtract: high-frequency Worley + fbm erodes edges so
-    // clouds look wispy rather than blobby. cp3.z = 0 disables.
+    // Detail subtract: a higher-frequency fbm erodes edges so the
+    // cloud silhouette has wispy fingers rather than smooth blobs.
+    // cp3.z = 0 disables; 0.3 is a comfortable cumulus default.
     if (cp3.z > 0.0) {
-        float hi_w = cloud_worley(sp * 3.0);
-        float hi_f = cloud_fbm(sp * 4.0, 2);
-        float hi   = 0.5 * hi_w + 0.5 * hi_f;
+        float hi = cloud_fbm(sp * 4.0, 3);
         density = saturate(density - hi * cp3.z);
     }
     return density * h_profile * cp1.w;
