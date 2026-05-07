@@ -170,6 +170,7 @@ namespace cvar {
     PT_CVAR(r_clouds_wind_z,         "0.0",      "Wind speed along +Z in metres/second.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_seed,           "0",        "Per-day noise seed (any float). Same preset + different seed = visually distinct cloud pattern. Use one seed per in-game day so each day has its own weather pattern.", CVAR_ARCHIVE);
     PT_CVAR(r_rayleigh,              "30.0",     "Atmospheric Rayleigh scattering scale on the per-channel sea-level sigma (R 5.8e-6, G 13.5e-6, B 33.1e-6 per metre). 1.0 = real Earth atmosphere -- but our typical r_volumetric_density (Mie haze) is ~30x stronger than real-Earth haze, so bumping this to 30 keeps the sky visibly blue at typical haze settings. Drop to 1.0 if you also drop r_volumetric_density to 0.0001-0.0005 (real haze). 0 disables Rayleigh.", CVAR_ARCHIVE);
+    PT_CVAR(r_moon_size,             "1.0",      "Moon angular-size multiplier. 1.0 = our default 0.55deg half-angle (already 2x the real 0.27deg, for visibility at typical 60-FOV 1080p). 5+ = dramatic 'big moon' shots; 0.5 = real lunar size (very small). Halo extent and texture mapping scale with the disc so the moon looks consistent at any size.", CVAR_ARCHIVE);
 
     PT_CVAR(dev_cheats,        "0",    "Gate for CHEAT-flagged cvars",   0);
     PT_CVAR(dev_log_level,     "info", "error|warn|info|debug",          0);
@@ -1276,6 +1277,8 @@ void Engine::RenderFrame() {
         // Moon. .xyz = unit vector toward moon (computed from astro),
         // .w = phase angle radians (0 = new, π = full).
         float moon_dir_phase[4];
+        // Moon extras. .x = r_moon_size multiplier, .yzw reserved.
+        float moon_extra[4];
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -1417,6 +1420,16 @@ void Engine::RenderFrame() {
         push.moon_dir_phase[1] = -1.0f;   // below-horizon sentinel
         push.moon_dir_phase[2] = 0.0f;
         push.moon_dir_phase[3] = 0.0f;
+    }
+    {
+        float moon_size = 1.0f;
+        if (auto* v = C.FindCVar("r_moon_size")) moon_size = v->GetFloat();
+        if (moon_size < 0.1f) moon_size = 0.1f;
+        if (moon_size > 50.0f) moon_size = 50.0f;
+        push.moon_extra[0] = moon_size;
+        push.moon_extra[1] = 0.0f;
+        push.moon_extra[2] = 0.0f;
+        push.moon_extra[3] = 0.0f;
     }
 
     // Sky mode resolution. "hdri" with no env map loaded falls back
@@ -1565,7 +1578,7 @@ void Engine::RenderFrame() {
         push.clouds_p3[3] = rayleigh;
     }
 
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16);
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16);
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
 
@@ -2894,6 +2907,7 @@ void Engine::RegisterCommands() {
     set_slider("r_volumetric_intensity",   0.0f,  4.0f,  0.05f);
     set_slider("r_volumetric_samples",     4.0f, 64.0f,  1.0f);
     set_slider("r_rayleigh",               0.0f, 100.0f,  0.5f);
+    set_slider("r_moon_size",              0.5f,  20.0f,  0.1f);
     set_slider("r_clouds_coverage",         0.0f,    1.0f,   0.01f);
     set_slider("r_clouds_base_height",      0.0f, 12000.0f, 25.0f);
     set_slider("r_clouds_top_height",      50.0f, 14000.0f, 25.0f);

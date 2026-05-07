@@ -143,6 +143,10 @@ cbuffer Push {
     // the moon disc's brightness in skyColor and for moonlight NEE
     // contribution amplitude on cloud / surface BRDF rays.
     float4 moon_dir_phase;
+    // Moon extras. .x = angular-size multiplier (1.0 = real ~0.55deg
+    // half-angle, used for debug / aesthetics: 5+ for "big moon"
+    // dramatic shots, 1.0 for realism). .yzw reserved.
+    float4 moon_extra;
 };
 
 // --- Procedural cloud field --------------------------------------------
@@ -626,12 +630,14 @@ float3 moonDisc(float3 rd, float4 mph, float3 sun_dir_world) {
     if (mph.y < -0.10) return float3(0.0);
     float3 m_dir = mph.xyz;
     float ang = dot(rd, m_dir);
-    // Real lunar angular radius is 0.27 deg, but at typical 60deg-FOV
-    // 1080p that's only ~9 px wide -- correct but tiny. Boosting to
-    // 0.55 deg (~2x real) keeps it close to physical and reads better
-    // on screen, matching what film + game engines typically do.
-    const float kCosR    = 0.99995;      // cos(0.55 deg) -- disc edge
-    const float kCosHalo = 0.99965;      // cos(1.5 deg)  -- halo extent
+    // Real lunar angular radius is 0.27 deg; we render at 0.55 deg
+    // (~2x real) for visibility at typical 60-FOV 1080p, then scale
+    // by r_moon_size (moon_extra.x) for "big moon" debug / aesthetics.
+    float size_mult = max(moon_extra.x, 0.1);
+    float r_deg     = 0.55 * size_mult;
+    float halo_deg  = 1.5  * size_mult;
+    float kCosR     = cos(r_deg    * 0.0174533);
+    float kCosHalo  = cos(halo_deg * 0.0174533);
     if (ang <= kCosHalo) return float3(0.0);
 
     float3 col_tint = float3(0.92, 0.94, 1.00);
@@ -658,9 +664,12 @@ float3 moonDisc(float3 rd, float4 mph, float3 sun_dir_world) {
         float3 t_a = normalize(cross(ax, m_dir));
         float3 t_b = cross(m_dir, t_a);
         // Scale factor 1/sin(disc half-angle) to map disc-tangent
-        // projection to [-1, 1] across the visible diameter.
-        float du = dot(rd, t_a) * 104.0;     // 1/sin(0.55deg)
-        float dv = dot(rd, t_b) * 104.0;
+        // projection to [-1, 1] across the visible diameter. Includes
+        // the moon-size multiplier so "big moon" debug mode still
+        // keeps the texture mapped onto the disc.
+        float disc_scale = 1.0 / max(sin(r_deg * 0.0174533), 1e-5);
+        float du = dot(rd, t_a) * disc_scale;
+        float dv = dot(rd, t_b) * disc_scale;
         float r2 = du * du + dv * dv;
         float zz = sqrt(max(1.0 - r2, 0.0));
 
@@ -679,6 +688,22 @@ float3 moonDisc(float3 rd, float4 mph, float3 sun_dir_world) {
         // transition over a few percent for an aliasing-free edge.
         float lit = saturate(dot(n_world, sun_dir_world) * 10.0 + 0.05);
         if (lit <= 0.0) return col_tint * col_atm * halo * moon_atm * 0.05;
+
+        // Lunar eclipse / blood moon. Earth's umbra at the moon's
+        // distance is ~0.7deg radius (penumbra ~1.25deg). When the
+        // moon's centre falls within this cone -- i.e. within ~0.7deg
+        // of the antisolar point (-sun_dir) -- direct sunlight is
+        // blocked. Atmospheric refraction through Earth's limb
+        // smears red light into the umbra (the same Rayleigh
+        // attenuation that reddens our own sunsets), so the moon
+        // glows deep red instead of going pitch dark. Smooth
+        // penumbra transition so partial eclipses blend.
+        float anti_sun_dot = -dot(m_dir, sun_dir_world);
+        float anti_sun_ang = acos(saturate(anti_sun_dot));
+        const float kUmbraRad    = 0.0122;     // ~0.7 deg
+        const float kPenumbraRad = 0.0218;     // ~1.25 deg
+        float eclipse = 1.0 - smoothstep(kUmbraRad, kPenumbraRad,
+                                         anti_sun_ang);
 
         // Sample the procedural moon map. Equirectangular UV from
         // local (du, dv, zz). Latitude from dv (north/south of moon
@@ -711,8 +736,19 @@ float3 moonDisc(float3 rd, float4 mph, float3 sun_dir_world) {
         // Limb darkening (real lunar limb is darker due to roughness).
         float limb = 0.55 + 0.45 * sqrt(saturate(t_d));
 
-        return col_tint * col_atm * surface * (12.0 * lit * limb * moon_atm)
-             + col_tint * col_atm * halo * lit * moon_atm * 0.3;
+        // Normal moon-lit colour.
+        float3 lit_col = col_tint * col_atm * surface
+                       * (12.0 * lit * limb * moon_atm)
+                       + col_tint * col_atm * halo * lit * moon_atm * 0.3;
+
+        // Blood-moon colour during eclipse: deep red-orange (the
+        // refracted-through-Earth-atmosphere light tone). Surface
+        // texture still shows through, just heavily red-tinted.
+        // Brightness drops a lot -- a typical totality has the moon
+        // ~1/10000 of normal full-moon brightness.
+        float3 eclipse_col = float3(0.55, 0.15, 0.04) * surface
+                           * (limb * moon_atm * 1.5);
+        return lerp(lit_col, eclipse_col, eclipse);
     }
     // Halo only -- no surface here. Halo dims toward new-moon by the
     // average disc lit fraction, approximated by phase brightness.
