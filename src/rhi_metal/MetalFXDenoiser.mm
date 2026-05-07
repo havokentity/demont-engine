@@ -16,12 +16,24 @@
 // shim allocates its own private RGBA16F texture, hands THAT to
 // MetalFX, and then encodes a blit copy from it onto the caller's
 // output texture (swapchain) before returning.
+//
+// Build portability: MTLFXTemporalDenoisedScaler is macOS 26+. On older
+// SDKs (e.g. CI runner macOS 15) the type isn't declared, so the whole
+// implementation is gated behind __MAC_OS_X_VERSION_MAX_ALLOWED. When
+// built against an older SDK we ship stub no-op entry points so callers
+// link, and pt_metalfx_create returning nullptr makes MetalDevice fall
+// through to the no-denoiser path -- same as the runtime @available
+// branch on a real macOS 15 box.
+
+#include <Availability.h>
+#include <cstdint>
+
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
 
 #import <Metal/Metal.h>
 #import <MetalFX/MetalFX.h>
 #import <simd/simd.h>
 
-#include <cstdint>
 #include <cstring>
 
 namespace {
@@ -216,3 +228,16 @@ extern "C" void pt_metalfx_encode(void* state,
         [blit endEncoding];
     }
 }
+
+#else  // __MAC_OS_X_VERSION_MAX_ALLOWED < 260000
+
+// SDK doesn't declare MTLFXTemporalDenoisedScaler -- ship stubs so the
+// link succeeds and the engine falls through to the no-denoiser path.
+extern "C" void* pt_metalfx_create(void*, std::uint32_t, std::uint32_t) {
+    return nullptr;
+}
+extern "C" void pt_metalfx_destroy(void*) {}
+extern "C" void pt_metalfx_encode(void*, void*, void*, void*, void*, void*,
+                                   float, float, const float*, const float*, int) {}
+
+#endif
