@@ -138,7 +138,7 @@ namespace cvar {
     // toward sun at each sample. Atmospheric haze + god rays through
     // gaps in geometry (sun shafts).
     PT_CVAR(r_volumetric,           "0",    "Volumetric single-scatter (atmospheric haze + sun shafts). 0 disables; otherwise march r_volumetric_samples points along each primary ray and NEE-shadow-test toward the sun at each.", CVAR_ARCHIVE);
-    PT_CVAR(r_volumetric_density,   "0.02", "Extinction coefficient (per world unit). Higher = thicker haze + brighter god rays. Realistic atmospheric values are 0.005..0.05.", CVAR_ARCHIVE);
+    PT_CVAR(r_volumetric_density,   "0.002", "Mie extinction coefficient (per metre). Real Earth aerosol haze is 1e-4 to 5e-4 at sea level; 0.002 gives visible god rays paired with r_rayleigh=30 for blue sky. 0.005 = thick haze (visible god rays, partial blue-sky tint loss). 0.05 = fog (sky goes white). Use Rayleigh (r_rayleigh) for the blue sky -- this is the haze layer on top.", CVAR_ARCHIVE);
     PT_CVAR(r_volumetric_anisotropy,"0.7",  "Henyey-Greenstein phase g in [-0.95, 0.95]. +0.7 = forward-peaked atmosphere, 0 = isotropic fog, negative = back-scattering. Higher g makes the sun's halo much brighter when the camera looks near it.", CVAR_ARCHIVE);
     PT_CVAR(r_volumetric_intensity, "1.0",  "Linear scale on the volumetric contribution. Useful to dial god rays up/down without changing the underlying density.", CVAR_ARCHIVE);
     PT_CVAR(r_volumetric_samples,   "16",   "March sample count per primary ray (4..64). More = smoother shafts at proportional GPU cost. 16 is a comfortable default with the denoiser on.", CVAR_ARCHIVE);

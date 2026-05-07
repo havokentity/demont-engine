@@ -212,13 +212,15 @@ float cloud_density_at(float3 pos,
     // Cumulus body: caller-controlled octaves of quintic-interpolated
     // value-noise fbm. Higher octaves -> more wispy detail, more cost.
     float low = cloud_fbm(sp, octaves);
-    // Smooth coverage transition. smoothstep(1-cov, 1, low) gives a
-    // soft S-curve from 0 (no cloud) to 1 (max cloud) over the
-    // noise-value band, instead of the hard linear ramp the previous
-    // saturate((low - (1-cov)) / cov) produced. Soft edges = light
-    // partially passes through wispy outer regions.
+    // Linear ramp coverage -- saturate((low - (1-coverage)) / coverage).
+    // Tried smoothstep but the steep S-curve near the threshold meant a
+    // single hi-freq fbm dip into the [1-coverage, 1-coverage+0.05]
+    // band collapses to zero density, punching visible holes through
+    // the cloud body. Linear keeps the response monotonic and
+    // proportional to the noise value -- holes only appear where the
+    // noise actually says "no cloud".
     float coverage = saturate(cp1.z);
-    float density  = smoothstep(1.0 - coverage, 1.0, low);
+    float density  = saturate((low - (1.0 - coverage)) / max(coverage, 0.01));
     if (density <= 0.0) return 0.0;
     // Detail erosion: a higher-frequency fbm erodes EDGES of clouds
     // into wispy fingers, but should NOT punch holes in dense cores.
