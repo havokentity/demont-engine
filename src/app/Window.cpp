@@ -85,9 +85,19 @@ void Window::RequestClose() {
 
 extern "C" void* pt_window_native_cocoa(GLFWwindow*);
 
+#if defined(_WIN32)
+#  define GLFW_EXPOSE_NATIVE_WIN32
+#  include <GLFW/glfw3native.h>
+#endif
+
 void* Window::NativeHandle() const {
 #if defined(__APPLE__)
     return pt_window_native_cocoa(handle_);
+#elif defined(_WIN32)
+    // Returns HWND. ConsoleOverlay_Win32 attaches a child window
+    // here for the in-game console. Cast to HWND on the consumer
+    // side; void* keeps Window.h free of <Windows.h>.
+    return handle_ ? static_cast<void*>(glfwGetWin32Window(handle_)) : nullptr;
 #else
     return nullptr;
 #endif

@@ -9,30 +9,64 @@
 **Phase in plan:** P12 — Windows bringup with native Vulkan
 (the 13-phase plan lives in `Raytracer Plan/*.html`)
 
-## State at handoff
+## State at handoff (post-runtime-bringup)
 
-CI is **green** on commit `f8db291`:
+Engine **builds, boots, dispatches the path tracer on the RTX 5090 with zero
+Vulkan validation errors.** Spheres + ground plane render. Sky brightness is
+the next visual mismatch to chase. Diff against the pre-bringup tip:
 
-| job | runner | status |
-|---|---|---|
-| macOS (Apple Silicon) | `macos-26` | success |
-| Windows (NVIDIA RTX target) | `windows-latest` | success |
+- `cmake/patch_enkits.cmake` (new): portable replacement for the Mac-only
+  `sed -i.bak` that fixed `std::is_pod` in enkiTS. Pure-CMake, runs on every OS.
+- `cmake/Dependencies.cmake`: enkiTS PATCH_COMMAND now calls `cmake -P`.
+- `cmake/Slang.cmake`: passes `-DPT_TARGET_SPIRV` / `-DPT_TARGET_METAL` to
+  slangc so the shader can fork its push-constant layout per-target.
+- `shaders/PathTrace.slang`: `[[vk::push_constant]] cbuffer Push` now splits
+  on SPIR-V — small prefix (112B) stays in push, tail (336B) lives in a new
+  `cbuffer Frame` at `vk::binding(14, 0)`. Mac path is unchanged.
+- `src/rhi_vulkan/VulkanDevice.{h,cpp}`: ~1000 LoC. Vulkan 1.3, ray-query +
+  acceleration-structure + deferred-host-operations + robustness2 extensions,
+  features pNext chain, 15-binding shared descriptor set layout, real
+  CreateBuffer / WriteBuffer / DestroyBuffer (host-visible, persistent map),
+  WriteTexture (staging buffer + cmd-buffer copy), CreateBLAS / CreateTLAS
+  via VK_KHR_acceleration_structure, per-frame Frame UBO ring for the
+  spilled push tail, full descriptor writes in `VulkanCommandBuffer::Dispatch`
+  with engine-slot → vk-binding translation tables.
 
-What that proves:
-- Every TU compiles under MSVC 14.44 (VS 2022)
-- Linking against `Ws2_32.lib` works for the line-protocol TCP server
-- Slang's Windows-x86_64 binary compiles all 4 shaders to SPIR-V
-  (`PathTrace`, `Tonemap`, `BloomDown`, `BloomUp`)
-- Vulkan SDK 1.3.296.0 resolves `Vulkan::Vulkan` cleanly
-- The final `demont.exe` links
+Confirmed working at runtime:
+- Window creation (GLFW + Vulkan surface)
+- Discrete-GPU pick (RTX 5090 over any iGPU)
+- `maxPushConstantsSize` reported = 256 (NVIDIA standard)
+- Path-trace pipeline creation (no SPIR-V capability errors)
+- Push-constant split: 112B push + 336B Frame UBO upload per dispatch
+- Descriptor binding for all 15 bindings every dispatch (storage_image x8,
+  AS x1, storage_buffer x5, ubo x1) with `nullDescriptor` for unbound slots
+- BLAS / TLAS build for the CSG-drilled cube
+- WriteTexture upload (sunset.hdr env_map, BSC starmap, procedural moon)
+- Console servers (HTTP + line) bind, web UI accessible
 
-What CI does **not** prove (this is the work for this session):
-- Window creation actually works (GLFW + Vulkan surface)
-- Discrete-GPU selection picks the RTX over an iGPU/MUX
-- Compute kernels run end-to-end on real NVIDIA silicon
-- Swapchain creation + present timing are sane
-- The console servers (HTTP + line) bind on Windows
-- The renderer produces the expected image at runtime
+Open visual mismatches vs Mac (next session's work):
+- Sky too bright. The path-trace shader has `output[tid] =
+  acesTonemap(avg * exposure_pad.x)` (PathTrace.slang:1667), so tonemap is
+  inline — but something in the input data (env_map, star_map, moon_map?
+  exposure?) is feeding values that overwhelm ACES rolloff. Debug live via
+  the web console at <http://127.0.0.1:27960/>:
+  - `r_env_intensity 0` → does sky go to procedural gradient?
+  - `r_show_stars 0` → does it dim?
+  - `r_exposure 0.5` → does it dial down proportionally?
+  - `r_env_map 0` → falls back to procedural sky entirely
+  Whichever toggle fixes brightness names the culprit.
+- CSG cube possibly missing. TLAS *builds* (no errors), but whether the
+  ray-query hits register correctly in the shader is not verified.
+
+Not blocking but cosmetic:
+- `Tonemap` / `BloomDown` / `BloomUp` pipelines aren't built on Vulkan yet
+  (they have their own descriptor layout + 576B push-constant block that
+  needs the same split treatment as PathTrace). Engine's tonemap dispatch
+  silently no-ops; PathTrace's inline tonemap does the work for now.
+- JobSystem reports "1 worker thread" on Windows. Functional but suboptimal
+  on a 16-core 9950X3D. Worth investigating in `JobSystem.cpp`.
+- Native Vulkan terminal output renders cleaner in Windows Terminal than
+  CLion's bundled emulator (better ANSI / Unicode handling).
 
 ## Build & run
 

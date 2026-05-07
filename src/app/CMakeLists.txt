@@ -10,6 +10,13 @@ if(APPLE)
         Window_Cocoa.mm
         MetalLayerAttach.mm
         ConsoleOverlay.mm)
+elseif(WIN32)
+    # Native Win32 console overlay (GDI + monospace font, child window
+    # attached to the GLFW HWND). Same cross-cutting role as the .mm
+    # implementation on macOS; lives in the OS window hierarchy, not
+    # the rendering pipeline.
+    list(APPEND _pt_window_sources
+        ConsoleOverlay_Win32.cpp)
 else()
     list(APPEND _pt_window_sources
         ConsoleOverlay_Stub.cpp)
@@ -23,6 +30,7 @@ target_link_libraries(pt_app_window
     PUBLIC  pt_core
     PUBLIC  pt_console
     PUBLIC  glfw
+    PUBLIC  fmt::fmt
 )
 
 if(APPLE)
@@ -38,6 +46,10 @@ if(APPLE)
     set_source_files_properties(Window_Cocoa.mm     PROPERTIES COMPILE_FLAGS "-fobjc-arc")
     set_source_files_properties(MetalLayerAttach.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
     set_source_files_properties(ConsoleOverlay.mm   PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+elseif(WIN32)
+    # GDI / user32 / kernel32. user32 is implicitly linked by MSVC
+    # but list it explicitly so the dependency is visible.
+    target_link_libraries(pt_app_window PUBLIC user32 gdi32)
 endif()
 
 pt_set_compiler_options(pt_app_window)
