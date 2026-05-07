@@ -142,6 +142,26 @@ namespace cvar {
     PT_CVAR(r_volumetric_anisotropy,"0.7",  "Henyey-Greenstein phase g in [-0.95, 0.95]. +0.7 = forward-peaked atmosphere, 0 = isotropic fog, negative = back-scattering. Higher g makes the sun's halo much brighter when the camera looks near it.", CVAR_ARCHIVE);
     PT_CVAR(r_volumetric_intensity, "1.0",  "Linear scale on the volumetric contribution. Useful to dial god rays up/down without changing the underlying density.", CVAR_ARCHIVE);
     PT_CVAR(r_volumetric_samples,   "16",   "March sample count per primary ray (4..64). More = smoother shafts at proportional GPU cost. 16 is a comfortable default with the denoiser on.", CVAR_ARCHIVE);
+
+    // Volumetric clouds. Layer on top of homogeneous haze: when r_clouds
+    // is on, the volumetric march multiplies sigma_t by a position-
+    // sampled cloud density (procedural fbm value-noise). Presets
+    // (`r_clouds_preset`) snap the individual params to known-good
+    // weather looks; the per-day seed (`r_clouds_seed`) shifts the
+    // noise hash so the same preset can produce visually distinct
+    // patterns each day.
+    PT_CVAR(r_clouds,                "0",        "Volumetric clouds on top of the homogeneous haze. 0 disables (haze stays). Requires r_volumetric to be on -- the cloud field rides the same ray march.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_preset,         "cumulus",  "Cloud preset name. One of clear|cumulus|stratus|cirrus|overcast|storm. Setting this snaps r_clouds_coverage / _base / _top / _density / _detail to canonical values for that weather.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_coverage,       "0.45",     "Sky coverage fraction [0..1]. 0 = clear, 1 = full overcast. Subtracted from the noise threshold so only high-noise regions become cloud.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_base_height,    "200.0",    "World-space height (Y) of the cloud layer's bottom, in metres. Cumulus 100-300m, stratus 100-200m, cirrus 6000-12000m.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_top_height,     "500.0",    "World-space height of the cloud layer's top. Cloud volume is base..top; outside this band density = 0.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_density,        "12.0",     "Peak extinction at the densest interior point. Multiplied into the volumetric sigma_t so values stack with r_volumetric_density. 8-15 reads as solid cumulus, 25+ reads as storm.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_freq,           "0.005",    "Noise frequency in cycles per world unit. 0.003 = ~330m features (slow undulating clouds), 0.01 = ~100m features (smaller puffy cumulus).", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_detail,         "0.35",     "High-frequency detail amount [0..1]. 0 = soft blobby clouds, 1 = wispy/eroded edges. Adds a 4x-frequency fbm subtract.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_wind_x,         "5.0",      "Wind velocity along world X, m/s. Drifts the noise field over time so clouds appear to move with the weather.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_wind_z,         "0.0",      "Wind velocity along world Z, m/s.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_seed,           "0",        "Per-day noise seed (any float). Same preset + different seed = visually distinct cloud pattern. Use to give each in-game day its own weather. Try 1, 2, 3, ... or hash from a date.", CVAR_ARCHIVE);
+
     PT_CVAR(dev_cheats,        "0",    "Gate for CHEAT-flagged cvars",   0);
     PT_CVAR(dev_log_level,     "info", "error|warn|info|debug",          0);
 
@@ -1192,6 +1212,11 @@ void Engine::RenderFrame() {
         // .x = density (0 disables). .y = HG anisotropy. .z =
         // intensity. .w = march sample count (cast to int in shader).
         float vol_params[4];
+        // Volumetric cloud parameters. See PathTrace.slang's Push for
+        // the field-by-field layout. Three float4s = 48 bytes.
+        float clouds_p1[4];   // (base_y, top_y, coverage, peak_density)
+        float clouds_p2[4];   // (wind_x, wind_z, freq, time_seconds)
+        float clouds_p3[4];   // (seed_offset_x, seed_offset_z, detail_amount, _)
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -1392,7 +1417,53 @@ void Engine::RenderFrame() {
         push.vol_params[3] = float(samples);
     }
 
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16);
+    {
+        // Volumetric clouds: ride the same march as homogeneous haze.
+        // peak_density (clouds_p1.w) of 0 disables sampling; the shader
+        // collapses back to plain haze sigma_t in that case.
+        bool  clouds_on   = false;
+        float coverage    = 0.45f;
+        float base_y      = 200.0f;
+        float top_y       = 500.0f;
+        float density     = 12.0f;
+        float freq        = 0.005f;
+        float detail      = 0.35f;
+        float wind_x      = 5.0f;
+        float wind_z      = 0.0f;
+        float seed        = 0.0f;
+        if (auto* v = C.FindCVar("r_clouds"))             clouds_on = v->GetBool();
+        if (auto* v = C.FindCVar("r_clouds_coverage"))    coverage  = v->GetFloat();
+        if (auto* v = C.FindCVar("r_clouds_base_height")) base_y    = v->GetFloat();
+        if (auto* v = C.FindCVar("r_clouds_top_height"))  top_y     = v->GetFloat();
+        if (auto* v = C.FindCVar("r_clouds_density"))     density   = v->GetFloat();
+        if (auto* v = C.FindCVar("r_clouds_freq"))        freq      = v->GetFloat();
+        if (auto* v = C.FindCVar("r_clouds_detail"))      detail    = v->GetFloat();
+        if (auto* v = C.FindCVar("r_clouds_wind_x"))      wind_x    = v->GetFloat();
+        if (auto* v = C.FindCVar("r_clouds_wind_z"))      wind_z    = v->GetFloat();
+        if (auto* v = C.FindCVar("r_clouds_seed"))        seed      = v->GetFloat();
+        if (top_y < base_y + 1.0f) top_y = base_y + 1.0f;
+        // Time accumulator for wind drift. Uses frame_index * a target
+        // frame interval -- imprecise versus wall clock but stable
+        // across reset_accum and reproducible per-frame for the
+        // accumulator's running mean (no temporal noise from clock jitter).
+        const float t_seconds = float(frame_index_) * (1.0f / 60.0f);
+        push.clouds_p1[0] = base_y;
+        push.clouds_p1[1] = top_y;
+        push.clouds_p1[2] = clouds_on ? coverage : 0.0f;
+        push.clouds_p1[3] = clouds_on ? density  : 0.0f;
+        push.clouds_p2[0] = wind_x;
+        push.clouds_p2[1] = wind_z;
+        push.clouds_p2[2] = freq;
+        push.clouds_p2[3] = t_seconds;
+        // Hash the seed into two coordinate offsets so r_clouds_seed=1
+        // and =2 produce visually different (not just shifted) fields.
+        push.clouds_p3[0] = seed * 137.137f;
+        push.clouds_p3[1] = seed * 271.951f;
+        push.clouds_p3[2] = detail;
+        push.clouds_p3[3] = 0.0f;
+    }
+
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48);
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
 
@@ -2366,6 +2437,74 @@ void Engine::RegisterCommands() {
             v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
         }
     }
+    // Cloud cvars: every change resets accum so the temporal mean
+    // doesn't smear the old field into the new one.
+    if (auto* v = C.FindCVar("r_clouds")) {
+        v->allowed_values = {"0", "1"};
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    for (const char* n : {"r_clouds_coverage",  "r_clouds_base_height",
+                          "r_clouds_top_height","r_clouds_density",
+                          "r_clouds_freq",      "r_clouds_detail",
+                          "r_clouds_wind_x",    "r_clouds_wind_z",
+                          "r_clouds_seed"}) {
+        if (auto* v = C.FindCVar(n)) {
+            v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+        }
+    }
+    // Cloud preset: when set, snap the individual cloud cvars to the
+    // preset's parameter set. The user can then nudge individual values
+    // without changing the preset name (or set it to "custom" to lock).
+    // Heights are in metres; density is the peak sigma multiplier.
+    if (auto* v = C.FindCVar("r_clouds_preset")) {
+        v->allowed_values = {"clear", "cumulus", "stratus", "cirrus",
+                              "overcast", "storm", "custom"};
+        v->on_change = [this](const pt::console::CVar& cv) {
+            struct CloudPreset {
+                const char* name;
+                float coverage;
+                float base_y;
+                float top_y;
+                float density;
+                float freq;
+                float detail;
+            };
+            static const CloudPreset presets[] = {
+                // name        cov   base    top    dens  freq    detail
+                { "clear",     0.0f, 200.0f, 500.0f, 0.0f,  0.005f, 0.0f  },
+                { "cumulus",   0.45f,200.0f, 500.0f, 12.0f, 0.005f, 0.35f },
+                { "stratus",   0.92f,150.0f, 280.0f, 6.0f,  0.0025f,0.15f },
+                { "cirrus",    0.30f,800.0f, 950.0f, 3.0f,  0.0035f,0.55f },
+                { "overcast",  0.98f,200.0f, 600.0f, 9.0f,  0.0035f,0.20f },
+                { "storm",     0.85f,150.0f, 1500.0f,22.0f, 0.0045f,0.45f },
+            };
+            const std::string& name = cv.value;
+            if (name == "custom") return;   // leave individual cvars alone
+            auto& C = pt::console::Console::Get();
+            for (const auto& p : presets) {
+                if (name != p.name) continue;
+                auto set_f = [&C](const char* n, float v) {
+                    if (auto* c = C.FindCVar(n)) {
+                        c->value = std::to_string(v);
+                        if (c->on_change) c->on_change(*c);
+                    }
+                };
+                set_f("r_clouds_coverage",    p.coverage);
+                set_f("r_clouds_base_height", p.base_y);
+                set_f("r_clouds_top_height",  p.top_y);
+                set_f("r_clouds_density",     p.density);
+                set_f("r_clouds_freq",        p.freq);
+                set_f("r_clouds_detail",      p.detail);
+                LOG_INFO("Cloud preset '{}': cov {:.2f} base {} top {} "
+                         "dens {} freq {} detail {:.2f}",
+                         name, p.coverage, p.base_y, p.top_y, p.density,
+                         p.freq, p.detail);
+                accum_dirty_ = true;
+                return;
+            }
+            LOG_WARN("Unknown cloud preset '{}': leaving cvars unchanged", name);
+        };
+    }
     // r_quality: master preset that bulk-edits the per-feature cvars.
     // Ranges chosen so 'low' is comfortably fast at 1080p on M-series
     // GPUs, 'high' is the headline-correct path, and 'ultra' bumps
@@ -2622,6 +2761,15 @@ void Engine::RegisterCommands() {
     set_slider("r_volumetric_anisotropy", -0.95f, 0.95f, 0.01f);
     set_slider("r_volumetric_intensity",   0.0f,  4.0f,  0.05f);
     set_slider("r_volumetric_samples",     4.0f, 64.0f,  1.0f);
+    set_slider("r_clouds_coverage",        0.0f,  1.0f,  0.01f);
+    set_slider("r_clouds_base_height",     0.0f, 2000.0f, 5.0f);
+    set_slider("r_clouds_top_height",      1.0f, 5000.0f, 5.0f);
+    set_slider("r_clouds_density",         0.0f, 50.0f,  0.1f);
+    set_slider("r_clouds_freq",         0.0005f, 0.05f, 0.0005f);
+    set_slider("r_clouds_detail",          0.0f,  1.0f,  0.01f);
+    set_slider("r_clouds_wind_x",        -50.0f, 50.0f,  0.5f);
+    set_slider("r_clouds_wind_z",        -50.0f, 50.0f,  0.5f);
+    set_slider("r_clouds_seed",            0.0f, 100.0f, 1.0f);
     set_slider("r_bloom_threshold",     0.0f,  10.0f,  0.05f);
     set_slider("r_bloom_intensity",     0.0f,   1.0f,  0.005f);
     set_slider("r_bloom_mips",          1.0f,   5.0f,  1.0f);

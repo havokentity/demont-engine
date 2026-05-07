@@ -105,7 +105,110 @@ cbuffer Push {
     //   .z = intensity multiplier on the final scatter contribution.
     //   .w = march sample count (cast to int; 4..64 typical).
     float4 vol_params;
+    // Volumetric cloud parameters. When clouds_p1.w > 0 the volumetric
+    // march multiplies sigma_t by a position-dependent cloud density
+    // sampled from a procedural fbm noise field.
+    //   clouds_p1: (base_y, top_y, coverage[0..1], peak_density)
+    //              base_y / top_y are world-space heights bracketing
+    //              the cloud layer; pos.y outside this range = 0.
+    //              coverage = sky-fill fraction; peak_density is the
+    //              extinction at the densest interior point.
+    //   clouds_p2: (wind_x, wind_z, freq, time_seconds)
+    //              wind translates the noise input by wind*time so
+    //              the cloud field drifts. freq is cycles per world
+    //              unit (~0.005 = ~200m features). time advances per
+    //              frame to animate the field.
+    //   clouds_p3: (seed_offset_x, seed_offset_z, detail_amount, _)
+    //              seed shifts the noise hash so different seeds
+    //              produce visually distinct cloud patterns at the
+    //              same preset (each "day" can have its own seed).
+    //              detail_amount in [0,1] blends in a higher-frequency
+    //              octave for wispy edges.
+    float4 clouds_p1;
+    float4 clouds_p2;
+    float4 clouds_p3;
 };
+
+// --- Procedural cloud field --------------------------------------------
+//
+// Hash-based 3D value noise + fbm. Cheaper than gradient (Perlin)
+// noise -- the smoothstep filter step gives enough visual continuity
+// for cloud bodies at this scale, and we don't need C2 continuity for
+// volumetric sampling. ~30 ALU per sample × ~4 octaves × 16 march
+// samples × 1080p = ~6 GFLOP/frame on the worst march, well under
+// budget on M4 Max.
+
+float cloud_hash(float3 p) {
+    p = frac(p * 0.3183099 + 0.1);
+    p *= 17.0;
+    return frac(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+
+float cloud_value_noise(float3 p) {
+    float3 i = floor(p);
+    float3 f = frac(p);
+    f = f * f * (3.0 - 2.0 * f);   // smoothstep interpolation
+    float a = cloud_hash(i + float3(0, 0, 0));
+    float b = cloud_hash(i + float3(1, 0, 0));
+    float c = cloud_hash(i + float3(0, 1, 0));
+    float d = cloud_hash(i + float3(1, 1, 0));
+    float e = cloud_hash(i + float3(0, 0, 1));
+    float fx = cloud_hash(i + float3(1, 0, 1));
+    float gx = cloud_hash(i + float3(0, 1, 1));
+    float hx = cloud_hash(i + float3(1, 1, 1));
+    return lerp(lerp(lerp(a,  b,  f.x), lerp(c,  d,  f.x), f.y),
+                lerp(lerp(e,  fx, f.x), lerp(gx, hx, f.x), f.y),
+                f.z);
+}
+
+float cloud_fbm(float3 p, int octaves) {
+    float v = 0.0;
+    float a = 0.5;
+    [unroll(6)]
+    for (int i = 0; i < octaves; ++i) {
+        v += a * cloud_value_noise(p);
+        p *= 2.02;          // non-integer freq mult avoids axis-aligned artefacts
+        a *= 0.5;
+    }
+    return v;
+}
+
+// Density at a world-space point. Returns 0 outside the cloud layer
+// or where the noise threshold isn't met. The volumetric march
+// multiplies this by sigma_t to vary extinction along the ray.
+float cloud_density_at(float3 pos,
+                       float4 cp1, float4 cp2, float4 cp3) {
+    if (cp1.w <= 0.0) return 0.0;
+    float base_y = cp1.x;
+    float top_y  = cp1.y;
+    if (pos.y < base_y || pos.y > top_y) return 0.0;
+    float h_norm = (pos.y - base_y) / max(top_y - base_y, 1e-3);
+    // Height profile: ramp up from the bottom, fall off before the top.
+    // Peaks around h_norm = 0.4 -- biases toward dense lower volumes,
+    // wispy upper volumes (cumulus shape).
+    float h_profile = smoothstep(0.0, 0.2, h_norm)
+                    * (1.0 - smoothstep(0.6, 1.0, h_norm));
+    if (h_profile <= 0.0) return 0.0;
+    // Wind translation + per-day seed offset.
+    float3 sp = pos
+              + float3(cp2.x * cp2.w, 0.0, cp2.y * cp2.w)
+              + float3(cp3.x, 0.0, cp3.y);
+    sp *= cp2.z;
+    // Low-frequency cloud body (4 fbm octaves).
+    float low = cloud_fbm(sp, 4);
+    // Coverage threshold: subtract (1 - coverage) so only high-noise
+    // regions become cloud. coverage = 1 -> all-cloud, 0 -> no cloud.
+    float coverage = saturate(cp1.z);
+    float density  = saturate((low - (1.0 - coverage)) / max(coverage, 0.01));
+    if (density <= 0.0) return 0.0;
+    // Detail subtract: high-frequency noise erodes edges so clouds
+    // look wispy rather than blobby. cp3.z = 0 disables.
+    if (cp3.z > 0.0) {
+        float hi = cloud_fbm(sp * 4.0, 2);
+        density = saturate(density - hi * cp3.z);
+    }
+    return density * h_profile * cp1.w;
+}
 
 static const uint MAT_LAMBERT    = 0u;
 static const uint MAT_METAL      = 1u;
@@ -848,10 +951,19 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         / (4.0 * 3.14159265358979
                                 * pow(max(1.0 + g2 - 2.0 * g * cos_theta, 1e-4), 1.5));
 
+            // If clouds are enabled (clouds_p1.w > 0), the per-step
+            // sigma_t is the homogeneous haze plus a position-sampled
+            // cloud density. Outside the cloud layer the cloud term
+            // evaluates to 0 so we collapse back to plain haze.
+            bool clouds_on = clouds_p1.w > 0.0;
             for (int vi = 0; vi < N; ++vi) {
                 float t = (float(vi) + 0.5) * dt + jitter;
                 if (t >= primary_t) break;
                 float3 sp = primary_ro + primary_rd * t;
+                float sigma_t_step = sigma_t;
+                if (clouds_on) {
+                    sigma_t_step += cloud_density_at(sp, clouds_p1, clouds_p2, clouds_p3);
+                }
                 // NEE toward sun: refractive-shadow-ray transmittance
                 // gives a tinted attenuation through any glass on
                 // the path, plus full kill if blocked by opaque.
@@ -859,10 +971,10 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     float3 trans_sun = transmittance(sp, sun_dir, 1e30);
                     if (any(trans_sun > float3(0.0))) {
                         v_color += sun_rad * trans_sun * phase
-                                 * sigma_t * dt * trans_eye;
+                                 * sigma_t_step * dt * trans_eye;
                     }
                 }
-                trans_eye *= exp(-sigma_t * dt);
+                trans_eye *= exp(-sigma_t_step * dt);
             }
             radiance += v_color * vol_int;
         }

@@ -35,6 +35,8 @@
     'r_bloom', 'r_bloom_intensity', 'r_bloom_threshold',
     'r_lens_flare', 'r_lens_flare_intensity',
     'r_volumetric', 'r_volumetric_density', 'r_volumetric_intensity',
+    'r_clouds', 'r_clouds_preset', 'r_clouds_coverage', 'r_clouds_density',
+    'r_clouds_seed',
   ];
   const pinnedRaw = localStorage.getItem('demont.pinned');
   const pinned = new Set(pinnedRaw === null
@@ -175,7 +177,7 @@
     if (/^stars_|^show_stars$/.test(tail))                                  return { top: 'r', sub: 'stars' };
     if (/^env_/.test(tail))                                                 return { top: 'r', sub: 'env' };
     if (/^exposure|^auto_exposure$|^eye_/.test(tail))                       return { top: 'r', sub: 'camera' };
-    if (/^caustics$|^refract|^quality$|^spp$|^max_bounces$|^volumetric/.test(tail)) return { top: 'r', sub: 'integrator' };
+    if (/^caustics$|^refract|^quality$|^spp$|^max_bounces$|^volumetric|^clouds/.test(tail)) return { top: 'r', sub: 'integrator' };
     if (/^denoiser$|^hdr_|^bloom|^lens_flare/.test(tail))                   return { top: 'r', sub: 'post' };
     return { top: 'r', sub: 'display' };
   }
