@@ -34,6 +34,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
+#include <numbers>
 #include <thread>
 
 namespace pt::engine {
@@ -749,7 +750,7 @@ void Engine::ReloadEnvMap(const std::string& path) {
     std::vector<float> marginal(H);                          // CDF over rows
     double total = 0.0;
     for (std::uint32_t v = 0; v < H; ++v) {
-        const double sin_theta = std::sin(M_PI * (double(v) + 0.5) / double(H));
+        const double sin_theta = std::sin(std::numbers::pi * (double(v) + 0.5) / double(H));
         double row_sum = 0.0;
         for (std::uint32_t u = 0; u < W; ++u) {
             const std::size_t pi = std::size_t(v) * W + u;
