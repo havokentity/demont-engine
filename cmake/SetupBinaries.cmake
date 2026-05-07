@@ -38,7 +38,18 @@ if(NOT EXISTS "${_slangc_path}")
         message(FATAL_ERROR "Slang download failed: ${_dl}")
     endif()
     file(MAKE_DIRECTORY "${_slang_dir}")
-    execute_process(COMMAND ${CMAKE_COMMAND} -E tar xf "${_slang_archive}"
+    # Pick extraction flags by archive type. Modern CMake's `tar xf`
+    # does auto-detect compression, but we've seen edge cases on older
+    # 3.20-ish toolchains and busybox-tar fallbacks where `xf` silently
+    # produces an empty extraction for .tar.gz inputs. Be explicit:
+    # `xzf` for gzip tarballs, `xf` for plain zips. The Mac/Linux Slang
+    # releases are .tar.gz; the Windows release is .zip.
+    if(_slang_archive MATCHES "\\.tar\\.gz$")
+        set(_tar_flags xzf)
+    else()
+        set(_tar_flags xf)
+    endif()
+    execute_process(COMMAND ${CMAKE_COMMAND} -E tar ${_tar_flags} "${_slang_archive}"
                     WORKING_DIRECTORY "${_slang_dir}"
                     RESULT_VARIABLE _tar_rc)
     if(NOT _tar_rc EQUAL 0)

@@ -150,6 +150,12 @@ private:
     HWND      parent_      = nullptr;
     HWND      hwnd_        = nullptr;
     HFONT     font_        = nullptr;
+    // True iff `font_` was created by us via CreateFontW and we own
+    // its lifetime. False if it points at a Win32 stock object (from
+    // GetStockObject), which the OS owns -- DeleteObject on a stock
+    // GDI handle is documented as undefined behaviour and was caught
+    // by Copilot review on the SYSTEM_FIXED_FONT fallback path.
+    bool      font_is_owned_ = false;
     bool      shown_       = false;
     bool      is_layered_  = false;
     int       parent_w_    = 0;
@@ -275,8 +281,14 @@ bool WinOverlay::Init(HWND parent) {
         CLEARTYPE_QUALITY,
         FIXED_PITCH | FF_MODERN,
         L"Cascadia Mono");
-    if (!font_) {
-        font_ = (HFONT)GetStockObject(SYSTEM_FIXED_FONT);
+    if (font_) {
+        font_is_owned_ = true;
+    } else {
+        // CreateFontW failure -- e.g. Cascadia Mono not installed on
+        // Windows Server SKUs. SYSTEM_FIXED_FONT always exists and is
+        // owned by GDI; we MUST NOT DeleteObject it in Shutdown().
+        font_          = (HFONT)GetStockObject(SYSTEM_FIXED_FONT);
+        font_is_owned_ = false;
     }
 
     g = this;
@@ -310,7 +322,14 @@ bool WinOverlay::Init(HWND parent) {
 void WinOverlay::Shutdown() {
     if (g == this) g = nullptr;
     if (hwnd_) { KillTimer(hwnd_, kAnimTimerId); }
-    if (font_)  { DeleteObject(font_); font_ = nullptr; }
+    if (font_)  {
+        // Stock GDI objects (GetStockObject) are owned by the OS --
+        // DeleteObject on them is undefined; only delete fonts we
+        // CreateFontW'd ourselves.
+        if (font_is_owned_) DeleteObject(font_);
+        font_          = nullptr;
+        font_is_owned_ = false;
+    }
     if (hwnd_)  { DestroyWindow(hwnd_); hwnd_ = nullptr; }
     parent_     = nullptr;
     shown_      = false;
