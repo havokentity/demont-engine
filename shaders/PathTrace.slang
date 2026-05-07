@@ -220,17 +220,22 @@ float cloud_density_at(float3 pos,
     float coverage = saturate(cp1.z);
     float density  = smoothstep(1.0 - coverage, 1.0, low);
     if (density <= 0.0) return 0.0;
-    // Detail subtract: a higher-frequency fbm erodes edges so the
-    // cloud silhouette has wispy fingers rather than smooth blobs.
+    // Detail erosion: a higher-frequency fbm erodes EDGES of clouds
+    // into wispy fingers, but should NOT punch holes in dense cores.
+    // The previous unconditional subtract was hollowing out cumulus
+    // bodies (donut-shaped clouds). Solution: scale erosion strength
+    // by (1 - density)^2 so density 1.0 is fully protected, density
+    // 0.5 erodes at 0.25x, density 0.1 erodes at full strength. Real
+    // cumulus shows wispy trails, not Swiss-cheese cores.
     if (cp3.z > 0.0) {
         float hi = cloud_fbm(sp * 4.0, 3);
-        density = saturate(density - hi * cp3.z);
+        float edge = (1.0 - density) * (1.0 - density);
+        density = saturate(density - hi * cp3.z * edge);
     }
-    // Internal variation: secondary fbm modulates density inside the
-    // cloud so a thick body isn't uniform white. Real cumulus has
-    // brighter rims and darker cores; this gives the volume some
-    // texture without being noisy.
-    float internal = 0.55 + 0.45 * cloud_fbm(sp * 1.7, 3);
+    // Internal variation: a SOFT secondary fbm gives the cloud volume
+    // some texture without holes. Bias toward 1.0 (multiplier 0.75-1.0
+    // instead of 0.55-1.0) so we don't dim the cloud body uniformly.
+    float internal = 0.75 + 0.25 * cloud_fbm(sp * 1.7, 3);
     density *= internal;
     // cp1.w is peak sigma_t per metre. Real meteorology:
     //   light cumulus    ~0.03-0.05 /m
