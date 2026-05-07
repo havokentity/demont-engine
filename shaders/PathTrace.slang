@@ -554,29 +554,62 @@ float3 procSky(float3 rd, float3 sun) {
     return max(sky, float3(0.0));
 }
 
-// Bright disc for the moon. Real lunar angular radius is 0.00465 rad
-// (~16 arcmin). Phase shading: brightness scales with (1 - cos(phase))/2
-// so full moon = 1, new = 0, half = 0.5. The disc is added on top of
-// whatever the underlying sky returns (procedural / env_map / gradient)
-// so it shows through the night sky AND through cloud-mip thin spots.
+// Moon disc + halo. Real lunar angular radius is 0.00465 rad (~0.27deg
+// half-angle = 0.54deg full). Brightness shading:
+//   - phase: 0.5*(1 - cos(phase)) maps new->0, full->1, half->0.5
+//   - limb darkening: edge of disc dimmer than centre (real lunar effect)
+//   - atmospheric attenuation: dims with airmass when moon is near horizon
+//     (same physics as sun reddening at sunset)
+//   - procedural surface noise: faint cratered look so the disc isn't
+//     a flat-shaded circle. Anchored to a moon-local frame so the
+//     "craters" stay put as the camera turns rather than swimming.
+//   - subtle outer halo: light scatters off cirrus + atmosphere around
+//     the moon (real "moon halo"), reading as a soft ring out to ~1.5deg.
 float3 moonDisc(float3 rd, float4 mph) {
-    if (mph.y < -0.10) return float3(0.0);     // moon below horizon
+    if (mph.y < -0.10) return float3(0.0);
     float3 m_dir = mph.xyz;
     float ang = dot(rd, m_dir);
-    const float kCosR = 0.99998918;            // cos(0.00465 rad)
-    if (ang <= kCosR) return float3(0.0);
-    // Phase brightness: 0.5 (1 - cos(phase)) maps 0->0, π->1, π/2->0.5.
-    // Dirty single-direction approximation — no terminator curvature.
-    float phase = mph.w;
+    const float kCosR    = 0.99998918;   // cos(0.27 deg) -- disc edge
+    const float kCosHalo = 0.99965;      // cos(1.5 deg)  -- halo extent
+    if (ang <= kCosHalo) return float3(0.0);
+
+    float phase  = mph.w;
     float bright = 0.5 * (1.0 - cos(phase));
-    // Slightly cool tint for moonlight (real moonlight is mostly
-    // sun-reflected so it's actually warm white, but eyes interpret
-    // it as cool against night-adapted vision; viewer expectation).
-    float3 col = float3(0.85, 0.90, 1.00);
-    // Limb darkening: dimmer near the disc edge.
-    float t_edge = (ang - kCosR) / (1.0 - kCosR);
-    float limb = 0.55 + 0.45 * sqrt(saturate(t_edge));
-    return col * (12.0 * bright * limb);
+    float3 col   = float3(0.92, 0.94, 1.00);
+
+    // Atmospheric attenuation. air_mass = 1/sin(elev), capped to handle
+    // near-horizon edge cases. Same model as sun_rad uses.
+    float moon_am  = 1.0 / max(mph.y, 0.04);
+    float moon_atm = exp(-0.30 * moon_am);
+
+    // Halo ring (extends beyond the disc).
+    float halo = 0.0;
+    if (ang > kCosHalo) {
+        float t_h = (ang - kCosHalo) / (1.0 - kCosHalo);
+        halo = pow(t_h, 4.0) * 0.6;
+    }
+
+    if (ang > kCosR) {
+        float t_d = (ang - kCosR) / (1.0 - kCosR);
+        // Build a tangent frame around the moon and project the view
+        // ray into (u, v) on the disc. Sampled noise becomes the
+        // cratered surface texture that's static relative to the
+        // moon's apparent direction.
+        float3 ax = abs(m_dir.y) < 0.99 ? float3(0, 1, 0) : float3(1, 0, 0);
+        float3 t_a = normalize(cross(ax, m_dir));
+        float3 t_b = cross(m_dir, t_a);
+        float du = dot(rd, t_a) * 215.0;     // ~1/sin(0.27deg) for unit disc
+        float dv = dot(rd, t_b) * 215.0;
+        // Two octaves of value noise for "mare + crater" detail.
+        float n_lo = cloud_value_noise(float3(du * 0.6, dv * 0.6, 0.0));
+        float n_hi = cloud_value_noise(float3(du * 2.2, dv * 2.2, 7.7));
+        float surface = 0.70 + 0.30 * (0.65 * n_lo + 0.35 * n_hi);
+        // Limb darkening (real lunar limb is darker due to roughness).
+        float limb = 0.55 + 0.45 * sqrt(saturate(t_d));
+        return col * (10.0 * bright * limb * surface * moon_atm)
+             + col *  halo * bright * moon_atm * 0.3;
+    }
+    return col * halo * bright * moon_atm * 0.3;
 }
 
 float3 skyColor(float3 rd) {
@@ -991,7 +1024,16 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         if (ndl > 0.0) {
                             float3 t_m = transmittance(hit_pt + nf * 1e-3, moon_jit, 1e30);
                             if (any(t_m > float3(0.0))) {
-                                float3 moon_rad = float3(0.85, 0.90, 1.00) * (4.0 * phase_b);
+                                // Atmospheric attenuation + warmth at low
+                                // moon altitude, mirroring sun radiance.
+                                float m_elev = max(moon_dir_phase.y, 0.04);
+                                float m_am = 1.0 / m_elev;
+                                float m_atm = exp(-0.30 * m_am);
+                                float m_warmth = saturate((m_am - 1.0) * 0.18);
+                                float3 m_col = lerp(float3(0.92, 0.94, 1.00),
+                                                    float3(1.20, 0.65, 0.40),
+                                                    m_warmth);
+                                float3 moon_rad = m_col * (0.8 * phase_b * m_atm);
                                 float3 brdf = h.albedo / 3.14159265358979;
                                 radiance += throughput * moon_rad * t_m * brdf * ndl;
                             }
@@ -1069,7 +1111,16 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         if (ndl > 0.0) {
                             float3 t_m = transmittance(hit_pt + nf * 1e-3, moon_jit, 1e30);
                             if (any(t_m > float3(0.0))) {
-                                float3 moon_rad = float3(0.85, 0.90, 1.00) * (4.0 * phase_b);
+                                // Atmospheric attenuation + warmth at low
+                                // moon altitude, mirroring sun radiance.
+                                float m_elev = max(moon_dir_phase.y, 0.04);
+                                float m_am = 1.0 / m_elev;
+                                float m_atm = exp(-0.30 * m_am);
+                                float m_warmth = saturate((m_am - 1.0) * 0.18);
+                                float3 m_col = lerp(float3(0.92, 0.94, 1.00),
+                                                    float3(1.20, 0.65, 0.40),
+                                                    m_warmth);
+                                float3 moon_rad = m_col * (0.8 * phase_b * m_atm);
                                 float3 brdf = h.albedo / 3.14159265358979;
                                 radiance += throughput * moon_rad * t_m * brdf * ndl;
                             }
@@ -1302,10 +1353,23 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                     float g2 = g * g;
                                     float phase_m = (1.0 - g2) / (4.0 * 3.14159265358979
                                         * pow(max(1.0 + g2 - 2.0 * g * c_t_m, 1e-4), 1.5));
-                                    // ~1/20 of sun strength at full;
-                                    // dim enough to read as "moonlit"
-                                    // but visible after auto-exposure.
-                                    float3 moon_rad = float3(0.85, 0.90, 1.00) * (4.0 * phase_b);
+                                    // Real moon irradiance is ~1/400000 of
+                                    // sun's, but we boost to 1/100 (sun_rad
+                                    // 80 -> moon ~0.8) so a moonlit scene
+                                    // is visible after typical auto-exposure
+                                    // without the moon shadowing through
+                                    // bright daylight. Atmospheric attenuation
+                                    // (air mass 1/sin(elev), tau 0.30) makes
+                                    // the moon dim and redden near the
+                                    // horizon, matching the sun's behaviour.
+                                    float m_elev   = max(moon_dir_phase.y, 0.04);
+                                    float m_am     = 1.0 / m_elev;
+                                    float m_atm    = exp(-0.30 * m_am);
+                                    float m_warmth = saturate((m_am - 1.0) * 0.18);
+                                    float3 m_col   = lerp(float3(0.92, 0.94, 1.00),
+                                                          float3(1.20, 0.65, 0.40),
+                                                          m_warmth);
+                                    float3 moon_rad = m_col * (0.8 * phase_b * m_atm);
                                     v_color_c += moon_rad * trans_moon * phase_m
                                                * dens * dtc * trans_eye_c;
                                 }
