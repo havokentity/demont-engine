@@ -32,7 +32,7 @@ public:
     void PushConstants(const void* data, std::size_t size) override;
     void Dispatch(std::uint32_t gx, std::uint32_t gy, std::uint32_t gz) override;
     void CopyBufferToTexture(BufferHandle, TextureHandle) override {}
-    void Barrier(const BarrierDesc&) override {}
+    void Barrier(const BarrierDesc& d) override;
 
     void Reset(VkCommandBuffer cb);
     VkCommandBuffer Raw() const { return cb_; }

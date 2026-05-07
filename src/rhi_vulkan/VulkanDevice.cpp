@@ -283,6 +283,61 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     vkCmdDispatch(cb_, gx, gy, gz);
 }
 
+void VulkanCommandBuffer::Barrier(const BarrierDesc& d) {
+    if (cb_ == VK_NULL_HANDLE) return;
+
+    // Translate the engine's coarse Stage enum to Vulkan stage / access
+    // masks. We emit a global VkMemoryBarrier rather than enumerating
+    // every resource handle: the caller's contract is "between these
+    // pipeline stages, make writes visible to reads," which a global
+    // memory barrier expresses cleanly without us tracking which
+    // resource was last written by which dispatch.
+    auto stage_to_vk = [](BarrierDesc::Stage s,
+                          VkPipelineStageFlags& stage_mask,
+                          VkAccessFlags& access_mask, bool is_dst) {
+        switch (s) {
+            case BarrierDesc::Stage::ComputeRead:
+                stage_mask  = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+                access_mask = VK_ACCESS_SHADER_READ_BIT;
+                break;
+            case BarrierDesc::Stage::ComputeWrite:
+                stage_mask  = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+                access_mask = is_dst ? (VK_ACCESS_SHADER_READ_BIT
+                                      | VK_ACCESS_SHADER_WRITE_BIT)
+                                     : VK_ACCESS_SHADER_WRITE_BIT;
+                break;
+            case BarrierDesc::Stage::Transfer:
+                stage_mask  = VK_PIPELINE_STAGE_TRANSFER_BIT;
+                access_mask = is_dst ? VK_ACCESS_TRANSFER_WRITE_BIT
+                                     : VK_ACCESS_TRANSFER_READ_BIT;
+                break;
+            case BarrierDesc::Stage::Present:
+                // Present-side barriers are handled by the swapchain
+                // acquire/release dance, not by this generic path.
+                stage_mask  = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+                access_mask = 0;
+                break;
+        }
+    };
+
+    VkPipelineStageFlags src_stage  = 0;
+    VkPipelineStageFlags dst_stage  = 0;
+    VkAccessFlags        src_access = 0;
+    VkAccessFlags        dst_access = 0;
+    stage_to_vk(d.from, src_stage, src_access, /*is_dst=*/false);
+    stage_to_vk(d.to,   dst_stage, dst_access, /*is_dst=*/true);
+
+    VkMemoryBarrier mb{};
+    mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = src_access;
+    mb.dstAccessMask = dst_access;
+    vkCmdPipelineBarrier(cb_, src_stage, dst_stage,
+                         /*dependencyFlags=*/0,
+                         /*memoryBarrierCount=*/1, &mb,
+                         /*bufferMemoryBarrierCount=*/0, nullptr,
+                         /*imageMemoryBarrierCount=*/0, nullptr);
+}
+
 // =====================================================================
 // VulkanDevice
 // =====================================================================

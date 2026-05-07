@@ -1720,6 +1720,17 @@ void Engine::RenderFrame() {
         if (auto* v = C.FindCVar("r_exposure_max"))    ae.exp_max     = v->GetFloat();
         if (auto* v = C.FindCVar("r_eye_adapt_speed")) ae.adapt_speed = v->GetFloat();
 
+        // Compute->compute hazard: the path tracer just wrote accum_hdr
+        // and the autoexpose dispatch is about to read it. On Vulkan
+        // submission order alone is insufficient per spec (the second
+        // dispatch's loads can race the first's stores on some drivers);
+        // emit a global compute-write -> compute-read barrier. Metal
+        // inserts the equivalent barrier automatically between dispatches
+        // on a shared resource, so the Metal backend's Barrier() is a
+        // no-op.
+        cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                     pt::rhi::BarrierDesc::Stage::ComputeRead});
+
         cb->BindComputePipeline(pt::rhi::PipelineHandle{autoexpose_pipeline_id_});
         // accum_hdr stays bound at slot 1 from the path-trace dispatch;
         // exposure_state at slot 6. The autoexpose shader only reads

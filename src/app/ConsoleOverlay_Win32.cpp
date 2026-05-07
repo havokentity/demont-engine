@@ -99,6 +99,12 @@ constexpr DWORD    kShowDurMs     = 220;
 constexpr DWORD    kHideDurMs     = 180;
 constexpr BYTE     kPanelAlpha    = 217;     // peak alpha for layered path
 
+// Custom message: marshal a repaint request from a non-UI thread
+// (e.g. pt::log sinks, which fire on whichever thread emits the log)
+// onto the overlay's owning thread. Cross-thread InvalidateRect is
+// undefined per Win32 -- PostMessage is the documented bridge.
+constexpr UINT WM_APP_REPAINT = WM_APP + 1;
+
 int ComputePanelHeight(int parent_h) {
     int h = static_cast<int>(parent_h * 0.45f);
     if (h < 240) h = 240;
@@ -461,7 +467,14 @@ void WinOverlay::OnLog(pt::log::Level /*lvl*/, const std::string& msg) {
         g->scrollback_.push_back({std::move(clean), LineRole::Default});
         while (g->scrollback_.size() > kScrollMax) g->scrollback_.pop_front();
     }
-    g->Repaint();
+    // pt::log sinks fire on the calling thread (Log::Emit doesn't
+    // reschedule), so OnLog can be invoked from any worker. Post a
+    // custom repaint message instead of calling Repaint() / Invalidate
+    // directly -- PostMessage is the only cross-thread Win32 UI bridge
+    // that's well-defined.
+    if (HWND target = g->hwnd_) {
+        PostMessageW(target, WM_APP_REPAINT, 0, 0);
+    }
 }
 
 void WinOverlay::Repaint() {
@@ -479,6 +492,11 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_ERASEBKGND:
         return 1;  // Background painted in WM_PAINT to avoid flicker
+    case WM_APP_REPAINT:
+        // Cross-thread repaint request (see OnLog). InvalidateRect runs
+        // on the UI thread now -- safe per Win32.
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
     case WM_TIMER:
         if (w == kAnimTimerId) { TickAnim(); return 0; }
         break;

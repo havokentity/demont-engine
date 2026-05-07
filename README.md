@@ -114,7 +114,7 @@ The Windows build:
 - Picks a discrete GPU when both iGPU + dGPU are present
 - Compiles every shader to SPIR-V via Slang's prebuilt Windows binary
 
-NVIDIA RT extensions (`VK_KHR_ray_tracing_pipeline`, `VK_KHR_acceleration_structure`) are queued — the path tracer presently uses the manual ray-shape kernel that runs on any compute-capable Vulkan device.
+`VK_KHR_acceleration_structure` + `VK_KHR_ray_query` are wired — the path tracer issues hardware-traversed ray queries from a compute kernel against BLAS/TLAS built per CSG/mesh bake. The dedicated `VK_KHR_ray_tracing_pipeline` (raygen / miss / hit shader binding tables) is queued; ray-query in compute already gives hardware traversal, so the extra pipeline pathway is only worth wiring when we need dynamic hit groups.
 
 CMake auto-downloads Slang and Apple's metal-cpp into `third_party/` on
 first configure. Manifold, fmt, glm, glfw, mimalloc, enkiTS, civetweb,

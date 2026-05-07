@@ -25,7 +25,7 @@ the next visual mismatch to chase. Diff against the pre-bringup tip:
   `cbuffer Frame` at `vk::binding(14, 0)`. Mac path is unchanged.
 - `src/rhi_vulkan/VulkanDevice.{h,cpp}`: ~1000 LoC. Vulkan 1.3, ray-query +
   acceleration-structure + deferred-host-operations + robustness2 extensions,
-  features pNext chain, 15-binding shared descriptor set layout, real
+  features pNext chain, 16-binding shared descriptor set layout, real
   CreateBuffer / WriteBuffer / DestroyBuffer (host-visible, persistent map),
   WriteTexture (staging buffer + cmd-buffer copy), CreateBLAS / CreateTLAS
   via VK_KHR_acceleration_structure, per-frame Frame UBO ring for the
@@ -38,8 +38,8 @@ Confirmed working at runtime:
 - `maxPushConstantsSize` reported = 256 (NVIDIA standard)
 - Path-trace pipeline creation (no SPIR-V capability errors)
 - Push-constant split: 112B push + 336B Frame UBO upload per dispatch
-- Descriptor binding for all 15 bindings every dispatch (storage_image x8,
-  AS x1, storage_buffer x5, ubo x1) with `nullDescriptor` for unbound slots
+- Descriptor binding for all 16 bindings every dispatch (storage_image x8,
+  AS x1, storage_buffer x5, ubo x2) with `nullDescriptor` for unbound slots
 - BLAS / TLAS build for the CSG-drilled cube
 - WriteTexture upload (sunset.hdr env_map, BSC starmap, procedural moon)
 - Console servers (HTTP + line) bind, web UI accessible
@@ -91,10 +91,16 @@ cmake --build build/win-debug --parallel
 - Physical-device pick prefers `VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU`
   (the RTX) over any iGPU — see `src/rhi_vulkan/VulkanDevice.cpp`
   device-pick block
-- The path tracer runs the **manual ray-shape compute kernel**, not
-  hardware RT. `VK_KHR_ray_query` / `VK_KHR_acceleration_structure` /
-  `VK_KHR_ray_tracing_pipeline` are deliberately NOT wired in this PR
-  (queued for the next one)
+- The path tracer runs an **inline ray-query compute kernel** against
+  hardware-built acceleration structures. `VK_KHR_ray_query` and
+  `VK_KHR_acceleration_structure` are wired in this PR (BLAS/TLAS
+  built on every CSG bake / mesh load). The dedicated
+  `VK_KHR_ray_tracing_pipeline` (RT pipeline state object with
+  raygen / miss / hit shaders) is deliberately not wired — ray-query
+  in a compute shader gives us the same hardware traversal without
+  the extra pipeline complexity, and the RT pipeline pathway is queued
+  for a later PR if we ever need shader binding tables / dynamic
+  hit groups.
 - HTTP console at <http://localhost:27960>; line protocol on
   `127.0.0.1:27961`. The web console does NOT auto-open — type
   `web_console` in either console to launch.
@@ -139,11 +145,21 @@ If anything goes wrong, capture:
 | `5ed61b0` | `/Zc:preprocessor` for `__VA_OPT__` |
 | `a8c8a5d` | `M_PI` → `std::numbers::pi` |
 | `f8db291` | `__fp16` → portable IEEE-754 binary16 decode |
+| `a7fdf53` | docs: this handoff document (initial draft) |
+| `79dca33` | Vulkan path-tracer port + GPU auto-exposure + console UX |
+| `0f8b9ae` | Win32 console overlay (Mac parity, native HWND child + slide/fade) |
+| `40f5704` | Vulkan: query supported device features before enabling optional bits |
+| `d6d635e` | README: clarify Win32 overlay (non-Apple Cocoa shims still no-op) |
+| `9677716` | ConsoleOverlay_Stub: comment now reflects non-Apple, non-Windows targets |
+| `218ab98` | README: drop redundant build dir when using `cmake --build --preset` |
+| `47e54f4` | docs(vulkan): fix 16-binding comments and nullDescriptor note |
 
 ## Out of scope for this PR (queued for follow-ups)
 
-- `VK_KHR_ray_tracing_pipeline` + `VK_KHR_acceleration_structure`
-  wiring (real hardware RT on the RTX)
+- `VK_KHR_ray_tracing_pipeline` (the dedicated RT pipeline state object
+  with raygen / miss / hit shaders) — ray-query in compute already
+  gives hardware traversal, so this is only worth wiring if we ever
+  need shader binding tables / dynamic hit groups
 - NRD (NVIDIA Real-time Denoisers) integration on Vulkan
 - Linux end-to-end CI (presets ship; no workflow yet)
 - DXGI / Windows-native present path for the software RHI fallback
