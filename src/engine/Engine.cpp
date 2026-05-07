@@ -2396,6 +2396,69 @@ void Engine::RegisterCommands() {
                                ? "(on-screen)" : "(off-screen)");
         });
 
+    C.RegisterCommand("dump_moon_pos",
+        "Print the engine's computed moon position (alt/az/phase) "
+        "and whether the engine thinks it should be lighting the "
+        "scene. Use to debug 'no moon visible' or 'no shadow' issues.",
+        [](auto, pt::console::Output& out) {
+            auto& C2 = pt::console::Console::Get();
+            bool astro_on = false;
+            if (auto* v = C2.FindCVar("r_sky_use_astronomical")) astro_on = v->GetBool();
+            if (!astro_on) {
+                out.PrintLine("r_sky_use_astronomical = 0 -> moon disabled.");
+                out.PrintLine("Set r_sky_use_astronomical 1 to enable.");
+                return;
+            }
+            // Compute moon at the engine's current effective JD.
+            float hour = 12.0f;
+            if (auto* v = C2.FindCVar("r_sky_hour")) hour = v->GetFloat();
+            bool local = true;
+            if (auto* v = C2.FindCVar("r_sky_hour_local")) local = v->GetBool();
+            float tz = 0.0f;
+            if (local) {
+                if (auto* v = C2.FindCVar("r_sky_tz_offset_hours")) tz = v->GetFloat();
+            }
+            int yr = 0, mo = 0, dy = 0;
+            if (auto* v = C2.FindCVar("r_sky_year"))  yr = v->GetInt();
+            if (auto* v = C2.FindCVar("r_sky_month")) mo = v->GetInt();
+            if (auto* v = C2.FindCVar("r_sky_day"))   dy = v->GetInt();
+            if (yr == 0 || mo == 0 || dy == 0) {
+                const std::time_t now = std::time(nullptr);
+                std::tm gm = *std::gmtime(&now);
+                if (yr == 0) yr = gm.tm_year + 1900;
+                if (mo == 0) mo = gm.tm_mon + 1;
+                if (dy == 0) dy = gm.tm_mday;
+            }
+            const float hour_utc = hour - tz;
+            const double jd_midnight = pt::astro::julianDateFromUtc(yr, mo, dy, 0, 0, 0.0);
+            const double jd = jd_midnight + double(hour_utc) / 24.0;
+            double lat = 13.0827, lon = 80.2707;
+            if (auto* v = C2.FindCVar("r_sky_lat")) lat = v->GetFloat();
+            if (auto* v = C2.FindCVar("r_sky_lon")) lon = v->GetFloat();
+            auto moon_eq = pt::astro::moonPosition(jd);
+            auto moon_h  = pt::astro::equatorialToHorizon(moon_eq, lat, lon, jd);
+            auto sun_eq  = pt::astro::sunPosition(jd);
+            auto sun_h   = pt::astro::equatorialToHorizon(sun_eq, lat, lon, jd);
+            double phase = pt::astro::moonPhaseAngle(sun_eq, moon_eq);
+            double phase_deg = phase * 180.0 / 3.14159265358979;
+            const char* lit = (moon_h.altitude_deg > 0.0) ? "ABOVE horizon"
+                                                          : "below horizon";
+            const char* sun_state = (sun_h.altitude_deg > 0.0) ? "above" : "below";
+            out.FormatLine("Date {}-{:02}-{:02} {:.1f}h local (UTC {:.1f}h)",
+                           yr, mo, dy, hour, hour_utc);
+            out.FormatLine("Observer {:.4f} N, {:.4f} E", lat, lon);
+            out.FormatLine("Moon: alt {:.2f} deg, az {:.2f} deg ({})",
+                           moon_h.altitude_deg, moon_h.azimuth_deg, lit);
+            out.FormatLine("Phase: {:.1f} deg from new (0=new, 180=full); "
+                           "phase_brightness ~ {:.2f}",
+                           phase_deg, 0.5 * (1.0 - std::cos(phase)));
+            out.FormatLine("Sun: alt {:.2f} ({} horizon)",
+                           sun_h.altitude_deg, sun_state);
+            out.PrintLine("If alt > 0, phase_brightness > 0, sun below horizon, ");
+            out.PrintLine("you should be seeing moonlight contribution. If not,");
+            out.PrintLine("the issue is in scene/exposure, not astronomical math.");
+        });
+
     C.RegisterCommand("dof_focus_here",
         "Auto-focus DOF on whatever's at the centre of the screen. "
         "Writes the hit distance into r_dof_focal_distance and turns "

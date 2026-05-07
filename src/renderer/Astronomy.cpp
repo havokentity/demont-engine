@@ -121,10 +121,15 @@ EquatorialPos moonPosition(double jd) {
 }
 
 double moonPhaseAngle(EquatorialPos sun, EquatorialPos moon) {
-    // Phase angle = angle Sun-Earth-Moon. cos(phase) = -cos(angular
-    // separation between sun and moon as seen from earth) (because
-    // when sun and moon are on opposite sides -- 180deg apart in the
-    // sky -- the moon is full = phase pi, when together it's new = 0).
+    // Phase = angular separation between the moon and the sun as seen
+    // from earth. New moon: sun and moon at the same place in the sky
+    // (separation = 0). Full moon: opposite (separation = pi). The
+    // shader expects 0 = new (no light), pi = full (max light).
+    //
+    // Earlier this returned acos(-cos_sep), which inverted the
+    // convention -- new moon read as full-strength and vice versa.
+    // That's the "no shadows on full moon, max shadows on new moon"
+    // bug the user spotted.
     double s_ra = sun.ra_deg * kDeg2Rad;
     double s_dec = sun.dec_deg * kDeg2Rad;
     double m_ra = moon.ra_deg * kDeg2Rad;
@@ -133,7 +138,7 @@ double moonPhaseAngle(EquatorialPos sun, EquatorialPos moon) {
                    + std::cos(s_dec) * std::cos(m_dec)
                        * std::cos(s_ra - m_ra);
     cos_sep = std::clamp(cos_sep, -1.0, 1.0);
-    return std::acos(-cos_sep);    // 0 at new moon, pi at full
+    return std::acos(cos_sep);     // 0 at new, pi at full
 }
 
 HorizonPos equatorialToHorizon(EquatorialPos eq,
