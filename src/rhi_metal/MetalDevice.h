@@ -80,8 +80,10 @@ private:
     // PushConstants() silently truncates beyond this size, so when
     // adding push fields make sure the buffer is still big enough --
     // a too-small buffer manifests as the last fields being all-zero
-    // at runtime (e.g. DOF appearing to do nothing).
-    std::uint8_t  push_buf_[512] {};
+    // at runtime (e.g. DOF appearing to do nothing). 1024B fits today's
+    // TonePush (576B with the physical-flare ghost array) and PtPush
+    // (352B); Metal's setBytes accepts up to 4KB so bump as needed.
+    std::uint8_t  push_buf_[1024] {};
     std::size_t   push_size_ = 0;
 };
 

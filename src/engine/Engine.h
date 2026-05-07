@@ -5,6 +5,7 @@
 #include "../app/Window.h"
 #include "../core/Jobs/JobSystem.h"
 #include "../rhi/Types.h"
+#include "LensFlare.h"
 
 #include <glm/glm.hpp>
 
@@ -158,6 +159,18 @@ private:
     std::uint32_t                               bloom_mip_w_[kBloomMips] {};
     std::uint32_t                               bloom_mip_h_[kBloomMips] {};
     std::uint64_t                               bloom_dummy_tex_id_ = 0;   // 1x1 RGBA16F when bloom off
+
+    // Physical lens flare (Hullin paraxial). LensSystem + traced
+    // ghost matrices live for the engine's lifetime; per-frame we
+    // compute screen-UV scales from the current viewport via
+    // prepare_shader_ghosts and pack into the tonemap push struct.
+    // r_lens_flare_mode = "physical" routes the shader to gather
+    // Gaussian splats at those positions; sun + image modes remain
+    // available as fallbacks.
+    lensflare::LensSystem                       lens_system_{};
+    lensflare::Ghost                            lens_ghosts_[lensflare::kMaxGhosts] {};
+    int                                         lens_ghost_count_ = 0;
+    lensflare::MainPath                         lens_main_path_{};
 
     // P11 environment map. Allocated when r_env_map cvar points at a
     // valid .hdr file; freed on cvar change or device teardown. The

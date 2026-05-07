@@ -42,7 +42,13 @@ private:
     VkCommandBuffer cb_     = VK_NULL_HANDLE;
     PipelineHandle bound_pipeline_{0};
     TextureHandle  bound_tex_[8] {};
-    std::uint8_t   push_buf_[128] {};
+    // Push-constant staging. Sized to match the Metal device (1024B)
+    // so passes that work on Metal also fit on MoltenVK / Apple Silicon
+    // Vulkan (which allows large push constants via Metal's setBytes).
+    // Native Vulkan/RTX has a 256-byte minimum per spec but most
+    // modern drivers support more; we'll switch larger pushes to a UBO
+    // when targeting native Windows Vulkan in P12.
+    std::uint8_t   push_buf_[1024] {};
     std::size_t    push_size_ = 0;
 };
 

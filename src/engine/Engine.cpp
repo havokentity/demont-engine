@@ -76,7 +76,7 @@ namespace cvar {
     PT_CVAR(r_lens_flare_dispersion, "0.012", "Per-channel scale offset for chromatic aberration on ghosts. 0 = achromatic (white ghosts), >0 = colourful rainbow fringe along ghost edges. Real lenses 0.01-0.03.", CVAR_ARCHIVE);
     PT_CVAR(r_lens_flare_count,"4",   "Number of ghost reflections to render (1..6). Each ghost has a different scale + colour tint hardcoded in the shader.", CVAR_ARCHIVE);
     PT_CVAR(r_lens_flare_threshold, "0.0", "(image mode only) Per-ghost luminance gate. 0 = no gate. 'sun' mode ignores this and draws clean sun-only flare.", CVAR_ARCHIVE);
-    PT_CVAR(r_lens_flare_mode, "sun", "Lens flare algorithm. 'sun' = explicit sun-position flare: projects the sun direction to screen and draws soft Gaussian-disc ghosts at its mirrored positions (clean, no scene mirroring, the production-correct approach). 'image' = old image-based flare: mirror-samples the full bloom mip at every output pixel (looks dreamy but reflects the whole scene as flare, which isn't physically what a lens does).", CVAR_ARCHIVE);
+    PT_CVAR(r_lens_flare_mode, "physical", "Lens flare algorithm. 'physical' = Hullin paraxial: ghosts come from a real 4-element 50mm lens model, with per-channel chromatic dispersion derived from each glass element's Abbe number. 'sun' = simpler explicit sun-position flare: projects the sun direction to screen and draws soft Gaussian-disc ghosts at its mirrored positions (clean, no scene mirroring). 'image' = legacy image-based flare: mirror-samples the full bloom mip at every output pixel.", CVAR_ARCHIVE);
     PT_CVAR(r_lens_flare_size, "0.04", "(sun mode) Ghost disc radius in fractions of screen *height*. 0.02 = ~22 px on 1080p, 0.08 = ~86 px. Default 0.04 (~43 px) gives discrete circular discs. Aspect-correct -- discs stay round on any aspect ratio.", CVAR_ARCHIVE);
     PT_CVAR(r_debug_sun_overlay, "0", "Debug: when 1, the tonemap pass overlays a green crosshair at the engine-projected sun_uv. Useful for verifying the lens-flare projection lines up with the rendered sun. Sets r_lens_flare_intensity to a sentinel internally; remember to disable when done.", 0);
     PT_CVAR(r_exposure,        "1.5","Manual HDR exposure multiplier applied before ACES tonemap. Used when r_auto_exposure = 0.", CVAR_ARCHIVE);
@@ -180,6 +180,18 @@ bool Engine::Init() {
     C.SetCVarOverride("sys_os",           hi.os_name);
 
     RegisterCommands();
+
+    // Physical lens-flare init. Trace ghost paths for the canonical
+    // lens once at startup -- the matrices are independent of frame
+    // state so this is amortised across the whole run. Per-frame the
+    // engine just calls prepare_shader_ghosts (~24 mat-vec) to convert
+    // these to viewport-relative scales for the tonemap push struct.
+    lens_system_      = lensflare::make_default_lens();
+    lens_ghost_count_ = lensflare::trace_ghosts(
+                            lens_system_, lens_ghosts_, lensflare::kMaxGhosts);
+    lens_main_path_   = lensflare::trace_main_path(lens_system_);
+    LOG_INFO("Lens flare: traced {} ghost paths (main B = {:.2f} mm)",
+             lens_ghost_count_, lens_main_path_.B_g);
 
     // P11 persistence: replay last session's archived cvars first, then
     // the user's autoexec.cfg. Both are exec'd as plain console scripts
@@ -1518,6 +1530,23 @@ void Engine::RenderFrame() {
             }
         }
 
+        // Shader-side ghost record. 32 bytes; matches `ShaderGhost` in
+        // Tonemap.slang exactly so the std140 layout aligns. Each ghost
+        // contributes one Gaussian splat per RGB channel at scaled sun
+        // UV positions; the per-channel scales encode chromatic
+        // dispersion derived from the lens elements' Abbe numbers.
+        struct PtShaderGhost {
+            float scale_r;
+            float scale_g;
+            float scale_b;
+            float intensity;
+            float radius_px;
+            float _pad[3];
+        };
+        static_assert(sizeof(PtShaderGhost) == 32, "ShaderGhost layout");
+        static_assert(sizeof(PtShaderGhost)
+                      == sizeof(lensflare::ShaderGhost), "ShaderGhost layout");
+
         struct TonePush {
             float        exposure;
             std::uint32_t passthrough;
@@ -1537,7 +1566,17 @@ void Engine::RenderFrame() {
             // the top-left edge regardless of where the sun is).
             float        _pad_sun_align;
             float        sun_uv[2];         // 8-byte aligned; matches MSL float2
+            // Physical-flare extension. flare_mode_physical = 1 routes
+            // the shader to gather Gaussian splats from the ghosts[]
+            // array (positions are sun_uv * scale per channel; radius
+            // is in pixels). Padding aligns the ghosts[] array to a
+            // 16-byte boundary for std140 / Metal struct rules.
+            std::uint32_t flare_mode_physical;
+            std::uint32_t physical_ghost_count;
+            float        _pad_phys_align[2];
+            PtShaderGhost ghosts[lensflare::kMaxGhosts];
         } tp{};
+        static_assert(sizeof(TonePush) % 16 == 0, "TonePush 16-byte aligned");
         tp.exposure         = push.exposure_pad[0];
         tp.passthrough      = hdr_pipeline ? 0u : 1u;
         tp.bloom_intensity  = (bloom_on && bloom_h.id == bloom_mip_tex_id_[0])
@@ -1546,12 +1585,12 @@ void Engine::RenderFrame() {
         // having actually run. If bloom is off the bloom_tex slot is
         // the 1x1 placeholder and the flare loop would just sample
         // zeros -- gate it explicitly to skip the loop entirely.
-        const bool bloom_ran = bloom_on && bloom_h.id == bloom_mip_tex_id_[0];
-        // 'sun' mode draws explicit ghosts (no bloom needed); 'image'
-        // mode samples bloom and therefore needs bloom_ran.
-        const bool flare_sun_mode = (flare_mode == "sun");
-        tp.flare_intensity  = (flare_on && (flare_sun_mode || bloom_ran))
-                                ? flare_int : 0.0f;
+        const bool bloom_ran    = bloom_on && bloom_h.id == bloom_mip_tex_id_[0];
+        const bool flare_sun_m  = (flare_mode == "sun");
+        const bool flare_phys_m = (flare_mode == "physical");
+        // sun + physical modes don't need the bloom mip; image mode does.
+        const bool flare_can_run = flare_on && (flare_sun_m || flare_phys_m || bloom_ran);
+        tp.flare_intensity  = flare_can_run ? flare_int : 0.0f;
         // Debug overlay sentinel: -1 in flare_intensity tells the
         // shader to skip the flare loop and instead draw a green
         // crosshair at sun_uv. Lets the user visually verify the
@@ -1562,10 +1601,31 @@ void Engine::RenderFrame() {
         tp.flare_dispersion = flare_disp;
         tp.flare_count      = static_cast<std::uint32_t>(flare_count);
         tp.flare_threshold  = flare_thresh;
-        tp.flare_mode_sun   = flare_sun_mode ? 1u : 0u;
+        tp.flare_mode_sun       = flare_sun_m  ? 1u : 0u;
+        tp.flare_mode_physical  = flare_phys_m ? 1u : 0u;
         tp.flare_size       = flare_size;
         tp.sun_uv[0]        = sun_uv_x;
         tp.sun_uv[1]        = sun_uv_y;
+
+        // Physical-mode ghost packing. Per-frame work: viewport-scaled
+        // pixel radii for each of the precomputed ghost matrices,
+        // capped at the user's r_lens_flare_count (so the slider is
+        // still meaningful in this mode). When physical mode is off,
+        // ghost_count = 0 makes the shader skip the loop.
+        if (flare_phys_m && flare_can_run) {
+            lensflare::ShaderGhost shader_ghosts[lensflare::kMaxGhosts];
+            const int packed = lensflare::prepare_shader_ghosts(
+                lens_system_, lens_ghosts_, lens_ghost_count_,
+                lens_main_path_, static_cast<int>(fc.height),
+                shader_ghosts, lensflare::kMaxGhosts);
+            const int n = std::min(packed, flare_count);
+            tp.physical_ghost_count = static_cast<std::uint32_t>(n);
+            std::memcpy(tp.ghosts, shader_ghosts,
+                        n * sizeof(PtShaderGhost));
+        } else {
+            tp.physical_ghost_count = 0u;
+        }
+
         cb->PushConstants(&tp, sizeof(tp));
         cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
     }

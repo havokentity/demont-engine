@@ -24,6 +24,21 @@
 // passes a 1x1 dummy) when r_bloom = 0 and bloom_intensity = 0.
 [[vk::binding(2, 0)]] RWTexture2D<float4> bloom_tex;
 
+// Physical-flare ghost record. 32 bytes -- matches the C++ struct in
+// Engine.cpp (TonePush::PtShaderGhost). Per-channel scale factor
+// (positions are sun_uv_centred * scale per channel), 0..1 base
+// intensity, and the disc radius in pixels.
+struct GhostShader {
+    // (scale_r, scale_g, scale_b, intensity)
+    float4 sci;
+    // (radius_px, _, _, _)
+    float4 rpad;
+};
+
+// Maximum ghosts the shader array can hold. MUST match
+// pt::engine::lensflare::kMaxGhosts in LensFlare.h.
+static const uint kPhysGhostMax = 16;
+
 [[vk::push_constant]]
 cbuffer Push {
     float exposure;
@@ -37,8 +52,7 @@ cbuffer Push {
     // chromatic-aberration rainbow fringe along ghost edges. 0 = no
     // dispersion (achromatic ghosts). Real range 0.0..0.05.
     float flare_dispersion;
-    // Number of ghost reflections (1..6). The shader has 6
-    // hardcoded ghost scales; this caps how many to use.
+    // Number of ghost reflections (1..16, capped at min(physical_ghost_count, flare_count) in physical mode).
     uint  flare_count;
     // (image mode only) Per-ghost luminance gate against the
     // bloom-mip sample. 0 = no gate.
@@ -56,7 +70,18 @@ cbuffer Push {
     // Sun's screen UV (computed engine-side from sun_dir + camera
     // basis). Sentinel (-2, -2) means sun is behind / off-screen
     // so the flare loop is skipped.
+    float _pad_sun_align;
     float2 sun_uv;
+    // 'physical' flare mode: gather per-channel Gaussian splats from
+    // ghosts[]. Each ghost's screen UV is sun_uv_centred * scale
+    // (offset from screen centre); the per-channel scales encode
+    // chromatic dispersion derived from the lens elements' Abbe
+    // numbers. Set when r_lens_flare_mode = "physical".
+    uint  flare_mode_physical;
+    // Number of valid entries in ghosts[]. 0 = skip the physical loop.
+    uint  physical_ghost_count;
+    float2 _pad_phys;
+    GhostShader ghosts[kPhysGhostMax];
 };
 
 float3 acesTonemap(float3 c) {
@@ -135,6 +160,65 @@ void main(uint3 tid : SV_DispatchThreadID) {
         float2 cv = uv - 0.5;
         uint   n  = min(flare_count, 6u);
         float3 flare = float3(0.0);
+
+        // 'physical' mode: gather per-channel Gaussian splats from the
+        // engine-traced ghost array. ghost_uv per channel = sun_uv
+        // centred and scaled by ghost.scale_*. Each channel is splatted
+        // independently so chromatic dispersion (different scale per
+        // wavelength, derived from glass Abbe numbers) shows up as a
+        // rainbow fringe along ghost edges. No bloom sampling.
+        if (flare_mode_physical != 0u && physical_ghost_count > 0u) {
+            // Skip when sun is off-screen / behind camera (sentinel uv).
+            if (sun_uv.x > -1.0 && sun_uv.x < 2.0 &&
+                sun_uv.y > -1.0 && sun_uv.y < 2.0) {
+                float2 dimf = float2(dim);
+                float2 sun_c = sun_uv - 0.5;
+                // Cap by both the engine-side ghost count and the user-
+                // controlled r_lens_flare_count slider so the slider
+                // still works in physical mode.
+                uint pn = min(physical_ghost_count, flare_count);
+                pn = min(pn, kPhysGhostMax);
+                for (uint gi = 0u; gi < pn; ++gi) {
+                    GhostShader g = ghosts[gi];
+                    float s_r = g.sci.x;
+                    float s_g = g.sci.y;
+                    float s_b = g.sci.z;
+                    float gi_int = g.sci.w;
+                    float r_px   = g.rpad.x;
+                    // Per-channel screen positions. Negative scale
+                    // puts the ghost on the opposite side of centre
+                    // from the sun (the canonical mirrored ghost);
+                    // |scale|>1 pushes it past centre.
+                    float2 c_R = 0.5 + sun_c * s_r;
+                    float2 c_G = 0.5 + sun_c * s_g;
+                    float2 c_B = 0.5 + sun_c * s_b;
+                    float2 d_R = (uv - c_R) * dimf;
+                    float2 d_G = (uv - c_G) * dimf;
+                    float2 d_B = (uv - c_B) * dimf;
+                    float r2  = max(r_px * r_px, 1e-6);
+                    float qR = dot(d_R, d_R) / r2;
+                    float qG = dot(d_G, d_G) / r2;
+                    float qB = dot(d_B, d_B) / r2;
+                    // Super-Gaussian for a clean disc edge.
+                    float iR = exp(-qR * qR);
+                    float iG = exp(-qG * qG);
+                    float iB = exp(-qB * qB);
+                    // Brightness scales with ghost intensity (Fresnel
+                    // product) and a uniform 4x boost so the ghosts
+                    // are visible at typical r_lens_flare_intensity.
+                    flare += float3(iR, iG, iB) * (gi_int * 4.0);
+                }
+                // Radial fade so ghosts wash off at the screen edges.
+                // Diagonal-normalised pixel distance from centre, with
+                // a 1.2 multiplier to fade slightly inside the corners.
+                float diag = 0.5 * length(dimf);
+                float fade = saturate(1.0 - length(cv * dimf) / diag * 1.2);
+                c += flare_intensity * flare * fade;
+            }
+            float3 ldr_phys = (passthrough != 0u) ? c : acesTonemap(c * exposure);
+            ldr_out[tid.xy] = float4(ldr_phys, 1.0);
+            return;
+        }
 
         // 'sun' mode: explicit sun-position flare. Project sun's
         // screen UV (engine-side); draw discrete soft Gaussian-disc
