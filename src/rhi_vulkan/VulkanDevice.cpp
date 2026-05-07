@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Rajesh D'Monte
 // Vulkan backend, P12 expansion: ray-query, acceleration structures,
 // real CreateBuffer / WriteBuffer / CreateBLAS / CreateTLAS, expanded
-// descriptor set layout (15 bindings) matching the unified PathTrace
+// descriptor set layout (16 bindings) matching the unified PathTrace
 // shader, and per-frame UBO ring for the spilled push-constant tail.
 
 #include "VulkanDevice.h"
@@ -161,10 +161,11 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     VkDevice raw_dev = device_->RawDevice();
     auto dset = device_->CurrentDescriptorSet();
 
-    // Build the full descriptor write list. We touch all 15 bindings on
-    // every dispatch -- nullDescriptor (VK_EXT_robustness2) means slots
-    // the engine didn't bind get VK_NULL_HANDLE silently. The cost of
-    // re-writing every binding each dispatch is small (15 small structs)
+    // Build the full descriptor write list. We touch all 16 bindings on
+    // every dispatch -- nullDescriptor (VK_EXT_robustness2), required at
+    // device-create time for this path, means slots the engine didn't
+    // bind get VK_NULL_HANDLE silently. The cost of re-writing every
+    // binding each dispatch is small (16 small structs)
     // and avoids per-pipeline layout management.
     constexpr std::uint32_t kMaxWrites = 16;
     std::array<VkDescriptorImageInfo,  kMaxWrites> img_infos {};
