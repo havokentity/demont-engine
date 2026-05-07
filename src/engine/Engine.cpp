@@ -172,6 +172,7 @@ namespace cvar {
     PT_CVAR(r_rayleigh,              "30.0",     "Atmospheric Rayleigh scattering scale on the per-channel sea-level sigma (R 5.8e-6, G 13.5e-6, B 33.1e-6 per metre). 1.0 = real Earth atmosphere -- but our typical r_volumetric_density (Mie haze) is ~30x stronger than real-Earth haze, so bumping this to 30 keeps the sky visibly blue at typical haze settings. Drop to 1.0 if you also drop r_volumetric_density to 0.0001-0.0005 (real haze). 0 disables Rayleigh.", CVAR_ARCHIVE);
     PT_CVAR(r_moon_size,             "1.0",      "Moon angular-size multiplier. 1.0 = our default 0.55deg half-angle (already 2x the real 0.27deg, for visibility at typical 60-FOV 1080p). 5+ = dramatic 'big moon' shots; 0.5 = real lunar size (very small). Astronomical distance variation (perigee/apogee) is also applied on top -- supermoons render ~14% bigger than micro-moons.", CVAR_ARCHIVE);
     PT_CVAR(r_sun_size,              "1.0",      "Sun angular-size multiplier. 1.0 = real ~0.55deg half-angle. Astronomical Earth-Sun distance (perihelion/aphelion) modulates this ~3.4% across the year. Bump for cinematic shots.", CVAR_ARCHIVE);
+    PT_CVAR(r_moon_brightness,       "0.7",      "Moon disc brightness multiplier. 1.0 = the post-ACES-tuned default; 0.7 reads as a softer night-sky moon where surface texture stays under the ACES knee. Drop further for a darker moon, raise toward 1.5+ for an artificial bright-moon look.", CVAR_ARCHIVE);
 
     PT_CVAR(dev_cheats,        "0",    "Gate for CHEAT-flagged cvars",   0);
     PT_CVAR(dev_log_level,     "info", "error|warn|info|debug",          0);
@@ -817,11 +818,10 @@ void Engine::ReloadEnvMap(const std::string& path) {
 void Engine::EnsureMoonMapUploaded() {
     if (!device_) return;
     if (moon_map_tex_id_ != 0) return;
-    // 1024x512 gives ~2 texture pixels per screen pixel even at
-    // default r_moon_size, so bilinear sampling preserves mare and
-    // crater detail instead of averaging them into uniform grey.
-    constexpr std::uint32_t kW = 1024;
-    constexpr std::uint32_t kH = 512;
+    // 2048x1024 = ~16 MB at RGBA16F. Plenty of crater + mare detail
+    // even at large r_moon_size; small enough to stay budget-cheap.
+    constexpr std::uint32_t kW = 2048;
+    constexpr std::uint32_t kH = 1024;
     std::vector<float> rgba;
     pt::moon::generateMoonTexture(int(kW), int(kH), rgba);
     auto tex = device_->CreateTexture({
@@ -1453,7 +1453,11 @@ void Engine::RenderFrame() {
             }
         }
         push.moon_extra[1] = moon_dist_ratio;
-        push.moon_extra[2] = 0.0f;
+        float moon_bright = 0.7f;
+        if (auto* v = C.FindCVar("r_moon_brightness")) moon_bright = v->GetFloat();
+        if (moon_bright < 0.0f) moon_bright = 0.0f;
+        if (moon_bright > 5.0f) moon_bright = 5.0f;
+        push.moon_extra[2] = moon_bright;
         push.moon_extra[3] = 0.0f;
     }
     {
@@ -3045,6 +3049,7 @@ void Engine::RegisterCommands() {
     set_slider("r_rayleigh",               0.0f, 100.0f,  0.5f);
     set_slider("r_moon_size",              0.5f,  20.0f,  0.1f);
     set_slider("r_sun_size",               0.5f,  20.0f,  0.1f);
+    set_slider("r_moon_brightness",        0.0f,   3.0f,  0.05f);
     set_slider("r_clouds_coverage",         0.0f,    1.0f,   0.01f);
     set_slider("r_clouds_base_height",      0.0f, 12000.0f, 25.0f);
     set_slider("r_clouds_top_height",      50.0f, 14000.0f, 25.0f);

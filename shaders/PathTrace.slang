@@ -144,7 +144,8 @@ cbuffer Push {
     // contribution amplitude on cloud / surface BRDF rays.
     float4 moon_dir_phase;
     // Moon extras. .x = r_moon_size, .y = astronomical distance ratio
-    // (mean/current; perigee ~1.06, apogee ~0.95). .zw reserved.
+    // (mean/current; perigee ~1.06, apogee ~0.95), .z = r_moon_brightness
+    // (disc-multiplier scale, 1.0 = post-ACES-tuned baseline). .w reserved.
     float4 moon_extra;
     // Sun extras. .x = r_sun_size, .y = Earth-Sun distance ratio
     // (mean/current; perihelion ~1.017, aphelion ~0.984).
@@ -744,17 +745,17 @@ float3 moonDisc(float3 rd, float4 mph, float3 sun_dir_world) {
         // Limb darkening (real lunar limb is darker due to roughness).
         float limb = 0.55 + 0.45 * sqrt(saturate(t_d));
 
-        // Normal moon-lit colour. Disc multiplier 3.5 (was 12.0):
-        // anything above ~10 hits the ACES knee and clips to flat
-        // white, so the surface texture's 0.05-0.98 range collapses.
-        // 3.5 keeps the disc bright at night exposure (auto-exp ~4
-        // -> ~14 raw -> 0.83 post-ACES) while preserving 0.5-0.85
-        // post-ACES range for the actual texture variation. Halo
-        // brightness also dropped proportionally so the surrounding
-        // bloom doesn't overwhelm the disc.
+        // Disc multiplier 3.5 baseline scaled by user-controlled
+        // r_moon_brightness (moon_extra.z). 1.0 = baseline; 0.7
+        // (default) reads as a softer night moon where surface texture
+        // stays well below the ACES knee. Halo scales with brightness
+        // so the surrounding bloom stays proportionate.
+        float bright_mult = max(moon_extra.z, 0.0);
+        float disc_scale_b = 3.5 * bright_mult;
         float3 lit_col = col_tint * col_atm * surface
-                       * (3.5 * lit * limb * moon_atm)
-                       + col_tint * col_atm * halo * lit * moon_atm * 0.6;
+                       * (disc_scale_b * lit * limb * moon_atm)
+                       + col_tint * col_atm * halo * lit * moon_atm
+                       * (0.6 * bright_mult);
 
         // Blood-moon colour during eclipse: deep red-orange (the
         // refracted-through-Earth-atmosphere light tone). Surface
