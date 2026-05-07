@@ -818,10 +818,14 @@ void Engine::ReloadEnvMap(const std::string& path) {
 void Engine::EnsureMoonMapUploaded() {
     if (!device_) return;
     if (moon_map_tex_id_ != 0) return;
-    // 2048x1024 = ~16 MB at RGBA16F. Plenty of crater + mare detail
-    // even at large r_moon_size; small enough to stay budget-cheap.
-    constexpr std::uint32_t kW = 2048;
-    constexpr std::uint32_t kH = 1024;
+    // 512x256 = ~1 MB at RGBA16F. The moon disc is tiny on screen
+    // (~9-15 px at default r_moon_size), so anything past a 256x
+    // near-side coverage is sampled-down to invisibility -- 2K was
+    // overkill. Bigger sizes via r_moon_size still resolve fine
+    // because the texture's mare features are LOW-frequency, well
+    // above one texel of detail at this resolution.
+    constexpr std::uint32_t kW = 512;
+    constexpr std::uint32_t kH = 256;
     std::vector<float> rgba;
     pt::moon::generateMoonTexture(int(kW), int(kH), rgba);
     auto tex = device_->CreateTexture({
