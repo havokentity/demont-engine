@@ -106,13 +106,14 @@ jobs:
         run: choco install ninja --no-progress -y
 
       - name: Install Vulkan SDK
-        # Purpose-built action that downloads the LunarG installer,
-        # caches the result, and -- crucially -- writes VULKAN_SDK +
-        # %VULKAN_SDK%\Bin to GITHUB_ENV / GITHUB_PATH so subsequent
-        # steps see them. The choco vulkan-sdk package didn't reliably
-        # propagate those env vars across step boundaries.
+        # Pinned to a known-good LunarG release. The action's "latest"
+        # tracking is brittle -- LunarG's CDN doesn't always publish
+        # bleeding-edge versions at the URL pattern the action expects
+        # (1.4.341.1's installer 404'd as of this commit). 1.3.296.0
+        # is widely cached + has SPIR-V 1.6 + every extension we use.
         uses: jakoch/install-vulkan-sdk-action@v1.2.0
         with:
+          vulkan_version: 1.3.296.0
           install_runtime: true
           cache: true
           stripdown: true
