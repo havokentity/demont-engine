@@ -273,7 +273,13 @@ void Console::Drain() {
         std::swap(local, queue_);
     }
     for (auto& pe : local) {
-        auto result = Execute(pe.line);
+        // Route through ExecuteScript so the queued payload may
+        // contain multiple semicolon- or newline-separated commands.
+        // Common use case: "r_clouds 1; r_clouds_preset cumulus;
+        // r_volumetric 1; r_rayleigh 30" pasted from a docs snippet.
+        // ExecuteScript is a no-op extra split for single statements
+        // (no ';' or '\n'), so this is a free upgrade.
+        auto result = ExecuteScript(pe.line);
         if (pe.responder) pe.responder(result);
     }
 }

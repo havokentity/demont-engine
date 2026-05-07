@@ -541,7 +541,9 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
 
     [self appendLine:line level:@"input"];
 
-    auto result = pt::console::Console::Get().Execute(
+    // ExecuteScript so pasted multi-statement lines (separated by ';'
+    // or '\n') run as a sequence -- e.g. "r_clouds 1; r_volumetric 1".
+    auto result = pt::console::Console::Get().ExecuteScript(
         std::string_view([line UTF8String]));
     if (!result.output.empty()) {
         NSString* o = [NSString stringWithUTF8String:result.output.c_str()];
