@@ -120,6 +120,34 @@ EquatorialPos moonPosition(double jd) {
     return EquatorialPos{ normDeg(ra), dec };
 }
 
+double moonDistanceKm(double jd) {
+    // Meeus chapter 47, distance terms (km). Uses the same fundamental
+    // arguments as moonPosition; extracts the dominant 6 cosine terms
+    // of the radial-distance series.
+    double T = (jd - 2451545.0) / 36525.0;
+    double D  = normDeg(297.8502042 + 445267.1115168 * T) * kDeg2Rad;
+    double M  = normDeg(357.5291092 +  35999.0502909 * T) * kDeg2Rad;
+    double Mm = normDeg(134.9634114 + 477198.8676313 * T) * kDeg2Rad;
+
+    double dist = 385000.56
+                + (-20905.355) * std::cos(Mm)
+                + ( -3699.111) * std::cos(2.0 * D - Mm)
+                + ( -2955.968) * std::cos(2.0 * D)
+                + (  -569.925) * std::cos(2.0 * Mm)
+                + (    48.888) * std::cos(M)
+                + (    -3.149) * std::cos(2.0 * (Mm - D));   // small terms
+    return dist;
+}
+
+double sunDistanceAu(double jd) {
+    // Naval Almanac low-precision: r = 1.00014 - 0.01671 cos(g)
+    //                                       - 0.00014 cos(2g)
+    // where g is the sun's mean anomaly. Accurate to ~5e-5 AU.
+    double n = jd - 2451545.0;
+    double g = normDeg(357.528 + 0.9856003 * n) * kDeg2Rad;
+    return 1.00014 - 0.01671 * std::cos(g) - 0.00014 * std::cos(2.0 * g);
+}
+
 double moonPhaseAngle(EquatorialPos sun, EquatorialPos moon) {
     // Phase = angular separation between the moon and the sun as seen
     // from earth. New moon: sun and moon at the same place in the sky

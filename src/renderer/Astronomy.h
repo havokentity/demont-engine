@@ -48,6 +48,22 @@ EquatorialPos moonPosition(double jd);
 // (moon between sun and earth, dark side facing earth), pi = full.
 double moonPhaseAngle(EquatorialPos sun, EquatorialPos moon);
 
+// Earth-Moon distance in kilometres at the given JD. Real moon orbit
+// is elliptical: perigee ~363,300 km, apogee ~405,500 km; the apparent
+// angular size varies ~14% across this range. Renderer uses this to
+// scale the moon disc.
+double moonDistanceKm(double jd);
+
+// Earth-Sun distance in astronomical units at the given JD. Earth's
+// orbit eccentricity is 0.0167 -- perihelion ~0.983 AU (early Jan),
+// aphelion ~1.017 AU (early Jul). Apparent sun size varies ~3.4%.
+double sunDistanceAu(double jd);
+
+// Mean reference distances. Use these as the "1.0x apparent size"
+// reference; scale = mean / current.
+constexpr double kMoonDistanceMeanKm = 384400.0;
+constexpr double kSunDistanceMeanAu  = 1.000001018;  // ~149.6 Mkm
+
 // Convert equatorial (ra, dec) to local horizon (az, alt) for an
 // observer at lat/lon (degrees, +N / +E) and the given JD.
 HorizonPos equatorialToHorizon(EquatorialPos eq,

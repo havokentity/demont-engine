@@ -143,10 +143,12 @@ cbuffer Push {
     // the moon disc's brightness in skyColor and for moonlight NEE
     // contribution amplitude on cloud / surface BRDF rays.
     float4 moon_dir_phase;
-    // Moon extras. .x = angular-size multiplier (1.0 = real ~0.55deg
-    // half-angle, used for debug / aesthetics: 5+ for "big moon"
-    // dramatic shots, 1.0 for realism). .yzw reserved.
+    // Moon extras. .x = r_moon_size, .y = astronomical distance ratio
+    // (mean/current; perigee ~1.06, apogee ~0.95). .zw reserved.
     float4 moon_extra;
+    // Sun extras. .x = r_sun_size, .y = Earth-Sun distance ratio
+    // (mean/current; perihelion ~1.017, aphelion ~0.984).
+    float4 sun_extra;
 };
 
 // --- Procedural cloud field --------------------------------------------
@@ -577,7 +579,11 @@ float3 procSky(float3 rd, float3 sun) {
 float3 sunDisc(float3 rd, float3 sun_dir) {
     if (sun_dir.y < -0.10) return float3(0.0);
     float ang = dot(rd, sun_dir);
-    const float kCosR = 0.99995;          // cos(0.55 deg)
+    // r_sun_size * astronomical-distance ratio. perihelion ~1.017
+    // (sun looks bigger), aphelion ~0.984. Half-angle scales linearly.
+    float sun_mult = max(sun_extra.x * sun_extra.y, 0.1);
+    float r_deg    = 0.55 * sun_mult;
+    float kCosR    = cos(r_deg * 0.0174533);
     // Halo extent grows from cos(2deg) at zenith to cos(8deg) near
     // horizon. The horizon halo is what you see as the "bigger" sun
     // at sunset -- it's atmospheric scattering, not the disc itself.
@@ -632,8 +638,10 @@ float3 moonDisc(float3 rd, float4 mph, float3 sun_dir_world) {
     float ang = dot(rd, m_dir);
     // Real lunar angular radius is 0.27 deg; we render at 0.55 deg
     // (~2x real) for visibility at typical 60-FOV 1080p, then scale
-    // by r_moon_size (moon_extra.x) for "big moon" debug / aesthetics.
-    float size_mult = max(moon_extra.x, 0.1);
+    // by r_moon_size (moon_extra.x) AND astronomical distance ratio
+    // (moon_extra.y; perigee ~1.06, apogee ~0.95) so supermoons
+    // really do render bigger than micro-moons.
+    float size_mult = max(moon_extra.x * moon_extra.y, 0.1);
     float r_deg     = 0.55 * size_mult;
     float halo_deg  = 1.5  * size_mult;
     float kCosR     = cos(r_deg    * 0.0174533);

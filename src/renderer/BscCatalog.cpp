@@ -139,10 +139,15 @@ void RasteriseJ2000Map(const std::vector<Star>& stars,
     // Gaussian's mass falls between texels and dim stars lose 90%+
     // of their amplitude. Brighter tiers get a wider halo on top.
     auto angular_radius = [](float vmag) {
-        if (vmag < -1.0f) return 2.4e-3f;  // ~8.3 arcmin -- Sirius/Canopus halo
-        if (vmag <  1.0f) return 1.8e-3f;  // ~6.2 arcmin -- top ~15 stars, gentle bloom
-        if (vmag <  3.0f) return 1.5e-3f;  // ~5.2 arcmin -- ~1 texel
-        return                  1.5e-3f;   // ~5.2 arcmin -- ~1 texel for the rest
+        // Tuned for 8192x4096 (~2.6 arcmin/texel). Earlier 4Kx2K
+        // values were ~2x too wide at the bumped resolution and made
+        // stars read as soft Gaussian smudges. These keep dim stars
+        // at ~half-texel sigma (crisp 1-px points) and only let
+        // brightest stars bloom across 2-3 texels for a visible halo.
+        if (vmag < -1.0f) return 1.4e-3f;  // ~4.8 arcmin -- Sirius/Canopus halo
+        if (vmag <  1.0f) return 1.0e-3f;  // ~3.4 arcmin -- top stars, gentle bloom
+        if (vmag <  3.0f) return 0.75e-3f; // ~2.6 arcmin -- 1 texel sharp
+        return                  0.75e-3f;  // ~2.6 arcmin -- 1 texel sharp
     };
 
     auto color_for_index = [](std::uint32_t i) {
