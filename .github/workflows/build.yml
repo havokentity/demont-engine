@@ -100,16 +100,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Skip if nightly already matches HEAD
+        # If the existing `nightly` tag already points at this commit,
+        # there's nothing new to publish -- short-circuit the job. Saves
+        # ~3 minutes of CI per quiet day. softprops/action-gh-release
+        # uses lightweight tags, so `git ls-remote refs/tags/nightly`
+        # gives the commit SHA directly. workflow_dispatch always
+        # rebuilds (the user explicitly asked for it).
+        id: nightly_check
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "manual dispatch -- forcing rebuild"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          PREV_SHA=$(git ls-remote origin refs/tags/nightly | awk '{print $1}')
+          if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" = "${GITHUB_SHA}" ]; then
+            echo "nightly already at ${GITHUB_SHA}; skipping rebuild"
+            echo "skip=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "rebuild needed: prev='${PREV_SHA}' current='${GITHUB_SHA}'"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install build tools
+        if: steps.nightly_check.outputs.skip != 'true'
         run: brew install ninja cmake vulkan-headers vulkan-loader molten-vk || true
 
       - name: Configure (release)
+        if: steps.nightly_check.outputs.skip != 'true'
         run: cmake --preset mac-release
 
       - name: Build
+        if: steps.nightly_check.outputs.skip != 'true'
         run: cmake --build build/mac-release --parallel
 
       - name: Stage artefact tree
+        if: steps.nightly_check.outputs.skip != 'true'
         # Same layout as release.yml's tag-driven flow, just with a
         # 'nightly' filename + commit SHA so users can correlate.
         run: |
@@ -126,6 +153,7 @@ jobs:
           echo "SHA_SHORT=$SHA_SHORT" >> "$GITHUB_ENV"
 
       - name: Update rolling 'nightly' release
+        if: steps.nightly_check.outputs.skip != 'true'
         # action-gh-release force-updates the tag to whatever commit
         # main points to at run time and replaces the attached artefact,
         # so users hitting the 'nightly' release page always get the
@@ -141,9 +169,11 @@ jobs:
           fail_on_unmatched_files: true
           body: |
             Scheduled nightly build of `main` -- runs at 23:00 IST
-            (Asia/Kolkata, UTC+5:30) every day.
+            (Asia/Kolkata, UTC+5:30) every day. Skipped automatically
+            when no new commits land between scheduled runs.
             Commit: `${{ env.SHA_SHORT }}` (${{ github.sha }}).
 
             For versioned, stable releases see the [tagged releases](https://github.com/havokentity/demont-engine/releases?q=v).
-            This tag is force-updated on each scheduled run; the
-            attached artefact reflects whatever was on `main` at run time.
+            This tag is force-updated on each scheduled run with new
+            commits; the attached artefact reflects whatever was on
+            `main` at run time.
