@@ -339,7 +339,10 @@ bool Engine::Init() {
         if (perf_overlay_) {
             int level = 0;
             if (auto* lv = C.FindCVar("r_perf_overlay")) {
-                try { level = std::stoi(lv->value); } catch (...) {}
+                // std::atoi instead of std::stoi -- the project compiles
+                // with -fno-exceptions, so std::stoi's throw on parse
+                // failure aborts. atoi returns 0 on failure cleanly.
+                level = std::atoi(lv->value.c_str());
             }
             // Native overlay is hidden when RHI mode is selected so
             // both don't draw at once.
@@ -2068,7 +2071,7 @@ void Engine::RenderFrame() {
         auto& Cn = pt::console::Console::Get();
         int   level    = 0;
         std::string mode = "native";
-        if (auto* lv = Cn.FindCVar("r_perf_overlay"))      try { level = std::stoi(lv->value); } catch (...) {}
+        if (auto* lv = Cn.FindCVar("r_perf_overlay"))      level = std::atoi(lv->value.c_str());
         if (auto* mv = Cn.FindCVar("r_perf_overlay_mode")) mode  = mv->value;
         if (level > 0 && mode == "rhi" &&
             perfoverlay_pipeline_id_ != 0 && perfoverlay_drawlist_id_ != 0) {
@@ -3083,8 +3086,7 @@ void Engine::RegisterCommands() {
         v->allowed_values = {"0", "1", "2", "3"};
         v->on_change = [this](const pt::console::CVar& cv) {
             if (perf_overlay_) {
-                int lv = 0;
-                try { lv = std::stoi(cv.value); } catch (...) { lv = 0; }
+                int lv = std::atoi(cv.value.c_str());
                 bool rhi = false;
                 if (auto* mv = pt::console::Console::Get().FindCVar("r_perf_overlay_mode")) {
                     rhi = (mv->value == "rhi");
@@ -3101,7 +3103,7 @@ void Engine::RegisterCommands() {
             if (perf_overlay_) {
                 int lv = 0;
                 if (auto* lvv = pt::console::Console::Get().FindCVar("r_perf_overlay")) {
-                    try { lv = std::stoi(lvv->value); } catch (...) {}
+                    lv = std::atoi(lvv->value.c_str());
                 }
                 perf_overlay_->SetLevel(cv.value == "rhi" ? 0 : lv);
             }

@@ -127,8 +127,9 @@ int LinesForLevel(int level) {
                                                weight:NSFontWeightRegular];
 
     // AppKit y-up; place text from the top by tracking a top-relative
-    // offset that decrements per row.
-    CGFloat top = b.size.height - kPaddingY - kLineHeight;
+    // offset that decrements per row. `__block` lets the closure
+    // below mutate it (Objective-C captures are const by default).
+    __block CGFloat top = b.size.height - kPaddingY - kLineHeight;
 
     auto drawRow = ^(NSColor* col, NSString* text) {
         NSDictionary* attrs = @{
