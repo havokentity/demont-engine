@@ -1737,7 +1737,19 @@ void Engine::RenderFrame() {
         // frame interval -- imprecise versus wall clock but stable
         // across reset_accum and reproducible per-frame for the
         // accumulator's running mean (no temporal noise from clock jitter).
-        const float t_seconds = float(frame_index_) * (1.0f / 60.0f);
+        //
+        // Wrap on a 24-hour sim window so the noise sample coordinate
+        // (pos + wind * t) stays in fp32-precise range even after long
+        // sessions.  86400 s × 60 fps = 5,184,000 frames; modulo the
+        // integer frame counter first so the float conversion is exact
+        // (well under the ~16M fp32-integer boundary).  Practical drift
+        // ceiling: with default wind 5 m/s, 432 km -- still well below
+        // anywhere fp32 loses 1-meter precision.  Wrap is invisible
+        // under normal use; only matters if someone leaves the engine
+        // running for >24h sim time.
+        constexpr std::uint64_t kCloudPeriodFrames = 86400ull * 60ull;
+        const float t_seconds = float(frame_index_ % kCloudPeriodFrames)
+                              * (1.0f / 60.0f);
         push.clouds_p1[0] = base_y;
         push.clouds_p1[1] = top_y;
         push.clouds_p1[2] = clouds_on ? coverage : 0.0f;
