@@ -1601,6 +1601,33 @@ void main(uint2 tid : SV_DispatchThreadID) {
             float3 trans_atm_surf = atmosphericTransmittance(
                 primary_ro, primary_rd, primary_t);
             radiance *= trans_atm_surf;
+            // HDRI-sourced haze additive. The atmospheric in-scatter
+            // march below is gated off in HDRI mode to avoid double-
+            // counting the HDRI's already-baked Rayleigh tint, but
+            // that means surfaces get attenuated WITHOUT the additive
+            // "absorbed light replaced by sky color" term that gives
+            // distant features their hazy lift toward the horizon.
+            // Without this, the ground plane near the horizon reads
+            // as a dark band where it should be fading into the sky.
+            //
+            // Approximation: treat (1 - trans_atm_surf) as the
+            // fraction of the path's radiance that the air absorbed,
+            // and replace it with the sky color in the camera's view
+            // direction. skyColor(primary_rd) samples env_map for
+            // HDRI mode (the actual sunset / clear-sky / etc. tint
+            // visible behind the surface). Clamp-wrapped to bound
+            // the magnitude when the view ray points toward a bright
+            // HDRI sun-cluster pixel.
+            //
+            // Procedural / gradient modes get this additive from the
+            // explicit Mie + Rayleigh in-scatter march below, which
+            // is more physically correct (uses sun_rad and the HG
+            // phase function), so we skip the simpler haze additive
+            // there to avoid double-counting.
+            if (env_map_present != 0u) {
+                radiance += clampIndirect(
+                    skyColor(primary_rd) * (float3(1.0) - trans_atm_surf));
+            }
         }
         // Volumetric single-scatter along the primary ray. Two
         // independent marches because the natural sampling rates
