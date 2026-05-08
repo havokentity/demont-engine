@@ -77,7 +77,7 @@ FetchContent_Declare(enkits
     GIT_TAG        v1.11
     GIT_SHALLOW    ON
     SYSTEM
-    PATCH_COMMAND  sed -i.bak "s/std::is_pod/std::is_trivially_copyable/g" src/TaskScheduler.cpp
+    PATCH_COMMAND  ${CMAKE_COMMAND} -P ${CMAKE_SOURCE_DIR}/cmake/patch_enkits.cmake
 )
 
 # --- civetweb: HTTP + WebSocket server -------------------------------------

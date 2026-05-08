@@ -27,12 +27,18 @@ endif()
 # pass. Both compile Slang -> MSL source which the runtime feeds into
 # Metal's newLibrary() at backend init.
 include(${CMAKE_SOURCE_DIR}/cmake/Slang.cmake)
+# Pre-compile Slang IR modules (target-agnostic; same .slang-module
+# files link into the Metal target as the SPIR-V target). Calls are
+# idempotent across rhi_vulkan + rhi_metal trees.
+pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTraceMath.slang)
+pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTraceCloud.slang)
 pt_compile_slang(
     TARGET  pt_rhi_metal
     SOURCE  ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
     STAGE   compute
     ENTRY   main
     TARGETS metal
+    MODULE_DEPS PathTraceMath PathTraceCloud
 )
 pt_compile_slang(
     TARGET  pt_rhi_metal
@@ -51,6 +57,20 @@ pt_compile_slang(
 pt_compile_slang(
     TARGET  pt_rhi_metal
     SOURCE  ${CMAKE_SOURCE_DIR}/shaders/BloomUp.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+)
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/AutoExposure.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+)
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/PerfOverlay.slang
     STAGE   compute
     ENTRY   main
     TARGETS metal

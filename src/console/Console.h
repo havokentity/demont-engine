@@ -84,6 +84,13 @@ struct Command {
     std::string name;
     std::string description;
     CommandCallback callback;
+
+    // Optional default argument string shown as a ghost-suggestion when
+    // the user has typed `<command> ` and is at the value position.
+    // Free-form -- the registrant picks something representative of a
+    // typical invocation (e.g. screenshot's "demonte_screen.ppm").
+    // Empty means the command has no value-position ghost.
+    std::string default_args;
 };
 
 struct ExecuteResult {
@@ -140,12 +147,19 @@ public:
     // Cvar undo / redo. Each ExecuteScript transaction captures the
     // pre-values of every cvar it touched and pushes them as one
     // entry on the undo stack. Undo() pops the top and restores;
-    // Redo() reapplies. Stack capped at kMaxHistory entries. Returns
-    // a 0-based count of entries actually rolled back; 0 means the
-    // stack was empty.
+    // Redo() reapplies. Stack capped at kMaxHistory entries.
+    // Returns one entry per cvar reverted in this transaction
+    // (empty if the stack was empty). Multi-cvar transactions
+    // (semicolon-bundle) come back as a single Undo() call with
+    // multiple entries -- caller can format each one.
+    struct CvarChange {
+        std::string name;
+        std::string from;   // value at undo time (the rolled-back-from value)
+        std::string to;     // value after undo (the restored value)
+    };
     static constexpr std::size_t kMaxHistory = 50;
-    std::size_t Undo();
-    std::size_t Redo();
+    std::vector<CvarChange> Undo();
+    std::vector<CvarChange> Redo();
     std::size_t UndoDepth() const { return undo_stack_.size(); }
     std::size_t RedoDepth() const { return redo_stack_.size(); }
 
@@ -167,6 +181,15 @@ private:
     std::deque<CvarSnapshot>  undo_stack_;
     std::deque<CvarSnapshot>  redo_stack_;
     bool                      in_undo_redo_ = false;   // suppress nested capture
+
+    // Bracket-batch mode (`[` ... `]`). When the user sends a line
+    // containing only `[`, subsequent lines are buffered (not
+    // executed) until a line containing only `]` arrives, at which
+    // point the entire buffer is run through ExecuteScript as one
+    // transaction (so undo reverts the whole bundle in one step).
+    // Single-threaded: only Drain() touches these.
+    std::string               batch_buffer_;
+    bool                      batch_active_ = false;
 };
 
 // Tokenize a single console line.  Quote-aware ("a b" stays one token).

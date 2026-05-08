@@ -9,12 +9,14 @@
 
 #include <glm/glm.hpp>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <vector>
 
-namespace pt::app      { class Window; class ConsoleOverlay; }
+namespace pt::app      { class Window; class ConsoleOverlay; class PerfOverlay; }
 namespace pt::jobs     { class JobSystem; }
 namespace pt::console  { class ConsoleServer; }
 namespace pt::rhi      { class Device; struct PipelineHandle; }
@@ -96,6 +98,15 @@ private:
     void EnsureStarMapUploaded();
     void EnsureMoonMapUploaded();
 
+    // Lazy pipeline-id (re-)resolution. The Vulkan backend builds its
+    // compute pipelines on a worker thread so the window can come up
+    // immediately, which means CreateComputePipeline-by-name returns
+    // id=0 for any kernel still under construction. We re-resolve
+    // every frame until each cached id flips non-zero, then the
+    // resolve becomes a single uint compare per pipeline (no mutex,
+    // no map lookup).  Idempotent: safe to call from RenderFrame.
+    void EnsurePipelineHandles();
+
     // Replace the current mesh-path resources (vertex/index buffers,
     // BLAS, TLAS) with one built from `baked`. Called from EnsureMesh*
     // on the main thread once a worker bake has completed.
@@ -111,6 +122,12 @@ private:
 
     std::unique_ptr<pt::app::Window>            window_;
     std::unique_ptr<pt::app::ConsoleOverlay>    overlay_;
+    std::unique_ptr<pt::app::PerfOverlay>       perf_overlay_;
+    // Ring buffer of recent frame_ms samples for the tier-3 sparkline.
+    // Sized to comfortably fill the overlay's graph width at any
+    // typical viewport DPI; oldest sample evicted on push.
+    std::vector<float>                          perf_history_;
+    std::size_t                                 perf_history_pos_ = 0;
     std::unique_ptr<pt::jobs::JobSystem>        jobs_;
     std::unique_ptr<pt::console::ConsoleServer> server_;
     std::unique_ptr<pt::rhi::Device>            device_;
@@ -132,7 +149,17 @@ private:
     std::uint64_t                               tonemap_pipeline_id_   = 0;
     std::uint64_t                               bloom_down_pipeline_id_ = 0;
     std::uint64_t                               bloom_up_pipeline_id_   = 0;
+    std::uint64_t                               perfoverlay_pipeline_id_ = 0;
+    std::uint64_t                               perfoverlay_drawlist_id_ = 0;
+    std::uint32_t                               perfoverlay_drawlist_capacity_ = 0;
+    std::uint64_t                               autoexpose_pipeline_id_ = 0;
     std::uint64_t                               accum_texture_id_      = 0;
+    // GPU-side exposure scalar: AutoExposure.slang updates this when
+    // r_auto_exposure=1; engine WriteBuffer's the manual r_exposure
+    // value when r_auto_exposure=0. PathTrace.slang reads this in
+    // its final tonemap, replacing the per-frame readback path that
+    // stalled the GPU on dGPU.
+    std::uint64_t                               exposure_state_id_     = 0;
     std::uint64_t                               box_blas_id_           = 0;
     std::uint64_t                               scene_tlas_id_         = 0;
     std::uint64_t                               box_vbuf_id_           = 0;
@@ -187,6 +214,26 @@ private:
     std::uint64_t                               env_conditional_cdf_id_ = 0;
     float                                       env_total_luminance_   = 0.0f;
 
+    // HDRI multi-light extraction. ReloadEnvMap thresholds the HDRI at
+    // the top 0.5% luminance percentile, runs 4-connected flood-fill
+    // (with horizontal wrap for lat-long) on the resulting mask, and
+    // stores the top kMaxHdriLights clusters by integrated flux. Each
+    // cluster's pixels are masked out of the env-map CDF (so env-map
+    // NEE skips them) and replaced by a stochastic directional NEE
+    // weighted by cluster luminance -- sharp shadows for any HDRI:
+    // single-sun outdoor, lone moon at night, multi-lamp interior,
+    // 3-point studio rig. The env_map texture itself is unchanged so
+    // camera-direct rays still see the visible bright pixels.
+    static constexpr std::uint32_t              kMaxHdriLights = 8;
+    struct HdriLight {
+        glm::vec3 dir        = {0.0f, 1.0f, 0.0f};  // unit vec to centroid
+        float     pmf        = 0.0f;                 // p(this light), sums to 1 across lights
+        glm::vec3 irradiance = {0.0f, 0.0f, 0.0f};   // ∫_cluster L dΩ per channel
+        float     luminance  = 0.0f;                 // luminance(irradiance), used for sorting + pmf
+    };
+    std::array<HdriLight, kMaxHdriLights>       hdri_lights_{};
+    std::uint32_t                               hdri_lights_count_       = 0;
+
     // P11 BSC starmap. RGBA16F equirectangular in J2000, rasterised once
     // at startup from assets/stars/BSC5.dat. The shader rotates incoming
     // ray directions into J2000 (using the per-frame world->J2000
@@ -209,14 +256,22 @@ private:
     float                                       last_jitter_x_         = 0.0f;
     float                                       last_jitter_y_         = 0.0f;
 
-    // Auto-exposure (P11 polish). Smoothly nudged toward
-    // 0.18 / scene_avg_luminance every few frames; used as the
-    // exposure multiplier when r_auto_exposure = 1.
-    float                                       current_exposure_      = 1.5f;
-    int                                         autoexpose_counter_    = 0;
+    // Auto-exposure now lives entirely on the GPU (see exposure_state_id_
+    // above + AutoExposure.slang). The legacy CPU-side `current_exposure_`
+    // / `autoexpose_counter_` fields drove a per-N-frames readback path
+    // that's been replaced; nothing on the host needs to mirror the value
+    // anymore -- PathTrace.slang reads `exposure_state[0]` directly.
     int                                         accum_w_               = 0;
     int                                         accum_h_               = 0;
     std::uint32_t                               frame_index_           = 0;
+
+    // Tracks whether the loading-frame branch in RenderFrame has
+    // ever fired (i.e. the Vulkan async pipeline build was still in
+    // flight when we hit our first frame). Used to log a single
+    // "loading screen active" message on entry and a single
+    // "pipelines ready" message on exit -- avoids a per-frame log
+    // spam during the 1-3s build window.
+    bool                                        loading_frame_active_  = false;
     bool                                        accum_dirty_           = true;
     BackendType                                 current_backend_       = BackendType::None;
     bool                                        mouse_look_active_     = false;

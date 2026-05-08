@@ -83,6 +83,56 @@ jobs:
       # create a window without a display. Local devs already run the
       # binary; CI's job is to catch compile + link regressions.
 
+  windows:
+    name: Windows (NVIDIA RTX target)
+    # Compile-test only -- the runner has no NVIDIA hardware so we can't
+    # actually exercise the Vulkan path, but link errors and Windows-
+    # specific compilation breakage get caught here. Same purpose as
+    # the macos job: regression gate on PRs.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        # Configures the build environment (cl, link, etc.) so the Ninja
+        # generator can find them. Required on windows-latest -- the
+        # MSVC toolchain isn't on PATH by default.
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Ninja
+        shell: pwsh
+        run: choco install ninja --no-progress -y
+
+      - name: Install Vulkan SDK
+        # Pinned to a known-good LunarG release. The action's "latest"
+        # tracking is brittle -- LunarG's CDN doesn't always publish
+        # bleeding-edge versions at the URL pattern the action expects
+        # (1.4.341.1's installer 404'd as of this commit). 1.3.296.0
+        # is widely cached + has SPIR-V 1.6 + every extension we use.
+        uses: jakoch/install-vulkan-sdk-action@v1.2.0
+        with:
+          vulkan_version: 1.3.296.0
+          install_runtime: true
+          cache: true
+          stripdown: true
+
+      - name: Verify toolchain
+        shell: pwsh
+        run: |
+          ninja --version
+          cmake --version
+          echo "VULKAN_SDK = $env:VULKAN_SDK"
+
+      - name: Configure
+        shell: pwsh
+        run: cmake --preset win-debug
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build/win-debug --parallel
+
   # Scheduled nightly release: at 23:00 IST (cron at top, in UTC) the
   # macos build runs and -- if it passes -- this job repackages the
   # release-config artefact and updates the `nightly` pre-release tag.

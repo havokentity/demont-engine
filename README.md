@@ -73,8 +73,8 @@ accumulation when the camera is stationary.
 | Renderer unification (analytic + mesh in one shader) | ✓ |
 | **P10 MetalFX TemporalDenoisedScaler (Mac)** | ✓ |
 | Vulkan denoiser (NRD or SVGF) for Windows / 5090 | queued — see FOLLOW_UPS |
-| P11 MIS, env maps, archived cvars, scene I/O | next |
-| P12 Windows bringup with native Vulkan | later |
+| P11 MIS, env maps, archived cvars, scene I/O | ✓ |
+| P12 Windows bringup with native Vulkan | in-progress (`feature/windows-nvidia`) |
 
 ## Build
 
@@ -92,18 +92,29 @@ cmake --build build/mac-debug
 
 ### Windows (NVIDIA RTX)
 
-Requires Windows 10/11 with current NVIDIA drivers (RTX 2000-series
-or newer for hardware ray-tracing), Vulkan SDK 1.3+, CMake ≥ 3.27,
-Ninja, MSVC 2022 or later (clang-cl also works).
+Requires:
+- Windows 10/11 with current NVIDIA drivers (RTX 2000-series or newer for hardware ray-tracing)
+- [Vulkan SDK 1.3+](https://vulkan.lunarg.com/sdk/home) — sets `VULKAN_SDK` env var
+- CMake ≥ 3.27
+- Ninja
+- MSVC 2022 (Visual Studio Build Tools or full IDE) — or clang-cl as an alternative
 
 ```pwsh
 cmake --preset win-debug
-cmake --build build/win-debug
-./build/win-debug/src/app/demont.exe
+cmake --build --preset win-debug
+.\build\win-debug\src\app\demont.exe
 ```
 
-The Windows preset ships in `CMakePresets.json`; the Vulkan backend
-auto-detects RT extensions and falls back to a non-RT path if missing.
+(or `win-release` for an optimised build, `win-clang-debug` for clang-cl.)
+
+The Windows build:
+- Skips the Metal RHI and the macOS Cocoa overlay path (Cocoa shims link as no-ops), while using a native Win32 console overlay on Windows
+- Auto-selects Vulkan as the default backend (`r_backend vulkan`)
+- Uses native Vulkan (no MoltenVK portability extensions)
+- Picks a discrete GPU when both iGPU + dGPU are present
+- Compiles every shader to SPIR-V via Slang's prebuilt Windows binary
+
+`VK_KHR_acceleration_structure` + `VK_KHR_ray_query` are wired — the path tracer issues hardware-traversed ray queries from a compute kernel against BLAS/TLAS built per CSG/mesh bake. The dedicated `VK_KHR_ray_tracing_pipeline` (raygen / miss / hit shader binding tables) is queued; ray-query in compute already gives hardware traversal, so the extra pipeline pathway is only worth wiring when we need dynamic hit groups.
 
 CMake auto-downloads Slang and Apple's metal-cpp into `third_party/` on
 first configure. Manifold, fmt, glm, glfw, mimalloc, enkiTS, civetweb,

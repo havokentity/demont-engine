@@ -46,6 +46,7 @@ public:
     void PushConstants(const void* data, std::size_t size) override;
     void Dispatch(std::uint32_t, std::uint32_t, std::uint32_t) override;
     void CopyBufferToTexture(BufferHandle, TextureHandle) override {}
+    void ClearStorageTexture(TextureHandle, const float[4]) override {}
     void Barrier(const BarrierDesc&) override {}
 
     PipelineHandle bound_pipeline{0};

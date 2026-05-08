@@ -22,12 +22,16 @@
 extern "C" {
 extern const unsigned char shader_PathTrace_metal_data[];
 extern const unsigned long shader_PathTrace_metal_size;
+extern const unsigned char shader_AutoExposure_metal_data[];
+extern const unsigned long shader_AutoExposure_metal_size;
 extern const unsigned char shader_Tonemap_metal_data[];
 extern const unsigned long shader_Tonemap_metal_size;
 extern const unsigned char shader_BloomDown_metal_data[];
 extern const unsigned long shader_BloomDown_metal_size;
 extern const unsigned char shader_BloomUp_metal_data[];
 extern const unsigned long shader_BloomUp_metal_size;
+extern const unsigned char shader_PerfOverlay_metal_data[];
+extern const unsigned long shader_PerfOverlay_metal_size;
 }
 
 // MetalFXDenoiser.mm: ObjC++ shim around MTLFXTemporalDenoisedScaler.
@@ -175,14 +179,32 @@ void MetalCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
         encoder_->setBytes(push_buf_, push_size_, push_slot);
     }
 
-    // dispatchThreads handles the remainder; pso threadExecutionWidth tells
-    // us a sane threadgroup size.
-    auto tew = pso->threadExecutionWidth();
-    auto h   = pso->maxTotalThreadsPerThreadgroup() / tew;
-    if (tew == 0) tew = 8;
-    if (h   == 0) h   = 8;
+    // Threadgroup size MUST match the kernel's [numthreads(...)]
+    // declaration. Every compute kernel in demont declares
+    // [numthreads(8, 8, 1)] (PathTrace, AutoExposure, Tonemap,
+    // BloomDown, BloomUp), so hardcode the matching shape here.
+    //
+    // The previous version computed tgsize from the pipeline's
+    // threadExecutionWidth (32 on Apple GPUs) and
+    // maxTotalThreadsPerThreadgroup (64 here), giving (32, 2, 1).
+    // Dispatching grid (8,8,1) with tgsize (32,2,1) fires FOUR
+    // threadgroups (ceil(grid/tgsize) = (1,4,1)), not the one the
+    // kernel expects. Pixel-per-thread kernels like PathTrace
+    // tolerate this because they bounds-check tid against the
+    // image dimensions, but reduction kernels like AutoExposure
+    // run their full reduction in each threadgroup and race-write
+    // to a single output slot, getting nondeterministic results
+    // skewed toward whichever threadgroup happened to finish last.
+    // This was the actual reason auto-exposure on Mac stabilized
+    // at a different value than Win for the same scene.
+    //
+    // grid = (gx*8, gy*8, gz) is already pre-multiplied by 8 by the
+    // engine's caller convention (cb->Dispatch(gx, gy, gz) means
+    // "dispatch gx*gy*gz threadgroups of [numthreads]"). With
+    // tgsize (8,8,1) Metal computes threadgroupCount = (gx, gy, gz)
+    // exactly as intended.
     MTL::Size grid    = MTL::Size::Make(gx * 8, gy * 8, gz);
-    MTL::Size tgsize  = MTL::Size::Make(tew, h, 1);
+    MTL::Size tgsize  = MTL::Size::Make(8, 8, 1);
     encoder_->dispatchThreads(grid, tgsize);
 }
 
@@ -286,10 +308,12 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
         named_pipelines_.emplace(kernel_name, id);
     };
 
-    build_pso("pathtrace",  shader_PathTrace_metal_data,  shader_PathTrace_metal_size);
-    build_pso("tonemap",    shader_Tonemap_metal_data,    shader_Tonemap_metal_size);
-    build_pso("bloom_down", shader_BloomDown_metal_data,  shader_BloomDown_metal_size);
-    build_pso("bloom_up",   shader_BloomUp_metal_data,    shader_BloomUp_metal_size);
+    build_pso("pathtrace",   shader_PathTrace_metal_data,    shader_PathTrace_metal_size);
+    build_pso("autoexpose",  shader_AutoExposure_metal_data, shader_AutoExposure_metal_size);
+    build_pso("tonemap",     shader_Tonemap_metal_data,      shader_Tonemap_metal_size);
+    build_pso("bloom_down",  shader_BloomDown_metal_data,    shader_BloomDown_metal_size);
+    build_pso("bloom_up",    shader_BloomUp_metal_data,      shader_BloomUp_metal_size);
+    build_pso("perfoverlay", shader_PerfOverlay_metal_data,  shader_PerfOverlay_metal_size);
 
     cmd_ = std::make_unique<MetalCommandBuffer>(this);
 }
@@ -735,6 +759,26 @@ bool MetalDevice::ReadbackTexture(TextureHandle h, void* dst, std::size_t dst_si
 
     if (need_temp) readable->release();
     pool->release();
+    return true;
+}
+
+bool MetalDevice::ReadbackBuffer(BufferHandle h, void* dst, std::size_t bytes) {
+    if (device_ == nullptr || dst == nullptr || bytes == 0) return false;
+    auto* buf = LookupBuffer(h);
+    if (buf == nullptr) return false;
+    if (buf->length() < bytes) return false;
+
+    // Engine MTL::Buffer is allocated with StorageModeShared (see
+    // CreateBuffer above), so contents() points at host-visible memory
+    // that's coherent with the GPU. To make sure any pending GPU
+    // writes (e.g. AutoExposure.slang updating exposure_state) are
+    // committed before we read, drain the queue with a no-op submit.
+    if (queue_ != nullptr) {
+        auto* cb = queue_->commandBuffer();
+        cb->commit();
+        cb->waitUntilCompleted();
+    }
+    std::memcpy(dst, buf->contents(), bytes);
     return true;
 }
 

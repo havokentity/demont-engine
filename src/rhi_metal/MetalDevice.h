@@ -49,6 +49,10 @@ public:
     void PushConstants(const void* data, std::size_t size) override;
     void Dispatch(std::uint32_t gx, std::uint32_t gy, std::uint32_t gz) override;
     void CopyBufferToTexture(BufferHandle, TextureHandle) override {}
+    // No-op on Metal: pipelines build synchronously and quickly, so
+    // the engine's loading-frame path (which is the only call site)
+    // never fires on this backend.
+    void ClearStorageTexture(TextureHandle, const float[4]) override {}
     void Barrier(const BarrierDesc&) override {}
 
     void Reset(MTL::CommandBuffer* cb);
@@ -128,6 +132,7 @@ public:
 
     bool ReadbackTexture(TextureHandle h, void* dst, std::size_t dst_size,
                          std::uint32_t* out_w, std::uint32_t* out_h) override;
+    bool ReadbackBuffer (BufferHandle  h, void* dst, std::size_t bytes) override;
 
     // ---- Internal lookup ------------------------------------------------
     MTL::ComputePipelineState* LookupPipeline(PipelineHandle h);

@@ -537,12 +537,32 @@ body::after {
   font-weight: 600;
   text-shadow: 0 0 8px var(--accent-glow);
 }
+.input-wrap {
+  position: relative; flex: 1; display: flex;
+}
 #input {
   flex: 1; background: transparent; border: none; outline: none;
   color: var(--fg); font: inherit; letter-spacing: 0.02em;
   caret-color: var(--accent);
+  padding: 0;
+  position: relative; z-index: 1;
 }
 #input::placeholder { color: var(--fg-dim); font-style: normal; }
+/* Ghost autosuggestion overlay -- positioned to mirror the input's
+   layout box.  The first span (transparent) re-occupies the width
+   of the typed text; the second span shows the candidate's tail
+   in dim colour so it visually trails the cursor. */
+.input-ghost {
+  position: absolute; inset: 0;
+  pointer-events: none;
+  font: inherit; letter-spacing: 0.02em;
+  white-space: pre;
+  display: flex; align-items: center;
+  z-index: 0;
+}
+.ghost-typed      { color: transparent; }
+.ghost-tail       { color: var(--fg-dim); }
+.ghost-annotation { color: var(--fg-dim); opacity: 0.7; font-style: italic; }
 
 /* ---------- cvars + commands sidebar ---------- */
 .kv-list {

@@ -11,8 +11,32 @@
 //
 // Bindings (Slang assigns Metal texture(0..1) in declaration order):
 //   slot 0 (texture) : hdr_in -- RGBA16F linear HDR from MetalFX
-//   slot 1 (texture) : ldr_out -- swapchain (BGRA8Unorm_sRGB) -- the
-//                       linear-to-sRGB encode is implicit on store.
+//   slot 1 (texture) : ldr_out -- swapchain.
+//                       - On Metal: BGRA8Unorm_sRGB, linear->sRGB
+//                         encode is IMPLICIT on store.
+//                       - On Vulkan/SPIR-V: BGRA8_UNORM, the encode is
+//                         EXPLICIT via PT_SRGB_ENCODE() applied just
+//                         before store (see the swapchain-write site
+//                         inside the kernel).  Both branches land at
+//                         the same on-screen colour space.
+
+// MSL SLOT ALIGNMENT NOTICE -- mirrors AutoExposure.slang's notice.
+// Slang's MSL backend assigns Metal buffer/texture slots in
+// DECLARATION order. The engine's MetalCommandBuffer::Dispatch
+// computes push_slot = max(bound_buf_slot)+1, which on every dispatch
+// after PathTrace lands at buf(7) (PathTrace binds slots 1..6, AS at
+// buffer slot 0). For the engine's setBytes(push, push_slot=7) call
+// to actually reach the kernel's Push cbuffer, every kernel's MSL
+// Push must be at buffer(7). Without padding, Tonemap.slang's
+// declaration order would emit Push at buffer(1) -- engine's setBytes
+// goes to buf(7), Tonemap's kernel reads buf(1) which is whatever
+// PathTrace had bound there (box_vbuf), and the entire push struct
+// is garbage. exposure_state was also reading buf(0) which gets
+// silently overwritten by setAccelerationStructure(0).
+//
+// Fix: pad declaration order to match PathTrace's emission so Push
+// lands at buffer(7) for ALL kernels. Dummies referenced in a
+// runtime-conditional dead branch so Slang's optimizer keeps them.
 
 [[vk::binding(0, 0)]] RWTexture2D<float4> hdr_in;
 [[vk::binding(1, 0)]] RWTexture2D<float4> ldr_out;
@@ -23,6 +47,24 @@
 // rest of the image. Always bound; the engine zero-fills it (or
 // passes a 1x1 dummy) when r_bloom = 0 and bloom_intensity = 0.
 [[vk::binding(2, 0)]] RWTexture2D<float4> bloom_tex;
+
+// --- buffer slot padding to push exposure_state to MSL buf(6) and
+//     Push (cbuffer) to MSL buf(7) ----------------------------------
+[[vk::binding(4, 0)]]  RaytracingAccelerationStructure _slot_tlas;        // buf(0)
+[[vk::binding(5, 0)]]  StructuredBuffer<float>  _slot_mesh_positions;     // buf(1)
+[[vk::binding(6, 0)]]  StructuredBuffer<uint>   _slot_mesh_indices;       // buf(2)
+[[vk::binding(7, 0)]]  StructuredBuffer<float4> _slot_primitives;         // buf(3)
+[[vk::binding(8, 0)]]  StructuredBuffer<float>  _slot_marginal_cdf;       // buf(4)
+[[vk::binding(9, 0)]]  StructuredBuffer<float>  _slot_conditional_cdf;    // buf(5)
+
+// GPU-resident exposure scalar. Same buffer PathTrace.slang reads in
+// its inline tonemap path, written every frame by AutoExposure.slang
+// (or seeded by the engine's r_exposure on_change hook in manual
+// mode). Reading here means Mac's post-pass tonemap tracks GPU-side
+// auto-exposure exactly the way the inline tonemap does on Vulkan,
+// without an exposure value round-tripping through the host. Lands
+// at MSL buf(6) thanks to the padding above.
+[[vk::binding(15, 0)]] RWStructuredBuffer<float> exposure_state;
 
 // Physical-flare ghost record. 32 bytes -- matches the C++ struct in
 // Engine.cpp (TonePush::PtShaderGhost). Per-channel scale factor
@@ -94,12 +136,52 @@ float3 acesTonemap(float3 c) {
     return saturate((c * (a * c + b)) / (c * (ck * c + d) + e));
 }
 
+// sRGB OETF (linear -> nonlinear) applied at swapchain-write sites on
+// the SPIR-V path. Mirror of PathTrace.slang's helper -- see that
+// file's long comment for the full reasoning. Short version: Vulkan
+// storage-image writes do NOT auto-encode sRGB even with
+// VK_FORMAT_B8G8R8A8_SRGB (only color-attachment writes do per spec),
+// so the encode happens here in the shader. Metal stays unchanged:
+// Apple silicon's BGRA8Unorm_sRGB storage write encodes implicitly.
+#if defined(PT_TARGET_SPIRV)
+float3 srgb_oetf(float3 c) {
+    c = max(c, float3(0.0, 0.0, 0.0));
+    float3 lin  = c * 12.92;
+    float3 expo = 1.055 * pow(c, float3(1.0/2.4)) - 0.055;
+    return select(c < 0.0031308, lin, expo);
+}
+#define PT_SRGB_ENCODE(x) srgb_oetf(x)
+#else
+#define PT_SRGB_ENCODE(x) (x)
+#endif
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
     uint2 dim;
     ldr_out.GetDimensions(dim.x, dim.y);
     if (tid.x >= dim.x || tid.y >= dim.y) return;
+
+    // Force Slang to emit the slot-padding dummy bindings (the
+    // optimizer would otherwise strip unused declarations and
+    // exposure_state would land at MSL buf(0) again, breaking the
+    // engine's push_slot=7 contract -- see the slot-alignment
+    // notice at the top of the file).  The condition `dim.x ==
+    // 0xDEADBEEFu` is uniform (every thread reads the same
+    // swapchain width) so the branch is either taken by the whole
+    // dispatch or by none of it; in practice never, because dim.x
+    // is the real texture width.  Slang can't statically prove
+    // that at compile time, so the body survives optimisation and
+    // every referenced declaration gets a real slot assignment.
+    if (dim.x == 0xDEADBEEFu) {
+        let p = _slot_mesh_positions[0];
+        let i = _slot_mesh_indices[0];
+        let q = _slot_primitives[0];
+        let m = _slot_marginal_cdf[0];
+        let c2 = _slot_conditional_cdf[0];
+        ldr_out[uint2(0, 0)] = float4(p, float(i), q.x, m + c2);
+        exposure_state[0] = p;
+    }
 
     float3 c = hdr_in[tid.xy].rgb;
 
@@ -302,7 +384,13 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 float sun_off = saturate(length(sun_uv - 0.5) * 4.0);
                 c += flare_intensity * flare * fade * vis * sun_off;
             }
-            float3 ldr_phys = (passthrough != 0u) ? c : acesTonemap(c * exposure);
+            // Passthrough path still needs sRGB OETF on SPIR-V swapchains
+            // (BGRA8_UNORM) -- without it the linear LDR `c` reaches the
+            // surface unencoded and the OS's EOTF interprets it too dark.
+            // On Metal PT_SRGB_ENCODE is identity; the swapchain is sRGB-
+            // formatted and Apple silicon auto-encodes on store.
+            float3 ldr_phys = PT_SRGB_ENCODE(
+                (passthrough != 0u) ? c : acesTonemap(c * exposure_state[0]));
             ldr_out[tid.xy] = float4(ldr_phys, 1.0);
             return;
         }
@@ -362,7 +450,8 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 }
                 c += flare_intensity * flare;
             }
-            float3 ldr_sun = (passthrough != 0u) ? c : acesTonemap(c * exposure);
+            float3 ldr_sun = PT_SRGB_ENCODE(
+                (passthrough != 0u) ? c : acesTonemap(c * exposure_state[0]));
             ldr_out[tid.xy] = float4(ldr_sun, 1.0);
             return;
         }
@@ -498,6 +587,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
             return;
         }
     }
-    float3 ldr = (passthrough != 0u) ? c : acesTonemap(c * exposure);
+    float3 ldr = PT_SRGB_ENCODE(
+        (passthrough != 0u) ? c : acesTonemap(c * exposure_state[0]));
     ldr_out[tid.xy] = float4(ldr, 1.0);
 }

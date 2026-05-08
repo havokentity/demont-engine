@@ -3,6 +3,7 @@
 #include "Engine.h"
 
 #include "../app/ConsoleOverlay.h"
+#include "../app/PerfOverlay.h"
 #include "../app/Window.h"
 #include "../console/Console.h"
 #include "../console/ConsoleServer.h"
@@ -29,11 +30,14 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <array>
 #include <charconv>
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
+#include <numbers>
+#include <numeric>
 #include <thread>
 
 namespace pt::engine {
@@ -56,12 +60,33 @@ namespace cvar {
             CVAR_ARCHIVE);
     PT_CVAR(app_overlay_enabled, "1",
             "Enable the in-window native console overlay (backtick toggles)", CVAR_ARCHIVE);
+    PT_CVAR(r_perf_overlay,    "0",
+            "Tiered in-game performance overlay. 0 = off, 1 = fps + frame_ms, "
+            "2 = + backend / resolution / GPU memory / spp / bounces / primitives, "
+            "3 = + frame-time sparkline. (Tier 4 reserved for per-pass GPU "
+            "timestamps once VkQueryPool / MTLCounterSampleBuffer is wired.)",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_perf_overlay_mode, "native",
+            "Backend for the perf overlay. 'native' = OS-native child window "
+            "(GDI on Win, NSPanel on Mac) -- has full text readout but can "
+            "leave compositing artifacts over Vulkan swapchains. 'rhi' = final "
+            "compute pass on the swapchain -- artifact-free, captured in "
+            "screenshots, currently visual-only (panel + sparkline, no text).",
+            CVAR_ARCHIVE);
     PT_CVAR(r_theme, "hardcore",
             "Web console theme: hardcore|amber|synthwave|matrix|vault|sakura|mono",
             CVAR_ARCHIVE);
+    // Default backend: Metal on Apple Silicon, Vulkan everywhere else
+    // (Windows + Linux use Vulkan + RT extensions; the Metal backend
+    // doesn't compile off Apple).
+#if defined(__APPLE__)
     PT_CVAR(r_backend,         "metal",    "One of none|software|metal|vulkan",CVAR_ARCHIVE);
+#else
+    PT_CVAR(r_backend,         "vulkan",   "One of none|vulkan",               CVAR_ARCHIVE);
+#endif
     PT_CVAR(r_max_bounces,     "8",  "Max path bounces per ray",          CVAR_ARCHIVE);
     PT_CVAR(r_spp,             "1",  "Samples per pixel per dispatch (>=1). Higher = cleaner motion frames at proportional GPU cost.", CVAR_ARCHIVE);
+    PT_CVAR(r_firefly_clamp,   "10",  "Per-contribution firefly clamp (per-channel ceiling on each indirect light contribution: env-NEE, ambient skylight, bounce-to-sky). Suppresses single-sample spikes from BSDF-sampled bounces hitting an HDRI sun pixel, while leaving camera-direct sky unbounded so the sun renders at full intensity. ACES saturates anything above ~5 to ~1.0 for SDR, so 10 preserves visible highlights and kills fireflies. 0 disables.", CVAR_ARCHIVE);
     PT_CVAR(r_quality,         "high",  "Master quality preset that drives r_spp, r_max_bounces, r_caustics, r_refract_bounces, etc. Options: low (fast, no caustics), medium (default-ish), high (caustics, more bounces), ultra (max). 'custom' leaves per-feature cvars as-is.", CVAR_ARCHIVE);
     PT_CVAR(r_caustics,        "1",  "Refractive shadow rays. 1 = NEE rays refract through dielectrics so glass/diamond produce caustic patterns; 0 = treat all dielectrics as opaque shadow blockers (faster, blocks any caustic). Path-tracer-correct in both modes.", CVAR_ARCHIVE);
     PT_CVAR(r_refract_bounces, "4",  "Maximum dielectric refractions a single shadow ray may chain through before giving up (returns no contribution). Higher catches more multi-facet caustics; lower is faster.", CVAR_ARCHIVE);
@@ -82,16 +107,28 @@ namespace cvar {
     PT_CVAR(r_debug_sun_overlay, "0", "Debug: when 1, the tonemap pass overlays a green crosshair at the engine-projected sun_uv. Useful for verifying the lens-flare projection lines up with the rendered sun. Sets r_lens_flare_intensity to a sentinel internally; remember to disable when done.", 0);
     PT_CVAR(r_exposure,        "1.5","Manual HDR exposure multiplier applied before ACES tonemap. Used when r_auto_exposure = 0.", CVAR_ARCHIVE);
     PT_CVAR(r_auto_exposure,   "1",  "Auto-exposure: 0 = use r_exposure manual value, 1 = sample accum_hdr each frame and adapt exposure toward r_exposure_target (eye-adaptation feel).", CVAR_ARCHIVE);
-    PT_CVAR(r_exposure_min,    "0.05",  "Minimum exposure scalar that auto-exposure can settle on. Stops a nuclear-bright scene from being crushed below this value.", CVAR_ARCHIVE);
+    PT_CVAR(r_exposure_min,    "1e-6",  "Minimum exposure scalar that auto-exposure can settle on. Used as a floor; the geometric-mean metering in AutoExposure.slang produces values down to ~1e-5 for genuine outdoor daylight (sky luminance of ~1e4 units / 0.18 target = ~1.8e-5). 1e-6 leaves headroom and prevents NaN pathologies; bump up to ~0.05 if you want auto-exposure to refuse to dim below a certain level for stylistic reasons.", CVAR_ARCHIVE);
     PT_CVAR(r_exposure_max,    "4.0",   "Maximum exposure scalar that auto-exposure can settle on. The reason nights stay dark instead of being boosted to look like day -- bumping this lets the eye adapt further into the dark, lowering it caps the boost.", CVAR_ARCHIVE);
     PT_CVAR(r_exposure_target, "0.18",  "Middle-grey target for auto-exposure. 0.18 matches the Zone-V/Munsell middle-grey convention; lower values aim for a darker overall look.", CVAR_ARCHIVE);
-    PT_CVAR(r_eye_adapt_speed, "0.20",  "Per-update interpolation factor for auto-exposure (0..1). Smaller = slower eye adaptation. The update fires every 8 frames, so 0.20 is roughly 'fully adapted in 1 second at 60fps'.", CVAR_ARCHIVE);
+    PT_CVAR(r_eye_adapt_speed, "0.20",  "Per-update interpolation factor for auto-exposure (0..1). Smaller = slower eye adaptation. The update fires every frame on the GPU (single-workgroup reduction over accum_hdr), so 0.20 settles ~80% in 5 frames, ~95% in 16 frames -- roughly 'eye-adapted in a quarter second at 60fps'.", CVAR_ARCHIVE);
     PT_CVAR(r_eye_model,       "human", "Preset 'iris/lens' tuning: human (default), cat (better dim-light dynamic range), owl (nocturnal -- huge max), dslr_iso100 (locked, narrow), dslr_iso6400 (locked, high gain), phone (auto, modest range), linear (no tonemap, debug). Selecting a preset writes r_exposure_min/max/target/r_eye_adapt_speed; 'custom' leaves them as-is.", CVAR_ARCHIVE);
     PT_CVAR(r_env_map,         "assets/hdri/sunset.hdr",
             "Path to a Radiance .hdr environment map. Used when r_sky_mode = hdri. "
             "Default points at the bundled CC0 sunset HDRI; resolves relative to CWD.",
             CVAR_ARCHIVE);
     PT_CVAR(r_env_intensity,   "1.0","Scalar multiplier on env-map samples. Useful for darkening/brightening the IBL without re-authoring the HDRI.", CVAR_ARCHIVE);
+    PT_CVAR(r_hdri_extract_percentile, "0.005",
+            "Top-luminance percentile threshold (0..0.5) for HDRI light "
+            "cluster extraction. Pixels above this percentile are flood-"
+            "filled into directional lights for crisp shadows. Default 0.005 "
+            "(top 0.5%) catches sun-class peaks on outdoor HDRIs and lamp "
+            "cores on interiors. Lower (e.g. 0.002) extracts only the very "
+            "brightest -- useful when an interior HDRI is over-extracting "
+            "stray bright pixels into spurious lights. Higher (e.g. 0.02) "
+            "catches dimmer features but risks merging the sky into the "
+            "extracted set. Takes effect on next env-map (re)load: change "
+            "this then re-set r_env_map to retrigger extraction.",
+            CVAR_ARCHIVE);
 
     // Procedural sky (Preetham-lite analytic). Used when r_sky_mode is
     // "procedural". The sun position drives both the sky colour gradient
@@ -303,6 +340,32 @@ bool Engine::Init() {
             }
         }
 
+        // Always-visible perf overlay (separate child window from the
+        // console).  Visibility is gated by r_perf_overlay -- the
+        // overlay starts in its initial state and the on_change
+        // handler below pushes the cvar's actual value once Init
+        // returns.
+        perf_overlay_ = std::make_unique<pt::app::PerfOverlay>();
+        if (!perf_overlay_->Init(window_->NativeHandle())) {
+            perf_overlay_.reset();
+        } else if (auto* tv = C.FindCVar("r_theme")) {
+            perf_overlay_->ApplyTheme(tv->value);
+        }
+        if (perf_overlay_) {
+            int level = 0;
+            if (auto* lv = C.FindCVar("r_perf_overlay")) {
+                // std::atoi instead of std::stoi -- the project compiles
+                // with -fno-exceptions, so std::stoi's throw on parse
+                // failure aborts. atoi returns 0 on failure cleanly.
+                level = std::atoi(lv->value.c_str());
+            }
+            // Native overlay is hidden when RHI mode is selected so
+            // both don't draw at once.
+            bool rhi = false;
+            if (auto* mv = C.FindCVar("r_perf_overlay_mode")) rhi = (mv->value == "rhi");
+            perf_overlay_->SetLevel(rhi ? 0 : level);
+        }
+
         window_->SetKeyHandler([this](int key, int /*mods*/) {
             constexpr int kGrave = 96;  // GLFW_KEY_GRAVE_ACCENT
             if (key != kGrave) return;
@@ -424,6 +487,11 @@ void Engine::TearDownDevice() {
         if (env_conditional_cdf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{env_conditional_cdf_id_});
         if (star_map_tex_id_        != 0) device_->DestroyTexture(pt::rhi::TextureHandle{star_map_tex_id_});
         if (moon_map_tex_id_        != 0) device_->DestroyTexture(pt::rhi::TextureHandle{moon_map_tex_id_});
+        // GPU-resident exposure scalar buffer; pipelines (incl.
+        // autoexpose_pipeline_id_) are owned by the device handle and
+        // released by device_.reset() below, same as tonemap / bloom.
+        if (exposure_state_id_      != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{exposure_state_id_});
+        if (perfoverlay_drawlist_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{perfoverlay_drawlist_id_});
     }
     scene_tlas_id_        = 0;
     box_blas_id_          = 0;
@@ -438,6 +506,9 @@ void Engine::TearDownDevice() {
     tonemap_pipeline_id_     = 0;
     bloom_down_pipeline_id_  = 0;
     bloom_up_pipeline_id_    = 0;
+    perfoverlay_pipeline_id_       = 0;
+    perfoverlay_drawlist_id_       = 0;
+    perfoverlay_drawlist_capacity_ = 0;
     bloom_dummy_tex_id_      = 0;
     for (auto& id : bloom_mip_tex_id_) id = 0;
     for (auto& w  : bloom_mip_w_)      w  = 0;
@@ -449,6 +520,8 @@ void Engine::TearDownDevice() {
     star_map_tex_id_      = 0;
     star_map_present_     = 0;
     moon_map_tex_id_      = 0;
+    autoexpose_pipeline_id_ = 0;
+    exposure_state_id_      = 0;
     denoiser_active_      = false;
     prev_view_proj_valid_ = false;
     primitives_dirty_     = true;        // re-upload on next device
@@ -494,33 +567,64 @@ void Engine::RequestBackendSwitch(BackendType to) {
     pt::console::Console::Get().SetCVarOverride(
         "sys_gpu_hwrt", device_->SupportsHardwareRT() ? "1" : "0");
 
-    // Two compute kernels: the path tracer ("pathtrace") and the
-    // post-denoise tonemap ("tonemap"). Both are pre-built at backend
-    // init in MetalDevice; CreateComputePipeline just looks them up
-    // by name and hands back a handle.
+    // Compute kernels are looked up by name from the active device's
+    // pre-built pipeline table. EnsurePipelineHandles fills the cached
+    // ids; on Metal those resolve immediately, on Vulkan they may
+    // resolve to 0 here while the async pipeline-build worker is
+    // still in flight, in which case RenderFrame keeps re-resolving
+    // each frame until they flip non-zero.
+    EnsurePipelineHandles();
+
+    // GPU-resident exposure scalar (1 float). AutoExposure.slang
+    // updates this each tick when r_auto_exposure=1; engine writes the
+    // manual r_exposure value here when r_auto_exposure=0. PathTrace.slang
+    // reads from it in the final tonemap, replacing the per-frame
+    // accum_hdr readback path.
+    //
+    // Seed with r_exposure if manual mode is the user's current state,
+    // otherwise 1.0 (auto mode kernel will overwrite on first frame).
     {
-        pt::rhi::ComputePipelineDesc desc{
-            .kernel_name = "pathtrace", .bytecode = {}, .debug_name = "pathtrace",
-        };
-        pathtrace_pipeline_id_ = device_->CreateComputePipeline(desc).id;
+        auto buf = device_->CreateBuffer({
+            .size = sizeof(float),
+            .usage = pt::rhi::BufferUsage::Storage,
+            .debug_name = "exposure_state",
+        });
+        exposure_state_id_ = buf.id;
+        if (exposure_state_id_ == 0) {
+            // exposure_state is required by PathTrace.slang (and
+            // Tonemap.slang in the Metal denoiser path) -- they read
+            // exposure_state[0] unconditionally. With it unallocated,
+            // the binds at slot 6 are silently skipped and the kernels
+            // either read the wrong slot or read garbage (especially
+            // on Metal where there's no nullDescriptor safety). Log
+            // and continue; further diagnosis would surface as black /
+            // wrong-exposure output rather than a silent failure.
+            LOG_ERROR("exposure_state buffer creation failed -- auto / manual exposure will misbehave");
+        } else {
+            float init_exposure = 1.0f;
+            auto& Cx = pt::console::Console::Get();
+            bool auto_exp = true;
+            if (auto* av = Cx.FindCVar("r_auto_exposure")) auto_exp = av->GetBool();
+            if (!auto_exp) {
+                if (auto* ev = Cx.FindCVar("r_exposure")) init_exposure = ev->GetFloat();
+            }
+            device_->WriteBuffer(buf, &init_exposure, sizeof(float), 0);
+        }
     }
+
+    // Perf-overlay draw list: one DrawCmd per uint4 entry.  Sized for
+    // tier-3 worst case (~256 sparkline segments + a handful of chrome
+    // entries).  Uploaded each frame via WriteBuffer when the RHI-mode
+    // overlay is active.
     {
-        pt::rhi::ComputePipelineDesc desc{
-            .kernel_name = "tonemap", .bytecode = {}, .debug_name = "tonemap",
-        };
-        tonemap_pipeline_id_ = device_->CreateComputePipeline(desc).id;
-    }
-    {
-        pt::rhi::ComputePipelineDesc desc{
-            .kernel_name = "bloom_down", .bytecode = {}, .debug_name = "bloom_down",
-        };
-        bloom_down_pipeline_id_ = device_->CreateComputePipeline(desc).id;
-    }
-    {
-        pt::rhi::ComputePipelineDesc desc{
-            .kernel_name = "bloom_up", .bytecode = {}, .debug_name = "bloom_up",
-        };
-        bloom_up_pipeline_id_ = device_->CreateComputePipeline(desc).id;
+        constexpr std::uint32_t kPerfDrawCapacity = 320;   // entries
+        auto buf = device_->CreateBuffer({
+            .size = sizeof(std::uint32_t) * 4 * kPerfDrawCapacity,
+            .usage = pt::rhi::BufferUsage::Storage,
+            .debug_name = "perfoverlay_drawlist",
+        });
+        perfoverlay_drawlist_id_       = buf.id;
+        perfoverlay_drawlist_capacity_ = kPerfDrawCapacity;
     }
 
     // Mark the analytic-primitive buffer dirty so it gets uploaded on
@@ -548,7 +652,12 @@ void Engine::SeedDefaultCsgScene() {
 }
 
 void Engine::EnsureMeshUpdated() {
-    if (!device_ || current_backend_ != BackendType::Metal) return;
+    if (!device_) return;
+    // Any backend that supports hardware ray tracing can host the CSG
+    // mesh -- not just Metal. Vulkan got real CreateBLAS/CreateTLAS in
+    // P12 (the Windows bringup). The software backend has no AS path
+    // and stays gated out via SupportsHardwareRT() = false.
+    if (!device_->SupportsHardwareRT()) return;
     if (!csg_scene_) return;
 
     // Phase 2: the worker has a result waiting. Pull it onto the main
@@ -716,6 +825,8 @@ void Engine::ReloadEnvMap(const std::string& path) {
         env_marginal_cdf_id_    = 0;
         env_conditional_cdf_id_ = 0;
         env_total_luminance_    = 0.0f;
+        hdri_lights_            = {};
+        hdri_lights_count_      = 0;
     };
 
     device_->WaitIdle();
@@ -735,14 +846,201 @@ void Engine::ReloadEnvMap(const std::string& path) {
         return;
     }
 
-    // Repack RGB -> RGBA + compute luminance per pixel for the CDF.
     const std::uint32_t W = img.width, H = img.height;
+
+    // === HDRI multi-light extraction ===
+    // Threshold the HDRI at the top 0.5% luminance percentile, then run
+    // 4-connected flood-fill (with horizontal wrap for lat-long) on the
+    // mask. Each connected component is a candidate light. Keep the top
+    // kMaxHdriLights by integrated flux; mask all kept clusters out of
+    // the env-map CDF so env-map NEE doesn't double-count them. The
+    // path tracer then does a stochastic directional NEE picking one
+    // light per sample weighted by cluster luminance -- single-sun
+    // outdoor HDRI gives one big cluster, night HDRI gives one moon,
+    // interior gives one cluster per lamp, all handled identically.
+    std::vector<std::uint8_t> light_mask(std::size_t(W) * H, 0u);
+    {
+        // Luminance per pixel + percentile threshold.
+        const std::size_t N_pix = std::size_t(W) * H;
+        std::vector<float> lums(N_pix);
+        float peak_lum = 0.0f;
+        for (std::size_t pi = 0; pi < N_pix; ++pi) {
+            const float r = img.rgb[pi * 3 + 0];
+            const float g = img.rgb[pi * 3 + 1];
+            const float b = img.rgb[pi * 3 + 2];
+            const float lum = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+            lums[pi] = lum;
+            if (lum > peak_lum) peak_lum = lum;
+        }
+
+        // Skip extraction on effectively black HDRIs -- a flood-fill on
+        // a uniform field would just pick noise. Anything below 0.5
+        // raw nits is "image is dim, no real lights detectable".
+        constexpr float kMinPeakLum = 0.5f;
+        if (peak_lum > kMinPeakLum) {
+            // Top-N% percentile threshold via partial-sort. The default
+            // 0.5% is sun-tuned but works for indoor HDRIs too because
+            // it scales with whatever the brightest content actually is
+            // (vs the prior fixed 50%-of-peak rule which only fired
+            // when peak luminance was sun-class). Driver: r_hdri_
+            // extract_percentile cvar, clamped to (0, 0.5] so the
+            // threshold stays at a meaningful "bright" tail.
+            double top_frac = 0.005;
+            if (auto* v = pt::console::Console::Get().FindCVar("r_hdri_extract_percentile")) {
+                top_frac = double(v->GetFloat());
+                if (top_frac < 1e-6) top_frac = 1e-6;
+                if (top_frac > 0.5)  top_frac = 0.5;
+            }
+            const std::size_t k_idx = N_pix - std::max<std::size_t>(
+                1, std::size_t(double(N_pix) * top_frac));
+            std::vector<float> lums_sorted = lums;  // nth_element mutates
+            std::nth_element(lums_sorted.begin(),
+                             lums_sorted.begin() + k_idx,
+                             lums_sorted.end());
+            float thresh = lums_sorted[k_idx];
+            // Floor to avoid clustering noise on dim HDRIs where the
+            // 99.5%ile lands below background.
+            if (thresh < 0.05f * peak_lum) thresh = 0.05f * peak_lum;
+            if (thresh < kMinPeakLum)      thresh = kMinPeakLum;
+
+            for (std::size_t pi = 0; pi < N_pix; ++pi) {
+                if (lums[pi] >= thresh) light_mask[pi] = 1u;
+            }
+        }
+    }
+
+    // Connected-components on light_mask. Lat-long wraps horizontally
+    // (column 0 is adjacent to column W-1) but not vertically. BFS via
+    // a vector stack keeps memory bounded; for typical HDRIs the masked
+    // set is < 1% of pixels so this is fast.
+    constexpr double kTwoPiSq = 2.0 * std::numbers::pi * std::numbers::pi;
+    const double dOmega_unit = kTwoPiSq / double(std::size_t(W) * H);
+    struct ClusterAcc {
+        glm::dvec3 centroid_dir_acc{0.0};
+        double     centroid_w_acc = 0.0;
+        glm::dvec3 flux_acc{0.0};
+        double     lum_acc = 0.0;       // ∫_cluster L dΩ -- used for sort + pmf
+        std::uint32_t pixels = 0;
+    };
+    std::vector<ClusterAcc> clusters;
+    std::vector<std::uint32_t> cluster_id(std::size_t(W) * H, 0u);  // 0 = unvisited
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> bfs_stack;
+    bfs_stack.reserve(1024);
+    auto pix_idx = [&](std::uint32_t u, std::uint32_t v) -> std::size_t {
+        return std::size_t(v) * W + u;
+    };
+    for (std::uint32_t v0 = 0; v0 < H; ++v0) {
+        for (std::uint32_t u0 = 0; u0 < W; ++u0) {
+            const std::size_t pi0 = pix_idx(u0, v0);
+            if (!light_mask[pi0] || cluster_id[pi0] != 0u) continue;
+            const std::uint32_t cid = std::uint32_t(clusters.size()) + 1u;
+            clusters.emplace_back();
+            ClusterAcc& acc = clusters.back();
+            bfs_stack.clear();
+            bfs_stack.emplace_back(u0, v0);
+            cluster_id[pi0] = cid;
+            while (!bfs_stack.empty()) {
+                auto [u, v] = bfs_stack.back();
+                bfs_stack.pop_back();
+                const std::size_t pi = pix_idx(u, v);
+                const double theta   = std::numbers::pi * (double(v) + 0.5) / double(H);
+                const double sint    = std::sin(theta);
+                const double cost    = std::cos(theta);
+                const double dOmega  = dOmega_unit * sint;
+                const double phi     = 2.0 * std::numbers::pi * (double(u) + 0.5) / double(W)
+                                     - std::numbers::pi;
+                const float  r = img.rgb[pi * 3 + 0];
+                const float  g = img.rgb[pi * 3 + 1];
+                const float  b = img.rgb[pi * 3 + 2];
+                const double lum  = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                const double wdir = lum * dOmega;
+                acc.centroid_dir_acc += glm::dvec3(sint * std::cos(phi), cost,
+                                                   sint * std::sin(phi)) * wdir;
+                acc.centroid_w_acc   += wdir;
+                acc.flux_acc         += glm::dvec3(double(r), double(g), double(b)) * dOmega;
+                acc.lum_acc          += lum * dOmega;
+                acc.pixels           += 1u;
+                const std::uint32_t um = (u == 0u)     ? (W - 1u) : (u - 1u);
+                const std::uint32_t up = (u + 1u >= W) ? 0u       : (u + 1u);
+                auto try_push = [&](std::uint32_t uu, std::uint32_t vv) {
+                    const std::size_t pp = pix_idx(uu, vv);
+                    if (light_mask[pp] && cluster_id[pp] == 0u) {
+                        cluster_id[pp] = cid;
+                        bfs_stack.emplace_back(uu, vv);
+                    }
+                };
+                try_push(um, v);
+                try_push(up, v);
+                if (v > 0)      try_push(u, v - 1u);
+                if (v + 1u < H) try_push(u, v + 1u);
+            }
+        }
+    }
+
+    // Index-sort clusters by integrated luminance descending so we
+    // know which original cluster_ids survive (cluster_id references
+    // the discovery-order index, not the sorted position). Keep top
+    // kMaxHdriLights and drop tiny noise clusters (< 3 px).
+    std::vector<std::uint32_t> order(clusters.size());
+    std::iota(order.begin(), order.end(), 0u);
+    std::sort(order.begin(), order.end(),
+        [&](std::uint32_t a, std::uint32_t b) {
+            return clusters[a].lum_acc > clusters[b].lum_acc;
+        });
+    std::vector<std::uint8_t> keep_id(clusters.size() + 1u, 0u);   // 1-based
+    hdri_lights_       = {};
+    hdri_lights_count_ = 0;
+    double total_lum = 0.0;
+    for (std::uint32_t idx : order) {
+        if (hdri_lights_count_ >= Engine::kMaxHdriLights) break;
+        const ClusterAcc& c = clusters[idx];
+        if (c.pixels < 3u || c.centroid_w_acc <= 0.0) continue;
+        keep_id[idx + 1u] = 1u;
+        HdriLight& L = hdri_lights_[hdri_lights_count_++];
+        L.dir        = glm::vec3(glm::normalize(c.centroid_dir_acc));
+        L.irradiance = glm::vec3(c.flux_acc);
+        L.luminance  = float(c.lum_acc);
+        total_lum   += c.lum_acc;
+    }
+    if (total_lum > 0.0) {
+        const float inv_total = float(1.0 / total_lum);
+        for (std::uint32_t i = 0; i < hdri_lights_count_; ++i) {
+            hdri_lights_[i].pmf = hdri_lights_[i].luminance * inv_total;
+        }
+    }
+    // Pixels in clusters we DIDN'T keep get unmasked from light_mask
+    // so env-map NEE can still pick up that minor light via the
+    // importance CDF (just no crisp directional shadow for those).
+    for (std::size_t pi = 0; pi < std::size_t(W) * H; ++pi) {
+        const std::uint32_t cid = cluster_id[pi];
+        if (cid != 0u && !keep_id[cid]) light_mask[pi] = 0u;
+    }
+    if (hdri_lights_count_ > 0) {
+        std::string msg = fmt::format(
+            "env_map: extracted {} HDRI light(s) from '{}':",
+            hdri_lights_count_, path);
+        for (std::uint32_t i = 0; i < hdri_lights_count_; ++i) {
+            const HdriLight& L = hdri_lights_[i];
+            msg += fmt::format(
+                "\n  [{}] dir=({:.2f},{:.2f},{:.2f}) flux=({:.1f},{:.1f},{:.1f}) pmf={:.3f}",
+                i, L.dir.x, L.dir.y, L.dir.z,
+                L.irradiance.r, L.irradiance.g, L.irradiance.b, L.pmf);
+        }
+        LOG_INFO("{}", msg);
+    }
+
+    // Repack RGB -> RGBA + compute luminance per pixel for the CDF.
+    // Pixels in any kept extracted cluster are zeroed in the CDF
+    // luminance only (so env-map NEE skips them -- those clusters are
+    // handled by the directional NEE in the shader). The env_map
+    // texture data itself keeps the bright pixels intact so camera-
+    // direct rays still see the visible bright pixels in the sky.
     std::vector<float> rgba(std::size_t(W) * H * 4);
     std::vector<float> conditional(std::size_t(W) * H);     // CDF per row
     std::vector<float> marginal(H);                          // CDF over rows
     double total = 0.0;
     for (std::uint32_t v = 0; v < H; ++v) {
-        const double sin_theta = std::sin(M_PI * (double(v) + 0.5) / double(H));
+        const double sin_theta = std::sin(std::numbers::pi * (double(v) + 0.5) / double(H));
         double row_sum = 0.0;
         for (std::uint32_t u = 0; u < W; ++u) {
             const std::size_t pi = std::size_t(v) * W + u;
@@ -753,7 +1051,8 @@ void Engine::ReloadEnvMap(const std::string& path) {
             rgba[pi * 4 + 1] = g;
             rgba[pi * 4 + 2] = b;
             rgba[pi * 4 + 3] = 1.0f;
-            const float lum = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+            const float lum_raw = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+            const float lum = light_mask[pi] ? 0.0f : lum_raw;
             const double weight = double(lum) * sin_theta;
             row_sum += weight;
             conditional[pi] = float(row_sum);   // unnormalized prefix sum within row
@@ -1009,8 +1308,58 @@ void Engine::EnsurePrimitivesUploaded() {
     accum_dirty_      = true;
 }
 
+void Engine::EnsurePipelineHandles() {
+    if (!device_) return;
+    auto resolve = [&](std::uint64_t& cached, const char* name) {
+        if (cached != 0) return;
+        pt::rhi::ComputePipelineDesc desc{
+            .kernel_name = name,
+            .bytecode    = {},
+            .debug_name  = name,
+        };
+        cached = device_->CreateComputePipeline(desc).id;
+    };
+    resolve(pathtrace_pipeline_id_,    "pathtrace");
+    resolve(tonemap_pipeline_id_,      "tonemap");
+    resolve(bloom_down_pipeline_id_,   "bloom_down");
+    resolve(bloom_up_pipeline_id_,     "bloom_up");
+    resolve(autoexpose_pipeline_id_,   "autoexpose");
+    resolve(perfoverlay_pipeline_id_,  "perfoverlay");
+}
+
 void Engine::RenderFrame() {
-    if (!device_ || pathtrace_pipeline_id_ == 0) return;
+    // Pipelines may still be building on the Vulkan backend's async
+    // worker; re-resolve cached ids each frame until each flips
+    // non-zero. Once all are cached the resolves are no-ops.
+    EnsurePipelineHandles();
+    if (!device_) return;
+    if (pathtrace_pipeline_id_ == 0) {
+        // Loading frame. Async pipeline build still in flight, so the
+        // path tracer / tonemap / overlay dispatches would all no-op
+        // and leave the swapchain image in its just-acquired
+        // UNDEFINED state -- visible as flickering / stale pixels.
+        // Issue a minimal clear to a defined dark colour so the user
+        // sees a clean frame while the pipelines finish compiling.
+        // Once the worker's done, EnsurePipelineHandles() flips the
+        // cached ids non-zero and this branch stops firing.
+        if (!loading_frame_active_) {
+            LOG_INFO("engine: loading screen active (Vulkan pipeline build pending)");
+            loading_frame_active_ = true;
+        }
+        auto fc = device_->BeginFrame();
+        auto* cb = device_->AcquireCommandBuffer();
+        if (cb) {
+            constexpr float kLoadingFrameRgba[4] = { 0.05f, 0.06f, 0.08f, 1.0f };
+            cb->ClearStorageTexture(fc.swapchain_image, kLoadingFrameRgba);
+            device_->Submit(cb);
+        }
+        device_->EndFrame(cb);
+        return;
+    }
+    if (loading_frame_active_) {
+        LOG_INFO("engine: pipelines ready, normal rendering resumed");
+        loading_frame_active_ = false;
+    }
 
     EnsureMeshUpdated();
     EnsurePrimitivesUploaded();
@@ -1199,6 +1548,13 @@ void Engine::RenderFrame() {
         : pt::rhi::BufferHandle{prim_buffer_id_};
     if (slot4.id != 0) cb->BindBuffer(4, slot4, 0);
     if (slot5.id != 0) cb->BindBuffer(5, slot5, 0);
+    // GPU-driven exposure scalar at slot 6. PathTrace reads it for
+    // the final tonemap; AutoExposure (dispatched later this frame)
+    // updates it. Replaces the per-frame readback path that stalled
+    // the GPU on dGPU.
+    if (exposure_state_id_ != 0) {
+        cb->BindBuffer(6, pt::rhi::BufferHandle{exposure_state_id_}, 0);
+    }
     // P10 G-buffer texture binds. The shader's vk::binding numbers (6/7/8)
     // are Vulkan descriptor slots; on Metal Slang assigns texture(N) in
     // declaration order, so output/accum/denoise_color/depth/motion/env
@@ -1296,6 +1652,17 @@ void Engine::RenderFrame() {
         // Sun extras. .x = r_sun_size multiplier, .y = Earth-Sun
         // distance ratio (mean / current_AU). .zw reserved.
         float sun_extra[4];
+        // HDRI multi-light extraction. Each entry: .xyz = unit dir to
+        // a bright cluster centroid, .w = pmf (sums to 1 across kept
+        // entries) used by the shader's stochastic light selector.
+        // Color: .rgb = ∫_cluster L dΩ (raw env_map units, scaled by
+        // env_intensity in shader). hdri_lights_count is the number
+        // of valid entries (0..kMaxHdriLights). Only meaningful when
+        // env_map_present == 1.
+        float hdri_lights_dir[Engine::kMaxHdriLights][4];
+        float hdri_lights_col[Engine::kMaxHdriLights][4];
+        std::uint32_t hdri_lights_count;
+        std::uint32_t _hdri_pad[3];   // 16-byte align next field / Slang struct end
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -1483,6 +1850,26 @@ void Engine::RenderFrame() {
         push.sun_extra[3] = 0.0f;
     }
 
+    // HDRI multi-light array (computed at HDRI load in ReloadEnvMap).
+    // Each entry is a directional light extracted from a bright cluster
+    // in the env map; the shader's stochastic NEE picks one per sample
+    // weighted by .w (pmf). Count = 0 disables HDRI directional NEE
+    // (the shader falls back to env-map-only). Only meaningful when
+    // env_map_present == 1.
+    for (std::uint32_t i = 0; i < Engine::kMaxHdriLights; ++i) {
+        const HdriLight& L = hdri_lights_[i];
+        push.hdri_lights_dir[i][0] = L.dir.x;
+        push.hdri_lights_dir[i][1] = L.dir.y;
+        push.hdri_lights_dir[i][2] = L.dir.z;
+        push.hdri_lights_dir[i][3] = L.pmf;
+        push.hdri_lights_col[i][0] = L.irradiance.r;
+        push.hdri_lights_col[i][1] = L.irradiance.g;
+        push.hdri_lights_col[i][2] = L.irradiance.b;
+        push.hdri_lights_col[i][3] = 0.0f;
+    }
+    push.hdri_lights_count = (env_map_tex_id_ != 0) ? hdri_lights_count_ : 0u;
+    push._hdri_pad[0] = push._hdri_pad[1] = push._hdri_pad[2] = 0u;
+
     // Sky mode resolution. "hdri" with no env map loaded falls back
     // to gradient so the shader doesn't read an unbound texture.
     std::string sky_mode_str = "procedural";
@@ -1496,9 +1883,12 @@ void Engine::RenderFrame() {
 
     bool auto_exp = false;
     if (auto* v = C.FindCVar("r_auto_exposure")) auto_exp = v->GetBool();
-    float manual_exp = 1.5f;
-    if (auto* v = C.FindCVar("r_exposure")) manual_exp = v->GetFloat();
-    push.exposure_pad[0] = auto_exp ? current_exposure_ : manual_exp;
+    // exposure_pad.x is dead in the shader -- PathTrace.slang reads the
+    // live exposure scalar straight from `exposure_state[0]` (updated
+    // every frame by AutoExposure.slang, or seeded by the engine on
+    // r_exposure on_change when r_auto_exposure=0). Zero this slot so
+    // tooling that dumps the push doesn't see a stale 1.5f.
+    push.exposure_pad[0] = 0.0f;
     bool show_stars = true;
     if (auto* v = C.FindCVar("r_show_stars")) show_stars = v->GetBool();
     std::string stars_mode = "bsc";
@@ -1530,7 +1920,15 @@ void Engine::RenderFrame() {
         pt::astro::worldToJ2000Matrix(lat, lon, jd, m);
         push.w2j_row0[0] = m[0]; push.w2j_row0[1] = m[1]; push.w2j_row0[2] = m[2];
         push.w2j_row1[0] = m[3]; push.w2j_row1[1] = m[4]; push.w2j_row1[2] = m[5];
-        push.w2j_row2[0] = m[6]; push.w2j_row2[1] = m[7]; push.w2j_row2[2] = m[8]; push.w2j_row2[3] = 0.0f;
+        // .w packs r_firefly_clamp -- per-contribution radiance ceiling
+        // (each indirect lighting term clamped individually: env-NEE,
+        // ambient skylight, bounce-to-sky). Camera-direct sky bypasses
+        // this and remains unbounded so the HDRI sun appears at full
+        // intensity in the rendered sky. 0 disables.
+        float firefly_clamp = 10.0f;
+        if (auto* v = C.FindCVar("r_firefly_clamp")) firefly_clamp = v->GetFloat();
+        if (firefly_clamp < 0.0f) firefly_clamp = 0.0f;
+        push.w2j_row2[0] = m[6]; push.w2j_row2[1] = m[7]; push.w2j_row2[2] = m[8]; push.w2j_row2[3] = firefly_clamp;
         // The 3x3 rotation only fills 9 floats; the w-lanes are
         // available scratch. Pack engine flags here:
         //   row0.w = HDR-pipeline (1 = raw HDR through MetalFX).
@@ -1610,7 +2008,19 @@ void Engine::RenderFrame() {
         // frame interval -- imprecise versus wall clock but stable
         // across reset_accum and reproducible per-frame for the
         // accumulator's running mean (no temporal noise from clock jitter).
-        const float t_seconds = float(frame_index_) * (1.0f / 60.0f);
+        //
+        // Wrap on a 24-hour sim window so the noise sample coordinate
+        // (pos + wind * t) stays in fp32-precise range even after long
+        // sessions.  86400 s × 60 fps = 5,184,000 frames; modulo the
+        // integer frame counter first so the float conversion is exact
+        // (well under the ~16M fp32-integer boundary).  Practical drift
+        // ceiling: with default wind 5 m/s, 432 km -- still well below
+        // anywhere fp32 loses 1-meter precision.  Wrap is invisible
+        // under normal use; only matters if someone leaves the engine
+        // running for >24h sim time.
+        constexpr std::uint64_t kCloudPeriodFrames = 86400ull * 60ull;
+        const float t_seconds = float(frame_index_ % kCloudPeriodFrames)
+                              * (1.0f / 60.0f);
         push.clouds_p1[0] = base_y;
         push.clouds_p1[1] = top_y;
         push.clouds_p1[2] = clouds_on ? coverage : 0.0f;
@@ -1629,13 +2039,73 @@ void Engine::RenderFrame() {
         push.clouds_p3[3] = rayleigh;
     }
 
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16);
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 128 + 128 + 16);
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
 
     auto wg_x = (fc.width  + 7) / 8;
     auto wg_y = (fc.height + 7) / 8;
     cb->Dispatch(wg_x, wg_y, 1);
+
+    // GPU-side auto-exposure: tiny reduction pass that samples
+    // accum_hdr (which the path tracer just wrote) and updates the
+    // exposure_state buffer the next frame's PathTrace reads. One
+    // frame of latency, zero CPU readback, zero queue-drain stall.
+    // Replaces the legacy per-8-frames CPU readback that on dGPU
+    // forced a vkQueueWaitIdle and tanked fps to ~18.
+    if (auto_exp && autoexpose_pipeline_id_ != 0 && exposure_state_id_ != 0
+        && accum_texture_id_ != 0) {
+        struct AePush {
+            std::uint32_t width;
+            std::uint32_t height;
+            std::uint32_t stride;
+            std::uint32_t pad0;
+            float key;
+            float exp_min;
+            float exp_max;
+            float adapt_speed;
+        } ae{};
+        ae.width  = fc.width;
+        ae.height = fc.height;
+        ae.stride = 16;
+        ae.key    = 0.18f;
+        ae.exp_min = 0.05f;
+        ae.exp_max = 4.0f;
+        ae.adapt_speed = 0.20f;
+        if (auto* v = C.FindCVar("r_exposure_target")) ae.key         = v->GetFloat();
+        if (auto* v = C.FindCVar("r_exposure_min"))    ae.exp_min     = v->GetFloat();
+        if (auto* v = C.FindCVar("r_exposure_max"))    ae.exp_max     = v->GetFloat();
+        if (auto* v = C.FindCVar("r_eye_adapt_speed")) ae.adapt_speed = v->GetFloat();
+
+        // Compute->compute hazard: the path tracer just wrote accum_hdr
+        // and the autoexpose dispatch is about to read it. On Vulkan
+        // submission order alone is insufficient per spec (the second
+        // dispatch's loads can race the first's stores on some drivers);
+        // emit a global compute-write -> compute-read barrier. Metal
+        // inserts the equivalent barrier automatically between dispatches
+        // on a shared resource, so the Metal backend's Barrier() is a
+        // no-op.
+        cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                     pt::rhi::BarrierDesc::Stage::ComputeRead});
+
+        cb->BindComputePipeline(pt::rhi::PipelineHandle{autoexpose_pipeline_id_});
+        // CRITICAL: re-bind accum_hdr and exposure_state AFTER
+        // BindComputePipeline. On Metal, BindComputePipeline clears all
+        // resource binds (see MetalCommandBuffer::BindComputePipeline)
+        // -- the path-tracer's binds do NOT carry over. On Vulkan binds
+        // persist across pipeline switches (the descriptor set is
+        // rewritten every Dispatch from bound_tex_/bound_buf_), but
+        // explicit re-binds work there too and keep the engine code
+        // backend-agnostic. Without this, AutoExposure on Mac runs with
+        // accum_hdr nil (reads zero), exposure_state nil (writes drop),
+        // and push constants land at the wrong MSL slot (push_slot is
+        // computed as max-bound-buf+1 = 0 instead of the kernel's
+        // declared buffer(7)) -- exposure converges to garbage.
+        cb->BindStorageTexture(1, pt::rhi::TextureHandle{accum_texture_id_});
+        cb->BindBuffer(6, pt::rhi::BufferHandle{exposure_state_id_}, 0);
+        cb->PushConstants(&ae, sizeof(ae));
+        cb->Dispatch(1, 1, 1);  // single workgroup of 64 threads
+    }
 
     // P10 denoise pass: encoded onto the same command buffer between
     // the path tracer dispatch and Submit. MetalFX reads the G-buffer
@@ -1720,6 +2190,21 @@ void Engine::RenderFrame() {
         cb->BindComputePipeline(pt::rhi::PipelineHandle{tonemap_pipeline_id_});
         cb->BindStorageTexture(0, pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
         cb->BindStorageTexture(1, fc.swapchain_image);
+        // exposure_state is already bound at engine slot 6 from the
+        // path-trace dispatch earlier this frame. Tonemap.slang has
+        // been padded with dummy bindings so its MSL emission puts
+        // exposure_state at MSL buffer(6) and Push at buffer(7) --
+        // matching PathTrace's layout and the engine's universal
+        // push_slot=max_bound_slot+1=7 contract. So we don't need
+        // to rebind here; the inheritance from PathTrace's
+        // BindBuffer(6, exposure_state) is exactly what Tonemap
+        // expects on Metal. Vulkan's descriptor sets carry the
+        // same vk::binding(15) population from PathTrace's set.
+        // (Defensive: if PathTrace didn't run for some reason, the
+        // explicit bind ensures it's there.)
+        if (exposure_state_id_ != 0) {
+            cb->BindBuffer(6, pt::rhi::BufferHandle{exposure_state_id_}, 0);
+        }
         // Bind bloom mip 0 (built above) when bloom is on, else a
         // 1x1 zero texture so the slot has *something* and the
         // shader's branch on bloom_intensity > 0 keeps it skipped.
@@ -1814,7 +2299,12 @@ void Engine::RenderFrame() {
             PtShaderGhost ghosts[lensflare::kMaxGhosts];
         } tp{};
         static_assert(sizeof(TonePush) % 16 == 0, "TonePush 16-byte aligned");
-        tp.exposure         = push.exposure_pad[0];
+        // tp.exposure is now dead in the shader -- Tonemap.slang reads
+        // exposure_state[0] from the bound buffer instead (matches
+        // PathTrace.slang's inline tonemap path). The field stays in
+        // the struct so the C++/MSL layouts don't shift; zero it so a
+        // stale value doesn't mislead anyone reading a push dump.
+        tp.exposure         = 0.0f;
         tp.passthrough      = hdr_pipeline ? 0u : 1u;
         tp.bloom_intensity  = (bloom_on && bloom_h.id == bloom_mip_tex_id_[0])
                                 ? bloom_intensity : 0.0f;
@@ -1867,62 +2357,187 @@ void Engine::RenderFrame() {
         cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
     }
 
+    // RHI-mode perf overlay: final compute pass that composites a panel
+    // + sparkline onto the post-tonemap swapchain image.  Skipped when
+    // the user picked native mode or set r_perf_overlay 0.  No text
+    // yet -- bitmap-font follow-up will land tier 1+ numbers here too.
+    {
+        auto& Cn = pt::console::Console::Get();
+        int   level    = 0;
+        std::string mode = "native";
+        if (auto* lv = Cn.FindCVar("r_perf_overlay"))      level = std::atoi(lv->value.c_str());
+        if (auto* mv = Cn.FindCVar("r_perf_overlay_mode")) mode  = mv->value;
+        if (level > 0 && mode == "rhi" &&
+            perfoverlay_pipeline_id_ != 0 && perfoverlay_drawlist_id_ != 0) {
+            // Compute-after-compute barrier on the swapchain image.
+            // The previous dispatch (PathTrace inline tonemap on
+            // Vulkan, or Tonemap.slang on Metal-with-denoiser) wrote
+            // the swapchain via storage-image stores; PerfOverlay
+            // now reads + writes the same image.  Without this
+            // barrier the load sees stale data and the resulting
+            // composite scribbles over the rendered scene.  Same
+            // pattern as the PathTrace -> AutoExposure barrier
+            // above (Metal's Barrier() is a no-op since dispatches
+            // on a shared resource auto-barrier; Vulkan needs the
+            // explicit emit).
+            cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                         pt::rhi::BarrierDesc::Stage::ComputeWrite});
+            // Panel sized for the chrome we draw: a fixed-aspect
+            // rectangle in the top-right corner.  Tier 3 adds height
+            // for the sparkline graph.
+            constexpr std::uint32_t kPanelW    = 240;
+            constexpr std::uint32_t kPanelMargin = 12;
+            std::uint32_t panel_h = (level >= 3) ? 90u : 28u;
+            std::uint32_t panel_w = kPanelW;
+            // Skip the overlay this frame if the swapchain is smaller
+            // than the margin -- unsigned subtraction would underflow
+            // to a huge value and produce wild panel coords / sizes.
+            // It's just a HUD; no harm in dropping it for a tiny window.
+            if (fc.width <= kPanelMargin || fc.height <= kPanelMargin) {
+                panel_w = panel_h = 0;
+            } else {
+                if (panel_w + kPanelMargin > fc.width)  panel_w = fc.width - kPanelMargin;
+                if (panel_h + kPanelMargin > fc.height) panel_h = fc.height - kPanelMargin;
+            }
+            std::uint32_t panel_x = (panel_w == 0u || panel_w + kPanelMargin > fc.width)
+                                  ? 0u : fc.width - panel_w - kPanelMargin;
+            std::uint32_t panel_y = kPanelMargin;
+
+            if (panel_w == 0u || panel_h == 0u) {
+                // Window too small for the HUD -- skip the dispatch.
+            } else {
+            // Build the draw list in panel-local coords.  Each command
+            // is uint4: kind, x, y, payload.  Buffer was sized for
+            // perfoverlay_drawlist_capacity_ entries; clamp.
+            std::vector<std::uint32_t> dl;
+            dl.reserve(perfoverlay_drawlist_capacity_ * 4);
+            auto push_cmd = [&](std::uint32_t kind, std::uint32_t x,
+                                std::uint32_t y, std::uint32_t payload) {
+                if (dl.size() / 4 >= perfoverlay_drawlist_capacity_) return;
+                dl.push_back(kind);
+                dl.push_back(x);
+                dl.push_back(y);
+                dl.push_back(payload);
+            };
+
+            if (level >= 3 && !perf_history_.empty()) {
+                // Sparkline.  Linearize the ring (oldest-first), find
+                // the peak, project samples to panel-local Y.  Ref
+                // line at 16.67 ms for 60 fps.
+                std::size_t n = perf_history_.size();
+                std::vector<float> linear(n);
+                for (std::size_t i = 0; i < n; ++i) {
+                    linear[i] = perf_history_[(perf_history_pos_ + i) % n];
+                }
+                float peak = 1.0f;
+                for (float v : linear) if (v > peak) peak = v;
+                if (peak < 0.5f) peak = 0.5f;
+
+                std::uint32_t graph_x  = 6;
+                std::uint32_t graph_y  = 24;     // below the (future) text rows
+                std::uint32_t graph_w  = panel_w - 12;
+                std::uint32_t graph_h  = panel_h - graph_y - 6;
+
+                // 60 fps reference (16.67 ms).
+                if (16.667f < peak) {
+                    std::uint32_t ref_y = graph_y + graph_h - 1
+                        - static_cast<std::uint32_t>((16.667f / peak) * (graph_h - 2));
+                    push_cmd(/*rule*/ 2, graph_x, ref_y, graph_w);
+                }
+
+                // Sparkline polyline: emit one segment per pixel of
+                // graph width, picking samples evenly across history.
+                std::uint32_t segs = (graph_w > 1) ? graph_w - 1 : 0;
+                for (std::uint32_t i = 0; i < segs; ++i) {
+                    std::size_t i0 = (i * n) / segs;
+                    std::size_t i1 = ((i + 1) * n) / segs;
+                    if (i1 >= n) i1 = n - 1;
+                    float v0 = linear[i0];
+                    float v1 = linear[i1];
+                    std::uint32_t x0 = graph_x + i;
+                    std::uint32_t x1 = graph_x + i + 1;
+                    std::uint32_t y0 = graph_y + graph_h - 1
+                        - static_cast<std::uint32_t>((v0 / peak) * (graph_h - 2));
+                    std::uint32_t y1 = graph_y + graph_h - 1
+                        - static_cast<std::uint32_t>((v1 / peak) * (graph_h - 2));
+                    if (y0 >= graph_y + graph_h) y0 = graph_y + graph_h - 1;
+                    if (y1 >= graph_y + graph_h) y1 = graph_y + graph_h - 1;
+                    // Pack y0 in low 16, y1 in high 16, x1 in payload low 16.
+                    std::uint32_t z   = (y0 & 0xFFFFu) | ((y1 & 0xFFFFu) << 16);
+                    std::uint32_t pay = (x1 & 0xFFFFu);
+                    push_cmd(/*segment*/ 1, x0, z, pay);
+                    if (dl.size() / 4 >= perfoverlay_drawlist_capacity_) break;
+                }
+            }
+
+            std::uint32_t num_cmds = static_cast<std::uint32_t>(dl.size() / 4);
+            if (num_cmds > 0) {
+                device_->WriteBuffer(pt::rhi::BufferHandle{perfoverlay_drawlist_id_},
+                                     dl.data(), dl.size() * sizeof(std::uint32_t), 0);
+            }
+
+            // Theme-driven panel/accent/graph colours (RGBA8 packed,
+            // alpha used for blend strength).  Picks a small set
+            // matching the native overlay's palette.
+            std::string theme = "hardcore";
+            if (auto* tv = Cn.FindCVar("r_theme")) theme = tv->value;
+            std::uint32_t panel_col  = 0xC8160E0Cu;  // dark, alpha ~0.78
+            std::uint32_t accent_col = 0xFFFFF000u;  // hardcore cyan
+            std::uint32_t graph_col  = 0xFFFFF000u;
+            if (theme == "amber")     { accent_col = 0xFF2890FFu; graph_col = 0xFF2890FFu; }
+            else if (theme == "synthwave") { accent_col = 0xFFB450FFu; graph_col = 0xFFB450FFu; }
+            else if (theme == "matrix")    { accent_col = 0xFF00FF50u; graph_col = 0xFF00FF50u; }
+            else if (theme == "vault")     { accent_col = 0xFFFFA050u; graph_col = 0xFFFFA050u; }
+            else if (theme == "sakura")    { accent_col = 0xFFB48CFFu; graph_col = 0xFFB48CFFu; }
+            else if (theme == "mono")      { accent_col = 0xFFE0E0E0u; graph_col = 0xFFE0E0E0u; }
+
+            struct PerfPush {
+                std::uint32_t panel_x;
+                std::uint32_t panel_y;
+                std::uint32_t panel_w;
+                std::uint32_t panel_h;
+                std::uint32_t num_cmds;
+                std::uint32_t panel_color;
+                std::uint32_t accent_color;
+                std::uint32_t graph_color;
+            } pp{
+                panel_x, panel_y, panel_w, panel_h,
+                num_cmds,
+                panel_col, accent_col, graph_col,
+            };
+
+            cb->BindComputePipeline(pt::rhi::PipelineHandle{perfoverlay_pipeline_id_});
+            cb->BindStorageTexture(0, fc.swapchain_image);
+            // Engine buffer slot 1 -> kSlotToBufBinding[1] = vk::binding(3)
+            // on Vulkan, MSL buffer(1) on Metal (after the
+            // _slot_dummy0 declaration in PerfOverlay.slang shifts
+            // draw_list off MSL slot 0).  Slot 3 here previously
+            // landed at vk::binding(5) (primitives) -- which is what
+            // produced the "rhi overlay totally breaks the scene"
+            // garbage: the shader read mesh_positions data as
+            // DrawCmd entries.
+            cb->BindBuffer(1, pt::rhi::BufferHandle{perfoverlay_drawlist_id_}, 0);
+            cb->PushConstants(&pp, sizeof(pp));
+            cb->Dispatch((panel_w + 7) / 8, (panel_h + 7) / 8, 1);
+            }   // panel_w/panel_h > 0 -- HUD dispatched
+        }
+    }
+
     device_->Submit(cb);
     device_->EndFrame(cb);
 
     prev_view_proj_       = curr_view_proj;
     prev_view_proj_valid_ = true;
 
-    // Auto-exposure: every 8 frames, sample accum_hdr's central region
-    // and nudge the exposure scalar toward 0.18 / scene_avg_luminance.
-    // accum_hdr is shared-storage on Apple Silicon so the readback is
-    // a memcpy; we step every 16th pixel for speed (~3.6k samples on a
-    // 1280x720 frame). Smoothing factor controls eye-adaptation rate.
-    if (auto_exp && accum_texture_id_ != 0 && ++autoexpose_counter_ >= 8) {
-        autoexpose_counter_ = 0;
-        std::uint32_t w = 0, h = 0;
-        const std::size_t bytes = std::size_t(accum_w_) * accum_h_ * 16;
-        std::vector<float> rgba(bytes / sizeof(float));
-        if (device_->ReadbackTexture(pt::rhi::TextureHandle{accum_texture_id_},
-                                     rgba.data(), bytes, &w, &h) && w > 0 && h > 0) {
-            double accum_lum = 0.0;
-            std::size_t n = 0;
-            for (std::uint32_t y = 0; y < h; y += 16) {
-                for (std::uint32_t x = 0; x < w; x += 16) {
-                    const float* p = rgba.data() + (std::size_t(y) * w + x) * 4;
-                    const float lum = 0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2];
-                    if (lum > 0.0f) { accum_lum += lum; ++n; }
-                }
-            }
-            if (n > 0) {
-                const float avg_lum = float(accum_lum / double(n));
-                float key      = 0.18f;
-                float exp_min  = 0.05f;
-                float exp_max  = 4.0f;
-                float k        = 0.20f;
-                auto& Cx = pt::console::Console::Get();
-                if (auto* v = Cx.FindCVar("r_exposure_target")) key     = v->GetFloat();
-                if (auto* v = Cx.FindCVar("r_exposure_min"))    exp_min = v->GetFloat();
-                if (auto* v = Cx.FindCVar("r_exposure_max"))    exp_max = v->GetFloat();
-                if (auto* v = Cx.FindCVar("r_eye_adapt_speed")) k       = v->GetFloat();
-                float target_exp = key / std::max(avg_lum, 1e-3f);
-                if (target_exp < exp_min) target_exp = exp_min;
-                if (target_exp > exp_max) target_exp = exp_max;
-                // Geometric smoothing in log space gives a more
-                // perceptually uniform fade than a linear lerp.
-                if (k <= 0.0f) {
-                    // Locked-exposure presets (DSLR / linear): jump
-                    // straight to target without smoothing so the
-                    // user sees the locked value immediately.
-                    current_exposure_ = target_exp;
-                } else {
-                    current_exposure_ = std::exp(
-                        std::log(current_exposure_) * (1.0f - k) +
-                        std::log(target_exp)        * k);
-                }
-            }
-        }
-    }
+    // Auto-exposure was a per-frame CPU readback of accum_hdr,
+    // which on dGPU stalls the GPU queue (vkQueueWaitIdle every 8
+    // frames -> ~18 fps). It's now done entirely on GPU by the
+    // AutoExposure compute pass dispatched right after the path
+    // tracer above; the result lives in the exposure_state buffer
+    // and PathTrace.slang reads it on the next frame. Manual-mode
+    // (r_auto_exposure=0) value updates are done via on_change
+    // cvar hooks below in BindCvars(), so no per-frame work happens
+    // for that path either.
 }
 
 void Engine::UpdateCamera(double dt) {
@@ -2022,6 +2637,25 @@ void Engine::Tick(double dt) {
             C.SetCVarOverride("r_sky_hour", std::to_string(hour));
             accum_dirty_ = true;
         }
+
+        // Cloud wind drift uses `frame_index_ * (1/60)` as time-seconds
+        // in the path tracer's cloud field (see RenderFrame), so the
+        // cloud pattern advances every frame whenever wind is non-zero.
+        // Without dirtying the accumulator, samples taken across many
+        // frames at different cloud positions get averaged into
+        // accum_hdr -> visible "stretched / smeared clouds" after the
+        // engine sits idle for a while; mouse motion fixes it because
+        // the camera-move dirty flag resets the accumulator.  Mirror
+        // the sky_animate path: when clouds are on AND wind is set,
+        // mark dirty every tick so accumulation resets per frame.
+        bool clouds_on = false;
+        if (auto* v = C.FindCVar("r_clouds")) clouds_on = v->GetBool();
+        if (clouds_on) {
+            float wx = 0.0f, wz = 0.0f;
+            if (auto* v = C.FindCVar("r_clouds_wind_x")) wx = v->GetFloat();
+            if (auto* v = C.FindCVar("r_clouds_wind_z")) wz = v->GetFloat();
+            if (wx != 0.0f || wz != 0.0f) accum_dirty_ = true;
+        }
     }
 
     auto t0 = std::chrono::steady_clock::now();
@@ -2029,27 +2663,79 @@ void Engine::Tick(double dt) {
     auto frame_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t0).count();
 
-    // Broadcast frame_stats throttled to ~10 Hz so the network doesn't
-    // get spammed at 240+ fps.
+    // Per-frame ring buffer for the tier-3 sparkline.  Sized for ~4
+    // seconds of 60-fps history; the overlay subsamples down to its
+    // available pixel width when rendering. Ring is resized lazily on
+    // first push when an overlay actually needs samples, so a session
+    // with the HUD disabled never allocates this buffer or runs the
+    // sample-write logic. Both native and rhi-mode paths feed off this
+    // ring, so gate on either being on.
+    bool perf_active = false;
+    if (auto* lv = pt::console::Console::Get().FindCVar("r_perf_overlay")) {
+        perf_active = lv->GetInt() > 0;
+    }
+    if (perf_active) {
+        if (perf_history_.empty()) perf_history_.assign(256, 0.0f);
+        perf_history_[perf_history_pos_] = static_cast<float>(frame_ms);
+        perf_history_pos_ = (perf_history_pos_ + 1) % perf_history_.size();
+    }
+
+    // Aggregate at ~10 Hz so the network doesn't get spammed at
+    // 240+ fps and the overlay's text doesn't visually flicker.
+    // Same window also drives the avg/min/max stats consumed below.
     static double accum_s = 0.0;
     static int    accum_frames = 0;
     static double accum_render_ms = 0.0;
+    static double accum_min = 1.0e30;
+    static double accum_max = 0.0;
     accum_s         += dt;
     accum_frames    += 1;
     accum_render_ms += frame_ms;
-    if (accum_s >= 0.1 && server_) {
-        double fps = accum_frames / accum_s;
+    if (frame_ms < accum_min) accum_min = frame_ms;
+    if (frame_ms > accum_max) accum_max = frame_ms;
+    if (accum_s >= 0.1) {
+        double fps        = accum_frames / accum_s;
         double avg_render = accum_render_ms / accum_frames;
         int w = window_ ? window_->Width()  : 0;
         int h = window_ ? window_->Height() : 0;
-        auto data = fmt::format(
-            R"({{"fps":{:.1f},"frame_ms":{:.3f},"trace_ms":{:.3f},"backend":"{}","resolution":[{},{}]}})",
-            fps, accum_render_ms / accum_frames, avg_render,
-            pt::rhi::BackendName(current_backend_), w, h);
-        server_->BroadcastEvent("frame_stats", data);
-        accum_s = 0.0;
-        accum_frames = 0;
+
+        if (server_) {
+            auto data = fmt::format(
+                R"({{"fps":{:.1f},"frame_ms":{:.3f},"trace_ms":{:.3f},"backend":"{}","resolution":[{},{}]}})",
+                fps, avg_render, avg_render,
+                pt::rhi::BackendName(current_backend_), w, h);
+            server_->BroadcastEvent("frame_stats", data);
+        }
+
+        if (perf_overlay_ && perf_overlay_->Level() > 0) {
+            // Linearize the ring (oldest-first) so the overlay can
+            // walk it left-to-right without modular arithmetic.
+            std::vector<float> linear(perf_history_.size());
+            for (std::size_t i = 0; i < perf_history_.size(); ++i) {
+                linear[i] = perf_history_[(perf_history_pos_ + i) % perf_history_.size()];
+            }
+            auto& Cn = pt::console::Console::Get();
+            pt::app::PerfStats st;
+            st.fps          = fps;
+            st.frame_ms_avg = avg_render;
+            st.frame_ms_min = accum_min;
+            st.frame_ms_max = accum_max;
+            st.backend      = pt::rhi::BackendName(current_backend_);
+            st.width        = w;
+            st.height       = h;
+            st.gpu_bytes    = device_ ? device_->CurrentAllocatedBytes() : 0;
+            if (auto* sv = Cn.FindCVar("r_spp"))         st.spp         = sv->GetInt();
+            if (auto* mv = Cn.FindCVar("r_max_bounces")) st.max_bounces = mv->GetInt();
+            st.primitives   = primitives_.size();
+            st.frame_ms_history = std::span<const float>(linear.data(), linear.size());
+            perf_overlay_->Update(st);
+        }
+
+        accum_s         = 0.0;
+        accum_frames    = 0;
         accum_render_ms = 0.0;
+        accum_min       = 1.0e30;
+        accum_max       = 0.0;
     }
 }
 
@@ -2062,6 +2748,16 @@ void Engine::Run() {
         last = now;
 
         window_->PollEvents();
+        // Child overlay HWND on Win32 doesn't auto-resize when the
+        // parent does; push the latest client size each frame (no-op
+        // unless changed). Also matches Mac's NSWindow setFrame logic
+        // which is driven by AppKit's resize, not the engine loop.
+        if (overlay_) {
+            overlay_->NotifyParentResized(window_->Width(), window_->Height());
+        }
+        if (perf_overlay_) {
+            perf_overlay_->NotifyParentResized(window_->Width(), window_->Height());
+        }
         Tick(dt);
 
         // If no device is bound yet we'd busy-loop; throttle.  With a
@@ -2267,7 +2963,7 @@ void Engine::RegisterCommands() {
             out.FormatLine("scene: loaded {} primitive(s) from {}", primitives_.size(), path);
         });
 
-    C.RegisterCommand("screenshot",
+    if (auto* cmd = C.RegisterCommand("screenshot",
         "screenshot <path.ppm> [accum|denoise_color|depth|motion]: dump the target render texture to a PPM file (P6 binary, ACES-tonemapped for HDR inputs).",
         [this](auto args, pt::console::Output& out) {
             if (!device_) { out.PrintLine("screenshot: no device"); return; }
@@ -2318,21 +3014,108 @@ void Engine::RegisterCommands() {
                 return;
             }
 
+            // Pull the live exposure scalar from the GPU-resident
+            // exposure_state buffer so the host-side ACES tonemap below
+            // matches what the GPU paths render on screen (PathTrace's
+            // inline tonemap on Vulkan, Tonemap.slang post-pass on
+            // Metal -- both multiply by exposure_state[0]).  Without
+            // this the PPM has no exposure applied and only matches
+            // the screen when the scalar happens to be exactly 1.0.
+            // Falls back to the r_exposure cvar if the readback isn't
+            // implemented (e.g. software backend).  Auto-expose mode
+            // tracks the GPU value live; manual mode reads back the
+            // value the engine wrote, which is exactly r_exposure.
+            float screenshot_exposure = 1.0f;
+            if (target == "accum" || target == "denoise_color") {
+                bool got = false;
+                if (exposure_state_id_ != 0) {
+                    float v = 1.0f;
+                    if (device_->ReadbackBuffer(pt::rhi::BufferHandle{exposure_state_id_},
+                                                &v, sizeof(float))) {
+                        screenshot_exposure = v;
+                        got = true;
+                    }
+                }
+                if (!got) {
+                    auto& Cx = pt::console::Console::Get();
+                    if (auto* ev = Cx.FindCVar("r_exposure"))
+                        screenshot_exposure = ev->GetFloat();
+                }
+            }
+
             // Convert to 8-bit RGB. ACES tonemap for HDR; depth gets a
             // grayscale ramp (0=black, 1=white); motion encodes (R = +x
             // mapped to [0..1], G = +y mapped, B=0) so directionality
-            // is visible. Half-float decode is via __fp16 (Apple Clang).
-            auto tonemap = [](float c) -> std::uint8_t {
+            // is visible. Half-float decode is a portable IEEE 754
+            // binary16 unpack (see lambda below) -- works on MSVC too.
+            auto tonemap = [exp = screenshot_exposure](float c) -> std::uint8_t {
+                c *= exp;
                 const float a = 2.51f, b = 0.03f, d = 2.43f, e = 0.59f, f = 0.14f;
                 float x = (c * (a * c + b)) / (c * (d * c + e) + f);
                 if (x < 0.0f) x = 0.0f;
                 if (x > 1.0f) x = 1.0f;
+                // sRGB OETF (linear -> nonlinear) so the stored 8-bit
+                // values match what the on-screen path writes to the
+                // swapchain after PathTrace.slang / Tonemap.slang's
+                // srgb_oetf().  Without this the PPM is linear LDR
+                // and viewers (which assume sRGB) re-apply the EOTF,
+                // producing a visibly darker image than what's on
+                // screen.  Same piecewise OETF as the shader.
+                if (x <= 0.0031308f) {
+                    x = x * 12.92f;
+                } else {
+                    x = 1.055f * std::pow(x, 1.0f / 2.4f) - 0.055f;
+                }
+                if (x > 1.0f) x = 1.0f;
                 return static_cast<std::uint8_t>(x * 255.0f + 0.5f);
             };
+            // Portable IEEE 754 binary16 -> binary32 decode. Apple Clang
+            // and GCC have __fp16 as an extension and we used to lean on
+            // it here, but MSVC has no equivalent (and _Float16 has
+            // partial support), so do the bit-shuffle manually. Handles
+            // ±0, subnormals, normals, Inf/NaN.
             auto half_to_float = [](std::uint16_t h_) -> float {
-                __fp16 v;
-                std::memcpy(&v, &h_, 2);
-                return float(v);
+                const std::uint32_t sign = (h_ >> 15) & 0x1u;
+                const std::uint32_t exp  = (h_ >> 10) & 0x1Fu;
+                const std::uint32_t mant = h_ & 0x3FFu;
+                std::uint32_t f;
+                if (exp == 0) {
+                    if (mant == 0) {
+                        f = sign << 31;  // signed zero
+                    } else {
+                        // Subnormal: renormalise into a regular float32.
+                        // Half subnormals have biased_exp = 0 and decode
+                        // to (-1)^s * 2^-14 * (mant / 2^10). Walk the
+                        // mantissa bits left until the implicit-1 lands
+                        // at bit 10 (0x400). Each shift represents a
+                        // factor of 2, lowering the effective exponent
+                        // by one. Final binary32 biased exponent =
+                        // 127 + (p - 24) where p is the original leading
+                        // bit position. With e = 1 + (10 - p) shifts,
+                        // p = 11 - e, so biased exp = 114 - e =
+                        // (127 - 15 - e + 2). The previous formula used
+                        // +1 instead of +2 and underestimated by one
+                        // exponent (subnormals decoded 2x too small).
+                        std::uint32_t e = 1;
+                        std::uint32_t m = mant;
+                        while ((m & 0x400u) == 0) { m <<= 1; ++e; }
+                        m &= 0x3FFu;
+                        f = (sign << 31)
+                          | ((127u - 15u - e + 2u) << 23)
+                          | (m << 13);
+                    }
+                } else if (exp == 31) {
+                    // Inf or NaN -- propagate via mantissa.
+                    f = (sign << 31) | (0xFFu << 23) | (mant << 13);
+                } else {
+                    // Normal: rebias exponent (15 -> 127) and shift mantissa.
+                    f = (sign << 31)
+                      | ((exp - 15u + 127u) << 23)
+                      | (mant << 13);
+                }
+                float result;
+                std::memcpy(&result, &f, sizeof(result));
+                return result;
             };
 
             std::vector<std::uint8_t> rgb(std::size_t(w) * hgt * 3);
@@ -2385,7 +3168,9 @@ void Engine::RegisterCommands() {
             std::fclose(f);
             out.FormatLine("screenshot: wrote {} ({}x{} {})", path, w, hgt, tag);
             (void)channels;
-        });
+        })) {
+        cmd->default_args = "demonte_screen.ppm";
+    }
 
     C.RegisterCommand("web_console",
         "Open the web console in the default browser.",
@@ -2450,30 +3235,39 @@ void Engine::RegisterCommands() {
     C.RegisterCommand("undo",
         "Roll back the most recent cvar change (or semicolon-bundle "
         "of changes) made via the console. Pre-transaction values "
-        "are restored; the rollback itself is recorded for redo. "
-        "History stack holds the last 50 transactions.",
+        "are restored as a single atomic step; the rollback itself "
+        "is recorded for redo. Output lists every cvar reverted with "
+        "before -> after values. History stack holds the last 50 "
+        "transactions.",
         [](auto, pt::console::Output& out) {
             auto& C2 = pt::console::Console::Get();
-            std::size_t n = C2.Undo();
-            if (n == 0) {
+            auto changes = C2.Undo();
+            if (changes.empty()) {
                 out.PrintLine("undo: history is empty");
-            } else {
-                out.FormatLine("undo: rolled back {} cvar change{}",
-                               n, n == 1 ? "" : "s");
+                return;
+            }
+            out.FormatLine("undo: rolled back {} cvar change{}",
+                           changes.size(), changes.size() == 1 ? "" : "s");
+            for (const auto& c : changes) {
+                out.FormatLine("  {}: \"{}\" -> \"{}\"", c.name, c.from, c.to);
             }
         });
 
     C.RegisterCommand("redo",
-        "Reapply the most recently undone cvar change. Cleared by "
-        "any new edit.",
+        "Reapply the most recently undone cvar change (or bundle). "
+        "Output lists every cvar reapplied with before -> after "
+        "values. Cleared by any new edit.",
         [](auto, pt::console::Output& out) {
             auto& C2 = pt::console::Console::Get();
-            std::size_t n = C2.Redo();
-            if (n == 0) {
+            auto changes = C2.Redo();
+            if (changes.empty()) {
                 out.PrintLine("redo: nothing to redo");
-            } else {
-                out.FormatLine("redo: reapplied {} cvar change{}",
-                               n, n == 1 ? "" : "s");
+                return;
+            }
+            out.FormatLine("redo: reapplied {} cvar change{}",
+                           changes.size(), changes.size() == 1 ? "" : "s");
+            for (const auto& c : changes) {
+                out.FormatLine("  {}: \"{}\" -> \"{}\"", c.name, c.from, c.to);
             }
         });
 
@@ -2634,9 +3428,49 @@ void Engine::RegisterCommands() {
             if (!r.ok) out.FormatLine("exec error: {}", r.error);
         });
 
-    // r_backend: validate against the known set + react to changes.
+    // r_perf_overlay: validate + push level changes to the overlay.
+    if (auto* v = C.FindCVar("r_perf_overlay")) {
+        v->allowed_values = {"0", "1", "2", "3"};
+        v->on_change = [this](const pt::console::CVar& cv) {
+            if (perf_overlay_) {
+                int lv = std::atoi(cv.value.c_str());
+                bool rhi = false;
+                if (auto* mv = pt::console::Console::Get().FindCVar("r_perf_overlay_mode")) {
+                    rhi = (mv->value == "rhi");
+                }
+                // Native overlay only takes the level when RHI mode is off;
+                // otherwise it stays hidden so both don't draw at once.
+                perf_overlay_->SetLevel(rhi ? 0 : lv);
+            }
+        };
+    }
+    if (auto* v = C.FindCVar("r_perf_overlay_mode")) {
+        v->allowed_values = {"native", "rhi"};
+        v->on_change = [this](const pt::console::CVar& cv) {
+            if (perf_overlay_) {
+                int lv = 0;
+                if (auto* lvv = pt::console::Console::Get().FindCVar("r_perf_overlay")) {
+                    lv = std::atoi(lvv->value.c_str());
+                }
+                perf_overlay_->SetLevel(cv.value == "rhi" ? 0 : lv);
+            }
+        };
+    }
+    // r_backend: validate against the set of backends actually
+    // compiled into this binary, so the console / web UI only offers
+    // values that can succeed.  Listing "metal" on Windows or
+    // "vulkan" on a build without PT_ENABLE_VULKAN_BACKEND would only
+    // produce confusing error logs at switch time.
     if (auto* v = C.FindCVar("r_backend")) {
-        v->allowed_values = {"none", "software", "metal", "vulkan"};
+        v->allowed_values.clear();
+        v->allowed_values.push_back("none");
+#if defined(__APPLE__)
+        v->allowed_values.push_back("software");
+        v->allowed_values.push_back("metal");
+#endif
+#if defined(PT_HAS_VULKAN_BACKEND)
+        v->allowed_values.push_back("vulkan");
+#endif
         v->on_change = [this](const pt::console::CVar& cv) {
             BackendType t = BackendType::None;
             if      (cv.value == "software") t = BackendType::Software;
@@ -2656,6 +3490,7 @@ void Engine::RegisterCommands() {
                 server_->BroadcastEvent("theme_change", data);
             }
             if (overlay_) overlay_->ApplyTheme(cv.value);
+            if (perf_overlay_) perf_overlay_->ApplyTheme(cv.value);
         };
     }
     // dev_log_level: validate
@@ -2845,19 +3680,25 @@ void Engine::RegisterCommands() {
                 bool  auto_exposure;       // 0 forces manual r_exposure
                 float manual_exp;
             };
+            // exp_min for auto-exposure presets is set to 1e-6 (effectively
+            // "no floor") so genuine outdoor daylight scenes can settle to
+            // the ~1e-5 exposure scalar they actually need. The legacy
+            // 0.05 floor was capping the dimming and burning out skies.
+            // Locked-exposure presets (dslr_iso*, linear) keep min == max
+            // since they're not running auto-exposure.
             static const Preset presets[] = {
                 // Human eye: comfortable adaptation range, ~1s adapt time.
-                {"human",        0.05f,  4.0f,  0.18f, 0.20f, true,  1.5f},
+                {"human",        1e-6f,  4.0f,  0.18f, 0.20f, true,  1.5f},
                 // Cats: rod-rich retina, ~6x dim-light sensitivity.
-                {"cat",          0.05f, 12.0f,  0.18f, 0.30f, true,  1.5f},
+                {"cat",          1e-6f, 12.0f,  0.18f, 0.30f, true,  1.5f},
                 // Owls: nocturnal extreme, ~100x rod density of humans.
-                {"owl",          0.05f, 30.0f,  0.18f, 0.35f, true,  1.5f},
+                {"owl",          1e-6f, 30.0f,  0.18f, 0.35f, true,  1.5f},
                 // DSLR locked at ISO 100: no auto, fixed exposure.
                 {"dslr_iso100",  1.0f,   1.0f,  0.18f, 0.0f,  false, 1.0f},
                 // DSLR locked at ISO 6400: 64x more gain.
                 {"dslr_iso6400", 8.0f,   8.0f,  0.18f, 0.0f,  false, 8.0f},
                 // Smartphone: auto, modest range.
-                {"phone",        0.10f,  6.0f,  0.18f, 0.25f, true,  1.5f},
+                {"phone",        1e-6f,  6.0f,  0.18f, 0.25f, true,  1.5f},
                 // Linear: bypass exposure entirely (debug).
                 {"linear",       1.0f,   1.0f,  0.18f, 0.0f,  false, 1.0f},
             };
@@ -2899,7 +3740,36 @@ void Engine::RegisterCommands() {
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
     if (auto* v = C.FindCVar("r_exposure")) {
-        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+        v->on_change = [this](const pt::console::CVar& cv) {
+            accum_dirty_ = true;
+            // Manual mode: push the new value straight to the GPU
+            // exposure_state buffer so the next frame's PathTrace
+            // tonemap picks it up. In auto mode, AutoExposure.slang
+            // overwrites it each frame so we don't bother.
+            if (exposure_state_id_ == 0 || !device_) return;
+            bool auto_exp = false;
+            if (auto* av = pt::console::Console::Get().FindCVar("r_auto_exposure"))
+                auto_exp = av->GetBool();
+            if (!auto_exp) {
+                float val = cv.GetFloat();
+                device_->WriteBuffer(pt::rhi::BufferHandle{exposure_state_id_},
+                                     &val, sizeof(float), 0);
+            }
+        };
+    }
+    if (auto* v = C.FindCVar("r_auto_exposure")) {
+        v->on_change = [this](const pt::console::CVar& cv) {
+            // Switching auto -> manual: seed the GPU buffer with the
+            // current r_exposure value so the path tracer doesn't
+            // briefly use whatever the auto pass last wrote.
+            if (cv.GetBool()) return;
+            if (exposure_state_id_ == 0 || !device_) return;
+            float val = 1.5f;
+            if (auto* ev = pt::console::Console::Get().FindCVar("r_exposure"))
+                val = ev->GetFloat();
+            device_->WriteBuffer(pt::rhi::BufferHandle{exposure_state_id_},
+                                 &val, sizeof(float), 0);
+        };
     }
     if (auto* v = C.FindCVar("r_sky_use_astronomical")) {
         v->allowed_values = {"0", "1"};

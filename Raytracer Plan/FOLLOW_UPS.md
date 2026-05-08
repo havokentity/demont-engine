@@ -233,6 +233,76 @@ Windows/5090 is a P12 milestone.
 
 ---
 
+## Spherical-Earth atmospheric model (post-NRD)
+
+**Status:** Deferred until after the Vulkan NRD denoiser lands. The
+current rendering uses planar earth + a flat cloud-layer slab, which
+leaves a visible gap between the cloud bottom and the geometric
+horizon when the camera is near the ground -- "clouds never touch
+the horizon" because a perfectly horizontal ray would need infinite
+horizontal distance to enter a cloud slab above the camera. In real
+life Earth curvature drops distant clouds below horizontal sightline
+so they visually merge with the horizon.
+
+**Why deferred:** the current planar approximation is good enough
+for most paths (HDRI mode + scenes within a few km), and NRD is on
+the critical path for Vulkan visual quality.
+
+**Use case driving this:** procedural sky for **flight rendering** —
+sunset / sunrise / altitude views where the horizon is the
+focal area, sun aureole + multi-scatter need to look right, and
+distant terrain should fade through curved-path aerial perspective.
+HDRI mode benefits less because the env map provides the sky, but
+still wins on the spherical cloud shell + curved aerial perspective
+on far surfaces.
+
+**The four phases (rough Hillaire 2020 implementation):**
+
+1. **Spherical cloud shell** (~150 LOC, ~1 hour). Add
+   `r_planet_radius` cvar (default 6371 km Earth). Replace cloud
+   layer's flat slab intersection with ray-vs-spherical-shell. Cloud
+   march cost rises by a couple of `sqrt`s per entry, runtime impact
+   negligible. Self-contained -- can ship without phases 2-4 and
+   still get the horizon-gap fix.
+
+2. **Transmittance LUT + spherical aerial perspective** (~250 LOC).
+   Replace the analytical `atmosphericTransmittance` (planar
+   exponential integral) with a 256x64 LUT computed once at startup
+   via a compute pass. Curved-path attenuation along the actual
+   spherical air mass. Sample per cloud-march step + per surface
+   hit; ~5 cycles + memory latency per sample (faster than the
+   current `exp` calls in many cases).
+
+3. **Multi-scatter + sky-view LUTs for procedural mode** (~350 LOC).
+   This is the flight-sim sunset visual win:
+   - **Multi-scatter LUT** 32x32, computed from the transmittance
+     LUT. Adds the secondary-bounce contribution that makes
+     overcast and sunset look saturated rather than washed out.
+   - **Sky-view LUT** 192x108 RGBA16F, recomputed each frame
+     because it depends on sun direction. Replaces `procSky`'s
+     analytical math with a proper sampled sky.
+   - Procedural sky's sun aureole + horizon gradient become correct.
+   - HDRI mode still bypasses this entirely (it samples the env
+     map for the sky color regardless).
+
+4. **Aerial perspective volumetric LUT** (~150 LOC, only if needed).
+   32x32x32 3D texture mapping `(screen pos, depth) ->
+   {transmittance, in-scatter}` for distant geometry. Skip if the
+   per-sample LUT from phase 2 already looks right -- this is just
+   a perf optimisation that batches the curved-path math into a
+   precompute. May not be needed at our typical scene scales
+   (1-30 km).
+
+**Total cost:** ~900 LOC, 1-2 days focused work, ~150 µs/frame for
+the per-frame LUT updates (sky-view + AP), trivially small relative
+to ray-tracing cost.
+
+**No assets to ship** -- all LUTs are procedural compute, generated
+from physical parameters (Mie/Rayleigh sigmas, sun direction,
+planet radius). Storage cost ~5 MB GPU memory total.
+
+---
+
 ## Per-face materials on CSG meshes
 
 **Status:** All triangles emitted by `pt::csg::CsgScene::Bake()` get the
@@ -373,3 +443,158 @@ when we need to (e.g. when chasing 60 FPS at 4K).
   scopes.
 - Frame marker via `FrameMark` at top of the main loop.
 - Connect with `tracy-profiler` from the Tracy repo.
+
+---
+
+## Async pipeline build + loading screen ✓ DONE
+
+**Status:** Shipped end-to-end on Vulkan.
+
+What landed:
+- **Persistent `VkPipelineCache`** at `%LOCALAPPDATA%/demont/pipeline.cache`
+  (Windows) or `$XDG_CACHE_HOME/demont/pipeline.cache` (POSIX). Loaded
+  at device init, written on shutdown, stale-blob rejection silent.
+- **Async pipeline build** on a worker thread spawned from
+  `VulkanDevice::Init`. Vulkan permits `vkCreateComputePipelines` in
+  parallel with the main thread's queue submit, so the engine's main
+  loop is never blocked by the 1-3s cold-cache pipeline compile.
+- **`Engine::EnsurePipelineHandles`** lazily resolves cached pipeline
+  ids each frame until the worker flips them non-zero. Once resolved,
+  the check is a single uint compare (no mutex / map lookup overhead).
+- **`RHI::CommandBuffer::ClearStorageTexture`** — minimal swapchain
+  clear-to-colour primitive, used by the loading-frame path so the
+  user sees a defined dark frame instead of undefined post-acquire
+  pixels while the pipelines compile.
+- **Per-pipeline timing log** (`Vulkan: async pipeline build done in
+  Nms (pathtrace ..., autoexpose ..., perfoverlay ...)`) plus
+  `engine: loading screen active` / `pipelines ready` pair for
+  observability of cold-vs-warm cache behaviour.
+
+**Mac/Metal:** Metal does the SPIR-V→native compile lazily on first
+draw and is much faster than Vulkan's eager `vkCreateComputePipelines`.
+The macOS port doesn't have the same freeze and isn't on this critical
+path. The same async-build loading-screen scaffold could host a Metal
+`MTLLibrary.makeComputePipelineState(completionHandler:)` worker if
+we ever see a similar stall there, but no current evidence we need it.
+
+**Future polish (not blocking):** the loading frame is a flat dark
+colour. A subtle pulse / progress text would be nicer UX but needs a
+text-rendering primitive that doesn't depend on the path-trace
+pipeline (perfoverlay would work but it's also under construction
+during the loading window).
+
+---
+
+## Slang IR module precompilation — landed (small extraction)
+
+**Status:** Reinstated.  The two small helper modules
+(`PathTraceMath`, `PathTraceCloud`) are compiled to `.slang-module`
+IR by `pt_compile_slang_module` and imported into PathTrace.slang.
+SPIR-V output is bit-identical to the monolithic build (490008 B
+both ways), so zero runtime impact -- this is a pure compile-time
+refactor.
+
+**The numbers** (ninja `.ninja_log`, win-debug, NVIDIA RTX 5090):
+
+| Phase | Monolithic | With 2 modules (~150 lines each) |
+|---|---|---|
+| `PathTrace.spv` alone | 855 ms | 710 ms (−145 ms saved on parse) |
+| Module compiles (ninja-parallel) | — | 360 ms wall-clock |
+| Clean rebuild critical path | **855 ms** | **1106 ms (+251 ms)** |
+| Body-only incremental | **855 ms** | **710 ms (−145 ms)** |
+
+We initially reverted on the basis that clean rebuilds got 250 ms
+slower; reinstated on the realisation that the body-only iteration
+case (the one that fires on every shader edit during development)
+is what dominates a working day.  Clean rebuilds are rare (branch
+switches / merges / fresh checkouts).
+
+**Why the link cost is high:** Slang's IR-link cost is roughly
+fixed per imported module regardless of size, while the saved
+front-end work scales with module content.  Below ~500 LOC of
+saved content per module, link overhead dominates the saved parse.
+The two helpers we extracted are ~150 LOC each -- well below that
+threshold individually -- but the body-only iteration win still
+makes the trade worth it because the link runs ONCE per body
+rebuild whereas the saved parse runs N times across an editing
+session.
+
+**When to expand the extraction:**
+- **If we go to option 3 (wavefront path tracing).** Each pass
+  becomes a separate entry point. All entry points share the same
+  helper modules, so the per-module link cost amortises across N
+  kernels instead of 1.  Both modules and many more chunks become
+  clear wins.
+- **If we extract a single large logical chunk** (e.g. the entire
+  atmospheric march + cloud march block into one module, ~600 LOC).
+  Doable but those blocks reference Push fields, so the module
+  would need `extern` declarations or a parameter-passing refactor.
+- **If a future Slang version reduces IR-link overhead.** Worth
+  re-measuring on every Slang upgrade -- the link cost is the
+  bottleneck and any improvement there directly raises the
+  break-even point for further extraction.
+
+---
+
+## Single source of truth for PtPush + Frame UBO + Vulkan constants
+
+**Status:** PtPush layout is currently defined in three places that
+must agree by hand:
+
+  1. `src/engine/Engine.cpp` -- the C++ struct used at dispatch site.
+  2. `shaders/PathTrace.slang` -- the SPIR-V `cbuffer Push` (small)
+     plus `cbuffer Frame` (spilled tail at vk::binding(14, 0)).
+  3. `src/rhi_vulkan/VulkanDevice.h` -- `kPushSplitOffset`,
+     `kFrameUboBinding`, `kFrameUboSize` constants.
+
+A `static_assert(sizeof(PtPush) == ...)` in Engine.cpp catches one
+class of drift (size change), but a field re-order with same total
+bytes would silently mismatch between C++ and Slang.  The runtime
+symptom of a desync is rendering corruption, not a build error.
+
+**Why deferred:** the human-side cost of three-place edits is real
+but rare (PtPush evolves once or twice per multi-week iteration),
+and the static_assert + comment cross-references make drift
+catchable in code review.
+
+**Plan when picked up:**
+- Option A: drive the layout from a single shared header
+  (`src/rhi/PtPushLayout.h`) included by both Engine.cpp (via
+  `#include`) and shaders/PathTrace.slang (via slangc's
+  `-I` + `import`).  Slang's modules support `cbuffer`
+  declarations now (post the PathTraceCloud/PathTraceMath split),
+  so the spilled-tail Frame UBO would be a public cbuffer in a
+  module that both PathTrace.slang and the engine import.
+- Option B: derive the C++ side from Slang reflection
+  (`slangc -reflection-json` or the Slang reflection API at
+  init).  Less code coupling but adds a build-time tool.
+- Option A is simpler; option B is more flexible.  Pick whichever
+  feels right when the next big PtPush expansion lands.
+
+**Acceptance:** changing one field in the shared layout source
+must propagate to all three call sites with at most one edit.
+
+---
+
+## VulkanDevice::WriteBuffer fast-path for tiny runtime updates
+
+**Status:** Current implementation is a synchronous staging-copy
++ vkQueueWaitIdle, fine for scene-load (mesh upload, CDF upload)
+but produces a brief 5-15 ms stall for every cvar-change write
+(e.g. `r_exposure` flip writing to `exposure_state`).
+
+**Why deferred:** the user-visible cost is a one-frame hitch on
+a knob change -- the user is the one initiating the change, and
+the hitch is acceptable at human-scale interaction.  Not on a
+hot path.
+
+**Plan when picked up:**
+- Add `vkCmdUpdateBuffer`-based fast-path for writes <=65536 B
+  (Vulkan spec maximum for inline updates).  No staging buffer,
+  no separate submit, no queue wait.
+- Queue pending tiny writes; drain into the next frame's command
+  buffer at BeginFrame, before any compute dispatch that reads
+  the updated buffer.  Insert a HostWrite -> ComputeRead barrier
+  for correctness.
+- Keep the staging-copy fallback for big uploads (mesh / CDF) --
+  vkCmdUpdateBuffer's 65 KB cap means it can't replace those.

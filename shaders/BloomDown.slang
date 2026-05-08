@@ -28,6 +28,20 @@
 [[vk::binding(0, 0)]] RWTexture2D<float4> src;
 [[vk::binding(1, 0)]] RWTexture2D<float4> dst;
 
+// MSL slot padding -- see Tonemap.slang's notice for the full story.
+// Dummies push the Push cbuffer to MSL buffer(7), matching the
+// engine's universal push_slot=max_bound_slot+1=7 contract that
+// PathTrace's bindings (slots 1..6) drag along to every dispatch
+// after it. Dead branch below references them so Slang's optimizer
+// keeps them.
+[[vk::binding(2, 0)]]  RaytracingAccelerationStructure _slot_tlas;
+[[vk::binding(3, 0)]]  StructuredBuffer<float>  _slot_mesh_positions;
+[[vk::binding(4, 0)]]  StructuredBuffer<uint>   _slot_mesh_indices;
+[[vk::binding(5, 0)]]  StructuredBuffer<float4> _slot_primitives;
+[[vk::binding(6, 0)]]  StructuredBuffer<float>  _slot_marginal_cdf;
+[[vk::binding(7, 0)]]  StructuredBuffer<float>  _slot_conditional_cdf;
+[[vk::binding(15, 0)]] RWStructuredBuffer<float> _slot_exposure_state;
+
 [[vk::push_constant]]
 cbuffer Push {
     float threshold;     // > 0 = first mip (apply threshold + Karis).
@@ -63,6 +77,19 @@ void main(uint3 tid : SV_DispatchThreadID) {
     dst.GetDimensions(dst_dim.x, dst_dim.y);
     src.GetDimensions(src_dim.x, src_dim.y);
     if (tid.x >= dst_dim.x || tid.y >= dst_dim.y) return;
+
+    // Force Slang to emit the slot-padding bindings (see notice at
+    // top). Branch never taken at runtime; Slang can't statically
+    // prove dst_dim.x != 0xDEADBEEFu so it survives optimization.
+    if (dst_dim.x == 0xDEADBEEFu) {
+        let p = _slot_mesh_positions[0];
+        let ii = _slot_mesh_indices[0];
+        let q = _slot_primitives[0];
+        let mc = _slot_marginal_cdf[0];
+        let cc = _slot_conditional_cdf[0];
+        let ex = _slot_exposure_state[0];
+        dst[uint2(0, 0)] = float4(p, float(ii), q.x, mc + cc + ex);
+    }
 
     int2  sd = int2(src_dim);
     // Source position for this dst pixel's CENTRE: dst is half-res of

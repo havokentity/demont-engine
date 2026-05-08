@@ -83,11 +83,26 @@ void Window::RequestClose() {
     if (handle_ != nullptr) glfwSetWindowShouldClose(handle_, GLFW_TRUE);
 }
 
-extern "C" void* pt_window_native_cocoa(GLFWwindow*);
+// Signature is `void*(void*)` everywhere -- the implementation in
+// Window_Cocoa.mm casts back to GLFWwindow* internally.  Standardising
+// on void* avoids an ODR violation across translation units that
+// don't include GLFW headers (ConsoleOverlay_Win32, ConsoleOverlay_Stub,
+// MetalDevice, SoftwareDevice all declare it as void*(void*)).
+extern "C" void* pt_window_native_cocoa(void*);
+
+#if defined(_WIN32)
+#  define GLFW_EXPOSE_NATIVE_WIN32
+#  include <GLFW/glfw3native.h>
+#endif
 
 void* Window::NativeHandle() const {
 #if defined(__APPLE__)
     return pt_window_native_cocoa(handle_);
+#elif defined(_WIN32)
+    // Returns HWND. ConsoleOverlay_Win32 attaches a child window
+    // here for the in-game console. Cast to HWND on the consumer
+    // side; void* keeps Window.h free of <Windows.h>.
+    return handle_ ? static_cast<void*>(glfwGetWin32Window(handle_)) : nullptr;
 #else
     return nullptr;
 #endif

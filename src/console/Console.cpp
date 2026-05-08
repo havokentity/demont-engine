@@ -149,15 +149,49 @@ bool Console::SetCVarOverride(std::string_view name, std::string_view value) {
 ExecuteResult Console::Execute(std::string_view line) {
     ExecuteResult result;
 
-    // Strip leading whitespace and skip blank/comment lines. We accept
-    // both `//` (Quake-style) and `#` (shell-style) so users can paste
-    // mixed-source snippets without stripping comments first.
+    // Strip leading whitespace and skip blank/comment lines. Accept
+    // `//` (Quake-style) full-line and `#` (shell-style) anywhere on
+    // the line: anything from a non-quoted `#` to end-of-line is
+    // dropped. Lets users paste an annotated block like
+    //     r_volumetric 0   # kill volumetric clouds
+    //     r_show_stars 0   # disable BSC starmap
+    // without splitting it into separate sends.
     while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) {
         line.remove_prefix(1);
     }
     if (line.empty()) return result;
-    if (line[0] == '#') return result;
     if (line.size() >= 2 && line[0] == '/' && line[1] == '/') return result;
+    {
+        // Inline `#` comment stripping. Track quote state so a `#`
+        // inside a quoted string is treated as data, not a comment.
+        // Also handle backslash escaping so `\"` doesn't flip the
+        // quote state mid-string -- without this, an escaped quote
+        // in a quoted token would silently end the quote and a
+        // following `#` would chop the rest of the command off.
+        bool in_quote = false;
+        bool escape   = false;
+        std::size_t cut = line.size();
+        for (std::size_t i = 0; i < line.size(); ++i) {
+            char c = line[i];
+            if (escape) {
+                escape = false;
+                continue;
+            }
+            if (c == '\\') { escape = true; continue; }
+            if (c == '"')  { in_quote = !in_quote; continue; }
+            if (c == '#' && !in_quote) { cut = i; break; }
+        }
+        if (cut < line.size()) line = line.substr(0, cut);
+    }
+    // Trim trailing whitespace including '\r' so CRLF-terminated input
+    // (config files, pasted text) doesn't end up with the carriage
+    // return swallowed into the last token, breaking command/cvar
+    // lookup.
+    while (!line.empty()
+           && (line.back() == ' ' || line.back() == '\t' || line.back() == '\r')) {
+        line.remove_suffix(1);
+    }
+    if (line.empty()) return result;
 
     std::string storage;
     auto tokens = TokenizeLine(line, storage);
@@ -308,8 +342,9 @@ ExecuteResult Console::ExecuteScript(std::string_view body) {
     return agg;
 }
 
-std::size_t Console::Undo() {
-    if (undo_stack_.empty()) return 0;
+std::vector<Console::CvarChange> Console::Undo() {
+    std::vector<CvarChange> changes;
+    if (undo_stack_.empty()) return changes;
     in_undo_redo_ = true;
     CvarSnapshot snap = std::move(undo_stack_.back());
     undo_stack_.pop_back();
@@ -319,21 +354,24 @@ std::size_t Console::Undo() {
     for (auto& [name, old] : snap) {
         auto it = cvars_.find(name);
         if (it == cvars_.end()) continue;
-        fwd[name] = it->second.value;
+        std::string current = it->second.value;
+        fwd[name] = current;
         // Set value via Execute so any allowed_values check, on_change
         // hook, and cascading on_change side effects fire as if the
         // user typed the rollback.
         std::string line = name + " " + old;
         Execute(line);
+        changes.push_back({name, std::move(current), old});
     }
     redo_stack_.push_back(std::move(fwd));
     if (redo_stack_.size() > kMaxHistory) redo_stack_.pop_front();
     in_undo_redo_ = false;
-    return snap.size();
+    return changes;
 }
 
-std::size_t Console::Redo() {
-    if (redo_stack_.empty()) return 0;
+std::vector<Console::CvarChange> Console::Redo() {
+    std::vector<CvarChange> changes;
+    if (redo_stack_.empty()) return changes;
     in_undo_redo_ = true;
     CvarSnapshot snap = std::move(redo_stack_.back());
     redo_stack_.pop_back();
@@ -341,14 +379,16 @@ std::size_t Console::Redo() {
     for (auto& [name, val] : snap) {
         auto it = cvars_.find(name);
         if (it == cvars_.end()) continue;
-        back[name] = it->second.value;
+        std::string current = it->second.value;
+        back[name] = current;
         std::string line = name + " " + val;
         Execute(line);
+        changes.push_back({name, std::move(current), val});
     }
     undo_stack_.push_back(std::move(back));
     if (undo_stack_.size() > kMaxHistory) undo_stack_.pop_front();
     in_undo_redo_ = false;
-    return snap.size();
+    return changes;
 }
 
 void Console::QueueExecute(std::string line, Responder responder) {
@@ -363,14 +403,91 @@ void Console::Drain() {
         std::swap(local, queue_);
     }
     for (auto& pe : local) {
-        // Route through ExecuteScript so the queued payload may
-        // contain multiple semicolon- or newline-separated commands.
-        // Common use case: "r_clouds 1; r_clouds_preset cumulus;
-        // r_volumetric 1; r_rayleigh 30" pasted from a docs snippet.
-        // ExecuteScript is a no-op extra split for single statements
-        // (no ';' or '\n'), so this is a free upgrade.
-        auto result = ExecuteScript(pe.line);
-        if (pe.responder) pe.responder(result);
+        // Trim leading/trailing whitespace to detect lone `[` / `]`.
+        std::string_view trimmed = pe.line;
+        while (!trimmed.empty() &&
+               (trimmed.front() == ' ' || trimmed.front() == '\t'  ||
+                trimmed.front() == '\r' || trimmed.front() == '\n')) {
+            trimmed.remove_prefix(1);
+        }
+        while (!trimmed.empty() &&
+               (trimmed.back() == ' ' || trimmed.back() == '\t'  ||
+                trimmed.back() == '\r' || trimmed.back() == '\n')) {
+            trimmed.remove_suffix(1);
+        }
+
+        if (!batch_active_) {
+            if (trimmed == "[") {
+                batch_active_ = true;
+                batch_buffer_.clear();
+                ExecuteResult r;
+                r.output = "batch: open  (send ']' on its own line to commit; "
+                           "the whole bundle is one undo step)";
+                if (pe.responder) pe.responder(r);
+                continue;
+            }
+            // Normal path: ExecuteScript splits on '\n' / ';' so
+            // multi-line paste in one shot still works.
+            auto result = ExecuteScript(pe.line);
+            if (pe.responder) pe.responder(result);
+            continue;
+        }
+
+        // batch_active_ == true: collect or commit
+        if (trimmed == "]") {
+            batch_active_ = false;
+            std::string body = std::move(batch_buffer_);
+            batch_buffer_.clear();
+            // Empty bundle: nothing to do. Otherwise run as one
+            // ExecuteScript transaction so the existing snapshot
+            // mechanism captures all touched cvars in one entry.
+            ExecuteResult result;
+            if (body.empty()) {
+                result.output = "batch: empty (nothing committed)";
+            } else {
+                result = ExecuteScript(body);
+                std::string header = "batch: committed (one undo step rolls back all)";
+                if (result.output.empty()) {
+                    result.output = std::move(header);
+                } else {
+                    result.output = header + "\n" + std::move(result.output);
+                }
+            }
+            if (pe.responder) pe.responder(result);
+        } else {
+            // Cap the bundle size so a misbehaving / disconnected
+            // client that opens '[' but never sends ']' can't grow
+            // the buffer without bound -- the engine is shared
+            // process-wide state and an OOM here would take
+            // everything down.  1 MiB is far more than any sane
+            // batched command list (cvar dumps + replay scripts in
+            // this codebase top out at < 64 KiB) but tiny relative
+            // to engine memory headroom, so it's safe to be
+            // generous before auto-aborting.
+            constexpr std::size_t kBatchMaxBytes = 1u * 1024u * 1024u;
+            const std::size_t projected =
+                batch_buffer_.size() + pe.line.size() + 1u;
+            if (projected > kBatchMaxBytes) {
+                batch_active_ = false;
+                batch_buffer_.clear();
+                ExecuteResult r;
+                r.output = fmt::format(
+                    "batch: aborted (would exceed {} byte cap; nothing committed). "
+                    "Send '[' again to retry with a smaller bundle.",
+                    kBatchMaxBytes);
+                if (pe.responder) pe.responder(r);
+                continue;
+            }
+            // Append the line to the batch buffer (preserve raw line,
+            // not the trimmed view -- ExecuteScript will trim per-line).
+            if (!batch_buffer_.empty()) batch_buffer_.push_back('\n');
+            batch_buffer_.append(pe.line);
+            ExecuteResult r;
+            r.output = fmt::format("batch: queued  ({} byte{} buffered, send ']' to commit)",
+                                   batch_buffer_.size(),
+                                   batch_buffer_.size() == 1 ? "" : "s");
+            if (pe.responder) pe.responder(r);
+        }
     }
 }
 
