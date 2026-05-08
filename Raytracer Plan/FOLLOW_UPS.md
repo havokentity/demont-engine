@@ -413,3 +413,54 @@ The macOS port doesn't have the same freeze and isn't on this critical
 path — but the same async-build loading-screen scaffold could host a
 Metal `MTLLibrary.makeComputePipelineState(completionHandler:)` worker
 if we ever see a similar stall there.
+
+---
+
+## Slang IR module precompilation — explored, deferred
+
+**Status:** Tried, measured, reverted. The infrastructure is sound
+(`pt_compile_slang_module` cmake function, `-emit-ir` per module,
+`-I <out_dir>` resolution on the entry-point compile, `MODULE_DEPS`
+parameter on `pt_compile_slang`) and module-extracted helpers compile
+cleanly into bit-identical SPIR-V via `import`. But for the helper
+sizes we'd extract from PathTrace.slang today, the IR-link overhead
+on the entry-point compile slightly exceeds the saved front-end work.
+
+**The numbers** (ninja `.ninja_log`, win-debug, NVIDIA RTX 5090):
+
+| Phase | Monolithic | With 2 modules (~150 lines each) |
+|---|---|---|
+| `PathTrace.spv` alone | 855 ms | 710 ms (−145 ms saved on parse) |
+| Module compiles (ninja-parallel) | — | 360 ms wall-clock |
+| Clean rebuild critical path | **855 ms** | **1106 ms (+251 ms)** |
+| Body-only incremental | **855 ms** | **710 ms (−145 ms)** |
+
+So body-only iteration on PathTrace.slang is ~145 ms faster, every
+clean rebuild (or change to the helpers themselves) is ~250 ms slower,
+and there's no runtime impact (output is byte-identical).
+
+**Why this didn't pay off:** Slang's IR-link cost is roughly fixed
+per imported module regardless of size, while the saved front-end
+work scales with module content. Below ~500 LOC of saved content
+per module, link overhead dominates. The two natural extractions
+(pure-math RNG / disc-sample / intersection helpers, and the cloud
+noise + density block) are ~150 LOC each — well below the threshold.
+
+**When to revisit:**
+- **If we go to option 3 (wavefront path tracing).** Each pass becomes
+  a separate entry point. All entry points share the same helper
+  modules, so the per-module link cost amortises across N kernels
+  instead of 1, and modules become a clear win.
+- **If we extract a single large logical chunk** (e.g. the entire
+  atmospheric march + cloud march block into one module, ~600 LOC).
+  Doable but those blocks reference Push fields, so the module
+  needs `extern` declarations or a parameter-passing refactor.
+- **If a future Slang version reduces IR-link overhead.** Worth re-
+  measuring on every Slang upgrade.
+
+**What to do today:** keep PathTrace.slang monolithic. The smaller
+helper file split (cloud noise + math) is a nice organizational
+thought, but no perf win, so not worth the maintenance overhead of
+two extra files + cmake plumbing. The cmake `pt_compile_slang_module`
+function is gone with the revert; bring it back when we hit one of
+the revisit conditions above.
