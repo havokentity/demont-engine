@@ -9,6 +9,7 @@
 
 #include <glm/glm.hpp>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <map>
@@ -204,21 +205,25 @@ private:
     std::uint64_t                               env_conditional_cdf_id_ = 0;
     float                                       env_total_luminance_   = 0.0f;
 
-    // P12 HDRI sun extraction. When ReloadEnvMap detects a bright pixel
-    // cluster (the sun) in the HDRI, those pixels get masked out of the
-    // CDF (env-map NEE skips them) and the cluster's centroid direction
-    // + integrated radiant flux are stored here. The path tracer then
-    // does a directional NEE toward the centroid each frame -- crisp
-    // shadow ray, sharp directional shadows regardless of how soft the
-    // HDRI's sun pixels are. The env_map texture itself is NOT modified
-    // (the visible HDRI sun remains in the rendered sky for camera-
-    // direct rays). _valid is false when the HDRI has no obvious sun
-    // (overcast, interior, dim peak); in that case the path tracer
-    // falls back to env-map NEE only and shadows depend on HDRI
-    // sharpness.
-    bool                                        extracted_sun_valid_     = false;
-    glm::vec3                                   extracted_sun_dir_       = {0.0f, 1.0f, 0.0f};
-    glm::vec3                                   extracted_sun_irradiance_ = {0.0f, 0.0f, 0.0f};
+    // HDRI multi-light extraction. ReloadEnvMap thresholds the HDRI at
+    // the top 0.5% luminance percentile, runs 4-connected flood-fill
+    // (with horizontal wrap for lat-long) on the resulting mask, and
+    // stores the top kMaxHdriLights clusters by integrated flux. Each
+    // cluster's pixels are masked out of the env-map CDF (so env-map
+    // NEE skips them) and replaced by a stochastic directional NEE
+    // weighted by cluster luminance -- sharp shadows for any HDRI:
+    // single-sun outdoor, lone moon at night, multi-lamp interior,
+    // 3-point studio rig. The env_map texture itself is unchanged so
+    // camera-direct rays still see the visible bright pixels.
+    static constexpr std::uint32_t              kMaxHdriLights = 8;
+    struct HdriLight {
+        glm::vec3 dir        = {0.0f, 1.0f, 0.0f};  // unit vec to centroid
+        float     pmf        = 0.0f;                 // p(this light), sums to 1 across lights
+        glm::vec3 irradiance = {0.0f, 0.0f, 0.0f};   // ∫_cluster L dΩ per channel
+        float     luminance  = 0.0f;                 // luminance(irradiance), used for sorting + pmf
+    };
+    std::array<HdriLight, kMaxHdriLights>       hdri_lights_{};
+    std::uint32_t                               hdri_lights_count_       = 0;
 
     // P11 BSC starmap. RGBA16F equirectangular in J2000, rasterised once
     // at startup from assets/stars/BSC5.dat. The shader rotates incoming

@@ -30,12 +30,14 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <array>
 #include <charconv>
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
 #include <numbers>
+#include <numeric>
 #include <thread>
 
 namespace pt::engine {
@@ -844,9 +846,8 @@ void Engine::ReloadEnvMap(const std::string& path) {
         env_marginal_cdf_id_    = 0;
         env_conditional_cdf_id_ = 0;
         env_total_luminance_    = 0.0f;
-        extracted_sun_valid_       = false;
-        extracted_sun_dir_         = {0.0f, 1.0f, 0.0f};
-        extracted_sun_irradiance_  = {0.0f, 0.0f, 0.0f};
+        hdri_lights_            = {};
+        hdri_lights_count_      = 0;
     };
 
     device_->WaitIdle();
@@ -868,105 +869,185 @@ void Engine::ReloadEnvMap(const std::string& path) {
 
     const std::uint32_t W = img.width, H = img.height;
 
-    // === HDRI sun extraction (P12) ===
-    // Find the brightest pixel in the HDRI. If it's well above ambient
-    // sky (kSunMinPeakLum), assume it's a sun and extract:
-    //   - all pixels with luminance > 50% of peak form the sun cluster
-    //   - centroid direction (luminance-weighted) becomes the sun direction
-    //   - integrated radiant flux (∫_cluster L dΩ per channel) becomes
-    //     the directional NEE source radiance
-    // The sun cluster is then masked out of the CDF below so env-map NEE
-    // doesn't sample it. The env_map texture itself stays unchanged --
-    // camera-direct rays still see the sun pixels in the sky. Lambert
-    // surfaces get a directional NEE shadow ray instead, which produces
-    // crisp shadows regardless of how soft the HDRI sun is across pixels.
-    std::vector<std::uint8_t> sun_mask;  // 1 = pixel is in sun cluster, exclude from CDF
+    // === HDRI multi-light extraction ===
+    // Threshold the HDRI at the top 0.5% luminance percentile, then run
+    // 4-connected flood-fill (with horizontal wrap for lat-long) on the
+    // mask. Each connected component is a candidate light. Keep the top
+    // kMaxHdriLights by integrated flux; mask all kept clusters out of
+    // the env-map CDF so env-map NEE doesn't double-count them. The
+    // path tracer then does a stochastic directional NEE picking one
+    // light per sample weighted by cluster luminance -- single-sun
+    // outdoor HDRI gives one big cluster, night HDRI gives one moon,
+    // interior gives one cluster per lamp, all handled identically.
+    std::vector<std::uint8_t> light_mask(std::size_t(W) * H, 0u);
     {
+        // Luminance per pixel + percentile threshold.
+        const std::size_t N_pix = std::size_t(W) * H;
+        std::vector<float> lums(N_pix);
         float peak_lum = 0.0f;
-        for (std::size_t pi = 0, n = std::size_t(W) * H; pi < n; ++pi) {
+        for (std::size_t pi = 0; pi < N_pix; ++pi) {
             const float r = img.rgb[pi * 3 + 0];
             const float g = img.rgb[pi * 3 + 1];
             const float b = img.rgb[pi * 3 + 2];
             const float lum = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+            lums[pi] = lum;
             if (lum > peak_lum) peak_lum = lum;
         }
 
-        // Below this peak there's no clearly distinguishable sun
-        // (overcast HDRI, interior, dim night scene). Skip extraction;
-        // fall back to env-map NEE only and accept whatever shadows
-        // (or none) emerge from the HDRI's own sharpness.
-        constexpr float kSunMinPeakLum = 100.0f;
-        constexpr float kSunThreshFrac = 0.5f;
+        // Skip extraction on effectively black HDRIs -- a flood-fill on
+        // a uniform field would just pick noise. Anything below 0.5
+        // raw nits is "image is dim, no real lights detectable".
+        constexpr float kMinPeakLum = 0.5f;
+        if (peak_lum > kMinPeakLum) {
+            // Top 0.5% percentile by partial-sort. Replaces the prior
+            // fixed 50%-of-peak rule which only worked for sun-class
+            // peaks (interiors with a 100-nit lamp under a 1e6-nit-
+            // peak rule extracted nothing).
+            constexpr double kTopFrac = 0.005;
+            const std::size_t k_idx = N_pix - std::max<std::size_t>(
+                1, std::size_t(double(N_pix) * kTopFrac));
+            std::vector<float> lums_sorted = lums;  // nth_element mutates
+            std::nth_element(lums_sorted.begin(),
+                             lums_sorted.begin() + k_idx,
+                             lums_sorted.end());
+            float thresh = lums_sorted[k_idx];
+            // Floor to avoid clustering noise on dim HDRIs where the
+            // 99.5%ile lands below background.
+            if (thresh < 0.05f * peak_lum) thresh = 0.05f * peak_lum;
+            if (thresh < kMinPeakLum)      thresh = kMinPeakLum;
 
-        if (peak_lum > kSunMinPeakLum) {
-            const float thresh = peak_lum * kSunThreshFrac;
-            sun_mask.assign(std::size_t(W) * H, 0u);
-
-            // Per-pixel solid angle on a lat-long sphere:
-            //   dΩ = (2π² / (W * H)) * sin(θ)
-            // with θ = π * (v + 0.5) / H.
-            constexpr double kTwoPiSq = 2.0 * std::numbers::pi * std::numbers::pi;
-            const double dOmega_unit = kTwoPiSq / double(std::size_t(W) * H);
-
-            glm::dvec3 centroid_acc(0.0);
-            double weight_total = 0.0;
-            glm::dvec3 flux_acc(0.0);
-
-            for (std::uint32_t v = 0; v < H; ++v) {
-                const double theta     = std::numbers::pi * (double(v) + 0.5) / double(H);
-                const double sin_theta = std::sin(theta);
-                const double cos_theta = std::cos(theta);
-                const double dOmega    = dOmega_unit * sin_theta;
-                for (std::uint32_t u = 0; u < W; ++u) {
-                    const std::size_t pi = std::size_t(v) * W + u;
-                    const float r = img.rgb[pi * 3 + 0];
-                    const float g = img.rgb[pi * 3 + 1];
-                    const float b = img.rgb[pi * 3 + 2];
-                    const float lum = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-                    if (lum < thresh) continue;
-
-                    sun_mask[pi] = 1u;
-
-                    // Lat-long → unit direction. u maps to azimuth phi
-                    // in [-π, π); v maps to polar theta in [0, π].
-                    // World-space convention: y up, atan2(z, x) for u.
-                    const double phi = 2.0 * std::numbers::pi * (double(u) + 0.5) / double(W) - std::numbers::pi;
-                    const double dx  = sin_theta * std::cos(phi);
-                    const double dy  = cos_theta;
-                    const double dz  = sin_theta * std::sin(phi);
-
-                    // Centroid weight = luminance × dΩ (so a few very
-                    // bright pixels dominate the centroid over many
-                    // moderately-bright ones, isolating the actual sun
-                    // disc rather than the bright sky around it).
-                    const double w = double(lum) * dOmega;
-                    centroid_acc += glm::dvec3(dx, dy, dz) * w;
-                    weight_total += w;
-
-                    // Total flux from the cluster: ∫_cluster L(ω) dΩ.
-                    // Used directly as the directional NEE radiance.
-                    flux_acc += glm::dvec3(double(r), double(g), double(b)) * dOmega;
-                }
-            }
-
-            if (weight_total > 0.0) {
-                const glm::dvec3 dir = glm::normalize(centroid_acc);
-                extracted_sun_dir_        = glm::vec3(dir);
-                extracted_sun_irradiance_ = glm::vec3(flux_acc);
-                extracted_sun_valid_      = true;
-                LOG_INFO(
-                    "env_map: extracted sun dir=({:.3f},{:.3f},{:.3f}) flux=({:.1f},{:.1f},{:.1f}) peak_lum={:.1f}",
-                    extracted_sun_dir_.x, extracted_sun_dir_.y, extracted_sun_dir_.z,
-                    extracted_sun_irradiance_.r, extracted_sun_irradiance_.g, extracted_sun_irradiance_.b,
-                    peak_lum);
+            for (std::size_t pi = 0; pi < N_pix; ++pi) {
+                if (lums[pi] >= thresh) light_mask[pi] = 1u;
             }
         }
     }
 
+    // Connected-components on light_mask. Lat-long wraps horizontally
+    // (column 0 is adjacent to column W-1) but not vertically. BFS via
+    // a vector stack keeps memory bounded; for typical HDRIs the masked
+    // set is < 1% of pixels so this is fast.
+    constexpr double kTwoPiSq = 2.0 * std::numbers::pi * std::numbers::pi;
+    const double dOmega_unit = kTwoPiSq / double(std::size_t(W) * H);
+    struct ClusterAcc {
+        glm::dvec3 centroid_dir_acc{0.0};
+        double     centroid_w_acc = 0.0;
+        glm::dvec3 flux_acc{0.0};
+        double     lum_acc = 0.0;       // ∫_cluster L dΩ -- used for sort + pmf
+        std::uint32_t pixels = 0;
+    };
+    std::vector<ClusterAcc> clusters;
+    std::vector<std::uint32_t> cluster_id(std::size_t(W) * H, 0u);  // 0 = unvisited
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> bfs_stack;
+    bfs_stack.reserve(1024);
+    auto pix_idx = [&](std::uint32_t u, std::uint32_t v) -> std::size_t {
+        return std::size_t(v) * W + u;
+    };
+    for (std::uint32_t v0 = 0; v0 < H; ++v0) {
+        for (std::uint32_t u0 = 0; u0 < W; ++u0) {
+            const std::size_t pi0 = pix_idx(u0, v0);
+            if (!light_mask[pi0] || cluster_id[pi0] != 0u) continue;
+            const std::uint32_t cid = std::uint32_t(clusters.size()) + 1u;
+            clusters.emplace_back();
+            ClusterAcc& acc = clusters.back();
+            bfs_stack.clear();
+            bfs_stack.emplace_back(u0, v0);
+            cluster_id[pi0] = cid;
+            while (!bfs_stack.empty()) {
+                auto [u, v] = bfs_stack.back();
+                bfs_stack.pop_back();
+                const std::size_t pi = pix_idx(u, v);
+                const double theta   = std::numbers::pi * (double(v) + 0.5) / double(H);
+                const double sint    = std::sin(theta);
+                const double cost    = std::cos(theta);
+                const double dOmega  = dOmega_unit * sint;
+                const double phi     = 2.0 * std::numbers::pi * (double(u) + 0.5) / double(W)
+                                     - std::numbers::pi;
+                const float  r = img.rgb[pi * 3 + 0];
+                const float  g = img.rgb[pi * 3 + 1];
+                const float  b = img.rgb[pi * 3 + 2];
+                const double lum  = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                const double wdir = lum * dOmega;
+                acc.centroid_dir_acc += glm::dvec3(sint * std::cos(phi), cost,
+                                                   sint * std::sin(phi)) * wdir;
+                acc.centroid_w_acc   += wdir;
+                acc.flux_acc         += glm::dvec3(double(r), double(g), double(b)) * dOmega;
+                acc.lum_acc          += lum * dOmega;
+                acc.pixels           += 1u;
+                const std::uint32_t um = (u == 0u)     ? (W - 1u) : (u - 1u);
+                const std::uint32_t up = (u + 1u >= W) ? 0u       : (u + 1u);
+                auto try_push = [&](std::uint32_t uu, std::uint32_t vv) {
+                    const std::size_t pp = pix_idx(uu, vv);
+                    if (light_mask[pp] && cluster_id[pp] == 0u) {
+                        cluster_id[pp] = cid;
+                        bfs_stack.emplace_back(uu, vv);
+                    }
+                };
+                try_push(um, v);
+                try_push(up, v);
+                if (v > 0)      try_push(u, v - 1u);
+                if (v + 1u < H) try_push(u, v + 1u);
+            }
+        }
+    }
+
+    // Index-sort clusters by integrated luminance descending so we
+    // know which original cluster_ids survive (cluster_id references
+    // the discovery-order index, not the sorted position). Keep top
+    // kMaxHdriLights and drop tiny noise clusters (< 3 px).
+    std::vector<std::uint32_t> order(clusters.size());
+    std::iota(order.begin(), order.end(), 0u);
+    std::sort(order.begin(), order.end(),
+        [&](std::uint32_t a, std::uint32_t b) {
+            return clusters[a].lum_acc > clusters[b].lum_acc;
+        });
+    std::vector<std::uint8_t> keep_id(clusters.size() + 1u, 0u);   // 1-based
+    hdri_lights_       = {};
+    hdri_lights_count_ = 0;
+    double total_lum = 0.0;
+    for (std::uint32_t idx : order) {
+        if (hdri_lights_count_ >= Engine::kMaxHdriLights) break;
+        const ClusterAcc& c = clusters[idx];
+        if (c.pixels < 3u || c.centroid_w_acc <= 0.0) continue;
+        keep_id[idx + 1u] = 1u;
+        HdriLight& L = hdri_lights_[hdri_lights_count_++];
+        L.dir        = glm::vec3(glm::normalize(c.centroid_dir_acc));
+        L.irradiance = glm::vec3(c.flux_acc);
+        L.luminance  = float(c.lum_acc);
+        total_lum   += c.lum_acc;
+    }
+    if (total_lum > 0.0) {
+        const float inv_total = float(1.0 / total_lum);
+        for (std::uint32_t i = 0; i < hdri_lights_count_; ++i) {
+            hdri_lights_[i].pmf = hdri_lights_[i].luminance * inv_total;
+        }
+    }
+    // Pixels in clusters we DIDN'T keep get unmasked from light_mask
+    // so env-map NEE can still pick up that minor light via the
+    // importance CDF (just no crisp directional shadow for those).
+    for (std::size_t pi = 0; pi < std::size_t(W) * H; ++pi) {
+        const std::uint32_t cid = cluster_id[pi];
+        if (cid != 0u && !keep_id[cid]) light_mask[pi] = 0u;
+    }
+    if (hdri_lights_count_ > 0) {
+        std::string msg = fmt::format(
+            "env_map: extracted {} HDRI light(s) from '{}':",
+            hdri_lights_count_, path);
+        for (std::uint32_t i = 0; i < hdri_lights_count_; ++i) {
+            const HdriLight& L = hdri_lights_[i];
+            msg += fmt::format(
+                "\n  [{}] dir=({:.2f},{:.2f},{:.2f}) flux=({:.1f},{:.1f},{:.1f}) pmf={:.3f}",
+                i, L.dir.x, L.dir.y, L.dir.z,
+                L.irradiance.r, L.irradiance.g, L.irradiance.b, L.pmf);
+        }
+        LOG_INFO("{}", msg);
+    }
+
     // Repack RGB -> RGBA + compute luminance per pixel for the CDF.
-    // Sun-cluster pixels (if any) are zeroed in the CDF luminance only;
-    // the env_map texture data itself keeps the bright pixels intact so
-    // camera-direct rays still see the visible HDRI sun.
+    // Pixels in any kept extracted cluster are zeroed in the CDF
+    // luminance only (so env-map NEE skips them -- those clusters are
+    // handled by the directional NEE in the shader). The env_map
+    // texture data itself keeps the bright pixels intact so camera-
+    // direct rays still see the visible bright pixels in the sky.
     std::vector<float> rgba(std::size_t(W) * H * 4);
     std::vector<float> conditional(std::size_t(W) * H);     // CDF per row
     std::vector<float> marginal(H);                          // CDF over rows
@@ -984,7 +1065,7 @@ void Engine::ReloadEnvMap(const std::string& path) {
             rgba[pi * 4 + 2] = b;
             rgba[pi * 4 + 3] = 1.0f;
             const float lum_raw = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-            const float lum = (sun_mask.empty() || !sun_mask[pi]) ? lum_raw : 0.0f;
+            const float lum = light_mask[pi] ? 0.0f : lum_raw;
             const double weight = double(lum) * sin_theta;
             row_sum += weight;
             conditional[pi] = float(row_sum);   // unnormalized prefix sum within row
@@ -1534,18 +1615,17 @@ void Engine::RenderFrame() {
         // Sun extras. .x = r_sun_size multiplier, .y = Earth-Sun
         // distance ratio (mean / current_AU). .zw reserved.
         float sun_extra[4];
-        // P12 HDRI-extracted sun. .xyz = unit direction (centroid of
-        // the bright pixel cluster in the env map); .w = valid flag
-        // (1 if a sun was extracted at HDRI load, 0 otherwise -- e.g.
-        // overcast HDRI). The path tracer casts a directional NEE
-        // shadow ray toward this direction in HDRI mode for crisp
-        // shadows. Only meaningful when env_map_present == 1.
-        float hdri_sun_dir[4];
-        // P12 HDRI-extracted sun radiant flux. .rgb = ∫_cluster L dΩ
-        // computed at HDRI load -- the integrated radiance over the
-        // sun cluster. The shader scales by env_intensity to match
-        // the env-map NEE's intensity treatment. .w reserved.
-        float hdri_sun_color[4];
+        // HDRI multi-light extraction. Each entry: .xyz = unit dir to
+        // a bright cluster centroid, .w = pmf (sums to 1 across kept
+        // entries) used by the shader's stochastic light selector.
+        // Color: .rgb = ∫_cluster L dΩ (raw env_map units, scaled by
+        // env_intensity in shader). hdri_lights_count is the number
+        // of valid entries (0..kMaxHdriLights). Only meaningful when
+        // env_map_present == 1.
+        float hdri_lights_dir[Engine::kMaxHdriLights][4];
+        float hdri_lights_col[Engine::kMaxHdriLights][4];
+        std::uint32_t hdri_lights_count;
+        std::uint32_t _hdri_pad[3];   // 16-byte align next field / Slang struct end
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -1733,18 +1813,25 @@ void Engine::RenderFrame() {
         push.sun_extra[3] = 0.0f;
     }
 
-    // P12 HDRI-extracted sun (computed at HDRI load in ReloadEnvMap).
-    // .w = 1.0 enables the directional NEE in the path tracer's HDRI
-    // Lambert block; 0.0 disables (no detectable sun in the HDRI, e.g.
-    // overcast / interior). Only meaningful when env_map_present == 1.
-    push.hdri_sun_dir[0]   = extracted_sun_dir_.x;
-    push.hdri_sun_dir[1]   = extracted_sun_dir_.y;
-    push.hdri_sun_dir[2]   = extracted_sun_dir_.z;
-    push.hdri_sun_dir[3]   = (extracted_sun_valid_ && env_map_tex_id_ != 0) ? 1.0f : 0.0f;
-    push.hdri_sun_color[0] = extracted_sun_irradiance_.r;
-    push.hdri_sun_color[1] = extracted_sun_irradiance_.g;
-    push.hdri_sun_color[2] = extracted_sun_irradiance_.b;
-    push.hdri_sun_color[3] = 0.0f;
+    // HDRI multi-light array (computed at HDRI load in ReloadEnvMap).
+    // Each entry is a directional light extracted from a bright cluster
+    // in the env map; the shader's stochastic NEE picks one per sample
+    // weighted by .w (pmf). Count = 0 disables HDRI directional NEE
+    // (the shader falls back to env-map-only). Only meaningful when
+    // env_map_present == 1.
+    for (std::uint32_t i = 0; i < Engine::kMaxHdriLights; ++i) {
+        const HdriLight& L = hdri_lights_[i];
+        push.hdri_lights_dir[i][0] = L.dir.x;
+        push.hdri_lights_dir[i][1] = L.dir.y;
+        push.hdri_lights_dir[i][2] = L.dir.z;
+        push.hdri_lights_dir[i][3] = L.pmf;
+        push.hdri_lights_col[i][0] = L.irradiance.r;
+        push.hdri_lights_col[i][1] = L.irradiance.g;
+        push.hdri_lights_col[i][2] = L.irradiance.b;
+        push.hdri_lights_col[i][3] = 0.0f;
+    }
+    push.hdri_lights_count = (env_map_tex_id_ != 0) ? hdri_lights_count_ : 0u;
+    push._hdri_pad[0] = push._hdri_pad[1] = push._hdri_pad[2] = 0u;
 
     // Sky mode resolution. "hdri" with no env map loaded falls back
     // to gradient so the shader doesn't read an unbound texture.
@@ -1915,7 +2002,7 @@ void Engine::RenderFrame() {
         push.clouds_p3[3] = rayleigh;
     }
 
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 16);
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 128 + 128 + 16);
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
 
