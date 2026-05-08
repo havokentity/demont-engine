@@ -215,40 +215,17 @@ private:
     // memcpy on each dispatch without staging.
     BufferEntry frame_ubos_[kFramesInFlight] {};
 
-    // ---- Async readback ring ------------------------------------------
-    // ReadbackTexture is called from the engine every 8 frames (auto-
-    // exposure update) and on demand (screenshots). Doing a synchronous
-    // vkQueueWaitIdle each time stalls the GPU and produces visible
-    // stutters. Instead, we maintain a small ring of staging buffers +
-    // fences. Each call:
-    //   1. Polls fences, captures any completed copies.
-    //   2. If a completed slot matches the requested texture handle,
-    //      returns its data immediately (likely 1-2 ticks old; fine for
-    //      auto-exposure's eye-adaptation smoothing).
-    //   3. Submits a new copy command for the requested texture with
-    //      its own fence. Does NOT wait.
-    //   4. If no completed data was available (cold start, different
-    //      texture), falls back to a synchronous wait on the slot we
-    //      just submitted -- one stutter at startup, then the ring
-    //      stays warm.
-    struct ReadbackSlot {
-        BufferEntry     staging;
-        VkFence         fence       = VK_NULL_HANDLE;
-        VkCommandBuffer cmd         = VK_NULL_HANDLE;
-        bool            in_flight   = false;
-        bool            data_ready  = false;
-        std::uint64_t   src_id      = 0;
-        std::uint32_t   width       = 0;
-        std::uint32_t   height      = 0;
-        std::size_t     bytes       = 0;
-    };
-    static constexpr int kReadbackSlots = 3;
-    ReadbackSlot readback_slots_[kReadbackSlots] {};
-
-    void PollReadbacks();
-    bool SubmitReadback(ReadbackSlot& slot, VkImage img, VkFormat fmt,
-                        VkExtent2D extent, std::uint64_t src_id,
-                        std::size_t bytes, std::size_t bpp);
+    // ReadbackTexture is implemented as a one-shot synchronous path
+    // (alloc staging buffer + cmd + fence, submit copy, wait, memcpy,
+    // free). The previous async-slot-ring infrastructure was built
+    // around a per-8-frames CPU autoexpose readback that's been
+    // retired -- auto-expose now lives entirely on the GPU (see
+    // shaders/AutoExposure.slang + exposure_state buffer). The only
+    // remaining caller is the `screenshot` console command, which is
+    // user-triggered and low-frequency, so a queue stall during
+    // readback is fine. When async per-frame readback returns (likely
+    // for GPU-physics event queues, not texture data), it'll land as
+    // a separate ReadbackBuffer API designed for that use case.
 
     // Helpers (impl in .cpp)
     bool CreateBufferImpl(VkDeviceSize size,

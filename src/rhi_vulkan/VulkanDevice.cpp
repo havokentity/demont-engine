@@ -784,21 +784,6 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         }
     }
 
-    // ---- Async readback fences + cmd buffers -------------------------
-    {
-        VkFenceCreateInfo rfci{};
-        rfci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        VkCommandBufferAllocateInfo rcbai{};
-        rcbai.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        rcbai.commandPool        = cmd_pool_;
-        rcbai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        rcbai.commandBufferCount = 1;
-        for (auto& slot : readback_slots_) {
-            vkCreateFence(device_, &rfci, nullptr, &slot.fence);
-            vkAllocateCommandBuffers(device_, &rcbai, &slot.cmd);
-        }
-    }
-
     // ---- Build the path-trace pipeline -------------------------------
     auto build_pipeline = [&](const char* name,
                               const unsigned char* spirv,
@@ -849,12 +834,6 @@ void VulkanDevice::DestroyDevice() {
             if (sem_image_avail_[i]) vkDestroySemaphore(device_, sem_image_avail_[i], nullptr);
             if (fence_in_flight_[i]) vkDestroyFence(device_, fence_in_flight_[i], nullptr);
             DestroyBufferImpl(frame_ubos_[i]);
-        }
-        for (auto& slot : readback_slots_) {
-            if (slot.in_flight) vkWaitForFences(device_, 1, &slot.fence, VK_TRUE, UINT64_MAX);
-            if (slot.cmd != VK_NULL_HANDLE) vkFreeCommandBuffers(device_, cmd_pool_, 1, &slot.cmd);
-            if (slot.fence != VK_NULL_HANDLE) vkDestroyFence(device_, slot.fence, nullptr);
-            DestroyBufferImpl(slot.staging);
         }
         for (auto s : sem_render_done_) {
             if (s) vkDestroySemaphore(device_, s, nullptr);
@@ -1466,91 +1445,6 @@ bool VulkanDevice::WriteTexture(TextureHandle h, const void* src,
     return true;
 }
 
-void VulkanDevice::PollReadbacks() {
-    for (auto& slot : readback_slots_) {
-        if (slot.in_flight && slot.fence != VK_NULL_HANDLE &&
-            vkGetFenceStatus(device_, slot.fence) == VK_SUCCESS) {
-            slot.in_flight  = false;
-            slot.data_ready = true;
-        }
-    }
-}
-
-bool VulkanDevice::SubmitReadback(ReadbackSlot& slot, VkImage img, VkFormat fmt,
-                                  VkExtent2D extent, std::uint64_t src_id,
-                                  std::size_t bytes, std::size_t /*bpp*/) {
-    (void)fmt;
-    // Grow staging buffer if needed (or first-time alloc).
-    if (slot.staging.buffer == VK_NULL_HANDLE || slot.staging.size < bytes) {
-        if (slot.staging.buffer != VK_NULL_HANDLE) DestroyBufferImpl(slot.staging);
-        if (!CreateBufferImpl(bytes,
-                              VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
-                                | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                              slot.staging,
-                              /*persistent_map=*/true)) {
-            return false;
-        }
-    }
-
-    vkResetFences(device_, 1, &slot.fence);
-    vkResetCommandBuffer(slot.cmd, 0);
-
-    VkCommandBufferBeginInfo bi{};
-    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    vkBeginCommandBuffer(slot.cmd, &bi);
-
-    auto barrier = [&](VkImageLayout from, VkImageLayout to,
-                       VkAccessFlags src_acc, VkAccessFlags dst_acc,
-                       VkPipelineStageFlags src_stage, VkPipelineStageFlags dst_stage) {
-        VkImageMemoryBarrier b{};
-        b.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        b.oldLayout     = from;
-        b.newLayout     = to;
-        b.srcAccessMask = src_acc;
-        b.dstAccessMask = dst_acc;
-        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.image         = img;
-        b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        b.subresourceRange.layerCount = 1;
-        b.subresourceRange.levelCount = 1;
-        vkCmdPipelineBarrier(slot.cmd, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
-    };
-
-    barrier(VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-
-    VkBufferImageCopy region{};
-    region.bufferOffset = 0;
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageSubresource.layerCount = 1;
-    region.imageExtent = { extent.width, extent.height, 1 };
-    vkCmdCopyImageToBuffer(slot.cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           slot.staging.buffer, 1, &region);
-
-    barrier(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-            VK_ACCESS_TRANSFER_READ_BIT,
-            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-
-    vkEndCommandBuffer(slot.cmd);
-    VkSubmitInfo si{};
-    si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers    = &slot.cmd;
-    vkQueueSubmit(graphics_queue_, 1, &si, slot.fence);
-
-    slot.in_flight  = true;
-    slot.data_ready = false;
-    slot.src_id     = src_id;
-    slot.width      = extent.width;
-    slot.height     = extent.height;
-    slot.bytes      = bytes;
-    return true;
-}
-
 bool VulkanDevice::ReadbackTexture(TextureHandle h, void* dst, std::size_t dst_size,
                                    std::uint32_t* out_w, std::uint32_t* out_h) {
     if (dst == nullptr || dst_size == 0 || device_ == VK_NULL_HANDLE) return false;
@@ -1584,92 +1478,105 @@ bool VulkanDevice::ReadbackTexture(TextureHandle h, void* dst, std::size_t dst_s
     const std::size_t bytes = std::size_t(extent.width) * extent.height * bpp;
     if (dst_size < bytes) return false;
 
-    PollReadbacks();
-
-    // Diagnostic: track cache vs sync stats so we can tell whether
-    // the async ring is actually serving cache hits or constantly
-    // falling back to the sync wait. Logged every 30 calls.
-    static std::uint32_t s_dbg_calls = 0;
-    static std::uint32_t s_dbg_cache = 0;
-    static std::uint32_t s_dbg_sync  = 0;
-    static std::uint32_t s_dbg_fail  = 0;
-    ++s_dbg_calls;
-
-    // Step 1: serve from the ring if any slot has matching ready data.
-    ReadbackSlot* served = nullptr;
-    for (auto& slot : readback_slots_) {
-        if (slot.data_ready && slot.src_id == h.id && slot.bytes == bytes) {
-            std::memcpy(dst, slot.staging.mapped, bytes);
-            if (out_w) *out_w = slot.width;
-            if (out_h) *out_h = slot.height;
-            slot.data_ready = false;  // consumed; slot is now reusable
-            served = &slot;
-            ++s_dbg_cache;
-            break;
-        }
-    }
-
-    // Step 2: find an idle slot to issue a fresh async copy into.
-    ReadbackSlot* idle = nullptr;
-    for (auto& slot : readback_slots_) {
-        if (!slot.in_flight && !slot.data_ready) { idle = &slot; break; }
-    }
-    if (idle == nullptr) {
-        // All in-flight; pick the slot we just consumed if we served, else
-        // any non-in-flight (overwriting an unconsumed ready slot is OK,
-        // it's stale data).
-        if (served != nullptr) idle = served;
-        else for (auto& slot : readback_slots_) {
-            if (!slot.in_flight) { idle = &slot; break; }
-        }
-    }
-
-    if (idle != nullptr) {
-        SubmitReadback(*idle, img, fmt, extent, h.id, bytes, bpp);
-    }
-
-    if (served != nullptr) {
-        if (s_dbg_calls % 30 == 0) {
-            LOG_INFO("readback: calls={} cache={} sync={} fail={}",
-                     s_dbg_calls, s_dbg_cache, s_dbg_sync, s_dbg_fail);
-        }
-        return true;
-    }
-
-    // Cold start / different texture: fall back to a synchronous wait
-    // on the slot we just submitted. One stutter, then the ring stays
-    // primed for subsequent calls.
-    if (idle == nullptr) {
-        ++s_dbg_fail;
-        if (s_dbg_calls % 30 == 0) {
-            LOG_INFO("readback: calls={} cache={} sync={} fail={}",
-                     s_dbg_calls, s_dbg_cache, s_dbg_sync, s_dbg_fail);
-        }
+    // One-shot synchronous readback path. The only caller today is the
+    // `screenshot` console command, which is user-triggered and
+    // low-frequency, so a queue stall during the wait is fine. The
+    // async-slot-ring infrastructure that lived here was built for the
+    // per-8-frames CPU autoexpose readback that's been retired
+    // (auto-expose is now entirely GPU-resident, see AutoExposure.slang
+    // + exposure_state). When async readback is needed again it'll most
+    // likely be buffer-shaped (GPU physics event queues, not texture
+    // data) and ship as a separate ReadbackBuffer API designed around
+    // that use case rather than retrofitted onto this one.
+    BufferEntry staging{};
+    if (!CreateBufferImpl(bytes,
+                          VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                            | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                          staging,
+                          /*persistent_map=*/true)) {
         return false;
     }
-    ++s_dbg_sync;
-    vkWaitForFences(device_, 1, &idle->fence, VK_TRUE, UINT64_MAX);
-    idle->in_flight  = false;
-    idle->data_ready = false;       // consumed in this call
-    std::memcpy(dst, idle->staging.mapped, bytes);
-    if (out_w) *out_w = idle->width;
-    if (out_h) *out_h = idle->height;
 
-    // Critical: also submit a FRESH async readback into a different
-    // slot so the next call has data cached and doesn't re-stutter.
-    // Without this, every tick falls into the sync fallback above
-    // (resetting all state) and the ring never gets to act as a ring.
-    for (auto& slot : readback_slots_) {
-        if (&slot == idle) continue;
-        if (!slot.in_flight && !slot.data_ready) {
-            SubmitReadback(slot, img, fmt, extent, h.id, bytes, bpp);
-            break;
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    {
+        VkCommandBufferAllocateInfo ai{};
+        ai.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        ai.commandPool        = cmd_pool_;
+        ai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(device_, &ai, &cb) != VK_SUCCESS) {
+            DestroyBufferImpl(staging);
+            return false;
         }
     }
-    if (s_dbg_calls % 30 == 0) {
-        LOG_INFO("readback: calls={} cache={} sync={} fail={}",
-                 s_dbg_calls, s_dbg_cache, s_dbg_sync, s_dbg_fail);
+
+    VkFence fence = VK_NULL_HANDLE;
+    {
+        VkFenceCreateInfo fci{};
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (vkCreateFence(device_, &fci, nullptr, &fence) != VK_SUCCESS) {
+            vkFreeCommandBuffers(device_, cmd_pool_, 1, &cb);
+            DestroyBufferImpl(staging);
+            return false;
+        }
     }
+
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    vkBeginCommandBuffer(cb, &bi);
+
+    auto barrier = [&](VkImageLayout from, VkImageLayout to,
+                       VkAccessFlags src_acc, VkAccessFlags dst_acc,
+                       VkPipelineStageFlags src_stage, VkPipelineStageFlags dst_stage) {
+        VkImageMemoryBarrier b{};
+        b.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.oldLayout     = from;
+        b.newLayout     = to;
+        b.srcAccessMask = src_acc;
+        b.dstAccessMask = dst_acc;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image         = img;
+        b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        b.subresourceRange.layerCount = 1;
+        b.subresourceRange.levelCount = 1;
+        vkCmdPipelineBarrier(cb, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
+    };
+
+    barrier(VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+    VkBufferImageCopy region{};
+    region.bufferOffset = 0;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = { extent.width, extent.height, 1 };
+    vkCmdCopyImageToBuffer(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           staging.buffer, 1, &region);
+
+    barrier(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_ACCESS_TRANSFER_READ_BIT,
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+    vkEndCommandBuffer(cb);
+
+    VkSubmitInfo si{};
+    si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers    = &cb;
+    vkQueueSubmit(graphics_queue_, 1, &si, fence);
+    vkWaitForFences(device_, 1, &fence, VK_TRUE, UINT64_MAX);
+
+    std::memcpy(dst, staging.mapped, bytes);
+    if (out_w) *out_w = extent.width;
+    if (out_h) *out_h = extent.height;
+
+    vkDestroyFence(device_, fence, nullptr);
+    vkFreeCommandBuffers(device_, cmd_pool_, 1, &cb);
+    DestroyBufferImpl(staging);
     return true;
 }
 
