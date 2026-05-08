@@ -147,10 +147,32 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gid_3d : SV_GroupThreadID) {
     uint h_steps = (height + stride - 1) / stride;
     uint total   = w_steps * h_steps;
 
-    // Per-thread accumulation in LOG space. The eps floor on lum
-    // (1e-6) keeps log() finite for near-black pixels; the if (lum > 0)
-    // guard skips truly zero pixels so they don't pull the mean down
-    // toward log(eps) ~= -14 and bias dark-scene exposure.
+    // Per-thread accumulation in LOG space, with luminance clipped to
+    // [1e-6, 1e3] before logging. The lower floor (1e-6) keeps log()
+    // finite for near-black pixels; the upper cap (1e3 ~ 1000 nits)
+    // is the critical bit for HDR-realistic outdoor scenes:
+    //
+    //   - Real-world sky luminance: ~1e4 nits
+    //   - Bright cloud / sun-lit white wall: ~1e3-1e4 nits
+    //   - Sun disc: ~1.6e9 nits
+    //   - Indoor ambient / shaded scene element: ~0.1-10 nits
+    //
+    // Without an upper cap, even a small percentage of sky / sun
+    // pixels in frame pulls the geometric mean far above the actual
+    // mid-tones of the scene. The metering then computes a tiny
+    // target exposure (key/avg) that crushes the ground / shaded
+    // areas to black while the sky still saturates ACES at the top.
+    //
+    // The 1e3 cap means "for metering purposes, anything brighter
+    // than ~1000 nits is treated as 1000 nits". Scene elements at
+    // their actual luminance still flow through the path tracer to
+    // the swapchain at full HDR -- only the auto-exposure's "what's
+    // the typical scene luminance?" calculation ignores the extreme
+    // tail. Standard outlier-clipping technique used in pro cameras
+    // and most game engines for robust auto-exposure.
+    //
+    // The if (lum > 0) guard skips truly zero pixels so they don't
+    // pull the mean down toward log(eps) and bias dark-scene exposure.
     float sum  = 0.0;
     uint  cnt  = 0;
     for (uint i = gid; i < total; i += 64u) {
@@ -160,7 +182,7 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gid_3d : SV_GroupThreadID) {
             float3 c = accum_hdr[uint2(x, y)].rgb;
             float lum = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
             if (lum > 0.0) {
-                sum += log(max(lum, 1e-6));
+                sum += log(clamp(lum, 1e-6, 1e3));
                 cnt += 1u;
             }
         }
