@@ -3,6 +3,7 @@
 #include "Engine.h"
 
 #include "../app/ConsoleOverlay.h"
+#include "../app/PerfOverlay.h"
 #include "../app/Window.h"
 #include "../console/Console.h"
 #include "../console/ConsoleServer.h"
@@ -57,6 +58,12 @@ namespace cvar {
             CVAR_ARCHIVE);
     PT_CVAR(app_overlay_enabled, "1",
             "Enable the in-window native console overlay (backtick toggles)", CVAR_ARCHIVE);
+    PT_CVAR(r_perf_overlay,    "0",
+            "Tiered in-game performance overlay. 0 = off, 1 = fps + frame_ms, "
+            "2 = + backend / resolution / GPU memory / spp / bounces / primitives, "
+            "3 = + frame-time sparkline. (Tier 4 reserved for per-pass GPU "
+            "timestamps once VkQueryPool / MTLCounterSampleBuffer is wired.)",
+            CVAR_ARCHIVE);
     PT_CVAR(r_theme, "hardcore",
             "Web console theme: hardcore|amber|synthwave|matrix|vault|sakura|mono",
             CVAR_ARCHIVE);
@@ -308,6 +315,25 @@ bool Engine::Init() {
                 pt::log::AddSink(&pt::app::ConsoleOverlay::OnLog);
             } else {
                 overlay_.reset();
+            }
+        }
+
+        // Always-visible perf overlay (separate child window from the
+        // console).  Visibility is gated by r_perf_overlay -- the
+        // overlay starts in its initial state and the on_change
+        // handler below pushes the cvar's actual value once Init
+        // returns.
+        perf_overlay_ = std::make_unique<pt::app::PerfOverlay>();
+        if (!perf_overlay_->Init(window_->NativeHandle())) {
+            perf_overlay_.reset();
+        } else if (auto* tv = C.FindCVar("r_theme")) {
+            perf_overlay_->ApplyTheme(tv->value);
+        }
+        if (perf_overlay_) {
+            if (auto* lv = C.FindCVar("r_perf_overlay")) {
+                int level = 0;
+                try { level = std::stoi(lv->value); } catch (...) {}
+                perf_overlay_->SetLevel(level);
             }
         }
 
@@ -2116,27 +2142,70 @@ void Engine::Tick(double dt) {
     auto frame_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t0).count();
 
-    // Broadcast frame_stats throttled to ~10 Hz so the network doesn't
-    // get spammed at 240+ fps.
+    // Per-frame ring buffer for the tier-3 sparkline.  Sized for ~4
+    // seconds of 60-fps history; the overlay subsamples down to its
+    // available pixel width when rendering.  Ring is resized lazily
+    // on first push so it doesn't allocate when the overlay is off.
+    if (perf_history_.empty()) perf_history_.assign(256, 0.0f);
+    perf_history_[perf_history_pos_] = static_cast<float>(frame_ms);
+    perf_history_pos_ = (perf_history_pos_ + 1) % perf_history_.size();
+
+    // Aggregate at ~10 Hz so the network doesn't get spammed at
+    // 240+ fps and the overlay's text doesn't visually flicker.
+    // Same window also drives the avg/min/max stats consumed below.
     static double accum_s = 0.0;
     static int    accum_frames = 0;
     static double accum_render_ms = 0.0;
+    static double accum_min = 1.0e30;
+    static double accum_max = 0.0;
     accum_s         += dt;
     accum_frames    += 1;
     accum_render_ms += frame_ms;
-    if (accum_s >= 0.1 && server_) {
-        double fps = accum_frames / accum_s;
+    if (frame_ms < accum_min) accum_min = frame_ms;
+    if (frame_ms > accum_max) accum_max = frame_ms;
+    if (accum_s >= 0.1) {
+        double fps        = accum_frames / accum_s;
         double avg_render = accum_render_ms / accum_frames;
         int w = window_ ? window_->Width()  : 0;
         int h = window_ ? window_->Height() : 0;
-        auto data = fmt::format(
-            R"({{"fps":{:.1f},"frame_ms":{:.3f},"trace_ms":{:.3f},"backend":"{}","resolution":[{},{}]}})",
-            fps, accum_render_ms / accum_frames, avg_render,
-            pt::rhi::BackendName(current_backend_), w, h);
-        server_->BroadcastEvent("frame_stats", data);
-        accum_s = 0.0;
-        accum_frames = 0;
+
+        if (server_) {
+            auto data = fmt::format(
+                R"({{"fps":{:.1f},"frame_ms":{:.3f},"trace_ms":{:.3f},"backend":"{}","resolution":[{},{}]}})",
+                fps, avg_render, avg_render,
+                pt::rhi::BackendName(current_backend_), w, h);
+            server_->BroadcastEvent("frame_stats", data);
+        }
+
+        if (perf_overlay_ && perf_overlay_->Level() > 0) {
+            // Linearize the ring (oldest-first) so the overlay can
+            // walk it left-to-right without modular arithmetic.
+            std::vector<float> linear(perf_history_.size());
+            for (std::size_t i = 0; i < perf_history_.size(); ++i) {
+                linear[i] = perf_history_[(perf_history_pos_ + i) % perf_history_.size()];
+            }
+            auto& Cn = pt::console::Console::Get();
+            pt::app::PerfStats st;
+            st.fps          = fps;
+            st.frame_ms_avg = avg_render;
+            st.frame_ms_min = accum_min;
+            st.frame_ms_max = accum_max;
+            st.backend      = pt::rhi::BackendName(current_backend_);
+            st.width        = w;
+            st.height       = h;
+            st.gpu_bytes    = device_ ? device_->CurrentAllocatedBytes() : 0;
+            if (auto* sv = Cn.FindCVar("r_spp"))         st.spp         = sv->GetInt();
+            if (auto* mv = Cn.FindCVar("r_max_bounces")) st.max_bounces = mv->GetInt();
+            st.primitives   = primitives_.size();
+            st.frame_ms_history = std::span<const float>(linear.data(), linear.size());
+            perf_overlay_->Update(st);
+        }
+
+        accum_s         = 0.0;
+        accum_frames    = 0;
         accum_render_ms = 0.0;
+        accum_min       = 1.0e30;
+        accum_max       = 0.0;
     }
 }
 
@@ -2155,6 +2224,9 @@ void Engine::Run() {
         // which is driven by AppKit's resize, not the engine loop.
         if (overlay_) {
             overlay_->NotifyParentResized(window_->Width(), window_->Height());
+        }
+        if (perf_overlay_) {
+            perf_overlay_->NotifyParentResized(window_->Width(), window_->Height());
         }
         Tick(dt);
 
@@ -2801,6 +2873,17 @@ void Engine::RegisterCommands() {
             if (!r.ok) out.FormatLine("exec error: {}", r.error);
         });
 
+    // r_perf_overlay: validate + push level changes to the overlay.
+    if (auto* v = C.FindCVar("r_perf_overlay")) {
+        v->allowed_values = {"0", "1", "2", "3"};
+        v->on_change = [this](const pt::console::CVar& cv) {
+            if (perf_overlay_) {
+                int lv = 0;
+                try { lv = std::stoi(cv.value); } catch (...) { lv = 0; }
+                perf_overlay_->SetLevel(lv);
+            }
+        };
+    }
     // r_backend: validate against the known set + react to changes.
     if (auto* v = C.FindCVar("r_backend")) {
         v->allowed_values = {"none", "software", "metal", "vulkan"};
@@ -2823,6 +2906,7 @@ void Engine::RegisterCommands() {
                 server_->BroadcastEvent("theme_change", data);
             }
             if (overlay_) overlay_->ApplyTheme(cv.value);
+            if (perf_overlay_) perf_overlay_->ApplyTheme(cv.value);
         };
     }
     // dev_log_level: validate

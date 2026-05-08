@@ -13,8 +13,9 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <vector>
 
-namespace pt::app      { class Window; class ConsoleOverlay; }
+namespace pt::app      { class Window; class ConsoleOverlay; class PerfOverlay; }
 namespace pt::jobs     { class JobSystem; }
 namespace pt::console  { class ConsoleServer; }
 namespace pt::rhi      { class Device; struct PipelineHandle; }
@@ -111,6 +112,12 @@ private:
 
     std::unique_ptr<pt::app::Window>            window_;
     std::unique_ptr<pt::app::ConsoleOverlay>    overlay_;
+    std::unique_ptr<pt::app::PerfOverlay>       perf_overlay_;
+    // Ring buffer of recent frame_ms samples for the tier-3 sparkline.
+    // Sized to comfortably fill the overlay's graph width at any
+    // typical viewport DPI; oldest sample evicted on push.
+    std::vector<float>                          perf_history_;
+    std::size_t                                 perf_history_pos_ = 0;
     std::unique_ptr<pt::jobs::JobSystem>        jobs_;
     std::unique_ptr<pt::console::ConsoleServer> server_;
     std::unique_ptr<pt::rhi::Device>            device_;
