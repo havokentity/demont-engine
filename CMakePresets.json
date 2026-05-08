@@ -108,12 +108,12 @@
     }
   ],
   "buildPresets": [
-    { "name": "mac-debug",       "configurePreset": "mac-debug"   },
-    { "name": "mac-release",     "configurePreset": "mac-release" },
-    { "name": "win-debug",       "configurePreset": "win-debug"   },
-    { "name": "win-release",     "configurePreset": "win-release" },
-    { "name": "win-clang-debug", "configurePreset": "win-clang-debug" },
-    { "name": "linux-debug",     "configurePreset": "linux-debug"   },
-    { "name": "linux-release",   "configurePreset": "linux-release" }
+    { "name": "mac-debug",       "configurePreset": "mac-debug",       "jobs": 0 },
+    { "name": "mac-release",     "configurePreset": "mac-release",     "jobs": 0 },
+    { "name": "win-debug",       "configurePreset": "win-debug",       "jobs": 0 },
+    { "name": "win-release",     "configurePreset": "win-release",     "jobs": 0 },
+    { "name": "win-clang-debug", "configurePreset": "win-clang-debug", "jobs": 0 },
+    { "name": "linux-debug",     "configurePreset": "linux-debug",     "jobs": 0 },
+    { "name": "linux-release",   "configurePreset": "linux-release",   "jobs": 0 }
   ]
 }
