@@ -204,6 +204,22 @@ private:
     std::uint64_t                               env_conditional_cdf_id_ = 0;
     float                                       env_total_luminance_   = 0.0f;
 
+    // P12 HDRI sun extraction. When ReloadEnvMap detects a bright pixel
+    // cluster (the sun) in the HDRI, those pixels get masked out of the
+    // CDF (env-map NEE skips them) and the cluster's centroid direction
+    // + integrated radiant flux are stored here. The path tracer then
+    // does a directional NEE toward the centroid each frame -- crisp
+    // shadow ray, sharp directional shadows regardless of how soft the
+    // HDRI's sun pixels are. The env_map texture itself is NOT modified
+    // (the visible HDRI sun remains in the rendered sky for camera-
+    // direct rays). _valid is false when the HDRI has no obvious sun
+    // (overcast, interior, dim peak); in that case the path tracer
+    // falls back to env-map NEE only and shadows depend on HDRI
+    // sharpness.
+    bool                                        extracted_sun_valid_     = false;
+    glm::vec3                                   extracted_sun_dir_       = {0.0f, 1.0f, 0.0f};
+    glm::vec3                                   extracted_sun_irradiance_ = {0.0f, 0.0f, 0.0f};
+
     // P11 BSC starmap. RGBA16F equirectangular in J2000, rasterised once
     // at startup from assets/stars/BSC5.dat. The shader rotates incoming
     // ray directions into J2000 (using the per-frame world->J2000

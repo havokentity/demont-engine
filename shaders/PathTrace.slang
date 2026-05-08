@@ -168,6 +168,17 @@ cbuffer Push {
     // Sun extras. .x = r_sun_size, .y = Earth-Sun distance ratio
     // (mean/current; perihelion ~1.017, aphelion ~0.984).
     float4 sun_extra;
+    // P12 HDRI-extracted sun. .xyz = unit direction toward the bright
+    // pixel cluster centroid in the env map (computed at HDRI load).
+    // .w = 1.0 if a sun was extracted, 0.0 otherwise. The path tracer
+    // casts a directional NEE shadow ray toward this direction in HDRI
+    // mode, producing crisp directional shadows independent of how
+    // soft/sharp the HDRI sun pixels actually are.
+    float4 hdri_sun_dir;
+    // P12 HDRI-extracted sun radiant flux. .rgb = ∫_cluster L dΩ over
+    // the cluster, in raw env_map units. Shader applies env_intensity
+    // for parity with env-map NEE's color scaling. .w reserved.
+    float4 hdri_sun_color;
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -193,6 +204,8 @@ cbuffer Frame {
     float4 moon_dir_phase;
     float4 moon_extra;
     float4 sun_extra;
+    float4 hdri_sun_dir;
+    float4 hdri_sun_color;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -898,8 +911,15 @@ float3 skyColor(float3 rd) {
         float3 c01 = env_map[uint2(x0, y1)].rgb;
         float3 c11 = env_map[uint2(x1, y1)].rgb;
         float3 sky = lerp(lerp(c00, c10, f.x), lerp(c01, c11, f.x), f.y);
-        return sky * env_intensity + moonDisc(rd, moon_dir_phase, sun_and_mode.xyz)
-             + sunDisc(rd, sun_and_mode.xyz);
+        // P12: HDRI mode is the canonical "all info from the HDRI"
+        // path. The HDRI texture itself contains the sun, moon, stars
+        // and any other celestial bodies baked in. We deliberately do
+        // NOT add a procedural sunDisc / moonDisc overlay -- the user's
+        // expectation is that the rendered sky matches the HDRI source.
+        // Crisp directional shadows come from the directional NEE
+        // toward the extracted sun cluster (see hdri_sun_dir block in
+        // the path tracer's Lambert hit handling).
+        return sky * env_intensity;
     }
     return base + moonDisc(rd, moon_dir_phase, sun_and_mode.xyz)
              + sunDisc(rd, sun_and_mode.xyz);
@@ -1283,6 +1303,28 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     if (any(trans > float3(0.0))) {
                         float3 brdf = h.albedo / 3.14159265358979;
                         radiance += clampIndirect(throughput * env.color * trans * brdf * n_dot_l / env.pdf);
+                    }
+                }
+                // P12 HDRI extracted sun NEE: env-map NEE samples the
+                // sun-MASKED CDF (the bright cluster pixels were zeroed
+                // at HDRI load), so the sun's contribution is missing
+                // from that estimator. Add it back as a directional
+                // NEE toward the cluster centroid: shoots one shadow
+                // ray, all Lambert pixels point in the same direction
+                // -> sharp directional shadows independent of HDRI sun
+                // softness. hdri_sun_color is the precomputed
+                // ∫_cluster L dΩ; multiplying by env_intensity matches
+                // env-map NEE's intensity treatment so toggling the
+                // cvar scales both equivalently.
+                if (hdri_sun_dir.w > 0.0) {
+                    float n_dot_sun = dot(nf, hdri_sun_dir.xyz);
+                    if (n_dot_sun > 0.0) {
+                        float3 t_s = transmittance(hit_pt + nf * 1e-3, hdri_sun_dir.xyz, 1e30);
+                        if (any(t_s > float3(0.0))) {
+                            float3 brdf = h.albedo / 3.14159265358979;
+                            radiance += clampIndirect(throughput * hdri_sun_color.xyz
+                                                     * env_intensity * t_s * brdf * n_dot_sun);
+                        }
                     }
                 }
                 // Moon NEE. Env-map importance sampling will mostly
