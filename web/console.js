@@ -885,6 +885,14 @@
   });
 
   input.addEventListener('keydown', (e) => {
+    // Modifier keys alone must not dismiss the ghost -- pressing
+    // Shift fires keydown with e.key === 'Shift' before Tab arrives,
+    // and "any-other-key dismisses" below would have killed the
+    // ghost so Shift+Tab degenerated into a forward cycle.  Skip.
+    if (e.key === 'Shift' || e.key === 'Control' || e.key === 'Alt' ||
+        e.key === 'Meta'  || e.key === 'CapsLock') {
+      return;
+    }
     // Ghost-mode key handling.  Tab cycles, Shift+Tab cycles back,
     // Right-arrow at end / End commits, Esc dismisses, any other
     // key dismisses and falls through to normal handling.

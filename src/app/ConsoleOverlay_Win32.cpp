@@ -749,6 +749,21 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_KEYDOWN: {
         std::lock_guard lk(state_mutex_);
 
+        // Modifier keys alone (Shift/Ctrl/Alt/Win) must not dismiss
+        // the ghost -- otherwise a user pressing Shift+Tab fires
+        // WM_KEYDOWN(VK_SHIFT) first, which would trip the
+        // "any-other-key dismisses" branch below; by the time Tab
+        // arrives the ghost is gone and Shift+Tab degenerates into a
+        // fresh first Tab (cycle forward) instead of a step back.
+        // Same for Caps Lock etc.  Just swallow modifier-only events.
+        if (w == VK_SHIFT   || w == VK_CONTROL || w == VK_MENU    ||
+            w == VK_LSHIFT  || w == VK_RSHIFT  ||
+            w == VK_LCONTROL|| w == VK_RCONTROL||
+            w == VK_LMENU   || w == VK_RMENU   ||
+            w == VK_CAPITAL || w == VK_LWIN    || w == VK_RWIN) {
+            return 0;
+        }
+
         // Ghost-mode preamble.  When the autosuggestion is active these
         // keys mean something different than their default: Tab cycles,
         // Shift+Tab cycles back, Right-arrow at end / End commits, Esc
