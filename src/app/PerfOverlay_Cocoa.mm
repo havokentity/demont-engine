@@ -22,13 +22,22 @@
 
 namespace {
 
+// Theme members are NSColor* held in a plain C struct.  Without an
+// explicit __strong annotation, ObjC pointers inside C structs default
+// to __unsafe_unretained under ARC, which would let the autoreleased
+// NSColor*s returned from PaletteFor() get released when the
+// surrounding autorelease pool drains -- the Theme struct stored on
+// the view via @property(assign) would then carry dangling pointers.
+// __strong opts each pointer into ARC retain/release, so struct
+// assignment (`self.view.theme = PaletteFor(name)`) correctly
+// retains the new colours and releases the old ones.
 struct Theme {
     const char* name;
-    NSColor* panel;
-    NSColor* text;
-    NSColor* accent;
-    NSColor* dim;
-    NSColor* graph;
+    __strong NSColor* panel;
+    __strong NSColor* text;
+    __strong NSColor* accent;
+    __strong NSColor* dim;
+    __strong NSColor* graph;
 };
 
 static NSColor* RGB8(int r, int g, int b, double a = 1.0) {
@@ -76,7 +85,13 @@ int LinesForLevel(int level) {
 @property (strong) PtPerfView* view;
 - (instancetype)initWithParent:(NSWindow*)parent;
 - (void)layoutToParent;
-- (void)setLevel:(int)level;
+// Renamed from setLevel: to avoid colliding with NSWindow/NSPanel's
+// own -setLevel:(NSWindowLevel) selector.  The collision meant
+// `self.level = NSStatusWindowLevel` in initWithParent: dispatched
+// to OUR int-tier setter instead of NSWindow's z-order level
+// setter, leaving the panel without its expected status-window
+// floating behaviour.
+- (void)setOverlayTier:(int)tier;
 - (void)applyTheme:(std::string_view)name;
 @end
 
@@ -257,11 +272,11 @@ int LinesForLevel(int level) {
     [self.view setNeedsDisplay:YES];
 }
 
-- (void)setLevel:(int)level {
-    if (level < 0) level = 0;
-    if (level > 3) level = 3;
-    self.view.level = level;
-    if (level == 0) {
+- (void)setOverlayTier:(int)tier {
+    if (tier < 0) tier = 0;
+    if (tier > 3) tier = 3;
+    self.view.level = tier;
+    if (tier == 0) {
         [self orderOut:nil];
     } else {
         [self layoutToParent];
@@ -327,7 +342,7 @@ void PerfOverlay::Shutdown() {
 
 void PerfOverlay::SetLevel(int level) {
     if (!opaque_) return;
-    [(__bridge PtPerfPanel*)opaque_ setLevel:level];
+    [(__bridge PtPerfPanel*)opaque_ setOverlayTier:level];
 }
 
 int PerfOverlay::Level() const {

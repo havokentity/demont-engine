@@ -605,6 +605,13 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     NSString* line = [self.inputField.stringValue copy];
     if (line.length == 0) return;
     self.inputField.stringValue = @"";
+    // Programmatic setStringValue: doesn't fire controlTextDidChange:,
+    // so an active ghost suggestion (e.g. one auto-activated by the
+    // commitGhost path that calls into submitInput) would otherwise
+    // stay visible with its stale text overlaid on the now-empty
+    // field.  Drop the ghost explicitly here so the submit always
+    // leaves a clean prompt.
+    if (self.ghostActive) [self dismissGhost];
     [self submitLine:line];
     [self refreshNames];
 }

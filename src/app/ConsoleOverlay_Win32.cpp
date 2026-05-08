@@ -143,7 +143,15 @@ std::vector<wchar_t> ToWide(std::string_view s) {
 
 class WinOverlay {
 public:
-    static WinOverlay* g;
+    // OnLog is invoked from arbitrary log-source threads via the
+    // pt::log sink chain, so reads of `g` must be atomic with respect
+    // to Init/Shutdown writes on the main thread (otherwise we have a
+    // C++ data race + a use-after-free if a log emit lands during
+    // shutdown).  std::atomic<T*> with default seq-cst gives a clean
+    // happens-before across the publish (g.store(this) in Init) and
+    // every load(), and a clear poison value (g.store(nullptr) in
+    // Shutdown) before HWND/GDI cleanup.
+    static std::atomic<WinOverlay*> g;
 
     bool  Init(HWND parent);
     void  Shutdown();
@@ -245,7 +253,7 @@ private:
     bool    wants_focus_on_activate_  = false;
 };
 
-WinOverlay* WinOverlay::g = nullptr;
+std::atomic<WinOverlay*> WinOverlay::g{nullptr};
 
 LRESULT CALLBACK WinOverlay::WndProcThunk(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_NCCREATE) {
@@ -268,7 +276,7 @@ LRESULT CALLBACK WinOverlay::WndProcThunk(HWND h, UINT m, WPARAM w, LPARAM l) {
 // because GWLP_USERDATA on the parent belongs to GLFW.
 LRESULT CALLBACK WinOverlay::ParentWndProcThunk(
     HWND h, UINT m, WPARAM w, LPARAM l) {
-    WinOverlay* self = WinOverlay::g;
+    WinOverlay* self = WinOverlay::g.load(std::memory_order_acquire);
     WNDPROC orig = (self != nullptr) ? self->original_parent_proc_ : nullptr;
     LRESULT r = (orig != nullptr)
         ? CallWindowProcW(orig, h, m, w, l)
@@ -394,7 +402,9 @@ bool WinOverlay::Init(HWND parent) {
         font_is_owned_ = false;
     }
 
-    g = this;
+    // Publish this instance with release semantics so log-thread loads
+    // see fully-initialised state_mutex_, scrollback_, hwnd_, etc.
+    g.store(this, std::memory_order_release);
 
     // Subclass the parent's WndProc so we can re-focus the overlay
     // when the application regains activation (alt-tab back). GLFW's
@@ -439,7 +449,16 @@ bool WinOverlay::Init(HWND parent) {
 }
 
 void WinOverlay::Shutdown() {
-    if (g == this) g = nullptr;
+    // Compare-and-clear under release ordering so any in-flight log
+    // emit on a worker thread either gets the live `this` pointer
+    // (and proceeds with the still-valid object up to the next g.load
+    // observation) or sees nullptr and bails out at the OnLog guard.
+    {
+        WinOverlay* expected = this;
+        g.compare_exchange_strong(expected, nullptr,
+                                  std::memory_order_release,
+                                  std::memory_order_relaxed);
+    }
     // Restore the parent's original WndProc before tearing down.
     // If another subclass installed itself on top of ours, this will
     // remove it too -- acceptable given there's no other subclass
@@ -612,7 +631,13 @@ void WinOverlay::NotifyParentResized(int w, int h) {
 }
 
 void WinOverlay::OnLog(pt::log::Level /*lvl*/, const std::string& msg) {
-    if (g == nullptr) return;
+    // Snapshot the singleton with acquire ordering; if Shutdown has
+    // already cleared it, OnLog becomes a no-op for the rest of this
+    // process lifetime.  Re-using the snapshot below avoids a TOCTOU
+    // hazard where g flips between an early null-check and a later
+    // dereference.
+    WinOverlay* self = g.load(std::memory_order_acquire);
+    if (self == nullptr) return;
     // Strip ANSI escape sequences -- the log layer formats with them
     // for terminal use; GDI doesn't render them.
     std::string clean;
@@ -627,16 +652,16 @@ void WinOverlay::OnLog(pt::log::Level /*lvl*/, const std::string& msg) {
         clean.push_back(c);
     }
     {
-        std::lock_guard lk(g->state_mutex_);
-        g->scrollback_.push_back({std::move(clean), LineRole::Default});
-        while (g->scrollback_.size() > kScrollMax) g->scrollback_.pop_front();
+        std::lock_guard lk(self->state_mutex_);
+        self->scrollback_.push_back({std::move(clean), LineRole::Default});
+        while (self->scrollback_.size() > kScrollMax) self->scrollback_.pop_front();
     }
     // pt::log sinks fire on the calling thread (Log::Emit doesn't
     // reschedule), so OnLog can be invoked from any worker. Post a
     // custom repaint message instead of calling Repaint() / Invalidate
     // directly -- PostMessage is the only cross-thread Win32 UI bridge
     // that's well-defined.
-    if (HWND target = g->hwnd_) {
+    if (HWND target = self->hwnd_) {
         PostMessageW(target, WM_APP_REPAINT, 0, 0);
     }
 }
@@ -1294,7 +1319,9 @@ void ConsoleOverlay::ApplyTheme(std::string_view n)    { if (opaque_) static_cas
 void ConsoleOverlay::NotifyParentResized(int w, int h) { if (opaque_) static_cast<WinOverlay*>(opaque_)->NotifyParentResized(w, h); }
 
 void ConsoleOverlay::OnLog(pt::log::Level lvl, const std::string& body) {
-    if (WinOverlay::g) WinOverlay::g->OnLog(lvl, body);
+    if (WinOverlay* w = WinOverlay::g.load(std::memory_order_acquire)) {
+        w->OnLog(lvl, body);
+    }
 }
 void ConsoleOverlay::SetGlobalInstance(ConsoleOverlay* /*o*/) {
     // The Mac overlay uses this to bridge a sink from a static log
