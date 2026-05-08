@@ -99,6 +99,16 @@ constexpr DWORD    kShowDurMs     = 220;
 constexpr DWORD    kHideDurMs     = 180;
 constexpr BYTE     kPanelAlpha    = 217;     // peak alpha for layered path
 
+// Focus-watchdog timer.  Runs at low frequency while the console is
+// shown; on each tick it checks whether keyboard focus has drifted off
+// the console child (which has happened intermittently after Enter --
+// something in GLFW's WndProc or the OS briefly hands focus back to
+// the parent past our WM_SETFOCUS redirect).  Re-asserts SetFocus when
+// drift is detected.  Gated on wants_focus_on_activate_ so a
+// deliberate click into the game viewport stays out of the loop.
+constexpr UINT_PTR kFocusGuardTimerId = 0xC04502u;
+constexpr UINT     kFocusGuardMs      = 100;
+
 // Custom message: marshal a repaint request from a non-UI thread
 // (e.g. pt::log sinks, which fire on whichever thread emits the log)
 // onto the overlay's owning thread. Cross-thread InvalidateRect is
@@ -437,7 +447,10 @@ void WinOverlay::Shutdown() {
             reinterpret_cast<LONG_PTR>(original_parent_proc_));
         original_parent_proc_ = nullptr;
     }
-    if (hwnd_) { KillTimer(hwnd_, kAnimTimerId); }
+    if (hwnd_) {
+        KillTimer(hwnd_, kAnimTimerId);
+        KillTimer(hwnd_, kFocusGuardTimerId);
+    }
     if (font_)  {
         // Stock GDI objects (GetStockObject) are owned by the OS --
         // DeleteObject on them is undefined; only delete fonts we
@@ -545,6 +558,9 @@ void WinOverlay::Show() {
     // parent viewport will flip this back via WM_KILLFOCUS.
     wants_focus_on_activate_ = true;
     StartAnim(/*showing=*/true);
+    // Arm the focus watchdog: every 100 ms while shown, re-check that
+    // keyboard focus is on the child and restore it if not.
+    if (hwnd_) SetTimer(hwnd_, kFocusGuardTimerId, kFocusGuardMs, nullptr);
 }
 
 void WinOverlay::Hide() {
@@ -552,6 +568,7 @@ void WinOverlay::Hide() {
     if (!shown_ && anim_state_ != AnimState::Showing) return;
     shown_ = false;
     StartAnim(/*showing=*/false);
+    if (hwnd_) KillTimer(hwnd_, kFocusGuardTimerId);
 }
 
 void WinOverlay::Toggle() { if (shown_) Hide(); else Show(); }
@@ -649,6 +666,18 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     case WM_TIMER:
         if (w == kAnimTimerId) { TickAnim(); return 0; }
+        if (w == kFocusGuardTimerId) {
+            // Re-assert focus on the child if it has drifted while
+            // the console is open.  Cheap (one GetFocus call) and
+            // self-correcting; only resets focus when needed so it
+            // doesn't fight a deliberate click-away.
+            if (shown_ && wants_focus_on_activate_ && hwnd_) {
+                if (GetFocus() != hwnd_) {
+                    SetFocus(hwnd_);
+                }
+            }
+            return 0;
+        }
         break;
     case WM_MOUSEWHEEL: {
         // Mouse-wheel scrollback. Positive delta = wheel rotated

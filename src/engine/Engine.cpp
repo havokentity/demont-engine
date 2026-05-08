@@ -2069,6 +2069,19 @@ void Engine::RenderFrame() {
         if (auto* mv = Cn.FindCVar("r_perf_overlay_mode")) mode  = mv->value;
         if (level > 0 && mode == "rhi" &&
             perfoverlay_pipeline_id_ != 0 && perfoverlay_drawlist_id_ != 0) {
+            // Compute-after-compute barrier on the swapchain image.
+            // The previous dispatch (PathTrace inline tonemap on
+            // Vulkan, or Tonemap.slang on Metal-with-denoiser) wrote
+            // the swapchain via storage-image stores; PerfOverlay
+            // now reads + writes the same image.  Without this
+            // barrier the load sees stale data and the resulting
+            // composite scribbles over the rendered scene.  Same
+            // pattern as the PathTrace -> AutoExposure barrier
+            // above (Metal's Barrier() is a no-op since dispatches
+            // on a shared resource auto-barrier; Vulkan needs the
+            // explicit emit).
+            cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                         pt::rhi::BarrierDesc::Stage::ComputeWrite});
             // Panel sized for the chrome we draw: a fixed-aspect
             // rectangle in the top-right corner.  Tier 3 adds height
             // for the sparkline graph.
