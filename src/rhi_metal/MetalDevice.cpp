@@ -741,6 +741,26 @@ bool MetalDevice::ReadbackTexture(TextureHandle h, void* dst, std::size_t dst_si
     return true;
 }
 
+bool MetalDevice::ReadbackBuffer(BufferHandle h, void* dst, std::size_t bytes) {
+    if (device_ == nullptr || dst == nullptr || bytes == 0) return false;
+    auto* buf = LookupBuffer(h);
+    if (buf == nullptr) return false;
+    if (buf->length() < bytes) return false;
+
+    // Engine MTL::Buffer is allocated with StorageModeShared (see
+    // CreateBuffer above), so contents() points at host-visible memory
+    // that's coherent with the GPU. To make sure any pending GPU
+    // writes (e.g. AutoExposure.slang updating exposure_state) are
+    // committed before we read, drain the queue with a no-op submit.
+    if (queue_ != nullptr) {
+        auto* cb = queue_->commandBuffer();
+        cb->commit();
+        cb->waitUntilCompleted();
+    }
+    std::memcpy(dst, buf->contents(), bytes);
+    return true;
+}
+
 void MetalDevice::WaitIdle() {
     if (queue_ == nullptr) return;
     auto* cb = queue_->commandBuffer();

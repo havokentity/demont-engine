@@ -80,6 +80,16 @@ public:
         return false;
     }
 
+    // Read a buffer back to CPU. The destination must be at least
+    // `bytes` long. Returns true on success. Mirrors ReadbackTexture's
+    // contract: synchronous, may stall the GPU, intended for screenshot
+    // / debug paths only. Used today by the `screenshot` command to
+    // pull `exposure_state[0]` so the host-side tonemap applies the
+    // same exposure scalar the GPU paths use.
+    virtual bool ReadbackBuffer(BufferHandle, void* /*dst*/, std::size_t /*bytes*/) {
+        return false;
+    }
+
     // Capability + introspection.
     virtual BackendType  Type()             const = 0;
     virtual bool         SupportsHardwareRT() const = 0;

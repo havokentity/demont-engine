@@ -1596,6 +1596,97 @@ bool VulkanDevice::ReadbackTexture(TextureHandle h, void* dst, std::size_t dst_s
     return true;
 }
 
+bool VulkanDevice::ReadbackBuffer(BufferHandle h, void* dst, std::size_t bytes) {
+    if (dst == nullptr || bytes == 0 || device_ == VK_NULL_HANDLE) return false;
+
+    VkBuffer src = VK_NULL_HANDLE;
+    {
+        std::lock_guard lock(resource_mutex_);
+        auto it = buffers_.find(h.id);
+        if (it == buffers_.end()) return false;
+        src = it->second.buffer;
+    }
+    if (src == VK_NULL_HANDLE) return false;
+
+    // One-shot synchronous readback, mirrors ReadbackTexture's pattern.
+    // Engine storage buffers are DEVICE_LOCAL only -- copy through a
+    // host-visible staging buffer to read.
+    BufferEntry staging{};
+    if (!CreateBufferImpl(bytes,
+                          VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                            | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                          staging,
+                          /*persistent_map=*/true)) {
+        return false;
+    }
+
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    {
+        VkCommandBufferAllocateInfo ai{};
+        ai.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        ai.commandPool        = cmd_pool_;
+        ai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(device_, &ai, &cb) != VK_SUCCESS) {
+            DestroyBufferImpl(staging);
+            return false;
+        }
+    }
+
+    VkFence fence = VK_NULL_HANDLE;
+    {
+        VkFenceCreateInfo fci{};
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (vkCreateFence(device_, &fci, nullptr, &fence) != VK_SUCCESS) {
+            vkFreeCommandBuffers(device_, cmd_pool_, 1, &cb);
+            DestroyBufferImpl(staging);
+            return false;
+        }
+    }
+
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    vkBeginCommandBuffer(cb, &bi);
+
+    // Wait for prior shader writes (e.g. AutoExposure.slang updating
+    // exposure_state) to be visible to TRANSFER_READ.
+    VkBufferMemoryBarrier bmb{};
+    bmb.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    bmb.srcAccessMask       = VK_ACCESS_SHADER_WRITE_BIT;
+    bmb.dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT;
+    bmb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bmb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bmb.buffer              = src;
+    bmb.offset              = 0;
+    bmb.size                = bytes;
+    vkCmdPipelineBarrier(cb,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 1, &bmb, 0, nullptr);
+
+    VkBufferCopy region{};
+    region.size = bytes;
+    vkCmdCopyBuffer(cb, src, staging.buffer, 1, &region);
+
+    vkEndCommandBuffer(cb);
+
+    VkSubmitInfo si{};
+    si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers    = &cb;
+    bool ok = (vkQueueSubmit(graphics_queue_, 1, &si, fence) == VK_SUCCESS);
+    if (ok) {
+        vkWaitForFences(device_, 1, &fence, VK_TRUE, UINT64_MAX);
+        std::memcpy(dst, staging.mapped, bytes);
+    }
+
+    vkDestroyFence(device_, fence, nullptr);
+    vkFreeCommandBuffers(device_, cmd_pool_, 1, &cb);
+    DestroyBufferImpl(staging);
+    return ok;
+}
+
 void VulkanDevice::DestroyTexture(TextureHandle h) {
     if (h.id == 0 || h.id == kSwapchainTextureId) return;
     std::lock_guard lock(resource_mutex_);

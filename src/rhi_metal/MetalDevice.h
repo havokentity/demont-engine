@@ -128,6 +128,7 @@ public:
 
     bool ReadbackTexture(TextureHandle h, void* dst, std::size_t dst_size,
                          std::uint32_t* out_w, std::uint32_t* out_h) override;
+    bool ReadbackBuffer (BufferHandle  h, void* dst, std::size_t bytes) override;
 
     // ---- Internal lookup ------------------------------------------------
     MTL::ComputePipelineState* LookupPipeline(PipelineHandle h);

@@ -2412,12 +2412,42 @@ void Engine::RegisterCommands() {
                 return;
             }
 
+            // Pull the live exposure scalar from the GPU-resident
+            // exposure_state buffer so the host-side ACES tonemap below
+            // matches what the GPU paths render on screen (PathTrace's
+            // inline tonemap on Vulkan, Tonemap.slang post-pass on
+            // Metal -- both multiply by exposure_state[0]).  Without
+            // this the PPM has no exposure applied and only matches
+            // the screen when the scalar happens to be exactly 1.0.
+            // Falls back to the r_exposure cvar if the readback isn't
+            // implemented (e.g. software backend).  Auto-expose mode
+            // tracks the GPU value live; manual mode reads back the
+            // value the engine wrote, which is exactly r_exposure.
+            float screenshot_exposure = 1.0f;
+            if (target == "accum" || target == "denoise_color") {
+                bool got = false;
+                if (exposure_state_id_ != 0) {
+                    float v = 1.0f;
+                    if (device_->ReadbackBuffer(pt::rhi::BufferHandle{exposure_state_id_},
+                                                &v, sizeof(float))) {
+                        screenshot_exposure = v;
+                        got = true;
+                    }
+                }
+                if (!got) {
+                    auto& Cx = pt::console::Console::Get();
+                    if (auto* ev = Cx.FindCVar("r_exposure"))
+                        screenshot_exposure = ev->GetFloat();
+                }
+            }
+
             // Convert to 8-bit RGB. ACES tonemap for HDR; depth gets a
             // grayscale ramp (0=black, 1=white); motion encodes (R = +x
             // mapped to [0..1], G = +y mapped, B=0) so directionality
             // is visible. Half-float decode is a portable IEEE 754
             // binary16 unpack (see lambda below) -- works on MSVC too.
-            auto tonemap = [](float c) -> std::uint8_t {
+            auto tonemap = [exp = screenshot_exposure](float c) -> std::uint8_t {
+                c *= exp;
                 const float a = 2.51f, b = 0.03f, d = 2.43f, e = 0.59f, f = 0.14f;
                 float x = (c * (a * c + b)) / (c * (d * c + e) + f);
                 if (x < 0.0f) x = 0.0f;
