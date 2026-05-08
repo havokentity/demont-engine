@@ -2330,6 +2330,25 @@ void Engine::Tick(double dt) {
             C.SetCVarOverride("r_sky_hour", std::to_string(hour));
             accum_dirty_ = true;
         }
+
+        // Cloud wind drift uses `frame_index_ * (1/60)` as time-seconds
+        // in the path tracer's cloud field (see RenderFrame), so the
+        // cloud pattern advances every frame whenever wind is non-zero.
+        // Without dirtying the accumulator, samples taken across many
+        // frames at different cloud positions get averaged into
+        // accum_hdr -> visible "stretched / smeared clouds" after the
+        // engine sits idle for a while; mouse motion fixes it because
+        // the camera-move dirty flag resets the accumulator.  Mirror
+        // the sky_animate path: when clouds are on AND wind is set,
+        // mark dirty every tick so accumulation resets per frame.
+        bool clouds_on = false;
+        if (auto* v = C.FindCVar("r_clouds")) clouds_on = v->GetBool();
+        if (clouds_on) {
+            float wx = 0.0f, wz = 0.0f;
+            if (auto* v = C.FindCVar("r_clouds_wind_x")) wx = v->GetFloat();
+            if (auto* v = C.FindCVar("r_clouds_wind_z")) wz = v->GetFloat();
+            if (wx != 0.0f || wz != 0.0f) accum_dirty_ = true;
+        }
     }
 
     auto t0 = std::chrono::steady_clock::now();
