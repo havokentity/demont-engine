@@ -1327,41 +1327,15 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         }
                     }
                 }
-                // Moon NEE. Env-map importance sampling will mostly
-                // pick the bright sun pixel during the day; at night
-                // the env-map pixel for the moon is dim (HDRIs rarely
-                // include the moon at full intensity), so we add an
-                // explicit moon NEE to ensure scenes are lit at night.
-                if (moon_dir_phase.y > 0.0) {
-                    float phase_b = 0.5 * (1.0 - cos(moon_dir_phase.w));
-                    if (phase_b > 0.01) {
-                        float3 moon_jit = sampleSunDisc(moon_dir_phase.xyz, seed);
-                        float ndl = max(0.0, dot(nf, moon_jit));
-                        if (ndl > 0.0) {
-                            float3 t_m = transmittance(hit_pt + nf * 1e-3, moon_jit, 1e30);
-                            if (any(t_m > float3(0.0))) {
-                                // Atmospheric attenuation + warmth at low
-                                // moon altitude, mirroring sun radiance.
-                                float m_elev = max(moon_dir_phase.y, 0.04);
-                                float m_am = 1.0 / m_elev;
-                                float m_atm = exp(-0.30 * m_am);
-                                float m_warmth = saturate((m_am - 1.0) * 0.18);
-                                float3 m_col = lerp(float3(0.92, 0.94, 1.00),
-                                                    float3(1.20, 0.65, 0.40),
-                                                    m_warmth);
-                                // 0.3x of sun (was 0.8) -- night feels
-                                // genuinely dim. Auto-exposure still
-                                // amplifies for visibility, but the
-                                // ground / clouds stay readably night
-                                // (~1/3 of daylight luminance) instead
-                                // of looking like a slightly cool day.
-                                float3 moon_rad = m_col * (0.3 * phase_b * m_atm);
-                                float3 brdf = h.albedo / 3.14159265358979;
-                                radiance += throughput * moon_rad * t_m * brdf * ndl;
-                            }
-                        }
-                    }
-                }
+                // No procedural moon NEE in HDRI mode: the HDRI is the
+                // canonical sky source, and adding moon_dir_phase-driven
+                // light here would re-introduce time-of-day dependence
+                // that contradicts the HDRI's own moonlight (or lack of
+                // it). If the chosen HDRI doesn't include a moon at
+                // night, the scene reads dim -- that's the HDRI being
+                // incomplete, not a missing engine feature. Pick an
+                // HDRI with the moon baked in or switch r_sky_mode to
+                // procedural.
                 // Diffuse skylight ambient via cosine-weighted hemisphere
                 // sample. Previous version sampled skyColor() at the
                 // surface normal exactly -- a single-direction shortcut
@@ -1586,8 +1560,16 @@ void main(uint2 tid : SV_DispatchThreadID) {
             const float kHrayleigh = 8000.0;
             const float kPi = 3.14159265358979;
             float rayleigh_int = clouds_p3.w;   // 0 disables, 1 = real
-            bool march_mie = vol_params.x > 0.0;
-            bool march_ray = rayleigh_int > 0.0;
+            // Atmospheric Mie + Rayleigh march is disabled in HDRI mode:
+            // the HDRI has the atmosphere baked into its sky pixels, so
+            // adding procedural in-scatter on top double-counts (the
+            // sky's blue tint comes from the HDRI directly) and would
+            // follow the engine sun_dir rather than the HDRI's actual
+            // sun. God rays / sunset haze in HDRI mode are a future
+            // feature that would need to anchor on the extracted-sun
+            // direction.
+            bool march_mie = (vol_params.x > 0.0) && (env_map_present == 0u);
+            bool march_ray = (rayleigh_int > 0.0) && (env_map_present == 0u);
             if (march_mie || march_ray) {
                 float  sigma_0 = vol_params.x;
                 float  t_far   = min(primary_t, 60000.0);
