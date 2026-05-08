@@ -149,7 +149,7 @@ int LinesForLevel(int level) {
 
     if (self.level >= 2) {
         double mem_mb = (double)s.gpu_bytes / (1024.0 * 1024.0);
-        drawRow(t.dim, [NSString stringWithFormat:@"backend     %s",   s.backend ?: ""]);
+        drawRow(t.dim, [NSString stringWithFormat:@"backend     %s",   s.backend ? s.backend : ""]);
         drawRow(t.dim, [NSString stringWithFormat:@"resolution  %dx%d", s.width, s.height]);
         drawRow(t.dim, [NSString stringWithFormat:@"gpu memory  %.1f MB", mem_mb]);
         drawRow(t.dim, [NSString stringWithFormat:@"spp         %d",   s.spp]);

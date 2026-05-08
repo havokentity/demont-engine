@@ -923,8 +923,9 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     NSString* typed = self.inputField.stringValue;
     NSString* tail  = [match substringFromIndex:self.ghostPrefix.length];
 
-    NSFont* font = self.inputField.font ?: [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightRegular];
-    NSColor* dim = self.palette.info ?: [NSColor grayColor];
+    NSFont* defaultFont = [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightRegular];
+    NSFont* font = self.inputField.font ? self.inputField.font : defaultFont;
+    NSColor* dim = self.palette.info ? self.palette.info : [NSColor grayColor];
     NSMutableAttributedString* s = [[NSMutableAttributedString alloc] init];
     // Transparent run mirrors typed text width so the visible tail
     // lines up just past the cursor.
@@ -945,7 +946,8 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
         // reads as commentary rather than another committable token.
         NSFontDescriptor* fd = [font.fontDescriptor
             fontDescriptorWithSymbolicTraits:NSFontDescriptorTraitItalic];
-        NSFont* italic = [NSFont fontWithDescriptor:fd size:font.pointSize] ?: font;
+        NSFont* italicCandidate = [NSFont fontWithDescriptor:fd size:font.pointSize];
+        NSFont* italic = italicCandidate ? italicCandidate : font;
         [s appendAttributedString:[[NSAttributedString alloc] initWithString:self.ghostAnnotation
             attributes:@{
                 NSFontAttributeName: italic,
