@@ -205,10 +205,33 @@ cbuffer Frame {
 // samples × 1080p = ~6 GFLOP/frame on the worst march, well under
 // budget on M4 Max.
 
+// Integer mixing hash (Wellons' Lowbias32 -- 3 multiplies + 3 xorshifts,
+// near-perfect avalanche on every input bit).  The previous
+// frac(p * 0.3183099 + 0.1) scaled-frac trick had two structural flaws
+// that produced visible patches/seams in the cloud body:
+//   1. Output biased toward extremes (the product p.x*p.y*p.z*(sum)
+//      collapses near zero whenever any component is small).
+//   2. Adjacent integer grid cells produce CORRELATED outputs because
+//      the multiplied frac() is similar for similar inputs -- visible
+//      as low-frequency "patches" even at small p magnitudes.
+// Lowbias32 + uint cast on integer-floored input fixes both.
+uint cloud_hash_u32(uint x) {
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
 float cloud_hash(float3 p) {
-    p = frac(p * 0.3183099 + 0.1);
-    p *= 17.0;
-    return frac(p.x * p.y * p.z * (p.x + p.y + p.z));
+    // Caller (cloud_value_noise) always passes already-floored float
+    // values; int cast is exact.  Two's-complement wrap on negatives
+    // is well-defined and the hash treats it as just another bit
+    // pattern, so world-space coords below origin still produce
+    // decorrelated cells.
+    int3 ip = int3(p);
+    uint h = cloud_hash_u32(uint(ip.x));
+    h = cloud_hash_u32(h ^ uint(ip.y));
+    h = cloud_hash_u32(h ^ uint(ip.z));
+    return float(h & 0x00FFFFFFu) * (1.0 / 16777216.0);
 }
 
 float cloud_value_noise(float3 p) {
