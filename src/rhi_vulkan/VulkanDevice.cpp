@@ -815,45 +815,59 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         }
     }
 
-    // ---- Persistent pipeline cache -----------------------------------
-    // Loaded before pipeline creation so vkCreateComputePipelines can
-    // hit precompiled bytecode. First launch is still slow (cache is
-    // empty), but every subsequent launch is near-instant. Failures
-    // (no file, corrupt header, driver-version-mismatch) just leave
-    // the cache empty -- the driver rebuilds on demand.
-    LoadPipelineCache();
+    // ---- Async pipeline build ----------------------------------------
+    // The path-tracer pipeline can take 1-3s on a cold pipeline cache;
+    // running that synchronously on the main thread blocks the window
+    // from appearing.  Move the load+build sequence to a worker that
+    // runs in parallel with RecreateSwapchain + the engine's first
+    // frames.  vkCreateComputePipelines is thread-safe with respect
+    // to the device; pipelines_/named_pipelines_ writes go through
+    // resource_mutex_ which the lookup paths already take.
+    //
+    // While the worker is in flight, named_pipelines_.find() returns
+    // empty and CreateComputePipeline-by-name hands back id=0.  The
+    // engine's RenderFrame skips dispatches with id=0 and re-resolves
+    // its cached ids each frame via Engine::EnsurePipelineHandles(),
+    // so as soon as a pipeline lands in named_pipelines_ the engine
+    // picks it up on the next frame.
+    pipeline_build_thread_ = std::thread([this]() {
+        // Pipeline cache load + creation also moved to the worker so
+        // the pipeline_cache_ handle isn't half-initialised when the
+        // first vkCreateComputePipelines runs against it.
+        LoadPipelineCache();
 
-    // ---- Build the path-trace pipeline -------------------------------
-    auto build_pipeline = [&](const char* name,
-                              const unsigned char* spirv,
-                              std::size_t          spirv_size) {
-        auto mod = MakeShaderModule(device_, spirv, spirv_size);
-        if (mod == VK_NULL_HANDLE) return;
-        VkPipelineShaderStageCreateInfo stage{};
-        stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = mod;
-        stage.pName  = "main";
-        VkComputePipelineCreateInfo cpci2{};
-        cpci2.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        cpci2.layout = shared_pipe_layout_;
-        cpci2.stage  = stage;
-        VkPipeline pipe = VK_NULL_HANDLE;
-        if (vkCreateComputePipelines(device_, pipeline_cache_, 1, &cpci2,
-                                     nullptr, &pipe) == VK_SUCCESS) {
-            std::lock_guard lock(resource_mutex_);
-            auto id = next_id_++;
-            pipelines_.emplace(id, PipelineEntry{pipe});
-            named_pipelines_.emplace(name, id);
-        } else {
-            LOG_ERROR("vkCreateComputePipelines({}) failed", name);
-        }
-        vkDestroyShaderModule(device_, mod, nullptr);
-    };
+        auto build_pipeline = [&](const char* name,
+                                  const unsigned char* spirv,
+                                  std::size_t          spirv_size) {
+            auto mod = MakeShaderModule(device_, spirv, spirv_size);
+            if (mod == VK_NULL_HANDLE) return;
+            VkPipelineShaderStageCreateInfo stage{};
+            stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+            stage.module = mod;
+            stage.pName  = "main";
+            VkComputePipelineCreateInfo cpci2{};
+            cpci2.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+            cpci2.layout = shared_pipe_layout_;
+            cpci2.stage  = stage;
+            VkPipeline pipe = VK_NULL_HANDLE;
+            if (vkCreateComputePipelines(device_, pipeline_cache_, 1, &cpci2,
+                                         nullptr, &pipe) == VK_SUCCESS) {
+                std::lock_guard lock(resource_mutex_);
+                auto id = next_id_++;
+                pipelines_.emplace(id, PipelineEntry{pipe});
+                named_pipelines_.emplace(name, id);
+            } else {
+                LOG_ERROR("vkCreateComputePipelines({}) failed", name);
+            }
+            vkDestroyShaderModule(device_, mod, nullptr);
+        };
 
-    build_pipeline("pathtrace",   shader_PathTrace_spirv_data,    shader_PathTrace_spirv_size);
-    build_pipeline("autoexpose",  shader_AutoExposure_spirv_data, shader_AutoExposure_spirv_size);
-    build_pipeline("perfoverlay", shader_PerfOverlay_spirv_data,  shader_PerfOverlay_spirv_size);
+        build_pipeline("pathtrace",   shader_PathTrace_spirv_data,    shader_PathTrace_spirv_size);
+        build_pipeline("autoexpose",  shader_AutoExposure_spirv_data, shader_AutoExposure_spirv_size);
+        build_pipeline("perfoverlay", shader_PerfOverlay_spirv_data,  shader_PerfOverlay_spirv_size);
+        pipelines_ready_.store(true, std::memory_order_release);
+    });
 
     if (!RecreateSwapchain()) return;
 
@@ -865,6 +879,14 @@ VulkanDevice::~VulkanDevice() {
 }
 
 void VulkanDevice::DestroyDevice() {
+    // Join the async pipeline build worker before touching anything
+    // device-related. The worker mutates pipelines_/named_pipelines_
+    // and reads pipeline_cache_, so we need it stopped before we
+    // destroy any of those.  Safe even if the worker is never
+    // started (default-constructed std::thread is not joinable).
+    if (pipeline_build_thread_.joinable()) {
+        pipeline_build_thread_.join();
+    }
     if (device_ != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(device_);
         for (auto v : swap_views_) if (v) vkDestroyImageView(device_, v, nullptr);

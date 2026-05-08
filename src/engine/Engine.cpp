@@ -567,46 +567,13 @@ void Engine::RequestBackendSwitch(BackendType to) {
     pt::console::Console::Get().SetCVarOverride(
         "sys_gpu_hwrt", device_->SupportsHardwareRT() ? "1" : "0");
 
-    // Two compute kernels: the path tracer ("pathtrace") and the
-    // post-denoise tonemap ("tonemap"). Both are pre-built at backend
-    // init in MetalDevice; CreateComputePipeline just looks them up
-    // by name and hands back a handle.
-    {
-        pt::rhi::ComputePipelineDesc desc{
-            .kernel_name = "pathtrace", .bytecode = {}, .debug_name = "pathtrace",
-        };
-        pathtrace_pipeline_id_ = device_->CreateComputePipeline(desc).id;
-    }
-    {
-        pt::rhi::ComputePipelineDesc desc{
-            .kernel_name = "tonemap", .bytecode = {}, .debug_name = "tonemap",
-        };
-        tonemap_pipeline_id_ = device_->CreateComputePipeline(desc).id;
-    }
-    {
-        pt::rhi::ComputePipelineDesc desc{
-            .kernel_name = "bloom_down", .bytecode = {}, .debug_name = "bloom_down",
-        };
-        bloom_down_pipeline_id_ = device_->CreateComputePipeline(desc).id;
-    }
-    {
-        pt::rhi::ComputePipelineDesc desc{
-            .kernel_name = "bloom_up", .bytecode = {}, .debug_name = "bloom_up",
-        };
-        bloom_up_pipeline_id_ = device_->CreateComputePipeline(desc).id;
-    }
-    {
-        pt::rhi::ComputePipelineDesc desc{
-            .kernel_name = "autoexpose", .bytecode = {}, .debug_name = "autoexpose",
-        };
-        autoexpose_pipeline_id_ = device_->CreateComputePipeline(desc).id;
-    }
-    {
-        pt::rhi::ComputePipelineDesc desc{
-            .kernel_name = "perfoverlay", .bytecode = {}, .debug_name = "perfoverlay",
-        };
-        perfoverlay_pipeline_id_ = device_->CreateComputePipeline(desc).id;
-    }
+    // Compute kernels are looked up by name from the active device's
+    // pre-built pipeline table. EnsurePipelineHandles fills the cached
+    // ids; on Metal those resolve immediately, on Vulkan they may
+    // resolve to 0 here while the async pipeline-build worker is
+    // still in flight, in which case RenderFrame keeps re-resolving
+    // each frame until they flip non-zero.
+    EnsurePipelineHandles();
 
     // GPU-resident exposure scalar (1 float). AutoExposure.slang
     // updates this each tick when r_auto_exposure=1; engine writes the
@@ -1341,7 +1308,30 @@ void Engine::EnsurePrimitivesUploaded() {
     accum_dirty_      = true;
 }
 
+void Engine::EnsurePipelineHandles() {
+    if (!device_) return;
+    auto resolve = [&](std::uint64_t& cached, const char* name) {
+        if (cached != 0) return;
+        pt::rhi::ComputePipelineDesc desc{
+            .kernel_name = name,
+            .bytecode    = {},
+            .debug_name  = name,
+        };
+        cached = device_->CreateComputePipeline(desc).id;
+    };
+    resolve(pathtrace_pipeline_id_,    "pathtrace");
+    resolve(tonemap_pipeline_id_,      "tonemap");
+    resolve(bloom_down_pipeline_id_,   "bloom_down");
+    resolve(bloom_up_pipeline_id_,     "bloom_up");
+    resolve(autoexpose_pipeline_id_,   "autoexpose");
+    resolve(perfoverlay_pipeline_id_,  "perfoverlay");
+}
+
 void Engine::RenderFrame() {
+    // Pipelines may still be building on the Vulkan backend's async
+    // worker; re-resolve cached ids each frame until each flips
+    // non-zero. Once all are cached the resolves are no-ops.
+    EnsurePipelineHandles();
     if (!device_ || pathtrace_pipeline_id_ == 0) return;
 
     EnsureMeshUpdated();

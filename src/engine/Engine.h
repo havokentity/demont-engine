@@ -98,6 +98,15 @@ private:
     void EnsureStarMapUploaded();
     void EnsureMoonMapUploaded();
 
+    // Lazy pipeline-id (re-)resolution. The Vulkan backend builds its
+    // compute pipelines on a worker thread so the window can come up
+    // immediately, which means CreateComputePipeline-by-name returns
+    // id=0 for any kernel still under construction. We re-resolve
+    // every frame until each cached id flips non-zero, then the
+    // resolve becomes a single uint compare per pipeline (no mutex,
+    // no map lookup).  Idempotent: safe to call from RenderFrame.
+    void EnsurePipelineHandles();
+
     // Replace the current mesh-path resources (vertex/index buffers,
     // BLAS, TLAS) with one built from `baked`. Called from EnsureMesh*
     // on the main thread once a worker bake has completed.

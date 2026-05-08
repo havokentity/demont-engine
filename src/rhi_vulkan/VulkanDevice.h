@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -196,6 +197,24 @@ private:
     void LoadPipelineCache();
     void SavePipelineCache();
     static std::string PipelineCachePath();
+
+    // Async pipeline build. The path-tracer pipeline can take
+    // 1-3s on a cold pipeline cache; running that on the main thread
+    // freezes the window during init.  Move it to a worker that runs
+    // alongside the main thread's swapchain setup and first frames.
+    // While the worker is in flight:
+    //   - named_pipelines_ is empty for any kernel still being built,
+    //     so CreateComputePipeline-by-name returns id=0.
+    //   - The engine treats id=0 as "no-op dispatch" so RenderFrame
+    //     skips the path-trace work cleanly each frame.
+    //   - The engine re-resolves cached pipeline ids each frame via
+    //     EnsurePipelineHandles() until all return non-zero.
+    // Vulkan permits vkCreateComputePipelines in parallel with queue
+    // submission on the same device; pipelines_/named_pipelines_
+    // mutations are already serialised through resource_mutex_, which
+    // LookupPipeline + CreateComputePipeline-by-name also take.
+    std::thread           pipeline_build_thread_;
+    std::atomic<bool>     pipelines_ready_{false};
 
     VkDescriptorPool dpool_ = VK_NULL_HANDLE;
     VkDescriptorSet  dsets_[kFramesInFlight] {};
