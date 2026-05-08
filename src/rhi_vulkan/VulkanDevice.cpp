@@ -20,10 +20,12 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <string>
 #include <vector>
 
 extern "C" {
@@ -885,11 +887,19 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // Pipeline cache load + creation also moved to the worker so
         // the pipeline_cache_ handle isn't half-initialised when the
         // first vkCreateComputePipelines runs against it.
+        const auto t_start = std::chrono::steady_clock::now();
         LoadPipelineCache();
 
+        // Per-pipeline timing surfaces cold/warm cache effectiveness
+        // and lets us see at a glance which kernel is the long pole
+        // (PathTrace today, by an order of magnitude).
+        struct PipeBuild { const char* name; double ms; };
+        std::vector<PipeBuild> timings;
+        timings.reserve(3);
         auto build_pipeline = [&](const char* name,
                                   const unsigned char* spirv,
                                   std::size_t          spirv_size) {
+            const auto t0 = std::chrono::steady_clock::now();
             auto mod = MakeShaderModule(device_, spirv, spirv_size);
             if (mod == VK_NULL_HANDLE) return;
             VkPipelineShaderStageCreateInfo stage{};
@@ -912,12 +922,27 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
                 LOG_ERROR("vkCreateComputePipelines({}) failed", name);
             }
             vkDestroyShaderModule(device_, mod, nullptr);
+            const auto t1 = std::chrono::steady_clock::now();
+            timings.push_back({
+                name,
+                std::chrono::duration<double, std::milli>(t1 - t0).count()
+            });
         };
 
         build_pipeline("pathtrace",   shader_PathTrace_spirv_data,    shader_PathTrace_spirv_size);
         build_pipeline("autoexpose",  shader_AutoExposure_spirv_data, shader_AutoExposure_spirv_size);
         build_pipeline("perfoverlay", shader_PerfOverlay_spirv_data,  shader_PerfOverlay_spirv_size);
         pipelines_ready_.store(true, std::memory_order_release);
+
+        const double total_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_start).count();
+        std::string per_pipe;
+        for (const auto& p : timings) {
+            if (!per_pipe.empty()) per_pipe += ", ";
+            per_pipe += fmt::format("{} {:.0f}ms", p.name, p.ms);
+        }
+        LOG_INFO("Vulkan: async pipeline build done in {:.0f}ms ({})",
+                 total_ms, per_pipe);
     });
 
     if (!RecreateSwapchain()) return;
