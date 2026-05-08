@@ -286,6 +286,7 @@ PerfOverlay::PerfOverlay() {
 PerfOverlay::~PerfOverlay() {
     if (opaque_) {
         PtPerfPanel* p = (__bridge_transfer PtPerfPanel*)opaque_;
+        [p.parentRenderWindow removeChildWindow:p];
         [p orderOut:nil];
         p = nil;
         opaque_ = nullptr;
@@ -301,8 +302,17 @@ bool PerfOverlay::Init(void* ns_window) {
         // Replace any prior instance (Init shouldn't normally be
         // called twice, but be defensive).
         PtPerfPanel* prev = (__bridge_transfer PtPerfPanel*)opaque_;
+        [prev.parentRenderWindow removeChildWindow:prev];
         [prev orderOut:nil];
     }
+    // Anchor the panel as a child window of the engine's NSWindow so it
+    // stays z-ordered above the render window even after the user clicks
+    // back into the main window. Without this, NSStatusWindowLevel alone
+    // is not enough -- macOS reorders all of the app's non-child windows
+    // when one of them becomes key, and the panel slides behind. Child
+    // windows are pinned above their parent regardless of focus changes.
+    // Same pattern as ConsoleOverlay.mm.
+    [parent addChildWindow:panel ordered:NSWindowAbove];
     opaque_ = (__bridge_retained void*)panel;
     return true;
 }
@@ -310,6 +320,7 @@ bool PerfOverlay::Init(void* ns_window) {
 void PerfOverlay::Shutdown() {
     if (!opaque_) return;
     PtPerfPanel* p = (__bridge_transfer PtPerfPanel*)opaque_;
+    [p.parentRenderWindow removeChildWindow:p];
     [p orderOut:nil];
     opaque_ = nullptr;
 }
