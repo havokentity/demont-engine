@@ -376,7 +376,13 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 float sun_off = saturate(length(sun_uv - 0.5) * 4.0);
                 c += flare_intensity * flare * fade * vis * sun_off;
             }
-            float3 ldr_phys = (passthrough != 0u) ? c : PT_SRGB_ENCODE(acesTonemap(c * exposure_state[0]));
+            // Passthrough path still needs sRGB OETF on SPIR-V swapchains
+            // (BGRA8_UNORM) -- without it the linear LDR `c` reaches the
+            // surface unencoded and the OS's EOTF interprets it too dark.
+            // On Metal PT_SRGB_ENCODE is identity; the swapchain is sRGB-
+            // formatted and Apple silicon auto-encodes on store.
+            float3 ldr_phys = PT_SRGB_ENCODE(
+                (passthrough != 0u) ? c : acesTonemap(c * exposure_state[0]));
             ldr_out[tid.xy] = float4(ldr_phys, 1.0);
             return;
         }
@@ -436,7 +442,8 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 }
                 c += flare_intensity * flare;
             }
-            float3 ldr_sun = (passthrough != 0u) ? c : PT_SRGB_ENCODE(acesTonemap(c * exposure_state[0]));
+            float3 ldr_sun = PT_SRGB_ENCODE(
+                (passthrough != 0u) ? c : acesTonemap(c * exposure_state[0]));
             ldr_out[tid.xy] = float4(ldr_sun, 1.0);
             return;
         }
@@ -572,6 +579,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
             return;
         }
     }
-    float3 ldr = (passthrough != 0u) ? c : PT_SRGB_ENCODE(acesTonemap(c * exposure_state[0]));
+    float3 ldr = PT_SRGB_ENCODE(
+        (passthrough != 0u) ? c : acesTonemap(c * exposure_state[0]));
     ldr_out[tid.xy] = float4(ldr, 1.0);
 }

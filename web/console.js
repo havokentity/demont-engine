@@ -1054,7 +1054,12 @@
     // track viewport width (re-evaluated each drag tick).
     const maxNow = () => (typeof maxPx === 'function') ? maxPx() : maxPx;
     const clamp  = (w) => Math.max(minPx, Math.min(maxNow(), w));
-    const stored = clamp(parseInt(localStorage.getItem(storageKey) || defaultPx, 10));
+    // localStorage may hold a non-numeric / corrupted value -- parseInt
+    // returns NaN and clamp(NaN) propagates NaN, ending up as `NaNpx`
+    // on the CSS variable and breaking the layout. Validate and fall
+    // back to defaultPx when the parse yields a non-finite number.
+    const rawStored = parseInt(localStorage.getItem(storageKey) || defaultPx, 10);
+    const stored = clamp(Number.isFinite(rawStored) ? rawStored : defaultPx);
     document.documentElement.style.setProperty(cssVar, stored + 'px');
 
     let dragging = false;

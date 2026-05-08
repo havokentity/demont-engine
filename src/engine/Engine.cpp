@@ -609,7 +609,17 @@ void Engine::RequestBackendSwitch(BackendType to) {
             .debug_name = "exposure_state",
         });
         exposure_state_id_ = buf.id;
-        if (exposure_state_id_ != 0) {
+        if (exposure_state_id_ == 0) {
+            // exposure_state is required by PathTrace.slang (and
+            // Tonemap.slang in the Metal denoiser path) -- they read
+            // exposure_state[0] unconditionally. With it unallocated,
+            // the binds at slot 6 are silently skipped and the kernels
+            // either read the wrong slot or read garbage (especially
+            // on Metal where there's no nullDescriptor safety). Log
+            // and continue; further diagnosis would surface as black /
+            // wrong-exposure output rather than a silent failure.
+            LOG_ERROR("exposure_state buffer creation failed -- auto / manual exposure will misbehave");
+        } else {
             float init_exposure = 1.0f;
             auto& Cx = pt::console::Console::Get();
             bool auto_exp = true;
@@ -2255,11 +2265,23 @@ void Engine::RenderFrame() {
             constexpr std::uint32_t kPanelMargin = 12;
             std::uint32_t panel_h = (level >= 3) ? 90u : 28u;
             std::uint32_t panel_w = kPanelW;
-            if (panel_w + kPanelMargin > fc.width)  panel_w = fc.width - kPanelMargin;
-            if (panel_h + kPanelMargin > fc.height) panel_h = fc.height - kPanelMargin;
-            std::uint32_t panel_x = fc.width  - panel_w - kPanelMargin;
+            // Skip the overlay this frame if the swapchain is smaller
+            // than the margin -- unsigned subtraction would underflow
+            // to a huge value and produce wild panel coords / sizes.
+            // It's just a HUD; no harm in dropping it for a tiny window.
+            if (fc.width <= kPanelMargin || fc.height <= kPanelMargin) {
+                panel_w = panel_h = 0;
+            } else {
+                if (panel_w + kPanelMargin > fc.width)  panel_w = fc.width - kPanelMargin;
+                if (panel_h + kPanelMargin > fc.height) panel_h = fc.height - kPanelMargin;
+            }
+            std::uint32_t panel_x = (panel_w == 0u || panel_w + kPanelMargin > fc.width)
+                                  ? 0u : fc.width - panel_w - kPanelMargin;
             std::uint32_t panel_y = kPanelMargin;
 
+            if (panel_w == 0u || panel_h == 0u) {
+                // Window too small for the HUD -- skip the dispatch.
+            } else {
             // Build the draw list in panel-local coords.  Each command
             // is uint4: kind, x, y, payload.  Buffer was sized for
             // perfoverlay_drawlist_capacity_ entries; clamp.
@@ -2373,6 +2395,7 @@ void Engine::RenderFrame() {
             cb->BindBuffer(1, pt::rhi::BufferHandle{perfoverlay_drawlist_id_}, 0);
             cb->PushConstants(&pp, sizeof(pp));
             cb->Dispatch((panel_w + 7) / 8, (panel_h + 7) / 8, 1);
+            }   // panel_w/panel_h > 0 -- HUD dispatched
         }
     }
 
@@ -2518,11 +2541,20 @@ void Engine::Tick(double dt) {
 
     // Per-frame ring buffer for the tier-3 sparkline.  Sized for ~4
     // seconds of 60-fps history; the overlay subsamples down to its
-    // available pixel width when rendering.  Ring is resized lazily
-    // on first push so it doesn't allocate when the overlay is off.
-    if (perf_history_.empty()) perf_history_.assign(256, 0.0f);
-    perf_history_[perf_history_pos_] = static_cast<float>(frame_ms);
-    perf_history_pos_ = (perf_history_pos_ + 1) % perf_history_.size();
+    // available pixel width when rendering. Ring is resized lazily on
+    // first push when an overlay actually needs samples, so a session
+    // with the HUD disabled never allocates this buffer or runs the
+    // sample-write logic. Both native and rhi-mode paths feed off this
+    // ring, so gate on either being on.
+    bool perf_active = false;
+    if (auto* lv = pt::console::Console::Get().FindCVar("r_perf_overlay")) {
+        perf_active = lv->GetInt() > 0;
+    }
+    if (perf_active) {
+        if (perf_history_.empty()) perf_history_.assign(256, 0.0f);
+        perf_history_[perf_history_pos_] = static_cast<float>(frame_ms);
+        perf_history_pos_ = (perf_history_pos_ + 1) % perf_history_.size();
+    }
 
     // Aggregate at ~10 Hz so the network doesn't get spammed at
     // 240+ fps and the overlay's text doesn't visually flicker.
@@ -2928,12 +2960,24 @@ void Engine::RegisterCommands() {
                         f = sign << 31;  // signed zero
                     } else {
                         // Subnormal: renormalise into a regular float32.
+                        // Half subnormals have biased_exp = 0 and decode
+                        // to (-1)^s * 2^-14 * (mant / 2^10). Walk the
+                        // mantissa bits left until the implicit-1 lands
+                        // at bit 10 (0x400). Each shift represents a
+                        // factor of 2, lowering the effective exponent
+                        // by one. Final binary32 biased exponent =
+                        // 127 + (p - 24) where p is the original leading
+                        // bit position. With e = 1 + (10 - p) shifts,
+                        // p = 11 - e, so biased exp = 114 - e =
+                        // (127 - 15 - e + 2). The previous formula used
+                        // +1 instead of +2 and underestimated by one
+                        // exponent (subnormals decoded 2x too small).
                         std::uint32_t e = 1;
                         std::uint32_t m = mant;
                         while ((m & 0x400u) == 0) { m <<= 1; ++e; }
                         m &= 0x3FFu;
                         f = (sign << 31)
-                          | ((127u - 15u - e + 1u) << 23)
+                          | ((127u - 15u - e + 2u) << 23)
                           | (m << 13);
                     }
                 } else if (exp == 31) {

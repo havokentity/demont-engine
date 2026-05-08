@@ -162,12 +162,24 @@ ExecuteResult Console::Execute(std::string_view line) {
     if (line.empty()) return result;
     if (line.size() >= 2 && line[0] == '/' && line[1] == '/') return result;
     {
+        // Inline `#` comment stripping. Track quote state so a `#`
+        // inside a quoted string is treated as data, not a comment.
+        // Also handle backslash escaping so `\"` doesn't flip the
+        // quote state mid-string -- without this, an escaped quote
+        // in a quoted token would silently end the quote and a
+        // following `#` would chop the rest of the command off.
         bool in_quote = false;
+        bool escape   = false;
         std::size_t cut = line.size();
         for (std::size_t i = 0; i < line.size(); ++i) {
             char c = line[i];
-            if (c == '"') in_quote = !in_quote;
-            else if (c == '#' && !in_quote) { cut = i; break; }
+            if (escape) {
+                escape = false;
+                continue;
+            }
+            if (c == '\\') { escape = true; continue; }
+            if (c == '"')  { in_quote = !in_quote; continue; }
+            if (c == '#' && !in_quote) { cut = i; break; }
         }
         if (cut < line.size()) line = line.substr(0, cut);
     }
