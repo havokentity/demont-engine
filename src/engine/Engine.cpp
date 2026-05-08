@@ -1342,6 +1342,10 @@ void Engine::RenderFrame() {
         // sees a clean frame while the pipelines finish compiling.
         // Once the worker's done, EnsurePipelineHandles() flips the
         // cached ids non-zero and this branch stops firing.
+        if (!loading_frame_active_) {
+            LOG_INFO("engine: loading screen active (Vulkan pipeline build pending)");
+            loading_frame_active_ = true;
+        }
         auto fc = device_->BeginFrame();
         auto* cb = device_->AcquireCommandBuffer();
         if (cb) {
@@ -1351,6 +1355,10 @@ void Engine::RenderFrame() {
         }
         device_->EndFrame(cb);
         return;
+    }
+    if (loading_frame_active_) {
+        LOG_INFO("engine: pipelines ready, normal rendering resumed");
+        loading_frame_active_ = false;
     }
 
     EnsureMeshUpdated();

@@ -264,6 +264,14 @@ private:
     int                                         accum_w_               = 0;
     int                                         accum_h_               = 0;
     std::uint32_t                               frame_index_           = 0;
+
+    // Tracks whether the loading-frame branch in RenderFrame has
+    // ever fired (i.e. the Vulkan async pipeline build was still in
+    // flight when we hit our first frame). Used to log a single
+    // "loading screen active" message on entry and a single
+    // "pipelines ready" message on exit -- avoids a per-frame log
+    // spam during the 1-3s build window.
+    bool                                        loading_frame_active_  = false;
     bool                                        accum_dirty_           = true;
     BackendType                                 current_backend_       = BackendType::None;
     bool                                        mouse_look_active_     = false;
