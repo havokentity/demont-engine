@@ -161,6 +161,57 @@ void VulkanCommandBuffer::PushConstants(const void* data, std::size_t size) {
     push_size_ = size;
 }
 
+void VulkanCommandBuffer::ClearStorageTexture(TextureHandle t, const float rgba[4]) {
+    if (cb_ == VK_NULL_HANDLE) return;
+    VkImage img = device_->LookupImage(t);
+    if (img == VK_NULL_HANDLE) return;
+    VkImageSubresourceRange range{};
+    range.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+    range.baseMipLevel   = 0;
+    range.levelCount     = 1;
+    range.baseArrayLayer = 0;
+    range.layerCount     = 1;
+    // Transition UNDEFINED -> TRANSFER_DST_OPTIMAL. UNDEFINED is the
+    // safe pessimistic source -- caller's contract is "this image
+    // doesn't need its current contents preserved", which matches the
+    // loading-frame use case (just-acquired swapchain image).
+    VkImageMemoryBarrier b{};
+    b.sType                = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b.oldLayout            = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout            = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.image                = img;
+    b.subresourceRange     = range;
+    b.srcAccessMask        = 0;
+    b.dstAccessMask        = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.srcQueueFamilyIndex  = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex  = VK_QUEUE_FAMILY_IGNORED;
+    vkCmdPipelineBarrier(cb_,
+                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &b);
+    VkClearColorValue cv{};
+    cv.float32[0] = rgba[0];
+    cv.float32[1] = rgba[1];
+    cv.float32[2] = rgba[2];
+    cv.float32[3] = rgba[3];
+    vkCmdClearColorImage(cb_, img,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         &cv, 1, &range);
+    // Leave in GENERAL so subsequent shader dispatches in the same
+    // frame (e.g. if pipelines come ready mid-frame and the engine
+    // chooses to render on top) see the image in its standard
+    // storage-texture layout. EndFrame's transition to PRESENT_SRC
+    // takes over from there.
+    b.oldLayout      = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout      = VK_IMAGE_LAYOUT_GENERAL;
+    b.srcAccessMask  = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask  = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cb_,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &b);
+}
+
 void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
                                    std::uint32_t gz) {
     if (cb_ == VK_NULL_HANDLE || !bound_pipeline_) return;

@@ -1332,7 +1332,26 @@ void Engine::RenderFrame() {
     // worker; re-resolve cached ids each frame until each flips
     // non-zero. Once all are cached the resolves are no-ops.
     EnsurePipelineHandles();
-    if (!device_ || pathtrace_pipeline_id_ == 0) return;
+    if (!device_) return;
+    if (pathtrace_pipeline_id_ == 0) {
+        // Loading frame. Async pipeline build still in flight, so the
+        // path tracer / tonemap / overlay dispatches would all no-op
+        // and leave the swapchain image in its just-acquired
+        // UNDEFINED state -- visible as flickering / stale pixels.
+        // Issue a minimal clear to a defined dark colour so the user
+        // sees a clean frame while the pipelines finish compiling.
+        // Once the worker's done, EnsurePipelineHandles() flips the
+        // cached ids non-zero and this branch stops firing.
+        auto fc = device_->BeginFrame();
+        auto* cb = device_->AcquireCommandBuffer();
+        if (cb) {
+            constexpr float kLoadingFrameRgba[4] = { 0.05f, 0.06f, 0.08f, 1.0f };
+            cb->ClearStorageTexture(fc.swapchain_image, kLoadingFrameRgba);
+            device_->Submit(cb);
+        }
+        device_->EndFrame(cb);
+        return;
+    }
 
     EnsureMeshUpdated();
     EnsurePrimitivesUploaded();
