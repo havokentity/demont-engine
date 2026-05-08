@@ -81,11 +81,18 @@
   // match is shown after the cursor in dim colour. Subsequent Tabs
   // cycle (Shift+Tab back); Right-arrow at end / End commits;
   // Esc / typing dismisses.
-  let allNames = [];
-  let cvarMeta = {};   // name -> { allowed_values: [...] }
-  let ghostState = null;  // { matches: [...], index, before, prefix, isToken0 }
-  const ghostTyped = document.querySelector('#input-ghost .ghost-typed');
-  const ghostTail  = document.querySelector('#input-ghost .ghost-tail');
+  let allNames    = [];
+  let cvarMeta    = {};   // name -> { allowed_values, value, default_value, ... }
+  let commandMeta = {};   // name -> { default_args }
+  // ghostState shape:
+  //   { matches: [...], index, before, prefix, isToken0,
+  //     isMeta:    bool   -- matches = [current, default] of a free-form cvar
+  //     annotation: str   -- "default: X" / "current: Y" when isMeta
+  //   }
+  let ghostState = null;
+  const ghostTyped      = document.querySelector('#input-ghost .ghost-typed');
+  const ghostTail       = document.querySelector('#input-ghost .ghost-tail');
+  const ghostAnnotation = document.querySelector('#input-ghost .ghost-annotation');
 
   // ---------- helpers --------------------------------------------------------
   function escape(s) {
@@ -631,10 +638,20 @@
           slider_min:     v.slider_min,
           slider_max:     v.slider_max,
           slider_step:    v.slider_step,
+          value:          v.value,
+          default_value:  v.default,
         };
       }
     }
-    if (k && k.ok && k.commands) for (const v of k.commands) names.add(v.name);
+    commandMeta = {};
+    if (k && k.ok && k.commands) {
+      for (const v of k.commands) {
+        names.add(v.name);
+        commandMeta[v.name] = {
+          default_args: v.default_args || '',
+        };
+      }
+    }
     allNames = Array.from(names).sort();
   }
 
@@ -651,19 +668,37 @@
     return p;
   }
 
+  function refreshGhostAnnotation() {
+    if (!ghostState) return;
+    if (!ghostState.isMeta || ghostState.matches.length < 2) {
+      ghostState.annotation = '';
+      return;
+    }
+    // matches[0] = current value, matches[1] = default (per activateValueGhost).
+    if (ghostState.index === 0) {
+      ghostState.annotation = '  default: ' + ghostState.matches[1];
+    } else {
+      ghostState.annotation = '  current: ' + ghostState.matches[0];
+    }
+  }
   function renderGhost() {
     if (!ghostState) {
-      ghostTyped.textContent = '';
-      ghostTail.textContent  = '';
+      ghostTyped.textContent      = '';
+      ghostTail.textContent       = '';
+      ghostAnnotation.textContent = '';
       return;
     }
     const match = ghostState.matches[ghostState.index];
-    if (match.length > ghostState.prefix.length && match.startsWith(ghostState.prefix)) {
-      ghostTyped.textContent = input.value;
-      ghostTail.textContent  = match.slice(ghostState.prefix.length);
+    const fits  = match.length >= ghostState.prefix.length &&
+                  match.startsWith(ghostState.prefix);
+    if (fits) {
+      ghostTyped.textContent      = input.value;
+      ghostTail.textContent       = match.slice(ghostState.prefix.length);
+      ghostAnnotation.textContent = ghostState.annotation || '';
     } else {
-      ghostTyped.textContent = '';
-      ghostTail.textContent  = '';
+      ghostTyped.textContent      = '';
+      ghostTail.textContent       = '';
+      ghostAnnotation.textContent = '';
     }
   }
   function dismissGhost() {
@@ -671,18 +706,56 @@
     ghostState = null;
     renderGhost();
   }
+  function activateValueGhost(name) {
+    let matches = null;
+    let isMeta  = false;
+    const cv = cvarMeta[name];
+    const cmd = commandMeta[name];
+    if (cv) {
+      if (cv.allowed_values && cv.allowed_values.length > 0) {
+        matches = cv.allowed_values.slice();
+      } else if (cv.value !== undefined) {
+        matches = [String(cv.value)];
+        const dflt = cv.default_value;
+        if (dflt !== undefined && String(dflt) !== String(cv.value)) {
+          matches.push(String(dflt));
+          isMeta = true;
+        }
+      }
+    } else if (cmd && cmd.default_args) {
+      matches = [cmd.default_args];
+    }
+    if (!matches || matches.length === 0) return;
+    ghostState = {
+      matches,
+      index:    0,
+      before:   input.value,    // already ends with "<name> "
+      prefix:   '',
+      isToken0: false,
+      isMeta,
+      annotation: '',
+    };
+    refreshGhostAnnotation();
+    renderGhost();
+  }
   function commitGhost() {
     if (!ghostState) return;
-    const match = ghostState.matches[ghostState.index];
-    const tail  = ghostState.isToken0 ? match + ' ' : match;
-    input.value = ghostState.before + tail;
+    const committed = ghostState.matches[ghostState.index];
+    const wasToken0 = ghostState.isToken0;
+    const tail      = wasToken0 ? committed + ' ' : committed;
+    input.value     = ghostState.before + tail;
     input.setSelectionRange(input.value.length, input.value.length);
     dismissGhost();
+    // Token-0 commit just landed on a name -- if it's a cvar, chain
+    // into a value-position ghost so the user immediately sees the
+    // current (and default, when free-form) value.
+    if (wasToken0) activateValueGhost(committed);
   }
   function cycleGhost(dir) {
     if (!ghostState) return;
     const n = ghostState.matches.length;
     ghostState.index = ((ghostState.index + dir) % n + n) % n;
+    refreshGhostAnnotation();
     renderGhost();
   }
 
@@ -812,6 +885,14 @@
   });
 
   input.addEventListener('keydown', (e) => {
+    // Modifier keys alone must not dismiss the ghost -- pressing
+    // Shift fires keydown with e.key === 'Shift' before Tab arrives,
+    // and "any-other-key dismisses" below would have killed the
+    // ghost so Shift+Tab degenerated into a forward cycle.  Skip.
+    if (e.key === 'Shift' || e.key === 'Control' || e.key === 'Alt' ||
+        e.key === 'Meta'  || e.key === 'CapsLock') {
+      return;
+    }
     // Ghost-mode key handling.  Tab cycles, Shift+Tab cycles back,
     // Right-arrow at end / End commits, Esc dismisses, any other
     // key dismisses and falls through to normal handling.
@@ -855,6 +936,22 @@
   // moves away from end-of-line, so the suggestion is no longer
   // contextually meaningful).
   input.addEventListener('mousedown', () => { dismissGhost(); });
+
+  // Auto-activate the value-position ghost when the user types
+  // `<name> ` themselves (without going through Tab + Right).  Fires
+  // after every text mutation; only triggers when input is exactly
+  // "<single token> " with cursor at the end and no ghost is already
+  // active.  Mirrors the post-commit auto-activation so manual typers
+  // get the same affordance as tab-completers.
+  input.addEventListener('input', () => {
+    if (ghostState) return;
+    const v = input.value;
+    if (v.length < 2 || v[v.length - 1] !== ' ') return;
+    if (input.selectionStart !== v.length) return;
+    const trimmed = v.slice(0, -1);
+    if (trimmed.length === 0 || trimmed.includes(' ')) return;
+    activateValueGhost(trimmed);
+  });
 
   // Paste-to-multiline: if the clipboard text spans multiple lines, treat
   // each line as its own command and run them in order. Whatever follows

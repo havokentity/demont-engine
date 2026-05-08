@@ -84,6 +84,13 @@ struct Command {
     std::string name;
     std::string description;
     CommandCallback callback;
+
+    // Optional default argument string shown as a ghost-suggestion when
+    // the user has typed `<command> ` and is at the value position.
+    // Free-form -- the registrant picks something representative of a
+    // typical invocation (e.g. screenshot's "demonte_screen.ppm").
+    // Empty means the command has no value-position ghost.
+    std::string default_args;
 };
 
 struct ExecuteResult {

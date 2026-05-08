@@ -99,11 +99,31 @@ constexpr DWORD    kShowDurMs     = 220;
 constexpr DWORD    kHideDurMs     = 180;
 constexpr BYTE     kPanelAlpha    = 217;     // peak alpha for layered path
 
+// Focus-watchdog timer.  Runs at low frequency while the console is
+// shown; on each tick it checks whether keyboard focus has drifted off
+// the console child (which has happened intermittently after Enter --
+// something in GLFW's WndProc or the OS briefly hands focus back to
+// the parent past our WM_SETFOCUS redirect).  Re-asserts SetFocus when
+// drift is detected.  Gated on wants_focus_on_activate_ so a
+// deliberate click into the game viewport stays out of the loop.
+constexpr UINT_PTR kFocusGuardTimerId = 0xC04502u;
+constexpr UINT     kFocusGuardMs      = 100;
+
 // Custom message: marshal a repaint request from a non-UI thread
 // (e.g. pt::log sinks, which fire on whichever thread emits the log)
 // onto the overlay's owning thread. Cross-thread InvalidateRect is
 // undefined per Win32 -- PostMessage is the documented bridge.
-constexpr UINT WM_APP_REPAINT = WM_APP + 1;
+constexpr UINT WM_APP_REPAINT  = WM_APP + 1;
+// Deferred SetFocus.  When the user presses backtick to open the
+// console, the WM_KEYDOWN is dispatched to the parent (GLFW HWND);
+// GLFW's WndProc fires our key callback which calls Show() ->
+// SetFocus(child) deep in its own message handler.  GLFW (or the
+// system) sometimes reverts focus before the call chain unwinds,
+// leaving the parent focused and keystrokes routed to the camera
+// (WASD).  Posting this message asks Windows to call SetFocus
+// AFTER the current message dispatch completes -- by then GLFW has
+// finished, and our SetFocus sticks.
+constexpr UINT WM_APP_SETFOCUS = WM_APP + 2;
 
 int ComputePanelHeight(int parent_h) {
     int h = static_cast<int>(parent_h * 0.45f);
@@ -146,6 +166,8 @@ private:
     void CycleGhost(int dir);
     void CommitGhost();
     void DismissGhost();
+    void ActivateValueGhost(const std::string& cvar_name);
+    void RefreshGhostAnnotation();
     void StartAnim(bool showing);
     void TickAnim();
     int  CurrentY() const;
@@ -190,6 +212,16 @@ private:
     // rendered after the cursor in dim color. Subsequent Tabs cycle
     // forward through matches; Shift+Tab cycles back; Right-arrow at
     // end / End commits; Esc / typing dismisses.
+    //
+    // Two activation modes:
+    //   - Token 0 (cvar/command name): triggered by Tab on a partial
+    //     name; matches list is the prefix-filtered name list.
+    //   - Value position: either user typed `cvar ` then Tab, OR a
+    //     token-0 commit just landed on a cvar (auto-activated by
+    //     CommitGhost). Matches are allowed_values when present;
+    //     otherwise [current, default] with `is_meta` set so the
+    //     inactive one is shown as `annotation` next to the primary
+    //     ghost (user sees both at once).
     struct GhostState {
         bool active = false;
         std::vector<std::string> matches;
@@ -197,6 +229,8 @@ private:
         std::string              before;     // text preserved before the token
         std::string              prefix;     // typed text of the token (already in input_)
         bool                     is_token0 = false;  // true → trailing space on commit
+        bool                     is_meta   = false;  // matches = [current, default] of a cvar
+        std::string              annotation;         // "default: X" or "current: Y" when is_meta
     };
     GhostState ghost_;
 
@@ -239,8 +273,19 @@ LRESULT CALLBACK WinOverlay::ParentWndProcThunk(
     LRESULT r = (orig != nullptr)
         ? CallWindowProcW(orig, h, m, w, l)
         : DefWindowProcW(h, m, w, l);
-    if (m == WM_ACTIVATE && LOWORD(w) != WA_INACTIVE && self != nullptr) {
-        if (self->hwnd_ && self->shown_ && self->wants_focus_on_activate_) {
+    if (self != nullptr && self->hwnd_ && self->shown_) {
+        // While the console is open we ALWAYS route keyboard focus to
+        // the child -- mouse interactions with the parent viewport
+        // (camera nav etc.) still work, but typing always goes to the
+        // console input.  WM_ACTIVATE catches alt-tab return /
+        // first-time app activation; WM_SETFOCUS catches every other
+        // path that hands focus to the parent (e.g. some internal
+        // GLFW step that fires once shortly after first show -- the
+        // earlier `wants_focus_on_activate_` gate flipped permanently
+        // to false on that, locking the user out of the console for
+        // the rest of that show cycle).
+        if ((m == WM_ACTIVATE && LOWORD(w) != WA_INACTIVE) ||
+             m == WM_SETFOCUS) {
             SetFocus(self->hwnd_);
         }
     }
@@ -291,7 +336,11 @@ bool WinOverlay::Init(HWND parent) {
     hwnd_ = CreateWindowExW(
         WS_EX_LAYERED,        // uniform-alpha translucency, see below
         class_name, L"",
-        WS_CHILD,
+        // WS_CLIPSIBLINGS prevents this window from painting into the
+        // perf-overlay sibling's pixels (and vice versa) when both are
+        // visible -- without it, the aggressive repaint pump on the
+        // perf HUD leaves stale "copy" artifacts on the console.
+        WS_CHILD | WS_CLIPSIBLINGS,
         0, y, parent_w_, panel_h_,
         parent_, nullptr,
         GetModuleHandleW(nullptr), this);
@@ -306,7 +355,7 @@ bool WinOverlay::Init(HWND parent) {
         SetLastError(0);
         hwnd_ = CreateWindowExW(
             0, class_name, L"",
-            WS_CHILD,
+            WS_CHILD | WS_CLIPSIBLINGS,
             0, y, parent_w_, panel_h_,
             parent_, nullptr,
             GetModuleHandleW(nullptr), this);
@@ -401,7 +450,10 @@ void WinOverlay::Shutdown() {
             reinterpret_cast<LONG_PTR>(original_parent_proc_));
         original_parent_proc_ = nullptr;
     }
-    if (hwnd_) { KillTimer(hwnd_, kAnimTimerId); }
+    if (hwnd_) {
+        KillTimer(hwnd_, kAnimTimerId);
+        KillTimer(hwnd_, kFocusGuardTimerId);
+    }
     if (font_)  {
         // Stock GDI objects (GetStockObject) are owned by the OS --
         // DeleteObject on them is undefined; only delete fonts we
@@ -457,7 +509,12 @@ void WinOverlay::StartAnim(bool showing) {
 
     if (showing) {
         ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+        // SetFocus directly + queue a deferred re-grab.  The direct
+        // call usually works; the deferred one fires after the
+        // current WM_KEYDOWN dispatch chain returns and re-asserts
+        // focus in case GLFW's continued processing yanked it back.
         SetFocus(hwnd_);
+        PostMessageW(hwnd_, WM_APP_SETFOCUS, 0, 0);
     }
     SetTimer(hwnd_, kAnimTimerId, kAnimTickMs, nullptr);
 }
@@ -504,6 +561,9 @@ void WinOverlay::Show() {
     // parent viewport will flip this back via WM_KILLFOCUS.
     wants_focus_on_activate_ = true;
     StartAnim(/*showing=*/true);
+    // Arm the focus watchdog: every 100 ms while shown, re-check that
+    // keyboard focus is on the child and restore it if not.
+    if (hwnd_) SetTimer(hwnd_, kFocusGuardTimerId, kFocusGuardMs, nullptr);
 }
 
 void WinOverlay::Hide() {
@@ -511,6 +571,7 @@ void WinOverlay::Hide() {
     if (!shown_ && anim_state_ != AnimState::Showing) return;
     shown_ = false;
     StartAnim(/*showing=*/false);
+    if (hwnd_) KillTimer(hwnd_, kFocusGuardTimerId);
 }
 
 void WinOverlay::Toggle() { if (shown_) Hide(); else Show(); }
@@ -600,9 +661,46 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // on the UI thread now -- safe per Win32.
         InvalidateRect(h, nullptr, FALSE);
         return 0;
+    case WM_APP_SETFOCUS:
+        // Re-grab focus after the original WM_KEYDOWN dispatch chain
+        // has unwound (see WM_APP_SETFOCUS doc comment near declaration).
+        // Only act if the overlay is still meant to be visible.
+        if (shown_) SetFocus(h);
+        return 0;
     case WM_TIMER:
         if (w == kAnimTimerId) { TickAnim(); return 0; }
+        if (w == kFocusGuardTimerId) {
+            // Re-assert focus on the child if it has drifted while
+            // the console is open.  Cheap (one GetFocus call) and
+            // self-correcting.  Unconditional while shown -- earlier
+            // gating on wants_focus_on_activate_ permanently disabled
+            // the watchdog after the first stray focus shift, which
+            // is the exact "first-open-only" bug the user reported.
+            if (shown_ && hwnd_) {
+                if (GetFocus() != hwnd_) {
+                    SetFocus(hwnd_);
+                }
+            }
+            return 0;
+        }
         break;
+    case WM_MOUSEWHEEL: {
+        // Mouse-wheel scrollback. Positive delta = wheel rotated
+        // forward (away from user) = scroll up = look at older
+        // content. WHEEL_DELTA (120) is one notch on a stock wheel;
+        // 3 lines per notch matches Windows' default text-control
+        // step. scroll_lines_ counts entries pushed up off the
+        // bottom, capped at scrollback_.size()-1.
+        int delta = GET_WHEEL_DELTA_WPARAM(w);
+        int lines = (delta * 3) / WHEEL_DELTA;
+        if (lines == 0) lines = (delta > 0) ? 1 : -1;
+        std::lock_guard lk(state_mutex_);
+        int n = static_cast<int>(scrollback_.size());
+        scroll_lines_ = std::clamp(scroll_lines_ + lines, 0,
+                                   std::max(0, n - 1));
+        Repaint();
+        return 0;
+    }
     case WM_KILLFOCUS: {
         // Distinguish "user clicked into the game viewport" (focus
         // moves to parent_) from "app is deactivating" (focus moves
@@ -630,12 +728,41 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             input_.insert(cursor_, 1, static_cast<char>(w));
             cursor_++;
             Repaint();
+            // After typing space, if the input is exactly "<name> "
+            // (single token + trailing space, cursor at end) and that
+            // name resolves to a known cvar/command with suggestions,
+            // auto-activate the value-position ghost.  Mirrors the
+            // post-commit auto-activation so users who type the full
+            // name themselves get the same affordance as those who
+            // tab-completed it.
+            if (w == ' ' && cursor_ == static_cast<int>(input_.size()) &&
+                input_.size() >= 2) {
+                auto first_space = input_.find(' ');
+                if (first_space + 1 == input_.size()) {
+                    ActivateValueGhost(input_.substr(0, first_space));
+                }
+            }
             return 0;
         }
         return 0;
     }
     case WM_KEYDOWN: {
         std::lock_guard lk(state_mutex_);
+
+        // Modifier keys alone (Shift/Ctrl/Alt/Win) must not dismiss
+        // the ghost -- otherwise a user pressing Shift+Tab fires
+        // WM_KEYDOWN(VK_SHIFT) first, which would trip the
+        // "any-other-key dismisses" branch below; by the time Tab
+        // arrives the ghost is gone and Shift+Tab degenerates into a
+        // fresh first Tab (cycle forward) instead of a step back.
+        // Same for Caps Lock etc.  Just swallow modifier-only events.
+        if (w == VK_SHIFT   || w == VK_CONTROL || w == VK_MENU    ||
+            w == VK_LSHIFT  || w == VK_RSHIFT  ||
+            w == VK_LCONTROL|| w == VK_RCONTROL||
+            w == VK_LMENU   || w == VK_RMENU   ||
+            w == VK_CAPITAL || w == VK_LWIN    || w == VK_RWIN) {
+            return 0;
+        }
 
         // Ghost-mode preamble.  When the autosuggestion is active these
         // keys mean something different than their default: Tab cycles,
@@ -868,6 +995,7 @@ void WinOverlay::CycleGhost(int dir) {
     int i = (static_cast<int>(ghost_.index) + dir) % n;
     if (i < 0) i += n;
     ghost_.index = static_cast<std::size_t>(i);
+    RefreshGhostAnnotation();
     Repaint();
 }
 
@@ -876,11 +1004,18 @@ void WinOverlay::CommitGhost() {
         DismissGhost();
         return;
     }
-    const std::string& match = ghost_.matches[ghost_.index];
-    std::string tail = ghost_.is_token0 ? (match + " ") : match;
+    const std::string committed = ghost_.matches[ghost_.index];
+    const bool        was_token0 = ghost_.is_token0;
+    std::string tail = was_token0 ? (committed + " ") : committed;
     input_  = ghost_.before + tail;
     cursor_ = static_cast<int>(input_.size());
     DismissGhost();
+
+    // Token-0 commit just landed on a name.  If the name is a cvar,
+    // auto-activate a value-position ghost so the user immediately
+    // sees the cvar's current value (and default, for free-form
+    // cvars).  Commands have no value-position ghost.
+    if (was_token0) ActivateValueGhost(committed);
 }
 
 void WinOverlay::DismissGhost() {
@@ -891,7 +1026,63 @@ void WinOverlay::DismissGhost() {
     ghost_.before.clear();
     ghost_.prefix.clear();
     ghost_.is_token0 = false;
+    ghost_.is_meta   = false;
+    ghost_.annotation.clear();
     Repaint();
+}
+
+// After a token-0 commit OR a typed `<name> ` sequence, auto-show
+// the cvar's current value (or a command's default args) as a ghost
+// so the user can see a useful suggestion without typing anything
+// more.  Three branches:
+//
+//   - CVar with allowed_values: cycle those (same as the existing
+//     value-position behaviour after `cvar ` + Tab).
+//   - Free-form cvar: cycle [current, default] with `is_meta` set
+//     so the inactive one is rendered as an annotation.
+//   - Command with default_args: single-match ghost showing the
+//     default invocation (e.g. `screenshot demonte_screen.ppm`).
+//
+// No-op for commands without default_args, and for unknown names.
+void WinOverlay::ActivateValueGhost(const std::string& name) {
+    auto& C = pt::console::Console::Get();
+    std::vector<std::string> matches;
+    bool meta = false;
+
+    if (auto* cv = C.FindCVar(name); cv != nullptr) {
+        if (!cv->allowed_values.empty()) {
+            matches = cv->allowed_values;
+        } else {
+            matches.push_back(cv->value);
+            if (cv->default_value != cv->value) {
+                matches.push_back(cv->default_value);
+                meta = true;
+            }
+        }
+    } else if (auto* cmd = C.FindCommand(name); cmd != nullptr) {
+        if (!cmd->default_args.empty()) {
+            matches.push_back(cmd->default_args);
+        }
+    }
+    if (matches.empty()) return;
+
+    ghost_.active    = true;
+    ghost_.matches   = std::move(matches);
+    ghost_.index     = 0;
+    ghost_.before    = input_;   // input_ already ends with "<name> "
+    ghost_.prefix.clear();
+    ghost_.is_token0 = false;
+    ghost_.is_meta   = meta;
+    RefreshGhostAnnotation();
+    Repaint();
+}
+
+void WinOverlay::RefreshGhostAnnotation() {
+    ghost_.annotation.clear();
+    if (!ghost_.is_meta || ghost_.matches.size() < 2) return;
+    // matches[0] = current, matches[1] = default (per ActivateValueGhost).
+    if (ghost_.index == 0) ghost_.annotation = "  default: " + ghost_.matches[1];
+    else                   ghost_.annotation = "  current: " + ghost_.matches[0];
 }
 
 void WinOverlay::Paint(HDC dc) {
@@ -1042,17 +1233,32 @@ void WinOverlay::Paint(HDC dc) {
 
         // Ghost text (dim, drawn just past the cursor).  Only the
         // portion of the candidate beyond the user's typed prefix is
-        // shown -- typed chars are already in input_ above.
+        // shown -- typed chars are already in input_ above.  An
+        // optional annotation (current/default for free-form cvars)
+        // trails the primary ghost in the same dim colour so the user
+        // sees both pieces of context at a glance.
         if (ghost_.active && !ghost_.matches.empty()) {
             const std::string& match = ghost_.matches[ghost_.index];
             if (match.size() > ghost_.prefix.size() &&
                 match.compare(0, ghost_.prefix.size(), ghost_.prefix) == 0) {
                 std::string ghost_tail = match.substr(ghost_.prefix.size());
                 SetTextColor(mdc, theme_.dim);
+                int gx = cx + 3;
                 auto gbuf = ToWide(ghost_tail);
                 if (!gbuf.empty()) {
-                    TextOutW(mdc, cx + 3, input_y, gbuf.data(),
+                    TextOutW(mdc, gx, input_y, gbuf.data(),
                              static_cast<int>(gbuf.size()));
+                    SIZE gsz{};
+                    GetTextExtentPoint32W(mdc, gbuf.data(),
+                                          static_cast<int>(gbuf.size()), &gsz);
+                    gx += gsz.cx;
+                }
+                if (!ghost_.annotation.empty()) {
+                    auto abuf = ToWide(ghost_.annotation);
+                    if (!abuf.empty()) {
+                        TextOutW(mdc, gx, input_y, abuf.data(),
+                                 static_cast<int>(abuf.size()));
+                    }
                 }
             }
         }

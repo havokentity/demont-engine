@@ -437,10 +437,12 @@ void ConsoleServer::HandleWsMessage(mg_connection* conn, std::string_view payloa
         std::string prefix = msg.value("prefix", std::string{});
         json arr = json::array();
         Console::Get().EnumerateCommands(prefix, [&arr](Command& c) {
-            arr.push_back(json{
+            json entry{
                 {"name",        c.name},
                 {"description", c.description},
-            });
+            };
+            if (!c.default_args.empty()) entry["default_args"] = c.default_args;
+            arr.push_back(entry);
         });
         reply(json{{"ok", true}, {"commands", arr}});
         return;

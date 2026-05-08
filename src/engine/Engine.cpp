@@ -3,6 +3,7 @@
 #include "Engine.h"
 
 #include "../app/ConsoleOverlay.h"
+#include "../app/PerfOverlay.h"
 #include "../app/Window.h"
 #include "../console/Console.h"
 #include "../console/ConsoleServer.h"
@@ -57,6 +58,19 @@ namespace cvar {
             CVAR_ARCHIVE);
     PT_CVAR(app_overlay_enabled, "1",
             "Enable the in-window native console overlay (backtick toggles)", CVAR_ARCHIVE);
+    PT_CVAR(r_perf_overlay,    "0",
+            "Tiered in-game performance overlay. 0 = off, 1 = fps + frame_ms, "
+            "2 = + backend / resolution / GPU memory / spp / bounces / primitives, "
+            "3 = + frame-time sparkline. (Tier 4 reserved for per-pass GPU "
+            "timestamps once VkQueryPool / MTLCounterSampleBuffer is wired.)",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_perf_overlay_mode, "native",
+            "Backend for the perf overlay. 'native' = OS-native child window "
+            "(GDI on Win, NSPanel on Mac) -- has full text readout but can "
+            "leave compositing artifacts over Vulkan swapchains. 'rhi' = final "
+            "compute pass on the swapchain -- artifact-free, captured in "
+            "screenshots, currently visual-only (panel + sparkline, no text).",
+            CVAR_ARCHIVE);
     PT_CVAR(r_theme, "hardcore",
             "Web console theme: hardcore|amber|synthwave|matrix|vault|sakura|mono",
             CVAR_ARCHIVE);
@@ -311,6 +325,29 @@ bool Engine::Init() {
             }
         }
 
+        // Always-visible perf overlay (separate child window from the
+        // console).  Visibility is gated by r_perf_overlay -- the
+        // overlay starts in its initial state and the on_change
+        // handler below pushes the cvar's actual value once Init
+        // returns.
+        perf_overlay_ = std::make_unique<pt::app::PerfOverlay>();
+        if (!perf_overlay_->Init(window_->NativeHandle())) {
+            perf_overlay_.reset();
+        } else if (auto* tv = C.FindCVar("r_theme")) {
+            perf_overlay_->ApplyTheme(tv->value);
+        }
+        if (perf_overlay_) {
+            int level = 0;
+            if (auto* lv = C.FindCVar("r_perf_overlay")) {
+                try { level = std::stoi(lv->value); } catch (...) {}
+            }
+            // Native overlay is hidden when RHI mode is selected so
+            // both don't draw at once.
+            bool rhi = false;
+            if (auto* mv = C.FindCVar("r_perf_overlay_mode")) rhi = (mv->value == "rhi");
+            perf_overlay_->SetLevel(rhi ? 0 : level);
+        }
+
         window_->SetKeyHandler([this](int key, int /*mods*/) {
             constexpr int kGrave = 96;  // GLFW_KEY_GRAVE_ACCENT
             if (key != kGrave) return;
@@ -436,6 +473,7 @@ void Engine::TearDownDevice() {
         // autoexpose_pipeline_id_) are owned by the device handle and
         // released by device_.reset() below, same as tonemap / bloom.
         if (exposure_state_id_      != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{exposure_state_id_});
+        if (perfoverlay_drawlist_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{perfoverlay_drawlist_id_});
     }
     scene_tlas_id_        = 0;
     box_blas_id_          = 0;
@@ -450,6 +488,9 @@ void Engine::TearDownDevice() {
     tonemap_pipeline_id_     = 0;
     bloom_down_pipeline_id_  = 0;
     bloom_up_pipeline_id_    = 0;
+    perfoverlay_pipeline_id_       = 0;
+    perfoverlay_drawlist_id_       = 0;
+    perfoverlay_drawlist_capacity_ = 0;
     bloom_dummy_tex_id_      = 0;
     for (auto& id : bloom_mip_tex_id_) id = 0;
     for (auto& w  : bloom_mip_w_)      w  = 0;
@@ -542,6 +583,12 @@ void Engine::RequestBackendSwitch(BackendType to) {
         };
         autoexpose_pipeline_id_ = device_->CreateComputePipeline(desc).id;
     }
+    {
+        pt::rhi::ComputePipelineDesc desc{
+            .kernel_name = "perfoverlay", .bytecode = {}, .debug_name = "perfoverlay",
+        };
+        perfoverlay_pipeline_id_ = device_->CreateComputePipeline(desc).id;
+    }
 
     // GPU-resident exposure scalar (1 float). AutoExposure.slang
     // updates this each tick when r_auto_exposure=1; engine writes the
@@ -568,6 +615,21 @@ void Engine::RequestBackendSwitch(BackendType to) {
             }
             device_->WriteBuffer(buf, &init_exposure, sizeof(float), 0);
         }
+    }
+
+    // Perf-overlay draw list: one DrawCmd per uint4 entry.  Sized for
+    // tier-3 worst case (~256 sparkline segments + a handful of chrome
+    // entries).  Uploaded each frame via WriteBuffer when the RHI-mode
+    // overlay is active.
+    {
+        constexpr std::uint32_t kPerfDrawCapacity = 320;   // entries
+        auto buf = device_->CreateBuffer({
+            .size = sizeof(std::uint32_t) * 4 * kPerfDrawCapacity,
+            .usage = pt::rhi::BufferUsage::Storage,
+            .debug_name = "perfoverlay_drawlist",
+        });
+        perfoverlay_drawlist_id_       = buf.id;
+        perfoverlay_drawlist_capacity_ = kPerfDrawCapacity;
     }
 
     // Mark the analytic-primitive buffer dirty so it gets uploaded on
@@ -1998,6 +2060,159 @@ void Engine::RenderFrame() {
         cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
     }
 
+    // RHI-mode perf overlay: final compute pass that composites a panel
+    // + sparkline onto the post-tonemap swapchain image.  Skipped when
+    // the user picked native mode or set r_perf_overlay 0.  No text
+    // yet -- bitmap-font follow-up will land tier 1+ numbers here too.
+    {
+        auto& Cn = pt::console::Console::Get();
+        int   level    = 0;
+        std::string mode = "native";
+        if (auto* lv = Cn.FindCVar("r_perf_overlay"))      try { level = std::stoi(lv->value); } catch (...) {}
+        if (auto* mv = Cn.FindCVar("r_perf_overlay_mode")) mode  = mv->value;
+        if (level > 0 && mode == "rhi" &&
+            perfoverlay_pipeline_id_ != 0 && perfoverlay_drawlist_id_ != 0) {
+            // Compute-after-compute barrier on the swapchain image.
+            // The previous dispatch (PathTrace inline tonemap on
+            // Vulkan, or Tonemap.slang on Metal-with-denoiser) wrote
+            // the swapchain via storage-image stores; PerfOverlay
+            // now reads + writes the same image.  Without this
+            // barrier the load sees stale data and the resulting
+            // composite scribbles over the rendered scene.  Same
+            // pattern as the PathTrace -> AutoExposure barrier
+            // above (Metal's Barrier() is a no-op since dispatches
+            // on a shared resource auto-barrier; Vulkan needs the
+            // explicit emit).
+            cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                         pt::rhi::BarrierDesc::Stage::ComputeWrite});
+            // Panel sized for the chrome we draw: a fixed-aspect
+            // rectangle in the top-right corner.  Tier 3 adds height
+            // for the sparkline graph.
+            constexpr std::uint32_t kPanelW    = 240;
+            constexpr std::uint32_t kPanelMargin = 12;
+            std::uint32_t panel_h = (level >= 3) ? 90u : 28u;
+            std::uint32_t panel_w = kPanelW;
+            if (panel_w + kPanelMargin > fc.width)  panel_w = fc.width - kPanelMargin;
+            if (panel_h + kPanelMargin > fc.height) panel_h = fc.height - kPanelMargin;
+            std::uint32_t panel_x = fc.width  - panel_w - kPanelMargin;
+            std::uint32_t panel_y = kPanelMargin;
+
+            // Build the draw list in panel-local coords.  Each command
+            // is uint4: kind, x, y, payload.  Buffer was sized for
+            // perfoverlay_drawlist_capacity_ entries; clamp.
+            std::vector<std::uint32_t> dl;
+            dl.reserve(perfoverlay_drawlist_capacity_ * 4);
+            auto push_cmd = [&](std::uint32_t kind, std::uint32_t x,
+                                std::uint32_t y, std::uint32_t payload) {
+                if (dl.size() / 4 >= perfoverlay_drawlist_capacity_) return;
+                dl.push_back(kind);
+                dl.push_back(x);
+                dl.push_back(y);
+                dl.push_back(payload);
+            };
+
+            if (level >= 3 && !perf_history_.empty()) {
+                // Sparkline.  Linearize the ring (oldest-first), find
+                // the peak, project samples to panel-local Y.  Ref
+                // line at 16.67 ms for 60 fps.
+                std::size_t n = perf_history_.size();
+                std::vector<float> linear(n);
+                for (std::size_t i = 0; i < n; ++i) {
+                    linear[i] = perf_history_[(perf_history_pos_ + i) % n];
+                }
+                float peak = 1.0f;
+                for (float v : linear) if (v > peak) peak = v;
+                if (peak < 0.5f) peak = 0.5f;
+
+                std::uint32_t graph_x  = 6;
+                std::uint32_t graph_y  = 24;     // below the (future) text rows
+                std::uint32_t graph_w  = panel_w - 12;
+                std::uint32_t graph_h  = panel_h - graph_y - 6;
+
+                // 60 fps reference (16.67 ms).
+                if (16.667f < peak) {
+                    std::uint32_t ref_y = graph_y + graph_h - 1
+                        - static_cast<std::uint32_t>((16.667f / peak) * (graph_h - 2));
+                    push_cmd(/*rule*/ 2, graph_x, ref_y, graph_w);
+                }
+
+                // Sparkline polyline: emit one segment per pixel of
+                // graph width, picking samples evenly across history.
+                std::uint32_t segs = (graph_w > 1) ? graph_w - 1 : 0;
+                for (std::uint32_t i = 0; i < segs; ++i) {
+                    std::size_t i0 = (i * n) / segs;
+                    std::size_t i1 = ((i + 1) * n) / segs;
+                    if (i1 >= n) i1 = n - 1;
+                    float v0 = linear[i0];
+                    float v1 = linear[i1];
+                    std::uint32_t x0 = graph_x + i;
+                    std::uint32_t x1 = graph_x + i + 1;
+                    std::uint32_t y0 = graph_y + graph_h - 1
+                        - static_cast<std::uint32_t>((v0 / peak) * (graph_h - 2));
+                    std::uint32_t y1 = graph_y + graph_h - 1
+                        - static_cast<std::uint32_t>((v1 / peak) * (graph_h - 2));
+                    if (y0 >= graph_y + graph_h) y0 = graph_y + graph_h - 1;
+                    if (y1 >= graph_y + graph_h) y1 = graph_y + graph_h - 1;
+                    // Pack y0 in low 16, y1 in high 16, x1 in payload low 16.
+                    std::uint32_t z   = (y0 & 0xFFFFu) | ((y1 & 0xFFFFu) << 16);
+                    std::uint32_t pay = (x1 & 0xFFFFu);
+                    push_cmd(/*segment*/ 1, x0, z, pay);
+                    if (dl.size() / 4 >= perfoverlay_drawlist_capacity_) break;
+                }
+            }
+
+            std::uint32_t num_cmds = static_cast<std::uint32_t>(dl.size() / 4);
+            if (num_cmds > 0) {
+                device_->WriteBuffer(pt::rhi::BufferHandle{perfoverlay_drawlist_id_},
+                                     dl.data(), dl.size() * sizeof(std::uint32_t), 0);
+            }
+
+            // Theme-driven panel/accent/graph colours (RGBA8 packed,
+            // alpha used for blend strength).  Picks a small set
+            // matching the native overlay's palette.
+            std::string theme = "hardcore";
+            if (auto* tv = Cn.FindCVar("r_theme")) theme = tv->value;
+            std::uint32_t panel_col  = 0xC8160E0Cu;  // dark, alpha ~0.78
+            std::uint32_t accent_col = 0xFFFFF000u;  // hardcore cyan
+            std::uint32_t graph_col  = 0xFFFFF000u;
+            if (theme == "amber")     { accent_col = 0xFF2890FFu; graph_col = 0xFF2890FFu; }
+            else if (theme == "synthwave") { accent_col = 0xFFB450FFu; graph_col = 0xFFB450FFu; }
+            else if (theme == "matrix")    { accent_col = 0xFF00FF50u; graph_col = 0xFF00FF50u; }
+            else if (theme == "vault")     { accent_col = 0xFFFFA050u; graph_col = 0xFFFFA050u; }
+            else if (theme == "sakura")    { accent_col = 0xFFB48CFFu; graph_col = 0xFFB48CFFu; }
+            else if (theme == "mono")      { accent_col = 0xFFE0E0E0u; graph_col = 0xFFE0E0E0u; }
+
+            struct PerfPush {
+                std::uint32_t panel_x;
+                std::uint32_t panel_y;
+                std::uint32_t panel_w;
+                std::uint32_t panel_h;
+                std::uint32_t num_cmds;
+                std::uint32_t panel_color;
+                std::uint32_t accent_color;
+                std::uint32_t graph_color;
+            } pp{
+                panel_x, panel_y, panel_w, panel_h,
+                num_cmds,
+                panel_col, accent_col, graph_col,
+            };
+
+            cb->BindComputePipeline(pt::rhi::PipelineHandle{perfoverlay_pipeline_id_});
+            cb->BindStorageTexture(0, fc.swapchain_image);
+            // Engine buffer slot 1 -> kSlotToBufBinding[1] = vk::binding(3)
+            // on Vulkan, MSL buffer(1) on Metal (after the
+            // _slot_dummy0 declaration in PerfOverlay.slang shifts
+            // draw_list off MSL slot 0).  Slot 3 here previously
+            // landed at vk::binding(5) (primitives) -- which is what
+            // produced the "rhi overlay totally breaks the scene"
+            // garbage: the shader read mesh_positions data as
+            // DrawCmd entries.
+            cb->BindBuffer(1, pt::rhi::BufferHandle{perfoverlay_drawlist_id_}, 0);
+            cb->PushConstants(&pp, sizeof(pp));
+            cb->Dispatch((panel_w + 7) / 8, (panel_h + 7) / 8, 1);
+        }
+    }
+
     device_->Submit(cb);
     device_->EndFrame(cb);
 
@@ -2119,27 +2334,70 @@ void Engine::Tick(double dt) {
     auto frame_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t0).count();
 
-    // Broadcast frame_stats throttled to ~10 Hz so the network doesn't
-    // get spammed at 240+ fps.
+    // Per-frame ring buffer for the tier-3 sparkline.  Sized for ~4
+    // seconds of 60-fps history; the overlay subsamples down to its
+    // available pixel width when rendering.  Ring is resized lazily
+    // on first push so it doesn't allocate when the overlay is off.
+    if (perf_history_.empty()) perf_history_.assign(256, 0.0f);
+    perf_history_[perf_history_pos_] = static_cast<float>(frame_ms);
+    perf_history_pos_ = (perf_history_pos_ + 1) % perf_history_.size();
+
+    // Aggregate at ~10 Hz so the network doesn't get spammed at
+    // 240+ fps and the overlay's text doesn't visually flicker.
+    // Same window also drives the avg/min/max stats consumed below.
     static double accum_s = 0.0;
     static int    accum_frames = 0;
     static double accum_render_ms = 0.0;
+    static double accum_min = 1.0e30;
+    static double accum_max = 0.0;
     accum_s         += dt;
     accum_frames    += 1;
     accum_render_ms += frame_ms;
-    if (accum_s >= 0.1 && server_) {
-        double fps = accum_frames / accum_s;
+    if (frame_ms < accum_min) accum_min = frame_ms;
+    if (frame_ms > accum_max) accum_max = frame_ms;
+    if (accum_s >= 0.1) {
+        double fps        = accum_frames / accum_s;
         double avg_render = accum_render_ms / accum_frames;
         int w = window_ ? window_->Width()  : 0;
         int h = window_ ? window_->Height() : 0;
-        auto data = fmt::format(
-            R"({{"fps":{:.1f},"frame_ms":{:.3f},"trace_ms":{:.3f},"backend":"{}","resolution":[{},{}]}})",
-            fps, accum_render_ms / accum_frames, avg_render,
-            pt::rhi::BackendName(current_backend_), w, h);
-        server_->BroadcastEvent("frame_stats", data);
-        accum_s = 0.0;
-        accum_frames = 0;
+
+        if (server_) {
+            auto data = fmt::format(
+                R"({{"fps":{:.1f},"frame_ms":{:.3f},"trace_ms":{:.3f},"backend":"{}","resolution":[{},{}]}})",
+                fps, avg_render, avg_render,
+                pt::rhi::BackendName(current_backend_), w, h);
+            server_->BroadcastEvent("frame_stats", data);
+        }
+
+        if (perf_overlay_ && perf_overlay_->Level() > 0) {
+            // Linearize the ring (oldest-first) so the overlay can
+            // walk it left-to-right without modular arithmetic.
+            std::vector<float> linear(perf_history_.size());
+            for (std::size_t i = 0; i < perf_history_.size(); ++i) {
+                linear[i] = perf_history_[(perf_history_pos_ + i) % perf_history_.size()];
+            }
+            auto& Cn = pt::console::Console::Get();
+            pt::app::PerfStats st;
+            st.fps          = fps;
+            st.frame_ms_avg = avg_render;
+            st.frame_ms_min = accum_min;
+            st.frame_ms_max = accum_max;
+            st.backend      = pt::rhi::BackendName(current_backend_);
+            st.width        = w;
+            st.height       = h;
+            st.gpu_bytes    = device_ ? device_->CurrentAllocatedBytes() : 0;
+            if (auto* sv = Cn.FindCVar("r_spp"))         st.spp         = sv->GetInt();
+            if (auto* mv = Cn.FindCVar("r_max_bounces")) st.max_bounces = mv->GetInt();
+            st.primitives   = primitives_.size();
+            st.frame_ms_history = std::span<const float>(linear.data(), linear.size());
+            perf_overlay_->Update(st);
+        }
+
+        accum_s         = 0.0;
+        accum_frames    = 0;
         accum_render_ms = 0.0;
+        accum_min       = 1.0e30;
+        accum_max       = 0.0;
     }
 }
 
@@ -2158,6 +2416,9 @@ void Engine::Run() {
         // which is driven by AppKit's resize, not the engine loop.
         if (overlay_) {
             overlay_->NotifyParentResized(window_->Width(), window_->Height());
+        }
+        if (perf_overlay_) {
+            perf_overlay_->NotifyParentResized(window_->Width(), window_->Height());
         }
         Tick(dt);
 
@@ -2364,7 +2625,7 @@ void Engine::RegisterCommands() {
             out.FormatLine("scene: loaded {} primitive(s) from {}", primitives_.size(), path);
         });
 
-    C.RegisterCommand("screenshot",
+    if (auto* cmd = C.RegisterCommand("screenshot",
         "screenshot <path.ppm> [accum|denoise_color|depth|motion]: dump the target render texture to a PPM file (P6 binary, ACES-tonemapped for HDR inputs).",
         [this](auto args, pt::console::Output& out) {
             if (!device_) { out.PrintLine("screenshot: no device"); return; }
@@ -2455,6 +2716,19 @@ void Engine::RegisterCommands() {
                 float x = (c * (a * c + b)) / (c * (d * c + e) + f);
                 if (x < 0.0f) x = 0.0f;
                 if (x > 1.0f) x = 1.0f;
+                // sRGB OETF (linear -> nonlinear) so the stored 8-bit
+                // values match what the on-screen path writes to the
+                // swapchain after PathTrace.slang / Tonemap.slang's
+                // srgb_oetf().  Without this the PPM is linear LDR
+                // and viewers (which assume sRGB) re-apply the EOTF,
+                // producing a visibly darker image than what's on
+                // screen.  Same piecewise OETF as the shader.
+                if (x <= 0.0031308f) {
+                    x = x * 12.92f;
+                } else {
+                    x = 1.055f * std::pow(x, 1.0f / 2.4f) - 0.055f;
+                }
+                if (x > 1.0f) x = 1.0f;
                 return static_cast<std::uint8_t>(x * 255.0f + 0.5f);
             };
             // Portable IEEE 754 binary16 -> binary32 decode. Apple Clang
@@ -2544,7 +2818,9 @@ void Engine::RegisterCommands() {
             std::fclose(f);
             out.FormatLine("screenshot: wrote {} ({}x{} {})", path, w, hgt, tag);
             (void)channels;
-        });
+        })) {
+        cmd->default_args = "demonte_screen.ppm";
+    }
 
     C.RegisterCommand("web_console",
         "Open the web console in the default browser.",
@@ -2802,6 +3078,35 @@ void Engine::RegisterCommands() {
             if (!r.ok) out.FormatLine("exec error: {}", r.error);
         });
 
+    // r_perf_overlay: validate + push level changes to the overlay.
+    if (auto* v = C.FindCVar("r_perf_overlay")) {
+        v->allowed_values = {"0", "1", "2", "3"};
+        v->on_change = [this](const pt::console::CVar& cv) {
+            if (perf_overlay_) {
+                int lv = 0;
+                try { lv = std::stoi(cv.value); } catch (...) { lv = 0; }
+                bool rhi = false;
+                if (auto* mv = pt::console::Console::Get().FindCVar("r_perf_overlay_mode")) {
+                    rhi = (mv->value == "rhi");
+                }
+                // Native overlay only takes the level when RHI mode is off;
+                // otherwise it stays hidden so both don't draw at once.
+                perf_overlay_->SetLevel(rhi ? 0 : lv);
+            }
+        };
+    }
+    if (auto* v = C.FindCVar("r_perf_overlay_mode")) {
+        v->allowed_values = {"native", "rhi"};
+        v->on_change = [this](const pt::console::CVar& cv) {
+            if (perf_overlay_) {
+                int lv = 0;
+                if (auto* lvv = pt::console::Console::Get().FindCVar("r_perf_overlay")) {
+                    try { lv = std::stoi(lvv->value); } catch (...) {}
+                }
+                perf_overlay_->SetLevel(cv.value == "rhi" ? 0 : lv);
+            }
+        };
+    }
     // r_backend: validate against the known set + react to changes.
     if (auto* v = C.FindCVar("r_backend")) {
         v->allowed_values = {"none", "software", "metal", "vulkan"};
@@ -2824,6 +3129,7 @@ void Engine::RegisterCommands() {
                 server_->BroadcastEvent("theme_change", data);
             }
             if (overlay_) overlay_->ApplyTheme(cv.value);
+            if (perf_overlay_) perf_overlay_->ApplyTheme(cv.value);
         };
     }
     // dev_log_level: validate
