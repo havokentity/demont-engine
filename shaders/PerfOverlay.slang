@@ -12,10 +12,20 @@
 // meantime.  Cvar `r_perf_overlay_mode native|rhi` selects which
 // overlay the engine drives.
 //
-// Bindings (compatible with the shared 16-slot Vulkan pipeline
-// layout, slot 0 = swapchain RW, slot 3 = storage buffer):
-//   binding 0  : swapchain RWTexture2D<float4> (read + write).
-//   binding 3  : draw list RWStructuredBuffer<DrawCmd>.
+// Bindings:
+//   Engine texture slot 0 -> vk::binding(0) = swapchain RW
+//   Engine buffer  slot 1 -> vk::binding(3) = draw_list
+//
+// MSL SLOT ALIGNMENT
+// On Vulkan, vk::binding decorations directly drive descriptor
+// bindings.  On Metal, Slang's MSL backend assigns buffer slots in
+// DECLARATION ORDER, ignoring vk::binding numbers.  The engine's
+// BindBuffer(slot=1) targets MSL buffer(1) (and Vulkan
+// vk::binding(3), via kSlotToBufBinding[1]=3).  Without a dummy
+// before draw_list, Slang would emit it at MSL buffer(0) and the
+// Metal backend would never write to that slot (engine slot 0 is
+// unused for buffers), so draw_list would read garbage.
+// Same alignment trick AutoExposure.slang uses for exposure_state.
 //
 // Push constants (fits in the engine's 112B unified push range):
 //   panel_x, panel_y, panel_w, panel_h : panel rect in pixels.
@@ -25,6 +35,11 @@
 //   graph_color_rgba                   : packed 8-bit RGBA for the sparkline.
 
 [[vk::binding(0, 0)]] RWTexture2D<float4>          out_image;
+// Dummy at vk::binding(4) (mesh_indices in PathTrace's layout, also
+// STORAGE_BUFFER in the shared descriptor set, so the type matches).
+// Forced-emitted in a never-taken branch below; on Vulkan the read
+// gets whatever the prior dispatch left there but never executes.
+[[vk::binding(4, 0)]] StructuredBuffer<uint>       _slot_dummy0;
 [[vk::binding(3, 0)]] RWStructuredBuffer<uint4>    draw_list;
 
 [[vk::push_constant]]
@@ -86,6 +101,16 @@ float seg_dist(float px, float py, float x0, float y0, float x1, float y1) {
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
+    // Force Slang to keep the dummy storage buffer in the MSL slot
+    // assignment.  The compiler can't statically prove
+    // `num_cmds == 0xDEADBEEFu` is false (it's a runtime push), so
+    // the branch survives optimization and the dummy gets a real
+    // slot.  Never executes on real dispatches.
+    if (num_cmds == 0xDEADBEEFu) {
+        let v = _slot_dummy0[0];
+        out_image[uint2(0, 0)] = float4(float(v), 0, 0, 0);
+    }
+
     // Dispatch is sized to cover the panel rect; each thread maps to
     // one swapchain pixel inside (or just past) the panel.  Skip
     // pixels outside the panel.

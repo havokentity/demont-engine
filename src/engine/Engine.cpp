@@ -2196,7 +2196,15 @@ void Engine::RenderFrame() {
 
             cb->BindComputePipeline(pt::rhi::PipelineHandle{perfoverlay_pipeline_id_});
             cb->BindStorageTexture(0, fc.swapchain_image);
-            cb->BindBuffer(3, pt::rhi::BufferHandle{perfoverlay_drawlist_id_}, 0);
+            // Engine buffer slot 1 -> kSlotToBufBinding[1] = vk::binding(3)
+            // on Vulkan, MSL buffer(1) on Metal (after the
+            // _slot_dummy0 declaration in PerfOverlay.slang shifts
+            // draw_list off MSL slot 0).  Slot 3 here previously
+            // landed at vk::binding(5) (primitives) -- which is what
+            // produced the "rhi overlay totally breaks the scene"
+            // garbage: the shader read mesh_positions data as
+            // DrawCmd entries.
+            cb->BindBuffer(1, pt::rhi::BufferHandle{perfoverlay_drawlist_id_}, 0);
             cb->PushConstants(&pp, sizeof(pp));
             cb->Dispatch((panel_w + 7) / 8, (panel_h + 7) / 8, 1);
         }
