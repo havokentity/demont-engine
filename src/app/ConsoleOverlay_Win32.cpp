@@ -263,8 +263,20 @@ LRESULT CALLBACK WinOverlay::ParentWndProcThunk(
     LRESULT r = (orig != nullptr)
         ? CallWindowProcW(orig, h, m, w, l)
         : DefWindowProcW(h, m, w, l);
-    if (m == WM_ACTIVATE && LOWORD(w) != WA_INACTIVE && self != nullptr) {
-        if (self->hwnd_ && self->shown_ && self->wants_focus_on_activate_) {
+    if (self != nullptr && self->hwnd_ && self->shown_
+        && self->wants_focus_on_activate_) {
+        // WM_ACTIVATE: alt-tab return / mouse-click-into-app
+        // activation -- redirect focus to the console child after
+        // GLFW has handled its own activation logic.
+        // WM_SETFOCUS: parent gained keyboard focus while the
+        // console is up.  Happens rarely during normal typing
+        // (~1/100) -- something inside GLFW's WndProc or the OS
+        // briefly steals focus from our child.  Re-grab.  Gated on
+        // wants_focus_on_activate_ so a deliberate click into the
+        // game viewport (which sets it false via WM_KILLFOCUS on
+        // the child) doesn't get hijacked.
+        if ((m == WM_ACTIVATE && LOWORD(w) != WA_INACTIVE) ||
+             m == WM_SETFOCUS) {
             SetFocus(self->hwnd_);
         }
     }

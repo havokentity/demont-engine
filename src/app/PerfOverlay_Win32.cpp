@@ -147,9 +147,13 @@ bool WinPerf::Init(HWND parent) {
     parent_w_ = pr.right - pr.left;
     parent_h_ = pr.bottom - pr.top;
 
+    // WS_EX_LAYERED only: WS_EX_TRANSPARENT was redundant alongside
+    // HTTRANSPARENT click-through and appeared to interact poorly with
+    // DWM compositing of sibling layered children over a Vulkan
+    // swapchain (panel went stale when the console hid).
     SetLastError(0);
     hwnd_ = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+        WS_EX_LAYERED,
         class_name, L"",
         WS_CHILD,
         0, 0, kPanelW, 64,
@@ -161,7 +165,7 @@ bool WinPerf::Init(HWND parent) {
         LOG_WARN("PerfOverlay_Win32: layered child create failed (GLE={}), retrying opaque", gle);
         SetLastError(0);
         hwnd_ = CreateWindowExW(
-            WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+            0,
             class_name, L"",
             WS_CHILD,
             0, 0, kPanelW, 64,
@@ -251,14 +255,22 @@ void WinPerf::Update(const PerfStats& stats) {
         history_copy_.assign(stats.frame_ms_history.begin(),
                              stats.frame_ms_history.end());
     }
-    // Keep the perf HUD on top of any sibling child windows (the
-    // console overlay, mainly). When a sibling animates open or
-    // closed, it can leave us occluded or stale-pixeled until the
-    // next Z-order shuffle; a no-activate top bump every Update
-    // avoids that without stealing focus.
+    // Aggressive repaint pump.  Layered children over a Vulkan
+    // swapchain don't reliably pick up sibling z-order shuffles or
+    // present-time invalidations, so we belt-and-suspender every
+    // Update tick:
+    //   1. ShowWindow(SW_SHOWNOACTIVATE): defensive in case
+    //      something hid the window.  Cheap if already visible.
+    //   2. SetWindowPos(HWND_TOP, NOACTIVATE): keep above siblings
+    //      (e.g. the console panel) without stealing focus.
+    //   3. RedrawWindow(... RDW_INVALIDATE | RDW_UPDATENOW):
+    //      schedule WM_PAINT *and* synchronously dispatch it now so
+    //      DWM has fresh pixels in the layered surface.
+    ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
     SetWindowPos(hwnd_, HWND_TOP, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    InvalidateRect(hwnd_, nullptr, FALSE);
+    RedrawWindow(hwnd_, nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_UPDATENOW);
 }
 
 void WinPerf::NotifyParentResized(int w, int h) {
