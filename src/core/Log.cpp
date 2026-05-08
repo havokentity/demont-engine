@@ -63,13 +63,13 @@ void RemoveAllSinks() {
 }
 
 void Emit(Level level, fmt::string_view fmt_str, fmt::format_args args) {
-    const char* tag      = "INFO ";
+    const char* tag      = "INFO";
     const char* tag_col  = "";
     const char* body_col = "";
     switch (level) {
-        case Level::Info:  tag = "INFO ";  tag_col = kCyan;     body_col = kFg;       break;
-        case Level::Warn:  tag = "WARN ";  tag_col = kAmberBold; body_col = kAmber;   break;
-        case Level::Error: tag = "ERROR";  tag_col = kRedBold;  body_col = kRed;      break;
+        case Level::Info:  tag = "INFO";  tag_col = kCyan;      body_col = kFg;     break;
+        case Level::Warn:  tag = "WARN";  tag_col = kAmberBold; body_col = kAmber;  break;
+        case Level::Error: tag = "ERROR"; tag_col = kRedBold;   body_col = kRed;    break;
     }
 
     auto now = std::chrono::system_clock::now();
