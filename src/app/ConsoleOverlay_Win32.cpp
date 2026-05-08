@@ -273,18 +273,17 @@ LRESULT CALLBACK WinOverlay::ParentWndProcThunk(
     LRESULT r = (orig != nullptr)
         ? CallWindowProcW(orig, h, m, w, l)
         : DefWindowProcW(h, m, w, l);
-    if (self != nullptr && self->hwnd_ && self->shown_
-        && self->wants_focus_on_activate_) {
-        // WM_ACTIVATE: alt-tab return / mouse-click-into-app
-        // activation -- redirect focus to the console child after
-        // GLFW has handled its own activation logic.
-        // WM_SETFOCUS: parent gained keyboard focus while the
-        // console is up.  Happens rarely during normal typing
-        // (~1/100) -- something inside GLFW's WndProc or the OS
-        // briefly steals focus from our child.  Re-grab.  Gated on
-        // wants_focus_on_activate_ so a deliberate click into the
-        // game viewport (which sets it false via WM_KILLFOCUS on
-        // the child) doesn't get hijacked.
+    if (self != nullptr && self->hwnd_ && self->shown_) {
+        // While the console is open we ALWAYS route keyboard focus to
+        // the child -- mouse interactions with the parent viewport
+        // (camera nav etc.) still work, but typing always goes to the
+        // console input.  WM_ACTIVATE catches alt-tab return /
+        // first-time app activation; WM_SETFOCUS catches every other
+        // path that hands focus to the parent (e.g. some internal
+        // GLFW step that fires once shortly after first show -- the
+        // earlier `wants_focus_on_activate_` gate flipped permanently
+        // to false on that, locking the user out of the console for
+        // the rest of that show cycle).
         if ((m == WM_ACTIVATE && LOWORD(w) != WA_INACTIVE) ||
              m == WM_SETFOCUS) {
             SetFocus(self->hwnd_);
@@ -673,9 +672,11 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (w == kFocusGuardTimerId) {
             // Re-assert focus on the child if it has drifted while
             // the console is open.  Cheap (one GetFocus call) and
-            // self-correcting; only resets focus when needed so it
-            // doesn't fight a deliberate click-away.
-            if (shown_ && wants_focus_on_activate_ && hwnd_) {
+            // self-correcting.  Unconditional while shown -- earlier
+            // gating on wants_focus_on_activate_ permanently disabled
+            // the watchdog after the first stray focus shift, which
+            // is the exact "first-open-only" bug the user reported.
+            if (shown_ && hwnd_) {
                 if (GetFocus() != hwnd_) {
                     SetFocus(hwnd_);
                 }
