@@ -90,7 +90,7 @@ namespace cvar {
     PT_CVAR(r_debug_sun_overlay, "0", "Debug: when 1, the tonemap pass overlays a green crosshair at the engine-projected sun_uv. Useful for verifying the lens-flare projection lines up with the rendered sun. Sets r_lens_flare_intensity to a sentinel internally; remember to disable when done.", 0);
     PT_CVAR(r_exposure,        "1.5","Manual HDR exposure multiplier applied before ACES tonemap. Used when r_auto_exposure = 0.", CVAR_ARCHIVE);
     PT_CVAR(r_auto_exposure,   "1",  "Auto-exposure: 0 = use r_exposure manual value, 1 = sample accum_hdr each frame and adapt exposure toward r_exposure_target (eye-adaptation feel).", CVAR_ARCHIVE);
-    PT_CVAR(r_exposure_min,    "0.05",  "Minimum exposure scalar that auto-exposure can settle on. Stops a nuclear-bright scene from being crushed below this value.", CVAR_ARCHIVE);
+    PT_CVAR(r_exposure_min,    "1e-6",  "Minimum exposure scalar that auto-exposure can settle on. Used as a floor; the geometric-mean metering in AutoExposure.slang produces values down to ~1e-5 for genuine outdoor daylight (sky luminance of ~1e4 units / 0.18 target = ~1.8e-5). 1e-6 leaves headroom and prevents NaN pathologies; bump up to ~0.05 if you want auto-exposure to refuse to dim below a certain level for stylistic reasons.", CVAR_ARCHIVE);
     PT_CVAR(r_exposure_max,    "4.0",   "Maximum exposure scalar that auto-exposure can settle on. The reason nights stay dark instead of being boosted to look like day -- bumping this lets the eye adapt further into the dark, lowering it caps the boost.", CVAR_ARCHIVE);
     PT_CVAR(r_exposure_target, "0.18",  "Middle-grey target for auto-exposure. 0.18 matches the Zone-V/Munsell middle-grey convention; lower values aim for a darker overall look.", CVAR_ARCHIVE);
     PT_CVAR(r_eye_adapt_speed, "0.20",  "Per-update interpolation factor for auto-exposure (0..1). Smaller = slower eye adaptation. The update fires every frame on the GPU (single-workgroup reduction over accum_hdr), so 0.20 settles ~80% in 5 frames, ~95% in 16 frames -- roughly 'eye-adapted in a quarter second at 60fps'.", CVAR_ARCHIVE);
@@ -2980,19 +2980,25 @@ void Engine::RegisterCommands() {
                 bool  auto_exposure;       // 0 forces manual r_exposure
                 float manual_exp;
             };
+            // exp_min for auto-exposure presets is set to 1e-6 (effectively
+            // "no floor") so genuine outdoor daylight scenes can settle to
+            // the ~1e-5 exposure scalar they actually need. The legacy
+            // 0.05 floor was capping the dimming and burning out skies.
+            // Locked-exposure presets (dslr_iso*, linear) keep min == max
+            // since they're not running auto-exposure.
             static const Preset presets[] = {
                 // Human eye: comfortable adaptation range, ~1s adapt time.
-                {"human",        0.05f,  4.0f,  0.18f, 0.20f, true,  1.5f},
+                {"human",        1e-6f,  4.0f,  0.18f, 0.20f, true,  1.5f},
                 // Cats: rod-rich retina, ~6x dim-light sensitivity.
-                {"cat",          0.05f, 12.0f,  0.18f, 0.30f, true,  1.5f},
+                {"cat",          1e-6f, 12.0f,  0.18f, 0.30f, true,  1.5f},
                 // Owls: nocturnal extreme, ~100x rod density of humans.
-                {"owl",          0.05f, 30.0f,  0.18f, 0.35f, true,  1.5f},
+                {"owl",          1e-6f, 30.0f,  0.18f, 0.35f, true,  1.5f},
                 // DSLR locked at ISO 100: no auto, fixed exposure.
                 {"dslr_iso100",  1.0f,   1.0f,  0.18f, 0.0f,  false, 1.0f},
                 // DSLR locked at ISO 6400: 64x more gain.
                 {"dslr_iso6400", 8.0f,   8.0f,  0.18f, 0.0f,  false, 8.0f},
                 // Smartphone: auto, modest range.
-                {"phone",        0.10f,  6.0f,  0.18f, 0.25f, true,  1.5f},
+                {"phone",        1e-6f,  6.0f,  0.18f, 0.25f, true,  1.5f},
                 // Linear: bypass exposure entirely (debug).
                 {"linear",       1.0f,   1.0f,  0.18f, 0.0f,  false, 1.0f},
             };
