@@ -27,6 +27,8 @@ extern const unsigned char shader_PathTrace_spirv_data[];
 extern const unsigned long shader_PathTrace_spirv_size;
 extern const unsigned char shader_AutoExposure_spirv_data[];
 extern const unsigned long shader_AutoExposure_spirv_size;
+extern const unsigned char shader_PerfOverlay_spirv_data[];
+extern const unsigned long shader_PerfOverlay_spirv_size;
 }
 
 namespace pt::rhi::vk {
@@ -812,8 +814,9 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         vkDestroyShaderModule(device_, mod, nullptr);
     };
 
-    build_pipeline("pathtrace",  shader_PathTrace_spirv_data,   shader_PathTrace_spirv_size);
-    build_pipeline("autoexpose", shader_AutoExposure_spirv_data, shader_AutoExposure_spirv_size);
+    build_pipeline("pathtrace",   shader_PathTrace_spirv_data,    shader_PathTrace_spirv_size);
+    build_pipeline("autoexpose",  shader_AutoExposure_spirv_data, shader_AutoExposure_spirv_size);
+    build_pipeline("perfoverlay", shader_PerfOverlay_spirv_data,  shader_PerfOverlay_spirv_size);
 
     if (!RecreateSwapchain()) return;
 

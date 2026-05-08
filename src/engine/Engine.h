@@ -139,6 +139,9 @@ private:
     std::uint64_t                               tonemap_pipeline_id_   = 0;
     std::uint64_t                               bloom_down_pipeline_id_ = 0;
     std::uint64_t                               bloom_up_pipeline_id_   = 0;
+    std::uint64_t                               perfoverlay_pipeline_id_ = 0;
+    std::uint64_t                               perfoverlay_drawlist_id_ = 0;
+    std::uint32_t                               perfoverlay_drawlist_capacity_ = 0;
     std::uint64_t                               autoexpose_pipeline_id_ = 0;
     std::uint64_t                               accum_texture_id_      = 0;
     // GPU-side exposure scalar: AutoExposure.slang updates this when
