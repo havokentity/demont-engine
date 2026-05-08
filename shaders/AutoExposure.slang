@@ -163,13 +163,22 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gid_3d : SV_GroupThreadID) {
     // target exposure (key/avg) that crushes the ground / shaded
     // areas to black while the sky still saturates ACES at the top.
     //
-    // The 1e3 cap means "for metering purposes, anything brighter
-    // than ~1000 nits is treated as 1000 nits". Scene elements at
-    // their actual luminance still flow through the path tracer to
-    // the swapchain at full HDR -- only the auto-exposure's "what's
-    // the typical scene luminance?" calculation ignores the extreme
-    // tail. Standard outlier-clipping technique used in pro cameras
-    // and most game engines for robust auto-exposure.
+    // The 1e2 cap (~100 nits) means "for metering purposes, anything
+    // brighter than ~100 nits is treated as 100 nits". 100 nits is
+    // roughly the brightness of a typical SDR display panel and the
+    // sRGB spec's reference white -- the natural target for "what
+    // the metering should consider fully bright". Anything brighter
+    // (sun-lit surfaces ~3e3 nits, sky ~1e4 nits, sun disc ~1.6e9
+    // nits) gets the same metering weight as a 100-nit pixel.
+    //
+    // Scene elements at their actual luminance still flow through
+    // the path tracer to the swapchain at full HDR -- only the
+    // auto-exposure's "what's the typical scene luminance?"
+    // calculation ignores the extreme tail. The bright end of the
+    // image still saturates ACES (correct for an SDR display
+    // showing midday sun), but mid-tones and shadows can land in
+    // the visible range because the metering isn't dragged up by
+    // the unbounded HDR tail.
     //
     // The if (lum > 0) guard skips truly zero pixels so they don't
     // pull the mean down toward log(eps) and bias dark-scene exposure.
@@ -182,7 +191,7 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gid_3d : SV_GroupThreadID) {
             float3 c = accum_hdr[uint2(x, y)].rgb;
             float lum = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
             if (lum > 0.0) {
-                sum += log(clamp(lum, 1e-6, 1e3));
+                sum += log(clamp(lum, 1e-6, 1e2));
                 cnt += 1u;
             }
         }
