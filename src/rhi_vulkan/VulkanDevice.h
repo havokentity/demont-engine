@@ -251,6 +251,7 @@ public:
     VkDescriptorSet     CurrentDescriptorSet() const { return dsets_[current_frame_]; }
     VkPipelineLayout    SharedPipelineLayout() const { return shared_pipe_layout_; }
     const BufferEntry&  CurrentFrameUbo() const { return frame_ubos_[current_frame_]; }
+    std::uint32_t       MaxPushConstantSize() const { return max_push_constant_size_; }
 };
 
 }  // namespace pt::rhi::vk

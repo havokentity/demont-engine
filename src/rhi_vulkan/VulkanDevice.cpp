@@ -183,8 +183,13 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     auto add_image = [&](std::uint32_t binding, VkImageView v) {
         auto& ii = img_infos[wc];
         ii.imageView   = v;
-        ii.imageLayout = (v == VK_NULL_HANDLE) ? VK_IMAGE_LAYOUT_UNDEFINED
-                                               : VK_IMAGE_LAYOUT_GENERAL;
+        // Use VK_IMAGE_LAYOUT_GENERAL for both bound and null storage-image
+        // descriptors. Validation layers expect a real, non-UNDEFINED
+        // layout for image descriptor writes -- robustness2 nullDescriptor
+        // makes the access produce zero, but the descriptor write itself
+        // still has to be spec-compliant. A stray UNDEFINED triggered
+        // VUID-VkWriteDescriptorSet errors on some drivers.
+        ii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         auto& w = writes[wc];
         w = {};
         w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -278,12 +283,21 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
                             0, 1, &dset, 0, nullptr);
 
     // Push constants: send only the on-chip prefix. The remainder lives
-    // in the Frame UBO uploaded above.
+    // in the Frame UBO uploaded above. Clamp to the device's actual
+    // pipeline-layout push range so we don't try to push more than the
+    // layout declares (max_push_constant_size_ may be < kPushSplitOffset
+    // on devices with a tighter VkPhysicalDeviceLimits::maxPushConstantsSize,
+    // or future increases of kPushSplitOffset would otherwise trigger
+    // VUID-vkCmdPushConstants-offset-01795).
     if (push_size_ > 0) {
+        const std::uint32_t layout_push_max = std::min<std::uint32_t>(
+            VulkanDevice::kPushSplitOffset, device_->MaxPushConstantSize());
         std::uint32_t to_push = static_cast<std::uint32_t>(
-            std::min<std::size_t>(push_size_, VulkanDevice::kPushSplitOffset));
-        vkCmdPushConstants(cb_, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                           to_push, push_buf_);
+            std::min<std::size_t>(push_size_, layout_push_max));
+        if (to_push > 0) {
+            vkCmdPushConstants(cb_, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                               to_push, push_buf_);
+        }
     }
     vkCmdDispatch(cb_, gx, gy, gz);
 }
@@ -313,8 +327,16 @@ void VulkanCommandBuffer::Barrier(const BarrierDesc& d) {
                 break;
             case BarrierDesc::Stage::Transfer:
                 stage_mask  = VK_PIPELINE_STAGE_TRANSFER_BIT;
-                access_mask = is_dst ? VK_ACCESS_TRANSFER_WRITE_BIT
-                                     : VK_ACCESS_TRANSFER_READ_BIT;
+                // Cover both directions on Transfer because the engine's
+                // coarse Stage enum doesn't distinguish "transfer wrote
+                // (vkCmdCopy*)" from "transfer will read" -- and the
+                // most common Transfer->* barrier in this engine is
+                // upload-then-shader-read, which needs srcAccess to
+                // include TRANSFER_WRITE_BIT or the visibility step
+                // is a no-op. Allowing both bits in both directions
+                // is the conservative cross-direction fix.
+                access_mask = VK_ACCESS_TRANSFER_READ_BIT
+                            | VK_ACCESS_TRANSFER_WRITE_BIT;
                 break;
             case BarrierDesc::Stage::Present:
                 // Present-side barriers are handled by the swapchain
@@ -1190,14 +1212,27 @@ void VulkanDevice::DestroyBuffer(BufferHandle h) {
 void VulkanDevice::WriteBuffer(BufferHandle h, const void* src, std::size_t size,
                                std::size_t dst_offset) {
     if (src == nullptr || size == 0 || device_ == VK_NULL_HANDLE) return;
-    VkBuffer dst_buf = VK_NULL_HANDLE;
+    VkBuffer    dst_buf  = VK_NULL_HANDLE;
+    std::size_t dst_size = 0;
     {
         std::lock_guard lock(resource_mutex_);
         auto it = buffers_.find(h.id);
         if (it == buffers_.end()) return;
-        dst_buf = it->second.buffer;
+        dst_buf  = it->second.buffer;
+        dst_size = it->second.size;
     }
     if (dst_buf == VK_NULL_HANDLE) return;
+    // Bounds-check the requested copy region against the destination
+    // buffer's allocated size. Without this, a caller passing an
+    // incorrect size / offset triggers vkCmdCopyBuffer past the buffer's
+    // end -- validation error / undefined behaviour on real drivers.
+    if (dst_offset > dst_size || size > dst_size - dst_offset) {
+        LOG_ERROR("Vulkan WriteBuffer: copy region [{} +{}] exceeds buffer size {}",
+                  static_cast<std::uint64_t>(dst_offset),
+                  static_cast<std::uint64_t>(size),
+                  static_cast<std::uint64_t>(dst_size));
+        return;
+    }
 
     // Stage CPU bytes through a transient host-visible buffer, then
     // vkCmdCopyBuffer to the device-local destination. Synchronous
@@ -1605,14 +1640,25 @@ bool VulkanDevice::ReadbackTexture(TextureHandle h, void* dst, std::size_t dst_s
 bool VulkanDevice::ReadbackBuffer(BufferHandle h, void* dst, std::size_t bytes) {
     if (dst == nullptr || bytes == 0 || device_ == VK_NULL_HANDLE) return false;
 
-    VkBuffer src = VK_NULL_HANDLE;
+    VkBuffer    src      = VK_NULL_HANDLE;
+    std::size_t src_size = 0;
     {
         std::lock_guard lock(resource_mutex_);
         auto it = buffers_.find(h.id);
         if (it == buffers_.end()) return false;
-        src = it->second.buffer;
+        src      = it->second.buffer;
+        src_size = it->second.size;
     }
     if (src == VK_NULL_HANDLE) return false;
+    // Bounds-check: a caller passing an oversized `bytes` would otherwise
+    // copy past the source buffer's allocation -- spec violation /
+    // undefined behaviour.
+    if (bytes > src_size) {
+        LOG_ERROR("Vulkan ReadbackBuffer: requested {} bytes from buffer of size {}",
+                  static_cast<std::uint64_t>(bytes),
+                  static_cast<std::uint64_t>(src_size));
+        return false;
+    }
 
     // One-shot synchronous readback, mirrors ReadbackTexture's pattern.
     // Engine storage buffers are DEVICE_LOCAL only -- copy through a
