@@ -1831,6 +1831,18 @@ void Engine::RenderFrame() {
         cb->BindComputePipeline(pt::rhi::PipelineHandle{tonemap_pipeline_id_});
         cb->BindStorageTexture(0, pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
         cb->BindStorageTexture(1, fc.swapchain_image);
+        // Live GPU-side exposure scalar. The shader reads
+        // `exposure_state[0]` for its `c * exposure_state[0]` tonemap
+        // multiply -- same buffer + same path PathTrace.slang's inline
+        // tonemap uses, so Mac's post-pass tonemap and Win's inline one
+        // see the identical adapted exposure value every frame. Slang
+        // assigns this storage buffer to MSL slot 0 (no AS, no other
+        // storage buffers in Tonemap), and the push constant block
+        // lands at slot 1 -- matches MetalCommandBuffer::Dispatch's
+        // push_slot = max_buf_slot + 1 rule.
+        if (exposure_state_id_ != 0) {
+            cb->BindBuffer(0, pt::rhi::BufferHandle{exposure_state_id_}, 0);
+        }
         // Bind bloom mip 0 (built above) when bloom is on, else a
         // 1x1 zero texture so the slot has *something* and the
         // shader's branch on bloom_intensity > 0 keeps it skipped.
@@ -1925,24 +1937,12 @@ void Engine::RenderFrame() {
             PtShaderGhost ghosts[lensflare::kMaxGhosts];
         } tp{};
         static_assert(sizeof(TonePush) % 16 == 0, "TonePush 16-byte aligned");
-        // Tonemap push exposure: pull straight from the r_exposure cvar
-        // rather than from push.exposure_pad[0] (which was sourced from
-        // the host-side `current_exposure_` field that I correctly
-        // deleted in db61e68 -- but I missed that the Mac post-pass
-        // tonemap was the actual reader, so zeroing the slot painted
-        // the screen black). Sourcing from the cvar is closer to the
-        // pre-cleanup behaviour: in manual mode (r_auto_exposure=0)
-        // it's exactly what the user typed; in auto mode the cvar
-        // sits at its default and the auto-exposure shader's GPU
-        // value never makes it here. That last bit is a real
-        // limitation -- Mac's post-pass tonemap won't track the
-        // GPU-side adaptation -- and the proper fix is to wire
-        // `exposure_state[0]` into Tonemap.slang the same way
-        // PathTrace.slang reads it. Filed as a follow-up; the
-        // immediate priority here is unbreaking the boot.
-        float r_exposure_val = 1.5f;
-        if (auto* v = C.FindCVar("r_exposure")) r_exposure_val = v->GetFloat();
-        tp.exposure         = r_exposure_val;
+        // tp.exposure is now dead in the shader -- Tonemap.slang reads
+        // exposure_state[0] from the bound buffer instead (matches
+        // PathTrace.slang's inline tonemap path). The field stays in
+        // the struct so the C++/MSL layouts don't shift; zero it so a
+        // stale value doesn't mislead anyone reading a push dump.
+        tp.exposure         = 0.0f;
         tp.passthrough      = hdr_pipeline ? 0u : 1u;
         tp.bloom_intensity  = (bloom_on && bloom_h.id == bloom_mip_tex_id_[0])
                                 ? bloom_intensity : 0.0f;

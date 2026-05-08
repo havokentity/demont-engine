@@ -23,6 +23,13 @@
 // rest of the image. Always bound; the engine zero-fills it (or
 // passes a 1x1 dummy) when r_bloom = 0 and bloom_intensity = 0.
 [[vk::binding(2, 0)]] RWTexture2D<float4> bloom_tex;
+// GPU-resident exposure scalar. Same buffer PathTrace.slang reads in
+// its inline tonemap path, written every frame by AutoExposure.slang
+// (or seeded by the engine's r_exposure on_change hook in manual
+// mode). Reading here means Mac's post-pass tonemap tracks GPU-side
+// auto-exposure exactly the way the inline tonemap does on Vulkan,
+// without an exposure value round-tripping through the host.
+[[vk::binding(3, 0)]] RWStructuredBuffer<float> exposure_state;
 
 // Physical-flare ghost record. 32 bytes -- matches the C++ struct in
 // Engine.cpp (TonePush::PtShaderGhost). Per-channel scale factor
@@ -302,7 +309,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 float sun_off = saturate(length(sun_uv - 0.5) * 4.0);
                 c += flare_intensity * flare * fade * vis * sun_off;
             }
-            float3 ldr_phys = (passthrough != 0u) ? c : acesTonemap(c * exposure);
+            float3 ldr_phys = (passthrough != 0u) ? c : acesTonemap(c * exposure_state[0]);
             ldr_out[tid.xy] = float4(ldr_phys, 1.0);
             return;
         }
@@ -362,7 +369,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 }
                 c += flare_intensity * flare;
             }
-            float3 ldr_sun = (passthrough != 0u) ? c : acesTonemap(c * exposure);
+            float3 ldr_sun = (passthrough != 0u) ? c : acesTonemap(c * exposure_state[0]);
             ldr_out[tid.xy] = float4(ldr_sun, 1.0);
             return;
         }
@@ -498,6 +505,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
             return;
         }
     }
-    float3 ldr = (passthrough != 0u) ? c : acesTonemap(c * exposure);
+    float3 ldr = (passthrough != 0u) ? c : acesTonemap(c * exposure_state[0]);
     ldr_out[tid.xy] = float4(ldr, 1.0);
 }
