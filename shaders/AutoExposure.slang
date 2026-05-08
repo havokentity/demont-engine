@@ -8,9 +8,11 @@
 // (geometric mean) luminance via group-shared reduction, then
 // writes the smoothed exposure scalar back into the persistent
 // ExposureState buffer. The path tracer's tonemap reads
-// `exposure_state[0]` directly -- no CPU readback, no GPU-side
-// pipeline barrier between the path-trace dispatch and the next
-// frame.
+// `exposure_state[0]` directly on the next frame -- no CPU readback,
+// no queue stall. The engine emits a compute-write -> compute-read
+// barrier between the path-trace dispatch and this kernel inside
+// the same command buffer (Vulkan needs it explicitly; Metal
+// auto-barriers between dispatches on a shared resource).
 //
 // Why log-average rather than arithmetic mean? Real-world HDR
 // scenes produce extreme outliers -- the sun disc reaches ~1.6e9
@@ -100,23 +102,20 @@ groupshared uint  g_lum_count[64];
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID, uint gid : SV_GroupIndex) {
-    // Why SV_GroupIndex (linear, 0..total-1) instead of computing it
-    // from SV_GroupThreadID? Cross-backend safety. The Metal RHI's
-    // MetalCommandBuffer::Dispatch dispatches with threadgroup shape
-    // derived from the pipeline's threadExecutionWidth (32 on Apple
-    // GPUs) and maxTotalThreadsPerThreadgroup (64 here), giving an
-    // actual runtime threadgroup shape of (32, 2, 1) -- NOT (8, 8, 1)
-    // as [numthreads] declares. So SV_GroupThreadID at runtime spans
-    // (0..31, 0..1, 0) on Mac, while on Vulkan the [numthreads(8,8,1)]
-    // shape is honored and SV_GroupThreadID spans (0..7, 0..7, 0).
-    // Hand-linearizing from a hard-coded 2D shape gets the wrong
-    // result on whichever backend doesn't match the assumed shape.
-    //
-    // SV_GroupIndex (mapped to MSL's [[thread_index_in_threadgroup]]
-    // and SPIR-V's LocalInvocationIndex) is the threadgroup-local
-    // linear index 0..total-1, computed by the GPU from whatever
-    // shape it actually used. Always 0..63 here, on any backend.
-    // Standard HLSL semantic; the right tool for this exact case.
+    // SV_GroupIndex (linear, 0..total-1) is the right semantic for the
+    // strided reduction loop: every thread maps to a unique position
+    // in g_lum_sum / g_lum_count without any 2D->1D math the shader
+    // has to do itself. Maps to MSL's [[thread_index_in_threadgroup]]
+    // and SPIR-V's LocalInvocationIndex. Always 0..63 here regardless
+    // of the underlying threadgroup shape Metal / Vulkan actually
+    // dispatched with -- which matters because earlier MetalCommandBuffer
+    // versions auto-derived tgsize from the pipeline's threadExecutionWidth
+    // (~32 on Apple silicon) and produced a (32,2,1) shape instead of the
+    // declared (8,8,1). Today MetalCommandBuffer::Dispatch hardcodes
+    // tgsize = (8,8,1) to match every kernel's [numthreads] declaration,
+    // so the historical reason is gone, but using SV_GroupIndex stays the
+    // right call -- it's still the cleanest, most portable way to write
+    // a strided 1D reduction loop.
     // Force Slang to emit the dummy bindings even though they're
     // unused at runtime. The compiler can't statically prove
     // `width == 0xDEADBEEFu` is false (width comes from a runtime
@@ -150,9 +149,9 @@ void main(uint3 tid : SV_DispatchThreadID, uint gid : SV_GroupIndex) {
     uint total   = w_steps * h_steps;
 
     // Per-thread accumulation in LOG space, with luminance clipped to
-    // [1e-6, 1e3] before logging. The lower floor (1e-6) keeps log()
-    // finite for near-black pixels; the upper cap (1e3 ~ 1000 nits)
-    // is the critical bit for HDR-realistic outdoor scenes:
+    // [1e-6, 1e2] before logging. The lower floor (1e-6) keeps log()
+    // finite for near-black pixels; the upper cap (1e2 ~ 100 nits, the
+    // sRGB reference-white target) is the critical bit for HDR scenes:
     //
     //   - Real-world sky luminance: ~1e4 nits
     //   - Bright cloud / sun-lit white wall: ~1e3-1e4 nits

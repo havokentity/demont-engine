@@ -41,9 +41,12 @@ constexpr bool kEnableValidation = true;
 constexpr bool kEnableValidation = false;
 #endif
 
-// Engine slot -> shader vk::binding translation. The unified PathTrace
-// shader uses bindings 0-13; Tonemap/Bloom* re-use a subset. Engine
-// code in Engine.cpp uses 8-element textures, 8-element buffers, and
+// Engine slot -> shader vk::binding translation. The unified descriptor
+// set has 16 bindings (0-15): storage_image x8 (output / accum_hdr /
+// denoise_color / depth / motion / env_map / star_map / moon_map),
+// AS x1 (scene_tlas), storage_buffer x6 (mesh / cdf / exposure_state),
+// uniform_buffer x1 (Frame UBO at binding 14). Tonemap / Bloom* re-use
+// a subset. Engine.cpp uses 8-element textures, 8-element buffers, and
 // 4-element accel-struct slot arrays as if Metal-style argument tables;
 // we flatten these into the single Vulkan descriptor set here.
 constexpr std::uint32_t kSlotToTexBinding[8] = {
@@ -675,7 +678,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
 
     // ---- Descriptor pool ---------------------------------------------
     // Sizing matches the expanded layout below:
-    //   8 storage_image  + 1 accel_struct + 5 storage_buffer + 1 ubo
+    //   8 storage_image  + 1 accel_struct + 6 storage_buffer + 1 ubo
     //   per set, x kFramesInFlight sets, with headroom.
     std::array<VkDescriptorPoolSize, 4> psizes{};
     psizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kFramesInFlight * 8 + 4 };
