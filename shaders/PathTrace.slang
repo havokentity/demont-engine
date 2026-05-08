@@ -1580,6 +1580,28 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 throughput /= p;
             }
         }
+        // Surface aerial perspective. All radiance accumulated above
+        // (direct surface NEE + multi-bounce indirect + diffuse sky
+        // ambient at the surface point) reaches the camera through the
+        // air mass between camera and primary hit, so attenuate by the
+        // analytical Mie + Rayleigh transmittance over [0, primary_t].
+        // Gated on primary_hit: sky-on-miss radiance is the sky's
+        // already-baked appearance at infinity (HDRI / procSky already
+        // include atmospheric absorption); attenuating again would
+        // double-count and dim the horizon.
+        //
+        // Order matters: this multiplication runs BEFORE the atmospheric
+        // in-scatter march and cloud march below. Those marches add
+        // their own pre-attenuated contributions (each in-scatter event
+        // weighted by trans_eye-up-to-that-depth, each cloud sample
+        // multiplied by atmosphericTransmittance(0, sample_t) inside
+        // the loop) so they compose correctly with the surface's
+        // aerial-perspective term.
+        if (primary_hit) {
+            float3 trans_atm_surf = atmosphericTransmittance(
+                primary_ro, primary_rd, primary_t);
+            radiance *= trans_atm_surf;
+        }
         // Volumetric single-scatter along the primary ray. Two
         // independent marches because the natural sampling rates
         // differ:
