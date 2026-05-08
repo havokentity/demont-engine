@@ -337,7 +337,11 @@ bool WinOverlay::Init(HWND parent) {
     hwnd_ = CreateWindowExW(
         WS_EX_LAYERED,        // uniform-alpha translucency, see below
         class_name, L"",
-        WS_CHILD,
+        // WS_CLIPSIBLINGS prevents this window from painting into the
+        // perf-overlay sibling's pixels (and vice versa) when both are
+        // visible -- without it, the aggressive repaint pump on the
+        // perf HUD leaves stale "copy" artifacts on the console.
+        WS_CHILD | WS_CLIPSIBLINGS,
         0, y, parent_w_, panel_h_,
         parent_, nullptr,
         GetModuleHandleW(nullptr), this);
@@ -352,7 +356,7 @@ bool WinOverlay::Init(HWND parent) {
         SetLastError(0);
         hwnd_ = CreateWindowExW(
             0, class_name, L"",
-            WS_CHILD,
+            WS_CHILD | WS_CLIPSIBLINGS,
             0, y, parent_w_, panel_h_,
             parent_, nullptr,
             GetModuleHandleW(nullptr), this);

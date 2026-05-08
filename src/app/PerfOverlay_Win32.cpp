@@ -155,7 +155,11 @@ bool WinPerf::Init(HWND parent) {
     hwnd_ = CreateWindowExW(
         WS_EX_LAYERED,
         class_name, L"",
-        WS_CHILD,
+        // WS_CLIPSIBLINGS pairs with the same flag on the console
+        // overlay so neither sibling's repaint clobbers the other's
+        // pixels -- without it, the aggressive RDW_UPDATENOW pump
+        // here leaves "copy" artifacts on the console panel.
+        WS_CHILD | WS_CLIPSIBLINGS,
         0, 0, kPanelW, 64,
         parent_, nullptr,
         GetModuleHandleW(nullptr), this);
@@ -167,7 +171,7 @@ bool WinPerf::Init(HWND parent) {
         hwnd_ = CreateWindowExW(
             0,
             class_name, L"",
-            WS_CHILD,
+            WS_CHILD | WS_CLIPSIBLINGS,
             0, 0, kPanelW, 64,
             parent_, nullptr,
             GetModuleHandleW(nullptr), this);
