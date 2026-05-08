@@ -1770,11 +1770,36 @@ void main(uint2 tid : SV_DispatchThreadID) {
     }
     frame_radiance /= float(sample_count);
 
+    // Sanitize: replace NaN / Inf / negative channels with 0 before the
+    // running-mean update below. Without this, a single rare bad sample
+    // (e.g. transmittance edge case, env.pdf underflowing to ~0 between
+    // the > 0 check and the divide, sqrt of slightly-negative numerical
+    // residues) injects NaN into accum_hdr[tid]. The running-mean update
+    // is `avg = (prev * n_old + new) / n_new`, so NaN propagates through
+    // prev forever -- that pixel becomes a permanent black speck. Over
+    // many minutes of static-camera accumulation, the contaminated pixel
+    // set grows monotonically. Replacing non-finite samples with 0 lets
+    // the running mean simply skip the bad sample and keep accumulating
+    // the good ones for that pixel.
+    {
+        bool3 bad = isnan(frame_radiance) || isinf(frame_radiance);
+        frame_radiance = select(bad, float3(0.0), max(frame_radiance, float3(0.0)));
+    }
+
     // Online running mean. reset_accum=1 starts a fresh average. The
     // `n_new` we record is the count of samples averaged into this
     // pixel -- with spp>1 we could store sample_count there, but the
     // shader only reads it as a weight, so 1-per-frame is fine.
     float4 prev = (reset_accum != 0u) ? float4(0,0,0,0) : accum_hdr[tid];
+    // Sanitize prev: if the previous-frame sample was already NaN/Inf
+    // (e.g. from a build before sanitization landed, or imported state),
+    // restart that pixel rather than re-averaging in the contamination.
+    {
+        bool3 prev_bad = isnan(prev.rgb) || isinf(prev.rgb);
+        if (any(prev_bad) || isnan(prev.a) || isinf(prev.a)) {
+            prev = float4(0, 0, 0, 0);
+        }
+    }
     float n_new = prev.a + 1.0;
     float3 avg  = (prev.rgb * prev.a + frame_radiance) / n_new;
     accum_hdr[tid] = float4(avg, n_new);
