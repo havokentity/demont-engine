@@ -1818,9 +1818,20 @@ void Engine::RenderFrame() {
                      pt::rhi::BarrierDesc::Stage::ComputeRead});
 
         cb->BindComputePipeline(pt::rhi::PipelineHandle{autoexpose_pipeline_id_});
-        // accum_hdr stays bound at slot 1 from the path-trace dispatch;
-        // exposure_state at slot 6. The autoexpose shader only reads
-        // those two -- other slots stay bound but are ignored.
+        // CRITICAL: re-bind accum_hdr and exposure_state AFTER
+        // BindComputePipeline. On Metal, BindComputePipeline clears all
+        // resource binds (see MetalCommandBuffer::BindComputePipeline)
+        // -- the path-tracer's binds do NOT carry over. On Vulkan binds
+        // persist across pipeline switches (the descriptor set is
+        // rewritten every Dispatch from bound_tex_/bound_buf_), but
+        // explicit re-binds work there too and keep the engine code
+        // backend-agnostic. Without this, AutoExposure on Mac runs with
+        // accum_hdr nil (reads zero), exposure_state nil (writes drop),
+        // and push constants land at the wrong MSL slot (push_slot is
+        // computed as max-bound-buf+1 = 0 instead of the kernel's
+        // declared buffer(7)) -- exposure converges to garbage.
+        cb->BindStorageTexture(1, pt::rhi::TextureHandle{accum_texture_id_});
+        cb->BindBuffer(6, pt::rhi::BufferHandle{exposure_state_id_}, 0);
         cb->PushConstants(&ae, sizeof(ae));
         cb->Dispatch(1, 1, 1);  // single workgroup of 64 threads
     }
