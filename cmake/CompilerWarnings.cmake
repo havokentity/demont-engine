@@ -38,7 +38,18 @@ function(pt_set_compiler_options target)
         )
         target_compile_options(${target} PRIVATE
             $<$<CONFIG:Debug>:/Od>
-            $<$<CONFIG:Debug>:/Zi>
+            # /Z7 (debug info embedded in .obj) instead of /Zi
+            # (separate .pdb written via mspdbsrv.exe).  /Zi forces
+            # every parallel cl.exe to funnel writes through one
+            # serialised PDB-server process, which on a 16-core
+            # build effectively bottlenecks at ~2-3 cores worth of
+            # throughput regardless of -j or jobs:0 settings.
+            # /Z7 lets each TU compile fully independently --
+            # typical 3-5x speedup on multicore Windows builds with
+            # zero runtime impact and same debugger info quality.
+            # Trade-off: .obj files are ~30% bigger, final linker
+            # PDB roughly the same size.
+            $<$<CONFIG:Debug>:/Z7>
             $<$<CONFIG:Release>:/O2>
             $<$<CONFIG:Release>:/fp:fast>
             $<$<CONFIG:Release>:/DNDEBUG>
