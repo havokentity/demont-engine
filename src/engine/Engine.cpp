@@ -117,6 +117,18 @@ namespace cvar {
             "Default points at the bundled CC0 sunset HDRI; resolves relative to CWD.",
             CVAR_ARCHIVE);
     PT_CVAR(r_env_intensity,   "1.0","Scalar multiplier on env-map samples. Useful for darkening/brightening the IBL without re-authoring the HDRI.", CVAR_ARCHIVE);
+    PT_CVAR(r_hdri_extract_percentile, "0.005",
+            "Top-luminance percentile threshold (0..0.5) for HDRI light "
+            "cluster extraction. Pixels above this percentile are flood-"
+            "filled into directional lights for crisp shadows. Default 0.005 "
+            "(top 0.5%) catches sun-class peaks on outdoor HDRIs and lamp "
+            "cores on interiors. Lower (e.g. 0.002) extracts only the very "
+            "brightest -- useful when an interior HDRI is over-extracting "
+            "stray bright pixels into spurious lights. Higher (e.g. 0.02) "
+            "catches dimmer features but risks merging the sky into the "
+            "extracted set. Takes effect on next env-map (re)load: change "
+            "this then re-set r_env_map to retrigger extraction.",
+            CVAR_ARCHIVE);
 
     // Procedural sky (Preetham-lite analytic). Used when r_sky_mode is
     // "procedural". The sun position drives both the sky colour gradient
@@ -899,13 +911,21 @@ void Engine::ReloadEnvMap(const std::string& path) {
         // raw nits is "image is dim, no real lights detectable".
         constexpr float kMinPeakLum = 0.5f;
         if (peak_lum > kMinPeakLum) {
-            // Top 0.5% percentile by partial-sort. Replaces the prior
-            // fixed 50%-of-peak rule which only worked for sun-class
-            // peaks (interiors with a 100-nit lamp under a 1e6-nit-
-            // peak rule extracted nothing).
-            constexpr double kTopFrac = 0.005;
+            // Top-N% percentile threshold via partial-sort. The default
+            // 0.5% is sun-tuned but works for indoor HDRIs too because
+            // it scales with whatever the brightest content actually is
+            // (vs the prior fixed 50%-of-peak rule which only fired
+            // when peak luminance was sun-class). Driver: r_hdri_
+            // extract_percentile cvar, clamped to (0, 0.5] so the
+            // threshold stays at a meaningful "bright" tail.
+            double top_frac = 0.005;
+            if (auto* v = pt::console::Console::Get().FindCVar("r_hdri_extract_percentile")) {
+                top_frac = double(v->GetFloat());
+                if (top_frac < 1e-6) top_frac = 1e-6;
+                if (top_frac > 0.5)  top_frac = 0.5;
+            }
             const std::size_t k_idx = N_pix - std::max<std::size_t>(
-                1, std::size_t(double(N_pix) * kTopFrac));
+                1, std::size_t(double(N_pix) * top_frac));
             std::vector<float> lums_sorted = lums;  // nth_element mutates
             std::nth_element(lums_sorted.begin(),
                              lums_sorted.begin() + k_idx,
