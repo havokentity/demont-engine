@@ -1831,17 +1831,20 @@ void Engine::RenderFrame() {
         cb->BindComputePipeline(pt::rhi::PipelineHandle{tonemap_pipeline_id_});
         cb->BindStorageTexture(0, pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
         cb->BindStorageTexture(1, fc.swapchain_image);
-        // Live GPU-side exposure scalar. The shader reads
-        // `exposure_state[0]` for its `c * exposure_state[0]` tonemap
-        // multiply -- same buffer + same path PathTrace.slang's inline
-        // tonemap uses, so Mac's post-pass tonemap and Win's inline one
-        // see the identical adapted exposure value every frame. Slang
-        // assigns this storage buffer to MSL slot 0 (no AS, no other
-        // storage buffers in Tonemap), and the push constant block
-        // lands at slot 1 -- matches MetalCommandBuffer::Dispatch's
-        // push_slot = max_buf_slot + 1 rule.
+        // exposure_state is already bound at engine slot 6 from the
+        // path-trace dispatch earlier this frame. Tonemap.slang has
+        // been padded with dummy bindings so its MSL emission puts
+        // exposure_state at MSL buffer(6) and Push at buffer(7) --
+        // matching PathTrace's layout and the engine's universal
+        // push_slot=max_bound_slot+1=7 contract. So we don't need
+        // to rebind here; the inheritance from PathTrace's
+        // BindBuffer(6, exposure_state) is exactly what Tonemap
+        // expects on Metal. Vulkan's descriptor sets carry the
+        // same vk::binding(15) population from PathTrace's set.
+        // (Defensive: if PathTrace didn't run for some reason, the
+        // explicit bind ensures it's there.)
         if (exposure_state_id_ != 0) {
-            cb->BindBuffer(0, pt::rhi::BufferHandle{exposure_state_id_}, 0);
+            cb->BindBuffer(6, pt::rhi::BufferHandle{exposure_state_id_}, 0);
         }
         // Bind bloom mip 0 (built above) when bloom is on, else a
         // 1x1 zero texture so the slot has *something* and the

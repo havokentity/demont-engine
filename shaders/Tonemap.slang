@@ -14,6 +14,24 @@
 //   slot 1 (texture) : ldr_out -- swapchain (BGRA8Unorm_sRGB) -- the
 //                       linear-to-sRGB encode is implicit on store.
 
+// MSL SLOT ALIGNMENT NOTICE -- mirrors AutoExposure.slang's notice.
+// Slang's MSL backend assigns Metal buffer/texture slots in
+// DECLARATION order. The engine's MetalCommandBuffer::Dispatch
+// computes push_slot = max(bound_buf_slot)+1, which on every dispatch
+// after PathTrace lands at buf(7) (PathTrace binds slots 1..6, AS at
+// buffer slot 0). For the engine's setBytes(push, push_slot=7) call
+// to actually reach the kernel's Push cbuffer, every kernel's MSL
+// Push must be at buffer(7). Without padding, Tonemap.slang's
+// declaration order would emit Push at buffer(1) -- engine's setBytes
+// goes to buf(7), Tonemap's kernel reads buf(1) which is whatever
+// PathTrace had bound there (box_vbuf), and the entire push struct
+// is garbage. exposure_state was also reading buf(0) which gets
+// silently overwritten by setAccelerationStructure(0).
+//
+// Fix: pad declaration order to match PathTrace's emission so Push
+// lands at buffer(7) for ALL kernels. Dummies referenced in a
+// runtime-conditional dead branch so Slang's optimizer keeps them.
+
 [[vk::binding(0, 0)]] RWTexture2D<float4> hdr_in;
 [[vk::binding(1, 0)]] RWTexture2D<float4> ldr_out;
 // Half-res linear HDR bloom layer. The engine builds this each frame
@@ -23,13 +41,24 @@
 // rest of the image. Always bound; the engine zero-fills it (or
 // passes a 1x1 dummy) when r_bloom = 0 and bloom_intensity = 0.
 [[vk::binding(2, 0)]] RWTexture2D<float4> bloom_tex;
+
+// --- buffer slot padding to push exposure_state to MSL buf(6) and
+//     Push (cbuffer) to MSL buf(7) ----------------------------------
+[[vk::binding(4, 0)]]  RaytracingAccelerationStructure _slot_tlas;        // buf(0)
+[[vk::binding(5, 0)]]  StructuredBuffer<float>  _slot_mesh_positions;     // buf(1)
+[[vk::binding(6, 0)]]  StructuredBuffer<uint>   _slot_mesh_indices;       // buf(2)
+[[vk::binding(7, 0)]]  StructuredBuffer<float4> _slot_primitives;         // buf(3)
+[[vk::binding(8, 0)]]  StructuredBuffer<float>  _slot_marginal_cdf;       // buf(4)
+[[vk::binding(9, 0)]]  StructuredBuffer<float>  _slot_conditional_cdf;    // buf(5)
+
 // GPU-resident exposure scalar. Same buffer PathTrace.slang reads in
 // its inline tonemap path, written every frame by AutoExposure.slang
 // (or seeded by the engine's r_exposure on_change hook in manual
 // mode). Reading here means Mac's post-pass tonemap tracks GPU-side
 // auto-exposure exactly the way the inline tonemap does on Vulkan,
-// without an exposure value round-tripping through the host.
-[[vk::binding(3, 0)]] RWStructuredBuffer<float> exposure_state;
+// without an exposure value round-tripping through the host. Lands
+// at MSL buf(6) thanks to the padding above.
+[[vk::binding(15, 0)]] RWStructuredBuffer<float> exposure_state;
 
 // Physical-flare ghost record. 32 bytes -- matches the C++ struct in
 // Engine.cpp (TonePush::PtShaderGhost). Per-channel scale factor
@@ -126,6 +155,25 @@ void main(uint3 tid : SV_DispatchThreadID) {
     uint2 dim;
     ldr_out.GetDimensions(dim.x, dim.y);
     if (tid.x >= dim.x || tid.y >= dim.y) return;
+
+    // Force Slang to emit the slot-padding dummy bindings (the
+    // optimizer would otherwise strip unused declarations and
+    // exposure_state would land at MSL buf(0) again, breaking the
+    // engine's push_slot=7 contract -- see the slot-alignment
+    // notice at the top of the file). The dim.x check is true for
+    // exactly tid (0,0) -- one thread per workgroup, branch is
+    // never taken at runtime anyway because tid.x < dim.x always
+    // holds after the bounds check above. Slang can't statically
+    // prove dim.x equals 0xDEADBEEFu so the branch survives.
+    if (dim.x == 0xDEADBEEFu) {
+        let p = _slot_mesh_positions[0];
+        let i = _slot_mesh_indices[0];
+        let q = _slot_primitives[0];
+        let m = _slot_marginal_cdf[0];
+        let c2 = _slot_conditional_cdf[0];
+        ldr_out[uint2(0, 0)] = float4(p, float(i), q.x, m + c2);
+        exposure_state[0] = p;
+    }
 
     float3 c = hdr_in[tid.xy].rgb;
 
