@@ -1,220 +1,150 @@
-# Vulkan swapchain sRGB encoding fix — handoff for Win Claude
+# Vulkan swapchain sRGB encoding fix — deploy & test
 
-> **Symptom**: demont's realtime output on Windows looks dimmer than on
-> Mac. PPM screenshots from both backends are byte-identical (path
-> tracer output is correct), but the on-screen image differs across
-> backends regardless of monitor calibration / Win HDR mode. User
-> intuition was correct: something is wrong on the Vulkan side.
+> Commit landed. Pull, build, test, decide.
 
-## Diagnosis
+## TL;DR for the user
 
-The two backends configure the swapchain asymmetrically:
+> demont was silently broken on Vulkan — the swapchain was missing the
+> linear→sRGB encode step that Mac/Metal does for free in hardware. Win
+> output ended up with the OS double-decoding linear values as if they
+> were already sRGB-encoded, making everything dimmer than the engine
+> intended. PPMs matched between backends because PPMs go through a
+> separate, correct, host-side tonemap; only the on-screen render path
+> was affected. Fix is a manual sRGB OETF inside the Slang shaders,
+> gated to the SPIR-V target so Mac stays untouched.
 
-```
-Mac  (Metal)  : MTLPixelFormatBGRA8Unorm_sRGB
-                (Apple silicon auto-encodes linear -> sRGB on STORAGE
-                 writes for sRGB pixel formats)
+## What landed
 
-Win  (Vulkan) : VK_FORMAT_B8G8R8A8_UNORM + VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
-                (no auto-encoding ever; OS treats stored bytes as already-
-                 sRGB-encoded and applies EOTF to produce panel light)
-```
+Commit on `feature/windows-nvidia` adds `srgb_oetf()` to PathTrace.slang
+and Tonemap.slang, gated by `#if defined(PT_TARGET_SPIRV)`, applied at
+every swapchain-write site:
 
-Both PathTrace.slang's inline tonemap and Tonemap.slang write **linear**
-ACES-tonemapped values directly to the swapchain, expecting the format
-to handle encoding. From `shaders/Tonemap.slang:14`:
+- `shaders/PathTrace.slang`: helper at the top of the file (next to
+  `acesTonemap`), and `output[tid] = float4(srgb_oetf(ldr), 1.0)`
+  at the end of `main`. The `denoise_color` write inside the
+  `if (denoiser_enabled)` branch is **deliberately** left linear —
+  it writes to a separate RGBA16F intermediate that Tonemap reads
+  later, must stay linear.
+- `shaders/Tonemap.slang`: helper near the top, `PT_SRGB_ENCODE(x)`
+  macro that expands to `srgb_oetf(x)` on SPIR-V and `(x)` on Metal,
+  applied at the three `acesTonemap(c * exposure_state[0])` sites
+  (physical flare branch, sun flare branch, main).
 
-```
-//   slot 1 (texture) : ldr_out -- swapchain (BGRA8Unorm_sRGB) -- the
-//                       linear-to-sRGB encode is implicit on store.
-```
+Mac path: zero behaviour change, the macro is a no-op on Metal.
 
-That assumption holds on Mac. It doesn't on Vulkan.
+Vulkan path: linear ACES output now gets sRGB-encoded before the
+swapchain store, so the OS's display-side EOTF reproduces the original
+linear correctly instead of double-decoding.
 
-What happens on Vulkan today:
+## How to deploy
 
-```
-shader writes linear 0.5
-  -> stored raw to UNORM image (0.5 in memory)
-  -> OS reads 0.5, applies sRGB EOTF (treats it as already encoded)
-  -> EOTF(0.5) ~= 0.215 linear
-  -> panel emits 0.215 linear instead of 0.5
-  -> image looks DIMMER (most strongly in midtones; black + white roughly
-     unchanged, but the curve in between is squashed).
-```
-
-Same on Mac:
-
-```
-shader writes linear 0.5
-  -> Apple silicon's BGRA8Unorm_sRGB storage write encodes -> 0.735
-  -> OS reads 0.735, applies sRGB EOTF -> 0.5 linear
-  -> panel emits 0.5 linear (correct)
+```sh
+git fetch origin feature/windows-nvidia
+git reset --hard origin/feature/windows-nvidia    # or rebase / merge
+cmake --build build/win-debug --parallel
+.\build\win-debug\src\app\demont.exe
 ```
 
-This is independent of Win HDR mode. With Win HDR off the Alienware
-shows the dimmed image at panel SDR brightness; with Win HDR on the
-DWM SDR-to-HDR remap further compresses to paper-white. Both Win paths
-are dimmer than Mac because the underlying sRGB encoding step is
-missing from the Vulkan write side.
+If Win Claude has local in-flight work, rebase rather than reset.
 
-## Vulkan spec evidence
+## What to expect visually
 
-From the Vulkan 1.3 spec on storage-image writes:
+**Before fix**: demont on Win was visibly dimmer than Mac (especially
+midtones). Highlights mostly fine, dark tones squashed.
 
-> Storage image writes do not perform format conversion for sRGB
-> formats. Linear values written to a storage image with an sRGB
-> format are stored as if the image had a non-sRGB UNORM format.
+**After fix**: demont on Win should look noticeably **brighter**, now
+matching what `screenshot win.ppm` looks like in Photoshop — which is
+also what Mac demont looks like onscreen. Side-by-side Mac and Win
+should now be brightness-matched (modulo monitor calibration).
 
-So even switching the swapchain format to `VK_FORMAT_B8G8R8A8_SRGB`
-**will not fix this** — storage writes still bypass the encode. Only
-color-attachment writes do the implicit encoding for SRGB formats.
+## Verification protocol
 
-## Fix options
+1. **Boot demont, eyeball the day scene.** Should look closer to Mac
+   than before.
 
-### Option A: manual OETF in the shader, gated to SPIR-V — RECOMMENDED
+2. **Take fresh PPMs, compare:**
+   ```
+   screenshot win_day_after_fix.ppm
+   ```
+   Should still byte-match Mac's PPM at same scene/cvars (PPMs go
+   through host-side tonemap, not the swapchain — so this stays
+   unchanged from before the fix; it's a regression check that I
+   didn't accidentally break the PPM path).
 
-Smallest change, fully portable across Vulkan drivers, doesn't touch
-the Metal path. Apply the sRGB OETF (linear -> sRGB encode) in the
-shader before storing to the swapchain output.
+3. **Take an OS-level screenshot of demont running.** Compare to a
+   Mac OS-level screenshot at the same scene/cvars. Now they should
+   look the same brightness.
 
-Slang snippet to drop into both `shaders/PathTrace.slang` and
-`shaders/Tonemap.slang`:
+## ⚠️ Critical: NVIDIA might be auto-encoding behind our back
 
-```slang
-// sRGB OETF (linear -> nonlinear). Standard piecewise definition
-// from IEC 61966-2-1: linear segment near zero, gamma ~2.4 above.
-float3 srgb_oetf(float3 c) {
-    c = max(c, float3(0.0, 0.0, 0.0));
-    float3 lin  = c * 12.92;
-    float3 expo = 1.055 * pow(c, float3(1.0/2.4)) - 0.055;
-    return select(c < 0.0031308, lin, expo);
-}
-```
+Vulkan spec only auto-encodes sRGB on **color-attachment** writes;
+storage-image writes are documented as bypassing the format conversion.
+**However**, some drivers (NVIDIA included historically) DO auto-encode
+on storage writes despite the spec, as a "helpful" non-portable
+behaviour. If that's the case here, this fix would **double-encode**
+on the RTX (driver encodes once, shader encodes again) and the image
+would look **too bright / washed out**.
 
-Then guard the swapchain write:
+If after deploying you see demont looking **nuked / blown out / too
+bright**, that's the symptom of double-encoding. The fix in that case
+is to revert the shader change and instead change the swapchain format
+to `VK_FORMAT_B8G8R8A8_SRGB` — letting the driver do the encode it's
+already doing.
 
-```slang
-float3 ldr = acesTonemap(avg * exposure);
-#if defined(PT_TARGET_SPIRV)
-    // Vulkan storage-image writes do not auto-encode sRGB even with
-    // VK_FORMAT_B8G8R8A8_SRGB format -- spec only auto-encodes for
-    // color-attachment writes. Apply OETF manually so the OS's
-    // EOTF-on-display reproduces the original linear values.
-    ldr = srgb_oetf(ldr);
-#endif
-output[tid] = float4(ldr, 1.0);
-```
+Test plan if the shader fix looks blown out:
 
-Three sites in Tonemap.slang (`acesTonemap(c * exposure_state[0])` x3),
-one main site in PathTrace.slang's inline tonemap (`output[tid] = ...`).
-The `denoise_color` write inside PathTrace.slang's denoiser-on path
-should NOT get the OETF — it writes to a separate RGBA16F texture
-that's later read by Tonemap.slang in linear space.
+1. Revert the shader change locally (don't push):
+   ```sh
+   git checkout shaders/PathTrace.slang shaders/Tonemap.slang
+   ```
+2. In `src/rhi_vulkan/VulkanDevice.cpp:921`, change:
+   ```cpp
+   swap_format_ = VK_FORMAT_B8G8R8A8_UNORM;
+   ```
+   to:
+   ```cpp
+   swap_format_ = VK_FORMAT_B8G8R8A8_SRGB;
+   ```
+   And update the surface-format probe loop right below to prefer
+   `VK_FORMAT_B8G8R8A8_SRGB`.
+3. Rebuild + run.
+4. If the image now looks correct (matches Mac), NVIDIA was indeed
+   auto-encoding storage writes and the format change is what we want.
+   Commit that as the fix instead of the shader change.
 
-`PT_TARGET_SPIRV` is already defined by `cmake/Slang.cmake` for the
-SPIR-V compile target; `PT_TARGET_METAL` for the MSL one. Existing
-example: `shaders/PathTrace.slang:184` uses `#if defined(PT_TARGET_SPIRV)`
-for the cbuffer Frame split.
+## How to confirm Mac stayed unchanged
 
-**Pros**:
-- Portable across every Vulkan driver (NVIDIA, AMD, Intel, Mesa)
-- Mac path completely untouched (Metal's storage-write auto-encode
-  on Apple silicon keeps doing its thing)
-- Tiny diff (~10 lines across two shaders)
-- Easy to A/B (toggle the `#if` to compare)
+Optional but worth doing once on the Mac side: take fresh PPMs +
+OS-level screenshots on Mac after pulling the fix, compare to
+pre-fix references. Should be byte-identical. If anything moves on
+Mac, the `#if defined(PT_TARGET_SPIRV)` gating leaked somewhere and
+needs investigation.
 
-**Cons**:
-- Extra ~5 ALU ops per output pixel (negligible at modern GPU rates)
-- Mac stays dependent on Apple silicon's storage-write encoding
-  behaviour, which isn't strictly Metal-spec-guaranteed but works
-  reliably on M1/M2/M3/M4
+## Why this was missed for so long
 
-### Option B: switch Vulkan to SRGB swapchain format + use color-attachment writes
+The Tonemap.slang header comment (line 14–15) explicitly documented
+the assumption: *"the linear-to-sRGB encode is implicit on store."*
+That's true on Apple silicon for `BGRA8Unorm_sRGB`. It's untrue on
+Vulkan generally and not even guaranteed by Vulkan spec for the
+analogous `B8G8R8A8_SRGB` format on storage writes. When P12 ported
+the engine to Vulkan it kept the assumption, picked `B8G8R8A8_UNORM`
+without the `_SRGB`, and shipped. The PPMs hid the bug because the
+PPM path bypasses the swapchain entirely.
 
-The architecturally "correct" answer. Requires:
+User was right to push back on the `r_output_scale` workaround — that
+would have masked this bug indefinitely.
 
-1. Change `VulkanDevice::RecreateSwapchain()` to prefer
-   `VK_FORMAT_B8G8R8A8_SRGB` over `_UNORM`.
-2. Change swapchain image USAGE to
-   `VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT` (already has this) and stop
-   using `VK_IMAGE_USAGE_STORAGE_BIT` for the swapchain output.
-3. Add a graphics pipeline (vertex + fragment shader) that does a
-   fullscreen-triangle pass reading the path tracer's output (now to
-   an intermediate non-swapchain texture) and writes to the swapchain
-   as a color attachment.
-4. Modify PathTrace.slang to write to a separate output texture,
-   not the swapchain directly.
-5. Add a render pass + framebuffer for the final fullscreen pass.
+## Don't do (post-mortem reminders)
 
-**Pros**: clean architecture, matches the standard Vulkan SDR sRGB
-pattern, no manual OETF in shaders.
-
-**Cons**: 200+ LoC change, requires new vertex shader, new graphics
-pipeline state, render-pass plumbing. Probably a separate PR. Not
-worth the complexity for a single-line shader fix when Option A
-solves the same problem.
-
-### Option C: do nothing (ship as-is, document the asymmetry)
-
-Could decide the dimmer Vulkan look is "fine, ship it." Argument
-against: the user explicitly observed the difference, and the engine's
-intent (linear ACES output through correct sRGB encoding to display)
-is genuinely broken on Vulkan. Shipping a buggy color pipeline is bad
-default. Don't pick this.
-
-## Recommended action
-
-**Land Option A.** Test plan:
-
-1. Add `srgb_oetf()` helper to both `PathTrace.slang` and
-   `Tonemap.slang`, gated on `PT_TARGET_SPIRV`.
-2. Apply at all the swapchain-write sites:
-   - `PathTrace.slang`: `output[tid] = float4(srgb_oetf_or_not(...), 1.0)`
-   - `Tonemap.slang`: three `c * exposure_state[0]` sites at lines
-     312, 372, 508
-3. Skip the OETF on the `denoise_color` write inside PathTrace.slang
-   (separate RGBA16F intermediate, must stay linear).
-4. Build + test on the Win box. Demont should look noticeably brighter
-   than before, and now match the Mac PPM-in-Photoshop reference.
-5. If matching is good, take fresh `screenshot win_day.ppm` and
-   compare to `mac_day.ppm` (should still be byte-identical since
-   PPMs go through the engine's own tonemap, not the swapchain).
-6. Take an OS-level screenshot of demont running and compare to
-   Mac's OS-level screenshot. They should now look the same brightness
-   regardless of monitor calibration (within calibration tolerance).
-
-## Things to verify on the RTX
-
-- Does NVIDIA's Vulkan driver actually auto-encode on storage writes
-  to `VK_FORMAT_B8G8R8A8_SRGB`? Spec says no, but some drivers do.
-  Test by switching to SRGB format with NO shader change; if image
-  becomes correct, NVIDIA is being non-spec-helpful and Option A's
-  shader OETF would double-encode (image too bright). If image stays
-  the same dim look, NVIDIA follows spec and Option A is the right
-  fix. **Verify before committing**.
-- After Option A lands, confirm there's no double-encoding on Mac
-  (the `#if defined(PT_TARGET_SPIRV)` should keep Metal untouched,
-  but visual A/B still worth a glance).
-
-## Why Mac was correct all along
-
-Apple silicon's storage-write path for `BGRA8Unorm_sRGB` does the
-linear -> sRGB OETF on store. This is documented Apple silicon
-behavior (not strictly Metal-spec, but reliable on M1+). So Metal +
-shader writing linear values + sRGB swapchain format -> correct.
-Vulkan + shader writing linear + UNORM swapchain (or SRGB swapchain
-with storage writes per spec) -> missing the OETF -> dim.
-
-Engine code assumed the Metal behaviour was universal. It isn't.
-Option A makes the assumption explicit and portable.
-
-## Don't do
-
-- Don't add an `r_output_scale` cvar to mask this. That dims Mac to
-  hide the fact that Vulkan is wrong, instead of fixing Vulkan. The
-  user already pushed back on this — correctly.
-- Don't switch swapchain to SRGB format without also switching to
-  color-attachment writes (Option B's full version). The format
-  change alone won't fix anything for storage writes.
-- Don't change the Metal path. It's already correct.
+- **Don't add `r_output_scale`.** The cvar would have applied a uniform
+  dim to compensate for the missing OETF, but the OETF is non-linear,
+  so the visual character would still be wrong (midtones especially).
+  Real fix is the OETF, not a multiplier.
+- **Don't change Mac's path.** It's correct (Apple silicon's
+  storage-write encoding for `BGRA8Unorm_sRGB` works as expected).
+  The macro / ifdef leaves it alone.
+- **Don't switch Vulkan swapchain format alone** (without the shader
+  fix) unless you've confirmed NVIDIA auto-encodes storage writes —
+  per spec it shouldn't, so on a strict driver you'd still be writing
+  un-encoded linear values into a SRGB-tagged image and the OS would
+  still mis-interpret them. Test before relying.

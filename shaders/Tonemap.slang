@@ -101,6 +101,25 @@ float3 acesTonemap(float3 c) {
     return saturate((c * (a * c + b)) / (c * (ck * c + d) + e));
 }
 
+// sRGB OETF (linear -> nonlinear) applied at swapchain-write sites on
+// the SPIR-V path. Mirror of PathTrace.slang's helper -- see that
+// file's long comment for the full reasoning. Short version: Vulkan
+// storage-image writes do NOT auto-encode sRGB even with
+// VK_FORMAT_B8G8R8A8_SRGB (only color-attachment writes do per spec),
+// so the encode happens here in the shader. Metal stays unchanged:
+// Apple silicon's BGRA8Unorm_sRGB storage write encodes implicitly.
+#if defined(PT_TARGET_SPIRV)
+float3 srgb_oetf(float3 c) {
+    c = max(c, float3(0.0, 0.0, 0.0));
+    float3 lin  = c * 12.92;
+    float3 expo = 1.055 * pow(c, float3(1.0/2.4)) - 0.055;
+    return select(c < 0.0031308, lin, expo);
+}
+#define PT_SRGB_ENCODE(x) srgb_oetf(x)
+#else
+#define PT_SRGB_ENCODE(x) (x)
+#endif
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
@@ -309,7 +328,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 float sun_off = saturate(length(sun_uv - 0.5) * 4.0);
                 c += flare_intensity * flare * fade * vis * sun_off;
             }
-            float3 ldr_phys = (passthrough != 0u) ? c : acesTonemap(c * exposure_state[0]);
+            float3 ldr_phys = (passthrough != 0u) ? c : PT_SRGB_ENCODE(acesTonemap(c * exposure_state[0]));
             ldr_out[tid.xy] = float4(ldr_phys, 1.0);
             return;
         }
@@ -369,7 +388,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 }
                 c += flare_intensity * flare;
             }
-            float3 ldr_sun = (passthrough != 0u) ? c : acesTonemap(c * exposure_state[0]);
+            float3 ldr_sun = (passthrough != 0u) ? c : PT_SRGB_ENCODE(acesTonemap(c * exposure_state[0]));
             ldr_out[tid.xy] = float4(ldr_sun, 1.0);
             return;
         }
@@ -505,6 +524,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
             return;
         }
     }
-    float3 ldr = (passthrough != 0u) ? c : acesTonemap(c * exposure_state[0]);
+    float3 ldr = (passthrough != 0u) ? c : PT_SRGB_ENCODE(acesTonemap(c * exposure_state[0]));
     ldr_out[tid.xy] = float4(ldr, 1.0);
 }

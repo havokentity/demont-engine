@@ -865,6 +865,20 @@ float3 acesTonemap(float3 c) {
     return saturate((c*(a*c+b))/(c*(d*c+e)+f));
 }
 
+#if defined(PT_TARGET_SPIRV)
+// Standard sRGB OETF (linear -> nonlinear, IEC 61966-2-1: linear seg
+// near zero + gamma ~2.4 above). Vulkan storage-image writes do NOT
+// auto-encode for sRGB swapchain formats per spec (only color-
+// attachment writes do). The Mac/Metal path uses Apple silicon's
+// implicit storage-write encoding for BGRA8Unorm_sRGB and skips this.
+float3 srgb_oetf(float3 c) {
+    c = max(c, float3(0.0, 0.0, 0.0));
+    float3 lin  = c * 12.92;
+    float3 expo = 1.055 * pow(c, float3(1.0/2.4)) - 0.055;
+    return select(c < 0.0031308, lin, expo);
+}
+#endif
+
 // ---------- env-map importance sampling (NEE for Lambert) ----------------
 struct EnvSample {
     float3 dir;
@@ -1671,6 +1685,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
     float exposure = exposure_state[0];
 
     if (denoiser_enabled != 0u) {
+        // denoise_color is an RGBA16F linear-HDR intermediate read by
+        // the post-pass Tonemap kernel later -- stays linear, no OETF.
         if (w2j_row0.w > 0.5) {
             denoise_color[tid] = float4(frame_radiance, 1.0);
         } else {
@@ -1679,5 +1695,13 @@ void main(uint2 tid : SV_DispatchThreadID) {
         }
     }
 
-    output[tid] = float4(acesTonemap(avg * exposure), 1.0);
+    // Swapchain write. Apply the OETF on the SPIR-V path so the OS's
+    // EOTF-on-display gives back the original linear values. On Metal
+    // the swapchain's BGRA8Unorm_sRGB pixel format encodes implicitly
+    // on Apple silicon storage writes -- nothing for the shader to do.
+    float3 ldr = acesTonemap(avg * exposure);
+#if defined(PT_TARGET_SPIRV)
+    ldr = srgb_oetf(ldr);
+#endif
+    output[tid] = float4(ldr, 1.0);
 }
