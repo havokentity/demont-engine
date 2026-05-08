@@ -839,6 +839,28 @@ float3 moonDisc(float3 rd, float4 mph, float3 sun_dir_world) {
     return col_tint * col_atm * halo * phase_b * moon_atm * 0.3;
 }
 
+// Per-contribution firefly clamp. Bounds a single indirect light
+// contribution (NEE off the env map, ambient skylight, bounce-to-sky
+// from b>0) so a single-sample spike from a tiny PDF or BSDF-sampled
+// bounce hitting an HDRI sun pixel doesn't blow the running mean.
+// Camera-direct sky paths (b == 0 sky-on-miss) bypass this so the
+// sun still appears at full intensity in the rendered sky.
+//
+// Hue-preserving: scale by max-channel ratio rather than per-channel
+// min(). A naive per-channel clamp would turn an orange contribution
+// (5, 3, 1) into pure grey (1, 1, 1) at ceiling=1 -- the sunset's
+// warm bounce light loses its color. Max-channel scaling maps the
+// same input to (1, 0.6, 0.2), preserving hue and just bounding
+// magnitude. This lets a ceiling of ~10 actually remain on without
+// neutralising the indirect colour cast.
+//
+// Engine plumbs the ceiling via w2j_row2.w; 0 disables.
+float3 clampIndirect(float3 c) {
+    if (w2j_row2.w <= 0.0) return c;
+    float m = max(c.r, max(c.g, c.b));
+    return (m > w2j_row2.w) ? c * (w2j_row2.w / m) : c;
+}
+
 float3 skyColor(float3 rd) {
     float3 base;
     uint mode = uint(sun_and_mode.w);
@@ -1229,7 +1251,15 @@ void main(uint2 tid : SV_DispatchThreadID) {
         }
         if (!h.hit) {
             if (!skip_sky_on_miss) {
-                radiance += throughput * skyColor(rd);
+                // b == 0 is the camera ray hitting the sky directly --
+                // unbounded so the HDRI sun renders at full intensity.
+                // b > 0 is a bounce ray escaping; clamp those to kill
+                // fireflies from BSDF-sampled bounces hitting the sun.
+                if (b == 0u) {
+                    radiance += throughput * skyColor(rd);
+                } else {
+                    radiance += clampIndirect(throughput * skyColor(rd));
+                }
             }
             break;
         }
@@ -1252,7 +1282,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     float3 trans = transmittance(hit_pt + nf * 1e-3, env.dir, 1e30);
                     if (any(trans > float3(0.0))) {
                         float3 brdf = h.albedo / 3.14159265358979;
-                        radiance += throughput * env.color * trans * brdf * n_dot_l / env.pdf;
+                        radiance += clampIndirect(throughput * env.color * trans * brdf * n_dot_l / env.pdf);
                     }
                 }
                 // Moon NEE. Env-map importance sampling will mostly
@@ -1290,19 +1320,34 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         }
                     }
                 }
-                // Calculated diffuse skylight ambient. For a Lambert
-                // surface under uniform sky L, the outgoing radiance is
-                //   albedo * L
-                // (the irradiance E = L * π cancels the BRDF's 1/π).
-                // For our non-uniform sky we approximate L by sampling
-                // skyColor() at the surface normal direction -- the
-                // dominant cosine-weighted direction. This is single-
-                // direction Lambert ambient: real and calculated from
-                // the actual sky, not a hardcoded constant. Without
-                // this term, cloud-shadowed surfaces on env_map mode
-                // converge slowly because most env-NEE samples land
-                // inside cloud_optical_depth and contribute nothing.
-                radiance += throughput * h.albedo * skyColor(nf);
+                // Diffuse skylight ambient via cosine-weighted hemisphere
+                // sample. Previous version sampled skyColor() at the
+                // surface normal exactly -- a single-direction shortcut
+                // that causes severe per-pixel fireflies on HDRI scenes:
+                // every pixel whose surface normal happens to align with
+                // the HDRI sun direction (a 1e6-nit pixel) gets a huge
+                // single-sample contribution, producing the classic
+                // sphere-speckle pattern visible on Lambert surfaces
+                // under sunset/noon HDRIs. Cosine-weighted hemisphere
+                // sampling integrates properly: the per-frame value is
+                // a random hemisphere tap, and spp + temporal averaging
+                // converges to the true diffuse irradiance. Bypasses
+                // cloud occlusion intentionally (skyColor reads env_map
+                // directly), so cloud-shadowed surfaces still receive
+                // ambient light -- the same approximation the original
+                // hack made, just without the firefly artifact.
+                {
+                    float xi_a = randf(seed), xi_b = randf(seed);
+                    float r    = sqrt(xi_a);
+                    float phi  = 6.28318530717958 * xi_b;
+                    float3 t1  = abs(nf.y) < 0.99 ? float3(0, 1, 0) : float3(1, 0, 0);
+                    float3 tx  = normalize(cross(t1, nf));
+                    float3 ty  = cross(nf, tx);
+                    float3 amb_dir = tx * (r * cos(phi))
+                                   + ty * (r * sin(phi))
+                                   + nf * sqrt(max(0.0, 1.0 - xi_a));
+                    radiance += clampIndirect(throughput * h.albedo * skyColor(amb_dir));
+                }
                 skip_sky_on_miss = true;
             } else {
                 // Procedural sun NEE + skylight ambient. Drives the

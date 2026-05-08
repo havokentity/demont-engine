@@ -84,6 +84,7 @@ namespace cvar {
 #endif
     PT_CVAR(r_max_bounces,     "8",  "Max path bounces per ray",          CVAR_ARCHIVE);
     PT_CVAR(r_spp,             "1",  "Samples per pixel per dispatch (>=1). Higher = cleaner motion frames at proportional GPU cost.", CVAR_ARCHIVE);
+    PT_CVAR(r_firefly_clamp,   "10",  "Per-contribution firefly clamp (per-channel ceiling on each indirect light contribution: env-NEE, ambient skylight, bounce-to-sky). Suppresses single-sample spikes from BSDF-sampled bounces hitting an HDRI sun pixel, while leaving camera-direct sky unbounded so the sun renders at full intensity. ACES saturates anything above ~5 to ~1.0 for SDR, so 10 preserves visible highlights and kills fireflies. 0 disables.", CVAR_ARCHIVE);
     PT_CVAR(r_quality,         "high",  "Master quality preset that drives r_spp, r_max_bounces, r_caustics, r_refract_bounces, etc. Options: low (fast, no caustics), medium (default-ish), high (caustics, more bounces), ultra (max). 'custom' leaves per-feature cvars as-is.", CVAR_ARCHIVE);
     PT_CVAR(r_caustics,        "1",  "Refractive shadow rays. 1 = NEE rays refract through dielectrics so glass/diamond produce caustic patterns; 0 = treat all dielectrics as opaque shadow blockers (faster, blocks any caustic). Path-tracer-correct in both modes.", CVAR_ARCHIVE);
     PT_CVAR(r_refract_bounces, "4",  "Maximum dielectric refractions a single shadow ray may chain through before giving up (returns no contribution). Higher catches more multi-facet caustics; lower is faster.", CVAR_ARCHIVE);
@@ -1657,7 +1658,15 @@ void Engine::RenderFrame() {
         pt::astro::worldToJ2000Matrix(lat, lon, jd, m);
         push.w2j_row0[0] = m[0]; push.w2j_row0[1] = m[1]; push.w2j_row0[2] = m[2];
         push.w2j_row1[0] = m[3]; push.w2j_row1[1] = m[4]; push.w2j_row1[2] = m[5];
-        push.w2j_row2[0] = m[6]; push.w2j_row2[1] = m[7]; push.w2j_row2[2] = m[8]; push.w2j_row2[3] = 0.0f;
+        // .w packs r_firefly_clamp -- per-contribution radiance ceiling
+        // (each indirect lighting term clamped individually: env-NEE,
+        // ambient skylight, bounce-to-sky). Camera-direct sky bypasses
+        // this and remains unbounded so the HDRI sun appears at full
+        // intensity in the rendered sky. 0 disables.
+        float firefly_clamp = 10.0f;
+        if (auto* v = C.FindCVar("r_firefly_clamp")) firefly_clamp = v->GetFloat();
+        if (firefly_clamp < 0.0f) firefly_clamp = 0.0f;
+        push.w2j_row2[0] = m[6]; push.w2j_row2[1] = m[7]; push.w2j_row2[2] = m[8]; push.w2j_row2[3] = firefly_clamp;
         // The 3x3 rotation only fills 9 floats; the w-lanes are
         // available scratch. Pack engine flags here:
         //   row0.w = HDR-pipeline (1 = raw HDR through MetalFX).
