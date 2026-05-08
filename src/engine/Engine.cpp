@@ -432,6 +432,10 @@ void Engine::TearDownDevice() {
         if (env_conditional_cdf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{env_conditional_cdf_id_});
         if (star_map_tex_id_        != 0) device_->DestroyTexture(pt::rhi::TextureHandle{star_map_tex_id_});
         if (moon_map_tex_id_        != 0) device_->DestroyTexture(pt::rhi::TextureHandle{moon_map_tex_id_});
+        // GPU-resident exposure scalar buffer; pipelines (incl.
+        // autoexpose_pipeline_id_) are owned by the device handle and
+        // released by device_.reset() below, same as tonemap / bloom.
+        if (exposure_state_id_      != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{exposure_state_id_});
     }
     scene_tlas_id_        = 0;
     box_blas_id_          = 0;
@@ -457,6 +461,8 @@ void Engine::TearDownDevice() {
     star_map_tex_id_      = 0;
     star_map_present_     = 0;
     moon_map_tex_id_      = 0;
+    autoexpose_pipeline_id_ = 0;
+    exposure_state_id_      = 0;
     denoiser_active_      = false;
     prev_view_proj_valid_ = false;
     primitives_dirty_     = true;        // re-upload on next device

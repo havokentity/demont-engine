@@ -1107,7 +1107,23 @@ bool VulkanDevice::CreateBufferImpl(VkDeviceSize size,
     out.size = size;
 
     if (persistent_map && (props & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
-        vkMapMemory(device_, out.memory, 0, size, 0, &out.mapped);
+        // vkMapMemory failure (rare: out of host address space, driver
+        // bug, or trying to map non-host-visible memory we let slip
+        // through earlier) leaves out.mapped at nullptr. Subsequent
+        // memcpy/WriteBuffer/WriteTexture would deref it and crash, so
+        // treat it as a buffer-creation failure: tear down the
+        // partially-built buffer and return false to the caller.
+        if (vkMapMemory(device_, out.memory, 0, size, 0, &out.mapped) != VK_SUCCESS) {
+            LOG_ERROR("Vulkan: vkMapMemory failed on persistent-map buffer (size {})",
+                      static_cast<std::uint64_t>(size));
+            out.mapped = nullptr;
+            vkFreeMemory(device_, out.memory, nullptr);
+            vkDestroyBuffer(device_, out.buffer, nullptr);
+            out.memory = VK_NULL_HANDLE;
+            out.buffer = VK_NULL_HANDLE;
+            out.size   = 0;
+            return false;
+        }
     }
     if ((usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) && pfn_GetBufferDeviceAddr_) {
         VkBufferDeviceAddressInfo bdai{};
