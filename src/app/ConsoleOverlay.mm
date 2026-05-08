@@ -242,6 +242,12 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
 @property (strong) NSString*            ghostPrefix;
 @property BOOL                          ghostIsToken0;
 @property BOOL                          ghostActive;
+// Free-form cvar value-position state.  When ghostIsMeta is YES the
+// matches array is [current, default] of a cvar with no allowed_values
+// list, and ghostAnnotation holds "default: X" / "current: Y" describing
+// the inactive one so both pieces are visible at once.
+@property BOOL                          ghostIsMeta;
+@property (strong) NSString*            ghostAnnotation;
 
 - (instancetype)initWithFrame:(NSRect)frame;
 - (void)appendLine:(NSString*)line level:(NSString*)level;
@@ -252,6 +258,8 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
 - (BOOL)commitGhost;
 - (void)dismissGhost;
 - (void)renderGhost;
+- (void)activateValueGhost:(NSString*)cvarName;
+- (void)refreshGhostAnnotation;
 - (void)refreshNames;
 @end
 
@@ -806,6 +814,7 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     NSInteger n = (NSInteger)self.ghostMatches.count;
     NSInteger i = ((self.ghostIndex + dir) % n + n) % n;
     self.ghostIndex = i;
+    [self refreshGhostAnnotation];
     [self renderGhost];
     return YES;
 }
@@ -815,21 +824,76 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
         [self dismissGhost];
         return YES;
     }
-    NSString* match = self.ghostMatches[self.ghostIndex];
-    NSString* tail = self.ghostIsToken0 ? [match stringByAppendingString:@" "] : match;
+    NSString* committed = self.ghostMatches[self.ghostIndex];
+    BOOL      wasToken0 = self.ghostIsToken0;
+    NSString* tail      = wasToken0 ? [committed stringByAppendingString:@" "] : committed;
     self.inputField.stringValue = [self.ghostBefore stringByAppendingString:tail];
     [self dismissGhost];
+    // Token-0 commit just landed on a name -- if it's a cvar, chain
+    // into a value-position ghost so the user immediately sees the
+    // current (and default) value.
+    if (wasToken0) [self activateValueGhost:committed];
     return YES;
 }
 
 - (void)dismissGhost {
-    self.ghostActive   = NO;
-    self.ghostMatches  = nil;
-    self.ghostIndex    = 0;
-    self.ghostBefore   = nil;
-    self.ghostPrefix   = nil;
-    self.ghostIsToken0 = NO;
+    self.ghostActive      = NO;
+    self.ghostMatches     = nil;
+    self.ghostIndex       = 0;
+    self.ghostBefore      = nil;
+    self.ghostPrefix      = nil;
+    self.ghostIsToken0    = NO;
+    self.ghostIsMeta      = NO;
+    self.ghostAnnotation  = nil;
     self.ghostLabel.attributedStringValue = [[NSAttributedString alloc] initWithString:@""];
+}
+
+- (void)activateValueGhost:(NSString*)cvarName {
+    auto* cv = pt::console::Console::Get().FindCVar(
+        std::string_view([cvarName UTF8String]));
+    if (cv == nullptr) return;   // commands have no value position
+
+    NSMutableArray<NSString*>* matches = [NSMutableArray array];
+    BOOL meta = NO;
+    if (!cv->allowed_values.empty()) {
+        for (auto& a : cv->allowed_values) {
+            [matches addObject:[NSString stringWithUTF8String:a.c_str()]];
+        }
+    } else {
+        NSString* current = [NSString stringWithUTF8String:cv->value.c_str()];
+        NSString* dflt    = [NSString stringWithUTF8String:cv->default_value.c_str()];
+        [matches addObject:current];
+        if (![dflt isEqualToString:current]) {
+            [matches addObject:dflt];
+            meta = YES;
+        }
+    }
+    if (matches.count == 0) return;
+
+    self.ghostMatches    = matches;
+    self.ghostIndex      = 0;
+    self.ghostBefore     = self.inputField.stringValue;   // "<name> "
+    self.ghostPrefix     = @"";
+    self.ghostIsToken0   = NO;
+    self.ghostIsMeta     = meta;
+    self.ghostActive     = YES;
+    [self refreshGhostAnnotation];
+    [self renderGhost];
+}
+
+- (void)refreshGhostAnnotation {
+    if (!self.ghostIsMeta || self.ghostMatches.count < 2) {
+        self.ghostAnnotation = nil;
+        return;
+    }
+    // matches[0] = current, matches[1] = default (per activateValueGhost).
+    if (self.ghostIndex == 0) {
+        self.ghostAnnotation = [NSString stringWithFormat:@"  default: %@",
+                                                          self.ghostMatches[1]];
+    } else {
+        self.ghostAnnotation = [NSString stringWithFormat:@"  current: %@",
+                                                          self.ghostMatches[0]];
+    }
 }
 
 - (void)renderGhost {
@@ -838,7 +902,7 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
         return;
     }
     NSString* match = self.ghostMatches[self.ghostIndex];
-    if (match.length <= self.ghostPrefix.length || ![match hasPrefix:self.ghostPrefix]) {
+    if (match.length < self.ghostPrefix.length || ![match hasPrefix:self.ghostPrefix]) {
         self.ghostLabel.attributedStringValue = [[NSAttributedString alloc] initWithString:@""];
         return;
     }
@@ -846,6 +910,7 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     NSString* tail  = [match substringFromIndex:self.ghostPrefix.length];
 
     NSFont* font = self.inputField.font ?: [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightRegular];
+    NSColor* dim = self.palette.info ?: [NSColor grayColor];
     NSMutableAttributedString* s = [[NSMutableAttributedString alloc] init];
     // Transparent run mirrors typed text width so the visible tail
     // lines up just past the cursor.
@@ -854,11 +919,25 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
             NSFontAttributeName: font,
             NSForegroundColorAttributeName: [NSColor clearColor],
         }]];
-    [s appendAttributedString:[[NSAttributedString alloc] initWithString:tail
-        attributes:@{
-            NSFontAttributeName: font,
-            NSForegroundColorAttributeName: self.palette.info ?: [NSColor grayColor],
-        }]];
+    if (tail.length > 0) {
+        [s appendAttributedString:[[NSAttributedString alloc] initWithString:tail
+            attributes:@{
+                NSFontAttributeName: font,
+                NSForegroundColorAttributeName: dim,
+            }]];
+    }
+    if (self.ghostAnnotation.length > 0) {
+        // Annotation rides in the same dim colour but italicised so it
+        // reads as commentary rather than another committable token.
+        NSFontDescriptor* fd = [font.fontDescriptor
+            fontDescriptorWithSymbolicTraits:NSFontDescriptorTraitItalic];
+        NSFont* italic = [NSFont fontWithDescriptor:fd size:font.pointSize] ?: font;
+        [s appendAttributedString:[[NSAttributedString alloc] initWithString:self.ghostAnnotation
+            attributes:@{
+                NSFontAttributeName: italic,
+                NSForegroundColorAttributeName: [dim colorWithAlphaComponent:0.7],
+            }]];
+    }
     self.ghostLabel.attributedStringValue = s;
 }
 

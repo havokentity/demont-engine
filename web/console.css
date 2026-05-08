@@ -560,8 +560,9 @@ body::after {
   display: flex; align-items: center;
   z-index: 0;
 }
-.ghost-typed { color: transparent; }
-.ghost-tail  { color: var(--fg-dim); }
+.ghost-typed      { color: transparent; }
+.ghost-tail       { color: var(--fg-dim); }
+.ghost-annotation { color: var(--fg-dim); opacity: 0.7; font-style: italic; }
 
 /* ---------- cvars + commands sidebar ---------- */
 .kv-list {

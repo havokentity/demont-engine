@@ -83,9 +83,15 @@
   // Esc / typing dismisses.
   let allNames = [];
   let cvarMeta = {};   // name -> { allowed_values: [...] }
-  let ghostState = null;  // { matches: [...], index, before, prefix, isToken0 }
-  const ghostTyped = document.querySelector('#input-ghost .ghost-typed');
-  const ghostTail  = document.querySelector('#input-ghost .ghost-tail');
+  // ghostState shape:
+  //   { matches: [...], index, before, prefix, isToken0,
+  //     isMeta:    bool   -- matches = [current, default] of a free-form cvar
+  //     annotation: str   -- "default: X" / "current: Y" when isMeta
+  //   }
+  let ghostState = null;
+  const ghostTyped      = document.querySelector('#input-ghost .ghost-typed');
+  const ghostTail       = document.querySelector('#input-ghost .ghost-tail');
+  const ghostAnnotation = document.querySelector('#input-ghost .ghost-annotation');
 
   // ---------- helpers --------------------------------------------------------
   function escape(s) {
@@ -631,6 +637,8 @@
           slider_min:     v.slider_min,
           slider_max:     v.slider_max,
           slider_step:    v.slider_step,
+          value:          v.value,
+          default_value:  v.default,
         };
       }
     }
@@ -651,19 +659,37 @@
     return p;
   }
 
+  function refreshGhostAnnotation() {
+    if (!ghostState) return;
+    if (!ghostState.isMeta || ghostState.matches.length < 2) {
+      ghostState.annotation = '';
+      return;
+    }
+    // matches[0] = current value, matches[1] = default (per activateValueGhost).
+    if (ghostState.index === 0) {
+      ghostState.annotation = '  default: ' + ghostState.matches[1];
+    } else {
+      ghostState.annotation = '  current: ' + ghostState.matches[0];
+    }
+  }
   function renderGhost() {
     if (!ghostState) {
-      ghostTyped.textContent = '';
-      ghostTail.textContent  = '';
+      ghostTyped.textContent      = '';
+      ghostTail.textContent       = '';
+      ghostAnnotation.textContent = '';
       return;
     }
     const match = ghostState.matches[ghostState.index];
-    if (match.length > ghostState.prefix.length && match.startsWith(ghostState.prefix)) {
-      ghostTyped.textContent = input.value;
-      ghostTail.textContent  = match.slice(ghostState.prefix.length);
+    const fits  = match.length >= ghostState.prefix.length &&
+                  match.startsWith(ghostState.prefix);
+    if (fits) {
+      ghostTyped.textContent      = input.value;
+      ghostTail.textContent       = match.slice(ghostState.prefix.length);
+      ghostAnnotation.textContent = ghostState.annotation || '';
     } else {
-      ghostTyped.textContent = '';
-      ghostTail.textContent  = '';
+      ghostTyped.textContent      = '';
+      ghostTail.textContent       = '';
+      ghostAnnotation.textContent = '';
     }
   }
   function dismissGhost() {
@@ -671,18 +697,53 @@
     ghostState = null;
     renderGhost();
   }
+  function activateValueGhost(cvarName) {
+    const meta = cvarMeta[cvarName];
+    if (!meta) return;   // commands have no entry in cvarMeta
+    let matches;
+    let isMeta = false;
+    if (meta.allowed_values && meta.allowed_values.length > 0) {
+      matches = meta.allowed_values.slice();
+    } else if (meta.value !== undefined) {
+      matches = [String(meta.value)];
+      const dflt = meta.default_value;
+      if (dflt !== undefined && String(dflt) !== String(meta.value)) {
+        matches.push(String(dflt));
+        isMeta = true;
+      }
+    } else {
+      return;
+    }
+    ghostState = {
+      matches,
+      index:    0,
+      before:   input.value,    // already ends with "<name> "
+      prefix:   '',
+      isToken0: false,
+      isMeta,
+      annotation: '',
+    };
+    refreshGhostAnnotation();
+    renderGhost();
+  }
   function commitGhost() {
     if (!ghostState) return;
-    const match = ghostState.matches[ghostState.index];
-    const tail  = ghostState.isToken0 ? match + ' ' : match;
-    input.value = ghostState.before + tail;
+    const committed = ghostState.matches[ghostState.index];
+    const wasToken0 = ghostState.isToken0;
+    const tail      = wasToken0 ? committed + ' ' : committed;
+    input.value     = ghostState.before + tail;
     input.setSelectionRange(input.value.length, input.value.length);
     dismissGhost();
+    // Token-0 commit just landed on a name -- if it's a cvar, chain
+    // into a value-position ghost so the user immediately sees the
+    // current (and default, when free-form) value.
+    if (wasToken0) activateValueGhost(committed);
   }
   function cycleGhost(dir) {
     if (!ghostState) return;
     const n = ghostState.matches.length;
     ghostState.index = ((ghostState.index + dir) % n + n) % n;
+    refreshGhostAnnotation();
     renderGhost();
   }
 

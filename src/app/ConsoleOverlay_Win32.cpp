@@ -146,6 +146,8 @@ private:
     void CycleGhost(int dir);
     void CommitGhost();
     void DismissGhost();
+    void ActivateValueGhost(const std::string& cvar_name);
+    void RefreshGhostAnnotation();
     void StartAnim(bool showing);
     void TickAnim();
     int  CurrentY() const;
@@ -190,6 +192,16 @@ private:
     // rendered after the cursor in dim color. Subsequent Tabs cycle
     // forward through matches; Shift+Tab cycles back; Right-arrow at
     // end / End commits; Esc / typing dismisses.
+    //
+    // Two activation modes:
+    //   - Token 0 (cvar/command name): triggered by Tab on a partial
+    //     name; matches list is the prefix-filtered name list.
+    //   - Value position: either user typed `cvar ` then Tab, OR a
+    //     token-0 commit just landed on a cvar (auto-activated by
+    //     CommitGhost). Matches are allowed_values when present;
+    //     otherwise [current, default] with `is_meta` set so the
+    //     inactive one is shown as `annotation` next to the primary
+    //     ghost (user sees both at once).
     struct GhostState {
         bool active = false;
         std::vector<std::string> matches;
@@ -197,6 +209,8 @@ private:
         std::string              before;     // text preserved before the token
         std::string              prefix;     // typed text of the token (already in input_)
         bool                     is_token0 = false;  // true → trailing space on commit
+        bool                     is_meta   = false;  // matches = [current, default] of a cvar
+        std::string              annotation;         // "default: X" or "current: Y" when is_meta
     };
     GhostState ghost_;
 
@@ -868,6 +882,7 @@ void WinOverlay::CycleGhost(int dir) {
     int i = (static_cast<int>(ghost_.index) + dir) % n;
     if (i < 0) i += n;
     ghost_.index = static_cast<std::size_t>(i);
+    RefreshGhostAnnotation();
     Repaint();
 }
 
@@ -876,11 +891,18 @@ void WinOverlay::CommitGhost() {
         DismissGhost();
         return;
     }
-    const std::string& match = ghost_.matches[ghost_.index];
-    std::string tail = ghost_.is_token0 ? (match + " ") : match;
+    const std::string committed = ghost_.matches[ghost_.index];
+    const bool        was_token0 = ghost_.is_token0;
+    std::string tail = was_token0 ? (committed + " ") : committed;
     input_  = ghost_.before + tail;
     cursor_ = static_cast<int>(input_.size());
     DismissGhost();
+
+    // Token-0 commit just landed on a name.  If the name is a cvar,
+    // auto-activate a value-position ghost so the user immediately
+    // sees the cvar's current value (and default, for free-form
+    // cvars).  Commands have no value-position ghost.
+    if (was_token0) ActivateValueGhost(committed);
 }
 
 void WinOverlay::DismissGhost() {
@@ -891,7 +913,52 @@ void WinOverlay::DismissGhost() {
     ghost_.before.clear();
     ghost_.prefix.clear();
     ghost_.is_token0 = false;
+    ghost_.is_meta   = false;
+    ghost_.annotation.clear();
     Repaint();
+}
+
+// After a token-0 commit (cvar or command name + trailing space),
+// auto-show the cvar's current value as a ghost so the user can see
+// what's currently set without typing anything more.  For cvars with
+// allowed_values, cycle those (same as the existing value-position
+// behaviour after `cvar ` + Tab).  For free-form cvars, the cycle
+// list is [current, default] and `is_meta` flips on so the inactive
+// one is rendered as an annotation.  No-op for commands.
+void WinOverlay::ActivateValueGhost(const std::string& cvar_name) {
+    auto* cv = pt::console::Console::Get().FindCVar(cvar_name);
+    if (cv == nullptr) return;
+
+    std::vector<std::string> matches;
+    bool meta = false;
+    if (!cv->allowed_values.empty()) {
+        matches = cv->allowed_values;
+    } else {
+        matches.push_back(cv->value);
+        if (cv->default_value != cv->value) {
+            matches.push_back(cv->default_value);
+            meta = true;
+        }
+    }
+    if (matches.empty()) return;
+
+    ghost_.active    = true;
+    ghost_.matches   = std::move(matches);
+    ghost_.index     = 0;
+    ghost_.before    = input_;   // input_ already ends with "<name> "
+    ghost_.prefix.clear();
+    ghost_.is_token0 = false;
+    ghost_.is_meta   = meta;
+    RefreshGhostAnnotation();
+    Repaint();
+}
+
+void WinOverlay::RefreshGhostAnnotation() {
+    ghost_.annotation.clear();
+    if (!ghost_.is_meta || ghost_.matches.size() < 2) return;
+    // matches[0] = current, matches[1] = default (per ActivateValueGhost).
+    if (ghost_.index == 0) ghost_.annotation = "  default: " + ghost_.matches[1];
+    else                   ghost_.annotation = "  current: " + ghost_.matches[0];
 }
 
 void WinOverlay::Paint(HDC dc) {
@@ -1042,17 +1109,32 @@ void WinOverlay::Paint(HDC dc) {
 
         // Ghost text (dim, drawn just past the cursor).  Only the
         // portion of the candidate beyond the user's typed prefix is
-        // shown -- typed chars are already in input_ above.
+        // shown -- typed chars are already in input_ above.  An
+        // optional annotation (current/default for free-form cvars)
+        // trails the primary ghost in the same dim colour so the user
+        // sees both pieces of context at a glance.
         if (ghost_.active && !ghost_.matches.empty()) {
             const std::string& match = ghost_.matches[ghost_.index];
             if (match.size() > ghost_.prefix.size() &&
                 match.compare(0, ghost_.prefix.size(), ghost_.prefix) == 0) {
                 std::string ghost_tail = match.substr(ghost_.prefix.size());
                 SetTextColor(mdc, theme_.dim);
+                int gx = cx + 3;
                 auto gbuf = ToWide(ghost_tail);
                 if (!gbuf.empty()) {
-                    TextOutW(mdc, cx + 3, input_y, gbuf.data(),
+                    TextOutW(mdc, gx, input_y, gbuf.data(),
                              static_cast<int>(gbuf.size()));
+                    SIZE gsz{};
+                    GetTextExtentPoint32W(mdc, gbuf.data(),
+                                          static_cast<int>(gbuf.size()), &gsz);
+                    gx += gsz.cx;
+                }
+                if (!ghost_.annotation.empty()) {
+                    auto abuf = ToWide(ghost_.annotation);
+                    if (!abuf.empty()) {
+                        TextOutW(mdc, gx, input_y, abuf.data(),
+                                 static_cast<int>(abuf.size()));
+                    }
                 }
             }
         }
