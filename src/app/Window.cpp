@@ -83,7 +83,12 @@ void Window::RequestClose() {
     if (handle_ != nullptr) glfwSetWindowShouldClose(handle_, GLFW_TRUE);
 }
 
-extern "C" void* pt_window_native_cocoa(GLFWwindow*);
+// Signature is `void*(void*)` everywhere -- the implementation in
+// Window_Cocoa.mm casts back to GLFWwindow* internally.  Standardising
+// on void* avoids an ODR violation across translation units that
+// don't include GLFW headers (ConsoleOverlay_Win32, ConsoleOverlay_Stub,
+// MetalDevice, SoftwareDevice all declare it as void*(void*)).
+extern "C" void* pt_window_native_cocoa(void*);
 
 #if defined(_WIN32)
 #  define GLFW_EXPOSE_NATIVE_WIN32

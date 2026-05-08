@@ -11,8 +11,14 @@
 //
 // Bindings (Slang assigns Metal texture(0..1) in declaration order):
 //   slot 0 (texture) : hdr_in -- RGBA16F linear HDR from MetalFX
-//   slot 1 (texture) : ldr_out -- swapchain (BGRA8Unorm_sRGB) -- the
-//                       linear-to-sRGB encode is implicit on store.
+//   slot 1 (texture) : ldr_out -- swapchain.
+//                       - On Metal: BGRA8Unorm_sRGB, linear->sRGB
+//                         encode is IMPLICIT on store.
+//                       - On Vulkan/SPIR-V: BGRA8_UNORM, the encode is
+//                         EXPLICIT via PT_SRGB_ENCODE() applied just
+//                         before store (see the swapchain-write site
+//                         inside the kernel).  Both branches land at
+//                         the same on-screen colour space.
 
 // MSL SLOT ALIGNMENT NOTICE -- mirrors AutoExposure.slang's notice.
 // Slang's MSL backend assigns Metal buffer/texture slots in

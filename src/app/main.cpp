@@ -7,6 +7,12 @@
 
 #include <fmt/format.h>
 
+// PrintBootLogo() uses ::stderr + fileno() on POSIX; explicit include
+// rather than relying on transitive pulls through core/Log.h or
+// fmt/format.h, both of which may stop including <cstdio> in the
+// future.
+#include <cstdio>
+
 // Portable isatty: POSIX uses <unistd.h>::isatty + ::fileno; MSVC's
 // runtime exposes _isatty + _fileno in <io.h>. Both check whether
 // the given C stdio FILE* is bound to a terminal.

@@ -183,7 +183,12 @@ ExecuteResult Console::Execute(std::string_view line) {
         }
         if (cut < line.size()) line = line.substr(0, cut);
     }
-    while (!line.empty() && (line.back() == ' ' || line.back() == '\t')) {
+    // Trim trailing whitespace including '\r' so CRLF-terminated input
+    // (config files, pasted text) doesn't end up with the carriage
+    // return swallowed into the last token, breaking command/cvar
+    // lookup.
+    while (!line.empty()
+           && (line.back() == ' ' || line.back() == '\t' || line.back() == '\r')) {
         line.remove_suffix(1);
     }
     if (line.empty()) return result;
