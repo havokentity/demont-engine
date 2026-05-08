@@ -76,11 +76,16 @@
   let histPos = -1;
 
   // Tab-completion state. allNames is a sorted array of cvar+command
-  // identifiers; pressing Tab once completes to the longest common prefix,
-  // pressing it again prints the candidate list.
+  // identifiers. First Tab on an ambiguous prefix extends to the
+  // longest common prefix AND activates ghostState: the first remaining
+  // match is shown after the cursor in dim colour. Subsequent Tabs
+  // cycle (Shift+Tab back); Right-arrow at end / End commits;
+  // Esc / typing dismisses.
   let allNames = [];
   let cvarMeta = {};   // name -> { allowed_values: [...] }
-  let lastTabState = null;  // {prefix, matches, shownList} for Tab cycling
+  let ghostState = null;  // { matches: [...], index, before, prefix, isToken0 }
+  const ghostTyped = document.querySelector('#input-ghost .ghost-typed');
+  const ghostTail  = document.querySelector('#input-ghost .ghost-tail');
 
   // ---------- helpers --------------------------------------------------------
   function escape(s) {
@@ -646,6 +651,41 @@
     return p;
   }
 
+  function renderGhost() {
+    if (!ghostState) {
+      ghostTyped.textContent = '';
+      ghostTail.textContent  = '';
+      return;
+    }
+    const match = ghostState.matches[ghostState.index];
+    if (match.length > ghostState.prefix.length && match.startsWith(ghostState.prefix)) {
+      ghostTyped.textContent = input.value;
+      ghostTail.textContent  = match.slice(ghostState.prefix.length);
+    } else {
+      ghostTyped.textContent = '';
+      ghostTail.textContent  = '';
+    }
+  }
+  function dismissGhost() {
+    if (!ghostState) return;
+    ghostState = null;
+    renderGhost();
+  }
+  function commitGhost() {
+    if (!ghostState) return;
+    const match = ghostState.matches[ghostState.index];
+    const tail  = ghostState.isToken0 ? match + ' ' : match;
+    input.value = ghostState.before + tail;
+    input.setSelectionRange(input.value.length, input.value.length);
+    dismissGhost();
+  }
+  function cycleGhost(dir) {
+    if (!ghostState) return;
+    const n = ghostState.matches.length;
+    ghostState.index = ((ghostState.index + dir) % n + n) % n;
+    renderGhost();
+  }
+
   function handleTab() {
     const value = input.value;
     const cursor = input.selectionStart;
@@ -679,30 +719,34 @@
     const matches = candidates.filter(n => n.startsWith(prefix));
     if (matches.length === 0) return;
 
+    const isToken0 = (lastSpace === -1);
+    const before   = beforeCursor.slice(0, lastSpace + 1);
+
     if (matches.length === 1) {
-      const replaced = beforeCursor.slice(0, lastSpace + 1) + matches[0]
-                     + (lastSpace === -1 ? ' ' : '');
-      input.value = replaced;
+      const tail = matches[0] + (isToken0 ? ' ' : '');
+      input.value = before + tail;
       input.setSelectionRange(input.value.length, input.value.length);
-      lastTabState = null;
+      dismissGhost();
       return;
     }
 
+    // Multiple matches: extend to longest common prefix, then activate
+    // ghost mode so the user can cycle / commit visually.
     const common = commonPrefix(matches);
+    let typedPrefix = prefix;
     if (common.length > prefix.length) {
-      const replaced = beforeCursor.slice(0, lastSpace + 1) + common;
-      input.value = replaced;
-      input.setSelectionRange(replaced.length, replaced.length);
-      lastTabState = { prefix: common, matches, shownList: false };
-      return;
+      input.value = before + common;
+      input.setSelectionRange(input.value.length, input.value.length);
+      typedPrefix = common;
     }
-
-    if (lastTabState && lastTabState.prefix === prefix && !lastTabState.shownList) {
-      append(`<span class="ts">${ts()}</span><span class="out">${escape(matches.join('  '))}</span>`);
-      lastTabState.shownList = true;
-    } else if (!lastTabState || lastTabState.prefix !== prefix) {
-      lastTabState = { prefix, matches, shownList: false };
-    }
+    ghostState = {
+      matches,
+      index: 0,
+      before,
+      prefix: typedPrefix,
+      isToken0,
+    };
+    renderGhost();
   }
 
   // ---------- Connect / wiring ----------------------------------------------
@@ -760,19 +804,41 @@
 
   form.addEventListener('submit', (e) => {
     e.preventDefault();
+    if (ghostState) commitGhost();   // Enter accepts the current ghost
     const line = input.value;
     input.value = '';
-    lastTabState = null;
+    dismissGhost();
     exec(line);
   });
 
   input.addEventListener('keydown', (e) => {
+    // Ghost-mode key handling.  Tab cycles, Shift+Tab cycles back,
+    // Right-arrow at end / End commits, Esc dismisses, any other
+    // key dismisses and falls through to normal handling.
     if (e.key === 'Tab') {
       e.preventDefault();
-      handleTab();
+      if (ghostState) cycleGhost(e.shiftKey ? -1 : +1);
+      else            handleTab();
       return;
     }
-    if (e.key !== 'Tab') lastTabState = null;
+    if (ghostState) {
+      if (e.key === 'End' ||
+          (e.key === 'ArrowRight' && input.selectionStart === input.value.length)) {
+        e.preventDefault();
+        commitGhost();
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        dismissGhost();
+        return;
+      }
+      // Enter is handled by the form 'submit' listener above.
+      if (e.key !== 'Enter') {
+        dismissGhost();
+        // fall through to default key behaviour
+      }
+    }
     if (e.key === 'ArrowUp') {
       if (histPos > 0) { histPos--; input.value = history[histPos] || ''; }
       e.preventDefault();
@@ -784,6 +850,11 @@
       e.preventDefault();
     }
   });
+
+  // Mouse click into the input dismisses the ghost (cursor probably
+  // moves away from end-of-line, so the suggestion is no longer
+  // contextually meaningful).
+  input.addEventListener('mousedown', () => { dismissGhost(); });
 
   // Paste-to-multiline: if the clipboard text spans multiple lines, treat
   // each line as its own command and run them in order. Whatever follows
@@ -800,7 +871,7 @@
     const parts = combined.split(/\r?\n/);
     const trailing = parts.pop() ?? '';
 
-    lastTabState = null;
+    dismissGhost();
     (async () => {
       for (const line of parts) {
         await exec(line);                            // exec() no-ops on blank lines
@@ -882,7 +953,11 @@
   const setupResize = (handleId, cssVar, storageKey, defaultPx, minPx, maxPx, getStartFromEvent) => {
     const handle = document.getElementById(handleId);
     if (!handle) return;
-    const stored = parseInt(localStorage.getItem(storageKey) || defaultPx, 10);
+    // maxPx may be a number OR a () => number so the outer panel can
+    // track viewport width (re-evaluated each drag tick).
+    const maxNow = () => (typeof maxPx === 'function') ? maxPx() : maxPx;
+    const clamp  = (w) => Math.max(minPx, Math.min(maxNow(), w));
+    const stored = clamp(parseInt(localStorage.getItem(storageKey) || defaultPx, 10));
     document.documentElement.style.setProperty(cssVar, stored + 'px');
 
     let dragging = false;
@@ -899,9 +974,7 @@
     window.addEventListener('mousemove', (e) => {
       if (!dragging) return;
       const dx = getStartFromEvent(e, startX);
-      let w = startW + dx;
-      w = Math.max(minPx, Math.min(maxPx, w));
-      document.documentElement.style.setProperty(cssVar, w + 'px');
+      document.documentElement.style.setProperty(cssVar, clamp(startW + dx) + 'px');
     });
     window.addEventListener('mouseup', () => {
       if (!dragging) return;
@@ -913,9 +986,14 @@
       if (w) localStorage.setItem(storageKey, String(w));
     });
   };
-  // Outer panel resize: dragging LEFT widens the panel. Inverted dx.
+  // Outer panel resize: dragging LEFT widens the panel. The cap is
+  // viewport-relative so on wide monitors the side panel can stretch
+  // well past 50%; on narrow viewports it collapses to the panel's
+  // own minimum. 280px floor leaves the output column usable; the
+  // extra 6px is the drag-handle grid column.
+  const outerMaxPx = () => Math.max(280, window.innerWidth - 280 - 6);
   setupResize('panel-resize', '--side-panel-w', 'demont.panelW',
-              480, 280, 900, (e, sx) => sx - e.clientX);
+              480, 280, outerMaxPx, (e, sx) => sx - e.clientX);
   // Inner column resize: dragging RIGHT widens the pinned column.
   setupResize('inner-resize', '--pinned-col-w', 'demont.pinnedW',
               180, 100, 500, (e, sx) => e.clientX - sx);

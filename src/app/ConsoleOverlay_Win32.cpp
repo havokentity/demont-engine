@@ -137,10 +137,15 @@ public:
 
 private:
     static LRESULT CALLBACK WndProcThunk(HWND, UINT, WPARAM, LPARAM);
+    static LRESULT CALLBACK ParentWndProcThunk(HWND, UINT, WPARAM, LPARAM);
     LRESULT WndProc(HWND, UINT, WPARAM, LPARAM);
     void Paint(HDC dc);
     void Repaint();
     void SubmitInput();
+    void HandleTab();
+    void CycleGhost(int dir);
+    void CommitGhost();
+    void DismissGhost();
     void StartAnim(bool showing);
     void TickAnim();
     int  CurrentY() const;
@@ -178,6 +183,32 @@ private:
     int                     scroll_lines_ = 0;     // 0 = at bottom
     std::deque<std::string> history_;
     int                     history_pos_  = -1;
+
+    // Tab-completion ghost state (fish-shell style autosuggestion).
+    // First Tab on an ambiguous prefix extends to the longest common
+    // prefix AND activates ghost mode: the first remaining match is
+    // rendered after the cursor in dim color. Subsequent Tabs cycle
+    // forward through matches; Shift+Tab cycles back; Right-arrow at
+    // end / End commits; Esc / typing dismisses.
+    struct GhostState {
+        bool active = false;
+        std::vector<std::string> matches;
+        std::size_t              index = 0;
+        std::string              before;     // text preserved before the token
+        std::string              prefix;     // typed text of the token (already in input_)
+        bool                     is_token0 = false;  // true → trailing space on commit
+    };
+    GhostState ghost_;
+
+    // Parent-WndProc subclass for alt-tab focus restoration.  GLFW's
+    // own WM_ACTIVATE handler calls SetFocus(parent) when the app
+    // regains activation, which steals focus from our child overlay
+    // and leaves the user unable to type into the open console.
+    // ParentWndProcThunk re-grabs focus after GLFW has run, gated on
+    // wants_focus_on_activate_ so a deliberate click into the parent
+    // viewport (which sets the flag false) doesn't get overridden.
+    WNDPROC original_parent_proc_     = nullptr;
+    bool    wants_focus_on_activate_  = false;
 };
 
 WinOverlay* WinOverlay::g = nullptr;
@@ -191,6 +222,29 @@ LRESULT CALLBACK WinOverlay::WndProcThunk(HWND h, UINT m, WPARAM w, LPARAM l) {
     auto* self = reinterpret_cast<WinOverlay*>(GetWindowLongPtrW(h, GWLP_USERDATA));
     if (self) return self->WndProc(h, m, w, l);
     return DefWindowProcW(h, m, w, l);
+}
+
+// Subclass of the parent (GLFW) window. Called for every message the
+// parent receives. We forward to GLFW's original WndProc first, then
+// post-process WM_ACTIVATE to redirect focus back to the overlay
+// child if it's shown -- otherwise GLFW's SetFocus(parent) on
+// activation leaves the overlay focusless after alt-tab.
+//
+// Routes through WinOverlay::g (the singleton instance set in Init)
+// because GWLP_USERDATA on the parent belongs to GLFW.
+LRESULT CALLBACK WinOverlay::ParentWndProcThunk(
+    HWND h, UINT m, WPARAM w, LPARAM l) {
+    WinOverlay* self = WinOverlay::g;
+    WNDPROC orig = (self != nullptr) ? self->original_parent_proc_ : nullptr;
+    LRESULT r = (orig != nullptr)
+        ? CallWindowProcW(orig, h, m, w, l)
+        : DefWindowProcW(h, m, w, l);
+    if (m == WM_ACTIVATE && LOWORD(w) != WA_INACTIVE && self != nullptr) {
+        if (self->hwnd_ && self->shown_ && self->wants_focus_on_activate_) {
+            SetFocus(self->hwnd_);
+        }
+    }
+    return r;
 }
 
 bool WinOverlay::Init(HWND parent) {
@@ -293,6 +347,22 @@ bool WinOverlay::Init(HWND parent) {
 
     g = this;
 
+    // Subclass the parent's WndProc so we can re-focus the overlay
+    // when the application regains activation (alt-tab back). GLFW's
+    // own WM_ACTIVATE path calls SetFocus(parent) which would
+    // otherwise leave our child overlay focusless and unable to
+    // receive keystrokes. Non-fatal if it fails -- the overlay still
+    // works, just without the auto-restore.
+    SetLastError(0);
+    LONG_PTR prev_proc = SetWindowLongPtrW(parent_, GWLP_WNDPROC,
+        reinterpret_cast<LONG_PTR>(ParentWndProcThunk));
+    if (prev_proc == 0 && GetLastError() != 0) {
+        LOG_WARN("ConsoleOverlay_Win32: parent WndProc subclass failed (GLE={})",
+                 GetLastError());
+    } else {
+        original_parent_proc_ = reinterpret_cast<WNDPROC>(prev_proc);
+    }
+
     // 13-line ASCII boot banner with role-tagged lines (frame /
     // letters / ray) so theme switching recolours them just like the
     // Mac overlay's NSView does. Same shape and characters as the
@@ -321,6 +391,16 @@ bool WinOverlay::Init(HWND parent) {
 
 void WinOverlay::Shutdown() {
     if (g == this) g = nullptr;
+    // Restore the parent's original WndProc before tearing down.
+    // If another subclass installed itself on top of ours, this will
+    // remove it too -- acceptable given there's no other subclass
+    // owner in this codebase. SetWindowSubclass (comctl32) would be
+    // the correct general-purpose primitive but isn't linked here.
+    if (parent_ && original_parent_proc_) {
+        SetWindowLongPtrW(parent_, GWLP_WNDPROC,
+            reinterpret_cast<LONG_PTR>(original_parent_proc_));
+        original_parent_proc_ = nullptr;
+    }
     if (hwnd_) { KillTimer(hwnd_, kAnimTimerId); }
     if (font_)  {
         // Stock GDI objects (GetStockObject) are owned by the OS --
@@ -419,6 +499,10 @@ void WinOverlay::Show() {
     if (!hwnd_) return;
     if (shown_ && anim_state_ != AnimState::Hiding) return;
     shown_ = true;
+    // Newly shown -> we want the input field to be the focus target
+    // when the app regains activation. A subsequent click into the
+    // parent viewport will flip this back via WM_KILLFOCUS.
+    wants_focus_on_activate_ = true;
     StartAnim(/*showing=*/true);
 }
 
@@ -519,6 +603,16 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_TIMER:
         if (w == kAnimTimerId) { TickAnim(); return 0; }
         break;
+    case WM_KILLFOCUS: {
+        // Distinguish "user clicked into the game viewport" (focus
+        // moves to parent_) from "app is deactivating" (focus moves
+        // to NULL or another process). The former is a deliberate
+        // step away from the console; the latter is alt-tab/minimize
+        // and we should reclaim focus when the app comes back.
+        HWND new_focus = reinterpret_cast<HWND>(w);
+        wants_focus_on_activate_ = (new_focus != parent_);
+        break;
+    }
     case WM_CHAR: {
         // Backtick: toggle off (matches the engine's Mac path where
         // backtick on the GLFW window opens the overlay; once open
@@ -542,7 +636,43 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_KEYDOWN: {
         std::lock_guard lk(state_mutex_);
+
+        // Ghost-mode preamble.  When the autosuggestion is active these
+        // keys mean something different than their default: Tab cycles,
+        // Shift+Tab cycles back, Right-arrow at end / End commits, Esc
+        // dismisses, Enter commits-then-submits.  Any other key
+        // dismisses the ghost and falls through to normal handling.
+        if (ghost_.active) {
+            const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            if (w == VK_TAB) {
+                CycleGhost(shift ? -1 : +1);
+                return 0;
+            }
+            if (w == VK_END ||
+                (w == VK_RIGHT && cursor_ == static_cast<int>(input_.size()))) {
+                CommitGhost();
+                return 0;
+            }
+            if (w == VK_ESCAPE) {
+                DismissGhost();
+                return 0;
+            }
+            if (w == VK_RETURN) {
+                CommitGhost();
+                // Fall through; WM_CHAR '\r' will then submit.
+            } else {
+                DismissGhost();
+                // Fall through to existing handlers below.
+            }
+        }
+
         switch (w) {
+        case VK_TAB:
+            // Handled here (not WM_CHAR) so DefWindowProcW never sees
+            // it -- WS_CHILD + VK_TAB otherwise triggers focus
+            // traversal in the parent's tab order.
+            HandleTab();
+            return 0;
         case VK_LEFT:
             if (cursor_ > 0) { cursor_--; Repaint(); }
             return 0;
@@ -635,6 +765,132 @@ void WinOverlay::SubmitInput() {
             Repaint();
         });
 
+    Repaint();
+}
+
+// First Tab on a fresh prefix.  Caller (WM_KEYDOWN) holds state_mutex_,
+// so direct access to input_/cursor_/ghost_ is safe.  Console::Enumerate*
+// /FindCVar run on the engine main thread (same thread that owns the
+// cvar map) -- no Console-side locking needed.
+//
+// Behavior: if there's a single match, commit it inline (with trailing
+// space for token 0).  If multiple, extend to the longest common prefix
+// and then activate ghost mode: ghost_ holds the candidate list and
+// renders the first match's tail as dim text after the cursor.
+// Subsequent Tab/Shift+Tab cycle the ghost; Right/End commit it.
+void WinOverlay::HandleTab() {
+    std::size_t last_space = input_.rfind(' ');
+
+    std::string prefix;
+    std::vector<std::string> candidates;
+
+    if (last_space == std::string::npos) {
+        // Token 0: cvar / command name.
+        prefix = input_;
+        pt::console::Console::Get().EnumerateCVars("",
+            [&](pt::console::CVar& v) { candidates.push_back(v.name); });
+        pt::console::Console::Get().EnumerateCommands("",
+            [&](pt::console::Command& c) { candidates.push_back(c.name); });
+        std::sort(candidates.begin(), candidates.end());
+    } else {
+        // Value position. `toggle <cvar>` is special-cased: token 1 is a
+        // cvar name (only those with allowed_values are useful). Otherwise
+        // we complete from the named cvar's allowed_values.
+        std::size_t first_space = input_.find(' ');
+        std::string first_tok   = input_.substr(0, first_space);
+        prefix                  = input_.substr(last_space + 1);
+        if (first_tok == "toggle") {
+            pt::console::Console::Get().EnumerateCVars("",
+                [&](pt::console::CVar& v) {
+                    if (!v.allowed_values.empty()) {
+                        candidates.push_back(v.name);
+                    }
+                });
+            std::sort(candidates.begin(), candidates.end());
+        } else {
+            auto* cv = pt::console::Console::Get().FindCVar(first_tok);
+            if (cv == nullptr || cv->allowed_values.empty()) return;
+            candidates = cv->allowed_values;
+        }
+    }
+
+    std::vector<std::string> matches;
+    for (const auto& c : candidates) {
+        if (c.size() >= prefix.size() &&
+            c.compare(0, prefix.size(), prefix) == 0) {
+            matches.push_back(c);
+        }
+    }
+    if (matches.empty()) return;
+
+    const bool is_token0 = (last_space == std::string::npos);
+    std::string before = is_token0 ? std::string()
+                                   : input_.substr(0, last_space + 1);
+
+    if (matches.size() == 1) {
+        // Single match: commit immediately.  Trailing space for token 0
+        // so the next argument can be typed straight away.
+        std::string tail = is_token0 ? matches[0] + " " : matches[0];
+        input_  = before + tail;
+        cursor_ = static_cast<int>(input_.size());
+        Repaint();
+        return;
+    }
+
+    // Multiple matches: extend to their longest common prefix.
+    std::string common = matches[0];
+    for (std::size_t i = 1; i < matches.size(); ++i) {
+        std::size_t lim = std::min(common.size(), matches[i].size());
+        std::size_t j   = 0;
+        while (j < lim && common[j] == matches[i][j]) ++j;
+        common.resize(j);
+        if (common.empty()) break;
+    }
+    if (common.size() > prefix.size()) {
+        input_  = before + common;
+        cursor_ = static_cast<int>(input_.size());
+        prefix  = common;  // ghost rendering trims by this length
+    }
+
+    // Activate ghost mode -- subsequent Tabs cycle, Right/End commits.
+    ghost_.active    = true;
+    ghost_.matches   = std::move(matches);
+    ghost_.index     = 0;
+    ghost_.before    = std::move(before);
+    ghost_.prefix    = std::move(prefix);
+    ghost_.is_token0 = is_token0;
+    Repaint();
+}
+
+void WinOverlay::CycleGhost(int dir) {
+    if (!ghost_.active || ghost_.matches.empty()) return;
+    int n = static_cast<int>(ghost_.matches.size());
+    int i = (static_cast<int>(ghost_.index) + dir) % n;
+    if (i < 0) i += n;
+    ghost_.index = static_cast<std::size_t>(i);
+    Repaint();
+}
+
+void WinOverlay::CommitGhost() {
+    if (!ghost_.active || ghost_.matches.empty()) {
+        DismissGhost();
+        return;
+    }
+    const std::string& match = ghost_.matches[ghost_.index];
+    std::string tail = ghost_.is_token0 ? (match + " ") : match;
+    input_  = ghost_.before + tail;
+    cursor_ = static_cast<int>(input_.size());
+    DismissGhost();
+}
+
+void WinOverlay::DismissGhost() {
+    if (!ghost_.active) return;
+    ghost_.active = false;
+    ghost_.matches.clear();
+    ghost_.index  = 0;
+    ghost_.before.clear();
+    ghost_.prefix.clear();
+    ghost_.is_token0 = false;
     Repaint();
 }
 
@@ -783,6 +1039,23 @@ void WinOverlay::Paint(HDC dc) {
         HBRUSH cb = CreateSolidBrush(theme_.accent);
         FillRect(mdc, &cur, cb);
         DeleteObject(cb);
+
+        // Ghost text (dim, drawn just past the cursor).  Only the
+        // portion of the candidate beyond the user's typed prefix is
+        // shown -- typed chars are already in input_ above.
+        if (ghost_.active && !ghost_.matches.empty()) {
+            const std::string& match = ghost_.matches[ghost_.index];
+            if (match.size() > ghost_.prefix.size() &&
+                match.compare(0, ghost_.prefix.size(), ghost_.prefix) == 0) {
+                std::string ghost_tail = match.substr(ghost_.prefix.size());
+                SetTextColor(mdc, theme_.dim);
+                auto gbuf = ToWide(ghost_tail);
+                if (!gbuf.empty()) {
+                    TextOutW(mdc, cx + 3, input_y, gbuf.data(),
+                             static_cast<int>(gbuf.size()));
+                }
+            }
+        }
     }
 
     SelectObject(mdc, old_font);

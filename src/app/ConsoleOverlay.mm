@@ -229,14 +229,29 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
 @property NSInteger                     historyPos;
 
 @property NSMutableArray<NSString*>*    allNames;
-@property NSString*                     lastTabPrefix;
-@property BOOL                          lastTabShownList;
+
+// Tab-completion ghost state (fish-shell autosuggestion).  First Tab on
+// an ambiguous prefix extends to the longest common prefix AND shows the
+// first remaining match in dim colour after the cursor.  Subsequent Tabs
+// cycle (Shift+Tab back); Right-arrow at end / End commits;
+// Esc / typing dismisses.
+@property (strong) NSTextField*         ghostLabel;
+@property (strong) NSMutableArray<NSString*>* ghostMatches;
+@property NSInteger                     ghostIndex;
+@property (strong) NSString*            ghostBefore;
+@property (strong) NSString*            ghostPrefix;
+@property BOOL                          ghostIsToken0;
+@property BOOL                          ghostActive;
 
 - (instancetype)initWithFrame:(NSRect)frame;
 - (void)appendLine:(NSString*)line level:(NSString*)level;
 - (void)submitInput;
 - (void)submitLine:(NSString*)line;
 - (BOOL)handleTab;
+- (BOOL)cycleGhost:(NSInteger)dir;
+- (BOOL)commitGhost;
+- (void)dismissGhost;
+- (void)renderGhost;
 - (void)refreshNames;
 @end
 
@@ -371,8 +386,28 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     [self addSubview:logo];
     self.logoView = logo;
 
+    NSRect inputFrame = NSMakeRect(32, 8, frame.size.width - 46, 22);
+
+    // Ghost label sits *behind* the input with the same frame, font and
+    // metrics.  Its attributed string has two runs: the typed prefix in
+    // a fully-transparent colour (so it occupies the exact width of the
+    // user's text) followed by the candidate's tail in the palette
+    // dim/info colour.  The transparent prefix keeps the visible tail
+    // aligned right after the cursor without pixel-measuring text.
+    NSTextField* ghost = [[NSTextField alloc] initWithFrame:inputFrame];
+    ghost.autoresizingMask = NSViewWidthSizable;
+    ghost.bezeled = NO;
+    ghost.bordered = NO;
+    ghost.drawsBackground = NO;
+    ghost.editable = NO;
+    ghost.selectable = NO;
+    ghost.font = [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightRegular];
+    ghost.stringValue = @"";
+    [self addSubview:ghost];
+    self.ghostLabel = ghost;
+
     PtConsoleInputField* in = [[PtConsoleInputField alloc]
-        initWithFrame:NSMakeRect(32, 8, frame.size.width - 46, 22)];
+        initWithFrame:inputFrame];
     in.owner = self;
     in.autoresizingMask = NSViewWidthSizable;
     in.bezeled = NO;
@@ -573,6 +608,12 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
 // setStringValue: does not re-trigger this, so the writeback below is safe.
 - (void)controlTextDidChange:(NSNotification*)note {
     if (note.object != self.inputField) return;
+
+    // Typing while the ghost is showing invalidates the suggestion (the
+    // typed prefix has changed, so the transparent mirror would no
+    // longer align).  Dismiss eagerly.
+    if (self.ghostActive) [self dismissGhost];
+
     NSString* value = self.inputField.stringValue;
 
     // Backtick is the show/hide toggle; stripping it here catches the
@@ -612,11 +653,36 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
 
 // NSControlTextEditingDelegate dispatch.  The field's `delegate` is set
 // to this PtConsoleView, so AppKit calls the method on us (not on the
-// field subclass).  We map insertTab:/insertNewline:/moveUp:/moveDown:
-// to our completion / submit / history hooks.
+// field subclass).  Tab/Shift+Tab/Right/End/Esc are intercepted for
+// ghost-mode interaction when active; otherwise they fall through to
+// completion / history / cancel.
 - (BOOL)control:(NSControl*)control textView:(NSTextView*)textView
       doCommandBySelector:(SEL)cmd {
+    // Ghost-mode keys.  When the autosuggestion is active these
+    // selectors mean cycle / commit / dismiss; everything else
+    // dismisses and falls through to default behaviour.
+    if (self.ghostActive) {
+        if (cmd == @selector(insertTab:))     return [self cycleGhost:+1];
+        if (cmd == @selector(insertBacktab:)) return [self cycleGhost:-1];
+        if (cmd == @selector(moveRight:) || cmd == @selector(moveToEndOfLine:) ||
+            cmd == @selector(moveToEndOfDocument:) || cmd == @selector(moveToEndOfParagraph:)) {
+            return [self commitGhost];
+        }
+        if (cmd == @selector(insertNewline:)) {
+            [self commitGhost];
+            [self submitInput];
+            return YES;
+        }
+        if (cmd == @selector(cancelOperation:)) {
+            [self dismissGhost];
+            return YES;
+        }
+        // Any other command dismisses; fall through.
+        [self dismissGhost];
+    }
+
     if (cmd == @selector(insertTab:))      return [self handleTab];
+    if (cmd == @selector(insertBacktab:))  return [self handleTab];   // first Tab even with shift
     if (cmd == @selector(insertNewline:)) { [self submitInput]; return YES; }
     if (cmd == @selector(moveUp:)) {
         if (self.historyPos > 0) {
@@ -698,19 +764,19 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     }
     if (matches.count == 0) return YES;
 
-    NSString* before = (lastSpace.location == NSNotFound)
-                         ? @""
-                         : [value substringToIndex:lastSpace.location + 1];
+    BOOL isToken0 = (lastSpace.location == NSNotFound);
+    NSString* before = isToken0 ? @"" : [value substringToIndex:lastSpace.location + 1];
 
     if (matches.count == 1) {
-        NSString* tail = (lastSpace.location == NSNotFound)
-                            ? [matches[0] stringByAppendingString:@" "]
-                            : matches[0];
+        NSString* tail = isToken0 ? [matches[0] stringByAppendingString:@" "]
+                                  : matches[0];
         self.inputField.stringValue = [before stringByAppendingString:tail];
-        self.lastTabPrefix = nil;
+        [self dismissGhost];
         return YES;
     }
 
+    // Extend to longest common prefix (if it advances), then activate
+    // ghost mode for cycling.
     NSString* common = matches[0];
     for (NSUInteger i = 1; i < matches.count; ++i) {
         NSUInteger j = 0;
@@ -719,21 +785,81 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
         common = [common substringToIndex:j];
         if (common.length == 0) break;
     }
+    NSString* typedPrefix = prefix;
     if (common.length > prefix.length) {
         self.inputField.stringValue = [before stringByAppendingString:common];
-        self.lastTabPrefix = common;
-        self.lastTabShownList = NO;
-        return YES;
+        typedPrefix = common;
     }
 
-    if (self.lastTabPrefix && [self.lastTabPrefix isEqualToString:prefix] && !self.lastTabShownList) {
-        [self appendLine:[matches componentsJoinedByString:@"  "] level:@"out"];
-        self.lastTabShownList = YES;
-    } else {
-        self.lastTabPrefix = prefix;
-        self.lastTabShownList = NO;
-    }
+    self.ghostMatches  = matches;
+    self.ghostIndex    = 0;
+    self.ghostBefore   = before;
+    self.ghostPrefix   = typedPrefix;
+    self.ghostIsToken0 = isToken0;
+    self.ghostActive   = YES;
+    [self renderGhost];
     return YES;
+}
+
+- (BOOL)cycleGhost:(NSInteger)dir {
+    if (!self.ghostActive || self.ghostMatches.count == 0) return YES;
+    NSInteger n = (NSInteger)self.ghostMatches.count;
+    NSInteger i = ((self.ghostIndex + dir) % n + n) % n;
+    self.ghostIndex = i;
+    [self renderGhost];
+    return YES;
+}
+
+- (BOOL)commitGhost {
+    if (!self.ghostActive || self.ghostMatches.count == 0) {
+        [self dismissGhost];
+        return YES;
+    }
+    NSString* match = self.ghostMatches[self.ghostIndex];
+    NSString* tail = self.ghostIsToken0 ? [match stringByAppendingString:@" "] : match;
+    self.inputField.stringValue = [self.ghostBefore stringByAppendingString:tail];
+    [self dismissGhost];
+    return YES;
+}
+
+- (void)dismissGhost {
+    self.ghostActive   = NO;
+    self.ghostMatches  = nil;
+    self.ghostIndex    = 0;
+    self.ghostBefore   = nil;
+    self.ghostPrefix   = nil;
+    self.ghostIsToken0 = NO;
+    self.ghostLabel.attributedStringValue = [[NSAttributedString alloc] initWithString:@""];
+}
+
+- (void)renderGhost {
+    if (!self.ghostActive || self.ghostMatches.count == 0) {
+        self.ghostLabel.attributedStringValue = [[NSAttributedString alloc] initWithString:@""];
+        return;
+    }
+    NSString* match = self.ghostMatches[self.ghostIndex];
+    if (match.length <= self.ghostPrefix.length || ![match hasPrefix:self.ghostPrefix]) {
+        self.ghostLabel.attributedStringValue = [[NSAttributedString alloc] initWithString:@""];
+        return;
+    }
+    NSString* typed = self.inputField.stringValue;
+    NSString* tail  = [match substringFromIndex:self.ghostPrefix.length];
+
+    NSFont* font = self.inputField.font ?: [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightRegular];
+    NSMutableAttributedString* s = [[NSMutableAttributedString alloc] init];
+    // Transparent run mirrors typed text width so the visible tail
+    // lines up just past the cursor.
+    [s appendAttributedString:[[NSAttributedString alloc] initWithString:typed
+        attributes:@{
+            NSFontAttributeName: font,
+            NSForegroundColorAttributeName: [NSColor clearColor],
+        }]];
+    [s appendAttributedString:[[NSAttributedString alloc] initWithString:tail
+        attributes:@{
+            NSFontAttributeName: font,
+            NSForegroundColorAttributeName: self.palette.info ?: [NSColor grayColor],
+        }]];
+    self.ghostLabel.attributedStringValue = s;
 }
 
 @end
