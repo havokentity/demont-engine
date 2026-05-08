@@ -955,6 +955,20 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     self.ghostLabel.attributedStringValue = s;
 }
 
+// Forward mouse-wheel events anywhere on the console view to the
+// scrollback's NSScrollView, so the user can scroll the log even
+// when the cursor is over the input row, banner or padding -- not
+// just when it's directly over the output area.  When the cursor IS
+// over the scroll view, AppKit hit-tests it directly and this
+// override never fires, so no double-scrolling.
+- (void)scrollWheel:(NSEvent*)event {
+    if (self.outputScroll) {
+        [self.outputScroll scrollWheel:event];
+    } else {
+        [super scrollWheel:event];
+    }
+}
+
 @end
 
 // ---------------------------------------------------------------------------

@@ -617,6 +617,23 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_TIMER:
         if (w == kAnimTimerId) { TickAnim(); return 0; }
         break;
+    case WM_MOUSEWHEEL: {
+        // Mouse-wheel scrollback. Positive delta = wheel rotated
+        // forward (away from user) = scroll up = look at older
+        // content. WHEEL_DELTA (120) is one notch on a stock wheel;
+        // 3 lines per notch matches Windows' default text-control
+        // step. scroll_lines_ counts entries pushed up off the
+        // bottom, capped at scrollback_.size()-1.
+        int delta = GET_WHEEL_DELTA_WPARAM(w);
+        int lines = (delta * 3) / WHEEL_DELTA;
+        if (lines == 0) lines = (delta > 0) ? 1 : -1;
+        std::lock_guard lk(state_mutex_);
+        int n = static_cast<int>(scrollback_.size());
+        scroll_lines_ = std::clamp(scroll_lines_ + lines, 0,
+                                   std::max(0, n - 1));
+        Repaint();
+        return 0;
+    }
     case WM_KILLFOCUS: {
         // Distinguish "user clicked into the game viewport" (focus
         // moves to parent_) from "app is deactivating" (focus moves
