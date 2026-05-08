@@ -16,6 +16,17 @@ math(EXPR byte_len "${hex_len} / 2")
 # (245k pairs) it took ~3 minutes.  One regex pass is O(N).
 string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," bytes "${content}")
 
+# Insert a newline every 16 entries so the emitted cpp isn't one
+# multi-megabyte line.  Some compilers / IDEs (notably older
+# clangd / VS source viewers) slow to a crawl or hit line-length
+# limits when parsing single-line files in the multi-MB range.
+# Second regex pass; still O(N).  The {16} quantifier doesn't fire
+# reliably in cmake's regex engine, so spell out the 16 hex pairs
+# explicitly -- ugly but reliable.
+set(_b "0x[0-9a-f][0-9a-f],")
+string(REGEX REPLACE "(${_b}${_b}${_b}${_b}${_b}${_b}${_b}${_b}${_b}${_b}${_b}${_b}${_b}${_b}${_b}${_b})" "\\1\n" bytes "${bytes}")
+unset(_b)
+
 # `extern` on the definition prevents the C++ default of giving const
 # namespace-scope variables internal linkage -- without it the
 # compiler can (and does, with -fvisibility=hidden) elide them

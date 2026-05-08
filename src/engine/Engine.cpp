@@ -3456,9 +3456,21 @@ void Engine::RegisterCommands() {
             }
         };
     }
-    // r_backend: validate against the known set + react to changes.
+    // r_backend: validate against the set of backends actually
+    // compiled into this binary, so the console / web UI only offers
+    // values that can succeed.  Listing "metal" on Windows or
+    // "vulkan" on a build without PT_ENABLE_VULKAN_BACKEND would only
+    // produce confusing error logs at switch time.
     if (auto* v = C.FindCVar("r_backend")) {
-        v->allowed_values = {"none", "software", "metal", "vulkan"};
+        v->allowed_values.clear();
+        v->allowed_values.push_back("none");
+#if defined(__APPLE__)
+        v->allowed_values.push_back("software");
+        v->allowed_values.push_back("metal");
+#endif
+#if defined(PT_HAS_VULKAN_BACKEND)
+        v->allowed_values.push_back("vulkan");
+#endif
         v->on_change = [this](const pt::console::CVar& cv) {
             BackendType t = BackendType::None;
             if      (cv.value == "software") t = BackendType::Software;

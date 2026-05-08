@@ -1440,10 +1440,15 @@ void VulkanDevice::WriteBuffer(BufferHandle h, const void* src, std::size_t size
     }
 
     // Stage CPU bytes through a transient host-visible buffer, then
-    // vkCmdCopyBuffer to the device-local destination. Synchronous
-    // submit-and-wait -- WriteBuffer is called at scene-load time
-    // (mesh upload, env CDF upload) not in the per-frame loop, so
-    // the stall cost is fine.
+    // vkCmdCopyBuffer to the device-local destination.  Synchronous
+    // submit-and-wait -- the call sites are scene-load time (mesh
+    // upload, env CDF upload) and rare cvar-change events
+    // (r_exposure flip, etc.), not every frame.  The 5-15 ms stall
+    // is user-initiated and acceptable on a knob change; we'd want
+    // a vkCmdUpdateBuffer-based fast-path queued into the next
+    // frame's command buffer if this ever moves into the per-frame
+    // loop.  See Raytracer Plan/FOLLOW_UPS.md "WriteBuffer fast
+    // path for tiny runtime updates" if you hit a hitch on a knob.
     BufferEntry staging{};
     if (!CreateBufferImpl(size,
                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT,

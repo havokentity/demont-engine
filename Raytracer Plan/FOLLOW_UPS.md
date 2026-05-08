@@ -533,3 +533,28 @@ session.
   re-measuring on every Slang upgrade -- the link cost is the
   bottleneck and any improvement there directly raises the
   break-even point for further extraction.
+
+---
+
+## VulkanDevice::WriteBuffer fast-path for tiny runtime updates
+
+**Status:** Current implementation is a synchronous staging-copy
++ vkQueueWaitIdle, fine for scene-load (mesh upload, CDF upload)
+but produces a brief 5-15 ms stall for every cvar-change write
+(e.g. `r_exposure` flip writing to `exposure_state`).
+
+**Why deferred:** the user-visible cost is a one-frame hitch on
+a knob change -- the user is the one initiating the change, and
+the hitch is acceptable at human-scale interaction.  Not on a
+hot path.
+
+**Plan when picked up:**
+- Add `vkCmdUpdateBuffer`-based fast-path for writes <=65536 B
+  (Vulkan spec maximum for inline updates).  No staging buffer,
+  no separate submit, no queue wait.
+- Queue pending tiny writes; drain into the next frame's command
+  buffer at BeginFrame, before any compute dispatch that reads
+  the updated buffer.  Insert a HostWrite -> ComputeRead barrier
+  for correctness.
+- Keep the staging-copy fallback for big uploads (mesh / CDF) --
+  vkCmdUpdateBuffer's 65 KB cap means it can't replace those.
