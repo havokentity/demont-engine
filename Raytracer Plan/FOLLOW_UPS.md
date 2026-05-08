@@ -233,6 +233,76 @@ Windows/5090 is a P12 milestone.
 
 ---
 
+## Spherical-Earth atmospheric model (post-NRD)
+
+**Status:** Deferred until after the Vulkan NRD denoiser lands. The
+current rendering uses planar earth + a flat cloud-layer slab, which
+leaves a visible gap between the cloud bottom and the geometric
+horizon when the camera is near the ground -- "clouds never touch
+the horizon" because a perfectly horizontal ray would need infinite
+horizontal distance to enter a cloud slab above the camera. In real
+life Earth curvature drops distant clouds below horizontal sightline
+so they visually merge with the horizon.
+
+**Why deferred:** the current planar approximation is good enough
+for most paths (HDRI mode + scenes within a few km), and NRD is on
+the critical path for Vulkan visual quality.
+
+**Use case driving this:** procedural sky for **flight rendering** —
+sunset / sunrise / altitude views where the horizon is the
+focal area, sun aureole + multi-scatter need to look right, and
+distant terrain should fade through curved-path aerial perspective.
+HDRI mode benefits less because the env map provides the sky, but
+still wins on the spherical cloud shell + curved aerial perspective
+on far surfaces.
+
+**The four phases (rough Hillaire 2020 implementation):**
+
+1. **Spherical cloud shell** (~150 LOC, ~1 hour). Add
+   `r_planet_radius` cvar (default 6371 km Earth). Replace cloud
+   layer's flat slab intersection with ray-vs-spherical-shell. Cloud
+   march cost rises by a couple of `sqrt`s per entry, runtime impact
+   negligible. Self-contained -- can ship without phases 2-4 and
+   still get the horizon-gap fix.
+
+2. **Transmittance LUT + spherical aerial perspective** (~250 LOC).
+   Replace the analytical `atmosphericTransmittance` (planar
+   exponential integral) with a 256x64 LUT computed once at startup
+   via a compute pass. Curved-path attenuation along the actual
+   spherical air mass. Sample per cloud-march step + per surface
+   hit; ~5 cycles + memory latency per sample (faster than the
+   current `exp` calls in many cases).
+
+3. **Multi-scatter + sky-view LUTs for procedural mode** (~350 LOC).
+   This is the flight-sim sunset visual win:
+   - **Multi-scatter LUT** 32x32, computed from the transmittance
+     LUT. Adds the secondary-bounce contribution that makes
+     overcast and sunset look saturated rather than washed out.
+   - **Sky-view LUT** 192x108 RGBA16F, recomputed each frame
+     because it depends on sun direction. Replaces `procSky`'s
+     analytical math with a proper sampled sky.
+   - Procedural sky's sun aureole + horizon gradient become correct.
+   - HDRI mode still bypasses this entirely (it samples the env
+     map for the sky color regardless).
+
+4. **Aerial perspective volumetric LUT** (~150 LOC, only if needed).
+   32x32x32 3D texture mapping `(screen pos, depth) ->
+   {transmittance, in-scatter}` for distant geometry. Skip if the
+   per-sample LUT from phase 2 already looks right -- this is just
+   a perf optimisation that batches the curved-path math into a
+   precompute. May not be needed at our typical scene scales
+   (1-30 km).
+
+**Total cost:** ~900 LOC, 1-2 days focused work, ~150 µs/frame for
+the per-frame LUT updates (sky-view + AP), trivially small relative
+to ray-tracing cost.
+
+**No assets to ship** -- all LUTs are procedural compute, generated
+from physical parameters (Mie/Rayleigh sigmas, sun direction,
+planet radius). Storage cost ~5 MB GPU memory total.
+
+---
+
 ## Per-face materials on CSG meshes
 
 **Status:** All triangles emitted by `pt::csg::CsgScene::Bake()` get the
