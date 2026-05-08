@@ -20,7 +20,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <vector>
 
 extern "C" {
 extern const unsigned char shader_PathTrace_spirv_data[];
@@ -811,6 +815,14 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         }
     }
 
+    // ---- Persistent pipeline cache -----------------------------------
+    // Loaded before pipeline creation so vkCreateComputePipelines can
+    // hit precompiled bytecode. First launch is still slow (cache is
+    // empty), but every subsequent launch is near-instant. Failures
+    // (no file, corrupt header, driver-version-mismatch) just leave
+    // the cache empty -- the driver rebuilds on demand.
+    LoadPipelineCache();
+
     // ---- Build the path-trace pipeline -------------------------------
     auto build_pipeline = [&](const char* name,
                               const unsigned char* spirv,
@@ -827,7 +839,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         cpci2.layout = shared_pipe_layout_;
         cpci2.stage  = stage;
         VkPipeline pipe = VK_NULL_HANDLE;
-        if (vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &cpci2,
+        if (vkCreateComputePipelines(device_, pipeline_cache_, 1, &cpci2,
                                      nullptr, &pipe) == VK_SUCCESS) {
             std::lock_guard lock(resource_mutex_);
             auto id = next_id_++;
@@ -899,6 +911,14 @@ void VulkanDevice::DestroyDevice() {
             vkDestroyDescriptorSetLayout(device_, shared_dset_layout_, nullptr);
         if (dpool_ != VK_NULL_HANDLE) vkDestroyDescriptorPool(device_, dpool_, nullptr);
 
+        // Persist pipeline cache before destroying device. Order matters:
+        // vkGetPipelineCacheData / vkDestroyPipelineCache need a live device.
+        SavePipelineCache();
+        if (pipeline_cache_ != VK_NULL_HANDLE) {
+            vkDestroyPipelineCache(device_, pipeline_cache_, nullptr);
+            pipeline_cache_ = VK_NULL_HANDLE;
+        }
+
         vkDestroyDevice(device_, nullptr);
         device_ = VK_NULL_HANDLE;
     }
@@ -916,6 +936,93 @@ void VulkanDevice::DestroyDevice() {
         vkDestroyInstance(instance_, nullptr);
         instance_ = VK_NULL_HANDLE;
     }
+}
+
+// ---- VkPipelineCache persistence ----------------------------------------
+//
+// Path: %LOCALAPPDATA%/demont/pipeline.cache on Windows,
+// $XDG_CACHE_HOME/demont/pipeline.cache (or $HOME/.cache/demont/...) on
+// POSIX. Per-driver / per-device blobs are NOT separated here -- the
+// driver tags the cache with a UUID and silently rejects mismatched
+// blobs, so a single file works correctly across reinstalls / GPU
+// swaps (just rebuilds on first launch after a change).
+
+std::string VulkanDevice::PipelineCachePath() {
+    namespace fs = std::filesystem;
+    fs::path base;
+#if defined(_WIN32)
+    if (const char* appdata = std::getenv("LOCALAPPDATA")) {
+        base = fs::path(appdata) / "demont";
+    } else {
+        base = fs::temp_directory_path() / "demont";
+    }
+#else
+    if (const char* xdg = std::getenv("XDG_CACHE_HOME")) {
+        base = fs::path(xdg) / "demont";
+    } else if (const char* home = std::getenv("HOME")) {
+        base = fs::path(home) / ".cache" / "demont";
+    } else {
+        base = fs::temp_directory_path() / "demont";
+    }
+#endif
+    std::error_code ec;
+    fs::create_directories(base, ec);     // best-effort; ignore failures
+    return (base / "pipeline.cache").string();
+}
+
+void VulkanDevice::LoadPipelineCache() {
+    if (device_ == VK_NULL_HANDLE) return;
+    std::vector<char> blob;
+    {
+        std::ifstream f(PipelineCachePath(), std::ios::binary);
+        if (f) {
+            f.seekg(0, std::ios::end);
+            const auto sz = f.tellg();
+            f.seekg(0, std::ios::beg);
+            if (sz > 0) {
+                blob.resize(static_cast<std::size_t>(sz));
+                f.read(blob.data(), sz);
+                if (!f) blob.clear();
+            }
+        }
+    }
+    VkPipelineCacheCreateInfo ci{};
+    ci.sType           = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    ci.initialDataSize = blob.size();
+    ci.pInitialData    = blob.empty() ? nullptr : blob.data();
+    if (vkCreatePipelineCache(device_, &ci, nullptr, &pipeline_cache_) != VK_SUCCESS) {
+        // Driver rejected the blob (header / UUID / version mismatch).
+        // Retry with empty initial data so the cache is at least usable
+        // for this run -- subsequent vkCreateComputePipelines will
+        // populate it and SavePipelineCache will overwrite the stale
+        // file on shutdown.
+        pipeline_cache_ = VK_NULL_HANDLE;
+        VkPipelineCacheCreateInfo empty_ci{};
+        empty_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+        if (vkCreatePipelineCache(device_, &empty_ci, nullptr, &pipeline_cache_) != VK_SUCCESS) {
+            pipeline_cache_ = VK_NULL_HANDLE;
+            LOG_WARN("Vulkan: pipeline cache create failed; pipelines will compile cold");
+        } else if (!blob.empty()) {
+            LOG_INFO("Vulkan: pipeline cache rejected stale blob ({} bytes); rebuilding", blob.size());
+        }
+    } else if (!blob.empty()) {
+        LOG_INFO("Vulkan: pipeline cache loaded ({} bytes)", blob.size());
+    }
+}
+
+void VulkanDevice::SavePipelineCache() {
+    if (device_ == VK_NULL_HANDLE || pipeline_cache_ == VK_NULL_HANDLE) return;
+    std::size_t sz = 0;
+    if (vkGetPipelineCacheData(device_, pipeline_cache_, &sz, nullptr) != VK_SUCCESS || sz == 0) {
+        return;
+    }
+    std::vector<char> blob(sz);
+    if (vkGetPipelineCacheData(device_, pipeline_cache_, &sz, blob.data()) != VK_SUCCESS) {
+        return;
+    }
+    std::ofstream f(PipelineCachePath(), std::ios::binary | std::ios::trunc);
+    if (!f) return;
+    f.write(blob.data(), static_cast<std::streamsize>(sz));
 }
 
 bool VulkanDevice::RecreateSwapchain() {

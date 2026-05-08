@@ -182,6 +182,21 @@ private:
     VkDescriptorSetLayout shared_dset_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout      shared_pipe_layout_ = VK_NULL_HANDLE;
 
+    // Persistent VkPipelineCache. Loaded from
+    // %LOCALAPPDATA%/demont/pipeline.cache (or $XDG_CACHE_HOME/demont
+    // on POSIX) at device init, and the cache blob is rewritten to
+    // disk in the destructor. The driver compiles SPIR-V -> native
+    // bytecode at vkCreateComputePipelines time; first launch pays
+    // that cost (PathTrace is the long pole, ~1-3 s), but subsequent
+    // launches see near-zero pipeline-creation latency because the
+    // driver finds a hit in this cache. Cache header is version-tagged
+    // by the driver, so a mismatched (stale) blob is silently rejected
+    // and rebuilt -- no need for engine-side validation.
+    VkPipelineCache       pipeline_cache_     = VK_NULL_HANDLE;
+    void LoadPipelineCache();
+    void SavePipelineCache();
+    static std::string PipelineCachePath();
+
     VkDescriptorPool dpool_ = VK_NULL_HANDLE;
     VkDescriptorSet  dsets_[kFramesInFlight] {};
 

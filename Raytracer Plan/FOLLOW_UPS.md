@@ -373,3 +373,43 @@ when we need to (e.g. when chasing 60 FPS at 4K).
   scopes.
 - Frame marker via `FrameMark` at top of the main loop.
 - Connect with `tracy-profiler` from the Tracy repo.
+
+---
+
+## Async pipeline build + loading screen
+
+**Status:** Persistent `VkPipelineCache` shipped (loads from
+`%LOCALAPPDATA%/demont/pipeline.cache` on Windows,
+`$XDG_CACHE_HOME/demont/pipeline.cache` on POSIX). Subsequent launches
+hit the cache and pipeline creation is near-instant.
+
+**Why deferred:** First-launch freeze (≈1-3 s on NVIDIA, dominated by
+PathTrace.spv → driver-native compile inside `vkCreateComputePipelines`)
+is still a one-time bad UX moment that the cache can't solve. It only
+hurts on first-ever run, after `pipeline.cache` is wiped, or after a
+driver upgrade — but it's the difference between "the app is starting"
+and "the app froze on launch".
+
+**Plan when picked up:**
+- Spin up a worker thread at `VulkanDevice::Init` that builds all
+  compute pipelines (`pathtrace`, `autoexpose`, `perfoverlay`, future
+  ones) using a thread-private `VkPipelineCache`. Vulkan pipeline
+  creation is thread-safe; we just need to keep the device handle
+  accessible to the worker.
+- Block in the main loop on a "pipelines ready" atomic before the first
+  `RenderFrame` that needs them — render a loading-screen frame in the
+  meantime (clear-to-color + a small spinner / text in the
+  `PerfOverlay_Win32` swapchain pass, which can run without the
+  PathTrace pipeline).
+- After the worker finishes, `vkMergePipelineCaches` the worker's cache
+  into the main one before saving on shutdown so the merged cache lands
+  on disk.
+- The Tonemap / Bloom shaders go through a separate engine inline path,
+  not `VulkanDevice::build_pipeline`. Audit when implementing.
+
+**Mac/Metal:** Metal does the SPIR-V→native compile lazily on first
+draw and is much faster than Vulkan's eager `vkCreateComputePipelines`.
+The macOS port doesn't have the same freeze and isn't on this critical
+path — but the same async-build loading-screen scaffold could host a
+Metal `MTLLibrary.makeComputePipelineState(completionHandler:)` worker
+if we ever see a similar stall there.
