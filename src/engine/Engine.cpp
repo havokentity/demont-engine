@@ -1925,7 +1925,24 @@ void Engine::RenderFrame() {
             PtShaderGhost ghosts[lensflare::kMaxGhosts];
         } tp{};
         static_assert(sizeof(TonePush) % 16 == 0, "TonePush 16-byte aligned");
-        tp.exposure         = push.exposure_pad[0];
+        // Tonemap push exposure: pull straight from the r_exposure cvar
+        // rather than from push.exposure_pad[0] (which was sourced from
+        // the host-side `current_exposure_` field that I correctly
+        // deleted in db61e68 -- but I missed that the Mac post-pass
+        // tonemap was the actual reader, so zeroing the slot painted
+        // the screen black). Sourcing from the cvar is closer to the
+        // pre-cleanup behaviour: in manual mode (r_auto_exposure=0)
+        // it's exactly what the user typed; in auto mode the cvar
+        // sits at its default and the auto-exposure shader's GPU
+        // value never makes it here. That last bit is a real
+        // limitation -- Mac's post-pass tonemap won't track the
+        // GPU-side adaptation -- and the proper fix is to wire
+        // `exposure_state[0]` into Tonemap.slang the same way
+        // PathTrace.slang reads it. Filed as a follow-up; the
+        // immediate priority here is unbreaking the boot.
+        float r_exposure_val = 1.5f;
+        if (auto* v = C.FindCVar("r_exposure")) r_exposure_val = v->GetFloat();
+        tp.exposure         = r_exposure_val;
         tp.passthrough      = hdr_pipeline ? 0u : 1u;
         tp.bloom_intensity  = (bloom_on && bloom_h.id == bloom_mip_tex_id_[0])
                                 ? bloom_intensity : 0.0f;
