@@ -166,11 +166,13 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // optimizer would otherwise strip unused declarations and
     // exposure_state would land at MSL buf(0) again, breaking the
     // engine's push_slot=7 contract -- see the slot-alignment
-    // notice at the top of the file). The dim.x check is true for
-    // exactly tid (0,0) -- one thread per workgroup, branch is
-    // never taken at runtime anyway because tid.x < dim.x always
-    // holds after the bounds check above. Slang can't statically
-    // prove dim.x equals 0xDEADBEEFu so the branch survives.
+    // notice at the top of the file).  The condition `dim.x ==
+    // 0xDEADBEEFu` is uniform (every thread reads the same
+    // swapchain width) so the branch is either taken by the whole
+    // dispatch or by none of it; in practice never, because dim.x
+    // is the real texture width.  Slang can't statically prove
+    // that at compile time, so the body survives optimisation and
+    // every referenced declaration gets a real slot assignment.
     if (dim.x == 0xDEADBEEFu) {
         let p = _slot_mesh_positions[0];
         let i = _slot_mesh_indices[0];

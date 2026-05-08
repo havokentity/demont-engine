@@ -133,18 +133,25 @@ bool ConsoleServer::Start(const Config& cfg, Console* console) {
     // Winsock requires per-process init before any socket() / bind() call.
     // civetweb does its own WSAStartup internally, but our line-protocol
     // listener is independent so we initialise here and pair with a
-    // matching WSACleanup() in Stop().
+    // matching WSACleanup() in Stop() (or in any failure-path unwind
+    // below).  Track success so a later mg_start() failure can pair
+    // each init with its matching cleanup -- otherwise repeated
+    // Start() retries leak process-wide socket / library state.
+    bool wsa_started = false;
     {
         WSADATA wsa{};
         int wsa_err = WSAStartup(MAKEWORD(2, 2), &wsa);
         if (wsa_err != 0) {
             LOG_ERROR("WSAStartup failed: {}", wsa_err);
             // Carry on -- HTTP via civetweb may still work.
+        } else {
+            wsa_started = true;
         }
     }
 #endif
 
     mg_init_library(0);
+    bool mg_lib_initialised = true;
 
     auto port_spec = fmt::format("{}:{}", config_.bind_address, config_.http_port);
     const char* opts[] = {
@@ -160,6 +167,16 @@ bool ConsoleServer::Start(const Config& cfg, Console* console) {
     ctx_ = mg_start(&callbacks, this, opts);
     if (ctx_ == nullptr) {
         LOG_ERROR("Failed to start civetweb on {}", port_spec);
+        // Unwind in reverse init order so process-wide library state
+        // doesn't leak across retried Start() calls.
+        if (mg_lib_initialised) {
+            mg_exit_library();
+        }
+#if defined(_WIN32)
+        if (wsa_started) {
+            WSACleanup();
+        }
+#endif
         return false;
     }
 
