@@ -644,6 +644,20 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             input_.insert(cursor_, 1, static_cast<char>(w));
             cursor_++;
             Repaint();
+            // After typing space, if the input is exactly "<name> "
+            // (single token + trailing space, cursor at end) and that
+            // name resolves to a known cvar/command with suggestions,
+            // auto-activate the value-position ghost.  Mirrors the
+            // post-commit auto-activation so users who type the full
+            // name themselves get the same affordance as those who
+            // tab-completed it.
+            if (w == ' ' && cursor_ == static_cast<int>(input_.size()) &&
+                input_.size() >= 2) {
+                auto first_space = input_.find(' ');
+                if (first_space + 1 == input_.size()) {
+                    ActivateValueGhost(input_.substr(0, first_space));
+                }
+            }
             return 0;
         }
         return 0;
@@ -918,26 +932,37 @@ void WinOverlay::DismissGhost() {
     Repaint();
 }
 
-// After a token-0 commit (cvar or command name + trailing space),
-// auto-show the cvar's current value as a ghost so the user can see
-// what's currently set without typing anything more.  For cvars with
-// allowed_values, cycle those (same as the existing value-position
-// behaviour after `cvar ` + Tab).  For free-form cvars, the cycle
-// list is [current, default] and `is_meta` flips on so the inactive
-// one is rendered as an annotation.  No-op for commands.
-void WinOverlay::ActivateValueGhost(const std::string& cvar_name) {
-    auto* cv = pt::console::Console::Get().FindCVar(cvar_name);
-    if (cv == nullptr) return;
-
+// After a token-0 commit OR a typed `<name> ` sequence, auto-show
+// the cvar's current value (or a command's default args) as a ghost
+// so the user can see a useful suggestion without typing anything
+// more.  Three branches:
+//
+//   - CVar with allowed_values: cycle those (same as the existing
+//     value-position behaviour after `cvar ` + Tab).
+//   - Free-form cvar: cycle [current, default] with `is_meta` set
+//     so the inactive one is rendered as an annotation.
+//   - Command with default_args: single-match ghost showing the
+//     default invocation (e.g. `screenshot demonte_screen.ppm`).
+//
+// No-op for commands without default_args, and for unknown names.
+void WinOverlay::ActivateValueGhost(const std::string& name) {
+    auto& C = pt::console::Console::Get();
     std::vector<std::string> matches;
     bool meta = false;
-    if (!cv->allowed_values.empty()) {
-        matches = cv->allowed_values;
-    } else {
-        matches.push_back(cv->value);
-        if (cv->default_value != cv->value) {
-            matches.push_back(cv->default_value);
-            meta = true;
+
+    if (auto* cv = C.FindCVar(name); cv != nullptr) {
+        if (!cv->allowed_values.empty()) {
+            matches = cv->allowed_values;
+        } else {
+            matches.push_back(cv->value);
+            if (cv->default_value != cv->value) {
+                matches.push_back(cv->default_value);
+                meta = true;
+            }
+        }
+    } else if (auto* cmd = C.FindCommand(name); cmd != nullptr) {
+        if (!cmd->default_args.empty()) {
+            matches.push_back(cmd->default_args);
         }
     }
     if (matches.empty()) return;

@@ -2361,7 +2361,7 @@ void Engine::RegisterCommands() {
             out.FormatLine("scene: loaded {} primitive(s) from {}", primitives_.size(), path);
         });
 
-    C.RegisterCommand("screenshot",
+    if (auto* cmd = C.RegisterCommand("screenshot",
         "screenshot <path.ppm> [accum|denoise_color|depth|motion]: dump the target render texture to a PPM file (P6 binary, ACES-tonemapped for HDR inputs).",
         [this](auto args, pt::console::Output& out) {
             if (!device_) { out.PrintLine("screenshot: no device"); return; }
@@ -2541,7 +2541,9 @@ void Engine::RegisterCommands() {
             std::fclose(f);
             out.FormatLine("screenshot: wrote {} ({}x{} {})", path, w, hgt, tag);
             (void)channels;
-        });
+        })) {
+        cmd->default_args = "demonte_screen.ppm";
+    }
 
     C.RegisterCommand("web_console",
         "Open the web console in the default browser.",

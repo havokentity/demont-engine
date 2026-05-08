@@ -81,8 +81,9 @@
   // match is shown after the cursor in dim colour. Subsequent Tabs
   // cycle (Shift+Tab back); Right-arrow at end / End commits;
   // Esc / typing dismisses.
-  let allNames = [];
-  let cvarMeta = {};   // name -> { allowed_values: [...] }
+  let allNames    = [];
+  let cvarMeta    = {};   // name -> { allowed_values, value, default_value, ... }
+  let commandMeta = {};   // name -> { default_args }
   // ghostState shape:
   //   { matches: [...], index, before, prefix, isToken0,
   //     isMeta:    bool   -- matches = [current, default] of a free-form cvar
@@ -642,7 +643,15 @@
         };
       }
     }
-    if (k && k.ok && k.commands) for (const v of k.commands) names.add(v.name);
+    commandMeta = {};
+    if (k && k.ok && k.commands) {
+      for (const v of k.commands) {
+        names.add(v.name);
+        commandMeta[v.name] = {
+          default_args: v.default_args || '',
+        };
+      }
+    }
     allNames = Array.from(names).sort();
   }
 
@@ -697,23 +706,26 @@
     ghostState = null;
     renderGhost();
   }
-  function activateValueGhost(cvarName) {
-    const meta = cvarMeta[cvarName];
-    if (!meta) return;   // commands have no entry in cvarMeta
-    let matches;
-    let isMeta = false;
-    if (meta.allowed_values && meta.allowed_values.length > 0) {
-      matches = meta.allowed_values.slice();
-    } else if (meta.value !== undefined) {
-      matches = [String(meta.value)];
-      const dflt = meta.default_value;
-      if (dflt !== undefined && String(dflt) !== String(meta.value)) {
-        matches.push(String(dflt));
-        isMeta = true;
+  function activateValueGhost(name) {
+    let matches = null;
+    let isMeta  = false;
+    const cv = cvarMeta[name];
+    const cmd = commandMeta[name];
+    if (cv) {
+      if (cv.allowed_values && cv.allowed_values.length > 0) {
+        matches = cv.allowed_values.slice();
+      } else if (cv.value !== undefined) {
+        matches = [String(cv.value)];
+        const dflt = cv.default_value;
+        if (dflt !== undefined && String(dflt) !== String(cv.value)) {
+          matches.push(String(dflt));
+          isMeta = true;
+        }
       }
-    } else {
-      return;
+    } else if (cmd && cmd.default_args) {
+      matches = [cmd.default_args];
     }
+    if (!matches || matches.length === 0) return;
     ghostState = {
       matches,
       index:    0,
@@ -916,6 +928,22 @@
   // moves away from end-of-line, so the suggestion is no longer
   // contextually meaningful).
   input.addEventListener('mousedown', () => { dismissGhost(); });
+
+  // Auto-activate the value-position ghost when the user types
+  // `<name> ` themselves (without going through Tab + Right).  Fires
+  // after every text mutation; only triggers when input is exactly
+  // "<single token> " with cursor at the end and no ghost is already
+  // active.  Mirrors the post-commit auto-activation so manual typers
+  // get the same affordance as tab-completers.
+  input.addEventListener('input', () => {
+    if (ghostState) return;
+    const v = input.value;
+    if (v.length < 2 || v[v.length - 1] !== ' ') return;
+    if (input.selectionStart !== v.length) return;
+    const trimmed = v.slice(0, -1);
+    if (trimmed.length === 0 || trimmed.includes(' ')) return;
+    activateValueGhost(trimmed);
+  });
 
   // Paste-to-multiline: if the clipboard text spans multiple lines, treat
   // each line as its own command and run them in order. Whatever follows

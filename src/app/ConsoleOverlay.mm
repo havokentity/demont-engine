@@ -624,6 +624,18 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
 
     NSString* value = self.inputField.stringValue;
 
+    // Auto-activate the value-position ghost when the user types
+    // `<name> ` themselves (without tab + commit).  Fires when input is
+    // exactly "<single token> " -- mirrors the post-commit auto-
+    // activation so manual typers get the same affordance.
+    if (value.length >= 2 && [value characterAtIndex:value.length - 1] == ' ') {
+        NSString* trimmed = [value substringToIndex:value.length - 1];
+        if (trimmed.length > 0 &&
+            [trimmed rangeOfString:@" "].location == NSNotFound) {
+            [self activateValueGhost:trimmed];
+        }
+    }
+
     // Backtick is the show/hide toggle; stripping it here catches the
     // case where the user presses ` to open AND starts typing fast
     // -- the original ` event arrives at the field editor before the
@@ -848,25 +860,27 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     self.ghostLabel.attributedStringValue = [[NSAttributedString alloc] initWithString:@""];
 }
 
-- (void)activateValueGhost:(NSString*)cvarName {
-    auto* cv = pt::console::Console::Get().FindCVar(
-        std::string_view([cvarName UTF8String]));
-    if (cv == nullptr) return;   // commands have no value position
-
+- (void)activateValueGhost:(NSString*)name {
+    auto& C = pt::console::Console::Get();
     NSMutableArray<NSString*>* matches = [NSMutableArray array];
     BOOL meta = NO;
-    if (!cv->allowed_values.empty()) {
-        for (auto& a : cv->allowed_values) {
-            [matches addObject:[NSString stringWithUTF8String:a.c_str()]];
+    if (auto* cv = C.FindCVar(std::string_view([name UTF8String])); cv != nullptr) {
+        if (!cv->allowed_values.empty()) {
+            for (auto& a : cv->allowed_values) {
+                [matches addObject:[NSString stringWithUTF8String:a.c_str()]];
+            }
+        } else {
+            NSString* current = [NSString stringWithUTF8String:cv->value.c_str()];
+            NSString* dflt    = [NSString stringWithUTF8String:cv->default_value.c_str()];
+            [matches addObject:current];
+            if (![dflt isEqualToString:current]) {
+                [matches addObject:dflt];
+                meta = YES;
+            }
         }
-    } else {
-        NSString* current = [NSString stringWithUTF8String:cv->value.c_str()];
-        NSString* dflt    = [NSString stringWithUTF8String:cv->default_value.c_str()];
-        [matches addObject:current];
-        if (![dflt isEqualToString:current]) {
-            [matches addObject:dflt];
-            meta = YES;
-        }
+    } else if (auto* cmd = C.FindCommand(std::string_view([name UTF8String]));
+               cmd != nullptr && !cmd->default_args.empty()) {
+        [matches addObject:[NSString stringWithUTF8String:cmd->default_args.c_str()]];
     }
     if (matches.count == 0) return;
 
