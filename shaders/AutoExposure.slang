@@ -98,8 +98,23 @@ groupshared float g_lum_sum[64];
 groupshared uint  g_lum_count[64];
 
 [shader("compute")]
-[numthreads(64, 1, 1)]
-void main(uint3 tid : SV_DispatchThreadID, uint gid : SV_GroupThreadID) {
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID, uint3 gid_3d : SV_GroupThreadID) {
+    // Why 8x8x1 instead of 64x1x1? The Metal RHI dispatches every
+    // compute kernel with threadgroup shape derived from the
+    // pipeline's threadExecutionWidth (32 on Apple GPUs) and
+    // maxTotalThreadsPerThreadgroup (64 here), giving an actual
+    // dispatch-time threadgroup shape of (32, 2, 1). If the kernel
+    // had declared [numthreads(64, 1, 1)] and used uint gid : SV_GroupThreadID
+    // expecting linearized 0..63 indexing, gid.x at runtime would only
+    // have spanned 0..31 -- the upper 32 threads would have gid.y=1 and
+    // collide with the lower 32 on the per-thread sum/count slot, race-
+    // writing into g_lum_sum[gid_lin] and computing half-correct mean.
+    // Declaring [numthreads(8, 8, 1)] makes the threadgroup shape match
+    // what every other kernel in the engine uses, and we linearize the
+    // 2D gid here for the rest of the reduction. Total threads per
+    // workgroup: 64, same as before, just laid out 2D.
+    uint gid = gid_3d.y * 8u + gid_3d.x;
     // Force Slang to emit the dummy bindings even though they're
     // unused at runtime. The compiler can't statically prove
     // `width == 0xDEADBEEFu` is false (width comes from a runtime
