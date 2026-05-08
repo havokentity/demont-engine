@@ -536,6 +536,46 @@ session.
 
 ---
 
+## Single source of truth for PtPush + Frame UBO + Vulkan constants
+
+**Status:** PtPush layout is currently defined in three places that
+must agree by hand:
+
+  1. `src/engine/Engine.cpp` -- the C++ struct used at dispatch site.
+  2. `shaders/PathTrace.slang` -- the SPIR-V `cbuffer Push` (small)
+     plus `cbuffer Frame` (spilled tail at vk::binding(14, 0)).
+  3. `src/rhi_vulkan/VulkanDevice.h` -- `kPushSplitOffset`,
+     `kFrameUboBinding`, `kFrameUboSize` constants.
+
+A `static_assert(sizeof(PtPush) == ...)` in Engine.cpp catches one
+class of drift (size change), but a field re-order with same total
+bytes would silently mismatch between C++ and Slang.  The runtime
+symptom of a desync is rendering corruption, not a build error.
+
+**Why deferred:** the human-side cost of three-place edits is real
+but rare (PtPush evolves once or twice per multi-week iteration),
+and the static_assert + comment cross-references make drift
+catchable in code review.
+
+**Plan when picked up:**
+- Option A: drive the layout from a single shared header
+  (`src/rhi/PtPushLayout.h`) included by both Engine.cpp (via
+  `#include`) and shaders/PathTrace.slang (via slangc's
+  `-I` + `import`).  Slang's modules support `cbuffer`
+  declarations now (post the PathTraceCloud/PathTraceMath split),
+  so the spilled-tail Frame UBO would be a public cbuffer in a
+  module that both PathTrace.slang and the engine import.
+- Option B: derive the C++ side from Slang reflection
+  (`slangc -reflection-json` or the Slang reflection API at
+  init).  Less code coupling but adds a build-time tool.
+- Option A is simpler; option B is more flexible.  Pick whichever
+  feels right when the next big PtPush expansion lands.
+
+**Acceptance:** changing one field in the shared layout source
+must propagate to all three call sites with at most one edit.
+
+---
+
 ## VulkanDevice::WriteBuffer fast-path for tiny runtime updates
 
 **Status:** Current implementation is a synchronous staging-copy

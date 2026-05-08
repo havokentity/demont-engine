@@ -455,6 +455,29 @@ void Console::Drain() {
             }
             if (pe.responder) pe.responder(result);
         } else {
+            // Cap the bundle size so a misbehaving / disconnected
+            // client that opens '[' but never sends ']' can't grow
+            // the buffer without bound -- the engine is shared
+            // process-wide state and an OOM here would take
+            // everything down.  1 MiB is far more than any sane
+            // batched command list (cvar dumps + replay scripts in
+            // this codebase top out at < 64 KiB) but tiny relative
+            // to engine memory headroom, so it's safe to be
+            // generous before auto-aborting.
+            constexpr std::size_t kBatchMaxBytes = 1u * 1024u * 1024u;
+            const std::size_t projected =
+                batch_buffer_.size() + pe.line.size() + 1u;
+            if (projected > kBatchMaxBytes) {
+                batch_active_ = false;
+                batch_buffer_.clear();
+                ExecuteResult r;
+                r.output = fmt::format(
+                    "batch: aborted (would exceed {} byte cap; nothing committed). "
+                    "Send '[' again to retry with a smaller bundle.",
+                    kBatchMaxBytes);
+                if (pe.responder) pe.responder(r);
+                continue;
+            }
             // Append the line to the batch buffer (preserve raw line,
             // not the trimmed view -- ExecuteScript will trim per-line).
             if (!batch_buffer_.empty()) batch_buffer_.push_back('\n');

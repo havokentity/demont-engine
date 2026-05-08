@@ -100,12 +100,31 @@ public:
     static constexpr std::uint64_t kSwapchainTextureId = 1;
 
     // ---- Push-constant / descriptor-binding constants -------------------
-    // Bytes [0..kPushSplitOffset] of the engine-side PtPush go into actual
-    // VkPushConstants; bytes [kPushSplitOffset..push_size_] go into the
-    // per-frame Frame UBO at binding kFrameUboBinding. Matches the layout
-    // of Push (small) + Frame (UBO) cbuffers in PathTrace.slang's SPIR-V
-    // path. Tied to the byte boundary inside PtPush in Engine.cpp; if you
-    // reorder fields, update these too.
+    // CROSS-FILE INVARIANTS -- THREE FILES MUST AGREE:
+    //   (a) src/engine/Engine.cpp PtPush struct:
+    //       - first kPushSplitOffset bytes hold the small Metal-Push
+    //         tail (frame_index, reset_accum, max_bounces, ...).
+    //       - bytes [kPushSplitOffset..sizeof(PtPush)] hold the
+    //         spilled tail (matrices, sun/moon, clouds, hdri lights).
+    //       Engine.cpp has a static_assert(sizeof(PtPush) == ...) at the
+    //       dispatch site (search "static_assert(sizeof(PtPush)")
+    //       which fires at compile-time if anything drifts.
+    //   (b) shaders/PathTrace.slang SPIR-V path:
+    //       - cbuffer Push  at vk::push_constant   = first kPushSplit
+    //         Offset bytes.
+    //       - cbuffer Frame at vk::binding(kFrameUboBinding, 0) =
+    //         the spilled tail layout.  The Frame { ... } block in
+    //         PathTrace.slang must match Engine.cpp's PtPush tail
+    //         FIELD-BY-FIELD AND BYTE-BY-BYTE; std140 uses 16-byte
+    //         alignment so all fields are float4-padded.
+    //   (c) This file: the kPush*/kFrame* constants below.
+    //
+    // If you reorder/resize PtPush, you MUST update the matching Frame
+    // cbuffer in PathTrace.slang AND verify the static_assert in
+    // Engine.cpp still fires green; the runtime symptom of a desync
+    // is rendering corruption, not a build error.  A future cleanup
+    // (logged in FOLLOW_UPS.md) is to drive these from a single
+    // shared header or Slang reflection.
     static constexpr std::uint32_t kPushSplitOffset = 112;
     static constexpr std::uint32_t kFrameUboBinding = 14;
     static constexpr std::size_t   kFrameUboSize    = 512;  // 336B + headroom

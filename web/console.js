@@ -681,11 +681,24 @@
       ghostState.annotation = '  current: ' + ghostState.matches[0];
     }
   }
+  // Sync the absolutely-positioned ghost overlay with the input's
+  // horizontal scroll position.  The input element scrolls its
+  // content when the typed string exceeds the visible width; without
+  // this translate, the ghost-typed/-tail spans stay anchored at
+  // the left edge while the actual typed glyphs slide left,
+  // misaligning the suggestion tail visually.  Called from
+  // renderGhost() and from input/scroll listeners below.
+  const ghostOverlay = document.getElementById('input-ghost');
+  function syncGhostScroll() {
+    if (!ghostOverlay) return;
+    ghostOverlay.style.transform = 'translateX(' + (-input.scrollLeft) + 'px)';
+  }
   function renderGhost() {
     if (!ghostState) {
       ghostTyped.textContent      = '';
       ghostTail.textContent       = '';
       ghostAnnotation.textContent = '';
+      syncGhostScroll();
       return;
     }
     const match = ghostState.matches[ghostState.index];
@@ -700,7 +713,12 @@
       ghostTail.textContent       = '';
       ghostAnnotation.textContent = '';
     }
+    syncGhostScroll();
   }
+  // Track input scroll directly too -- typing past the visible
+  // width fires both 'input' and 'scroll' events; cursor moves
+  // (arrow keys) only fire 'scroll'.
+  input.addEventListener('scroll', syncGhostScroll, { passive: true });
   function dismissGhost() {
     if (!ghostState) return;
     ghostState = null;
