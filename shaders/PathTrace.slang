@@ -1097,6 +1097,56 @@ float cloud_optical_depth(float3 ro, float3 rd, float t_max) {
     return od;
 }
 
+// Analytical atmospheric transmittance (Mie + Rayleigh) along the
+// straight ray segment [ro, ro + rd*t]. Used to give cloud-march
+// samples and (in future) primary-ray surface hits aerial-perspective
+// fade with distance, regardless of sky mode -- the HDRI is the
+// canonical sky source but doesn't model the air mass between the
+// camera and a far cloud, so distant clouds need this attenuation
+// applied on top.
+//
+// Both Mie and Rayleigh have an exponential altitude profile:
+//     sigma(h) = sigma0 * exp(-h / H_scale)
+// On a straight slanted ray h(s) = ro.y + rd.y * s, so the optical
+// depth ∫[0,t] sigma(h(s)) ds is closed-form:
+//     rd.y != 0:  H/rd.y * (exp(-ro.y/H) - exp(-(ro.y + rd.y*t)/H))
+//     rd.y == 0:  t * exp(-ro.y/H)   (horizontal ray at constant alt)
+// Multiplied by sigma0 for each species.  Returns the per-channel
+// transmittance exp(-tau).
+//
+// vol_params.x is the user-controlled Mie sigma at sea level; if it's
+// 0 the user has disabled Mie haze and we return Rayleigh-only.
+// clouds_p3.w is the Rayleigh intensity multiplier (0 = no Rayleigh,
+// 1 = real-Earth sigma).  Both gates honoured so a debug "no
+// atmosphere" mode still works.
+float3 atmosphericTransmittance(float3 ro, float3 rd, float t) {
+    if (t <= 0.0) return float3(1.0);
+    const float kHmie      = 1500.0;
+    const float kHrayleigh = 8000.0;
+    const float3 kSigmaR   = float3(5.8e-6, 13.5e-6, 33.1e-6);
+    float  sigma_mie0 = vol_params.x;
+    float  rayleigh_i = clouds_p3.w;
+    bool   any_mie    = sigma_mie0 > 0.0;
+    bool   any_ray    = rayleigh_i > 0.0;
+    if (!any_mie && !any_ray) return float3(1.0);
+    // Vertical path-length factor (analytical altitude integral).
+    float gv_mie, gv_ray;
+    if (abs(rd.y) > 1e-6) {
+        float a_m = exp(-ro.y / kHmie);
+        float b_m = exp(-(ro.y + rd.y * t) / kHmie);
+        gv_mie = (a_m - b_m) * (kHmie / rd.y);
+        float a_r = exp(-ro.y / kHrayleigh);
+        float b_r = exp(-(ro.y + rd.y * t) / kHrayleigh);
+        gv_ray = (a_r - b_r) * (kHrayleigh / rd.y);
+    } else {
+        gv_mie = t * exp(-max(ro.y, 0.0) / kHmie);
+        gv_ray = t * exp(-max(ro.y, 0.0) / kHrayleigh);
+    }
+    float  tau_mie = any_mie ? sigma_mie0 * gv_mie : 0.0;
+    float3 tau_ray = any_ray ? kSigmaR * rayleigh_i * gv_ray : float3(0.0);
+    return exp(-(tau_ray + float3(tau_mie)));
+}
+
 // Up to kMaxRefract dielectric bounces; beyond that the ray gives up
 // (returns 0) so a pathological all-glass scene can't loop forever.
 // TIR also returns 0 (light can't pass that interface).
@@ -1598,13 +1648,18 @@ void main(uint2 tid : SV_DispatchThreadID) {
             const float kHrayleigh = 8000.0;
             const float kPi = 3.14159265358979;
             float rayleigh_int = clouds_p3.w;   // 0 disables, 1 = real
-            // Atmospheric Mie + Rayleigh march is disabled in HDRI mode:
-            // the HDRI has the atmosphere baked into its sky pixels, so
-            // adding procedural in-scatter on top double-counts (the
-            // sky's blue tint comes from the HDRI directly) and would
-            // follow the engine sun_dir rather than the HDRI's actual
-            // sun. God rays / sunset haze in HDRI mode are a future
-            // feature that would need to anchor on hdri_lights[0].
+            // Atmospheric in-scatter march (Mie + Rayleigh). Runs in
+            // procedural and gradient sky modes -- the engine sun is
+            // the in-scatter source, and the cloud march below also
+            // uses analytical atmospheric transmittance to attenuate
+            // its own samples regardless of sky mode (aerial
+            // perspective). HDRI mode skips this in-scatter step
+            // because the HDRI has the atmospheric scattering baked
+            // into its sky pixels; adding procedural in-scatter on
+            // top double-counts and would follow sun_and_mode.xyz
+            // (engine time-of-day) instead of the HDRI's actual sun.
+            // The cloud march still gets aerial-perspective fade in
+            // HDRI mode via the analytical transmittance helper.
             bool march_mie = (vol_params.x > 0.0) && (env_map_present == 0u);
             bool march_ray = (rayleigh_int > 0.0) && (env_map_present == 0u);
             if (march_mie || march_ray) {
@@ -1719,15 +1774,24 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         float dens = cloud_density_at(sp, clouds_p1,
                                                       clouds_p2, clouds_p3, 6);
                         if (dens <= 0.0) continue;
+                        // Aerial perspective: per-channel atmospheric
+                        // transmittance from camera to this sample,
+                        // analytical Mie + Rayleigh integral. Each
+                        // contribution below gets multiplied by
+                        // trans_atm so distant clouds fade toward the
+                        // sky color naturally (Rayleigh tints, Mie
+                        // dims). Active in all sky modes -- the HDRI
+                        // doesn't model in-front-of-cloud air mass so
+                        // distant clouds need this regardless. Wrapped
+                        // in clampIndirect to bound per-sample fireflies
+                        // (HG forward-scatter peak * env-map NEE * long
+                        // horizon ray was producing white halos).
+                        float3 trans_atm = atmosphericTransmittance(
+                            primary_ro, primary_rd, t);
+                        float  step_w = dens * dtc * trans_eye_c;
                         if (hdri_lit) {
                             // HDRI extracted-lights NEE: stochastic
-                            // single-pick over the extracted cluster
-                            // lights, weighted by cluster luminance.
-                            // Same approach as the surface BRDF site
-                            // and the same HDRI-purity guarantee --
-                            // night-only HDRI lights the cloud via
-                            // its moon cluster, multi-lamp interior
-                            // via whichever lamp this sample picks.
+                            // single-pick weighted by cluster luminance.
                             if (hdri_lights_count > 0u) {
                                 HdriLightSample hl = sampleHdriLight(seed);
                                 if (hl.pdf > 0.0) {
@@ -1736,17 +1800,15 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                         * pow(max(1.0 + g2 - 2.0 * g * c_t_h, 1e-4), 1.5));
                                     float3 t_s = transmittance(sp, hl.dir, 1e30);
                                     if (any(t_s > float3(0.0))) {
-                                        v_color_c += hl.color * t_s * phase_h
-                                                   * dens * dtc * trans_eye_c / hl.pdf;
+                                        v_color_c += clampIndirect(
+                                            hl.color * t_s * phase_h * step_w * trans_atm
+                                            / hl.pdf);
                                     }
                                 }
                             }
-                            // HDRI ambient via env-map MIS NEE. The CDF
-                            // excludes the sun cluster (handled by the
-                            // directional NEE above), so this samples
-                            // only the diffuse-sky portion of the HDRI.
-                            // One sample per cloud step -- temporal
-                            // accumulation converges the integral.
+                            // HDRI ambient via env-map MIS NEE (CDF
+                            // excludes the extracted clusters; this
+                            // samples only the diffuse-sky portion).
                             {
                                 float2 xi_e = float2(randf(seed), randf(seed));
                                 EnvSample env = sampleEnvMap(xi_e);
@@ -1756,22 +1818,18 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                         float c_t_e = dot(primary_rd, -env.dir);
                                         float phase_e = (1.0 - g2) / (4.0 * 3.14159265358979
                                             * pow(max(1.0 + g2 - 2.0 * g * c_t_e, 1e-4), 1.5));
-                                        v_color_c += env.color * t_e * phase_e
-                                                   * dens * dtc * trans_eye_c / env.pdf;
+                                        v_color_c += clampIndirect(
+                                            env.color * t_e * phase_e * step_w * trans_atm
+                                            / env.pdf);
                                     }
                                 }
                             }
                         } else {
-                            // Direct sun (single-scatter NEE). Scale
-                            // sun_rad by altitude-dependent atmospheric
-                            // attenuation: high clouds (cirrus at 8km)
+                            // Direct sun (single-scatter NEE). Altitude-
+                            // boosted sun_rad: high clouds (cirrus at 8km)
                             // sit ABOVE most of the absorbing atmosphere
-                            // and catch much brighter / less-reddened
-                            // light than the ground does. Approximation:
-                            // boost = exp(tau * sun_am * (h / H_atm))
-                            // where H_atm ~ 8km is the atmospheric scale
-                            // height. For ground-level cumulus the factor
-                            // is ~1.05; for cirrus at 8km it's ~5x.
+                            // and catch brighter / less-reddened light
+                            // than the ground does.
                             if (sun_elev > 0.0) {
                                 float h_alt   = max(sp.y, 0.0);
                                 float h_norm  = saturate(h_alt / 8000.0);
@@ -1780,14 +1838,14 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                 float3 sun_jit = sampleSunDisc(sun_dir, seed);
                                 float3 trans_sun = transmittance(sp, sun_jit, 1e30);
                                 if (any(trans_sun > float3(0.0))) {
-                                    v_color_c += sun_at * trans_sun * phase
-                                               * dens * dtc * trans_eye_c;
+                                    v_color_c += clampIndirect(
+                                        sun_at * trans_sun * phase * step_w * trans_atm);
                                 }
                             }
                             // Direct moon (single-scatter NEE). Moon is the
                             // night sky's key light; without this clouds go
                             // pitch-black after sunset. Phase shading via
-                            // 0.5 * (1 - cos(phase)) so new moon contributes
+                            // 0.5*(1-cos(phase)) so new moon contributes
                             // nothing, full moon is full-strength.
                             if (moon_dir_phase.y > 0.0) {
                                 float phase_b = 0.5 * (1.0 - cos(moon_dir_phase.w));
@@ -1798,15 +1856,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                         float c_t_m = dot(primary_rd, -moon_dir_phase.xyz);
                                         float phase_m = (1.0 - g2) / (4.0 * 3.14159265358979
                                             * pow(max(1.0 + g2 - 2.0 * g * c_t_m, 1e-4), 1.5));
-                                        // Real moon irradiance is ~1/400000 of
-                                        // sun's, but we boost to 1/100 (sun_rad
-                                        // 80 -> moon ~0.8) so a moonlit scene
-                                        // is visible after typical auto-exposure
-                                        // without the moon shadowing through
-                                        // bright daylight. Atmospheric attenuation
-                                        // (air mass 1/sin(elev), tau 0.30) makes
-                                        // the moon dim and redden near the
-                                        // horizon, matching the sun's behaviour.
+                                        // Atmospheric attenuation + warmth at
+                                        // low moon altitude, mirroring sun.
                                         float m_elev   = max(moon_dir_phase.y, 0.04);
                                         float m_am     = 1.0 / m_elev;
                                         float m_atm    = exp(-0.30 * m_am);
@@ -1814,21 +1865,17 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                         float3 m_col   = lerp(float3(0.92, 0.94, 1.00),
                                                               float3(1.20, 0.65, 0.40),
                                                               m_warmth);
-                                        // 0.3x of sun (was 0.8) -- night feels
-                                        // genuinely dim. Auto-exposure still
-                                        // amplifies for visibility, but the
-                                        // ground / clouds stay readably night
-                                        // (~1/3 of daylight luminance) instead
-                                        // of looking like a slightly cool day.
+                                        // 0.3x of sun -- night reads as ~1/3
+                                        // daylight luminance after auto-exposure.
                                         float3 moon_rad = m_col * (0.3 * phase_b * m_atm);
-                                        v_color_c += moon_rad * trans_moon * phase_m
-                                                   * dens * dtc * trans_eye_c;
+                                        v_color_c += clampIndirect(
+                                            moon_rad * trans_moon * phase_m * step_w * trans_atm);
                                     }
                                 }
                             }
-                            // Diffuse skylight (hemisphere integral). No phase
-                            // function -- ambient is by definition omnidirectional.
-                            v_color_c += sky_ambient * dens * dtc * trans_eye_c;
+                            // Diffuse skylight (omnidirectional, no phase
+                            // function).
+                            v_color_c += clampIndirect(sky_ambient * step_w * trans_atm);
                         }
                         trans_eye_c *= exp(-dens * dtc);
                     }
