@@ -40,7 +40,46 @@
 //   exp_min/max  : clamps for current_exposure
 //   adapt_speed  : log-space lerp factor; <=0 means "lock to target"
 
+// MSL SLOT ALIGNMENT NOTICE
+// ==========================
+// Slang's MSL backend assigns Metal buffer/texture slots in DECLARATION
+// order, ignoring vk::binding numbers. The engine's AutoExposure
+// dispatch reuses the bindings PathTrace.slang's dispatch left in
+// place (engine texture slot 1 = accum_hdr, engine buffer slot 6 =
+// exposure_state). For that to work on Metal, AutoExposure's MSL slot
+// layout needs to match PathTrace's:
+//
+//   PathTrace MSL : tex(0)=output, tex(1)=accum_hdr, ...
+//                   buf(0)=AS, buf(1..5)=mesh/cdf storage buffers,
+//                   buf(6)=exposure_state, buf(7)=Push
+//
+// Without alignment, AutoExposure on Metal would emit accum_hdr at
+// tex(0) (where the engine has the swapchain bound) and
+// exposure_state at buf(0) (unbound), reading garbage and writing to
+// nowhere -- exposure_state would never update.
+//
+// The fix: declare dummies before the actively-used bindings to
+// shift them to the right MSL slots, and reference the dummies in a
+// runtime-conditional branch the optimizer can't elide so Slang
+// actually emits the bindings.
+//
+// On Vulkan this is a no-op: each declaration uses its vk::binding
+// number directly, and the dummies' bindings are already populated
+// by the path-trace dispatch's descriptor writes. The dead branch
+// gets compiled away by the Vulkan driver's pipeline JIT.
+
+// --- texture slots: padded to put accum_hdr at tex(1) ----------------
+[[vk::binding(0, 0)]]  RWTexture2D<float4> _slot_output;
 [[vk::binding(1, 0)]]  RWTexture2D<float4> accum_hdr;
+
+// --- buffer slots: AS at buf(0), then 5 storage buffers, then
+//     exposure_state at buf(6). Matches PathTrace's emission order.
+[[vk::binding(2, 0)]]  RaytracingAccelerationStructure _slot_tlas;
+[[vk::binding(3, 0)]]  StructuredBuffer<float>  _slot_mesh_positions;
+[[vk::binding(4, 0)]]  StructuredBuffer<uint>   _slot_mesh_indices;
+[[vk::binding(5, 0)]]  StructuredBuffer<float4> _slot_primitives;
+[[vk::binding(10, 0)]] StructuredBuffer<float>  _slot_marginal_cdf;
+[[vk::binding(11, 0)]] StructuredBuffer<float>  _slot_conditional_cdf;
 [[vk::binding(15, 0)]] RWStructuredBuffer<float> exposure_state;
 
 [[vk::push_constant]]
@@ -61,6 +100,34 @@ groupshared uint  g_lum_count[64];
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID, uint gid : SV_GroupThreadID) {
+    // Force Slang to emit the dummy bindings even though they're
+    // unused at runtime. The compiler can't statically prove
+    // `width == 0xDEADBEEFu` is false (width comes from a runtime
+    // push constant), so the branch survives optimization and the
+    // referenced declarations get slot assignments. The branch is
+    // never taken on real dispatches (width is always a real frame
+    // dimension), so this costs one comparison + a never-taken jump
+    // per thread -- ~1 cycle.
+    if (width == 0xDEADBEEFu) {
+        _slot_output[uint2(0, 0)] = float4(0, 0, 0, 0);
+        // RaytracingAccelerationStructure can't easily be
+        // "touched" inside a compute kernel without ray query --
+        // declare it but rely on Slang's reflection emitting it
+        // because the binding number is annotated. The buf(0)
+        // slot in MSL output is reserved for AS in PathTrace, so
+        // this matches even if the AS itself isn't referenced
+        // here. (Slang does emit declared-but-unread AS bindings
+        // for kernels that don't use them.)
+        let p = _slot_mesh_positions[0];
+        let i = _slot_mesh_indices[0];
+        let q = _slot_primitives[0];
+        let m = _slot_marginal_cdf[0];
+        let c = _slot_conditional_cdf[0];
+        // Touch the real ones too to make the side effect concrete.
+        accum_hdr[uint2(0, 0)] = float4(p, float(i), q.x, m + c);
+        exposure_state[0] = p;
+    }
+
     uint w_steps = (width  + stride - 1) / stride;
     uint h_steps = (height + stride - 1) / stride;
     uint total   = w_steps * h_steps;
