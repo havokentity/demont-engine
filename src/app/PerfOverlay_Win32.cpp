@@ -251,6 +251,13 @@ void WinPerf::Update(const PerfStats& stats) {
         history_copy_.assign(stats.frame_ms_history.begin(),
                              stats.frame_ms_history.end());
     }
+    // Keep the perf HUD on top of any sibling child windows (the
+    // console overlay, mainly). When a sibling animates open or
+    // closed, it can leave us occluded or stale-pixeled until the
+    // next Z-order shuffle; a no-activate top bump every Update
+    // avoids that without stealing focus.
+    SetWindowPos(hwnd_, HWND_TOP, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 

@@ -2692,6 +2692,19 @@ void Engine::RegisterCommands() {
                 float x = (c * (a * c + b)) / (c * (d * c + e) + f);
                 if (x < 0.0f) x = 0.0f;
                 if (x > 1.0f) x = 1.0f;
+                // sRGB OETF (linear -> nonlinear) so the stored 8-bit
+                // values match what the on-screen path writes to the
+                // swapchain after PathTrace.slang / Tonemap.slang's
+                // srgb_oetf().  Without this the PPM is linear LDR
+                // and viewers (which assume sRGB) re-apply the EOTF,
+                // producing a visibly darker image than what's on
+                // screen.  Same piecewise OETF as the shader.
+                if (x <= 0.0031308f) {
+                    x = x * 12.92f;
+                } else {
+                    x = 1.055f * std::pow(x, 1.0f / 2.4f) - 0.055f;
+                }
+                if (x > 1.0f) x = 1.0f;
                 return static_cast<std::uint8_t>(x * 255.0f + 0.5f);
             };
             // Portable IEEE 754 binary16 -> binary32 decode. Apple Clang

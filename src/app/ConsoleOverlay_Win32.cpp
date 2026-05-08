@@ -103,7 +103,17 @@ constexpr BYTE     kPanelAlpha    = 217;     // peak alpha for layered path
 // (e.g. pt::log sinks, which fire on whichever thread emits the log)
 // onto the overlay's owning thread. Cross-thread InvalidateRect is
 // undefined per Win32 -- PostMessage is the documented bridge.
-constexpr UINT WM_APP_REPAINT = WM_APP + 1;
+constexpr UINT WM_APP_REPAINT  = WM_APP + 1;
+// Deferred SetFocus.  When the user presses backtick to open the
+// console, the WM_KEYDOWN is dispatched to the parent (GLFW HWND);
+// GLFW's WndProc fires our key callback which calls Show() ->
+// SetFocus(child) deep in its own message handler.  GLFW (or the
+// system) sometimes reverts focus before the call chain unwinds,
+// leaving the parent focused and keystrokes routed to the camera
+// (WASD).  Posting this message asks Windows to call SetFocus
+// AFTER the current message dispatch completes -- by then GLFW has
+// finished, and our SetFocus sticks.
+constexpr UINT WM_APP_SETFOCUS = WM_APP + 2;
 
 int ComputePanelHeight(int parent_h) {
     int h = static_cast<int>(parent_h * 0.45f);
@@ -471,7 +481,12 @@ void WinOverlay::StartAnim(bool showing) {
 
     if (showing) {
         ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+        // SetFocus directly + queue a deferred re-grab.  The direct
+        // call usually works; the deferred one fires after the
+        // current WM_KEYDOWN dispatch chain returns and re-asserts
+        // focus in case GLFW's continued processing yanked it back.
         SetFocus(hwnd_);
+        PostMessageW(hwnd_, WM_APP_SETFOCUS, 0, 0);
     }
     SetTimer(hwnd_, kAnimTimerId, kAnimTickMs, nullptr);
 }
@@ -613,6 +628,12 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // Cross-thread repaint request (see OnLog). InvalidateRect runs
         // on the UI thread now -- safe per Win32.
         InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    case WM_APP_SETFOCUS:
+        // Re-grab focus after the original WM_KEYDOWN dispatch chain
+        // has unwound (see WM_APP_SETFOCUS doc comment near declaration).
+        // Only act if the overlay is still meant to be visible.
+        if (shown_) SetFocus(h);
         return 0;
     case WM_TIMER:
         if (w == kAnimTimerId) { TickAnim(); return 0; }
