@@ -177,14 +177,32 @@ void MetalCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
         encoder_->setBytes(push_buf_, push_size_, push_slot);
     }
 
-    // dispatchThreads handles the remainder; pso threadExecutionWidth tells
-    // us a sane threadgroup size.
-    auto tew = pso->threadExecutionWidth();
-    auto h   = pso->maxTotalThreadsPerThreadgroup() / tew;
-    if (tew == 0) tew = 8;
-    if (h   == 0) h   = 8;
+    // Threadgroup size MUST match the kernel's [numthreads(...)]
+    // declaration. Every compute kernel in demont declares
+    // [numthreads(8, 8, 1)] (PathTrace, AutoExposure, Tonemap,
+    // BloomDown, BloomUp), so hardcode the matching shape here.
+    //
+    // The previous version computed tgsize from the pipeline's
+    // threadExecutionWidth (32 on Apple GPUs) and
+    // maxTotalThreadsPerThreadgroup (64 here), giving (32, 2, 1).
+    // Dispatching grid (8,8,1) with tgsize (32,2,1) fires FOUR
+    // threadgroups (ceil(grid/tgsize) = (1,4,1)), not the one the
+    // kernel expects. Pixel-per-thread kernels like PathTrace
+    // tolerate this because they bounds-check tid against the
+    // image dimensions, but reduction kernels like AutoExposure
+    // run their full reduction in each threadgroup and race-write
+    // to a single output slot, getting nondeterministic results
+    // skewed toward whichever threadgroup happened to finish last.
+    // This was the actual reason auto-exposure on Mac stabilized
+    // at a different value than Win for the same scene.
+    //
+    // grid = (gx*8, gy*8, gz) is already pre-multiplied by 8 by the
+    // engine's caller convention (cb->Dispatch(gx, gy, gz) means
+    // "dispatch gx*gy*gz threadgroups of [numthreads]"). With
+    // tgsize (8,8,1) Metal computes threadgroupCount = (gx, gy, gz)
+    // exactly as intended.
     MTL::Size grid    = MTL::Size::Make(gx * 8, gy * 8, gz);
-    MTL::Size tgsize  = MTL::Size::Make(tew, h, 1);
+    MTL::Size tgsize  = MTL::Size::Make(8, 8, 1);
     encoder_->dispatchThreads(grid, tgsize);
 }
 
