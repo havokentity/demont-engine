@@ -155,6 +155,20 @@ public:
         // behaviour.
         enum class Quality : std::uint8_t { Basic, Atrous };
         Quality quality = Quality::Atrous;
+
+        // Which denoiser implementation the backend should route to.
+        // The Vulkan backend looks at this to dispatch between
+        // VulkanNrdDenoiser (Svgf -- in-house SVGF/atrous chain) and
+        // VulkanOptixDenoiser (OptixHdr / OptixHdrAov -- NVIDIA OptiX
+        // via CUDA-Vulkan interop). MetalFX ignores it -- the Metal
+        // backend has only one denoiser path.
+        //
+        // Defaults to Svgf so callers still pinned to the PR #2 API
+        // shape (Mac/MetalFX path, existing test fixtures) keep their
+        // behaviour. Engine sets this explicitly each frame from the
+        // active DenoiserKind cvar.
+        enum class Kind : std::uint8_t { Svgf, OptixHdr, OptixHdrAov };
+        Kind kind = Kind::Svgf;
         // Required by MetalFX TemporalDenoisedScaler. Column-major 4x4
         // (16 floats each). Pass nullptr only if the backend doesn't need
         // them (currently: nothing -- both Metal and any future Vulkan

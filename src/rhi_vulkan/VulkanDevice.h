@@ -17,6 +17,9 @@
 #include <vector>
 
 namespace pt::rhi::vk { class VulkanNrdDenoiser; }
+#if defined(PT_ENABLE_OPTIX)
+namespace pt::rhi::vk { class VulkanOptixDenoiser; }
+#endif
 
 struct GLFWwindow;
 
@@ -110,9 +113,49 @@ public:
 
     // Internal accessors used by the command buffer.
     VkDevice         RawDevice()     const { return device_; }
+    VkPhysicalDevice RawPhysicalDevice() const { return phys_device_; }
+    VkQueue          RawGraphicsQueue() const { return graphics_queue_; }
+    std::uint32_t    GraphicsQueueFamily() const { return graphics_qfi_; }
     VkPipeline       LookupPipeline(PipelineHandle h);
     VkPipelineLayout LookupPipelineLayout(PipelineHandle h);
     VkImageView      CurrentSwapchainImageView() const;
+
+#if defined(PT_ENABLE_OPTIX)
+    // Run JUST the SVGF DenoiseFinalize compute pass (ACES + sRGB
+    // tonemap to swapchain), exposed for the OptiX denoiser path so
+    // it doesn't have to roll its own tonemap. Lazy-creates and
+    // initialises the SVGF VulkanNrdDenoiser (only the finalize
+    // pipeline is needed; the SVGF history textures stay
+    // unallocated until/unless the user actually picks svgf_*).
+    // No-op if PT_ENABLE_OPTIX is off; safe to call on any frame.
+    //
+    // Caller responsible for both image layouts being GENERAL before
+    // the call. See VulkanNrdDenoiser::EncodeFinalizeOnly for the
+    // detailed contract.
+    void EncodeDenoiseFinalize(VkCommandBuffer cb,
+                               VkImageView    color_in_view,
+                               VkImageView    final_output_view,
+                               VkBuffer       exposure_state_buf,
+                               std::uint32_t  width,
+                               std::uint32_t  height,
+                               bool           hdr_pipeline);
+
+    // CUDA-Vulkan interop hook for VulkanOptixDenoiser.
+    //
+    // VulkanOptixDenoiser::Encode records the input copy into the
+    // engine's main command buffer (so it runs as part of the engine's
+    // submit), but CUDA needs to know when that copy is done before
+    // it can read the OptiX denoiser input. Vulkan can only signal
+    // semaphores at submit time, so this method lets the OptiX path
+    // request that the next call to Submit() additionally signals
+    // a timeline semaphore at the given value -- letting CUDA's
+    // cudaWaitExternalSemaphoresAsync gate on it.
+    //
+    // Cleared automatically after one Submit. Call once per frame
+    // when the OptiX path is active. Setting sem == VK_NULL_HANDLE
+    // disables (and is the post-Submit reset state).
+    void RequestExtraSubmitSignal(VkSemaphore sem, std::uint64_t timeline_value);
+#endif
 
     static constexpr std::uint64_t kSwapchainTextureId = 1;
 
@@ -260,6 +303,22 @@ private:
     // DestroyDevice() before any VkPipeline / VkDescriptorPool teardown.
     std::unique_ptr<VulkanNrdDenoiser> denoiser_;
 
+#if defined(PT_ENABLE_OPTIX)
+    // OptiX denoiser. Sibling to denoiser_ above, gated by build-time
+    // PT_ENABLE_OPTIX. Allocated lazily by Denoise() on the first call
+    // with d.kind == OptixHdr / OptixHdrAov. The two never run on the
+    // same frame (cvar pick is exclusive) and can coexist as members
+    // because each owns its own scratch resources -- only the active
+    // one consumes GPU memory after Init().
+    std::unique_ptr<VulkanOptixDenoiser> optix_denoiser_;
+
+    // Pending extra signal semaphore for the next Submit. See
+    // RequestExtraSubmitSignal(). Reset to (VK_NULL_HANDLE, 0) after
+    // each Submit. Only the OptiX path uses this today.
+    VkSemaphore   extra_submit_signal_sem_   = VK_NULL_HANDLE;
+    std::uint64_t extra_submit_signal_value_ = 0;
+#endif
+
     VkDescriptorPool dpool_ = VK_NULL_HANDLE;
     VkDescriptorSet  dsets_[kFramesInFlight] {};
 
@@ -324,6 +383,7 @@ private:
 public:
     VkImageView         LookupImageView(TextureHandle h);
     VkImage             LookupImage(TextureHandle h);
+    VkExtent2D          LookupImageExtent(TextureHandle h);
     VkBuffer            LookupBuffer(BufferHandle h);
     VkAccelerationStructureKHR LookupAccel(AccelStructHandle h);
     VkDescriptorSet     CurrentDescriptorSet() const { return dsets_[current_frame_]; }

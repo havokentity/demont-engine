@@ -7,6 +7,9 @@
 
 #include "VulkanDevice.h"
 #include "VulkanDenoiser.h"
+#if defined(PT_ENABLE_OPTIX)
+#include "VulkanOptixDenoiser.h"
+#endif
 
 #include "../core/Log.h"
 #include "../core/Memory/MemTag.h"
@@ -649,6 +652,27 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     if (supports_null_descriptor) {
         dexts.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
     }
+#if defined(PT_ENABLE_OPTIX)
+    // CUDA-Vulkan interop for the OptiX denoiser. The base
+    // VK_KHR_external_memory / VK_KHR_external_semaphore are core 1.1
+    // (already implicitly available through VkPhysicalDeviceVulkan11/12),
+    // but the platform-specific export variants must still be requested
+    // explicitly -- they're what supplies vkGetMemoryWin32HandleKHR /
+    // vkGetSemaphoreWin32HandleKHR (or the _fd flavours on Linux),
+    // which VulkanOptixDenoiser uses to hand VkDeviceMemory and
+    // VkSemaphore handles to the CUDA runtime.
+    //
+    // All NVIDIA RTX-class GPUs / drivers expose these unconditionally,
+    // so we don't query support before enabling -- a missing extension
+    // would be a fundamental driver-bug situation we can't recover from.
+    #if defined(_WIN32)
+        dexts.push_back("VK_KHR_external_memory_win32");
+        dexts.push_back("VK_KHR_external_semaphore_win32");
+    #elif defined(__linux__)
+        dexts.push_back("VK_KHR_external_memory_fd");
+        dexts.push_back("VK_KHR_external_semaphore_fd");
+    #endif
+#endif  // PT_ENABLE_OPTIX
 
     // pNext feature chain. Hold each struct by value so the chain stays
     // valid for the duration of vkCreateDevice. Order in the chain
@@ -670,6 +694,17 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     v12.descriptorBindingUniformBufferUpdateAfterBind = supports_uab_uniform_buffer ? VK_TRUE : VK_FALSE;
     v12.descriptorBindingPartiallyBound               =
         (v12_supported.descriptorBindingPartiallyBound == VK_TRUE) ? VK_TRUE : VK_FALSE;
+#if defined(PT_ENABLE_OPTIX)
+    // Timeline semaphores: required by VulkanOptixDenoiser to fence
+    // CUDA <-> Vulkan work. Without enabling the feature, Vulkan
+    // creates a binary semaphore on vkCreateSemaphore (silently
+    // ignoring VK_SEMAPHORE_TYPE_TIMELINE), which then makes
+    // cudaImportExternalSemaphore reject the handle as 'invalid
+    // argument'. Core Vulkan 1.2 feature; universally supported on
+    // RTX-class GPUs, so no per-device support query.
+    v12.timelineSemaphore =
+        (v12_supported.timelineSemaphore == VK_TRUE) ? VK_TRUE : VK_FALSE;
+#endif
 
     VkPhysicalDeviceVulkan13Features v13{};
     v13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
@@ -975,6 +1010,20 @@ void VulkanDevice::DestroyDevice() {
         pipeline_build_thread_.join();
     }
     if (device_ != VK_NULL_HANDLE) {
+#if defined(PT_ENABLE_OPTIX)
+        // Drain the CUDA stream BEFORE vkDeviceWaitIdle. The OptiX
+        // denoiser submitted a private output-copy cb whose wait on
+        // sem_cuda_to_vk only completes after CUDA signals (in turn
+        // gated on engine-cb completion via sem_vk_to_cuda). If CUDA
+        // hasn't finished its queued denoise work, the private cb
+        // stays pending forever and vkDeviceWaitIdle deadlocks. The
+        // drain here forces CUDA to flush, signaling cuda_to_vk for
+        // every pending frame -- which lets the private cbs complete
+        // and vkDeviceWaitIdle return instantly.
+        if (optix_denoiser_) {
+            optix_denoiser_->DrainCuda();
+        }
+#endif
         vkDeviceWaitIdle(device_);
         // Tear down the denoiser before any of its dependencies
         // (VkPipeline / VkDescriptorPool / VkImageView). The denoiser
@@ -982,6 +1031,15 @@ void VulkanDevice::DestroyDevice() {
         // raw VK objects via its own dtor; destroying it here does
         // both in the right order while device_ is still live.
         denoiser_.reset();
+#if defined(PT_ENABLE_OPTIX)
+        // Same rationale for the OptiX denoiser: it holds external
+        // VkImage / VkDeviceMemory / VkSemaphore handles whose dtor
+        // calls vkDestroy* against device_->RawDevice(). Reset before
+        // vkDestroyDevice() below so the VkDevice is still live when
+        // those teardowns run -- otherwise the validation layer
+        // (correctly) flags the underlying VK objects as leaked.
+        optix_denoiser_.reset();
+#endif
         for (auto v : swap_views_) if (v) vkDestroyImageView(device_, v, nullptr);
         swap_views_.clear();
         if (swapchain_ != VK_NULL_HANDLE) vkDestroySwapchainKHR(device_, swapchain_, nullptr);
@@ -1263,6 +1321,14 @@ VkImage VulkanDevice::LookupImage(TextureHandle h) {
     std::lock_guard lock(resource_mutex_);
     auto it = images_.find(h.id);
     return (it == images_.end()) ? VK_NULL_HANDLE : it->second.image;
+}
+
+VkExtent2D VulkanDevice::LookupImageExtent(TextureHandle h) {
+    if (h.id == kSwapchainTextureId) return swap_extent_;
+    if (h.id == 0) return {0, 0};
+    std::lock_guard lock(resource_mutex_);
+    auto it = images_.find(h.id);
+    return (it == images_.end()) ? VkExtent2D{0, 0} : it->second.extent;
 }
 
 VkBuffer VulkanDevice::LookupBuffer(BufferHandle h) {
@@ -2336,7 +2402,50 @@ void VulkanDevice::Submit(CommandBuffer* cb) {
     si.pCommandBuffers      = &cmd;
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores    = &sem_render_done_[current_swap_index_];
+
+#if defined(PT_ENABLE_OPTIX)
+    // OptiX path: when VulkanOptixDenoiser::Encode requested an extra
+    // timeline-semaphore signal for CUDA's cudaWaitExternalSemaphoresAsync
+    // to gate on, attach it here. Both signals (the binary swapchain-
+    // present sem + the timeline OptiX sem) go in the same vkQueueSubmit
+    // -- VkTimelineSemaphoreSubmitInfo's pSignalSemaphoreValues holds
+    // values per-position, with binary-semaphore positions ignored.
+    VkSemaphore     opt_signals[2] {};
+    std::uint64_t   opt_signal_vals[2] {};
+    VkTimelineSemaphoreSubmitInfo timeline_info{};
+    if (extra_submit_signal_sem_ != VK_NULL_HANDLE) {
+        opt_signals[0]      = sem_render_done_[current_swap_index_];
+        opt_signals[1]      = extra_submit_signal_sem_;
+        opt_signal_vals[0]  = 0;  // ignored for binary
+        opt_signal_vals[1]  = extra_submit_signal_value_;
+        timeline_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+        timeline_info.signalSemaphoreValueCount = 2;
+        timeline_info.pSignalSemaphoreValues    = opt_signal_vals;
+        si.pNext                = &timeline_info;
+        si.signalSemaphoreCount = 2;
+        si.pSignalSemaphores    = opt_signals;
+    }
+#endif
+
     vkQueueSubmit(graphics_queue_, 1, &si, fence_in_flight_[current_frame_]);
+
+#if defined(PT_ENABLE_OPTIX)
+    // One-shot: clear the request after each submit so a frame where
+    // the OptiX path doesn't activate (cvar transition, denoiser
+    // un-ready, etc.) doesn't accidentally signal a stale value.
+    extra_submit_signal_sem_   = VK_NULL_HANDLE;
+    extra_submit_signal_value_ = 0;
+
+    // Submit the OptiX denoiser's private output-copy cb after the
+    // main engine cb. Encode() recorded it but deferred the submit so
+    // queue-order serialization works: the private cb waits on a
+    // timeline that the engine's cb above signals (via the
+    // RequestExtraSubmitSignal path), so it must be submitted AFTER
+    // the engine's cb to avoid blocking the queue.
+    if (optix_denoiser_) {
+        optix_denoiser_->SubmitPostMain();
+    }
+#endif
 
     VkPresentInfoKHR pi{};
     pi.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -2350,6 +2459,43 @@ void VulkanDevice::Submit(CommandBuffer* cb) {
         RecreateSwapchain();
     }
 }
+
+#if defined(PT_ENABLE_OPTIX)
+void VulkanDevice::RequestExtraSubmitSignal(VkSemaphore sem,
+                                            std::uint64_t timeline_value) {
+    extra_submit_signal_sem_   = sem;
+    extra_submit_signal_value_ = timeline_value;
+}
+
+void VulkanDevice::EncodeDenoiseFinalize(VkCommandBuffer cb,
+                                         VkImageView    color_in_view,
+                                         VkImageView    final_output_view,
+                                         VkBuffer       exposure_state_buf,
+                                         std::uint32_t  width,
+                                         std::uint32_t  height,
+                                         bool           hdr_pipeline) {
+    // Lazy: ensure the NRD denoiser exists + Init'd so finalize_pipe_
+    // is built. We only need the finalize pipeline (the temporal /
+    // atrous pipelines and history textures remain unbuilt /
+    // unallocated as long as Encode() isn't called -- ResizeTextures
+    // is gated on Encode(), not Init()).
+    if (denoiser_ == nullptr) {
+        denoiser_ = std::make_unique<VulkanNrdDenoiser>(this);
+    }
+    if (!denoiser_->Ready()) {
+        if (!denoiser_->Init()) {
+            LOG_ERROR("VulkanDevice::EncodeDenoiseFinalize: SVGF denoiser "
+                      "Init failed; OptiX path will skip tonemap (image will "
+                      "be over-bright on screen until a re-init succeeds)");
+            denoiser_.reset();
+            return;
+        }
+    }
+    denoiser_->EncodeFinalizeOnly(cb, color_in_view, final_output_view,
+                                  exposure_state_buf, width, height,
+                                  hdr_pipeline);
+}
+#endif
 
 void VulkanDevice::EndFrame(CommandBuffer*) {
     current_frame_ = (current_frame_ + 1) % kFramesInFlight;
@@ -2398,6 +2544,65 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
         // (loading frame, or path tracer skipped) -- silently no-op.
         return;
     }
+
+    // ---- Dispatch-routing trace. Logged once per Kind transition
+    // (off->svgf, svgf->optix, etc.) so the engine -> RHI plumbing
+    // boundary is observable for any future denoiser-routing bug.
+    // Earned its keep on the OptiX bring-up: revealed that the
+    // engine routing was correct (kind=1 dispatched cleanly) and
+    // isolated the failures to optixInit + optixDenoiserComputeIntensity
+    // upstream. Stays in -- matches the engine's "log on state
+    // transitions" philosophy and costs nothing per frame after the
+    // first dispatch (static guard latches once kind is logged).
+    // Will move to PT_DIAG(2) when the r_diagnostic_level cvar lands
+    // (see follow-up).
+    {
+        static int s_last_logged_kind = -1;
+        const int k = static_cast<int>(d.kind);
+        if (k != s_last_logged_kind) {
+            LOG_INFO("VulkanDevice::Denoise: dispatching kind={} (0=Svgf, 1=OptixHdr, 2=OptixHdrAov), "
+                     "color={} out={} normal={} depth={} motion={}",
+                     k, d.color_in.id, d.output.id, d.normal_in.id, d.depth_in.id, d.motion_in.id);
+            s_last_logged_kind = k;
+        }
+    }
+
+    // Route based on d.kind. SVGF and OptiX have different input
+    // contracts: SVGF wants the full G-buffer (color/depth/motion/
+    // normal/output); OptiX HDR only needs color + output; OptiX HDR
+    // AOV adds normal_in (and primary_albedo, once Phase 1a step 3
+    // lands). Each path validates only what it actually consumes.
+#if defined(PT_ENABLE_OPTIX)
+    if (d.kind == DenoiseDesc::Kind::OptixHdr ||
+        d.kind == DenoiseDesc::Kind::OptixHdrAov) {
+        if (d.color_in.id == 0 || d.output.id == 0) {
+            LOG_WARN("VulkanDevice::Denoise(OptiX): missing color/output (color={} out={})",
+                     d.color_in.id, d.output.id);
+            return;
+        }
+        if (optix_denoiser_ == nullptr) {
+            const auto opt_kind = (d.kind == DenoiseDesc::Kind::OptixHdrAov)
+                                  ? VulkanOptixDenoiser::Kind::HdrAov
+                                  : VulkanOptixDenoiser::Kind::Hdr;
+            optix_denoiser_ = std::make_unique<VulkanOptixDenoiser>(this, opt_kind);
+        }
+        if (!optix_denoiser_->IsReady()) {
+            // Init() guards itself against re-entry via init_attempted_,
+            // so the first failure logs once (inside Init) and subsequent
+            // per-frame calls return false silently. We KEEP the failed
+            // instance alive so we don't recreate-and-retry every frame --
+            // re-trying after a hardware/driver-level failure has no path
+            // to succeed anyway. To force a retry the user must restart.
+            if (!optix_denoiser_->Init()) {
+                return;
+            }
+        }
+        optix_denoiser_->Encode(wrapped_cb_->Raw(), d);
+        return;
+    }
+#endif
+
+    // ---- SVGF / NRD path (Kind::Svgf, the historical default) ------------
     // Need at least the noisy color, depth, motion, normal, and a
     // valid output target. The engine's allocation gate guarantees
     // these on a denoiser-active frame; if any are missing it's a

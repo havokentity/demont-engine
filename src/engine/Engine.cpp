@@ -101,8 +101,15 @@ namespace cvar {
             "detail). nrd = same dispatch chain as svgf_atrous today; "
             "reserved for the proper NVIDIA RayTracingDenoiser library "
             "integration once that's wired up (see Raytracer "
-            "Plan/FOLLOW_UPS.md). Mac builds ignore the svgf_*/nrd "
-            "values; Windows builds ignore metalfx.",
+            "Plan/FOLLOW_UPS.md). optix_hdr = NVIDIA OptiX HDR denoiser "
+            "via CUDA-Vulkan interop (gated by build-time PT_ENABLE_OPTIX, "
+            "auto-detected at configure when CUDA Toolkit + OptiX SDK are "
+            "found; runtime gracefully falls back to off if the GPU/driver "
+            "isn't OptiX-capable). optix_hdr_aov = same as optix_hdr today, "
+            "reserved for the AOV (albedo + normal hints) variant landing "
+            "in Phase 1a step 3 alongside the path-tracer's primary_albedo "
+            "output. Mac builds ignore the svgf_*/nrd/optix_* values; "
+            "non-NVIDIA Vulkan builds ignore optix_*.",
             CVAR_ARCHIVE);
     PT_CVAR(r_hdr_pipeline,    "1",  "Linear-HDR pipeline through MetalFX. 1 = path tracer writes raw HDR, MetalFX denoises in HDR, post-pass applies exposure+ACES (recommended). 0 = path tracer pre-applies exposure+ACES, MetalFX denoises LDR, tonemap pass is a passthrough copy. Only affects the denoiser-on path.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom,           "1",  "HDR bloom (downsample/upsample pyramid, additive composite before ACES). 0 disables; tonemap then samples a 1x1 zero buffer.", CVAR_ARCHIVE);
@@ -1381,19 +1388,24 @@ void Engine::RenderFrame() {
 
     // P10/P12 denoiser state. Resolved before BeginFrame so we know
     // whether to allocate the G-buffer textures this frame. The cvar
-    // value chooses the kind (off / metalfx / svgf / nrd); per-backend
-    // gating then drops it to off if the active device doesn't support
-    // the chosen kind. metalfx is Mac-only; svgf+nrd are Vulkan-only;
-    // the no-op "off" value short-circuits all G-buffer allocation.
+    // value chooses the kind (off / metalfx / svgf / nrd / optix_*);
+    // per-backend gating then drops it to off if the active device
+    // doesn't support the chosen kind. metalfx is Mac-only; svgf, nrd,
+    // and optix_* are Vulkan-only; optix_* additionally requires the
+    // build-time PT_ENABLE_OPTIX (CUDA Toolkit + OptiX SDK detected)
+    // and a runtime CUDA-capable NVIDIA GPU. The no-op "off" value
+    // short-circuits all G-buffer allocation.
     DenoiserKind want_kind = DenoiserKind::Off;
     if (auto* v = C.FindCVar("r_denoiser")) {
         const auto& s = v->value;
         if (s == "metalfx" && current_backend_ == BackendType::Metal) {
             want_kind = DenoiserKind::MetalFX;
         } else if (current_backend_ == BackendType::Vulkan) {
-            if      (s == "svgf_basic")  want_kind = DenoiserKind::SvgfBasic;
-            else if (s == "svgf_atrous") want_kind = DenoiserKind::SvgfAtrous;
-            else if (s == "nrd")         want_kind = DenoiserKind::Nrd;
+            if      (s == "svgf_basic")    want_kind = DenoiserKind::SvgfBasic;
+            else if (s == "svgf_atrous")   want_kind = DenoiserKind::SvgfAtrous;
+            else if (s == "nrd")           want_kind = DenoiserKind::Nrd;
+            else if (s == "optix_hdr")     want_kind = DenoiserKind::OptixHdr;
+            else if (s == "optix_hdr_aov") want_kind = DenoiserKind::OptixHdrAov;
         }
     }
     if (want_kind != DenoiserKind::Off && !device_->SupportsDenoise()) {
@@ -1425,6 +1437,12 @@ void Engine::RenderFrame() {
                      "edge-aware filter");
         } else if (want_kind == DenoiserKind::MetalFX) {
             LOG_INFO("engine: r_denoiser=metalfx -- MetalFX TemporalDenoisedScaler active");
+        } else if (want_kind == DenoiserKind::OptixHdr) {
+            LOG_INFO("engine: r_denoiser=optix_hdr -- NVIDIA OptiX denoiser (HDR model) "
+                     "via CUDA-Vulkan interop active");
+        } else if (want_kind == DenoiserKind::OptixHdrAov) {
+            LOG_INFO("engine: r_denoiser=optix_hdr_aov -- NVIDIA OptiX denoiser (HDR + "
+                     "albedo + normal AOV model) via CUDA-Vulkan interop active");
         }
         if (!want_denoiser && device_) {
             if (denoise_color_tex_id_    != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
@@ -2228,6 +2246,19 @@ void Engine::RenderFrame() {
         dd.quality = (denoiser_kind_ == DenoiserKind::SvgfBasic)
                          ? pt::rhi::Device::DenoiseDesc::Quality::Basic
                          : pt::rhi::Device::DenoiseDesc::Quality::Atrous;
+
+        // Top-level Kind: tells the Vulkan backend whether to dispatch
+        // through VulkanNrdDenoiser (Svgf -- in-house SVGF chain) or
+        // VulkanOptixDenoiser (OptixHdr / OptixHdrAov). MetalFX ignores
+        // it. The svgf_basic / svgf_atrous / nrd values all collapse to
+        // Kind::Svgf -- they're tiers within the same backend impl.
+        if (denoiser_kind_ == DenoiserKind::OptixHdr) {
+            dd.kind = pt::rhi::Device::DenoiseDesc::Kind::OptixHdr;
+        } else if (denoiser_kind_ == DenoiserKind::OptixHdrAov) {
+            dd.kind = pt::rhi::Device::DenoiseDesc::Kind::OptixHdrAov;
+        } else {
+            dd.kind = pt::rhi::Device::DenoiseDesc::Kind::Svgf;
+        }
         // r_hdr_pipeline mirrors row0.w of the path-tracer push (set
         // earlier this frame) -- we read the cvar straight here so
         // the denoiser-finalize sRGB-only branch matches whichever
@@ -3624,14 +3655,23 @@ void Engine::RegisterCommands() {
         v->allowed_values = {"error", "warn", "info", "debug"};
     }
     if (auto* v = C.FindCVar("r_denoiser")) {
-        // metalfx is Mac-only; svgf_basic / svgf_atrous / nrd are
-        // Vulkan-only. The RenderFrame check downgrades incompatible
+        // metalfx is Mac-only; svgf_basic / svgf_atrous / nrd / optix_*
+        // are Vulkan-only. The RenderFrame check downgrades incompatible
         // (cvar, backend) combinations to off rather than rejecting
         // at console-set time -- so a user can have `r_denoiser
         // svgf_atrous` in their demont.cfg and still launch on a Mac
         // without the cfg getting rejected.
+        //
+        // optix_hdr is wired up via VulkanOptixDenoiser (gated by the
+        // build-time PT_ENABLE_OPTIX flag and runtime CUDA + OptiX
+        // detection -- see VulkanDevice::Denoise's OptiX branch).
+        // optix_hdr_aov is currently a synonym for optix_hdr until
+        // the AOV variant lands in Phase 1a step 3 alongside the path
+        // tracer's primary_albedo output (the underlying OptiX path
+        // logs a one-time INFO at Init noting the fallback).
         v->allowed_values = {"off", "metalfx",
-                              "svgf_basic", "svgf_atrous", "nrd"};
+                              "svgf_basic", "svgf_atrous", "nrd",
+                              "optix_hdr", "optix_hdr_aov"};
     }
     if (auto* v = C.FindCVar("r_hdr_pipeline")) {
         v->allowed_values = {"0", "1"};
