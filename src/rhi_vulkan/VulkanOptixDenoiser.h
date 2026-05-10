@@ -67,16 +67,8 @@ typedef struct OptixDeviceContext_t* OptixDeviceContext;
 struct OptixDenoiser_t;
 typedef struct OptixDenoiser_t* OptixDenoiser;
 
-// CUDA driver-API CUdeviceptr is unsigned long long across all
-// supported platforms; safe to mirror as a typedef so we don't pull
-// in cuda.h here.
-typedef unsigned long long CUdeviceptr_v2_local;
-
 // CUDA runtime opaque handles. Match the SDK definitions; we only
 // pass them through, never deref.
-struct cudaArray;
-typedef struct cudaArray* cudaArray_t;
-typedef unsigned long long cudaSurfaceObject_t;
 struct CUexternalMemory_st;
 typedef struct CUexternalMemory_st* cudaExternalMemory_t;
 struct CUexternalSemaphore_st;
@@ -131,11 +123,31 @@ public:
     // the lifetime of this instance.
     bool Init();
 
-    // Per-frame dispatch. Records Vulkan->CUDA sync, runs
-    // optixDenoiserInvoke, records CUDA->Vulkan sync. No-op until
-    // Init() succeeds. Resizes the scratch + external textures
-    // automatically when the input size changes.
+    // Per-frame dispatch. Records the input copy into the engine's
+    // command buffer, schedules the async CUDA wait+denoise+signal,
+    // and records (but does not submit) the private cb that copies
+    // the denoised output back to the engine's d.output. The actual
+    // private-cb submit happens in SubmitPostMain() below, after the
+    // engine's main vkQueueSubmit completes -- otherwise queue-order
+    // serialization deadlocks (engine's cb signals the timeline our
+    // private cb waits on).
+    //
+    // No-op until Init() succeeds.
     void Encode(VkCommandBuffer cb, const Device::DenoiseDesc& d);
+
+    // Called by VulkanDevice::Submit after the main engine cb is
+    // submitted. Submits the private output-copy cb (waiting on the
+    // CUDA->VK timeline at the value Encode set up), so it executes
+    // strictly after CUDA finishes the denoise. Idempotent: a frame
+    // where Encode wasn't called (denoiser off) just returns.
+    void SubmitPostMain();
+
+    // Block the calling thread until the CUDA stream drains. Called
+    // by VulkanDevice::DestroyDevice BEFORE vkDeviceWaitIdle so the
+    // private output-copy cb's wait on sem_cuda_to_vk gets satisfied
+    // (CUDA signals the timeline as it completes the queued denoise
+    // work). Without this, vkDeviceWaitIdle deadlocks at shutdown.
+    void DrainCuda();
 
     // Whether the requested kind is currently usable (Init succeeded
     // AND scratch is sized). Engine consults this in the dispatch
@@ -147,11 +159,13 @@ public:
 private:
     bool InitOnce();              // CUDA + OptiX context (one-shot)
     bool ResizeScratch(std::uint32_t w, std::uint32_t h);
-    bool ResizeExternalImages(std::uint32_t w, std::uint32_t h);
+    bool ResizeExternalBuffers(std::uint32_t w, std::uint32_t h);
     bool ResizeExternalSemaphores();
+    bool EnsureCommandPool();
     void DestroyResources();
-    void DestroyExternalImage(int slot);   // 0 = color_in, 1 = output
+    void DestroyExternalBuffer(int slot);   // 0 = color_in, 1 = output
     void DestroyExternalSemaphores();
+    void DestroyCommandPool();
 
     VulkanDevice* device_         = nullptr;
     Kind          kind_           = Kind::Hdr;
@@ -181,18 +195,42 @@ private:
     std::uint32_t cached_h_ = 0;
 
     // External Vulkan-side resources. Two pairs (color_in @ slot 0,
-    // output @ slot 1) of (VkImage, VkDeviceMemory, cudaExternalMemory,
-    // cudaArray, cudaSurfaceObject). All RGBA16F, layout GENERAL.
-    struct ExternalImage {
-        VkImage              image     = VK_NULL_HANDLE;
+    // output @ slot 1) of (VkBuffer, VkDeviceMemory, cudaExternalMemory,
+    // CUdeviceptr). RGBA16F linear in CUDA's view -- the engine's
+    // images get vkCmdCopyImageToBuffer'd in to color_in, OptiX denoises
+    // the linear data into output, then vkCmdCopyBufferToImage transfers
+    // back to the engine's d.output VkImage.
+    //
+    // Why VkBuffers and not VkImages: OptiX's OptixImage2D::data takes
+    // a CUdeviceptr (linear memory). Vulkan-imaged-as-cudaArray
+    // (surface object) doesn't expose linear memory and can't feed
+    // OptiX directly. cudaExternalMemoryGetMappedBuffer on an external
+    // VkBuffer returns the CUdeviceptr we need.
+    //
+    // Stored as std::uint64_t to avoid pulling cuda.h into the header;
+    // the real type is CUdeviceptr (== unsigned long long).
+    struct ExternalBuffer {
+        VkBuffer             buffer    = VK_NULL_HANDLE;
         VkDeviceMemory       memory    = VK_NULL_HANDLE;
-        VkImageView          view      = VK_NULL_HANDLE;
+        VkDeviceSize         size      = 0;       // total bytes
         cudaExternalMemory_t cuda_ext  = nullptr;
-        cudaArray_t          cuda_arr  = nullptr;
-        cudaSurfaceObject_t  cuda_surf = 0;
+        std::uint64_t        cuda_ptr  = 0;       // CUdeviceptr
     };
-    ExternalImage img_color_in_;
-    ExternalImage img_output_;
+    ExternalBuffer buf_color_in_;
+    ExternalBuffer buf_output_;
+    // Pixel layout matching what we copy: RGBA16F = 8 bytes per
+    // pixel, tightly packed, row stride = width * 8.
+    static constexpr std::uint32_t kBytesPerPixel = 8;
+
+    // Private Vulkan command pool + per-frame-in-flight command
+    // buffer used for the output copy submit. The output copy waits
+    // on sem_cuda_to_vk_ before reading our buffer, so it can't be
+    // recorded into the engine's main cb (which doesn't wait on
+    // CUDA's signal). Owned + freed by this class.
+    VkCommandPool   private_pool_      = VK_NULL_HANDLE;
+    static constexpr int kFramesInFlight = 2;
+    VkCommandBuffer private_cb_out_[kFramesInFlight] {};
+    int             private_cb_index_  = 0;
 
     // Timeline VkSemaphores exported to CUDA for cross-API sync.
     // vk_signals_cuda_waits_ : Vulkan queue signals after recording
@@ -209,6 +247,17 @@ private:
     cudaExternalSemaphore_t cuda_sem_vk_to_cuda_ = nullptr;
     cudaExternalSemaphore_t cuda_sem_cuda_to_vk_ = nullptr;
     std::uint64_t           timeline_counter_    = 0;
+
+    // Per-frame state shared between Encode() and SubmitPostMain().
+    // Encode records the private output-copy cb and saves which
+    // private_cb_out_ slot it used + the timeline value the cb waits
+    // on. SubmitPostMain reads these and does the vkQueueSubmit. The
+    // pending flag is reset after each SubmitPostMain so a frame
+    // where Encode wasn't called doesn't accidentally re-submit a
+    // stale cb.
+    bool          pending_post_main_       = false;
+    int           pending_pcb_slot_        = 0;
+    std::uint64_t pending_wait_value_      = 0;
 };
 
 }  // namespace pt::rhi::vk

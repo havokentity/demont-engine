@@ -114,9 +114,29 @@ public:
     // Internal accessors used by the command buffer.
     VkDevice         RawDevice()     const { return device_; }
     VkPhysicalDevice RawPhysicalDevice() const { return phys_device_; }
+    VkQueue          RawGraphicsQueue() const { return graphics_queue_; }
+    std::uint32_t    GraphicsQueueFamily() const { return graphics_qfi_; }
     VkPipeline       LookupPipeline(PipelineHandle h);
     VkPipelineLayout LookupPipelineLayout(PipelineHandle h);
     VkImageView      CurrentSwapchainImageView() const;
+
+#if defined(PT_ENABLE_OPTIX)
+    // CUDA-Vulkan interop hook for VulkanOptixDenoiser.
+    //
+    // VulkanOptixDenoiser::Encode records the input copy into the
+    // engine's main command buffer (so it runs as part of the engine's
+    // submit), but CUDA needs to know when that copy is done before
+    // it can read the OptiX denoiser input. Vulkan can only signal
+    // semaphores at submit time, so this method lets the OptiX path
+    // request that the next call to Submit() additionally signals
+    // a timeline semaphore at the given value -- letting CUDA's
+    // cudaWaitExternalSemaphoresAsync gate on it.
+    //
+    // Cleared automatically after one Submit. Call once per frame
+    // when the OptiX path is active. Setting sem == VK_NULL_HANDLE
+    // disables (and is the post-Submit reset state).
+    void RequestExtraSubmitSignal(VkSemaphore sem, std::uint64_t timeline_value);
+#endif
 
     static constexpr std::uint64_t kSwapchainTextureId = 1;
 
@@ -272,6 +292,12 @@ private:
     // because each owns its own scratch resources -- only the active
     // one consumes GPU memory after Init().
     std::unique_ptr<VulkanOptixDenoiser> optix_denoiser_;
+
+    // Pending extra signal semaphore for the next Submit. See
+    // RequestExtraSubmitSignal(). Reset to (VK_NULL_HANDLE, 0) after
+    // each Submit. Only the OptiX path uses this today.
+    VkSemaphore   extra_submit_signal_sem_   = VK_NULL_HANDLE;
+    std::uint64_t extra_submit_signal_value_ = 0;
 #endif
 
     VkDescriptorPool dpool_ = VK_NULL_HANDLE;
@@ -338,6 +364,7 @@ private:
 public:
     VkImageView         LookupImageView(TextureHandle h);
     VkImage             LookupImage(TextureHandle h);
+    VkExtent2D          LookupImageExtent(TextureHandle h);
     VkBuffer            LookupBuffer(BufferHandle h);
     VkAccelerationStructureKHR LookupAccel(AccelStructHandle h);
     VkDescriptorSet     CurrentDescriptorSet() const { return dsets_[current_frame_]; }

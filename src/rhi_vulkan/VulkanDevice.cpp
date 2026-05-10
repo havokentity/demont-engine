@@ -1010,6 +1010,20 @@ void VulkanDevice::DestroyDevice() {
         pipeline_build_thread_.join();
     }
     if (device_ != VK_NULL_HANDLE) {
+#if defined(PT_ENABLE_OPTIX)
+        // Drain the CUDA stream BEFORE vkDeviceWaitIdle. The OptiX
+        // denoiser submitted a private output-copy cb whose wait on
+        // sem_cuda_to_vk only completes after CUDA signals (in turn
+        // gated on engine-cb completion via sem_vk_to_cuda). If CUDA
+        // hasn't finished its queued denoise work, the private cb
+        // stays pending forever and vkDeviceWaitIdle deadlocks. The
+        // drain here forces CUDA to flush, signaling cuda_to_vk for
+        // every pending frame -- which lets the private cbs complete
+        // and vkDeviceWaitIdle return instantly.
+        if (optix_denoiser_) {
+            optix_denoiser_->DrainCuda();
+        }
+#endif
         vkDeviceWaitIdle(device_);
         // Tear down the denoiser before any of its dependencies
         // (VkPipeline / VkDescriptorPool / VkImageView). The denoiser
@@ -1307,6 +1321,14 @@ VkImage VulkanDevice::LookupImage(TextureHandle h) {
     std::lock_guard lock(resource_mutex_);
     auto it = images_.find(h.id);
     return (it == images_.end()) ? VK_NULL_HANDLE : it->second.image;
+}
+
+VkExtent2D VulkanDevice::LookupImageExtent(TextureHandle h) {
+    if (h.id == kSwapchainTextureId) return swap_extent_;
+    if (h.id == 0) return {0, 0};
+    std::lock_guard lock(resource_mutex_);
+    auto it = images_.find(h.id);
+    return (it == images_.end()) ? VkExtent2D{0, 0} : it->second.extent;
 }
 
 VkBuffer VulkanDevice::LookupBuffer(BufferHandle h) {
@@ -2380,7 +2402,50 @@ void VulkanDevice::Submit(CommandBuffer* cb) {
     si.pCommandBuffers      = &cmd;
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores    = &sem_render_done_[current_swap_index_];
+
+#if defined(PT_ENABLE_OPTIX)
+    // OptiX path: when VulkanOptixDenoiser::Encode requested an extra
+    // timeline-semaphore signal for CUDA's cudaWaitExternalSemaphoresAsync
+    // to gate on, attach it here. Both signals (the binary swapchain-
+    // present sem + the timeline OptiX sem) go in the same vkQueueSubmit
+    // -- VkTimelineSemaphoreSubmitInfo's pSignalSemaphoreValues holds
+    // values per-position, with binary-semaphore positions ignored.
+    VkSemaphore     opt_signals[2] {};
+    std::uint64_t   opt_signal_vals[2] {};
+    VkTimelineSemaphoreSubmitInfo timeline_info{};
+    if (extra_submit_signal_sem_ != VK_NULL_HANDLE) {
+        opt_signals[0]      = sem_render_done_[current_swap_index_];
+        opt_signals[1]      = extra_submit_signal_sem_;
+        opt_signal_vals[0]  = 0;  // ignored for binary
+        opt_signal_vals[1]  = extra_submit_signal_value_;
+        timeline_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+        timeline_info.signalSemaphoreValueCount = 2;
+        timeline_info.pSignalSemaphoreValues    = opt_signal_vals;
+        si.pNext                = &timeline_info;
+        si.signalSemaphoreCount = 2;
+        si.pSignalSemaphores    = opt_signals;
+    }
+#endif
+
     vkQueueSubmit(graphics_queue_, 1, &si, fence_in_flight_[current_frame_]);
+
+#if defined(PT_ENABLE_OPTIX)
+    // One-shot: clear the request after each submit so a frame where
+    // the OptiX path doesn't activate (cvar transition, denoiser
+    // un-ready, etc.) doesn't accidentally signal a stale value.
+    extra_submit_signal_sem_   = VK_NULL_HANDLE;
+    extra_submit_signal_value_ = 0;
+
+    // Submit the OptiX denoiser's private output-copy cb after the
+    // main engine cb. Encode() recorded it but deferred the submit so
+    // queue-order serialization works: the private cb waits on a
+    // timeline that the engine's cb above signals (via the
+    // RequestExtraSubmitSignal path), so it must be submitted AFTER
+    // the engine's cb to avoid blocking the queue.
+    if (optix_denoiser_) {
+        optix_denoiser_->SubmitPostMain();
+    }
+#endif
 
     VkPresentInfoKHR pi{};
     pi.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -2394,6 +2459,14 @@ void VulkanDevice::Submit(CommandBuffer* cb) {
         RecreateSwapchain();
     }
 }
+
+#if defined(PT_ENABLE_OPTIX)
+void VulkanDevice::RequestExtraSubmitSignal(VkSemaphore sem,
+                                            std::uint64_t timeline_value) {
+    extra_submit_signal_sem_   = sem;
+    extra_submit_signal_value_ = timeline_value;
+}
+#endif
 
 void VulkanDevice::EndFrame(CommandBuffer*) {
     current_frame_ = (current_frame_ + 1) % kFramesInFlight;

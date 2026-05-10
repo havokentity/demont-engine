@@ -235,7 +235,7 @@ bool VulkanOptixDenoiser::Init() {
     // Mark ready so VulkanDevice::Denoise stops re-Init-ing every frame.
     ready_ = true;
     LOG_INFO("VulkanOptixDenoiser: CUDA + OptiX context initialised "
-             "(kind={}); scratch + external images sized lazily on "
+             "(kind={}); scratch + external buffers sized lazily on "
              "first Encode",
              kind_ == Kind::HdrAov ? "HdrAov" : "Hdr");
     return true;
@@ -337,7 +337,7 @@ bool VulkanOptixDenoiser::ResizeScratch(std::uint32_t w, std::uint32_t h) {
     return true;
 }
 
-// ---- ResizeExternalImages ------------------------------------------------
+// ---- ResizeExternalBuffers -----------------------------------------------
 
 namespace {
 
@@ -357,40 +357,38 @@ std::uint32_t FindMemoryType(VkPhysicalDevice phys, std::uint32_t type_bits,
 
 }  // namespace
 
-bool VulkanOptixDenoiser::ResizeExternalImages(std::uint32_t w, std::uint32_t h) {
-    DestroyExternalImage(0);
-    DestroyExternalImage(1);
+// VkBuffers (not VkImages) backing the OptiX denoiser inputs/outputs.
+// OptixImage2D::data takes a CUdeviceptr -- cudaExternalMemoryGetMappedBuffer
+// (on a buffer-mode external memory import) returns exactly that, while
+// the image-mode import returns cudaArrays which OptiX can't accept.
+bool VulkanOptixDenoiser::ResizeExternalBuffers(std::uint32_t w, std::uint32_t h) {
+    DestroyExternalBuffer(0);
+    DestroyExternalBuffer(1);
 
     VkDevice dev = device_->RawDevice();
     VkPhysicalDevice phys = device_->RawPhysicalDevice();
 
-    auto build_one = [&](ExternalImage& out, const char* label) -> bool {
-        // External image creation: VK_KHR_external_memory + the per-OS
-        // handle type. Tiling LINEAR keeps the pitch deterministic so
-        // CUDA sees a row-major layout it can map without extra copies.
-        VkExternalMemoryImageCreateInfo emci{};
-        emci.sType       = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
-        emci.handleTypes = external::HandleTypes::vk_memory;
+    const VkDeviceSize buf_size =
+        static_cast<VkDeviceSize>(w) * h * kBytesPerPixel;
 
-        VkImageCreateInfo ici{};
-        ici.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-        ici.pNext         = &emci;
-        ici.imageType     = VK_IMAGE_TYPE_2D;
-        ici.format        = kOptixImageFormat;
-        ici.extent        = { w, h, 1 };
-        ici.mipLevels     = 1;
-        ici.arrayLayers   = 1;
-        ici.samples       = VK_SAMPLE_COUNT_1_BIT;
-        ici.tiling        = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage         = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                            VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                            VK_IMAGE_USAGE_STORAGE_BIT;
-        ici.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
-        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        VK_TRY(vkCreateImage(dev, &ici, nullptr, &out.image));
+    auto build_one = [&](ExternalBuffer& out, const char* label) -> bool {
+        VkExternalMemoryBufferCreateInfo embci{};
+        embci.sType       = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+        embci.handleTypes = external::HandleTypes::vk_memory;
+
+        VkBufferCreateInfo bci{};
+        bci.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bci.pNext       = &embci;
+        bci.size        = buf_size;
+        bci.usage       = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                          VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VK_TRY(vkCreateBuffer(dev, &bci, nullptr, &out.buffer));
+        out.size = buf_size;
 
         VkMemoryRequirements mr{};
-        vkGetImageMemoryRequirements(dev, out.image, &mr);
+        vkGetBufferMemoryRequirements(dev, out.buffer, &mr);
 
         VkExportMemoryAllocateInfo emai{};
         emai.sType       = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
@@ -398,7 +396,7 @@ bool VulkanOptixDenoiser::ResizeExternalImages(std::uint32_t w, std::uint32_t h)
 
         VkMemoryDedicatedAllocateInfo mdai{};
         mdai.sType   = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
-        mdai.image   = out.image;
+        mdai.buffer  = out.buffer;
         mdai.pNext   = &emai;
 
         VkMemoryAllocateInfo mai{};
@@ -413,11 +411,8 @@ bool VulkanOptixDenoiser::ResizeExternalImages(std::uint32_t w, std::uint32_t h)
             return false;
         }
         VK_TRY(vkAllocateMemory(dev, &mai, nullptr, &out.memory));
-        VK_TRY(vkBindImageMemory(dev, out.image, out.memory, 0));
+        VK_TRY(vkBindBufferMemory(dev, out.buffer, out.memory, 0));
 
-        // Export to native handle and import into CUDA. Renamed to
-        // `nh` to avoid shadowing the outer `h` (height) parameter
-        // captured in this lambda.
         external::NativeHandle nh;
         if (external::ExportMemoryHandle(dev, out.memory, &nh) != VK_SUCCESS ||
             !nh.is_valid()) {
@@ -433,12 +428,9 @@ bool VulkanOptixDenoiser::ResizeExternalImages(std::uint32_t w, std::uint32_t h)
 #else
         emdesc.handle.fd           = nh.value;
 #endif
-        emdesc.size = mr.size;
-        // Dedicated allocation -> tell CUDA so it doesn't try to manage
-        // sub-region offsets internally.
+        emdesc.size  = mr.size;
         emdesc.flags = cudaExternalMemoryDedicated;
         cudaError_t cerr = cudaImportExternalMemory(&out.cuda_ext, &emdesc);
-        // CUDA dups the handle internally on import, so close ours.
         external::CloseNativeHandle(nh);
         if (cerr != cudaSuccess) {
             LOG_ERROR("VulkanOptixDenoiser({}): cudaImportExternalMemory: {}",
@@ -446,65 +438,46 @@ bool VulkanOptixDenoiser::ResizeExternalImages(std::uint32_t w, std::uint32_t h)
             return false;
         }
 
-        // Get a mipmapped array view -> first level cudaArray for surface.
-        cudaExternalMemoryMipmappedArrayDesc madesc{};
-        std::memset(&madesc, 0, sizeof(madesc));
-        madesc.offset    = 0;
-        madesc.formatDesc.x = 16; madesc.formatDesc.y = 16;
-        madesc.formatDesc.z = 16; madesc.formatDesc.w = 16;
-        madesc.formatDesc.f = cudaChannelFormatKindFloat;
-        madesc.extent.width  = w;
-        madesc.extent.height = h;
-        madesc.extent.depth  = 0;
-        madesc.flags         = cudaArraySurfaceLoadStore;
-        madesc.numLevels     = 1;
-        cudaMipmappedArray_t mip = nullptr;
-        cerr = cudaExternalMemoryGetMappedMipmappedArray(&mip, out.cuda_ext, &madesc);
+        // Map as a buffer -> CUdeviceptr. This is what OptixImage2D
+        // wants. The pointer's lifetime is tied to cuda_ext; freeing
+        // cuda_ext (cudaDestroyExternalMemory) frees the mapping too.
+        cudaExternalMemoryBufferDesc bdesc{};
+        std::memset(&bdesc, 0, sizeof(bdesc));
+        bdesc.offset = 0;
+        bdesc.size   = mr.size;
+        bdesc.flags  = 0;
+        void* dev_ptr = nullptr;
+        cerr = cudaExternalMemoryGetMappedBuffer(&dev_ptr, out.cuda_ext, &bdesc);
         if (cerr != cudaSuccess) {
-            LOG_ERROR("VulkanOptixDenoiser({}): cudaExternalMemoryGetMappedMipmappedArray: {}",
+            LOG_ERROR("VulkanOptixDenoiser({}): cudaExternalMemoryGetMappedBuffer: {}",
                       label, cudaGetErrorString(cerr));
             return false;
         }
-        cerr = cudaGetMipmappedArrayLevel(&out.cuda_arr, mip, 0);
-        if (cerr != cudaSuccess) {
-            LOG_ERROR("VulkanOptixDenoiser({}): cudaGetMipmappedArrayLevel: {}",
-                      label, cudaGetErrorString(cerr));
-            return false;
-        }
-
-        cudaResourceDesc rdesc{};
-        rdesc.resType         = cudaResourceTypeArray;
-        rdesc.res.array.array = out.cuda_arr;
-        cerr = cudaCreateSurfaceObject(&out.cuda_surf, &rdesc);
-        if (cerr != cudaSuccess) {
-            LOG_ERROR("VulkanOptixDenoiser({}): cudaCreateSurfaceObject: {}",
-                      label, cudaGetErrorString(cerr));
-            return false;
-        }
+        out.cuda_ptr = reinterpret_cast<std::uint64_t>(dev_ptr);
         return true;
     };
 
-    if (!build_one(img_color_in_, "color_in")) return false;
-    if (!build_one(img_output_,   "output"))   return false;
+    if (!build_one(buf_color_in_, "color_in")) return false;
+    if (!build_one(buf_output_,   "output"))   return false;
 
-    LOG_INFO("VulkanOptixDenoiser: external images sized for {}x{} "
-             "(2 x VK_FORMAT_R16G16B16A16_SFLOAT, dedicated allocation, "
-             "imported to CUDA as surface objects)", w, h);
+    LOG_INFO("VulkanOptixDenoiser: external buffers sized for {}x{} "
+             "(2 x {}KB, dedicated allocation, imported to CUDA as "
+             "linear CUdeviceptrs)", w, h, buf_size / 1024);
     return true;
 }
 
-void VulkanOptixDenoiser::DestroyExternalImage(int slot) {
-    ExternalImage& e = (slot == 0) ? img_color_in_ : img_output_;
-    if (e.cuda_surf != 0) { cudaDestroySurfaceObject(e.cuda_surf); e.cuda_surf = 0; }
-    if (e.cuda_ext  != nullptr) { cudaDestroyExternalMemory(e.cuda_ext); e.cuda_ext = nullptr; }
-    e.cuda_arr = nullptr;  // owned by the mipmapped array; cudaDestroyExternalMemory frees it
+void VulkanOptixDenoiser::DestroyExternalBuffer(int slot) {
+    ExternalBuffer& e = (slot == 0) ? buf_color_in_ : buf_output_;
+    // CUDA mapping freed implicitly when cudaDestroyExternalMemory runs.
+    if (e.cuda_ext != nullptr) { cudaDestroyExternalMemory(e.cuda_ext); e.cuda_ext = nullptr; }
+    e.cuda_ptr = 0;
 
     VkDevice dev = device_ ? device_->RawDevice() : VK_NULL_HANDLE;
     if (dev != VK_NULL_HANDLE) {
-        if (e.view   != VK_NULL_HANDLE) { vkDestroyImageView(dev, e.view, nullptr); e.view = VK_NULL_HANDLE; }
-        if (e.image  != VK_NULL_HANDLE) { vkDestroyImage(dev, e.image, nullptr); e.image = VK_NULL_HANDLE; }
+        if (e.buffer != VK_NULL_HANDLE) { vkDestroyBuffer(dev, e.buffer, nullptr); e.buffer = VK_NULL_HANDLE; }
         if (e.memory != VK_NULL_HANDLE) { vkFreeMemory(dev, e.memory, nullptr); e.memory = VK_NULL_HANDLE; }
     }
+    e.size = 0;
 }
 
 // ---- ResizeExternalSemaphores --------------------------------------------
@@ -545,17 +518,12 @@ bool VulkanOptixDenoiser::ResizeExternalSemaphores() {
 #else
         desc.handle.fd           = nh.value;
 #endif
-        // For timeline semaphores CUDA also wants the timeline flag.
-        desc.flags = cudaExternalSemaphoreHandleTypeOpaqueWin32 ==
-                         external::HandleTypes::cuda_semaphore
-                     ? 0
-                     : 0;
-        // Note: the cuda sem handle type *_win32 already implies opaque;
-        // the timeline-vs-binary distinction is encoded in the handle
-        // type when CUDA was extended for timeline support. Recent CUDA
-        // (12.0+) accepts the same "Opaque*" type and detects timeline
-        // automatically from the imported VkSemaphore's type. No extra
-        // flag needed here.
+        // For timeline semaphores no extra flag is needed -- the handle
+        // type itself (TimelineSemaphoreWin32 / TimelineSemaphoreFd) is
+        // what tells CUDA the imported VkSemaphore is timeline-typed.
+        // ExternalHandles.h's HandleTypes::cuda_semaphore picks the
+        // right one per-platform.
+        desc.flags = 0;
         cudaError_t cerr = cudaImportExternalSemaphore(&cu_sem, &desc);
         external::CloseNativeHandle(nh);
         if (cerr != cudaSuccess) {
@@ -583,85 +551,379 @@ void VulkanOptixDenoiser::DestroyExternalSemaphores() {
     timeline_counter_ = 0;
 }
 
-// ---- Encode --------------------------------------------------------------
+// ---- EnsureCommandPool ---------------------------------------------------
 
-void VulkanOptixDenoiser::Encode(VkCommandBuffer /*cb*/,
+bool VulkanOptixDenoiser::EnsureCommandPool() {
+    if (private_pool_ != VK_NULL_HANDLE) return true;
+    VkDevice dev = device_->RawDevice();
+    VkCommandPoolCreateInfo pci{};
+    pci.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    pci.queueFamilyIndex = device_->GraphicsQueueFamily();
+    pci.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    VK_TRY(vkCreateCommandPool(dev, &pci, nullptr, &private_pool_));
+    VkCommandBufferAllocateInfo cbai{};
+    cbai.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbai.commandPool        = private_pool_;
+    cbai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = kFramesInFlight;
+    VK_TRY(vkAllocateCommandBuffers(dev, &cbai, private_cb_out_));
+    return true;
+}
+
+void VulkanOptixDenoiser::DestroyCommandPool() {
+    VkDevice dev = device_ ? device_->RawDevice() : VK_NULL_HANDLE;
+    if (dev != VK_NULL_HANDLE && private_pool_ != VK_NULL_HANDLE) {
+        // VkCommandBuffers are freed implicitly with the pool.
+        vkDestroyCommandPool(dev, private_pool_, nullptr);
+    }
+    private_pool_ = VK_NULL_HANDLE;
+    for (auto& cb : private_cb_out_) cb = VK_NULL_HANDLE;
+    private_cb_index_ = 0;
+}
+
+// ---- Encode --------------------------------------------------------------
+//
+// Per-frame flow when r_denoiser optix_hdr is active:
+//
+//   Frame N tick:
+//     1. Engine path-tracer dispatch records into engine cb (already
+//        done before VulkanDevice::Denoise dispatched here).
+//     2. We append to the engine cb:
+//          - barrier d.color_in: GENERAL -> TRANSFER_SRC
+//          - vkCmdCopyImageToBuffer(d.color_in -> buf_color_in_)
+//          - barrier d.color_in: TRANSFER_SRC -> GENERAL (path tracer
+//            wants GENERAL again next frame)
+//     3. Tell VulkanDevice to extra-signal sem_vk_to_cuda_ at value N
+//        when it submits the engine cb.
+//     4. Schedule async CUDA work on cuda_stream_:
+//          - cudaWaitExternalSemaphoresAsync on sem_vk_to_cuda_ (val N)
+//          - optixDenoiserComputeIntensity (HDR model needs intensity)
+//          - optixDenoiserInvoke (buf_color_in_.cuda_ptr ->
+//                                 buf_output_.cuda_ptr)
+//          - cudaSignalExternalSemaphoresAsync on sem_cuda_to_vk_ (val N)
+//     5. Submit a private cb on the graphics queue:
+//          - waitSemaphore: sem_cuda_to_vk_ at value N
+//          - barrier d.output: GENERAL -> TRANSFER_DST
+//          - vkCmdCopyBufferToImage(buf_output_ -> d.output)
+//          - barrier d.output: TRANSFER_DST -> GENERAL (so the
+//            engine's next tonemap / present sees a sane layout)
+//
+// Submitting the private cb at Encode time before the engine cb is
+// submitted is fine -- the wait on sem_cuda_to_vk_ value N keeps the
+// private cb pending in the queue until CUDA signals, which only
+// happens after the engine cb has signalled sem_vk_to_cuda_, which
+// only happens after the engine cb finishes its copy. Serialised
+// correctly through the timeline-semaphore handshake.
+
+void VulkanOptixDenoiser::Encode(VkCommandBuffer cb,
                                  const Device::DenoiseDesc& d) {
     if (!ready_) return;
+    if (cb == VK_NULL_HANDLE)   return;
+    if (d.color_in.id == 0 || d.output.id == 0) return;
 
-    // Resolve frame size from engine's color_in.
-    auto* dev = device_;
-    if (dev == nullptr) return;
-    // Look up the engine VkImage's extent. VulkanDevice exposes a
-    // LookupImage helper; the underlying ImageEntry stored alongside
-    // it has the extent we need. To avoid surfacing internals, query
-    // via the ResizeTextures-style pattern: pass color_in's id and
-    // let LookupImage give us the VkImage so we can read extent from
-    // an inferred query (fallback: use a fixed default when lookup
-    // doesn't reveal extent).
+    VkDevice dev = device_->RawDevice();
+
+    // ---- Lazy first-time setup: scratch + buffers + sems + private pool --
     //
-    // Engine guarantees color_in is the path-tracer-output sized
-    // texture, which matches the swapchain at frame creation time.
-    // We piggyback on ResizeTextures for the actual size detection.
-    //
-    // For this commit we read the size from the color_in texture
-    // image's extent via VulkanDevice's images_ map (LookupImage
-    // returns the VkImage but not the extent; add a sibling lookup
-    // or compute from descriptor info).
-    //
-    // Simplest path: VulkanDevice tracks ImageEntry which has extent;
-    // expose via a small accessor. If no accessor exists today, the
-    // resize path waits on the next refactor.
-    //
-    // Implementation note: VulkanDevice has private std::unordered_map
-    // images_. We can't read it from here without an accessor. Rather
-    // than touch VulkanDevice for this commit, we depend on the engine
-    // to have allocated post_denoise_hdr / denoise_color at the
-    // swapchain size, and we use the swapchain extent which the
-    // engine guarantees matches.
-    //
-    // For now: fixed default of 1920x1080 on first call. Resize on
-    // size change is a follow-up. RTX 5090 + 1080p is the explicit
-    // target hardware so this is fine for the smoke test of this
-    // commit; later commits make it dynamic.
-    const std::uint32_t target_w = 1920;
-    const std::uint32_t target_h = 1080;
-    (void)d;  // d.color_in / d.output unused until per-frame work lands
+    // Size pulled from the engine's d.color_in extent so we automatically
+    // match whatever the engine allocated for the path tracer (the engine
+    // sizes the G-buffer to the swapchain). Window resize will currently
+    // hit a stale-size fast path -- proper resize handling is a small
+    // follow-up (free + rebuild scratch / buffers / sems on extent change,
+    // matching the existing OptiX state-buffer-keyed-on-WxH pattern).
+    VkExtent2D src_extent = device_->LookupImageExtent(d.color_in);
+    if (src_extent.width == 0 || src_extent.height == 0) {
+        LOG_WARN("VulkanOptixDenoiser::Encode: color_in extent lookup returned 0x0");
+        return;
+    }
+    const std::uint32_t target_w = src_extent.width;
+    const std::uint32_t target_h = src_extent.height;
 
     if (target_w != cached_w_ || target_h != cached_h_) {
-        if (!ResizeScratch(target_w, target_h)) {
-            LOG_ERROR("VulkanOptixDenoiser: ResizeScratch({}x{}) failed; "
-                      "marking denoiser un-ready", target_w, target_h);
-            ready_ = false;
-            return;
-        }
-        if (!ResizeExternalImages(target_w, target_h)) {
-            LOG_ERROR("VulkanOptixDenoiser: ResizeExternalImages({}x{}) failed; "
-                      "marking denoiser un-ready", target_w, target_h);
-            ready_ = false;
-            return;
-        }
-        if (!ResizeExternalSemaphores()) {
-            LOG_ERROR("VulkanOptixDenoiser: ResizeExternalSemaphores failed; "
+        if (!ResizeScratch(target_w, target_h)         ||
+            !ResizeExternalBuffers(target_w, target_h) ||
+            !ResizeExternalSemaphores()                ||
+            !EnsureCommandPool()) {
+            LOG_ERROR("VulkanOptixDenoiser: lazy first-time setup failed; "
                       "marking denoiser un-ready");
             ready_ = false;
             return;
         }
         cached_w_ = target_w;
         cached_h_ = target_h;
-        LOG_INFO("VulkanOptixDenoiser: static state ready ({}x{}); "
-                 "per-frame denoise dispatch is the next commit -- "
-                 "image will stay noisy until then",
-                 target_w, target_h);
+        LOG_INFO("VulkanOptixDenoiser: per-frame denoise dispatch active "
+                 "for {}x{}", target_w, target_h);
     }
 
-    // Per-frame interop dispatch lands in the next commit -- the
-    // record-side sequence (vkCmdCopyImage in, signal vk-to-cuda,
-    // optixDenoiserComputeIntensity, optixDenoiserInvoke,
-    // cudaStreamSynchronize, vkCmdCopyImage out) touches Vulkan
-    // queue submission semantics that need their own focused review.
-    // With the static state above proven on first call, the per-frame
-    // work is ~150 lines and lands cleanly on top.
+    // ---- Resolve engine VkImages ---------------------------------------
+    VkImage src_img = device_->LookupImage(d.color_in);
+    VkImage dst_img = device_->LookupImage(d.output);
+    if (src_img == VK_NULL_HANDLE || dst_img == VK_NULL_HANDLE) {
+        LOG_WARN("VulkanOptixDenoiser::Encode: image lookup miss "
+                 "(src={} dst={})", static_cast<void*>(src_img),
+                                    static_cast<void*>(dst_img));
+        return;
+    }
+
+    timeline_counter_++;
+    const std::uint64_t this_frame = timeline_counter_;
+
+    // ---- Step 2: append to engine cb -- copy d.color_in -> buf_color_in_ -
+    {
+        VkImageMemoryBarrier toSrc{};
+        toSrc.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        toSrc.oldLayout     = VK_IMAGE_LAYOUT_GENERAL;
+        toSrc.newLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        toSrc.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toSrc.image         = src_img;
+        toSrc.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        toSrc.subresourceRange.layerCount = 1;
+        toSrc.subresourceRange.levelCount = 1;
+        vkCmdPipelineBarrier(cb,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &toSrc);
+
+        VkBufferImageCopy region{};
+        region.bufferOffset      = 0;
+        region.bufferRowLength   = 0;  // tightly packed
+        region.bufferImageHeight = 0;
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent       = { cached_w_, cached_h_, 1 };
+        vkCmdCopyImageToBuffer(cb, src_img,
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               buf_color_in_.buffer,
+                               1, &region);
+
+        // Restore d.color_in to GENERAL so the engine's path-tracer
+        // dispatch on the next frame sees the layout it expects.
+        VkImageMemoryBarrier backToGeneral{};
+        backToGeneral.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        backToGeneral.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        backToGeneral.newLayout     = VK_IMAGE_LAYOUT_GENERAL;
+        backToGeneral.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        backToGeneral.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        backToGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        backToGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        backToGeneral.image         = src_img;
+        backToGeneral.subresourceRange = toSrc.subresourceRange;
+        vkCmdPipelineBarrier(cb,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &backToGeneral);
+    }
+
+    // ---- Step 3: request the engine submit additionally signal vk_to_cuda
+    device_->RequestExtraSubmitSignal(sem_vk_to_cuda_, this_frame);
+
+    // ---- Step 4: schedule async CUDA wait + denoise + signal -------------
+    //
+    // All four calls are checked: a silent failure here would leave the
+    // private cb's wait on sem_cuda_to_vk forever-pending, blocking
+    // vkDeviceWaitIdle at engine shutdown -> force-kill required. The
+    // log message identifies which step broke so we don't have to
+    // bisect.
+    bool cuda_chain_ok = true;
+    {
+        cudaExternalSemaphoreWaitParams wait_params{};
+        std::memset(&wait_params, 0, sizeof(wait_params));
+        wait_params.params.fence.value = this_frame;
+        cudaError_t cerr = cudaWaitExternalSemaphoresAsync(
+            &cuda_sem_vk_to_cuda_, &wait_params, 1, cuda_stream_);
+        if (cerr != cudaSuccess) {
+            LOG_ERROR("VulkanOptixDenoiser::Encode: cudaWaitExternalSemaphoresAsync: {}",
+                      cudaGetErrorString(cerr));
+            cuda_chain_ok = false;
+        }
+
+        OptixImage2D color_in{};
+        color_in.data             = static_cast<CUdeviceptr>(buf_color_in_.cuda_ptr);
+        color_in.width            = cached_w_;
+        color_in.height           = cached_h_;
+        color_in.rowStrideInBytes = cached_w_ * kBytesPerPixel;
+        color_in.pixelStrideInBytes = kBytesPerPixel;
+        color_in.format           = kOptixPixelFormat;
+
+        OptixImage2D output{};
+        output.data             = static_cast<CUdeviceptr>(buf_output_.cuda_ptr);
+        output.width            = cached_w_;
+        output.height           = cached_h_;
+        output.rowStrideInBytes = cached_w_ * kBytesPerPixel;
+        output.pixelStrideInBytes = kBytesPerPixel;
+        output.format           = kOptixPixelFormat;
+
+        if (cuda_chain_ok) {
+            OptixResult oresult = optixDenoiserComputeIntensity(
+                optix_denoiser_, cuda_stream_,
+                &color_in,
+                static_cast<CUdeviceptr>(intensity_buf_),
+                static_cast<CUdeviceptr>(scratch_buf_),
+                scratch_size_);
+            if (oresult != OPTIX_SUCCESS) {
+                LOG_ERROR("VulkanOptixDenoiser::Encode: "
+                          "optixDenoiserComputeIntensity (OptixResult={})",
+                          static_cast<int>(oresult));
+                cuda_chain_ok = false;
+            }
+        }
+
+        OptixDenoiserParams params{};
+        std::memset(&params, 0, sizeof(params));
+        params.hdrIntensity   = static_cast<CUdeviceptr>(intensity_buf_);
+        params.blendFactor    = 0.0f;  // 0 = full denoise, 1 = passthrough
+
+        OptixDenoiserGuideLayer guide_layer{};
+        std::memset(&guide_layer, 0, sizeof(guide_layer));
+
+        OptixDenoiserLayer layer{};
+        std::memset(&layer, 0, sizeof(layer));
+        layer.input  = color_in;
+        layer.output = output;
+
+        if (cuda_chain_ok) {
+            OptixResult oresult = optixDenoiserInvoke(
+                optix_denoiser_, cuda_stream_,
+                &params,
+                static_cast<CUdeviceptr>(state_buf_), state_size_,
+                &guide_layer,
+                &layer, 1,
+                /*inputOffsetX*/ 0, /*inputOffsetY*/ 0,
+                static_cast<CUdeviceptr>(scratch_buf_), scratch_size_);
+            if (oresult != OPTIX_SUCCESS) {
+                LOG_ERROR("VulkanOptixDenoiser::Encode: optixDenoiserInvoke "
+                          "(OptixResult={})", static_cast<int>(oresult));
+                cuda_chain_ok = false;
+            }
+        }
+
+        // ALWAYS signal cuda_to_vk -- even if any earlier CUDA/OptiX
+        // step failed. Otherwise the private cb's wait deadlocks the
+        // queue and hangs vkDeviceWaitIdle at shutdown. Visual output
+        // will be garbage on a failure frame, but the engine stays
+        // responsive and the LOG_ERROR above tells us why.
+        cudaExternalSemaphoreSignalParams sig_params{};
+        std::memset(&sig_params, 0, sizeof(sig_params));
+        sig_params.params.fence.value = this_frame;
+        cudaError_t sig_err = cudaSignalExternalSemaphoresAsync(
+            &cuda_sem_cuda_to_vk_, &sig_params, 1, cuda_stream_);
+        if (sig_err != cudaSuccess) {
+            LOG_ERROR("VulkanOptixDenoiser::Encode: cudaSignalExternalSemaphoresAsync: {}",
+                      cudaGetErrorString(sig_err));
+            // No way to recover -- private cb will hang. Warn and
+            // proceed; vkDeviceWaitIdle will hang at shutdown.
+        }
+    }
+
+    // ---- Step 5: record private cb that copies buf_output_ -> d.output ---
+    // (Submitted later by SubmitPostMain(), called from VulkanDevice::Submit
+    // AFTER the main engine cb is submitted -- queue-order serialization
+    // would otherwise deadlock on the engine cb signalling the timeline
+    // our private cb's wait depends on.)
+    const int  pcb_slot = private_cb_index_;
+    VkCommandBuffer pcb = private_cb_out_[pcb_slot];
+    private_cb_index_   = (private_cb_index_ + 1) % kFramesInFlight;
+    vkResetCommandBuffer(pcb, 0);
+    {
+        VkCommandBufferBeginInfo bi{};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (vkBeginCommandBuffer(pcb, &bi) != VK_SUCCESS) {
+            LOG_WARN("VulkanOptixDenoiser::Encode: vkBeginCommandBuffer(private) failed");
+            return;
+        }
+
+        VkImageMemoryBarrier toDst{};
+        toDst.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        // UNDEFINED is spec-correct here -- we're about to write the
+        // entire image via vkCmdCopyBufferToImage so previous contents
+        // don't matter. Using GENERAL would require the image to
+        // already be in GENERAL on first frame, which it isn't (engine
+        // creates post_denoise_hdr with VK_IMAGE_LAYOUT_UNDEFINED).
+        toDst.oldLayout     = VK_IMAGE_LAYOUT_UNDEFINED;
+        toDst.newLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toDst.srcAccessMask = 0;
+        toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toDst.image         = dst_img;
+        toDst.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        toDst.subresourceRange.layerCount = 1;
+        toDst.subresourceRange.levelCount = 1;
+        vkCmdPipelineBarrier(pcb,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &toDst);
+
+        VkBufferImageCopy region{};
+        region.bufferOffset      = 0;
+        region.bufferRowLength   = 0;
+        region.bufferImageHeight = 0;
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent       = { cached_w_, cached_h_, 1 };
+        vkCmdCopyBufferToImage(pcb, buf_output_.buffer, dst_img,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               1, &region);
+
+        VkImageMemoryBarrier backToGeneral{};
+        backToGeneral.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        backToGeneral.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        backToGeneral.newLayout     = VK_IMAGE_LAYOUT_GENERAL;
+        backToGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        backToGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        backToGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        backToGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        backToGeneral.image         = dst_img;
+        backToGeneral.subresourceRange = toDst.subresourceRange;
+        vkCmdPipelineBarrier(pcb,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &backToGeneral);
+
+        vkEndCommandBuffer(pcb);
+    }
+
+    // Submit deferred to SubmitPostMain(); save state for that call.
+    pending_post_main_  = true;
+    pending_pcb_slot_   = pcb_slot;
+    pending_wait_value_ = this_frame;
+    (void)dev;
+}
+
+void VulkanOptixDenoiser::DrainCuda() {
+    if (cuda_stream_ != nullptr) {
+        cudaStreamSynchronize(cuda_stream_);
+    }
+}
+
+void VulkanOptixDenoiser::SubmitPostMain() {
+    if (!pending_post_main_) return;
+    pending_post_main_ = false;
+
+    VkCommandBuffer pcb = private_cb_out_[pending_pcb_slot_];
+
+    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkTimelineSemaphoreSubmitInfo timeline_info{};
+    timeline_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+    timeline_info.waitSemaphoreValueCount = 1;
+    timeline_info.pWaitSemaphoreValues    = &pending_wait_value_;
+
+    VkSubmitInfo si{};
+    si.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.pNext                = &timeline_info;
+    si.waitSemaphoreCount   = 1;
+    si.pWaitSemaphores      = &sem_cuda_to_vk_;
+    si.pWaitDstStageMask    = &wait_stage;
+    si.commandBufferCount   = 1;
+    si.pCommandBuffers      = &pcb;
+    si.signalSemaphoreCount = 0;
+    if (vkQueueSubmit(device_->RawGraphicsQueue(), 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) {
+        LOG_WARN("VulkanOptixDenoiser::SubmitPostMain: vkQueueSubmit(private) failed");
+    }
 }
 
 // ---- DestroyResources -----------------------------------------------------
@@ -675,8 +937,9 @@ void VulkanOptixDenoiser::DestroyResources() {
     }
 
     DestroyExternalSemaphores();
-    DestroyExternalImage(0);
-    DestroyExternalImage(1);
+    DestroyCommandPool();
+    DestroyExternalBuffer(0);
+    DestroyExternalBuffer(1);
 
     if (state_buf_     != 0) { cudaFree(reinterpret_cast<void*>(state_buf_));     state_buf_     = 0; }
     if (scratch_buf_   != 0) { cudaFree(reinterpret_cast<void*>(scratch_buf_));   scratch_buf_   = 0; }
