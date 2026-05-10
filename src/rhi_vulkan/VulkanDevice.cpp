@@ -2594,6 +2594,11 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
     // CUDA-side previous-output history buffer the denoiser maintains
     // internally; OptiX TEMPORAL_AOV is the union (motion + albedo +
     // normal + history).
+#if defined(PT_ENABLE_OPTIX)
+    // Kind-classification bools live inside the PT_ENABLE_OPTIX guard
+    // because they're only consumed by the OptiX dispatch block.
+    // Hoisting them out triggers Mac CI's zero-warnings gate
+    // (Wunused-variable) since the Mac build defines no OptiX kinds.
     const bool kind_is_optix_temporal =
         (d.kind == DenoiseDesc::Kind::OptixTemporalHdr ||
          d.kind == DenoiseDesc::Kind::OptixTemporalHdrAov);
@@ -2604,7 +2609,6 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
         (d.kind == DenoiseDesc::Kind::OptixHdr ||
          d.kind == DenoiseDesc::Kind::OptixHdrAov ||
          kind_is_optix_temporal);
-#if defined(PT_ENABLE_OPTIX)
     if (kind_is_optix) {
         if (d.color_in.id == 0 || d.output.id == 0) {
             LOG_WARN("VulkanDevice::Denoise(OptiX): missing color/output (color={} out={})",
