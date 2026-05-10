@@ -96,17 +96,19 @@ public:
     //   Hdr           Plain HDR model. Cheapest, no AOV inputs.
     //                 Cvar value: r_denoiser optix_hdr.
     //
-    //   HdrAov        HDR model + albedo + normal AOV hints. Better
-    //                 quality, especially in shadowed regions where
-    //                 plain HDR can over-smooth surface detail. Costs
-    //                 the path tracer one additional output (primary
-    //                 albedo, RGBA16F at vk::binding 17, gated by
-    //                 PT_TARGET_SPIRV).
-    //                 Cvar value: r_denoiser optix_hdr_aov.
-    //                 NOTE: AOV plumbing lands in Phase 1a step 3 --
-    //                 this enum value is wired but currently behaves
-    //                 the same as Hdr until the path-tracer albedo
-    //                 output + AOV inputs land.
+    //   HdrAov        HDR model + albedo + normal AOV hints
+    //                 (OPTIX_DENOISER_MODEL_KIND_AOV). Better quality
+    //                 than plain Hdr in disocclusion / low-confidence
+    //                 regions and at diffuse-color edges where the
+    //                 plain HDR model can over-smooth surface detail.
+    //                 Costs the path tracer two additional G-buffer
+    //                 outputs:
+    //                   - primary albedo (RGBA16F at vk::binding 17)
+    //                   - primary normal (RGBA16F at vk::binding 16,
+    //                     reused from the SVGF/NRD path)
+    //                 Both gated by PT_TARGET_SPIRV. The engine
+    //                 allocates them only when r_denoiser is
+    //                 optix_hdr_aov. Cvar value: r_denoiser optix_hdr_aov.
     //
     //   TemporalHdr     [Phase 1b] Temporal HDR model.
     //   TemporalHdrAov  [Phase 1b] Temporal HDR + AOV.
@@ -229,8 +231,20 @@ private:
     };
     ExternalBuffer buf_color_in_;
     ExternalBuffer buf_output_;
+    // OptiX AOV-only guide-layer inputs. Allocated alongside
+    // color_in/output by ResizeExternalBuffers when kind_ == HdrAov;
+    // left in their default-empty state for kind_ == Hdr (the plain-
+    // HDR model has no guide layers). Imported with the same external-
+    // memory machinery as color_in -- the engine's albedo_tex and
+    // normal_tex VkImages get vkCmdCopyImageToBuffer'd in alongside
+    // color_in during Encode, and OptiX reads them as
+    // OptixDenoiserGuideLayer::albedo / .normal in SubmitPostMain.
+    ExternalBuffer buf_albedo_;
+    ExternalBuffer buf_normal_;
     // Pixel layout matching what we copy: RGBA16F = 8 bytes per
-    // pixel, tightly packed, row stride = width * 8.
+    // pixel, tightly packed, row stride = width * 8. Albedo and normal
+    // share this same layout (OptiX accepts HALF4 for guide layers
+    // and ignores the alpha channel).
     static constexpr std::uint32_t kBytesPerPixel = 8;
 
     // Private Vulkan command pool + per-frame-in-flight command
