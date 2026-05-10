@@ -1385,19 +1385,24 @@ void Engine::RenderFrame() {
 
     // P10/P12 denoiser state. Resolved before BeginFrame so we know
     // whether to allocate the G-buffer textures this frame. The cvar
-    // value chooses the kind (off / metalfx / svgf / nrd); per-backend
-    // gating then drops it to off if the active device doesn't support
-    // the chosen kind. metalfx is Mac-only; svgf+nrd are Vulkan-only;
-    // the no-op "off" value short-circuits all G-buffer allocation.
+    // value chooses the kind (off / metalfx / svgf / nrd / optix_*);
+    // per-backend gating then drops it to off if the active device
+    // doesn't support the chosen kind. metalfx is Mac-only; svgf, nrd,
+    // and optix_* are Vulkan-only; optix_* additionally requires the
+    // build-time PT_ENABLE_OPTIX (CUDA Toolkit + OptiX SDK detected)
+    // and a runtime CUDA-capable NVIDIA GPU. The no-op "off" value
+    // short-circuits all G-buffer allocation.
     DenoiserKind want_kind = DenoiserKind::Off;
     if (auto* v = C.FindCVar("r_denoiser")) {
         const auto& s = v->value;
         if (s == "metalfx" && current_backend_ == BackendType::Metal) {
             want_kind = DenoiserKind::MetalFX;
         } else if (current_backend_ == BackendType::Vulkan) {
-            if      (s == "svgf_basic")  want_kind = DenoiserKind::SvgfBasic;
-            else if (s == "svgf_atrous") want_kind = DenoiserKind::SvgfAtrous;
-            else if (s == "nrd")         want_kind = DenoiserKind::Nrd;
+            if      (s == "svgf_basic")    want_kind = DenoiserKind::SvgfBasic;
+            else if (s == "svgf_atrous")   want_kind = DenoiserKind::SvgfAtrous;
+            else if (s == "nrd")           want_kind = DenoiserKind::Nrd;
+            else if (s == "optix_hdr")     want_kind = DenoiserKind::OptixHdr;
+            else if (s == "optix_hdr_aov") want_kind = DenoiserKind::OptixHdrAov;
         }
     }
     if (want_kind != DenoiserKind::Off && !device_->SupportsDenoise()) {
@@ -1429,6 +1434,12 @@ void Engine::RenderFrame() {
                      "edge-aware filter");
         } else if (want_kind == DenoiserKind::MetalFX) {
             LOG_INFO("engine: r_denoiser=metalfx -- MetalFX TemporalDenoisedScaler active");
+        } else if (want_kind == DenoiserKind::OptixHdr) {
+            LOG_INFO("engine: r_denoiser=optix_hdr -- NVIDIA OptiX denoiser (HDR model) "
+                     "via CUDA-Vulkan interop active");
+        } else if (want_kind == DenoiserKind::OptixHdrAov) {
+            LOG_INFO("engine: r_denoiser=optix_hdr_aov -- NVIDIA OptiX denoiser (HDR + "
+                     "albedo + normal AOV model) via CUDA-Vulkan interop active");
         }
         if (!want_denoiser && device_) {
             if (denoise_color_tex_id_    != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
@@ -2232,6 +2243,19 @@ void Engine::RenderFrame() {
         dd.quality = (denoiser_kind_ == DenoiserKind::SvgfBasic)
                          ? pt::rhi::Device::DenoiseDesc::Quality::Basic
                          : pt::rhi::Device::DenoiseDesc::Quality::Atrous;
+
+        // Top-level Kind: tells the Vulkan backend whether to dispatch
+        // through VulkanNrdDenoiser (Svgf -- in-house SVGF chain) or
+        // VulkanOptixDenoiser (OptixHdr / OptixHdrAov). MetalFX ignores
+        // it. The svgf_basic / svgf_atrous / nrd values all collapse to
+        // Kind::Svgf -- they're tiers within the same backend impl.
+        if (denoiser_kind_ == DenoiserKind::OptixHdr) {
+            dd.kind = pt::rhi::Device::DenoiseDesc::Kind::OptixHdr;
+        } else if (denoiser_kind_ == DenoiserKind::OptixHdrAov) {
+            dd.kind = pt::rhi::Device::DenoiseDesc::Kind::OptixHdrAov;
+        } else {
+            dd.kind = pt::rhi::Device::DenoiseDesc::Kind::Svgf;
+        }
         // r_hdr_pipeline mirrors row0.w of the path-tracer push (set
         // earlier this frame) -- we read the cvar straight here so
         // the denoiser-finalize sRGB-only branch matches whichever

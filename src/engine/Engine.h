@@ -269,8 +269,16 @@ private:
     //   SvgfAtrous = temporal + 3-pass a-trous edge-aware filter
     //   Nrd        = currently aliases SvgfAtrous; reserved for the
     //                proper NVIDIA RayTracingDenoiser library later.
+    //   OptixHdr   = NVIDIA OptiX denoiser, HDR model. CUDA-Vulkan
+    //                interop; available only when PT_ENABLE_OPTIX is
+    //                compiled in AND the runtime detects an OptiX-
+    //                capable NVIDIA GPU. Falls back to off otherwise.
+    //   OptixHdrAov= OptiX HDR + albedo + normal AOV model. Better
+    //                quality (especially in shadowed regions) at small
+    //                additional cost. Adds a primary_albedo G-buffer
+    //                output to the path tracer (Vulkan/SPIR-V only).
     enum class DenoiserKind : std::uint8_t {
-        Off, MetalFX, SvgfBasic, SvgfAtrous, Nrd
+        Off, MetalFX, SvgfBasic, SvgfAtrous, Nrd, OptixHdr, OptixHdrAov
     };
     DenoiserKind                                denoiser_kind_         = DenoiserKind::Off;
     float                                       last_jitter_x_         = 0.0f;

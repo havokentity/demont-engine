@@ -7,6 +7,9 @@
 
 #include "VulkanDevice.h"
 #include "VulkanDenoiser.h"
+#if defined(PT_ENABLE_OPTIX)
+#include "VulkanOptixDenoiser.h"
+#endif
 
 #include "../core/Log.h"
 #include "../core/Memory/MemTag.h"
@@ -2398,6 +2401,43 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
         // (loading frame, or path tracer skipped) -- silently no-op.
         return;
     }
+
+    // Route based on d.kind. SVGF and OptiX have different input
+    // contracts: SVGF wants the full G-buffer (color/depth/motion/
+    // normal/output); OptiX HDR only needs color + output; OptiX HDR
+    // AOV adds normal_in (and primary_albedo, once Phase 1a step 3
+    // lands). Each path validates only what it actually consumes.
+#if defined(PT_ENABLE_OPTIX)
+    if (d.kind == DenoiseDesc::Kind::OptixHdr ||
+        d.kind == DenoiseDesc::Kind::OptixHdrAov) {
+        if (d.color_in.id == 0 || d.output.id == 0) {
+            LOG_WARN("VulkanDevice::Denoise(OptiX): missing color/output (color={} out={})",
+                     d.color_in.id, d.output.id);
+            return;
+        }
+        if (optix_denoiser_ == nullptr) {
+            const auto opt_kind = (d.kind == DenoiseDesc::Kind::OptixHdrAov)
+                                  ? VulkanOptixDenoiser::Kind::HdrAov
+                                  : VulkanOptixDenoiser::Kind::Hdr;
+            optix_denoiser_ = std::make_unique<VulkanOptixDenoiser>(this, opt_kind);
+        }
+        if (!optix_denoiser_->IsReady()) {
+            // Init() guards itself against re-entry via init_attempted_,
+            // so the first failure logs once (inside Init) and subsequent
+            // per-frame calls return false silently. We KEEP the failed
+            // instance alive so we don't recreate-and-retry every frame --
+            // re-trying after a hardware/driver-level failure has no path
+            // to succeed anyway. To force a retry the user must restart.
+            if (!optix_denoiser_->Init()) {
+                return;
+            }
+        }
+        optix_denoiser_->Encode(wrapped_cb_->Raw(), d);
+        return;
+    }
+#endif
+
+    // ---- SVGF / NRD path (Kind::Svgf, the historical default) ------------
     // Need at least the noisy color, depth, motion, normal, and a
     // valid output target. The engine's allocation gate guarantees
     // these on a denoiser-active frame; if any are missing it's a

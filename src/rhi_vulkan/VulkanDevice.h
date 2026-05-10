@@ -17,6 +17,9 @@
 #include <vector>
 
 namespace pt::rhi::vk { class VulkanNrdDenoiser; }
+#if defined(PT_ENABLE_OPTIX)
+namespace pt::rhi::vk { class VulkanOptixDenoiser; }
+#endif
 
 struct GLFWwindow;
 
@@ -259,6 +262,16 @@ private:
     // time it's called with a non-zero output texture; freed in
     // DestroyDevice() before any VkPipeline / VkDescriptorPool teardown.
     std::unique_ptr<VulkanNrdDenoiser> denoiser_;
+
+#if defined(PT_ENABLE_OPTIX)
+    // OptiX denoiser. Sibling to denoiser_ above, gated by build-time
+    // PT_ENABLE_OPTIX. Allocated lazily by Denoise() on the first call
+    // with d.kind == OptixHdr / OptixHdrAov. The two never run on the
+    // same frame (cvar pick is exclusive) and can coexist as members
+    // because each owns its own scratch resources -- only the active
+    // one consumes GPU memory after Init().
+    std::unique_ptr<VulkanOptixDenoiser> optix_denoiser_;
+#endif
 
     VkDescriptorPool dpool_ = VK_NULL_HANDLE;
     VkDescriptorSet  dsets_[kFramesInFlight] {};
