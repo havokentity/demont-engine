@@ -2545,10 +2545,17 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
         return;
     }
 
-    // ---- DEBUG: trace which dispatch path the active d.kind takes.
-    // Logged once per kind transition so the user can verify the
-    // engine is actually requesting the OptiX path when r_denoiser
-    // optix_hdr is set. Remove when the per-frame path is verified.
+    // ---- Dispatch-routing trace. Logged once per Kind transition
+    // (off->svgf, svgf->optix, etc.) so the engine -> RHI plumbing
+    // boundary is observable for any future denoiser-routing bug.
+    // Earned its keep on the OptiX bring-up: revealed that the
+    // engine routing was correct (kind=1 dispatched cleanly) and
+    // isolated the failures to optixInit + optixDenoiserComputeIntensity
+    // upstream. Stays in -- matches the engine's "log on state
+    // transitions" philosophy and costs nothing per frame after the
+    // first dispatch (static guard latches once kind is logged).
+    // Will move to PT_DIAG(2) when the r_diagnostic_level cvar lands
+    // (see follow-up).
     {
         static int s_last_logged_kind = -1;
         const int k = static_cast<int>(d.kind);

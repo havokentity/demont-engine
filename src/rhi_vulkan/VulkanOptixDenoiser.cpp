@@ -262,11 +262,18 @@ bool VulkanOptixDenoiser::InitOnce() {
     cuDeviceGetName(dev_name, sizeof(dev_name), cu_dev);
     LOG_INFO("VulkanOptixDenoiser: using CUDA device 0: {}", dev_name);
 
-    // CUDA 13 added cuCtxCreate_v4 with an extra CUctxCreateParams* arg
-    // (NULL for default). The macro cuCtxCreate maps to v4 in CUDA 13;
-    // earlier toolkits aliased it to v3 (3 args). Always pass nullptr
-    // for the params struct -- we don't use exec affinity / CIG.
-    CU_TRY(cuCtxCreate(&cuda_ctx_, nullptr, 0, cu_dev));
+    // cuCtxCreate signature changed across toolkits:
+    //   CUDA 12.x: macro -> cuCtxCreate_v3(CUcontext*, unsigned flags, CUdevice)
+    //   CUDA 13.x: macro -> cuCtxCreate_v4(CUcontext*, CUctxCreateParams*, unsigned, CUdevice)
+    // CMake's find_package(CUDAToolkit 12.0 ...) accepts both, so we
+    // version-gate on CUDA_VERSION (>=13000 = 13.x) to compile against
+    // either. nullptr for the v4 params struct -- we don't use exec
+    // affinity / CIG / SM partitioning.
+#if CUDA_VERSION >= 13000
+    CU_TRY(cuCtxCreate(&cuda_ctx_, nullptr, 0, cu_dev));   // v4 (CUDA 13+)
+#else
+    CU_TRY(cuCtxCreate(&cuda_ctx_, 0, cu_dev));            // v3 (CUDA 12.x)
+#endif
     CUDART_TRY(cudaStreamCreate(&cuda_stream_));
 
     // ---- OptiX: function table load + context + denoiser handle ----------
@@ -584,37 +591,52 @@ void VulkanOptixDenoiser::DestroyCommandPool() {
 
 // ---- Encode --------------------------------------------------------------
 //
-// Per-frame flow when r_denoiser optix_hdr is active:
+// Per-frame flow when r_denoiser optix_hdr is active. v1 sync model
+// favours simplicity over peak perf: vkQueueWaitIdle at the start of
+// SubmitPostMain + cudaStreamSynchronize before submitting the
+// private cb. CPU stalls per frame for the OptiX latency (~2-4 ms
+// at 720p HDR) but no risk of cross-API deadlock from optix calls
+// with hidden CPU-side synchronisation. Async via timeline
+// semaphores is wired up at the API layer (sem_vk_to_cuda_,
+// sem_cuda_to_vk_, RequestExtraSubmitSignal) but not used in the
+// per-frame path -- ready to re-enable as a future commit.
 //
 //   Frame N tick:
 //     1. Engine path-tracer dispatch records into engine cb (already
 //        done before VulkanDevice::Denoise dispatched here).
-//     2. We append to the engine cb:
+//     2. Encode appends to the engine cb:
 //          - barrier d.color_in: GENERAL -> TRANSFER_SRC
 //          - vkCmdCopyImageToBuffer(d.color_in -> buf_color_in_)
 //          - barrier d.color_in: TRANSFER_SRC -> GENERAL (path tracer
 //            wants GENERAL again next frame)
-//     3. Tell VulkanDevice to extra-signal sem_vk_to_cuda_ at value N
-//        when it submits the engine cb.
-//     4. Schedule async CUDA work on cuda_stream_:
-//          - cudaWaitExternalSemaphoresAsync on sem_vk_to_cuda_ (val N)
+//     3. Encode records (without submitting) the private cb:
+//          - barrier d.output: GENERAL -> TRANSFER_DST
+//          - vkCmdCopyBufferToImage(buf_output_ -> d.output)
+//          - barrier d.output: TRANSFER_DST -> GENERAL (compute read)
+//          - barrier swapchain: UNDEFINED -> GENERAL (compute write)
+//          - VulkanDevice::EncodeDenoiseFinalize (ACES + sRGB tonemap)
+//          - barrier swapchain: GENERAL -> PRESENT_SRC
+//        Saves the cb slot + frame index for SubmitPostMain.
+//     4. Encode returns. Engine continues recording into engine cb,
+//        then VulkanDevice::Submit submits engine cb.
+//     5. SubmitPostMain (called by Submit AFTER engine cb submit):
+//          - vkQueueWaitIdle (engine cb done -> buf_color_in_ has data)
 //          - optixDenoiserComputeIntensity (HDR model needs intensity)
 //          - optixDenoiserInvoke (buf_color_in_.cuda_ptr ->
 //                                 buf_output_.cuda_ptr)
-//          - cudaSignalExternalSemaphoresAsync on sem_cuda_to_vk_ (val N)
-//     5. Submit a private cb on the graphics queue:
-//          - waitSemaphore: sem_cuda_to_vk_ at value N
-//          - barrier d.output: GENERAL -> TRANSFER_DST
-//          - vkCmdCopyBufferToImage(buf_output_ -> d.output)
-//          - barrier d.output: TRANSFER_DST -> GENERAL (so the
-//            engine's next tonemap / present sees a sane layout)
+//          - cudaStreamSynchronize (block until denoise done)
+//          - vkQueueSubmit private cb (no semaphore waits -- queue
+//            order + the CPU stall above already serialise everything)
+//     6. Engine's vkQueuePresentKHR runs after SubmitPostMain returns,
+//        sees the tonemapped swapchain.
 //
-// Submitting the private cb at Encode time before the engine cb is
-// submitted is fine -- the wait on sem_cuda_to_vk_ value N keeps the
-// private cb pending in the queue until CUDA signals, which only
-// happens after the engine cb has signalled sem_vk_to_cuda_, which
-// only happens after the engine cb finishes its copy. Serialised
-// correctly through the timeline-semaphore handshake.
+// The future async-with-semaphores variant of step 4-5 is documented
+// in 7fdbdc0's commit message: it wants RequestExtraSubmitSignal
+// to chain a timeline signal onto the engine submit, then CUDA's
+// async wait on that signal lets ComputeIntensity / Invoke run
+// async-on-stream, then the private cb waits on the cuda->vk signal.
+// Deferred until we've mapped which OptiX calls have hidden CPU sync
+// (optixDenoiserComputeIntensity is one; full audit pending).
 
 void VulkanOptixDenoiser::Encode(VkCommandBuffer cb,
                                  const Device::DenoiseDesc& d) {
@@ -750,14 +772,18 @@ void VulkanOptixDenoiser::Encode(VkCommandBuffer cb,
 
         VkImageMemoryBarrier toDst{};
         toDst.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        // UNDEFINED is spec-correct here -- we're about to write the
-        // entire image via vkCmdCopyBufferToImage so previous contents
-        // don't matter. Using GENERAL would require the image to
-        // already be in GENERAL on first frame, which it isn't (engine
-        // creates post_denoise_hdr with VK_IMAGE_LAYOUT_UNDEFINED).
-        toDst.oldLayout     = VK_IMAGE_LAYOUT_UNDEFINED;
+        // GENERAL is the actual layout on entry: VulkanDevice::CreateTexture
+        // submits a one-shot UNDEFINED -> GENERAL barrier at allocation
+        // time, and the prior frame's DenoiseFinalize compute pass left
+        // it in GENERAL (it was the SHADER_READ source of that pass).
+        // Using UNDEFINED here would (a) trip validation on a "wrong
+        // current layout" check, and (b) skip synchronisation with the
+        // prior frame's compute read -- the queue's vkQueueWaitIdle in
+        // SubmitPostMain already covers (b) but the sync intent is what
+        // the barrier should express.
+        toDst.oldLayout     = VK_IMAGE_LAYOUT_GENERAL;
         toDst.newLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        toDst.srcAccessMask = 0;
+        toDst.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;   // prior finalize pass
         toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -766,7 +792,7 @@ void VulkanOptixDenoiser::Encode(VkCommandBuffer cb,
         toDst.subresourceRange.layerCount = 1;
         toDst.subresourceRange.levelCount = 1;
         vkCmdPipelineBarrier(pcb,
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,   // prior finalize pass read d.output
             VK_PIPELINE_STAGE_TRANSFER_BIT,
             0, 0, nullptr, 0, nullptr, 1, &toDst);
 

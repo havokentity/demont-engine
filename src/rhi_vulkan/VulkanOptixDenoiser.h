@@ -55,9 +55,20 @@
 
 #include <cstdint>
 
-// Forward-declare CUDA + OptiX types so the header doesn't drag the
-// full SDKs into every TU that pulls this in. The real includes
-// happen in the .cpp.
+// Forward-declare OptiX types and the CUDA driver/runtime context +
+// stream + external-memory/semaphore opaque pointers so we don't
+// have to include <optix.h> from every TU that pulls in this header.
+//
+// The transitive cost from ExternalHandles.h above is non-zero --
+// it pulls <cuda.h> + <cuda_runtime.h> for the CUDA-side handle-type
+// enums (cudaExternalMemoryHandleType etc.) -- so the "header is
+// SDK-light" claim is partial: cuda.h DOES end up in any TU that
+// includes us. Acceptable because the only non-OptiX includer is
+// VulkanDevice.{h,cpp} (the SVGF path doesn't pull this header), and
+// the whole thing is gated behind PT_ENABLE_OPTIX so non-NVIDIA
+// builds skip it entirely. Keeping the OptiX forward-decls here
+// (vs another #include) still saves ~200 KB of headers per TU --
+// non-trivial in the engine's hot compile path.
 struct CUctx_st;
 typedef struct CUctx_st* CUcontext;
 struct CUstream_st;

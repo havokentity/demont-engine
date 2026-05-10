@@ -101,12 +101,15 @@ namespace cvar {
             "detail). nrd = same dispatch chain as svgf_atrous today; "
             "reserved for the proper NVIDIA RayTracingDenoiser library "
             "integration once that's wired up (see Raytracer "
-            "Plan/FOLLOW_UPS.md). optix_hdr / optix_hdr_aov = NVIDIA "
-            "OptiX denoiser via CUDA-Vulkan interop (Phase 1a in flight; "
-            "values accepted today but treated as off until the dispatch "
-            "+ interop commits land -- only the build/link scaffold is "
-            "in place so far). Mac builds ignore the svgf_*/nrd/optix_* "
-            "values; Windows builds ignore metalfx.",
+            "Plan/FOLLOW_UPS.md). optix_hdr = NVIDIA OptiX HDR denoiser "
+            "via CUDA-Vulkan interop (gated by build-time PT_ENABLE_OPTIX, "
+            "auto-detected at configure when CUDA Toolkit + OptiX SDK are "
+            "found; runtime gracefully falls back to off if the GPU/driver "
+            "isn't OptiX-capable). optix_hdr_aov = same as optix_hdr today, "
+            "reserved for the AOV (albedo + normal hints) variant landing "
+            "in Phase 1a step 3 alongside the path-tracer's primary_albedo "
+            "output. Mac builds ignore the svgf_*/nrd/optix_* values; "
+            "non-NVIDIA Vulkan builds ignore optix_*.",
             CVAR_ARCHIVE);
     PT_CVAR(r_hdr_pipeline,    "1",  "Linear-HDR pipeline through MetalFX. 1 = path tracer writes raw HDR, MetalFX denoises in HDR, post-pass applies exposure+ACES (recommended). 0 = path tracer pre-applies exposure+ACES, MetalFX denoises LDR, tonemap pass is a passthrough copy. Only affects the denoiser-on path.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom,           "1",  "HDR bloom (downsample/upsample pyramid, additive composite before ACES). 0 disables; tonemap then samples a 1x1 zero buffer.", CVAR_ARCHIVE);
@@ -3659,11 +3662,13 @@ void Engine::RegisterCommands() {
         // svgf_atrous` in their demont.cfg and still launch on a Mac
         // without the cfg getting rejected.
         //
-        // optix_hdr / optix_hdr_aov are listed for tab-complete
-        // discoverability but currently no-op: the RenderFrame dispatch
-        // doesn't recognise them yet, so they fall through to off. The
-        // next commit on this branch wires them up to VulkanOptixDenoiser
-        // (still under PT_OPTIX_ACTIVE so non-NVIDIA builds keep working).
+        // optix_hdr is wired up via VulkanOptixDenoiser (gated by the
+        // build-time PT_ENABLE_OPTIX flag and runtime CUDA + OptiX
+        // detection -- see VulkanDevice::Denoise's OptiX branch).
+        // optix_hdr_aov is currently a synonym for optix_hdr until
+        // the AOV variant lands in Phase 1a step 3 alongside the path
+        // tracer's primary_albedo output (the underlying OptiX path
+        // logs a one-time INFO at Init noting the fallback).
         v->allowed_values = {"off", "metalfx",
                               "svgf_basic", "svgf_atrous", "nrd",
                               "optix_hdr", "optix_hdr_aov"};
