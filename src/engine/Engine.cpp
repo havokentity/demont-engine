@@ -7,6 +7,7 @@
 #include "../app/Window.h"
 #include "../console/Console.h"
 #include "../console/ConsoleServer.h"
+#include "../core/Diag.h"
 #include "../core/Hardware/HardwareInfo.h"
 #include "../core/Jobs/JobSystem.h"
 #include "../core/Log.h"
@@ -233,6 +234,18 @@ namespace cvar {
 
     PT_CVAR(dev_cheats,        "0",    "Gate for CHEAT-flagged cvars",   0);
     PT_CVAR(dev_log_level,     "info", "error|warn|info|debug",          0);
+    PT_CVAR(r_diagnostic_level, "1",
+            "Tiered diagnostics gate for PT_DIAG_TIERn() callsites. "
+            "0 = off (LOG_ERROR/LOG_WARN still flow; tiered diagnostics "
+            "suppressed). 1 = state transition (init / shutdown / fallback "
+            "/ cvar change / mode switch -- one-shot events; production "
+            "default). 2 = per-frame summary (<=1 line per frame per "
+            "category, e.g. pipeline cache hit-rate, denoiser dispatch "
+            "summary). 3 = per-call detail (every encode / dispatch / "
+            "barrier; dev-only, very chatty). Adoption is opt-in per "
+            "callsite -- raising the level only emits at sites that have "
+            "been migrated to PT_DIAG_TIERn().",
+            CVAR_ARCHIVE);
 
     // Hardware info (filled at startup, READONLY).
     PT_CVAR(sys_cpu_model,    "?",  "CPU brand string",              CVAR_READONLY);
@@ -3696,6 +3709,33 @@ void Engine::RegisterCommands() {
     // dev_log_level: validate
     if (auto* v = C.FindCVar("dev_log_level")) {
         v->allowed_values = {"error", "warn", "info", "debug"};
+    }
+    // r_diagnostic_level: validate + mirror into pt::diag::g_diag_level so
+    // every PT_DIAG_TIERn() callsite is a single relaxed atomic load +
+    // compare. The on_change handler emits the transition through
+    // LOG_INFO directly (NOT PT_DIAG_TIER1) so the user sees the gate
+    // flip in the same console even when transitioning *to* tier 0.
+    if (auto* v = C.FindCVar("r_diagnostic_level")) {
+        v->allowed_values = {"0", "1", "2", "3"};
+        v->slider_min  = 0.0f;
+        v->slider_max  = 3.0f;
+        v->slider_step = 1.0f;
+        v->on_change = [](const pt::console::CVar& cv) {
+            int n = std::clamp(cv.GetInt(), 0, 3);
+            pt::diag::g_diag_level.store(n, std::memory_order_relaxed);
+            LOG_INFO("[engine.cvars] r_diagnostic_level={} ({})", n,
+                     n == 0 ? "off"
+                   : n == 1 ? "state-transition"
+                   : n == 2 ? "per-frame summary"
+                            : "per-call detail");
+        };
+        // Sync the cache to whatever the cvar holds right now (e.g.
+        // demont.cfg may have already overridden the default before this
+        // registration block ran during Engine::Init -- although today
+        // RegisterCommands runs before the cfg load, future reorders
+        // shouldn't break the invariant).
+        pt::diag::g_diag_level.store(std::clamp(v->GetInt(), 0, 3),
+                                     std::memory_order_relaxed);
     }
     if (auto* v = C.FindCVar("r_denoiser")) {
         // metalfx is Mac-only; svgf_basic / svgf_atrous / nrd / optix_*

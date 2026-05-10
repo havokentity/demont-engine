@@ -3,6 +3,7 @@
 #include "VulkanDenoiser.h"
 #include "VulkanDevice.h"
 
+#include "../core/Diag.h"
 #include "../core/Log.h"
 #include "../rhi/Resources.h"
 
@@ -205,6 +206,9 @@ bool VulkanNrdDenoiser::Init() {
     }
 
     ready_ = true;
+    PT_DIAG_TIER1("denoiser",
+                  "VulkanNrdDenoiser: SVGF compute pipelines + dummy "
+                  "history textures ready");
     return true;
 }
 
@@ -763,6 +767,14 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
     // reads it as the prior history. Non-reset path: standard
     // ping-pong roll. Both cases want a single XOR.
     frame_parity_ ^= 1u;
+
+    PT_DIAG_TIER3("denoiser",
+                  "NRD::Encode: {}x{} parity={} reset={} atrous={} hdr_pipeline={}",
+                  cached_w_, cached_h_,
+                  static_cast<int>(frame_parity_),
+                  reset_history ? 1 : 0,
+                  atrous_enabled ? 1 : 0,
+                  hdr_pipeline ? 1 : 0);
 }
 
 // ---- EncodeFinalizeOnly (standalone tonemap + sRGB compute pass) ---------

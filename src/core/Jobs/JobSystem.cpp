@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Rajesh D'Monte
 #include "JobSystem.h"
+#include "../Diag.h"
 #include "../Log.h"
 #include "../Hardware/HardwareInfo.h"
 
@@ -63,7 +64,7 @@ void JobSystem::Init(int worker_count) {
     cfg.numTaskThreadsToCreate = static_cast<uint32_t>(worker_count_);
     sched_->Initialize(cfg);
 
-    LOG_INFO("JobSystem online: {} worker thread(s)", worker_count_);
+    PT_DIAG_TIER1("jobs", "JobSystem online: {} worker thread(s)", worker_count_);
 }
 
 void JobSystem::Shutdown() {

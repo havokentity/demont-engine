@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Rajesh D'Monte
+#include "core/Diag.h"
 #include "core/Jobs/JobSystem.h"
 #include "core/Log.h"
 #include "core/Memory/Memory.h"
@@ -103,7 +104,7 @@ int main() {
     if (auto* js = pt::jobs::JobSystem::Instance(); js != nullptr) {
         bool ran = false;
         js->Run([&ran]{ ran = true; });
-        LOG_INFO("JobSystem smoke test: ran = {}", ran);
+        PT_DIAG_TIER1("startup", "JobSystem smoke test: ran = {}", ran);
     }
 
     engine.Run();
