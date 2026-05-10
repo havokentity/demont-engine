@@ -594,6 +594,17 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
             p.a             = 1.0f;    // sigma_depth (relative)
             p.b             = 64.0f;   // sigma_normal (pow exponent; bigger = sharper edges)
             p.c             = 4.0f;    // sigma_color (luminance Gaussian sigma)
+            // Slot map: in / v_dummy_c / v_depth / v_dummy_m / v_normal /
+            // out / v_depth_hist_write / v_normal_hist_write. The shared
+            // 8-binding layout exists for the temporal pass; the atrous
+            // shader only declares bindings 0, 2, 4, 5 (color_in,
+            // depth_tex, normal_tex, color_out). Bindings 1, 3, 6, 7 are
+            // bound but unread -- v_dummy_c/v_dummy_m at 1/3 are 1x1
+            // placeholders, and v_depth_hist_write/v_normal_hist_write
+            // at 6/7 are the temporal pass's history-write views,
+            // forwarded here purely to satisfy the descriptor write
+            // (Vulkan layouts permit shaders that use a subset of
+            // declared bindings).
             RecordPass(cb, atrous_pipe_, NextSet(),
                        in, v_dummy_c, v_depth, v_dummy_m, v_normal, out,
                        v_depth_hist_write, v_normal_hist_write,
@@ -622,16 +633,16 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                      reinterpret_cast<void*>(dst_img));
             return;
         }
-        // Compute -> transfer handoff. dstAccess covers both the
-        // transfer's read of the source image (history_write) AND its
-        // write to the destination image (output) -- the latter being
-        // the WAW edge against any prior shader write to `output`. In
-        // the current flow `output` (post_denoise_hdr) isn't touched
-        // earlier in this command buffer (atrous mode would have
-        // written there, but we're in the basic branch), so the WAW
-        // is theoretical -- still, declaring TRANSFER_WRITE_BIT here
-        // is the spec-correct way and keeps validation happy if a
-        // future caller introduces such a write upstream.
+        // Compute -> transfer handoff. NB: with the history-copy block
+        // above (which already issued compute_write -> transfer for the
+        // depth/normal hist copies), this barrier is technically
+        // redundant for the current flow -- no compute op writes
+        // color_hist between the temporal pass and here. Kept
+        // defensively so a future refactor that inserts new compute
+        // writes between those points doesn't silently regress
+        // visibility. dstAccess covers both transfer read of
+        // color_hist and transfer write of `output` (theoretical WAW
+        // against any future upstream shader write to output).
         StageBarrier(cb,
                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                      VK_PIPELINE_STAGE_TRANSFER_BIT,
