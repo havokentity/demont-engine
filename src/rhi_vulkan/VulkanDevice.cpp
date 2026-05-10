@@ -2597,10 +2597,27 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
                 return;
             }
         }
+        const auto opt_kind = (d.kind == DenoiseDesc::Kind::OptixHdrAov)
+                              ? VulkanOptixDenoiser::Kind::HdrAov
+                              : VulkanOptixDenoiser::Kind::Hdr;
+        // Detect runtime r_denoiser cvar transitions that swap kinds
+        // (optix_hdr <-> optix_hdr_aov). The denoiser builds its OptiX
+        // state buffer + external buffers around `kind_` at construction,
+        // so we can't just flip the field on the live instance -- tear
+        // it down and rebuild. Destruction drains CUDA + frees external
+        // memory + destroys the OptiX context, so this is safe to do
+        // between frames (the engine clears pending_post_main_ inside
+        // SubmitPostMain at the end of every frame). Cheap: state +
+        // scratch are <200MB and the rebuild's ~tens-of-ms.
+        if (optix_denoiser_ != nullptr &&
+            optix_denoiser_->GetKind() != opt_kind) {
+            LOG_INFO("VulkanDevice::Denoise: OptiX kind transition "
+                     "(was {}, now {}); rebuilding denoiser instance",
+                     static_cast<int>(optix_denoiser_->GetKind()),
+                     static_cast<int>(opt_kind));
+            optix_denoiser_.reset();
+        }
         if (optix_denoiser_ == nullptr) {
-            const auto opt_kind = (d.kind == DenoiseDesc::Kind::OptixHdrAov)
-                                  ? VulkanOptixDenoiser::Kind::HdrAov
-                                  : VulkanOptixDenoiser::Kind::Hdr;
             optix_denoiser_ = std::make_unique<VulkanOptixDenoiser>(this, opt_kind);
         }
         if (!optix_denoiser_->IsReady()) {

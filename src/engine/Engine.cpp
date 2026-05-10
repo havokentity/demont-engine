@@ -1574,7 +1574,7 @@ void Engine::RenderFrame() {
         } else {
             normal_tex_id_ = 0;
         }
-        // Albedo G-buffer: OptiX AOV only. RGBA16F to keep header room
+        // Albedo G-buffer: OptiX AOV only. RGBA16F to keep headroom
         // for HDR-encoded materials (emissive base colors, etc.) and to
         // match the format convention of the other G-buffers.
         if (want_albedo_gbuffer) {
