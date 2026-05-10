@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Rajesh D'Monte
 add_library(pt_core STATIC
+    Diag.cpp
     Log.cpp
     Memory/Memory.cpp
     Memory/FrameArena.cpp
