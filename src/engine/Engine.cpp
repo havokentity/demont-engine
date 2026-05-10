@@ -101,7 +101,11 @@ namespace cvar {
             "detail). nrd = same dispatch chain as svgf_atrous today; "
             "reserved for the proper NVIDIA RayTracingDenoiser library "
             "integration once that's wired up (see Raytracer "
-            "Plan/FOLLOW_UPS.md). Mac builds ignore the svgf_*/nrd "
+            "Plan/FOLLOW_UPS.md). optix_hdr / optix_hdr_aov = NVIDIA "
+            "OptiX denoiser via CUDA-Vulkan interop (Phase 1a in flight; "
+            "values accepted today but treated as off until the dispatch "
+            "+ interop commits land -- only the build/link scaffold is "
+            "in place so far). Mac builds ignore the svgf_*/nrd/optix_* "
             "values; Windows builds ignore metalfx.",
             CVAR_ARCHIVE);
     PT_CVAR(r_hdr_pipeline,    "1",  "Linear-HDR pipeline through MetalFX. 1 = path tracer writes raw HDR, MetalFX denoises in HDR, post-pass applies exposure+ACES (recommended). 0 = path tracer pre-applies exposure+ACES, MetalFX denoises LDR, tonemap pass is a passthrough copy. Only affects the denoiser-on path.", CVAR_ARCHIVE);
@@ -3624,14 +3628,21 @@ void Engine::RegisterCommands() {
         v->allowed_values = {"error", "warn", "info", "debug"};
     }
     if (auto* v = C.FindCVar("r_denoiser")) {
-        // metalfx is Mac-only; svgf_basic / svgf_atrous / nrd are
-        // Vulkan-only. The RenderFrame check downgrades incompatible
+        // metalfx is Mac-only; svgf_basic / svgf_atrous / nrd / optix_*
+        // are Vulkan-only. The RenderFrame check downgrades incompatible
         // (cvar, backend) combinations to off rather than rejecting
         // at console-set time -- so a user can have `r_denoiser
         // svgf_atrous` in their demont.cfg and still launch on a Mac
         // without the cfg getting rejected.
+        //
+        // optix_hdr / optix_hdr_aov are listed for tab-complete
+        // discoverability but currently no-op: the RenderFrame dispatch
+        // doesn't recognise them yet, so they fall through to off. The
+        // next commit on this branch wires them up to VulkanOptixDenoiser
+        // (still under PT_OPTIX_ACTIVE so non-NVIDIA builds keep working).
         v->allowed_values = {"off", "metalfx",
-                              "svgf_basic", "svgf_atrous", "nrd"};
+                              "svgf_basic", "svgf_atrous", "nrd",
+                              "optix_hdr", "optix_hdr_aov"};
     }
     if (auto* v = C.FindCVar("r_hdr_pipeline")) {
         v->allowed_values = {"0", "1"};
