@@ -2,6 +2,7 @@
 # Copyright (c) 2026 Rajesh D'Monte
 add_library(pt_engine STATIC
     Engine.cpp
+    FrameCapture.cpp
     LensFlare.cpp
 )
 
