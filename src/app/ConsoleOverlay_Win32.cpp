@@ -733,11 +733,13 @@ void WinOverlay::EnsureFontScale() {
     // window receives a paint between Delete and assign it'd reach a
     // dangling HFONT). Stock fonts are not owned and must not be
     // DeleteObject'd; mirror the ctor's font_is_owned_ tracking.
-    if (font_ != nullptr && font_is_owned_) DeleteObject(font_);
+    HFONT      old_font  = font_;
+    const bool old_owned = font_is_owned_;
     font_          = new_font;
     font_is_owned_ = true;
     font_scale_    = requested;
     line_height_   = new_line_h;
+    if (old_font != nullptr && old_owned) DeleteObject(old_font);
     LOG_INFO("ConsoleOverlay: con_font_scale={:.2f} -> font_h={} line_h={}",
              requested, new_font_h, new_line_h);
     Repaint();
@@ -876,12 +878,23 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (OpenClipboard(hwnd_)) {
                 if (HANDLE h = GetClipboardData(CF_UNICODETEXT); h != nullptr) {
                     if (auto* src = static_cast<const wchar_t*>(GlobalLock(h))) {
+                        // n includes the trailing NUL because cchWideChar=-1
+                        // signals "input is null-terminated, count it". The
+                        // destination buffer therefore must be sized for n
+                        // bytes, not n-1 -- we resize the std::string to n,
+                        // write into all n bytes, then pop_back the trailing
+                        // NUL so size() == strlen(). Earlier we sized to n-1
+                        // and passed n as the destination capacity, which is
+                        // a one-byte overflow into whatever sits past
+                        // text.data()+size() (typically the std::string's
+                        // own internal NUL slot, but UB to rely on).
                         const int n = WideCharToMultiByte(CP_UTF8, 0, src, -1,
                                                           nullptr, 0, nullptr, nullptr);
                         if (n > 1) {
-                            text.resize(static_cast<std::size_t>(n - 1));
+                            text.resize(static_cast<std::size_t>(n));
                             WideCharToMultiByte(CP_UTF8, 0, src, -1,
                                                 text.data(), n, nullptr, nullptr);
+                            text.pop_back();  // drop trailing NUL
                         }
                         GlobalUnlock(h);
                     }
