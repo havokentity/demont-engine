@@ -28,10 +28,12 @@
 
 [[vk::binding(0, 0)]] RWTexture2D<float4> color_in;          // path-tracer output, RGBA16F
 [[vk::binding(1, 0)]] RWTexture2D<float4> color_history_in;  // prev-frame accumulated, RGBA16F (.a = sample count)
-[[vk::binding(2, 0)]] RWTexture2D<float>  depth_tex;         // R32F linear camera-space depth
+[[vk::binding(2, 0)]] RWTexture2D<float>  depth_tex;         // this-frame R32F linear camera-space depth
 [[vk::binding(3, 0)]] RWTexture2D<float2> motion_tex;        // RG16F pixel-space motion (prev - curr)
-[[vk::binding(4, 0)]] RWTexture2D<float4> normal_tex;        // RGBA16F world-space normal
+[[vk::binding(4, 0)]] RWTexture2D<float4> normal_tex;        // this-frame RGBA16F world-space normal
 [[vk::binding(5, 0)]] RWTexture2D<float4> color_out;         // this-frame accumulated, RGBA16F
+[[vk::binding(6, 0)]] RWTexture2D<float>  depth_history_in;  // prev-frame R32F depth history (reproject sample source)
+[[vk::binding(7, 0)]] RWTexture2D<float4> normal_history_in; // prev-frame RGBA16F normal history (reproject sample source)
 
 [[vk::push_constant]]
 cbuffer Push {
@@ -71,31 +73,18 @@ ReprojSample sampleHistory(float2 prev_pos, float curr_depth, float3 curr_normal
 
     float4 acc = float4(0.0);
     float  wsum = 0.0;
-    // Disocclusion test -- known simplification.
-    // ---------------------------------------------------------------
-    // A textbook SVGF disocclusion check compares THIS frame's depth
-    // / normal at curr_pos against LAST frame's depth / normal at
-    // prev_pos. We currently sample depth_tex / normal_tex (which the
-    // path tracer wrote THIS frame) at prev_pos. The check effectively
-    // asks "are the surfaces near curr_pos and prev_pos similar in
-    // this frame?" -- a weaker proxy that catches large depth/normal
-    // discontinuities (silhouette edges) but misses true cross-frame
-    // disocclusions (a previously-occluded surface revealed by motion
-    // shows the same depth/normal this frame as the surrounding
-    // visible surface).
-    //
-    // Proper fix is to ping-pong depth_history / normal_history
-    // textures alongside color_history; deferred (see Raytracer
-    // Plan/FOLLOW_UPS.md). The current behaviour is visibly clean on
-    // the default scenes; ghosting on disocclusions is the trade-off.
+    // Disocclusion test:
+    // Compare this frame's depth/normal at curr_pos against previous
+    // frame's depth/normal history sampled at prev_pos (true cross-
+    // frame validation, matching SVGF's intended gating).
     [unroll] for (int i = 0; i < 4; ++i) {
         int2 p = base + off[i];
         if (p.x < 0 || p.y < 0 || p.x >= int(width) || p.y >= int(height)) continue;
         uint2 up = uint2(p);
-        float prev_depth = depth_tex[up];
+        float prev_depth = depth_history_in[up];
         float depth_delta = abs(prev_depth - curr_depth) / max(curr_depth, 1e-3);
         if (depth_delta > depth_tolerance) continue;
-        float3 prev_n = normal_tex[up].xyz;
+        float3 prev_n = normal_history_in[up].xyz;
         if (length(curr_normal) > 0.5 && length(prev_n) > 0.5) {
             float n_dot = dot(curr_normal, prev_n);
             if (n_dot < normal_tolerance) continue;

@@ -21,14 +21,16 @@
 // Frame parity flips which history texture is read vs written so the
 // next frame picks up this frame's pre-spatial-filter accumulation.
 //
-// Resource ownership: the denoiser owns four scratch textures
-// (history_a, history_b, atrous_a, atrous_b -- all RGBA16F at frame
-// resolution). The engine continues to own the noisy color, depth,
-// motion, and normal G-buffers (see PathTrace.slang's bindings 6/7/8/16)
-// plus the final `output` (post_denoise_hdr).
+// Resource ownership: the denoiser owns eight scratch textures:
+// color history ping-pong (history_a/history_b, RGBA16F), depth history
+// ping-pong (depth_history_a/depth_history_b, R32F), normal history
+// ping-pong (normal_history_a/normal_history_b, RGBA16F), and a-trous
+// ping-pong (atrous_a/atrous_b, RGBA16F). The engine continues to own
+// the noisy color/depth/motion/normal G-buffers (PathTrace bindings
+// 6/7/8/16) plus final `output` (post_denoise_hdr).
 //
 // Pipeline layout: dedicated, NOT the engine's unified 17-binding
-// layout. Six bindings, all storage images, plus a 32-byte push
+// layout. Eight bindings, all storage images, plus a 32-byte push
 // constant range. Each Encode dispatch picks a fresh descriptor set
 // from the ring so we don't conflict with prior in-flight dispatches.
 
@@ -103,10 +105,12 @@ private:
                     VkDescriptorSet set,
                     VkImageView     color_in,
                     VkImageView     color_history_in,
-                    VkImageView     depth_in,
+                    VkImageView     depth_curr,
                     VkImageView     motion_in,
-                    VkImageView     normal_in,
+                    VkImageView     normal_curr,
                     VkImageView     color_out,
+                    VkImageView     depth_history_in,
+                    VkImageView     normal_history_in,
                     const void*     push,
                     std::size_t     push_size,
                     std::uint32_t   gx,
@@ -141,6 +145,10 @@ private:
     // Owned scratch textures (RHI-managed, freed via DestroyTextures()).
     std::uint64_t         history_a_id_ = 0;
     std::uint64_t         history_b_id_ = 0;
+    std::uint64_t         depth_history_a_id_ = 0;
+    std::uint64_t         depth_history_b_id_ = 0;
+    std::uint64_t         normal_history_a_id_ = 0;
+    std::uint64_t         normal_history_b_id_ = 0;
     std::uint64_t         atrous_a_id_  = 0;
     std::uint64_t         atrous_b_id_  = 0;
     // 1x1 RGBA16F placeholder for the unused bindings in atrous passes.
