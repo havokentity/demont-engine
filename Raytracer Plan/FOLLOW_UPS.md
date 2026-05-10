@@ -273,16 +273,6 @@ messages.
 
 **Quality follow-ups (all small):**
 
-- *Proper cross-frame disocclusion test.* `DenoiseTemporal.slang`
-  currently samples this-frame's `depth_tex` / `normal_tex` at
-  `prev_pos` rather than last-frame's depth/normal there -- a
-  weaker proxy that catches large depth/normal discontinuities
-  (silhouettes) but misses revealed-surface disocclusions. Fix:
-  ping-pong `depth_history` / `normal_history` textures alongside
-  `color_history_a` / `_b` and sample those in the bilinear
-  rejection loop. ~30 LOC + 2 extra RGBA16F textures (16 MB at
-  1080p). Visible improvement on fast camera turns at object
-  silhouettes.
 - *Eager denoiser pipeline build in the worker thread.* Today
   `VulkanNrdDenoiser::Init()` runs synchronously on the first
   `Denoise()` call -- a few-ms hitch on the first frame after

@@ -141,9 +141,16 @@ void VulkanNrdDenoiser::DestroyTextures() {
     if (device_ == nullptr) return;
     if (history_a_id_ != 0) device_->DestroyTexture(TextureHandle{history_a_id_});
     if (history_b_id_ != 0) device_->DestroyTexture(TextureHandle{history_b_id_});
+    if (depth_history_a_id_ != 0) device_->DestroyTexture(TextureHandle{depth_history_a_id_});
+    if (depth_history_b_id_ != 0) device_->DestroyTexture(TextureHandle{depth_history_b_id_});
+    if (normal_history_a_id_ != 0) device_->DestroyTexture(TextureHandle{normal_history_a_id_});
+    if (normal_history_b_id_ != 0) device_->DestroyTexture(TextureHandle{normal_history_b_id_});
     if (atrous_a_id_  != 0) device_->DestroyTexture(TextureHandle{atrous_a_id_});
     if (atrous_b_id_  != 0) device_->DestroyTexture(TextureHandle{atrous_b_id_});
-    history_a_id_ = history_b_id_ = atrous_a_id_ = atrous_b_id_ = 0;
+    history_a_id_ = history_b_id_ = 0;
+    depth_history_a_id_ = depth_history_b_id_ = 0;
+    normal_history_a_id_ = normal_history_b_id_ = 0;
+    atrous_a_id_ = atrous_b_id_ = 0;
     cached_w_ = cached_h_ = 0;
     needs_history_clear_ = true;
 }
@@ -188,9 +195,9 @@ bool VulkanNrdDenoiser::Init() {
 bool VulkanNrdDenoiser::BuildLayout() {
     VkDevice dev = device_->RawDevice();
 
-    // ---- temporal/atrous: 6 storage images --------------------------
+    // ---- temporal/atrous: 8 storage images --------------------------
     {
-        std::array<VkDescriptorSetLayoutBinding, 6> b{};
+        std::array<VkDescriptorSetLayoutBinding, 8> b{};
         for (std::uint32_t i = 0; i < b.size(); ++i) {
             b[i].binding         = i;
             b[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -296,14 +303,14 @@ bool VulkanNrdDenoiser::BuildDescriptorPool() {
     VkDevice dev = device_->RawDevice();
 
     // Mixed pool sizing for both layouts:
-    //   - kSetRing sets of (6 storage images) for temporal/atrous.
+    //   - kSetRing sets of (8 storage images) for temporal/atrous.
     //   - kFinalizeSetRing sets of (2 storage images + 1 storage
     //     buffer) for the finalize pass.
     // Plus a small headroom on each type.
     std::array<VkDescriptorPoolSize, 2> ps{};
     ps[0].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     ps[0].descriptorCount = static_cast<std::uint32_t>(
-        kSetRing * 6 + kFinalizeSetRing * 2 + 4);
+        kSetRing * 8 + kFinalizeSetRing * 2 + 4);
     ps[1].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     ps[1].descriptorCount = static_cast<std::uint32_t>(kFinalizeSetRing * 1 + 2);
 
@@ -351,7 +358,9 @@ bool VulkanNrdDenoiser::BuildDescriptorPool() {
 bool VulkanNrdDenoiser::ResizeTextures(std::uint32_t w, std::uint32_t h) {
     if (w == 0 || h == 0) return false;
     if (cached_w_ == w && cached_h_ == h && history_a_id_ != 0 &&
-        history_b_id_ != 0 && atrous_a_id_ != 0 && atrous_b_id_ != 0) {
+        history_b_id_ != 0 && depth_history_a_id_ != 0 &&
+        depth_history_b_id_ != 0 && normal_history_a_id_ != 0 &&
+        normal_history_b_id_ != 0 && atrous_a_id_ != 0 && atrous_b_id_ != 0) {
         return true;  // already sized
     }
     DestroyTextures();
@@ -368,9 +377,25 @@ bool VulkanNrdDenoiser::ResizeTextures(std::uint32_t w, std::uint32_t h) {
 
     history_a_id_ = mk("denoise_history_a");
     history_b_id_ = mk("denoise_history_b");
+    auto mk_depth = [&](const char* name) -> std::uint64_t {
+        auto h_ = device_->CreateTexture({
+            .width  = w, .height = h,
+            .format = TextureFormat::R32F,
+            .usage  = TextureUsage::Storage,
+            .debug_name = name,
+        });
+        return h_.id;
+    };
+    depth_history_a_id_ = mk_depth("denoise_depth_history_a");
+    depth_history_b_id_ = mk_depth("denoise_depth_history_b");
+    normal_history_a_id_ = mk("denoise_normal_history_a");
+    normal_history_b_id_ = mk("denoise_normal_history_b");
     atrous_a_id_  = mk("denoise_atrous_a");
     atrous_b_id_  = mk("denoise_atrous_b");
-    if (!history_a_id_ || !history_b_id_ || !atrous_a_id_ || !atrous_b_id_) {
+    if (!history_a_id_ || !history_b_id_ ||
+        !depth_history_a_id_ || !depth_history_b_id_ ||
+        !normal_history_a_id_ || !normal_history_b_id_ ||
+        !atrous_a_id_ || !atrous_b_id_) {
         LOG_ERROR("VulkanNrdDenoiser: scratch texture alloc failed at {}x{}", w, h);
         DestroyTextures();
         return false;
@@ -392,18 +417,23 @@ void VulkanNrdDenoiser::RecordPass(VkCommandBuffer cb,
                                    VkDescriptorSet set,
                                    VkImageView     color_in,
                                    VkImageView     color_history_in,
-                                   VkImageView     depth_in,
+                                   VkImageView     depth_curr,
                                    VkImageView     motion_in,
-                                   VkImageView     normal_in,
+                                   VkImageView     normal_curr,
                                    VkImageView     color_out,
+                                   VkImageView     depth_history_in,
+                                   VkImageView     normal_history_in,
                                    const void*     push,
                                    std::size_t     push_size,
                                    std::uint32_t   gx,
                                    std::uint32_t   gy) {
-    VkImageView views[6] = { color_in, color_history_in, depth_in, motion_in, normal_in, color_out };
-    VkDescriptorImageInfo infos[6] {};
-    VkWriteDescriptorSet  writes[6] {};
-    for (std::uint32_t i = 0; i < 6; ++i) {
+    VkImageView views[8] = {
+        color_in, color_history_in, depth_curr, motion_in, normal_curr, color_out,
+        depth_history_in, normal_history_in
+    };
+    VkDescriptorImageInfo infos[8] {};
+    VkWriteDescriptorSet  writes[8] {};
+    for (std::uint32_t i = 0; i < 8; ++i) {
         infos[i].imageView   = views[i];
         infos[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -413,7 +443,7 @@ void VulkanNrdDenoiser::RecordPass(VkCommandBuffer cb,
         writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         writes[i].pImageInfo      = &infos[i];
     }
-    vkUpdateDescriptorSets(device_->RawDevice(), 6, writes, 0, nullptr);
+    vkUpdateDescriptorSets(device_->RawDevice(), 8, writes, 0, nullptr);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
                             pipe_layout_, 0, 1, &set, 0, nullptr);
@@ -447,6 +477,10 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
     VkImageView v_output    = device_->LookupImageView(output);
     VkImageView v_hist_a    = device_->LookupImageView(TextureHandle{history_a_id_});
     VkImageView v_hist_b    = device_->LookupImageView(TextureHandle{history_b_id_});
+    VkImageView v_depth_hist_a = device_->LookupImageView(TextureHandle{depth_history_a_id_});
+    VkImageView v_depth_hist_b = device_->LookupImageView(TextureHandle{depth_history_b_id_});
+    VkImageView v_normal_hist_a = device_->LookupImageView(TextureHandle{normal_history_a_id_});
+    VkImageView v_normal_hist_b = device_->LookupImageView(TextureHandle{normal_history_b_id_});
     VkImageView v_atrous_a  = device_->LookupImageView(TextureHandle{atrous_a_id_});
     VkImageView v_atrous_b  = device_->LookupImageView(TextureHandle{atrous_b_id_});
     VkImageView v_dummy_c   = device_->LookupImageView(TextureHandle{dummy_color_id_});
@@ -459,7 +493,9 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
     if (v_color_in == VK_NULL_HANDLE || v_depth == VK_NULL_HANDLE ||
         v_motion == VK_NULL_HANDLE   || v_normal == VK_NULL_HANDLE ||
         v_output == VK_NULL_HANDLE   || v_hist_a == VK_NULL_HANDLE ||
-        v_hist_b == VK_NULL_HANDLE   || v_atrous_a == VK_NULL_HANDLE ||
+        v_hist_b == VK_NULL_HANDLE   || v_depth_hist_a == VK_NULL_HANDLE ||
+        v_depth_hist_b == VK_NULL_HANDLE || v_normal_hist_a == VK_NULL_HANDLE ||
+        v_normal_hist_b == VK_NULL_HANDLE || v_atrous_a == VK_NULL_HANDLE ||
         v_atrous_b == VK_NULL_HANDLE ||
         v_dummy_c == VK_NULL_HANDLE  || v_dummy_m == VK_NULL_HANDLE) {
         LOG_WARN("VulkanNrdDenoiser::Encode: missing input image views");
@@ -479,8 +515,15 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
     // Frame-parity ping-pong: history read = side[parity], history
     // write = side[1 - parity]. Bumping parity at the end so consecutive
     // Encode calls swap roles.
-    const VkImageView v_hist_read  = (frame_parity_ == 0) ? v_hist_a : v_hist_b;
-    const VkImageView v_hist_write = (frame_parity_ == 0) ? v_hist_b : v_hist_a;
+    const bool parity_is_a = (frame_parity_ == 0);
+    const VkImageView v_hist_read  = parity_is_a ? v_hist_a : v_hist_b;
+    const VkImageView v_hist_write = parity_is_a ? v_hist_b : v_hist_a;
+    const VkImageView v_depth_hist_read  = parity_is_a ? v_depth_hist_a : v_depth_hist_b;
+    const VkImageView v_depth_hist_write = parity_is_a ? v_depth_hist_b : v_depth_hist_a;
+    const VkImageView v_normal_hist_read  = parity_is_a ? v_normal_hist_a : v_normal_hist_b;
+    const VkImageView v_normal_hist_write = parity_is_a ? v_normal_hist_b : v_normal_hist_a;
+    const std::uint64_t depth_hist_write_id = parity_is_a ? depth_history_b_id_ : depth_history_a_id_;
+    const std::uint64_t normal_hist_write_id = parity_is_a ? normal_history_b_id_ : normal_history_a_id_;
 
     // Force-reset on first Encode after Init / resize so the read of
     // freshly-allocated history memory doesn't drift undefined values
@@ -497,13 +540,46 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
     p1.b             = 0.85f;   // normal_tolerance (cos angle)
     p1.c             = 0.10f;   // min_alpha (steady-state blend)
     RecordPass(cb, temporal_pipe_, NextSet(),
-               v_color_in, v_hist_read, v_depth, v_motion, v_normal,
-               v_hist_write,
+               v_color_in, v_hist_read, v_depth, v_motion, v_normal, v_hist_write,
+               v_depth_hist_read, v_normal_hist_read,
                &p1, sizeof(p1), gx, gy);
 
-    if (atrous_enabled) {
-        ComputeChainBarrier(cb);
+    // Keep depth/normal history ping-ponged in lockstep with color history
+    // so frame N+1 can validate reprojection taps against frame N surfaces.
+    VkImage dst_depth_hist = device_->LookupImage(TextureHandle{depth_hist_write_id});
+    VkImage dst_normal_hist = device_->LookupImage(TextureHandle{normal_hist_write_id});
+    VkImage src_depth = device_->LookupImage(depth_in);
+    VkImage src_normal = device_->LookupImage(normal_in);
+    if (src_depth == VK_NULL_HANDLE || src_normal == VK_NULL_HANDLE ||
+        dst_depth_hist == VK_NULL_HANDLE || dst_normal_hist == VK_NULL_HANDLE) {
+        LOG_WARN("VulkanNrdDenoiser::Encode: history copy image lookup miss");
+        return;
+    }
+    StageBarrier(cb,
+                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                 VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkImageCopy copy_region{};
+    // R32F + RGBA16F storage images use COLOR aspect in Vulkan.
+    copy_region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy_region.srcSubresource.layerCount = 1;
+    copy_region.dstSubresource            = copy_region.srcSubresource;
+    copy_region.extent.width  = cached_w_;
+    copy_region.extent.height = cached_h_;
+    copy_region.extent.depth  = 1;
+    vkCmdCopyImage(cb,
+                   src_depth, VK_IMAGE_LAYOUT_GENERAL,
+                   dst_depth_hist, VK_IMAGE_LAYOUT_GENERAL,
+                   1, &copy_region);
+    vkCmdCopyImage(cb,
+                   src_normal, VK_IMAGE_LAYOUT_GENERAL,
+                   dst_normal_hist, VK_IMAGE_LAYOUT_GENERAL,
+                   1, &copy_region);
+    StageBarrier(cb,
+                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
 
+    if (atrous_enabled) {
         // ---- Passes 2..4: a-trous chain at step sizes 1, 2, 4 ----------
         // The first pass reads the just-written history (v_hist_write)
         // and outputs to atrous_a; subsequent passes ping-pong between
@@ -518,8 +594,20 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
             p.a             = 1.0f;    // sigma_depth (relative)
             p.b             = 64.0f;   // sigma_normal (pow exponent; bigger = sharper edges)
             p.c             = 4.0f;    // sigma_color (luminance Gaussian sigma)
+            // Slot map: in / v_dummy_c / v_depth / v_dummy_m / v_normal /
+            // out / v_depth_hist_write / v_normal_hist_write. The shared
+            // 8-binding layout exists for the temporal pass; the atrous
+            // shader only declares bindings 0, 2, 4, 5 (color_in,
+            // depth_tex, normal_tex, color_out). Bindings 1, 3, 6, 7 are
+            // bound but unread -- v_dummy_c/v_dummy_m at 1/3 are 1x1
+            // placeholders, and v_depth_hist_write/v_normal_hist_write
+            // at 6/7 are the temporal pass's history-write views,
+            // forwarded here purely to satisfy the descriptor write
+            // (Vulkan layouts permit shaders that use a subset of
+            // declared bindings).
             RecordPass(cb, atrous_pipe_, NextSet(),
                        in, v_dummy_c, v_depth, v_dummy_m, v_normal, out,
+                       v_depth_hist_write, v_normal_hist_write,
                        &p, sizeof(p), gx, gy);
             ComputeChainBarrier(cb);
         };
@@ -545,16 +633,16 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                      reinterpret_cast<void*>(dst_img));
             return;
         }
-        // Compute -> transfer handoff. dstAccess covers both the
-        // transfer's read of the source image (history_write) AND its
-        // write to the destination image (output) -- the latter being
-        // the WAW edge against any prior shader write to `output`. In
-        // the current flow `output` (post_denoise_hdr) isn't touched
-        // earlier in this command buffer (atrous mode would have
-        // written there, but we're in the basic branch), so the WAW
-        // is theoretical -- still, declaring TRANSFER_WRITE_BIT here
-        // is the spec-correct way and keeps validation happy if a
-        // future caller introduces such a write upstream.
+        // Compute -> transfer handoff. NB: with the history-copy block
+        // above (which already issued compute_write -> transfer for the
+        // depth/normal hist copies), this barrier is technically
+        // redundant for the current flow -- no compute op writes
+        // color_hist between the temporal pass and here. Kept
+        // defensively so a future refactor that inserts new compute
+        // writes between those points doesn't silently regress
+        // visibility. dstAccess covers both transfer read of
+        // color_hist and transfer write of `output` (theoretical WAW
+        // against any future upstream shader write to output).
         StageBarrier(cb,
                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                      VK_PIPELINE_STAGE_TRANSFER_BIT,
