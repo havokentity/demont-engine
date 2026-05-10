@@ -967,6 +967,54 @@ body::after {
   opacity: 0.55;
 }
 
+/* ---------- Apply button (free-form text input + slider readout) ----------
+   Free-form cvar values commit on Enter or blur; both events are
+   fragile (focus stealing, browser quirks, mobile keyboards). The
+   Apply button is the third explicit commit path -- always works,
+   never depends on what the focus state happens to be. Styled to
+   match the v-input / v-slider widgets it sits next to. */
+.kv .v-input-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 160px;
+  max-width: 78%;
+}
+.kv .v-input-wrap .v-input {
+  flex: 1 1 auto;
+  background: transparent;
+  color: var(--text);
+  border: none;
+  border-bottom: 1px solid var(--border);
+  outline: none;
+  padding: 2px 4px;
+  font-family: inherit;
+  font-size: 12px;
+}
+.kv .v-input-wrap .v-input:hover { border-bottom-color: var(--accent-dim); }
+.kv .v-input-wrap .v-input:focus { border-bottom-color: var(--accent); }
+.kv .v-apply {
+  background: transparent;
+  color: var(--accent-dim);
+  border: 1px solid var(--border);
+  padding: 1px 8px;
+  font-family: inherit;
+  font-size: 10px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: color 80ms, border-color 80ms, background 80ms;
+}
+.kv .v-apply:hover {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+.kv .v-apply:active {
+  background: var(--accent);
+  color: var(--bg);
+}
+
 /* ---------- selection + scrollbars ---------- */
 ::selection { background: var(--accent); color: var(--bg); }
 
