@@ -78,6 +78,14 @@ namespace cvar {
             "3 = + frame-time sparkline. (Tier 4 reserved for per-pass GPU "
             "timestamps once VkQueryPool / MTLCounterSampleBuffer is wired.)",
             CVAR_ARCHIVE);
+    PT_CVAR(r_perf_overlay_scale, "1.0",
+            "Perf overlay scale (1.0 = baseline 13 logical-unit "
+            "CreateFontW height + 296px panel width + 44px sparkline "
+            "height; CreateFontW takes logical units, not points). "
+            "Effective range 0.5..3.0; values outside are clamped at "
+            "Paint() time. Win32 only -- the Mac overlay uses native "
+            "NSFont sizing and ignores this cvar.",
+            CVAR_ARCHIVE);
     PT_CVAR(r_perf_overlay_mode, "native",
             "Backend for the perf overlay. 'native' = OS-native child window "
             "(GDI on Win, NSPanel on Mac) -- has full text readout but can "
@@ -4064,6 +4072,33 @@ void Engine::RegisterCommands() {
             }
             if (overlay_) overlay_->ApplyTheme(cv.value);
             if (perf_overlay_) perf_overlay_->ApplyTheme(cv.value);
+        };
+    }
+    // con_font_scale: cvar IS the source of truth (the in-game Win32
+    // overlay reads the live cvar value inside its EnsureFontScale()
+    // poll, called from Paint()). But Paint() only fires on WM_PAINT,
+    // and a web-GUI cvar set doesn't trigger one -- so without this
+    // on_change wiring, the user types con_font_scale 1.5 in the web
+    // console, the cvar updates, but the in-game overlay stays at the
+    // old size until something else triggers a paint (typing, scroll,
+    // animation timer). Pinging Repaint here closes that gap: any
+    // cvar writer (web GUI, in-game console, autoexec.cfg, CLI args)
+    // gets the same instant-feedback behaviour. No copy-paste of
+    // values -- the overlay re-reads the cvar inside EnsureFontScale.
+    if (auto* v = C.FindCVar("con_font_scale")) {
+        v->on_change = [this](const pt::console::CVar&) {
+            if (overlay_) overlay_->Repaint();
+        };
+    }
+    // r_perf_overlay_scale: same web-GUI live-propagation pattern as
+    // con_font_scale above. Win32 PerfOverlay's EnsureScale() polls
+    // the cvar inside Paint(); without an on_change kick from the
+    // setter, web GUI changes go invisible until the per-frame Update
+    // tick lands a redraw. Pinging Repaint here forces the next
+    // Paint immediately.
+    if (auto* v = C.FindCVar("r_perf_overlay_scale")) {
+        v->on_change = [this](const pt::console::CVar&) {
+            if (perf_overlay_) perf_overlay_->Repaint();
         };
     }
     // dev_log_level: validate

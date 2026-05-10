@@ -1168,6 +1168,18 @@ void ConsoleOverlay::ApplyTheme(std::string_view name) {
     });
 }
 
+void ConsoleOverlay::Repaint() {
+    // Mac path: forward to the consoleView's setNeedsDisplay: (must
+    // run on the main thread per AppKit rules; cvar on_change runs on
+    // the engine thread / civetweb worker thread, so dispatch async
+    // to main). Win32 implementation is in ConsoleOverlay_Win32.cpp.
+    if (!opaque_) return;
+    PtConsolePanel* panel = (__bridge PtConsolePanel*)opaque_;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [panel.consoleView setNeedsDisplay:YES];
+    });
+}
+
 void ConsoleOverlay::NotifyParentResized(int /*width*/, int /*height*/) {
     if (!opaque_) return;
     PtConsolePanel* panel = (__bridge PtConsolePanel*)opaque_;

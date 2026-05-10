@@ -163,13 +163,16 @@ public:
     void  ApplyTheme(std::string_view name);
     void  NotifyParentResized(int w, int h);
     void  OnLog(pt::log::Level lvl, const std::string& body);
+    // Public: forwards from ConsoleOverlay::Repaint() (PR #10) so cvar
+    // on_change handlers can ping the overlay without copy-pasting
+    // values across the IPC boundary.
+    void  Repaint();
 
 private:
     static LRESULT CALLBACK WndProcThunk(HWND, UINT, WPARAM, LPARAM);
     static LRESULT CALLBACK ParentWndProcThunk(HWND, UINT, WPARAM, LPARAM);
     LRESULT WndProc(HWND, UINT, WPARAM, LPARAM);
     void Paint(HDC dc);
-    void Repaint();
     void SubmitInput();
     void HandleTab();
     void CycleGhost(int dir);
@@ -1479,6 +1482,7 @@ void ConsoleOverlay::Hide()                            { if (opaque_) static_cas
 void ConsoleOverlay::Toggle()                          { if (opaque_) static_cast<WinOverlay*>(opaque_)->Toggle(); }
 bool ConsoleOverlay::IsShown() const                   { return opaque_ && static_cast<WinOverlay*>(opaque_)->IsShown(); }
 void ConsoleOverlay::ApplyTheme(std::string_view n)    { if (opaque_) static_cast<WinOverlay*>(opaque_)->ApplyTheme(n); }
+void ConsoleOverlay::Repaint()                         { if (opaque_) static_cast<WinOverlay*>(opaque_)->Repaint(); }
 void ConsoleOverlay::NotifyParentResized(int w, int h) { if (opaque_) static_cast<WinOverlay*>(opaque_)->NotifyParentResized(w, h); }
 
 void ConsoleOverlay::OnLog(pt::log::Level lvl, const std::string& body) {

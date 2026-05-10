@@ -369,4 +369,14 @@ void PerfOverlay::ApplyTheme(std::string_view name) {
     [(__bridge PtPerfPanel*)opaque_ applyTheme:name];
 }
 
+void PerfOverlay::Repaint() {
+    // Mac: dispatch setNeedsDisplay: on the main thread (AppKit
+    // requirement). Win32 implementation lives in PerfOverlay_Win32.cpp.
+    if (!opaque_) return;
+    PtPerfPanel* panel = (__bridge PtPerfPanel*)opaque_;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [panel.contentView setNeedsDisplay:YES];
+    });
+}
+
 }  // namespace pt::app

@@ -42,6 +42,21 @@ public:
     // future appended lines also use the new palette.
     void ApplyTheme(std::string_view name);
 
+    // Force a repaint. Used by cvar on_change handlers (e.g.
+    // con_font_scale) so a value typed into the WEB GUI propagates
+    // immediately to the in-game overlay -- otherwise the overlay's
+    // own poll-on-Paint mechanism only fires when something else
+    // (typing, scrolling, animation timer) triggers a paint, and a
+    // web-side cvar change goes invisible until the user moves the
+    // mouse over the overlay or types something. Cvar IS the source
+    // of truth; this just kicks the consumer to re-read it.
+    //
+    // Thread-safe: Win32 InvalidateRect is documented thread-safe;
+    // Mac forwards to setNeedsDisplay: which is main-thread-required
+    // but cvar on_change runs on the engine thread anyway. No-op if
+    // the overlay is hidden.
+    void Repaint();
+
     // Called by Engine on the GLFW resize callback so the floating panel
     // tracks the renderer window.
     void NotifyParentResized(int width, int height);
