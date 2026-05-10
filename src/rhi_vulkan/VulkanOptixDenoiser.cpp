@@ -888,10 +888,32 @@ void VulkanOptixDenoiser::Encode(VkCommandBuffer cb,
                 const std::size_t bytes =
                     static_cast<std::size_t>(cached_w_) * cached_h_ *
                     static_cast<std::size_t>(internal_guide_pixel_size_);
-                cudaMemsetAsync(reinterpret_cast<void*>(internal_guide_a_),
-                                0, bytes, cuda_stream_);
-                cudaMemsetAsync(reinterpret_cast<void*>(internal_guide_b_),
-                                0, bytes, cuda_stream_);
+                // Surface cudaMemsetAsync failures with a clear LOG_WARN
+                // instead of swallowing the cudaError_t. A failure here
+                // would mean the next Invoke reads stale internal-guide-
+                // layer state from before the reset_history signal --
+                // visually a one-frame ghost from the pre-discontinuity
+                // scene leaking into the post-discontinuity frame. Don't
+                // bail out of the function (the rest of Encode is fine);
+                // just make the cause greppable.
+                cudaError_t e1 = cudaMemsetAsync(
+                    reinterpret_cast<void*>(internal_guide_a_),
+                    0, bytes, cuda_stream_);
+                cudaError_t e2 = cudaMemsetAsync(
+                    reinterpret_cast<void*>(internal_guide_b_),
+                    0, bytes, cuda_stream_);
+                if (e1 != cudaSuccess) {
+                    LOG_WARN("VulkanOptixDenoiser::Encode(reset_history): "
+                             "cudaMemsetAsync(internal_guide_a_) failed ({}); "
+                             "next-frame temporal reset may not fully clear",
+                             cudaGetErrorString(e1));
+                }
+                if (e2 != cudaSuccess) {
+                    LOG_WARN("VulkanOptixDenoiser::Encode(reset_history): "
+                             "cudaMemsetAsync(internal_guide_b_) failed ({}); "
+                             "next-frame temporal reset may not fully clear",
+                             cudaGetErrorString(e2));
+                }
             }
         }
     }
@@ -1230,6 +1252,20 @@ void VulkanOptixDenoiser::SubmitPostMain() {
     std::memset(&params, 0, sizeof(params));
     params.hdrIntensity = static_cast<CUdeviceptr>(intensity_buf_);
     params.blendFactor  = 0.0f;
+    if (KindIsTemporal(kind_)) {
+        // Critical: tell OptiX to actually CONSUME the temporal layers
+        // (layer.previousOutput + guide_layer.previousOutputInternalGuide
+        // Layer) we populated above. The default value (0) makes OptiX
+        // silently ignore those fields and run as if it were a single-
+        // frame denoise -- which presents as "TEMPORAL_AOV looks
+        // identical to AOV" because the per-frame behaviour is
+        // identical when the temporal blend is off. Set to 1 on every
+        // frame except the first / post-reset_history one, where we
+        // don't have valid prior layers yet (the previousOutput field
+        // intentionally points at layer.input on those frames as a
+        // self-blend, but OptiX needs the flag to take that path).
+        params.temporalModeUsePreviousLayers = first_temporal_frame_ ? 0 : 1;
+    }
 
     OptixDenoiserGuideLayer guide_layer{};
     std::memset(&guide_layer, 0, sizeof(guide_layer));
@@ -1321,14 +1357,12 @@ void VulkanOptixDenoiser::SubmitPostMain() {
     const ExternalBuffer* prev_output_buf = nullptr;
     ExternalBuffer*       this_output_buf = nullptr;
     if (KindIsTemporal(kind_)) {
-        const int prev_idx = (prev_output_write_idx_ + 1) % 2;
         prev_output_buf = (prev_output_write_idx_ == 0)
                               ? &buf_prev_output_b_  // last frame wrote to b
                               : &buf_prev_output_a_;
         this_output_buf = (prev_output_write_idx_ == 0)
                               ? &buf_prev_output_a_
                               : &buf_prev_output_b_;
-        (void)prev_idx;
     }
 
     OptixDenoiserLayer layer{};
@@ -1407,6 +1441,7 @@ void VulkanOptixDenoiser::SubmitPostMain() {
                   cudaGetErrorString(cerr));
         return;
     }
+
 
     // ---- Submit private output-copy cb with no waits ----
     VkCommandBuffer pcb = private_cb_out_[pending_pcb_slot_];
