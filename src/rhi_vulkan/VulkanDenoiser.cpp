@@ -765,4 +765,79 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
     frame_parity_ ^= 1u;
 }
 
+// ---- EncodeFinalizeOnly (standalone tonemap + sRGB compute pass) ---------
+//
+// Mirrors the finalize dispatch at the tail of Encode() above, but
+// works against caller-supplied views/buffers instead of pulling them
+// from the SVGF history textures. Used by the OptiX denoiser path so
+// it gets the same ACES + sRGB output as SVGF without duplicating the
+// pipeline, layout, descriptor pool, or kernel.
+//
+// Layout assumption: both images already in GENERAL. Caller barriers
+// before/after.
+void VulkanNrdDenoiser::EncodeFinalizeOnly(VkCommandBuffer cb,
+                                           VkImageView    color_in_view,
+                                           VkImageView    final_output_view,
+                                           VkBuffer       exposure_state_buf,
+                                           std::uint32_t  width,
+                                           std::uint32_t  height,
+                                           bool           hdr_pipeline) {
+    if (!ready_)                                  return;
+    if (cb == VK_NULL_HANDLE)                     return;
+    if (color_in_view     == VK_NULL_HANDLE)      return;
+    if (final_output_view == VK_NULL_HANDLE)      return;
+    if (exposure_state_buf == VK_NULL_HANDLE)     return;
+    if (width == 0 || height == 0)                return;
+
+    VkDescriptorSet fset = finalize_sets_[next_finalize_set_];
+    next_finalize_set_   = (next_finalize_set_ + 1) % kFinalizeSetRing;
+
+    VkDescriptorImageInfo  ii[2] {};
+    VkDescriptorBufferInfo bi    {};
+    VkWriteDescriptorSet   w[3]  {};
+
+    ii[0].imageView   = color_in_view;
+    ii[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    ii[1].imageView   = final_output_view;
+    ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    bi.buffer = exposure_state_buf;
+    bi.offset = 0;
+    bi.range  = VK_WHOLE_SIZE;
+
+    for (int i = 0; i < 3; ++i) {
+        w[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[i].dstSet          = fset;
+        w[i].dstBinding      = static_cast<std::uint32_t>(i);
+        w[i].descriptorCount = 1;
+    }
+    w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    w[0].pImageInfo     = &ii[0];
+    w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    w[1].pImageInfo     = &ii[1];
+    w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    w[2].pBufferInfo    = &bi;
+    vkUpdateDescriptorSets(device_->RawDevice(), 3, w, 0, nullptr);
+
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, finalize_pipe_);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            finalize_pipe_layout_, 0, 1, &fset, 0, nullptr);
+
+    struct FinalizePush {
+        std::uint32_t width;
+        std::uint32_t height;
+        std::uint32_t hdr_pipeline;  // 1 = ACES + sRGB; 0 = sRGB OETF only
+        std::uint32_t pad1;
+    } fp{};
+    fp.width        = width;
+    fp.height       = height;
+    fp.hdr_pipeline = hdr_pipeline ? 1u : 0u;
+    vkCmdPushConstants(cb, finalize_pipe_layout_,
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(fp), &fp);
+
+    const std::uint32_t gx = (width  + 7) / 8;
+    const std::uint32_t gy = (height + 7) / 8;
+    vkCmdDispatch(cb, gx, gy, 1);
+}
+
 }  // namespace pt::rhi::vk

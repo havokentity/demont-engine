@@ -121,6 +121,25 @@ public:
     VkImageView      CurrentSwapchainImageView() const;
 
 #if defined(PT_ENABLE_OPTIX)
+    // Run JUST the SVGF DenoiseFinalize compute pass (ACES + sRGB
+    // tonemap to swapchain), exposed for the OptiX denoiser path so
+    // it doesn't have to roll its own tonemap. Lazy-creates and
+    // initialises the SVGF VulkanNrdDenoiser (only the finalize
+    // pipeline is needed; the SVGF history textures stay
+    // unallocated until/unless the user actually picks svgf_*).
+    // No-op if PT_ENABLE_OPTIX is off; safe to call on any frame.
+    //
+    // Caller responsible for both image layouts being GENERAL before
+    // the call. See VulkanNrdDenoiser::EncodeFinalizeOnly for the
+    // detailed contract.
+    void EncodeDenoiseFinalize(VkCommandBuffer cb,
+                               VkImageView    color_in_view,
+                               VkImageView    final_output_view,
+                               VkBuffer       exposure_state_buf,
+                               std::uint32_t  width,
+                               std::uint32_t  height,
+                               bool           hdr_pipeline);
+
     // CUDA-Vulkan interop hook for VulkanOptixDenoiser.
     //
     // VulkanOptixDenoiser::Encode records the input copy into the

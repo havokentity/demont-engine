@@ -88,6 +88,26 @@ public:
     // True after Init() succeeded. Used by VulkanDevice::SupportsDenoise.
     bool Ready() const { return ready_; }
 
+    // Encode JUST the DenoiseFinalize compute dispatch (HDR -> ACES + sRGB
+    // -> swapchain) without running any of the SVGF passes that
+    // normally precede it. Exposed so the OptiX denoiser path can
+    // reuse this proven tonemap+sRGB stage instead of rolling its
+    // own. Caller is responsible for:
+    //   - Both images in VK_IMAGE_LAYOUT_GENERAL before the call
+    //   - Any pre-barrier on color_in (the dispatch is a shader read)
+    //   - Any post-barrier the next consumer needs
+    //
+    // Pipeline must be Ready() (call Init() first if not). Width and
+    // height drive the dispatch grid; hdr_pipeline picks ACES+sRGB
+    // (true) vs sRGB-OETF only (false; for paths that pre-tonemap).
+    void EncodeFinalizeOnly(VkCommandBuffer cb,
+                            VkImageView    color_in_view,
+                            VkImageView    final_output_view,
+                            VkBuffer       exposure_state_buf,
+                            std::uint32_t  width,
+                            std::uint32_t  height,
+                            bool           hdr_pipeline);
+
 private:
     void DestroyAll();
     bool BuildLayout();

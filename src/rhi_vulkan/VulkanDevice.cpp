@@ -2466,6 +2466,35 @@ void VulkanDevice::RequestExtraSubmitSignal(VkSemaphore sem,
     extra_submit_signal_sem_   = sem;
     extra_submit_signal_value_ = timeline_value;
 }
+
+void VulkanDevice::EncodeDenoiseFinalize(VkCommandBuffer cb,
+                                         VkImageView    color_in_view,
+                                         VkImageView    final_output_view,
+                                         VkBuffer       exposure_state_buf,
+                                         std::uint32_t  width,
+                                         std::uint32_t  height,
+                                         bool           hdr_pipeline) {
+    // Lazy: ensure the NRD denoiser exists + Init'd so finalize_pipe_
+    // is built. We only need the finalize pipeline (the temporal /
+    // atrous pipelines and history textures remain unbuilt /
+    // unallocated as long as Encode() isn't called -- ResizeTextures
+    // is gated on Encode(), not Init()).
+    if (denoiser_ == nullptr) {
+        denoiser_ = std::make_unique<VulkanNrdDenoiser>(this);
+    }
+    if (!denoiser_->Ready()) {
+        if (!denoiser_->Init()) {
+            LOG_ERROR("VulkanDevice::EncodeDenoiseFinalize: SVGF denoiser "
+                      "Init failed; OptiX path will skip tonemap (image will "
+                      "be over-bright on screen until a re-init succeeds)");
+            denoiser_.reset();
+            return;
+        }
+    }
+    denoiser_->EncodeFinalizeOnly(cb, color_in_view, final_output_view,
+                                  exposure_state_buf, width, height,
+                                  hdr_pipeline);
+}
 #endif
 
 void VulkanDevice::EndFrame(CommandBuffer*) {
