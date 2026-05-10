@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Rajesh D'Monte
 #include "HdrImage.h"
 
+#include "../core/Diag.h"
 #include "../core/Log.h"
 
 #include <algorithm>
@@ -150,8 +151,9 @@ HdrImage LoadRadianceHdr(const std::string& path, std::string* out_error) {
 
     std::fclose(f);
     if (out_error) out_error->clear();
-    LOG_INFO("HDR '{}' loaded: {}x{}, {} pixels", path, img.width, img.height,
-             img.width * img.height);
+    PT_DIAG_TIER1("renderer", "HDR '{}' loaded: {}x{}, {} pixels",
+                  path, img.width, img.height,
+                  img.width * img.height);
     return img;
 }
 

@@ -11,6 +11,7 @@
 #include "VulkanOptixDenoiser.h"
 #endif
 
+#include "../core/Diag.h"
 #include "../core/Log.h"
 #include "../core/Memory/MemTag.h"
 #include "../core/Memory/Memory.h"
@@ -987,8 +988,9 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
             if (!per_pipe.empty()) per_pipe += ", ";
             per_pipe += fmt::format("{} {:.0f}ms", p.name, p.ms);
         }
-        LOG_INFO("Vulkan: async pipeline build done in {:.0f}ms ({})",
-                 total_ms, per_pipe);
+        PT_DIAG_TIER2("rhi.vulkan",
+                      "async pipeline build done in {:.0f}ms ({})",
+                      total_ms, per_pipe);
     });
 
     if (!RecreateSwapchain()) return;
@@ -1176,10 +1178,13 @@ void VulkanDevice::LoadPipelineCache() {
             pipeline_cache_ = VK_NULL_HANDLE;
             LOG_WARN("Vulkan: pipeline cache create failed; pipelines will compile cold");
         } else if (!blob.empty()) {
-            LOG_INFO("Vulkan: pipeline cache rejected stale blob ({} bytes); rebuilding", blob.size());
+            PT_DIAG_TIER2("rhi.vulkan",
+                          "pipeline cache rejected stale blob ({} bytes); rebuilding",
+                          blob.size());
         }
     } else if (!blob.empty()) {
-        LOG_INFO("Vulkan: pipeline cache loaded ({} bytes)", blob.size());
+        PT_DIAG_TIER2("rhi.vulkan",
+                      "pipeline cache loaded ({} bytes)", blob.size());
     }
 }
 
