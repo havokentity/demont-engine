@@ -55,8 +55,13 @@ struct HandleTypes {
         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
     static constexpr cudaExternalMemoryHandleType           cuda_memory =
         cudaExternalMemoryHandleTypeOpaqueWin32;
+    // CUDA differentiates binary vs timeline semaphores at import time
+    // (Vulkan uses one VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_* for
+    // both). VulkanOptixDenoiser uses timeline VkSemaphores for the
+    // CUDA <-> Vulkan fence handshake, so the CUDA-side import must
+    // be the matching TimelineSemaphore* type. CUDA 11.2+.
     static constexpr cudaExternalSemaphoreHandleType        cuda_semaphore =
-        cudaExternalSemaphoreHandleTypeOpaqueWin32;
+        cudaExternalSemaphoreHandleTypeTimelineSemaphoreWin32;
 #elif defined(__linux__)
     static constexpr VkExternalMemoryHandleTypeFlagBits     vk_memory =
         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
@@ -64,8 +69,9 @@ struct HandleTypes {
         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
     static constexpr cudaExternalMemoryHandleType           cuda_memory =
         cudaExternalMemoryHandleTypeOpaqueFd;
+    // Same timeline-vs-binary distinction on Linux. CUDA 11.2+.
     static constexpr cudaExternalSemaphoreHandleType        cuda_semaphore =
-        cudaExternalSemaphoreHandleTypeOpaqueFd;
+        cudaExternalSemaphoreHandleTypeTimelineSemaphoreFd;
 #else
     #error "VulkanOptixDenoiser: only Windows and Linux are supported (macOS uses MetalFX)."
 #endif

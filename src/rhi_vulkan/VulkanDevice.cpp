@@ -652,6 +652,27 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     if (supports_null_descriptor) {
         dexts.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
     }
+#if defined(PT_ENABLE_OPTIX)
+    // CUDA-Vulkan interop for the OptiX denoiser. The base
+    // VK_KHR_external_memory / VK_KHR_external_semaphore are core 1.1
+    // (already implicitly available through VkPhysicalDeviceVulkan11/12),
+    // but the platform-specific export variants must still be requested
+    // explicitly -- they're what supplies vkGetMemoryWin32HandleKHR /
+    // vkGetSemaphoreWin32HandleKHR (or the _fd flavours on Linux),
+    // which VulkanOptixDenoiser uses to hand VkDeviceMemory and
+    // VkSemaphore handles to the CUDA runtime.
+    //
+    // All NVIDIA RTX-class GPUs / drivers expose these unconditionally,
+    // so we don't query support before enabling -- a missing extension
+    // would be a fundamental driver-bug situation we can't recover from.
+    #if defined(_WIN32)
+        dexts.push_back("VK_KHR_external_memory_win32");
+        dexts.push_back("VK_KHR_external_semaphore_win32");
+    #elif defined(__linux__)
+        dexts.push_back("VK_KHR_external_memory_fd");
+        dexts.push_back("VK_KHR_external_semaphore_fd");
+    #endif
+#endif  // PT_ENABLE_OPTIX
 
     // pNext feature chain. Hold each struct by value so the chain stays
     // valid for the duration of vkCreateDevice. Order in the chain
@@ -673,6 +694,17 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     v12.descriptorBindingUniformBufferUpdateAfterBind = supports_uab_uniform_buffer ? VK_TRUE : VK_FALSE;
     v12.descriptorBindingPartiallyBound               =
         (v12_supported.descriptorBindingPartiallyBound == VK_TRUE) ? VK_TRUE : VK_FALSE;
+#if defined(PT_ENABLE_OPTIX)
+    // Timeline semaphores: required by VulkanOptixDenoiser to fence
+    // CUDA <-> Vulkan work. Without enabling the feature, Vulkan
+    // creates a binary semaphore on vkCreateSemaphore (silently
+    // ignoring VK_SEMAPHORE_TYPE_TIMELINE), which then makes
+    // cudaImportExternalSemaphore reject the handle as 'invalid
+    // argument'. Core Vulkan 1.2 feature; universally supported on
+    // RTX-class GPUs, so no per-device support query.
+    v12.timelineSemaphore =
+        (v12_supported.timelineSemaphore == VK_TRUE) ? VK_TRUE : VK_FALSE;
+#endif
 
     VkPhysicalDeviceVulkan13Features v13{};
     v13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
@@ -985,6 +1017,15 @@ void VulkanDevice::DestroyDevice() {
         // raw VK objects via its own dtor; destroying it here does
         // both in the right order while device_ is still live.
         denoiser_.reset();
+#if defined(PT_ENABLE_OPTIX)
+        // Same rationale for the OptiX denoiser: it holds external
+        // VkImage / VkDeviceMemory / VkSemaphore handles whose dtor
+        // calls vkDestroy* against device_->RawDevice(). Reset before
+        // vkDestroyDevice() below so the VkDevice is still live when
+        // those teardowns run -- otherwise the validation layer
+        // (correctly) flags the underlying VK objects as leaked.
+        optix_denoiser_.reset();
+#endif
         for (auto v : swap_views_) if (v) vkDestroyImageView(device_, v, nullptr);
         swap_views_.clear();
         if (swapchain_ != VK_NULL_HANDLE) vkDestroySwapchainKHR(device_, swapchain_, nullptr);
