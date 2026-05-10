@@ -2,6 +2,7 @@
 # Copyright (c) 2026 Rajesh D'Monte
 add_library(pt_rhi_vulkan STATIC
     VulkanDevice.cpp
+    VulkanDenoiser.cpp
 )
 
 target_include_directories(pt_rhi_vulkan PUBLIC ${CMAKE_SOURCE_DIR}/src)
@@ -54,6 +55,19 @@ pt_compile_slang(
     STAGE compute ENTRY main TARGETS spirv)
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/PerfOverlay.slang
+    STAGE compute ENTRY main TARGETS spirv)
+# SVGF/NRD denoiser kernels. Each is its own SPIR-V blob; the Vulkan
+# backend's VulkanNrdDenoiser builds a dedicated VkPipelineLayout +
+# 2 VkPipeline handles from these and dispatches them in sequence.
+# Metal builds skip these -- the Mac path uses MetalFX instead.
+pt_compile_slang(
+    TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/DenoiseTemporal.slang
+    STAGE compute ENTRY main TARGETS spirv)
+pt_compile_slang(
+    TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/DenoiseAtrous.slang
+    STAGE compute ENTRY main TARGETS spirv)
+pt_compile_slang(
+    TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/DenoiseFinalize.slang
     STAGE compute ENTRY main TARGETS spirv)
 
 pt_set_compiler_options(pt_rhi_vulkan)

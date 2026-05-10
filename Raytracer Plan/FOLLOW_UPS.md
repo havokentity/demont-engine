@@ -203,33 +203,96 @@ for reference (and as a template for the Vulkan denoiser).
 
 ---
 
-## Vulkan denoiser (5090 path) — `r_denoiser nrd | svgf`
+## Vulkan denoiser (5090 path) — `r_denoiser svgf_basic | svgf_atrous | nrd`
 
-**Status:** P10 wires MetalFX for the Mac-only Metal backend. Vulkan
-backend has no denoiser yet, so on a 5090 the path tracer runs at 1 spp
-and looks noisy until accumulation converges.
+**Status (in-house SVGF):** Landed with two quality tiers plus the
+forward-compat `nrd` alias.
 
-**Why deferred:** MetalFX is Apple-only (`MetalFX.framework`). Implementing
-denoising on Vulkan is a separate code path; the user is on M4 today,
-Windows/5090 is a P12 milestone.
+- `svgf_basic` — temporal accumulation only, no spatial filter. The
+  temporal pass writes the next frame's history texture; the result
+  is `vkCmdCopyImage`'d into `post_denoise_hdr` for the bloom +
+  tonemap chain. ~1.5 ms at 1080p on a 5090. Best for fast camera
+  motion (no a-trous lag), slightly noisier on disocclusions.
+- `svgf_atrous` — `svgf_basic` plus 3 a-trous wavelet passes at step
+  sizes 1/2/4 with depth + normal + luminance edge stops. The last
+  pass writes directly into `post_denoise_hdr`. ~5 ms; cleaner on
+  disocclusions, mild softening of micro-detail.
+- `nrd` — currently aliases `svgf_atrous`; reserved for the proper
+  NVIDIA library swap (see below). One-time log on transition so the
+  user knows they're on the SVGF placeholder.
 
-**Plan when picked up:**
-- Pick a backend lib:
-  - **NRD** (NVIDIA RealTime Denoiser) — BSD-licensed since 2024, ships
-    with Vulkan bindings, works on AMD/Intel too. Recommended.
-  - **SVGF / A-trous** — write our own compute shader (~150 LOC). More
-    educational, fully portable.
-  - **DLSS Ray Reconstruction** — highest quality, NVIDIA-only, needs
-    a 5090-specific shim.
-- The G-buffer the shader emits in P10 (color, depth, motion, normals)
-  is reusable as-is; only the post-pass library differs.
-- Add `nrd` / `svgf` as values to the existing `r_denoiser` cvar in
-  `Engine.cpp`.
-- Wire the denoise dispatch from `VulkanDevice::Denoise(...)` (mirror
-  the Metal-side API).
+The path tracer writes a fourth G-buffer (world-space normal at
+primary hit, RGBA16F, `vk::binding(16)`, gated by `PT_TARGET_SPIRV`
+so the Metal/MetalFX path is unaffected) when any svgf*/nrd value
+is selected.
 
-**Acceptance:** Same as P10's Metal acceptance — 1 spp + denoiser at
-&gt;30 FPS at 1080p, no major ghosting, edges preserved.
+**Open work — proper NRD library integration:**
+
+NVIDIA's
+[RayTracingDenoiser](https://github.com/NVIDIAGameWorks/RayTracingDenoiser)
+(BSD since 2024) gives substantially better quality than our SVGF-lite:
+REBLUR (recurrent blur with variance-aware step size selection),
+RELAX (specifically tuned for ReSTIR), SIGMA (shadow-only).
+Integration is multi-day work because:
+
+- NRD's API hands you back ~60 internal `nrd::TextureDesc` slots and
+  ~40 `nrd::PipelineDesc` shader stages per frame. The user is
+  responsible for translating those to `VkImage` / `VkPipeline` /
+  `VkDescriptorSet`, recording the dispatches in a user-supplied
+  command buffer, and tracking pipeline-layout-vs-shader-resource
+  identity.
+- NRD wants normal+roughness packed together in NRD's own format
+  (`NRD_FrontEnd_PackNormalAndRoughness`). The path tracer would need
+  to emit one extra texture in NRD's encoded layout.
+- viewZ format needs to be NRD's specific encoding (linear in clip,
+  not in world units like our current depth_tex).
+- Hit-distance buffer is a separate input -- requires the path tracer
+  to write `path.t * lin_brdf_pdf_weight` into a new G-buffer.
+
+When picked up, the work splits cleanly into:
+1. **Vendor NRD via FetchContent** with `PT_ENABLE_NRD=OFF` default
+   so the dependency is opt-in. NRD ships its CMake with embedded
+   shader resources.
+2. **G-buffer extension**: pack normal+roughness, switch depth to
+   NRD's viewZ, add hit-distance.
+3. **VulkanNrdDenoiser swap**: replace the SVGF dispatch chain with
+   a real NRD `Denoise()` call inside the same class. The engine
+   side stays unchanged because the cvar value is already `nrd`.
+4. **Acceptance**: visibly better quality vs SVGF-lite on disocclusions
+   and complex BRDFs (gold metal, dielectrics with caustics).
+
+**Future option — DLSS Ray Reconstruction:** highest quality,
+NVIDIA-only, needs a 5090-specific shim. Defer further; SVGF + the
+eventual NRD path cover the bulk of cross-vendor users.
+
+**Acceptance for the in-house path (already met):** clean 1-spp at
+&gt;30 FPS at 1080p, no validation errors, edges preserved on the
+default scene with both procedural and HDRI sky. Both `svgf_basic`
+and `svgf_atrous` boot cleanly on RTX 5090 with no VK validation
+messages.
+
+**Quality follow-ups (all small):**
+
+- *Eager denoiser pipeline build in the worker thread.* Today
+  `VulkanNrdDenoiser::Init()` runs synchronously on the first
+  `Denoise()` call -- a few-ms hitch on the first frame after
+  toggling `r_denoiser` from `off` to a Vulkan kind. Moving the
+  build into the existing async pipeline-build worker (alongside
+  `pathtrace`/`autoexpose`/`perfoverlay`) eliminates the hitch
+  cleanly; the denoiser's resource_mutex usage is already worker-
+  safe.
+
+**Future cross-platform option — SVGF on Metal:** the same two
+shaders (`DenoiseTemporal.slang` / `DenoiseAtrous.slang`) compile to
+MSL with no source changes (no SPIR-V-only intrinsics in the bodies).
+Adding Metal support would mean: emit them as MSL targets in the
+`pt_rhi_metal` CMakeLists, drop the `PT_TARGET_SPIRV` gate around
+`PathTrace.slang`'s `normal_tex` declaration, allocate the normal
+G-buffer for the Metal path too, and wire `MetalDevice::Denoise` to
+dispatch the SVGF kernels as an alternative to MetalFX (perhaps
+exposed as `r_denoiser svgf_basic` / `svgf_atrous` on Mac instead
+of routing those values to off). That'd give Mac users a
+G-buffer-aware option alongside MetalFX's black-box approach.
 
 ---
 

@@ -13,8 +13,8 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
 endif()
 
 project(demont
-    VERSION 0.3.0
-    DESCRIPTION "DeMonT Engine -- non-rasterized real-time game engine. Path-traced every pixel, mesh CSG via Manifold. Metal + MetalFX denoiser on Apple Silicon, Vulkan + RT extensions on NVIDIA RTX."
+    VERSION 0.3.1
+    DESCRIPTION "DeMonT Engine -- non-rasterized real-time game engine. Path-traced every pixel, mesh CSG via Manifold. Metal + MetalFX denoiser on Apple Silicon, Vulkan + SVGF compute denoiser on NVIDIA RTX."
     LANGUAGES C CXX
 )
 

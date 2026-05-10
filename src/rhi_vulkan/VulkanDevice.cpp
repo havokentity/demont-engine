@@ -6,6 +6,7 @@
 // shader, and per-frame UBO ring for the spilled push-constant tail.
 
 #include "VulkanDevice.h"
+#include "VulkanDenoiser.h"
 
 #include "../core/Log.h"
 #include "../core/Memory/MemTag.h"
@@ -48,14 +49,17 @@ constexpr bool kEnableValidation = false;
 #endif
 
 // Engine slot -> shader vk::binding translation. The unified descriptor
-// set has 16 bindings (0-15): storage_image x8 (output / accum_hdr /
-// denoise_color / depth / motion / env_map / star_map / moon_map),
-// AS x1 (scene_tlas), storage_buffer x6 (mesh / cdf / exposure_state),
-// uniform_buffer x1 (Frame UBO at binding 14). Tonemap / Bloom* re-use
-// a subset. Engine.cpp uses 8-element textures, 8-element buffers, and
-// 4-element accel-struct slot arrays as if Metal-style argument tables;
-// we flatten these into the single Vulkan descriptor set here.
-constexpr std::uint32_t kSlotToTexBinding[8] = {
+// set has 17 bindings (0-16): storage_image x9 (output / accum_hdr /
+// denoise_color / depth / motion / env_map / star_map / moon_map /
+// normal_tex), AS x1 (scene_tlas), storage_buffer x6 (mesh / cdf /
+// exposure_state), uniform_buffer x1 (Frame UBO at binding 14).
+// Tonemap / Bloom* re-use a subset. Engine.cpp uses up-to-9-element
+// textures, 8-element buffers, and 4-element accel-struct slot arrays
+// as if Metal-style argument tables; we flatten these into the single
+// Vulkan descriptor set here. Engine slot 8 (normal_tex / vk::binding 16)
+// is Vulkan-only -- only the SVGF/NRD denoiser path tracer writes it.
+static constexpr std::uint32_t kNumTexSlots = 9;
+constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     0,  // engine slot 0 -> shader binding 0  (output / swapchain)
     1,  // engine slot 1 -> shader binding 1  (accum_hdr)
     6,  // engine slot 2 -> shader binding 6  (denoise_color)
@@ -64,6 +68,7 @@ constexpr std::uint32_t kSlotToTexBinding[8] = {
     9,  // engine slot 5 -> shader binding 9  (env_map)
     12, // engine slot 6 -> shader binding 12 (star_map)
     13, // engine slot 7 -> shader binding 13 (moon_map)
+    16, // engine slot 8 -> shader binding 16 (normal_tex, SVGF/NRD only)
 };
 constexpr std::uint32_t kSlotToBufBinding[8] = {
     0,  // engine slot 0 unused
@@ -223,13 +228,13 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     VkDevice raw_dev = device_->RawDevice();
     auto dset = device_->CurrentDescriptorSet();
 
-    // Build the full descriptor write list. We touch all 16 bindings on
+    // Build the full descriptor write list. We touch all 17 bindings on
     // every dispatch -- nullDescriptor (VK_EXT_robustness2), required at
     // device-create time for this path, means slots the engine didn't
     // bind get VK_NULL_HANDLE silently. The cost of re-writing every
-    // binding each dispatch is small (16 small structs)
+    // binding each dispatch is small (17 small structs)
     // and avoids per-pipeline layout management.
-    constexpr std::uint32_t kMaxWrites = 16;
+    constexpr std::uint32_t kMaxWrites = 17;
     std::array<VkDescriptorImageInfo,  kMaxWrites> img_infos {};
     std::array<VkDescriptorBufferInfo, kMaxWrites> buf_infos {};
     std::array<VkWriteDescriptorSetAccelerationStructureKHR, 1> as_infos {};
@@ -298,8 +303,12 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
         ++wc;
     };
 
-    // ---- Storage images at bindings 0,1,6,7,8,9,12,13 -----------------
-    for (std::uint32_t s = 0; s < std::size(bound_tex_); ++s) {
+    // ---- Storage images at bindings 0,1,6,7,8,9,12,13,16 --------------
+    // Iterate exactly kNumTexSlots even though bound_tex_ has spares;
+    // those spares aren't in kSlotToTexBinding so we can't translate
+    // them, and the unused vk::binding slots in the layout would still
+    // be written nullDescriptor by the AS / buffer / UBO loops below.
+    for (std::uint32_t s = 0; s < kNumTexSlots; ++s) {
         VkImageView v = device_->LookupImageView(bound_tex_[s]);
         add_image(kSlotToTexBinding[s], v);
     }
@@ -757,10 +766,10 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
 
     // ---- Descriptor pool ---------------------------------------------
     // Sizing matches the expanded layout below:
-    //   8 storage_image  + 1 accel_struct + 6 storage_buffer + 1 ubo
+    //   9 storage_image  + 1 accel_struct + 6 storage_buffer + 1 ubo
     //   per set, x kFramesInFlight sets, with headroom.
     std::array<VkDescriptorPoolSize, 4> psizes{};
-    psizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kFramesInFlight * 8 + 4 };
+    psizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kFramesInFlight * 9 + 4 };
     psizes[1] = { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, kFramesInFlight * 1 + 1 };
     psizes[2] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kFramesInFlight * 6 + 4 };
     psizes[3] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,          kFramesInFlight * 1 + 1 };
@@ -773,9 +782,9 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
                        | VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
     vkCreateDescriptorPool(device_, &dpci, nullptr, &dpool_);
 
-    // ---- Build the unified 16-binding descriptor set layout ----------
+    // ---- Build the unified 17-binding descriptor set layout ----------
     {
-        std::array<VkDescriptorSetLayoutBinding, 16> b{};
+        std::array<VkDescriptorSetLayoutBinding, 17> b{};
         auto fill = [&](std::uint32_t idx, std::uint32_t binding,
                         VkDescriptorType type) {
             b[idx].binding         = binding;
@@ -807,11 +816,13 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         fill(14, kFrameUboBinding, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
         // binding 15: exposure_state (GPU-driven auto-exposure scalar)
         fill(15, 15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        // binding 16: normal_tex (path tracer G-buffer for SVGF/NRD)
+        fill(16, 16, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
 
         // UPDATE_AFTER_BIND for every binding so we can rewrite the
         // shared descriptor set between dispatches in the same cmd
         // buffer without invalidating earlier recorded draws.
-        std::array<VkDescriptorBindingFlags, 16> bind_flags{};
+        std::array<VkDescriptorBindingFlags, 17> bind_flags{};
         for (auto& f : bind_flags) f = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
         VkDescriptorSetLayoutBindingFlagsCreateInfo bfci{};
         bfci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
@@ -965,6 +976,12 @@ void VulkanDevice::DestroyDevice() {
     }
     if (device_ != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(device_);
+        // Tear down the denoiser before any of its dependencies
+        // (VkPipeline / VkDescriptorPool / VkImageView). The denoiser
+        // owns a few textures via device_->DestroyTexture and a few
+        // raw VK objects via its own dtor; destroying it here does
+        // both in the right order while device_ is still live.
+        denoiser_.reset();
         for (auto v : swap_views_) if (v) vkDestroyImageView(device_, v, nullptr);
         swap_views_.clear();
         if (swapchain_ != VK_NULL_HANDLE) vkDestroySwapchainKHR(device_, swapchain_, nullptr);
@@ -1517,7 +1534,16 @@ TextureHandle VulkanDevice::CreateTexture(const TextureDesc& d) {
     ici.arrayLayers  = 1;
     ici.samples      = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling       = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage        = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    // STORAGE_BIT  : sampling + writes from compute shaders (the
+    //                main path for every texture we create here).
+    // TRANSFER_DST : WriteTexture host upload + ReadbackTexture's
+    //                transient staging fill.
+    // TRANSFER_SRC : the SVGF basic-mode vkCmdCopyImage out of the
+    //                history texture into post_denoise_hdr; also
+    //                lets ReadbackTexture work on any storage image.
+    ici.usage        = VK_IMAGE_USAGE_STORAGE_BIT
+                     | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                     | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     ici.sharingMode  = VK_SHARING_MODE_EXCLUSIVE;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImage img = VK_NULL_HANDLE;
@@ -2340,6 +2366,86 @@ void VulkanDevice::Resize(int /*w*/, int /*h*/) {
 
 std::size_t VulkanDevice::CurrentAllocatedBytes() const {
     return 0;
+}
+
+// ---- SVGF/NRD denoiser --------------------------------------------------
+
+bool VulkanDevice::SupportsDenoise() const {
+    // Two-stage readiness:
+    //   1) `denoiser_->Ready()` is true once the denoiser has been
+    //      lazily initialised by the first Denoise() call (which builds
+    //      its 3 compute pipelines, descriptor pool, and dummy textures
+    //      synchronously -- a one-time few-ms hitch on first transition
+    //      from r_denoiser=off to a Vulkan kind).
+    //   2) Before that first init, fall back to `pipelines_ready_`,
+    //      which the engine's main async pipeline-build worker flips
+    //      true after pathtrace/autoexpose/perfoverlay finish. This is
+    //      a soft signal -- it means "the device has finished its
+    //      heavy-lift cold-cache work, opting in is safe" -- not "the
+    //      denoiser itself is ready". The hitch on opt-in is acceptable
+    //      because it's a one-shot user-driven cvar transition.
+    // Eagerly building the denoiser in the worker would eliminate the
+    // hitch (see the FOLLOW_UPS.md note); deferred since the hitch is
+    // small and only happens once per session.
+    if (denoiser_ != nullptr && denoiser_->Ready()) return true;
+    return pipelines_ready_.load(std::memory_order_acquire);
+}
+
+void VulkanDevice::Denoise(const DenoiseDesc& d) {
+    if (device_ == VK_NULL_HANDLE) return;
+    if (wrapped_cb_ == nullptr || wrapped_cb_->Raw() == VK_NULL_HANDLE) {
+        // Engine called Denoise without first AcquireCommandBuffer
+        // (loading frame, or path tracer skipped) -- silently no-op.
+        return;
+    }
+    // Need at least the noisy color, depth, motion, normal, and a
+    // valid output target. The engine's allocation gate guarantees
+    // these on a denoiser-active frame; if any are missing it's a
+    // logic bug, so log + skip rather than dispatch with garbage.
+    if (d.color_in.id == 0 || d.depth_in.id == 0 || d.motion_in.id == 0 ||
+        d.normal_in.id == 0 || d.output.id == 0) {
+        LOG_WARN("VulkanDevice::Denoise: missing G-buffer inputs (color={} depth={} motion={} normal={} out={})",
+                 d.color_in.id, d.depth_in.id, d.motion_in.id, d.normal_in.id, d.output.id);
+        return;
+    }
+
+    // Lazy denoiser init. Safe to call every frame -- Init() is a
+    // no-op once ready_.
+    if (denoiser_ == nullptr) {
+        denoiser_ = std::make_unique<VulkanNrdDenoiser>(this);
+    }
+    if (!denoiser_->Ready()) {
+        if (!denoiser_->Init()) {
+            LOG_ERROR("VulkanDevice::Denoise: denoiser init failed; disabling");
+            denoiser_.reset();
+            return;
+        }
+    }
+
+    // Resolve the G-buffer dimensions from the noisy color texture
+    // so scratch textures track resize + backend toggles automatically.
+    auto image_it = images_.find(d.color_in.id);
+    if (image_it == images_.end()) {
+        LOG_WARN("VulkanDevice::Denoise: color_in image lookup miss");
+        return;
+    }
+    const std::uint32_t w = image_it->second.extent.width;
+    const std::uint32_t h = image_it->second.extent.height;
+    if (w == 0 || h == 0) return;
+    if (!denoiser_->ResizeTextures(w, h)) {
+        LOG_ERROR("VulkanDevice::Denoise: ResizeTextures({}x{}) failed", w, h);
+        return;
+    }
+
+    const bool atrous_enabled =
+        (d.quality == DenoiseDesc::Quality::Atrous);
+    denoiser_->Encode(wrapped_cb_->Raw(),
+                      d.color_in, d.depth_in, d.motion_in,
+                      d.normal_in, d.output,
+                      d.final_output, d.exposure_state,
+                      d.reset_history,
+                      atrous_enabled,
+                      d.hdr_pipeline);
 }
 
 }  // namespace pt::rhi::vk

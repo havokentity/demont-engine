@@ -106,10 +106,55 @@ public:
         TextureHandle color_in;       // RGBA16F linear (per-frame, not accumulated)
         TextureHandle depth_in;       // R32F clip-space depth (z/w in [0,1])
         TextureHandle motion_in;      // RG16F pixel-space (prev - curr)
-        TextureHandle output;         // typically the swapchain image
+        // World-space surface normals at primary hit (RGBA16F, .xyz =
+        // unit normal, .w unused). Required by the Vulkan SVGF/NRD
+        // denoiser for edge-aware spatial filtering; MetalFX ignores it
+        // (handle may be 0 on Metal). Engine writes it from the path
+        // tracer's primary-ray pass when denoiser_enabled.
+        TextureHandle normal_in;
+        // Linear-HDR target the denoiser writes to. On Mac/MetalFX this
+        // is the post_denoise_hdr intermediate that the Tonemap pipeline
+        // reads. On Vulkan with SVGF/NRD it's the same intermediate, but
+        // the denoiser also runs its own DenoiseFinalize pass that
+        // reads from `output` and writes the tonemapped LDR result into
+        // `final_output` (typically the swapchain).
+        TextureHandle output;
+        // Vulkan SVGF/NRD only: tonemapped-LDR target the denoiser's
+        // finalize pass writes (typically the swapchain image). Ignored
+        // by MetalFX -- the engine's separate Tonemap dispatch reads
+        // `output` and writes the swapchain there. May be 0 on Metal.
+        TextureHandle final_output;
+        // Vulkan SVGF/NRD only: GPU-side exposure scalar buffer
+        // (AutoExposure.slang updates it / engine seeds it). The
+        // finalize pass reads exposure_state[0] to apply the same
+        // exposure the path tracer's inline tonemap would have used.
+        // MetalFX ignores it.
+        BufferHandle  exposure_state;
+        // Vulkan SVGF/NRD only: r_hdr_pipeline value (1 = path tracer
+        // wrote raw linear HDR into color_in, denoiser finalize applies
+        // ACES + sRGB; 0 = path tracer already tonemapped into color_in,
+        // finalize applies sRGB OETF only). MetalFX ignores it -- the
+        // existing Tonemap.slang pipeline keys on the same flag via its
+        // own push.
+        bool hdr_pipeline = true;
         float jitter_x       = 0.0f;
         float jitter_y       = 0.0f;
         bool  reset_history  = false; // true on backend switch / scene reset
+        // SVGF/NRD-only: which spatial-filter quality tier to apply
+        // after the temporal accumulation pass.
+        //   Basic  = temporal only, then a one-shot vkCmdCopyImage to
+        //            the output texture. ~1.5 ms at 1080p on a 5090.
+        //            Cleaner under fast motion (no atrous lag), slightly
+        //            noisier on disocclusions / undersampled regions.
+        //   Atrous = temporal pass + 3 a-trous wavelet passes at step
+        //            sizes 1/2/4 with depth+normal+luminance edge stops.
+        //            ~5 ms; cleaner on disocclusions, mild softening of
+        //            micro-detail.
+        // MetalFX path ignores this. Defaults to Atrous so existing
+        // callers (and the `r_denoiser svgf` alias) keep their previous
+        // behaviour.
+        enum class Quality : std::uint8_t { Basic, Atrous };
+        Quality quality = Quality::Atrous;
         // Required by MetalFX TemporalDenoisedScaler. Column-major 4x4
         // (16 floats each). Pass nullptr only if the backend doesn't need
         // them (currently: nothing -- both Metal and any future Vulkan

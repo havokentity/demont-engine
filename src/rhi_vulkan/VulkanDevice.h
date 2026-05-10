@@ -16,6 +16,8 @@
 #include <unordered_map>
 #include <vector>
 
+namespace pt::rhi::vk { class VulkanNrdDenoiser; }
+
 struct GLFWwindow;
 
 namespace pt::rhi::vk {
@@ -43,7 +45,11 @@ private:
     VulkanDevice*  device_ = nullptr;
     VkCommandBuffer cb_     = VK_NULL_HANDLE;
     PipelineHandle bound_pipeline_{0};
-    TextureHandle  bound_tex_[8] {};
+    // 12 texture slots gives engine slot 8 (normal_tex for the SVGF/NRD
+    // denoiser, mapped to vk::binding 16) plus 3 spare. Metal stays at
+    // 8 because MetalFX doesn't take a normal input and the path-tracer
+    // shader gates the normal write on PT_TARGET_SPIRV.
+    TextureHandle  bound_tex_[12] {};
     BufferHandle   bound_buf_[8] {};
     std::size_t    bound_buf_off_[8] {};
     AccelStructHandle bound_accel_[4] {};
@@ -90,6 +96,17 @@ public:
     bool         SupportsHardwareRT() const override { return rt_supported_; }
     const char*  DeviceName()       const override { return device_name_.c_str(); }
     std::size_t  CurrentAllocatedBytes() const override;
+
+    // SVGF/NRD denoiser. The denoiser pipelines + scratch textures are
+    // NOT built by the async worker -- they're constructed lazily on
+    // the first Denoise() call (a few ms one-time hitch on the first
+    // frame after r_denoiser is toggled to a Vulkan kind). Until then,
+    // SupportsDenoise gates on the main async pipeline build (so the
+    // engine doesn't flag denoiser as available before the path-tracer
+    // pipeline is even ready). After lazy init, the cached `ready_`
+    // flag short-circuits this check.
+    bool SupportsDenoise() const override;
+    void Denoise(const DenoiseDesc& d) override;
 
     // Internal accessors used by the command buffer.
     VkDevice         RawDevice()     const { return device_; }
@@ -235,6 +252,13 @@ private:
     // LookupPipeline + CreateComputePipeline-by-name also take.
     std::thread           pipeline_build_thread_;
     std::atomic<bool>     pipelines_ready_{false};
+
+    // SVGF/NRD denoiser. Pointer rather than embedded so the heavy
+    // VulkanDenoiser.h doesn't bleed into every translation unit that
+    // pulls in this header. Allocated lazily by Denoise() the first
+    // time it's called with a non-zero output texture; freed in
+    // DestroyDevice() before any VkPipeline / VkDescriptorPool teardown.
+    std::unique_ptr<VulkanNrdDenoiser> denoiser_;
 
     VkDescriptorPool dpool_ = VK_NULL_HANDLE;
     VkDescriptorSet  dsets_[kFramesInFlight] {};
