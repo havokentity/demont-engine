@@ -110,14 +110,38 @@ public:
     //                 allocates them only when r_denoiser is
     //                 optix_hdr_aov. Cvar value: r_denoiser optix_hdr_aov.
     //
-    //   TemporalHdr     [Phase 1b] Temporal HDR model.
-    //   TemporalHdrAov  [Phase 1b] Temporal HDR + AOV.
+    //   TemporalHdr     HDR model + motion-vector flow guide +
+    //                   1-frame denoised-output history (OPTIX_DENOISER_
+    //                   MODEL_KIND_TEMPORAL). The history is ping-ponged
+    //                   on the CUDA side via two RGBA16F external buffers;
+    //                   no extra Vulkan-side storage. Closes the
+    //                   per-frame flicker gap vs SVGF on static scenes
+    //                   while keeping no-ghosting motion behaviour.
+    //                   Cvar value: r_denoiser optix_temporal_hdr.
+    //
+    //   TemporalHdrAov  TemporalHdr + albedo + normal guide layers
+    //                   (OPTIX_DENOISER_MODEL_KIND_TEMPORAL_AOV). The
+    //                   strongest OptiX variant -- temporal smoothing
+    //                   AND AOV edge fidelity. Reuses the same albedo +
+    //                   normal G-buffers HdrAov uses, plus the motion
+    //                   buffer + history that TemporalHdr uses.
+    //                   Cvar value: r_denoiser optix_temporal_hdr_aov.
     enum class Kind : std::uint8_t {
         Hdr,
         HdrAov,
-        // TemporalHdr,    // Phase 1b
-        // TemporalHdrAov, // Phase 1b
+        TemporalHdr,
+        TemporalHdrAov,
     };
+
+    // Convenience predicates (public so the dispatcher can ask without
+    // poking at kind_ directly). Also used internally to gate buffer
+    // allocation + Encode + Invoke setup.
+    static constexpr bool KindIsTemporal(Kind k) {
+        return k == Kind::TemporalHdr || k == Kind::TemporalHdrAov;
+    }
+    static constexpr bool KindIsAov(Kind k) {
+        return k == Kind::HdrAov || k == Kind::TemporalHdrAov;
+    }
 
     explicit VulkanOptixDenoiser(VulkanDevice* device, Kind kind);
     ~VulkanOptixDenoiser();
@@ -201,6 +225,17 @@ private:
     std::uint64_t      state_buf_      = 0;
     std::uint64_t      scratch_buf_    = 0;
     std::uint64_t      intensity_buf_  = 0;     // single-float HDR intensity scratch
+    // OptiX 9.x TEMPORAL / TEMPORAL_AOV models require a per-frame
+    // "internal guide layer" -- an OptiX-managed device buffer holding
+    // implementation-defined temporal state. Two ping-pong buffers
+    // (this-frame writes into one, next-frame reads it as the previous
+    // frame's value). Per-pixel byte size comes from
+    // OptixDenoiserSizes::internalGuideLayerPixelSizeInBytes; total
+    // bytes = w * h * pixel_size. Pure CUDA-side -- no Vulkan import.
+    // Set to 0 / nullptr on non-temporal kinds.
+    std::uint64_t      internal_guide_pixel_size_ = 0;
+    std::uint64_t      internal_guide_a_          = 0;
+    std::uint64_t      internal_guide_b_          = 0;
 
     // Cached frame dimensions. ResizeXxx is a no-op when these match
     // the requested w/h.
@@ -241,11 +276,41 @@ private:
     // OptixDenoiserGuideLayer::albedo / .normal in SubmitPostMain.
     ExternalBuffer buf_albedo_;
     ExternalBuffer buf_normal_;
-    // Pixel layout matching what we copy: RGBA16F = 8 bytes per
-    // pixel, tightly packed, row stride = width * 8. Albedo and normal
-    // share this same layout (OptiX accepts HALF4 for guide layers
-    // and ignores the alpha channel).
+    // OptiX TEMPORAL-only inputs. Allocated by ResizeExternalBuffers
+    // when KindIsTemporal(kind_) is true; left empty for non-temporal
+    // kinds.
+    //   buf_motion_       : RG16F (4 bytes/pixel) -- the engine's
+    //                       motion_tex G-buffer copied here each frame
+    //                       and bound as OptixDenoiserGuideLayer::flow.
+    //   buf_prev_output_a / _b : two RGBA16F history buffers for the
+    //                       denoiser's `previousOutput` ping-pong.
+    //                       Each frame, prev = buf_prev_output_[(idx+1)%2]
+    //                       (last frame's denoised output) and
+    //                       this-frame's output is written to
+    //                       buf_prev_output_[idx]; idx then flips so
+    //                       the buffer we just wrote becomes "previous"
+    //                       on the next frame. Vulkan-side back-copy to
+    //                       d.output reads the just-written one.
+    ExternalBuffer buf_motion_;
+    ExternalBuffer buf_prev_output_a_;
+    ExternalBuffer buf_prev_output_b_;
+    // 0 or 1 -- the index that *this frame* will write to. Toggles
+    // after each Invoke; the OTHER index is what we feed as
+    // layer.previousOutput. Reset to 0 on init / kind transition;
+    // also reset when the engine signals reset_history (camera
+    // teleport, scene change).
+    int  prev_output_write_idx_ = 0;
+    bool first_temporal_frame_  = true;
+
+    // Pixel layout for the RGBA16F-format buffers (color_in, output,
+    // albedo, normal, prev_output_*): 8 bytes per pixel, tightly
+    // packed, row stride = width * 8. OptiX accepts HALF4 for guide
+    // layers and ignores the alpha channel.
     static constexpr std::uint32_t kBytesPerPixel = 8;
+    // Pixel layout for the RG16F motion buffer: 4 bytes per pixel.
+    // OptiX expects pixel-space flow vectors (HALF2), which is what
+    // PathTrace.slang already writes to motion_tex.
+    static constexpr std::uint32_t kMotionBytesPerPixel = 4;
 
     // Private Vulkan command pool + per-frame-in-flight command
     // buffer used for the output copy submit. The output copy waits

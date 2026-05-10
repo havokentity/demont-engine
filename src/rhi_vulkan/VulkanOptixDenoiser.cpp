@@ -288,25 +288,59 @@ bool VulkanOptixDenoiser::InitOnce() {
     OPTIX_TRY(optixDeviceContextCreate(cuda_ctx_, &ctx_opts, &optix_ctx_));
 
     OptixDenoiserOptions opts{};
+    std::memset(&opts, 0, sizeof(opts));
     OptixDenoiserModelKind model_kind = OPTIX_DENOISER_MODEL_KIND_HDR;
-    if (kind_ == Kind::HdrAov) {
-        // AOV model: takes color + albedo + normal as guide layers.
-        // The engine allocates the albedo + normal G-buffers and the
-        // path tracer writes them every frame; here we just tell OptiX
-        // we'll provide them so the denoiser builds the right state.
+    const bool is_aov      = KindIsAov(kind_);
+    const bool is_temporal = KindIsTemporal(kind_);
+    if (is_aov) {
+        // AOV-family models take albedo + normal as guide layers. The
+        // engine allocates the albedo + normal G-buffers and the path
+        // tracer writes them every frame; here we just tell OptiX we'll
+        // provide them so the denoiser builds the right state.
         opts.guideAlbedo = 1;
         opts.guideNormal = 1;
-        model_kind       = OPTIX_DENOISER_MODEL_KIND_AOV;
-        LOG_INFO("VulkanOptixDenoiser: kind=HdrAov -- using "
-                 "OPTIX_DENOISER_MODEL_KIND_AOV with albedo + normal "
-                 "guide layers (RGBA16F at vk::binding 17 / 16)");
-    } else {
-        // Plain HDR: no guide layers. OptiX uses only the noisy color
-        // input + an internal HDR intensity scratch.
-        opts.guideAlbedo = 0;
-        opts.guideNormal = 0;
-        LOG_INFO("VulkanOptixDenoiser: kind=Hdr -- using "
-                 "OPTIX_DENOISER_MODEL_KIND_HDR (no AOV guides)");
+    }
+    if (is_temporal) {
+        // Temporal-family models take a motion-vector flow guide AND
+        // a previous-output history fed back as
+        // OptixDenoiserLayer::previousOutput. OptiX 9.1's
+        // OptixDenoiserOptions struct has no explicit "guideMotion"
+        // field -- the model_kind (TEMPORAL / TEMPORAL_AOV) implicitly
+        // tells the denoiser to expect guide_layer.flow on every
+        // Invoke. We just zero-init opts and let the model_kind do the
+        // signalling. The history ping-pong is host-side state
+        // (prev_output_write_idx_) reset on init / kind transition /
+        // reset_history.
+        first_temporal_frame_  = true;
+        prev_output_write_idx_ = 0;
+    }
+    switch (kind_) {
+        case Kind::Hdr:
+            model_kind = OPTIX_DENOISER_MODEL_KIND_HDR;
+            LOG_INFO("VulkanOptixDenoiser: kind=Hdr -- using "
+                     "OPTIX_DENOISER_MODEL_KIND_HDR (no guide layers)");
+            break;
+        case Kind::HdrAov:
+            model_kind = OPTIX_DENOISER_MODEL_KIND_AOV;
+            LOG_INFO("VulkanOptixDenoiser: kind=HdrAov -- using "
+                     "OPTIX_DENOISER_MODEL_KIND_AOV with albedo + normal "
+                     "guide layers (RGBA16F at vk::binding 17 / 16)");
+            break;
+        case Kind::TemporalHdr:
+            model_kind = OPTIX_DENOISER_MODEL_KIND_TEMPORAL;
+            LOG_INFO("VulkanOptixDenoiser: kind=TemporalHdr -- using "
+                     "OPTIX_DENOISER_MODEL_KIND_TEMPORAL with motion-vector "
+                     "flow guide + 1-frame previousOutput history "
+                     "(RG16F motion at vk::binding 8, history ping-pong on "
+                     "the CUDA side)");
+            break;
+        case Kind::TemporalHdrAov:
+            model_kind = OPTIX_DENOISER_MODEL_KIND_TEMPORAL_AOV;
+            LOG_INFO("VulkanOptixDenoiser: kind=TemporalHdrAov -- using "
+                     "OPTIX_DENOISER_MODEL_KIND_TEMPORAL_AOV with motion + "
+                     "previousOutput history + albedo + normal guides "
+                     "(the strongest OptiX variant)");
+            break;
     }
     OPTIX_TRY(optixDenoiserCreate(optix_ctx_,
                                   model_kind,
@@ -324,11 +358,14 @@ bool VulkanOptixDenoiser::ResizeScratch(std::uint32_t w, std::uint32_t h) {
     state_size_   = sizes.stateSizeInBytes;
     scratch_size_ = sizes.withoutOverlapScratchSizeInBytes;
     overlap_      = 0;  // no tiling; we always denoise the full frame
+    internal_guide_pixel_size_ = sizes.internalGuideLayerPixelSizeInBytes;
 
     // Free old scratch if any (resize path).
     if (state_buf_   != 0) { cudaFree(reinterpret_cast<void*>(state_buf_));   state_buf_   = 0; }
     if (scratch_buf_ != 0) { cudaFree(reinterpret_cast<void*>(scratch_buf_)); scratch_buf_ = 0; }
     if (intensity_buf_ != 0) { cudaFree(reinterpret_cast<void*>(intensity_buf_)); intensity_buf_ = 0; }
+    if (internal_guide_a_ != 0) { cudaFree(reinterpret_cast<void*>(internal_guide_a_)); internal_guide_a_ = 0; }
+    if (internal_guide_b_ != 0) { cudaFree(reinterpret_cast<void*>(internal_guide_b_)); internal_guide_b_ = 0; }
 
     void* p_state    = nullptr;
     void* p_scratch  = nullptr;
@@ -340,13 +377,51 @@ bool VulkanOptixDenoiser::ResizeScratch(std::uint32_t w, std::uint32_t h) {
     scratch_buf_   = reinterpret_cast<std::uint64_t>(p_scratch);
     intensity_buf_ = reinterpret_cast<std::uint64_t>(p_intens);
 
+    // Internal guide layer ping-pong (TEMPORAL/TEMPORAL_AOV models
+    // only). OptiX manages the contents -- our job is to provide two
+    // device buffers of the right size and ping-pong them between
+    // .previousOutputInternalGuideLayer and .outputInternalGuideLayer
+    // each frame. Size is implementation-defined per model_kind;
+    // sizes.internalGuideLayerPixelSizeInBytes is 0 for non-temporal
+    // models, so this branch is naturally a no-op there.
+    std::uint64_t internal_total_bytes = 0;
+    if (KindIsTemporal(kind_) && internal_guide_pixel_size_ > 0) {
+        internal_total_bytes =
+            static_cast<std::uint64_t>(w) * h * internal_guide_pixel_size_;
+        void* p_a = nullptr;
+        void* p_b = nullptr;
+        CUDART_TRY(cudaMalloc(&p_a, internal_total_bytes));
+        CUDART_TRY(cudaMalloc(&p_b, internal_total_bytes));
+        // Zero-init both so the first frame's read of "previous"
+        // returns deterministic zeros (OptiX validates the data
+        // pointer is non-null but the contents on first frame are
+        // OK to be zero -- the model sees no prior signal and falls
+        // back to single-frame behaviour for that frame).
+        CUDART_TRY(cudaMemsetAsync(p_a, 0, internal_total_bytes, cuda_stream_));
+        CUDART_TRY(cudaMemsetAsync(p_b, 0, internal_total_bytes, cuda_stream_));
+        internal_guide_a_ = reinterpret_cast<std::uint64_t>(p_a);
+        internal_guide_b_ = reinterpret_cast<std::uint64_t>(p_b);
+    }
+
     OPTIX_TRY(optixDenoiserSetup(optix_denoiser_, cuda_stream_,
                                  w, h,
                                  static_cast<CUdeviceptr>(state_buf_),   state_size_,
                                  static_cast<CUdeviceptr>(scratch_buf_), scratch_size_));
-    LOG_INFO("VulkanOptixDenoiser: scratch sized for {}x{} (state={}MB, scratch={}MB)",
-             w, h, state_size_   / (1024 * 1024),
-                   scratch_size_ / (1024 * 1024));
+    if (internal_total_bytes > 0) {
+        LOG_INFO("VulkanOptixDenoiser: scratch sized for {}x{} "
+                 "(state={}MB, scratch={}MB, internal_guide={}KB x 2 "
+                 "[temporal ping-pong, {}B/pixel])",
+                 w, h,
+                 state_size_   / (1024 * 1024),
+                 scratch_size_ / (1024 * 1024),
+                 internal_total_bytes / 1024,
+                 internal_guide_pixel_size_);
+    } else {
+        LOG_INFO("VulkanOptixDenoiser: scratch sized for {}x{} "
+                 "(state={}MB, scratch={}MB)",
+                 w, h, state_size_   / (1024 * 1024),
+                       scratch_size_ / (1024 * 1024));
+    }
     return true;
 }
 
@@ -379,14 +454,24 @@ bool VulkanOptixDenoiser::ResizeExternalBuffers(std::uint32_t w, std::uint32_t h
     DestroyExternalBuffer(1);
     DestroyExternalBuffer(2);  // albedo (no-op when not previously allocated)
     DestroyExternalBuffer(3);  // normal (no-op when not previously allocated)
+    DestroyExternalBuffer(4);  // motion (no-op when not previously allocated)
+    DestroyExternalBuffer(5);  // prev_output_a (no-op on non-temporal)
+    DestroyExternalBuffer(6);  // prev_output_b (no-op on non-temporal)
 
     VkDevice dev = device_->RawDevice();
     VkPhysicalDevice phys = device_->RawPhysicalDevice();
 
-    const VkDeviceSize buf_size =
+    // Most buffers (color_in, output, albedo, normal, prev_output_*)
+    // are RGBA16F = 8 bytes/pixel. Motion is RG16F = 4 bytes/pixel.
+    // The lambda accepts an explicit size_bytes so the same machinery
+    // (external-memory import + CUDA pointer mapping) handles both.
+    const VkDeviceSize rgba_size =
         static_cast<VkDeviceSize>(w) * h * kBytesPerPixel;
+    const VkDeviceSize motion_size =
+        static_cast<VkDeviceSize>(w) * h * kMotionBytesPerPixel;
 
-    auto build_one = [&](ExternalBuffer& out, const char* label) -> bool {
+    auto build_one = [&](ExternalBuffer& out, const char* label,
+                         VkDeviceSize buf_size) -> bool {
         VkExternalMemoryBufferCreateInfo embci{};
         embci.sType       = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
         embci.handleTypes = external::HandleTypes::vk_memory;
@@ -472,38 +557,67 @@ bool VulkanOptixDenoiser::ResizeExternalBuffers(std::uint32_t w, std::uint32_t h
         return true;
     };
 
-    if (!build_one(buf_color_in_, "color_in")) return false;
-    if (!build_one(buf_output_,   "output"))   return false;
+    if (!build_one(buf_color_in_, "color_in", rgba_size)) return false;
+    if (!build_one(buf_output_,   "output",   rgba_size)) return false;
 
-    int aov_count = 0;
-    if (kind_ == Kind::HdrAov) {
+    int rgba_count = 2;
+    int motion_count = 0;
+    if (KindIsAov(kind_)) {
         // AOV guide layers: same external-memory machinery as color_in
         // and output (linear DEVICE_LOCAL VkBuffer + cudaImportExternal-
         // Memory + GetMappedBuffer). OptiX reads these as half4 RGBA in
         // OptixDenoiserGuideLayer::albedo / .normal during Invoke.
-        if (!build_one(buf_albedo_, "albedo")) return false;
-        if (!build_one(buf_normal_, "normal")) return false;
-        aov_count = 2;
+        if (!build_one(buf_albedo_, "albedo", rgba_size)) return false;
+        if (!build_one(buf_normal_, "normal", rgba_size)) return false;
+        rgba_count += 2;
+    }
+    if (KindIsTemporal(kind_)) {
+        // Motion: RG16F (HALF2). The path tracer writes pixel-space
+        // reprojection deltas to motion_tex (binding 8); we copy that
+        // directly each frame and feed it to OptiX as
+        // OptixDenoiserGuideLayer::flow.
+        if (!build_one(buf_motion_, "motion", motion_size)) return false;
+        motion_count = 1;
+        // Two history buffers ping-ponged each frame so OptiX always
+        // has a stable previousOutput while it writes this frame's
+        // result. prev_output_write_idx_ flips after each Invoke.
+        // Both are RGBA16F, same shape as buf_output_.
+        if (!build_one(buf_prev_output_a_, "prev_output_a", rgba_size)) return false;
+        if (!build_one(buf_prev_output_b_, "prev_output_b", rgba_size)) return false;
+        rgba_count += 2;
+        first_temporal_frame_  = true;
+        prev_output_write_idx_ = 0;
     }
 
     LOG_INFO("VulkanOptixDenoiser: external buffers sized for {}x{} "
-             "({} x {}KB, dedicated allocation, imported to CUDA as "
-             "linear CUdeviceptrs)", w, h, 2 + aov_count, buf_size / 1024);
+             "({} x {}KB RGBA16F + {} x {}KB RG16F, dedicated allocation, "
+             "imported to CUDA as linear CUdeviceptrs)",
+             w, h,
+             rgba_count, rgba_size / 1024,
+             motion_count, motion_size / 1024);
     return true;
 }
 
 void VulkanOptixDenoiser::DestroyExternalBuffer(int slot) {
-    // Slot semantics:
-    //   0 = buf_color_in_  (always allocated)
-    //   1 = buf_output_    (always allocated)
-    //   2 = buf_albedo_    (HdrAov only; null on Hdr -- safe to call)
-    //   3 = buf_normal_    (HdrAov only; null on Hdr -- safe to call)
+    // Slot semantics (all entries are no-ops when not previously
+    // allocated, so calling Destroy on every slot at teardown is
+    // safe regardless of kind_):
+    //   0 = buf_color_in_       (always allocated)
+    //   1 = buf_output_         (always allocated)
+    //   2 = buf_albedo_         (KindIsAov only)
+    //   3 = buf_normal_         (KindIsAov only)
+    //   4 = buf_motion_         (KindIsTemporal only)
+    //   5 = buf_prev_output_a_  (KindIsTemporal only)
+    //   6 = buf_prev_output_b_  (KindIsTemporal only)
     ExternalBuffer* pe = nullptr;
     switch (slot) {
-        case 0: pe = &buf_color_in_; break;
-        case 1: pe = &buf_output_;   break;
-        case 2: pe = &buf_albedo_;   break;
-        case 3: pe = &buf_normal_;   break;
+        case 0: pe = &buf_color_in_;        break;
+        case 1: pe = &buf_output_;          break;
+        case 2: pe = &buf_albedo_;          break;
+        case 3: pe = &buf_normal_;          break;
+        case 4: pe = &buf_motion_;          break;
+        case 5: pe = &buf_prev_output_a_;   break;
+        case 6: pe = &buf_prev_output_b_;   break;
         default:
             LOG_WARN("VulkanOptixDenoiser::DestroyExternalBuffer: "
                      "unexpected slot={}", slot);
@@ -718,15 +832,89 @@ void VulkanOptixDenoiser::Encode(VkCommandBuffer cb,
     VkImage swap_img     = device_->LookupImage(d.final_output);
     VkImage albedo_img   = VK_NULL_HANDLE;
     VkImage normal_img   = VK_NULL_HANDLE;
-    if (kind_ == Kind::HdrAov) {
+    VkImage motion_img   = VK_NULL_HANDLE;
+    if (KindIsAov(kind_)) {
         albedo_img = device_->LookupImage(d.albedo_in);
         normal_img = device_->LookupImage(d.normal_in);
         if (albedo_img == VK_NULL_HANDLE || normal_img == VK_NULL_HANDLE) {
-            LOG_WARN("VulkanOptixDenoiser::Encode(HdrAov): AOV image lookup miss "
+            LOG_WARN("VulkanOptixDenoiser::Encode(AOV): AOV image lookup miss "
                      "(albedo={} normal={}); skipping frame",
                      static_cast<void*>(albedo_img),
                      static_cast<void*>(normal_img));
             return;
+        }
+    }
+    if (KindIsTemporal(kind_)) {
+        motion_img = device_->LookupImage(d.motion_in);
+        if (motion_img == VK_NULL_HANDLE) {
+            // Log the actual handle id (always populated by the
+            // engine; useful for chasing missing motion_tex wiring
+            // upstream) rather than the resolved VkImage which is
+            // null by definition on this branch.
+            LOG_WARN("VulkanOptixDenoiser::Encode(Temporal): motion image "
+                     "lookup miss (d.motion_in.id={}); skipping frame",
+                     d.motion_in.id);
+            return;
+        }
+        // Engine signals "discard history" on first frame after a kind
+        // toggle / camera teleport / scene reset via dd.reset_history.
+        // We reset BOTH ping-pongs (the older layer.previousOutput one
+        // AND OptiX's internal-guide-layer one) so OptiX never reads
+        // stale temporal state from before the discontinuity:
+        //   - first_temporal_frame_ -> true: SubmitPostMain feeds
+        //                                    layer.previousOutput =
+        //                                    layer.input next frame.
+        //   - prev_output_write_idx_ -> 0:   restart the ping-pong from
+        //                                    a known side so the
+        //                                    "previous" side after the
+        //                                    flip lands on the buffer
+        //                                    we'll just have written
+        //                                    fresh data into.
+        //   - cudaMemsetAsync the internal guide buffers: OptiX'
+        //                                    temporal model otherwise
+        //                                    re-uses the prior frame's
+        //                                    internal state (the
+        //                                    previousOutputInternalGuide
+        //                                    Layer side); zeroing both
+        //                                    forces the model into its
+        //                                    first-frame fallback for
+        //                                    one frame, matching the
+        //                                    user's intent.
+        if (d.reset_history) {
+            first_temporal_frame_  = true;
+            prev_output_write_idx_ = 0;
+            if (internal_guide_a_ != 0 && internal_guide_b_ != 0 &&
+                internal_guide_pixel_size_ > 0) {
+                const std::size_t bytes =
+                    static_cast<std::size_t>(cached_w_) * cached_h_ *
+                    static_cast<std::size_t>(internal_guide_pixel_size_);
+                // Surface cudaMemsetAsync failures with a clear LOG_WARN
+                // instead of swallowing the cudaError_t. A failure here
+                // would mean the next Invoke reads stale internal-guide-
+                // layer state from before the reset_history signal --
+                // visually a one-frame ghost from the pre-discontinuity
+                // scene leaking into the post-discontinuity frame. Don't
+                // bail out of the function (the rest of Encode is fine);
+                // just make the cause greppable.
+                cudaError_t e1 = cudaMemsetAsync(
+                    reinterpret_cast<void*>(internal_guide_a_),
+                    0, bytes, cuda_stream_);
+                cudaError_t e2 = cudaMemsetAsync(
+                    reinterpret_cast<void*>(internal_guide_b_),
+                    0, bytes, cuda_stream_);
+                if (e1 != cudaSuccess) {
+                    LOG_WARN("VulkanOptixDenoiser::Encode(reset_history): "
+                             "cudaMemsetAsync(internal_guide_a_) failed ({}); "
+                             "next-frame temporal reset may not fully clear",
+                             cudaGetErrorString(e1));
+                }
+                if (e2 != cudaSuccess) {
+                    LOG_WARN("VulkanOptixDenoiser::Encode(reset_history): "
+                             "cudaMemsetAsync(internal_guide_b_) failed ({}); "
+                             "next-frame temporal reset may not fully clear",
+                             cudaGetErrorString(e2));
+                }
+            }
         }
     }
     if (src_img == VK_NULL_HANDLE || dst_img == VK_NULL_HANDLE) {
@@ -792,18 +980,17 @@ void VulkanOptixDenoiser::Encode(VkCommandBuffer cb,
             0, 0, nullptr, 0, nullptr, 1, &backToGeneral);
     }
 
-    // ---- Step 2b: AOV guide-layer copies (HdrAov only) ------------------
+    // ---- Step 2b: AOV / Temporal guide-layer copies ---------------------
     // For OPTIX_DENOISER_MODEL_KIND_AOV the guide layer wants linear
-    // CUdeviceptrs for albedo + normal. Same machinery as color_in:
-    // GENERAL -> TRANSFER_SRC, vkCmdCopyImageToBuffer, back to GENERAL.
-    // Two images means two barrier-pairs; we batch each image's
-    // barriers into a single vkCmdPipelineBarrier rather than a single
-    // multi-barrier call across both images, because the source layouts
-    // are independent per-image and barrier batching across images
-    // doesn't actually save anything on NVIDIA's driver beyond what
-    // the engine's per-image batching already achieves.
-    if (kind_ == Kind::HdrAov) {
-        auto copy_aov_image_to_buffer = [&](VkImage img, VkBuffer buf, const char* label) {
+    // CUdeviceptrs for albedo + normal. For *_TEMPORAL the guide
+    // layer additionally wants flow (motion vectors). Same machinery
+    // as color_in: GENERAL -> TRANSFER_SRC, vkCmdCopyImageToBuffer,
+    // back to GENERAL. Each image gets its own barrier-pair; we don't
+    // batch barriers across images because the source layouts are
+    // independent per-image and the engine's per-image batching
+    // already covers the savings on NVIDIA's driver.
+    if (KindIsAov(kind_) || KindIsTemporal(kind_)) {
+        auto copy_image_to_buffer = [&](VkImage img, VkBuffer buf, const char* label) {
             VkImageMemoryBarrier toSrc{};
             toSrc.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             toSrc.oldLayout     = VK_IMAGE_LAYOUT_GENERAL;
@@ -848,8 +1035,13 @@ void VulkanOptixDenoiser::Encode(VkCommandBuffer cb,
                 0, 0, nullptr, 0, nullptr, 1, &back);
             (void)label;
         };
-        copy_aov_image_to_buffer(albedo_img, buf_albedo_.buffer, "albedo");
-        copy_aov_image_to_buffer(normal_img, buf_normal_.buffer, "normal");
+        if (KindIsAov(kind_)) {
+            copy_image_to_buffer(albedo_img, buf_albedo_.buffer, "albedo");
+            copy_image_to_buffer(normal_img, buf_normal_.buffer, "normal");
+        }
+        if (KindIsTemporal(kind_)) {
+            copy_image_to_buffer(motion_img, buf_motion_.buffer, "motion");
+        }
     }
 
     // CUDA + OptiX work is deferred to SubmitPostMain (called from
@@ -1060,10 +1252,24 @@ void VulkanOptixDenoiser::SubmitPostMain() {
     std::memset(&params, 0, sizeof(params));
     params.hdrIntensity = static_cast<CUdeviceptr>(intensity_buf_);
     params.blendFactor  = 0.0f;
+    if (KindIsTemporal(kind_)) {
+        // Critical: tell OptiX to actually CONSUME the temporal layers
+        // (layer.previousOutput + guide_layer.previousOutputInternalGuide
+        // Layer) we populated above. The default value (0) makes OptiX
+        // silently ignore those fields and run as if it were a single-
+        // frame denoise -- which presents as "TEMPORAL_AOV looks
+        // identical to AOV" because the per-frame behaviour is
+        // identical when the temporal blend is off. Set to 1 on every
+        // frame except the first / post-reset_history one, where we
+        // don't have valid prior layers yet (the previousOutput field
+        // intentionally points at layer.input on those frames as a
+        // self-blend, but OptiX needs the flag to take that path).
+        params.temporalModeUsePreviousLayers = first_temporal_frame_ ? 0 : 1;
+    }
 
     OptixDenoiserGuideLayer guide_layer{};
     std::memset(&guide_layer, 0, sizeof(guide_layer));
-    if (kind_ == Kind::HdrAov) {
+    if (KindIsAov(kind_)) {
         // Albedo guide: linear-RGB at primary hit. OptiX uses it to
         // preserve diffuse-color edges that the noisy color buffer
         // alone can't disambiguate (e.g. wallpaper-on-shadow boundary
@@ -1084,11 +1290,104 @@ void VulkanOptixDenoiser::SubmitPostMain() {
         guide_layer.normal.pixelStrideInBytes = kBytesPerPixel;
         guide_layer.normal.format           = kOptixPixelFormat;
     }
+    if (KindIsTemporal(kind_)) {
+        // Flow (motion) guide: pixel-space (prev - curr) reprojection
+        // delta from PathTrace.slang's motion_tex output. RG16F = HALF2
+        // = 4 bytes/pixel, the only non-RGBA16F buffer in this denoiser.
+        guide_layer.flow.data             = static_cast<CUdeviceptr>(buf_motion_.cuda_ptr);
+        guide_layer.flow.width            = cached_w_;
+        guide_layer.flow.height           = cached_h_;
+        guide_layer.flow.rowStrideInBytes = cached_w_ * kMotionBytesPerPixel;
+        guide_layer.flow.pixelStrideInBytes = kMotionBytesPerPixel;
+        guide_layer.flow.format           = OPTIX_PIXEL_FORMAT_HALF2;
+
+        // OptiX 9.x TEMPORAL/TEMPORAL_AOV: provide the
+        // {previous,output}OutputInternalGuideLayer fields. OptiX
+        // manages contents -- we just supply CUDA pointers + dims +
+        // strides. Format is OPTIX_PIXEL_FORMAT_INTERNAL_GUIDE_LAYER
+        // (a sentinel meaning "the layout is implementation-defined,
+        // use internalGuideLayerPixelSizeInBytes for stride").
+        // Ping-pong: this frame writes to the side prev_output_write_idx_
+        // points at; previous = the OTHER side. Index flips after Invoke.
+        //
+        // Defensive gate: only wire the layers when the buffers
+        // actually exist. internalGuideLayerPixelSizeInBytes is 0 on
+        // non-temporal models (so the buffers stay null), and a
+        // future model_kind that reports 0 unexpectedly would crash
+        // OptiX with a less obvious error if we filled the OptixImage2D
+        // anyway. The temporal model_kind path always populates
+        // pixel_size > 0 today, but the guard makes the contract
+        // explicit.
+        if (internal_guide_a_ != 0 && internal_guide_b_ != 0 &&
+            internal_guide_pixel_size_ > 0) {
+            const std::uint64_t prev_internal =
+                (prev_output_write_idx_ == 0) ? internal_guide_b_ : internal_guide_a_;
+            const std::uint64_t this_internal =
+                (prev_output_write_idx_ == 0) ? internal_guide_a_ : internal_guide_b_;
+            const std::uint32_t igl_pixel = static_cast<std::uint32_t>(internal_guide_pixel_size_);
+            const std::uint32_t igl_row   = cached_w_ * igl_pixel;
+            guide_layer.previousOutputInternalGuideLayer.data             = static_cast<CUdeviceptr>(prev_internal);
+            guide_layer.previousOutputInternalGuideLayer.width            = cached_w_;
+            guide_layer.previousOutputInternalGuideLayer.height           = cached_h_;
+            guide_layer.previousOutputInternalGuideLayer.rowStrideInBytes = igl_row;
+            guide_layer.previousOutputInternalGuideLayer.pixelStrideInBytes = igl_pixel;
+            guide_layer.previousOutputInternalGuideLayer.format           = OPTIX_PIXEL_FORMAT_INTERNAL_GUIDE_LAYER;
+            guide_layer.outputInternalGuideLayer.data             = static_cast<CUdeviceptr>(this_internal);
+            guide_layer.outputInternalGuideLayer.width            = cached_w_;
+            guide_layer.outputInternalGuideLayer.height           = cached_h_;
+            guide_layer.outputInternalGuideLayer.rowStrideInBytes = igl_row;
+            guide_layer.outputInternalGuideLayer.pixelStrideInBytes = igl_pixel;
+            guide_layer.outputInternalGuideLayer.format           = OPTIX_PIXEL_FORMAT_INTERNAL_GUIDE_LAYER;
+        } else {
+            LOG_WARN("VulkanOptixDenoiser::SubmitPostMain: temporal kind "
+                     "but internal-guide-layer buffers missing "
+                     "(pixel_size={}, a=0x{:x}, b=0x{:x}); OptiX will "
+                     "reject the Invoke -- check ResizeScratch alloc",
+                     internal_guide_pixel_size_,
+                     internal_guide_a_, internal_guide_b_);
+        }
+    }
+
+    // Pick which prev-output buffer is "previous" vs "current" this
+    // frame. previousOutput is the OTHER buffer (last frame's write);
+    // we'll write this frame's output to OUR side of the ping-pong
+    // (write_idx). On first temporal frame (or after reset_history),
+    // OptiX docs say to set previousOutput = layer.input -- the
+    // denoiser internally treats it as "no temporal signal yet".
+    const ExternalBuffer* prev_output_buf = nullptr;
+    ExternalBuffer*       this_output_buf = nullptr;
+    if (KindIsTemporal(kind_)) {
+        prev_output_buf = (prev_output_write_idx_ == 0)
+                              ? &buf_prev_output_b_  // last frame wrote to b
+                              : &buf_prev_output_a_;
+        this_output_buf = (prev_output_write_idx_ == 0)
+                              ? &buf_prev_output_a_
+                              : &buf_prev_output_b_;
+    }
 
     OptixDenoiserLayer layer{};
     std::memset(&layer, 0, sizeof(layer));
     layer.input  = color_in;
     layer.output = output;
+    if (KindIsTemporal(kind_)) {
+        // Temporal output goes to BOTH the engine output buffer (so the
+        // Vulkan-side back-copy lands the latest denoised frame) AND
+        // the ping-pong history (so next frame has it as previousOutput).
+        // OptiX writes layer.output; we cudaMemcpyAsync the same data
+        // into this_output_buf right after invoke (cheaper than asking
+        // OptiX to write to two buffers). previousOutput is the
+        // ping-pong's "other" side from last frame.
+        OptixImage2D prev{};
+        prev.data             = first_temporal_frame_
+                                    ? layer.input.data
+                                    : static_cast<CUdeviceptr>(prev_output_buf->cuda_ptr);
+        prev.width            = cached_w_;
+        prev.height           = cached_h_;
+        prev.rowStrideInBytes = cached_w_ * kBytesPerPixel;
+        prev.pixelStrideInBytes = kBytesPerPixel;
+        prev.format           = kOptixPixelFormat;
+        layer.previousOutput  = prev;
+    }
 
     oresult = optixDenoiserInvoke(
         optix_denoiser_, cuda_stream_,
@@ -1104,12 +1403,45 @@ void VulkanOptixDenoiser::SubmitPostMain() {
         return;
     }
 
+    if (KindIsTemporal(kind_) && this_output_buf != nullptr) {
+        // Mirror the freshly-written buf_output_ into our ping-pong
+        // slot so next frame can feed it as layer.previousOutput. Use
+        // cudaMemcpyAsync on the same stream the denoise just ran on,
+        // so the copy serialises naturally before the cudaStream-
+        // Synchronize below.
+        const std::size_t bytes =
+            static_cast<std::size_t>(cached_w_) * cached_h_ * kBytesPerPixel;
+        cudaError_t mcerr = cudaMemcpyAsync(
+            reinterpret_cast<void*>(this_output_buf->cuda_ptr),
+            reinterpret_cast<const void*>(buf_output_.cuda_ptr),
+            bytes, cudaMemcpyDeviceToDevice, cuda_stream_);
+        if (mcerr != cudaSuccess) {
+            LOG_WARN("VulkanOptixDenoiser::SubmitPostMain: prev_output "
+                     "ping-pong cudaMemcpyAsync failed ({}); next-frame "
+                     "previousOutput history may be stale for one frame",
+                     cudaGetErrorString(mcerr));
+        }
+        // Flip the ping-pong UNCONDITIONALLY: OptiX wrote the
+        // outputInternalGuideLayer side regardless of whether our
+        // separate previousOutput-history copy succeeded, so the
+        // shared write index has to advance to keep
+        // previousOutputInternalGuideLayer pointing at the side OptiX
+        // just wrote on the next frame. Worst case from a memcpy fail
+        // is one frame of stale layer.previousOutput history, which
+        // self-heals as soon as the next frame's invoke writes fresh
+        // data; keeping the indices in lockstep across both ping-pongs
+        // is the correctness-critical part.
+        prev_output_write_idx_ = (prev_output_write_idx_ + 1) % 2;
+        first_temporal_frame_  = false;
+    }
+
     cudaError_t cerr = cudaStreamSynchronize(cuda_stream_);
     if (cerr != cudaSuccess) {
         LOG_ERROR("VulkanOptixDenoiser::SubmitPostMain: cudaStreamSynchronize: {}",
                   cudaGetErrorString(cerr));
         return;
     }
+
 
     // ---- Submit private output-copy cb with no waits ----
     VkCommandBuffer pcb = private_cb_out_[pending_pcb_slot_];
@@ -1138,14 +1470,20 @@ void VulkanOptixDenoiser::DestroyResources() {
     DestroyCommandPool();
     DestroyExternalBuffer(0);
     DestroyExternalBuffer(1);
-    DestroyExternalBuffer(2);  // albedo (no-op on Hdr, valid on HdrAov)
-    DestroyExternalBuffer(3);  // normal (no-op on Hdr, valid on HdrAov)
+    DestroyExternalBuffer(2);  // albedo (no-op on non-AOV)
+    DestroyExternalBuffer(3);  // normal (no-op on non-AOV)
+    DestroyExternalBuffer(4);  // motion (no-op on non-temporal)
+    DestroyExternalBuffer(5);  // prev_output_a (no-op on non-temporal)
+    DestroyExternalBuffer(6);  // prev_output_b (no-op on non-temporal)
 
-    if (state_buf_     != 0) { cudaFree(reinterpret_cast<void*>(state_buf_));     state_buf_     = 0; }
-    if (scratch_buf_   != 0) { cudaFree(reinterpret_cast<void*>(scratch_buf_));   scratch_buf_   = 0; }
-    if (intensity_buf_ != 0) { cudaFree(reinterpret_cast<void*>(intensity_buf_)); intensity_buf_ = 0; }
-    state_size_   = 0;
-    scratch_size_ = 0;
+    if (state_buf_        != 0) { cudaFree(reinterpret_cast<void*>(state_buf_));        state_buf_        = 0; }
+    if (scratch_buf_      != 0) { cudaFree(reinterpret_cast<void*>(scratch_buf_));      scratch_buf_      = 0; }
+    if (intensity_buf_    != 0) { cudaFree(reinterpret_cast<void*>(intensity_buf_));    intensity_buf_    = 0; }
+    if (internal_guide_a_ != 0) { cudaFree(reinterpret_cast<void*>(internal_guide_a_)); internal_guide_a_ = 0; }
+    if (internal_guide_b_ != 0) { cudaFree(reinterpret_cast<void*>(internal_guide_b_)); internal_guide_b_ = 0; }
+    state_size_                = 0;
+    scratch_size_              = 0;
+    internal_guide_pixel_size_ = 0;
 
     if (optix_denoiser_ != nullptr) {
         optixDenoiserDestroy(optix_denoiser_);

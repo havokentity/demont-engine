@@ -2579,7 +2579,9 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
         static int s_last_logged_kind = -1;
         const int k = static_cast<int>(d.kind);
         if (k != s_last_logged_kind) {
-            LOG_INFO("VulkanDevice::Denoise: dispatching kind={} (0=Svgf, 1=OptixHdr, 2=OptixHdrAov), "
+            LOG_INFO("VulkanDevice::Denoise: dispatching kind={} "
+                     "(0=Svgf, 1=OptixHdr, 2=OptixHdrAov, "
+                     "3=OptixTemporalHdr, 4=OptixTemporalHdrAov), "
                      "color={} out={} normal={} depth={} motion={}",
                      k, d.color_in.id, d.output.id, d.normal_in.id, d.depth_in.id, d.motion_in.id);
             s_last_logged_kind = k;
@@ -2589,29 +2591,60 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
     // Route based on d.kind. SVGF and OptiX have different input
     // contracts: SVGF wants the full G-buffer (color/depth/motion/
     // normal/output); OptiX HDR only needs color + output; OptiX HDR
-    // AOV needs color + output + albedo + normal (the AOV model's
-    // OptixDenoiserGuideLayer).
+    // AOV adds albedo + normal (the AOV model's OptixDenoiserGuideLayer);
+    // OptiX TEMPORAL adds motion_in (fed as guide_layer.flow) plus a
+    // CUDA-side previous-output history buffer the denoiser maintains
+    // internally; OptiX TEMPORAL_AOV is the union (motion + albedo +
+    // normal + history).
 #if defined(PT_ENABLE_OPTIX)
-    if (d.kind == DenoiseDesc::Kind::OptixHdr ||
-        d.kind == DenoiseDesc::Kind::OptixHdrAov) {
+    // Kind-classification bools live inside the PT_ENABLE_OPTIX guard
+    // because they're only consumed by the OptiX dispatch block.
+    // Hoisting them out triggers Mac CI's zero-warnings gate
+    // (Wunused-variable) since the Mac build defines no OptiX kinds.
+    const bool kind_is_optix_temporal =
+        (d.kind == DenoiseDesc::Kind::OptixTemporalHdr ||
+         d.kind == DenoiseDesc::Kind::OptixTemporalHdrAov);
+    const bool kind_is_optix_aov =
+        (d.kind == DenoiseDesc::Kind::OptixHdrAov ||
+         d.kind == DenoiseDesc::Kind::OptixTemporalHdrAov);
+    const bool kind_is_optix =
+        (d.kind == DenoiseDesc::Kind::OptixHdr ||
+         d.kind == DenoiseDesc::Kind::OptixHdrAov ||
+         kind_is_optix_temporal);
+    if (kind_is_optix) {
         if (d.color_in.id == 0 || d.output.id == 0) {
             LOG_WARN("VulkanDevice::Denoise(OptiX): missing color/output (color={} out={})",
                      d.color_in.id, d.output.id);
             return;
         }
-        if (d.kind == DenoiseDesc::Kind::OptixHdrAov) {
+        if (kind_is_optix_aov) {
             if (d.albedo_in.id == 0 || d.normal_in.id == 0) {
                 LOG_WARN("VulkanDevice::Denoise(OptiX AOV): missing albedo/normal "
                          "(albedo={} normal={}) -- engine should have allocated these "
-                         "for r_denoiser=optix_hdr_aov; check Engine::want_albedo_gbuffer "
-                         "/ want_normal_gbuffer paths",
+                         "for the optix_*_aov variants; check "
+                         "Engine::want_albedo_gbuffer / want_normal_gbuffer paths",
                          d.albedo_in.id, d.normal_in.id);
                 return;
             }
         }
-        const auto opt_kind = (d.kind == DenoiseDesc::Kind::OptixHdrAov)
-                              ? VulkanOptixDenoiser::Kind::HdrAov
-                              : VulkanOptixDenoiser::Kind::Hdr;
+        if (kind_is_optix_temporal) {
+            if (d.motion_in.id == 0) {
+                LOG_WARN("VulkanDevice::Denoise(OptiX Temporal): missing motion "
+                         "(motion={}) -- the temporal model needs the per-pixel "
+                         "reprojection delta as guide_layer.flow input; engine "
+                         "always allocates motion_tex when denoiser_active",
+                         d.motion_in.id);
+                return;
+            }
+        }
+        VulkanOptixDenoiser::Kind opt_kind;
+        switch (d.kind) {
+            case DenoiseDesc::Kind::OptixHdr:             opt_kind = VulkanOptixDenoiser::Kind::Hdr; break;
+            case DenoiseDesc::Kind::OptixHdrAov:          opt_kind = VulkanOptixDenoiser::Kind::HdrAov; break;
+            case DenoiseDesc::Kind::OptixTemporalHdr:     opt_kind = VulkanOptixDenoiser::Kind::TemporalHdr; break;
+            case DenoiseDesc::Kind::OptixTemporalHdrAov:  opt_kind = VulkanOptixDenoiser::Kind::TemporalHdrAov; break;
+            default: opt_kind = VulkanOptixDenoiser::Kind::Hdr; break;  // unreachable
+        }
         // Detect runtime r_denoiser cvar transitions that swap kinds
         // (optix_hdr <-> optix_hdr_aov). The denoiser builds its OptiX
         // state buffer + external buffers around `kind_` at construction,
