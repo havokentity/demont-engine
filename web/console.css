@@ -453,6 +453,12 @@ body::after {
 #side-panel[data-density="compact"] .v.toggle.on::after { left: 13px; }
 #side-panel[data-density="compact"] .v.v-input,
 #side-panel[data-density="compact"] .v.v-select { font-size: 10px; padding: 0 3px; }
+/* Compact-density rule for the wrap-based free-form input added in
+   PR #10 (the v-input is no longer a direct .v child -- it sits
+   inside .v-input-wrap). Without this the compact density toggle
+   used to silently leave the new free-form widgets at full size. */
+#side-panel[data-density="compact"] .v-input-wrap .v-input { font-size: 10px; padding: 0 3px; }
+#side-panel[data-density="compact"] .v-apply { font-size: 9px; padding: 0 6px; }
 .panel-head::after {
   content: '';
   position: absolute; left: 0; bottom: -1px;

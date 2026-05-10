@@ -704,7 +704,19 @@ void WinOverlay::EnsureFontScale() {
     // consumed" by returning end == start, which we treat as parse-fail.
     char* end = nullptr;
     float requested = std::strtof(v->value.c_str(), &end);
-    if (end == v->value.c_str()) requested = 1.0f;
+    // Reject "no digits" AND non-finite (NaN / +-Inf): strtof returns
+    // a quiet NaN for "nan"/"NaN"/"NAN" and +-Inf for "inf"/"-inf"
+    // without setting errno, and once a non-finite value reaches the
+    // < / > clamps below they BOTH return false (NaN compares
+    // unordered) -- so requested would stay non-finite, sneak past
+    // the early-exit (NaN < 1e-3 is also false), and the
+    // static_cast<int>(...) calls computing new_font_h / new_line_h
+    // would be undefined behavior. Now with PR #10's con_font_scale
+    // on_change -> Repaint -> Paint -> EnsureFontScale wiring,
+    // typing `con_font_scale nan` in the console fires this path
+    // immediately, so the guard matters even more than before.
+    // Mirrors the same fix applied to PerfOverlay_Win32::EnsureScale.
+    if (end == v->value.c_str() || !std::isfinite(requested)) requested = 1.0f;
     // Clamp to a sane range. Below 0.5 the prompt is unreadable;
     // above 3.0 the input row dominates the panel and history vanishes.
     if (requested < 0.5f) requested = 0.5f;

@@ -3247,8 +3247,11 @@ void Engine::RegisterCommands() {
     // Slots 1..9 are user-savable, persisted across runs via the
     // cam_slot_N CVAR_ARCHIVE cvars registered above. cam_load and
     // cam_reset both fire prev_view_proj_valid_ = false so the next
-    // frame's dd.reset_history clears the OptiX temporal denoiser's
-    // history -- otherwise the per-frame temporal blend keeps mixing
+    // frame's dd.reset_history clears the ACTIVE temporal denoiser's
+    // history -- consumed by SVGF/NRD's temporal accumulation,
+    // MetalFX's history-state reset, and the OptiX temporal
+    // denoisers' prev_output / internal-guide-layer ping-pong.
+    // Without this the per-frame temporal blend keeps mixing
     // pre-teleport content into post-teleport frames (visible as the
     // "went inside a sphere, came out, screen still tinted black"
     // symptom v0.3.4 surfaced).
@@ -3346,7 +3349,7 @@ void Engine::RegisterCommands() {
                                slot, v->value);
                 return;
             }
-            prev_view_proj_valid_ = false;  // clear OptiX temporal history
+            prev_view_proj_valid_ = false;  // active denoiser reset_history (SVGF/NRD/MetalFX/OptiX-temporal)
             out.FormatLine("cam_load: slot {} = {}", slot, v->value);
         });
 
