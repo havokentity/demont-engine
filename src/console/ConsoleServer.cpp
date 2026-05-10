@@ -224,14 +224,17 @@ bool ConsoleServer::Start(const Config& cfg, Console* console) {
         line_thread_ = std::thread(&ConsoleServer::LineAcceptLoop, this);
     }
 
-    PT_DIAG_TIER1("console", "");
+    // Banner spacers stay on plain LOG_INFO so they're truly blank
+    // instead of "[console] " with a trailing space. Only the content
+    // lines tier-gate; per Copilot review on PR #6.
+    LOG_INFO("");
     PT_DIAG_TIER1("console", "---- console listening ----");
     PT_DIAG_TIER1("console", "  Web UI    http://{}:{}/", config_.bind_address, config_.http_port);
     PT_DIAG_TIER1("console", "  WebSocket ws://{}:{}/ws",  config_.bind_address, config_.http_port);
     PT_DIAG_TIER1("console", "  Line TCP  {}:{}",           config_.bind_address, config_.line_port);
     PT_DIAG_TIER1("console", "  Auth      disabled");
     PT_DIAG_TIER1("console", "---------------------------");
-    PT_DIAG_TIER1("console", "");
+    LOG_INFO("");
 
     return true;
 }

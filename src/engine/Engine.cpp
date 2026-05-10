@@ -3668,21 +3668,18 @@ void Engine::RegisterCommands() {
         v->allowed_values = {"error", "warn", "info", "debug"};
     }
     // r_diagnostic_level: validate + mirror into pt::diag::g_diag_level so
-    // every PT_DIAG_TIERn() callsite is a single load+compare. The
-    // on_change handler also self-logs at TIER1 so the user sees the
-    // gate flip in the same console.
+    // every PT_DIAG_TIERn() callsite is a single relaxed atomic load +
+    // compare. The on_change handler emits the transition through
+    // LOG_INFO directly (NOT PT_DIAG_TIER1) so the user sees the gate
+    // flip in the same console even when transitioning *to* tier 0.
     if (auto* v = C.FindCVar("r_diagnostic_level")) {
         v->allowed_values = {"0", "1", "2", "3"};
         v->slider_min  = 0.0f;
         v->slider_max  = 3.0f;
         v->slider_step = 1.0f;
         v->on_change = [](const pt::console::CVar& cv) {
-            int n = cv.GetInt();
-            if (n < 0) n = 0;
-            if (n > 3) n = 3;
-            pt::diag::g_diag_level = n;
-            // Emit at LOG_INFO directly (not PT_DIAG_TIER1) so the
-            // transition is visible even when transitioning *to* tier 0.
+            int n = std::clamp(cv.GetInt(), 0, 3);
+            pt::diag::g_diag_level.store(n, std::memory_order_relaxed);
             LOG_INFO("[engine.cvars] r_diagnostic_level={} ({})", n,
                      n == 0 ? "off"
                    : n == 1 ? "state-transition"
@@ -3694,7 +3691,8 @@ void Engine::RegisterCommands() {
         // registration block ran during Engine::Init -- although today
         // RegisterCommands runs before the cfg load, future reorders
         // shouldn't break the invariant).
-        pt::diag::g_diag_level = std::clamp(v->GetInt(), 0, 3);
+        pt::diag::g_diag_level.store(std::clamp(v->GetInt(), 0, 3),
+                                     std::memory_order_relaxed);
     }
     if (auto* v = C.FindCVar("r_denoiser")) {
         // metalfx is Mac-only; svgf_basic / svgf_atrous / nrd / optix_*

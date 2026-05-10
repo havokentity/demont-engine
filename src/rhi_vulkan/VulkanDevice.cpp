@@ -981,16 +981,23 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         build_pipeline("perfoverlay", shader_PerfOverlay_spirv_data,  shader_PerfOverlay_spirv_size);
         pipelines_ready_.store(true, std::memory_order_release);
 
-        const double total_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - t_start).count();
-        std::string per_pipe;
-        for (const auto& p : timings) {
-            if (!per_pipe.empty()) per_pipe += ", ";
-            per_pipe += fmt::format("{} {:.0f}ms", p.name, p.ms);
+        // Skip the per-pipeline timing-string construction below tier 2.
+        // The macro itself short-circuits format-args evaluation, but the
+        // explicit `per_pipe` loop sits outside the macro and would run
+        // unconditionally otherwise -- belt-and-braces with the macro's
+        // own gate.
+        if (pt::diag::TierEnabled(2)) {
+            const double total_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_start).count();
+            std::string per_pipe;
+            for (const auto& p : timings) {
+                if (!per_pipe.empty()) per_pipe += ", ";
+                per_pipe += fmt::format("{} {:.0f}ms", p.name, p.ms);
+            }
+            PT_DIAG_TIER2("rhi.vulkan",
+                          "async pipeline build done in {:.0f}ms ({})",
+                          total_ms, per_pipe);
         }
-        PT_DIAG_TIER2("rhi.vulkan",
-                      "async pipeline build done in {:.0f}ms ({})",
-                      total_ms, per_pipe);
     });
 
     if (!RecreateSwapchain()) return;
