@@ -99,11 +99,13 @@ if(PT_ENABLE_OPTIX AND PT_ENABLE_VULKAN_BACKEND)
         endif()
         if(NOT OPTIX_INCLUDE_DIR)
             message(STATUS "PT_ENABLE_OPTIX: OptiX SDK headers not found; "
-                           "OptiX denoiser inactive. Install OptiX 8+ and either "
+                           "OptiX denoiser inactive. Install OptiX 8+/9+ and either "
                            "set OPTIX_INSTALL_DIR (e.g. "
                            "'C:/ProgramData/NVIDIA Corporation/OptiX SDK 9.1.0') "
                            "in the shell that runs cmake, or accept the auto-detected "
-                           "path on a fresh shell after install.")
+                           "path on a fresh shell after install. See OPTIX_SETUP.md "
+                           "in the repo root for full setup + driver-compat notes "
+                           "(including the OptiX 9.0 fallback for older drivers).")
         endif()
     endif()
 endif()
