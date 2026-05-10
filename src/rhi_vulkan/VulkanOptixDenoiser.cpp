@@ -656,14 +656,19 @@ void VulkanOptixDenoiser::Encode(VkCommandBuffer cb,
     }
 
     // ---- Resolve engine VkImages ---------------------------------------
-    VkImage src_img = device_->LookupImage(d.color_in);
-    VkImage dst_img = device_->LookupImage(d.output);
+    VkImage src_img      = device_->LookupImage(d.color_in);
+    VkImage dst_img      = device_->LookupImage(d.output);
+    VkImage swap_img     = device_->LookupImage(d.final_output);
     if (src_img == VK_NULL_HANDLE || dst_img == VK_NULL_HANDLE) {
         LOG_WARN("VulkanOptixDenoiser::Encode: image lookup miss "
                  "(src={} dst={})", static_cast<void*>(src_img),
                                     static_cast<void*>(dst_img));
         return;
     }
+    // swap_img may be VK_NULL_HANDLE if engine didn't pass final_output
+    // (older callers). In that case we skip the blit-to-swapchain step
+    // and the image stays noisy on screen, but the OptiX denoise at
+    // least lands cleanly in d.output for any downstream finalize.
 
     timeline_counter_++;
     const std::uint64_t this_frame = timeline_counter_;
@@ -788,20 +793,113 @@ void VulkanOptixDenoiser::Encode(VkCommandBuffer cb,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                1, &region);
 
-        VkImageMemoryBarrier backToGeneral{};
-        backToGeneral.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        backToGeneral.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        backToGeneral.newLayout     = VK_IMAGE_LAYOUT_GENERAL;
-        backToGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        backToGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        backToGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        backToGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        backToGeneral.image         = dst_img;
-        backToGeneral.subresourceRange = toDst.subresourceRange;
-        vkCmdPipelineBarrier(pcb,
-            VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &backToGeneral);
+        // ---- Blit denoised result to swapchain (v1: skips tonemap) ----
+        // For v1 we use vkCmdBlitImage to get the OptiX-denoised pixels
+        // onto screen with format conversion (RGBA16F -> BGRA8_SRGB).
+        // The blit does sRGB-encoding on write but does NOT do HDR
+        // tonemap, so values >1.0 clamp to white. Visually different
+        // from SVGF's DenoiseFinalize (which applies ACES + sRGB), but
+        // confirms 'is OptiX denoising' end-to-end. v2 will reuse the
+        // SVGF DenoiseFinalize.slang compute kernel for proper tonemap.
+        if (swap_img != VK_NULL_HANDLE) {
+            // d.output: TRANSFER_DST -> TRANSFER_SRC (read for blit).
+            VkImageMemoryBarrier outToSrc{};
+            outToSrc.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            outToSrc.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            outToSrc.newLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            outToSrc.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            outToSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            outToSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            outToSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            outToSrc.image         = dst_img;
+            outToSrc.subresourceRange = toDst.subresourceRange;
+            vkCmdPipelineBarrier(pcb,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &outToSrc);
+
+            // Swapchain: UNDEFINED (don't care -- we'll overwrite the
+            // whole image) -> TRANSFER_DST. Engine's Submit transitioned
+            // it to PRESENT_SRC after the path-tracer dispatch; UNDEFINED
+            // here is spec-correct since the entire image is replaced.
+            VkImageMemoryBarrier swapToDst{};
+            swapToDst.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            swapToDst.oldLayout     = VK_IMAGE_LAYOUT_UNDEFINED;
+            swapToDst.newLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            swapToDst.srcAccessMask = 0;
+            swapToDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            swapToDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            swapToDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            swapToDst.image         = swap_img;
+            swapToDst.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            swapToDst.subresourceRange.layerCount = 1;
+            swapToDst.subresourceRange.levelCount = 1;
+            vkCmdPipelineBarrier(pcb,
+                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &swapToDst);
+
+            VkImageBlit blit{};
+            blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            blit.srcSubresource.layerCount = 1;
+            blit.srcOffsets[1] = { static_cast<int32_t>(cached_w_),
+                                   static_cast<int32_t>(cached_h_), 1 };
+            blit.dstSubresource = blit.srcSubresource;
+            blit.dstOffsets[1] = blit.srcOffsets[1];
+            vkCmdBlitImage(pcb,
+                           dst_img,  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           swap_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           1, &blit, VK_FILTER_NEAREST);
+
+            // Swapchain back to PRESENT_SRC for vkQueuePresentKHR.
+            VkImageMemoryBarrier swapToPres{};
+            swapToPres.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            swapToPres.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            swapToPres.newLayout     = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            swapToPres.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            swapToPres.dstAccessMask = 0;
+            swapToPres.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            swapToPres.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            swapToPres.image         = swap_img;
+            swapToPres.subresourceRange = swapToDst.subresourceRange;
+            vkCmdPipelineBarrier(pcb,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &swapToPres);
+
+            // d.output back to GENERAL for next frame's path-tracer
+            // dispatch (or SVGF cycle on cvar switch back).
+            VkImageMemoryBarrier outBackToGeneral{};
+            outBackToGeneral.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            outBackToGeneral.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            outBackToGeneral.newLayout     = VK_IMAGE_LAYOUT_GENERAL;
+            outBackToGeneral.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            outBackToGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            outBackToGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            outBackToGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            outBackToGeneral.image         = dst_img;
+            outBackToGeneral.subresourceRange = toDst.subresourceRange;
+            vkCmdPipelineBarrier(pcb,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &outBackToGeneral);
+        } else {
+            // No swapchain target -- just leave d.output in GENERAL.
+            VkImageMemoryBarrier backToGeneral{};
+            backToGeneral.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            backToGeneral.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            backToGeneral.newLayout     = VK_IMAGE_LAYOUT_GENERAL;
+            backToGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            backToGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            backToGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            backToGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            backToGeneral.image         = dst_img;
+            backToGeneral.subresourceRange = toDst.subresourceRange;
+            vkCmdPipelineBarrier(pcb,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &backToGeneral);
+        }
 
         vkEndCommandBuffer(pcb);
     }
