@@ -113,6 +113,7 @@ public:
 
     // Internal accessors used by the command buffer.
     VkDevice         RawDevice()     const { return device_; }
+    VkPhysicalDevice RawPhysicalDevice() const { return phys_device_; }
     VkPipeline       LookupPipeline(PipelineHandle h);
     VkPipelineLayout LookupPipelineLayout(PipelineHandle h);
     VkImageView      CurrentSwapchainImageView() const;
