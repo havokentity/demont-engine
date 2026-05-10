@@ -243,7 +243,16 @@ void WinPerf::EnsureScale() {
     if (v == nullptr) return;
     char* end = nullptr;
     float requested = std::strtof(v->value.c_str(), &end);
-    if (end == v->value.c_str()) requested = 1.0f;
+    // Reject "no digits parsed" AND non-finite values (NaN / +-Inf).
+    // strtof happily returns a quiet NaN for "nan"/"NaN"/"NAN" inputs
+    // and +-Inf for "inf"; once non-finite slips into the comparisons
+    // below, the < / > clamps return false in BOTH directions (NaN
+    // compares unordered) -- so requested would stay NaN, sneak past
+    // the early-exit, and the static_cast<int>(NaN * something) calls
+    // computing new_font_h / new_panel_w / new_graph_h would be
+    // undefined behavior. Fall back to 1.0 (engineering default)
+    // before any math/casts. Copilot review pass on PR #10.
+    if (end == v->value.c_str() || !std::isfinite(requested)) requested = 1.0f;
     if (requested < 0.5f) requested = 0.5f;
     if (requested > 3.0f) requested = 3.0f;
     if (std::fabs(requested - font_scale_) < 1e-3f) return;

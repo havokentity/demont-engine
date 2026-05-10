@@ -984,7 +984,12 @@ body::after {
 .kv .v-input-wrap .v-input {
   flex: 1 1 auto;
   background: transparent;
-  color: var(--text);
+  /* All themes (root + each .theme-*) define --fg; --text was never
+     defined anywhere in this stylesheet, so the original declaration
+     resolved to the inherited browser-default and rendered the typed
+     text in the wrong color on a few themes. Fixed in Copilot review
+     pass on PR #10. */
+  color: var(--fg);
   border: none;
   border-bottom: 1px solid var(--border);
   outline: none;

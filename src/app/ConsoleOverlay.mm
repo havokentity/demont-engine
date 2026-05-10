@@ -1170,9 +1170,16 @@ void ConsoleOverlay::ApplyTheme(std::string_view name) {
 
 void ConsoleOverlay::Repaint() {
     // Mac path: forward to the consoleView's setNeedsDisplay: (must
-    // run on the main thread per AppKit rules; cvar on_change runs on
-    // the engine thread / civetweb worker thread, so dispatch async
-    // to main). Win32 implementation is in ConsoleOverlay_Win32.cpp.
+    // run on the main thread per AppKit rules). Today every caller
+    // reaches Repaint() on the engine main thread -- the civetweb
+    // worker thread only enqueues commands via Console::QueueExecute,
+    // and the actual Execute() (which fires cvar on_change) runs from
+    // Console::Drain() called from Engine::Tick() on main. On macOS
+    // the engine main thread IS AppKit's main thread, so the
+    // dispatch_async-to-main below is technically a no-op shuffle in
+    // the steady state -- but it's a cheap defensive safety net for
+    // any future caller that bypasses Drain. Win32 implementation is
+    // in ConsoleOverlay_Win32.cpp.
     if (!opaque_) return;
     PtConsolePanel* panel = (__bridge PtConsolePanel*)opaque_;
     dispatch_async(dispatch_get_main_queue(), ^{

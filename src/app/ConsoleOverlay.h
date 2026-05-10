@@ -51,10 +51,20 @@ public:
     // mouse over the overlay or types something. Cvar IS the source
     // of truth; this just kicks the consumer to re-read it.
     //
-    // Thread-safe: Win32 InvalidateRect is documented thread-safe;
-    // Mac forwards to setNeedsDisplay: which is main-thread-required
-    // but cvar on_change runs on the engine thread anyway. No-op if
-    // the overlay is hidden.
+    // Threading: cvar on_change ALWAYS fires on the engine main
+    // thread -- the civetweb worker thread only enqueues into
+    // Console::QueueExecute(), and the actual Execute() (which calls
+    // on_change) runs from Console::Drain(), invoked once per frame
+    // from Engine::Tick() on the main thread. So today's callers
+    // always reach Repaint() on main.
+    //
+    // Win32: InvalidateRect is documented thread-safe regardless.
+    // macOS: the engine main thread IS the AppKit main thread, so
+    // setNeedsDisplay: would be safe to call directly; the .mm
+    // implementation still dispatch_async-es to main as a defensive
+    // safety net for any future caller that bypasses Drain().
+    //
+    // No-op if the overlay is hidden.
     void Repaint();
 
     // Called by Engine on the GLFW resize callback so the floating panel
