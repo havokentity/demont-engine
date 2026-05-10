@@ -80,7 +80,8 @@ public:
                 TextureHandle   final_output,  // tonemapped-LDR target (swapchain)
                 BufferHandle    exposure_state,
                 bool            reset_history,
-                bool            atrous_enabled);
+                bool            atrous_enabled,
+                bool            hdr_pipeline);
 
     // True after Init() succeeded. Used by VulkanDevice::SupportsDenoise.
     bool Ready() const { return ready_; }

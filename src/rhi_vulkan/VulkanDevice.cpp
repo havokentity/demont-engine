@@ -2371,17 +2371,23 @@ std::size_t VulkanDevice::CurrentAllocatedBytes() const {
 // ---- SVGF/NRD denoiser --------------------------------------------------
 
 bool VulkanDevice::SupportsDenoise() const {
-    // The denoiser is allocated lazily on first Denoise() call; once
-    // ready_ flips true it stays so until backend teardown. Reporting
-    // false until the first dispatch means the engine's first-frame
-    // path doesn't allocate G-buffer textures we'd then ignore. The
-    // engine will re-poll SupportsDenoise each frame (no caching),
-    // and once we return true it allocates the G-buffers and the
-    // next frame's Denoise() call drives the SVGF chain.
+    // Two-stage readiness:
+    //   1) `denoiser_->Ready()` is true once the denoiser has been
+    //      lazily initialised by the first Denoise() call (which builds
+    //      its 3 compute pipelines, descriptor pool, and dummy textures
+    //      synchronously -- a one-time few-ms hitch on first transition
+    //      from r_denoiser=off to a Vulkan kind).
+    //   2) Before that first init, fall back to `pipelines_ready_`,
+    //      which the engine's main async pipeline-build worker flips
+    //      true after pathtrace/autoexpose/perfoverlay finish. This is
+    //      a soft signal -- it means "the device has finished its
+    //      heavy-lift cold-cache work, opting in is safe" -- not "the
+    //      denoiser itself is ready". The hitch on opt-in is acceptable
+    //      because it's a one-shot user-driven cvar transition.
+    // Eagerly building the denoiser in the worker would eliminate the
+    // hitch (see the FOLLOW_UPS.md note); deferred since the hitch is
+    // small and only happens once per session.
     if (denoiser_ != nullptr && denoiser_->Ready()) return true;
-    // Async pipelines still building: we lazy-init in Denoise() so
-    // the first dispatch costs more, but reporting "not ready yet"
-    // here keeps the engine on its noisy-but-correct fallback path.
     return pipelines_ready_.load(std::memory_order_acquire);
 }
 
@@ -2438,7 +2444,8 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
                       d.normal_in, d.output,
                       d.final_output, d.exposure_state,
                       d.reset_history,
-                      atrous_enabled);
+                      atrous_enabled,
+                      d.hdr_pipeline);
 }
 
 }  // namespace pt::rhi::vk

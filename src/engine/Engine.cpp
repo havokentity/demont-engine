@@ -2224,6 +2224,16 @@ void Engine::RenderFrame() {
         dd.quality = (denoiser_kind_ == DenoiserKind::SvgfBasic)
                          ? pt::rhi::Device::DenoiseDesc::Quality::Basic
                          : pt::rhi::Device::DenoiseDesc::Quality::Atrous;
+        // r_hdr_pipeline mirrors row0.w of the path-tracer push (set
+        // earlier this frame) -- we read the cvar straight here so
+        // the denoiser-finalize sRGB-only branch matches whichever
+        // tonemap the path tracer applied to denoise_color. Default
+        // (1) keeps tonemap+OETF in finalize; setting r_hdr_pipeline 0
+        // skips the tonemap so the path tracer's pre-tonemapped
+        // denoise_color isn't double-mapped.
+        bool dd_hdr_pipeline = true;
+        if (auto* v = C.FindCVar("r_hdr_pipeline")) dd_hdr_pipeline = v->GetBool();
+        dd.hdr_pipeline = dd_hdr_pipeline;
         // MetalFX wants worldToView and viewToClip separately, so pass
         // them rather than the combined view*proj. glm matrices are
         // column-major, matching simd_float4x4 on the consumer end.

@@ -431,7 +431,8 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                                TextureHandle   final_output,
                                BufferHandle    exposure_state,
                                bool            reset_history,
-                               bool            atrous_enabled) {
+                               bool            atrous_enabled,
+                               bool            hdr_pipeline) {
     if (!ready_) return;
     if (cb == VK_NULL_HANDLE) return;
     if (cached_w_ == 0 || cached_h_ == 0) return;
@@ -450,11 +451,17 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
     VkImageView v_atrous_b  = device_->LookupImageView(TextureHandle{atrous_b_id_});
     VkImageView v_dummy_c   = device_->LookupImageView(TextureHandle{dummy_color_id_});
     VkImageView v_dummy_m   = device_->LookupImageView(TextureHandle{dummy_motion_id_});
+    // The atrous passes bind v_dummy_c / v_dummy_m at the otherwise-
+    // unused slots 1 and 3 of the temporal/atrous descriptor set, so
+    // they need the same null-view check as the real inputs -- a stray
+    // VK_NULL_HANDLE write would either trigger a validation error or
+    // (without robustness2 nullDescriptor) a real undefined access.
     if (v_color_in == VK_NULL_HANDLE || v_depth == VK_NULL_HANDLE ||
         v_motion == VK_NULL_HANDLE   || v_normal == VK_NULL_HANDLE ||
         v_output == VK_NULL_HANDLE   || v_hist_a == VK_NULL_HANDLE ||
         v_hist_b == VK_NULL_HANDLE   || v_atrous_a == VK_NULL_HANDLE ||
-        v_atrous_b == VK_NULL_HANDLE) {
+        v_atrous_b == VK_NULL_HANDLE ||
+        v_dummy_c == VK_NULL_HANDLE  || v_dummy_m == VK_NULL_HANDLE) {
         LOG_WARN("VulkanNrdDenoiser::Encode: missing input image views");
         return;
     }
@@ -538,9 +545,20 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                      reinterpret_cast<void*>(dst_img));
             return;
         }
+        // Compute -> transfer handoff. dstAccess covers both the
+        // transfer's read of the source image (history_write) AND its
+        // write to the destination image (output) -- the latter being
+        // the WAW edge against any prior shader write to `output`. In
+        // the current flow `output` (post_denoise_hdr) isn't touched
+        // earlier in this command buffer (atrous mode would have
+        // written there, but we're in the basic branch), so the WAW
+        // is theoretical -- still, declaring TRANSFER_WRITE_BIT here
+        // is the spec-correct way and keeps validation happy if a
+        // future caller introduces such a write upstream.
         StageBarrier(cb,
                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-                     VK_PIPELINE_STAGE_TRANSFER_BIT,       VK_ACCESS_TRANSFER_READ_BIT);
+                     VK_PIPELINE_STAGE_TRANSFER_BIT,
+                     VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
         VkImageCopy region{};
         region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         region.srcSubresource.layerCount = 1;
@@ -613,11 +631,12 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
             struct FinalizePush {
                 std::uint32_t width;
                 std::uint32_t height;
-                std::uint32_t pad0;
+                std::uint32_t hdr_pipeline;  // 1 = ACES + sRGB; 0 = sRGB OETF only
                 std::uint32_t pad1;
             } fp{};
-            fp.width  = cached_w_;
-            fp.height = cached_h_;
+            fp.width        = cached_w_;
+            fp.height       = cached_h_;
+            fp.hdr_pipeline = hdr_pipeline ? 1u : 0u;
             vkCmdPushConstants(cb, finalize_pipe_layout_,
                                VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                sizeof(fp), &fp);

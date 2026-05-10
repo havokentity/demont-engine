@@ -130,6 +130,13 @@ public:
         // exposure the path tracer's inline tonemap would have used.
         // MetalFX ignores it.
         BufferHandle  exposure_state;
+        // Vulkan SVGF/NRD only: r_hdr_pipeline value (1 = path tracer
+        // wrote raw linear HDR into color_in, denoiser finalize applies
+        // ACES + sRGB; 0 = path tracer already tonemapped into color_in,
+        // finalize applies sRGB OETF only). MetalFX ignores it -- the
+        // existing Tonemap.slang pipeline keys on the same flag via its
+        // own push.
+        bool hdr_pipeline = true;
         float jitter_x       = 0.0f;
         float jitter_y       = 0.0f;
         bool  reset_history  = false; // true on backend switch / scene reset

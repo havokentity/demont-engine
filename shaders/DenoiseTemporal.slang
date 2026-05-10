@@ -71,24 +71,30 @@ ReprojSample sampleHistory(float2 prev_pos, float curr_depth, float3 curr_normal
 
     float4 acc = float4(0.0);
     float  wsum = 0.0;
+    // Disocclusion test -- known simplification.
+    // ---------------------------------------------------------------
+    // A textbook SVGF disocclusion check compares THIS frame's depth
+    // / normal at curr_pos against LAST frame's depth / normal at
+    // prev_pos. We currently sample depth_tex / normal_tex (which the
+    // path tracer wrote THIS frame) at prev_pos. The check effectively
+    // asks "are the surfaces near curr_pos and prev_pos similar in
+    // this frame?" -- a weaker proxy that catches large depth/normal
+    // discontinuities (silhouette edges) but misses true cross-frame
+    // disocclusions (a previously-occluded surface revealed by motion
+    // shows the same depth/normal this frame as the surrounding
+    // visible surface).
+    //
+    // Proper fix is to ping-pong depth_history / normal_history
+    // textures alongside color_history; deferred (see Raytracer
+    // Plan/FOLLOW_UPS.md). The current behaviour is visibly clean on
+    // the default scenes; ghosting on disocclusions is the trade-off.
     [unroll] for (int i = 0; i < 4; ++i) {
         int2 p = base + off[i];
         if (p.x < 0 || p.y < 0 || p.x >= int(width) || p.y >= int(height)) continue;
         uint2 up = uint2(p);
-        // Reuse depth_tex at the reprojected pixel as the historical
-        // depth proxy. The path tracer writes depth_tex with this
-        // frame's depth, but motion vectors say "the surface that's
-        // now at curr_pos was at prev_pos last frame", and frame N-1's
-        // depth at prev_pos and frame N's depth at curr_pos should
-        // agree to within the depth_tolerance (modulo silhouettes /
-        // disocclusions). When they don't, drop this tap.
         float prev_depth = depth_tex[up];
         float depth_delta = abs(prev_depth - curr_depth) / max(curr_depth, 1e-3);
         if (depth_delta > depth_tolerance) continue;
-        // Same idea for normals: the cross-frame normal should be
-        // ~aligned for the surface to be the same one. Sky pixels
-        // (zero normal) skip this check via the dot-with-zero
-        // collapsing to 0 < normal_tolerance, which we permit.
         float3 prev_n = normal_tex[up].xyz;
         if (length(curr_normal) > 0.5 && length(prev_n) > 0.5) {
             float n_dot = dot(curr_normal, prev_n);

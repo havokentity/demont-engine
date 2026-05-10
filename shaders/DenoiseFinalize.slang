@@ -14,13 +14,14 @@
 // wrote inline -- making r_denoiser={svgf_basic,svgf_atrous,nrd}
 // visually identical to r_denoiser=off.
 //
-// Quality note: this kernel always applies ACES + sRGB. It assumes
-// the path tracer fed denoise_color the raw linear HDR radiance
-// (i.e. r_hdr_pipeline = 1, the default). With r_hdr_pipeline = 0
-// the path tracer pre-applies tonemap to denoise_color and this
-// kernel would double-tonemap -- a visibly washed-out image. The
-// engine warns on that combo. When the proper Tonemap pipeline
-// lands on Vulkan it'll honor r_hdr_pipeline correctly.
+// Honors r_hdr_pipeline:
+//   hdr_pipeline = 1 (default): denoise_color holds linear HDR
+//     radiance from the path tracer; we apply exposure * ACES * sRGB
+//     OETF here -- one tonemap, end-to-end.
+//   hdr_pipeline = 0: the path tracer already pre-tonemapped into
+//     denoise_color, so we skip the tonemap and just apply the sRGB
+//     OETF for swapchain encoding. Avoids the double-tonemap that
+//     would otherwise wash the image out.
 
 [[vk::binding(0, 0)]] RWTexture2D<float4> hdr_in;
 [[vk::binding(1, 0)]] RWTexture2D<float4> swap_out;
@@ -30,7 +31,7 @@
 cbuffer Push {
     uint width;
     uint height;
-    uint _pad0;
+    uint hdr_pipeline;     // 1 = apply ACES + sRGB; 0 = sRGB OETF only
     uint _pad1;
 };
 
@@ -54,9 +55,15 @@ float3 srgb_oetf(float3 c) {
 [numthreads(8, 8, 1)]
 void main(uint2 tid : SV_DispatchThreadID) {
     if (tid.x >= width || tid.y >= height) return;
-    float3 hdr = hdr_in[tid].rgb;
-    float exposure = exposure_state[0];
-    float3 ldr = acesTonemap(hdr * exposure);
-    ldr = srgb_oetf(ldr);
-    swap_out[tid] = float4(ldr, 1.0);
+    float3 c = hdr_in[tid].rgb;
+    if (hdr_pipeline != 0u) {
+        // Linear HDR in -- apply exposure + ACES, then sRGB OETF.
+        float exposure = exposure_state[0];
+        c = acesTonemap(c * exposure);
+    }
+    // sRGB encode runs in either branch: hdr_pipeline=0 case has
+    // already-tonemapped LDR-ish values that still need the OETF
+    // for the BGRA8Unorm swapchain.
+    c = srgb_oetf(c);
+    swap_out[tid] = float4(c, 1.0);
 }

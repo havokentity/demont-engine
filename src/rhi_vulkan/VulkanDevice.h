@@ -97,9 +97,14 @@ public:
     const char*  DeviceName()       const override { return device_name_.c_str(); }
     std::size_t  CurrentAllocatedBytes() const override;
 
-    // SVGF/NRD denoiser. SupportsDenoise flips true once the worker
-    // thread finishes building the denoise pipelines + scratch
-    // textures; until then the engine's Denoise() call is a no-op.
+    // SVGF/NRD denoiser. The denoiser pipelines + scratch textures are
+    // NOT built by the async worker -- they're constructed lazily on
+    // the first Denoise() call (a few ms one-time hitch on the first
+    // frame after r_denoiser is toggled to a Vulkan kind). Until then,
+    // SupportsDenoise gates on the main async pipeline build (so the
+    // engine doesn't flag denoiser as available before the path-tracer
+    // pipeline is even ready). After lazy init, the cached `ready_`
+    // flag short-circuits this check.
     bool SupportsDenoise() const override;
     void Denoise(const DenoiseDesc& d) override;
 

@@ -271,6 +271,27 @@ default scene with both procedural and HDRI sky. Both `svgf_basic`
 and `svgf_atrous` boot cleanly on RTX 5090 with no VK validation
 messages.
 
+**Quality follow-ups (all small):**
+
+- *Proper cross-frame disocclusion test.* `DenoiseTemporal.slang`
+  currently samples this-frame's `depth_tex` / `normal_tex` at
+  `prev_pos` rather than last-frame's depth/normal there -- a
+  weaker proxy that catches large depth/normal discontinuities
+  (silhouettes) but misses revealed-surface disocclusions. Fix:
+  ping-pong `depth_history` / `normal_history` textures alongside
+  `color_history_a` / `_b` and sample those in the bilinear
+  rejection loop. ~30 LOC + 2 extra RGBA16F textures (16 MB at
+  1080p). Visible improvement on fast camera turns at object
+  silhouettes.
+- *Eager denoiser pipeline build in the worker thread.* Today
+  `VulkanNrdDenoiser::Init()` runs synchronously on the first
+  `Denoise()` call -- a few-ms hitch on the first frame after
+  toggling `r_denoiser` from `off` to a Vulkan kind. Moving the
+  build into the existing async pipeline-build worker (alongside
+  `pathtrace`/`autoexpose`/`perfoverlay`) eliminates the hitch
+  cleanly; the denoiser's resource_mutex usage is already worker-
+  safe.
+
 **Future cross-platform option — SVGF on Metal:** the same two
 shaders (`DenoiseTemporal.slang` / `DenoiseAtrous.slang`) compile to
 MSL with no source changes (no SPIR-V-only intrinsics in the bodies).

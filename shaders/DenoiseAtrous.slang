@@ -37,7 +37,11 @@ cbuffer Push {
     uint  step_size;       // 1, 2, 4, ...
     uint  _pad0;
     float sigma_depth;     // larger = depth differences more tolerated
-    float sigma_normal;    // smaller = normals must agree more strictly
+    // sigma_normal is the exponent in `pow(max(0,dot(n0,n1)), sigma_normal)`.
+    // Larger value = stricter normal agreement (the weight falls off
+    // faster as the dot product moves away from 1). Defaults around
+    // 64 give crisp creases; 8 is soft, 256 is razor.
+    float sigma_normal;
     float sigma_color;     // larger = color differences more tolerated
     float _pad1;
 };
