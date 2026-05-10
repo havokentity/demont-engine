@@ -116,6 +116,21 @@ public:
         float jitter_x       = 0.0f;
         float jitter_y       = 0.0f;
         bool  reset_history  = false; // true on backend switch / scene reset
+        // SVGF/NRD-only: which spatial-filter quality tier to apply
+        // after the temporal accumulation pass.
+        //   Basic  = temporal only, then a one-shot vkCmdCopyImage to
+        //            the output texture. ~1.5 ms at 1080p on a 5090.
+        //            Cleaner under fast motion (no atrous lag), slightly
+        //            noisier on disocclusions / undersampled regions.
+        //   Atrous = temporal pass + 3 a-trous wavelet passes at step
+        //            sizes 1/2/4 with depth+normal+luminance edge stops.
+        //            ~5 ms; cleaner on disocclusions, mild softening of
+        //            micro-detail.
+        // MetalFX path ignores this. Defaults to Atrous so existing
+        // callers (and the `r_denoiser svgf` alias) keep their previous
+        // behaviour.
+        enum class Quality : std::uint8_t { Basic, Atrous };
+        Quality quality = Quality::Atrous;
         // Required by MetalFX TemporalDenoisedScaler. Column-major 4x4
         // (16 floats each). Pass nullptr only if the backend doesn't need
         // them (currently: nothing -- both Metal and any future Vulkan

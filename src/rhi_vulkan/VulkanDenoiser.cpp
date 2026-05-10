@@ -60,6 +60,24 @@ void ComputeChainBarrier(VkCommandBuffer cb) {
                          0, 1, &mb, 0, nullptr, 0, nullptr);
 }
 
+// Generic stage/access barrier. Used to bracket the vkCmdCopyImage in
+// the svgf_basic path: the temporal compute write must be visible to
+// the transfer read of the same image, and the transfer write to the
+// caller's output must be visible to the subsequent bloom/tonemap
+// compute reads. All affected images stay in VK_IMAGE_LAYOUT_GENERAL,
+// so a memory-only barrier is sufficient -- no image-layout transition
+// needed.
+void StageBarrier(VkCommandBuffer cb,
+                  VkPipelineStageFlags src_stage, VkAccessFlags src_access,
+                  VkPipelineStageFlags dst_stage, VkAccessFlags dst_access) {
+    VkMemoryBarrier mb{};
+    mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = src_access;
+    mb.dstAccessMask = dst_access;
+    vkCmdPipelineBarrier(cb, src_stage, dst_stage,
+                         0, 1, &mb, 0, nullptr, 0, nullptr);
+}
+
 }  // namespace
 
 VulkanNrdDenoiser::~VulkanNrdDenoiser() {
@@ -338,7 +356,8 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                                TextureHandle   motion_in,
                                TextureHandle   normal_in,
                                TextureHandle   output,
-                               bool            reset_history) {
+                               bool            reset_history,
+                               bool            atrous_enabled) {
     if (!ready_) return;
     if (cb == VK_NULL_HANDLE) return;
     if (cached_w_ == 0 || cached_h_ == 0) return;
@@ -400,28 +419,69 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                v_color_in, v_hist_read, v_depth, v_motion, v_normal,
                v_hist_write,
                &p1, sizeof(p1), gx, gy);
-    ComputeChainBarrier(cb);
 
-    // ---- Passes 2..4: a-trous chain at step sizes 1, 2, 4 --------------
-    // The first pass reads the just-written history (v_hist_write) and
-    // outputs to atrous_a; subsequent passes ping-pong between the two
-    // atrous textures. The last pass writes directly to `output`.
-    auto atrous_pass = [&](VkImageView in, VkImageView out, std::uint32_t step) {
-        DenoisePush p{};
-        p.width         = cached_w_;
-        p.height        = cached_h_;
-        p.step_or_reset = step;
-        p.a             = 1.0f;    // sigma_depth (relative)
-        p.b             = 64.0f;   // sigma_normal (pow exponent; bigger = sharper edges)
-        p.c             = 4.0f;    // sigma_color (luminance Gaussian sigma)
-        RecordPass(cb, atrous_pipe_, NextSet(),
-                   in, v_dummy_c, v_depth, v_dummy_m, v_normal, out,
-                   &p, sizeof(p), gx, gy);
+    if (atrous_enabled) {
         ComputeChainBarrier(cb);
-    };
-    atrous_pass(v_hist_write, v_atrous_a, 1u);
-    atrous_pass(v_atrous_a,   v_atrous_b, 2u);
-    atrous_pass(v_atrous_b,   v_output,   4u);
+
+        // ---- Passes 2..4: a-trous chain at step sizes 1, 2, 4 ----------
+        // The first pass reads the just-written history (v_hist_write)
+        // and outputs to atrous_a; subsequent passes ping-pong between
+        // the two atrous textures. The last pass writes directly to
+        // `output`, leaving v_hist_write unchanged so next frame's
+        // temporal still blends from the pre-spatial-filter accumulation.
+        auto atrous_pass = [&](VkImageView in, VkImageView out, std::uint32_t step) {
+            DenoisePush p{};
+            p.width         = cached_w_;
+            p.height        = cached_h_;
+            p.step_or_reset = step;
+            p.a             = 1.0f;    // sigma_depth (relative)
+            p.b             = 64.0f;   // sigma_normal (pow exponent; bigger = sharper edges)
+            p.c             = 4.0f;    // sigma_color (luminance Gaussian sigma)
+            RecordPass(cb, atrous_pipe_, NextSet(),
+                       in, v_dummy_c, v_depth, v_dummy_m, v_normal, out,
+                       &p, sizeof(p), gx, gy);
+            ComputeChainBarrier(cb);
+        };
+        atrous_pass(v_hist_write, v_atrous_a, 1u);
+        atrous_pass(v_atrous_a,   v_atrous_b, 2u);
+        atrous_pass(v_atrous_b,   v_output,   4u);
+    } else {
+        // ---- svgf_basic: temporal-only -> copy history into output ----
+        // Skip the spatial filter entirely. The temporal pass already
+        // wrote v_hist_write; copy that exact image to the caller's
+        // output texture so the bloom + tonemap chain downstream sees
+        // the temporally-stable result. Both images are RGBA16F at
+        // (cached_w_, cached_h_) and stay in GENERAL layout, so a
+        // memory-barrier-only handoff plus a single vkCmdCopyImage is
+        // all we need.
+        const std::uint64_t hist_write_id =
+            (frame_parity_ == 0) ? history_b_id_ : history_a_id_;
+        VkImage src_img = device_->LookupImage(TextureHandle{hist_write_id});
+        VkImage dst_img = device_->LookupImage(output);
+        if (src_img == VK_NULL_HANDLE || dst_img == VK_NULL_HANDLE) {
+            LOG_WARN("VulkanNrdDenoiser::Encode: basic-mode VkImage lookup miss "
+                     "(src={} dst={})", reinterpret_cast<void*>(src_img),
+                     reinterpret_cast<void*>(dst_img));
+            return;
+        }
+        StageBarrier(cb,
+                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_TRANSFER_BIT,       VK_ACCESS_TRANSFER_READ_BIT);
+        VkImageCopy region{};
+        region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.srcSubresource.layerCount = 1;
+        region.dstSubresource            = region.srcSubresource;
+        region.extent.width  = cached_w_;
+        region.extent.height = cached_h_;
+        region.extent.depth  = 1;
+        vkCmdCopyImage(cb,
+                       src_img, VK_IMAGE_LAYOUT_GENERAL,
+                       dst_img, VK_IMAGE_LAYOUT_GENERAL,
+                       1, &region);
+        StageBarrier(cb,
+                     VK_PIPELINE_STAGE_TRANSFER_BIT,        VK_ACCESS_TRANSFER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,  VK_ACCESS_SHADER_READ_BIT);
+    }
 
     if (!effective_reset) {
         frame_parity_ ^= 1u;

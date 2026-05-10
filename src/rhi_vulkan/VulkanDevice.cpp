@@ -1534,7 +1534,16 @@ TextureHandle VulkanDevice::CreateTexture(const TextureDesc& d) {
     ici.arrayLayers  = 1;
     ici.samples      = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling       = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage        = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    // STORAGE_BIT  : sampling + writes from compute shaders (the
+    //                main path for every texture we create here).
+    // TRANSFER_DST : WriteTexture host upload + ReadbackTexture's
+    //                transient staging fill.
+    // TRANSFER_SRC : the SVGF basic-mode vkCmdCopyImage out of the
+    //                history texture into post_denoise_hdr; also
+    //                lets ReadbackTexture work on any storage image.
+    ici.usage        = VK_IMAGE_USAGE_STORAGE_BIT
+                     | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                     | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     ici.sharingMode  = VK_SHARING_MODE_EXCLUSIVE;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImage img = VK_NULL_HANDLE;
@@ -2422,9 +2431,12 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
         return;
     }
 
+    const bool atrous_enabled =
+        (d.quality == DenoiseDesc::Quality::Atrous);
     denoiser_->Encode(wrapped_cb_->Raw(),
                       d.color_in, d.depth_in, d.motion_in,
-                      d.normal_in, d.output, d.reset_history);
+                      d.normal_in, d.output, d.reset_history,
+                      atrous_enabled);
 }
 
 }  // namespace pt::rhi::vk

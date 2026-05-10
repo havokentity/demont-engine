@@ -64,13 +64,21 @@ public:
     // input textures (the engine already inserts a Barrier() between
     // path-tracer and autoexpose; we add our own between denoise
     // sub-passes). `reset_history` zeros temporal accumulation.
+    // `atrous_enabled` selects between the two quality tiers:
+    //   false (svgf_basic) -- temporal pass only, then vkCmdCopyImage
+    //                         the temporal result into `output`.
+    //   true  (svgf_atrous /
+    //          nrd alias)  -- temporal pass + 3 a-trous wavelet passes
+    //                         at step sizes 1/2/4 with the last pass
+    //                         writing directly into `output`.
     void Encode(VkCommandBuffer cb,
                 TextureHandle   color_in,
                 TextureHandle   depth_in,
                 TextureHandle   motion_in,
                 TextureHandle   normal_in,
                 TextureHandle   output,
-                bool            reset_history);
+                bool            reset_history,
+                bool            atrous_enabled);
 
     // True after Init() succeeded. Used by VulkanDevice::SupportsDenoise.
     bool Ready() const { return ready_; }

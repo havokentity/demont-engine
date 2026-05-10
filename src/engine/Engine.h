@@ -259,12 +259,19 @@ private:
     bool                                        prev_view_proj_valid_  = false;
     bool                                        denoiser_active_       = false;
     // Which denoiser kind the active backend is running. metalfx is
-    // Mac-only; svgf and nrd both route through the Vulkan
-    // VulkanNrdDenoiser today (real NRD library integration is
+    // Mac-only; svgf_basic/svgf_atrous/nrd all route through the
+    // Vulkan VulkanNrdDenoiser today (real NRD library integration is
     // deferred -- see Raytracer Plan/FOLLOW_UPS.md). Stored so the
     // engine knows whether to allocate the normal G-buffer (only the
-    // Vulkan path uses it) and which one-time log to print.
-    enum class DenoiserKind : std::uint8_t { Off, MetalFX, Svgf, Nrd };
+    // Vulkan paths need it) and which one-time log to print.
+    //
+    //   SvgfBasic  = temporal accumulation only (no spatial filter)
+    //   SvgfAtrous = temporal + 3-pass a-trous edge-aware filter
+    //   Nrd        = currently aliases SvgfAtrous; reserved for the
+    //                proper NVIDIA RayTracingDenoiser library later.
+    enum class DenoiserKind : std::uint8_t {
+        Off, MetalFX, SvgfBasic, SvgfAtrous, Nrd
+    };
     DenoiserKind                                denoiser_kind_         = DenoiserKind::Off;
     float                                       last_jitter_x_         = 0.0f;
     float                                       last_jitter_y_         = 0.0f;

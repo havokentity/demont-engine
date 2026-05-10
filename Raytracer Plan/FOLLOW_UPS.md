@@ -203,23 +203,30 @@ for reference (and as a template for the Vulkan denoiser).
 
 ---
 
-## Vulkan denoiser (5090 path) — `r_denoiser svgf | nrd`
+## Vulkan denoiser (5090 path) — `r_denoiser svgf_basic | svgf_atrous | nrd`
 
-**Status (in-house SVGF):** Landed. `r_denoiser svgf` and
-`r_denoiser nrd` both route through `VulkanNrdDenoiser` — a temporal
-accumulation pass + 3 a-trous wavelet passes (steps 1, 2, 4) running
-on the Vulkan backend's worker pipeline. The path tracer writes a
-fourth G-buffer (world-space normals at primary hit, RGBA16F,
-vk::binding(16), gated by `PT_TARGET_SPIRV` so Metal stays unaffected).
-Edge stops use depth + normal + luminance. Dispatch chain runs
-~2.5 ms at 1080p on a 5090.
+**Status (in-house SVGF):** Landed with two quality tiers plus the
+forward-compat `nrd` alias.
 
-Why both names point at the same kernel: `nrd` is the user-facing
-forward-compatible knob — when the proper NVIDIA library lands (see
-below) it'll swap the implementation under that cvar value without
-the user's `demont.cfg` needing to change. The engine logs a one-time
-note distinguishing the two on cvar transition so this isn't a silent
-swap.
+- `svgf_basic` — temporal accumulation only, no spatial filter. The
+  temporal pass writes the next frame's history texture; the result
+  is `vkCmdCopyImage`'d into `post_denoise_hdr` for the bloom +
+  tonemap chain. ~1.5 ms at 1080p on a 5090. Best for fast camera
+  motion (no a-trous lag), slightly noisier on disocclusions.
+- `svgf_atrous` — `svgf_basic` plus 3 a-trous wavelet passes at step
+  sizes 1/2/4 with depth + normal + luminance edge stops. The last
+  pass writes directly into `post_denoise_hdr`. ~5 ms; cleaner on
+  disocclusions, mild softening of micro-detail.
+- `svgf` — back-compat alias for `svgf_atrous` (the cvar value
+  briefly shipped without the basic/atrous split).
+- `nrd` — currently aliases `svgf_atrous`; reserved for the proper
+  NVIDIA library swap (see below). One-time log on transition so the
+  user knows they're on the SVGF placeholder.
+
+The path tracer writes a fourth G-buffer (world-space normal at
+primary hit, RGBA16F, `vk::binding(16)`, gated by `PT_TARGET_SPIRV`
+so the Metal/MetalFX path is unaffected) when any svgf*/nrd value
+is selected.
 
 **Open work — proper NRD library integration:**
 
@@ -262,7 +269,21 @@ eventual NRD path cover the bulk of cross-vendor users.
 
 **Acceptance for the in-house path (already met):** clean 1-spp at
 &gt;30 FPS at 1080p, no validation errors, edges preserved on the
-default scene with both procedural and HDRI sky.
+default scene with both procedural and HDRI sky. Both `svgf_basic`
+and `svgf_atrous` boot cleanly on RTX 5090 with no VK validation
+messages.
+
+**Future cross-platform option — SVGF on Metal:** the same two
+shaders (`DenoiseTemporal.slang` / `DenoiseAtrous.slang`) compile to
+MSL with no source changes (no SPIR-V-only intrinsics in the bodies).
+Adding Metal support would mean: emit them as MSL targets in the
+`pt_rhi_metal` CMakeLists, drop the `PT_TARGET_SPIRV` gate around
+`PathTrace.slang`'s `normal_tex` declaration, allocate the normal
+G-buffer for the Metal path too, and wire `MetalDevice::Denoise` to
+dispatch the SVGF kernels as an alternative to MetalFX (perhaps
+exposed as `r_denoiser svgf_basic` / `svgf_atrous` on Mac instead
+of routing those values to off). That'd give Mac users a
+G-buffer-aware option alongside MetalFX's black-box approach.
 
 ---
 

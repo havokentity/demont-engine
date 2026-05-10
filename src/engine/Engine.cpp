@@ -93,13 +93,16 @@ namespace cvar {
     PT_CVAR(r_denoiser,        "off",
             "Denoiser. off = noisy 1-spp, accumulating image only. "
             "metalfx = Mac MetalFX TemporalDenoisedScaler (Apple Silicon "
-            "only). svgf = Vulkan in-house SVGF-style denoiser: temporal "
-            "accumulation + 3-tap a-trous edge-aware filter, runs on any "
-            "Vulkan device with ray query. nrd = same dispatch chain as "
-            "svgf today; reserved for the proper NVIDIA RayTracingDenoiser "
-            "library integration once that's wired up (see Raytracer "
-            "Plan/FOLLOW_UPS.md). Mac builds ignore svgf/nrd; Windows "
-            "builds ignore metalfx.",
+            "only). svgf_basic = Vulkan in-house temporal accumulation "
+            "only (no spatial filter, ~1.5 ms at 1080p; cleaner under "
+            "fast motion, slightly noisier on disocclusions). svgf_atrous "
+            "= svgf_basic + 3-pass a-trous edge-aware spatial filter "
+            "(~5 ms; cleaner on disocclusions, mild softening of micro "
+            "detail). svgf = alias for svgf_atrous. nrd = same dispatch "
+            "chain as svgf_atrous today; reserved for the proper NVIDIA "
+            "RayTracingDenoiser library integration once that's wired up "
+            "(see Raytracer Plan/FOLLOW_UPS.md). Mac builds ignore the "
+            "svgf*/nrd values; Windows builds ignore metalfx.",
             CVAR_ARCHIVE);
     PT_CVAR(r_hdr_pipeline,    "1",  "Linear-HDR pipeline through MetalFX. 1 = path tracer writes raw HDR, MetalFX denoises in HDR, post-pass applies exposure+ACES (recommended). 0 = path tracer pre-applies exposure+ACES, MetalFX denoises LDR, tonemap pass is a passthrough copy. Only affects the denoiser-on path.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom,           "1",  "HDR bloom (downsample/upsample pyramid, additive composite before ACES). 0 disables; tonemap then samples a 1x1 zero buffer.", CVAR_ARCHIVE);
@@ -1387,10 +1390,14 @@ void Engine::RenderFrame() {
         const auto& s = v->value;
         if (s == "metalfx" && current_backend_ == BackendType::Metal) {
             want_kind = DenoiserKind::MetalFX;
-        } else if (s == "svgf" && current_backend_ == BackendType::Vulkan) {
-            want_kind = DenoiserKind::Svgf;
-        } else if (s == "nrd"  && current_backend_ == BackendType::Vulkan) {
-            want_kind = DenoiserKind::Nrd;
+        } else if (current_backend_ == BackendType::Vulkan) {
+            // svgf is a back-compat alias for svgf_atrous (the cvar
+            // value briefly shipped on this branch before the
+            // basic/atrous split).
+            if      (s == "svgf_basic")  want_kind = DenoiserKind::SvgfBasic;
+            else if (s == "svgf_atrous") want_kind = DenoiserKind::SvgfAtrous;
+            else if (s == "svgf")        want_kind = DenoiserKind::SvgfAtrous;
+            else if (s == "nrd")         want_kind = DenoiserKind::Nrd;
         }
     }
     if (want_kind != DenoiserKind::Off && !device_->SupportsDenoise()) {
@@ -1411,10 +1418,15 @@ void Engine::RenderFrame() {
         // they're on (especially for the nrd-as-svgf-placeholder case).
         if (want_kind == DenoiserKind::Nrd) {
             LOG_INFO("engine: r_denoiser=nrd accepted -- routing through the in-house "
-                     "SVGF kernels until the NVIDIA RayTracingDenoiser library is integrated. "
-                     "See Raytracer Plan/FOLLOW_UPS.md for the integration plan.");
-        } else if (want_kind == DenoiserKind::Svgf) {
-            LOG_INFO("engine: r_denoiser=svgf -- in-house temporal + a-trous denoiser active");
+                     "SVGF kernels (atrous chain) until the NVIDIA RayTracingDenoiser "
+                     "library is integrated. See Raytracer Plan/FOLLOW_UPS.md for the "
+                     "integration plan.");
+        } else if (want_kind == DenoiserKind::SvgfBasic) {
+            LOG_INFO("engine: r_denoiser=svgf_basic -- temporal accumulation only "
+                     "(no spatial filter)");
+        } else if (want_kind == DenoiserKind::SvgfAtrous) {
+            LOG_INFO("engine: r_denoiser=svgf_atrous -- temporal + 3-pass a-trous "
+                     "edge-aware filter");
         } else if (want_kind == DenoiserKind::MetalFX) {
             LOG_INFO("engine: r_denoiser=metalfx -- MetalFX TemporalDenoisedScaler active");
         }
@@ -1479,7 +1491,8 @@ void Engine::RenderFrame() {
     // RGBA16F MetalFX writes to; the `tonemap` compute kernel reads it
     // and writes the swapchain.
     const bool want_normal_gbuffer =
-        (denoiser_kind_ == DenoiserKind::Svgf ||
+        (denoiser_kind_ == DenoiserKind::SvgfBasic  ||
+         denoiser_kind_ == DenoiserKind::SvgfAtrous ||
          denoiser_kind_ == DenoiserKind::Nrd);
     if (denoiser_active_ &&
         (denoise_color_tex_id_ == 0 || depth_tex_id_ == 0 || motion_tex_id_ == 0 ||
@@ -2199,6 +2212,13 @@ void Engine::RenderFrame() {
         dd.jitter_x      = last_jitter_x_;
         dd.jitter_y      = last_jitter_y_;
         dd.reset_history = !prev_view_proj_valid_;
+        // Map the engine's denoiser kind to the RHI quality tier. Nrd
+        // and SvgfAtrous both run the full a-trous chain today; only
+        // SvgfBasic skips the spatial filter. MetalFX ignores the
+        // quality field entirely.
+        dd.quality = (denoiser_kind_ == DenoiserKind::SvgfBasic)
+                         ? pt::rhi::Device::DenoiseDesc::Quality::Basic
+                         : pt::rhi::Device::DenoiseDesc::Quality::Atrous;
         // MetalFX wants worldToView and viewToClip separately, so pass
         // them rather than the combined view*proj. glm matrices are
         // column-major, matching simd_float4x4 on the consumer end.
@@ -3575,13 +3595,15 @@ void Engine::RegisterCommands() {
         v->allowed_values = {"error", "warn", "info", "debug"};
     }
     if (auto* v = C.FindCVar("r_denoiser")) {
-        // metalfx is Mac-only; svgf+nrd are Vulkan-only. The
-        // RenderFrame check downgrades incompatible (cvar, backend)
-        // combinations to off rather than rejecting at console-set
-        // time -- so a user can have `r_denoiser svgf` in their
-        // demont.cfg and still launch on a Mac without the cfg
-        // getting rejected.
-        v->allowed_values = {"off", "metalfx", "svgf", "nrd"};
+        // metalfx is Mac-only; svgf_basic / svgf_atrous / nrd are
+        // Vulkan-only. The RenderFrame check downgrades incompatible
+        // (cvar, backend) combinations to off rather than rejecting
+        // at console-set time -- so a user can have `r_denoiser
+        // svgf_atrous` in their demont.cfg and still launch on a Mac
+        // without the cfg getting rejected. `svgf` (no suffix) is a
+        // back-compat alias for svgf_atrous.
+        v->allowed_values = {"off", "metalfx", "svgf",
+                              "svgf_basic", "svgf_atrous", "nrd"};
     }
     if (auto* v = C.FindCVar("r_hdr_pipeline")) {
         v->allowed_values = {"0", "1"};
