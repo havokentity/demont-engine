@@ -2402,6 +2402,21 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
         return;
     }
 
+    // ---- DEBUG: trace which dispatch path the active d.kind takes.
+    // Logged once per kind transition so the user can verify the
+    // engine is actually requesting the OptiX path when r_denoiser
+    // optix_hdr is set. Remove when the per-frame path is verified.
+    {
+        static int s_last_logged_kind = -1;
+        const int k = static_cast<int>(d.kind);
+        if (k != s_last_logged_kind) {
+            LOG_INFO("VulkanDevice::Denoise: dispatching kind={} (0=Svgf, 1=OptixHdr, 2=OptixHdrAov), "
+                     "color={} out={} normal={} depth={} motion={}",
+                     k, d.color_in.id, d.output.id, d.normal_in.id, d.depth_in.id, d.motion_in.id);
+            s_last_logged_kind = k;
+        }
+    }
+
     // Route based on d.kind. SVGF and OptiX have different input
     // contracts: SVGF wants the full G-buffer (color/depth/motion/
     // normal/output); OptiX HDR only needs color + output; OptiX HDR
