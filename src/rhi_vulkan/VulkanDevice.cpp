@@ -2579,7 +2579,9 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
         static int s_last_logged_kind = -1;
         const int k = static_cast<int>(d.kind);
         if (k != s_last_logged_kind) {
-            LOG_INFO("VulkanDevice::Denoise: dispatching kind={} (0=Svgf, 1=OptixHdr, 2=OptixHdrAov), "
+            LOG_INFO("VulkanDevice::Denoise: dispatching kind={} "
+                     "(0=Svgf, 1=OptixHdr, 2=OptixHdrAov, "
+                     "3=OptixTemporalHdr, 4=OptixTemporalHdrAov), "
                      "color={} out={} normal={} depth={} motion={}",
                      k, d.color_in.id, d.output.id, d.normal_in.id, d.depth_in.id, d.motion_in.id);
             s_last_logged_kind = k;
