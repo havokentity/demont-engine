@@ -53,6 +53,17 @@
 // moonDisc() to give the disc real mare + crater detail.
 [[vk::binding(13, 0)]] RWTexture2D<float4> moon_map;
 
+// G-buffer: world-space normal at primary hit. Written when
+// denoiser_enabled != 0 by the SPIR-V/Vulkan path; the SVGF/NRD
+// denoiser samples it for edge-aware temporal+spatial filtering.
+// Gated to SPIR-V only -- on Metal/MSL the MetalFX denoiser doesn't
+// need surface normals, and adding the slot would cascade through
+// every other texture binding. Sky pixels (no hit) write float3(0)
+// to mark "no surface" so the denoiser falls back to a wider radius.
+#ifdef PT_TARGET_SPIRV
+[[vk::binding(16, 0)]] RWTexture2D<float4> normal_tex;
+#endif
+
 // GPU-resident exposure scalar. Updated each frame by AutoExposure.slang
 // (when r_auto_exposure = 1) or written once by the engine via
 // WriteBuffer (when r_auto_exposure = 0, holding the manual r_exposure
@@ -1033,12 +1044,15 @@ void main(uint2 tid : SV_DispatchThreadID) {
         HitInfo h0 = traceScene(ro0, rd0);
 
         float3 hit_world;
+        float3 hit_normal;
         float  depth_view;   // linear camera-space Z (world units along forward)
         if (h0.hit) {
-            hit_world = ro0 + rd0 * h0.t;
+            hit_world  = ro0 + rd0 * h0.t;
+            hit_normal = h0.normal;
             depth_view = h0.t * dot(rd0, normalize(fwd_aspect.xyz));
         } else {
             hit_world  = ro0 + rd0 * 1000.0;   // far point so sky still gets motion
+            hit_normal = float3(0.0, 0.0, 0.0); // sentinel: sky / no surface
             depth_view = 1000.0;
         }
 
@@ -1053,6 +1067,9 @@ void main(uint2 tid : SV_DispatchThreadID) {
 
         depth_tex[tid]  = depth_view;
         motion_tex[tid] = motion;
+#ifdef PT_TARGET_SPIRV
+        normal_tex[tid] = float4(hit_normal, 0.0);
+#endif
     }
 
     // Multi-sample loop: average `spp` independent paths into a single

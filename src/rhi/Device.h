@@ -106,6 +106,12 @@ public:
         TextureHandle color_in;       // RGBA16F linear (per-frame, not accumulated)
         TextureHandle depth_in;       // R32F clip-space depth (z/w in [0,1])
         TextureHandle motion_in;      // RG16F pixel-space (prev - curr)
+        // World-space surface normals at primary hit (RGBA16F, .xyz =
+        // unit normal, .w unused). Required by the Vulkan SVGF/NRD
+        // denoiser for edge-aware spatial filtering; MetalFX ignores it
+        // (handle may be 0 on Metal). Engine writes it from the path
+        // tracer's primary-ray pass when denoiser_enabled.
+        TextureHandle normal_in;
         TextureHandle output;         // typically the swapchain image
         float jitter_x       = 0.0f;
         float jitter_y       = 0.0f;

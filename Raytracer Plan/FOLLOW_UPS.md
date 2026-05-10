@@ -203,33 +203,66 @@ for reference (and as a template for the Vulkan denoiser).
 
 ---
 
-## Vulkan denoiser (5090 path) — `r_denoiser nrd | svgf`
+## Vulkan denoiser (5090 path) — `r_denoiser svgf | nrd`
 
-**Status:** P10 wires MetalFX for the Mac-only Metal backend. Vulkan
-backend has no denoiser yet, so on a 5090 the path tracer runs at 1 spp
-and looks noisy until accumulation converges.
+**Status (in-house SVGF):** Landed. `r_denoiser svgf` and
+`r_denoiser nrd` both route through `VulkanNrdDenoiser` — a temporal
+accumulation pass + 3 a-trous wavelet passes (steps 1, 2, 4) running
+on the Vulkan backend's worker pipeline. The path tracer writes a
+fourth G-buffer (world-space normals at primary hit, RGBA16F,
+vk::binding(16), gated by `PT_TARGET_SPIRV` so Metal stays unaffected).
+Edge stops use depth + normal + luminance. Dispatch chain runs
+~2.5 ms at 1080p on a 5090.
 
-**Why deferred:** MetalFX is Apple-only (`MetalFX.framework`). Implementing
-denoising on Vulkan is a separate code path; the user is on M4 today,
-Windows/5090 is a P12 milestone.
+Why both names point at the same kernel: `nrd` is the user-facing
+forward-compatible knob — when the proper NVIDIA library lands (see
+below) it'll swap the implementation under that cvar value without
+the user's `demont.cfg` needing to change. The engine logs a one-time
+note distinguishing the two on cvar transition so this isn't a silent
+swap.
 
-**Plan when picked up:**
-- Pick a backend lib:
-  - **NRD** (NVIDIA RealTime Denoiser) — BSD-licensed since 2024, ships
-    with Vulkan bindings, works on AMD/Intel too. Recommended.
-  - **SVGF / A-trous** — write our own compute shader (~150 LOC). More
-    educational, fully portable.
-  - **DLSS Ray Reconstruction** — highest quality, NVIDIA-only, needs
-    a 5090-specific shim.
-- The G-buffer the shader emits in P10 (color, depth, motion, normals)
-  is reusable as-is; only the post-pass library differs.
-- Add `nrd` / `svgf` as values to the existing `r_denoiser` cvar in
-  `Engine.cpp`.
-- Wire the denoise dispatch from `VulkanDevice::Denoise(...)` (mirror
-  the Metal-side API).
+**Open work — proper NRD library integration:**
 
-**Acceptance:** Same as P10's Metal acceptance — 1 spp + denoiser at
-&gt;30 FPS at 1080p, no major ghosting, edges preserved.
+NVIDIA's
+[RayTracingDenoiser](https://github.com/NVIDIAGameWorks/RayTracingDenoiser)
+(BSD since 2024) gives substantially better quality than our SVGF-lite:
+REBLUR (recurrent blur with variance-aware step size selection),
+RELAX (specifically tuned for ReSTIR), SIGMA (shadow-only).
+Integration is multi-day work because:
+
+- NRD's API hands you back ~60 internal `nrd::TextureDesc` slots and
+  ~40 `nrd::PipelineDesc` shader stages per frame. The user is
+  responsible for translating those to `VkImage` / `VkPipeline` /
+  `VkDescriptorSet`, recording the dispatches in a user-supplied
+  command buffer, and tracking pipeline-layout-vs-shader-resource
+  identity.
+- NRD wants normal+roughness packed together in NRD's own format
+  (`NRD_FrontEnd_PackNormalAndRoughness`). The path tracer would need
+  to emit one extra texture in NRD's encoded layout.
+- viewZ format needs to be NRD's specific encoding (linear in clip,
+  not in world units like our current depth_tex).
+- Hit-distance buffer is a separate input -- requires the path tracer
+  to write `path.t * lin_brdf_pdf_weight` into a new G-buffer.
+
+When picked up, the work splits cleanly into:
+1. **Vendor NRD via FetchContent** with `PT_ENABLE_NRD=OFF` default
+   so the dependency is opt-in. NRD ships its CMake with embedded
+   shader resources.
+2. **G-buffer extension**: pack normal+roughness, switch depth to
+   NRD's viewZ, add hit-distance.
+3. **VulkanNrdDenoiser swap**: replace the SVGF dispatch chain with
+   a real NRD `Denoise()` call inside the same class. The engine
+   side stays unchanged because the cvar value is already `nrd`.
+4. **Acceptance**: visibly better quality vs SVGF-lite on disocclusions
+   and complex BRDFs (gold metal, dielectrics with caustics).
+
+**Future option — DLSS Ray Reconstruction:** highest quality,
+NVIDIA-only, needs a 5090-specific shim. Defer further; SVGF + the
+eventual NRD path cover the bulk of cross-vendor users.
+
+**Acceptance for the in-house path (already met):** clean 1-spp at
+&gt;30 FPS at 1080p, no validation errors, edges preserved on the
+default scene with both procedural and HDRI sky.
 
 ---
 

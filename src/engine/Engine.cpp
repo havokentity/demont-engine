@@ -90,7 +90,17 @@ namespace cvar {
     PT_CVAR(r_quality,         "high",  "Master quality preset that drives r_spp, r_max_bounces, r_caustics, r_refract_bounces, etc. Options: low (fast, no caustics), medium (default-ish), high (caustics, more bounces), ultra (max). 'custom' leaves per-feature cvars as-is.", CVAR_ARCHIVE);
     PT_CVAR(r_caustics,        "1",  "Refractive shadow rays. 1 = NEE rays refract through dielectrics so glass/diamond produce caustic patterns; 0 = treat all dielectrics as opaque shadow blockers (faster, blocks any caustic). Path-tracer-correct in both modes.", CVAR_ARCHIVE);
     PT_CVAR(r_refract_bounces, "4",  "Maximum dielectric refractions a single shadow ray may chain through before giving up (returns no contribution). Higher catches more multi-facet caustics; lower is faster.", CVAR_ARCHIVE);
-    PT_CVAR(r_denoiser,        "off","Denoiser: off|metalfx (Mac MetalFX TemporalDenoisedScaler).", CVAR_ARCHIVE);
+    PT_CVAR(r_denoiser,        "off",
+            "Denoiser. off = noisy 1-spp, accumulating image only. "
+            "metalfx = Mac MetalFX TemporalDenoisedScaler (Apple Silicon "
+            "only). svgf = Vulkan in-house SVGF-style denoiser: temporal "
+            "accumulation + 3-tap a-trous edge-aware filter, runs on any "
+            "Vulkan device with ray query. nrd = same dispatch chain as "
+            "svgf today; reserved for the proper NVIDIA RayTracingDenoiser "
+            "library integration once that's wired up (see Raytracer "
+            "Plan/FOLLOW_UPS.md). Mac builds ignore svgf/nrd; Windows "
+            "builds ignore metalfx.",
+            CVAR_ARCHIVE);
     PT_CVAR(r_hdr_pipeline,    "1",  "Linear-HDR pipeline through MetalFX. 1 = path tracer writes raw HDR, MetalFX denoises in HDR, post-pass applies exposure+ACES (recommended). 0 = path tracer pre-applies exposure+ACES, MetalFX denoises LDR, tonemap pass is a passthrough copy. Only affects the denoiser-on path.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom,           "1",  "HDR bloom (downsample/upsample pyramid, additive composite before ACES). 0 disables; tonemap then samples a 1x1 zero buffer.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom_threshold, "1.0","Linear-HDR luminance threshold for the bloom extract. Pixels below this value contribute nothing to the pyramid; pixels above contribute proportional to (lum - threshold). The path tracer's pixels are in tonemap-relative units (sun ~30, env ~3) so a threshold of 1.0 picks up only HDR highlights.", CVAR_ARCHIVE);
@@ -1366,26 +1376,60 @@ void Engine::RenderFrame() {
 
     auto& C = pt::console::Console::Get();
 
-    // P10 denoiser state. Resolved before BeginFrame so we know whether
-    // to allocate the G-buffer textures this frame.
-    bool want_denoiser = false;
+    // P10/P12 denoiser state. Resolved before BeginFrame so we know
+    // whether to allocate the G-buffer textures this frame. The cvar
+    // value chooses the kind (off / metalfx / svgf / nrd); per-backend
+    // gating then drops it to off if the active device doesn't support
+    // the chosen kind. metalfx is Mac-only; svgf+nrd are Vulkan-only;
+    // the no-op "off" value short-circuits all G-buffer allocation.
+    DenoiserKind want_kind = DenoiserKind::Off;
     if (auto* v = C.FindCVar("r_denoiser")) {
-        want_denoiser = (v->value == "metalfx") && device_->SupportsDenoise();
+        const auto& s = v->value;
+        if (s == "metalfx" && current_backend_ == BackendType::Metal) {
+            want_kind = DenoiserKind::MetalFX;
+        } else if (s == "svgf" && current_backend_ == BackendType::Vulkan) {
+            want_kind = DenoiserKind::Svgf;
+        } else if (s == "nrd"  && current_backend_ == BackendType::Vulkan) {
+            want_kind = DenoiserKind::Nrd;
+        }
     }
-    if (want_denoiser != denoiser_active_) {
-        // Toggle: free or allocate G-buffer next, force history reset.
+    if (want_kind != DenoiserKind::Off && !device_->SupportsDenoise()) {
+        // Backend doesn't support denoising yet (Vulkan: pipelines
+        // still building on the worker thread, denoiser allocates
+        // lazily on first dispatch). Stay on the noisy path until
+        // SupportsDenoise flips true.
+        want_kind = DenoiserKind::Off;
+    }
+    const bool want_denoiser = (want_kind != DenoiserKind::Off);
+    if (want_denoiser != denoiser_active_ || want_kind != denoiser_kind_) {
+        // Toggle (or kind switch -- e.g. svgf -> nrd): free the G-buffer
+        // and force a history reset on the next allocation.
         denoiser_active_      = want_denoiser;
+        denoiser_kind_        = want_kind;
         prev_view_proj_valid_ = false;
+        // One-time log on transitions so the user sees which path
+        // they're on (especially for the nrd-as-svgf-placeholder case).
+        if (want_kind == DenoiserKind::Nrd) {
+            LOG_INFO("engine: r_denoiser=nrd accepted -- routing through the in-house "
+                     "SVGF kernels until the NVIDIA RayTracingDenoiser library is integrated. "
+                     "See Raytracer Plan/FOLLOW_UPS.md for the integration plan.");
+        } else if (want_kind == DenoiserKind::Svgf) {
+            LOG_INFO("engine: r_denoiser=svgf -- in-house temporal + a-trous denoiser active");
+        } else if (want_kind == DenoiserKind::MetalFX) {
+            LOG_INFO("engine: r_denoiser=metalfx -- MetalFX TemporalDenoisedScaler active");
+        }
         if (!want_denoiser && device_) {
             if (denoise_color_tex_id_    != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
             if (depth_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
             if (motion_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
+            if (normal_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{normal_tex_id_});
             if (post_denoise_hdr_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
             for (auto& id : bloom_mip_tex_id_) {
                 if (id != 0) device_->DestroyTexture(pt::rhi::TextureHandle{id});
                 id = 0;
             }
-            denoise_color_tex_id_ = depth_tex_id_ = motion_tex_id_ = post_denoise_hdr_tex_id_ = 0;
+            denoise_color_tex_id_ = depth_tex_id_ = motion_tex_id_ = 0;
+            normal_tex_id_ = post_denoise_hdr_tex_id_ = 0;
         }
     }
 
@@ -1434,12 +1478,17 @@ void Engine::RenderFrame() {
     // denoising is off. The post-denoise HDR intermediate is the linear
     // RGBA16F MetalFX writes to; the `tonemap` compute kernel reads it
     // and writes the swapchain.
+    const bool want_normal_gbuffer =
+        (denoiser_kind_ == DenoiserKind::Svgf ||
+         denoiser_kind_ == DenoiserKind::Nrd);
     if (denoiser_active_ &&
         (denoise_color_tex_id_ == 0 || depth_tex_id_ == 0 || motion_tex_id_ == 0 ||
-         post_denoise_hdr_tex_id_ == 0 || size_changed)) {
+         post_denoise_hdr_tex_id_ == 0 || size_changed ||
+         (want_normal_gbuffer && normal_tex_id_ == 0))) {
         if (denoise_color_tex_id_     != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
         if (depth_tex_id_             != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
         if (motion_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
+        if (normal_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{normal_tex_id_});
         if (post_denoise_hdr_tex_id_  != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
         auto color_h = device_->CreateTexture({
             .width = fc.width, .height = fc.height,
@@ -1469,9 +1518,25 @@ void Engine::RenderFrame() {
         depth_tex_id_            = depth_h.id;
         motion_tex_id_           = motion_h.id;
         post_denoise_hdr_tex_id_ = post_h.id;
+        // Normal G-buffer: only the SVGF/NRD path needs it. MetalFX
+        // ignores normals and the path tracer's normal write is gated
+        // by PT_TARGET_SPIRV (so on Metal there's no shader binding
+        // expecting it either).
+        if (want_normal_gbuffer) {
+            auto normal_h = device_->CreateTexture({
+                .width = fc.width, .height = fc.height,
+                .format = pt::rhi::TextureFormat::RGBA16F,
+                .usage  = pt::rhi::TextureUsage::Storage,
+                .debug_name = "denoise_normal",
+            });
+            normal_tex_id_ = normal_h.id;
+        } else {
+            normal_tex_id_ = 0;
+        }
         prev_view_proj_valid_ = false;        // history is invalid after resize
         if (denoise_color_tex_id_ == 0 || depth_tex_id_ == 0 ||
-            motion_tex_id_        == 0 || post_denoise_hdr_tex_id_ == 0) {
+            motion_tex_id_        == 0 || post_denoise_hdr_tex_id_ == 0 ||
+            (want_normal_gbuffer && normal_tex_id_ == 0)) {
             LOG_ERROR("denoiser G-buffer allocation failed at {}x{}", fc.width, fc.height);
             denoiser_active_ = false;
         }
@@ -1564,6 +1629,17 @@ void Engine::RenderFrame() {
         cb->BindStorageTexture(2, pt::rhi::TextureHandle{denoise_color_tex_id_});
         cb->BindStorageTexture(3, pt::rhi::TextureHandle{depth_tex_id_});
         cb->BindStorageTexture(4, pt::rhi::TextureHandle{motion_tex_id_});
+    }
+    // Engine slot 8 -> vk::binding 16 (normal_tex). Vulkan-only:
+    // PathTrace.slang's normal_tex declaration is gated by
+    // PT_TARGET_SPIRV so Metal builds don't expect anything here, and
+    // the engine slot is only used by the SVGF/NRD path. We also bind
+    // the placeholder env_map / star_map / moon_map at slots they
+    // need; binding 16 is similarly safe-to-bind because the Metal
+    // backend's bound_tex_[8] is exactly 8 entries (slot 8 silently
+    // dropped) and the Vulkan backend extends to 12.
+    if (denoiser_active_ && normal_tex_id_ != 0) {
+        cb->BindStorageTexture(8, pt::rhi::TextureHandle{normal_tex_id_});
     }
     if (env_map_tex_id_ != 0) {
         cb->BindStorageTexture(5, pt::rhi::TextureHandle{env_map_tex_id_});
@@ -2116,6 +2192,7 @@ void Engine::RenderFrame() {
         dd.color_in      = pt::rhi::TextureHandle{denoise_color_tex_id_};
         dd.depth_in      = pt::rhi::TextureHandle{depth_tex_id_};
         dd.motion_in     = pt::rhi::TextureHandle{motion_tex_id_};
+        dd.normal_in     = pt::rhi::TextureHandle{normal_tex_id_};
         // MetalFX writes to the linear-HDR intermediate; the tonemap
         // dispatch below converts that to sRGB and writes the swapchain.
         dd.output        = pt::rhi::TextureHandle{post_denoise_hdr_tex_id_};
@@ -3498,7 +3575,13 @@ void Engine::RegisterCommands() {
         v->allowed_values = {"error", "warn", "info", "debug"};
     }
     if (auto* v = C.FindCVar("r_denoiser")) {
-        v->allowed_values = {"off", "metalfx"};
+        // metalfx is Mac-only; svgf+nrd are Vulkan-only. The
+        // RenderFrame check downgrades incompatible (cvar, backend)
+        // combinations to off rather than rejecting at console-set
+        // time -- so a user can have `r_denoiser svgf` in their
+        // demont.cfg and still launch on a Mac without the cfg
+        // getting rejected.
+        v->allowed_values = {"off", "metalfx", "svgf", "nrd"};
     }
     if (auto* v = C.FindCVar("r_hdr_pipeline")) {
         v->allowed_values = {"0", "1"};

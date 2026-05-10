@@ -171,6 +171,11 @@ private:
     std::uint64_t                               denoise_color_tex_id_  = 0;
     std::uint64_t                               depth_tex_id_          = 0;
     std::uint64_t                               motion_tex_id_         = 0;
+    // Vulkan SVGF/NRD denoiser only: world-space surface normal at
+    // primary hit, written by PathTrace.slang's G-buffer pass and read
+    // by DenoiseTemporal/DenoiseAtrous for edge-aware filtering. Not
+    // allocated for the metalfx path -- MetalFX doesn't take normals.
+    std::uint64_t                               normal_tex_id_         = 0;
     // Linear HDR intermediate that MetalFX writes to instead of the
     // swapchain. The `tonemap` compute kernel reads this and writes
     // exposure+ACES-encoded sRGB into the swapchain. Co-allocated +
@@ -253,6 +258,14 @@ private:
     glm::mat4                                   prev_view_proj_        { 1.0f };  // identity
     bool                                        prev_view_proj_valid_  = false;
     bool                                        denoiser_active_       = false;
+    // Which denoiser kind the active backend is running. metalfx is
+    // Mac-only; svgf and nrd both route through the Vulkan
+    // VulkanNrdDenoiser today (real NRD library integration is
+    // deferred -- see Raytracer Plan/FOLLOW_UPS.md). Stored so the
+    // engine knows whether to allocate the normal G-buffer (only the
+    // Vulkan path uses it) and which one-time log to print.
+    enum class DenoiserKind : std::uint8_t { Off, MetalFX, Svgf, Nrd };
+    DenoiserKind                                denoiser_kind_         = DenoiserKind::Off;
     float                                       last_jitter_x_         = 0.0f;
     float                                       last_jitter_y_         = 0.0f;
 
