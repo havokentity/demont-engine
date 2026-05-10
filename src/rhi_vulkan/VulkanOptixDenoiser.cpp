@@ -90,9 +90,10 @@ std::atomic<bool> g_optix_initialized{false};
 // All four images we shuttle (color_in, output, optional albedo,
 // optional normal) are RGBA16F so they pack tightly into CUDA arrays
 // and OptixImage2D::format = OPTIX_PIXEL_FORMAT_HALF4 lines up.
-constexpr VkFormat kOptixImageFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+// OptiX denoiser input/output is RGBA16F. Vulkan buffers we feed it
+// via cudaExternalMemoryGetMappedBuffer are tightly packed (no row
+// padding) at 8 bytes per pixel.
 constexpr OptixPixelFormat kOptixPixelFormat = OPTIX_PIXEL_FORMAT_HALF4;
-constexpr std::uint32_t kPixelStrideBytes = 8;  // 4 channels * 2 bytes
 
 // OptiX log callback. Hooks into the engine's logger so OptiX warnings
 // surface in the regular log stream rather than stderr.
@@ -673,17 +674,6 @@ void VulkanOptixDenoiser::Encode(VkCommandBuffer cb,
     timeline_counter_++;
     const std::uint64_t this_frame = timeline_counter_;
 
-    // Per-step debug logging on the first few frames to localise hangs.
-    // Prints once per step until the second frame completes; after that
-    // the static counter latches and the logs go silent so steady-state
-    // doesn't spam.
-    static int s_first_frame_log_count = 0;
-    const bool log_steps = (s_first_frame_log_count < 6);
-    auto step_log = [&](const char* tag) {
-        if (log_steps) LOG_INFO("VulkanOptixDenoiser::Encode[frame {}]: {}", this_frame, tag);
-    };
-    step_log("entry");
-
     // ---- Step 2: append to engine cb -- copy d.color_in -> buf_color_in_ -
     {
         VkImageMemoryBarrier toSrc{};
@@ -732,8 +722,6 @@ void VulkanOptixDenoiser::Encode(VkCommandBuffer cb,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0, 0, nullptr, 0, nullptr, 1, &backToGeneral);
     }
-
-    step_log("after engine-cb input copy recorded");
 
     // CUDA + OptiX work is deferred to SubmitPostMain (called from
     // VulkanDevice::Submit AFTER the engine cb is submitted). Doing it
@@ -876,8 +864,6 @@ void VulkanOptixDenoiser::Encode(VkCommandBuffer cb,
     pending_post_main_  = true;
     pending_pcb_slot_   = pcb_slot;
     pending_wait_value_ = this_frame;
-    step_log("Encode complete; pending_post_main_=true");
-    if (log_steps) ++s_first_frame_log_count;
     (void)dev;
 }
 
@@ -890,14 +876,6 @@ void VulkanOptixDenoiser::DrainCuda() {
 void VulkanOptixDenoiser::SubmitPostMain() {
     if (!pending_post_main_) return;
     pending_post_main_ = false;
-
-    static int s_post_main_log_count = 0;
-    const bool log_first = (s_post_main_log_count < 3);
-    auto step_log = [&](const char* tag) {
-        if (log_first) LOG_INFO("VulkanOptixDenoiser::SubmitPostMain[frame {}]: {}",
-                                pending_wait_value_, tag);
-    };
-    step_log("entry");
 
     // V1 sync model: wait for engine cb (and prior private cbs) to
     // finish so buf_color_in_ has the path-tracer's output, run the
@@ -915,7 +893,6 @@ void VulkanOptixDenoiser::SubmitPostMain() {
                  static_cast<int>(vr));
         return;
     }
-    step_log("after vkQueueWaitIdle (engine cb done)");
 
     // ---- CUDA: schedule + sync the OptiX denoise ----
     OptixImage2D color_in{};
@@ -934,18 +911,15 @@ void VulkanOptixDenoiser::SubmitPostMain() {
     output.pixelStrideInBytes = kBytesPerPixel;
     output.format           = kOptixPixelFormat;
 
-    step_log("before optixDenoiserComputeIntensity");
     OptixResult oresult = optixDenoiserComputeIntensity(
         optix_denoiser_, cuda_stream_,
         &color_in,
         static_cast<CUdeviceptr>(intensity_buf_),
         static_cast<CUdeviceptr>(scratch_buf_),
         scratch_size_);
-    step_log("after optixDenoiserComputeIntensity");
     if (oresult != OPTIX_SUCCESS) {
         LOG_ERROR("VulkanOptixDenoiser::SubmitPostMain: optixDenoiserComputeIntensity "
                   "(OptixResult={})", static_cast<int>(oresult));
-        if (log_first) ++s_post_main_log_count;
         return;
     }
 
@@ -962,7 +936,6 @@ void VulkanOptixDenoiser::SubmitPostMain() {
     layer.input  = color_in;
     layer.output = output;
 
-    step_log("before optixDenoiserInvoke");
     oresult = optixDenoiserInvoke(
         optix_denoiser_, cuda_stream_,
         &params,
@@ -971,21 +944,16 @@ void VulkanOptixDenoiser::SubmitPostMain() {
         &layer, 1,
         /*inputOffsetX*/ 0, /*inputOffsetY*/ 0,
         static_cast<CUdeviceptr>(scratch_buf_), scratch_size_);
-    step_log("after optixDenoiserInvoke");
     if (oresult != OPTIX_SUCCESS) {
         LOG_ERROR("VulkanOptixDenoiser::SubmitPostMain: optixDenoiserInvoke "
                   "(OptixResult={})", static_cast<int>(oresult));
-        if (log_first) ++s_post_main_log_count;
         return;
     }
 
-    step_log("before cudaStreamSynchronize");
     cudaError_t cerr = cudaStreamSynchronize(cuda_stream_);
-    step_log("after cudaStreamSynchronize");
     if (cerr != cudaSuccess) {
         LOG_ERROR("VulkanOptixDenoiser::SubmitPostMain: cudaStreamSynchronize: {}",
                   cudaGetErrorString(cerr));
-        if (log_first) ++s_post_main_log_count;
         return;
     }
 
@@ -997,12 +965,9 @@ void VulkanOptixDenoiser::SubmitPostMain() {
     si.pCommandBuffers      = &pcb;
     si.signalSemaphoreCount = 0;
     si.waitSemaphoreCount   = 0;
-    step_log("before private vkQueueSubmit");
     if (vkQueueSubmit(device_->RawGraphicsQueue(), 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) {
         LOG_WARN("VulkanOptixDenoiser::SubmitPostMain: vkQueueSubmit(private) failed");
     }
-    step_log("after private vkQueueSubmit");
-    if (log_first) ++s_post_main_log_count;
 }
 
 // ---- DestroyResources -----------------------------------------------------
