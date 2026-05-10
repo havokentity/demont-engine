@@ -14,6 +14,22 @@ target_link_libraries(pt_rhi_vulkan
     PUBLIC glfw                    # for glfwCreateWindowSurface
 )
 
+# ---- OptiX denoiser (NVIDIA only) -----------------------------------------
+# Adds the OptiX denoiser strategy alongside the SVGF/NRD one. Gated by
+# PT_OPTIX_ACTIVE (set by the top-level CMakeLists once CUDA Toolkit and
+# OptiX SDK headers are both detected). When inactive the OptiX file isn't
+# compiled, the CUDA libs aren't linked, and PT_ENABLE_OPTIX is undefined
+# so the #if blocks in the source compile out.
+if(PT_OPTIX_ACTIVE)
+    target_sources(pt_rhi_vulkan PRIVATE VulkanOptixDenoiser.cpp)
+    target_include_directories(pt_rhi_vulkan PRIVATE ${OPTIX_INCLUDE_DIR})
+    target_link_libraries(pt_rhi_vulkan
+        PRIVATE CUDA::cudart_static
+        PRIVATE CUDA::cuda_driver
+    )
+    target_compile_definitions(pt_rhi_vulkan PUBLIC PT_ENABLE_OPTIX=1)
+endif()
+
 # Compile every compute kernel to SPIR-V so when the Vulkan backend
 # does start instantiating Tonemap / BloomDown / BloomUp pipelines,
 # the SPIR-V is already available alongside PathTrace + AutoExposure.

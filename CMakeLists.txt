@@ -29,6 +29,8 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # --- Project options --------------------------------------------------------
 option(PT_ENABLE_VULKAN_BACKEND "Build Vulkan/MoltenVK backend (P4+)"   ON)
+option(PT_ENABLE_OPTIX
+    "Build OptiX denoiser (NVIDIA only; needs CUDA Toolkit + OptiX SDK installed)" ON)
 option(PT_ENABLE_TRACY          "Enable Tracy profiler client"          ON)
 # ASan + mimalloc do not coexist cleanly without MI_TRACK_ASAN; opt-in only.
 option(PT_ENABLE_SANITIZERS     "Enable -fsanitize=address,undefined in Debug" OFF)
@@ -42,6 +44,67 @@ if(PT_ENABLE_VULKAN_BACKEND)
     find_package(Vulkan REQUIRED)
     if(Vulkan_FOUND)
         message(STATUS "Vulkan: ${Vulkan_LIBRARIES} (headers: ${Vulkan_INCLUDE_DIRS})")
+    endif()
+endif()
+
+# --- OptiX denoiser (CUDA Toolkit + OptiX SDK, NVIDIA only) ----------------
+# OptiX runs on CUDA, denoises VkImages via VK_KHR_external_memory + cuda
+# imported memory. Requires the Vulkan backend (interop is the whole point).
+#
+# Detection self-heals: if PT_ENABLE_OPTIX is requested but a dep is missing
+# we set the internal `PT_OPTIX_ACTIVE` flag to OFF for this configure pass,
+# leaving the user's PT_ENABLE_OPTIX cache entry intact. On a subsequent
+# reconfigure (after they install the missing dep / set OPTIX_INSTALL_DIR)
+# CMake re-runs find_path because OPTIX_INCLUDE_DIR is NOTFOUND, picks it
+# up, and the next build links OptiX in.
+set(PT_OPTIX_ACTIVE OFF)
+
+if(PT_ENABLE_OPTIX AND NOT PT_ENABLE_VULKAN_BACKEND)
+    message(STATUS "PT_ENABLE_OPTIX requires PT_ENABLE_VULKAN_BACKEND; OptiX denoiser inactive.")
+endif()
+
+if(PT_ENABLE_OPTIX AND PT_ENABLE_VULKAN_BACKEND)
+    find_package(CUDAToolkit 12.0 QUIET)
+
+    # Try common install layouts so the build works without OPTIX_INSTALL_DIR
+    # being set in the active shell (env vars set via System Properties only
+    # propagate to processes started AFTER the change). The glob picks up any
+    # 'OptiX SDK X.Y.Z' install on Windows; explicit Linux paths cover the
+    # standard NVIDIA-recommended locations.
+    file(GLOB _pt_optix_candidates
+        "C:/ProgramData/NVIDIA Corporation/OptiX SDK *"
+        "C:/Program Files/NVIDIA Corporation/OptiX SDK *"
+        "/usr/local/optix*"
+        "/opt/optix*"
+        "$ENV{HOME}/optix*")
+
+    find_path(OPTIX_INCLUDE_DIR
+        NAMES optix.h
+        HINTS
+            $ENV{OPTIX_INSTALL_DIR}
+            ${_pt_optix_candidates}
+        PATH_SUFFIXES include
+        DOC "OptiX SDK include directory")
+
+    if(CUDAToolkit_FOUND AND OPTIX_INCLUDE_DIR)
+        set(PT_OPTIX_ACTIVE ON)
+        message(STATUS "OptiX denoiser: enabled")
+        message(STATUS "  CUDA Toolkit:  ${CUDAToolkit_VERSION} (${CUDAToolkit_INCLUDE_DIRS})")
+        message(STATUS "  OptiX headers: ${OPTIX_INCLUDE_DIR}")
+    else()
+        if(NOT CUDAToolkit_FOUND)
+            message(STATUS "PT_ENABLE_OPTIX: CUDA Toolkit 12.0+ not found; "
+                           "OptiX denoiser inactive. Install from "
+                           "developer.nvidia.com/cuda-downloads and reconfigure.")
+        endif()
+        if(NOT OPTIX_INCLUDE_DIR)
+            message(STATUS "PT_ENABLE_OPTIX: OptiX SDK headers not found; "
+                           "OptiX denoiser inactive. Install OptiX 8+ and either "
+                           "set OPTIX_INSTALL_DIR (e.g. "
+                           "'C:/ProgramData/NVIDIA Corporation/OptiX SDK 9.1.0') "
+                           "in the shell that runs cmake, or accept the auto-detected "
+                           "path on a fresh shell after install.")
+        endif()
     endif()
 endif()
 
