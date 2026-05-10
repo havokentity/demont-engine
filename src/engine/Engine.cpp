@@ -2856,15 +2856,12 @@ void Engine::RenderFrame() {
             : pt::engine::CaptureSourceKind::Accum;
         const std::uint64_t denoised_tex_id =
             denoiser_active_ ? post_denoise_hdr_tex_id_ : 0;
+        auto& C = pt::console::Console::Get();
         std::string denoiser_label = "off";
-        if (auto* dv = pt::console::Console::Get().FindCVar("r_denoiser")) {
-            denoiser_label = dv->value;
-        }
+        if (auto* dv = C.FindCVar("r_denoiser")) denoiser_label = dv->value;
         float exposure_fallback = 1.0f;
-        if (auto* ev = pt::console::Console::Get().FindCVar("r_exposure")) {
-            exposure_fallback = ev->GetFloat();
-        }
-        pt::engine::capture::MaybeCapture(
+        if (auto* ev = C.FindCVar("r_exposure")) exposure_fallback = ev->GetFloat();
+        const auto cap_result = pt::engine::capture::MaybeCapture(
             device_.get(),
             frame_index_,
             accum_texture_id_,
@@ -2875,6 +2872,18 @@ void Engine::RenderFrame() {
             kind,
             denoiser_label,
             exposure_fallback);
+        // Keep the user-facing cvar surface honest. Help text says
+        // r_capture_frame_at "auto-resets to 0 after the capture
+        // fires" and r_capture_seq is empty when disarmed -- so
+        // mirror the internal disarm into the cvar values now.
+        // SetCVarOverride bypasses CVAR_READONLY but these aren't
+        // marked readonly anyway.
+        if (cap_result.one_shot_fired) {
+            C.SetCVarOverride("r_capture_frame_at", "0");
+        }
+        if (cap_result.seq_completed) {
+            C.SetCVarOverride("r_capture_seq", "");
+        }
     }
 
     prev_view_proj_       = curr_view_proj;
@@ -3942,6 +3951,10 @@ void Engine::RegisterCommands() {
         v->on_change = [this](const pt::console::CVar& cv) {
             int n = cv.GetInt();
             if (n < 0) n = 0;
+            // Documented contract: 0 = let frame_index_ run naturally.
+            // No-op so re-setting to 0 doesn't surprise the operator
+            // by trashing accum + dropping a pending capture.
+            if (n == 0) return;
             frame_index_ = static_cast<std::uint32_t>(n);
             accum_dirty_ = true;
             // Drop any pending capture state too -- a seed reset

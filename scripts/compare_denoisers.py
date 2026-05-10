@@ -130,8 +130,28 @@ def run_capture(exe: Path,
                 line_port: int) -> Path | None:
     """Launch demont.exe with the supplied autoexec.cfg and wait for a
     capture PPM matching `expected_ppm_glob` to appear. Returns the
-    captured PPM path or None on timeout / failure."""
+    captured PPM path or None on timeout / failure.
+
+    Non-destructive to the user's existing autoexec.cfg: if one is
+    already present in `workdir`, we preserve its bytes in a
+    `.compare_denoisers.bak` sibling and restore on exit (success or
+    failure). This matters because demont.exe's working dir is the
+    install / build tree where the user is likely to have a real cfg
+    they care about."""
     autoexec = workdir / "autoexec.cfg"
+    backup   = workdir / ".compare_denoisers.bak"
+    backup_made = False
+    if autoexec.exists():
+        # If a stale backup is sitting around from a previous crashed
+        # run, leave it -- restoring user's autoexec is more important
+        # than not clobbering the backup. Bail loud if both exist.
+        if backup.exists():
+            print(f"[run_capture] WARNING: existing backup at {backup} "
+                  f"-- not overwriting. Move/delete it manually if "
+                  f"you're sure it's stale.", file=sys.stderr)
+        else:
+            shutil.copy2(autoexec, backup)
+            backup_made = True
     write_autoexec(autoexec, cfg_lines)
     captures_dir = workdir / "captures"
     captures_dir.mkdir(exist_ok=True)
@@ -189,10 +209,18 @@ def run_capture(exe: Path,
                 proc.wait(timeout=2.0)
         except Exception as e:
             print(f"[run_capture] cleanup warning: {e}", file=sys.stderr)
+        # Restore any pre-existing autoexec.cfg, then clean up the
+        # backup. If we never made a backup, just delete our temporary
+        # autoexec.
         try:
-            autoexec.unlink()
-        except FileNotFoundError:
-            pass
+            if backup_made:
+                shutil.move(str(backup), str(autoexec))
+            else:
+                autoexec.unlink(missing_ok=True)
+        except Exception as e:
+            print(f"[run_capture] cleanup warning: could not restore "
+                  f"autoexec.cfg ({e}). User's original (if any) is "
+                  f"in {backup}", file=sys.stderr)
 
 
 def main() -> int:

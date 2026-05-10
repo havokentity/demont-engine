@@ -74,9 +74,20 @@ void StartSequence(std::string_view prefix,
 // handler when the user resets the deterministic seed.
 void Reset();
 
+// What MaybeCapture did this frame. The boolean trio lets the engine
+// keep the user-facing cvar surface honest: when the one-shot capture
+// fires the engine resets `r_capture_frame_at` back to "0", and when a
+// sequence completes the engine clears `r_capture_seq` back to "".
+// Without these flags MaybeCapture's callers can't tell apart "no
+// capture armed" from "capture just fired and disarmed itself".
+struct MaybeCaptureResult {
+    bool wrote          = false;  // any PPM was written this frame
+    bool one_shot_fired = false;  // r_capture_frame_at trigger fired
+    bool seq_completed  = false;  // r_capture_seq decremented to 0
+};
+
 // Single per-frame entry point. Called from the engine's render loop
-// after `device_->EndFrame()` (post-present). Returns true when an
-// actual capture wrote a file -- caller can log if interested.
+// after `device_->EndFrame()` (post-present).
 //
 // `denoiser_label` is just a tag for the output filename (e.g.
 // "off" / "svgf_atrous" / "optix_hdr_aov"); FrameCapture doesn't
@@ -84,16 +95,22 @@ void Reset();
 // live GPU-resident exposure scalar is read back so the on-CPU ACES
 // tonemap matches what the GPU's PathTrace.slang / Tonemap.slang
 // applies on-screen (mirroring the screenshot-command behaviour).
-bool MaybeCapture(pt::rhi::Device*  device,
-                  std::uint32_t     frame_index,
-                  std::uint64_t     accum_tex_id,
-                  std::uint64_t     denoise_color_tex_id,
-                  std::uint64_t     exposure_state_buf_id,
-                  std::int32_t      accum_w,
-                  std::int32_t      accum_h,
-                  CaptureSourceKind source,
-                  std::string_view  denoiser_label,
-                  float             exposure_fallback);
+//
+// Path-traversal safety: `denoiser_label` and the internal sequence
+// `prefix` (set via StartSequence) are sanitised to a `[A-Za-z0-9_-]+`
+// subset before being formatted into the output filename, so a hostile
+// or accidentally weird cvar value (e.g. "../../etc") cannot escape
+// the captures/ directory.
+MaybeCaptureResult MaybeCapture(pt::rhi::Device*  device,
+                                std::uint32_t     frame_index,
+                                std::uint64_t     accum_tex_id,
+                                std::uint64_t     denoise_color_tex_id,
+                                std::uint64_t     exposure_state_buf_id,
+                                std::int32_t      accum_w,
+                                std::int32_t      accum_h,
+                                CaptureSourceKind source,
+                                std::string_view  denoiser_label,
+                                float             exposure_fallback);
 
 // Cheap predicate: is any capture currently armed? Engine can use this
 // to skip allocations / readback paths when nothing is requested.

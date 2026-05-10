@@ -124,6 +124,43 @@ std::filesystem::path EnsureCapturesDir() {
     return dir;
 }
 
+// Sanitize a user-controllable string (sequence prefix, denoiser
+// label) before letting it land in a filename. Maps any character
+// outside [A-Za-z0-9_-] to '_'; collapses repeated underscores and
+// trims leading/trailing underscores; clamps to a reasonable length
+// so a pathological input doesn't blow up MAX_PATH (260 on legacy
+// Windows). Returns the sanitized string; if the input was entirely
+// stripped, falls back to `fallback` so we never produce a filename
+// segment of just ".ppm".
+std::string SanitizeFilenamePart(std::string_view in,
+                                 std::string_view fallback) {
+    constexpr std::size_t kMaxLen = 64;
+    std::string out;
+    out.reserve(std::min<std::size_t>(in.size(), kMaxLen));
+    bool last_underscore = false;
+    for (char c : in) {
+        const bool ok =
+            (c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') ||
+            c == '_' || c == '-';
+        if (ok) {
+            out.push_back(c);
+            last_underscore = (c == '_');
+        } else if (!last_underscore) {
+            out.push_back('_');
+            last_underscore = true;
+        }
+        if (out.size() >= kMaxLen) break;
+    }
+    // Trim leading / trailing underscores so we don't emit names
+    // like "_foo_" / "..ppm".
+    while (!out.empty() && out.front() == '_') out.erase(out.begin());
+    while (!out.empty() && out.back()  == '_') out.pop_back();
+    if (out.empty()) out.assign(fallback);
+    return out;
+}
+
 std::string FormatTimestamp() {
     auto now = std::chrono::system_clock::now();
     auto t   = std::chrono::system_clock::to_time_t(now);
@@ -234,17 +271,18 @@ bool DoCapture(pt::rhi::Device*  device,
     const float exposure = ResolveExposure(device, exposure_state_buf_id,
                                            exposure_fallback);
 
-    auto dir   = EnsureCapturesDir();
-    auto fname = fmt::format("{}_{:06d}_{}_{}.ppm",
-                             filename_prefix.empty()
-                                 ? std::string_view{"capture"}
-                                 : filename_prefix,
-                             frame_index,
-                             denoiser_label.empty()
-                                 ? std::string_view{"unknown"}
-                                 : denoiser_label,
-                             FormatTimestamp());
-    auto path  = dir / fname;
+    // Sanitize the operator-controllable filename parts so e.g.
+    // `r_capture_seq "../../etc 5 1"` or `r_denoiser` containing
+    // path separators can't escape captures/. Both come from cvar
+    // values and should always be reasonable, but defence-in-depth
+    // is cheap.
+    auto dir       = EnsureCapturesDir();
+    auto safe_pref = SanitizeFilenamePart(filename_prefix, "capture");
+    auto safe_lbl  = SanitizeFilenamePart(denoiser_label,  "unknown");
+    auto fname     = fmt::format("{}_{:06d}_{}_{}.ppm",
+                                 safe_pref, frame_index,
+                                 safe_lbl, FormatTimestamp());
+    auto path      = dir / fname;
 
     if (!EncodeAndWritePpm(path, raw, w, h, source, exposure)) {
         LOG_WARN("FrameCapture: cannot open '{}' for writing",
@@ -304,54 +342,85 @@ bool IsArmed() {
     return s.one_shot_frame != 0 || s.seq_remaining > 0;
 }
 
-bool MaybeCapture(pt::rhi::Device*  device,
-                  std::uint32_t     frame_index,
-                  std::uint64_t     accum_tex_id,
-                  std::uint64_t     denoise_color_tex_id,
-                  std::uint64_t     exposure_state_buf_id,
-                  std::int32_t      accum_w,
-                  std::int32_t      accum_h,
-                  CaptureSourceKind source,
-                  std::string_view  denoiser_label,
-                  float             exposure_fallback) {
+MaybeCaptureResult MaybeCapture(pt::rhi::Device*  device,
+                                std::uint32_t     frame_index,
+                                std::uint64_t     accum_tex_id,
+                                std::uint64_t     denoise_color_tex_id,
+                                std::uint64_t     exposure_state_buf_id,
+                                std::int32_t      accum_w,
+                                std::int32_t      accum_h,
+                                CaptureSourceKind source,
+                                std::string_view  denoiser_label,
+                                float             exposure_fallback) {
+    MaybeCaptureResult r;
     auto& s = GetState();
-    if (s.one_shot_frame == 0 && s.seq_remaining == 0) return false;
+    if (s.one_shot_frame == 0 && s.seq_remaining == 0) return r;
 
-    bool wrote = false;
-
-    // r_capture_frame_at: one-shot trigger. Cleared after firing.
+    // r_capture_frame_at: one-shot trigger. Disarms only on a
+    // successful write -- if DoCapture fails (e.g. ReadbackTexture
+    // returned an empty extent), keep the trigger armed and try
+    // again next frame so a transient hiccup doesn't lose the shot.
+    // The engine's post-present hook clears the cvar surface once
+    // `one_shot_fired` is reported.
     if (s.one_shot_frame != 0 && frame_index == s.one_shot_frame) {
-        wrote |= DoCapture(device, frame_index,
-                           accum_tex_id, denoise_color_tex_id,
-                           exposure_state_buf_id,
-                           accum_w, accum_h, source,
-                           denoiser_label, exposure_fallback,
-                           /*filename_prefix=*/"capture");
-        s.one_shot_frame = 0;  // belt-and-braces; cvar on_change clears too
-    }
-
-    // r_capture_seq: emit at every `seq_interval` frames until
-    // `seq_remaining` decrements to zero.
-    if (s.seq_remaining > 0 && frame_index >= s.seq_next_frame) {
-        wrote |= DoCapture(device, frame_index,
-                           accum_tex_id, denoise_color_tex_id,
-                           exposure_state_buf_id,
-                           accum_w, accum_h, source,
-                           denoiser_label, exposure_fallback,
-                           /*filename_prefix=*/s.seq_prefix);
-        --s.seq_remaining;
-        s.seq_next_frame = frame_index + s.seq_interval;
-        if (s.seq_remaining == 0) {
-            PT_DIAG_TIER1("capture",
-                          "sequence capture done (prefix={})",
-                          s.seq_prefix);
-            s.seq_prefix.clear();
-            s.seq_next_frame = 0;
-            s.seq_interval   = 1;
+        const bool ok = DoCapture(device, frame_index,
+                                  accum_tex_id, denoise_color_tex_id,
+                                  exposure_state_buf_id,
+                                  accum_w, accum_h, source,
+                                  denoiser_label, exposure_fallback,
+                                  /*filename_prefix=*/"capture");
+        if (ok) {
+            r.wrote = true;
+            r.one_shot_fired = true;
+            s.one_shot_frame = 0;
+        }
+        // On failure leave one_shot_frame set; next frame past the
+        // target it will skip the equality check, so we'd actually
+        // lose the trigger anyway. Bump it to (frame_index + 1) so
+        // the retry hits next frame instead.
+        else {
+            s.one_shot_frame = frame_index + 1;
         }
     }
 
-    return wrote;
+    // r_capture_seq: emit at every `seq_interval` frames until
+    // `seq_remaining` decrements to zero. Same retry semantics as
+    // the one-shot path: only decrement / advance the schedule on
+    // a successful write, so a readback hiccup costs at most one
+    // frame of latency, not a missing capture in the middle of the
+    // sequence.
+    if (s.seq_remaining > 0 && frame_index >= s.seq_next_frame) {
+        const bool ok = DoCapture(device, frame_index,
+                                  accum_tex_id, denoise_color_tex_id,
+                                  exposure_state_buf_id,
+                                  accum_w, accum_h, source,
+                                  denoiser_label, exposure_fallback,
+                                  /*filename_prefix=*/s.seq_prefix);
+        if (ok) {
+            r.wrote = true;
+            --s.seq_remaining;
+            s.seq_next_frame = frame_index + s.seq_interval;
+            if (s.seq_remaining == 0) {
+                PT_DIAG_TIER1("capture",
+                              "sequence capture done (prefix={})",
+                              s.seq_prefix);
+                s.seq_prefix.clear();
+                s.seq_next_frame = 0;
+                s.seq_interval   = 1;
+                r.seq_completed  = true;
+            }
+        } else {
+            // Don't burn a count on a failed write. Re-schedule for
+            // next frame (interval-spacing is sacrificed once on a
+            // hiccup, but the user still gets `count` total
+            // captures) -- the failure already logged a LOG_WARN
+            // inside DoCapture so this is silent retry on top of
+            // visible diagnostic.
+            s.seq_next_frame = frame_index + 1;
+        }
+    }
+
+    return r;
 }
 
 }  // namespace pt::engine::capture
