@@ -2,6 +2,8 @@
 // Copyright (c) 2026 Rajesh D'Monte
 #include "Engine.h"
 
+#include "FrameCapture.h"
+
 #include "../app/ConsoleOverlay.h"
 #include "../app/PerfOverlay.h"
 #include "../app/Window.h"
@@ -253,6 +255,41 @@ namespace cvar {
             "callsite -- raising the level only emits at sites that have "
             "been migrated to PT_DIAG_TIERn().",
             CVAR_ARCHIVE);
+    PT_CVAR(r_capture_frame_at, "0",
+            "Frame-capture: write the current visible frame to "
+            "captures/capture_<frame_n>_<denoiser>_<ts>.ppm at the given "
+            "absolute frame index (engine's frame_index_, monotonic from "
+            "0 on cold start). 0 = disabled. One-shot per cvar set; auto-"
+            "resets to 0 after the capture fires. Source texture is "
+            "picked from the engine state: accum_hdr (RGBA32F) when "
+            "denoiser is off, denoise_color (RGBA16F) when denoiser is "
+            "on. Both go through the same on-CPU ACES + sRGB OETF as "
+            "the screenshot command, so the PPM matches what's on screen "
+            "modulo bloom / lens-flare / perf-overlay.",
+            0);
+    PT_CVAR(r_capture_seq, "",
+            "Frame-capture sequence: capture N frames at the given "
+            "interval. Format: '<prefix> <N> <interval>' (positional, "
+            "space-separated). Example: 'baseline 60 4' captures 60 "
+            "frames every 4th frame starting from the next render "
+            "frame. The prefix tags the output filenames "
+            "(captures/<prefix>_<frame_n>_<denoiser>_<ts>.ppm). Empty "
+            "string disables. Useful for analyzing temporal stability "
+            "(non-temporal denoisers show frame-to-frame variance; "
+            "temporal ones converge).",
+            0);
+    PT_CVAR(r_capture_seed, "0",
+            "Frame-capture deterministic seed: when non-zero, the cvar's "
+            "on_change handler resets the engine's frame_index_ counter "
+            "to this value and forces an accum reset. Combined with "
+            "identical camera + identical scene + identical r_spp, this "
+            "makes two demont.exe runs produce bitwise-identical noise "
+            "patterns at the same r_capture_frame_at. The path tracer's "
+            "PRNG seeds purely from (pixel_id, frame_index) so this is "
+            "the single knob needed for deterministic A/B comparison "
+            "across denoiser configurations. 0 = let frame_index_ run "
+            "naturally from cold-start 0.",
+            0);
 
     // Hardware info (filled at startup, READONLY).
     PT_CVAR(sys_cpu_model,    "?",  "CPU brand string",              CVAR_READONLY);
@@ -2793,6 +2830,53 @@ void Engine::RenderFrame() {
     device_->Submit(cb);
     device_->EndFrame(cb);
 
+    // Post-present frame-capture hook. Driven by r_capture_frame_at /
+    // r_capture_seq / r_capture_seed -- the cvars' on_change handlers
+    // arm the FrameCapture state and this hook services it. Cheap
+    // when nothing is requested (single bool check via IsArmed());
+    // pays the readback + tonemap + PPM-write cost only on the actual
+    // capture frame. Source texture is the engine's "current visible
+    // HDR image" -- denoise_color when a denoiser is active, accum
+    // otherwise -- so PPM RMSE comparisons across r_denoiser values
+    // measure the denoiser delta directly (modulo bloom / lens flare /
+    // perf overlay, which only land in the swapchain).
+    if (pt::engine::capture::IsArmed()) {
+        // Source texture selection: when no denoiser is active, the
+        // path tracer's `accum` (RGBA32F) is what gets tonemapped to
+        // the swapchain. When a denoiser is on, the denoiser's output
+        // image -- `post_denoise_hdr_tex_id_` (RGBA16F) -- is what bloom
+        // + tonemap read; that's the right "denoiser delta" to capture.
+        // Note: `denoise_color_tex_id_` is the denoiser's *input* (the
+        // path tracer's per-frame HDR write), not its output -- naming
+        // historical from the SVGF G-buffer days. Capturing that would
+        // make svgf_atrous / optix_hdr / optix_hdr_aov produce
+        // bitwise-identical PPMs (same input goes into all three).
+        const auto kind = denoiser_active_
+            ? pt::engine::CaptureSourceKind::DenoiseColor
+            : pt::engine::CaptureSourceKind::Accum;
+        const std::uint64_t denoised_tex_id =
+            denoiser_active_ ? post_denoise_hdr_tex_id_ : 0;
+        std::string denoiser_label = "off";
+        if (auto* dv = pt::console::Console::Get().FindCVar("r_denoiser")) {
+            denoiser_label = dv->value;
+        }
+        float exposure_fallback = 1.0f;
+        if (auto* ev = pt::console::Console::Get().FindCVar("r_exposure")) {
+            exposure_fallback = ev->GetFloat();
+        }
+        pt::engine::capture::MaybeCapture(
+            device_.get(),
+            frame_index_,
+            accum_texture_id_,
+            denoised_tex_id,
+            exposure_state_id_,
+            accum_w_,
+            accum_h_,
+            kind,
+            denoiser_label,
+            exposure_fallback);
+    }
+
     prev_view_proj_       = curr_view_proj;
     prev_view_proj_valid_ = true;
 
@@ -3790,6 +3874,82 @@ void Engine::RegisterCommands() {
         // shouldn't break the invariant).
         pt::diag::g_diag_level.store(std::clamp(v->GetInt(), 0, 3),
                                      std::memory_order_relaxed);
+    }
+    // r_capture_frame_at: arm the FrameCapture one-shot trigger. Cleared
+    // back to 0 after the capture fires (FrameCapture also clears the
+    // internal armed flag; this just keeps the cvar surface honest so a
+    // re-set of the same value re-fires the on_change).
+    if (auto* v = C.FindCVar("r_capture_frame_at")) {
+        v->on_change = [](const pt::console::CVar& cv) {
+            int n = cv.GetInt();
+            if (n < 0) n = 0;
+            pt::engine::capture::SetOneShotFrame(static_cast<std::uint32_t>(n));
+        };
+    }
+    // r_capture_seq: parse "<prefix> <N> <interval>" (positional, space-
+    // separated) and arm the sequence. Empty string disables.
+    if (auto* v = C.FindCVar("r_capture_seq")) {
+        v->on_change = [](const pt::console::CVar& cv) {
+            const std::string& s = cv.value;
+            if (s.empty()) {
+                pt::engine::capture::StartSequence("", 0, 0);
+                return;
+            }
+            // Tokenise on whitespace -- duplicate of TokenizeLine logic
+            // would be overkill for three positional fields. The cvar's
+            // value is already de-quoted by Console::Execute, so just
+            // walk the string.
+            std::vector<std::string> toks;
+            std::string cur;
+            for (char c : s) {
+                if (c == ' ' || c == '\t') {
+                    if (!cur.empty()) { toks.push_back(std::move(cur)); cur.clear(); }
+                } else {
+                    cur.push_back(c);
+                }
+            }
+            if (!cur.empty()) toks.push_back(std::move(cur));
+            if (toks.size() < 3) {
+                LOG_WARN("r_capture_seq: expected 'prefix N interval' (got {} token(s)); "
+                         "sequence disabled", toks.size());
+                pt::engine::capture::StartSequence("", 0, 0);
+                return;
+            }
+            int n        = std::atoi(toks[1].c_str());
+            int interval = std::atoi(toks[2].c_str());
+            if (n <= 0 || interval <= 0) {
+                LOG_WARN("r_capture_seq: N and interval must be positive (got N={} interval={}); "
+                         "sequence disabled", n, interval);
+                pt::engine::capture::StartSequence("", 0, 0);
+                return;
+            }
+            pt::engine::capture::StartSequence(
+                toks[0],
+                static_cast<std::uint32_t>(n),
+                static_cast<std::uint32_t>(interval));
+        };
+    }
+    // r_capture_seed: when non-zero, reset frame_index_ to this value
+    // and force an accum reset, so two demont.exe launches with
+    // identical settings + the same seed produce bitwise-identical noise
+    // patterns at the same r_capture_frame_at. Path tracer's PRNG seeds
+    // purely from (pixel_id, frame_index) so this is the single knob
+    // we need (see PathTrace.slang's pcgHash line ~1047). The on_change
+    // handler captures `this` to mutate the engine's frame counter +
+    // accum-dirty flag, which lives in the cvar registration's
+    // RegisterCommands lane.
+    if (auto* v = C.FindCVar("r_capture_seed")) {
+        v->on_change = [this](const pt::console::CVar& cv) {
+            int n = cv.GetInt();
+            if (n < 0) n = 0;
+            frame_index_ = static_cast<std::uint32_t>(n);
+            accum_dirty_ = true;
+            // Drop any pending capture state too -- a seed reset
+            // implies the operator wants a clean baseline.
+            pt::engine::capture::Reset();
+            LOG_INFO("[capture] r_capture_seed={} -- frame_index reset, "
+                     "accum cleared, pending captures dropped", n);
+        };
     }
     if (auto* v = C.FindCVar("r_denoiser")) {
         // metalfx is Mac-only; svgf_basic / svgf_atrous / nrd / optix_*
