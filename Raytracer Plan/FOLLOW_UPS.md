@@ -217,8 +217,6 @@ forward-compat `nrd` alias.
   sizes 1/2/4 with depth + normal + luminance edge stops. The last
   pass writes directly into `post_denoise_hdr`. ~5 ms; cleaner on
   disocclusions, mild softening of micro-detail.
-- `svgf` — back-compat alias for `svgf_atrous` (the cvar value
-  briefly shipped without the basic/atrous split).
 - `nrd` — currently aliases `svgf_atrous`; reserved for the proper
   NVIDIA library swap (see below). One-time log on transition so the
   user knows they're on the SVGF placeholder.

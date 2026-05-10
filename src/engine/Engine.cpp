@@ -98,11 +98,11 @@ namespace cvar {
             "fast motion, slightly noisier on disocclusions). svgf_atrous "
             "= svgf_basic + 3-pass a-trous edge-aware spatial filter "
             "(~5 ms; cleaner on disocclusions, mild softening of micro "
-            "detail). svgf = alias for svgf_atrous. nrd = same dispatch "
-            "chain as svgf_atrous today; reserved for the proper NVIDIA "
-            "RayTracingDenoiser library integration once that's wired up "
-            "(see Raytracer Plan/FOLLOW_UPS.md). Mac builds ignore the "
-            "svgf*/nrd values; Windows builds ignore metalfx.",
+            "detail). nrd = same dispatch chain as svgf_atrous today; "
+            "reserved for the proper NVIDIA RayTracingDenoiser library "
+            "integration once that's wired up (see Raytracer "
+            "Plan/FOLLOW_UPS.md). Mac builds ignore the svgf_*/nrd "
+            "values; Windows builds ignore metalfx.",
             CVAR_ARCHIVE);
     PT_CVAR(r_hdr_pipeline,    "1",  "Linear-HDR pipeline through MetalFX. 1 = path tracer writes raw HDR, MetalFX denoises in HDR, post-pass applies exposure+ACES (recommended). 0 = path tracer pre-applies exposure+ACES, MetalFX denoises LDR, tonemap pass is a passthrough copy. Only affects the denoiser-on path.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom,           "1",  "HDR bloom (downsample/upsample pyramid, additive composite before ACES). 0 disables; tonemap then samples a 1x1 zero buffer.", CVAR_ARCHIVE);
@@ -1391,12 +1391,8 @@ void Engine::RenderFrame() {
         if (s == "metalfx" && current_backend_ == BackendType::Metal) {
             want_kind = DenoiserKind::MetalFX;
         } else if (current_backend_ == BackendType::Vulkan) {
-            // svgf is a back-compat alias for svgf_atrous (the cvar
-            // value briefly shipped on this branch before the
-            // basic/atrous split).
             if      (s == "svgf_basic")  want_kind = DenoiserKind::SvgfBasic;
             else if (s == "svgf_atrous") want_kind = DenoiserKind::SvgfAtrous;
-            else if (s == "svgf")        want_kind = DenoiserKind::SvgfAtrous;
             else if (s == "nrd")         want_kind = DenoiserKind::Nrd;
         }
     }
@@ -3600,9 +3596,8 @@ void Engine::RegisterCommands() {
         // (cvar, backend) combinations to off rather than rejecting
         // at console-set time -- so a user can have `r_denoiser
         // svgf_atrous` in their demont.cfg and still launch on a Mac
-        // without the cfg getting rejected. `svgf` (no suffix) is a
-        // back-compat alias for svgf_atrous.
-        v->allowed_values = {"off", "metalfx", "svgf",
+        // without the cfg getting rejected.
+        v->allowed_values = {"off", "metalfx",
                               "svgf_basic", "svgf_atrous", "nrd"};
     }
     if (auto* v = C.FindCVar("r_hdr_pipeline")) {

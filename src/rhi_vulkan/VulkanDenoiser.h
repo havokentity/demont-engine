@@ -2,13 +2,13 @@
 // Copyright (c) 2026 Rajesh D'Monte
 //
 // SVGF-style temporal + a-trous compute denoiser for the Vulkan
-// backend. Branded under the engine's `r_denoiser nrd` cvar value
-// (and "svgf") so the user-facing knob distinguishes it from MetalFX
-// on the Mac. The "nrd" name is forward-looking: when NVIDIA's
-// RayTracingDenoiser library lands properly (multi-day integration,
-// see Raytracer Plan/FOLLOW_UPS.md), the cvar value will switch
-// implementation but stay user-stable. Today both `svgf` and `nrd`
-// route through this class with a one-time log distinguishing them.
+// backend. Drives the engine's `r_denoiser svgf_basic`,
+// `r_denoiser svgf_atrous`, and `r_denoiser nrd` cvar values.
+// `nrd` is forward-looking: when NVIDIA's RayTracingDenoiser
+// library lands properly (multi-day integration, see Raytracer
+// Plan/FOLLOW_UPS.md), the cvar value will switch implementation
+// but stay user-stable. Today it aliases svgf_atrous with a
+// one-time log on transition.
 //
 // Pipeline shape, per Encode() call:
 //   1) DenoiseTemporal: reproject color_history_a + accumulate noisy
