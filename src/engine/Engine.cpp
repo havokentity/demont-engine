@@ -37,10 +37,12 @@
 #include <array>
 #include <charconv>
 #include <chrono>
+#include <cmath>      // std::sqrt for cam-teleport detection
 #include <cstdlib>
 #include <ctime>
 #include <numbers>
 #include <numeric>
+#include <sstream>    // std::istringstream for cam_load slot parsing
 #include <thread>
 
 namespace pt::engine {
@@ -75,6 +77,14 @@ namespace cvar {
             "2 = + backend / resolution / GPU memory / spp / bounces / primitives, "
             "3 = + frame-time sparkline. (Tier 4 reserved for per-pass GPU "
             "timestamps once VkQueryPool / MTLCounterSampleBuffer is wired.)",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_perf_overlay_scale, "1.0",
+            "Perf overlay scale (1.0 = baseline 13 logical-unit "
+            "CreateFontW height + 296px panel width + 44px sparkline "
+            "height; CreateFontW takes logical units, not points). "
+            "Effective range 0.5..3.0; values outside are clamped at "
+            "Paint() time. Win32 only -- the Mac overlay uses native "
+            "NSFont sizing and ignores this cvar.",
             CVAR_ARCHIVE);
     PT_CVAR(r_perf_overlay_mode, "native",
             "Backend for the perf overlay. 'native' = OS-native child window "
@@ -207,6 +217,38 @@ namespace cvar {
     PT_CVAR(cam_pos,           "0 1.5 4", "Camera position (x y z)",       CVAR_ARCHIVE);
     PT_CVAR(cam_yaw,           "0",       "Yaw in degrees",                CVAR_ARCHIVE);
     PT_CVAR(cam_pitch,         "-11.5",   "Pitch in degrees (clamped +/- 85)", CVAR_ARCHIVE);
+    // Camera-state slots for the cam_save / cam_load / cam_list / cam_reset
+    // commands (registered in RegisterCommands). Slots 1..9 are user-
+    // savable via `cam_save [N]`; slot 0 is the engineering default
+    // (hardcoded inside cam_reset, no cvar). Format string is
+    // "x y z yaw_deg pitch_deg fov_deg" -- same space-separated
+    // convention cam_pos uses, six floats. Empty string = unsaved.
+    // CVAR_ARCHIVE so saved viewpoints persist across runs.
+    // Format: "x y z yaw_deg pitch_deg fov_deg" -- six floats, all
+    // angles in DEGREES (Camera stores yaw/pitch as radians; the
+    // cam_save / cam_load helpers handle the conversion).
+    PT_CVAR(cam_slot_1, "", "Saved camera state, slot 1: \"x y z yaw_deg pitch_deg fov_deg\"", CVAR_ARCHIVE);
+    PT_CVAR(cam_slot_2, "", "Saved camera state, slot 2: \"x y z yaw_deg pitch_deg fov_deg\"", CVAR_ARCHIVE);
+    PT_CVAR(cam_slot_3, "", "Saved camera state, slot 3: \"x y z yaw_deg pitch_deg fov_deg\"", CVAR_ARCHIVE);
+    PT_CVAR(cam_slot_4, "", "Saved camera state, slot 4: \"x y z yaw_deg pitch_deg fov_deg\"", CVAR_ARCHIVE);
+    PT_CVAR(cam_slot_5, "", "Saved camera state, slot 5: \"x y z yaw_deg pitch_deg fov_deg\"", CVAR_ARCHIVE);
+    PT_CVAR(cam_slot_6, "", "Saved camera state, slot 6: \"x y z yaw_deg pitch_deg fov_deg\"", CVAR_ARCHIVE);
+    PT_CVAR(cam_slot_7, "", "Saved camera state, slot 7: \"x y z yaw_deg pitch_deg fov_deg\"", CVAR_ARCHIVE);
+    PT_CVAR(cam_slot_8, "", "Saved camera state, slot 8: \"x y z yaw_deg pitch_deg fov_deg\"", CVAR_ARCHIVE);
+    PT_CVAR(cam_slot_9, "", "Saved camera state, slot 9: \"x y z yaw_deg pitch_deg fov_deg\"", CVAR_ARCHIVE);
+    PT_CVAR(cam_teleport_threshold, "5.0",
+            "Per-frame position-delta threshold (in world units) for "
+            "auto-firing the active denoiser's reset_history flag. "
+            "Larger jumps (e.g. user typed a coordinate in console, or "
+            "moved through a sphere whose inside is black) clear the "
+            "current denoiser's history -- consumed by SVGF/NRD's "
+            "temporal accumulation path, MetalFX's history-state "
+            "reset, AND the OptiX temporal denoisers' "
+            "prev_output / internal-guide-layer ping-pong -- instead "
+            "of bleeding stale pre-jump color into post-jump frames. "
+            "Default 5 = ~33x typical WASD per-frame movement at "
+            "cam_speed=3, 60fps. 0 = disabled.",
+            CVAR_ARCHIVE);
     // Depth-of-field (thin-lens camera). Each primary ray originates
     // at a random sample on the aperture and aims through the focal-
     // plane intersection of the pinhole ray. Bokeh shape comes from
@@ -1591,6 +1633,33 @@ void Engine::RenderFrame() {
                      (cam.pitch != last_cam_pitch_)  ||
                      (cam.fov_deg != last_cam_fov_);
     if (cam_moved) accum_dirty_ = true;
+    // Auto-fire reset_history on a "teleport" -- per-frame position
+    // delta exceeds cam_teleport_threshold (default 5 units, ~33x
+    // typical WASD movement). Catches cam_load (already explicitly
+    // resets), cam_reset (same), AND inadvertent jumps where the user
+    // typed a coordinate or moved a camera through a sphere whose
+    // inside is black. Without this auto-detection, post-teleport
+    // frames blend with the pre-teleport temporal history, visibly
+    // bleeding stale color forward (the v0.3.4 inside-sphere
+    // symptom). prev_view_proj_valid_ already gets cleared on
+    // backend toggle / denoiser kind switch / first frame, so the
+    // check is naturally a no-op on those paths. Only fires when the
+    // engine's *been* rendering normally and the camera then jumps.
+    if (prev_view_proj_valid_) {
+        const float dx = cam.pos.x - last_cam_pos_[0];
+        const float dy = cam.pos.y - last_cam_pos_[1];
+        const float dz = cam.pos.z - last_cam_pos_[2];
+        const float dist2 = dx * dx + dy * dy + dz * dz;
+        float thresh = 5.0f;
+        if (auto* v = pt::console::Console::Get().FindCVar("cam_teleport_threshold")) {
+            thresh = v->GetFloat();
+        }
+        if (thresh > 0.0f && dist2 > thresh * thresh) {
+            prev_view_proj_valid_ = false;
+            LOG_INFO("engine: camera teleport detected ({:.2f}u > threshold {:.2f}u); "
+                     "firing denoiser reset_history", std::sqrt(dist2), thresh);
+        }
+    }
     last_cam_pos_[0] = cam.pos.x; last_cam_pos_[1] = cam.pos.y; last_cam_pos_[2] = cam.pos.z;
     last_cam_yaw_   = cam.yaw;   last_cam_pitch_  = cam.pitch;  last_cam_fov_  = cam.fov_deg;
 
@@ -3172,6 +3241,156 @@ void Engine::RegisterCommands() {
             out.Print("\n");
         });
 
+    // ---- cam_* dev tools ---------------------------------------------------
+    // Save / restore camera viewpoints by slot number. Slot 0 is the
+    // engineering default (read-only, hardcoded inside cam_reset).
+    // Slots 1..9 are user-savable, persisted across runs via the
+    // cam_slot_N CVAR_ARCHIVE cvars registered above. cam_load and
+    // cam_reset both fire prev_view_proj_valid_ = false so the next
+    // frame's dd.reset_history clears the ACTIVE temporal denoiser's
+    // history -- consumed by SVGF/NRD's temporal accumulation,
+    // MetalFX's history-state reset, and the OptiX temporal
+    // denoisers' prev_output / internal-guide-layer ping-pong.
+    // Without this the per-frame temporal blend keeps mixing
+    // pre-teleport content into post-teleport frames (visible as the
+    // "went inside a sphere, came out, screen still tinted black"
+    // symptom v0.3.4 surfaced).
+    // Helpers as no-capture lambdas (so they're copy-constructible into
+    // the std::function backing each command). Constants live inside
+    // each lambda rather than being captured -- captures-by-reference
+    // chain trips up MSVC's _Enable_if_callable_t when the helpers get
+    // captured by value into the inner command lambdas.
+    const auto fmt_cam_state = [](const pt::renderer::Camera& c) -> std::string {
+        constexpr float kRadToDeg = 57.29577951308232f;
+        return fmt::format("{:.6f} {:.6f} {:.6f} {:.4f} {:.4f} {:.3f}",
+                           c.pos.x, c.pos.y, c.pos.z,
+                           c.yaw   * kRadToDeg,
+                           c.pitch * kRadToDeg,
+                           c.fov_deg);
+    };
+    const auto parse_cam_state = [](std::string_view s, pt::renderer::Camera& out) -> bool {
+        constexpr float kDegToRad = 0.017453292519943295f;
+        std::istringstream iss{std::string(s)};
+        float x, y, z, yaw_d, pitch_d, fov_d;
+        if (!(iss >> x >> y >> z >> yaw_d >> pitch_d >> fov_d)) return false;
+        out.pos     = glm::vec3(x, y, z);
+        out.yaw     = yaw_d   * kDegToRad;
+        out.pitch   = pitch_d * kDegToRad;
+        out.fov_deg = fov_d;
+        out.ClampPitch();
+        return true;
+    };
+    // /EHs-c- (exceptions disabled) -- can't use std::stoi try/catch.
+    // std::from_chars is the right tool: no allocations, no exceptions,
+    // and it returns BOTH a parse-failure errc AND the consumed-up-to
+    // pointer so we can reject partial inputs like "1abc" (which
+    // strtol would silently accept as 1). Also reports
+    // std::errc::result_out_of_range explicitly instead of silently
+    // truncating a long-to-int cast.
+    const auto parse_slot = [](std::span<const std::string_view> args, int default_slot) -> int {
+        if (args.empty()) return default_slot;
+        const std::string_view sv = args[0];
+        if (sv.empty()) return -1;
+        int parsed = 0;
+        const auto* first = sv.data();
+        const auto* last  = sv.data() + sv.size();
+        const auto r = std::from_chars(first, last, parsed);
+        if (r.ec != std::errc{}) return -1;   // parse error or out-of-range
+        if (r.ptr != last)       return -1;   // partial input -- "1abc" rejected
+        return parsed;
+    };
+
+    C.RegisterCommand("cam_save",
+        "Save the current camera state into a slot (1..9, default 1). "
+        "Slot 0 is the engineering default and cannot be saved into.",
+        [this, fmt_cam_state, parse_slot](auto args, pt::console::Output& out) {
+            if (!camera_) { out.PrintLine("cam_save: no camera"); return; }
+            const int slot = parse_slot(args, 1);
+            if (slot == 0) {
+                out.PrintLine("cam_save: slot 0 is the engineering default (read-only). Use 1..9.");
+                return;
+            }
+            if (slot < 1 || slot > 9) {
+                out.FormatLine("cam_save: slot {} out of range; use 1..9", slot);
+                return;
+            }
+            const std::string s = fmt_cam_state(*camera_);
+            const std::string cvar_name = fmt::format("cam_slot_{}", slot);
+            pt::console::Console::Get().SetCVarOverride(cvar_name, s);
+            out.FormatLine("cam_save: slot {} = {}", slot, s);
+        });
+
+    C.RegisterCommand("cam_load",
+        "Load a saved camera state from a slot (1..9, default 1). "
+        "Use cam_reset for slot 0 (engineering default). Loading "
+        "fires the active denoiser's history-reset flag so the "
+        "temporal denoise pipeline (SVGF/NRD/MetalFX/OptiX-temporal) "
+        "doesn't blend pre-teleport content forward.",
+        [this, parse_cam_state, parse_slot](auto args, pt::console::Output& out) {
+            if (!camera_) { out.PrintLine("cam_load: no camera"); return; }
+            const int slot = parse_slot(args, 1);
+            if (slot == 0) {
+                out.PrintLine("cam_load: slot 0 is the engineering default; use `cam_reset` instead.");
+                return;
+            }
+            if (slot < 1 || slot > 9) {
+                out.FormatLine("cam_load: slot {} out of range; use 1..9", slot);
+                return;
+            }
+            const std::string cvar_name = fmt::format("cam_slot_{}", slot);
+            auto* v = pt::console::Console::Get().FindCVar(cvar_name);
+            if (v == nullptr || v->value.empty()) {
+                out.FormatLine("cam_load: slot {} is empty (use `cam_save {}` to populate)",
+                               slot, slot);
+                return;
+            }
+            if (!parse_cam_state(v->value, *camera_)) {
+                out.FormatLine("cam_load: slot {} contents malformed: '{}'",
+                               slot, v->value);
+                return;
+            }
+            prev_view_proj_valid_ = false;  // active denoiser reset_history (SVGF/NRD/MetalFX/OptiX-temporal)
+            out.FormatLine("cam_load: slot {} = {}", slot, v->value);
+        });
+
+    C.RegisterCommand("cam_reset",
+        "Reset camera to the engineering default (slot 0, read-only). "
+        "Fires the active denoiser's history-reset flag so the "
+        "temporal denoise pipeline (SVGF/NRD/MetalFX/OptiX-temporal) "
+        "doesn't blend pre-reset content forward.",
+        [this](auto, pt::console::Output& out) {
+            if (!camera_) { out.PrintLine("cam_reset: no camera"); return; }
+            // Hardcoded engineering default. Matches the inline defaults
+            // in Camera.h (pos=(0,1.5,4), yaw=0, pitch=-0.20rad=-11.46deg,
+            // fov=60). NOT read from cam_pos / cam_yaw / etc. cvars
+            // because those are CVAR_ARCHIVE -- they hold the user's
+            // last-quit state, not the engine default.
+            camera_->pos     = glm::vec3(0.0f, 1.5f, 4.0f);
+            camera_->yaw     = 0.0f;
+            camera_->pitch   = -0.20f;
+            camera_->fov_deg = 60.0f;
+            prev_view_proj_valid_ = false;
+            out.PrintLine("cam_reset: pos=(0, 1.5, 4) yaw=0 pitch=-11.46 fov=60");
+        });
+
+    C.RegisterCommand("cam_list",
+        "List camera slots: 0 = engineering default (read-only), "
+        "1..9 = user-savable. Empty slots show <empty>.",
+        [](auto, pt::console::Output& out) {
+            auto& C2 = pt::console::Console::Get();
+            out.PrintLine("cam slots:");
+            out.PrintLine("  0: <engineering default>  (use cam_reset to load)");
+            for (int slot = 1; slot <= 9; ++slot) {
+                const std::string cvar_name = fmt::format("cam_slot_{}", slot);
+                auto* v = C2.FindCVar(cvar_name);
+                if (v != nullptr && !v->value.empty()) {
+                    out.FormatLine("  {}: {}", slot, v->value);
+                } else {
+                    out.FormatLine("  {}: <empty>", slot);
+                }
+            }
+        });
+
     C.RegisterCommand("sys_info", "Summarize hardware.",
         [](auto, pt::console::Output& out) {
             auto& C2 = pt::console::Console::Get();
@@ -3873,6 +4092,33 @@ void Engine::RegisterCommands() {
             }
             if (overlay_) overlay_->ApplyTheme(cv.value);
             if (perf_overlay_) perf_overlay_->ApplyTheme(cv.value);
+        };
+    }
+    // con_font_scale: cvar IS the source of truth (the in-game Win32
+    // overlay reads the live cvar value inside its EnsureFontScale()
+    // poll, called from Paint()). But Paint() only fires on WM_PAINT,
+    // and a web-GUI cvar set doesn't trigger one -- so without this
+    // on_change wiring, the user types con_font_scale 1.5 in the web
+    // console, the cvar updates, but the in-game overlay stays at the
+    // old size until something else triggers a paint (typing, scroll,
+    // animation timer). Pinging Repaint here closes that gap: any
+    // cvar writer (web GUI, in-game console, autoexec.cfg, CLI args)
+    // gets the same instant-feedback behaviour. No copy-paste of
+    // values -- the overlay re-reads the cvar inside EnsureFontScale.
+    if (auto* v = C.FindCVar("con_font_scale")) {
+        v->on_change = [this](const pt::console::CVar&) {
+            if (overlay_) overlay_->Repaint();
+        };
+    }
+    // r_perf_overlay_scale: same web-GUI live-propagation pattern as
+    // con_font_scale above. Win32 PerfOverlay's EnsureScale() polls
+    // the cvar inside Paint(); without an on_change kick from the
+    // setter, web GUI changes go invisible until the per-frame Update
+    // tick lands a redraw. Pinging Repaint here forces the next
+    // Paint immediately.
+    if (auto* v = C.FindCVar("r_perf_overlay_scale")) {
+        v->on_change = [this](const pt::console::CVar&) {
+            if (perf_overlay_) perf_overlay_->Repaint();
         };
     }
     // dev_log_level: validate

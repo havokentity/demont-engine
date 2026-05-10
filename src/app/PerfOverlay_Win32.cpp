@@ -9,6 +9,7 @@
 #include <Windows.h>
 
 #include "PerfOverlay.h"
+#include "../console/Console.h"
 #include "../core/Log.h"
 
 #include <fmt/format.h>
@@ -16,6 +17,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>      // std::strtof for r_perf_overlay_scale parse
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -83,6 +85,9 @@ public:
     void NotifyParentResized(int w, int h);
     void ApplyTheme(std::string_view name);
 
+    // Public entry points exposed via PerfOverlay's stable handle.
+    void Repaint();
+
 private:
     static LRESULT CALLBACK WndProcThunk(HWND, UINT, WPARAM, LPARAM);
     LRESULT WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -90,6 +95,11 @@ private:
     int  CurrentPanelHeight() const;
     void Reposition();
     void UpdateVisibility();
+    // Re-pull r_perf_overlay_scale, recreate the HFONT + recompute
+    // line_height_/panel_w_/graph_h_ if it changed since last frame.
+    // Mirror of ConsoleOverlay_Win32's EnsureFontScale (PR #7). Cheap
+    // when the cvar is unchanged (single cvar lookup + float compare).
+    void EnsureScale();
 
     HWND  parent_         = nullptr;
     HWND  hwnd_           = nullptr;
@@ -100,6 +110,15 @@ private:
     int   parent_h_       = 0;
     Theme theme_          = kThemes[0];
     std::atomic<int> level_{0};
+    // r_perf_overlay_scale state -- mirrors ConsoleOverlay_Win32's
+    // con_font_scale plumbing (PR #7). Cvar IS the source of truth;
+    // these are caches updated inside EnsureScale() at Paint() time.
+    // EnsureScale() recreates the HFONT + recomputes line_height_ /
+    // panel_w_ when the cvar value differs from font_scale_.
+    float font_scale_  = 1.0f;
+    int   line_height_ = kLineHeight;
+    int   panel_w_     = kPanelW;
+    int   graph_h_     = kGraphH;
 
     std::mutex     stats_mutex_;
     PerfStats      stats_;                 // history span owned by caller
@@ -214,20 +233,85 @@ void WinPerf::Shutdown() {
     parent_ = nullptr;
 }
 
+void WinPerf::Repaint() {
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void WinPerf::EnsureScale() {
+    auto& C = pt::console::Console::Get();
+    auto* v = C.FindCVar("r_perf_overlay_scale");
+    if (v == nullptr) return;
+    char* end = nullptr;
+    float requested = std::strtof(v->value.c_str(), &end);
+    // Reject "no digits parsed" AND non-finite values (NaN / +-Inf).
+    // strtof happily returns a quiet NaN for "nan"/"NaN"/"NAN" inputs
+    // and +-Inf for "inf"; once non-finite slips into the comparisons
+    // below, the < / > clamps return false in BOTH directions (NaN
+    // compares unordered) -- so requested would stay NaN, sneak past
+    // the early-exit, and the static_cast<int>(NaN * something) calls
+    // computing new_font_h / new_panel_w / new_graph_h would be
+    // undefined behavior. Fall back to 1.0 (engineering default)
+    // before any math/casts. Copilot review pass on PR #10.
+    if (end == v->value.c_str() || !std::isfinite(requested)) requested = 1.0f;
+    if (requested < 0.5f) requested = 0.5f;
+    if (requested > 3.0f) requested = 3.0f;
+    if (std::fabs(requested - font_scale_) < 1e-3f) return;
+
+    const int new_font_h = std::max(6, static_cast<int>(kFontHeight * requested + 0.5f));
+    const int new_line_h = std::max(8, static_cast<int>(kLineHeight * requested + 0.5f));
+    const int new_panel_w = std::max(64, static_cast<int>(kPanelW * requested + 0.5f));
+    const int new_graph_h = std::max(16, static_cast<int>(kGraphH * requested + 0.5f));
+
+    HFONT new_font = CreateFontW(
+        new_font_h, 0, 0, 0, FW_NORMAL,
+        FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY,
+        FIXED_PITCH | FF_MODERN,
+        L"Cascadia Mono");
+    if (new_font == nullptr) {
+        LOG_WARN("PerfOverlay: CreateFontW failed at scale={:.2f} "
+                 "(GLE={}); keeping previous font",
+                 requested, GetLastError());
+        return;
+    }
+
+    // Swap then free (mirrors ConsoleOverlay_Win32's EnsureFontScale
+    // ordering after Copilot's review on PR #7 -- if the window paints
+    // between Delete and assign it'd reach a dangling HFONT). Stock
+    // fonts are not owned and must not be DeleteObject'd.
+    HFONT      old_font  = font_;
+    const bool old_owned = font_is_owned_;
+    font_          = new_font;
+    font_is_owned_ = true;
+    font_scale_    = requested;
+    line_height_   = new_line_h;
+    panel_w_       = new_panel_w;
+    graph_h_       = new_graph_h;
+    if (old_font != nullptr && old_owned) DeleteObject(old_font);
+
+    // Window dimensions changed -- reposition + force a fresh paint.
+    Reposition();
+    LOG_INFO("PerfOverlay: r_perf_overlay_scale={:.2f} -> "
+             "font_h={} line_h={} panel_w={} graph_h={}",
+             requested, new_font_h, new_line_h, new_panel_w, new_graph_h);
+}
+
 int WinPerf::CurrentPanelHeight() const {
     int level = level_.load(std::memory_order_relaxed);
     int lines = LinesForLevel(level);
-    int h = kPaddingY * 2 + lines * kLineHeight;
-    if (level >= 3) h += kGraphH + kPaddingY;
+    int h = kPaddingY * 2 + lines * line_height_;
+    if (level >= 3) h += graph_h_ + kPaddingY;
     return h;
 }
 
 void WinPerf::Reposition() {
     if (!hwnd_) return;
     int h  = CurrentPanelHeight();
-    int x  = std::max(0, parent_w_ - kPanelW - kPanelMargin);
+    int x  = std::max(0, parent_w_ - panel_w_ - kPanelMargin);
     int y  = kPanelMargin;
-    SetWindowPos(hwnd_, nullptr, x, y, kPanelW, h,
+    SetWindowPos(hwnd_, nullptr, x, y, panel_w_, h,
                  SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
@@ -309,6 +393,7 @@ LRESULT WinPerf::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 void WinPerf::Paint(HDC dc) {
+    EnsureScale();  // re-pull r_perf_overlay_scale, recreate font on change
     RECT rc{};
     GetClientRect(hwnd_, &rc);
     int W = rc.right;
@@ -347,7 +432,7 @@ void WinPerf::Paint(HDC dc) {
         if (!wbuf.empty()) {
             TextOutW(mdc, kPaddingX, y, wbuf.data(), (int)wbuf.size());
         }
-        y += kLineHeight;
+        y += line_height_;
     };
 
     // Tier-1 lines (always shown when visible).
@@ -385,7 +470,7 @@ void WinPerf::Paint(HDC dc) {
         int gx = kPaddingX;
         int gy = y + 4;
         int gw = W - 2 * kPaddingX;
-        int gh = kGraphH;
+        int gh = graph_h_;
 
         // Frame the graph area with a 1px border.
         HBRUSH frame = CreateSolidBrush(theme_.dim);
@@ -463,5 +548,6 @@ int  PerfOverlay::Level() const                     { return opaque_ ? static_ca
 void PerfOverlay::Update(const PerfStats& s)        { if (opaque_) static_cast<WinPerf*>(opaque_)->Update(s); }
 void PerfOverlay::NotifyParentResized(int w, int h) { if (opaque_) static_cast<WinPerf*>(opaque_)->NotifyParentResized(w, h); }
 void PerfOverlay::ApplyTheme(std::string_view n)    { if (opaque_) static_cast<WinPerf*>(opaque_)->ApplyTheme(n); }
+void PerfOverlay::Repaint()                         { if (opaque_) static_cast<WinPerf*>(opaque_)->Repaint(); }
 
 }  // namespace pt::app

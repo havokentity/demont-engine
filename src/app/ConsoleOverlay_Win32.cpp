@@ -163,13 +163,16 @@ public:
     void  ApplyTheme(std::string_view name);
     void  NotifyParentResized(int w, int h);
     void  OnLog(pt::log::Level lvl, const std::string& body);
+    // Public: forwards from ConsoleOverlay::Repaint() (PR #10) so cvar
+    // on_change handlers can ping the overlay without copy-pasting
+    // values across the IPC boundary.
+    void  Repaint();
 
 private:
     static LRESULT CALLBACK WndProcThunk(HWND, UINT, WPARAM, LPARAM);
     static LRESULT CALLBACK ParentWndProcThunk(HWND, UINT, WPARAM, LPARAM);
     LRESULT WndProc(HWND, UINT, WPARAM, LPARAM);
     void Paint(HDC dc);
-    void Repaint();
     void SubmitInput();
     void HandleTab();
     void CycleGhost(int dir);
@@ -701,7 +704,19 @@ void WinOverlay::EnsureFontScale() {
     // consumed" by returning end == start, which we treat as parse-fail.
     char* end = nullptr;
     float requested = std::strtof(v->value.c_str(), &end);
-    if (end == v->value.c_str()) requested = 1.0f;
+    // Reject "no digits" AND non-finite (NaN / +-Inf): strtof returns
+    // a quiet NaN for "nan"/"NaN"/"NAN" and +-Inf for "inf"/"-inf"
+    // without setting errno, and once a non-finite value reaches the
+    // < / > clamps below they BOTH return false (NaN compares
+    // unordered) -- so requested would stay non-finite, sneak past
+    // the early-exit (NaN < 1e-3 is also false), and the
+    // static_cast<int>(...) calls computing new_font_h / new_line_h
+    // would be undefined behavior. Now with PR #10's con_font_scale
+    // on_change -> Repaint -> Paint -> EnsureFontScale wiring,
+    // typing `con_font_scale nan` in the console fires this path
+    // immediately, so the guard matters even more than before.
+    // Mirrors the same fix applied to PerfOverlay_Win32::EnsureScale.
+    if (end == v->value.c_str() || !std::isfinite(requested)) requested = 1.0f;
     // Clamp to a sane range. Below 0.5 the prompt is unreadable;
     // above 3.0 the input row dominates the panel and history vanishes.
     if (requested < 0.5f) requested = 0.5f;
@@ -1479,6 +1494,7 @@ void ConsoleOverlay::Hide()                            { if (opaque_) static_cas
 void ConsoleOverlay::Toggle()                          { if (opaque_) static_cast<WinOverlay*>(opaque_)->Toggle(); }
 bool ConsoleOverlay::IsShown() const                   { return opaque_ && static_cast<WinOverlay*>(opaque_)->IsShown(); }
 void ConsoleOverlay::ApplyTheme(std::string_view n)    { if (opaque_) static_cast<WinOverlay*>(opaque_)->ApplyTheme(n); }
+void ConsoleOverlay::Repaint()                         { if (opaque_) static_cast<WinOverlay*>(opaque_)->Repaint(); }
 void ConsoleOverlay::NotifyParentResized(int w, int h) { if (opaque_) static_cast<WinOverlay*>(opaque_)->NotifyParentResized(w, h); }
 
 void ConsoleOverlay::OnLog(pt::log::Level lvl, const std::string& body) {

@@ -73,6 +73,13 @@ public:
     // Apply one of the named themes (matches r_theme cvar values).
     void ApplyTheme(std::string_view name);
 
+    // Force a repaint. Used by cvar on_change handlers (specifically
+    // r_perf_overlay_scale) so values typed into the WEB GUI propagate
+    // immediately to the in-game overlay -- mirrors ConsoleOverlay::
+    // Repaint(). Cvar IS the source of truth; this just kicks the
+    // consumer to re-read it. No-op if hidden.
+    void Repaint();
+
 private:
     void* opaque_ = nullptr;
 };

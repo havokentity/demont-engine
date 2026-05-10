@@ -453,6 +453,12 @@ body::after {
 #side-panel[data-density="compact"] .v.toggle.on::after { left: 13px; }
 #side-panel[data-density="compact"] .v.v-input,
 #side-panel[data-density="compact"] .v.v-select { font-size: 10px; padding: 0 3px; }
+/* Compact-density rule for the wrap-based free-form input added in
+   PR #10 (the v-input is no longer a direct .v child -- it sits
+   inside .v-input-wrap). Without this the compact density toggle
+   used to silently leave the new free-form widgets at full size. */
+#side-panel[data-density="compact"] .v-input-wrap .v-input { font-size: 10px; padding: 0 3px; }
+#side-panel[data-density="compact"] .v-apply { font-size: 9px; padding: 0 6px; }
 .panel-head::after {
   content: '';
   position: absolute; left: 0; bottom: -1px;
@@ -965,6 +971,59 @@ body::after {
   letter-spacing: 1px;
   text-transform: uppercase;
   opacity: 0.55;
+}
+
+/* ---------- Apply button (free-form text input + slider readout) ----------
+   Free-form cvar values commit on Enter or blur; both events are
+   fragile (focus stealing, browser quirks, mobile keyboards). The
+   Apply button is the third explicit commit path -- always works,
+   never depends on what the focus state happens to be. Styled to
+   match the v-input / v-slider widgets it sits next to. */
+.kv .v-input-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 160px;
+  max-width: 78%;
+}
+.kv .v-input-wrap .v-input {
+  flex: 1 1 auto;
+  background: transparent;
+  /* All themes (root + each .theme-*) define --fg; --text was never
+     defined anywhere in this stylesheet, so the original declaration
+     resolved to the inherited browser-default and rendered the typed
+     text in the wrong color on a few themes. Fixed in Copilot review
+     pass on PR #10. */
+  color: var(--fg);
+  border: none;
+  border-bottom: 1px solid var(--border);
+  outline: none;
+  padding: 2px 4px;
+  font-family: inherit;
+  font-size: 12px;
+}
+.kv .v-input-wrap .v-input:hover { border-bottom-color: var(--accent-dim); }
+.kv .v-input-wrap .v-input:focus { border-bottom-color: var(--accent); }
+.kv .v-apply {
+  background: transparent;
+  color: var(--accent-dim);
+  border: 1px solid var(--border);
+  padding: 1px 8px;
+  font-family: inherit;
+  font-size: 10px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: color 80ms, border-color 80ms, background 80ms;
+}
+.kv .v-apply:hover {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+.kv .v-apply:active {
+  background: var(--accent);
+  color: var(--bg);
 }
 
 /* ---------- selection + scrollbars ---------- */

@@ -18,5 +18,6 @@ int  PerfOverlay::Level() const                     { return 0; }
 void PerfOverlay::Update(const PerfStats&)          {}
 void PerfOverlay::NotifyParentResized(int, int)     {}
 void PerfOverlay::ApplyTheme(std::string_view)      {}
+void PerfOverlay::Repaint()                         {}
 
 }  // namespace pt::app

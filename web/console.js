@@ -448,25 +448,55 @@
       });
       readout.addEventListener('blur',  commitReadout);
       readout.addEventListener('click', (e) => e.stopPropagation());
+      // Explicit Apply button: a third commit path alongside Enter
+      // and blur. Some users (and some browsers / focus-stealing
+      // events) drop blur/change events; the button gives an
+      // unambiguous "send this value now" trigger.
+      const apply = document.createElement('button');
+      apply.type = 'button';
+      apply.className = 'v-apply';
+      apply.textContent = 'Apply';
+      apply.title = 'Send the typed value to the engine now';
+      apply.addEventListener('click', (e) => {
+        e.stopPropagation();
+        commitReadout();
+      });
       widget.appendChild(range);
       widget.appendChild(readout);
+      widget.appendChild(apply);
     } else {
-      // Free-form: text input that commits on Enter or blur.
-      widget = document.createElement('input');
-      widget.type  = 'text';
-      widget.className = 'v v-input';
-      widget.value = v.value;
-      widget.spellcheck = false;
-      widget.autocomplete = 'off';
+      // Free-form: text input that commits on Enter, blur, or
+      // explicit Apply-button click. The button matters when blur
+      // doesn't fire (focus-stealing modal, browser quirk, or the
+      // user simply wanting to confirm without losing focus).
+      widget = document.createElement('div');
+      widget.className = 'v v-input-wrap';
+      const inp = document.createElement('input');
+      inp.type  = 'text';
+      inp.className = 'v-input';
+      inp.value = v.value;
+      inp.spellcheck = false;
+      inp.autocomplete = 'off';
       const commit = () => {
-        if (widget.value !== v.value) setCvar(widget.value);
+        if (inp.value !== v.value) setCvar(inp.value);
       };
-      widget.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') { commit(); widget.blur(); }
-        if (e.key === 'Escape') { widget.value = v.value; widget.blur(); }
+      inp.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { commit(); inp.blur(); }
+        if (e.key === 'Escape') { inp.value = v.value; inp.blur(); }
       });
-      widget.addEventListener('blur',  commit);
-      widget.addEventListener('click', (e) => e.stopPropagation());
+      inp.addEventListener('blur',  commit);
+      inp.addEventListener('click', (e) => e.stopPropagation());
+      const apply = document.createElement('button');
+      apply.type = 'button';
+      apply.className = 'v-apply';
+      apply.textContent = 'Apply';
+      apply.title = 'Send the typed value to the engine now';
+      apply.addEventListener('click', (e) => {
+        e.stopPropagation();
+        commit();
+      });
+      widget.appendChild(inp);
+      widget.appendChild(apply);
     }
     row.appendChild(widget);
     return row;
