@@ -224,24 +224,30 @@ namespace cvar {
     // "x y z yaw_deg pitch_deg fov_deg" -- same space-separated
     // convention cam_pos uses, six floats. Empty string = unsaved.
     // CVAR_ARCHIVE so saved viewpoints persist across runs.
-    PT_CVAR(cam_slot_1, "", "Saved camera state, slot 1 (x y z yaw pitch fov)", CVAR_ARCHIVE);
-    PT_CVAR(cam_slot_2, "", "Saved camera state, slot 2 (x y z yaw pitch fov)", CVAR_ARCHIVE);
-    PT_CVAR(cam_slot_3, "", "Saved camera state, slot 3 (x y z yaw pitch fov)", CVAR_ARCHIVE);
-    PT_CVAR(cam_slot_4, "", "Saved camera state, slot 4 (x y z yaw pitch fov)", CVAR_ARCHIVE);
-    PT_CVAR(cam_slot_5, "", "Saved camera state, slot 5 (x y z yaw pitch fov)", CVAR_ARCHIVE);
-    PT_CVAR(cam_slot_6, "", "Saved camera state, slot 6 (x y z yaw pitch fov)", CVAR_ARCHIVE);
-    PT_CVAR(cam_slot_7, "", "Saved camera state, slot 7 (x y z yaw pitch fov)", CVAR_ARCHIVE);
-    PT_CVAR(cam_slot_8, "", "Saved camera state, slot 8 (x y z yaw pitch fov)", CVAR_ARCHIVE);
-    PT_CVAR(cam_slot_9, "", "Saved camera state, slot 9 (x y z yaw pitch fov)", CVAR_ARCHIVE);
+    // Format: "x y z yaw_deg pitch_deg fov_deg" -- six floats, all
+    // angles in DEGREES (Camera stores yaw/pitch as radians; the
+    // cam_save / cam_load helpers handle the conversion).
+    PT_CVAR(cam_slot_1, "", "Saved camera state, slot 1: \"x y z yaw_deg pitch_deg fov_deg\"", CVAR_ARCHIVE);
+    PT_CVAR(cam_slot_2, "", "Saved camera state, slot 2: \"x y z yaw_deg pitch_deg fov_deg\"", CVAR_ARCHIVE);
+    PT_CVAR(cam_slot_3, "", "Saved camera state, slot 3: \"x y z yaw_deg pitch_deg fov_deg\"", CVAR_ARCHIVE);
+    PT_CVAR(cam_slot_4, "", "Saved camera state, slot 4: \"x y z yaw_deg pitch_deg fov_deg\"", CVAR_ARCHIVE);
+    PT_CVAR(cam_slot_5, "", "Saved camera state, slot 5: \"x y z yaw_deg pitch_deg fov_deg\"", CVAR_ARCHIVE);
+    PT_CVAR(cam_slot_6, "", "Saved camera state, slot 6: \"x y z yaw_deg pitch_deg fov_deg\"", CVAR_ARCHIVE);
+    PT_CVAR(cam_slot_7, "", "Saved camera state, slot 7: \"x y z yaw_deg pitch_deg fov_deg\"", CVAR_ARCHIVE);
+    PT_CVAR(cam_slot_8, "", "Saved camera state, slot 8: \"x y z yaw_deg pitch_deg fov_deg\"", CVAR_ARCHIVE);
+    PT_CVAR(cam_slot_9, "", "Saved camera state, slot 9: \"x y z yaw_deg pitch_deg fov_deg\"", CVAR_ARCHIVE);
     PT_CVAR(cam_teleport_threshold, "5.0",
             "Per-frame position-delta threshold (in world units) for "
-            "auto-firing the OptiX temporal denoiser's reset_history. "
+            "auto-firing the active denoiser's reset_history flag. "
             "Larger jumps (e.g. user typed a coordinate in console, or "
             "moved through a sphere whose inside is black) clear the "
-            "denoiser's prev_output / internal-guide-layer history "
-            "instead of bleeding stale pre-jump color into post-jump "
-            "frames. Default 5 = ~33x typical WASD per-frame movement "
-            "at cam_speed=3, 60fps. 0 = disabled.",
+            "current denoiser's history -- consumed by SVGF/NRD's "
+            "temporal accumulation path, MetalFX's history-state "
+            "reset, AND the OptiX temporal denoisers' "
+            "prev_output / internal-guide-layer ping-pong -- instead "
+            "of bleeding stale pre-jump color into post-jump frames. "
+            "Default 5 = ~33x typical WASD per-frame movement at "
+            "cam_speed=3, 60fps. 0 = disabled.",
             CVAR_ARCHIVE);
     // Depth-of-field (thin-lens camera). Each primary ray originates
     // at a random sample on the aperture and aims through the focal-
@@ -3272,14 +3278,23 @@ void Engine::RegisterCommands() {
         return true;
     };
     // /EHs-c- (exceptions disabled) -- can't use std::stoi try/catch.
-    // strtol returns 0 on parse-fail with end == start signalling.
+    // std::from_chars is the right tool: no allocations, no exceptions,
+    // and it returns BOTH a parse-failure errc AND the consumed-up-to
+    // pointer so we can reject partial inputs like "1abc" (which
+    // strtol would silently accept as 1). Also reports
+    // std::errc::result_out_of_range explicitly instead of silently
+    // truncating a long-to-int cast.
     const auto parse_slot = [](std::span<const std::string_view> args, int default_slot) -> int {
         if (args.empty()) return default_slot;
-        const std::string s{args[0]};
-        char* end = nullptr;
-        const long v = std::strtol(s.c_str(), &end, 10);
-        if (end == s.c_str()) return -1;  // parse failed
-        return static_cast<int>(v);
+        const std::string_view sv = args[0];
+        if (sv.empty()) return -1;
+        int parsed = 0;
+        const auto* first = sv.data();
+        const auto* last  = sv.data() + sv.size();
+        const auto r = std::from_chars(first, last, parsed);
+        if (r.ec != std::errc{}) return -1;   // parse error or out-of-range
+        if (r.ptr != last)       return -1;   // partial input -- "1abc" rejected
+        return parsed;
     };
 
     C.RegisterCommand("cam_save",
@@ -3305,7 +3320,8 @@ void Engine::RegisterCommands() {
     C.RegisterCommand("cam_load",
         "Load a saved camera state from a slot (1..9, default 1). "
         "Use cam_reset for slot 0 (engineering default). Loading "
-        "fires the denoiser's reset_history so OptiX temporal "
+        "fires the active denoiser's history-reset flag so the "
+        "temporal denoise pipeline (SVGF/NRD/MetalFX/OptiX-temporal) "
         "doesn't blend pre-teleport content forward.",
         [this, parse_cam_state, parse_slot](auto args, pt::console::Output& out) {
             if (!camera_) { out.PrintLine("cam_load: no camera"); return; }
@@ -3336,8 +3352,9 @@ void Engine::RegisterCommands() {
 
     C.RegisterCommand("cam_reset",
         "Reset camera to the engineering default (slot 0, read-only). "
-        "Fires the denoiser's reset_history so OptiX temporal doesn't "
-        "blend pre-reset content forward.",
+        "Fires the active denoiser's history-reset flag so the "
+        "temporal denoise pipeline (SVGF/NRD/MetalFX/OptiX-temporal) "
+        "doesn't blend pre-reset content forward.",
         [this](auto, pt::console::Output& out) {
             if (!camera_) { out.PrintLine("cam_reset: no camera"); return; }
             // Hardcoded engineering default. Matches the inline defaults
