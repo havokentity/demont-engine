@@ -311,8 +311,19 @@ private:
     //                quality (especially in shadowed regions) at small
     //                additional cost. Adds a primary_albedo G-buffer
     //                output to the path tracer (Vulkan/SPIR-V only).
+    //   OptixTemporalHdr     = HDR model + motion-vector flow guide +
+    //                          1-frame denoised-output history. Closes
+    //                          the per-frame flicker gap vs SVGF on
+    //                          static scenes while keeping OptiX's
+    //                          motion-handling advantage (no temporal
+    //                          ghosting on fast motion).
+    //   OptixTemporalHdrAov  = OptixTemporalHdr + albedo + normal guide
+    //                          layers. The strongest OptiX variant --
+    //                          temporal smoothing AND AOV edge fidelity.
     enum class DenoiserKind : std::uint8_t {
-        Off, MetalFX, SvgfBasic, SvgfAtrous, Nrd, OptixHdr, OptixHdrAov
+        Off, MetalFX, SvgfBasic, SvgfAtrous, Nrd,
+        OptixHdr, OptixHdrAov,
+        OptixTemporalHdr, OptixTemporalHdrAov,
     };
     DenoiserKind                                denoiser_kind_         = DenoiserKind::Off;
     float                                       last_jitter_x_         = 0.0f;

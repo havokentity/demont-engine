@@ -175,7 +175,21 @@ public:
         // shape (Mac/MetalFX path, existing test fixtures) keep their
         // behaviour. Engine sets this explicitly each frame from the
         // active DenoiserKind cvar.
-        enum class Kind : std::uint8_t { Svgf, OptixHdr, OptixHdrAov };
+        // OptixTemporalHdr / OptixTemporalHdrAov: same model family as
+        // OptixHdr / OptixHdrAov but with an extra motion-vector flow
+        // guide + a single-frame denoised-output history buffer fed
+        // back as OptixDenoiserLayer::previousOutput. Maps to
+        // OPTIX_DENOISER_MODEL_KIND_TEMPORAL{,_AOV} on the OptiX side.
+        // Reuses motion_in (the SVGF/MetalFX motion G-buffer) as the
+        // flow input -- the engine already produces it on every
+        // denoiser-active frame; this just imports it to CUDA.
+        enum class Kind : std::uint8_t {
+            Svgf,
+            OptixHdr,
+            OptixHdrAov,
+            OptixTemporalHdr,
+            OptixTemporalHdrAov,
+        };
         Kind kind = Kind::Svgf;
         // Required by MetalFX TemporalDenoisedScaler. Column-major 4x4
         // (16 floats each). Pass nullptr only if the backend doesn't need

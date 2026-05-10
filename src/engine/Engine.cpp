@@ -113,11 +113,17 @@ namespace cvar {
             "via CUDA-Vulkan interop (gated by build-time PT_ENABLE_OPTIX, "
             "auto-detected at configure when CUDA Toolkit + OptiX SDK are "
             "found; runtime gracefully falls back to off if the GPU/driver "
-            "isn't OptiX-capable). optix_hdr_aov = same as optix_hdr today, "
-            "reserved for the AOV (albedo + normal hints) variant landing "
-            "in Phase 1a step 3 alongside the path-tracer's primary_albedo "
-            "output. Mac builds ignore the svgf_*/nrd/optix_* values; "
-            "non-NVIDIA Vulkan builds ignore optix_*.",
+            "isn't OptiX-capable). optix_hdr_aov = OptiX HDR + albedo + "
+            "normal AOV guide layers (better edge fidelity on textured "
+            "or diffuse-color-rich surfaces; same per-frame characteristic "
+            "as optix_hdr -- non-temporal). optix_temporal_hdr = HDR model "
+            "with motion-vector flow guide + 1-frame denoised-output "
+            "history; closes the per-frame flicker gap vs SVGF on static "
+            "scenes while keeping OptiX's no-ghosting motion behaviour. "
+            "optix_temporal_hdr_aov = optix_temporal_hdr + albedo+normal "
+            "AOV guides; the strongest OptiX variant. Mac builds ignore "
+            "the svgf_*/nrd/optix_* values; non-NVIDIA Vulkan builds "
+            "ignore optix_*.",
             CVAR_ARCHIVE);
     PT_CVAR(r_hdr_pipeline,    "1",  "Linear-HDR pipeline through MetalFX. 1 = path tracer writes raw HDR, MetalFX denoises in HDR, post-pass applies exposure+ACES (recommended). 0 = path tracer pre-applies exposure+ACES, MetalFX denoises LDR, tonemap pass is a passthrough copy. Only affects the denoiser-on path.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom,           "1",  "HDR bloom (downsample/upsample pyramid, additive composite before ACES). 0 disables; tonemap then samples a 1x1 zero buffer.", CVAR_ARCHIVE);
@@ -1468,11 +1474,13 @@ void Engine::RenderFrame() {
         if (s == "metalfx" && current_backend_ == BackendType::Metal) {
             want_kind = DenoiserKind::MetalFX;
         } else if (current_backend_ == BackendType::Vulkan) {
-            if      (s == "svgf_basic")    want_kind = DenoiserKind::SvgfBasic;
-            else if (s == "svgf_atrous")   want_kind = DenoiserKind::SvgfAtrous;
-            else if (s == "nrd")           want_kind = DenoiserKind::Nrd;
-            else if (s == "optix_hdr")     want_kind = DenoiserKind::OptixHdr;
-            else if (s == "optix_hdr_aov") want_kind = DenoiserKind::OptixHdrAov;
+            if      (s == "svgf_basic")            want_kind = DenoiserKind::SvgfBasic;
+            else if (s == "svgf_atrous")           want_kind = DenoiserKind::SvgfAtrous;
+            else if (s == "nrd")                   want_kind = DenoiserKind::Nrd;
+            else if (s == "optix_hdr")             want_kind = DenoiserKind::OptixHdr;
+            else if (s == "optix_hdr_aov")         want_kind = DenoiserKind::OptixHdrAov;
+            else if (s == "optix_temporal_hdr")    want_kind = DenoiserKind::OptixTemporalHdr;
+            else if (s == "optix_temporal_hdr_aov") want_kind = DenoiserKind::OptixTemporalHdrAov;
         }
     }
     if (want_kind != DenoiserKind::Off && !device_->SupportsDenoise()) {
@@ -1510,6 +1518,14 @@ void Engine::RenderFrame() {
         } else if (want_kind == DenoiserKind::OptixHdrAov) {
             LOG_INFO("engine: r_denoiser=optix_hdr_aov -- NVIDIA OptiX denoiser (HDR + "
                      "albedo + normal AOV model) via CUDA-Vulkan interop active");
+        } else if (want_kind == DenoiserKind::OptixTemporalHdr) {
+            LOG_INFO("engine: r_denoiser=optix_temporal_hdr -- NVIDIA OptiX denoiser "
+                     "(TEMPORAL model: motion-vector flow + 1-frame output history) "
+                     "via CUDA-Vulkan interop active");
+        } else if (want_kind == DenoiserKind::OptixTemporalHdrAov) {
+            LOG_INFO("engine: r_denoiser=optix_temporal_hdr_aov -- NVIDIA OptiX denoiser "
+                     "(TEMPORAL_AOV model: motion + history + albedo + normal guides) "
+                     "via CUDA-Vulkan interop active");
         }
         if (!want_denoiser && device_) {
             if (denoise_color_tex_id_    != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
@@ -1573,19 +1589,21 @@ void Engine::RenderFrame() {
     // RGBA16F MetalFX writes to; the `tonemap` compute kernel reads it
     // and writes the swapchain.
     // SVGF/NRD use the normal G-buffer for edge-aware spatial filtering.
-    // The OptiX AOV denoiser also wants it as the normal guide layer
-    // alongside albedo, so OptixHdrAov triggers normal allocation too.
-    // OptixHdr (no AOV) doesn't need it.
+    // The OptiX AOV variants (HdrAov + TemporalHdrAov) also use it as
+    // the normal guide layer alongside albedo. The plain OptiX HDR
+    // variants (Hdr + TemporalHdr) don't need it.
     const bool want_normal_gbuffer =
-        (denoiser_kind_ == DenoiserKind::SvgfBasic   ||
-         denoiser_kind_ == DenoiserKind::SvgfAtrous  ||
-         denoiser_kind_ == DenoiserKind::Nrd         ||
-         denoiser_kind_ == DenoiserKind::OptixHdrAov);
-    // Albedo G-buffer is OptiX-AOV-only -- SVGF/NRD don't take an albedo
-    // input, MetalFX doesn't either, and OptixHdr uses the plain HDR
-    // model that has no AOV inputs.
+        (denoiser_kind_ == DenoiserKind::SvgfBasic           ||
+         denoiser_kind_ == DenoiserKind::SvgfAtrous          ||
+         denoiser_kind_ == DenoiserKind::Nrd                 ||
+         denoiser_kind_ == DenoiserKind::OptixHdrAov         ||
+         denoiser_kind_ == DenoiserKind::OptixTemporalHdrAov);
+    // Albedo G-buffer: OptiX AOV variants only (HdrAov + TemporalHdrAov).
+    // SVGF/NRD don't take an albedo input, MetalFX doesn't either, and
+    // the non-AOV OptiX models have no albedo guide layer.
     const bool want_albedo_gbuffer =
-        (denoiser_kind_ == DenoiserKind::OptixHdrAov);
+        (denoiser_kind_ == DenoiserKind::OptixHdrAov ||
+         denoiser_kind_ == DenoiserKind::OptixTemporalHdrAov);
     if (denoiser_active_ &&
         (denoise_color_tex_id_ == 0 || depth_tex_id_ == 0 || motion_tex_id_ == 0 ||
          post_denoise_hdr_tex_id_ == 0 || size_changed ||
@@ -2359,11 +2377,16 @@ void Engine::RenderFrame() {
 
         // Top-level Kind: tells the Vulkan backend whether to dispatch
         // through VulkanNrdDenoiser (Svgf -- in-house SVGF chain) or
-        // VulkanOptixDenoiser (OptixHdr / OptixHdrAov). MetalFX ignores
-        // it. The svgf_basic / svgf_atrous / nrd values all collapse to
-        // Kind::Svgf -- they're tiers within the same backend impl.
+        // VulkanOptixDenoiser (OptixHdr / OptixHdrAov / OptixTemporalHdr
+        // / OptixTemporalHdrAov). MetalFX ignores it. The svgf_basic /
+        // svgf_atrous / nrd values all collapse to Kind::Svgf -- they're
+        // tiers within the same backend impl.
         if (denoiser_kind_ == DenoiserKind::OptixHdr) {
             dd.kind = pt::rhi::Device::DenoiseDesc::Kind::OptixHdr;
+        } else if (denoiser_kind_ == DenoiserKind::OptixTemporalHdr) {
+            dd.kind = pt::rhi::Device::DenoiseDesc::Kind::OptixTemporalHdr;
+        } else if (denoiser_kind_ == DenoiserKind::OptixTemporalHdrAov) {
+            dd.kind = pt::rhi::Device::DenoiseDesc::Kind::OptixTemporalHdrAov;
         } else if (denoiser_kind_ == DenoiserKind::OptixHdrAov) {
             dd.kind = pt::rhi::Device::DenoiseDesc::Kind::OptixHdrAov;
         } else {
@@ -3808,7 +3831,8 @@ void Engine::RegisterCommands() {
         // logs a one-time INFO at Init noting the fallback).
         v->allowed_values = {"off", "metalfx",
                               "svgf_basic", "svgf_atrous", "nrd",
-                              "optix_hdr", "optix_hdr_aov"};
+                              "optix_hdr", "optix_hdr_aov",
+                              "optix_temporal_hdr", "optix_temporal_hdr_aov"};
     }
     if (auto* v = C.FindCVar("r_hdr_pipeline")) {
         v->allowed_values = {"0", "1"};
