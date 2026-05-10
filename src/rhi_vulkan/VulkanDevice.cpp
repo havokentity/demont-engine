@@ -52,16 +52,18 @@ constexpr bool kEnableValidation = false;
 #endif
 
 // Engine slot -> shader vk::binding translation. The unified descriptor
-// set has 17 bindings (0-16): storage_image x9 (output / accum_hdr /
+// set has 18 bindings (0-17): storage_image x10 (output / accum_hdr /
 // denoise_color / depth / motion / env_map / star_map / moon_map /
-// normal_tex), AS x1 (scene_tlas), storage_buffer x6 (mesh / cdf /
-// exposure_state), uniform_buffer x1 (Frame UBO at binding 14).
-// Tonemap / Bloom* re-use a subset. Engine.cpp uses up-to-9-element
-// textures, 8-element buffers, and 4-element accel-struct slot arrays
-// as if Metal-style argument tables; we flatten these into the single
-// Vulkan descriptor set here. Engine slot 8 (normal_tex / vk::binding 16)
-// is Vulkan-only -- only the SVGF/NRD denoiser path tracer writes it.
-static constexpr std::uint32_t kNumTexSlots = 9;
+// normal_tex / albedo_tex), AS x1 (scene_tlas), storage_buffer x6
+// (mesh / cdf / exposure_state), uniform_buffer x1 (Frame UBO at
+// binding 14). Tonemap / Bloom* re-use a subset. Engine.cpp uses
+// up-to-10-element textures, 8-element buffers, and 4-element
+// accel-struct slot arrays as if Metal-style argument tables; we
+// flatten these into the single Vulkan descriptor set here. Engine
+// slot 8 (normal_tex / vk::binding 16) and slot 9 (albedo_tex /
+// vk::binding 17) are Vulkan-only -- the SVGF/NRD path tracer writes
+// normal; only OptiX AOV (optix_hdr_aov) writes albedo.
+static constexpr std::uint32_t kNumTexSlots = 10;
 constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     0,  // engine slot 0 -> shader binding 0  (output / swapchain)
     1,  // engine slot 1 -> shader binding 1  (accum_hdr)
@@ -71,7 +73,8 @@ constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     9,  // engine slot 5 -> shader binding 9  (env_map)
     12, // engine slot 6 -> shader binding 12 (star_map)
     13, // engine slot 7 -> shader binding 13 (moon_map)
-    16, // engine slot 8 -> shader binding 16 (normal_tex, SVGF/NRD only)
+    16, // engine slot 8 -> shader binding 16 (normal_tex, SVGF/NRD/OptiX-AOV)
+    17, // engine slot 9 -> shader binding 17 (albedo_tex, OptiX AOV only)
 };
 constexpr std::uint32_t kSlotToBufBinding[8] = {
     0,  // engine slot 0 unused
@@ -231,13 +234,15 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     VkDevice raw_dev = device_->RawDevice();
     auto dset = device_->CurrentDescriptorSet();
 
-    // Build the full descriptor write list. We touch all 17 bindings on
+    // Build the full descriptor write list. We touch all 18 bindings on
     // every dispatch -- nullDescriptor (VK_EXT_robustness2), required at
     // device-create time for this path, means slots the engine didn't
     // bind get VK_NULL_HANDLE silently. The cost of re-writing every
-    // binding each dispatch is small (17 small structs)
-    // and avoids per-pipeline layout management.
-    constexpr std::uint32_t kMaxWrites = 17;
+    // binding each dispatch is small (18 small structs) and avoids
+    // per-pipeline layout management. Composition:
+    //   10 storage_image (kNumTexSlots) + 6 storage_buffer + 1 accel
+    //   + 1 uniform_buffer (Frame UBO) = 18.
+    constexpr std::uint32_t kMaxWrites = 18;
     std::array<VkDescriptorImageInfo,  kMaxWrites> img_infos {};
     std::array<VkDescriptorBufferInfo, kMaxWrites> buf_infos {};
     std::array<VkWriteDescriptorSetAccelerationStructureKHR, 1> as_infos {};
@@ -801,10 +806,10 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
 
     // ---- Descriptor pool ---------------------------------------------
     // Sizing matches the expanded layout below:
-    //   9 storage_image  + 1 accel_struct + 6 storage_buffer + 1 ubo
+    //   10 storage_image + 1 accel_struct + 6 storage_buffer + 1 ubo
     //   per set, x kFramesInFlight sets, with headroom.
     std::array<VkDescriptorPoolSize, 4> psizes{};
-    psizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kFramesInFlight * 9 + 4 };
+    psizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kFramesInFlight * 10 + 4 };
     psizes[1] = { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, kFramesInFlight * 1 + 1 };
     psizes[2] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kFramesInFlight * 6 + 4 };
     psizes[3] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,          kFramesInFlight * 1 + 1 };
@@ -817,9 +822,9 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
                        | VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
     vkCreateDescriptorPool(device_, &dpci, nullptr, &dpool_);
 
-    // ---- Build the unified 17-binding descriptor set layout ----------
+    // ---- Build the unified 18-binding descriptor set layout ----------
     {
-        std::array<VkDescriptorSetLayoutBinding, 17> b{};
+        std::array<VkDescriptorSetLayoutBinding, 18> b{};
         auto fill = [&](std::uint32_t idx, std::uint32_t binding,
                         VkDescriptorType type) {
             b[idx].binding         = binding;
@@ -851,13 +856,15 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         fill(14, kFrameUboBinding, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
         // binding 15: exposure_state (GPU-driven auto-exposure scalar)
         fill(15, 15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-        // binding 16: normal_tex (path tracer G-buffer for SVGF/NRD)
+        // binding 16: normal_tex (path tracer G-buffer for SVGF/NRD/OptiX-AOV)
         fill(16, 16, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        // binding 17: albedo_tex (path tracer G-buffer for OptiX AOV only)
+        fill(17, 17, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
 
         // UPDATE_AFTER_BIND for every binding so we can rewrite the
         // shared descriptor set between dispatches in the same cmd
         // buffer without invalidating earlier recorded draws.
-        std::array<VkDescriptorBindingFlags, 17> bind_flags{};
+        std::array<VkDescriptorBindingFlags, 18> bind_flags{};
         for (auto& f : bind_flags) f = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
         VkDescriptorSetLayoutBindingFlagsCreateInfo bfci{};
         bfci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
@@ -2570,8 +2577,8 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
     // Route based on d.kind. SVGF and OptiX have different input
     // contracts: SVGF wants the full G-buffer (color/depth/motion/
     // normal/output); OptiX HDR only needs color + output; OptiX HDR
-    // AOV adds normal_in (and primary_albedo, once Phase 1a step 3
-    // lands). Each path validates only what it actually consumes.
+    // AOV needs color + output + albedo + normal (the AOV model's
+    // OptixDenoiserGuideLayer).
 #if defined(PT_ENABLE_OPTIX)
     if (d.kind == DenoiseDesc::Kind::OptixHdr ||
         d.kind == DenoiseDesc::Kind::OptixHdrAov) {
@@ -2579,6 +2586,16 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
             LOG_WARN("VulkanDevice::Denoise(OptiX): missing color/output (color={} out={})",
                      d.color_in.id, d.output.id);
             return;
+        }
+        if (d.kind == DenoiseDesc::Kind::OptixHdrAov) {
+            if (d.albedo_in.id == 0 || d.normal_in.id == 0) {
+                LOG_WARN("VulkanDevice::Denoise(OptiX AOV): missing albedo/normal "
+                         "(albedo={} normal={}) -- engine should have allocated these "
+                         "for r_denoiser=optix_hdr_aov; check Engine::want_albedo_gbuffer "
+                         "/ want_normal_gbuffer paths",
+                         d.albedo_in.id, d.normal_in.id);
+                return;
+            }
         }
         if (optix_denoiser_ == nullptr) {
             const auto opt_kind = (d.kind == DenoiseDesc::Kind::OptixHdrAov)

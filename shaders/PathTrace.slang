@@ -64,6 +64,22 @@
 [[vk::binding(16, 0)]] RWTexture2D<float4> normal_tex;
 #endif
 
+// G-buffer: linear-RGB albedo at primary hit. Written when
+// denoiser_enabled != 0 by the SPIR-V/Vulkan path; consumed by the
+// OptiX AOV denoiser (OPTIX_DENOISER_MODEL_KIND_AOV) as the albedo
+// guide layer alongside the world-space normal. The AOV model uses
+// these to preserve diffuse-color edges and surface orientation
+// detail under aggressive denoising. Gated to SPIR-V only --
+// MetalFX doesn't take an albedo input. Sky pixels (no hit) write
+// float3(0) as a "no surface" sentinel matching the normal G-buffer
+// convention. The engine only allocates and binds this image when
+// r_denoiser is optix_hdr_aov; in any other mode binding 17 stays
+// at the default null descriptor and the write below is a no-op via
+// Vulkan's robust-buffer-access rules.
+#ifdef PT_TARGET_SPIRV
+[[vk::binding(17, 0)]] RWTexture2D<float4> albedo_tex;
+#endif
+
 // GPU-resident exposure scalar. Updated each frame by AutoExposure.slang
 // (when r_auto_exposure = 1) or written once by the engine via
 // WriteBuffer (when r_auto_exposure = 0, holding the manual r_exposure
@@ -1045,14 +1061,17 @@ void main(uint2 tid : SV_DispatchThreadID) {
 
         float3 hit_world;
         float3 hit_normal;
+        float3 hit_albedo;   // linear RGB at primary hit; sky writes float3(0)
         float  depth_view;   // linear camera-space Z (world units along forward)
         if (h0.hit) {
             hit_world  = ro0 + rd0 * h0.t;
             hit_normal = h0.normal;
+            hit_albedo = h0.albedo;
             depth_view = h0.t * dot(rd0, normalize(fwd_aspect.xyz));
         } else {
             hit_world  = ro0 + rd0 * 1000.0;   // far point so sky still gets motion
             hit_normal = float3(0.0, 0.0, 0.0); // sentinel: sky / no surface
+            hit_albedo = float3(0.0, 0.0, 0.0); // sky has no surface albedo
             depth_view = 1000.0;
         }
 
@@ -1069,6 +1088,12 @@ void main(uint2 tid : SV_DispatchThreadID) {
         motion_tex[tid] = motion;
 #ifdef PT_TARGET_SPIRV
         normal_tex[tid] = float4(hit_normal, 0.0);
+        // Albedo G-buffer: only allocated/bound by the engine when
+        // r_denoiser is optix_hdr_aov. In other modes binding 17 is a
+        // null descriptor and this write is a no-op (Vulkan robust-
+        // buffer-access). Cheap unconditional write keeps the shader
+        // simple and avoids per-frame specialization-constant churn.
+        albedo_tex[tid] = float4(hit_albedo, 0.0);
 #endif
     }
 
