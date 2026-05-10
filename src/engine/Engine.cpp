@@ -2856,7 +2856,6 @@ void Engine::RenderFrame() {
             : pt::engine::CaptureSourceKind::Accum;
         const std::uint64_t denoised_tex_id =
             denoiser_active_ ? post_denoise_hdr_tex_id_ : 0;
-        auto& C = pt::console::Console::Get();
         std::string denoiser_label = "off";
         if (auto* dv = C.FindCVar("r_denoiser")) denoiser_label = dv->value;
         float exposure_fallback = 1.0f;
