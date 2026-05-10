@@ -60,6 +60,12 @@ namespace cvar {
             CVAR_ARCHIVE);
     PT_CVAR(app_overlay_enabled, "1",
             "Enable the in-window native console overlay (backtick toggles)", CVAR_ARCHIVE);
+    PT_CVAR(con_font_scale, "1.0",
+            "Console overlay font scale (1.0 = default 14pt baseline). "
+            "Effective range 0.5..3.0; values outside are clamped at "
+            "Paint() time. Win32 only -- the Mac overlay uses native "
+            "NSFont sizing and ignores this cvar.",
+            CVAR_ARCHIVE);
     PT_CVAR(r_perf_overlay,    "0",
             "Tiered in-game performance overlay. 0 = off, 1 = fps + frame_ms, "
             "2 = + backend / resolution / GPU memory / spp / bounces / primitives, "
