@@ -515,10 +515,15 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
     // Frame-parity ping-pong: history read = side[parity], history
     // write = side[1 - parity]. Bumping parity at the end so consecutive
     // Encode calls swap roles.
-    const VkImageView v_hist_read  = (frame_parity_ == 0) ? v_hist_a : v_hist_b;
-    const VkImageView v_hist_write = (frame_parity_ == 0) ? v_hist_b : v_hist_a;
-    const VkImageView v_depth_hist_read  = (frame_parity_ == 0) ? v_depth_hist_a : v_depth_hist_b;
-    const VkImageView v_normal_hist_read  = (frame_parity_ == 0) ? v_normal_hist_a : v_normal_hist_b;
+    const bool parity_is_a = (frame_parity_ == 0);
+    const VkImageView v_hist_read  = parity_is_a ? v_hist_a : v_hist_b;
+    const VkImageView v_hist_write = parity_is_a ? v_hist_b : v_hist_a;
+    const VkImageView v_depth_hist_read  = parity_is_a ? v_depth_hist_a : v_depth_hist_b;
+    const VkImageView v_depth_hist_write = parity_is_a ? v_depth_hist_b : v_depth_hist_a;
+    const VkImageView v_normal_hist_read  = parity_is_a ? v_normal_hist_a : v_normal_hist_b;
+    const VkImageView v_normal_hist_write = parity_is_a ? v_normal_hist_b : v_normal_hist_a;
+    const std::uint64_t depth_hist_write_id = parity_is_a ? depth_history_b_id_ : depth_history_a_id_;
+    const std::uint64_t normal_hist_write_id = parity_is_a ? normal_history_b_id_ : normal_history_a_id_;
 
     // Force-reset on first Encode after Init / resize so the read of
     // freshly-allocated history memory doesn't drift undefined values
@@ -541,10 +546,8 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
 
     // Keep depth/normal history ping-ponged in lockstep with color history
     // so frame N+1 can validate reprojection taps against frame N surfaces.
-    VkImage dst_depth_hist = device_->LookupImage(TextureHandle{
-        (frame_parity_ == 0) ? depth_history_b_id_ : depth_history_a_id_});
-    VkImage dst_normal_hist = device_->LookupImage(TextureHandle{
-        (frame_parity_ == 0) ? normal_history_b_id_ : normal_history_a_id_});
+    VkImage dst_depth_hist = device_->LookupImage(TextureHandle{depth_hist_write_id});
+    VkImage dst_normal_hist = device_->LookupImage(TextureHandle{normal_hist_write_id});
     VkImage src_depth = device_->LookupImage(depth_in);
     VkImage src_normal = device_->LookupImage(normal_in);
     if (src_depth == VK_NULL_HANDLE || src_normal == VK_NULL_HANDLE ||
@@ -557,6 +560,7 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                  VK_PIPELINE_STAGE_TRANSFER_BIT,
                  VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
     VkImageCopy copy_region{};
+    // R32F + RGBA16F storage images use COLOR aspect in Vulkan.
     copy_region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     copy_region.srcSubresource.layerCount = 1;
     copy_region.dstSubresource            = copy_region.srcSubresource;
@@ -592,7 +596,7 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
             p.c             = 4.0f;    // sigma_color (luminance Gaussian sigma)
             RecordPass(cb, atrous_pipe_, NextSet(),
                        in, v_dummy_c, v_depth, v_dummy_m, v_normal, out,
-                       v_depth, v_normal,
+                       v_depth_hist_write, v_normal_hist_write,
                        &p, sizeof(p), gx, gy);
             ComputeChainBarrier(cb);
         };
