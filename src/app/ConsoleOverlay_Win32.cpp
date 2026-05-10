@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>     // std::strtof (engine builds /EHs-c-, no std::stof)
 #include <deque>
 #include <mutex>
 #include <string>
@@ -179,6 +180,12 @@ private:
     void StartAnim(bool showing);
     void TickAnim();
     int  CurrentY() const;
+    // Re-creates `font_` at the new scaled height and updates
+    // line_height_. Called from Paint() when the `con_font_scale`
+    // cvar value differs from font_scale_. Clamps to [0.5, 3.0].
+    // No-op (returns early) if scale matches the cached value, so
+    // it's cheap to call every frame.
+    void EnsureFontScale();
 
     enum class AnimState : std::uint8_t { Idle, Showing, Hiding };
 
@@ -191,6 +198,16 @@ private:
     // GDI handle is documented as undefined behaviour and was caught
     // by Copilot review on the SYSTEM_FIXED_FONT fallback path.
     bool      font_is_owned_ = false;
+    // Effective font scale as last applied by RecreateFontFromScale.
+    // Driven by the `con_font_scale` cvar; polled inside Paint() so a
+    // runtime change shows up on the next repaint without a separate
+    // on_change wiring path. Clamped to [0.5, 3.0] at apply time.
+    float     font_scale_   = 1.0f;
+    // Cached pixel-space line height = round(kLineHeight * font_scale_).
+    // Replaces the constexpr kLineHeight at the four use sites in
+    // Paint() (input row Y, scrollback row count, scrollback Y stride,
+    // caret rect height) so they track the current scale.
+    int       line_height_  = kLineHeight;
     bool      shown_       = false;
     bool      is_layered_  = false;
     int       parent_w_    = 0;
@@ -670,6 +687,64 @@ void WinOverlay::Repaint() {
     if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
+void WinOverlay::EnsureFontScale() {
+    // Pull the cvar each call. Console::FindCVar is a flat-table
+    // lookup, so the no-change path is O(1) name compare + a single
+    // load -- cheaper than wiring up an on_change callback that
+    // reaches across TUs from console -> app.
+    auto& C = pt::console::Console::Get();
+    auto* v = C.FindCVar("con_font_scale");
+    if (v == nullptr) return;
+
+    // The engine compiles with /EHs-c- (exceptions disabled) so std::stof
+    // is off-limits. std::strtof never throws and signals "no chars
+    // consumed" by returning end == start, which we treat as parse-fail.
+    char* end = nullptr;
+    float requested = std::strtof(v->value.c_str(), &end);
+    if (end == v->value.c_str()) requested = 1.0f;
+    // Clamp to a sane range. Below 0.5 the prompt is unreadable;
+    // above 3.0 the input row dominates the panel and history vanishes.
+    if (requested < 0.5f) requested = 0.5f;
+    if (requested > 3.0f) requested = 3.0f;
+
+    // Treat tiny float deltas as no-op so a freshly-typed value that
+    // round-trips through std::stof at slightly different precision
+    // doesn't keep recreating the font.
+    if (std::fabs(requested - font_scale_) < 1e-3f) return;
+
+    const int new_font_h = std::max(6, static_cast<int>(kFontHeight * requested + 0.5f));
+    const int new_line_h = std::max(8, static_cast<int>(kLineHeight * requested + 0.5f));
+
+    HFONT new_font = CreateFontW(
+        new_font_h, 0, 0, 0, FW_NORMAL,
+        FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY,
+        FIXED_PITCH | FF_MODERN,
+        L"Cascadia Mono");
+    if (new_font == nullptr) {
+        LOG_WARN("ConsoleOverlay: CreateFontW failed at scale={:.2f} "
+                 "(GLE={}); keeping previous font", requested, GetLastError());
+        return;
+    }
+
+    // Swap then free the old font (must be in this order -- if the
+    // window receives a paint between Delete and assign it'd reach a
+    // dangling HFONT). Stock fonts are not owned and must not be
+    // DeleteObject'd; mirror the ctor's font_is_owned_ tracking.
+    HFONT      old_font  = font_;
+    const bool old_owned = font_is_owned_;
+    font_          = new_font;
+    font_is_owned_ = true;
+    font_scale_    = requested;
+    line_height_   = new_line_h;
+    if (old_font != nullptr && old_owned) DeleteObject(old_font);
+    LOG_INFO("ConsoleOverlay: con_font_scale={:.2f} -> font_h={} line_h={}",
+             requested, new_font_h, new_line_h);
+    Repaint();
+}
+
 LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_PAINT: {
@@ -789,6 +864,72 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
 
+        // Ctrl+V: paste from clipboard at cursor. Inline (rather than
+        // a helper) because state_mutex_ is already held by the
+        // lock_guard above; an outline call to a method that re-locked
+        // would deadlock. CF_UNICODETEXT is preferred (proper
+        // non-ASCII handling); fall back to CF_TEXT if absent. Multi-
+        // line clipboard content is truncated at the first newline --
+        // the overlay is one-line-at-a-time, and silently submitting
+        // a chain of pasted commands would surprise the user.
+        const bool ctrl_held = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        if (ctrl_held && (w == 'V' || w == 'v')) {
+            std::string text;
+            if (OpenClipboard(hwnd_)) {
+                if (HANDLE h = GetClipboardData(CF_UNICODETEXT); h != nullptr) {
+                    if (auto* src = static_cast<const wchar_t*>(GlobalLock(h))) {
+                        // n includes the trailing NUL because cchWideChar=-1
+                        // signals "input is null-terminated, count it". The
+                        // destination buffer therefore must be sized for n
+                        // bytes, not n-1 -- we resize the std::string to n,
+                        // write into all n bytes, then pop_back the trailing
+                        // NUL so size() == strlen(). Earlier we sized to n-1
+                        // and passed n as the destination capacity, which is
+                        // a one-byte overflow into whatever sits past
+                        // text.data()+size() (typically the std::string's
+                        // own internal NUL slot, but UB to rely on).
+                        const int n = WideCharToMultiByte(CP_UTF8, 0, src, -1,
+                                                          nullptr, 0, nullptr, nullptr);
+                        if (n > 1) {
+                            text.resize(static_cast<std::size_t>(n));
+                            WideCharToMultiByte(CP_UTF8, 0, src, -1,
+                                                text.data(), n, nullptr, nullptr);
+                            text.pop_back();  // drop trailing NUL
+                        }
+                        GlobalUnlock(h);
+                    }
+                } else if (HANDLE h = GetClipboardData(CF_TEXT); h != nullptr) {
+                    if (auto* src = static_cast<const char*>(GlobalLock(h))) {
+                        text.assign(src);
+                        GlobalUnlock(h);
+                    }
+                }
+                CloseClipboard();
+            } else {
+                LOG_WARN("ConsoleOverlay: OpenClipboard failed (GLE={})",
+                         GetLastError());
+            }
+
+            if (!text.empty()) {
+                if (auto pos = text.find_first_of("\r\n"); pos != std::string::npos) {
+                    text.resize(pos);
+                }
+                // Strip ASCII control chars except \t (preserve UTF-8
+                // high-byte sequences -- 0x80+ unsigned).
+                text.erase(std::remove_if(text.begin(), text.end(),
+                    [](char c) {
+                        return static_cast<unsigned char>(c) < 32 && c != '\t';
+                    }), text.end());
+                if (!text.empty()) {
+                    input_.insert(cursor_, text);
+                    cursor_ += static_cast<int>(text.size());
+                    history_pos_ = -1;
+                    Repaint();
+                }
+            }
+            return 0;
+        }
+
         // Ghost-mode preamble.  When the autosuggestion is active these
         // keys mean something different than their default: Tab cycles,
         // Shift+Tab cycles back, Right-arrow at end / End commits, Esc
@@ -869,9 +1010,23 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             Repaint();
             return 0;
         case VK_ESCAPE:
-            // ESC also closes the overlay -- common console-game
-            // pattern, gives a second way out besides backtick.
-            // (Hide() acquires state_mutex_ via its own path.)
+            // Two-stage Esc:
+            //   1st press, input non-empty -> clear the line (matches
+            //                                 fish/zsh/Bash readline +
+            //                                 most rich console UIs)
+            //   2nd press (input empty)    -> close the overlay
+            //                                 (common console-game
+            //                                 pattern, second way out
+            //                                 besides backtick)
+            // Hide() acquires state_mutex_ via its own path so it
+            // must run AFTER this lock_guard releases at function exit.
+            if (!input_.empty()) {
+                input_.clear();
+                cursor_ = 0;
+                history_pos_ = -1;
+                Repaint();
+                return 0;
+            }
             break;
         }
         if (w == VK_ESCAPE) { Hide(); return 0; }
@@ -1111,6 +1266,14 @@ void WinOverlay::RefreshGhostAnnotation() {
 }
 
 void WinOverlay::Paint(HDC dc) {
+    // Re-pull con_font_scale every paint. Cheap: zero work when the
+    // value hasn't changed; on change we delete + recreate the GDI
+    // HFONT and recompute line_height_, then proceed to draw at the
+    // new size. Polled here (not via cvar on_change) because the
+    // overlay TU has no clean dependency hook into Console -- and a
+    // per-frame compare-against-cached is < 1 us.
+    EnsureFontScale();
+
     RECT rc{};
     GetClientRect(hwnd_, &rc);
     int W = rc.right;
@@ -1194,10 +1357,10 @@ void WinOverlay::Paint(HDC dc) {
         TextOutW(mdc, W - kPaddingX - sz.cx, kPaddingY + 4, status, slen);
     }
 
-    int input_y   = H - kLineHeight - kPaddingY;
+    int input_y   = H - line_height_ - kPaddingY;
     int log_top   = kPaddingY + 1 + 24;  // +1 accent, +24 for icon/status row
     int log_bot   = input_y - kPaddingY;
-    int max_lines = std::max(1, (log_bot - log_top) / kLineHeight);
+    int max_lines = std::max(1, (log_bot - log_top) / line_height_);
 
     {
         std::lock_guard lk(state_mutex_);
@@ -1224,7 +1387,7 @@ void WinOverlay::Paint(HDC dc) {
             if (!wbuf.empty()) {
                 TextOutW(mdc, kPaddingX, y, wbuf.data(), (int)wbuf.size());
             }
-            y += kLineHeight;
+            y += line_height_;
         }
 
         // Prompt
@@ -1251,7 +1414,7 @@ void WinOverlay::Paint(HDC dc) {
             }
         }
         int cx = kPaddingX + prompt_sz.cx + pre.cx;
-        RECT cur = {cx, input_y, cx + 2, input_y + kLineHeight};
+        RECT cur = {cx, input_y, cx + 2, input_y + line_height_};
         HBRUSH cb = CreateSolidBrush(theme_.accent);
         FillRect(mdc, &cur, cb);
         DeleteObject(cb);

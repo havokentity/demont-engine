@@ -92,9 +92,14 @@ void PrintBootLogo() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     PrintBootLogo();
     pt::engine::Engine engine;
+    // Hand argv to the engine so Init() can apply command-line cvar
+    // overrides (currently --net-port / --net-line-port for running
+    // multiple demont.exe instances on different ports). Init reads
+    // these AFTER the cfg load so they win over archived values.
+    engine.SetCommandLineArgs(argc, argv);
     if (!engine.Init()) {
         LOG_ERROR("Engine init failed");
         return 1;

@@ -61,6 +61,13 @@ namespace cvar {
             CVAR_ARCHIVE);
     PT_CVAR(app_overlay_enabled, "1",
             "Enable the in-window native console overlay (backtick toggles)", CVAR_ARCHIVE);
+    PT_CVAR(con_font_scale, "1.0",
+            "Console overlay font scale (1.0 = baseline 14 logical-unit "
+            "CreateFontW height; CreateFontW takes logical units, not "
+            "points). Effective range 0.5..3.0; values outside are "
+            "clamped at Paint() time. Win32 only -- the Mac overlay "
+            "uses native NSFont sizing and ignores this cvar.",
+            CVAR_ARCHIVE);
     PT_CVAR(r_perf_overlay,    "0",
             "Tiered in-game performance overlay. 0 = off, 1 = fps + frame_ms, "
             "2 = + backend / resolution / GPU memory / spp / bounces / primitives, "
@@ -311,6 +318,13 @@ bool Engine::Init() {
     exec_if_exists("demont.cfg");      // archived cvars from last quit
     exec_if_exists("autoexec.cfg");    // user-supplied startup script (overrides above)
 
+    // Command-line cvar overrides land last so they beat both archived
+    // and autoexec values. Currently this is the entry point for
+    // running multiple demont.exe instances on different ports
+    // (--net-port / --net-line-port); other --<cvar>=<value> args can
+    // be added inside ApplyCommandLineCvarOverrides as needed.
+    ApplyCommandLineCvarOverrides();
+
     // Job system.
     jobs_ = std::make_unique<pt::jobs::JobSystem>();
     jobs_->Init();
@@ -459,6 +473,46 @@ void Engine::OpenWebConsole() {
     auto cmd = fmt::format("xdg-open '{}' >/dev/null 2>&1 &", url);
     std::system(cmd.c_str());
 #endif
+}
+
+void Engine::ApplyCommandLineCvarOverrides() {
+    if (argv_ == nullptr || argc_ <= 1) return;
+    auto& C = pt::console::Console::Get();
+
+    // Pure pass-through table: each entry maps a CLI flag prefix
+    // (with trailing `=`) to the underlying cvar name. Adding a new
+    // override is one row -- no extra parsing branches.
+    struct OverrideMap { std::string_view flag_prefix; std::string_view cvar_name; };
+    static constexpr OverrideMap kOverrides[] = {
+        { "--net-port=",      "net_port"      },  // HTTP/WebSocket UI
+        { "--net-line-port=", "net_line_port" },  // TCP console
+    };
+
+    for (int i = 1; i < argc_; ++i) {
+        if (argv_[i] == nullptr) continue;
+        const std::string_view arg(argv_[i]);
+        bool matched = false;
+        for (const auto& o : kOverrides) {
+            if (!arg.starts_with(o.flag_prefix)) continue;
+            const std::string_view value = arg.substr(o.flag_prefix.size());
+            if (value.empty()) {
+                LOG_WARN("engine: {} given with empty value -- ignored",
+                         o.flag_prefix);
+            } else if (!C.SetCVarOverride(o.cvar_name, value)) {
+                LOG_WARN("engine: {} -> SetCVarOverride('{}', '{}') failed "
+                         "(cvar not registered yet?)",
+                         arg, o.cvar_name, value);
+            } else {
+                LOG_INFO("engine: CLI override {} = '{}' (post-cfg)",
+                         o.cvar_name, value);
+            }
+            matched = true;
+            break;
+        }
+        if (!matched && arg.starts_with("--")) {
+            LOG_WARN("engine: unrecognised CLI flag '{}' (ignored)", arg);
+        }
+    }
 }
 
 void Engine::Shutdown() {
