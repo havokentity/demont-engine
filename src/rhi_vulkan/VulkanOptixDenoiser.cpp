@@ -288,23 +288,28 @@ bool VulkanOptixDenoiser::InitOnce() {
     OPTIX_TRY(optixDeviceContextCreate(cuda_ctx_, &ctx_opts, &optix_ctx_));
 
     OptixDenoiserOptions opts{};
+    OptixDenoiserModelKind model_kind = OPTIX_DENOISER_MODEL_KIND_HDR;
     if (kind_ == Kind::HdrAov) {
-        // Phase 1a step 3 lands the actual albedo + normal AOV inputs;
-        // until then HdrAov falls back to plain HDR so this denoiser is
-        // usable today. The cvar value is preserved so the user can
-        // pre-set their preferred kind even before AOV plumbing lands.
-        opts.guideAlbedo = 0;
-        opts.guideNormal = 0;
-        LOG_INFO("VulkanOptixDenoiser: kind=HdrAov requested but AOV "
-                 "inputs (primary_albedo) not yet wired -- falling back "
-                 "to plain HDR for this commit. AOV variant lands in "
-                 "Phase 1a step 3.");
+        // AOV model: takes color + albedo + normal as guide layers.
+        // The engine allocates the albedo + normal G-buffers and the
+        // path tracer writes them every frame; here we just tell OptiX
+        // we'll provide them so the denoiser builds the right state.
+        opts.guideAlbedo = 1;
+        opts.guideNormal = 1;
+        model_kind       = OPTIX_DENOISER_MODEL_KIND_AOV;
+        LOG_INFO("VulkanOptixDenoiser: kind=HdrAov -- using "
+                 "OPTIX_DENOISER_MODEL_KIND_AOV with albedo + normal "
+                 "guide layers (RGBA16F at vk::binding 17 / 16)");
     } else {
+        // Plain HDR: no guide layers. OptiX uses only the noisy color
+        // input + an internal HDR intensity scratch.
         opts.guideAlbedo = 0;
         opts.guideNormal = 0;
+        LOG_INFO("VulkanOptixDenoiser: kind=Hdr -- using "
+                 "OPTIX_DENOISER_MODEL_KIND_HDR (no AOV guides)");
     }
     OPTIX_TRY(optixDenoiserCreate(optix_ctx_,
-                                  OPTIX_DENOISER_MODEL_KIND_HDR,
+                                  model_kind,
                                   &opts,
                                   &optix_denoiser_));
     return true;
@@ -372,6 +377,8 @@ std::uint32_t FindMemoryType(VkPhysicalDevice phys, std::uint32_t type_bits,
 bool VulkanOptixDenoiser::ResizeExternalBuffers(std::uint32_t w, std::uint32_t h) {
     DestroyExternalBuffer(0);
     DestroyExternalBuffer(1);
+    DestroyExternalBuffer(2);  // albedo (no-op when not previously allocated)
+    DestroyExternalBuffer(3);  // normal (no-op when not previously allocated)
 
     VkDevice dev = device_->RawDevice();
     VkPhysicalDevice phys = device_->RawPhysicalDevice();
@@ -468,14 +475,41 @@ bool VulkanOptixDenoiser::ResizeExternalBuffers(std::uint32_t w, std::uint32_t h
     if (!build_one(buf_color_in_, "color_in")) return false;
     if (!build_one(buf_output_,   "output"))   return false;
 
+    int aov_count = 0;
+    if (kind_ == Kind::HdrAov) {
+        // AOV guide layers: same external-memory machinery as color_in
+        // and output (linear DEVICE_LOCAL VkBuffer + cudaImportExternal-
+        // Memory + GetMappedBuffer). OptiX reads these as half4 RGBA in
+        // OptixDenoiserGuideLayer::albedo / .normal during Invoke.
+        if (!build_one(buf_albedo_, "albedo")) return false;
+        if (!build_one(buf_normal_, "normal")) return false;
+        aov_count = 2;
+    }
+
     LOG_INFO("VulkanOptixDenoiser: external buffers sized for {}x{} "
-             "(2 x {}KB, dedicated allocation, imported to CUDA as "
-             "linear CUdeviceptrs)", w, h, buf_size / 1024);
+             "({} x {}KB, dedicated allocation, imported to CUDA as "
+             "linear CUdeviceptrs)", w, h, 2 + aov_count, buf_size / 1024);
     return true;
 }
 
 void VulkanOptixDenoiser::DestroyExternalBuffer(int slot) {
-    ExternalBuffer& e = (slot == 0) ? buf_color_in_ : buf_output_;
+    // Slot semantics:
+    //   0 = buf_color_in_  (always allocated)
+    //   1 = buf_output_    (always allocated)
+    //   2 = buf_albedo_    (HdrAov only; null on Hdr -- safe to call)
+    //   3 = buf_normal_    (HdrAov only; null on Hdr -- safe to call)
+    ExternalBuffer* pe = nullptr;
+    switch (slot) {
+        case 0: pe = &buf_color_in_; break;
+        case 1: pe = &buf_output_;   break;
+        case 2: pe = &buf_albedo_;   break;
+        case 3: pe = &buf_normal_;   break;
+        default:
+            LOG_WARN("VulkanOptixDenoiser::DestroyExternalBuffer: "
+                     "unexpected slot={}", slot);
+            return;
+    }
+    ExternalBuffer& e = *pe;
     // CUDA mapping freed implicitly when cudaDestroyExternalMemory runs.
     if (e.cuda_ext != nullptr) { cudaDestroyExternalMemory(e.cuda_ext); e.cuda_ext = nullptr; }
     e.cuda_ptr = 0;
@@ -682,6 +716,19 @@ void VulkanOptixDenoiser::Encode(VkCommandBuffer cb,
     VkImage src_img      = device_->LookupImage(d.color_in);
     VkImage dst_img      = device_->LookupImage(d.output);
     VkImage swap_img     = device_->LookupImage(d.final_output);
+    VkImage albedo_img   = VK_NULL_HANDLE;
+    VkImage normal_img   = VK_NULL_HANDLE;
+    if (kind_ == Kind::HdrAov) {
+        albedo_img = device_->LookupImage(d.albedo_in);
+        normal_img = device_->LookupImage(d.normal_in);
+        if (albedo_img == VK_NULL_HANDLE || normal_img == VK_NULL_HANDLE) {
+            LOG_WARN("VulkanOptixDenoiser::Encode(HdrAov): AOV image lookup miss "
+                     "(albedo={} normal={}); skipping frame",
+                     static_cast<void*>(albedo_img),
+                     static_cast<void*>(normal_img));
+            return;
+        }
+    }
     if (src_img == VK_NULL_HANDLE || dst_img == VK_NULL_HANDLE) {
         LOG_WARN("VulkanOptixDenoiser::Encode: image lookup miss "
                  "(src={} dst={})", static_cast<void*>(src_img),
@@ -743,6 +790,66 @@ void VulkanOptixDenoiser::Encode(VkCommandBuffer cb,
             VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0, 0, nullptr, 0, nullptr, 1, &backToGeneral);
+    }
+
+    // ---- Step 2b: AOV guide-layer copies (HdrAov only) ------------------
+    // For OPTIX_DENOISER_MODEL_KIND_AOV the guide layer wants linear
+    // CUdeviceptrs for albedo + normal. Same machinery as color_in:
+    // GENERAL -> TRANSFER_SRC, vkCmdCopyImageToBuffer, back to GENERAL.
+    // Two images means two barrier-pairs; we batch each image's
+    // barriers into a single vkCmdPipelineBarrier rather than a single
+    // multi-barrier call across both images, because the source layouts
+    // are independent per-image and barrier batching across images
+    // doesn't actually save anything on NVIDIA's driver beyond what
+    // the engine's per-image batching already achieves.
+    if (kind_ == Kind::HdrAov) {
+        auto copy_aov_image_to_buffer = [&](VkImage img, VkBuffer buf, const char* label) {
+            VkImageMemoryBarrier toSrc{};
+            toSrc.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            toSrc.oldLayout     = VK_IMAGE_LAYOUT_GENERAL;
+            toSrc.newLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            toSrc.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toSrc.image         = img;
+            toSrc.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            toSrc.subresourceRange.layerCount = 1;
+            toSrc.subresourceRange.levelCount = 1;
+            vkCmdPipelineBarrier(cb,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &toSrc);
+
+            VkBufferImageCopy region{};
+            region.bufferOffset      = 0;
+            region.bufferRowLength   = 0;
+            region.bufferImageHeight = 0;
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.layerCount = 1;
+            region.imageExtent = { cached_w_, cached_h_, 1 };
+            vkCmdCopyImageToBuffer(cb, img,
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   buf, 1, &region);
+
+            VkImageMemoryBarrier back{};
+            back.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            back.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            back.newLayout     = VK_IMAGE_LAYOUT_GENERAL;
+            back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            back.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            back.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            back.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            back.image         = img;
+            back.subresourceRange = toSrc.subresourceRange;
+            vkCmdPipelineBarrier(cb,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &back);
+            (void)label;
+        };
+        copy_aov_image_to_buffer(albedo_img, buf_albedo_.buffer, "albedo");
+        copy_aov_image_to_buffer(normal_img, buf_normal_.buffer, "normal");
     }
 
     // CUDA + OptiX work is deferred to SubmitPostMain (called from
@@ -956,6 +1063,27 @@ void VulkanOptixDenoiser::SubmitPostMain() {
 
     OptixDenoiserGuideLayer guide_layer{};
     std::memset(&guide_layer, 0, sizeof(guide_layer));
+    if (kind_ == Kind::HdrAov) {
+        // Albedo guide: linear-RGB at primary hit. OptiX uses it to
+        // preserve diffuse-color edges that the noisy color buffer
+        // alone can't disambiguate (e.g. wallpaper-on-shadow boundary
+        // looks like noise to the color denoiser).
+        guide_layer.albedo.data             = static_cast<CUdeviceptr>(buf_albedo_.cuda_ptr);
+        guide_layer.albedo.width            = cached_w_;
+        guide_layer.albedo.height           = cached_h_;
+        guide_layer.albedo.rowStrideInBytes = cached_w_ * kBytesPerPixel;
+        guide_layer.albedo.pixelStrideInBytes = kBytesPerPixel;
+        guide_layer.albedo.format           = kOptixPixelFormat;
+        // Normal guide: world-space surface normal at primary hit.
+        // Used to preserve geometric edges + suppress filtering across
+        // surface-orientation discontinuities (silhouettes / corners).
+        guide_layer.normal.data             = static_cast<CUdeviceptr>(buf_normal_.cuda_ptr);
+        guide_layer.normal.width            = cached_w_;
+        guide_layer.normal.height           = cached_h_;
+        guide_layer.normal.rowStrideInBytes = cached_w_ * kBytesPerPixel;
+        guide_layer.normal.pixelStrideInBytes = kBytesPerPixel;
+        guide_layer.normal.format           = kOptixPixelFormat;
+    }
 
     OptixDenoiserLayer layer{};
     std::memset(&layer, 0, sizeof(layer));
@@ -1010,6 +1138,8 @@ void VulkanOptixDenoiser::DestroyResources() {
     DestroyCommandPool();
     DestroyExternalBuffer(0);
     DestroyExternalBuffer(1);
+    DestroyExternalBuffer(2);  // albedo (no-op on Hdr, valid on HdrAov)
+    DestroyExternalBuffer(3);  // normal (no-op on Hdr, valid on HdrAov)
 
     if (state_buf_     != 0) { cudaFree(reinterpret_cast<void*>(state_buf_));     state_buf_     = 0; }
     if (scratch_buf_   != 0) { cudaFree(reinterpret_cast<void*>(scratch_buf_));   scratch_buf_   = 0; }

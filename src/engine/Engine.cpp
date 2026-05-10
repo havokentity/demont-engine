@@ -1449,13 +1449,14 @@ void Engine::RenderFrame() {
             if (depth_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
             if (motion_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
             if (normal_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{normal_tex_id_});
+            if (albedo_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{albedo_tex_id_});
             if (post_denoise_hdr_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
             for (auto& id : bloom_mip_tex_id_) {
                 if (id != 0) device_->DestroyTexture(pt::rhi::TextureHandle{id});
                 id = 0;
             }
             denoise_color_tex_id_ = depth_tex_id_ = motion_tex_id_ = 0;
-            normal_tex_id_ = post_denoise_hdr_tex_id_ = 0;
+            normal_tex_id_ = albedo_tex_id_ = post_denoise_hdr_tex_id_ = 0;
         }
     }
 
@@ -1504,18 +1505,30 @@ void Engine::RenderFrame() {
     // denoising is off. The post-denoise HDR intermediate is the linear
     // RGBA16F MetalFX writes to; the `tonemap` compute kernel reads it
     // and writes the swapchain.
+    // SVGF/NRD use the normal G-buffer for edge-aware spatial filtering.
+    // The OptiX AOV denoiser also wants it as the normal guide layer
+    // alongside albedo, so OptixHdrAov triggers normal allocation too.
+    // OptixHdr (no AOV) doesn't need it.
     const bool want_normal_gbuffer =
-        (denoiser_kind_ == DenoiserKind::SvgfBasic  ||
-         denoiser_kind_ == DenoiserKind::SvgfAtrous ||
-         denoiser_kind_ == DenoiserKind::Nrd);
+        (denoiser_kind_ == DenoiserKind::SvgfBasic   ||
+         denoiser_kind_ == DenoiserKind::SvgfAtrous  ||
+         denoiser_kind_ == DenoiserKind::Nrd         ||
+         denoiser_kind_ == DenoiserKind::OptixHdrAov);
+    // Albedo G-buffer is OptiX-AOV-only -- SVGF/NRD don't take an albedo
+    // input, MetalFX doesn't either, and OptixHdr uses the plain HDR
+    // model that has no AOV inputs.
+    const bool want_albedo_gbuffer =
+        (denoiser_kind_ == DenoiserKind::OptixHdrAov);
     if (denoiser_active_ &&
         (denoise_color_tex_id_ == 0 || depth_tex_id_ == 0 || motion_tex_id_ == 0 ||
          post_denoise_hdr_tex_id_ == 0 || size_changed ||
-         (want_normal_gbuffer && normal_tex_id_ == 0))) {
+         (want_normal_gbuffer && normal_tex_id_ == 0) ||
+         (want_albedo_gbuffer && albedo_tex_id_ == 0))) {
         if (denoise_color_tex_id_     != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
         if (depth_tex_id_             != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
         if (motion_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
         if (normal_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{normal_tex_id_});
+        if (albedo_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{albedo_tex_id_});
         if (post_denoise_hdr_tex_id_  != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
         auto color_h = device_->CreateTexture({
             .width = fc.width, .height = fc.height,
@@ -1545,10 +1558,11 @@ void Engine::RenderFrame() {
         depth_tex_id_            = depth_h.id;
         motion_tex_id_           = motion_h.id;
         post_denoise_hdr_tex_id_ = post_h.id;
-        // Normal G-buffer: only the SVGF/NRD path needs it. MetalFX
-        // ignores normals and the path tracer's normal write is gated
-        // by PT_TARGET_SPIRV (so on Metal there's no shader binding
-        // expecting it either).
+        // Normal G-buffer: SVGF/NRD use it for edge-aware spatial
+        // filtering; the OptiX AOV denoiser uses it as a guide layer.
+        // MetalFX ignores normals and the path tracer's normal write is
+        // gated by PT_TARGET_SPIRV (so on Metal there's no shader
+        // binding expecting it either).
         if (want_normal_gbuffer) {
             auto normal_h = device_->CreateTexture({
                 .width = fc.width, .height = fc.height,
@@ -1560,10 +1574,26 @@ void Engine::RenderFrame() {
         } else {
             normal_tex_id_ = 0;
         }
+        // Albedo G-buffer: OptiX AOV only. RGBA16F to keep headroom
+        // for HDR-encoded materials (emissive base colors, etc.) and to
+        // match the format convention of the other G-buffers.
+        if (want_albedo_gbuffer) {
+            auto albedo_h = device_->CreateTexture({
+                .width = fc.width, .height = fc.height,
+                .format = pt::rhi::TextureFormat::RGBA16F,
+                .usage  = pt::rhi::TextureUsage::Storage,
+                .debug_name = "denoise_albedo",
+            });
+            albedo_tex_id_ = albedo_h.id;
+            LOG_INFO("engine: allocated denoise_albedo G-buffer ({}x{} RGBA16F) for OptiX AOV", fc.width, fc.height);
+        } else {
+            albedo_tex_id_ = 0;
+        }
         prev_view_proj_valid_ = false;        // history is invalid after resize
         if (denoise_color_tex_id_ == 0 || depth_tex_id_ == 0 ||
             motion_tex_id_        == 0 || post_denoise_hdr_tex_id_ == 0 ||
-            (want_normal_gbuffer && normal_tex_id_ == 0)) {
+            (want_normal_gbuffer && normal_tex_id_ == 0) ||
+            (want_albedo_gbuffer && albedo_tex_id_ == 0)) {
             LOG_ERROR("denoiser G-buffer allocation failed at {}x{}", fc.width, fc.height);
             denoiser_active_ = false;
         }
@@ -1667,6 +1697,16 @@ void Engine::RenderFrame() {
     // dropped) and the Vulkan backend extends to 12.
     if (denoiser_active_ && normal_tex_id_ != 0) {
         cb->BindStorageTexture(8, pt::rhi::TextureHandle{normal_tex_id_});
+    }
+    // Engine slot 9 -> vk::binding 17 (albedo_tex). Vulkan + OptiX-AOV
+    // only. PathTrace.slang's albedo_tex is PT_TARGET_SPIRV-gated so
+    // Metal builds don't expect anything; the Metal backend's 8-slot
+    // bound_tex_ silently drops slot 9 anyway. When albedo_tex_id_ is
+    // 0 (any non-AOV mode) we don't bind here, and the path tracer's
+    // unconditional write to binding 17 is a no-op via Vulkan
+    // robust-buffer-access against the descriptor set's null entry.
+    if (denoiser_active_ && albedo_tex_id_ != 0) {
+        cb->BindStorageTexture(9, pt::rhi::TextureHandle{albedo_tex_id_});
     }
     if (env_map_tex_id_ != 0) {
         cb->BindStorageTexture(5, pt::rhi::TextureHandle{env_map_tex_id_});
@@ -2220,6 +2260,9 @@ void Engine::RenderFrame() {
         dd.depth_in      = pt::rhi::TextureHandle{depth_tex_id_};
         dd.motion_in     = pt::rhi::TextureHandle{motion_tex_id_};
         dd.normal_in     = pt::rhi::TextureHandle{normal_tex_id_};
+        // OptiX AOV only -- 0 in any other mode (the backend's OptixHdr
+        // path validates only color/output and ignores this).
+        dd.albedo_in     = pt::rhi::TextureHandle{albedo_tex_id_};
         // MetalFX writes to the linear-HDR intermediate; the tonemap
         // dispatch below converts that to sRGB and writes the swapchain.
         dd.output        = pt::rhi::TextureHandle{post_denoise_hdr_tex_id_};

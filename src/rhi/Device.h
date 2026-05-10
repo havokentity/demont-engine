@@ -108,10 +108,18 @@ public:
         TextureHandle motion_in;      // RG16F pixel-space (prev - curr)
         // World-space surface normals at primary hit (RGBA16F, .xyz =
         // unit normal, .w unused). Required by the Vulkan SVGF/NRD
-        // denoiser for edge-aware spatial filtering; MetalFX ignores it
-        // (handle may be 0 on Metal). Engine writes it from the path
-        // tracer's primary-ray pass when denoiser_enabled.
+        // denoiser for edge-aware spatial filtering and by the OptiX
+        // AOV denoiser (OptixHdrAov) as the normal guide layer; MetalFX
+        // ignores it (handle may be 0 on Metal). Engine writes it from
+        // the path tracer's primary-ray pass when denoiser_enabled.
         TextureHandle normal_in;
+        // Linear-RGB albedo at primary hit (RGBA16F, .rgb = surface
+        // diffuse color, .a unused). Consumed by the OptiX AOV denoiser
+        // (OptixHdrAov) as the albedo guide layer; ignored by the SVGF/
+        // NRD path and by MetalFX (handle may be 0 in those modes).
+        // Engine allocates + writes this only when r_denoiser is
+        // optix_hdr_aov.
+        TextureHandle albedo_in;
         // Linear-HDR target the denoiser writes to. On Mac/MetalFX this
         // is the post_denoise_hdr intermediate that the Tonemap pipeline
         // reads. On Vulkan with SVGF/NRD it's the same intermediate, but

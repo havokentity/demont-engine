@@ -173,9 +173,18 @@ private:
     std::uint64_t                               motion_tex_id_         = 0;
     // Vulkan SVGF/NRD denoiser only: world-space surface normal at
     // primary hit, written by PathTrace.slang's G-buffer pass and read
-    // by DenoiseTemporal/DenoiseAtrous for edge-aware filtering. Not
-    // allocated for the metalfx path -- MetalFX doesn't take normals.
+    // by DenoiseTemporal/DenoiseAtrous for edge-aware filtering. Also
+    // allocated for the OptiX AOV denoiser (optix_hdr_aov) which uses
+    // the same image as its normal guide layer. Not allocated for the
+    // metalfx path -- MetalFX doesn't take normals.
     std::uint64_t                               normal_tex_id_         = 0;
+    // Vulkan OptiX AOV denoiser only: linear-RGB albedo at primary
+    // hit, written by PathTrace.slang's G-buffer pass and consumed by
+    // OPTIX_DENOISER_MODEL_KIND_AOV as the albedo guide layer for
+    // diffuse-color-edge-aware denoising. Not allocated for SVGF/NRD
+    // (those don't take albedo) or MetalFX -- non-zero only when
+    // r_denoiser is optix_hdr_aov.
+    std::uint64_t                               albedo_tex_id_         = 0;
     // Linear HDR intermediate that MetalFX writes to instead of the
     // swapchain. The `tonemap` compute kernel reads this and writes
     // exposure+ACES-encoded sRGB into the swapchain. Co-allocated +
