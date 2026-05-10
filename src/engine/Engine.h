@@ -32,6 +32,17 @@ public:
     Engine();
     ~Engine();
 
+    // Stores argv pointers for ApplyCommandLineCvarOverrides (called
+    // from inside Init() AFTER the cfg load so command-line values
+    // win over archived ones). Pass argc/argv unmodified from main();
+    // the engine doesn't own or copy them so the caller must keep
+    // them alive at least until Init() returns. No-op if Init runs
+    // without args being set.
+    void SetCommandLineArgs(int argc, char** argv) {
+        argc_ = argc;
+        argv_ = argv;
+    }
+
     bool Init();
     void Shutdown();
 
@@ -74,6 +85,14 @@ private:
     void RegisterPrimCommands();
     void TearDownDevice();
     void RenderFrame();
+
+    // Scans argv_ for `--<cvar-name>=<value>` overrides and applies
+    // them via Console::SetCVarOverride. Currently recognised:
+    //   --net-port=N         -> net_port (HTTP/WebSocket UI)
+    //   --net-line-port=N    -> net_line_port (TCP console)
+    // Called from Init() after cfg load so CLI args beat archived
+    // values. Adding new pass-through args is a 4-line append.
+    void ApplyCommandLineCvarOverrides();
 
     void UpdateCamera(double dt);
 
@@ -119,6 +138,12 @@ private:
     // Seed the analytic-primitive set with the canonical 3-sphere +
     // ground-plane scene (Lambert red, gold metal, glass dielectric).
     void SeedDefaultPrimitives();
+
+    // Command-line args captured from main() via SetCommandLineArgs.
+    // argv_ is a borrowed pointer; argc_ is 0 if SetCommandLineArgs
+    // never ran (e.g. unit tests instantiating Engine directly).
+    int                                         argc_ = 0;
+    char**                                      argv_ = nullptr;
 
     std::unique_ptr<pt::app::Window>            window_;
     std::unique_ptr<pt::app::ConsoleOverlay>    overlay_;
