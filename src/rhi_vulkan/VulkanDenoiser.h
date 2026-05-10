@@ -76,7 +76,9 @@ public:
                 TextureHandle   depth_in,
                 TextureHandle   motion_in,
                 TextureHandle   normal_in,
-                TextureHandle   output,
+                TextureHandle   output,        // linear-HDR scratch
+                TextureHandle   final_output,  // tonemapped-LDR target (swapchain)
+                BufferHandle    exposure_state,
                 bool            reset_history,
                 bool            atrous_enabled);
 
@@ -116,6 +118,17 @@ private:
     VkPipeline            temporal_pipe_ = VK_NULL_HANDLE;
     VkPipeline            atrous_pipe_  = VK_NULL_HANDLE;
     VkDescriptorPool      dpool_        = VK_NULL_HANDLE;
+    // DenoiseFinalize uses its own layout (2 storage images + 1
+    // storage buffer; different from the temporal/atrous 6-image
+    // layout) so it gets a parallel layout / pipeline / set ring.
+    // Same VkDescriptorPool serves both since we sized it for a
+    // mixed pool.
+    VkDescriptorSetLayout finalize_dset_layout_ = VK_NULL_HANDLE;
+    VkPipelineLayout      finalize_pipe_layout_ = VK_NULL_HANDLE;
+    VkPipeline            finalize_pipe_        = VK_NULL_HANDLE;
+    static constexpr int  kFinalizeSetRing      = 4;
+    VkDescriptorSet       finalize_sets_[kFinalizeSetRing] {};
+    int                   next_finalize_set_    = 0;
 
     // 4 dispatches per Encode * 2 frames in flight = 8 minimum; round
     // up so a stray reset doesn't wrap mid-frame and recycle a set

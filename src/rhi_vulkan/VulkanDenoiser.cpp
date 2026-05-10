@@ -14,6 +14,8 @@ extern const unsigned char shader_DenoiseTemporal_spirv_data[];
 extern const unsigned long shader_DenoiseTemporal_spirv_size;
 extern const unsigned char shader_DenoiseAtrous_spirv_data[];
 extern const unsigned long shader_DenoiseAtrous_spirv_size;
+extern const unsigned char shader_DenoiseFinalize_spirv_data[];
+extern const unsigned long shader_DenoiseFinalize_spirv_size;
 }
 
 namespace pt::rhi::vk {
@@ -103,19 +105,32 @@ void VulkanNrdDenoiser::DestroyAll() {
         vkDestroyPipeline(dev, atrous_pipe_, nullptr);
         atrous_pipe_ = VK_NULL_HANDLE;
     }
+    if (finalize_pipe_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(dev, finalize_pipe_, nullptr);
+        finalize_pipe_ = VK_NULL_HANDLE;
+    }
     if (pipe_layout_ != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(dev, pipe_layout_, nullptr);
         pipe_layout_ = VK_NULL_HANDLE;
+    }
+    if (finalize_pipe_layout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(dev, finalize_pipe_layout_, nullptr);
+        finalize_pipe_layout_ = VK_NULL_HANDLE;
     }
     if (dset_layout_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(dev, dset_layout_, nullptr);
         dset_layout_ = VK_NULL_HANDLE;
     }
+    if (finalize_dset_layout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(dev, finalize_dset_layout_, nullptr);
+        finalize_dset_layout_ = VK_NULL_HANDLE;
+    }
     if (dpool_ != VK_NULL_HANDLE) {
         // VkDescriptorPool destruction frees all sets; clear the cache
         // first so we don't accidentally reuse stale handles after
         // re-Init().
-        for (auto& s : sets_) s = VK_NULL_HANDLE;
+        for (auto& s : sets_)          s = VK_NULL_HANDLE;
+        for (auto& s : finalize_sets_) s = VK_NULL_HANDLE;
         vkDestroyDescriptorPool(dev, dpool_, nullptr);
         dpool_ = VK_NULL_HANDLE;
     }
@@ -173,37 +188,69 @@ bool VulkanNrdDenoiser::Init() {
 bool VulkanNrdDenoiser::BuildLayout() {
     VkDevice dev = device_->RawDevice();
 
-    std::array<VkDescriptorSetLayoutBinding, 6> b{};
-    for (std::uint32_t i = 0; i < b.size(); ++i) {
-        b[i].binding         = i;
-        b[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        b[i].descriptorCount = 1;
-        b[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    // ---- temporal/atrous: 6 storage images --------------------------
+    {
+        std::array<VkDescriptorSetLayoutBinding, 6> b{};
+        for (std::uint32_t i = 0; i < b.size(); ++i) {
+            b[i].binding         = i;
+            b[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            b[i].descriptorCount = 1;
+            b[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo dslci{};
+        dslci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        dslci.bindingCount = static_cast<std::uint32_t>(b.size());
+        dslci.pBindings    = b.data();
+        if (vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &dset_layout_) != VK_SUCCESS) {
+            LOG_ERROR("VulkanNrdDenoiser: vkCreateDescriptorSetLayout failed");
+            return false;
+        }
+        VkPushConstantRange pcr{};
+        pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pcr.offset     = 0;
+        pcr.size       = sizeof(DenoisePush);
+        VkPipelineLayoutCreateInfo plci{};
+        plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        plci.setLayoutCount         = 1;
+        plci.pSetLayouts            = &dset_layout_;
+        plci.pushConstantRangeCount = 1;
+        plci.pPushConstantRanges    = &pcr;
+        if (vkCreatePipelineLayout(dev, &plci, nullptr, &pipe_layout_) != VK_SUCCESS) {
+            LOG_ERROR("VulkanNrdDenoiser: vkCreatePipelineLayout failed");
+            return false;
+        }
     }
 
-    VkDescriptorSetLayoutCreateInfo dslci{};
-    dslci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dslci.bindingCount = static_cast<std::uint32_t>(b.size());
-    dslci.pBindings    = b.data();
-    if (vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &dset_layout_) != VK_SUCCESS) {
-        LOG_ERROR("VulkanNrdDenoiser: vkCreateDescriptorSetLayout failed");
-        return false;
-    }
-
-    VkPushConstantRange pcr{};
-    pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    pcr.offset     = 0;
-    pcr.size       = sizeof(DenoisePush);
-
-    VkPipelineLayoutCreateInfo plci{};
-    plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    plci.setLayoutCount         = 1;
-    plci.pSetLayouts            = &dset_layout_;
-    plci.pushConstantRangeCount = 1;
-    plci.pPushConstantRanges    = &pcr;
-    if (vkCreatePipelineLayout(dev, &plci, nullptr, &pipe_layout_) != VK_SUCCESS) {
-        LOG_ERROR("VulkanNrdDenoiser: vkCreatePipelineLayout failed");
-        return false;
+    // ---- finalize: 2 storage images + 1 storage buffer --------------
+    {
+        std::array<VkDescriptorSetLayoutBinding, 3> b{};
+        b[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        b[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        b[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        VkDescriptorSetLayoutCreateInfo dslci{};
+        dslci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        dslci.bindingCount = static_cast<std::uint32_t>(b.size());
+        dslci.pBindings    = b.data();
+        if (vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &finalize_dset_layout_) != VK_SUCCESS) {
+            LOG_ERROR("VulkanNrdDenoiser: finalize descriptor set layout failed");
+            return false;
+        }
+        // Finalize push: width, height + 8 bytes pad to keep the
+        // struct 16-byte aligned (Slang/SPIR-V cbuffer convention).
+        VkPushConstantRange pcr{};
+        pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pcr.offset     = 0;
+        pcr.size       = 16;
+        VkPipelineLayoutCreateInfo plci{};
+        plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        plci.setLayoutCount         = 1;
+        plci.pSetLayouts            = &finalize_dset_layout_;
+        plci.pushConstantRangeCount = 1;
+        plci.pPushConstantRanges    = &pcr;
+        if (vkCreatePipelineLayout(dev, &plci, nullptr, &finalize_pipe_layout_) != VK_SUCCESS) {
+            LOG_ERROR("VulkanNrdDenoiser: finalize pipeline layout failed");
+            return false;
+        }
     }
     return true;
 }
@@ -212,7 +259,7 @@ bool VulkanNrdDenoiser::BuildPipelines() {
     VkDevice dev = device_->RawDevice();
 
     auto build = [&](const unsigned char* spirv, std::size_t spirv_size,
-                     VkPipeline& out, const char* label) -> bool {
+                     VkPipelineLayout layout, VkPipeline& out, const char* label) -> bool {
         VkShaderModule m = MakeModule(dev, spirv, spirv_size);
         if (m == VK_NULL_HANDLE) {
             LOG_ERROR("VulkanNrdDenoiser: shader module failed for {}", label);
@@ -225,7 +272,7 @@ bool VulkanNrdDenoiser::BuildPipelines() {
         s.pName  = "main";
         VkComputePipelineCreateInfo cpci{};
         cpci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        cpci.layout = pipe_layout_;
+        cpci.layout = layout;
         cpci.stage  = s;
         VkResult r = vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpci, nullptr, &out);
         vkDestroyShaderModule(dev, m, nullptr);
@@ -237,24 +284,34 @@ bool VulkanNrdDenoiser::BuildPipelines() {
     };
 
     if (!build(shader_DenoiseTemporal_spirv_data, shader_DenoiseTemporal_spirv_size,
-               temporal_pipe_, "DenoiseTemporal")) return false;
+               pipe_layout_, temporal_pipe_, "DenoiseTemporal")) return false;
     if (!build(shader_DenoiseAtrous_spirv_data, shader_DenoiseAtrous_spirv_size,
-               atrous_pipe_, "DenoiseAtrous")) return false;
+               pipe_layout_, atrous_pipe_, "DenoiseAtrous")) return false;
+    if (!build(shader_DenoiseFinalize_spirv_data, shader_DenoiseFinalize_spirv_size,
+               finalize_pipe_layout_, finalize_pipe_, "DenoiseFinalize")) return false;
     return true;
 }
 
 bool VulkanNrdDenoiser::BuildDescriptorPool() {
     VkDevice dev = device_->RawDevice();
 
-    // 6 storage images per set * kSetRing sets, plus a small headroom.
-    VkDescriptorPoolSize ps{};
-    ps.type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    ps.descriptorCount = static_cast<std::uint32_t>(kSetRing * 6 + 4);
+    // Mixed pool sizing for both layouts:
+    //   - kSetRing sets of (6 storage images) for temporal/atrous.
+    //   - kFinalizeSetRing sets of (2 storage images + 1 storage
+    //     buffer) for the finalize pass.
+    // Plus a small headroom on each type.
+    std::array<VkDescriptorPoolSize, 2> ps{};
+    ps[0].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    ps[0].descriptorCount = static_cast<std::uint32_t>(
+        kSetRing * 6 + kFinalizeSetRing * 2 + 4);
+    ps[1].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    ps[1].descriptorCount = static_cast<std::uint32_t>(kFinalizeSetRing * 1 + 2);
+
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpci.maxSets       = kSetRing;
-    dpci.poolSizeCount = 1;
-    dpci.pPoolSizes    = &ps;
+    dpci.maxSets       = static_cast<std::uint32_t>(kSetRing + kFinalizeSetRing);
+    dpci.poolSizeCount = static_cast<std::uint32_t>(ps.size());
+    dpci.pPoolSizes    = ps.data();
     // Sets stay alive for the pool's lifetime; we re-write them via
     // vkUpdateDescriptorSets each Encode rather than freeing/realloc.
     if (vkCreateDescriptorPool(dev, &dpci, nullptr, &dpool_) != VK_SUCCESS) {
@@ -262,16 +319,31 @@ bool VulkanNrdDenoiser::BuildDescriptorPool() {
         return false;
     }
 
-    std::array<VkDescriptorSetLayout, kSetRing> layouts;
-    for (auto& l : layouts) l = dset_layout_;
-    VkDescriptorSetAllocateInfo dsai{};
-    dsai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dsai.descriptorPool     = dpool_;
-    dsai.descriptorSetCount = kSetRing;
-    dsai.pSetLayouts        = layouts.data();
-    if (vkAllocateDescriptorSets(dev, &dsai, sets_) != VK_SUCCESS) {
-        LOG_ERROR("VulkanNrdDenoiser: vkAllocateDescriptorSets failed");
-        return false;
+    {
+        std::array<VkDescriptorSetLayout, kSetRing> layouts;
+        for (auto& l : layouts) l = dset_layout_;
+        VkDescriptorSetAllocateInfo dsai{};
+        dsai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsai.descriptorPool     = dpool_;
+        dsai.descriptorSetCount = kSetRing;
+        dsai.pSetLayouts        = layouts.data();
+        if (vkAllocateDescriptorSets(dev, &dsai, sets_) != VK_SUCCESS) {
+            LOG_ERROR("VulkanNrdDenoiser: vkAllocateDescriptorSets (temporal/atrous) failed");
+            return false;
+        }
+    }
+    {
+        std::array<VkDescriptorSetLayout, kFinalizeSetRing> layouts;
+        for (auto& l : layouts) l = finalize_dset_layout_;
+        VkDescriptorSetAllocateInfo dsai{};
+        dsai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsai.descriptorPool     = dpool_;
+        dsai.descriptorSetCount = kFinalizeSetRing;
+        dsai.pSetLayouts        = layouts.data();
+        if (vkAllocateDescriptorSets(dev, &dsai, finalize_sets_) != VK_SUCCESS) {
+            LOG_ERROR("VulkanNrdDenoiser: vkAllocateDescriptorSets (finalize) failed");
+            return false;
+        }
     }
     return true;
 }
@@ -356,6 +428,8 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                                TextureHandle   motion_in,
                                TextureHandle   normal_in,
                                TextureHandle   output,
+                               TextureHandle   final_output,
+                               BufferHandle    exposure_state,
                                bool            reset_history,
                                bool            atrous_enabled) {
     if (!ready_) return;
@@ -481,6 +555,84 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
         StageBarrier(cb,
                      VK_PIPELINE_STAGE_TRANSFER_BIT,        VK_ACCESS_TRANSFER_WRITE_BIT,
                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,  VK_ACCESS_SHADER_READ_BIT);
+    }
+
+    // ---- Finalize: HDR -> ACES + sRGB -> swapchain --------------------
+    // Both atrous and basic paths leave the linear-HDR result in
+    // `output` (and the basic path also issued a transfer->compute
+    // barrier already, which double-covers as our finalize-read
+    // barrier; in the atrous path the last ComputeChainBarrier covers
+    // it). We dispatch DenoiseFinalize only when the caller supplied
+    // a final_output target and an exposure_state buffer -- both
+    // required for the kernel's bindings. Skipping the dispatch when
+    // either is missing keeps the code defensive against a partially-
+    // wired caller (the engine fills both today).
+    if (final_output.id != 0 && exposure_state.id != 0) {
+        VkImageView v_final = device_->LookupImageView(final_output);
+        VkBuffer    b_exp   = device_->LookupBuffer(exposure_state);
+        if (v_final != VK_NULL_HANDLE && b_exp != VK_NULL_HANDLE) {
+            VkDescriptorSet fset = finalize_sets_[next_finalize_set_];
+            next_finalize_set_ = (next_finalize_set_ + 1) % kFinalizeSetRing;
+
+            VkDescriptorImageInfo  ii[2] {};
+            VkDescriptorBufferInfo bi    {};
+            VkWriteDescriptorSet   w[3]  {};
+
+            ii[0].imageView   = v_output;
+            ii[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            ii[1].imageView   = v_final;
+            ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            bi.buffer = b_exp;
+            bi.offset = 0;
+            bi.range  = VK_WHOLE_SIZE;
+
+            for (int i = 0; i < 3; ++i) {
+                w[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                w[i].dstSet          = fset;
+                w[i].dstBinding      = i;
+                w[i].descriptorCount = 1;
+            }
+            w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            w[0].pImageInfo     = &ii[0];
+            w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            w[1].pImageInfo     = &ii[1];
+            w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            w[2].pBufferInfo    = &bi;
+
+            vkUpdateDescriptorSets(device_->RawDevice(), 3, w, 0, nullptr);
+
+            // Atrous path's last pass left the chain barrier in place,
+            // so the read of `output` is already covered. Basic path
+            // emitted a transfer->compute barrier on the same image.
+            // Both reach this dispatch with the source image visible
+            // for shader read.
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, finalize_pipe_);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    finalize_pipe_layout_, 0, 1, &fset, 0, nullptr);
+
+            struct FinalizePush {
+                std::uint32_t width;
+                std::uint32_t height;
+                std::uint32_t pad0;
+                std::uint32_t pad1;
+            } fp{};
+            fp.width  = cached_w_;
+            fp.height = cached_h_;
+            vkCmdPushConstants(cb, finalize_pipe_layout_,
+                               VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                               sizeof(fp), &fp);
+            vkCmdDispatch(cb, gx, gy, 1);
+
+            // Compute->compute barrier so any subsequent dispatch
+            // (perfoverlay etc.) reading the swapchain image sees the
+            // tonemapped result.
+            ComputeChainBarrier(cb);
+        } else {
+            LOG_WARN("VulkanNrdDenoiser::Encode: finalize lookup miss "
+                     "(final_view={} exp_buf={})",
+                     reinterpret_cast<void*>(v_final),
+                     reinterpret_cast<void*>(b_exp));
+        }
     }
 
     if (!effective_reset) {

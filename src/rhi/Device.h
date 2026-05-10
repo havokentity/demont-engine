@@ -112,7 +112,24 @@ public:
         // (handle may be 0 on Metal). Engine writes it from the path
         // tracer's primary-ray pass when denoiser_enabled.
         TextureHandle normal_in;
-        TextureHandle output;         // typically the swapchain image
+        // Linear-HDR target the denoiser writes to. On Mac/MetalFX this
+        // is the post_denoise_hdr intermediate that the Tonemap pipeline
+        // reads. On Vulkan with SVGF/NRD it's the same intermediate, but
+        // the denoiser also runs its own DenoiseFinalize pass that
+        // reads from `output` and writes the tonemapped LDR result into
+        // `final_output` (typically the swapchain).
+        TextureHandle output;
+        // Vulkan SVGF/NRD only: tonemapped-LDR target the denoiser's
+        // finalize pass writes (typically the swapchain image). Ignored
+        // by MetalFX -- the engine's separate Tonemap dispatch reads
+        // `output` and writes the swapchain there. May be 0 on Metal.
+        TextureHandle final_output;
+        // Vulkan SVGF/NRD only: GPU-side exposure scalar buffer
+        // (AutoExposure.slang updates it / engine seeds it). The
+        // finalize pass reads exposure_state[0] to apply the same
+        // exposure the path tracer's inline tonemap would have used.
+        // MetalFX ignores it.
+        BufferHandle  exposure_state;
         float jitter_x       = 0.0f;
         float jitter_y       = 0.0f;
         bool  reset_history  = false; // true on backend switch / scene reset

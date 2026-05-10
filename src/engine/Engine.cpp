@@ -2205,6 +2205,15 @@ void Engine::RenderFrame() {
         // MetalFX writes to the linear-HDR intermediate; the tonemap
         // dispatch below converts that to sRGB and writes the swapchain.
         dd.output        = pt::rhi::TextureHandle{post_denoise_hdr_tex_id_};
+        // Vulkan SVGF/NRD finalize: reads `output` (linear HDR) and
+        // writes a tonemapped LDR result directly into the swapchain,
+        // bypassing the engine's separate Tonemap pipeline (which isn't
+        // built on Vulkan yet -- see the comment at the pipeline build
+        // worker in VulkanDevice.cpp). MetalFX path ignores both fields
+        // because its existing Tonemap pipeline already handles the
+        // post-pass tonemap.
+        dd.final_output    = fc.swapchain_image;
+        dd.exposure_state  = pt::rhi::BufferHandle{exposure_state_id_};
         dd.jitter_x      = last_jitter_x_;
         dd.jitter_y      = last_jitter_y_;
         dd.reset_history = !prev_view_proj_valid_;

@@ -2435,7 +2435,9 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
         (d.quality == DenoiseDesc::Quality::Atrous);
     denoiser_->Encode(wrapped_cb_->Raw(),
                       d.color_in, d.depth_in, d.motion_in,
-                      d.normal_in, d.output, d.reset_history,
+                      d.normal_in, d.output,
+                      d.final_output, d.exposure_state,
+                      d.reset_history,
                       atrous_enabled);
 }
 
