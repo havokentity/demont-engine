@@ -124,8 +124,9 @@ private:
     VkPipeline            atrous_pipe_  = VK_NULL_HANDLE;
     VkDescriptorPool      dpool_        = VK_NULL_HANDLE;
     // DenoiseFinalize uses its own layout (2 storage images + 1
-    // storage buffer; different from the temporal/atrous 6-image
-    // layout) so it gets a parallel layout / pipeline / set ring.
+    // storage buffer; different from the temporal/atrous 8-image
+    // layout, which gained depth/normal history bindings 6/7 in
+    // PR #3) so it gets a parallel layout / pipeline / set ring.
     // Same VkDescriptorPool serves both since we sized it for a
     // mixed pool.
     VkDescriptorSetLayout finalize_dset_layout_ = VK_NULL_HANDLE;
@@ -151,8 +152,14 @@ private:
     std::uint64_t         normal_history_b_id_ = 0;
     std::uint64_t         atrous_a_id_  = 0;
     std::uint64_t         atrous_b_id_  = 0;
-    // 1x1 RGBA16F placeholder for the unused bindings in atrous passes.
-    // Allocated lazily; lives for the lifetime of the denoiser.
+    // 1x1 placeholders for the temporal/atrous bindings the active
+    // shader doesn't read but the descriptor set still requires:
+    //   dummy_color_id_  -- RGBA16F, plugs slot 1 (color_history_in)
+    //                       on atrous passes.
+    //   dummy_motion_id_ -- RG16F,   plugs slot 3 (motion_in) on
+    //                       atrous passes (matches the shader's
+    //                       declared float2 storage image format).
+    // Allocated once at Init(); live for the denoiser's lifetime.
     std::uint64_t         dummy_color_id_  = 0;
     std::uint64_t         dummy_motion_id_ = 0;
 

@@ -8,6 +8,7 @@
 
 #include <array>
 #include <cstring>
+#include <vector>
 
 extern "C" {
 extern const unsigned char shader_DenoiseTemporal_spirv_data[];
@@ -24,10 +25,25 @@ namespace {
 
 VkShaderModule MakeModule(VkDevice dev,
                           const unsigned char* bytes, std::size_t n) {
+    // VkShaderModuleCreateInfo::pCode requires 4-byte-aligned SPIR-V
+    // words. The embedded SPIR-V blobs come from EmbedFile.cmake as
+    // `const unsigned char[]` -- byte-aligned by the C++ standard.
+    // Casting to `const uint32_t*` is undefined behavior if the array
+    // happened to land on a non-4-byte boundary (and would trap on
+    // strict-alignment archs / be flagged by UBSan). Side-step it by
+    // memcpying into an aligned `std::vector<uint32_t>` before handing
+    // pCode to the driver. SPIR-V is always a multiple of 4 bytes, so
+    // the size check is also a sanity gate against a corrupt blob.
+    if (n == 0 || (n % sizeof(std::uint32_t)) != 0) {
+        LOG_ERROR("MakeModule: invalid SPIR-V byte length {} (must be >0 and 4-aligned)", n);
+        return VK_NULL_HANDLE;
+    }
+    std::vector<std::uint32_t> aligned(n / sizeof(std::uint32_t));
+    std::memcpy(aligned.data(), bytes, n);
     VkShaderModuleCreateInfo ci{};
     ci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     ci.codeSize = n;
-    ci.pCode    = reinterpret_cast<const std::uint32_t*>(bytes);
+    ci.pCode    = aligned.data();
     VkShaderModule m = VK_NULL_HANDLE;
     if (vkCreateShaderModule(dev, &ci, nullptr, &m) != VK_SUCCESS) return VK_NULL_HANDLE;
     return m;
@@ -742,13 +758,11 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
         }
     }
 
-    if (!effective_reset) {
-        frame_parity_ ^= 1u;
-    } else {
-        // After a reset, history_write holds this frame's noisy stamp.
-        // Advance parity so the next frame's temporal pass reads it.
-        frame_parity_ ^= 1u;
-    }
+    // Advance parity unconditionally. Reset path: history_write now
+    // holds this frame's noisy stamp, and next frame's temporal pass
+    // reads it as the prior history. Non-reset path: standard
+    // ping-pong roll. Both cases want a single XOR.
+    frame_parity_ ^= 1u;
 }
 
 }  // namespace pt::rhi::vk

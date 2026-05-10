@@ -2206,12 +2206,16 @@ void Engine::RenderFrame() {
         // dispatch below converts that to sRGB and writes the swapchain.
         dd.output        = pt::rhi::TextureHandle{post_denoise_hdr_tex_id_};
         // Vulkan SVGF/NRD finalize: reads `output` (linear HDR) and
-        // writes a tonemapped LDR result directly into the swapchain,
-        // bypassing the engine's separate Tonemap pipeline (which isn't
-        // built on Vulkan yet -- see the comment at the pipeline build
-        // worker in VulkanDevice.cpp). MetalFX path ignores both fields
-        // because its existing Tonemap pipeline already handles the
-        // post-pass tonemap.
+        // writes a tonemapped LDR result directly into the swapchain.
+        // The engine's separate Tonemap pipeline isn't built on Vulkan
+        // yet (its push struct exceeds the 256B native push-constant
+        // limit and would need the same spill-to-UBO machinery PtPush
+        // uses -- deferred). On Vulkan the bloom + tonemap chain below
+        // is gated on `tonemap_pipeline_id_ != 0`, so it's skipped and
+        // DenoiseFinalize is the authoritative swapchain writer. The
+        // MetalFX path ignores both fields here because its Tonemap
+        // pipeline IS built and handles the post-pass tonemap (and
+        // bloom + lens flare) the usual way.
         dd.final_output    = fc.swapchain_image;
         dd.exposure_state  = pt::rhi::BufferHandle{exposure_state_id_};
         dd.jitter_x      = last_jitter_x_;
@@ -2241,6 +2245,15 @@ void Engine::RenderFrame() {
         dd.view_to_clip  = glm::value_ptr(proj);
         device_->Denoise(dd);
 
+        // Vulkan-only: when the engine's Tonemap pipeline isn't
+        // built (it isn't, today), skip the entire bloom + tonemap
+        // chain. The Denoise() call above already wrote the
+        // swapchain via DenoiseFinalize; the dispatches below would
+        // all no-op via id=0 lookups but still cost CPU time on the
+        // descriptor-bind + push-constants setup. On Mac, the
+        // pipeline IS built and this branch runs the standard
+        // bloom-into-tonemap flow.
+        if (tonemap_pipeline_id_ != 0) {
         // Bloom pyramid: extract bright HDR pixels into bloom_mip[0]
         // (with luminance threshold), then progressively downsample
         // through the chain, then upsample additively back up to mip
@@ -2467,6 +2480,7 @@ void Engine::RenderFrame() {
 
         cb->PushConstants(&tp, sizeof(tp));
         cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
+        }  // end: if (tonemap_pipeline_id_ != 0)
     }
 
     // RHI-mode perf overlay: final compute pass that composites a panel
