@@ -2011,7 +2011,19 @@ void Engine::RenderFrame() {
         float hdri_lights_dir[Engine::kMaxHdriLights][4];
         float hdri_lights_col[Engine::kMaxHdriLights][4];
         std::uint32_t hdri_lights_count;
-        std::uint32_t _hdri_pad[3];   // 16-byte align next field / Slang struct end
+        // 1 -> kernel writes normal_tex at primary hit, 0 -> skip. We
+        // already gate the entire G-buffer block on denoiser_enabled,
+        // but normal is only consumed by the SVGF chain (svgf_basic /
+        // svgf_atrous / nrd) and the OptiX AOV variants. For metalfx /
+        // optix_hdr / optix_temporal_hdr the engine doesn't allocate
+        // normal_tex_id_, so writing normal_tex[tid] would either be
+        // a robust-access no-op (Vulkan) or an unbound-texture write
+        // (Metal -- implementation defined). This flag lets the
+        // shader skip the write entirely, saving one RGBA16F write
+        // per pixel per frame on non-normal-consuming denoiser modes
+        // AND closing the unbound-write hole on Metal.
+        std::uint32_t write_normal_gbuffer;
+        std::uint32_t _hdri_pad[2];   // 16-byte align next field / Slang struct end
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -2032,6 +2044,15 @@ void Engine::RenderFrame() {
     push.prim_count    = static_cast<std::uint32_t>(primitives_.size());
     push.spp           = spp;
     push.denoiser_enabled = denoiser_active_ ? 1u : 0u;
+    // Only the SVGF chain (svgf_basic / svgf_atrous / nrd) and the
+    // OptiX AOV variants consume normal_tex. Other denoisers (metalfx,
+    // plain optix_hdr, optix_temporal_hdr) don't, and the engine
+    // doesn't allocate normal_tex_id_ for them -- so the kernel must
+    // not write to an unbound slot. denoiser_active_ alone isn't
+    // enough; tie the gate to whether the engine actually owns a
+    // normal G-buffer this frame.
+    push.write_normal_gbuffer =
+        (denoiser_active_ && normal_tex_id_ != 0) ? 1u : 0u;
     push.env_map_present  = (env_map_tex_id_ != 0) ? 1u : 0u;
     {
         float intensity = 1.0f;

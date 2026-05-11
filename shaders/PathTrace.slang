@@ -81,7 +81,7 @@ Texture2D<float4> moon_map;
 #endif
 
 // G-buffer: world-space normal at primary hit. Written when
-// denoiser_enabled != 0. Consumed by:
+// denoiser_enabled != 0 AND write_normal_gbuffer != 0. Consumed by:
 //   - Vulkan SVGF/NRD chain for edge-aware temporal + spatial filtering
 //     (DenoiseTemporal disocclusion rejection, DenoiseAtrous normal
 //     weight in the wavelet kernel).
@@ -89,12 +89,11 @@ Texture2D<float4> moon_map;
 //     cross-compiled to MSL, same edge-aware behaviour.
 //   - OptiX AOV models (HdrAov / TemporalHdrAov) as the normal guide
 //     layer.
-// MetalFX itself doesn't read it; when r_denoiser is metalfx the engine
-// still allocates / binds normal_tex_id_ = 0, and the per-pixel write
-// here is gated on denoiser_enabled so a no-denoiser frame doesn't pay
-// for it either. Sky pixels (no hit) write float3(0) so the SVGF /
-// atrous edge-stops treat them as "no surface" and skip the normal
-// weight.
+// MetalFX / plain OptiX HDR don't read it -- the engine drops
+// write_normal_gbuffer to 0 for those modes (and doesn't allocate
+// normal_tex_id_), so the per-pixel write below skips entirely. Sky
+// pixels (no hit) write float3(0) so the SVGF / atrous edge-stops
+// treat them as "no surface" and skip the normal weight.
 [[vk::binding(16, 0)]] RWTexture2D<float4> normal_tex;
 
 // G-buffer: linear-RGB albedo at primary hit. Written when
@@ -237,7 +236,13 @@ cbuffer Push {
     float4 hdri_lights_dir[8];
     float4 hdri_lights_col[8];
     uint   hdri_lights_count;
-    uint   _hdri_pad0;
+    // 1 -> write normal_tex at primary hit, 0 -> skip. The engine
+    // sets this based on whether the active denoiser kind consumes
+    // normals (svgf_basic / svgf_atrous / nrd / optix_*_aov) AND has
+    // allocated a normal G-buffer this frame. On modes that don't
+    // need it (metalfx, plain optix_hdr / optix_temporal_hdr) the
+    // texture isn't bound, so the kernel MUST skip the write.
+    uint   write_normal_gbuffer;
     uint   _hdri_pad1;
     uint   _hdri_pad2;
 #endif  // !PT_TARGET_SPIRV
@@ -268,7 +273,9 @@ cbuffer Frame {
     float4 hdri_lights_dir[8];
     float4 hdri_lights_col[8];
     uint   hdri_lights_count;
-    uint   _hdri_pad0;
+    // See the matching field in the Metal Push cbuffer above for
+    // semantics. 1 -> write normal_tex, 0 -> skip.
+    uint   write_normal_gbuffer;
     uint   _hdri_pad1;
     uint   _hdri_pad2;
 };
@@ -1119,13 +1126,17 @@ void main(uint2 tid : SV_DispatchThreadID) {
 
         depth_tex[tid]  = depth_view;
         motion_tex[tid] = motion;
-        // Normal G-buffer: declared unconditionally above. On Metal
-        // builds the engine binds normal_tex_id_ at slot 8 only when
-        // r_denoiser is one of svgf_basic / svgf_atrous (the SVGF
-        // chain that consumes it); for r_denoiser=metalfx or =off the
-        // slot is bound to a 1x1 placeholder so this write goes to a
-        // harmless target rather than an unbound texture.
-        normal_tex[tid] = float4(hit_normal, 0.0);
+        // Normal G-buffer: only written when the active denoiser
+        // actually consumes it (SVGF + OptiX AOV variants). The engine
+        // doesn't allocate or bind normal_tex_id_ for metalfx / plain
+        // optix_hdr / optix_temporal_hdr, so an unconditional write
+        // here would hit an unbound texture on Metal and rely on
+        // robust-buffer-access for a no-op on Vulkan -- the explicit
+        // gate is cleaner on both and saves one RGBA16F write per
+        // pixel per frame on non-normal-consuming modes.
+        if (write_normal_gbuffer != 0u) {
+            normal_tex[tid] = float4(hit_normal, 0.0);
+        }
 #ifdef PT_TARGET_SPIRV
         // Albedo G-buffer: only allocated/bound by the engine when
         // r_denoiser is optix_hdr_aov. In other modes binding 17 is a
