@@ -3,6 +3,7 @@
 add_library(pt_rhi_metal STATIC
     MetalDevice.cpp
     MetalFXDenoiser.mm
+    MetalSvgfDenoiser.cpp
 )
 
 target_include_directories(pt_rhi_metal PUBLIC ${CMAKE_SOURCE_DIR}/src)
@@ -71,6 +72,27 @@ pt_compile_slang(
 pt_compile_slang(
     TARGET  pt_rhi_metal
     SOURCE  ${CMAKE_SOURCE_DIR}/shaders/PerfOverlay.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+)
+# SVGF denoiser (svgf_basic / svgf_atrous on r_denoiser). Same Slang
+# sources the Vulkan backend uses; slangc cross-compiles them to MSL.
+# DenoiseFinalize is NOT built on Metal -- the existing Tonemap pipeline
+# is the authoritative swapchain writer here (unlike Vulkan, whose
+# Tonemap pipeline isn't built and so needs DenoiseFinalize). The
+# Metal SVGF chain writes its result into post_denoise_hdr and the
+# normal post-denoise bloom + tonemap dispatch takes it from there.
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/DenoiseTemporal.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+)
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/DenoiseAtrous.slang
     STAGE   compute
     ENTRY   main
     TARGETS metal

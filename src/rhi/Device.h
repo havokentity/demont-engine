@@ -168,13 +168,15 @@ public:
         // The Vulkan backend looks at this to dispatch between
         // VulkanNrdDenoiser (Svgf -- in-house SVGF/atrous chain) and
         // VulkanOptixDenoiser (OptixHdr / OptixHdrAov -- NVIDIA OptiX
-        // via CUDA-Vulkan interop). MetalFX ignores it -- the Metal
-        // backend has only one denoiser path.
+        // via CUDA-Vulkan interop). The Metal backend looks at it to
+        // dispatch between MetalSvgfDenoiser (Svgf -- same Slang
+        // shaders the Vulkan path uses, cross-compiled to MSL) and
+        // MetalFX (Apple's MTLFXTemporalDenoisedScaler).
         //
-        // Defaults to Svgf so callers still pinned to the PR #2 API
-        // shape (Mac/MetalFX path, existing test fixtures) keep their
-        // behaviour. Engine sets this explicitly each frame from the
-        // active DenoiserKind cvar.
+        // Defaults to Svgf so callers pinned to the PR #2 API shape
+        // (existing test fixtures) keep their behaviour. Engine sets
+        // this explicitly each frame from the active DenoiserKind
+        // cvar.
         // OptixTemporalHdr / OptixTemporalHdrAov: same model family as
         // OptixHdr / OptixHdrAov but with an extra motion-vector flow
         // guide + a single-frame denoised-output history buffer fed
@@ -189,6 +191,7 @@ public:
             OptixHdrAov,
             OptixTemporalHdr,
             OptixTemporalHdrAov,
+            MetalFX,
         };
         Kind kind = Kind::Svgf;
         // Required by MetalFX TemporalDenoisedScaler. Column-major 4x4

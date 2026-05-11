@@ -293,11 +293,13 @@ private:
     bool                                        prev_view_proj_valid_  = false;
     bool                                        denoiser_active_       = false;
     // Which denoiser kind the active backend is running. metalfx is
-    // Mac-only; svgf_basic/svgf_atrous/nrd all route through the
-    // Vulkan VulkanNrdDenoiser today (real NRD library integration is
-    // deferred -- see Raytracer Plan/FOLLOW_UPS.md). Stored so the
-    // engine knows whether to allocate the normal G-buffer (only the
-    // Vulkan paths need it) and which one-time log to print.
+    // Mac-only; svgf_basic/svgf_atrous/nrd route through the in-house
+    // SVGF chain on EITHER backend -- VulkanNrdDenoiser on Vulkan,
+    // MetalSvgfDenoiser on Metal, both built from the same Slang
+    // sources. Real NRD library integration is deferred (see
+    // Raytracer Plan/FOLLOW_UPS.md). Stored so the engine knows
+    // whether to allocate the normal G-buffer (both Vulkan and Metal
+    // SVGF need it) and which one-time log to print.
     //
     //   SvgfBasic  = temporal accumulation only (no spatial filter)
     //   SvgfAtrous = temporal + 3-pass a-trous edge-aware filter

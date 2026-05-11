@@ -33,7 +33,26 @@
 // P11 environment map. RGBA32F lat-long HDR; sampled by ray direction
 // when env_map_present != 0. Used for both skybox visibility and
 // indirect lighting in one place (path tracing collapses skybox + IBL).
+//
+// Declared as Texture2D (read-only) on Metal and RWTexture2D on
+// Vulkan. The kernel only ever READS these three sample-only textures
+// (env_map / star_map / moon_map are CPU-uploaded once via
+// WriteTexture and never written from a kernel), so a read-only view
+// is the natural fit. On Metal the read-only view also matters: the
+// Apple Silicon compute pipeline caps read_write textures per kernel
+// at 8, and PathTrace would otherwise sit right at that limit
+// (output, accum_hdr, denoise_color, depth_tex, motion_tex, env_map,
+// star_map, moon_map). Moving env_map / star_map / moon_map off the
+// read_write quota frees room for normal_tex at binding 16, which the
+// SVGF denoiser needs. Vulkan keeps RWTexture2D because its descriptor
+// layout already wires these as STORAGE_IMAGE bindings -- switching to
+// SAMPLED_IMAGE there would cascade through VulkanDevice's pipeline
+// layout for no actual gain.
+#ifdef PT_TARGET_METAL
+Texture2D<float4> env_map;
+#else
 [[vk::binding(9, 0)]] RWTexture2D<float4> env_map;
+#endif
 
 // P11 MIS / NEE: precomputed CDFs over env_map luminance. marginal_cdf
 // is length H (one entry per row); conditional_cdf is length H*W
@@ -46,23 +65,37 @@
 // equatorial frame, rasterised once at startup from BSC5.dat. The host
 // pushes a per-frame world->J2000 rotation matrix; the shader samples
 // this texture additively when the sun is below the horizon.
+#ifdef PT_TARGET_METAL
+Texture2D<float4> star_map;
+#else
 [[vk::binding(12, 0)]] RWTexture2D<float4> star_map;
+#endif
 
 // Procedural moon surface texture, equirectangular RGBA16F generated
 // once at engine init by pt::moon::generateMoonTexture. Sampled in
 // moonDisc() to give the disc real mare + crater detail.
+#ifdef PT_TARGET_METAL
+Texture2D<float4> moon_map;
+#else
 [[vk::binding(13, 0)]] RWTexture2D<float4> moon_map;
+#endif
 
 // G-buffer: world-space normal at primary hit. Written when
-// denoiser_enabled != 0 by the SPIR-V/Vulkan path; the SVGF/NRD
-// denoiser samples it for edge-aware temporal+spatial filtering.
-// Gated to SPIR-V only -- on Metal/MSL the MetalFX denoiser doesn't
-// need surface normals, and adding the slot would cascade through
-// every other texture binding. Sky pixels (no hit) write float3(0)
-// to mark "no surface" so the denoiser falls back to a wider radius.
-#ifdef PT_TARGET_SPIRV
+// denoiser_enabled != 0. Consumed by:
+//   - Vulkan SVGF/NRD chain for edge-aware temporal + spatial filtering
+//     (DenoiseTemporal disocclusion rejection, DenoiseAtrous normal
+//     weight in the wavelet kernel).
+//   - Metal SVGF chain (svgf_basic / svgf_atrous) -- same shaders
+//     cross-compiled to MSL, same edge-aware behaviour.
+//   - OptiX AOV models (HdrAov / TemporalHdrAov) as the normal guide
+//     layer.
+// MetalFX itself doesn't read it; when r_denoiser is metalfx the engine
+// still allocates / binds normal_tex_id_ = 0, and the per-pixel write
+// here is gated on denoiser_enabled so a no-denoiser frame doesn't pay
+// for it either. Sky pixels (no hit) write float3(0) so the SVGF /
+// atrous edge-stops treat them as "no surface" and skip the normal
+// weight.
 [[vk::binding(16, 0)]] RWTexture2D<float4> normal_tex;
-#endif
 
 // G-buffer: linear-RGB albedo at primary hit. Written when
 // denoiser_enabled != 0 by the SPIR-V/Vulkan path; consumed by the
@@ -1086,13 +1119,23 @@ void main(uint2 tid : SV_DispatchThreadID) {
 
         depth_tex[tid]  = depth_view;
         motion_tex[tid] = motion;
-#ifdef PT_TARGET_SPIRV
+        // Normal G-buffer: declared unconditionally above. On Metal
+        // builds the engine binds normal_tex_id_ at slot 8 only when
+        // r_denoiser is one of svgf_basic / svgf_atrous (the SVGF
+        // chain that consumes it); for r_denoiser=metalfx or =off the
+        // slot is bound to a 1x1 placeholder so this write goes to a
+        // harmless target rather than an unbound texture.
         normal_tex[tid] = float4(hit_normal, 0.0);
+#ifdef PT_TARGET_SPIRV
         // Albedo G-buffer: only allocated/bound by the engine when
         // r_denoiser is optix_hdr_aov. In other modes binding 17 is a
         // null descriptor and this write is a no-op (Vulkan robust-
-        // buffer-access). Cheap unconditional write keeps the shader
-        // simple and avoids per-frame specialization-constant churn.
+        // buffer-access). Metal SVGF doesn't use albedo so the
+        // declaration stays SPIR-V-only -- adding a new texture slot
+        // on the Metal side has a real cost (MSL texture-index
+        // assignment cascades) and SVGF without an albedo guide
+        // matches the Vulkan svgf_basic / svgf_atrous behaviour
+        // exactly.
         albedo_tex[tid] = float4(hit_albedo, 0.0);
 #endif
     }

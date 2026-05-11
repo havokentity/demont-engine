@@ -113,15 +113,18 @@ namespace cvar {
     PT_CVAR(r_denoiser,        "off",
             "Denoiser. off = noisy 1-spp, accumulating image only. "
             "metalfx = Mac MetalFX TemporalDenoisedScaler (Apple Silicon "
-            "only). svgf_basic = Vulkan in-house temporal accumulation "
-            "only (no spatial filter, ~1.5 ms at 1080p; cleaner under "
-            "fast motion, slightly noisier on disocclusions). svgf_atrous "
-            "= svgf_basic + 3-pass a-trous edge-aware spatial filter "
-            "(~5 ms; cleaner on disocclusions, mild softening of micro "
-            "detail). nrd = same dispatch chain as svgf_atrous today; "
-            "reserved for the proper NVIDIA RayTracingDenoiser library "
-            "integration once that's wired up (see Raytracer "
-            "Plan/FOLLOW_UPS.md). optix_hdr = NVIDIA OptiX HDR denoiser "
+            "only). svgf_basic = in-house temporal accumulation only "
+            "(no spatial filter, ~1.5 ms at 1080p; cleaner under fast "
+            "motion, slightly noisier on disocclusions). Supported on "
+            "Vulkan and Metal -- same Slang sources cross-compiled to "
+            "each target. svgf_atrous = svgf_basic + 3-pass a-trous "
+            "edge-aware spatial filter (~5 ms; cleaner on disocclusions, "
+            "mild softening of micro detail). Supported on Vulkan and "
+            "Metal. nrd = same dispatch chain as svgf_atrous today on "
+            "both backends; reserved for the proper NVIDIA "
+            "RayTracingDenoiser library integration once that's wired "
+            "up on Vulkan (see Raytracer Plan/FOLLOW_UPS.md). optix_hdr "
+            "= NVIDIA OptiX HDR denoiser "
             "via CUDA-Vulkan interop (gated by build-time PT_ENABLE_OPTIX, "
             "auto-detected at configure when CUDA Toolkit + OptiX SDK are "
             "found; runtime gracefully falls back to off if the GPU/driver "
@@ -133,9 +136,10 @@ namespace cvar {
             "history; closes the per-frame flicker gap vs SVGF on static "
             "scenes while keeping OptiX's no-ghosting motion behaviour. "
             "optix_temporal_hdr_aov = optix_temporal_hdr + albedo+normal "
-            "AOV guides; the strongest OptiX variant. Mac builds ignore "
-            "the svgf_*/nrd/optix_* values; non-NVIDIA Vulkan builds "
-            "ignore optix_*.",
+            "AOV guides; the strongest OptiX variant. Mac builds accept "
+            "svgf_basic / svgf_atrous / nrd (in-house SVGF) and metalfx; "
+            "they ignore optix_*. Non-NVIDIA Vulkan builds ignore "
+            "optix_*; Vulkan builds ignore metalfx.",
             CVAR_ARCHIVE);
     PT_CVAR(r_hdr_pipeline,    "1",  "Linear-HDR pipeline through MetalFX. 1 = path tracer writes raw HDR, MetalFX denoises in HDR, post-pass applies exposure+ACES (recommended). 0 = path tracer pre-applies exposure+ACES, MetalFX denoises LDR, tonemap pass is a passthrough copy. Only affects the denoiser-on path.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom,           "1",  "HDR bloom (downsample/upsample pyramid, additive composite before ACES). 0 disables; tonemap then samples a 1x1 zero buffer.", CVAR_ARCHIVE);
@@ -1552,6 +1556,17 @@ void Engine::RenderFrame() {
         const auto& s = v->value;
         if (s == "metalfx" && current_backend_ == BackendType::Metal) {
             want_kind = DenoiserKind::MetalFX;
+        } else if (current_backend_ == BackendType::Metal) {
+            // SVGF on Metal: same in-house SVGF chain as Vulkan, same
+            // Slang sources cross-compiled to MSL. svgf_basic = temporal
+            // only; svgf_atrous = temporal + 3-pass a-trous. The `nrd`
+            // alias accepts the same value on Metal -- it falls through
+            // to svgf_atrous today, matching the Vulkan placeholder
+            // behaviour so a user's r_denoiser=nrd setting works on
+            // either backend.
+            if      (s == "svgf_basic")            want_kind = DenoiserKind::SvgfBasic;
+            else if (s == "svgf_atrous")           want_kind = DenoiserKind::SvgfAtrous;
+            else if (s == "nrd")                   want_kind = DenoiserKind::Nrd;
         } else if (current_backend_ == BackendType::Vulkan) {
             if      (s == "svgf_basic")            want_kind = DenoiserKind::SvgfBasic;
             else if (s == "svgf_atrous")           want_kind = DenoiserKind::SvgfAtrous;
@@ -2481,12 +2496,17 @@ void Engine::RenderFrame() {
                          ? pt::rhi::Device::DenoiseDesc::Quality::Basic
                          : pt::rhi::Device::DenoiseDesc::Quality::Atrous;
 
-        // Top-level Kind: tells the Vulkan backend whether to dispatch
-        // through VulkanNrdDenoiser (Svgf -- in-house SVGF chain) or
-        // VulkanOptixDenoiser (OptixHdr / OptixHdrAov / OptixTemporalHdr
-        // / OptixTemporalHdrAov). MetalFX ignores it. The svgf_basic /
-        // svgf_atrous / nrd values all collapse to Kind::Svgf -- they're
-        // tiers within the same backend impl.
+        // Top-level Kind: tells the backend which denoiser
+        // implementation to dispatch.
+        //   Vulkan: VulkanNrdDenoiser (Svgf) vs VulkanOptixDenoiser
+        //           (OptixHdr / OptixHdrAov / OptixTemporalHdr /
+        //           OptixTemporalHdrAov).
+        //   Metal:  MetalSvgfDenoiser (Svgf) vs MetalFX
+        //           (MTLFXTemporalDenoisedScaler).
+        // The svgf_basic / svgf_atrous / nrd values all collapse to
+        // Kind::Svgf -- they're tiers within the same backend impl
+        // and the Quality field below selects between basic (temporal
+        // only) and atrous (temporal + 3-pass a-trous).
         if (denoiser_kind_ == DenoiserKind::OptixHdr) {
             dd.kind = pt::rhi::Device::DenoiseDesc::Kind::OptixHdr;
         } else if (denoiser_kind_ == DenoiserKind::OptixTemporalHdr) {
@@ -2495,6 +2515,8 @@ void Engine::RenderFrame() {
             dd.kind = pt::rhi::Device::DenoiseDesc::Kind::OptixTemporalHdrAov;
         } else if (denoiser_kind_ == DenoiserKind::OptixHdrAov) {
             dd.kind = pt::rhi::Device::DenoiseDesc::Kind::OptixHdrAov;
+        } else if (denoiser_kind_ == DenoiserKind::MetalFX) {
+            dd.kind = pt::rhi::Device::DenoiseDesc::Kind::MetalFX;
         } else {
             dd.kind = pt::rhi::Device::DenoiseDesc::Kind::Svgf;
         }
