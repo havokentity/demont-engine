@@ -2238,7 +2238,13 @@ void Engine::RenderFrame() {
         push.hdri_lights_col[i][3] = 0.0f;
     }
     push.hdri_lights_count = (env_map_tex_id_ != 0) ? hdri_lights_count_ : 0u;
-    push._hdri_pad[0] = push._hdri_pad[1] = push._hdri_pad[2] = 0u;
+    // _hdri_pad and write_normal_gbuffer (which used to be _hdri_pad[0])
+    // are already zero-initialized by the `PtPush push{};` aggregate
+    // value-init at the top of the function. The defensive
+    // `push._hdri_pad[0..2] = 0u` line that used to live here did an
+    // out-of-bounds write when _hdri_pad shrank from [3] to [2] (since
+    // write_normal_gbuffer claimed the [0] slot); it has been removed.
+    // write_normal_gbuffer is set explicitly earlier in the function.
 
     // Sky mode resolution. "hdri" with no env map loaded falls back
     // to gradient so the shader doesn't read an unbound texture.
