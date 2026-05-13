@@ -22,6 +22,11 @@
 // MSL slot padding -- see Tonemap.slang's notice. Aligns Push to
 // MSL buffer(7) so the engine's universal push_slot=7 contract
 // is satisfied on every dispatch after PathTrace.
+//
+// Metal-only: the dummy types conflict with the shared Vulkan
+// pipeline layout (binding 6 is a storage image there, not a
+// StructuredBuffer). SPIR-V doesn't need the alignment trick.
+#ifdef PT_TARGET_METAL
 [[vk::binding(2, 0)]]  RaytracingAccelerationStructure _slot_tlas;
 [[vk::binding(3, 0)]]  StructuredBuffer<float>  _slot_mesh_positions;
 [[vk::binding(4, 0)]]  StructuredBuffer<uint>   _slot_mesh_indices;
@@ -29,6 +34,7 @@
 [[vk::binding(6, 0)]]  StructuredBuffer<float>  _slot_marginal_cdf;
 [[vk::binding(7, 0)]]  StructuredBuffer<float>  _slot_conditional_cdf;
 [[vk::binding(15, 0)]] RWStructuredBuffer<float> _slot_exposure_state;
+#endif
 
 [[vk::push_constant]]
 cbuffer Push {
@@ -67,7 +73,9 @@ void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= dst_dim.x || tid.y >= dst_dim.y) return;
 
     // Force Slang to emit the slot-padding bindings. See notice at
-    // top. Branch never taken at runtime.
+    // top. Branch never taken at runtime. Metal-only -- the dummies
+    // are SPIRV-gated out above.
+#ifdef PT_TARGET_METAL
     if (dst_dim.x == 0xDEADBEEFu) {
         let p = _slot_mesh_positions[0];
         let ii = _slot_mesh_indices[0];
@@ -77,6 +85,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
         let ex = _slot_exposure_state[0];
         dst[uint2(0, 0)] = float4(p, float(ii), q.x, mc + cc + ex);
     }
+#endif
 
     int2  sd  = int2(src_dim);
     // Centre this dst pixel's source position. dst is 2x larger than

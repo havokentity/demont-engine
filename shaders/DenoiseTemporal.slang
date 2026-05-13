@@ -117,7 +117,23 @@ void main(uint2 tid : SV_DispatchThreadID) {
     }
 
     float2 motion = motion_tex[tid];
-    float2 prev_pos = float2(tid) + motion;
+    // Pixel-center reprojection. PathTrace.slang's G-buffer pass writes
+    // motion = pre_pix - cur_pix where both pre_pix and cur_pix are
+    // pixel-CENTER coords (pixel i has center i + 0.5), because the
+    // unjittered primary ray is cast through (tid + 0.5) / dim. So the
+    // sample point in last frame's history is
+    //
+    //   pre_pix = cur_pix + motion = (tid + 0.5) + motion
+    //
+    // The `+ 0.5` was previously missing -- prev_pos landed on the
+    // pixel CORNER instead, which made the 2x2 bilinear sample below
+    // box-average the upper-left 2x2 neighborhood (samples at base,
+    // base+(1,0), base+(0,1), base+(1,1) with weights 0.25 each when
+    // frac collapses to 0.5). Over many frames of accumulation that
+    // bias drags content from upper-left toward lower-right of screen,
+    // producing the visible smudge in that direction that reproduced
+    // on both Vulkan and Metal.
+    float2 prev_pos = float2(tid) + 0.5 + motion;
     bool in_frame = prev_pos.x >= 0.0 && prev_pos.y >= 0.0
                   && prev_pos.x < float(width) && prev_pos.y < float(height);
 

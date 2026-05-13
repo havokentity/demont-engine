@@ -138,6 +138,26 @@ public:
         // exposure the path tracer's inline tonemap would have used.
         // MetalFX ignores it.
         BufferHandle  exposure_state;
+        // Vulkan SVGF/NRD only: bloom-pyramid mip 0 (half-res linear
+        // HDR). The DenoiseFinalize pass bilinear-samples this and
+        // adds it pre-tonemap so highlights get the same ACES squash.
+        // Disabled-bloom contract: the engine sets bloom_in = 0 and
+        // bloom_intensity = 0; VulkanNrdDenoiser then binds its own
+        // color_in_view as a safe-but-unread fallback at descriptor
+        // binding 3 (the layout requires a valid view) and forces the
+        // push intensity to 0 so the shader's gate short-circuits the
+        // sample. No 1x1 placeholder texture is created for this
+        // path. MetalFX ignores this -- Metal's bloom is mixed in
+        // Tonemap.slang after the denoise call returns (which uses
+        // the engine's bloom_dummy_tex_id_ 1x1 texture for *its* own
+        // disabled-bloom slot).
+        TextureHandle bloom_in;
+        // Vulkan SVGF/NRD only: linear blend factor of the bloom layer
+        // added on top of the HDR image before tonemap. Mirrors the
+        // r_bloom_intensity cvar. 0 = skip the bloom add entirely.
+        // MetalFX ignores it (Metal's Tonemap.slang has its own
+        // bloom_intensity in TonePush).
+        float         bloom_intensity = 0.0f;
         // Vulkan SVGF/NRD only: r_hdr_pipeline value (1 = path tracer
         // wrote raw linear HDR into color_in, denoiser finalize applies
         // ACES + sRGB; 0 = path tracer already tonemapped into color_in,
@@ -168,13 +188,15 @@ public:
         // The Vulkan backend looks at this to dispatch between
         // VulkanNrdDenoiser (Svgf -- in-house SVGF/atrous chain) and
         // VulkanOptixDenoiser (OptixHdr / OptixHdrAov -- NVIDIA OptiX
-        // via CUDA-Vulkan interop). MetalFX ignores it -- the Metal
-        // backend has only one denoiser path.
+        // via CUDA-Vulkan interop). The Metal backend looks at it to
+        // dispatch between MetalSvgfDenoiser (Svgf -- same Slang
+        // shaders the Vulkan path uses, cross-compiled to MSL) and
+        // MetalFX (Apple's MTLFXTemporalDenoisedScaler).
         //
-        // Defaults to Svgf so callers still pinned to the PR #2 API
-        // shape (Mac/MetalFX path, existing test fixtures) keep their
-        // behaviour. Engine sets this explicitly each frame from the
-        // active DenoiserKind cvar.
+        // Defaults to Svgf so callers pinned to the PR #2 API shape
+        // (existing test fixtures) keep their behaviour. Engine sets
+        // this explicitly each frame from the active DenoiserKind
+        // cvar.
         // OptixTemporalHdr / OptixTemporalHdrAov: same model family as
         // OptixHdr / OptixHdrAov but with an extra motion-vector flow
         // guide + a single-frame denoised-output history buffer fed
@@ -189,6 +211,7 @@ public:
             OptixHdrAov,
             OptixTemporalHdr,
             OptixTemporalHdrAov,
+            MetalFX,
         };
         Kind kind = Kind::Svgf;
         // Required by MetalFX TemporalDenoisedScaler. Column-major 4x4

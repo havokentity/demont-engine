@@ -11,6 +11,7 @@
 #include <QuartzCore/QuartzCore.hpp>
 
 #include "MetalDevice.h"
+#include "MetalSvgfDenoiser.h"
 #include "../core/Log.h"
 #include "../core/Memory/Memory.h"
 
@@ -320,6 +321,10 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
 
 MetalDevice::~MetalDevice() {
     cmd_.reset();
+    // Tear down the SVGF denoiser BEFORE we release device_ / queue_ /
+    // pipelines_ -- its textures + pipelines were allocated against
+    // device_ and need to release while it's still valid.
+    svgf_denoiser_.reset();
     if (metalfx_scaler_) { pt_metalfx_destroy(metalfx_scaler_); metalfx_scaler_ = nullptr; }
     {
         std::lock_guard lock(resource_mutex_);
@@ -357,6 +362,46 @@ void MetalDevice::Denoise(const DenoiseDesc& d) {
     }
     const std::uint32_t w = static_cast<std::uint32_t>(color_in->width());
     const std::uint32_t h = static_cast<std::uint32_t>(color_in->height());
+
+    // The compute encoder (if any) must be ended first since both the
+    // MetalFX scaler and our SVGF chain create their own encoders.
+    cmd_->FlushEncoder();
+
+    if (d.kind == DenoiseDesc::Kind::Svgf) {
+        // In-house SVGF / atrous chain. normal_in is required (the
+        // engine allocates it whenever r_denoiser is svgf_*). The
+        // shaders treat a zero-normal sentinel as "no surface" so a
+        // missing normal isn't catastrophic, but the spatial filter
+        // would lose its normal-weighted edge stop.
+        auto* normal_in = LookupTexture(d.normal_in);
+        if (normal_in == nullptr) {
+            LOG_WARN("MetalDevice::Denoise(svgf): normal_in is null -- engine "
+                     "should allocate normal_tex for r_denoiser=svgf_*");
+            return;
+        }
+        if (!svgf_denoiser_) {
+            svgf_denoiser_ = std::make_unique<MetalSvgfDenoiser>(this);
+            if (!svgf_denoiser_->Init()) {
+                LOG_ERROR("MetalSvgfDenoiser::Init() failed");
+                svgf_denoiser_.reset();
+                return;
+            }
+        }
+        if (!svgf_denoiser_->ResizeTextures(w, h)) {
+            LOG_ERROR("MetalSvgfDenoiser::ResizeTextures({}x{}) failed", w, h);
+            return;
+        }
+        const bool atrous_enabled =
+            (d.quality == DenoiseDesc::Quality::Atrous);
+        svgf_denoiser_->Encode(cmd_->RawCmdBuf(),
+                                color_in, depth_in, motion_in, normal_in,
+                                color_out,
+                                d.reset_history, atrous_enabled);
+        return;
+    }
+
+    // MetalFX path (Kind::MetalFX, or any backwards-compat caller that
+    // left kind defaulted on Metal -- the engine sets it explicitly).
     if (metalfx_scaler_ == nullptr ||
         metalfx_width_  != w ||
         metalfx_height_ != h) {
@@ -370,10 +415,6 @@ void MetalDevice::Denoise(const DenoiseDesc& d) {
         metalfx_height_ = h;
     }
 
-    // Encode the denoise pass on the SAME command buffer as the path
-    // tracer dispatch. The compute encoder (if any) must be ended first
-    // since MetalFX wants to attach its own encoders.
-    cmd_->FlushEncoder();
     pt_metalfx_encode(metalfx_scaler_,
                       static_cast<void*>(cmd_->RawCmdBuf()),
                       static_cast<void*>(color_in),

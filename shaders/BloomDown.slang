@@ -34,6 +34,12 @@
 // PathTrace's bindings (slots 1..6) drag along to every dispatch
 // after it. Dead branch below references them so Slang's optimizer
 // keeps them.
+//
+// Gated to Metal only: the dummy types (StructuredBuffer at binding 6
+// in particular) would collide with the shared Vulkan layout, which
+// has binding 6 as a storage IMAGE (denoise_color in the path tracer).
+// SPIR-V doesn't need the slot-alignment trick anyway.
+#ifdef PT_TARGET_METAL
 [[vk::binding(2, 0)]]  RaytracingAccelerationStructure _slot_tlas;
 [[vk::binding(3, 0)]]  StructuredBuffer<float>  _slot_mesh_positions;
 [[vk::binding(4, 0)]]  StructuredBuffer<uint>   _slot_mesh_indices;
@@ -41,6 +47,7 @@
 [[vk::binding(6, 0)]]  StructuredBuffer<float>  _slot_marginal_cdf;
 [[vk::binding(7, 0)]]  StructuredBuffer<float>  _slot_conditional_cdf;
 [[vk::binding(15, 0)]] RWStructuredBuffer<float> _slot_exposure_state;
+#endif
 
 [[vk::push_constant]]
 cbuffer Push {
@@ -81,6 +88,8 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // Force Slang to emit the slot-padding bindings (see notice at
     // top). Branch never taken at runtime; Slang can't statically
     // prove dst_dim.x != 0xDEADBEEFu so it survives optimization.
+    // Metal-only -- the dummies are SPIRV-gated out above.
+#ifdef PT_TARGET_METAL
     if (dst_dim.x == 0xDEADBEEFu) {
         let p = _slot_mesh_positions[0];
         let ii = _slot_mesh_indices[0];
@@ -90,6 +99,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
         let ex = _slot_exposure_state[0];
         dst[uint2(0, 0)] = float4(p, float(ii), q.x, mc + cc + ex);
     }
+#endif
 
     int2  sd = int2(src_dim);
     // Source position for this dst pixel's CENTRE: dst is half-res of

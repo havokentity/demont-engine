@@ -46,16 +46,39 @@
 // added pre-tonemap so it gets ACES-curve-compressed alongside the
 // rest of the image. Always bound; the engine zero-fills it (or
 // passes a 1x1 dummy) when r_bloom = 0 and bloom_intensity = 0.
-[[vk::binding(2, 0)]] RWTexture2D<float4> bloom_tex;
+//
+// Bound at engine slot 2 -> shader vk::binding 6 on Vulkan (a storage
+// image slot in the shared 17-binding pipeline layout) -- so this
+// pipeline can re-use the same descriptor set layout the path tracer
+// builds. On Metal, Slang assigns texture indices in declaration
+// order regardless of the vk::binding number, so the kernel still
+// sees bloom_tex at [[texture(2)]] which matches the engine's
+// BindStorageTexture(2, ...) call.
+[[vk::binding(6, 0)]] RWTexture2D<float4> bloom_tex;
 
 // --- buffer slot padding to push exposure_state to MSL buf(6) and
 //     Push (cbuffer) to MSL buf(7) ----------------------------------
-[[vk::binding(4, 0)]]  RaytracingAccelerationStructure _slot_tlas;        // buf(0)
-[[vk::binding(5, 0)]]  StructuredBuffer<float>  _slot_mesh_positions;     // buf(1)
-[[vk::binding(6, 0)]]  StructuredBuffer<uint>   _slot_mesh_indices;       // buf(2)
-[[vk::binding(7, 0)]]  StructuredBuffer<float4> _slot_primitives;         // buf(3)
-[[vk::binding(8, 0)]]  StructuredBuffer<float>  _slot_marginal_cdf;       // buf(4)
-[[vk::binding(9, 0)]]  StructuredBuffer<float>  _slot_conditional_cdf;    // buf(5)
+//
+// Gated to Metal only: on Vulkan these dummy bindings would collide
+// with the shared 17-binding pipeline layout. MSL slot alignment is
+// the only reason these exist; SPIR-V doesn't need them.
+//
+// vk::binding numbers picked from the 18..23 range -- intentionally
+// out-of-band vs the shared layout (bindings 0..17) so even if Slang
+// ever starts cross-checking vk::binding on the MSL path, none of
+// these collide with a real Vulkan binding. The attribute itself is
+// ignored by Slang's MSL backend (Metal slot assignment is by
+// declaration order: _slot_tlas -> buf(0), _slot_mesh_positions ->
+// buf(1), ..., _slot_conditional_cdf -> buf(5), exposure_state below
+// -> buf(6), Push -> buf(7)).
+#ifdef PT_TARGET_METAL
+[[vk::binding(18, 0)]] RaytracingAccelerationStructure _slot_tlas;        // buf(0)
+[[vk::binding(19, 0)]] StructuredBuffer<float>  _slot_mesh_positions;     // buf(1)
+[[vk::binding(20, 0)]] StructuredBuffer<uint>   _slot_mesh_indices;       // buf(2)
+[[vk::binding(21, 0)]] StructuredBuffer<float4> _slot_primitives;         // buf(3)
+[[vk::binding(22, 0)]] StructuredBuffer<float>  _slot_marginal_cdf;       // buf(4)
+[[vk::binding(23, 0)]] StructuredBuffer<float>  _slot_conditional_cdf;    // buf(5)
+#endif
 
 // GPU-resident exposure scalar. Same buffer PathTrace.slang reads in
 // its inline tonemap path, written every frame by AutoExposure.slang
@@ -123,8 +146,31 @@ cbuffer Push {
     // Number of valid entries in ghosts[]. 0 = skip the physical loop.
     uint  physical_ghost_count;
     float2 _pad_phys;
+    // 48 bytes of padding to push the ghost array forward to host
+    // offset 112 (the Vulkan kPushSplitOffset boundary). On Vulkan
+    // only the first 112 bytes hit vkCmdPushConstants; bytes
+    // [112..624] (the ghost array) spill into the Frame UBO declared
+    // at vk::binding(14, 0) below. On Metal the whole 624-byte block
+    // goes through setBytes -- the padding is wasted but keeps a
+    // single host-side TonePush layout shared across both backends.
+    float4 _pad_to_push_split[3];
+#ifndef PT_TARGET_SPIRV
+    // Metal path: ghosts live in the push struct.
+    GhostShader ghosts[kPhysGhostMax];
+#endif
+};
+
+// SPIR-V path: ghosts live in the Frame UBO at binding 14. The
+// VulkanCommandBuffer's per-dispatch ring-UBO write copies the host
+// TonePush's tail (bytes [kPushSplitOffset..push_size]) into this
+// buffer, so `ghosts[i]` here reads the same data the Metal path
+// reads from the push struct's tail.
+#ifdef PT_TARGET_SPIRV
+[[vk::binding(14, 0)]]
+cbuffer Frame {
     GhostShader ghosts[kPhysGhostMax];
 };
+#endif
 
 float3 acesTonemap(float3 c) {
     // Narkowicz fit. Same constants as PathTrace.slang -- duplicated
@@ -173,6 +219,9 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // is the real texture width.  Slang can't statically prove
     // that at compile time, so the body survives optimisation and
     // every referenced declaration gets a real slot assignment.
+    // Metal-only: the dummy bindings are only declared on Metal,
+    // and SPIR-V doesn't need the alignment trick anyway.
+#ifdef PT_TARGET_METAL
     if (dim.x == 0xDEADBEEFu) {
         let p = _slot_mesh_positions[0];
         let i = _slot_mesh_indices[0];
@@ -182,6 +231,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
         ldr_out[uint2(0, 0)] = float4(p, float(i), q.x, m + c2);
         exposure_state[0] = p;
     }
+#endif
 
     float3 c = hdr_in[tid.xy].rgb;
 

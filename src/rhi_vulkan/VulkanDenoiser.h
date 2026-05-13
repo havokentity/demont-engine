@@ -78,9 +78,11 @@ public:
                 TextureHandle   depth_in,
                 TextureHandle   motion_in,
                 TextureHandle   normal_in,
-                TextureHandle   output,        // linear-HDR scratch
-                TextureHandle   final_output,  // tonemapped-LDR target (swapchain)
+                TextureHandle   output,         // linear-HDR scratch
+                TextureHandle   final_output,   // tonemapped-LDR target (swapchain)
                 BufferHandle    exposure_state,
+                TextureHandle   bloom_in,       // bloom mip 0 (id=0 -> bloom_intensity must be 0)
+                float           bloom_intensity,
                 bool            reset_history,
                 bool            atrous_enabled,
                 bool            hdr_pipeline);
@@ -104,6 +106,8 @@ public:
                             VkImageView    color_in_view,
                             VkImageView    final_output_view,
                             VkBuffer       exposure_state_buf,
+                            VkImageView    bloom_in_view,   // bloom mip 0 (placeholder if no bloom)
+                            float          bloom_intensity, // 0 = skip bloom add
                             std::uint32_t  width,
                             std::uint32_t  height,
                             bool           hdr_pipeline);

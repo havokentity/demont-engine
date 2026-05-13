@@ -72,7 +72,15 @@ private:
     MTL::ComputeCommandEncoder* encoder_    = nullptr;
 
     PipelineHandle             bound_pso_{0};
-    TextureHandle              bound_tex_[8] {};
+    // Texture slot map: large enough for every kernel's max engine slot.
+    // PathTrace tops at 9 (albedo_tex on the Vulkan OptiX-AOV path,
+    // never set on Metal, but we keep the same engine API). The SVGF
+    // denoise kernels declare 8 storage images at slots 0..7 (below 12
+    // by a wide margin). Bumped from 8 -> 12 so engine slot 8
+    // (normal_tex) isn't silently dropped on the Metal SVGF path; the
+    // original 8-slot limit was the only reason normal_tex was gated
+    // to PT_TARGET_SPIRV in the path tracer.
+    TextureHandle              bound_tex_[12] {};
     BufferHandle               bound_buf_[8] {};
     std::size_t                bound_buf_off_[8] {};
     AccelStructHandle          bound_accel_[4] {};
@@ -140,6 +148,9 @@ public:
     MTL::Buffer*               LookupBuffer(BufferHandle h);
     MTL::AccelerationStructure* LookupAccelStruct(AccelStructHandle h);
 
+    // Used by MetalSvgfDenoiser to build its own pipelines + textures.
+    MTL::Device* RawDevice() const { return device_; }
+
     // Mark all known acceleration structures as used by the current
     // encoder. Required because a TLAS internally references its BLASes
     // and Metal needs every one declared as a dependency on the encoder
@@ -179,6 +190,11 @@ private:
     void*         metalfx_scaler_   = nullptr;
     std::uint32_t metalfx_width_    = 0;
     std::uint32_t metalfx_height_   = 0;
+
+    // In-house SVGF (svgf_basic / svgf_atrous). Same Slang sources as
+    // the Vulkan backend, cross-compiled to MSL. Allocated lazily on
+    // first SVGF-mode Denoise() call.
+    std::unique_ptr<class MetalSvgfDenoiser> svgf_denoiser_;
 };
 
 }  // namespace pt::rhi::mtl

@@ -113,15 +113,18 @@ namespace cvar {
     PT_CVAR(r_denoiser,        "off",
             "Denoiser. off = noisy 1-spp, accumulating image only. "
             "metalfx = Mac MetalFX TemporalDenoisedScaler (Apple Silicon "
-            "only). svgf_basic = Vulkan in-house temporal accumulation "
-            "only (no spatial filter, ~1.5 ms at 1080p; cleaner under "
-            "fast motion, slightly noisier on disocclusions). svgf_atrous "
-            "= svgf_basic + 3-pass a-trous edge-aware spatial filter "
-            "(~5 ms; cleaner on disocclusions, mild softening of micro "
-            "detail). nrd = same dispatch chain as svgf_atrous today; "
-            "reserved for the proper NVIDIA RayTracingDenoiser library "
-            "integration once that's wired up (see Raytracer "
-            "Plan/FOLLOW_UPS.md). optix_hdr = NVIDIA OptiX HDR denoiser "
+            "only). svgf_basic = in-house temporal accumulation only "
+            "(no spatial filter, ~1.5 ms at 1080p; cleaner under fast "
+            "motion, slightly noisier on disocclusions). Supported on "
+            "Vulkan and Metal -- same Slang sources cross-compiled to "
+            "each target. svgf_atrous = svgf_basic + 3-pass a-trous "
+            "edge-aware spatial filter (~5 ms; cleaner on disocclusions, "
+            "mild softening of micro detail). Supported on Vulkan and "
+            "Metal. nrd = same dispatch chain as svgf_atrous today on "
+            "both backends; reserved for the proper NVIDIA "
+            "RayTracingDenoiser library integration once that's wired "
+            "up on Vulkan (see Raytracer Plan/FOLLOW_UPS.md). optix_hdr "
+            "= NVIDIA OptiX HDR denoiser "
             "via CUDA-Vulkan interop (gated by build-time PT_ENABLE_OPTIX, "
             "auto-detected at configure when CUDA Toolkit + OptiX SDK are "
             "found; runtime gracefully falls back to off if the GPU/driver "
@@ -133,9 +136,10 @@ namespace cvar {
             "history; closes the per-frame flicker gap vs SVGF on static "
             "scenes while keeping OptiX's no-ghosting motion behaviour. "
             "optix_temporal_hdr_aov = optix_temporal_hdr + albedo+normal "
-            "AOV guides; the strongest OptiX variant. Mac builds ignore "
-            "the svgf_*/nrd/optix_* values; non-NVIDIA Vulkan builds "
-            "ignore optix_*.",
+            "AOV guides; the strongest OptiX variant. Mac builds accept "
+            "svgf_basic / svgf_atrous / nrd (in-house SVGF) and metalfx; "
+            "they ignore optix_*. Non-NVIDIA Vulkan builds ignore "
+            "optix_*; Vulkan builds ignore metalfx.",
             CVAR_ARCHIVE);
     PT_CVAR(r_hdr_pipeline,    "1",  "Linear-HDR pipeline through MetalFX. 1 = path tracer writes raw HDR, MetalFX denoises in HDR, post-pass applies exposure+ACES (recommended). 0 = path tracer pre-applies exposure+ACES, MetalFX denoises LDR, tonemap pass is a passthrough copy. Only affects the denoiser-on path.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom,           "1",  "HDR bloom (downsample/upsample pyramid, additive composite before ACES). 0 disables; tonemap then samples a 1x1 zero buffer.", CVAR_ARCHIVE);
@@ -1552,6 +1556,17 @@ void Engine::RenderFrame() {
         const auto& s = v->value;
         if (s == "metalfx" && current_backend_ == BackendType::Metal) {
             want_kind = DenoiserKind::MetalFX;
+        } else if (current_backend_ == BackendType::Metal) {
+            // SVGF on Metal: same in-house SVGF chain as Vulkan, same
+            // Slang sources cross-compiled to MSL. svgf_basic = temporal
+            // only; svgf_atrous = temporal + 3-pass a-trous. The `nrd`
+            // alias accepts the same value on Metal -- it falls through
+            // to svgf_atrous today, matching the Vulkan placeholder
+            // behaviour so a user's r_denoiser=nrd setting works on
+            // either backend.
+            if      (s == "svgf_basic")            want_kind = DenoiserKind::SvgfBasic;
+            else if (s == "svgf_atrous")           want_kind = DenoiserKind::SvgfAtrous;
+            else if (s == "nrd")                   want_kind = DenoiserKind::Nrd;
         } else if (current_backend_ == BackendType::Vulkan) {
             if      (s == "svgf_basic")            want_kind = DenoiserKind::SvgfBasic;
             else if (s == "svgf_atrous")           want_kind = DenoiserKind::SvgfAtrous;
@@ -1996,7 +2011,19 @@ void Engine::RenderFrame() {
         float hdri_lights_dir[Engine::kMaxHdriLights][4];
         float hdri_lights_col[Engine::kMaxHdriLights][4];
         std::uint32_t hdri_lights_count;
-        std::uint32_t _hdri_pad[3];   // 16-byte align next field / Slang struct end
+        // 1 -> kernel writes normal_tex at primary hit, 0 -> skip. We
+        // already gate the entire G-buffer block on denoiser_enabled,
+        // but normal is only consumed by the SVGF chain (svgf_basic /
+        // svgf_atrous / nrd) and the OptiX AOV variants. For metalfx /
+        // optix_hdr / optix_temporal_hdr the engine doesn't allocate
+        // normal_tex_id_, so writing normal_tex[tid] would either be
+        // a robust-access no-op (Vulkan) or an unbound-texture write
+        // (Metal -- implementation defined). This flag lets the
+        // shader skip the write entirely, saving one RGBA16F write
+        // per pixel per frame on non-normal-consuming denoiser modes
+        // AND closing the unbound-write hole on Metal.
+        std::uint32_t write_normal_gbuffer;
+        std::uint32_t _hdri_pad[2];   // 16-byte align next field / Slang struct end
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -2017,6 +2044,15 @@ void Engine::RenderFrame() {
     push.prim_count    = static_cast<std::uint32_t>(primitives_.size());
     push.spp           = spp;
     push.denoiser_enabled = denoiser_active_ ? 1u : 0u;
+    // Only the SVGF chain (svgf_basic / svgf_atrous / nrd) and the
+    // OptiX AOV variants consume normal_tex. Other denoisers (metalfx,
+    // plain optix_hdr, optix_temporal_hdr) don't, and the engine
+    // doesn't allocate normal_tex_id_ for them -- so the kernel must
+    // not write to an unbound slot. denoiser_active_ alone isn't
+    // enough; tie the gate to whether the engine actually owns a
+    // normal G-buffer this frame.
+    push.write_normal_gbuffer =
+        (denoiser_active_ && normal_tex_id_ != 0) ? 1u : 0u;
     push.env_map_present  = (env_map_tex_id_ != 0) ? 1u : 0u;
     {
         float intensity = 1.0f;
@@ -2202,7 +2238,13 @@ void Engine::RenderFrame() {
         push.hdri_lights_col[i][3] = 0.0f;
     }
     push.hdri_lights_count = (env_map_tex_id_ != 0) ? hdri_lights_count_ : 0u;
-    push._hdri_pad[0] = push._hdri_pad[1] = push._hdri_pad[2] = 0u;
+    // _hdri_pad and write_normal_gbuffer (which used to be _hdri_pad[0])
+    // are already zero-initialized by the `PtPush push{};` aggregate
+    // value-init at the top of the function. The defensive
+    // `push._hdri_pad[0..2] = 0u` line that used to live here did an
+    // out-of-bounds write when _hdri_pad shrank from [3] to [2] (since
+    // write_normal_gbuffer claimed the [0] slot); it has been removed.
+    // write_normal_gbuffer is set explicitly earlier in the function.
 
     // Sky mode resolution. "hdri" with no env map loaded falls back
     // to gradient so the shader doesn't read an unbound texture.
@@ -2446,6 +2488,39 @@ void Engine::RenderFrame() {
     // textures the shader just wrote and outputs to the swapchain
     // (overwriting the shader's tonemapped fallback).
     if (denoiser_active_) {
+        // The engine-side Tonemap.slang post-denoise chain (bloom
+        // composite + ACES + lens flare + sRGB encode -> swapchain)
+        // currently only runs cleanly on Metal. Reasons:
+        //   - OptiX (Vulkan only): defers its actual denoise + copy-
+        //     into-d.output into a private cb submitted AFTER the
+        //     engine cb (CUDA sync model, see VulkanOptixDenoiser::
+        //     Encode's flow comment). So when the engine cb reaches
+        //     the Tonemap dispatch, post_denoise_hdr still holds the
+        //     PREVIOUS frame's OptiX output -- engine Tonemap would
+        //     tonemap a stale frame to the swapchain.
+        //   - SVGF/NRD on Vulkan: the dispatch reaches Tonemap.slang
+        //     fine, but the kernel produces a black swapchain on
+        //     PC (RTX 5090, validation-layer build pending). Not yet
+        //     root-caused -- likely a barrier / descriptor visibility
+        //     bug between SVGF's writes to post_denoise_hdr and the
+        //     Tonemap dispatch's reads via the shared 18-binding
+        //     UPDATE_AFTER_BIND descriptor set. Pending investigation;
+        //     for now Vulkan stays on the legacy DenoiseFinalize path
+        //     (bloom works, lens flare not yet wired). See follow-ups
+        //     in the commit message that disables this gate.
+        //   - SVGF/MetalFX on Mac: synchronous in the engine cb,
+        //     same descriptor model behaves correctly -- this is the
+        //     only platform where the chain runs today.
+        const bool kind_is_optix =
+            (denoiser_kind_ == DenoiserKind::OptixHdr            ||
+             denoiser_kind_ == DenoiserKind::OptixHdrAov         ||
+             denoiser_kind_ == DenoiserKind::OptixTemporalHdr    ||
+             denoiser_kind_ == DenoiserKind::OptixTemporalHdrAov);
+        const bool backend_is_metal =
+            (current_backend_ == pt::rhi::BackendType::Metal);
+        const bool use_engine_tonemap =
+            (tonemap_pipeline_id_ != 0 && !kind_is_optix && backend_is_metal);
+
         pt::rhi::Device::DenoiseDesc dd{};
         dd.color_in      = pt::rhi::TextureHandle{denoise_color_tex_id_};
         dd.depth_in      = pt::rhi::TextureHandle{depth_tex_id_};
@@ -2459,16 +2534,16 @@ void Engine::RenderFrame() {
         dd.output        = pt::rhi::TextureHandle{post_denoise_hdr_tex_id_};
         // Vulkan SVGF/NRD finalize: reads `output` (linear HDR) and
         // writes a tonemapped LDR result directly into the swapchain.
-        // The engine's separate Tonemap pipeline isn't built on Vulkan
-        // yet (its push struct exceeds the 256B native push-constant
-        // limit and would need the same spill-to-UBO machinery PtPush
-        // uses -- deferred). On Vulkan the bloom + tonemap chain below
-        // is gated on `tonemap_pipeline_id_ != 0`, so it's skipped and
-        // DenoiseFinalize is the authoritative swapchain writer. The
-        // MetalFX path ignores both fields here because its Tonemap
-        // pipeline IS built and handles the post-pass tonemap (and
-        // bloom + lens flare) the usual way.
-        dd.final_output    = fc.swapchain_image;
+        // ONLY when the engine's separate Tonemap.slang pipeline isn't
+        // built OR we can't safely chain it (OptiX, see above) -- when
+        // the engine WILL tonemap (Metal always for SVGF/MetalFX,
+        // Vulkan for SVGF/NRD via the push/UBO split), we tell the
+        // SVGF/NRD finalize step to skip its own swapchain write by
+        // passing final_output = 0. MetalFX doesn't have an internal
+        // finalize step so it ignores this field either way.
+        dd.final_output    = use_engine_tonemap
+                                 ? pt::rhi::TextureHandle{0}
+                                 : fc.swapchain_image;
         dd.exposure_state  = pt::rhi::BufferHandle{exposure_state_id_};
         dd.jitter_x      = last_jitter_x_;
         dd.jitter_y      = last_jitter_y_;
@@ -2481,12 +2556,17 @@ void Engine::RenderFrame() {
                          ? pt::rhi::Device::DenoiseDesc::Quality::Basic
                          : pt::rhi::Device::DenoiseDesc::Quality::Atrous;
 
-        // Top-level Kind: tells the Vulkan backend whether to dispatch
-        // through VulkanNrdDenoiser (Svgf -- in-house SVGF chain) or
-        // VulkanOptixDenoiser (OptixHdr / OptixHdrAov / OptixTemporalHdr
-        // / OptixTemporalHdrAov). MetalFX ignores it. The svgf_basic /
-        // svgf_atrous / nrd values all collapse to Kind::Svgf -- they're
-        // tiers within the same backend impl.
+        // Top-level Kind: tells the backend which denoiser
+        // implementation to dispatch.
+        //   Vulkan: VulkanNrdDenoiser (Svgf) vs VulkanOptixDenoiser
+        //           (OptixHdr / OptixHdrAov / OptixTemporalHdr /
+        //           OptixTemporalHdrAov).
+        //   Metal:  MetalSvgfDenoiser (Svgf) vs MetalFX
+        //           (MTLFXTemporalDenoisedScaler).
+        // The svgf_basic / svgf_atrous / nrd values all collapse to
+        // Kind::Svgf -- they're tiers within the same backend impl
+        // and the Quality field below selects between basic (temporal
+        // only) and atrous (temporal + 3-pass a-trous).
         if (denoiser_kind_ == DenoiserKind::OptixHdr) {
             dd.kind = pt::rhi::Device::DenoiseDesc::Kind::OptixHdr;
         } else if (denoiser_kind_ == DenoiserKind::OptixTemporalHdr) {
@@ -2495,6 +2575,8 @@ void Engine::RenderFrame() {
             dd.kind = pt::rhi::Device::DenoiseDesc::Kind::OptixTemporalHdrAov;
         } else if (denoiser_kind_ == DenoiserKind::OptixHdrAov) {
             dd.kind = pt::rhi::Device::DenoiseDesc::Kind::OptixHdrAov;
+        } else if (denoiser_kind_ == DenoiserKind::MetalFX) {
+            dd.kind = pt::rhi::Device::DenoiseDesc::Kind::MetalFX;
         } else {
             dd.kind = pt::rhi::Device::DenoiseDesc::Kind::Svgf;
         }
@@ -2513,70 +2595,137 @@ void Engine::RenderFrame() {
         // column-major, matching simd_float4x4 on the consumer end.
         dd.world_to_view = glm::value_ptr(view);
         dd.view_to_clip  = glm::value_ptr(proj);
-        device_->Denoise(dd);
 
-        // Vulkan-only: when the engine's Tonemap pipeline isn't
-        // built (it isn't, today), skip the entire bloom + tonemap
-        // chain. The Denoise() call above already wrote the
-        // swapchain via DenoiseFinalize; the dispatches below would
-        // all no-op via id=0 lookups but still cost CPU time on the
-        // descriptor-bind + push-constants setup. On Mac, the
-        // pipeline IS built and this branch runs the standard
-        // bloom-into-tonemap flow.
-        if (tonemap_pipeline_id_ != 0) {
-        // Bloom pyramid: extract bright HDR pixels into bloom_mip[0]
-        // (with luminance threshold), then progressively downsample
-        // through the chain, then upsample additively back up to mip
-        // 0. The result in mip 0 is sampled by the tonemap kernel
-        // and added pre-ACES so the bloom gets the same curve squash
-        // as the rest of the image.
-        bool bloom_on = false;
-        if (auto* v = C.FindCVar("r_bloom")) bloom_on = v->GetBool();
-        float bloom_thresh = 1.0f, bloom_intensity = 0.05f;
-        int   bloom_mips   = kBloomMips;
+        // Read bloom cvars up here so both the pre-Denoise (Vulkan)
+        // and post-Denoise (Metal) bloom chains share them.
+        bool  bloom_on        = false;
+        float bloom_thresh    = 1.0f;
+        float bloom_intensity = 0.05f;
+        int   bloom_mips_in   = kBloomMips;
+        if (auto* v = C.FindCVar("r_bloom"))           bloom_on        = v->GetBool();
         if (auto* v = C.FindCVar("r_bloom_threshold")) bloom_thresh    = v->GetFloat();
         if (auto* v = C.FindCVar("r_bloom_intensity")) bloom_intensity = v->GetFloat();
-        if (auto* v = C.FindCVar("r_bloom_mips"))      bloom_mips      = v->GetInt();
-        if (bloom_mips < 1) bloom_mips = 1;
-        if (bloom_mips > kBloomMips) bloom_mips = kBloomMips;
+        if (auto* v = C.FindCVar("r_bloom_mips"))      bloom_mips_in   = v->GetInt();
+        const int bloom_mips = std::clamp(bloom_mips_in, 1, kBloomMips);
+        float bloom_radius   = 1.0f;
+        if (auto* v = C.FindCVar("r_bloom_radius"))    bloom_radius    = v->GetFloat();
 
-        if (bloom_on && bloom_mip_tex_id_[0] != 0 && bloom_intensity > 0.0f) {
-            // Downsample chain: post_denoise_hdr -> mip0 (with
-            // threshold), mip0 -> mip1, ..., mip[N-2] -> mip[N-1].
+        // Bloom-pyramid dispatch helper. Reads from `source_tex_id`
+        // (which differs per backend -- see call sites) and builds
+        // bloom_mip[0..bloom_mips-1] via downsample (Karis-suppressed
+        // on the first mip for path-tracer firefly resilience) then
+        // upsample-add.
+        auto dispatch_bloom_pyramid = [&](std::uint64_t source_tex_id) {
+            // Downsample: source_tex -> mip0 (with threshold), then
+            // mip0 -> mip1 -> ... -> mip[N-1]. Each step's read of
+            // mip[i-1] is the previous step's write -- explicit
+            // compute_write -> compute_read barriers thread the RAW
+            // hazard chain so we don't race the prior dispatch's store.
+            // Metal's MetalCommandBuffer auto-barriers on shared
+            // resources so its Barrier() is a no-op; Vulkan needs the
+            // explicit emit (same pattern as the PathTrace -> autoexpose
+            // hand-off earlier in the frame).
             for (int i = 0; i < bloom_mips; ++i) {
+                if (i > 0) {
+                    cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                                 pt::rhi::BarrierDesc::Stage::ComputeRead});
+                }
                 cb->BindComputePipeline(pt::rhi::PipelineHandle{bloom_down_pipeline_id_});
                 pt::rhi::TextureHandle src_h{
-                    (i == 0) ? post_denoise_hdr_tex_id_ : bloom_mip_tex_id_[i - 1]};
+                    (i == 0) ? source_tex_id : bloom_mip_tex_id_[i - 1]};
                 pt::rhi::TextureHandle dst_h{bloom_mip_tex_id_[i]};
                 cb->BindStorageTexture(0, src_h);
                 cb->BindStorageTexture(1, dst_h);
                 struct DownPush { float threshold; float pad[3]; } dp{};
-                // Threshold only applies on the first mip; later mips
-                // are downsampling already-extracted bright pixels.
                 dp.threshold = (i == 0) ? bloom_thresh : 0.0f;
                 cb->PushConstants(&dp, sizeof(dp));
                 cb->Dispatch((bloom_mip_w_[i] + 7) / 8,
                              (bloom_mip_h_[i] + 7) / 8, 1);
             }
-            // Upsample chain: mip[N-1] -> mip[N-2] (additive),
-            // mip[N-2] -> mip[N-3], ..., mip 1 -> mip 0. Result
-            // accumulates into mip 0 which is the layer the tonemap
-            // pass samples. r_bloom_radius widens the per-mip
-            // sample spread for a softer halo.
-            float bloom_radius = 1.0f;
-            if (auto* v = C.FindCVar("r_bloom_radius")) bloom_radius = v->GetFloat();
+            // Upsample: mip[N-1] -> mip[N-2] (additive), ..., mip 1 -> mip 0.
+            // `dst[tid] = prev + tent` is read-modify-write so we also
+            // need the barrier between successive ups, plus one at the
+            // end so the consumer (DenoiseFinalize / Tonemap) sees the
+            // final mip[0] write.
             for (int i = bloom_mips - 1; i > 0; --i) {
+                cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                             pt::rhi::BarrierDesc::Stage::ComputeRead});
                 cb->BindComputePipeline(pt::rhi::PipelineHandle{bloom_up_pipeline_id_});
                 cb->BindStorageTexture(0, pt::rhi::TextureHandle{bloom_mip_tex_id_[i]});
                 cb->BindStorageTexture(1, pt::rhi::TextureHandle{bloom_mip_tex_id_[i - 1]});
-                // Renamed from `up` to `up_push` to avoid shadowing
-                // the function-scope `up = cam.Up()` camera vector.
                 struct UpPush { float radius; float pad[3]; } up_push{};
                 up_push.radius = bloom_radius;
                 cb->PushConstants(&up_push, sizeof(up_push));
                 cb->Dispatch((bloom_mip_w_[i - 1] + 7) / 8,
                              (bloom_mip_h_[i - 1] + 7) / 8, 1);
             }
+            cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                         pt::rhi::BarrierDesc::Stage::ComputeRead});
+        };
+        const bool bloom_can_run =
+            (bloom_on && bloom_intensity > 0.0f &&
+             bloom_mip_tex_id_[0] != 0 &&
+             bloom_down_pipeline_id_ != 0 && bloom_up_pipeline_id_ != 0);
+
+        // Vulkan-only: build the bloom pyramid BEFORE the Denoise()
+        // call so DenoiseFinalize (which runs inside Denoise() and is
+        // the authoritative swapchain writer on Vulkan today) can
+        // composite bloom_mip[0] pre-tonemap. Source = denoise_color
+        // (the path tracer's per-frame noisy 1-spp HDR). post_denoise_hdr
+        // doesn't exist yet at this point in the frame, and even on the
+        // Metal-tonemap path bloom samples from the input to the chain,
+        // not the SVGF output. BloomDown's first-mip Karis averaging is
+        // designed for noisy path-tracer input so the bloom layer reads
+        // clean after one downsample. Metal: bloom runs in the
+        // post-Denoise Tonemap.slang chain below, NOT here.
+        // Vulkan bloom is currently DISABLED. The eaaf7b4 design built a
+        // pre-Denoise bloom pyramid from denoise_color and passed
+        // bloom_mip[0] through DenoiseFinalize for the composite. On PC
+        // (RTX 5090) that path renders only the upper-left ~quarter of
+        // the swapchain when r_bloom = 1, with the rest of the swap
+        // showing a darkened version of an earlier pass -- looks like
+        // a descriptor / barrier issue between the shared 18-binding
+        // pipeline-layout's storage-image bindings 0/1 (which bloom_down
+        // re-binds to mip views) and the dispatches that bracket it
+        // (PathTrace inline tonemap before, DenoiseFinalize at the
+        // tail). The bug reproduces on eaaf7b4 too -- pre-existing,
+        // not caused by this branch. Until a validation-layer +
+        // RenderDoc capture pin it down, force the Vulkan bloom path
+        // off so the swap is rendered cleanly. r_bloom on Vulkan is
+        // a no-op (DenoiseFinalize sees bloom_in = 0 and the engine
+        // never runs the pyramid here); Metal's post-Denoise Tonemap
+        // chain is unaffected and continues to composite bloom as
+        // before.
+        (void)dispatch_bloom_pyramid;  // keep lambda alive for clarity / future re-enable
+        const bool vulkan_pre_denoise_bloom = false;
+        dd.bloom_in        = vulkan_pre_denoise_bloom
+                                 ? pt::rhi::TextureHandle{bloom_mip_tex_id_[0]}
+                                 : pt::rhi::TextureHandle{0};
+        dd.bloom_intensity = vulkan_pre_denoise_bloom ? bloom_intensity : 0.0f;
+
+        device_->Denoise(dd);
+
+        // Run the engine's bloom + tonemap chain only when we've told
+        // the denoiser path to defer the swapchain write to us (see
+        // use_engine_tonemap above). When tonemap isn't built (asset
+        // pipeline failure) or the active denoiser is OptiX (deferred
+        // private cb -- engine cb would tonemap STALE post_denoise_hdr),
+        // Denoise()'s own finalize wrote the swapchain and the
+        // dispatches below would just no-op or worse, race the OptiX
+        // private cb on the swapchain image.
+        if (use_engine_tonemap) {
+        // Bloom pyramid: extract bright HDR pixels into bloom_mip[0]
+        // (with luminance threshold), then progressively downsample
+        // through the chain, then upsample additively back up to mip
+        // 0. The result in mip 0 is sampled by the tonemap kernel
+        // and added pre-ACES so the bloom gets the same curve squash
+        // as the rest of the image. Metal-only here: bloom reads
+        // post_denoise_hdr (the SVGF/MetalFX output). Vulkan has
+        // already built its bloom pyramid above from denoise_color
+        // before the Denoise() call -- see the
+        // `vulkan_pre_denoise_bloom` branch up there.
+        if (bloom_can_run) {
+            dispatch_bloom_pyramid(post_denoise_hdr_tex_id_);
         }
 
         // Post-denoise tonemap: linear HDR -> exposure -> ACES -> sRGB
@@ -2691,9 +2840,27 @@ void Engine::RenderFrame() {
             std::uint32_t flare_mode_physical;
             std::uint32_t physical_ghost_count;
             float        _pad_phys_align[2];
+            // 48 bytes of padding to advance ghosts[] forward to host
+            // offset 112 -- the Vulkan push-constant split boundary
+            // (VulkanDevice::kPushSplitOffset). The first 112 bytes of
+            // this struct go to vkCmdPushConstants on the SPIR-V path;
+            // the remaining 512 bytes (the ghost array) spill into the
+            // Frame UBO at vk::binding(14, 0). With the array landing
+            // at exactly offset 112, the spill is bit-aligned to the
+            // shader-side Frame UBO declaration -- no per-byte
+            // shuffling. On Metal the whole 624-byte block goes
+            // through setBytes; the padding is dead weight (~0.05% of
+            // a frame's CPU push budget) but keeps a single host-side
+            // TonePush shape across both backends.
+            float        _pad_to_push_split[12];   // 12 * 4 = 48 bytes
             PtShaderGhost ghosts[lensflare::kMaxGhosts];
         } tp{};
         static_assert(sizeof(TonePush) % 16 == 0, "TonePush 16-byte aligned");
+        static_assert(sizeof(TonePush) == 624,
+                      "TonePush layout (ghosts must land at offset 112 "
+                      "for the SPIR-V push/UBO split)");
+        static_assert(offsetof(TonePush, ghosts) == 112,
+                      "ghosts[] must start at the Vulkan push-split boundary");
         // tp.exposure is now dead in the shader -- Tonemap.slang reads
         // exposure_state[0] from the bound buffer instead (matches
         // PathTrace.slang's inline tonemap path). The field stays in
@@ -2750,7 +2917,7 @@ void Engine::RenderFrame() {
 
         cb->PushConstants(&tp, sizeof(tp));
         cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
-        }  // end: if (tonemap_pipeline_id_ != 0)
+        }  // end: if (use_engine_tonemap)
     }
 
     // RHI-mode perf overlay: final compute pass that composites a panel

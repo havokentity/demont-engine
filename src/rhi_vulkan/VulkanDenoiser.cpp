@@ -248,12 +248,27 @@ bool VulkanNrdDenoiser::BuildLayout() {
         }
     }
 
-    // ---- finalize: 2 storage images + 1 storage buffer --------------
+    // ---- finalize: 3 storage images + 1 storage buffer --------------
+    // 0: hdr_in       (RGBA16F linear-HDR post-denoise)
+    // 1: swap_out     (BGRA8 swapchain)
+    // 2: exposure_state (storage buffer, written by AutoExposure.slang)
+    // 3: bloom_in     (RGBA16F bloom mip 0 when bloom is enabled).
+    //                  Disabled-bloom contract: the engine passes
+    //                  dd.bloom_in = 0 and dd.bloom_intensity = 0;
+    //                  Encode() / EncodeFinalizeOnly() bind v_output
+    //                  (color_in_view) as a safe-but-unread fallback
+    //                  and force the push's bloom_intensity to 0 so
+    //                  the shader's `bloom_intensity > 0` gate skips
+    //                  the sample. No 1x1 placeholder texture is
+    //                  required on this path (Tonemap.slang's slot 2
+    //                  path is a separate Mac-only contract that does
+    //                  use the engine's bloom_dummy_tex_id_).
     {
-        std::array<VkDescriptorSetLayoutBinding, 3> b{};
+        std::array<VkDescriptorSetLayoutBinding, 4> b{};
         b[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
         b[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
         b[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        b[3] = { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
         VkDescriptorSetLayoutCreateInfo dslci{};
         dslci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         dslci.bindingCount = static_cast<std::uint32_t>(b.size());
@@ -262,8 +277,8 @@ bool VulkanNrdDenoiser::BuildLayout() {
             LOG_ERROR("VulkanNrdDenoiser: finalize descriptor set layout failed");
             return false;
         }
-        // Finalize push: width, height + 8 bytes pad to keep the
-        // struct 16-byte aligned (Slang/SPIR-V cbuffer convention).
+        // Finalize push: width, height, hdr_pipeline, bloom_intensity.
+        // 4 x 4 bytes = 16 (16-byte aligned, std140-friendly).
         VkPushConstantRange pcr{};
         pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         pcr.offset     = 0;
@@ -324,13 +339,13 @@ bool VulkanNrdDenoiser::BuildDescriptorPool() {
 
     // Mixed pool sizing for both layouts:
     //   - kSetRing sets of (8 storage images) for temporal/atrous.
-    //   - kFinalizeSetRing sets of (2 storage images + 1 storage
-    //     buffer) for the finalize pass.
+    //   - kFinalizeSetRing sets of (3 storage images + 1 storage
+    //     buffer) for the finalize pass (the 3rd image is bloom_in).
     // Plus a small headroom on each type.
     std::array<VkDescriptorPoolSize, 2> ps{};
     ps[0].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     ps[0].descriptorCount = static_cast<std::uint32_t>(
-        kSetRing * 8 + kFinalizeSetRing * 2 + 4);
+        kSetRing * 8 + kFinalizeSetRing * 3 + 4);
     ps[1].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     ps[1].descriptorCount = static_cast<std::uint32_t>(kFinalizeSetRing * 1 + 2);
 
@@ -480,6 +495,8 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                                TextureHandle   output,
                                TextureHandle   final_output,
                                BufferHandle    exposure_state,
+                               TextureHandle   bloom_in,
+                               float           bloom_intensity,
                                bool            reset_history,
                                bool            atrous_enabled,
                                bool            hdr_pipeline) {
@@ -696,36 +713,63 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
     if (final_output.id != 0 && exposure_state.id != 0) {
         VkImageView v_final = device_->LookupImageView(final_output);
         VkBuffer    b_exp   = device_->LookupBuffer(exposure_state);
+        // Bloom is optional. If the caller didn't pass a bloom mip
+        // (id=0) OR the lookup misses OR bloom_intensity is zero, we
+        // still need to bind *something* at binding 3 because the
+        // descriptor set layout declares it. Fall back to v_output
+        // (any valid RGBA16F storage image) and force the effective
+        // intensity to zero in that case so the shader's
+        // `if (bloom_intensity > 0.0)` short-circuits the sample.
+        // Tracking `bloom_real` instead of keying intensity on
+        // bloom_in.id catches the corner case where the engine passes
+        // a non-zero handle but LookupImageView returns NULL_HANDLE
+        // (mid-resize, stale handle, etc.) -- without the gate the
+        // shader would sample v_output as its own bloom layer and
+        // produce a feedback-style artifact.
+        bool bloom_real = (bloom_in.id != 0);
+        VkImageView v_bloom = VK_NULL_HANDLE;
+        if (bloom_real) v_bloom = device_->LookupImageView(bloom_in);
+        if (v_bloom == VK_NULL_HANDLE) {
+            v_bloom    = v_output;
+            bloom_real = false;
+        }
         if (v_final != VK_NULL_HANDLE && b_exp != VK_NULL_HANDLE) {
             VkDescriptorSet fset = finalize_sets_[next_finalize_set_];
             next_finalize_set_ = (next_finalize_set_ + 1) % kFinalizeSetRing;
 
-            VkDescriptorImageInfo  ii[2] {};
+            VkDescriptorImageInfo  ii[3] {};
             VkDescriptorBufferInfo bi    {};
-            VkWriteDescriptorSet   w[3]  {};
+            VkWriteDescriptorSet   w[4]  {};
 
             ii[0].imageView   = v_output;
             ii[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
             ii[1].imageView   = v_final;
             ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            ii[2].imageView   = v_bloom;
+            ii[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
             bi.buffer = b_exp;
             bi.offset = 0;
             bi.range  = VK_WHOLE_SIZE;
 
-            for (int i = 0; i < 3; ++i) {
+            for (int i = 0; i < 4; ++i) {
                 w[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                 w[i].dstSet          = fset;
-                w[i].dstBinding      = i;
                 w[i].descriptorCount = 1;
             }
+            w[0].dstBinding     = 0;
             w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             w[0].pImageInfo     = &ii[0];
+            w[1].dstBinding     = 1;
             w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             w[1].pImageInfo     = &ii[1];
+            w[2].dstBinding     = 2;
             w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             w[2].pBufferInfo    = &bi;
+            w[3].dstBinding     = 3;
+            w[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            w[3].pImageInfo     = &ii[2];
 
-            vkUpdateDescriptorSets(device_->RawDevice(), 3, w, 0, nullptr);
+            vkUpdateDescriptorSets(device_->RawDevice(), 4, w, 0, nullptr);
 
             // Atrous path's last pass left the chain barrier in place,
             // so the read of `output` is already covered. Basic path
@@ -739,12 +783,18 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
             struct FinalizePush {
                 std::uint32_t width;
                 std::uint32_t height;
-                std::uint32_t hdr_pipeline;  // 1 = ACES + sRGB; 0 = sRGB OETF only
-                std::uint32_t pad1;
+                std::uint32_t hdr_pipeline;     // 1 = ACES + sRGB; 0 = sRGB OETF only
+                float         bloom_intensity;  // 0 = skip bloom add
             } fp{};
-            fp.width        = cached_w_;
-            fp.height       = cached_h_;
-            fp.hdr_pipeline = hdr_pipeline ? 1u : 0u;
+            fp.width           = cached_w_;
+            fp.height          = cached_h_;
+            fp.hdr_pipeline    = hdr_pipeline ? 1u : 0u;
+            // Key intensity on the resolved-bloom flag, not on
+            // bloom_in.id, so the corner case where the engine passes
+            // a non-zero handle but LookupImageView fails also
+            // collapses to a no-op (otherwise the v_output fallback
+            // above would be sampled as bloom -- HDR feedback artifact).
+            fp.bloom_intensity = bloom_real ? bloom_intensity : 0.0f;
             vkCmdPushConstants(cb, finalize_pipe_layout_,
                                VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                sizeof(fp), &fp);
@@ -791,6 +841,8 @@ void VulkanNrdDenoiser::EncodeFinalizeOnly(VkCommandBuffer cb,
                                            VkImageView    color_in_view,
                                            VkImageView    final_output_view,
                                            VkBuffer       exposure_state_buf,
+                                           VkImageView    bloom_in_view,
+                                           float          bloom_intensity,
                                            std::uint32_t  width,
                                            std::uint32_t  height,
                                            bool           hdr_pipeline) {
@@ -800,35 +852,51 @@ void VulkanNrdDenoiser::EncodeFinalizeOnly(VkCommandBuffer cb,
     if (final_output_view == VK_NULL_HANDLE)      return;
     if (exposure_state_buf == VK_NULL_HANDLE)     return;
     if (width == 0 || height == 0)                return;
+    // Bloom slot must be valid (descriptor layout requires it). If the
+    // caller didn't pass one, fall back to color_in_view -- the shader
+    // gates the read on bloom_intensity > 0 so the slot is never
+    // actually sampled.
+    VkImageView v_bloom = (bloom_in_view != VK_NULL_HANDLE)
+                            ? bloom_in_view
+                            : color_in_view;
+    const float effective_bloom = (bloom_in_view != VK_NULL_HANDLE)
+                                    ? bloom_intensity : 0.0f;
 
     VkDescriptorSet fset = finalize_sets_[next_finalize_set_];
     next_finalize_set_   = (next_finalize_set_ + 1) % kFinalizeSetRing;
 
-    VkDescriptorImageInfo  ii[2] {};
+    VkDescriptorImageInfo  ii[3] {};
     VkDescriptorBufferInfo bi    {};
-    VkWriteDescriptorSet   w[3]  {};
+    VkWriteDescriptorSet   w[4]  {};
 
     ii[0].imageView   = color_in_view;
     ii[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     ii[1].imageView   = final_output_view;
     ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    ii[2].imageView   = v_bloom;
+    ii[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     bi.buffer = exposure_state_buf;
     bi.offset = 0;
     bi.range  = VK_WHOLE_SIZE;
 
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 4; ++i) {
         w[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w[i].dstSet          = fset;
-        w[i].dstBinding      = static_cast<std::uint32_t>(i);
         w[i].descriptorCount = 1;
     }
+    w[0].dstBinding     = 0;
     w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     w[0].pImageInfo     = &ii[0];
+    w[1].dstBinding     = 1;
     w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     w[1].pImageInfo     = &ii[1];
+    w[2].dstBinding     = 2;
     w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     w[2].pBufferInfo    = &bi;
-    vkUpdateDescriptorSets(device_->RawDevice(), 3, w, 0, nullptr);
+    w[3].dstBinding     = 3;
+    w[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    w[3].pImageInfo     = &ii[2];
+    vkUpdateDescriptorSets(device_->RawDevice(), 4, w, 0, nullptr);
 
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, finalize_pipe_);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -837,12 +905,13 @@ void VulkanNrdDenoiser::EncodeFinalizeOnly(VkCommandBuffer cb,
     struct FinalizePush {
         std::uint32_t width;
         std::uint32_t height;
-        std::uint32_t hdr_pipeline;  // 1 = ACES + sRGB; 0 = sRGB OETF only
-        std::uint32_t pad1;
+        std::uint32_t hdr_pipeline;     // 1 = ACES + sRGB; 0 = sRGB OETF only
+        float         bloom_intensity;  // 0 = skip bloom add
     } fp{};
-    fp.width        = width;
-    fp.height       = height;
-    fp.hdr_pipeline = hdr_pipeline ? 1u : 0u;
+    fp.width           = width;
+    fp.height          = height;
+    fp.hdr_pipeline    = hdr_pipeline ? 1u : 0u;
+    fp.bloom_intensity = effective_bloom;
     vkCmdPushConstants(cb, finalize_pipe_layout_,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        sizeof(fp), &fp);
