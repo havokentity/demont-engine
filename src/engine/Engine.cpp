@@ -2501,16 +2501,16 @@ void Engine::RenderFrame() {
         dd.output        = pt::rhi::TextureHandle{post_denoise_hdr_tex_id_};
         // Vulkan SVGF/NRD finalize: reads `output` (linear HDR) and
         // writes a tonemapped LDR result directly into the swapchain.
-        // The engine's separate Tonemap pipeline isn't built on Vulkan
-        // yet (its push struct exceeds the 256B native push-constant
-        // limit and would need the same spill-to-UBO machinery PtPush
-        // uses -- deferred). On Vulkan the bloom + tonemap chain below
-        // is gated on `tonemap_pipeline_id_ != 0`, so it's skipped and
-        // DenoiseFinalize is the authoritative swapchain writer. The
-        // MetalFX path ignores both fields here because its Tonemap
-        // pipeline IS built and handles the post-pass tonemap (and
-        // bloom + lens flare) the usual way.
-        dd.final_output    = fc.swapchain_image;
+        // ONLY when the engine's separate Tonemap.slang pipeline isn't
+        // built -- when it IS built (Metal always, Vulkan now too via
+        // the push/UBO split), the post-denoise tonemap chain below
+        // takes over and we tell the SVGF/NRD finalize step to skip
+        // its own swapchain write by passing final_output = 0. The
+        // MetalFX path doesn't have an internal finalize step so it
+        // ignores this field either way.
+        dd.final_output    = (tonemap_pipeline_id_ != 0)
+                                 ? pt::rhi::TextureHandle{0}
+                                 : fc.swapchain_image;
         dd.exposure_state  = pt::rhi::BufferHandle{exposure_state_id_};
         dd.jitter_x      = last_jitter_x_;
         dd.jitter_y      = last_jitter_y_;
@@ -2615,30 +2615,15 @@ void Engine::RenderFrame() {
              bloom_mip_tex_id_[0] != 0 &&
              bloom_down_pipeline_id_ != 0 && bloom_up_pipeline_id_ != 0);
 
-        // Vulkan-only: build the bloom pyramid BEFORE the Denoise()
-        // call so DenoiseFinalize (which runs inside Denoise() and is
-        // the swapchain writer on Vulkan today) can composite
-        // bloom_mip[0] pre-tonemap. The source is denoise_color (the
-        // path tracer's per-frame noisy 1-spp HDR output) -- not
-        // post_denoise_hdr, which doesn't exist yet at this point.
-        // BloomDown's first-mip Karis averaging is designed precisely
-        // for noisy path-tracer input so the bloom layer reads clean
-        // after one downsample. Metal does NOT run bloom here -- it
-        // runs the existing post-Denoise() chain below that reads
-        // post_denoise_hdr instead.
-        const bool vulkan_pre_denoise_bloom =
-            (current_backend_ == pt::rhi::BackendType::Vulkan && bloom_can_run);
-        if (vulkan_pre_denoise_bloom) {
-            dispatch_bloom_pyramid(denoise_color_tex_id_);
-        }
-        // Tell the backend's Denoise() about the bloom layer. Vulkan
-        // reads dd.bloom_in inside DenoiseFinalize; Metal ignores it
-        // (its bloom composite happens in Tonemap.slang post-
-        // Denoise).
-        dd.bloom_in = vulkan_pre_denoise_bloom
-                          ? pt::rhi::TextureHandle{bloom_mip_tex_id_[0]}
-                          : pt::rhi::TextureHandle{0};
-        dd.bloom_intensity = vulkan_pre_denoise_bloom ? bloom_intensity : 0.0f;
+        // dd.bloom_in / dd.bloom_intensity stay zero on the common
+        // path -- the Tonemap.slang pipeline (built on both backends
+        // now) is the bloom compositor, so DenoiseFinalize's own
+        // bloom slot stays a no-op. The fields remain in DenoiseDesc
+        // so a future setup that doesn't build Tonemap (e.g. a Vulkan
+        // build that strips bloom + flare) can still light up
+        // DenoiseFinalize's bloom path by passing them through.
+        dd.bloom_in        = pt::rhi::TextureHandle{0};
+        dd.bloom_intensity = 0.0f;
 
         device_->Denoise(dd);
 
@@ -2777,9 +2762,27 @@ void Engine::RenderFrame() {
             std::uint32_t flare_mode_physical;
             std::uint32_t physical_ghost_count;
             float        _pad_phys_align[2];
+            // 48 bytes of padding to advance ghosts[] forward to host
+            // offset 112 -- the Vulkan push-constant split boundary
+            // (VulkanDevice::kPushSplitOffset). The first 112 bytes of
+            // this struct go to vkCmdPushConstants on the SPIR-V path;
+            // the remaining 512 bytes (the ghost array) spill into the
+            // Frame UBO at vk::binding(14, 0). With the array landing
+            // at exactly offset 112, the spill is bit-aligned to the
+            // shader-side Frame UBO declaration -- no per-byte
+            // shuffling. On Metal the whole 624-byte block goes
+            // through setBytes; the padding is dead weight (~0.05% of
+            // a frame's CPU push budget) but keeps a single host-side
+            // TonePush shape across both backends.
+            float        _pad_to_push_split[12];   // 12 * 4 = 48 bytes
             PtShaderGhost ghosts[lensflare::kMaxGhosts];
         } tp{};
         static_assert(sizeof(TonePush) % 16 == 0, "TonePush 16-byte aligned");
+        static_assert(sizeof(TonePush) == 624,
+                      "TonePush layout (ghosts must land at offset 112 "
+                      "for the SPIR-V push/UBO split)");
+        static_assert(offsetof(TonePush, ghosts) == 112,
+                      "ghosts[] must start at the Vulkan push-split boundary");
         // tp.exposure is now dead in the shader -- Tonemap.slang reads
         // exposure_state[0] from the bound buffer instead (matches
         // PathTrace.slang's inline tonemap path). The field stays in

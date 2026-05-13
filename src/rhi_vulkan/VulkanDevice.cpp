@@ -50,6 +50,15 @@ extern const unsigned char shader_BloomDown_spirv_data[];
 extern const unsigned long shader_BloomDown_spirv_size;
 extern const unsigned char shader_BloomUp_spirv_data[];
 extern const unsigned long shader_BloomUp_spirv_size;
+// Tonemap (composite bloom + apply exposure*ACES*sRGB, plus lens
+// flare). Compiled to SPIR-V; the host-side TonePush has 48 bytes of
+// padding inserted so the ghost array lands at the kPushSplitOffset
+// boundary (offset 112) and naturally spills into the Frame UBO at
+// binding 14. The shader's PT_TARGET_SPIRV path reads ghosts[] from
+// that UBO; the non-ghost fields live in vkCmdPushConstants like the
+// rest of the small-push pipelines.
+extern const unsigned char shader_Tonemap_spirv_data[];
+extern const unsigned long shader_Tonemap_spirv_size;
 }
 
 namespace pt::rhi::vk {
@@ -1007,6 +1016,18 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // identically to the Metal path.
         build_pipeline("bloom_down",  shader_BloomDown_spirv_data,    shader_BloomDown_spirv_size);
         build_pipeline("bloom_up",    shader_BloomUp_spirv_data,      shader_BloomUp_spirv_size);
+        // Tonemap pipeline. Engine.cpp's post-denoise tonemap chain
+        // dispatches this when tonemap_pipeline_id_ != 0; before this
+        // change that id was always zero on Vulkan and the chain
+        // skipped (DenoiseFinalize.slang ran in its place but had no
+        // bloom or lens-flare compositing). With the pipeline built
+        // here, the engine routes the full bloom + flare + tonemap
+        // chain on Vulkan symmetrically with Metal, and dd.final_output
+        // gets set to 0 so DenoiseFinalize doesn't double-write the
+        // swapchain. See Tonemap.slang's `#ifdef PT_TARGET_SPIRV`
+        // branch for the push/UBO split that makes the 624-byte
+        // TonePush fit Vulkan's 256B push-constant limit.
+        build_pipeline("tonemap",     shader_Tonemap_spirv_data,      shader_Tonemap_spirv_size);
         pipelines_ready_.store(true, std::memory_order_release);
 
         // Skip the per-pipeline timing-string construction below tier 2.

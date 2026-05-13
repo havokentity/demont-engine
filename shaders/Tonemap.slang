@@ -139,8 +139,31 @@ cbuffer Push {
     // Number of valid entries in ghosts[]. 0 = skip the physical loop.
     uint  physical_ghost_count;
     float2 _pad_phys;
+    // 48 bytes of padding to push the ghost array forward to host
+    // offset 112 (the Vulkan kPushSplitOffset boundary). On Vulkan
+    // only the first 112 bytes hit vkCmdPushConstants; bytes
+    // [112..624] (the ghost array) spill into the Frame UBO declared
+    // at vk::binding(14, 0) below. On Metal the whole 624-byte block
+    // goes through setBytes -- the padding is wasted but keeps a
+    // single host-side TonePush layout shared across both backends.
+    float4 _pad_to_push_split[3];
+#ifndef PT_TARGET_SPIRV
+    // Metal path: ghosts live in the push struct.
+    GhostShader ghosts[kPhysGhostMax];
+#endif
+};
+
+// SPIR-V path: ghosts live in the Frame UBO at binding 14. The
+// VulkanCommandBuffer's per-dispatch ring-UBO write copies the host
+// TonePush's tail (bytes [kPushSplitOffset..push_size]) into this
+// buffer, so `ghosts[i]` here reads the same data the Metal path
+// reads from the push struct's tail.
+#ifdef PT_TARGET_SPIRV
+[[vk::binding(14, 0)]]
+cbuffer Frame {
     GhostShader ghosts[kPhysGhostMax];
 };
+#endif
 
 float3 acesTonemap(float3 c) {
     // Narkowicz fit. Same constants as PathTrace.slang -- duplicated
