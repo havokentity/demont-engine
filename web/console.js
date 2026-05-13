@@ -1192,6 +1192,20 @@
       return;
     }
 
+    // Ctrl+Space (or Cmd+Space on Mac) -- universal "show me my
+    // options" shortcut. Matches VS Code / IntelliJ / every IDE.
+    // Force-opens the popup regardless of whether one is already
+    // open and regardless of how empty the current token is, so the
+    // user can always summon completions on demand even after
+    // dismissing them. Has to be early in keydown -- before the
+    // modifier-only skip would catch Ctrl alone, and before the
+    // popup-active branch consumes Space as "any other key".
+    if ((e.ctrlKey || e.metaKey) && e.key === ' ') {
+      e.preventDefault();
+      refreshCompletions(/*forceShow=*/true);
+      return;
+    }
+
     // ---- Popup-active key handling --------------------------------------
     // Up/Down move the highlight inside the popup (NOT command
     // history); Tab commits the highlighted match; Enter is handled
@@ -1248,6 +1262,17 @@
         input.value = histPos === history.length ? '' : history[histPos];
       }
       e.preventDefault();
+    }
+
+    // Cursor-move keys re-evaluate the popup against the new caret
+    // position. Without this, arrow-keying into the trailing space
+    // of `r_denoiser ` (e.g. after navigating via Home then End)
+    // leaves the popup state stale -- the user would have to type a
+    // char to get the value-position popup to (re-)open. setTimeout
+    // defers until after the browser has actually moved the cursor.
+    if (e.key === 'ArrowLeft'  || e.key === 'ArrowRight' ||
+        e.key === 'Home'       || e.key === 'End') {
+      setTimeout(() => refreshCompletions(/*forceShow=*/false), 0);
     }
   });
 

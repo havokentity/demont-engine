@@ -961,6 +961,21 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
 
+        // Ctrl+Space -- universal "show me my options" shortcut.
+        // Matches VS Code / IntelliJ / every IDE. Force-opens the
+        // popup regardless of current state so the user can summon
+        // completions on demand even after dismissing them by
+        // typing or clicking elsewhere. Has to run before the
+        // popup-active "any other key dismisses" branch, otherwise
+        // the dismissal would beat the open. Swallowing the
+        // keystroke (`return 0`) prevents WM_CHAR from generating
+        // a stray space character.
+        if (ctrl_held && w == VK_SPACE) {
+            RefreshCompletions(/*force_show=*/true);
+            Repaint();
+            return 0;
+        }
+
         // Popup-active key handling. Up/Down navigate the highlight
         // (NOT command history); Tab commits + chains; Enter commits
         // without chaining (then falls through so WM_CHAR '\r' fires
@@ -1007,14 +1022,32 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             RefreshCompletions(/*force_show=*/true);
             Repaint();
             return 0;
+        // Cursor-move keys also re-evaluate the popup against the
+        // new caret position. Without this, navigating into the
+        // trailing space of `r_denoiser ` via Home + End leaves the
+        // popup stale -- the user would have to type a char to get
+        // the value-position popup to open. Refreshing here keeps
+        // the popup in sync with whatever word the cursor is on.
         case VK_LEFT:
-            if (cursor_ > 0) { cursor_--; Repaint(); }
+            if (cursor_ > 0) cursor_--;
+            RefreshCompletions(/*force_show=*/false);
+            Repaint();
             return 0;
         case VK_RIGHT:
-            if (cursor_ < (int)input_.size()) { cursor_++; Repaint(); }
+            if (cursor_ < (int)input_.size()) cursor_++;
+            RefreshCompletions(/*force_show=*/false);
+            Repaint();
             return 0;
-        case VK_HOME:   cursor_ = 0;                       Repaint(); return 0;
-        case VK_END:    cursor_ = (int)input_.size();      Repaint(); return 0;
+        case VK_HOME:
+            cursor_ = 0;
+            RefreshCompletions(/*force_show=*/false);
+            Repaint();
+            return 0;
+        case VK_END:
+            cursor_ = (int)input_.size();
+            RefreshCompletions(/*force_show=*/false);
+            Repaint();
+            return 0;
         case VK_DELETE:
             if (cursor_ < (int)input_.size()) {
                 input_.erase(cursor_, 1); Repaint();
