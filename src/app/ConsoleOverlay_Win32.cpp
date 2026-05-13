@@ -245,6 +245,20 @@ private:
     BYTE      anim_from_alpha_= 0;
     BYTE      anim_to_alpha_  = 0;
 
+    // Guards scrollback_ / input_ / cursor_ / history_ / scroll_lines_.
+    // WARNING: callers must NOT invoke LOG_INFO / LOG_WARN / LOG_ERROR
+    // while holding this mutex. The log emit path fans out to every
+    // registered sink synchronously on the calling thread, and our own
+    // OnLog sink (line ~689) re-locks state_mutex_ to push the line
+    // onto scrollback_. Recursive lock on std::mutex is undefined
+    // behaviour; MSVC's _Mtx_lock returns _RESOURCE_DEADLOCK_WOULD_OCCUR
+    // and std::mutex::lock() throws std::system_error, which under our
+    // /EHs-c- (-fno-exceptions) build immediately fast-fails the
+    // process (caught in a crash dump from PR #12 review: r_denoiser
+    // value-position popup + Ctrl+Space LOG_INFO -> ucrtbase fast-fail
+    // subcode 7). WM_KEYDOWN now uses unique_lock so the two
+    // diagnostic logs inside it can release/re-acquire around the
+    // emit call.
     std::mutex              state_mutex_;
     std::deque<ScrollLine>  scrollback_;
     std::string             input_;
@@ -878,7 +892,11 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_KEYDOWN: {
-        std::lock_guard lk(state_mutex_);
+        // unique_lock (not lock_guard) so the Ctrl+V failure path and
+        // the Ctrl+Space first-fire diagnostic can drop the mutex
+        // before calling LOG_*; see the comment on state_mutex_'s
+        // declaration for why holding it across a log emit fast-fails.
+        std::unique_lock<std::mutex> lk(state_mutex_);
 
         // Modifier keys alone (Shift/Ctrl/Alt/Win) must not dismiss
         // the ghost -- otherwise a user pressing Shift+Tab fires
@@ -937,8 +955,13 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 }
                 CloseClipboard();
             } else {
-                LOG_WARN("ConsoleOverlay: OpenClipboard failed (GLE={})",
-                         GetLastError());
+                // OpenClipboard failed -- log it, but only after
+                // dropping state_mutex_ because LOG_WARN -> OnLog
+                // re-locks it on the same thread (would fast-fail).
+                const DWORD gle = GetLastError();
+                lk.unlock();
+                LOG_WARN("ConsoleOverlay: OpenClipboard failed (GLE={})", gle);
+                lk.lock();
             }
 
             if (!text.empty()) {
@@ -985,8 +1008,17 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (ctrl_held && w == VK_SPACE) {
             static std::atomic<bool> s_logged_once{false};
             if (!s_logged_once.exchange(true)) {
+                // Snapshot then drop the lock for the emit: LOG_INFO
+                // fans out to ConsoleOverlay::OnLog which re-locks
+                // state_mutex_ (would fast-fail under std::mutex's
+                // non-recursive contract + our /EHs-c- build).
+                std::string snap_input  = input_;
+                int         snap_cursor = cursor_;
+                lk.unlock();
                 LOG_INFO("ConsoleOverlay: Ctrl+Space force-show fired "
-                         "(input='{}' cursor={})", input_, cursor_);
+                         "(input='{}' cursor={})",
+                         snap_input, snap_cursor);
+                lk.lock();
             }
             RefreshCompletions(/*force_show=*/true);
             Repaint();
