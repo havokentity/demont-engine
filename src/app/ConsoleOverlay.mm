@@ -836,11 +836,16 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
             self.historyPos -= 1;
             self.inputField.stringValue = self.history[self.historyPos];
             // Move caret to end of restored line so a follow-up Up/Down
-            // reads from the same insertion point and the popup re-eval
-            // (below) sees a sensible cursor.
+            // step picks up from the right insertion point.
             NSText* ed = [self.inputField currentEditor];
             if (ed) [ed setSelectedRange:NSMakeRange(self.inputField.stringValue.length, 0)];
-            [self refreshCompletions:NO];
+            // DELIBERATELY do NOT auto-open the popup on a history
+            // step. Walking past commands flashes a popup at each step
+            // otherwise, which is noise -- the user is reviewing what
+            // they ran, not asking for completions. Ctrl+Space is the
+            // explicit summon if they want to complete from the
+            // restored line. Programmatic setStringValue: above does
+            // not fire controlTextDidChange:, so no implicit refresh.
         }
         return YES;
     }
@@ -854,7 +859,7 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
             }
             NSText* ed = [self.inputField currentEditor];
             if (ed) [ed setSelectedRange:NSMakeRange(self.inputField.stringValue.length, 0)];
-            [self refreshCompletions:NO];
+            // No auto-popup -- see -moveUp: above. Ctrl+Space summons.
         }
         return YES;
     }

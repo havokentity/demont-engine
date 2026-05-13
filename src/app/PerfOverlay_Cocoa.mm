@@ -259,10 +259,23 @@ int LinesForLevel(int level) {
         CGFloat gw = b.size.width - 2 * padX;
         CGFloat gh = [self scaledGraphH];
 
-        // Border.
+        // Stroke widths scale with the overlay scale -- without this
+        // a 2x scale draws a graph that's twice as big BUT outlined
+        // and traced with the same 1px lines, so the border + sparkline
+        // look anaemic and visually disconnected from the rest of the
+        // panel which is fully scaled. Round to nearest pixel,
+        // minimum 1, so 0.5x scale doesn't degenerate to invisible.
+        CGFloat scale = [self scale];
+        CGFloat strokePx = std::max((CGFloat)1.0, std::round(scale));
+
+        // Border. Inset by half the stroke width so the rect's pixel
+        // bounds match the graph area (NSBezierPath strokes centred
+        // on the path).
         [t.dim setStroke];
-        NSBezierPath* frame = [NSBezierPath bezierPathWithRect:NSMakeRect(gx + 0.5, gy + 0.5, gw - 1, gh - 1)];
-        frame.lineWidth = 1.0;
+        CGFloat half = strokePx * 0.5;
+        NSBezierPath* frame = [NSBezierPath bezierPathWithRect:
+            NSMakeRect(gx + half, gy + half, gw - strokePx, gh - strokePx)];
+        frame.lineWidth = strokePx;
         [frame stroke];
 
         // Find peak for Y scale.
@@ -272,26 +285,39 @@ int LinesForLevel(int level) {
         }
         peak = std::max(peak, 0.5f);
 
-        // 60 fps reference at 16.67 ms.
+        // 60 fps reference at 16.67 ms. Inset from the border so the
+        // reference rule never overlaps the frame stroke; height
+        // matches strokePx so it stays visually proportional with
+        // the rest of the graph at all scales.
         float ref_ms = 16.667f;
         if (ref_ms < peak) {
-            CGFloat ref_y = gy + 1 + (ref_ms / peak) * (gh - 2);
+            CGFloat inset = strokePx;
+            CGFloat usable_h = gh - 2 * inset;
+            CGFloat ref_y = gy + inset + (ref_ms / peak) * usable_h;
             [t.dim setFill];
-            NSRectFill(NSMakeRect(gx + 1, ref_y, gw - 2, 1));
+            NSRectFill(NSMakeRect(gx + inset, ref_y,
+                                  gw - 2 * inset, strokePx));
         }
 
-        // Sparkline.
-        NSInteger avail = std::max((NSInteger)2, (NSInteger)(gw - 2));
+        // Sparkline. Available drawing band is the interior of the
+        // border. Older samples are right-aligned to the most-recent
+        // edge: when history < available pixels, the line starts in
+        // the middle of the graph and grows leftward as history fills,
+        // matching the Win32 reference. Stroke width tracks scale.
+        CGFloat inset = strokePx;
+        NSInteger avail = std::max((NSInteger)2, (NSInteger)(gw - 2 * inset));
         NSInteger n = (NSInteger)self.history.count;
+        NSInteger draw = std::min(n, avail);
+        NSInteger startCol = avail - draw;       // right-align partial history
+        NSInteger startHi  = std::max((NSInteger)0, n - avail);
         NSBezierPath* line = [NSBezierPath bezierPath];
-        line.lineWidth = 1.0;
+        line.lineWidth = strokePx;
         BOOL first = YES;
-        for (NSInteger i = 0; i < std::min(n, avail); ++i) {
-            NSInteger hi = n - 1 - (avail - 1 - i);
-            if (hi < 0) hi = 0;
-            float v = self.history[hi].floatValue;
-            CGFloat px = gx + 1 + i;
-            CGFloat py = gy + 1 + (v / peak) * (gh - 2);
+        CGFloat usable_h = gh - 2 * inset;
+        for (NSInteger c = 0; c < draw; ++c) {
+            float v = self.history[startHi + c].floatValue;
+            CGFloat px = gx + inset + (CGFloat)(startCol + c);
+            CGFloat py = gy + inset + (v / peak) * usable_h;
             NSPoint p = NSMakePoint(px, py);
             if (first) { [line moveToPoint:p]; first = NO; }
             else        [line lineToPoint:p];
