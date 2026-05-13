@@ -734,16 +734,15 @@
     let isToken0 = true;
     let firstTok = '';
     {
-      // Quick scan: find first non-space; collect chars until next
-      // space; compare its end position vs `s`.
+      // Find the first non-space run -- that's "token 0" by definition.
+      // The cursor's word is `isToken0` only when its start aligns
+      // with the start of that run (`s === tStart`). A cursor anywhere
+      // past the first run's trailing space lives in a later token.
       let i = 0;
       while (i < v.length && v[i] === ' ') ++i;
       const tStart = i;
       while (i < v.length && v[i] !== ' ') ++i;
       firstTok = v.slice(tStart, i);
-      isToken0 = (s <= i);
-      // If the cursor sits inside the first token's run (s == tStart),
-      // we ARE completing token 0. If s > i, we're at token 1+.
       isToken0 = (s === tStart);
     }
     return { start: s, end: e, text, isToken0, firstTok };
@@ -835,9 +834,14 @@
     }
     // Value position.
     if (token.firstTok === 'toggle') {
-      for (const n of Object.keys(cvarMeta).sort()) {
+      // Reuse the already-sorted `allNames` and filter -- avoids
+      // re-sorting on every keystroke (Object.keys(cvarMeta).sort()
+      // is O(n log n); refreshCompletions runs from the `input`
+      // event handler, so per-keystroke). `allNames` is sorted once
+      // in refreshNames(); allNames -> filter is O(n).
+      for (const n of allNames) {
         const cv = cvarMeta[n];
-        if (cv.allowed_values && cv.allowed_values.length > 0) {
+        if (cv && cv.allowed_values && cv.allowed_values.length > 0) {
           out.push({ name: n, kind: 'cvar',
                      value: cv.value !== undefined ? String(cv.value) : '',
                      description: cv.description || '' });
@@ -949,8 +953,17 @@
           ? `<span class="completion-kind">${escape(kindLabel)}</span>` : '';
       const descEl = it.description
           ? `<div class="completion-desc">${escape(it.description.slice(0, 120))}</div>` : '';
-      const sel = (i === popupState.selected) ? ' selected' : '';
-      return `<div class="completion-row${sel}" role="option" data-idx="${i}">`
+      const isSel = (i === popupState.selected);
+      const sel   = isSel ? ' selected' : '';
+      // aria-selected pairs with the row's `selected` CSS class. The
+      // listbox container (#input-completions) has role="listbox";
+      // each row is role="option" -- screen readers announce the
+      // option marked aria-selected="true" so the highlight is
+      // perceivable without sighted CSS.
+      const aria  = ` aria-selected="${isSel ? 'true' : 'false'}"`;
+      const opt_id = `completion-opt-${i}`;
+      return `<div class="completion-row${sel}" role="option" id="${opt_id}"`
+           + aria + ` data-idx="${i}">`
            + `<span class="completion-name">${name}</span>`
            + kindEl + valEl + descEl + `</div>`;
     }).join('');
@@ -959,6 +972,19 @@
     // Scroll the selected row into view (popup is scrollable when N > visible).
     const sel = completionsEl.querySelector('.completion-row.selected');
     if (sel) sel.scrollIntoView({ block: 'nearest' });
+    // ARIA wiring: input owns the listbox via aria-controls and points
+    // at the currently-highlighted option via aria-activedescendant.
+    // Screen readers reading the input then announce the selected
+    // option's text on selection change (Up/Down) without focus
+    // needing to move out of the input.
+    input.setAttribute('aria-controls', 'input-completions');
+    input.setAttribute('aria-expanded', 'true');
+    if (popupState.selected >= 0) {
+      input.setAttribute('aria-activedescendant',
+        `completion-opt-${popupState.selected}`);
+    } else {
+      input.removeAttribute('aria-activedescendant');
+    }
   }
 
   function renderGhostFromPopup() {
@@ -969,13 +995,20 @@
     }
     const it = popupState.items[popupState.selected];
     const t  = popupState.token;
-    // Only render the inline ghost when the candidate STARTS WITH the
-    // typed token (prefix match). For substring/fuzzy hits the tail
-    // wouldn't visually concatenate cleanly with what the user
-    // already typed, so the popup itself is the affordance and we
-    // leave the inline ghost blank.
+    // Two preconditions for the inline ghost:
+    //   1. The candidate STARTS WITH the typed token (prefix fit).
+    //      Substring / fuzzy hits don't concatenate cleanly with what
+    //      the user already typed -- the popup row's match-span
+    //      highlight is the affordance for those.
+    //   2. The token ENDS at the input's EOL (and the cursor is also
+    //      at EOL). For mid-line tokens (`r_bl|m` with cursor in the
+    //      middle of a word), renderGhost() would otherwise paint the
+    //      ghost tail past the entire input.value -- visually wrong,
+    //      since the completion will splice into the middle.
     const fits = it.name.toLowerCase().startsWith(t.text.toLowerCase());
-    if (!fits) { ghostState = null; renderGhost(); return; }
+    const atEOL = (t.end === input.value.length) &&
+                  (input.selectionStart === input.value.length);
+    if (!fits || !atEOL) { ghostState = null; renderGhost(); return; }
     ghostState = {
       matches: popupState.items.map(x => x.name),
       index:   popupState.selected,
@@ -993,6 +1026,11 @@
       completionsEl.hidden = true;
       completionsEl.innerHTML = '';
     }
+    // Clear the ARIA wiring so the input no longer claims to own a
+    // listbox / point at an option that's gone.
+    input.removeAttribute('aria-controls');
+    input.removeAttribute('aria-activedescendant');
+    input.setAttribute('aria-expanded', 'false');
     ghostState = null;
     renderGhost();
   }
@@ -1166,9 +1204,19 @@
       if (e.key === 'ArrowUp')   { e.preventDefault(); popupMoveSelection(-1); return; }
       if (e.key === 'Tab')       { e.preventDefault(); popupCommit(/*chainNext=*/true); return; }
       if (e.key === 'Escape')    { e.preventDefault(); hideCompletions(); return; }
+      // End / Right-arrow-at-EOL commit the highlighted match without
+      // chaining (matches the PR description: "Enter / click / Right-
+      // arrow commit without chaining"). Previously these only fired
+      // when ghostState existed (prefix fit), so substring / fuzzy
+      // selections silently dropped these keys -- inconsistent UX.
+      // The popup itself is the affordance regardless of match mode,
+      // so commit unconditionally when the user reaches for End or
+      // Right-arrow-at-EOL.
       if (e.key === 'End' ||
           (e.key === 'ArrowRight' && input.selectionStart === input.value.length)) {
-        if (ghostState) { e.preventDefault(); popupCommit(/*chainNext=*/true); return; }
+        e.preventDefault();
+        popupCommit(/*chainNext=*/false);
+        return;
       }
       // Any other key dismisses the popup and falls through to default
       // input behaviour. The subsequent `input` event handler will
