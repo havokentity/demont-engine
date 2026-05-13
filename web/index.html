@@ -49,6 +49,13 @@
       <div class="input-wrap">
         <input id="input" type="text" placeholder='sys_info  ·  mem_report  ·  Tab to complete' spellcheck="false" autofocus>
         <div id="input-ghost" class="input-ghost" aria-hidden="true"><span class="ghost-typed"></span><span class="ghost-tail"></span><span class="ghost-annotation"></span></div>
+        <!-- VS Code-style completion popup. Auto-shows while typing in a
+             completable token (cvar/command name or value position).
+             Each row has the matched name (with substring highlight),
+             the current value or default args (dim), and a short
+             description excerpt (dim). Up/Down cycle the highlight,
+             Tab/Enter commit, Esc dismisses. -->
+        <div id="input-completions" class="input-completions" role="listbox" hidden></div>
       </div>
     </form>
   </section>

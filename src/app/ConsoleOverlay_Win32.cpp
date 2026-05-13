@@ -21,6 +21,7 @@
 #include <Windows.h>
 
 #include "ConsoleOverlay.h"
+#include "../console/Completion.h"
 #include "../console/Console.h"
 #include "../core/Log.h"
 
@@ -56,6 +57,20 @@ struct Theme {
     COLORREF logo_letters;
     COLORREF logo_ray;
 };
+// Multiply each RGB channel by `factor` clamped to [0, 1]. Used to
+// derive a "dimmer accent" / "darker panel" shade for the popup's
+// selected-row background and panel fill -- the Theme struct only
+// stores the base palette, so we synthesise the depth shades here
+// rather than expanding the struct + every theme table entry.
+inline COLORREF DimColor(COLORREF c, float factor) {
+    if (factor < 0.0f) factor = 0.0f;
+    if (factor > 1.0f) factor = 1.0f;
+    BYTE r = static_cast<BYTE>(static_cast<float>(GetRValue(c)) * factor + 0.5f);
+    BYTE g = static_cast<BYTE>(static_cast<float>(GetGValue(c)) * factor + 0.5f);
+    BYTE b = static_cast<BYTE>(static_cast<float>(GetBValue(c)) * factor + 0.5f);
+    return RGB(r, g, b);
+}
+
 constexpr Theme kThemes[] = {
     //              panel             text              accent            prompt            dim               logo_frame        logo_letters      logo_ray
     {"hardcore",  RGB( 15, 18, 28), RGB(220,220,232), RGB(  0,240,255), RGB(  0,255,128), RGB(110,120,146), RGB(  0,130,160), RGB(231,234,242), RGB(255, 58,140)},
@@ -174,12 +189,22 @@ private:
     LRESULT WndProc(HWND, UINT, WPARAM, LPARAM);
     void Paint(HDC dc);
     void SubmitInput();
-    void HandleTab();
-    void CycleGhost(int dir);
-    void CommitGhost();
-    void DismissGhost();
-    void ActivateValueGhost(const std::string& cvar_name);
-    void RefreshGhostAnnotation();
+    // VS Code-style completion popup. RefreshCompletions rebuilds the
+    // candidate list from `input_` + `cursor_` and (re)opens the
+    // popup; MovePopupSelection moves the highlight; CommitPopup
+    // replaces the word-at-cursor with the highlighted match;
+    // DismissPopup tears the state down. See the PopupState comment
+    // below + Completion.h for the scoring + token-context model.
+    void RefreshCompletions(bool force_show);
+    void MovePopupSelection(int dir);
+    void CommitPopup(bool chain_next);
+    void DismissPopup();
+    // Single source of truth for how many popup rows actually fit
+    // between the log area and the input row at the current panel
+    // size. Used by both Paint (to pick visible_n) and
+    // MovePopupSelection (so scroll_offset advances at the same
+    // threshold the user sees). Returns 0 if even one row won't fit.
+    int  PopupVisibleRows() const;
     void StartAnim(bool showing);
     void TickAnim();
     int  CurrentY() const;
@@ -226,6 +251,20 @@ private:
     BYTE      anim_from_alpha_= 0;
     BYTE      anim_to_alpha_  = 0;
 
+    // Guards scrollback_ / input_ / cursor_ / history_ / scroll_lines_.
+    // WARNING: callers must NOT invoke LOG_INFO / LOG_WARN / LOG_ERROR
+    // while holding this mutex. The log emit path fans out to every
+    // registered sink synchronously on the calling thread, and our own
+    // OnLog sink (line ~689) re-locks state_mutex_ to push the line
+    // onto scrollback_. Recursive lock on std::mutex is undefined
+    // behaviour; MSVC's _Mtx_lock returns _RESOURCE_DEADLOCK_WOULD_OCCUR
+    // and std::mutex::lock() throws std::system_error, which under our
+    // /EHs-c- (-fno-exceptions) build immediately fast-fails the
+    // process (caught in a crash dump from PR #12 review: r_denoiser
+    // value-position popup + Ctrl+Space LOG_INFO -> ucrtbase fast-fail
+    // subcode 7). WM_KEYDOWN now uses unique_lock so the two
+    // diagnostic logs inside it can release/re-acquire around the
+    // emit call.
     std::mutex              state_mutex_;
     std::deque<ScrollLine>  scrollback_;
     std::string             input_;
@@ -234,33 +273,28 @@ private:
     std::deque<std::string> history_;
     int                     history_pos_  = -1;
 
-    // Tab-completion ghost state (fish-shell style autosuggestion).
-    // First Tab on an ambiguous prefix extends to the longest common
-    // prefix AND activates ghost mode: the first remaining match is
-    // rendered after the cursor in dim color. Subsequent Tabs cycle
-    // forward through matches; Shift+Tab cycles back; Right-arrow at
-    // end / End commits; Esc / typing dismisses.
+    // VS Code-style completion popup. Mirrors the web console's
+    // `popupState` (see web/console.js) and reuses the shared scoring
+    // engine in src/console/Completion.h. Auto-shows as the user
+    // types; Up/Down navigate the highlight; Tab commits + chains
+    // (so `r_bloom_<TAB>` lands the cvar name AND opens the
+    // allowed-values popup); Enter/click commit without chaining;
+    // Esc dismisses.
     //
-    // Two activation modes:
-    //   - Token 0 (cvar/command name): triggered by Tab on a partial
-    //     name; matches list is the prefix-filtered name list.
-    //   - Value position: either user typed `cvar ` then Tab, OR a
-    //     token-0 commit just landed on a cvar (auto-activated by
-    //     CommitGhost). Matches are allowed_values when present;
-    //     otherwise [current, default] with `is_meta` set so the
-    //     inactive one is shown as `annotation` next to the primary
-    //     ghost (user sees both at once).
-    struct GhostState {
-        bool active = false;
-        std::vector<std::string> matches;
-        std::size_t              index = 0;
-        std::string              before;     // text preserved before the token
-        std::string              prefix;     // typed text of the token (already in input_)
-        bool                     is_token0 = false;  // true → trailing space on commit
-        bool                     is_meta   = false;  // matches = [current, default] of a cvar
-        std::string              annotation;         // "default: X" or "current: Y" when is_meta
+    // popup_token_ captures the word-at-cursor at the moment of the
+    // refresh -- including byte offsets within input_ so commit can
+    // splice the candidate name in without re-parsing.
+    struct PopupState {
+        bool                                       active   = false;
+        std::vector<pt::console::CompletionMatch>  items;
+        int                                        selected = -1;
+        pt::console::TokenInfo                     token;
+        // Top-of-window index when items.size() exceeds the visible
+        // row budget. Kept in sync with `selected` so the highlighted
+        // row is always on screen.
+        int                                        scroll_offset = 0;
     };
-    GhostState ghost_;
+    PopupState popup_;
 
     // Parent-WndProc subclass for alt-tab focus restoration.  GLFW's
     // own WM_ACTIVATE handler calls SetFocus(parent) when the app
@@ -761,6 +795,16 @@ void WinOverlay::EnsureFontScale() {
 }
 
 LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    // Set by WM_KEYDOWN's Ctrl+Space branch so the WM_CHAR that
+    // TranslateMessage queues for the SAME keystroke can be consumed;
+    // otherwise WM_CHAR(' ') would insert a stray space at the cursor
+    // and call RefreshCompletions again on top of the popup we just
+    // summoned. Function-scope static (not lambda-static) so both the
+    // WM_KEYDOWN setter and the WM_CHAR consumer can see it. atomic
+    // is overkill on a single-threaded message pump but cheap, and
+    // documents the cross-message-handler hand-off.
+    static std::atomic<bool> s_suppress_next_wm_char{false};
+
     switch (m) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
@@ -827,42 +871,73 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         break;
     }
     case WM_CHAR: {
+        // Ctrl+Space (handled in WM_KEYDOWN above) sets this flag so
+        // we swallow the WM_CHAR that TranslateMessage queues for the
+        // SAME keystroke. On US/most layouts ToUnicode(VK_SPACE,
+        // ctrl-held) returns 0x20 (space), and without this guard the
+        // WM_CHAR(' ') branch below would insert a stray space at the
+        // cursor and call RefreshCompletions again -- visible to the
+        // user as "Ctrl+Space silently inserts a space and the popup
+        // I just summoned blinks / doesn't show stably." See WM_KEYDOWN
+        // Ctrl+Space block for the matching set.
+        if (s_suppress_next_wm_char.exchange(false)) {
+            return 0;
+        }
         // Backtick: toggle off (matches the engine's Mac path where
         // backtick on the GLFW window opens the overlay; once open
         // the Cocoa NSView's keyDown closes it).
         if (w == '`') { Hide(); return 0; }
         if (w == '\r') { SubmitInput(); return 0; }
         if (w == '\b') {
-            std::lock_guard lk(state_mutex_);
-            if (cursor_ > 0) { input_.erase(cursor_ - 1, 1); cursor_--; }
+            // Hold the mutex across BOTH the input mutation AND the
+            // RefreshCompletions call -- RefreshCompletions reads
+            // input_ / cursor_ and writes popup_, so its caller must
+            // hold state_mutex_ (matching the WM_KEYDOWN call sites).
+            // Earlier rev released the lock between mutate + refresh,
+            // creating a window where another thread could observe a
+            // half-updated state. Repaint() is just InvalidateRect,
+            // safe to call after the lock drops.
+            {
+                std::lock_guard lk(state_mutex_);
+                if (cursor_ > 0) { input_.erase(cursor_ - 1, 1); cursor_--; }
+                // Re-rank completions on every text mutation --
+                // backspace narrows / widens the matching set
+                // depending on whether the char being removed was
+                // matching anywhere.
+                RefreshCompletions(/*force_show=*/false);
+            }
             Repaint();
             return 0;
         }
         if (w >= 32 && w < 127) {
-            std::lock_guard lk(state_mutex_);
-            input_.insert(cursor_, 1, static_cast<char>(w));
-            cursor_++;
-            Repaint();
-            // After typing space, if the input is exactly "<name> "
-            // (single token + trailing space, cursor at end) and that
-            // name resolves to a known cvar/command with suggestions,
-            // auto-activate the value-position ghost.  Mirrors the
-            // post-commit auto-activation so users who type the full
-            // name themselves get the same affordance as those who
-            // tab-completed it.
-            if (w == ' ' && cursor_ == static_cast<int>(input_.size()) &&
-                input_.size() >= 2) {
-                auto first_space = input_.find(' ');
-                if (first_space + 1 == input_.size()) {
-                    ActivateValueGhost(input_.substr(0, first_space));
-                }
+            // Same locking rationale as the WM_BACK branch above:
+            // RefreshCompletions touches input_ / cursor_ / popup_
+            // and is contractually called with state_mutex_ held.
+            {
+                std::lock_guard lk(state_mutex_);
+                input_.insert(cursor_, 1, static_cast<char>(w));
+                cursor_++;
+                // After every text mutation, re-rank completions
+                // against the new cursor context. The popup auto-
+                // shows when there are matches and the typed token
+                // is non-empty (or the user has just hit `<name> ` --
+                // ForceShow=true lets the value-position popup open
+                // without a query). Mirrors the web console's `input`
+                // event handler.
+                const bool typed_separator = (w == ' ');
+                RefreshCompletions(/*force_show=*/typed_separator);
             }
+            Repaint();
             return 0;
         }
         return 0;
     }
     case WM_KEYDOWN: {
-        std::lock_guard lk(state_mutex_);
+        // unique_lock (not lock_guard) so the Ctrl+V failure path and
+        // the Ctrl+Space first-fire diagnostic can drop the mutex
+        // before calling LOG_*; see the comment on state_mutex_'s
+        // declaration for why holding it across a log emit fast-fails.
+        std::unique_lock<std::mutex> lk(state_mutex_);
 
         // Modifier keys alone (Shift/Ctrl/Alt/Win) must not dismiss
         // the ghost -- otherwise a user pressing Shift+Tab fires
@@ -921,8 +996,13 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 }
                 CloseClipboard();
             } else {
-                LOG_WARN("ConsoleOverlay: OpenClipboard failed (GLE={})",
-                         GetLastError());
+                // OpenClipboard failed -- log it, but only after
+                // dropping state_mutex_ because LOG_WARN -> OnLog
+                // re-locks it on the same thread (would fast-fail).
+                const DWORD gle = GetLastError();
+                lk.unlock();
+                LOG_WARN("ConsoleOverlay: OpenClipboard failed (GLE={})", gle);
+                lk.lock();
             }
 
             if (!text.empty()) {
@@ -945,50 +1025,137 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
 
-        // Ghost-mode preamble.  When the autosuggestion is active these
-        // keys mean something different than their default: Tab cycles,
-        // Shift+Tab cycles back, Right-arrow at end / End commits, Esc
-        // dismisses, Enter commits-then-submits.  Any other key
-        // dismisses the ghost and falls through to normal handling.
-        if (ghost_.active) {
-            const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-            if (w == VK_TAB) {
-                CycleGhost(shift ? -1 : +1);
-                return 0;
+        // Ctrl+Space -- universal "show me my options" shortcut.
+        // Matches VS Code / IntelliJ / every IDE. Force-opens the
+        // popup regardless of current state so the user can summon
+        // completions on demand even after dismissing them by
+        // typing or clicking elsewhere. Has to run before the
+        // popup-active "any other key dismisses" branch, otherwise
+        // the dismissal would beat the open. Swallowing the
+        // keystroke (`return 0`) prevents WM_CHAR from generating
+        // a stray space character.
+        //
+        // CAVEATS: on Windows with Chinese / Japanese / Korean IME
+        // enabled, Ctrl+Space is reserved by the OS for toggling
+        // the IME and never reaches this handler. There's nothing
+        // we can do about that short of binding a different shortcut
+        // -- if a user reports it not working, suggest checking
+        // Settings > Time & Language > Advanced keyboard settings
+        // for any IME toggle bindings.
+        //
+        // The first-fire log is a one-shot diagnostic so users can
+        // confirm the handler is being reached (e.g. by tailing the
+        // engine log while pressing the shortcut).
+        if (ctrl_held && w == VK_SPACE) {
+            // Tell WM_CHAR to swallow the space that TranslateMessage
+            // queued for THIS keystroke (US/most layouts map Ctrl+Space
+            // to 0x20). Otherwise it'd insert a stray space at the
+            // cursor and rebuild the popup on top of itself.
+            s_suppress_next_wm_char.store(true);
+            static std::atomic<bool> s_logged_once{false};
+            if (!s_logged_once.exchange(true)) {
+                // Snapshot then drop the lock for the emit: LOG_INFO
+                // fans out to ConsoleOverlay::OnLog which re-locks
+                // state_mutex_ (would fast-fail under std::mutex's
+                // non-recursive contract + our /EHs-c- build).
+                std::string snap_input  = input_;
+                int         snap_cursor = cursor_;
+                lk.unlock();
+                LOG_INFO("ConsoleOverlay: Ctrl+Space force-show fired "
+                         "(input='{}' cursor={})",
+                         snap_input, snap_cursor);
+                lk.lock();
             }
+            RefreshCompletions(/*force_show=*/true);
+            Repaint();
+            return 0;
+        }
+
+        // Popup-active key handling. Up/Down navigate the highlight
+        // (NOT command history); Tab commits + chains; Enter commits
+        // without chaining (and falls through to the WM_CHAR '\r'
+        // generated by TranslateMessage for the SAME Enter keystroke,
+        // which runs SubmitInput on the just-completed line -- see the
+        // VK_RETURN block below for the message-loop mechanics); End
+        // and Right-arrow-at-EOL commit WITHOUT chaining (only Tab
+        // chains -- matches VS Code and the web console's
+        // popupCommit(chainNext=false) on the same keys); Esc
+        // dismisses; any other key dismisses the popup and falls
+        // through -- the subsequent WM_CHAR / repaint will re-rank
+        // via the input handler, so the popup re-opens if the new
+        // typed char still leaves us inside a completable token.
+        if (popup_.active) {
+            if (w == VK_DOWN)  { MovePopupSelection(+1); return 0; }
+            if (w == VK_UP)    { MovePopupSelection(-1); return 0; }
+            if (w == VK_TAB)   { CommitPopup(/*chain_next=*/true); return 0; }
+            if (w == VK_ESCAPE){ DismissPopup(); return 0; }
             if (w == VK_END ||
                 (w == VK_RIGHT && cursor_ == static_cast<int>(input_.size()))) {
-                CommitGhost();
-                return 0;
-            }
-            if (w == VK_ESCAPE) {
-                DismissGhost();
+                // chain_next=false: End / Right are "accept this row
+                // and stop" gestures, mirroring the web console. Only
+                // Tab chains (= "complete + show next suggestions").
+                CommitPopup(/*chain_next=*/false);
                 return 0;
             }
             if (w == VK_RETURN) {
-                CommitGhost();
-                // Fall through; WM_CHAR '\r' will then submit.
-            } else {
-                DismissGhost();
-                // Fall through to existing handlers below.
+                CommitPopup(/*chain_next=*/false);
+                // Returning 0 here doesn't stop WM_CHAR from also
+                // firing for the SAME Enter keystroke (TranslateMessage
+                // in the message loop has already queued a WM_CHAR
+                // '\r' by this point -- WM_KEYDOWN's return code only
+                // gates DefWindowProc, not the WM_CHAR translation).
+                // So after this return, WM_CHAR '\r' arrives and runs
+                // SubmitInput() on the just-completed line. Matches
+                // the prior ghost-era behaviour for typed Enter -- the
+                // user's mental model on a console is "Enter = run",
+                // so committing the highlighted match and then
+                // submitting it is the least-surprise path.
+                return 0;
             }
+            // Any other key: tear the popup down and let the keystroke
+            // route through the normal handlers below (so e.g. Left
+            // arrow still moves the cursor, backspace still deletes).
+            DismissPopup();
+            // fall through
         }
 
         switch (w) {
         case VK_TAB:
             // Handled here (not WM_CHAR) so DefWindowProcW never sees
             // it -- WS_CHILD + VK_TAB otherwise triggers focus
-            // traversal in the parent's tab order.
-            HandleTab();
+            // traversal in the parent's tab order. Tab with popup
+            // hidden FORCE-SHOWS the popup (even for an empty query),
+            // mirroring the web console's behaviour where Tab on
+            // `r_bloom_intensity ` opens the value-position popup.
+            RefreshCompletions(/*force_show=*/true);
+            Repaint();
             return 0;
+        // Cursor-move keys also re-evaluate the popup against the
+        // new caret position. Without this, navigating into the
+        // trailing space of `r_denoiser ` via Home + End leaves the
+        // popup stale -- the user would have to type a char to get
+        // the value-position popup to open. Refreshing here keeps
+        // the popup in sync with whatever word the cursor is on.
         case VK_LEFT:
-            if (cursor_ > 0) { cursor_--; Repaint(); }
+            if (cursor_ > 0) cursor_--;
+            RefreshCompletions(/*force_show=*/false);
+            Repaint();
             return 0;
         case VK_RIGHT:
-            if (cursor_ < (int)input_.size()) { cursor_++; Repaint(); }
+            if (cursor_ < (int)input_.size()) cursor_++;
+            RefreshCompletions(/*force_show=*/false);
+            Repaint();
             return 0;
-        case VK_HOME:   cursor_ = 0;                       Repaint(); return 0;
-        case VK_END:    cursor_ = (int)input_.size();      Repaint(); return 0;
+        case VK_HOME:
+            cursor_ = 0;
+            RefreshCompletions(/*force_show=*/false);
+            Repaint();
+            return 0;
+        case VK_END:
+            cursor_ = (int)input_.size();
+            RefreshCompletions(/*force_show=*/false);
+            Repaint();
+            return 0;
         case VK_DELETE:
             if (cursor_ < (int)input_.size()) {
                 input_.erase(cursor_, 1); Repaint();
@@ -1090,194 +1257,128 @@ void WinOverlay::SubmitInput() {
     Repaint();
 }
 
-// First Tab on a fresh prefix.  Caller (WM_KEYDOWN) holds state_mutex_,
-// so direct access to input_/cursor_/ghost_ is safe.  Console::Enumerate*
-// /FindCVar run on the engine main thread (same thread that owns the
-// cvar map) -- no Console-side locking needed.
+// Rebuild the popup against the current input_ + cursor_ context.
+// Caller (WM_KEYDOWN / WM_CHAR / paste / WM_CHAR backspace etc.)
+// holds state_mutex_ when changes are recent, so direct reads of
+// input_ / cursor_ here are safe. pt::console::BuildCompletions
+// runs on the engine main thread (same thread that owns the cvar
+// map) -- no Console-side locking needed.
 //
-// Behavior: if there's a single match, commit it inline (with trailing
-// space for token 0).  If multiple, extend to the longest common prefix
-// and then activate ghost mode: ghost_ holds the candidate list and
-// renders the first match's tail as dim text after the cursor.
-// Subsequent Tab/Shift+Tab cycle the ghost; Right/End commit it.
-void WinOverlay::HandleTab() {
-    std::size_t last_space = input_.rfind(' ');
+// `force_show` mirrors the web console: when true (Tab + post-space
+// triggers) the popup opens even for an empty query, so the user
+// can browse value-position candidates without typing anything; when
+// false (normal char input) the popup only shows when there's a
+// non-empty query AND at least one match.
+void WinOverlay::RefreshCompletions(bool force_show) {
+    const std::size_t cur = static_cast<std::size_t>(std::max(0, cursor_));
+    pt::console::TokenInfo token =
+        pt::console::CurrentToken(input_, cur);
 
-    std::string prefix;
-    std::vector<std::string> candidates;
-
-    if (last_space == std::string::npos) {
-        // Token 0: cvar / command name.
-        prefix = input_;
-        pt::console::Console::Get().EnumerateCVars("",
-            [&](pt::console::CVar& v) { candidates.push_back(v.name); });
-        pt::console::Console::Get().EnumerateCommands("",
-            [&](pt::console::Command& c) { candidates.push_back(c.name); });
-        std::sort(candidates.begin(), candidates.end());
-    } else {
-        // Value position. `toggle <cvar>` is special-cased: token 1 is a
-        // cvar name (only those with allowed_values are useful). Otherwise
-        // we complete from the named cvar's allowed_values.
-        std::size_t first_space = input_.find(' ');
-        std::string first_tok   = input_.substr(0, first_space);
-        prefix                  = input_.substr(last_space + 1);
-        if (first_tok == "toggle") {
-            pt::console::Console::Get().EnumerateCVars("",
-                [&](pt::console::CVar& v) {
-                    if (!v.allowed_values.empty()) {
-                        candidates.push_back(v.name);
-                    }
-                });
-            std::sort(candidates.begin(), candidates.end());
-        } else {
-            auto* cv = pt::console::Console::Get().FindCVar(first_tok);
-            if (cv == nullptr || cv->allowed_values.empty()) return;
-            candidates = cv->allowed_values;
-        }
+    // Empty-query gating:
+    //   - Token 0 with empty text: don't auto-open. The popup would
+    //     list every cvar + command in the engine every time the
+    //     input becomes empty (e.g. fresh open, post-Submit clear) --
+    //     that's noise. Token 0 needs at least one typed char.
+    //   - Value position (is_token0 == false) with empty text: DO
+    //     auto-open. This is the "user just typed `<cvar> ` and
+    //     wants to see the value list (incl. current value)" path.
+    //     Mirrors the web console's equivalent gate.
+    if (!force_show && token.text.empty() && token.is_token0) {
+        DismissPopup();
+        return;
     }
 
-    std::vector<std::string> matches;
-    for (const auto& c : candidates) {
-        if (c.size() >= prefix.size() &&
-            c.compare(0, prefix.size(), prefix) == 0) {
-            matches.push_back(c);
+    auto items = pt::console::BuildCompletions(token, /*max_results=*/60,
+                                               /*description_clip=*/120);
+    if (items.empty()) {
+        DismissPopup();
+        return;
+    }
+
+    popup_.active        = true;
+    popup_.items         = std::move(items);
+    popup_.selected      = 0;
+    popup_.token         = std::move(token);
+    popup_.scroll_offset = 0;
+}
+
+int WinOverlay::PopupVisibleRows() const {
+    constexpr int kPopupMaxRows = 10;
+    const int n = static_cast<int>(popup_.items.size());
+    if (n == 0 || line_height_ <= 0) return 0;
+    if (!hwnd_) return std::min(n, kPopupMaxRows);
+    RECT rc{};
+    GetClientRect(hwnd_, &rc);
+    const int H        = rc.bottom;
+    const int input_y  = H - line_height_ - kPaddingY;
+    const int log_top  = kPaddingY + 1 + 24;
+    // Available vertical room between log_top + 2 and input_y - 6
+    // (matches the popup_y offset Paint uses). The -8 in the row
+    // calc is the popup's 4 px internal padding top + bottom.
+    const int available_h = (input_y - 6) - (log_top + 2);
+    if (available_h < line_height_ + 8) return 0;
+    const int by_height = std::max(1, (available_h - 8) / line_height_);
+    return std::min({n, kPopupMaxRows, by_height});
+}
+
+void WinOverlay::MovePopupSelection(int dir) {
+    if (!popup_.active || popup_.items.empty()) return;
+    const int n = static_cast<int>(popup_.items.size());
+    popup_.selected = ((popup_.selected + dir) % n + n) % n;
+    // Keep the highlighted row in the visible window. `visible` is
+    // the actual paint-able row count for the current panel size
+    // (shared with Paint via PopupVisibleRows), so when the panel
+    // is short and Paint can only fit e.g. 4 rows, Up/Down scrolls
+    // the window through the rest instead of letting selection run
+    // off-screen.
+    const int visible = PopupVisibleRows();
+    if (visible > 0) {
+        if (popup_.selected < popup_.scroll_offset) {
+            popup_.scroll_offset = popup_.selected;
+        } else if (popup_.selected >= popup_.scroll_offset + visible) {
+            popup_.scroll_offset = popup_.selected - visible + 1;
         }
     }
-    if (matches.empty()) return;
+    Repaint();
+}
 
-    const bool is_token0 = (last_space == std::string::npos);
-    std::string before = is_token0 ? std::string()
-                                   : input_.substr(0, last_space + 1);
-
-    if (matches.size() == 1) {
-        // Single match: commit immediately.  Trailing space for token 0
-        // so the next argument can be typed straight away.
-        std::string tail = is_token0 ? matches[0] + " " : matches[0];
-        input_  = before + tail;
-        cursor_ = static_cast<int>(input_.size());
+// Commit the currently-highlighted candidate by replacing the word
+// at the cursor with the candidate name (+ trailing space when we're
+// completing token 0 so the user lands at the value position ready
+// to keep typing). `chain_next` controls whether we auto-reopen the
+// popup at the new cursor position after commit:
+//   - Tab commits chain (Tab = "complete + show next suggestions")
+//   - Enter / click commits DON'T chain (those are "accept + stop"
+//     gestures; chaining would loop the popup forever on repeated
+//     Enter)
+// Mirrors the web console's popupCommit(chainNext) semantics.
+void WinOverlay::CommitPopup(bool chain_next) {
+    if (!popup_.active ||
+        popup_.selected < 0 ||
+        popup_.selected >= static_cast<int>(popup_.items.size())) {
+        DismissPopup();
+        return;
+    }
+    const pt::console::CompletionMatch& it = popup_.items[popup_.selected];
+    const pt::console::TokenInfo&        t = popup_.token;
+    std::string tail = it.name + (t.is_token0 ? std::string(" ") : std::string());
+    input_  = input_.substr(0, t.start) + tail + input_.substr(t.end);
+    cursor_ = static_cast<int>(t.start + tail.size());
+    const bool was_token0 = t.is_token0;
+    DismissPopup();
+    if (chain_next && was_token0) {
+        RefreshCompletions(/*force_show=*/true);
         Repaint();
-        return;
     }
+}
 
-    // Multiple matches: extend to their longest common prefix.
-    std::string common = matches[0];
-    for (std::size_t i = 1; i < matches.size(); ++i) {
-        std::size_t lim = std::min(common.size(), matches[i].size());
-        std::size_t j   = 0;
-        while (j < lim && common[j] == matches[i][j]) ++j;
-        common.resize(j);
-        if (common.empty()) break;
-    }
-    if (common.size() > prefix.size()) {
-        input_  = before + common;
-        cursor_ = static_cast<int>(input_.size());
-        prefix  = common;  // ghost rendering trims by this length
-    }
-
-    // Activate ghost mode -- subsequent Tabs cycle, Right/End commits.
-    ghost_.active    = true;
-    ghost_.matches   = std::move(matches);
-    ghost_.index     = 0;
-    ghost_.before    = std::move(before);
-    ghost_.prefix    = std::move(prefix);
-    ghost_.is_token0 = is_token0;
+void WinOverlay::DismissPopup() {
+    popup_.active   = false;
+    popup_.items.clear();
+    popup_.selected = -1;
+    popup_.token    = pt::console::TokenInfo{};
+    popup_.scroll_offset = 0;
     Repaint();
-}
-
-void WinOverlay::CycleGhost(int dir) {
-    if (!ghost_.active || ghost_.matches.empty()) return;
-    int n = static_cast<int>(ghost_.matches.size());
-    int i = (static_cast<int>(ghost_.index) + dir) % n;
-    if (i < 0) i += n;
-    ghost_.index = static_cast<std::size_t>(i);
-    RefreshGhostAnnotation();
-    Repaint();
-}
-
-void WinOverlay::CommitGhost() {
-    if (!ghost_.active || ghost_.matches.empty()) {
-        DismissGhost();
-        return;
-    }
-    const std::string committed = ghost_.matches[ghost_.index];
-    const bool        was_token0 = ghost_.is_token0;
-    std::string tail = was_token0 ? (committed + " ") : committed;
-    input_  = ghost_.before + tail;
-    cursor_ = static_cast<int>(input_.size());
-    DismissGhost();
-
-    // Token-0 commit just landed on a name.  If the name is a cvar,
-    // auto-activate a value-position ghost so the user immediately
-    // sees the cvar's current value (and default, for free-form
-    // cvars).  Commands have no value-position ghost.
-    if (was_token0) ActivateValueGhost(committed);
-}
-
-void WinOverlay::DismissGhost() {
-    if (!ghost_.active) return;
-    ghost_.active = false;
-    ghost_.matches.clear();
-    ghost_.index  = 0;
-    ghost_.before.clear();
-    ghost_.prefix.clear();
-    ghost_.is_token0 = false;
-    ghost_.is_meta   = false;
-    ghost_.annotation.clear();
-    Repaint();
-}
-
-// After a token-0 commit OR a typed `<name> ` sequence, auto-show
-// the cvar's current value (or a command's default args) as a ghost
-// so the user can see a useful suggestion without typing anything
-// more.  Three branches:
-//
-//   - CVar with allowed_values: cycle those (same as the existing
-//     value-position behaviour after `cvar ` + Tab).
-//   - Free-form cvar: cycle [current, default] with `is_meta` set
-//     so the inactive one is rendered as an annotation.
-//   - Command with default_args: single-match ghost showing the
-//     default invocation (e.g. `screenshot demonte_screen.ppm`).
-//
-// No-op for commands without default_args, and for unknown names.
-void WinOverlay::ActivateValueGhost(const std::string& name) {
-    auto& C = pt::console::Console::Get();
-    std::vector<std::string> matches;
-    bool meta = false;
-
-    if (auto* cv = C.FindCVar(name); cv != nullptr) {
-        if (!cv->allowed_values.empty()) {
-            matches = cv->allowed_values;
-        } else {
-            matches.push_back(cv->value);
-            if (cv->default_value != cv->value) {
-                matches.push_back(cv->default_value);
-                meta = true;
-            }
-        }
-    } else if (auto* cmd = C.FindCommand(name); cmd != nullptr) {
-        if (!cmd->default_args.empty()) {
-            matches.push_back(cmd->default_args);
-        }
-    }
-    if (matches.empty()) return;
-
-    ghost_.active    = true;
-    ghost_.matches   = std::move(matches);
-    ghost_.index     = 0;
-    ghost_.before    = input_;   // input_ already ends with "<name> "
-    ghost_.prefix.clear();
-    ghost_.is_token0 = false;
-    ghost_.is_meta   = meta;
-    RefreshGhostAnnotation();
-    Repaint();
-}
-
-void WinOverlay::RefreshGhostAnnotation() {
-    ghost_.annotation.clear();
-    if (!ghost_.is_meta || ghost_.matches.size() < 2) return;
-    // matches[0] = current, matches[1] = default (per ActivateValueGhost).
-    if (ghost_.index == 0) ghost_.annotation = "  default: " + ghost_.matches[1];
-    else                   ghost_.annotation = "  current: " + ghost_.matches[0];
 }
 
 void WinOverlay::Paint(HDC dc) {
@@ -1434,35 +1535,277 @@ void WinOverlay::Paint(HDC dc) {
         FillRect(mdc, &cur, cb);
         DeleteObject(cb);
 
-        // Ghost text (dim, drawn just past the cursor).  Only the
-        // portion of the candidate beyond the user's typed prefix is
-        // shown -- typed chars are already in input_ above.  An
-        // optional annotation (current/default for free-form cvars)
-        // trails the primary ghost in the same dim colour so the user
-        // sees both pieces of context at a glance.
-        if (ghost_.active && !ghost_.matches.empty()) {
-            const std::string& match = ghost_.matches[ghost_.index];
-            if (match.size() > ghost_.prefix.size() &&
-                match.compare(0, ghost_.prefix.size(), ghost_.prefix) == 0) {
-                std::string ghost_tail = match.substr(ghost_.prefix.size());
-                SetTextColor(mdc, theme_.dim);
-                int gx = cx + 3;
-                auto gbuf = ToWide(ghost_tail);
-                if (!gbuf.empty()) {
-                    TextOutW(mdc, gx, input_y, gbuf.data(),
-                             static_cast<int>(gbuf.size()));
-                    SIZE gsz{};
-                    GetTextExtentPoint32W(mdc, gbuf.data(),
-                                          static_cast<int>(gbuf.size()), &gsz);
-                    gx += gsz.cx;
-                }
-                if (!ghost_.annotation.empty()) {
-                    auto abuf = ToWide(ghost_.annotation);
-                    if (!abuf.empty()) {
-                        TextOutW(mdc, gx, input_y, abuf.data(),
-                                 static_cast<int>(abuf.size()));
+        // Inline ghost preview of the highlighted popup match. Only
+        // shown when the match is a prefix-fit for the token at the
+        // cursor -- substring / fuzzy hits go to the popup rows
+        // (highlighted match-spans inside the name) since their tail
+        // wouldn't concatenate cleanly with what the user typed.
+        if (popup_.active && popup_.selected >= 0 &&
+            popup_.selected < static_cast<int>(popup_.items.size()) &&
+            cursor_ == static_cast<int>(input_.size())) {
+            const auto& it    = popup_.items[popup_.selected];
+            const auto& token = popup_.token;
+            if (it.name.size() > token.text.size()) {
+                // Case-insensitive prefix check (token.text might
+                // differ in case from it.name).
+                bool prefix = true;
+                for (std::size_t i = 0; i < token.text.size(); ++i) {
+                    auto lc = [](char c) {
+                        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c;
+                    };
+                    if (lc(token.text[i]) != lc(it.name[i])) {
+                        prefix = false; break;
                     }
                 }
+                if (prefix) {
+                    std::string tail = it.name.substr(token.text.size());
+                    // Tint the ghost yellow when the previewed candidate
+                    // is the cvar's CURRENT value: cycling Up/Down
+                    // through allowed_values, this is the one already
+                    // set, so the user gets the same affordance as the
+                    // popup row's accent name + left bar -- "this is
+                    // what's active right now" -- but visible inline
+                    // even when the popup is below the input. Hardcoded
+                    // gold (matches amber/vault's prompt and the web
+                    // theme's --warn) so it stays warm across every
+                    // theme; the Theme palette doesn't carry a `warn`
+                    // slot today, and synthesising one per theme would
+                    // be churn for a single hint colour.
+                    constexpr COLORREF kCurrentHintColor = RGB(255, 200, 80);
+                    const bool is_current = (it.value == "current");
+                    SetTextColor(mdc, is_current ? kCurrentHintColor
+                                                 : theme_.dim);
+                    int gx = cx + 3;
+                    auto gbuf = ToWide(tail);
+                    if (!gbuf.empty()) {
+                        TextOutW(mdc, gx, input_y, gbuf.data(),
+                                 static_cast<int>(gbuf.size()));
+                    }
+                }
+            }
+        }
+
+        // Completion popup -- anchored ABOVE the input row (input
+        // sits at the bottom of the panel, so a downward dropdown
+        // would clip outside the overlay window). Each row shows the
+        // candidate name with its match-spans highlighted in accent
+        // colour, an optional kind chip ("cvar" / "cmd"), the
+        // current value (or "current" / "default" for value-position
+        // rows), and a truncated description appended after the
+        // value column.
+        if (popup_.active && !popup_.items.empty()) {
+            // PopupVisibleRows() does the panel-fit math (shared with
+            // MovePopupSelection so Up/Down scrolling agrees with what
+            // the user can see). Returns 0 when not even one row
+            // fits -- in that case skip rendering entirely. Otherwise
+            // visible_n is min(items.size(), kPopupMaxRows=10,
+            // by-height-of-available-space) and Up/Down scrolls the
+            // window through the remaining items via popup_.scroll_offset.
+            const int n = static_cast<int>(popup_.items.size());
+            const int visible_n = PopupVisibleRows();
+            const int popup_h = visible_n * line_height_ + 8;
+            const int popup_w = W - 2 * kPaddingX;
+            const int popup_x = kPaddingX;
+            const int popup_y = input_y - popup_h - 6;
+            if (visible_n > 0) {
+                RECT pr = { popup_x, popup_y, popup_x + popup_w,
+                            popup_y + popup_h };
+                // Panel background -- slightly darker than the
+                // overlay's main panel so the popup stands out from
+                // the scrollback area behind it. DimColor() is the
+                // theme-agnostic way to get that depth without
+                // expanding every theme table entry with a separate
+                // "popup_bg" colour.
+                HBRUSH pbg = CreateSolidBrush(DimColor(theme_.panel, 0.55f));
+                FillRect(mdc, &pr, pbg);
+                DeleteObject(pbg);
+                // 1 px accent outline.
+                HPEN outline = CreatePen(PS_SOLID, 1, DimColor(theme_.accent, 0.6f));
+                HPEN old_p = (HPEN)SelectObject(mdc, outline);
+                HBRUSH no_brush = (HBRUSH)GetStockObject(NULL_BRUSH);
+                HBRUSH old_b = (HBRUSH)SelectObject(mdc, no_brush);
+                Rectangle(mdc, pr.left, pr.top, pr.right, pr.bottom);
+                SelectObject(mdc, old_p);
+                SelectObject(mdc, old_b);
+                DeleteObject(outline);
+
+                // Clip all subsequent TextOutW calls to the popup's
+                // interior. The previous char-budget truncation in
+                // the description draw was a guess at how many chars
+                // would fit; with a real clip region we can paint the
+                // full string and let GDI clip the overflow pixels
+                // (still ugly visually, but won't bleed into the
+                // scrollback below the popup). SaveDC / RestoreDC
+                // bracket the clip so it doesn't affect drawing past
+                // the popup.
+                const int saved_dc = SaveDC(mdc);
+                IntersectClipRect(mdc, pr.left + 1, pr.top + 1,
+                                       pr.right - 1, pr.bottom - 1);
+
+                const int scroll = popup_.scroll_offset;
+                int row_y = popup_y + 4;
+                for (int vi = 0; vi < visible_n; ++vi) {
+                    const int idx = scroll + vi;
+                    if (idx < 0 || idx >= n) break;
+                    const auto& it = popup_.items[idx];
+                    const bool selected   = (idx == popup_.selected);
+                    const bool is_current = (it.value == "current");
+                    const bool is_default = (it.value == "default");
+                    if (selected) {
+                        RECT rr = { popup_x + 2, row_y,
+                                    popup_x + popup_w - 2,
+                                    row_y + line_height_ };
+                        // Selected row: accent-tinted but dim enough
+                        // that the row text stays readable on top.
+                        HBRUSH selbg = CreateSolidBrush(DimColor(theme_.accent, 0.22f));
+                        FillRect(mdc, &rr, selbg);
+                        DeleteObject(selbg);
+                    }
+                    // Left-edge accent bar marks the current value's
+                    // row (independent of selection) so the user can
+                    // always spot "what's set right now" while cycling
+                    // Up/Down through the value list. Softer dim bar
+                    // for the default value, so reset-to-default is
+                    // also visible without competing.
+                    if (is_current || is_default) {
+                        RECT bar = { popup_x + 2, row_y,
+                                     popup_x + 4,
+                                     row_y + line_height_ };
+                        COLORREF c = is_current
+                            ? theme_.accent
+                            : DimColor(theme_.accent, 0.45f);
+                        HBRUSH bb = CreateSolidBrush(c);
+                        FillRect(mdc, &bar, bb);
+                        DeleteObject(bb);
+                    }
+                    // Name with match-span highlighting. Walk the
+                    // spans, emitting the in-span runs in accent
+                    // colour and the out-of-span runs in `text`.
+                    // Current-value rows tint the WHOLE name in
+                    // accent so the marker isn't just on the bar --
+                    // the eye lands on the highlighted name first.
+                    const std::string& name = it.name;
+                    int tx = popup_x + 8;
+                    const COLORREF name_fg = is_current
+                        ? theme_.accent
+                        : theme_.text;
+                    std::size_t cursor_ch = 0;
+                    auto draw_run = [&](std::size_t a, std::size_t b,
+                                        COLORREF col) {
+                        if (a >= b) return;
+                        SetTextColor(mdc, col);
+                        auto wbuf = ToWide(std::string_view(
+                            name.data() + a, b - a));
+                        if (wbuf.empty()) return;
+                        TextOutW(mdc, tx, row_y, wbuf.data(),
+                                 static_cast<int>(wbuf.size()));
+                        SIZE sz{};
+                        GetTextExtentPoint32W(mdc, wbuf.data(),
+                            static_cast<int>(wbuf.size()), &sz);
+                        tx += sz.cx;
+                    };
+                    for (const auto& sp : it.spans) {
+                        if (sp.first > cursor_ch) {
+                            draw_run(cursor_ch, sp.first, name_fg);
+                        }
+                        draw_run(sp.first, sp.second, theme_.accent);
+                        cursor_ch = sp.second;
+                    }
+                    if (cursor_ch < name.size()) {
+                        draw_run(cursor_ch, name.size(), name_fg);
+                    }
+                    // Optional kind chip ("cvar" / "cmd") for token-0
+                    // rows. Mirrors the web console + Mac overlay so a
+                    // user reading the popup can tell at a glance
+                    // whether a candidate is a cvar (settable) or a
+                    // command (callable). Drawn in dim so it doesn't
+                    // compete with the name -- value position rows
+                    // (kind == Value) don't get a chip since the kind
+                    // is implicit from context.
+                    if (it.kind == pt::console::CompletionKind::Cvar ||
+                        it.kind == pt::console::CompletionKind::Command) {
+                        const wchar_t* chip =
+                            (it.kind == pt::console::CompletionKind::Cvar)
+                                ? L"cvar" : L"cmd";
+                        const int chip_len = (int)wcslen(chip);
+                        SetTextColor(mdc, theme_.dim);
+                        tx += 8;
+                        TextOutW(mdc, tx, row_y, chip, chip_len);
+                        SIZE csz{};
+                        GetTextExtentPoint32W(mdc, chip, chip_len, &csz);
+                        tx += csz.cx;
+                    }
+                    // Right-justified value chip + truncated
+                    // description, separated by ` -- `. Painted in
+                    // dim so they don't fight the name for the eye.
+                    tx += 12;
+                    if (!it.value.empty()) {
+                        // Value chip colour: accent for "current",
+                        // dimmed-accent for "default", plain dim for
+                        // the cvar's actual current value when it's
+                        // shown on a non-value-position row (cvar
+                        // candidate at token 0). The is_current /
+                        // is_default flags above already capture the
+                        // tag-driven cases.
+                        COLORREF vc = is_current
+                            ? theme_.accent
+                            : (is_default ? DimColor(theme_.accent, 0.6f)
+                                          : theme_.dim);
+                        SetTextColor(mdc, vc);
+                        auto vbuf = ToWide(it.value);
+                        if (!vbuf.empty()) {
+                            TextOutW(mdc, tx, row_y, vbuf.data(),
+                                     static_cast<int>(vbuf.size()));
+                            SIZE sz{};
+                            GetTextExtentPoint32W(mdc, vbuf.data(),
+                                static_cast<int>(vbuf.size()), &sz);
+                            tx += sz.cx + 12;
+                        }
+                    }
+                    if (!it.description.empty()) {
+                        // Clip region (IntersectClipRect above) keeps
+                        // the text from bleeding past the popup right
+                        // edge into the scrollback. We still cap with
+                        // a char-budget truncate so the visible part
+                        // ends in an ellipsis instead of a sharp pixel
+                        // cut -- nicer reading.
+                        const int budget = (popup_x + popup_w - 8) - tx;
+                        if (budget > 24) {
+                            std::string desc = it.description;
+                            // Rough estimate: ~7 px/char in monospace
+                            // at default line_height_; halve when at
+                            // 2x scale. Just pick a sane cap.
+                            const std::size_t max_chars =
+                                static_cast<std::size_t>(std::max(0, budget / 7));
+                            if (desc.size() > max_chars && max_chars > 3) {
+                                // UTF-8 safe truncation -- naive resize
+                                // by byte count can split a multibyte
+                                // codepoint, and ToWide()'s
+                                // MultiByteToWideChar(CP_UTF8) returns 0
+                                // on invalid UTF-8, dropping the entire
+                                // description from the popup row. Cvar
+                                // descriptions contain non-ASCII (e.g.
+                                // "≈" in Engine.cpp).
+                                pt::console::Utf8SafeTruncate(desc, max_chars - 1);
+                                desc.push_back('\xE2');  // unicode ellipsis "…"
+                                desc.push_back('\x80');  // utf-8 bytes
+                                desc.push_back('\xA6');
+                            }
+                            SetTextColor(mdc, theme_.dim);
+                            auto dbuf = ToWide(desc);
+                            if (!dbuf.empty()) {
+                                TextOutW(mdc, tx, row_y, dbuf.data(),
+                                         static_cast<int>(dbuf.size()));
+                            }
+                        }
+                    }
+                    row_y += line_height_;
+                }
+
+                // Drop the popup clip so subsequent draws (none today
+                // but defence-in-depth for any future Paint() append)
+                // aren't constrained.
+                RestoreDC(mdc, saved_dc);
             }
         }
     }

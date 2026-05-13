@@ -568,7 +568,115 @@ body::after {
 }
 .ghost-typed      { color: transparent; }
 .ghost-tail       { color: var(--fg-dim); }
+/* Yellow tint when the previewed candidate is the cvar's current value
+ * (Up/Down cycling lands on it). --warn is the warmest per-theme slot
+ * we already have and is yellow-ish across every dark theme; the Win32
+ * overlay's matching code uses RGB(255,200,80) -- amber/vault's prompt
+ * colour -- to stay warm-toned regardless of palette. Matches the popup
+ * row's "this is what's set right now" affordance but stays visible
+ * inline even when the popup is closed. */
+.ghost-tail.is-current { color: var(--warn); }
 .ghost-annotation { color: var(--fg-dim); opacity: 0.7; font-style: italic; }
+
+/* ---------- VS Code-style completion popup ----------
+   Anchored to the input row (input-wrap is position:relative). Floats
+   *upward* so it sits above the input -- the input is at the bottom
+   of the output panel, so a downward dropdown would clip the page
+   chrome. `bottom: 100%` + `margin-bottom` gives a small gap above
+   the prompt. Width matches the input (so name + value + descr line
+   up); max-height + overflow gives us a scrollable list when there
+   are many matches. */
+.input-completions {
+  position: absolute;
+  left: 0; right: 0;
+  bottom: 100%;
+  margin-bottom: 6px;
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--panel-bg, #111);
+  border: 1px solid var(--border, #2a2a2a);
+  border-radius: 6px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+  z-index: 10;
+  font: inherit;
+  padding: 4px 0;
+}
+.input-completions[hidden] { display: none; }
+.completion-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 12px;
+  padding: 4px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  align-items: center;
+}
+.completion-row:hover { background: var(--accent-dim, #1a1a1a); }
+.completion-row.selected {
+  background: var(--accent-glow, #2a2a4a);
+  outline: 1px solid var(--accent, #5af);
+  outline-offset: -1px;
+}
+.completion-name {
+  color: var(--fg, #ddd);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.completion-name .match {
+  color: var(--accent, #5af);
+  font-weight: 700;
+}
+.completion-kind {
+  color: var(--fg-dim, #888);
+  font-size: 0.85em;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.completion-value {
+  color: var(--fg-dim, #888);
+  font-size: 0.9em;
+  max-width: 12ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Value-position row whose name IS the cvar's current value gets
+   an accent tint on its name AND a left-edge accent bar regardless
+   of selection state. So when the user cycles Up/Down through the
+   value list, the "this is what's set right now" row stays
+   visually distinct from the others -- you can always see at a
+   glance which value is live, separate from which row is being
+   highlighted by the popup cursor. */
+.completion-row.is-current {
+  border-left: 2px solid var(--accent, #5af);
+  padding-left: 10px;            /* 12 - 2 to balance the border */
+}
+.completion-row.is-current .completion-name { color: var(--accent, #5af); }
+.completion-row.is-current .completion-value {
+  color: var(--accent, #5af);
+  font-weight: 600;
+}
+/* Default-value row gets a softer accent tint so users can also
+   spot "what would I get if I reset this cvar" without it
+   competing with the current-value marker. */
+.completion-row.is-default {
+  border-left: 2px solid var(--accent-dim, #455);
+  padding-left: 10px;
+}
+.completion-row.is-default .completion-value {
+  color: var(--accent-dim, #99a);
+  font-weight: 500;
+}
+.completion-desc {
+  grid-column: 1 / -1;
+  color: var(--fg-dim, #888);
+  font-size: 0.85em;
+  opacity: 0.75;
+  margin-top: 1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* ---------- cvars + commands sidebar ---------- */
 .kv-list {
