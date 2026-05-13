@@ -9,12 +9,15 @@
 #import <Cocoa/Cocoa.h>
 
 #include "PerfOverlay.h"
+#include "../console/Console.h"
 #include "../core/Log.h"
 
 #include <fmt/format.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -54,6 +57,10 @@ Theme PaletteFor(std::string_view name) {
     return                        {"hardcore",  RGB8(12, 14, 22, 0.85), RGB8(220,220,232), RGB8(  0,240,255), RGB8(110,120,146), RGB8(  0,240,255)};
 }
 
+// Baseline (1.0x) sizing constants. Effective layout uses these
+// multiplied by the live `r_perf_overlay_scale` cvar value (clamped to
+// [0.5, 3.0]) -- mirrors WinPerf::EnsureScale() on Windows.
+constexpr int kFontPt      = 11;
 constexpr int kPanelW      = 296;
 constexpr int kPanelMargin = 12;
 constexpr int kLineHeight  = 16;
@@ -72,12 +79,30 @@ int LinesForLevel(int level) {
 
 }  // namespace
 
+@class PtPerfPanel;
+
 @interface PtPerfView : NSView
 @property (assign) int level;
 @property (assign) Theme theme;
 @property (assign) pt::app::PerfStats stats;
 @property (strong) NSMutableArray<NSNumber*>* history;
+// Weak back-reference so a scale change inside drawRect: can ping the
+// owning panel to recompute its frame (panel width / row count
+// derive from the scale, same as Win32 WinPerf::Reposition()).
+@property (weak) PtPerfPanel* panel;
 - (void)applyStats:(const pt::app::PerfStats&)s;
+// Re-poll the live `r_perf_overlay_scale` cvar. Cheap when unchanged.
+// Returns YES if the cached scale changed -- the caller (drawRect:)
+// uses that to trigger a panel re-layout before drawing this frame.
+- (BOOL)ensureScale;
+// Effective layout values, scale * baseline. Read by drawRect: and
+// PtPerfPanel's layoutToParent so they share one source of truth.
+- (CGFloat)scale;
+- (int)scaledPanelW;
+- (int)scaledLineHeight;
+- (int)scaledGraphH;
+- (int)scaledPaddingX;
+- (int)scaledPaddingY;
 @end
 
 @interface PtPerfPanel : NSPanel
@@ -96,7 +121,14 @@ int LinesForLevel(int level) {
 @end
 
 // ---------------------------------------------------------------------------
-@implementation PtPerfView
+@implementation PtPerfView {
+    // Effective r_perf_overlay_scale value last applied by -ensureScale.
+    // Cvar IS the source of truth (matches Win32 WinPerf::EnsureScale).
+    // Polled from drawRect: -- one cvar lookup + float compare per
+    // paint when unchanged, NSFont rebuild + LOG_INFO when not.
+    float    _scale;
+    NSFont*  _font;
+}
 
 - (instancetype)initWithFrame:(NSRect)frame {
     self = [super initWithFrame:frame];
@@ -106,6 +138,9 @@ int LinesForLevel(int level) {
     self.layer.masksToBounds = YES;
     self.history = [NSMutableArray array];
     self.theme = PaletteFor("hardcore");
+    _scale = 1.0f;
+    _font  = [NSFont monospacedSystemFontOfSize:kFontPt
+                                         weight:NSFontWeightRegular];
     return self;
 }
 
@@ -114,6 +149,39 @@ int LinesForLevel(int level) {
 // Forward all mouse events to the parent window so the overlay never
 // captures clicks (it's a read-only HUD over the game viewport).
 - (NSView*)hitTest:(NSPoint)point { (void)point; return nil; }
+
+- (CGFloat)scale            { return (CGFloat)_scale; }
+- (int)scaledPanelW         { return std::max(64,  (int)(kPanelW      * _scale + 0.5f)); }
+- (int)scaledLineHeight     { return std::max(8,   (int)(kLineHeight  * _scale + 0.5f)); }
+- (int)scaledGraphH         { return std::max(16,  (int)(kGraphH      * _scale + 0.5f)); }
+- (int)scaledPaddingX       { return std::max(2,   (int)(kPaddingX    * _scale + 0.5f)); }
+- (int)scaledPaddingY       { return std::max(2,   (int)(kPaddingY    * _scale + 0.5f)); }
+
+- (BOOL)ensureScale {
+    auto* v = pt::console::Console::Get().FindCVar("r_perf_overlay_scale");
+    if (v == nullptr) return NO;
+    char* end = nullptr;
+    float requested = std::strtof(v->value.c_str(), &end);
+    // Reject non-finite (NaN / +-Inf) before any math -- same trap
+    // WinPerf::EnsureScale guards against. NaN propagates through the
+    // < / > clamps unordered, sneaks past the early-exit, and ends up
+    // multiplying every layout constant for an undefined-behaviour
+    // float-to-int cast.
+    if (end == v->value.c_str() || !std::isfinite(requested)) requested = 1.0f;
+    if (requested < 0.5f) requested = 0.5f;
+    if (requested > 3.0f) requested = 3.0f;
+    if (std::fabs(requested - _scale) < 1e-3f) return NO;
+
+    _scale = requested;
+    const CGFloat new_pt = (CGFloat)kFontPt * requested;
+    _font  = [NSFont monospacedSystemFontOfSize:new_pt
+                                         weight:NSFontWeightRegular];
+    LOG_INFO("PerfOverlay: r_perf_overlay_scale={:.2f} -> "
+             "font={:.1f}pt panel_w={} line_h={} graph_h={}",
+             requested, new_pt, [self scaledPanelW],
+             [self scaledLineHeight], [self scaledGraphH]);
+    return YES;
+}
 
 - (void)applyStats:(const pt::app::PerfStats&)s {
     self.stats = s;
@@ -126,6 +194,17 @@ int LinesForLevel(int level) {
 
 - (void)drawRect:(NSRect)dirty {
     (void)dirty;
+    // Polling here (NOT applyStats:) is the single point where any cvar
+    // setter -- web GUI, in-game overlay, autoexec -- gets reflected.
+    // applyStats only fires on Update(), so a scale change with the
+    // overlay paused (level=0 + then re-enabled) wouldn't propagate.
+    if ([self ensureScale]) {
+        // Panel width / row count derive from scale; ping the parent
+        // panel so its frame catches up before this paint draws into
+        // a now-wrong-size view. Triggers a follow-up drawRect: with
+        // the corrected bounds.
+        if (self.panel != nil) [self.panel layoutToParent];
+    }
     NSRect b = self.bounds;
     Theme  t = self.theme;
     pt::app::PerfStats s = self.stats;
@@ -138,21 +217,23 @@ int LinesForLevel(int level) {
     [t.accent setFill];
     NSRectFill(NSMakeRect(0, b.size.height - 1, b.size.width, 1));
 
-    NSFont* font = [NSFont monospacedSystemFontOfSize:11
-                                               weight:NSFontWeightRegular];
+    NSFont* font = _font;
+    const int line_h = [self scaledLineHeight];
+    const int padX   = [self scaledPaddingX];
+    const int padY   = [self scaledPaddingY];
 
     // AppKit y-up; place text from the top by tracking a top-relative
     // offset that decrements per row. `__block` lets the closure
     // below mutate it (Objective-C captures are const by default).
-    __block CGFloat top = b.size.height - kPaddingY - kLineHeight;
+    __block CGFloat top = b.size.height - padY - line_h;
 
     auto drawRow = ^(NSColor* col, NSString* text) {
         NSDictionary* attrs = @{
             NSFontAttributeName: font,
             NSForegroundColorAttributeName: col,
         };
-        [text drawAtPoint:NSMakePoint(kPaddingX, top) withAttributes:attrs];
-        top -= kLineHeight;
+        [text drawAtPoint:NSMakePoint(padX, top) withAttributes:attrs];
+        top -= line_h;
     };
 
     // Tier-1 lines.
@@ -173,10 +254,10 @@ int LinesForLevel(int level) {
     }
 
     if (self.level >= 3 && self.history.count > 0) {
-        CGFloat gx = kPaddingX;
-        CGFloat gy = kPaddingY;
-        CGFloat gw = b.size.width - 2 * kPaddingX;
-        CGFloat gh = kGraphH;
+        CGFloat gx = padX;
+        CGFloat gy = padY;
+        CGFloat gw = b.size.width - 2 * padX;
+        CGFloat gh = [self scaledGraphH];
 
         // Border.
         [t.dim setStroke];
@@ -252,6 +333,7 @@ int LinesForLevel(int level) {
     PtPerfView* v = [[PtPerfView alloc] initWithFrame:NSMakeRect(0, 0, kPanelW, 64)];
     self.contentView = v;
     self.view = v;
+    v.panel  = self;       // weak back-ref so EnsureScale can ping us
 
     return self;
 }
@@ -259,16 +341,22 @@ int LinesForLevel(int level) {
 - (void)layoutToParent {
     NSWindow* parent = self.parentRenderWindow;
     if (!parent) return;
+    // Pull the live scale BEFORE computing height so a cvar change
+    // takes effect on the same NotifyParentResized / SetLevel hop.
+    [self.view ensureScale];
     NSRect pf = parent.frame;
     int level = self.view.level;
     int lines = LinesForLevel(level);
-    CGFloat h = kPaddingY * 2 + lines * kLineHeight;
-    if (level >= 3) h += kGraphH + kPaddingY;
-    NSRect f = NSMakeRect(pf.origin.x + pf.size.width - kPanelW - kPanelMargin,
+    const int line_h = [self.view scaledLineHeight];
+    const int padY   = [self.view scaledPaddingY];
+    const int panelW = [self.view scaledPanelW];
+    CGFloat h = padY * 2 + lines * line_h;
+    if (level >= 3) h += [self.view scaledGraphH] + padY;
+    NSRect f = NSMakeRect(pf.origin.x + pf.size.width - panelW - kPanelMargin,
                           pf.origin.y + pf.size.height - h - kPanelMargin,
-                          kPanelW, h);
+                          panelW, h);
     [self setFrame:f display:YES];
-    self.view.frame = NSMakeRect(0, 0, kPanelW, h);
+    self.view.frame = NSMakeRect(0, 0, panelW, h);
     [self.view setNeedsDisplay:YES];
 }
 

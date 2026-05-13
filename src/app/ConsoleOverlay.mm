@@ -14,9 +14,13 @@
 
 #include "../console/Completion.h"
 #include "../console/Console.h"
+#include "../core/Log.h"
 
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>
+
+#include <cmath>
+#include <cstdlib>
 
 // Tiny logo-drawing NSView. Same glyph as the web console: a hexagon
 // (mesh primitive) framing a three-bounce ray with hit-point dots.
@@ -266,6 +270,16 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
 // Called by PtConsolePopupView's drawRect: -- keeps the popup state
 // (items / selected / scroll_offset) private to PtConsoleView.
 - (void)drawPopupInRect:(NSRect)bounds;
+
+// Polls the live `con_font_scale` cvar. Cheap when unchanged (one
+// cvar lookup + float compare). Called from ConsoleOverlay::Repaint
+// whenever a cvar setter pings us, so a value typed into the web
+// console / autoexec / CLI propagates to the in-game overlay without
+// requiring the user to type something else first. Mirrors Win32's
+// EnsureFontScale() polling pattern -- only the AppKit side has to
+// rebuild four NSFont instances (input / output / prompt / status)
+// instead of the one HFONT Win32 carries.
+- (void)applyFontScale;
 @end
 
 // ---------------------------------------------------------------------------
@@ -343,6 +357,11 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     NSInteger                                  _popupSelected;
     pt::console::TokenInfo                     _popupToken;
     NSInteger                                  _popupScrollOffset;
+    // Effective con_font_scale value last applied by -applyFontScale.
+    // Driven by the `con_font_scale` cvar; polled from
+    // ConsoleOverlay::Repaint so cvar setters propagate live. Default
+    // 1.0 = baseline 13/12/9 pt fonts (input / output / status).
+    float                                      _fontScale;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame {
@@ -359,6 +378,7 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     _popupActive       = NO;
     _popupSelected     = -1;
     _popupScrollOffset = 0;
+    _fontScale         = 1.0f;
 
     // Two-layer backdrop. NSVisualEffectView gives the blurred-edge
     // vibrancy; a dark tint sub-layer on TOP of it guarantees text
@@ -1167,9 +1187,14 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     NSColor* warn    = PtRGB(1.0, 200.0/255.0, 80.0/255.0);
 
     const NSRect bounds = self.popupView.bounds;
-    // Background -- darker than the panel tint so the popup stands out
-    // from the scrollback area visible behind it.
-    NSColor* popupBg = PtRGBA(0.012, 0.016, 0.026, 0.94);
+    // Background -- FULLY opaque so the scrollback rendered behind the
+    // popup zone (NSTextView in the NSScrollView underneath) doesn't
+    // bleed through. Semi-transparency here is tempting because the
+    // panel itself uses NSVisualEffectView vibrancy, but the same
+    // vibrancy already shows through the popup's location to the
+    // scrollback's text -- a translucent popup on top would render
+    // popup rows over a chaos of overlapping log text.
+    NSColor* popupBg = PtRGB(0.018, 0.024, 0.042);
     [popupBg setFill];
     NSRectFill(bounds);
     // 1 px accent outline (slightly dimmed so it doesn't shout).
@@ -1353,6 +1378,54 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     }
 }
 
+- (void)applyFontScale {
+    auto* v = pt::console::Console::Get().FindCVar("con_font_scale");
+    if (v == nullptr) return;
+    char* end = nullptr;
+    float requested = std::strtof(v->value.c_str(), &end);
+    // Reject "no digits parsed" AND non-finite values (NaN / +-Inf):
+    // strtof happily returns a quiet NaN for "nan"/"NaN" and +-Inf for
+    // "inf"; once non-finite slips into the comparisons below, the < /
+    // > clamps return false in BOTH directions (NaN compares unordered),
+    // so requested would stay NaN, sneak past the early-exit, and the
+    // float * point-size casts in the NSFont calls below would propagate
+    // NaN into AppKit -- undefined behaviour. Fall back to 1.0 (the
+    // engineering default) before any math. Mirrors the equivalent
+    // guard in WinOverlay::EnsureFontScale().
+    if (end == v->value.c_str() || !std::isfinite(requested)) requested = 1.0f;
+    if (requested < 0.5f) requested = 0.5f;
+    if (requested > 3.0f) requested = 3.0f;
+    if (std::fabs(requested - _fontScale) < 1e-3f) return;
+
+    _fontScale = requested;
+    const CGFloat input_pt  = (CGFloat)13.0 * requested;
+    const CGFloat output_pt = (CGFloat)12.0 * requested;
+    const CGFloat status_pt = (CGFloat)9.0  * requested;
+    self.inputField.font  = [NSFont monospacedSystemFontOfSize:input_pt
+                                                        weight:NSFontWeightRegular];
+    self.outputView.font  = [NSFont monospacedSystemFontOfSize:output_pt
+                                                        weight:NSFontWeightRegular];
+    self.promptLabel.font = [NSFont monospacedSystemFontOfSize:input_pt
+                                                        weight:NSFontWeightSemibold];
+    self.statusLabel.font = [NSFont monospacedSystemFontOfSize:status_pt
+                                                        weight:NSFontWeightSemibold];
+    self.ghostLabel.font  = [NSFont monospacedSystemFontOfSize:input_pt
+                                                        weight:NSFontWeightRegular];
+    // Popup row count + line height derive from inputField.font, so a
+    // scale change shrinks/grows the popup in lockstep. Existing
+    // ghostLabel string still has its own font baked into the
+    // attributed runs -- re-render so the dim tail picks up the new
+    // size on the next paint.
+    if (_popupActive) {
+        [self layoutPopup];
+        [self renderInlineGhost];
+        [self.popupView setNeedsDisplay:YES];
+    }
+    LOG_INFO("ConsoleOverlay: con_font_scale={:.2f} -> "
+             "input={:.1f}pt output={:.1f}pt status={:.1f}pt",
+             requested, input_pt, output_pt, status_pt);
+}
+
 @end
 
 // ---------------------------------------------------------------------------
@@ -1528,6 +1601,14 @@ bool ConsoleOverlay::Init(void* ns_window) {
     opaque_ = (__bridge_retained void*)panel;
     SetGlobalInstance(this);
 
+    // Pick up the live `con_font_scale` value that may already have
+    // been set by autoexec.cfg / CLI args before the overlay was
+    // constructed. Without this poll, the first Show would render at
+    // 1.0x and only catch up to the configured scale on the next cvar
+    // change. Cheap (one cvar lookup + float compare); no-op when the
+    // cvar is at its default.
+    [panel.consoleView applyFontScale];
+
     // Forward log lines into the overlay (the panel's contentView).
     return true;
 }
@@ -1580,9 +1661,15 @@ void ConsoleOverlay::Repaint() {
     // the steady state -- but it's a cheap defensive safety net for
     // any future caller that bypasses Drain. Win32 implementation is
     // in ConsoleOverlay_Win32.cpp.
+    //
+    // applyFontScale is the Mac equivalent of WinOverlay::EnsureFontScale
+    // -- polling the live `con_font_scale` cvar so a change typed in
+    // the web console / autoexec / CLI takes effect on the next
+    // Repaint, with no per-frame cost when the value is unchanged.
     if (!opaque_) return;
     PtConsolePanel* panel = (__bridge PtConsolePanel*)opaque_;
     dispatch_async(dispatch_get_main_queue(), ^{
+        [panel.consoleView applyFontScale];
         [panel.consoleView setNeedsDisplay:YES];
     });
 }
