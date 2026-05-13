@@ -40,9 +40,10 @@
 [[vk::binding(0, 0)]] RWTexture2D<float4> hdr_in;
 [[vk::binding(1, 0)]] RWTexture2D<float4> swap_out;
 [[vk::binding(2, 0)]] RWStructuredBuffer<float> exposure_state;
-// Bloom mip 0 (half-res linear HDR). Bound to a 1x1 zero placeholder
-// when r_bloom is off / not built -- combined with bloom_intensity = 0
-// this collapses the bloom sample to a no-op.
+// Bloom mip 0 (half-res linear HDR). When Vulkan bloom is disabled / not
+// built, the host binds a safe valid fallback view here and pushes
+// bloom_intensity = 0, so the shader's bloom path short-circuits before
+// any sample becomes observable.
 [[vk::binding(3, 0)]] RWTexture2D<float4> bloom_tex;
 
 [[vk::push_constant]]
