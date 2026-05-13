@@ -737,22 +737,25 @@
     while (s > 0 && !isWs(v[s - 1])) --s;
     while (e < v.length && !isWs(v[e])) ++e;
     const text = v.slice(s, e);
-    // Token-0 detection: scan from start of input through `s`; if
-    // we see any non-whitespace before `s`, we're past token 0.
+    // Token-0 detection: scan from start of input through `s`. The
+    // cursor is in token-0 context whenever its position is at OR
+    // BEFORE the first non-whitespace run -- i.e. the user is typing
+    // / browsing where token 0 will land. A cursor anywhere past the
+    // first run's trailing whitespace lives in a later (value)
+    // token. A cursor in leading whitespace (s < tStart) is logically
+    // still "at the start of the command line" since the executor
+    // strips leading whitespace before tokenising, so Tab/Ctrl+Space
+    // there should offer cvar/command names rather than value
+    // candidates for some downstream first token.
     let isToken0 = true;
     let firstTok = '';
     {
-      // Find the first non-whitespace run -- that's "token 0" by
-      // definition. The cursor's word is `isToken0` only when its
-      // start aligns with the start of that run (`s === tStart`). A
-      // cursor anywhere past the first run's trailing whitespace
-      // lives in a later token.
       let i = 0;
       while (i < v.length && isWs(v[i])) ++i;
       const tStart = i;
       while (i < v.length && !isWs(v[i])) ++i;
       firstTok = v.slice(tStart, i);
-      isToken0 = (s === tStart);
+      isToken0 = (s <= tStart);
     }
     return { start: s, end: e, text, isToken0, firstTok };
   }

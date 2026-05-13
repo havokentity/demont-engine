@@ -66,11 +66,11 @@ namespace cvar {
     PT_CVAR(app_overlay_enabled, "1",
             "Enable the in-window native console overlay (backtick toggles)", CVAR_ARCHIVE);
     PT_CVAR(con_font_scale, "1.0",
-            "Console overlay font scale (1.0 = baseline -- 14 logical-unit "
+            "Console overlay font scale. 1.0 = baseline (14 logical-unit "
             "CreateFontW height on Win32; 13/12/9 pt input/output/status "
-            "NSFont on Mac). Effective range 0.5..3.0; values outside are "
-            "clamped at Paint() / Repaint() time. Honored by both the "
-            "Win32 and Cocoa overlays.",
+            "NSFont on Mac). Effective range 0.5..3.0; values outside "
+            "are clamped at render time. Honored by both the Win32 and "
+            "Cocoa overlays.",
             CVAR_ARCHIVE);
     PT_CVAR(r_perf_overlay,    "0",
             "Tiered in-game performance overlay. 0 = off, 1 = fps + frame_ms, "
@@ -79,13 +79,12 @@ namespace cvar {
             "timestamps once VkQueryPool / MTLCounterSampleBuffer is wired.)",
             CVAR_ARCHIVE);
     PT_CVAR(r_perf_overlay_scale, "1.0",
-            "Perf overlay scale (1.0 = baseline -- 13 logical-unit "
-            "CreateFontW height on Win32; 11 pt monospaced NSFont on Mac. "
-            "Both backends scale the 296px panel width + 44px sparkline "
-            "height + line height + paddings by the same factor.) "
+            "Perf overlay scale. 1.0 = baseline (13 logical-unit "
+            "CreateFontW height on Win32; 11 pt monospaced NSFont on Mac). "
+            "Both backends scale the 296px panel width, 44px sparkline "
+            "height, line height and paddings by the same factor. "
             "Effective range 0.5..3.0; values outside are clamped at "
-            "Paint() / drawRect: time. Honored by both the Win32 and "
-            "Cocoa overlays.",
+            "render time. Honored by both the Win32 and Cocoa overlays.",
             CVAR_ARCHIVE);
     PT_CVAR(r_perf_overlay_mode, "native",
             "Backend for the perf overlay. 'native' = OS-native child window "

@@ -94,8 +94,32 @@ int ScoreMatch(std::string_view name, std::string_view query,
 //
 // `description_clip` truncates each candidate's description before
 // returning so the caller doesn't have to do it. 0 = keep full text.
+// Truncation is UTF-8 safe (Utf8SafeTruncate below) -- some cvar
+// descriptions contain non-ASCII characters (e.g. "≈"), and a naive
+// std::string::resize at a byte boundary could split a multibyte
+// codepoint and produce invalid UTF-8 that downstream renderers
+// (MultiByteToWideChar, [NSString stringWithUTF8String:]) silently
+// drop.
 std::vector<CompletionMatch> BuildCompletions(const TokenInfo& token,
                                               std::size_t max_results    = 60,
                                               std::size_t description_clip = 120);
+
+// Truncate a UTF-8 string to AT MOST `max_bytes` bytes WITHOUT
+// splitting a multibyte codepoint. If the byte at position max_bytes
+// is a UTF-8 continuation byte (high bits 10xxxxxx), backs up one
+// byte at a time until we land on a codepoint START byte (anything
+// other than 10xxxxxx). Result may be shorter than max_bytes by up
+// to 3 bytes (UTF-8 codepoints are at most 4 bytes long, so worst
+// case we back up over 3 continuation bytes). Used by BuildCompletions
+// itself and by frontend popup renderers that need to re-truncate to
+// a pixel-width budget.
+inline void Utf8SafeTruncate(std::string& s, std::size_t max_bytes) {
+    if (s.size() <= max_bytes) return;
+    while (max_bytes > 0 &&
+           (static_cast<unsigned char>(s[max_bytes]) & 0xC0) == 0x80) {
+        --max_bytes;
+    }
+    s.resize(max_bytes);
+}
 
 }  // namespace pt::console

@@ -45,13 +45,20 @@ TokenInfo CurrentToken(std::string_view input, std::size_t cursor) {
 
     // First-token detection: scan from start of input through `s`;
     // collect the first non-whitespace run as first_tok. is_token0
-    // == true iff s coincides with the start of that first run.
+    // == true iff the cursor sits AT or BEFORE the first non-
+    // whitespace run -- i.e. the user is typing / browsing where
+    // token 0 will land. A cursor in leading whitespace (s < t0_start)
+    // is logically still "at the start of the command line" since
+    // Console::Execute strips leading whitespace before tokenising,
+    // so Tab / Ctrl+Space at that position should offer cvar/command
+    // names rather than value candidates for some downstream first
+    // token the user hasn't reached yet.
     std::size_t i = 0;
     while (i < input.size() && is_ws(input[i])) ++i;
     std::size_t t0_start = i;
     while (i < input.size() && !is_ws(input[i])) ++i;
     t.first_tok  = std::string(input.substr(t0_start, i - t0_start));
-    t.is_token0  = (s == t0_start);
+    t.is_token0  = (s <= t0_start);
     return t;
 }
 
@@ -276,9 +283,12 @@ std::vector<CompletionMatch> BuildCompletions(const TokenInfo& token,
     }
     if (description_clip > 0) {
         for (auto& m : ranked) {
-            if (m.description.size() > description_clip) {
-                m.description.resize(description_clip);
-            }
+            // UTF-8 safe -- some cvar descriptions contain non-ASCII
+            // (e.g. "≈" in Engine.cpp), and std::string::resize at a
+            // raw byte index can split a multibyte codepoint, leaving
+            // an invalid UTF-8 sequence that downstream renderers
+            // silently drop.
+            Utf8SafeTruncate(m.description, description_clip);
         }
     }
     return ranked;

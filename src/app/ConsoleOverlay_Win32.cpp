@@ -889,31 +889,44 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (w == '`') { Hide(); return 0; }
         if (w == '\r') { SubmitInput(); return 0; }
         if (w == '\b') {
+            // Hold the mutex across BOTH the input mutation AND the
+            // RefreshCompletions call -- RefreshCompletions reads
+            // input_ / cursor_ and writes popup_, so its caller must
+            // hold state_mutex_ (matching the WM_KEYDOWN call sites).
+            // Earlier rev released the lock between mutate + refresh,
+            // creating a window where another thread could observe a
+            // half-updated state. Repaint() is just InvalidateRect,
+            // safe to call after the lock drops.
             {
                 std::lock_guard lk(state_mutex_);
                 if (cursor_ > 0) { input_.erase(cursor_ - 1, 1); cursor_--; }
+                // Re-rank completions on every text mutation --
+                // backspace narrows / widens the matching set
+                // depending on whether the char being removed was
+                // matching anywhere.
+                RefreshCompletions(/*force_show=*/false);
             }
-            // Re-rank completions on every text mutation -- backspace
-            // narrows / widens the matching set depending on whether
-            // the char being removed was matching anywhere.
-            RefreshCompletions(/*force_show=*/false);
             Repaint();
             return 0;
         }
         if (w >= 32 && w < 127) {
+            // Same locking rationale as the WM_BACK branch above:
+            // RefreshCompletions touches input_ / cursor_ / popup_
+            // and is contractually called with state_mutex_ held.
             {
                 std::lock_guard lk(state_mutex_);
                 input_.insert(cursor_, 1, static_cast<char>(w));
                 cursor_++;
+                // After every text mutation, re-rank completions
+                // against the new cursor context. The popup auto-
+                // shows when there are matches and the typed token
+                // is non-empty (or the user has just hit `<name> ` --
+                // ForceShow=true lets the value-position popup open
+                // without a query). Mirrors the web console's `input`
+                // event handler.
+                const bool typed_separator = (w == ' ');
+                RefreshCompletions(/*force_show=*/typed_separator);
             }
-            // After every text mutation, re-rank completions against
-            // the new cursor context. The popup auto-shows when there
-            // are matches and the typed token is non-empty (or the
-            // user has just hit `<name> ` -- ForceShow=true lets the
-            // value-position popup open without a query). Mirrors the
-            // web console's `input` event handler.
-            const bool typed_separator = (w == ' ');
-            RefreshCompletions(/*force_show=*/typed_separator);
             Repaint();
             return 0;
         }
@@ -1701,6 +1714,27 @@ void WinOverlay::Paint(HDC dc) {
                     if (cursor_ch < name.size()) {
                         draw_run(cursor_ch, name.size(), name_fg);
                     }
+                    // Optional kind chip ("cvar" / "cmd") for token-0
+                    // rows. Mirrors the web console + Mac overlay so a
+                    // user reading the popup can tell at a glance
+                    // whether a candidate is a cvar (settable) or a
+                    // command (callable). Drawn in dim so it doesn't
+                    // compete with the name -- value position rows
+                    // (kind == Value) don't get a chip since the kind
+                    // is implicit from context.
+                    if (it.kind == pt::console::CompletionKind::Cvar ||
+                        it.kind == pt::console::CompletionKind::Command) {
+                        const wchar_t* chip =
+                            (it.kind == pt::console::CompletionKind::Cvar)
+                                ? L"cvar" : L"cmd";
+                        const int chip_len = (int)wcslen(chip);
+                        SetTextColor(mdc, theme_.dim);
+                        tx += 8;
+                        TextOutW(mdc, tx, row_y, chip, chip_len);
+                        SIZE csz{};
+                        GetTextExtentPoint32W(mdc, chip, chip_len, &csz);
+                        tx += csz.cx;
+                    }
                     // Right-justified value chip + truncated
                     // description, separated by ` -- `. Painted in
                     // dim so they don't fight the name for the eye.
@@ -1744,7 +1778,15 @@ void WinOverlay::Paint(HDC dc) {
                             const std::size_t max_chars =
                                 static_cast<std::size_t>(std::max(0, budget / 7));
                             if (desc.size() > max_chars && max_chars > 3) {
-                                desc.resize(max_chars - 1);
+                                // UTF-8 safe truncation -- naive resize
+                                // by byte count can split a multibyte
+                                // codepoint, and ToWide()'s
+                                // MultiByteToWideChar(CP_UTF8) returns 0
+                                // on invalid UTF-8, dropping the entire
+                                // description from the popup row. Cvar
+                                // descriptions contain non-ASCII (e.g.
+                                // "≈" in Engine.cpp).
+                                pt::console::Utf8SafeTruncate(desc, max_chars - 1);
                                 desc.push_back('\xE2');  // unicode ellipsis "…"
                                 desc.push_back('\x80');  // utf-8 bytes
                                 desc.push_back('\xA6');

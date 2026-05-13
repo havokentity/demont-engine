@@ -280,6 +280,14 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
 // rebuild four NSFont instances (input / output / prompt / status)
 // instead of the one HFONT Win32 carries.
 - (void)applyFontScale;
+
+// Theme-derived popup background colour. A dark base blended with a
+// small fraction of the active palette accent so each theme tints the
+// popup just enough to read as part of the same visual family --
+// matches Win32's DimColor(theme_.panel, 0.55f). Always FULLY OPAQUE
+// (NSColor blendedColorWithFraction returns alpha 1.0) so the layer
+// + drawRect: fills hide the scrollback behind the popup zone.
+- (NSColor*)popupBackgroundColor;
 @end
 
 // ---------------------------------------------------------------------------
@@ -526,9 +534,9 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     // through any subsequent non-opaque overlay (e.g. the previous
     // 22%-alpha accent selection band). Setting layer.backgroundColor
     // pins the layer itself opaque, so any fill we do on top inherits
-    // a solid base regardless of compositing path.
-    popup.layer.backgroundColor =
-        [PtRGB(0.018, 0.024, 0.042) CGColor];
+    // a solid base regardless of compositing path. Theme switches
+    // refresh this in -applyTheme: so the bg picks up the new accent.
+    popup.layer.backgroundColor = [[self popupBackgroundColor] CGColor];
     [self addSubview:popup];
     self.popupView = popup;
 
@@ -627,7 +635,26 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     self.logoView.frameColor        = p.accent;
     self.logoView.rayColor          = p.logoRay;
     [self.logoView setNeedsDisplay:YES];
+    // Popup bg is palette-derived (subtle accent tint over a dark
+    // base); refresh the LAYER backing colour so a theme switch
+    // recolours the popup immediately, even before the next drawRect
+    // tick fills the new colour on top.
+    self.popupView.layer.backgroundColor =
+        [[self popupBackgroundColor] CGColor];
+    [self.popupView setNeedsDisplay:YES];
     [self rebuildBanner];
+}
+
+- (NSColor*)popupBackgroundColor {
+    NSColor* base = PtRGB(0.018, 0.024, 0.042);
+    NSColor* accent = self.palette.accent;
+    if (accent == nil) return base;
+    // 6% accent over 94% dark base -- enough to make the popup feel
+    // like part of the active theme without losing the "darker than
+    // the panel" cue that separates it visually from the scrollback.
+    // blendedColorWithFraction returns alpha=1.0 so the result is
+    // safe to use as a fully-opaque layer backing.
+    return [base blendedColorWithFraction:0.06 ofColor:accent];
 }
 
 // Special-case bannered ASCII line -- colour per role pulled from the
@@ -1184,8 +1211,11 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
 // view's coordinate system flipped (top-down) so y math reads the same
 // as the Win32 reference. Background + outline + per-row content
 // (selection bg, current/default left bar, name with match-spans,
-// value chip, truncated description). All colours derived from the
-// active palette so theme switches recolour automatically.
+// value chip, truncated description). The bg is a dark base + small
+// accent blend (-popupBackgroundColor) so each theme tints the popup
+// distinctly; everything else (outline, name, chips, value, desc) is
+// pulled from the active palette so theme switches recolour
+// automatically.
 - (void)drawPopupInRect:(NSRect)dirtyRect {
     (void)dirtyRect;
     if (!_popupActive || _popupItems.empty()) return;
@@ -1210,9 +1240,11 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     // vibrancy already shows through the popup's location to the
     // scrollback's text -- a translucent popup on top would render
     // popup rows over a chaos of overlapping log text. Layer.backing
-    // is set to the same colour in initWithFrame so the OPAQUE base is
-    // there even before drawRect runs.
-    NSColor* popupBg = PtRGB(0.018, 0.024, 0.042);
+    // is set to the same colour in initWithFrame so the OPAQUE base
+    // is there even before drawRect runs. Theme-derived via
+    // -popupBackgroundColor so amber/matrix/etc each tint the popup
+    // with a hint of their accent.
+    NSColor* popupBg = [self popupBackgroundColor];
     [popupBg setFill];
     NSRectFill(bounds);
     // Pre-compute the SOLID selection / left-bar colours by blending
@@ -1363,7 +1395,13 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
                 NSInteger maxCh = (NSInteger)floor(budgetPx / pxPerCh);
                 std::string desc = it.description;
                 if ((NSInteger)desc.size() > maxCh && maxCh > 3) {
-                    desc.resize((std::size_t)(maxCh - 1));
+                    // UTF-8 safe truncation -- a raw resize can split
+                    // a multibyte codepoint, and
+                    // [NSString stringWithUTF8String:] returns nil on
+                    // invalid UTF-8, dropping the description draw.
+                    // Cvar descriptions contain non-ASCII (e.g. "≈"
+                    // in Engine.cpp).
+                    pt::console::Utf8SafeTruncate(desc, (std::size_t)(maxCh - 1));
                     desc.append("\xE2\x80\xA6");  // UTF-8 ellipsis
                 }
                 NSString* d = [NSString stringWithUTF8String:desc.c_str()];
