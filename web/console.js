@@ -724,24 +724,33 @@
   function currentToken() {
     const v   = input.value;
     const pos = input.selectionStart ?? v.length;
+    // Treat both ' ' and '\t' as a token delimiter -- mirrors the C++
+    // Console::TokenizeLine + Completion::CurrentToken whitespace
+    // class. The native overlay's paste path preserves tabs, and the
+    // engine's executor will tokenize on both, so completion has to
+    // classify the active word the same way (otherwise a pasted line
+    // with a tab gets the wrong start/end and the commit splices the
+    // candidate at the wrong byte offset).
+    const isWs = (c) => c === ' ' || c === '\t';
     // Find the word boundaries around `pos`.
     let s = pos, e = pos;
-    while (s > 0 && v[s - 1] !== ' ') --s;
-    while (e < v.length && v[e] !== ' ') ++e;
+    while (s > 0 && !isWs(v[s - 1])) --s;
+    while (e < v.length && !isWs(v[e])) ++e;
     const text = v.slice(s, e);
     // Token-0 detection: scan from start of input through `s`; if
-    // we see any non-space before `s`, we're past token 0.
+    // we see any non-whitespace before `s`, we're past token 0.
     let isToken0 = true;
     let firstTok = '';
     {
-      // Find the first non-space run -- that's "token 0" by definition.
-      // The cursor's word is `isToken0` only when its start aligns
-      // with the start of that run (`s === tStart`). A cursor anywhere
-      // past the first run's trailing space lives in a later token.
+      // Find the first non-whitespace run -- that's "token 0" by
+      // definition. The cursor's word is `isToken0` only when its
+      // start aligns with the start of that run (`s === tStart`). A
+      // cursor anywhere past the first run's trailing whitespace
+      // lives in a later token.
       let i = 0;
-      while (i < v.length && v[i] === ' ') ++i;
+      while (i < v.length && isWs(v[i])) ++i;
       const tStart = i;
-      while (i < v.length && v[i] !== ' ') ++i;
+      while (i < v.length && !isWs(v[i])) ++i;
       firstTok = v.slice(tStart, i);
       isToken0 = (s === tStart);
     }
@@ -1237,13 +1246,6 @@
     // key. The earlier `e.key === ' '` check missed those cases.
     if ((e.ctrlKey || e.metaKey) && e.code === 'Space') {
       e.preventDefault();
-      // Console-log so the user can verify the handler fired when
-      // testing in the browser dev tools. One-shot to avoid spam.
-      if (!window.__demont_ctrl_space_logged) {
-        window.__demont_ctrl_space_logged = true;
-        console.log('[demont] Ctrl+Space force-show fired',
-                    { value: input.value, cursor: input.selectionStart });
-      }
       refreshCompletions(/*forceShow=*/true);
       return;
     }

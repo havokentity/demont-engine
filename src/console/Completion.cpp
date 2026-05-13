@@ -24,24 +24,32 @@ inline char to_lower_ascii(char c) {
 TokenInfo CurrentToken(std::string_view input, std::size_t cursor) {
     TokenInfo t;
     if (cursor > input.size()) cursor = input.size();
-    // Word boundaries around `cursor`: walk left until a space (or
-    // SOL), walk right until a space (or EOL). Empty input or a
-    // cursor on a space gives start == end == cursor.
+    // Treat both ' ' and '\t' as a token delimiter. Console::TokenizeLine
+    // (the engine's actual parser) treats both as whitespace, and the
+    // Win32 paste path preserves tabs, so completion has to classify
+    // tokens the same way the executor will -- otherwise pasted input
+    // containing a tab would get a wrong start/end and splice the
+    // candidate at the wrong byte offset.
+    auto is_ws = [](char c) { return c == ' ' || c == '\t'; };
+
+    // Word boundaries around `cursor`: walk left until whitespace (or
+    // SOL), walk right until whitespace (or EOL). Empty input or a
+    // cursor on whitespace gives start == end == cursor.
     std::size_t s = cursor;
-    while (s > 0 && input[s - 1] != ' ') --s;
+    while (s > 0 && !is_ws(input[s - 1])) --s;
     std::size_t e = cursor;
-    while (e < input.size() && input[e] != ' ') ++e;
+    while (e < input.size() && !is_ws(input[e])) ++e;
     t.start = s;
     t.end   = e;
     t.text  = std::string(input.substr(s, e - s));
 
     // First-token detection: scan from start of input through `s`;
-    // collect the first non-space run as first_tok. is_token0 == true
-    // iff s coincides with the start of that first run.
+    // collect the first non-whitespace run as first_tok. is_token0
+    // == true iff s coincides with the start of that first run.
     std::size_t i = 0;
-    while (i < input.size() && input[i] == ' ') ++i;
+    while (i < input.size() && is_ws(input[i])) ++i;
     std::size_t t0_start = i;
-    while (i < input.size() && input[i] != ' ') ++i;
+    while (i < input.size() && !is_ws(input[i])) ++i;
     t.first_tok  = std::string(input.substr(t0_start, i - t0_start));
     t.is_token0  = (s == t0_start);
     return t;
