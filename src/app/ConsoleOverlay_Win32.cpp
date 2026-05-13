@@ -789,6 +789,16 @@ void WinOverlay::EnsureFontScale() {
 }
 
 LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    // Set by WM_KEYDOWN's Ctrl+Space branch so the WM_CHAR that
+    // TranslateMessage queues for the SAME keystroke can be consumed;
+    // otherwise WM_CHAR(' ') would insert a stray space at the cursor
+    // and call RefreshCompletions again on top of the popup we just
+    // summoned. Function-scope static (not lambda-static) so both the
+    // WM_KEYDOWN setter and the WM_CHAR consumer can see it. atomic
+    // is overkill on a single-threaded message pump but cheap, and
+    // documents the cross-message-handler hand-off.
+    static std::atomic<bool> s_suppress_next_wm_char{false};
+
     switch (m) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
@@ -855,6 +865,18 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         break;
     }
     case WM_CHAR: {
+        // Ctrl+Space (handled in WM_KEYDOWN above) sets this flag so
+        // we swallow the WM_CHAR that TranslateMessage queues for the
+        // SAME keystroke. On US/most layouts ToUnicode(VK_SPACE,
+        // ctrl-held) returns 0x20 (space), and without this guard the
+        // WM_CHAR(' ') branch below would insert a stray space at the
+        // cursor and call RefreshCompletions again -- visible to the
+        // user as "Ctrl+Space silently inserts a space and the popup
+        // I just summoned blinks / doesn't show stably." See WM_KEYDOWN
+        // Ctrl+Space block for the matching set.
+        if (s_suppress_next_wm_char.exchange(false)) {
+            return 0;
+        }
         // Backtick: toggle off (matches the engine's Mac path where
         // backtick on the GLFW window opens the overlay; once open
         // the Cocoa NSView's keyDown closes it).
@@ -1006,6 +1028,11 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // confirm the handler is being reached (e.g. by tailing the
         // engine log while pressing the shortcut).
         if (ctrl_held && w == VK_SPACE) {
+            // Tell WM_CHAR to swallow the space that TranslateMessage
+            // queued for THIS keystroke (US/most layouts map Ctrl+Space
+            // to 0x20). Otherwise it'd insert a stray space at the
+            // cursor and rebuild the popup on top of itself.
+            s_suppress_next_wm_char.store(true);
             static std::atomic<bool> s_logged_once{false};
             if (!s_logged_once.exchange(true)) {
                 // Snapshot then drop the lock for the emit: LOG_INFO
@@ -1527,12 +1554,31 @@ void WinOverlay::Paint(HDC dc) {
         if (popup_.active && !popup_.items.empty()) {
             constexpr int kPopupMaxRows = 10;
             const int n = static_cast<int>(popup_.items.size());
-            const int visible_n = std::min(n, kPopupMaxRows);
-            const int popup_h = visible_n * line_height_ + 8;
+            int visible_n = std::min(n, kPopupMaxRows);
+            int popup_h = visible_n * line_height_ + 8;
             const int popup_w = W - 2 * kPaddingX;
             const int popup_x = kPaddingX;
-            const int popup_y = input_y - popup_h - 6;
-            if (popup_y > log_top) {   // skip if no room
+            int popup_y = input_y - popup_h - 6;
+            // If the popup would overflow above the scrollback area,
+            // shrink it to fit instead of silently skipping. Previous
+            // behaviour was `if (popup_y > log_top) render(); else
+            // drop it`, which made Ctrl+Space appear to do nothing
+            // when the user had typed something like `r_denoiser ` --
+            // 9 allowed_values * line_height_ pushed the popup above
+            // log_top and it vanished. Now we compute how many rows
+            // fit in the gap [log_top, input_y - 6] and clamp
+            // visible_n down to that; the user sees a shorter popup
+            // (with Up/Down scrolling through the rest) instead of
+            // nothing.
+            const int available_h = (input_y - 6) - (log_top + 2);
+            if (popup_h > available_h) {
+                visible_n = std::max(1, (available_h - 8) / line_height_);
+                popup_h = visible_n * line_height_ + 8;
+                popup_y = input_y - popup_h - 6;
+            }
+            // If the overlay is so short there's no room for even one
+            // row, give up. line_height_ + 8 is the minimum popup_h.
+            if (popup_h >= line_height_ + 8 && available_h >= line_height_ + 8) {
                 RECT pr = { popup_x, popup_y, popup_x + popup_w,
                             popup_y + popup_h };
                 // Panel background -- slightly darker than the
