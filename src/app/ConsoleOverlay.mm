@@ -12,6 +12,7 @@
 
 #include "ConsoleOverlay.h"
 
+#include "../console/Completion.h"
 #include "../console/Console.h"
 
 #import <AppKit/AppKit.h>
@@ -95,6 +96,7 @@ pt::app::ConsoleOverlay* g_instance = nullptr;
 }
 
 @class PtConsoleView;
+@class PtConsolePopupView;
 
 @interface PtConsoleInputField : NSTextField
 @property (weak) PtConsoleView* owner;
@@ -228,39 +230,53 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
 @property NSMutableArray<NSString*>*    history;
 @property NSInteger                     historyPos;
 
-@property NSMutableArray<NSString*>*    allNames;
-
-// Tab-completion ghost state (fish-shell autosuggestion).  First Tab on
-// an ambiguous prefix extends to the longest common prefix AND shows the
-// first remaining match in dim colour after the cursor.  Subsequent Tabs
-// cycle (Shift+Tab back); Right-arrow at end / End commits;
-// Esc / typing dismisses.
+// Inline ghost preview (a dim-coloured tail of the highlighted popup
+// match, drawn just past the cursor when the match is a case-
+// insensitive prefix of the typed token AND the cursor is at end of
+// input). Reused from the prior ghost-only era -- the popup state
+// machine drives it now via -renderInlineGhost. When the highlighted
+// candidate is the cvar's CURRENT value the ghost tints YELLOW
+// (RGB 255,200,80), matching web's --warn / Win32's kCurrentHintColor.
 @property (strong) NSTextField*         ghostLabel;
-@property (strong) NSMutableArray<NSString*>* ghostMatches;
-@property NSInteger                     ghostIndex;
-@property (strong) NSString*            ghostBefore;
-@property (strong) NSString*            ghostPrefix;
-@property BOOL                          ghostIsToken0;
-@property BOOL                          ghostActive;
-// Free-form cvar value-position state.  When ghostIsMeta is YES the
-// matches array is [current, default] of a cvar with no allowed_values
-// list, and ghostAnnotation holds "default: X" / "current: Y" describing
-// the inactive one so both pieces are visible at once.
-@property BOOL                          ghostIsMeta;
-@property (strong) NSString*            ghostAnnotation;
+
+// VS Code-style completion popup. The popup view is a sibling NSView
+// inside this PtConsoleView (NOT a separate NSPanel) so it inherits
+// the panel's animation + theme + occlusion behaviour the same way
+// the Win32 popup is a sub-rect of the child HWND. Frame + visibility
+// are driven by -layoutPopup which runs whenever popup state changes.
+@property (strong) PtConsolePopupView*  popupView;
 
 - (instancetype)initWithFrame:(NSRect)frame;
 - (void)appendLine:(NSString*)line level:(NSString*)level;
 - (void)submitInput;
 - (void)submitLine:(NSString*)line;
-- (BOOL)handleTab;
-- (BOOL)cycleGhost:(NSInteger)dir;
-- (BOOL)commitGhost;
-- (void)dismissGhost;
-- (void)renderGhost;
-- (void)activateValueGhost:(NSString*)cvarName;
-- (void)refreshGhostAnnotation;
-- (void)refreshNames;
+
+// Popup state machine. Mirrors WinOverlay's RefreshCompletions /
+// MovePopupSelection / CommitPopup / DismissPopup 1-for-1 -- see
+// ConsoleOverlay_Win32.cpp for the reference implementation, and
+// src/console/Completion.h for the shared scoring engine the three
+// frontends (web JS + Win32 GDI + this AppKit overlay) all use.
+- (void)refreshCompletions:(BOOL)forceShow;
+- (void)movePopupSelection:(NSInteger)dir;
+- (void)commitPopup:(BOOL)chainNext;
+- (void)dismissPopup;
+- (NSInteger)popupVisibleRows;
+- (void)layoutPopup;
+- (void)renderInlineGhost;
+// Called by PtConsolePopupView's drawRect: -- keeps the popup state
+// (items / selected / scroll_offset) private to PtConsoleView.
+- (void)drawPopupInRect:(NSRect)bounds;
+@end
+
+// ---------------------------------------------------------------------------
+// Popup background NSView. Lives as a sibling of input/scroll inside the
+// PtConsoleView. drawRect: just delegates to the owner so all popup
+// state (items / selected / scroll_offset / token) stays in
+// PtConsoleView's C++ ivars and we don't have to fan that state across
+// two ObjC classes. isFlipped:YES so row-y math runs top-down (matches
+// the Win32 implementation -- easier to keep parity).
+@interface PtConsolePopupView : NSView
+@property (weak) PtConsoleView* owner;
 @end
 
 // ---------------------------------------------------------------------------
@@ -290,7 +306,44 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
 @end
 
 // ---------------------------------------------------------------------------
-@implementation PtConsoleView
+@implementation PtConsolePopupView
+- (BOOL)isFlipped { return YES; }
+- (void)drawRect:(NSRect)dirtyRect {
+    PtConsoleView* o = self.owner;
+    if (o == nil) return;
+    [o drawPopupInRect:dirtyRect];
+}
+// Eat clicks so a stray mouse-down inside the popup zone doesn't punch
+// through to the scrollback selection underneath. Today the popup is
+// keyboard-driven only (no row-clicks), but eating clicks keeps the
+// behaviour predictable and matches the Win32 child-window's natural
+// hit-testing.
+- (void)mouseDown:(NSEvent*)event { (void)event; }
+@end
+
+// ---------------------------------------------------------------------------
+@implementation PtConsoleView {
+    // VS Code-style completion popup state. Held as plain C++ ivars
+    // (not @properties) because std::vector<CompletionMatch> + TokenInfo
+    // are non-trivial C++ types -- @property storage doesn't model
+    // their constructors/destructors. ARC + Objective-C++ accept C++
+    // ivars in the @implementation block.
+    //
+    // Mirrors WinOverlay::PopupState in ConsoleOverlay_Win32.cpp:
+    //   _popupActive        : false when popup hidden, true when shown
+    //   _popupItems         : ranked candidates from BuildCompletions
+    //   _popupSelected      : highlighted row index, or -1 when empty
+    //   _popupToken         : word at cursor at time of last refresh
+    //                         (start/end byte indices ready for splice)
+    //   _popupScrollOffset  : top-of-window index when items >
+    //                         visible-row budget. Kept in sync with
+    //                         _popupSelected by movePopupSelection:.
+    BOOL                                       _popupActive;
+    std::vector<pt::console::CompletionMatch>  _popupItems;
+    NSInteger                                  _popupSelected;
+    pt::console::TokenInfo                     _popupToken;
+    NSInteger                                  _popupScrollOffset;
+}
 
 - (instancetype)initWithFrame:(NSRect)frame {
     self = [super initWithFrame:frame];
@@ -301,8 +354,11 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
 
     self.history    = [NSMutableArray array];
     self.historyPos = 0;
-    self.allNames   = [NSMutableArray array];
     self.palette    = PtPaletteForTheme(@"hardcore");
+
+    _popupActive       = NO;
+    _popupSelected     = -1;
+    _popupScrollOffset = 0;
 
     // Two-layer backdrop. NSVisualEffectView gives the blurred-edge
     // vibrancy; a dark tint sub-layer on TOP of it guarantees text
@@ -424,10 +480,26 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     in.focusRingType = NSFocusRingTypeNone;
     in.font = [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightRegular];
     in.textColor = [NSColor whiteColor];
-    in.placeholderString = @"sys_info  ·  Tab completes  ·  Up/Down history";
+    in.placeholderString = @"sys_info  ·  Tab opens completions  ·  Up/Down history";
     in.delegate = self;
     [self addSubview:in];
     self.inputField = in;
+
+    // Popup background view -- starts hidden; layoutPopup sizes + shows
+    // it when the popup state is active. Anchored at the bottom (above
+    // the input row) with NSViewMaxYMargin so it stays put when the
+    // panel resizes vertically. Width tracks the panel width so the
+    // description column expands on a wider window. Z-ordered above the
+    // input/ghost so its background hides them while open -- matches
+    // the Win32 implementation where the popup is painted last.
+    PtConsolePopupView* popup = [[PtConsolePopupView alloc]
+        initWithFrame:NSMakeRect(14, 36, frame.size.width - 28, 0)];
+    popup.owner = self;
+    popup.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+    popup.hidden = YES;
+    popup.wantsLayer = YES;
+    [self addSubview:popup];
+    self.popupView = popup;
 
     // Hex banner with chevroned inner box and a bouncing-ray scaffold.
     // Cyan frame, magenta-pink rays + hit dots, bright white letters.
@@ -606,14 +678,12 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     if (line.length == 0) return;
     self.inputField.stringValue = @"";
     // Programmatic setStringValue: doesn't fire controlTextDidChange:,
-    // so an active ghost suggestion (e.g. one auto-activated by the
-    // commitGhost path that calls into submitInput) would otherwise
-    // stay visible with its stale text overlaid on the now-empty
-    // field.  Drop the ghost explicitly here so the submit always
-    // leaves a clean prompt.
-    if (self.ghostActive) [self dismissGhost];
+    // so an active popup (e.g. one auto-opened by the commitPopup path
+    // that calls into submitInput) would otherwise linger with stale
+    // items pointing at a now-empty field. Tear it down explicitly so
+    // every submit leaves a clean prompt.
+    if (_popupActive) [self dismissPopup];
     [self submitLine:line];
-    [self refreshNames];
 }
 
 // Paste-to-multiline: when the user pastes text containing newlines, run
@@ -624,24 +694,7 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
 - (void)controlTextDidChange:(NSNotification*)note {
     if (note.object != self.inputField) return;
 
-    // Typing while the ghost is showing invalidates the suggestion (the
-    // typed prefix has changed, so the transparent mirror would no
-    // longer align).  Dismiss eagerly.
-    if (self.ghostActive) [self dismissGhost];
-
     NSString* value = self.inputField.stringValue;
-
-    // Auto-activate the value-position ghost when the user types
-    // `<name> ` themselves (without tab + commit).  Fires when input is
-    // exactly "<single token> " -- mirrors the post-commit auto-
-    // activation so manual typers get the same affordance.
-    if (value.length >= 2 && [value characterAtIndex:value.length - 1] == ' ') {
-        NSString* trimmed = [value substringToIndex:value.length - 1];
-        if (trimmed.length > 0 &&
-            [trimmed rangeOfString:@" "].location == NSNotFound) {
-            [self activateValueGhost:trimmed];
-        }
-    }
 
     // Backtick is the show/hide toggle; stripping it here catches the
     // case where the user presses ` to open AND starts typing fast
@@ -653,68 +706,110 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
         self.inputField.stringValue = value;
     }
 
-    if ([value rangeOfString:@"\n"].location == NSNotFound) return;
-
-    NSArray<NSString*>* parts = [value componentsSeparatedByString:@"\n"];
-    NSString* trailing = parts.lastObject ? parts.lastObject : @"";
-    self.inputField.stringValue = trailing;
-
-    for (NSUInteger i = 0; i + 1 < parts.count; ++i) {
-        [self submitLine:parts[i]];
+    if ([value rangeOfString:@"\n"].location != NSNotFound) {
+        NSArray<NSString*>* parts = [value componentsSeparatedByString:@"\n"];
+        NSString* trailing = parts.lastObject ? parts.lastObject : @"";
+        self.inputField.stringValue = trailing;
+        for (NSUInteger i = 0; i + 1 < parts.count; ++i) {
+            [self submitLine:parts[i]];
+        }
     }
-    [self refreshNames];
+
+    // Re-rank completions on every text mutation. The shared engine's
+    // gating decides whether the popup auto-opens (token 0 with empty
+    // text -> dismiss; value position with empty text -> open with
+    // allowed_values list). Mirrors the web console's `input` event
+    // and the Win32 WM_CHAR handler.
+    [self refreshCompletions:NO];
 }
 
-- (void)refreshNames {
-    [self.allNames removeAllObjects];
-    pt::console::Console::Get().EnumerateCVars("",
-        [self](pt::console::CVar& v) {
-            [self.allNames addObject:[NSString stringWithUTF8String:v.name.c_str()]];
-        });
-    pt::console::Console::Get().EnumerateCommands("",
-        [self](pt::console::Command& c) {
-            [self.allNames addObject:[NSString stringWithUTF8String:c.name.c_str()]];
-        });
-    [self.allNames sortUsingSelector:@selector(compare:)];
-}
-
-// NSControlTextEditingDelegate dispatch.  The field's `delegate` is set
+// NSControlTextEditingDelegate dispatch. The field's `delegate` is set
 // to this PtConsoleView, so AppKit calls the method on us (not on the
-// field subclass).  Tab/Shift+Tab/Right/End/Esc are intercepted for
-// ghost-mode interaction when active; otherwise they fall through to
-// completion / history / cancel.
+// field subclass). When the popup is active, Up/Down/Tab/Enter/Esc/End
+// drive the popup state machine; otherwise these keys revert to
+// history-walk / submit / clear semantics. Cursor-move keys (Left /
+// Right / Home / End) re-evaluate completions against the new caret
+// position so e.g. arrowing into the trailing space of `r_denoiser `
+// pops the value-position list -- mirrors the Win32 implementation.
 - (BOOL)control:(NSControl*)control textView:(NSTextView*)textView
       doCommandBySelector:(SEL)cmd {
-    // Ghost-mode keys.  When the autosuggestion is active these
-    // selectors mean cycle / commit / dismiss; everything else
-    // dismisses and falls through to default behaviour.
-    if (self.ghostActive) {
-        if (cmd == @selector(insertTab:))     return [self cycleGhost:+1];
-        if (cmd == @selector(insertBacktab:)) return [self cycleGhost:-1];
-        if (cmd == @selector(moveRight:) || cmd == @selector(moveToEndOfLine:) ||
-            cmd == @selector(moveToEndOfDocument:) || cmd == @selector(moveToEndOfParagraph:)) {
-            return [self commitGhost];
+    (void)control;
+
+    // Popup-active keys. Mirrors the WM_KEYDOWN block in
+    // ConsoleOverlay_Win32.cpp:
+    //   Up/Down  -- move highlight (do NOT walk history)
+    //   Tab      -- commit + chain (open value-position popup if
+    //               we just landed on a token-0 cvar/command name)
+    //   Enter    -- commit WITHOUT chain, then submit the line
+    //   Esc      -- dismiss
+    //   End / Right-at-EOL -- commit WITHOUT chain
+    //   any other command -- dismiss + fall through to default
+    if (_popupActive) {
+        if (cmd == @selector(moveUp:))     { [self movePopupSelection:-1]; return YES; }
+        if (cmd == @selector(moveDown:))   { [self movePopupSelection:+1]; return YES; }
+        if (cmd == @selector(insertTab:))     { [self commitPopup:YES]; return YES; }
+        if (cmd == @selector(insertBacktab:)) { [self commitPopup:YES]; return YES; }
+        if (cmd == @selector(cancelOperation:)) {
+            [self dismissPopup];
+            return YES;
         }
-        if (cmd == @selector(insertNewline:)) {
-            [self commitGhost];
+        if (cmd == @selector(insertNewline:) ||
+            cmd == @selector(insertNewlineIgnoringFieldEditor:)) {
+            [self commitPopup:NO];
             [self submitInput];
             return YES;
         }
-        if (cmd == @selector(cancelOperation:)) {
-            [self dismissGhost];
+        if (cmd == @selector(moveToEndOfLine:) ||
+            cmd == @selector(moveToEndOfDocument:) ||
+            cmd == @selector(moveToEndOfParagraph:)) {
+            [self commitPopup:NO];
             return YES;
         }
-        // Any other command dismisses; fall through.
-        [self dismissGhost];
+        if (cmd == @selector(moveRight:)) {
+            NSText* ed = [self.inputField currentEditor];
+            const NSUInteger end = self.inputField.stringValue.length;
+            if (ed && ed.selectedRange.location >= end) {
+                [self commitPopup:NO];
+                return YES;
+            }
+            // Right-arrow before EOL: dismiss + let the cursor move
+            // and the post-move re-eval (below) re-rank against the
+            // new position.
+            [self dismissPopup];
+            // fall through to cursor-move handling below
+        } else {
+            // Any other command: tear the popup down and let the
+            // keystroke route through default handling. The post-
+            // mutation refresh in controlTextDidChange: (or the
+            // cursor-move re-eval below) will reopen the popup if
+            // the new state still has matches.
+            [self dismissPopup];
+            // fall through
+        }
     }
 
-    if (cmd == @selector(insertTab:))      return [self handleTab];
-    if (cmd == @selector(insertBacktab:))  return [self handleTab];   // first Tab even with shift
+    if (cmd == @selector(insertTab:)) {
+        // Tab with popup hidden = force-show. Mirrors the web
+        // console's Tab handler and Win32's VK_TAB branch.
+        [self refreshCompletions:YES];
+        return YES;
+    }
+    if (cmd == @selector(insertBacktab:)) {
+        // Shift+Tab without popup: same force-show semantics.
+        [self refreshCompletions:YES];
+        return YES;
+    }
     if (cmd == @selector(insertNewline:)) { [self submitInput]; return YES; }
     if (cmd == @selector(moveUp:)) {
         if (self.historyPos > 0) {
             self.historyPos -= 1;
             self.inputField.stringValue = self.history[self.historyPos];
+            // Move caret to end of restored line so a follow-up Up/Down
+            // reads from the same insertion point and the popup re-eval
+            // (below) sees a sensible cursor.
+            NSText* ed = [self.inputField currentEditor];
+            if (ed) [ed setSelectedRange:NSMakeRange(self.inputField.stringValue.length, 0)];
+            [self refreshCompletions:NO];
         }
         return YES;
     }
@@ -726,6 +821,9 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
             } else {
                 self.inputField.stringValue = self.history[self.historyPos];
             }
+            NSText* ed = [self.inputField currentEditor];
+            if (ed) [ed setSelectedRange:NSMakeRange(self.inputField.stringValue.length, 0)];
+            [self refreshCompletions:NO];
         }
         return YES;
     }
@@ -738,230 +836,495 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
             }
         } else {
             self.inputField.stringValue = @"";
+            [self dismissPopup];
         }
         return YES;
+    }
+
+    // Cursor-move keys re-evaluate the popup against the new caret
+    // position (fires AFTER the cursor has actually moved -- we run
+    // the refresh on the next main-loop tick). Without this, navigating
+    // into the trailing space of `r_denoiser ` via Home + End leaves
+    // the popup stale -- the user would have to type a char to get the
+    // value-position popup to open. Matches the Win32 VK_LEFT / VK_RIGHT
+    // / VK_HOME / VK_END branches.
+    if (cmd == @selector(moveLeft:) ||
+        cmd == @selector(moveRight:) ||
+        cmd == @selector(moveToBeginningOfLine:) ||
+        cmd == @selector(moveToEndOfLine:) ||
+        cmd == @selector(moveToBeginningOfDocument:) ||
+        cmd == @selector(moveToEndOfDocument:) ||
+        cmd == @selector(moveToBeginningOfParagraph:) ||
+        cmd == @selector(moveToEndOfParagraph:) ||
+        cmd == @selector(moveWordLeft:) ||
+        cmd == @selector(moveWordRight:)) {
+        __weak PtConsoleView* weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf refreshCompletions:NO];
+        });
+        return NO;  // let AppKit perform the actual cursor move
     }
     return NO;
 }
 
-- (BOOL)handleTab {
-    if (self.allNames.count == 0) [self refreshNames];
+// ---------------------------------------------------------------------------
+// Popup state machine. See WinOverlay::RefreshCompletions et al. in
+// ConsoleOverlay_Win32.cpp for the reference implementation -- this is
+// a 1-for-1 port with AppKit equivalents for byte-vs-UTF16 cursor math
+// and NSAttributedString rendering.
 
-    NSString* value = self.inputField.stringValue;
-    NSRange lastSpace = [value rangeOfString:@" " options:NSBackwardsSearch];
+// Convert the current input + UTF-16 cursor into UTF-8 bytes + byte
+// offset, the form pt::console::CurrentToken expects. Cvar / command
+// names are pure ASCII so the conversion is a no-op for the typical
+// case, but a user pasting non-ASCII into the input would otherwise
+// splice at the wrong byte offset on commit.
+- (std::string)utf8InputAndCursor:(std::size_t*)outCursorBytes {
+    NSString* input = self.inputField.stringValue;
+    if (input == nil) input = @"";
+    const char* utf8 = [input UTF8String];
+    std::string s = (utf8 != nullptr) ? std::string(utf8) : std::string();
+    NSText* ed = [self.inputField currentEditor];
+    NSUInteger cursorUTF16 = (ed != nil) ? ed.selectedRange.location
+                                         : input.length;
+    if (cursorUTF16 > input.length) cursorUTF16 = input.length;
+    NSString* prefix = [input substringToIndex:cursorUTF16];
+    NSUInteger cursorBytes = [prefix lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+    if (outCursorBytes) *outCursorBytes = cursorBytes;
+    return s;
+}
 
-    NSString* prefix;
-    NSArray<NSString*>* candidates;
+- (void)refreshCompletions:(BOOL)forceShow {
+    std::size_t cursorBytes = 0;
+    std::string input = [self utf8InputAndCursor:&cursorBytes];
+    pt::console::TokenInfo token = pt::console::CurrentToken(input, cursorBytes);
 
-    if (lastSpace.location == NSNotFound) {
-        // Token 0: cvar / command name.
-        prefix = value;
-        candidates = self.allNames;
-    } else {
-        // Value position. `toggle <cvar>` is special-cased: token 1 is a
-        // cvar name (only those with allowed_values are useful). Otherwise
-        // we complete from the named cvar's allowed_values.
-        NSString* firstTok = [value substringToIndex:[value rangeOfString:@" "].location];
-        prefix = [value substringFromIndex:lastSpace.location + 1];
-        if ([firstTok isEqualToString:@"toggle"]) {
-            NSMutableArray* toggleables = [NSMutableArray array];
-            pt::console::Console::Get().EnumerateCVars("",
-                [&](pt::console::CVar& v) {
-                    if (!v.allowed_values.empty()) {
-                        [toggleables addObject:[NSString stringWithUTF8String:v.name.c_str()]];
-                    }
-                });
-            [toggleables sortUsingSelector:@selector(compare:)];
-            candidates = toggleables;
-        } else {
-            auto* cv = pt::console::Console::Get().FindCVar(
-                std::string_view([firstTok UTF8String]));
-            if (cv == nullptr || cv->allowed_values.empty()) return YES;
-            NSMutableArray* allowed = [NSMutableArray array];
-            for (auto& a : cv->allowed_values) {
-                [allowed addObject:[NSString stringWithUTF8String:a.c_str()]];
-            }
-            candidates = allowed;
+    // Empty-query gating mirrors Win32 / web:
+    //   - Token 0 with empty text + !forceShow: don't auto-open. The
+    //     popup would otherwise list every cvar + command in the engine
+    //     every time the input becomes empty (fresh open, post-Submit
+    //     clear) -- noise.
+    //   - Value position (is_token0 == false) with empty text: DO open.
+    //     The user just typed `<cvar> ` and wants to see the value list
+    //     including the current value.
+    if (!forceShow && token.text.empty() && token.is_token0) {
+        [self dismissPopup];
+        return;
+    }
+
+    auto items = pt::console::BuildCompletions(token,
+                                                /*max_results=*/60,
+                                                /*description_clip=*/120);
+    if (items.empty()) {
+        [self dismissPopup];
+        return;
+    }
+
+    _popupActive       = YES;
+    _popupItems        = std::move(items);
+    _popupSelected     = 0;
+    _popupToken        = std::move(token);
+    _popupScrollOffset = 0;
+    [self layoutPopup];
+    [self renderInlineGhost];
+    [self.popupView setNeedsDisplay:YES];
+}
+
+- (NSInteger)popupVisibleRows {
+    constexpr NSInteger kPopupMaxRows = 10;
+    const NSInteger n = (NSInteger)_popupItems.size();
+    if (n == 0) return 0;
+    NSFont* font = self.inputField.font;
+    if (font == nil) font = [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightRegular];
+    const CGFloat lineH = ceil(font.pointSize * 1.35);
+    if (lineH <= 0) return 0;
+
+    // Available vertical room between the input row top and the log
+    // area's bottom edge. Input field sits at y=8, height=22 -- top
+    // edge at y=30 in Mac (bottom-left) coords. The output scroll
+    // starts at y=36, so the popup sits in the strip between y=36 and
+    // the panel top, anchored at the bottom (above the input). Leave
+    // 4 px of breathing room from the scroll's top edge so the popup
+    // doesn't visually fight the log header.
+    const NSRect bounds = self.bounds;
+    const CGFloat panelH    = bounds.size.height;
+    const CGFloat popupYBot = 36;            // bottom of popup in Mac coords
+    const CGFloat popupYTop = panelH - 36;   // top of available zone
+    const CGFloat available = popupYTop - popupYBot - 4;
+    if (available < lineH + 8) return 0;
+    NSInteger byHeight = (NSInteger)floor((available - 8) / lineH);
+    if (byHeight < 1) byHeight = 1;
+    NSInteger v = n;
+    if (v > kPopupMaxRows) v = kPopupMaxRows;
+    if (v > byHeight)      v = byHeight;
+    return v;
+}
+
+- (void)movePopupSelection:(NSInteger)dir {
+    if (!_popupActive || _popupItems.empty()) return;
+    const NSInteger n = (NSInteger)_popupItems.size();
+    NSInteger sel = ((_popupSelected + dir) % n + n) % n;
+    _popupSelected = sel;
+    // Keep the highlighted row in the visible window. visible is the
+    // actual paintable row count for the current panel size (shared
+    // with drawPopupInRect: via -popupVisibleRows), so on a short
+    // panel Up/Down scrolls the window through the rest instead of
+    // letting selection run off-screen.
+    const NSInteger visible = [self popupVisibleRows];
+    if (visible > 0) {
+        if (sel < _popupScrollOffset) {
+            _popupScrollOffset = sel;
+        } else if (sel >= _popupScrollOffset + visible) {
+            _popupScrollOffset = sel - visible + 1;
         }
     }
-
-    NSMutableArray<NSString*>* matches = [NSMutableArray array];
-    for (NSString* n in candidates) {
-        if ([n hasPrefix:prefix]) [matches addObject:n];
-    }
-    if (matches.count == 0) return YES;
-
-    BOOL isToken0 = (lastSpace.location == NSNotFound);
-    NSString* before = isToken0 ? @"" : [value substringToIndex:lastSpace.location + 1];
-
-    if (matches.count == 1) {
-        NSString* tail = isToken0 ? [matches[0] stringByAppendingString:@" "]
-                                  : matches[0];
-        self.inputField.stringValue = [before stringByAppendingString:tail];
-        [self dismissGhost];
-        return YES;
-    }
-
-    // Extend to longest common prefix (if it advances), then activate
-    // ghost mode for cycling.
-    NSString* common = matches[0];
-    for (NSUInteger i = 1; i < matches.count; ++i) {
-        NSUInteger j = 0;
-        NSUInteger lim = MIN(common.length, [matches[i] length]);
-        while (j < lim && [common characterAtIndex:j] == [matches[i] characterAtIndex:j]) ++j;
-        common = [common substringToIndex:j];
-        if (common.length == 0) break;
-    }
-    NSString* typedPrefix = prefix;
-    if (common.length > prefix.length) {
-        self.inputField.stringValue = [before stringByAppendingString:common];
-        typedPrefix = common;
-    }
-
-    self.ghostMatches  = matches;
-    self.ghostIndex    = 0;
-    self.ghostBefore   = before;
-    self.ghostPrefix   = typedPrefix;
-    self.ghostIsToken0 = isToken0;
-    self.ghostActive   = YES;
-    [self renderGhost];
-    return YES;
+    [self renderInlineGhost];
+    [self.popupView setNeedsDisplay:YES];
 }
 
-- (BOOL)cycleGhost:(NSInteger)dir {
-    if (!self.ghostActive || self.ghostMatches.count == 0) return YES;
-    NSInteger n = (NSInteger)self.ghostMatches.count;
-    NSInteger i = ((self.ghostIndex + dir) % n + n) % n;
-    self.ghostIndex = i;
-    [self refreshGhostAnnotation];
-    [self renderGhost];
-    return YES;
-}
-
-- (BOOL)commitGhost {
-    if (!self.ghostActive || self.ghostMatches.count == 0) {
-        [self dismissGhost];
-        return YES;
-    }
-    NSString* committed = self.ghostMatches[self.ghostIndex];
-    BOOL      wasToken0 = self.ghostIsToken0;
-    NSString* tail      = wasToken0 ? [committed stringByAppendingString:@" "] : committed;
-    self.inputField.stringValue = [self.ghostBefore stringByAppendingString:tail];
-    [self dismissGhost];
-    // Token-0 commit just landed on a name -- if it's a cvar, chain
-    // into a value-position ghost so the user immediately sees the
-    // current (and default) value.
-    if (wasToken0) [self activateValueGhost:committed];
-    return YES;
-}
-
-- (void)dismissGhost {
-    self.ghostActive      = NO;
-    self.ghostMatches     = nil;
-    self.ghostIndex       = 0;
-    self.ghostBefore      = nil;
-    self.ghostPrefix      = nil;
-    self.ghostIsToken0    = NO;
-    self.ghostIsMeta      = NO;
-    self.ghostAnnotation  = nil;
-    self.ghostLabel.attributedStringValue = [[NSAttributedString alloc] initWithString:@""];
-}
-
-- (void)activateValueGhost:(NSString*)name {
-    auto& C = pt::console::Console::Get();
-    NSMutableArray<NSString*>* matches = [NSMutableArray array];
-    BOOL meta = NO;
-    if (auto* cv = C.FindCVar(std::string_view([name UTF8String])); cv != nullptr) {
-        if (!cv->allowed_values.empty()) {
-            for (auto& a : cv->allowed_values) {
-                [matches addObject:[NSString stringWithUTF8String:a.c_str()]];
-            }
-        } else {
-            NSString* current = [NSString stringWithUTF8String:cv->value.c_str()];
-            NSString* dflt    = [NSString stringWithUTF8String:cv->default_value.c_str()];
-            [matches addObject:current];
-            if (![dflt isEqualToString:current]) {
-                [matches addObject:dflt];
-                meta = YES;
-            }
-        }
-    } else if (auto* cmd = C.FindCommand(std::string_view([name UTF8String]));
-               cmd != nullptr && !cmd->default_args.empty()) {
-        [matches addObject:[NSString stringWithUTF8String:cmd->default_args.c_str()]];
-    }
-    if (matches.count == 0) return;
-
-    self.ghostMatches    = matches;
-    self.ghostIndex      = 0;
-    self.ghostBefore     = self.inputField.stringValue;   // "<name> "
-    self.ghostPrefix     = @"";
-    self.ghostIsToken0   = NO;
-    self.ghostIsMeta     = meta;
-    self.ghostActive     = YES;
-    [self refreshGhostAnnotation];
-    [self renderGhost];
-}
-
-- (void)refreshGhostAnnotation {
-    if (!self.ghostIsMeta || self.ghostMatches.count < 2) {
-        self.ghostAnnotation = nil;
+// Commit the highlighted candidate by replacing the word at the cursor
+// with the candidate name (+ trailing space when we're completing token
+// 0 so the user lands at the value position ready to keep typing).
+// chainNext == YES auto-reopens the popup at the new cursor (Tab path);
+// NO leaves the popup closed (Enter / End / Right-at-EOL paths -- those
+// are "accept + stop" gestures).
+- (void)commitPopup:(BOOL)chainNext {
+    if (!_popupActive ||
+        _popupSelected < 0 ||
+        _popupSelected >= (NSInteger)_popupItems.size()) {
+        [self dismissPopup];
         return;
     }
-    // matches[0] = current, matches[1] = default (per activateValueGhost).
-    if (self.ghostIndex == 0) {
-        self.ghostAnnotation = [NSString stringWithFormat:@"  default: %@",
-                                                          self.ghostMatches[1]];
-    } else {
-        self.ghostAnnotation = [NSString stringWithFormat:@"  current: %@",
-                                                          self.ghostMatches[0]];
+    const pt::console::CompletionMatch& it = _popupItems[(std::size_t)_popupSelected];
+    const pt::console::TokenInfo&        t = _popupToken;
+
+    std::size_t /*cursorBytes*/ _ = 0;
+    std::string s = [self utf8InputAndCursor:&_];
+    if (t.end > s.size()) {
+        // Token boundaries shifted out from under us (the user typed
+        // something between refreshCompletions and commit). Bail.
+        [self dismissPopup];
+        return;
+    }
+    std::string tail = it.name + (t.is_token0 ? std::string(" ") : std::string());
+    std::string newInput = s.substr(0, t.start) + tail + s.substr(t.end);
+    const std::size_t newCursorBytes = t.start + tail.size();
+    const bool wasToken0 = t.is_token0;
+
+    // Push the new value into the field. setStringValue: doesn't fire
+    // controlTextDidChange:, so we explicitly tear the popup down and
+    // (optionally) refresh below -- no double-open surprise.
+    NSString* ns = [NSString stringWithUTF8String:newInput.c_str()];
+    if (ns == nil) ns = @"";
+    self.inputField.stringValue = ns;
+
+    // Convert byte cursor back to UTF-16 for AppKit's selectedRange.
+    std::string prefixBytes = newInput.substr(0, newCursorBytes);
+    NSString* prefixStr = [NSString stringWithUTF8String:prefixBytes.c_str()];
+    if (prefixStr == nil) prefixStr = @"";
+    NSText* ed = [self.inputField currentEditor];
+    if (ed != nil) {
+        [ed setSelectedRange:NSMakeRange(prefixStr.length, 0)];
+    }
+
+    [self dismissPopup];
+    if (chainNext && wasToken0) {
+        [self refreshCompletions:YES];
     }
 }
 
-- (void)renderGhost {
-    if (!self.ghostActive || self.ghostMatches.count == 0) {
-        self.ghostLabel.attributedStringValue = [[NSAttributedString alloc] initWithString:@""];
+- (void)dismissPopup {
+    _popupActive       = NO;
+    _popupItems.clear();
+    _popupSelected     = -1;
+    _popupToken        = pt::console::TokenInfo{};
+    _popupScrollOffset = 0;
+    self.popupView.hidden = YES;
+    self.ghostLabel.attributedStringValue =
+        [[NSAttributedString alloc] initWithString:@""];
+}
+
+// Place the popup view above the input row, sized to the visible-row
+// budget for the current panel height. Mac coords are bottom-left, so
+// frame origin is at the popup's BOTTOM edge and frame.height grows
+// upward. Hidden when not enough room for even one row -- matches
+// Win32's PopupVisibleRows() == 0 short-circuit.
+- (void)layoutPopup {
+    if (!_popupActive || _popupItems.empty()) {
+        self.popupView.hidden = YES;
         return;
     }
-    NSString* match = self.ghostMatches[self.ghostIndex];
-    if (match.length < self.ghostPrefix.length || ![match hasPrefix:self.ghostPrefix]) {
-        self.ghostLabel.attributedStringValue = [[NSAttributedString alloc] initWithString:@""];
+    const NSInteger visibleN = [self popupVisibleRows];
+    if (visibleN <= 0) {
+        self.popupView.hidden = YES;
         return;
     }
+    NSFont* font = self.inputField.font;
+    if (font == nil) font = [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightRegular];
+    const CGFloat lineH = ceil(font.pointSize * 1.35);
+    const CGFloat popupH = visibleN * lineH + 8;
+    const NSRect bounds = self.bounds;
+    NSRect target = NSMakeRect(14, 36,
+                               bounds.size.width - 28,
+                               popupH);
+    self.popupView.frame = target;
+    self.popupView.hidden = NO;
+    [self.popupView setNeedsDisplay:YES];
+}
+
+// Ghost preview just past the cursor: dim tail of the highlighted
+// candidate when it's a case-insensitive prefix of the token-at-cursor
+// AND the cursor is at end of input. Tinted YELLOW (RGB 255,200,80) on
+// current-value rows so cycling Up/Down through allowed_values keeps a
+// visible "this is what's set right now" cue inline as well as in the
+// popup row -- matches web's `.ghost-tail.is-current` and Win32's
+// kCurrentHintColor.
+- (void)renderInlineGhost {
+    NSAttributedString* empty = [[NSAttributedString alloc] initWithString:@""];
+    if (!_popupActive ||
+        _popupSelected < 0 ||
+        _popupSelected >= (NSInteger)_popupItems.size()) {
+        self.ghostLabel.attributedStringValue = empty;
+        return;
+    }
+
+    NSText* ed = [self.inputField currentEditor];
     NSString* typed = self.inputField.stringValue;
-    NSString* tail  = [match substringFromIndex:self.ghostPrefix.length];
+    NSUInteger cursorUTF16 = (ed != nil) ? ed.selectedRange.location
+                                         : typed.length;
+    if (cursorUTF16 != typed.length) {
+        // Only show inline preview at end-of-input; otherwise the dim
+        // tail would visually extend past mid-line text and confuse.
+        self.ghostLabel.attributedStringValue = empty;
+        return;
+    }
+
+    const pt::console::CompletionMatch& it = _popupItems[(std::size_t)_popupSelected];
+    const pt::console::TokenInfo&        t = _popupToken;
+    if (it.name.size() <= t.text.size()) {
+        self.ghostLabel.attributedStringValue = empty;
+        return;
+    }
+    auto lc = [](char c) -> char {
+        return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+    };
+    bool prefix = true;
+    for (std::size_t i = 0; i < t.text.size(); ++i) {
+        if (lc(t.text[i]) != lc(it.name[i])) { prefix = false; break; }
+    }
+    if (!prefix) {
+        self.ghostLabel.attributedStringValue = empty;
+        return;
+    }
+    std::string tailUtf8 = it.name.substr(t.text.size());
+    NSString* tail = [NSString stringWithUTF8String:tailUtf8.c_str()];
+    if (tail == nil || tail.length == 0) {
+        self.ghostLabel.attributedStringValue = empty;
+        return;
+    }
 
     NSFont* defaultFont = [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightRegular];
     NSFont* font = self.inputField.font ? self.inputField.font : defaultFont;
     NSColor* dim = self.palette.info ? self.palette.info : [NSColor grayColor];
+    NSColor* warn = PtRGB(1.0, 200.0/255.0, 80.0/255.0);
+    const bool isCurrent = (it.value == "current");
+
     NSMutableAttributedString* s = [[NSMutableAttributedString alloc] init];
-    // Transparent run mirrors typed text width so the visible tail
-    // lines up just past the cursor.
+    // Transparent run mirrors the typed text width so the visible tail
+    // lands just past the cursor without per-pixel measurement.
     [s appendAttributedString:[[NSAttributedString alloc] initWithString:typed
         attributes:@{
             NSFontAttributeName: font,
             NSForegroundColorAttributeName: [NSColor clearColor],
         }]];
-    if (tail.length > 0) {
-        [s appendAttributedString:[[NSAttributedString alloc] initWithString:tail
-            attributes:@{
-                NSFontAttributeName: font,
-                NSForegroundColorAttributeName: dim,
-            }]];
-    }
-    if (self.ghostAnnotation.length > 0) {
-        // Annotation rides in the same dim colour but italicised so it
-        // reads as commentary rather than another committable token.
-        NSFontDescriptor* fd = [font.fontDescriptor
-            fontDescriptorWithSymbolicTraits:NSFontDescriptorTraitItalic];
-        NSFont* italicCandidate = [NSFont fontWithDescriptor:fd size:font.pointSize];
-        NSFont* italic = italicCandidate ? italicCandidate : font;
-        [s appendAttributedString:[[NSAttributedString alloc] initWithString:self.ghostAnnotation
-            attributes:@{
-                NSFontAttributeName: italic,
-                NSForegroundColorAttributeName: [dim colorWithAlphaComponent:0.7],
-            }]];
-    }
+    [s appendAttributedString:[[NSAttributedString alloc] initWithString:tail
+        attributes:@{
+            NSFontAttributeName: font,
+            NSForegroundColorAttributeName: (isCurrent ? warn : dim),
+        }]];
     self.ghostLabel.attributedStringValue = s;
+}
+
+// Render the popup. Called by PtConsolePopupView's drawRect:, with the
+// view's coordinate system flipped (top-down) so y math reads the same
+// as the Win32 reference. Background + outline + per-row content
+// (selection bg, current/default left bar, name with match-spans,
+// value chip, truncated description). All colours derived from the
+// active palette so theme switches recolour automatically.
+- (void)drawPopupInRect:(NSRect)dirtyRect {
+    (void)dirtyRect;
+    if (!_popupActive || _popupItems.empty()) return;
+    const NSInteger visibleN = [self popupVisibleRows];
+    if (visibleN <= 0) return;
+
+    NSFont* font = self.inputField.font;
+    if (font == nil) font = [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightRegular];
+    const CGFloat lineH = ceil(font.pointSize * 1.35);
+
+    PtThemePalette p = self.palette;
+    NSColor* accent  = p.accent  ? p.accent  : PtRGB(0.0, 0.94, 1.0);
+    NSColor* dimCol  = p.info    ? p.info    : [NSColor grayColor];
+    NSColor* textCol = p.out     ? p.out     : [NSColor whiteColor];
+    NSColor* warn    = PtRGB(1.0, 200.0/255.0, 80.0/255.0);
+
+    const NSRect bounds = self.popupView.bounds;
+    // Background -- darker than the panel tint so the popup stands out
+    // from the scrollback area visible behind it.
+    NSColor* popupBg = PtRGBA(0.012, 0.016, 0.026, 0.94);
+    [popupBg setFill];
+    NSRectFill(bounds);
+    // 1 px accent outline (slightly dimmed so it doesn't shout).
+    [[accent colorWithAlphaComponent:0.55] setStroke];
+    NSBezierPath* outline = [NSBezierPath bezierPathWithRect:
+        NSInsetRect(bounds, 0.5, 0.5)];
+    outline.lineWidth = 1.0;
+    [outline stroke];
+
+    // Clip subsequent draws to the popup interior so a long
+    // description tail (or an unexpectedly wide kind chip) doesn't
+    // bleed past the popup's right edge into whatever's behind.
+    [NSGraphicsContext saveGraphicsState];
+    NSBezierPath* clip = [NSBezierPath bezierPathWithRect:
+        NSInsetRect(bounds, 1.0, 1.0)];
+    [clip addClip];
+
+    const NSInteger n = (NSInteger)_popupItems.size();
+    const NSInteger scroll = _popupScrollOffset;
+    const CGFloat   xStart = 8.0;
+    CGFloat         rowY   = 4.0;
+    for (NSInteger vi = 0; vi < visibleN; ++vi) {
+        const NSInteger idx = scroll + vi;
+        if (idx < 0 || idx >= n) break;
+        const pt::console::CompletionMatch& it = _popupItems[(std::size_t)idx];
+        const bool selected   = (idx == _popupSelected);
+        const bool isCurrent  = (it.value == "current");
+        const bool isDefault  = (it.value == "default");
+
+        // Selected row tinted background.
+        if (selected) {
+            NSRect rr = NSMakeRect(2, rowY,
+                                   bounds.size.width - 4, lineH);
+            [[accent colorWithAlphaComponent:0.22] setFill];
+            NSRectFill(rr);
+        }
+        // Left-edge accent bar marks the current value (and a softer
+        // dimmed bar for the default), independent of selection -- so
+        // "what's set right now" stays visible while cycling Up/Down
+        // through the value list.
+        if (isCurrent || isDefault) {
+            NSRect bar = NSMakeRect(2, rowY, 2, lineH);
+            NSColor* barCol = isCurrent
+                ? accent
+                : [accent colorWithAlphaComponent:0.45];
+            [barCol setFill];
+            NSRectFill(bar);
+        }
+
+        // Walk the match-spans, emitting in-span runs in accent and
+        // out-of-span runs in textCol. Current-value rows tint the
+        // WHOLE name in accent so the eye lands on it first.
+        const std::string& name = it.name;
+        NSColor* nameFg = isCurrent ? accent : textCol;
+        CGFloat tx = xStart;
+
+        auto drawRun = [&](std::size_t a, std::size_t b, NSColor* col) {
+            if (a >= b || a >= name.size()) return;
+            const std::size_t end = std::min(b, name.size());
+            std::string sub = name.substr(a, end - a);
+            NSString* ns = [NSString stringWithUTF8String:sub.c_str()];
+            if (ns == nil || ns.length == 0) return;
+            NSDictionary* attrs = @{
+                NSFontAttributeName:            font,
+                NSForegroundColorAttributeName: col,
+            };
+            // Mac AppKit's drawAtPoint draws with the baseline at point.y
+            // when isFlipped is YES (top-down), so the y we pass is the
+            // top of the row -- AppKit handles baseline placement.
+            [ns drawAtPoint:NSMakePoint(tx, rowY) withAttributes:attrs];
+            NSSize sz = [ns sizeWithAttributes:attrs];
+            tx += sz.width;
+        };
+
+        std::size_t cursorCh = 0;
+        for (const auto& sp : it.spans) {
+            if (sp.first > cursorCh) {
+                drawRun(cursorCh, sp.first, nameFg);
+            }
+            drawRun(sp.first, sp.second, accent);
+            cursorCh = sp.second;
+        }
+        if (cursorCh < name.size()) {
+            drawRun(cursorCh, name.size(), nameFg);
+        }
+
+        // Kind chip (cvar / cmd) for token-0 rows. Dim small caps.
+        if (it.kind == pt::console::CompletionKind::Cvar ||
+            it.kind == pt::console::CompletionKind::Command) {
+            NSString* chip =
+                (it.kind == pt::console::CompletionKind::Cvar) ? @"cvar" : @"cmd";
+            NSDictionary* chipAttrs = @{
+                NSFontAttributeName: [NSFont monospacedSystemFontOfSize:font.pointSize - 2
+                                                                weight:NSFontWeightRegular],
+                NSForegroundColorAttributeName: [dimCol colorWithAlphaComponent:0.85],
+            };
+            tx += 8;
+            [chip drawAtPoint:NSMakePoint(tx, rowY + 1) withAttributes:chipAttrs];
+            NSSize sz = [chip sizeWithAttributes:chipAttrs];
+            tx += sz.width;
+        }
+
+        tx += 12;
+
+        // Value chip ("current" / "default" / current-value string).
+        // Accent for current, dim-accent for default, plain dim for
+        // anything else (e.g. the cvar's value shown on a token-0 row).
+        if (!it.value.empty()) {
+            NSString* val = [NSString stringWithUTF8String:it.value.c_str()];
+            if (val != nil && val.length > 0) {
+                NSColor* vc = isCurrent
+                    ? accent
+                    : (isDefault ? [accent colorWithAlphaComponent:0.65]
+                                 : dimCol);
+                if (isCurrent) vc = warn;  // warm tint matches inline ghost
+                NSDictionary* vAttrs = @{
+                    NSFontAttributeName: font,
+                    NSForegroundColorAttributeName: vc,
+                };
+                [val drawAtPoint:NSMakePoint(tx, rowY) withAttributes:vAttrs];
+                NSSize sz = [val sizeWithAttributes:vAttrs];
+                tx += sz.width + 12;
+            }
+        }
+
+        // Truncated description, painted in dim. The clip region above
+        // hides any overflow pixel-clean; we still cap by char count
+        // so the visible part ends in an ellipsis instead of a sharp
+        // right-edge cut. ~7 px per char in the default monospace font
+        // at 13 pt -- scale roughly with point size.
+        if (!it.description.empty()) {
+            const CGFloat budgetPx = bounds.size.width - tx - 8;
+            if (budgetPx > 24) {
+                const CGFloat pxPerCh = MAX((CGFloat)4.0, font.pointSize * 0.55);
+                NSInteger maxCh = (NSInteger)floor(budgetPx / pxPerCh);
+                std::string desc = it.description;
+                if ((NSInteger)desc.size() > maxCh && maxCh > 3) {
+                    desc.resize((std::size_t)(maxCh - 1));
+                    desc.append("\xE2\x80\xA6");  // UTF-8 ellipsis
+                }
+                NSString* d = [NSString stringWithUTF8String:desc.c_str()];
+                if (d != nil && d.length > 0) {
+                    NSDictionary* dAttrs = @{
+                        NSFontAttributeName:            font,
+                        NSForegroundColorAttributeName: dimCol,
+                    };
+                    [d drawAtPoint:NSMakePoint(tx, rowY) withAttributes:dAttrs];
+                }
+            }
+        }
+
+        rowY += lineH;
+    }
+
+    [NSGraphicsContext restoreGraphicsState];
 }
 
 // Forward mouse-wheel events anywhere on the console view to the
@@ -975,6 +1338,18 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
         [self.outputScroll scrollWheel:event];
     } else {
         [super scrollWheel:event];
+    }
+}
+
+// Re-flow the popup on every panel resize. The popup-fit math depends
+// on bounds.height (visibleN can shrink on a short panel), so a window
+// resize that doesn't touch popup state still has to re-evaluate the
+// frame -- otherwise a popup opened at 10 rows stays 10 rows tall when
+// the user shrinks the panel below that height.
+- (void)setFrameSize:(NSSize)newSize {
+    [super setFrameSize:newSize];
+    if (_popupActive) {
+        [self layoutPopup];
     }
 }
 
@@ -1062,6 +1437,16 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     // Backtick toggles when the panel is the key window.  An NSEvent
     // monitor catches the keystroke before the field editor inserts it,
     // so the user can press ` to close even with the input focused.
+    // Ctrl+Space (VS Code / IntelliJ universal "show me my options")
+    // force-opens the completion popup -- after the recent auto-trigger
+    // improvements it's largely redundant, but kept for the "Esc
+    // dismissed it, summon it back" case. We use Ctrl+Space, not
+    // Cmd+Space, because Cmd+Space is owned by Spotlight system-wide
+    // and never reaches our handler. Returning nil from the monitor
+    // consumes the event before AppKit's interpretKeyEvents can
+    // synthesise an insertText:" " on the same keystroke -- so unlike
+    // the Win32 implementation we don't need a separate
+    // s_suppress_next_wm_char gate.
     __weak PtConsolePanel* weakSelf = self;
     self.eventMonitor = [NSEvent
         addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
@@ -1071,6 +1456,21 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
             if (chars.length == 1 && [chars characterAtIndex:0] == '`') {
                 [weakSelf toggle];
                 return nil;          // swallow it -- don't insert into field
+            }
+            // Ctrl+Space -- force-show completion popup. Plain Control
+            // mask only (no Cmd, no Option, no Shift) so e.g. Ctrl+Shift
+            // +Space doesn't trip it accidentally.
+            const NSEventModifierFlags mods =
+                e.modifierFlags &
+                (NSEventModifierFlagControl | NSEventModifierFlagCommand |
+                 NSEventModifierFlagOption  | NSEventModifierFlagShift);
+            if (mods == NSEventModifierFlagControl &&
+                chars.length == 1 && [chars characterAtIndex:0] == ' ') {
+                PtConsoleView* cv = weakSelf.consoleView;
+                if (cv != nil) {
+                    [cv refreshCompletions:YES];
+                }
+                return nil;          // swallow -- don't insert space
             }
             return e;
         }];
