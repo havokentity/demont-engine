@@ -3,6 +3,7 @@
 add_library(pt_console STATIC
     Console.cpp
     ConsoleServer.cpp
+    Completion.cpp
 )
 
 target_include_directories(pt_console PUBLIC ${CMAKE_SOURCE_DIR}/src)
