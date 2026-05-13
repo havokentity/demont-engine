@@ -2488,6 +2488,39 @@ void Engine::RenderFrame() {
     // textures the shader just wrote and outputs to the swapchain
     // (overwriting the shader's tonemapped fallback).
     if (denoiser_active_) {
+        // The engine-side Tonemap.slang post-denoise chain (bloom
+        // composite + ACES + lens flare + sRGB encode -> swapchain)
+        // currently only runs cleanly on Metal. Reasons:
+        //   - OptiX (Vulkan only): defers its actual denoise + copy-
+        //     into-d.output into a private cb submitted AFTER the
+        //     engine cb (CUDA sync model, see VulkanOptixDenoiser::
+        //     Encode's flow comment). So when the engine cb reaches
+        //     the Tonemap dispatch, post_denoise_hdr still holds the
+        //     PREVIOUS frame's OptiX output -- engine Tonemap would
+        //     tonemap a stale frame to the swapchain.
+        //   - SVGF/NRD on Vulkan: the dispatch reaches Tonemap.slang
+        //     fine, but the kernel produces a black swapchain on
+        //     PC (RTX 5090, validation-layer build pending). Not yet
+        //     root-caused -- likely a barrier / descriptor visibility
+        //     bug between SVGF's writes to post_denoise_hdr and the
+        //     Tonemap dispatch's reads via the shared 18-binding
+        //     UPDATE_AFTER_BIND descriptor set. Pending investigation;
+        //     for now Vulkan stays on the legacy DenoiseFinalize path
+        //     (bloom works, lens flare not yet wired). See follow-ups
+        //     in the commit message that disables this gate.
+        //   - SVGF/MetalFX on Mac: synchronous in the engine cb,
+        //     same descriptor model behaves correctly -- this is the
+        //     only platform where the chain runs today.
+        const bool kind_is_optix =
+            (denoiser_kind_ == DenoiserKind::OptixHdr            ||
+             denoiser_kind_ == DenoiserKind::OptixHdrAov         ||
+             denoiser_kind_ == DenoiserKind::OptixTemporalHdr    ||
+             denoiser_kind_ == DenoiserKind::OptixTemporalHdrAov);
+        const bool backend_is_metal =
+            (current_backend_ == pt::rhi::BackendType::Metal);
+        const bool use_engine_tonemap =
+            (tonemap_pipeline_id_ != 0 && !kind_is_optix && backend_is_metal);
+
         pt::rhi::Device::DenoiseDesc dd{};
         dd.color_in      = pt::rhi::TextureHandle{denoise_color_tex_id_};
         dd.depth_in      = pt::rhi::TextureHandle{depth_tex_id_};
@@ -2502,13 +2535,13 @@ void Engine::RenderFrame() {
         // Vulkan SVGF/NRD finalize: reads `output` (linear HDR) and
         // writes a tonemapped LDR result directly into the swapchain.
         // ONLY when the engine's separate Tonemap.slang pipeline isn't
-        // built -- when it IS built (Metal always, Vulkan now too via
-        // the push/UBO split), the post-denoise tonemap chain below
-        // takes over and we tell the SVGF/NRD finalize step to skip
-        // its own swapchain write by passing final_output = 0. The
-        // MetalFX path doesn't have an internal finalize step so it
-        // ignores this field either way.
-        dd.final_output    = (tonemap_pipeline_id_ != 0)
+        // built OR we can't safely chain it (OptiX, see above) -- when
+        // the engine WILL tonemap (Metal always for SVGF/MetalFX,
+        // Vulkan for SVGF/NRD via the push/UBO split), we tell the
+        // SVGF/NRD finalize step to skip its own swapchain write by
+        // passing final_output = 0. MetalFX doesn't have an internal
+        // finalize step so it ignores this field either way.
+        dd.final_output    = use_engine_tonemap
                                  ? pt::rhi::TextureHandle{0}
                                  : fc.swapchain_image;
         dd.exposure_state  = pt::rhi::BufferHandle{exposure_state_id_};
@@ -2615,27 +2648,39 @@ void Engine::RenderFrame() {
              bloom_mip_tex_id_[0] != 0 &&
              bloom_down_pipeline_id_ != 0 && bloom_up_pipeline_id_ != 0);
 
-        // dd.bloom_in / dd.bloom_intensity stay zero on the common
-        // path -- the Tonemap.slang pipeline (built on both backends
-        // now) is the bloom compositor, so DenoiseFinalize's own
-        // bloom slot stays a no-op. The fields remain in DenoiseDesc
-        // so a future setup that doesn't build Tonemap (e.g. a Vulkan
-        // build that strips bloom + flare) can still light up
-        // DenoiseFinalize's bloom path by passing them through.
-        dd.bloom_in        = pt::rhi::TextureHandle{0};
-        dd.bloom_intensity = 0.0f;
+        // Vulkan-only: build the bloom pyramid BEFORE the Denoise()
+        // call so DenoiseFinalize (which runs inside Denoise() and is
+        // the authoritative swapchain writer on Vulkan today) can
+        // composite bloom_mip[0] pre-tonemap. Source = denoise_color
+        // (the path tracer's per-frame noisy 1-spp HDR). post_denoise_hdr
+        // doesn't exist yet at this point in the frame, and even on the
+        // Metal-tonemap path bloom samples from the input to the chain,
+        // not the SVGF output. BloomDown's first-mip Karis averaging is
+        // designed for noisy path-tracer input so the bloom layer reads
+        // clean after one downsample. Metal: bloom runs in the
+        // post-Denoise Tonemap.slang chain below, NOT here.
+        const bool vulkan_pre_denoise_bloom =
+            (current_backend_ == pt::rhi::BackendType::Vulkan &&
+             !kind_is_optix && bloom_can_run);
+        if (vulkan_pre_denoise_bloom) {
+            dispatch_bloom_pyramid(denoise_color_tex_id_);
+        }
+        dd.bloom_in        = vulkan_pre_denoise_bloom
+                                 ? pt::rhi::TextureHandle{bloom_mip_tex_id_[0]}
+                                 : pt::rhi::TextureHandle{0};
+        dd.bloom_intensity = vulkan_pre_denoise_bloom ? bloom_intensity : 0.0f;
 
         device_->Denoise(dd);
 
-        // Vulkan-only: when the engine's Tonemap pipeline isn't
-        // built (it isn't, today), skip the entire bloom + tonemap
-        // chain. The Denoise() call above already wrote the
-        // swapchain via DenoiseFinalize; the dispatches below would
-        // all no-op via id=0 lookups but still cost CPU time on the
-        // descriptor-bind + push-constants setup. On Mac, the
-        // pipeline IS built and this branch runs the standard
-        // bloom-into-tonemap flow.
-        if (tonemap_pipeline_id_ != 0) {
+        // Run the engine's bloom + tonemap chain only when we've told
+        // the denoiser path to defer the swapchain write to us (see
+        // use_engine_tonemap above). When tonemap isn't built (asset
+        // pipeline failure) or the active denoiser is OptiX (deferred
+        // private cb -- engine cb would tonemap STALE post_denoise_hdr),
+        // Denoise()'s own finalize wrote the swapchain and the
+        // dispatches below would just no-op or worse, race the OptiX
+        // private cb on the swapchain image.
+        if (use_engine_tonemap) {
         // Bloom pyramid: extract bright HDR pixels into bloom_mip[0]
         // (with luminance threshold), then progressively downsample
         // through the chain, then upsample additively back up to mip
@@ -2839,7 +2884,7 @@ void Engine::RenderFrame() {
 
         cb->PushConstants(&tp, sizeof(tp));
         cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
-        }  // end: if (tonemap_pipeline_id_ != 0)
+        }  // end: if (use_engine_tonemap)
     }
 
     // RHI-mode perf overlay: final compute pass that composites a panel
