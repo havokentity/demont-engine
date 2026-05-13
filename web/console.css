@@ -568,6 +568,14 @@ body::after {
 }
 .ghost-typed      { color: transparent; }
 .ghost-tail       { color: var(--fg-dim); }
+/* Yellow tint when the previewed candidate is the cvar's current value
+ * (Up/Down cycling lands on it). --warn is the warmest per-theme slot
+ * we already have and is yellow-ish across every dark theme; the Win32
+ * overlay's matching code uses RGB(255,200,80) -- amber/vault's prompt
+ * colour -- to stay warm-toned regardless of palette. Matches the popup
+ * row's "this is what's set right now" affordance but stays visible
+ * inline even when the popup is closed. */
+.ghost-tail.is-current { color: var(--warn); }
 .ghost-annotation { color: var(--fg-dim); opacity: 0.7; font-style: italic; }
 
 /* ---------- VS Code-style completion popup ----------

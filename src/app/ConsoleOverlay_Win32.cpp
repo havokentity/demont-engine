@@ -1482,7 +1482,22 @@ void WinOverlay::Paint(HDC dc) {
                 }
                 if (prefix) {
                     std::string tail = it.name.substr(token.text.size());
-                    SetTextColor(mdc, theme_.dim);
+                    // Tint the ghost yellow when the previewed candidate
+                    // is the cvar's CURRENT value: cycling Up/Down
+                    // through allowed_values, this is the one already
+                    // set, so the user gets the same affordance as the
+                    // popup row's accent name + left bar -- "this is
+                    // what's active right now" -- but visible inline
+                    // even when the popup is below the input. Hardcoded
+                    // gold (matches amber/vault's prompt and the web
+                    // theme's --warn) so it stays warm across every
+                    // theme; the Theme palette doesn't carry a `warn`
+                    // slot today, and synthesising one per theme would
+                    // be churn for a single hint colour.
+                    constexpr COLORREF kCurrentHintColor = RGB(255, 200, 80);
+                    const bool is_current = (it.value == "current");
+                    SetTextColor(mdc, is_current ? kCurrentHintColor
+                                                 : theme_.dim);
                     int gx = cx + 3;
                     auto gbuf = ToWide(tail);
                     if (!gbuf.empty()) {

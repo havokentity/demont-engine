@@ -1034,6 +1034,12 @@
       prefix:  t.text,
       isToken0: t.isToken0,
       annotation: '',
+      // True when the previewed candidate is the cvar's CURRENT value
+      // (Up/Down cycling lands on it). Drives the yellow tint on
+      // .ghost-tail.is-current -- matches the Win32 overlay's
+      // kCurrentHintColor branch so both UIs flag "this is what's
+      // active right now" the same way.
+      isCurrent: it.value === 'current',
     };
     renderGhost();
   }
@@ -1118,6 +1124,12 @@
       ghostTail.textContent       = '';
       ghostAnnotation.textContent = '';
     }
+    // .is-current toggles the yellow tint when the previewed
+    // candidate is the cvar's current value. Set on every render so
+    // it tracks Up/Down cycling without needing a separate refresh
+    // path.
+    ghostTail.classList.toggle('is-current',
+      Boolean(ghostState && ghostState.isCurrent && fits));
     syncGhostScroll();
   }
   // Track input scroll directly too -- typing past the visible
