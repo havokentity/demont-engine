@@ -15,16 +15,19 @@
 // wrote inline -- making r_denoiser={svgf_basic,svgf_atrous,nrd}
 // visually identical to r_denoiser=off.
 //
-// Bloom on Vulkan: while Tonemap.slang isn't built, the smaller
-// bloom-pyramid kernels (BloomDown / BloomUp) ARE buildable for
-// SPIR-V because they only need 2 storage-image bindings each.
-// The engine builds those pipelines and runs the pyramid (which
-// writes bloom_mip[0]) before this kernel. We sample mip[0] with
-// bilinear and add it pre-ACES so it gets the same curve squash
-// as the rest of the image, matching Metal's Tonemap.slang
-// behaviour. When the engine has bloom disabled it binds a 1x1
-// zero placeholder and sets bloom_intensity = 0 so this code path
-// is a no-op.
+// Bloom on Vulkan: Tonemap.slang IS built on the SPIR-V path (see
+// VulkanDevice.cpp's pipeline build block) but Engine.cpp gates
+// `use_engine_tonemap` to Metal only, so DenoiseFinalize is what
+// composites bloom on Vulkan today -- the bloom-pyramid kernels
+// (BloomDown / BloomUp) only need 2 storage-image bindings each and
+// run cleanly on the SPIR-V path. We sample mip[0] with bilinear and
+// add it pre-ACES so it gets the same curve squash as the rest of
+// the image, matching Metal's Tonemap.slang behaviour. Disabled-
+// bloom contract: VulkanNrdDenoiser binds color_in_view as a
+// safe-but-unread fallback at binding 3 and pushes
+// bloom_intensity = 0 so the `if (bloom_intensity > 0.0)` gate
+// short-circuits the sample. No 1x1 placeholder texture is
+// involved on this path.
 //
 // Honors r_hdr_pipeline:
 //   hdr_pipeline = 1 (default): denoise_color holds linear HDR

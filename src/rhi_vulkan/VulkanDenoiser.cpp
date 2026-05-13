@@ -252,9 +252,17 @@ bool VulkanNrdDenoiser::BuildLayout() {
     // 0: hdr_in       (RGBA16F linear-HDR post-denoise)
     // 1: swap_out     (BGRA8 swapchain)
     // 2: exposure_state (storage buffer, written by AutoExposure.slang)
-    // 3: bloom_in     (RGBA16F bloom mip 0; engine binds a 1x1 zero
-    //                  placeholder when r_bloom is off so the slot is
-    //                  always valid even when bloom_intensity = 0)
+    // 3: bloom_in     (RGBA16F bloom mip 0 when bloom is enabled).
+    //                  Disabled-bloom contract: the engine passes
+    //                  dd.bloom_in = 0 and dd.bloom_intensity = 0;
+    //                  Encode() / EncodeFinalizeOnly() bind v_output
+    //                  (color_in_view) as a safe-but-unread fallback
+    //                  and force the push's bloom_intensity to 0 so
+    //                  the shader's `bloom_intensity > 0` gate skips
+    //                  the sample. No 1x1 placeholder texture is
+    //                  required on this path (Tonemap.slang's slot 2
+    //                  path is a separate Mac-only contract that does
+    //                  use the engine's bloom_dummy_tex_id_).
     {
         std::array<VkDescriptorSetLayoutBinding, 4> b{};
         b[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
@@ -706,15 +714,25 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
         VkImageView v_final = device_->LookupImageView(final_output);
         VkBuffer    b_exp   = device_->LookupBuffer(exposure_state);
         // Bloom is optional. If the caller didn't pass a bloom mip
-        // (id=0) OR bloom_intensity is zero, we still need to bind
-        // *something* at binding 3 because the descriptor set layout
-        // declares it. Fall back to v_output (any valid RGBA16F
-        // storage image) and rely on the shader's
-        // `if (bloom_intensity > 0.0)` short-circuit. Robust: never
-        // reads the slot, never writes a null descriptor.
+        // (id=0) OR the lookup misses OR bloom_intensity is zero, we
+        // still need to bind *something* at binding 3 because the
+        // descriptor set layout declares it. Fall back to v_output
+        // (any valid RGBA16F storage image) and force the effective
+        // intensity to zero in that case so the shader's
+        // `if (bloom_intensity > 0.0)` short-circuits the sample.
+        // Tracking `bloom_real` instead of keying intensity on
+        // bloom_in.id catches the corner case where the engine passes
+        // a non-zero handle but LookupImageView returns NULL_HANDLE
+        // (mid-resize, stale handle, etc.) -- without the gate the
+        // shader would sample v_output as its own bloom layer and
+        // produce a feedback-style artifact.
+        bool bloom_real = (bloom_in.id != 0);
         VkImageView v_bloom = VK_NULL_HANDLE;
-        if (bloom_in.id != 0) v_bloom = device_->LookupImageView(bloom_in);
-        if (v_bloom == VK_NULL_HANDLE) v_bloom = v_output;
+        if (bloom_real) v_bloom = device_->LookupImageView(bloom_in);
+        if (v_bloom == VK_NULL_HANDLE) {
+            v_bloom    = v_output;
+            bloom_real = false;
+        }
         if (v_final != VK_NULL_HANDLE && b_exp != VK_NULL_HANDLE) {
             VkDescriptorSet fset = finalize_sets_[next_finalize_set_];
             next_finalize_set_ = (next_finalize_set_ + 1) % kFinalizeSetRing;
@@ -771,11 +789,12 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
             fp.width           = cached_w_;
             fp.height          = cached_h_;
             fp.hdr_pipeline    = hdr_pipeline ? 1u : 0u;
-            // If the engine didn't pass a real bloom image, force
-            // intensity to 0 so the shader's `bloom_intensity > 0`
-            // gate definitely skips. Defence-in-depth -- the engine
-            // already does this on its side.
-            fp.bloom_intensity = (bloom_in.id != 0) ? bloom_intensity : 0.0f;
+            // Key intensity on the resolved-bloom flag, not on
+            // bloom_in.id, so the corner case where the engine passes
+            // a non-zero handle but LookupImageView fails also
+            // collapses to a no-op (otherwise the v_output fallback
+            // above would be sampled as bloom -- HDR feedback artifact).
+            fp.bloom_intensity = bloom_real ? bloom_intensity : 0.0f;
             vkCmdPushConstants(cb, finalize_pipe_layout_,
                                VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                sizeof(fp), &fp);

@@ -141,11 +141,16 @@ public:
         // Vulkan SVGF/NRD only: bloom-pyramid mip 0 (half-res linear
         // HDR). The DenoiseFinalize pass bilinear-samples this and
         // adds it pre-tonemap so highlights get the same ACES squash.
-        // When bloom is disabled, the engine binds a 1x1 zero
-        // placeholder and sets bloom_intensity = 0 below so the
-        // composite collapses to a no-op. MetalFX ignores this --
-        // Metal's bloom is mixed in Tonemap.slang after the denoise
-        // call returns. May be 0 on Metal.
+        // Disabled-bloom contract: the engine sets bloom_in = 0 and
+        // bloom_intensity = 0; VulkanNrdDenoiser then binds its own
+        // color_in_view as a safe-but-unread fallback at descriptor
+        // binding 3 (the layout requires a valid view) and forces the
+        // push intensity to 0 so the shader's gate short-circuits the
+        // sample. No 1x1 placeholder texture is created for this
+        // path. MetalFX ignores this -- Metal's bloom is mixed in
+        // Tonemap.slang after the denoise call returns (which uses
+        // the engine's bloom_dummy_tex_id_ 1x1 texture for *its* own
+        // disabled-bloom slot).
         TextureHandle bloom_in;
         // Vulkan SVGF/NRD only: linear blend factor of the bloom layer
         // added on top of the HDR image before tonemap. Mirrors the
