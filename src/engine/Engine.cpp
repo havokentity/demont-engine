@@ -2617,8 +2617,19 @@ void Engine::RenderFrame() {
         // upsample-add.
         auto dispatch_bloom_pyramid = [&](std::uint64_t source_tex_id) {
             // Downsample: source_tex -> mip0 (with threshold), then
-            // mip0 -> mip1 -> ... -> mip[N-1].
+            // mip0 -> mip1 -> ... -> mip[N-1]. Each step's read of
+            // mip[i-1] is the previous step's write -- explicit
+            // compute_write -> compute_read barriers thread the RAW
+            // hazard chain so we don't race the prior dispatch's store.
+            // Metal's MetalCommandBuffer auto-barriers on shared
+            // resources so its Barrier() is a no-op; Vulkan needs the
+            // explicit emit (same pattern as the PathTrace -> autoexpose
+            // hand-off earlier in the frame).
             for (int i = 0; i < bloom_mips; ++i) {
+                if (i > 0) {
+                    cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                                 pt::rhi::BarrierDesc::Stage::ComputeRead});
+                }
                 cb->BindComputePipeline(pt::rhi::PipelineHandle{bloom_down_pipeline_id_});
                 pt::rhi::TextureHandle src_h{
                     (i == 0) ? source_tex_id : bloom_mip_tex_id_[i - 1]};
@@ -2632,7 +2643,13 @@ void Engine::RenderFrame() {
                              (bloom_mip_h_[i] + 7) / 8, 1);
             }
             // Upsample: mip[N-1] -> mip[N-2] (additive), ..., mip 1 -> mip 0.
+            // `dst[tid] = prev + tent` is read-modify-write so we also
+            // need the barrier between successive ups, plus one at the
+            // end so the consumer (DenoiseFinalize / Tonemap) sees the
+            // final mip[0] write.
             for (int i = bloom_mips - 1; i > 0; --i) {
+                cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                             pt::rhi::BarrierDesc::Stage::ComputeRead});
                 cb->BindComputePipeline(pt::rhi::PipelineHandle{bloom_up_pipeline_id_});
                 cb->BindStorageTexture(0, pt::rhi::TextureHandle{bloom_mip_tex_id_[i]});
                 cb->BindStorageTexture(1, pt::rhi::TextureHandle{bloom_mip_tex_id_[i - 1]});
@@ -2642,6 +2659,8 @@ void Engine::RenderFrame() {
                 cb->Dispatch((bloom_mip_w_[i - 1] + 7) / 8,
                              (bloom_mip_h_[i - 1] + 7) / 8, 1);
             }
+            cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                         pt::rhi::BarrierDesc::Stage::ComputeRead});
         };
         const bool bloom_can_run =
             (bloom_on && bloom_intensity > 0.0f &&
@@ -2659,12 +2678,26 @@ void Engine::RenderFrame() {
         // designed for noisy path-tracer input so the bloom layer reads
         // clean after one downsample. Metal: bloom runs in the
         // post-Denoise Tonemap.slang chain below, NOT here.
-        const bool vulkan_pre_denoise_bloom =
-            (current_backend_ == pt::rhi::BackendType::Vulkan &&
-             !kind_is_optix && bloom_can_run);
-        if (vulkan_pre_denoise_bloom) {
-            dispatch_bloom_pyramid(denoise_color_tex_id_);
-        }
+        // Vulkan bloom is currently DISABLED. The eaaf7b4 design built a
+        // pre-Denoise bloom pyramid from denoise_color and passed
+        // bloom_mip[0] through DenoiseFinalize for the composite. On PC
+        // (RTX 5090) that path renders only the upper-left ~quarter of
+        // the swapchain when r_bloom = 1, with the rest of the swap
+        // showing a darkened version of an earlier pass -- looks like
+        // a descriptor / barrier issue between the shared 18-binding
+        // pipeline-layout's storage-image bindings 0/1 (which bloom_down
+        // re-binds to mip views) and the dispatches that bracket it
+        // (PathTrace inline tonemap before, DenoiseFinalize at the
+        // tail). The bug reproduces on eaaf7b4 too -- pre-existing,
+        // not caused by this branch. Until a validation-layer +
+        // RenderDoc capture pin it down, force the Vulkan bloom path
+        // off so the swap is rendered cleanly. r_bloom on Vulkan is
+        // a no-op (DenoiseFinalize sees bloom_in = 0 and the engine
+        // never runs the pyramid here); Metal's post-Denoise Tonemap
+        // chain is unaffected and continues to composite bloom as
+        // before.
+        (void)dispatch_bloom_pyramid;  // keep lambda alive for clarity / future re-enable
+        const bool vulkan_pre_denoise_bloom = false;
         dd.bloom_in        = vulkan_pre_denoise_bloom
                                  ? pt::rhi::TextureHandle{bloom_mip_tex_id_[0]}
                                  : pt::rhi::TextureHandle{0};
