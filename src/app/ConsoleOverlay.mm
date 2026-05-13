@@ -518,6 +518,17 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     popup.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
     popup.hidden = YES;
     popup.wantsLayer = YES;
+    // Set the LAYER's backing colour so the popup is opaque from the
+    // compositor up, not just inside drawRect:'s NSRectFill call. With
+    // wantsLayer=YES + the panel's NSVisualEffectView vibrancy host,
+    // a drawRect-only fill leaves the layer's compositing alpha
+    // unchanged -- and the scrollback NSTextView underneath bleeds
+    // through any subsequent non-opaque overlay (e.g. the previous
+    // 22%-alpha accent selection band). Setting layer.backgroundColor
+    // pins the layer itself opaque, so any fill we do on top inherits
+    // a solid base regardless of compositing path.
+    popup.layer.backgroundColor =
+        [PtRGB(0.018, 0.024, 0.042) CGColor];
     [self addSubview:popup];
     self.popupView = popup;
 
@@ -1193,12 +1204,28 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     // panel itself uses NSVisualEffectView vibrancy, but the same
     // vibrancy already shows through the popup's location to the
     // scrollback's text -- a translucent popup on top would render
-    // popup rows over a chaos of overlapping log text.
+    // popup rows over a chaos of overlapping log text. Layer.backing
+    // is set to the same colour in initWithFrame so the OPAQUE base is
+    // there even before drawRect runs.
     NSColor* popupBg = PtRGB(0.018, 0.024, 0.042);
     [popupBg setFill];
     NSRectFill(bounds);
-    // 1 px accent outline (slightly dimmed so it doesn't shout).
-    [[accent colorWithAlphaComponent:0.55] setStroke];
+    // Pre-compute the SOLID selection / left-bar colours by blending
+    // the popup bg with the accent. blendedColorWithFraction returns a
+    // fully-opaque colour, so the row highlight composites cleanly
+    // over the bg with no chance of revealing the scrollback layer
+    // underneath -- the prior `accent colorWithAlphaComponent:0.22`
+    // approach still pulled the (previously-translucent) layer's
+    // compositing alpha through to the user. Three tiers:
+    //   selRowBg    -- selected row background (subtle accent wash)
+    //   curBarSolid -- current-value left bar (full accent)
+    //   defBarSolid -- default-value left bar (mid-blend)
+    NSColor* selRowBg    = [popupBg blendedColorWithFraction:0.22 ofColor:accent];
+    NSColor* curBarSolid = accent;
+    NSColor* defBarSolid = [popupBg blendedColorWithFraction:0.55 ofColor:accent];
+    // 1 px accent outline (solid blend; same opacity rationale).
+    NSColor* outlineColor = [popupBg blendedColorWithFraction:0.55 ofColor:accent];
+    [outlineColor setStroke];
     NSBezierPath* outline = [NSBezierPath bezierPathWithRect:
         NSInsetRect(bounds, 0.5, 0.5)];
     outline.lineWidth = 1.0;
@@ -1224,23 +1251,22 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
         const bool isCurrent  = (it.value == "current");
         const bool isDefault  = (it.value == "default");
 
-        // Selected row tinted background.
+        // Selected row -- SOLID blended bg (no alpha) so the row never
+        // shows scrollback through the highlight. See selRowBg comment
+        // above the loop.
         if (selected) {
             NSRect rr = NSMakeRect(2, rowY,
                                    bounds.size.width - 4, lineH);
-            [[accent colorWithAlphaComponent:0.22] setFill];
+            [selRowBg setFill];
             NSRectFill(rr);
         }
-        // Left-edge accent bar marks the current value (and a softer
-        // dimmed bar for the default), independent of selection -- so
-        // "what's set right now" stays visible while cycling Up/Down
-        // through the value list.
+        // Left-edge bar marks the current value (and a softer mid-
+        // blend for the default), independent of selection -- "what's
+        // set right now" stays visible while cycling through the
+        // value list. Both bar colours are solid blends, no alpha.
         if (isCurrent || isDefault) {
             NSRect bar = NSMakeRect(2, rowY, 2, lineH);
-            NSColor* barCol = isCurrent
-                ? accent
-                : [accent colorWithAlphaComponent:0.45];
-            [barCol setFill];
+            [(isCurrent ? curBarSolid : defBarSolid) setFill];
             NSRectFill(bar);
         }
 
