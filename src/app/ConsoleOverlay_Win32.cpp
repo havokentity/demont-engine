@@ -199,6 +199,12 @@ private:
     void MovePopupSelection(int dir);
     void CommitPopup(bool chain_next);
     void DismissPopup();
+    // Single source of truth for how many popup rows actually fit
+    // between the log area and the input row at the current panel
+    // size. Used by both Paint (to pick visible_n) and
+    // MovePopupSelection (so scroll_offset advances at the same
+    // threshold the user sees). Returns 0 if even one row won't fit.
+    int  PopupVisibleRows() const;
     void StartAnim(bool showing);
     void TickAnim();
     int  CurrentY() const;
@@ -1283,19 +1289,42 @@ void WinOverlay::RefreshCompletions(bool force_show) {
     popup_.scroll_offset = 0;
 }
 
+int WinOverlay::PopupVisibleRows() const {
+    constexpr int kPopupMaxRows = 10;
+    const int n = static_cast<int>(popup_.items.size());
+    if (n == 0 || line_height_ <= 0) return 0;
+    if (!hwnd_) return std::min(n, kPopupMaxRows);
+    RECT rc{};
+    GetClientRect(hwnd_, &rc);
+    const int H        = rc.bottom;
+    const int input_y  = H - line_height_ - kPaddingY;
+    const int log_top  = kPaddingY + 1 + 24;
+    // Available vertical room between log_top + 2 and input_y - 6
+    // (matches the popup_y offset Paint uses). The -8 in the row
+    // calc is the popup's 4 px internal padding top + bottom.
+    const int available_h = (input_y - 6) - (log_top + 2);
+    if (available_h < line_height_ + 8) return 0;
+    const int by_height = std::max(1, (available_h - 8) / line_height_);
+    return std::min({n, kPopupMaxRows, by_height});
+}
+
 void WinOverlay::MovePopupSelection(int dir) {
     if (!popup_.active || popup_.items.empty()) return;
     const int n = static_cast<int>(popup_.items.size());
     popup_.selected = ((popup_.selected + dir) % n + n) % n;
-    // Keep the highlighted row in the visible window. The popup
-    // paints `kPopupMaxRows` rows max; if `selected` lands outside
-    // [scroll, scroll+kPopupMaxRows), pull `scroll` to a value that
-    // brings it in.
-    constexpr int kPopupMaxRows = 10;
-    if (popup_.selected < popup_.scroll_offset) {
-        popup_.scroll_offset = popup_.selected;
-    } else if (popup_.selected >= popup_.scroll_offset + kPopupMaxRows) {
-        popup_.scroll_offset = popup_.selected - kPopupMaxRows + 1;
+    // Keep the highlighted row in the visible window. `visible` is
+    // the actual paint-able row count for the current panel size
+    // (shared with Paint via PopupVisibleRows), so when the panel
+    // is short and Paint can only fit e.g. 4 rows, Up/Down scrolls
+    // the window through the rest instead of letting selection run
+    // off-screen.
+    const int visible = PopupVisibleRows();
+    if (visible > 0) {
+        if (popup_.selected < popup_.scroll_offset) {
+            popup_.scroll_offset = popup_.selected;
+        } else if (popup_.selected >= popup_.scroll_offset + visible) {
+            popup_.scroll_offset = popup_.selected - visible + 1;
+        }
     }
     Repaint();
 }
@@ -1552,33 +1581,20 @@ void WinOverlay::Paint(HDC dc) {
         // rows), and a truncated description appended after the
         // value column.
         if (popup_.active && !popup_.items.empty()) {
-            constexpr int kPopupMaxRows = 10;
+            // PopupVisibleRows() does the panel-fit math (shared with
+            // MovePopupSelection so Up/Down scrolling agrees with what
+            // the user can see). Returns 0 when not even one row
+            // fits -- in that case skip rendering entirely. Otherwise
+            // visible_n is min(items.size(), kPopupMaxRows=10,
+            // by-height-of-available-space) and Up/Down scrolls the
+            // window through the remaining items via popup_.scroll_offset.
             const int n = static_cast<int>(popup_.items.size());
-            int visible_n = std::min(n, kPopupMaxRows);
-            int popup_h = visible_n * line_height_ + 8;
+            const int visible_n = PopupVisibleRows();
+            const int popup_h = visible_n * line_height_ + 8;
             const int popup_w = W - 2 * kPaddingX;
             const int popup_x = kPaddingX;
-            int popup_y = input_y - popup_h - 6;
-            // If the popup would overflow above the scrollback area,
-            // shrink it to fit instead of silently skipping. Previous
-            // behaviour was `if (popup_y > log_top) render(); else
-            // drop it`, which made Ctrl+Space appear to do nothing
-            // when the user had typed something like `r_denoiser ` --
-            // 9 allowed_values * line_height_ pushed the popup above
-            // log_top and it vanished. Now we compute how many rows
-            // fit in the gap [log_top, input_y - 6] and clamp
-            // visible_n down to that; the user sees a shorter popup
-            // (with Up/Down scrolling through the rest) instead of
-            // nothing.
-            const int available_h = (input_y - 6) - (log_top + 2);
-            if (popup_h > available_h) {
-                visible_n = std::max(1, (available_h - 8) / line_height_);
-                popup_h = visible_n * line_height_ + 8;
-                popup_y = input_y - popup_h - 6;
-            }
-            // If the overlay is so short there's no room for even one
-            // row, give up. line_height_ + 8 is the minimum popup_h.
-            if (popup_h >= line_height_ + 8 && available_h >= line_height_ + 8) {
+            const int popup_y = input_y - popup_h - 6;
+            if (visible_n > 0) {
                 RECT pr = { popup_x, popup_y, popup_x + popup_w,
                             popup_y + popup_h };
                 // Panel background -- slightly darker than the
