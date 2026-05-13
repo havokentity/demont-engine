@@ -670,6 +670,7 @@
           slider_step:    v.slider_step,
           value:          v.value,
           default_value:  v.default,
+          description:    v.description || '',
         };
       }
     }
@@ -679,38 +680,336 @@
         names.add(v.name);
         commandMeta[v.name] = {
           default_args: v.default_args || '',
+          description:  v.description || '',
         };
       }
     }
     allNames = Array.from(names).sort();
   }
 
-  // ---------- Tab completion -------------------------------------------------
-  function commonPrefix(strs) {
-    if (strs.length === 0) return '';
-    let p = strs[0];
-    for (let i = 1; i < strs.length; ++i) {
-      let j = 0;
-      while (j < p.length && j < strs[i].length && p[j] === strs[i][j]) ++j;
-      p = p.slice(0, j);
-      if (!p) break;
+  // ---------- VS Code-style completion popup + inline ghost -----------------
+  //
+  // Two coupled UIs share state via `popupState`:
+  //   1. The popup (#input-completions) -- a scrollable list of matches
+  //      with name + kind chip + current value + truncated description.
+  //   2. The inline ghost (#input-ghost) -- a dim preview of the
+  //      currently-highlighted match's tail, rendered IN-PLACE in the
+  //      input so the user sees what Tab will commit.
+  //
+  // Match scoring tries 3 modes in descending priority (the highest
+  // scoring mode wins per candidate; all candidates with score > 0
+  // get ranked in the popup):
+  //   - PREFIX: candidate starts with the query. Tightest, top score.
+  //   - SUBSTRING: query appears as a contiguous run inside the
+  //     candidate. Bonus when the run starts at a word boundary
+  //     (position 0 or right after `_`).
+  //   - FUZZY: query chars appear in order, possibly with gaps. Used
+  //     so typing "rbi" finds "r_bloom_intensity". Penalized vs the
+  //     stricter modes so prefix/substring always sort above.
+  //
+  // popupState shape:
+  //   { active: bool, items: [{name, kind, value, description, score, spans}],
+  //     selected: int, token: {start, end, text, isToken0, firstTok} }
+  let popupState = { active: false, items: [], selected: -1, token: null };
+  const completionsEl = document.getElementById('input-completions');
+
+  // Identify the word at the cursor (or just before it). Returns
+  //   { start, end, text, isToken0, firstTok }
+  // where text is the run of non-space chars containing the cursor.
+  // `start`..`end` are indices into `input.value` ready for splice-
+  // style replacement. isToken0 == true means we're completing the
+  // first word of the line (a cvar/command name); firstTok is the
+  // already-typed first token (used to pick value-position
+  // candidates).
+  function currentToken() {
+    const v   = input.value;
+    const pos = input.selectionStart ?? v.length;
+    // Find the word boundaries around `pos`.
+    let s = pos, e = pos;
+    while (s > 0 && v[s - 1] !== ' ') --s;
+    while (e < v.length && v[e] !== ' ') ++e;
+    const text = v.slice(s, e);
+    // Token-0 detection: scan from start of input through `s`; if
+    // we see any non-space before `s`, we're past token 0.
+    let isToken0 = true;
+    let firstTok = '';
+    {
+      // Quick scan: find first non-space; collect chars until next
+      // space; compare its end position vs `s`.
+      let i = 0;
+      while (i < v.length && v[i] === ' ') ++i;
+      const tStart = i;
+      while (i < v.length && v[i] !== ' ') ++i;
+      firstTok = v.slice(tStart, i);
+      isToken0 = (s <= i);
+      // If the cursor sits inside the first token's run (s == tStart),
+      // we ARE completing token 0. If s > i, we're at token 1+.
+      isToken0 = (s === tStart);
     }
-    return p;
+    return { start: s, end: e, text, isToken0, firstTok };
   }
 
-  function refreshGhostAnnotation() {
-    if (!ghostState) return;
-    if (!ghostState.isMeta || ghostState.matches.length < 2) {
-      ghostState.annotation = '';
+  // Score a candidate against the user's query. Returns
+  //   { score, spans }
+  // where score is a positive number (0 means no match) and spans is
+  // an array of [from, to) char ranges within the candidate that
+  // matched -- used by the popup to highlight the matching chars
+  // visually. Higher score = ranked higher. Length-of-candidate tie-
+  // breaker is applied by the caller after scoring.
+  function scoreMatch(name, q) {
+    if (!q) return { score: 1, spans: [] };
+    const nLow = name.toLowerCase();
+    const qLow = q.toLowerCase();
+    // PREFIX -- tightest match, highest base score.
+    if (nLow.startsWith(qLow)) {
+      const tightness = qLow.length / nLow.length;   // 0..1
+      return { score: 1000 + Math.round(tightness * 200), spans: [[0, qLow.length]] };
+    }
+    // SUBSTRING -- contiguous match anywhere.
+    const idx = nLow.indexOf(qLow);
+    if (idx !== -1) {
+      const wordStart = (idx === 0) || nLow[idx - 1] === '_';
+      const tightness = qLow.length / nLow.length;
+      const wordBonus = wordStart ? 100 : 0;
+      return {
+        score: 500 + wordBonus + Math.round(tightness * 100) - idx,
+        spans: [[idx, idx + qLow.length]],
+      };
+    }
+    // FUZZY -- in-order subsequence match, char by char, with a
+    // word-boundary bonus for each char that lands at the start of a
+    // segment (after `_`). Pairs of consecutive matches get a small
+    // streak bonus so "rbi" prefers "r_bloom_intensity" over
+    // "r_blur_threshold_idiv" (hypothetical).
+    let qi = 0, score = 0, lastMatch = -2;
+    const spans = [];
+    let runStart = -1;
+    for (let i = 0; i < nLow.length && qi < qLow.length; ++i) {
+      if (nLow[i] !== qLow[qi]) {
+        if (runStart !== -1) { spans.push([runStart, i]); runStart = -1; }
+        continue;
+      }
+      // Per-char scoring.
+      const atWordStart = (i === 0) || nLow[i - 1] === '_';
+      score += atWordStart ? 8 : 4;
+      if (i === lastMatch + 1) score += 4;   // streak bonus
+      lastMatch = i;
+      if (runStart === -1) runStart = i;
+      ++qi;
+    }
+    if (runStart !== -1) spans.push([runStart, lastMatch + 1]);
+    if (qi < qLow.length) return { score: 0, spans: [] };   // didn't match all chars
+    // Penalize fuzzy heavily so prefix/substring sort above. Density
+    // bonus rewards tight matches (fewer skipped chars).
+    const density = qLow.length / nLow.length;
+    return { score: 100 + score + Math.round(density * 50), spans };
+  }
+
+  // Build the candidate pool for the current token context:
+  //   - Token 0: every cvar + every command.
+  //   - Token 1+ with `toggle` as first token: only cvars with
+  //     allowed_values (those are the meaningful toggle targets).
+  //   - Token 1+ otherwise: the named cvar's allowed_values (when it
+  //     has any). Returns [] when there's nothing useful to suggest.
+  function getCandidates(token) {
+    const out = [];
+    if (token.isToken0) {
+      for (const n of allNames) {
+        const cv  = cvarMeta[n];
+        const cmd = commandMeta[n];
+        if (cv) {
+          out.push({
+            name: n, kind: 'cvar',
+            value: cv.value !== undefined ? String(cv.value) : '',
+            description: cv.description || '',
+          });
+        } else if (cmd) {
+          out.push({
+            name: n, kind: 'cmd',
+            value: cmd.default_args || '',
+            description: cmd.description || '',
+          });
+        }
+      }
+      return out;
+    }
+    // Value position.
+    if (token.firstTok === 'toggle') {
+      for (const n of Object.keys(cvarMeta).sort()) {
+        const cv = cvarMeta[n];
+        if (cv.allowed_values && cv.allowed_values.length > 0) {
+          out.push({ name: n, kind: 'cvar',
+                     value: cv.value !== undefined ? String(cv.value) : '',
+                     description: cv.description || '' });
+        }
+      }
+      return out;
+    }
+    const cv = cvarMeta[token.firstTok];
+    if (cv && cv.allowed_values && cv.allowed_values.length > 0) {
+      for (const v of cv.allowed_values) {
+        out.push({ name: v, kind: 'value',
+                   value: (String(v) === String(cv.value)) ? 'current'
+                        : (String(v) === String(cv.default_value)) ? 'default' : '',
+                   description: '' });
+      }
+    } else if (cv && cv.value !== undefined) {
+      // Free-form cvar: offer the current value and (when different)
+      // the default as one-shot suggestions.
+      out.push({ name: String(cv.value), kind: 'value', value: 'current',
+                 description: cv.description || '' });
+      const dflt = cv.default_value;
+      if (dflt !== undefined && String(dflt) !== String(cv.value)) {
+        out.push({ name: String(dflt), kind: 'value', value: 'default',
+                   description: cv.description || '' });
+      }
+    }
+    return out;
+  }
+
+  // Recompute candidates + scores for the current cursor context and
+  // (re)render the popup + inline ghost. Called from the `input`
+  // event handler, from Tab, from cursor-movement keys, etc.
+  function refreshCompletions(forceShow) {
+    const token = currentToken();
+    const pool  = getCandidates(token);
+    if (pool.length === 0) { hideCompletions(); return; }
+
+    // Empty query (cursor just landed somewhere) is fine on Tab/force
+    // but produces too much noise during normal typing. On forceShow
+    // we list everything; otherwise we require at least one char.
+    if (!forceShow && token.text.length === 0) {
+      hideCompletions();
       return;
     }
-    // matches[0] = current value, matches[1] = default (per activateValueGhost).
-    if (ghostState.index === 0) {
-      ghostState.annotation = '  default: ' + ghostState.matches[1];
-    } else {
-      ghostState.annotation = '  current: ' + ghostState.matches[0];
+
+    const scored = [];
+    for (const c of pool) {
+      const { score, spans } = scoreMatch(c.name, token.text);
+      if (score > 0) scored.push({ ...c, score, spans });
     }
+    if (scored.length === 0) { hideCompletions(); return; }
+    scored.sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      if (a.name.length !== b.name.length) return a.name.length - b.name.length;
+      return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+    });
+
+    // Cap to a reasonable visible count -- the popup is scrollable
+    // beyond that, but rendering 800 rows every keystroke is wasteful.
+    const items = scored.slice(0, 60);
+    popupState = { active: true, items, selected: 0, token };
+    renderCompletions();
+    renderGhostFromPopup();
   }
+
+  function renderCompletions() {
+    if (!completionsEl) return;
+    if (!popupState.active || popupState.items.length === 0) {
+      completionsEl.hidden = true;
+      completionsEl.innerHTML = '';
+      return;
+    }
+    const rows = popupState.items.map((it, i) => {
+      // Build the name with match-span highlights.
+      let name = '';
+      let cursor = 0;
+      const spans = it.spans || [];
+      for (const [a, b] of spans) {
+        if (a > cursor) name += escape(it.name.slice(cursor, a));
+        name += '<span class="match">' + escape(it.name.slice(a, b)) + '</span>';
+        cursor = b;
+      }
+      if (cursor < it.name.length) name += escape(it.name.slice(cursor));
+      const valEl = it.value
+          ? `<span class="completion-value">${escape(it.value)}</span>` : '';
+      const kindLabel = it.kind === 'cmd' ? 'cmd'
+                      : it.kind === 'value' ? '' : 'cvar';
+      const kindEl = kindLabel
+          ? `<span class="completion-kind">${escape(kindLabel)}</span>` : '';
+      const descEl = it.description
+          ? `<div class="completion-desc">${escape(it.description.slice(0, 120))}</div>` : '';
+      const sel = (i === popupState.selected) ? ' selected' : '';
+      return `<div class="completion-row${sel}" role="option" data-idx="${i}">`
+           + `<span class="completion-name">${name}</span>`
+           + kindEl + valEl + descEl + `</div>`;
+    }).join('');
+    completionsEl.innerHTML = rows;
+    completionsEl.hidden = false;
+    // Scroll the selected row into view (popup is scrollable when N > visible).
+    const sel = completionsEl.querySelector('.completion-row.selected');
+    if (sel) sel.scrollIntoView({ block: 'nearest' });
+  }
+
+  function renderGhostFromPopup() {
+    if (!popupState.active || popupState.selected < 0) {
+      ghostState = null;
+      renderGhost();
+      return;
+    }
+    const it = popupState.items[popupState.selected];
+    const t  = popupState.token;
+    // Only render the inline ghost when the candidate STARTS WITH the
+    // typed token (prefix match). For substring/fuzzy hits the tail
+    // wouldn't visually concatenate cleanly with what the user
+    // already typed, so the popup itself is the affordance and we
+    // leave the inline ghost blank.
+    const fits = it.name.toLowerCase().startsWith(t.text.toLowerCase());
+    if (!fits) { ghostState = null; renderGhost(); return; }
+    ghostState = {
+      matches: popupState.items.map(x => x.name),
+      index:   popupState.selected,
+      before:  input.value.slice(0, t.start),
+      prefix:  t.text,
+      isToken0: t.isToken0,
+      annotation: '',
+    };
+    renderGhost();
+  }
+
+  function hideCompletions() {
+    popupState = { active: false, items: [], selected: -1, token: null };
+    if (completionsEl) {
+      completionsEl.hidden = true;
+      completionsEl.innerHTML = '';
+    }
+    ghostState = null;
+    renderGhost();
+  }
+
+  function popupMoveSelection(dir) {
+    if (!popupState.active || popupState.items.length === 0) return false;
+    const n = popupState.items.length;
+    popupState.selected = ((popupState.selected + dir) % n + n) % n;
+    renderCompletions();
+    renderGhostFromPopup();
+    return true;
+  }
+
+  // Commit the currently-highlighted popup row by replacing the word
+  // at the cursor with the candidate name (and a trailing space when
+  // we're completing token 0 so the user lands at the value position
+  // ready to keep typing). `chainNext` controls whether we
+  // auto-reopen the popup at the new cursor position after commit:
+  //   - Tab commits chain (Tab = "complete + show next suggestions")
+  //   - Enter / click commits DON'T chain (those are "accept + stop"
+  //     gestures -- otherwise Enter would loop the popup forever).
+  // Mirrors VS Code's IntelliSense-vs-Tab semantics.
+  function popupCommit(chainNext) {
+    if (!popupState.active || popupState.selected < 0) return false;
+    const it = popupState.items[popupState.selected];
+    const t  = popupState.token;
+    const v  = input.value;
+    const tail = it.name + (t.isToken0 ? ' ' : '');
+    input.value = v.slice(0, t.start) + tail + v.slice(t.end);
+    const caret = t.start + tail.length;
+    input.setSelectionRange(caret, caret);
+    const wasToken0 = t.isToken0;
+    hideCompletions();
+    if (chainNext && wasToken0) refreshCompletions(/*forceShow=*/true);
+    return true;
+  }
+
   // Sync the absolutely-positioned ghost overlay with the input's
   // horizontal scroll position.  The input element scrolls its
   // content when the typed string exceeds the visible width; without
@@ -752,121 +1051,6 @@
   function dismissGhost() {
     if (!ghostState) return;
     ghostState = null;
-    renderGhost();
-  }
-  function activateValueGhost(name) {
-    let matches = null;
-    let isMeta  = false;
-    const cv = cvarMeta[name];
-    const cmd = commandMeta[name];
-    if (cv) {
-      if (cv.allowed_values && cv.allowed_values.length > 0) {
-        matches = cv.allowed_values.slice();
-      } else if (cv.value !== undefined) {
-        matches = [String(cv.value)];
-        const dflt = cv.default_value;
-        if (dflt !== undefined && String(dflt) !== String(cv.value)) {
-          matches.push(String(dflt));
-          isMeta = true;
-        }
-      }
-    } else if (cmd && cmd.default_args) {
-      matches = [cmd.default_args];
-    }
-    if (!matches || matches.length === 0) return;
-    ghostState = {
-      matches,
-      index:    0,
-      before:   input.value,    // already ends with "<name> "
-      prefix:   '',
-      isToken0: false,
-      isMeta,
-      annotation: '',
-    };
-    refreshGhostAnnotation();
-    renderGhost();
-  }
-  function commitGhost() {
-    if (!ghostState) return;
-    const committed = ghostState.matches[ghostState.index];
-    const wasToken0 = ghostState.isToken0;
-    const tail      = wasToken0 ? committed + ' ' : committed;
-    input.value     = ghostState.before + tail;
-    input.setSelectionRange(input.value.length, input.value.length);
-    dismissGhost();
-    // Token-0 commit just landed on a name -- if it's a cvar, chain
-    // into a value-position ghost so the user immediately sees the
-    // current (and default, when free-form) value.
-    if (wasToken0) activateValueGhost(committed);
-  }
-  function cycleGhost(dir) {
-    if (!ghostState) return;
-    const n = ghostState.matches.length;
-    ghostState.index = ((ghostState.index + dir) % n + n) % n;
-    refreshGhostAnnotation();
-    renderGhost();
-  }
-
-  function handleTab() {
-    const value = input.value;
-    const cursor = input.selectionStart;
-    if (cursor !== value.length) return;
-    const beforeCursor = value.slice(0, cursor);
-    const lastSpace = beforeCursor.lastIndexOf(' ');
-
-    let prefix, candidates;
-    if (lastSpace === -1) {
-      // Token 0: cvar / command name.
-      prefix = beforeCursor;
-      candidates = allNames;
-    } else {
-      // Value position: special-case `toggle` -- second token is a cvar
-      // name, only those with allowed_values are useful candidates.
-      const firstTok = beforeCursor.split(/\s+/)[0];
-      if (firstTok === 'toggle') {
-        candidates = Object.keys(cvarMeta).filter(
-          n => cvarMeta[n].allowed_values && cvarMeta[n].allowed_values.length > 0
-        ).sort();
-        prefix = beforeCursor.slice(lastSpace + 1);
-      } else {
-        // Default: complete from the named cvar's allowed_values.
-        const meta = cvarMeta[firstTok];
-        if (!meta || !meta.allowed_values || meta.allowed_values.length === 0) return;
-        prefix = beforeCursor.slice(lastSpace + 1);
-        candidates = meta.allowed_values;
-      }
-    }
-
-    const matches = candidates.filter(n => n.startsWith(prefix));
-    if (matches.length === 0) return;
-
-    const isToken0 = (lastSpace === -1);
-    const before   = beforeCursor.slice(0, lastSpace + 1);
-
-    if (matches.length === 1) {
-      const tail = matches[0] + (isToken0 ? ' ' : '');
-      input.value = before + tail;
-      input.setSelectionRange(input.value.length, input.value.length);
-      dismissGhost();
-      return;
-    }
-
-    // Multiple matches: extend to longest common prefix, then activate
-    // ghost mode so the user can cycle / commit visually.
-    const common = commonPrefix(matches);
-    let typedPrefix = prefix;
-    if (common.length > prefix.length) {
-      input.value = before + common;
-      input.setSelectionRange(input.value.length, input.value.length);
-      typedPrefix = common;
-    }
-    ghostState = {
-      matches,
-      index: 0,
-      before,
-      prefix: typedPrefix,
-      isToken0,
-    };
     renderGhost();
   }
 
@@ -925,48 +1109,67 @@
 
   form.addEventListener('submit', (e) => {
     e.preventDefault();
-    if (ghostState) commitGhost();   // Enter accepts the current ghost
+    // Enter while the popup is up commits the highlighted match and
+    // KEEPS the line in the input -- VS Code-style "accept the
+    // suggestion, don't run yet". A second Enter (with the popup now
+    // dismissed) actually submits the line. This avoids the
+    // surprise-execute behaviour where Enter would both commit the
+    // ghost AND fire the command in one keystroke.
+    if (popupState.active) {
+      popupCommit(/*chainNext=*/false);
+      return;
+    }
     const line = input.value;
     input.value = '';
-    dismissGhost();
+    hideCompletions();
     exec(line);
   });
 
   input.addEventListener('keydown', (e) => {
-    // Modifier keys alone must not dismiss the ghost -- pressing
-    // Shift fires keydown with e.key === 'Shift' before Tab arrives,
-    // and "any-other-key dismisses" below would have killed the
-    // ghost so Shift+Tab degenerated into a forward cycle.  Skip.
+    // Modifier keys alone are noise (Shift fires keydown before the
+    // real key arrives) -- ignore them so a Shift-Up still routes to
+    // the popup, Shift-Tab still cycles backward, etc.
     if (e.key === 'Shift' || e.key === 'Control' || e.key === 'Alt' ||
         e.key === 'Meta'  || e.key === 'CapsLock') {
       return;
     }
-    // Ghost-mode key handling.  Tab cycles, Shift+Tab cycles back,
-    // Right-arrow at end / End commits, Esc dismisses, any other
-    // key dismisses and falls through to normal handling.
-    if (e.key === 'Tab') {
-      e.preventDefault();
-      if (ghostState) cycleGhost(e.shiftKey ? -1 : +1);
-      else            handleTab();
-      return;
-    }
-    if (ghostState) {
+
+    // ---- Popup-active key handling --------------------------------------
+    // Up/Down move the highlight inside the popup (NOT command
+    // history); Tab commits the highlighted match; Enter is handled
+    // by the submit listener above (commits + dismiss + keep line);
+    // Esc dismisses; Right-arrow at end commits the prefix-fitting
+    // ghost (the only case where the inline preview accurately
+    // represents what gets inserted).
+    if (popupState.active) {
+      if (e.key === 'ArrowDown') { e.preventDefault(); popupMoveSelection(+1); return; }
+      if (e.key === 'ArrowUp')   { e.preventDefault(); popupMoveSelection(-1); return; }
+      if (e.key === 'Tab')       { e.preventDefault(); popupCommit(/*chainNext=*/true); return; }
+      if (e.key === 'Escape')    { e.preventDefault(); hideCompletions(); return; }
       if (e.key === 'End' ||
           (e.key === 'ArrowRight' && input.selectionStart === input.value.length)) {
-        e.preventDefault();
-        commitGhost();
-        return;
+        if (ghostState) { e.preventDefault(); popupCommit(/*chainNext=*/true); return; }
       }
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        dismissGhost();
-        return;
-      }
-      // Enter is handled by the form 'submit' listener above.
+      // Any other key dismisses the popup and falls through to default
+      // input behaviour. The subsequent `input` event handler will
+      // re-open the popup if the typed char still leaves us inside a
+      // completable token.
       if (e.key !== 'Enter') {
-        dismissGhost();
-        // fall through to default key behaviour
+        hideCompletions();
+        // fall through
       }
+    }
+
+    // ---- Popup-inactive key handling ------------------------------------
+    if (e.key === 'Tab') {
+      // Open the popup -- the input handler that auto-shows only fires
+      // on input events, not on bare Tab presses, so we route through
+      // refreshCompletions(forceShow=true) which lists every candidate
+      // for the current token (useful when the token is empty, e.g.
+      // user typed "r_bloom " and wants to see the allowed values).
+      e.preventDefault();
+      refreshCompletions(/*forceShow=*/true);
+      return;
     }
     if (e.key === 'ArrowUp') {
       if (histPos > 0) { histPos--; input.value = history[histPos] || ''; }
@@ -980,25 +1183,48 @@
     }
   });
 
-  // Mouse click into the input dismisses the ghost (cursor probably
-  // moves away from end-of-line, so the suggestion is no longer
-  // contextually meaningful).
-  input.addEventListener('mousedown', () => { dismissGhost(); });
+  // Mouse click on a popup row commits that row. We use mousedown
+  // (not click) because click fires AFTER blur, and blur hides the
+  // popup -- so a click on a row would otherwise hit empty space by
+  // the time the click event actually arrived. Also: capture in
+  // mousedown lets us preventDefault to keep the input focused so
+  // the user can keep typing immediately after the commit.
+  if (completionsEl) {
+    completionsEl.addEventListener('mousedown', (e) => {
+      const row = e.target.closest('.completion-row');
+      if (!row) return;
+      e.preventDefault();
+      const idx = parseInt(row.dataset.idx, 10);
+      if (!Number.isNaN(idx)) {
+        popupState.selected = idx;
+        popupCommit(/*chainNext=*/false);
+        input.focus();
+      }
+    });
+  }
 
-  // Auto-activate the value-position ghost when the user types
-  // `<name> ` themselves (without going through Tab + Right).  Fires
-  // after every text mutation; only triggers when input is exactly
-  // "<single token> " with cursor at the end and no ghost is already
-  // active.  Mirrors the post-commit auto-activation so manual typers
-  // get the same affordance as tab-completers.
+  // Clicks INSIDE the input only re-anchor the cursor; refresh the
+  // popup against the new cursor position so partial-cursor edits
+  // still get a contextual suggestion. (Click outside the input
+  // hides the popup via the blur path below.)
+  input.addEventListener('mouseup', () => {
+    // Microtask so input.selectionStart is the post-click position.
+    setTimeout(() => refreshCompletions(/*forceShow=*/false), 0);
+  });
+  input.addEventListener('blur', () => {
+    // Tiny delay so a popup-row mousedown still gets processed before
+    // we hide the popup.
+    setTimeout(() => { if (document.activeElement !== input) hideCompletions(); }, 80);
+  });
+
+  // Re-rank completions on every input mutation. This is the
+  // "VS Code-like" affordance: as soon as the user types a single
+  // char that matches anything in the candidate pool, the popup
+  // appears -- no need to press Tab first. The popup is also kept
+  // in sync as the user keeps typing (chars accepted -> matches
+  // narrow, char deleted -> matches widen).
   input.addEventListener('input', () => {
-    if (ghostState) return;
-    const v = input.value;
-    if (v.length < 2 || v[v.length - 1] !== ' ') return;
-    if (input.selectionStart !== v.length) return;
-    const trimmed = v.slice(0, -1);
-    if (trimmed.length === 0 || trimmed.includes(' ')) return;
-    activateValueGhost(trimmed);
+    refreshCompletions(/*forceShow=*/false);
   });
 
   // Paste-to-multiline: if the clipboard text spans multiple lines, treat
