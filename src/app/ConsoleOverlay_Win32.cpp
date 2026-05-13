@@ -970,7 +970,24 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // the dismissal would beat the open. Swallowing the
         // keystroke (`return 0`) prevents WM_CHAR from generating
         // a stray space character.
+        //
+        // CAVEATS: on Windows with Chinese / Japanese / Korean IME
+        // enabled, Ctrl+Space is reserved by the OS for toggling
+        // the IME and never reaches this handler. There's nothing
+        // we can do about that short of binding a different shortcut
+        // -- if a user reports it not working, suggest checking
+        // Settings > Time & Language > Advanced keyboard settings
+        // for any IME toggle bindings.
+        //
+        // The first-fire log is a one-shot diagnostic so users can
+        // confirm the handler is being reached (e.g. by tailing the
+        // engine log while pressing the shortcut).
         if (ctrl_held && w == VK_SPACE) {
+            static std::atomic<bool> s_logged_once{false};
+            if (!s_logged_once.exchange(true)) {
+                LOG_INFO("ConsoleOverlay: Ctrl+Space force-show fired "
+                         "(input='{}' cursor={})", input_, cursor_);
+            }
             RefreshCompletions(/*force_show=*/true);
             Repaint();
             return 0;
@@ -1501,7 +1518,9 @@ void WinOverlay::Paint(HDC dc) {
                     const int idx = scroll + vi;
                     if (idx < 0 || idx >= n) break;
                     const auto& it = popup_.items[idx];
-                    const bool selected = (idx == popup_.selected);
+                    const bool selected   = (idx == popup_.selected);
+                    const bool is_current = (it.value == "current");
+                    const bool is_default = (it.value == "default");
                     if (selected) {
                         RECT rr = { popup_x + 2, row_y,
                                     popup_x + popup_w - 2,
@@ -1512,11 +1531,34 @@ void WinOverlay::Paint(HDC dc) {
                         FillRect(mdc, &rr, selbg);
                         DeleteObject(selbg);
                     }
+                    // Left-edge accent bar marks the current value's
+                    // row (independent of selection) so the user can
+                    // always spot "what's set right now" while cycling
+                    // Up/Down through the value list. Softer dim bar
+                    // for the default value, so reset-to-default is
+                    // also visible without competing.
+                    if (is_current || is_default) {
+                        RECT bar = { popup_x + 2, row_y,
+                                     popup_x + 4,
+                                     row_y + line_height_ };
+                        COLORREF c = is_current
+                            ? theme_.accent
+                            : DimColor(theme_.accent, 0.45f);
+                        HBRUSH bb = CreateSolidBrush(c);
+                        FillRect(mdc, &bar, bb);
+                        DeleteObject(bb);
+                    }
                     // Name with match-span highlighting. Walk the
                     // spans, emitting the in-span runs in accent
                     // colour and the out-of-span runs in `text`.
+                    // Current-value rows tint the WHOLE name in
+                    // accent so the marker isn't just on the bar --
+                    // the eye lands on the highlighted name first.
                     const std::string& name = it.name;
                     int tx = popup_x + 8;
+                    const COLORREF name_fg = is_current
+                        ? theme_.accent
+                        : theme_.text;
                     std::size_t cursor_ch = 0;
                     auto draw_run = [&](std::size_t a, std::size_t b,
                                         COLORREF col) {
@@ -1534,20 +1576,31 @@ void WinOverlay::Paint(HDC dc) {
                     };
                     for (const auto& sp : it.spans) {
                         if (sp.first > cursor_ch) {
-                            draw_run(cursor_ch, sp.first, theme_.text);
+                            draw_run(cursor_ch, sp.first, name_fg);
                         }
                         draw_run(sp.first, sp.second, theme_.accent);
                         cursor_ch = sp.second;
                     }
                     if (cursor_ch < name.size()) {
-                        draw_run(cursor_ch, name.size(), theme_.text);
+                        draw_run(cursor_ch, name.size(), name_fg);
                     }
                     // Right-justified value chip + truncated
                     // description, separated by ` -- `. Painted in
                     // dim so they don't fight the name for the eye.
                     tx += 12;
                     if (!it.value.empty()) {
-                        SetTextColor(mdc, theme_.dim);
+                        // Value chip colour: accent for "current",
+                        // dimmed-accent for "default", plain dim for
+                        // the cvar's actual current value when it's
+                        // shown on a non-value-position row (cvar
+                        // candidate at token 0). The is_current /
+                        // is_default flags above already capture the
+                        // tag-driven cases.
+                        COLORREF vc = is_current
+                            ? theme_.accent
+                            : (is_default ? DimColor(theme_.accent, 0.6f)
+                                          : theme_.dim);
+                        SetTextColor(mdc, vc);
                         auto vbuf = ToWide(it.value);
                         if (!vbuf.empty()) {
                             TextOutW(mdc, tx, row_y, vbuf.data(),

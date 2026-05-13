@@ -964,6 +964,15 @@
           ? `<div class="completion-desc">${escape(it.description.slice(0, 120))}</div>` : '';
       const isSel = (i === popupState.selected);
       const sel   = isSel ? ' selected' : '';
+      // Row state classes -- independent of selection. The current-
+      // value row stays visually marked (accent border + accent name
+      // tint) even when the user has the popup cursor highlighting a
+      // different row, so "what is the cvar set to right now?" is
+      // always readable at a glance. Default-value row gets a softer
+      // marker so it's visible without competing with current.
+      const stateCls = it.value === 'current' ? ' is-current'
+                    : it.value === 'default' ? ' is-default'
+                    : '';
       // aria-selected pairs with the row's `selected` CSS class. The
       // listbox container (#input-completions) has role="listbox";
       // each row is role="option" -- screen readers announce the
@@ -971,7 +980,7 @@
       // perceivable without sighted CSS.
       const aria  = ` aria-selected="${isSel ? 'true' : 'false'}"`;
       const opt_id = `completion-opt-${i}`;
-      return `<div class="completion-row${sel}" role="option" id="${opt_id}"`
+      return `<div class="completion-row${sel}${stateCls}" role="option" id="${opt_id}"`
            + aria + ` data-idx="${i}">`
            + `<span class="completion-name">${name}</span>`
            + kindEl + valEl + descEl + `</div>`;
@@ -1207,10 +1216,22 @@
     // open and regardless of how empty the current token is, so the
     // user can always summon completions on demand even after
     // dismissing them. Has to be early in keydown -- before the
-    // modifier-only skip would catch Ctrl alone, and before the
     // popup-active branch consumes Space as "any other key".
-    if ((e.ctrlKey || e.metaKey) && e.key === ' ') {
+    //
+    // Match on `e.code === 'Space'` rather than `e.key === ' '`
+    // because Ctrl+Space with an active IME (Microsoft Pinyin,
+    // Japanese, etc.) sometimes produces an empty `e.key` or a
+    // different value while `e.code` always reflects the physical
+    // key. The earlier `e.key === ' '` check missed those cases.
+    if ((e.ctrlKey || e.metaKey) && e.code === 'Space') {
       e.preventDefault();
+      // Console-log so the user can verify the handler fired when
+      // testing in the browser dev tools. One-shot to avoid spam.
+      if (!window.__demont_ctrl_space_logged) {
+        window.__demont_ctrl_space_logged = true;
+        console.log('[demont] Ctrl+Space force-show fired',
+                    { value: input.value, cursor: input.selectionStart });
+      }
       refreshCompletions(/*forceShow=*/true);
       return;
     }

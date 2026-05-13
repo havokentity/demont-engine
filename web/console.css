@@ -632,6 +632,33 @@ body::after {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* Value-position row whose name IS the cvar's current value gets
+   an accent tint on its name AND a left-edge accent bar regardless
+   of selection state. So when the user cycles Up/Down through the
+   value list, the "this is what's set right now" row stays
+   visually distinct from the others -- you can always see at a
+   glance which value is live, separate from which row is being
+   highlighted by the popup cursor. */
+.completion-row.is-current {
+  border-left: 2px solid var(--accent, #5af);
+  padding-left: 10px;            /* 12 - 2 to balance the border */
+}
+.completion-row.is-current .completion-name { color: var(--accent, #5af); }
+.completion-row.is-current .completion-value {
+  color: var(--accent, #5af);
+  font-weight: 600;
+}
+/* Default-value row gets a softer accent tint so users can also
+   spot "what would I get if I reset this cvar" without it
+   competing with the current-value marker. */
+.completion-row.is-default {
+  border-left: 2px solid var(--accent-dim, #455);
+  padding-left: 10px;
+}
+.completion-row.is-default .completion-value {
+  color: var(--accent-dim, #99a);
+  font-weight: 500;
+}
 .completion-desc {
   grid-column: 1 / -1;
   color: var(--fg-dim, #888);
