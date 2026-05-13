@@ -22,10 +22,16 @@
 // All comparisons are case-insensitive ASCII (cvar / command names
 // in this engine are ASCII identifiers + digits + `_`).
 //
-// `BuildCompletions` is the one entry point a UI frontend needs:
-// pass the input string + cursor position, get back a ranked vector
-// of matches ready for display. The underlying token classification
-// and per-candidate scoring helpers are exposed for unit-testability.
+// Call pattern is two-step: a frontend first calls
+//   TokenInfo t = CurrentToken(input, cursor);
+// to identify the word at the cursor + first-token context, then
+//   std::vector<CompletionMatch> matches = BuildCompletions(t);
+// to get the ranked candidate list ready for display. Splitting the
+// two lets the caller reuse the same TokenInfo for both the popup
+// build AND the eventual commit-time splice (start/end byte indices
+// for replacement). ScoreMatch is exposed separately so unit tests
+// can compare web-vs-native ordering on synthetic inputs without
+// going through the Console singleton.
 
 #pragma once
 
