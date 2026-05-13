@@ -2562,6 +2562,84 @@ void Engine::RenderFrame() {
         // column-major, matching simd_float4x4 on the consumer end.
         dd.world_to_view = glm::value_ptr(view);
         dd.view_to_clip  = glm::value_ptr(proj);
+
+        // Read bloom cvars up here so both the pre-Denoise (Vulkan)
+        // and post-Denoise (Metal) bloom chains share them.
+        bool  bloom_on        = false;
+        float bloom_thresh    = 1.0f;
+        float bloom_intensity = 0.05f;
+        int   bloom_mips_in   = kBloomMips;
+        if (auto* v = C.FindCVar("r_bloom"))           bloom_on        = v->GetBool();
+        if (auto* v = C.FindCVar("r_bloom_threshold")) bloom_thresh    = v->GetFloat();
+        if (auto* v = C.FindCVar("r_bloom_intensity")) bloom_intensity = v->GetFloat();
+        if (auto* v = C.FindCVar("r_bloom_mips"))      bloom_mips_in   = v->GetInt();
+        const int bloom_mips = std::clamp(bloom_mips_in, 1, kBloomMips);
+        float bloom_radius   = 1.0f;
+        if (auto* v = C.FindCVar("r_bloom_radius"))    bloom_radius    = v->GetFloat();
+
+        // Bloom-pyramid dispatch helper. Reads from `source_tex_id`
+        // (which differs per backend -- see call sites) and builds
+        // bloom_mip[0..bloom_mips-1] via downsample (Karis-suppressed
+        // on the first mip for path-tracer firefly resilience) then
+        // upsample-add.
+        auto dispatch_bloom_pyramid = [&](std::uint64_t source_tex_id) {
+            // Downsample: source_tex -> mip0 (with threshold), then
+            // mip0 -> mip1 -> ... -> mip[N-1].
+            for (int i = 0; i < bloom_mips; ++i) {
+                cb->BindComputePipeline(pt::rhi::PipelineHandle{bloom_down_pipeline_id_});
+                pt::rhi::TextureHandle src_h{
+                    (i == 0) ? source_tex_id : bloom_mip_tex_id_[i - 1]};
+                pt::rhi::TextureHandle dst_h{bloom_mip_tex_id_[i]};
+                cb->BindStorageTexture(0, src_h);
+                cb->BindStorageTexture(1, dst_h);
+                struct DownPush { float threshold; float pad[3]; } dp{};
+                dp.threshold = (i == 0) ? bloom_thresh : 0.0f;
+                cb->PushConstants(&dp, sizeof(dp));
+                cb->Dispatch((bloom_mip_w_[i] + 7) / 8,
+                             (bloom_mip_h_[i] + 7) / 8, 1);
+            }
+            // Upsample: mip[N-1] -> mip[N-2] (additive), ..., mip 1 -> mip 0.
+            for (int i = bloom_mips - 1; i > 0; --i) {
+                cb->BindComputePipeline(pt::rhi::PipelineHandle{bloom_up_pipeline_id_});
+                cb->BindStorageTexture(0, pt::rhi::TextureHandle{bloom_mip_tex_id_[i]});
+                cb->BindStorageTexture(1, pt::rhi::TextureHandle{bloom_mip_tex_id_[i - 1]});
+                struct UpPush { float radius; float pad[3]; } up_push{};
+                up_push.radius = bloom_radius;
+                cb->PushConstants(&up_push, sizeof(up_push));
+                cb->Dispatch((bloom_mip_w_[i - 1] + 7) / 8,
+                             (bloom_mip_h_[i - 1] + 7) / 8, 1);
+            }
+        };
+        const bool bloom_can_run =
+            (bloom_on && bloom_intensity > 0.0f &&
+             bloom_mip_tex_id_[0] != 0 &&
+             bloom_down_pipeline_id_ != 0 && bloom_up_pipeline_id_ != 0);
+
+        // Vulkan-only: build the bloom pyramid BEFORE the Denoise()
+        // call so DenoiseFinalize (which runs inside Denoise() and is
+        // the swapchain writer on Vulkan today) can composite
+        // bloom_mip[0] pre-tonemap. The source is denoise_color (the
+        // path tracer's per-frame noisy 1-spp HDR output) -- not
+        // post_denoise_hdr, which doesn't exist yet at this point.
+        // BloomDown's first-mip Karis averaging is designed precisely
+        // for noisy path-tracer input so the bloom layer reads clean
+        // after one downsample. Metal does NOT run bloom here -- it
+        // runs the existing post-Denoise() chain below that reads
+        // post_denoise_hdr instead.
+        const bool vulkan_pre_denoise_bloom =
+            (current_backend_ == pt::rhi::BackendType::Vulkan && bloom_can_run);
+        if (vulkan_pre_denoise_bloom) {
+            dispatch_bloom_pyramid(denoise_color_tex_id_);
+        }
+        // Tell the backend's Denoise() about the bloom layer. Vulkan
+        // reads dd.bloom_in inside DenoiseFinalize; Metal ignores it
+        // (its bloom composite happens in Tonemap.slang post-
+        // Denoise).
+        dd.bloom_in = vulkan_pre_denoise_bloom
+                          ? pt::rhi::TextureHandle{bloom_mip_tex_id_[0]}
+                          : pt::rhi::TextureHandle{0};
+        dd.bloom_intensity = vulkan_pre_denoise_bloom ? bloom_intensity : 0.0f;
+
         device_->Denoise(dd);
 
         // Vulkan-only: when the engine's Tonemap pipeline isn't
@@ -2578,54 +2656,13 @@ void Engine::RenderFrame() {
         // through the chain, then upsample additively back up to mip
         // 0. The result in mip 0 is sampled by the tonemap kernel
         // and added pre-ACES so the bloom gets the same curve squash
-        // as the rest of the image.
-        bool bloom_on = false;
-        if (auto* v = C.FindCVar("r_bloom")) bloom_on = v->GetBool();
-        float bloom_thresh = 1.0f, bloom_intensity = 0.05f;
-        int   bloom_mips   = kBloomMips;
-        if (auto* v = C.FindCVar("r_bloom_threshold")) bloom_thresh    = v->GetFloat();
-        if (auto* v = C.FindCVar("r_bloom_intensity")) bloom_intensity = v->GetFloat();
-        if (auto* v = C.FindCVar("r_bloom_mips"))      bloom_mips      = v->GetInt();
-        if (bloom_mips < 1) bloom_mips = 1;
-        if (bloom_mips > kBloomMips) bloom_mips = kBloomMips;
-
-        if (bloom_on && bloom_mip_tex_id_[0] != 0 && bloom_intensity > 0.0f) {
-            // Downsample chain: post_denoise_hdr -> mip0 (with
-            // threshold), mip0 -> mip1, ..., mip[N-2] -> mip[N-1].
-            for (int i = 0; i < bloom_mips; ++i) {
-                cb->BindComputePipeline(pt::rhi::PipelineHandle{bloom_down_pipeline_id_});
-                pt::rhi::TextureHandle src_h{
-                    (i == 0) ? post_denoise_hdr_tex_id_ : bloom_mip_tex_id_[i - 1]};
-                pt::rhi::TextureHandle dst_h{bloom_mip_tex_id_[i]};
-                cb->BindStorageTexture(0, src_h);
-                cb->BindStorageTexture(1, dst_h);
-                struct DownPush { float threshold; float pad[3]; } dp{};
-                // Threshold only applies on the first mip; later mips
-                // are downsampling already-extracted bright pixels.
-                dp.threshold = (i == 0) ? bloom_thresh : 0.0f;
-                cb->PushConstants(&dp, sizeof(dp));
-                cb->Dispatch((bloom_mip_w_[i] + 7) / 8,
-                             (bloom_mip_h_[i] + 7) / 8, 1);
-            }
-            // Upsample chain: mip[N-1] -> mip[N-2] (additive),
-            // mip[N-2] -> mip[N-3], ..., mip 1 -> mip 0. Result
-            // accumulates into mip 0 which is the layer the tonemap
-            // pass samples. r_bloom_radius widens the per-mip
-            // sample spread for a softer halo.
-            float bloom_radius = 1.0f;
-            if (auto* v = C.FindCVar("r_bloom_radius")) bloom_radius = v->GetFloat();
-            for (int i = bloom_mips - 1; i > 0; --i) {
-                cb->BindComputePipeline(pt::rhi::PipelineHandle{bloom_up_pipeline_id_});
-                cb->BindStorageTexture(0, pt::rhi::TextureHandle{bloom_mip_tex_id_[i]});
-                cb->BindStorageTexture(1, pt::rhi::TextureHandle{bloom_mip_tex_id_[i - 1]});
-                // Renamed from `up` to `up_push` to avoid shadowing
-                // the function-scope `up = cam.Up()` camera vector.
-                struct UpPush { float radius; float pad[3]; } up_push{};
-                up_push.radius = bloom_radius;
-                cb->PushConstants(&up_push, sizeof(up_push));
-                cb->Dispatch((bloom_mip_w_[i - 1] + 7) / 8,
-                             (bloom_mip_h_[i - 1] + 7) / 8, 1);
-            }
+        // as the rest of the image. Metal-only here: bloom reads
+        // post_denoise_hdr (the SVGF/MetalFX output). Vulkan has
+        // already built its bloom pyramid above from denoise_color
+        // before the Denoise() call -- see the
+        // `vulkan_pre_denoise_bloom` branch up there.
+        if (bloom_can_run) {
+            dispatch_bloom_pyramid(post_denoise_hdr_tex_id_);
         }
 
         // Post-denoise tonemap: linear HDR -> exposure -> ACES -> sRGB

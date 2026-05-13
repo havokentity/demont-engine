@@ -138,6 +138,21 @@ public:
         // exposure the path tracer's inline tonemap would have used.
         // MetalFX ignores it.
         BufferHandle  exposure_state;
+        // Vulkan SVGF/NRD only: bloom-pyramid mip 0 (half-res linear
+        // HDR). The DenoiseFinalize pass bilinear-samples this and
+        // adds it pre-tonemap so highlights get the same ACES squash.
+        // When bloom is disabled, the engine binds a 1x1 zero
+        // placeholder and sets bloom_intensity = 0 below so the
+        // composite collapses to a no-op. MetalFX ignores this --
+        // Metal's bloom is mixed in Tonemap.slang after the denoise
+        // call returns. May be 0 on Metal.
+        TextureHandle bloom_in;
+        // Vulkan SVGF/NRD only: linear blend factor of the bloom layer
+        // added on top of the HDR image before tonemap. Mirrors the
+        // r_bloom_intensity cvar. 0 = skip the bloom add entirely.
+        // MetalFX ignores it (Metal's Tonemap.slang has its own
+        // bloom_intensity in TonePush).
+        float         bloom_intensity = 0.0f;
         // Vulkan SVGF/NRD only: r_hdr_pipeline value (1 = path tracer
         // wrote raw linear HDR into color_in, denoiser finalize applies
         // ACES + sRGB; 0 = path tracer already tonemapped into color_in,

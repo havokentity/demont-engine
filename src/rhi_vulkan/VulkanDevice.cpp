@@ -40,6 +40,16 @@ extern const unsigned char shader_AutoExposure_spirv_data[];
 extern const unsigned long shader_AutoExposure_spirv_size;
 extern const unsigned char shader_PerfOverlay_spirv_data[];
 extern const unsigned long shader_PerfOverlay_spirv_size;
+// Bloom pyramid (BloomDown/Up). Compiled to SPIR-V and embedded
+// alongside the other compute shaders. Each declares only 2
+// storage-image bindings (src + dst) on Vulkan, which is compatible
+// with the shared 17-binding pipeline layout -- so we build them with
+// the same VkPipelineLayout the path tracer uses and drive them via
+// the engine's standard cb->BindComputePipeline + cb->Dispatch path.
+extern const unsigned char shader_BloomDown_spirv_data[];
+extern const unsigned long shader_BloomDown_spirv_size;
+extern const unsigned char shader_BloomUp_spirv_data[];
+extern const unsigned long shader_BloomUp_spirv_size;
 }
 
 namespace pt::rhi::vk {
@@ -986,6 +996,17 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         build_pipeline("pathtrace",   shader_PathTrace_spirv_data,    shader_PathTrace_spirv_size);
         build_pipeline("autoexpose",  shader_AutoExposure_spirv_data, shader_AutoExposure_spirv_size);
         build_pipeline("perfoverlay", shader_PerfOverlay_spirv_data,  shader_PerfOverlay_spirv_size);
+        // Bloom pyramid pipelines. These re-use the shared 17-binding
+        // pipeline layout (their only real bindings are 0 and 1, both
+        // storage images, which the shared layout supports). The MSL
+        // slot-padding dummies that BloomDown.slang / BloomUp.slang
+        // emit on Metal are PT_TARGET_METAL-gated so the SPIR-V we
+        // load here only declares the real bindings -- no clash with
+        // the shared layout. Engine.cpp's existing post-denoise bloom
+        // dispatch chain (BindComputePipeline + Dispatch) drives them
+        // identically to the Metal path.
+        build_pipeline("bloom_down",  shader_BloomDown_spirv_data,    shader_BloomDown_spirv_size);
+        build_pipeline("bloom_up",    shader_BloomUp_spirv_data,      shader_BloomUp_spirv_size);
         pipelines_ready_.store(true, std::memory_order_release);
 
         // Skip the per-pipeline timing-string construction below tier 2.
@@ -2510,9 +2531,12 @@ void VulkanDevice::EncodeDenoiseFinalize(VkCommandBuffer cb,
             return;
         }
     }
+    // OptiX denoise path doesn't run the bloom pyramid (different
+    // resource flow), so pass no bloom (placeholder + intensity=0).
     denoiser_->EncodeFinalizeOnly(cb, color_in_view, final_output_view,
-                                  exposure_state_buf, width, height,
-                                  hdr_pipeline);
+                                  exposure_state_buf,
+                                  VK_NULL_HANDLE, 0.0f,
+                                  width, height, hdr_pipeline);
 }
 #endif
 
@@ -2727,6 +2751,7 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
                       d.color_in, d.depth_in, d.motion_in,
                       d.normal_in, d.output,
                       d.final_output, d.exposure_state,
+                      d.bloom_in, d.bloom_intensity,
                       d.reset_history,
                       atrous_enabled,
                       d.hdr_pipeline);
