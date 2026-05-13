@@ -1744,8 +1744,12 @@ void Engine::RenderFrame() {
         (tonemap_pipeline_id_ != 0);
     // Either path needs denoise_color + the bloom mip chain. Only the
     // denoiser path needs the depth/motion/post_denoise_hdr/normal/
-    // albedo G-buffers.
-    const bool need_hdr_aux = denoiser_active_ || metal_bloom_without_denoiser;
+    // albedo G-buffers. NOT const -- the allocation-failure branch
+    // below clears denoiser_active_ / metal_bloom_without_denoiser and
+    // needs to drag this flag down with them so the downstream slot-2
+    // bind and push.write_hdr_aux setter don't try to use a freshly-
+    // failed (handle 0) denoise_color texture.
+    bool need_hdr_aux = denoiser_active_ || metal_bloom_without_denoiser;
     if (need_hdr_aux &&
         (denoise_color_tex_id_ == 0 || size_changed ||
          (denoiser_active_ &&
@@ -1833,9 +1837,13 @@ void Engine::RenderFrame() {
             LOG_ERROR("denoise_color allocation failed at {}x{}", fc.width, fc.height);
             // Both paths need denoise_color, so fall back to the
             // inline-tonemap-to-swapchain path (path tracer writes
-            // LDR straight to the swap, no bloom).
+            // LDR straight to the swap, no bloom). need_hdr_aux drops
+            // with the two source flags so the slot-2 bind and
+            // push.write_hdr_aux setter downstream don't drive a
+            // handle-0 / unbound texture through the shader.
             denoiser_active_ = false;
             metal_bloom_without_denoiser = false;
+            need_hdr_aux = false;
         } else if (denoiser_active_ &&
             (depth_tex_id_      == 0 || motion_tex_id_       == 0 ||
              post_denoise_hdr_tex_id_ == 0 ||
