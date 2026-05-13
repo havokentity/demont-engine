@@ -53,6 +53,16 @@ int ScoreMatch(std::string_view name, std::string_view query,
     if (query.empty()) return 1;     // anything matches an empty query
     if (name.empty())  return 0;
 
+    // round-to-nearest integer division: matches JS's
+    // Math.round((numerator) / denominator). Integer floor would
+    // produce different rankings for otherwise-close candidates
+    // (e.g. lengths 7 vs 8 in the denominator), which would diverge
+    // the C++ ordering from the web JS ordering.
+    auto rdiv = [](std::size_t num, std::size_t den) -> int {
+        if (den == 0) return 0;
+        return static_cast<int>((num + den / 2) / den);
+    };
+
     // PREFIX: name starts with query (case-insensitive).
     if (name.size() >= query.size()) {
         bool prefix = true;
@@ -63,8 +73,7 @@ int ScoreMatch(std::string_view name, std::string_view query,
             }
         }
         if (prefix) {
-            const int tightness = static_cast<int>(
-                (query.size() * 200) / name.size());
+            const int tightness = rdiv(query.size() * 200, name.size());
             if (out_spans) out_spans->emplace_back(0, query.size());
             return 1000 + tightness;
         }
@@ -86,8 +95,7 @@ int ScoreMatch(std::string_view name, std::string_view query,
         }
         if (found != std::string::npos) {
             const bool word_start = (found == 0) || name[found - 1] == '_';
-            const int  tightness  = static_cast<int>(
-                (query.size() * 100) / name.size());
+            const int  tightness  = rdiv(query.size() * 100, name.size());
             const int  word_bonus = word_start ? 100 : 0;
             // The `- idx` term gives a small preference to matches
             // closer to the front of the name, breaking ties between
@@ -130,7 +138,7 @@ int ScoreMatch(std::string_view name, std::string_view query,
         if (run_start != std::string::npos && out_spans) {
             out_spans->emplace_back(run_start, static_cast<std::size_t>(last_match) + 1);
         }
-        const int density = static_cast<int>((query.size() * 50) / name.size());
+        const int density = rdiv(query.size() * 50, name.size());
         return 100 + score + density;
     }
 }
@@ -172,8 +180,20 @@ std::vector<CompletionMatch> BuildCompletions(const TokenInfo& token,
             pool.push_back(std::move(m));
         });
     } else {
-        // Value position. Pull from the named cvar's allowed_values,
-        // or fall back to [current, default] for free-form cvars.
+        // Value position. Three sources, in priority order:
+        //   1. CVar with allowed_values  -- list those, tag the
+        //      current / default ones via `value`. Descriptions are
+        //      LEFT EMPTY here because the cvar's help text would be
+        //      identical on every row (same cvar) -- visual noise.
+        //      Web/console.js takes the same approach.
+        //   2. CVar without allowed_values -- offer [current, default]
+        //      as one-shot suggestions. Description kept because each
+        //      row has the same cvar help, but there are only 1-2
+        //      rows so the repetition is bounded.
+        //   3. Command with default_args -- show the default
+        //      invocation as a single suggestion. Restores the prior
+        //      ghost-era affordance for things like
+        //      `screenshot demonte_screen.ppm`.
         auto* cv = C.FindCVar(token.first_tok);
         if (cv != nullptr) {
             if (!cv->allowed_values.empty()) {
@@ -183,7 +203,7 @@ std::vector<CompletionMatch> BuildCompletions(const TokenInfo& token,
                     m.kind = CompletionKind::Value;
                     if (v == cv->value)            m.value = "current";
                     else if (v == cv->default_value) m.value = "default";
-                    m.description = cv->description;
+                    // description left empty -- same text per row is noise.
                     pool.push_back(std::move(m));
                 }
             } else {
@@ -201,6 +221,15 @@ std::vector<CompletionMatch> BuildCompletions(const TokenInfo& token,
                     dflt.description = cv->description;
                     pool.push_back(std::move(dflt));
                 }
+            }
+        } else if (auto* cmd = C.FindCommand(token.first_tok); cmd != nullptr) {
+            if (!cmd->default_args.empty()) {
+                CompletionMatch m;
+                m.name        = cmd->default_args;
+                m.kind        = CompletionKind::Value;
+                m.value       = "default";
+                m.description = cmd->description;
+                pool.push_back(std::move(m));
             }
         }
     }

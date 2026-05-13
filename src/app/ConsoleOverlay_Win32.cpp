@@ -996,12 +996,17 @@ LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
             if (w == VK_RETURN) {
                 CommitPopup(/*chain_next=*/false);
-                // Fall through; WM_CHAR '\r' fires next and submits
-                // the now-completed line. Matches the prior ghost-
-                // era behaviour for typed Enter -- the user's mental
-                // model on a console is "Enter = run", so committing
-                // the highlighted match and then submitting it is
-                // the least-surprise path.
+                // Returning 0 here doesn't stop WM_CHAR from also
+                // firing for the SAME Enter keystroke (TranslateMessage
+                // in the message loop has already queued a WM_CHAR
+                // '\r' by this point -- WM_KEYDOWN's return code only
+                // gates DefWindowProc, not the WM_CHAR translation).
+                // So after this return, WM_CHAR '\r' arrives and runs
+                // SubmitInput() on the just-completed line. Matches
+                // the prior ghost-era behaviour for typed Enter -- the
+                // user's mental model on a console is "Enter = run",
+                // so committing the highlighted match and then
+                // submitting it is the least-surprise path.
                 return 0;
             }
             // Any other key: tear the popup down and let the keystroke
@@ -1477,6 +1482,19 @@ void WinOverlay::Paint(HDC dc) {
                 SelectObject(mdc, old_b);
                 DeleteObject(outline);
 
+                // Clip all subsequent TextOutW calls to the popup's
+                // interior. The previous char-budget truncation in
+                // the description draw was a guess at how many chars
+                // would fit; with a real clip region we can paint the
+                // full string and let GDI clip the overflow pixels
+                // (still ugly visually, but won't bleed into the
+                // scrollback below the popup). SaveDC / RestoreDC
+                // bracket the clip so it doesn't affect drawing past
+                // the popup.
+                const int saved_dc = SaveDC(mdc);
+                IntersectClipRect(mdc, pr.left + 1, pr.top + 1,
+                                       pr.right - 1, pr.bottom - 1);
+
                 const int scroll = popup_.scroll_offset;
                 int row_y = popup_y + 4;
                 for (int vi = 0; vi < visible_n; ++vi) {
@@ -1541,15 +1559,12 @@ void WinOverlay::Paint(HDC dc) {
                         }
                     }
                     if (!it.description.empty()) {
-                        // Clip description text to whatever horizontal
-                        // budget remains on this row -- we don't have
-                        // a clip region set up, so draw what fits and
-                        // accept that TextOutW will silently overflow
-                        // past popup_w on a long string (Rectangle
-                        // outline above doesn't clip the text). Cheap
-                        // visual hack: if description is wider than
-                        // the remaining budget, truncate by char count
-                        // proportionally.
+                        // Clip region (IntersectClipRect above) keeps
+                        // the text from bleeding past the popup right
+                        // edge into the scrollback. We still cap with
+                        // a char-budget truncate so the visible part
+                        // ends in an ellipsis instead of a sharp pixel
+                        // cut -- nicer reading.
                         const int budget = (popup_x + popup_w - 8) - tx;
                         if (budget > 24) {
                             std::string desc = it.description;
@@ -1574,6 +1589,11 @@ void WinOverlay::Paint(HDC dc) {
                     }
                     row_y += line_height_;
                 }
+
+                // Drop the popup clip so subsequent draws (none today
+                // but defence-in-depth for any future Paint() append)
+                // aren't constrained.
+                RestoreDC(mdc, saved_dc);
             }
         }
     }

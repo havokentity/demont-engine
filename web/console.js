@@ -867,6 +867,15 @@
         out.push({ name: String(dflt), kind: 'value', value: 'default',
                    description: cv.description || '' });
       }
+    } else if (commandMeta[token.firstTok] &&
+               commandMeta[token.firstTok].default_args) {
+      // Command with a registered default invocation -- offer it as
+      // a single suggestion (e.g. `screenshot demonte_screen.ppm`).
+      // Restores the prior ghost-era affordance and matches the C++
+      // BuildCompletions behaviour.
+      const cmd = commandMeta[token.firstTok];
+      out.push({ name: cmd.default_args, kind: 'value', value: 'default',
+                 description: cmd.description || '' });
     }
     return out;
   }
