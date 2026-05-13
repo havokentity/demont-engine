@@ -1017,16 +1017,21 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         build_pipeline("bloom_down",  shader_BloomDown_spirv_data,    shader_BloomDown_spirv_size);
         build_pipeline("bloom_up",    shader_BloomUp_spirv_data,      shader_BloomUp_spirv_size);
         // Tonemap pipeline. Engine.cpp's post-denoise tonemap chain
-        // dispatches this when tonemap_pipeline_id_ != 0; before this
-        // change that id was always zero on Vulkan and the chain
-        // skipped (DenoiseFinalize.slang ran in its place but had no
-        // bloom or lens-flare compositing). With the pipeline built
-        // here, the engine routes the full bloom + flare + tonemap
-        // chain on Vulkan symmetrically with Metal, and dd.final_output
-        // gets set to 0 so DenoiseFinalize doesn't double-write the
-        // swapchain. See Tonemap.slang's `#ifdef PT_TARGET_SPIRV`
-        // branch for the push/UBO split that makes the 624-byte
-        // TonePush fit Vulkan's 256B push-constant limit.
+        // dispatches this when tonemap_pipeline_id_ != 0 AND
+        // use_engine_tonemap is true; the latter is currently gated to
+        // Metal only (see b2f4bfd's commit msg + Engine.cpp's
+        // backend_is_metal check) because the Vulkan engine-tonemap
+        // path black-screens on PC and stale-frames on OptiX. So on
+        // Vulkan today this pipeline IS built but is NOT routed --
+        // DenoiseFinalize.slang remains the swapchain writer for
+        // SVGF/NRD, and r_bloom on Vulkan is a no-op pending the
+        // descriptor/layout root-cause work (see Engine.cpp's
+        // `vulkan_pre_denoise_bloom = false` workaround). Building the
+        // pipeline anyway keeps re-enable as a single-boolean flip
+        // once the underlying bug is fixed. See Tonemap.slang's
+        // `#ifdef PT_TARGET_SPIRV` branch for the push/UBO split that
+        // makes the 624-byte TonePush fit Vulkan's 256B push-constant
+        // limit.
         build_pipeline("tonemap",     shader_Tonemap_spirv_data,      shader_Tonemap_spirv_size);
         pipelines_ready_.store(true, std::memory_order_release);
 

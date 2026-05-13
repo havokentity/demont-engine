@@ -60,17 +60,24 @@
 //     Push (cbuffer) to MSL buf(7) ----------------------------------
 //
 // Gated to Metal only: on Vulkan these dummy bindings would collide
-// with the shared 17-binding pipeline layout (e.g. binding 4 is
-// mesh_indices = StructuredBuffer<uint> in the path tracer's layout,
-// but we'd declare it as an AS here -- VK validation error). MSL slot
-// alignment is the only reason these exist; SPIR-V doesn't need them.
+// with the shared 17-binding pipeline layout. MSL slot alignment is
+// the only reason these exist; SPIR-V doesn't need them.
+//
+// vk::binding numbers picked from the 18..23 range -- intentionally
+// out-of-band vs the shared layout (bindings 0..17) so even if Slang
+// ever starts cross-checking vk::binding on the MSL path, none of
+// these collide with a real Vulkan binding. The attribute itself is
+// ignored by Slang's MSL backend (Metal slot assignment is by
+// declaration order: _slot_tlas -> buf(0), _slot_mesh_positions ->
+// buf(1), ..., _slot_conditional_cdf -> buf(5), exposure_state below
+// -> buf(6), Push -> buf(7)).
 #ifdef PT_TARGET_METAL
-[[vk::binding(4, 0)]]  RaytracingAccelerationStructure _slot_tlas;        // buf(0)
-[[vk::binding(5, 0)]]  StructuredBuffer<float>  _slot_mesh_positions;     // buf(1)
-[[vk::binding(6, 0)]]  StructuredBuffer<uint>   _slot_mesh_indices;       // buf(2)
-[[vk::binding(7, 0)]]  StructuredBuffer<float4> _slot_primitives;         // buf(3)
-[[vk::binding(8, 0)]]  StructuredBuffer<float>  _slot_marginal_cdf;       // buf(4)
-[[vk::binding(9, 0)]]  StructuredBuffer<float>  _slot_conditional_cdf;    // buf(5)
+[[vk::binding(18, 0)]] RaytracingAccelerationStructure _slot_tlas;        // buf(0)
+[[vk::binding(19, 0)]] StructuredBuffer<float>  _slot_mesh_positions;     // buf(1)
+[[vk::binding(20, 0)]] StructuredBuffer<uint>   _slot_mesh_indices;       // buf(2)
+[[vk::binding(21, 0)]] StructuredBuffer<float4> _slot_primitives;         // buf(3)
+[[vk::binding(22, 0)]] StructuredBuffer<float>  _slot_marginal_cdf;       // buf(4)
+[[vk::binding(23, 0)]] StructuredBuffer<float>  _slot_conditional_cdf;    // buf(5)
 #endif
 
 // GPU-resident exposure scalar. Same buffer PathTrace.slang reads in

@@ -19,12 +19,16 @@
 //
 // What this does NOT do (intentional): the post-denoise tonemap. On
 // Metal the engine's existing Tonemap.slang pipeline is built and
-// reads post_denoise_hdr -> writes swapchain, so MetalSvgfDenoiser
-// just leaves its linear-HDR result in `output` (= post_denoise_hdr)
-// and the standard bloom + tonemap chain takes it from there. This is
-// the only structural difference vs the Vulkan SVGF path, which has
-// to run DenoiseFinalize because Vulkan's Tonemap pipeline isn't
-// built today.
+// dispatched, reading post_denoise_hdr -> writing swapchain, so
+// MetalSvgfDenoiser just leaves its linear-HDR result in `output`
+// (= post_denoise_hdr) and the standard bloom + tonemap chain takes
+// it from there. This is the only structural difference vs the
+// Vulkan SVGF path -- which runs DenoiseFinalize.slang to do the
+// swapchain write itself, because Engine.cpp gates
+// `use_engine_tonemap` to Metal only (see b2f4bfd). The Vulkan
+// Tonemap.slang pipeline IS built (so re-enabling is a single-flag
+// flip) but is currently un-routed pending root-cause of the
+// descriptor / layout corruption that black-screened the chain on PC.
 //
 // Lifetime: MetalDevice owns one of these and lazily allocates the
 // scratch textures + pipelines on first Encode(). Pipelines stay for
