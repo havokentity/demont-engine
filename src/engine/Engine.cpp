@@ -1725,88 +1725,138 @@ void Engine::RenderFrame() {
     const bool want_albedo_gbuffer =
         (denoiser_kind_ == DenoiserKind::OptixHdrAov ||
          denoiser_kind_ == DenoiserKind::OptixTemporalHdrAov);
-    if (denoiser_active_ &&
-        (denoise_color_tex_id_ == 0 || depth_tex_id_ == 0 || motion_tex_id_ == 0 ||
-         post_denoise_hdr_tex_id_ == 0 || size_changed ||
-         (want_normal_gbuffer && normal_tex_id_ == 0) ||
-         (want_albedo_gbuffer && albedo_tex_id_ == 0))) {
+    // Bloom-without-denoiser path: when the user has r_bloom on but
+    // no denoiser, the engine still needs `denoise_color` (as the
+    // path tracer's linear-HDR output the bloom pyramid samples) and
+    // the bloom mip chain so the engine-side Tonemap.slang pass can
+    // composite a bloom layer. depth/motion/post_denoise_hdr/normal/
+    // albedo stay unallocated -- those are denoiser-only. Gated to
+    // Metal: the engine Tonemap chain only runs cleanly on Metal
+    // today (see the long comment above the `if (denoiser_active_)`
+    // post-process block for why Vulkan stays on its DenoiseFinalize
+    // path). When this is off, the path tracer's inline tonemap to
+    // the swapchain is the whole post-process -- no bloom is added.
+    bool r_bloom_on_local = false;
+    if (auto* v = C.FindCVar("r_bloom")) r_bloom_on_local = v->GetBool();
+    bool metal_bloom_without_denoiser =
+        (!denoiser_active_) && r_bloom_on_local &&
+        (current_backend_ == pt::rhi::BackendType::Metal) &&
+        (tonemap_pipeline_id_ != 0);
+    // Either path needs denoise_color + the bloom mip chain. Only the
+    // denoiser path needs the depth/motion/post_denoise_hdr/normal/
+    // albedo G-buffers. NOT const -- the allocation-failure branch
+    // below clears denoiser_active_ / metal_bloom_without_denoiser and
+    // needs to drag this flag down with them so the downstream slot-2
+    // bind and push.write_hdr_aux setter don't try to use a freshly-
+    // failed (handle 0) denoise_color texture.
+    bool need_hdr_aux = denoiser_active_ || metal_bloom_without_denoiser;
+    if (need_hdr_aux &&
+        (denoise_color_tex_id_ == 0 || size_changed ||
+         (denoiser_active_ &&
+            (depth_tex_id_ == 0 || motion_tex_id_ == 0 ||
+             post_denoise_hdr_tex_id_ == 0 ||
+             (want_normal_gbuffer && normal_tex_id_ == 0) ||
+             (want_albedo_gbuffer && albedo_tex_id_ == 0))))) {
         if (denoise_color_tex_id_     != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
-        if (depth_tex_id_             != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
-        if (motion_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
-        if (normal_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{normal_tex_id_});
-        if (albedo_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{albedo_tex_id_});
-        if (post_denoise_hdr_tex_id_  != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
+        // depth/motion/normal/albedo/post_denoise_hdr only exist on the
+        // denoiser path. Destroy them only when the denoiser path is
+        // active -- otherwise we'd UAF them if a prior denoiser session
+        // left them allocated and we're now in the bloom-only branch
+        // (they stay around as harmless leftovers until denoiser turns
+        // back on, which re-fires this block and reallocates them).
+        if (denoiser_active_) {
+            if (depth_tex_id_             != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
+            if (motion_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
+            if (normal_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{normal_tex_id_});
+            if (albedo_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{albedo_tex_id_});
+            if (post_denoise_hdr_tex_id_  != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
+        }
         auto color_h = device_->CreateTexture({
             .width = fc.width, .height = fc.height,
             .format = pt::rhi::TextureFormat::RGBA16F,
             .usage  = pt::rhi::TextureUsage::Storage,
             .debug_name = "denoise_color",
         });
-        auto depth_h = device_->CreateTexture({
-            .width = fc.width, .height = fc.height,
-            .format = pt::rhi::TextureFormat::R32F,
-            .usage  = pt::rhi::TextureUsage::Storage,
-            .debug_name = "denoise_depth",
-        });
-        auto motion_h = device_->CreateTexture({
-            .width = fc.width, .height = fc.height,
-            .format = pt::rhi::TextureFormat::RG16F,
-            .usage  = pt::rhi::TextureUsage::Storage,
-            .debug_name = "denoise_motion",
-        });
-        auto post_h = device_->CreateTexture({
-            .width = fc.width, .height = fc.height,
-            .format = pt::rhi::TextureFormat::RGBA16F,
-            .usage  = pt::rhi::TextureUsage::Storage,
-            .debug_name = "post_denoise_hdr",
-        });
         denoise_color_tex_id_    = color_h.id;
-        depth_tex_id_            = depth_h.id;
-        motion_tex_id_           = motion_h.id;
-        post_denoise_hdr_tex_id_ = post_h.id;
-        // Normal G-buffer: SVGF/NRD use it for edge-aware spatial
-        // filtering; the OptiX AOV denoiser uses it as a guide layer.
-        // MetalFX ignores normals and the path tracer's normal write is
-        // gated by PT_TARGET_SPIRV (so on Metal there's no shader
-        // binding expecting it either).
-        if (want_normal_gbuffer) {
-            auto normal_h = device_->CreateTexture({
+        if (denoiser_active_) {
+            auto depth_h = device_->CreateTexture({
+                .width = fc.width, .height = fc.height,
+                .format = pt::rhi::TextureFormat::R32F,
+                .usage  = pt::rhi::TextureUsage::Storage,
+                .debug_name = "denoise_depth",
+            });
+            auto motion_h = device_->CreateTexture({
+                .width = fc.width, .height = fc.height,
+                .format = pt::rhi::TextureFormat::RG16F,
+                .usage  = pt::rhi::TextureUsage::Storage,
+                .debug_name = "denoise_motion",
+            });
+            auto post_h = device_->CreateTexture({
                 .width = fc.width, .height = fc.height,
                 .format = pt::rhi::TextureFormat::RGBA16F,
                 .usage  = pt::rhi::TextureUsage::Storage,
-                .debug_name = "denoise_normal",
+                .debug_name = "post_denoise_hdr",
             });
-            normal_tex_id_ = normal_h.id;
-        } else {
-            normal_tex_id_ = 0;
-        }
-        // Albedo G-buffer: OptiX AOV only. RGBA16F to keep headroom
-        // for HDR-encoded materials (emissive base colors, etc.) and to
-        // match the format convention of the other G-buffers.
-        if (want_albedo_gbuffer) {
-            auto albedo_h = device_->CreateTexture({
-                .width = fc.width, .height = fc.height,
-                .format = pt::rhi::TextureFormat::RGBA16F,
-                .usage  = pt::rhi::TextureUsage::Storage,
-                .debug_name = "denoise_albedo",
-            });
-            albedo_tex_id_ = albedo_h.id;
-            LOG_INFO("engine: allocated denoise_albedo G-buffer ({}x{} RGBA16F) for OptiX AOV", fc.width, fc.height);
-        } else {
-            albedo_tex_id_ = 0;
+            depth_tex_id_            = depth_h.id;
+            motion_tex_id_           = motion_h.id;
+            post_denoise_hdr_tex_id_ = post_h.id;
+            // Normal G-buffer: SVGF/NRD use it for edge-aware spatial
+            // filtering; the OptiX AOV denoiser uses it as a guide layer.
+            // MetalFX ignores normals and the path tracer's normal write is
+            // gated by PT_TARGET_SPIRV (so on Metal there's no shader
+            // binding expecting it either).
+            if (want_normal_gbuffer) {
+                auto normal_h = device_->CreateTexture({
+                    .width = fc.width, .height = fc.height,
+                    .format = pt::rhi::TextureFormat::RGBA16F,
+                    .usage  = pt::rhi::TextureUsage::Storage,
+                    .debug_name = "denoise_normal",
+                });
+                normal_tex_id_ = normal_h.id;
+            } else {
+                normal_tex_id_ = 0;
+            }
+            // Albedo G-buffer: OptiX AOV only. RGBA16F to keep headroom
+            // for HDR-encoded materials (emissive base colors, etc.) and to
+            // match the format convention of the other G-buffers.
+            if (want_albedo_gbuffer) {
+                auto albedo_h = device_->CreateTexture({
+                    .width = fc.width, .height = fc.height,
+                    .format = pt::rhi::TextureFormat::RGBA16F,
+                    .usage  = pt::rhi::TextureUsage::Storage,
+                    .debug_name = "denoise_albedo",
+                });
+                albedo_tex_id_ = albedo_h.id;
+                LOG_INFO("engine: allocated denoise_albedo G-buffer ({}x{} RGBA16F) for OptiX AOV", fc.width, fc.height);
+            } else {
+                albedo_tex_id_ = 0;
+            }
         }
         prev_view_proj_valid_ = false;        // history is invalid after resize
-        if (denoise_color_tex_id_ == 0 || depth_tex_id_ == 0 ||
-            motion_tex_id_        == 0 || post_denoise_hdr_tex_id_ == 0 ||
-            (want_normal_gbuffer && normal_tex_id_ == 0) ||
-            (want_albedo_gbuffer && albedo_tex_id_ == 0)) {
+        if (denoise_color_tex_id_ == 0) {
+            LOG_ERROR("denoise_color allocation failed at {}x{}", fc.width, fc.height);
+            // Both paths need denoise_color, so fall back to the
+            // inline-tonemap-to-swapchain path (path tracer writes
+            // LDR straight to the swap, no bloom). need_hdr_aux drops
+            // with the two source flags so the slot-2 bind and
+            // push.write_hdr_aux setter downstream don't drive a
+            // handle-0 / unbound texture through the shader.
+            denoiser_active_ = false;
+            metal_bloom_without_denoiser = false;
+            need_hdr_aux = false;
+        } else if (denoiser_active_ &&
+            (depth_tex_id_      == 0 || motion_tex_id_       == 0 ||
+             post_denoise_hdr_tex_id_ == 0 ||
+             (want_normal_gbuffer && normal_tex_id_ == 0) ||
+             (want_albedo_gbuffer && albedo_tex_id_ == 0))) {
             LOG_ERROR("denoiser G-buffer allocation failed at {}x{}", fc.width, fc.height);
             denoiser_active_ = false;
         }
         // Bloom mip chain. mip[0] is half-res; each subsequent mip
-        // halves again. Caps at 1x1 if the swapchain is tiny. Always
-        // allocated alongside the denoiser textures since bloom is
-        // bound through the tonemap pass.
+        // halves again. Caps at 1x1 if the swapchain is tiny. Allocated
+        // alongside denoise_color whenever EITHER the denoiser path or
+        // the Metal bloom-without-denoiser path is active -- both feed
+        // the same engine-side Tonemap.slang composite that reads mip[0].
         for (int i = 0; i < kBloomMips; ++i) {
             if (bloom_mip_tex_id_[i] != 0) {
                 device_->DestroyTexture(pt::rhi::TextureHandle{bloom_mip_tex_id_[i]});
@@ -1888,8 +1938,18 @@ void Engine::RenderFrame() {
     // declaration order, so output/accum/denoise_color/depth/motion/env
     // become texture(0..5). The Metal RHI treats the slot arg as the MSL
     // texture index, so we bind them at 2/3/4/5 here.
-    if (denoiser_active_) {
+    //
+    // Slot 2 (denoise_color) is bound for the bloom-without-denoiser
+    // Metal path too -- the path tracer writes linear HDR into it
+    // (gated on push.write_hdr_aux) and the engine Tonemap.slang pass
+    // samples it as the bloom-pyramid + composite source. Slots 3/4
+    // (depth/motion) stay denoiser-only: the shader's G-buffer block
+    // is still gated on denoiser_enabled, and we don't allocate those
+    // textures in the bloom-only path.
+    if (need_hdr_aux) {
         cb->BindStorageTexture(2, pt::rhi::TextureHandle{denoise_color_tex_id_});
+    }
+    if (denoiser_active_) {
         cb->BindStorageTexture(3, pt::rhi::TextureHandle{depth_tex_id_});
         cb->BindStorageTexture(4, pt::rhi::TextureHandle{motion_tex_id_});
     }
@@ -2023,7 +2083,16 @@ void Engine::RenderFrame() {
         // per pixel per frame on non-normal-consuming denoiser modes
         // AND closing the unbound-write hole on Metal.
         std::uint32_t write_normal_gbuffer;
-        std::uint32_t _hdri_pad[2];   // 16-byte align next field / Slang struct end
+        // 1 -> kernel writes per-pixel linear-HDR radiance to
+        // denoise_color. Set when EITHER a denoiser is active OR bloom
+        // is requested on a backend that runs the engine-side Tonemap
+        // chain (Metal, currently). The shader's depth/motion/normal/
+        // albedo G-buffer block stays gated on denoiser_enabled (those
+        // textures are denoiser-only), so this flag is the narrower
+        // "produce an HDR aux for post-process" signal. Lives in the
+        // 4-byte slot that used to be _hdri_pad[0]; layout-equivalent.
+        std::uint32_t write_hdr_aux;
+        std::uint32_t _hdri_pad[1];   // 16-byte align next field / Slang struct end
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -2044,6 +2113,13 @@ void Engine::RenderFrame() {
     push.prim_count    = static_cast<std::uint32_t>(primitives_.size());
     push.spp           = spp;
     push.denoiser_enabled = denoiser_active_ ? 1u : 0u;
+    // Tell the kernel to also produce its linear-HDR aux write to
+    // denoise_color whenever we need a bloom source -- i.e. either
+    // a real denoiser is active (its input) or the bloom-only Metal
+    // path is on (Tonemap.slang's sampling source). Separate from
+    // denoiser_enabled because the depth/motion G-buffer block is
+    // denoiser-only; this flag is the narrower "write HDR aux" signal.
+    push.write_hdr_aux = need_hdr_aux ? 1u : 0u;
     // Only the SVGF chain (svgf_basic / svgf_atrous / nrd) and the
     // OptiX AOV variants consume normal_tex. Other denoisers (metalfx,
     // plain optix_hdr, optix_temporal_hdr) don't, and the engine
@@ -2487,7 +2563,14 @@ void Engine::RenderFrame() {
     // the path tracer dispatch and Submit. MetalFX reads the G-buffer
     // textures the shader just wrote and outputs to the swapchain
     // (overwriting the shader's tonemapped fallback).
-    if (denoiser_active_) {
+    //
+    // The outer gate also catches the bloom-without-denoiser Metal
+    // path: in that case the inner `if (denoiser_active_)` around the
+    // DenoiseDesc setup + Denoise() call below is skipped, but the
+    // engine bloom + Tonemap.slang chain that follows still runs --
+    // its HDR source becomes the path tracer's direct denoise_color
+    // write rather than the denoiser's post_denoise_hdr output.
+    if (denoiser_active_ || metal_bloom_without_denoiser) {
         // The engine-side Tonemap.slang post-denoise chain (bloom
         // composite + ACES + lens flare + sRGB encode -> swapchain)
         // currently only runs cleanly on Metal. Reasons:
@@ -2703,7 +2786,14 @@ void Engine::RenderFrame() {
                                  : pt::rhi::TextureHandle{0};
         dd.bloom_intensity = vulkan_pre_denoise_bloom ? bloom_intensity : 0.0f;
 
-        device_->Denoise(dd);
+        // Skip the denoiser dispatch in the bloom-only Metal path -- no
+        // denoiser is active, so `dd` above was just unused setup work.
+        // The engine tonemap block below still runs and reads its HDR
+        // source from denoise_color (the path tracer's direct write)
+        // instead of post_denoise_hdr (the denoiser's output).
+        if (denoiser_active_) {
+            device_->Denoise(dd);
+        }
 
         // Run the engine's bloom + tonemap chain only when we've told
         // the denoiser path to defer the swapchain write to us (see
@@ -2720,19 +2810,23 @@ void Engine::RenderFrame() {
         // 0. The result in mip 0 is sampled by the tonemap kernel
         // and added pre-ACES so the bloom gets the same curve squash
         // as the rest of the image. Metal-only here: bloom reads
-        // post_denoise_hdr (the SVGF/MetalFX output). Vulkan has
-        // already built its bloom pyramid above from denoise_color
-        // before the Denoise() call -- see the
-        // `vulkan_pre_denoise_bloom` branch up there.
+        // post_denoise_hdr (the SVGF/MetalFX output) when a denoiser
+        // is active, or the path tracer's denoise_color (the direct
+        // linear-HDR write) when it isn't. Vulkan has already built
+        // its bloom pyramid above from denoise_color before the
+        // Denoise() call -- see the `vulkan_pre_denoise_bloom` branch
+        // up there.
+        const std::uint64_t tonemap_hdr_source_id =
+            denoiser_active_ ? post_denoise_hdr_tex_id_ : denoise_color_tex_id_;
         if (bloom_can_run) {
-            dispatch_bloom_pyramid(post_denoise_hdr_tex_id_);
+            dispatch_bloom_pyramid(tonemap_hdr_source_id);
         }
 
         // Post-denoise tonemap: linear HDR -> exposure -> ACES -> sRGB
         // swapchain (gamma encode is implicit on store of the BGRA8_sRGB
         // surface).
         cb->BindComputePipeline(pt::rhi::PipelineHandle{tonemap_pipeline_id_});
-        cb->BindStorageTexture(0, pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
+        cb->BindStorageTexture(0, pt::rhi::TextureHandle{tonemap_hdr_source_id});
         cb->BindStorageTexture(1, fc.swapchain_image);
         // exposure_state is already bound at engine slot 6 from the
         // path-trace dispatch earlier this frame. Tonemap.slang has

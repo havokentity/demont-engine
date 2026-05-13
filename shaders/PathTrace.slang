@@ -243,8 +243,16 @@ cbuffer Push {
     // need it (metalfx, plain optix_hdr / optix_temporal_hdr) the
     // texture isn't bound, so the kernel MUST skip the write.
     uint   write_normal_gbuffer;
+    // 1 -> kernel writes its per-pixel linear-HDR (or pre-tonemapped LDR
+    // when w2j_row0.w = 0) radiance to `denoise_color`. Set by the engine
+    // when EITHER a denoiser is active OR `r_bloom` is on without a
+    // denoiser on a backend that runs the engine-side Tonemap.slang
+    // chain. Distinct from `denoiser_enabled`, which still gates the
+    // depth/motion/normal/albedo G-buffer writes + Halton jitter (only
+    // meaningful when a real denoiser consumes them). Reuses what used
+    // to be `_hdri_pad1` -- same wire offset, same Slang struct end.
+    uint   write_hdr_aux;
     uint   _hdri_pad1;
-    uint   _hdri_pad2;
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -276,8 +284,9 @@ cbuffer Frame {
     // See the matching field in the Metal Push cbuffer above for
     // semantics. 1 -> write normal_tex, 0 -> skip.
     uint   write_normal_gbuffer;
+    // See `write_hdr_aux` in the Metal Push cbuffer above.
+    uint   write_hdr_aux;
     uint   _hdri_pad1;
-    uint   _hdri_pad2;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -1889,13 +1898,28 @@ void main(uint2 tid : SV_DispatchThreadID) {
     // the queue once per N frames.
     float exposure = exposure_state[0];
 
-    if (denoiser_enabled != 0u) {
+    if (write_hdr_aux != 0u) {
         // denoise_color is an RGBA16F linear-HDR intermediate read by
         // the post-pass Tonemap kernel later -- stays linear, no OETF.
+        // Gated on write_hdr_aux (not denoiser_enabled) so the engine
+        // can request this write for the bloom-without-denoiser path
+        // too, without also forcing the depth/motion G-buffer block
+        // above (which is denoiser-only).
+        //
+        // Source-radiance choice depends on whether a denoiser is
+        // chaining after us:
+        //   - denoiser on  -> frame_radiance (the 1-spp noisy estimate);
+        //     the denoiser does its own temporal accumulation, so pre-
+        //     accumulating here would double-accumulate / lag history.
+        //   - denoiser off -> avg (the accumulated linear HDR `accum`
+        //     average); matches the value the inline swapchain write
+        //     below uses, so the engine Tonemap chain reads the same
+        //     accumulated image and just adds bloom on top.
+        float3 hdr_src = (denoiser_enabled != 0u) ? frame_radiance : avg;
         if (w2j_row0.w > 0.5) {
-            denoise_color[tid] = float4(frame_radiance, 1.0);
+            denoise_color[tid] = float4(hdr_src, 1.0);
         } else {
-            float3 mapped = acesTonemap(frame_radiance * exposure);
+            float3 mapped = acesTonemap(hdr_src * exposure);
             denoise_color[tid] = float4(mapped, 1.0);
         }
     }
