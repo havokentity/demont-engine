@@ -875,18 +875,38 @@
     const pool  = getCandidates(token);
     if (pool.length === 0) { hideCompletions(); return; }
 
-    // Empty query (cursor just landed somewhere) is fine on Tab/force
-    // but produces too much noise during normal typing. On forceShow
-    // we list everything; otherwise we require at least one char.
-    if (!forceShow && token.text.length === 0) {
+    // Empty-query gating:
+    //   - Token 0 with empty text: don't auto-open. The popup would
+    //     list every cvar + command in the engine every time the
+    //     input becomes empty (e.g. fresh page load, post-Submit
+    //     clear) -- that's noise. Token 0 needs at least one typed
+    //     char to open.
+    //   - Value position (token.isToken0 === false) with empty text:
+    //     DO auto-open. This is the "user just typed `<cvar> ` and
+    //     wants to see the value list including the current value"
+    //     path.
+    //   - forceShow=true (Tab from a hidden popup) always opens
+    //     regardless of token text.
+    if (!forceShow && token.text.length === 0 && token.isToken0) {
       hideCompletions();
       return;
     }
 
+    // Score every candidate. Value-position rows tagged "current" /
+    // "default" get a small score bonus so they sort to the top when
+    // the popup opens at `<cvar> ` (empty query, value position) --
+    // the user expressly asked for "show the current value". Bonuses
+    // are small enough that any real prefix / substring / fuzzy match
+    // on a typed query still beats them (prefix scores 1000+,
+    // substring 500+, fuzzy 100+; +5 / +2 are noise at those scales).
     const scored = [];
     for (const c of pool) {
       const { score, spans } = scoreMatch(c.name, token.text);
-      if (score > 0) scored.push({ ...c, score, spans });
+      if (score <= 0) continue;
+      let s = score;
+      if      (c.value === 'current') s += 5;
+      else if (c.value === 'default') s += 2;
+      scored.push({ ...c, score: s, spans });
     }
     if (scored.length === 0) { hideCompletions(); return; }
     scored.sort((a, b) => {

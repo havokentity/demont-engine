@@ -183,6 +183,7 @@ std::vector<CompletionMatch> BuildCompletions(const TokenInfo& token,
                     m.kind = CompletionKind::Value;
                     if (v == cv->value)            m.value = "current";
                     else if (v == cv->default_value) m.value = "default";
+                    m.description = cv->description;
                     pool.push_back(std::move(m));
                 }
             } else {
@@ -206,13 +207,22 @@ std::vector<CompletionMatch> BuildCompletions(const TokenInfo& token,
 
     if (pool.empty()) return {};
 
-    // Score every candidate; keep score-bearing ones.
+    // Score every candidate; keep score-bearing ones. Value-position
+    // rows tagged "current" / "default" get a small score bonus so
+    // they sort to the top of the popup when the user opens it at
+    // `<cvar> ` (empty query, value position) -- this is the "show
+    // the current value first" affordance. Bonuses are small enough
+    // that any real prefix / substring / fuzzy match on a typed query
+    // still beats them (prefix gives 1000+, substring 500+, fuzzy
+    // 100+; +5 / +2 are noise at those magnitudes).
     std::vector<CompletionMatch> ranked;
     ranked.reserve(pool.size());
     for (auto& m : pool) {
         const int s = ScoreMatch(m.name, token.text, &m.spans);
         if (s <= 0) continue;
         m.score = s;
+        if      (m.value == "current") m.score += 5;
+        else if (m.value == "default") m.score += 2;
         ranked.push_back(std::move(m));
     }
     if (ranked.empty()) return {};

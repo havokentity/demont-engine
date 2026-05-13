@@ -1133,7 +1133,16 @@ void WinOverlay::RefreshCompletions(bool force_show) {
     pt::console::TokenInfo token =
         pt::console::CurrentToken(input_, cur);
 
-    if (!force_show && token.text.empty()) {
+    // Empty-query gating:
+    //   - Token 0 with empty text: don't auto-open. The popup would
+    //     list every cvar + command in the engine every time the
+    //     input becomes empty (e.g. fresh open, post-Submit clear) --
+    //     that's noise. Token 0 needs at least one typed char.
+    //   - Value position (is_token0 == false) with empty text: DO
+    //     auto-open. This is the "user just typed `<cvar> ` and
+    //     wants to see the value list (incl. current value)" path.
+    //     Mirrors the web console's equivalent gate.
+    if (!force_show && token.text.empty() && token.is_token0) {
         DismissPopup();
         return;
     }
