@@ -4818,6 +4818,12 @@ void Engine::RegisterCommands() {
     if (auto* v = C.FindCVar("r_env_intensity")) {
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
+    // r_mis changes the per-frame radiance estimator; runtime toggle
+    // must invalidate accum_hdr so we don't blend pre- and post-toggle
+    // samples together (same precedent as r_env_intensity above).
+    if (auto* v = C.FindCVar("r_mis")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
     // Sky cvars: changing any of them invalidates accumulation.
     if (auto* v = C.FindCVar("r_sky_mode")) {
         v->allowed_values = {"gradient", "hdri", "procedural"};

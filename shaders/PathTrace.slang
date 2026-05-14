@@ -904,31 +904,47 @@ EnvSample sampleEnvMap(float2 xi) {
     return s;
 }
 
+// Returns true iff the direction maps to an HDRI extracted-cluster
+// pixel -- one where multi-light extraction zeroed the env-map CDF's
+// contribution. The CDF prefix sum doesn't advance at those pixels
+// (0.0 is added), so conditional_cdf[base+u] == conditional_cdf[base+u-1]
+// bit-identically. Used by both pdfEnvMapDir (for early-return) and
+// the BRDF-side MIS miss handler (to avoid double-counting with the
+// extracted-lights NEE that handles cluster flux on its side).
+bool isExtractedClusterDir(float3 dir) {
+    if (env_map_present == 0u || hdri_lights_count == 0u) return false;
+    float ct = clamp(dir.y, -1.0, 1.0);
+    float th = acos(ct);
+    float st = sin(th);
+    if (st < 1e-6) return false;
+    float ph = atan2(dir.z, dir.x);
+    uint W, H;
+    env_map.GetDimensions(W, H);
+    float u = (ph + 3.14159265358979) * (1.0 / 6.28318530717958);
+    float v = th * (1.0 / 3.14159265358979);
+    uint u_idx = min(uint(u * float(W)), W - 1u);
+    uint v_idx = min(uint(v * float(H)), H - 1u);
+    uint base = v_idx * W;
+    float c_curr = conditional_cdf[base + u_idx];
+    float c_prev = (u_idx > 0u) ? conditional_cdf[base + u_idx - 1u] : 0.0;
+    return c_curr <= c_prev;
+}
+
 // Evaluate the env-map importance-sampling PDF (solid-angle) for an
 // arbitrary world-space direction. Mirrors sampleEnvMap's PDF formula
 // for the texel the direction projects to. Used as the "other" sampler
 // PDF in the balance heuristic when MIS-weighting BRDF-sampled bounces
 // that hit the sky. Returns 0 when the env map isn't bound, the total
-// luminance integral is degenerate, or the direction lands at a pole
-// (sin theta -> 0 -> infinite Jacobian; the env-map estimator can't
-// generate such a sample, so its PDF is 0).
-//
-// HDRI multi-light extraction zeroes cluster pixels in the
-// conditional_cdf (but not in the raw env_map texture, so camera-direct
-// rays still see the bright pixels). The env-map sampler's PDF at a
-// cluster direction is therefore exactly 0, even though the raw texel
-// has positive luminance. We detect masked pixels by checking whether
-// the conditional CDF's prefix sum advanced at this pixel -- a masked
-// pixel writes the same prefix value as its predecessor (bit-identical
-// equality since 0.0 is added). Without this check the BRDF-side MIS
-// weight at cluster directions would be pdf_brdf/(pdf_brdf+spurious)
-// instead of 1.0, under-counting BRDF-sampled contributions there.
+// luminance integral is degenerate, the direction lands at a pole
+// (sin theta -> 0 -> infinite Jacobian), or the direction lands on an
+// extracted-cluster pixel (CDF was masked there).
 float pdfEnvMapDir(float3 dir) {
     if (env_map_present == 0u || env_total_luminance <= 0.0) return 0.0;
     float cos_theta = clamp(dir.y, -1.0, 1.0);
     float theta     = acos(cos_theta);
     float sin_theta = sin(theta);
     if (sin_theta < 1e-6) return 0.0;
+    if (isExtractedClusterDir(dir)) return 0.0;
     float phi = atan2(dir.z, dir.x);
     uint W, H;
     env_map.GetDimensions(W, H);
@@ -936,14 +952,6 @@ float pdfEnvMapDir(float3 dir) {
     float v = theta * (1.0 / 3.14159265358979);
     uint u_idx = min(uint(u * float(W)), W - 1u);
     uint v_idx = min(uint(v * float(H)), H - 1u);
-    // CDF-based mask test: cluster pixels (extracted as directional
-    // lights in ReloadEnvMap) contribute 0 to the prefix sum, so
-    // cdf[base+u] == cdf[base+u-1]. Two buffer reads vs uploading a
-    // separate mask texture; same correctness, no extra binding.
-    uint base = v_idx * W;
-    float cdf_curr = conditional_cdf[base + u_idx];
-    float cdf_prev = (u_idx > 0u) ? conditional_cdf[base + u_idx - 1u] : 0.0;
-    if (cdf_curr <= cdf_prev) return 0.0;
     float3 raw = env_map[uint2(u_idx, v_idx)].rgb;
     float lum  = 0.2126 * raw.r + 0.7152 * raw.g + 0.0722 * raw.b;
     return (lum * float(W * H)) /
@@ -1348,9 +1356,21 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 // pdf_other = pdf the env-map sampler would have picked
                 // this same direction; pdf_self = cosine-hemisphere PDF
                 // recorded at the Lambert bounce site.
-                float pdf_env = pdfEnvMapDir(rd);
-                float w_brdf  = misBalance(prev_lambert_brdf_pdf, pdf_env);
-                radiance += clampIndirect(throughput * skyColor(rd) * w_brdf);
+                //
+                // Skip extracted-cluster directions: the env-map CDF
+                // has them masked to 0, AND extracted-lights NEE
+                // contributes their flux every frame on its own
+                // sampler. Adding a BRDF-side contribution here would
+                // double-count those clusters. The proper long-term
+                // fix is a 3-way MIS across env-CDF / extracted-lights
+                // / BRDF; this gating matches the pre-MIS behaviour
+                // at cluster directions (NEE-only) which is unbiased,
+                // and is documented as deferred work in FOLLOW_UPS.
+                if (!isExtractedClusterDir(rd)) {
+                    float pdf_env = pdfEnvMapDir(rd);
+                    float w_brdf  = misBalance(prev_lambert_brdf_pdf, pdf_env);
+                    radiance += clampIndirect(throughput * skyColor(rd) * w_brdf);
+                }
             } else if (!skip_sky_on_miss) {
                 // b == 0 is the camera ray hitting the sky directly --
                 // unbounded so the HDRI sun renders at full intensity.
@@ -1391,7 +1411,16 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     if (any(trans > float3(0.0))) {
                         float3 brdf = h.albedo / 3.14159265358979;
                         float pdf_brdf_at_env = n_dot_l * (1.0 / 3.14159265358979);
-                        float w_light = (mis_enabled != 0u)
+                        // Only apply the MIS down-weight when the BRDF
+                        // complement will actually be evaluated (next
+                        // bounce in the loop). On the last allowed
+                        // bounce (b + 1 >= max_bounces; includes the
+                        // r_max_bounces=1 edge case) the BRDF strategy
+                        // never fires, so the unbiased estimator is
+                        // full-weight NEE alone.
+                        bool brdf_complement_will_fire =
+                            (mis_enabled != 0u) && ((b + 1u) < max_bounces);
+                        float w_light = brdf_complement_will_fire
                             ? misBalance(env.pdf, pdf_brdf_at_env)
                             : 1.0;
                         radiance += clampIndirect(throughput * env.color * trans * brdf * n_dot_l * w_light / env.pdf);
