@@ -120,15 +120,17 @@ Texture2D<float4> moon_map;
 // final tonemap, no host round-trip.
 [[vk::binding(15, 0)]] RWStructuredBuffer<float> exposure_state;
 
-// The full PtPush is 448 bytes. Native Vulkan / NVIDIA caps push
-// constants at 256B, so on SPIR-V we keep only the small per-dispatch
-// prefix (camera basis + flags + jitter, 112B) in [[vk::push_constant]]
-// and spill the rest into a UBO at binding(14, 0). On Metal,
-// [[vk::push_constant]] lowers to a regular setBytes buffer slot
+// The full PtPush is 720 bytes today (112 B head + 608 B tail; see the
+// static_assert at the dispatch site in Engine.cpp). Native Vulkan / NVIDIA
+// caps push constants at 256B, so on SPIR-V we keep only the small
+// per-dispatch prefix (camera basis + flags + jitter, 112B) in
+// [[vk::push_constant]] and spill the rest into a UBO at binding(14, 0).
+// On Metal, [[vk::push_constant]] lowers to a regular setBytes buffer slot
 // (no hw size cap), so we keep the full struct there for simplicity.
-// VulkanCommandBuffer::Dispatch byte-splits the contiguous host
-// PtPush struct: bytes [0..112] -> vkCmdPushConstants, bytes
-// [112..448] -> the per-frame Frame UBO upload.
+// VulkanCommandBuffer::Dispatch byte-splits the contiguous host PtPush
+// struct: bytes [0..112] -> vkCmdPushConstants, bytes [112..sizeof(PtPush))
+// -> the per-frame Frame UBO upload (sized by kFrameUboSize in
+// VulkanDevice.h; the dispatch path LOG_ERRORs once if the tail overflows).
 [[vk::push_constant]]
 cbuffer Push {
     float4 pos_fovtan;

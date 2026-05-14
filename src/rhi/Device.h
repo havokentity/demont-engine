@@ -184,6 +184,17 @@ public:
         enum class Quality : std::uint8_t { Basic, Atrous };
         Quality quality = Quality::Atrous;
 
+        // SVGF-atrous only: number of A-Trous wavelet passes to dispatch
+        // after the temporal accumulation. Each pass keeps the same 5x5
+        // binomial kernel but doubles the tap stride (1 -> 2 -> 4 -> 8
+        // -> 16), so the effective edge-aware footprint doubles per
+        // pass at constant tap cost. The engine drives this from the
+        // r_svgf_atrous_passes cvar; the backend clamps to 1..5
+        // internally (5 = canonical SVGF / Schied 2017). Ignored by
+        // SVGF-basic (which skips the spatial chain entirely) and by
+        // MetalFX/OptiX.
+        std::uint32_t atrous_passes = 1;
+
         // Which denoiser implementation the backend should route to.
         // The Vulkan backend looks at this to dispatch between
         // VulkanNrdDenoiser (Svgf -- in-house SVGF/atrous chain) and
@@ -212,6 +223,15 @@ public:
             OptixTemporalHdr,
             OptixTemporalHdrAov,
             MetalFX,
+            // SVGF followed by MetalFX TemporalDenoisedScaler as a
+            // finalizer. Metal only. SVGF kills path-tracing noise;
+            // MetalFX then ML-TAAs the result (cleaner edges than the
+            // in-shader edge-aware blend). The backend lazily allocates
+            // an intermediate scratch texture sized to the swapchain
+            // and routes the SVGF output through it before invoking
+            // MetalFX. On Vulkan this falls back to Kind::Svgf (the
+            // base denoiser still runs; the MetalFX chain is dropped).
+            SvgfMetalFx,
         };
         Kind kind = Kind::Svgf;
         // Required by MetalFX TemporalDenoisedScaler. Column-major 4x4

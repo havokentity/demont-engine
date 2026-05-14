@@ -81,6 +81,16 @@ public:
     void DestroyPipeline(PipelineHandle) override {}
     void DestroyAccelStruct(AccelStructHandle h) override;
 
+    // Batched-destroy fast paths. The public Destroy* above each call
+    // vkDeviceWaitIdle() internally so a single destroy is always safe.
+    // Callers that tear down N resources back-to-back (denoiser scratch
+    // reallocation, swapchain rebuild, shutdown) pay an N-way idle stall
+    // otherwise. The NoWait variants skip the internal wait; the caller
+    // is responsible for issuing a single WaitIdle() before the batch.
+    // Strictly Vulkan-specific (not on the abstract Device interface).
+    void DestroyBufferNoWait(BufferHandle h);
+    void DestroyTextureNoWait(TextureHandle h);
+
     void WriteBuffer(BufferHandle h, const void* src, std::size_t size,
                      std::size_t dst_offset) override;
     bool WriteTexture(TextureHandle h, const void* src, std::size_t src_size) override;
@@ -187,7 +197,16 @@ public:
     // shared header or Slang reflection.
     static constexpr std::uint32_t kPushSplitOffset = 112;
     static constexpr std::uint32_t kFrameUboBinding = 14;
-    static constexpr std::size_t   kFrameUboSize    = 512;  // 336B + headroom
+    // Sized to fit the PtPush tail (sizeof(PtPush) - kPushSplitOffset) with
+    // room to grow. The static_assert at Engine.cpp's dispatch site checks
+    // sizeof(PtPush) against the field-by-field sum; the runtime guard in
+    // VulkanCommandBuffer::Dispatch LOG_ERRORs once if the tail ever exceeds
+    // this size, since silently clamping the memcpy truncates the GPU-side
+    // view of trailing fields (write_hdr_aux, write_normal_gbuffer etc.) and
+    // turns rendering corruption into a silent visual bug. PtPush tail today
+    // is 608 B (HDRI multi-light + flags); bump this constant whenever the
+    // static_assert fires.
+    static constexpr std::size_t   kFrameUboSize    = 1024;
 
 private:
     void DestroyDevice();

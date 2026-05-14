@@ -302,7 +302,14 @@ private:
     // SVGF need it) and which one-time log to print.
     //
     //   SvgfBasic  = temporal accumulation only (no spatial filter)
-    //   SvgfAtrous = temporal + 3-pass a-trous edge-aware filter
+    //   SvgfAtrous = temporal + a-trous edge-aware filter
+    //   SvgfBasicMetalFx / SvgfAtrousMetalFx = chain the corresponding
+    //                SVGF mode through MetalFX TemporalDenoisedScaler
+    //                as a finalizer (Mac only). SVGF kills the path-
+    //                tracing noise, MetalFX then ML-TAAs the edges /
+    //                cleans up sub-pixel aliasing the SVGF spatial
+    //                filter can't preserve. Falls back to plain SVGF
+    //                on Vulkan / when MetalFX isn't available.
     //   Nrd        = currently aliases SvgfAtrous; reserved for the
     //                proper NVIDIA RayTracingDenoiser library later.
     //   OptixHdr   = NVIDIA OptiX denoiser, HDR model. CUDA-Vulkan
@@ -324,6 +331,7 @@ private:
     //                          temporal smoothing AND AOV edge fidelity.
     enum class DenoiserKind : std::uint8_t {
         Off, MetalFX, SvgfBasic, SvgfAtrous, Nrd,
+        SvgfBasicMetalFx, SvgfAtrousMetalFx,
         OptixHdr, OptixHdrAov,
         OptixTemporalHdr, OptixTemporalHdrAov,
     };

@@ -195,6 +195,14 @@ private:
     // the Vulkan backend, cross-compiled to MSL. Allocated lazily on
     // first SVGF-mode Denoise() call.
     std::unique_ptr<class MetalSvgfDenoiser> svgf_denoiser_;
+
+    // SVGF -> MetalFX chain (Kind::SvgfMetalFx): intermediate RGBA16F
+    // texture SVGF writes to before MetalFX reads it as the "color"
+    // input. Lazily allocated on first chain-mode Denoise() and
+    // resized when the swapchain dims change.
+    MTL::Texture* svgf_metalfx_intermediate_   = nullptr;
+    std::uint32_t svgf_metalfx_intermediate_w_ = 0;
+    std::uint32_t svgf_metalfx_intermediate_h_ = 0;
 };
 
 }  // namespace pt::rhi::mtl

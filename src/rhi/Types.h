@@ -31,8 +31,13 @@ enum class TextureFormat : std::uint8_t {
     RGBA16F,
     RGBA32F,
     R32_UINT,
-    R32F,         // P10 denoiser depth
-    RG16F,        // P10 denoiser motion vectors
+    R32F,         // P10 denoiser depth (storage image)
+    RG16F,        // P10 denoiser motion vectors (storage image)
+    RG32F,        // Two-channel 32-bit float storage image. No current
+                  // texture-backed user -- SVGF luminance moments + variance
+                  // live in storage *buffers* now (under Metal's 8-RW-texture
+                  // compute cap), but the format is kept registered for any
+                  // future caller that needs a 2x32f image.
 };
 
 enum class TextureUsage : std::uint32_t {

@@ -1,64 +1,88 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Rajesh D'Monte
 //
-// SVGF-style temporal accumulation for the Vulkan path tracer.
-// Reads the per-frame noisy radiance the path tracer writes into
-// `color_in`, reprojects the previous frame's accumulated history
-// (color_history_in) using motion vectors, and blends them into
-// color_out -- which next frame becomes color_history_in.
+// Proper SVGF temporal accumulation (Schied et al. 2017). Reprojects the
+// previous frame's color + luminance moments using motion vectors,
+// validates the reprojection against depth+normal history, blends with
+// the current noisy radiance, and emits:
 //
-// Why this is "SVGF-lite": we skip variance estimation and the
-// luminance-weighted reprojection rejection, but we keep the two
-// pieces that matter for visual quality at 1 spp:
-//   1. Temporal blend with adaptive alpha. Disocclusions (motion
-//      reprojects off-screen, or the depth/normal of the historical
-//      sample disagrees with the current pixel's) collapse alpha to
-//      1.0 so we don't ghost stale color into freshly-revealed
-//      surfaces. Stable pixels get alpha ~= 0.10 so they pull most
-//      of their value from the long-running mean.
-//   2. Bilinear filtering of the reprojected history. Motion vectors
-//      land on sub-pixel positions; nearest-tap reprojection looks
-//      jittery on slow camera moves. 4-tap bilinear reads + per-tap
-//      validity check gives stable temporal sub-pixel reconstruction.
+//   color_out          -- temporally-blended RGB + sample count in .a
+//   moments_out        -- temporally-blended luminance moments (mu1, mu2)
+//   variance_out       -- per-pixel luminance variance, ready for the
+//                         A-Trous chain to use as its w_l denominator
 //
-// History invariant: color_history_in.a stores the running sample
-// count (clamped to 32) so the next frame's blend can use 1/(N+1)
-// adaptive alpha for the first few samples after a reset (faster
-// convergence than the steady-state 0.10).
+// Two changes from the previous "SVGF-lite":
+//   1. Moments + variance: track running mean and mean-of-squares of
+//      luminance via a 2nd ping-pong history (moments_history_a/b).
+//      Variance = mu2 - mu1^2 gives the A-Trous pass a real measure of
+//      how converged the pixel is, so it can keep stationary regions
+//      crisp instead of bilateral-blurring them.
+//   2. Spatial variance fallback: pixels with sample_count < 4 don't
+//      have enough temporal samples for a reliable variance estimate
+//      (just-disoccluded surfaces). For those pixels we additionally
+//      compute a 7x7 spatial luminance variance and lerp toward it
+//      based on sample count -- so newly-revealed surfaces get a fat
+//      luminance sigma until temporal moments stabilise.
+//
+// History invariants:
+//   color_history_in.a       -- running sample count (clamped to 32).
+//   moments_history_in.r     -- mu1 (running mean luminance).
+//   moments_history_in.g     -- mu2 (running mean of luminance^2).
+//
+// On reprojection failure (off-screen, depth/normal mismatch) all
+// three trails reset: color = noisy_now, moments = (l_now, l_now^2),
+// variance falls back to the 7x7 spatial estimate.
 
-[[vk::binding(0, 0)]] RWTexture2D<float4> color_in;          // path-tracer output, RGBA16F
-[[vk::binding(1, 0)]] RWTexture2D<float4> color_history_in;  // prev-frame accumulated, RGBA16F (.a = sample count)
-[[vk::binding(2, 0)]] RWTexture2D<float>  depth_tex;         // this-frame R32F linear camera-space depth
-[[vk::binding(3, 0)]] RWTexture2D<float2> motion_tex;        // RG16F pixel-space motion (prev - curr)
-[[vk::binding(4, 0)]] RWTexture2D<float4> normal_tex;        // this-frame RGBA16F world-space normal
-[[vk::binding(5, 0)]] RWTexture2D<float4> color_out;         // this-frame accumulated, RGBA16F
-[[vk::binding(6, 0)]] RWTexture2D<float>  depth_history_in;  // prev-frame R32F depth history (reproject sample source)
-[[vk::binding(7, 0)]] RWTexture2D<float4> normal_history_in; // prev-frame RGBA16F normal history (reproject sample source)
+[[vk::binding(0,  0)]] RWTexture2D<float4> color_in;            // path-tracer noisy radiance, RGBA16F
+[[vk::binding(1,  0)]] RWTexture2D<float4> color_history_in;    // prev-frame accumulated color, RGBA16F
+[[vk::binding(2,  0)]] RWTexture2D<float>  depth_tex;           // current-frame linear depth, R32F
+[[vk::binding(3,  0)]] RWTexture2D<float2> motion_tex;          // pixel-space motion (prev - curr), RG16F
+[[vk::binding(4,  0)]] RWTexture2D<float4> normal_tex;          // current-frame world-space normal, RGBA16F
+[[vk::binding(5,  0)]] RWTexture2D<float4> color_out;           // accumulated color, RGBA16F (.a = sample count)
+[[vk::binding(6,  0)]] RWTexture2D<float>  depth_history_in;    // prev-frame depth, R32F
+[[vk::binding(7,  0)]] RWTexture2D<float4> normal_history_in;   // prev-frame normal, RGBA16F
+// Buffer-backed bindings start at 8. Storage *buffers* don't share Metal's
+// 8-texture-with-read_write-access compute limit (we keep 8 RW textures at
+// the cap; 12 RW textures crashed slangc's MSL output). Indexing is
+// row-major: idx = y*width + x.
+[[vk::binding(8,  0)]] RWStructuredBuffer<float2> moments_history_in;  // prev-frame (mu1, mu2)
+[[vk::binding(9,  0)]] RWStructuredBuffer<float2> moments_history_out; // this-frame (mu1, mu2)
+[[vk::binding(10, 0)]] RWStructuredBuffer<float>  variance_in_unused;  // unread by temporal -- host binds a placeholder
+[[vk::binding(11, 0)]] RWStructuredBuffer<float>  variance_out;        // this-frame initial variance
 
 [[vk::push_constant]]
 cbuffer Push {
     uint  width;
     uint  height;
-    uint  reset_history;     // 1 = ignore history this frame
+    uint  reset_history;
     uint  _pad0;
-    float depth_tolerance;   // relative depth difference allowed for reproj
-    float normal_tolerance;  // dot-product threshold (1.0 = exact, 0.0 = any)
-    float min_alpha;         // steady-state blend factor (e.g. 0.10)
+    float depth_tolerance;
+    float normal_tolerance;
+    float min_alpha;
     float _pad1;
 };
 
-// Sample a 2x2 bilinear neighbourhood from color_history_in at the
-// reprojected position. Each tap is validated against the current
-// pixel's depth + normal; failing taps drop out of the average. If
-// no taps pass we return alpha=1 to disable temporal reuse.
+float luminance(float3 c) {
+    return dot(c, float3(0.2126, 0.7152, 0.0722));
+}
+
+uint pixelIndex(uint2 p) { return p.y * width + p.x; }
+
+// 2x2 bilinear reprojection with per-tap depth+normal validation.
+// Returns the blended color (rgb) + aggregated sample count (a) AND
+// the matching moments at the same reprojected position. Both share
+// the same validity test, so when we accept a tap for color we also
+// accept its moments -- the two trails never desync.
 struct ReprojSample {
-    float4 color;       // .rgb = blended color, .a = aggregated sample count
+    float4 color;
+    float2 moments;
     bool   valid;
 };
 
 ReprojSample sampleHistory(float2 prev_pos, float curr_depth, float3 curr_normal) {
     ReprojSample r;
     r.color = float4(0.0);
+    r.moments = float2(0.0);
     r.valid = false;
 
     int2 base = int2(floor(prev_pos - 0.5));
@@ -71,12 +95,9 @@ ReprojSample sampleHistory(float2 prev_pos, float curr_depth, float3 curr_normal
     };
     int2 off[4] = { int2(0,0), int2(1,0), int2(0,1), int2(1,1) };
 
-    float4 acc = float4(0.0);
-    float  wsum = 0.0;
-    // Disocclusion test:
-    // Compare this frame's depth/normal at curr_pos against previous
-    // frame's depth/normal history sampled at prev_pos (true cross-
-    // frame validation, matching SVGF's intended gating).
+    float4 acc_color = float4(0.0);
+    float2 acc_mom   = float2(0.0);
+    float  wsum      = 0.0;
     [unroll] for (int i = 0; i < 4; ++i) {
         int2 p = base + off[i];
         if (p.x < 0 || p.y < 0 || p.x >= int(width) || p.y >= int(height)) continue;
@@ -89,14 +110,39 @@ ReprojSample sampleHistory(float2 prev_pos, float curr_depth, float3 curr_normal
             float n_dot = dot(curr_normal, prev_n);
             if (n_dot < normal_tolerance) continue;
         }
-        acc  += w[i] * color_history_in[up];
-        wsum += w[i];
+        acc_color += w[i] * color_history_in[up];
+        acc_mom   += w[i] * moments_history_in[pixelIndex(up)];
+        wsum      += w[i];
     }
     if (wsum > 1e-3) {
-        r.color = acc / wsum;
-        r.valid = true;
+        r.color   = acc_color / wsum;
+        r.moments = acc_mom   / wsum;
+        r.valid   = true;
     }
     return r;
+}
+
+// 7x7 spatial luminance variance estimate. Used to seed the variance
+// channel for pixels with too-few temporal samples to trust mu2 - mu1^2
+// (Schied 2017 section 4.3). All taps are clamped in-bounds.
+float spatialVariance(uint2 tid) {
+    float sum  = 0.0;
+    float sum2 = 0.0;
+    float n    = 0.0;
+    [unroll] for (int dy = -3; dy <= 3; ++dy) {
+        [unroll] for (int dx = -3; dx <= 3; ++dx) {
+            int2 p = int2(tid) + int2(dx, dy);
+            if (p.x < 0 || p.y < 0 || p.x >= int(width) || p.y >= int(height)) continue;
+            float l = luminance(color_in[uint2(p)].rgb);
+            sum  += l;
+            sum2 += l * l;
+            n    += 1.0;
+        }
+    }
+    if (n < 1.0) return 0.0;
+    float mu  = sum  / n;
+    float mu2 = sum2 / n;
+    return max(0.0, mu2 - mu * mu);
 }
 
 [shader("compute")]
@@ -104,59 +150,80 @@ ReprojSample sampleHistory(float2 prev_pos, float curr_depth, float3 curr_normal
 void main(uint2 tid : SV_DispatchThreadID) {
     if (tid.x >= width || tid.y >= height) return;
 
-    float4 noisy = color_in[tid];
+    float4 noisy      = color_in[tid];
     float  curr_depth = depth_tex[tid];
-    float3 curr_n = normal_tex[tid].xyz;
+    float3 curr_n     = normal_tex[tid].xyz;
+    float  l_now      = luminance(noisy.rgb);
 
-    // Reset path: just stamp the current frame and seed the history
-    // counter. Avoids a single-frame ghost from undefined memory in
-    // color_history_in on first frame after backend init.
+    // Hard reset path: stamp the noisy color, seed moments at (l_now,
+    // l_now^2) so initial variance is 0 (1-sample regions defer to the
+    // spatial variance fallback below regardless), and write a fresh
+    // variance derived purely from the 7x7 spatial neighborhood.
     if (reset_history != 0u) {
-        color_out[tid] = float4(noisy.rgb, 1.0);
+        color_out[tid]                       = float4(noisy.rgb, 1.0);
+        moments_history_out[pixelIndex(tid)] = float2(l_now, l_now * l_now);
+        variance_out[pixelIndex(tid)]        = spatialVariance(tid);
         return;
     }
 
     float2 motion = motion_tex[tid];
-    // Pixel-center reprojection. PathTrace.slang's G-buffer pass writes
-    // motion = pre_pix - cur_pix where both pre_pix and cur_pix are
-    // pixel-CENTER coords (pixel i has center i + 0.5), because the
-    // unjittered primary ray is cast through (tid + 0.5) / dim. So the
-    // sample point in last frame's history is
-    //
-    //   pre_pix = cur_pix + motion = (tid + 0.5) + motion
-    //
-    // The `+ 0.5` was previously missing -- prev_pos landed on the
-    // pixel CORNER instead, which made the 2x2 bilinear sample below
-    // box-average the upper-left 2x2 neighborhood (samples at base,
-    // base+(1,0), base+(0,1), base+(1,1) with weights 0.25 each when
-    // frac collapses to 0.5). Over many frames of accumulation that
-    // bias drags content from upper-left toward lower-right of screen,
-    // producing the visible smudge in that direction that reproduced
-    // on both Vulkan and Metal.
+    // Pixel-center reprojection: G-buffer writes motion = prev_pix - curr_pix
+    // where both are pixel-CENTER coords (see PathTrace.slang).
     float2 prev_pos = float2(tid) + 0.5 + motion;
     bool in_frame = prev_pos.x >= 0.0 && prev_pos.y >= 0.0
                   && prev_pos.x < float(width) && prev_pos.y < float(height);
 
     ReprojSample h;
     h.color = float4(0.0);
+    h.moments = float2(0.0);
     h.valid = false;
     if (in_frame) h = sampleHistory(prev_pos, curr_depth, curr_n);
 
     if (!h.valid) {
-        color_out[tid] = float4(noisy.rgb, 1.0);
+        // Disocclusion: drop history. Spatial variance carries us until
+        // the temporal moments stabilise over the next ~4 frames.
+        color_out[tid]                       = float4(noisy.rgb, 1.0);
+        moments_history_out[pixelIndex(tid)] = float2(l_now, l_now * l_now);
+        variance_out[pixelIndex(tid)]        = spatialVariance(tid);
         return;
     }
 
-    // Adaptive alpha: 1/(N+1) for the first few samples after a
-    // reset (faster convergence), clamped to min_alpha for steady
-    // state. Sample count lives in history.a; cap at 32 so a long-
-    // stationary scene can still adapt to lighting changes.
-    float n = clamp(h.color.a, 1.0, 32.0);
+    // Adaptive alpha: 1/(N+1) for the first few samples after reset,
+    // then min_alpha steady-state. Same blend factor drives color and
+    // moments so they stay in lockstep (a desynced mu1/color would
+    // corrupt variance).
+    float n     = clamp(h.color.a, 1.0, 32.0);
     float alpha = max(min_alpha, 1.0 / (n + 1.0));
 
-    float3 blended = lerp(h.color.rgb, noisy.rgb, alpha);
-    // Sanitize: NaNs / Infs from the path tracer's HDR pixels would
-    // poison the running mean forever. Drop them.
-    if (any(isnan(blended)) || any(isinf(blended))) blended = noisy.rgb;
-    color_out[tid] = float4(blended, min(n + 1.0, 32.0));
+    float3 blended_color = lerp(h.color.rgb, noisy.rgb, alpha);
+    float2 blended_mom   = lerp(h.moments,
+                                float2(l_now, l_now * l_now),
+                                alpha);
+
+    // NaN/Inf shielding -- HDR fireflies must not poison the long-running
+    // mean / second moment.
+    if (any(isnan(blended_color)) || any(isinf(blended_color))) blended_color = noisy.rgb;
+    if (any(isnan(blended_mom))   || any(isinf(blended_mom)))   blended_mom   = float2(l_now, l_now * l_now);
+
+    float new_count = min(n + 1.0, 32.0);
+    color_out[tid]                       = float4(blended_color, new_count);
+    moments_history_out[pixelIndex(tid)] = blended_mom;
+
+    // Temporal variance from the running moments.
+    float temporal_var = max(0.0, blended_mom.y - blended_mom.x * blended_mom.x);
+
+    // Sample-count-driven blend with the 7x7 spatial fallback. Below 4
+    // samples we trust the spatial estimate more than the unsteady
+    // temporal one (Schied 2017 4.3). The lerp is on sample count, not
+    // alpha, so a low-min_alpha tweak doesn't push us back into spatial
+    // territory once converged.
+    float final_var;
+    if (new_count < 4.0) {
+        float spatial_var = spatialVariance(tid);
+        float t = new_count / 4.0;
+        final_var = lerp(spatial_var, temporal_var, t);
+    } else {
+        final_var = temporal_var;
+    }
+    variance_out[pixelIndex(tid)] = final_var;
 }
