@@ -624,12 +624,13 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
     const bool effective_reset = reset_history || needs_history_clear_;
     needs_history_clear_ = false;
 
-    // In SVGF-atrous mode the temporal output is scratch (read by
-    // atrous pass 1); v_hist_write receives the FIRST atrous output,
-    // which is what feeds next frame's reprojection per Schied 2017.
-    // In SVGF-basic the atrous chain is skipped so temporal writes
-    // straight into v_hist_write.
-    const VkImageView v_temporal_color_out = atrous_enabled ? v_atrous_a : v_hist_write;
+    // Temporal always writes to v_hist_write -- that's what feeds next
+    // frame's reprojection. In atrous mode we then run ONE A-Trous pass
+    // (step=1) reading v_hist_write and writing to v_output; the
+    // feedback loop is intentionally disabled. With a single pass,
+    // feeding the filtered result back compounds smoothing across
+    // frames -- which was the "soft cast" we saw at 3 passes.
+    const VkImageView v_temporal_color_out = v_hist_write;
 
     // ---- Pass 1: temporal accumulate -----------------------------------
     DenoisePush p1{};
@@ -696,13 +697,12 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
 
     if (atrous_enabled) {
-        // ---- Passes 2..4: a-trous chain at step sizes 1, 2, 4 ----------
-        // The first pass reads the temporal scratch (v_atrous_a) and
-        // writes the result to v_hist_write -- that becomes next frame's
-        // reprojection source (Schied 2017 feedback loop). Subsequent
-        // passes ping-pong v_atrous_b and the caller's output. Variance
-        // ping-pongs v_variance_a/b in lockstep so each pass uses the
-        // previous pass's filtered variance as its w_l denominator.
+        // ---- Pass 2: single step=1 A-Trous filter ----------------------
+        // Reads v_hist_write (= temporal output) and writes directly
+        // to the caller's output. Effective 5x5 neighbourhood. The
+        // previous 3-pass chain at steps 1/2/4 was visibly over-smooth;
+        // dropping to one pass keeps noise rejection without the 17x17
+        // blur footprint.
         auto atrous_pass = [&](VkImageView color_src, VkImageView color_dst,
                                VkBuffer var_src, VkBuffer var_dst,
                                std::uint32_t step) {
@@ -740,9 +740,10 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                        &p, sizeof(p), gx, gy);
             ComputeChainBarrier(cb);
         };
-        atrous_pass(v_atrous_a,  v_hist_write, b_variance_a, b_variance_b, 1u);
-        atrous_pass(v_hist_write, v_atrous_b,  b_variance_b, b_variance_a, 2u);
-        atrous_pass(v_atrous_b,   v_output,    b_variance_a, b_variance_b, 4u);
+        // Single step=1 pass: v_hist_write (temporal output) -> v_output.
+        // b_variance_b is written but discarded (no subsequent pass);
+        // the buffer stays allocated for future multi-pass support.
+        atrous_pass(v_hist_write, v_output, b_variance_a, b_variance_b, 1u);
     } else {
         // ---- svgf_basic: temporal-only -> copy history into output ----
         // Skip the spatial filter entirely. The temporal pass already

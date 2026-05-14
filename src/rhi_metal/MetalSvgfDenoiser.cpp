@@ -271,13 +271,14 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
     MTL::Size groups  = MTL::Size::Make((w + 7) / 8, (h + 7) / 8, 1);
     MTL::Size tgsize  = MTL::Size::Make(8, 8, 1);
 
-    // In SVGF-atrous mode the temporal output is intermediate scratch
-    // (consumed by atrous pass 1) and hist_write is the slot that
-    // receives the FIRST atrous output (= what feeds next frame's
-    // history, per Schied 2017's feedback loop). In SVGF-basic the
-    // atrous chain is skipped, so temporal writes straight to
-    // hist_write -- the same texture that backs next frame's history.
-    MTL::Texture* temporal_color_out = atrous_enabled ? atrous_a_ : hist_write;
+    // Temporal always writes to hist_write -- that's what feeds next
+    // frame's reprojection. In atrous mode we then run ONE A-Trous pass
+    // (step=1) reading hist_write and writing to the caller's output;
+    // hist_write itself is NOT modified by the spatial filter, so
+    // Schied's feedback loop is intentionally disabled. With a single
+    // pass, feeding the filtered result back compounds smoothing across
+    // frames -- which is exactly the "soft cast" we saw at 3 passes.
+    MTL::Texture* temporal_color_out = hist_write;
 
     // ---- Pass 1: temporal accumulate -------------------------------
     {
@@ -349,7 +350,11 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
         blit->endEncoding();
     }
 
-    // ---- Passes 2..4: a-trous chain (atrous_enabled only) ----------
+    // ---- Pass 2: single A-Trous filter (atrous_enabled only) -------
+    // Just one step=1 pass (effective 5x5 neighbourhood). The previous
+    // 3-pass chain at steps 1/2/4 produced an over-smooth read on
+    // diffuse content; this matches "svgf_basic plus a touch of
+    // spatial denoise."
     if (atrous_enabled) {
         MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
         enc->setComputePipelineState(atrous_pso_);
@@ -405,14 +410,11 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
             enc->memoryBarrier(MTL::BarrierScope(MTL::BarrierScopeTextures |
                                                 MTL::BarrierScopeBuffers));
         };
-        // Schied 2017 feedback loop: the first A-Trous output is what
-        // gets fed back as next frame's color history (the temporal
-        // pass's raw blend is noisier and would drift). hist_write
-        // captures pass-1 output; passes 2 and 3 ping-pong atrous_b
-        // and the caller's output.
-        atrous_pass(atrous_a_, hist_write, variance_a_, variance_b_, 1u);
-        atrous_pass(hist_write, atrous_b_, variance_b_, variance_a_, 2u);
-        atrous_pass(atrous_b_,  output,    variance_a_, variance_b_, 4u);
+        // Single pass: hist_write (= temporal output) -> caller's output.
+        // variance_b is written but immediately discarded since there's
+        // no subsequent pass to read it; the buffer stays allocated for
+        // future multi-pass support.
+        atrous_pass(hist_write, output, variance_a_, variance_b_, 1u);
         enc->endEncoding();
     }
 
