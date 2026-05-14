@@ -96,19 +96,33 @@ private:
     MTL::ComputePipelineState*  temporal_pso_ = nullptr;
     MTL::ComputePipelineState*  atrous_pso_   = nullptr;
 
-    // Scratch textures (owned). All RGBA16F except depth_history_*
-    // (R32F) and the two 1x1 placeholders for the atrous shader's
-    // declared-but-unread slots 1 (RGBA16F) and 3 (RG16F).
-    MTL::Texture* history_a_       = nullptr;
-    MTL::Texture* history_b_       = nullptr;
-    MTL::Texture* depth_history_a_ = nullptr;
-    MTL::Texture* depth_history_b_ = nullptr;
-    MTL::Texture* normal_history_a_ = nullptr;
-    MTL::Texture* normal_history_b_ = nullptr;
-    MTL::Texture* atrous_a_        = nullptr;
-    MTL::Texture* atrous_b_        = nullptr;
-    MTL::Texture* dummy_color_     = nullptr;  // 1x1 RGBA16F (atrous slot 1)
-    MTL::Texture* dummy_motion_    = nullptr;  // 1x1 RG16F   (atrous slot 3)
+    // Scratch textures (owned). Cross-frame ping-pong:
+    //   history_*        RGBA16F (rgb = first-A-Trous output, a = sample count)
+    //   depth_history_*  R32F
+    //   normal_history_* RGBA16F
+    //   moments_history_* RG32F (mu1, mu2 luminance moments)
+    // Within-frame ping-pong:
+    //   atrous_a_/atrous_b_  RGBA16F color scratch
+    //   variance_a_/variance_b_ R32F variance ping-pong (temporal seeds
+    //                           one of them, A-Trous filters through both)
+    // Plus 1x1 placeholders for slots the active pass declares but
+    // does not consume (atrous: slot 1 RGBA16F, slot 3 RG16F; temporal:
+    // slot 10 R32F).
+    MTL::Texture* history_a_         = nullptr;
+    MTL::Texture* history_b_         = nullptr;
+    MTL::Texture* depth_history_a_   = nullptr;
+    MTL::Texture* depth_history_b_   = nullptr;
+    MTL::Texture* normal_history_a_  = nullptr;
+    MTL::Texture* normal_history_b_  = nullptr;
+    MTL::Texture* moments_history_a_ = nullptr;
+    MTL::Texture* moments_history_b_ = nullptr;
+    MTL::Texture* atrous_a_          = nullptr;
+    MTL::Texture* atrous_b_          = nullptr;
+    MTL::Texture* variance_a_        = nullptr;
+    MTL::Texture* variance_b_        = nullptr;
+    MTL::Texture* dummy_color_       = nullptr;  // 1x1 RGBA16F
+    MTL::Texture* dummy_motion_      = nullptr;  // 1x1 RG16F
+    MTL::Texture* dummy_variance_    = nullptr;  // 1x1 R32F (temporal slot 10)
 
     std::uint32_t cached_w_       = 0;
     std::uint32_t cached_h_       = 0;

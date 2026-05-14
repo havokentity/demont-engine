@@ -123,18 +123,14 @@ private:
     VkDescriptorSet NextSet();
 
     // Bind a single dispatch's images into `set` and dispatch with
-    // `pipe` + `push`.
+    // `pipe` + `push`. Slot count matches the temporal/atrous
+    // descriptor set layout -- see BuildLayout() for the per-slot
+    // semantics.
+    static constexpr std::uint32_t kPassBindings = 12;
     void RecordPass(VkCommandBuffer cb,
                     VkPipeline      pipe,
                     VkDescriptorSet set,
-                    VkImageView     color_in,
-                    VkImageView     color_history_in,
-                    VkImageView     depth_curr,
-                    VkImageView     motion_in,
-                    VkImageView     normal_curr,
-                    VkImageView     color_out,
-                    VkImageView     depth_history_in,
-                    VkImageView     normal_history_in,
+                    const VkImageView (&views)[kPassBindings],
                     const void*     push,
                     std::size_t     push_size,
                     std::uint32_t   gx,
@@ -168,24 +164,30 @@ private:
     int                   next_set_     = 0;
 
     // Owned scratch textures (RHI-managed, freed via DestroyTextures()).
-    std::uint64_t         history_a_id_ = 0;
-    std::uint64_t         history_b_id_ = 0;
-    std::uint64_t         depth_history_a_id_ = 0;
-    std::uint64_t         depth_history_b_id_ = 0;
-    std::uint64_t         normal_history_a_id_ = 0;
-    std::uint64_t         normal_history_b_id_ = 0;
-    std::uint64_t         atrous_a_id_  = 0;
-    std::uint64_t         atrous_b_id_  = 0;
+    // Cross-frame ping-pong: history_*, depth_history_*, normal_history_*,
+    // moments_history_* (all sized to the swapchain). Within-frame
+    // ping-pong: atrous_a/b color scratch + variance_a/b ping-pong.
+    std::uint64_t         history_a_id_         = 0;
+    std::uint64_t         history_b_id_         = 0;
+    std::uint64_t         depth_history_a_id_   = 0;
+    std::uint64_t         depth_history_b_id_   = 0;
+    std::uint64_t         normal_history_a_id_  = 0;
+    std::uint64_t         normal_history_b_id_  = 0;
+    std::uint64_t         moments_history_a_id_ = 0;
+    std::uint64_t         moments_history_b_id_ = 0;
+    std::uint64_t         atrous_a_id_          = 0;
+    std::uint64_t         atrous_b_id_          = 0;
+    std::uint64_t         variance_a_id_        = 0;
+    std::uint64_t         variance_b_id_        = 0;
     // 1x1 placeholders for the temporal/atrous bindings the active
     // shader doesn't read but the descriptor set still requires:
-    //   dummy_color_id_  -- RGBA16F, plugs slot 1 (color_history_in)
-    //                       on atrous passes.
-    //   dummy_motion_id_ -- RG16F,   plugs slot 3 (motion_in) on
-    //                       atrous passes (matches the shader's
-    //                       declared float2 storage image format).
+    //   dummy_color_id_    -- RGBA16F, plugs atrous slot 1 (color_history)
+    //   dummy_motion_id_   -- RG16F,   plugs atrous slot 3 (motion)
+    //   dummy_variance_id_ -- R32F,    plugs temporal slot 10 (variance_in)
     // Allocated once at Init(); live for the denoiser's lifetime.
-    std::uint64_t         dummy_color_id_  = 0;
-    std::uint64_t         dummy_motion_id_ = 0;
+    std::uint64_t         dummy_color_id_    = 0;
+    std::uint64_t         dummy_motion_id_   = 0;
+    std::uint64_t         dummy_variance_id_ = 0;
 
     std::uint32_t         cached_w_     = 0;
     std::uint32_t         cached_h_     = 0;
