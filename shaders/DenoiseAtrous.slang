@@ -134,10 +134,17 @@ void main(uint2 tid : SV_DispatchThreadID) {
     // pass-through that re-noises later passes.
     float sigma_l_denom = sigma_color * sqrt(max(gauss_var, 0.0)) + 1e-4;
 
-    float3 sum_color = float3(0.0);
-    float  sum_var   = 0.0;
-    float  sum_w     = 0.0;
-    int    s         = int(step_size);
+    float3 sum_color  = float3(0.0);
+    float  sum_var    = 0.0;
+    float  sum_w      = 0.0;
+    // Geometric weight sum (depth*normal, NO luminance term). This is
+    // the silhouette detector for the edge-aware TAA-preservation
+    // blend below. At interior pixels neighbours pass the depth/normal
+    // gates -> this sums to ~1.0. At silhouettes the gates collapse
+    // toward 0 for off-side neighbours -> sum drops toward the center
+    // tap's kw alone (~0.14).
+    float  sum_w_geom = 0.0;
+    int    s          = int(step_size);
 
     [unroll] for (int dy = -2; dy <= 2; ++dy) {
         [unroll] for (int dx = -2; dx <= 2; ++dx) {
@@ -186,6 +193,10 @@ void main(uint2 tid : SV_DispatchThreadID) {
             // when the inputs are independent -- Schied 2017 (5)).
             sum_var   += w * w * nv;
             sum_w     += w;
+            // Geometric weight (kernel * depth * normal, no luminance).
+            // The center tap (dx=dy=0) contributes kw_center = 36/256
+            // since its depth/normal weights are exactly 1.
+            sum_w_geom += kw * w_depth * w_normal;
         }
     }
 
@@ -200,6 +211,25 @@ void main(uint2 tid : SV_DispatchThreadID) {
         filtered_color = center.rgb;
         filtered_var   = variance_in[pixelIndex(tid)];
     }
+
+    // Edge-aware TAA preservation. The temporal pass averages
+    // jittered 1spp samples over ~32 frames, which sub-pixel-supersamples
+    // silhouettes -- center.rgb arrives here as a soft TAA mean.
+    // But the A-Trous depth/normal gates asymmetrically reject the
+    // off-silhouette side, so the filtered output snaps to whichever
+    // side the unjittered G-buffer says this pixel "belongs to" --
+    // erasing the TAA mean and producing visible aliasing. Detect
+    // that case via the geometric (depth*normal) weight sum: it
+    // collapses toward kw_center at silhouettes (only the center tap
+    // contributes) and stays near 1.0 in interiors. Lerp the filter
+    // output back toward the input center value by that factor so
+    // silhouettes preserve the TAA result while interiors get full
+    // denoising.
+    const float kw_center        = (6.0 / 16.0) * (6.0 / 16.0);
+    const float kw_norm_denom    = max(1.0 - kw_center, 1e-6);
+    float w_geom_normalized = saturate((sum_w_geom - kw_center) / kw_norm_denom);
+    float edge_factor       = 1.0 - w_geom_normalized;
+    filtered_color = lerp(filtered_color, center.rgb, edge_factor);
     // Preserve the sample-count tag from the input so subsequent
     // passes / the next frame's temporal reprojection can still see
     // how converged the source pixel was.
