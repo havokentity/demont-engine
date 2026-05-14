@@ -4559,6 +4559,7 @@ void Engine::RegisterCommands() {
         // logs a one-time INFO at Init noting the fallback).
         v->allowed_values = {"off", "metalfx",
                               "svgf_basic", "svgf_atrous", "nrd",
+                              "svgf_basic_metalfx", "svgf_atrous_metalfx",
                               "optix_hdr", "optix_hdr_aov",
                               "optix_temporal_hdr", "optix_temporal_hdr_aov"};
     }
