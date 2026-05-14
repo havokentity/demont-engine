@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -363,7 +364,22 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
         // Copy spilled tail if push exceeds the on-chip range.
         if (push_size_ > VulkanDevice::kPushSplitOffset && ubo.mapped != nullptr) {
             std::size_t tail = push_size_ - VulkanDevice::kPushSplitOffset;
-            if (tail > VulkanDevice::kFrameUboSize) tail = VulkanDevice::kFrameUboSize;
+            // Silent clamp would truncate trailing PtPush fields and
+            // surface as rendering corruption (the prior svgf_basic
+            // regression: `write_hdr_aux` at UBO offset 600 read as 0,
+            // so the path tracer skipped its denoise_color write and
+            // SVGF sampled zeros -> black frame). LOG_ERROR once when
+            // it happens so the next person hits a noisy failure instead
+            // of squinting at the framebuffer.
+            if (tail > VulkanDevice::kFrameUboSize) {
+                static std::atomic<bool> s_warned{false};
+                bool expected = false;
+                if (s_warned.compare_exchange_strong(expected, true)) {
+                    LOG_ERROR("Frame UBO too small: PtPush tail {} > kFrameUboSize {} -- bump kFrameUboSize in VulkanDevice.h; trailing PtPush fields will not reach the GPU and rendering will be corrupted",
+                              tail, VulkanDevice::kFrameUboSize);
+                }
+                tail = VulkanDevice::kFrameUboSize;
+            }
             std::memcpy(ubo.mapped,
                         push_buf_ + VulkanDevice::kPushSplitOffset, tail);
         }

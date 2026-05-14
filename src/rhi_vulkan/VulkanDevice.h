@@ -187,7 +187,16 @@ public:
     // shared header or Slang reflection.
     static constexpr std::uint32_t kPushSplitOffset = 112;
     static constexpr std::uint32_t kFrameUboBinding = 14;
-    static constexpr std::size_t   kFrameUboSize    = 512;  // 336B + headroom
+    // Sized to fit the PtPush tail (sizeof(PtPush) - kPushSplitOffset) with
+    // room to grow. The static_assert at Engine.cpp's dispatch site checks
+    // sizeof(PtPush) against the field-by-field sum; the runtime guard in
+    // VulkanCommandBuffer::Dispatch LOG_ERRORs once if the tail ever exceeds
+    // this size, since silently clamping the memcpy truncates the GPU-side
+    // view of trailing fields (write_hdr_aux, write_normal_gbuffer etc.) and
+    // turns rendering corruption into a silent visual bug. PtPush tail today
+    // is 608 B (HDRI multi-light + flags); bump this constant whenever the
+    // static_assert fires.
+    static constexpr std::size_t   kFrameUboSize    = 1024;
 
 private:
     void DestroyDevice();
