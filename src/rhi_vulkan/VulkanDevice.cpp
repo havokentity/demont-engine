@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -363,7 +364,22 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
         // Copy spilled tail if push exceeds the on-chip range.
         if (push_size_ > VulkanDevice::kPushSplitOffset && ubo.mapped != nullptr) {
             std::size_t tail = push_size_ - VulkanDevice::kPushSplitOffset;
-            if (tail > VulkanDevice::kFrameUboSize) tail = VulkanDevice::kFrameUboSize;
+            // Silent clamp would truncate trailing PtPush fields and
+            // surface as rendering corruption (the prior svgf_basic
+            // regression: `write_hdr_aux` at UBO offset 600 read as 0,
+            // so the path tracer skipped its denoise_color write and
+            // SVGF sampled zeros -> black frame). LOG_ERROR once when
+            // it happens so the next person hits a noisy failure instead
+            // of squinting at the framebuffer.
+            if (tail > VulkanDevice::kFrameUboSize) {
+                static std::atomic<bool> s_warned{false};
+                bool expected = false;
+                if (s_warned.compare_exchange_strong(expected, true)) {
+                    LOG_ERROR("Frame UBO too small: PtPush tail {} > kFrameUboSize {} -- bump kFrameUboSize in VulkanDevice.h; trailing PtPush fields will not reach the GPU and rendering will be corrupted",
+                              tail, VulkanDevice::kFrameUboSize);
+                }
+                tail = VulkanDevice::kFrameUboSize;
+            }
             std::memcpy(ubo.mapped,
                         push_buf_ + VulkanDevice::kPushSplitOffset, tail);
         }
@@ -1555,10 +1571,19 @@ BufferHandle VulkanDevice::CreateBuffer(const BufferDesc& d) {
 
 void VulkanDevice::DestroyBuffer(BufferHandle h) {
     if (h.id == 0 || device_ == VK_NULL_HANDLE) return;
+    // One-shot caller path: wait idle so the GPU isn't still using the
+    // buffer. Batch teardown should use DestroyBufferNoWait + a single
+    // upfront WaitIdle() instead (this method's wait amortises to one
+    // per destroy, which is fine in isolation but N× for batches).
+    vkDeviceWaitIdle(device_);
+    DestroyBufferNoWait(h);
+}
+
+void VulkanDevice::DestroyBufferNoWait(BufferHandle h) {
+    if (h.id == 0 || device_ == VK_NULL_HANDLE) return;
     std::lock_guard lock(resource_mutex_);
     auto it = buffers_.find(h.id);
     if (it == buffers_.end()) return;
-    vkDeviceWaitIdle(device_);
     DestroyBufferImpl(it->second);
     buffers_.erase(it);
 }
@@ -1654,6 +1679,7 @@ TextureHandle VulkanDevice::CreateTexture(const TextureDesc& d) {
         case TextureFormat::R32_UINT:    fmt = VK_FORMAT_R32_UINT;             break;
         case TextureFormat::R32F:        fmt = VK_FORMAT_R32_SFLOAT;           break;
         case TextureFormat::RG16F:       fmt = VK_FORMAT_R16G16_SFLOAT;        break;
+        case TextureFormat::RG32F:       fmt = VK_FORMAT_R32G32_SFLOAT;        break;
         default: break;
     }
 
@@ -2109,10 +2135,19 @@ bool VulkanDevice::ReadbackBuffer(BufferHandle h, void* dst, std::size_t bytes) 
 
 void VulkanDevice::DestroyTexture(TextureHandle h) {
     if (h.id == 0 || h.id == kSwapchainTextureId) return;
+    // One-shot caller path: wait idle so the GPU isn't still using the
+    // texture. Batch teardown should use DestroyTextureNoWait + a single
+    // upfront WaitIdle() instead (this method's wait amortises to one
+    // per destroy, which is fine in isolation but N× for batches).
+    if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
+    DestroyTextureNoWait(h);
+}
+
+void VulkanDevice::DestroyTextureNoWait(TextureHandle h) {
+    if (h.id == 0 || h.id == kSwapchainTextureId || device_ == VK_NULL_HANDLE) return;
     std::lock_guard lock(resource_mutex_);
     auto it = images_.find(h.id);
     if (it == images_.end()) return;
-    if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
     if (it->second.view)   vkDestroyImageView(device_, it->second.view, nullptr);
     if (it->second.image)  vkDestroyImage(device_, it->second.image, nullptr);
     if (it->second.memory) vkFreeMemory(device_, it->second.memory, nullptr);
@@ -2780,6 +2815,7 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
                       d.bloom_in, d.bloom_intensity,
                       d.reset_history,
                       atrous_enabled,
+                      d.atrous_passes,
                       d.hdr_pipeline);
 }
 

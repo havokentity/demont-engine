@@ -10,27 +10,42 @@
 // but stay user-stable. Today it aliases svgf_atrous with a
 // one-time log on transition.
 //
-// Pipeline shape, per Encode() call:
-//   1) DenoiseTemporal: reproject color_history_a + accumulate noisy
-//      input -> color_history_b. Adaptive alpha falls to 1.0 on
-//      reprojection failure (off-screen / depth+normal mismatch).
-//   2) DenoiseAtrous step=1: 5x5 edge-aware spatial filter over
-//      color_history_b -> atrous_pingpong_a.
-//   3) DenoiseAtrous step=2: atrous_pingpong_a -> atrous_pingpong_b.
-//   4) DenoiseAtrous step=4: atrous_pingpong_b -> output.
-// Frame parity flips which history texture is read vs written so the
-// next frame picks up this frame's pre-spatial-filter accumulation.
+// Pipeline shape, per Encode() call (atrous mode, N from
+// r_svgf_atrous_passes; clamped to 1..5):
+//   1) DenoiseTemporal: reproject color_history + moments_history
+//      + variance, accumulate noisy input. Adaptive alpha falls to 1.0
+//      on reprojection failure (off-screen / depth+normal mismatch),
+//      with a 7x7 spatial variance fallback for sample_count < 4.
+//      Writes color into v_atrous_a (intermediate) when N >= 1.
+//   2) DenoiseAtrous pass 1 (step=1): variance-gated 5x5 edge-aware
+//      spatial filter v_atrous_a -> v_hist_write (Schied feedback
+//      target: next frame's temporal reads this).
+//   ...) Passes 2..N-1 ping-pong between v_atrous_b / v_atrous_a with
+//      step sizes 2, 4, 8, 16 (footprint doubles per pass).
+//   N) Last pass writes directly into the caller's `output`. For N==1
+//      we vkCmdCopyImage v_hist_write -> output to publish.
+// Variance ping-pongs in lockstep with color through variance_a/b.
+// Frame parity flips which history side is read vs written so the next
+// frame picks up this frame's spatially-filtered accumulation.
+// Basic mode (atrous_enabled == false) skips the chain entirely:
+// temporal writes straight to v_hist_write, then copy -> output.
 //
-// Resource ownership: the denoiser owns eight scratch textures:
-// color history ping-pong (history_a/history_b, RGBA16F), depth history
-// ping-pong (depth_history_a/depth_history_b, R32F), normal history
-// ping-pong (normal_history_a/normal_history_b, RGBA16F), and a-trous
-// ping-pong (atrous_a/atrous_b, RGBA16F). The engine continues to own
-// the noisy color/depth/motion/normal G-buffers (PathTrace bindings
-// 6/7/8/16) plus final `output` (post_denoise_hdr).
+// Resource ownership: the denoiser owns 8 scratch textures + 4 storage
+// buffers. Textures: color history ping-pong (history_a/history_b,
+// RGBA16F), depth history ping-pong (depth_history_a/b, R32F), normal
+// history ping-pong (normal_history_a/b, RGBA16F), and a-trous
+// color ping-pong (atrous_a/b, RGBA16F). Buffers: moments_history_a/b
+// (RG32F mu1/mu2 luminance moments, cross-frame ping-pong) and
+// variance_a/b (R32F per-pixel luminance variance, intra-frame
+// ping-pong through the a-trous chain). The moments + variance went to
+// storage buffers (not RW textures) to clear Metal's 8-RW-texture
+// compute cap; the SPIR-V emission is unaffected. The engine continues
+// to own the noisy color/depth/motion/normal G-buffers (PathTrace
+// bindings 6/7/8/16) plus final `output` (post_denoise_hdr).
 //
 // Pipeline layout: dedicated, NOT the engine's unified 17-binding
-// layout. Eight bindings, all storage images, plus a 32-byte push
+// layout. 12 bindings -- 8 storage images at 0..7 + 4 storage buffers
+// at 8..11 (moments_in/out, variance_in/out) -- plus a 32-byte push
 // constant range. Each Encode dispatch picks a fresh descriptor set
 // from the ring so we don't conflict with prior in-flight dispatches.
 
@@ -70,9 +85,11 @@ public:
     //   false (svgf_basic) -- temporal pass only, then vkCmdCopyImage
     //                         the temporal result into `output`.
     //   true  (svgf_atrous /
-    //          nrd alias)  -- temporal pass + 3 a-trous wavelet passes
-    //                         at step sizes 1/2/4 with the last pass
-    //                         writing directly into `output`.
+    //          nrd alias)  -- temporal pass + N a-trous wavelet passes,
+    //                         where N comes from `atrous_passes` (1..5,
+    //                         clamped). Footprint doubles per pass:
+    //                         1 = 5x5, 2 = 9x9, 3 = 17x17, 4 = 33x33,
+    //                         5 = 65x65 (canonical SVGF).
     void Encode(VkCommandBuffer cb,
                 TextureHandle   color_in,
                 TextureHandle   depth_in,
@@ -85,6 +102,7 @@ public:
                 float           bloom_intensity,
                 bool            reset_history,
                 bool            atrous_enabled,
+                std::uint32_t   atrous_passes,  // 1..5
                 bool            hdr_pipeline);
 
     // True after Init() succeeded. Used by VulkanDevice::SupportsDenoise.
@@ -117,24 +135,30 @@ private:
     bool BuildLayout();
     bool BuildPipelines();
     bool BuildDescriptorPool();
+    // Public: WaitIdle()s once then frees all 12 scratch resources via
+    // the device's NoWait fast path. Use for standalone resize.
     void DestroyTextures();
+    // Same teardown as DestroyTextures but skips the WaitIdle -- caller
+    // promises a wait already happened upstream (DestroyAll's single
+    // batch wait covers DestroyTextures + dummy resources + pipelines
+    // + pool in one stall).
+    void DestroyTexturesAlreadyWaited();
 
     // Acquire the next descriptor set in the ring. Wraps when full.
     VkDescriptorSet NextSet();
 
-    // Bind a single dispatch's images into `set` and dispatch with
-    // `pipe` + `push`.
+    // Bind a single dispatch's resources into `set` and dispatch with
+    // `pipe` + `push`. Bindings 0..7 are storage images (engine-managed
+    // G-buffer + denoiser texture history); bindings 8..11 are storage
+    // buffers (moments + variance). See BuildLayout() for per-slot
+    // semantics.
+    static constexpr std::uint32_t kPassImages  = 8;
+    static constexpr std::uint32_t kPassBuffers = 4;
     void RecordPass(VkCommandBuffer cb,
                     VkPipeline      pipe,
                     VkDescriptorSet set,
-                    VkImageView     color_in,
-                    VkImageView     color_history_in,
-                    VkImageView     depth_curr,
-                    VkImageView     motion_in,
-                    VkImageView     normal_curr,
-                    VkImageView     color_out,
-                    VkImageView     depth_history_in,
-                    VkImageView     normal_history_in,
+                    const VkImageView (&views)[kPassImages],
+                    const VkBuffer    (&buffers)[kPassBuffers],
                     const void*     push,
                     std::size_t     push_size,
                     std::uint32_t   gx,
@@ -167,25 +191,35 @@ private:
     VkDescriptorSet       sets_[kSetRing] {};
     int                   next_set_     = 0;
 
-    // Owned scratch textures (RHI-managed, freed via DestroyTextures()).
-    std::uint64_t         history_a_id_ = 0;
-    std::uint64_t         history_b_id_ = 0;
-    std::uint64_t         depth_history_a_id_ = 0;
-    std::uint64_t         depth_history_b_id_ = 0;
-    std::uint64_t         normal_history_a_id_ = 0;
-    std::uint64_t         normal_history_b_id_ = 0;
-    std::uint64_t         atrous_a_id_  = 0;
-    std::uint64_t         atrous_b_id_  = 0;
-    // 1x1 placeholders for the temporal/atrous bindings the active
-    // shader doesn't read but the descriptor set still requires:
-    //   dummy_color_id_  -- RGBA16F, plugs slot 1 (color_history_in)
-    //                       on atrous passes.
-    //   dummy_motion_id_ -- RG16F,   plugs slot 3 (motion_in) on
-    //                       atrous passes (matches the shader's
-    //                       declared float2 storage image format).
+    // Owned scratch resources (RHI-managed, freed via DestroyTextures()).
+    // Cross-frame ping-pong: history_*, depth_history_*, normal_history_*
+    // (textures), moments_history_* (storage buffers; see BuildLayout()
+    // for why bindings 8..11 are buffers not images).
+    // Within-frame ping-pong: atrous_a/b color scratch (textures) +
+    // variance_a/b ping-pong (storage buffers).
+    std::uint64_t         history_a_id_         = 0;
+    std::uint64_t         history_b_id_         = 0;
+    std::uint64_t         depth_history_a_id_   = 0;
+    std::uint64_t         depth_history_b_id_   = 0;
+    std::uint64_t         normal_history_a_id_  = 0;
+    std::uint64_t         normal_history_b_id_  = 0;
+    std::uint64_t         moments_history_a_buf_ = 0;
+    std::uint64_t         moments_history_b_buf_ = 0;
+    std::uint64_t         atrous_a_id_          = 0;
+    std::uint64_t         atrous_b_id_          = 0;
+    std::uint64_t         variance_a_buf_       = 0;
+    std::uint64_t         variance_b_buf_       = 0;
+    // 1x1 image placeholders for the bindings the atrous shader
+    // declares but does not consume:
+    //   dummy_color_id_  -- RGBA16F, plugs atrous slot 1 (color_history)
+    //   dummy_motion_id_ -- RG16F,   plugs atrous slot 3 (motion)
     // Allocated once at Init(); live for the denoiser's lifetime.
     std::uint64_t         dummy_color_id_  = 0;
     std::uint64_t         dummy_motion_id_ = 0;
+    // Storage-buffer placeholder for temporal's slot-10 (variance_in
+    // unused). Sized to a single element; the shader never reads it but
+    // Vulkan still validates the descriptor write.
+    std::uint64_t         dummy_variance_buf_ = 0;
 
     std::uint32_t         cached_w_     = 0;
     std::uint32_t         cached_h_     = 0;

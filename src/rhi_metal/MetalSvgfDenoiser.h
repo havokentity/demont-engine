@@ -46,6 +46,7 @@ class Device;
 class CommandBuffer;
 class ComputePipelineState;
 class Texture;
+class Buffer;
 }
 
 namespace pt::rhi::mtl {
@@ -74,8 +75,15 @@ public:
     //   output -- engine-owned linear-HDR target the tonemap chain
     //     reads next (= post_denoise_hdr).
     //   reset_history -- true clears the temporal accumulation.
-    //   atrous_enabled -- true runs the 3-pass spatial filter, false
-    //     blits history_write -> output (svgf_basic).
+    //   atrous_enabled -- true runs the spatial filter, false blits
+    //     history_write -> output (svgf_basic).
+    //   atrous_passes -- number of A-Trous wavelet passes when
+    //     atrous_enabled (1..5, clamped here). The A-Trous structure
+    //     keeps the same 5x5 binomial kernel but doubles its tap
+    //     stride per pass (1, 2, 4, 8, 16). Effective footprint:
+    //     1 = 5x5 (default), 2 = 9x9, 3 = 17x17, 4 = 33x33,
+    //     5 = 65x65 (canonical SVGF / Schied 2017). Ignored when
+    //     atrous_enabled is false.
     void Encode(MTL::CommandBuffer* cb,
                 MTL::Texture*       color_in,
                 MTL::Texture*       depth_in,
@@ -83,7 +91,8 @@ public:
                 MTL::Texture*       normal_in,
                 MTL::Texture*       output,
                 bool                reset_history,
-                bool                atrous_enabled);
+                bool                atrous_enabled,
+                std::uint32_t       atrous_passes);
 
     bool Ready() const { return ready_; }
 
@@ -96,19 +105,34 @@ private:
     MTL::ComputePipelineState*  temporal_pso_ = nullptr;
     MTL::ComputePipelineState*  atrous_pso_   = nullptr;
 
-    // Scratch textures (owned). All RGBA16F except depth_history_*
-    // (R32F) and the two 1x1 placeholders for the atrous shader's
-    // declared-but-unread slots 1 (RGBA16F) and 3 (RG16F).
-    MTL::Texture* history_a_       = nullptr;
-    MTL::Texture* history_b_       = nullptr;
-    MTL::Texture* depth_history_a_ = nullptr;
-    MTL::Texture* depth_history_b_ = nullptr;
-    MTL::Texture* normal_history_a_ = nullptr;
-    MTL::Texture* normal_history_b_ = nullptr;
-    MTL::Texture* atrous_a_        = nullptr;
-    MTL::Texture* atrous_b_        = nullptr;
-    MTL::Texture* dummy_color_     = nullptr;  // 1x1 RGBA16F (atrous slot 1)
-    MTL::Texture* dummy_motion_    = nullptr;  // 1x1 RG16F   (atrous slot 3)
+    // Scratch resources (owned). Cross-frame ping-pong:
+    //   history_*         RGBA16F texture (rgb = first-A-Trous output, a = sample count)
+    //   depth_history_*   R32F texture
+    //   normal_history_*  RGBA16F texture
+    //   moments_history_* RG32F-packed *buffer* (w*h * float2 elements;
+    //                     storage buffers don't count against Metal's
+    //                     8-RW-texture compute limit)
+    // Within-frame ping-pong:
+    //   atrous_a/atrous_b RGBA16F color scratch
+    //   variance_a/b      R32F *buffer* (temporal seeds one, A-Trous
+    //                     filters through both)
+    // Plus 1x1 placeholder textures for slots the active pass declares
+    // but does not consume (atrous: slot 1 RGBA16F, slot 3 RG16F).
+    MTL::Texture* history_a_           = nullptr;
+    MTL::Texture* history_b_           = nullptr;
+    MTL::Texture* depth_history_a_     = nullptr;
+    MTL::Texture* depth_history_b_     = nullptr;
+    MTL::Texture* normal_history_a_    = nullptr;
+    MTL::Texture* normal_history_b_    = nullptr;
+    MTL::Buffer*  moments_history_a_   = nullptr;
+    MTL::Buffer*  moments_history_b_   = nullptr;
+    MTL::Texture* atrous_a_            = nullptr;
+    MTL::Texture* atrous_b_            = nullptr;
+    MTL::Buffer*  variance_a_          = nullptr;
+    MTL::Buffer*  variance_b_          = nullptr;
+    MTL::Buffer*  dummy_variance_buf_  = nullptr;  // for temporal's unused variance_in slot
+    MTL::Texture* dummy_color_         = nullptr;  // 1x1 RGBA16F
+    MTL::Texture* dummy_motion_        = nullptr;  // 1x1 RG16F
 
     std::uint32_t cached_w_       = 0;
     std::uint32_t cached_h_       = 0;
