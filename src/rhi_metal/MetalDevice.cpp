@@ -465,13 +465,15 @@ void MetalDevice::Denoise(const DenoiseDesc& d) {
                 cmd_->FlushEncoder();
                 auto* cb = cmd_->RawCmdBuf();
                 auto* blit = static_cast<MTL::CommandBuffer*>(cb)->blitCommandEncoder();
-                MTL::Origin org = MTL::Origin::Make(0, 0, 0);
-                MTL::Size   sz  = MTL::Size::Make(w, h, 1);
-                blit->copyFromTexture(static_cast<MTL::Texture*>(svgf_metalfx_intermediate_),
-                                      0, 0, org, sz,
-                                      static_cast<MTL::Texture*>(color_out),
-                                      0, 0, org);
-                blit->endEncoding();
+                if (blit) {
+                    MTL::Origin org = MTL::Origin::Make(0, 0, 0);
+                    MTL::Size   sz  = MTL::Size::Make(w, h, 1);
+                    blit->copyFromTexture(static_cast<MTL::Texture*>(svgf_metalfx_intermediate_),
+                                          0, 0, org, sz,
+                                          static_cast<MTL::Texture*>(color_out),
+                                          0, 0, org);
+                    blit->endEncoding();
+                }
                 return;
             }
             metalfx_width_  = w;
