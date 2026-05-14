@@ -167,6 +167,16 @@ namespace cvar {
             "Default points at the bundled CC0 sunset HDRI; resolves relative to CWD.",
             CVAR_ARCHIVE);
     PT_CVAR(r_env_intensity,   "1.0","Scalar multiplier on env-map samples. Useful for darkening/brightening the IBL without re-authoring the HDRI.", CVAR_ARCHIVE);
+    PT_CVAR(r_mis,             "1",
+            "Multiple importance sampling for direct lighting on Lambert "
+            "hits under HDRI. 1 = balance-heuristic MIS between env-map "
+            "NEE and BRDF-sampled bounces (lower variance on rough "
+            "Lambert under HDRIs with concentrated bright regions; the "
+            "BRDF-sampled bounce hitting the sun is recovered cleanly). "
+            "0 = legacy NEE-only path (BRDF-bounce sky-miss is skipped "
+            "to avoid double-counting). Specular bounces (metal / "
+            "dielectric) are delta-BRDF and unaffected either way.",
+            CVAR_ARCHIVE);
     PT_CVAR(r_hdri_extract_percentile, "0.005",
             "Top-luminance percentile threshold (0..0.5) for HDRI light "
             "cluster extraction. Pixels above this percentile are flood-"
@@ -2092,7 +2102,12 @@ void Engine::RenderFrame() {
         // "produce an HDR aux for post-process" signal. Lives in the
         // 4-byte slot that used to be _hdri_pad[0]; layout-equivalent.
         std::uint32_t write_hdr_aux;
-        std::uint32_t _hdri_pad[1];   // 16-byte align next field / Slang struct end
+        // r_mis: 1 -> apply balance-heuristic MIS weights to env-map
+        // NEE and BRDF-bounce miss contributions on Lambert hits.
+        // 0 -> classic NEE-only path (skip_sky_on_miss after NEE).
+        // Reuses the slot that used to be `_hdri_pad[1]`; same total
+        // struct size, same static_assert sum below.
+        std::uint32_t mis_enabled;
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -2136,6 +2151,11 @@ void Engine::RenderFrame() {
         push.env_intensity = intensity;
     }
     push.env_total_luminance = env_total_luminance_;
+    {
+        int mis = 1;
+        if (auto* v = C.FindCVar("r_mis")) mis = v->GetInt();
+        push.mis_enabled = (mis != 0) ? 1u : 0u;
+    }
 
     // Halton(2,3) sub-pixel jitter sequence in [-0.5, 0.5] each axis.
     // 16-sample period before repeating; ample for the denoiser's

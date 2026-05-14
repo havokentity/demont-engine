@@ -252,7 +252,13 @@ cbuffer Push {
     // meaningful when a real denoiser consumes them). Reuses what used
     // to be `_hdri_pad1` -- same wire offset, same Slang struct end.
     uint   write_hdr_aux;
-    uint   _hdri_pad1;
+    // 1 -> apply balance-heuristic MIS weights to env-map NEE and
+    // BRDF-bounce miss contributions on Lambert hits. 0 -> classic
+    // NEE-only (existing `skip_sky_on_miss` path). Specular bounces
+    // (metal / dielectric) are delta-BRDF and unaffected -- they keep
+    // their existing "no NEE, sky-miss is real" behaviour either way.
+    // Reuses what was `_hdri_pad1`; layout-equivalent.
+    uint   mis_enabled;
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -286,7 +292,9 @@ cbuffer Frame {
     uint   write_normal_gbuffer;
     // See `write_hdr_aux` in the Metal Push cbuffer above.
     uint   write_hdr_aux;
-    uint   _hdri_pad1;
+    // See `mis_enabled` in the Metal Push cbuffer above. Reuses
+    // `_hdri_pad1`; layout-equivalent across both targets.
+    uint   mis_enabled;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -894,6 +902,41 @@ EnvSample sampleEnvMap(float2 xi) {
     return s;
 }
 
+// Evaluate the env-map importance-sampling PDF (solid-angle) for an
+// arbitrary world-space direction. Mirrors sampleEnvMap's PDF formula
+// for the texel the direction projects to. Used as the "other" sampler
+// PDF in the balance heuristic when MIS-weighting BRDF-sampled bounces
+// that hit the sky. Returns 0 when the env map isn't bound, the total
+// luminance integral is degenerate, or the direction lands at a pole
+// (sin theta -> 0 -> infinite Jacobian; the env-map estimator can't
+// generate such a sample, so its PDF is 0).
+float pdfEnvMapDir(float3 dir) {
+    if (env_map_present == 0u || env_total_luminance <= 0.0) return 0.0;
+    float cos_theta = clamp(dir.y, -1.0, 1.0);
+    float theta     = acos(cos_theta);
+    float sin_theta = sin(theta);
+    if (sin_theta < 1e-6) return 0.0;
+    float phi = atan2(dir.z, dir.x);
+    uint W, H;
+    env_map.GetDimensions(W, H);
+    float u = (phi + 3.14159265358979) * (1.0 / 6.28318530717958);
+    float v = theta * (1.0 / 3.14159265358979);
+    uint u_idx = min(uint(u * float(W)), W - 1u);
+    uint v_idx = min(uint(v * float(H)), H - 1u);
+    float3 raw = env_map[uint2(u_idx, v_idx)].rgb;
+    float lum  = 0.2126 * raw.r + 0.7152 * raw.g + 0.0722 * raw.b;
+    return (lum * float(W * H)) /
+           (2.0 * 3.14159265358979 * 3.14159265358979 * env_total_luminance);
+}
+
+// Balance heuristic between two single-sample strategies. Returns the
+// MIS weight to apply to a contribution drawn from `pdf_self` given the
+// other strategy would sample the same direction with `pdf_other`.
+// Sums to 1 across the two strategies, so unbiased combined estimator.
+float misBalance(float pdf_self, float pdf_other) {
+    return pdf_self / max(pdf_self + pdf_other, 1e-12);
+}
+
 // ---------- HDRI extracted-light stochastic NEE -------------------------
 // Single-pick over the up-to-8 directional lights extracted from the
 // HDRI at load. Selection is luminance-weighted via the pmf stored in
@@ -1240,8 +1283,14 @@ void main(uint2 tid : SV_DispatchThreadID) {
         float3 radiance   = float3(0.0);
         // After a Lambert bounce we did NEE for direct env-map lighting,
         // so the next BRDF-bounce ray's miss contribution is already
-        // counted -- skip on miss to avoid double counting.
-        bool   skip_sky_on_miss = false;
+        // counted -- skip on miss to avoid double counting. With MIS
+        // (mis_enabled != 0 && env_map present) we instead KEEP the
+        // sky-miss contribution and weight both NEE and BRDF samples
+        // by the balance heuristic; tracked by `prev_was_lambert_nee`
+        // + `prev_lambert_brdf_pdf` below.
+        bool   skip_sky_on_miss   = false;
+        bool   prev_was_lambert_nee = false;   // previous bounce was Lambert with env-map NEE
+        float  prev_lambert_brdf_pdf = 0.0;    // cosine-hemisphere PDF of the bounce dir sampled there
 
         // Save primary-ray params for the volumetric march (single
         // scatter along the camera ray, evaluated after the bounce
@@ -1270,7 +1319,18 @@ void main(uint2 tid : SV_DispatchThreadID) {
             primary_t_recorded = true;
         }
         if (!h.hit) {
-            if (!skip_sky_on_miss) {
+            if (mis_enabled != 0u && prev_was_lambert_nee) {
+                // MIS path: previous bounce was a Lambert hit that did
+                // env-map NEE. The NEE side already contributed its
+                // weighted estimator; here we add the BRDF-sampled
+                // miss contribution, weighted by the balance heuristic.
+                // pdf_other = pdf the env-map sampler would have picked
+                // this same direction; pdf_self = cosine-hemisphere PDF
+                // recorded at the Lambert bounce site.
+                float pdf_env = pdfEnvMapDir(rd);
+                float w_brdf  = misBalance(prev_lambert_brdf_pdf, pdf_env);
+                radiance += clampIndirect(throughput * skyColor(rd) * w_brdf);
+            } else if (!skip_sky_on_miss) {
                 // b == 0 is the camera ray hitting the sky directly --
                 // unbounded so the HDRI sun renders at full intensity.
                 // b > 0 is a bounce ray escaping; clamp those to kill
@@ -1290,7 +1350,14 @@ void main(uint2 tid : SV_DispatchThreadID) {
 
         if (h.mat == MAT_LAMBERT) {
             if (env_map_present != 0u) {
-                // NEE: importance-sampled env-map direct light.
+                // NEE: importance-sampled env-map direct light. With
+                // MIS, this contribution is weighted by the balance
+                // heuristic vs. the cosine-hemisphere (BRDF) sampler,
+                // and the BRDF-sampled bounce's sky-miss contribution
+                // is kept (weighted) instead of being skipped. The
+                // two strategies together give a lower-variance
+                // estimate than NEE alone on Lambert surfaces under
+                // HDRIs with concentrated bright regions.
                 float2 xi = float2(randf(seed), randf(seed));
                 EnvSample env = sampleEnvMap(xi);
                 float n_dot_l = dot(nf, env.dir);
@@ -1302,7 +1369,11 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     float3 trans = transmittance(hit_pt + nf * 1e-3, env.dir, 1e30);
                     if (any(trans > float3(0.0))) {
                         float3 brdf = h.albedo / 3.14159265358979;
-                        radiance += clampIndirect(throughput * env.color * trans * brdf * n_dot_l / env.pdf);
+                        float pdf_brdf_at_env = n_dot_l * (1.0 / 3.14159265358979);
+                        float w_light = (mis_enabled != 0u)
+                            ? misBalance(env.pdf, pdf_brdf_at_env)
+                            : 1.0;
+                        radiance += clampIndirect(throughput * env.color * trans * brdf * n_dot_l * w_light / env.pdf);
                     }
                 }
                 // HDRI extracted-lights NEE: env-map NEE samples the
@@ -1364,7 +1435,10 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                    + nf * sqrt(max(0.0, 1.0 - xi_a));
                     radiance += clampIndirect(throughput * h.albedo * skyColor(amb_dir));
                 }
-                skip_sky_on_miss = true;
+                // With MIS we KEEP the bounce-ray sky-miss contribution
+                // and balance-heuristic-weight both sides. Without MIS
+                // we suppress the miss to avoid double-counting NEE.
+                skip_sky_on_miss = (mis_enabled == 0u);
             } else {
                 // Procedural sun NEE + skylight ambient. Drives the
                 // procedural / gradient sky modes -- the scene's
@@ -1455,6 +1529,17 @@ void main(uint2 tid : SV_DispatchThreadID) {
             throughput *= h.albedo;
             ro = hit_pt + nf * 1e-3;
             rd = sampleCosineHemisphere(nf, seed);
+            // For MIS: record the cosine-hemisphere PDF of the bounce
+            // direction we just sampled, so the next iteration's
+            // sky-miss branch can balance-heuristic-weight it against
+            // the env-map PDF that would have produced the same dir.
+            // Only meaningful when the env map was the NEE source.
+            if (mis_enabled != 0u && env_map_present != 0u) {
+                prev_lambert_brdf_pdf = max(0.0, dot(nf, rd)) * (1.0 / 3.14159265358979);
+                prev_was_lambert_nee  = true;
+            } else {
+                prev_was_lambert_nee  = false;
+            }
         }
         else if (h.mat == MAT_METAL) {
             float3 r = reflect(rd, nf);
@@ -1463,6 +1548,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
             ro = hit_pt + nf * 1e-3;
             rd = r;
             skip_sky_on_miss = false;   // metal didn't NEE; sky on miss is real
+            prev_was_lambert_nee = false;   // specular bounce: MIS doesn't apply here
         }
         else {  // dielectric
             float ior_a = (ndi < 0.0) ? 1.0   : h.ior;
@@ -1483,6 +1569,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 ro = hit_pt - nf * 1e-3;
             }
             skip_sky_on_miss = false;   // dielectric didn't NEE either
+            prev_was_lambert_nee = false;   // specular/refraction: MIS doesn't apply
         }
 
             if (b >= 2u) {
