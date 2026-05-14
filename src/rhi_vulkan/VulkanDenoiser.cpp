@@ -624,13 +624,15 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
     const bool effective_reset = reset_history || needs_history_clear_;
     needs_history_clear_ = false;
 
-    // Temporal always writes to v_hist_write -- that's what feeds next
-    // frame's reprojection. In atrous mode we then run ONE A-Trous pass
-    // (step=1) reading v_hist_write and writing to v_output; the
-    // feedback loop is intentionally disabled. With a single pass,
-    // feeding the filtered result back compounds smoothing across
-    // frames -- which was the "soft cast" we saw at 3 passes.
-    const VkImageView v_temporal_color_out = v_hist_write;
+    // In SVGF-atrous mode the temporal output is intermediate scratch
+    // (consumed by the single A-Trous pass) and v_hist_write receives
+    // the filtered result -- Schied 2017's feedback loop. With variance
+    // gating + tight sigma_color, converged regions are barely touched
+    // by the filter so feedback is ~no-op there; disoccluded regions
+    // benefit because next frame's temporal blend starts from a
+    // spatially-denoised estimate, accelerating convergence. SVGF-basic
+    // skips the chain so temporal writes straight to v_hist_write.
+    const VkImageView v_temporal_color_out = atrous_enabled ? v_atrous_a : v_hist_write;
 
     // ---- Pass 1: temporal accumulate -----------------------------------
     DenoisePush p1{};
@@ -740,10 +742,40 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                        &p, sizeof(p), gx, gy);
             ComputeChainBarrier(cb);
         };
-        // Single step=1 pass: v_hist_write (temporal output) -> v_output.
-        // b_variance_b is written but discarded (no subsequent pass);
-        // the buffer stays allocated for future multi-pass support.
-        atrous_pass(v_hist_write, v_output, b_variance_a, b_variance_b, 1u);
+        // Single step=1 pass: temporal scratch (v_atrous_a) ->
+        // v_hist_write. hist_write doubles as next frame's reprojection
+        // source (Schied feedback) AND the source for the final
+        // vkCmdCopyImage to v_output below.
+        atrous_pass(v_atrous_a, v_hist_write, b_variance_a, b_variance_b, 1u);
+
+        // Publish filtered result to v_output. Both images are RGBA16F
+        // at (cached_w_, cached_h_) and stay in GENERAL layout, so a
+        // memory-barrier-only handoff plus one vkCmdCopyImage is enough.
+        VkImage src_img = device_->LookupImage(TextureHandle{
+            parity_is_a ? history_b_id_ : history_a_id_ });
+        VkImage dst_img = device_->LookupImage(output);
+        if (src_img != VK_NULL_HANDLE && dst_img != VK_NULL_HANDLE) {
+            StageBarrier(cb,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+            VkImageCopy region{};
+            region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.srcSubresource.layerCount = 1;
+            region.dstSubresource            = region.srcSubresource;
+            region.extent.width  = cached_w_;
+            region.extent.height = cached_h_;
+            region.extent.depth  = 1;
+            vkCmdCopyImage(cb,
+                           src_img, VK_IMAGE_LAYOUT_GENERAL,
+                           dst_img, VK_IMAGE_LAYOUT_GENERAL,
+                           1, &region);
+            StageBarrier(cb,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,        VK_ACCESS_TRANSFER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,  VK_ACCESS_SHADER_READ_BIT);
+        } else {
+            LOG_WARN("VulkanNrdDenoiser::Encode: atrous publish blit lookup miss");
+        }
     } else {
         // ---- svgf_basic: temporal-only -> copy history into output ----
         // Skip the spatial filter entirely. The temporal pass already

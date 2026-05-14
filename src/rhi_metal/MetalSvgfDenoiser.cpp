@@ -271,14 +271,16 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
     MTL::Size groups  = MTL::Size::Make((w + 7) / 8, (h + 7) / 8, 1);
     MTL::Size tgsize  = MTL::Size::Make(8, 8, 1);
 
-    // Temporal always writes to hist_write -- that's what feeds next
-    // frame's reprojection. In atrous mode we then run ONE A-Trous pass
-    // (step=1) reading hist_write and writing to the caller's output;
-    // hist_write itself is NOT modified by the spatial filter, so
-    // Schied's feedback loop is intentionally disabled. With a single
-    // pass, feeding the filtered result back compounds smoothing across
-    // frames -- which is exactly the "soft cast" we saw at 3 passes.
-    MTL::Texture* temporal_color_out = hist_write;
+    // In SVGF-atrous mode the temporal output is intermediate scratch
+    // (consumed by the single A-Trous pass) and hist_write receives the
+    // filtered result -- Schied 2017's feedback loop. With variance
+    // gating + tight sigma_color, converged regions are barely touched
+    // by the filter so feedback is ~no-op there; disoccluded regions
+    // benefit because next frame's temporal blend starts from a
+    // spatially-denoised estimate, accelerating convergence. In
+    // SVGF-basic the chain is skipped so temporal writes straight into
+    // hist_write.
+    MTL::Texture* temporal_color_out = atrous_enabled ? atrous_a_ : hist_write;
 
     // ---- Pass 1: temporal accumulate -------------------------------
     {
@@ -410,12 +412,23 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
             enc->memoryBarrier(MTL::BarrierScope(MTL::BarrierScopeTextures |
                                                 MTL::BarrierScopeBuffers));
         };
-        // Single pass: hist_write (= temporal output) -> caller's output.
-        // variance_b is written but immediately discarded since there's
-        // no subsequent pass to read it; the buffer stays allocated for
-        // future multi-pass support.
-        atrous_pass(hist_write, output, variance_a_, variance_b_, 1u);
+        // Single pass: temporal scratch (atrous_a_) -> hist_write.
+        // hist_write doubles as the Schied feedback target (next frame's
+        // reprojection source) AND the source for the final blit to the
+        // caller's output below.
+        atrous_pass(atrous_a_, hist_write, variance_a_, variance_b_, 1u);
         enc->endEncoding();
+
+        // Publish the filtered result to the caller's output. Same
+        // RGBA16F format / dims, both still in MTLStorageModePrivate.
+        // Cheaper than running pass 1 twice (once for feedback, once
+        // for display).
+        MTL::BlitCommandEncoder* blit2 = cb->blitCommandEncoder();
+        MTL::Origin org = MTL::Origin::Make(0, 0, 0);
+        MTL::Size   sz  = MTL::Size::Make(w, h, 1);
+        blit2->copyFromTexture(hist_write, 0, 0, org, sz,
+                               output,     0, 0, org);
+        blit2->endEncoding();
     }
 
     frame_parity_ ^= 1u;
