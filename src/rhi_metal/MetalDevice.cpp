@@ -396,7 +396,8 @@ void MetalDevice::Denoise(const DenoiseDesc& d) {
         svgf_denoiser_->Encode(cmd_->RawCmdBuf(),
                                 color_in, depth_in, motion_in, normal_in,
                                 color_out,
-                                d.reset_history, atrous_enabled);
+                                d.reset_history, atrous_enabled,
+                                d.atrous_passes);
         return;
     }
 

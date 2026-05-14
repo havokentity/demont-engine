@@ -550,6 +550,7 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                                float           bloom_intensity,
                                bool            reset_history,
                                bool            atrous_enabled,
+                               std::uint32_t   atrous_passes,
                                bool            hdr_pipeline) {
     if (!ready_) return;
     if (cb == VK_NULL_HANDLE) return;
@@ -699,12 +700,19 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
 
     if (atrous_enabled) {
-        // ---- Pass 2: single step=1 A-Trous filter ----------------------
-        // Reads v_hist_write (= temporal output) and writes directly
-        // to the caller's output. Effective 5x5 neighbourhood. The
-        // previous 3-pass chain at steps 1/2/4 was visibly over-smooth;
-        // dropping to one pass keeps noise rejection without the 17x17
-        // blur footprint.
+        // ---- A-Trous chain ---------------------------------------------
+        // Caller picks pass count (1..3) via r_svgf_atrous_passes:
+        //   1 = step=1 only         (5x5 effective)
+        //   2 = step=1, step=2      (9x9 effective)
+        //   3 = step=1, step=2, 4   (17x17, canonical SVGF)
+        // Pass 1 always writes to v_hist_write so it doubles as next
+        // frame's reprojection source (Schied feedback). For n_passes
+        // == 1 we vkCmdCopyImage hist_write -> output below; for
+        // multi-pass the LAST pass writes directly into v_output.
+        std::uint32_t n_passes = atrous_passes;
+        if (n_passes < 1u) n_passes = 1u;
+        if (n_passes > 3u) n_passes = 3u;
+
         auto atrous_pass = [&](VkImageView color_src, VkImageView color_dst,
                                VkBuffer var_src, VkBuffer var_dst,
                                std::uint32_t step) {
@@ -742,39 +750,59 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                        &p, sizeof(p), gx, gy);
             ComputeChainBarrier(cb);
         };
-        // Single step=1 pass: temporal scratch (v_atrous_a) ->
-        // v_hist_write. hist_write doubles as next frame's reprojection
-        // source (Schied feedback) AND the source for the final
-        // vkCmdCopyImage to v_output below.
+        // Pass 1 always: temporal scratch (v_atrous_a) -> v_hist_write.
+        // For n_passes == 1 this is the only pass and v_hist_write
+        // feeds both the next-frame history (Schied) AND the user
+        // output via a vkCmdCopyImage below. For n_passes >= 2
+        // hist_write is just the history target; the final pass
+        // writes the user output directly.
         atrous_pass(v_atrous_a, v_hist_write, b_variance_a, b_variance_b, 1u);
 
-        // Publish filtered result to v_output. Both images are RGBA16F
-        // at (cached_w_, cached_h_) and stay in GENERAL layout, so a
-        // memory-barrier-only handoff plus one vkCmdCopyImage is enough.
-        VkImage src_img = device_->LookupImage(TextureHandle{
-            parity_is_a ? history_b_id_ : history_a_id_ });
-        VkImage dst_img = device_->LookupImage(output);
-        if (src_img != VK_NULL_HANDLE && dst_img != VK_NULL_HANDLE) {
-            StageBarrier(cb,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-            VkImageCopy region{};
-            region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            region.srcSubresource.layerCount = 1;
-            region.dstSubresource            = region.srcSubresource;
-            region.extent.width  = cached_w_;
-            region.extent.height = cached_h_;
-            region.extent.depth  = 1;
-            vkCmdCopyImage(cb,
-                           src_img, VK_IMAGE_LAYOUT_GENERAL,
-                           dst_img, VK_IMAGE_LAYOUT_GENERAL,
-                           1, &region);
-            StageBarrier(cb,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT,        VK_ACCESS_TRANSFER_WRITE_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,  VK_ACCESS_SHADER_READ_BIT);
-        } else {
-            LOG_WARN("VulkanNrdDenoiser::Encode: atrous publish blit lookup miss");
+        if (n_passes >= 2u) {
+            // Step=2. Last pass when n_passes == 2; otherwise feeds
+            // into pass 3 via v_atrous_b.
+            VkImageView p2_dst = (n_passes == 2u) ? v_output : v_atrous_b;
+            atrous_pass(v_hist_write, p2_dst,
+                        b_variance_b, b_variance_a, 2u);
+        }
+        if (n_passes >= 3u) {
+            // Step=4. Always the last pass when present -> writes
+            // straight to v_output.
+            atrous_pass(v_atrous_b, v_output,
+                        b_variance_a, b_variance_b, 4u);
+        }
+
+        if (n_passes == 1u) {
+            // One-pass path: pass 1's output sits in v_hist_write (the
+            // feedback target). Publish a copy to v_output. Both
+            // images are RGBA16F at (cached_w_, cached_h_) and stay in
+            // GENERAL layout, so a memory-barrier-only handoff plus
+            // one vkCmdCopyImage is enough.
+            VkImage src_img = device_->LookupImage(TextureHandle{
+                parity_is_a ? history_b_id_ : history_a_id_ });
+            VkImage dst_img = device_->LookupImage(output);
+            if (src_img != VK_NULL_HANDLE && dst_img != VK_NULL_HANDLE) {
+                StageBarrier(cb,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+                VkImageCopy region{};
+                region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                region.srcSubresource.layerCount = 1;
+                region.dstSubresource            = region.srcSubresource;
+                region.extent.width  = cached_w_;
+                region.extent.height = cached_h_;
+                region.extent.depth  = 1;
+                vkCmdCopyImage(cb,
+                               src_img, VK_IMAGE_LAYOUT_GENERAL,
+                               dst_img, VK_IMAGE_LAYOUT_GENERAL,
+                               1, &region);
+                StageBarrier(cb,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,        VK_ACCESS_TRANSFER_WRITE_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,  VK_ACCESS_SHADER_READ_BIT);
+            } else {
+                LOG_WARN("VulkanNrdDenoiser::Encode: atrous publish blit lookup miss");
+            }
         }
     } else {
         // ---- svgf_basic: temporal-only -> copy history into output ----

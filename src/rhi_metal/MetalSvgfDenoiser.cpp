@@ -238,7 +238,8 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
                                 MTL::Texture*       normal_in,
                                 MTL::Texture*       output,
                                 bool                reset_history,
-                                bool                atrous_enabled) {
+                                bool                atrous_enabled,
+                                std::uint32_t       atrous_passes) {
     if (!ready_ || cb == nullptr) return;
     if (color_in == nullptr || depth_in == nullptr || motion_in == nullptr ||
         normal_in == nullptr || output == nullptr) {
@@ -352,12 +353,20 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
         blit->endEncoding();
     }
 
-    // ---- Pass 2: single A-Trous filter (atrous_enabled only) -------
-    // Just one step=1 pass (effective 5x5 neighbourhood). The previous
-    // 3-pass chain at steps 1/2/4 produced an over-smooth read on
-    // diffuse content; this matches "svgf_basic plus a touch of
-    // spatial denoise."
+    // ---- A-Trous chain (atrous_enabled only) -----------------------
+    // The caller picks pass count (1..3) via r_svgf_atrous_passes:
+    //   1 = step=1 only         (5x5 effective)
+    //   2 = step=1, step=2      (9x9 effective)
+    //   3 = step=1, step=2, 4   (17x17, canonical SVGF)
+    // Pass 1 always writes to hist_write so it doubles as next frame's
+    // reprojection source (Schied's feedback). When the chain has only
+    // one pass we blit hist_write -> output below; for multi-pass the
+    // LAST pass writes directly to output.
     if (atrous_enabled) {
+        std::uint32_t n_passes = atrous_passes;
+        if (n_passes < 1u) n_passes = 1u;
+        if (n_passes > 3u) n_passes = 3u;
+
         MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
         enc->setComputePipelineState(atrous_pso_);
 
@@ -412,23 +421,39 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
             enc->memoryBarrier(MTL::BarrierScope(MTL::BarrierScopeTextures |
                                                 MTL::BarrierScopeBuffers));
         };
-        // Single pass: temporal scratch (atrous_a_) -> hist_write.
-        // hist_write doubles as the Schied feedback target (next frame's
-        // reprojection source) AND the source for the final blit to the
-        // caller's output below.
+        // Pass 1 always: temporal scratch (atrous_a_) -> hist_write.
+        // For n_passes == 1 this is the only pass and hist_write feeds
+        // both the next-frame history (Schied) AND the user output via
+        // a blit below. For n_passes >= 2 hist_write is just the
+        // history target; the final pass writes the user output.
         atrous_pass(atrous_a_, hist_write, variance_a_, variance_b_, 1u);
+
+        if (n_passes >= 2u) {
+            // Step=2. Last pass when n_passes == 2; otherwise feeds
+            // into pass 3 via atrous_b_.
+            MTL::Texture* p2_dst = (n_passes == 2u) ? output : atrous_b_;
+            atrous_pass(hist_write, p2_dst,
+                        variance_b_, variance_a_, 2u);
+        }
+        if (n_passes >= 3u) {
+            // Step=4. Always the last pass when present -> writes
+            // straight to the user output.
+            atrous_pass(atrous_b_, output,
+                        variance_a_, variance_b_, 4u);
+        }
         enc->endEncoding();
 
-        // Publish the filtered result to the caller's output. Same
-        // RGBA16F format / dims, both still in MTLStorageModePrivate.
-        // Cheaper than running pass 1 twice (once for feedback, once
-        // for display).
-        MTL::BlitCommandEncoder* blit2 = cb->blitCommandEncoder();
-        MTL::Origin org = MTL::Origin::Make(0, 0, 0);
-        MTL::Size   sz  = MTL::Size::Make(w, h, 1);
-        blit2->copyFromTexture(hist_write, 0, 0, org, sz,
-                               output,     0, 0, org);
-        blit2->endEncoding();
+        if (n_passes == 1u) {
+            // One-pass path: pass 1's output sits in hist_write (the
+            // feedback target). Publish a copy to the caller's output.
+            // Same RGBA16F format / dims, both in MTLStorageModePrivate.
+            MTL::BlitCommandEncoder* blit2 = cb->blitCommandEncoder();
+            MTL::Origin org = MTL::Origin::Make(0, 0, 0);
+            MTL::Size   sz  = MTL::Size::Make(w, h, 1);
+            blit2->copyFromTexture(hist_write, 0, 0, org, sz,
+                                   output,     0, 0, org);
+            blit2->endEncoding();
+        }
     }
 
     frame_parity_ ^= 1u;

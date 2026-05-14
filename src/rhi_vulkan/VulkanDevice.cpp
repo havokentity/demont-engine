@@ -2781,6 +2781,7 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
                       d.bloom_in, d.bloom_intensity,
                       d.reset_history,
                       atrous_enabled,
+                      d.atrous_passes,
                       d.hdr_pipeline);
 }
 

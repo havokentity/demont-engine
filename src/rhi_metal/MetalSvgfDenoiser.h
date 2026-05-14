@@ -75,8 +75,12 @@ public:
     //   output -- engine-owned linear-HDR target the tonemap chain
     //     reads next (= post_denoise_hdr).
     //   reset_history -- true clears the temporal accumulation.
-    //   atrous_enabled -- true runs the 3-pass spatial filter, false
-    //     blits history_write -> output (svgf_basic).
+    //   atrous_enabled -- true runs the spatial filter, false blits
+    //     history_write -> output (svgf_basic).
+    //   atrous_passes -- number of A-Trous wavelet passes when
+    //     atrous_enabled (1..3, clamped here). 1 = 5x5 effective
+    //     footprint (default); 2 = 9x9; 3 = 17x17 canonical SVGF.
+    //     Ignored when atrous_enabled is false.
     void Encode(MTL::CommandBuffer* cb,
                 MTL::Texture*       color_in,
                 MTL::Texture*       depth_in,
@@ -84,7 +88,8 @@ public:
                 MTL::Texture*       normal_in,
                 MTL::Texture*       output,
                 bool                reset_history,
-                bool                atrous_enabled);
+                bool                atrous_enabled,
+                std::uint32_t       atrous_passes);
 
     bool Ready() const { return ready_; }
 

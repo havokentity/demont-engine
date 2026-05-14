@@ -141,6 +141,16 @@ namespace cvar {
             "they ignore optix_*. Non-NVIDIA Vulkan builds ignore "
             "optix_*; Vulkan builds ignore metalfx.",
             CVAR_ARCHIVE);
+    PT_CVAR(r_svgf_atrous_passes, "1",
+            "Number of A-Trous wavelet passes the in-house SVGF denoiser "
+            "runs after the temporal accumulation. 1 = effective 5x5 "
+            "footprint (default, cleanest detail). 2 = 9x9 (extra cleanup "
+            "in dim indirect / low-freq noise). 3 = 17x17 (canonical SVGF "
+            "paper config; may compound smoothing across frames via the "
+            "Schied feedback loop). Clamped to 1..3. Only affects "
+            "r_denoiser svgf_atrous / nrd; svgf_basic skips the spatial "
+            "chain entirely.",
+            CVAR_ARCHIVE);
     PT_CVAR(r_hdr_pipeline,    "1",  "Linear-HDR pipeline through MetalFX. 1 = path tracer writes raw HDR, MetalFX denoises in HDR, post-pass applies exposure+ACES (recommended). 0 = path tracer pre-applies exposure+ACES, MetalFX denoises LDR, tonemap pass is a passthrough copy. Only affects the denoiser-on path.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom,           "1",  "HDR bloom (downsample/upsample pyramid, additive composite before ACES). 0 disables; tonemap then samples a 1x1 zero buffer.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom_threshold, "1.0","Linear-HDR luminance threshold for the bloom extract. Pixels below this value contribute nothing to the pyramid; pixels above contribute proportional to (lum - threshold). The path tracer's pixels are in tonemap-relative units (sun ~30, env ~3) so a threshold of 1.0 picks up only HDR highlights.", CVAR_ARCHIVE);
@@ -2638,6 +2648,18 @@ void Engine::RenderFrame() {
         dd.quality = (denoiser_kind_ == DenoiserKind::SvgfBasic)
                          ? pt::rhi::Device::DenoiseDesc::Quality::Basic
                          : pt::rhi::Device::DenoiseDesc::Quality::Atrous;
+        // A-Trous pass count for the in-house SVGF chain. Cvar-driven so
+        // the user can A/B 1 vs 2 vs 3 at runtime; clamped here so a
+        // typo in the console can't push us beyond the texture/buffer
+        // ping-pong the backend allocates for.
+        std::uint32_t atrous_passes_want = 1;
+        if (auto* v = C.FindCVar("r_svgf_atrous_passes")) {
+            int n = v->GetInt();
+            if (n < 1) n = 1;
+            if (n > 3) n = 3;
+            atrous_passes_want = static_cast<std::uint32_t>(n);
+        }
+        dd.atrous_passes = atrous_passes_want;
 
         // Top-level Kind: tells the backend which denoiser
         // implementation to dispatch.
