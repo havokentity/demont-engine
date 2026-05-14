@@ -81,6 +81,16 @@ public:
     void DestroyPipeline(PipelineHandle) override {}
     void DestroyAccelStruct(AccelStructHandle h) override;
 
+    // Batched-destroy fast paths. The public Destroy* above each call
+    // vkDeviceWaitIdle() internally so a single destroy is always safe.
+    // Callers that tear down N resources back-to-back (denoiser scratch
+    // reallocation, swapchain rebuild, shutdown) pay an N-way idle stall
+    // otherwise. The NoWait variants skip the internal wait; the caller
+    // is responsible for issuing a single WaitIdle() before the batch.
+    // Strictly Vulkan-specific (not on the abstract Device interface).
+    void DestroyBufferNoWait(BufferHandle h);
+    void DestroyTextureNoWait(TextureHandle h);
+
     void WriteBuffer(BufferHandle h, const void* src, std::size_t size,
                      std::size_t dst_offset) override;
     bool WriteTexture(TextureHandle h, const void* src, std::size_t src_size) override;

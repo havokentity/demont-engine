@@ -1571,10 +1571,19 @@ BufferHandle VulkanDevice::CreateBuffer(const BufferDesc& d) {
 
 void VulkanDevice::DestroyBuffer(BufferHandle h) {
     if (h.id == 0 || device_ == VK_NULL_HANDLE) return;
+    // One-shot caller path: wait idle so the GPU isn't still using the
+    // buffer. Batch teardown should use DestroyBufferNoWait + a single
+    // upfront WaitIdle() instead (this method's wait amortises to one
+    // per destroy, which is fine in isolation but N× for batches).
+    vkDeviceWaitIdle(device_);
+    DestroyBufferNoWait(h);
+}
+
+void VulkanDevice::DestroyBufferNoWait(BufferHandle h) {
+    if (h.id == 0 || device_ == VK_NULL_HANDLE) return;
     std::lock_guard lock(resource_mutex_);
     auto it = buffers_.find(h.id);
     if (it == buffers_.end()) return;
-    vkDeviceWaitIdle(device_);
     DestroyBufferImpl(it->second);
     buffers_.erase(it);
 }
@@ -2126,10 +2135,19 @@ bool VulkanDevice::ReadbackBuffer(BufferHandle h, void* dst, std::size_t bytes) 
 
 void VulkanDevice::DestroyTexture(TextureHandle h) {
     if (h.id == 0 || h.id == kSwapchainTextureId) return;
+    // One-shot caller path: wait idle so the GPU isn't still using the
+    // texture. Batch teardown should use DestroyTextureNoWait + a single
+    // upfront WaitIdle() instead (this method's wait amortises to one
+    // per destroy, which is fine in isolation but N× for batches).
+    if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
+    DestroyTextureNoWait(h);
+}
+
+void VulkanDevice::DestroyTextureNoWait(TextureHandle h) {
+    if (h.id == 0 || h.id == kSwapchainTextureId) return;
     std::lock_guard lock(resource_mutex_);
     auto it = images_.find(h.id);
     if (it == images_.end()) return;
-    if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
     if (it->second.view)   vkDestroyImageView(device_, it->second.view, nullptr);
     if (it->second.image)  vkDestroyImage(device_, it->second.image, nullptr);
     if (it->second.memory) vkFreeMemory(device_, it->second.memory, nullptr);

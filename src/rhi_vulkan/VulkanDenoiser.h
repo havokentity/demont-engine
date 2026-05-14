@@ -135,7 +135,14 @@ private:
     bool BuildLayout();
     bool BuildPipelines();
     bool BuildDescriptorPool();
+    // Public: WaitIdle()s once then frees all 12 scratch resources via
+    // the device's NoWait fast path. Use for standalone resize.
     void DestroyTextures();
+    // Same teardown as DestroyTextures but skips the WaitIdle -- caller
+    // promises a wait already happened upstream (DestroyAll's single
+    // batch wait covers DestroyTextures + dummy resources + pipelines
+    // + pool in one stall).
+    void DestroyTexturesAlreadyWaited();
 
     // Acquire the next descriptor set in the ring. Wraps when full.
     VkDescriptorSet NextSet();

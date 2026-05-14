@@ -108,10 +108,19 @@ void VulkanNrdDenoiser::DestroyAll() {
     VkDevice dev = device_->RawDevice();
     if (dev == VK_NULL_HANDLE) return;
 
-    DestroyTextures();
-    if (dummy_color_id_     != 0) device_->DestroyTexture(TextureHandle{dummy_color_id_});
-    if (dummy_motion_id_    != 0) device_->DestroyTexture(TextureHandle{dummy_motion_id_});
-    if (dummy_variance_buf_ != 0) device_->DestroyBuffer(BufferHandle{dummy_variance_buf_});
+    // Batch teardown: one WaitIdle covers everything destroyed below
+    // (scratch textures/buffers via DestroyTextures, the three 1x1
+    // dummies, the pipelines, and the pool). Per-resource Destroy*
+    // calls would otherwise each issue their own vkDeviceWaitIdle ->
+    // ~15 idle stalls on a shutdown / re-Init. The pipeline/pool
+    // destroys are inherently non-waiting (vkDestroyPipeline /
+    // vkDestroyDescriptorPool have no implicit-wait semantic).
+    device_->WaitIdle();
+
+    DestroyTexturesAlreadyWaited();
+    if (dummy_color_id_     != 0) device_->DestroyTextureNoWait(TextureHandle{dummy_color_id_});
+    if (dummy_motion_id_    != 0) device_->DestroyTextureNoWait(TextureHandle{dummy_motion_id_});
+    if (dummy_variance_buf_ != 0) device_->DestroyBufferNoWait(BufferHandle{dummy_variance_buf_});
     dummy_color_id_     = 0;
     dummy_motion_id_    = 0;
     dummy_variance_buf_ = 0;
@@ -158,14 +167,22 @@ void VulkanNrdDenoiser::DestroyAll() {
 
 void VulkanNrdDenoiser::DestroyTextures() {
     if (device_ == nullptr) return;
-    // Wait idle once upfront to avoid N× GPU stalls (DestroyTexture and
-    // DestroyBuffer both call vkDeviceWaitIdle internally).
+    // Batch the 12 scratch resources behind a single WaitIdle. The
+    // per-resource Destroy* path each calls vkDeviceWaitIdle internally,
+    // which adds up to 12× stalls on a resize (8 textures + 4 storage
+    // buffers); a single up-front wait + NoWait destroys is identical
+    // in safety but pays one stall.
     device_->WaitIdle();
+    DestroyTexturesAlreadyWaited();
+}
+
+void VulkanNrdDenoiser::DestroyTexturesAlreadyWaited() {
+    if (device_ == nullptr) return;
     auto relTex = [&](std::uint64_t& id) {
-        if (id != 0) { device_->DestroyTexture(TextureHandle{id}); id = 0; }
+        if (id != 0) { device_->DestroyTextureNoWait(TextureHandle{id}); id = 0; }
     };
     auto relBuf = [&](std::uint64_t& id) {
-        if (id != 0) { device_->DestroyBuffer(BufferHandle{id}); id = 0; }
+        if (id != 0) { device_->DestroyBufferNoWait(BufferHandle{id}); id = 0; }
     };
     relTex(history_a_id_);
     relTex(history_b_id_);
