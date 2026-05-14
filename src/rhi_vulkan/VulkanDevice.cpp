@@ -2144,7 +2144,7 @@ void VulkanDevice::DestroyTexture(TextureHandle h) {
 }
 
 void VulkanDevice::DestroyTextureNoWait(TextureHandle h) {
-    if (h.id == 0 || h.id == kSwapchainTextureId) return;
+    if (h.id == 0 || h.id == kSwapchainTextureId || device_ == VK_NULL_HANDLE) return;
     std::lock_guard lock(resource_mutex_);
     auto it = images_.find(h.id);
     if (it == images_.end()) return;

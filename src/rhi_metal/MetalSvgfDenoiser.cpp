@@ -161,10 +161,9 @@ bool MetalSvgfDenoiser::Init() {
     //   atrous slot 3 (motion_unused,        RG16F)
     // MSL demands a valid texture at every declared [[texture(N)]] index.
     // The buffer placeholder (dummy_variance_buf_) for temporal's unused
-    // variance_in slot is a fixed 16-byte storage buffer allocated in
-    // ResizeTextures -- it doesn't track the swapchain resolution
-    // because the shader never reads it, but the buffer pointer must
-    // be non-null so the MSL kernel argument list is valid.
+    // variance_in slot is a fixed 16-byte storage buffer allocated once
+    // in ResizeTextures. The shader never reads it, but the buffer pointer
+    // must be non-null so the MSL kernel argument list is valid.
     dummy_color_  = MakeTexture(dev, MTL::PixelFormatRGBA16Float, 1, 1);
     dummy_motion_ = MakeTexture(dev, MTL::PixelFormatRG16Float,   1, 1);
     if (dummy_color_ == nullptr || dummy_motion_ == nullptr) {
