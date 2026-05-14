@@ -452,6 +452,7 @@ TextureHandle MetalDevice::CreateTexture(const TextureDesc& d) {
         case TextureFormat::R32_UINT:    fmt = MTL::PixelFormatR32Uint;          break;
         case TextureFormat::R32F:        fmt = MTL::PixelFormatR32Float;         break;
         case TextureFormat::RG16F:       fmt = MTL::PixelFormatRG16Float;        break;
+        case TextureFormat::RG32F:       fmt = MTL::PixelFormatRG32Float;        break;
         default: break;
     }
 

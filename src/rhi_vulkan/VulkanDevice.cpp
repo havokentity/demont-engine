@@ -1654,6 +1654,7 @@ TextureHandle VulkanDevice::CreateTexture(const TextureDesc& d) {
         case TextureFormat::R32_UINT:    fmt = VK_FORMAT_R32_UINT;             break;
         case TextureFormat::R32F:        fmt = VK_FORMAT_R32_SFLOAT;           break;
         case TextureFormat::RG16F:       fmt = VK_FORMAT_R16G16_SFLOAT;        break;
+        case TextureFormat::RG32F:       fmt = VK_FORMAT_R32G32_SFLOAT;        break;
         default: break;
     }
 

@@ -31,8 +31,10 @@ enum class TextureFormat : std::uint8_t {
     RGBA16F,
     RGBA32F,
     R32_UINT,
-    R32F,         // P10 denoiser depth
+    R32F,         // P10 denoiser depth, P10 SVGF variance
     RG16F,        // P10 denoiser motion vectors
+    RG32F,        // P10 SVGF luminance moments (mu1, mu2) -- fp16 too narrow
+                  // for mu2 = lum^2 once luminance exceeds ~256.
 };
 
 enum class TextureUsage : std::uint32_t {
