@@ -287,11 +287,6 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
     {
         MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
         enc->setComputePipelineState(temporal_pso_);
-        // Slang MSL emission for [[vk::binding(N, 0)]] storage images
-        // assigns [[texture(N)]] in declaration order. Slang
-        // [[vk::binding]] storage buffers land after the push-constant
-        // cbuffer at [[buffer(0)]]; bindings 8..11 in declaration order
-        // map to MSL [[buffer(1..4)]].
         // Slang MSL slot map for the temporal kernel (kept stable by
         // Slang's declaration-order policy; verified in the emitted
         // DenoiseTemporal.metal):
@@ -379,20 +374,20 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
                                MTL::Buffer*  var_src,
                                MTL::Buffer*  var_dst,
                                std::uint32_t step) {
-            // Slots 1, 3 are texture dummies (color_history_unused,
-            // motion_unused); slots 6, 7 carry valid same-format
-            // textures the atrous pass declares but doesn't read.
-            // The moments buffers at MSL [[buffer(1..2)]] are unused;
-            // we still bind the parity-side moments buffers so the
-            // shader's device pointer is non-null (atrous never reads
-            // or writes them).
             // Slang MSL slot map for the atrous kernel (same policy as
-            // temporal -- bindings 8..11 -> buffers 0..3, push at 4).
-            // Slots 1, 3, 6, 7 (texture) and 0, 1 (buffer) are DCE'd
-            // from the kernel signature; we still call setTexture/
-            // setBuffer there because Metal silently ignores binds to
-            // slots not present in the kernel signature, and this keeps
-            // the host code symmetric with the Vulkan path.
+            // temporal -- bindings 8..11 -> buffers 0..3, push at 4):
+            //   texture(1, 3, 6, 7) -- declared but DCE'd from kernel
+            //     signature. We still bind dummies / parity textures
+            //     because Metal silently ignores binds to slots not
+            //     present in the kernel signature, and this keeps the
+            //     host code symmetric with the Vulkan path.
+            //   buffer(0, 1)        -- moments_in_unused /
+            //     moments_out_unused, also DCE'd. We bind the parity-
+            //     side moments buffer at both slots; the shader never
+            //     reads or writes through them.
+            //   buffer(2, 3)        -- variance_in / variance_out
+            //     (the only buffers the atrous shader actually uses).
+            //   buffer(4)           -- push_constant cbuffer.
             enc->setTexture(color_src,         0);
             enc->setTexture(dummy_color_,      1);
             enc->setTexture(depth_in,          2);

@@ -10,10 +10,9 @@
 // All three terms have the SVGF denominators wired in -- the depth
 // gradient lets fronto-parallel surfaces stay strict while grazing
 // slopes are lenient, and the variance term lets converged shading
-// regions reject neighbours instead of blurring through them. Together
-// with the 3-pass 5x5 cascade (step=1,2,4 -> effective 17x17) this is
-// the canonical SVGF filter shape; the previous "fixed-weight" version
-// shipped a too-tolerant bilateral blur.
+// regions reject neighbours instead of blurring through them. The
+// previous "fixed-weight" version shipped a too-tolerant bilateral
+// blur; this implementation is the canonical SVGF filter shape.
 //
 // Variance also rides the cascade: each pass filters its variance with
 // the SQUARED edge-aware weights (Var' = Sum(w^2 * Var_q) / (Sum w)^2)
@@ -22,8 +21,13 @@
 // drops -- which is what gives SVGF its "wide spatial radius without
 // blurring details" property.
 //
-// A-Trous step sizes: 1 -> 2 -> 4. Run as three host dispatches with
-// the variance ping-ponged in lockstep.
+// Pass schedule: the host runs N dispatches (N = 1..5, configurable via
+// the r_svgf_atrous_passes cvar; each pass uses the same 5x5 kernel but
+// doubles its tap stride per pass -- 1, 2, 4, 8, 16. So effective
+// footprint per pass count: 5x5, 9x9, 17x17, 33x33, 65x65. N = 5 is
+// the canonical Schied 2017 configuration; default N = 1. Variance
+// ping-pongs through both `variance_in` and `variance_out` slots each
+// pass.
 
 [[vk::binding(0,  0)]] RWTexture2D<float4> color_in;            // input radiance (RGBA16F)
 [[vk::binding(1,  0)]] RWTexture2D<float4> color_history_unused;// unread; host binds dummy

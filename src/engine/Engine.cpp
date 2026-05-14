@@ -1591,8 +1591,15 @@ void Engine::RenderFrame() {
             else if (s == "svgf_atrous_metalfx")   want_kind = DenoiserKind::SvgfAtrousMetalFx;
             else if (s == "nrd")                   want_kind = DenoiserKind::Nrd;
         } else if (current_backend_ == BackendType::Vulkan) {
+            // The *_metalfx variants chain MetalFX as a finalizer (Mac
+            // only). On Vulkan we silently degrade to the corresponding
+            // plain SVGF mode so a user's demont.cfg / preset value
+            // works across both backends -- they just lose the MetalFX
+            // finalizer on Vulkan, matching the cvar help text.
             if      (s == "svgf_basic")            want_kind = DenoiserKind::SvgfBasic;
             else if (s == "svgf_atrous")           want_kind = DenoiserKind::SvgfAtrous;
+            else if (s == "svgf_basic_metalfx")    want_kind = DenoiserKind::SvgfBasic;
+            else if (s == "svgf_atrous_metalfx")   want_kind = DenoiserKind::SvgfAtrous;
             else if (s == "nrd")                   want_kind = DenoiserKind::Nrd;
             else if (s == "optix_hdr")             want_kind = DenoiserKind::OptixHdr;
             else if (s == "optix_hdr_aov")         want_kind = DenoiserKind::OptixHdrAov;
