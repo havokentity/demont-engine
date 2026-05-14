@@ -712,7 +712,11 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
             p.step_or_reset = step;
             p.a             = 1.0f;     // sigma_depth (gradient-scaled)
             p.b             = 128.0f;   // sigma_normal (sharper than the old 64.0)
-            p.c             = 4.0f;     // sigma_color (variance-scaled)
+            p.c             = 1.0f;     // sigma_color (variance-scaled). The SVGF
+                                        // paper default of 4.0 reads as visibly
+                                        // smooth on diffuse surfaces -- 1.0 keeps
+                                        // the noise rejection without averaging
+                                        // through 4-sigma-wide luminance bands.
             const VkImageView views[kPassImages] = {
                 /*0 color_in            */ color_src,
                 /*1 color_history_in    */ v_dummy_c,
