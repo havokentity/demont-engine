@@ -122,15 +122,18 @@ private:
     // Acquire the next descriptor set in the ring. Wraps when full.
     VkDescriptorSet NextSet();
 
-    // Bind a single dispatch's images into `set` and dispatch with
-    // `pipe` + `push`. Slot count matches the temporal/atrous
-    // descriptor set layout -- see BuildLayout() for the per-slot
+    // Bind a single dispatch's resources into `set` and dispatch with
+    // `pipe` + `push`. Bindings 0..7 are storage images (engine-managed
+    // G-buffer + denoiser texture history); bindings 8..11 are storage
+    // buffers (moments + variance). See BuildLayout() for per-slot
     // semantics.
-    static constexpr std::uint32_t kPassBindings = 12;
+    static constexpr std::uint32_t kPassImages  = 8;
+    static constexpr std::uint32_t kPassBuffers = 4;
     void RecordPass(VkCommandBuffer cb,
                     VkPipeline      pipe,
                     VkDescriptorSet set,
-                    const VkImageView (&views)[kPassBindings],
+                    const VkImageView (&views)[kPassImages],
+                    const VkBuffer    (&buffers)[kPassBuffers],
                     const void*     push,
                     std::size_t     push_size,
                     std::uint32_t   gx,
@@ -163,31 +166,35 @@ private:
     VkDescriptorSet       sets_[kSetRing] {};
     int                   next_set_     = 0;
 
-    // Owned scratch textures (RHI-managed, freed via DestroyTextures()).
-    // Cross-frame ping-pong: history_*, depth_history_*, normal_history_*,
-    // moments_history_* (all sized to the swapchain). Within-frame
-    // ping-pong: atrous_a/b color scratch + variance_a/b ping-pong.
+    // Owned scratch resources (RHI-managed, freed via DestroyTextures()).
+    // Cross-frame ping-pong: history_*, depth_history_*, normal_history_*
+    // (textures), moments_history_* (storage buffers; see BuildLayout()
+    // for why bindings 8..11 are buffers not images).
+    // Within-frame ping-pong: atrous_a/b color scratch (textures) +
+    // variance_a/b ping-pong (storage buffers).
     std::uint64_t         history_a_id_         = 0;
     std::uint64_t         history_b_id_         = 0;
     std::uint64_t         depth_history_a_id_   = 0;
     std::uint64_t         depth_history_b_id_   = 0;
     std::uint64_t         normal_history_a_id_  = 0;
     std::uint64_t         normal_history_b_id_  = 0;
-    std::uint64_t         moments_history_a_id_ = 0;
-    std::uint64_t         moments_history_b_id_ = 0;
+    std::uint64_t         moments_history_a_buf_ = 0;
+    std::uint64_t         moments_history_b_buf_ = 0;
     std::uint64_t         atrous_a_id_          = 0;
     std::uint64_t         atrous_b_id_          = 0;
-    std::uint64_t         variance_a_id_        = 0;
-    std::uint64_t         variance_b_id_        = 0;
-    // 1x1 placeholders for the temporal/atrous bindings the active
-    // shader doesn't read but the descriptor set still requires:
-    //   dummy_color_id_    -- RGBA16F, plugs atrous slot 1 (color_history)
-    //   dummy_motion_id_   -- RG16F,   plugs atrous slot 3 (motion)
-    //   dummy_variance_id_ -- R32F,    plugs temporal slot 10 (variance_in)
+    std::uint64_t         variance_a_buf_       = 0;
+    std::uint64_t         variance_b_buf_       = 0;
+    // 1x1 image placeholders for the bindings the atrous shader
+    // declares but does not consume:
+    //   dummy_color_id_  -- RGBA16F, plugs atrous slot 1 (color_history)
+    //   dummy_motion_id_ -- RG16F,   plugs atrous slot 3 (motion)
     // Allocated once at Init(); live for the denoiser's lifetime.
-    std::uint64_t         dummy_color_id_    = 0;
-    std::uint64_t         dummy_motion_id_   = 0;
-    std::uint64_t         dummy_variance_id_ = 0;
+    std::uint64_t         dummy_color_id_  = 0;
+    std::uint64_t         dummy_motion_id_ = 0;
+    // Storage-buffer placeholder for temporal's slot-10 (variance_in
+    // unused). Sized to a single element; the shader never reads it but
+    // Vulkan still validates the descriptor write.
+    std::uint64_t         dummy_variance_buf_ = 0;
 
     std::uint32_t         cached_w_     = 0;
     std::uint32_t         cached_h_     = 0;

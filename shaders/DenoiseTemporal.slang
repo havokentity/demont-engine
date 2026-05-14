@@ -41,10 +41,14 @@
 [[vk::binding(5,  0)]] RWTexture2D<float4> color_out;           // accumulated color, RGBA16F (.a = sample count)
 [[vk::binding(6,  0)]] RWTexture2D<float>  depth_history_in;    // prev-frame depth, R32F
 [[vk::binding(7,  0)]] RWTexture2D<float4> normal_history_in;   // prev-frame normal, RGBA16F
-[[vk::binding(8,  0)]] RWTexture2D<float2> moments_history_in;  // prev-frame (mu1, mu2), RG32F
-[[vk::binding(9,  0)]] RWTexture2D<float2> moments_history_out; // this-frame (mu1, mu2), RG32F
-[[vk::binding(10, 0)]] RWTexture2D<float>  variance_in_unused;  // unread by temporal -- host binds a placeholder
-[[vk::binding(11, 0)]] RWTexture2D<float>  variance_out;        // this-frame initial variance, R32F
+// Buffer-backed bindings start at 8. Storage *buffers* don't share Metal's
+// 8-texture-with-read_write-access compute limit (we keep 8 RW textures at
+// the cap; 12 RW textures crashed slangc's MSL output). Indexing is
+// row-major: idx = y*width + x.
+[[vk::binding(8,  0)]] RWStructuredBuffer<float2> moments_history_in;  // prev-frame (mu1, mu2)
+[[vk::binding(9,  0)]] RWStructuredBuffer<float2> moments_history_out; // this-frame (mu1, mu2)
+[[vk::binding(10, 0)]] RWStructuredBuffer<float>  variance_in_unused;  // unread by temporal -- host binds a placeholder
+[[vk::binding(11, 0)]] RWStructuredBuffer<float>  variance_out;        // this-frame initial variance
 
 [[vk::push_constant]]
 cbuffer Push {
@@ -61,6 +65,8 @@ cbuffer Push {
 float luminance(float3 c) {
     return dot(c, float3(0.2126, 0.7152, 0.0722));
 }
+
+uint pixelIndex(uint2 p) { return p.y * width + p.x; }
 
 // 2x2 bilinear reprojection with per-tap depth+normal validation.
 // Returns the blended color (rgb) + aggregated sample count (a) AND
@@ -105,7 +111,7 @@ ReprojSample sampleHistory(float2 prev_pos, float curr_depth, float3 curr_normal
             if (n_dot < normal_tolerance) continue;
         }
         acc_color += w[i] * color_history_in[up];
-        acc_mom   += w[i] * moments_history_in[up];
+        acc_mom   += w[i] * moments_history_in[pixelIndex(up)];
         wsum      += w[i];
     }
     if (wsum > 1e-3) {
@@ -154,9 +160,9 @@ void main(uint2 tid : SV_DispatchThreadID) {
     // spatial variance fallback below regardless), and write a fresh
     // variance derived purely from the 7x7 spatial neighborhood.
     if (reset_history != 0u) {
-        color_out[tid]           = float4(noisy.rgb, 1.0);
-        moments_history_out[tid] = float2(l_now, l_now * l_now);
-        variance_out[tid]        = spatialVariance(tid);
+        color_out[tid]                       = float4(noisy.rgb, 1.0);
+        moments_history_out[pixelIndex(tid)] = float2(l_now, l_now * l_now);
+        variance_out[pixelIndex(tid)]        = spatialVariance(tid);
         return;
     }
 
@@ -176,9 +182,9 @@ void main(uint2 tid : SV_DispatchThreadID) {
     if (!h.valid) {
         // Disocclusion: drop history. Spatial variance carries us until
         // the temporal moments stabilise over the next ~4 frames.
-        color_out[tid]           = float4(noisy.rgb, 1.0);
-        moments_history_out[tid] = float2(l_now, l_now * l_now);
-        variance_out[tid]        = spatialVariance(tid);
+        color_out[tid]                       = float4(noisy.rgb, 1.0);
+        moments_history_out[pixelIndex(tid)] = float2(l_now, l_now * l_now);
+        variance_out[pixelIndex(tid)]        = spatialVariance(tid);
         return;
     }
 
@@ -200,8 +206,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
     if (any(isnan(blended_mom))   || any(isinf(blended_mom)))   blended_mom   = float2(l_now, l_now * l_now);
 
     float new_count = min(n + 1.0, 32.0);
-    color_out[tid]           = float4(blended_color, new_count);
-    moments_history_out[tid] = blended_mom;
+    color_out[tid]                       = float4(blended_color, new_count);
+    moments_history_out[pixelIndex(tid)] = blended_mom;
 
     // Temporal variance from the running moments.
     float temporal_var = max(0.0, blended_mom.y - blended_mom.x * blended_mom.x);
@@ -219,5 +225,5 @@ void main(uint2 tid : SV_DispatchThreadID) {
     } else {
         final_var = temporal_var;
     }
-    variance_out[tid] = final_var;
+    variance_out[pixelIndex(tid)] = final_var;
 }

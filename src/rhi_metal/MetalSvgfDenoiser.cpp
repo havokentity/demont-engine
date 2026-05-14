@@ -110,28 +110,29 @@ MetalSvgfDenoiser::~MetalSvgfDenoiser() {
 
 void MetalSvgfDenoiser::DestroyAll() {
     DestroyTextures();
-    if (dummy_color_)    { dummy_color_->release();    dummy_color_    = nullptr; }
-    if (dummy_motion_)   { dummy_motion_->release();   dummy_motion_   = nullptr; }
-    if (dummy_variance_) { dummy_variance_->release(); dummy_variance_ = nullptr; }
-    if (temporal_pso_)   { temporal_pso_->release();   temporal_pso_   = nullptr; }
-    if (atrous_pso_)     { atrous_pso_->release();     atrous_pso_     = nullptr; }
+    if (dummy_color_)  { dummy_color_->release();  dummy_color_  = nullptr; }
+    if (dummy_motion_) { dummy_motion_->release(); dummy_motion_ = nullptr; }
+    if (temporal_pso_) { temporal_pso_->release(); temporal_pso_ = nullptr; }
+    if (atrous_pso_)   { atrous_pso_->release();   atrous_pso_   = nullptr; }
     ready_ = false;
 }
 
 void MetalSvgfDenoiser::DestroyTextures() {
-    auto rel = [](MTL::Texture*& t) { if (t) { t->release(); t = nullptr; } };
-    rel(history_a_);
-    rel(history_b_);
-    rel(depth_history_a_);
-    rel(depth_history_b_);
-    rel(normal_history_a_);
-    rel(normal_history_b_);
-    rel(moments_history_a_);
-    rel(moments_history_b_);
-    rel(atrous_a_);
-    rel(atrous_b_);
-    rel(variance_a_);
-    rel(variance_b_);
+    auto relT = [](MTL::Texture*& t) { if (t) { t->release(); t = nullptr; } };
+    auto relB = [](MTL::Buffer*&  b) { if (b) { b->release(); b = nullptr; } };
+    relT(history_a_);
+    relT(history_b_);
+    relT(depth_history_a_);
+    relT(depth_history_b_);
+    relT(normal_history_a_);
+    relT(normal_history_b_);
+    relB(moments_history_a_);
+    relB(moments_history_b_);
+    relT(atrous_a_);
+    relT(atrous_b_);
+    relB(variance_a_);
+    relB(variance_b_);
+    relB(dummy_variance_buf_);
     cached_w_ = 0;
     cached_h_ = 0;
     needs_history_clear_ = true;
@@ -154,18 +155,18 @@ bool MetalSvgfDenoiser::Init() {
         return false;
     }
 
-    // 1x1 placeholders for the slots each pass declares but does not
-    // consume:
+    // 1x1 texture placeholders for the slots each pass declares but
+    // does not consume:
     //   atrous slot 1 (color_history_unused, RGBA16F)
-    //   atrous slot 3 (motion_unused, RG16F)
-    //   temporal slot 10 (variance_in_unused, R32F)
-    // MSL still demands valid textures at every declared [[texture(N)]]
-    // index, so we keep one tiny resident texture per format.
-    dummy_color_    = MakeTexture(dev, MTL::PixelFormatRGBA16Float, 1, 1);
-    dummy_motion_   = MakeTexture(dev, MTL::PixelFormatRG16Float,   1, 1);
-    dummy_variance_ = MakeTexture(dev, MTL::PixelFormatR32Float,    1, 1);
-    if (dummy_color_ == nullptr || dummy_motion_ == nullptr ||
-        dummy_variance_ == nullptr) {
+    //   atrous slot 3 (motion_unused,        RG16F)
+    // MSL demands a valid texture at every declared [[texture(N)]] index.
+    // The buffer placeholder (dummy_variance_buf_) for temporal's unused
+    // variance_in slot is sized lazily in ResizeTextures so it matches
+    // the active resolution -- a 1-element buffer is fine since the
+    // shader never reads it, but the buffer must be non-null.
+    dummy_color_  = MakeTexture(dev, MTL::PixelFormatRGBA16Float, 1, 1);
+    dummy_motion_ = MakeTexture(dev, MTL::PixelFormatRG16Float,   1, 1);
+    if (dummy_color_ == nullptr || dummy_motion_ == nullptr) {
         LOG_ERROR("MetalSvgfDenoiser: 1x1 placeholder texture alloc failed");
         DestroyAll();
         return false;
@@ -185,26 +186,39 @@ bool MetalSvgfDenoiser::ResizeTextures(std::uint32_t w, std::uint32_t h) {
     MTL::Device* dev = device_->RawDevice();
     if (dev == nullptr) return false;
 
-    history_a_         = MakeTexture(dev, MTL::PixelFormatRGBA16Float, w, h);
-    history_b_         = MakeTexture(dev, MTL::PixelFormatRGBA16Float, w, h);
-    depth_history_a_   = MakeTexture(dev, MTL::PixelFormatR32Float,    w, h);
-    depth_history_b_   = MakeTexture(dev, MTL::PixelFormatR32Float,    w, h);
-    normal_history_a_  = MakeTexture(dev, MTL::PixelFormatRGBA16Float, w, h);
-    normal_history_b_  = MakeTexture(dev, MTL::PixelFormatRGBA16Float, w, h);
-    moments_history_a_ = MakeTexture(dev, MTL::PixelFormatRG32Float,   w, h);
-    moments_history_b_ = MakeTexture(dev, MTL::PixelFormatRG32Float,   w, h);
-    atrous_a_          = MakeTexture(dev, MTL::PixelFormatRGBA16Float, w, h);
-    atrous_b_          = MakeTexture(dev, MTL::PixelFormatRGBA16Float, w, h);
-    variance_a_        = MakeTexture(dev, MTL::PixelFormatR32Float,    w, h);
-    variance_b_        = MakeTexture(dev, MTL::PixelFormatR32Float,    w, h);
+    history_a_        = MakeTexture(dev, MTL::PixelFormatRGBA16Float, w, h);
+    history_b_        = MakeTexture(dev, MTL::PixelFormatRGBA16Float, w, h);
+    depth_history_a_  = MakeTexture(dev, MTL::PixelFormatR32Float,    w, h);
+    depth_history_b_  = MakeTexture(dev, MTL::PixelFormatR32Float,    w, h);
+    normal_history_a_ = MakeTexture(dev, MTL::PixelFormatRGBA16Float, w, h);
+    normal_history_b_ = MakeTexture(dev, MTL::PixelFormatRGBA16Float, w, h);
+    atrous_a_         = MakeTexture(dev, MTL::PixelFormatRGBA16Float, w, h);
+    atrous_b_         = MakeTexture(dev, MTL::PixelFormatRGBA16Float, w, h);
+
+    // Buffer-backed scratch:
+    //   moments_history: width*height * sizeof(float2) per side
+    //   variance:        width*height * sizeof(float)  per side
+    // MTLStorageModePrivate so the GPU keeps the only copy; the shader
+    // initialises every element it reads on first touch (reset path).
+    const std::size_t pix       = std::size_t(w) * std::size_t(h);
+    const std::size_t mom_bytes = pix * sizeof(float) * 2;
+    const std::size_t var_bytes = pix * sizeof(float);
+    moments_history_a_  = dev->newBuffer(mom_bytes, MTL::ResourceStorageModePrivate);
+    moments_history_b_  = dev->newBuffer(mom_bytes, MTL::ResourceStorageModePrivate);
+    variance_a_         = dev->newBuffer(var_bytes, MTL::ResourceStorageModePrivate);
+    variance_b_         = dev->newBuffer(var_bytes, MTL::ResourceStorageModePrivate);
+    // Temporal's variance_in slot is declared but never read; bind a
+    // 16-byte placeholder so the MSL device pointer is non-null.
+    dummy_variance_buf_ = dev->newBuffer(16, MTL::ResourceStorageModePrivate);
 
     if (history_a_ == nullptr || history_b_ == nullptr ||
         depth_history_a_ == nullptr || depth_history_b_ == nullptr ||
         normal_history_a_ == nullptr || normal_history_b_ == nullptr ||
-        moments_history_a_ == nullptr || moments_history_b_ == nullptr ||
         atrous_a_ == nullptr || atrous_b_ == nullptr ||
-        variance_a_ == nullptr || variance_b_ == nullptr) {
-        LOG_ERROR("MetalSvgfDenoiser: scratch texture alloc failed at {}x{}", w, h);
+        moments_history_a_ == nullptr || moments_history_b_ == nullptr ||
+        variance_a_ == nullptr || variance_b_ == nullptr ||
+        dummy_variance_buf_ == nullptr) {
+        LOG_ERROR("MetalSvgfDenoiser: scratch resource alloc failed at {}x{}", w, h);
         DestroyTextures();
         return false;
     }
@@ -240,14 +254,14 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
     // parity side, history write = other side. Mirror of
     // VulkanNrdDenoiser frame_parity_.
     const bool parity_is_a = (frame_parity_ == 0);
-    MTL::Texture* hist_read           = parity_is_a ? history_a_          : history_b_;
-    MTL::Texture* hist_write          = parity_is_a ? history_b_          : history_a_;
-    MTL::Texture* depth_hist_read     = parity_is_a ? depth_history_a_    : depth_history_b_;
-    MTL::Texture* depth_hist_write    = parity_is_a ? depth_history_b_    : depth_history_a_;
-    MTL::Texture* normal_hist_read    = parity_is_a ? normal_history_a_   : normal_history_b_;
-    MTL::Texture* normal_hist_write   = parity_is_a ? normal_history_b_   : normal_history_a_;
-    MTL::Texture* moments_hist_read   = parity_is_a ? moments_history_a_  : moments_history_b_;
-    MTL::Texture* moments_hist_write  = parity_is_a ? moments_history_b_  : moments_history_a_;
+    MTL::Texture* hist_read         = parity_is_a ? history_a_         : history_b_;
+    MTL::Texture* hist_write        = parity_is_a ? history_b_         : history_a_;
+    MTL::Texture* depth_hist_read   = parity_is_a ? depth_history_a_   : depth_history_b_;
+    MTL::Texture* depth_hist_write  = parity_is_a ? depth_history_b_   : depth_history_a_;
+    MTL::Texture* normal_hist_read  = parity_is_a ? normal_history_a_  : normal_history_b_;
+    MTL::Texture* normal_hist_write = parity_is_a ? normal_history_b_  : normal_history_a_;
+    MTL::Buffer*  moments_hist_read  = parity_is_a ? moments_history_a_ : moments_history_b_;
+    MTL::Buffer*  moments_hist_write = parity_is_a ? moments_history_b_ : moments_history_a_;
 
     const bool effective_reset = reset_history || needs_history_clear_;
     needs_history_clear_ = false;
@@ -270,21 +284,37 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
         MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
         enc->setComputePipelineState(temporal_pso_);
         // Slang MSL emission for [[vk::binding(N, 0)]] storage images
-        // assigns [[texture(N)]] in declaration order; we bind by
-        // shader slot index. Slot 10 (variance_in) is unread by the
-        // temporal pass but still needs a valid R32F texture.
-        enc->setTexture(color_in,            0);
-        enc->setTexture(hist_read,           1);
-        enc->setTexture(depth_in,            2);
-        enc->setTexture(motion_in,           3);
-        enc->setTexture(normal_in,           4);
-        enc->setTexture(temporal_color_out,  5);
-        enc->setTexture(depth_hist_read,     6);
-        enc->setTexture(normal_hist_read,    7);
-        enc->setTexture(moments_hist_read,   8);
-        enc->setTexture(moments_hist_write,  9);
-        enc->setTexture(dummy_variance_,    10);
-        enc->setTexture(variance_a_,        11);
+        // assigns [[texture(N)]] in declaration order. Slang
+        // [[vk::binding]] storage buffers land after the push-constant
+        // cbuffer at [[buffer(0)]]; bindings 8..11 in declaration order
+        // map to MSL [[buffer(1..4)]].
+        // Slang MSL slot map for the temporal kernel (kept stable by
+        // Slang's declaration-order policy; verified in the emitted
+        // DenoiseTemporal.metal):
+        //   [[texture(N)]]  -- N matches the Slang [[vk::binding(N,0)]]
+        //                      slot for storage-image bindings 0..7.
+        //   [[buffer(0..3)]] -- Slang bindings 8..11 map 1:1 onto MSL
+        //                       buffer slots 0..3, in declaration order.
+        //                       Slot 2 (variance_in_unused) is DCE'd
+        //                       from the kernel signature so any bind
+        //                       at slot 2 is silently ignored, but we
+        //                       still pass the dummy so Vulkan parity
+        //                       is preserved.
+        //   [[buffer(4)]]    -- push_constant cbuffer; Slang places it
+        //                       AFTER the structured buffers.
+        enc->setTexture(color_in,           0);
+        enc->setTexture(hist_read,          1);
+        enc->setTexture(depth_in,           2);
+        enc->setTexture(motion_in,          3);
+        enc->setTexture(normal_in,          4);
+        enc->setTexture(temporal_color_out, 5);
+        enc->setTexture(depth_hist_read,    6);
+        enc->setTexture(normal_hist_read,   7);
+
+        enc->setBuffer(moments_hist_read,   0, 0); // moments_history_in  (binding 8)
+        enc->setBuffer(moments_hist_write,  0, 1); // moments_history_out (binding 9)
+        enc->setBuffer(dummy_variance_buf_, 0, 2); // variance_in_unused  (binding 10, DCE'd)
+        enc->setBuffer(variance_a_,         0, 3); // variance_out        (binding 11)
 
         DenoisePush p{};
         p.width         = w;
@@ -293,9 +323,7 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
         p.a             = 0.10f;   // depth_tolerance (relative)
         p.b             = 0.85f;   // normal_tolerance (cos angle)
         p.c             = 0.10f;   // min_alpha (steady-state blend)
-        // [[vk::push_constant]] cbuffer Push lands at [[buffer(0)]] on
-        // MSL since these shaders declare no StructuredBuffers.
-        enc->setBytes(&p, sizeof(p), 0);
+        enc->setBytes(&p, sizeof(p), 4);
         enc->dispatchThreadgroups(groups, tgsize);
         enc->endEncoding();
     }
@@ -328,25 +356,36 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
 
         auto atrous_pass = [&](MTL::Texture* color_src,
                                MTL::Texture* color_dst,
-                               MTL::Texture* var_src,
-                               MTL::Texture* var_dst,
+                               MTL::Buffer*  var_src,
+                               MTL::Buffer*  var_dst,
                                std::uint32_t step) {
-            // Slots 1, 3 are dummies (color_history_unused,
-            // motion_unused); slots 6-9 carry valid same-format
-            // textures the atrous pass declares but doesn't read,
-            // saving an R32F + RGBA16F + RG32F dummy each.
-            enc->setTexture(color_src,           0);
-            enc->setTexture(dummy_color_,        1);
-            enc->setTexture(depth_in,            2);
-            enc->setTexture(dummy_motion_,       3);
-            enc->setTexture(normal_in,           4);
-            enc->setTexture(color_dst,           5);
-            enc->setTexture(depth_hist_write,    6);
-            enc->setTexture(normal_hist_write,   7);
-            enc->setTexture(moments_hist_write,  8);
-            enc->setTexture(moments_hist_write,  9);
-            enc->setTexture(var_src,            10);
-            enc->setTexture(var_dst,            11);
+            // Slots 1, 3 are texture dummies (color_history_unused,
+            // motion_unused); slots 6, 7 carry valid same-format
+            // textures the atrous pass declares but doesn't read.
+            // The moments buffers at MSL [[buffer(1..2)]] are unused;
+            // we still bind the parity-side moments buffers so the
+            // shader's device pointer is non-null (atrous never reads
+            // or writes them).
+            // Slang MSL slot map for the atrous kernel (same policy as
+            // temporal -- bindings 8..11 -> buffers 0..3, push at 4).
+            // Slots 1, 3, 6, 7 (texture) and 0, 1 (buffer) are DCE'd
+            // from the kernel signature; we still call setTexture/
+            // setBuffer there because Metal silently ignores binds to
+            // slots not present in the kernel signature, and this keeps
+            // the host code symmetric with the Vulkan path.
+            enc->setTexture(color_src,         0);
+            enc->setTexture(dummy_color_,      1);
+            enc->setTexture(depth_in,          2);
+            enc->setTexture(dummy_motion_,     3);
+            enc->setTexture(normal_in,         4);
+            enc->setTexture(color_dst,         5);
+            enc->setTexture(depth_hist_write,  6);
+            enc->setTexture(normal_hist_write, 7);
+
+            enc->setBuffer(moments_hist_write, 0, 0); // moments_in_unused  (DCE'd)
+            enc->setBuffer(moments_hist_write, 0, 1); // moments_out_unused (DCE'd)
+            enc->setBuffer(var_src,            0, 2); // variance_in
+            enc->setBuffer(var_dst,            0, 3); // variance_out
 
             DenoisePush p{};
             p.width         = w;
@@ -355,13 +394,12 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
             p.a             = 1.0f;     // sigma_depth (gradient-scaled)
             p.b             = 128.0f;   // sigma_normal (sharper than the old 64.0)
             p.c             = 4.0f;     // sigma_color (variance-scaled)
-            enc->setBytes(&p, sizeof(p), 0);
+            enc->setBytes(&p, sizeof(p), 4);
             enc->dispatchThreadgroups(groups, tgsize);
-            // Inter-dispatch barrier: each pass reads the previous
-            // pass's output. memoryBarrier(BarrierScopeTextures)
-            // flushes pending texture writes from this encoder so the
-            // next dispatch sees them.
-            enc->memoryBarrier(MTL::BarrierScopeTextures);
+            // Inter-dispatch barrier flushes pending texture AND buffer
+            // writes from this encoder so the next dispatch sees them.
+            enc->memoryBarrier(MTL::BarrierScope(MTL::BarrierScopeTextures |
+                                                MTL::BarrierScopeBuffers));
         };
         // Schied 2017 feedback loop: the first A-Trous output is what
         // gets fed back as next frame's color history (the temporal
