@@ -912,6 +912,17 @@ EnvSample sampleEnvMap(float2 xi) {
 // luminance integral is degenerate, or the direction lands at a pole
 // (sin theta -> 0 -> infinite Jacobian; the env-map estimator can't
 // generate such a sample, so its PDF is 0).
+//
+// HDRI multi-light extraction zeroes cluster pixels in the
+// conditional_cdf (but not in the raw env_map texture, so camera-direct
+// rays still see the bright pixels). The env-map sampler's PDF at a
+// cluster direction is therefore exactly 0, even though the raw texel
+// has positive luminance. We detect masked pixels by checking whether
+// the conditional CDF's prefix sum advanced at this pixel -- a masked
+// pixel writes the same prefix value as its predecessor (bit-identical
+// equality since 0.0 is added). Without this check the BRDF-side MIS
+// weight at cluster directions would be pdf_brdf/(pdf_brdf+spurious)
+// instead of 1.0, under-counting BRDF-sampled contributions there.
 float pdfEnvMapDir(float3 dir) {
     if (env_map_present == 0u || env_total_luminance <= 0.0) return 0.0;
     float cos_theta = clamp(dir.y, -1.0, 1.0);
@@ -925,6 +936,14 @@ float pdfEnvMapDir(float3 dir) {
     float v = theta * (1.0 / 3.14159265358979);
     uint u_idx = min(uint(u * float(W)), W - 1u);
     uint v_idx = min(uint(v * float(H)), H - 1u);
+    // CDF-based mask test: cluster pixels (extracted as directional
+    // lights in ReloadEnvMap) contribute 0 to the prefix sum, so
+    // cdf[base+u] == cdf[base+u-1]. Two buffer reads vs uploading a
+    // separate mask texture; same correctness, no extra binding.
+    uint base = v_idx * W;
+    float cdf_curr = conditional_cdf[base + u_idx];
+    float cdf_prev = (u_idx > 0u) ? conditional_cdf[base + u_idx - 1u] : 0.0;
+    if (cdf_curr <= cdf_prev) return 0.0;
     float3 raw = env_map[uint2(u_idx, v_idx)].rgb;
     float lum  = 0.2126 * raw.r + 0.7152 * raw.g + 0.0722 * raw.b;
     return (lum * float(W * H)) /
