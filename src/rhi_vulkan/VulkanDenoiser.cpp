@@ -158,6 +158,9 @@ void VulkanNrdDenoiser::DestroyAll() {
 
 void VulkanNrdDenoiser::DestroyTextures() {
     if (device_ == nullptr) return;
+    // Wait idle once upfront to avoid N× GPU stalls (DestroyTexture and
+    // DestroyBuffer both call vkDeviceWaitIdle internally).
+    device_->WaitIdle();
     auto relTex = [&](std::uint64_t& id) {
         if (id != 0) { device_->DestroyTexture(TextureHandle{id}); id = 0; }
     };
