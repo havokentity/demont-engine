@@ -33,10 +33,14 @@
 [[vk::binding(5,  0)]] RWTexture2D<float4> color_out;           // filtered radiance (RGBA16F)
 [[vk::binding(6,  0)]] RWTexture2D<float>  depth_hist_unused;   // unread; host binds anything R32F
 [[vk::binding(7,  0)]] RWTexture2D<float4> normal_hist_unused;  // unread; host binds anything RGBA16F
-[[vk::binding(8,  0)]] RWTexture2D<float2> moments_in_unused;   // unread; host binds anything RG32F
-[[vk::binding(9,  0)]] RWTexture2D<float2> moments_out_unused;  // unwritten; host binds anything RG32F
-[[vk::binding(10, 0)]] RWTexture2D<float>  variance_in;         // R32F variance from previous pass
-[[vk::binding(11, 0)]] RWTexture2D<float>  variance_out;        // R32F filtered variance for next pass
+// Buffer-backed bindings start at 8. RWStructuredBuffer<T> is a storage
+// buffer in Vulkan / a device pointer in MSL; it does *not* count toward
+// Metal's 8-RW-texture compute limit. Indexing is row-major
+// (y*width + x); the host sizes each buffer to width*height elements.
+[[vk::binding(8,  0)]] RWStructuredBuffer<float2> moments_in_unused;  // unread; host binds any RG32 buffer
+[[vk::binding(9,  0)]] RWStructuredBuffer<float2> moments_out_unused; // unwritten; host binds any RG32 buffer
+[[vk::binding(10, 0)]] RWStructuredBuffer<float>  variance_in;         // variance from previous pass
+[[vk::binding(11, 0)]] RWStructuredBuffer<float>  variance_out;        // filtered variance for next pass
 
 [[vk::push_constant]]
 cbuffer Push {
@@ -71,6 +75,8 @@ float luminance(float3 c) {
     return dot(c, float3(0.2126, 0.7152, 0.0722));
 }
 
+uint pixelIndex(uint2 p) { return p.y * width + p.x; }
+
 float clampDepthRead(int2 p) {
     int2 q = clamp(p, int2(0, 0), int2(int(width) - 1, int(height) - 1));
     return depth_tex[uint2(q)];
@@ -78,7 +84,7 @@ float clampDepthRead(int2 p) {
 
 float clampVarianceRead(int2 p) {
     int2 q = clamp(p, int2(0, 0), int2(int(width) - 1, int(height) - 1));
-    return variance_in[uint2(q)];
+    return variance_in[pixelIndex(uint2(q))];
 }
 
 [shader("compute")]
@@ -144,7 +150,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
             float4 nc      = color_in[q];
             float  nd      = depth_tex[q];
             float3 nn      = normal_tex[q].xyz;
-            float  nv      = variance_in[q];
+            float  nv      = variance_in[pixelIndex(q)];
 
             // Depth weight: gradient-projected expected delta. Adding
             // a small relative epsilon (1% of center depth) lets
@@ -192,11 +198,11 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // Pathological case: all neighbours rejected. Hold the center
         // color + variance so we don't push a 0 into the next pass.
         filtered_color = center.rgb;
-        filtered_var   = variance_in[tid];
+        filtered_var   = variance_in[pixelIndex(tid)];
     }
     // Preserve the sample-count tag from the input so subsequent
     // passes / the next frame's temporal reprojection can still see
     // how converged the source pixel was.
-    color_out[tid]    = float4(filtered_color, center.a);
-    variance_out[tid] = filtered_var;
+    color_out[tid]                = float4(filtered_color, center.a);
+    variance_out[pixelIndex(tid)] = filtered_var;
 }
