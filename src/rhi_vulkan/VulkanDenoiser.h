@@ -10,27 +10,42 @@
 // but stay user-stable. Today it aliases svgf_atrous with a
 // one-time log on transition.
 //
-// Pipeline shape, per Encode() call:
-//   1) DenoiseTemporal: reproject color_history_a + accumulate noisy
-//      input -> color_history_b. Adaptive alpha falls to 1.0 on
-//      reprojection failure (off-screen / depth+normal mismatch).
-//   2) DenoiseAtrous step=1: 5x5 edge-aware spatial filter over
-//      color_history_b -> atrous_pingpong_a.
-//   3) DenoiseAtrous step=2: atrous_pingpong_a -> atrous_pingpong_b.
-//   4) DenoiseAtrous step=4: atrous_pingpong_b -> output.
-// Frame parity flips which history texture is read vs written so the
-// next frame picks up this frame's pre-spatial-filter accumulation.
+// Pipeline shape, per Encode() call (atrous mode, N from
+// r_svgf_atrous_passes; clamped to 1..5):
+//   1) DenoiseTemporal: reproject color_history + moments_history
+//      + variance, accumulate noisy input. Adaptive alpha falls to 1.0
+//      on reprojection failure (off-screen / depth+normal mismatch),
+//      with a 7x7 spatial variance fallback for sample_count < 4.
+//      Writes color into v_atrous_a (intermediate) when N >= 1.
+//   2) DenoiseAtrous pass 1 (step=1): variance-gated 5x5 edge-aware
+//      spatial filter v_atrous_a -> v_hist_write (Schied feedback
+//      target: next frame's temporal reads this).
+//   ...) Passes 2..N-1 ping-pong between v_atrous_b / v_atrous_a with
+//      step sizes 2, 4, 8, 16 (footprint doubles per pass).
+//   N) Last pass writes directly into the caller's `output`. For N==1
+//      we vkCmdCopyImage v_hist_write -> output to publish.
+// Variance ping-pongs in lockstep with color through variance_a/b.
+// Frame parity flips which history side is read vs written so the next
+// frame picks up this frame's spatially-filtered accumulation.
+// Basic mode (atrous_enabled == false) skips the chain entirely:
+// temporal writes straight to v_hist_write, then copy -> output.
 //
-// Resource ownership: the denoiser owns eight scratch textures:
-// color history ping-pong (history_a/history_b, RGBA16F), depth history
-// ping-pong (depth_history_a/depth_history_b, R32F), normal history
-// ping-pong (normal_history_a/normal_history_b, RGBA16F), and a-trous
-// ping-pong (atrous_a/atrous_b, RGBA16F). The engine continues to own
-// the noisy color/depth/motion/normal G-buffers (PathTrace bindings
-// 6/7/8/16) plus final `output` (post_denoise_hdr).
+// Resource ownership: the denoiser owns 8 scratch textures + 4 storage
+// buffers. Textures: color history ping-pong (history_a/history_b,
+// RGBA16F), depth history ping-pong (depth_history_a/b, R32F), normal
+// history ping-pong (normal_history_a/b, RGBA16F), and a-trous
+// color ping-pong (atrous_a/b, RGBA16F). Buffers: moments_history_a/b
+// (RG32F mu1/mu2 luminance moments, cross-frame ping-pong) and
+// variance_a/b (R32F per-pixel luminance variance, intra-frame
+// ping-pong through the a-trous chain). The moments + variance went to
+// storage buffers (not RW textures) to clear Metal's 8-RW-texture
+// compute cap; the SPIR-V emission is unaffected. The engine continues
+// to own the noisy color/depth/motion/normal G-buffers (PathTrace
+// bindings 6/7/8/16) plus final `output` (post_denoise_hdr).
 //
 // Pipeline layout: dedicated, NOT the engine's unified 17-binding
-// layout. Eight bindings, all storage images, plus a 32-byte push
+// layout. 12 bindings -- 8 storage images at 0..7 + 4 storage buffers
+// at 8..11 (moments_in/out, variance_in/out) -- plus a 32-byte push
 // constant range. Each Encode dispatch picks a fresh descriptor set
 // from the ring so we don't conflict with prior in-flight dispatches.
 
