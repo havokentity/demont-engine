@@ -71,9 +71,10 @@ public:
     //                         the temporal result into `output`.
     //   true  (svgf_atrous /
     //          nrd alias)  -- temporal pass + N a-trous wavelet passes,
-    //                         where N comes from `atrous_passes` (1..3,
-    //                         clamped). 1 = 5x5 footprint, 2 = 9x9,
-    //                         3 = 17x17 (canonical SVGF).
+    //                         where N comes from `atrous_passes` (1..5,
+    //                         clamped). Footprint doubles per pass:
+    //                         1 = 5x5, 2 = 9x9, 3 = 17x17, 4 = 33x33,
+    //                         5 = 65x65 (canonical SVGF).
     void Encode(VkCommandBuffer cb,
                 TextureHandle   color_in,
                 TextureHandle   depth_in,
@@ -86,7 +87,7 @@ public:
                 float           bloom_intensity,
                 bool            reset_history,
                 bool            atrous_enabled,
-                std::uint32_t   atrous_passes,  // 1..3
+                std::uint32_t   atrous_passes,  // 1..5
                 bool            hdr_pipeline);
 
     // True after Init() succeeded. Used by VulkanDevice::SupportsDenoise.

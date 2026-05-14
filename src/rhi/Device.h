@@ -185,11 +185,14 @@ public:
         Quality quality = Quality::Atrous;
 
         // SVGF-atrous only: number of A-Trous wavelet passes to dispatch
-        // after the temporal accumulation. Each pass widens the
-        // edge-aware footprint (step 1 -> step 2 -> step 4 -> ...). The
-        // engine drives this from the r_svgf_atrous_passes cvar; the
-        // backend clamps to 1..3 internally. Ignored by SVGF-basic
-        // (which skips the spatial chain entirely) and by MetalFX/OptiX.
+        // after the temporal accumulation. Each pass keeps the same 5x5
+        // binomial kernel but doubles the tap stride (1 -> 2 -> 4 -> 8
+        // -> 16), so the effective edge-aware footprint doubles per
+        // pass at constant tap cost. The engine drives this from the
+        // r_svgf_atrous_passes cvar; the backend clamps to 1..5
+        // internally (5 = canonical SVGF / Schied 2017). Ignored by
+        // SVGF-basic (which skips the spatial chain entirely) and by
+        // MetalFX/OptiX.
         std::uint32_t atrous_passes = 1;
 
         // Which denoiser implementation the backend should route to.

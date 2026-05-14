@@ -78,9 +78,12 @@ public:
     //   atrous_enabled -- true runs the spatial filter, false blits
     //     history_write -> output (svgf_basic).
     //   atrous_passes -- number of A-Trous wavelet passes when
-    //     atrous_enabled (1..3, clamped here). 1 = 5x5 effective
-    //     footprint (default); 2 = 9x9; 3 = 17x17 canonical SVGF.
-    //     Ignored when atrous_enabled is false.
+    //     atrous_enabled (1..5, clamped here). The A-Trous structure
+    //     keeps the same 5x5 binomial kernel but doubles its tap
+    //     stride per pass (1, 2, 4, 8, 16). Effective footprint:
+    //     1 = 5x5 (default), 2 = 9x9, 3 = 17x17, 4 = 33x33,
+    //     5 = 65x65 (canonical SVGF / Schied 2017). Ignored when
+    //     atrous_enabled is false.
     void Encode(MTL::CommandBuffer* cb,
                 MTL::Texture*       color_in,
                 MTL::Texture*       depth_in,

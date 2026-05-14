@@ -354,18 +354,22 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
     }
 
     // ---- A-Trous chain (atrous_enabled only) -----------------------
-    // The caller picks pass count (1..3) via r_svgf_atrous_passes:
-    //   1 = step=1 only         (5x5 effective)
-    //   2 = step=1, step=2      (9x9 effective)
-    //   3 = step=1, step=2, 4   (17x17, canonical SVGF)
-    // Pass 1 always writes to hist_write so it doubles as next frame's
-    // reprojection source (Schied's feedback). When the chain has only
-    // one pass we blit hist_write -> output below; for multi-pass the
-    // LAST pass writes directly to output.
+    // The caller picks pass count (1..5) via r_svgf_atrous_passes:
+    //   1 = step=1                       (5x5  effective)
+    //   2 = step=1, 2                    (9x9)
+    //   3 = step=1, 2, 4                 (17x17)
+    //   4 = step=1, 2, 4, 8              (33x33)
+    //   5 = step=1, 2, 4, 8, 16          (65x65, canonical SVGF)
+    // Pass 1 ALWAYS writes to hist_write so it doubles as next frame's
+    // reprojection source (Schied's feedback). For n_passes >= 2 the
+    // LAST pass writes to the caller's output; intermediate passes
+    // ping-pong atrous_a / atrous_b. With one pass we instead blit
+    // hist_write -> output at the end (one pass is both Schied feedback
+    // AND user output).
     if (atrous_enabled) {
         std::uint32_t n_passes = atrous_passes;
         if (n_passes < 1u) n_passes = 1u;
-        if (n_passes > 3u) n_passes = 3u;
+        if (n_passes > 5u) n_passes = 5u;
 
         MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
         enc->setComputePipelineState(atrous_pso_);
@@ -421,25 +425,32 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
             enc->memoryBarrier(MTL::BarrierScope(MTL::BarrierScopeTextures |
                                                 MTL::BarrierScopeBuffers));
         };
-        // Pass 1 always: temporal scratch (atrous_a_) -> hist_write.
-        // For n_passes == 1 this is the only pass and hist_write feeds
-        // both the next-frame history (Schied) AND the user output via
-        // a blit below. For n_passes >= 2 hist_write is just the
-        // history target; the final pass writes the user output.
-        atrous_pass(atrous_a_, hist_write, variance_a_, variance_b_, 1u);
-
-        if (n_passes >= 2u) {
-            // Step=2. Last pass when n_passes == 2; otherwise feeds
-            // into pass 3 via atrous_b_.
-            MTL::Texture* p2_dst = (n_passes == 2u) ? output : atrous_b_;
-            atrous_pass(hist_write, p2_dst,
-                        variance_b_, variance_a_, 2u);
-        }
-        if (n_passes >= 3u) {
-            // Step=4. Always the last pass when present -> writes
-            // straight to the user output.
-            atrous_pass(atrous_b_, output,
-                        variance_a_, variance_b_, 4u);
+        // Pass schedule. Color ping-pong:
+        //   pass 1: atrous_a_ -> hist_write     (Schied feedback target)
+        //   pass 2: hist_write -> atrous_b_     (or -> output if last)
+        //   pass i (i>=3, not last): toggles atrous_a_ <-> atrous_b_
+        //   pass N (last, N>=2):              -> output
+        // Variance ping-pong is independent: starts variance_a -> b on
+        // pass 1, then alternates each pass.
+        MTL::Texture* color_src   = atrous_a_;
+        MTL::Buffer*  var_src     = variance_a_;
+        MTL::Buffer*  var_dst     = variance_b_;
+        for (std::uint32_t i = 1; i <= n_passes; ++i) {
+            const std::uint32_t step = 1u << (i - 1u);
+            MTL::Texture* color_dst;
+            if (i == 1u) {
+                color_dst = hist_write;
+            } else if (i == n_passes) {
+                color_dst = output;
+            } else {
+                // Even i -> atrous_b_, odd i -> atrous_a_. After pass 1
+                // atrous_a_ is no longer read, so we're free to reuse
+                // it as a ping-pong scratch for i >= 3.
+                color_dst = (i % 2u == 0u) ? atrous_b_ : atrous_a_;
+            }
+            atrous_pass(color_src, color_dst, var_src, var_dst, step);
+            color_src = color_dst;
+            std::swap(var_src, var_dst);
         }
         enc->endEncoding();
 

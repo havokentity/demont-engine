@@ -701,17 +701,20 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
 
     if (atrous_enabled) {
         // ---- A-Trous chain ---------------------------------------------
-        // Caller picks pass count (1..3) via r_svgf_atrous_passes:
-        //   1 = step=1 only         (5x5 effective)
-        //   2 = step=1, step=2      (9x9 effective)
-        //   3 = step=1, step=2, 4   (17x17, canonical SVGF)
+        // Caller picks pass count (1..5) via r_svgf_atrous_passes:
+        //   1 = step=1                       (5x5  effective)
+        //   2 = step=1, 2                    (9x9)
+        //   3 = step=1, 2, 4                 (17x17)
+        //   4 = step=1, 2, 4, 8              (33x33)
+        //   5 = step=1, 2, 4, 8, 16          (65x65, canonical SVGF)
         // Pass 1 always writes to v_hist_write so it doubles as next
         // frame's reprojection source (Schied feedback). For n_passes
         // == 1 we vkCmdCopyImage hist_write -> output below; for
-        // multi-pass the LAST pass writes directly into v_output.
+        // multi-pass the LAST pass writes directly into v_output and
+        // intermediates ping-pong v_atrous_a / v_atrous_b.
         std::uint32_t n_passes = atrous_passes;
         if (n_passes < 1u) n_passes = 1u;
-        if (n_passes > 3u) n_passes = 3u;
+        if (n_passes > 5u) n_passes = 5u;
 
         auto atrous_pass = [&](VkImageView color_src, VkImageView color_dst,
                                VkBuffer var_src, VkBuffer var_dst,
@@ -750,26 +753,30 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                        &p, sizeof(p), gx, gy);
             ComputeChainBarrier(cb);
         };
-        // Pass 1 always: temporal scratch (v_atrous_a) -> v_hist_write.
-        // For n_passes == 1 this is the only pass and v_hist_write
-        // feeds both the next-frame history (Schied) AND the user
-        // output via a vkCmdCopyImage below. For n_passes >= 2
-        // hist_write is just the history target; the final pass
-        // writes the user output directly.
-        atrous_pass(v_atrous_a, v_hist_write, b_variance_a, b_variance_b, 1u);
-
-        if (n_passes >= 2u) {
-            // Step=2. Last pass when n_passes == 2; otherwise feeds
-            // into pass 3 via v_atrous_b.
-            VkImageView p2_dst = (n_passes == 2u) ? v_output : v_atrous_b;
-            atrous_pass(v_hist_write, p2_dst,
-                        b_variance_b, b_variance_a, 2u);
-        }
-        if (n_passes >= 3u) {
-            // Step=4. Always the last pass when present -> writes
-            // straight to v_output.
-            atrous_pass(v_atrous_b, v_output,
-                        b_variance_a, b_variance_b, 4u);
+        // Pass schedule. Color ping-pong:
+        //   pass 1: v_atrous_a -> v_hist_write     (Schied feedback)
+        //   pass i (1<i<N): toggles v_atrous_b / v_atrous_a
+        //   pass N (last, N>=2):                  -> v_output
+        // Variance ping-pong is independent: starts variance_a -> b on
+        // pass 1, then alternates each pass.
+        VkImageView color_src = v_atrous_a;
+        VkBuffer    var_src   = b_variance_a;
+        VkBuffer    var_dst   = b_variance_b;
+        for (std::uint32_t i = 1; i <= n_passes; ++i) {
+            const std::uint32_t step = 1u << (i - 1u);
+            VkImageView color_dst;
+            if (i == 1u) {
+                color_dst = v_hist_write;
+            } else if (i == n_passes) {
+                color_dst = v_output;
+            } else {
+                // After pass 1 v_atrous_a is no longer read, so it's
+                // free to re-enter the ping-pong from pass 3 onward.
+                color_dst = (i % 2u == 0u) ? v_atrous_b : v_atrous_a;
+            }
+            atrous_pass(color_src, color_dst, var_src, var_dst, step);
+            color_src = color_dst;
+            std::swap(var_src, var_dst);
         }
 
         if (n_passes == 1u) {

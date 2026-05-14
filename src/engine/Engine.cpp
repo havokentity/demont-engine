@@ -143,13 +143,18 @@ namespace cvar {
             CVAR_ARCHIVE);
     PT_CVAR(r_svgf_atrous_passes, "1",
             "Number of A-Trous wavelet passes the in-house SVGF denoiser "
-            "runs after the temporal accumulation. 1 = effective 5x5 "
-            "footprint (default, cleanest detail). 2 = 9x9 (extra cleanup "
-            "in dim indirect / low-freq noise). 3 = 17x17 (canonical SVGF "
-            "paper config; may compound smoothing across frames via the "
-            "Schied feedback loop). Clamped to 1..3. Only affects "
-            "r_denoiser svgf_atrous / nrd; svgf_basic skips the spatial "
-            "chain entirely.",
+            "runs after the temporal accumulation. The A-Trous structure "
+            "keeps the same 5x5 binomial kernel but multiplies its tap "
+            "stride per pass (1, 2, 4, 8, 16) -- constant 25 taps per pass, "
+            "effective footprint doubles per pass. "
+            "1 = 5x5 (default, sharpest). "
+            "2 = 9x9 (mild large-scale cleanup). "
+            "3 = 17x17. "
+            "4 = 33x33 (helps low-freq indirect / soft AO). "
+            "5 = 65x65 (canonical SVGF / Schied 2017 paper config). "
+            "Clamped to 1..5. Higher passes cost ~1 ms each at 1080p; "
+            "only affects r_denoiser svgf_atrous / nrd (svgf_basic skips "
+            "the spatial chain entirely).",
             CVAR_ARCHIVE);
     PT_CVAR(r_hdr_pipeline,    "1",  "Linear-HDR pipeline through MetalFX. 1 = path tracer writes raw HDR, MetalFX denoises in HDR, post-pass applies exposure+ACES (recommended). 0 = path tracer pre-applies exposure+ACES, MetalFX denoises LDR, tonemap pass is a passthrough copy. Only affects the denoiser-on path.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom,           "1",  "HDR bloom (downsample/upsample pyramid, additive composite before ACES). 0 disables; tonemap then samples a 1x1 zero buffer.", CVAR_ARCHIVE);
@@ -2648,15 +2653,15 @@ void Engine::RenderFrame() {
         dd.quality = (denoiser_kind_ == DenoiserKind::SvgfBasic)
                          ? pt::rhi::Device::DenoiseDesc::Quality::Basic
                          : pt::rhi::Device::DenoiseDesc::Quality::Atrous;
-        // A-Trous pass count for the in-house SVGF chain. Cvar-driven so
-        // the user can A/B 1 vs 2 vs 3 at runtime; clamped here so a
-        // typo in the console can't push us beyond the texture/buffer
-        // ping-pong the backend allocates for.
+        // A-Trous pass count for the in-house SVGF chain. Cvar-driven
+        // so the user can A/B 1..5 at runtime; clamped to [1,5] here
+        // so a typo in the console can't push us past what the backend
+        // supports (steps 1, 2, 4, 8, 16 -- 5 is canonical SVGF).
         std::uint32_t atrous_passes_want = 1;
         if (auto* v = C.FindCVar("r_svgf_atrous_passes")) {
             int n = v->GetInt();
             if (n < 1) n = 1;
-            if (n > 3) n = 3;
+            if (n > 5) n = 5;
             atrous_passes_want = static_cast<std::uint32_t>(n);
         }
         dd.atrous_passes = atrous_passes_want;
