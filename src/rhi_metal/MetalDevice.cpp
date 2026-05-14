@@ -326,6 +326,12 @@ MetalDevice::~MetalDevice() {
     // device_ and need to release while it's still valid.
     svgf_denoiser_.reset();
     if (metalfx_scaler_) { pt_metalfx_destroy(metalfx_scaler_); metalfx_scaler_ = nullptr; }
+    if (svgf_metalfx_intermediate_) {
+        svgf_metalfx_intermediate_->release();
+        svgf_metalfx_intermediate_   = nullptr;
+        svgf_metalfx_intermediate_w_ = 0;
+        svgf_metalfx_intermediate_h_ = 0;
+    }
     {
         std::lock_guard lock(resource_mutex_);
         for (auto& [_, p] : pipelines_) if (p) p->release();
@@ -367,7 +373,9 @@ void MetalDevice::Denoise(const DenoiseDesc& d) {
     // MetalFX scaler and our SVGF chain create their own encoders.
     cmd_->FlushEncoder();
 
-    if (d.kind == DenoiseDesc::Kind::Svgf) {
+    const bool kind_is_svgf       = (d.kind == DenoiseDesc::Kind::Svgf);
+    const bool kind_is_svgf_chain = (d.kind == DenoiseDesc::Kind::SvgfMetalFx);
+    if (kind_is_svgf || kind_is_svgf_chain) {
         // In-house SVGF / atrous chain. normal_in is required (the
         // engine allocates it whenever r_denoiser is svgf_*). The
         // shaders treat a zero-normal sentinel as "no surface" so a
@@ -393,11 +401,78 @@ void MetalDevice::Denoise(const DenoiseDesc& d) {
         }
         const bool atrous_enabled =
             (d.quality == DenoiseDesc::Quality::Atrous);
+
+        // For the SVGF -> MetalFX chain, route SVGF's output through
+        // an intermediate texture so MetalFX can read it as its color
+        // input. For plain SVGF we write straight to the caller's
+        // output texture as before.
+        MTL::Texture* svgf_target = color_out;
+        if (kind_is_svgf_chain) {
+            if (svgf_metalfx_intermediate_ == nullptr ||
+                svgf_metalfx_intermediate_w_ != w ||
+                svgf_metalfx_intermediate_h_ != h) {
+                if (svgf_metalfx_intermediate_ != nullptr) {
+                    svgf_metalfx_intermediate_->release();
+                    svgf_metalfx_intermediate_ = nullptr;
+                }
+                NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+                MTL::TextureDescriptor* td =
+                    MTL::TextureDescriptor::texture2DDescriptor(
+                        MTL::PixelFormatRGBA16Float, w, h, /*mipmapped=*/false);
+                td->setUsage(MTL::TextureUsageShaderRead |
+                             MTL::TextureUsageShaderWrite);
+                td->setStorageMode(MTL::StorageModePrivate);
+                svgf_metalfx_intermediate_ = device_->newTexture(td);
+                pool->release();
+                if (svgf_metalfx_intermediate_ == nullptr) {
+                    LOG_ERROR("MetalDevice::Denoise(svgf_metalfx): "
+                              "intermediate texture alloc failed at {}x{}", w, h);
+                    return;
+                }
+                svgf_metalfx_intermediate_w_ = w;
+                svgf_metalfx_intermediate_h_ = h;
+            }
+            svgf_target = svgf_metalfx_intermediate_;
+        }
+
         svgf_denoiser_->Encode(cmd_->RawCmdBuf(),
                                 color_in, depth_in, motion_in, normal_in,
-                                color_out,
+                                svgf_target,
                                 d.reset_history, atrous_enabled,
                                 d.atrous_passes);
+
+        if (!kind_is_svgf_chain) return;
+
+        // Chain mode: MetalFX TemporalDenoisedScaler now reads the
+        // SVGF-denoised intermediate and applies its ML TAA + edge
+        // refinement on top, writing into the caller's color_out.
+        // SVGF already ended its compute encoder; pt_metalfx_encode
+        // opens its own.
+        if (metalfx_scaler_ == nullptr ||
+            metalfx_width_  != w ||
+            metalfx_height_ != h) {
+            if (metalfx_scaler_) {
+                pt_metalfx_destroy(metalfx_scaler_);
+                metalfx_scaler_ = nullptr;
+            }
+            metalfx_scaler_ = pt_metalfx_create(static_cast<void*>(device_), w, h);
+            if (metalfx_scaler_ == nullptr) {
+                LOG_ERROR("MetalDevice::Denoise(svgf_metalfx): MetalFX scaler "
+                          "create failed (size {}x{})", w, h);
+                return;
+            }
+            metalfx_width_  = w;
+            metalfx_height_ = h;
+        }
+        pt_metalfx_encode(metalfx_scaler_,
+                          static_cast<void*>(cmd_->RawCmdBuf()),
+                          static_cast<void*>(svgf_metalfx_intermediate_),
+                          static_cast<void*>(depth_in),
+                          static_cast<void*>(motion_in),
+                          static_cast<void*>(color_out),
+                          d.jitter_x, d.jitter_y,
+                          d.world_to_view, d.view_to_clip,
+                          d.reset_history ? 1 : 0);
         return;
     }
 

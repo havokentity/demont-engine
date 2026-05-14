@@ -136,10 +136,15 @@ namespace cvar {
             "history; closes the per-frame flicker gap vs SVGF on static "
             "scenes while keeping OptiX's no-ghosting motion behaviour. "
             "optix_temporal_hdr_aov = optix_temporal_hdr + albedo+normal "
-            "AOV guides; the strongest OptiX variant. Mac builds accept "
-            "svgf_basic / svgf_atrous / nrd (in-house SVGF) and metalfx; "
-            "they ignore optix_*. Non-NVIDIA Vulkan builds ignore "
-            "optix_*; Vulkan builds ignore metalfx.",
+            "AOV guides; the strongest OptiX variant. "
+            "svgf_basic_metalfx / svgf_atrous_metalfx = SVGF on Metal "
+            "followed by MetalFX TemporalDenoisedScaler as a finalizer "
+            "(ML TAA on top of SVGF-denoised input -- cleanest edge AA "
+            "available; Mac only). Mac builds accept "
+            "svgf_basic / svgf_atrous / svgf_basic_metalfx / "
+            "svgf_atrous_metalfx / nrd / metalfx; they ignore optix_*. "
+            "Non-NVIDIA Vulkan builds ignore optix_*; Vulkan builds "
+            "ignore metalfx / *_metalfx.",
             CVAR_ARCHIVE);
     PT_CVAR(r_svgf_atrous_passes, "1",
             "Number of A-Trous wavelet passes the in-house SVGF denoiser "
@@ -1574,13 +1579,16 @@ void Engine::RenderFrame() {
         } else if (current_backend_ == BackendType::Metal) {
             // SVGF on Metal: same in-house SVGF chain as Vulkan, same
             // Slang sources cross-compiled to MSL. svgf_basic = temporal
-            // only; svgf_atrous = temporal + 3-pass a-trous. The `nrd`
-            // alias accepts the same value on Metal -- it falls through
-            // to svgf_atrous today, matching the Vulkan placeholder
-            // behaviour so a user's r_denoiser=nrd setting works on
-            // either backend.
+            // only; svgf_atrous = temporal + a-trous (passes set by
+            // r_svgf_atrous_passes). The `nrd` alias falls through to
+            // svgf_atrous today (placeholder for the NVIDIA RayTracingDenoiser
+            // library). The *_metalfx variants chain MetalFX
+            // TemporalDenoisedScaler as a finalizer (ML TAA on top of
+            // SVGF-denoised input) -- highest quality but Mac-only.
             if      (s == "svgf_basic")            want_kind = DenoiserKind::SvgfBasic;
             else if (s == "svgf_atrous")           want_kind = DenoiserKind::SvgfAtrous;
+            else if (s == "svgf_basic_metalfx")    want_kind = DenoiserKind::SvgfBasicMetalFx;
+            else if (s == "svgf_atrous_metalfx")   want_kind = DenoiserKind::SvgfAtrousMetalFx;
             else if (s == "nrd")                   want_kind = DenoiserKind::Nrd;
         } else if (current_backend_ == BackendType::Vulkan) {
             if      (s == "svgf_basic")            want_kind = DenoiserKind::SvgfBasic;
@@ -1617,8 +1625,14 @@ void Engine::RenderFrame() {
             LOG_INFO("engine: r_denoiser=svgf_basic -- temporal accumulation only "
                      "(no spatial filter)");
         } else if (want_kind == DenoiserKind::SvgfAtrous) {
-            LOG_INFO("engine: r_denoiser=svgf_atrous -- temporal + 3-pass a-trous "
+            LOG_INFO("engine: r_denoiser=svgf_atrous -- temporal + a-trous "
                      "edge-aware filter");
+        } else if (want_kind == DenoiserKind::SvgfBasicMetalFx) {
+            LOG_INFO("engine: r_denoiser=svgf_basic_metalfx -- SVGF (temporal only) "
+                     "-> MetalFX TemporalDenoisedScaler chain");
+        } else if (want_kind == DenoiserKind::SvgfAtrousMetalFx) {
+            LOG_INFO("engine: r_denoiser=svgf_atrous_metalfx -- SVGF (temporal + a-trous) "
+                     "-> MetalFX TemporalDenoisedScaler chain");
         } else if (want_kind == DenoiserKind::MetalFX) {
             LOG_INFO("engine: r_denoiser=metalfx -- MetalFX TemporalDenoisedScaler active");
         } else if (want_kind == DenoiserKind::OptixHdr) {
@@ -1731,6 +1745,8 @@ void Engine::RenderFrame() {
     const bool want_normal_gbuffer =
         (denoiser_kind_ == DenoiserKind::SvgfBasic           ||
          denoiser_kind_ == DenoiserKind::SvgfAtrous          ||
+         denoiser_kind_ == DenoiserKind::SvgfBasicMetalFx    ||
+         denoiser_kind_ == DenoiserKind::SvgfAtrousMetalFx   ||
          denoiser_kind_ == DenoiserKind::Nrd                 ||
          denoiser_kind_ == DenoiserKind::OptixHdrAov         ||
          denoiser_kind_ == DenoiserKind::OptixTemporalHdrAov);
@@ -2647,10 +2663,13 @@ void Engine::RenderFrame() {
         dd.jitter_y      = last_jitter_y_;
         dd.reset_history = !prev_view_proj_valid_;
         // Map the engine's denoiser kind to the RHI quality tier. Nrd
-        // and SvgfAtrous both run the full a-trous chain today; only
-        // SvgfBasic skips the spatial filter. MetalFX ignores the
-        // quality field entirely.
-        dd.quality = (denoiser_kind_ == DenoiserKind::SvgfBasic)
+        // and the various Atrous variants all run the full a-trous
+        // chain; only SvgfBasic / SvgfBasicMetalFx skip the spatial
+        // filter. MetalFX ignores the quality field entirely.
+        const bool quality_is_basic =
+            (denoiser_kind_ == DenoiserKind::SvgfBasic ||
+             denoiser_kind_ == DenoiserKind::SvgfBasicMetalFx);
+        dd.quality = quality_is_basic
                          ? pt::rhi::Device::DenoiseDesc::Quality::Basic
                          : pt::rhi::Device::DenoiseDesc::Quality::Atrous;
         // A-Trous pass count for the in-house SVGF chain. Cvar-driven
@@ -2687,6 +2706,9 @@ void Engine::RenderFrame() {
             dd.kind = pt::rhi::Device::DenoiseDesc::Kind::OptixHdrAov;
         } else if (denoiser_kind_ == DenoiserKind::MetalFX) {
             dd.kind = pt::rhi::Device::DenoiseDesc::Kind::MetalFX;
+        } else if (denoiser_kind_ == DenoiserKind::SvgfBasicMetalFx ||
+                   denoiser_kind_ == DenoiserKind::SvgfAtrousMetalFx) {
+            dd.kind = pt::rhi::Device::DenoiseDesc::Kind::SvgfMetalFx;
         } else {
             dd.kind = pt::rhi::Device::DenoiseDesc::Kind::Svgf;
         }
