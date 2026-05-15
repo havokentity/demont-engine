@@ -120,7 +120,7 @@ Texture2D<float4> moon_map;
 // final tonemap, no host round-trip.
 [[vk::binding(15, 0)]] RWStructuredBuffer<float> exposure_state;
 
-// The full PtPush is 720 bytes today (112 B head + 608 B tail; see the
+// The full PtPush is 736 bytes today (112 B head + 624 B tail; see the
 // static_assert at the dispatch site in Engine.cpp). Native Vulkan / NVIDIA
 // caps push constants at 256B, so on SPIR-V we keep only the small
 // per-dispatch prefix (camera basis + flags + jitter, 112B) in
@@ -277,7 +277,7 @@ cbuffer Push {
 #ifdef PT_TARGET_SPIRV
 // Spilled tail of PtPush — see the comments in the (Metal) Push cbuffer
 // above for per-field semantics. Layout is byte-equivalent to bytes
-// [112..448] of the host PtPush struct in Engine.cpp. Bound by
+// [112..736] of the host PtPush struct in Engine.cpp. Bound by
 // VulkanCommandBuffer::Dispatch from a per-frame ring-buffer UBO.
 [[vk::binding(14, 0)]]
 cbuffer Frame {
