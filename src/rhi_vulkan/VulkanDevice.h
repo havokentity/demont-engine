@@ -97,6 +97,9 @@ public:
     bool ReadbackTexture(TextureHandle h, void* dst, std::size_t dst_size,
                          std::uint32_t* out_w, std::uint32_t* out_h) override;
     bool ReadbackBuffer (BufferHandle  h, void* dst, std::size_t bytes) override;
+    bool ReadbackSwapchain(void* dst, std::size_t dst_size,
+                           std::uint32_t* out_w, std::uint32_t* out_h,
+                           SwapFormat* out_format) override;
 
     FrameContext   BeginFrame() override;
     void           EndFrame(CommandBuffer*) override;
@@ -247,6 +250,20 @@ private:
     std::vector<VkImage>        swap_images_;
     std::vector<VkImageView>    swap_views_;
 
+    // ReadbackSwapchain handshake: two atomics + a persistent host-
+    // coherent staging buffer (declared further down, alongside the
+    // BufferEntry definition).
+    //   swap_capture_requested_: set by the caller, consumed by the
+    //                            next Submit() (which inserts the
+    //                            vkCmdCopyImageToBuffer + sets the
+    //                            "consumed" flag below).
+    //   swap_capture_consumed_:  set by Submit() once the copy has
+    //                            been recorded into the cmd buffer.
+    //                            The caller WaitIdle's after seeing
+    //                            this so the GPU work also completes.
+    std::atomic<bool>           swap_capture_requested_ { false };
+    std::atomic<bool>           swap_capture_consumed_  { false };
+
     // Per-frame in flight: 2-deep
     static constexpr int kFramesInFlight = 2;
     int                       current_frame_ = 0;
@@ -339,7 +356,26 @@ private:
 #endif
 
     VkDescriptorPool dpool_ = VK_NULL_HANDLE;
-    VkDescriptorSet  dsets_[kFramesInFlight] {};
+    // Ring of descriptor sets for the shared 17-binding layout. Why a
+    // ring and not one set per frame: the shared layout uses
+    // UPDATE_AFTER_BIND on every binding so the engine can rewrite
+    // bindings between dispatches in the same cmd buffer. Per the
+    // Vulkan spec, the GPU reads UPDATE_AFTER_BIND descriptors at
+    // command-EXECUTION time, not record time -- which means if we
+    // share one set across multiple recorded dispatches and update
+    // its bindings between them, ALL dispatches end up reading the
+    // LATEST update at execution. The path-tracer's `output` binding
+    // would observe whatever the last bloom_down rebinding left, and
+    // its output.GetDimensions() would return the wrong dimensions.
+    // The ring sidesteps this: each Dispatch() takes a fresh set from
+    // dsets_[current_frame_][next_dispatch_set_], so each dispatch's
+    // bindings are isolated. next_dispatch_set_ is reset to 0 in
+    // AcquireCommandBuffer. Total live sets = kFramesInFlight *
+    // kDispatchSetsPerFrame -- conservative cap that covers PathTrace
+    // + autoexpose + 9 bloom (5 down + 4 up) + perfoverlay + room.
+    static constexpr int kDispatchSetsPerFrame = 24;
+    VkDescriptorSet  dsets_[kFramesInFlight][kDispatchSetsPerFrame] {};
+    int              next_dispatch_set_ = 0;
 
     struct ImageEntry {
         VkImage        image  = VK_NULL_HANDLE;
@@ -358,6 +394,14 @@ private:
         void*           mapped         = nullptr; // non-null iff host-visible & persistent
     };
     std::unordered_map<std::uint64_t, BufferEntry> buffers_;
+
+    // Persistent staging buffer for ReadbackSwapchain. Allocated /
+    // re-allocated lazily on the first capture request (and on swap
+    // resize), so projects that never trigger the screenshot-swap
+    // path don't pay the ~3MB cost (1280x720x4) at startup. See
+    // ReadbackSwapchain for the rest of the contract.
+    BufferEntry                 swap_capture_staging_ {};
+    std::size_t                 swap_capture_staging_capacity_ = 0;
 
     struct AccelEntry {
         VkAccelerationStructureKHR accel          = VK_NULL_HANDLE;
@@ -405,7 +449,19 @@ public:
     VkExtent2D          LookupImageExtent(TextureHandle h);
     VkBuffer            LookupBuffer(BufferHandle h);
     VkAccelerationStructureKHR LookupAccel(AccelStructHandle h);
-    VkDescriptorSet     CurrentDescriptorSet() const { return dsets_[current_frame_]; }
+    // Hand out the next descriptor set in this frame's ring and
+    // advance the cursor. Called once per Dispatch so each dispatch
+    // gets its own set (see kDispatchSetsPerFrame's comment for why
+    // we can't reuse one set across multiple dispatches with
+    // UPDATE_AFTER_BIND). Wraps if a frame issues more than
+    // kDispatchSetsPerFrame dispatches -- which would re-introduce
+    // the sharing bug for whichever dispatches collide; bump the
+    // constant if you see it.
+    VkDescriptorSet AcquireDispatchDescriptorSet() {
+        VkDescriptorSet s = dsets_[current_frame_][next_dispatch_set_];
+        next_dispatch_set_ = (next_dispatch_set_ + 1) % kDispatchSetsPerFrame;
+        return s;
+    }
     VkPipelineLayout    SharedPipelineLayout() const { return shared_pipe_layout_; }
     const BufferEntry&  CurrentFrameUbo() const { return frame_ubos_[current_frame_]; }
     std::uint32_t       MaxPushConstantSize() const { return max_push_constant_size_; }

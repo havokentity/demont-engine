@@ -90,6 +90,36 @@ public:
         return false;
     }
 
+    // Read the most-recently-submitted swapchain image back to CPU.
+    // The destination must be at least width*height*4 bytes; pixels
+    // come back as a tight-packed buffer in `out_format` order.
+    // Returns true on success.
+    //
+    // Implementation contract: the backend latches a "capture next
+    // submit" flag, the next Submit() inserts a copy-image-to-buffer
+    // of the swap image (in GENERAL layout, BEFORE its transition to
+    // PRESENT_SRC_KHR) into a host-coherent staging buffer, then this
+    // call blocks (WaitIdle + poll) until the staging buffer has the
+    // captured data and memcpys it out.
+    //
+    // Use case: debugging / screenshot tools that need to compare the
+    // actual presented pixels against engine-managed scratch textures
+    // (post_denoise_hdr, denoise_color, etc.) -- independent of OS-
+    // level compositing, window-position, occlusion. Synchronous, may
+    // stall the GPU; intended for one-shot user-triggered capture.
+    enum class SwapFormat : std::uint8_t {
+        Bgra8Unorm,    // raw 8-bit BGRA, linear in storage
+        Bgra8Srgb,     // 8-bit BGRA, sRGB-encoded in storage
+        Rgba8Unorm,
+        Rgba8Srgb,
+        Other          // backend-specific; caller treats as opaque BGRA-ish
+    };
+    virtual bool ReadbackSwapchain(void* /*dst*/, std::size_t /*dst_size*/,
+                                   std::uint32_t* /*out_w*/, std::uint32_t* /*out_h*/,
+                                   SwapFormat* /*out_format*/) {
+        return false;
+    }
+
     // Capability + introspection.
     virtual BackendType  Type()             const = 0;
     virtual bool         SupportsHardwareRT() const = 0;
@@ -232,6 +262,27 @@ public:
             // MetalFX. On Vulkan this falls back to Kind::Svgf (the
             // base denoiser still runs; the MetalFX chain is dropped).
             SvgfMetalFx,
+            // Skip every temporal / spatial denoising pass and run JUST
+            // the swapchain finalize stage (linear HDR -> exposure ->
+            // ACES -> sRGB OETF + bloom composite, written into
+            // final_output). Used by the engine's "bloom-without-
+            // denoiser" path on backends where the standalone Tonemap.
+            // slang compute kernel doesn't reach the swapchain
+            // correctly (Vulkan today -- documented in Engine.cpp's
+            // use_engine_tonemap comment block). Inputs:
+            //   - color_in:        linear-HDR source (engine's
+            //                      denoise_color, the path tracer's
+            //                      per-frame HDR-aux write)
+            //   - final_output:    swapchain image
+            //   - bloom_in:        bloom_mip[0], or handle 0 if bloom is off
+            //   - bloom_intensity: linear blend factor (matches the
+            //                      cvar; 0 == bloom add skipped)
+            //   - exposure_state:  GPU-resident exposure scalar buffer
+            //   - hdr_pipeline:    true = ACES + sRGB, false = sRGB-only
+            // Backends that don't implement this kind (Metal, software)
+            // can no-op the call -- the engine's caller checks
+            // SupportsDenoise() / current_backend_ before issuing.
+            FinalizeOnly,
         };
         Kind kind = Kind::Svgf;
         // Required by MetalFX TemporalDenoisedScaler. Column-major 4x4

@@ -362,6 +362,20 @@ private:
     int                                         accum_h_               = 0;
     std::uint32_t                               frame_index_           = 0;
 
+    // `screenshot ... swap` deferred-capture state. The screenshot
+    // lambda runs in Console::Drain on the main render thread BEFORE
+    // RenderFrame; blocking inside it would deadlock Submit, so we
+    // queue the request, store the output path here, and let
+    // Engine::Tick poll Device::ReadbackSwapchain across frames until
+    // it returns true (= consume + WaitIdle done, staging bytes
+    // ready). Empty string = no capture pending.
+    std::string                                 pending_swap_screenshot_path_;
+    // Ticks elapsed since the screenshot was queued. Used to bound
+    // the wait: if Submit never consumes the request (device down,
+    // suspended loop, etc.), give up after a few seconds rather than
+    // leaving the pending state forever stuck.
+    int                                         pending_swap_screenshot_ticks_ = 0;
+
     // Tracks whether the loading-frame branch in RenderFrame has
     // ever fired (i.e. the Vulkan async pipeline build was still in
     // flight when we hit our first frame). Used to log a single
