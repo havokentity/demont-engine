@@ -4892,8 +4892,9 @@ void Engine::RegisterCommands() {
     // r_accum_ema_alpha switches the accumulator update rule (online
     // running mean vs EMA blend); reusing history captured under the
     // previous algorithm would mix incompatible weights (a count-based
-    // average alongside an exponential-decay average). Start a fresh
-    // accumulation epoch on every toggle.
+    // average alongside an exponential-decay average). Changing it
+    // mid-render against a non-zero prev.a would also instantly mix modes
+    // for a jittery frame. Start a fresh accumulation epoch on every toggle.
     if (auto* v = C.FindCVar("r_accum_ema_alpha")) {
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
