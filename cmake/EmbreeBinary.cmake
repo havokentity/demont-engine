@@ -24,22 +24,96 @@
 #       libembree4.a    (macOS / Linux)
 #       embree4.lib     (Windows)
 #
-# Cache dir: ${FETCHCONTENT_BASE_DIR}/embree-prebuilt-<version>/
-# (using the same env-driven path as the rest of FetchContent so the
-# external-drive workaround stays consistent).
+# Cache dir: ${FETCHCONTENT_BASE_DIR}/embree-prebuilt-<artefact_name>/
+# (e.g. embree-prebuilt-embree-v4.4.0-cfg1-macos-arm64/).  Encodes
+# platform + config in the path so cross-host shared caches (NFS-
+# mounted $HOME, multi-stage container builds, two-devbox cloud
+# drives) can't mistakenly serve the wrong-arch prebuilt -- each
+# platform's tarball expands into its own directory.  Uses the same
+# env-driven FETCHCONTENT_BASE_DIR as the rest of FetchContent so the
+# external-drive workaround stays consistent.
 
 include_guard(GLOBAL)
 include(${CMAKE_CURRENT_LIST_DIR}/EmbreeConfig.cmake)
 
 set(EMBREE_PREBUILT_FOUND FALSE)
 
-# Figure out which artefact filename to look for, per host platform.
-# Empty string = unsupported platform; fall through immediately.
-pt_embree_artefact_name(_embree_artefact)
+# Multi-config generators on Windows: bail to source-compile.
+#
+# CMAKE_BUILD_TYPE is empty at configure time for multi-config generators
+# (Visual Studio, Xcode, Ninja Multi-Config) -- the consumer picks the
+# config at build time via `cmake --build --config Debug|Release`.  If
+# we proceeded here we'd download whichever artefact maps to "empty
+# build type" (Release, per the default below), then a later `--config
+# Debug` build would link the Release Embree .lib into Debug demont
+# .obj files and hit the exact LNK2038 _ITERATOR_DEBUG_LEVEL /
+# RuntimeLibrary mismatch this PR set out to avoid.
+#
+# Our CMakePresets.json only ships Ninja (single-config), so the
+# project's supported configure paths all set CMAKE_BUILD_TYPE
+# explicitly.  This guard is defensive: if a user runs
+# `cmake -G "Visual Studio 17 2022"` off-script, they fall back to
+# source-compile of Embree (slow but correct) instead of getting the
+# linker error.
+#
+# Mac + Linux don't need this gate (libc++ doesn't have an iterator-
+# debug-level marker, so mixing Release Embree into a multi-config
+# Debug build is benign there), but applying it cross-platform isn't
+# wrong either -- multi-config + multi-prebuilt is a hairball we just
+# don't need to deal with given Ninja covers every real workflow.
+if(WIN32 AND CMAKE_CONFIGURATION_TYPES)
+    message(STATUS
+        "Embree prebuilt: multi-config generator detected on Windows "
+        "(CMAKE_CONFIGURATION_TYPES=${CMAKE_CONFIGURATION_TYPES}); "
+        "falling back to compile-from-source.  Switch to a Ninja-based "
+        "preset (--preset win-clang-release / win-clang-debug) to "
+        "consume the prebuilt instead.")
+    return()
+endif()
+
+# Pick the artefact for the current host + current build type.  Empty
+# string = unsupported platform; fall through to source compile.
+# CMAKE_BUILD_TYPE may be unset on single-config generators when the
+# user didn't pass -DCMAKE_BUILD_TYPE explicitly; default to Release
+# for the lookup, same as CMake does for unset build-type values.
+#
+# Build type only changes the artefact name on Windows (Release vs
+# Debug Embree must be config-matched because MSVC's STL stamps
+# _ITERATOR_DEBUG_LEVEL + RuntimeLibrary markers at .lib granularity;
+# see EmbreeConfig.cmake's pt_embree_artefact_name for the full
+# rationale).  On Mac + Linux pt_embree_artefact_name always returns
+# the Release artefact regardless of build type.
+if(CMAKE_BUILD_TYPE)
+    set(_embree_buildtype "${CMAKE_BUILD_TYPE}")
+else()
+    set(_embree_buildtype "Release")
+endif()
+pt_embree_artefact_name(_embree_artefact "${_embree_buildtype}")
 if(NOT _embree_artefact)
     message(STATUS "Embree prebuilt: no artefact mapping for this host (CMAKE_SYSTEM_PROCESSOR='${CMAKE_SYSTEM_PROCESSOR}', WIN32=${WIN32}, APPLE=${APPLE}); falling back to compile-from-source.")
     return()
 endif()
+
+# Derive the cache extract directory name from the artefact filename
+# itself (minus archive extension).  Encodes platform + config (where
+# applicable) directly into the cache path so that:
+#
+#   * macos-arm64 / windows-x64 / windows-x64-debug / linux-x64 /
+#     linux-arm64 each get a fully isolated cache subdirectory.
+#   * A shared FETCHCONTENT_BASE_DIR across hosts (e.g. NFS-mounted
+#     $HOME between a Mac and a Linux VM, a multi-stage container
+#     build sharing /root between platform stages, or just two
+#     developers' devboxes accidentally pointing at the same cloud
+#     drive) can't make the second-platform configure see the first-
+#     platform's `embree/lib/libembree4.a` canary and skip the
+#     download -- which would silently link the WRONG-ARCH .a / .lib.
+#   * The Windows-Debug suffix in the artefact name automatically
+#     produces a distinct cache dir from the Windows-Release one,
+#     replacing the old explicit `_embree_cache_suffix` plumbing.
+#
+# Strip both .tar.gz and .zip extensions; the regex handles either.
+set(_embree_cache_basename "${_embree_artefact}")
+string(REGEX REPLACE "\\.(tar\\.gz|zip)$" "" _embree_cache_basename "${_embree_cache_basename}")
 
 # GitHub Release URL.  Tag format: vendored/embree-<version>.  The
 # forward-slash in the tag name needs URL-encoding for the download URL
@@ -65,7 +139,7 @@ elseif(DEFINED FETCHCONTENT_BASE_DIR)
 else()
     set(_embree_cache_root "${CMAKE_BINARY_DIR}/_deps")
 endif()
-set(_embree_extract_dir "${_embree_cache_root}/embree-prebuilt-${EMBREE_VENDORED_VERSION}")
+set(_embree_extract_dir "${_embree_cache_root}/embree-prebuilt-${_embree_cache_basename}")
 set(_embree_archive_path "${_embree_extract_dir}.archive")
 
 # Short-circuit when the cache already has a usable extracted tree.
