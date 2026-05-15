@@ -104,6 +104,18 @@ namespace cvar {
 #else
     PT_CVAR(r_backend,         "vulkan",   "One of none|software|vulkan",      CVAR_ARCHIVE);
 #endif
+    // Software backend's present path on Windows. Default 'vulkan' uses
+    // a minimal VkInstance/VkSurface/VkSwapchain owned by SoftwareDevice
+    // so the window stays in DXGI flip-model presentation throughout
+    // its lifetime -- the only spec-compliant way to keep displaying
+    // after the Vulkan backend ever rendered to the same HWND. 'gdi'
+    // uses SetDIBitsToDevice into the HWND's HDC (lower overhead, no
+    // Vulkan dependency), but is permanently broken once Vulkan ever
+    // touches the window (Microsoft DXGI flip-model lockout, see
+    // https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/for-best-performance--use-dxgi-flip-model);
+    // safe only for software-fresh-start sessions. The cvar takes
+    // effect on the next backend (re)initialise. No-op on Mac/Linux.
+    PT_CVAR(r_software_blit,   "vulkan",   "Software backend present path on Windows: vulkan (default; spec-compliant across all backend switches; minimal extra VkInstance) | gdi (legacy SetDIBitsToDevice; broken after vulkan -> software switch per Microsoft DXGI flip-model lockout). No-op on Mac/Linux.", CVAR_ARCHIVE);
     PT_CVAR(r_max_bounces,     "8",  "Max path bounces per ray",          CVAR_ARCHIVE);
     PT_CVAR(r_spp,             "1",  "Samples per pixel per dispatch (>=1). Higher = cleaner motion frames at proportional GPU cost.", CVAR_ARCHIVE);
     PT_CVAR(r_firefly_clamp,   "10",  "Per-contribution firefly clamp (per-channel ceiling on each indirect light contribution: env-NEE, ambient skylight, bounce-to-sky). Suppresses single-sample spikes from BSDF-sampled bounces hitting an HDRI sun pixel, while leaving camera-direct sky unbounded so the sun renders at full intensity. ACES saturates anything above ~5 to ~1.0 for SDR, so 10 preserves visible highlights and kills fireflies. 0 disables.", CVAR_ARCHIVE);
@@ -838,6 +850,29 @@ void Engine::RequestBackendSwitch(BackendType to) {
     LOG_INFO("backend switch: {} -> {}",
              pt::rhi::BackendName(current_backend_),
              pt::rhi::BackendName(to));
+
+#if defined(_WIN32)
+    // The vulkan->software switch with r_software_blit=gdi will leave
+    // the window stuck on the last Vulkan frame for the rest of the
+    // session (Microsoft DXGI flip-model lockout, see Vulkan
+    // VK_KHR_win32_surface spec note + Microsoft DXGI flip-model docs).
+    // Warn at the actual switch moment, not just at cvar on_change,
+    // so users who saved r_software_blit=gdi in cfg get the warning
+    // when it's most actionable (right before the visual breaks).
+    if (to == BackendType::Software &&
+        current_backend_ == BackendType::Vulkan) {
+        if (auto* v = pt::console::Console::Get().FindCVar("r_software_blit");
+            v && v->value == "gdi") {
+            LOG_WARN("backend switch vulkan -> software with "
+                     "r_software_blit=gdi: window will be permanently "
+                     "stuck on the last Vulkan frame (Microsoft DXGI "
+                     "flip-model lockout). Quit + relaunch with "
+                     "r_backend software (and r_software_blit gdi) "
+                     "in demont.cfg for a clean GDI session, or set "
+                     "r_software_blit vulkan to switch live.");
+        }
+    }
+#endif
 
     TearDownDevice();
 
@@ -5114,6 +5149,41 @@ void Engine::RegisterCommands() {
             else if (cv.value == "vulkan")   t = BackendType::Vulkan;
             RequestBackendSwitch(t);
         };
+    }
+    // r_software_blit: validate the value across all platforms (so cfg
+    // load doesn't bounce a saved value back to default on Mac/Linux),
+    // but only emit the platform-specific WARN/INFO chatter on Win32
+    // -- the cvar is documented as a no-op on Mac/Linux, so users
+    // shouldn't see "selected, takes effect, beware DXGI lockout"
+    // messages there.
+    if (auto* v = C.FindCVar("r_software_blit")) {
+        v->allowed_values = {"vulkan", "gdi"};
+#if defined(_WIN32)
+        v->on_change = [this](const pt::console::CVar& cv) {
+            if (cv.value == "gdi" &&
+                current_backend_ == BackendType::Vulkan) {
+                LOG_WARN("r_software_blit=gdi -- if you switch r_backend "
+                         "from vulkan to software in this session, the "
+                         "window will be permanently stuck on the last "
+                         "Vulkan frame (Microsoft DXGI flip-model lockout, "
+                         "spec-defined behaviour). Restart the app to use "
+                         "GDI cleanly, or set r_software_blit vulkan to "
+                         "switch backends without restarting.");
+            } else if (cv.value == "gdi") {
+                LOG_INFO("r_software_blit=gdi -- legacy GDI present path "
+                         "selected. Safe for software-fresh-start sessions; "
+                         "do NOT switch from vulkan->software in this "
+                         "session without restarting (Microsoft DXGI "
+                         "flip-model lockout). Takes effect on next "
+                         "Software backend (re)initialise.");
+            } else {
+                LOG_INFO("r_software_blit=vulkan -- Vulkan-blit present "
+                         "path selected (default). Survives all backend "
+                         "switches. Takes effect on next Software backend "
+                         "(re)initialise.");
+            }
+        };
+#endif
     }
     // r_theme: validate + push the new theme to every WS client so the
     // browser console flips live without a page reload.

@@ -31,6 +31,10 @@
 
 #include "SoftwareDevice.h"
 #include "SoftwareTracer.h"
+#if defined(_WIN32)
+#  include "SoftwareVulkanPresent.h"
+#  include "../console/Console.h"
+#endif
 
 #include "../core/Log.h"
 #include "../core/Memory/MemTag.h"
@@ -227,8 +231,36 @@ SoftwareDevice::SoftwareDevice(const NativeWindowHandle& window) {
     LOG_INFO("Software backend online (CPU + Embree, Metal present): {}x{}",
              width_, height_);
 #elif defined(_WIN32)
-    LOG_INFO("Software backend online (CPU + Embree, GDI present): {}x{}",
-             width_, height_);
+    // Pick present path. The default ("vulkan") is the only mode that
+    // survives a vulkan -> software backend switch on Windows: once
+    // Vulkan touched the HWND, DXGI flip-model permanently locks the
+    // window out of GDI presentation (Microsoft spec, see
+    // SoftwareVulkanPresent.h for receipts). Users can opt into "gdi"
+    // for a software-fresh-start session, but mid-session switches
+    // from Vulkan will leave the window stale until restart -- a
+    // LOG_WARN is emitted from the cvar's on_change in that case.
+    bool vk_present_path = true;
+    if (auto* v = pt::console::Console::Get().FindCVar("r_software_blit")) {
+        vk_present_path = (v->value == "vulkan");
+    }
+    if (vk_present_path && native_window_ != nullptr) {
+        vk_present_ = std::make_unique<SoftwareVulkanPresent>();
+        if (!vk_present_->Init(native_window_, width_, height_)) {
+            LOG_WARN("Software backend (Win32): Vulkan-blit present "
+                     "init failed; falling back to GDI present (note: "
+                     "GDI will be permanently broken if this session "
+                     "ever ran the Vulkan backend; restart the app for "
+                     "a clean GDI session)");
+            vk_present_.reset();
+        }
+    }
+    if (vk_present_) {
+        LOG_INFO("Software backend online (CPU + Embree, Vulkan-blit "
+                 "present): {}x{}", width_, height_);
+    } else {
+        LOG_INFO("Software backend online (CPU + Embree, GDI present): "
+                 "{}x{}", width_, height_);
+    }
 #else
     LOG_INFO("Software backend online (CPU + Embree, no present): {}x{}",
              width_, height_);
@@ -567,9 +599,13 @@ void SoftwareDevice::EndFrame(CommandBuffer*) {
 
     pool->release();
 #elif defined(_WIN32)
-    // Windows present: SetDIBitsToDevice from the BGRA8 scratch buffer
-    // directly to the HWND's device context.  HDC is acquired and
-    // released per frame -- no driver-managed swapchain to worry about.
+    // Windows present. Two paths:
+    //   - Vulkan-blit (vk_present_ non-null, default): pack output via
+    //     PresentOutput() then upload + vkCmdCopyBufferToImage +
+    //     vkQueuePresentKHR through SoftwareVulkanPresent.
+    //   - GDI (vk_present_ null, opt-in): SetDIBitsToDevice from the
+    //     BGRA8 scratch buffer to the HWND's HDC. HDC is acquired
+    //     and released per frame; no driver-managed swapchain.
     HWND hwnd = static_cast<HWND>(native_window_);
     if (hwnd == nullptr) { ++frame_index_; return; }
 
@@ -579,6 +615,15 @@ void SoftwareDevice::EndFrame(CommandBuffer*) {
         PresentOutput();   // packs RGBA32F -> BGRA8 into present_scratch_
         if (!present_scratch_.empty() &&
             present_scratch_w_ > 0 && present_scratch_h_ > 0) {
+            if (vk_present_) {
+                if (vk_present_->Present(present_scratch_,
+                                         static_cast<int>(present_scratch_w_),
+                                         static_cast<int>(present_scratch_h_))) {
+                    blitted = true;
+                }
+                ++frame_index_;
+                return;  // GDI fallback below not used in Vulkan-blit mode
+            }
             HDC hdc = GetDC(hwnd);
             if (hdc) {
                 BITMAPINFO bmi{};
@@ -662,10 +707,12 @@ void SoftwareDevice::Resize(int w, int h) {
         mtl_layer_->setDrawableSize(CGSize{static_cast<CGFloat>(w),
                                            static_cast<CGFloat>(h)});
     }
+#elif defined(_WIN32)
+    if (vk_present_) vk_present_->Resize(w, h);
 #endif
-    // Windows: no layer-side state to resize.  GetClientRect is queried
-    // fresh each BeginFrame / EndFrame, so the next present will pick
-    // up the new size automatically.
+    // Windows GDI fallback: no layer-side state to resize.  GetClientRect
+    // is queried fresh each BeginFrame / EndFrame, so the next present
+    // will pick up the new size automatically.
     //
     // Cross-platform: force the output texture to re-allocate so the
     // CPU kernel writes into a correctly-sized buffer next frame.  The

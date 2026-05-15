@@ -92,6 +92,9 @@ struct BackedAccel {
 };
 
 class SoftwareDevice;
+#if defined(_WIN32)
+class SoftwareVulkanPresent;  // defined in SoftwareVulkanPresent.h
+#endif
 
 // Per-slot bind state, captured by BindBuffer / BindStorageTexture /
 // BindAccelStruct between Dispatch calls so the CPU kernel can look
@@ -227,6 +230,18 @@ private:
     std::uint32_t              present_scratch_h_ = 0;
 
     std::unique_ptr<SoftwareCommandBuffer> cmd_buf_;
+
+#if defined(_WIN32)
+    // Win32-only: Vulkan-blit present path. Owned when r_software_blit
+    // selects "vulkan" (the default) and Init succeeded; nullptr when
+    // the user opted into "gdi" mode or Vulkan-blit init failed (in
+    // which case EndFrame falls back to the existing GDI path).
+    // SoftwareVulkanPresent is forward-declared in the same namespace
+    // (pt::rhi::sw) at the bottom of SoftwareDevice.h's namespace
+    // bracket below, so the public header doesn't pull in
+    // <vulkan/vulkan.h>.
+    std::unique_ptr<SoftwareVulkanPresent> vk_present_;
+#endif
 
     // Embree state. One device shared across all BLAS/TLAS; each scene
     // is owned by the corresponding BackedAccel entry.
