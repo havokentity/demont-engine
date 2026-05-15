@@ -211,6 +211,43 @@ SoftwareDevice::SoftwareDevice(const NativeWindowHandle& window) {
             int h = static_cast<int>(rc.bottom - rc.top);
             if (w > 0 && h > 0) { width_ = w; height_ = h; }
         }
+        // Wipe whatever is currently shown in the window. When we're
+        // taking over from Vulkan via a backend switch, VkSwapchain
+        // teardown leaves the LAST presented frame visible in the
+        // window's compositor surface -- Windows doesn't auto-clear,
+        // and our first GDI present is gated on the kernel having
+        // produced a non-empty output texture (PresentOutput +
+        // SetDIBitsToDevice are both no-ops when the kernel hasn't
+        // dispatched yet, so the stale Vulkan image stays on screen
+        // until the first software-rendered frame lands -- which can
+        // be one or more frames later, especially with EnsurePipeline
+        // / CSG-bake / etc. doing init work). Pre-wiping with a GDI
+        // FillRect of pending_clear_ here guarantees the swap from
+        // any prior backend's content is immediate and visible. One-
+        // shot, runs on every Software backend (re)initialise, and
+        // costs one HDC + FillRect.
+        if (HWND hwnd_wipe = static_cast<HWND>(native_window_)) {
+            if (HDC hdc = GetDC(hwnd_wipe); hdc) {
+                RECT cr{};
+                if (GetClientRect(hwnd_wipe, &cr)) {
+                    auto to_byte = [](float v) {
+                        return static_cast<int>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f);
+                    };
+                    COLORREF col = RGB(to_byte(pending_clear_[0]),
+                                       to_byte(pending_clear_[1]),
+                                       to_byte(pending_clear_[2]));
+                    if (HBRUSH br = CreateSolidBrush(col); br) {
+                        FillRect(hdc, &cr, br);
+                        DeleteObject(br);
+                        LOG_INFO("Software backend (Win32): wiped HWND "
+                                 "client area on init (clears stale frame "
+                                 "from prior backend before kernel produces "
+                                 "first software frame)");
+                    }
+                }
+                ReleaseDC(hwnd_wipe, hdc);
+            }
+        }
     }
 #else
     native_window_ = window.opaque;   // unsupported platform; will no-op present
