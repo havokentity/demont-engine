@@ -35,13 +35,17 @@ option(PT_ENABLE_TRACY          "Enable Tracy profiler client"          ON)
 # ASan + mimalloc do not coexist cleanly without MI_TRACK_ASAN; opt-in only.
 option(PT_ENABLE_SANITIZERS     "Enable -fsanitize=address,undefined in Debug" OFF)
 # AVX-512 build of Embree adds the 16-wide BVH16 intersector for users
-# on Zen 4+ (Ryzen 7000+), Threadripper, Xeon Skylake+, Rocket Lake
-# (i9-11900K), and HEDT chips. Costs ~25% extra build time. Default
-# OFF because AVX-512 isn't ubiquitous on consumer hardware: Zen 3
-# (5950X) doesn't have it at all, and Intel fused it off in microcode
-# on Alder Lake (12th gen) and every consumer chip since. Workstation
-# users on the platforms that DO have it flip the flag on locally.
-option(PT_ENABLE_AVX512_EMBREE  "Enable AVX-512 build of Embree (workstation perf, +~25% build time)" OFF)
+# on Zen 4+ (Ryzen 7000+), Zen 5 (Ryzen 9000+, the project owner's
+# 9950X3D), Threadripper, Xeon Skylake+, Rocket Lake (i9-11900K), and
+# HEDT chips.  Costs ~25% extra build time.  Default ON: AVX-512 has
+# become the consumer-modern default on AMD since Zen 4 in 2022, and
+# Embree's runtime ISA dispatch lets the binary fall back to AVX2 on
+# any chip that lacks AVX-512 (Zen 3, Intel mainstream consumer since
+# Alder Lake, etc.) -- so one shipped binary covers everyone without
+# breaking anyone.  Local devs who want a faster build (no need for
+# AVX-512 perf on their own machine) can flip this OFF in their cmake
+# invocation.
+option(PT_ENABLE_AVX512_EMBREE  "Enable AVX-512 build of Embree (runtime-dispatched; +~25% build time)" ON)
 
 # --- Compiler/warning helper -----------------------------------------------
 include(cmake/CompilerWarnings.cmake)

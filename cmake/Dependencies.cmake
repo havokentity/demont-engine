@@ -147,14 +147,17 @@ set(EMBREE_ZIP_MODE                 OFF CACHE BOOL   "" FORCE)
 # class has AVX2, so the SSE2 / SSE4.2 / AVX variants Embree builds by
 # default are pure dead code on real demont users -- they exist only
 # to support pre-2013 hardware that can't run Vulkan / Metal anyway.
-# AVX-512 is gated on PT_ENABLE_AVX512_EMBREE (default OFF, see top-level
-# CMakeLists.txt): Zen 3 (5950X) doesn't have it at all, and Intel fused
-# it off in microcode on Alder Lake and every consumer chip since, so
-# AVX-512 isn't ubiquitous on consumer hardware -- default builds skip
-# the +~25% build cost.  Workstation users on Zen 4+ (Ryzen 7000+),
-# Threadripper, Xeon Skylake+, Rocket Lake (i9-11900K), and HEDT chips
-# flip the flag on and get ~30-50% BVH traversal perf via Embree's
-# 16-wide BVH16 intersector.
+# AVX-512 is gated on PT_ENABLE_AVX512_EMBREE (default ON, see top-level
+# CMakeLists.txt): Zen 4+ (Ryzen 7000+), Zen 5 (Ryzen 9000+, the
+# project owner's 9950X3D), Threadripper, Xeon Skylake+, Rocket Lake
+# (i9-11900K), and HEDT chips all have it -- that's everything modern
+# on the AMD consumer side plus most workstation chips.  Embree's
+# runtime ISA dispatch falls back to AVX2 on chips that lack AVX-512
+# (Zen 3, Intel mainstream consumer since Alder Lake), so the single
+# shipped binary covers every supported CPU without breaking anyone.
+# Local devs who want a faster build (don't need AVX-512 perf on
+# their own machine) can flip PT_ENABLE_AVX512_EMBREE OFF in their
+# cmake invocation.
 #
 # The whole x86 ISA block is gated on CMAKE_SYSTEM_PROCESSOR matching
 # x86 -- on ARM hosts (Apple Silicon, ARM Linux), Embree's CMake auto-
@@ -169,10 +172,26 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86|amd64|AMD64")
     set(EMBREE_ISA_SSE42            OFF CACHE BOOL   "" FORCE)
     set(EMBREE_ISA_AVX              OFF CACHE BOOL   "" FORCE)
     set(EMBREE_ISA_AVX2             ON  CACHE BOOL   "" FORCE)
-    if(PT_ENABLE_AVX512_EMBREE)
+    # AVX-512 requires clang / clang-cl / icx.  Embree's own CMake has
+    # an explicit hard error -- "Microsoft Visual C++ Compiler does not
+    # support AVX512.  Please use Intel Compiler or Clang" -- at line
+    # 321 of their top-level CMakeLists.txt, so the build refuses to
+    # configure if we try AVX-512 + MSVC cl.exe.  build.yml's win-debug
+    # PR-gate job uses MSVC (release.yml uses clang-cl), so we have to
+    # silently drop AVX-512 when the compiler is MSVC -- otherwise
+    # default-ON PT_ENABLE_AVX512_EMBREE breaks every PR's Windows CI.
+    # clang-cl release builds + Mac/Linux clang builds keep AVX-512.
+    if(PT_ENABLE_AVX512_EMBREE AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
         set(EMBREE_ISA_AVX512       ON  CACHE BOOL   "" FORCE)
     else()
         set(EMBREE_ISA_AVX512       OFF CACHE BOOL   "" FORCE)
+        if(PT_ENABLE_AVX512_EMBREE AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+            message(STATUS
+                "PT_ENABLE_AVX512_EMBREE: requested but compiler is MSVC; "
+                "AVX-512 disabled for this configure (Embree limitation -- "
+                "see common/cmake/msvc.cmake).  Switch to clang-cl "
+                "(--preset win-clang-release / win-clang-debug) to enable.")
+        endif()
     endif()
 endif()
 FetchContent_Declare(embree
