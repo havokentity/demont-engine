@@ -52,10 +52,16 @@ set(_embree_url
 # devs on external-drive setups (which caused git-pack failures on the
 # in-source path historically) keep their cache in $HOME like everything
 # else FetchContent does.
-if(DEFINED FETCHCONTENT_BASE_DIR)
-    set(_embree_cache_root "${FETCHCONTENT_BASE_DIR}")
-elseif(DEFINED ENV{FETCHCONTENT_BASE_DIR})
+# Env-var check first: FetchContent.cmake's module init has already
+# defaulted the CMake-variable FETCHCONTENT_BASE_DIR to
+# ${CMAKE_BINARY_DIR}/_deps by the time this file is included from
+# Dependencies.cmake, which would mask any FETCHCONTENT_BASE_DIR=...
+# the user set in their shell.  Honour the env var explicitly so the
+# prebuilt cache co-locates with whatever the user picked.
+if(DEFINED ENV{FETCHCONTENT_BASE_DIR})
     set(_embree_cache_root "$ENV{FETCHCONTENT_BASE_DIR}")
+elseif(DEFINED FETCHCONTENT_BASE_DIR)
+    set(_embree_cache_root "${FETCHCONTENT_BASE_DIR}")
 else()
     set(_embree_cache_root "${CMAKE_BINARY_DIR}/_deps")
 endif()
@@ -119,14 +125,43 @@ if(NOT EXISTS "${_embree_lib_path}")
     endif()
 endif()
 
+# Collect every companion archive Embree installs alongside the main
+# libembree4.  With EMBREE_STATIC_LIB=ON Embree splits its
+# implementation across libsys.a / libmath.a / libsimd.a / liblexers.a
+# / libtasking.a (low-level helpers) plus libembree_avx2.a /
+# libembree_avx512.a (the ISA-dispatched intersector kernels Embree
+# picks between at runtime via cpuid).  On the FetchContent path
+# Embree's own CMake wires `target_link_libraries(embree PUBLIC ...)`
+# to all of these so consumers pull them in transitively.  On the
+# prebuilt path we have to chain them manually -- without this, every
+# call into Embree's hot ray-traversal kernels would be an unresolved
+# symbol at link time (the ISA archives hold _embree_dispatch_intersect1
+# et al; the low-level libs hold most of the math / threading internals).
+# Glob is restricted to actual archive files (.a on Unix, .lib on
+# Windows) so we don't pick up Embree's exported CMake config tree
+# under lib/cmake/embree-X.Y.Z/ which the install step also produces.
+file(GLOB _embree_companions
+    "${_embree_extract_dir}/embree/lib/*.a"
+    "${_embree_extract_dir}/embree/lib/*.lib")
+list(REMOVE_ITEM _embree_companions "${_embree_lib_path}")
+
 # Wire up the imported target.  Same name as what the FetchContent path
 # produces (`embree`), so consumer code (src/rhi_software/CMakeLists.txt)
 # stays identical -- `target_link_libraries(... PRIVATE embree)` works
-# either way.
+# either way.  INTERFACE_LINK_LIBRARIES chains the companion archives so
+# the link is complete.  Link order:
+#     consumer -> libembree4.a -> [companions in glob order]
+# Glob ordering puts ISA archives before low-level helpers
+# alphabetically, which matches the natural dependency direction
+# (libembree4 calls libembree_avx2 calls libsys/libmath/...).  Apple
+# ld64 / lld / clang-cl link.exe all handle any residual cycles via
+# their own multi-pass static-lib resolution -- no --start-group
+# wrappers needed on the platforms we ship.
 add_library(embree STATIC IMPORTED GLOBAL)
 set_target_properties(embree PROPERTIES
     IMPORTED_LOCATION             "${_embree_lib_path}"
     INTERFACE_INCLUDE_DIRECTORIES "${_embree_include_path}"
+    INTERFACE_LINK_LIBRARIES      "${_embree_companions}"
 )
 
 # Mark the includes as SYSTEM so consumer code under our strict
@@ -135,4 +170,6 @@ set_target_properties(embree PROPERTIES
 target_include_directories(embree SYSTEM INTERFACE "${_embree_include_path}")
 
 set(EMBREE_PREBUILT_FOUND TRUE)
-message(STATUS "Embree prebuilt: linked ${_embree_lib_path}")
+list(LENGTH _embree_companions _embree_n_companions)
+message(STATUS
+    "Embree prebuilt: linked ${_embree_lib_path} + ${_embree_n_companions} companion archive(s)")

@@ -79,12 +79,12 @@ if(NOT TARGET embree)
 endif()
 
 # Embree's source tree ships its public headers under include/embree4/;
-# install them straight from the fetched source dir.
-install(DIRECTORY ${embree_SOURCE_DIR}/include/embree4
-        DESTINATION include
-        PATTERN "*.h"
-        PATTERN "*.hpp"
-)
+# install the whole directory.  Everything in there is a public-API
+# header (.h / .isph) so we don't need a filter clause -- earlier I had
+# `PATTERN "*.h"` selectors here but PATTERN without FILES_MATCHING is
+# a permission-style selector, not an include-filter, so those were
+# no-ops.  Cleaner to just install everything.
+install(DIRECTORY ${embree_SOURCE_DIR}/include/embree4 DESTINATION include)
 
 # Install every Embree target as a static lib.  EMBREE_STATIC_LIB=ON
 # already in the config so these are .a / .lib (not .dylib / .dll).
