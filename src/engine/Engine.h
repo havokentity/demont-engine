@@ -162,6 +162,16 @@ private:
     std::unique_ptr<pt::csg::BakedMesh>         pending_baked_;
     pt::jobs::JobSystem::Handle                 bake_handle_{};
     std::atomic<int>                            bake_phase_{0};   // 0 idle, 1 baking, 2 ready
+    // Set on backend switch (RequestBackendSwitch).  TearDownDevice
+    // destroys the per-device BLAS/TLAS resources, but csg_scene_'s
+    // own Dirty() flag tracks topology changes -- it stays clean
+    // across switches if the user didn't mutate the CSG tree.  Without
+    // this flag the next EnsureMeshUpdated tick wouldn't kick a bake
+    // on the new device, so the CSG mesh would silently disappear
+    // (visible only as "where did my drilled cube go?" on a Software
+    // -> Metal swap).  Consumed (cleared) by EnsureMeshUpdated when
+    // it enqueues a fresh bake.
+    bool                                        force_mesh_rebuild_ = false;
 
     // Analytic primitives (sphere/plane) -- ordered by user id, uploaded
     // to a storage buffer when dirty. Mesh CSG and analytic primitives
