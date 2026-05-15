@@ -43,32 +43,25 @@ set(EMBREE_VENDORED_URL_HASH
 #   v4.4.0-cfg1: initial AVX2 + (opt) AVX-512 layout, no SSE2/SSE42/AVX,
 #                EMBREE_GEOMETRY_TRIANGLE + INSTANCE only, EMBREE_STATIC_LIB ON,
 #                EMBREE_TASKING_SYSTEM INTERNAL, EMBREE_RAY_PACKETS OFF.
-#   v4.4.0-cfg2: same Embree config, expanded artefact matrix --
-#                Release + Debug per platform, added Linux x64 + Linux
-#                ARM64.  Artefact filenames now carry a -release /
-#                -debug suffix.
-set(EMBREE_VENDORED_VERSION "v4.4.0-cfg2")
+#                Release-only.  Adding more PLATFORM variants under the
+#                same cfg1 (e.g. Linux x64 / ARM64) doesn't require a
+#                bump -- artefact set grows, but the per-platform .a is
+#                produced from identical Embree flags.
+set(EMBREE_VENDORED_VERSION "v4.4.0-cfg1")
 
-# --- Per-host + per-config filename derivation ------------------------------
+# --- Per-host filename derivation -------------------------------------------
 # Used by both the prebuild workflow (to NAME the uploaded artefact) and
 # the EmbreeBinary download wrapper (to PICK the right artefact for the
 # current host).  Returns an empty string for unsupported platform combos
 # (e.g. Intel Mac, FreeBSD); callers fall through to source compile.
 #
-# `config` arg should be either "Release" or "Debug" (case-insensitive --
-# any other value normalises to Release, matching CMake's behaviour for
-# unrecognised CMAKE_BUILD_TYPE values).  Distinct Release / Debug
-# artefacts let the PR-gate build.yml (Debug) and release.yml (Release)
-# both consume prebuilts at their respective configs without each having
-# to live with the other's optimisation level.
-function(pt_embree_artefact_name out_var config)
-    string(TOLOWER "${config}" _cfg_lower)
-    if(_cfg_lower MATCHES "debug")
-        set(_cfg "debug")
-    else()
-        set(_cfg "release")
-    endif()
-
+# Only Release-config builds are produced.  Debug Embree was considered
+# but dropped: mixing Release third-party deps with Debug app code is
+# standard practice for C-API libs (no std:: types across the boundary
+# means no _ITERATOR_DEBUG_LEVEL traps), and the only real loss is
+# Embree's internal assert() calls firing on API misuse -- worth far
+# less than the doubled prebuild cost + 8x bigger Debug tarballs.
+function(pt_embree_artefact_name out_var)
     if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^arm")
         set(_plat "macos-arm64")
         set(_ext "tar.gz")
@@ -94,7 +87,7 @@ function(pt_embree_artefact_name out_var config)
     endif()
 
     set(${out_var}
-        "embree-${EMBREE_VENDORED_VERSION}-${_plat}-${_cfg}.${_ext}"
+        "embree-${EMBREE_VENDORED_VERSION}-${_plat}.${_ext}"
         PARENT_SCOPE)
 endfunction()
 
