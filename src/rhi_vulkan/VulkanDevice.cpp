@@ -265,21 +265,23 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     // 320x180 instead of 1280x720. See dsets_ comment in VulkanDevice.h.
     auto dset = device_->AcquireDispatchDescriptorSet();
 
-    // Build the full descriptor write list. We touch all 19 bindings on
-    // every dispatch -- nullDescriptor (VK_EXT_robustness2), required at
-    // device-create time for this path, means slots the engine didn't
-    // bind get VK_NULL_HANDLE silently. The cost of re-writing every
-    // binding each dispatch is small (19 small structs) and avoids
-    // per-pipeline layout management. Composition:
-    //   10 storage_image (kNumTexSlots) + 1 accel_struct + 7 storage_buffer
-    //   (engine slots 1..7 -> shader bindings 3/4/5/10/11/15/18)
-    //   + 1 uniform_buffer (Frame UBO) = 19.
-    // (v0.3.9 grew this from 18 by adding analytic-prim BVH nodes at
-    // binding 18 / engine slot 7; kMaxWrites must always equal the
+    // Build the descriptor write list. Each binding in the shared layout
+    // is marked VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, so slots the
+    // engine didn't bind for this dispatch are simply *not written* --
+    // they stay in whatever state the prior dispatch left them in, and
+    // the shader is required not to access them (the pipeline's SPIR-V
+    // dictates which bindings it reads/writes). This replaces the older
+    // strategy of writing VK_NULL_HANDLE to unbound slots via
+    // VK_EXT_robustness2.nullDescriptor -- MoltenVK on Apple Silicon
+    // reports the extension but with nullDescriptor=false, so the null
+    // path doesn't work on Mac. Partially-bound is core Vulkan 1.2 and
+    // supported on every target including MoltenVK.
+    //
+    // Capacity: 10 storage_image (kNumTexSlots) + 1 accel_struct +
+    // 7 storage_buffer + 1 uniform_buffer = 19, sized to the worst-case
+    // "PathTrace binds everything" dispatch. kMaxWrites must be >= the
     // total binding count or vkUpdateDescriptorSets reads off the
-    // end of these stack arrays -- the crash signature is "engine
-    // dies on first PathTrace Dispatch after switching to a r_bloom 1
-    // path that brings the dispatch loop iteration count to 19".)
+    // end of these stack arrays.
     constexpr std::uint32_t kMaxWrites = 19;
     std::array<VkDescriptorImageInfo,  kMaxWrites> img_infos {};
     std::array<VkDescriptorBufferInfo, kMaxWrites> buf_infos {};
@@ -288,15 +290,13 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     std::array<VkWriteDescriptorSet, kMaxWrites> writes {};
     std::uint32_t wc = 0;
 
+    // Helpers each assume a non-null handle -- callers gate at the call
+    // site, so unbound slots are skipped instead of being written as
+    // null. This matches the partially-bound contract: writes that
+    // happen must be spec-compliant for real resources.
     auto add_image = [&](std::uint32_t binding, VkImageView v) {
         auto& ii = img_infos[wc];
         ii.imageView   = v;
-        // Use VK_IMAGE_LAYOUT_GENERAL for both bound and null storage-image
-        // descriptors. Validation layers expect a real, non-UNDEFINED
-        // layout for image descriptor writes -- robustness2 nullDescriptor
-        // makes the access produce zero, but the descriptor write itself
-        // still has to be spec-compliant. A stray UNDEFINED triggered
-        // VUID-VkWriteDescriptorSet errors on some drivers.
         ii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         auto& w = writes[wc];
         w = {};
@@ -314,12 +314,8 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
                           VkDescriptorType type) {
         auto& bi = buf_infos[wc];
         bi.buffer = b;
-        // Null descriptors must use offset=0, range=VK_WHOLE_SIZE per
-        // VUID-VkDescriptorBufferInfo-buffer-02999. Robustness2's
-        // nullDescriptor feature lets the access produce zero, but the
-        // descriptor write itself still must be spec-compliant.
-        bi.offset = (b == VK_NULL_HANDLE) ? 0 : off;
-        bi.range  = (b == VK_NULL_HANDLE) ? VK_WHOLE_SIZE : sz;
+        bi.offset = off;
+        bi.range  = sz;
         auto& w = writes[wc];
         w = {};
         w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -350,19 +346,20 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     };
 
     // ---- Storage images at bindings 0,1,6,7,8,9,12,13,16 --------------
-    // Iterate exactly kNumTexSlots even though bound_tex_ has spares;
-    // those spares aren't in kSlotToTexBinding so we can't translate
-    // them, and the unused vk::binding slots in the layout would still
-    // be written nullDescriptor by the AS / buffer / UBO loops below.
+    // Skip slots the engine didn't bind: partially-bound layout means
+    // unwritten slots are simply absent from this dispatch's set view.
+    // (Slots a shader actually reads must be bound by the engine ahead
+    // of Dispatch; that's the dispatch-pipeline contract.)
     for (std::uint32_t s = 0; s < kNumTexSlots; ++s) {
         VkImageView v = device_->LookupImageView(bound_tex_[s]);
+        if (v == VK_NULL_HANDLE) continue;
         add_image(kSlotToTexBinding[s], v);
     }
 
     // ---- Acceleration structure at binding 2 --------------------------
     {
         auto a = device_->LookupAccel(bound_accel_[2]);
-        add_accel(2, a);
+        if (a != VK_NULL_HANDLE) add_accel(2, a);
     }
 
     // ---- Storage buffers at bindings 3,4,5,10,11,15,18 ---------------
@@ -372,8 +369,8 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     // (StructuredBuffer<float4> pairs, 32B per BvhNode).
     for (std::uint32_t s = 1; s <= 7; ++s) {
         VkBuffer b = device_->LookupBuffer(bound_buf_[s]);
-        VkDeviceSize sz = (b == VK_NULL_HANDLE) ? 0 : VK_WHOLE_SIZE;
-        add_buffer(kSlotToBufBinding[s], b, bound_buf_off_[s], sz,
+        if (b == VK_NULL_HANDLE) continue;
+        add_buffer(kSlotToBufBinding[s], b, bound_buf_off_[s], VK_WHOLE_SIZE,
                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
     }
 
@@ -621,7 +618,6 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     bool has_ray_query        = DeviceSupportsExtension(phys_device_, VK_KHR_RAY_QUERY_EXTENSION_NAME);
     bool has_accel_struct     = DeviceSupportsExtension(phys_device_, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
     bool has_deferred_host_op = DeviceSupportsExtension(phys_device_, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
-    bool has_robustness2      = DeviceSupportsExtension(phys_device_, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
     rt_supported_ = has_ray_query && has_accel_struct && has_deferred_host_op;
 
     // Query feature support before enabling anything in vkCreateDevice.
@@ -636,8 +632,6 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     as_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
     VkPhysicalDeviceRayQueryFeaturesKHR rq_supported{};
     rq_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
-    VkPhysicalDeviceRobustness2FeaturesEXT rob2_supported{};
-    rob2_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT;
 
     void** supported_next = &v12_supported.pNext;
     auto chain_supported = [&](void* node, void** node_next) {
@@ -647,9 +641,6 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     if (rt_supported_) {
         chain_supported(&as_supported, reinterpret_cast<void**>(&as_supported.pNext));
         chain_supported(&rq_supported, reinterpret_cast<void**>(&rq_supported.pNext));
-    }
-    if (has_robustness2) {
-        chain_supported(&rob2_supported, reinterpret_cast<void**>(&rob2_supported.pNext));
     }
     vkGetPhysicalDeviceFeatures2(phys_device_, &f2_supported);
 
@@ -664,8 +655,9 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         v12_supported.descriptorBindingUniformBufferUpdateAfterBind == VK_TRUE;
     const bool supports_update_after_bind =
         supports_uab_storage_image && supports_uab_storage_buffer && supports_uab_uniform_buffer;
+    const bool supports_partially_bound =
+        v12_supported.descriptorBindingPartiallyBound == VK_TRUE;
     const bool supports_buffer_device_address = v12_supported.bufferDeviceAddress == VK_TRUE;
-    const bool supports_null_descriptor = has_robustness2 && (rob2_supported.nullDescriptor == VK_TRUE);
 
     if (!supports_storage_image_rw_wo_format) {
         LOG_ERROR("Vulkan: missing shaderStorageImageRead/WriteWithoutFormat feature");
@@ -675,8 +667,11 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         LOG_ERROR("Vulkan: UPDATE_AFTER_BIND features are required for shared descriptor-set dispatch");
         return;
     }
-    if (!supports_null_descriptor) {
-        LOG_ERROR("Vulkan: VK_EXT_robustness2 nullDescriptor is required by Vulkan descriptor binding strategy");
+    if (!supports_partially_bound) {
+        // PARTIALLY_BOUND lets dispatches leave unused slots in the
+        // 19-binding shared layout unwritten. Core Vulkan 1.2 feature;
+        // present on every desktop driver and MoltenVK.
+        LOG_ERROR("Vulkan: descriptorBindingPartiallyBound is required by Vulkan descriptor binding strategy");
         return;
     }
 
@@ -708,9 +703,6 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         dexts.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
         dexts.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
         dexts.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
-    }
-    if (supports_null_descriptor) {
-        dexts.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
     }
 #if defined(PT_ENABLE_OPTIX)
     // CUDA-Vulkan interop for the OptiX denoiser. The base
@@ -752,8 +744,11 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     v12.descriptorBindingStorageImageUpdateAfterBind  = supports_uab_storage_image ? VK_TRUE : VK_FALSE;
     v12.descriptorBindingStorageBufferUpdateAfterBind = supports_uab_storage_buffer ? VK_TRUE : VK_FALSE;
     v12.descriptorBindingUniformBufferUpdateAfterBind = supports_uab_uniform_buffer ? VK_TRUE : VK_FALSE;
-    v12.descriptorBindingPartiallyBound               =
-        (v12_supported.descriptorBindingPartiallyBound == VK_TRUE) ? VK_TRUE : VK_FALSE;
+    // PARTIALLY_BOUND lets dispatches leave unused slots in the shared
+    // 19-binding layout unwritten -- the descriptor-write path skips
+    // them, the shader is required not to access them. Replaces the
+    // older nullDescriptor-based scheme that MoltenVK doesn't support.
+    v12.descriptorBindingPartiallyBound = VK_TRUE;
 #if defined(PT_ENABLE_OPTIX)
     // Timeline semaphores: required by VulkanOptixDenoiser to fence
     // CUDA <-> Vulkan work. Without enabling the feature, Vulkan
@@ -778,10 +773,6 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     rq_feat.sType    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
     rq_feat.rayQuery = VK_TRUE;
 
-    VkPhysicalDeviceRobustness2FeaturesEXT rob2_feat{};
-    rob2_feat.sType          = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT;
-    rob2_feat.nullDescriptor = VK_TRUE;
-
     void** next_slot = &f2.pNext;
     auto chain = [&](void* node, void** node_next) {
         *next_slot = node;
@@ -792,9 +783,6 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     if (rt_supported_) {
         chain(&as_feat, reinterpret_cast<void**>(&as_feat.pNext));
         chain(&rq_feat, reinterpret_cast<void**>(&rq_feat.pNext));
-    }
-    if (supports_null_descriptor) {
-        chain(&rob2_feat, reinterpret_cast<void**>(&rob2_feat.pNext));
     }
 
     VkDeviceCreateInfo dci{};
@@ -929,8 +917,14 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // UPDATE_AFTER_BIND for every binding so we can rewrite the
         // shared descriptor set between dispatches in the same cmd
         // buffer without invalidating earlier recorded draws.
+        // PARTIALLY_BOUND so dispatches can leave unused slots unwritten
+        // -- the descriptor-write path skips slots the engine didn't
+        // bind (the shader is required not to access those slots).
         std::array<VkDescriptorBindingFlags, 19> bind_flags{};
-        for (auto& f : bind_flags) f = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
+        for (auto& f : bind_flags) {
+            f = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT
+              | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+        }
         VkDescriptorSetLayoutBindingFlagsCreateInfo bfci{};
         bfci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
         bfci.bindingCount  = static_cast<std::uint32_t>(bind_flags.size());
@@ -1121,6 +1115,15 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     if (!RecreateSwapchain()) return;
 
     wrapped_cb_ = std::make_unique<VulkanCommandBuffer>(this);
+
+    // All required Vulkan objects are created. The factory in Device.cpp
+    // checks this; without it, partial-init failure (e.g. a required
+    // feature missing) silently produced a non-null unique_ptr whose
+    // underlying VkDevice was VK_NULL_HANDLE, and the engine's
+    // subsequent CreateBuffer/CreateTexture calls all failed with the
+    // diagnostic-noise cascade ("exposure_state buffer creation
+    // failed", "env_map: texture create/upload failed", ...).
+    init_ok_ = true;
 }
 
 VulkanDevice::~VulkanDevice() {
@@ -3187,6 +3190,15 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
 
 namespace pt::rhi {
 std::unique_ptr<Device> CreateVulkanDevice(const NativeWindowHandle& w) {
-    return std::make_unique<vk::VulkanDevice>(w);
+    auto dev = std::make_unique<vk::VulkanDevice>(w);
+    if (!dev->IsInitialized()) {
+        // Constructor early-returned (missing required feature, failed
+        // vkCreateDevice, swapchain create failed, ...). Drop the
+        // half-built object so Engine::RequestBackendSwitch sees the
+        // factory return nullptr and rolls back to BackendType::None
+        // cleanly, rather than driving render through a dead device.
+        return nullptr;
+    }
+    return dev;
 }
 }  // namespace pt::rhi
