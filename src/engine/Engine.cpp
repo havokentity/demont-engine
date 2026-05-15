@@ -903,9 +903,15 @@ void Engine::RequestBackendSwitch(BackendType to) {
     }
 
     // Mark the analytic-primitive buffer dirty so it gets uploaded on
-    // the first frame against this device. The mesh BLAS + TLAS are
-    // driven by CsgScene -- EnsureMeshUpdated() handles the bake job.
+    // the first frame against this device.
     primitives_dirty_ = true;
+    // The CSG mesh BLAS + TLAS were just destroyed in TearDownDevice
+    // but csg_scene_->Dirty() only tracks user-driven topology changes
+    // -- it stays clean across a backend switch where the tree is
+    // unchanged.  Force EnsureMeshUpdated() to kick a re-bake on the
+    // first frame against the new device, otherwise the CSG mesh
+    // would silently disappear after a Software <-> Metal swap.
+    force_mesh_rebuild_ = true;
 
     // Reload env map on the new device so its texture handle is valid.
     if (auto* v = pt::console::Console::Get().FindCVar("r_env_map");
@@ -959,11 +965,14 @@ void Engine::EnsureMeshUpdated() {
         }
     }
 
-    // Phase 0: idle. If the scene is dirty, kick a fresh bake. Ack the
+    // Phase 0: idle. If the scene is dirty OR the engine forced a
+    // rebuild (backend switch destroyed the device-side BLAS/TLAS but
+    // didn't touch the CSG tree itself), kick a fresh bake. Ack the
     // scene clean BEFORE submitting so a mutation during the bake re-marks
     // it dirty -- we'll then bake again on the next ready->idle transition.
     if (bake_phase_.load(std::memory_order_acquire) == 0 &&
-        csg_scene_->Dirty() && jobs_) {
+        (csg_scene_->Dirty() || force_mesh_rebuild_) && jobs_) {
+        force_mesh_rebuild_ = false;
         csg_scene_->AcknowledgeClean();
         bake_phase_.store(1, std::memory_order_release);
         bake_handle_ = jobs_->Submit([this] {
