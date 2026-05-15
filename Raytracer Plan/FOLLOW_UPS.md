@@ -661,3 +661,68 @@ hot path.
   for correctness.
 - Keep the staging-copy fallback for big uploads (mesh / CDF) --
   vkCmdUpdateBuffer's 65 KB cap means it can't replace those.
+
+---
+
+## Async analytic-primitive BVH build (post-multi-thousand-prim)
+
+**Status:** Today's analytic-prim BVH (landed in v0.3.9, `r_analytic_bvh_threshold`)
+builds synchronously on the main thread inside `EnsurePrimitivesUploaded`.
+That's fine because the trigger conditions are bounded — the rebuild fires
+only on `primitives_dirty_` events (prim add/edit/remove, threshold cvar
+change, scene load, backend switch), not per frame, and at N=1000 spheres
+the build is well under a frame budget. The dirty flag is binary, so a
+batch of N prim_sphere commands collapses into one rebuild at the next
+frame.
+
+**Why deferred:** No scene today hits the prim count where async pays for
+itself, and async carries real complexity costs (worker thread, double-
+buffered node array, frame-coherent swap-in so the renderer doesn't read
+mid-build, edit-to-render latency = N frames). Sync wins for both demo
+scenes and the 1000-prim stress test.
+
+**When to pick this up:**
+
+- **N > ~10k analytic prims** — O(N log N) median-split builds start
+  approaching the 16 ms frame budget at 60 fps.
+- **Per-frame BVH rebuilds** — e.g., voxel-destruction scenes where the
+  set of finite primitives changes every tick. (Voxel-side itself will
+  use a sparse octree + DDA, not a BVH; this point only applies if the
+  user mixes voxel rigid-chunks with analytic prims that get added/
+  removed each frame.)
+- **Streaming worlds** with continuous primitive churn.
+
+**Plan when picked up:**
+
+1. **Dynamic thread-count gating.** Below a tunable prim-count threshold
+   (default e.g. 2048 finite prims, exposed as `r_analytic_bvh_async_threshold`),
+   keep the sync path — low-count edits stay zero-overhead. Above the
+   threshold, dispatch to a worker. This avoids paying thread spawn /
+   mutex acquisition costs on scenes that don't need it.
+2. **Copy the CSG bake worker pattern.** `Engine::csg_scene_` already
+   does the right thing: `bake_handle_` + `bake_phase_` (idle/baking/
+   ready atomic) + `pending_baked_` swap-in on the main thread once the
+   worker finishes. The analytic-prim BVH worker can sit alongside it —
+   one bake job posted to `pt::jobs::JobSystem`, write the new node
+   array into a `pending_bvh_` slot, flip the atomic, and the main
+   thread swaps it in (uploading the new GPU buffer) at the start of
+   the next `EnsurePrimitivesUploaded` call.
+3. **Edit-coalescing.** While a build is in flight, additional
+   `primitives_dirty_` events should queue (not start a second worker),
+   and when the in-flight worker finishes, if dirty is still set, fire
+   another. Two-state machine: idle → building → (idle | rebuild-queued).
+4. **Don't stall the renderer.** While the new BVH is being built, the
+   previous BVH stays bound and the renderer uses it. Lag is N frames
+   after an edit — acceptable for the prim counts this targets (the
+   user-visible result is "BVH updates feel slightly behind heavy
+   bulk edits", same as Manifold CSG bakes today).
+5. **Bench before / after.** Verify the async path's worker spawn +
+   handoff isn't slower than sync at the threshold prim count. If it
+   is, raise the threshold or tune the worker pool size. Goal: zero
+   regression at small N, dominant speedup at large N.
+
+**Pitfall:** double-buffering the GPU node buffer is non-trivial because
+the buffer is shared between dispatch and write. Either grow the buffer
+to 2x and swap halves with a fence, or stall briefly on the swap (the
+existing CSG bake does the latter, accepting a small one-frame hitch on
+swap-in).
