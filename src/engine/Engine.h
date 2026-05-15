@@ -397,6 +397,22 @@ private:
     // "pipelines ready" message on exit -- avoids a per-frame log
     // spam during the 1-3s build window.
     bool                                        loading_frame_active_  = false;
+    // Set true while Init() is sourcing demont.cfg / autoexec.cfg /
+    // command-line cvar overrides. Astronomy-only cvar on_change
+    // handlers consult this so they don't fire false-positive
+    // "your cvar is ignored" warnings during cfg load: cfg writes
+    // happen in std::map / lexicographic order, so r_sky_* lines get
+    // applied before r_sky_use_astronomical, and a user with astro=1
+    // saved would otherwise see warnings that get superseded a
+    // millisecond later. A single summary audit fires after cfg load
+    // completes (Engine::Init), with the final astro state correct.
+    bool                                        cfg_loading_           = false;
+    // Set true inside the r_sky_city on_change while it cascades into
+    // r_sky_lat / r_sky_lon / r_sky_tz_offset_hours via SetCVarOverride.
+    // The astronomy-only warning suppresses itself when this is set so
+    // a single user-issued `r_sky_city` change emits one warn (for the
+    // city itself), not three (city + lat + lon).
+    bool                                        astro_chained_update_  = false;
     bool                                        accum_dirty_           = true;
     BackendType                                 current_backend_       = BackendType::None;
     bool                                        mouse_look_active_     = false;

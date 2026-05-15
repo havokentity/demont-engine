@@ -267,7 +267,7 @@ namespace cvar {
     PT_CVAR(r_sky_month,       "0",       "Month for astronomical date (1..12). 0 = use today's month. Ignored when r_sky_use_astronomical = 0.", CVAR_ARCHIVE);
     PT_CVAR(r_sky_day,         "0",       "Day of month for astronomical date (1..31). 0 = use today's day. Ignored when r_sky_use_astronomical = 0.", CVAR_ARCHIVE);
     PT_CVAR(r_sky_tz_offset_hours, "5.5", "Selected city's UTC offset in hours (positive east). Updated when r_sky_city changes; you generally don't write this directly. Ignored when r_sky_use_astronomical = 0.", CVAR_READONLY);
-    PT_CVAR(r_sky_animate,     "0",       "If 1, advance r_sky_hour every frame at r_sky_animate_rate hours per real-time second. Wraps at 24. Ignored when r_sky_use_astronomical = 0 (animation runs but advances a value nothing reads -- the engine emits a one-line warning).", CVAR_ARCHIVE);
+    PT_CVAR(r_sky_animate,     "0",       "If 1, advance r_sky_hour every frame at r_sky_animate_rate hours per real-time second. Wraps at 24. Ignored when r_sky_use_astronomical = 0 (Tick skips the per-frame advance entirely; the engine emits a one-line warning if this cvar is changed in manual-sun mode).", CVAR_ARCHIVE);
     PT_CVAR(r_sky_animate_rate,"0.5",     "Hours of sim time per real-time second when r_sky_animate = 1. 0.5 = half-hour/s (a full day in 48s). 24 = compress a day into 1s. 1/3600 ≈ live-time. Ignored when r_sky_use_astronomical = 0.", CVAR_ARCHIVE);
     PT_CVAR(r_sky_city,        "chennai", "Preset observer location. Selecting one writes r_sky_lat / r_sky_lon to that city's coordinates. 'custom' leaves them as-is. lat/lon are ignored when r_sky_use_astronomical = 0.", CVAR_ARCHIVE);
     PT_CVAR(r_show_stars,      "1",       "Render stars at night (sun below horizon). 0 disables.", CVAR_ARCHIVE);
@@ -466,6 +466,13 @@ bool Engine::Init() {
         if (!r.ok) LOG_WARN("{}: {}", path, r.error);
         LOG_INFO("loaded {}", path);
     };
+    // cfg_loading_ suppresses astronomy-only on_change warnings
+    // during cfg/autoexec/CLI overrides. Cfg writes happen in
+    // lex order so r_sky_* values are set before
+    // r_sky_use_astronomical -- without the suppression a user with
+    // astro=1 saved would see warnings get superseded a moment later.
+    // The post-cfg-load audit a few lines below uses the final state.
+    cfg_loading_ = true;
     exec_if_exists("demont.cfg");      // archived cvars from last quit
     exec_if_exists("autoexec.cfg");    // user-supplied startup script (overrides above)
 
@@ -475,6 +482,24 @@ bool Engine::Init() {
     // (--net-port / --net-line-port); other --<cvar>=<value> args can
     // be added inside ApplyCommandLineCvarOverrides as needed.
     ApplyCommandLineCvarOverrides();
+    cfg_loading_ = false;
+
+    // Post-cfg-load astronomy-mode audit. If astro is off after cfg +
+    // autoexec + CLI overrides have applied, emit ONE summary warning
+    // pointing at the dependency. This replaces the per-cvar startup
+    // warnings (which were lex-order false-positive prone) with an
+    // accurate single line that fires only when the final state is
+    // a no-op for the saved astro cvars. Mid-session per-cvar
+    // warnings still fire on user-issued console writes.
+    if (auto* a = pt::console::Console::Get().FindCVar("r_sky_use_astronomical");
+        a && !a->GetBool()) {
+        LOG_WARN("r_sky_use_astronomical = 0 -- astronomy-only cvars "
+                 "(r_sky_hour, r_sky_lat/lon, r_sky_year/month/day, "
+                 "r_sky_city, r_sky_animate*, r_sky_hour_local, "
+                 "r_sky_tz_offset_hours) have no visible effect in this "
+                 "mode. Set r_sky_use_astronomical 1 to engage "
+                 "time-based sun.");
+    }
 
     // Job system.
     jobs_ = std::make_unique<pt::jobs::JobSystem>();
@@ -5563,22 +5588,47 @@ void Engine::RegisterCommands() {
         v->allowed_values = {"0", "1"};
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
-    // Factory for astronomy-only cvars. The handler always dirties the
-    // accumulator (cheap, harmless when astro is off) and additionally
-    // emits a one-line warning when r_sky_use_astronomical = 0 -- those
-    // cvars are silently ignored in manual-sun mode otherwise, and the
-    // warning surfaces "your command had no visible effect, here's why"
-    // instead of leaving the user wondering. The warning intentionally
-    // fires during cfg load too: if your demont.cfg has these saved but
-    // astro mode is off, you'll see the warning(s) once at startup so
-    // you know immediately, rather than discovering it later when you
-    // try to tweak something at runtime.
-    auto astro_handler = [this](const char* name) {
-        return [this, name](const pt::console::CVar&) {
+    // Factories for astronomy-only cvars. Both emit a one-line warning
+    // when r_sky_use_astronomical = 0 (the cvar has no visible effect
+    // in manual-sun mode), but they differ on accumulator dirtying:
+    //  - `astro_handler`            -- dirties the accumulator. Used by
+    //    cvars whose value is consumed by the path tracer's per-frame
+    //    state (sun position, observer location, date), where a change
+    //    invalidates accumulated samples.
+    //  - `astro_handler_no_dirty`   -- skips accum_dirty_. Used by
+    //    r_sky_animate / r_sky_animate_rate: toggling the animation or
+    //    changing its rate doesn't change the current frame's state
+    //    (Tick() applies the rate next frame), and EMA-mode users
+    //    don't want every cvar nudge to nuke their accumulator.
+    //
+    // Both suppress the warning while `cfg_loading_` is true (cfg load
+    // writes cvars in lex order, so r_sky_* lines apply before
+    // r_sky_use_astronomical -- false positives unless suppressed).
+    // A single summary audit fires after cfg load with the correct
+    // final state. They also suppress when `astro_chained_update_`
+    // is set so the r_sky_city handler's writes to lat/lon/tz don't
+    // re-emit per-cvar warnings -- city emits its own warn once.
+    auto astro_should_warn = [this]() {
+        if (cfg_loading_ || astro_chained_update_) return false;
+        auto* a = pt::console::Console::Get().FindCVar("r_sky_use_astronomical");
+        return a != nullptr && !a->GetBool();
+    };
+    auto astro_handler = [this, astro_should_warn](const char* name) {
+        return [this, name, astro_should_warn](const pt::console::CVar&) {
             accum_dirty_ = true;
-            auto& C2 = pt::console::Console::Get();
-            auto* a = C2.FindCVar("r_sky_use_astronomical");
-            if (a && !a->GetBool()) {
+            if (astro_should_warn()) {
+                LOG_WARN("{}: changed but r_sky_use_astronomical = 0 -- "
+                         "ignored in manual-sun mode (set "
+                         "r_sky_use_astronomical 1 to engage time-based sun)",
+                         name);
+            }
+        };
+    };
+    auto astro_handler_no_dirty = [astro_should_warn](const char* name) {
+        return [name, astro_should_warn](const pt::console::CVar&) {
+            // No accum_dirty_: animate-toggle and rate-change don't
+            // alter the current frame's state. EMA preservation matters.
+            if (astro_should_warn()) {
                 LOG_WARN("{}: changed but r_sky_use_astronomical = 0 -- "
                          "ignored in manual-sun mode (set "
                          "r_sky_use_astronomical 1 to engage time-based sun)",
@@ -5589,9 +5639,9 @@ void Engine::RegisterCommands() {
     if (auto* v = C.FindCVar("r_sky_hour"))   v->on_change = astro_handler("r_sky_hour");
     if (auto* v = C.FindCVar("r_sky_animate")) {
         v->allowed_values = {"0", "1"};
-        v->on_change = astro_handler("r_sky_animate");
+        v->on_change = astro_handler_no_dirty("r_sky_animate");
     }
-    if (auto* v = C.FindCVar("r_sky_animate_rate")) v->on_change = astro_handler("r_sky_animate_rate");
+    if (auto* v = C.FindCVar("r_sky_animate_rate")) v->on_change = astro_handler_no_dirty("r_sky_animate_rate");
     if (auto* v = C.FindCVar("r_show_stars")) {
         v->allowed_values = {"0", "1"};
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
@@ -5607,7 +5657,9 @@ void Engine::RegisterCommands() {
     }
     if (auto* v = C.FindCVar("r_sky_lat") ) v->on_change = astro_handler("r_sky_lat");
     if (auto* v = C.FindCVar("r_sky_lon") ) v->on_change = astro_handler("r_sky_lon");
-    if (auto* v = C.FindCVar("r_sky_time_offset")) v->on_change = astro_handler("r_sky_time_offset");
+    // r_sky_time_offset isn't a registered cvar; the previous
+    // FindCVar/on_change pair was dead code carried forward from an
+    // earlier iteration. Removed.
     if (auto* v = C.FindCVar("r_sky_year"))  v->on_change = astro_handler("r_sky_year");
     if (auto* v = C.FindCVar("r_sky_month")) v->on_change = astro_handler("r_sky_month");
     if (auto* v = C.FindCVar("r_sky_day"))   v->on_change = astro_handler("r_sky_day");
@@ -5632,9 +5684,11 @@ void Engine::RegisterCommands() {
             // (city only matters when r_sky_use_astronomical = 1) but
             // inlined because this handler also writes lat/lon/tz on
             // preset selection; we want the warn line in addition to
-            // the lat/lon/tz writes, not in place of them. Fires at
-            // cfg load too -- intentional, see astro_handler comment.
-            {
+            // the lat/lon/tz writes, not in place of them. Suppressed
+            // during cfg load (matches astro_handler convention) so a
+            // user with astro=1 saved doesn't see false-positive
+            // warnings before the cfg-end audit reports the truth.
+            if (!cfg_loading_) {
                 auto& Cw = pt::console::Console::Get();
                 auto* a = Cw.FindCVar("r_sky_use_astronomical");
                 if (a && !a->GetBool()) {
@@ -5643,6 +5697,16 @@ void Engine::RegisterCommands() {
                              "(set r_sky_use_astronomical 1 to engage time-based sun)");
                 }
             }
+            // Mark chained-update before the SetCVarOverride writes
+            // below so r_sky_lat / r_sky_lon's astro_handler doesn't
+            // also emit per-cvar warnings -- the user issued ONE
+            // command and should see ONE warn (the city one above).
+            // RAII so we can't forget to clear on early return / throw.
+            struct ChainGuard {
+                bool& flag;
+                ChainGuard(bool& f) : flag(f) { flag = true; }
+                ~ChainGuard()                 { flag = false; }
+            } chain_guard(astro_chained_update_);
             // tz is the city's standard-time UTC offset in hours
             // (positive east). DST is intentionally ignored: this is
             // a sky simulator, not a clock app, and DST switches add
