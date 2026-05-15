@@ -155,7 +155,18 @@ public:
     void           Resize(int w, int h) override;
 
     BackendType  Type()             const override { return BackendType::Software; }
-    bool         SupportsHardwareRT() const override { return false; }
+    // Embree gives us a software-emulated BVH + triangle intersection
+    // pipeline (CreateBLAS / CreateTLAS / rtcIntersect1) that is
+    // semantically equivalent to "hardware ray tracing" from the
+    // engine's perspective. Returning true here unlocks
+    // Engine::EnsureMeshUpdated()'s CSG-bake + RebuildMeshResources
+    // path -- without it the engine treats this backend as RT-less
+    // and never builds a TLAS, so the mesh stays invisible no matter
+    // what the kernel does. The name is a slight misnomer for a CPU
+    // backend, but the contract it gates on is "can the device build
+    // an acceleration structure and trace rays against it" which we
+    // satisfy via Embree.
+    bool         SupportsHardwareRT() const override { return true; }
     const char*  DeviceName()       const override { return "DeMonT Software (CPU + Embree)"; }
     std::size_t  CurrentAllocatedBytes() const override;
 
@@ -194,6 +205,12 @@ private:
     MTL::Texture*      present_tex_ = nullptr;   // RGBA8Unorm, sized to swapchain
     std::uint32_t      present_w_   = 0;
     std::uint32_t      present_h_   = 0;
+    // Scratch buffer reused across frames for the RGBA32F -> BGRA8Unorm
+    // pack step in PresentOutput(). Allocating a fresh vector every
+    // frame at 1080p / 4K was several MB of heap churn on top of the
+    // CPU tracer; this stays sized to the current swapchain and only
+    // re-allocates on resize.
+    std::vector<std::uint32_t> present_scratch_;
 
     std::unique_ptr<SoftwareCommandBuffer> cmd_buf_;
 

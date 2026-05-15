@@ -351,17 +351,19 @@ bool SoftwareDevice::ReadbackTexture(TextureHandle h, void* dst, std::size_t dst
     if (t == nullptr || dst == nullptr) return false;
     if (out_w) *out_w = t->width;
     if (out_h) *out_h = t->height;
-    // Internal format is always RGBA32F (4 floats per pixel). The
-    // screenshot path expects raw bytes matching what the GPU
-    // backends would return for the same texture handle; for `accum`
-    // that's 16B/pixel RGBA32F so the formats line up. For other
-    // targets the bytes will be wider than the GPU equivalent, but
-    // copying the prefix is still better than failing -- the
-    // screenshot path tonemaps the first 16B/pixel as RGBA32F floats
-    // anyway.
+    // Internal format is always RGBA32F (4 floats per pixel). Refuse
+    // partial reads so the caller knows it has the full bytes or
+    // nothing -- silently truncating would let screenshot / capture
+    // callers process incomplete data as if the readback succeeded.
+    // For `accum` (RGBA32F GPU format too) the sizes line up; for
+    // RGBA16F targets the caller's buffer is half the size we
+    // expose, which legitimately fails here -- that's the GPU-only
+    // path (denoise_color, depth, motion) and the screenshot
+    // command's per-target route already documents it as a
+    // Software-backend gap.
     const std::size_t src_size = t->data.size() * sizeof(float);
-    const std::size_t to_copy  = std::min(src_size, dst_size);
-    std::memcpy(dst, t->data.data(), to_copy);
+    if (dst_size < src_size) return false;
+    std::memcpy(dst, t->data.data(), src_size);
     return true;
 }
 
@@ -575,8 +577,13 @@ void SoftwareDevice::PresentOutput() {
 
     // Convert RGBA32F -> BGRA8Unorm and upload. Clamp to [0,1]; the
     // path tracer is responsible for tonemapping into that range.
+    // Scratch buffer is a class member so the per-frame heap churn
+    // (several MB at 1080p / tens of MB at 4K) goes away after the
+    // first resize -- only re-allocates when the swapchain grows.
     const std::size_t pixel_count = std::size_t(w) * h;
-    std::vector<std::uint32_t> packed(pixel_count);
+    if (present_scratch_.size() < pixel_count) {
+        present_scratch_.resize(pixel_count);
+    }
     for (std::size_t i = 0; i < pixel_count; ++i) {
         float r = std::clamp(out_tex->data[i * 4 + 0], 0.0f, 1.0f);
         float g = std::clamp(out_tex->data[i * 4 + 1], 0.0f, 1.0f);
@@ -587,10 +594,10 @@ void SoftwareDevice::PresentOutput() {
         std::uint32_t ri = static_cast<std::uint32_t>(r * 255.0f + 0.5f);
         std::uint32_t ai = static_cast<std::uint32_t>(a * 255.0f + 0.5f);
         // BGRA8Unorm packs as 0xAARRGGBB on little-endian.
-        packed[i] = (ai << 24) | (ri << 16) | (gi << 8) | bi;
+        present_scratch_[i] = (ai << 24) | (ri << 16) | (gi << 8) | bi;
     }
     MTL::Region region = MTL::Region::Make2D(0, 0, w, h);
-    present_tex_->replaceRegion(region, 0, packed.data(), w * 4);
+    present_tex_->replaceRegion(region, 0, present_scratch_.data(), w * 4);
 }
 
 }  // namespace pt::rhi::sw

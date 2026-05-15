@@ -17,7 +17,9 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/constants.hpp>
 
+#include <algorithm>    // std::max, std::min, std::clamp
 #include <atomic>
+#include <cmath>        // std::sqrt, std::fabs, std::pow, std::abs
 #include <cstring>
 #include <thread>
 #include <vector>
@@ -269,6 +271,23 @@ void RunPathTraceKernel(SoftwareDevice& device,
         BackedAccel* a = device.GetAccel(AccelStructHandle{cmd.binds.accel_structs[2]});
         if (a != nullptr && a->is_tlas) tlas_scene = a->scene;
     }
+
+    // Match the GPU paths' exposure handling. The engine writes the
+    // current exposure scalar to exposure_state[0] (seeded by
+    // r_exposure on_change when r_auto_exposure=0; the AutoExposure
+    // dispatch updates it each frame when =1, but that dispatch is
+    // a no-op on Software so manual mode is what works today). The
+    // GPU shaders multiply HDR radiance by this value before
+    // tonemapping; we mirror it so r_exposure changes track on
+    // screen here too.
+    float exposure = 1.0f;
+    if (cmd.binds.buffers[6] != 0) {
+        BackedBuffer* eb = device.GetBuffer(BufferHandle{cmd.binds.buffers[6]});
+        if (eb != nullptr && eb->size >= sizeof(float)) {
+            std::memcpy(&exposure, eb->data.data(), sizeof(float));
+            if (!std::isfinite(exposure) || exposure <= 0.0f) exposure = 1.0f;
+        }
+    }
     // One-shot diagnostic so the user can see whether the engine
     // bound a TLAS at all. Cheap because it only fires on the first
     // dispatch and reads atomics; subsequent frames skip the log.
@@ -350,7 +369,7 @@ void RunPathTraceKernel(SoftwareDevice& device,
                     }
                     col = ambient + lit;
                 }
-                glm::vec3 tonemapped = SrgbOetf(AcesNarkowicz(col));
+                glm::vec3 tonemapped = SrgbOetf(AcesNarkowicz(col * exposure));
                 row[x * 4 + 0] = tonemapped.r;
                 row[x * 4 + 1] = tonemapped.g;
                 row[x * 4 + 2] = tonemapped.b;
