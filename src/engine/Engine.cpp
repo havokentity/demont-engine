@@ -4897,12 +4897,6 @@ void Engine::RegisterCommands() {
     if (auto* v = C.FindCVar("r_accum_ema_alpha")) {
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
-    // r_accum_ema_alpha switches the accumulator between running-mean
-    // (alpha == 0) and EMA blending: changing it mid-render against a
-    // non-zero prev.a would instantly mix modes for a jittery frame.
-    if (auto* v = C.FindCVar("r_accum_ema_alpha")) {
-        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
-    }
     // Sky cvars: changing any of them invalidates accumulation.
     if (auto* v = C.FindCVar("r_sky_mode")) {
         v->allowed_values = {"gradient", "hdri", "procedural"};
