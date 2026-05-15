@@ -2890,10 +2890,15 @@ void Engine::RenderFrame() {
         //     reads post_denoise_hdr, composites bloom pre-ACES, writes swap.
         //   - Metal + bloom-without-denoiser: engine Tonemap.slang reads
         //     denoise_color (PathTrace direct write), same composite chain.
-        //   - Vulkan + SVGF/NRD: VulkanNrdDenoiser's internal
-        //     DenoiseFinalize writes the swap. Bloom is a no-op
-        //     (PR #11 disabled the pre-Denoise pyramid, separate
-        //     descriptor-reuse bug).
+        //   - Vulkan + SVGF/NRD: build the bloom pyramid in-engine from
+        //     denoise_color (PathTrace's raw HDR write, pre-denoise),
+        //     then pass bloom_mip[0] through Denoise(Kind::Svgf) so
+        //     VulkanNrdDenoiser::Encode composites it during its
+        //     internal DenoiseFinalize step before writing the swap.
+        //     The descriptor-reuse bug PR #11 originally worked around
+        //     was the same root cause fixed by PR #18's per-dispatch
+        //     descriptor-set ring (kept dispatches from observing each
+        //     other's UPDATE_AFTER_BIND writes).
         //   - Vulkan + bloom-without-denoiser: build the bloom pyramid
         //     in-engine, then dispatch VulkanNrdDenoiser::EncodeFinalizeOnly
         //     via Denoise(Kind::FinalizeOnly). EncodeFinalizeOnly has its
@@ -3088,34 +3093,68 @@ void Engine::RenderFrame() {
              bloom_mip_tex_id_[0] != 0 &&
              bloom_down_pipeline_id_ != 0 && bloom_up_pipeline_id_ != 0);
 
-        // Vulkan + denoiser-active: the original design built a
-        // pre-Denoise bloom pyramid from denoise_color and passed
-        // bloom_mip[0] through DenoiseFinalize for the composite.
-        // On PC (RTX 5090) that path renders only the upper-left
-        // ~quarter of the swapchain when r_bloom = 1, with the rest
-        // of the swap showing a darkened version of an earlier pass
-        // -- looks like a descriptor / barrier issue between the
+        // Vulkan + SVGF/NRD active: build a pre-Denoise bloom pyramid
+        // from denoise_color (PathTrace's raw HDR write) and pass
+        // bloom_mip[0] through Denoise() so VulkanNrdDenoiser::Encode
+        // composites bloom inside its internal DenoiseFinalize step.
+        // Pre-denoise pyramid source carries some path-tracer noise
+        // but bloom is a low-frequency feature so it's acceptable; a
+        // post-denoise pyramid would require splitting Encode() into
+        // stages-only + a separate FinalizeOnly call (deferred).
+        //
+        // History: PR #11 originally disabled this path because the
         // shared 19-binding pipeline-layout's storage-image bindings
-        // 0/1 (which bloom_down re-binds to mip views) and the
-        // dispatches that bracket it (PathTrace's HDR-aux write
-        // before, DenoiseFinalize at the tail). The bug reproduces
-        // on eaaf7b4 too -- pre-existing, not caused by this branch.
-        // Until a validation-layer + RenderDoc capture pins it down,
-        // force this pyramid off so DenoiseFinalize gets bloom_in = 0
-        // and the swap is rendered cleanly. r_bloom remains a no-op
-        // on Vulkan when a denoiser is ACTIVE.
+        // 0/1 (which bloom_down re-binds to mip views) interleaved
+        // with the dispatches that bracketed it -- the swap rendered
+        // only the upper-left ~quarter with the rest of the image
+        // showing an earlier pass. Root cause was UPDATE_AFTER_BIND
+        // descriptors: every dispatch read the LATEST host write at
+        // execution time, so PathTrace's `output` binding observed
+        // bloom_mip[1]'s 320x180 view rebinding and the shader's
+        // GetDimensions() returned (320, 180), killing all writes
+        // outside that region. PR #18 fixed it with a per-dispatch
+        // descriptor-set ring (VulkanDevice::AcquireDispatchDescriptorSet),
+        // so each dispatch now sees the descriptors it was recorded
+        // with. The Tonemap.slang black-screen bug is unrelated and
+        // doesn't reach this path -- SVGF's internal DenoiseFinalize
+        // uses VulkanNrdDenoiser's dedicated layout, not Tonemap.slang.
         //
         // Vulkan + bloom-without-denoiser (use_vulkan_bloom_finalize):
-        // there's no SVGF dispatch in the pipeline, so the bug above
-        // doesn't apply. The engine dispatches the bloom pyramid
-        // in-engine then calls Denoise(Kind::FinalizeOnly) below,
-        // which routes to VulkanNrdDenoiser::EncodeFinalizeOnly --
-        // a self-contained 4-binding pipeline that sidesteps both
-        // the bloom-vs-SVGF descriptor bug above and the Tonemap.slang
+        // there's no SVGF dispatch in the pipeline; the engine
+        // dispatches the bloom pyramid in-engine then calls
+        // Denoise(Kind::FinalizeOnly) below, which routes to
+        // VulkanNrdDenoiser::EncodeFinalizeOnly -- a self-contained
+        // 4-binding pipeline that also sidesteps the Tonemap.slang
         // black-swapchain bug. (Tonemap.slang is broken on Vulkan
         // regardless of upstream denoiser state, contrary to the
         // earlier hypothesis that the bug was SVGF-specific.)
-        const bool vulkan_pre_denoise_bloom = false;
+        //
+        // OptiX is excluded here because its denoise runs on a
+        // private cb gated by a CUDA->Vulkan timeline semaphore, so
+        // the engine cb can't safely pass a "current frame" bloom
+        // mip in -- Branch B (feature/vulkan-bloom-with-optix) deals
+        // with that handshake separately.
+        const bool vulkan_pre_denoise_bloom =
+            (!backend_is_metal && denoiser_active_ && !kind_is_optix &&
+             bloom_can_run);
+        // Edge-detect log: fire once when the path engages and once
+        // when it disengages. Both transitions matter operationally --
+        // engagement tells the user bloom is now being composited
+        // inside SVGF's finalize (so they know which dispatch to
+        // capture if they want to debug); disengagement covers the
+        // case where r_bloom 0 / r_denoiser none / a kind switch
+        // turned it off, so a missing bloom isn't mistaken for the
+        // SVGF path silently breaking.
+        if (vulkan_pre_denoise_bloom && !vulkan_pre_denoise_bloom_engaged_) {
+            LOG_INFO("engine: vulkan pre-denoise bloom engaged -- pyramid built from "
+                     "denoise_color ({}x{} RGBA16F), bloom_mip[0] composited inside "
+                     "VulkanNrdDenoiser::Encode's DenoiseFinalize",
+                     fc.width, fc.height);
+            vulkan_pre_denoise_bloom_engaged_ = true;
+        } else if (!vulkan_pre_denoise_bloom && vulkan_pre_denoise_bloom_engaged_) {
+            LOG_INFO("engine: vulkan pre-denoise bloom disengaged");
+            vulkan_pre_denoise_bloom_engaged_ = false;
+        }
         dd.bloom_in        = vulkan_pre_denoise_bloom
                                  ? pt::rhi::TextureHandle{bloom_mip_tex_id_[0]}
                                  : pt::rhi::TextureHandle{0};
@@ -3170,6 +3209,25 @@ void Engine::RenderFrame() {
                          fc.width, fc.height);
                 s_logged_optix_bloom = true;
             }
+        }
+
+        // Vulkan + SVGF/NRD bloom: build the pyramid from denoise_color
+        // BEFORE Denoise(). VulkanNrdDenoiser::Encode samples
+        // bloom_mip[0] in its internal DenoiseFinalize step, so the
+        // pyramid must be a finished resource by the time SVGF runs.
+        // PathTrace wrote denoise_color earlier this frame; emit the
+        // RAW barrier so bloom_down's read isn't racing the store.
+        // (Autoexpose upstream emits the same barrier when r_auto_exposure
+        // is on -- this is unconditional cover for the off case, matching
+        // the use_vulkan_bloom_finalize branch below.)
+        //
+        // Mutually exclusive with the OptiX block above: vulkan_pre_denoise_bloom
+        // requires !kind_is_optix, use_vulkan_optix_bloom requires kind_is_optix.
+        // At most one of these dispatches runs per frame.
+        if (vulkan_pre_denoise_bloom) {
+            cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                         pt::rhi::BarrierDesc::Stage::ComputeRead});
+            dispatch_bloom_pyramid(denoise_color_tex_id_);
         }
 
         // Skip the denoiser dispatch in the bloom-without-denoiser
