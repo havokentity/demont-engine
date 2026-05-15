@@ -2838,6 +2838,8 @@ void VulkanDevice::EncodeDenoiseFinalize(VkCommandBuffer cb,
                                          VkImageView    color_in_view,
                                          VkImageView    final_output_view,
                                          VkBuffer       exposure_state_buf,
+                                         VkImageView    bloom_in_view,
+                                         float          bloom_intensity,
                                          std::uint32_t  width,
                                          std::uint32_t  height,
                                          bool           hdr_pipeline) {
@@ -2858,11 +2860,14 @@ void VulkanDevice::EncodeDenoiseFinalize(VkCommandBuffer cb,
             return;
         }
     }
-    // OptiX denoise path doesn't run the bloom pyramid (different
-    // resource flow), so pass no bloom (placeholder + intensity=0).
+    // EncodeFinalizeOnly's contract: a null bloom view forces intensity
+    // to 0 internally and binds color_in as a safe-but-unread fallback,
+    // so the OptiX bloom-off case (engine passes view=NULL, intensity=0)
+    // and the OptiX bloom-on case (view=mip0, intensity>0) both go
+    // through the same call.
     denoiser_->EncodeFinalizeOnly(cb, color_in_view, final_output_view,
                                   exposure_state_buf,
-                                  VK_NULL_HANDLE, 0.0f,
+                                  bloom_in_view, bloom_intensity,
                                   width, height, hdr_pipeline);
 }
 #endif

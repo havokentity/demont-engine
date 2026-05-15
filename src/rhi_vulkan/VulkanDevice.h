@@ -146,10 +146,20 @@ public:
     // Caller responsible for both image layouts being GENERAL before
     // the call. See VulkanNrdDenoiser::EncodeFinalizeOnly for the
     // detailed contract.
+    //
+    // bloom_in_view / bloom_intensity: optional bloom-pyramid mip 0
+    // composite. Pass VK_NULL_HANDLE / 0.0f to skip the bloom add (the
+    // shader gates the read on intensity > 0). When supplied, the view
+    // must reference an RGBA16F storage image in GENERAL layout, with
+    // any prior compute-write ordered by the caller (the queue submit
+    // boundary between the engine cb that wrote the pyramid and this
+    // private cb is sufficient on its own).
     void EncodeDenoiseFinalize(VkCommandBuffer cb,
                                VkImageView    color_in_view,
                                VkImageView    final_output_view,
                                VkBuffer       exposure_state_buf,
+                               VkImageView    bloom_in_view,
+                               float          bloom_intensity,
                                std::uint32_t  width,
                                std::uint32_t  height,
                                bool           hdr_pipeline);
