@@ -125,80 +125,29 @@ FetchContent_Declare(nlohmann_json
 # this codebase. ARM64 / Apple Silicon support has been first-class
 # since Embree 4.x; the same source tree builds natively on
 # x86_64 Windows + NVIDIA RTX too.
-set(EMBREE_TUTORIALS                OFF CACHE BOOL   "" FORCE)
-set(EMBREE_STATIC_LIB               ON  CACHE BOOL   "" FORCE)
-set(EMBREE_ISPC_SUPPORT             OFF CACHE BOOL   "" FORCE)
-set(EMBREE_TASKING_SYSTEM           "INTERNAL" CACHE STRING "" FORCE)
-set(EMBREE_GEOMETRY_TRIANGLE        ON  CACHE BOOL   "" FORCE)
-set(EMBREE_GEOMETRY_QUAD            OFF CACHE BOOL   "" FORCE)
-set(EMBREE_GEOMETRY_CURVE           OFF CACHE BOOL   "" FORCE)
-set(EMBREE_GEOMETRY_SUBDIVISION     OFF CACHE BOOL   "" FORCE)
-set(EMBREE_GEOMETRY_USER            OFF CACHE BOOL   "" FORCE)
-set(EMBREE_GEOMETRY_INSTANCE        ON  CACHE BOOL   "" FORCE)
-set(EMBREE_GEOMETRY_INSTANCE_ARRAY  OFF CACHE BOOL   "" FORCE)
-set(EMBREE_GEOMETRY_GRID            OFF CACHE BOOL   "" FORCE)
-set(EMBREE_GEOMETRY_POINT           OFF CACHE BOOL   "" FORCE)
-set(EMBREE_RAY_PACKETS              OFF CACHE BOOL   "" FORCE)
-set(EMBREE_FILTER_FUNCTION          OFF CACHE BOOL   "" FORCE)
-set(EMBREE_BACKFACE_CULLING         OFF CACHE BOOL   "" FORCE)
-set(EMBREE_ZIP_MODE                 OFF CACHE BOOL   "" FORCE)
-# ISA matrix: target hardware floor is AMD Ryzen 9 5950X (Zen 3, 2020) /
-# Intel Rocket Lake i9-11900K (2021) or equivalent.  Every CPU in that
-# class has AVX2, so the SSE2 / SSE4.2 / AVX variants Embree builds by
-# default are pure dead code on real demont users -- they exist only
-# to support pre-2013 hardware that can't run Vulkan / Metal anyway.
-# AVX-512 is gated on PT_ENABLE_AVX512_EMBREE (default ON, see top-level
-# CMakeLists.txt): Zen 4+ (Ryzen 7000+), Zen 5 (Ryzen 9000+, the
-# project owner's 9950X3D), Threadripper, Xeon Skylake+, Rocket Lake
-# (i9-11900K), and HEDT chips all have it -- that's everything modern
-# on the AMD consumer side plus most workstation chips.  Embree's
-# runtime ISA dispatch falls back to AVX2 on chips that lack AVX-512
-# (Zen 3, Intel mainstream consumer since Alder Lake), so the single
-# shipped binary covers every supported CPU without breaking anyone.
-# Local devs who want a faster build (don't need AVX-512 perf on
-# their own machine) can flip PT_ENABLE_AVX512_EMBREE OFF in their
-# cmake invocation.
 #
-# The whole x86 ISA block is gated on CMAKE_SYSTEM_PROCESSOR matching
-# x86 -- on ARM hosts (Apple Silicon, ARM Linux), Embree's CMake auto-
-# selects NEON via its EMBREE_ARM detection path and leaves the x86
-# flags at OFF.  Forcing EMBREE_ISA_AVX2 ON unconditionally would
-# trip Embree's "static lib + multiple ISAs + AppleClang >= 9.0"
-# guard (NUMISA=2 from NEON + AVX2 on Apple Silicon), failing the
-# configure step.  Gating keeps both consumer x86 builds and Apple
-# Silicon happy without per-ISA-flag conditional sprawl.
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86|amd64|AMD64")
-    set(EMBREE_ISA_SSE2             OFF CACHE BOOL   "" FORCE)
-    set(EMBREE_ISA_SSE42            OFF CACHE BOOL   "" FORCE)
-    set(EMBREE_ISA_AVX              OFF CACHE BOOL   "" FORCE)
-    set(EMBREE_ISA_AVX2             ON  CACHE BOOL   "" FORCE)
-    # AVX-512 requires clang / clang-cl / icx.  Embree's own CMake has
-    # an explicit hard error -- "Microsoft Visual C++ Compiler does not
-    # support AVX512.  Please use Intel Compiler or Clang" -- at line
-    # 321 of their top-level CMakeLists.txt, so the build refuses to
-    # configure if we try AVX-512 + MSVC cl.exe.  build.yml's win-debug
-    # PR-gate job uses MSVC (release.yml uses clang-cl), so we have to
-    # silently drop AVX-512 when the compiler is MSVC -- otherwise
-    # default-ON PT_ENABLE_AVX512_EMBREE breaks every PR's Windows CI.
-    # clang-cl release builds + Mac/Linux clang builds keep AVX-512.
-    if(PT_ENABLE_AVX512_EMBREE AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-        set(EMBREE_ISA_AVX512       ON  CACHE BOOL   "" FORCE)
-    else()
-        set(EMBREE_ISA_AVX512       OFF CACHE BOOL   "" FORCE)
-        if(PT_ENABLE_AVX512_EMBREE AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-            message(STATUS
-                "PT_ENABLE_AVX512_EMBREE: requested but compiler is MSVC; "
-                "AVX-512 disabled for this configure (Embree limitation -- "
-                "see common/cmake/msvc.cmake).  Switch to clang-cl "
-                "(--preset win-clang-release / win-clang-debug) to enable.")
-        endif()
-    endif()
+# Two acquisition paths, in order of preference:
+#   1. Pre-built artefact from .github/workflows/prebuild-embree.yml,
+#      consumed via cmake/EmbreeBinary.cmake.  Sets EMBREE_PREBUILT_FOUND
+#      = TRUE and an `embree` IMPORTED STATIC target; skips the slow
+#      from-source compile entirely (~30s download vs ~10-15min build).
+#   2. Source compile via FetchContent.  Triggered when EmbreeBinary
+#      couldn't find a prebuilt for the host platform / config -- new
+#      Embree version, ISA flag bump, unsupported platform, etc.  The
+#      first such build is slow; prebuild-embree.yml then runs and
+#      uploads the artefact so the NEXT configure hits the fast path.
+#
+# Both paths read their settings from cmake/EmbreeConfig.cmake (single
+# source of truth for version + flags) so they can't drift.
+include(${CMAKE_CURRENT_LIST_DIR}/EmbreeBinary.cmake)
+if(NOT EMBREE_PREBUILT_FOUND)
+    pt_apply_embree_config()
+    FetchContent_Declare(embree
+        URL       ${EMBREE_VENDORED_URL}
+        URL_HASH  ${EMBREE_VENDORED_URL_HASH}
+        SYSTEM
+    )
 endif()
-FetchContent_Declare(embree
-    URL           https://github.com/RenderKit/embree/archive/refs/tags/v4.4.0.tar.gz
-    URL_HASH      SHA256=acb517b0ea0f4b442235d5331b69f96192c28da6aca5d5dde0cbe40799638d5c
-    SYSTEM
-)
 
 # --- manifold: mesh CSG (P9 headline) --------------------------------------
 # Robust manifold-mesh boolean ops (union/intersect/subtract). Builds with
@@ -248,29 +197,37 @@ else()
     set(PT_DEP_UNDEF_DEBUG_FLAGS -UDEBUG)
 endif()
 
-# Embree's headers (common/sys/vector.h etc.) rely on pre-C++17 transitive
-# includes (<type_traits>, <exception>) that libc++ no longer pulls in
-# automatically when the consumer compiles with C++20+. Building Embree
-# itself in C++17 sidesteps the issue without forking; consumers of
-# Embree (our SoftwareDevice TU) keep building in the project's standard
-# C++23. Block scope (see Manifold pattern below) confines the override
-# so it doesn't leak to subsequent fetches.
-block()
-    set(CMAKE_CXX_STANDARD 17)
-    set(CMAKE_CXX_STANDARD_REQUIRED ON)
-    FetchContent_MakeAvailable(embree)
-endblock()
-# Silence Embree's vendored warning-as-noise so the build log stays
-# readable; the lib has ~hundreds of warnings we can't fix without
-# forking the upstream project.
-if(TARGET embree)
-    target_compile_options(embree PRIVATE ${PT_DEP_WARN_SILENCE_FLAG})
-endif()
-foreach(_t sys math simd lexers tasking)
-    if(TARGET ${_t})
-        target_compile_options(${_t} PRIVATE ${PT_DEP_WARN_SILENCE_FLAG})
+# Embree compile + per-target tweaks below are only relevant when we're
+# building Embree from source (EmbreeBinary.cmake didn't find a prebuilt
+# for this host).  The prebuilt path is a single IMPORTED target with no
+# in-tree sources to compile, so there's nothing to wrap in the C++17
+# block and no sub-targets (sys / math / simd / lexers / tasking) to
+# tweak warning flags on.
+if(NOT EMBREE_PREBUILT_FOUND)
+    # Embree's headers (common/sys/vector.h etc.) rely on pre-C++17 transitive
+    # includes (<type_traits>, <exception>) that libc++ no longer pulls in
+    # automatically when the consumer compiles with C++20+. Building Embree
+    # itself in C++17 sidesteps the issue without forking; consumers of
+    # Embree (our SoftwareDevice TU) keep building in the project's standard
+    # C++23. Block scope (see Manifold pattern below) confines the override
+    # so it doesn't leak to subsequent fetches.
+    block()
+        set(CMAKE_CXX_STANDARD 17)
+        set(CMAKE_CXX_STANDARD_REQUIRED ON)
+        FetchContent_MakeAvailable(embree)
+    endblock()
+    # Silence Embree's vendored warning-as-noise so the build log stays
+    # readable; the lib has ~hundreds of warnings we can't fix without
+    # forking the upstream project.
+    if(TARGET embree)
+        target_compile_options(embree PRIVATE ${PT_DEP_WARN_SILENCE_FLAG})
     endif()
-endforeach()
+    foreach(_t sys math simd lexers tasking)
+        if(TARGET ${_t})
+            target_compile_options(${_t} PRIVATE ${PT_DEP_WARN_SILENCE_FLAG})
+        endif()
+    endforeach()
+endif()
 if(PT_ENABLE_VULKAN_BACKEND)
     FetchContent_MakeAvailable(vma)
 endif()

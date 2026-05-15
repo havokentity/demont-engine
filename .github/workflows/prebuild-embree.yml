@@ -1,0 +1,253 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Rajesh D'Monte
+#
+# Builds Embree once per host platform with demont-engine's exact
+# config (cmake/EmbreeConfig.cmake) and uploads the resulting .a / .lib
+# + headers as assets on a GitHub Release tagged `vendored/embree-<v>`.
+# cmake/EmbreeBinary.cmake on the consumer side then downloads that
+# artefact instead of compiling Embree from source -- ~30 sec vs the
+# ~10-15 min cold compile.
+#
+# Triggers:
+#   - workflow_dispatch: manual run from the Actions tab.  Useful if
+#     a build needs re-running (toolchain bump on the runner image,
+#     etc.) without changing any source.  `force` input bypasses the
+#     skip-if-exists check.
+#   - push: on changes to the Embree config (EmbreeConfig.cmake) or
+#     the standalone prebuild project / workflow itself.  Auto-fires
+#     so a config bump on main / a feature branch immediately
+#     produces fresh prebuilts.  PRs are NOT triggered (we don't
+#     want feature-branch CMake tweaks consuming runner minutes
+#     until they actually land).
+
+name: Prebuild Embree
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force rebuild even when the release asset already exists"
+        type: boolean
+        default: false
+  push:
+    branches: [ main ]
+    paths:
+      - 'cmake/EmbreeConfig.cmake'
+      - 'cmake/embree-prebuild/CMakeLists.txt'
+      - '.github/workflows/prebuild-embree.yml'
+
+# One run per ref to avoid two main pushes racing each other to upload
+# the same release asset (the second would fail on "asset exists").
+concurrency:
+  group: prebuild-embree-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Reads EMBREE_VENDORED_VERSION out of cmake/EmbreeConfig.cmake once
+  # and exposes it to the per-platform build jobs.  Doing this once in
+  # a fan-in job keeps the version logic in lockstep across platforms
+  # and avoids duplicating the grep.
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag:     ${{ steps.ver.outputs.tag }}
+      exists:  ${{ steps.check.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract EMBREE_VENDORED_VERSION
+        id: ver
+        run: |
+          v=$(grep -E '^set\(EMBREE_VENDORED_VERSION' cmake/EmbreeConfig.cmake | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$v" ]; then
+            echo "::error::Could not extract EMBREE_VENDORED_VERSION from cmake/EmbreeConfig.cmake"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "tag=vendored/embree-$v" >> "$GITHUB_OUTPUT"
+          echo "Resolved vendored version: $v"
+      - name: Check if release tag already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.ver.outputs.tag }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release ${{ steps.ver.outputs.tag }} already exists; per-platform jobs will skip unless force=true."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Release ${{ steps.ver.outputs.tag }} doesn't exist; per-platform jobs will build + upload."
+          fi
+
+  macos-arm64:
+    name: Prebuild Embree (macOS arm64)
+    needs: resolve-version
+    runs-on: macos-26
+    permissions:
+      contents: write   # needed to upload to a GitHub Release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check if macOS arm64 asset already exists
+        id: asset_check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset="embree-${{ needs.resolve-version.outputs.version }}-macos-arm64.tar.gz"
+          if [ "${{ needs.resolve-version.outputs.exists }}" = "true" ] && \
+             gh release view "${{ needs.resolve-version.outputs.tag }}" \
+                  --repo "${{ github.repository }}" --json assets \
+                  --jq ".assets[].name" | grep -qx "$asset"; then
+            echo "asset_exists=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping: $asset already on release."
+          else
+            echo "asset_exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install build tools
+        if: steps.asset_check.outputs.asset_exists != 'true' || inputs.force
+        run: brew install ninja cmake || true
+
+      - name: Configure prebuild project
+        if: steps.asset_check.outputs.asset_exists != 'true' || inputs.force
+        run: |
+          cmake -S cmake/embree-prebuild -B build/embree-prebuild \
+                -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_OSX_ARCHITECTURES=arm64 \
+                -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+                -DPT_ENABLE_AVX512_EMBREE=OFF
+
+      - name: Build Embree
+        if: steps.asset_check.outputs.asset_exists != 'true' || inputs.force
+        run: cmake --build build/embree-prebuild --parallel
+
+      - name: Stage install tree
+        if: steps.asset_check.outputs.asset_exists != 'true' || inputs.force
+        run: |
+          cmake --install build/embree-prebuild --prefix dist/embree
+          ls -lR dist/embree | head -50
+
+      - name: Package
+        if: steps.asset_check.outputs.asset_exists != 'true' || inputs.force
+        run: |
+          asset="embree-${{ needs.resolve-version.outputs.version }}-macos-arm64.tar.gz"
+          (cd dist && tar -czf "$asset" embree)
+          ls -lh "dist/$asset"
+          echo "ASSET=dist/$asset" >> "$GITHUB_ENV"
+
+      - name: Upload to release
+        if: steps.asset_check.outputs.asset_exists != 'true' || inputs.force
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:    ${{ needs.resolve-version.outputs.tag }}
+          name:        "Vendored Embree ${{ needs.resolve-version.outputs.version }}"
+          prerelease:  true
+          files:       ${{ env.ASSET }}
+          fail_on_unmatched_files: true
+          body: |
+            Pre-built Embree static libraries for demont-engine, produced by
+            `.github/workflows/prebuild-embree.yml` with the exact config in
+            `cmake/EmbreeConfig.cmake` (vendored version
+            `${{ needs.resolve-version.outputs.version }}`).
+
+            Consumed automatically by `cmake/EmbreeBinary.cmake` when the
+            project is configured -- skips the ~10-15 min Embree source
+            compile on cache misses.  Built fresh whenever EmbreeConfig.cmake
+            or the standalone prebuild project changes on main.
+
+            Assets:
+              - `embree-<version>-macos-arm64.tar.gz` (NEON, Apple Silicon)
+              - `embree-<version>-windows-x64.zip`    (clang-cl, AVX2 [+ AVX-512])
+
+  windows-x64:
+    name: Prebuild Embree (Windows x64, clang-cl)
+    needs: resolve-version
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check if Windows x64 asset already exists
+        id: asset_check
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $asset = "embree-${{ needs.resolve-version.outputs.version }}-windows-x64.zip"
+          if ('${{ needs.resolve-version.outputs.exists }}' -eq 'true') {
+            $names = gh release view '${{ needs.resolve-version.outputs.tag }}' `
+                        --repo '${{ github.repository }}' --json assets `
+                        --jq '.assets[].name'
+            if ($names -contains $asset) {
+              "asset_exists=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+              Write-Host "Skipping: $asset already on release."
+              exit 0
+            }
+          }
+          "asset_exists=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Set up MSVC
+        if: steps.asset_check.outputs.asset_exists != 'true' || inputs.force
+        # clang-cl needs MSVC's SDK headers + link.exe on PATH even
+        # though we're not compiling with cl.exe itself.
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Ninja
+        if: steps.asset_check.outputs.asset_exists != 'true' || inputs.force
+        shell: pwsh
+        run: choco install ninja --no-progress -y
+
+      - name: Verify clang-cl is on PATH
+        if: steps.asset_check.outputs.asset_exists != 'true' || inputs.force
+        shell: pwsh
+        run: |
+          $clangCl = Get-Command clang-cl -ErrorAction SilentlyContinue
+          if (-not $clangCl) {
+            Write-Error "clang-cl.exe not found on PATH"
+            exit 1
+          }
+          clang-cl --version
+
+      - name: Configure prebuild project
+        if: steps.asset_check.outputs.asset_exists != 'true' || inputs.force
+        shell: pwsh
+        run: |
+          cmake -S cmake/embree-prebuild -B build/embree-prebuild `
+                -G Ninja -DCMAKE_BUILD_TYPE=Release `
+                -DCMAKE_C_COMPILER=clang-cl `
+                -DCMAKE_CXX_COMPILER=clang-cl `
+                -DPT_ENABLE_AVX512_EMBREE=ON
+
+      - name: Build Embree
+        if: steps.asset_check.outputs.asset_exists != 'true' || inputs.force
+        shell: pwsh
+        run: cmake --build build/embree-prebuild --parallel
+
+      - name: Stage install tree
+        if: steps.asset_check.outputs.asset_exists != 'true' || inputs.force
+        shell: pwsh
+        run: |
+          cmake --install build/embree-prebuild --prefix dist/embree
+          Get-ChildItem -Recurse dist/embree | Select-Object FullName, Length | Format-Table
+
+      - name: Package
+        if: steps.asset_check.outputs.asset_exists != 'true' || inputs.force
+        shell: pwsh
+        run: |
+          $asset = "embree-${{ needs.resolve-version.outputs.version }}-windows-x64.zip"
+          Compress-Archive -Path dist/embree -DestinationPath "dist/$asset" -Force
+          Get-Item "dist/$asset" | Select-Object Name, Length
+          "ASSET=dist/$asset" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload to release
+        if: steps.asset_check.outputs.asset_exists != 'true' || inputs.force
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:    ${{ needs.resolve-version.outputs.tag }}
+          name:        "Vendored Embree ${{ needs.resolve-version.outputs.version }}"
+          prerelease:  true
+          files:       ${{ env.ASSET }}
+          fail_on_unmatched_files: true
