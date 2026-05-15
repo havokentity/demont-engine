@@ -3472,8 +3472,17 @@ void Engine::Tick(double dt) {
             // Wrap into [0, 24).
             hour = std::fmod(hour, 24.0f);
             if (hour < 0.0f) hour += 24.0f;
+            // SetCVarOverride below triggers r_sky_hour's on_change handler
+            // (registered in RegisterCommands) which unconditionally sets
+            // accum_dirty_ = true. That's correct for the legacy running-
+            // mean path but defeats EMA's whole purpose -- EMA wants the
+            // accumulator to smoothly track the slowly-advancing sun via
+            // exponential decay, not hard-reset every tick. Snapshot
+            // accum_dirty_ before the override and restore if EMA is the
+            // active mode.
+            bool dirty_before = accum_dirty_;
             C.SetCVarOverride("r_sky_hour", std::to_string(hour));
-            if (ema_alpha_sky <= 0.0f) accum_dirty_ = true;
+            if (ema_alpha_sky > 0.0f) accum_dirty_ = dirty_before;
         }
 
         // Cloud wind drift uses `frame_index_ * (1/60)` as time-seconds
@@ -4878,6 +4887,14 @@ void Engine::RegisterCommands() {
     // must invalidate accum_hdr so we don't blend pre- and post-toggle
     // samples together (same precedent as r_env_intensity above).
     if (auto* v = C.FindCVar("r_mis")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    // r_accum_ema_alpha switches the accumulator update rule (online
+    // running mean vs EMA blend); reusing history captured under the
+    // previous algorithm would mix incompatible weights (a count-based
+    // average alongside an exponential-decay average). Start a fresh
+    // accumulation epoch on every toggle.
+    if (auto* v = C.FindCVar("r_accum_ema_alpha")) {
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
     // r_accum_ema_alpha switches the accumulator between running-mean
