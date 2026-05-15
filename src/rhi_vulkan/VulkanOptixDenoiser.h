@@ -348,6 +348,27 @@ private:
     bool          pending_post_main_       = false;
     int           pending_pcb_slot_        = 0;
     std::uint64_t pending_wait_value_      = 0;
+    // True if Encode claimed a pending swapchain-readback request and
+    // recorded the copy into the private cb (between EncodeDenoiseFinalize
+    // and the swap GENERAL->PRESENT_SRC barrier). SubmitPostMain reads
+    // this AFTER the private cb's queue-submit returns and publishes
+    // swap_capture_consumed_ accordingly; without that publish the
+    // engine's ReadbackSwapchain poll would never observe the consume
+    // signal and would time out (~5s) waiting on a copy that's already
+    // queued + completes within microseconds.
+    //
+    // Why this matters: VulkanDevice::Submit() also has a path that
+    // claims and records the capture against the engine cb. On the
+    // OptiX path that capture would land BEFORE the OptiX private-cb
+    // finalize composites bloom + tonemap into the swap image -- so
+    // the resulting screenshot would be bloom-less and probably
+    // garbage layout-wise (the engine cb's swap is just UNDEFINED->
+    // GENERAL with no shader writes on the OptiX path). The atomic
+    // exchange inside TryRecordSwapchainCapture lets whichever cb
+    // records first claim the request; the OptiX path's claim runs
+    // during engine-cb recording (before Submit), so it wins on the
+    // OptiX path.
+    bool          pending_swap_capture_in_pcb_ = false;
 };
 
 }  // namespace pt::rhi::vk

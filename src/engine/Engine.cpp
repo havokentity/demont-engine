@@ -3194,21 +3194,27 @@ void Engine::RenderFrame() {
             dispatch_bloom_pyramid(denoise_color_tex_id_);
             dd.bloom_in        = pt::rhi::TextureHandle{bloom_mip_tex_id_[0]};
             dd.bloom_intensity = bloom_intensity;
-            // First-activation log (state transition: bloom is now
-            // engaged on the OptiX path). Mirrors PR #18's
-            // bloom-without-denoiser engagement log so the path is
-            // greppable in user logs. Static gate fires once per
-            // engine lifetime; r_bloom toggling off then back on
-            // doesn't re-log, which matches the existing pattern.
-            static bool s_logged_optix_bloom = false;
-            if (!s_logged_optix_bloom) {
-                LOG_INFO("engine: bloom-with-OptiX engaged -- pyramid "
-                         "built from PathTrace denoise_color "
-                         "({}x{}), mip[0] composited in OptiX "
-                         "private-cb finalize",
-                         fc.width, fc.height);
-                s_logged_optix_bloom = true;
-            }
+        }
+        // Edge-detect log for the Vulkan + OptiX bloom path. Mirrors
+        // the SVGF edge-detect above: fire once when the path engages
+        // and once when it disengages. Both transitions matter for
+        // diagnostics -- engagement tells the user bloom is now being
+        // composited inside the OptiX private-cb finalize (so e.g.
+        // `screenshot foo swap` will pick it up); disengagement
+        // distinguishes "bloom turned off" from "bloom path silently
+        // broke" if the next screenshot comes back flat. Replaces the
+        // earlier function-static one-shot which only logged engagement
+        // once per process lifetime, leaving subsequent r_bloom toggles
+        // invisible in the log stream.
+        if (use_vulkan_optix_bloom && !vulkan_optix_bloom_engaged_) {
+            LOG_INFO("engine: bloom-with-OptiX engaged -- pyramid built from "
+                     "PathTrace denoise_color ({}x{}), mip[0] composited in "
+                     "OptiX private-cb finalize",
+                     fc.width, fc.height);
+            vulkan_optix_bloom_engaged_ = true;
+        } else if (!use_vulkan_optix_bloom && vulkan_optix_bloom_engaged_) {
+            LOG_INFO("engine: bloom-with-OptiX disengaged");
+            vulkan_optix_bloom_engaged_ = false;
         }
 
         // Vulkan + SVGF/NRD bloom: build the pyramid from denoise_color
@@ -3510,6 +3516,17 @@ void Engine::RenderFrame() {
         // PR #22.)
         LOG_INFO("engine: vulkan pre-denoise bloom disengaged");
         vulkan_pre_denoise_bloom_engaged_ = false;
+    }
+    // Same stuck-latch fallback for the OptiX bloom path. Fires when
+    // the outer `if (denoiser_active_ || bloom_without_denoiser)` is
+    // false (so the inner edge-detect didn't run) but the OptiX-bloom
+    // latch is still hot -- e.g. user toggled `r_denoiser none` while
+    // r_bloom was on, or the device tore down. Clears the latch with a
+    // disengage log so the next OptiX-bloom engagement still fires.
+    if (vulkan_optix_bloom_engaged_ &&
+        !(denoiser_active_ || bloom_without_denoiser)) {
+        LOG_INFO("engine: bloom-with-OptiX disengaged");
+        vulkan_optix_bloom_engaged_ = false;
     }
 
     // RHI-mode perf overlay: final compute pass that composites a panel

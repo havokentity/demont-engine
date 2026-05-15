@@ -1189,7 +1189,41 @@ void VulkanOptixDenoiser::Encode(VkCommandBuffer cb,
                          static_cast<void*>(exp_buf));
             }
 
+            // screenshot ... swap capture point.
+            //
+            // After EncodeDenoiseFinalize: the swap image holds the
+            // bloom+tonemap composite the user actually sees on screen.
+            // Try to claim a pending ReadbackSwapchain request and
+            // record the copy into the private cb here so the capture
+            // matches what's PRESENT'd.
+            //
+            // Without this, VulkanDevice::Submit's analogous claim
+            // would record the copy in the ENGINE cb (which executes
+            // BEFORE this private cb on the OptiX path), capturing the
+            // pre-finalize swap image -- bloom-less and effectively
+            // garbage since the engine cb doesn't write the swap when
+            // OptiX is active. The atomic exchange in
+            // TryRecordSwapchainCapture makes the OptiX-side claim win
+            // (it runs during engine-cb recording, before Submit).
+            //
+            // SubmitPostMain publishes swap_capture_consumed_ after
+            // this private cb is queue-submitted.
+            pending_swap_capture_in_pcb_ =
+                device_->TryRecordSwapchainCapture(pcb, swap_img,
+                                                   { cached_w_, cached_h_ });
+
             // Swapchain back to PRESENT_SRC for vkQueuePresentKHR.
+            //
+            // srcStage includes TRANSFER_BIT so the layout transition
+            // is ordered after BOTH the finalize's compute writes AND
+            // any in-flight TRANSFER_READ from
+            // TryRecordSwapchainCapture's vkCmdCopyImageToBuffer above.
+            // With only COMPUTE_SHADER_BIT, the transition could race
+            // the screenshot copy on a strict implementation -- the
+            // present's read of the image still needs to happen-after
+            // the copy completes. Unconditional widening is harmless
+            // when no capture was recorded: no TRANSFER-stage work
+            // means no extra synchronisation.
             VkImageMemoryBarrier swapToPres{};
             swapToPres.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             swapToPres.oldLayout     = VK_IMAGE_LAYOUT_GENERAL;
@@ -1201,7 +1235,7 @@ void VulkanOptixDenoiser::Encode(VkCommandBuffer cb,
             swapToPres.image         = swap_img;
             swapToPres.subresourceRange = swapToGeneral.subresourceRange;
             vkCmdPipelineBarrier(pcb,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                 0, 0, nullptr, 0, nullptr, 1, &swapToPres);
         }
@@ -1225,6 +1259,19 @@ void VulkanOptixDenoiser::DrainCuda() {
 void VulkanOptixDenoiser::SubmitPostMain() {
     if (!pending_post_main_) return;
     pending_post_main_ = false;
+    // Consume-and-reset the swap-capture claim into a local. Mirrors
+    // pending_post_main_'s read-once discipline so any failure path
+    // below (vkQueueWaitIdle, optixDenoiserComputeIntensity,
+    // optixDenoiserInvoke, cudaStreamSynchronize, vkQueueSubmit) leaves
+    // the member cleared instead of leaking the claim into a future
+    // frame -- where it would falsely trigger a PublishSwapchainCaptureConsumed
+    // for a capture whose copy never made it to the GPU. Engine::Tick's
+    // ReadbackSwapchain poll re-arms swap_capture_requested_ each tick
+    // until either a real capture publishes consumed or the ~5s timeout
+    // surfaces the failure, so dropping the claim here is the correct
+    // fallback rather than retrying mid-frame.
+    const bool wants_swap_capture_publish = pending_swap_capture_in_pcb_;
+    pending_swap_capture_in_pcb_ = false;
 
     // V1 sync model: wait for engine cb (and prior private cbs) to
     // finish so buf_color_in_ has the path-tracer's output, run the
@@ -1475,8 +1522,29 @@ void VulkanOptixDenoiser::SubmitPostMain() {
     si.pCommandBuffers      = &pcb;
     si.signalSemaphoreCount = 0;
     si.waitSemaphoreCount   = 0;
-    if (vkQueueSubmit(device_->RawGraphicsQueue(), 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) {
-        LOG_WARN("VulkanOptixDenoiser::SubmitPostMain: vkQueueSubmit(private) failed");
+    const VkResult submit_r = vkQueueSubmit(device_->RawGraphicsQueue(),
+                                            1, &si, VK_NULL_HANDLE);
+    if (submit_r != VK_SUCCESS) {
+        LOG_WARN("VulkanOptixDenoiser::SubmitPostMain: vkQueueSubmit(private) failed "
+                 "(VkResult={})", static_cast<int>(submit_r));
+        // Don't publish swap_capture_consumed_ on failure: the staging
+        // buffer's host-readable contents weren't actually written. The
+        // claim was already cleared at SubmitPostMain entry, so the
+        // stuck swap_capture_requested_ flag (re-armed by Engine::Tick's
+        // poll each frame) will either be claimed by a future successful
+        // capture or surface as a ~5s timeout in the poll loop.
+        return;
+    }
+
+    // ReadbackSwapchain consume publish: Encode claimed a pending
+    // request and recorded the copy into the private cb above. Now that
+    // the queue submit has returned, a concurrent ReadbackSwapchain
+    // poller that observes the consume flag and calls vkDeviceWaitIdle
+    // will actually wait for the copy to complete. Mirrors the engine
+    // cb's publish path in VulkanDevice::Submit (which fires on the
+    // SVGF path).
+    if (wants_swap_capture_publish) {
+        device_->PublishSwapchainCaptureConsumed();
     }
 }
 
