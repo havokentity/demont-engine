@@ -60,7 +60,16 @@ endif()
 # prebuilts; the suffix keeps the two trees from trampling each other
 # when a dev builds win-clang-release + win-clang-debug on the same
 # machine.  Mac + Linux only ever see Release so suffix stays empty.
-if(WIN32 AND _embree_buildtype STREQUAL "Debug")
+#
+# Case-insensitive compare: pt_embree_artefact_name() normalises its
+# config arg via TOLOWER + MATCHES "debug" -- if we only checked
+# STREQUAL "Debug" here, a user running `cmake -DCMAKE_BUILD_TYPE=debug`
+# (lowercase) would get the windows-x64-DEBUG artefact downloaded
+# into the windows-x64-RELEASE cache dir, then on the NEXT configure
+# pass the cache-hit path would re-use that as if it were Release.
+# Match the function's case-insensitive logic to keep them aligned.
+string(TOLOWER "${_embree_buildtype}" _embree_buildtype_lower)
+if(WIN32 AND _embree_buildtype_lower MATCHES "debug")
     set(_embree_cache_suffix "-debug")
 else()
     set(_embree_cache_suffix "")

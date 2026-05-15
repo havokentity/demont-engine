@@ -15,7 +15,8 @@
 #   embree-<v>-linux-x64.tar.gz         (clang Release, AVX2 [+AVX-512])
 #   embree-<v>-linux-arm64.tar.gz       (clang Release, NEON; Pi/Graviton/Ampere)
 #
-# All artefacts EXCEPT the second one are Release-config.  Windows has
+# All artefacts EXCEPT the third one (windows-x64-debug.zip) are
+# Release-config.  Windows has
 # both because MSVC's STL stamps `_ITERATOR_DEBUG_LEVEL` (0/2) and
 # `RuntimeLibrary` (MD/MDd) as .lib-level markers, and the linker
 # refuses to merge .obj files whose markers don't match.  Embree's
