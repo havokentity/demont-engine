@@ -43,7 +43,7 @@
 // to own the noisy color/depth/motion/normal G-buffers (PathTrace
 // bindings 6/7/8/16) plus final `output` (post_denoise_hdr).
 //
-// Pipeline layout: dedicated, NOT the engine's unified 17-binding
+// Pipeline layout: dedicated, NOT the engine's unified 19-binding
 // layout. 12 bindings -- 8 storage images at 0..7 + 4 storage buffers
 // at 8..11 (moments_in/out, variance_in/out) -- plus a 32-byte push
 // constant range. Each Encode dispatch picks a fresh descriptor set

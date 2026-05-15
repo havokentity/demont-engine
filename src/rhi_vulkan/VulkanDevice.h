@@ -100,6 +100,7 @@ public:
     bool ReadbackSwapchain(void* dst, std::size_t dst_size,
                            std::uint32_t* out_w, std::uint32_t* out_h,
                            SwapFormat* out_format) override;
+    bool SupportsSwapchainReadback() const override { return swap_supports_readback_; }
 
     FrameContext   BeginFrame() override;
     void           EndFrame(CommandBuffer*) override;
@@ -249,6 +250,12 @@ private:
     VkExtent2D                  swap_extent_   { 0, 0 };
     std::vector<VkImage>        swap_images_;
     std::vector<VkImageView>    swap_views_;
+    // True iff the platform's surface advertised TRANSFER_SRC_BIT and
+    // RecreateSwapchain successfully included it in the swap's
+    // imageUsage. Read by SupportsSwapchainReadback() / the
+    // ReadbackSwapchain implementation so the screenshot-swap path
+    // refuses to engage on platforms that strip TRANSFER_SRC.
+    bool                        swap_supports_readback_ = false;
 
     // ReadbackSwapchain handshake: two atomics + a persistent host-
     // coherent staging buffer (declared further down, alongside the
@@ -263,6 +270,11 @@ private:
     //                            this so the GPU work also completes.
     std::atomic<bool>           swap_capture_requested_ { false };
     std::atomic<bool>           swap_capture_consumed_  { false };
+    // Latched at the recording site that emits vkCmdCopyImageToBuffer.
+    // ReadbackSwapchain reads from this (NOT current swap_extent_)
+    // when computing the memcpy size, so a swap-resize between
+    // record and read can't desync the staging-vs-caller byte count.
+    VkExtent2D                  swap_capture_extent_ { 0, 0 };
 
     // Per-frame in flight: 2-deep
     static constexpr int kFramesInFlight = 2;
@@ -356,7 +368,7 @@ private:
 #endif
 
     VkDescriptorPool dpool_ = VK_NULL_HANDLE;
-    // Ring of descriptor sets for the shared 17-binding layout. Why a
+    // Ring of descriptor sets for the shared 19-binding layout. Why a
     // ring and not one set per frame: the shared layout uses
     // UPDATE_AFTER_BIND on every binding so the engine can rewrite
     // bindings between dispatches in the same cmd buffer. Per the

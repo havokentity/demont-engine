@@ -1922,17 +1922,20 @@ void Engine::RenderFrame() {
     // Bloom-without-denoiser path: when the user has r_bloom on but
     // no denoiser, the engine still needs `denoise_color` (as the
     // path tracer's linear-HDR output the bloom pyramid samples) and
-    // the bloom mip chain so the engine-side Tonemap.slang pass can
-    // composite a bloom layer. depth/motion/post_denoise_hdr/normal/
+    // the bloom mip chain so the post-process composite pass can
+    // build a bloom layer. depth/motion/post_denoise_hdr/normal/
     // albedo stay unallocated -- those are denoiser-only. Backend-
-    // agnostic: works on Metal (auto-barriers between dispatches)
-    // and on Vulkan (this is the only post-process chain Vulkan
-    // runs without a denoiser -- the descriptor / Tonemap-visibility
-    // bugs documented above the post-process block are SVGF-specific
-    // and don't apply when PathTrace writes denoise_color directly
-    // and Tonemap.slang reads it without an SVGF dispatch between
-    // them). When this is off, the path tracer's inline tonemap to
-    // the swapchain is the whole post-process -- no bloom is added.
+    // agnostic flag, but each backend hits a different composite
+    // kernel below:
+    //   - Metal: engine's Tonemap.slang dispatch reads denoise_color
+    //     + bloom_mip[0] directly (use_engine_tonemap branch).
+    //   - Vulkan: routes through Denoise(Kind::FinalizeOnly), which
+    //     dispatches VulkanNrdDenoiser::EncodeFinalizeOnly on its
+    //     dedicated 4-binding layout. Tonemap.slang remains broken
+    //     on Vulkan (black swapchain) so the engine deliberately
+    //     skips it on this backend even for the no-denoiser case.
+    // When this flag is off, the path tracer's inline tonemap to the
+    // swapchain is the whole post-process -- no bloom is added.
     bool r_bloom_on_local = false;
     if (auto* v = C.FindCVar("r_bloom")) r_bloom_on_local = v->GetBool();
     bool bloom_without_denoiser =
@@ -3074,12 +3077,12 @@ void Engine::RenderFrame() {
         // ~quarter of the swapchain when r_bloom = 1, with the rest
         // of the swap showing a darkened version of an earlier pass
         // -- looks like a descriptor / barrier issue between the
-        // shared 18-binding pipeline-layout's storage-image bindings
+        // shared 19-binding pipeline-layout's storage-image bindings
         // 0/1 (which bloom_down re-binds to mip views) and the
         // dispatches that bracket it (PathTrace's HDR-aux write
         // before, DenoiseFinalize at the tail). The bug reproduces
         // on eaaf7b4 too -- pre-existing, not caused by this branch.
-        // Until a validation-layer + RenderDoc capture pin it down,
+        // Until a validation-layer + RenderDoc capture pins it down,
         // force this pyramid off so DenoiseFinalize gets bloom_in = 0
         // and the swap is rendered cleanly. r_bloom remains a no-op
         // on Vulkan when a denoiser is ACTIVE.
@@ -4250,7 +4253,7 @@ void Engine::RegisterCommands() {
         });
 
     if (auto* cmd = C.RegisterCommand("screenshot",
-        "screenshot <path.ppm> [accum|denoise_color|bloom_mip0|swap|depth|motion]: dump the target render texture to a PPM file (P6 binary, ACES-tonemapped for HDR inputs; swap target is the actual presented BGRA8 pixels, sRGB-decoded by the OS).",
+        "screenshot <path.ppm> [accum|denoise_color|bloom_mip0|swap|depth|motion]: dump the target render texture to a PPM file (P6 binary, ACES-tonemapped for HDR inputs; the swap target dumps the actual presented 8-bit BGRA bytes after the engine's sRGB OETF, no host-side tonemap).",
         [this](auto args, pt::console::Output& out) {
             if (!device_) { out.PrintLine("screenshot: no device"); return; }
             if (args.empty()) { out.PrintLine("usage: screenshot <path.ppm> [accum|denoise_color|bloom_mip0|swap|depth|motion]"); return; }
@@ -4266,6 +4269,17 @@ void Engine::RegisterCommands() {
             // the request, and let Engine::Tick poll across frames
             // until the device returns the data.
             if (target == "swap") {
+                if (!device_->SupportsSwapchainReadback()) {
+                    // No backend implementation (Metal / software /
+                    // a Vulkan surface that didn't advertise
+                    // TRANSFER_SRC). Bail before queueing -- otherwise
+                    // the engine's Tick poll loop would spin for the
+                    // 5-second timeout window and only then surface
+                    // the failure, which makes the screenshot
+                    // command feel broken on those backends.
+                    out.PrintLine("screenshot: swap target not supported on this backend (requires Vulkan with TRANSFER_SRC on the surface)");
+                    return;
+                }
                 if (!pending_swap_screenshot_path_.empty()) {
                     out.FormatLine("screenshot: another swap capture already pending for '{}'",
                                    pending_swap_screenshot_path_);
@@ -4273,11 +4287,13 @@ void Engine::RegisterCommands() {
                 }
                 std::uint32_t sw = 0, sh = 0;
                 pt::rhi::Device::SwapFormat fmt = pt::rhi::Device::SwapFormat::Other;
-                // First call seeds the request and returns false. We
-                // store the path; Engine::Tick will call ReadbackSwapchain
-                // again on subsequent ticks until it returns true, at
-                // which point it writes the PPM.
-                std::vector<std::uint8_t> dummy(1);
+                // Latch the request (first call sets the flag + returns
+                // false; subsequent polls from Engine::Tick get the
+                // data). The throwaway dst buffer here is just large
+                // enough to satisfy the pre-flight extent check inside
+                // ReadbackSwapchain; the real memcpy happens on Tick's
+                // poll into a properly-sized buffer.
+                std::vector<std::uint8_t> dummy(std::size_t(accum_w_) * accum_h_ * 4u);
                 (void)device_->ReadbackSwapchain(dummy.data(), dummy.size(),
                                                  &sw, &sh, &fmt);
                 pending_swap_screenshot_path_ = path;

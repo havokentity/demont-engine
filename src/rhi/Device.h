@@ -93,25 +93,47 @@ public:
     // Read the most-recently-submitted swapchain image back to CPU.
     // The destination must be at least width*height*4 bytes; pixels
     // come back as a tight-packed buffer in `out_format` order.
-    // Returns true on success.
     //
-    // Implementation contract: the backend latches a "capture next
-    // submit" flag, the next Submit() inserts a copy-image-to-buffer
-    // of the swap image (in GENERAL layout, BEFORE its transition to
-    // PRESENT_SRC_KHR) into a host-coherent staging buffer, then this
-    // call blocks (WaitIdle + poll) until the staging buffer has the
-    // captured data and memcpys it out.
+    // Polling contract (NOT blocking -- the previous documentation
+    // here said "block until ready" but the only implementation
+    // (Vulkan) cannot block because the caller would deadlock
+    // Submit; see VulkanDevice::ReadbackSwapchain's comment):
     //
-    // Use case: debugging / screenshot tools that need to compare the
-    // actual presented pixels against engine-managed scratch textures
-    // (post_denoise_hdr, denoise_color, etc.) -- independent of OS-
-    // level compositing, window-position, occlusion. Synchronous, may
-    // stall the GPU; intended for one-shot user-triggered capture.
+    //   First call:    backend latches a "capture next submit"
+    //                  request. Returns false ("not ready, call again
+    //                  next tick").
+    //   Later calls:   when the render loop's Submit() has inserted
+    //                  the copy + the GPU has finished, returns true
+    //                  and memcpys staging -> dst.
+    //
+    // Callers that issue this from the same thread that drives the
+    // render loop (e.g. the engine's `screenshot ... swap` console
+    // command, which runs inside Console::Drain on the main thread)
+    // must NOT busy-wait; poll across ticks. Backends that don't
+    // implement this just return false on every call.
+    // SupportsSwapchainReadback() above lets callers fail fast
+    // instead of polling indefinitely.
+    //
+    // Use case: debugging / screenshot tools that need the actual
+    // presented pixels for comparison against engine-managed scratch
+    // textures (post_denoise_hdr, denoise_color, etc.) -- independent
+    // of OS-level compositing, window-position, occlusion.
     enum class SwapFormat : std::uint8_t {
-        Bgra8Unorm,    // raw 8-bit BGRA, linear in storage
-        Bgra8Srgb,     // 8-bit BGRA, sRGB-encoded in storage
-        Rgba8Unorm,
-        Rgba8Srgb,
+        // Note: "Unorm" here refers to the Vulkan FORMAT only, not
+        // the engine's tonemap convention. The engine's compute
+        // shaders manually apply the sRGB OETF before storing to a
+        // VK_FORMAT_B8G8R8A8_UNORM swap so the OS's framebuffer-
+        // display path doesn't re-encode -- so on a typical Vulkan
+        // PC build the BYTES come back already sRGB-encoded even
+        // though Vulkan calls the format Unorm. Consumers comparing
+        // against linear-HDR scratch textures should treat all four
+        // variants below as "already display-ready (sRGB-encoded)
+        // 8-bit bytes" and only do channel-swap (B<->R) when the
+        // variant indicates BGRA.
+        Bgra8Unorm,    // 8-bit BGRA; bytes are sRGB-encoded by the engine
+        Bgra8Srgb,     // 8-bit BGRA; format-level sRGB encode (storage view)
+        Rgba8Unorm,    // 8-bit RGBA; bytes are sRGB-encoded by the engine
+        Rgba8Srgb,     // 8-bit RGBA; format-level sRGB encode (storage view)
         Other          // backend-specific; caller treats as opaque BGRA-ish
     };
     virtual bool ReadbackSwapchain(void* /*dst*/, std::size_t /*dst_size*/,
@@ -119,6 +141,12 @@ public:
                                    SwapFormat* /*out_format*/) {
         return false;
     }
+    // True iff the backend actually implements ReadbackSwapchain.
+    // Callers (the engine's screenshot-swap path) check this before
+    // issuing a capture so they don't poll-and-timeout on backends
+    // (Metal, software, or a Vulkan driver that didn't advertise
+    // TRANSFER_SRC on the swap surface) that have no implementation.
+    virtual bool SupportsSwapchainReadback() const { return false; }
 
     // Capability + introspection.
     virtual BackendType  Type()             const = 0;
