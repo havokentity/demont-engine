@@ -91,8 +91,13 @@ bool SoftwareVulkanPresent::Present(
 
     // Wait for the previous frame's GPU work to retire so we can
     // safely overwrite staging + cmd_buf_ + signal sem_image_avail_.
+    // Note we deliberately do NOT vkResetFences here -- if any of the
+    // early-out paths below fire (acquire OUT_OF_DATE, acquire error,
+    // submit fail), an already-reset fence would never get re-signaled
+    // and the next frame's wait would deadlock. The reset moves to
+    // immediately before vkQueueSubmit, which is the only point we
+    // know we're committed to signaling the fence again.
     vkWaitForFences(device_, 1, &fence_in_flight_, VK_TRUE, UINT64_MAX);
-    vkResetFences(device_, 1, &fence_in_flight_);
 
     std::memcpy(staging_mapped_, bgra8_scratch.data(),
                 static_cast<size_t>(need_bytes));
@@ -102,8 +107,12 @@ bool SoftwareVulkanPresent::Present(
                                         sem_image_avail_, VK_NULL_HANDLE,
                                         &img_idx);
     if (ar == VK_ERROR_OUT_OF_DATE_KHR) {
+        // Spec: on OUT_OF_DATE the semaphore is NOT signaled, so
+        // there's no leftover wait to consume on the next acquire.
+        // The fence was never reset (see comment above) so the next
+        // frame's wait succeeds immediately.
         Resize(width, height);
-        return true;  // skip this frame; next call will use new swapchain
+        return true;
     }
     if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) {
         LOG_WARN("SoftwareVulkanPresent: vkAcquireNextImageKHR failed "
@@ -177,8 +186,22 @@ bool SoftwareVulkanPresent::Present(
     si.pCommandBuffers      = &cmd_buf_;
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores    = &sem_render_done_;
+    // Reset the fence here -- only at the point we're committed to
+    // signaling it via this submit. See the early-out comment above.
+    vkResetFences(device_, 1, &fence_in_flight_);
     if (vkQueueSubmit(queue_, 1, &si, fence_in_flight_) != VK_SUCCESS) {
         LOG_ERROR("SoftwareVulkanPresent: vkQueueSubmit failed");
+        // Submit failed -> fence will never be signaled. Re-signal it
+        // by submitting an empty signal-only batch so the next frame's
+        // vkWaitForFences doesn't deadlock. Tolerate failure of this
+        // recovery path (rare; if the queue is broken the device is
+        // probably lost anyway).
+        VkSubmitInfo dummy{};
+        dummy.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        if (vkQueueSubmit(queue_, 1, &dummy, fence_in_flight_) != VK_SUCCESS) {
+            LOG_ERROR("SoftwareVulkanPresent: fallback fence-resignal "
+                      "submit also failed -- next frame may deadlock");
+        }
         return false;
     }
 
@@ -191,6 +214,13 @@ bool SoftwareVulkanPresent::Present(
     pi.pImageIndices      = &img_idx;
     VkResult pr = vkQueuePresentKHR(queue_, &pi);
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
+        // Drain the queue before swapchain recreation so sem_render_done_
+        // is fully consumed by the present operation. vkDeviceWaitIdle
+        // inside Resize() also covers this, but waiting on the queue
+        // explicitly here documents the intent: a semaphore in
+        // signaled-but-not-waited state during swapchain teardown is
+        // spec-undefined per VK_KHR_swapchain.
+        vkQueueWaitIdle(queue_);
         Resize(width, height);
     } else if (pr != VK_SUCCESS) {
         LOG_WARN("SoftwareVulkanPresent: vkQueuePresentKHR failed "
@@ -423,6 +453,16 @@ bool SoftwareVulkanPresent::CreateStagingBuffer(std::uint64_t size_bytes) {
     vkBindBufferMemory(device_, staging_buf_, staging_mem_, 0);
     if (vkMapMemory(device_, staging_mem_, 0, VK_WHOLE_SIZE, 0,
                     &staging_mapped_) != VK_SUCCESS) {
+        // Mirror the cleanup pattern of the FindMemoryType failure
+        // path above -- without these, staging_buf_ + staging_mem_
+        // would leak until the next CreateStagingBuffer attempt
+        // (which would only fire if the next frame's need_bytes
+        // also exceeds the now-zero staging_size_) or until full
+        // shutdown.
+        vkFreeMemory(device_, staging_mem_, nullptr);
+        vkDestroyBuffer(device_, staging_buf_, nullptr);
+        staging_mem_ = VK_NULL_HANDLE;
+        staging_buf_ = VK_NULL_HANDLE;
         return false;
     }
     staging_size_ = mr.size;

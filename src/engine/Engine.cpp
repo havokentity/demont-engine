@@ -5150,12 +5150,15 @@ void Engine::RegisterCommands() {
             RequestBackendSwitch(t);
         };
     }
-    // r_software_blit: validate, plus a runtime warning when the user
-    // opts into 'gdi' so they know about the Microsoft DXGI flip-model
-    // lockout (vulkan->software switches from this point on will leave
-    // the window stale until app restart).
+    // r_software_blit: validate the value across all platforms (so cfg
+    // load doesn't bounce a saved value back to default on Mac/Linux),
+    // but only emit the platform-specific WARN/INFO chatter on Win32
+    // -- the cvar is documented as a no-op on Mac/Linux, so users
+    // shouldn't see "selected, takes effect, beware DXGI lockout"
+    // messages there.
     if (auto* v = C.FindCVar("r_software_blit")) {
         v->allowed_values = {"vulkan", "gdi"};
+#if defined(_WIN32)
         v->on_change = [this](const pt::console::CVar& cv) {
             if (cv.value == "gdi" &&
                 current_backend_ == BackendType::Vulkan) {
@@ -5180,6 +5183,7 @@ void Engine::RegisterCommands() {
                          "(re)initialise.");
             }
         };
+#endif
     }
     // r_theme: validate + push the new theme to every WS client so the
     // browser console flips live without a page reload.
