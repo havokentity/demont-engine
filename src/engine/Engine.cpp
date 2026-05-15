@@ -45,6 +45,23 @@
 #include <sstream>    // std::istringstream for cam_load slot parsing
 #include <thread>
 
+#if defined(_WIN32)
+// SetWindowPos / RedrawWindow / HWND for the post-Vulkan-teardown
+// DWM-cache-release nudge in TearDownDevice. Gated to keep the
+// usual cross-platform header surface clean.
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+// Same extern "C" hook the Vulkan / Software RHIs use to extract the
+// HWND from the engine's GLFW window opaque pointer. Forward-declared
+// here so we don't need to drag <GLFW/glfw3native.h> into Engine.cpp.
+extern "C" void* pt_window_native_win32(void* glfw_window);
+#endif
+
 namespace pt::engine {
 
 namespace {
@@ -814,6 +831,37 @@ void Engine::TearDownDevice() {
         // tears the queue down. Cheap when nothing's pending.
         device_->WaitIdle();
         device_.reset();
+#if defined(_WIN32)
+        // Win32: nudge DWM to release the cached swapchain composite
+        // for the window IMMEDIATELY after VulkanDevice teardown,
+        // before any new device init touches the HWND. Without this
+        // (and even with the equivalent nudge inside SoftwareDevice's
+        // own init), DWM keeps showing the last-presented Vulkan
+        // frame -- GDI presents land on a back buffer DWM ignores.
+        // The asymmetry was diagnostic: software->vulkan and
+        // software-fresh both work because the Vulkan presentation
+        // path takes over the compositor cleanly; only vulkan->soft
+        // fails because GDI can't reclaim a window DWM still has
+        // marked as Vulkan-owned. Doing the nudge HERE (after device
+        // is gone) gives DWM a clean window with no presentation
+        // surface attached, which is when SetWindowPos /
+        // RedrawWindow have the best chance of forcing a cache
+        // flush. Mac uses CAMetalLayer attach/detach which doesn't
+        // suffer from this; gated on _WIN32 only.
+        if (window_) {
+            HWND hwnd = static_cast<HWND>(pt_window_native_win32(window_->Handle()));
+            if (hwnd) {
+                SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                             SWP_NOACTIVATE | SWP_FRAMECHANGED);
+                RedrawWindow(hwnd, nullptr, nullptr,
+                             RDW_INVALIDATE | RDW_UPDATENOW |
+                             RDW_ERASE | RDW_FRAME);
+                LOG_INFO("engine: TearDownDevice nudged DWM to release "
+                         "compositor cache (post-Vulkan-teardown)");
+            }
+        }
+#endif
     }
     pathtrace_pipeline_id_ = 0;
 }
