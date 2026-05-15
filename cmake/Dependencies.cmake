@@ -126,6 +126,39 @@ FetchContent_Declare(nlohmann_json
     SYSTEM
 )
 
+# --- embree: CPU BVH + ray-triangle intersection for the Software RHI -----
+# Triangle-only BVH for the software backend's mesh path. We disable
+# every geometry type except triangles, ray packets (single rays are
+# fine here -- the engine fans out across pixels at the dispatcher),
+# ISPC (no need for cross-platform SIMD codegen at this scale), and
+# tutorials. Tasking system goes INTERNAL so we don't drag TBB into
+# this codebase. ARM64 / Apple Silicon support has been first-class
+# since Embree 4.x; the same source tree builds natively on
+# x86_64 Windows + NVIDIA RTX too.
+set(EMBREE_TUTORIALS                OFF CACHE BOOL   "" FORCE)
+set(EMBREE_STATIC_LIB               ON  CACHE BOOL   "" FORCE)
+set(EMBREE_ISPC_SUPPORT             OFF CACHE BOOL   "" FORCE)
+set(EMBREE_TASKING_SYSTEM           "INTERNAL" CACHE STRING "" FORCE)
+set(EMBREE_GEOMETRY_TRIANGLE        ON  CACHE BOOL   "" FORCE)
+set(EMBREE_GEOMETRY_QUAD            OFF CACHE BOOL   "" FORCE)
+set(EMBREE_GEOMETRY_CURVE           OFF CACHE BOOL   "" FORCE)
+set(EMBREE_GEOMETRY_SUBDIVISION     OFF CACHE BOOL   "" FORCE)
+set(EMBREE_GEOMETRY_USER            OFF CACHE BOOL   "" FORCE)
+set(EMBREE_GEOMETRY_INSTANCE        ON  CACHE BOOL   "" FORCE)
+set(EMBREE_GEOMETRY_INSTANCE_ARRAY  OFF CACHE BOOL   "" FORCE)
+set(EMBREE_GEOMETRY_GRID            OFF CACHE BOOL   "" FORCE)
+set(EMBREE_GEOMETRY_POINT           OFF CACHE BOOL   "" FORCE)
+set(EMBREE_RAY_PACKETS              OFF CACHE BOOL   "" FORCE)
+set(EMBREE_FILTER_FUNCTION          OFF CACHE BOOL   "" FORCE)
+set(EMBREE_BACKFACE_CULLING         OFF CACHE BOOL   "" FORCE)
+set(EMBREE_ZIP_MODE                 OFF CACHE BOOL   "" FORCE)
+FetchContent_Declare(embree
+    GIT_REPOSITORY https://github.com/RenderKit/embree.git
+    GIT_TAG        v4.4.0
+    GIT_SHALLOW    ON
+    SYSTEM
+)
+
 # --- manifold: mesh CSG (P9 headline) --------------------------------------
 # Robust manifold-mesh boolean ops (union/intersect/subtract). Builds with
 # CMake via FetchContent. We disable everything except the core C++ lib --
@@ -148,6 +181,30 @@ FetchContent_Declare(manifold
 )
 
 FetchContent_MakeAvailable(glm fmt mimalloc glfw enkits civetweb tomlplusplus nlohmann_json)
+
+# Embree's headers (common/sys/vector.h etc.) rely on pre-C++17 transitive
+# includes (<type_traits>, <exception>) that libc++ no longer pulls in
+# automatically when the consumer compiles with C++20+. Building Embree
+# itself in C++17 sidesteps the issue without forking; consumers of
+# Embree (our SoftwareDevice TU) keep building in the project's standard
+# C++23. Block scope (see Manifold pattern below) confines the override
+# so it doesn't leak to subsequent fetches.
+block()
+    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    FetchContent_MakeAvailable(embree)
+endblock()
+# Silence Embree's vendored warning-as-noise so the build log stays
+# readable; the lib has ~hundreds of warnings we can't fix without
+# forking the upstream project.
+if(TARGET embree)
+    target_compile_options(embree PRIVATE -w)
+endif()
+foreach(_t sys math simd lexers tasking)
+    if(TARGET ${_t})
+        target_compile_options(${_t} PRIVATE -w)
+    endif()
+endforeach()
 if(PT_ENABLE_VULKAN_BACKEND)
     FetchContent_MakeAvailable(vma)
 endif()
