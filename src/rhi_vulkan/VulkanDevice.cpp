@@ -2625,110 +2625,34 @@ void VulkanDevice::Submit(CommandBuffer* cb) {
     VkCommandBuffer cmd = vcb->Raw();
     if (cmd == VK_NULL_HANDLE) return;
 
-    // ReadbackSwapchain: a caller requested a one-shot capture of the
-    // swap image's contents. The swap is currently in GENERAL layout
-    // (the engine's dispatches just finished writing it) and we're
-    // about to transition it to PRESENT_SRC_KHR -- so insert a
-    // vkCmdCopyImageToBuffer NOW, before the layout transition, into
-    // a persistent host-coherent staging buffer.
+    // ReadbackSwapchain: if a caller requested a one-shot capture of
+    // the swap image's contents, claim it now and record the copy into
+    // the engine cb. Helper handles the atomic exchange + barriers +
+    // copy + staging-buffer (re)allocation; we only care about whether
+    // it claimed so we know to publish swap_capture_consumed_ after
+    // vkQueueSubmit returns.
     //
-    // We DEFER publishing swap_capture_consumed_ until AFTER the
-    // queue submit lower down (see the matching set with the comment
-    // "ReadbackSwapchain consume publish"). Two reasons:
-    //   1. Mid-recording publish is racy: a caller polling on the
-    //      flag and immediately calling vkDeviceWaitIdle could
-    //      observe the flag, find the queue idle (nothing submitted
-    //      yet), and memcpy STALE staging. Pushing the publish past
-    //      vkQueueSubmit means by the time the flag is observable
-    //      the copy is at least in the queue -- WaitIdle then
-    //      actually waits for it.
-    //   2. The capture's true extent is locked to current_swap_index_
-    //      + swap_extent_ at this recording point; latching it into
-    //      a member here lets ReadbackSwapchain compute `bytes` from
-    //      the captured-time extent instead of the current
-    //      swap_extent_, which can change under a resize between
-    //      record-time and the caller's read.
-    bool capture_recorded_this_submit = false;
-    if (swap_capture_requested_.exchange(false, std::memory_order_acq_rel)) {
-        const std::size_t need_bytes =
-            std::size_t(swap_extent_.width) * swap_extent_.height * 4u;
-        if (need_bytes > 0 && swap_capture_staging_capacity_ < need_bytes) {
-            if (swap_capture_staging_.buffer != VK_NULL_HANDLE) {
-                DestroyBufferImpl(swap_capture_staging_);
-                swap_capture_staging_ = {};
-                swap_capture_staging_capacity_ = 0;
-            }
-            if (CreateBufferImpl(need_bytes,
-                                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
-                                   | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                                 swap_capture_staging_,
-                                 /*persistent_map=*/true)) {
-                swap_capture_staging_capacity_ = need_bytes;
-            } else {
-                LOG_ERROR("ReadbackSwapchain: staging buffer alloc failed ({} bytes)",
-                          need_bytes);
-            }
-        }
-        if (swap_capture_staging_.buffer != VK_NULL_HANDLE &&
-            swap_capture_staging_capacity_ >= need_bytes) {
-            // Image memory barrier: make the engine dispatches'
-            // SHADER_WRITE_BIT to the swap visible to the upcoming
-            // TRANSFER_READ_BIT by vkCmdCopyImageToBuffer. Without
-            // this the copy can observe stale (or even partially-
-            // written) compute output -- queue order alone doesn't
-            // provide the memory dependency (per VUID-vkCmdCopyImageToBuffer-srcImage-00188 / the
-            // execution + memory rules around inter-stage hazards).
-            VkImageMemoryBarrier mb{};
-            mb.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            mb.oldLayout     = VK_IMAGE_LAYOUT_GENERAL;
-            mb.newLayout     = VK_IMAGE_LAYOUT_GENERAL;
-            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            mb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            mb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            mb.image         = swap_images_[current_swap_index_];
-            mb.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            mb.subresourceRange.layerCount = 1;
-            mb.subresourceRange.levelCount = 1;
-            vkCmdPipelineBarrier(cmd,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                0, 0, nullptr, 0, nullptr, 1, &mb);
-
-            VkBufferImageCopy region{};
-            region.bufferOffset = 0;
-            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            region.imageSubresource.layerCount = 1;
-            region.imageExtent = { swap_extent_.width, swap_extent_.height, 1 };
-            vkCmdCopyImageToBuffer(cmd, swap_images_[current_swap_index_],
-                                   VK_IMAGE_LAYOUT_GENERAL,
-                                   swap_capture_staging_.buffer, 1, &region);
-            // Make the transfer-write visible to host reads after the
-            // submission completes. ReadbackSwapchain's WaitIdle handles
-            // the GPU-side wait; this buffer barrier handshakes the
-            // memory visibility step inside the same command buffer.
-            VkBufferMemoryBarrier bb{};
-            bb.sType         = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-            bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            bb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-            bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            bb.buffer        = swap_capture_staging_.buffer;
-            bb.offset        = 0;
-            bb.size          = VK_WHOLE_SIZE;
-            vkCmdPipelineBarrier(cmd,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
-                0, 0, nullptr, 1, &bb, 0, nullptr);
-            // Latch the recording-time extent so ReadbackSwapchain can
-            // compute its memcpy size from this (NOT the current
-            // swap_extent_, which may change under a resize between
-            // record and read).
-            swap_capture_extent_.width  = swap_extent_.width;
-            swap_capture_extent_.height = swap_extent_.height;
-            capture_recorded_this_submit = true;
-        }
-    }
+    // Why publish AFTER submit (not inside the helper): a caller
+    // polling on the flag and immediately calling vkDeviceWaitIdle
+    // could observe a mid-recording publish, find the queue idle
+    // (nothing submitted yet), and memcpy STALE staging. Pushing the
+    // publish past vkQueueSubmit means by the time the flag is
+    // observable the copy is at least in the queue -- WaitIdle then
+    // actually waits for it.
+    //
+    // The OptiX path also calls TryRecordSwapchainCapture from inside
+    // its private cb (see VulkanOptixDenoiser::Encode). The atomic
+    // exchange ensures only one cb records the copy per request: on
+    // the OptiX path the OptiX private cb claims first (because its
+    // Encode runs during engine-cb recording, before Submit), and the
+    // call here sees the flag already false and skips. That's the
+    // intended behaviour -- the engine cb's pre-finalize swap image
+    // doesn't contain the OptiX bloom+tonemap composite, so capturing
+    // it here would write a bloom-less screenshot.
+    const bool capture_recorded_this_submit =
+        TryRecordSwapchainCapture(cmd,
+                                  swap_images_[current_swap_index_],
+                                  swap_extent_);
 
     VkImageMemoryBarrier toPres{};
     toPres.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -2793,7 +2717,7 @@ void VulkanDevice::Submit(CommandBuffer* cb) {
     // caller memcpy stale staging). Order matters here: store-release
     // pairs with the load-acquire in ReadbackSwapchain.
     if (capture_recorded_this_submit) {
-        swap_capture_consumed_.store(true, std::memory_order_release);
+        PublishSwapchainCaptureConsumed();
     }
 
 #if defined(PT_ENABLE_OPTIX)
@@ -2825,6 +2749,109 @@ void VulkanDevice::Submit(CommandBuffer* cb) {
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
         RecreateSwapchain();
     }
+}
+
+bool VulkanDevice::TryRecordSwapchainCapture(VkCommandBuffer cb,
+                                             VkImage         swap_image,
+                                             VkExtent2D      extent) {
+    if (cb == VK_NULL_HANDLE || swap_image == VK_NULL_HANDLE) return false;
+    if (extent.width == 0 || extent.height == 0)               return false;
+    // Atomic exchange: only one cb claims a given request. The OptiX
+    // private cb's recording (inside VulkanOptixDenoiser::Encode) races
+    // here against the engine cb's recording (in VulkanDevice::Submit)
+    // for the same request. Whichever calls this method first wins;
+    // the other sees false and skips.
+    if (!swap_capture_requested_.exchange(false, std::memory_order_acq_rel)) {
+        return false;
+    }
+
+    const std::size_t need_bytes =
+        std::size_t(extent.width) * extent.height * 4u;
+    if (need_bytes > 0 && swap_capture_staging_capacity_ < need_bytes) {
+        if (swap_capture_staging_.buffer != VK_NULL_HANDLE) {
+            DestroyBufferImpl(swap_capture_staging_);
+            swap_capture_staging_ = {};
+            swap_capture_staging_capacity_ = 0;
+        }
+        if (CreateBufferImpl(need_bytes,
+                             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                               | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                             swap_capture_staging_,
+                             /*persistent_map=*/true)) {
+            swap_capture_staging_capacity_ = need_bytes;
+        } else {
+            LOG_ERROR("ReadbackSwapchain: staging buffer alloc failed ({} bytes)",
+                      need_bytes);
+        }
+    }
+    if (swap_capture_staging_.buffer == VK_NULL_HANDLE ||
+        swap_capture_staging_capacity_ < need_bytes) {
+        // Staging wasn't usable; drop the claim. The caller's poll will
+        // see neither consumed nor requested and re-issue on the next
+        // ReadbackSwapchain call.
+        return false;
+    }
+
+    // Image memory barrier: make the prior dispatches' SHADER_WRITE_BIT
+    // on the swap image visible to TRANSFER_READ_BIT by
+    // vkCmdCopyImageToBuffer. Without this the copy can observe stale
+    // (or partially-written) compute output -- queue order alone
+    // doesn't provide the memory dependency
+    // (per VUID-vkCmdCopyImageToBuffer-srcImage-00188 / the execution +
+    // memory rules around inter-stage hazards).
+    VkImageMemoryBarrier mb{};
+    mb.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    mb.oldLayout     = VK_IMAGE_LAYOUT_GENERAL;
+    mb.newLayout     = VK_IMAGE_LAYOUT_GENERAL;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    mb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    mb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    mb.image         = swap_image;
+    mb.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    mb.subresourceRange.layerCount = 1;
+    mb.subresourceRange.levelCount = 1;
+    vkCmdPipelineBarrier(cb,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &mb);
+
+    VkBufferImageCopy region{};
+    region.bufferOffset = 0;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = { extent.width, extent.height, 1 };
+    vkCmdCopyImageToBuffer(cb, swap_image,
+                           VK_IMAGE_LAYOUT_GENERAL,
+                           swap_capture_staging_.buffer, 1, &region);
+    // Make the transfer-write visible to host reads after the submission
+    // completes. ReadbackSwapchain's WaitIdle handles the GPU-side wait;
+    // this buffer barrier handshakes the memory visibility step inside
+    // the same command buffer.
+    VkBufferMemoryBarrier bb{};
+    bb.sType         = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    bb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bb.buffer        = swap_capture_staging_.buffer;
+    bb.offset        = 0;
+    bb.size          = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cb,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+        0, 0, nullptr, 1, &bb, 0, nullptr);
+    // Latch the recording-time extent so ReadbackSwapchain can compute
+    // its memcpy size from this (NOT the current swap_extent_, which
+    // may change under a resize between record and read).
+    swap_capture_extent_.width  = extent.width;
+    swap_capture_extent_.height = extent.height;
+    return true;
+}
+
+void VulkanDevice::PublishSwapchainCaptureConsumed() {
+    // store-release pairs with the load-acquire in ReadbackSwapchain.
+    swap_capture_consumed_.store(true, std::memory_order_release);
 }
 
 #if defined(PT_ENABLE_OPTIX)

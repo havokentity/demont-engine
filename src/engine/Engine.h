@@ -313,6 +313,13 @@ private:
     // every frame. The predicate itself is recomputed in Tick(), this
     // is purely the edge-detect memory.
     bool                                        vulkan_pre_denoise_bloom_engaged_ = false;
+    // Same edge-detect for the Vulkan + OptiX bloom path. Earlier code
+    // used a function-static one-shot bool here, which logged the
+    // initial r_bloom-on transition but stayed silent on subsequent
+    // r_bloom toggles -- mismatching the SVGF path's "engaged on, log
+    // each toggle" pattern and making "did bloom actually disengage?"
+    // ungreppable in user logs. Member-based latch matches SVGF.
+    bool                                        vulkan_optix_bloom_engaged_       = false;
     // Which denoiser kind the active backend is running. metalfx is
     // Mac-only; svgf_basic/svgf_atrous/nrd route through the in-house
     // SVGF chain on EITHER backend -- VulkanNrdDenoiser on Vulkan,

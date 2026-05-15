@@ -181,6 +181,39 @@ public:
     void RequestExtraSubmitSignal(VkSemaphore sem, std::uint64_t timeline_value);
 #endif
 
+    // Try to record the pending swapchain-readback copy into `cb`,
+    // sourcing from `swap_image` at `extent`. Returns true if a pending
+    // request was claimed (caller MUST call PublishSwapchainCaptureConsumed
+    // after their queue-submit returns).
+    //
+    // Contract:
+    //   * swap_image must be in VK_IMAGE_LAYOUT_GENERAL when this method
+    //     records into `cb`.
+    //   * The prior writes to swap_image must execute on
+    //     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT with
+    //     VK_ACCESS_SHADER_WRITE_BIT; this method inserts the
+    //     compute->transfer + buffer->host barriers internally.
+    //   * Caller is responsible for the subsequent layout transition
+    //     to PRESENT_SRC (or whatever else) after this method returns.
+    //
+    // The OptiX path uses this from inside its private cb (after
+    // EncodeDenoiseFinalize composites bloom + tonemap into the swap
+    // image) so the screenshot reflects the image that gets PRESENT'd.
+    // The SVGF path uses it from Submit() against the engine cb, where
+    // the SVGF DenoiseFinalize compute pass already wrote the swap.
+    // Atomically exchanges the request flag so only one cb records.
+    bool TryRecordSwapchainCapture(VkCommandBuffer cb,
+                                   VkImage         swap_image,
+                                   VkExtent2D      extent);
+
+    // Publish the swap_capture_consumed_ flag. Call this AFTER the
+    // queue-submit that contains the recorded copy returns, so a
+    // concurrent ReadbackSwapchain poller that observes the flag and
+    // immediately calls vkDeviceWaitIdle actually waits for the copy
+    // to complete instead of finding nothing queued. Pairs with
+    // TryRecordSwapchainCapture above.
+    void PublishSwapchainCaptureConsumed();
+
     static constexpr std::uint64_t kSwapchainTextureId = 1;
 
     // ---- Push-constant / descriptor-binding constants -------------------
