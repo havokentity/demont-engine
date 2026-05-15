@@ -95,6 +95,29 @@ void FillHwndClientRectWithClearColor(HWND hwnd, float r, float g, float b) {
     }
     ReleaseDC(hwnd, hdc);
 }
+
+// Force DWM to drop any cached swapchain composite for this window
+// and accept GDI as the new presentation source. Called after a
+// VkSwapchain teardown leaves the prior backend's last-presented
+// frame stuck on screen -- DWM doesn't auto-invalidate when the
+// app-side swapchain goes away, so GDI writes alone are invisible
+// to the compositor on most NVIDIA drivers (verified RTX 5090).
+//
+// The trick: SetWindowPos with SWP_FRAMECHANGED + a no-op move
+// signals DWM that the window's frame state has materially changed,
+// which on modern Windows is the documented hammer for forcing the
+// compositor to re-evaluate cached surface state. RedrawWindow with
+// RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE | RDW_FRAME further
+// drives a synchronous WM_PAINT cycle through GLFW's WndProc so
+// the wipe FillRect actually shows up.
+void ForceDwmReleaseSwapchainCache(HWND hwnd) {
+    if (hwnd == nullptr) return;
+    SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                 SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    RedrawWindow(hwnd, nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE | RDW_FRAME);
+}
 }  // namespace
 #endif
 
@@ -255,13 +278,25 @@ SoftwareDevice::SoftwareDevice(const NativeWindowHandle& window) {
         // any prior backend's content is immediate and visible. One-
         // shot, runs on every Software backend (re)initialise, and
         // costs one HDC + FillRect.
-        FillHwndClientRectWithClearColor(static_cast<HWND>(native_window_),
+        // Order matters: nudge DWM to release any cached swapchain
+        // composite FIRST (without it, the FillRect lands on a back
+        // buffer DWM ignores in favour of the cached Vulkan frame),
+        // then FillRect to paint the wipe colour, then a final
+        // RedrawWindow inside ForceDwmReleaseSwapchainCache to drive
+        // the WM_PAINT cycle. We do the DWM release on both ends
+        // because some driver / DWM versions need the post-paint
+        // nudge to actually swap to the new GDI source.
+        HWND wipe_hwnd = static_cast<HWND>(native_window_);
+        ForceDwmReleaseSwapchainCache(wipe_hwnd);
+        FillHwndClientRectWithClearColor(wipe_hwnd,
                                          pending_clear_[0],
                                          pending_clear_[1],
                                          pending_clear_[2]);
+        ForceDwmReleaseSwapchainCache(wipe_hwnd);
         LOG_INFO("Software backend (Win32): wiped HWND client area on "
-                 "init (clears stale frame from prior backend before "
-                 "kernel produces first software frame)");
+                 "init + nudged DWM to release prior backend's "
+                 "compositor cache (clears stale frame before kernel "
+                 "produces first software frame)");
     }
 #else
     native_window_ = window.opaque;   // unsupported platform; will no-op present
