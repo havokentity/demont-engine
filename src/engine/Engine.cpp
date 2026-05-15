@@ -793,6 +793,20 @@ void Engine::TearDownDevice() {
 }
 
 void Engine::RequestBackendSwitch(BackendType to) {
+    // Guard: cfg-driven on_change can fire from inside Console::ExecuteScript
+    // during demont.cfg load (line ~468 of Init), which runs BEFORE
+    // window_ is created at line ~490.  A premature switch here would
+    // create a device with no native-window handle (no CAMetalLayer
+    // attached on Mac, no HWND on Windows), the present blit would
+    // silently no-op every frame, and the explicit RequestBackendSwitch
+    // at the tail of Init() would then short-circuit via the
+    // `to == current_backend_ && device_` check below -- leaving the
+    // unrenderable device in place.  Symptom: `r_backend software` in
+    // demont.cfg renders nothing on launch, but toggling to a different
+    // backend and back fixes it (because by then window_ exists).
+    // Returning here defers the real setup to the explicit Init() call.
+    if (!window_) return;
+
     if (to == current_backend_ && (to == BackendType::None || device_)) return;
     LOG_INFO("backend switch: {} -> {}",
              pt::rhi::BackendName(current_backend_),
