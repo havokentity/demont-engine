@@ -60,6 +60,14 @@ static_assert(sizeof(PtPushHead) == 112, "PtPushHead must mirror engine's first 
 // smaller struct than expected (e.g. the Vulkan-SPIRV head-only push).
 constexpr std::size_t kSunAndModeOffset = 240;
 
+// Accumulator parameters offset inside the engine's full PtPush. The
+// `accum_params` field sits at byte 720 (after the 4-uint header tail
+// at 704: hdri_lights_count / write_normal_gbuffer / write_hdr_aux /
+// mis_enabled).  .x is the r_accum_ema_alpha EMA-history-retention
+// factor; .y/.z/.w reserved.  See PathTrace.slang's Push.accum_params
+// + Engine.cpp's PtPush.accum_params for the canonical doc.
+constexpr std::size_t kAccumParamsOffset = 720;
+
 // Analytic prim layout (matches PathTrace.slang's `primitives` SSBO):
 //   v0.xyz = sphere center or plane normal; v0.w = sphere radius or plane d
 //   v1.rgb = albedo; v1.a = roughness
@@ -288,6 +296,22 @@ void RunPathTraceKernel(SoftwareDevice& device,
             if (!std::isfinite(exposure) || exposure <= 0.0f) exposure = 1.0f;
         }
     }
+
+    // EMA history-retention factor (r_accum_ema_alpha).  0 = legacy
+    // online running mean; >0 = EMA blend with effective window
+    // ~1/(1-alpha).  Read defensively -- engine may push less than the
+    // full struct on the Vulkan-SPIRV split-push path, in which case
+    // we fall back to the running-mean default which is correct.
+    float ema_alpha = 0.0f;
+    if (cmd.push_constants_size >= kAccumParamsOffset + 16) {
+        const float* ap = reinterpret_cast<const float*>(
+            cmd.push_constants_buf + kAccumParamsOffset);
+        ema_alpha = glm::clamp(ap[0], 0.0f, 0.999f);
+    }
+    const std::uint32_t reset_accum = push->reset_accum;
+    const bool accum_active = (accum != nullptr
+                               && accum->width  == w
+                               && accum->height == h);
     // One-shot diagnostic so the user can see whether the engine
     // bound a TLAS at all. Cheap because it only fires on the first
     // dispatch and reads atomics; subsequent frames skip the log.
@@ -369,23 +393,73 @@ void RunPathTraceKernel(SoftwareDevice& device,
                     }
                     col = ambient + lit;
                 }
-                glm::vec3 tonemapped = SrgbOetf(AcesNarkowicz(col * exposure));
+                // Sanitize the new sample: NaN / Inf / negative
+                // channels become 0.  Without this a single bad sample
+                // (env.pdf underflow, sqrt of slightly-negative
+                // numerical residue, etc.) injects NaN into accum and
+                // poisons that pixel forever -- the running-mean update
+                // `avg = (prev*n + new) / n_new` propagates NaN through
+                // prev across every subsequent frame.  Matches
+                // PathTrace.slang's sanitize-before-accum block.
+                glm::vec3 frame_rad = col;
+                if (!std::isfinite(frame_rad.r) || frame_rad.r < 0.0f) frame_rad.r = 0.0f;
+                if (!std::isfinite(frame_rad.g) || frame_rad.g < 0.0f) frame_rad.g = 0.0f;
+                if (!std::isfinite(frame_rad.b) || frame_rad.b < 0.0f) frame_rad.b = 0.0f;
+
+                // Accumulator update.  When the engine bound an accum
+                // texture (steady state on every frame), do a proper
+                // running-mean / EMA update matching the GPU shader's
+                // logic in PathTrace.slang.  When no accum is bound
+                // (very first frame before EnsureAccumTexture, or a
+                // legacy code path), skip the accum and tonemap the
+                // per-frame radiance directly -- same as session 1+2
+                // behaviour.
+                glm::vec3 avg = frame_rad;
+                if (accum_active) {
+                    float* arow = &accum->data[std::size_t(y) * w * 4];
+                    // Read prev (or zero out for fresh epoch).
+                    glm::vec4 prev{0.0f};
+                    if (reset_accum == 0u) {
+                        prev = glm::vec4(arow[x * 4 + 0], arow[x * 4 + 1],
+                                          arow[x * 4 + 2], arow[x * 4 + 3]);
+                        // Sanitize prev (handle legacy-NaN imports).
+                        if (!std::isfinite(prev.x) || !std::isfinite(prev.y) ||
+                            !std::isfinite(prev.z) || !std::isfinite(prev.w)) {
+                            prev = glm::vec4{0.0f};
+                        }
+                    }
+                    float n_new;
+                    if (prev.w < 0.5f || ema_alpha <= 0.0f) {
+                        // First-sample-of-epoch OR legacy running mean
+                        // (ema_alpha == 0).  prev.a == 0 seeds cleanly;
+                        // ema_alpha == 0 keeps unbounded online avg.
+                        n_new = prev.w + 1.0f;
+                        avg = (glm::vec3(prev) * prev.w + frame_rad) / n_new;
+                    } else {
+                        // EMA blend with retention factor ema_alpha.
+                        // Count is informational only (capped to avoid
+                        // float-precision drift over long runs).
+                        avg = glm::vec3(prev) * ema_alpha
+                            + frame_rad   * (1.0f - ema_alpha);
+                        n_new = std::min(prev.w + 1.0f,
+                                          1.0f / std::max(1.0f - ema_alpha, 1e-3f));
+                    }
+                    arow[x * 4 + 0] = avg.r;
+                    arow[x * 4 + 1] = avg.g;
+                    arow[x * 4 + 2] = avg.b;
+                    arow[x * 4 + 3] = n_new;
+                }
+
+                // Tonemap from the accumulated mean, not the raw
+                // per-frame radiance.  Static-camera convergence
+                // matches the GPU backends: noise falls as 1/sqrt(N)
+                // for running-mean mode, floor at the EMA variance
+                // floor for EMA mode.
+                glm::vec3 tonemapped = SrgbOetf(AcesNarkowicz(avg * exposure));
                 row[x * 4 + 0] = tonemapped.r;
                 row[x * 4 + 1] = tonemapped.g;
                 row[x * 4 + 2] = tonemapped.b;
                 row[x * 4 + 3] = 1.0f;
-                // Mirror the HDR pre-tonemap value into accum (if the
-                // engine bound an accum texture at slot 1). Lets the
-                // `screenshot accum` command read back the linear-HDR
-                // pixels and apply its own tonemap chain -- same
-                // contract as the Metal/Vulkan backends.
-                if (accum != nullptr && accum->width == w && accum->height == h) {
-                    float* arow = &accum->data[std::size_t(y) * w * 4];
-                    arow[x * 4 + 0] = col.r;
-                    arow[x * 4 + 1] = col.g;
-                    arow[x * 4 + 2] = col.b;
-                    arow[x * 4 + 3] = 1.0f;
-                }
             }
         }
     };
