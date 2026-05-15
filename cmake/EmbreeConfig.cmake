@@ -94,11 +94,18 @@ function(pt_embree_artefact_name out_var config)
     if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^arm")
         set(_plat "macos-arm64")
         set(_ext "tar.gz")
-    elseif(WIN32)
+    elseif(WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^AMD64$|^amd64$|^x86_64$|^x64$")
         # Windows prebuilt is the clang-cl build (matches release.yml's
         # win-clang-release preset).  MSVC consumers can't use AVX-512
         # anyway (Embree refuses cl.exe + AVX-512); they'd fall through
         # to source compile and skip AVX-512 there too.
+        #
+        # Strict x64 processor match: Windows ARM64 (Surface Pro X,
+        # Snapdragon-based Copilot+ PCs, etc.) would otherwise
+        # silently route to the x64 .lib and fail at link with arch-
+        # mismatch errors.  Those hosts now fall through to source
+        # compile (no Windows-ARM64 prebuilt today; could be added if
+        # demand surfaces).
         set(_plat "windows-x64")
         set(_ext "zip")
         if(_cfg STREQUAL "debug")
