@@ -3499,6 +3499,17 @@ void Engine::RenderFrame() {
         cb->PushConstants(&tp, sizeof(tp));
         cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
         }  // end: if (use_engine_tonemap)
+    } else if (vulkan_pre_denoise_bloom_engaged_) {
+        // Both denoiser_active_ AND bloom_without_denoiser went false
+        // in the same frame (e.g. user issued `r_denoiser none;
+        // r_bloom 0`, or TearDownDevice cleared denoiser_active_
+        // while r_bloom was already off). The predicate's edge-detect
+        // inside the outer block didn't run, so the latch is stuck.
+        // Clear it here with a disengage log so the next "engaged"
+        // edge still fires once bloom comes back on. (Copilot review,
+        // PR #22.)
+        LOG_INFO("engine: vulkan pre-denoise bloom disengaged");
+        vulkan_pre_denoise_bloom_engaged_ = false;
     }
 
     // RHI-mode perf overlay: final compute pass that composites a panel
