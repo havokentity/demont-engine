@@ -112,6 +112,44 @@ Texture2D<float4> moon_map;
 [[vk::binding(17, 0)]] RWTexture2D<float4> albedo_tex;
 #endif
 
+// Analytic-primitive BVH (binary, CPU-built in renderer::AnalyticBvh,
+// uploaded as one StructuredBuffer<float4>). Root at index 0. Used by
+// traceScene's analytic-prim path when push.bvh_params.y > 0; otherwise
+// the linear-scan fallback runs over the full primitive list.
+//
+// Stored as two float4s per node (32 bytes total) so the stride is
+// identical on Metal (where Slang would otherwise pad a struct's
+// nested float3 to 16 bytes -> 64-byte stride) and on Vulkan std430.
+// The two uint fields are stored in the .w lanes and reinterpreted via
+// asuint().
+//
+//   lo.xyz = aabb_min                  lo.w (as uint) = left_first
+//   hi.xyz = aabb_max                  hi.w (as uint) = count
+//                                                       (0  -> internal,
+//                                                        >0 -> leaf with
+//                                                        this many prims
+//                                                        starting at
+//                                                        left_first)
+[[vk::binding(18, 0)]] StructuredBuffer<float4> bvh_nodes;
+
+struct BvhNode {
+    float3 aabb_min;
+    uint   left_first;
+    float3 aabb_max;
+    uint   count;
+};
+
+BvhNode loadBvhNode(uint idx) {
+    float4 lo = bvh_nodes[idx * 2u + 0u];
+    float4 hi = bvh_nodes[idx * 2u + 1u];
+    BvhNode n;
+    n.aabb_min  = lo.xyz;
+    n.left_first = asuint(lo.w);
+    n.aabb_max  = hi.xyz;
+    n.count     = asuint(hi.w);
+    return n;
+}
+
 // GPU-resident exposure scalar. Updated each frame by AutoExposure.slang
 // (when r_auto_exposure = 1) or written once by the engine via
 // WriteBuffer (when r_auto_exposure = 0, holding the manual r_exposure
@@ -271,6 +309,16 @@ cbuffer Push {
     //        of a variance floor proportional to 1/window.
     //   .y/.z/.w reserved for future accum-side knobs.
     float4 accum_params;
+    // Analytic-primitive traversal params (hybrid linear / BVH). See
+    // Engine.cpp's PtPush::bvh_params for full docs.
+    //   .x = linear_prim_count — number of always-linear-tested prims
+    //        at the front of `primitives` (planes today).
+    //   .y = bvh_node_count    — 0 disables BVH path (linear over all
+    //        remaining prims); >0 enables iterative traversal of
+    //        `bvh_nodes` for the trailing range [linear_prim_count,
+    //        prim_count).
+    //   .z/.w reserved.
+    uint4 bvh_params;
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -309,6 +357,8 @@ cbuffer Frame {
     uint   mis_enabled;
     // See `accum_params` in the Metal Push cbuffer above.
     float4 accum_params;
+    // See `bvh_params` in the Metal Push cbuffer above.
+    uint4 bvh_params;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -348,6 +398,50 @@ struct HitInfo {
     float  ior;
 };
 
+// Test a single analytic primitive at `primitives[idx*3 + 0..2]` against
+// (ro, rd) and update `h` if it's a closer hit. Centralizes the per-prim
+// dispatch so the linear-loop and BVH-leaf paths share one body.
+void testAnalyticPrim(uint idx, float3 ro, float3 rd, inout HitInfo h) {
+    float4 v0 = primitives[idx * 3u + 0u];
+    float4 v1 = primitives[idx * 3u + 1u];
+    float4 v2 = primitives[idx * 3u + 2u];
+    uint type = uint(v2.x);
+    float t;
+    if (type == PRIM_SPHERE) {
+        if (intersectSphere(ro, rd, v0.xyz, v0.w, t) && t < h.t) {
+            h.hit = true; h.t = t;
+            h.normal = normalize(ro + rd * t - v0.xyz);
+            h.mat = uint(v2.y);
+            h.albedo = v1.rgb;
+            h.roughness = v1.a;
+            h.ior = v2.z;
+        }
+    } else if (type == PRIM_PLANE) {
+        if (intersectPlane(ro, rd, v0.xyz, v0.w, t) && t < h.t) {
+            h.hit = true; h.t = t;
+            h.normal = v0.xyz;
+            h.mat = uint(v2.y);
+            h.albedo = v1.rgb;
+            h.roughness = v1.a;
+            h.ior = v2.z;
+        }
+    }
+}
+
+// Slab ray-AABB intersection. Returns true if the ray (ro, rd) hits the
+// box [mn, mx] within [0, t_max]. Used to decide whether to descend a
+// BVH node. rd_inv must be 1.0 / rd componentwise; we precompute it
+// once per ray and pass through to avoid divides per node.
+bool intersectAabb(float3 ro, float3 rd_inv, float3 mn, float3 mx, float t_max) {
+    float3 t0 = (mn - ro) * rd_inv;
+    float3 t1 = (mx - ro) * rd_inv;
+    float3 tmin3 = min(t0, t1);
+    float3 tmax3 = max(t0, t1);
+    float tmin = max(max(tmin3.x, tmin3.y), tmin3.z);
+    float tmax = min(min(tmax3.x, tmax3.y), tmax3.z);
+    return tmax >= max(tmin, 0.0) && tmin <= t_max;
+}
+
 HitInfo traceScene(float3 ro, float3 rd) {
     HitInfo h;
     h.hit = false; h.t = 1e30;
@@ -359,29 +453,49 @@ HitInfo traceScene(float3 ro, float3 rd) {
     //   v0 = (xyz: center / normal,  w: radius / d)
     //   v1 = (rgb: albedo,           a: roughness)
     //   v2 = (x: type,  y: material, z: ior, w: pad)
-    for (uint i = 0u; i < prim_count; ++i) {
-        float4 v0 = primitives[i * 3u + 0u];
-        float4 v1 = primitives[i * 3u + 1u];
-        float4 v2 = primitives[i * 3u + 2u];
-        uint type = uint(v2.x);
-        float t;
-        if (type == PRIM_SPHERE) {
-            if (intersectSphere(ro, rd, v0.xyz, v0.w, t) && t < h.t) {
-                h.hit = true; h.t = t;
-                h.normal = normalize(ro + rd * t - v0.xyz);
-                h.mat = uint(v2.y);
-                h.albedo = v1.rgb;
-                h.roughness = v1.a;
-                h.ior = v2.z;
-            }
-        } else if (type == PRIM_PLANE) {
-            if (intersectPlane(ro, rd, v0.xyz, v0.w, t) && t < h.t) {
-                h.hit = true; h.t = t;
-                h.normal = v0.xyz;
-                h.mat = uint(v2.y);
-                h.albedo = v1.rgb;
-                h.roughness = v1.a;
-                h.ior = v2.z;
+    //
+    // The host partitions the buffer at upload time so the first
+    // `linear_prim_count` entries are infinite-extent prims (planes)
+    // that must always be linear-tested -- they can't fit in a finite
+    // AABB. The remainder is either linear-scanned (when bvh_params.y
+    // == 0, i.e. count below r_analytic_bvh_threshold) or traversed
+    // via the BVH whose flat node array lives in `bvh_nodes`.
+    uint linear_prim_count = bvh_params.x;
+    uint bvh_node_count    = bvh_params.y;
+    // Linear pass over the infinite-extent segment first.
+    for (uint i = 0u; i < linear_prim_count && i < prim_count; ++i) {
+        testAnalyticPrim(i, ro, rd, h);
+    }
+    if (bvh_node_count == 0u) {
+        // BVH inactive: linear-scan the rest of the buffer too.
+        for (uint i = linear_prim_count; i < prim_count; ++i) {
+            testAnalyticPrim(i, ro, rd, h);
+        }
+    } else {
+        // Iterative BVH traversal with a small local stack. Depth is
+        // log2(node_count); 32 slots covers ~4 billion leaves with
+        // headroom. Pre-reciprocal rd to skip per-node divides.
+        float3 rd_safe = select(abs(rd) > float3(1e-30), rd, float3(1e-30));
+        float3 rd_inv = 1.0 / rd_safe;
+        uint stack[32];
+        int  sp = 0;
+        stack[sp++] = 0u;
+        while (sp > 0) {
+            uint idx = stack[--sp];
+            BvhNode node = loadBvhNode(idx);
+            if (!intersectAabb(ro, rd_inv, node.aabb_min, node.aabb_max, h.t)) continue;
+            if (node.count > 0u) {
+                // Leaf: test the contiguous prim range.
+                uint base = node.left_first + linear_prim_count;
+                for (uint k = 0u; k < node.count; ++k) {
+                    testAnalyticPrim(base + k, ro, rd, h);
+                }
+            } else {
+                // Internal: push both children. Stack-depth guard.
+                if (sp + 2 <= 32) {
+                    stack[sp++] = node.left_first;
+                    stack[sp++] = node.left_first + 1u;
+                }
             }
         }
     }

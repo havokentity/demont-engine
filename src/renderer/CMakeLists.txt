@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Rajesh D'Monte
 add_library(pt_renderer STATIC
+    AnalyticBvh.cpp
     Astronomy.cpp
     BscCatalog.cpp
     Csg/CsgScene.cpp
