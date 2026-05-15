@@ -271,6 +271,10 @@ cbuffer Push {
     float4 moon_extra;
     // Sun extras. .x = r_sun_size, .y = Earth-Sun distance ratio
     // (mean/current; perihelion ~1.017, aphelion ~0.984).
+    // .z = vertical-flatten ratio for atmospheric refraction at horizon
+    // (1.0 = render a perfect circle; <1.0 = vertically-squished oval
+    // computed via Saemundsson differential across the real solar disc;
+    // typical values: ~1.0 above 5deg elev, ~0.81 at elev=0). .w reserved.
     float4 sun_extra;
     // HDRI multi-light extraction (computed at HDRI load in
     // ReloadEnvMap). Each entry is a directional light derived from a
@@ -702,6 +706,44 @@ float3 sunDisc(float3 rd, float3 sun_dir) {
     float kCosHalo   = cos(halo_rad);
     if (ang <= kCosHalo) return float3(0.0);
 
+    // Atmospheric horizon refraction differentially lifts the lower
+    // limb more than the upper limb (Saemundsson 1986), squashing the
+    // apparent disc into a vertical oval. CPU computes the ratio in
+    // sun_extra.z; 1.0 means circular. We test ellipticity in the
+    // sun's local horizon frame so only the disc squishes -- the halo
+    // is at-observer scattering (kept circular by design; gradual
+    // falloff hides any anisotropy that does exist).
+    float vflat = sun_extra.z;
+    bool oval = vflat < 0.999;
+
+    // Disc-membership test. Circular fast path when no flatten;
+    // elliptical test in sun-local frame otherwise. The squashed oval
+    // is fully contained inside the original circular cone (vertical
+    // radius shrinks; horizontal unchanged), so `ang > kCosR` is a
+    // valid superset gate for both branches -- pixels failing it
+    // can't be inside the oval either.
+    bool inside_disc = false;
+    if (ang > kCosR) {
+        if (!oval) {
+            inside_disc = true;
+        } else {
+            // Build sun-local horizon frame. Safe at non-zenith sun
+            // (vflat < 0.999 only fires below ~6deg elev, far from
+            // zenith singularity).
+            float3 world_up    = float3(0.0, 1.0, 0.0);
+            float3 local_right = normalize(cross(world_up, sun_dir));
+            float3 local_up    = cross(sun_dir, local_right);
+            float3 delta       = rd - sun_dir * ang;            // perp to sun
+            float h_off        = dot(delta, local_right);
+            float v_off        = dot(delta, local_up);
+            float r_h          = r_deg * 0.0174533;
+            float r_v          = r_h * vflat;
+            float ellipse      = (h_off * h_off) / (r_h * r_h)
+                               + (v_off * v_off) / (r_v * r_v);
+            inside_disc = ellipse <= 1.0;
+        }
+    }
+
     // Atmospheric attenuation + warmth, matching sun_rad in NEE.
     float am  = 1.0 / max(sun_dir.y, 0.04);
     float atm = exp(-0.30 * am);
@@ -718,7 +760,7 @@ float3 sunDisc(float3 rd, float3 sun_dir) {
         halo = pow(t_h, falloff);
     }
 
-    if (ang > kCosR) {
+    if (inside_disc) {
         // Bright disc -- sun is enormously brighter than anything
         // else; ACES will clip the centre to white but the limb +
         // halo carry the warmth.
