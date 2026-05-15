@@ -1153,9 +1153,33 @@ void VulkanOptixDenoiser::Encode(VkCommandBuffer cb,
             VkImageView dst_view  = device_->LookupImageView(d.output);
             VkImageView swap_view = device_->LookupImageView(d.final_output);
             VkBuffer    exp_buf   = device_->LookupBuffer(d.exposure_state);
+            // Bloom mip 0 (engine-built in the prior engine cb). The
+            // queue-submit boundary between that cb's bloom_up writes
+            // and this private cb's finalize read is sufficient
+            // synchronisation -- SubmitPostMain vkQueueWaitIdle's
+            // before submitting pcb. d.bloom_in.id == 0 means the
+            // engine deliberately disabled the composite (bloom off,
+            // intensity 0, or a missing pipeline) -- pass a null view
+            // and EncodeDenoiseFinalize substitutes color_in as the
+            // safe-but-unread placeholder.
+            VkImageView bloom_view  = (d.bloom_in.id != 0)
+                                        ? device_->LookupImageView(d.bloom_in)
+                                        : VK_NULL_HANDLE;
+            const float bloom_intensity = (bloom_view != VK_NULL_HANDLE)
+                                            ? d.bloom_intensity : 0.0f;
+            if (d.bloom_in.id != 0 && bloom_view == VK_NULL_HANDLE) {
+                // Engine asked for bloom but the view lookup whiffed --
+                // log so a future "bloom missing on OptiX" doesn't fail
+                // silently. Skip the composite for this frame; the
+                // tonemap still runs.
+                LOG_WARN("VulkanOptixDenoiser::Encode: bloom view lookup "
+                         "miss (id={}); finalize will skip bloom add",
+                         d.bloom_in.id);
+            }
             if (dst_view != VK_NULL_HANDLE && swap_view != VK_NULL_HANDLE &&
                 exp_buf  != VK_NULL_HANDLE) {
                 device_->EncodeDenoiseFinalize(pcb, dst_view, swap_view, exp_buf,
+                                               bloom_view, bloom_intensity,
                                                cached_w_, cached_h_, d.hdr_pipeline);
             } else {
                 LOG_WARN("VulkanOptixDenoiser::Encode: finalize lookup miss "

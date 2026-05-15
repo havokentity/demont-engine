@@ -3121,6 +3121,57 @@ void Engine::RenderFrame() {
                                  : pt::rhi::TextureHandle{0};
         dd.bloom_intensity = vulkan_pre_denoise_bloom ? bloom_intensity : 0.0f;
 
+        // Vulkan + OptiX denoiser + r_bloom: build the bloom pyramid
+        // here in the engine cb from the path tracer's noisy
+        // denoise_color (Karis-suppressed first downsample shrugs off
+        // the path-tracer fireflies), and feed mip[0] to the OptiX
+        // path's deferred finalize. The pyramid then flows to
+        // VulkanOptixDenoiser::Encode via dd.bloom_in /
+        // dd.bloom_intensity, where it's wired into the private cb's
+        // EncodeDenoiseFinalize call -- which composites mip[0]
+        // pre-ACES and writes the swap on the same dedicated
+        // 4-binding layout that PR #18's bloom-without-denoiser path
+        // uses, sidestepping the SVGF-active descriptor reuse bug.
+        //
+        // Order: dispatch_bloom_pyramid runs BEFORE device_->Denoise(dd)
+        // so the pyramid's denoise_color reads happen before the OptiX
+        // input copy reads it (both are reads -- no hazard, but logical
+        // order is "pyramid then input copy"). The cross-queue-submit
+        // boundary between this engine cb and the OptiX private cb
+        // (vkQueueWaitIdle inside SubmitPostMain) covers the
+        // bloom-up-write -> finalize-read synchronisation; no
+        // additional barrier needed past dispatch_bloom_pyramid's
+        // internal compute_write -> compute_read chain.
+        const bool use_vulkan_optix_bloom =
+            (!backend_is_metal && bloom_can_run && kind_is_optix &&
+             device_->SupportsDenoise());
+        if (use_vulkan_optix_bloom) {
+            // RAW: PathTrace wrote denoise_color and bloom_down is
+            // about to read it. Same global barrier the
+            // use_vulkan_bloom_finalize branch below issues for the
+            // identical hazard.
+            cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                         pt::rhi::BarrierDesc::Stage::ComputeRead});
+            dispatch_bloom_pyramid(denoise_color_tex_id_);
+            dd.bloom_in        = pt::rhi::TextureHandle{bloom_mip_tex_id_[0]};
+            dd.bloom_intensity = bloom_intensity;
+            // First-activation log (state transition: bloom is now
+            // engaged on the OptiX path). Mirrors PR #18's
+            // bloom-without-denoiser engagement log so the path is
+            // greppable in user logs. Static gate fires once per
+            // engine lifetime; r_bloom toggling off then back on
+            // doesn't re-log, which matches the existing pattern.
+            static bool s_logged_optix_bloom = false;
+            if (!s_logged_optix_bloom) {
+                LOG_INFO("engine: bloom-with-OptiX engaged -- pyramid "
+                         "built from PathTrace denoise_color "
+                         "({}x{}), mip[0] composited in OptiX "
+                         "private-cb finalize",
+                         fc.width, fc.height);
+                s_logged_optix_bloom = true;
+            }
+        }
+
         // Skip the denoiser dispatch in the bloom-without-denoiser
         // path (Metal or Vulkan) -- no denoiser is active, so `dd`
         // above was just unused setup work. The downstream branches
