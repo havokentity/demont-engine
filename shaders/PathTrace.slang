@@ -120,7 +120,7 @@ Texture2D<float4> moon_map;
 // final tonemap, no host round-trip.
 [[vk::binding(15, 0)]] RWStructuredBuffer<float> exposure_state;
 
-// The full PtPush is 720 bytes today (112 B head + 608 B tail; see the
+// The full PtPush is 736 bytes today (112 B head + 624 B tail; see the
 // static_assert at the dispatch site in Engine.cpp). Native Vulkan / NVIDIA
 // caps push constants at 256B, so on SPIR-V we keep only the small
 // per-dispatch prefix (camera basis + flags + jitter, 112B) in
@@ -262,13 +262,22 @@ cbuffer Push {
     // scope, not a property of those materials. Reuses what was
     // `_hdri_pad1`; layout-equivalent.
     uint   mis_enabled;
+    // Accumulator parameters. See Engine.cpp's PtPush::accum_params for
+    // full docs.
+    //   .x = ema_alpha in [0, 1). 0 = legacy online running mean;
+    //        >0 = EMA blend with this history retention factor (effective
+    //        sliding window ~1/(1-alpha) frames). Lets the accumulator
+    //        track dynamic content without wet-paint smear, at the cost
+    //        of a variance floor proportional to 1/window.
+    //   .y/.z/.w reserved for future accum-side knobs.
+    float4 accum_params;
 #endif  // !PT_TARGET_SPIRV
 };
 
 #ifdef PT_TARGET_SPIRV
 // Spilled tail of PtPush — see the comments in the (Metal) Push cbuffer
 // above for per-field semantics. Layout is byte-equivalent to bytes
-// [112..448] of the host PtPush struct in Engine.cpp. Bound by
+// [112..736] of the host PtPush struct in Engine.cpp. Bound by
 // VulkanCommandBuffer::Dispatch from a per-frame ring-buffer UBO.
 [[vk::binding(14, 0)]]
 cbuffer Frame {
@@ -298,6 +307,8 @@ cbuffer Frame {
     // See `mis_enabled` in the Metal Push cbuffer above. Reuses
     // `_hdri_pad1`; layout-equivalent across both targets.
     uint   mis_enabled;
+    // See `accum_params` in the Metal Push cbuffer above.
+    float4 accum_params;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -2027,8 +2038,33 @@ void main(uint2 tid : SV_DispatchThreadID) {
             prev = float4(0, 0, 0, 0);
         }
     }
-    float n_new = prev.a + 1.0;
-    float3 avg  = (prev.rgb * prev.a + frame_radiance) / n_new;
+    // accum_params.x = EMA history retention. 0 -> legacy online running
+    // mean (unbounded convergence). >0 -> blend at this retention factor
+    // so old samples decay; lets the accumulator track wind-drifting
+    // clouds / animated lights without the wet-paint smear that pure
+    // running mean produces on non-stationary input. Trade-off: the
+    // running mean's variance falls as 1/N, EMA's floors at ~variance
+    // of the per-frame estimator divided by the effective window
+    // 1/(1-alpha). With a denoiser on, this is moot -- the denoiser's
+    // own motion-vector temporal reuse is strictly stronger and the
+    // engine still writes accum_hdr only as a fallback path for
+    // toggling the denoiser off mid-session.
+    float ema_alpha = clamp(accum_params.x, 0.0, 0.999);
+    float n_new;
+    float3 avg;
+    if (prev.a < 0.5 || ema_alpha <= 0.0) {
+        // Legacy / first-frame-of-epoch path. prev.a==0 case (after
+        // reset_accum or a NaN-driven prev sanitization) seeds the
+        // mean cleanly; ema_alpha==0 keeps unbounded online averaging.
+        n_new = prev.a + 1.0;
+        avg   = (prev.rgb * prev.a + frame_radiance) / n_new;
+    } else {
+        avg   = prev.rgb * ema_alpha + frame_radiance * (1.0 - ema_alpha);
+        // Count is informational only (tonemap stats); cap so it
+        // doesn't grow without bound and lose float precision over
+        // long runs.
+        n_new = min(prev.a + 1.0, 1.0 / max(1.0 - ema_alpha, 1e-3));
+    }
     accum_hdr[tid] = float4(avg, n_new);
 
     // Per-frame radiance feeds the denoiser. With the HDR pipeline

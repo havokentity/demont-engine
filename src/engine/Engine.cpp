@@ -187,6 +187,22 @@ namespace cvar {
             "Default points at the bundled CC0 sunset HDRI; resolves relative to CWD.",
             CVAR_ARCHIVE);
     PT_CVAR(r_env_intensity,   "1.0","Scalar multiplier on env-map samples. Useful for darkening/brightening the IBL without re-authoring the HDRI.", CVAR_ARCHIVE);
+    PT_CVAR(r_accum_ema_alpha, "0.0",
+            "Exponential moving average for the accumulator. 0 = legacy "
+            "online running mean (unbounded convergence, classic path "
+            "tracer behaviour). >0 = EMA blend with this history retention "
+            "factor in [0, 1) -- avg = prev*alpha + sample*(1-alpha). "
+            "Effective sliding window ~1/(1-alpha) frames (0.9 ~10 frames, "
+            "0.95 ~20). Lets the accumulator track dynamic content (wind-"
+            "drifting clouds, animated lights, slow time-of-day) without "
+            "the wet-paint smear that pure running mean produces on "
+            "non-stationary input, at the cost of a variance floor "
+            "proportional to 1/window. When >0 the engine also skips the "
+            "cloud-wind accum-dirty trigger so EMA can actually do its "
+            "job. Only meaningful with r_denoiser off; with a denoiser "
+            "on the denoiser does its own (smarter, motion-vector-aware) "
+            "temporal reuse and this value is ignored.",
+            CVAR_ARCHIVE);
     PT_CVAR(r_mis,             "1",
             "Multiple importance sampling for direct lighting on Lambert "
             "hits under HDRI. 1 = balance-heuristic MIS between env-map "
@@ -2148,6 +2164,22 @@ void Engine::RenderFrame() {
         // Reuses the slot that used to be `_hdri_pad[1]`; same total
         // struct size, same static_assert sum below.
         std::uint32_t mis_enabled;
+        // Accumulator parameters.
+        //   .x = r_accum_ema_alpha — exponential-moving-average history
+        //        retention factor in [0, 1). 0 = legacy online-mean
+        //        accumulator (the shader path that's been here forever:
+        //        avg = (prev*n + sample) / (n+1), unbounded convergence).
+        //        >0 = EMA blend: avg = prev*α + sample*(1-α), effective
+        //        window ~1/(1-α). Lets the accumulator track dynamic
+        //        content (wind-drifting clouds, animated lights, slow
+        //        time-of-day) without the wet-paint smear that the
+        //        running mean produces, at the cost of a variance floor
+        //        proportional to 1/window. When >0 the engine also
+        //        skips the cloud-wind accum_dirty_ trigger so EMA can
+        //        actually do its job. 0.9 is a sensible starting point.
+        //   .y/.z/.w reserved for future accum-side knobs (e.g. variance
+        //   clamp, max-sample cap, motion-vector reproject weight).
+        float accum_params[4];
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -2195,6 +2227,18 @@ void Engine::RenderFrame() {
         int mis = 1;
         if (auto* v = C.FindCVar("r_mis")) mis = v->GetInt();
         push.mis_enabled = (mis != 0) ? 1u : 0u;
+    }
+    {
+        float ema = 0.0f;
+        if (auto* v = C.FindCVar("r_accum_ema_alpha")) ema = v->GetFloat();
+        // Clamp to [0, 0.999]: 1.0 would be "never accept new samples"
+        // which freezes the image at whatever's already in accum_hdr.
+        if (ema < 0.0f) ema = 0.0f;
+        if (ema > 0.999f) ema = 0.999f;
+        push.accum_params[0] = ema;
+        push.accum_params[1] = 0.0f;
+        push.accum_params[2] = 0.0f;
+        push.accum_params[3] = 0.0f;
     }
 
     // Halton(2,3) sub-pixel jitter sequence in [-0.5, 0.5] each axis.
@@ -2551,7 +2595,7 @@ void Engine::RenderFrame() {
         push.clouds_p3[3] = rayleigh;
     }
 
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 128 + 128 + 16);
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 128 + 128 + 16 + 16);
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
 
@@ -3415,6 +3459,10 @@ void Engine::Tick(double dt) {
         auto& C = pt::console::Console::Get();
         bool animate = false;
         if (auto* v = C.FindCVar("r_sky_animate")) animate = v->GetBool();
+        // EMA tracks slowly-advancing astronomical sun smoothly; only
+        // the running-mean path needs the per-tick dirty bit.
+        float ema_alpha_sky = 0.0f;
+        if (auto* v = C.FindCVar("r_accum_ema_alpha")) ema_alpha_sky = v->GetFloat();
         if (animate) {
             float rate = 0.0f;
             if (auto* v = C.FindCVar("r_sky_animate_rate")) rate = v->GetFloat();
@@ -3424,8 +3472,17 @@ void Engine::Tick(double dt) {
             // Wrap into [0, 24).
             hour = std::fmod(hour, 24.0f);
             if (hour < 0.0f) hour += 24.0f;
+            // SetCVarOverride below triggers r_sky_hour's on_change handler
+            // (registered in RegisterCommands) which unconditionally sets
+            // accum_dirty_ = true. That's correct for the legacy running-
+            // mean path but defeats EMA's whole purpose -- EMA wants the
+            // accumulator to smoothly track the slowly-advancing sun via
+            // exponential decay, not hard-reset every tick. Snapshot
+            // accum_dirty_ before the override and restore if EMA is the
+            // active mode.
+            bool dirty_before = accum_dirty_;
             C.SetCVarOverride("r_sky_hour", std::to_string(hour));
-            accum_dirty_ = true;
+            if (ema_alpha_sky > 0.0f) accum_dirty_ = dirty_before;
         }
 
         // Cloud wind drift uses `frame_index_ * (1/60)` as time-seconds
@@ -3438,9 +3495,15 @@ void Engine::Tick(double dt) {
         // the camera-move dirty flag resets the accumulator.  Mirror
         // the sky_animate path: when clouds are on AND wind is set,
         // mark dirty every tick so accumulation resets per frame.
+        // When r_accum_ema_alpha > 0, EMA tracks the drifting cloud
+        // field smoothly via exponential decay -- no need to nuke the
+        // accumulator every frame. The legacy running-mean path still
+        // needs the dirty trigger to avoid wet-paint smear.
+        float ema_alpha_dirty = 0.0f;
+        if (auto* v = C.FindCVar("r_accum_ema_alpha")) ema_alpha_dirty = v->GetFloat();
         bool clouds_on = false;
         if (auto* v = C.FindCVar("r_clouds")) clouds_on = v->GetBool();
-        if (clouds_on) {
+        if (clouds_on && ema_alpha_dirty <= 0.0f) {
             float wx = 0.0f, wz = 0.0f;
             if (auto* v = C.FindCVar("r_clouds_wind_x")) wx = v->GetFloat();
             if (auto* v = C.FindCVar("r_clouds_wind_z")) wz = v->GetFloat();
@@ -4824,6 +4887,15 @@ void Engine::RegisterCommands() {
     // must invalidate accum_hdr so we don't blend pre- and post-toggle
     // samples together (same precedent as r_env_intensity above).
     if (auto* v = C.FindCVar("r_mis")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    // r_accum_ema_alpha switches the accumulator update rule (online
+    // running mean vs EMA blend); reusing history captured under the
+    // previous algorithm would mix incompatible weights (a count-based
+    // average alongside an exponential-decay average). Changing it
+    // mid-render against a non-zero prev.a would also instantly mix modes
+    // for a jittery frame. Start a fresh accumulation epoch on every toggle.
+    if (auto* v = C.FindCVar("r_accum_ema_alpha")) {
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
     // Sky cvars: changing any of them invalidates accumulation.
