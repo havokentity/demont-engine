@@ -16,7 +16,7 @@ on:
 
 # Build cache invalidation knob.  Bump this string to force every
 # release runner's `actions/cache` entry to miss on the next run --
-# useful if we ever suspect cached .obj files are stale relative to a
+# useful if we ever suspect cached object files are stale relative to a
 # toolchain upgrade on the runner image (clang-cl version bump, Windows
 # SDK refresh, etc.) without changing any source files.  Normal source
 # changes already invalidate the cache via the hashFiles() portion of
@@ -58,7 +58,7 @@ jobs:
 
       - name: Cache CMake build directory
         # Restores the entire build/mac-release tree (CMakeCache.txt +
-        # _deps fetched source + compiled .obj files) when the cache
+        # _deps fetched source + compiled object files) when the cache
         # key matches a prior successful build.  The hashFiles() inputs
         # cover everything that changes what gets built: top-level
         # CMakeLists, all cmake/ helpers (Dependencies.cmake especially
@@ -194,8 +194,8 @@ jobs:
           clang-cl --version
 
       - name: Cache CMake build directory
-        # Restores the entire build/win-clang-release tree (CMakeCache,
-        # _deps fetched source, compiled .obj files) when the cache key
+        # Restores the entire build/win-clang-release tree (CMakeCache.txt,
+        # _deps fetched source, compiled object files) when the cache key
         # matches.  Same hashFiles() shape + behaviour as the macOS job
         # above; the per-OS prefix in the key keeps Mac and Windows
         # caches separate.  Embree alone is ~250k LOC of templated
