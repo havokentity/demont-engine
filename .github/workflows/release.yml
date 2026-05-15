@@ -14,6 +14,16 @@ on:
         description: "Release tag (eg v0.2.0)"
         required: true
 
+# Build cache invalidation knob.  Bump this string to force every
+# release runner's `actions/cache` entry to miss on the next run --
+# useful if we ever suspect cached object files are stale relative to a
+# toolchain upgrade on the runner image (clang-cl version bump, Windows
+# SDK refresh, etc.) without changing any source files.  Normal source
+# changes already invalidate the cache via the hashFiles() portion of
+# the cache key below; this string is the manual panic button on top.
+env:
+  RELEASE_CACHE_VERSION: v1
+
 jobs:
   macos-release:
     name: macOS (Apple Silicon) -- release artefact
@@ -45,6 +55,24 @@ jobs:
         # discoverable Vulkan::Vulkan target so the Vk backend builds.
         # molten-vk supplies the runtime ICD for full release coverage.
         run: brew install ninja cmake vulkan-headers vulkan-loader molten-vk || true
+
+      - name: Cache CMake build directory
+        # Restores the entire build/mac-release tree (CMakeCache.txt +
+        # _deps fetched source + compiled object files) when the cache
+        # key matches a prior successful build.  The hashFiles() inputs
+        # cover everything that changes what gets built: top-level
+        # CMakeLists, all cmake/ helpers (Dependencies.cmake especially
+        # -- bumping a dep version busts the cache as intended), every
+        # subdirectory CMakeLists, and the workflow file itself
+        # (compiler-flag changes, dep upgrades, etc).  No restore-keys
+        # fallback: an exact-match hit or fresh build, nothing fuzzy --
+        # release builds value reproducibility over the marginal time
+        # win of a partial restore.  RELEASE_CACHE_VERSION at the top
+        # of this workflow is the manual invalidate-everything knob.
+        uses: actions/cache@v4
+        with:
+          path: build/mac-release
+          key: ${{ env.RELEASE_CACHE_VERSION }}-macos-release-${{ hashFiles('CMakeLists.txt', 'cmake/**', '**/CMakeLists.txt', '.github/workflows/release.yml') }}
 
       - name: Configure (release)
         run: cmake --preset mac-release
@@ -164,6 +192,20 @@ jobs:
             exit 1
           }
           clang-cl --version
+
+      - name: Cache CMake build directory
+        # Restores the entire build/win-clang-release tree (CMakeCache.txt,
+        # _deps fetched source, compiled object files) when the cache key
+        # matches.  Same hashFiles() shape + behaviour as the macOS job
+        # above; the per-OS prefix in the key keeps Mac and Windows
+        # caches separate.  Embree alone is ~250k LOC of templated
+        # kernels that take ~10 min to compile cold under clang-cl;
+        # cache hits should bring that down to "rebuild only the
+        # changed app code + relink" -- a few minutes at most.
+        uses: actions/cache@v4
+        with:
+          path: build/win-clang-release
+          key: ${{ env.RELEASE_CACHE_VERSION }}-windows-clang-release-${{ hashFiles('CMakeLists.txt', 'cmake/**', '**/CMakeLists.txt', '.github/workflows/release.yml') }}
 
       - name: Configure (release)
         shell: pwsh
