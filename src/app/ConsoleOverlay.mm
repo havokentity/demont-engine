@@ -1536,6 +1536,37 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
 
 - (BOOL)canBecomeKeyWindow { return YES; }
 
+// Forward standard edit-menu Cmd shortcuts (Cmd+C / V / X / A) to the
+// first responder. The console panel is a borderless NSPanel and the
+// app process doesn't install an Edit menu, so AppKit's default
+// performKeyEquivalent: dispatch never invokes cut:/copy:/paste:/
+// selectAll: on the field editor -- without this override Cmd+V is a
+// no-op inside the console input. The first responder is the text
+// view backing the NSTextField when the panel is key, which is
+// exactly the receiver these selectors target. Returning YES from
+// tryToPerform tells AppKit we consumed the event so it doesn't
+// fall through to a system beep.
+- (BOOL)performKeyEquivalent:(NSEvent*)event {
+    const NSEventModifierFlags mask =
+        NSEventModifierFlagControl | NSEventModifierFlagCommand |
+        NSEventModifierFlagOption  | NSEventModifierFlagShift;
+    const NSEventModifierFlags mods = event.modifierFlags & mask;
+    if (mods == NSEventModifierFlagCommand && event.charactersIgnoringModifiers.length == 1) {
+        SEL action = NULL;
+        switch ([event.charactersIgnoringModifiers characterAtIndex:0]) {
+            case 'c': case 'C': action = @selector(copy:);      break;
+            case 'v': case 'V': action = @selector(paste:);     break;
+            case 'x': case 'X': action = @selector(cut:);       break;
+            case 'a': case 'A': action = @selector(selectAll:); break;
+            default: break;
+        }
+        if (action != NULL && [self.firstResponder tryToPerform:action with:self]) {
+            return YES;
+        }
+    }
+    return [super performKeyEquivalent:event];
+}
+
 - (void)layoutToParent {
     if (self.parentRenderWindow == nil) return;
     NSRect frame = self.parentRenderWindow.frame;
