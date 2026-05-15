@@ -274,7 +274,10 @@ cbuffer Push {
     // .z = vertical-flatten ratio for atmospheric refraction at horizon
     // (1.0 = render a perfect circle; <1.0 = vertically-squished oval
     // computed via Saemundsson differential across the real solar disc;
-    // typical values: ~1.0 above 5deg elev, ~0.81 at elev=0). .w reserved.
+    // CPU-clamped to [0.5, 1.0]). Typical values produced by the
+    // formula: ~0.78 at elev=0 (4:5 oval, peak squish), ~0.87 at 1deg,
+    // ~0.95 at 3deg, ~0.97 at 5deg, ~0.99 at 10deg, indistinguishable
+    // from 1.0 above ~30deg. .w reserved.
     float4 sun_extra;
     // HDRI multi-light extraction (computed at HDRI load in
     // ReloadEnvMap). Each entry is a directional light derived from a

@@ -352,7 +352,7 @@ namespace cvar {
     PT_CVAR(r_rayleigh,              "30.0",     "Atmospheric Rayleigh scattering scale on the per-channel sea-level sigma (R 5.8e-6, G 13.5e-6, B 33.1e-6 per metre). 1.0 = real Earth atmosphere -- but our typical r_volumetric_density (Mie haze) is ~30x stronger than real-Earth haze, so bumping this to 30 keeps the sky visibly blue at typical haze settings. Drop to 1.0 if you also drop r_volumetric_density to 0.0001-0.0005 (real haze). 0 disables Rayleigh.", CVAR_ARCHIVE);
     PT_CVAR(r_moon_size,             "1.0",      "Moon angular-size multiplier. 1.0 = our default 0.55deg half-angle (already 2x the real 0.27deg, for visibility at typical 60-FOV 1080p). 5+ = dramatic 'big moon' shots; 0.5 = real lunar size (very small). Astronomical distance variation (perigee/apogee) is also applied on top -- supermoons render ~14% bigger than micro-moons.", CVAR_ARCHIVE);
     PT_CVAR(r_sun_size,              "1.0",      "Sun angular-size multiplier. 1.0 = real ~0.55deg half-angle. Astronomical Earth-Sun distance (perihelion/aphelion) modulates this ~3.4% across the year. Bump for cinematic shots.", CVAR_ARCHIVE);
-    PT_CVAR(r_sun_horizon_flatten,   "1",        "Atmospheric refraction differentially lifts the sun's lower limb more than its upper limb, vertically squishing the disc into an oval as it nears the horizon (Saemundsson 1986). 1 = physical flatten enabled (~19% vertical compression at elev=0, fades to <1% above ~5deg); 0 = render a perfect circle regardless of elevation. Horizontal radius is unchanged either way; r_sun_size stacks on top.", CVAR_ARCHIVE);
+    PT_CVAR(r_sun_horizon_flatten,   "1",        "Atmospheric refraction differentially lifts the sun's lower limb more than its upper limb, vertically squishing the disc into an oval as it nears the horizon (Saemundsson 1986). 1 = physical flatten enabled (vertical-scale ~0.78 at elev=0 / ~21% squish, ~0.87 at 1deg, ~0.97 at 5deg, ~0.99 at 10deg); 0 = render a perfect circle regardless of elevation. Horizontal radius is unchanged either way; r_sun_size stacks on top.", CVAR_ARCHIVE);
     PT_CVAR(r_moon_brightness,       "0.7",      "Moon disc brightness multiplier. 1.0 = the post-ACES-tuned default; 0.7 reads as a softer night-sky moon where surface texture stays under the ACES knee. Drop further for a darker moon, raise toward 1.5+ for an artificial bright-moon look.", CVAR_ARCHIVE);
 
     PT_CVAR(dev_cheats,        "0",    "Gate for CHEAT-flagged cvars",   0);
@@ -2598,18 +2598,21 @@ void Engine::RenderFrame() {
         }
         push.sun_extra[1] = sun_dist_ratio;
         // sun_extra[2]: vertical-flatten ratio for atmospheric refraction
-        // at horizon. 1.0 = circle. Below ~5-6 deg elevation the lower
-        // limb is refracted more than the upper limb (Saemundsson 1986),
-        // so the apparent disc compresses vertically into an oval. The
-        // differential is computed from the REAL solar disc (~0.265 deg
-        // half-angle) so the physical flatten ratio doesn't depend on
-        // r_sun_size. Above ~6 deg the effect is <1%, skipped here.
+        // at horizon. 1.0 = circle. The lower limb is refracted more
+        // than the upper limb (Saemundsson 1986), so the apparent disc
+        // compresses vertically into an oval. The differential is
+        // computed from the REAL solar disc (~0.265 deg half-angle) so
+        // the physical flatten ratio doesn't depend on r_sun_size.
+        // Always computed when the cvar is on (one tan() pair, the
+        // formula naturally trends toward 1.0 above ~10 deg elevation
+        // -- earlier short-circuit gates introduced a visible
+        // discontinuity at the cutoff so the unconditional path wins).
         float vflat = 1.0f;
         bool refraction_on = true;
         if (auto* v = C.FindCVar("r_sun_horizon_flatten")) {
             refraction_on = v->GetBool();
         }
-        if (refraction_on && sun_elev_deg < 6.0f) {
+        if (refraction_on) {
             constexpr float kRealSunRadiusDeg = 0.265f;
             // Saemundsson 1986: R(h) = 1 / tan((h + 7.31/(h+4.4)) deg) arcmin.
             // h is apparent altitude in degrees; clamp the lower limb
@@ -2626,13 +2629,20 @@ void Engine::RenderFrame() {
             const float vert_diam_orig_deg = 2.0f * kRealSunRadiusDeg;
             // Floor at 0.5 (50% squish) so degenerate near-horizon queries
             // don't collapse the disc — beyond ~-1.5 deg the formula is
-            // anyway leaving its physical regime.
+            // anyway leaving its physical regime. The clamp also brings
+            // vflat back to ~1.0 for sun centers far below the horizon
+            // (both limbs hit the same clamped h, so the differential
+            // collapses to zero) -- correct fallback rather than nonsense.
             vflat = std::clamp(1.0f - diff_deg / vert_diam_orig_deg,
                                0.5f, 1.0f);
         }
         // State-transition log on enable/disable AND on first crossing
         // into the active-refraction band, per the engine's
-        // log-on-state-transition convention.
+        // log-on-state-transition convention. Note vflat returns to
+        // ~1.0 in TWO regimes -- high elevation (formula naturally
+        // small) and far below horizon (clamp degenerate) -- so the
+        // inactive log just reports the elevation rather than naming
+        // a single threshold.
         static bool s_refr_logged_on = false;
         static bool s_refr_logged_active = false;
         const bool active = (vflat < 0.999f);
@@ -2652,8 +2662,8 @@ void Engine::RenderFrame() {
                          sun_elev_deg, vflat, (1.0f - vflat) * 100.0f);
             } else {
                 LOG_INFO("engine: sun horizon-refraction inactive "
-                         "(elev={:.2f} deg above ~6 deg threshold)",
-                         sun_elev_deg);
+                         "(elev={:.2f} deg, vertical-scale={:.3f})",
+                         sun_elev_deg, vflat);
             }
             s_refr_logged_active = active;
         }
@@ -5464,6 +5474,14 @@ void Engine::RegisterCommands() {
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
     if (auto* v = C.FindCVar("r_sun_azimuth")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    // Toggling horizon-flatten changes the sun-disc shape on the
+    // procedural-sky path, so the accumulator must drop the prior
+    // (mismatched) samples or the new oval/circle blends with the old
+    // one until something else dirties the state.
+    if (auto* v = C.FindCVar("r_sun_horizon_flatten")) {
+        v->allowed_values = {"0", "1"};
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
     if (auto* v = C.FindCVar("r_exposure")) {
