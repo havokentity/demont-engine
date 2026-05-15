@@ -142,6 +142,26 @@ set(EMBREE_RAY_PACKETS              OFF CACHE BOOL   "" FORCE)
 set(EMBREE_FILTER_FUNCTION          OFF CACHE BOOL   "" FORCE)
 set(EMBREE_BACKFACE_CULLING         OFF CACHE BOOL   "" FORCE)
 set(EMBREE_ZIP_MODE                 OFF CACHE BOOL   "" FORCE)
+# ISA matrix: target hardware floor is AMD Ryzen 9 5950X (Zen 3, 2020) /
+# Intel Rocket Lake i9-11900K (2021) or equivalent.  Every CPU in that
+# class has AVX2, so the SSE2 / SSE4.2 / AVX variants Embree builds by
+# default are pure dead code on real demont users -- they exist only
+# to support pre-2013 hardware that can't run Vulkan / Metal anyway.
+# AVX-512 is gated on PT_ENABLE_AVX512_EMBREE (default OFF, see top-level
+# CMakeLists.txt): 5950X / Rocket Lake don't have it, so consumer builds
+# skip the +~25% build cost; workstation users on Zen 4+ / Threadripper /
+# Xeon Skylake+ flip the flag on and get ~30-50% BVH traversal perf via
+# Embree's 16-wide BVH16 intersector.  Apple Silicon ignores all of these
+# (NEON is selected automatically by Embree's EMBREE_ARM detection path).
+set(EMBREE_ISA_SSE2                 OFF CACHE BOOL   "" FORCE)
+set(EMBREE_ISA_SSE42                OFF CACHE BOOL   "" FORCE)
+set(EMBREE_ISA_AVX                  OFF CACHE BOOL   "" FORCE)
+set(EMBREE_ISA_AVX2                 ON  CACHE BOOL   "" FORCE)
+if(PT_ENABLE_AVX512_EMBREE)
+    set(EMBREE_ISA_AVX512           ON  CACHE BOOL   "" FORCE)
+else()
+    set(EMBREE_ISA_AVX512           OFF CACHE BOOL   "" FORCE)
+endif()
 FetchContent_Declare(embree
     URL           https://github.com/RenderKit/embree/archive/refs/tags/v4.4.0.tar.gz
     URL_HASH      SHA256=acb517b0ea0f4b442235d5331b69f96192c28da6aca5d5dde0cbe40799638d5c

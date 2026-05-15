@@ -34,6 +34,11 @@ option(PT_ENABLE_OPTIX
 option(PT_ENABLE_TRACY          "Enable Tracy profiler client"          ON)
 # ASan + mimalloc do not coexist cleanly without MI_TRACK_ASAN; opt-in only.
 option(PT_ENABLE_SANITIZERS     "Enable -fsanitize=address,undefined in Debug" OFF)
+# AVX-512 build of Embree adds the 16-wide BVH16 intersector for users on
+# Zen 4+ (Ryzen 7000+), Threadripper, Xeon Skylake+, and HEDT chips. Costs
+# ~25% extra build time. Default OFF because the consumer floor is Zen 3
+# (5950X) / Rocket Lake which lack AVX-512; opt-in for workstation users.
+option(PT_ENABLE_AVX512_EMBREE  "Enable AVX-512 build of Embree (workstation perf, +~25% build time)" OFF)
 
 # --- Compiler/warning helper -----------------------------------------------
 include(cmake/CompilerWarnings.cmake)
