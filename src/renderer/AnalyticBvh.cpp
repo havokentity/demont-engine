@@ -60,16 +60,26 @@ void AnalyticBvh::Build(std::span<const BvhPrim> prims) {
 std::uint32_t AnalyticBvh::BuildRecursive(std::uint32_t node_idx,
                                           std::uint32_t first,
                                           std::uint32_t count) {
-    BvhNode& node = nodes_[node_idx];
-    AabbReset(node.aabb_min, node.aabb_max);
+    // IMPORTANT: never bind a reference into nodes_ across a
+    // nodes_.push_back() call. vector reallocation can move the
+    // backing storage, leaving the reference dangling -- internal
+    // node writes after the child push_backs were corrupting memory
+    // (rendered as empty BVH on first attempt). Compute the AABB
+    // into locals and copy to nodes_[node_idx] each time we touch it.
+    float bn[3], bx[3];
+    AabbReset(bn, bx);
     for (std::uint32_t i = 0; i < count; ++i) {
         const auto& wp = working_[first + i];
-        AabbInclude(node.aabb_min, node.aabb_max, wp.prim.center, wp.prim.radius);
+        AabbInclude(bn, bx, wp.prim.center, wp.prim.radius);
+    }
+    for (int a = 0; a < 3; ++a) {
+        nodes_[node_idx].aabb_min[a] = bn[a];
+        nodes_[node_idx].aabb_max[a] = bx[a];
     }
 
     if (count <= kMaxLeafSize) {
-        node.left_first = first;
-        node.count      = count;
+        nodes_[node_idx].left_first = first;
+        nodes_[node_idx].count      = count;
         return 1;
     }
 
@@ -94,8 +104,8 @@ std::uint32_t AnalyticBvh::BuildRecursive(std::uint32_t node_idx,
     // Degenerate: all centroids coincide. Force a leaf even if count >
     // kMaxLeafSize -- otherwise we recurse forever.
     if (widest <= 0.0f) {
-        node.left_first = first;
-        node.count      = count;
+        nodes_[node_idx].left_first = first;
+        nodes_[node_idx].count      = count;
         return 1;
     }
 
@@ -115,20 +125,19 @@ std::uint32_t AnalyticBvh::BuildRecursive(std::uint32_t node_idx,
     const std::uint32_t right_count = count - left_count;
 
     // Reserve two child slots; left child first, right child immediately
-    // after. node.left_first records the left child's index.
+    // after. left_first on the internal node records the left child's
+    // index. Write to the internal node BEFORE the push_backs so any
+    // reallocation after this point is harmless to it.
     const std::uint32_t left_idx  = static_cast<std::uint32_t>(nodes_.size());
-    nodes_.push_back({});
-    const std::uint32_t right_idx = static_cast<std::uint32_t>(nodes_.size());
-    nodes_.push_back({});
-
-    // count = 0 marks this as an internal node in the shader.
     nodes_[node_idx].left_first = left_idx;
-    nodes_[node_idx].count      = 0;
+    nodes_[node_idx].count      = 0;   // 0 marks internal
+    nodes_.push_back({});
+    const std::uint32_t right_idx = left_idx + 1u;
+    nodes_.push_back({});
 
     std::uint32_t emitted = 1;
-    emitted += BuildRecursive(left_idx,  first,                left_count);
-    emitted += BuildRecursive(right_idx, first + left_count,   right_count);
-    (void)right_idx;
+    emitted += BuildRecursive(left_idx,  first,              left_count);
+    emitted += BuildRecursive(right_idx, first + left_count, right_count);
     return emitted;
 }
 

@@ -112,6 +112,14 @@ Texture2D<float4> moon_map;
 [[vk::binding(17, 0)]] RWTexture2D<float4> albedo_tex;
 #endif
 
+// GPU-resident exposure scalar. Updated each frame by AutoExposure.slang
+// (when r_auto_exposure = 1) or written once by the engine via
+// WriteBuffer (when r_auto_exposure = 0, holding the manual r_exposure
+// value). Replaces the per-frame CPU readback of accum_hdr that
+// stalled the GPU on dGPU paths -- now read directly here in the
+// final tonemap, no host round-trip.
+[[vk::binding(15, 0)]] RWStructuredBuffer<float> exposure_state;
+
 // Analytic-primitive BVH (binary, CPU-built in renderer::AnalyticBvh,
 // uploaded as one StructuredBuffer<float4>). Root at index 0. Used by
 // traceScene's analytic-prim path when push.bvh_params.y > 0; otherwise
@@ -130,6 +138,11 @@ Texture2D<float4> moon_map;
 //                                                        this many prims
 //                                                        starting at
 //                                                        left_first)
+//
+// IMPORTANT: declared AFTER exposure_state so the Metal slot
+// allocation (which is by declaration order) puts bvh_nodes at slot 7,
+// matching the engine's BindBuffer(7, ...) call. Moving this earlier
+// would shift exposure_state's slot and break the engine binding.
 [[vk::binding(18, 0)]] StructuredBuffer<float4> bvh_nodes;
 
 struct BvhNode {
@@ -149,14 +162,6 @@ BvhNode loadBvhNode(uint idx) {
     n.count     = asuint(hi.w);
     return n;
 }
-
-// GPU-resident exposure scalar. Updated each frame by AutoExposure.slang
-// (when r_auto_exposure = 1) or written once by the engine via
-// WriteBuffer (when r_auto_exposure = 0, holding the manual r_exposure
-// value). Replaces the per-frame CPU readback of accum_hdr that
-// stalled the GPU on dGPU paths -- now read directly here in the
-// final tonemap, no host round-trip.
-[[vk::binding(15, 0)]] RWStructuredBuffer<float> exposure_state;
 
 // The full PtPush is 736 bytes today (112 B head + 624 B tail; see the
 // static_assert at the dispatch site in Engine.cpp). Native Vulkan / NVIDIA
