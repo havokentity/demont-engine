@@ -726,3 +726,76 @@ the buffer is shared between dispatch and write. Either grow the buffer
 to 2x and swap halves with a fence, or stall briefly on the swap (the
 existing CSG bake does the latter, accepting a small one-frame hitch on
 swap-in).
+
+---
+
+## Smoke-test capture-frame race on Windows / PowerShell loopback TCP
+
+**Status:** The user's `Send-DemontCmd` helper (one TCP connection per
+command) lands commands ~2.3 s apart on Windows -- the .NET
+`StreamWriter.Close()` teardown is the cost, not the network. On macOS
+the same helper is <100 ms. At ~160 fps on a 5090 that's ~370 frames
+between `r_capture_seed 1` and `r_capture_frame_at 64`, so by the time
+the one-shot arms, `frame_index_` is already past 64 and the strict
+equality check at `FrameCapture.cpp:365`
+(`frame_index == s.one_shot_frame`) silently never fires. The capture
+just doesn't happen and there's no warning.
+
+Diagnostic that distinguished this from a stalled render loop:
+`r_capture_seq "<prefix> 1 1"` fires on the *next* rendered frame
+regardless of `frame_index_` (sentinel path in `MaybeCapture`), so the
+seq path succeeded while the one-shot path silently did not. That
+isolated it to a frame-counter race rather than a Vulkan / present
+hang.
+
+**Why deferred:** smoke tests pass with a batched helper
+(single TCP connection, all commands written before `Close()`).
+Not blocking any PR. Worth picking up because the silent no-op is
+surprising to a fresh operator running the published smoke-test
+script on Windows, and surprise > breakage on a workflow tool.
+
+**Plan when picked up:** either is fine, pick one --
+- Helper side: ship a batched `Send-DemontBatch` in the smoke-test
+  guide / README and recommend it on Windows. Single TCP open,
+  multiple `WriteLine`s, one `Close()`. Mac path unaffected.
+- Engine side: relax the one-shot trigger to `frame_index >=
+  s.one_shot_frame` in `FrameCapture::MaybeCapture`, disarming on
+  first fire. Survives both command-latency misses and any genuine
+  frame stutter that skips the target. Costs nothing on the happy
+  path; the only behaviour change is that arming a one-shot at a
+  past frame fires next frame instead of never firing -- arguably
+  the better default anyway.
+
+**Acceptance:** a fresh operator on Windows running the published
+`Send-DemontCmd` loop captures all three armed shots without needing
+to know about the helper's per-call latency.
+
+---
+
+## "engine: pipelines ready" log marker fires only on cold launches
+
+**Status:** `Engine::Run` logs "engine: loading screen active (Vulkan
+pipeline build pending)" / "engine: pipelines ready, normal rendering
+resumed" only when `loading_frame_active_` flips from false -> true ->
+false (`Engine.cpp:1554`, `:1568`). On a warm launch with cached
+SPIR-V the pipeline build returns ready on first poll, so
+`loading_frame_active_` is never set and neither message is emitted.
+Documented as intentional in `Engine.h:354` (avoids per-frame log
+spam during the build window).
+
+This is correct for humans, but CI / smoke-test scripts that grep
+for "pipelines ready" as a startup-sync marker will block forever
+on a cached launch.
+
+**Why deferred:** cosmetic. Today's smoke tests use a fixed
+`Start-Sleep -Seconds 10` after launch, which works on both cold
+and warm. Only worth fixing when someone wires a sync-on-marker
+into automation.
+
+**Plan when picked up:** emit a one-shot "engine: pipelines warm
+(cached)" on the first frame when `loading_frame_active_` stays
+false through the warm path, gated by the same one-shot flag so it
+doesn't spam. Alternatively, always log a single
+"engine: first frame rendered" marker right after the first
+successful `Submit`/`EndFrame`, which gives CI scripts a uniform
+sync point regardless of cold-vs-warm.
