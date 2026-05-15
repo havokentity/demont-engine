@@ -2,10 +2,32 @@
 // Copyright (c) 2026 Rajesh D'Monte
 // Software backend: CPU compute via Embree (triangle BVH) + analytic-
 // primitive intersection done inline. The path tracer writes a CPU
-// framebuffer; we upload it to a Metal texture and blit-present each
-// frame. No Slang shader is compiled to CPU for this target; the kernel
-// is a hand-written C++ port covering the subset documented in
+// framebuffer; the present path is platform-specific:
+//   * Mac: upload to a transient MTLTexture, blit to the drawable, and
+//     present via CAMetalLayer.
+//   * Windows: SetDIBitsToDevice from the same packed BGRA8 scratch
+//     buffer directly to the HWND's device context.  This is a DIB-
+//     to-DC blit, not a `BitBlt` -- BitBlt copies between two DCs and
+//     isn't what we're doing here.  Grep for `SetDIBitsToDevice` to
+//     find the call site.
+// No Slang shader is compiled to CPU for this target; the kernel is a
+// hand-written C++ port covering the subset documented in
 // SoftwareTracer.h.
+//
+// Known limitation (Windows): GDI present is not DPI-aware.  The engine
+// makes no SetProcessDpiAwarenessContext call, so on a high-DPI display
+// Windows reports virtualised pixels from GetClientRect while
+// SetDIBitsToDevice writes physical pixels; the DWM then bilinearly
+// stretches our framebuffer to the real display size, softening the
+// path-traced output.  Acceptable for a CPU reference renderer; the
+// future Vulkan-blit alternative (see TODO below) will pick up real
+// per-monitor DPI awareness through VkSurfaceKHR.
+//
+// TODO (follow-up PR): r_software_blit cvar to select between GDI and
+// a Vulkan-blit present on Windows.  The Vulkan path will share the
+// engine's VkDevice with VulkanDevice (avoids dragging a second Vulkan
+// instance in just for present); see SoftwareDevice::EndFrame for the
+// Windows code paths.
 
 #include "SoftwareDevice.h"
 #include "SoftwareTracer.h"
@@ -14,11 +36,25 @@
 #include "../core/Memory/MemTag.h"
 #include "../core/Memory/Memory.h"
 
+#if defined(__APPLE__)
 // Headers only -- the metal-cpp PRIVATE_IMPLEMENTATION TU lives in
 // rhi_metal/MetalDevice.cpp and supplies the impl symbols we need.
-#include <Foundation/Foundation.hpp>
-#include <Metal/Metal.hpp>
-#include <QuartzCore/QuartzCore.hpp>
+#  include <Foundation/Foundation.hpp>
+#  include <Metal/Metal.hpp>
+#  include <QuartzCore/QuartzCore.hpp>
+#elif defined(_WIN32)
+// We pull in <windows.h> for GDI (SetDIBitsToDevice, BITMAPINFO,
+// GetClientRect, GetDC/ReleaseDC) and HWND.  NOMINMAX prevents
+// <windows.h>'s min/max macros from colliding with std::min/std::max
+// used elsewhere in this TU.
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#endif
 
 #include <embree4/rtcore.h>
 
@@ -26,8 +62,12 @@
 #include <cstring>
 #include <cmath>
 
+#if defined(__APPLE__)
 extern "C" void  pt_metal_attach_layer(void* ns_window, void* metal_layer);
 extern "C" void* pt_window_native_cocoa(void* glfw_window);
+#elif defined(_WIN32)
+extern "C" void* pt_window_native_win32(void* glfw_window);
+#endif
 
 namespace pt::rhi::sw {
 
@@ -101,7 +141,6 @@ SoftwareDevice::SoftwareDevice(const NativeWindowHandle& window) {
     pt::mem::TagScope scope(pt::MemTag::GpuBuffers);
     cmd_buf_ = std::make_unique<SoftwareCommandBuffer>(this);
 
-    ns_window_ = pt_window_native_cocoa(window.opaque);
     width_  = window.width;
     height_ = window.height;
     // Cfg-driven backend switch can fire BEFORE the engine constructs
@@ -114,6 +153,9 @@ SoftwareDevice::SoftwareDevice(const NativeWindowHandle& window) {
     // once the swapchain settles.
     if (width_ <= 0)  width_  = 1280;
     if (height_ <= 0) height_ = 720;
+
+#if defined(__APPLE__)
+    native_window_ = pt_window_native_cocoa(window.opaque);
 
     mtl_device_ = MTL::CreateSystemDefaultDevice();
     if (mtl_device_ == nullptr) {
@@ -134,7 +176,7 @@ SoftwareDevice::SoftwareDevice(const NativeWindowHandle& window) {
     mtl_layer_->setDrawableSize(CGSize{static_cast<CGFloat>(width_),
                                        static_cast<CGFloat>(height_)});
 
-    pt_metal_attach_layer(ns_window_, mtl_layer_);
+    pt_metal_attach_layer(native_window_, mtl_layer_);
     // When the engine creates the device via a cfg-driven backend
     // switch, the window may not have realised its content-view size
     // yet -- the caller passes width=0/height=0 in that case. Query
@@ -149,6 +191,30 @@ SoftwareDevice::SoftwareDevice(const NativeWindowHandle& window) {
             height_ = static_cast<int>(sz.height);
         }
     }
+#elif defined(_WIN32)
+    // pt_window_native_win32 extracts the HWND from the GLFWwindow*
+    // the engine handed us via NativeWindowHandle::opaque.
+    native_window_ = pt_window_native_win32(window.opaque);
+    if (native_window_ == nullptr) {
+        LOG_ERROR("Software backend: pt_window_native_win32 returned null HWND");
+        // Don't bail -- the kernel can still run and write pixels into
+        // the output texture, the GDI present step will just no-op.
+    } else {
+        // Prefer the real client-rect size over the caller-supplied
+        // width/height when available -- handles the cfg-driven backend
+        // switch where the window dimensions arrive as 0x0 before the
+        // window has finished realising. Same shape as the Mac block
+        // above does via mtl_layer_->drawableSize().
+        RECT rc{};
+        if (GetClientRect(static_cast<HWND>(native_window_), &rc)) {
+            int w = static_cast<int>(rc.right  - rc.left);
+            int h = static_cast<int>(rc.bottom - rc.top);
+            if (w > 0 && h > 0) { width_ = w; height_ = h; }
+        }
+    }
+#else
+    native_window_ = window.opaque;   // unsupported platform; will no-op present
+#endif
 
     embree_device_ = rtcNewDevice(nullptr);
     if (embree_device_ == nullptr) {
@@ -157,8 +223,16 @@ SoftwareDevice::SoftwareDevice(const NativeWindowHandle& window) {
     }
     rtcSetDeviceErrorFunction(embree_device_, EmbreeErrorCallback, nullptr);
 
+#if defined(__APPLE__)
     LOG_INFO("Software backend online (CPU + Embree, Metal present): {}x{}",
              width_, height_);
+#elif defined(_WIN32)
+    LOG_INFO("Software backend online (CPU + Embree, GDI present): {}x{}",
+             width_, height_);
+#else
+    LOG_INFO("Software backend online (CPU + Embree, no present): {}x{}",
+             width_, height_);
+#endif
 }
 
 SoftwareDevice::~SoftwareDevice() {
@@ -178,10 +252,15 @@ SoftwareDevice::~SoftwareDevice() {
         textures_.clear();
     }
     if (embree_device_) { rtcReleaseDevice(embree_device_); embree_device_ = nullptr; }
+#if defined(__APPLE__)
     if (present_tex_)   { present_tex_->release();          present_tex_   = nullptr; }
     if (mtl_layer_)     { mtl_layer_->release();            mtl_layer_     = nullptr; }
     if (mtl_queue_)     { mtl_queue_->release();            mtl_queue_     = nullptr; }
     if (mtl_device_)    { mtl_device_->release();           mtl_device_    = nullptr; }
+#endif
+    // Windows: no GDI-side ownership to release. GetDC / ReleaseDC are
+    // paired around each Present call so the device-context lifetime
+    // never spans frames.
 }
 
 BufferHandle SoftwareDevice::CreateBuffer(const BufferDesc& d) {
@@ -406,11 +485,25 @@ void SoftwareDevice::WriteBuffer(BufferHandle h, const void* src, std::size_t si
 }
 
 FrameContext SoftwareDevice::BeginFrame() {
+    // Sync our cached width/height with the real window size each
+    // frame -- handles late-arriving resize events that the engine
+    // hasn't pumped through Resize() yet.
+#if defined(__APPLE__)
     if (mtl_layer_) {
         auto sz = mtl_layer_->drawableSize();
         width_  = static_cast<int>(sz.width);
         height_ = static_cast<int>(sz.height);
     }
+#elif defined(_WIN32)
+    if (HWND hwnd = static_cast<HWND>(native_window_)) {
+        RECT rc{};
+        if (GetClientRect(hwnd, &rc)) {
+            int w = static_cast<int>(rc.right  - rc.left);
+            int h = static_cast<int>(rc.bottom - rc.top);
+            if (w > 0 && h > 0) { width_ = w; height_ = h; }
+        }
+    }
+#endif
     EnsureSwapchainOutput();
     return FrameContext{
         .swapchain_image = TextureHandle{output_tex_id_},
@@ -421,12 +514,13 @@ FrameContext SoftwareDevice::BeginFrame() {
 }
 
 void SoftwareDevice::EndFrame(CommandBuffer*) {
-    if (mtl_layer_ == nullptr || mtl_queue_ == nullptr) return;
+#if defined(__APPLE__)
+    if (mtl_layer_ == nullptr || mtl_queue_ == nullptr) { ++frame_index_; return; }
 
     auto* pool = NS::AutoreleasePool::alloc()->init();
 
     auto* drawable = mtl_layer_->nextDrawable();
-    if (drawable == nullptr) { pool->release(); return; }
+    if (drawable == nullptr) { pool->release(); ++frame_index_; return; }
 
     // If the path tracer wrote into the output texture this frame,
     // upload its CPU backing to a Metal texture and blit-copy to the
@@ -472,6 +566,83 @@ void SoftwareDevice::EndFrame(CommandBuffer*) {
     }
 
     pool->release();
+#elif defined(_WIN32)
+    // Windows present: SetDIBitsToDevice from the BGRA8 scratch buffer
+    // directly to the HWND's device context.  HDC is acquired and
+    // released per frame -- no driver-managed swapchain to worry about.
+    HWND hwnd = static_cast<HWND>(native_window_);
+    if (hwnd == nullptr) { ++frame_index_; return; }
+
+    bool blitted = false;
+    BackedTexture* out_tex = GetTexture(TextureHandle{output_tex_id_});
+    if (out_tex != nullptr && out_tex->width > 0 && out_tex->height > 0) {
+        PresentOutput();   // packs RGBA32F -> BGRA8 into present_scratch_
+        if (!present_scratch_.empty() &&
+            present_scratch_w_ > 0 && present_scratch_h_ > 0) {
+            HDC hdc = GetDC(hwnd);
+            if (hdc) {
+                BITMAPINFO bmi{};
+                bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+                bmi.bmiHeader.biWidth       =  static_cast<LONG>(present_scratch_w_);
+                // Negative height = top-down DIB.  Our scratch buffer
+                // is in top-down row order (row 0 = top of image), so
+                // a negative biHeight tells GDI not to flip Y on us.
+                bmi.bmiHeader.biHeight      = -static_cast<LONG>(present_scratch_h_);
+                bmi.bmiHeader.biPlanes      = 1;
+                bmi.bmiHeader.biBitCount    = 32;
+                bmi.bmiHeader.biCompression = BI_RGB;
+                SetDIBitsToDevice(
+                    hdc,
+                    /*xDest=*/ 0,             /*yDest=*/ 0,
+                    /*w=*/     present_scratch_w_,
+                    /*h=*/     present_scratch_h_,
+                    /*xSrc=*/  0,             /*ySrc=*/  0,
+                    /*startScan=*/ 0,
+                    /*cLines=*/    present_scratch_h_,
+                    present_scratch_.data(),
+                    &bmi,
+                    DIB_RGB_COLORS);
+                ReleaseDC(hwnd, hdc);
+                blitted = true;
+            }
+        }
+    }
+    if (!blitted && out_tex == nullptr) {
+        // First-frame fallback ONLY (no output texture exists yet).
+        // Paint the client rect with the pending clear colour so the
+        // window doesn't show garbage on launch before the kernel
+        // dispatches its first frame.
+        //
+        // Why gated on out_tex == nullptr: if out_tex exists but is
+        // transiently 0x0 (e.g. one frame after a minimise-to-tray
+        // Resize(0, 0)), or PresentOutput legitimately couldn't pack
+        // a frame for some other reason, painting clear colour over
+        // the previously-blitted content flashes a single ugly frame.
+        // GDI doesn't auto-repaint, so leaving the HDC untouched
+        // keeps the last good frame on screen until the kernel
+        // produces a new one -- much better UX than the flash.  Mac
+        // doesn't have this hazard because every Metal frame must
+        // present a drawable, so the equivalent fallback there
+        // genuinely needs to run.
+        HDC hdc = GetDC(hwnd);
+        if (hdc) {
+            RECT rc{};
+            GetClientRect(hwnd, &rc);
+            auto to_byte = [](float v) {
+                return static_cast<int>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f);
+            };
+            COLORREF cr = RGB(to_byte(pending_clear_[0]),
+                              to_byte(pending_clear_[1]),
+                              to_byte(pending_clear_[2]));
+            HBRUSH br = CreateSolidBrush(cr);
+            if (br) {
+                FillRect(hdc, &rc, br);
+                DeleteObject(br);
+            }
+            ReleaseDC(hwnd, hdc);
+        }
+    }
+#endif
     ++frame_index_;
 }
 
@@ -486,12 +657,19 @@ void SoftwareDevice::Submit(CommandBuffer*) {
 
 void SoftwareDevice::Resize(int w, int h) {
     width_  = w; height_ = h;
+#if defined(__APPLE__)
     if (mtl_layer_) {
         mtl_layer_->setDrawableSize(CGSize{static_cast<CGFloat>(w),
                                            static_cast<CGFloat>(h)});
     }
-    // Force the output texture and present scratch to resize on next
-    // frame.
+#endif
+    // Windows: no layer-side state to resize.  GetClientRect is queried
+    // fresh each BeginFrame / EndFrame, so the next present will pick
+    // up the new size automatically.
+    //
+    // Cross-platform: force the output texture to re-allocate so the
+    // CPU kernel writes into a correctly-sized buffer next frame.  The
+    // present scratch buffer also re-sizes lazily inside PresentOutput.
     if (output_tex_id_ != 0) {
         BackedTexture* t = GetTexture(TextureHandle{output_tex_id_});
         if (t != nullptr) {
@@ -553,13 +731,42 @@ void SoftwareDevice::EnsureSwapchainOutput() {
 
 void SoftwareDevice::PresentOutput() {
     BackedTexture* out_tex = GetTexture(TextureHandle{output_tex_id_});
-    if (out_tex == nullptr || mtl_device_ == nullptr) return;
+    if (out_tex == nullptr) return;
 
     const std::uint32_t w = out_tex->width;
     const std::uint32_t h = out_tex->height;
+    if (w == 0 || h == 0) return;
 
-    // Allocate / re-create the present scratch texture if the
-    // swapchain size changed.
+    // --- Cross-platform: RGBA32F -> BGRA8 pack into scratch ---------
+    // Clamp to [0,1]; the path tracer is responsible for tonemapping
+    // into that range. Scratch buffer is a class member so the per-
+    // frame heap churn (several MB at 1080p / tens of MB at 4K) goes
+    // away after the first resize -- only re-allocates when the
+    // swapchain grows.  The packed format 0xAARRGGBB matches both
+    // Metal's BGRA8Unorm pixel format (Mac upload path) and GDI's
+    // BI_RGB DIB layout (Windows present path).
+    const std::size_t pixel_count = std::size_t(w) * h;
+    if (present_scratch_.size() < pixel_count) {
+        present_scratch_.resize(pixel_count);
+    }
+    for (std::size_t i = 0; i < pixel_count; ++i) {
+        float r = std::clamp(out_tex->data[i * 4 + 0], 0.0f, 1.0f);
+        float g = std::clamp(out_tex->data[i * 4 + 1], 0.0f, 1.0f);
+        float b = std::clamp(out_tex->data[i * 4 + 2], 0.0f, 1.0f);
+        float a = std::clamp(out_tex->data[i * 4 + 3], 0.0f, 1.0f);
+        std::uint32_t bi = static_cast<std::uint32_t>(b * 255.0f + 0.5f);
+        std::uint32_t gi = static_cast<std::uint32_t>(g * 255.0f + 0.5f);
+        std::uint32_t ri = static_cast<std::uint32_t>(r * 255.0f + 0.5f);
+        std::uint32_t ai = static_cast<std::uint32_t>(a * 255.0f + 0.5f);
+        present_scratch_[i] = (ai << 24) | (ri << 16) | (gi << 8) | bi;
+    }
+    present_scratch_w_ = w;
+    present_scratch_h_ = h;
+
+#if defined(__APPLE__)
+    // Mac upload: copy scratch into a transient MTLTexture so the
+    // EndFrame blit can src from a GPU-side resource into the drawable.
+    if (mtl_device_ == nullptr) return;
     if (present_tex_ == nullptr || present_w_ != w || present_h_ != h) {
         if (present_tex_) { present_tex_->release(); present_tex_ = nullptr; }
         auto* td = MTL::TextureDescriptor::alloc()->init();
@@ -574,30 +781,11 @@ void SoftwareDevice::PresentOutput() {
         present_h_ = h;
     }
     if (present_tex_ == nullptr) return;
-
-    // Convert RGBA32F -> BGRA8Unorm and upload. Clamp to [0,1]; the
-    // path tracer is responsible for tonemapping into that range.
-    // Scratch buffer is a class member so the per-frame heap churn
-    // (several MB at 1080p / tens of MB at 4K) goes away after the
-    // first resize -- only re-allocates when the swapchain grows.
-    const std::size_t pixel_count = std::size_t(w) * h;
-    if (present_scratch_.size() < pixel_count) {
-        present_scratch_.resize(pixel_count);
-    }
-    for (std::size_t i = 0; i < pixel_count; ++i) {
-        float r = std::clamp(out_tex->data[i * 4 + 0], 0.0f, 1.0f);
-        float g = std::clamp(out_tex->data[i * 4 + 1], 0.0f, 1.0f);
-        float b = std::clamp(out_tex->data[i * 4 + 2], 0.0f, 1.0f);
-        float a = std::clamp(out_tex->data[i * 4 + 3], 0.0f, 1.0f);
-        std::uint32_t bi = static_cast<std::uint32_t>(b * 255.0f + 0.5f);
-        std::uint32_t gi = static_cast<std::uint32_t>(g * 255.0f + 0.5f);
-        std::uint32_t ri = static_cast<std::uint32_t>(r * 255.0f + 0.5f);
-        std::uint32_t ai = static_cast<std::uint32_t>(a * 255.0f + 0.5f);
-        // BGRA8Unorm packs as 0xAARRGGBB on little-endian.
-        present_scratch_[i] = (ai << 24) | (ri << 16) | (gi << 8) | bi;
-    }
     MTL::Region region = MTL::Region::Make2D(0, 0, w, h);
     present_tex_->replaceRegion(region, 0, present_scratch_.data(), w * 4);
+#endif
+    // Windows: nothing more to do -- EndFrame() reads present_scratch_
+    // directly via SetDIBitsToDevice. No intermediate GPU resource.
 }
 
 }  // namespace pt::rhi::sw

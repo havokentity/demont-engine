@@ -9,7 +9,7 @@ target_include_directories(pt_rhi_software PUBLIC ${CMAKE_SOURCE_DIR}/src)
 
 target_link_libraries(pt_rhi_software
     PUBLIC pt_core
-    PUBLIC pt_app_window     # for pt_metal_attach_layer / pt_window_native_cocoa
+    PUBLIC pt_app_window     # for pt_window_native_cocoa / pt_window_native_win32 / pt_metal_attach_layer
     PRIVATE embree           # CPU BVH + ray-triangle intersection (PathTrace.slang's RayQuery equivalent on the CPU side)
     PRIVATE glm::glm         # vec/mat math for the CPU kernel
 )
@@ -24,6 +24,12 @@ if(APPLE)
         "-framework Foundation"
         "-framework QuartzCore"
     )
+elseif(WIN32)
+    # Software backend's Windows present path uses GDI: SetDIBitsToDevice
+    # into the HWND's HDC.  gdi32 + user32 are implicitly linked by the
+    # MSVC / clang-cl default lib set; listing them explicitly documents
+    # the dependency for anyone reading the build.
+    target_link_libraries(pt_rhi_software PRIVATE gdi32 user32)
 endif()
 
 pt_set_compiler_options(pt_rhi_software)

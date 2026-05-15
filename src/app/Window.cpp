@@ -93,6 +93,17 @@ extern "C" void* pt_window_native_cocoa(void*);
 #if defined(_WIN32)
 #  define GLFW_EXPOSE_NATIVE_WIN32
 #  include <GLFW/glfw3native.h>
+
+// Win32 symmetric counterpart to pt_window_native_cocoa: takes a
+// GLFWwindow* (as void*) and returns the underlying HWND (as void*).
+// Used by SoftwareDevice's GDI present path -- same call shape as the
+// Mac side so the backend doesn't need to drag GLFW headers in.
+extern "C" void* pt_window_native_win32(void* glfw_window) {
+    return glfw_window
+        ? static_cast<void*>(glfwGetWin32Window(
+              static_cast<GLFWwindow*>(glfw_window)))
+        : nullptr;
+}
 #endif
 
 void* Window::NativeHandle() const {

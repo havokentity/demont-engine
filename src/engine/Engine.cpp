@@ -102,7 +102,7 @@ namespace cvar {
 #if defined(__APPLE__)
     PT_CVAR(r_backend,         "metal",    "One of none|software|metal|vulkan",CVAR_ARCHIVE);
 #else
-    PT_CVAR(r_backend,         "vulkan",   "One of none|vulkan",               CVAR_ARCHIVE);
+    PT_CVAR(r_backend,         "vulkan",   "One of none|software|vulkan",      CVAR_ARCHIVE);
 #endif
     PT_CVAR(r_max_bounces,     "8",  "Max path bounces per ray",          CVAR_ARCHIVE);
     PT_CVAR(r_spp,             "1",  "Samples per pixel per dispatch (>=1). Higher = cleaner motion frames at proportional GPU cost.", CVAR_ARCHIVE);
@@ -5055,8 +5055,11 @@ void Engine::RegisterCommands() {
     if (auto* v = C.FindCVar("r_backend")) {
         v->allowed_values.clear();
         v->allowed_values.push_back("none");
-#if defined(__APPLE__)
+#if defined(PT_HAS_SOFTWARE_BACKEND)
+        // Cross-platform (Mac CAMetalLayer present, Windows GDI present).
         v->allowed_values.push_back("software");
+#endif
+#if defined(__APPLE__)
         v->allowed_values.push_back("metal");
 #endif
 #if defined(PT_HAS_VULKAN_BACKEND)

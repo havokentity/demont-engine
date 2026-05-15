@@ -23,13 +23,16 @@ struct RTCSceneTy;
 typedef RTCSceneTy* RTCScene;
 
 // Forward decls for metal-cpp pointer types.  Real defs come from
-// <Metal/Metal.hpp> in the .cpp.
+// <Metal/Metal.hpp> in the .cpp.  Apple-only -- the Windows present
+// path uses GDI (see PresentOutput / EndFrame in SoftwareDevice.cpp).
+#if defined(__APPLE__)
 namespace MTL {
 class Device;
 class CommandQueue;
 class Texture;
 }
 namespace CA { class MetalLayer; class MetalDrawable; }
+#endif
 
 namespace pt::rhi::sw {
 
@@ -189,13 +192,18 @@ private:
     void EnsureSwapchainOutput();   // allocate the slot-0 output texture sized to width/height
     void PresentOutput();           // upload output texture to Metal drawable and present
 
-    void* ns_window_ = nullptr;
+    // Native window handle.  NSWindow* on Mac (via pt_window_native_cocoa
+    // -> CAMetalLayer attach), HWND on Windows (via pt_window_native_win32
+    // -> GDI SetDIBitsToDevice).  Stored as void* so this header doesn't
+    // pull in <Cocoa.h> / <Windows.h>.
+    void* native_window_ = nullptr;
     int   width_  = 0;
     int   height_ = 0;
     std::uint32_t frame_index_ = 0;
 
     float pending_clear_[4] { 0.18f, 0.05f, 0.28f, 1.0f };
 
+#if defined(__APPLE__)
     // Metal-side: only used for the present blit. The CPU kernel does
     // all the real work into BackedTexture::data above and we upload
     // that data into a transient MTLTexture at EndFrame time.
@@ -205,12 +213,18 @@ private:
     MTL::Texture*      present_tex_ = nullptr;   // RGBA8Unorm, sized to swapchain
     std::uint32_t      present_w_   = 0;
     std::uint32_t      present_h_   = 0;
-    // Scratch buffer reused across frames for the RGBA32F -> BGRA8Unorm
-    // pack step in PresentOutput(). Allocating a fresh vector every
-    // frame at 1080p / 4K was several MB of heap churn on top of the
-    // CPU tracer; this stays sized to the current swapchain and only
-    // re-allocates on resize.
+#endif
+
+    // Cross-platform scratch buffer reused across frames for the
+    // RGBA32F -> BGRA8 pack step in PresentOutput().  Allocating a
+    // fresh vector every frame at 1080p / 4K was several MB of heap
+    // churn on top of the CPU tracer; this stays sized to the current
+    // swapchain and only re-allocates on resize.  Mac uploads it into
+    // a transient MTLTexture; Windows passes it directly to
+    // SetDIBitsToDevice.
     std::vector<std::uint32_t> present_scratch_;
+    std::uint32_t              present_scratch_w_ = 0;
+    std::uint32_t              present_scratch_h_ = 0;
 
     std::unique_ptr<SoftwareCommandBuffer> cmd_buf_;
 
