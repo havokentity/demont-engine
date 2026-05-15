@@ -705,6 +705,20 @@ void Engine::TearDownDevice() {
     accum_texture_id_ = 0;
     accum_w_ = accum_h_ = 0;
     if (device_) {
+        // Drain the GPU BEFORE releasing any resources. The Metal RHI's
+        // DestroyTexture/DestroyBuffer call `release()` immediately on
+        // the underlying MTLTexture/MTLBuffer; if the GPU still has the
+        // last frame's compute dispatch in flight when we release them,
+        // the driver gets left in a degraded internal state (no hard
+        // crash thanks to deferred-release semantics, but WindowServer
+        // / SkyLight have to clean up at the next lock/unlock or app
+        // switch -- which has been observed as a visible multi-second
+        // hitch when reactivating the screen after a demont session).
+        // The Vulkan RHI's DestroyDevice path joins its async pipeline
+        // worker + calls vkDeviceWaitIdle in its own destructor, but
+        // per-resource Destroy* calls there are also synchronous so the
+        // same ordering rule applies.
+        device_->WaitIdle();
         if (scene_tlas_id_        != 0) device_->DestroyAccelStruct(pt::rhi::AccelStructHandle{scene_tlas_id_});
         if (box_blas_id_          != 0) device_->DestroyAccelStruct(pt::rhi::AccelStructHandle{box_blas_id_});
         if (box_vbuf_id_          != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{box_vbuf_id_});
@@ -768,6 +782,10 @@ void Engine::TearDownDevice() {
     primitives_dirty_     = true;        // re-upload on next device
 
     if (device_) {
+        // Already drained above before the resource destroys; this
+        // WaitIdle is the belt-and-braces guard for the device's own
+        // pipeline / accel-structure tail before `device_.reset()`
+        // tears the queue down. Cheap when nothing's pending.
         device_->WaitIdle();
         device_.reset();
     }
