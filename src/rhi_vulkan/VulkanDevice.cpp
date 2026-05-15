@@ -44,7 +44,7 @@ extern const unsigned long shader_PerfOverlay_spirv_size;
 // Bloom pyramid (BloomDown/Up). Compiled to SPIR-V and embedded
 // alongside the other compute shaders. Each declares only 2
 // storage-image bindings (src + dst) on Vulkan, which is compatible
-// with the shared 17-binding pipeline layout -- so we build them with
+// with the shared 19-binding pipeline layout -- so we build them with
 // the same VkPipelineLayout the path tracer uses and drive them via
 // the engine's standard cb->BindComputePipeline + cb->Dispatch path.
 extern const unsigned char shader_BloomDown_spirv_data[];
@@ -255,17 +255,32 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     if (layout == VK_NULL_HANDLE) return;
 
     VkDevice raw_dev = device_->RawDevice();
-    auto dset = device_->CurrentDescriptorSet();
+    // Each Dispatch grabs a fresh descriptor set from this frame's
+    // ring so its bindings are isolated from other dispatches in the
+    // same cmd buffer. With one shared set + UPDATE_AFTER_BIND, the
+    // GPU reads the LATEST descriptor at execution time -- which
+    // meant PathTrace's `output` ended up reading whatever
+    // bloom_pyramid's last bloom_down dispatch had bound there
+    // (a 320x180 bloom mip), bounds-checking PathTrace's writes to
+    // 320x180 instead of 1280x720. See dsets_ comment in VulkanDevice.h.
+    auto dset = device_->AcquireDispatchDescriptorSet();
 
     // Build the full descriptor write list. We touch all 19 bindings on
     // every dispatch -- nullDescriptor (VK_EXT_robustness2), required at
     // device-create time for this path, means slots the engine didn't
     // bind get VK_NULL_HANDLE silently. The cost of re-writing every
-    // binding each dispatch is small (18 small structs) and avoids
+    // binding each dispatch is small (19 small structs) and avoids
     // per-pipeline layout management. Composition:
-    //   10 storage_image (kNumTexSlots) + 6 storage_buffer + 1 accel
-    //   + 1 uniform_buffer (Frame UBO) = 18.
-    constexpr std::uint32_t kMaxWrites = 18;
+    //   10 storage_image (kNumTexSlots) + 1 accel_struct + 7 storage_buffer
+    //   (engine slots 1..7 -> shader bindings 3/4/5/10/11/15/18)
+    //   + 1 uniform_buffer (Frame UBO) = 19.
+    // (v0.3.9 grew this from 18 by adding analytic-prim BVH nodes at
+    // binding 18 / engine slot 7; kMaxWrites must always equal the
+    // total binding count or vkUpdateDescriptorSets reads off the
+    // end of these stack arrays -- the crash signature is "engine
+    // dies on first PathTrace Dispatch after switching to a r_bloom 1
+    // path that brings the dispatch loop iteration count to 19".)
+    constexpr std::uint32_t kMaxWrites = 19;
     std::array<VkDescriptorImageInfo,  kMaxWrites> img_infos {};
     std::array<VkDescriptorBufferInfo, kMaxWrites> buf_infos {};
     std::array<VkWriteDescriptorSetAccelerationStructureKHR, 1> as_infos {};
@@ -845,17 +860,25 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     }
 
     // ---- Descriptor pool ---------------------------------------------
-    // Sizing matches the expanded layout below:
-    //   10 storage_image + 1 accel_struct + 6 storage_buffer + 1 ubo
-    //   per set, x kFramesInFlight sets, with headroom.
+    // Pool sized for the per-frame dispatch ring of shared-layout sets
+    // (see kDispatchSetsPerFrame in VulkanDevice.h for why a ring is
+    // necessary -- UPDATE_AFTER_BIND descriptors are read at execution
+    // time, so a single shared set across multiple recorded dispatches
+    // races on the LATEST host-side binding update). Total sets =
+    // kFramesInFlight * kDispatchSetsPerFrame, each set needs the full
+    // 19-binding allocation:
+    //   10 storage_image + 1 accel_struct + 7 storage_buffer + 1 ubo
+    // The "+4" / "+1" headroom from the original sizing is preserved.
+    const std::uint32_t kTotalSets =
+        static_cast<std::uint32_t>(kFramesInFlight * kDispatchSetsPerFrame);
     std::array<VkDescriptorPoolSize, 4> psizes{};
-    psizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kFramesInFlight * 10 + 4 };
-    psizes[1] = { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, kFramesInFlight * 1 + 1 };
-    psizes[2] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kFramesInFlight * 7 + 4 };
-    psizes[3] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,          kFramesInFlight * 1 + 1 };
+    psizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kTotalSets * 10 + 4 };
+    psizes[1] = { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, kTotalSets * 1 + 1 };
+    psizes[2] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 7 + 4 };
+    psizes[3] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,          kTotalSets * 1 + 1 };
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpci.maxSets       = kFramesInFlight;
+    dpci.maxSets       = kTotalSets;
     dpci.poolSizeCount = static_cast<std::uint32_t>(psizes.size());
     dpci.pPoolSizes    = psizes.data();
     dpci.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
@@ -941,13 +964,34 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
             return;
         }
 
-        std::vector<VkDescriptorSetLayout> layouts(kFramesInFlight, shared_dset_layout_);
+        // Allocate the full ring: kFramesInFlight * kDispatchSetsPerFrame
+        // sets, all sharing the 19-binding layout. We allocate them in
+        // one batch (each row corresponds to one frame slot, the
+        // columns are the ring slots advanced by AcquireDispatch
+        // DescriptorSet). Per the comment on dsets_ in the header,
+        // each Dispatch grabs a fresh column so that the
+        // UPDATE_AFTER_BIND read-at-execution semantic doesn't cause
+        // PathTrace and bloom_pyramid (which both run on this layout)
+        // to read each other's bindings.
+        std::vector<VkDescriptorSetLayout> layouts(
+            kFramesInFlight * kDispatchSetsPerFrame, shared_dset_layout_);
+        std::vector<VkDescriptorSet> flat_dsets(
+            kFramesInFlight * kDispatchSetsPerFrame, VK_NULL_HANDLE);
         VkDescriptorSetAllocateInfo dsai{};
         dsai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         dsai.descriptorPool     = dpool_;
-        dsai.descriptorSetCount = kFramesInFlight;
+        dsai.descriptorSetCount =
+            static_cast<std::uint32_t>(kFramesInFlight * kDispatchSetsPerFrame);
         dsai.pSetLayouts        = layouts.data();
-        vkAllocateDescriptorSets(device_, &dsai, dsets_);
+        if (vkAllocateDescriptorSets(device_, &dsai, flat_dsets.data()) != VK_SUCCESS) {
+            LOG_ERROR("Vulkan: vkAllocateDescriptorSets for shared-layout ring failed");
+            return;
+        }
+        for (int f = 0; f < kFramesInFlight; ++f) {
+            for (int s = 0; s < kDispatchSetsPerFrame; ++s) {
+                dsets_[f][s] = flat_dsets[f * kDispatchSetsPerFrame + s];
+            }
+        }
     }
 
     // ---- Per-frame Frame UBO ring ------------------------------------
@@ -1027,7 +1071,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         build_pipeline("pathtrace",   shader_PathTrace_spirv_data,    shader_PathTrace_spirv_size);
         build_pipeline("autoexpose",  shader_AutoExposure_spirv_data, shader_AutoExposure_spirv_size);
         build_pipeline("perfoverlay", shader_PerfOverlay_spirv_data,  shader_PerfOverlay_spirv_size);
-        // Bloom pyramid pipelines. These re-use the shared 17-binding
+        // Bloom pyramid pipelines. These re-use the shared 19-binding
         // pipeline layout (their only real bindings are 0 and 1, both
         // storage images, which the shared layout supports). The MSL
         // slot-padding dummies that BloomDown.slang / BloomUp.slang
@@ -1040,17 +1084,15 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         build_pipeline("bloom_up",    shader_BloomUp_spirv_data,      shader_BloomUp_spirv_size);
         // Tonemap pipeline. Engine.cpp's post-denoise tonemap chain
         // dispatches this when tonemap_pipeline_id_ != 0 AND
-        // use_engine_tonemap is true; the latter is currently gated to
-        // Metal only (see b2f4bfd's commit msg + Engine.cpp's
-        // backend_is_metal check) because the Vulkan engine-tonemap
-        // path black-screens on PC and stale-frames on OptiX. So on
-        // Vulkan today this pipeline IS built but is NOT routed --
-        // DenoiseFinalize.slang remains the swapchain writer for
-        // SVGF/NRD, and r_bloom on Vulkan is a no-op pending the
-        // descriptor/layout root-cause work (see Engine.cpp's
-        // `vulkan_pre_denoise_bloom = false` workaround). Building the
-        // pipeline anyway keeps re-enable as a single-boolean flip
-        // once the underlying bug is fixed. See Tonemap.slang's
+        // use_engine_tonemap is true. On Vulkan that's currently NEVER:
+        // bloom-without-denoiser routes through Denoise(Kind::Finalize
+        // Only) -> VulkanNrdDenoiser::EncodeFinalizeOnly (a dedicated
+        // 4-binding layout that sidesteps the broken Tonemap.slang
+        // black-screen path); SVGF/NRD denoiser stays on its own
+        // DenoiseFinalize.slang; OptiX stays on its private-cb
+        // finalize. Tonemap.slang remains BUILT on the SPIR-V path
+        // (compiled and bound by name in case it's needed for future
+        // routing) but is NOT exercised at runtime. See Tonemap.slang's
         // `#ifdef PT_TARGET_SPIRV` branch for the push/UBO split that
         // makes the 624-byte TonePush fit Vulkan's 256B push-constant
         // limit.
@@ -1132,6 +1174,11 @@ void VulkanDevice::DestroyDevice() {
             if (sem_image_avail_[i]) vkDestroySemaphore(device_, sem_image_avail_[i], nullptr);
             if (fence_in_flight_[i]) vkDestroyFence(device_, fence_in_flight_[i], nullptr);
             DestroyBufferImpl(frame_ubos_[i]);
+        }
+        if (swap_capture_staging_.buffer != VK_NULL_HANDLE) {
+            DestroyBufferImpl(swap_capture_staging_);
+            swap_capture_staging_ = {};
+            swap_capture_staging_capacity_ = 0;
         }
         for (auto s : sem_render_done_) {
             if (s) vkDestroySemaphore(device_, s, nullptr);
@@ -1339,6 +1386,22 @@ bool VulkanDevice::RecreateSwapchain() {
     sci.imageUsage       = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
                          | VK_IMAGE_USAGE_STORAGE_BIT
                          | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    // TRANSFER_SRC is requested when the platform's surface caps allow it,
+    // so the screenshot-swap path's vkCmdCopyImageToBuffer is valid
+    // (per VUID-vkCmdCopyImageToBuffer-srcImage-00188 the source image
+    // must have VK_IMAGE_USAGE_TRANSFER_SRC_BIT). swap_supports_readback_
+    // gates ReadbackSwapchain at runtime so on a stripped-down driver
+    // that refuses TRANSFER_SRC the screenshot swap target just reports
+    // unsupported instead of silently producing UB.
+    if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) {
+        sci.imageUsage          |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        swap_supports_readback_  = true;
+    } else {
+        swap_supports_readback_  = false;
+        LOG_INFO("swap surface does not advertise TRANSFER_SRC_BIT "
+                 "(supportedUsageFlags=0x{:x}); ReadbackSwapchain will be unsupported",
+                 static_cast<std::uint32_t>(caps.supportedUsageFlags));
+    }
     sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     sci.preTransform     = caps.currentTransform;
     sci.compositeAlpha   = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -2139,6 +2202,81 @@ bool VulkanDevice::ReadbackBuffer(BufferHandle h, void* dst, std::size_t bytes) 
     return ok;
 }
 
+bool VulkanDevice::ReadbackSwapchain(void* dst, std::size_t dst_size,
+                                     std::uint32_t* out_w, std::uint32_t* out_h,
+                                     SwapFormat* out_format) {
+    if (dst == nullptr || device_ == VK_NULL_HANDLE) return false;
+    if (!swap_supports_readback_) return false;
+
+    // Non-blocking. The caller polls across ticks (the public contract
+    // in Device.h's ReadbackSwapchain block documents this). First
+    // call latches the request; later calls (after Submit() consumes
+    // it) return true and memcpy. Blocking here would deadlock when
+    // the caller is the same thread that runs the render loop -- the
+    // engine's console-drain-on-main-thread case.
+    if (!swap_capture_consumed_.load(std::memory_order_acquire)) {
+        // Pre-flight extent sanity: we can't size dst_size against
+        // the recording-time extent yet (it hasn't been recorded), so
+        // use the current swap_extent_ as a conservative estimate.
+        // A subsequent swap resize between this call and the next
+        // poll is handled below by reading swap_capture_extent_.
+        if (swap_extent_.width  == 0 || swap_extent_.height == 0) return false;
+        const std::size_t need = std::size_t(swap_extent_.width) *
+                                 swap_extent_.height * 4u;
+        if (dst_size < need) return false;
+        swap_capture_requested_.store(true, std::memory_order_release);
+        return false;
+    }
+
+    // Capture-time extent (latched by Submit at the moment of
+    // vkCmdCopyImageToBuffer) is what's in the staging buffer.
+    // Don't use the current swap_extent_ -- a resize between the
+    // record and this read would desync the byte count.
+    const std::uint32_t cw = swap_capture_extent_.width;
+    const std::uint32_t ch = swap_capture_extent_.height;
+    const std::size_t bytes = std::size_t(cw) * ch * 4u;
+    if (cw == 0 || ch == 0 || bytes == 0) {
+        swap_capture_consumed_.store(false, std::memory_order_release);
+        return false;
+    }
+    if (dst_size < bytes) {
+        // Caller's buffer is too small for what was captured -- bail
+        // and reset state so the next request gets a fresh latch.
+        swap_capture_consumed_.store(false, std::memory_order_release);
+        return false;
+    }
+
+    // WaitIdle here is cheap once the consuming frame's work has
+    // already completed in real-time (the typical case once a frame
+    // has elapsed since the request). Bounds the worst case if the
+    // poll happens to fire before the GPU finishes. Safe to call now
+    // that swap_capture_consumed_ is only published after the host
+    // Submit returned (so WaitIdle is guaranteed to find the copy
+    // queued and wait for its completion rather than no-oping).
+    vkDeviceWaitIdle(device_);
+
+    if (swap_capture_staging_.mapped == nullptr) {
+        LOG_ERROR("ReadbackSwapchain: staging buffer has no host mapping after consume");
+        swap_capture_consumed_.store(false, std::memory_order_release);
+        return false;
+    }
+    std::memcpy(dst, swap_capture_staging_.mapped, bytes);
+    swap_capture_consumed_.store(false, std::memory_order_release);
+
+    if (out_w) *out_w = cw;
+    if (out_h) *out_h = ch;
+    if (out_format) {
+        switch (swap_format_) {
+            case VK_FORMAT_B8G8R8A8_UNORM: *out_format = SwapFormat::Bgra8Unorm; break;
+            case VK_FORMAT_B8G8R8A8_SRGB:  *out_format = SwapFormat::Bgra8Srgb;  break;
+            case VK_FORMAT_R8G8B8A8_UNORM: *out_format = SwapFormat::Rgba8Unorm; break;
+            case VK_FORMAT_R8G8B8A8_SRGB:  *out_format = SwapFormat::Rgba8Srgb;  break;
+            default:                       *out_format = SwapFormat::Other;      break;
+        }
+    }
+    return true;
+}
+
 void VulkanDevice::DestroyTexture(TextureHandle h) {
     if (h.id == 0 || h.id == kSwapchainTextureId) return;
     // One-shot caller path: wait idle so the GPU isn't still using the
@@ -2449,6 +2587,12 @@ FrameContext VulkanDevice::BeginFrame() {
 
 CommandBuffer* VulkanDevice::AcquireCommandBuffer() {
     if (device_ == VK_NULL_HANDLE) return nullptr;
+    // Reset the per-frame descriptor-set ring so the first Dispatch
+    // of this frame takes set 0. Safe to reset here because BeginFrame
+    // already vkWaitForFences'd the previous use of this frame slot
+    // (so the GPU is done reading those sets and we can safely
+    // re-bind them with fresh values).
+    next_dispatch_set_ = 0;
     VkCommandBuffer cb = cmds_[current_frame_];
     VkCommandBufferBeginInfo bi{};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -2480,6 +2624,111 @@ void VulkanDevice::Submit(CommandBuffer* cb) {
     auto* vcb = static_cast<VulkanCommandBuffer*>(cb);
     VkCommandBuffer cmd = vcb->Raw();
     if (cmd == VK_NULL_HANDLE) return;
+
+    // ReadbackSwapchain: a caller requested a one-shot capture of the
+    // swap image's contents. The swap is currently in GENERAL layout
+    // (the engine's dispatches just finished writing it) and we're
+    // about to transition it to PRESENT_SRC_KHR -- so insert a
+    // vkCmdCopyImageToBuffer NOW, before the layout transition, into
+    // a persistent host-coherent staging buffer.
+    //
+    // We DEFER publishing swap_capture_consumed_ until AFTER the
+    // queue submit lower down (see the matching set with the comment
+    // "ReadbackSwapchain consume publish"). Two reasons:
+    //   1. Mid-recording publish is racy: a caller polling on the
+    //      flag and immediately calling vkDeviceWaitIdle could
+    //      observe the flag, find the queue idle (nothing submitted
+    //      yet), and memcpy STALE staging. Pushing the publish past
+    //      vkQueueSubmit means by the time the flag is observable
+    //      the copy is at least in the queue -- WaitIdle then
+    //      actually waits for it.
+    //   2. The capture's true extent is locked to current_swap_index_
+    //      + swap_extent_ at this recording point; latching it into
+    //      a member here lets ReadbackSwapchain compute `bytes` from
+    //      the captured-time extent instead of the current
+    //      swap_extent_, which can change under a resize between
+    //      record-time and the caller's read.
+    bool capture_recorded_this_submit = false;
+    if (swap_capture_requested_.exchange(false, std::memory_order_acq_rel)) {
+        const std::size_t need_bytes =
+            std::size_t(swap_extent_.width) * swap_extent_.height * 4u;
+        if (need_bytes > 0 && swap_capture_staging_capacity_ < need_bytes) {
+            if (swap_capture_staging_.buffer != VK_NULL_HANDLE) {
+                DestroyBufferImpl(swap_capture_staging_);
+                swap_capture_staging_ = {};
+                swap_capture_staging_capacity_ = 0;
+            }
+            if (CreateBufferImpl(need_bytes,
+                                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                   | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                 swap_capture_staging_,
+                                 /*persistent_map=*/true)) {
+                swap_capture_staging_capacity_ = need_bytes;
+            } else {
+                LOG_ERROR("ReadbackSwapchain: staging buffer alloc failed ({} bytes)",
+                          need_bytes);
+            }
+        }
+        if (swap_capture_staging_.buffer != VK_NULL_HANDLE &&
+            swap_capture_staging_capacity_ >= need_bytes) {
+            // Image memory barrier: make the engine dispatches'
+            // SHADER_WRITE_BIT to the swap visible to the upcoming
+            // TRANSFER_READ_BIT by vkCmdCopyImageToBuffer. Without
+            // this the copy can observe stale (or even partially-
+            // written) compute output -- queue order alone doesn't
+            // provide the memory dependency (per VUID-vkCmdCopyImageToBuffer-srcImage-00188 / the
+            // execution + memory rules around inter-stage hazards).
+            VkImageMemoryBarrier mb{};
+            mb.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            mb.oldLayout     = VK_IMAGE_LAYOUT_GENERAL;
+            mb.newLayout     = VK_IMAGE_LAYOUT_GENERAL;
+            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            mb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            mb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            mb.image         = swap_images_[current_swap_index_];
+            mb.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            mb.subresourceRange.layerCount = 1;
+            mb.subresourceRange.levelCount = 1;
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &mb);
+
+            VkBufferImageCopy region{};
+            region.bufferOffset = 0;
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.layerCount = 1;
+            region.imageExtent = { swap_extent_.width, swap_extent_.height, 1 };
+            vkCmdCopyImageToBuffer(cmd, swap_images_[current_swap_index_],
+                                   VK_IMAGE_LAYOUT_GENERAL,
+                                   swap_capture_staging_.buffer, 1, &region);
+            // Make the transfer-write visible to host reads after the
+            // submission completes. ReadbackSwapchain's WaitIdle handles
+            // the GPU-side wait; this buffer barrier handshakes the
+            // memory visibility step inside the same command buffer.
+            VkBufferMemoryBarrier bb{};
+            bb.sType         = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            bb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bb.buffer        = swap_capture_staging_.buffer;
+            bb.offset        = 0;
+            bb.size          = VK_WHOLE_SIZE;
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                0, 0, nullptr, 1, &bb, 0, nullptr);
+            // Latch the recording-time extent so ReadbackSwapchain can
+            // compute its memcpy size from this (NOT the current
+            // swap_extent_, which may change under a resize between
+            // record and read).
+            swap_capture_extent_.width  = swap_extent_.width;
+            swap_capture_extent_.height = swap_extent_.height;
+            capture_recorded_this_submit = true;
+        }
+    }
 
     VkImageMemoryBarrier toPres{};
     toPres.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -2535,6 +2784,17 @@ void VulkanDevice::Submit(CommandBuffer* cb) {
 #endif
 
     vkQueueSubmit(graphics_queue_, 1, &si, fence_in_flight_[current_frame_]);
+
+    // ReadbackSwapchain consume publish: AFTER vkQueueSubmit. By the
+    // time another thread observes this flag, the copy is at least
+    // queued -- so a follow-up vkDeviceWaitIdle on that thread will
+    // actually wait for the copy to finish (rather than returning
+    // immediately because nothing was submitted, which would let the
+    // caller memcpy stale staging). Order matters here: store-release
+    // pairs with the load-acquire in ReadbackSwapchain.
+    if (capture_recorded_this_submit) {
+        swap_capture_consumed_.store(true, std::memory_order_release);
+    }
 
 #if defined(PT_ENABLE_OPTIX)
     // One-shot: clear the request after each submit so a frame where
@@ -2672,7 +2932,8 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
         if (k != s_last_logged_kind) {
             LOG_INFO("VulkanDevice::Denoise: dispatching kind={} "
                      "(0=Svgf, 1=OptixHdr, 2=OptixHdrAov, "
-                     "3=OptixTemporalHdr, 4=OptixTemporalHdrAov), "
+                     "3=OptixTemporalHdr, 4=OptixTemporalHdrAov, "
+                     "5=MetalFX, 6=SvgfMetalFx, 7=FinalizeOnly), "
                      "color={} out={} normal={} depth={} motion={}",
                      k, d.color_in.id, d.output.id, d.normal_in.id, d.depth_in.id, d.motion_in.id);
             s_last_logged_kind = k;
@@ -2771,6 +3032,60 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
         return;
     }
 #endif
+
+    // ---- FinalizeOnly path (Kind::FinalizeOnly) ------------------------
+    // Run JUST the swapchain finalize stage (linear HDR -> exposure ->
+    // ACES -> sRGB OETF + bloom composite) via VulkanNrdDenoiser::
+    // EncodeFinalizeOnly. Skips every temporal / spatial denoising pass.
+    // Used by the engine's bloom-without-denoiser path on Vulkan, where
+    // the standalone Tonemap.slang compute kernel that Metal uses for
+    // the same job produces a black swapchain (descriptor-visibility
+    // bug against the shared 19-binding layout, not yet root-caused).
+    // EncodeFinalizeOnly has its own dedicated 4-binding layout +
+    // descriptor set ring, so it sidesteps the Tonemap.slang issue.
+    if (d.kind == DenoiseDesc::Kind::FinalizeOnly) {
+        if (d.color_in.id == 0 || d.final_output.id == 0) {
+            LOG_WARN("VulkanDevice::Denoise(FinalizeOnly): missing "
+                     "color_in / final_output (color={} final={})",
+                     d.color_in.id, d.final_output.id);
+            return;
+        }
+        if (denoiser_ == nullptr) {
+            denoiser_ = std::make_unique<VulkanNrdDenoiser>(this);
+        }
+        if (!denoiser_->Ready()) {
+            if (!denoiser_->Init()) {
+                LOG_ERROR("VulkanDevice::Denoise(FinalizeOnly): NRD "
+                          "denoiser Init failed; bloom composite + "
+                          "swapchain write will be skipped this frame");
+                denoiser_.reset();
+                return;
+            }
+        }
+        auto image_it = images_.find(d.color_in.id);
+        if (image_it == images_.end()) {
+            LOG_WARN("VulkanDevice::Denoise(FinalizeOnly): color_in "
+                     "image lookup miss (id={})", d.color_in.id);
+            return;
+        }
+        const std::uint32_t w = image_it->second.extent.width;
+        const std::uint32_t h = image_it->second.extent.height;
+        if (w == 0 || h == 0) return;
+
+        VkImageView color_view  = LookupImageView(d.color_in);
+        VkImageView output_view = LookupImageView(d.final_output);
+        VkImageView bloom_view  = (d.bloom_in.id != 0)
+                                    ? LookupImageView(d.bloom_in)
+                                    : VK_NULL_HANDLE;
+        VkBuffer    exposure_buf = LookupBuffer(d.exposure_state);
+
+        denoiser_->EncodeFinalizeOnly(wrapped_cb_->Raw(),
+                                      color_view, output_view,
+                                      exposure_buf,
+                                      bloom_view, d.bloom_intensity,
+                                      w, h, d.hdr_pipeline);
+        return;
+    }
 
     // ---- SVGF / NRD path (Kind::Svgf, the historical default) ------------
     // Need at least the noisy color, depth, motion, normal, and a

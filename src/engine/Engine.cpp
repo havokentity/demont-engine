@@ -1922,28 +1922,33 @@ void Engine::RenderFrame() {
     // Bloom-without-denoiser path: when the user has r_bloom on but
     // no denoiser, the engine still needs `denoise_color` (as the
     // path tracer's linear-HDR output the bloom pyramid samples) and
-    // the bloom mip chain so the engine-side Tonemap.slang pass can
-    // composite a bloom layer. depth/motion/post_denoise_hdr/normal/
-    // albedo stay unallocated -- those are denoiser-only. Gated to
-    // Metal: the engine Tonemap chain only runs cleanly on Metal
-    // today (see the long comment above the `if (denoiser_active_)`
-    // post-process block for why Vulkan stays on its DenoiseFinalize
-    // path). When this is off, the path tracer's inline tonemap to
-    // the swapchain is the whole post-process -- no bloom is added.
+    // the bloom mip chain so the post-process composite pass can
+    // build a bloom layer. depth/motion/post_denoise_hdr/normal/
+    // albedo stay unallocated -- those are denoiser-only. Backend-
+    // agnostic flag, but each backend hits a different composite
+    // kernel below:
+    //   - Metal: engine's Tonemap.slang dispatch reads denoise_color
+    //     + bloom_mip[0] directly (use_engine_tonemap branch).
+    //   - Vulkan: routes through Denoise(Kind::FinalizeOnly), which
+    //     dispatches VulkanNrdDenoiser::EncodeFinalizeOnly on its
+    //     dedicated 4-binding layout. Tonemap.slang remains broken
+    //     on Vulkan (black swapchain) so the engine deliberately
+    //     skips it on this backend even for the no-denoiser case.
+    // When this flag is off, the path tracer's inline tonemap to the
+    // swapchain is the whole post-process -- no bloom is added.
     bool r_bloom_on_local = false;
     if (auto* v = C.FindCVar("r_bloom")) r_bloom_on_local = v->GetBool();
-    bool metal_bloom_without_denoiser =
+    bool bloom_without_denoiser =
         (!denoiser_active_) && r_bloom_on_local &&
-        (current_backend_ == pt::rhi::BackendType::Metal) &&
         (tonemap_pipeline_id_ != 0);
     // Either path needs denoise_color + the bloom mip chain. Only the
     // denoiser path needs the depth/motion/post_denoise_hdr/normal/
     // albedo G-buffers. NOT const -- the allocation-failure branch
-    // below clears denoiser_active_ / metal_bloom_without_denoiser and
+    // below clears denoiser_active_ / bloom_without_denoiser and
     // needs to drag this flag down with them so the downstream slot-2
     // bind and push.write_hdr_aux setter don't try to use a freshly-
     // failed (handle 0) denoise_color texture.
-    bool need_hdr_aux = denoiser_active_ || metal_bloom_without_denoiser;
+    bool need_hdr_aux = denoiser_active_ || bloom_without_denoiser;
     if (need_hdr_aux &&
         (denoise_color_tex_id_ == 0 || size_changed ||
          (denoiser_active_ &&
@@ -1972,6 +1977,20 @@ void Engine::RenderFrame() {
             .debug_name = "denoise_color",
         });
         denoise_color_tex_id_    = color_h.id;
+        // State transition log: tells future readers (and rules out
+        // silent failure when the on-screen bloom doesn't match
+        // expectations) WHICH consumer is about to start sampling
+        // denoise_color this frame -- the denoiser's Encode (in which
+        // case the G-buffer block below also fires) or the engine
+        // bloom + finalize chain (this is the only place that signals
+        // the bloom-without-denoiser path took over). The downstream
+        // finalize is Tonemap.slang on Metal, Denoise(FinalizeOnly)
+        // -> VulkanNrdDenoiser::EncodeFinalizeOnly on Vulkan.
+        if (bloom_without_denoiser && !denoiser_active_) {
+            LOG_INFO("engine: bloom-without-denoiser engaged -- allocated denoise_color "
+                     "({}x{} RGBA16F) as bloom-pyramid + finalize HDR source",
+                     fc.width, fc.height);
+        }
         if (denoiser_active_) {
             auto depth_h = device_->CreateTexture({
                 .width = fc.width, .height = fc.height,
@@ -2036,7 +2055,7 @@ void Engine::RenderFrame() {
             // push.write_hdr_aux setter downstream don't drive a
             // handle-0 / unbound texture through the shader.
             denoiser_active_ = false;
-            metal_bloom_without_denoiser = false;
+            bloom_without_denoiser = false;
             need_hdr_aux = false;
         } else if (denoiser_active_ &&
             (depth_tex_id_      == 0 || motion_tex_id_       == 0 ||
@@ -2828,36 +2847,45 @@ void Engine::RenderFrame() {
     // textures the shader just wrote and outputs to the swapchain
     // (overwriting the shader's tonemapped fallback).
     //
-    // The outer gate also catches the bloom-without-denoiser Metal
-    // path: in that case the inner `if (denoiser_active_)` around the
-    // DenoiseDesc setup + Denoise() call below is skipped, but the
-    // engine bloom + Tonemap.slang chain that follows still runs --
-    // its HDR source becomes the path tracer's direct denoise_color
-    // write rather than the denoiser's post_denoise_hdr output.
-    if (denoiser_active_ || metal_bloom_without_denoiser) {
+    // The outer gate also catches the bloom-without-denoiser path
+    // (Metal and Vulkan): in that case the inner `if (denoiser_active_)`
+    // around the DenoiseDesc setup + Denoise() call below is skipped,
+    // but the engine bloom + Tonemap.slang chain that follows still
+    // runs -- its HDR source becomes the path tracer's direct
+    // denoise_color write rather than the denoiser's post_denoise_hdr
+    // output.
+    if (denoiser_active_ || bloom_without_denoiser) {
         // The engine-side Tonemap.slang post-denoise chain (bloom
         // composite + ACES + lens flare + sRGB encode -> swapchain)
-        // currently only runs cleanly on Metal. Reasons:
-        //   - OptiX (Vulkan only): defers its actual denoise + copy-
-        //     into-d.output into a private cb submitted AFTER the
-        //     engine cb (CUDA sync model, see VulkanOptixDenoiser::
-        //     Encode's flow comment). So when the engine cb reaches
-        //     the Tonemap dispatch, post_denoise_hdr still holds the
-        //     PREVIOUS frame's OptiX output -- engine Tonemap would
-        //     tonemap a stale frame to the swapchain.
-        //   - SVGF/NRD on Vulkan: the dispatch reaches Tonemap.slang
-        //     fine, but the kernel produces a black swapchain on
-        //     PC (RTX 5090, validation-layer build pending). Not yet
-        //     root-caused -- likely a barrier / descriptor visibility
-        //     bug between SVGF's writes to post_denoise_hdr and the
-        //     Tonemap dispatch's reads via the shared 18-binding
-        //     UPDATE_AFTER_BIND descriptor set. Pending investigation;
-        //     for now Vulkan stays on the legacy DenoiseFinalize path
-        //     (bloom works, lens flare not yet wired). See follow-ups
-        //     in the commit message that disables this gate.
-        //   - SVGF/MetalFX on Mac: synchronous in the engine cb,
-        //     same descriptor model behaves correctly -- this is the
-        //     only platform where the chain runs today.
+        // runs only on Metal today. Tonemap.slang reaches its kernel
+        // on Vulkan too, but the dispatch produces a black swapchain
+        // on PC -- the descriptor-visibility / barrier root cause
+        // hasn't been pinned down yet (validation-layer + RenderDoc
+        // capture follow-up). Affects both the SVGF/NRD-active case
+        // (writes post_denoise_hdr -> Tonemap reads it) and the
+        // bloom-without-denoiser case (writes denoise_color -> Tonemap
+        // reads it); the bug is in the Tonemap dispatch itself, not
+        // SVGF-specific as originally suspected.
+        //
+        // What runs in each case:
+        //   - Metal + SVGF/MetalFX (denoiser_active_): engine Tonemap.slang
+        //     reads post_denoise_hdr, composites bloom pre-ACES, writes swap.
+        //   - Metal + bloom-without-denoiser: engine Tonemap.slang reads
+        //     denoise_color (PathTrace direct write), same composite chain.
+        //   - Vulkan + SVGF/NRD: VulkanNrdDenoiser's internal
+        //     DenoiseFinalize writes the swap. Bloom is a no-op
+        //     (PR #11 disabled the pre-Denoise pyramid, separate
+        //     descriptor-reuse bug).
+        //   - Vulkan + bloom-without-denoiser: build the bloom pyramid
+        //     in-engine, then dispatch VulkanNrdDenoiser::EncodeFinalizeOnly
+        //     via Denoise(Kind::FinalizeOnly). EncodeFinalizeOnly has its
+        //     own dedicated 4-binding layout / descriptor set, so it
+        //     sidesteps the Tonemap.slang descriptor bug.
+        //   - OptiX (Vulkan only): defers its actual denoise + copy
+        //     into a private cb submitted AFTER the engine cb (CUDA
+        //     sync model, see VulkanOptixDenoiser::Encode's flow
+        //     comment). The engine never runs the Tonemap chain in
+        //     this case (would tonemap stale post_denoise_hdr).
         const bool kind_is_optix =
             (denoiser_kind_ == DenoiserKind::OptixHdr            ||
              denoiser_kind_ == DenoiserKind::OptixHdrAov         ||
@@ -2865,8 +2893,18 @@ void Engine::RenderFrame() {
              denoiser_kind_ == DenoiserKind::OptixTemporalHdrAov);
         const bool backend_is_metal =
             (current_backend_ == pt::rhi::BackendType::Metal);
+        // Metal-only: Tonemap.slang produces black on Vulkan
+        // regardless of denoiser state (see comment block above).
         const bool use_engine_tonemap =
             (tonemap_pipeline_id_ != 0 && !kind_is_optix && backend_is_metal);
+        // Vulkan bloom-without-denoiser: route the swapchain write
+        // through Denoise(Kind::FinalizeOnly) instead. The engine
+        // builds the bloom pyramid first (so DenoiseFinalize can
+        // composite bloom_mip[0]) and then issues the finalize-only
+        // dispatch which writes the swap.
+        const bool use_vulkan_bloom_finalize =
+            (!backend_is_metal && bloom_without_denoiser &&
+             device_->SupportsDenoise());
 
         pt::rhi::Device::DenoiseDesc dd{};
         dd.color_in      = pt::rhi::TextureHandle{denoise_color_tex_id_};
@@ -3032,48 +3070,78 @@ void Engine::RenderFrame() {
              bloom_mip_tex_id_[0] != 0 &&
              bloom_down_pipeline_id_ != 0 && bloom_up_pipeline_id_ != 0);
 
-        // Vulkan-only: build the bloom pyramid BEFORE the Denoise()
-        // call so DenoiseFinalize (which runs inside Denoise() and is
-        // the authoritative swapchain writer on Vulkan today) can
-        // composite bloom_mip[0] pre-tonemap. Source = denoise_color
-        // (the path tracer's per-frame noisy 1-spp HDR). post_denoise_hdr
-        // doesn't exist yet at this point in the frame, and even on the
-        // Metal-tonemap path bloom samples from the input to the chain,
-        // not the SVGF output. BloomDown's first-mip Karis averaging is
-        // designed for noisy path-tracer input so the bloom layer reads
-        // clean after one downsample. Metal: bloom runs in the
-        // post-Denoise Tonemap.slang chain below, NOT here.
-        // Vulkan bloom is currently DISABLED. The eaaf7b4 design built a
+        // Vulkan + denoiser-active: the original design built a
         // pre-Denoise bloom pyramid from denoise_color and passed
-        // bloom_mip[0] through DenoiseFinalize for the composite. On PC
-        // (RTX 5090) that path renders only the upper-left ~quarter of
-        // the swapchain when r_bloom = 1, with the rest of the swap
-        // showing a darkened version of an earlier pass -- looks like
-        // a descriptor / barrier issue between the shared 18-binding
-        // pipeline-layout's storage-image bindings 0/1 (which bloom_down
-        // re-binds to mip views) and the dispatches that bracket it
-        // (PathTrace inline tonemap before, DenoiseFinalize at the
-        // tail). The bug reproduces on eaaf7b4 too -- pre-existing,
-        // not caused by this branch. Until a validation-layer +
-        // RenderDoc capture pin it down, force the Vulkan bloom path
-        // off so the swap is rendered cleanly. r_bloom on Vulkan is
-        // a no-op (DenoiseFinalize sees bloom_in = 0 and the engine
-        // never runs the pyramid here); Metal's post-Denoise Tonemap
-        // chain is unaffected and continues to composite bloom as
-        // before.
-        (void)dispatch_bloom_pyramid;  // keep lambda alive for clarity / future re-enable
+        // bloom_mip[0] through DenoiseFinalize for the composite.
+        // On PC (RTX 5090) that path renders only the upper-left
+        // ~quarter of the swapchain when r_bloom = 1, with the rest
+        // of the swap showing a darkened version of an earlier pass
+        // -- looks like a descriptor / barrier issue between the
+        // shared 19-binding pipeline-layout's storage-image bindings
+        // 0/1 (which bloom_down re-binds to mip views) and the
+        // dispatches that bracket it (PathTrace's HDR-aux write
+        // before, DenoiseFinalize at the tail). The bug reproduces
+        // on eaaf7b4 too -- pre-existing, not caused by this branch.
+        // Until a validation-layer + RenderDoc capture pins it down,
+        // force this pyramid off so DenoiseFinalize gets bloom_in = 0
+        // and the swap is rendered cleanly. r_bloom remains a no-op
+        // on Vulkan when a denoiser is ACTIVE.
+        //
+        // Vulkan + bloom-without-denoiser (use_vulkan_bloom_finalize):
+        // there's no SVGF dispatch in the pipeline, so the bug above
+        // doesn't apply. The engine dispatches the bloom pyramid
+        // in-engine then calls Denoise(Kind::FinalizeOnly) below,
+        // which routes to VulkanNrdDenoiser::EncodeFinalizeOnly --
+        // a self-contained 4-binding pipeline that sidesteps both
+        // the bloom-vs-SVGF descriptor bug above and the Tonemap.slang
+        // black-swapchain bug. (Tonemap.slang is broken on Vulkan
+        // regardless of upstream denoiser state, contrary to the
+        // earlier hypothesis that the bug was SVGF-specific.)
         const bool vulkan_pre_denoise_bloom = false;
         dd.bloom_in        = vulkan_pre_denoise_bloom
                                  ? pt::rhi::TextureHandle{bloom_mip_tex_id_[0]}
                                  : pt::rhi::TextureHandle{0};
         dd.bloom_intensity = vulkan_pre_denoise_bloom ? bloom_intensity : 0.0f;
 
-        // Skip the denoiser dispatch in the bloom-only Metal path -- no
-        // denoiser is active, so `dd` above was just unused setup work.
-        // The engine tonemap block below still runs and reads its HDR
-        // source from denoise_color (the path tracer's direct write)
-        // instead of post_denoise_hdr (the denoiser's output).
+        // Skip the denoiser dispatch in the bloom-without-denoiser
+        // path (Metal or Vulkan) -- no denoiser is active, so `dd`
+        // above was just unused setup work. The downstream branches
+        // (use_vulkan_bloom_finalize on Vulkan, use_engine_tonemap on
+        // Metal) still write the swapchain from denoise_color.
         if (denoiser_active_) {
+            device_->Denoise(dd);
+        }
+
+        // Vulkan bloom-without-denoiser: build the bloom pyramid from
+        // PathTrace's denoise_color, then call Denoise(FinalizeOnly)
+        // to run VulkanNrdDenoiser::EncodeFinalizeOnly. That kernel
+        // composites bloom_mip[0] pre-ACES, applies the sRGB OETF, and
+        // writes the swapchain through a dedicated 4-binding pipeline
+        // layout that the Tonemap.slang black-screen bug doesn't affect.
+        if (use_vulkan_bloom_finalize) {
+            // RAW hazard: PathTrace wrote denoise_color and bloom_down
+            // is about to read it. The autoexpose dispatch upstream
+            // emits the same global barrier when r_auto_exposure is
+            // on; emit it unconditionally here to cover auto-exposure-
+            // off too. (No-op on Metal -- but Metal never enters this
+            // branch.)
+            cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                         pt::rhi::BarrierDesc::Stage::ComputeRead});
+            if (bloom_can_run) {
+                dispatch_bloom_pyramid(denoise_color_tex_id_);
+            }
+            // Repurpose dd for the FinalizeOnly route. The
+            // depth/motion/normal/albedo/output/quality/kind fields
+            // are unused on this path -- VulkanDevice::Denoise reads
+            // only color_in / final_output / bloom_in / bloom_intensity
+            // / exposure_state / hdr_pipeline when kind == FinalizeOnly.
+            dd.kind = pt::rhi::Device::DenoiseDesc::Kind::FinalizeOnly;
+            dd.color_in     = pt::rhi::TextureHandle{denoise_color_tex_id_};
+            dd.final_output = fc.swapchain_image;
+            dd.bloom_in     = (bloom_can_run && bloom_mip_tex_id_[0] != 0)
+                                  ? pt::rhi::TextureHandle{bloom_mip_tex_id_[0]}
+                                  : pt::rhi::TextureHandle{0};
+            dd.bloom_intensity = bloom_can_run ? bloom_intensity : 0.0f;
             device_->Denoise(dd);
         }
 
@@ -3091,15 +3159,25 @@ void Engine::RenderFrame() {
         // through the chain, then upsample additively back up to mip
         // 0. The result in mip 0 is sampled by the tonemap kernel
         // and added pre-ACES so the bloom gets the same curve squash
-        // as the rest of the image. Metal-only here: bloom reads
-        // post_denoise_hdr (the SVGF/MetalFX output) when a denoiser
-        // is active, or the path tracer's denoise_color (the direct
-        // linear-HDR write) when it isn't. Vulkan has already built
-        // its bloom pyramid above from denoise_color before the
-        // Denoise() call -- see the `vulkan_pre_denoise_bloom` branch
-        // up there.
+        // as the rest of the image.
+        //
+        // Metal-only here (use_engine_tonemap is Metal-gated):
+        //   - Metal + denoiser active        -> post_denoise_hdr (SVGF/MetalFX output)
+        //   - Metal + bloom-without-denoiser -> denoise_color    (PathTrace direct write)
+        // Vulkan never enters this branch: bloom-without-denoiser
+        // is handled by the `use_vulkan_bloom_finalize` branch above,
+        // and denoiser-active Vulkan stays on VulkanNrdDenoiser's
+        // internal finalize.
         const std::uint64_t tonemap_hdr_source_id =
             denoiser_active_ ? post_denoise_hdr_tex_id_ : denoise_color_tex_id_;
+        // Metal's MetalCommandBuffer auto-barriers on shared
+        // resources between dispatches, so the explicit emit below
+        // is a no-op on the only backend that reaches this branch.
+        // Left in for documentation symmetry with the
+        // use_vulkan_bloom_finalize branch above (which DOES need
+        // the explicit barrier).
+        cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                     pt::rhi::BarrierDesc::Stage::ComputeRead});
         if (bloom_can_run) {
             dispatch_bloom_pyramid(tonemap_hdr_source_id);
         }
@@ -3610,6 +3688,54 @@ void Engine::UpdateCamera(double dt) {
 
 void Engine::Tick(double dt) {
     pt::console::Console::Get().Drain();
+
+    // Deferred swap screenshot: after Drain may have queued one in
+    // pending_swap_screenshot_path_, poll Device::ReadbackSwapchain
+    // until it returns true. First call (which happened inside the
+    // command lambda) seeded the request; subsequent ticks block on
+    // Submit consuming it and the GPU finishing the copy. Bounded
+    // timeout in ticks (~5s @ 60fps).
+    if (!pending_swap_screenshot_path_.empty() && device_ != nullptr) {
+        std::uint32_t sw = 0, sh = 0;
+        pt::rhi::Device::SwapFormat fmt = pt::rhi::Device::SwapFormat::Other;
+        std::vector<std::uint8_t> raw(std::size_t(accum_w_) * accum_h_ * 4u);
+        const bool ready = device_->ReadbackSwapchain(raw.data(), raw.size(),
+                                                      &sw, &sh, &fmt);
+        if (ready && sw > 0 && sh > 0) {
+            const bool bgra = (fmt == pt::rhi::Device::SwapFormat::Bgra8Unorm ||
+                               fmt == pt::rhi::Device::SwapFormat::Bgra8Srgb ||
+                               fmt == pt::rhi::Device::SwapFormat::Other);
+            std::vector<std::uint8_t> rgb(std::size_t(sw) * sh * 3u);
+            for (std::size_t i = 0, n = std::size_t(sw) * sh; i < n; ++i) {
+                std::uint8_t b0 = raw[i * 4 + 0];
+                std::uint8_t b1 = raw[i * 4 + 1];
+                std::uint8_t b2 = raw[i * 4 + 2];
+                rgb[i * 3 + 0] = bgra ? b2 : b0;
+                rgb[i * 3 + 1] =        b1;
+                rgb[i * 3 + 2] = bgra ? b0 : b2;
+            }
+            FILE* f = std::fopen(pending_swap_screenshot_path_.c_str(), "wb");
+            if (f != nullptr) {
+                std::fprintf(f, "P6\n%u %u\n255\n", sw, sh);
+                std::fwrite(rgb.data(), 1, rgb.size(), f);
+                std::fclose(f);
+                LOG_INFO("screenshot: wrote {} ({}x{} swap)",
+                         pending_swap_screenshot_path_, sw, sh);
+            } else {
+                LOG_ERROR("screenshot: cannot open '{}' for swap capture",
+                          pending_swap_screenshot_path_);
+            }
+            pending_swap_screenshot_path_.clear();
+            pending_swap_screenshot_ticks_ = 0;
+        } else if (++pending_swap_screenshot_ticks_ > 300) {
+            // ~5s at 60fps. Drop on timeout.
+            LOG_WARN("screenshot: swap capture timed out (never consumed by Submit) -- giving up on '{}'",
+                     pending_swap_screenshot_path_);
+            pending_swap_screenshot_path_.clear();
+            pending_swap_screenshot_ticks_ = 0;
+        }
+    }
+
     UpdateCamera(dt);
 
     // Sky animation: advance r_sky_hour by `rate * dt` real-time
@@ -4127,12 +4253,53 @@ void Engine::RegisterCommands() {
         });
 
     if (auto* cmd = C.RegisterCommand("screenshot",
-        "screenshot <path.ppm> [accum|denoise_color|depth|motion]: dump the target render texture to a PPM file (P6 binary, ACES-tonemapped for HDR inputs).",
+        "screenshot <path.ppm> [accum|denoise_color|bloom_mip0|swap|depth|motion]: dump the target render texture to a PPM file (P6 binary, ACES-tonemapped for HDR inputs; the swap target dumps the actual presented 8-bit BGRA bytes after the engine's sRGB OETF, no host-side tonemap).",
         [this](auto args, pt::console::Output& out) {
             if (!device_) { out.PrintLine("screenshot: no device"); return; }
-            if (args.empty()) { out.PrintLine("usage: screenshot <path.ppm> [accum|denoise_color|depth|motion]"); return; }
+            if (args.empty()) { out.PrintLine("usage: screenshot <path.ppm> [accum|denoise_color|bloom_mip0|swap|depth|motion]"); return; }
             std::string path(args[0]);
             std::string target = (args.size() >= 2) ? std::string(args[1]) : std::string("accum");
+
+            // Swap target: queue an async swapchain readback. The
+            // screenshot lambda runs inside Console::Drain on the main
+            // render thread, BEFORE that tick's RenderFrame; if we
+            // blocked here waiting for Submit to consume our request,
+            // we'd deadlock (Submit can't run while this lambda holds
+            // the main thread). Instead, set a pending state, fire
+            // the request, and let Engine::Tick poll across frames
+            // until the device returns the data.
+            if (target == "swap") {
+                if (!device_->SupportsSwapchainReadback()) {
+                    // No backend implementation (Metal / software /
+                    // a Vulkan surface that didn't advertise
+                    // TRANSFER_SRC). Bail before queueing -- otherwise
+                    // the engine's Tick poll loop would spin for the
+                    // 5-second timeout window and only then surface
+                    // the failure, which makes the screenshot
+                    // command feel broken on those backends.
+                    out.PrintLine("screenshot: swap target not supported on this backend (requires Vulkan with TRANSFER_SRC on the surface)");
+                    return;
+                }
+                if (!pending_swap_screenshot_path_.empty()) {
+                    out.FormatLine("screenshot: another swap capture already pending for '{}'",
+                                   pending_swap_screenshot_path_);
+                    return;
+                }
+                std::uint32_t sw = 0, sh = 0;
+                pt::rhi::Device::SwapFormat fmt = pt::rhi::Device::SwapFormat::Other;
+                // Latch the request (first call sets the flag + returns
+                // false; subsequent polls from Engine::Tick get the
+                // data). The throwaway dst buffer here is just large
+                // enough to satisfy the pre-flight extent check inside
+                // ReadbackSwapchain; the real memcpy happens on Tick's
+                // poll into a properly-sized buffer.
+                std::vector<std::uint8_t> dummy(std::size_t(accum_w_) * accum_h_ * 4u);
+                (void)device_->ReadbackSwapchain(dummy.data(), dummy.size(),
+                                                 &sw, &sh, &fmt);
+                pending_swap_screenshot_path_ = path;
+                out.FormatLine("screenshot: queued swap capture, will write to '{}'", path);
+                return;
+            }
 
             std::uint64_t tex_id = 0;
             int channels = 4;
@@ -4143,10 +4310,27 @@ void Engine::RegisterCommands() {
                 bytes_per_pixel = 16;   // RGBA32F
                 tag = "accum_hdr";
             } else if (target == "denoise_color") {
-                if (!denoiser_active_) { out.PrintLine("screenshot: denoiser is off; enable r_denoiser metalfx first"); return; }
+                // denoise_color is the path tracer's linear-HDR write
+                // target. Allocated when a denoiser is active OR when
+                // r_bloom is on without a denoiser (the bloom-pyramid
+                // input). The `tex_id == 0` check below catches the
+                // off-and-bloom-off case; no need to gate on
+                // denoiser_active_ here.
                 tex_id = denoise_color_tex_id_;
                 bytes_per_pixel = 8;    // RGBA16F
                 tag = "denoise_color";
+            } else if (target == "bloom_mip0") {
+                // bloom_mip0 is the half-res RGBA16F bloom pyramid
+                // output (BloomDown extract -> BloomUp add). Tonemap
+                // samples this and adds it pre-ACES. Dumping it is
+                // the cheapest way to verify the bloom path is
+                // actually computing -- non-zero values in
+                // bloom-bright regions = the pyramid ran; all-zero
+                // = pyramid didn't run / threshold filtered everything.
+                // Decode reuses the denoise_color RGBA16F path below.
+                tex_id = bloom_mip_tex_id_[0];
+                bytes_per_pixel = 8;    // RGBA16F (half-res of the framebuffer)
+                tag = "bloom_mip0";
             } else if (target == "depth") {
                 if (!denoiser_active_) { out.PrintLine("screenshot: denoiser is off"); return; }
                 tex_id = depth_tex_id_;
@@ -4289,7 +4473,7 @@ void Engine::RegisterCommands() {
                     if (target == "accum") {
                         const float* src = reinterpret_cast<const float*>(raw.data()) + pi * 4;
                         r = src[0]; g = src[1]; b = src[2];
-                    } else if (target == "denoise_color") {
+                    } else if (target == "denoise_color" || target == "bloom_mip0") {
                         const std::uint16_t* src = reinterpret_cast<const std::uint16_t*>(raw.data()) + pi * 4;
                         r = half_to_float(src[0]);
                         g = half_to_float(src[1]);
