@@ -183,7 +183,14 @@ FetchContent_MakeAvailable(glm fmt mimalloc glfw enkits civetweb tomlplusplus nl
 # the MSVC-style flags anyway, so either branch works for it.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     set(PT_DEP_WARN_SILENCE_FLAG /w)
-    set(PT_DEP_UNDEF_DEBUG_FLAGS /U DEBUG)
+    # /U<symbol> with no space -- if we used `/U DEBUG` here, CMake's
+    # set() would create a two-element list and target_compile_options
+    # would forward `/U` and `DEBUG` as separate cl.exe args.  cl.exe
+    # then treats `DEBUG` as a source-input filename rather than the
+    # symbol to undefine, and the DEBUG macro stays defined.  Joined
+    # form matches the documented MSVC syntax and the -UDEBUG semantics
+    # on the GCC/Clang side below.
+    set(PT_DEP_UNDEF_DEBUG_FLAGS /UDEBUG)
 else()
     set(PT_DEP_WARN_SILENCE_FLAG -w)
     set(PT_DEP_UNDEF_DEBUG_FLAGS -UDEBUG)
