@@ -101,25 +101,29 @@ std::uint32_t AnalyticBvh::BuildRecursive(std::uint32_t node_idx,
         if (w > widest) { widest = w; axis = a; }
     }
 
-    // Degenerate: all centroids coincide. Force a leaf even if count >
-    // kMaxLeafSize -- otherwise we recurse forever.
+    // Degenerate: all centroids coincide (e.g., concentric spheres at
+    // the same origin). Centroid-based split would recurse forever.
+    // Fall back to a simple index-median split so leaf sizes still
+    // stay bounded by ~kMaxLeafSize log-depth-down. The shader-side
+    // per-leaf loop relies on this invariant -- a leaf with hundreds
+    // of prims would defeat the whole point of the BVH.
     if (widest <= 0.0f) {
-        nodes_[node_idx].left_first = first;
-        nodes_[node_idx].count      = count;
-        return 1;
+        // No partitioning needed; the range is already arbitrary since
+        // every prim has the same centroid. Just slice it down the
+        // middle by index.
+    } else {
+        // Median split: partition around the median centroid on `axis`.
+        // nth_element is O(N) and good enough; SAH would build a slightly
+        // tighter tree but the build cost on edits would rise nontrivially
+        // for a marginal trace-time win on the prim counts we expect.
+        auto* begin = working_.data() + first;
+        auto* mid   = begin + count / 2;
+        auto* end   = begin + count;
+        std::nth_element(begin, mid, end,
+            [axis](const WorkPrim& a, const WorkPrim& b) {
+                return a.centroid[axis] < b.centroid[axis];
+            });
     }
-
-    // Median split: partition around the median centroid on `axis`.
-    // nth_element is O(N) and good enough; SAH would build a slightly
-    // tighter tree but the build cost on edits would rise nontrivially
-    // for a marginal trace-time win on the prim counts we expect.
-    auto* begin = working_.data() + first;
-    auto* mid   = begin + count / 2;
-    auto* end   = begin + count;
-    std::nth_element(begin, mid, end,
-        [axis](const WorkPrim& a, const WorkPrim& b) {
-            return a.centroid[axis] < b.centroid[axis];
-        });
 
     const std::uint32_t left_count  = count / 2;
     const std::uint32_t right_count = count - left_count;

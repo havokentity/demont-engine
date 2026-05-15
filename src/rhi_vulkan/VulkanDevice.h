@@ -274,7 +274,7 @@ private:
     std::unordered_map<std::string, std::uint64_t>       named_pipelines_;
 
     // Shared layouts -- created once at construction. The layout has
-    // 16 bindings matching the maximally-expanded shader: the smaller
+    // 19 bindings matching the maximally-expanded shader: the smaller
     // shaders (Tonemap, BloomDown/Up) reference only a subset; Vulkan
     // allows pipelines whose shader doesn't use a binding to be created
     // against the larger layout. nullDescriptor lets the unused slots

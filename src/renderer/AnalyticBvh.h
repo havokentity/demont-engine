@@ -14,15 +14,23 @@ namespace pt::renderer {
 // excluded -- they have infinite extent and stay on the linear-scan
 // path at the front of the primitive buffer.
 //
-// Node layout, 32 bytes, std430-compatible (matches the shader's
-// StructuredBuffer<BvhNode> binding):
+// Node layout, 32 bytes total. The GPU-side encoding is intentionally a
+// pair of float4s in StructuredBuffer<float4> (lo / hi), with the uint
+// fields stored in the .w lanes and recovered via asuint() in the
+// shader. The host struct below uses the natural C++ layout (also 32B);
+// the GPU side avoids a StructuredBuffer<BvhNode> because Slang's MSL
+// emit pads nested float3 inside a struct to 16 bytes, yielding a 64B
+// stride on Metal vs the 32B host stride. Keep this in sync if you
+// add new fields.
 //
-//   float3 aabb_min;     // 12B
-//   uint   left_first;   // 4B  internal: index of left child node
-//                        //     leaf:     first primitive index
-//   float3 aabb_max;     // 12B
-//   uint   count;        // 4B  0  -> internal (right child = left_first + 1)
-//                        //     >0 -> leaf with this many consecutive prims
+//   float3 aabb_min;     // 12B  -> lo.xyz on GPU
+//   uint   left_first;   // 4B   -> asuint(lo.w)
+//                        //   internal: index of left child node
+//                        //   leaf:     first primitive index
+//   float3 aabb_max;     // 12B  -> hi.xyz on GPU
+//   uint   count;        // 4B   -> asuint(hi.w)
+//                        //   0  -> internal (right child = left_first + 1)
+//                        //   >0 -> leaf with this many consecutive prims
 //
 // Build strategy: top-down median-split along the axis of widest spread
 // of leaf-centroid distribution. Recurse until the leaf has <=
@@ -58,8 +66,10 @@ public:
     bool Empty() const { return nodes_.empty(); }
     std::size_t NodeCount() const { return nodes_.size(); }
 
-    // Flat node array, root at index 0. Upload directly as a
-    // StructuredBuffer<BvhNode> to the GPU.
+    // Flat node array, root at index 0. The host struct is 32B; the
+    // GPU side reads this as a StructuredBuffer<float4> of pairs and
+    // recovers the uint fields with asuint(). See the node-layout
+    // comment at the top of this file for why.
     const std::vector<BvhNode>& Nodes() const { return nodes_; }
 
     // Permuted prim_id sequence. permuted[leaf_first_prim + k] gives
