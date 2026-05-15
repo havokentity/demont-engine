@@ -154,16 +154,26 @@ set(EMBREE_ZIP_MODE                 OFF CACHE BOOL   "" FORCE)
 # the +~25% build cost.  Workstation users on Zen 4+ (Ryzen 7000+),
 # Threadripper, Xeon Skylake+, Rocket Lake (i9-11900K), and HEDT chips
 # flip the flag on and get ~30-50% BVH traversal perf via Embree's
-# 16-wide BVH16 intersector.  Apple Silicon ignores all of these (NEON
-# is selected automatically by Embree's EMBREE_ARM detection path).
-set(EMBREE_ISA_SSE2                 OFF CACHE BOOL   "" FORCE)
-set(EMBREE_ISA_SSE42                OFF CACHE BOOL   "" FORCE)
-set(EMBREE_ISA_AVX                  OFF CACHE BOOL   "" FORCE)
-set(EMBREE_ISA_AVX2                 ON  CACHE BOOL   "" FORCE)
-if(PT_ENABLE_AVX512_EMBREE)
-    set(EMBREE_ISA_AVX512           ON  CACHE BOOL   "" FORCE)
-else()
-    set(EMBREE_ISA_AVX512           OFF CACHE BOOL   "" FORCE)
+# 16-wide BVH16 intersector.
+#
+# The whole x86 ISA block is gated on CMAKE_SYSTEM_PROCESSOR matching
+# x86 -- on ARM hosts (Apple Silicon, ARM Linux), Embree's CMake auto-
+# selects NEON via its EMBREE_ARM detection path and leaves the x86
+# flags at OFF.  Forcing EMBREE_ISA_AVX2 ON unconditionally would
+# trip Embree's "static lib + multiple ISAs + AppleClang >= 9.0"
+# guard (NUMISA=2 from NEON + AVX2 on Apple Silicon), failing the
+# configure step.  Gating keeps both consumer x86 builds and Apple
+# Silicon happy without per-ISA-flag conditional sprawl.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86|amd64|AMD64")
+    set(EMBREE_ISA_SSE2             OFF CACHE BOOL   "" FORCE)
+    set(EMBREE_ISA_SSE42            OFF CACHE BOOL   "" FORCE)
+    set(EMBREE_ISA_AVX              OFF CACHE BOOL   "" FORCE)
+    set(EMBREE_ISA_AVX2             ON  CACHE BOOL   "" FORCE)
+    if(PT_ENABLE_AVX512_EMBREE)
+        set(EMBREE_ISA_AVX512       ON  CACHE BOOL   "" FORCE)
+    else()
+        set(EMBREE_ISA_AVX512       OFF CACHE BOOL   "" FORCE)
+    endif()
 endif()
 FetchContent_Declare(embree
     URL           https://github.com/RenderKit/embree/archive/refs/tags/v4.4.0.tar.gz
