@@ -69,6 +69,35 @@ extern "C" void* pt_window_native_cocoa(void* glfw_window);
 extern "C" void* pt_window_native_win32(void* glfw_window);
 #endif
 
+#if defined(_WIN32)
+namespace {
+// Wipe an HWND's client area to a clear colour via GDI. Shared
+// between SoftwareDevice::Initialize (one-shot wipe to clear stale
+// frames left in the window's compositor surface from a prior
+// backend) and SoftwareDevice::EndFrame's first-frame fallback (when
+// no output texture exists yet to BLIT). Pulling the colour-pack +
+// brush + FillRect plumbing into one helper keeps gamma / rounding /
+// alpha handling consistent across both sites.
+void FillHwndClientRectWithClearColor(HWND hwnd, float r, float g, float b) {
+    if (hwnd == nullptr) return;
+    HDC hdc = GetDC(hwnd);
+    if (hdc == nullptr) return;
+    RECT cr{};
+    if (GetClientRect(hwnd, &cr)) {
+        auto to_byte = [](float v) {
+            return static_cast<int>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f);
+        };
+        COLORREF col = RGB(to_byte(r), to_byte(g), to_byte(b));
+        if (HBRUSH br = CreateSolidBrush(col); br) {
+            FillRect(hdc, &cr, br);
+            DeleteObject(br);
+        }
+    }
+    ReleaseDC(hwnd, hdc);
+}
+}  // namespace
+#endif
+
 namespace pt::rhi::sw {
 
 // ---------- SoftwarePipeline ------------------------------------------------
@@ -226,28 +255,13 @@ SoftwareDevice::SoftwareDevice(const NativeWindowHandle& window) {
         // any prior backend's content is immediate and visible. One-
         // shot, runs on every Software backend (re)initialise, and
         // costs one HDC + FillRect.
-        if (HWND hwnd_wipe = static_cast<HWND>(native_window_)) {
-            if (HDC hdc = GetDC(hwnd_wipe); hdc) {
-                RECT cr{};
-                if (GetClientRect(hwnd_wipe, &cr)) {
-                    auto to_byte = [](float v) {
-                        return static_cast<int>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f);
-                    };
-                    COLORREF col = RGB(to_byte(pending_clear_[0]),
-                                       to_byte(pending_clear_[1]),
-                                       to_byte(pending_clear_[2]));
-                    if (HBRUSH br = CreateSolidBrush(col); br) {
-                        FillRect(hdc, &cr, br);
-                        DeleteObject(br);
-                        LOG_INFO("Software backend (Win32): wiped HWND "
-                                 "client area on init (clears stale frame "
-                                 "from prior backend before kernel produces "
-                                 "first software frame)");
-                    }
-                }
-                ReleaseDC(hwnd_wipe, hdc);
-            }
-        }
+        FillHwndClientRectWithClearColor(static_cast<HWND>(native_window_),
+                                         pending_clear_[0],
+                                         pending_clear_[1],
+                                         pending_clear_[2]);
+        LOG_INFO("Software backend (Win32): wiped HWND client area on "
+                 "init (clears stale frame from prior backend before "
+                 "kernel produces first software frame)");
     }
 #else
     native_window_ = window.opaque;   // unsupported platform; will no-op present
@@ -661,23 +675,10 @@ void SoftwareDevice::EndFrame(CommandBuffer*) {
         // doesn't have this hazard because every Metal frame must
         // present a drawable, so the equivalent fallback there
         // genuinely needs to run.
-        HDC hdc = GetDC(hwnd);
-        if (hdc) {
-            RECT rc{};
-            GetClientRect(hwnd, &rc);
-            auto to_byte = [](float v) {
-                return static_cast<int>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f);
-            };
-            COLORREF cr = RGB(to_byte(pending_clear_[0]),
-                              to_byte(pending_clear_[1]),
-                              to_byte(pending_clear_[2]));
-            HBRUSH br = CreateSolidBrush(cr);
-            if (br) {
-                FillRect(hdc, &rc, br);
-                DeleteObject(br);
-            }
-            ReleaseDC(hwnd, hdc);
-        }
+        FillHwndClientRectWithClearColor(hwnd,
+                                         pending_clear_[0],
+                                         pending_clear_[1],
+                                         pending_clear_[2]);
     }
 #endif
     ++frame_index_;
