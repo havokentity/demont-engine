@@ -24,9 +24,14 @@
 #       libembree4.a    (macOS / Linux)
 #       embree4.lib     (Windows)
 #
-# Cache dir: ${FETCHCONTENT_BASE_DIR}/embree-prebuilt-<version>/
-# (using the same env-driven path as the rest of FetchContent so the
-# external-drive workaround stays consistent).
+# Cache dir: ${FETCHCONTENT_BASE_DIR}/embree-prebuilt-<artefact_name>/
+# (e.g. embree-prebuilt-embree-v4.4.0-cfg1-macos-arm64/).  Encodes
+# platform + config in the path so cross-host shared caches (NFS-
+# mounted $HOME, multi-stage container builds, two-devbox cloud
+# drives) can't mistakenly serve the wrong-arch prebuilt -- each
+# platform's tarball expands into its own directory.  Uses the same
+# env-driven FETCHCONTENT_BASE_DIR as the rest of FetchContent so the
+# external-drive workaround stays consistent.
 
 include_guard(GLOBAL)
 include(${CMAKE_CURRENT_LIST_DIR}/EmbreeConfig.cmake)
@@ -89,24 +94,26 @@ if(NOT _embree_artefact)
     return()
 endif()
 
-# Cache extract dir suffix.  Only Windows has both Release and Debug
-# prebuilts; the suffix keeps the two trees from trampling each other
-# when a dev builds win-clang-release + win-clang-debug on the same
-# machine.  Mac + Linux only ever see Release so suffix stays empty.
+# Derive the cache extract directory name from the artefact filename
+# itself (minus archive extension).  Encodes platform + config (where
+# applicable) directly into the cache path so that:
 #
-# Case-insensitive compare: pt_embree_artefact_name() normalises its
-# config arg via TOLOWER + MATCHES "debug" -- if we only checked
-# STREQUAL "Debug" here, a user running `cmake -DCMAKE_BUILD_TYPE=debug`
-# (lowercase) would get the windows-x64-DEBUG artefact downloaded
-# into the windows-x64-RELEASE cache dir, then on the NEXT configure
-# pass the cache-hit path would re-use that as if it were Release.
-# Match the function's case-insensitive logic to keep them aligned.
-string(TOLOWER "${_embree_buildtype}" _embree_buildtype_lower)
-if(WIN32 AND _embree_buildtype_lower MATCHES "debug")
-    set(_embree_cache_suffix "-debug")
-else()
-    set(_embree_cache_suffix "")
-endif()
+#   * macos-arm64 / windows-x64 / windows-x64-debug / linux-x64 /
+#     linux-arm64 each get a fully isolated cache subdirectory.
+#   * A shared FETCHCONTENT_BASE_DIR across hosts (e.g. NFS-mounted
+#     $HOME between a Mac and a Linux VM, a multi-stage container
+#     build sharing /root between platform stages, or just two
+#     developers' devboxes accidentally pointing at the same cloud
+#     drive) can't make the second-platform configure see the first-
+#     platform's `embree/lib/libembree4.a` canary and skip the
+#     download -- which would silently link the WRONG-ARCH .a / .lib.
+#   * The Windows-Debug suffix in the artefact name automatically
+#     produces a distinct cache dir from the Windows-Release one,
+#     replacing the old explicit `_embree_cache_suffix` plumbing.
+#
+# Strip both .tar.gz and .zip extensions; the regex handles either.
+set(_embree_cache_basename "${_embree_artefact}")
+string(REGEX REPLACE "\\.(tar\\.gz|zip)$" "" _embree_cache_basename "${_embree_cache_basename}")
 
 # GitHub Release URL.  Tag format: vendored/embree-<version>.  The
 # forward-slash in the tag name needs URL-encoding for the download URL
@@ -132,7 +139,7 @@ elseif(DEFINED FETCHCONTENT_BASE_DIR)
 else()
     set(_embree_cache_root "${CMAKE_BINARY_DIR}/_deps")
 endif()
-set(_embree_extract_dir "${_embree_cache_root}/embree-prebuilt-${EMBREE_VENDORED_VERSION}${_embree_cache_suffix}")
+set(_embree_extract_dir "${_embree_cache_root}/embree-prebuilt-${_embree_cache_basename}")
 set(_embree_archive_path "${_embree_extract_dir}.archive")
 
 # Short-circuit when the cache already has a usable extracted tree.
