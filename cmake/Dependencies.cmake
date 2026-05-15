@@ -170,6 +170,25 @@ FetchContent_Declare(manifold
 
 FetchContent_MakeAvailable(glm fmt mimalloc glfw enkits civetweb tomlplusplus nlohmann_json)
 
+# Cross-platform flags for silencing third-party warnings.  Vendored
+# libraries (Embree's kernels, civetweb's sha1.inl, Tracy's sprintf use,
+# etc.) emit thousands of warnings we can't fix without forking.  We
+# silence them at target scope so our own code stays under strict
+# warning levels.  Earlier versions of this file used GCC-style "-w" /
+# "-UDEBUG" unconditionally, which MSVC silently ignored -- civetweb
+# alone leaked ~137 C5045 warnings into the Windows release log on
+# v0.3.15.  Use the matching MSVC flag form when CMAKE_CXX_COMPILER_ID
+# is MSVC (cl.exe).  clang-cl reports as "Clang" so it falls through
+# to the unix branch; clang-cl accepts "-w" / "-UDEBUG" in addition to
+# the MSVC-style flags anyway, so either branch works for it.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    set(PT_DEP_WARN_SILENCE_FLAG /w)
+    set(PT_DEP_UNDEF_DEBUG_FLAGS /U DEBUG)
+else()
+    set(PT_DEP_WARN_SILENCE_FLAG -w)
+    set(PT_DEP_UNDEF_DEBUG_FLAGS -UDEBUG)
+endif()
+
 # Embree's headers (common/sys/vector.h etc.) rely on pre-C++17 transitive
 # includes (<type_traits>, <exception>) that libc++ no longer pulls in
 # automatically when the consumer compiles with C++20+. Building Embree
@@ -186,11 +205,11 @@ endblock()
 # readable; the lib has ~hundreds of warnings we can't fix without
 # forking the upstream project.
 if(TARGET embree)
-    target_compile_options(embree PRIVATE -w)
+    target_compile_options(embree PRIVATE ${PT_DEP_WARN_SILENCE_FLAG})
 endif()
 foreach(_t sys math simd lexers tasking)
     if(TARGET ${_t})
-        target_compile_options(${_t} PRIVATE -w)
+        target_compile_options(${_t} PRIVATE ${PT_DEP_WARN_SILENCE_FLAG})
     endif()
 endforeach()
 if(PT_ENABLE_VULKAN_BACKEND)
@@ -218,13 +237,16 @@ endblock()
 # silence the warning. C_STANDARD_REQUIRED ensures the compile fails
 # loudly if a future bump pulls in an even newer C feature.
 if(TARGET civetweb-c-library)
-    # -UDEBUG: kill civetweb's worker-thread trace flood under cmake Debug.
+    # PT_DEP_UNDEF_DEBUG_FLAGS: kill civetweb's worker-thread trace flood
+    #     under cmake Debug (DEBUG macro gate inside civetweb's source).
     # C_STANDARD 11: civetweb uses _Static_assert (a C11 feature).
-    # -w: civetweb's source has ~100 warnings (extra-semis in sha1.inl,
-    #     sprintf deprecation, format mismatches, alloca usage) we
-    #     can't fix without forking. Target-scoped -w suppresses only
-    #     for this library; our own targets stay strict.
-    target_compile_options(civetweb-c-library PRIVATE -UDEBUG -w)
+    # PT_DEP_WARN_SILENCE_FLAG: civetweb's source has ~100 warnings (extra-
+    #     semis in sha1.inl, sprintf deprecation, format mismatches, alloca
+    #     usage on Mac; ~137 C5045 Spectre mitigation notes on MSVC) we
+    #     can't fix without forking. Target-scoped suppresses only for
+    #     this library; our own targets stay strict.
+    target_compile_options(civetweb-c-library
+        PRIVATE ${PT_DEP_UNDEF_DEBUG_FLAGS} ${PT_DEP_WARN_SILENCE_FLAG})
     set_target_properties(civetweb-c-library PROPERTIES
         C_STANDARD          11
         C_STANDARD_REQUIRED ON)
@@ -235,7 +257,7 @@ if(PT_ENABLE_TRACY)
     # Same policy as civetweb -- vendored third-party C++ we don't
     # maintain, suppress at target scope.
     if(TARGET TracyClient)
-        target_compile_options(TracyClient PRIVATE -w)
+        target_compile_options(TracyClient PRIVATE ${PT_DEP_WARN_SILENCE_FLAG})
     endif()
 endif()
 
