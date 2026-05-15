@@ -24,21 +24,44 @@
 #       libembree4.a    (macOS / Linux)
 #       embree4.lib     (Windows)
 #
-# Cache dir: ${FETCHCONTENT_BASE_DIR}/embree-prebuilt-<version>/
+# Cache dir: ${FETCHCONTENT_BASE_DIR}/embree-prebuilt-<version>-<config>/
 # (using the same env-driven path as the rest of FetchContent so the
-# external-drive workaround stays consistent).
+# external-drive workaround stays consistent).  Distinct cache dirs
+# per config (release / debug) so a dev switching between mac-debug
+# and mac-release doesn't re-trigger downloads.
 
 include_guard(GLOBAL)
 include(${CMAKE_CURRENT_LIST_DIR}/EmbreeConfig.cmake)
 
 set(EMBREE_PREBUILT_FOUND FALSE)
 
-# Figure out which artefact filename to look for, per host platform.
-# Empty string = unsupported platform; fall through immediately.
-pt_embree_artefact_name(_embree_artefact)
+
+
+# Pick the artefact for the current host + current build type.  Empty
+# string = unsupported platform; fall through to source compile.
+# CMAKE_BUILD_TYPE may be unset (multi-config generators); default to
+# Release for the lookup, same as CMake does when the user doesn't
+# specify a config.
+if(CMAKE_BUILD_TYPE)
+    set(_embree_buildtype "${CMAKE_BUILD_TYPE}")
+else()
+    set(_embree_buildtype "Release")
+endif()
+pt_embree_artefact_name(_embree_artefact "${_embree_buildtype}")
 if(NOT _embree_artefact)
     message(STATUS "Embree prebuilt: no artefact mapping for this host (CMAKE_SYSTEM_PROCESSOR='${CMAKE_SYSTEM_PROCESSOR}', WIN32=${WIN32}, APPLE=${APPLE}); falling back to compile-from-source.")
     return()
+endif()
+
+# Stash the lowercased config for the cache extract dir below -- keeps
+# Release and Debug prebuilts on disk simultaneously (same dev may
+# build mac-debug + mac-release in separate trees without re-fetching
+# either tarball).
+string(TOLOWER "${_embree_buildtype}" _embree_cfg_lower)
+if(_embree_cfg_lower MATCHES "debug")
+    set(_embree_cfg_lower "debug")
+else()
+    set(_embree_cfg_lower "release")
 endif()
 
 # GitHub Release URL.  Tag format: vendored/embree-<version>.  The
@@ -65,7 +88,7 @@ elseif(DEFINED FETCHCONTENT_BASE_DIR)
 else()
     set(_embree_cache_root "${CMAKE_BINARY_DIR}/_deps")
 endif()
-set(_embree_extract_dir "${_embree_cache_root}/embree-prebuilt-${EMBREE_VENDORED_VERSION}")
+set(_embree_extract_dir "${_embree_cache_root}/embree-prebuilt-${EMBREE_VENDORED_VERSION}-${_embree_cfg_lower}")
 set(_embree_archive_path "${_embree_extract_dir}.archive")
 
 # Short-circuit when the cache already has a usable extracted tree.
@@ -172,4 +195,4 @@ target_include_directories(embree SYSTEM INTERFACE "${_embree_include_path}")
 set(EMBREE_PREBUILT_FOUND TRUE)
 list(LENGTH _embree_companions _embree_n_companions)
 message(STATUS
-    "Embree prebuilt: linked ${_embree_lib_path} + ${_embree_n_companions} companion archive(s)")
+    "Embree prebuilt (${_embree_cfg_lower}): linked ${_embree_lib_path} + ${_embree_n_companions} companion archive(s)")

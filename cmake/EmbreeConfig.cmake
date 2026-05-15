@@ -43,25 +43,59 @@ set(EMBREE_VENDORED_URL_HASH
 #   v4.4.0-cfg1: initial AVX2 + (opt) AVX-512 layout, no SSE2/SSE42/AVX,
 #                EMBREE_GEOMETRY_TRIANGLE + INSTANCE only, EMBREE_STATIC_LIB ON,
 #                EMBREE_TASKING_SYSTEM INTERNAL, EMBREE_RAY_PACKETS OFF.
-set(EMBREE_VENDORED_VERSION "v4.4.0-cfg1")
+#   v4.4.0-cfg2: same Embree config, expanded artefact matrix --
+#                Release + Debug per platform, added Linux x64 + Linux
+#                ARM64.  Artefact filenames now carry a -release /
+#                -debug suffix.
+set(EMBREE_VENDORED_VERSION "v4.4.0-cfg2")
 
-# --- Per-host filename derivation -------------------------------------------
+# --- Per-host + per-config filename derivation ------------------------------
 # Used by both the prebuild workflow (to NAME the uploaded artefact) and
 # the EmbreeBinary download wrapper (to PICK the right artefact for the
-# current host).  ARM Linux + Intel Mac aren't built right now -- they
-# fall through to source compile.
-function(pt_embree_artefact_name out_var)
+# current host).  Returns an empty string for unsupported platform combos
+# (e.g. Intel Mac, FreeBSD); callers fall through to source compile.
+#
+# `config` arg should be either "Release" or "Debug" (case-insensitive --
+# any other value normalises to Release, matching CMake's behaviour for
+# unrecognised CMAKE_BUILD_TYPE values).  Distinct Release / Debug
+# artefacts let the PR-gate build.yml (Debug) and release.yml (Release)
+# both consume prebuilts at their respective configs without each having
+# to live with the other's optimisation level.
+function(pt_embree_artefact_name out_var config)
+    string(TOLOWER "${config}" _cfg_lower)
+    if(_cfg_lower MATCHES "debug")
+        set(_cfg "debug")
+    else()
+        set(_cfg "release")
+    endif()
+
     if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^arm")
-        set(${out_var} "embree-${EMBREE_VENDORED_VERSION}-macos-arm64.tar.gz" PARENT_SCOPE)
+        set(_plat "macos-arm64")
+        set(_ext "tar.gz")
     elseif(WIN32)
         # Windows prebuilt is the clang-cl build (matches release.yml's
         # win-clang-release preset).  MSVC consumers can't use AVX-512
         # anyway (Embree refuses cl.exe + AVX-512); they'd fall through
         # to source compile and skip AVX-512 there too.
-        set(${out_var} "embree-${EMBREE_VENDORED_VERSION}-windows-x64.zip" PARENT_SCOPE)
+        set(_plat "windows-x64")
+        set(_ext "zip")
+    elseif(UNIX AND NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^arm|^aarch64")
+        # Linux ARM64 (Pi 4/5, Graviton, Ampere Altra, etc.).  Same NEON
+        # path Embree uses on Apple Silicon; distinct from macos-arm64
+        # because libc / ABI / linker differ.
+        set(_plat "linux-arm64")
+        set(_ext "tar.gz")
+    elseif(UNIX AND NOT APPLE)
+        set(_plat "linux-x64")
+        set(_ext "tar.gz")
     else()
         set(${out_var} "" PARENT_SCOPE)
+        return()
     endif()
+
+    set(${out_var}
+        "embree-${EMBREE_VENDORED_VERSION}-${_plat}-${_cfg}.${_ext}"
+        PARENT_SCOPE)
 endfunction()
 
 # --- Embree CMake flags -- THE shared config --------------------------------
