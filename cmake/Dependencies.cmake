@@ -9,17 +9,15 @@ set(FETCHCONTENT_UPDATES_DISCONNECTED ON)
 
 # --- glm: vector math (header-only) ----------------------------------------
 FetchContent_Declare(glm
-    GIT_REPOSITORY https://github.com/g-truc/glm.git
-    GIT_TAG        1.0.1
-    GIT_SHALLOW    ON
+    URL           https://github.com/g-truc/glm/archive/refs/tags/1.0.1.tar.gz
+    URL_HASH      SHA256=9f3174561fd26904b23f0db5e560971cbf9b3cbda0b280f04d5c379d03bf234c
     SYSTEM
 )
 
 # --- fmt: formatted output (until libc++ std::print is everywhere) ---------
 FetchContent_Declare(fmt
-    GIT_REPOSITORY https://github.com/fmtlib/fmt.git
-    GIT_TAG        11.2.0
-    GIT_SHALLOW    ON
+    URL           https://github.com/fmtlib/fmt/archive/refs/tags/11.2.0.tar.gz
+    URL_HASH      SHA256=bc23066d87ab3168f27cef3e97d545fa63314f5c79df5ea444d41d56f962c6af
     SYSTEM
 )
 
@@ -33,9 +31,8 @@ set(MI_BUILD_TESTS   OFF CACHE BOOL "" FORCE)
 set(MI_OVERRIDE      OFF CACHE BOOL "" FORCE)
 set(MI_INSTALL_TOPLEVEL OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(mimalloc
-    GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
-    GIT_TAG        v2.1.7
-    GIT_SHALLOW    ON
+    URL           https://github.com/microsoft/mimalloc/archive/refs/tags/v2.1.7.tar.gz
+    URL_HASH      SHA256=0eed39319f139afde8515010ff59baf24de9e47ea316a315398e8027d198202d
     SYSTEM
 )
 
@@ -45,9 +42,8 @@ if(PT_ENABLE_TRACY)
     set(TRACY_ON_DEMAND  ON  CACHE BOOL "" FORCE)  # only profile when client connects
     set(TRACY_NO_BROADCAST OFF CACHE BOOL "" FORCE)
     FetchContent_Declare(tracy
-        GIT_REPOSITORY https://github.com/wolfpld/tracy.git
-        GIT_TAG        v0.11.1
-        GIT_SHALLOW    ON
+        URL           https://github.com/wolfpld/tracy/archive/refs/tags/v0.11.1.tar.gz
+        URL_HASH      SHA256=2c11ca816f2b756be2730f86b0092920419f3dabc7a7173829ffd897d91888a1
         SYSTEM
     )
 endif()
@@ -58,9 +54,8 @@ set(GLFW_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GLFW_INSTALL        OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(glfw
-    GIT_REPOSITORY https://github.com/glfw/glfw.git
-    GIT_TAG        3.4
-    GIT_SHALLOW    ON
+    URL           https://github.com/glfw/glfw/archive/refs/tags/3.4.tar.gz
+    URL_HASH      SHA256=c038d34200234d071fae9345bc455e4a8f2f544ab60150765d7704e08f3dac01
     SYSTEM
 )
 
@@ -73,9 +68,8 @@ set(ENKITS_BUILD_EXAMPLES    OFF CACHE BOOL "" FORCE)
 set(ENKITS_BUILD_SHARED      OFF CACHE BOOL "" FORCE)
 set(ENKITS_INSTALL           OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(enkits
-    GIT_REPOSITORY https://github.com/dougbinks/enkiTS.git
-    GIT_TAG        v1.11
-    GIT_SHALLOW    ON
+    URL           https://github.com/dougbinks/enkiTS/archive/refs/tags/v1.11.tar.gz
+    URL_HASH      SHA256=b57a782a6a68146169d29d180d3553bfecb9f1a0e87a5159082331920e7d297e
     SYSTEM
     PATCH_COMMAND  ${CMAKE_COMMAND} -P ${CMAKE_SOURCE_DIR}/cmake/patch_enkits.cmake
 )
@@ -91,26 +85,23 @@ set(CIVETWEB_ENABLE_SERVER_EXECUTABLE OFF CACHE BOOL "" FORCE)
 set(CIVETWEB_INSTALL_EXECUTABLE OFF CACHE BOOL "" FORCE)
 set(CIVETWEB_ENABLE_ASAN OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(civetweb
-    GIT_REPOSITORY https://github.com/civetweb/civetweb.git
-    GIT_TAG        v1.16
-    GIT_SHALLOW    ON
+    URL           https://github.com/civetweb/civetweb/archive/refs/tags/v1.16.tar.gz
+    URL_HASH      SHA256=f0e471c1bf4e7804a6cfb41ea9d13e7d623b2bcc7bc1e2a4dd54951a24d60285
     SYSTEM
 )
 
 # --- tomlplusplus: TOML parsing (config files later phases) ----------------
 FetchContent_Declare(tomlplusplus
-    GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git
-    GIT_TAG        v3.4.0
-    GIT_SHALLOW    ON
+    URL           https://github.com/marzer/tomlplusplus/archive/refs/tags/v3.4.0.tar.gz
+    URL_HASH      SHA256=8517f65938a4faae9ccf8ebb36631a38c1cadfb5efa85d9a72e15b9e97d25155
     SYSTEM
 )
 
 # --- VulkanMemoryAllocator: simplifies Vk allocation lifetime --------------
 # Header-only.  Used by the Vulkan backend (P4+).
 FetchContent_Declare(vma
-    GIT_REPOSITORY https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
-    GIT_TAG        v3.1.0
-    GIT_SHALLOW    ON
+    URL           https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/archive/refs/tags/v3.1.0.tar.gz
+    URL_HASH      SHA256=ae134ecc37c55634f108e926f85d5d887b670360e77cd107affaf3a9539595f2
     SYSTEM
 )
 
@@ -120,9 +111,8 @@ FetchContent_Declare(vma
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
 set(JSON_Install    OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(nlohmann_json
-    GIT_REPOSITORY https://github.com/nlohmann/json.git
-    GIT_TAG        v3.11.3
-    GIT_SHALLOW    ON
+    URL           https://github.com/nlohmann/json/archive/refs/tags/v3.11.3.tar.gz
+    URL_HASH      SHA256=0d8ef5af7f9794e3263480193c491549b2ba6cc74bb018906202ada498a79406
     SYSTEM
 )
 
@@ -153,9 +143,8 @@ set(EMBREE_FILTER_FUNCTION          OFF CACHE BOOL   "" FORCE)
 set(EMBREE_BACKFACE_CULLING         OFF CACHE BOOL   "" FORCE)
 set(EMBREE_ZIP_MODE                 OFF CACHE BOOL   "" FORCE)
 FetchContent_Declare(embree
-    GIT_REPOSITORY https://github.com/RenderKit/embree.git
-    GIT_TAG        v4.4.0
-    GIT_SHALLOW    ON
+    URL           https://github.com/RenderKit/embree/archive/refs/tags/v4.4.0.tar.gz
+    URL_HASH      SHA256=acb517b0ea0f4b442235d5331b69f96192c28da6aca5d5dde0cbe40799638d5c
     SYSTEM
 )
 
@@ -174,9 +163,8 @@ set(MANIFOLD_DOWNLOADS  OFF CACHE BOOL "" FORCE)
 set(MANIFOLD_PAR            OFF CACHE BOOL "" FORCE)
 set(MANIFOLD_CROSS_SECTION  OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(manifold
-    GIT_REPOSITORY https://github.com/elalish/manifold.git
-    GIT_TAG        v3.1.1
-    GIT_SHALLOW    ON
+    URL           https://github.com/elalish/manifold/archive/refs/tags/v3.1.1.tar.gz
+    URL_HASH      SHA256=1e47f69a96fe228a953e6bfce99657b6d278ed98a822e950322f722adf2e74ed
     SYSTEM
 )
 
