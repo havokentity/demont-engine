@@ -6,10 +6,22 @@
 //   * Mac: upload to a transient MTLTexture, blit to the drawable, and
 //     present via CAMetalLayer.
 //   * Windows: SetDIBitsToDevice from the same packed BGRA8 scratch
-//     buffer directly to the HWND's device context.
+//     buffer directly to the HWND's device context.  This is a DIB-
+//     to-DC blit, not a `BitBlt` -- BitBlt copies between two DCs and
+//     isn't what we're doing here.  Grep for `SetDIBitsToDevice` to
+//     find the call site.
 // No Slang shader is compiled to CPU for this target; the kernel is a
 // hand-written C++ port covering the subset documented in
 // SoftwareTracer.h.
+//
+// Known limitation (Windows): GDI present is not DPI-aware.  The engine
+// makes no SetProcessDpiAwarenessContext call, so on a high-DPI display
+// Windows reports virtualised pixels from GetClientRect while
+// SetDIBitsToDevice writes physical pixels; the DWM then bilinearly
+// stretches our framebuffer to the real display size, softening the
+// path-traced output.  Acceptable for a CPU reference renderer; the
+// future Vulkan-blit alternative (see TODO below) will pick up real
+// per-monitor DPI awareness through VkSurfaceKHR.
 //
 // TODO (follow-up PR): r_software_blit cvar to select between GDI and
 // a Vulkan-blit present on Windows.  The Vulkan path will share the
@@ -595,8 +607,23 @@ void SoftwareDevice::EndFrame(CommandBuffer*) {
             }
         }
     }
-    if (!blitted) {
-        // Fallback: paint the client rect with the pending clear colour.
+    if (!blitted && out_tex == nullptr) {
+        // First-frame fallback ONLY (no output texture exists yet).
+        // Paint the client rect with the pending clear colour so the
+        // window doesn't show garbage on launch before the kernel
+        // dispatches its first frame.
+        //
+        // Why gated on out_tex == nullptr: if out_tex exists but is
+        // transiently 0x0 (e.g. one frame after a minimise-to-tray
+        // Resize(0, 0)), or PresentOutput legitimately couldn't pack
+        // a frame for some other reason, painting clear colour over
+        // the previously-blitted content flashes a single ugly frame.
+        // GDI doesn't auto-repaint, so leaving the HDC untouched
+        // keeps the last good frame on screen until the kernel
+        // produces a new one -- much better UX than the flash.  Mac
+        // doesn't have this hazard because every Metal frame must
+        // present a drawable, so the equivalent fallback there
+        // genuinely needs to run.
         HDC hdc = GetDC(hwnd);
         if (hdc) {
             RECT rc{};
