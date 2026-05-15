@@ -49,19 +49,43 @@ set(EMBREE_VENDORED_URL_HASH
 #                produced from identical Embree flags.
 set(EMBREE_VENDORED_VERSION "v4.4.0-cfg1")
 
-# --- Per-host filename derivation -------------------------------------------
+# --- Per-host + per-config filename derivation ------------------------------
 # Used by both the prebuild workflow (to NAME the uploaded artefact) and
 # the EmbreeBinary download wrapper (to PICK the right artefact for the
 # current host).  Returns an empty string for unsupported platform combos
-# (e.g. Intel Mac, FreeBSD); callers fall through to source compile.
+# (e.g. Intel Mac, FreeBSD, Linux RISC-V); callers fall through to
+# source compile.
 #
-# Only Release-config builds are produced.  Debug Embree was considered
-# but dropped: mixing Release third-party deps with Debug app code is
-# standard practice for C-API libs (no std:: types across the boundary
-# means no _ITERATOR_DEBUG_LEVEL traps), and the only real loss is
-# Embree's internal assert() calls firing on API misuse -- worth far
-# less than the doubled prebuild cost + 8x bigger Debug tarballs.
-function(pt_embree_artefact_name out_var)
+# `config` arg is "Release" or "Debug" (case-insensitive).  Used only
+# on Windows -- everywhere else we ship Release-only because their
+# linkers handle Release+Debug mixing cleanly.
+#
+# Windows is the exception: MSVC's STL stores `_ITERATOR_DEBUG_LEVEL`
+# (0 in Release, 2 in Debug) and `RuntimeLibrary` (MD / MDd) as
+# LIB-level markers, and the linker refuses to merge object files
+# whose markers don't match.  Embree's implementation uses std::vector
+# / std::string internally even though its public API is C, so the
+# .lib carries those markers.  Net effect: a Debug demont built
+# against a Release Embree prebuilt produces LNK2038 errors.  Fix is
+# to ship BOTH Release and Debug Windows prebuilts, named:
+#
+#   embree-<v>-windows-x64.zip          (Release, default)
+#   embree-<v>-windows-x64-debug.zip    (Debug)
+#
+# Mac + Linux don't need this distinction (clang's libc++ doesn't
+# have a debug-level marker, no LIB-level CRT either), so their
+# artefact names are config-agnostic.
+function(pt_embree_artefact_name out_var config)
+    string(TOLOWER "${config}" _cfg_lower)
+    if(_cfg_lower MATCHES "debug")
+        set(_cfg "debug")
+    else()
+        set(_cfg "release")
+    endif()
+
+    # Default: no -debug suffix (Release everywhere except Windows).
+    set(_suffix "")
+
     if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^arm")
         set(_plat "macos-arm64")
         set(_ext "tar.gz")
@@ -72,13 +96,23 @@ function(pt_embree_artefact_name out_var)
         # to source compile and skip AVX-512 there too.
         set(_plat "windows-x64")
         set(_ext "zip")
+        if(_cfg STREQUAL "debug")
+            set(_suffix "-debug")
+        endif()
     elseif(UNIX AND NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^arm|^aarch64")
         # Linux ARM64 (Pi 4/5, Graviton, Ampere Altra, etc.).  Same NEON
         # path Embree uses on Apple Silicon; distinct from macos-arm64
         # because libc / ABI / linker differ.
         set(_plat "linux-arm64")
         set(_ext "tar.gz")
-    elseif(UNIX AND NOT APPLE)
+    elseif(UNIX AND NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^x86_64$|^amd64$|^AMD64$|^x64$")
+        # Strict x86_64 / amd64 match -- earlier we used a looser
+        # "anything not ARM" branch but Copilot pointed out it would
+        # silently route RISC-V / ppc64le / s390x hosts to the x86_64
+        # archive.  Those architectures now fall through to source
+        # compile (which will also fail without the right Embree ISA
+        # bits, but at least the failure mode is "Embree refused to
+        # configure" rather than "we downloaded the wrong arch lib").
         set(_plat "linux-x64")
         set(_ext "tar.gz")
     else()
@@ -87,7 +121,7 @@ function(pt_embree_artefact_name out_var)
     endif()
 
     set(${out_var}
-        "embree-${EMBREE_VENDORED_VERSION}-${_plat}.${_ext}"
+        "embree-${EMBREE_VENDORED_VERSION}-${_plat}${_suffix}.${_ext}"
         PARENT_SCOPE)
 endfunction()
 

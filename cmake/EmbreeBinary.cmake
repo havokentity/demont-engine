@@ -33,17 +33,37 @@ include(${CMAKE_CURRENT_LIST_DIR}/EmbreeConfig.cmake)
 
 set(EMBREE_PREBUILT_FOUND FALSE)
 
-# Pick the artefact for the current host.  Empty string = unsupported
-# platform; fall through to source compile.  Always picks the Release-
-# config prebuilt regardless of CMAKE_BUILD_TYPE -- mixing Release
-# third-party C libs into Debug app code is fine (no std:: types
-# across Embree's C API means no _ITERATOR_DEBUG_LEVEL hazards), and
-# we don't ship Debug prebuilts (see EmbreeConfig.cmake comment for
-# the rationale).
-pt_embree_artefact_name(_embree_artefact)
+# Pick the artefact for the current host + current build type.  Empty
+# string = unsupported platform; fall through to source compile.
+# CMAKE_BUILD_TYPE may be unset (multi-config generators); default to
+# Release for the lookup, same as CMake does when the user doesn't
+# specify a config.
+#
+# Build type only changes the artefact name on Windows (Release vs
+# Debug Embree must be config-matched because MSVC's STL stamps
+# _ITERATOR_DEBUG_LEVEL + RuntimeLibrary markers at .lib granularity;
+# see EmbreeConfig.cmake's pt_embree_artefact_name for the full
+# rationale).  On Mac + Linux pt_embree_artefact_name always returns
+# the Release artefact regardless of build type.
+if(CMAKE_BUILD_TYPE)
+    set(_embree_buildtype "${CMAKE_BUILD_TYPE}")
+else()
+    set(_embree_buildtype "Release")
+endif()
+pt_embree_artefact_name(_embree_artefact "${_embree_buildtype}")
 if(NOT _embree_artefact)
     message(STATUS "Embree prebuilt: no artefact mapping for this host (CMAKE_SYSTEM_PROCESSOR='${CMAKE_SYSTEM_PROCESSOR}', WIN32=${WIN32}, APPLE=${APPLE}); falling back to compile-from-source.")
     return()
+endif()
+
+# Cache extract dir suffix.  Only Windows has both Release and Debug
+# prebuilts; the suffix keeps the two trees from trampling each other
+# when a dev builds win-clang-release + win-clang-debug on the same
+# machine.  Mac + Linux only ever see Release so suffix stays empty.
+if(WIN32 AND _embree_buildtype STREQUAL "Debug")
+    set(_embree_cache_suffix "-debug")
+else()
+    set(_embree_cache_suffix "")
 endif()
 
 # GitHub Release URL.  Tag format: vendored/embree-<version>.  The
@@ -70,7 +90,7 @@ elseif(DEFINED FETCHCONTENT_BASE_DIR)
 else()
     set(_embree_cache_root "${CMAKE_BINARY_DIR}/_deps")
 endif()
-set(_embree_extract_dir "${_embree_cache_root}/embree-prebuilt-${EMBREE_VENDORED_VERSION}")
+set(_embree_extract_dir "${_embree_cache_root}/embree-prebuilt-${EMBREE_VENDORED_VERSION}${_embree_cache_suffix}")
 set(_embree_archive_path "${_embree_extract_dir}.archive")
 
 # Short-circuit when the cache already has a usable extracted tree.
