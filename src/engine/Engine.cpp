@@ -194,8 +194,10 @@ namespace cvar {
             "Lambert under HDRIs with concentrated bright regions; the "
             "BRDF-sampled bounce hitting the sun is recovered cleanly). "
             "0 = legacy NEE-only path (BRDF-bounce sky-miss is skipped "
-            "to avoid double-counting). Specular bounces (metal / "
-            "dielectric) are delta-BRDF and unaffected either way.",
+            "to avoid double-counting). MIS currently applies only to "
+            "Lambert hits; metal (including rough metal via h.roughness) "
+            "and dielectric paths are left on their existing code paths "
+            "either way.",
             CVAR_ARCHIVE);
     PT_CVAR(r_hdri_extract_percentile, "0.005",
             "Top-luminance percentile threshold (0..0.5) for HDRI light "

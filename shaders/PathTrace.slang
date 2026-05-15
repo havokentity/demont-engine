@@ -256,10 +256,11 @@ cbuffer Push {
     uint   write_hdr_aux;
     // 1 -> apply balance-heuristic MIS weights to env-map NEE and
     // BRDF-bounce miss contributions on Lambert hits. 0 -> classic
-    // NEE-only (existing `skip_sky_on_miss` path). Specular bounces
-    // (metal / dielectric) are delta-BRDF and unaffected -- they keep
-    // their existing "no NEE, sky-miss is real" behaviour either way.
-    // Reuses what was `_hdri_pad1`; layout-equivalent.
+    // NEE-only (existing `skip_sky_on_miss` path). Metal (including
+    // rough metal via h.roughness) and dielectric paths stay on their
+    // existing code paths either way -- MIS is currently a Lambert-only
+    // scope, not a property of those materials. Reuses what was
+    // `_hdri_pad1`; layout-equivalent.
     uint   mis_enabled;
 #endif  // !PT_TARGET_SPIRV
 };
@@ -932,19 +933,22 @@ bool isExtractedClusterDir(float3 dir) {
 
 // Evaluate the env-map importance-sampling PDF (solid-angle) for an
 // arbitrary world-space direction. Mirrors sampleEnvMap's PDF formula
-// for the texel the direction projects to. Used as the "other" sampler
-// PDF in the balance heuristic when MIS-weighting BRDF-sampled bounces
-// that hit the sky. Returns 0 when the env map isn't bound, the total
-// luminance integral is degenerate, the direction lands at a pole
-// (sin theta -> 0 -> infinite Jacobian), or the direction lands on an
-// extracted-cluster pixel (CDF was masked there).
+// for the texel the direction projects to. Returns 0 when the env map
+// isn't bound, the total luminance integral is degenerate, or the
+// direction lands at a pole (sin theta -> 0 -> infinite Jacobian).
+//
+// Caller contract: must NOT pass extracted-cluster directions. The
+// cluster check is gated at the call site (the MIS sky-miss block in
+// the path-trace loop) so we don't perform it twice on every miss.
+// pdfEnvMapDir does not re-check, and would return a spurious positive
+// value for a cluster direction (it reads the raw env_map texel, which
+// keeps cluster pixels intact).
 float pdfEnvMapDir(float3 dir) {
     if (env_map_present == 0u || env_total_luminance <= 0.0) return 0.0;
     float cos_theta = clamp(dir.y, -1.0, 1.0);
     float theta     = acos(cos_theta);
     float sin_theta = sin(theta);
     if (sin_theta < 1e-6) return 0.0;
-    if (isExtractedClusterDir(dir)) return 0.0;
     float phi = atan2(dir.z, dir.x);
     uint W, H;
     env_map.GetDimensions(W, H);
@@ -1357,19 +1361,26 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 // this same direction; pdf_self = cosine-hemisphere PDF
                 // recorded at the Lambert bounce site.
                 //
-                // Skip extracted-cluster directions: the env-map CDF
-                // has them masked to 0, AND extracted-lights NEE
-                // contributes their flux every frame on its own
-                // sampler. Adding a BRDF-side contribution here would
-                // double-count those clusters. The proper long-term
-                // fix is a 3-way MIS across env-CDF / extracted-lights
-                // / BRDF; this gating matches the pre-MIS behaviour
-                // at cluster directions (NEE-only) which is unbiased,
-                // and is documented as deferred work in FOLLOW_UPS.
+                // Cluster directions: env-map CDF masks them to 0 AND
+                // extracted-lights NEE samples them every frame on its
+                // own sampler. Adding a BRDF-side contribution would
+                // double-count, so skip. The check happens once here;
+                // pdfEnvMapDir does NOT re-check internally (caller
+                // contract documented above its definition). The
+                // proper long-term fix is a 3-way MIS across
+                // env-CDF / extracted-lights / BRDF.
                 if (!isExtractedClusterDir(rd)) {
+                    // transmittance() matches the NEE-side estimator's
+                    // visibility term (cloud Beer's-law + dielectric
+                    // tint along the bounce direction). Without it the
+                    // BRDF strategy and the NEE strategy estimate
+                    // different integrands, biasing cloudy bounce
+                    // directions bright. ro is already the post-Lambert
+                    // origin (offset by nf*1e-3 from the surface).
                     float pdf_env = pdfEnvMapDir(rd);
                     float w_brdf  = misBalance(prev_lambert_brdf_pdf, pdf_env);
-                    radiance += clampIndirect(throughput * skyColor(rd) * w_brdf);
+                    float3 trans  = transmittance(ro, rd, 1e30);
+                    radiance += clampIndirect(throughput * skyColor(rd) * trans * w_brdf);
                 }
             } else if (!skip_sky_on_miss) {
                 // b == 0 is the camera ray hitting the sky directly --
