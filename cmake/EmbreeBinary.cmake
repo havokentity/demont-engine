@@ -33,11 +33,44 @@ include(${CMAKE_CURRENT_LIST_DIR}/EmbreeConfig.cmake)
 
 set(EMBREE_PREBUILT_FOUND FALSE)
 
+# Multi-config generators on Windows: bail to source-compile.
+#
+# CMAKE_BUILD_TYPE is empty at configure time for multi-config generators
+# (Visual Studio, Xcode, Ninja Multi-Config) -- the consumer picks the
+# config at build time via `cmake --build --config Debug|Release`.  If
+# we proceeded here we'd download whichever artefact maps to "empty
+# build type" (Release, per the default below), then a later `--config
+# Debug` build would link the Release Embree .lib into Debug demont
+# .obj files and hit the exact LNK2038 _ITERATOR_DEBUG_LEVEL /
+# RuntimeLibrary mismatch this PR set out to avoid.
+#
+# Our CMakePresets.json only ships Ninja (single-config), so the
+# project's supported configure paths all set CMAKE_BUILD_TYPE
+# explicitly.  This guard is defensive: if a user runs
+# `cmake -G "Visual Studio 17 2022"` off-script, they fall back to
+# source-compile of Embree (slow but correct) instead of getting the
+# linker error.
+#
+# Mac + Linux don't need this gate (libc++ doesn't have an iterator-
+# debug-level marker, so mixing Release Embree into a multi-config
+# Debug build is benign there), but applying it cross-platform isn't
+# wrong either -- multi-config + multi-prebuilt is a hairball we just
+# don't need to deal with given Ninja covers every real workflow.
+if(WIN32 AND CMAKE_CONFIGURATION_TYPES)
+    message(STATUS
+        "Embree prebuilt: multi-config generator detected on Windows "
+        "(CMAKE_CONFIGURATION_TYPES=${CMAKE_CONFIGURATION_TYPES}); "
+        "falling back to compile-from-source.  Switch to a Ninja-based "
+        "preset (--preset win-clang-release / win-clang-debug) to "
+        "consume the prebuilt instead.")
+    return()
+endif()
+
 # Pick the artefact for the current host + current build type.  Empty
 # string = unsupported platform; fall through to source compile.
-# CMAKE_BUILD_TYPE may be unset (multi-config generators); default to
-# Release for the lookup, same as CMake does when the user doesn't
-# specify a config.
+# CMAKE_BUILD_TYPE may be unset on single-config generators when the
+# user didn't pass -DCMAKE_BUILD_TYPE explicitly; default to Release
+# for the lookup, same as CMake does for unset build-type values.
 #
 # Build type only changes the artefact name on Windows (Release vs
 # Debug Embree must be config-matched because MSVC's STL stamps
