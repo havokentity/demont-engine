@@ -1213,6 +1213,17 @@ void VulkanOptixDenoiser::Encode(VkCommandBuffer cb,
                                                    { cached_w_, cached_h_ });
 
             // Swapchain back to PRESENT_SRC for vkQueuePresentKHR.
+            //
+            // srcStage includes TRANSFER_BIT so the layout transition
+            // is ordered after BOTH the finalize's compute writes AND
+            // any in-flight TRANSFER_READ from
+            // TryRecordSwapchainCapture's vkCmdCopyImageToBuffer above.
+            // With only COMPUTE_SHADER_BIT, the transition could race
+            // the screenshot copy on a strict implementation -- the
+            // present's read of the image still needs to happen-after
+            // the copy completes. Unconditional widening is harmless
+            // when no capture was recorded: no TRANSFER-stage work
+            // means no extra synchronisation.
             VkImageMemoryBarrier swapToPres{};
             swapToPres.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             swapToPres.oldLayout     = VK_IMAGE_LAYOUT_GENERAL;
@@ -1224,7 +1235,7 @@ void VulkanOptixDenoiser::Encode(VkCommandBuffer cb,
             swapToPres.image         = swap_img;
             swapToPres.subresourceRange = swapToGeneral.subresourceRange;
             vkCmdPipelineBarrier(pcb,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                 0, 0, nullptr, 0, nullptr, 1, &swapToPres);
         }
@@ -1248,6 +1259,19 @@ void VulkanOptixDenoiser::DrainCuda() {
 void VulkanOptixDenoiser::SubmitPostMain() {
     if (!pending_post_main_) return;
     pending_post_main_ = false;
+    // Consume-and-reset the swap-capture claim into a local. Mirrors
+    // pending_post_main_'s read-once discipline so any failure path
+    // below (vkQueueWaitIdle, optixDenoiserComputeIntensity,
+    // optixDenoiserInvoke, cudaStreamSynchronize, vkQueueSubmit) leaves
+    // the member cleared instead of leaking the claim into a future
+    // frame -- where it would falsely trigger a PublishSwapchainCaptureConsumed
+    // for a capture whose copy never made it to the GPU. Engine::Tick's
+    // ReadbackSwapchain poll re-arms swap_capture_requested_ each tick
+    // until either a real capture publishes consumed or the ~5s timeout
+    // surfaces the failure, so dropping the claim here is the correct
+    // fallback rather than retrying mid-frame.
+    const bool wants_swap_capture_publish = pending_swap_capture_in_pcb_;
+    pending_swap_capture_in_pcb_ = false;
 
     // V1 sync model: wait for engine cb (and prior private cbs) to
     // finish so buf_color_in_ has the path-tracer's output, run the
@@ -1504,11 +1528,11 @@ void VulkanOptixDenoiser::SubmitPostMain() {
         LOG_WARN("VulkanOptixDenoiser::SubmitPostMain: vkQueueSubmit(private) failed "
                  "(VkResult={})", static_cast<int>(submit_r));
         // Don't publish swap_capture_consumed_ on failure: the staging
-        // buffer's host-readable contents weren't actually written. Clear
-        // the pending flag so a stuck request flag eventually times out
-        // in Engine::Tick's poll loop rather than wedging the next valid
-        // capture.
-        pending_swap_capture_in_pcb_ = false;
+        // buffer's host-readable contents weren't actually written. The
+        // claim was already cleared at SubmitPostMain entry, so the
+        // stuck swap_capture_requested_ flag (re-armed by Engine::Tick's
+        // poll each frame) will either be claimed by a future successful
+        // capture or surface as a ~5s timeout in the poll loop.
         return;
     }
 
@@ -1519,9 +1543,8 @@ void VulkanOptixDenoiser::SubmitPostMain() {
     // will actually wait for the copy to complete. Mirrors the engine
     // cb's publish path in VulkanDevice::Submit (which fires on the
     // SVGF path).
-    if (pending_swap_capture_in_pcb_) {
+    if (wants_swap_capture_publish) {
         device_->PublishSwapchainCaptureConsumed();
-        pending_swap_capture_in_pcb_ = false;
     }
 }
 

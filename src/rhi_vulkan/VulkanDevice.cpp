@@ -2666,8 +2666,19 @@ void VulkanDevice::Submit(CommandBuffer* cb) {
     toPres.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     toPres.subresourceRange.layerCount = 1;
     toPres.subresourceRange.levelCount = 1;
+    // srcStage includes TRANSFER_BIT so the layout transition is
+    // ordered after BOTH the engine's compute writes AND any in-flight
+    // TRANSFER_READ from TryRecordSwapchainCapture's
+    // vkCmdCopyImageToBuffer above. With only COMPUTE_SHADER_BIT,
+    // execution-dependency rules would let the transition race the
+    // copy on a strict implementation -- the layout is GENERAL on both
+    // sides so the layout flip is trivial, but the present's read of
+    // the image still needs to happen-after the copy completes.
+    // Unconditional widening is harmless when no capture was recorded:
+    // no TRANSFER-stage work means no extra synchronisation.
     vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
         0, 0, nullptr, 0, nullptr, 1, &toPres);
 
     vkEndCommandBuffer(cmd);
