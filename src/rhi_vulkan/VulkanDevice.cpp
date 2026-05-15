@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Rajesh D'Monte
 // Vulkan backend, P12 expansion: ray-query, acceleration structures,
 // real CreateBuffer / WriteBuffer / CreateBLAS / CreateTLAS, expanded
-// descriptor set layout (16 bindings) matching the unified PathTrace
+// descriptor set layout (19 bindings) matching the unified PathTrace
 // shader, and per-frame UBO ring for the spilled push-constant tail.
 
 #include "VulkanDevice.h"
@@ -73,17 +73,19 @@ constexpr bool kEnableValidation = false;
 #endif
 
 // Engine slot -> shader vk::binding translation. The unified descriptor
-// set has 18 bindings (0-17): storage_image x10 (output / accum_hdr /
+// set has 19 bindings (0-18): storage_image x10 (output / accum_hdr /
 // denoise_color / depth / motion / env_map / star_map / moon_map /
-// normal_tex / albedo_tex), AS x1 (scene_tlas), storage_buffer x6
-// (mesh / cdf / exposure_state), uniform_buffer x1 (Frame UBO at
-// binding 14). Tonemap / Bloom* re-use a subset. Engine.cpp uses
+// normal_tex / albedo_tex), AS x1 (scene_tlas), storage_buffer x7
+// (mesh / cdf / exposure_state / bvh_nodes), uniform_buffer x1 (Frame
+// UBO at binding 14). Tonemap / Bloom* re-use a subset. Engine.cpp uses
 // up-to-10-element textures, 8-element buffers, and 4-element
 // accel-struct slot arrays as if Metal-style argument tables; we
 // flatten these into the single Vulkan descriptor set here. Engine
 // slot 8 (normal_tex / vk::binding 16) and slot 9 (albedo_tex /
 // vk::binding 17) are Vulkan-only -- the SVGF/NRD path tracer writes
-// normal; only OptiX AOV (optix_hdr_aov) writes albedo.
+// normal; only OptiX AOV (optix_hdr_aov) writes albedo. Engine slot 7
+// (bvh_nodes / vk::binding 18) is populated for the analytic-prim BVH
+// path on either backend.
 static constexpr std::uint32_t kNumTexSlots = 10;
 constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     0,  // engine slot 0 -> shader binding 0  (output / swapchain)
@@ -105,7 +107,7 @@ constexpr std::uint32_t kSlotToBufBinding[8] = {
     10, // engine slot 4 -> shader binding 10 (marginal_cdf)
     11, // engine slot 5 -> shader binding 11 (conditional_cdf)
     15, // engine slot 6 -> shader binding 15 (exposure_state)
-    0,  // engine slot 7 unused
+    18, // engine slot 7 -> shader binding 18 (analytic-prim BVH nodes)
 };
 // Scene TLAS lives at engine accel-slot 2 -> shader binding 2.
 
@@ -255,7 +257,7 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     VkDevice raw_dev = device_->RawDevice();
     auto dset = device_->CurrentDescriptorSet();
 
-    // Build the full descriptor write list. We touch all 18 bindings on
+    // Build the full descriptor write list. We touch all 19 bindings on
     // every dispatch -- nullDescriptor (VK_EXT_robustness2), required at
     // device-create time for this path, means slots the engine didn't
     // bind get VK_NULL_HANDLE silently. The cost of re-writing every
@@ -348,10 +350,12 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
         add_accel(2, a);
     }
 
-    // ---- Storage buffers at bindings 3,4,5,10,11,15 ------------------
+    // ---- Storage buffers at bindings 3,4,5,10,11,15,18 ---------------
     // Slot 6 -> binding 15 is exposure_state (GPU-driven auto-exposure
     // scalar; PathTrace reads, AutoExposure writes).
-    for (std::uint32_t s = 1; s <= 6; ++s) {
+    // Slot 7 -> binding 18 is the analytic-primitive BVH node buffer
+    // (StructuredBuffer<float4> pairs, 32B per BvhNode).
+    for (std::uint32_t s = 1; s <= 7; ++s) {
         VkBuffer b = device_->LookupBuffer(bound_buf_[s]);
         VkDeviceSize sz = (b == VK_NULL_HANDLE) ? 0 : VK_WHOLE_SIZE;
         add_buffer(kSlotToBufBinding[s], b, bound_buf_off_[s], sz,
@@ -847,7 +851,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     std::array<VkDescriptorPoolSize, 4> psizes{};
     psizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kFramesInFlight * 10 + 4 };
     psizes[1] = { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, kFramesInFlight * 1 + 1 };
-    psizes[2] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kFramesInFlight * 6 + 4 };
+    psizes[2] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kFramesInFlight * 7 + 4 };
     psizes[3] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,          kFramesInFlight * 1 + 1 };
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -858,9 +862,9 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
                        | VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
     vkCreateDescriptorPool(device_, &dpci, nullptr, &dpool_);
 
-    // ---- Build the unified 18-binding descriptor set layout ----------
+    // ---- Build the unified 19-binding descriptor set layout ----------
     {
-        std::array<VkDescriptorSetLayoutBinding, 18> b{};
+        std::array<VkDescriptorSetLayoutBinding, 19> b{};
         auto fill = [&](std::uint32_t idx, std::uint32_t binding,
                         VkDescriptorType type) {
             b[idx].binding         = binding;
@@ -896,11 +900,13 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         fill(16, 16, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
         // binding 17: albedo_tex (path tracer G-buffer for OptiX AOV only)
         fill(17, 17, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        // binding 18: bvh_nodes (analytic-prim BVH flat node array)
+        fill(18, 18, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
 
         // UPDATE_AFTER_BIND for every binding so we can rewrite the
         // shared descriptor set between dispatches in the same cmd
         // buffer without invalidating earlier recorded draws.
-        std::array<VkDescriptorBindingFlags, 18> bind_flags{};
+        std::array<VkDescriptorBindingFlags, 19> bind_flags{};
         for (auto& f : bind_flags) f = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
         VkDescriptorSetLayoutBindingFlagsCreateInfo bfci{};
         bfci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
@@ -915,7 +921,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         dslci.pBindings    = b.data();
         if (vkCreateDescriptorSetLayout(device_, &dslci, nullptr,
                                         &shared_dset_layout_) != VK_SUCCESS) {
-            LOG_ERROR("vkCreateDescriptorSetLayout (16-binding) failed");
+            LOG_ERROR("vkCreateDescriptorSetLayout (19-binding) failed");
             return;
         }
 

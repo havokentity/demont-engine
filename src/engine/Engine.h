@@ -4,6 +4,7 @@
 
 #include "../app/Window.h"
 #include "../core/Jobs/JobSystem.h"
+#include "../renderer/AnalyticBvh.h"
 #include "../rhi/Types.h"
 #include "LensFlare.h"
 
@@ -165,10 +166,23 @@ private:
     // Analytic primitives (sphere/plane) -- ordered by user id, uploaded
     // to a storage buffer when dirty. Mesh CSG and analytic primitives
     // are independent; the unified renderer takes the closest hit.
+    //
+    // Upload-time partition: primitives with infinite extent (planes)
+    // go to the front of the buffer and are always linearly scanned in
+    // the shader. Finite-extent primitives (spheres today, future
+    // box/disk/cylinder) follow and are either scanned linearly
+    // (sphere count below r_analytic_bvh_threshold) or traversed via
+    // the CPU-built BVH in `analytic_bvh_` / `bvh_node_buffer_id_`
+    // (count at or above threshold). linear_prim_count_ records the
+    // boundary so the shader can dispatch the two paths.
     std::map<std::uint32_t, AnalyticPrim>       primitives_;
     bool                                        primitives_dirty_      = true;
     std::uint64_t                               prim_buffer_id_        = 0;
     std::uint32_t                               prim_buffer_capacity_  = 0;  // primitives that fit
+    std::uint32_t                               linear_prim_count_     = 0;
+    pt::renderer::AnalyticBvh                   analytic_bvh_;
+    std::uint64_t                               bvh_node_buffer_id_       = 0;
+    std::uint32_t                               bvh_node_buffer_capacity_ = 0;  // nodes that fit
 
     std::uint64_t                               pathtrace_pipeline_id_ = 0;
     std::uint64_t                               tonemap_pipeline_id_   = 0;

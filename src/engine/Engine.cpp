@@ -203,6 +203,19 @@ namespace cvar {
             "on the denoiser does its own (smarter, motion-vector-aware) "
             "temporal reuse and this value is ignored.",
             CVAR_ARCHIVE);
+    PT_CVAR(r_analytic_bvh_threshold, "16",
+            "Minimum finite analytic-primitive count at which the engine "
+            "switches the closest-hit search from a linear scan to a "
+            "CPU-built binary BVH (uploaded as a storage buffer, traversed "
+            "iteratively in the shader). Below this count the per-pixel "
+            "linear loop wins on GPUs because BVH traversal overhead "
+            "dominates with few primitives. Planes are always linear-"
+            "tested (infinite extent excludes them from the BVH); only "
+            "finite primitives (spheres today) count toward the threshold. "
+            "Set high (e.g. 1024) to force linear-only for A/B; set low "
+            "(e.g. 1) to force the BVH path always. Takes effect on next "
+            "primitives_dirty rebuild.",
+            CVAR_ARCHIVE);
     PT_CVAR(r_mis,             "1",
             "Multiple importance sampling for direct lighting on Lambert "
             "hits under HDRI. 1 = balance-heuristic MIS between env-map "
@@ -697,6 +710,7 @@ void Engine::TearDownDevice() {
         if (box_vbuf_id_          != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{box_vbuf_id_});
         if (box_ibuf_id_          != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{box_ibuf_id_});
         if (prim_buffer_id_       != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{prim_buffer_id_});
+        if (bvh_node_buffer_id_   != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{bvh_node_buffer_id_});
         if (denoise_color_tex_id_    != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
         if (depth_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
         if (motion_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
@@ -723,6 +737,9 @@ void Engine::TearDownDevice() {
     box_ibuf_id_          = 0;
     prim_buffer_id_       = 0;
     prim_buffer_capacity_ = 0;
+    bvh_node_buffer_id_       = 0;
+    bvh_node_buffer_capacity_ = 0;
+    linear_prim_count_        = 0;
     denoise_color_tex_id_    = 0;
     depth_tex_id_            = 0;
     motion_tex_id_           = 0;
@@ -1499,35 +1516,146 @@ void Engine::EnsurePrimitivesUploaded() {
     }
 
     if (count == 0) {
-        primitives_dirty_ = false;
-        accum_dirty_      = true;
+        linear_prim_count_ = 0;
+        analytic_bvh_      = pt::renderer::AnalyticBvh{};
+        primitives_dirty_  = false;
+        accum_dirty_       = true;
         return;
     }
 
-    // Pack into a temporary float vector matching the shader layout:
-    //   v0 = (xyz: pos/normal,  w: radius/d)
-    //   v1 = (rgb: albedo,      a: roughness)
-    //   v2 = (x: type,  y: mat, z: ior, w: pad)
-    std::vector<float> packed(std::size_t(count) * kFloatsPerPrim, 0.0f);
-    std::size_t offset = 0;
+    // Partition primitives into two ordered lists:
+    //   - infinite (planes, ...): linear-tested at the front of the buffer.
+    //   - finite   (spheres, ...): candidates for the BVH path; if the
+    //     count crosses r_analytic_bvh_threshold we build a CPU BVH over
+    //     them, otherwise they're appended for linear traversal.
+    // PRIM_PLANE in the shader is type 1; PRIM_SPHERE is 0. The
+    // AnalyticPrim::type field matches.
+    constexpr std::uint32_t kPrimPlane  = 1u;
+
+    std::vector<const AnalyticPrim*> infinite_prims;
+    std::vector<const AnalyticPrim*> finite_prims;
+    infinite_prims.reserve(count);
+    finite_prims.reserve(count);
     for (const auto& [id, p] : primitives_) {
-        packed[offset + 0] = p.pos_or_n[0];
-        packed[offset + 1] = p.pos_or_n[1];
-        packed[offset + 2] = p.pos_or_n[2];
-        packed[offset + 3] = p.radius_or_d;
-        packed[offset + 4] = p.albedo[0];
-        packed[offset + 5] = p.albedo[1];
-        packed[offset + 6] = p.albedo[2];
-        packed[offset + 7] = p.roughness;
-        packed[offset + 8]  = static_cast<float>(p.type);
-        packed[offset + 9]  = static_cast<float>(p.material);
-        packed[offset + 10] = p.ior;
-        packed[offset + 11] = 0.0f;
-        offset += kFloatsPerPrim;
+        if (p.type == kPrimPlane) infinite_prims.push_back(&p);
+        else                       finite_prims.push_back(&p);
+    }
+
+    // Decide whether to build the BVH. Default threshold is 16 finite
+    // primitives -- below that the per-pixel linear loop beats BVH
+    // setup + traversal overhead on GPU. The cvar lets the user tune
+    // empirically per scene.
+    std::uint32_t bvh_threshold = 16u;
+    if (auto* v = pt::console::Console::Get().FindCVar("r_analytic_bvh_threshold")) {
+        const int t = v->GetInt();
+        if (t > 0) bvh_threshold = static_cast<std::uint32_t>(t);
+    }
+
+    std::vector<std::uint32_t> finite_order;       // index into finite_prims after BVH reordering
+    finite_order.resize(finite_prims.size());
+    for (std::uint32_t i = 0; i < finite_prims.size(); ++i) finite_order[i] = i;
+
+    const bool build_bvh = static_cast<std::uint32_t>(finite_prims.size()) >= bvh_threshold;
+    if (build_bvh) {
+        std::vector<pt::renderer::BvhPrim> bvh_input;
+        bvh_input.reserve(finite_prims.size());
+        for (std::uint32_t i = 0; i < finite_prims.size(); ++i) {
+            const AnalyticPrim& p = *finite_prims[i];
+            pt::renderer::BvhPrim bp{};
+            bp.center[0] = p.pos_or_n[0];
+            bp.center[1] = p.pos_or_n[1];
+            bp.center[2] = p.pos_or_n[2];
+            // Sphere bounding radius = radius. Future finite types
+            // (box, disk, cylinder) should compute a bounding-sphere
+            // radius here from their extent.
+            bp.radius    = p.radius_or_d;
+            bp.prim_id   = i;
+            bvh_input.push_back(bp);
+        }
+        analytic_bvh_.Build(bvh_input);
+        finite_order = analytic_bvh_.PermutedPrimIds();
+    } else {
+        analytic_bvh_ = pt::renderer::AnalyticBvh{};
+    }
+
+    linear_prim_count_ = static_cast<std::uint32_t>(infinite_prims.size());
+
+    // Pack into the shader buffer in two segments:
+    //   [0..linear_prim_count_)               : infinite prims (planes)
+    //   [linear_prim_count_..count)           : finite prims, reordered to match
+    //                                            BVH leaf order (if BVH built)
+    //                                            or in arbitrary order (linear path)
+    std::vector<float> packed(std::size_t(count) * kFloatsPerPrim, 0.0f);
+    auto pack_prim = [&](std::size_t out_idx, const AnalyticPrim& p) {
+        std::size_t off = out_idx * kFloatsPerPrim;
+        packed[off + 0]  = p.pos_or_n[0];
+        packed[off + 1]  = p.pos_or_n[1];
+        packed[off + 2]  = p.pos_or_n[2];
+        packed[off + 3]  = p.radius_or_d;
+        packed[off + 4]  = p.albedo[0];
+        packed[off + 5]  = p.albedo[1];
+        packed[off + 6]  = p.albedo[2];
+        packed[off + 7]  = p.roughness;
+        packed[off + 8]  = static_cast<float>(p.type);
+        packed[off + 9]  = static_cast<float>(p.material);
+        packed[off + 10] = p.ior;
+        packed[off + 11] = 0.0f;
+    };
+    for (std::size_t i = 0; i < infinite_prims.size(); ++i) {
+        pack_prim(i, *infinite_prims[i]);
+    }
+    for (std::size_t i = 0; i < finite_order.size(); ++i) {
+        pack_prim(linear_prim_count_ + i, *finite_prims[finite_order[i]]);
     }
     device_->WriteBuffer(pt::rhi::BufferHandle{prim_buffer_id_},
                          packed.data(), packed.size() * sizeof(float));
 
+    // Upload BVH node buffer if a tree was built. Node stride is 32B
+    // (matches the shader struct's std430 layout). We grow by powers
+    // of two like the primitive buffer.
+    if (build_bvh && !analytic_bvh_.Empty()) {
+        const std::uint32_t needed_nodes = static_cast<std::uint32_t>(analytic_bvh_.NodeCount());
+        if (needed_nodes > bvh_node_buffer_capacity_) {
+            std::uint32_t new_cap = bvh_node_buffer_capacity_ ? bvh_node_buffer_capacity_ : 64u;
+            while (new_cap < needed_nodes) new_cap *= 2u;
+            if (bvh_node_buffer_id_ != 0) {
+                device_->WaitIdle();
+                device_->DestroyBuffer(pt::rhi::BufferHandle{bvh_node_buffer_id_});
+                bvh_node_buffer_id_ = 0;
+            }
+            auto buf = device_->CreateBuffer({
+                .size = std::size_t(new_cap) * sizeof(pt::renderer::BvhNode),
+                .usage = pt::rhi::BufferUsage::Storage,
+                .debug_name = "analytic_bvh_nodes",
+            });
+            if (buf.id == 0) {
+                LOG_ERROR("BVH node buffer allocation failed (capacity {})", new_cap);
+                // Fall back to linear scan -- clear the BVH so the
+                // shader path doesn't try to traverse missing data.
+                analytic_bvh_ = pt::renderer::AnalyticBvh{};
+            } else {
+                bvh_node_buffer_id_       = buf.id;
+                bvh_node_buffer_capacity_ = new_cap;
+            }
+        }
+        if (!analytic_bvh_.Empty() && bvh_node_buffer_id_ != 0) {
+            device_->WriteBuffer(pt::rhi::BufferHandle{bvh_node_buffer_id_},
+                                 analytic_bvh_.Nodes().data(),
+                                 analytic_bvh_.NodeCount() * sizeof(pt::renderer::BvhNode));
+        }
+    }
+
+    LOG_INFO("[bvh] uploaded {} prim(s): {} linear (planes etc), {} finite ({}, {} BVH nodes)",
+             count, linear_prim_count_, count - linear_prim_count_,
+             analytic_bvh_.Empty() ? "linear scan" : "BVH",
+             analytic_bvh_.Empty() ? 0u : static_cast<std::uint32_t>(analytic_bvh_.NodeCount()));
+    if (!analytic_bvh_.Empty() && analytic_bvh_.NodeCount() > 0) {
+        const auto& n0 = analytic_bvh_.Nodes()[0];
+        LOG_INFO("[bvh] root node aabb=[{:.2f},{:.2f},{:.2f} .. {:.2f},{:.2f},{:.2f}] left_first={} count={}",
+                 n0.aabb_min[0], n0.aabb_min[1], n0.aabb_min[2],
+                 n0.aabb_max[0], n0.aabb_max[1], n0.aabb_max[2],
+                 n0.left_first, n0.count);
+    }
     primitives_dirty_ = false;
     accum_dirty_      = true;
 }
@@ -1999,6 +2127,17 @@ void Engine::RenderFrame() {
     if (exposure_state_id_ != 0) {
         cb->BindBuffer(6, pt::rhi::BufferHandle{exposure_state_id_}, 0);
     }
+    // Analytic-primitive BVH nodes at slot 7. The shader only reads
+    // this buffer when push.bvh_params.y > 0 (i.e. the engine built a
+    // tree); but the binding must always resolve to a real buffer for
+    // the same reason slot 4/5 do (Metal's dynamic slot assignment
+    // depends on max-bound + 1 of the contiguous range -- leaving 7
+    // unbound would shift the push slot). When no BVH is built we
+    // re-use the primitive buffer as a harmless placeholder.
+    pt::rhi::BufferHandle slot7 = (bvh_node_buffer_id_ != 0)
+        ? pt::rhi::BufferHandle{bvh_node_buffer_id_}
+        : pt::rhi::BufferHandle{prim_buffer_id_};
+    if (slot7.id != 0) cb->BindBuffer(7, slot7, 0);
     // P10 G-buffer texture binds. The shader's vk::binding numbers (6/7/8)
     // are Vulkan descriptor slots; on Metal Slang assigns texture(N) in
     // declaration order, so output/accum/denoise_color/depth/motion/env
@@ -2180,6 +2319,19 @@ void Engine::RenderFrame() {
         //   .y/.z/.w reserved for future accum-side knobs (e.g. variance
         //   clamp, max-sample cap, motion-vector reproject weight).
         float accum_params[4];
+        // Analytic-primitive traversal params (hybrid linear / BVH).
+        //   .x = linear_prim_count -- # of always-linear-tested prims
+        //        at the front of `primitives` (infinite-extent prims:
+        //        planes; future: explicit-skip toggles).
+        //   .y = bvh_node_count    -- 0 disables the BVH path; >0
+        //        enables iterative BVH traversal over the remaining
+        //        prims at [linear_prim_count, prim_count). Root node
+        //        always at bvh_nodes[0]. Built by AnalyticBvh on
+        //        EnsurePrimitivesUploaded when the finite-prim count
+        //        meets r_analytic_bvh_threshold.
+        //   .z/.w reserved for future BVH-side knobs (leaf size,
+        //   builder selection).
+        std::uint32_t bvh_params[4];
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -2239,6 +2391,14 @@ void Engine::RenderFrame() {
         push.accum_params[1] = 0.0f;
         push.accum_params[2] = 0.0f;
         push.accum_params[3] = 0.0f;
+    }
+    {
+        push.bvh_params[0] = linear_prim_count_;
+        push.bvh_params[1] = analytic_bvh_.Empty()
+            ? 0u
+            : static_cast<std::uint32_t>(analytic_bvh_.NodeCount());
+        push.bvh_params[2] = 0u;
+        push.bvh_params[3] = 0u;
     }
 
     // Halton(2,3) sub-pixel jitter sequence in [-0.5, 0.5] each axis.
@@ -2595,7 +2755,7 @@ void Engine::RenderFrame() {
         push.clouds_p3[3] = rayleigh;
     }
 
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 128 + 128 + 16 + 16);
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 128 + 128 + 16 + 16 + 16);
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
 
@@ -4888,6 +5048,17 @@ void Engine::RegisterCommands() {
     // samples together (same precedent as r_env_intensity above).
     if (auto* v = C.FindCVar("r_mis")) {
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    // r_analytic_bvh_threshold changes the linear/BVH split decision;
+    // mark primitives_dirty_ so EnsurePrimitivesUploaded re-runs the
+    // partition + (re)builds or tears down the BVH accordingly.
+    // accum_dirty_ follows (re-ordering the primitive buffer changes
+    // hit-test order, so per-frame radiance can shift fractionally).
+    if (auto* v = C.FindCVar("r_analytic_bvh_threshold")) {
+        v->on_change = [this](const pt::console::CVar&) {
+            primitives_dirty_ = true;
+            accum_dirty_      = true;
+        };
     }
     // r_accum_ema_alpha switches the accumulator update rule (online
     // running mean vs EMA blend); reusing history captured under the
