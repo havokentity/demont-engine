@@ -142,6 +142,39 @@ set(EMBREE_RAY_PACKETS              OFF CACHE BOOL   "" FORCE)
 set(EMBREE_FILTER_FUNCTION          OFF CACHE BOOL   "" FORCE)
 set(EMBREE_BACKFACE_CULLING         OFF CACHE BOOL   "" FORCE)
 set(EMBREE_ZIP_MODE                 OFF CACHE BOOL   "" FORCE)
+# ISA matrix: target hardware floor is AMD Ryzen 9 5950X (Zen 3, 2020) /
+# Intel Rocket Lake i9-11900K (2021) or equivalent.  Every CPU in that
+# class has AVX2, so the SSE2 / SSE4.2 / AVX variants Embree builds by
+# default are pure dead code on real demont users -- they exist only
+# to support pre-2013 hardware that can't run Vulkan / Metal anyway.
+# AVX-512 is gated on PT_ENABLE_AVX512_EMBREE (default OFF, see top-level
+# CMakeLists.txt): Zen 3 (5950X) doesn't have it at all, and Intel fused
+# it off in microcode on Alder Lake and every consumer chip since, so
+# AVX-512 isn't ubiquitous on consumer hardware -- default builds skip
+# the +~25% build cost.  Workstation users on Zen 4+ (Ryzen 7000+),
+# Threadripper, Xeon Skylake+, Rocket Lake (i9-11900K), and HEDT chips
+# flip the flag on and get ~30-50% BVH traversal perf via Embree's
+# 16-wide BVH16 intersector.
+#
+# The whole x86 ISA block is gated on CMAKE_SYSTEM_PROCESSOR matching
+# x86 -- on ARM hosts (Apple Silicon, ARM Linux), Embree's CMake auto-
+# selects NEON via its EMBREE_ARM detection path and leaves the x86
+# flags at OFF.  Forcing EMBREE_ISA_AVX2 ON unconditionally would
+# trip Embree's "static lib + multiple ISAs + AppleClang >= 9.0"
+# guard (NUMISA=2 from NEON + AVX2 on Apple Silicon), failing the
+# configure step.  Gating keeps both consumer x86 builds and Apple
+# Silicon happy without per-ISA-flag conditional sprawl.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86|amd64|AMD64")
+    set(EMBREE_ISA_SSE2             OFF CACHE BOOL   "" FORCE)
+    set(EMBREE_ISA_SSE42            OFF CACHE BOOL   "" FORCE)
+    set(EMBREE_ISA_AVX              OFF CACHE BOOL   "" FORCE)
+    set(EMBREE_ISA_AVX2             ON  CACHE BOOL   "" FORCE)
+    if(PT_ENABLE_AVX512_EMBREE)
+        set(EMBREE_ISA_AVX512       ON  CACHE BOOL   "" FORCE)
+    else()
+        set(EMBREE_ISA_AVX512       OFF CACHE BOOL   "" FORCE)
+    endif()
+endif()
 FetchContent_Declare(embree
     URL           https://github.com/RenderKit/embree/archive/refs/tags/v4.4.0.tar.gz
     URL_HASH      SHA256=acb517b0ea0f4b442235d5331b69f96192c28da6aca5d5dde0cbe40799638d5c
