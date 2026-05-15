@@ -306,6 +306,13 @@ private:
     glm::mat4                                   prev_view_proj_        { 1.0f };  // identity
     bool                                        prev_view_proj_valid_  = false;
     bool                                        denoiser_active_       = false;
+    // One-shot state-transition latch for the Vulkan + SVGF/NRD bloom
+    // path (built in PR for feature/vulkan-bloom-svgf-nrd). True from
+    // the frame the predicate first goes hot until it goes cold; lets
+    // us log "engaged"/"disengaged" exactly once per toggle instead of
+    // every frame. The predicate itself is recomputed in Tick(), this
+    // is purely the edge-detect memory.
+    bool                                        vulkan_pre_denoise_bloom_engaged_ = false;
     // Which denoiser kind the active backend is running. metalfx is
     // Mac-only; svgf_basic/svgf_atrous/nrd route through the in-house
     // SVGF chain on EITHER backend -- VulkanNrdDenoiser on Vulkan,
