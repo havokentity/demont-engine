@@ -92,11 +92,21 @@ jobs:
           generate_release_notes: true
 
   windows-release:
-    name: Windows (x64, MSVC) -- release artefact
+    name: Windows (x64, clang-cl) -- release artefact
     # Mirrors the build.yml Windows job (compile-test) but in Release
     # config + staging an artefact tarball, parallel with the macOS
     # release job.  windows-latest gets cmake, MSVC via the action
-    # below, and the Vulkan SDK pinned to a known-good LunarG release.
+    # below (we keep that step for the SDK headers + linker), and the
+    # Vulkan SDK pinned to a known-good LunarG release.
+    #
+    # Release builds use the win-clang-release preset (clang-cl on top
+    # of the MSVC toolchain) rather than plain MSVC. Embree compiles 4
+    # ISA variants (SSE2 / SSE4.2 / AVX / AVX2) of every kernel for
+    # runtime CPU dispatch -- ~250k LOC of templated C++ that MSVC
+    # ground through in ~20min on the first cold build of v0.3.15.
+    # clang-cl typically halves that on template-heavy code, and it
+    # uses the same MSVC ABI / SDK headers so the resulting demont.exe
+    # is binary-compatible with what users expect on Windows.
     runs-on: windows-latest
     permissions:
       contents: write
@@ -117,9 +127,12 @@ jobs:
           }
 
       - name: Set up MSVC
-        # Configures cl.exe / link.exe / SDK headers on PATH for cmake's
-        # Ninja generator.  Required on windows-latest -- the MSVC
-        # toolchain isn't on PATH by default.
+        # Configures the MSVC toolchain (SDK headers + link.exe + lib
+        # paths) on the environment.  Required on windows-latest -- the
+        # MSVC toolchain isn't on PATH by default.  We don't actually
+        # compile with cl.exe here (the preset selects clang-cl) but
+        # clang-cl piggy-backs on MSVC's headers + linker so this step
+        # is still required.
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
@@ -138,13 +151,27 @@ jobs:
           cache: true
           stripdown: true
 
+      - name: Verify clang-cl is on PATH
+        # windows-latest ships LLVM at C:\Program Files\LLVM\bin so
+        # clang-cl.exe should already resolve.  Failing the job early
+        # with a clear error beats a confusing CMake "compiler not
+        # found" later in Configure if Microsoft ever changes that.
+        shell: pwsh
+        run: |
+          $clangCl = Get-Command clang-cl -ErrorAction SilentlyContinue
+          if (-not $clangCl) {
+            Write-Error "clang-cl.exe not found on PATH. windows-latest used to ship LLVM under C:\Program Files\LLVM\bin -- check whether that's still the case."
+            exit 1
+          }
+          clang-cl --version
+
       - name: Configure (release)
         shell: pwsh
-        run: cmake --preset win-release
+        run: cmake --preset win-clang-release
 
       - name: Build
         shell: pwsh
-        run: cmake --build build/win-release --parallel
+        run: cmake --build build/win-clang-release --parallel
 
       - name: Stage artefact tree
         # Stage just what an end-user actually needs to run the engine
@@ -156,7 +183,7 @@ jobs:
         run: |
           $stage = "demont-${{ steps.tag.outputs.value }}-windows-x64"
           New-Item -ItemType Directory -Force -Path "dist/$stage" | Out-Null
-          Copy-Item "build/win-release/src/app/demont.exe"  "dist/$stage/"
+          Copy-Item "build/win-clang-release/src/app/demont.exe"  "dist/$stage/"
           Copy-Item -Recurse "assets"                       "dist/$stage/"
           Copy-Item "LICENSE"                               "dist/$stage/"
           Copy-Item "README.md"                             "dist/$stage/"
