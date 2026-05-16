@@ -46,10 +46,14 @@ option(PT_ENABLE_SANITIZERS     "Enable -fsanitize=address,undefined in Debug" O
 # AVX-512 perf on their own machine) can flip this OFF in their cmake
 # invocation.
 option(PT_ENABLE_AVX512_EMBREE  "Enable AVX-512 build of Embree (runtime-dispatched; +~25% build time)" ON)
-# Unit tests. Default ON for developer builds; CI passes
-# -DPT_BUILD_TESTS=OFF when shipping release artefacts where the test
-# binaries shouldn't appear alongside `demont` in the bundle. doctest is
-# small + header-only so the configure-time cost is negligible.
+# Unit tests. Default ON for developer builds. The option exists for
+# anyone wanting to trim configure time on a build that genuinely
+# can't run tests (CI release-staging step, embedded systems, etc.) --
+# pass -DPT_BUILD_TESTS=OFF to skip the doctest fetch + tests/ subtree.
+# release.yml doesn't pass this today (the release artefact only copies
+# build/<preset>/src/app/demont so the test binaries don't ship
+# regardless). doctest is single-header so the configure-time cost is
+# small either way.
 option(PT_BUILD_TESTS           "Build unit tests via doctest"          ON)
 
 # --- Compiler/warning helper -----------------------------------------------
