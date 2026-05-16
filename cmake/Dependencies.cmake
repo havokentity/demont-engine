@@ -169,7 +169,31 @@ FetchContent_Declare(manifold
     SYSTEM
 )
 
+# --- doctest: unit test framework (header-only) ----------------------------
+# Single-header testing framework. Fast compile (the framework header
+# itself is ~7000 lines but only the TU declaring DOCTEST_CONFIG_IMPLEMENT
+# pays the framework-implementation parse cost), MIT licensed, supports
+# the usual TEST_CASE / SUBCASE / CHECK / REQUIRE / SECTION idioms. Picked
+# over Catch2 / GoogleTest specifically because the compile-time overhead
+# is much lower -- meaningful when test TUs proliferate across the
+# pt_math / pt_csg / pt_renderer / pt_console modules.
+#
+# Only fetched when PT_BUILD_TESTS is ON (default ON; CI release builds
+# pass -DPT_BUILD_TESTS=OFF). Gating it here avoids paying the (small)
+# FetchContent populate cost on configures that don't need tests.
+if(PT_BUILD_TESTS)
+    FetchContent_Declare(doctest
+        URL           https://github.com/doctest/doctest/archive/refs/tags/v2.4.11.tar.gz
+        URL_HASH      SHA256=632ed2c05a7f53fa961381497bf8069093f0d6628c5f26286161fbd32a560186
+        SYSTEM
+    )
+endif()
+
 FetchContent_MakeAvailable(glm fmt mimalloc glfw enkits civetweb tomlplusplus nlohmann_json)
+
+if(PT_BUILD_TESTS)
+    FetchContent_MakeAvailable(doctest)
+endif()
 
 # Cross-platform flags for silencing third-party warnings.  Vendored
 # libraries (Embree's kernels, civetweb's sha1.inl, Tracy's sprintf use,

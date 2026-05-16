@@ -46,6 +46,11 @@ option(PT_ENABLE_SANITIZERS     "Enable -fsanitize=address,undefined in Debug" O
 # AVX-512 perf on their own machine) can flip this OFF in their cmake
 # invocation.
 option(PT_ENABLE_AVX512_EMBREE  "Enable AVX-512 build of Embree (runtime-dispatched; +~25% build time)" ON)
+# Unit tests. Default ON for developer builds; CI passes
+# -DPT_BUILD_TESTS=OFF when shipping release artefacts where the test
+# binaries shouldn't appear alongside `demont` in the bundle. doctest is
+# small + header-only so the configure-time cost is negligible.
+option(PT_BUILD_TESTS           "Build unit tests via doctest"          ON)
 
 # --- Compiler/warning helper -----------------------------------------------
 include(cmake/CompilerWarnings.cmake)
@@ -130,3 +135,12 @@ include(cmake/Dependencies.cmake)
 
 # --- Sources ----------------------------------------------------------------
 add_subdirectory(src)
+
+# --- Tests ------------------------------------------------------------------
+# enable_testing() must be in the top-level CMakeLists so `ctest` from the
+# build root finds the tests. tests/CMakeLists.txt defines per-test
+# executables + their add_test() registrations.
+if(PT_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
