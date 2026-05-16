@@ -44,6 +44,21 @@
 #include <numeric>
 #include <sstream>    // std::istringstream for cam_load slot parsing
 #include <thread>
+#include <vector>     // std::vector<char> command-line buffer for RestartProcess
+
+// <windows.h> is included only for RecreateWindow's restart-prompt and
+// the user-facing MessageBoxW + CreateProcessA + GetModuleFileNameA
+// calls. NOMINMAX prevents <windows.h>'s min/max macros from colliding
+// with std::min/std::max used elsewhere in this TU.
+#if defined(_WIN32)
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#endif
 
 namespace pt::engine {
 
@@ -136,6 +151,27 @@ namespace cvar {
     // safe only for software-fresh-start sessions. The cvar takes
     // effect on the next backend (re)initialise. No-op on Mac/Linux.
     PT_CVAR(r_software_blit,   "vulkan",   "Software backend present path on Windows: vulkan (default; spec-compliant across all backend switches; minimal extra VkInstance) | gdi (legacy SetDIBitsToDevice; broken after vulkan -> software switch per Microsoft DXGI flip-model lockout). No-op on Mac/Linux.", CVAR_ARCHIVE);
+    // r_software_blit_recreate selects the behaviour when the vulkan ->
+    // software switch happens with r_software_blit=gdi (the DXGI flip-
+    // model lockout scenario; see r_software_blit docs above and the
+    // dispatch site in RequestBackendSwitch).
+    //   auto   = (default) recreate the GLFW window / HWND in-process
+    //            so the new HWND has never been a Vulkan present target
+    //            and accepts GDI writes. Preserves engine state (cvars,
+    //            console history, CSG scene, camera). Visible as a
+    //            brief window flicker at the switch moment.
+    //   prompt = pop a MessageBox asking the user whether to restart
+    //            the process. Yes spawns a fresh demont.exe with the
+    //            original argv and exits the current one; No falls back
+    //            to the warn path.
+    //   warn   = today's legacy behaviour: emit a LOG_WARN, leave the
+    //            window stuck on the last Vulkan frame, require the
+    //            user to quit + relaunch manually.
+    // No-op on Mac/Linux -- the lockout is Microsoft-DXGI-specific.
+    // Takes effect on the next such switch.
+    PT_CVAR(r_software_blit_recreate, "auto",
+            "Win32 only: behaviour when r_backend switches vulkan -> software with r_software_blit=gdi. auto (default) = in-process HWND recreate so GDI works on the fresh HWND | prompt = MessageBox Restart Now? (Yes spawns fresh process with original argv) | warn = legacy LOG_WARN, manual restart. No-op on Mac/Linux.",
+            CVAR_ARCHIVE);
     PT_CVAR(r_max_bounces,     "8",  "Max path bounces per ray",          CVAR_ARCHIVE);
     PT_CVAR(r_spp,             "1",  "Samples per pixel per dispatch (>=1). Higher = cleaner motion frames at proportional GPU cost.", CVAR_ARCHIVE);
     PT_CVAR(r_firefly_clamp,   "10",  "Per-contribution firefly clamp (per-channel ceiling on each indirect light contribution: env-NEE, ambient skylight, bounce-to-sky). Suppresses single-sample spikes from BSDF-sampled bounces hitting an HDRI sun pixel, while leaving camera-direct sky unbounded so the sun renders at full intensity. ACES saturates anything above ~5 to ~1.0 for SDR, so 10 preserves visible highlights and kills fireflies. 0 disables.", CVAR_ARCHIVE);
@@ -590,6 +626,16 @@ bool Engine::Init() {
             overlay_ = std::make_unique<pt::app::ConsoleOverlay>();
             if (overlay_->Init(window_->NativeHandle())) {
                 pt::log::AddSink(&pt::app::ConsoleOverlay::OnLog);
+                // P11 persistence: restore the previous session's
+                // up-arrow history + scrollback. Single-shot: call
+                // exactly once per process, here at Engine::Init's
+                // overlay-attach site. A repeated call would re-append
+                // the "previous session" separator block on top of
+                // already-loaded entries; the Win32 LoadState impl
+                // doesn't guard against that. Missing file is fine
+                // (first launch, deleted file). Mac + Linux overlays
+                // return false (no-op).
+                overlay_->LoadState("demont_console.state");
             } else {
                 overlay_.reset();
             }
@@ -799,6 +845,14 @@ void Engine::Shutdown() {
         LOG_WARN("could not write demont.cfg");
     }
 
+    // P11 persistence: dump up-arrow history + scrollback so the next
+    // Engine startup (cold launch or prompt-restart replacement) can
+    // pick them back up. Mac + Linux overlays return false (no-op);
+    // Win32 actually writes. Failure here is non-fatal (logged inside
+    // SaveState). Done BEFORE RemoveAllSinks + overlay->Shutdown so
+    // both the in-memory deques and the log sink are still wired.
+    if (overlay_) overlay_->SaveState("demont_console.state");
+
     pt::log::RemoveAllSinks();
     if (overlay_) overlay_->Shutdown();
     overlay_.reset();
@@ -940,25 +994,188 @@ void Engine::RequestBackendSwitch(BackendType to) {
     // the window stuck on the last Vulkan frame for the rest of the
     // session (Microsoft DXGI flip-model lockout, see Vulkan
     // VK_KHR_win32_surface spec note + Microsoft DXGI flip-model docs).
-    // Warn at the actual switch moment, not just at cvar on_change,
-    // so users who saved r_software_blit=gdi in cfg get the warning
-    // when it's most actionable (right before the visual breaks).
+    // r_software_blit_recreate selects how we handle this:
+    //   - "auto"   : RecreateWindow() -- destroy + recreate the HWND
+    //                in-process so the new HWND has never been a
+    //                Vulkan present target (preserves engine state)
+    //   - "prompt" : MessageBox Restart Now? -- Yes spawns a fresh
+    //                process; No falls back to warn
+    //   - "warn"   : legacy LOG_WARN; user manually relaunches
+    // Decision is recorded BEFORE TearDownDevice runs so we can short-
+    // circuit the prompt path (Yes -> spawn + set wants_quit_, return
+    // without touching the device -- the main loop's normal teardown
+    // path runs as the loop exits).
+    bool need_recreate = false;
+    bool need_warn     = false;
     if (to == BackendType::Software &&
         current_backend_ == BackendType::Vulkan) {
         if (auto* v = pt::console::Console::Get().FindCVar("r_software_blit");
             v && v->value == "gdi") {
-            LOG_WARN("backend switch vulkan -> software with "
-                     "r_software_blit=gdi: window will be permanently "
-                     "stuck on the last Vulkan frame (Microsoft DXGI "
-                     "flip-model lockout). Quit + relaunch with "
-                     "r_backend software (and r_software_blit gdi) "
-                     "in demont.cfg for a clean GDI session, or set "
-                     "r_software_blit vulkan to switch live.");
+            std::string mode = "auto";
+            if (auto* m = pt::console::Console::Get().FindCVar("r_software_blit_recreate")) {
+                mode = m->value;
+            }
+            if (mode == "auto") {
+                need_recreate = true;
+            } else if (mode == "prompt") {
+                LOG_INFO("r_software_blit_recreate=prompt: asking user whether to restart for a clean GDI session");
+                HWND parent = window_ ? static_cast<HWND>(window_->NativeHandle()) : nullptr;
+                int btn = MessageBoxW(
+                    parent,
+                    L"Switching from Vulkan to Software with r_software_blit=gdi "
+                    L"will leave the window stuck on the last Vulkan frame "
+                    L"(Microsoft DXGI flip-model lockout).\r\n\r\n"
+                    L"Restart the application now to use GDI cleanly?\r\n\r\n"
+                    L"Yes: relaunch (current session is lost)\r\n"
+                    L"No: continue without restart (set r_software_blit vulkan to recover)",
+                    L"demont engine: vulkan -> software (GDI)",
+                    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON1);
+                if (btn == IDYES) {
+                    // Persist the user's current cvar state (most
+                    // importantly r_backend=software and r_software_
+                    // blit=gdi -- both freshly mutated in this Tick
+                    // and not yet on disk) BEFORE spawning so the
+                    // child reads what the user actually intended.
+                    // Otherwise CreateProcessA + child Init can race
+                    // ahead of this process's Shutdown-time cfg
+                    // write, and the child boots from stale on-disk
+                    // values (typically the previous launch's
+                    // r_backend=vulkan -- not what the user asked
+                    // for). Bare LOG only; failure here is non-fatal.
+                    if (int n = pt::console::Console::Get().SaveArchivedCvars("demont.cfg"); n >= 0) {
+                        LOG_INFO("r_software_blit_recreate=prompt: pre-spawn cfg save ok ({} cvar(s))", n);
+                    } else {
+                        LOG_WARN("r_software_blit_recreate=prompt: pre-spawn cfg save failed -- child may boot with stale cvar state");
+                    }
+                    // Persist up-arrow history + scrollback now so the
+                    // child can pick them up on Init. Shutdown also
+                    // saves later, but that's AFTER the child has
+                    // already started reading -- so we'd lose this
+                    // session's tail. Saving twice is harmless (same
+                    // atomic .tmp + rename).
+                    if (overlay_) {
+                        overlay_->SaveState("demont_console.state");
+                    }
+                    // Release our HTTP / TCP console-server ports BEFORE
+                    // spawning so the child's ConsoleServer::Start can
+                    // bind them cleanly. Without this the child races
+                    // ahead of our Shutdown-time server reset and hits
+                    // "Failed to start civetweb on 127.0.0.1:<port>" --
+                    // the child still runs (bind failure is non-fatal)
+                    // but loses HTTP / web-console access for the new
+                    // session. Releasing here also drops any already-
+                    // connected web console clients; they should
+                    // reconnect to the new process which now owns the
+                    // ports.
+                    //
+                    // server_.reset() calls ~ConsoleServer -> Stop()
+                    // exactly once. We also null the singleton pointer
+                    // so the static OnLog log sink (still registered
+                    // for the remainder of this Tick) sees g_instance
+                    // == nullptr and bails out instead of dereferencing
+                    // a destroyed server_. Shutdown's `if (server_)`
+                    // guard turns the later server_->Stop() into a
+                    // no-op; ConsoleServer::Stop is NOT idempotent
+                    // wrt WSACleanup (unconditional cleanup would
+                    // double-decrement Winsock's refcount if called
+                    // twice), so a single reset here is the right
+                    // shape.
+                    if (server_) {
+                        LOG_INFO("r_software_blit_recreate=prompt: releasing console-server ports for child");
+                        pt::console::ConsoleServer::SetGlobalInstance(nullptr);
+                        server_.reset();
+                    }
+                    if (RestartProcess()) {
+                        LOG_INFO("r_software_blit_recreate=prompt: spawn succeeded; tearing down GPU + hiding window so the user sees only the new process");
+                        // Tear down the Vulkan device now (instead of
+                        // letting Shutdown do it at end of loop) for
+                        // two reasons:
+                        //
+                        //   1. The current Tick is mid-iteration; the
+                        //      remaining RenderFrame call would dispatch
+                        //      a final frame on a device whose swapchain
+                        //      may have lost compatibility while the
+                        //      modal MessageBox was up (DWM can
+                        //      reconfigure during modal dispatch).
+                        //      RenderFrame guards on (!device_) so
+                        //      clearing it makes the rest of this Tick
+                        //      a clean no-op.
+                        //   2. The child process is already starting
+                        //      up its own Vulkan instance; releasing
+                        //      ours promptly avoids two processes
+                        //      hammering the GPU + driver state at the
+                        //      same moment (driver crashes have been
+                        //      reported on this overlap window with
+                        //      the previous prompt-path implementation).
+                        //
+                        // Hide the window so the user only sees the
+                        // child's window during the brief overlap
+                        // before wants_quit_ unwinds the main loop.
+                        // Window stays alive (Hide, not Destroy) so
+                        // the rest of this Tick + the Shutdown path
+                        // can finish without window_->Handle() going
+                        // null on them.
+                        TearDownDevice();
+                        current_backend_ = BackendType::None;
+                        if (window_) window_->Hide();
+                        return;
+                    }
+                    LOG_WARN("r_software_blit_recreate=prompt: CreateProcessA failed; falling back to warn behaviour");
+                    need_warn = true;
+                } else {
+                    LOG_INFO("r_software_blit_recreate=prompt: user declined restart; falling back to warn behaviour");
+                    need_warn = true;
+                }
+            } else {
+                // mode == "warn" (or any unrecognised value -- the
+                // allowed_values validator at registration time rejects
+                // anything else, so this branch is the explicit warn
+                // path).
+                need_warn = true;
+            }
         }
     }
 #endif
 
     TearDownDevice();
+
+#if defined(_WIN32)
+    if (need_recreate) {
+        LOG_INFO("r_software_blit_recreate=auto: vulkan -> software gdi: recreating HWND to escape DXGI flip-model lockout");
+        if (!RecreateWindow()) {
+            // Hard stop. Window::Recreate failure leaves window_ alive
+            // but with handle_ == nullptr (Destroy succeeded, Create
+            // failed), and RecreateWindow has already dropped both
+            // overlays. Continuing to Device::Create below with the
+            // null native handle would produce an unpresentable device:
+            // every present blit would silently no-op forever (the same
+            // failure mode the early `if (!window_) return;` guards
+            // against on initial init).
+            //
+            // The old device is already torn down (TearDownDevice ran
+            // above), so we can't recover the previous render either.
+            // Request a clean process exit so the user sees Shutdown
+            // run its course and can relaunch. wants_quit_ is the same
+            // signal RestartProcess uses on the prompt path -- the
+            // main loop checks it on the next iteration.
+            LOG_ERROR("r_software_blit_recreate=auto: RecreateWindow failed -- window is destroyed and engine is unrenderable; requesting clean quit so the user can relaunch");
+            current_backend_ = BackendType::None;
+            wants_quit_      = true;
+            return;
+        }
+    }
+    if (need_warn) {
+        LOG_WARN("backend switch vulkan -> software with "
+                 "r_software_blit=gdi: window will be permanently "
+                 "stuck on the last Vulkan frame (Microsoft DXGI "
+                 "flip-model lockout). Quit + relaunch with "
+                 "r_backend software (and r_software_blit gdi) "
+                 "in demont.cfg for a clean GDI session, set "
+                 "r_software_blit vulkan to switch live, or set "
+                 "r_software_blit_recreate auto for an automatic "
+                 "in-process recreate.");
+    }
+#endif
 
     if (to == BackendType::None) {
         current_backend_ = BackendType::None;
@@ -1066,6 +1283,265 @@ void Engine::RequestBackendSwitch(BackendType to) {
     // BSC starmap: load + rasterise once on this device.
     EnsureStarMapUploaded();
     EnsureMoonMapUploaded();
+}
+
+bool Engine::RecreateWindow() {
+#if defined(_WIN32)
+    if (!window_) {
+        LOG_ERROR("Engine::RecreateWindow: no window to recreate");
+        return false;
+    }
+    LOG_INFO("Engine::RecreateWindow: tearing down overlays before HWND swap");
+    // Shut overlays down explicitly BEFORE destroying the parent
+    // GLFW window. Windows would cascade-destroy the child HWNDs when
+    // the parent dies, but the overlay objects still cache stale
+    // hwnd_ pointers in that case -- their next Paint/Repaint/Update
+    // would touch a dead handle. Explicit Shutdown nulls those
+    // pointers cleanly, and the static log dispatch (ConsoleOverlay::
+    // OnLog -> g_instance) goes inert until re-Init.
+    if (overlay_) {
+        overlay_->Shutdown();
+    }
+    if (perf_overlay_) {
+        perf_overlay_->Shutdown();
+    }
+
+    if (!window_->Recreate()) {
+        LOG_ERROR("Engine::RecreateWindow: Window::Recreate failed; engine is in an unusable window state");
+        // Drop the overlays since their parent_ is dead. The engine
+        // is now unrenderable (no window, both overlays gone) and
+        // returning false signals the dispatch site to hard-stop:
+        // it sets current_backend_=None + wants_quit_=true so the
+        // main loop exits cleanly and the user can relaunch. We
+        // can't continue down the device-creation path because
+        // window_->Handle() is nullptr -- the new device would have
+        // no native handle and present-blits would silently no-op
+        // forever.
+        overlay_.reset();
+        perf_overlay_.reset();
+        return false;
+    }
+
+    LOG_INFO("Engine::RecreateWindow: re-attaching overlays to fresh HWND");
+    auto& C = pt::console::Console::Get();
+    if (overlay_) {
+        if (!overlay_->Init(window_->NativeHandle())) {
+            LOG_WARN("Engine::RecreateWindow: ConsoleOverlay re-Init failed; in-window log overlay disabled for this session");
+            overlay_.reset();
+        } else if (auto* tv = C.FindCVar("r_theme")) {
+            // Re-apply the current theme. r_theme's on_change handler
+            // would push the theme to overlay_ if it fired, but the
+            // cvar value hasn't changed across the recreate -- so the
+            // on_change never fires and the freshly-Init'd overlay
+            // sits at its default theme. Mirror the perf_overlay
+            // branch below (which already does this).
+            overlay_->ApplyTheme(tv->value);
+        }
+        // Sink list is unchanged: ConsoleOverlay::OnLog stays
+        // registered and starts forwarding again now that the static
+        // g_instance points at the live overlay.
+    }
+    if (perf_overlay_) {
+        if (!perf_overlay_->Init(window_->NativeHandle())) {
+            LOG_WARN("Engine::RecreateWindow: PerfOverlay re-Init failed; perf HUD disabled for this session");
+            perf_overlay_.reset();
+        } else {
+            // Mirror the initial setup in Init(): re-apply theme, then
+            // resolve r_perf_overlay + r_perf_overlay_mode to set the
+            // tier level (or 0 if r_perf_overlay_mode=rhi).
+            if (auto* tv = C.FindCVar("r_theme")) {
+                perf_overlay_->ApplyTheme(tv->value);
+            }
+            int level = 0;
+            if (auto* lv = C.FindCVar("r_perf_overlay")) {
+                level = std::atoi(lv->value.c_str());
+            }
+            bool rhi = false;
+            if (auto* mv = C.FindCVar("r_perf_overlay_mode")) rhi = (mv->value == "rhi");
+            perf_overlay_->SetLevel(rhi ? 0 : level);
+        }
+    }
+    LOG_INFO("Engine::RecreateWindow: ok; HWND swap complete");
+    return true;
+#else
+    LOG_ERROR("Engine::RecreateWindow: Win32-only (called on a non-Win32 build)");
+    return false;
+#endif
+}
+
+bool Engine::RestartProcess() {
+#if defined(_WIN32)
+    // Resolve the running exe path via GetModuleFileNameA -- argv[0]
+    // can be a relative path or a different casing than what the OS
+    // actually loaded, and using the OS-reported path avoids surprises
+    // when the user launched from a different cwd. ANSI is fine: paths
+    // on Windows can legitimately contain non-ASCII via the active
+    // code page, but the engine's existing logging + cfg load chain is
+    // also ANSI, so we stay consistent. If a non-ASCII path bites,
+    // upgrading to GetModuleFileNameW is a localised change.
+    char exe_path[MAX_PATH] = {0};
+    DWORD n = GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) {
+        LOG_ERROR("Engine::RestartProcess: GetModuleFileNameA failed (GLE={}, n={})", GetLastError(), n);
+        return false;
+    }
+
+    // Build the lpCommandLine string. CreateProcessA requires a single
+    // writable buffer, by convention starting with the (quoted)
+    // application name followed by space-separated args.
+    //
+    // Windows argv quoting per CommandLineToArgvW
+    // (https://learn.microsoft.com/en-us/cpp/cpp/main-function-command-line-args
+    //  #parsing-c-command-line-arguments) is unusual:
+    //
+    //   - 2n   backslashes followed by " -> n backslashes + begin/end quote.
+    //   - 2n+1 backslashes followed by " -> n backslashes + literal quote.
+    //   - n    backslashes not followed by " -> n LITERAL backslashes.
+    //
+    // The naive "escape every \\ and \"" approach (used in the first
+    // pass of this code, caught by Copilot review) doubles every
+    // backslash unconditionally. CommandLineToArgvW then sees a run of
+    // backslashes not followed by a quote and treats it as literal:
+    // a Windows path like C:\Program Files\demont.exe becomes
+    // C:\\Program Files\\demont.exe in the child's argv, breaking any
+    // arg whose value contains a backslash.
+    //
+    // Correct algorithm (Daniel Colascione, "Everyone quotes command
+    // line arguments the wrong way"):
+    //   - If arg has no whitespace / tab / quote / cmd metacharacter:
+    //     emit literally.
+    //   - Else: wrap in "...". Inside the quoted run:
+    //     - Track runs of consecutive backslashes.
+    //     - If the run is followed by " (embedded literal quote):
+    //         double the run + emit a single escape backslash + emit ".
+    //     - If the run is at end-of-arg (closing quote follows):
+    //         double the run.
+    //     - Otherwise (run followed by ordinary char):
+    //         emit the run literally.
+    //
+    // The trigger-set is extended beyond ` \t"` to include the cmd.exe
+    // metacharacters & | < > ( ) ^ -- because we ship the command
+    // line through `cmd.exe /c start ...` below, an arg containing
+    // any of those would be reinterpreted by cmd before the target
+    // sees it. Wrapping in double quotes neutralises them inside the
+    // quoted run, leaving the target's CommandLineToArgvW parse
+    // unchanged. NOTE: % is NOT escaped here -- cmd expands
+    // %VAR% inside double quotes too, so an arg like `--user=%USER%`
+    // would still be interpreted by cmd (the canonical fix is the
+    // %^% trick but it doesn't survive cmd's quoting parser). The
+    // engine's own argv doesn't use % so this is a documented
+    // residual limit, not a live bug.
+    auto quote = [](const std::string& s) -> std::string {
+        if (!s.empty() && s.find_first_of(" \t\"&|<>()^") == std::string::npos) return s;
+        std::string r = "\"";
+        for (std::size_t i = 0; i < s.size(); ) {
+            std::size_t bs = 0;
+            while (i < s.size() && s[i] == '\\') { ++bs; ++i; }
+            if (i == s.size()) {
+                r.append(2 * bs, '\\');               // run before closing "
+            } else if (s[i] == '"') {
+                r.append(2 * bs, '\\');               // run before embedded "
+                r += '\\';
+                r += '"';
+                ++i;
+            } else {
+                r.append(bs, '\\');                   // run before ordinary char
+                r += s[i];
+                ++i;
+            }
+        }
+        r += '"';
+        return r;
+    };
+    // Bounce the spawn through cmd.exe's `start` builtin instead of
+    // calling CreateProcessA on the exe directly. Rationale:
+    //
+    // Modern launcher hosts (CLion's run/debug, Visual Studio, Windows
+    // Terminal, VS Code's integrated terminal) wrap their child
+    // processes in a job object configured with
+    // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE and -- critically for the
+    // CLion case -- WITHOUT JOB_OBJECT_LIMIT_BREAKAWAY_OK. A direct
+    // CreateProcessA spawn inherits that job, and the previous attempt
+    // (CREATE_BREAKAWAY_FROM_JOB with a fallback retry on
+    // ERROR_ACCESS_DENIED) silently fell back to a non-breakaway spawn
+    // when the host forbade breakaway. The new process then lived for
+    // a few frames until this process exited and the host's job-close
+    // killed every other process in the job, including the freshly-
+    // spawned child. From the user's perspective: child window opens,
+    // runs for a moment, then disappears silently.
+    //
+    // The shell-detach trick: spawn cmd.exe with a one-shot
+    // `start "" "<exe>" <args>` command. cmd's internal `start`
+    // builtin uses ShellExecuteEx, which routes through the shell
+    // dispatch path (explorer.exe / sechost) and produces a process
+    // tree where the target is a child of the shell, NOT of cmd or
+    // us. The target is therefore OUTSIDE the host's job entirely
+    // and survives this process's exit unconditionally.
+    //
+    // cmd.exe itself does inherit the host's job and dies with it,
+    // but it's a transient shim that exits within milliseconds after
+    // kicking off start -- by the time the host kills its job, cmd
+    // is already gone. CREATE_NO_WINDOW hides the cmd console
+    // (which would otherwise flash briefly); the spawned demont
+    // gets its own fresh console window via the default
+    // ShellExecuteEx SW_SHOWNORMAL behaviour for console-subsystem
+    // apps, so stdio still has a destination.
+    //
+    // The empty "" before <exe> is start's window-title parameter
+    // (required when the path is itself quoted -- otherwise start
+    // interprets the quoted path AS the title and treats subsequent
+    // tokens as the command).
+
+    char sys_dir[MAX_PATH] = {0};
+    UINT sd_len = GetSystemDirectoryA(sys_dir, MAX_PATH);
+    if (sd_len == 0 || sd_len >= MAX_PATH) {
+        LOG_ERROR("Engine::RestartProcess: GetSystemDirectoryA failed (GLE={}, len={})", GetLastError(), sd_len);
+        return false;
+    }
+    std::string cmd_exe_path = std::string(sys_dir) + "\\cmd.exe";
+
+    // lpCommandLine for cmd.exe. argv[0] is cmd.exe by convention.
+    // The /c flag tells cmd to run the supplied command then exit.
+    // We quote the start-target with the same Colascione algorithm
+    // (start.exe passes its argv through CommandLineToArgvW to the
+    // target), and prepend an empty "" for start's title slot.
+    std::string shell_cmdline = "cmd.exe /c start \"\" " + quote(exe_path);
+    for (int i = 1; i < argc_ && argv_ != nullptr; ++i) {
+        if (argv_[i] == nullptr) break;
+        shell_cmdline += ' ';
+        shell_cmdline += quote(argv_[i]);
+    }
+    std::vector<char> cmdbuf(shell_cmdline.begin(), shell_cmdline.end());
+    cmdbuf.push_back('\0');
+
+    STARTUPINFOA       si{};
+    PROCESS_INFORMATION pi{};
+    si.cb = sizeof(si);
+    LOG_INFO("Engine::RestartProcess: shell-detaching via '{}'", shell_cmdline);
+
+    BOOL ok = CreateProcessA(
+        cmd_exe_path.c_str(), // lpApplicationName
+        cmdbuf.data(),        // lpCommandLine (writable)
+        nullptr,              // lpProcessAttributes
+        nullptr,              // lpThreadAttributes
+        FALSE,                // bInheritHandles
+        CREATE_NO_WINDOW,     // hide cmd's transient console
+        nullptr,              // lpEnvironment (inherit)
+        nullptr,              // lpCurrentDirectory (inherit)
+        &si, &pi);
+    if (!ok) {
+        LOG_ERROR("Engine::RestartProcess: CreateProcessA for cmd.exe failed (GLE={})", GetLastError());
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    LOG_INFO("Engine::RestartProcess: cmd-shim PID={} spawned; target will be a child of the shell (outside host's job); setting wants_quit_", pi.dwProcessId);
+    wants_quit_ = true;
+    return true;
+#else
+    LOG_ERROR("Engine::RestartProcess: Win32-only (called on a non-Win32 build)");
+    return false;
+#endif
 }
 
 void Engine::SeedDefaultCsgScene() {
@@ -5477,6 +5953,37 @@ void Engine::RegisterCommands() {
                          "path selected (default). Survives all backend "
                          "switches. Takes effect on next Software backend "
                          "(re)initialise.");
+            }
+        };
+#endif
+    }
+    // r_software_blit_recreate: validate cross-platform (so cfg load
+    // doesn't bounce a saved value back to default on Mac/Linux), but
+    // only emit Win32-specific info chatter on_change -- the cvar is
+    // documented as a no-op on Mac/Linux so users shouldn't see
+    // "auto/prompt/warn behaviour" messages there.
+    if (auto* v = C.FindCVar("r_software_blit_recreate")) {
+        v->allowed_values = {"auto", "prompt", "warn"};
+#if defined(_WIN32)
+        v->on_change = [](const pt::console::CVar& cv) {
+            if (cv.value == "auto") {
+                LOG_INFO("r_software_blit_recreate=auto -- vulkan -> software "
+                         "with r_software_blit=gdi will recreate the GLFW "
+                         "window in-process (escape DXGI flip-model lockout, "
+                         "preserve engine state). Brief flicker at the switch. "
+                         "Takes effect on next such switch.");
+            } else if (cv.value == "prompt") {
+                LOG_INFO("r_software_blit_recreate=prompt -- vulkan -> software "
+                         "with r_software_blit=gdi will pop a MessageBox "
+                         "offering to restart the process. Yes spawns a fresh "
+                         "demont.exe with the original argv; No falls back to "
+                         "the warn behaviour. Takes effect on next such switch.");
+            } else {
+                LOG_INFO("r_software_blit_recreate=warn -- vulkan -> software "
+                         "with r_software_blit=gdi will emit a LOG_WARN and "
+                         "leave the window stuck on the last Vulkan frame "
+                         "(legacy behaviour); user must manually quit and "
+                         "relaunch. Takes effect on next such switch.");
             }
         };
 #endif

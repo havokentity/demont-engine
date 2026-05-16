@@ -30,8 +30,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>      // std::FILE / std::fopen / std::fwrite for SaveState
 #include <cstdlib>     // std::strtof (engine builds /EHs-c-, no std::stof)
+#include <cstring>     // std::strncmp for LoadState header check
 #include <deque>
+#include <filesystem>  // std::filesystem::rename for atomic SaveState
+#include <fstream>     // std::ifstream / std::getline for LoadState
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -182,6 +186,8 @@ public:
     // on_change handlers can ping the overlay without copy-pasting
     // values across the IPC boundary.
     void  Repaint();
+    bool  SaveState(const std::string& path) const;
+    bool  LoadState(const std::string& path);
 
 private:
     static LRESULT CALLBACK WndProcThunk(HWND, UINT, WPARAM, LPARAM);
@@ -456,6 +462,23 @@ bool WinOverlay::Init(HWND parent) {
         font_is_owned_ = false;
     }
 
+    // Re-sync the cached scale invariant with the freshly-created
+    // font. The font was just made at kFontHeight (the unscaled
+    // default); font_scale_ MUST reflect that, otherwise EnsureFontScale
+    // on the next Paint will compare cvar(e.g. 1.5) against a stale
+    // font_scale_(1.5) carried over from a previous lifetime, decide
+    // "no change needed", and leave the new font at the unscaled size.
+    //
+    // The bug only fires when Init runs a SECOND time on the same
+    // WinOverlay object -- which is exactly what Engine::RecreateWindow
+    // does on the vulkan->software gdi-mode HWND swap. On first init
+    // font_scale_'s class-default (1.0f) already matches; on re-init
+    // it carries whatever EnsureFontScale last applied. Reset both
+    // here so the next Paint's EnsureFontScale always re-applies the
+    // current cvar from a clean baseline.
+    font_scale_   = 1.0f;
+    line_height_  = kLineHeight;
+
     // Publish this instance with release semantics so log-thread loads
     // see fully-initialised state_mutex_, scrollback_, hwnd_, etc.
     g.store(this, std::memory_order_release);
@@ -481,6 +504,20 @@ bool WinOverlay::Init(HWND parent) {
     // Mac overlay's NSView does. Same shape and characters as the
     // terminal banner in main.cpp::PrintBootLogo and the Cocoa
     // overlay's hex banner.
+    //
+    // Skip when scrollback_ is already populated. WinOverlay::Shutdown
+    // does NOT clear scrollback_, so an Engine::RecreateWindow cycle
+    // (Shutdown + Init on the same instance, used by the
+    // r_software_blit_recreate=auto path) would otherwise push a
+    // second copy of every banner line above whatever the previous
+    // session accumulated. The check also handles the case where
+    // LoadState ran before us in some future call order -- if there's
+    // any pre-existing content, the user has already seen a banner,
+    // skip it. (Order today is Init -> banner -> LoadState, so this
+    // is a forward-compatible guard.)
+    if (!scrollback_.empty()) {
+        return true;
+    }
     scrollback_.push_back({"        \xe2\x96\x91\xe2\x96\x92\xe2\x96\x93\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x93\xe2\x96\x92\xe2\x96\x91", LineRole::LogoFrame});
     scrollback_.push_back({"     \xe2\x96\x91\xe2\x96\x92\xe2\x96\x93\xe2\x96\x88\xe2\x96\x88\xe2\x95\x94\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x97\xe2\x96\x93\xe2\x96\x92\xe2\x96\x91", LineRole::LogoFrame});
     scrollback_.push_back({"   \xe2\x96\x91\xe2\x96\x93\xe2\x96\x88\xe2\x96\x88\xe2\x95\x94\xe2\x95\x90\xe2\x95\x9d   D \xc2\xb7 M \xc2\xb7 T   \xe2\x95\x9a\xe2\x95\x90\xe2\x95\x97\xe2\x96\x88\xe2\x96\x88\xe2\x96\x93\xe2\x96\x91", LineRole::LogoLetters});
@@ -792,6 +829,197 @@ void WinOverlay::EnsureFontScale() {
     LOG_INFO("ConsoleOverlay: con_font_scale={:.2f} -> font_h={} line_h={}",
              requested, new_font_h, new_line_h);
     Repaint();
+}
+
+// --- State persistence (history + scrollback) -----------------------------
+//
+// File format (plain text, line-oriented, UTF-8):
+//
+//   DEMONT_CONSOLE_STATE v1
+//   HISTORY <N>
+//   <history line 1>
+//   ...
+//   <history line N>
+//   SCROLLBACK <M>
+//   <role>\t<text>
+//   ...
+//
+// where <role> is a digit 0..4 mapping to LineRole::{Default,LogoFrame,
+// LogoLetters,LogoRay,Echo}. Banner roles (LogoFrame/LogoLetters/LogoRay)
+// are SKIPPED on save -- the next Init regenerates them, so saving them
+// would just produce duplicates. We use a TAB to separate role from
+// text so embedded spaces in log lines round-trip cleanly; embedded
+// newlines aren't legal in scrollback entries (they're split into
+// separate entries on push) so single-newline-per-record is safe.
+//
+// SaveState writes to <path>.tmp and renames; an in-flight crash leaves
+// the previous good file intact. LoadState appends after whatever the
+// current Init's banner already put in scrollback, with a "previous
+// session" separator -- the user can tell where the restored block
+// starts.
+
+bool WinOverlay::SaveState(const std::string& path) const {
+    // Snapshot under the state mutex. We must NOT hold the mutex while
+    // doing file I/O -- the log path can call OnLog re-entrantly via
+    // any LOG_* inside fwrite/fclose's failure handling, and OnLog
+    // tries to acquire the same mutex. Copy out, release, then write.
+    std::deque<std::string> hist_copy;
+    std::deque<ScrollLine>  scroll_copy;
+    {
+        // const_cast around state_mutex_: the mutex is logically
+        // mutable (acquired for read-only access here), but we promised
+        // a `const`-qualified SaveState in the public API to keep
+        // call sites tidy.
+        auto& self = const_cast<WinOverlay&>(*this);
+        std::lock_guard lock(self.state_mutex_);
+        hist_copy   = history_;
+        scroll_copy = scrollback_;
+    }
+
+    const std::string tmp_path = path + ".tmp";
+    std::FILE* f = std::fopen(tmp_path.c_str(), "wb");
+    if (f == nullptr) {
+        LOG_WARN("ConsoleOverlay::SaveState: fopen('{}', 'wb') failed",
+                 tmp_path);
+        return false;
+    }
+
+    // Count non-banner scrollback entries up-front so the header is
+    // accurate (a single pass over scroll_copy filters banner roles).
+    std::size_t scrollback_count = 0;
+    for (const auto& s : scroll_copy) {
+        if (s.role == LineRole::LogoFrame ||
+            s.role == LineRole::LogoLetters ||
+            s.role == LineRole::LogoRay) continue;
+        ++scrollback_count;
+    }
+
+    fmt::print(f, "DEMONT_CONSOLE_STATE v1\n");
+    fmt::print(f, "HISTORY {}\n", hist_copy.size());
+    for (const auto& h : hist_copy) {
+        // Strip any embedded newlines defensively -- the line-oriented
+        // format would otherwise split one history entry into two.
+        std::string clean = h;
+        std::replace(clean.begin(), clean.end(), '\n', ' ');
+        std::replace(clean.begin(), clean.end(), '\r', ' ');
+        fmt::print(f, "{}\n", clean);
+    }
+    fmt::print(f, "SCROLLBACK {}\n", scrollback_count);
+    for (const auto& s : scroll_copy) {
+        if (s.role == LineRole::LogoFrame ||
+            s.role == LineRole::LogoLetters ||
+            s.role == LineRole::LogoRay) continue;
+        std::string clean = s.text;
+        std::replace(clean.begin(), clean.end(), '\n', ' ');
+        std::replace(clean.begin(), clean.end(), '\r', ' ');
+        fmt::print(f, "{}\t{}\n",
+                   static_cast<int>(s.role), clean);
+    }
+    std::fclose(f);
+
+    std::error_code ec;
+    std::filesystem::rename(tmp_path, path, ec);
+    if (ec) {
+        LOG_WARN("ConsoleOverlay::SaveState: rename('{}' -> '{}') failed: {}",
+                 tmp_path, path, ec.message());
+        // Leave the .tmp file behind so the next save can overwrite it;
+        // removing here would race with antivirus scanners that hold
+        // open handles transiently on newly-created files.
+        return false;
+    }
+    LOG_INFO("ConsoleOverlay::SaveState: wrote {} history + {} scrollback entries to '{}'",
+             hist_copy.size(), scrollback_count, path);
+    return true;
+}
+
+bool WinOverlay::LoadState(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) {
+        // Missing file is not an error: first launch ever, or user
+        // deleted the file to start fresh.
+        return false;
+    }
+
+    std::string line;
+    if (!std::getline(in, line) ||
+        line.rfind("DEMONT_CONSOLE_STATE v1", 0) != 0) {
+        LOG_WARN("ConsoleOverlay::LoadState: '{}' missing v1 header (got '{}'); skipping",
+                 path, line);
+        return false;
+    }
+
+    std::deque<std::string> hist_loaded;
+    std::deque<ScrollLine>  scroll_loaded;
+
+    // Section parser: small + paranoid. Unknown sections / malformed
+    // lines are logged and skipped rather than aborting the whole load
+    // (a partial restore beats no restore).
+    while (std::getline(in, line)) {
+        if (line.rfind("HISTORY ", 0) == 0) {
+            std::size_t n = static_cast<std::size_t>(std::atoi(line.c_str() + 8));
+            for (std::size_t i = 0; i < n; ++i) {
+                if (!std::getline(in, line)) break;
+                hist_loaded.push_back(std::move(line));
+            }
+            // Clamp to the same bound the live deque enforces so a
+            // tampered file can't blow memory.
+            while (hist_loaded.size() > kHistoryMax) hist_loaded.pop_front();
+        } else if (line.rfind("SCROLLBACK ", 0) == 0) {
+            std::size_t n = static_cast<std::size_t>(std::atoi(line.c_str() + 11));
+            for (std::size_t i = 0; i < n; ++i) {
+                if (!std::getline(in, line)) break;
+                auto tab = line.find('\t');
+                if (tab == std::string::npos || tab == 0) {
+                    // Malformed entry; skip rather than carry partial.
+                    continue;
+                }
+                int role_n = std::atoi(line.substr(0, tab).c_str());
+                if (role_n < 0 ||
+                    role_n > static_cast<int>(LineRole::Echo)) {
+                    role_n = static_cast<int>(LineRole::Default);
+                }
+                scroll_loaded.push_back({
+                    line.substr(tab + 1),
+                    static_cast<LineRole>(role_n)
+                });
+            }
+            while (scroll_loaded.size() > kScrollMax) scroll_loaded.pop_front();
+        }
+        // Other lines (blank, unrecognised) are just skipped.
+    }
+
+    // Capture sizes for the post-lock log line so we don't read the
+    // shared deques after releasing the mutex (a worker-thread OnLog
+    // could legally mutate scrollback_ between the unlock and the
+    // log emit).
+    const std::size_t hist_n   = hist_loaded.size();
+    const std::size_t scroll_n = scroll_loaded.size();
+
+    // Splice into the live state under the mutex. The current
+    // scrollback_ already has Init's freshly-pushed banner; we append
+    // a separator, then the loaded scrollback after it. History is
+    // empty on a fresh Init so we just adopt the loaded deque.
+    {
+        std::lock_guard lock(state_mutex_);
+        history_ = std::move(hist_loaded);
+        history_pos_ = -1;  // up-arrow walks from the most recent
+
+        if (!scroll_loaded.empty()) {
+            scrollback_.push_back({"", LineRole::Default});
+            scrollback_.push_back(
+                {"---- previous session " + std::string(40, '-'), LineRole::Default});
+            scrollback_.push_back({"", LineRole::Default});
+            for (auto& sl : scroll_loaded) {
+                scrollback_.push_back(std::move(sl));
+                while (scrollback_.size() > kScrollMax) scrollback_.pop_front();
+            }
+        }
+    }
+
+    LOG_INFO("ConsoleOverlay::LoadState: restored {} history + {} scrollback entries from '{}'",
+             hist_n, scroll_n, path);
+    Repaint();
+    return true;
 }
 
 LRESULT WinOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -1839,6 +2067,12 @@ bool ConsoleOverlay::IsShown() const                   { return opaque_ && stati
 void ConsoleOverlay::ApplyTheme(std::string_view n)    { if (opaque_) static_cast<WinOverlay*>(opaque_)->ApplyTheme(n); }
 void ConsoleOverlay::Repaint()                         { if (opaque_) static_cast<WinOverlay*>(opaque_)->Repaint(); }
 void ConsoleOverlay::NotifyParentResized(int w, int h) { if (opaque_) static_cast<WinOverlay*>(opaque_)->NotifyParentResized(w, h); }
+bool ConsoleOverlay::SaveState(const std::string& path) const {
+    return opaque_ && static_cast<const WinOverlay*>(opaque_)->SaveState(path);
+}
+bool ConsoleOverlay::LoadState(const std::string& path) {
+    return opaque_ && static_cast<WinOverlay*>(opaque_)->LoadState(path);
+}
 
 void ConsoleOverlay::OnLog(pt::log::Level lvl, const std::string& body) {
     if (WinOverlay* w = WinOverlay::g.load(std::memory_order_acquire)) {

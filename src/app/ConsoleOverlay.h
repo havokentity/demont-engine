@@ -71,6 +71,39 @@ public:
     // tracks the renderer window.
     void NotifyParentResized(int width, int height);
 
+    // Persist input-history + scrollback to `path`, so that the next
+    // Engine startup (including the r_software_blit_recreate=prompt
+    // spawned-replacement path) can recall up-arrow command history
+    // and the previous session's log lines. Auto-generated banner
+    // lines (LogoFrame / LogoLetters / LogoRay roles) are skipped on
+    // save -- they're rebuilt by the next Init's banner push, so
+    // saving them would just produce duplicates.
+    //
+    // LoadState appends previous-session entries AFTER whatever the
+    // current Init's banner already put in scrollback, with a "----
+    // previous session ----" separator so users can tell where the
+    // restored block starts. History entries are loaded in order so
+    // up-arrow walks them as if they were typed in this session.
+    //
+    // LoadState is single-shot per process: it APPENDS rather than
+    // replaces, so a second call would inject a duplicate "previous
+    // session" header + restored block on top of the already-loaded
+    // state. Call it exactly once, from Engine::Init right after
+    // overlay->Init() succeeds. (The Win32 impl doesn't guard against
+    // re-entry; if a future caller needs an idempotent variant,
+    // either add a loaded_once_ flag here or implement REPLACE
+    // semantics in the platform impl.)
+    //
+    // File format is plain-text "DEMONT_CONSOLE_STATE v1" with a
+    // HISTORY <N> section followed by a SCROLLBACK <M> section --
+    // re-readable by hand. Save uses atomic .tmp + rename so a crash
+    // mid-write doesn't corrupt the file. Both calls are no-ops (and
+    // return false) on platforms whose overlay impl doesn't support
+    // persistence (today: macOS stub, Linux stub); they're safe to
+    // call unconditionally.
+    bool SaveState(const std::string& path) const;
+    bool LoadState(const std::string& path);
+
     // Forwarded by pt::log -> our sink so log lines appear in the overlay.
     static void OnLog(pt::log::Level level, const std::string& body);
     static void SetGlobalInstance(ConsoleOverlay* o);

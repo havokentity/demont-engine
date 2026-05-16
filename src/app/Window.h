@@ -23,9 +23,36 @@ public:
     bool Create(int w, int h, std::string_view title);
     void Destroy();
 
+    // Win32 only: destroy + recreate the underlying GLFW window so it
+    // gets a fresh HWND. Preserves width, height, title, window
+    // position, and cursor mode; scroll/cursor accumulators are
+    // re-baselined to a clean post-Create state. key_handler_ persists
+    // across the cycle (it's a member, not GLFW state). After this
+    // returns, Handle() and NativeHandle() point at fresh handles --
+    // any caller that cached either must re-fetch.
+    //
+    // Use case: escape the DXGI flip-model lockout that poisons an
+    // HWND for the remainder of its lifetime once Vulkan has presented
+    // to it (see Engine::RecreateWindow + r_software_blit_recreate).
+    //
+    // Returns true on success; on failure the Window is left destroyed
+    // (Handle() == nullptr) and the caller must treat it as fatal.
+    // No-op (returns false) on non-Win32 builds -- the lockout is
+    // Microsoft-DXGI-specific.
+    bool Recreate();
+
     void PollEvents();
     bool ShouldClose() const;
     void RequestClose();
+
+    // Hide the OS window without destroying it. Used by the prompt
+    // path in r_software_blit_recreate=prompt: once the replacement
+    // process has been spawned (Engine::RestartProcess), hide this
+    // process's window immediately so the user doesn't see two
+    // overlapping engine windows during the brief interval before
+    // the main loop notices wants_quit_ and exits. No-op if the
+    // window doesn't exist.
+    void Hide();
 
     int  Width()  const noexcept { return width_;  }
     int  Height() const noexcept { return height_; }

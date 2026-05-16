@@ -75,12 +75,72 @@ void Window::PollEvents() {
     if (g_glfw_inited) glfwPollEvents();
 }
 
+// Win32 GLFW native declaration is set up later in the file; forward-
+// declare here so Recreate() can call it. The macro guard mirrors the
+// definition site below.
+#if defined(_WIN32)
+extern "C" void* pt_window_native_win32(void* glfw_window);
+#endif
+
+bool Window::Recreate() {
+#if defined(_WIN32)
+    if (handle_ == nullptr) {
+        LOG_ERROR("Window::Recreate: called with no live handle");
+        return false;
+    }
+    int pos_x = 0, pos_y = 0;
+    glfwGetWindowPos(handle_, &pos_x, &pos_y);
+    // glfwCreateWindow takes LOGICAL window size, so we have to source
+    // saved_w/saved_h from glfwGetWindowSize -- not from width_/height_,
+    // which the framebuffer-size callback OnResize populates with PIXEL
+    // dimensions. On a Win32 desktop without DPI scaling the two agree
+    // exactly, so the original `saved_w = width_;` worked on the dev
+    // machine, but on a HiDPI Win32 setup (e.g. 200% scaling) the
+    // framebuffer is 2x the logical window -- using width_ would
+    // double the window size after every recreate. glfwGetWindowSize
+    // returns the logical size we passed to the original Create call.
+    int saved_w = 0, saved_h = 0;
+    glfwGetWindowSize(handle_, &saved_w, &saved_h);
+    const int saved_cursor_mode  = glfwGetInputMode(handle_, GLFW_CURSOR);
+    const std::string saved_t    = title_;
+    void* old_native             = pt_window_native_win32(handle_);
+
+    LOG_INFO("Window::Recreate: tearing down GLFW window (HWND={}); preserving logical {}x{} pos {},{} cursor_mode={}",
+             old_native, saved_w, saved_h, pos_x, pos_y, saved_cursor_mode);
+
+    Destroy();
+    if (!Create(saved_w, saved_h, saved_t)) {
+        LOG_ERROR("Window::Recreate: Create failed after Destroy; window is now in an unusable state");
+        return false;
+    }
+    glfwSetWindowPos(handle_, pos_x, pos_y);
+    glfwSetInputMode(handle_, GLFW_CURSOR, saved_cursor_mode);
+    // Re-baseline polled accumulators against the fresh GLFW state so
+    // the first ConsumeMouseDelta after recreate returns 0 instead of
+    // a teleport jump.
+    cursor_have_baseline_ = false;
+    scroll_accum_x_       = 0.0;
+    scroll_accum_y_       = 0.0;
+
+    LOG_INFO("Window::Recreate: created new GLFW window (HWND={})",
+             pt_window_native_win32(handle_));
+    return true;
+#else
+    LOG_ERROR("Window::Recreate: Win32-only (called on a non-Win32 build)");
+    return false;
+#endif
+}
+
 bool Window::ShouldClose() const {
     return handle_ != nullptr && glfwWindowShouldClose(handle_);
 }
 
 void Window::RequestClose() {
     if (handle_ != nullptr) glfwSetWindowShouldClose(handle_, GLFW_TRUE);
+}
+
+void Window::Hide() {
+    if (handle_ != nullptr) glfwHideWindow(handle_);
 }
 
 // Signature is `void*(void*)` everywhere -- the implementation in
