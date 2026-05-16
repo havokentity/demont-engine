@@ -20,8 +20,8 @@
 // SetDIBitsToDevice writes physical pixels; the DWM then bilinearly
 // stretches our framebuffer to the real display size, softening the
 // path-traced output.  Acceptable for a CPU reference renderer.  The
-// Vulkan-blit present alternative (r_software_blit=1, the default on
-// Win32 since PR #42) sidesteps the GDI path entirely.
+// Vulkan-blit present alternative (r_software_blit=vulkan, the default
+// on Win32 since PR #42) sidesteps the GDI path entirely.
 
 #include "SoftwareDevice.h"
 #include "SoftwareTracer.h"
