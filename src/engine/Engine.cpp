@@ -1384,16 +1384,49 @@ bool Engine::RestartProcess() {
     PROCESS_INFORMATION pi{};
     si.cb = sizeof(si);
     LOG_INFO("Engine::RestartProcess: spawning '{}' with cmdline '{}'", exe_path, cmdline);
-    BOOL ok = CreateProcessA(
+
+    // Try to break the child out of the parent's job object + put it
+    // in its own process group. Modern terminal hosts (Windows
+    // Terminal, VS Code's integrated terminal, the VS debugger) and
+    // some script launchers wrap their child processes in a job with
+    // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE set. Without breakaway, the
+    // child we spawn inherits the job; when this process exits a
+    // moment later (wants_quit_ -> Shutdown -> exit), Windows kills
+    // every other process in the job, including the brand-new child
+    // -- the user sees the new window appear, do a frame or two of
+    // setup, then disappear or crash mid-init.
+    //
+    // CREATE_BREAKAWAY_FROM_JOB only succeeds if the surrounding job
+    // permits it (JOB_OBJECT_LIMIT_BREAKAWAY_OK on the job). When the
+    // job forbids it, CreateProcessA returns FALSE with last error
+    // ERROR_ACCESS_DENIED -- we retry without the flag in that case.
+    // The child may still get reaped on parent-exit in that scenario,
+    // but at least the spawn doesn't fail outright; users hitting it
+    // can launch demont under a job-less host (plain cmd.exe).
+    //
+    // CREATE_NEW_PROCESS_GROUP isolates the child from Ctrl-C /
+    // Ctrl-Break events delivered to our console group: the parent's
+    // imminent exit shouldn't cascade as a CTRL_C_EVENT into the
+    // child's console handler.
+    DWORD flags = CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP;
+    BOOL  ok    = CreateProcessA(
         exe_path,        // lpApplicationName
         cmdbuf.data(),   // lpCommandLine (writable)
         nullptr,         // lpProcessAttributes
         nullptr,         // lpThreadAttributes
         FALSE,           // bInheritHandles
-        0,               // dwCreationFlags
+        flags,           // dwCreationFlags
         nullptr,         // lpEnvironment (inherit)
         nullptr,         // lpCurrentDirectory (inherit)
         &si, &pi);
+    if (!ok && GetLastError() == ERROR_ACCESS_DENIED) {
+        LOG_WARN("Engine::RestartProcess: surrounding job forbids CREATE_BREAKAWAY_FROM_JOB; retrying without breakaway (child may be reaped when this process exits if host enforces job lifetime)");
+        flags &= ~static_cast<DWORD>(CREATE_BREAKAWAY_FROM_JOB);
+        ok = CreateProcessA(
+            exe_path, cmdbuf.data(),
+            nullptr, nullptr, FALSE, flags,
+            nullptr, nullptr, &si, &pi);
+    }
     if (!ok) {
         LOG_ERROR("Engine::RestartProcess: CreateProcessA failed (GLE={})", GetLastError());
         return false;
