@@ -2,6 +2,10 @@
 // Copyright (c) 2026 Rajesh D'Monte
 #include "FrameCapture.h"
 
+#include "CaptureEncoder.h"
+#include "CaptureFormat.h"
+
+#include "../console/Console.h"
 #include "../core/Diag.h"
 #include "../core/Log.h"
 #include "../rhi/Device.h"
@@ -10,11 +14,10 @@
 #include <fmt/format.h>
 
 #include <chrono>
-#include <cmath>
 #include <cstdio>
-#include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <string>
 #include <vector>
 
 namespace pt::engine::capture {
@@ -37,65 +40,46 @@ State& GetState() {
     return s;
 }
 
-// Portable IEEE 754 binary16 -> binary32 decode. Lifted from the
-// screenshot path in Engine.cpp's RegisterCommands -- duplicated rather
-// than refactored so this PR doesn't churn the existing screenshot
-// command. A future PR can deduplicate by pulling both the half decode
-// and the ACES + sRGB OETF into a small `pt::renderer::HostTonemap`
-// header.
-float HalfToFloat(std::uint16_t h_) {
-    const std::uint32_t sign = (h_ >> 15) & 0x1u;
-    const std::uint32_t exp  = (h_ >> 10) & 0x1Fu;
-    const std::uint32_t mant = h_ & 0x3FFu;
-    std::uint32_t f;
-    if (exp == 0) {
-        if (mant == 0) {
-            f = sign << 31;  // signed zero
-        } else {
-            // Subnormal: renormalise into a regular float32. Same shift
-            // logic as the screenshot path; see that comment for the
-            // detailed exponent-rebias derivation.
-            std::uint32_t e = 1;
-            std::uint32_t m = mant;
-            while ((m & 0x400u) == 0) { m <<= 1; ++e; }
-            m &= 0x3FFu;
-            f = (sign << 31)
-              | ((127u - 15u - e + 2u) << 23)
-              | (m << 13);
-        }
-    } else if (exp == 31) {
-        f = (sign << 31) | (0xFFu << 23) | (mant << 13);
-    } else {
-        f = (sign << 31)
-          | ((exp - 15u + 127u) << 23)
-          | (mant << 13);
+// Register `r_capture_format` at static-init time. PT_CVAR doesn't
+// surface `allowed_values`, so we register manually via Console::Get
+// and mutate the returned CVar*. `allowed_values` makes Console::
+// Execute reject unknown strings with a uniform "got 'X', expected
+// 'png|ppm'" error -- no per-cvar on_change validator needed.
+//
+// Static-init runs once at program startup before any FrameCapture
+// function is reachable, so by the time DoCapture queries the cvar
+// it's guaranteed to exist with a valid `value`. Sentinel bool keeps
+// the initializer from being optimised away under LTO.
+const bool kCaptureFormatRegistered = [] {
+    auto* cv = pt::console::Console::Get().RegisterCVar(
+        kCaptureFormatCvar,
+        kCaptureFormatDefault,
+        "Frame-capture output format. 'png' (default, 8-bit RGB via "
+        "stb_image_write) is consumed by `imgdiff` and the golden-image "
+        "regression matrix. 'ppm' (legacy P6 plain-header) is dependency-"
+        "free and retained as a fallback. Filename suffix derives from "
+        "this value, not from the prefix passed to r_capture_seq.",
+        pt::console::CVAR_ARCHIVE);
+    if (cv != nullptr) {
+        cv->allowed_values = {"png", "ppm"};
     }
-    float result;
-    std::memcpy(&result, &f, sizeof(result));
-    return result;
-}
+    return cv != nullptr;
+}();
 
-std::uint8_t AcesPlusSrgb(float linear, float exposure) {
-    float c = linear * exposure;
-    // ACES filmic (Hill / Krzysztof Narkowicz fit) -- same constants as
-    // the screenshot path and PathTrace.slang's inline tonemap, so PPMs
-    // match what's on-screen pixel-for-pixel modulo bloom / lens flare /
-    // perf overlay (all of which only land in the swapchain after this
-    // intermediate).
-    const float a = 2.51f, b = 0.03f, d = 2.43f, e = 0.59f, f = 0.14f;
-    float x = (c * (a * c + b)) / (c * (d * c + e) + f);
-    if (x < 0.0f) x = 0.0f;
-    if (x > 1.0f) x = 1.0f;
-    // sRGB OETF: piecewise to match the shader's srgb_oetf so the LDR
-    // PPM is the same byte-for-byte as what would land in the
-    // swapchain's sRGB-formatted attachment.
-    if (x <= 0.0031308f) {
-        x = x * 12.92f;
-    } else {
-        x = 1.055f * std::pow(x, 1.0f / 2.4f) - 0.055f;
+// Read the current value of r_capture_format and parse into OutputFormat.
+// allowed_values gates the write side at Console::Execute, but startup
+// races (cvar registered after a malformed demont.cfg load) and
+// defence-in-depth motivate the LOG_WARN-and-default-to-PNG fallback.
+OutputFormat ResolveCaptureFormat() {
+    auto* cv = pt::console::Console::Get().FindCVar(kCaptureFormatCvar);
+    if (cv == nullptr) return OutputFormat::Png;
+    OutputFormat fmt = OutputFormat::Png;
+    if (!ParseOutputFormat(cv->value, fmt)) {
+        LOG_WARN("FrameCapture: unrecognized r_capture_format='{}' "
+                 "(allowed: png|ppm); defaulting to png", cv->value);
+        return OutputFormat::Png;
     }
-    if (x > 1.0f) x = 1.0f;
-    return static_cast<std::uint8_t>(x * 255.0f + 0.5f);
+    return fmt;
 }
 
 // Pull the live GPU-resident exposure scalar so the host-side tonemap
@@ -175,51 +159,6 @@ std::string FormatTimestamp() {
                        tm.tm_hour, tm.tm_min, tm.tm_sec);
 }
 
-// Decode `raw` (the readback bytes for `kind`) into 8-bit sRGB and
-// write a PPM P6 to `path`. Returns true on success.
-bool EncodeAndWritePpm(const std::filesystem::path&     path,
-                       const std::vector<std::uint8_t>& raw,
-                       std::uint32_t                    w,
-                       std::uint32_t                    h,
-                       CaptureSourceKind                kind,
-                       float                            exposure) {
-    std::vector<std::uint8_t> rgb(std::size_t(w) * h * 3);
-    for (std::uint32_t y = 0; y < h; ++y) {
-        for (std::uint32_t x = 0; x < w; ++x) {
-            const std::size_t pi = std::size_t(y) * w + x;
-            float r = 0.0f, g = 0.0f, b = 0.0f;
-            switch (kind) {
-                case CaptureSourceKind::Accum: {
-                    // RGBA32F linear HDR.
-                    const float* src = reinterpret_cast<const float*>(raw.data()) + pi * 4;
-                    r = src[0]; g = src[1]; b = src[2];
-                    break;
-                }
-                case CaptureSourceKind::DenoiseColor: {
-                    // RGBA16F linear HDR (denoiser output).
-                    const std::uint16_t* src =
-                        reinterpret_cast<const std::uint16_t*>(raw.data()) + pi * 4;
-                    r = HalfToFloat(src[0]);
-                    g = HalfToFloat(src[1]);
-                    b = HalfToFloat(src[2]);
-                    break;
-                }
-            }
-            std::uint8_t* dst = rgb.data() + pi * 3;
-            dst[0] = AcesPlusSrgb(r, exposure);
-            dst[1] = AcesPlusSrgb(g, exposure);
-            dst[2] = AcesPlusSrgb(b, exposure);
-        }
-    }
-
-    std::FILE* f = std::fopen(path.string().c_str(), "wb");
-    if (f == nullptr) return false;
-    std::fprintf(f, "P6\n%u %u\n255\n", w, h);
-    std::fwrite(rgb.data(), 1, rgb.size(), f);
-    std::fclose(f);
-    return true;
-}
-
 bool DoCapture(pt::rhi::Device*  device,
                std::uint32_t     frame_index,
                std::uint64_t     accum_tex_id,
@@ -279,21 +218,37 @@ bool DoCapture(pt::rhi::Device*  device,
     auto dir       = EnsureCapturesDir();
     auto safe_pref = SanitizeFilenamePart(filename_prefix, "capture");
     auto safe_lbl  = SanitizeFilenamePart(denoiser_label,  "unknown");
-    auto fname     = fmt::format("{}_{:06d}_{}_{}.ppm",
+
+    // Format selection: r_capture_format gates which encoder runs.
+    // Filename suffix derives from the resolved format (.png / .ppm),
+    // not from the prefix, so a sequence prefix that already contains
+    // an extension produces consistent on-disk names.
+    const OutputFormat       output_fmt = ResolveCaptureFormat();
+    const std::string_view   ext        = OutputFormatExtension(output_fmt);
+    auto fname     = fmt::format("{}_{:06d}_{}_{}.{}",
                                  safe_pref, frame_index,
-                                 safe_lbl, FormatTimestamp());
+                                 safe_lbl, FormatTimestamp(), ext);
     auto path      = dir / fname;
 
-    if (!EncodeAndWritePpm(path, raw, w, h, source, exposure)) {
-        LOG_WARN("FrameCapture: cannot open '{}' for writing",
-                 path.string());
+    bool ok = false;
+    switch (output_fmt) {
+        case OutputFormat::Png:
+            ok = EncodeAndWritePng(path, raw, w, h, source, exposure);
+            break;
+        case OutputFormat::Ppm:
+            ok = EncodeAndWritePpm(path, raw, w, h, source, exposure);
+            break;
+    }
+    if (!ok) {
+        LOG_WARN("FrameCapture: cannot encode/write '{}' (format={})",
+                 path.string(), ext);
         return false;
     }
 
-    LOG_INFO("FrameCapture: wrote {} ({}x{} {}, exposure={:.3f})",
+    LOG_INFO("FrameCapture: wrote {} ({}x{} {}, exposure={:.3f}, format={})",
              path.string(), w, h,
              source == CaptureSourceKind::Accum ? "accum_hdr" : "denoise_color",
-             exposure);
+             exposure, ext);
     return true;
 }
 
