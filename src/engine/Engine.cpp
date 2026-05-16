@@ -1377,63 +1377,89 @@ bool Engine::RestartProcess() {
         cmdline += ' ';
         cmdline += quote(argv_[i]);
     }
-    std::vector<char> cmdbuf(cmdline.begin(), cmdline.end());
+    // Bounce the spawn through cmd.exe's `start` builtin instead of
+    // calling CreateProcessA on the exe directly. Rationale:
+    //
+    // Modern launcher hosts (CLion's run/debug, Visual Studio, Windows
+    // Terminal, VS Code's integrated terminal) wrap their child
+    // processes in a job object configured with
+    // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE and -- critically for the
+    // CLion case -- WITHOUT JOB_OBJECT_LIMIT_BREAKAWAY_OK. A direct
+    // CreateProcessA spawn inherits that job, and the previous attempt
+    // (CREATE_BREAKAWAY_FROM_JOB with a fallback retry on
+    // ERROR_ACCESS_DENIED) silently fell back to a non-breakaway spawn
+    // when the host forbade breakaway. The new process then lived for
+    // a few frames until this process exited and the host's job-close
+    // killed every other process in the job, including the freshly-
+    // spawned child. From the user's perspective: child window opens,
+    // runs for a moment, then disappears silently.
+    //
+    // The shell-detach trick: spawn cmd.exe with a one-shot
+    // `start "" "<exe>" <args>` command. cmd's internal `start`
+    // builtin uses ShellExecuteEx, which routes through the shell
+    // dispatch path (explorer.exe / sechost) and produces a process
+    // tree where the target is a child of the shell, NOT of cmd or
+    // us. The target is therefore OUTSIDE the host's job entirely
+    // and survives this process's exit unconditionally.
+    //
+    // cmd.exe itself does inherit the host's job and dies with it,
+    // but it's a transient shim that exits within milliseconds after
+    // kicking off start -- by the time the host kills its job, cmd
+    // is already gone. CREATE_NO_WINDOW hides the cmd console
+    // (which would otherwise flash briefly); the spawned demont
+    // gets its own fresh console window via the default
+    // ShellExecuteEx SW_SHOWNORMAL behaviour for console-subsystem
+    // apps, so stdio still has a destination.
+    //
+    // The empty "" before <exe> is start's window-title parameter
+    // (required when the path is itself quoted -- otherwise start
+    // interprets the quoted path AS the title and treats subsequent
+    // tokens as the command).
+
+    char sys_dir[MAX_PATH] = {0};
+    UINT sd_len = GetSystemDirectoryA(sys_dir, MAX_PATH);
+    if (sd_len == 0 || sd_len >= MAX_PATH) {
+        LOG_ERROR("Engine::RestartProcess: GetSystemDirectoryA failed (GLE={}, len={})", GetLastError(), sd_len);
+        return false;
+    }
+    std::string cmd_exe_path = std::string(sys_dir) + "\\cmd.exe";
+
+    // lpCommandLine for cmd.exe. argv[0] is cmd.exe by convention.
+    // The /c flag tells cmd to run the supplied command then exit.
+    // We quote the start-target with the same Colascione algorithm
+    // (start.exe passes its argv through CommandLineToArgvW to the
+    // target), and prepend an empty "" for start's title slot.
+    std::string shell_cmdline = "cmd.exe /c start \"\" " + quote(exe_path);
+    for (int i = 1; i < argc_ && argv_ != nullptr; ++i) {
+        if (argv_[i] == nullptr) break;
+        shell_cmdline += ' ';
+        shell_cmdline += quote(argv_[i]);
+    }
+    std::vector<char> cmdbuf(shell_cmdline.begin(), shell_cmdline.end());
     cmdbuf.push_back('\0');
 
     STARTUPINFOA       si{};
     PROCESS_INFORMATION pi{};
     si.cb = sizeof(si);
-    LOG_INFO("Engine::RestartProcess: spawning '{}' with cmdline '{}'", exe_path, cmdline);
+    LOG_INFO("Engine::RestartProcess: shell-detaching via '{}'", shell_cmdline);
 
-    // Try to break the child out of the parent's job object + put it
-    // in its own process group. Modern terminal hosts (Windows
-    // Terminal, VS Code's integrated terminal, the VS debugger) and
-    // some script launchers wrap their child processes in a job with
-    // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE set. Without breakaway, the
-    // child we spawn inherits the job; when this process exits a
-    // moment later (wants_quit_ -> Shutdown -> exit), Windows kills
-    // every other process in the job, including the brand-new child
-    // -- the user sees the new window appear, do a frame or two of
-    // setup, then disappear or crash mid-init.
-    //
-    // CREATE_BREAKAWAY_FROM_JOB only succeeds if the surrounding job
-    // permits it (JOB_OBJECT_LIMIT_BREAKAWAY_OK on the job). When the
-    // job forbids it, CreateProcessA returns FALSE with last error
-    // ERROR_ACCESS_DENIED -- we retry without the flag in that case.
-    // The child may still get reaped on parent-exit in that scenario,
-    // but at least the spawn doesn't fail outright; users hitting it
-    // can launch demont under a job-less host (plain cmd.exe).
-    //
-    // CREATE_NEW_PROCESS_GROUP isolates the child from Ctrl-C /
-    // Ctrl-Break events delivered to our console group: the parent's
-    // imminent exit shouldn't cascade as a CTRL_C_EVENT into the
-    // child's console handler.
-    DWORD flags = CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP;
-    BOOL  ok    = CreateProcessA(
-        exe_path,        // lpApplicationName
-        cmdbuf.data(),   // lpCommandLine (writable)
-        nullptr,         // lpProcessAttributes
-        nullptr,         // lpThreadAttributes
-        FALSE,           // bInheritHandles
-        flags,           // dwCreationFlags
-        nullptr,         // lpEnvironment (inherit)
-        nullptr,         // lpCurrentDirectory (inherit)
+    BOOL ok = CreateProcessA(
+        cmd_exe_path.c_str(), // lpApplicationName
+        cmdbuf.data(),        // lpCommandLine (writable)
+        nullptr,              // lpProcessAttributes
+        nullptr,              // lpThreadAttributes
+        FALSE,                // bInheritHandles
+        CREATE_NO_WINDOW,     // hide cmd's transient console
+        nullptr,              // lpEnvironment (inherit)
+        nullptr,              // lpCurrentDirectory (inherit)
         &si, &pi);
-    if (!ok && GetLastError() == ERROR_ACCESS_DENIED) {
-        LOG_WARN("Engine::RestartProcess: surrounding job forbids CREATE_BREAKAWAY_FROM_JOB; retrying without breakaway (child may be reaped when this process exits if host enforces job lifetime)");
-        flags &= ~static_cast<DWORD>(CREATE_BREAKAWAY_FROM_JOB);
-        ok = CreateProcessA(
-            exe_path, cmdbuf.data(),
-            nullptr, nullptr, FALSE, flags,
-            nullptr, nullptr, &si, &pi);
-    }
     if (!ok) {
-        LOG_ERROR("Engine::RestartProcess: CreateProcessA failed (GLE={})", GetLastError());
+        LOG_ERROR("Engine::RestartProcess: CreateProcessA for cmd.exe failed (GLE={})", GetLastError());
         return false;
     }
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
-    LOG_INFO("Engine::RestartProcess: spawn ok (PID={}); setting wants_quit_ for current process", pi.dwProcessId);
+    LOG_INFO("Engine::RestartProcess: cmd-shim PID={} spawned; target will be a child of the shell (outside host's job); setting wants_quit_", pi.dwProcessId);
     wants_quit_ = true;
     return true;
 #else
