@@ -99,3 +99,13 @@ pt_add_test(harness_smoke harness_smoke_test.cpp)
 pt_add_test(cvar_roundtrip
     cvar_roundtrip_test.cpp
     LINK_TARGETS pt_console)
+
+# Image-diff compute kernel. Exercises pt::imgdiff::Compute / Passes
+# directly with hand-crafted RGBA8 buffers -- no PNG I/O, no CLI
+# parsing. Groundwork for the golden-image regression matrix (#45);
+# tool driver is at tools/imgdiff/main.cpp (#69).
+#
+# Target name is `imgdiff_test` (not `imgdiff`) to avoid colliding with
+# the tools/imgdiff/ executable target.
+pt_add_test(imgdiff_test
+    imgdiff_test.cpp)

@@ -13,7 +13,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
 endif()
 
 project(demont
-    VERSION 0.3.22
+    VERSION 0.3.24
     DESCRIPTION "DeMonT Engine -- non-rasterized real-time game engine. Path-traced every pixel, mesh CSG via Manifold. Metal + MetalFX denoiser on Apple Silicon, Vulkan + SVGF compute denoiser on NVIDIA RTX."
     LANGUAGES C CXX
 )
@@ -55,6 +55,12 @@ option(PT_ENABLE_AVX512_EMBREE  "Enable AVX-512 build of Embree (runtime-dispatc
 # regardless). doctest is single-header so the configure-time cost is
 # small either way.
 option(PT_BUILD_TESTS           "Build unit tests via doctest"          ON)
+# Developer tooling (imgdiff, future golden-image helpers, etc.).
+# Standalone executables with no engine deps -- they build fast and
+# don't need Vulkan / Metal SDKs. Default ON so contributors get them
+# without extra cmake flags; release.yml can flip OFF if/when the
+# pipeline only ships the demont binary.
+option(PT_BUILD_TOOLS           "Build developer tooling under tools/"  ON)
 
 # --- Compiler/warning helper -----------------------------------------------
 include(cmake/CompilerWarnings.cmake)
@@ -139,6 +145,15 @@ include(cmake/Dependencies.cmake)
 
 # --- Sources ----------------------------------------------------------------
 add_subdirectory(src)
+
+# --- Tools ------------------------------------------------------------------
+# Developer CLIs that don't depend on the engine -- imgdiff is the first.
+# Gated separately from PT_BUILD_TESTS so a "tests off, tools on" build
+# (e.g. someone wanting just imgdiff for a CI image-compare step) is
+# still possible.
+if(PT_BUILD_TOOLS)
+    add_subdirectory(tools)
+endif()
 
 # --- Tests ------------------------------------------------------------------
 # enable_testing() must be in the top-level CMakeLists so `ctest` from the
