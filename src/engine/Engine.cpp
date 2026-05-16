@@ -3030,6 +3030,14 @@ void Engine::RenderFrame() {
             float exp_max;
             float adapt_speed;
         } ae{};
+        // Phase-0 defensive guard. AePush is scalar-only (4 uints + 4
+        // floats = 32B, naturally aligned), but adding a vec4 or
+        // reordering into something non-multiple-of-16 would silently
+        // shift the shader's reads. Asserts catch it at compile time.
+        static_assert(sizeof(AePush) == 32,
+                      "AePush layout mismatch with AutoExposure.slang");
+        static_assert(sizeof(AePush) % 16 == 0,
+                      "AePush must be 16-byte aligned (cbuffer rule)");
         ae.width  = fc.width;
         ae.height = fc.height;
         ae.stride = 16;
@@ -3275,6 +3283,15 @@ void Engine::RenderFrame() {
                 cb->BindStorageTexture(0, src_h);
                 cb->BindStorageTexture(1, dst_h);
                 struct DownPush { float threshold; float pad[3]; } dp{};
+                // Phase-0 defensive guard: every push struct must be 16-byte
+                // aligned to satisfy the std140 / MSL cbuffer rule the Slang
+                // compiler applies on the GPU side. DownPush is naturally
+                // 16B (1 float + 3 pad floats), but the assert catches a
+                // future "drop the pad" edit that would silently shift the
+                // shader's read offset. See the same pattern on PtPush
+                // (Engine.cpp:~3002) where the regression actually bit us.
+                static_assert(sizeof(DownPush) % 16 == 0,
+                              "DownPush must be 16-byte aligned (cbuffer rule)");
                 dp.threshold = (i == 0) ? bloom_thresh : 0.0f;
                 cb->PushConstants(&dp, sizeof(dp));
                 cb->Dispatch((bloom_mip_w_[i] + 7) / 8,
@@ -3292,6 +3309,9 @@ void Engine::RenderFrame() {
                 cb->BindStorageTexture(0, pt::rhi::TextureHandle{bloom_mip_tex_id_[i]});
                 cb->BindStorageTexture(1, pt::rhi::TextureHandle{bloom_mip_tex_id_[i - 1]});
                 struct UpPush { float radius; float pad[3]; } up_push{};
+                // Phase-0 defensive guard -- see DownPush above for rationale.
+                static_assert(sizeof(UpPush) % 16 == 0,
+                              "UpPush must be 16-byte aligned (cbuffer rule)");
                 up_push.radius = bloom_radius;
                 cb->PushConstants(&up_push, sizeof(up_push));
                 cb->Dispatch((bloom_mip_w_[i - 1] + 7) / 8,
@@ -3889,6 +3909,12 @@ void Engine::RenderFrame() {
                 num_cmds,
                 panel_col, accent_col, graph_col,
             };
+            // Phase-0 defensive guard -- 8 uints = 32B, naturally aligned,
+            // assert catches future reorderings into a non-16B size.
+            static_assert(sizeof(PerfPush) == 32,
+                          "PerfPush layout mismatch with PerfOverlay.slang");
+            static_assert(sizeof(PerfPush) % 16 == 0,
+                          "PerfPush must be 16-byte aligned (cbuffer rule)");
 
             cb->BindComputePipeline(pt::rhi::PipelineHandle{perfoverlay_pipeline_id_});
             cb->BindStorageTexture(0, fc.swapchain_image);
