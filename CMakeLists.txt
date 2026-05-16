@@ -13,7 +13,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
 endif()
 
 project(demont
-    VERSION 0.3.23
+    VERSION 0.3.25
     DESCRIPTION "DeMonT Engine -- non-rasterized real-time game engine. Path-traced every pixel, mesh CSG via Manifold. Metal + MetalFX denoiser on Apple Silicon, Vulkan + SVGF compute denoiser on NVIDIA RTX."
     LANGUAGES C CXX
 )
@@ -55,6 +55,24 @@ option(PT_ENABLE_AVX512_EMBREE  "Enable AVX-512 build of Embree (runtime-dispatc
 # regardless). doctest is single-header so the configure-time cost is
 # small either way.
 option(PT_BUILD_TESTS           "Build unit tests via doctest"          ON)
+# Developer tooling (imgdiff, future golden-image helpers, etc.).
+# Each tool target is standalone -- no link deps on pt_engine /
+# pt_rhi_vulkan / pt_rhi_metal, so cmake --build --target <tool>
+# stays fast and doesn't pull in the GPU backends.
+#
+# Caveat: this gates *building* tools/, not project configure. The
+# top-level configure still runs the usual find_package(Vulkan) +
+# add_subdirectory(src) path, which means a tools-only consumer who
+# wants to skip the Vulkan SDK install needs both
+#   -DPT_BUILD_TOOLS=ON -DPT_ENABLE_VULKAN_BACKEND=OFF
+# Disabling the engine subtree from configure is a separate option we
+# haven't needed yet; revisit if a CI image-compare job wants a truly
+# minimal configure.
+#
+# Default ON so contributors get the tools without extra cmake flags;
+# release.yml can flip OFF if the release artefact should stay binary-
+# minimal.
+option(PT_BUILD_TOOLS           "Build developer tooling under tools/"  ON)
 
 # --- Compiler/warning helper -----------------------------------------------
 include(cmake/CompilerWarnings.cmake)
@@ -139,6 +157,15 @@ include(cmake/Dependencies.cmake)
 
 # --- Sources ----------------------------------------------------------------
 add_subdirectory(src)
+
+# --- Tools ------------------------------------------------------------------
+# Developer CLIs that don't depend on the engine -- imgdiff is the first.
+# Gated separately from PT_BUILD_TESTS so a "tests off, tools on" build
+# (e.g. someone wanting just imgdiff for a CI image-compare step) is
+# still possible.
+if(PT_BUILD_TOOLS)
+    add_subdirectory(tools)
+endif()
 
 # --- Tests ------------------------------------------------------------------
 # enable_testing() must be in the top-level CMakeLists so `ctest` from the

@@ -1,0 +1,295 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Rajesh D'Monte
+//
+// imgdiff: PNG-to-PNG comparison CLI. Groundwork for the golden-image
+// regression matrix (#45). Exits 0 if the candidate matches the
+// reference within the supplied thresholds; non-zero otherwise.
+//
+// Usage:
+//   imgdiff actual.png golden.png [--max-delta N] [--mean-delta M]
+//                                  [--fail-percent P] [--diff out.png]
+//
+// Threshold semantics live in ImgDiff.h. All three numeric flags
+// default to 0 -> byte-identical match required. Loosen as needed for
+// AA / dithering tolerance in goldens that include antialiased edges
+// or dithering noise.
+//
+// PNG I/O via vendored stb_image / stb_image_write headers. The
+// implementations live in stb_impl.cpp so this TU stays under the
+// project's normal warning policy. Output (in addition to the exit
+// code) is one line of "key=value ..." stats to stdout so it's easy
+// to grep + parse from CI logs.
+
+#include "stb_image.h"
+#include "stb_image_write.h"
+
+#include "ImgDiff.h"
+
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string_view>
+#include <vector>
+
+namespace {
+
+constexpr int kExitOk             = 0;
+constexpr int kExitMismatch       = 1;  // diff above thresholds
+constexpr int kExitUsageError     = 2;  // bad args / unknown flag
+constexpr int kExitLoadError      = 3;  // PNG load failed
+constexpr int kExitSizeMismatch   = 4;  // images differ in dimensions
+constexpr int kExitDiffWriteError = 5;  // --diff target couldn't be written
+
+void PrintUsage(std::FILE* out) {
+    std::fprintf(out,
+        "Usage: imgdiff actual.png golden.png [options]\n"
+        "\n"
+        "Compare two RGBA images and exit non-zero if the per-pixel L2\n"
+        "distance exceeds the supplied thresholds. Used by the golden-\n"
+        "image regression matrix.\n"
+        "\n"
+        "Options:\n"
+        "  --max-delta N       Per-pixel L2 above N counts as a 'bad' pixel.\n"
+        "                      Default 0 (any non-zero diff is bad).\n"
+        "  --mean-delta M      Fail if mean per-pixel L2 > M. Default 0.\n"
+        "  --fail-percent P    Fail if percentage of bad pixels > P. Default 0.\n"
+        "  --diff path.png     Write a colorized heatmap PNG of per-pixel deltas.\n"
+        "  -h, --help          Show this help.\n"
+        "\n"
+        "Exit codes:\n"
+        "  0 = pass (within thresholds)\n"
+        "  1 = mismatch (above thresholds)\n"
+        "  2 = usage error\n"
+        "  3 = failed to load one of the input PNGs\n"
+        "  4 = inputs differ in dimensions\n"
+        "  5 = --diff PNG could not be written\n");
+}
+
+bool ParseDouble(const char* s, double& out) {
+    // strtod over std::from_chars(double): libc++ on macOS gates the
+    // floating-point from_chars overloads on the deployment target
+    // (-mmacosx-version-min=14.0 in this project's mac preset rejects
+    // it as "introduced in macOS 26.0"). strtod has been in <cstdlib>
+    // since C89 and has no availability gating. Trade-off: strtod
+    // touches errno + the global locale's decimal point. We accept
+    // that here -- imgdiff is a short-lived CLI process, not a
+    // hot-path engine routine; the locale dependency only matters
+    // for users running with a decimal-comma locale, who can
+    // `LC_ALL=C imgdiff ...` if it bites.
+    if (!s || *s == '\0') return false;
+    errno = 0;
+    char* end = nullptr;
+    const double v = std::strtod(s, &end);
+    // strict tail: must consume the entire string, otherwise we'd
+    // silently accept "1.0junk" or "1e" (partial-parse stops).
+    if (end == s || *end != '\0') return false;
+    if (errno != 0)                return false;
+    out = v;
+    return true;
+}
+
+struct CliArgs {
+    const char* actualPath = nullptr;
+    const char* goldenPath = nullptr;
+    const char* diffPath   = nullptr;
+    pt::imgdiff::Thresholds thresholds;
+    bool helpRequested     = false;
+};
+
+// Parse argv into CliArgs. Returns true on success, false on usage
+// error (in which case an error message has already been printed to
+// stderr).
+bool ParseArgs(int argc, char** argv, CliArgs& out) {
+    int positional = 0;
+    for (int i = 1; i < argc; ++i) {
+        std::string_view a = argv[i];
+
+        if (a == "-h" || a == "--help") {
+            out.helpRequested = true;
+            return true;
+        }
+
+        // All value-taking flags need a follow-on argv.
+        auto takeValue = [&](std::string_view flag, double& dst) -> bool {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "imgdiff: %.*s requires a value\n",
+                             int(flag.size()), flag.data());
+                return false;
+            }
+            ++i;
+            if (!ParseDouble(argv[i], dst)) {
+                std::fprintf(stderr, "imgdiff: %.*s: invalid number '%s'\n",
+                             int(flag.size()), flag.data(), argv[i]);
+                return false;
+            }
+            return true;
+        };
+
+        if (a == "--max-delta") {
+            if (!takeValue(a, out.thresholds.maxDelta)) return false;
+        } else if (a == "--mean-delta") {
+            if (!takeValue(a, out.thresholds.meanDelta)) return false;
+        } else if (a == "--fail-percent") {
+            if (!takeValue(a, out.thresholds.failPercent)) return false;
+        } else if (a == "--diff") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "imgdiff: --diff requires a path\n");
+                return false;
+            }
+            ++i;
+            out.diffPath = argv[i];
+        } else if (!a.empty() && a.front() == '-') {
+            std::fprintf(stderr, "imgdiff: unknown flag '%s'\n", argv[i]);
+            return false;
+        } else {
+            if (positional == 0)      out.actualPath = argv[i];
+            else if (positional == 1) out.goldenPath = argv[i];
+            else {
+                std::fprintf(stderr, "imgdiff: unexpected extra argument '%s'\n",
+                             argv[i]);
+                return false;
+            }
+            ++positional;
+        }
+    }
+
+    if (out.helpRequested) return true;
+
+    if (!out.actualPath || !out.goldenPath) {
+        std::fprintf(stderr, "imgdiff: expected two positional PNG paths\n");
+        return false;
+    }
+    return true;
+}
+
+// Wrap stb_image's malloc-returning load into a vector for RAII. Forces
+// 4-channel RGBA8 output regardless of source channel count -- matches
+// the ImgDiff::Compute contract.
+struct LoadedImage {
+    std::vector<uint8_t> pixels;
+    int width  = 0;
+    int height = 0;
+};
+
+bool LoadRgba8(const char* path, LoadedImage& out) {
+    int w = 0, h = 0, ch = 0;
+    // desired_channels=4 -> always RGBA8; stb fills the alpha with 255
+    // for sources without alpha. Source-channel-count goes into `ch`
+    // for diagnostics but we never read it again after this.
+    uint8_t* data = stbi_load(path, &w, &h, &ch, 4);
+    if (!data) {
+        std::fprintf(stderr, "imgdiff: failed to load '%s': %s\n",
+                     path, stbi_failure_reason());
+        return false;
+    }
+    // stb's contract is that a successful load has w >= 1 and h >= 1,
+    // but assert it explicitly: corrupted PNG headers, future stb
+    // bugs, or a partially-zeroed return path on an error stb didn't
+    // detect would otherwise feed undefined bytes through `data + 0`.
+    if (w <= 0 || h <= 0) {
+        std::fprintf(stderr, "imgdiff: '%s' has invalid dimensions %dx%d\n",
+                     path, w, h);
+        stbi_image_free(data);
+        return false;
+    }
+    // Overflow guard. `w` and `h` are signed int (positive after the
+    // check above), so the product can be up to ~4.6e18 which fits in
+    // uint64_t. On 64-bit platforms that's well under SIZE_MAX so this
+    // is a no-op there; on 32-bit it catches a corrupted header that
+    // could otherwise demand multi-GB allocations via `data + bytes`
+    // wraparound. The arbitrary cap is the actual SIZE_MAX of the
+    // build target, not a hard-coded image-size limit -- legitimate
+    // 64-bit builds can still load very large goldens.
+    const uint64_t bytes64 = uint64_t(w) * uint64_t(h) * 4ull;
+    if (bytes64 > uint64_t(SIZE_MAX)) {
+        std::fprintf(stderr,
+            "imgdiff: '%s' is too large for this build (%dx%d, %llu bytes)\n",
+            path, w, h, (unsigned long long)bytes64);
+        stbi_image_free(data);
+        return false;
+    }
+    const size_t bytes = size_t(bytes64);
+    out.pixels.assign(data, data + bytes);
+    out.width  = w;
+    out.height = h;
+    stbi_image_free(data);
+    return true;
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    CliArgs args;
+    if (!ParseArgs(argc, argv, args)) {
+        PrintUsage(stderr);
+        return kExitUsageError;
+    }
+    if (args.helpRequested) {
+        PrintUsage(stdout);
+        return kExitOk;
+    }
+
+    LoadedImage actual;
+    LoadedImage golden;
+    if (!LoadRgba8(args.actualPath, actual)) return kExitLoadError;
+    if (!LoadRgba8(args.goldenPath, golden)) return kExitLoadError;
+
+    if (actual.width != golden.width || actual.height != golden.height) {
+        std::fprintf(stderr,
+            "imgdiff: dimension mismatch: actual=%dx%d golden=%dx%d\n",
+            actual.width, actual.height, golden.width, golden.height);
+        return kExitSizeMismatch;
+    }
+
+    std::vector<uint8_t> diffPixels;
+    uint8_t* diffPtr = nullptr;
+    if (args.diffPath) {
+        diffPixels.resize(size_t(actual.width) * size_t(actual.height) * 4u);
+        diffPtr = diffPixels.data();
+    }
+
+    const pt::imgdiff::DiffStats stats = pt::imgdiff::Compute(
+        actual.pixels.data(),
+        golden.pixels.data(),
+        uint32_t(actual.width),
+        uint32_t(actual.height),
+        args.thresholds.maxDelta,
+        diffPtr);
+
+    const bool ok = pt::imgdiff::Passes(stats, args.thresholds);
+
+    // One-line key=value stats so CI logs can grep them out. `result` is
+    // the human-friendly verdict; the exit code is the machine signal.
+    std::printf(
+        "result=%s width=%d height=%d total=%llu bad=%llu "
+        "max_delta=%.4f mean_delta=%.6f rms_delta=%.6f bad_percent=%.6f "
+        "thr_max=%.4f thr_mean=%.6f thr_fail_percent=%.6f\n",
+        ok ? "pass" : "fail",
+        actual.width, actual.height,
+        (unsigned long long)stats.totalPixels,
+        (unsigned long long)stats.badPixels,
+        stats.maxDelta, stats.meanDelta, stats.rmsDelta, stats.badPercent,
+        args.thresholds.maxDelta, args.thresholds.meanDelta,
+        args.thresholds.failPercent);
+
+    if (args.diffPath) {
+        const int stride = actual.width * 4;
+        if (!stbi_write_png(args.diffPath, actual.width, actual.height,
+                            4, diffPixels.data(), stride)) {
+            std::fprintf(stderr, "imgdiff: failed to write diff PNG '%s'\n",
+                         args.diffPath);
+            // Distinct exit code (5) so the CI caller can tell a
+            // diff-write failure apart from a real load failure (3) or
+            // a real mismatch (1). On a mismatch we keep returning 1 --
+            // the user already learned the verdict via stdout + exit
+            // code 1, the missing heatmap is a degraded diagnostic but
+            // not a different outcome. On a passing compare a missing
+            // heatmap is the *only* thing to flag, so 5 it is.
+            return ok ? kExitDiffWriteError : kExitMismatch;
+        }
+    }
+
+    return ok ? kExitOk : kExitMismatch;
+}
