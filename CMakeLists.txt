@@ -56,10 +56,22 @@ option(PT_ENABLE_AVX512_EMBREE  "Enable AVX-512 build of Embree (runtime-dispatc
 # small either way.
 option(PT_BUILD_TESTS           "Build unit tests via doctest"          ON)
 # Developer tooling (imgdiff, future golden-image helpers, etc.).
-# Standalone executables with no engine deps -- they build fast and
-# don't need Vulkan / Metal SDKs. Default ON so contributors get them
-# without extra cmake flags; release.yml can flip OFF if/when the
-# pipeline only ships the demont binary.
+# Each tool target is standalone -- no link deps on pt_engine /
+# pt_rhi_vulkan / pt_rhi_metal, so cmake --build --target <tool>
+# stays fast and doesn't pull in the GPU backends.
+#
+# Caveat: this gates *building* tools/, not project configure. The
+# top-level configure still runs the usual find_package(Vulkan) +
+# add_subdirectory(src) path, which means a tools-only consumer who
+# wants to skip the Vulkan SDK install needs both
+#   -DPT_BUILD_TOOLS=ON -DPT_ENABLE_VULKAN_BACKEND=OFF
+# Disabling the engine subtree from configure is a separate option we
+# haven't needed yet; revisit if a CI image-compare job wants a truly
+# minimal configure.
+#
+# Default ON so contributors get the tools without extra cmake flags;
+# release.yml can flip OFF if the release artefact should stay binary-
+# minimal.
 option(PT_BUILD_TOOLS           "Build developer tooling under tools/"  ON)
 
 # --- Compiler/warning helper -----------------------------------------------

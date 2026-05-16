@@ -11,14 +11,15 @@
 //
 // Threshold semantics live in ImgDiff.h. All three numeric flags
 // default to 0 -> byte-identical match required. Loosen as needed for
-// AA / dithering tolerance in golden goldens.
+// AA / dithering tolerance in goldens that include antialiased edges
+// or dithering noise.
 //
-// PNG I/O via vendored stb_image / stb_image_write headers. Output (in
-// addition to the exit code) is one line of "key=value ..." stats to
-// stdout so it's easy to grep + parse from CI logs.
+// PNG I/O via vendored stb_image / stb_image_write headers. The
+// implementations live in stb_impl.cpp so this TU stays under the
+// project's normal warning policy. Output (in addition to the exit
+// code) is one line of "key=value ..." stats to stdout so it's easy
+// to grep + parse from CI logs.
 
-#define STB_IMAGE_IMPLEMENTATION
-#define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image.h"
 #include "stb_image_write.h"
 
@@ -35,11 +36,12 @@
 
 namespace {
 
-constexpr int kExitOk           = 0;
-constexpr int kExitMismatch     = 1;  // diff above thresholds
-constexpr int kExitUsageError   = 2;  // bad args / unknown flag
-constexpr int kExitLoadError    = 3;  // PNG load failed
-constexpr int kExitSizeMismatch = 4;  // images differ in dimensions
+constexpr int kExitOk             = 0;
+constexpr int kExitMismatch       = 1;  // diff above thresholds
+constexpr int kExitUsageError     = 2;  // bad args / unknown flag
+constexpr int kExitLoadError      = 3;  // PNG load failed
+constexpr int kExitSizeMismatch   = 4;  // images differ in dimensions
+constexpr int kExitDiffWriteError = 5;  // --diff target couldn't be written
 
 void PrintUsage(std::FILE* out) {
     std::fprintf(out,
@@ -62,7 +64,8 @@ void PrintUsage(std::FILE* out) {
         "  1 = mismatch (above thresholds)\n"
         "  2 = usage error\n"
         "  3 = failed to load one of the input PNGs\n"
-        "  4 = inputs differ in dimensions\n");
+        "  4 = inputs differ in dimensions\n"
+        "  5 = --diff PNG could not be written\n");
 }
 
 bool ParseDouble(std::string_view s, double& out) {
@@ -173,7 +176,33 @@ bool LoadRgba8(const char* path, LoadedImage& out) {
                      path, stbi_failure_reason());
         return false;
     }
-    const size_t bytes = size_t(w) * size_t(h) * 4u;
+    // stb's contract is that a successful load has w >= 1 and h >= 1,
+    // but assert it explicitly: corrupted PNG headers, future stb
+    // bugs, or a partially-zeroed return path on an error stb didn't
+    // detect would otherwise feed undefined bytes through `data + 0`.
+    if (w <= 0 || h <= 0) {
+        std::fprintf(stderr, "imgdiff: '%s' has invalid dimensions %dx%d\n",
+                     path, w, h);
+        stbi_image_free(data);
+        return false;
+    }
+    // Overflow guard. `w` and `h` are signed int (positive after the
+    // check above), so the product can be up to ~4.6e18 which fits in
+    // uint64_t. On 64-bit platforms that's well under SIZE_MAX so this
+    // is a no-op there; on 32-bit it catches a corrupted header that
+    // could otherwise demand multi-GB allocations via `data + bytes`
+    // wraparound. The arbitrary cap is the actual SIZE_MAX of the
+    // build target, not a hard-coded image-size limit -- legitimate
+    // 64-bit builds can still load very large goldens.
+    const uint64_t bytes64 = uint64_t(w) * uint64_t(h) * 4ull;
+    if (bytes64 > uint64_t(SIZE_MAX)) {
+        std::fprintf(stderr,
+            "imgdiff: '%s' is too large for this build (%dx%d, %llu bytes)\n",
+            path, w, h, (unsigned long long)bytes64);
+        stbi_image_free(data);
+        return false;
+    }
+    const size_t bytes = size_t(bytes64);
     out.pixels.assign(data, data + bytes);
     out.width  = w;
     out.height = h;
@@ -243,10 +272,14 @@ int main(int argc, char** argv) {
                             4, diffPixels.data(), stride)) {
             std::fprintf(stderr, "imgdiff: failed to write diff PNG '%s'\n",
                          args.diffPath);
-            // Reported separately from the comparison verdict: the diff
-            // PNG is a diagnostic artefact, and a failure to write it
-            // shouldn't flip a passing comparison to a fail.
-            return ok ? kExitLoadError : kExitMismatch;
+            // Distinct exit code (5) so the CI caller can tell a
+            // diff-write failure apart from a real load failure (3) or
+            // a real mismatch (1). On a mismatch we keep returning 1 --
+            // the user already learned the verdict via stdout + exit
+            // code 1, the missing heatmap is a degraded diagnostic but
+            // not a different outcome. On a passing compare a missing
+            // heatmap is the *only* thing to flag, so 5 it is.
+            return ok ? kExitDiffWriteError : kExitMismatch;
         }
     }
 
