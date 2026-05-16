@@ -130,6 +130,10 @@ void Window::RequestClose() {
     if (handle_ != nullptr) glfwSetWindowShouldClose(handle_, GLFW_TRUE);
 }
 
+void Window::Hide() {
+    if (handle_ != nullptr) glfwHideWindow(handle_);
+}
+
 // Signature is `void*(void*)` everywhere -- the implementation in
 // Window_Cocoa.mm casts back to GLFWwindow* internally.  Standardising
 // on void* avoids an ODR violation across translation units that

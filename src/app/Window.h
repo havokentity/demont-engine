@@ -45,6 +45,15 @@ public:
     bool ShouldClose() const;
     void RequestClose();
 
+    // Hide the OS window without destroying it. Used by the prompt
+    // path in r_software_blit_recreate=prompt: once the replacement
+    // process has been spawned (Engine::RestartProcess), hide this
+    // process's window immediately so the user doesn't see two
+    // overlapping engine windows during the brief interval before
+    // the main loop notices wants_quit_ and exits. No-op if the
+    // window doesn't exist.
+    void Hide();
+
     int  Width()  const noexcept { return width_;  }
     int  Height() const noexcept { return height_; }
 

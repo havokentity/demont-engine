@@ -1013,11 +1013,55 @@ void Engine::RequestBackendSwitch(BackendType to) {
                     L"demont engine: vulkan -> software (GDI)",
                     MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON1);
                 if (btn == IDYES) {
+                    // Persist the user's current cvar state (most
+                    // importantly r_backend=software and r_software_
+                    // blit=gdi -- both freshly mutated in this Tick
+                    // and not yet on disk) BEFORE spawning so the
+                    // child reads what the user actually intended.
+                    // Otherwise CreateProcessA + child Init can race
+                    // ahead of this process's Shutdown-time cfg
+                    // write, and the child boots from stale on-disk
+                    // values (typically the previous launch's
+                    // r_backend=vulkan -- not what the user asked
+                    // for). Bare LOG only; failure here is non-fatal.
+                    if (int n = pt::console::Console::Get().SaveArchivedCvars("demont.cfg"); n >= 0) {
+                        LOG_INFO("r_software_blit_recreate=prompt: pre-spawn cfg save ok ({} cvar(s))", n);
+                    } else {
+                        LOG_WARN("r_software_blit_recreate=prompt: pre-spawn cfg save failed -- child may boot with stale cvar state");
+                    }
                     if (RestartProcess()) {
-                        LOG_INFO("r_software_blit_recreate=prompt: spawn succeeded; current process will exit on next loop iteration");
-                        // Bail out without touching the device --
-                        // wants_quit_ is set, the loop exits cleanly,
-                        // and Shutdown() tears down GPU resources.
+                        LOG_INFO("r_software_blit_recreate=prompt: spawn succeeded; tearing down GPU + hiding window so the user sees only the new process");
+                        // Tear down the Vulkan device now (instead of
+                        // letting Shutdown do it at end of loop) for
+                        // two reasons:
+                        //
+                        //   1. The current Tick is mid-iteration; the
+                        //      remaining RenderFrame call would dispatch
+                        //      a final frame on a device whose swapchain
+                        //      may have lost compatibility while the
+                        //      modal MessageBox was up (DWM can
+                        //      reconfigure during modal dispatch).
+                        //      RenderFrame guards on (!device_) so
+                        //      clearing it makes the rest of this Tick
+                        //      a clean no-op.
+                        //   2. The child process is already starting
+                        //      up its own Vulkan instance; releasing
+                        //      ours promptly avoids two processes
+                        //      hammering the GPU + driver state at the
+                        //      same moment (driver crashes have been
+                        //      reported on this overlap window with
+                        //      the previous prompt-path implementation).
+                        //
+                        // Hide the window so the user only sees the
+                        // child's window during the brief overlap
+                        // before wants_quit_ unwinds the main loop.
+                        // Window stays alive (Hide, not Destroy) so
+                        // the rest of this Tick + the Shutdown path
+                        // can finish without window_->Handle() going
+                        // null on them.
+                        TearDownDevice();
+                        current_backend_ = BackendType::None;
+                        if (window_) window_->Hide();
                         return;
                     }
                     LOG_WARN("r_software_blit_recreate=prompt: CreateProcessA failed; falling back to warn behaviour");
