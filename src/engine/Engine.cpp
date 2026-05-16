@@ -1029,6 +1029,35 @@ void Engine::RequestBackendSwitch(BackendType to) {
                     } else {
                         LOG_WARN("r_software_blit_recreate=prompt: pre-spawn cfg save failed -- child may boot with stale cvar state");
                     }
+                    // Release our HTTP / TCP console-server ports BEFORE
+                    // spawning so the child's ConsoleServer::Start can
+                    // bind them cleanly. Without this the child races
+                    // ahead of our Shutdown-time server reset and hits
+                    // "Failed to start civetweb on 127.0.0.1:<port>" --
+                    // the child still runs (bind failure is non-fatal)
+                    // but loses HTTP / web-console access for the new
+                    // session. Releasing here also drops any already-
+                    // connected web console clients; they should
+                    // reconnect to the new process which now owns the
+                    // ports.
+                    //
+                    // server_.reset() calls ~ConsoleServer -> Stop()
+                    // exactly once. We also null the singleton pointer
+                    // so the static OnLog log sink (still registered
+                    // for the remainder of this Tick) sees g_instance
+                    // == nullptr and bails out instead of dereferencing
+                    // a destroyed server_. Shutdown's `if (server_)`
+                    // guard turns the later server_->Stop() into a
+                    // no-op; ConsoleServer::Stop is NOT idempotent
+                    // wrt WSACleanup (unconditional cleanup would
+                    // double-decrement Winsock's refcount if called
+                    // twice), so a single reset here is the right
+                    // shape.
+                    if (server_) {
+                        LOG_INFO("r_software_blit_recreate=prompt: releasing console-server ports for child");
+                        pt::console::ConsoleServer::SetGlobalInstance(nullptr);
+                        server_.reset();
+                    }
                     if (RestartProcess()) {
                         LOG_INFO("r_software_blit_recreate=prompt: spawn succeeded; tearing down GPU + hiding window so the user sees only the new process");
                         // Tear down the Vulkan device now (instead of
