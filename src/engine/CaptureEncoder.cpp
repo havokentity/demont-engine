@@ -82,6 +82,16 @@ std::vector<std::uint8_t> BuildSrgbBuffer(
     std::uint32_t                    h,
     CaptureSourceKind                kind,
     float                            exposure) {
+    // Per-component memcpy rather than `reinterpret_cast<float*>` /
+    // `reinterpret_cast<uint16_t*>` on the byte buffer. `std::vector<
+    // uint8_t>` only guarantees 1-byte alignment per the standard
+    // (std::allocator returns max-align-aligned storage in practice on
+    // every platform we target, so the typed loads work in production,
+    // but the standard-level UB trips UBSan and is brittle if the
+    // readback API ever switches to a custom allocator). memcpy is
+    // the canonical way to do "load a value with this representation
+    // from this byte stream" without strict-aliasing or alignment
+    // assumptions; modern compilers fold it to a single MOV/LDR.
     std::vector<std::uint8_t> rgb(std::size_t(w) * h * 3);
     for (std::uint32_t y = 0; y < h; ++y) {
         for (std::uint32_t x = 0; x < w; ++x) {
@@ -89,17 +99,25 @@ std::vector<std::uint8_t> BuildSrgbBuffer(
             float r = 0.0f, g = 0.0f, b = 0.0f;
             switch (kind) {
                 case CaptureSourceKind::Accum: {
-                    const float* src =
-                        reinterpret_cast<const float*>(raw.data()) + pi * 4;
-                    r = src[0]; g = src[1]; b = src[2];
+                    // RGBA32F: 16 bytes/pixel. Load R/G/B as three
+                    // independent float reads from the raw byte stream.
+                    const std::uint8_t* src = raw.data() + pi * 16;
+                    std::memcpy(&r, src + 0,  sizeof(float));
+                    std::memcpy(&g, src + 4,  sizeof(float));
+                    std::memcpy(&b, src + 8,  sizeof(float));
                     break;
                 }
                 case CaptureSourceKind::DenoiseColor: {
-                    const std::uint16_t* src =
-                        reinterpret_cast<const std::uint16_t*>(raw.data()) + pi * 4;
-                    r = HalfToFloat(src[0]);
-                    g = HalfToFloat(src[1]);
-                    b = HalfToFloat(src[2]);
+                    // RGBA16F: 8 bytes/pixel. Load each half-float as
+                    // uint16 then decode to float32 portably.
+                    const std::uint8_t* src = raw.data() + pi * 8;
+                    std::uint16_t hr = 0, hg = 0, hb = 0;
+                    std::memcpy(&hr, src + 0, sizeof(std::uint16_t));
+                    std::memcpy(&hg, src + 2, sizeof(std::uint16_t));
+                    std::memcpy(&hb, src + 4, sizeof(std::uint16_t));
+                    r = HalfToFloat(hr);
+                    g = HalfToFloat(hg);
+                    b = HalfToFloat(hb);
                     break;
                 }
             }

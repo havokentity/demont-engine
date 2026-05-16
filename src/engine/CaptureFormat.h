@@ -12,7 +12,8 @@
 // in without linking the encoder (the encoder TU is what owns the stb
 // implementation; this file owns only the format identity).
 //
-// The cvar `r_capture_format` is registered in CaptureEncoder.cpp with
+// The cvar `r_capture_format` is registered in FrameCapture.cpp at
+// static-init time (sentinel `kCaptureFormatRegistered`), with
 // `allowed_values = {"png","ppm"}` so the Console::Execute path
 // auto-rejects unknown strings with a uniform error. ParseOutputFormat
 // is the read-side counterpart used at capture time.

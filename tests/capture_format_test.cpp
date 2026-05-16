@@ -41,6 +41,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -147,13 +148,14 @@ TEST_CASE("capture format cvar: default png, archive flag, allowed_values gate")
     CHECK(r_jpg.error.find("png") != std::string::npos);
     CHECK(r_jpg.error.find("ppm") != std::string::npos);
 
-    // Empty value also rejected.
-    auto r_empty = C.Execute("test_cap_fmt_gate");
-    // Note: `Execute("name")` with no value typically prints the
-    // current value rather than mutating -- so `r_empty.ok` is true
-    // (it's a read, not a write). The substantive negative test is
-    // the explicit-invalid case above; this one only asserts the
-    // value didn't get clobbered by the no-arg form.
+    // No-arg form: `test_cap_fmt_gate` (no value). Execute("name") with
+    // no value prints the current value rather than mutating, so we
+    // don't care about r.ok -- the substantive negative test is the
+    // explicit-invalid case above. This sub-test only asserts the
+    // value didn't get clobbered by the no-arg form. Discard the
+    // result explicitly so `-Wall -Wextra` doesn't flag an unused
+    // local.
+    (void)C.Execute("test_cap_fmt_gate");
     CHECK(cv->value == "ppm");
 
     // The cvar-name and default-value constants exported from
@@ -176,20 +178,25 @@ TEST_CASE("capture encoder: PNG round-trip preserves every pixel") {
     constexpr std::uint32_t W = 4;
     constexpr std::uint32_t H = 3;
 
-    // RGBA32F input = 16 bytes / pixel. Layout matches CaptureSourceKind::Accum.
-    std::vector<std::uint8_t> raw(std::size_t(W) * H * 16);
-    float* fp = reinterpret_cast<float*>(raw.data());
+    // RGBA32F input. Build as a properly-aligned `std::vector<float>`,
+    // then memcpy bytes into the encoder's expected `vector<uint8_t>`
+    // contract. Avoids the alignment / strict-aliasing UB that a
+    // `reinterpret_cast<float*>(uint8_data)` write would incur (and
+    // matches the memcpy-based read on the encoder side).
+    std::vector<float> floats(std::size_t(W) * H * 4);
     for (std::uint32_t y = 0; y < H; ++y) {
         for (std::uint32_t x = 0; x < W; ++x) {
             const std::size_t pi = std::size_t(y) * W + x;
             // R = horizontal ramp 0..1, G = vertical ramp 0..1, B = constant
             // 0.5 (mid-tone, exercises the non-linear sRGB segment), A = 1.
-            fp[pi * 4 + 0] = static_cast<float>(x) / static_cast<float>(W - 1);
-            fp[pi * 4 + 1] = static_cast<float>(y) / static_cast<float>(H - 1);
-            fp[pi * 4 + 2] = 0.5f;
-            fp[pi * 4 + 3] = 1.0f;
+            floats[pi * 4 + 0] = static_cast<float>(x) / static_cast<float>(W - 1);
+            floats[pi * 4 + 1] = static_cast<float>(y) / static_cast<float>(H - 1);
+            floats[pi * 4 + 2] = 0.5f;
+            floats[pi * 4 + 3] = 1.0f;
         }
     }
+    std::vector<std::uint8_t> raw(floats.size() * sizeof(float));
+    std::memcpy(raw.data(), floats.data(), raw.size());
 
     // Ground truth: what the shared sRGB helper produces from this input.
     // EncodeAndWritePng and BuildSrgbBuffer are the same path up to the

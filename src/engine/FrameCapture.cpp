@@ -43,14 +43,18 @@ State& GetState() {
 // Register `r_capture_format` at static-init time. PT_CVAR doesn't
 // surface `allowed_values`, so we register manually via Console::Get
 // and mutate the returned CVar*. `allowed_values` makes Console::
-// Execute reject unknown strings with a uniform "got 'X', expected
-// 'png|ppm'" error -- no per-cvar on_change validator needed.
+// Execute reject unknown strings with a uniform error formatted as
+// `r_capture_format: invalid value 'X' (expected one of: png|ppm)`
+// -- no per-cvar on_change validator needed.
 //
 // Static-init runs once at program startup before any FrameCapture
 // function is reachable, so by the time DoCapture queries the cvar
 // it's guaranteed to exist with a valid `value`. Sentinel bool keeps
-// the initializer from being optimised away under LTO.
-const bool kCaptureFormatRegistered = [] {
+// the initializer from being optimised away under LTO;
+// `[[maybe_unused]]` silences -Wunused-const-variable on Clang/GCC
+// (the sentinel itself is never read by the program -- only the
+// side effect of its initializer matters).
+[[maybe_unused]] const bool kCaptureFormatRegistered = [] {
     auto* cv = pt::console::Console::Get().RegisterCVar(
         kCaptureFormatCvar,
         kCaptureFormatDefault,
