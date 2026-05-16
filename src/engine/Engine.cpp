@@ -405,15 +405,20 @@ namespace cvar {
             CVAR_ARCHIVE);
     PT_CVAR(r_capture_frame_at, "0",
             "Frame-capture: write the current visible frame to "
-            "captures/capture_<frame_n>_<denoiser>_<ts>.ppm at the given "
+            "captures/capture_<frame_n>_<denoiser>_<ts>.<ext> at the given "
             "absolute frame index (engine's frame_index_, monotonic from "
-            "0 on cold start). 0 = disabled. One-shot per cvar set; auto-"
-            "resets to 0 after the capture fires. Source texture is "
-            "picked from the engine state: accum_hdr (RGBA32F) when "
-            "denoiser is off, denoise_color (RGBA16F) when denoiser is "
-            "on. Both go through the same on-CPU ACES + sRGB OETF as "
-            "the screenshot command, so the PPM matches what's on screen "
-            "modulo bloom / lens-flare / perf-overlay.",
+            "0 on cold start; <ext> picked by r_capture_format). 0 = "
+            "disabled. One-shot per cvar set; auto-resets to 0 after the "
+            "capture fires. ABSOLUTE on purpose so it pairs with "
+            "r_capture_seed for bit-identical capture across runs -- for "
+            "interactive `capture in N frames from now` use the "
+            "`capture_in N` command, which writes this cvar to "
+            "frame_index + N. Source texture is picked from the engine "
+            "state: accum_hdr (RGBA32F) when denoiser is off, "
+            "denoise_color (RGBA16F) when denoiser is on. Both go through "
+            "the same on-CPU ACES + sRGB OETF as the screenshot command, "
+            "so the output matches what's on screen modulo bloom / "
+            "lens-flare / perf-overlay.",
             0);
     PT_CVAR(r_capture_seq, "",
             "Frame-capture sequence: capture N frames at the given "
@@ -5175,6 +5180,90 @@ void Engine::RegisterCommands() {
         // sync with the active format.
         cmd->default_args = "demonte_screen";
     }
+
+    // frame_info: read-only peek at the engine's monotonic frame counter
+    // (the value r_capture_frame_at is measured against) plus the
+    // backend + r_spp + current resolution + whatever's armed on the
+    // capture state machine. Lets an interactive operator answer
+    // "what frame am I on?" without having to peek at the perf overlay
+    // (which doesn't surface frame_index anyway).
+    C.RegisterCommand("frame_info",
+        "Print the engine's monotonic frame index, current backend, "
+        "r_spp, render extent, and any armed FrameCapture state. "
+        "Use `capture_in N` to arm a one-shot relative to the current "
+        "frame; r_capture_frame_at is absolute (cold-start zero) and "
+        "pairs with r_capture_seed for deterministic capture across "
+        "runs.",
+        [this](auto, pt::console::Output& out) {
+            auto& Cf = pt::console::Console::Get();
+            int spp = 0;
+            if (auto* sv = Cf.FindCVar("r_spp")) spp = sv->GetInt();
+            std::string armed;
+            if (auto* v = Cf.FindCVar("r_capture_frame_at")) {
+                const int at = v->GetInt();
+                if (at > 0) armed += fmt::format(" one_shot_at={}", at);
+            }
+            if (auto* v = Cf.FindCVar("r_capture_seq")) {
+                if (!v->value.empty()) armed += fmt::format(" seq=\"{}\"", v->value);
+            }
+            out.FormatLine(
+                "frame_index={} backend={} r_spp={} accum={}x{}{}",
+                frame_index_,
+                pt::rhi::BackendName(current_backend_),
+                spp,
+                accum_w_, accum_h_,
+                armed.empty() ? std::string{} : (" armed:" + armed));
+        });
+
+    // capture_in: ergonomic relative form of r_capture_frame_at. Same
+    // machinery (one-shot arm + auto-disarm + format dispatch + retry-
+    // on-readback-failure) -- this command just resolves "now + N" to
+    // an absolute frame_index and writes the cvar. Kept separate from
+    // r_capture_frame_at so the determinism contract on the cvar
+    // (absolute frame index, pairs with r_capture_seed for bitwise-
+    // identical output across runs) stays intact.
+    C.RegisterCommand("capture_in",
+        "capture_in <N>: arm a one-shot frame capture for N frames "
+        "from now (N >= 1). Convenience wrapper around r_capture_frame_at; "
+        "honours r_capture_format and r_capture_seed exactly like the "
+        "cvar-driven path.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.empty()) {
+                out.PrintLine("usage: capture_in <N>");
+                return;
+            }
+            // std::from_chars keeps us out of std::stoi's throw-on-fail
+            // semantics (project builds with -fno-exceptions / /EHs-c-).
+            // Rejects empty, signed, non-digit input.
+            const std::string s_arg(args[0]);
+            int n = 0;
+            auto pr = std::from_chars(s_arg.data(),
+                                      s_arg.data() + s_arg.size(), n);
+            if (pr.ec != std::errc() ||
+                pr.ptr != s_arg.data() + s_arg.size() ||
+                n <= 0) {
+                out.FormatLine("capture_in: N must be a positive integer "
+                               "(got '{}')", args[0]);
+                return;
+            }
+            const std::uint32_t target =
+                frame_index_ + static_cast<std::uint32_t>(n);
+            // SetCVarOverride writes the value AND fires on_change, so the
+            // r_capture_frame_at handler installed in RegisterCommands'
+            // post-cfg pass arms FrameCapture::SetOneShotFrame in one go.
+            // The on_change is also what the engine watches to reset the
+            // cvar surface back to "0" after the capture fires (see the
+            // MaybeCapture path in Tick).
+            auto& Cf = pt::console::Console::Get();
+            Cf.SetCVarOverride("r_capture_frame_at", std::to_string(target));
+            std::string fmt_name = "png";
+            if (auto* fv = Cf.FindCVar("r_capture_format")) {
+                fmt_name = fv->value;
+            }
+            out.FormatLine("capture_in: armed one-shot at frame {} "
+                           "(current={}, +{}); format={}",
+                           target, frame_index_, n, fmt_name);
+        });
 
     C.RegisterCommand("web_console",
         "Open the web console in the default browser.",
