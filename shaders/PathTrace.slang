@@ -295,6 +295,14 @@ cbuffer Push {
     // need it (metalfx, plain optix_hdr / optix_temporal_hdr) the
     // texture isn't bound, so the kernel MUST skip the write.
     uint   write_normal_gbuffer;
+    // 1 -> write albedo_tex at primary hit, 0 -> skip. The engine
+    // sets this only for the OptiX AOV variants (optix_hdr_aov /
+    // optix_temporal_hdr_aov), the only modes that own an albedo
+    // G-buffer. Required because under
+    // VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT the unbound slot
+    // doesn't get a null-descriptor pass-through anymore -- the
+    // shader must elide the write itself.
+    uint   write_albedo_gbuffer;
     // 1 -> kernel writes its per-pixel linear-HDR (or pre-tonemapped LDR
     // when w2j_row0.w = 0) radiance to `denoise_color`. Set by the engine
     // when EITHER a denoiser is active OR `r_bloom` is on without a
@@ -362,6 +370,9 @@ cbuffer Frame {
     // See the matching field in the Metal Push cbuffer above for
     // semantics. 1 -> write normal_tex, 0 -> skip.
     uint   write_normal_gbuffer;
+    // See the matching field in the Metal Push cbuffer above for
+    // semantics. 1 -> write albedo_tex, 0 -> skip.
+    uint   write_albedo_gbuffer;
     // See `write_hdr_aux` in the Metal Push cbuffer above.
     uint   write_hdr_aux;
     // See `mis_enabled` in the Metal Push cbuffer above. Reuses
@@ -1399,15 +1410,21 @@ void main(uint2 tid : SV_DispatchThreadID) {
         }
 #ifdef PT_TARGET_SPIRV
         // Albedo G-buffer: only allocated/bound by the engine when
-        // r_denoiser is optix_hdr_aov. In other modes binding 17 is a
-        // null descriptor and this write is a no-op (Vulkan robust-
-        // buffer-access). Metal SVGF doesn't use albedo so the
-        // declaration stays SPIR-V-only -- adding a new texture slot
-        // on the Metal side has a real cost (MSL texture-index
-        // assignment cascades) and SVGF without an albedo guide
-        // matches the Vulkan svgf_basic / svgf_atrous behaviour
-        // exactly.
-        albedo_tex[tid] = float4(hit_albedo, 0.0);
+        // r_denoiser is optix_hdr_aov / optix_temporal_hdr_aov. Gated
+        // because the descriptor layout uses
+        // VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT -- binding 17 is
+        // simply absent from the dispatch's descriptor view in other
+        // modes (it used to be a null descriptor + robust-buffer-
+        // access no-op, but MoltenVK on Apple Silicon doesn't
+        // implement nullDescriptor, hence the move to partially-
+        // bound). Metal SVGF doesn't use albedo so the declaration
+        // stays SPIR-V-only -- adding a new texture slot on the
+        // Metal side has a real cost (MSL texture-index assignment
+        // cascades) and SVGF without an albedo guide matches the
+        // Vulkan svgf_basic / svgf_atrous behaviour exactly.
+        if (write_albedo_gbuffer != 0u) {
+            albedo_tex[tid] = float4(hit_albedo, 0.0);
+        }
 #endif
     }
 

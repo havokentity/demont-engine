@@ -2295,9 +2295,11 @@ void Engine::RenderFrame() {
     // only. PathTrace.slang's albedo_tex is PT_TARGET_SPIRV-gated so
     // Metal builds don't expect anything; the Metal backend's 8-slot
     // bound_tex_ silently drops slot 9 anyway. When albedo_tex_id_ is
-    // 0 (any non-AOV mode) we don't bind here, and the path tracer's
-    // unconditional write to binding 17 is a no-op via Vulkan
-    // robust-buffer-access against the descriptor set's null entry.
+    // 0 (any non-AOV mode) we don't bind here AND the host sets
+    // push.write_albedo_gbuffer = 0 so the shader elides its write --
+    // required under VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, which
+    // (unlike the older nullDescriptor scheme) leaves the slot absent
+    // from the descriptor set rather than as a safe null pass-through.
     if (denoiser_active_ && albedo_tex_id_ != 0) {
         cb->BindStorageTexture(9, pt::rhi::TextureHandle{albedo_tex_id_});
     }
@@ -2413,6 +2415,18 @@ void Engine::RenderFrame() {
         // per pixel per frame on non-normal-consuming denoiser modes
         // AND closing the unbound-write hole on Metal.
         std::uint32_t write_normal_gbuffer;
+        // 1 -> kernel writes albedo_tex at primary hit, 0 -> skip.
+        // Albedo is only consumed by the OptiX AOV variants
+        // (optix_hdr_aov / optix_temporal_hdr_aov); the engine
+        // doesn't allocate albedo_tex_id_ for any other denoiser.
+        // Required gate after the descriptor strategy moved to
+        // VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT -- the unconditional
+        // albedo_tex write used to rely on Vulkan robust-buffer-access
+        // returning zero for the null descriptor on non-AOV modes;
+        // under partially-bound the slot stays unwritten in the
+        // descriptor set and the write would be UB. Mirrors the
+        // write_normal_gbuffer gating exactly.
+        std::uint32_t write_albedo_gbuffer;
         // 1 -> kernel writes per-pixel linear-HDR radiance to
         // denoise_color. Set when EITHER a denoiser is active OR bloom
         // is requested on a backend that runs the engine-side Tonemap
@@ -2428,6 +2442,27 @@ void Engine::RenderFrame() {
         // Reuses the slot that used to be `_hdri_pad[1]`; same total
         // struct size, same static_assert sum below.
         std::uint32_t mis_enabled;
+        // Explicit 12-byte pad to align `accum_params` (float4) at the
+        // next 16-byte boundary, matching the std140 / MSL cbuffer
+        // rule the Slang shader compiler applies to `Push` /
+        // `Frame` in PathTrace.slang. Originally we had 4 uints here
+        // (hdri_lights_count + write_normal_gbuffer + write_hdr_aux +
+        // mis_enabled) totalling 16 bytes -- already a multiple of 16,
+        // so accum_params landed at the right offset without any
+        // explicit pad. Adding write_albedo_gbuffer pushed the run
+        // to 5 uints (20 bytes); without this pad the host writes
+        // accum_params at +20 while the shader reads it at +32, which
+        // shifts every subsequent field by 12 bytes -- linear_prim_count
+        // reads as 0, bvh_node_count reads as garbage past struct end,
+        // and primary rays sail through the analytic-plane geometry
+        // because the linear-pass loop runs zero iterations. Symptom
+        // was "Metal walls/floor wash to procedural-sky pink with the
+        // SVGF chain active" -- TLAS-mesh rays kept working (separate
+        // code path) but analytic-plane hits all missed. The offsetof
+        // static_asserts at the bottom of this struct guard against
+        // the same class of bug recurring if anyone slips a new uint
+        // in here.
+        std::uint32_t _pad_before_accum_params[3];
         // Accumulator parameters.
         //   .x = r_accum_ema_alpha — exponential-moving-average history
         //        retention factor in [0, 1). 0 = legacy online-mean
@@ -2493,6 +2528,11 @@ void Engine::RenderFrame() {
     // normal G-buffer this frame.
     push.write_normal_gbuffer =
         (denoiser_active_ && normal_tex_id_ != 0) ? 1u : 0u;
+    // Same gating logic as write_normal_gbuffer -- only the OptiX AOV
+    // modes own an albedo G-buffer this frame; everything else dispatches
+    // with binding 17 unbound under partially-bound semantics.
+    push.write_albedo_gbuffer =
+        (denoiser_active_ && albedo_tex_id_ != 0) ? 1u : 0u;
     push.env_map_present  = (env_map_tex_id_ != 0) ? 1u : 0u;
     {
         float intensity = 1.0f;
@@ -2950,7 +2990,21 @@ void Engine::RenderFrame() {
         push.clouds_p3[3] = rayleigh;
     }
 
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 128 + 128 + 16 + 16 + 16);
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16);
+    // Alignment guards: every vec4 / uvec4 field in the host PtPush
+    // must sit on a 16-byte boundary to match the std140 / MSL
+    // cbuffer layout the Slang compiler applies to PathTrace.slang's
+    // `Push` (Metal) and `Frame` (Vulkan) blocks. The shader compiler
+    // silently inserts padding to honour that rule, so if the host
+    // forgets to mirror it the GPU reads from 12 bytes ahead of where
+    // the host wrote (the bug class that landed `_pad_before_accum_params`
+    // above). Catch the next regression at compile time.
+    static_assert(offsetof(PtPush, accum_params) % 16 == 0,
+                  "PtPush::accum_params must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    static_assert(offsetof(PtPush, bvh_params) % 16 == 0,
+                  "PtPush::bvh_params must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
 

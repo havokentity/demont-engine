@@ -70,6 +70,11 @@ public:
     explicit VulkanDevice(const NativeWindowHandle& w);
     ~VulkanDevice() override;
 
+    // True iff the constructor finished without early-returning on a
+    // missing required feature / failed Vulkan call. The factory in
+    // Device.cpp uses this to surface a clean nullptr on partial init.
+    bool IsInitialized() const { return init_ok_; }
+
     BufferHandle      CreateBuffer(const BufferDesc&) override;
     TextureHandle     CreateTexture(const TextureDesc&) override;
     PipelineHandle    CreateComputePipeline(const ComputePipelineDesc&) override;
@@ -264,6 +269,14 @@ private:
     int         height_      = 0;
     std::string device_name_ = "Vulkan Device";
     bool        rt_supported_ = false;
+    // True iff the constructor ran to completion. The factory in
+    // Device.cpp checks this and returns nullptr on partial init, so
+    // Engine never sees a half-built device whose VkDevice handle is
+    // VK_NULL_HANDLE -- that previously cascaded into a wall of
+    // "buffer creation failed" / "texture create/upload failed" errors
+    // (one per resource the engine then tried to create against the
+    // dead device) after the first init check failed.
+    bool        init_ok_      = false;
     std::uint32_t frame_index_ = 0;
     std::uint32_t max_push_constant_size_ = 128;
 
@@ -349,8 +362,10 @@ private:
     // 19 bindings matching the maximally-expanded shader: the smaller
     // shaders (Tonemap, BloomDown/Up) reference only a subset; Vulkan
     // allows pipelines whose shader doesn't use a binding to be created
-    // against the larger layout. nullDescriptor lets the unused slots
-    // bind VK_NULL_HANDLE without validation noise.
+    // against the larger layout. Every binding is flagged
+    // PARTIALLY_BOUND so dispatches can leave unused slots unwritten
+    // without validation noise (no dependence on
+    // VK_EXT_robustness2.nullDescriptor, which MoltenVK doesn't expose).
     VkDescriptorSetLayout shared_dset_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout      shared_pipe_layout_ = VK_NULL_HANDLE;
 
