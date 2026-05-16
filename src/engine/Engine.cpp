@@ -69,11 +69,21 @@ namespace cvar {
             "Smoke-test frame budget. >0 = render this many frames then "
             "exit cleanly (exit code 0). 0 = run normally until the user "
             "quits. Typically set via the --smoke-frames=N CLI override "
-            "so a CI job can launch `demont --smoke-frames=32`, watch "
-            "the process exit cleanly, and infer that the backend "
-            "boots + renders + tears down without crashing. NOT "
-            "CVAR_ARCHIVE -- this is a per-invocation knob, never "
-            "persisted to demont.cfg, never read from it.",
+            "so a developer can run "
+            "`demont --smoke-frames=8 --r-backend=metal` on real "
+            "hardware to validate that a backend boots + renders + "
+            "tears down without crashing -- the exit code (0 success, "
+            "2 = backend init failed) plus the log output give a "
+            "useful smoke signal without needing a full screenshot "
+            "regression matrix. NOT wired into GitHub Actions CI "
+            "because the public-tier runners have no GPU (Mac has "
+            "only a paravirtualized GPU; Windows-latest has no GPU "
+            "at all; the paid `gpu-t4-4-core` is Team/Enterprise-only "
+            "and not available to open-source repos). When/if "
+            "self-hosted runners on real M-series / RTX hardware "
+            "appear, wire this back into build.yml -- the engine side "
+            "is ready. NOT CVAR_ARCHIVE -- per-invocation knob, never "
+            "persisted to demont.cfg.",
             CVAR_NONE);
     PT_CVAR(con_font_scale, "1.0",
             "Console overlay font scale. 1.0 = baseline (14 logical-unit "
@@ -4339,14 +4349,25 @@ void Engine::Run() {
 
     // Smoke-test mode: read the per-invocation frame budget once at
     // loop start. 0 (the default) = unbounded; >0 = render exactly
-    // this many frames then exit cleanly so CI can launch
-    // `demont --smoke-frames=N`, watch the process return 0, and
-    // infer "backend boots + renders + tears down without crashing
-    // or hitting an assertion." Set via the `--smoke-frames=N` CLI
-    // override which routes to the pt_smoke_frames cvar in
-    // RegisterCVars. Read once (not per-frame) because mid-run
-    // mutations to the budget would just be confusing -- the budget
-    // is a launch parameter.
+    // this many frames then exit cleanly. Set via the
+    // `--smoke-frames=N` CLI override which routes to the
+    // pt_smoke_frames cvar in RegisterCVars.
+    //
+    // Intended use is manual local validation -- e.g. after touching
+    // a backend's init path, run
+    //   ./demont --smoke-frames=8 --r-backend=metal
+    // and confirm the process exits 0. The 2-exit-code "backend init
+    // failed in 10s" path below catches the silent-init-failure case
+    // that's otherwise hard to spot.
+    //
+    // NOT wired into GH Actions CI today -- the public-tier hosted
+    // runners have no real GPU. See the comment block on
+    // pt_smoke_frames in RegisterCVars for the full backstory and
+    // the build.yml comment for where the smoke steps used to live.
+    //
+    // Read once (not per-frame) because mid-run mutations to the
+    // budget would just be confusing -- the budget is a launch
+    // parameter, not a runtime knob.
     std::uint32_t smoke_frame_budget = 0;
     if (auto* v = pt::console::Console::Get().FindCVar("pt_smoke_frames")) {
         const int n = v->GetInt();

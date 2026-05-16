@@ -88,45 +88,22 @@ jobs:
         # broke without an extra artefact download.
         run: ctest --test-dir build/mac-debug --output-on-failure
 
-      # Smoke tests: boot the engine, render 8 frames, exit cleanly.
-      # Catches device-init regressions, descriptor-binding regressions,
-      # kernel-dispatch regressions that don't crash the build but
-      # crash the runtime. Each backend runs in its own step so a Metal
-      # regression doesn't mask a Software one. macOS GH runners are
-      # real macOS VMs with a window server, so GLFW window creation
-      # works -- the smoke tests do create a brief on-screen window
-      # each run, which is fine on CI but explains why local devs see
-      # a flash if they run these commands manually.
+      # Backend smoke tests (`demont --smoke-frames=N --r-backend=X`)
+      # intentionally NOT run on the GH-hosted runner. The standard
+      # macos-* runners have only a paravirtualized Apple GPU --
+      # basic Metal renders but hardware ray tracing (which the engine
+      # requires) doesn't work reliably, and the smoke tests would
+      # either hang or fail-fast on no-device init. GitHub's paid
+      # GPU runner offering (`gpu-t4-4-core`, Tesla T4) is gated to
+      # Team / Enterprise plans and is Linux/Windows-only -- no
+      # Apple-Silicon GPU runner exists at any tier. See PR #77 for
+      # the full investigation.
       #
-      # timeout-minutes: 2 per step is the second line of defence
-      # behind the engine's own kSmokeNoDeviceTimeoutSec (10s in
-      # Engine::Run) -- if the in-engine fail-fast somehow regresses
-      # and the loop hangs, GH Actions kills the step within 2 minutes
-      # instead of burning the workflow's default 6-hour timeout.
-
-      - name: Smoke test (Software backend)
-        timeout-minutes: 2
-        run: ./build/mac-debug/src/app/demont --smoke-frames=8 --r-backend=software
-
-      - name: Smoke test (Metal backend)
-        # Catches MetalDevice init, MTLDevice / MTLCommandQueue creation,
-        # metal-cpp + metal-objc bridging glue, MetalSvgfDenoiser
-        # compile-on-first-Denoise path, etc. Mac Apple Silicon only --
-        # this step exists because the macOS runner is the only place
-        # we get a real Metal stack.
-        timeout-minutes: 2
-        run: ./build/mac-debug/src/app/demont --smoke-frames=8 --r-backend=metal
-
-      - name: Smoke test (Vulkan / MoltenVK backend)
-        # MoltenVK on Apple Silicon. Catches: nullDescriptor / partially-
-        # bound regressions (the v0.3.20 fix lives or dies on this step),
-        # AS / RayQuery paths, MoltenVK extension plumbing. Note: the
-        # CSG-on-Mac-Vulkan bug (#44) means rendered output is
-        # incomplete here but the smoke test still passes -- it asserts
-        # "boots + N frames + clean exit", not pixel-correctness. Pixel
-        # correctness is the golden-matrix job's concern (#45).
-        timeout-minutes: 2
-        run: ./build/mac-debug/src/app/demont --smoke-frames=8 --r-backend=vulkan
+      # The engine-side `--smoke-frames` mode itself stays usable for
+      # local dev + future self-hosted-runner CI. Run manually on real
+      # hardware when validating a backend:
+      #   ./build/mac-debug/src/app/demont --smoke-frames=8 --r-backend=metal
+      #   ./build/mac-debug/src/app/demont --smoke-frames=8 --r-backend=vulkan
 
   windows:
     name: Windows (NVIDIA RTX target)
@@ -183,30 +160,18 @@ jobs:
         shell: pwsh
         run: ctest --test-dir build/win-debug --output-on-failure
 
-      - name: Smoke test (Software backend)
-        # See the mac-debug Software smoke test for rationale. Windows
-        # has a desktop session on the GH runner so GLFW window
-        # creation works fine. timeout-minutes is the second line of
-        # defence behind Engine::Run's kSmokeNoDeviceTimeoutSec.
-        shell: pwsh
-        timeout-minutes: 2
-        run: ./build/win-debug/src/app/demont.exe --smoke-frames=8 --r-backend=software
-
-      # NOTE on the missing Windows Vulkan smoke step:
+      # Backend smoke tests intentionally NOT run on the GH-hosted
+      # windows-latest runner. The runner has no GPU hardware
+      # (no NVIDIA, no AMD, no software Vulkan ICD beyond what we
+      # don't install), so Vulkan init returns
+      # VK_ERROR_INCOMPATIBLE_DRIVER and Software backend would only
+      # exercise the CPU path. GitHub's paid Tesla-T4 GPU runners
+      # ARE Linux/Windows-only but are gated to Team / Enterprise
+      # plans, not available to public open-source repos. See PR #77
+      # for the full investigation.
       #
-      # The windows-latest GH runner has no GPU hardware and no
-      # software Vulkan ICD installed by the workflow (only the LunarG
-      # loader + headers, via install-vulkan-sdk-action). With no ICD,
-      # vkCreateInstance returns VK_ERROR_INCOMPATIBLE_DRIVER and the
-      # engine's Vulkan backend init fails -- which the smoke test's
-      # kSmokeNoDeviceTimeoutSec correctly treats as a fatal failure
-      # (exit code 2). That's a CI-environment limitation, not a
-      # regression worth gating PRs on; the Mac Vulkan smoke step
-      # already covers the MoltenVK path which is the most fragile.
-      # When a Windows-NVIDIA self-hosted runner exists, add the
-      # `--r-backend=vulkan` smoke step here (mirror the mac block).
-      # Until then, intentionally omitted to keep the windows job
-      # green.
+      # Run manually on real RTX hardware when validating Vulkan:
+      #   .\build\win-debug\src\app\demont.exe --smoke-frames=8 --r-backend=vulkan
 
   # Scheduled nightly release: at 23:00 IST (cron at top, in UTC) the
   # macos build runs and -- if it passes -- this job repackages the
