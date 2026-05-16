@@ -25,13 +25,12 @@
 
 #include "ImgDiff.h"
 
-#include <charconv>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string_view>
-#include <system_error>
 #include <vector>
 
 namespace {
@@ -68,17 +67,26 @@ void PrintUsage(std::FILE* out) {
         "  5 = --diff PNG could not be written\n");
 }
 
-bool ParseDouble(std::string_view s, double& out) {
-    // std::from_chars on double is C++17 in the spec but only widely
-    // shipped in libstdc++ 11+ / libc++ 17+ / MSVC STL 19.21+. All
-    // toolchains this project supports (MSVC 2022, AppleClang 15+,
-    // GCC 13+) ship it. Strict parse: rejects "1.0junk" by checking
-    // that the whole string-view was consumed.
-    const char* first = s.data();
-    const char* last  = s.data() + s.size();
-    auto [ptr, ec] = std::from_chars(first, last, out);
-    if (ec != std::errc{}) return false;
-    if (ptr != last)        return false;
+bool ParseDouble(const char* s, double& out) {
+    // strtod over std::from_chars(double): libc++ on macOS gates the
+    // floating-point from_chars overloads on the deployment target
+    // (-mmacosx-version-min=14.0 in this project's mac preset rejects
+    // it as "introduced in macOS 26.0"). strtod has been in <cstdlib>
+    // since C89 and has no availability gating. Trade-off: strtod
+    // touches errno + the global locale's decimal point. We accept
+    // that here -- imgdiff is a short-lived CLI process, not a
+    // hot-path engine routine; the locale dependency only matters
+    // for users running with a decimal-comma locale, who can
+    // `LC_ALL=C imgdiff ...` if it bites.
+    if (!s || *s == '\0') return false;
+    errno = 0;
+    char* end = nullptr;
+    const double v = std::strtod(s, &end);
+    // strict tail: must consume the entire string, otherwise we'd
+    // silently accept "1.0junk" or "1e" (partial-parse stops).
+    if (end == s || *end != '\0') return false;
+    if (errno != 0)                return false;
+    out = v;
     return true;
 }
 
