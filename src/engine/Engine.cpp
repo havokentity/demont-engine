@@ -1305,10 +1305,14 @@ bool Engine::RecreateWindow() {
     if (!window_->Recreate()) {
         LOG_ERROR("Engine::RecreateWindow: Window::Recreate failed; engine is in an unusable window state");
         // Drop the overlays since their parent_ is dead. The engine
-        // can technically continue with no window (smoke-test mode
-        // tolerates this), but the caller has already started a
-        // backend switch -- the most useful next thing is to log
-        // and let the dispatch site fall back to its warn path.
+        // is now unrenderable (no window, both overlays gone) and
+        // returning false signals the dispatch site to hard-stop:
+        // it sets current_backend_=None + wants_quit_=true so the
+        // main loop exits cleanly and the user can relaunch. We
+        // can't continue down the device-creation path because
+        // window_->Handle() is nullptr -- the new device would have
+        // no native handle and present-blits would silently no-op
+        // forever.
         overlay_.reset();
         perf_overlay_.reset();
         return false;
@@ -1320,6 +1324,14 @@ bool Engine::RecreateWindow() {
         if (!overlay_->Init(window_->NativeHandle())) {
             LOG_WARN("Engine::RecreateWindow: ConsoleOverlay re-Init failed; in-window log overlay disabled for this session");
             overlay_.reset();
+        } else if (auto* tv = C.FindCVar("r_theme")) {
+            // Re-apply the current theme. r_theme's on_change handler
+            // would push the theme to overlay_ if it fired, but the
+            // cvar value hasn't changed across the recreate -- so the
+            // on_change never fires and the freshly-Init'd overlay
+            // sits at its default theme. Mirror the perf_overlay
+            // branch below (which already does this).
+            overlay_->ApplyTheme(tv->value);
         }
         // Sink list is unchanged: ConsoleOverlay::OnLog stays
         // registered and starts forwarding again now that the static
@@ -1392,7 +1404,8 @@ bool Engine::RestartProcess() {
     //
     // Correct algorithm (Daniel Colascione, "Everyone quotes command
     // line arguments the wrong way"):
-    //   - If arg has no whitespace / tab / quote: emit literally.
+    //   - If arg has no whitespace / tab / quote / cmd metacharacter:
+    //     emit literally.
     //   - Else: wrap in "...". Inside the quoted run:
     //     - Track runs of consecutive backslashes.
     //     - If the run is followed by " (embedded literal quote):
@@ -1401,8 +1414,21 @@ bool Engine::RestartProcess() {
     //         double the run.
     //     - Otherwise (run followed by ordinary char):
     //         emit the run literally.
+    //
+    // The trigger-set is extended beyond ` \t"` to include the cmd.exe
+    // metacharacters & | < > ( ) ^ -- because we ship the command
+    // line through `cmd.exe /c start ...` below, an arg containing
+    // any of those would be reinterpreted by cmd before the target
+    // sees it. Wrapping in double quotes neutralises them inside the
+    // quoted run, leaving the target's CommandLineToArgvW parse
+    // unchanged. NOTE: % is NOT escaped here -- cmd expands
+    // %VAR% inside double quotes too, so an arg like `--user=%USER%`
+    // would still be interpreted by cmd (the canonical fix is the
+    // %^% trick but it doesn't survive cmd's quoting parser). The
+    // engine's own argv doesn't use % so this is a documented
+    // residual limit, not a live bug.
     auto quote = [](const std::string& s) -> std::string {
-        if (!s.empty() && s.find_first_of(" \t\"") == std::string::npos) return s;
+        if (!s.empty() && s.find_first_of(" \t\"&|<>()^") == std::string::npos) return s;
         std::string r = "\"";
         for (std::size_t i = 0; i < s.size(); ) {
             std::size_t bs = 0;
@@ -1423,12 +1449,6 @@ bool Engine::RestartProcess() {
         r += '"';
         return r;
     };
-    std::string cmdline = quote(exe_path);
-    for (int i = 1; i < argc_ && argv_ != nullptr; ++i) {
-        if (argv_[i] == nullptr) break;
-        cmdline += ' ';
-        cmdline += quote(argv_[i]);
-    }
     // Bounce the spawn through cmd.exe's `start` builtin instead of
     // calling CreateProcessA on the exe directly. Rationale:
     //

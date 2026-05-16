@@ -105,9 +105,13 @@ private:
     // escape the DXGI flip-model lockout that poisons an HWND once
     // Vulkan has presented to it. Engine-level state (cvars, console
     // history, CSG scene, camera, primitives) all persist -- none of
-    // it is HWND-attached. Returns true on success; false leaves the
-    // engine in an unusable state (no window, no overlays) and the
-    // caller treats it as a hard failure (-> falls back to warn).
+    // it is HWND-attached. Returns true on success; on false the
+    // engine is unrenderable (window destroyed, both overlays
+    // dropped, no recovery path) and the dispatch site treats it as
+    // a hard stop: sets current_backend_=None, wants_quit_=true, and
+    // returns so the main loop exits cleanly and the user can
+    // relaunch. Earlier revisions of this comment said "falls back
+    // to warn" -- that's stale, the implementation is hard-quit.
     bool RecreateWindow();
 
     // Win32 only: spawn a fresh copy of this process via CreateProcessA
