@@ -626,6 +626,12 @@ bool Engine::Init() {
             overlay_ = std::make_unique<pt::app::ConsoleOverlay>();
             if (overlay_->Init(window_->NativeHandle())) {
                 pt::log::AddSink(&pt::app::ConsoleOverlay::OnLog);
+                // P11 persistence: restore the previous session's
+                // up-arrow history + scrollback. Idempotent / safe to
+                // call when the file doesn't exist (first launch).
+                // Mac + Linux overlays return false (no-op) for now;
+                // Win32 actually loads. See ConsoleOverlay.h docs.
+                overlay_->LoadState("demont_console.state");
             } else {
                 overlay_.reset();
             }
@@ -835,6 +841,14 @@ void Engine::Shutdown() {
         LOG_WARN("could not write demont.cfg");
     }
 
+    // P11 persistence: dump up-arrow history + scrollback so the next
+    // Engine startup (cold launch or prompt-restart replacement) can
+    // pick them back up. Mac + Linux overlays return false (no-op);
+    // Win32 actually writes. Failure here is non-fatal (logged inside
+    // SaveState). Done BEFORE RemoveAllSinks + overlay->Shutdown so
+    // both the in-memory deques and the log sink are still wired.
+    if (overlay_) overlay_->SaveState("demont_console.state");
+
     pt::log::RemoveAllSinks();
     if (overlay_) overlay_->Shutdown();
     overlay_.reset();
@@ -1028,6 +1042,15 @@ void Engine::RequestBackendSwitch(BackendType to) {
                         LOG_INFO("r_software_blit_recreate=prompt: pre-spawn cfg save ok ({} cvar(s))", n);
                     } else {
                         LOG_WARN("r_software_blit_recreate=prompt: pre-spawn cfg save failed -- child may boot with stale cvar state");
+                    }
+                    // Persist up-arrow history + scrollback now so the
+                    // child can pick them up on Init. Shutdown also
+                    // saves later, but that's AFTER the child has
+                    // already started reading -- so we'd lose this
+                    // session's tail. Saving twice is harmless (same
+                    // atomic .tmp + rename).
+                    if (overlay_) {
+                        overlay_->SaveState("demont_console.state");
                     }
                     // Release our HTTP / TCP console-server ports BEFORE
                     // spawning so the child's ConsoleServer::Start can

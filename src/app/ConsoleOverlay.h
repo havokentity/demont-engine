@@ -71,6 +71,30 @@ public:
     // tracks the renderer window.
     void NotifyParentResized(int width, int height);
 
+    // Persist input-history + scrollback to `path`, so that the next
+    // Engine startup (including the r_software_blit_recreate=prompt
+    // spawned-replacement path) can recall up-arrow command history
+    // and the previous session's log lines. Auto-generated banner
+    // lines (LogoFrame / LogoLetters / LogoRay roles) are skipped on
+    // save -- they're rebuilt by the next Init's banner push, so
+    // saving them would just produce duplicates.
+    //
+    // LoadState appends previous-session entries AFTER whatever the
+    // current Init's banner already put in scrollback, with a "----
+    // previous session ----" separator so users can tell where the
+    // restored block starts. History entries are loaded in order so
+    // up-arrow walks them as if they were typed in this session.
+    //
+    // File format is plain-text "DEMONT_CONSOLE_STATE v1" with a
+    // HISTORY <N> section followed by a SCROLLBACK <M> section --
+    // re-readable by hand. Save uses atomic .tmp + rename so a crash
+    // mid-write doesn't corrupt the file. Both calls are no-ops (and
+    // return false) on platforms whose overlay impl doesn't support
+    // persistence (today: macOS stub, Linux stub); they're safe to
+    // call unconditionally.
+    bool SaveState(const std::string& path) const;
+    bool LoadState(const std::string& path);
+
     // Forwarded by pt::log -> our sink so log lines appear in the overlay.
     static void OnLog(pt::log::Level level, const std::string& body);
     static void SetGlobalInstance(ConsoleOverlay* o);

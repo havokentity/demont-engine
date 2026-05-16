@@ -30,6 +30,8 @@ void ConsoleOverlay::ApplyTheme(std::string_view)              {}
 void ConsoleOverlay::NotifyParentResized(int, int)             {}
 void ConsoleOverlay::OnLog(pt::log::Level, const std::string&) {}
 void ConsoleOverlay::SetGlobalInstance(ConsoleOverlay*)        {}
+bool ConsoleOverlay::SaveState(const std::string&) const       { return false; }
+bool ConsoleOverlay::LoadState(const std::string&)             { return false; }
 
 }  // namespace pt::app
 

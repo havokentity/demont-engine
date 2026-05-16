@@ -1784,6 +1784,19 @@ void ConsoleOverlay::NotifyParentResized(int /*width*/, int /*height*/) {
 
 void ConsoleOverlay::SetGlobalInstance(ConsoleOverlay* o) { g_instance = o; }
 
+// Mac state-persistence stubs. The Cocoa overlay's history + scrollback
+// live inside PtConsoleView's Objective-C ivars (NSMutableArray of
+// NSString *); a parallel serialiser to the Win32 one would need to
+// reach into that view across the C++/Obj-C boundary and dispatch_sync
+// back to main to read it safely. Not required for the
+// r_software_blit_recreate=prompt feature this lands alongside (that
+// path is Win32-only -- DXGI flip-model lockout is Microsoft-specific
+// and Mac never spawns a replacement process), so the Mac side returns
+// false (no-op) for now. File a follow-up if Mac users want the same
+// up-arrow / scrollback persistence across cold restarts.
+bool ConsoleOverlay::SaveState(const std::string& /*path*/) const { return false; }
+bool ConsoleOverlay::LoadState(const std::string& /*path*/)       { return false; }
+
 void ConsoleOverlay::OnLog(pt::log::Level level, const std::string& body) {
     if (g_instance == nullptr || g_instance->opaque_ == nullptr) return;
     const char* lv = "info";
