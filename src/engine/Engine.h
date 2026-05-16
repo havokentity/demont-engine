@@ -438,11 +438,25 @@ private:
     BackendType                                 current_backend_       = BackendType::None;
     bool                                        mouse_look_active_     = false;
     std::atomic<bool>                           wants_quit_{false};
-    // Smoke-test mode: set true by Run() if the loop exited because of a
-    // fatal smoke-test condition (no device bound inside the timeout).
-    // main() reads it via SmokeTestFailed() to set the process exit
-    // code. Default false; the budget=0 case never touches this.
+    // Smoke-test mode: set true by Run() when the smoke-test outcome is
+    // a failure. Three failure modes feed it:
+    //   1. No device bound within kSmokeNoDeviceTimeoutSec (~10s) --
+    //      backend init failed silently.
+    //   2. ApplyCommandLineCvarOverrides rejected a CLI arg
+    //      (allowed_values miss, non-numeric --smoke-frames, etc.) --
+    //      smoke mode shouldn't proceed against a misconfigured engine.
+    //   3. Run loop exited (window-close, `quit` command, ShouldClose
+    //      from any other path) before the frame budget was hit --
+    //      smoke test cancelled, not completed.
+    // main() reads this via SmokeTestFailed() to set the process exit
+    // code. Default false; the budget=0 case never sets it.
     bool                                        smoke_test_failed_     = false;
+    // Sticky flag set by ApplyCommandLineCvarOverrides when any CLI
+    // arg is rejected (unknown allowed-value, non-numeric integer,
+    // etc.). Engine::Run inspects it at loop start: in smoke mode,
+    // a rejected arg is a hard fail (mode #2 above). In interactive
+    // mode, the LOG_ERROR is enough -- no behavioural change.
+    bool                                        cli_arg_was_rejected_  = false;
 
     // Snapshot of last camera state, used to detect movement and reset
     // accumulation. (vec4 to keep it trivially copyable.)
