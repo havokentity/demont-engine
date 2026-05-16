@@ -90,13 +90,22 @@ bool Window::Recreate() {
     }
     int pos_x = 0, pos_y = 0;
     glfwGetWindowPos(handle_, &pos_x, &pos_y);
-    const int saved_w            = width_;
-    const int saved_h            = height_;
+    // glfwCreateWindow takes LOGICAL window size, so we have to source
+    // saved_w/saved_h from glfwGetWindowSize -- not from width_/height_,
+    // which the framebuffer-size callback OnResize populates with PIXEL
+    // dimensions. On a Win32 desktop without DPI scaling the two agree
+    // exactly, so the original `saved_w = width_;` worked on the dev
+    // machine, but on a HiDPI Win32 setup (e.g. 200% scaling) the
+    // framebuffer is 2x the logical window -- using width_ would
+    // double the window size after every recreate. glfwGetWindowSize
+    // returns the logical size we passed to the original Create call.
+    int saved_w = 0, saved_h = 0;
+    glfwGetWindowSize(handle_, &saved_w, &saved_h);
     const int saved_cursor_mode  = glfwGetInputMode(handle_, GLFW_CURSOR);
     const std::string saved_t    = title_;
     void* old_native             = pt_window_native_win32(handle_);
 
-    LOG_INFO("Window::Recreate: tearing down GLFW window (HWND={}); preserving {}x{} pos {},{} cursor_mode={}",
+    LOG_INFO("Window::Recreate: tearing down GLFW window (HWND={}); preserving logical {}x{} pos {},{} cursor_mode={}",
              old_native, saved_w, saved_h, pos_x, pos_y, saved_cursor_mode);
 
     Destroy();

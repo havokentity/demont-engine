@@ -85,6 +85,15 @@ public:
     // restored block starts. History entries are loaded in order so
     // up-arrow walks them as if they were typed in this session.
     //
+    // LoadState is single-shot per process: it APPENDS rather than
+    // replaces, so a second call would inject a duplicate "previous
+    // session" header + restored block on top of the already-loaded
+    // state. Call it exactly once, from Engine::Init right after
+    // overlay->Init() succeeds. (The Win32 impl doesn't guard against
+    // re-entry; if a future caller needs an idempotent variant,
+    // either add a loaded_once_ flag here or implement REPLACE
+    // semantics in the platform impl.)
+    //
     // File format is plain-text "DEMONT_CONSOLE_STATE v1" with a
     // HISTORY <N> section followed by a SCROLLBACK <M> section --
     // re-readable by hand. Save uses atomic .tmp + rename so a crash

@@ -504,6 +504,20 @@ bool WinOverlay::Init(HWND parent) {
     // Mac overlay's NSView does. Same shape and characters as the
     // terminal banner in main.cpp::PrintBootLogo and the Cocoa
     // overlay's hex banner.
+    //
+    // Skip when scrollback_ is already populated. WinOverlay::Shutdown
+    // does NOT clear scrollback_, so an Engine::RecreateWindow cycle
+    // (Shutdown + Init on the same instance, used by the
+    // r_software_blit_recreate=auto path) would otherwise push a
+    // second copy of every banner line above whatever the previous
+    // session accumulated. The check also handles the case where
+    // LoadState ran before us in some future call order -- if there's
+    // any pre-existing content, the user has already seen a banner,
+    // skip it. (Order today is Init -> banner -> LoadState, so this
+    // is a forward-compatible guard.)
+    if (!scrollback_.empty()) {
+        return true;
+    }
     scrollback_.push_back({"        \xe2\x96\x91\xe2\x96\x92\xe2\x96\x93\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x93\xe2\x96\x92\xe2\x96\x91", LineRole::LogoFrame});
     scrollback_.push_back({"     \xe2\x96\x91\xe2\x96\x92\xe2\x96\x93\xe2\x96\x88\xe2\x96\x88\xe2\x95\x94\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x97\xe2\x96\x93\xe2\x96\x92\xe2\x96\x91", LineRole::LogoFrame});
     scrollback_.push_back({"   \xe2\x96\x91\xe2\x96\x93\xe2\x96\x88\xe2\x96\x88\xe2\x95\x94\xe2\x95\x90\xe2\x95\x9d   D \xc2\xb7 M \xc2\xb7 T   \xe2\x95\x9a\xe2\x95\x90\xe2\x95\x97\xe2\x96\x88\xe2\x96\x88\xe2\x96\x93\xe2\x96\x91", LineRole::LogoLetters});

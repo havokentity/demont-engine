@@ -627,10 +627,14 @@ bool Engine::Init() {
             if (overlay_->Init(window_->NativeHandle())) {
                 pt::log::AddSink(&pt::app::ConsoleOverlay::OnLog);
                 // P11 persistence: restore the previous session's
-                // up-arrow history + scrollback. Idempotent / safe to
-                // call when the file doesn't exist (first launch).
-                // Mac + Linux overlays return false (no-op) for now;
-                // Win32 actually loads. See ConsoleOverlay.h docs.
+                // up-arrow history + scrollback. Single-shot: call
+                // exactly once per process, here at Engine::Init's
+                // overlay-attach site. A repeated call would re-append
+                // the "previous session" separator block on top of
+                // already-loaded entries; the Win32 LoadState impl
+                // doesn't guard against that. Missing file is fine
+                // (first launch, deleted file). Mac + Linux overlays
+                // return false (no-op).
                 overlay_->LoadState("demont_console.state");
             } else {
                 overlay_.reset();
