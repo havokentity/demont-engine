@@ -1043,8 +1043,25 @@ void Engine::RequestBackendSwitch(BackendType to) {
     if (need_recreate) {
         LOG_INFO("r_software_blit_recreate=auto: vulkan -> software gdi: recreating HWND to escape DXGI flip-model lockout");
         if (!RecreateWindow()) {
-            LOG_ERROR("r_software_blit_recreate=auto: RecreateWindow failed; falling back to warn behaviour (window may be in a degraded state)");
-            need_warn = true;
+            // Hard stop. Window::Recreate failure leaves window_ alive
+            // but with handle_ == nullptr (Destroy succeeded, Create
+            // failed), and RecreateWindow has already dropped both
+            // overlays. Continuing to Device::Create below with the
+            // null native handle would produce an unpresentable device:
+            // every present blit would silently no-op forever (the same
+            // failure mode the early `if (!window_) return;` guards
+            // against on initial init).
+            //
+            // The old device is already torn down (TearDownDevice ran
+            // above), so we can't recover the previous render either.
+            // Request a clean process exit so the user sees Shutdown
+            // run its course and can relaunch. wants_quit_ is the same
+            // signal RestartProcess uses on the prompt path -- the
+            // main loop checks it on the next iteration.
+            LOG_ERROR("r_software_blit_recreate=auto: RecreateWindow failed -- window is destroyed and engine is unrenderable; requesting clean quit so the user can relaunch");
+            current_backend_ = BackendType::None;
+            wants_quit_      = true;
+            return;
         }
     }
     if (need_warn) {
@@ -1259,15 +1276,53 @@ bool Engine::RestartProcess() {
 
     // Build the lpCommandLine string. CreateProcessA requires a single
     // writable buffer, by convention starting with the (quoted)
-    // application name followed by space-separated args. Quote any
-    // token containing whitespace or double quotes to survive the
-    // standard CommandLineToArgvW parse on the new-process side.
+    // application name followed by space-separated args.
+    //
+    // Windows argv quoting per CommandLineToArgvW
+    // (https://learn.microsoft.com/en-us/cpp/cpp/main-function-command-line-args
+    //  #parsing-c-command-line-arguments) is unusual:
+    //
+    //   - 2n   backslashes followed by " -> n backslashes + begin/end quote.
+    //   - 2n+1 backslashes followed by " -> n backslashes + literal quote.
+    //   - n    backslashes not followed by " -> n LITERAL backslashes.
+    //
+    // The naive "escape every \\ and \"" approach (used in the first
+    // pass of this code, caught by Copilot review) doubles every
+    // backslash unconditionally. CommandLineToArgvW then sees a run of
+    // backslashes not followed by a quote and treats it as literal:
+    // a Windows path like C:\Program Files\demont.exe becomes
+    // C:\\Program Files\\demont.exe in the child's argv, breaking any
+    // arg whose value contains a backslash.
+    //
+    // Correct algorithm (Daniel Colascione, "Everyone quotes command
+    // line arguments the wrong way"):
+    //   - If arg has no whitespace / tab / quote: emit literally.
+    //   - Else: wrap in "...". Inside the quoted run:
+    //     - Track runs of consecutive backslashes.
+    //     - If the run is followed by " (embedded literal quote):
+    //         double the run + emit a single escape backslash + emit ".
+    //     - If the run is at end-of-arg (closing quote follows):
+    //         double the run.
+    //     - Otherwise (run followed by ordinary char):
+    //         emit the run literally.
     auto quote = [](const std::string& s) -> std::string {
         if (!s.empty() && s.find_first_of(" \t\"") == std::string::npos) return s;
         std::string r = "\"";
-        for (char c : s) {
-            if (c == '"' || c == '\\') r += '\\';
-            r += c;
+        for (std::size_t i = 0; i < s.size(); ) {
+            std::size_t bs = 0;
+            while (i < s.size() && s[i] == '\\') { ++bs; ++i; }
+            if (i == s.size()) {
+                r.append(2 * bs, '\\');               // run before closing "
+            } else if (s[i] == '"') {
+                r.append(2 * bs, '\\');               // run before embedded "
+                r += '\\';
+                r += '"';
+                ++i;
+            } else {
+                r.append(bs, '\\');                   // run before ordinary char
+                r += s[i];
+                ++i;
+            }
         }
         r += '"';
         return r;
