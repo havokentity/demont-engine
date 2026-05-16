@@ -119,13 +119,7 @@ bool EncodeAndWritePpm(const std::filesystem::path&     path,
                        CaptureSourceKind                kind,
                        float                            exposure) {
     const auto rgb = BuildSrgbBuffer(raw, w, h, kind, exposure);
-
-    std::FILE* f = std::fopen(path.string().c_str(), "wb");
-    if (f == nullptr) return false;
-    std::fprintf(f, "P6\n%u %u\n255\n", w, h);
-    const std::size_t wrote = std::fwrite(rgb.data(), 1, rgb.size(), f);
-    std::fclose(f);
-    return wrote == rgb.size();
+    return WriteRgb8(path, rgb.data(), w, h, OutputFormat::Ppm);
 }
 
 bool EncodeAndWritePng(const std::filesystem::path&     path,
@@ -135,16 +129,40 @@ bool EncodeAndWritePng(const std::filesystem::path&     path,
                        CaptureSourceKind                kind,
                        float                            exposure) {
     const auto rgb = BuildSrgbBuffer(raw, w, h, kind, exposure);
+    return WriteRgb8(path, rgb.data(), w, h, OutputFormat::Png);
+}
 
-    // stbi_write_png returns non-zero on success.
-    // Stride = w * 3 (tightly packed 8-bit RGB, no row padding).
-    const int rc = stbi_write_png(path.string().c_str(),
-                                  static_cast<int>(w),
-                                  static_cast<int>(h),
-                                  /*comp=*/3,
-                                  rgb.data(),
-                                  /*stride_in_bytes=*/static_cast<int>(w) * 3);
-    return rc != 0;
+bool WriteRgb8(const std::filesystem::path& path,
+               const std::uint8_t*          rgb,
+               std::uint32_t                w,
+               std::uint32_t                h,
+               OutputFormat                 fmt) {
+    if (rgb == nullptr || w == 0 || h == 0) return false;
+
+    switch (fmt) {
+        case OutputFormat::Png: {
+            // Stride = w * 3 (tightly packed 8-bit RGB, no row padding).
+            // stbi_write_png returns non-zero on success.
+            const int rc = stbi_write_png(
+                path.string().c_str(),
+                static_cast<int>(w),
+                static_cast<int>(h),
+                /*comp=*/3,
+                rgb,
+                /*stride_in_bytes=*/static_cast<int>(w) * 3);
+            return rc != 0;
+        }
+        case OutputFormat::Ppm: {
+            std::FILE* f = std::fopen(path.string().c_str(), "wb");
+            if (f == nullptr) return false;
+            std::fprintf(f, "P6\n%u %u\n255\n", w, h);
+            const std::size_t want  = std::size_t(w) * h * 3;
+            const std::size_t wrote = std::fwrite(rgb, 1, want, f);
+            std::fclose(f);
+            return wrote == want;
+        }
+    }
+    return false;
 }
 
 }  // namespace pt::engine::capture

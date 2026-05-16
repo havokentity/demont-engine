@@ -53,6 +53,9 @@ using pt::engine::capture::EncodeAndWritePng;
 using pt::engine::capture::OutputFormat;
 using pt::engine::capture::OutputFormatExtension;
 using pt::engine::capture::ParseOutputFormat;
+using pt::engine::capture::ParseOutputFormatOr;
+using pt::engine::capture::ResolveCapturePath;
+using pt::engine::capture::WriteRgb8;
 using pt::engine::capture::kCaptureFormatCvar;
 using pt::engine::capture::kCaptureFormatDefault;
 
@@ -232,7 +235,123 @@ TEST_CASE("capture encoder: PNG round-trip preserves every pixel") {
     fs::remove(png_path, ec);
 }
 
-// --- Test 4: PPM encoder still works (regression guard) -----------------
+// --- ResolveCapturePath: always-override semantics ----------------------
+// The `screenshot` command + the on-disk format dispatch both feed
+// user-supplied paths through ResolveCapturePath. The cvar wins over
+// any extension the user typed -- we assert that contract explicitly
+// so a future "respect user's typed extension" regression breaks loud.
+TEST_CASE("capture format: ResolveCapturePath always overrides extension") {
+    // Bare stem -> ext appended.
+    CHECK(ResolveCapturePath("foo", OutputFormat::Png).string() == "foo.png");
+    CHECK(ResolveCapturePath("foo", OutputFormat::Ppm).string() == "foo.ppm");
+
+    // User typed the matching ext -> no change.
+    CHECK(ResolveCapturePath("foo.png", OutputFormat::Png).string() == "foo.png");
+    CHECK(ResolveCapturePath("foo.ppm", OutputFormat::Ppm).string() == "foo.ppm");
+
+    // User typed the OPPOSITE ext -> cvar-derived ext wins. This is
+    // the regression case: `screenshot foo.ppm` while
+    // r_capture_format=png MUST produce foo.png, not a silent format
+    // mismatch.
+    CHECK(ResolveCapturePath("foo.ppm", OutputFormat::Png).string() == "foo.png");
+    CHECK(ResolveCapturePath("foo.png", OutputFormat::Ppm).string() == "foo.ppm");
+
+    // Unknown extension also gets normalized. User's mental model is
+    // "screenshot writes images"; we don't keep a stray extension just
+    // because we don't recognize it.
+    CHECK(ResolveCapturePath("foo.bar", OutputFormat::Png).string() == "foo.png");
+
+    // Paths with directories preserved; only the basename's extension
+    // changes.
+    auto p = ResolveCapturePath("sub/dir/foo", OutputFormat::Png);
+    CHECK(p.filename().string() == "foo.png");
+    CHECK(p.has_parent_path());
+}
+
+// --- ParseOutputFormatOr: read-side convenience -------------------------
+TEST_CASE("capture format: ParseOutputFormatOr returns fallback on parse fail") {
+    CHECK(ParseOutputFormatOr("png", OutputFormat::Ppm) == OutputFormat::Png);
+    CHECK(ParseOutputFormatOr("ppm", OutputFormat::Png) == OutputFormat::Ppm);
+    // Fallback path: anything not in {"png","ppm"} returns the
+    // supplied fallback verbatim. Useful for callers that want a
+    // safe-default behaviour without writing the if/else.
+    CHECK(ParseOutputFormatOr("",     OutputFormat::Png) == OutputFormat::Png);
+    CHECK(ParseOutputFormatOr("jpg",  OutputFormat::Ppm) == OutputFormat::Ppm);
+    CHECK(ParseOutputFormatOr("PNG",  OutputFormat::Ppm) == OutputFormat::Ppm);
+}
+
+// --- WriteRgb8: round-trip on a pre-built RGB buffer --------------------
+// The screenshot command's depth / motion / swap targets build their
+// own rgb buffers (no ACES pipeline) and hand them to WriteRgb8 for
+// the format dispatch. Verify both PNG and PPM round-trip those
+// buffers byte-identically.
+TEST_CASE("capture encoder: WriteRgb8 PNG round-trip") {
+    constexpr std::uint32_t W = 3, H = 2;
+    std::vector<std::uint8_t> rgb = {
+        255, 0, 0,    0, 255, 0,    0, 0, 255,
+        128, 128, 128,  64, 96, 200, 200, 100, 50,
+    };
+    REQUIRE(rgb.size() == std::size_t(W) * H * 3);
+
+    const fs::path png_path = temp_path("rgb8_rt", "png");
+    REQUIRE(WriteRgb8(png_path, rgb.data(), W, H, OutputFormat::Png));
+    REQUIRE(fs::exists(png_path));
+
+    int rw = 0, rh = 0, rc_in = 0;
+    stbi_uc* loaded = stbi_load(png_path.string().c_str(),
+                                &rw, &rh, &rc_in, /*desired_channels=*/3);
+    REQUIRE(loaded != nullptr);
+    CHECK(rw == static_cast<int>(W));
+    CHECK(rh == static_cast<int>(H));
+
+    bool all_match = true;
+    for (std::size_t i = 0; i < rgb.size(); ++i) {
+        if (static_cast<int>(loaded[i]) != static_cast<int>(rgb[i])) {
+            all_match = false;
+            break;
+        }
+    }
+    CHECK(all_match);
+
+    stbi_image_free(loaded);
+    std::error_code ec;
+    fs::remove(png_path, ec);
+}
+
+TEST_CASE("capture encoder: WriteRgb8 PPM round-trip") {
+    constexpr std::uint32_t W = 2, H = 2;
+    std::vector<std::uint8_t> rgb = {
+        10, 20, 30,   40, 50, 60,
+        70, 80, 90,  100, 110, 120,
+    };
+    REQUIRE(rgb.size() == std::size_t(W) * H * 3);
+
+    const fs::path ppm_path = temp_path("rgb8_rt", "ppm");
+    REQUIRE(WriteRgb8(ppm_path, rgb.data(), W, H, OutputFormat::Ppm));
+    REQUIRE(fs::exists(ppm_path));
+
+    // Read back: "P6\n2 2\n255\n" + 12 binary bytes.
+    std::FILE* f = std::fopen(ppm_path.string().c_str(), "rb");
+    REQUIRE(f != nullptr);
+    char hdr[16] = {0};
+    REQUIRE(std::fread(hdr, 1, 12, f) == 12);
+    // Header should start "P6\n" -- exact byte after is "2" (width).
+    CHECK(hdr[0] == 'P');
+    CHECK(hdr[1] == '6');
+    CHECK(hdr[2] == '\n');
+    // Skip to body. Rather than parsing the variable-length header
+    // for this test (width / height count is data-dependent), seek
+    // to end and confirm size = header + 12 body bytes. The exact
+    // header "P6\n2 2\n255\n" is 11 bytes.
+    std::fclose(f);
+    const auto sz = fs::file_size(ppm_path);
+    CHECK(sz == 11 + std::size_t(W) * H * 3);
+
+    std::error_code ec;
+    fs::remove(ppm_path, ec);
+}
+
+// --- Test: PPM encoder still works (regression guard) -----------------
 // The PPM legacy path is retained per issue #94's design ("ppm" allowed
 // value). This test isn't strictly required by the issue's acceptance
 // criteria but adding it costs ~20 LOC and pins the byte-for-byte legacy

@@ -63,4 +63,19 @@ bool EncodeAndWritePng(const std::filesystem::path&     path,
                        CaptureSourceKind                kind,
                        float                            exposure);
 
+// Write a pre-built tightly-packed 8-bit RGB buffer (`w * h * 3` bytes)
+// to `path` in `fmt`. Used by callers that build the rgb buffer
+// themselves (e.g. the `screenshot` command's depth / motion / swap
+// targets, which use mappings that don't fit the ACES + sRGB pipeline
+// the `EncodeAndWrite*` helpers bake in). Returns true on success;
+// on failure the file is closed but may be partially written.
+//
+// `rgb` must point to at least `w * h * 3` bytes, with no padding
+// between rows.
+bool WriteRgb8(const std::filesystem::path& path,
+               const std::uint8_t*          rgb,
+               std::uint32_t                w,
+               std::uint32_t                h,
+               OutputFormat                 fmt);
+
 }  // namespace pt::engine::capture

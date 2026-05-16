@@ -2,6 +2,8 @@
 // Copyright (c) 2026 Rajesh D'Monte
 #include "Engine.h"
 
+#include "CaptureEncoder.h"
+#include "CaptureFormat.h"
 #include "FrameCapture.h"
 
 #include "../app/ConsoleOverlay.h"
@@ -4191,16 +4193,19 @@ void Engine::Tick(double dt) {
                 rgb[i * 3 + 1] =        b1;
                 rgb[i * 3 + 2] = bgra ? b0 : b2;
             }
-            FILE* f = std::fopen(pending_swap_screenshot_path_.c_str(), "wb");
-            if (f != nullptr) {
-                std::fprintf(f, "P6\n%u %u\n255\n", sw, sh);
-                std::fwrite(rgb.data(), 1, rgb.size(), f);
-                std::fclose(f);
-                LOG_INFO("screenshot: wrote {} ({}x{} swap)",
-                         pending_swap_screenshot_path_, sw, sh);
+            if (pt::engine::capture::WriteRgb8(
+                    pending_swap_screenshot_path_,
+                    rgb.data(), sw, sh,
+                    pending_swap_screenshot_fmt_)) {
+                LOG_INFO("screenshot: wrote {} ({}x{} swap, format={})",
+                         pending_swap_screenshot_path_, sw, sh,
+                         pt::engine::capture::OutputFormatExtension(
+                             pending_swap_screenshot_fmt_));
             } else {
-                LOG_ERROR("screenshot: cannot open '{}' for swap capture",
-                          pending_swap_screenshot_path_);
+                LOG_ERROR("screenshot: cannot write '{}' for swap capture (format={})",
+                          pending_swap_screenshot_path_,
+                          pt::engine::capture::OutputFormatExtension(
+                              pending_swap_screenshot_fmt_));
             }
             pending_swap_screenshot_path_.clear();
             pending_swap_screenshot_ticks_ = 0;
@@ -4870,12 +4875,36 @@ void Engine::RegisterCommands() {
         });
 
     if (auto* cmd = C.RegisterCommand("screenshot",
-        "screenshot <path.ppm> [accum|denoise_color|bloom_mip0|swap|depth|motion]: dump the target render texture to a PPM file (P6 binary, ACES-tonemapped for HDR inputs; the swap target dumps the actual presented 8-bit BGRA bytes after the engine's sRGB OETF, no host-side tonemap).",
+        "screenshot <name> [accum|denoise_color|bloom_mip0|swap|depth|motion]: dump the target render texture to disk. Output format is selected by r_capture_format (png|ppm); the matching extension is auto-appended to <name>, overriding any extension you typed. ACES-tonemapped for HDR inputs (accum / denoise_color / bloom_mip0); the swap target dumps the actual presented 8-bit BGRA bytes after the engine's sRGB OETF, no host-side tonemap.",
         [this](auto args, pt::console::Output& out) {
             if (!device_) { out.PrintLine("screenshot: no device"); return; }
-            if (args.empty()) { out.PrintLine("usage: screenshot <path.ppm> [accum|denoise_color|bloom_mip0|swap|depth|motion]"); return; }
+            if (args.empty()) { out.PrintLine("usage: screenshot <name> [accum|denoise_color|bloom_mip0|swap|depth|motion]"); return; }
             std::string path(args[0]);
             std::string target = (args.size() >= 2) ? std::string(args[1]) : std::string("accum");
+
+            // Resolve the on-disk format + path once, up front. The cvar
+            // is the single source of truth -- whatever the user typed
+            // (foo, foo.png, foo.ppm, foo.bar) gets normalized to
+            // foo.<png|ppm> based on r_capture_format. Both the swap
+            // (deferred-write) and the synchronous targets use this.
+            //
+            // Console::Get() rather than the enclosing scope's `C` here:
+            // the lambda only captures [this], so the outer `C` would be
+            // a dangling reference inside this callback. Same pattern
+            // the existing exposure read-back below uses.
+            using pt::engine::capture::OutputFormat;
+            using pt::engine::capture::ParseOutputFormatOr;
+            using pt::engine::capture::ResolveCapturePath;
+            using pt::engine::capture::WriteRgb8;
+            using pt::engine::capture::OutputFormatExtension;
+            using pt::engine::capture::kCaptureFormatCvar;
+            auto& Csh = pt::console::Console::Get();
+            OutputFormat out_fmt = OutputFormat::Png;
+            if (auto* fmt_cv = Csh.FindCVar(kCaptureFormatCvar)) {
+                out_fmt = ParseOutputFormatOr(fmt_cv->value, OutputFormat::Png);
+            }
+            const std::filesystem::path resolved_path =
+                ResolveCapturePath(path, out_fmt);
 
             // Swap target: queue an async swapchain readback. The
             // screenshot lambda runs inside Console::Drain on the main
@@ -4913,8 +4942,13 @@ void Engine::RegisterCommands() {
                 std::vector<std::uint8_t> dummy(std::size_t(accum_w_) * accum_h_ * 4u);
                 (void)device_->ReadbackSwapchain(dummy.data(), dummy.size(),
                                                  &sw, &sh, &fmt);
-                pending_swap_screenshot_path_ = path;
-                out.FormatLine("screenshot: queued swap capture, will write to '{}'", path);
+                // Latch the resolved path + format. The deferred writer
+                // in Tick uses these so the on-disk format can't drift
+                // if the user toggles r_capture_format mid-flight.
+                pending_swap_screenshot_path_ = resolved_path.string();
+                pending_swap_screenshot_fmt_  = out_fmt;
+                out.FormatLine("screenshot: queued swap capture, will write to '{}'",
+                               pending_swap_screenshot_path_);
                 return;
             }
 
@@ -5125,15 +5159,21 @@ void Engine::RegisterCommands() {
                 }
             }
 
-            FILE* f = std::fopen(path.c_str(), "wb");
-            if (f == nullptr) { out.FormatLine("screenshot: cannot open '{}'", path); return; }
-            std::fprintf(f, "P6\n%u %u\n255\n", w, hgt);
-            std::fwrite(rgb.data(), 1, rgb.size(), f);
-            std::fclose(f);
-            out.FormatLine("screenshot: wrote {} ({}x{} {})", path, w, hgt, tag);
+            if (!WriteRgb8(resolved_path, rgb.data(), w, hgt, out_fmt)) {
+                out.FormatLine("screenshot: cannot write '{}' (format={})",
+                               resolved_path.string(),
+                               OutputFormatExtension(out_fmt));
+                return;
+            }
+            out.FormatLine("screenshot: wrote {} ({}x{} {}, format={})",
+                           resolved_path.string(), w, hgt, tag,
+                           OutputFormatExtension(out_fmt));
             (void)channels;
         })) {
-        cmd->default_args = "demonte_screen.ppm";
+        // No extension: ResolveCapturePath auto-appends .png / .ppm
+        // based on r_capture_format. Keeps the ghost-suggestion in
+        // sync with the active format.
+        cmd->default_args = "demonte_screen";
     }
 
     C.RegisterCommand("web_console",

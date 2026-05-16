@@ -6,6 +6,7 @@
 #include "../core/Jobs/JobSystem.h"
 #include "../renderer/AnalyticBvh.h"
 #include "../rhi/Types.h"
+#include "CaptureFormat.h"
 #include "LensFlare.h"
 
 #include <glm/glm.hpp>
@@ -405,6 +406,14 @@ private:
     // it returns true (= consume + WaitIdle done, staging bytes
     // ready). Empty string = no capture pending.
     std::string                                 pending_swap_screenshot_path_;
+    // Output format latched at queue time (read from r_capture_format
+    // then). The deferred writer in Tick uses this rather than re-reading
+    // the cvar, so a user toggling r_capture_format while a swap capture
+    // is in flight doesn't change the format mid-flight. The path stored
+    // above already carries the matching .png / .ppm extension applied
+    // via ResolveCapturePath.
+    pt::engine::capture::OutputFormat           pending_swap_screenshot_fmt_ =
+        pt::engine::capture::OutputFormat::Png;
     // Ticks elapsed since the screenshot was queued. Used to bound
     // the wait: if Submit never consumes the request (device down,
     // suspended loop, etc.), give up after a few seconds rather than
