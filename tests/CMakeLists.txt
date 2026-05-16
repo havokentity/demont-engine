@@ -20,8 +20,13 @@
 #      below. It wires the doctest dep + ctest registration in one shot.
 #
 # The doctest dep ships from cmake/Dependencies.cmake (FetchContent),
-# already populated by the time this file is processed via the top-level
-# CMakeLists' `add_subdirectory(src)` -> Dependencies.cmake -> here order.
+# already populated by the time this file is processed. The top-level
+# CMakeLists.txt order is:
+#   include(cmake/Dependencies.cmake)  <-- doctest is fetched + made
+#                                          available here
+#   add_subdirectory(src)
+#   add_subdirectory(tests)            <-- this file
+# so doctest::doctest is a valid target by the time pt_add_test() runs.
 # `enable_testing()` is also in the top-level (must be there, not here,
 # for ctest discovery from the build root).
 
