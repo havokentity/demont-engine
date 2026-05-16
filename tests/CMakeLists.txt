@@ -109,3 +109,24 @@ pt_add_test(cvar_roundtrip
 # the tools/imgdiff/ executable target.
 pt_add_test(imgdiff_test
     imgdiff_test.cpp)
+
+# Frame-capture output-format selector + PNG round-trip (issue #94).
+# Two surfaces: (1) the format parser + the `r_capture_format` cvar
+# gate (`allowed_values` rejects everything other than "png"/"ppm"),
+# (2) `EncodeAndWritePng` -> stbi_load round-trip on a known RGBA32F
+# buffer. Links pt_capture_encoder (the stb-impl-bearing static lib)
+# plus pt_console for the cvar test. stb_image's loader is compiled
+# in `stb_image_impl_for_test.cpp` as a second source -- per-file
+# `/w` (MSVC) / `-w` (Clang/GCC) below silences stb's warning flood
+# without disabling warnings for the test code itself.
+pt_add_test(capture_format
+    capture_format_test.cpp
+    SOURCES      stb_image_impl_for_test.cpp
+    LINK_TARGETS pt_capture_encoder pt_console)
+if(MSVC)
+    set_source_files_properties(stb_image_impl_for_test.cpp
+        PROPERTIES COMPILE_OPTIONS "/w")
+else()
+    set_source_files_properties(stb_image_impl_for_test.cpp
+        PROPERTIES COMPILE_OPTIONS "-w")
+endif()
