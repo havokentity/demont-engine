@@ -54,6 +54,17 @@ public:
     // Main loop.  Returns when the window is closed or `quit` runs.
     void Run();
 
+    // True if the engine was launched in smoke-test mode
+    // (`pt_smoke_frames > 0`) and the Run loop hit a fatal condition
+    // that ended it BEFORE the user-frames-rendered budget was met --
+    // most importantly, "backend init never produced a usable device_
+    // inside the smoke-device timeout". Callers (specifically main())
+    // use this to translate the smoke-test outcome into a process exit
+    // code: 0 if the budget was met cleanly, non-zero if this returns
+    // true. Always false in non-smoke-test runs (no budget set -> no
+    // way to fail this check).
+    bool SmokeTestFailed() const { return smoke_test_failed_; }
+
     // Vid_restart-style: drain the current device, destroy it, recreate the
     // window if the new backend requires a different graphics API hint,
     // construct the new device, set the active backend.
@@ -427,6 +438,25 @@ private:
     BackendType                                 current_backend_       = BackendType::None;
     bool                                        mouse_look_active_     = false;
     std::atomic<bool>                           wants_quit_{false};
+    // Smoke-test mode: set true by Run() when the smoke-test outcome is
+    // a failure. Three failure modes feed it:
+    //   1. No device bound within kSmokeNoDeviceTimeoutSec (~10s) --
+    //      backend init failed silently.
+    //   2. ApplyCommandLineCvarOverrides rejected a CLI arg
+    //      (allowed_values miss, non-numeric --smoke-frames, etc.) --
+    //      smoke mode shouldn't proceed against a misconfigured engine.
+    //   3. Run loop exited (window-close, `quit` command, ShouldClose
+    //      from any other path) before the frame budget was hit --
+    //      smoke test cancelled, not completed.
+    // main() reads this via SmokeTestFailed() to set the process exit
+    // code. Default false; the budget=0 case never sets it.
+    bool                                        smoke_test_failed_     = false;
+    // Sticky flag set by ApplyCommandLineCvarOverrides when any CLI
+    // arg is rejected (unknown allowed-value, non-numeric integer,
+    // etc.). Engine::Run inspects it at loop start: in smoke mode,
+    // a rejected arg is a hard fail (mode #2 above). In interactive
+    // mode, the LOG_ERROR is enough -- no behavioural change.
+    bool                                        cli_arg_was_rejected_  = false;
 
     // Snapshot of last camera state, used to detect movement and reset
     // accumulation. (vec4 to keep it trivially copyable.)

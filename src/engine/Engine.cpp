@@ -65,6 +65,26 @@ namespace cvar {
             CVAR_ARCHIVE);
     PT_CVAR(app_overlay_enabled, "1",
             "Enable the in-window native console overlay (backtick toggles)", CVAR_ARCHIVE);
+    PT_CVAR(pt_smoke_frames, "0",
+            "Smoke-test frame budget. >0 = render this many frames then "
+            "exit cleanly (exit code 0). 0 = run normally until the user "
+            "quits. Typically set via the --smoke-frames=N CLI override "
+            "so a developer can run "
+            "`demont --smoke-frames=8 --r-backend=metal` on real "
+            "hardware to validate that a backend boots + renders + "
+            "tears down without crashing -- the exit code (0 success, "
+            "2 = backend init failed) plus the log output give a "
+            "useful smoke signal without needing a full screenshot "
+            "regression matrix. NOT wired into GitHub Actions CI "
+            "because the public-tier runners have no GPU (Mac has "
+            "only a paravirtualized GPU; Windows-latest has no GPU "
+            "at all; the paid `gpu-t4-4-core` is Team/Enterprise-only "
+            "and not available to open-source repos). When/if "
+            "self-hosted runners on real M-series / RTX hardware "
+            "appear, wire this back into build.yml -- the engine side "
+            "is ready. NOT CVAR_ARCHIVE -- per-invocation knob, never "
+            "persisted to demont.cfg.",
+            CVAR_NONE);
     PT_CVAR(con_font_scale, "1.0",
             "Console overlay font scale. 1.0 = baseline (14 logical-unit "
             "CreateFontW height on Win32; 13/12/9 pt input/output/status "
@@ -674,6 +694,18 @@ void Engine::ApplyCommandLineCvarOverrides() {
     static constexpr OverrideMap kOverrides[] = {
         { "--net-port=",      "net_port"      },  // HTTP/WebSocket UI
         { "--net-line-port=", "net_line_port" },  // TCP console
+        // --smoke-frames= and --r-backend= drive the manual / local
+        // smoke-test mode (see pt_smoke_frames cvar in RegisterCVars
+        // for the full backstory). --smoke-frames= gets an extra
+        // integer-validation pass below because the underlying cvar
+        // stores everything as a string + CVar::GetInt() is forgiving
+        // (returns 0 on parse failure) -- without explicit validation
+        // here, --smoke-frames=abc would silently disable smoke mode
+        // instead of failing loudly. --r-backend= relies on the
+        // generic allowed_values check below (r_backend's set is
+        // {none, software, metal, vulkan}).
+        { "--smoke-frames=",  "pt_smoke_frames" },
+        { "--r-backend=",     "r_backend"     },
     };
 
     for (int i = 1; i < argc_; ++i) {
@@ -683,18 +715,70 @@ void Engine::ApplyCommandLineCvarOverrides() {
         for (const auto& o : kOverrides) {
             if (!arg.starts_with(o.flag_prefix)) continue;
             const std::string_view value = arg.substr(o.flag_prefix.size());
+            matched = true;
             if (value.empty()) {
                 LOG_WARN("engine: {} given with empty value -- ignored",
                          o.flag_prefix);
-            } else if (!C.SetCVarOverride(o.cvar_name, value)) {
+                cli_arg_was_rejected_ = true;
+                break;
+            }
+            // 1. Generic allowed_values check. SetCVarOverride bypasses
+            //    CVAR_READONLY (necessary for some engine-set cvars)
+            //    but does NOT enforce allowed_values (the equivalent
+            //    check in Console::Execute is what normally rejects
+            //    bad values from user input). For CLI args we want
+            //    both behaviours: bypass READONLY, but reject typos /
+            //    unsupported values. Hence the manual check here.
+            auto* cv = C.FindCVar(o.cvar_name);
+            if (cv != nullptr && !cv->allowed_values.empty()) {
+                bool in_set = false;
+                for (const auto& av : cv->allowed_values) {
+                    if (av == value) { in_set = true; break; }
+                }
+                if (!in_set) {
+                    std::string allowed_csv;
+                    for (std::size_t j = 0; j < cv->allowed_values.size(); ++j) {
+                        if (j) allowed_csv += ", ";
+                        allowed_csv += cv->allowed_values[j];
+                    }
+                    LOG_ERROR("engine: {} = '{}' rejected: not in allowed set "
+                              "for cvar '{}' (allowed: {}). Override ignored.",
+                              arg, value, o.cvar_name, allowed_csv);
+                    cli_arg_was_rejected_ = true;
+                    break;
+                }
+            }
+            // 2. Special-case validation for pt_smoke_frames: must
+            //    parse as a non-negative integer. CVar::GetInt() is
+            //    forgiving (silent fallback to 0 on parse failure)
+            //    which would silently disable smoke mode for typos
+            //    like --smoke-frames=abc. Better to reject here.
+            if (o.cvar_name == std::string_view("pt_smoke_frames")) {
+                // Manual digit scan keeps us out of std::stoll's
+                // throw-on-failure semantics (we build with
+                // -fno-exceptions). A leading '+' or '-' would also
+                // be rejected -- negative budgets are nonsense.
+                bool numeric = !value.empty();
+                for (char c : value) {
+                    if (c < '0' || c > '9') { numeric = false; break; }
+                }
+                if (!numeric) {
+                    LOG_ERROR("engine: {} = '{}' rejected: --smoke-frames "
+                              "must be a non-negative integer (got non-numeric "
+                              "value). Override ignored.", arg, value);
+                    cli_arg_was_rejected_ = true;
+                    break;
+                }
+            }
+            if (!C.SetCVarOverride(o.cvar_name, value)) {
                 LOG_WARN("engine: {} -> SetCVarOverride('{}', '{}') failed "
                          "(cvar not registered yet?)",
                          arg, o.cvar_name, value);
+                cli_arg_was_rejected_ = true;
             } else {
                 LOG_INFO("engine: CLI override {} = '{}' (post-cfg)",
                          o.cvar_name, value);
             }
-            matched = true;
             break;
         }
         if (!matched && arg.starts_with("--")) {
@@ -4282,6 +4366,74 @@ void Engine::Tick(double dt) {
 void Engine::Run() {
     using clk = std::chrono::steady_clock;
     auto last = clk::now();
+
+    // Smoke-test mode: read the per-invocation frame budget once at
+    // loop start. 0 (the default) = unbounded; >0 = render exactly
+    // this many frames then exit cleanly. Set via the
+    // `--smoke-frames=N` CLI override which routes to the
+    // pt_smoke_frames cvar in RegisterCVars.
+    //
+    // Intended use is manual local validation -- e.g. after touching
+    // a backend's init path, run
+    //   ./demont --smoke-frames=8 --r-backend=metal
+    // and confirm the process exits 0. The 2-exit-code "backend init
+    // failed in 10s" path below catches the silent-init-failure case
+    // that's otherwise hard to spot.
+    //
+    // NOT wired into GH Actions CI today -- the public-tier hosted
+    // runners have no real GPU. See the comment block on
+    // pt_smoke_frames in RegisterCVars for the full backstory and
+    // the build.yml comment for where the smoke steps used to live.
+    //
+    // Read once (not per-frame) because mid-run mutations to the
+    // budget would just be confusing -- the budget is a launch
+    // parameter, not a runtime knob.
+    std::uint32_t smoke_frame_budget = 0;
+    if (auto* v = pt::console::Console::Get().FindCVar("pt_smoke_frames")) {
+        const int n = v->GetInt();
+        if (n > 0) smoke_frame_budget = static_cast<std::uint32_t>(n);
+    }
+    if (smoke_frame_budget > 0) {
+        LOG_INFO("smoke-test mode: will render {} frame(s) then exit cleanly",
+                 smoke_frame_budget);
+        // If any CLI arg was rejected at parse time (allowed-values
+        // miss, non-numeric --smoke-frames, etc.), fail the smoke
+        // test immediately. The engine is in a known-misconfigured
+        // state -- e.g. the user asked for `--r-backend=metalfx`,
+        // got "metalfx is not in allowed set", and the override was
+        // dropped, so the engine's now running with whatever
+        // r_backend was previously. That's NOT what the operator
+        // requested; better to surface as a smoke-test failure than
+        // silently render against the wrong backend.
+        if (cli_arg_was_rejected_) {
+            LOG_ERROR("smoke-test: at least one CLI arg was rejected "
+                      "during parse. Failing the smoke test (exit code 2) "
+                      "instead of proceeding with a misconfigured engine.");
+            smoke_test_failed_ = true;
+            return;
+        }
+    }
+    std::uint32_t smoke_frames_rendered = 0;
+
+    // Smoke-test hang detector. If the device_ never becomes non-null
+    // (backend init failed silently, MoltenVK refused to create on the
+    // host, Metal hardware-RT requirement unmet on a virtual GPU, etc.)
+    // the existing post-device frame counter would NEVER fire, and the
+    // pre-device sleep loop further down would idle indefinitely. On a
+    // CI runner that means the job burns until the workflow timeout
+    // rather than failing promptly. Track elapsed time since Run start;
+    // if we've been waiting for the device past kSmokeNoDeviceTimeoutSec
+    // and smoke mode is on, give up loudly with smoke_test_failed_ = true
+    // and let main() translate that into a non-zero exit code.
+    //
+    // 10s is well past every "normal" Init+ first-frame timeline (most
+    // backends bind within ~100-500ms; the worst case is Vulkan cold
+    // pipeline compile which is already bounded by the async pipeline-
+    // build worker, capped at a few seconds even on cold caches). A
+    // backend that hasn't bound at 10s is broken, not slow.
+    constexpr double kSmokeNoDeviceTimeoutSec = 10.0;
+    const auto       run_start                = clk::now();
+
     while (!wants_quit_ && !window_->ShouldClose()) {
         auto now = clk::now();
         double dt = std::chrono::duration<double>(now - last).count();
@@ -4305,8 +4457,72 @@ void Engine::Run() {
         if (!device_) {
             std::this_thread::sleep_for(std::chrono::milliseconds(8));
         }
+
+        // Smoke-test exit accounting -- two paths:
+        //
+        //   1. device_ is bound AND we're past the loading window:
+        //      count this iteration as a rendered frame. Once the
+        //      budget is hit, request a clean exit. The
+        //      `!loading_frame_active_` gate is critical: on Vulkan
+        //      cold-cache launches the pipeline-build worker is in
+        //      flight for the first ~1-3s, during which Tick paints
+        //      a flat dark loading frame via the swapchain clear path
+        //      (no PathTrace dispatch). Counting those would consume
+        //      the budget on placeholder paint, not real renders --
+        //      `--smoke-frames=8` could exit after only 2 real
+        //      frames if 6 loading frames slipped in first.
+        //
+        //   2. device_ is still null: backend init may still be in
+        //      flight, or may have failed silently. If we've been
+        //      waiting past kSmokeNoDeviceTimeoutSec the in-flight
+        //      case is implausible -- treat it as a silent failure.
+        if (smoke_frame_budget > 0) {
+            if (device_ && !loading_frame_active_) {
+                ++smoke_frames_rendered;
+                if (smoke_frames_rendered >= smoke_frame_budget) {
+                    LOG_INFO("smoke-test: rendered {} frame(s); "
+                             "requesting clean exit",
+                             smoke_frames_rendered);
+                    wants_quit_ = true;
+                }
+            } else if (!device_) {
+                const double elapsed = std::chrono::duration<double>(
+                    clk::now() - run_start).count();
+                if (elapsed > kSmokeNoDeviceTimeoutSec) {
+                    LOG_ERROR("smoke-test: no device bound after {:.1f}s -- "
+                              "backend init appears to have failed silently. "
+                              "Failing the smoke test (exit code 2).",
+                              elapsed);
+                    smoke_test_failed_ = true;
+                    wants_quit_ = true;
+                }
+            }
+            // else: device_ bound but loading_frame_active_ -- silently
+            // skip this iteration, don't count it, don't fail on it.
+        }
     }
     LOG_INFO("Run loop exited.");
+
+    // Final smoke-test verdict for the "exit before budget" cancellation
+    // case. wants_quit_ alone is ambiguous -- it can be set by:
+    //   - This loop reaching the frame budget (success)
+    //   - The user closing the window mid-smoke-test (failure)
+    //   - The `quit` console command (failure -- same idea)
+    //   - The no-device timeout above (already marked failure)
+    // If we exited without hitting the budget AND haven't already
+    // marked failure, the smoke test was cancelled prematurely --
+    // record it so main() exits non-zero. Avoids the
+    // "Cmd+Q-during-smoke-runs returns 0" footgun.
+    if (smoke_frame_budget > 0 &&
+        !smoke_test_failed_ &&
+        smoke_frames_rendered < smoke_frame_budget) {
+        LOG_ERROR("smoke-test: exited after {} of {} budgeted frame(s) -- "
+                  "loop terminated before budget was hit (window-close, "
+                  "quit command, or external signal). Failing the smoke "
+                  "test (exit code 2).",
+                  smoke_frames_rendered, smoke_frame_budget);
+        smoke_test_failed_ = true;
+    }
 }
 
 // ----- Commands -------------------------------------------------------------
