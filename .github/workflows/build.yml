@@ -79,9 +79,19 @@ jobs:
           fi
           echo "Zero compiler warnings."
 
+      - name: Unit tests (ctest)
+        # Phase 1 test harness (issue #47). Runs every doctest-based
+        # test registered via tests/CMakeLists.txt -- harness_smoke
+        # canary + cvar_roundtrip today, more module tests as the
+        # rollout phases land. --output-on-failure prints the doctest
+        # report inline when a test fails so the CI log shows what
+        # broke without an extra artefact download.
+        run: ctest --test-dir build/mac-debug --output-on-failure
+
       # Smoke boot-test is skipped on the runner because GLFW can't
       # create a window without a display. Local devs already run the
-      # binary; CI's job is to catch compile + link regressions.
+      # binary; CI's job is to catch compile + link regressions + the
+      # unit-test matrix above.
 
   windows:
     name: Windows (NVIDIA RTX target)
@@ -132,6 +142,11 @@ jobs:
       - name: Build
         shell: pwsh
         run: cmake --build build/win-debug --parallel
+
+      - name: Unit tests (ctest)
+        # See mac-debug job above for rationale.
+        shell: pwsh
+        run: ctest --test-dir build/win-debug --output-on-failure
 
   # Scheduled nightly release: at 23:00 IST (cron at top, in UTC) the
   # macos build runs and -- if it passes -- this job repackages the

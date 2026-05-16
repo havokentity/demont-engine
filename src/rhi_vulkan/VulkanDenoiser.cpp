@@ -966,6 +966,12 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                 std::uint32_t hdr_pipeline;     // 1 = ACES + sRGB; 0 = sRGB OETF only
                 float         bloom_intensity;  // 0 = skip bloom add
             } fp{};
+            // Phase-0 defensive guard. 3 uints + 1 float = 16B naturally,
+            // assert catches a future "add a vec4" or reorder.
+            static_assert(sizeof(FinalizePush) == 16,
+                          "FinalizePush layout mismatch with DenoiseFinalize.slang");
+            static_assert(sizeof(FinalizePush) % 16 == 0,
+                          "FinalizePush must be 16-byte aligned (cbuffer rule)");
             fp.width           = cached_w_;
             fp.height          = cached_h_;
             fp.hdr_pipeline    = hdr_pipeline ? 1u : 0u;
@@ -1088,6 +1094,13 @@ void VulkanNrdDenoiser::EncodeFinalizeOnly(VkCommandBuffer cb,
         std::uint32_t hdr_pipeline;     // 1 = ACES + sRGB; 0 = sRGB OETF only
         float         bloom_intensity;  // 0 = skip bloom add
     } fp{};
+    // Phase-0 defensive guard. Same struct as the chained-denoiser path
+    // above (the two definitions are independent function-local types
+    // but the layout must match the shader's single FinalizePush cbuffer).
+    static_assert(sizeof(FinalizePush) == 16,
+                  "FinalizePush layout mismatch with DenoiseFinalize.slang");
+    static_assert(sizeof(FinalizePush) % 16 == 0,
+                  "FinalizePush must be 16-byte aligned (cbuffer rule)");
     fp.width           = width;
     fp.height          = height;
     fp.hdr_pipeline    = hdr_pipeline ? 1u : 0u;
