@@ -223,3 +223,53 @@ TEST_CASE("cvar round-trip: non-archive cvars are NOT serialized") {
     std::error_code ec;
     fs::remove(path, ec);
 }
+
+// --- Test 5: allowed_values gate (r_software_blit_recreate shape) -------
+// Pins the cvar shape used by PR-B (auto / prompt / warn, archived,
+// validation by Console::Execute). Regression catch: if a future refactor
+// stops enforcing allowed_values on Execute, r_software_blit_recreate=foo
+// would silently overwrite the value and the next vulkan->software gdi
+// switch would silently fall through to none of the three documented
+// branches, leaving the engine in undefined behaviour with no operator
+// signal.
+TEST_CASE("cvar allowed_values: auto/prompt/warn gate accepts valid, rejects others") {
+    auto& C = pt::console::Console::Get();
+
+    // Mirror r_software_blit_recreate's registration shape, with a
+    // unique test_rt_blit_recreate name so this TEST_CASE doesn't
+    // collide with the production cvar (which is registered by
+    // Engine.cpp's static-init when the engine is linked).
+    C.RegisterCVar("test_rt_blit_recreate", "auto",
+                   "test mirror of r_software_blit_recreate",
+                   pt::console::CVAR_ARCHIVE);
+    auto* v = C.FindCVar("test_rt_blit_recreate");
+    REQUIRE(v != nullptr);
+    v->allowed_values = {"auto", "prompt", "warn"};
+
+    // Default value should be "auto".
+    CHECK(v->value == "auto");
+
+    // All three documented values must Execute cleanly.
+    CHECK(C.Execute("test_rt_blit_recreate auto").ok);
+    CHECK(v->value == "auto");
+    CHECK(C.Execute("test_rt_blit_recreate prompt").ok);
+    CHECK(v->value == "prompt");
+    CHECK(C.Execute("test_rt_blit_recreate warn").ok);
+    CHECK(v->value == "warn");
+
+    // Unrecognised values must be rejected with a non-empty error
+    // string. The cvar's stored value should NOT change.
+    auto r_bad = C.Execute("test_rt_blit_recreate foobar");
+    CHECK_FALSE(r_bad.ok);
+    CHECK_FALSE(r_bad.error.empty());
+    CHECK(v->value == "warn");  // unchanged from previous successful set
+
+    // Mixed-case is also rejected: allowed_values uses exact string
+    // match, so "Auto" doesn't slip through. (The engine's HWND-
+    // recreate dispatch hits its `mode == "auto"` branch -- not
+    // case-insensitive -- so case-folding here would create a silent
+    // fall-through to the warn branch.)
+    auto r_case = C.Execute("test_rt_blit_recreate Auto");
+    CHECK_FALSE(r_case.ok);
+    CHECK(v->value == "warn");
+}

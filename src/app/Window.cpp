@@ -75,6 +75,53 @@ void Window::PollEvents() {
     if (g_glfw_inited) glfwPollEvents();
 }
 
+// Win32 GLFW native declaration is set up later in the file; forward-
+// declare here so Recreate() can call it. The macro guard mirrors the
+// definition site below.
+#if defined(_WIN32)
+extern "C" void* pt_window_native_win32(void* glfw_window);
+#endif
+
+bool Window::Recreate() {
+#if defined(_WIN32)
+    if (handle_ == nullptr) {
+        LOG_ERROR("Window::Recreate: called with no live handle");
+        return false;
+    }
+    int pos_x = 0, pos_y = 0;
+    glfwGetWindowPos(handle_, &pos_x, &pos_y);
+    const int saved_w            = width_;
+    const int saved_h            = height_;
+    const int saved_cursor_mode  = glfwGetInputMode(handle_, GLFW_CURSOR);
+    const std::string saved_t    = title_;
+    void* old_native             = pt_window_native_win32(handle_);
+
+    LOG_INFO("Window::Recreate: tearing down GLFW window (HWND={}); preserving {}x{} pos {},{} cursor_mode={}",
+             old_native, saved_w, saved_h, pos_x, pos_y, saved_cursor_mode);
+
+    Destroy();
+    if (!Create(saved_w, saved_h, saved_t)) {
+        LOG_ERROR("Window::Recreate: Create failed after Destroy; window is now in an unusable state");
+        return false;
+    }
+    glfwSetWindowPos(handle_, pos_x, pos_y);
+    glfwSetInputMode(handle_, GLFW_CURSOR, saved_cursor_mode);
+    // Re-baseline polled accumulators against the fresh GLFW state so
+    // the first ConsumeMouseDelta after recreate returns 0 instead of
+    // a teleport jump.
+    cursor_have_baseline_ = false;
+    scroll_accum_x_       = 0.0;
+    scroll_accum_y_       = 0.0;
+
+    LOG_INFO("Window::Recreate: created new GLFW window (HWND={})",
+             pt_window_native_win32(handle_));
+    return true;
+#else
+    LOG_ERROR("Window::Recreate: Win32-only (called on a non-Win32 build)");
+    return false;
+#endif
+}
+
 bool Window::ShouldClose() const {
     return handle_ != nullptr && glfwWindowShouldClose(handle_);
 }

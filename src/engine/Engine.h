@@ -98,6 +98,26 @@ private:
     void TearDownDevice();
     void RenderFrame();
 
+    // Win32 only: destroy + recreate the GLFW window (and its HWND)
+    // and re-attach the console + perf overlays. Called by
+    // RequestBackendSwitch when transitioning vulkan->software with
+    // r_software_blit=gdi and r_software_blit_recreate=auto, to
+    // escape the DXGI flip-model lockout that poisons an HWND once
+    // Vulkan has presented to it. Engine-level state (cvars, console
+    // history, CSG scene, camera, primitives) all persist -- none of
+    // it is HWND-attached. Returns true on success; false leaves the
+    // engine in an unusable state (no window, no overlays) and the
+    // caller treats it as a hard failure (-> falls back to warn).
+    bool RecreateWindow();
+
+    // Win32 only: spawn a fresh copy of this process via CreateProcessA
+    // with the original argv_ and set wants_quit_ so the current main
+    // loop exits cleanly. Used by r_software_blit_recreate=prompt when
+    // the user clicks Yes. Returns true on successful spawn (caller
+    // should bail out of the current operation and let the loop exit);
+    // false on CreateProcessA failure (caller falls back to warn).
+    bool RestartProcess();
+
     // Scans argv_ for `--<cvar-name>=<value>` overrides and applies
     // them via Console::SetCVarOverride. Currently recognised:
     //   --net-port=N         -> net_port (HTTP/WebSocket UI)

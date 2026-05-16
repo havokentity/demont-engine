@@ -44,6 +44,21 @@
 #include <numeric>
 #include <sstream>    // std::istringstream for cam_load slot parsing
 #include <thread>
+#include <vector>     // std::vector<char> command-line buffer for RestartProcess
+
+// <windows.h> is included only for RecreateWindow's restart-prompt and
+// the user-facing MessageBoxW + CreateProcessA + GetModuleFileNameA
+// calls. NOMINMAX prevents <windows.h>'s min/max macros from colliding
+// with std::min/std::max used elsewhere in this TU.
+#if defined(_WIN32)
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#endif
 
 namespace pt::engine {
 
@@ -136,6 +151,27 @@ namespace cvar {
     // safe only for software-fresh-start sessions. The cvar takes
     // effect on the next backend (re)initialise. No-op on Mac/Linux.
     PT_CVAR(r_software_blit,   "vulkan",   "Software backend present path on Windows: vulkan (default; spec-compliant across all backend switches; minimal extra VkInstance) | gdi (legacy SetDIBitsToDevice; broken after vulkan -> software switch per Microsoft DXGI flip-model lockout). No-op on Mac/Linux.", CVAR_ARCHIVE);
+    // r_software_blit_recreate selects the behaviour when the vulkan ->
+    // software switch happens with r_software_blit=gdi (the DXGI flip-
+    // model lockout scenario; see r_software_blit docs above and the
+    // dispatch site in RequestBackendSwitch).
+    //   auto   = (default) recreate the GLFW window / HWND in-process
+    //            so the new HWND has never been a Vulkan present target
+    //            and accepts GDI writes. Preserves engine state (cvars,
+    //            console history, CSG scene, camera). Visible as a
+    //            brief window flicker at the switch moment.
+    //   prompt = pop a MessageBox asking the user whether to restart
+    //            the process. Yes spawns a fresh demont.exe with the
+    //            original argv and exits the current one; No falls back
+    //            to the warn path.
+    //   warn   = today's legacy behaviour: emit a LOG_WARN, leave the
+    //            window stuck on the last Vulkan frame, require the
+    //            user to quit + relaunch manually.
+    // No-op on Mac/Linux -- the lockout is Microsoft-DXGI-specific.
+    // Takes effect on the next such switch.
+    PT_CVAR(r_software_blit_recreate, "auto",
+            "Win32 only: behaviour when r_backend switches vulkan -> software with r_software_blit=gdi. auto (default) = in-process HWND recreate so GDI works on the fresh HWND | prompt = MessageBox Restart Now? (Yes spawns fresh process with original argv) | warn = legacy LOG_WARN, manual restart. No-op on Mac/Linux.",
+            CVAR_ARCHIVE);
     PT_CVAR(r_max_bounces,     "8",  "Max path bounces per ray",          CVAR_ARCHIVE);
     PT_CVAR(r_spp,             "1",  "Samples per pixel per dispatch (>=1). Higher = cleaner motion frames at proportional GPU cost.", CVAR_ARCHIVE);
     PT_CVAR(r_firefly_clamp,   "10",  "Per-contribution firefly clamp (per-channel ceiling on each indirect light contribution: env-NEE, ambient skylight, bounce-to-sky). Suppresses single-sample spikes from BSDF-sampled bounces hitting an HDRI sun pixel, while leaving camera-direct sky unbounded so the sun renders at full intensity. ACES saturates anything above ~5 to ~1.0 for SDR, so 10 preserves visible highlights and kills fireflies. 0 disables.", CVAR_ARCHIVE);
@@ -940,25 +976,89 @@ void Engine::RequestBackendSwitch(BackendType to) {
     // the window stuck on the last Vulkan frame for the rest of the
     // session (Microsoft DXGI flip-model lockout, see Vulkan
     // VK_KHR_win32_surface spec note + Microsoft DXGI flip-model docs).
-    // Warn at the actual switch moment, not just at cvar on_change,
-    // so users who saved r_software_blit=gdi in cfg get the warning
-    // when it's most actionable (right before the visual breaks).
+    // r_software_blit_recreate selects how we handle this:
+    //   - "auto"   : RecreateWindow() -- destroy + recreate the HWND
+    //                in-process so the new HWND has never been a
+    //                Vulkan present target (preserves engine state)
+    //   - "prompt" : MessageBox Restart Now? -- Yes spawns a fresh
+    //                process; No falls back to warn
+    //   - "warn"   : legacy LOG_WARN; user manually relaunches
+    // Decision is recorded BEFORE TearDownDevice runs so we can short-
+    // circuit the prompt path (Yes -> spawn + set wants_quit_, return
+    // without touching the device -- the main loop's normal teardown
+    // path runs as the loop exits).
+    bool need_recreate = false;
+    bool need_warn     = false;
     if (to == BackendType::Software &&
         current_backend_ == BackendType::Vulkan) {
         if (auto* v = pt::console::Console::Get().FindCVar("r_software_blit");
             v && v->value == "gdi") {
-            LOG_WARN("backend switch vulkan -> software with "
-                     "r_software_blit=gdi: window will be permanently "
-                     "stuck on the last Vulkan frame (Microsoft DXGI "
-                     "flip-model lockout). Quit + relaunch with "
-                     "r_backend software (and r_software_blit gdi) "
-                     "in demont.cfg for a clean GDI session, or set "
-                     "r_software_blit vulkan to switch live.");
+            std::string mode = "auto";
+            if (auto* m = pt::console::Console::Get().FindCVar("r_software_blit_recreate")) {
+                mode = m->value;
+            }
+            if (mode == "auto") {
+                need_recreate = true;
+            } else if (mode == "prompt") {
+                LOG_INFO("r_software_blit_recreate=prompt: asking user whether to restart for a clean GDI session");
+                HWND parent = window_ ? static_cast<HWND>(window_->NativeHandle()) : nullptr;
+                int btn = MessageBoxW(
+                    parent,
+                    L"Switching from Vulkan to Software with r_software_blit=gdi "
+                    L"will leave the window stuck on the last Vulkan frame "
+                    L"(Microsoft DXGI flip-model lockout).\r\n\r\n"
+                    L"Restart the application now to use GDI cleanly?\r\n\r\n"
+                    L"Yes: relaunch (current session is lost)\r\n"
+                    L"No: continue without restart (set r_software_blit vulkan to recover)",
+                    L"demont engine: vulkan -> software (GDI)",
+                    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON1);
+                if (btn == IDYES) {
+                    if (RestartProcess()) {
+                        LOG_INFO("r_software_blit_recreate=prompt: spawn succeeded; current process will exit on next loop iteration");
+                        // Bail out without touching the device --
+                        // wants_quit_ is set, the loop exits cleanly,
+                        // and Shutdown() tears down GPU resources.
+                        return;
+                    }
+                    LOG_WARN("r_software_blit_recreate=prompt: CreateProcessA failed; falling back to warn behaviour");
+                    need_warn = true;
+                } else {
+                    LOG_INFO("r_software_blit_recreate=prompt: user declined restart; falling back to warn behaviour");
+                    need_warn = true;
+                }
+            } else {
+                // mode == "warn" (or any unrecognised value -- the
+                // allowed_values validator at registration time rejects
+                // anything else, so this branch is the explicit warn
+                // path).
+                need_warn = true;
+            }
         }
     }
 #endif
 
     TearDownDevice();
+
+#if defined(_WIN32)
+    if (need_recreate) {
+        LOG_INFO("r_software_blit_recreate=auto: vulkan -> software gdi: recreating HWND to escape DXGI flip-model lockout");
+        if (!RecreateWindow()) {
+            LOG_ERROR("r_software_blit_recreate=auto: RecreateWindow failed; falling back to warn behaviour (window may be in a degraded state)");
+            need_warn = true;
+        }
+    }
+    if (need_warn) {
+        LOG_WARN("backend switch vulkan -> software with "
+                 "r_software_blit=gdi: window will be permanently "
+                 "stuck on the last Vulkan frame (Microsoft DXGI "
+                 "flip-model lockout). Quit + relaunch with "
+                 "r_backend software (and r_software_blit gdi) "
+                 "in demont.cfg for a clean GDI session, set "
+                 "r_software_blit vulkan to switch live, or set "
+                 "r_software_blit_recreate auto for an automatic "
+                 "in-process recreate.");
+    }
+#endif
 
     if (to == BackendType::None) {
         current_backend_ = BackendType::None;
@@ -1066,6 +1166,148 @@ void Engine::RequestBackendSwitch(BackendType to) {
     // BSC starmap: load + rasterise once on this device.
     EnsureStarMapUploaded();
     EnsureMoonMapUploaded();
+}
+
+bool Engine::RecreateWindow() {
+#if defined(_WIN32)
+    if (!window_) {
+        LOG_ERROR("Engine::RecreateWindow: no window to recreate");
+        return false;
+    }
+    LOG_INFO("Engine::RecreateWindow: tearing down overlays before HWND swap");
+    // Shut overlays down explicitly BEFORE destroying the parent
+    // GLFW window. Windows would cascade-destroy the child HWNDs when
+    // the parent dies, but the overlay objects still cache stale
+    // hwnd_ pointers in that case -- their next Paint/Repaint/Update
+    // would touch a dead handle. Explicit Shutdown nulls those
+    // pointers cleanly, and the static log dispatch (ConsoleOverlay::
+    // OnLog -> g_instance) goes inert until re-Init.
+    if (overlay_) {
+        overlay_->Shutdown();
+    }
+    if (perf_overlay_) {
+        perf_overlay_->Shutdown();
+    }
+
+    if (!window_->Recreate()) {
+        LOG_ERROR("Engine::RecreateWindow: Window::Recreate failed; engine is in an unusable window state");
+        // Drop the overlays since their parent_ is dead. The engine
+        // can technically continue with no window (smoke-test mode
+        // tolerates this), but the caller has already started a
+        // backend switch -- the most useful next thing is to log
+        // and let the dispatch site fall back to its warn path.
+        overlay_.reset();
+        perf_overlay_.reset();
+        return false;
+    }
+
+    LOG_INFO("Engine::RecreateWindow: re-attaching overlays to fresh HWND");
+    auto& C = pt::console::Console::Get();
+    if (overlay_) {
+        if (!overlay_->Init(window_->NativeHandle())) {
+            LOG_WARN("Engine::RecreateWindow: ConsoleOverlay re-Init failed; in-window log overlay disabled for this session");
+            overlay_.reset();
+        }
+        // Sink list is unchanged: ConsoleOverlay::OnLog stays
+        // registered and starts forwarding again now that the static
+        // g_instance points at the live overlay.
+    }
+    if (perf_overlay_) {
+        if (!perf_overlay_->Init(window_->NativeHandle())) {
+            LOG_WARN("Engine::RecreateWindow: PerfOverlay re-Init failed; perf HUD disabled for this session");
+            perf_overlay_.reset();
+        } else {
+            // Mirror the initial setup in Init(): re-apply theme, then
+            // resolve r_perf_overlay + r_perf_overlay_mode to set the
+            // tier level (or 0 if r_perf_overlay_mode=rhi).
+            if (auto* tv = C.FindCVar("r_theme")) {
+                perf_overlay_->ApplyTheme(tv->value);
+            }
+            int level = 0;
+            if (auto* lv = C.FindCVar("r_perf_overlay")) {
+                level = std::atoi(lv->value.c_str());
+            }
+            bool rhi = false;
+            if (auto* mv = C.FindCVar("r_perf_overlay_mode")) rhi = (mv->value == "rhi");
+            perf_overlay_->SetLevel(rhi ? 0 : level);
+        }
+    }
+    LOG_INFO("Engine::RecreateWindow: ok; HWND swap complete");
+    return true;
+#else
+    LOG_ERROR("Engine::RecreateWindow: Win32-only (called on a non-Win32 build)");
+    return false;
+#endif
+}
+
+bool Engine::RestartProcess() {
+#if defined(_WIN32)
+    // Resolve the running exe path via GetModuleFileNameA -- argv[0]
+    // can be a relative path or a different casing than what the OS
+    // actually loaded, and using the OS-reported path avoids surprises
+    // when the user launched from a different cwd. ANSI is fine: paths
+    // on Windows can legitimately contain non-ASCII via the active
+    // code page, but the engine's existing logging + cfg load chain is
+    // also ANSI, so we stay consistent. If a non-ASCII path bites,
+    // upgrading to GetModuleFileNameW is a localised change.
+    char exe_path[MAX_PATH] = {0};
+    DWORD n = GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) {
+        LOG_ERROR("Engine::RestartProcess: GetModuleFileNameA failed (GLE={}, n={})", GetLastError(), n);
+        return false;
+    }
+
+    // Build the lpCommandLine string. CreateProcessA requires a single
+    // writable buffer, by convention starting with the (quoted)
+    // application name followed by space-separated args. Quote any
+    // token containing whitespace or double quotes to survive the
+    // standard CommandLineToArgvW parse on the new-process side.
+    auto quote = [](const std::string& s) -> std::string {
+        if (!s.empty() && s.find_first_of(" \t\"") == std::string::npos) return s;
+        std::string r = "\"";
+        for (char c : s) {
+            if (c == '"' || c == '\\') r += '\\';
+            r += c;
+        }
+        r += '"';
+        return r;
+    };
+    std::string cmdline = quote(exe_path);
+    for (int i = 1; i < argc_ && argv_ != nullptr; ++i) {
+        if (argv_[i] == nullptr) break;
+        cmdline += ' ';
+        cmdline += quote(argv_[i]);
+    }
+    std::vector<char> cmdbuf(cmdline.begin(), cmdline.end());
+    cmdbuf.push_back('\0');
+
+    STARTUPINFOA       si{};
+    PROCESS_INFORMATION pi{};
+    si.cb = sizeof(si);
+    LOG_INFO("Engine::RestartProcess: spawning '{}' with cmdline '{}'", exe_path, cmdline);
+    BOOL ok = CreateProcessA(
+        exe_path,        // lpApplicationName
+        cmdbuf.data(),   // lpCommandLine (writable)
+        nullptr,         // lpProcessAttributes
+        nullptr,         // lpThreadAttributes
+        FALSE,           // bInheritHandles
+        0,               // dwCreationFlags
+        nullptr,         // lpEnvironment (inherit)
+        nullptr,         // lpCurrentDirectory (inherit)
+        &si, &pi);
+    if (!ok) {
+        LOG_ERROR("Engine::RestartProcess: CreateProcessA failed (GLE={})", GetLastError());
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    LOG_INFO("Engine::RestartProcess: spawn ok (PID={}); setting wants_quit_ for current process", pi.dwProcessId);
+    wants_quit_ = true;
+    return true;
+#else
+    LOG_ERROR("Engine::RestartProcess: Win32-only (called on a non-Win32 build)");
+    return false;
+#endif
 }
 
 void Engine::SeedDefaultCsgScene() {
@@ -5477,6 +5719,37 @@ void Engine::RegisterCommands() {
                          "path selected (default). Survives all backend "
                          "switches. Takes effect on next Software backend "
                          "(re)initialise.");
+            }
+        };
+#endif
+    }
+    // r_software_blit_recreate: validate cross-platform (so cfg load
+    // doesn't bounce a saved value back to default on Mac/Linux), but
+    // only emit Win32-specific info chatter on_change -- the cvar is
+    // documented as a no-op on Mac/Linux so users shouldn't see
+    // "auto/prompt/warn behaviour" messages there.
+    if (auto* v = C.FindCVar("r_software_blit_recreate")) {
+        v->allowed_values = {"auto", "prompt", "warn"};
+#if defined(_WIN32)
+        v->on_change = [](const pt::console::CVar& cv) {
+            if (cv.value == "auto") {
+                LOG_INFO("r_software_blit_recreate=auto -- vulkan -> software "
+                         "with r_software_blit=gdi will recreate the GLFW "
+                         "window in-process (escape DXGI flip-model lockout, "
+                         "preserve engine state). Brief flicker at the switch. "
+                         "Takes effect on next such switch.");
+            } else if (cv.value == "prompt") {
+                LOG_INFO("r_software_blit_recreate=prompt -- vulkan -> software "
+                         "with r_software_blit=gdi will pop a MessageBox "
+                         "offering to restart the process. Yes spawns a fresh "
+                         "demont.exe with the original argv; No falls back to "
+                         "the warn behaviour. Takes effect on next such switch.");
+            } else {
+                LOG_INFO("r_software_blit_recreate=warn -- vulkan -> software "
+                         "with r_software_blit=gdi will emit a LOG_WARN and "
+                         "leave the window stuck on the last Vulkan frame "
+                         "(legacy behaviour); user must manually quit and "
+                         "relaunch. Takes effect on next such switch.");
             }
         };
 #endif
