@@ -88,37 +88,44 @@ jobs:
         # broke without an extra artefact download.
         run: ctest --test-dir build/mac-debug --output-on-failure
 
+      # Smoke tests: boot the engine, render 8 frames, exit cleanly.
+      # Catches device-init regressions, descriptor-binding regressions,
+      # kernel-dispatch regressions that don't crash the build but
+      # crash the runtime. Each backend runs in its own step so a Metal
+      # regression doesn't mask a Software one. macOS GH runners are
+      # real macOS VMs with a window server, so GLFW window creation
+      # works -- the smoke tests do create a brief on-screen window
+      # each run, which is fine on CI but explains why local devs see
+      # a flash if they run these commands manually.
+      #
+      # timeout-minutes: 2 per step is the second line of defence
+      # behind the engine's own kSmokeNoDeviceTimeoutSec (10s in
+      # Engine::Run) -- if the in-engine fail-fast somehow regresses
+      # and the loop hangs, GH Actions kills the step within 2 minutes
+      # instead of burning the workflow's default 6-hour timeout.
+
       - name: Smoke test (Software backend)
-        # Boots the engine with the Software backend, renders 8 frames,
-        # exits cleanly. Catches: device-init regressions, descriptor
-        # binding regressions, kernel dispatch regressions that don't
-        # crash the build but crash the runtime. Per-backend smoke
-        # tests run sequentially so a Metal regression doesn't mask a
-        # Software one. macOS GH runners are real macOS VMs with a
-        # window server, so GLFW window creation works -- the smoke
-        # tests do create a brief on-screen window each run, which is
-        # fine on CI but explains why local devs see a flash if they
-        # run these commands manually.
+        timeout-minutes: 2
         run: ./build/mac-debug/src/app/demont --smoke-frames=8 --r-backend=software
 
       - name: Smoke test (Metal backend)
-        # Same as the Software smoke test but explicitly exercises the
-        # Metal path. Catches: MetalDevice init, MTLDevice / MTLCommandQueue
-        # creation, the metal-cpp + metal-objc bridging glue,
-        # MetalSvgfDenoiser compile-on-first-Denoise path, etc. Mac
-        # Apple Silicon only -- this step exists because the macOS
-        # runner is the only place we get a real Metal stack.
+        # Catches MetalDevice init, MTLDevice / MTLCommandQueue creation,
+        # metal-cpp + metal-objc bridging glue, MetalSvgfDenoiser
+        # compile-on-first-Denoise path, etc. Mac Apple Silicon only --
+        # this step exists because the macOS runner is the only place
+        # we get a real Metal stack.
+        timeout-minutes: 2
         run: ./build/mac-debug/src/app/demont --smoke-frames=8 --r-backend=metal
 
       - name: Smoke test (Vulkan / MoltenVK backend)
         # MoltenVK on Apple Silicon. Catches: nullDescriptor / partially-
         # bound regressions (the v0.3.20 fix lives or dies on this step),
-        # AS / RayQuery / Embree-equivalent paths, MoltenVK extension
-        # plumbing. Note: the CSG-on-Mac-Vulkan bug (#44) means the
-        # rendered output is incomplete here but the smoke test still
-        # passes -- it asserts "boots + N frames + clean exit", not
-        # pixel-correctness. Pixel-correctness is the golden-matrix
-        # job's concern (#45) when that lands.
+        # AS / RayQuery paths, MoltenVK extension plumbing. Note: the
+        # CSG-on-Mac-Vulkan bug (#44) means rendered output is
+        # incomplete here but the smoke test still passes -- it asserts
+        # "boots + N frames + clean exit", not pixel-correctness. Pixel
+        # correctness is the golden-matrix job's concern (#45).
+        timeout-minutes: 2
         run: ./build/mac-debug/src/app/demont --smoke-frames=8 --r-backend=vulkan
 
   windows:
@@ -179,20 +186,27 @@ jobs:
       - name: Smoke test (Software backend)
         # See the mac-debug Software smoke test for rationale. Windows
         # has a desktop session on the GH runner so GLFW window
-        # creation works fine.
+        # creation works fine. timeout-minutes is the second line of
+        # defence behind Engine::Run's kSmokeNoDeviceTimeoutSec.
         shell: pwsh
+        timeout-minutes: 2
         run: ./build/win-debug/src/app/demont.exe --smoke-frames=8 --r-backend=software
 
-      - name: Smoke test (Vulkan backend)
-        # Windows-NVIDIA path. The runner has no NVIDIA hardware so
-        # this exercises the Vulkan loader's fallback to the software
-        # rasterizer (Microsoft's lavapipe-equivalent) -- still
-        # catches API regressions, descriptor + binding plumbing,
-        # validation-layer-detected misuse, etc. Real NVIDIA RTX
-        # exercise happens on the user's local + the eventual
-        # self-hosted RTX runner.
-        shell: pwsh
-        run: ./build/win-debug/src/app/demont.exe --smoke-frames=8 --r-backend=vulkan
+      # NOTE on the missing Windows Vulkan smoke step:
+      #
+      # The windows-latest GH runner has no GPU hardware and no
+      # software Vulkan ICD installed by the workflow (only the LunarG
+      # loader + headers, via install-vulkan-sdk-action). With no ICD,
+      # vkCreateInstance returns VK_ERROR_INCOMPATIBLE_DRIVER and the
+      # engine's Vulkan backend init fails -- which the smoke test's
+      # kSmokeNoDeviceTimeoutSec correctly treats as a fatal failure
+      # (exit code 2). That's a CI-environment limitation, not a
+      # regression worth gating PRs on; the Mac Vulkan smoke step
+      # already covers the MoltenVK path which is the most fragile.
+      # When a Windows-NVIDIA self-hosted runner exists, add the
+      # `--r-backend=vulkan` smoke step here (mirror the mac block).
+      # Until then, intentionally omitted to keep the windows job
+      # green.
 
   # Scheduled nightly release: at 23:00 IST (cron at top, in UTC) the
   # macos build runs and -- if it passes -- this job repackages the
