@@ -65,6 +65,16 @@ namespace cvar {
             CVAR_ARCHIVE);
     PT_CVAR(app_overlay_enabled, "1",
             "Enable the in-window native console overlay (backtick toggles)", CVAR_ARCHIVE);
+    PT_CVAR(pt_smoke_frames, "0",
+            "Smoke-test frame budget. >0 = render this many frames then "
+            "exit cleanly (exit code 0). 0 = run normally until the user "
+            "quits. Typically set via the --smoke-frames=N CLI override "
+            "so a CI job can launch `demont --smoke-frames=32`, watch "
+            "the process exit cleanly, and infer that the backend "
+            "boots + renders + tears down without crashing. NOT "
+            "CVAR_ARCHIVE -- this is a per-invocation knob, never "
+            "persisted to demont.cfg, never read from it.",
+            CVAR_NONE);
     PT_CVAR(con_font_scale, "1.0",
             "Console overlay font scale. 1.0 = baseline (14 logical-unit "
             "CreateFontW height on Win32; 13/12/9 pt input/output/status "
@@ -674,6 +684,13 @@ void Engine::ApplyCommandLineCvarOverrides() {
     static constexpr OverrideMap kOverrides[] = {
         { "--net-port=",      "net_port"      },  // HTTP/WebSocket UI
         { "--net-line-port=", "net_line_port" },  // TCP console
+        { "--smoke-frames=",  "pt_smoke_frames" },  // CI smoke-test budget
+        // --r-backend= routes to the existing r_backend cvar so CI can
+        // fire one smoke-test invocation per backend without baking
+        // backend choices into demont.cfg. Honours r_backend's
+        // allowed_values (software / metal / vulkan) -- SetCVarOverride
+        // rejects out-of-set values + LOG_WARNs below.
+        { "--r-backend=",     "r_backend"     },
     };
 
     for (int i = 1; i < argc_; ++i) {
@@ -4282,6 +4299,28 @@ void Engine::Tick(double dt) {
 void Engine::Run() {
     using clk = std::chrono::steady_clock;
     auto last = clk::now();
+
+    // Smoke-test mode: read the per-invocation frame budget once at
+    // loop start. 0 (the default) = unbounded; >0 = render exactly
+    // this many frames then exit cleanly so CI can launch
+    // `demont --smoke-frames=N`, watch the process return 0, and
+    // infer "backend boots + renders + tears down without crashing
+    // or hitting an assertion." Set via the `--smoke-frames=N` CLI
+    // override which routes to the pt_smoke_frames cvar in
+    // RegisterCVars. Read once (not per-frame) because mid-run
+    // mutations to the budget would just be confusing -- the budget
+    // is a launch parameter.
+    std::uint32_t smoke_frame_budget = 0;
+    if (auto* v = pt::console::Console::Get().FindCVar("pt_smoke_frames")) {
+        const int n = v->GetInt();
+        if (n > 0) smoke_frame_budget = static_cast<std::uint32_t>(n);
+    }
+    if (smoke_frame_budget > 0) {
+        LOG_INFO("smoke-test mode: will render {} frame(s) then exit cleanly",
+                 smoke_frame_budget);
+    }
+    std::uint32_t smoke_frames_rendered = 0;
+
     while (!wants_quit_ && !window_->ShouldClose()) {
         auto now = clk::now();
         double dt = std::chrono::duration<double>(now - last).count();
@@ -4304,6 +4343,20 @@ void Engine::Run() {
         // device, the swapchain present already paces us via vsync.
         if (!device_) {
             std::this_thread::sleep_for(std::chrono::milliseconds(8));
+        }
+
+        // Smoke-test exit: count only iterations after the device is
+        // bound (= a real frame got rendered). The pre-device throttle
+        // path above is the loading window where Tick is a no-op; we
+        // don't want a 32-frame budget consumed entirely by loading-
+        // screen ticks that never touched the GPU.
+        if (smoke_frame_budget > 0 && device_) {
+            ++smoke_frames_rendered;
+            if (smoke_frames_rendered >= smoke_frame_budget) {
+                LOG_INFO("smoke-test: rendered {} frame(s); requesting clean exit",
+                         smoke_frames_rendered);
+                wants_quit_ = true;
+            }
         }
     }
     LOG_INFO("Run loop exited.");
