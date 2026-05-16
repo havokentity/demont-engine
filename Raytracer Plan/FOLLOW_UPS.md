@@ -799,3 +799,132 @@ doesn't spam. Alternatively, always log a single
 "engine: first frame rendered" marker right after the first
 successful `Submit`/`EndFrame`, which gives CI scripts a uniform
 sync point regardless of cold-vs-warm.
+
+---
+
+## SVGF a-trous smudges stars at night (post-composite fix)
+
+**Status:** Observed on Mac at night-time HDRI / procedural-night
+skies: stars become low-contrast smears that fade toward invisible
+as `r_svgf_atrous_passes` increases. Root cause is structural to the
+a-trous edge-stop formulation, not a tuning bug:
+
+- Stars are sub-pixel point emitters -- one or a handful of bright
+  pixels in an otherwise near-black sky.
+- The luminance edge-stop `exp(-|L_center - L_sample| / sigma_L)`
+  saturates against bright neighbours but treats dark neighbours
+  as "consistent," so the kernel happily blends the star pixel's
+  energy outward.
+- Strides 1 / 2 / 4 / 8 each widen the footprint; by the last pass
+  the energy is spread across a ~17x17 region and the star reads
+  as a faint smudge instead of a point.
+- Depth + normal edge-stops don't save us either -- sky pixels all
+  share viewZ = far-plane and a synthesized "up" normal, so every
+  star-vs-sky pair passes the geometric tests.
+
+**Confirmed workarounds (both work, neither is the right answer):**
+
+- `r_svgf_atrous_passes 1` -- one pass still spreads slightly but
+  stars remain recognizably point-like.
+- `r_denoiser svgf_basic` -- temporal only, no spatial filter at all.
+  Stars stay sharp but the rest of the scene loses the a-trous
+  cleanup on disocclusions.
+
+Both are useful debugging escape hatches but neither lets us keep
+the full a-trous quality for *non-star* pixels while protecting the
+stars themselves.
+
+**Why deferred:** the workarounds are usable today, the fix touches
+multiple shaders + pipeline plumbing (~500 LOC), and the Vulkan NRD
+integration is on the critical path ahead of this. Worth picking up
+once NRD lands because NRD has the same class of issue with
+point-like emitters and the same post-composite split is the
+production answer there too.
+
+**Plan when picked up -- Option A, post-denoise composite:**
+
+The standard production pattern for point-like emitters (stars,
+lens flare, distant headlights) is to route them around the
+denoiser and composite back in *after* denoise / *before* bloom.
+That preserves the denoiser quality on diffuse lighting while
+keeping the points pixel-sharp, and bloom still picks them up
+correctly because the composite happens upstream of the bloom
+downsample chain.
+
+1. **PathTrace.slang split.** Detect "star" hits when the primary
+   miss samples an HDRI/procedural-sky texel above a configurable
+   luminance threshold (`r_star_split_threshold`, default ~50
+   cd/m^2 scene-referred). Write that contribution to a new
+   `accum_stars` RGBA16F target instead of the main accumulator.
+   Everything else (diffuse sky, sun disc, ground, geometry) keeps
+   going to `accum_main` as today. Per-pixel binary classification,
+   no overlap.
+
+2. **Engine.cpp pipeline plumbing.** Allocate `accum_stars` next to
+   the existing accumulator, bind it as a second storage texture
+   in the path-trace pass, declare the matching binding slot, and
+   wire it through `RebuildFrameResources()` resize handling.
+
+3. **New `CompositeStars.slang` compute pass.** Reads
+   `post_denoise_hdr` (denoised main) + `accum_stars` (unfiltered
+   points), additive-blends them into a fresh `post_composite_hdr`
+   target. Trivial kernel -- one add + one fma for the framecount
+   normalisation, no edge-stops or filtering. Inserted between
+   `Denoise()` and the bloom downsample in the render graph.
+
+4. **Bloom + tonemap chain rebind.** Bloom currently reads
+   `post_denoise_hdr`; switch it to `post_composite_hdr`. No
+   shader change inside the bloom chain itself -- it's strictly
+   an input rebind in the Vulkan / Metal pipeline setup. Bright
+   stars will then drive bloom correctly (which they don't today
+   because by the time the pixel reaches bloom it's already been
+   blurred to mid-grey).
+
+**DOF compatibility (already correct, documenting why):** the path
+tracer's primary-ray aperture jitter is upstream of the star/main
+split, so a star hit's `accum_stars` write already lands at the
+DOF-jittered pixel position. Averaging across spp produces the
+correct circle-of-confusion bokeh on stars, same as on geometry.
+The composite pass reads `accum_stars` as-is, so DOF flows through
+unchanged. No extra work needed.
+
+**Bloom compatibility (already correct, documenting why):** the
+composite pass runs *before* the bloom downsample chain reads its
+input, so stars are present in the bright-pass extraction and
+generate bloom halos exactly like any other bright pixel. This is
+the whole reason for picking "post-denoise, pre-bloom" as the
+insertion point -- it gives stars both denoiser-bypass *and*
+bloom-participation, which is the production-correct behaviour.
+
+**Threshold choice:** start with luminance-based selection because
+it's the cleanest test for "point-like bright thing surrounded by
+dark." If HDRIs with localized bright clouds end up false-positive
+(unlikely but possible at sunset / aurora skies), switch to a
+2x2 local-contrast test (this pixel >> max of 4 neighbours) which
+is robust against bright *regions* but still flags bright *points*.
+
+**Estimated scope:**
+
+- `PathTrace.slang`: ~80 LOC for the split + new output binding.
+- `Engine.cpp` + `EnsureFrameResources`: ~150 LOC for the
+  `accum_stars` texture lifecycle + bind plumbing.
+- `CompositeStars.slang` (new): ~50 LOC including header + IO.
+- `VulkanDevice::RecordFrame` / `MetalDevice::RecordFrame`: ~100
+  LOC each for the composite-pass dispatch insertion and bloom
+  input rebind.
+- Cvars + docs: ~30 LOC across `Cvars.cpp` + `cvars.md`.
+
+Total ~500 LOC, single session of work.
+
+**Acceptance:**
+
+- At `r_denoiser svgf_atrous` with default 3 passes, stars at night
+  remain pixel-sharp (no measurable smudging when comparing
+  per-pixel luminance to a reference 1024-spp render).
+- Bloom halos appear around stars proportional to their brightness.
+- DOF defocus produces correct bokeh circles on stars when the
+  focus plane is far from the camera.
+- No regression on diffuse-scene denoise quality (a-trous still
+  runs identically on `accum_main`).
+- No measurable frame-time cost beyond the composite dispatch
+  itself (~0.1 ms at 1080p; one full-screen add).
