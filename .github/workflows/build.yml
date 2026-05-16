@@ -88,10 +88,38 @@ jobs:
         # broke without an extra artefact download.
         run: ctest --test-dir build/mac-debug --output-on-failure
 
-      # Smoke boot-test is skipped on the runner because GLFW can't
-      # create a window without a display. Local devs already run the
-      # binary; CI's job is to catch compile + link regressions + the
-      # unit-test matrix above.
+      - name: Smoke test (Software backend)
+        # Boots the engine with the Software backend, renders 8 frames,
+        # exits cleanly. Catches: device-init regressions, descriptor
+        # binding regressions, kernel dispatch regressions that don't
+        # crash the build but crash the runtime. Per-backend smoke
+        # tests run sequentially so a Metal regression doesn't mask a
+        # Software one. macOS GH runners are real macOS VMs with a
+        # window server, so GLFW window creation works -- the smoke
+        # tests do create a brief on-screen window each run, which is
+        # fine on CI but explains why local devs see a flash if they
+        # run these commands manually.
+        run: ./build/mac-debug/src/app/demont --smoke-frames=8 --r-backend=software
+
+      - name: Smoke test (Metal backend)
+        # Same as the Software smoke test but explicitly exercises the
+        # Metal path. Catches: MetalDevice init, MTLDevice / MTLCommandQueue
+        # creation, the metal-cpp + metal-objc bridging glue,
+        # MetalSvgfDenoiser compile-on-first-Denoise path, etc. Mac
+        # Apple Silicon only -- this step exists because the macOS
+        # runner is the only place we get a real Metal stack.
+        run: ./build/mac-debug/src/app/demont --smoke-frames=8 --r-backend=metal
+
+      - name: Smoke test (Vulkan / MoltenVK backend)
+        # MoltenVK on Apple Silicon. Catches: nullDescriptor / partially-
+        # bound regressions (the v0.3.20 fix lives or dies on this step),
+        # AS / RayQuery / Embree-equivalent paths, MoltenVK extension
+        # plumbing. Note: the CSG-on-Mac-Vulkan bug (#44) means the
+        # rendered output is incomplete here but the smoke test still
+        # passes -- it asserts "boots + N frames + clean exit", not
+        # pixel-correctness. Pixel-correctness is the golden-matrix
+        # job's concern (#45) when that lands.
+        run: ./build/mac-debug/src/app/demont --smoke-frames=8 --r-backend=vulkan
 
   windows:
     name: Windows (NVIDIA RTX target)
@@ -147,6 +175,24 @@ jobs:
         # See mac-debug job above for rationale.
         shell: pwsh
         run: ctest --test-dir build/win-debug --output-on-failure
+
+      - name: Smoke test (Software backend)
+        # See the mac-debug Software smoke test for rationale. Windows
+        # has a desktop session on the GH runner so GLFW window
+        # creation works fine.
+        shell: pwsh
+        run: ./build/win-debug/src/app/demont.exe --smoke-frames=8 --r-backend=software
+
+      - name: Smoke test (Vulkan backend)
+        # Windows-NVIDIA path. The runner has no NVIDIA hardware so
+        # this exercises the Vulkan loader's fallback to the software
+        # rasterizer (Microsoft's lavapipe-equivalent) -- still
+        # catches API regressions, descriptor + binding plumbing,
+        # validation-layer-detected misuse, etc. Real NVIDIA RTX
+        # exercise happens on the user's local + the eventual
+        # self-hosted RTX runner.
+        shell: pwsh
+        run: ./build/win-debug/src/app/demont.exe --smoke-frames=8 --r-backend=vulkan
 
   # Scheduled nightly release: at 23:00 IST (cron at top, in UTC) the
   # macos build runs and -- if it passes -- this job repackages the
