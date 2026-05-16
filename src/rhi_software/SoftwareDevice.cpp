@@ -14,20 +14,14 @@
 // hand-written C++ port covering the subset documented in
 // SoftwareTracer.h.
 //
-// Known limitation (Windows): GDI present is not DPI-aware.  The engine
-// makes no SetProcessDpiAwarenessContext call, so on a high-DPI display
+// Known limitation (Windows GDI path): not DPI-aware.  The engine makes
+// no SetProcessDpiAwarenessContext call, so on a high-DPI display
 // Windows reports virtualised pixels from GetClientRect while
 // SetDIBitsToDevice writes physical pixels; the DWM then bilinearly
 // stretches our framebuffer to the real display size, softening the
-// path-traced output.  Acceptable for a CPU reference renderer; the
-// future Vulkan-blit alternative (see TODO below) will pick up real
-// per-monitor DPI awareness through VkSurfaceKHR.
-//
-// TODO (follow-up PR): r_software_blit cvar to select between GDI and
-// a Vulkan-blit present on Windows.  The Vulkan path will share the
-// engine's VkDevice with VulkanDevice (avoids dragging a second Vulkan
-// instance in just for present); see SoftwareDevice::EndFrame for the
-// Windows code paths.
+// path-traced output.  Acceptable for a CPU reference renderer.  The
+// Vulkan-blit present alternative (r_software_blit=1, the default on
+// Win32 since PR #42) sidesteps the GDI path entirely.
 
 #include "SoftwareDevice.h"
 #include "SoftwareTracer.h"
