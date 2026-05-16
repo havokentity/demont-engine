@@ -456,6 +456,23 @@ bool WinOverlay::Init(HWND parent) {
         font_is_owned_ = false;
     }
 
+    // Re-sync the cached scale invariant with the freshly-created
+    // font. The font was just made at kFontHeight (the unscaled
+    // default); font_scale_ MUST reflect that, otherwise EnsureFontScale
+    // on the next Paint will compare cvar(e.g. 1.5) against a stale
+    // font_scale_(1.5) carried over from a previous lifetime, decide
+    // "no change needed", and leave the new font at the unscaled size.
+    //
+    // The bug only fires when Init runs a SECOND time on the same
+    // WinOverlay object -- which is exactly what Engine::RecreateWindow
+    // does on the vulkan->software gdi-mode HWND swap. On first init
+    // font_scale_'s class-default (1.0f) already matches; on re-init
+    // it carries whatever EnsureFontScale last applied. Reset both
+    // here so the next Paint's EnsureFontScale always re-applies the
+    // current cvar from a clean baseline.
+    font_scale_   = 1.0f;
+    line_height_  = kLineHeight;
+
     // Publish this instance with release semantics so log-thread loads
     // see fully-initialised state_mutex_, scrollback_, hwnd_, etc.
     g.store(this, std::memory_order_release);

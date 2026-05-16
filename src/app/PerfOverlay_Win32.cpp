@@ -220,6 +220,24 @@ bool WinPerf::Init(HWND parent) {
         font_is_owned_ = false;
     }
 
+    // Re-sync the cached scale invariant with the freshly-created
+    // font (mirrors ConsoleOverlay_Win32). The font was just made at
+    // kFontHeight (the unscaled default); font_scale_ MUST reflect
+    // that, otherwise EnsureScale on the next Paint will compare
+    // cvar(e.g. 2.0) against a stale font_scale_(2.0) carried over
+    // from a previous lifetime, decide "no change needed", and leave
+    // the new font + panel width + graph at unscaled defaults.
+    //
+    // The bug only fires when Init runs a SECOND time on the same
+    // WinPerf object -- which is what Engine::RecreateWindow does on
+    // the vulkan->software gdi-mode HWND swap. All four scale-driven
+    // caches (font_scale_, line_height_, panel_w_, graph_h_) must
+    // reset together so EnsureScale's "any changed?" gate fires.
+    font_scale_  = 1.0f;
+    line_height_ = kLineHeight;
+    panel_w_     = kPanelW;
+    graph_h_     = kGraphH;
+
     return true;
 }
 
