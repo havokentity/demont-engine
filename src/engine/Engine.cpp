@@ -687,9 +687,17 @@ void Engine::ApplyCommandLineCvarOverrides() {
         { "--smoke-frames=",  "pt_smoke_frames" },  // CI smoke-test budget
         // --r-backend= routes to the existing r_backend cvar so CI can
         // fire one smoke-test invocation per backend without baking
-        // backend choices into demont.cfg. Honours r_backend's
-        // allowed_values (software / metal / vulkan) -- SetCVarOverride
-        // rejects out-of-set values + LOG_WARNs below.
+        // backend choices into demont.cfg. Validated below against
+        // r_backend's allowed_values (software / metal / vulkan) -- the
+        // SetCVarOverride path bypasses CVAR_READONLY but does NOT
+        // enforce allowed_values, so we have to do that check
+        // explicitly here. Without the check, --r-backend=metalfx
+        // would silently assign "metalfx" to r_backend, the engine
+        // would find no backend matching that name, device_ would
+        // stay null, and the smoke-test loop would have nothing to
+        // do (the no-device fail-fast path below catches that as a
+        // fatal smoke-test error, but it's better to fail at arg-
+        // parse time with a clear "unknown value" message).
         { "--r-backend=",     "r_backend"     },
     };
 
@@ -700,10 +708,40 @@ void Engine::ApplyCommandLineCvarOverrides() {
         for (const auto& o : kOverrides) {
             if (!arg.starts_with(o.flag_prefix)) continue;
             const std::string_view value = arg.substr(o.flag_prefix.size());
+            matched = true;
             if (value.empty()) {
                 LOG_WARN("engine: {} given with empty value -- ignored",
                          o.flag_prefix);
-            } else if (!C.SetCVarOverride(o.cvar_name, value)) {
+                break;
+            }
+            // Validate against the cvar's allowed_values set before
+            // applying. SetCVarOverride is the "engine internal
+            // override" path -- it bypasses CVAR_READONLY (necessary
+            // for some engine-set cvars) but does NOT enforce
+            // allowed_values (the equivalent check in Console::Execute
+            // is what normally rejects bad values from user input).
+            // For CLI args we want both behaviours: bypass READONLY,
+            // but reject typos / unsupported values. Hence the manual
+            // check here.
+            auto* cv = C.FindCVar(o.cvar_name);
+            if (cv != nullptr && !cv->allowed_values.empty()) {
+                bool in_set = false;
+                for (const auto& av : cv->allowed_values) {
+                    if (av == value) { in_set = true; break; }
+                }
+                if (!in_set) {
+                    std::string allowed_csv;
+                    for (std::size_t j = 0; j < cv->allowed_values.size(); ++j) {
+                        if (j) allowed_csv += ", ";
+                        allowed_csv += cv->allowed_values[j];
+                    }
+                    LOG_ERROR("engine: {} = '{}' rejected: not in allowed set "
+                              "for cvar '{}' (allowed: {}). Override ignored.",
+                              arg, value, o.cvar_name, allowed_csv);
+                    break;
+                }
+            }
+            if (!C.SetCVarOverride(o.cvar_name, value)) {
                 LOG_WARN("engine: {} -> SetCVarOverride('{}', '{}') failed "
                          "(cvar not registered yet?)",
                          arg, o.cvar_name, value);
@@ -711,7 +749,6 @@ void Engine::ApplyCommandLineCvarOverrides() {
                 LOG_INFO("engine: CLI override {} = '{}' (post-cfg)",
                          o.cvar_name, value);
             }
-            matched = true;
             break;
         }
         if (!matched && arg.starts_with("--")) {
@@ -4321,6 +4358,25 @@ void Engine::Run() {
     }
     std::uint32_t smoke_frames_rendered = 0;
 
+    // Smoke-test hang detector. If the device_ never becomes non-null
+    // (backend init failed silently, MoltenVK refused to create on the
+    // host, Metal hardware-RT requirement unmet on a virtual GPU, etc.)
+    // the existing post-device frame counter would NEVER fire, and the
+    // pre-device sleep loop further down would idle indefinitely. On a
+    // CI runner that means the job burns until the workflow timeout
+    // rather than failing promptly. Track elapsed time since Run start;
+    // if we've been waiting for the device past kSmokeNoDeviceTimeoutSec
+    // and smoke mode is on, give up loudly with smoke_test_failed_ = true
+    // and let main() translate that into a non-zero exit code.
+    //
+    // 10s is well past every "normal" Init+ first-frame timeline (most
+    // backends bind within ~100-500ms; the worst case is Vulkan cold
+    // pipeline compile which is already bounded by the async pipeline-
+    // build worker, capped at a few seconds even on cold caches). A
+    // backend that hasn't bound at 10s is broken, not slow.
+    constexpr double kSmokeNoDeviceTimeoutSec = 10.0;
+    const auto       run_start                = clk::now();
+
     while (!wants_quit_ && !window_->ShouldClose()) {
         auto now = clk::now();
         double dt = std::chrono::duration<double>(now - last).count();
@@ -4345,17 +4401,42 @@ void Engine::Run() {
             std::this_thread::sleep_for(std::chrono::milliseconds(8));
         }
 
-        // Smoke-test exit: count only iterations after the device is
-        // bound (= a real frame got rendered). The pre-device throttle
-        // path above is the loading window where Tick is a no-op; we
-        // don't want a 32-frame budget consumed entirely by loading-
-        // screen ticks that never touched the GPU.
-        if (smoke_frame_budget > 0 && device_) {
-            ++smoke_frames_rendered;
-            if (smoke_frames_rendered >= smoke_frame_budget) {
-                LOG_INFO("smoke-test: rendered {} frame(s); requesting clean exit",
-                         smoke_frames_rendered);
-                wants_quit_ = true;
+        // Smoke-test exit accounting -- two paths:
+        //
+        //   1. device_ is bound: count this iteration as a rendered
+        //      frame. Once the budget is hit, request a clean exit.
+        //      The pre-device throttle path further up is the loading
+        //      window where Tick is a no-op; we don't want a 32-frame
+        //      budget consumed entirely by loading-screen ticks that
+        //      never touched the GPU.
+        //
+        //   2. device_ is still null: the engine hasn't bound a backend
+        //      yet (either init genuinely in flight, or it failed). If
+        //      we've been here longer than kSmokeNoDeviceTimeoutSec the
+        //      "init in flight" case is implausible -- it's a silent
+        //      failure. Mark the smoke test failed + exit so CI sees a
+        //      non-zero exit code instead of hanging until the workflow
+        //      timeout fires.
+        if (smoke_frame_budget > 0) {
+            if (device_) {
+                ++smoke_frames_rendered;
+                if (smoke_frames_rendered >= smoke_frame_budget) {
+                    LOG_INFO("smoke-test: rendered {} frame(s); "
+                             "requesting clean exit",
+                             smoke_frames_rendered);
+                    wants_quit_ = true;
+                }
+            } else {
+                const double elapsed = std::chrono::duration<double>(
+                    clk::now() - run_start).count();
+                if (elapsed > kSmokeNoDeviceTimeoutSec) {
+                    LOG_ERROR("smoke-test: no device bound after {:.1f}s -- "
+                              "backend init appears to have failed silently. "
+                              "Failing the smoke test (exit code 2).",
+                              elapsed);
+                    smoke_test_failed_ = true;
+                    wants_quit_ = true;
+                }
             }
         }
     }

@@ -114,6 +114,15 @@ int main(int argc, char** argv) {
 
     engine.Run();
 
+    // Smoke-test mode (--smoke-frames=N) maps a clean budget-hit exit to
+    // 0 and a "couldn't even bind a backend within the no-device
+    // timeout" failure to 2. Non-smoke-test launches never set the
+    // flag, so this is a no-op (returns 0) in interactive runs.
+    const int exit_code = engine.SmokeTestFailed() ? 2 : 0;
+    if (exit_code != 0) {
+        LOG_ERROR("smoke-test mode: exiting with code {}", exit_code);
+    }
+
     pt::mem::PrintReport();
-    return 0;
+    return exit_code;
 }
