@@ -52,7 +52,7 @@ extern const unsigned long shader_PerfOverlay_spirv_size;
 // Bloom pyramid (BloomDown/Up). Compiled to SPIR-V and embedded
 // alongside the other compute shaders. Each declares only 2
 // storage-image bindings (src + dst) on Vulkan, which is compatible
-// with the shared 19-binding pipeline layout -- so we build them with
+// with the shared 20-binding pipeline layout -- so we build them with
 // the same VkPipelineLayout the path tracer uses and drive them via
 // the engine's standard cb->BindComputePipeline + cb->Dispatch path.
 extern const unsigned char shader_BloomDown_spirv_data[];
@@ -81,20 +81,24 @@ constexpr bool kEnableValidation = false;
 #endif
 
 // Engine slot -> shader vk::binding translation. The unified descriptor
-// set has 19 bindings (0-18): storage_image x10 (output / accum_hdr /
+// set has 20 bindings (0-19): storage_image x11 (output / accum_hdr /
 // denoise_color / depth / motion / env_map / star_map / moon_map /
-// normal_tex / albedo_tex), AS x1 (scene_tlas), storage_buffer x7
-// (mesh / cdf / exposure_state / bvh_nodes), uniform_buffer x1 (Frame
-// UBO at binding 14). Tonemap / Bloom* re-use a subset. Engine.cpp uses
-// up-to-10-element textures, 8-element buffers, and 4-element
-// accel-struct slot arrays as if Metal-style argument tables; we
-// flatten these into the single Vulkan descriptor set here. Engine
-// slot 8 (normal_tex / vk::binding 16) and slot 9 (albedo_tex /
-// vk::binding 17) are Vulkan-only -- the SVGF/NRD path tracer writes
-// normal; only OptiX AOV (optix_hdr_aov) writes albedo. Engine slot 7
-// (bvh_nodes / vk::binding 18) is populated for the analytic-prim BVH
-// path on either backend.
-static constexpr std::uint32_t kNumTexSlots = 10;
+// normal_tex / albedo_tex / accum_stars), AS x1 (scene_tlas),
+// storage_buffer x7 (mesh / cdf / exposure_state / bvh_nodes),
+// uniform_buffer x1 (Frame UBO at binding 14). Tonemap / Bloom* re-use
+// a subset. Engine.cpp uses up-to-11-element textures, 8-element
+// buffers, and 4-element accel-struct slot arrays as if Metal-style
+// argument tables; we flatten these into the single Vulkan descriptor
+// set here. Engine slot 8 (normal_tex / vk::binding 16) and slot 9
+// (albedo_tex / vk::binding 17) are Vulkan-only -- the SVGF/NRD path
+// tracer writes normal; only OptiX AOV (optix_hdr_aov) writes albedo.
+// Engine slot 7 (bvh_nodes / vk::binding 18) is populated for the
+// analytic-prim BVH path on either backend. Engine slot 10
+// (accum_stars / vk::binding 19) is the star-split accumulator that
+// bypasses the SVGF a-trous kernel (issue #46) -- written by
+// PathTrace's primary-miss path and read back by DenoiseFinalize +
+// Tonemap pre-ACES so sub-pixel stars never enter the wavelet filter.
+static constexpr std::uint32_t kNumTexSlots = 11;
 constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     0,  // engine slot 0 -> shader binding 0  (output / swapchain)
     1,  // engine slot 1 -> shader binding 1  (accum_hdr)
@@ -106,6 +110,7 @@ constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     13, // engine slot 7 -> shader binding 13 (moon_map)
     16, // engine slot 8 -> shader binding 16 (normal_tex, SVGF/NRD/OptiX-AOV)
     17, // engine slot 9 -> shader binding 17 (albedo_tex, OptiX AOV only)
+    19, // engine slot 10 -> shader binding 19 (accum_stars, issue #46)
 };
 constexpr std::uint32_t kSlotToBufBinding[8] = {
     0,  // engine slot 0 unused
@@ -285,12 +290,15 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     // path doesn't work on Mac. Partially-bound is core Vulkan 1.2 and
     // supported on every target including MoltenVK.
     //
-    // Capacity: 10 storage_image (kNumTexSlots) + 1 accel_struct +
-    // 7 storage_buffer + 1 uniform_buffer = 19, sized to the worst-case
+    // Capacity: 11 storage_image (kNumTexSlots) + 1 accel_struct +
+    // 7 storage_buffer + 1 uniform_buffer = 20, sized to the worst-case
     // "PathTrace binds everything" dispatch. kMaxWrites must be >= the
     // total binding count or vkUpdateDescriptorSets reads off the
-    // end of these stack arrays.
-    constexpr std::uint32_t kMaxWrites = 19;
+    // end of these stack arrays. The +1 over the legacy 19 is the
+    // accum_stars binding 19 that PathTrace writes (and DenoiseFinalize
+    // reads via its own dedicated layout, not this shared one) for
+    // issue #46's star-split fix.
+    constexpr std::uint32_t kMaxWrites = 20;
     std::array<VkDescriptorImageInfo,  kMaxWrites> img_infos {};
     std::array<VkDescriptorBufferInfo, kMaxWrites> buf_infos {};
     std::array<VkWriteDescriptorSetAccelerationStructureKHR, 1> as_infos {};
@@ -685,7 +693,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     }
     if (!supports_partially_bound) {
         // PARTIALLY_BOUND lets dispatches leave unused slots in the
-        // 19-binding shared layout unwritten. Core Vulkan 1.2 feature;
+        // 20-binding shared layout unwritten. Core Vulkan 1.2 feature;
         // present on every desktop driver and MoltenVK.
         LOG_ERROR("Vulkan: descriptorBindingPartiallyBound is required by Vulkan descriptor binding strategy");
         return;
@@ -761,7 +769,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     v12.descriptorBindingStorageBufferUpdateAfterBind = supports_uab_storage_buffer ? VK_TRUE : VK_FALSE;
     v12.descriptorBindingUniformBufferUpdateAfterBind = supports_uab_uniform_buffer ? VK_TRUE : VK_FALSE;
     // PARTIALLY_BOUND lets dispatches leave unused slots in the shared
-    // 19-binding layout unwritten -- the descriptor-write path skips
+    // 20-binding layout unwritten -- the descriptor-write path skips
     // them, the shader is required not to access them. Replaces the
     // older nullDescriptor-based scheme that MoltenVK doesn't support.
     v12.descriptorBindingPartiallyBound = VK_TRUE;
@@ -871,15 +879,17 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // races on the LATEST host-side binding update). Total sets =
     // kFramesInFlight * kDispatchSetsPerFrame, each set needs the full
     // per-binding allocation:
-    //   10 storage_image + [1 accel_struct] + 7 storage_buffer + 1 ubo
+    //   11 storage_image + [1 accel_struct] + 7 storage_buffer + 1 ubo
     // The accel-struct pool entry is only emitted when rt_supported_
     // is true; ASKHR isn't a valid descriptor type at all on drivers
     // without VK_KHR_acceleration_structure (e.g. pre-1.3 MoltenVK).
     // The "+4" / "+1" headroom from the original sizing is preserved.
+    // 11 storage_images: +1 over the legacy 10 is the accum_stars
+    // binding 19 added for issue #46 (star-split bypass of SVGF).
     const std::uint32_t kTotalSets =
         static_cast<std::uint32_t>(kFramesInFlight * kDispatchSetsPerFrame);
     std::vector<VkDescriptorPoolSize> psizes;
-    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kTotalSets * 10 + 4 });
+    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kTotalSets * 11 + 4 });
     if (rt_supported_) {
         psizes.push_back({ VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, kTotalSets * 1 + 1 });
     }
@@ -905,7 +915,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // exactly like the HW path does.
     {
         std::vector<VkDescriptorSetLayoutBinding> b;
-        b.reserve(19);
+        b.reserve(20);
         auto add_binding = [&](std::uint32_t binding, VkDescriptorType type) {
             VkDescriptorSetLayoutBinding lb{};
             lb.binding         = binding;
@@ -946,6 +956,14 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         add_binding(17, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
         // binding 18: bvh_nodes (analytic-prim BVH flat node array)
         add_binding(18, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        // binding 19: accum_stars (issue #46 star-split accumulator;
+        // RGBA16F per-pixel star contribution that PathTrace routes
+        // around the SVGF a-trous kernel, then DenoiseFinalize +
+        // Tonemap composite back in pre-ACES). Always allocated in
+        // the layout so the partially-bound rules cover the
+        // off-mode (denoiser off / r_star_split 0) read as a
+        // silent no-op against a 1x1 dummy.
+        add_binding(19, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
 
         // UPDATE_AFTER_BIND for every binding so we can rewrite the
         // shared descriptor set between dispatches in the same cmd
@@ -990,7 +1008,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         }
 
         // Allocate the full ring: kFramesInFlight * kDispatchSetsPerFrame
-        // sets, all sharing the 19-binding layout. We allocate them in
+        // sets, all sharing the 20-binding layout. We allocate them in
         // one batch (each row corresponds to one frame slot, the
         // columns are the ring slots advanced by AcquireDispatch
         // DescriptorSet). Per the comment on dsets_ in the header,
@@ -1110,7 +1128,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         }
         build_pipeline("autoexpose",  shader_AutoExposure_spirv_data, shader_AutoExposure_spirv_size);
         build_pipeline("perfoverlay", shader_PerfOverlay_spirv_data,  shader_PerfOverlay_spirv_size);
-        // Bloom pyramid pipelines. These re-use the shared 19-binding
+        // Bloom pyramid pipelines. These re-use the shared 20-binding
         // pipeline layout (their only real bindings are 0 and 1, both
         // storage images, which the shared layout supports). The MSL
         // slot-padding dummies that BloomDown.slang / BloomUp.slang
@@ -2928,7 +2946,8 @@ void VulkanDevice::EncodeDenoiseFinalize(VkCommandBuffer cb,
                                          float          bloom_intensity,
                                          std::uint32_t  width,
                                          std::uint32_t  height,
-                                         bool           hdr_pipeline) {
+                                         bool           hdr_pipeline,
+                                         VkImageView    stars_in_view) {
     // Lazy: ensure the NRD denoiser exists + Init'd so finalize_pipe_
     // is built. We only need the finalize pipeline (the temporal /
     // atrous pipelines and history textures remain unbuilt /
@@ -2950,11 +2969,17 @@ void VulkanDevice::EncodeDenoiseFinalize(VkCommandBuffer cb,
     // to 0 internally and binds color_in as a safe-but-unread fallback,
     // so the OptiX bloom-off case (engine passes view=NULL, intensity=0)
     // and the OptiX bloom-on case (view=mip0, intensity>0) both go
-    // through the same call.
+    // through the same call. The stars_in_view follows the same
+    // contract: null falls back to color_in as a safe stand-in (the
+    // shader's additive read becomes hdr_in + hdr_in -- a benign
+    // brightness bump rather than a crash), and the engine is
+    // expected to pass its 1x1 zero accum_stars_dummy when stars
+    // aren't routed.
     denoiser_->EncodeFinalizeOnly(cb, color_in_view, final_output_view,
                                   exposure_state_buf,
                                   bloom_in_view, bloom_intensity,
-                                  width, height, hdr_pipeline);
+                                  width, height, hdr_pipeline,
+                                  stars_in_view);
 }
 #endif
 
@@ -3131,7 +3156,7 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
     // Used by the engine's bloom-without-denoiser path on Vulkan, where
     // the standalone Tonemap.slang compute kernel that Metal uses for
     // the same job produces a black swapchain (descriptor-visibility
-    // bug against the shared 19-binding layout, not yet root-caused).
+    // bug against the shared 20-binding layout, not yet root-caused).
     // EncodeFinalizeOnly has its own dedicated 4-binding layout +
     // descriptor set ring, so it sidesteps the Tonemap.slang issue.
     if (d.kind == DenoiseDesc::Kind::FinalizeOnly) {
@@ -3168,13 +3193,22 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
         VkImageView bloom_view  = (d.bloom_in.id != 0)
                                     ? LookupImageView(d.bloom_in)
                                     : VK_NULL_HANDLE;
+        // Star-split accumulator (issue #46). On the FinalizeOnly
+        // route (bloom-without-denoiser path) PathTrace.slang skips
+        // its accum_stars write because star_split_enabled requires
+        // denoiser_enabled, so the engine binds the 1x1 zero dummy
+        // here and the additive read is a no-op. The denoiser-active
+        // path is handled in the SVGF/NRD branch below via d.stars_in.
+        VkImageView stars_view  = (d.stars_in.id != 0)
+                                    ? LookupImageView(d.stars_in)
+                                    : VK_NULL_HANDLE;
         VkBuffer    exposure_buf = LookupBuffer(d.exposure_state);
 
         denoiser_->EncodeFinalizeOnly(wrapped_cb_->Raw(),
                                       color_view, output_view,
                                       exposure_buf,
                                       bloom_view, d.bloom_intensity,
-                                      w, h, d.hdr_pipeline);
+                                      w, h, d.hdr_pipeline, stars_view);
         return;
     }
 
@@ -3228,7 +3262,8 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
                       d.reset_history,
                       atrous_enabled,
                       d.atrous_passes,
-                      d.hdr_pipeline);
+                      d.hdr_pipeline,
+                      d.stars_in);
 }
 
 }  // namespace pt::rhi::vk

@@ -56,6 +56,23 @@
 // BindStorageTexture(2, ...) call.
 [[vk::binding(6, 0)]] RWTexture2D<float4> bloom_tex;
 
+// Star-split accumulator (issue #46). Holds the per-pixel star
+// contribution PathTrace.slang routed around the SVGF a-trous kernel
+// to keep sub-pixel stars from being smudged into surrounding sky
+// texels. Added to hdr_in pre-bloom so highlights here get the same
+// ACES squash as the rest of the image, and bloom (which downsamples
+// hdr_in upstream) still produces star halos -- the engine's bloom
+// pyramid runs from post_denoise_hdr on the Metal SVGF/MetalFX paths,
+// and we route accum_stars into bloom_tex's source upstream of the
+// pyramid so the halos pick up the same energy this kernel adds.
+//
+// Slot is binding 19 to match PathTrace.slang's reserved slot for the
+// same texture (so the shared 19-binding pipeline layout doesn't need
+// extending). When star-split is off (cvar r_star_split 0 or denoiser
+// off) the engine binds a 1x1 zero texture here so the additive read
+// is a no-op.
+[[vk::binding(19, 0)]] RWTexture2D<float4> stars_tex;
+
 // --- buffer slot padding to push exposure_state to MSL buf(6) and
 //     Push (cbuffer) to MSL buf(7) ----------------------------------
 //
@@ -234,6 +251,19 @@ void main(uint3 tid : SV_DispatchThreadID) {
 #endif
 
     float3 c = hdr_in[tid.xy].rgb;
+
+    // Star-split composite (issue #46). stars_tex holds the per-pixel
+    // star contribution PathTrace.slang routed around the SVGF
+    // a-trous kernel. Added pre-bloom-sample / pre-tonemap so the
+    // sub-pixel star energy lands intact in the final tonemapped
+    // image (no a-trous smudging) and the downstream bloom + lens
+    // flare paths read the combined HDR -- though note that the
+    // engine's bloom pyramid was built upstream of this dispatch
+    // from a stars-free source on the SVGF/MetalFX paths today, so
+    // star halos in bloom are a follow-up (acceptance criterion in
+    // issue #46 mentions bloom-on-stars; the smudge fix is the
+    // primary deliverable here, halo support is the next pass).
+    c += stars_tex[tid.xy].rgb;
 
     // Bloom + lens flare both bilinear-sample the bloom pyramid;
     // factor the bilinear sampler into a helper so the flare loop

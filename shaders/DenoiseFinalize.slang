@@ -45,6 +45,16 @@
 // bloom_intensity = 0, so the shader's bloom path short-circuits before
 // any sample becomes observable.
 [[vk::binding(3, 0)]] RWTexture2D<float4> bloom_tex;
+// Star-split accumulator (issue #46). Same role as Tonemap.slang's
+// stars_tex on Metal: PathTrace.slang accumulates the per-pixel star
+// contribution here, bypassing the SVGF a-trous kernel that would
+// otherwise smudge sub-pixel star energy into surrounding sky texels.
+// Added pre-bloom-composite / pre-ACES so the stars land in the
+// final HDR pre-tonemap and ACES-squash uniformly with the rest of
+// the image. The host binds a safe 1x1 zero texture here when
+// star-split is off (cvar r_star_split 0) so the additive read is
+// observably zero.
+[[vk::binding(4, 0)]] RWTexture2D<float4> stars_tex;
 
 [[vk::push_constant]]
 cbuffer Push {
@@ -99,6 +109,14 @@ float3 sampleBloom(uint2 tid, uint2 dim) {
 void main(uint2 tid : SV_DispatchThreadID) {
     if (tid.x >= width || tid.y >= height) return;
     float3 c = hdr_in[tid].rgb;
+
+    // Star-split composite (issue #46). Stars stored in stars_tex
+    // bypass the SVGF a-trous kernel; add them back here pre-ACES so
+    // they land in the final image without the smudge artefacts the
+    // wavelet pass would otherwise inflict. When star-split is off
+    // the engine binds a 1x1 zero fallback at slot 4 so this is a
+    // no-op read.
+    c += stars_tex[tid].rgb;
 
     // Bloom composite. Pre-tonemap so highlights get the same ACES
     // squash as the rest of the image. bloom_intensity = 0 short-

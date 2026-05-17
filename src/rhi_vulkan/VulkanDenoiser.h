@@ -103,7 +103,8 @@ public:
                 bool            reset_history,
                 bool            atrous_enabled,
                 std::uint32_t   atrous_passes,  // 1..5
-                bool            hdr_pipeline);
+                bool            hdr_pipeline,
+                TextureHandle   stars_in);      // accum_stars (issue #46; id=0 -> dummy)
 
     // True after Init() succeeded. Used by VulkanDevice::SupportsDenoise.
     bool Ready() const { return ready_; }
@@ -128,7 +129,9 @@ public:
                             float          bloom_intensity, // 0 = skip bloom add
                             std::uint32_t  width,
                             std::uint32_t  height,
-                            bool           hdr_pipeline);
+                            bool           hdr_pipeline,
+                            VkImageView    stars_in_view);  // accum_stars (issue #46;
+                                                            // safe dummy if stars off)
 
 private:
     void DestroyAll();

@@ -319,11 +319,18 @@ bool VulkanNrdDenoiser::BuildLayout() {
     //                  path is a separate Mac-only contract that does
     //                  use the engine's bloom_dummy_tex_id_).
     {
-        std::array<VkDescriptorSetLayoutBinding, 4> b{};
+        // Layout: hdr_in / swap_out / exposure_state / bloom_tex /
+        // stars_tex. The +1 binding (4 = stars_tex) is the issue #46
+        // star-split accumulator -- DenoiseFinalize.slang adds it
+        // pre-ACES so SVGF a-trous never sees sub-pixel star energy.
+        // Caller passes a 1x1 zero dummy when stars are off so the
+        // additive read is observably 0.
+        std::array<VkDescriptorSetLayoutBinding, 5> b{};
         b[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
         b[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
         b[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
         b[3] = { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        b[4] = { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
         VkDescriptorSetLayoutCreateInfo dslci{};
         dslci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         dslci.bindingCount = static_cast<std::uint32_t>(b.size());
@@ -395,13 +402,15 @@ bool VulkanNrdDenoiser::BuildDescriptorPool() {
     // Mixed pool sizing for both layouts:
     //   - kSetRing sets of (kPassImages storage images + kPassBuffers
     //     storage buffers) for temporal/atrous.
-    //   - kFinalizeSetRing sets of (3 storage images + 1 storage
-    //     buffer) for the finalize pass (the 3rd image is bloom_in).
+    //   - kFinalizeSetRing sets of (4 storage images + 1 storage
+    //     buffer) for the finalize pass: hdr_in, swap_out, bloom_in,
+    //     stars_in (+1 over the legacy 3 is the issue #46 star-split
+    //     accumulator that DenoiseFinalize composites pre-ACES).
     // Plus a small headroom on each type.
     std::array<VkDescriptorPoolSize, 2> ps{};
     ps[0].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     ps[0].descriptorCount = static_cast<std::uint32_t>(
-        kSetRing * kPassImages + kFinalizeSetRing * 3 + 4);
+        kSetRing * kPassImages + kFinalizeSetRing * 4 + 4);
     ps[1].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     ps[1].descriptorCount = static_cast<std::uint32_t>(
         kSetRing * kPassBuffers + kFinalizeSetRing * 1 + 4);
@@ -571,7 +580,8 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                                bool            reset_history,
                                bool            atrous_enabled,
                                std::uint32_t   atrous_passes,
-                               bool            hdr_pipeline) {
+                               bool            hdr_pipeline,
+                               TextureHandle   stars_in) {
     if (!ready_) return;
     if (cb == VK_NULL_HANDLE) return;
     if (cached_w_ == 0 || cached_h_ == 0) return;
@@ -913,13 +923,29 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
             v_bloom    = v_output;
             bloom_real = false;
         }
+        // Star-split accumulator (issue #46) at finalize binding 4.
+        // When the caller passed id=0 OR the view lookup misses, fall
+        // back to v_output as a safe RGBA16F storage image so the
+        // descriptor write succeeds. The shader's add is unconditional
+        // (no intensity gate), so for the off case the engine MUST
+        // pass a zeroed texture (its 1x1 accum_stars_dummy_tex_id_).
+        // Falling back to v_output here is a defensive guard for the
+        // pathological "engine passed garbage" case -- the resulting
+        // wrong colour (a copy of hdr_in added on top of itself) is
+        // a visible artefact rather than a crash, which is the right
+        // failure mode for a renderer-side issue.
+        VkImageView v_stars = (stars_in.id != 0) ? device_->LookupImageView(stars_in)
+                                                : VK_NULL_HANDLE;
+        if (v_stars == VK_NULL_HANDLE) {
+            v_stars = v_output;
+        }
         if (v_final != VK_NULL_HANDLE && b_exp != VK_NULL_HANDLE) {
             VkDescriptorSet fset = finalize_sets_[next_finalize_set_];
             next_finalize_set_ = (next_finalize_set_ + 1) % kFinalizeSetRing;
 
-            VkDescriptorImageInfo  ii[3] {};
+            VkDescriptorImageInfo  ii[4] {};
             VkDescriptorBufferInfo bi    {};
-            VkWriteDescriptorSet   w[4]  {};
+            VkWriteDescriptorSet   w[5]  {};
 
             ii[0].imageView   = v_output;
             ii[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -927,11 +953,13 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
             ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
             ii[2].imageView   = v_bloom;
             ii[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            ii[3].imageView   = v_stars;
+            ii[3].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
             bi.buffer = b_exp;
             bi.offset = 0;
             bi.range  = VK_WHOLE_SIZE;
 
-            for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < 5; ++i) {
                 w[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                 w[i].dstSet          = fset;
                 w[i].descriptorCount = 1;
@@ -948,8 +976,11 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
             w[3].dstBinding     = 3;
             w[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             w[3].pImageInfo     = &ii[2];
+            w[4].dstBinding     = 4;
+            w[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            w[4].pImageInfo     = &ii[3];
 
-            vkUpdateDescriptorSets(device_->RawDevice(), 4, w, 0, nullptr);
+            vkUpdateDescriptorSets(device_->RawDevice(), 5, w, 0, nullptr);
 
             // Atrous path's last pass left the chain barrier in place,
             // so the read of `output` is already covered. Basic path
@@ -1031,7 +1062,8 @@ void VulkanNrdDenoiser::EncodeFinalizeOnly(VkCommandBuffer cb,
                                            float          bloom_intensity,
                                            std::uint32_t  width,
                                            std::uint32_t  height,
-                                           bool           hdr_pipeline) {
+                                           bool           hdr_pipeline,
+                                           VkImageView    stars_in_view) {
     if (!ready_)                                  return;
     if (cb == VK_NULL_HANDLE)                     return;
     if (color_in_view     == VK_NULL_HANDLE)      return;
@@ -1047,13 +1079,19 @@ void VulkanNrdDenoiser::EncodeFinalizeOnly(VkCommandBuffer cb,
                             : color_in_view;
     const float effective_bloom = (bloom_in_view != VK_NULL_HANDLE)
                                     ? bloom_intensity : 0.0f;
+    // Star-split slot (issue #46). Same fallback logic as Encode()
+    // above; the shader add is unconditional so the caller is
+    // responsible for passing a zeroed texture when stars are off.
+    VkImageView v_stars = (stars_in_view != VK_NULL_HANDLE)
+                            ? stars_in_view
+                            : color_in_view;
 
     VkDescriptorSet fset = finalize_sets_[next_finalize_set_];
     next_finalize_set_   = (next_finalize_set_ + 1) % kFinalizeSetRing;
 
-    VkDescriptorImageInfo  ii[3] {};
+    VkDescriptorImageInfo  ii[4] {};
     VkDescriptorBufferInfo bi    {};
-    VkWriteDescriptorSet   w[4]  {};
+    VkWriteDescriptorSet   w[5]  {};
 
     ii[0].imageView   = color_in_view;
     ii[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -1061,11 +1099,13 @@ void VulkanNrdDenoiser::EncodeFinalizeOnly(VkCommandBuffer cb,
     ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     ii[2].imageView   = v_bloom;
     ii[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    ii[3].imageView   = v_stars;
+    ii[3].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     bi.buffer = exposure_state_buf;
     bi.offset = 0;
     bi.range  = VK_WHOLE_SIZE;
 
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 5; ++i) {
         w[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w[i].dstSet          = fset;
         w[i].descriptorCount = 1;
@@ -1082,7 +1122,10 @@ void VulkanNrdDenoiser::EncodeFinalizeOnly(VkCommandBuffer cb,
     w[3].dstBinding     = 3;
     w[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     w[3].pImageInfo     = &ii[2];
-    vkUpdateDescriptorSets(device_->RawDevice(), 4, w, 0, nullptr);
+    w[4].dstBinding     = 4;
+    w[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    w[4].pImageInfo     = &ii[3];
+    vkUpdateDescriptorSets(device_->RawDevice(), 5, w, 0, nullptr);
 
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, finalize_pipe_);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE,

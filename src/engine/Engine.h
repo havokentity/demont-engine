@@ -286,6 +286,29 @@ private:
     // exposure+ACES-encoded sRGB into the swapchain. Co-allocated +
     // resized with the other denoiser-related textures.
     std::uint64_t                               post_denoise_hdr_tex_id_ = 0;
+    // Star-split accumulator (issue #46). RGBA16F at swapchain
+    // resolution; PathTrace.slang writes the per-pixel star
+    // contribution here (peeled out of the primary-miss sky term so
+    // the SVGF a-trous kernel doesn't smudge it), and the post-
+    // denoise finalize / tonemap step adds it back pre-ACES. Allocated
+    // alongside the rest of the denoiser-related textures only when
+    // both r_denoiser != off AND r_star_split = 1; freed otherwise.
+    // When the texture isn't allocated the shader slot is bound to
+    // accum_stars_dummy_tex_id_ below (a 1x1 zero RGBA16F) so the
+    // additive read is observably 0 -- mirrors the bloom_dummy
+    // pattern for r_bloom = 0 on the bloom slot.
+    std::uint64_t                               accum_stars_tex_id_ = 0;
+    std::uint64_t                               accum_stars_dummy_tex_id_ = 0;
+    // Tracks whether the star-split accumulator needs a `reset_accum`
+    // pulse on the next frame. Set when the user toggles r_star_split
+    // (so stale stars from a previous run don't bleed in) or when
+    // the texture is reallocated on swapchain resize. The engine's
+    // reset_accum flag in the path tracer push already handles the
+    // primary accum_hdr; we mirror that for accum_stars rather than
+    // overloading the same flag (the two accumulators can drift in
+    // and out of need-reset state independently: r_star_split toggle
+    // resets stars but not the main accum, for example).
+    bool                                        star_split_reset_pending_ = false;
 
     // Bloom mip chain. mip 0 is half-res of the swapchain; each
     // subsequent mip halves again. Built every frame from

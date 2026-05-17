@@ -1178,9 +1178,20 @@ void VulkanOptixDenoiser::Encode(VkCommandBuffer cb,
             }
             if (dst_view != VK_NULL_HANDLE && swap_view != VK_NULL_HANDLE &&
                 exp_buf  != VK_NULL_HANDLE) {
+                // Star-split (issue #46). OptiX path: stars accumulator
+                // is engine-side; PathTrace wrote to accum_stars on the
+                // same conditions as SVGF, and DenoiseFinalize will
+                // composite it pre-ACES. Looking up the view here so
+                // the private-cb call to the finalize stage carries
+                // it through; null means the engine didn't allocate
+                // (r_star_split off / non-OptiX-active state).
+                VkImageView stars_view = (d.stars_in.id != 0)
+                                            ? device_->LookupImageView(d.stars_in)
+                                            : VK_NULL_HANDLE;
                 device_->EncodeDenoiseFinalize(pcb, dst_view, swap_view, exp_buf,
                                                bloom_view, bloom_intensity,
-                                               cached_w_, cached_h_, d.hdr_pipeline);
+                                               cached_w_, cached_h_, d.hdr_pipeline,
+                                               stars_view);
             } else {
                 LOG_WARN("VulkanOptixDenoiser::Encode: finalize lookup miss "
                          "(dst_view={} swap_view={} exp_buf={}); skipping tonemap",

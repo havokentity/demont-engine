@@ -167,7 +167,8 @@ public:
                                float          bloom_intensity,
                                std::uint32_t  width,
                                std::uint32_t  height,
-                               bool           hdr_pipeline);
+                               bool           hdr_pipeline,
+                               VkImageView    stars_in_view);  // accum_stars (issue #46)
 
     // CUDA-Vulkan interop hook for VulkanOptixDenoiser.
     //
@@ -426,7 +427,7 @@ private:
 #endif
 
     VkDescriptorPool dpool_ = VK_NULL_HANDLE;
-    // Ring of descriptor sets for the shared 19-binding layout. Why a
+    // Ring of descriptor sets for the shared 20-binding layout. Why a
     // ring and not one set per frame: the shared layout uses
     // UPDATE_AFTER_BIND on every binding so the engine can rewrite
     // bindings between dispatches in the same cmd buffer. Per the
