@@ -117,7 +117,12 @@ jobs:
         # NOT the source files, so stale PNGs are a real hazard.
         id: goldens
         run: |
+          # Clear stale PNGs from the cached build dir but recreate
+          # the parent directories: imgdiff writes via stb_image_write
+          # which doesn't auto-mkdir, and the configure-time
+          # `file(MAKE_DIRECTORY)` only fires on a fresh cmake configure.
           rm -rf build/mac-debug/golden_actual build/mac-debug/golden_diff
+          mkdir -p build/mac-debug/golden_actual build/mac-debug/golden_diff
           set +e
           ctest --test-dir build/mac-debug --output-on-failure -L golden_software
           echo "rc=$?" >> "$GITHUB_OUTPUT"
@@ -241,9 +246,16 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
+          # Clear stale PNGs but recreate the parent directories:
+          # imgdiff writes via stb_image_write which doesn't auto-mkdir,
+          # and the configure-time `file(MAKE_DIRECTORY)` only fires on
+          # a fresh cmake configure.
           Remove-Item -Recurse -Force -ErrorAction SilentlyContinue `
               build/win-debug/golden_actual,
               build/win-debug/golden_diff
+          New-Item -ItemType Directory -Force -Path `
+              build/win-debug/golden_actual,
+              build/win-debug/golden_diff | Out-Null
           ctest --test-dir build/win-debug --output-on-failure -L golden_software
           "rc=$LASTEXITCODE" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           exit 0
