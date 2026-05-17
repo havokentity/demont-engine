@@ -106,21 +106,31 @@ namespace cvar {
     // points at a console-script fixture file (e.g.
     // tests/goldens/scenes/cornell_csg.cfg) that's exec'd right after
     // demont.cfg + autoexec.cfg + --<cvar>= CLI overrides but BEFORE
-    // the backend boots, so its cvar writes drive the scene shape /
-    // camera / sun / denoiser / spp etc. pt_smoke_capture_out is the
-    // destination PNG path for the final frame written at the end of
-    // the smoke run; engine does a synchronous readback into this path
-    // right before tearing the device down so ctest cells can diff it
-    // against a stored golden via the imgdiff CLI (PR #92). Both are
-    // per-invocation knobs, not archived to demont.cfg, set via the
-    // --smoke-exec= / --smoke-capture-out= CLI overrides plumbed
-    // through ApplyCommandLineCvarOverrides. Empty string = disabled.
+    // the backend boots. Scope at this exec point: cvar writes only --
+    // camera pose, sun, path-tracer knobs, denoiser, spp, exposure,
+    // capture format/seed, app_window_* (consumed at window creation
+    // below). CSG-scene (`cs_*`) and analytic-primitive commands are
+    // out of scope here because `csg_scene_` + `SeedDefaultPrimitives()`
+    // haven't run yet; see the TODO(#45-followup) at the call site for
+    // a planned late-phase exec to widen the supported command set.
+    // pt_smoke_capture_out is the destination PNG path for the final
+    // frame written at the end of the smoke run; engine does a
+    // synchronous readback into this path right before tearing the
+    // device down so ctest cells can diff it against a stored golden
+    // via the imgdiff CLI (PR #92). Both are per-invocation knobs, not
+    // archived to demont.cfg, set via the --smoke-exec= /
+    // --smoke-capture-out= CLI overrides plumbed through
+    // ApplyCommandLineCvarOverrides. Empty string = disabled.
     PT_CVAR(pt_smoke_exec, "",
             "Path to a console-script .cfg fixture exec'd at engine "
             "start, after demont.cfg + autoexec.cfg + --<cvar>= CLI "
             "overrides. Used by the golden-image regression matrix "
-            "(issue #45) to lock down scene state per cell. Typically "
-            "set via --smoke-exec=tests/goldens/scenes/cornell_csg.cfg. "
+            "(issue #45) to lock down per-cell CVAR state (camera, sun, "
+            "path-tracer knobs, exposure, capture seed, app_window_*). "
+            "Scene/primitive commands are NOT supported at this exec "
+            "point today (csg_scene_ + SeedDefaultPrimitives have not "
+            "run yet). Typically set via "
+            "--smoke-exec=tests/goldens/scenes/cornell_csg.cfg. "
             "Empty = no fixture. NOT CVAR_ARCHIVE -- per-invocation.",
             CVAR_NONE);
     PT_CVAR(pt_smoke_capture_out, "",
@@ -603,10 +613,34 @@ bool Engine::Init() {
     // below). A fixture that issues `cs_*` here is a silent no-op.
     // TODO(#45-followup): add a second exec pass after
     // SeedDefaultPrimitives() so scene/primitive fixtures work too.
+    //
+    // Strict failure mode (unlike demont.cfg / autoexec.cfg above):
+    // a smoke-exec fixture that can't be read or that produces a
+    // parse error aborts Init -- demont returns non-zero, the wrapper
+    // emits kExitSpawnError, the ctest `_render` cell fails. Silently
+    // rendering against a half-applied fixture would surface as a
+    // confusing pixel diff at best, or get committed as a bogus
+    // baseline at regen time at worst.
+    //
     // Same cfg_loading_ guard as demont.cfg/autoexec.cfg so astronomy
     // on_change warnings stay suppressed during fixture load.
     if (auto* sx = C.FindCVar("pt_smoke_exec"); sx != nullptr && !sx->value.empty()) {
-        exec_if_exists(sx->value.c_str());
+        FILE* sf = std::fopen(sx->value.c_str(), "rb");
+        if (sf == nullptr) {
+            LOG_ERROR("pt_smoke_exec: '{}' not found", sx->value);
+            cfg_loading_ = false;
+            return false;
+        }
+        std::string sbody; char sbuf[4096];
+        while (auto sn = std::fread(sbuf, 1, sizeof(sbuf), sf)) sbody.append(sbuf, sn);
+        std::fclose(sf);
+        auto sr = pt::console::Console::Get().ExecuteScript(sbody);
+        if (!sr.ok) {
+            LOG_ERROR("pt_smoke_exec '{}': {}", sx->value, sr.error);
+            cfg_loading_ = false;
+            return false;
+        }
+        LOG_INFO("loaded smoke-exec fixture {}", sx->value);
     }
     cfg_loading_ = false;
 

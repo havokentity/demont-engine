@@ -18,9 +18,17 @@
 #   ACTUAL  -- absolute path to the actual PNG that ctest's _render
 #              step is producing on this host.
 
+# Compute the golden's parent directory so the regen hint includes a
+# mkdir step. On first-time-host regen the parent (e.g.
+# `tests/goldens/Windows/`) doesn't exist yet, so a plain `cp` would
+# fail. Print `cmake -E make_directory` so the hint works on every host
+# without per-shell command splits.
+get_filename_component(_golden_dir "${GOLDEN}" DIRECTORY)
+
 message("MISSING GOLDEN: ${GOLDEN}")
 message("Regenerate with:")
 message("  ctest -R ^${CELL}_render$")
-message("  cp ${ACTUAL} ${GOLDEN}")
+message("  cmake -E make_directory \"${_golden_dir}\"")
+message("  cmake -E copy \"${ACTUAL}\" \"${GOLDEN}\"")
 message("See Raytracer Plan/TESTING_STRATEGY.md for the full regen workflow.")
 message(FATAL_ERROR "missing-golden placeholder for cell ${CELL}")

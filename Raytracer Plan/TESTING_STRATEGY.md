@@ -406,11 +406,18 @@ bad-pixel ratio > FAIL_PERCENT %.
 
 ### Adding a new scene fixture
 
-1. Drop `tests/goldens/scenes/<scene>.cfg`. Sticks to plain console
-   commands (cvar writes, `prim_*`, `csg_*`, `cam_*`). Avoid
-   `;` and backtick characters inside `#` comments -- the console
-   parser splits scripts on `;` even mid-comment, which leaks the
-   post-semicolon text as a fresh command.
+1. Drop `tests/goldens/scenes/<scene>.cfg`. **Cvar writes only**
+   in the current implementation -- the smoke-exec pass runs in
+   `Engine::Init` BEFORE `csg_scene_` is constructed and BEFORE
+   `SeedDefaultPrimitives()` runs (see `src/engine/Engine.cpp`
+   around the `pt_smoke_exec` exec). That means
+   CSG-scene commands (`cs_box`, `cs_sphere`, `cs_combine`, ...)
+   and analytic-primitive commands (`prim_*`) are silently dropped
+   today -- they're queued for a future late-phase exec
+   (TODO(#45-followup) in Engine.cpp). Avoid `;` and backtick
+   characters inside `#` comments -- the console parser splits
+   scripts on `;` even mid-comment, which leaks the post-semicolon
+   text as a fresh command.
 2. Lock down everything the matrix needs to be deterministic:
    resolution (`app_window_width` / `_height`), camera pose
    (`cam_pos`, `cam_yaw`, `cam_pitch`, `cam_fov`), sun
