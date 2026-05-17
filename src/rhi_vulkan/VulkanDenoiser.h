@@ -103,7 +103,8 @@ public:
                 bool            reset_history,
                 bool            atrous_enabled,
                 std::uint32_t   atrous_passes,  // 1..5
-                bool            hdr_pipeline);
+                bool            hdr_pipeline,
+                TextureHandle   stars_in);      // accum_stars (issue #46; id=0 -> dummy)
 
     // True after Init() succeeded. Used by VulkanDevice::SupportsDenoise.
     bool Ready() const { return ready_; }
@@ -128,7 +129,9 @@ public:
                             float          bloom_intensity, // 0 = skip bloom add
                             std::uint32_t  width,
                             std::uint32_t  height,
-                            bool           hdr_pipeline);
+                            bool           hdr_pipeline,
+                            VkImageView    stars_in_view);  // accum_stars (issue #46;
+                                                            // safe dummy if stars off)
 
 private:
     void DestroyAll();
@@ -228,6 +231,13 @@ private:
     // reset_history.
     std::uint32_t         frame_parity_ = 0;
     bool                  needs_history_clear_ = true;
+    // Issue #46 round-3: stars_in lookup-failure log latch. Encode runs
+    // every frame, so a persistent stale-handle race would otherwise
+    // spam the log once per frame. We emit on the leading edge (first
+    // time per session the lookup fails) and clear when it next
+    // resolves cleanly. Mirrors the one-shot vs spamming pattern used
+    // by other per-frame error paths in this file.
+    bool                  stars_lookup_warn_latched_ = false;
 };
 
 }  // namespace pt::rhi::vk

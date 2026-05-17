@@ -188,6 +188,25 @@ Texture2D<float4> moon_map;
 [[vk::binding(21, 0)]] StructuredBuffer<float4> sdf_clusters;
 // --- end SDF Phase 1 -------------------------------------------------------
 
+// Star-split accumulator (issue #46). When the denoiser is active and
+// `star_split_enabled` is non-zero, the primary-miss path writes
+// star-only radiance to this texture instead of folding it into
+// frame_radiance / denoise_color. Stars then bypass the SVGF a-trous
+// kernel (which would smudge their sub-pixel energy across a ~17x17
+// region by the third pass) and get composited back in at the
+// post-denoise finalize / tonemap stage. Same RGBA16F format and
+// dimensions as denoise_color; written with the same EMA blend as
+// accum_hdr so 1-spp temporal stability matches the rest of the
+// linear-HDR pipeline. When star-split is off (cvar r_star_split 0 or
+// denoiser_enabled == 0) the engine binds a 1x1 placeholder texture
+// here purely for descriptor-set validity; the shader's
+// `star_split_enabled` gate ensures this slot is never written to in
+// that case, so the placeholder's contents don't matter.
+//
+// Moved from binding 21 to binding 22 to coexist with SDF clusters
+// (which #109 placed at binding 21 before this round-2 merge).
+[[vk::binding(22, 0)]] RWTexture2D<float4> accum_stars;
+
 struct BvhNode {
     float3 aabb_min;
     uint   left_first;
@@ -427,6 +446,20 @@ cbuffer Push {
     //      metres). Default 1e-4. .yzw reserved.
     float4 sdf_params_f;
     // --- end SDF Phase 1 ---------------------------------------------------
+    // Star-split flag (issue #46). 1 = route star contribution out
+    // of frame_radiance and into accum_stars; the post-denoise
+    // finalize stage adds it back pre-tonemap so SVGF's a-trous
+    // kernel never sees the sub-pixel star energy and can't smudge
+    // it across neighbouring sky texels. 0 = legacy behaviour,
+    // stars fold into frame_radiance like any other sky term and
+    // get filtered with the rest. Engine fills this from the
+    // r_star_split cvar gated by denoiser_enabled and a real
+    // accum_stars allocation. The trailing 12 bytes of pad keep the
+    // cbuffer trailing block 16-byte aligned for std140 / MSL.
+    uint star_split_enabled;
+    uint _pad_star_split0;
+    uint _pad_star_split1;
+    uint _pad_star_split2;
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -475,6 +508,11 @@ cbuffer Frame {
     uint4  sdf_params;
     float4 sdf_params_f;
     // --- end SDF Phase 1 ---------------------------------------------------
+    // See `star_split_enabled` in the Metal Push cbuffer above.
+    uint star_split_enabled;
+    uint _pad_star_split0;
+    uint _pad_star_split1;
+    uint _pad_star_split2;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -877,40 +915,23 @@ HitInfo traceScene(float3 ro, float3 rd) {
 // linear; the sun disk is around 50x normal sky brightness so it
 // punches through ACES tonemap and reads as "the sun" rather than a
 // bright dot.
-float3 procSky(float3 rd, float3 sun) {
-    float cosTheta = clamp(rd.y, -1.0, 1.0);    // 1=zenith, 0=horizon, -1=nadir
-    float cosGamma = clamp(dot(rd, sun), -1.0, 1.0);
-    float sun_elev = sun.y;                     // sin(elevation)
-
-    // Day vs night blend: smoothstep on sun elevation across the
-    // civil-twilight band.
-    float day = smoothstep(-0.10, 0.20, sun_elev);
-
-    // Sunset glow: peaks when sun is just at the horizon.
-    float sunset = smoothstep(0.30, -0.05, sun_elev) *
-                   smoothstep(-0.20, 0.05, sun_elev);
-
-    // Day sky palette.
-    float3 zenith_day  = float3(0.32, 0.55, 0.92);
-    float3 horizon_day = float3(0.78, 0.88, 1.00);
-    // Sunset palette pulls toward orange/red on the side of the sun.
-    float side_factor  = smoothstep(0.0, 0.7, dot(normalize(float3(rd.x, 0, rd.z)),
-                                                  normalize(float3(sun.x, 0, sun.z))));
-    float3 horizon_sunset = lerp(float3(0.95, 0.45, 0.20),
-                                 float3(1.00, 0.65, 0.30), side_factor);
-    float3 horizon_col    = lerp(horizon_day, horizon_sunset, sunset);
-    float3 zenith_col     = lerp(zenith_day,  float3(0.18, 0.18, 0.30), sunset * 0.6);
-
-    // Vertical gradient from horizon to zenith.
-    float t = smoothstep(0.0, 0.40, cosTheta);
-    float3 sky = lerp(horizon_col, zenith_col, t);
-
-    // Apply day/night brightness curve. Night is a deep navy with
-    // a faint horizon line, no sun.
-    float3 night = float3(0.005, 0.010, 0.030) +
-                   smoothstep(0.0, 0.05, abs(cosTheta - 0.0)) * 0.0;
-    sky = lerp(night, sky, day);
-
+// Compute the night-sky star contribution (BSC starmap or procedural
+// cell-hash fallback) for a primary ray direction. Returns the raw
+// star radiance with day-fade already applied; callers add it
+// additively onto whatever sky base they're using.
+//
+// Extracted from procSky() for issue #46: SVGF a-trous smudges these
+// sub-pixel features into surrounding dark sky texels (~17x17 spread
+// by the third pass). When star-split is enabled the engine routes
+// this value out of frame_radiance and into accum_stars so the
+// denoiser never sees it -- composited back in pre-tonemap. The
+// helper is also called from procSky() itself for the legacy
+// (star-split off / denoiser off) path, keeping a single source of
+// truth for the star sampling logic.
+float3 starsOnly(float3 rd, float3 sun) {
+    float cosTheta = clamp(rd.y, -1.0, 1.0);
+    float sun_elev = sun.y;
+    float day      = smoothstep(-0.10, 0.20, sun_elev);
     // BSC starmap (real Yale Bright Star Catalog, J2000 frame). Sampled
     // additively whenever the host has uploaded the texture and we're
     // looking above the horizon. Falls back to the procedural cell-hash
@@ -953,7 +974,7 @@ float3 procSky(float3 rd, float3 sun) {
             stars *= w;
         }
         // Fade with day so stars vanish at sunrise.
-        sky += stars * (1.0 - day);
+        return stars * (1.0 - day);
     } else if (cosTheta > -0.05 && exposure_pad.y > 0.5 && day < 0.6) {
         // Cells sized so each one is ~3-5 pixels wide on a 1080p frame
         // -- smaller cells make stars sub-pixel and they vanish.
@@ -976,9 +997,75 @@ float3 procSky(float3 rd, float3 sun) {
             float3 cool = float3(1.05, 0.85, 0.70);
             float3 starColor = (colorMix < 0.33) ? hot
                               : (colorMix < 0.80) ? mid : cool;
-            sky += intensity * starColor * (1.0 - day);
+            return intensity * starColor * (1.0 - day);
         }
     }
+    return float3(0.0);
+}
+
+// Star contribution at a primary-miss direction, regardless of which
+// sky path is active. HDRI mode bakes stars into the env_map so we
+// return 0 there (the env_map is sampled at primary miss anyway; we
+// can't separate the stars from the rest of the texture without a
+// brightness threshold, which is a separate piece of work). Procedural
+// + gradient modes route through starsOnly() above, which mirrors the
+// per-mode gates inside procSky().
+float3 starsAtPrimaryMiss(float3 rd) {
+    uint mode = uint(sun_and_mode.w);
+    // procSky (mode == 2) is the only path that injects stars at
+    // primary miss; gradient sky has no stars and HDRI mode bakes
+    // them into the env_map (extracting requires a brightness
+    // threshold -- deferred to bloom-on-stars follow-up, since the
+    // issue acceptance criterion "bloom halos proportional to
+    // brightness" implies a real threshold to know what counts as
+    // a "star"). All other modes return 0 here.
+    if (mode == 2u) {
+        return starsOnly(rd, sun_and_mode.xyz);
+    }
+    return float3(0.0);
+}
+
+float3 procSky(float3 rd, float3 sun) {
+    float cosTheta = clamp(rd.y, -1.0, 1.0);    // 1=zenith, 0=horizon, -1=nadir
+    float cosGamma = clamp(dot(rd, sun), -1.0, 1.0);
+    float sun_elev = sun.y;                     // sin(elevation)
+
+    // Day vs night blend: smoothstep on sun elevation across the
+    // civil-twilight band.
+    float day = smoothstep(-0.10, 0.20, sun_elev);
+
+    // Sunset glow: peaks when sun is just at the horizon.
+    float sunset = smoothstep(0.30, -0.05, sun_elev) *
+                   smoothstep(-0.20, 0.05, sun_elev);
+
+    // Day sky palette.
+    float3 zenith_day  = float3(0.32, 0.55, 0.92);
+    float3 horizon_day = float3(0.78, 0.88, 1.00);
+    // Sunset palette pulls toward orange/red on the side of the sun.
+    float side_factor  = smoothstep(0.0, 0.7, dot(normalize(float3(rd.x, 0, rd.z)),
+                                                  normalize(float3(sun.x, 0, sun.z))));
+    float3 horizon_sunset = lerp(float3(0.95, 0.45, 0.20),
+                                 float3(1.00, 0.65, 0.30), side_factor);
+    float3 horizon_col    = lerp(horizon_day, horizon_sunset, sunset);
+    float3 zenith_col     = lerp(zenith_day,  float3(0.18, 0.18, 0.30), sunset * 0.6);
+
+    // Vertical gradient from horizon to zenith.
+    float t = smoothstep(0.0, 0.40, cosTheta);
+    float3 sky = lerp(horizon_col, zenith_col, t);
+
+    // Apply day/night brightness curve. Night is a deep navy with
+    // a faint horizon line, no sun.
+    float3 night = float3(0.005, 0.010, 0.030) +
+                   smoothstep(0.0, 0.05, abs(cosTheta - 0.0)) * 0.0;
+    sky = lerp(night, sky, day);
+
+    // Star contribution. Routed through starsOnly() so the same logic
+    // is reusable from the primary-miss star-split path (issue #46).
+    // When that split is active, the engine subtracts this term from
+    // frame_radiance and writes it to accum_stars instead, so the
+    // SVGF a-trous kernel never sees sub-pixel star energy and can't
+    // smudge it across neighbouring sky texels.
+    sky += starsOnly(rd, sun);
 
     // Sun disk: very tight angular radius (~0.25 deg ~= cos > 0.99996).
     float disk = smoothstep(0.99996, 0.99999, cosGamma);
@@ -1738,6 +1825,21 @@ void main(uint2 tid : SV_DispatchThreadID) {
     // proportional GPU cost; spp=1 is the classic 1-spp interactive mode.
     uint sample_count = (spp == 0u) ? 1u : spp;
     float3 frame_radiance = float3(0.0);
+    // Star-split accumulator for issue #46. When star_split_enabled
+    // AND denoiser_enabled, the primary-miss sky term is split into
+    // (sky_minus_stars, stars_only). frame_radiance gets the former
+    // (denoised normally); this gets the latter (composited back in
+    // post-denoise so the a-trous filter can't smudge it). Stays at 0
+    // when star-split is off; the texture write below is gated, so the
+    // unused slot stays harmless.
+    float3 frame_stars    = float3(0.0);
+    // Star-split gate. star_split_enabled is in the Frame UBO on
+    // Vulkan and the Metal Push cbuffer on Metal, but the field name
+    // and offset are identical from the shader's perspective so this
+    // single expression works on both targets.
+    const bool star_split_active =
+        (denoiser_enabled != 0u) && (write_hdr_aux != 0u) &&
+        (star_split_enabled != 0u);
     for (uint s = 0u; s < sample_count; ++s) {
         // When MetalFX is on, all pixels of the frame share the same
         // sub-pixel offset (Halton sequence picked on host) so the
@@ -1885,7 +1987,46 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 // b > 0 is a bounce ray escaping; clamp those to kill
                 // fireflies from BSDF-sampled bounces hitting the sun.
                 if (b == 0u) {
-                    radiance += throughput * skyColor(rd);
+                    // Star-split (issue #46): when the denoiser is on
+                    // and the user opted in (r_star_split 1, default
+                    // on), peel sub-pixel star energy out of the
+                    // primary-miss sky term so the SVGF a-trous kernel
+                    // doesn't smudge it. The peeled value lands in
+                    // frame_stars; the post-denoise finalize stage
+                    // adds it back pre-tonemap. Procedural / BSC star
+                    // paths only -- HDRI mode is a no-op (stars are
+                    // baked into env_map and starsAtPrimaryMiss
+                    // returns 0). Bounce rays (b > 0) keep their
+                    // existing path: clampIndirect already kills
+                    // firefly contributions from sub-pixel stars on
+                    // secondary bounces, and the indirect star
+                    // contribution is small enough that denoiser
+                    // smudging is invisible there.
+                    //
+                    // Gate the starsAtPrimaryMiss() call on
+                    // star_split_active so the legacy branch (cvar
+                    // off, denoiser off, etc.) doesn't pay for the
+                    // starmap sample + per-cell hash work whose
+                    // result it would just discard. The split branch
+                    // computes stars_only once and subtracts it from
+                    // sky_full BEFORE the throughput multiply, so the
+                    // active and legacy paths differ by exactly
+                    // `throughput * stars_only` instead of relying on
+                    // the algebraic identity `T*(A+S) - T*S == T*A`
+                    // (which is not bit-identical in fp16 storage
+                    // paths). Also keeps a single source of truth for
+                    // the star sampling logic on the active path -- a
+                    // future change inside procSky's star contribution
+                    // would propagate through both sides via
+                    // starsAtPrimaryMiss without manual re-syncing.
+                    float3 sky_full = skyColor(rd);
+                    if (star_split_active) {
+                        float3 stars_only = starsAtPrimaryMiss(rd);
+                        frame_stars += throughput * stars_only;
+                        radiance    += throughput * (sky_full - stars_only);
+                    } else {
+                        radiance    += throughput * sky_full;
+                    }
                 } else {
                     radiance += clampIndirect(throughput * skyColor(rd));
                 }
@@ -2493,6 +2634,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
         frame_radiance += radiance;
     }
     frame_radiance /= float(sample_count);
+    frame_stars    /= float(sample_count);
 
     // Sanitize: replace NaN / Inf / negative channels with 0 before the
     // running-mean update below. Without this, a single rare bad sample
@@ -2508,6 +2650,15 @@ void main(uint2 tid : SV_DispatchThreadID) {
     {
         bool3 bad = isnan(frame_radiance) || isinf(frame_radiance);
         frame_radiance = select(bad, float3(0.0), max(frame_radiance, float3(0.0)));
+    }
+    // Same sanitisation for frame_stars: starsAtPrimaryMiss reads a
+    // host-uploaded RGBA16F starmap which we trust to be clean, but a
+    // NaN in throughput (from an upstream BRDF edge case) would
+    // propagate identically into accum_stars. Snap to 0 so the texture
+    // never carries non-finite state.
+    {
+        bool3 bad = isnan(frame_stars) || isinf(frame_stars);
+        frame_stars = select(bad, float3(0.0), max(frame_stars, float3(0.0)));
     }
 
     // Online running mean. reset_accum=1 starts a fresh average. The
@@ -2585,6 +2736,15 @@ void main(uint2 tid : SV_DispatchThreadID) {
         //     average); matches the value the inline swapchain write
         //     below uses, so the engine Tonemap chain reads the same
         //     accumulated image and just adds bloom on top.
+        //
+        // Note (issue #46 star-split): when star_split_active was set
+        // above, the primary-miss code already subtracted the star
+        // contribution from `radiance`, so frame_radiance carries
+        // sky-without-stars. The bypassed stars sit in frame_stars
+        // and are written separately to accum_stars below. With
+        // star-split off, frame_radiance is identical to the
+        // pre-fix value (the subtraction branch never fires) and
+        // frame_stars stays at 0.
         float3 hdr_src = (denoiser_enabled != 0u) ? frame_radiance : avg;
         if (w2j_row0.w > 0.5) {
             denoise_color[tid] = float4(hdr_src, 1.0);
@@ -2592,6 +2752,35 @@ void main(uint2 tid : SV_DispatchThreadID) {
             float3 mapped = acesTonemap(hdr_src * exposure);
             denoise_color[tid] = float4(mapped, 1.0);
         }
+    }
+
+    // Star-split accumulator (issue #46). Same EMA / running-mean
+    // update shape as accum_hdr above, so a static-camera night
+    // scene converges identically and we don't introduce a fresh
+    // noise source on the bypass path. Gate kept tight: only writes
+    // when star_split_active was the gating condition for the
+    // subtraction above -- a write under a slack condition would
+    // leak stars into the legacy / off path's accum_stars (currently
+    // zero) and the finalize stage would composite them twice.
+    if (star_split_active) {
+        float4 prev_s = (reset_accum != 0u) ? float4(0,0,0,0) : accum_stars[tid];
+        {
+            // Sanitize prev: mirrors accum_hdr's NaN/Inf guard above.
+            bool3 prev_bad = isnan(prev_s.rgb) || isinf(prev_s.rgb);
+            if (any(prev_bad) || isnan(prev_s.a) || isinf(prev_s.a)) {
+                prev_s = float4(0, 0, 0, 0);
+            }
+        }
+        float n_new_s;
+        float3 avg_s;
+        if (prev_s.a < 0.5 || ema_alpha <= 0.0) {
+            n_new_s = prev_s.a + 1.0;
+            avg_s   = (prev_s.rgb * prev_s.a + frame_stars) / n_new_s;
+        } else {
+            avg_s   = prev_s.rgb * ema_alpha + frame_stars * (1.0 - ema_alpha);
+            n_new_s = min(prev_s.a + 1.0, 1.0 / max(1.0 - ema_alpha, 1e-3));
+        }
+        accum_stars[tid] = float4(avg_s, n_new_s);
     }
 
     // Swapchain write. Apply the OETF on the SPIR-V path so the OS's

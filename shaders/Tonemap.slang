@@ -56,6 +56,52 @@
 // BindStorageTexture(2, ...) call.
 [[vk::binding(6, 0)]] RWTexture2D<float4> bloom_tex;
 
+// Star-split accumulator (issue #46). Holds the per-pixel star
+// contribution PathTrace.slang routed around the SVGF a-trous kernel
+// to keep sub-pixel stars from being smudged into surrounding sky
+// texels. Added to hdr_in pre-bloom so highlights here get the same
+// ACES squash as the rest of the image, and bloom (which downsamples
+// hdr_in upstream) still produces star halos -- the engine's bloom
+// pyramid runs from post_denoise_hdr on the Metal SVGF/MetalFX paths,
+// and we route accum_stars into bloom_tex's source upstream of the
+// pyramid so the halos pick up the same energy this kernel adds.
+//
+// Slot is binding 22 to match PathTrace.slang's reserved slot for the
+// same texture (the shared descriptor-set layout was extended past 19
+// when #107's triangle BVH took bindings 19/20, again past 21 when
+// SDF Phase 1 #109 took binding 21 for its storage buffer -- stars
+// moved 21 -> 22 in the round-2 merge). When star-split is off (cvar
+// r_star_split 0 or denoiser off) the engine binds a 1x1 placeholder
+// texture here purely for descriptor-set validity; the shader's
+// `stars_present` push gate ensures this slot is never sampled in
+// that case, so the placeholder's contents don't matter.
+//
+// IMPORTANT (Vulkan path is currently DEAD code -- read before
+// reviving it): On Metal this slot is correct because Slang's MSL
+// backend ignores vk::binding annotations and assigns texture indices
+// in DECLARATION order: hdr_in -> texture(0), ldr_out -> texture(1),
+// bloom_tex -> texture(2), stars_tex -> texture(3). The engine calls
+// `BindStorageTexture(3, ...)` so the MSL binding lands correctly.
+//
+// On Vulkan the engine's slot table (`kSlotToTexBinding[]` in
+// VulkanDevice.cpp) maps engine slot 3 to vk::binding 7 (depth_tex),
+// NOT to binding 22. Vulkan today never dispatches Tonemap.slang --
+// VulkanDevice::Denoise routes through DenoiseFinalize.slang on its
+// own dedicated 4-binding layout (search for
+// `use_vulkan_bloom_finalize` / `EncodeFinalizeOnly`) -- so the
+// vk::binding(22) annotation is latent: it would only fire if a
+// future change re-enables the engine's Tonemap.slang dispatch on
+// Vulkan. If that happens, either the engine must bind via a NEW
+// engine slot that maps to binding 22 (e.g. slot 11, which is the
+// PathTrace `accum_stars` slot), OR this declaration must move to
+// binding 7 to match `kSlotToTexBinding[3]`. Without one of those
+// changes, the descriptor write at binding 22 would never receive a
+// view and binding 7 would be unexpectedly aliased to stars (with
+// the wrong format / contents of depth_tex). See the
+// "Vulkan never enters this branch" comment around the engine's
+// `use_engine_tonemap` gate in Engine.cpp for the current routing.
+[[vk::binding(22, 0)]] RWTexture2D<float4> stars_tex;
+
 // --- buffer slot padding to push exposure_state to MSL buf(6) and
 //     Push (cbuffer) to MSL buf(7) ----------------------------------
 //
@@ -145,7 +191,14 @@ cbuffer Push {
     uint  flare_mode_physical;
     // Number of valid entries in ghosts[]. 0 = skip the physical loop.
     uint  physical_ghost_count;
-    float2 _pad_phys;
+    // Star-split present flag (issue #46). 1 -> add stars_tex to the
+    // HDR colour pre-bloom; 0 -> skip the additive read entirely
+    // (the slot is bound to a 1x1 placeholder for descriptor
+    // validity, so a read would either over-bright the image with
+    // garbage pixel 0 contents or just waste a sample). Mirrors
+    // TonePush::stars_present in Engine.cpp at the same byte offset.
+    uint  stars_present;
+    uint  _pad_stars_align;
     // 48 bytes of padding to push the ghost array forward to host
     // offset 112 (the Vulkan kPushSplitOffset boundary). On Vulkan
     // only the first 112 bytes hit vkCmdPushConstants; bytes
@@ -234,6 +287,25 @@ void main(uint3 tid : SV_DispatchThreadID) {
 #endif
 
     float3 c = hdr_in[tid.xy].rgb;
+
+    // Star-split composite (issue #46). stars_tex holds the per-pixel
+    // star contribution PathTrace.slang routed around the SVGF
+    // a-trous kernel. Added pre-bloom-sample / pre-tonemap so the
+    // sub-pixel star energy lands intact in the final tonemapped
+    // image (no a-trous smudging) and the downstream bloom + lens
+    // flare paths read the combined HDR -- though note that the
+    // engine's bloom pyramid was built upstream of this dispatch
+    // from a stars-free source on the SVGF/MetalFX paths today, so
+    // star halos in bloom are a follow-up (issue #110 / acceptance
+    // criterion in issue #46 mentions bloom-on-stars; the smudge
+    // fix is the primary deliverable here, halo support is the next
+    // pass). Gated on `stars_present` so the read is elided when
+    // the engine isn't routing stars (cvar r_star_split = 0 or
+    // denoiser off) -- the slot is bound to a 1x1 placeholder in
+    // that case, purely for descriptor-set validity.
+    if (stars_present != 0u) {
+        c += stars_tex[tid.xy].rgb;
+    }
 
     // Bloom + lens flare both bilinear-sample the bloom pyramid;
     // factor the bilinear sampler into a helper so the flare loop

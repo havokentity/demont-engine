@@ -223,6 +223,19 @@ public:
         // existing Tonemap.slang pipeline keys on the same flag via its
         // own push.
         bool hdr_pipeline = true;
+        // Star-split accumulator (issue #46). Holds the per-pixel star
+        // contribution PathTrace.slang routed around the SVGF a-trous
+        // kernel to keep sub-pixel star energy from being smudged.
+        // VulkanNrdDenoiser's DenoiseFinalize stage adds it pre-ACES,
+        // gated on a `stars_present` push flag. When the engine isn't
+        // routing stars (r_star_split = 0 or denoiser off) it can
+        // pass either a 1x1 placeholder (the descriptor stays valid
+        // and the shader's gate elides the read) or `id = 0` (the
+        // backend internally falls back to a safe view and forces
+        // stars_present = 0). MetalFX ignores this -- Metal's
+        // Tonemap.slang has its own stars_tex binding and the engine
+        // routes the accumulator there directly.
+        TextureHandle stars_in;
         float jitter_x       = 0.0f;
         float jitter_y       = 0.0f;
         bool  reset_history  = false; // true on backend switch / scene reset

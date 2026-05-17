@@ -45,6 +45,18 @@
 // bloom_intensity = 0, so the shader's bloom path short-circuits before
 // any sample becomes observable.
 [[vk::binding(3, 0)]] RWTexture2D<float4> bloom_tex;
+// Star-split accumulator (issue #46). Same role as Tonemap.slang's
+// stars_tex on Metal: PathTrace.slang accumulates the per-pixel star
+// contribution here, bypassing the SVGF a-trous kernel that would
+// otherwise smudge sub-pixel star energy into surrounding sky texels.
+// Added pre-bloom-composite / pre-ACES so the stars land in the
+// final HDR pre-tonemap and ACES-squash uniformly with the rest of
+// the image. When star-split is off (cvar r_star_split 0 or the
+// accumulator isn't allocated) the host binds a 1x1 placeholder
+// texture here purely for descriptor-set validity; the shader's
+// `stars_present` push gate ensures this slot is never sampled in
+// that case, so the placeholder's contents don't matter.
+[[vk::binding(4, 0)]] RWTexture2D<float4> stars_tex;
 
 [[vk::push_constant]]
 cbuffer Push {
@@ -52,6 +64,17 @@ cbuffer Push {
     uint  height;
     uint  hdr_pipeline;     // 1 = apply ACES + sRGB; 0 = sRGB OETF only
     float bloom_intensity;  // 0 = skip bloom add entirely
+    // Star-split present flag (issue #46). 1 -> add stars_tex to the
+    // HDR colour pre-bloom; 0 -> skip the additive read entirely
+    // (the slot is bound to a 1x1 placeholder when stars aren't
+    // routed). Mirrors VulkanNrdDenoiser::FinalizePush at the same
+    // byte offset.
+    uint  stars_present;
+    // 12 bytes of explicit pad so the push block size is a multiple
+    // of 16, matching the std140 cbuffer rule.
+    uint  _pad0;
+    uint  _pad1;
+    uint  _pad2;
 };
 
 float3 acesTonemap(float3 c) {
@@ -99,6 +122,18 @@ float3 sampleBloom(uint2 tid, uint2 dim) {
 void main(uint2 tid : SV_DispatchThreadID) {
     if (tid.x >= width || tid.y >= height) return;
     float3 c = hdr_in[tid].rgb;
+
+    // Star-split composite (issue #46). Stars stored in stars_tex
+    // bypass the SVGF a-trous kernel; add them back here pre-ACES so
+    // they land in the final image without the smudge artefacts the
+    // wavelet pass would otherwise inflict. Gated on `stars_present`
+    // so the read is elided when the engine isn't routing stars
+    // (cvar r_star_split = 0 or no accumulator) -- the slot is bound
+    // to a 1x1 placeholder in that case, purely for descriptor-set
+    // validity.
+    if (stars_present != 0u) {
+        c += stars_tex[tid].rgb;
+    }
 
     // Bloom composite. Pre-tonemap so highlights get the same ACES
     // squash as the rest of the image. bloom_intensity = 0 short-
