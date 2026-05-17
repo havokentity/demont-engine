@@ -146,6 +146,33 @@ namespace cvar {
             "the golden-image regression matrix (issue #45). Empty = "
             "no capture. NOT CVAR_ARCHIVE -- per-invocation.",
             CVAR_NONE);
+    // --- SDF Phase 1 (#97) -----------------------------------------------------
+    PT_CVAR(pt_smoke_skip_csg_seed, "0",
+            "1 = skip the headline drilled-cube CSG seed in Init(). Used "
+            "by golden-image fixtures that don't want the default CSG "
+            "mesh in frame (e.g. the SDF acceptance scene). Read once "
+            "in Init() right before SeedDefaultCsgScene; cvar writes "
+            "after first frame have no effect. NOT CVAR_ARCHIVE -- "
+            "per-invocation.",
+            CVAR_NONE);
+    PT_CVAR(pt_smoke_skip_prim_seed, "0",
+            "1 = skip the default 3-sphere + ground-plane analytic-prim "
+            "seed in Init(). Used by golden-image fixtures that want a "
+            "fully-custom scene without the canonical primitives "
+            "(e.g. the SDF acceptance scene replaces them with its own "
+            "row of analytic spheres). Read once in Init() right before "
+            "SeedDefaultPrimitives. NOT CVAR_ARCHIVE -- per-invocation.",
+            CVAR_NONE);
+    PT_CVAR(pt_smoke_late_exec, "",
+            "Path to a console-script .cfg fixture exec'd AFTER "
+            "SeedDefaultCsgScene + SeedDefaultPrimitives + console "
+            "command registration. Use this for CSG / prim / SDF "
+            "commands that need csg_scene_ + the seeded sets to exist "
+            "first. Same strict-failure semantics as pt_smoke_exec "
+            "(read failure / parse error aborts Init). NOT "
+            "CVAR_ARCHIVE -- per-invocation.",
+            CVAR_NONE);
+    // --- end SDF Phase 1 -------------------------------------------------------
     PT_CVAR(con_font_scale, "1.0",
             "Console overlay font scale. 1.0 = baseline (14 logical-unit "
             "CreateFontW height on Win32; 13/12/9 pt input/output/status "
@@ -330,6 +357,33 @@ namespace cvar {
             "(e.g. 1) to force the BVH path always. Takes effect on next "
             "primitives_dirty rebuild.",
             CVAR_ARCHIVE);
+    // --- SDF Phase 1 (#97) -----------------------------------------------------
+    PT_CVAR(r_sdf_max_iters,          "128",
+            "Maximum sphere-trace iterations per SDF cluster, per ray. "
+            "Each iteration evaluates the cluster's distance field once "
+            "and advances by that distance. Higher = fewer missed glancing "
+            "hits on near-grazing rays at the cost of GPU time. Clamped "
+            "to 1..256 in the shader to bound worst-case work. Default 128 "
+            "is comfortable for analytic SDFs + smooth-CSG ops (Phase 1); "
+            "fractals in Phase 3 of #96 will want this higher.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_sdf_epsilon,            "0.0001",
+            "Surface-distance terminator for the SDF sphere-trace, in "
+            "metres. A step that lands within this distance of the "
+            "surface is treated as a hit. Default 1e-4 m (0.1 mm) -- well "
+            "below the angular extent of one pixel at typical camera "
+            "distances. Lower = sharper silhouettes at the cost of more "
+            "iterations near the surface; higher = visibly rounded "
+            "silhouettes but cheaper rendering.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_sdf_debug_iters,        "0",
+            "1 = output iteration heat-map for each SDF cluster instead "
+            "of normal shading. Useful for tuning r_sdf_max_iters per "
+            "scene. Phase 1 wires the flag through the push struct; the "
+            "actual heat-map visualisation lands with Phase 2 procedural "
+            "noise tuning.",
+            0);
+    // --- end SDF Phase 1 -------------------------------------------------------
     PT_CVAR(r_mis,             "1",
             "Multiple importance sampling for direct lighting on Lambert "
             "hits under HDRI. 1 = balance-heuristic MIS between env-map "
@@ -711,14 +765,36 @@ bool Engine::Init() {
 
     // CSG scene -- the source of truth for triangle-mesh geometry from
     // P9 onward. Seeded with the headline drilled-cube scene so first-
-    // frame renders something interesting.
+    // frame renders something interesting. SDF Phase 1 (#97) fixtures
+    // can opt out via pt_smoke_skip_csg_seed so the SDF acceptance
+    // scene renders without the gold drilled-cube in frame.
     csg_scene_ = std::make_unique<pt::csg::CsgScene>();
-    SeedDefaultCsgScene();
+    bool skip_csg_seed = false;
+    if (auto* v = C.FindCVar("pt_smoke_skip_csg_seed")) skip_csg_seed = v->GetBool();
+    if (!skip_csg_seed) {
+        SeedDefaultCsgScene();
+    } else {
+        // CsgScene's ctor itself seeds a unit box at id=1 (see Reset()
+        // in src/renderer/Csg/CsgScene.cpp), so just skipping
+        // SeedDefaultCsgScene isn't enough -- we still need to wipe
+        // that default leaf. Remove drops it cleanly along with any
+        // root reference. Now the bake produces an empty mesh and the
+        // shader's tlas_present / bvh_params.z gates kick in.
+        csg_scene_->Remove(1);
+        LOG_INFO("engine: skipping default CSG seed (pt_smoke_skip_csg_seed=1)");
+    }
 
     // Analytic primitives -- spheres + planes that the unified renderer
     // intersects alongside the mesh TLAS. Seeded with the canonical
-    // 3-sphere + ground-plane scene.
-    SeedDefaultPrimitives();
+    // 3-sphere + ground-plane scene. SDF Phase 1 (#97) fixtures can
+    // opt out via pt_smoke_skip_prim_seed.
+    bool skip_prim_seed = false;
+    if (auto* v = C.FindCVar("pt_smoke_skip_prim_seed")) skip_prim_seed = v->GetBool();
+    if (!skip_prim_seed) {
+        SeedDefaultPrimitives();
+    } else {
+        LOG_INFO("engine: skipping default analytic-prim seed (pt_smoke_skip_prim_seed=1)");
+    }
 
     // Boot the requested backend so the window renders something on
     // startup (defaults to "software" -- the only one online today).
@@ -812,6 +888,39 @@ bool Engine::Init() {
     if (auto* v = C.FindCVar("cam_pitch")) camera_->pitch = glm::radians(v->GetFloat());
     if (auto* v = C.FindCVar("cam_fov"))   camera_->fov_deg = v->GetFloat();
     camera_->ClampPitch();
+
+    // --- SDF Phase 1 (#97) -----------------------------------------------------
+    // Late smoke-exec hook. Runs AFTER:
+    //   - csg_scene_ construction + SeedDefaultCsgScene (or its skip)
+    //   - SeedDefaultPrimitives (or its skip)
+    //   - RegisterCommands (csg_*, prim_*, sdf_*) all registered
+    //   - cvar overrides applied
+    //   - Camera state pulled from cvars
+    // so a fixture can issue any console command without crashing.
+    // Same strict-failure semantics as pt_smoke_exec above.
+    if (auto* lx = pt::console::Console::Get().FindCVar("pt_smoke_late_exec");
+        lx != nullptr && !lx->value.empty()) {
+        FILE* lf = std::fopen(lx->value.c_str(), "rb");
+        if (lf == nullptr) {
+            LOG_ERROR("pt_smoke_late_exec: '{}' not found", lx->value);
+            return false;
+        }
+        std::string lbody; char lbuf[4096];
+        while (auto ln = std::fread(lbuf, 1, sizeof(lbuf), lf)) lbody.append(lbuf, ln);
+        const bool lread_err = (std::ferror(lf) != 0);
+        std::fclose(lf);
+        if (lread_err) {
+            LOG_ERROR("pt_smoke_late_exec '{}': read error", lx->value);
+            return false;
+        }
+        auto lr = pt::console::Console::Get().ExecuteScript(lbody);
+        if (!lr.ok) {
+            LOG_ERROR("pt_smoke_late_exec '{}': {}", lx->value, lr.error);
+            return false;
+        }
+        LOG_INFO("loaded late smoke-exec fixture {}", lx->value);
+    }
+    // --- end SDF Phase 1 -------------------------------------------------------
 
     LOG_INFO("Engine initialized.");
     return true;
@@ -1023,6 +1132,9 @@ void Engine::TearDownDevice() {
         if (tri_bvh_permuted_ids_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{tri_bvh_permuted_ids_id_});
         if (prim_buffer_id_       != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{prim_buffer_id_});
         if (bvh_node_buffer_id_   != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{bvh_node_buffer_id_});
+        // --- SDF Phase 1 (#97) -------------------------------------------------
+        if (sdf_cluster_buffer_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{sdf_cluster_buffer_id_});
+        // --- end SDF Phase 1 ---------------------------------------------------
         if (denoise_color_tex_id_    != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
         if (depth_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
         if (motion_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
@@ -1042,6 +1154,7 @@ void Engine::TearDownDevice() {
         // released by device_.reset() below, same as tonemap / bloom.
         if (exposure_state_id_      != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{exposure_state_id_});
         if (perfoverlay_drawlist_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{perfoverlay_drawlist_id_});
+        if (placeholder_storage_id_  != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{placeholder_storage_id_});
     }
     scene_tlas_id_        = 0;
     box_blas_id_          = 0;
@@ -1057,6 +1170,12 @@ void Engine::TearDownDevice() {
     bvh_node_buffer_id_       = 0;
     bvh_node_buffer_capacity_ = 0;
     linear_prim_count_        = 0;
+    // --- SDF Phase 1 (#97) -------------------------------------------------
+    sdf_cluster_buffer_id_    = 0;
+    sdf_cluster_capacity_     = 0;
+    sdf_cluster_count_        = 0;
+    sdf_prims_dirty_          = true;
+    // --- end SDF Phase 1 ---------------------------------------------------
     denoise_color_tex_id_    = 0;
     depth_tex_id_            = 0;
     motion_tex_id_           = 0;
@@ -1080,6 +1199,7 @@ void Engine::TearDownDevice() {
     moon_map_tex_id_      = 0;
     autoexpose_pipeline_id_ = 0;
     exposure_state_id_      = 0;
+    placeholder_storage_id_ = 0;
     denoiser_active_      = false;
     prev_view_proj_valid_ = false;
     primitives_dirty_     = true;        // re-upload on next device
@@ -1388,6 +1508,32 @@ void Engine::RequestBackendSwitch(BackendType to) {
         });
         perfoverlay_drawlist_id_       = buf.id;
         perfoverlay_drawlist_capacity_ = kPerfDrawCapacity;
+    }
+
+    // Always-present placeholder storage buffer. Used as a harmless
+    // fallback for optional binding slots (env CDFs at 4/5, BVH nodes
+    // at 7, tri_bvh nodes/ids at 8/9, SDF clusters at 10) whose primary
+    // buffer can legally be 0 (no env map; no BVH built; no SDFs
+    // uploaded). Metal computes the dynamic push-constant slot from
+    // max-bound + 1 of the contiguous
+    // range, so leaving any slot in that range unbound shifts the push
+    // slot and corrupts every push field -> all-black render. Previous
+    // code reused prim_buffer_id_ for the same purpose, but with
+    // pt_smoke_skip_prim_seed=1 and no analytic prims that id stays 0
+    // too. Sized at 16 bytes (one float4) -- the shader never reads
+    // these slots when their respective count fields are 0.
+    {
+        auto buf = device_->CreateBuffer({
+            .size = 16,
+            .usage = pt::rhi::BufferUsage::Storage,
+            .debug_name = "placeholder_storage",
+        });
+        placeholder_storage_id_ = buf.id;
+        if (placeholder_storage_id_ == 0) {
+            LOG_ERROR("placeholder_storage buffer creation failed -- "
+                      "optional binding slots may fall back to slot 0 / "
+                      "shift Metal push-constant slot");
+        }
     }
 
     // Mark the analytic-primitive buffer dirty so it gets uploaded on
@@ -2563,6 +2709,146 @@ void Engine::EnsurePrimitivesUploaded() {
     accum_dirty_      = true;
 }
 
+// --- SDF Phase 1 (#97) -----------------------------------------------------
+void Engine::EnsureSdfPrimsUploaded() {
+    if (!device_) return;
+    if (!sdf_prims_dirty_) return;
+
+    const std::uint32_t count = static_cast<std::uint32_t>(sdf_prims_.size());
+
+    // Per-cluster GPU layout (must match SdfPrimitives.slang's
+    // loadSdfCluster):
+    //   header (4 float4s = 64 B):
+    //     hdr0.xyz = aabb_min        ;  asuint(hdr0.w) = node_count
+    //     hdr1.xyz = aabb_max        ;  asuint(hdr1.w) = material
+    //     hdr2.xyz = albedo          ;          hdr2.w = roughness
+    //     hdr3.x   = ior             ;  hdr3.yzw pad
+    //   nodes (kMaxNodes * 3 float4s = 384 B):
+    //     n0.x=asfloat(op)  n0.y=asfloat(shape)
+    //     n0.z=asfloat(child_a)  n0.w=asfloat(child_b)
+    //     n1 = params (float4)
+    //     n2.xyz = center           ; n2.w pad
+    constexpr std::uint32_t kHeaderFloat4s = 4;
+    constexpr std::uint32_t kNodeFloat4s   = 3;
+    constexpr std::uint32_t kClusterFloat4s =
+        kHeaderFloat4s + pt::renderer::SdfPrim::kMaxNodes * kNodeFloat4s;
+    constexpr std::uint32_t kBytesPerCluster = sizeof(float) * 4u * kClusterFloat4s;
+
+    // Grow GPU buffer by powers of two from a floor of 4 clusters --
+    // matches the analytic-prim buffer's allocation pattern so
+    // steady-state edits don't reallocate.
+    if (count > sdf_cluster_capacity_) {
+        std::uint32_t new_cap = sdf_cluster_capacity_ ? sdf_cluster_capacity_ : 4u;
+        while (new_cap < count) new_cap *= 2u;
+        if (sdf_cluster_buffer_id_ != 0) {
+            device_->WaitIdle();
+            device_->DestroyBuffer(pt::rhi::BufferHandle{sdf_cluster_buffer_id_});
+            sdf_cluster_buffer_id_ = 0;
+        }
+        auto buf = device_->CreateBuffer({
+            .size = std::size_t(new_cap) * kBytesPerCluster,
+            .usage = pt::rhi::BufferUsage::Storage,
+            .debug_name = "sdf_clusters",
+        });
+        if (buf.id == 0) {
+            LOG_ERROR("[sdf] cluster buffer allocation failed (capacity {})", new_cap);
+            return;
+        }
+        sdf_cluster_buffer_id_ = buf.id;
+        sdf_cluster_capacity_  = new_cap;
+    }
+
+    if (count == 0) {
+        sdf_cluster_count_ = 0;
+        sdf_prims_dirty_   = false;
+        accum_dirty_       = true;
+        LOG_INFO("[sdf] no clusters active");
+        return;
+    }
+
+    // Allocate enough capacity for the buffer's full footprint (even
+    // unused trailing clusters) so the shader's bounds checks against
+    // sdf_cluster_count are the only thing that matters.
+    std::vector<float> packed(std::size_t(sdf_cluster_capacity_) * 4u * kClusterFloat4s, 0.0f);
+
+    auto pack_cluster = [&](std::size_t idx, const pt::renderer::SdfPrim& p) {
+        const std::size_t base = idx * std::size_t(4u * kClusterFloat4s);
+        // hdr0
+        packed[base + 0]  = p.aabb_min[0];
+        packed[base + 1]  = p.aabb_min[1];
+        packed[base + 2]  = p.aabb_min[2];
+        std::memcpy(&packed[base + 3], &p.node_count, sizeof(float));
+        // hdr1
+        packed[base + 4]  = p.aabb_max[0];
+        packed[base + 5]  = p.aabb_max[1];
+        packed[base + 6]  = p.aabb_max[2];
+        std::memcpy(&packed[base + 7], &p.material, sizeof(float));
+        // hdr2
+        packed[base + 8]  = p.albedo[0];
+        packed[base + 9]  = p.albedo[1];
+        packed[base + 10] = p.albedo[2];
+        packed[base + 11] = p.roughness;
+        // hdr3
+        packed[base + 12] = p.ior;
+        // 13/14/15 pad (already zeroed)
+
+        for (std::uint32_t i = 0; i < pt::renderer::SdfPrim::kMaxNodes; ++i) {
+            const std::size_t nb = base + std::size_t(4u * (kHeaderFloat4s + i * kNodeFloat4s));
+            const pt::renderer::SdfNode& n = p.nodes[i];
+            // n0
+            std::memcpy(&packed[nb + 0], &n.op,      sizeof(float));
+            std::memcpy(&packed[nb + 1], &n.shape,   sizeof(float));
+            std::memcpy(&packed[nb + 2], &n.child_a, sizeof(float));
+            std::memcpy(&packed[nb + 3], &n.child_b, sizeof(float));
+            // n1 (params)
+            packed[nb + 4] = n.params[0];
+            packed[nb + 5] = n.params[1];
+            packed[nb + 6] = n.params[2];
+            packed[nb + 7] = n.params[3];
+            // n2 (center)
+            packed[nb + 8]  = n.center[0];
+            packed[nb + 9]  = n.center[1];
+            packed[nb + 10] = n.center[2];
+            // pad at +11 already zero
+        }
+    };
+
+    std::size_t idx = 0;
+    for (auto& [id, prim] : sdf_prims_) {
+        // Re-derive the cluster AABB from its current node tree before
+        // packing. The console commands that build / combine clusters
+        // already call ComputeSdfAabb, but recomputing here closes the
+        // gap if anything mutates an SdfPrim in-place between those
+        // calls and the next upload -- the sphere-trace is AABB-bounded
+        // so a stale AABB silently misses hits. Failure leaves the
+        // existing aabb_min/max in place (best-effort; a malformed
+        // tree would also fail at construction time and never reach
+        // here).
+        if (!pt::renderer::ComputeSdfAabb(prim)) {
+            LOG_WARN("[sdf] cluster id={} AABB recompute failed at upload; "
+                     "using existing AABB which may be stale", id);
+        }
+        pack_cluster(idx++, prim);
+    }
+
+    device_->WriteBuffer(pt::rhi::BufferHandle{sdf_cluster_buffer_id_},
+                         packed.data(), packed.size() * sizeof(float));
+    sdf_cluster_count_ = count;
+    sdf_prims_dirty_   = false;
+    accum_dirty_       = true;
+    LOG_INFO("[sdf] uploaded {} cluster(s), iter budget = {} (r_sdf_max_iters), epsilon = {} m (r_sdf_epsilon)",
+             count,
+             [&]{ if (auto* v = pt::console::Console::Get().FindCVar("r_sdf_max_iters")) return v->GetInt(); return 128; }(),
+             [&]{ if (auto* v = pt::console::Console::Get().FindCVar("r_sdf_epsilon"))  return v->GetFloat(); return 1e-4f; }());
+    for (const auto& [id, p] : sdf_prims_) {
+        LOG_INFO("[sdf]   id={} nodes={} aabb=[{:.2f},{:.2f},{:.2f} .. {:.2f},{:.2f},{:.2f}]",
+                 id, p.node_count,
+                 p.aabb_min[0], p.aabb_min[1], p.aabb_min[2],
+                 p.aabb_max[0], p.aabb_max[1], p.aabb_max[2]);
+    }
+}
+// --- end SDF Phase 1 -------------------------------------------------------
+
 void Engine::EnsurePipelineHandles() {
     if (!device_) return;
     auto resolve = [&](std::uint64_t& cached, const char* name) {
@@ -2618,6 +2904,9 @@ void Engine::RenderFrame() {
 
     EnsureMeshUpdated();
     EnsurePrimitivesUploaded();
+    // --- SDF Phase 1 (#97) -------------------------------------------------
+    EnsureSdfPrimsUploaded();
+    // --- end SDF Phase 1 ---------------------------------------------------
 
     auto& C = pt::console::Console::Get();
 
@@ -3042,15 +3331,17 @@ void Engine::RenderFrame() {
     // buffers, so leaving slots 4/5 unbound shifts the dynamically-
     // assigned push-constant slot to the wrong index (Metal computes
     // it as max-bound + 1) and the shader reads garbage push fields
-    // -> all-black render. When env CDFs aren't available we re-use
-    // the prim_buffer as a harmless placeholder; the shader never
-    // reads from slots 4/5 when env_map_present == 0.
+    // -> all-black render. When env CDFs aren't available we fall
+    // back to the always-present placeholder storage buffer; the
+    // shader never reads from slots 4/5 when env_map_present == 0.
+    // (Previously we reused prim_buffer_id_ here, but that id is 0
+    // when pt_smoke_skip_prim_seed=1 and no analytic prims exist.)
     pt::rhi::BufferHandle slot4 = (env_marginal_cdf_id_ != 0)
         ? pt::rhi::BufferHandle{env_marginal_cdf_id_}
-        : pt::rhi::BufferHandle{prim_buffer_id_};
+        : pt::rhi::BufferHandle{placeholder_storage_id_};
     pt::rhi::BufferHandle slot5 = (env_conditional_cdf_id_ != 0)
         ? pt::rhi::BufferHandle{env_conditional_cdf_id_}
-        : pt::rhi::BufferHandle{prim_buffer_id_};
+        : pt::rhi::BufferHandle{placeholder_storage_id_};
     if (slot4.id != 0) cb->BindBuffer(4, slot4, 0);
     if (slot5.id != 0) cb->BindBuffer(5, slot5, 0);
     // GPU-driven exposure scalar at slot 6. PathTrace reads it for
@@ -3066,10 +3357,10 @@ void Engine::RenderFrame() {
     // the same reason slot 4/5 do (Metal's dynamic slot assignment
     // depends on max-bound + 1 of the contiguous range -- leaving 7
     // unbound would shift the push slot). When no BVH is built we
-    // re-use the primitive buffer as a harmless placeholder.
+    // fall back to the always-present placeholder storage buffer.
     pt::rhi::BufferHandle slot7 = (bvh_node_buffer_id_ != 0)
         ? pt::rhi::BufferHandle{bvh_node_buffer_id_}
-        : pt::rhi::BufferHandle{prim_buffer_id_};
+        : pt::rhi::BufferHandle{placeholder_storage_id_};
     if (slot7.id != 0) cb->BindBuffer(7, slot7, 0);
     // Engine slots 8 / 9 -> shader bindings 19 / 20 (tri_bvh_nodes,
     // tri_bvh_permuted_ids; PR #106 follow-up). Same "always bind
@@ -3088,6 +3379,25 @@ void Engine::RenderFrame() {
         : pt::rhi::BufferHandle{prim_buffer_id_};
     if (slot8.id != 0) cb->BindBuffer(8, slot8, 0);
     if (slot9.id != 0) cb->BindBuffer(9, slot9, 0);
+    // --- SDF Phase 1 (#97) -------------------------------------------------
+    // SDF cluster buffer at engine slot 10 (MSL slot order;
+    // vk::binding(21, 0)). Moved from engine slot 8 / vk::binding 19
+    // to make room for PR #106's tri_bvh_* at slots 8/9 / bindings
+    // 19/20. The shader only reads this when push.sdf_params.x > 0;
+    // the binding still has to resolve to a real buffer for the same
+    // reason 4/5/7/8/9 do (Metal computes dynamic slots from
+    // max-bound + 1 of the contiguous range -- leaving 10 unbound
+    // would shift the push slot by one and corrupt every field). Use
+    // the always-present placeholder storage buffer when no SDF
+    // clusters exist. (Earlier versions reused prim_buffer_id_, but
+    // that id is 0 when pt_smoke_skip_prim_seed=1 and no analytic
+    // prims have been seeded -- the binding would silently drop and
+    // shift the push slot.)
+    pt::rhi::BufferHandle slot10 = (sdf_cluster_buffer_id_ != 0)
+        ? pt::rhi::BufferHandle{sdf_cluster_buffer_id_}
+        : pt::rhi::BufferHandle{placeholder_storage_id_};
+    if (slot10.id != 0) cb->BindBuffer(10, slot10, 0);
+    // --- end SDF Phase 1 ---------------------------------------------------
     // P10 G-buffer texture binds. The shader's vk::binding numbers (6/7/8)
     // are Vulkan descriptor slots; on Metal Slang assigns texture(N) in
     // declaration order, so output/accum/denoise_color/depth/motion/env
@@ -3320,6 +3630,23 @@ void Engine::RenderFrame() {
         //   .z/.w reserved for future BVH-side knobs (leaf size,
         //   builder selection).
         std::uint32_t bvh_params[4];
+        // --- SDF Phase 1 (#97) -------------------------------------------------
+        // SDF traversal params.
+        //   .x = sdf_cluster_count -- number of SDF clusters in the
+        //        sdf_clusters buffer. 0 disables the entire SDF path.
+        //   .y = sdf_max_iters     -- r_sdf_max_iters cvar, clamped to
+        //        1..256 on the host (the shader's hard upper bound).
+        //   .z = sdf_debug_iters   -- r_sdf_debug_iters cvar. 1 ->
+        //        future iteration-count heat map; Phase 1 just plumbs
+        //        the bit through so Phase 2 turns it on without a
+        //        push-constant reshuffle.
+        //   .w reserved.
+        std::uint32_t sdf_params[4];
+        // .x = r_sdf_epsilon (sphere-trace surface terminator, metres).
+        // .yzw reserved for future SDF-side knobs (LOD distance, normal
+        // bias, etc.).
+        float         sdf_params_f[4];
+        // --- end SDF Phase 1 ---------------------------------------------------
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -3415,6 +3742,29 @@ void Engine::RenderFrame() {
             ? tri_bvh_node_count_
             : 0u;
     }
+    // --- SDF Phase 1 (#97) -------------------------------------------------
+    {
+        int    max_iters = 128;
+        float  epsilon   = 1e-4f;
+        int    debug     = 0;
+        if (auto* v = C.FindCVar("r_sdf_max_iters"))   max_iters = v->GetInt();
+        if (auto* v = C.FindCVar("r_sdf_epsilon"))     epsilon   = v->GetFloat();
+        if (auto* v = C.FindCVar("r_sdf_debug_iters")) debug     = v->GetInt();
+        if (max_iters < 1)   max_iters = 1;
+        if (max_iters > 256) max_iters = 256;     // shader clamps the same way
+        if (epsilon   < 1e-7f) epsilon = 1e-7f;
+        // Disable the entire SDF path when no clusters are active --
+        // the shader's gate is sdf_params.x > 0.
+        push.sdf_params[0] = sdf_cluster_count_;
+        push.sdf_params[1] = static_cast<std::uint32_t>(max_iters);
+        push.sdf_params[2] = (debug != 0) ? 1u : 0u;
+        push.sdf_params[3] = 0u;
+        push.sdf_params_f[0] = epsilon;
+        push.sdf_params_f[1] = 0.0f;
+        push.sdf_params_f[2] = 0.0f;
+        push.sdf_params_f[3] = 0.0f;
+    }
+    // --- end SDF Phase 1 ---------------------------------------------------
 
     // Halton(2,3) sub-pixel jitter sequence in [-0.5, 0.5] each axis.
     // 16-sample period before repeating; ample for the denoiser's
@@ -3840,7 +4190,11 @@ void Engine::RenderFrame() {
         push.clouds_p3[3] = rayleigh;
     }
 
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16);
+    // 736 (pre-SDF) + 16 (sdf_params uvec4) + 16 (sdf_params_f vec4) = 768 B.
+    // Vulkan keeps the first 112 B in push constants and spills the rest
+    // into the Frame UBO (kFrameUboSize = 1024); Metal keeps the whole
+    // struct in a setBytes-style slot.
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16);
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
     // cbuffer layout the Slang compiler applies to PathTrace.slang's
@@ -3855,6 +4209,14 @@ void Engine::RenderFrame() {
     static_assert(offsetof(PtPush, bvh_params) % 16 == 0,
                   "PtPush::bvh_params must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
+    // --- SDF Phase 1 (#97) -------------------------------------------------
+    static_assert(offsetof(PtPush, sdf_params) % 16 == 0,
+                  "PtPush::sdf_params must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    static_assert(offsetof(PtPush, sdf_params_f) % 16 == 0,
+                  "PtPush::sdf_params_f must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    // --- end SDF Phase 1 ---------------------------------------------------
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
 
@@ -7243,6 +7605,9 @@ void Engine::RegisterCommands() {
 
     RegisterCsgCommands();
     RegisterPrimCommands();
+    // --- SDF Phase 1 (#97) -----------------------------------------------------
+    RegisterSdfCommands();
+    // --- end SDF Phase 1 -------------------------------------------------------
 }
 
 namespace {
@@ -7552,5 +7917,362 @@ void Engine::RegisterPrimCommands() {
                            id, MaterialName(mat), nx, ny, nz, d);
         });
 }
+
+// --- SDF Phase 1 (#97) -----------------------------------------------------
+//
+// Console commands for the SDF primitive set. Mirrors the prim_* /
+// csg_* conventions:
+//   * `sdf_<shape> <id> [params...] <x y z> <material> <r g b>` adds a
+//     LEAF cluster (a single-shape SDF blob). Material follows the same
+//     lambert | metal | dielectric taxonomy as analytic prims.
+//   * `sdf_smin / sdf_smax / sdf_sdiff <id> <child_id_a> <child_id_b>
+//     <k> [material] [r g b]` combines two existing SDF leaves into a
+//     smooth-CSG cluster. The two child clusters are CONSUMED -- they
+//     get folded into the new cluster's flat node array and removed
+//     from the active set.
+//   * `sdf_list / sdf_clear / sdf_remove` round out the management API.
+//
+// On any successful mutation we set sdf_prims_dirty_ so the next render
+// frame uploads the cluster buffer to the GPU. The shader gates the
+// whole SDF path on sdf_cluster_count_ > 0 so an empty set is free.
+
+namespace {
+
+bool ParseSdfMaterial(std::string_view s, std::uint32_t& mat) {
+    if (s == "lambert")    { mat = 0u; return true; }
+    if (s == "metal")      { mat = 1u; return true; }
+    if (s == "dielectric") { mat = 2u; return true; }
+    return false;
+}
+
+}  // namespace
+
+void Engine::RegisterSdfCommands() {
+    auto& C = pt::console::Console::Get();
+
+    C.RegisterCommand("sdf_list",
+        "List signed-distance-field clusters.",
+        [this](auto, pt::console::Output& out) {
+            if (sdf_prims_.empty()) { out.PrintLine("(no SDF clusters)"); return; }
+            out.FormatLine("{} SDF cluster(s):", sdf_prims_.size());
+            for (const auto& [id, p] : sdf_prims_) {
+                out.FormatLine("  {:>3}  nodes={}  aabb=[{:.2f},{:.2f},{:.2f} .. {:.2f},{:.2f},{:.2f}] mat={} rgb=({:.2f},{:.2f},{:.2f})",
+                               id, p.node_count,
+                               p.aabb_min[0], p.aabb_min[1], p.aabb_min[2],
+                               p.aabb_max[0], p.aabb_max[1], p.aabb_max[2],
+                               p.material,
+                               p.albedo[0], p.albedo[1], p.albedo[2]);
+            }
+        });
+
+    C.RegisterCommand("sdf_clear",
+        "Remove all SDF clusters.",
+        [this](auto, pt::console::Output& out) {
+            sdf_prims_.clear();
+            sdf_prims_dirty_ = true;
+            accum_dirty_     = true;
+            out.PrintLine("sdf: cleared");
+        });
+
+    C.RegisterCommand("sdf_remove",
+        "sdf_remove <id>: drop an SDF cluster.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 1) { out.PrintLine("usage: sdf_remove <id>"); return; }
+            std::uint32_t id;
+            if (!ParseUint(args[0], id)) { out.PrintLine("sdf_remove: id parse failed"); return; }
+            if (sdf_prims_.erase(id) == 0) {
+                out.FormatLine("sdf_remove: id {} not found", id);
+                return;
+            }
+            sdf_prims_dirty_ = true;
+            accum_dirty_     = true;
+            out.FormatLine("sdf: removed id {}", id);
+        });
+
+    // Helper: add a single-leaf cluster with the given shape + params.
+    // Logs on success per the engine's "logging is a mantra" pattern.
+    auto add_leaf = [this](std::uint32_t id,
+                           pt::renderer::SdfShape shape,
+                           std::array<float, 4> params,
+                           float x, float y, float z,
+                           std::uint32_t material,
+                           float r, float g, float b,
+                           pt::console::Output& out,
+                           const char* tag) {
+        pt::renderer::SdfPrim prim{};
+        prim.node_count   = 1;
+        prim.material     = material;
+        prim.albedo[0] = r; prim.albedo[1] = g; prim.albedo[2] = b;
+        prim.roughness    = 0.0f;
+        prim.ior          = 1.5f;
+        pt::renderer::SdfNode& n = prim.nodes[0];
+        n.op       = pt::renderer::SDF_OP_LEAF;
+        n.shape    = shape;
+        n.child_a  = 0;
+        n.child_b  = 0;
+        n.params[0] = params[0]; n.params[1] = params[1];
+        n.params[2] = params[2]; n.params[3] = params[3];
+        n.center[0] = x; n.center[1] = y; n.center[2] = z;
+        if (!pt::renderer::ComputeSdfAabb(prim)) {
+            out.FormatLine("sdf_{}: degenerate params", tag);
+            return;
+        }
+        sdf_prims_[id] = prim;
+        sdf_prims_dirty_ = true;
+        accum_dirty_     = true;
+        LOG_INFO("[sdf] add {} id={} aabb=[{:.2f},{:.2f},{:.2f} .. {:.2f},{:.2f},{:.2f}]",
+                 tag, id,
+                 prim.aabb_min[0], prim.aabb_min[1], prim.aabb_min[2],
+                 prim.aabb_max[0], prim.aabb_max[1], prim.aabb_max[2]);
+        out.FormatLine("sdf: added {} id={} @ ({:.2f} {:.2f} {:.2f})", tag, id, x, y, z);
+    };
+
+    C.RegisterCommand("sdf_sphere",
+        "sdf_sphere <id> <radius> <x> <y> <z> <lambert|metal|dielectric> <r> <g> <b>: add a sphere SDF.",
+        [add_leaf](auto args, pt::console::Output& out) {
+            if (args.size() != 9) { out.PrintLine("usage: sdf_sphere <id> <radius> <x> <y> <z> <material> <r> <g> <b>"); return; }
+            std::uint32_t id, mat;
+            float radius, x, y, z, r, g, b;
+            if (!ParseUint(args[0], id) || !ParseFloat(args[1], radius) ||
+                !ParseFloat(args[2], x) || !ParseFloat(args[3], y) || !ParseFloat(args[4], z) ||
+                !ParseSdfMaterial(args[5], mat) ||
+                !ParseFloat(args[6], r) || !ParseFloat(args[7], g) || !ParseFloat(args[8], b)) {
+                out.PrintLine("sdf_sphere: arg parse failed");
+                return;
+            }
+            add_leaf(id, pt::renderer::SDF_SHAPE_SPHERE,
+                     {radius, 0.0f, 0.0f, 0.0f}, x, y, z, mat, r, g, b, out, "sphere");
+        });
+
+    C.RegisterCommand("sdf_box",
+        "sdf_box <id> <hx> <hy> <hz> <x> <y> <z> <material> <r> <g> <b>: add a box SDF (half-extents).",
+        [add_leaf](auto args, pt::console::Output& out) {
+            if (args.size() != 11) { out.PrintLine("usage: sdf_box <id> <hx> <hy> <hz> <x> <y> <z> <material> <r> <g> <b>"); return; }
+            std::uint32_t id, mat;
+            float hx, hy, hz, x, y, z, r, g, b;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], hx) || !ParseFloat(args[2], hy) || !ParseFloat(args[3], hz) ||
+                !ParseFloat(args[4], x)  || !ParseFloat(args[5], y)  || !ParseFloat(args[6], z) ||
+                !ParseSdfMaterial(args[7], mat) ||
+                !ParseFloat(args[8], r) || !ParseFloat(args[9], g) || !ParseFloat(args[10], b)) {
+                out.PrintLine("sdf_box: arg parse failed");
+                return;
+            }
+            add_leaf(id, pt::renderer::SDF_SHAPE_BOX,
+                     {hx, hy, hz, 0.0f}, x, y, z, mat, r, g, b, out, "box");
+        });
+
+    C.RegisterCommand("sdf_round_box",
+        "sdf_round_box <id> <hx> <hy> <hz> <corner_r> <x> <y> <z> <material> <r> <g> <b>: add a rounded box SDF.",
+        [add_leaf](auto args, pt::console::Output& out) {
+            if (args.size() != 12) { out.PrintLine("usage: sdf_round_box <id> <hx> <hy> <hz> <corner_r> <x> <y> <z> <material> <r> <g> <b>"); return; }
+            std::uint32_t id, mat;
+            float hx, hy, hz, cr, x, y, z, r, g, b;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], hx) || !ParseFloat(args[2], hy) || !ParseFloat(args[3], hz) ||
+                !ParseFloat(args[4], cr) ||
+                !ParseFloat(args[5], x)  || !ParseFloat(args[6], y)  || !ParseFloat(args[7], z) ||
+                !ParseSdfMaterial(args[8], mat) ||
+                !ParseFloat(args[9], r) || !ParseFloat(args[10], g) || !ParseFloat(args[11], b)) {
+                out.PrintLine("sdf_round_box: arg parse failed");
+                return;
+            }
+            // Reject malformed shape parameters at parse time so a bad
+            // command surfaces as a clear console error rather than a
+            // silently-mis-bounded SDF (rounded box with a negative
+            // corner radius would shrink the AABB inward of the actual
+            // sdRoundBox surface and miss hits during the trace).
+            if (hx <= 0.0f || hy <= 0.0f || hz <= 0.0f) {
+                out.FormatLine("sdf_round_box: half-extents must be > 0 (got hx={} hy={} hz={})",
+                               hx, hy, hz);
+                return;
+            }
+            if (cr < 0.0f) {
+                out.FormatLine("sdf_round_box: corner_r must be >= 0 (got {})", cr);
+                return;
+            }
+            add_leaf(id, pt::renderer::SDF_SHAPE_ROUNDED_BOX,
+                     {hx, hy, hz, cr}, x, y, z, mat, r, g, b, out, "round_box");
+        });
+
+    C.RegisterCommand("sdf_torus",
+        "sdf_torus <id> <R> <r> <x> <y> <z> <material> <r_col> <g_col> <b_col>: add a torus SDF (XZ plane).",
+        [add_leaf](auto args, pt::console::Output& out) {
+            if (args.size() != 10) { out.PrintLine("usage: sdf_torus <id> <R> <r> <x> <y> <z> <material> <r> <g> <b>"); return; }
+            std::uint32_t id, mat;
+            float R, r, x, y, z, cr, cg, cb;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], R) || !ParseFloat(args[2], r) ||
+                !ParseFloat(args[3], x) || !ParseFloat(args[4], y) || !ParseFloat(args[5], z) ||
+                !ParseSdfMaterial(args[6], mat) ||
+                !ParseFloat(args[7], cr) || !ParseFloat(args[8], cg) || !ParseFloat(args[9], cb)) {
+                out.PrintLine("sdf_torus: arg parse failed");
+                return;
+            }
+            add_leaf(id, pt::renderer::SDF_SHAPE_TORUS,
+                     {R, r, 0.0f, 0.0f}, x, y, z, mat, cr, cg, cb, out, "torus");
+        });
+
+    C.RegisterCommand("sdf_capsule",
+        "sdf_capsule <id> <half_height> <radius> <x> <y> <z> <material> <r> <g> <b>: add a Y-axis capsule SDF.",
+        [add_leaf](auto args, pt::console::Output& out) {
+            if (args.size() != 10) { out.PrintLine("usage: sdf_capsule <id> <half_h> <radius> <x> <y> <z> <material> <r> <g> <b>"); return; }
+            std::uint32_t id, mat;
+            float h, r, x, y, z, cr, cg, cb;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], h) || !ParseFloat(args[2], r) ||
+                !ParseFloat(args[3], x) || !ParseFloat(args[4], y) || !ParseFloat(args[5], z) ||
+                !ParseSdfMaterial(args[6], mat) ||
+                !ParseFloat(args[7], cr) || !ParseFloat(args[8], cg) || !ParseFloat(args[9], cb)) {
+                out.PrintLine("sdf_capsule: arg parse failed");
+                return;
+            }
+            add_leaf(id, pt::renderer::SDF_SHAPE_CAPSULE,
+                     {h, r, 0.0f, 0.0f}, x, y, z, mat, cr, cg, cb, out, "capsule");
+        });
+
+    // ----- smooth-CSG combinators ------------------------------------------
+    // Take two existing SDF cluster ids and fold them into a new
+    // combined cluster. The children are removed from the active set
+    // since their data is now inlined into the parent's node array.
+    // Combined node count must not exceed SdfPrim::kMaxNodes; if it
+    // would, the command fails and the children are left in place.
+    auto combine = [this](std::uint32_t id,
+                          std::uint32_t a_id,
+                          std::uint32_t b_id,
+                          float k,
+                          pt::renderer::SdfOp op,
+                          std::uint32_t material,
+                          float r, float g, float b,
+                          pt::console::Output& out,
+                          const char* tag) {
+        // Reject self-combine: a_id == b_id would duplicate the same
+        // node stream into the output and then attempt to erase the
+        // same map entry twice (the second erase is a no-op but the
+        // duplicated nodes already inflated the count, possibly past
+        // kMaxNodes). It's a user error -- surface it clearly.
+        if (a_id == b_id) {
+            out.FormatLine("sdf_{}: child_a and child_b must differ (got {} twice)",
+                           tag, a_id);
+            return;
+        }
+        auto it_a = sdf_prims_.find(a_id);
+        auto it_b = sdf_prims_.find(b_id);
+        if (it_a == sdf_prims_.end() || it_b == sdf_prims_.end()) {
+            out.FormatLine("sdf_{}: child id {} or {} not found", tag, a_id, b_id);
+            return;
+        }
+        const pt::renderer::SdfPrim& A = it_a->second;
+        const pt::renderer::SdfPrim& B = it_b->second;
+        if (A.node_count + B.node_count + 1 > pt::renderer::SdfPrim::kMaxNodes) {
+            out.FormatLine("sdf_{}: combined node count {} exceeds kMaxNodes={}",
+                           tag, A.node_count + B.node_count + 1,
+                           pt::renderer::SdfPrim::kMaxNodes);
+            return;
+        }
+        pt::renderer::SdfPrim out_p{};
+        // Copy A's nodes first (root @ 0), then B's nodes shifted by
+        // A.node_count, then the op node referencing the two child
+        // root indices.
+        for (std::uint32_t i = 0; i < A.node_count; ++i) out_p.nodes[i] = A.nodes[i];
+        for (std::uint32_t i = 0; i < B.node_count; ++i) {
+            pt::renderer::SdfNode nb = B.nodes[i];
+            // Rewrite child indices in B by the shift amount so they
+            // still reference the right nodes inside the merged array.
+            if (nb.op != pt::renderer::SDF_OP_LEAF) {
+                nb.child_a += A.node_count;
+                nb.child_b += A.node_count;
+            }
+            out_p.nodes[A.node_count + i] = nb;
+        }
+        std::uint32_t op_idx = A.node_count + B.node_count;
+        pt::renderer::SdfNode& opn = out_p.nodes[op_idx];
+        opn.op       = op;
+        opn.shape    = 0;
+        // child_a = root of A (always index 0 by host convention).
+        // child_b = root of B (now at index A.node_count after shift).
+        // BUT the host emits nodes in ascending order with children
+        // earlier than parents, and the root of any sub-tree is the
+        // LAST node in its block. So the root of A is at index
+        // A.node_count - 1, and the root of B is at index
+        // A.node_count + B.node_count - 1.
+        opn.child_a  = A.node_count - 1u;
+        opn.child_b  = A.node_count + B.node_count - 1u;
+        opn.params[0] = k;
+        // op node's center is unused -- zero by default-init.
+        // The op node MUST be the LAST emitted node (the merged tree's
+        // new root) so downstream walkers find the merged result.
+        out_p.node_count = op_idx + 1;
+        out_p.material   = material;
+        out_p.albedo[0]  = r; out_p.albedo[1] = g; out_p.albedo[2] = b;
+        out_p.roughness  = 0.0f;
+        out_p.ior        = 1.5f;
+        if (!pt::renderer::ComputeSdfAabb(out_p)) {
+            out.FormatLine("sdf_{}: AABB computation failed", tag);
+            return;
+        }
+        // Drop the consumed children. Insert the new cluster under the
+        // requested id (overwrite if it collides).
+        sdf_prims_.erase(it_a);
+        sdf_prims_.erase(b_id);
+        sdf_prims_[id]   = out_p;
+        sdf_prims_dirty_ = true;
+        accum_dirty_     = true;
+        LOG_INFO("[sdf] {} id={} (children {}+{}, k={:.3f}) aabb=[{:.2f},{:.2f},{:.2f} .. {:.2f},{:.2f},{:.2f}]",
+                 tag, id, a_id, b_id, k,
+                 out_p.aabb_min[0], out_p.aabb_min[1], out_p.aabb_min[2],
+                 out_p.aabb_max[0], out_p.aabb_max[1], out_p.aabb_max[2]);
+        out.FormatLine("sdf: {} id={} ({} + {}, k={})", tag, id, a_id, b_id, k);
+    };
+
+    C.RegisterCommand("sdf_smin",
+        "sdf_smin <id> <child_a> <child_b> <k> <material> <r> <g> <b>: smooth-union two SDF clusters (k = smoothing radius, metres).",
+        [combine](auto args, pt::console::Output& out) {
+            if (args.size() != 8) { out.PrintLine("usage: sdf_smin <id> <a> <b> <k> <material> <r> <g> <b>"); return; }
+            std::uint32_t id, a, b, mat;
+            float k, cr, cg, cb;
+            if (!ParseUint(args[0], id) || !ParseUint(args[1], a) || !ParseUint(args[2], b) ||
+                !ParseFloat(args[3], k) ||
+                !ParseSdfMaterial(args[4], mat) ||
+                !ParseFloat(args[5], cr) || !ParseFloat(args[6], cg) || !ParseFloat(args[7], cb)) {
+                out.PrintLine("sdf_smin: arg parse failed");
+                return;
+            }
+            combine(id, a, b, k, pt::renderer::SDF_OP_SMOOTH_UNION, mat, cr, cg, cb, out, "smin");
+        });
+
+    C.RegisterCommand("sdf_smax",
+        "sdf_smax <id> <child_a> <child_b> <k> <material> <r> <g> <b>: smooth-intersect two SDF clusters.",
+        [combine](auto args, pt::console::Output& out) {
+            if (args.size() != 8) { out.PrintLine("usage: sdf_smax <id> <a> <b> <k> <material> <r> <g> <b>"); return; }
+            std::uint32_t id, a, b, mat;
+            float k, cr, cg, cb;
+            if (!ParseUint(args[0], id) || !ParseUint(args[1], a) || !ParseUint(args[2], b) ||
+                !ParseFloat(args[3], k) ||
+                !ParseSdfMaterial(args[4], mat) ||
+                !ParseFloat(args[5], cr) || !ParseFloat(args[6], cg) || !ParseFloat(args[7], cb)) {
+                out.PrintLine("sdf_smax: arg parse failed");
+                return;
+            }
+            combine(id, a, b, k, pt::renderer::SDF_OP_SMOOTH_INTERSECT, mat, cr, cg, cb, out, "smax");
+        });
+
+    C.RegisterCommand("sdf_sdiff",
+        "sdf_sdiff <id> <child_a> <child_b> <k> <material> <r> <g> <b>: smooth-subtract child_b from child_a.",
+        [combine](auto args, pt::console::Output& out) {
+            if (args.size() != 8) { out.PrintLine("usage: sdf_sdiff <id> <a> <b> <k> <material> <r> <g> <b>"); return; }
+            std::uint32_t id, a, b, mat;
+            float k, cr, cg, cb;
+            if (!ParseUint(args[0], id) || !ParseUint(args[1], a) || !ParseUint(args[2], b) ||
+                !ParseFloat(args[3], k) ||
+                !ParseSdfMaterial(args[4], mat) ||
+                !ParseFloat(args[5], cr) || !ParseFloat(args[6], cg) || !ParseFloat(args[7], cb)) {
+                out.PrintLine("sdf_sdiff: arg parse failed");
+                return;
+            }
+            combine(id, a, b, k, pt::renderer::SDF_OP_SMOOTH_SUBTRACT, mat, cr, cg, cb, out, "sdiff");
+        });
+}
+// --- end SDF Phase 1 -------------------------------------------------------
 
 }  // namespace pt::engine
