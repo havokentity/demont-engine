@@ -3910,17 +3910,27 @@ void Engine::RenderFrame() {
         // `reset_stars_accum` + 2 trailing pads are set below where
         // the per-frame reset pulse is computed.
     }
-    // Consume the pending star-accum reset pulse. Set by the
-    // accum_stars (re)allocation block above and by r_star_split's
-    // on_change handler (cvar registration site). Routed to its OWN
-    // `reset_stars_accum` push field -- decoupled from `reset_accum`,
-    // which the engine forces to 1 every frame on the denoised path
-    // (so accum_hdr stays 1-frame for the denoiser's own temporal
-    // accumulator). Sharing `reset_accum` for accum_stars caused
-    // per-frame flicker because the stars running mean reset every
-    // frame and frame_stars (1-spp + Halton jitter) became the entire
-    // output. With this gate the EMA converges across frames.
-    push.reset_stars_accum = star_split_reset_pending_ ? 1u : 0u;
+    // Compute the per-dispatch reset pulse for accum_stars. Three
+    // legitimate triggers:
+    //   (1) `star_split_reset_pending_` -- set on accum_stars
+    //       (re)allocation and on r_star_split toggle. Clears history
+    //       that may not match the current texture / cvar state.
+    //   (2) `accum_dirty_` -- set when something happened this frame
+    //       that invalidates per-pixel history for accum_hdr (camera
+    //       motion, sun/sky position change, time-of-day change, etc.).
+    //       The stars EMA accumulates per-pixel star radiance, so it
+    //       has to invalidate on the same triggers -- otherwise the
+    //       previous frame's pixel direction stays glued to the screen
+    //       and you see "stars frozen in place" when the camera pans.
+    //
+    // DECOUPLED from `reset_accum` (which the engine forces to 1 every
+    // frame on the denoised path so accum_hdr stays 1-frame for the
+    // denoiser's own temporal accumulator). Sharing `reset_accum` for
+    // accum_stars caused per-frame flicker because the stars running
+    // mean reset every frame and frame_stars (1-spp + Halton jitter)
+    // became the entire output.
+    push.reset_stars_accum =
+        (star_split_reset_pending_ || accum_dirty_) ? 1u : 0u;
     push._pad_star_split[0] = 0u;
     push._pad_star_split[1] = 0u;
     if (star_split_reset_pending_) {
