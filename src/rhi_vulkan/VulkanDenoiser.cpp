@@ -930,27 +930,45 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
         }
         // Star-split accumulator (issue #46) at finalize binding 4.
         // The shader's additive read is gated on a `stars_present`
-        // push flag, so a null or failed-lookup view is safe: we
-        // fall back to v_output (a guaranteed-valid view in this
-        // function's scope) purely for descriptor-set validity, and
-        // force stars_present = 0 so the shader never actually
-        // samples it -- avoiding both the previous 2x-brightness
-        // feedback hazard AND the previous hard-skip that produced
-        // a black/stale frame. The engine still tries to pass the
-        // real accumulator (or its 1x1 placeholder) so this fallback
-        // is a defence-in-depth path for init/teardown races, not a
-        // first-class no-stars contract.
+        // push flag, so a null or failed-lookup view is safe AS LONG
+        // AS the fallback view is itself a known-safe target (not the
+        // dispatch's own write target). Round-2 fell back to v_output
+        // for descriptor validity; round-3 (this code) replaces that
+        // with the device-owned 1x1 dummy (`dummy_color_id_`, allocated
+        // once at Init for the atrous color_history placeholder slot)
+        // -- same lifetime, same format (RGBA16F), guaranteed not to
+        // be either the read source or the write target of this
+        // dispatch. The shader's `stars_present == 0` gate still
+        // elides the read in this case; the dummy bind is purely
+        // descriptor-set validity. Any future shader edit that adds
+        // an unconditional read of `stars_tex` (e.g. a bloom-on-stars
+        // prepass per follow-up issue #110) will read zeros from the
+        // dummy rather than over-reading the destination HDR.
+        //
+        // The lookup-failure LOG_WARN is rate-limited via a one-shot
+        // latch: per-frame Encode would otherwise spam the log for as
+        // long as a stale-handle race persists. We log on the leading
+        // edge and clear when the lookup next resolves.
         VkImageView v_stars = (stars_in.id != 0) ? device_->LookupImageView(stars_in)
                                                 : VK_NULL_HANDLE;
         bool stars_real = (v_stars != VK_NULL_HANDLE);
         if (!stars_real) {
-            if (stars_in.id != 0) {
+            if (stars_in.id != 0 && !stars_lookup_warn_latched_) {
                 LOG_WARN("VulkanDenoiser: stars_in view lookup failed (id={}); "
-                         "binding output as a safe-but-unread fallback and "
-                         "forcing stars_present=0 (the shader's gate elides "
-                         "the additive read in this case)", stars_in.id);
+                         "binding device-owned 1x1 dummy as a safe-but-unread "
+                         "fallback and forcing stars_present=0 (the shader's "
+                         "gate elides the additive read in this case). "
+                         "Logged once per stale-handle episode.", stars_in.id);
+                stars_lookup_warn_latched_ = true;
             }
-            v_stars = v_output;
+            v_stars = device_->LookupImageView(TextureHandle{dummy_color_id_});
+            // If even the dummy is unavailable (extremely defensive --
+            // dummy is allocated at Init and lives until Shutdown), fall
+            // back to v_output as a last resort. stars_present stays 0
+            // either way so the shader never reads.
+            if (v_stars == VK_NULL_HANDLE) v_stars = v_output;
+        } else if (stars_lookup_warn_latched_) {
+            stars_lookup_warn_latched_ = false;
         }
         if (v_final != VK_NULL_HANDLE && b_exp != VK_NULL_HANDLE) {
             VkDescriptorSet fset = finalize_sets_[next_finalize_set_];
@@ -1107,16 +1125,28 @@ void VulkanNrdDenoiser::EncodeFinalizeOnly(VkCommandBuffer cb,
                                     ? bloom_intensity : 0.0f;
     // Star-split slot (issue #46). The shader's additive read of
     // stars_tex is gated on a `stars_present` push flag, so a null
-    // stars_in_view is safe: we fall back to color_in_view (a known-
-    // valid view in this function's scope) purely for descriptor-set
-    // validity and force stars_present = 0 so the shader never
-    // actually samples it. This degrades the OptiX / bloom-only
-    // finalize callers to "no stars composite" rather than "no frame
-    // at all" -- the previous hard-skip-on-null produced a black or
-    // stale swapchain, which is the symptom the issue-#46 round-2
-    // review flagged.
+    // stars_in_view is safe AS LONG AS the fallback view is itself
+    // a known-safe target. Round-2 fell back to color_in_view for
+    // descriptor validity; round-3 (this code) replaces that with the
+    // device-owned 1x1 dummy (`dummy_color_id_`, allocated once at
+    // Init for the atrous color_history placeholder slot) -- same
+    // lifetime, same format (RGBA16F), guaranteed not to alias either
+    // the read source or the write target of this dispatch. The
+    // shader's `stars_present == 0` gate still elides the read; the
+    // dummy bind is purely descriptor-set validity. Any future shader
+    // edit that adds an unconditional read of `stars_tex` (e.g. a
+    // bloom-on-stars prepass per follow-up issue #110) will read
+    // zeros from the dummy rather than over-reading the source HDR.
     const bool stars_real = (stars_in_view != VK_NULL_HANDLE);
-    VkImageView v_stars   = stars_real ? stars_in_view : color_in_view;
+    VkImageView v_stars   = stars_real ? stars_in_view : VK_NULL_HANDLE;
+    if (!stars_real) {
+        v_stars = device_->LookupImageView(TextureHandle{dummy_color_id_});
+        // Defensive: dummy lives for the denoiser's lifetime, so a
+        // null lookup here would indicate a torn-down denoiser state.
+        // Fall back to color_in_view as a last resort -- stars_present
+        // stays 0 either way so the shader never reads.
+        if (v_stars == VK_NULL_HANDLE) v_stars = color_in_view;
+    }
 
     VkDescriptorSet fset = finalize_sets_[next_finalize_set_];
     next_finalize_set_   = (next_finalize_set_ + 1) % kFinalizeSetRing;

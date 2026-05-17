@@ -3081,16 +3081,14 @@ void Engine::RenderFrame() {
             std::uint16_t zero[4] {0,0,0,0};
             if (dh.id != 0) device_->WriteTexture(dh, zero, sizeof(zero));
         }
-        // Star-split slot: when stars aren't being routed (r_star_split
-        // = 0 or no accum_stars allocated), the shaders skip the
-        // additive read entirely via the `stars_present` push flag.
-        // The descriptor slot itself still needs to resolve to a
-        // valid texture (Metal validation; Vulkan tolerates partially-
-        // bound but we keep both backends on the same path), so the
-        // engine binds the existing 1x1 `bloom_dummy_tex_id_` allocated
-        // above as a safe placeholder. No additional allocation is
-        // required, and the previous swapchain-sized ~16 MB zero-fill
-        // companion has been retired in favour of the push gate.
+        // Star-split slot (issue #46): reuses the 1x1 bloom_dummy
+        // allocated above as a placeholder when stars aren't routed.
+        // Actual BindStorageTexture calls live at the PathTrace
+        // dispatch site (search for `BindStorageTexture(10,`) and the
+        // Metal Tonemap dispatch site (search for
+        // `BindStorageTexture(3,` near `tonemap_stars_present`); the
+        // shader's `stars_present` push gate elides the read when
+        // the placeholder is bound.
     }
 
     auto* cb = device_->AcquireCommandBuffer();

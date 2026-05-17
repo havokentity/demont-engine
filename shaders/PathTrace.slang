@@ -1863,21 +1863,25 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     // contribution is small enough that denoiser
                     // smudging is invisible there.
                     //
-                    // We compute stars_only once via starsAtPrimaryMiss
-                    // and subtract it from sky_full BEFORE the
-                    // throughput multiply, so the legacy and split
-                    // branches differ by exactly `throughput *
-                    // stars_only` instead of relying on the algebraic
-                    // identity `T*(A+S) - T*S == T*A` (which is not
-                    // bit-identical in fp16 storage paths). Also keeps
-                    // a single source of truth for the star sampling
-                    // logic -- a future change inside procSky's star
-                    // contribution would propagate through both
-                    // sides via starsAtPrimaryMiss without manual
-                    // re-syncing.
-                    float3 sky_full   = skyColor(rd);
-                    float3 stars_only = starsAtPrimaryMiss(rd);
+                    // Gate the starsAtPrimaryMiss() call on
+                    // star_split_active so the legacy branch (cvar
+                    // off, denoiser off, etc.) doesn't pay for the
+                    // starmap sample + per-cell hash work whose
+                    // result it would just discard. The split branch
+                    // computes stars_only once and subtracts it from
+                    // sky_full BEFORE the throughput multiply, so the
+                    // active and legacy paths differ by exactly
+                    // `throughput * stars_only` instead of relying on
+                    // the algebraic identity `T*(A+S) - T*S == T*A`
+                    // (which is not bit-identical in fp16 storage
+                    // paths). Also keeps a single source of truth for
+                    // the star sampling logic on the active path -- a
+                    // future change inside procSky's star contribution
+                    // would propagate through both sides via
+                    // starsAtPrimaryMiss without manual re-syncing.
+                    float3 sky_full = skyColor(rd);
                     if (star_split_active) {
+                        float3 stars_only = starsAtPrimaryMiss(rd);
                         frame_stars += throughput * stars_only;
                         radiance    += throughput * (sky_full - stars_only);
                     } else {
