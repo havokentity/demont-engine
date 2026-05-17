@@ -147,3 +147,272 @@ endif()
 pt_add_test(pt_core_analytic_bvh
     pt_core_analytic_bvh_test.cpp
     LINK_TARGETS pt_renderer)
+
+# ============================================================================
+# Golden-image regression matrix (issue #45)
+# ============================================================================
+#
+# Each cell here renders one frame headlessly via pt_render_one_frame
+# (which fork+exec's demont with --smoke-frames= + --smoke-exec= +
+# --smoke-capture-out=), then diff's the resulting PNG against a stored
+# golden via the imgdiff CLI. Per-cell tolerance lives on the imgdiff
+# invocation -- pixel-correct goldens use --max-delta 0; stochastic-
+# noise-floored goldens use --max-delta / --mean-delta / --fail-percent
+# sized to the cell's known variance.
+#
+# Layout:
+#   tests/goldens/scenes/<scene>.cfg                       -- fixture
+#   tests/goldens/<host>/<scene>__<backend>__<denoiser>.png-- golden
+#   <build>/golden_actual/<scene>__<backend>__<denoiser>.png -- actual
+#   <build>/golden_diff/<scene>__<backend>__<denoiser>.png   -- diff
+#
+# `<host>` is one of Darwin / Linux / Windows -- CMAKE_SYSTEM_NAME
+# values. Goldens are host-specific because (a) Metal exists only on
+# Darwin; (b) ULPs across architectures + driver versions add small
+# host-correlated bias to floating-point reductions; (c) keeping
+# host-baselines separate makes "regenerate on this host only" the
+# safe default. See `Raytracer Plan/TESTING_STRATEGY.md` for the
+# "how to add a cell" / "how to regenerate goldens" workflow.
+#
+# Per coordination note in the issue: this block is intentionally
+# under its own banner so parallel agent branches appending other
+# pt_add_test(...) blocks at the end of this file rebase cleanly.
+
+# MVP cut: 1 scene x 3 backends x 1 denoiser = 3 cells. The matrix
+# expands later (see "Add a cell" in TESTING_STRATEGY.md) -- the
+# helper below is generic over (scene, backend, denoiser).
+#
+# The function name is pt_add_golden_cell -- each call registers
+# *two* ctest tests: `${_cell_name}_render` (runs the harness) and
+# `${_cell_name}_diff` (runs imgdiff vs the committed golden; the
+# diff DEPENDS on the render so ctest serialises them per cell).
+# Cells are skipped (NOT registered) on hosts where their backend
+# isn't available: Metal cells only register on Darwin; Vulkan cells
+# only register if PT_ENABLE_VULKAN_BACKEND is ON; Software cells
+# only register on APPLE or WIN32 (rhi_software is gated to those
+# platforms in src/rhi/CMakeLists.txt -- no SetDIBitsToDevice analog
+# implemented for Linux yet). This matches the runtime gate the
+# engine already has.
+#
+# The host (Darwin/Linux/Windows) is also pulled from
+# CMAKE_SYSTEM_NAME so the golden path is build-target-derived, not
+# host-machine-derived. Cross-builds (rare in this repo) get the
+# target's host directory, matching what their runtime would produce.
+function(pt_add_golden_cell)
+    set(_options)
+    set(_oneval SCENE BACKEND DENOISER FRAMES SPP MAX_DELTA MEAN_DELTA FAIL_PERCENT)
+    set(_multival EXTRA)
+    cmake_parse_arguments(PT_CELL "${_options}" "${_oneval}" "${_multival}" ${ARGN})
+
+    # Required args -- fail at configure time if a caller forgets one.
+    # Use STREQUAL "" instead of `NOT VAR` because the denoiser
+    # short-form `off` is a CMake-falsy string (same trap as the
+    # boolean-coercion rules around OFF / NO / FALSE). STREQUAL "" only
+    # matches a genuinely unset / empty variable.
+    foreach(_req SCENE BACKEND DENOISER)
+        if("${PT_CELL_${_req}}" STREQUAL "")
+            message(FATAL_ERROR
+                "pt_add_golden_cell: SCENE/BACKEND/DENOISER are all required "
+                "(missing ${_req})")
+        endif()
+    endforeach()
+
+    # Skip cells whose backend isn't compiled in. The wrapper would
+    # fail at runtime anyway (engine rejects an unknown r_backend);
+    # skipping at configure time keeps the ctest run clean.
+    if(PT_CELL_BACKEND STREQUAL "metal" AND NOT APPLE)
+        return()
+    endif()
+    if(PT_CELL_BACKEND STREQUAL "vulkan" AND NOT PT_ENABLE_VULKAN_BACKEND)
+        return()
+    endif()
+    # rhi_software is gated to APPLE OR WIN32 in src/rhi/CMakeLists.txt
+    # (no SetDIBitsToDevice analog implemented for Linux). Registering
+    # a software cell on Linux would fail at runtime when the engine
+    # rejects r_backend software; skip it at configure time.
+    if(PT_CELL_BACKEND STREQUAL "software" AND NOT (APPLE OR WIN32))
+        return()
+    endif()
+
+    # Defaults. cmake_parse_arguments leaves variables undefined when
+    # the caller doesn't pass the corresponding flag, so `NOT VAR`
+    # evaluates true and the default fires.
+    #
+    # FRAMES default 64: at r_spp=1 the path-tracer accumulator's
+    # noise floor is well below the 16-L2 per-pixel + 2-L2 mean +
+    # 1%-bad-pixel imgdiff thresholds. Empirical measurement on the
+    # cornell_csg scene: at 8 frames the Metal backend has ~3.4%
+    # bad pixels between identical runs (HW-RT BLAS build entropy);
+    # at 64 frames the noise floor settles below imgdiff's
+    # quantisation. CI runners on the macos-26 image use a
+    # paravirtualised GPU that's slower than a real M-series, so
+    # 64 frames at 512x384 is still under a few seconds per cell.
+    # Use `NOT DEFINED` (not `NOT VAR`) so a caller passing the
+    # numeric `0` -- which CMake treats as boolean-false in the
+    # `NOT VAR` form -- actually takes effect. Without this, the
+    # documented `--max-delta 0` style pixel-exact cell would
+    # silently get the default (16) instead of zero tolerance.
+    # cmake_parse_arguments leaves the variable UNDEFINED when the
+    # caller doesn't pass the corresponding flag, so DEFINED is the
+    # right "did the caller provide a value?" signal.
+    if(NOT DEFINED PT_CELL_FRAMES)
+        set(PT_CELL_FRAMES 64)
+    endif()
+    if(NOT DEFINED PT_CELL_MAX_DELTA)
+        set(PT_CELL_MAX_DELTA 16)
+    endif()
+    if(NOT DEFINED PT_CELL_MEAN_DELTA)
+        set(PT_CELL_MEAN_DELTA 2)
+    endif()
+    if(NOT DEFINED PT_CELL_FAIL_PERCENT)
+        set(PT_CELL_FAIL_PERCENT 1)
+    endif()
+
+    set(_host        ${CMAKE_SYSTEM_NAME})
+    set(_cell_name   golden_${PT_CELL_SCENE}__${PT_CELL_BACKEND}__${PT_CELL_DENOISER})
+    set(_scene_cfg   ${CMAKE_SOURCE_DIR}/tests/goldens/scenes/${PT_CELL_SCENE}.cfg)
+    set(_golden_png  ${CMAKE_SOURCE_DIR}/tests/goldens/${_host}/${PT_CELL_SCENE}__${PT_CELL_BACKEND}__${PT_CELL_DENOISER}.png)
+    set(_actual_png  ${CMAKE_BINARY_DIR}/golden_actual/${PT_CELL_SCENE}__${PT_CELL_BACKEND}__${PT_CELL_DENOISER}.png)
+    set(_diff_png    ${CMAKE_BINARY_DIR}/golden_diff/${PT_CELL_SCENE}__${PT_CELL_BACKEND}__${PT_CELL_DENOISER}.png)
+    # Per-cell working directory. The engine reads demont.cfg /
+    # autoexec.cfg from CWD before applying the smoke-exec fixture, so
+    # using a shared CWD (e.g. CMAKE_BINARY_DIR) would let an archived
+    # cvar from a previous cell or session leak into the baseline.
+    # Per-cell CWD isolates one cell from another within a ctest run;
+    # the wrapper (`pt_render_one_frame/main.cpp`) additionally
+    # removes `demont.cfg` and `autoexec.cfg` from its CWD before
+    # invoking demont, so archived cvars from a previous run cannot
+    # leak across runs either.
+    set(_cell_workdir ${CMAKE_BINARY_DIR}/golden_workdir/${_cell_name})
+
+    # Pre-create the actual / diff output directories. imgdiff writes
+    # the diff PNG via stb_image_write which doesn't auto-create parent
+    # dirs; the smoke-capture in pt_render_one_frame's child does
+    # create_directories on its own, but doing both here keeps the
+    # behaviour symmetric + lets a contributor run the imgdiff cell
+    # in isolation against a stale actual from a previous run.
+    file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/golden_actual)
+    file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/golden_diff)
+    file(MAKE_DIRECTORY ${_cell_workdir})
+
+    # Build the pt_render_one_frame argument list. Spp / extra are
+    # optional pass-throughs.
+    set(_render_args
+        --scene    ${_scene_cfg}
+        --backend  ${PT_CELL_BACKEND}
+        --denoiser ${PT_CELL_DENOISER}
+        --frames   ${PT_CELL_FRAMES}
+        --out      ${_actual_png})
+    if(PT_CELL_SPP)
+        list(APPEND _render_args --spp ${PT_CELL_SPP})
+    endif()
+    if(PT_CELL_EXTRA)
+        string(REPLACE ";" "\n" _extra_joined "${PT_CELL_EXTRA}")
+        list(APPEND _render_args --extra ${_extra_joined})
+    endif()
+
+    # Two-step ctest cell: a `_render` test runs pt_render_one_frame
+    # (which fork+exec's demont) to produce the actual PNG under
+    # build/golden_actual/, and a separate `_diff` test (DEPENDS on
+    # `_render`) runs imgdiff against the host's stored golden. Two
+    # tests instead of one chained recipe because (a) ctest's parallel
+    # scheduler can serialise the diff after the render via DEPENDS,
+    # and (b) on diff failure ctest shows which side failed without
+    # the operator having to read a shell pipe.
+    #
+    # imgdiff thresholds: per-pixel L2 above MAX_DELTA classifies a
+    # pixel as "bad"; >FAIL_PERCENT% of bad pixels OR a mean L2 above
+    # MEAN_DELTA fails the cell. Default thresholds (16 / 2 / 1) leave
+    # room for backend-specific FP nondeterminism (e.g. fma ordering
+    # across drivers) without hiding real shader regressions, which
+    # typically shift much more than 16 L2 over thousands of pixels.
+    #
+    # Missing-golden handling: when this host has no committed golden,
+    # the `_diff` test fires the `tests/missing_golden.cmake` -P script
+    # which exits non-zero with a regen hint. WILL_FAIL TRUE on the
+    # test inverts that to PASS, so a missing-golden cell prints the
+    # regen hint to the maintainer without breaking ctest as a whole.
+    # See `Raytracer Plan/TESTING_STRATEGY.md` for the regen workflow.
+    add_test(NAME ${_cell_name}_render
+        COMMAND $<TARGET_FILE:pt_render_one_frame> ${_render_args}
+        WORKING_DIRECTORY ${_cell_workdir})
+    set_tests_properties(${_cell_name}_render PROPERTIES
+        TIMEOUT 120
+        LABELS  "golden;golden_${PT_CELL_BACKEND}")
+
+    if(EXISTS ${_golden_png})
+        add_test(NAME ${_cell_name}_diff
+            COMMAND $<TARGET_FILE:imgdiff>
+                ${_actual_png}
+                ${_golden_png}
+                --max-delta    ${PT_CELL_MAX_DELTA}
+                --mean-delta   ${PT_CELL_MEAN_DELTA}
+                --fail-percent ${PT_CELL_FAIL_PERCENT}
+                --diff         ${_diff_png}
+            WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+        set_tests_properties(${_cell_name}_diff PROPERTIES
+            TIMEOUT 30
+            DEPENDS ${_cell_name}_render
+            LABELS  "golden;golden_${PT_CELL_BACKEND}")
+    else()
+        # Missing-golden cell: drive a -P CMake script that prints the
+        # regen hint then exits non-zero (via FATAL_ERROR). WILL_FAIL
+        # inverts the non-zero exit to PASS so the missing-golden state
+        # is surfaced to the maintainer without breaking ctest.
+        #
+        # Configure-time STATUS message duplicates the regen hint so
+        # maintainers see it in `cmake --preset ...` output too --
+        # under ctest's `--output-on-failure`, a WILL_FAIL-passes test
+        # does not print its captured output, so the in-test
+        # `message(FATAL_ERROR ...)` text is hidden from CI logs.
+        # The configure-time STATUS always appears.
+        message(STATUS
+            "tests: missing golden on this host -- ${_golden_png}\n"
+            "       Regenerate with:\n"
+            "         ctest --test-dir <build> -R ^${_cell_name}_render$\n"
+            "         cmake -E make_directory \"${CMAKE_SOURCE_DIR}/tests/goldens/${_host}\"\n"
+            "         cmake -E copy \"${_actual_png}\" \"${_golden_png}\"")
+        add_test(NAME ${_cell_name}_diff
+            COMMAND ${CMAKE_COMMAND}
+                -DGOLDEN=${_golden_png}
+                -DCELL=${_cell_name}
+                -DACTUAL=${_actual_png}
+                -P ${CMAKE_SOURCE_DIR}/tests/missing_golden.cmake)
+        set_tests_properties(${_cell_name}_diff PROPERTIES
+            WILL_FAIL TRUE
+            DEPENDS   ${_cell_name}_render
+            LABELS    "golden;golden_${PT_CELL_BACKEND};golden_missing")
+    endif()
+endfunction()
+
+# --- MVP cells --------------------------------------------------------------
+# 1 scene (cornell_csg) x 3 backends (software/metal/vulkan) x 1
+# denoiser (off).
+#
+# CI mapping today (.github/workflows/build.yml uses `-L golden_software`
+# on both the macOS and Windows lanes): the hosted GitHub runners do
+# not have GPUs that survive Metal / Vulkan init reliably -- the macOS
+# runner ships a paravirtualised Apple-GPU, and the Windows lane runs
+# on a generic VM without an NVIDIA / AMD ICD -- so CI exercises the
+# software backend on both. Metal and Vulkan cells still REGISTER on
+# Mac (so a local `ctest` against a real M-series picks them up) and
+# the matrix expands cleanly to real hardware once a self-hosted
+# runner with a GPU shows up. Each host's CI step filters via the
+# `golden_software` label; other ctest LABELS (`golden`,
+# `golden_metal`, `golden_vulkan`, `golden_missing`) are for local /
+# future use.
+#
+# pt_add_golden_cell expands `$<TARGET_FILE:pt_render_one_frame>` and
+# `$<TARGET_FILE:imgdiff>` at generate time; both targets only exist
+# when PT_BUILD_TOOLS=ON. Skip the matrix registration entirely when
+# they're absent so a `PT_BUILD_TESTS=ON, PT_BUILD_TOOLS=OFF` configure
+# succeeds. The doctest unit tests above don't depend on the tools.
+if(TARGET pt_render_one_frame AND TARGET imgdiff)
+    pt_add_golden_cell(SCENE cornell_csg BACKEND software DENOISER off)
+    pt_add_golden_cell(SCENE cornell_csg BACKEND metal    DENOISER off)
+    pt_add_golden_cell(SCENE cornell_csg BACKEND vulkan   DENOISER off)
+else()
+    message(STATUS
+        "tests: golden-image matrix skipped -- pt_render_one_frame and/or "
+        "imgdiff targets unavailable (PT_BUILD_TOOLS=OFF?)")
+endif()

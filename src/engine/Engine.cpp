@@ -102,6 +102,50 @@ namespace cvar {
             "is ready. NOT CVAR_ARCHIVE -- per-invocation knob, never "
             "persisted to demont.cfg.",
             CVAR_NONE);
+    // Golden-image regression matrix support (issue #45). pt_smoke_exec
+    // points at a console-script fixture file (e.g.
+    // tests/goldens/scenes/cornell_csg.cfg) that's exec'd right after
+    // demont.cfg + autoexec.cfg + --<cvar>= CLI overrides but BEFORE
+    // the backend boots. Scope at this exec point: cvar writes only --
+    // camera pose, sun, path-tracer knobs, denoiser, spp, exposure,
+    // capture format/seed, app_window_* (consumed at window creation
+    // below). CSG console commands (`csg_*`) and analytic-primitive
+    // commands are out of scope here because `csg_scene_` +
+    // `SeedDefaultPrimitives()` haven't run yet; see the
+    // TODO(#45-followup) at the call site for a planned late-phase
+    // exec to widen the supported command set.
+    // pt_smoke_capture_out is the destination PNG path for the final
+    // frame written at the end of the smoke run; engine does a
+    // synchronous readback into this path right before tearing the
+    // device down so ctest cells can diff it against a stored golden
+    // via the imgdiff CLI (PR #92). Both are per-invocation knobs, not
+    // archived to demont.cfg, set via the --smoke-exec= /
+    // --smoke-capture-out= CLI overrides plumbed through
+    // ApplyCommandLineCvarOverrides. Empty string = disabled.
+    PT_CVAR(pt_smoke_exec, "",
+            "Path to a console-script .cfg fixture exec'd at engine "
+            "start, after demont.cfg + autoexec.cfg + --<cvar>= CLI "
+            "overrides. Used by the golden-image regression matrix "
+            "(issue #45) to lock down per-cell CVAR state (camera, sun, "
+            "path-tracer knobs, exposure, capture seed, app_window_*). "
+            "CSG console commands (csg_box / csg_sphere / csg_op / "
+            "csg_reset / etc.) are NOT supported at this exec point "
+            "today -- csg_scene_ + SeedDefaultPrimitives have not run "
+            "yet, and several of those handlers dereference csg_scene_ "
+            "before checking it. Typically set via "
+            "--smoke-exec=tests/goldens/scenes/cornell_csg.cfg. "
+            "Empty = no fixture. NOT CVAR_ARCHIVE -- per-invocation.",
+            CVAR_NONE);
+    PT_CVAR(pt_smoke_capture_out, "",
+            "Destination PNG path for the final smoke-mode frame. Set "
+            "via --smoke-capture-out=path. After pt_smoke_frames render "
+            "iterations the engine does a synchronous ReadbackTexture "
+            "of accum/denoise_color (same source-of-truth picker as "
+            "FrameCapture / `screenshot`), tonemaps host-side with "
+            "ACES + sRGB OETF, and writes a PNG to this path. Used by "
+            "the golden-image regression matrix (issue #45). Empty = "
+            "no capture. NOT CVAR_ARCHIVE -- per-invocation.",
+            CVAR_NONE);
     PT_CVAR(con_font_scale, "1.0",
             "Console overlay font scale. 1.0 = baseline (14 logical-unit "
             "CreateFontW height on Win32; 13/12/9 pt input/output/status "
@@ -557,6 +601,66 @@ bool Engine::Init() {
     // (--net-port / --net-line-port); other --<cvar>=<value> args can
     // be added inside ApplyCommandLineCvarOverrides as needed.
     ApplyCommandLineCvarOverrides();
+
+    // Golden-image regression matrix (issue #45) fixture exec. Runs
+    // AFTER CLI overrides so the --smoke-exec=path flag has populated
+    // pt_smoke_exec, and BEFORE the device boots so the fixture's cvar
+    // writes (r_spp, r_max_bounces, camera pose, sun position,
+    // app_window_*, r_capture_*, etc.) take effect during window
+    // creation + first frame.
+    //
+    // Scope at THIS exec point: cvar writes only. CSG console commands
+    // (`csg_box`, `csg_sphere`, `csg_cylinder`, `csg_op`, `csg_reset`,
+    // `csg_remove`, `csg_dump`) are out of scope here -- `csg_scene_`
+    // is not constructed and `SeedDefaultPrimitives()` has not run yet
+    // (see the section below where both happen). And worse than silent:
+    // several of the csg_* handlers dereference `csg_scene_` directly
+    // before checking it, so a fixture that calls them at this point
+    // would *crash* the engine, not no-op. The strict failure path
+    // below catches that as a fixture parse/exec failure.
+    // TODO(#45-followup): add a second exec pass after
+    // SeedDefaultPrimitives() so CSG-touching fixtures work properly.
+    //
+    // Strict failure mode (unlike demont.cfg / autoexec.cfg above):
+    // a smoke-exec fixture that can't be read or that produces a
+    // parse error aborts Init -- demont returns non-zero, the wrapper
+    // emits kExitSpawnError, the ctest `_render` cell fails. Silently
+    // rendering against a half-applied fixture would surface as a
+    // confusing pixel diff at best, or get committed as a bogus
+    // baseline at regen time at worst.
+    //
+    // Same cfg_loading_ guard as demont.cfg/autoexec.cfg so astronomy
+    // on_change warnings stay suppressed during fixture load.
+    if (auto* sx = C.FindCVar("pt_smoke_exec"); sx != nullptr && !sx->value.empty()) {
+        FILE* sf = std::fopen(sx->value.c_str(), "rb");
+        if (sf == nullptr) {
+            LOG_ERROR("pt_smoke_exec: '{}' not found", sx->value);
+            cfg_loading_ = false;
+            return false;
+        }
+        std::string sbody; char sbuf[4096];
+        while (auto sn = std::fread(sbuf, 1, sizeof(sbuf), sf)) sbody.append(sbuf, sn);
+        // fopen succeeds on a directory on POSIX, but fread on a
+        // directory returns 0 with ferror() set. Without this check we
+        // would run ExecuteScript on an empty body and silently render
+        // the engine default instead of the intended fixture -- the
+        // exact "confusing pixel diff later" failure mode this fail-fast
+        // path is meant to prevent.
+        const bool sread_err = (std::ferror(sf) != 0);
+        std::fclose(sf);
+        if (sread_err) {
+            LOG_ERROR("pt_smoke_exec '{}': read error", sx->value);
+            cfg_loading_ = false;
+            return false;
+        }
+        auto sr = pt::console::Console::Get().ExecuteScript(sbody);
+        if (!sr.ok) {
+            LOG_ERROR("pt_smoke_exec '{}': {}", sx->value, sr.error);
+            cfg_loading_ = false;
+            return false;
+        }
+        LOG_INFO("loaded smoke-exec fixture {}", sx->value);
+    }
     cfg_loading_ = false;
 
     // Post-cfg-load astronomy-mode audit. If astro is off after cfg +
@@ -759,6 +863,15 @@ void Engine::ApplyCommandLineCvarOverrides() {
         // {none, software, metal, vulkan}).
         { "--smoke-frames=",  "pt_smoke_frames" },
         { "--r-backend=",     "r_backend"     },
+        // Golden-image regression matrix wiring (issue #45). Both
+        // flags are pure pass-through to their backing cvars; cvar
+        // help text covers the semantics. Engine::Run reads them on
+        // loop start, the post-budget hook performs the readback +
+        // PNG write. Empty value (no `=` payload) is rejected by the
+        // shared empty-check above so `--smoke-exec=` with no path
+        // doesn't silently disable the override.
+        { "--smoke-exec=",         "pt_smoke_exec"        },
+        { "--smoke-capture-out=",  "pt_smoke_capture_out" },
     };
 
     for (int i = 1; i < argc_; ++i) {
@@ -4988,6 +5101,126 @@ void Engine::Run() {
         }
     }
     LOG_INFO("Run loop exited.");
+
+    // Golden-image regression matrix (issue #45) final-frame capture.
+    // Fires when smoke mode hit its budget cleanly (smoke_test_failed_
+    // is still false) AND the operator gave a --smoke-capture-out=path.
+    // Done synchronously here, AFTER the loop exited (last RenderFrame
+    // has presented) but BEFORE Shutdown -> TearDownDevice releases
+    // the GPU textures we're about to read back from.
+    //
+    // Source-texture pick mirrors FrameCapture's MaybeCapture hook:
+    // denoise_color when a denoiser is active, accum otherwise. Same
+    // host-side ACES + sRGB OETF as the screenshot command / PR #94's
+    // CaptureEncoder, so the PNG written here matches what a golden
+    // captured via `screenshot path.png accum` would produce -- the
+    // matrix can mix-and-match generation paths.
+    if (smoke_frame_budget > 0 &&
+        !smoke_test_failed_ &&
+        smoke_frames_rendered >= smoke_frame_budget &&
+        device_ != nullptr) {
+        std::string out_path;
+        if (auto* cv = pt::console::Console::Get().FindCVar("pt_smoke_capture_out");
+            cv != nullptr) {
+            out_path = cv->value;
+        }
+        if (!out_path.empty()) {
+            // Same source-of-truth picker as the post-present FrameCapture
+            // hook in RenderFrame: when a denoiser is on, capture its
+            // *output* image (post_denoise_hdr_tex_id_); otherwise the
+            // path tracer's accum_hdr. Reading denoise_color_tex_id_
+            // when a denoiser is active would capture the denoiser's
+            // INPUT (path tracer's per-frame write) and produce
+            // bitwise-identical PNGs across svgf_atrous / optix_hdr /
+            // optix_hdr_aov -- defeating the whole point of a
+            // (backend, denoiser, scene) matrix.
+            const auto kind = denoiser_active_
+                ? pt::engine::CaptureSourceKind::DenoiseColor
+                : pt::engine::CaptureSourceKind::Accum;
+            const std::uint64_t tex_id = denoiser_active_
+                ? post_denoise_hdr_tex_id_
+                : accum_texture_id_;
+            const int bytes_per_pixel = denoiser_active_ ? 8 : 16;  // half / float
+
+            // Drain in-flight work so the readback sees the last frame's
+            // submitted writes, not an in-progress dispatch.
+            device_->WaitIdle();
+
+            if (tex_id == 0) {
+                LOG_ERROR("smoke-capture: requested source texture is not "
+                          "allocated (denoiser_active={} tex_id=0). "
+                          "Failing the smoke test (exit code 2).",
+                          denoiser_active_);
+                smoke_test_failed_ = true;
+            } else if (accum_w_ <= 0 || accum_h_ <= 0) {
+                LOG_ERROR("smoke-capture: invalid render extent {}x{} "
+                          "-- backend never produced a real frame. "
+                          "Failing the smoke test (exit code 2).",
+                          accum_w_, accum_h_);
+                smoke_test_failed_ = true;
+            } else {
+                std::vector<std::uint8_t> raw(
+                    std::size_t(accum_w_) * accum_h_ * bytes_per_pixel);
+                std::uint32_t rb_w = 0, rb_h = 0;
+                if (!device_->ReadbackTexture(pt::rhi::TextureHandle{tex_id},
+                                              raw.data(), raw.size(),
+                                              &rb_w, &rb_h) ||
+                    rb_w == 0 || rb_h == 0) {
+                    LOG_ERROR("smoke-capture: ReadbackTexture failed "
+                              "(tex_id={}, {}x{}). Failing the smoke "
+                              "test (exit code 2).",
+                              tex_id, accum_w_, accum_h_);
+                    smoke_test_failed_ = true;
+                } else {
+                    // Resolve the live exposure scalar so the host-side
+                    // tonemap matches what was on-screen. Same fallback
+                    // path FrameCapture uses: live readback when the
+                    // exposure_state buffer exists, manual r_exposure
+                    // value otherwise.
+                    float exposure_fallback = 1.0f;
+                    if (auto* ev = pt::console::Console::Get()
+                                       .FindCVar("r_exposure")) {
+                        exposure_fallback = ev->GetFloat();
+                    }
+                    float exposure = exposure_fallback;
+                    if (exposure_state_id_ != 0) {
+                        float v = exposure_fallback;
+                        if (device_->ReadbackBuffer(
+                                pt::rhi::BufferHandle{exposure_state_id_},
+                                &v, sizeof(float))) {
+                            exposure = v;
+                        }
+                    }
+
+                    // Parent dir is created here rather than relying on
+                    // operator-supplied conventions; ctest cells write
+                    // into ${CMAKE_CURRENT_BINARY_DIR}/golden_actual/...
+                    // which doesn't pre-exist on a fresh build.
+                    std::filesystem::path png_path(out_path);
+                    if (png_path.has_parent_path()) {
+                        std::error_code ec;
+                        std::filesystem::create_directories(
+                            png_path.parent_path(), ec);
+                    }
+
+                    const bool ok = pt::engine::capture::EncodeAndWritePng(
+                        png_path, raw, rb_w, rb_h, kind, exposure);
+                    if (!ok) {
+                        LOG_ERROR("smoke-capture: EncodeAndWritePng failed "
+                                  "for '{}'. Failing the smoke test "
+                                  "(exit code 2).", png_path.string());
+                        smoke_test_failed_ = true;
+                    } else {
+                        LOG_INFO("smoke-capture: wrote {} ({}x{}, "
+                                 "source={}, exposure={:.3f})",
+                                 png_path.string(), rb_w, rb_h,
+                                 denoiser_active_ ? "denoise_color" : "accum_hdr",
+                                 exposure);
+                    }
+                }
+            }
+        }
+    }
 
     // Final smoke-test verdict for the "exit before budget" cancellation
     // case. wants_quit_ alone is ambiguous -- it can be set by:

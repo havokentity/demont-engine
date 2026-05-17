@@ -82,11 +82,77 @@ jobs:
       - name: Unit tests (ctest)
         # Phase 1 test harness (issue #47). Runs every doctest-based
         # test registered via tests/CMakeLists.txt -- harness_smoke
-        # canary + cvar_roundtrip today, more module tests as the
-        # rollout phases land. --output-on-failure prints the doctest
-        # report inline when a test fails so the CI log shows what
-        # broke without an extra artefact download.
-        run: ctest --test-dir build/mac-debug --output-on-failure
+        # canary + cvar_roundtrip + imgdiff_test + capture_format
+        # today, more module tests as the rollout phases land.
+        # --output-on-failure prints the doctest report inline when
+        # a test fails so the CI log shows what broke without an
+        # extra artefact download.
+        #
+        # The golden-image regression matrix (#45) cells are excluded
+        # here (-LE golden) and run in a dedicated step below so a
+        # render failure produces a downloadable PNG artefact instead
+        # of just a log line.
+        run: ctest --test-dir build/mac-debug --output-on-failure -LE golden
+
+      # Golden-image regression matrix (#45) -- software backend only.
+      # Metal + Vulkan cells exist in the matrix (one per primary host)
+      # but are deliberately skipped on GH-hosted Mac runners because
+      # the macos-26 image has only a paravirtualised GPU without
+      # reliable hardware ray tracing, which the Metal CSG path
+      # requires. Software backend uses Embree on the CPU and runs
+      # everywhere. The Metal + Vulkan cells stay registered with
+      # ctest so a self-hosted Mac runner (future) or a developer's
+      # local box catches them; -L golden_software filters to the
+      # subset that's safe here.
+      - name: Golden-image regression matrix (software cell)
+        # `|| true` lets the upload step below still run when the
+        # cell fails; the step's own exit code is what fails the
+        # job. Actual implementation: `set +e` then capture the rc.
+        #
+        # Clear `golden_actual/` + `golden_diff/` before invoking
+        # ctest so a render that crashes before producing a fresh
+        # PNG can't leave the always-uploaded artifact populated
+        # with stale images from a previous cached-build run. The
+        # cache key includes CMakeLists / cmake/* / preset hash but
+        # NOT the source files, so stale PNGs are a real hazard.
+        id: goldens
+        run: |
+          # Clear stale PNGs from the cached build dir but recreate
+          # the parent directories: imgdiff writes via stb_image_write
+          # which doesn't auto-mkdir, and the configure-time
+          # `file(MAKE_DIRECTORY)` only fires on a fresh cmake configure.
+          rm -rf build/mac-debug/golden_actual build/mac-debug/golden_diff
+          mkdir -p build/mac-debug/golden_actual build/mac-debug/golden_diff
+          set +e
+          ctest --test-dir build/mac-debug --output-on-failure -L golden_software
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+          true
+
+      - name: Upload golden-image diff artefacts
+        # On failure (any golden_<...>_diff cell tripped above), the
+        # build dir contains the diff PNGs heat-mapping where the
+        # render diverged from the committed golden. Upload so a
+        # reviewer can eyeball without re-running CI. if: always()
+        # so a successful cell uploads its (likely empty) diff dir
+        # too -- not strictly needed but keeps the step idempotent.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: goldens-macos
+          path: |
+            build/mac-debug/golden_actual/
+            build/mac-debug/golden_diff/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Fail job if golden cell failed
+        # The `goldens` step above swallowed its own rc into the
+        # output so the upload step could run unconditionally. This
+        # step propagates the real outcome to the job's exit code.
+        if: steps.goldens.outputs.rc != '0'
+        run: |
+          echo "::error::Golden-image cell failed (rc=${{ steps.goldens.outputs.rc }}); see goldens-macos artefact."
+          exit "${{ steps.goldens.outputs.rc }}"
 
       # Backend smoke tests (`demont --smoke-frames=N --r-backend=X`)
       # intentionally NOT run on the GH-hosted runner. The standard
@@ -104,6 +170,10 @@ jobs:
       # hardware when validating a backend:
       #   ./build/mac-debug/src/app/demont --smoke-frames=8 --r-backend=metal
       #   ./build/mac-debug/src/app/demont --smoke-frames=8 --r-backend=vulkan
+      # or end-to-end via the golden harness:
+      #   ./build/mac-debug/tools/pt_render_one_frame/pt_render_one_frame \
+      #     --scene tests/goldens/scenes/cornell_csg.cfg --backend metal \
+      #     --denoiser off --frames 64 --out /tmp/out.png
 
   windows:
     name: Windows (NVIDIA RTX target)
@@ -156,9 +226,57 @@ jobs:
         run: cmake --build build/win-debug --parallel
 
       - name: Unit tests (ctest)
-        # See mac-debug job above for rationale.
+        # See mac-debug job above for rationale. Golden cells are
+        # excluded here and run in their own step so a render failure
+        # produces a downloadable PNG artefact.
         shell: pwsh
-        run: ctest --test-dir build/win-debug --output-on-failure
+        run: ctest --test-dir build/win-debug --output-on-failure -LE golden
+
+      # Golden-image regression matrix (#45) -- software backend
+      # only. The Windows runner has no usable Vulkan ICD beyond
+      # validation-layer headers, so the vulkan cell would init-fail
+      # the same way the smoke tests would. Software runs via Embree
+      # on the CPU and works on every host.
+      - name: Golden-image regression matrix (software cell)
+        # Pre-clean stale golden_actual/diff PNGs from a cached build
+        # so a render crash can't leave the always-uploaded artifact
+        # populated with a previous run's images. Matches the macOS
+        # job above.
+        id: goldens
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          # Clear stale PNGs but recreate the parent directories:
+          # imgdiff writes via stb_image_write which doesn't auto-mkdir,
+          # and the configure-time `file(MAKE_DIRECTORY)` only fires on
+          # a fresh cmake configure.
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue `
+              build/win-debug/golden_actual,
+              build/win-debug/golden_diff
+          New-Item -ItemType Directory -Force -Path `
+              build/win-debug/golden_actual,
+              build/win-debug/golden_diff | Out-Null
+          ctest --test-dir build/win-debug --output-on-failure -L golden_software
+          "rc=$LASTEXITCODE" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          exit 0
+
+      - name: Upload golden-image diff artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: goldens-windows
+          path: |
+            build/win-debug/golden_actual/
+            build/win-debug/golden_diff/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Fail job if golden cell failed
+        if: steps.goldens.outputs.rc != '0'
+        shell: pwsh
+        run: |
+          Write-Host "::error::Golden-image cell failed (rc=${{ steps.goldens.outputs.rc }}); see goldens-windows artefact."
+          exit ${{ steps.goldens.outputs.rc }}
 
       # Backend smoke tests intentionally NOT run on the GH-hosted
       # windows-latest runner. The runner has no GPU hardware
@@ -172,6 +290,10 @@ jobs:
       #
       # Run manually on real RTX hardware when validating Vulkan:
       #   .\build\win-debug\src\app\demont.exe --smoke-frames=8 --r-backend=vulkan
+      # or end-to-end via the golden harness:
+      #   .\build\win-debug\tools\pt_render_one_frame\pt_render_one_frame.exe `
+      #     --scene tests\goldens\scenes\cornell_csg.cfg --backend vulkan `
+      #     --denoiser off --frames 64 --out C:\temp\out.png
 
   # Scheduled nightly release: at 23:00 IST (cron at top, in UTC) the
   # macos build runs and -- if it passes -- this job repackages the
