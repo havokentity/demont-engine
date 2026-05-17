@@ -1512,9 +1512,10 @@ void Engine::RequestBackendSwitch(BackendType to) {
 
     // Always-present placeholder storage buffer. Used as a harmless
     // fallback for optional binding slots (env CDFs at 4/5, BVH nodes
-    // at 7, SDF clusters at 8) whose primary buffer can legally be 0
-    // (no env map; no BVH built; no SDFs uploaded). Metal computes the
-    // dynamic push-constant slot from max-bound + 1 of the contiguous
+    // at 7, tri_bvh nodes/ids at 8/9, SDF clusters at 10) whose primary
+    // buffer can legally be 0 (no env map; no BVH built; no SDFs
+    // uploaded). Metal computes the dynamic push-constant slot from
+    // max-bound + 1 of the contiguous
     // range, so leaving any slot in that range unbound shifts the push
     // slot and corrupts every push field -> all-black render. Previous
     // code reused prim_buffer_id_ for the same purpose, but with

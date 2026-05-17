@@ -270,7 +270,7 @@ private:
 
     // Always-allocated 16-byte storage buffer used as a harmless
     // placeholder for any optional binding slot whose primary buffer is
-    // 0 (e.g. SDF cluster slot 8 when no SDFs exist AND analytic prims
+    // 0 (e.g. SDF cluster slot 10 when no SDFs exist AND analytic prims
     // are also off via pt_smoke_skip_prim_seed=1). Metal computes the
     // dynamic push-constant slot from max-bound + 1 of the contiguous
     // binding range, so leaving any slot in that range unbound shifts

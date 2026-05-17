@@ -106,7 +106,7 @@ struct SdfPrim {
 };
 // kMaxNodes * 48 = 384 nodes block. + 4 (node_count) + 4 (material) +
 // 12 (aabb_min) + 12 (aabb_max) + 12 (albedo) + 4 (roughness) + 4 (ior)
-// + 12 (pad) = 464. Bump if you add fields.
+// + 12 (pad) = 448. Bump if you add fields.
 static_assert(sizeof(SdfPrim) == 48 * 8 + 4 + 4 + 12 + 12 + 12 + 4 + 4 + 12,
               "SdfPrim layout drift");
 // --- end SDF Phase 1 -------------------------------------------------------

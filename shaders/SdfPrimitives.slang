@@ -2,9 +2,12 @@
 // Copyright (c) 2026 Rajesh D'Monte
 //
 // SDF Phase 1 (#97) -- analytic signed-distance-field primitive
-// library. Used by PathTrace.slang when a BVH leaf is tagged as
-// SHAPE_SDF. The host (src/renderer/AnalyticBvh.{h,cpp}) builds the
-// flat per-cluster node table; this module walks the table, runs the
+// library. Phase 1 invokes this module from PathTrace.slang via a
+// separate linear scan over all SDF clusters (one sphere-trace per
+// cluster AABB). Folding SDF clusters into the analytic BVH as
+// SHAPE_SDF leaves is deferred to a future phase (tracked in #111).
+// The host (src/renderer/AnalyticBvh.{h,cpp}) builds the flat
+// per-cluster node table; this module walks the table, runs the
 // sphere-trace inside the cluster AABB, and returns hit position +
 // analytic-gradient normal + material id.
 //
