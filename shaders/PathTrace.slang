@@ -117,9 +117,20 @@ Texture2D<float4> moon_map;
 // r_denoiser is optix_hdr_aov; in any other mode binding 17 stays
 // at the default null descriptor and the write below is a no-op via
 // Vulkan's robust-buffer-access rules.
-#ifdef PT_TARGET_SPIRV
+// Declared on BOTH Metal and SPIR-V (NOT #ifdef-wrapped). When the
+// declaration was SPIR-V-only, Slang's MSL backend dead-code-eliminated
+// it from the kernel signature, which compacted subsequent texture
+// slots and shifted accum_stars from MSL texture(10) to texture(9).
+// The engine's BindStorageTexture(10, accum_stars) call then landed
+// on an unbound MSL slot, silently dropping every star write/read --
+// see PR #108's regression history. Keeping the declaration on both
+// targets preserves Slang's slot assignment contract: each declared
+// texture gets a stable MSL index in declaration order regardless of
+// backend. The runtime `write_albedo_gbuffer` push gate (set to 0 by
+// the engine on Metal and on non-OptiX-AOV Vulkan dispatches) is the
+// actual run-or-skip switch; the engine binds a placeholder when
+// albedo_tex_id_ is 0 to satisfy descriptor validity.
 [[vk::binding(17, 0)]] RWTexture2D<float4> albedo_tex;
-#endif
 
 // GPU-resident exposure scalar. Updated each frame by AutoExposure.slang
 // (when r_auto_exposure = 1) or written once by the engine via
@@ -1800,24 +1811,35 @@ void main(uint2 tid : SV_DispatchThreadID) {
         if (write_normal_gbuffer != 0u) {
             normal_tex[tid] = float4(hit_normal, 0.0);
         }
-#ifdef PT_TARGET_SPIRV
         // Albedo G-buffer: only allocated/bound by the engine when
-        // r_denoiser is optix_hdr_aov / optix_temporal_hdr_aov. Gated
-        // because the descriptor layout uses
-        // VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT -- binding 17 is
-        // simply absent from the dispatch's descriptor view in other
-        // modes (it used to be a null descriptor + robust-buffer-
-        // access no-op, but MoltenVK on Apple Silicon doesn't
-        // implement nullDescriptor, hence the move to partially-
-        // bound). Metal SVGF doesn't use albedo so the declaration
-        // stays SPIR-V-only -- adding a new texture slot on the
-        // Metal side has a real cost (MSL texture-index assignment
-        // cascades) and SVGF without an albedo guide matches the
-        // Vulkan svgf_basic / svgf_atrous behaviour exactly.
+        // r_denoiser is optix_hdr_aov / optix_temporal_hdr_aov. The
+        // runtime `write_albedo_gbuffer` push gate is the actual
+        // run-or-skip switch -- the engine sets it to 0 on Metal
+        // (which never uses OptiX AOV anyway) and to 0 on Vulkan
+        // for non-AOV denoisers, so albedo_tex is only ever touched
+        // by the OptiX-AOV path. Vulkan tolerates the unbound slot
+        // via VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT; Metal binds
+        // a placeholder when albedo_tex_id_ is 0.
+        //
+        // CRITICAL: keep this write code visible to ALL targets, NOT
+        // wrapped in `#ifdef PT_TARGET_SPIRV`. When the write was
+        // SPIR-V-only, Slang's MSL backend saw albedo_tex as a
+        // declared-but-never-used resource and dead-code-eliminated
+        // it from the kernel signature -- which compacted all
+        // following texture slots and shifted accum_stars from MSL
+        // texture(10) to texture(9). The engine's
+        // BindStorageTexture(10, accum_stars) call then landed on an
+        // unbound MSL slot, silently dropping every star write/read.
+        // Bug history: this caused PR #108's star-split path to
+        // render zero stars on Mac under any denoiser; the fix
+        // landed in commit <next> by removing the #ifdef wrapper
+        // (write is still runtime-gated so non-AOV dispatches don't
+        // pay for it). Removing the gate ENTIRELY would also work
+        // but costs an RGBA16F write per pixel per frame on non-AOV
+        // modes; the runtime gate keeps that free.
         if (write_albedo_gbuffer != 0u) {
             albedo_tex[tid] = float4(hit_albedo, 0.0);
         }
-#endif
     }
 
     // Multi-sample loop: average `spp` independent paths into a single
