@@ -30,3 +30,8 @@ build_win.bat
 *.toml
 !CMakePresets.json
 demont_console.state
+
+# Local screenshot / capture dumps from FrameCapture, smoke tests,
+# and ad-hoc renderdoc-style triage. Not committed -- per-host
+# scratch.
+captures/
