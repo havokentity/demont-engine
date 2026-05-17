@@ -1045,6 +1045,7 @@ void Engine::TearDownDevice() {
     box_blas_id_          = 0;
     box_vbuf_id_          = 0;
     box_ibuf_id_          = 0;
+    mesh_tri_count_       = 0;
     prim_buffer_id_       = 0;
     prim_buffer_capacity_ = 0;
     bvh_node_buffer_id_       = 0;
@@ -1674,11 +1675,15 @@ void Engine::SeedDefaultCsgScene() {
 
 void Engine::EnsureMeshUpdated() {
     if (!device_) return;
-    // Any backend that supports hardware ray tracing can host the CSG
-    // mesh -- not just Metal. Vulkan got real CreateBLAS/CreateTLAS in
-    // P12 (the Windows bringup). The software backend has no AS path
-    // and stays gated out via SupportsHardwareRT() = false.
-    if (!device_->SupportsHardwareRT()) return;
+    // Mesh CSG rendering works on every backend now, not just those
+    // exposing hardware ray tracing. The fast path (Metal Ray Tracing,
+    // Vulkan VK_KHR_ray_query, Embree on the software backend) builds
+    // a BLAS/TLAS in CreateBLAS/CreateTLAS; the slow-fallback path
+    // (e.g. Mac-Vulkan on MoltenVK builds without VK_KHR_ray_query --
+    // anything pre-MoltenVK 1.3) uploads the baked vertex + index
+    // buffer and lets PathTrace.slang linear-scan triangles via the
+    // mesh_tri_count > 0 branch. RebuildMeshResources chooses the
+    // path automatically based on device_->SupportsHardwareRT().
     if (!csg_scene_) return;
 
     // Phase 2: the worker has a result waiting. Pull it onto the main
@@ -1702,6 +1707,7 @@ void Engine::EnsureMeshUpdated() {
             if (box_vbuf_id_   != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{box_vbuf_id_});
             if (box_ibuf_id_   != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{box_ibuf_id_});
             scene_tlas_id_ = box_blas_id_ = box_vbuf_id_ = box_ibuf_id_ = 0;
+            mesh_tri_count_ = 0;
         }
     }
 
@@ -1739,6 +1745,7 @@ void Engine::RebuildMeshResources(const pt::csg::BakedMesh& baked) {
     if (box_vbuf_id_   != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{box_vbuf_id_});
     if (box_ibuf_id_   != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{box_ibuf_id_});
     scene_tlas_id_ = box_blas_id_ = box_vbuf_id_ = box_ibuf_id_ = 0;
+    mesh_tri_count_ = 0;
 
     const std::size_t vbytes = sizeof(float) * baked.positions.size();
     const std::size_t ibytes = sizeof(std::uint32_t) * baked.indices.size();
@@ -1758,41 +1765,88 @@ void Engine::RebuildMeshResources(const pt::csg::BakedMesh& baked) {
     device_->WriteBuffer(ibuf, baked.indices.data(),   ibytes);
     box_vbuf_id_ = vbuf.id;
     box_ibuf_id_ = ibuf.id;
+    // Set mesh_tri_count_ BEFORE the AS build below. If BLAS/TLAS fails
+    // on an RT-capable backend, the early-returns leave vbuf/ibuf
+    // uploaded; with mesh_tri_count_ already set, the next frame's
+    // `sw_mesh_present` gate fires and the shader's SW linear-scan path
+    // renders the mesh instead of silently dropping it. Without this
+    // ordering, an AS failure would leave the engine in a half-built
+    // state -- buffers uploaded but invisible because neither HW nor SW
+    // path triggers.
+    mesh_tri_count_ = baked.TriangleCount();
 
-    pt::rhi::BLASDesc blas_desc{
-        .vertex_positions = baked.positions.data(),
-        .vertex_count     = baked.VertexCount(),
-        .indices          = baked.indices.data(),
-        .index_count      = static_cast<std::uint32_t>(baked.indices.size()),
-        .debug_name       = "csg",
-    };
-    auto blas = device_->CreateBLAS(blas_desc);
-    if (blas.id == 0) {
-        LOG_ERROR("CSG: BLAS build failed ({} verts, {} tris)",
-                  baked.VertexCount(), baked.TriangleCount());
-        return;
-    }
-    box_blas_id_ = blas.id;
+    // BLAS/TLAS build is conditional on hardware ray tracing. When the
+    // backend can't host an AS (Mac-Vulkan on pre-1.3 MoltenVK is the
+    // motivating case -- it doesn't expose VK_KHR_acceleration_structure),
+    // the engine still uploads the vertex + index buffers above and lets
+    // PathTrace.slang linear-scan triangles via the mesh_tri_count > 0
+    // branch. Performance scales linearly with TriangleCount() on that
+    // path, which is fine for sub-1k-tri scenes like the headline CSG
+    // demos but should not be relied on for production-size meshes --
+    // see the one-shot warning below.
+    if (device_->SupportsHardwareRT()) {
+        pt::rhi::BLASDesc blas_desc{
+            .vertex_positions = baked.positions.data(),
+            .vertex_count     = baked.VertexCount(),
+            .indices          = baked.indices.data(),
+            .index_count      = static_cast<std::uint32_t>(baked.indices.size()),
+            .debug_name       = "csg",
+        };
+        auto blas = device_->CreateBLAS(blas_desc);
+        if (blas.id == 0) {
+            LOG_ERROR("CSG: BLAS build failed ({} verts, {} tris); "
+                      "falling back to SW linear-scan path",
+                      baked.VertexCount(), baked.TriangleCount());
+            return;
+        }
+        box_blas_id_ = blas.id;
 
-    // Single instance, identity transform -- the CSG bake already places
-    // geometry in world space.
-    pt::rhi::TLASInstance inst{};
-    inst.blas = blas;
-    inst.transform[0] = 1; inst.transform[1] = 0; inst.transform[2] = 0; inst.transform[3]  = 0.0f;
-    inst.transform[4] = 0; inst.transform[5] = 1; inst.transform[6] = 0; inst.transform[7]  = 0.0f;
-    inst.transform[8] = 0; inst.transform[9] = 0; inst.transform[10]= 1; inst.transform[11] = 0.0f;
-    inst.instance_id = 0;
-    inst.mask        = 0xFF;
-    std::vector<pt::rhi::TLASInstance> insts{inst};
-    pt::rhi::TLASDesc tlas_desc{ .instances = insts, .debug_name = "scene" };
-    auto tlas = device_->CreateTLAS(tlas_desc);
-    scene_tlas_id_ = tlas.id;
-    if (scene_tlas_id_ == 0) {
-        LOG_ERROR("CSG: TLAS build failed");
-        return;
+        // Single instance, identity transform -- the CSG bake already places
+        // geometry in world space.
+        pt::rhi::TLASInstance inst{};
+        inst.blas = blas;
+        inst.transform[0] = 1; inst.transform[1] = 0; inst.transform[2] = 0; inst.transform[3]  = 0.0f;
+        inst.transform[4] = 0; inst.transform[5] = 1; inst.transform[6] = 0; inst.transform[7]  = 0.0f;
+        inst.transform[8] = 0; inst.transform[9] = 0; inst.transform[10]= 1; inst.transform[11] = 0.0f;
+        inst.instance_id = 0;
+        inst.mask        = 0xFF;
+        std::vector<pt::rhi::TLASInstance> insts{inst};
+        pt::rhi::TLASDesc tlas_desc{ .instances = insts, .debug_name = "scene" };
+        auto tlas = device_->CreateTLAS(tlas_desc);
+        scene_tlas_id_ = tlas.id;
+        if (scene_tlas_id_ == 0) {
+            LOG_ERROR("CSG: TLAS build failed; tearing down BLAS and "
+                      "falling back to SW linear-scan path");
+            device_->DestroyAccelStruct(pt::rhi::AccelStructHandle{box_blas_id_});
+            box_blas_id_ = 0;
+            return;
+        }
+        LOG_INFO("CSG: rebuilt mesh ({} verts, {} tris) -- hw-rt BLAS+TLAS",
+                 baked.VertexCount(), baked.TriangleCount());
+    } else {
+        // Software-mesh fallback: vbuf + ibuf are already uploaded above.
+        // PathTrace.slang's mesh_tri_count branch reads them directly.
+        LOG_INFO("CSG: rebuilt mesh ({} verts, {} tris) -- software linear-scan (no hw RT)",
+                 baked.VertexCount(), baked.TriangleCount());
+
+        // One-shot perf-cliff warning. The SW path is O(tris) per ray
+        // per bounce, so a moderately-sized mesh on a non-RT host
+        // (~10k tris, 6 bounces, 1080p) freezes the renderer at
+        // sub-1-FPS rates. kSwMeshWarnThreshold = 4096 tris is the
+        // empirical knee where it starts hurting visibly on M-series;
+        // sub-1k stays interactive. Set once per process so the log
+        // doesn't spam on every bake.
+        constexpr std::uint32_t kSwMeshWarnThreshold = 4096u;
+        if (baked.TriangleCount() > kSwMeshWarnThreshold &&
+            !sw_mesh_perf_warning_fired_) {
+            LOG_WARN("CSG: mesh has {} tris on the SW linear-scan path "
+                     "(no hardware RT). Performance is O(tris/ray/bounce) -- "
+                     "production-size meshes will tank framerate. Threshold {} "
+                     "tris. Future work: build a triangle BVH on host.",
+                     baked.TriangleCount(), kSwMeshWarnThreshold);
+            sw_mesh_perf_warning_fired_ = true;
+        }
     }
-    LOG_INFO("CSG: rebuilt mesh ({} verts, {} tris)",
-             baked.VertexCount(), baked.TriangleCount());
 }
 
 void Engine::SeedDefaultPrimitives() {
@@ -2898,10 +2952,21 @@ void Engine::RenderFrame() {
     // numbers below are 1-based for buffers (the AS, declared at vk slot
     // 2, lands at buffer(0) on Metal; mesh_positions at buffer(1), etc.).
     bool tlas_present = (scene_tlas_id_ != 0);
+    // Software-mesh fallback (mesh_tri_count_ > 0 && !tlas_present):
+    // we still bind the vertex + index buffers and let PathTrace.slang
+    // linear-scan triangles. Currently exercised on Mac-Vulkan when the
+    // installed MoltenVK build doesn't expose VK_KHR_acceleration_structure
+    // (pre-1.3); the gold path stays on top of VK_KHR_ray_query when it
+    // is available. See VulkanDevice's RT extension probe log.
+    const bool sw_mesh_present = (!tlas_present && mesh_tri_count_ > 0 &&
+                                  box_vbuf_id_ != 0 && box_ibuf_id_ != 0);
     if (tlas_present) {
         cb->BindAccelStruct(2, pt::rhi::AccelStructHandle{scene_tlas_id_});
         if (box_vbuf_id_ != 0) cb->BindBuffer(1, pt::rhi::BufferHandle{box_vbuf_id_}, 0);
         if (box_ibuf_id_ != 0) cb->BindBuffer(2, pt::rhi::BufferHandle{box_ibuf_id_}, 0);
+    } else if (sw_mesh_present) {
+        cb->BindBuffer(1, pt::rhi::BufferHandle{box_vbuf_id_}, 0);
+        cb->BindBuffer(2, pt::rhi::BufferHandle{box_ibuf_id_}, 0);
     }
     if (prim_buffer_id_ != 0) {
         cb->BindBuffer(3, pt::rhi::BufferHandle{prim_buffer_id_}, 0);
@@ -3242,7 +3307,16 @@ void Engine::RenderFrame() {
         push.bvh_params[1] = analytic_bvh_.Empty()
             ? 0u
             : static_cast<std::uint32_t>(analytic_bvh_.NodeCount());
-        push.bvh_params[2] = 0u;
+        // .z carries `mesh_tri_count` for the software-mesh linear-scan
+        // fallback. Set only when the engine has uploaded vbuf/ibuf for
+        // a CSG mesh AND no TLAS was bound this frame (i.e. the backend
+        // lacks hardware ray tracing). The shader gates the linear-scan
+        // branch on this being non-zero. Zero on every other path -- the
+        // shader's existing `tlas_present` test continues to drive the
+        // RayQuery branch on RT-capable backends.
+        push.bvh_params[2] = sw_mesh_present
+            ? mesh_tri_count_
+            : 0u;
         push.bvh_params[3] = 0u;
     }
 

@@ -22,7 +22,16 @@
 
 [[vk::binding(0, 0)]] RWTexture2D<float4> output;
 [[vk::binding(1, 0)]] RWTexture2D<float4> accum_hdr;
+// scene_tlas is omitted from the SPIR-V variant when the build defines
+// PT_SPIRV_NO_RAYQUERY (issue #44 fallback for backends without
+// VK_KHR_ray_query, e.g. Mac-Vulkan on pre-1.3 MoltenVK). Without the
+// guard the SPIR-V module declares the RayQueryKHR capability up-front,
+// which fails vkCreateShaderModule on those drivers and breaks the
+// pipeline build entirely. Metal target always includes it -- Metal Ray
+// Tracing is unconditionally present on Apple Silicon.
+#if !defined(PT_TARGET_SPIRV) || !defined(PT_SPIRV_NO_RAYQUERY)
 [[vk::binding(2, 0)]] RaytracingAccelerationStructure scene_tlas;
+#endif
 [[vk::binding(3, 0)]] StructuredBuffer<float>  mesh_positions;
 [[vk::binding(4, 0)]] StructuredBuffer<uint>   mesh_indices;
 [[vk::binding(5, 0)]] StructuredBuffer<float4> primitives;
@@ -523,9 +532,18 @@ HitInfo traceScene(float3 ro, float3 rd) {
         }
     }
 
-    // Triangle meshes via TLAS. Skipped when the host signals there's
-    // no mesh bound (tlas_present == 0) -- accessing scene_tlas in
-    // that case would be undefined.
+    // Triangle meshes. Two paths exist:
+    //   tlas_present != 0                 -> HW RayQuery (fast)
+    //   tlas_present == 0 && tri_count > 0 -> SW linear-scan fallback
+    // The SW path is the workaround for backends that lack
+    // VK_KHR_acceleration_structure -- specifically Mac-Vulkan on
+    // pre-1.3 MoltenVK installations. Accessing scene_tlas when no TLAS
+    // is bound is undefined; the tlas_present guard avoids that on
+    // backends that don't expose the RT extensions at all. Builds with
+    // PT_SPIRV_NO_RAYQUERY remove the HW branch entirely so the SPIR-V
+    // module doesn't declare the RayQueryKHR capability and can load on
+    // drivers without VK_KHR_ray_query (e.g. older MoltenVK).
+#if !defined(PT_TARGET_SPIRV) || !defined(PT_SPIRV_NO_RAYQUERY)
     if (tlas_present != 0u) {
         RayDesc r;
         r.Origin    = ro;
@@ -561,6 +579,79 @@ HitInfo traceScene(float3 ro, float3 rd) {
                 h.roughness = 0.05;
                 h.ior = 1.0;
             }
+        }
+    } else
+#endif
+    if (bvh_params.z != 0u) {
+        // Software fallback: brute-force Möller-Trumbore over every
+        // triangle in the CSG bake. O(N) per ray; fine for sub-1k-tri
+        // CSG meshes (the headline drilled-cube scene is ~hundreds).
+        // The CSG bake places geometry in world space and the HW path
+        // also uses an identity-transform TLAS instance (see
+        // Engine::RebuildMeshResources), so no ObjectToWorld is needed
+        // here -- when per-mesh transforms land both paths gain one.
+        // On builds with PT_SPIRV_NO_RAYQUERY this is the ONLY mesh path
+        // (the `else` above attaches to the `if (tlas_present != 0u)`
+        // block, which is preprocessed out for that variant).
+        uint  tri_count = bvh_params.z;
+        float t_mesh    = h.t;
+        uint  prim_hit  = 0u;
+        bool  found     = false;
+        for (uint pi = 0u; pi < tri_count; ++pi) {
+            uint i0 = mesh_indices[pi * 3u + 0u];
+            uint i1 = mesh_indices[pi * 3u + 1u];
+            uint i2 = mesh_indices[pi * 3u + 2u];
+            float3 v0 = float3(mesh_positions[i0 * 3u + 0u],
+                               mesh_positions[i0 * 3u + 1u],
+                               mesh_positions[i0 * 3u + 2u]);
+            float3 v1 = float3(mesh_positions[i1 * 3u + 0u],
+                               mesh_positions[i1 * 3u + 1u],
+                               mesh_positions[i1 * 3u + 2u]);
+            float3 v2 = float3(mesh_positions[i2 * 3u + 0u],
+                               mesh_positions[i2 * 3u + 1u],
+                               mesh_positions[i2 * 3u + 2u]);
+            float3 e1 = v1 - v0;
+            float3 e2 = v2 - v0;
+            float3 pv = cross(rd, e2);
+            float  det = dot(e1, pv);
+            // Two-sided: CSG bake doesn't guarantee winding direction
+            // relative to the ray; only the degenerate near-zero case
+            // is rejected.
+            if (abs(det) < 1e-8) continue;
+            float inv_det = 1.0 / det;
+            float3 tvec = ro - v0;
+            float u = dot(tvec, pv) * inv_det;
+            if (u < 0.0 || u > 1.0) continue;
+            float3 qv = cross(tvec, e1);
+            float v = dot(rd, qv) * inv_det;
+            if (v < 0.0 || u + v > 1.0) continue;
+            float t_tri = dot(e2, qv) * inv_det;
+            if (t_tri > 1e-3 && t_tri < t_mesh) {
+                found    = true;
+                t_mesh   = t_tri;
+                prim_hit = pi;
+            }
+        }
+        if (found) {
+            uint i0 = mesh_indices[prim_hit * 3u + 0u];
+            uint i1 = mesh_indices[prim_hit * 3u + 1u];
+            uint i2 = mesh_indices[prim_hit * 3u + 2u];
+            float3 v0 = float3(mesh_positions[i0 * 3u + 0u],
+                               mesh_positions[i0 * 3u + 1u],
+                               mesh_positions[i0 * 3u + 2u]);
+            float3 v1 = float3(mesh_positions[i1 * 3u + 0u],
+                               mesh_positions[i1 * 3u + 1u],
+                               mesh_positions[i1 * 3u + 2u]);
+            float3 v2 = float3(mesh_positions[i2 * 3u + 0u],
+                               mesh_positions[i2 * 3u + 1u],
+                               mesh_positions[i2 * 3u + 2u]);
+            float3 obj_n = normalize(cross(v1 - v0, v2 - v0));
+            h.hit = true; h.t = t_mesh;
+            h.normal = obj_n;
+            h.mat = MAT_METAL;
+            h.albedo = MESH_ALBEDO;
+            h.roughness = 0.05;
+            h.ior = 1.0;
         }
     }
     return h;
