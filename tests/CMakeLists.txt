@@ -176,6 +176,23 @@ pt_add_test(pt_csg_scene
     pt_csg_scene_test.cpp
     LINK_TARGETS pt_renderer)
 
+# --- pt_renderer/Astronomy unit tests (issue #65) --------------------------
+# JD conversions (J2000 + Unix-epoch reference points), GMST at J2000
+# vs the IAU 1982 formula, sun position at four cardinal solar events
+# (J2000 + 2026 equinoxes + solstices) cross-checked against JPL
+# HORIZONS / Naval Almanac references, equatorial -> horizon transform
+# sanity (sun at zenith on equator/equinox, sunrise/sunset diurnal
+# sign-change), plus the Moon API surface (position invariants /
+# determinism, phase-angle synodic-cycle range, distance perigee..
+# apogee envelope), sun distance (perihelion..aphelion envelope), and
+# worldToJ2000Matrix (right-handed orthonormal rotation). All
+# reference values are hardcoded -- no time() / no system clock --
+# so the test is deterministic across host OS + compiler + build type.
+# Links pt_renderer (where Astronomy lives).
+pt_add_test(pt_renderer_astronomy
+    pt_renderer_astronomy_test.cpp
+    LINK_TARGETS pt_renderer)
+
 # ============================================================================
 # Golden-image regression matrix (issue #45)
 # ============================================================================
