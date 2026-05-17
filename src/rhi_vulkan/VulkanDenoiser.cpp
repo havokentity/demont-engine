@@ -924,20 +924,26 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
             bloom_real = false;
         }
         // Star-split accumulator (issue #46) at finalize binding 4.
-        // When the caller passed id=0 OR the view lookup misses, fall
-        // back to v_output as a safe RGBA16F storage image so the
-        // descriptor write succeeds. The shader's add is unconditional
-        // (no intensity gate), so for the off case the engine MUST
-        // pass a zeroed texture (its 1x1 accum_stars_dummy_tex_id_).
-        // Falling back to v_output here is a defensive guard for the
-        // pathological "engine passed garbage" case -- the resulting
-        // wrong colour (a copy of hdr_in added on top of itself) is
-        // a visible artefact rather than a crash, which is the right
-        // failure mode for a renderer-side issue.
+        // The engine ALWAYS passes either the real accumulator or its
+        // swapchain-sized zero-fill texture; a NULL stars_in.id or a
+        // failed view lookup is a programmer error, not a renderable
+        // case. We previously fell back to v_output here, which made
+        // the shader's unconditional additive read `c += stars_tex[tid]`
+        // sample the dispatch's own destination -- depending on driver
+        // scheduling that's either a 2x brightness bug or a read-write
+        // hazard with undefined results. Skipping the dispatch on
+        // missing stars_in mirrors the existing v_final / b_exp guard
+        // above: the renderer-side state is broken, so produce a
+        // visible black frame and log loudly rather than silently
+        // corrupting the image.
         VkImageView v_stars = (stars_in.id != 0) ? device_->LookupImageView(stars_in)
                                                 : VK_NULL_HANDLE;
         if (v_stars == VK_NULL_HANDLE) {
-            v_stars = v_output;
+            LOG_ERROR("VulkanDenoiser: stars_in view lookup failed (id={}); "
+                      "skipping DenoiseFinalize dispatch (would have read "
+                      "from output texture and produced a 2x-brightness "
+                      "feedback artifact)", stars_in.id);
+            return;
         }
         if (v_final != VK_NULL_HANDLE && b_exp != VK_NULL_HANDLE) {
             VkDescriptorSet fset = finalize_sets_[next_finalize_set_];
@@ -1079,12 +1085,27 @@ void VulkanNrdDenoiser::EncodeFinalizeOnly(VkCommandBuffer cb,
                             : color_in_view;
     const float effective_bloom = (bloom_in_view != VK_NULL_HANDLE)
                                     ? bloom_intensity : 0.0f;
-    // Star-split slot (issue #46). Same fallback logic as Encode()
-    // above; the shader add is unconditional so the caller is
-    // responsible for passing a zeroed texture when stars are off.
-    VkImageView v_stars = (stars_in_view != VK_NULL_HANDLE)
-                            ? stars_in_view
-                            : color_in_view;
+    // Star-split slot (issue #46). The engine ALWAYS passes either the
+    // real accumulator or its swapchain-sized zero-fill texture; a
+    // NULL stars_in_view is a programmer error, not a renderable case.
+    // Falling back to color_in_view here would cause the shader's
+    // unconditional additive read `c += stars_tex[tid]` to sample the
+    // dispatch's source texture and double-count the HDR (the same
+    // read-then-write hazard as the bloom path used to have before we
+    // gated bloom_intensity = 0). Treat it like the other required-
+    // resource checks at the top of this function: bail with a
+    // logged error and produce a visible failure instead of silently
+    // brightening the frame.
+    if (stars_in_view == VK_NULL_HANDLE) {
+        LOG_ERROR("VulkanDenoiser::EncodeFinalizeOnly: stars_in_view is "
+                  "VK_NULL_HANDLE; skipping finalize dispatch (would have "
+                  "read from color_in_view and produced a 2x-brightness "
+                  "feedback artifact). Engine must pass either the real "
+                  "accum_stars texture or its swapchain-sized zero-fill "
+                  "companion.");
+        return;
+    }
+    VkImageView v_stars = stars_in_view;
 
     VkDescriptorSet fset = finalize_sets_[next_finalize_set_];
     next_finalize_set_   = (next_finalize_set_ + 1) % kFinalizeSetRing;

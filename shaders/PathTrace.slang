@@ -791,21 +791,13 @@ float3 starsOnly(float3 rd, float3 sun) {
 // per-mode gates inside procSky().
 float3 starsAtPrimaryMiss(float3 rd) {
     uint mode = uint(sun_and_mode.w);
-    // HDRI mode: stars are baked into the env_map. We don't have a
-    // clean way to extract them without a luminance threshold, so the
-    // star-split bypass is a no-op here -- the SVGF smudging issue
-    // primarily affects the procedural / BSC starmap path (procedural
-    // mode + r_stars_mode bsc), which is the night-scene workflow the
-    // issue was filed against. Adding a brightness-threshold extract
-    // for HDRI is on the deferred list (issue acceptance criterion
-    // "bloom halos proportional to brightness" -- needs a real
-    // threshold to know what counts as a "star").
-    if (mode != 2u && env_map_present == 0u) {
-        // Gradient sky has no stars (no starmap sampling, no procedural
-        // cell scatter -- the night-sky branch only fires under
-        // procSky / mode==2). Safe to return 0.
-        return float3(0.0);
-    }
+    // procSky (mode == 2) is the only path that injects stars at
+    // primary miss; gradient sky has no stars and HDRI mode bakes
+    // them into the env_map (extracting requires a brightness
+    // threshold -- deferred to bloom-on-stars follow-up, since the
+    // issue acceptance criterion "bloom halos proportional to
+    // brightness" implies a real threshold to know what counts as
+    // a "star"). All other modes return 0 here.
     if (mode == 2u) {
         return starsOnly(rd, sun_and_mode.xyz);
     }
@@ -1789,11 +1781,24 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     // secondary bounces, and the indirect star
                     // contribution is small enough that denoiser
                     // smudging is invisible there.
-                    float3 sky_full = skyColor(rd);
+                    //
+                    // We compute stars_only once via starsAtPrimaryMiss
+                    // and subtract it from sky_full BEFORE the
+                    // throughput multiply, so the legacy and split
+                    // branches differ by exactly `throughput *
+                    // stars_only` instead of relying on the algebraic
+                    // identity `T*(A+S) - T*S == T*A` (which is not
+                    // bit-identical in fp16 storage paths). Also keeps
+                    // a single source of truth for the star sampling
+                    // logic -- a future change inside procSky's star
+                    // contribution would propagate through both
+                    // sides via starsAtPrimaryMiss without manual
+                    // re-syncing.
+                    float3 sky_full   = skyColor(rd);
+                    float3 stars_only = starsAtPrimaryMiss(rd);
                     if (star_split_active) {
-                        float3 stars = throughput * starsAtPrimaryMiss(rd);
-                        frame_stars += stars;
-                        radiance    += throughput * sky_full - stars;
+                        frame_stars += throughput * stars_only;
+                        radiance    += throughput * (sky_full - stars_only);
                     } else {
                         radiance    += throughput * sky_full;
                     }

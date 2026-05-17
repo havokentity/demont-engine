@@ -228,11 +228,17 @@ public:
         // kernel to keep sub-pixel star energy from being smudged.
         // VulkanNrdDenoiser's DenoiseFinalize stage adds it pre-ACES.
         // When the engine isn't routing stars (r_star_split = 0 or
-        // denoiser off) it passes its 1x1 zero accum_stars_dummy
-        // texture here so the additive read is a no-op. MetalFX
-        // ignores this -- Metal's Tonemap.slang has its own stars_tex
-        // binding and the engine routes the accumulator there
-        // directly.
+        // denoiser off) it passes its swapchain-sized zero-fill
+        // companion (accum_stars_zero_tex_id_) here so the additive
+        // read is observably 0 at every pixel. Must NEVER be left
+        // null on a denoiser-active dispatch; the finalize kernel's
+        // unconditional `c += stars_tex[tid]` would otherwise need
+        // to fall back to the destination texture and produce a
+        // 2x-brightness feedback artifact (the implementation now
+        // bails the dispatch with a logged error instead of falling
+        // back). MetalFX ignores this -- Metal's Tonemap.slang has
+        // its own stars_tex binding and the engine routes the
+        // accumulator there directly.
         TextureHandle stars_in;
         float jitter_x       = 0.0f;
         float jitter_y       = 0.0f;

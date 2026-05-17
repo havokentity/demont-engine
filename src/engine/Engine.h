@@ -290,15 +290,34 @@ private:
     // resolution; PathTrace.slang writes the per-pixel star
     // contribution here (peeled out of the primary-miss sky term so
     // the SVGF a-trous kernel doesn't smudge it), and the post-
-    // denoise finalize / tonemap step adds it back pre-ACES. Allocated
-    // alongside the rest of the denoiser-related textures only when
-    // both r_denoiser != off AND r_star_split = 1; freed otherwise.
-    // When the texture isn't allocated the shader slot is bound to
-    // accum_stars_dummy_tex_id_ below (a 1x1 zero RGBA16F) so the
-    // additive read is observably 0 -- mirrors the bloom_dummy
-    // pattern for r_bloom = 0 on the bloom slot.
+    // denoise finalize / tonemap step adds it back pre-ACES.
+    //
+    // Lifecycle: allocated alongside the rest of the denoiser-related
+    // textures whenever `r_denoiser != off` (i.e. `denoiser_active_`).
+    // The cvar `r_star_split` only gates whether PathTrace.slang
+    // actually writes to it and whether the post-denoise finalize /
+    // Tonemap kernel reads it; the storage itself follows the broader
+    // denoiser texture lifetime so the resize / teardown contract
+    // stays one-shot (no separate "stars-only" allocation state).
+    // Freed alongside the rest on the r_denoiser-off transition.
+    //
+    // When the real accumulator isn't allocated (r_denoiser off) OR
+    // r_star_split is 0, the shader slot is bound to a swapchain-
+    // sized zero-filled accum_stars_zero_tex_id_ below so the
+    // additive read sees zeros at every pixel without relying on
+    // out-of-bounds storage-image-read robustness behaviour.
     std::uint64_t                               accum_stars_tex_id_ = 0;
-    std::uint64_t                               accum_stars_dummy_tex_id_ = 0;
+    // Swapchain-sized RGBA16F that stays zero-filled (allocated and
+    // sized alongside the denoiser textures via the same resize path).
+    // Bound in place of accum_stars_tex_id_ when r_star_split is 0
+    // (or the real accumulator isn't allocated yet) so the post-
+    // denoise finalize / Tonemap additive read is well-defined and
+    // observably zero at every pixel. The previous 1x1 dummy relied
+    // on out-of-bounds storage-image-read returning zero, which is
+    // only guaranteed when robustImageAccess is enabled (per Vulkan
+    // spec). Sized to swapchain so the in-bounds read is the spec'd
+    // load and the result is the texel data we wrote (zeros).
+    std::uint64_t                               accum_stars_zero_tex_id_ = 0;
     // Tracks whether the star-split accumulator needs a `reset_accum`
     // pulse on the next frame. Set when the user toggles r_star_split
     // (so stale stars from a previous run don't bleed in) or when

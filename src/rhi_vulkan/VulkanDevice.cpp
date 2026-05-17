@@ -2969,12 +2969,15 @@ void VulkanDevice::EncodeDenoiseFinalize(VkCommandBuffer cb,
     // to 0 internally and binds color_in as a safe-but-unread fallback,
     // so the OptiX bloom-off case (engine passes view=NULL, intensity=0)
     // and the OptiX bloom-on case (view=mip0, intensity>0) both go
-    // through the same call. The stars_in_view follows the same
-    // contract: null falls back to color_in as a safe stand-in (the
-    // shader's additive read becomes hdr_in + hdr_in -- a benign
-    // brightness bump rather than a crash), and the engine is
-    // expected to pass its 1x1 zero accum_stars_dummy when stars
-    // aren't routed.
+    // through the same call. The stars_in_view contract is stricter:
+    // it MUST NOT be null. The shader's additive read of stars_tex is
+    // unconditional, so a null fallback would have to read from
+    // color_in_view (the dispatch's own source), producing a 2x-
+    // brightness feedback artifact. The engine passes either the real
+    // accum_stars accumulator (denoiser + r_star_split on) or the
+    // swapchain-sized zero-fill companion (other cases); EncodeFinalize
+    // -Only bails the dispatch with a logged error if stars_in_view
+    // arrives null.
     denoiser_->EncodeFinalizeOnly(cb, color_in_view, final_output_view,
                                   exposure_state_buf,
                                   bloom_in_view, bloom_intensity,
