@@ -185,8 +185,11 @@ pt_add_test(pt_core_analytic_bvh
 # The function name is pt_add_golden_cell -- one ctest test per call.
 # Cells are skipped (NOT registered) on hosts where their backend
 # isn't available: Metal cells only register on Darwin; Vulkan cells
-# only register if PT_ENABLE_VULKAN_BACKEND is ON; Software is always
-# available. This matches the runtime gate the engine already has.
+# only register if PT_ENABLE_VULKAN_BACKEND is ON; Software cells
+# only register on APPLE or WIN32 (rhi_software is gated to those
+# platforms in src/rhi/CMakeLists.txt -- no SetDIBitsToDevice analog
+# implemented for Linux yet). This matches the runtime gate the
+# engine already has.
 #
 # The host (Darwin/Linux/Windows) is also pulled from
 # CMAKE_SYSTEM_NAME so the golden path is build-target-derived, not
@@ -241,16 +244,24 @@ function(pt_add_golden_cell)
     # quantisation. CI runners on the macos-26 image use a
     # paravirtualised GPU that's slower than a real M-series, so
     # 64 frames at 512x384 is still under a few seconds per cell.
-    if(NOT PT_CELL_FRAMES)
+    # Use `NOT DEFINED` (not `NOT VAR`) so a caller passing the
+    # numeric `0` -- which CMake treats as boolean-false in the
+    # `NOT VAR` form -- actually takes effect. Without this, the
+    # documented `--max-delta 0` style pixel-exact cell would
+    # silently get the default (16) instead of zero tolerance.
+    # cmake_parse_arguments leaves the variable UNDEFINED when the
+    # caller doesn't pass the corresponding flag, so DEFINED is the
+    # right "did the caller provide a value?" signal.
+    if(NOT DEFINED PT_CELL_FRAMES)
         set(PT_CELL_FRAMES 64)
     endif()
-    if(NOT PT_CELL_MAX_DELTA)
+    if(NOT DEFINED PT_CELL_MAX_DELTA)
         set(PT_CELL_MAX_DELTA 16)
     endif()
-    if(NOT PT_CELL_MEAN_DELTA)
+    if(NOT DEFINED PT_CELL_MEAN_DELTA)
         set(PT_CELL_MEAN_DELTA 2)
     endif()
-    if(NOT PT_CELL_FAIL_PERCENT)
+    if(NOT DEFINED PT_CELL_FAIL_PERCENT)
         set(PT_CELL_FAIL_PERCENT 1)
     endif()
 
@@ -334,6 +345,19 @@ function(pt_add_golden_cell)
         # regen hint then exits non-zero (via FATAL_ERROR). WILL_FAIL
         # inverts the non-zero exit to PASS so the missing-golden state
         # is surfaced to the maintainer without breaking ctest.
+        #
+        # Configure-time STATUS message duplicates the regen hint so
+        # maintainers see it in `cmake --preset ...` output too --
+        # under ctest's `--output-on-failure`, a WILL_FAIL-passes test
+        # does not print its captured output, so the in-test
+        # `message(FATAL_ERROR ...)` text is hidden from CI logs.
+        # The configure-time STATUS always appears.
+        message(STATUS
+            "tests: missing golden on this host -- ${_golden_png}\n"
+            "       Regenerate with:\n"
+            "         ctest --test-dir <build> -R ^${_cell_name}_render$\n"
+            "         cmake -E make_directory \"${CMAKE_SOURCE_DIR}/tests/goldens/${_host}\"\n"
+            "         cmake -E copy \"${_actual_png}\" \"${_golden_png}\"")
         add_test(NAME ${_cell_name}_diff
             COMMAND ${CMAKE_COMMAND}
                 -DGOLDEN=${_golden_png}
@@ -342,18 +366,27 @@ function(pt_add_golden_cell)
                 -P ${CMAKE_SOURCE_DIR}/tests/missing_golden.cmake)
         set_tests_properties(${_cell_name}_diff PROPERTIES
             WILL_FAIL TRUE
+            DEPENDS   ${_cell_name}_render
             LABELS    "golden;golden_${PT_CELL_BACKEND};golden_missing")
     endif()
 endfunction()
 
 # --- MVP cells --------------------------------------------------------------
 # 1 scene (cornell_csg) x 3 backends (software/metal/vulkan) x 1
-# denoiser (off). Each host's CI job runs only the cells whose
-# backend matches its primary platform (Mac -> metal, Windows ->
-# vulkan, Linux -> software), filtered via the `golden_<backend>`
-# ctest LABELS in .github/workflows/build.yml. Other hosts can run
-# the off-platform cells too if they want; the wrapper handles the
-# r_backend gate at engine runtime.
+# denoiser (off).
+#
+# CI mapping today (.github/workflows/build.yml uses `-L golden_software`
+# on both the macOS and Windows lanes): the hosted GitHub runners do
+# not have GPUs that survive Metal / Vulkan init reliably -- the macOS
+# runner ships a paravirtualised Apple-GPU, and the Windows lane runs
+# on a generic VM without an NVIDIA / AMD ICD -- so CI exercises the
+# software backend on both. Metal and Vulkan cells still REGISTER on
+# Mac (so a local `ctest` against a real M-series picks them up) and
+# the matrix expands cleanly to real hardware once a self-hosted
+# runner with a GPU shows up. Each host's CI step filters via the
+# `golden_software` label; other ctest LABELS (`golden`,
+# `golden_metal`, `golden_vulkan`, `golden_missing`) are for local /
+# future use.
 #
 # pt_add_golden_cell expands `$<TARGET_FILE:pt_render_one_frame>` and
 # `$<TARGET_FILE:imgdiff>` at generate time; both targets only exist

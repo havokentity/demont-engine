@@ -633,7 +633,19 @@ bool Engine::Init() {
         }
         std::string sbody; char sbuf[4096];
         while (auto sn = std::fread(sbuf, 1, sizeof(sbuf), sf)) sbody.append(sbuf, sn);
+        // fopen succeeds on a directory on POSIX, but fread on a
+        // directory returns 0 with ferror() set. Without this check we
+        // would run ExecuteScript on an empty body and silently render
+        // the engine default instead of the intended fixture -- the
+        // exact "confusing pixel diff later" failure mode this fail-fast
+        // path is meant to prevent.
+        const bool sread_err = (std::ferror(sf) != 0);
         std::fclose(sf);
+        if (sread_err) {
+            LOG_ERROR("pt_smoke_exec '{}': read error", sx->value);
+            cfg_loading_ = false;
+            return false;
+        }
         auto sr = pt::console::Console::Get().ExecuteScript(sbody);
         if (!sr.ok) {
             LOG_ERROR("pt_smoke_exec '{}': {}", sx->value, sr.error);

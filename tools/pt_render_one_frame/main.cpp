@@ -127,7 +127,23 @@ bool ParseArgs(int argc, char** argv, Args& a) {
         else if (s == "--backend")      { if (!takeValue(i, s, a.backend))      return false; }
         else if (s == "--out")          { if (!takeValue(i, s, a.outPath))      return false; }
         else if (s == "--denoiser")     { if (!takeValue(i, s, a.denoiser))     return false; }
-        else if (s == "--spp")          { if (!takeValue(i, s, a.spp))          return false; }
+        else if (s == "--spp") {
+            std::string v;
+            if (!takeValue(i, s, v)) return false;
+            // Same positive-int validation as --frames. r_spp has no
+            // allowed-values gate engine-side and CVar::GetInt() falls
+            // back to the default on parse failure, so an unvalidated
+            // `--spp abc` would silently render at the default sample
+            // count instead of failing here.
+            int spp_n = 0;
+            if (!ParsePositiveInt(v, spp_n)) {
+                std::fprintf(stderr,
+                    "pt_render_one_frame: --spp: invalid positive integer '%s'\n",
+                    v.c_str());
+                return false;
+            }
+            a.spp = v;
+        }
         else if (s == "--extra")        { if (!takeValue(i, s, a.extra))        return false; }
         else if (s == "--demont")       { if (!takeValue(i, s, a.demontPath))   return false; }
         else if (s == "--frames") {
@@ -164,21 +180,31 @@ bool ParseArgs(int argc, char** argv, Args& a) {
             "{software,metal,vulkan}; got '%s'\n", a.backend.c_str());
         return false;
     }
-    // Validate scene path exists in the wrapper. The engine's `exec`
-    // command reports "cannot open" as console output but does NOT make
-    // the smoke run fail -- a typo or missing fixture would render the
-    // engine default scene and only surface later as a pixel diff. Fail
-    // fast here with a clear error so the operator notices immediately.
+    // Validate scene path is a *readable regular file* in the wrapper.
+    // A bare existence check would pass a directory (which fopen()
+    // happily opens on POSIX, then fread returns 0 and the engine's
+    // smoke-exec sees an empty script -> renders the default scene ->
+    // pixel diff failure later). is_regular_file rules out
+    // directories / symlinks-to-directories / device nodes; a probe
+    // open rules out permission-denied files we couldn't read anyway.
     {
         std::error_code ec;
-        if (!std::filesystem::exists(a.scenePath, ec) || ec) {
+        if (!std::filesystem::is_regular_file(a.scenePath, ec) || ec) {
             std::fprintf(stderr,
-                "pt_render_one_frame: --scene '%s' does not exist%s%s\n",
+                "pt_render_one_frame: --scene '%s' is not a regular file%s%s\n",
                 a.scenePath.c_str(),
                 ec ? ": " : "",
                 ec ? ec.message().c_str() : "");
             return false;
         }
+        std::FILE* probe = std::fopen(a.scenePath.c_str(), "rb");
+        if (probe == nullptr) {
+            std::fprintf(stderr,
+                "pt_render_one_frame: --scene '%s' is not readable: %s\n",
+                a.scenePath.c_str(), std::strerror(errno));
+            return false;
+        }
+        std::fclose(probe);
     }
     return true;
 }
@@ -228,18 +254,47 @@ std::filesystem::path ResolveDemontPath(const std::filesystem::path& self_arg0,
     return build_root.empty() ? c2 : (build_root / "src" / "app" / demont_name);
 }
 
-// Build a synthesised "pre-scene" console-script that the engine exec's
-// via --smoke-exec=<path>. Format is one console command per line;
-// blank lines and lines starting with `#` are ignored by the parser.
-// The file:
-//   1. Sets r_denoiser to the operator's pick.
-//   2. Optionally sets r_spp.
-//   3. Pulls in the operator's --scene fixture via `exec PATH`.
+// Build a synthesised console-script that the engine exec's via
+// --smoke-exec=<path>. Format is one console command per line; blank
+// lines and lines starting with `#` are ignored by the parser. The
+// file:
+//   1. Inlines the operator's --scene fixture verbatim (read from
+//      disk here, NOT chained through the console `exec` command --
+//      `exec` only logs nested ExecuteScript failures and returns ok
+//      to its caller, so a typo in the fixture would be silently
+//      ignored by the engine's strict smoke-exec path).
+//   2. Sets r_denoiser to the operator's pick.
+//   3. Optionally sets r_spp.
 //   4. Inlines --extra "<cmds>" verbatim (caller is responsible for
 //      keeping quoting sane on the host shell side).
 // Returns the path on success (empty filesystem::path on I/O failure).
 std::filesystem::path BuildSmokeExec(const Args& a) {
     namespace fs = std::filesystem;
+
+    // Slurp the scene fixture. ParseArgs already validated it as a
+    // readable regular file, so a failure here is an I/O race
+    // (deleted between validate + read) -- treat as fatal.
+    std::FILE* sf = std::fopen(a.scenePath.c_str(), "rb");
+    if (sf == nullptr) {
+        std::fprintf(stderr,
+            "pt_render_one_frame: failed to reopen --scene '%s': %s\n",
+            a.scenePath.c_str(), std::strerror(errno));
+        return {};
+    }
+    std::string scene_body;
+    char rbuf[4096];
+    while (auto rn = std::fread(rbuf, 1, sizeof(rbuf), sf)) {
+        scene_body.append(rbuf, rn);
+    }
+    const bool scene_read_err = (std::ferror(sf) != 0);
+    std::fclose(sf);
+    if (scene_read_err) {
+        std::fprintf(stderr,
+            "pt_render_one_frame: read error on --scene '%s'\n",
+            a.scenePath.c_str());
+        return {};
+    }
+
     fs::path tmp_dir = fs::temp_directory_path();
     // Randomised name so parallel ctest runs don't clobber each other's
     // temp script. ctest's job control runs cells in parallel by default.
@@ -253,42 +308,22 @@ std::filesystem::path BuildSmokeExec(const Args& a) {
 
     std::ofstream f(out, std::ios::binary);
     if (!f.is_open()) return {};
-    // The console tokenizer splits on whitespace and honours
-    // double-quoted spans. Paths can contain spaces (Mac dev tree
-    // lives under '/Volumes/XTRM 5 Media/...'), so we quote every
-    // operator-supplied string before serialising it. ScenePath in
-    // particular MUST be quoted because `exec` takes a single
-    // positional argument and an unquoted space would clip the
-    // tail. The tokenizer's only escape inside a quote is the
-    // backslash sequences {\n, \t, \", \\} -- a literal `\` not
-    // followed by one of those is consumed and the next char is
-    // appended raw, so paths with embedded quote characters (rare
-    // but legal on Windows) need explicit double-escaping. Cover
-    // both with QuoteForConsole below.
-    auto quoteForConsole = [](std::string_view s) -> std::string {
-        std::string q;
-        q.reserve(s.size() + 2);
-        q.push_back('"');
-        for (char c : s) {
-            if (c == '\\' || c == '"') q.push_back('\\');
-            q.push_back(c);
-        }
-        q.push_back('"');
-        return q;
-    };
 
     f << "# pt_render_one_frame: synthesised --smoke-exec cfg\n";
     f << "# Generated for backend=" << a.backend
       << " denoiser=" << a.denoiser
       << " spp=" << (a.spp.empty() ? "<fixture>" : a.spp)
       << " frames=" << a.frames << "\n";
-    // Scene fixture loads FIRST so the wrapper's per-cell overrides
-    // (--denoiser / --spp / --extra) can override anything the fixture
-    // sets. cornell_csg.cfg pins r_spp 1, so if the wrapper emitted
-    // `r_spp` before the `exec` the fixture would silently overwrite
-    // the operator's `--spp` value. The "more-specific wins" overlay
-    // here is wrapper flag > fixture > engine default.
-    f << "exec " << quoteForConsole(a.scenePath) << "\n";
+    // Scene fixture loads FIRST (inlined verbatim, not via `exec`) so
+    // the wrapper's per-cell overrides below can override anything the
+    // fixture sets. cornell_csg.cfg pins r_spp 1, so if the wrapper
+    // emitted `r_spp` before the fixture the fixture would silently
+    // overwrite the operator's `--spp` value. The "more-specific wins"
+    // overlay here is wrapper flag > fixture > engine default.
+    f << "# --- inlined from " << a.scenePath << " ---\n";
+    f << scene_body;
+    if (!scene_body.empty() && scene_body.back() != '\n') f << '\n';
+    f << "# --- end inlined fixture ---\n";
     f << "r_denoiser " << a.denoiser << "\n";
     if (!a.spp.empty()) {
         f << "r_spp " << a.spp << "\n";
