@@ -468,7 +468,19 @@ cbuffer Push {
     // accum_stars allocation. The trailing 12 bytes of pad keep the
     // cbuffer trailing block 16-byte aligned for std140 / MSL.
     uint star_split_enabled;
-    uint _pad_star_split0;
+    // Per-dispatch reset pulse for the star-split running mean,
+    // DECOUPLED from `reset_accum`. The engine sets reset_accum=1
+    // every frame when a denoiser is active (accum_hdr must stay
+    // 1-frame for the denoiser's own temporal accumulator to take
+    // over). Using the same flag for accum_stars caused the stars
+    // running mean to reset every frame too -- frame_stars (a
+    // single 1-spp star sample with sub-pixel Halton jitter) became
+    // the entire output, producing visible rapid flicker. This
+    // separate flag fires once per (alloc / resize / r_star_split
+    // toggle) and stays 0 otherwise, so the stars EMA converges
+    // even on the denoised path. See Engine.cpp comment at the
+    // matching push field for the host-side gate.
+    uint reset_stars_accum;
     uint _pad_star_split1;
     uint _pad_star_split2;
 #endif  // !PT_TARGET_SPIRV
@@ -521,7 +533,8 @@ cbuffer Frame {
     // --- end SDF Phase 1 ---------------------------------------------------
     // See `star_split_enabled` in the Metal Push cbuffer above.
     uint star_split_enabled;
-    uint _pad_star_split0;
+    // See `reset_stars_accum` in the Metal Push cbuffer above.
+    uint reset_stars_accum;
     uint _pad_star_split1;
     uint _pad_star_split2;
 };
@@ -2785,7 +2798,15 @@ void main(uint2 tid : SV_DispatchThreadID) {
     // leak stars into the legacy / off path's accum_stars (currently
     // zero) and the finalize stage would composite them twice.
     if (star_split_active) {
-        float4 prev_s = (reset_accum != 0u) ? float4(0,0,0,0) : accum_stars[tid];
+        // Use `reset_stars_accum` (NOT `reset_accum`): the engine forces
+        // `reset_accum=1` every frame on the denoised path so accum_hdr
+        // stays 1-frame for the denoiser's own temporal accumulator.
+        // Sharing that flag with the stars accumulator caused per-frame
+        // flicker because frame_stars (a 1-spp sample with sub-pixel
+        // jitter) was the entire output. `reset_stars_accum` is fired
+        // only on accum_stars (re)allocation or r_star_split toggles,
+        // letting the stars EMA converge across frames.
+        float4 prev_s = (reset_stars_accum != 0u) ? float4(0,0,0,0) : accum_stars[tid];
         {
             // Sanitize prev: mirrors accum_hdr's NaN/Inf guard above.
             bool3 prev_bad = isnan(prev_s.rgb) || isinf(prev_s.rgb);

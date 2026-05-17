@@ -3756,12 +3756,22 @@ void Engine::RenderFrame() {
         // Star-split flag (issue #46). 1 = peel star contribution out
         // of frame_radiance into accum_stars; 0 = legacy fold-into-
         // sky behaviour. See the matching shader-side comment in
-        // PathTrace.slang. Followed by 12 bytes of explicit padding
-        // so the trailing block lands on a 16-byte boundary, matching
-        // the std140 / MSL cbuffer rule the Slang compiler applies
-        // to the shader-side `Push` / `Frame` blocks.
+        // PathTrace.slang. Followed by `reset_stars_accum` + 8 bytes
+        // of pad so the trailing block lands on a 16-byte boundary,
+        // matching the std140 / MSL cbuffer rule the Slang compiler
+        // applies to the shader-side `Push` / `Frame` blocks.
         std::uint32_t star_split_enabled;
-        std::uint32_t _pad_star_split[3];
+        // Per-dispatch reset pulse for accum_stars, DECOUPLED from
+        // `reset_accum`. `reset_accum` is forced to 1 every frame
+        // when a denoiser is active (so accum_hdr stays 1-frame for
+        // the denoiser's own temporal accumulator). The stars
+        // running mean needs the OPPOSITE behaviour -- to converge
+        // across frames so sub-pixel Halton jitter doesn't dominate.
+        // Engine fires this flag from `star_split_reset_pending_`
+        // (alloc / resize / r_star_split toggle); shader uses it in
+        // place of `reset_accum` for the accum_stars read gate.
+        std::uint32_t reset_stars_accum;
+        std::uint32_t _pad_star_split[2];
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -3897,18 +3907,23 @@ void Engine::RenderFrame() {
         engine_star_split_active =
             denoiser_active_ && accum_stars_tex_id_ != 0 && star_split_on;
         push.star_split_enabled = engine_star_split_active ? 1u : 0u;
-        push._pad_star_split[0] = 0u;
-        push._pad_star_split[1] = 0u;
-        push._pad_star_split[2] = 0u;
+        // `reset_stars_accum` + 2 trailing pads are set below where
+        // the per-frame reset pulse is computed.
     }
     // Consume the pending star-accum reset pulse. Set by the
     // accum_stars (re)allocation block above and by r_star_split's
-    // on_change handler (cvar registration site); OR'd into the
-    // primary `reset_accum` flag here so the shader's existing reset
-    // path also zeroes prev_s.a on this dispatch, then cleared so we
-    // don't fire it again next frame.
+    // on_change handler (cvar registration site). Routed to its OWN
+    // `reset_stars_accum` push field -- decoupled from `reset_accum`,
+    // which the engine forces to 1 every frame on the denoised path
+    // (so accum_hdr stays 1-frame for the denoiser's own temporal
+    // accumulator). Sharing `reset_accum` for accum_stars caused
+    // per-frame flicker because the stars running mean reset every
+    // frame and frame_stars (1-spp + Halton jitter) became the entire
+    // output. With this gate the EMA converges across frames.
+    push.reset_stars_accum = star_split_reset_pending_ ? 1u : 0u;
+    push._pad_star_split[0] = 0u;
+    push._pad_star_split[1] = 0u;
     if (star_split_reset_pending_) {
-        push.reset_accum = 1u;
         star_split_reset_pending_ = false;
     }
 
