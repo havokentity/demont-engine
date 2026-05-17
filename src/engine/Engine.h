@@ -257,6 +257,9 @@ private:
     // Mac-Vulkan on pre-1.3 MoltenVK builds that don't expose
     // VK_KHR_acceleration_structure / VK_KHR_ray_query).
     std::uint32_t                               mesh_tri_count_        = 0;
+    // One-shot guard so the "SW linear-scan path with N>threshold tris"
+    // perf-cliff warning fires once per process, not on every CSG bake.
+    bool                                        sw_mesh_perf_warning_fired_ = false;
 
     // P10 denoiser G-buffer textures. Allocated lazily when r_denoiser
     // moves off "off" and freed on backend teardown / when denoiser is

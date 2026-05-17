@@ -1765,6 +1765,15 @@ void Engine::RebuildMeshResources(const pt::csg::BakedMesh& baked) {
     device_->WriteBuffer(ibuf, baked.indices.data(),   ibytes);
     box_vbuf_id_ = vbuf.id;
     box_ibuf_id_ = ibuf.id;
+    // Set mesh_tri_count_ BEFORE the AS build below. If BLAS/TLAS fails
+    // on an RT-capable backend, the early-returns leave vbuf/ibuf
+    // uploaded; with mesh_tri_count_ already set, the next frame's
+    // `sw_mesh_present` gate fires and the shader's SW linear-scan path
+    // renders the mesh instead of silently dropping it. Without this
+    // ordering, an AS failure would leave the engine in a half-built
+    // state -- buffers uploaded but invisible because neither HW nor SW
+    // path triggers.
+    mesh_tri_count_ = baked.TriangleCount();
 
     // BLAS/TLAS build is conditional on hardware ray tracing. When the
     // backend can't host an AS (Mac-Vulkan on pre-1.3 MoltenVK is the
@@ -1773,7 +1782,8 @@ void Engine::RebuildMeshResources(const pt::csg::BakedMesh& baked) {
     // PathTrace.slang linear-scan triangles via the mesh_tri_count > 0
     // branch. Performance scales linearly with TriangleCount() on that
     // path, which is fine for sub-1k-tri scenes like the headline CSG
-    // demos but should not be relied on for production-size meshes.
+    // demos but should not be relied on for production-size meshes --
+    // see the one-shot warning below.
     if (device_->SupportsHardwareRT()) {
         pt::rhi::BLASDesc blas_desc{
             .vertex_positions = baked.positions.data(),
@@ -1784,7 +1794,8 @@ void Engine::RebuildMeshResources(const pt::csg::BakedMesh& baked) {
         };
         auto blas = device_->CreateBLAS(blas_desc);
         if (blas.id == 0) {
-            LOG_ERROR("CSG: BLAS build failed ({} verts, {} tris)",
+            LOG_ERROR("CSG: BLAS build failed ({} verts, {} tris); "
+                      "falling back to SW linear-scan path",
                       baked.VertexCount(), baked.TriangleCount());
             return;
         }
@@ -1804,7 +1815,10 @@ void Engine::RebuildMeshResources(const pt::csg::BakedMesh& baked) {
         auto tlas = device_->CreateTLAS(tlas_desc);
         scene_tlas_id_ = tlas.id;
         if (scene_tlas_id_ == 0) {
-            LOG_ERROR("CSG: TLAS build failed");
+            LOG_ERROR("CSG: TLAS build failed; tearing down BLAS and "
+                      "falling back to SW linear-scan path");
+            device_->DestroyAccelStruct(pt::rhi::AccelStructHandle{box_blas_id_});
+            box_blas_id_ = 0;
             return;
         }
         LOG_INFO("CSG: rebuilt mesh ({} verts, {} tris) -- hw-rt BLAS+TLAS",
@@ -1812,11 +1826,27 @@ void Engine::RebuildMeshResources(const pt::csg::BakedMesh& baked) {
     } else {
         // Software-mesh fallback: vbuf + ibuf are already uploaded above.
         // PathTrace.slang's mesh_tri_count branch reads them directly.
-        // Cache the triangle count so the dispatch path can pass it down.
         LOG_INFO("CSG: rebuilt mesh ({} verts, {} tris) -- software linear-scan (no hw RT)",
                  baked.VertexCount(), baked.TriangleCount());
+
+        // One-shot perf-cliff warning. The SW path is O(tris) per ray
+        // per bounce, so a moderately-sized mesh on a non-RT host
+        // (~10k tris, 6 bounces, 1080p) freezes the renderer at
+        // sub-1-FPS rates. kSwMeshWarnThreshold = 4096 tris is the
+        // empirical knee where it starts hurting visibly on M-series;
+        // sub-1k stays interactive. Set once per process so the log
+        // doesn't spam on every bake.
+        constexpr std::uint32_t kSwMeshWarnThreshold = 4096u;
+        if (baked.TriangleCount() > kSwMeshWarnThreshold &&
+            !sw_mesh_perf_warning_fired_) {
+            LOG_WARN("CSG: mesh has {} tris on the SW linear-scan path "
+                     "(no hardware RT). Performance is O(tris/ray/bounce) -- "
+                     "production-size meshes will tank framerate. Threshold {} "
+                     "tris. Future work: build a triangle BVH on host.",
+                     baked.TriangleCount(), kSwMeshWarnThreshold);
+            sw_mesh_perf_warning_fired_ = true;
+        }
     }
-    mesh_tri_count_ = baked.TriangleCount();
 }
 
 void Engine::SeedDefaultPrimitives() {
@@ -3284,7 +3314,7 @@ void Engine::RenderFrame() {
         // branch on this being non-zero. Zero on every other path -- the
         // shader's existing `tlas_present` test continues to drive the
         // RayQuery branch on RT-capable backends.
-        push.bvh_params[2] = (!tlas_present && sw_mesh_present)
+        push.bvh_params[2] = sw_mesh_present
             ? mesh_tri_count_
             : 0u;
         push.bvh_params[3] = 0u;
