@@ -326,13 +326,12 @@ private:
     // entirely via a `stars_present` push flag -- so the texture slot
     // is bound to a safe 1x1 placeholder purely to satisfy descriptor-
     // set validity, and the GPU never actually samples it. The engine
-    // reuses the existing `bloom_dummy_tex_id_` field (declared a few
-    // members below in this header, search for "bloom_dummy_tex_id_")
-    // for this purpose -- it's a 1x1 RGBA16F allocated for bloom-off
-    // descriptor validity and recycled here rather than allocating a
-    // dedicated star-split companion. Previously we paid ~16 MB at
-    // 1080p for a swapchain-sized zero-fill companion; the push gate
-    // plus this reuse makes that allocation unnecessary.
+    // reuses the existing `bloom_dummy_tex_id_` (a 1x1 RGBA16F
+    // allocated for bloom-off descriptor validity, declared a few
+    // members below in this header) as that placeholder rather than
+    // allocating a dedicated star-split companion. Previously we paid
+    // ~16 MB at 1080p for a swapchain-sized zero-fill companion; the
+    // push gate plus this reuse makes that allocation unnecessary.
     std::uint64_t                               accum_stars_tex_id_ = 0;
     // Tracks whether the star-split accumulator needs a `reset_accum`
     // pulse on the next frame. Set when the user toggles r_star_split

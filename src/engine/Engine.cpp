@@ -3081,14 +3081,6 @@ void Engine::RenderFrame() {
             std::uint16_t zero[4] {0,0,0,0};
             if (dh.id != 0) device_->WriteTexture(dh, zero, sizeof(zero));
         }
-        // Star-split slot (issue #46): reuses the 1x1 bloom_dummy
-        // allocated above as a placeholder when stars aren't routed.
-        // Actual BindStorageTexture calls live at the PathTrace
-        // dispatch site (search for `BindStorageTexture(10,`) and the
-        // Metal Tonemap dispatch site (search for
-        // `BindStorageTexture(3,` near `tonemap_stars_present`); the
-        // shader's `stars_present` push gate elides the read when
-        // the placeholder is bound.
     }
 
     auto* cb = device_->AcquireCommandBuffer();
@@ -3243,6 +3235,11 @@ void Engine::RenderFrame() {
     // PathTrace shader's own runtime gate (`star_split_enabled`)
     // ensures the placeholder is never actually written to or read
     // from when stars aren't active.
+    //
+    // Star-split slot (issue #46): binds accum_stars_tex_id_ when
+    // allocated, otherwise falls back to the 1x1 bloom_dummy as a
+    // placeholder. The shader's `star_split_enabled` push gate elides
+    // the read/write when the placeholder is bound.
     {
         const std::uint64_t stars_id =
             (accum_stars_tex_id_ != 0) ? accum_stars_tex_id_ : bloom_dummy_tex_id_;
@@ -4611,6 +4608,12 @@ void Engine::RenderFrame() {
         // OWN stars binding (DenoiseFinalize.slang binding=4, wired
         // through VulkanDenoiser::EncodeFinalizeOnly / Encode) and
         // never reaches this codepath.
+        // Star-split slot (issue #46): Metal Tonemap.slang slot 3 maps to
+        // MSL texture(3) by declaration order. Binds accum_stars_tex_id_
+        // when allocated and r_star_split is on, otherwise falls back to
+        // the 1x1 bloom_dummy as a placeholder. The shader's
+        // `stars_present` push gate elides the read when the placeholder
+        // is bound.
         bool tonemap_stars_present = false;
         {
             bool r_star_split_on = true;
