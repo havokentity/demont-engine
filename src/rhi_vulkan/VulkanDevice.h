@@ -52,7 +52,7 @@ private:
     // denoiser, mapped to vk::binding 16) plus 3 spare. Metal stays at
     // 8 because MetalFX doesn't take a normal input and the path-tracer
     // shader gates the normal write on PT_TARGET_SPIRV.
-    TextureHandle  bound_tex_[12] {};
+    TextureHandle  bound_tex_[11] {};
     // 11 buffer slots: 8 original (mesh_positions/indices, primitives,
     // marginal/conditional CDFs, exposure_state, analytic-prim bvh_nodes),
     // slots 8/9 for the triangle-BVH (tri_bvh_nodes,

@@ -3559,7 +3559,7 @@ void Engine::RenderFrame() {
         const std::uint64_t stars_id =
             (accum_stars_tex_id_ != 0) ? accum_stars_tex_id_ : bloom_dummy_tex_id_;
         if (stars_id != 0) {
-            cb->BindStorageTexture(11, pt::rhi::TextureHandle{stars_id});
+            cb->BindStorageTexture(10, pt::rhi::TextureHandle{stars_id});
         }
     }
 

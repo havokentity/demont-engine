@@ -80,7 +80,7 @@ private:
     // (normal_tex) isn't silently dropped on the Metal SVGF path; the
     // original 8-slot limit was the only reason normal_tex was gated
     // to PT_TARGET_SPIRV in the path tracer.
-    TextureHandle              bound_tex_[12] {};
+    TextureHandle              bound_tex_[11] {};
     // 11 buffer slots. Slots 0..7 are the original engine layout
     // (mesh_positions / mesh_indices, primitives, marginal /
     // conditional CDFs, exposure_state, analytic-prim bvh_nodes).

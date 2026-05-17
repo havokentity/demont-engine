@@ -109,17 +109,25 @@ constexpr bool kEnableValidation = false;
 // gates the SDF read on push.sdf_params.x > 0.
 // --- end SDF Phase 1 --------------------------------------------------------
 // --- Star-split (#46, round-2 merge) ----------------------------------------
-// Engine texture slot 11 -> vk::binding 22 is the accum_stars storage
+// Engine texture slot 10 -> vk::binding 22 is the accum_stars storage
 // image used by the star-split bypass of the SVGF a-trous kernel.
 // PathTrace writes; DenoiseFinalize + Tonemap composite back in pre-ACES.
 // Moved from binding 21 because SDF Phase 1 (#109) claimed that binding
-// for its storage buffer; the two would have collided in Vulkan's flat
-// descriptor space. Engine texture slot 10 is reserved (no binding); it
-// only existed in the round-1 layout when stars lived at slot 10. The
-// engine binds accum_stars at slot 11 directly; slot 10 in the texture
-// space is never touched.
+// for its STORAGE BUFFER -- the two would have collided in Vulkan's flat
+// descriptor space, but the SLOT-10 collision was a phantom: the engine
+// keeps separate slot namespaces for textures (`kSlotToTexBinding[]`)
+// and buffers (`kSlotToBufBinding[]`), and on Metal the texture / buffer
+// argument-table indices are likewise distinct. So texture-slot 10 can
+// host accum_stars without conflicting with buffer-slot 10's SDF
+// clusters. Choosing slot 10 (rather than 11) also keeps the Metal
+// declaration-order MSL slot honest: PathTrace.slang declares
+// accum_stars as the 11th texture (0-indexed = MSL texture(10)), and
+// Slang's MSL backend assigns texture indices by declaration order, so
+// the engine must call `BindStorageTexture(10, ...)` for the Metal path
+// to wire up. The earlier slot-11 layout left accum_stars unbound on
+// Metal (MSL texture(11) doesn't exist) -- stars rendered invisibly.
 // --- end Star-split ---------------------------------------------------------
-static constexpr std::uint32_t kNumTexSlots = 12;
+static constexpr std::uint32_t kNumTexSlots = 11;
 constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     0,  // engine slot 0  -> shader binding 0  (output / swapchain)
     1,  // engine slot 1  -> shader binding 1  (accum_hdr)
@@ -131,17 +139,13 @@ constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     13, // engine slot 7  -> shader binding 13 (moon_map)
     16, // engine slot 8  -> shader binding 16 (normal_tex, SVGF/NRD/OptiX-AOV)
     17, // engine slot 9  -> shader binding 17 (albedo_tex, OptiX AOV only)
-    0,  // engine slot 10 -> unused on the texture path (SDF clusters
-        //                   live in the buffer slot table at slot 10).
-        //                   Iteration gate at LookupImageView skips this
-        //                   entry because nothing ever binds a texture
-        //                   here; the entry exists only so slot 11 lines
-        //                   up with the engine-side BindStorageTexture(11)
-        //                   call for accum_stars.
-    22, // engine slot 11 -> shader binding 22 (accum_stars, issue #46;
+    22, // engine slot 10 -> shader binding 22 (accum_stars, issue #46;
         //                   moved from binding 21 in round-2 merge with
         //                   main after SDF Phase 1 #109 took binding 21
-        //                   for its storage buffer).
+        //                   for its storage buffer. Slot index 10 is
+        //                   shared with the buffer-slot table's SDF
+        //                   entry only by NUMBER; the namespaces are
+        //                   distinct on both backends.)
 };
 constexpr std::uint32_t kSlotToBufBinding[11] = {
     0,  // engine slot 0 unused
