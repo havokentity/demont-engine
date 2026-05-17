@@ -3910,28 +3910,32 @@ void Engine::RenderFrame() {
         // `reset_stars_accum` + 2 trailing pads are set below where
         // the per-frame reset pulse is computed.
     }
-    // Compute the per-dispatch reset pulse for accum_stars.
-    // `star_split_reset_pending_` fires on (re)allocation and on
-    // r_star_split toggle -- discrete events that genuinely
-    // invalidate prior history.
+    // Per-dispatch reset pulse for accum_stars. Fires on
+    //   (1) `star_split_reset_pending_` -- (re)alloc, r_star_split toggle.
+    //   (2) `accum_dirty_` -- camera motion, sun/sky position changes,
+    //       time-of-day changes (everything that invalidates accum_hdr
+    //       history). Without (2), the previous frame's pixel direction
+    //       stays glued to the screen on camera pan.
     //
-    // We deliberately DO NOT OR `accum_dirty_` (or `cam_moved`)
-    // into this gate, even though both invalidate accum_hdr. The
-    // denoised path forces `reset_accum = 1` every frame so
-    // accum_hdr stays 1-frame for the denoiser to do its OWN
-    // motion-vector reprojection (SVGF re-uses the
-    // depth/motion/normal G-buffer; MetalFX consumes its own motion
-    // input). accum_stars has no equivalent reprojection path -- if
-    // we reset on cam_moved, every frame of continuous panning gives
-    // a 1-spp star sample with sub-pixel Halton jitter, which reads
-    // as rapid flicker on screen. The trade-off without proper
-    // motion-vector reprojection: stars ghost briefly during a pan
-    // (the previous direction's pattern fades while the new one
-    // builds in via the running mean) and snap-converge once motion
-    // stops. Better stable+ghosted than fresh+flickering. A follow-up
-    // could route accum_stars through the same motion-vector pipeline
-    // SVGF uses for accum_hdr to recover both freshness AND stability.
-    push.reset_stars_accum = star_split_reset_pending_ ? 1u : 0u;
+    // Decoupled from `reset_accum` (which the engine forces to 1 every
+    // frame on the denoised path so accum_hdr stays 1-frame for the
+    // denoiser's own temporal accumulator). Sharing `reset_accum` for
+    // accum_stars caused per-frame flicker because the running mean
+    // reset every frame and frame_stars (1-spp + Halton jitter)
+    // became the entire output.
+    //
+    // KNOWN TRADE-OFF: while the camera is in continuous motion,
+    // accum_dirty_ fires every frame, so accum_stars resets every
+    // frame too -- stars flicker rapidly during a pan. The proper
+    // fix is motion-vector reprojection of accum_stars (#113); short
+    // of that, the alternative path is the stateless StarsComposite
+    // rewrite (#46 follow-up below) that dispenses with the
+    // accumulator entirely. This branch keeps the running mean +
+    // accum_dirty trigger so static views are stable AND camera
+    // tracking works; the user makes the flicker-during-motion
+    // trade-off explicitly.
+    push.reset_stars_accum =
+        (star_split_reset_pending_ || accum_dirty_) ? 1u : 0u;
     push._pad_star_split[0] = 0u;
     push._pad_star_split[1] = 0u;
     if (star_split_reset_pending_) {
