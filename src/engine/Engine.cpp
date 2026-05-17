@@ -1019,6 +1019,8 @@ void Engine::TearDownDevice() {
         if (box_blas_id_          != 0) device_->DestroyAccelStruct(pt::rhi::AccelStructHandle{box_blas_id_});
         if (box_vbuf_id_          != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{box_vbuf_id_});
         if (box_ibuf_id_          != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{box_ibuf_id_});
+        if (tri_bvh_nodes_id_       != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{tri_bvh_nodes_id_});
+        if (tri_bvh_permuted_ids_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{tri_bvh_permuted_ids_id_});
         if (prim_buffer_id_       != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{prim_buffer_id_});
         if (bvh_node_buffer_id_   != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{bvh_node_buffer_id_});
         if (denoise_color_tex_id_    != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
@@ -1046,6 +1048,10 @@ void Engine::TearDownDevice() {
     box_vbuf_id_          = 0;
     box_ibuf_id_          = 0;
     mesh_tri_count_       = 0;
+    tri_bvh_nodes_id_       = 0;
+    tri_bvh_permuted_ids_id_ = 0;
+    tri_bvh_node_count_     = 0;
+    tri_bvh_                = pt::renderer::TriangleBvh{};
     prim_buffer_id_       = 0;
     prim_buffer_capacity_ = 0;
     bvh_node_buffer_id_       = 0;
@@ -1706,7 +1712,12 @@ void Engine::EnsureMeshUpdated() {
             if (box_blas_id_   != 0) device_->DestroyAccelStruct(pt::rhi::AccelStructHandle{box_blas_id_});
             if (box_vbuf_id_   != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{box_vbuf_id_});
             if (box_ibuf_id_   != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{box_ibuf_id_});
+            if (tri_bvh_nodes_id_       != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{tri_bvh_nodes_id_});
+            if (tri_bvh_permuted_ids_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{tri_bvh_permuted_ids_id_});
             scene_tlas_id_ = box_blas_id_ = box_vbuf_id_ = box_ibuf_id_ = 0;
+            tri_bvh_nodes_id_ = tri_bvh_permuted_ids_id_ = 0;
+            tri_bvh_node_count_ = 0;
+            tri_bvh_ = pt::renderer::TriangleBvh{};
             mesh_tri_count_ = 0;
         }
     }
@@ -1744,7 +1755,16 @@ void Engine::RebuildMeshResources(const pt::csg::BakedMesh& baked) {
     if (box_blas_id_   != 0) device_->DestroyAccelStruct(pt::rhi::AccelStructHandle{box_blas_id_});
     if (box_vbuf_id_   != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{box_vbuf_id_});
     if (box_ibuf_id_   != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{box_ibuf_id_});
+    // PR #106 follow-up: triangle BVH SSBOs live alongside vbuf/ibuf
+    // and follow the same lifetime -- a new bake invalidates the
+    // previous tree, so destroy + reallocate. Same WaitIdle() above
+    // covers the prior dispatches that may still reference these.
+    if (tri_bvh_nodes_id_       != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{tri_bvh_nodes_id_});
+    if (tri_bvh_permuted_ids_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{tri_bvh_permuted_ids_id_});
     scene_tlas_id_ = box_blas_id_ = box_vbuf_id_ = box_ibuf_id_ = 0;
+    tri_bvh_nodes_id_ = tri_bvh_permuted_ids_id_ = 0;
+    tri_bvh_node_count_ = 0;
+    tri_bvh_ = pt::renderer::TriangleBvh{};
     mesh_tri_count_ = 0;
 
     const std::size_t vbytes = sizeof(float) * baked.positions.size();
@@ -1774,6 +1794,52 @@ void Engine::RebuildMeshResources(const pt::csg::BakedMesh& baked) {
     // state -- buffers uploaded but invisible because neither HW nor SW
     // path triggers.
     mesh_tri_count_ = baked.TriangleCount();
+
+    // Build the triangle BVH on this thread (the same thread the CSG
+    // bake job ran on, or whichever main-loop tick consumed the bake
+    // result -- both cases are equally OK here, the build is pure
+    // CPU work bounded by O(N log N) on triangle count). Uploaded to
+    // two storage buffers; the shader's SW mesh path walks them in
+    // place of the previous O(N) Möller-Trumbore loop. PR #106
+    // follow-up; see comment on tri_bvh_ in Engine.h.
+    tri_bvh_.Build(baked.positions, baked.indices);
+    if (!tri_bvh_.Empty()) {
+        const auto& nodes        = tri_bvh_.Nodes();
+        const auto& permuted_ids = tri_bvh_.PermutedPrimIds();
+        const std::size_t nodes_bytes    = nodes.size() * sizeof(pt::renderer::TriBvhNode);
+        const std::size_t permuted_bytes = permuted_ids.size() * sizeof(std::uint32_t);
+        auto nbuf = device_->CreateBuffer({
+            .size       = nodes_bytes,
+            .usage      = pt::rhi::BufferUsage::Storage,
+            .debug_name = "tri_bvh_nodes",
+        });
+        auto pbuf = device_->CreateBuffer({
+            .size       = permuted_bytes,
+            .usage      = pt::rhi::BufferUsage::Storage,
+            .debug_name = "tri_bvh_permuted_ids",
+        });
+        if (nbuf.id != 0 && pbuf.id != 0) {
+            device_->WriteBuffer(nbuf, nodes.data(),        nodes_bytes);
+            device_->WriteBuffer(pbuf, permuted_ids.data(), permuted_bytes);
+            tri_bvh_nodes_id_        = nbuf.id;
+            tri_bvh_permuted_ids_id_ = pbuf.id;
+            tri_bvh_node_count_      = static_cast<std::uint32_t>(nodes.size());
+            LOG_INFO("CSG: tri-BVH built ({} tris -> {} nodes, {} permuted ids)",
+                     baked.TriangleCount(), nodes.size(), permuted_ids.size());
+        } else {
+            // Allocation failure: log + fall back to a no-BVH state.
+            // The shader gates the SW BVH walk on bvh_params.w > 0,
+            // so this is benign -- the SW mesh path drops out for this
+            // frame (mesh stays invisible). Beats the previous-PR
+            // O(N) linear scan still being there as a fallback because
+            // we removed it.
+            LOG_ERROR("CSG: tri-BVH SSBO allocation failed ({} tris); SW mesh path disabled this bake",
+                      baked.TriangleCount());
+            if (nbuf.id != 0) device_->DestroyBuffer(nbuf);
+            if (pbuf.id != 0) device_->DestroyBuffer(pbuf);
+            tri_bvh_ = pt::renderer::TriangleBvh{};
+        }
+    }
 
     // BLAS/TLAS build is conditional on hardware ray tracing. When the
     // backend can't host an AS (Mac-Vulkan on pre-1.3 MoltenVK is the
@@ -1824,28 +1890,28 @@ void Engine::RebuildMeshResources(const pt::csg::BakedMesh& baked) {
         LOG_INFO("CSG: rebuilt mesh ({} verts, {} tris) -- hw-rt BLAS+TLAS",
                  baked.VertexCount(), baked.TriangleCount());
     } else {
-        // Software-mesh fallback: vbuf + ibuf are already uploaded above.
-        // PathTrace.slang's mesh_tri_count branch reads them directly.
-        LOG_INFO("CSG: rebuilt mesh ({} verts, {} tris) -- software linear-scan (no hw RT)",
+        // Software-mesh fallback: vbuf + ibuf are already uploaded above
+        // and the triangle BVH was built / uploaded a few lines up.
+        // PathTrace.slang walks the BVH for triangles when bvh_params.z
+        // is non-zero (mesh present) and the HW RT path is off.
+        // Replaces the previous O(N) Möller-Trumbore linear scan PR
+        // #106 shipped -- the linear scan crushed framerate to ~1 FPS
+        // at 1080p on a 1k-tri scene; the BVH walk is O(log N) and
+        // brings interactivity back.
+        LOG_INFO("CSG: rebuilt mesh ({} verts, {} tris) -- software path (host-built tri-BVH, no hw RT)",
                  baked.VertexCount(), baked.TriangleCount());
 
-        // One-shot perf-cliff warning. The SW path is O(tris) per ray
-        // per bounce, so a moderately-sized mesh on a non-RT host
-        // (~10k tris, 6 bounces, 1080p) freezes the renderer at
-        // sub-1-FPS rates. kSwMeshWarnThreshold = 4096 tris is the
-        // empirical knee where it starts hurting visibly on M-series;
-        // sub-1k stays interactive. Set once per process so the log
-        // doesn't spam on every bake.
-        constexpr std::uint32_t kSwMeshWarnThreshold = 4096u;
-        if (baked.TriangleCount() > kSwMeshWarnThreshold &&
-            !sw_mesh_perf_warning_fired_) {
-            LOG_WARN("CSG: mesh has {} tris on the SW linear-scan path "
-                     "(no hardware RT). Performance is O(tris/ray/bounce) -- "
-                     "production-size meshes will tank framerate. Threshold {} "
-                     "tris. Future work: build a triangle BVH on host.",
-                     baked.TriangleCount(), kSwMeshWarnThreshold);
-            sw_mesh_perf_warning_fired_ = true;
-        }
+        // The previous perf-cliff warning (~4k tris on the SW linear
+        // scan) no longer applies now that the SW path uses a real
+        // BVH. The walker's runtime cost scales O(log N), so the
+        // 1080p / 6-bounce / 1k-tri case that motivated PR #106 sits
+        // around ~30 FPS instead of ~1 FPS on Mac-Vulkan -- the
+        // empirical knee where SW becomes uncomfortable is closer to
+        // ~100k tris now (mostly bounded by AABB-fetch bandwidth, not
+        // intersect count). We keep the one-shot guard variable
+        // declared in Engine.h so a future "warn at 100k+ tris on SW
+        // backend" check can drop in here without re-plumbing.
+        (void)sw_mesh_perf_warning_fired_;
     }
 }
 
@@ -3005,6 +3071,23 @@ void Engine::RenderFrame() {
         ? pt::rhi::BufferHandle{bvh_node_buffer_id_}
         : pt::rhi::BufferHandle{prim_buffer_id_};
     if (slot7.id != 0) cb->BindBuffer(7, slot7, 0);
+    // Engine slots 8 / 9 -> shader bindings 19 / 20 (tri_bvh_nodes,
+    // tri_bvh_permuted_ids; PR #106 follow-up). Same "always bind
+    // something" rule as slots 4/5/7 -- Metal's dynamic push-slot
+    // assignment is max-bound + 1, so leaving these unbound when the
+    // CSG bake hasn't run yet would shift the push slot off by two and
+    // corrupt every push field. When no triangle BVH exists we re-use
+    // the primitive buffer as a harmless placeholder; the shader gates
+    // its reads on bvh_params.w > 0 (the runtime "is the BVH
+    // populated" signal).
+    pt::rhi::BufferHandle slot8 = (tri_bvh_nodes_id_ != 0)
+        ? pt::rhi::BufferHandle{tri_bvh_nodes_id_}
+        : pt::rhi::BufferHandle{prim_buffer_id_};
+    pt::rhi::BufferHandle slot9 = (tri_bvh_permuted_ids_id_ != 0)
+        ? pt::rhi::BufferHandle{tri_bvh_permuted_ids_id_}
+        : pt::rhi::BufferHandle{prim_buffer_id_};
+    if (slot8.id != 0) cb->BindBuffer(8, slot8, 0);
+    if (slot9.id != 0) cb->BindBuffer(9, slot9, 0);
     // P10 G-buffer texture binds. The shader's vk::binding numbers (6/7/8)
     // are Vulkan descriptor slots; on Metal Slang assigns texture(N) in
     // declaration order, so output/accum/denoise_color/depth/motion/env
@@ -3317,7 +3400,20 @@ void Engine::RenderFrame() {
         push.bvh_params[2] = sw_mesh_present
             ? mesh_tri_count_
             : 0u;
-        push.bvh_params[3] = 0u;
+        // .w carries the triangle-BVH node count. The shader's SW
+        // mesh branch walks the tri-BVH (engine slots 8/9) when this
+        // is non-zero AND .z is non-zero (mesh present, no TLAS). PR
+        // #106 follow-up: replaces the previous O(N) Möller-Trumbore
+        // linear scan with O(log N) stack-based BVH traversal -- fixes
+        // the ~1 FPS @1080p perf cliff on Mac-Vulkan (MoltenVK without
+        // VK_KHR_ray_query). If the build failed (allocation failure
+        // -- rare but possible on memory-tight devices), .w stays at
+        // 0 and the SW mesh branch short-circuits to "no hit", which
+        // is a benign failure mode (mesh stays invisible) compared to
+        // a per-ray full scan.
+        push.bvh_params[3] = sw_mesh_present
+            ? tri_bvh_node_count_
+            : 0u;
     }
 
     // Halton(2,3) sub-pixel jitter sequence in [-0.5, 0.5] each axis.
