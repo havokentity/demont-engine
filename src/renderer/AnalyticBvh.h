@@ -3,11 +3,108 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <span>
 #include <vector>
 
 namespace pt::renderer {
+
+// --- SDF Phase 1 (#97) -----------------------------------------------------
+// Signed-distance-field primitives. Each `SdfPrim` is one self-contained
+// SDF expression -- either a single primitive (sphere / box / torus /
+// capsule / rounded box / plane) or a flat sequence of those leaves
+// combined via smooth-CSG ops (smin / smax / sdiff / displace). A
+// cluster has a tight world-space AABB used as the BVH bound; the shader
+// only sphere-traces *inside* that AABB after the BVH says the ray
+// entered it.
+//
+// On-GPU layout per cluster: a fixed-size "header" block (material +
+// AABB) followed by a small fixed-size array of node records that the
+// shader walks linearly to evaluate the distance. Keeping the per-node
+// stride identical on host and shader is load-bearing for the same
+// std430 / MSL-padding reasons documented on BvhNode above.
+//
+// IMPORTANT: SDFs live in a SEPARATE primitive buffer from AnalyticPrim.
+// The existing analytic-primitive path is untouched so its goldens stay
+// bit-exact across this change.
+
+// SDF leaf-primitive kinds. Numeric values are part of the host/shader
+// wire format -- never renumber without bumping the shader too.
+enum SdfShape : std::uint32_t {
+    SDF_SHAPE_SPHERE       = 0,   // params: radius
+    SDF_SHAPE_BOX          = 1,   // params: half-extents (3)
+    SDF_SHAPE_ROUNDED_BOX  = 2,   // params: half-extents (3), corner radius
+    SDF_SHAPE_TORUS        = 3,   // params: major radius R, minor radius r
+    SDF_SHAPE_CAPSULE      = 4,   // params: half-length on +Y axis, radius
+    SDF_SHAPE_PLANE        = 5,   // params: unit normal (3), distance d (n . p + d = 0)
+};
+
+// SDF CSG ops. opSmoothUnion / opSmoothSubtract / opSmoothIntersect (k
+// is the smoothing radius in metres); opDisplace adds a scalar bump
+// magnitude to its child. See SdfPrimitives.slang for the formulas.
+enum SdfOp : std::uint32_t {
+    SDF_OP_LEAF             = 0,   // params: see SdfShape above
+    SDF_OP_SMOOTH_UNION     = 1,   // children: a, b; param k
+    SDF_OP_SMOOTH_SUBTRACT  = 2,   // children: a, b; param k (b carved from a)
+    SDF_OP_SMOOTH_INTERSECT = 3,   // children: a, b; param k
+    SDF_OP_DISPLACE         = 4,   // children: a; param amp (analytic bump along normal)
+};
+
+// One node in a cluster's flat op-tree. Children are *node indices*
+// within the same cluster; the root is always node 0. The shader walks
+// the array in post-order so that by the time we reach a node, its
+// children's evaluated distances are already in a small register stack.
+// We keep nodes_per_cluster fixed and small (Phase 1: <= 8 per cluster)
+// so the shader can keep the stack in registers without spilling.
+struct SdfNode {
+    std::uint32_t op       = SDF_OP_LEAF;        // SdfOp
+    std::uint32_t shape    = SDF_SHAPE_SPHERE;   // SdfShape (only meaningful when op == LEAF)
+    std::uint32_t child_a  = 0;                  // index of left child  (ops only)
+    std::uint32_t child_b  = 0;                  // index of right child (binary ops only)
+    // Per-node parameters. Layout:
+    //   LEAF SPHERE        : params[0]=radius
+    //   LEAF BOX           : params[0..2]=half-extents
+    //   LEAF ROUNDED_BOX   : params[0..2]=half-extents, params[3]=corner radius
+    //   LEAF TORUS         : params[0]=R, params[1]=r
+    //   LEAF CAPSULE       : params[0]=half-height, params[1]=radius
+    //   LEAF PLANE         : params[0..2]=normal (unit), params[3]=d
+    //   SMOOTH_*           : params[0]=k (smoothing radius, metres)
+    //   DISPLACE           : params[0]=amplitude (metres)
+    float         params[4] {0.0f, 0.0f, 0.0f, 0.0f};
+    // Local-frame origin/offset. The shape SDF is evaluated against
+    // (p - center). For ops this lane is reserved (zeroed).
+    float         center[3] {0.0f, 0.0f, 0.0f};
+    std::uint32_t _pad      = 0;     // pad to 48B for clean std430 stride
+};
+static_assert(sizeof(SdfNode) == 48, "SdfNode must be 48 bytes for std430 stride");
+
+// One SDF cluster. A cluster maps 1:1 to a BVH leaf primitive. Up to
+// kSdfMaxNodes nodes per cluster (Phase 1 -- expression size budget;
+// row of `sdf_smin(a, b, k)` only needs 3 nodes each so the typical
+// scene stays well under). AABB is computed by the host from the leaf
+// shapes plus the smoothing radius.
+//
+// Material follows the AnalyticPrim convention (0=Lambert,1=Metal,
+// 2=Dielectric) so hits feed the same BSDF path as analytic prims.
+struct SdfPrim {
+    static constexpr std::uint32_t kMaxNodes = 8;
+    std::array<SdfNode, kMaxNodes> nodes {};
+    std::uint32_t node_count   = 0;
+    std::uint32_t material     = 0;     // 0 Lambert, 1 Metal, 2 Dielectric
+    float         aabb_min[3]  {0.0f, 0.0f, 0.0f};
+    float         aabb_max[3]  {0.0f, 0.0f, 0.0f};
+    float         albedo[3]    {0.7f, 0.7f, 0.7f};
+    float         roughness    = 0.0f;
+    float         ior          = 1.5f;
+    std::uint32_t _pad[3]      {0, 0, 0}; // pad to clean std430 boundary
+};
+// kMaxNodes * 48 = 384 nodes block. + 4 (node_count) + 4 (material) +
+// 12 (aabb_min) + 12 (aabb_max) + 12 (albedo) + 4 (roughness) + 4 (ior)
+// + 12 (pad) = 464. Bump if you add fields.
+static_assert(sizeof(SdfPrim) == 48 * 8 + 4 + 4 + 12 + 12 + 12 + 4 + 4 + 12,
+              "SdfPrim layout drift");
+// --- end SDF Phase 1 -------------------------------------------------------
 
 // Flat-linear binary BVH over analytic primitives that have a finite
 // bounding box (spheres today; future: box, disk, cylinder). Planes are
@@ -93,5 +190,19 @@ private:
     std::vector<BvhNode>            nodes_;
     std::vector<std::uint32_t>      permuted_;
 };
+
+// --- SDF Phase 1 (#97) -----------------------------------------------------
+// Walk the cluster's op-tree and fill aabb_min / aabb_max in-place with
+// a tight world-space AABB that bounds the root expression's zero-isosurface.
+//
+// Leaf shapes contribute their analytic AABB; ops widen by their k /
+// amplitude (smoothing radius / displacement magnitude). This is the
+// envelope the path tracer's BVH leaf will use to bound the sphere-
+// tracing loop, so the bound MUST be a true superset of the actual
+// isosurface (false negatives = missed hits, false positives = wasted
+// step budget but rendering stays correct). Returns false if the prim
+// is malformed (e.g. node_count == 0 or a child index out of range).
+bool ComputeSdfAabb(SdfPrim& prim);
+// --- end SDF Phase 1 -------------------------------------------------------
 
 }  // namespace pt::renderer

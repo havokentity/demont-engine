@@ -9,6 +9,161 @@
 
 namespace pt::renderer {
 
+// --- SDF Phase 1 (#97) -----------------------------------------------------
+namespace {
+
+// Per-leaf AABB in shape-local space (i.e. relative to node.center).
+// Returns false if the leaf is degenerate (zero radius / extent).
+bool LeafLocalAabb(const SdfNode& n, float (&mn)[3], float (&mx)[3]) {
+    switch (n.shape) {
+        case SDF_SHAPE_SPHERE: {
+            float r = n.params[0];
+            if (r <= 0.0f) return false;
+            mn[0] = -r; mn[1] = -r; mn[2] = -r;
+            mx[0] =  r; mx[1] =  r; mx[2] =  r;
+            return true;
+        }
+        case SDF_SHAPE_BOX: {
+            float hx = n.params[0], hy = n.params[1], hz = n.params[2];
+            if (hx <= 0.0f || hy <= 0.0f || hz <= 0.0f) return false;
+            mn[0] = -hx; mn[1] = -hy; mn[2] = -hz;
+            mx[0] =  hx; mx[1] =  hy; mx[2] =  hz;
+            return true;
+        }
+        case SDF_SHAPE_ROUNDED_BOX: {
+            // Rounded box's surface lies outside the half-extents by the
+            // corner radius, so widen the AABB by r in every direction.
+            float hx = n.params[0] + n.params[3];
+            float hy = n.params[1] + n.params[3];
+            float hz = n.params[2] + n.params[3];
+            if (hx <= 0.0f || hy <= 0.0f || hz <= 0.0f) return false;
+            mn[0] = -hx; mn[1] = -hy; mn[2] = -hz;
+            mx[0] =  hx; mx[1] =  hy; mx[2] =  hz;
+            return true;
+        }
+        case SDF_SHAPE_TORUS: {
+            // Torus laid in XZ plane (Y is the symmetry axis), major
+            // radius R, minor radius r. Outer XZ radius is R+r; Y
+            // extent is +/- r.
+            float R = n.params[0];
+            float r = n.params[1];
+            if (R <= 0.0f || r <= 0.0f) return false;
+            mn[0] = -(R + r); mn[1] = -r; mn[2] = -(R + r);
+            mx[0] =  (R + r); mx[1] =  r; mx[2] =  (R + r);
+            return true;
+        }
+        case SDF_SHAPE_CAPSULE: {
+            // Capsule from (0, -h, 0) to (0, +h, 0) with radius r.
+            float h = n.params[0];
+            float r = n.params[1];
+            if (h < 0.0f || r <= 0.0f) return false;
+            mn[0] = -r; mn[1] = -h - r; mn[2] = -r;
+            mx[0] =  r; mx[1] =  h + r; mx[2] =  r;
+            return true;
+        }
+        case SDF_SHAPE_PLANE: {
+            // Plane is infinite -- the host caller should not put a
+            // plane SDF in a cluster (planes belong on the analytic-
+            // primitive linear path). Refuse so we don't try to box-
+            // bound infinity.
+            return false;
+        }
+    }
+    return false;
+}
+
+// Recursive AABB walker. Returns false if a malformed reference is hit.
+bool NodeAabb(const SdfPrim& prim, std::uint32_t idx,
+              float (&mn)[3], float (&mx)[3]) {
+    if (idx >= prim.node_count) return false;
+    const SdfNode& n = prim.nodes[idx];
+    auto translate = [&](float (&a)[3], float (&b)[3]) {
+        for (int i = 0; i < 3; ++i) { a[i] += n.center[i]; b[i] += n.center[i]; }
+    };
+    auto widen = [](float (&a)[3], float (&b)[3], float k) {
+        for (int i = 0; i < 3; ++i) { a[i] -= k; b[i] += k; }
+    };
+    auto union_aabb = [](float (&a)[3], float (&b)[3],
+                         const float (&u)[3], const float (&v)[3]) {
+        for (int i = 0; i < 3; ++i) {
+            a[i] = std::min(a[i], u[i]);
+            b[i] = std::max(b[i], v[i]);
+        }
+    };
+    switch (n.op) {
+        case SDF_OP_LEAF: {
+            float lmn[3], lmx[3];
+            if (!LeafLocalAabb(n, lmn, lmx)) return false;
+            for (int i = 0; i < 3; ++i) { mn[i] = lmn[i]; mx[i] = lmx[i]; }
+            translate(mn, mx);
+            return true;
+        }
+        case SDF_OP_SMOOTH_UNION:
+        case SDF_OP_SMOOTH_INTERSECT: {
+            // Smooth blend can bulge the surface outward by ~k. Union
+            // bounds = union of children's bounds + k pad. Intersect
+            // bounds = the children's overlap; conservatively reuse
+            // child A's bounds widened by k (intersect can't be larger
+            // than either operand).
+            float amn[3], amx[3], bmn[3], bmx[3];
+            if (!NodeAabb(prim, n.child_a, amn, amx)) return false;
+            if (!NodeAabb(prim, n.child_b, bmn, bmx)) return false;
+            if (n.op == SDF_OP_SMOOTH_UNION) {
+                for (int i = 0; i < 3; ++i) {
+                    mn[i] = amn[i]; mx[i] = amx[i];
+                }
+                union_aabb(mn, mx, bmn, bmx);
+            } else { // SMOOTH_INTERSECT
+                for (int i = 0; i < 3; ++i) {
+                    mn[i] = std::max(amn[i], bmn[i]);
+                    mx[i] = std::min(amx[i], bmx[i]);
+                }
+            }
+            widen(mn, mx, std::max(0.0f, n.params[0]));
+            return true;
+        }
+        case SDF_OP_SMOOTH_SUBTRACT: {
+            // a - b: result is at most a, possibly carved smaller.
+            // Reuse a's AABB widened by k (the smooth carve can bulge
+            // by k along the cut boundary).
+            float amn[3], amx[3], bmn[3], bmx[3];
+            if (!NodeAabb(prim, n.child_a, amn, amx)) return false;
+            if (!NodeAabb(prim, n.child_b, bmn, bmx)) return false;
+            for (int i = 0; i < 3; ++i) {
+                mn[i] = amn[i]; mx[i] = amx[i];
+            }
+            widen(mn, mx, std::max(0.0f, n.params[0]));
+            return true;
+        }
+        case SDF_OP_DISPLACE: {
+            float amn[3], amx[3];
+            if (!NodeAabb(prim, n.child_a, amn, amx)) return false;
+            for (int i = 0; i < 3; ++i) { mn[i] = amn[i]; mx[i] = amx[i]; }
+            widen(mn, mx, std::abs(n.params[0]));
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+bool ComputeSdfAabb(SdfPrim& prim) {
+    if (prim.node_count == 0 || prim.node_count > SdfPrim::kMaxNodes) return false;
+    float mn[3], mx[3];
+    // Convention: the LAST node in the flat array is the root of the
+    // merged op-tree (matches the shader's `dists[node_count - 1]` read
+    // in sdfClusterDist / sdfClusterNormal). Walk from there so the
+    // AABB reflects the actual expression, not just child A.
+    if (!NodeAabb(prim, prim.node_count - 1u, mn, mx)) return false;
+    for (int i = 0; i < 3; ++i) {
+        prim.aabb_min[i] = mn[i];
+        prim.aabb_max[i] = mx[i];
+    }
+    return true;
+}
+// --- end SDF Phase 1 -------------------------------------------------------
+
 namespace {
 
 inline void AabbInclude(float (&mn)[3], float (&mx)[3],
