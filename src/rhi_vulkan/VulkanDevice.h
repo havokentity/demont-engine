@@ -53,8 +53,11 @@ private:
     // 8 because MetalFX doesn't take a normal input and the path-tracer
     // shader gates the normal write on PT_TARGET_SPIRV.
     TextureHandle  bound_tex_[12] {};
-    BufferHandle   bound_buf_[8] {};
-    std::size_t    bound_buf_off_[8] {};
+    // 9 buffer slots: engine slot 8 added by SDF Phase 1 (#97) for the
+    // SDF cluster storage buffer (vk::binding 19). Keep this in sync
+    // with kSlotToBufBinding[] in VulkanDevice.cpp.
+    BufferHandle   bound_buf_[9] {};
+    std::size_t    bound_buf_off_[9] {};
     AccelStructHandle bound_accel_[4] {};
     // Push-constant staging. Sized to fit the full PtPush (~448B today)
     // plus growth headroom so the engine can keep treating push as one

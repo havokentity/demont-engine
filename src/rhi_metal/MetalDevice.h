@@ -81,8 +81,12 @@ private:
     // original 8-slot limit was the only reason normal_tex was gated
     // to PT_TARGET_SPIRV in the path tracer.
     TextureHandle              bound_tex_[12] {};
-    BufferHandle               bound_buf_[8] {};
-    std::size_t                bound_buf_off_[8] {};
+    // 9 buffer slots: engine slot 8 added by SDF Phase 1 (#97) for the
+    // SDF cluster storage buffer (MSL slot 8 in the path tracer's
+    // dynamic buffer-slot layout). Keep in sync with the engine's
+    // BindBuffer(8, ...) call site.
+    BufferHandle               bound_buf_[9] {};
+    std::size_t                bound_buf_off_[9] {};
     AccelStructHandle          bound_accel_[4] {};
 
     // Push-constant buffer. Sized to fit the unified PathTrace push

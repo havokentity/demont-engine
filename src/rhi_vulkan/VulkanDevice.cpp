@@ -81,19 +81,25 @@ constexpr bool kEnableValidation = false;
 #endif
 
 // Engine slot -> shader vk::binding translation. The unified descriptor
-// set has 19 bindings (0-18): storage_image x10 (output / accum_hdr /
+// set has 20 bindings (0-19): storage_image x10 (output / accum_hdr /
 // denoise_color / depth / motion / env_map / star_map / moon_map /
-// normal_tex / albedo_tex), AS x1 (scene_tlas), storage_buffer x7
-// (mesh / cdf / exposure_state / bvh_nodes), uniform_buffer x1 (Frame
-// UBO at binding 14). Tonemap / Bloom* re-use a subset. Engine.cpp uses
-// up-to-10-element textures, 8-element buffers, and 4-element
-// accel-struct slot arrays as if Metal-style argument tables; we
-// flatten these into the single Vulkan descriptor set here. Engine
-// slot 8 (normal_tex / vk::binding 16) and slot 9 (albedo_tex /
-// vk::binding 17) are Vulkan-only -- the SVGF/NRD path tracer writes
-// normal; only OptiX AOV (optix_hdr_aov) writes albedo. Engine slot 7
-// (bvh_nodes / vk::binding 18) is populated for the analytic-prim BVH
-// path on either backend.
+// normal_tex / albedo_tex), AS x1 (scene_tlas), storage_buffer x8
+// (mesh / cdf / exposure_state / bvh_nodes / sdf_clusters),
+// uniform_buffer x1 (Frame UBO at binding 14). Tonemap / Bloom* re-use
+// a subset. Engine.cpp uses up-to-10-element textures, 9-element
+// buffers, and 4-element accel-struct slot arrays as if Metal-style
+// argument tables; we flatten these into the single Vulkan descriptor
+// set here. Engine slot 8 (normal_tex / vk::binding 16) and slot 9
+// (albedo_tex / vk::binding 17) are Vulkan-only -- the SVGF/NRD path
+// tracer writes normal; only OptiX AOV (optix_hdr_aov) writes albedo.
+// Engine slot 7 (bvh_nodes / vk::binding 18) is populated for the
+// analytic-prim BVH path on either backend.
+// --- SDF Phase 1 (#97) -----------------------------------------------------
+// Engine slot 8 (buffer) -> vk::binding 19 is the new SDF cluster
+// storage buffer. Always bound (placeholder = primitives buffer) so
+// the descriptor set remains complete; the shader gates the SDF read
+// on push.sdf_params.x > 0.
+// --- end SDF Phase 1 -------------------------------------------------------
 static constexpr std::uint32_t kNumTexSlots = 10;
 constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     0,  // engine slot 0 -> shader binding 0  (output / swapchain)
@@ -107,7 +113,7 @@ constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     16, // engine slot 8 -> shader binding 16 (normal_tex, SVGF/NRD/OptiX-AOV)
     17, // engine slot 9 -> shader binding 17 (albedo_tex, OptiX AOV only)
 };
-constexpr std::uint32_t kSlotToBufBinding[8] = {
+constexpr std::uint32_t kSlotToBufBinding[9] = {
     0,  // engine slot 0 unused
     3,  // engine slot 1 -> shader binding 3  (mesh_positions)
     4,  // engine slot 2 -> shader binding 4  (mesh_indices)
@@ -116,6 +122,7 @@ constexpr std::uint32_t kSlotToBufBinding[8] = {
     11, // engine slot 5 -> shader binding 11 (conditional_cdf)
     15, // engine slot 6 -> shader binding 15 (exposure_state)
     18, // engine slot 7 -> shader binding 18 (analytic-prim BVH nodes)
+    19, // engine slot 8 -> shader binding 19 (SDF cluster buffer)
 };
 // Scene TLAS lives at engine accel-slot 2 -> shader binding 2.
 
@@ -370,12 +377,13 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
         if (a != VK_NULL_HANDLE) add_accel(2, a);
     }
 
-    // ---- Storage buffers at bindings 3,4,5,10,11,15,18 ---------------
+    // ---- Storage buffers at bindings 3,4,5,10,11,15,18,19 ------------
     // Slot 6 -> binding 15 is exposure_state (GPU-driven auto-exposure
     // scalar; PathTrace reads, AutoExposure writes).
     // Slot 7 -> binding 18 is the analytic-primitive BVH node buffer
     // (StructuredBuffer<float4> pairs, 32B per BvhNode).
-    for (std::uint32_t s = 1; s <= 7; ++s) {
+    // Slot 8 -> binding 19 is the SDF cluster buffer (SDF Phase 1, #97).
+    for (std::uint32_t s = 1; s <= 8; ++s) {
         VkBuffer b = device_->LookupBuffer(bound_buf_[s]);
         if (b == VK_NULL_HANDLE) continue;
         add_buffer(kSlotToBufBinding[s], b, bound_buf_off_[s], VK_WHOLE_SIZE,
@@ -871,11 +879,13 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // races on the LATEST host-side binding update). Total sets =
     // kFramesInFlight * kDispatchSetsPerFrame, each set needs the full
     // per-binding allocation:
-    //   10 storage_image + [1 accel_struct] + 7 storage_buffer + 1 ubo
+    //   10 storage_image + [1 accel_struct] + 8 storage_buffer + 1 ubo
     // The accel-struct pool entry is only emitted when rt_supported_
     // is true; ASKHR isn't a valid descriptor type at all on drivers
     // without VK_KHR_acceleration_structure (e.g. pre-1.3 MoltenVK).
     // The "+4" / "+1" headroom from the original sizing is preserved.
+    // SDF Phase 1 (#97) bumps storage_buffer per set from 7 to 8 for
+    // the new SDF cluster buffer at binding 19.
     const std::uint32_t kTotalSets =
         static_cast<std::uint32_t>(kFramesInFlight * kDispatchSetsPerFrame);
     std::vector<VkDescriptorPoolSize> psizes;
@@ -883,7 +893,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     if (rt_supported_) {
         psizes.push_back({ VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, kTotalSets * 1 + 1 });
     }
-    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 7 + 4 });
+    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 8 + 4 });
     psizes.push_back({ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,          kTotalSets * 1 + 1 });
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -895,17 +905,18 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     vkCreateDescriptorPool(device_, &dpci, nullptr, &dpool_);
 
     // ---- Build the unified descriptor set layout ----------------------
-    // 19 bindings when hw RT is available (slot 2 = scene_tlas KHR AS),
-    // 18 otherwise -- the AS descriptor type itself is invalid on
+    // 20 bindings when hw RT is available (slot 2 = scene_tlas KHR AS),
+    // 19 otherwise -- the AS descriptor type itself is invalid on
     // drivers without VK_KHR_acceleration_structure, so the layout has
     // to omit that binding entirely. The matching SPIR-V variant
     // (PathTrace_norq.spv) drops the scene_tlas declaration in lock
     // step so the shader's binding numbering still matches; the SW
     // mesh path reads mesh_positions / mesh_indices (bindings 3/4)
-    // exactly like the HW path does.
+    // exactly like the HW path does. SDF Phase 1 (#97) adds binding
+    // 19 for the SDF cluster buffer.
     {
         std::vector<VkDescriptorSetLayoutBinding> b;
-        b.reserve(19);
+        b.reserve(20);
         auto add_binding = [&](std::uint32_t binding, VkDescriptorType type) {
             VkDescriptorSetLayoutBinding lb{};
             lb.binding         = binding;
@@ -946,6 +957,10 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         add_binding(17, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
         // binding 18: bvh_nodes (analytic-prim BVH flat node array)
         add_binding(18, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        // --- SDF Phase 1 (#97) ---
+        // binding 19: sdf_clusters (flat per-cluster op-tree + AABB).
+        add_binding(19, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        // --- end SDF Phase 1 ---
 
         // UPDATE_AFTER_BIND for every binding so we can rewrite the
         // shared descriptor set between dispatches in the same cmd
