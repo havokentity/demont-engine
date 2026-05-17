@@ -116,6 +116,18 @@
         "CMAKE_BUILD_TYPE": "Release",
         "PT_ENABLE_TRACY":  "OFF"
       }
+    },
+    {
+      "name": "linux-asan-ubsan-debug",
+      "displayName": "Linux · Debug + ASan/UBSan",
+      "inherits": "linux-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE":         "Debug",
+        "PT_ENABLE_SANITIZERS":     "ON",
+        "PT_ENABLE_TRACY":          "OFF",
+        "PT_ENABLE_VULKAN_BACKEND": "OFF",
+        "PT_ENABLE_OPTIX":          "OFF"
+      }
     }
   ],
   "buildPresets": [
@@ -126,6 +138,7 @@
     { "name": "win-clang-debug",   "configurePreset": "win-clang-debug",   "jobs": 0 },
     { "name": "win-clang-release", "configurePreset": "win-clang-release", "jobs": 0 },
     { "name": "linux-debug",     "configurePreset": "linux-debug",     "jobs": 0 },
-    { "name": "linux-release",   "configurePreset": "linux-release",   "jobs": 0 }
+    { "name": "linux-release",   "configurePreset": "linux-release",   "jobs": 0 },
+    { "name": "linux-asan-ubsan-debug", "configurePreset": "linux-asan-ubsan-debug", "jobs": 0 }
   ]
 }

@@ -30,6 +30,16 @@ set(MI_BUILD_OBJECT  OFF CACHE BOOL "" FORCE)
 set(MI_BUILD_TESTS   OFF CACHE BOOL "" FORCE)
 set(MI_OVERRIDE      OFF CACHE BOOL "" FORCE)
 set(MI_INSTALL_TOPLEVEL OFF CACHE BOOL "" FORCE)
+# Under PT_ENABLE_SANITIZERS, route mimalloc's internal heap accounting
+# through ASan's __asan_poison_memory_region / __asan_unpoison_memory_region
+# so ASan sees the same red zones mimalloc maintains internally. Without
+# this, ASan flags every mi_free as a "double-free" because mimalloc's
+# segment-cache reuses freed slots before ASan has marked them poisoned,
+# and every mi_malloc as "use-after-free" symmetrically. MI_TRACK_ASAN is
+# mimalloc 2.1+'s blessed integration for sanitizer builds.
+if(PT_ENABLE_SANITIZERS)
+    set(MI_TRACK_ASAN ON CACHE BOOL "" FORCE)
+endif()
 FetchContent_Declare(mimalloc
     URL           https://github.com/microsoft/mimalloc/archive/refs/tags/v2.1.7.tar.gz
     URL_HASH      SHA256=0eed39319f139afde8515010ff59baf24de9e47ea316a315398e8027d198202d

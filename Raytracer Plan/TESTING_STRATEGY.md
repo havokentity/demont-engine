@@ -125,14 +125,87 @@ Catch2/GTest, MIT, supports `TEST_CASE`/`SUBCASE`/`CHECK`/`REQUIRE`).
 New CMake preset `linux-asan-ubsan-debug` with
 `-fsanitize=address,undefined -fno-sanitize-recover=all`. Runs:
 
-- All unit tests
-- Software-backend smoke test
-- Initial render of each scene at low spp
+- All unit tests under sanitizer instrumentation
+
+Smoke-test + lo-spp goldens deliberately omitted from the Linux
+sanitizer job: `ubuntu-latest` has no GPU and no usable Vulkan ICD
+(see PR #77 for the full investigation -- engine-side smoke mode is
+ready to re-wire when a self-hosted GPU runner appears). The Linux
+software backend doesn't exist yet either (`src/CMakeLists.txt` gates
+`rhi_software` to Apple/Windows; a Linux present path is a separate
+work item). So the CI gate exercises the doctest test suite under
+ASan/UBSan -- which is what the project's pre-existing tests already
+target: CPU code paths like cvar parsing, capture-format selection,
+image-diff compute, and (post Phase 3 unit-test landings) pt_math /
+pt_csg / Astronomy / HdrImage / AnalyticBvh / Console.
 
 Catches: OOB writes (would have caught a misaligned write if it
 crossed an allocated boundary), use-after-free, leaks, signed
 overflow, alignment violations. Linux runner because clang's ASan
 is more reliable there than on macOS-arm64.
+
+**How to reproduce locally on a Linux box**
+
+```bash
+# One-shot configure + build + test under sanitizers
+cmake --preset linux-asan-ubsan-debug
+cmake --build build/linux-asan-ubsan-debug --parallel
+ctest --test-dir build/linux-asan-ubsan-debug --output-on-failure
+```
+
+The preset disables `PT_ENABLE_VULKAN_BACKEND` + `PT_ENABLE_OPTIX` so
+no Vulkan SDK or CUDA install is required; Embree is auto-fetched as
+a prebuilt tarball via `cmake/EmbreeBinary.cmake`. To inspect
+sanitizer-handler env vars (mirroring CI):
+
+```bash
+export ASAN_OPTIONS="halt_on_error=1:detect_leaks=1:detect_stack_use_after_return=1"
+export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1"
+ctest --test-dir build/linux-asan-ubsan-debug --output-on-failure -V
+```
+
+UBSan sub-checks `vptr` and `function` are opted out of project-wide
+in `cmake/CompilerWarnings.cmake`: both require RTTI, which this
+project disables via `-fno-rtti` (orthodox-C++23 policy). All other
+UBSan sub-checks (signed-integer overflow, alignment, null deref,
+unreachable, vla-bound, shift, etc.) stay on.
+
+**How to read a sanitizer report**
+
+ASan reports look like:
+
+```
+==12345==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x...
+READ of size 4 at 0x... thread T0
+    #0 0x... in pt::csg::FlattenScene(...) src/csg/CsgScene.cpp:142:18
+    #1 ...
+```
+
+The first `#0` frame after the `ERROR:` line is the offending site;
+follow the stack up to find your code. `READ` vs `WRITE` tells you
+the direction.
+
+UBSan reports look like:
+
+```
+src/math/Quat.cpp:88:14: runtime error: signed integer overflow:
+  2147483647 + 1 cannot be represented in type 'int'
+```
+
+File:line:col is the exact source location. UBSan tags
+`-fno-sanitize-recover=all` so the run also exits non-zero on the
+first hit (the CI job's `halt_on_error=1` env var enforces the same
+on the ASan side).
+
+**Suppressions**
+
+If a third-party shutdown leak (Embree's TBB worker pool draining,
+mimalloc's segment-cache final-release, etc.) trips LSan with a
+clean-stack-frame report, add a narrow rule to `.lsan-suppressions.txt`
+at the repo root. **Do not blanket-suppress** -- each rule should
+name the specific stack frame so a real leak introduced later in the
+same module still surfaces. The file is wired in via the CI job's
+`LSAN_OPTIONS=suppressions=...:print_suppressions=0` env var.
 
 **Estimate:** 1 dev-day.
 
@@ -198,14 +271,17 @@ Filed as its own issue, must-have feature.
 
 ```
 Today:
-  mac-release    (build only)
-  windows-release (build only)
+  mac-26                (build + zero-warnings + unit tests)
+  windows-latest        (build + unit tests)
+  linux-asan-ubsan      (build + unit tests under ASan/UBSan)  <-- Phase 3 [#68, this PR]
 
-Target after Phase 3:
-  mac-release           (build + unit + smoke + goldens)
-  windows-release       (build + unit + smoke + goldens)
-  linux-asan-ubsan      (build + unit + software-only smoke + lo-spp goldens)
-  linux-release         (build + software-only goldens)
+Target after Phase 2 (golden matrix #45):
+  mac-26                (build + unit + smoke + goldens)
+  windows-latest        (build + unit + smoke + goldens)
+  linux-asan-ubsan      (build + unit under sanitizers; smoke + goldens wait
+                         for a self-hosted GPU runner or GH GPU-tier OSS access)
+  linux-release         (build + software-only goldens, once a Linux software
+                         backend present path lands)
 ```
 
 Free for public repos on GH Actions' standard `ubuntu-*` /
