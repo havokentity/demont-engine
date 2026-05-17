@@ -79,14 +79,24 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install build tools
-        # ninja-build + clang + cmake are the only deps the preset needs.
+        # ninja-build + clang + cmake drive the configure/build.  GLFW
+        # (fetched via Dependencies.cmake) needs X11 + Wayland dev
+        # headers + wayland-scanner on Linux because GLFW 3.4's
+        # CMakeLists tries to enable both backends and hard-errors if
+        # the codegen tool / protocol package is missing.  We never
+        # actually open a window on the headless runner -- pt_engine
+        # links against libglfw but the tests don't construct one --
+        # but a *configure-time* hard error blocks the whole build.
         # `clang` on ubuntu-latest (24.04 as of this commit) is currently
         # clang-18, which has ASan + UBSan parity with mainline LLVM 18.
         # We don't pin a specific clang version because the sanitizer
         # ABI is stable enough that ubuntu's rolling clang works fine.
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build cmake clang
+          sudo apt-get install -y \
+              ninja-build cmake clang \
+              libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev \
+              libwayland-dev wayland-protocols libxkbcommon-dev
           clang --version
           cmake --version
           ninja --version
