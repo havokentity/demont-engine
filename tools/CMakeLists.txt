@@ -7,3 +7,4 @@
 # needed). Gated as a whole by PT_BUILD_TOOLS at the root level.
 
 add_subdirectory(imgdiff)
+add_subdirectory(pt_render_one_frame)
