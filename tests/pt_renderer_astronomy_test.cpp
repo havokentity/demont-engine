@@ -13,10 +13,19 @@
 // Reference-data sources
 // ----------------------
 // * Julian-date reference instants: standard astronomical conversions.
-//   - J2000.0 = 2000-01-01 12:00:00 UTC = JD 2451545.0 (definition).
-//     See e.g. IAU SOFA's `iauEpj2jd`, Meeus "Astronomical Algorithms"
-//     2nd ed. ch. 7, or NASA HORIZONS' Julian-date converter.
-//   - Unix epoch = 1970-01-01 00:00:00 UTC = JD 2440587.5 (definition).
+//   - J2000.0 is *strictly* defined at 2000-01-01 12:00 TT (Terrestrial
+//     Time), not UTC; the difference (TT - UTC = ~64.184 s in 2000)
+//     amounts to ~7e-4 day. This engine treats UTC == TT for the
+//     ~1-arcminute sky model (the sun moves ~0.04 deg / hour at the
+//     equator, so 65 s offsets the apparent position by ~7e-4 deg,
+//     well below the model's claimed accuracy and our tolerances).
+//     `Astronomy.h` documents the TT definition; tests below pass
+//     UTC arguments and accept the result as "JD 2451545.0" within
+//     the kJdEps tolerance.  References: IAU SOFA's `iauEpj2jd`,
+//     Meeus "Astronomical Algorithms" 2nd ed. ch. 7, or NASA HORIZONS'
+//     Julian-date converter.
+//   - Unix epoch = 1970-01-01 00:00:00 UTC = JD 2440587.5 (definition,
+//     same UTC vs TT note applies).
 // * GMST at J2000: 18h 41m 50.54841s = 280.4606184 deg per the IAU 1982
 //   formula (and the engine's gmstDegrees() implements exactly that
 //   model -- see Astronomy.cpp). Tolerance ~0.01 deg here is just float
@@ -51,7 +60,12 @@ using pt::astro::equatorialToHorizon;
 using pt::astro::gmstDegrees;
 using pt::astro::julianDateFromTimeT;
 using pt::astro::julianDateFromUtc;
+using pt::astro::moonDistanceKm;
+using pt::astro::moonPhaseAngle;
+using pt::astro::moonPosition;
+using pt::astro::sunDistanceAu;
 using pt::astro::sunPosition;
+using pt::astro::worldToJ2000Matrix;
 
 namespace {
 
@@ -377,4 +391,172 @@ TEST_CASE("Astronomy: julianDateFromUtc does not crash on edge-case inputs") {
     // Hour=23, minute=59, second=59.999 -- close to a day boundary.
     const double jd2 = julianDateFromUtc(2026, 6, 21, 23, 59, 59.999);
     CHECK(std::isfinite(jd2));
+}
+
+// --- Test 9: Moon position invariants -------------------------------------
+// `moonPosition` returns RA in [0, 360) and dec in a band bounded by the
+// sum of the ecliptic obliquity (23.4 deg) and the lunar inclination to
+// the ecliptic (~5.1 deg). The full range is therefore |dec| <= 28.6 deg
+// or so; we test against a slightly looser ~29 deg envelope. These are
+// model-invariant truths (any conforming Meeus implementation must
+// respect them), not reference values that need JPL HORIZONS truth.
+TEST_CASE("Astronomy: moonPosition invariants across the J2000 epoch") {
+    // Walk a full 29.5-day synodic cycle at half-day resolution starting
+    // from J2000. ~60 samples; cheap and exhaustive within the range
+    // restriction we're checking.
+    constexpr double kDeclEnvelopeDeg = 29.0;
+    for (int step = 0; step <= 59; ++step) {
+        const double jd = 2451545.0 + 0.5 * step;
+        const EquatorialPos p = moonPosition(jd);
+        CAPTURE(jd);
+        CAPTURE(p.ra_deg);
+        CAPTURE(p.dec_deg);
+        CHECK(std::isfinite(p.ra_deg));
+        CHECK(std::isfinite(p.dec_deg));
+        CHECK(p.ra_deg  >= 0.0);
+        CHECK(p.ra_deg  <  360.0);
+        CHECK(p.dec_deg >= -kDeclEnvelopeDeg);
+        CHECK(p.dec_deg <=  kDeclEnvelopeDeg);
+    }
+}
+
+TEST_CASE("Astronomy: moonPosition is deterministic for the same JD") {
+    // Same JD twice -- function is pure, must return bit-identical
+    // values. Guards against an accidental introduction of any
+    // global state (caching that depends on call order, etc.).
+    const double jd = 2451559.5;   // J2000 + 14.5 days (near first full moon)
+    const EquatorialPos a = moonPosition(jd);
+    const EquatorialPos b = moonPosition(jd);
+    CHECK(a.ra_deg  == b.ra_deg);
+    CHECK(a.dec_deg == b.dec_deg);
+}
+
+// --- Test 10: Moon phase angle cycles through 0..pi over a synodic month -
+// The synodic month is ~29.53 days. Walking the cycle starting from
+// J2000 -- when the moon is approximately 5.6 days past new -- we should
+// see the phase angle traverse from near zero (new) through pi (full)
+// and back. The agent doesn't need to identify which sample is new or
+// full to test the range invariant; verifying the angle is always in
+// [0, pi] and that the sample-to-sample spread covers a meaningful
+// fraction of the range is enough to catch a sign-flipped or
+// constant-output regression.
+TEST_CASE("Astronomy: moonPhaseAngle stays in [0, pi] and covers the cycle") {
+    constexpr double kPi = 3.14159265358979323846;
+    double min_phase =  kPi + 1.0;     // sentinel above range
+    double max_phase = -1.0;           // sentinel below range
+    for (int step = 0; step <= 59; ++step) {
+        const double jd = 2451545.0 + 0.5 * step;
+        const EquatorialPos sun  = sunPosition(jd);
+        const EquatorialPos moon = moonPosition(jd);
+        const double phase = moonPhaseAngle(sun, moon);
+        CAPTURE(jd);
+        CAPTURE(phase);
+        CHECK(std::isfinite(phase));
+        CHECK(phase >= 0.0);
+        CHECK(phase <= kPi);
+        if (phase < min_phase) min_phase = phase;
+        if (phase > max_phase) max_phase = phase;
+    }
+    // Over a synodic month we should see phase swing through a wide
+    // range -- minimum near 0 (new) and maximum near pi (full). Allow
+    // generous slack: min < 0.4 rad and max > kPi - 0.4 rad.
+    CHECK(min_phase < 0.4);
+    CHECK(max_phase > kPi - 0.4);
+}
+
+// --- Test 11: Moon distance stays in physical perigee..apogee range ------
+// Real lunar orbit: perigee ~363,300 km, apogee ~405,500 km (per the
+// header docstring). Engine model claims ~14% angular-size variation,
+// matching this range. Test envelope kept loose at [350,000, 410,000]
+// km to absorb the simplified-Meeus model's accuracy bound.
+TEST_CASE("Astronomy: moonDistanceKm stays in perigee..apogee envelope") {
+    for (int step = 0; step <= 59; ++step) {
+        const double jd = 2451545.0 + 0.5 * step;
+        const double d = moonDistanceKm(jd);
+        CAPTURE(jd);
+        CAPTURE(d);
+        CHECK(std::isfinite(d));
+        CHECK(d >= 350000.0);
+        CHECK(d <= 410000.0);
+    }
+}
+
+// --- Test 12: Sun distance stays in perihelion..aphelion envelope ---------
+// Earth orbital eccentricity 0.0167 -> perihelion 0.983 AU, aphelion
+// 1.017 AU per Astronomy.h. Use a 0.97..1.03 envelope to absorb the
+// model's own ~0.001 AU residual.
+TEST_CASE("Astronomy: sunDistanceAu stays in perihelion..aphelion envelope") {
+    // Sample at month intervals across a year starting from J2000.
+    for (int month_step = 0; month_step <= 12; ++month_step) {
+        const double jd = 2451545.0 + 30.4 * month_step;
+        const double d = sunDistanceAu(jd);
+        CAPTURE(jd);
+        CAPTURE(d);
+        CHECK(std::isfinite(d));
+        CHECK(d >= 0.97);
+        CHECK(d <= 1.03);
+    }
+    // Mean distance check: the kSunDistanceMeanAu constant should be
+    // close to 1.0 by construction.
+    CHECK(CloseAbs(pt::astro::kSunDistanceMeanAu, 1.0, 0.01));
+}
+
+// --- Test 13: worldToJ2000Matrix orthonormality -------------------------
+// The world->J2000 transform is a pure rotation: rows must be unit
+// length, mutually orthogonal, and the matrix determinant must be
+// +1 (right-handed; no reflection). A bug that swapped two rows or
+// transposed a sub-block would fail here. Tolerance is float epsilon
+// magnified to 1e-5 to absorb double->float rounding in the
+// row-major output buffer.
+TEST_CASE("Astronomy: worldToJ2000Matrix is a right-handed orthonormal rotation") {
+    constexpr double kOrthoEps = 1e-5;
+    // A spread of (observer, JD) tuples: London at J2000, Tokyo at
+    // 2026 summer solstice, Sydney at 2026 winter solstice.
+    struct Sample { double lat; double lon; double jd; };
+    const Sample samples[] = {
+        {51.4769, -0.0005,    2451545.0},                         // Greenwich at J2000
+        {35.6762, 139.6503,   julianDateFromUtc(2026, 6, 21, 6, 0, 0.0)},
+        {-33.8688, 151.2093,  julianDateFromUtc(2026, 12, 21, 18, 0, 0.0)},
+    };
+    for (const auto& s : samples) {
+        float M[9] = {};
+        worldToJ2000Matrix(s.lat, s.lon, s.jd, M);
+        CAPTURE(s.lat);
+        CAPTURE(s.lon);
+        CAPTURE(s.jd);
+        // All entries finite.
+        for (int i = 0; i < 9; ++i) {
+            CHECK(std::isfinite(M[i]));
+        }
+        // Row dot products: rows 0,1,2 each unit length, mutually orthogonal.
+        auto rowDot = [&](int a, int b) -> double {
+            return double(M[a*3+0]) * M[b*3+0]
+                 + double(M[a*3+1]) * M[b*3+1]
+                 + double(M[a*3+2]) * M[b*3+2];
+        };
+        CHECK(CloseAbs(rowDot(0, 0), 1.0, kOrthoEps));
+        CHECK(CloseAbs(rowDot(1, 1), 1.0, kOrthoEps));
+        CHECK(CloseAbs(rowDot(2, 2), 1.0, kOrthoEps));
+        CHECK(CloseAbs(rowDot(0, 1), 0.0, kOrthoEps));
+        CHECK(CloseAbs(rowDot(0, 2), 0.0, kOrthoEps));
+        CHECK(CloseAbs(rowDot(1, 2), 0.0, kOrthoEps));
+        // Determinant = +1 (right-handed) computed via cofactor expansion
+        // on row 0.  det = r0 . (r1 x r2). Equivalent to triple product.
+        const double cx = double(M[3]) * M[7] - double(M[4]) * M[6];
+        const double cy = double(M[5]) * M[6] - double(M[3]) * M[8];
+        const double cz = double(M[4]) * M[8] - double(M[5]) * M[7];
+        // The cofactor cross product is (r1 x r2), and r1 x r2 should
+        // equal r0 (or -r0 for left-handed). Use row-0 dot (r1 x r2).
+        // Note the sign convention above produces (r1 x r2) directly:
+        //   (r1 x r2).x = r1.y * r2.z - r1.z * r2.y -> M[4]*M[8] - M[5]*M[7]
+        // Recompute with the correct formula for clarity:
+        const double crossYZ = double(M[4]) * M[8] - double(M[5]) * M[7];
+        const double crossZX = double(M[5]) * M[6] - double(M[3]) * M[8];
+        const double crossXY = double(M[3]) * M[7] - double(M[4]) * M[6];
+        const double det = double(M[0]) * crossYZ
+                         + double(M[1]) * crossZX
+                         + double(M[2]) * crossXY;
+        CHECK(CloseAbs(det, 1.0, kOrthoEps));
+        (void)cx; (void)cy; (void)cz;
+    }
 }
