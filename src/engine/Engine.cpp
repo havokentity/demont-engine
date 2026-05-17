@@ -109,10 +109,11 @@ namespace cvar {
     // the backend boots. Scope at this exec point: cvar writes only --
     // camera pose, sun, path-tracer knobs, denoiser, spp, exposure,
     // capture format/seed, app_window_* (consumed at window creation
-    // below). CSG-scene (`cs_*`) and analytic-primitive commands are
-    // out of scope here because `csg_scene_` + `SeedDefaultPrimitives()`
-    // haven't run yet; see the TODO(#45-followup) at the call site for
-    // a planned late-phase exec to widen the supported command set.
+    // below). CSG console commands (`csg_*`) and analytic-primitive
+    // commands are out of scope here because `csg_scene_` +
+    // `SeedDefaultPrimitives()` haven't run yet; see the
+    // TODO(#45-followup) at the call site for a planned late-phase
+    // exec to widen the supported command set.
     // pt_smoke_capture_out is the destination PNG path for the final
     // frame written at the end of the smoke run; engine does a
     // synchronous readback into this path right before tearing the

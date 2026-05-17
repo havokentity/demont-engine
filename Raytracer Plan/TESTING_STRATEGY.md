@@ -42,8 +42,12 @@ denoiser = 3 cells. Harness, comparison tool, CI integration, and
 the first Mac goldens are in. The matrix is generic over (scene,
 backend, denoiser) so further cells expand via additional
 `pt_add_golden_cell(...)` rows -- see "How to add a new test"
-below. Initial Mac goldens (Darwin host) are committed; Windows +
-Linux goldens are regenerated on first CI run per the workflow.
+below. Initial Mac goldens (Darwin host) are committed; the
+Windows golden_software baseline needs to be regenerated on a
+Windows box and committed in a follow-up. There is no Linux
+golden CI today -- `pt_add_golden_cell` skips the `software` cell
+on non-(APPLE OR WIN32) hosts (rhi_software isn't ported to Linux
+yet), and the Linux sanitizers workflow does not run the matrix.
 
 **Target matrix** (per the issue): **18 backend x denoiser cells**
 (1 Software + 6 Metal + 3 Vulkan + 8 Vulkan-OptiX) x **3 scenes**

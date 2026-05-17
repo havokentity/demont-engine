@@ -186,6 +186,42 @@ bool ParseArgs(int argc, char** argv, Args& a) {
             "{software,metal,vulkan}; got '%s'\n", a.backend.c_str());
         return false;
     }
+    // Validate --denoiser against the full superset of r_denoiser
+    // values the engine accepts (per the PT_CVAR description in
+    // src/engine/Engine.cpp). The engine does NOT have an
+    // allowed-values gate on r_denoiser; an unrecognised string is
+    // silently treated as `off`. Without this check a typo like
+    // `--denoiser svgf_basc` would render at the noisier `off` setting
+    // and -- worse, at regen time -- get committed as an "off"
+    // baseline misfiled under the misspelled name. The full superset
+    // is validated here regardless of backend; the engine handles
+    // platform availability at runtime (e.g. metalfx on Vulkan reverts
+    // to off).
+    {
+        static constexpr std::string_view kDenoiserAllowed[] = {
+            "off",
+            "metalfx",
+            "svgf_basic", "svgf_atrous",
+            "svgf_basic_metalfx", "svgf_atrous_metalfx",
+            "nrd",
+            "optix_hdr", "optix_hdr_aov",
+            "optix_temporal_hdr", "optix_temporal_hdr_aov",
+        };
+        bool ok = false;
+        for (auto v : kDenoiserAllowed) {
+            if (a.denoiser == v) { ok = true; break; }
+        }
+        if (!ok) {
+            std::fprintf(stderr,
+                "pt_render_one_frame: --denoiser '%s' is not a recognised "
+                "r_denoiser value. Supported: off, metalfx, svgf_basic, "
+                "svgf_atrous, svgf_basic_metalfx, svgf_atrous_metalfx, "
+                "nrd, optix_hdr, optix_hdr_aov, optix_temporal_hdr, "
+                "optix_temporal_hdr_aov.\n",
+                a.denoiser.c_str());
+            return false;
+        }
+    }
     // Validate scene path is a *readable regular file* in the wrapper.
     // A bare existence check would pass a directory (which fopen()
     // happily opens on POSIX, then fread returns 0 and the engine's

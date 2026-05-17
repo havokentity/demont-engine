@@ -182,7 +182,10 @@ pt_add_test(pt_core_analytic_bvh
 # expands later (see "Add a cell" in TESTING_STRATEGY.md) -- the
 # helper below is generic over (scene, backend, denoiser).
 #
-# The function name is pt_add_golden_cell -- one ctest test per call.
+# The function name is pt_add_golden_cell -- each call registers
+# *two* ctest tests: `${_cell_name}_render` (runs the harness) and
+# `${_cell_name}_diff` (runs imgdiff vs the committed golden; the
+# diff DEPENDS on the render so ctest serialises them per cell).
 # Cells are skipped (NOT registered) on hosts where their backend
 # isn't available: Metal cells only register on Darwin; Vulkan cells
 # only register if PT_ENABLE_VULKAN_BACKEND is ON; Software cells
@@ -275,9 +278,11 @@ function(pt_add_golden_cell)
     # autoexec.cfg from CWD before applying the smoke-exec fixture, so
     # using a shared CWD (e.g. CMAKE_BINARY_DIR) would let an archived
     # cvar from a previous cell or session leak into the baseline.
-    # Per-cell CWD isolates one cell from another; the workflow
-    # pre-cleans golden_workdir/ before ctest so a previous CI run's
-    # archived demont.cfg can't leak across runs either.
+    # Per-cell CWD isolates one cell from another within a ctest run;
+    # the wrapper (`pt_render_one_frame/main.cpp`) additionally
+    # removes `demont.cfg` and `autoexec.cfg` from its CWD before
+    # invoking demont, so archived cvars from a previous run cannot
+    # leak across runs either.
     set(_cell_workdir ${CMAKE_BINARY_DIR}/golden_workdir/${_cell_name})
 
     # Pre-create the actual / diff output directories. imgdiff writes
