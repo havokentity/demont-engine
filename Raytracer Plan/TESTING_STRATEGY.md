@@ -37,9 +37,48 @@ For each `(backend, denoiser_kind, scene)` combo, render one frame
 headlessly and assert pixel match within tolerance against a stored
 reference image.
 
-Initial matrix: **18 backend x denoiser cells** (1 Software + 6 Metal
-+ 3 Vulkan + 8 Vulkan-OptiX) x **3 scenes** (`cornell_csg`,
-`hdri_env`, `procedural_night`).
+**MVP shipped** (initial PR for #45): 1 scene x 3 backends x 1
+denoiser = 3 cells. Harness, comparison tool, CI integration, and
+the first Mac goldens are in. The matrix is generic over (scene,
+backend, denoiser) so further cells expand via additional
+`pt_add_golden_cell(...)` rows -- see "How to add a new test"
+below. Initial Mac goldens (Darwin host) are committed; Windows +
+Linux goldens are regenerated on first CI run per the workflow.
+
+**Target matrix** (per the issue): **18 backend x denoiser cells**
+(1 Software + 6 Metal + 3 Vulkan + 8 Vulkan-OptiX) x **3 scenes**
+(`cornell_csg`, `hdri_env`, `procedural_night`). Tracked in #45
+follow-ups.
+
+**Architecture** (as implemented):
+- `tools/pt_render_one_frame/` -- thin C++ harness CLI that
+  translates `(scene, backend, denoiser, spp, frames, out)` into
+  the engine's smoke-test plumbing and fork/exec's `demont`. No
+  GPU / engine library links so it builds in ms.
+- `src/engine/Engine.cpp` -- two new cvars + CLI flags wired into
+  the existing `--smoke-frames` loop:
+    - `pt_smoke_exec` (`--smoke-exec=path`): exec a console-script
+      fixture right after demont.cfg + autoexec.cfg + CLI overrides
+      load but before the device boots.
+    - `pt_smoke_capture_out` (`--smoke-capture-out=path`):
+      synchronous final-frame readback + host-side ACES + sRGB
+      OETF + stbi_write_png after the smoke loop hits its budget,
+      before TearDownDevice releases the GPU textures.
+- `tools/imgdiff/` (existing, PR #92) -- per-pixel L2 thresholded
+  diff with --max-delta / --mean-delta / --fail-percent gates and
+  a colorised diff PNG.
+- `tests/goldens/scenes/<scene>.cfg` -- deterministic fixture
+  pinning resolution, camera, sun, spp, accumulator EMA, capture
+  seed.
+- `tests/goldens/<host>/<scene>__<backend>__<denoiser>.png` --
+  per-host committed reference PNGs.
+- `tests/CMakeLists.txt` `pt_add_golden_cell(...)` helper -- one
+  ctest pair per cell (`_render` + `_diff`), skipped at configure
+  time when the backend isn't available on the host.
+- `.github/workflows/build.yml` -- per-host golden step that
+  runs the `golden_software` label subset (only backend that
+  works on GH hosted runners) and uploads `golden_actual/` +
+  `golden_diff/` as workflow artefacts on failure.
 
 Would have caught both bug class entries 1 + 2 above the moment
 they landed.
@@ -301,10 +340,14 @@ Phase 1 (week 1, ~5 days):          Test framework + smoke tests
                                     - Cvar round-trip                  [2.3]
 
 Phase 2 (week 2-3, ~7 days):        Golden-image matrix                [1.1 / #45]
-                                    - pt_render_one_frame harness
-                                    - imgdiff tool
-                                    - CI integration (mac, win, lin)
-                                    - Initial goldens
+                                    - pt_render_one_frame harness        [done]
+                                    - imgdiff tool                       [done, PR #92]
+                                    - CI integration (mac, win, lin)     [MVP: software cell per host]
+                                    - Initial goldens                    [Darwin done; Win + Linux
+                                                                          via per-host regen workflow]
+                                    - Matrix expansion                   [follow-up PRs: SVGF cells,
+                                                                          hdri_env scene, procedural_night,
+                                                                          OptiX denoiser cells on RTX hw]
 
 Phase 3 (week 3-4, ~5 days):        Unit tests + sanitizers            [2.1 + 2.2]
                                     - pt_math, pt_csg, Astronomy
@@ -323,24 +366,144 @@ Total Phase 0-3: ~3 weeks of focused work.
 
 ## How to add a new test
 
-(Filled in after Phase 1 lands. The harness + ctest wiring needs
-to exist before we can document "add a test here, register it
-there.")
+The Phase 1 + 2 harness is wired and a contributor adds tests
+without touching the engine.
+
+### Doctest-based unit tests
+
+1. Drop `tests/<area>/<name>_test.cpp` (or `tests/<name>_test.cpp` for
+   shared helpers like `harness_smoke`). First two lines:
+   ```cpp
+   #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+   #include <doctest/doctest.h>
+   ```
+2. Add a `pt_add_test(<name> <source.cpp> [LINK_TARGETS ...])` line
+   under the existing block in `tests/CMakeLists.txt`. The helper
+   wires doctest, the project's strict warning policy, and ctest
+   registration with a 60 s timeout.
+3. Run `ctest --test-dir build/<preset>` to confirm.
+
+### Golden-image cells
+
+Each cell is one `pt_add_golden_cell(SCENE ... BACKEND ... DENOISER
+...)` row in `tests/CMakeLists.txt` (under the "Golden-image
+regression matrix" banner). Required args:
+
+- `SCENE`     -- name of a fixture at `tests/goldens/scenes/<name>.cfg`.
+- `BACKEND`   -- one of `software` / `metal` / `vulkan`. Cells whose
+  backend isn't available on the build host (Metal off Apple, Vulkan
+  when `PT_ENABLE_VULKAN_BACKEND=OFF`) are silently skipped at
+  configure time.
+- `DENOISER`  -- value the cell sets `r_denoiser` to via the harness'
+  synthesised pre-exec script.
+
+Optional knobs: `FRAMES` (smoke-test frame budget, default 64),
+`SPP`, `EXTRA` (semicolon-separated console-script lines inlined
+into the pre-exec), and the imgdiff thresholds `MAX_DELTA` /
+`MEAN_DELTA` / `FAIL_PERCENT`. Per-pixel L2 above MAX_DELTA marks
+a pixel as "bad"; a cell fails if mean L2 > MEAN_DELTA or
+bad-pixel ratio > FAIL_PERCENT %.
+
+### Adding a new scene fixture
+
+1. Drop `tests/goldens/scenes/<scene>.cfg`. Sticks to plain console
+   commands (cvar writes, `prim_*`, `csg_*`, `cam_*`). Avoid
+   `;` and backtick characters inside `#` comments -- the console
+   parser splits scripts on `;` even mid-comment, which leaks the
+   post-semicolon text as a fresh command.
+2. Lock down everything the matrix needs to be deterministic:
+   resolution (`app_window_width` / `_height`), camera pose
+   (`cam_pos`, `cam_yaw`, `cam_pitch`, `cam_fov`), sun
+   (`r_sky_mode`, `r_sun_*`), path-tracer (`r_spp`, `r_max_bounces`,
+   `r_firefly_clamp`, `r_accum_ema_alpha`), exposure
+   (`r_auto_exposure 0`, `r_exposure <fixed>`), post effects
+   (`r_bloom 0`, `r_lens_flare 0` unless the cell is specifically
+   testing them), capture format / seed (`r_capture_format png`,
+   `r_capture_seed <non-zero>`).
+3. Do NOT pin `r_backend`, `r_denoiser`, `pt_smoke_*` cvars in
+   the fixture -- those are set by the harness wrapper per cell.
 
 ## How to regenerate goldens
 
-(Filled in after Phase 2 lands. Critical for operator usability --
-without a clear regen workflow every legitimate renderer change
-becomes a multi-day golden-shuffle. Likely shape: `ctest -R
-render_matrix --regenerate-goldens` re-renders, prints a diff
-summary, lets you commit the new PNGs.)
+Goldens live under `tests/goldens/<host>/<scene>__<backend>__<denoiser>.png`,
+where `<host>` is `Darwin` / `Linux` / `Windows` (`CMAKE_SYSTEM_NAME`).
+Each host owns its own subdirectory; cross-platform variance from
+FP nondeterminism, driver versions, and resolution defaults
+(Vulkan on Retina Mac renders at 2x logical size, for example) is
+not something tolerance thresholds can absorb cleanly, so
+per-host goldens stay the canonical pattern.
+
+Regeneration is one command per cell:
+
+```bash
+# from the worktree root, after a clean build:
+./build/<preset>/tools/pt_render_one_frame/pt_render_one_frame \
+    --scene   tests/goldens/scenes/cornell_csg.cfg \
+    --backend software \
+    --denoiser off \
+    --frames  64 \
+    --out     tests/goldens/$(uname -s)/cornell_csg__software__off.png
+```
+
+For all-cell regen on a host:
+
+```bash
+# Mac (Darwin):
+for b in software metal vulkan; do
+    rm -f demont.cfg
+    ./build/mac-debug/tools/pt_render_one_frame/pt_render_one_frame \
+        --scene   tests/goldens/scenes/cornell_csg.cfg \
+        --backend "$b" \
+        --denoiser off \
+        --frames  64 \
+        --out     "tests/goldens/Darwin/cornell_csg__${b}__off.png"
+done
+```
+
+After regen:
+
+1. `git diff --stat tests/goldens/` -- verify only the expected PNGs
+   changed. Surprises (extra files, an unrelated host's directory)
+   are likely a working-dir slip-up.
+2. Eyeball each new PNG against the prior commit's version. A
+   legitimate visible change should be obvious; a regression should
+   look broken.
+3. Commit with a `test(goldens): refresh ... after ...` style
+   message that says WHY they were regenerated.
+
+CI uploads two artefact directories on every run -- `golden_actual/`
+(what this PR's build produced) and `golden_diff/` (the imgdiff
+heatmaps). On a failing cell, downloading the artefact ZIP and
+opening the diff PNG points at the exact pixels that drifted.
 
 ## Maintenance + care of goldens
 
-(Filled in after Phase 2 lands. Stochastic noise floor, seed
-choice, tolerance per scene, what counts as "legitimate visual
-change" vs "regression" -- the judgment calls every golden-image
-workflow eventually grows.)
+- **Stochastic noise floor.** The default 64 smoke frames at
+  `r_spp 1` on the cornell_csg scene settles below the matrix's
+  default thresholds (max-delta 16, mean-delta 2, fail-percent 1).
+  Lower frame counts trip imgdiff with the Metal HW-RT BLAS build
+  entropy alone. If a new scene is noisier, bump `FRAMES` rather
+  than weakening tolerances -- tighter tolerances are what catch
+  the bug class this matrix exists for.
+- **Per-cell tolerance.** Override `MAX_DELTA` / `MEAN_DELTA` /
+  `FAIL_PERCENT` on the `pt_add_golden_cell(...)` line when a
+  specific scene has known irreducible variance (HDRI sun pixel,
+  thin specular highlights). Don't widen defaults.
+- **"Legitimate visual change" vs "regression".** Rule of thumb:
+  if the changed pixels are localised to a feature the touching
+  PR mentions, it's a legitimate update -- regen, commit. If the
+  diff is scattered or hits regions the PR shouldn't touch, it's
+  a regression. Use the diff PNG heatmap as the deciding view.
+- **Repo size.** PNGs commit at modest 512x384 (3-5 KB compressed
+  per image) so even a 100-cell matrix fits in ~500 KB. Vulkan on
+  Mac Retina renders at 1024x768 which lands around 80 KB per
+  golden -- still cheap. If a scene needs 1080p for any reason,
+  that's an LFS-territory decision; consult before bumping.
+- **Cross-host parity.** Two hosts producing pixel-identical PNGs
+  for the same `(scene, backend, denoiser)` is a happy accident,
+  not a guarantee. ULP drift across architectures and driver
+  versions means each host's golden lives independently. CI gates
+  each host on its own subdirectory.
 
 ## Related
 
