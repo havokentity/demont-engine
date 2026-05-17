@@ -66,12 +66,12 @@
 // and we route accum_stars into bloom_tex's source upstream of the
 // pyramid so the halos pick up the same energy this kernel adds.
 //
-// Slot is binding 19 to match PathTrace.slang's reserved slot for the
-// same texture (so the shared 19-binding pipeline layout doesn't need
-// extending). When star-split is off (cvar r_star_split 0 or denoiser
-// off) the engine binds a 1x1 zero texture here so the additive read
-// is a no-op.
-[[vk::binding(19, 0)]] RWTexture2D<float4> stars_tex;
+// Slot is binding 21 to match PathTrace.slang's reserved slot for the
+// same texture (the shared descriptor-set layout was extended past 19
+// when #107's triangle BVH took bindings 19/20). When star-split is off
+// (cvar r_star_split 0 or denoiser off) the engine binds a swapchain-
+// sized zero texture here so the additive read is a no-op.
+[[vk::binding(21, 0)]] RWTexture2D<float4> stars_tex;
 
 // --- buffer slot padding to push exposure_state to MSL buf(6) and
 //     Push (cbuffer) to MSL buf(7) ----------------------------------

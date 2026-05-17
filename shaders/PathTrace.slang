@@ -154,6 +154,23 @@ Texture2D<float4> moon_map;
 // would shift exposure_state's slot and break the engine binding.
 [[vk::binding(18, 0)]] StructuredBuffer<float4> bvh_nodes;
 
+// Triangle BVH (PR #106 follow-up; issue #44). Host-built mirror of
+// renderer::TriangleBvh -- the same flat 32B node layout AnalyticBvh
+// uses (two float4s per node, uints recovered via asuint() so the GPU
+// stride stays 32B on both std430 and Metal). `tri_bvh_permuted_ids`
+// is a flat list of triangle indices; each leaf's range
+// [left_first, left_first + count) selects which entries to test. The
+// shader reads `mesh_indices[3 * tri + 0..2]` for vertex indices and
+// then `mesh_positions[3 * vid + 0..2]` for positions exactly the same
+// way the (now removed) SW linear-scan path did.
+//
+// Always declared (PARTIALLY_BOUND), even on HW-RT builds. The runtime
+// gate is `bvh_params.w > 0` -- non-zero means the engine populated
+// the buffer and the shader's SW mesh path should walk it; zero means
+// no SW mesh path is active for this dispatch.
+[[vk::binding(19, 0)]] StructuredBuffer<float4> tri_bvh_nodes;
+[[vk::binding(20, 0)]] StructuredBuffer<uint>   tri_bvh_permuted_ids;
+
 // Star-split accumulator (issue #46). When the denoiser is active and
 // `star_split_enabled` is non-zero, the primary-miss path writes
 // star-only radiance to this texture instead of folding it into
@@ -164,9 +181,12 @@ Texture2D<float4> moon_map;
 // dimensions as denoise_color; written with the same EMA blend as
 // accum_hdr so 1-spp temporal stability matches the rest of the
 // linear-HDR pipeline. When star-split is off (cvar r_star_split 0 or
-// denoiser_enabled == 0) the texture isn't bound and this slot stays
-// unwritten under VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT.
-[[vk::binding(19, 0)]] RWTexture2D<float4> accum_stars;
+// denoiser_enabled == 0) the engine binds a swapchain-sized zero
+// texture here so the additive read is a no-op.
+//
+// Moved from binding 19 to binding 21 to coexist with triangle BVH
+// (which #107 placed at 19/20 before #108 landed).
+[[vk::binding(21, 0)]] RWTexture2D<float4> accum_stars;
 
 struct BvhNode {
     float3 aabb_min;
@@ -178,6 +198,22 @@ struct BvhNode {
 BvhNode loadBvhNode(uint idx) {
     float4 lo = bvh_nodes[idx * 2u + 0u];
     float4 hi = bvh_nodes[idx * 2u + 1u];
+    BvhNode n;
+    n.aabb_min  = lo.xyz;
+    n.left_first = asuint(lo.w);
+    n.aabb_max  = hi.xyz;
+    n.count     = asuint(hi.w);
+    return n;
+}
+
+// Same node shape as the analytic BVH; the host (renderer::TriangleBvh)
+// guarantees the layout matches. Pulled out as a separate function so
+// the traversal walker reads naturally and so future tri-BVH-only
+// loaders (e.g. a 2x-quantised version) can be swapped without
+// touching the analytic walker.
+BvhNode loadTriBvhNode(uint idx) {
+    float4 lo = tri_bvh_nodes[idx * 2u + 0u];
+    float4 hi = tri_bvh_nodes[idx * 2u + 1u];
     BvhNode n;
     n.aabb_min  = lo.xyz;
     n.left_first = asuint(lo.w);
@@ -352,15 +388,25 @@ cbuffer Push {
     //        of a variance floor proportional to 1/window.
     //   .y/.z/.w reserved for future accum-side knobs.
     float4 accum_params;
-    // Analytic-primitive traversal params (hybrid linear / BVH). See
-    // Engine.cpp's PtPush::bvh_params for full docs.
+    // Analytic-primitive + triangle BVH traversal params. See Engine.cpp's
+    // PtPush::bvh_params for full docs.
     //   .x = linear_prim_count — number of always-linear-tested prims
     //        at the front of `primitives` (planes today).
-    //   .y = bvh_node_count    — 0 disables BVH path (linear over all
-    //        remaining prims); >0 enables iterative traversal of
-    //        `bvh_nodes` for the trailing range [linear_prim_count,
-    //        prim_count).
-    //   .z/.w reserved.
+    //   .y = bvh_node_count    — 0 disables analytic-prim BVH path
+    //        (linear over all remaining prims); >0 enables iterative
+    //        traversal of `bvh_nodes` for the trailing range
+    //        [linear_prim_count, prim_count).
+    //   .z = mesh_tri_count    — total CSG triangle count uploaded to
+    //        mesh_positions / mesh_indices this dispatch. Non-zero on
+    //        the SW-mesh fallback path (no TLAS bound, e.g. Mac-Vulkan
+    //        on pre-1.3 MoltenVK); the shader checks this to decide
+    //        whether the SW mesh branch fires at all.
+    //   .w = tri_bvh_node_count — when non-zero, the SW mesh branch
+    //        traverses the host-built triangle BVH at `tri_bvh_nodes`
+    //        / `tri_bvh_permuted_ids` instead of brute-force linear
+    //        scanning every triangle. PR #106 follow-up: the linear
+    //        scan was O(N) per ray and crushed framerate on Mac-Vulkan;
+    //        the BVH walk is O(log N).
     uint4 bvh_params;
     // Star-split parameters (issue #46). Engine fills these from the
     // r_star_split / r_star_split_threshold cvars and an internal
@@ -614,53 +660,84 @@ HitInfo traceScene(float3 ro, float3 rd) {
     } else
 #endif
     if (bvh_params.z != 0u) {
-        // Software fallback: brute-force Möller-Trumbore over every
-        // triangle in the CSG bake. O(N) per ray; fine for sub-1k-tri
-        // CSG meshes (the headline drilled-cube scene is ~hundreds).
-        // The CSG bake places geometry in world space and the HW path
-        // also uses an identity-transform TLAS instance (see
+        // Software fallback: traverse the host-built triangle BVH
+        // (renderer::TriangleBvh -- PR #106 follow-up, replaces the
+        // O(N) Möller-Trumbore linear scan #106 shipped). The CSG bake
+        // places geometry in world space and the HW path uses an
+        // identity-transform TLAS instance (see
         // Engine::RebuildMeshResources), so no ObjectToWorld is needed
         // here -- when per-mesh transforms land both paths gain one.
-        // On builds with PT_SPIRV_NO_RAYQUERY this is the ONLY mesh path
-        // (the `else` above attaches to the `if (tlas_present != 0u)`
+        // On builds with PT_SPIRV_NO_RAYQUERY this is the ONLY mesh
+        // path (the `else` above attaches to the `if (tlas_present)`
         // block, which is preprocessed out for that variant).
-        uint  tri_count = bvh_params.z;
-        float t_mesh    = h.t;
-        uint  prim_hit  = 0u;
-        bool  found     = false;
-        for (uint pi = 0u; pi < tri_count; ++pi) {
-            uint i0 = mesh_indices[pi * 3u + 0u];
-            uint i1 = mesh_indices[pi * 3u + 1u];
-            uint i2 = mesh_indices[pi * 3u + 2u];
-            float3 v0 = float3(mesh_positions[i0 * 3u + 0u],
-                               mesh_positions[i0 * 3u + 1u],
-                               mesh_positions[i0 * 3u + 2u]);
-            float3 v1 = float3(mesh_positions[i1 * 3u + 0u],
-                               mesh_positions[i1 * 3u + 1u],
-                               mesh_positions[i1 * 3u + 2u]);
-            float3 v2 = float3(mesh_positions[i2 * 3u + 0u],
-                               mesh_positions[i2 * 3u + 1u],
-                               mesh_positions[i2 * 3u + 2u]);
-            float3 e1 = v1 - v0;
-            float3 e2 = v2 - v0;
-            float3 pv = cross(rd, e2);
-            float  det = dot(e1, pv);
-            // Two-sided: CSG bake doesn't guarantee winding direction
-            // relative to the ray; only the degenerate near-zero case
-            // is rejected.
-            if (abs(det) < 1e-8) continue;
-            float inv_det = 1.0 / det;
-            float3 tvec = ro - v0;
-            float u = dot(tvec, pv) * inv_det;
-            if (u < 0.0 || u > 1.0) continue;
-            float3 qv = cross(tvec, e1);
-            float v = dot(rd, qv) * inv_det;
-            if (v < 0.0 || u + v > 1.0) continue;
-            float t_tri = dot(e2, qv) * inv_det;
-            if (t_tri > 1e-3 && t_tri < t_mesh) {
-                found    = true;
-                t_mesh   = t_tri;
-                prim_hit = pi;
+        //
+        // Walker mirrors the analytic-BVH walker above: iterative stack
+        // (depth 64 covers >1B triangles via balanced log2 splits with
+        // headroom), per-node AABB-slab test culls subtrees beyond
+        // closest-t, per-leaf loop over `count` triangles via the
+        // permuted-id indirection. Möller-Trumbore intersect is
+        // identical to what the linear-scan loop had -- two-sided,
+        // reject |det| < 1e-8 only. If the engine somehow leaves the
+        // BVH unpopulated (.w == 0) while still flagging the SW mesh
+        // path (.z != 0), the walker short-circuits to "no hit" and
+        // the SW mesh contribution drops out for that frame; this is
+        // a benign failure mode (mesh stays black) rather than a hang
+        // or per-ray full scan.
+        uint tri_bvh_node_count = bvh_params.w;
+        float t_mesh = h.t;
+        uint  prim_hit = 0u;
+        bool  found    = false;
+        if (tri_bvh_node_count > 0u) {
+            float3 rd_safe = select(abs(rd) > float3(1e-30), rd, float3(1e-30));
+            float3 rd_inv  = 1.0 / rd_safe;
+            uint stack[64];
+            int  sp = 0;
+            stack[sp++] = 0u;
+            while (sp > 0) {
+                uint idx = stack[--sp];
+                BvhNode node = loadTriBvhNode(idx);
+                if (!intersectAabb(ro, rd_inv, node.aabb_min, node.aabb_max, t_mesh)) continue;
+                if (node.count > 0u) {
+                    // Leaf: test the contiguous range of permuted tri ids.
+                    for (uint k = 0u; k < node.count; ++k) {
+                        uint tri = tri_bvh_permuted_ids[node.left_first + k];
+                        uint i0 = mesh_indices[tri * 3u + 0u];
+                        uint i1 = mesh_indices[tri * 3u + 1u];
+                        uint i2 = mesh_indices[tri * 3u + 2u];
+                        float3 v0 = float3(mesh_positions[i0 * 3u + 0u],
+                                           mesh_positions[i0 * 3u + 1u],
+                                           mesh_positions[i0 * 3u + 2u]);
+                        float3 v1 = float3(mesh_positions[i1 * 3u + 0u],
+                                           mesh_positions[i1 * 3u + 1u],
+                                           mesh_positions[i1 * 3u + 2u]);
+                        float3 v2 = float3(mesh_positions[i2 * 3u + 0u],
+                                           mesh_positions[i2 * 3u + 1u],
+                                           mesh_positions[i2 * 3u + 2u]);
+                        float3 e1 = v1 - v0;
+                        float3 e2 = v2 - v0;
+                        float3 pv = cross(rd, e2);
+                        float  det = dot(e1, pv);
+                        if (abs(det) < 1e-8) continue;
+                        float inv_det = 1.0 / det;
+                        float3 tvec = ro - v0;
+                        float u = dot(tvec, pv) * inv_det;
+                        if (u < 0.0 || u > 1.0) continue;
+                        float3 qv = cross(tvec, e1);
+                        float v = dot(rd, qv) * inv_det;
+                        if (v < 0.0 || u + v > 1.0) continue;
+                        float t_tri = dot(e2, qv) * inv_det;
+                        if (t_tri > 1e-3 && t_tri < t_mesh) {
+                            found    = true;
+                            t_mesh   = t_tri;
+                            prim_hit = tri;
+                        }
+                    }
+                } else {
+                    if (sp + 2 <= 64) {
+                        stack[sp++] = node.left_first;
+                        stack[sp++] = node.left_first + 1u;
+                    }
+                }
             }
         }
         if (found) {
