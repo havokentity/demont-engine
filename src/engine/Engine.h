@@ -97,6 +97,13 @@ private:
     void RegisterCommands();
     void RegisterCsgCommands();
     void RegisterPrimCommands();
+    // --- SDF Phase 1 (#97) -------------------------------------------------
+    // Console commands for the SDF primitive set (`sdf_sphere`,
+    // `sdf_box`, `sdf_smin`, ...). Mirrors the prim_*/csg_* registration
+    // style; populated map is uploaded to GPU on next render frame via
+    // EnsureSdfPrimsUploaded.
+    void RegisterSdfCommands();
+    // --- end SDF Phase 1 ---------------------------------------------------
     void TearDownDevice();
     void RenderFrame();
 
@@ -143,6 +150,16 @@ private:
     // Re-upload the analytic-primitive storage buffer from the in-memory
     // map. Called from RenderFrame whenever primitives_dirty_ is set.
     void EnsurePrimitivesUploaded();
+
+    // --- SDF Phase 1 (#97) -------------------------------------------------
+    // Re-upload the SDF cluster storage buffer from `sdf_prims_`. Called
+    // from RenderFrame whenever sdf_prims_dirty_ is set. Re-runs
+    // pt::renderer::ComputeSdfAabb on each cluster immediately before
+    // packing so the GPU buffer's AABB always matches the current node
+    // tree (the sphere-trace is AABB-bounded, so a stale AABB silently
+    // misses hits).
+    void EnsureSdfPrimsUploaded();
+    // --- end SDF Phase 1 ---------------------------------------------------
 
     // Load (or unload) the env map from disk. Called from the r_env_map
     // cvar's on_change. Sets env_map_tex_id_ and env_map_path_.
@@ -230,6 +247,36 @@ private:
     pt::renderer::AnalyticBvh                   analytic_bvh_;
     std::uint64_t                               bvh_node_buffer_id_       = 0;
     std::uint32_t                               bvh_node_buffer_capacity_ = 0;  // nodes that fit
+
+    // --- SDF Phase 1 (#97) -------------------------------------------------
+    // Signed-distance-field primitives. Independent of `primitives_` --
+    // SDFs are a separate shader path (sphere-tracing inside a tight
+    // AABB) and live in their own GPU storage buffer. Per-cluster
+    // expression (sphere/box/torus/capsule/rounded box + smooth-CSG
+    // ops). Each cluster's AABB is computed by the host via
+    // pt::renderer::ComputeSdfAabb at upload time.
+    //
+    // The map keys are user-supplied ids (mirrors the analytic-prim
+    // / CSG-node convention). sdf_prims_dirty_ triggers a re-upload
+    // on the next render frame; the GPU buffer grows by powers of two
+    // from a small floor (4 clusters) just like primitive_ /
+    // bvh_node_buffer_ to keep steady-state edits allocation-free.
+    std::map<std::uint32_t, pt::renderer::SdfPrim> sdf_prims_;
+    bool                                        sdf_prims_dirty_         = true;
+    std::uint64_t                               sdf_cluster_buffer_id_   = 0;
+    std::uint32_t                               sdf_cluster_capacity_    = 0;  // clusters that fit
+    std::uint32_t                               sdf_cluster_count_       = 0;  // clusters last uploaded
+    // --- end SDF Phase 1 ---------------------------------------------------
+
+    // Always-allocated 16-byte storage buffer used as a harmless
+    // placeholder for any optional binding slot whose primary buffer is
+    // 0 (e.g. SDF cluster slot 10 when no SDFs exist AND analytic prims
+    // are also off via pt_smoke_skip_prim_seed=1). Metal computes the
+    // dynamic push-constant slot from max-bound + 1 of the contiguous
+    // binding range, so leaving any slot in that range unbound shifts
+    // the push slot and corrupts every field. Allocated once at device
+    // init alongside exposure_state; destroyed in TearDownDevice.
+    std::uint64_t                               placeholder_storage_id_  = 0;
 
     std::uint64_t                               pathtrace_pipeline_id_ = 0;
     std::uint64_t                               tonemap_pipeline_id_   = 0;

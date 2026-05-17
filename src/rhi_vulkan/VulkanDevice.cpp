@@ -81,38 +81,69 @@ constexpr bool kEnableValidation = false;
 #endif
 
 // Engine slot -> shader vk::binding translation. The unified descriptor
-// set has 20 bindings (0-19): storage_image x11 (output / accum_hdr /
+// set has 23 bindings (0-22): storage_image x11 (output / accum_hdr /
 // denoise_color / depth / motion / env_map / star_map / moon_map /
 // normal_tex / albedo_tex / accum_stars), AS x1 (scene_tlas),
-// storage_buffer x7 (mesh / cdf / exposure_state / bvh_nodes),
-// uniform_buffer x1 (Frame UBO at binding 14). Tonemap / Bloom* re-use
-// a subset. Engine.cpp uses up-to-11-element textures, 8-element
-// buffers, and 4-element accel-struct slot arrays as if Metal-style
-// argument tables; we flatten these into the single Vulkan descriptor
-// set here. Engine slot 8 (normal_tex / vk::binding 16) and slot 9
-// (albedo_tex / vk::binding 17) are Vulkan-only -- the SVGF/NRD path
-// tracer writes normal; only OptiX AOV (optix_hdr_aov) writes albedo.
-// Engine slot 7 (bvh_nodes / vk::binding 18) is populated for the
-// analytic-prim BVH path on either backend. Engine slot 10
-// (accum_stars / vk::binding 21) is the star-split accumulator that
-// bypasses the SVGF a-trous kernel (issue #46) -- written by
-// PathTrace's primary-miss path and read back by DenoiseFinalize +
-// Tonemap pre-ACES so sub-pixel stars never enter the wavelet filter.
-static constexpr std::uint32_t kNumTexSlots = 11;
+// storage_buffer x10 (mesh / cdf / exposure_state / bvh_nodes /
+// tri_bvh_nodes / tri_bvh_permuted_ids / sdf_clusters), uniform_buffer
+// x1 (Frame UBO at binding 14). Tonemap / Bloom* re-use a subset.
+// Engine.cpp uses up-to-12-element textures, 11-element buffers, and
+// 4-element accel-struct slot arrays as if Metal-style argument tables;
+// we flatten these into the single Vulkan descriptor set here. Engine
+// slot 8 (normal_tex / vk::binding 16) and slot 9 (albedo_tex /
+// vk::binding 17) are Vulkan-only -- the SVGF/NRD path tracer writes
+// normal; only OptiX AOV (optix_hdr_aov) writes albedo. Engine slot 7
+// (bvh_nodes / vk::binding 18) is populated for the analytic-prim BVH
+// path on either backend.
+// --- PR #106 follow-up (triangle BVH) ---------------------------------------
+// Engine buffer slots 8 / 9 -> vk::bindings 19 / 20 are the triangle
+// BVH (tri_bvh_nodes + tri_bvh_permuted_ids). Always bound (placeholder
+// = primitives buffer) so the descriptor set remains complete; the
+// shader gates the read on push.bvh_params.w > 0.
+// --- end PR #106 follow-up --------------------------------------------------
+// --- SDF Phase 1 (#97) ------------------------------------------------------
+// Engine buffer slot 10 -> vk::binding 21 is the SDF cluster storage
+// buffer. Moved from engine slot 8 / vk::binding 19 to make room for
+// PR #106's triangle BVH. Always bound (placeholder = placeholder
+// storage buffer) so the descriptor set remains complete; the shader
+// gates the SDF read on push.sdf_params.x > 0.
+// --- end SDF Phase 1 --------------------------------------------------------
+// --- Star-split (#46, round-2 merge) ----------------------------------------
+// Engine texture slot 11 -> vk::binding 22 is the accum_stars storage
+// image used by the star-split bypass of the SVGF a-trous kernel.
+// PathTrace writes; DenoiseFinalize + Tonemap composite back in pre-ACES.
+// Moved from binding 21 because SDF Phase 1 (#109) claimed that binding
+// for its storage buffer; the two would have collided in Vulkan's flat
+// descriptor space. Engine texture slot 10 is reserved (no binding); it
+// only existed in the round-1 layout when stars lived at slot 10. The
+// engine binds accum_stars at slot 11 directly; slot 10 in the texture
+// space is never touched.
+// --- end Star-split ---------------------------------------------------------
+static constexpr std::uint32_t kNumTexSlots = 12;
 constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
-    0,  // engine slot 0 -> shader binding 0  (output / swapchain)
-    1,  // engine slot 1 -> shader binding 1  (accum_hdr)
-    6,  // engine slot 2 -> shader binding 6  (denoise_color)
-    7,  // engine slot 3 -> shader binding 7  (depth_tex)
-    8,  // engine slot 4 -> shader binding 8  (motion_tex)
-    9,  // engine slot 5 -> shader binding 9  (env_map)
-    12, // engine slot 6 -> shader binding 12 (star_map)
-    13, // engine slot 7 -> shader binding 13 (moon_map)
-    16, // engine slot 8 -> shader binding 16 (normal_tex, SVGF/NRD/OptiX-AOV)
-    17, // engine slot 9 -> shader binding 17 (albedo_tex, OptiX AOV only)
-    21, // engine slot 10 -> shader binding 21 (accum_stars, issue #46)
+    0,  // engine slot 0  -> shader binding 0  (output / swapchain)
+    1,  // engine slot 1  -> shader binding 1  (accum_hdr)
+    6,  // engine slot 2  -> shader binding 6  (denoise_color)
+    7,  // engine slot 3  -> shader binding 7  (depth_tex)
+    8,  // engine slot 4  -> shader binding 8  (motion_tex)
+    9,  // engine slot 5  -> shader binding 9  (env_map)
+    12, // engine slot 6  -> shader binding 12 (star_map)
+    13, // engine slot 7  -> shader binding 13 (moon_map)
+    16, // engine slot 8  -> shader binding 16 (normal_tex, SVGF/NRD/OptiX-AOV)
+    17, // engine slot 9  -> shader binding 17 (albedo_tex, OptiX AOV only)
+    0,  // engine slot 10 -> unused on the texture path (SDF clusters
+        //                   live in the buffer slot table at slot 10).
+        //                   Iteration gate at LookupImageView skips this
+        //                   entry because nothing ever binds a texture
+        //                   here; the entry exists only so slot 11 lines
+        //                   up with the engine-side BindStorageTexture(11)
+        //                   call for accum_stars.
+    22, // engine slot 11 -> shader binding 22 (accum_stars, issue #46;
+        //                   moved from binding 21 in round-2 merge with
+        //                   main after SDF Phase 1 #109 took binding 21
+        //                   for its storage buffer).
 };
-constexpr std::uint32_t kSlotToBufBinding[10] = {
+constexpr std::uint32_t kSlotToBufBinding[11] = {
     0,  // engine slot 0 unused
     3,  // engine slot 1 -> shader binding 3  (mesh_positions)
     4,  // engine slot 2 -> shader binding 4  (mesh_indices)
@@ -126,6 +157,9 @@ constexpr std::uint32_t kSlotToBufBinding[10] = {
     // Mac-Vulkan / MoltenVK without VK_KHR_ray_query).
     19, // engine slot 8 -> shader binding 19 (tri_bvh_nodes)
     20, // engine slot 9 -> shader binding 20 (tri_bvh_permuted_ids)
+    // SDF Phase 1 (#97): SDF cluster buffer. Moved here from engine
+    // slot 8 / binding 19 to make room for tri_bvh_*.
+    21, // engine slot 10 -> shader binding 21 (SDF cluster buffer)
 };
 // Scene TLAS lives at engine accel-slot 2 -> shader binding 2.
 
@@ -295,16 +329,21 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     // path doesn't work on Mac. Partially-bound is core Vulkan 1.2 and
     // supported on every target including MoltenVK.
     //
-    // Capacity: 11 storage_image (kNumTexSlots) + 1 accel_struct +
-    // 9 storage_buffer + 1 uniform_buffer = 22, sized to the worst-case
-    // "PathTrace binds everything" dispatch. kMaxWrites must be >= the
-    // total binding count or vkUpdateDescriptorSets reads off the
-    // end of these stack arrays. The +3 over the legacy 19 is binding 21
-    // (accum_stars, issue #46 star-split — PathTrace writes; DenoiseFinalize
-    // reads via its own dedicated layout, not this shared one) plus
-    // bindings 19/20 (tri_bvh_nodes / tri_bvh_permuted_ids, PR #106
-    // follow-up host-built triangle BVH).
-    constexpr std::uint32_t kMaxWrites = 22;
+    // Capacity: 11 storage_image (one less than kNumTexSlots because
+    // engine texture slot 10 is reserved/unused on the Vulkan path)
+    // + 1 accel_struct + 10 storage_buffer + 1 uniform_buffer = 23,
+    // sized to the worst-case "PathTrace binds everything" dispatch.
+    // kMaxWrites must be >= the total binding count or
+    // vkUpdateDescriptorSets reads off the end of these stack arrays.
+    // The +4 over the legacy 19 is bindings 19/20 (tri_bvh_nodes /
+    // tri_bvh_permuted_ids, PR #106 follow-up host-built triangle BVH),
+    // binding 21 (SDF cluster buffer, SDF Phase 1 #97; moved from
+    // binding 19 to make room for the tri BVH), and binding 22
+    // (accum_stars, issue #46 star-split — PathTrace writes;
+    // DenoiseFinalize reads via its own dedicated layout, not this
+    // shared one — moved from binding 21 because SDF Phase 1 #109 took
+    // that binding for its storage buffer).
+    constexpr std::uint32_t kMaxWrites = 23;
     std::array<VkDescriptorImageInfo,  kMaxWrites> img_infos {};
     std::array<VkDescriptorBufferInfo, kMaxWrites> buf_infos {};
     std::array<VkWriteDescriptorSetAccelerationStructureKHR, 1> as_infos {};
@@ -367,11 +406,15 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
         ++wc;
     };
 
-    // ---- Storage images at bindings 0,1,6,7,8,9,12,13,16 --------------
+    // ---- Storage images at bindings 0,1,6,7,8,9,12,13,16,17,22 -------
     // Skip slots the engine didn't bind: partially-bound layout means
     // unwritten slots are simply absent from this dispatch's set view.
     // (Slots a shader actually reads must be bound by the engine ahead
-    // of Dispatch; that's the dispatch-pipeline contract.)
+    // of Dispatch; that's the dispatch-pipeline contract.) Engine
+    // texture slot 10 is reserved (no binding) -- accum_stars moved to
+    // slot 11 / binding 22 in round-2 merge so SDF Phase 1 (#109) could
+    // own buffer slot 10 / binding 21 without colliding in the flat
+    // Vulkan descriptor space.
     for (std::uint32_t s = 0; s < kNumTexSlots; ++s) {
         VkImageView v = device_->LookupImageView(bound_tex_[s]);
         if (v == VK_NULL_HANDLE) continue;
@@ -384,7 +427,7 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
         if (a != VK_NULL_HANDLE) add_accel(2, a);
     }
 
-    // ---- Storage buffers at bindings 3,4,5,10,11,15,18,19,20 --------
+    // ---- Storage buffers at bindings 3,4,5,10,11,15,18,19,20,21 -----
     // Slot 6 -> binding 15 is exposure_state (GPU-driven auto-exposure
     // scalar; PathTrace reads, AutoExposure writes).
     // Slot 7 -> binding 18 is the analytic-primitive BVH node buffer
@@ -393,6 +436,8 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     // (PR #106 follow-up). Bound on every dispatch so the partially-bound
     // semantics work and the shader's SW mesh path doesn't read an
     // unbound slot when the CSG bake has finished.
+    // Slot 10 -> binding 21 is the SDF cluster buffer (SDF Phase 1, #97;
+    // moved from binding 19 to make room for the triangle BVH).
     for (std::uint32_t s = 1; s < std::size(bound_buf_); ++s) {
         VkBuffer b = device_->LookupBuffer(bound_buf_[s]);
         if (b == VK_NULL_HANDLE) continue;
@@ -889,13 +934,19 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // races on the LATEST host-side binding update). Total sets =
     // kFramesInFlight * kDispatchSetsPerFrame, each set needs the full
     // per-binding allocation:
-    //   11 storage_image + [1 accel_struct] + 7 storage_buffer + 1 ubo
+    //   11 storage_image + [1 accel_struct] + 10 storage_buffer + 1 ubo
     // The accel-struct pool entry is only emitted when rt_supported_
     // is true; ASKHR isn't a valid descriptor type at all on drivers
     // without VK_KHR_acceleration_structure (e.g. pre-1.3 MoltenVK).
     // The "+4" / "+1" headroom from the original sizing is preserved.
     // 11 storage_images: +1 over the legacy 10 is the accum_stars
-    // binding 19 added for issue #46 (star-split bypass of SVGF).
+    // binding 22 added for issue #46 (star-split bypass of SVGF;
+    // moved from binding 21 in round-2 merge with main after SDF
+    // Phase 1 #109 took binding 21 for its storage buffer).
+    // PR #106 follow-up bumps storage_buffer per set from 7 to 9 for
+    // tri_bvh_nodes / tri_bvh_permuted_ids (bindings 19/20); SDF
+    // Phase 1 (#97) bumps it again from 9 to 10 for the SDF cluster
+    // buffer at binding 21.
     const std::uint32_t kTotalSets =
         static_cast<std::uint32_t>(kFramesInFlight * kDispatchSetsPerFrame);
     std::vector<VkDescriptorPoolSize> psizes;
@@ -903,11 +954,11 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     if (rt_supported_) {
         psizes.push_back({ VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, kTotalSets * 1 + 1 });
     }
-    // 9 storage-buffer bindings per dispatch: mesh_positions, mesh_indices,
+    // 10 storage-buffer bindings per dispatch: mesh_positions, mesh_indices,
     // primitives, marginal_cdf, conditional_cdf, exposure_state, analytic
     // bvh_nodes (binding 18), tri_bvh_nodes (binding 19),
-    // tri_bvh_permuted_ids (binding 20).
-    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 9 + 4 });
+    // tri_bvh_permuted_ids (binding 20), sdf_clusters (binding 21).
+    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 10 + 4 });
     psizes.push_back({ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,          kTotalSets * 1 + 1 });
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -919,18 +970,22 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     vkCreateDescriptorPool(device_, &dpci, nullptr, &dpool_);
 
     // ---- Build the unified descriptor set layout ----------------------
-    // 21 bindings when hw RT is available (slot 2 = scene_tlas KHR AS),
-    // 20 otherwise -- the AS descriptor type itself is invalid on
+    // 23 bindings when hw RT is available (slot 2 = scene_tlas KHR AS),
+    // 22 otherwise -- the AS descriptor type itself is invalid on
     // drivers without VK_KHR_acceleration_structure, so the layout has
     // to omit that binding entirely. The matching SPIR-V variant
     // (PathTrace_norq.spv) drops the scene_tlas declaration in lock
     // step so the shader's binding numbering still matches; the SW
     // mesh path reads mesh_positions / mesh_indices (bindings 3/4) and
     // (PR #106 follow-up) the host-built triangle BVH at bindings 19/20
-    // exactly like the HW path does.
+    // exactly like the HW path does. SDF Phase 1 (#97) adds binding 21
+    // for the SDF cluster buffer (moved from binding 19 to make room
+    // for the triangle BVH). Star-split (#46) adds binding 22 for the
+    // accum_stars storage image (moved from binding 21 to make room for
+    // the SDF cluster buffer in round-2 merge with main).
     {
         std::vector<VkDescriptorSetLayoutBinding> b;
-        b.reserve(22);
+        b.reserve(23);
         auto add_binding = [&](std::uint32_t binding, VkDescriptorType type) {
             VkDescriptorSetLayoutBinding lb{};
             lb.binding         = binding;
@@ -981,7 +1036,17 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // is the runtime "is the BVH populated" signal).
         add_binding(19, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
         add_binding(20, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-        // binding 21: accum_stars (issue #46 star-split accumulator;
+        // --- SDF Phase 1 (#97) ---
+        // binding 21: sdf_clusters (flat per-cluster op-tree + AABB).
+        // Moved here from binding 19 to make room for #106's
+        // tri_bvh_nodes / tri_bvh_permuted_ids. PARTIALLY_BOUND means
+        // the unbound case is fine (engine binds a placeholder
+        // storage buffer when no SDF clusters exist); the shader's
+        // gate `sdf_params.x > 0` is the runtime "have any clusters"
+        // signal.
+        add_binding(21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        // --- end SDF Phase 1 ---
+        // binding 22: accum_stars (issue #46 star-split accumulator;
         // RGBA16F per-pixel star contribution that PathTrace routes
         // around the SVGF a-trous kernel, then DenoiseFinalize +
         // Tonemap composite back in pre-ACES). Always allocated in
@@ -990,8 +1055,9 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // placeholder texture there for descriptor-set validity and
         // the shaders' `stars_present` / `star_split_enabled` push
         // gates skip the read/write entirely. Moved here from
-        // binding 19 to make room for #107's triangle BVH.
-        add_binding(21, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        // binding 21 in the round-2 merge after SDF Phase 1 (#109)
+        // claimed binding 21 for its storage buffer.
+        add_binding(22, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
 
         // UPDATE_AFTER_BIND for every binding so we can rewrite the
         // shared descriptor set between dispatches in the same cmd

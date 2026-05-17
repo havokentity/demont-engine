@@ -66,13 +66,15 @@
 // and we route accum_stars into bloom_tex's source upstream of the
 // pyramid so the halos pick up the same energy this kernel adds.
 //
-// Slot is binding 21 to match PathTrace.slang's reserved slot for the
+// Slot is binding 22 to match PathTrace.slang's reserved slot for the
 // same texture (the shared descriptor-set layout was extended past 19
-// when #107's triangle BVH took bindings 19/20). When star-split is
-// off (cvar r_star_split 0 or denoiser off) the engine binds a 1x1
-// placeholder texture here purely for descriptor-set validity; the
-// shader's `stars_present` push gate ensures this slot is never
-// sampled in that case, so the placeholder's contents don't matter.
+// when #107's triangle BVH took bindings 19/20, again past 21 when
+// SDF Phase 1 #109 took binding 21 for its storage buffer -- stars
+// moved 21 -> 22 in the round-2 merge). When star-split is off (cvar
+// r_star_split 0 or denoiser off) the engine binds a 1x1 placeholder
+// texture here purely for descriptor-set validity; the shader's
+// `stars_present` push gate ensures this slot is never sampled in
+// that case, so the placeholder's contents don't matter.
 //
 // IMPORTANT (Vulkan path is currently DEAD code -- read before
 // reviving it): On Metal this slot is correct because Slang's MSL
@@ -83,22 +85,22 @@
 //
 // On Vulkan the engine's slot table (`kSlotToTexBinding[]` in
 // VulkanDevice.cpp) maps engine slot 3 to vk::binding 7 (depth_tex),
-// NOT to binding 21. Vulkan today never dispatches Tonemap.slang --
+// NOT to binding 22. Vulkan today never dispatches Tonemap.slang --
 // VulkanDevice::Denoise routes through DenoiseFinalize.slang on its
 // own dedicated 4-binding layout (search for
 // `use_vulkan_bloom_finalize` / `EncodeFinalizeOnly`) -- so the
-// vk::binding(21) annotation is latent: it would only fire if a
+// vk::binding(22) annotation is latent: it would only fire if a
 // future change re-enables the engine's Tonemap.slang dispatch on
 // Vulkan. If that happens, either the engine must bind via a NEW
-// engine slot that maps to binding 21 (e.g. slot 10, which is the
+// engine slot that maps to binding 22 (e.g. slot 11, which is the
 // PathTrace `accum_stars` slot), OR this declaration must move to
 // binding 7 to match `kSlotToTexBinding[3]`. Without one of those
-// changes, the descriptor write at binding 21 would never receive a
+// changes, the descriptor write at binding 22 would never receive a
 // view and binding 7 would be unexpectedly aliased to stars (with
 // the wrong format / contents of depth_tex). See the
 // "Vulkan never enters this branch" comment around the engine's
 // `use_engine_tonemap` gate in Engine.cpp for the current routing.
-[[vk::binding(21, 0)]] RWTexture2D<float4> stars_tex;
+[[vk::binding(22, 0)]] RWTexture2D<float4> stars_tex;
 
 // --- buffer slot padding to push exposure_state to MSL buf(6) and
 //     Push (cbuffer) to MSL buf(7) ----------------------------------

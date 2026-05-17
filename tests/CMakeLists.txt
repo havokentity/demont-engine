@@ -477,6 +477,22 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     pt_add_golden_cell(SCENE cornell_csg BACKEND software DENOISER off)
     pt_add_golden_cell(SCENE cornell_csg BACKEND metal    DENOISER off)
     pt_add_golden_cell(SCENE cornell_csg BACKEND vulkan   DENOISER off)
+
+    # --- SDF Phase 1 (#97) -------------------------------------------------
+    # Acceptance cell: row of smin-blended SDF sphere pairs next to
+    # analytic spheres in the same frame. Issue #97 acceptance bar is
+    # "Blend region shows continuous normal (no facet artifact)" -- the
+    # imgdiff tolerance below is set permissively because the SDF sphere-
+    # trace's per-pixel iteration count is more sensitive to FP order
+    # across backends than the analytic-sphere path. Tightening once
+    # cross-backend variance is measured is fine.
+    pt_add_golden_cell(SCENE sdf_smin_row BACKEND software DENOISER off
+        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+    pt_add_golden_cell(SCENE sdf_smin_row BACKEND metal    DENOISER off
+        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+    pt_add_golden_cell(SCENE sdf_smin_row BACKEND vulkan   DENOISER off
+        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+    # --- end SDF Phase 1 ---------------------------------------------------
 else()
     message(STATUS
         "tests: golden-image matrix skipped -- pt_render_one_frame and/or "

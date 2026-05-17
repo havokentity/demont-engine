@@ -53,10 +53,14 @@ include(${CMAKE_SOURCE_DIR}/cmake/Slang.cmake)
 # skip the module re-parse, saving ~145ms / rebuild.
 pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTraceMath.slang)
 pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTraceCloud.slang)
+# --- SDF Phase 1 (#97) -----------------------------------------------------
+# Analytic SDF library; same compile-module pattern.
+pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/SdfPrimitives.slang)
+# --- end SDF Phase 1 -------------------------------------------------------
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
     STAGE compute ENTRY main TARGETS spirv
-    MODULE_DEPS PathTraceMath PathTraceCloud)
+    MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives)
 # Second PathTrace SPIR-V variant without RayQuery, for backends that
 # don't expose VK_KHR_ray_query (Mac-Vulkan on pre-1.3 MoltenVK builds).
 # The two variants share the source file; PT_SPIRV_NO_RAYQUERY strips
@@ -68,7 +72,7 @@ pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
     STAGE compute ENTRY main TARGETS spirv
     VARIANT norq EXTRA_DEFINES -DPT_SPIRV_NO_RAYQUERY
-    MODULE_DEPS PathTraceMath PathTraceCloud)
+    MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives)
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/Tonemap.slang
     STAGE compute ENTRY main TARGETS spirv)
