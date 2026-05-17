@@ -148,6 +148,34 @@ pt_add_test(pt_core_analytic_bvh
     pt_core_analytic_bvh_test.cpp
     LINK_TARGETS pt_renderer)
 
+# --- pt_csg/CsgScene unit tests (issue #64) --------------------------------
+# Manifold-backed CSG facade. Public-API coverage:
+#   - empty scene -> Bake produces Empty() BakedMesh + error string
+#   - single primitive leaves (box / sphere / cylinder) -> non-empty
+#     mesh, AABB extents match the requested dimensions, translation
+#     applied after origin-centering
+#   - union of disjoint primitives preserves both surfaces (sum-of-
+#     children triangle count + AABB spanning both)
+#   - subtract (box - centred sphere) adds triangles, AABB still
+#     bounded by the outer box
+#   - intersect of disjoint primitives is empty; intersect of
+#     overlapping primitives has the overlap-region AABB
+#   - Reset / Dirty / AcknowledgeClean state machine
+#   - id reuse via Remove+re-Add round-trip, duplicate-id rejection
+#   - Remove cascades through internal nodes referencing the removed id
+#   - same-process determinism: repeated Bake() is identical
+#   - boolean identities: (a - a) == empty, (a intersect a) ~= a
+#   - degenerate primitive rejection, SetRoot of unknown id rejected
+#   - Dump emits a tree dump with the [root] marker
+# CsgScene lives in pt_renderer (src/renderer/Csg/) so we link that.
+# Tests assert STRUCTURAL properties (vertex count, triangle count,
+# AABB extents) rather than vertex-by-vertex equality -- Manifold's
+# mesh output isn't bit-stable across library versions but its
+# structural properties (and same-process determinism) are.
+pt_add_test(pt_csg_scene
+    pt_csg_scene_test.cpp
+    LINK_TARGETS pt_renderer)
+
 # ============================================================================
 # Golden-image regression matrix (issue #45)
 # ============================================================================
