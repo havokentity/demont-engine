@@ -154,6 +154,21 @@ Texture2D<float4> moon_map;
 // would shift exposure_state's slot and break the engine binding.
 [[vk::binding(18, 0)]] StructuredBuffer<float4> bvh_nodes;
 
+// --- SDF Phase 1 (#97) -----------------------------------------------------
+// SDF cluster buffer. Each cluster is a flat array of nodes (op-tree)
+// plus a tight world-space AABB. Sphere-tracing is bounded to the AABB
+// after a separate (per-cluster) linear hit test that runs alongside
+// the analytic-prim BVH walk. The buffer is packed in the host as a
+// SoA stream of float4s; the loader below reassembles the cluster
+// header + nodes.
+//
+// IMPORTANT: declared AFTER bvh_nodes so existing Metal slots 0..7 are
+// undisturbed (Metal slot allocation is declaration-order based; see
+// the note above bvh_nodes). SDF cluster buffer lands on Metal slot 8.
+// On Vulkan the explicit vk::binding(19) is what matters.
+[[vk::binding(19, 0)]] StructuredBuffer<float4> sdf_clusters;
+// --- end SDF Phase 1 -------------------------------------------------------
+
 struct BvhNode {
     float3 aabb_min;
     uint   left_first;
@@ -348,6 +363,25 @@ cbuffer Push {
     //        prim_count).
     //   .z/.w reserved.
     uint4 bvh_params;
+    // --- SDF Phase 1 (#97) -------------------------------------------------
+    // SDF traversal params. See Engine.cpp's PtPush::sdf_params for full
+    // docs.
+    //   .x = sdf_cluster_count -- number of SDF clusters in
+    //        `sdf_clusters`. 0 disables the SDF path entirely.
+    //   .y = sdf_max_iters     -- sphere-trace iteration cap per
+    //        cluster (host cvar r_sdf_max_iters, default 128, clamped
+    //        to 1..256 on the host).
+    //   .z = sdf_debug_iters   -- 1 -> output an iteration heat-map
+    //        instead of normal shading for diagnostics. Phase 1 leaves
+    //        the heat-map plumbed but not yet visualized; the field is
+    //        wired so Phase 2 / fractal tuning can switch it on without
+    //        a push-constant reshuffle.
+    //   .w reserved.
+    uint4 sdf_params;
+    // .x = r_sdf_epsilon (sphere-trace surface-distance terminator,
+    //      metres). Default 1e-4. .yzw reserved.
+    float4 sdf_params_f;
+    // --- end SDF Phase 1 ---------------------------------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -391,6 +425,11 @@ cbuffer Frame {
     float4 accum_params;
     // See `bvh_params` in the Metal Push cbuffer above.
     uint4 bvh_params;
+    // --- SDF Phase 1 (#97) -------------------------------------------------
+    // See `sdf_params` / `sdf_params_f` in the Metal Push cbuffer above.
+    uint4  sdf_params;
+    float4 sdf_params_f;
+    // --- end SDF Phase 1 ---------------------------------------------------
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -405,6 +444,12 @@ cbuffer Frame {
 // of this entry-point shader.
 import PathTraceCloud;
 import PathTraceMath;
+// --- SDF Phase 1 (#97) -----------------------------------------------------
+// Analytic SDF library (sphere/box/torus/capsule/plane + smooth-CSG
+// ops + sphere-trace). Imported as a Slang IR module so body-only
+// PathTrace.slang iterations don't re-parse it.
+import SdfPrimitives;
+// --- end SDF Phase 1 -------------------------------------------------------
 
 static const uint MAT_LAMBERT    = 0u;
 static const uint MAT_METAL      = 1u;
@@ -459,6 +504,86 @@ void testAnalyticPrim(uint idx, float3 ro, float3 rd, inout HitInfo h) {
         }
     }
 }
+
+// --- SDF Phase 1 (#97) -----------------------------------------------------
+// Per-cluster stride in float4s: 4 (header) + kMaxNodes * 3. Header
+// layout:
+//   hdr0.xyz = aabb_min ;  asuint(hdr0.w) = node_count
+//   hdr1.xyz = aabb_max ;  asuint(hdr1.w) = material (0/1/2)
+//   hdr2.xyz = albedo   ;          hdr2.w = roughness
+//   hdr3.x   = ior      ;  hdr3.yzw = pad
+// Each SdfClusterNode occupies 3 float4s:
+//   n0.x = asfloat(op) ; n0.y = asfloat(shape) ;
+//   n0.z = asfloat(child_a) ; n0.w = asfloat(child_b)
+//   n1   = params (float4)
+//   n2.xyz = center ; n2.w pad
+static const uint kSdfHeaderFloat4s = 4u;
+static const uint kSdfNodeFloat4s   = 3u;
+static const uint kSdfClusterStride = kSdfHeaderFloat4s + SDF_MAX_NODES * kSdfNodeFloat4s; // 28
+
+SdfCluster loadSdfCluster(uint cluster_idx) {
+    uint base = cluster_idx * kSdfClusterStride;
+    SdfCluster c;
+    float4 h0 = sdf_clusters[base + 0u];
+    float4 h1 = sdf_clusters[base + 1u];
+    float4 h2 = sdf_clusters[base + 2u];
+    float4 h3 = sdf_clusters[base + 3u];
+    c.aabb_min   = h0.xyz;
+    c.node_count = asuint(h0.w);
+    c.aabb_max   = h1.xyz;
+    c.material   = asuint(h1.w);
+    c.albedo     = h2.xyz;
+    c.roughness  = h2.w;
+    c.ior        = h3.x;
+    [unroll(SDF_MAX_NODES)]
+    for (uint i = 0u; i < SDF_MAX_NODES; ++i) {
+        uint nb = base + kSdfHeaderFloat4s + i * kSdfNodeFloat4s;
+        float4 n0 = sdf_clusters[nb + 0u];
+        float4 n1 = sdf_clusters[nb + 1u];
+        float4 n2 = sdf_clusters[nb + 2u];
+        SdfClusterNode n;
+        n.op      = asuint(n0.x);
+        n.shape   = asuint(n0.y);
+        n.child_a = asuint(n0.z);
+        n.child_b = asuint(n0.w);
+        n.params  = n1;
+        n.center  = n2.xyz;
+        n._pad    = 0u;
+        c.nodes[i] = n;
+    }
+    return c;
+}
+
+// Test all SDF clusters against the ray and update the hit record with
+// any closer hit found. Linear scan -- Phase 1 expects <= 8 clusters,
+// per the issue's perf budget. A future phase will fold this into the
+// analytic-prim BVH as a third leaf-shape tag.
+void traceSdfClusters(float3 ro, float3 rd, inout HitInfo h) {
+    uint count = sdf_params.x;
+    if (count == 0u) return;
+    uint  iter_budget = sdf_params.y;
+    float epsilon     = sdf_params_f.x;
+    for (uint i = 0u; i < count; ++i) {
+        SdfCluster c = loadSdfCluster(i);
+        float t;
+        float3 n;
+        // t_min = 1e-3 keeps the start past the camera plane;
+        // t_max = h.t bounds the trace to the current closest hit so
+        // an SDF cluster behind an existing closer hit short-circuits.
+        if (sdfClusterTrace(c, ro, rd, 1e-3, h.t, iter_budget, epsilon, t, n)) {
+            if (t < h.t) {
+                h.hit       = true;
+                h.t         = t;
+                h.normal    = n;
+                h.mat       = c.material;
+                h.albedo    = c.albedo;
+                h.roughness = c.roughness;
+                h.ior       = c.ior;
+            }
+        }
+    }
+}
+// --- end SDF Phase 1 -------------------------------------------------------
 
 // Slab ray-AABB intersection. Returns true if the ray (ro, rd) hits the
 // box [mn, mx] within [0, t_max]. Used to decide whether to descend a
@@ -531,6 +656,19 @@ HitInfo traceScene(float3 ro, float3 rd) {
             }
         }
     }
+
+    // --- SDF Phase 1 (#97) ---------------------------------------------
+    // SDF clusters. Each cluster is a self-contained op-tree of
+    // analytic SDFs (sphere/box/torus/capsule/rounded box) blended via
+    // smooth-CSG ops. The shape's hit-record format is identical to
+    // the analytic-prim path (pos + normal + material id) so the BSDF
+    // / NEE / denoiser downstream see no difference. Linear scan over
+    // all clusters; each cluster does its own slab-test against its
+    // tight world-space AABB before launching the sphere-trace, so
+    // the heavy work is only paid when the ray actually enters a
+    // cluster's footprint.
+    traceSdfClusters(ro, rd, h);
+    // --- end SDF Phase 1 -----------------------------------------------
 
     // Triangle meshes. Two paths exist:
     //   tlas_present != 0                 -> HW RayQuery (fast)

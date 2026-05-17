@@ -33,13 +33,19 @@ include(${CMAKE_SOURCE_DIR}/cmake/Slang.cmake)
 # idempotent across rhi_vulkan + rhi_metal trees.
 pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTraceMath.slang)
 pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTraceCloud.slang)
+# --- SDF Phase 1 (#97) -----------------------------------------------------
+# Analytic SDF library (sphere/box/torus/capsule/rounded box + smooth-CSG
+# ops + sphere-trace). Same target-agnostic module pattern as
+# PathTraceMath / PathTraceCloud above.
+pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/SdfPrimitives.slang)
+# --- end SDF Phase 1 -------------------------------------------------------
 pt_compile_slang(
     TARGET  pt_rhi_metal
     SOURCE  ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
     STAGE   compute
     ENTRY   main
     TARGETS metal
-    MODULE_DEPS PathTraceMath PathTraceCloud
+    MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives
 )
 pt_compile_slang(
     TARGET  pt_rhi_metal
