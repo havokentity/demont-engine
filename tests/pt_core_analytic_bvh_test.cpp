@@ -446,16 +446,24 @@ TEST_CASE("AnalyticBvh: BVH closest-hit matches naive scan over 1000 random rays
 // --- Test 4: many primitives sharing a split-plane coordinate -------------
 // Stresses the median-split partition: if the builder's nth_element
 // partition mishandles ties (e.g. all centroids equal on the split
-// axis), prims could end up dropped or wrongly grouped. Test with 64
-// spheres at metre scale where the split-axis centroid is identical
-// across many prims (every sphere shares x=0).
+// axis), prims could end up dropped or wrongly grouped.
+//
+// AnalyticBvh picks the *widest* centroid-spread axis before calling
+// nth_element (src/renderer/AnalyticBvh.cpp:86-125). To actually exercise
+// tie handling we have to (a) force the chosen axis to be X and
+// (b) load X with ties. Two outliers at +/-100 m make X by far the
+// widest centroid axis; the remaining 62 prims share x=0 exactly, so
+// nth_element runs on a 64-element list with 62 ties at the median
+// value.
 TEST_CASE("AnalyticBvh: many primitives on same splitter plane -- all reachable") {
     std::vector<BvhPrim> prims;
     constexpr std::uint32_t kN = 64;
     XorShift32 rng(0xCAFEF00Du);
     for (std::uint32_t i = 0; i < kN; ++i) {
         BvhPrim p{};
-        p.center[0] = 0.0f;                                   // forced tie on X
+        if (i == 0)      p.center[0] =  100.0f;               // outlier (+X) -- makes X the widest centroid axis
+        else if (i == 1) p.center[0] = -100.0f;               // outlier (-X)
+        else             p.center[0] =    0.0f;               // 62 ties on the chosen split axis
         p.center[1] = rng.rangef(-5.0f, 5.0f);
         p.center[2] = rng.rangef(-5.0f, 5.0f);
         p.radius    = 0.3f;
@@ -479,8 +487,9 @@ TEST_CASE("AnalyticBvh: many primitives on same splitter plane -- all reachable"
     // the BVH finds it. This is the "all reachable via ray query"
     // assertion -- naive scan over the same prims will trivially hit;
     // if any prim went missing during partition the BVH path won't.
+    // Ray origin at x=-200 clears even the x=-100 outlier.
     for (std::uint32_t i = 0; i < kN; ++i) {
-        const float ro[3] = {-20.0f, prims[i].center[1], prims[i].center[2]};
+        const float ro[3] = {-200.0f, prims[i].center[1], prims[i].center[2]};
         const float rd[3] = {1.0f, 0.0f, 0.0f};
         Hit b = BvhTrace(bvh.Nodes(), bvh.PermutedPrimIds(), prims, ro, rd, 0.0f);
         Hit n = NaiveTrace(prims, ro, rd, 0.0f);
@@ -645,8 +654,19 @@ TEST_CASE("AnalyticBvh: every node's AABB contains all reachable leaf-prim AABBs
                     CHECK(contains(node_aabb, prim_aabb));
                 }
             } else {
-                stack.push_back(n.left_first);
-                stack.push_back(n.left_first + 1u);
+                // Internal node: bounds-check child indices before
+                // pushing so a builder regression that corrupts
+                // left_first surfaces here as a clear REQUIRE failure
+                // instead of an OOB read on the next iteration.
+                const std::uint32_t lc = n.left_first;
+                const std::uint32_t rc = n.left_first + 1u;
+                CAPTURE(idx);
+                CAPTURE(lc);
+                CAPTURE(rc);
+                REQUIRE(lc < nodes.size());
+                REQUIRE(rc < nodes.size());
+                stack.push_back(lc);
+                stack.push_back(rc);
             }
         }
     }
