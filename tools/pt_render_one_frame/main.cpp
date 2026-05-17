@@ -164,6 +164,22 @@ bool ParseArgs(int argc, char** argv, Args& a) {
             "{software,metal,vulkan}; got '%s'\n", a.backend.c_str());
         return false;
     }
+    // Validate scene path exists in the wrapper. The engine's `exec`
+    // command reports "cannot open" as console output but does NOT make
+    // the smoke run fail -- a typo or missing fixture would render the
+    // engine default scene and only surface later as a pixel diff. Fail
+    // fast here with a clear error so the operator notices immediately.
+    {
+        std::error_code ec;
+        if (!std::filesystem::exists(a.scenePath, ec) || ec) {
+            std::fprintf(stderr,
+                "pt_render_one_frame: --scene '%s' does not exist%s%s\n",
+                a.scenePath.c_str(),
+                ec ? ": " : "",
+                ec ? ec.message().c_str() : "");
+            return false;
+        }
+    }
     return true;
 }
 
@@ -266,6 +282,13 @@ std::filesystem::path BuildSmokeExec(const Args& a) {
       << " denoiser=" << a.denoiser
       << " spp=" << (a.spp.empty() ? "<fixture>" : a.spp)
       << " frames=" << a.frames << "\n";
+    // Scene fixture loads FIRST so the wrapper's per-cell overrides
+    // (--denoiser / --spp / --extra) can override anything the fixture
+    // sets. cornell_csg.cfg pins r_spp 1, so if the wrapper emitted
+    // `r_spp` before the `exec` the fixture would silently overwrite
+    // the operator's `--spp` value. The "more-specific wins" overlay
+    // here is wrapper flag > fixture > engine default.
+    f << "exec " << quoteForConsole(a.scenePath) << "\n";
     f << "r_denoiser " << a.denoiser << "\n";
     if (!a.spp.empty()) {
         f << "r_spp " << a.spp << "\n";
@@ -277,10 +300,6 @@ std::filesystem::path BuildSmokeExec(const Args& a) {
         // shell-quoting the value sensibly on its end.
         f << a.extra << "\n";
     }
-    // Scene fixture loads last so its settings can override anything
-    // above (matches the cfg / autoexec / CLI overlay order: more-
-    // specific wins). The path is quoted to survive spaces.
-    f << "exec " << quoteForConsole(a.scenePath) << "\n";
     if (!f) return {};
     return out;
 }
@@ -439,7 +458,11 @@ int main(int argc, char** argv) {
     if (rc != 0) {
         std::fprintf(stderr,
             "pt_render_one_frame: demont exited with code %d\n", rc);
-        return rc == kExitOk ? kExitSpawnError : rc;
+        // The usage text documents exit 3 (kExitSpawnError) for "child
+        // returned non-zero". Honour that contract regardless of the
+        // child's specific exit code; callers (ctest cells, scripts)
+        // gate on this wrapper's exit, not demont's.
+        return kExitSpawnError;
     }
     return kExitOk;
 }

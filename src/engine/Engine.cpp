@@ -591,10 +591,19 @@ bool Engine::Init() {
 
     // Golden-image regression matrix (issue #45) fixture exec. Runs
     // AFTER CLI overrides so the --smoke-exec=path flag has populated
-    // pt_smoke_exec, and BEFORE the device boots so its cvar writes
-    // (r_spp, r_seed, scene primitive commands, camera pose, sun
-    // position, etc.) take effect during the first frame. Same
-    // cfg_loading_ guard as demont.cfg/autoexec.cfg so astronomy
+    // pt_smoke_exec, and BEFORE the device boots so the fixture's cvar
+    // writes (r_spp, r_max_bounces, camera pose, sun position,
+    // app_window_*, r_capture_*, etc.) take effect during window
+    // creation + first frame.
+    //
+    // Scope at THIS exec point: cvar writes only. CSG-scene
+    // (`cs_*`) and analytic-primitive commands are intentionally
+    // out of scope here -- `csg_scene_` is not constructed and
+    // `SeedDefaultPrimitives()` has not run yet (see lines 653 / 659
+    // below). A fixture that issues `cs_*` here is a silent no-op.
+    // TODO(#45-followup): add a second exec pass after
+    // SeedDefaultPrimitives() so scene/primitive fixtures work too.
+    // Same cfg_loading_ guard as demont.cfg/autoexec.cfg so astronomy
     // on_change warnings stay suppressed during fixture load.
     if (auto* sx = C.FindCVar("pt_smoke_exec"); sx != nullptr && !sx->value.empty()) {
         exec_if_exists(sx->value.c_str());
