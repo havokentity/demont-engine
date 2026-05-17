@@ -57,6 +57,18 @@ pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
     STAGE compute ENTRY main TARGETS spirv
     MODULE_DEPS PathTraceMath PathTraceCloud)
+# Second PathTrace SPIR-V variant without RayQuery, for backends that
+# don't expose VK_KHR_ray_query (Mac-Vulkan on pre-1.3 MoltenVK builds).
+# The two variants share the source file; PT_SPIRV_NO_RAYQUERY strips
+# the scene_tlas binding + the HW RayQuery branch, so the SPIR-V module
+# never declares the RayQueryKHR capability and loads cleanly on those
+# drivers. VulkanDevice picks one at pipeline build time based on
+# rt_supported_; see the PathTrace pipeline build site for the gate.
+pt_compile_slang(
+    TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
+    STAGE compute ENTRY main TARGETS spirv
+    VARIANT norq EXTRA_DEFINES -DPT_SPIRV_NO_RAYQUERY
+    MODULE_DEPS PathTraceMath PathTraceCloud)
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/Tonemap.slang
     STAGE compute ENTRY main TARGETS spirv)

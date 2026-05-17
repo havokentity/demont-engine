@@ -37,6 +37,14 @@
 extern "C" {
 extern const unsigned char shader_PathTrace_spirv_data[];
 extern const unsigned long shader_PathTrace_spirv_size;
+// no-RayQuery variant. Built by src/rhi_vulkan/CMakeLists.txt with
+// -DPT_SPIRV_NO_RAYQUERY; used in place of the RT-enabled blob above
+// on backends that don't expose VK_KHR_ray_query (Mac-Vulkan on
+// pre-MoltenVK-1.3 builds). The two are functionally equivalent except
+// for the mesh-traversal path: gold variant uses RayQuery, norq
+// variant falls back to a linear scan via bvh_params.z.
+extern const unsigned char shader_PathTrace_norq_spirv_data[];
+extern const unsigned long shader_PathTrace_norq_spirv_size;
 extern const unsigned char shader_AutoExposure_spirv_data[];
 extern const unsigned long shader_AutoExposure_spirv_size;
 extern const unsigned char shader_PerfOverlay_spirv_data[];
@@ -619,6 +627,14 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     bool has_accel_struct     = DeviceSupportsExtension(phys_device_, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
     bool has_deferred_host_op = DeviceSupportsExtension(phys_device_, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
     rt_supported_ = has_ray_query && has_accel_struct && has_deferred_host_op;
+    // One-line log for the bringup gate so the cause of a missing RT
+    // path is obvious in the console. Pre-MoltenVK-1.3 builds report
+    // 'ray_query=false accel_struct=false' here; on those drivers
+    // the engine falls back to a CPU-built triangle BVH for CSG meshes
+    // (see Engine::RebuildMeshResources + the bvh_tris software path
+    // in PathTrace.slang).
+    LOG_INFO("Vulkan RT extension presence: ray_query={} accel_struct={} deferred_host_op={} -> hw_rt={}",
+             has_ray_query, has_accel_struct, has_deferred_host_op, rt_supported_);
 
     // Query feature support before enabling anything in vkCreateDevice.
     VkPhysicalDeviceFeatures2 f2_supported{};
@@ -854,16 +870,21 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // time, so a single shared set across multiple recorded dispatches
     // races on the LATEST host-side binding update). Total sets =
     // kFramesInFlight * kDispatchSetsPerFrame, each set needs the full
-    // 19-binding allocation:
-    //   10 storage_image + 1 accel_struct + 7 storage_buffer + 1 ubo
+    // per-binding allocation:
+    //   10 storage_image + [1 accel_struct] + 7 storage_buffer + 1 ubo
+    // The accel-struct pool entry is only emitted when rt_supported_
+    // is true; ASKHR isn't a valid descriptor type at all on drivers
+    // without VK_KHR_acceleration_structure (e.g. pre-1.3 MoltenVK).
     // The "+4" / "+1" headroom from the original sizing is preserved.
     const std::uint32_t kTotalSets =
         static_cast<std::uint32_t>(kFramesInFlight * kDispatchSetsPerFrame);
-    std::array<VkDescriptorPoolSize, 4> psizes{};
-    psizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kTotalSets * 10 + 4 };
-    psizes[1] = { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, kTotalSets * 1 + 1 };
-    psizes[2] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 7 + 4 };
-    psizes[3] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,          kTotalSets * 1 + 1 };
+    std::vector<VkDescriptorPoolSize> psizes;
+    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kTotalSets * 10 + 4 });
+    if (rt_supported_) {
+        psizes.push_back({ VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, kTotalSets * 1 + 1 });
+    }
+    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 7 + 4 });
+    psizes.push_back({ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,          kTotalSets * 1 + 1 });
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     dpci.maxSets       = kTotalSets;
@@ -873,46 +894,58 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
                        | VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
     vkCreateDescriptorPool(device_, &dpci, nullptr, &dpool_);
 
-    // ---- Build the unified 19-binding descriptor set layout ----------
+    // ---- Build the unified descriptor set layout ----------------------
+    // 19 bindings when hw RT is available (slot 2 = scene_tlas KHR AS),
+    // 18 otherwise -- the AS descriptor type itself is invalid on
+    // drivers without VK_KHR_acceleration_structure, so the layout has
+    // to omit that binding entirely. The matching SPIR-V variant
+    // (PathTrace_norq.spv) drops the scene_tlas declaration in lock
+    // step so the shader's binding numbering still matches; the SW
+    // mesh path reads mesh_positions / mesh_indices (bindings 3/4)
+    // exactly like the HW path does.
     {
-        std::array<VkDescriptorSetLayoutBinding, 19> b{};
-        auto fill = [&](std::uint32_t idx, std::uint32_t binding,
-                        VkDescriptorType type) {
-            b[idx].binding         = binding;
-            b[idx].descriptorType  = type;
-            b[idx].descriptorCount = 1;
-            b[idx].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+        std::vector<VkDescriptorSetLayoutBinding> b;
+        b.reserve(19);
+        auto add_binding = [&](std::uint32_t binding, VkDescriptorType type) {
+            VkDescriptorSetLayoutBinding lb{};
+            lb.binding         = binding;
+            lb.descriptorType  = type;
+            lb.descriptorCount = 1;
+            lb.stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+            b.push_back(lb);
         };
         // bindings 0-1: output + accum (storage image)
-        fill(0,  0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
-        fill(1,  1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
-        // binding 2: scene_tlas
-        fill(2,  2, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
+        add_binding(0,  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        add_binding(1,  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        // binding 2: scene_tlas (only when hw RT is supported)
+        if (rt_supported_) {
+            add_binding(2, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
+        }
         // bindings 3-5: mesh_positions, mesh_indices, primitives (storage buffer)
-        fill(3,  3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-        fill(4,  4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-        fill(5,  5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        add_binding(3,  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        add_binding(4,  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        add_binding(5,  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
         // bindings 6-9: denoise_color, depth_tex, motion_tex, env_map (storage image)
-        fill(6,  6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
-        fill(7,  7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
-        fill(8,  8, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
-        fill(9,  9, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        add_binding(6,  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        add_binding(7,  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        add_binding(8,  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        add_binding(9,  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
         // bindings 10-11: marginal_cdf, conditional_cdf (storage buffer)
-        fill(10, 10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-        fill(11, 11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        add_binding(10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        add_binding(11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
         // bindings 12-13: star_map, moon_map (storage image)
-        fill(12, 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
-        fill(13, 13, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        add_binding(12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        add_binding(13, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
         // binding 14: Frame UBO (spilled push tail)
-        fill(14, kFrameUboBinding, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+        add_binding(kFrameUboBinding, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
         // binding 15: exposure_state (GPU-driven auto-exposure scalar)
-        fill(15, 15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        add_binding(15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
         // binding 16: normal_tex (path tracer G-buffer for SVGF/NRD/OptiX-AOV)
-        fill(16, 16, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        add_binding(16, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
         // binding 17: albedo_tex (path tracer G-buffer for OptiX AOV only)
-        fill(17, 17, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        add_binding(17, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
         // binding 18: bvh_nodes (analytic-prim BVH flat node array)
-        fill(18, 18, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        add_binding(18, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
 
         // UPDATE_AFTER_BIND for every binding so we can rewrite the
         // shared descriptor set between dispatches in the same cmd
@@ -920,11 +953,9 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // PARTIALLY_BOUND so dispatches can leave unused slots unwritten
         // -- the descriptor-write path skips slots the engine didn't
         // bind (the shader is required not to access those slots).
-        std::array<VkDescriptorBindingFlags, 19> bind_flags{};
-        for (auto& f : bind_flags) {
-            f = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT
-              | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
-        }
+        std::vector<VkDescriptorBindingFlags> bind_flags(b.size(),
+            VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT
+          | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
         VkDescriptorSetLayoutBindingFlagsCreateInfo bfci{};
         bfci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
         bfci.bindingCount  = static_cast<std::uint32_t>(bind_flags.size());
@@ -938,7 +969,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         dslci.pBindings    = b.data();
         if (vkCreateDescriptorSetLayout(device_, &dslci, nullptr,
                                         &shared_dset_layout_) != VK_SUCCESS) {
-            LOG_ERROR("vkCreateDescriptorSetLayout (19-binding) failed");
+            LOG_ERROR("vkCreateDescriptorSetLayout (PathTrace shared layout) failed");
             return;
         }
 
@@ -1062,7 +1093,21 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
             });
         };
 
-        build_pipeline("pathtrace",   shader_PathTrace_spirv_data,    shader_PathTrace_spirv_size);
+        // Pick the PathTrace SPIR-V variant at pipeline build time:
+        // rt_supported_ -> RT-enabled blob (RayQuery + scene_tlas binding);
+        // !rt_supported_ -> norq blob (no RayQueryKHR capability, mesh
+        // traversal degrades to the linear-scan path in PathTrace.slang).
+        // The norq variant exists because some MoltenVK builds don't
+        // expose VK_KHR_ray_query at all -- loading the RT-enabled blob
+        // on those drivers fails vkCreateShaderModule with a
+        // "RayQueryKHR capability declared but rayQuery feature missing"
+        // validation error, taking the path tracer pipeline down with
+        // it. See issue #44.
+        if (rt_supported_) {
+            build_pipeline("pathtrace", shader_PathTrace_spirv_data, shader_PathTrace_spirv_size);
+        } else {
+            build_pipeline("pathtrace", shader_PathTrace_norq_spirv_data, shader_PathTrace_norq_spirv_size);
+        }
         build_pipeline("autoexpose",  shader_AutoExposure_spirv_data, shader_AutoExposure_spirv_size);
         build_pipeline("perfoverlay", shader_PerfOverlay_spirv_data,  shader_PerfOverlay_spirv_size);
         // Bloom pyramid pipelines. These re-use the shared 19-binding

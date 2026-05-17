@@ -20,11 +20,20 @@
 #                  STAGE  <compute|vertex|fragment>   default: compute
 #                  ENTRY  <entry_point>               default: main
 #                  TARGETS metal [spirv ...]
-#                  MODULE_DEPS <name1> [<name2> ...])
+#                  MODULE_DEPS <name1> [<name2> ...]
+#                  EXTRA_DEFINES <-DFOO> [-DBAR ...]
+#                  VARIANT  <suffix>)
 #
 # For each requested target, emits a build-time custom command that runs
 # slangc and embeds the result as a binary blob into <tgt>. Symbol names
-# follow the pattern shader_<name>_<format>{_data,_size}.
+# follow the pattern shader_<name>_<format>{_data,_size}, OR --
+# when VARIANT is supplied -- shader_<name>_<variant>_<format>{_data,_size},
+# letting one .slang file produce multiple SPIR-V/MSL outputs with
+# different preprocessor states (e.g. RT-on vs RT-off PathTrace builds
+# for backends that lack VK_KHR_ray_query).
+#
+# EXTRA_DEFINES lets the caller append -D flags on top of the
+# target-specific defaults (-DPT_TARGET_METAL / -DPT_TARGET_SPIRV).
 #
 # MODULE_DEPS lists Slang modules (without extension) that the entry
 # point imports. Each `<name>` resolves to `<binary>/shaders/<name>.slang-module`
@@ -62,7 +71,7 @@ function(pt_compile_slang_module)
 endfunction()
 
 function(pt_compile_slang)
-    cmake_parse_arguments(SLG "" "TARGET;SOURCE;STAGE;ENTRY" "TARGETS;MODULE_DEPS" ${ARGN})
+    cmake_parse_arguments(SLG "" "TARGET;SOURCE;STAGE;ENTRY;VARIANT" "TARGETS;MODULE_DEPS;EXTRA_DEFINES" ${ARGN})
 
     if(NOT SLG_TARGET OR NOT SLG_SOURCE OR NOT SLG_TARGETS)
         message(FATAL_ERROR "pt_compile_slang needs TARGET / SOURCE / TARGETS")
@@ -110,7 +119,19 @@ function(pt_compile_slang)
             message(FATAL_ERROR "pt_compile_slang: unknown target '${t}'")
         endif()
 
-        set(out "${out_dir}/${slg_name}.${ext}")
+        # When VARIANT is supplied the output filename and embedded
+        # symbol both gain the suffix so a single .slang source can
+        # produce multiple SPIR-V/MSL blobs that coexist in the same
+        # binary (see PathTrace's rq / norq pair).
+        if(SLG_VARIANT)
+            set(out "${out_dir}/${slg_name}_${SLG_VARIANT}.${ext}")
+            set(symbol "shader_${slg_name}_${SLG_VARIANT}_${t}")
+            set(label "${slg_name}_${SLG_VARIANT}.slang")
+        else()
+            set(out "${out_dir}/${slg_name}.${ext}")
+            set(symbol "shader_${slg_name}_${t}")
+            set(label "${slg_name}.slang")
+        endif()
         # -Wno-40100 silences slangc's harmless "entry point 'main' has
         # been renamed to 'main_0'" notice -- it's a side effect of
         # Slang's mangling rules and not something we can avoid in
@@ -123,15 +144,15 @@ function(pt_compile_slang)
                     -entry   ${SLG_ENTRY}
                     -stage   ${SLG_STAGE}
                     ${slang_defs}
+                    ${SLG_EXTRA_DEFINES}
                     -I       "${out_dir}"
                     -Wno-40100
                     -o       "${out}"
             DEPENDS "${slg_full}" "${PT_SLANGC_BIN}" ${module_outputs}
             VERBATIM
-            COMMENT "slangc ${slg_name}.slang -> ${ext}"
+            COMMENT "slangc ${label} -> ${ext}"
         )
 
-        set(symbol "shader_${slg_name}_${t}")
         pt_embed_resource(${SLG_TARGET}
             SYMBOL    ${symbol}
             FULL_PATH "${out}"
