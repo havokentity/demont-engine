@@ -176,6 +176,27 @@ pt_add_test(pt_csg_scene
     pt_csg_scene_test.cpp
     LINK_TARGETS pt_renderer)
 
+# --- pt_renderer/TriangleBvh unit tests ------------------------------------
+# Triangle-BVH-on-host follow-up to PR #106 (issue #44). The SW
+# Möller-Trumbore linear-scan PR #106 shipped to make Mac-Vulkan render
+# CSG meshes on MoltenVK was O(N) per ray; on a 1k-tri scene this
+# crushed framerate to ~1 FPS at 1080p. The TriangleBvh class replaces
+# that with O(log N) stack-based traversal of a host-built BVH that
+# the engine uploads alongside vbuf / ibuf. Coverage mirrors the
+# AnalyticBvh test pattern:
+#   - empty BVH -> no hit
+#   - malformed indices (size % 3 != 0) -> empty BVH, no crash
+#   - single triangle -> hit / miss
+#   - degenerate (collinear) triangle preserves traversal of nearby tris
+#   - many tris on the same split-plane coord (tie stress on nth_element)
+#   - ~30 random tris + 1000 deterministic rays: BVH closest-hit ==
+#     naive linear-scan closest-hit
+#   - parent-AABB contains all reachable leaf-tri AABBs invariant
+# Links pt_renderer (where TriangleBvh lives, same lib as AnalyticBvh).
+pt_add_test(pt_renderer_triangle_bvh
+    pt_renderer_triangle_bvh_test.cpp
+    LINK_TARGETS pt_renderer)
+
 # --- pt_renderer/Astronomy unit tests (issue #65) --------------------------
 # JD conversions (J2000 + Unix-epoch reference points), GMST at J2000
 # vs the IAU 1982 formula, sun position at four cardinal solar events

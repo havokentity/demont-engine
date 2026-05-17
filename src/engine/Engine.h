@@ -5,6 +5,7 @@
 #include "../app/Window.h"
 #include "../core/Jobs/JobSystem.h"
 #include "../renderer/AnalyticBvh.h"
+#include "../renderer/TriangleBvh.h"
 #include "../rhi/Types.h"
 #include "CaptureFormat.h"
 #include "LensFlare.h"
@@ -304,6 +305,25 @@ private:
     // Mac-Vulkan on pre-1.3 MoltenVK builds that don't expose
     // VK_KHR_acceleration_structure / VK_KHR_ray_query).
     std::uint32_t                               mesh_tri_count_        = 0;
+    // Triangle BVH for the SW mesh path (PR #106 follow-up). Built
+    // alongside the vbuf/ibuf upload in RebuildMeshResources from the
+    // BakedMesh's positions + indices; uploaded to two storage buffers
+    // and bound on every dispatch as long as a CSG mesh is present.
+    // Driven from `bvh_params.w = tri_bvh_node_count_` in the push
+    // constants; the shader's SW mesh branch walks the tree there
+    // instead of the previous O(N) Möller-Trumbore linear scan, fixing
+    // the ~1 FPS @1080p perf cliff that PR #106 introduced on
+    // Mac-Vulkan (MoltenVK without VK_KHR_ray_query).
+    //
+    // The build is unconditional (runs on both RT-capable and SW-only
+    // backends) so the dispatch site is dispatch-uniform; the HW path
+    // simply doesn't read these buffers. A memory-conscious follow-up
+    // could gate the build on `!SupportsHardwareRT()` to avoid the
+    // upload on RT-capable backends, but that's separate work.
+    pt::renderer::TriangleBvh                   tri_bvh_;
+    std::uint64_t                               tri_bvh_nodes_id_       = 0;
+    std::uint64_t                               tri_bvh_permuted_ids_id_ = 0;
+    std::uint32_t                               tri_bvh_node_count_     = 0;
     // One-shot guard so the "SW linear-scan path with N>threshold tris"
     // perf-cliff warning fires once per process, not on every CSG bake.
     bool                                        sw_mesh_perf_warning_fired_ = false;
