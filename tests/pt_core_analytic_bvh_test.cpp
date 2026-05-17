@@ -181,12 +181,27 @@ Hit BvhTrace(const std::vector<BvhNode>&        nodes,
     stack[sp++] = 0u;
     while (sp > 0) {
         const std::uint32_t idx = stack[--sp];
+        // Defensive bounds check: a builder regression that produced
+        // a corrupt left_first on a previous iteration could push an
+        // out-of-range index. REQUIRE here surfaces the bug as a clear
+        // doctest assertion instead of UB on the `nodes[idx]` read.
+        REQUIRE(idx < nodes.size());
         const BvhNode& n = nodes[idx];
         if (!IntersectAabb(ro, rd_inv, n.aabb_min, n.aabb_max, h.t)) continue;
         if (n.count > 0u) {
-            // Leaf: test the contiguous prim range.
+            // Leaf: test the contiguous prim range. Bounds-check the
+            // full [left_first, left_first+count) range against
+            // permuted.size() once instead of per-element, and check
+            // each prim_id against original_prims.size() before
+            // indexing.
+            CAPTURE(idx);
+            CAPTURE(n.left_first);
+            CAPTURE(n.count);
+            REQUIRE(static_cast<std::size_t>(n.left_first) + n.count
+                    <= permuted.size());
             for (std::uint32_t k = 0; k < n.count; ++k) {
                 const std::uint32_t prim_id = permuted[n.left_first + k];
+                REQUIRE(prim_id < original_prims.size());
                 const BvhPrim& p = original_prims[prim_id];
                 float t; float nrm[3];
                 if (IntersectSphere(ro, rd, p, tmin, t, nrm) && t < h.t) {
@@ -197,9 +212,19 @@ Hit BvhTrace(const std::vector<BvhNode>&        nodes,
                 }
             }
         } else {
+            // Internal node: bounds-check the children against
+            // nodes.size() before pushing so a corrupt left_first
+            // surfaces here, not on the next iteration's nodes[idx].
+            const std::uint32_t lc = n.left_first;
+            const std::uint32_t rc = n.left_first + 1u;
+            CAPTURE(idx);
+            CAPTURE(lc);
+            CAPTURE(rc);
+            REQUIRE(lc < nodes.size());
+            REQUIRE(rc < nodes.size());
             if (sp + 2 <= 64) {
-                stack[sp++] = n.left_first;
-                stack[sp++] = n.left_first + 1u;
+                stack[sp++] = lc;
+                stack[sp++] = rc;
             }
         }
     }
@@ -640,6 +665,15 @@ TEST_CASE("AnalyticBvh: every node's AABB contains all reachable leaf-prim AABBs
             stack.pop_back();
             const BvhNode& n = nodes[idx];
             if (n.count > 0u) {
+                // Bounds-check the full leaf range against permuted.size()
+                // before per-element indexing so a corrupt left_first /
+                // count fails with a clear REQUIRE instead of OOB on the
+                // permuted[] read.
+                CAPTURE(idx);
+                CAPTURE(n.left_first);
+                CAPTURE(n.count);
+                REQUIRE(static_cast<std::size_t>(n.left_first) + n.count
+                        <= permuted.size());
                 for (std::uint32_t k = 0; k < n.count; ++k) {
                     const std::uint32_t prim_id = permuted[n.left_first + k];
                     REQUIRE(prim_id < prims.size());
