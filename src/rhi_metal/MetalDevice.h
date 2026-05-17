@@ -81,8 +81,12 @@ private:
     // original 8-slot limit was the only reason normal_tex was gated
     // to PT_TARGET_SPIRV in the path tracer.
     TextureHandle              bound_tex_[12] {};
-    BufferHandle               bound_buf_[8] {};
-    std::size_t                bound_buf_off_[8] {};
+    // 10 buffer slots. Slots 0..7 mirror the Vulkan layout; slots 8/9
+    // were added in the PR #106 follow-up for the triangle BVH
+    // (tri_bvh_nodes / tri_bvh_permuted_ids -- replaces the SW
+    // Möller-Trumbore linear-scan path with a stack-based BVH walk).
+    BufferHandle               bound_buf_[10] {};
+    std::size_t                bound_buf_off_[10] {};
     AccelStructHandle          bound_accel_[4] {};
 
     // Push-constant buffer. Sized to fit the unified PathTrace push
