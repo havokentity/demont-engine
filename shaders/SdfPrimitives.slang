@@ -230,9 +230,13 @@ float3 evalLeafNormal(float3 p_local, uint shape, float4 params) {
 // ----- op-tree distance + analytic normal ---------------------------------
 //
 // SdfCluster is the GPU representation of one host SdfPrim. The op-
-// tree is in `nodes[]`; root is at index 0. Material+albedo+AABB are
-// in the header. Layout MUST match the SoA packing the host writes into
-// the SDF storage buffer (see EnsureSdfPrimsUploaded in Engine.cpp).
+// tree is in `nodes[]`; the host emits nodes in POST-ORDER so the root
+// is always the LAST node, at index `node_count - 1` (mirrors the
+// host-side convention documented on SdfNode in AnalyticBvh.h, and
+// what sdfClusterDist / sdfClusterNormal return below).
+// Material+albedo+AABB are in the header. Layout MUST match the SoA
+// packing the host writes into the SDF storage buffer (see
+// EnsureSdfPrimsUploaded in Engine.cpp).
 
 struct SdfClusterNode {
     uint   op;
@@ -304,26 +308,49 @@ float3 sdfClusterNormal(SdfCluster c, float3 p) {
             d = evalLeafDist(pl, n.shape, n.params);
             g = evalLeafNormal(pl, n.shape, n.params);
         } else if (n.op == SDF_OP_SMOOTH_UNION) {
-            float k  = max(n.params.x, 1e-6);
+            // k<=0 fallback: opSmoothUnion (distance path) early-outs
+            // to min(da,db). The gradient must also be the HARD pick
+            // -- the child whose distance won -- otherwise distance
+            // and gradient stop corresponding and the surface normal
+            // is wrong.
+            float kp = n.params.x;
             float da = dists[n.child_a];
             float db = dists[n.child_b];
-            float h  = clamp(0.5 + 0.5 * (db - da) / k, 0.0, 1.0);
-            d = lerp(db, da, h) - k * h * (1.0 - h);
-            g = normalize(lerp(grads[n.child_b], grads[n.child_a], h));
+            if (kp <= 0.0) {
+                d = min(da, db);
+                g = (da < db) ? grads[n.child_a] : grads[n.child_b];
+            } else {
+                float h = clamp(0.5 + 0.5 * (db - da) / kp, 0.0, 1.0);
+                d = lerp(db, da, h) - kp * h * (1.0 - h);
+                g = normalize(lerp(grads[n.child_b], grads[n.child_a], h));
+            }
         } else if (n.op == SDF_OP_SMOOTH_SUBTRACT) {
-            float k  = max(n.params.x, 1e-6);
+            // k<=0 fallback: opSmoothSubtract -> max(da, -db). Hard
+            // gradient is grad_a when (da > -db), -grad_b otherwise.
+            float kp = n.params.x;
             float da = dists[n.child_a];
             float db = dists[n.child_b];
-            float h  = clamp(0.5 - 0.5 * (db + da) / k, 0.0, 1.0);
-            d = lerp(da, -db, h) + k * h * (1.0 - h);
-            g = normalize(lerp(grads[n.child_a], -grads[n.child_b], h));
+            if (kp <= 0.0) {
+                d = max(da, -db);
+                g = (da > -db) ? grads[n.child_a] : -grads[n.child_b];
+            } else {
+                float h = clamp(0.5 - 0.5 * (db + da) / kp, 0.0, 1.0);
+                d = lerp(da, -db, h) + kp * h * (1.0 - h);
+                g = normalize(lerp(grads[n.child_a], -grads[n.child_b], h));
+            }
         } else if (n.op == SDF_OP_SMOOTH_INTERSECT) {
-            float k  = max(n.params.x, 1e-6);
+            // k<=0 fallback: opSmoothIntersect -> max(da, db).
+            float kp = n.params.x;
             float da = dists[n.child_a];
             float db = dists[n.child_b];
-            float h  = clamp(0.5 - 0.5 * (db - da) / k, 0.0, 1.0);
-            d = lerp(db, da, h) + k * h * (1.0 - h);
-            g = normalize(lerp(grads[n.child_b], grads[n.child_a], h));
+            if (kp <= 0.0) {
+                d = max(da, db);
+                g = (da > db) ? grads[n.child_a] : grads[n.child_b];
+            } else {
+                float h = clamp(0.5 - 0.5 * (db - da) / kp, 0.0, 1.0);
+                d = lerp(db, da, h) + kp * h * (1.0 - h);
+                g = normalize(lerp(grads[n.child_b], grads[n.child_a], h));
+            }
         } else if (n.op == SDF_OP_DISPLACE) {
             // Constant displace doesn't change the gradient direction.
             d = opDisplace(dists[n.child_a], n.params.x);
@@ -384,16 +411,33 @@ bool sdfClusterTrace(SdfCluster c, float3 ro, float3 rd,
     // bound on the shader's worst-case work. 256 is a generous Phase 1
     // ceiling for analytic primitives + smooth ops (fractals in Phase 3
     // will need more).
+    //
+    // Inside-surface guard: a ray that starts inside the SDF (e.g. a
+    // dielectric refraction ray spawned a tiny step into the medium)
+    // sees d < 0 on its first sample. The naive `if (d < epsilon) hit`
+    // + `t += d` would (a) report an immediate self-hit at t = t_min,
+    // and (b) step BACKWARDS along the ray, never escaping. Use
+    // |d| for both the hit test and the advance: that's still a
+    // distance-bounded step (we never tunnel through a thin surface),
+    // and it lets the trace march forward until it crosses out through
+    // the surface from the inside. Note `epsilon` is intentionally
+    // small enough (default 1e-4 m) that we don't accept the start
+    // point itself as a hit unless we genuinely are within `epsilon`
+    // of the surface to begin with.
     uint iters = min(max_iters, 256u);
     for (uint i = 0u; i < iters; ++i) {
-        float3 p = ro + rd * t;
-        float  d = sdfClusterDist(c, p);
-        if (d < epsilon) {
+        float3 p     = ro + rd * t;
+        float  d     = sdfClusterDist(c, p);
+        float  abs_d = abs(d);
+        if (abs_d < epsilon) {
             out_t      = t;
             out_normal = normalize(sdfClusterNormal(c, p));
             return true;
         }
-        t += d;
+        // Always advance by a strictly-positive step. Floor at epsilon
+        // so a ray that's exactly on the surface (|d| ~ 0 from the
+        // previous step's overshoot) still makes progress.
+        t += max(abs_d, epsilon);
         if (t >= t_end) return false;
     }
     return false;

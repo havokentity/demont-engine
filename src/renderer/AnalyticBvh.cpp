@@ -102,9 +102,18 @@ bool NodeAabb(const SdfPrim& prim, std::uint32_t idx,
         case SDF_OP_SMOOTH_INTERSECT: {
             // Smooth blend can bulge the surface outward by ~k. Union
             // bounds = union of children's bounds + k pad. Intersect
-            // bounds = the children's overlap; conservatively reuse
-            // child A's bounds widened by k (intersect can't be larger
-            // than either operand).
+            // bounds = the children's overlap widened by k -- but the
+            // raw `max-min / min-max` formula yields an INVALID AABB
+            // (mn > mx on some axis) when the children's bounds are
+            // disjoint on that axis. The downstream slab test treats
+            // an inverted box as a miss, which is technically correct
+            // for a hard intersect of disjoint shapes (no surface) but
+            // the smooth-intersect blend band CAN poke surface up to k
+            // outside each child's bound. Fall back to the children's
+            // UNION (widened by k below) in that disjoint case -- it's
+            // a conservative superset that's guaranteed to contain any
+            // smooth-intersect surface, and only one or two extra
+            // sphere-trace steps wasted on empty space.
             float amn[3], amx[3], bmn[3], bmx[3];
             if (!NodeAabb(prim, n.child_a, amn, amx)) return false;
             if (!NodeAabb(prim, n.child_b, bmn, bmx)) return false;
@@ -114,9 +123,21 @@ bool NodeAabb(const SdfPrim& prim, std::uint32_t idx,
                 }
                 union_aabb(mn, mx, bmn, bmx);
             } else { // SMOOTH_INTERSECT
+                bool disjoint = false;
                 for (int i = 0; i < 3; ++i) {
                     mn[i] = std::max(amn[i], bmn[i]);
                     mx[i] = std::min(amx[i], bmx[i]);
+                    if (mn[i] > mx[i]) disjoint = true;
+                }
+                if (disjoint) {
+                    // No overlap on at least one axis: hard-intersect
+                    // surface is empty. Use the children's union as a
+                    // safe superset of any smooth-blend surface that
+                    // might bulge between them.
+                    for (int i = 0; i < 3; ++i) {
+                        mn[i] = amn[i]; mx[i] = amx[i];
+                    }
+                    union_aabb(mn, mx, bmn, bmx);
                 }
             }
             widen(mn, mx, std::max(0.0f, n.params[0]));

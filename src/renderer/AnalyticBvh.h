@@ -52,11 +52,16 @@ enum SdfOp : std::uint32_t {
 };
 
 // One node in a cluster's flat op-tree. Children are *node indices*
-// within the same cluster; the root is always node 0. The shader walks
-// the array in post-order so that by the time we reach a node, its
-// children's evaluated distances are already in a small register stack.
-// We keep nodes_per_cluster fixed and small (Phase 1: <= 8 per cluster)
-// so the shader can keep the stack in registers without spilling.
+// within the same cluster. The host emits nodes in POST-ORDER (children
+// before parents), so the root of any cluster is always the LAST node:
+// index `node_count - 1`. The shader walks the array in ascending order
+// so that by the time we reach a node, its children's evaluated
+// distances are already in a small register stack. We keep
+// nodes_per_cluster fixed and small (Phase 1: <= 8 per cluster) so the
+// shader can keep the stack in registers without spilling.
+// See ComputeSdfAabb in AnalyticBvh.cpp and sdfClusterDist /
+// sdfClusterNormal in SdfPrimitives.slang -- they all read the root as
+// `node_count - 1`.
 struct SdfNode {
     std::uint32_t op       = SDF_OP_LEAF;        // SdfOp
     std::uint32_t shape    = SDF_SHAPE_SPHERE;   // SdfShape (only meaningful when op == LEAF)

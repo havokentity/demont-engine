@@ -152,9 +152,11 @@ private:
 
     // --- SDF Phase 1 (#97) -------------------------------------------------
     // Re-upload the SDF cluster storage buffer from `sdf_prims_`. Called
-    // from RenderFrame whenever sdf_prims_dirty_ is set. Computes each
-    // cluster's tight AABB via pt::renderer::ComputeSdfAabb before
-    // packing.
+    // from RenderFrame whenever sdf_prims_dirty_ is set. Re-runs
+    // pt::renderer::ComputeSdfAabb on each cluster immediately before
+    // packing so the GPU buffer's AABB always matches the current node
+    // tree (the sphere-trace is AABB-bounded, so a stale AABB silently
+    // misses hits).
     void EnsureSdfPrimsUploaded();
     // --- end SDF Phase 1 ---------------------------------------------------
 
@@ -264,6 +266,16 @@ private:
     std::uint32_t                               sdf_cluster_capacity_    = 0;  // clusters that fit
     std::uint32_t                               sdf_cluster_count_       = 0;  // clusters last uploaded
     // --- end SDF Phase 1 ---------------------------------------------------
+
+    // Always-allocated 16-byte storage buffer used as a harmless
+    // placeholder for any optional binding slot whose primary buffer is
+    // 0 (e.g. SDF cluster slot 8 when no SDFs exist AND analytic prims
+    // are also off via pt_smoke_skip_prim_seed=1). Metal computes the
+    // dynamic push-constant slot from max-bound + 1 of the contiguous
+    // binding range, so leaving any slot in that range unbound shifts
+    // the push slot and corrupts every field. Allocated once at device
+    // init alongside exposure_state; destroyed in TearDownDevice.
+    std::uint64_t                               placeholder_storage_id_  = 0;
 
     std::uint64_t                               pathtrace_pipeline_id_ = 0;
     std::uint64_t                               tonemap_pipeline_id_   = 0;

@@ -1152,6 +1152,7 @@ void Engine::TearDownDevice() {
         // released by device_.reset() below, same as tonemap / bloom.
         if (exposure_state_id_      != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{exposure_state_id_});
         if (perfoverlay_drawlist_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{perfoverlay_drawlist_id_});
+        if (placeholder_storage_id_  != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{placeholder_storage_id_});
     }
     scene_tlas_id_        = 0;
     box_blas_id_          = 0;
@@ -1192,6 +1193,7 @@ void Engine::TearDownDevice() {
     moon_map_tex_id_      = 0;
     autoexpose_pipeline_id_ = 0;
     exposure_state_id_      = 0;
+    placeholder_storage_id_ = 0;
     denoiser_active_      = false;
     prev_view_proj_valid_ = false;
     primitives_dirty_     = true;        // re-upload on next device
@@ -1500,6 +1502,31 @@ void Engine::RequestBackendSwitch(BackendType to) {
         });
         perfoverlay_drawlist_id_       = buf.id;
         perfoverlay_drawlist_capacity_ = kPerfDrawCapacity;
+    }
+
+    // Always-present placeholder storage buffer. Used as a harmless
+    // fallback for optional binding slots (env CDFs at 4/5, BVH nodes
+    // at 7, SDF clusters at 8) whose primary buffer can legally be 0
+    // (no env map; no BVH built; no SDFs uploaded). Metal computes the
+    // dynamic push-constant slot from max-bound + 1 of the contiguous
+    // range, so leaving any slot in that range unbound shifts the push
+    // slot and corrupts every push field -> all-black render. Previous
+    // code reused prim_buffer_id_ for the same purpose, but with
+    // pt_smoke_skip_prim_seed=1 and no analytic prims that id stays 0
+    // too. Sized at 16 bytes (one float4) -- the shader never reads
+    // these slots when their respective count fields are 0.
+    {
+        auto buf = device_->CreateBuffer({
+            .size = 16,
+            .usage = pt::rhi::BufferUsage::Storage,
+            .debug_name = "placeholder_storage",
+        });
+        placeholder_storage_id_ = buf.id;
+        if (placeholder_storage_id_ == 0) {
+            LOG_ERROR("placeholder_storage buffer creation failed -- "
+                      "optional binding slots may fall back to slot 0 / "
+                      "shift Metal push-constant slot");
+        }
     }
 
     // Mark the analytic-primitive buffer dirty so it gets uploaded on
@@ -2720,7 +2747,20 @@ void Engine::EnsureSdfPrimsUploaded() {
     };
 
     std::size_t idx = 0;
-    for (const auto& [id, prim] : sdf_prims_) {
+    for (auto& [id, prim] : sdf_prims_) {
+        // Re-derive the cluster AABB from its current node tree before
+        // packing. The console commands that build / combine clusters
+        // already call ComputeSdfAabb, but recomputing here closes the
+        // gap if anything mutates an SdfPrim in-place between those
+        // calls and the next upload -- the sphere-trace is AABB-bounded
+        // so a stale AABB silently misses hits. Failure leaves the
+        // existing aabb_min/max in place (best-effort; a malformed
+        // tree would also fail at construction time and never reach
+        // here).
+        if (!pt::renderer::ComputeSdfAabb(prim)) {
+            LOG_WARN("[sdf] cluster id={} AABB recompute failed at upload; "
+                     "using existing AABB which may be stale", id);
+        }
         pack_cluster(idx++, prim);
     }
 
@@ -3224,15 +3264,17 @@ void Engine::RenderFrame() {
     // buffers, so leaving slots 4/5 unbound shifts the dynamically-
     // assigned push-constant slot to the wrong index (Metal computes
     // it as max-bound + 1) and the shader reads garbage push fields
-    // -> all-black render. When env CDFs aren't available we re-use
-    // the prim_buffer as a harmless placeholder; the shader never
-    // reads from slots 4/5 when env_map_present == 0.
+    // -> all-black render. When env CDFs aren't available we fall
+    // back to the always-present placeholder storage buffer; the
+    // shader never reads from slots 4/5 when env_map_present == 0.
+    // (Previously we reused prim_buffer_id_ here, but that id is 0
+    // when pt_smoke_skip_prim_seed=1 and no analytic prims exist.)
     pt::rhi::BufferHandle slot4 = (env_marginal_cdf_id_ != 0)
         ? pt::rhi::BufferHandle{env_marginal_cdf_id_}
-        : pt::rhi::BufferHandle{prim_buffer_id_};
+        : pt::rhi::BufferHandle{placeholder_storage_id_};
     pt::rhi::BufferHandle slot5 = (env_conditional_cdf_id_ != 0)
         ? pt::rhi::BufferHandle{env_conditional_cdf_id_}
-        : pt::rhi::BufferHandle{prim_buffer_id_};
+        : pt::rhi::BufferHandle{placeholder_storage_id_};
     if (slot4.id != 0) cb->BindBuffer(4, slot4, 0);
     if (slot5.id != 0) cb->BindBuffer(5, slot5, 0);
     // GPU-driven exposure scalar at slot 6. PathTrace reads it for
@@ -3248,10 +3290,10 @@ void Engine::RenderFrame() {
     // the same reason slot 4/5 do (Metal's dynamic slot assignment
     // depends on max-bound + 1 of the contiguous range -- leaving 7
     // unbound would shift the push slot). When no BVH is built we
-    // re-use the primitive buffer as a harmless placeholder.
+    // fall back to the always-present placeholder storage buffer.
     pt::rhi::BufferHandle slot7 = (bvh_node_buffer_id_ != 0)
         ? pt::rhi::BufferHandle{bvh_node_buffer_id_}
-        : pt::rhi::BufferHandle{prim_buffer_id_};
+        : pt::rhi::BufferHandle{placeholder_storage_id_};
     if (slot7.id != 0) cb->BindBuffer(7, slot7, 0);
     // --- SDF Phase 1 (#97) -------------------------------------------------
     // SDF cluster buffer at slot 8 (MSL slot order; vk::binding(19, 0)).
@@ -3259,11 +3301,14 @@ void Engine::RenderFrame() {
     // still has to resolve to a real buffer for the same reason 4/5/7
     // do (Metal computes dynamic slots from max-bound + 1 of the
     // contiguous range -- leaving 8 unbound would shift the push slot
-    // by one and corrupt every field). Reuse prim_buffer as a harmless
-    // placeholder when no SDF clusters exist.
+    // by one and corrupt every field). Use the always-present
+    // placeholder storage buffer when no SDF clusters exist. (Earlier
+    // versions reused prim_buffer_id_, but that id is 0 when
+    // pt_smoke_skip_prim_seed=1 and no analytic prims have been seeded
+    // -- the binding would silently drop and shift the push slot.)
     pt::rhi::BufferHandle slot8 = (sdf_cluster_buffer_id_ != 0)
         ? pt::rhi::BufferHandle{sdf_cluster_buffer_id_}
-        : pt::rhi::BufferHandle{prim_buffer_id_};
+        : pt::rhi::BufferHandle{placeholder_storage_id_};
     if (slot8.id != 0) cb->BindBuffer(8, slot8, 0);
     // --- end SDF Phase 1 ---------------------------------------------------
     // P10 G-buffer texture binds. The shader's vk::binding numbers (6/7/8)
@@ -7932,6 +7977,20 @@ void Engine::RegisterSdfCommands() {
                 out.PrintLine("sdf_round_box: arg parse failed");
                 return;
             }
+            // Reject malformed shape parameters at parse time so a bad
+            // command surfaces as a clear console error rather than a
+            // silently-mis-bounded SDF (rounded box with a negative
+            // corner radius would shrink the AABB inward of the actual
+            // sdRoundBox surface and miss hits during the trace).
+            if (hx <= 0.0f || hy <= 0.0f || hz <= 0.0f) {
+                out.FormatLine("sdf_round_box: half-extents must be > 0 (got hx={} hy={} hz={})",
+                               hx, hy, hz);
+                return;
+            }
+            if (cr < 0.0f) {
+                out.FormatLine("sdf_round_box: corner_r must be >= 0 (got {})", cr);
+                return;
+            }
             add_leaf(id, pt::renderer::SDF_SHAPE_ROUNDED_BOX,
                      {hx, hy, hz, cr}, x, y, z, mat, r, g, b, out, "round_box");
         });
@@ -7987,6 +8046,16 @@ void Engine::RegisterSdfCommands() {
                           float r, float g, float b,
                           pt::console::Output& out,
                           const char* tag) {
+        // Reject self-combine: a_id == b_id would duplicate the same
+        // node stream into the output and then attempt to erase the
+        // same map entry twice (the second erase is a no-op but the
+        // duplicated nodes already inflated the count, possibly past
+        // kMaxNodes). It's a user error -- surface it clearly.
+        if (a_id == b_id) {
+            out.FormatLine("sdf_{}: child_a and child_b must differ (got {} twice)",
+                           tag, a_id);
+            return;
+        }
         auto it_a = sdf_prims_.find(a_id);
         auto it_b = sdf_prims_.find(b_id);
         if (it_a == sdf_prims_.end() || it_b == sdf_prims_.end()) {
