@@ -984,11 +984,13 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // binding 21: accum_stars (issue #46 star-split accumulator;
         // RGBA16F per-pixel star contribution that PathTrace routes
         // around the SVGF a-trous kernel, then DenoiseFinalize +
-        // Tonemap composite back in pre-ACES). Always allocated in the
-        // layout so the partially-bound rules cover the off-mode
-        // (denoiser off / r_star_split 0) read as a no-op against a
-        // swapchain-sized zero texture. Moved here from binding 19
-        // to make room for #107's triangle BVH.
+        // Tonemap composite back in pre-ACES). Always allocated in
+        // the layout so the partially-bound rules cover the off-mode
+        // (denoiser off / r_star_split 0); the engine binds a 1x1
+        // placeholder texture there for descriptor-set validity and
+        // the shaders' `stars_present` / `star_split_enabled` push
+        // gates skip the read/write entirely. Moved here from
+        // binding 19 to make room for #107's triangle BVH.
         add_binding(21, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
 
         // UPDATE_AFTER_BIND for every binding so we can rewrite the
@@ -2995,15 +2997,13 @@ void VulkanDevice::EncodeDenoiseFinalize(VkCommandBuffer cb,
     // to 0 internally and binds color_in as a safe-but-unread fallback,
     // so the OptiX bloom-off case (engine passes view=NULL, intensity=0)
     // and the OptiX bloom-on case (view=mip0, intensity>0) both go
-    // through the same call. The stars_in_view contract is stricter:
-    // it MUST NOT be null. The shader's additive read of stars_tex is
-    // unconditional, so a null fallback would have to read from
-    // color_in_view (the dispatch's own source), producing a 2x-
-    // brightness feedback artifact. The engine passes either the real
-    // accum_stars accumulator (denoiser + r_star_split on) or the
-    // swapchain-sized zero-fill companion (other cases); EncodeFinalize
-    // -Only bails the dispatch with a logged error if stars_in_view
-    // arrives null.
+    // through the same call. The stars_in_view contract mirrors that
+    // exactly: a null view also falls back to color_in plus
+    // stars_present=0 internally, so the OptiX path can pass
+    // VK_NULL_HANDLE when star_split is off without producing a black
+    // frame. When stars are routed the engine passes the real
+    // accum_stars accumulator and stars_present resolves to 1 inside
+    // EncodeFinalizeOnly.
     denoiser_->EncodeFinalizeOnly(cb, color_in_view, final_output_view,
                                   exposure_state_buf,
                                   bloom_in_view, bloom_intensity,
@@ -3225,9 +3225,12 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
         // Star-split accumulator (issue #46). On the FinalizeOnly
         // route (bloom-without-denoiser path) PathTrace.slang skips
         // its accum_stars write because star_split_enabled requires
-        // denoiser_enabled, so the engine binds the 1x1 zero dummy
-        // here and the additive read is a no-op. The denoiser-active
-        // path is handled in the SVGF/NRD branch below via d.stars_in.
+        // denoiser_enabled. The engine therefore binds a 1x1
+        // placeholder here purely for descriptor validity, and the
+        // shader's `stars_present` push gate elides the additive
+        // read. The denoiser-active path is handled in the SVGF/NRD
+        // branch below via d.stars_in (real accumulator when
+        // r_star_split is on, placeholder otherwise).
         VkImageView stars_view  = (d.stars_in.id != 0)
                                     ? LookupImageView(d.stars_in)
                                     : VK_NULL_HANDLE;

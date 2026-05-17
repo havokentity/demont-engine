@@ -226,19 +226,15 @@ public:
         // Star-split accumulator (issue #46). Holds the per-pixel star
         // contribution PathTrace.slang routed around the SVGF a-trous
         // kernel to keep sub-pixel star energy from being smudged.
-        // VulkanNrdDenoiser's DenoiseFinalize stage adds it pre-ACES.
-        // When the engine isn't routing stars (r_star_split = 0 or
-        // denoiser off) it passes its swapchain-sized zero-fill
-        // companion (accum_stars_zero_tex_id_) here so the additive
-        // read is observably 0 at every pixel. Must NEVER be left
-        // null on a denoiser-active dispatch; the finalize kernel's
-        // unconditional `c += stars_tex[tid]` would otherwise need
-        // to fall back to the destination texture and produce a
-        // 2x-brightness feedback artifact (the implementation now
-        // bails the dispatch with a logged error instead of falling
-        // back). MetalFX ignores this -- Metal's Tonemap.slang has
-        // its own stars_tex binding and the engine routes the
-        // accumulator there directly.
+        // VulkanNrdDenoiser's DenoiseFinalize stage adds it pre-ACES,
+        // gated on a `stars_present` push flag. When the engine isn't
+        // routing stars (r_star_split = 0 or denoiser off) it can
+        // pass either a 1x1 placeholder (the descriptor stays valid
+        // and the shader's gate elides the read) or `id = 0` (the
+        // backend internally falls back to a safe view and forces
+        // stars_present = 0). MetalFX ignores this -- Metal's
+        // Tonemap.slang has its own stars_tex binding and the engine
+        // routes the accumulator there directly.
         TextureHandle stars_in;
         float jitter_x       = 0.0f;
         float jitter_y       = 0.0f;

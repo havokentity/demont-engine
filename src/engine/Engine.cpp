@@ -1046,7 +1046,6 @@ void Engine::TearDownDevice() {
         if (motion_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
         if (post_denoise_hdr_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
         if (accum_stars_tex_id_       != 0) device_->DestroyTexture(pt::rhi::TextureHandle{accum_stars_tex_id_});
-        if (accum_stars_zero_tex_id_  != 0) device_->DestroyTexture(pt::rhi::TextureHandle{accum_stars_zero_tex_id_});
         for (auto& id : bloom_mip_tex_id_) {
             if (id != 0) device_->DestroyTexture(pt::rhi::TextureHandle{id});
             id = 0;
@@ -1081,8 +1080,7 @@ void Engine::TearDownDevice() {
     depth_tex_id_            = 0;
     motion_tex_id_           = 0;
     post_denoise_hdr_tex_id_ = 0;
-    accum_stars_tex_id_      = 0;
-    accum_stars_zero_tex_id_ = 0;
+    accum_stars_tex_id_       = 0;
     star_split_reset_pending_ = false;
     tonemap_pipeline_id_     = 0;
     bloom_down_pipeline_id_  = 0;
@@ -2746,20 +2744,12 @@ void Engine::RenderFrame() {
             if (normal_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{normal_tex_id_});
             if (albedo_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{albedo_tex_id_});
             if (post_denoise_hdr_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
-            // Star-split accumulator (issue #46). Co-allocated with the
-            // denoiser textures and freed alongside them on the
-            // r_denoiser off transition so the GPU memory drops back to
-            // the pre-denoiser baseline. We also free the
-            // accum_stars_zero_tex_id_ companion: it's swapchain-sized
-            // (~16 MB at 1080p RGBA16F) and serves no purpose with
-            // r_denoiser off (Tonemap.slang's stars_tex slot is only
-            // sampled from the denoiser-active branch on the Metal
-            // path; the bloom-without-denoiser branch in Tonemap.slang
-            // is a separate, denoiser-free pipeline that doesn't bind
-            // stars_tex at all). If r_denoiser turns back on later the
-            // resize block below will re-allocate both textures.
+            // Star-split accumulator (issue #46). Co-allocated with
+            // the denoiser textures and freed alongside them on the
+            // r_denoiser off transition so the GPU memory drops back
+            // to the pre-denoiser baseline. If r_denoiser turns back
+            // on later the resize block below will re-allocate.
             if (accum_stars_tex_id_      != 0) device_->DestroyTexture(pt::rhi::TextureHandle{accum_stars_tex_id_});
-            if (accum_stars_zero_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{accum_stars_zero_tex_id_});
             for (auto& id : bloom_mip_tex_id_) {
                 if (id != 0) device_->DestroyTexture(pt::rhi::TextureHandle{id});
                 id = 0;
@@ -2767,7 +2757,6 @@ void Engine::RenderFrame() {
             denoise_color_tex_id_ = depth_tex_id_ = motion_tex_id_ = 0;
             normal_tex_id_ = albedo_tex_id_ = post_denoise_hdr_tex_id_ = 0;
             accum_stars_tex_id_       = 0;
-            accum_stars_zero_tex_id_  = 0;
             // Clear the pending-reset flag too: it was set by the
             // resize/teardown path that created accum_stars_tex_id_,
             // but with no accumulator (and no PathTrace dispatch to
@@ -2934,17 +2923,6 @@ void Engine::RenderFrame() {
             post_denoise_hdr_tex_id_ = 0;
             accum_stars_tex_id_      = 0;
         }
-        // Star-split zero-fill texture: also reallocate on size_changed so
-        // its dimensions match the swapchain (the additive read into
-        // stars_tex[tid.xy] from Tonemap / DenoiseFinalize is performed at
-        // full screen resolution, so a smaller backing image would walk
-        // off the texel grid into spec-defined-only-with-robustImageAccess
-        // territory). Free here; the (re)allocation block below will
-        // create it at fc.{width,height}.
-        if (accum_stars_zero_tex_id_ != 0) {
-            device_->DestroyTexture(pt::rhi::TextureHandle{accum_stars_zero_tex_id_});
-            accum_stars_zero_tex_id_ = 0;
-        }
         auto color_h = device_->CreateTexture({
             .width = fc.width, .height = fc.height,
             .format = pt::rhi::TextureFormat::RGBA16F,
@@ -2992,15 +2970,11 @@ void Engine::RenderFrame() {
             // the denoiser is active; the cvar `r_star_split` only
             // gates whether PathTrace.slang actually writes to it and
             // whether the post-denoise finalize/Tonemap kernel reads
-            // it. Co-allocating with the rest of the denoiser-related
-            // textures keeps the resize / teardown contract one-shot
-            // (no separate "stars-only" lifecycle to debug). A
-            // running install paying the ~16 MB at 1080p RGBA16F for
-            // an off-by-default stars feature would be wasteful, so
-            // we additionally gate behind the cvar default = 1 (on);
-            // when 0 the engine still allocates, but the kernel
-            // doesn't write or read it. Future: skip the alloc
-            // entirely when r_star_split = 0.
+            // it (via the `stars_present` push gate). Co-allocating
+            // with the rest of the denoiser-related textures keeps
+            // the resize / teardown contract one-shot (no separate
+            // "stars-only" lifecycle to debug). Future: skip the
+            // alloc entirely when r_star_split = 0.
             auto stars_h = device_->CreateTexture({
                 .width = fc.width, .height = fc.height,
                 .format = pt::rhi::TextureFormat::RGBA16F,
@@ -3107,40 +3081,16 @@ void Engine::RenderFrame() {
             std::uint16_t zero[4] {0,0,0,0};
             if (dh.id != 0) device_->WriteTexture(dh, zero, sizeof(zero));
         }
-        // Star-split zero-fill texture: swapchain-sized RGBA16F kept
-        // zero-filled, used to feed the post-denoise finalize /
-        // Tonemap kernel's stars_tex slot when stars aren't being
-        // routed (r_star_split = 0, or in the bloom-without-denoiser
-        // path that still binds stars_tex unconditionally). The slot
-        // must be valid because the shader's read is `stars_tex[tid.xy]`
-        // -- unconditional, at full screen resolution. Previously
-        // this was a 1x1 dummy relying on the additive read of an
-        // out-of-bounds texel returning zero, which is only guaranteed
-        // under VK_EXT_robustness / robustImageAccess (not all our
-        // target Vulkan drivers enable it). A swapchain-sized texture
-        // turns the read into an in-bounds load of the zero data we
-        // uploaded, which is the only spec-defined behaviour.
-        // Memory cost: ~16 MB at 1080p / RGBA16F -- dwarfed by the
-        // 6 other denoiser-related textures sharing the same lifetime.
-        if (accum_stars_zero_tex_id_ == 0) {
-            auto sh = device_->CreateTexture({
-                .width = fc.width, .height = fc.height,
-                .format = pt::rhi::TextureFormat::RGBA16F,
-                .usage  = pt::rhi::TextureUsage::Storage,
-                .debug_name = "accum_stars_zero",
-            });
-            accum_stars_zero_tex_id_ = sh.id;
-            if (sh.id != 0) {
-                // RGBA16F -> 8 bytes per texel. Zero-fill the full
-                // image so every in-bounds read returns 0 regardless
-                // of which texel the shader samples. Allocated on the
-                // stack-of-frame so it doesn't persist past this scope.
-                const std::size_t texel_count = static_cast<std::size_t>(fc.width) * fc.height;
-                const std::size_t byte_count  = texel_count * 8;     // RGBA16F
-                std::vector<std::uint8_t> zeros(byte_count, 0);
-                device_->WriteTexture(sh, zeros.data(), byte_count);
-            }
-        }
+        // Star-split slot: when stars aren't being routed (r_star_split
+        // = 0 or no accum_stars allocated), the shaders skip the
+        // additive read entirely via the `stars_present` push flag.
+        // The descriptor slot itself still needs to resolve to a
+        // valid texture (Metal validation; Vulkan tolerates partially-
+        // bound but we keep both backends on the same path), so the
+        // engine binds the existing 1x1 `bloom_dummy_tex_id_` allocated
+        // above as a safe placeholder. No additional allocation is
+        // required, and the previous swapchain-sized ~16 MB zero-fill
+        // companion has been retired in favour of the push gate.
     }
 
     auto* cb = device_->AcquireCommandBuffer();
@@ -3283,18 +3233,21 @@ void Engine::RenderFrame() {
         cb->BindStorageTexture(6, pt::rhi::TextureHandle{star_map_tex_id_});
     }
     // Star-split accumulator (issue #46) at engine slot 10. PathTrace
-    // writes into this when star_split_params.x > 0 (engine gate above
-    // checks denoiser_active_ && r_star_split && allocated). When not
-    // active we still bind the swapchain-sized zero texture so the
-    // shader's slot stays valid -- Metal demands every declared slot
-    // resolve to a real texture (RT validation on Apple Silicon enforces
-    // it). Vulkan tolerates an unbound slot under
-    // VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, but binding the zero
-    // texture keeps both backends on the same code path and avoids the
-    // out-of-bounds-storage-image-read robustness corner case.
+    // writes into this when star_split_enabled (push.star_split_enabled
+    // = 1; engine gate below requires denoiser_active_ &&
+    // r_star_split && accum_stars_tex_id_). When not active we still
+    // bind a 1x1 placeholder so the shader's declared slot stays
+    // valid -- Metal demands every declared slot resolve to a real
+    // texture (RT validation on Apple Silicon enforces it). Vulkan
+    // tolerates an unbound slot under
+    // VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, but binding the
+    // placeholder keeps both backends on the same code path. The
+    // PathTrace shader's own runtime gate (`star_split_enabled`)
+    // ensures the placeholder is never actually written to or read
+    // from when stars aren't active.
     {
         const std::uint64_t stars_id =
-            (accum_stars_tex_id_ != 0) ? accum_stars_tex_id_ : accum_stars_zero_tex_id_;
+            (accum_stars_tex_id_ != 0) ? accum_stars_tex_id_ : bloom_dummy_tex_id_;
         if (stars_id != 0) {
             cb->BindStorageTexture(10, pt::rhi::TextureHandle{stars_id});
         }
@@ -3473,14 +3426,15 @@ void Engine::RenderFrame() {
         //   .z/.w reserved for future BVH-side knobs (leaf size,
         //   builder selection).
         std::uint32_t bvh_params[4];
-        // Star-split parameters (issue #46). See the matching shader-
-        // side comment in PathTrace.slang.
-        //   .x = star_split_enabled (1 = peel star contribution out
-        //        of frame_radiance into accum_stars; 0 = legacy fold-
-        //        into-sky behaviour).
-        //   .y/.z/.w reserved (future: per-pixel star threshold for
-        //        procedural splits, twinkle phase offset).
-        float star_split_params[4];
+        // Star-split flag (issue #46). 1 = peel star contribution out
+        // of frame_radiance into accum_stars; 0 = legacy fold-into-
+        // sky behaviour. See the matching shader-side comment in
+        // PathTrace.slang. Followed by 12 bytes of explicit padding
+        // so the trailing block lands on a 16-byte boundary, matching
+        // the std140 / MSL cbuffer rule the Slang compiler applies
+        // to the shader-side `Push` / `Frame` blocks.
+        std::uint32_t star_split_enabled;
+        std::uint32_t _pad_star_split[3];
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -3577,8 +3531,8 @@ void Engine::RenderFrame() {
             : 0u;
     }
 
-    // Star-split parameters (issue #46). Gate the kernel-side split
-    // on (denoiser_active_ AND accum_stars_tex_id_ allocated AND
+    // Star-split flag (issue #46). Gate the kernel-side split on
+    // (denoiser_active_ AND accum_stars_tex_id_ allocated AND
     // r_star_split enabled). The shader's own runtime gate also
     // re-checks (denoiser_enabled && write_hdr_aux), so this engine
     // gate is the wider "user opted in AND we have the resources to
@@ -3586,15 +3540,26 @@ void Engine::RenderFrame() {
     // touch the accum_stars binding and stars fall through to
     // frame_radiance like in the legacy path -- safe to leave
     // accum_stars_tex_id_ at 0 in that branch.
+    bool engine_star_split_active = false;
     {
         bool star_split_on = true;
         if (auto* v = C.FindCVar("r_star_split")) star_split_on = v->GetBool();
-        const bool engine_star_split_active =
+        engine_star_split_active =
             denoiser_active_ && accum_stars_tex_id_ != 0 && star_split_on;
-        push.star_split_params[0] = engine_star_split_active ? 1.0f : 0.0f;
-        push.star_split_params[1] = 0.0f;
-        push.star_split_params[2] = 0.0f;
-        push.star_split_params[3] = 0.0f;
+        push.star_split_enabled = engine_star_split_active ? 1u : 0u;
+        push._pad_star_split[0] = 0u;
+        push._pad_star_split[1] = 0u;
+        push._pad_star_split[2] = 0u;
+    }
+    // Consume the pending star-accum reset pulse. Set by the
+    // accum_stars (re)allocation block above and by r_star_split's
+    // on_change handler (cvar registration site); OR'd into the
+    // primary `reset_accum` flag here so the shader's existing reset
+    // path also zeroes prev_s.a on this dispatch, then cleared so we
+    // don't fire it again next frame.
+    if (star_split_reset_pending_) {
+        push.reset_accum = 1u;
+        star_split_reset_pending_ = false;
     }
 
     // Halton(2,3) sub-pixel jitter sequence in [-0.5, 0.5] each axis.
@@ -4021,9 +3986,10 @@ void Engine::RenderFrame() {
         push.clouds_p3[3] = rayleigh;
     }
 
-    // PtPush layout: the trailing 16 bytes here are star_split_params
-    // (float4) added for issue #46 -- mirrors the matching field in
-    // PathTrace.slang's Push/Frame block.
+    // PtPush layout: the trailing 16 bytes here are the star-split
+    // block (issue #46) -- one uint flag plus 12 bytes of explicit
+    // padding that the SPIR-V / MSL cbuffer rule would have inserted
+    // anyway. Mirrored in PathTrace.slang's Push/Frame block.
     static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16);
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
@@ -4039,8 +4005,8 @@ void Engine::RenderFrame() {
     static_assert(offsetof(PtPush, bvh_params) % 16 == 0,
                   "PtPush::bvh_params must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
-    static_assert(offsetof(PtPush, star_split_params) % 16 == 0,
-                  "PtPush::star_split_params must be 16-byte aligned to match "
+    static_assert(offsetof(PtPush, star_split_enabled) % 16 == 0,
+                  "PtPush::star_split_enabled must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
@@ -4194,20 +4160,25 @@ void Engine::RenderFrame() {
         // OptiX AOV only -- 0 in any other mode (the backend's OptixHdr
         // path validates only color/output and ignores this).
         dd.albedo_in     = pt::rhi::TextureHandle{albedo_tex_id_};
-        // Star-split accumulator (issue #46). DenoiseFinalize adds this
-        // to the post-denoise HDR pre-ACES so stars (written upstream
-        // by PathTrace, bypassing the SVGF a-trous kernel) land in the
-        // final image without smudge artefacts. When the cvar is off
-        // or the accumulator isn't allocated, route the swapchain-
-        // sized zero texture so the in-bounds additive read sees 0.
+        // Star-split accumulator (issue #46). DenoiseFinalize adds
+        // this to the post-denoise HDR pre-ACES so stars (written
+        // upstream by PathTrace, bypassing the SVGF a-trous kernel)
+        // land in the final image without smudge artefacts. When the
+        // cvar is off or the accumulator isn't allocated, route the
+        // 1x1 `bloom_dummy_tex_id_` placeholder; the shader's
+        // `stars_present` push gate ensures the slot is never
+        // sampled in that case, so the binding only needs to satisfy
+        // descriptor-set validity. A zero `stars_in.id` is also valid
+        // and tells the backend to skip the additive read entirely
+        // (the descriptor falls back to a known-safe view internally).
         {
             bool r_star_split_on = true;
             if (auto* v = C.FindCVar("r_star_split")) r_star_split_on = v->GetBool();
-            const std::uint64_t stars_id =
-                (r_star_split_on && accum_stars_tex_id_ != 0)
-                    ? accum_stars_tex_id_
-                    : accum_stars_zero_tex_id_;
-            dd.stars_in = pt::rhi::TextureHandle{stars_id};
+            const bool stars_present_finalize =
+                r_star_split_on && accum_stars_tex_id_ != 0;
+            dd.stars_in = stars_present_finalize
+                ? pt::rhi::TextureHandle{accum_stars_tex_id_}
+                : pt::rhi::TextureHandle{bloom_dummy_tex_id_};
         }
         // MetalFX writes to the linear-HDR intermediate; the tonemap
         // dispatch below converts that to sRGB and writes the swapchain.
@@ -4629,34 +4600,28 @@ void Engine::RenderFrame() {
                 : bloom_dummy_tex_id_};
         if (bloom_h.id != 0) cb->BindStorageTexture(2, bloom_h);
         // Star-split accumulator slot (issue #46). Tonemap.slang reads
-        // stars_tex pre-bloom and adds it to the HDR colour, so the
-        // SVGF a-trous kernel's smudging never lands in the final
-        // image. Bind the real accumulator when allocated; otherwise
-        // bind the swapchain-sized zero texture so the additive read
-        // sees 0 at every pixel.
+        // stars_tex pre-bloom and adds it to the HDR colour, gated on
+        // a `stars_present` push flag so the read only fires when the
+        // engine has a real accumulator routed. Bind the real
+        // accumulator when allocated; otherwise bind the 1x1
+        // `bloom_dummy_tex_id_` placeholder purely for descriptor-set
+        // validity (the shader never samples it under stars_present=0).
         //
         // This branch is Metal-only (use_engine_tonemap gate above):
         // engine slot 3 -> Tonemap.slang stars_tex via declaration
         // order -> MSL texture(3). The Vulkan finalize path uses its
         // OWN stars binding (DenoiseFinalize.slang binding=4, wired
         // through VulkanDenoiser::EncodeFinalizeOnly / Encode) and
-        // never reaches this codepath. (Engine slot 10's separate
-        // Vulkan-binding-19 mapping above is for the PathTrace
-        // dispatch's accum_stars writer slot, not this Tonemap
-        // reader.) The host knows whether the dispatch will read real
-        // stars because PathTrace's star_split_params gate is set
-        // above on the same condition (denoiser_active_ &&
-        // r_star_split && accum_stars_tex_id_), and we mirror that
-        // gate here so the tonemap's additive read sees a zeroed
-        // texture in the off case rather than stale data from a
-        // previous denoiser session.
+        // never reaches this codepath.
+        bool tonemap_stars_present = false;
         {
             bool r_star_split_on = true;
             if (auto* v = C.FindCVar("r_star_split")) r_star_split_on = v->GetBool();
-            const std::uint64_t stars_id =
-                (r_star_split_on && accum_stars_tex_id_ != 0)
-                    ? accum_stars_tex_id_
-                    : accum_stars_zero_tex_id_;
+            tonemap_stars_present =
+                r_star_split_on && accum_stars_tex_id_ != 0;
+            const std::uint64_t stars_id = tonemap_stars_present
+                ? accum_stars_tex_id_
+                : bloom_dummy_tex_id_;
             if (stars_id != 0) cb->BindStorageTexture(3, pt::rhi::TextureHandle{stars_id});
         }
         bool hdr_pipeline = true;
@@ -4741,7 +4706,14 @@ void Engine::RenderFrame() {
             // 16-byte boundary for std140 / Metal struct rules.
             std::uint32_t flare_mode_physical;
             std::uint32_t physical_ghost_count;
-            float        _pad_phys_align[2];
+            // Star-split present flag (issue #46). 1 -> Tonemap.slang
+            // adds stars_tex to the HDR colour pre-bloom; 0 -> skip
+            // the additive read entirely (the slot is bound to a
+            // 1x1 placeholder for descriptor validity but the shader
+            // never samples it). Mirrors `stars_present` in
+            // Tonemap.slang's Push cbuffer at the same byte offset.
+            std::uint32_t stars_present;
+            std::uint32_t _pad_stars_align;
             // 48 bytes of padding to advance ghosts[] forward to host
             // offset 112 -- the Vulkan push-constant split boundary
             // (VulkanDevice::kPushSplitOffset). The first 112 bytes of
@@ -4794,6 +4766,8 @@ void Engine::RenderFrame() {
         tp.flare_threshold  = flare_thresh;
         tp.flare_mode_sun       = flare_sun_m  ? 1u : 0u;
         tp.flare_mode_physical  = flare_phys_m ? 1u : 0u;
+        tp.stars_present        = tonemap_stars_present ? 1u : 0u;
+        tp._pad_stars_align     = 0u;
         tp.flare_size       = flare_size;
         tp.sun_uv[0]        = sun_uv_x;
         tp.sun_uv[1]        = sun_uv_y;
@@ -6929,6 +6903,22 @@ void Engine::RegisterCommands() {
     if (auto* v = C.FindCVar("r_hdr_pipeline")) {
         v->allowed_values = {"0", "1"};
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    // r_star_split (issue #46): toggling at runtime changes whether
+    // PathTrace folds stars into frame_radiance (legacy) or peels
+    // them into the accum_stars side-buffer. The existing primary
+    // accumulator carries stale, inconsistent samples across the
+    // toggle and would produce visible ghosting until the camera
+    // moves enough to invalidate history -- so both reset
+    // accum_dirty_ (primary accum_hdr) and star_split_reset_pending_
+    // (the side accumulator's running mean), matching the pattern
+    // used by every other path-tracer-affecting cvar above.
+    if (auto* v = C.FindCVar("r_star_split")) {
+        v->allowed_values = {"0", "1"};
+        v->on_change = [this](const pt::console::CVar&) {
+            accum_dirty_              = true;
+            star_split_reset_pending_ = true;
+        };
     }
     if (auto* v = C.FindCVar("r_bloom")) {
         v->allowed_values = {"0", "1"};

@@ -68,9 +68,11 @@
 //
 // Slot is binding 21 to match PathTrace.slang's reserved slot for the
 // same texture (the shared descriptor-set layout was extended past 19
-// when #107's triangle BVH took bindings 19/20). When star-split is off
-// (cvar r_star_split 0 or denoiser off) the engine binds a swapchain-
-// sized zero texture here so the additive read is a no-op.
+// when #107's triangle BVH took bindings 19/20). When star-split is
+// off (cvar r_star_split 0 or denoiser off) the engine binds a 1x1
+// placeholder texture here purely for descriptor-set validity; the
+// shader's `stars_present` push gate ensures this slot is never
+// sampled in that case, so the placeholder's contents don't matter.
 [[vk::binding(21, 0)]] RWTexture2D<float4> stars_tex;
 
 // --- buffer slot padding to push exposure_state to MSL buf(6) and
@@ -162,7 +164,14 @@ cbuffer Push {
     uint  flare_mode_physical;
     // Number of valid entries in ghosts[]. 0 = skip the physical loop.
     uint  physical_ghost_count;
-    float2 _pad_phys;
+    // Star-split present flag (issue #46). 1 -> add stars_tex to the
+    // HDR colour pre-bloom; 0 -> skip the additive read entirely
+    // (the slot is bound to a 1x1 placeholder for descriptor
+    // validity, so a read would either over-bright the image with
+    // garbage pixel 0 contents or just waste a sample). Mirrors
+    // TonePush::stars_present in Engine.cpp at the same byte offset.
+    uint  stars_present;
+    uint  _pad_stars_align;
     // 48 bytes of padding to push the ghost array forward to host
     // offset 112 (the Vulkan kPushSplitOffset boundary). On Vulkan
     // only the first 112 bytes hit vkCmdPushConstants; bytes
@@ -260,10 +269,16 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // flare paths read the combined HDR -- though note that the
     // engine's bloom pyramid was built upstream of this dispatch
     // from a stars-free source on the SVGF/MetalFX paths today, so
-    // star halos in bloom are a follow-up (acceptance criterion in
-    // issue #46 mentions bloom-on-stars; the smudge fix is the
-    // primary deliverable here, halo support is the next pass).
-    c += stars_tex[tid.xy].rgb;
+    // star halos in bloom are a follow-up (issue #110 / acceptance
+    // criterion in issue #46 mentions bloom-on-stars; the smudge
+    // fix is the primary deliverable here, halo support is the next
+    // pass). Gated on `stars_present` so the read is elided when
+    // the engine isn't routing stars (cvar r_star_split = 0 or
+    // denoiser off) -- the slot is bound to a 1x1 placeholder in
+    // that case, purely for descriptor-set validity.
+    if (stars_present != 0u) {
+        c += stars_tex[tid.xy].rgb;
+    }
 
     // Bloom + lens flare both bilinear-sample the bloom pyramid;
     // factor the bilinear sampler into a helper so the flare loop

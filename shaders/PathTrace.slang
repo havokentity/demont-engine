@@ -181,8 +181,10 @@ Texture2D<float4> moon_map;
 // dimensions as denoise_color; written with the same EMA blend as
 // accum_hdr so 1-spp temporal stability matches the rest of the
 // linear-HDR pipeline. When star-split is off (cvar r_star_split 0 or
-// denoiser_enabled == 0) the engine binds a swapchain-sized zero
-// texture here so the additive read is a no-op.
+// denoiser_enabled == 0) the engine binds a 1x1 placeholder texture
+// here purely for descriptor-set validity; the shader's
+// `star_split_enabled` gate ensures this slot is never written to in
+// that case, so the placeholder's contents don't matter.
 //
 // Moved from binding 19 to binding 21 to coexist with triangle BVH
 // (which #107 placed at 19/20 before #108 landed).
@@ -408,21 +410,20 @@ cbuffer Push {
     //        scan was O(N) per ray and crushed framerate on Mac-Vulkan;
     //        the BVH walk is O(log N).
     uint4 bvh_params;
-    // Star-split parameters (issue #46). Engine fills these from the
-    // r_star_split / r_star_split_threshold cvars and an internal
-    // gate that requires denoiser_enabled != 0 AND write_hdr_aux != 0
-    // (otherwise the bypass has nowhere to land).
-    //   .x = star_split_enabled. 1 = route star contribution out of
-    //        frame_radiance and into accum_stars; the post-denoise
-    //        finalize stage adds it back pre-tonemap so SVGF's a-trous
-    //        kernel never sees the sub-pixel star energy and can't
-    //        smudge it across neighbouring sky texels. 0 = legacy
-    //        behaviour, stars fold into frame_radiance like any other
-    //        sky term and get filtered with the rest.
-    //   .y reserved (future: per-pixel star_threshold for procedural
-    //        star sources, if we add any).
-    //   .z/.w reserved.
-    float4 star_split_params;
+    // Star-split flag (issue #46). 1 = route star contribution out
+    // of frame_radiance and into accum_stars; the post-denoise
+    // finalize stage adds it back pre-tonemap so SVGF's a-trous
+    // kernel never sees the sub-pixel star energy and can't smudge
+    // it across neighbouring sky texels. 0 = legacy behaviour,
+    // stars fold into frame_radiance like any other sky term and
+    // get filtered with the rest. Engine fills this from the
+    // r_star_split cvar gated by denoiser_enabled and a real
+    // accum_stars allocation. The trailing 12 bytes of pad keep the
+    // cbuffer trailing block 16-byte aligned for std140 / MSL.
+    uint star_split_enabled;
+    uint _pad_star_split0;
+    uint _pad_star_split1;
+    uint _pad_star_split2;
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -466,8 +467,11 @@ cbuffer Frame {
     float4 accum_params;
     // See `bvh_params` in the Metal Push cbuffer above.
     uint4 bvh_params;
-    // See `star_split_params` in the Metal Push cbuffer above.
-    float4 star_split_params;
+    // See `star_split_enabled` in the Metal Push cbuffer above.
+    uint star_split_enabled;
+    uint _pad_star_split0;
+    uint _pad_star_split1;
+    uint _pad_star_split2;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -1681,7 +1685,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
     // proportional GPU cost; spp=1 is the classic 1-spp interactive mode.
     uint sample_count = (spp == 0u) ? 1u : spp;
     float3 frame_radiance = float3(0.0);
-    // Star-split accumulator for issue #46. When star_split_params.x > 0
+    // Star-split accumulator for issue #46. When star_split_enabled
     // AND denoiser_enabled, the primary-miss sky term is split into
     // (sky_minus_stars, stars_only). frame_radiance gets the former
     // (denoised normally); this gets the latter (composited back in
@@ -1689,13 +1693,13 @@ void main(uint2 tid : SV_DispatchThreadID) {
     // when star-split is off; the texture write below is gated, so the
     // unused slot stays harmless.
     float3 frame_stars    = float3(0.0);
-    // Star-split gate. star_split_params is in the Frame UBO on Vulkan
-    // and the Metal Push cbuffer on Metal, but the field name + offset
-    // are identical from the shader's perspective so this single
-    // expression works on both targets.
+    // Star-split gate. star_split_enabled is in the Frame UBO on
+    // Vulkan and the Metal Push cbuffer on Metal, but the field name
+    // and offset are identical from the shader's perspective so this
+    // single expression works on both targets.
     const bool star_split_active =
         (denoiser_enabled != 0u) && (write_hdr_aux != 0u) &&
-        (star_split_params.x > 0.5);
+        (star_split_enabled != 0u);
     for (uint s = 0u; s < sample_count; ++s) {
         // When MetalFX is on, all pixels of the frame share the same
         // sub-pixel offset (Halton sequence picked on host) so the
