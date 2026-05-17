@@ -130,3 +130,20 @@ else()
     set_source_files_properties(stb_image_impl_for_test.cpp
         PROPERTIES COMPILE_OPTIONS "-w")
 endif()
+
+# --- pt_core/AnalyticBvh unit tests (issue #67) ----------------------------
+# Builder + traversal vs naive linear scan on a known input. Mirrors
+# the shader-side BVH walk (shaders/PathTrace.slang:497-525) in pure
+# host C++ so the data structure is testable without a GPU. Coverage:
+#   - empty BVH -> no hit
+#   - single primitive -> hit / miss cases
+#   - ~50 primitives + ~1000 deterministic rays: BVH closest-hit ==
+#     naive linear-scan closest-hit (the main coverage)
+#   - many primitives sharing a split-plane coordinate (tie-break
+#     stress on nth_element)
+#   - AABB-degenerate primitive (zero-radius sphere)
+#   - parent-AABB-contains-leaf-prim-AABBs structural invariant
+# Links pt_renderer (where AnalyticBvh lives).
+pt_add_test(pt_core_analytic_bvh
+    pt_core_analytic_bvh_test.cpp
+    LINK_TARGETS pt_renderer)
