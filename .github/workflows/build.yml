@@ -108,8 +108,16 @@ jobs:
         # `|| true` lets the upload step below still run when the
         # cell fails; the step's own exit code is what fails the
         # job. Actual implementation: `set +e` then capture the rc.
+        #
+        # Clear `golden_actual/` + `golden_diff/` before invoking
+        # ctest so a render that crashes before producing a fresh
+        # PNG can't leave the always-uploaded artifact populated
+        # with stale images from a previous cached-build run. The
+        # cache key includes CMakeLists / cmake/* / preset hash but
+        # NOT the source files, so stale PNGs are a real hazard.
         id: goldens
         run: |
+          rm -rf build/mac-debug/golden_actual build/mac-debug/golden_diff
           set +e
           ctest --test-dir build/mac-debug --output-on-failure -L golden_software
           echo "rc=$?" >> "$GITHUB_OUTPUT"
@@ -225,10 +233,17 @@ jobs:
       # the same way the smoke tests would. Software runs via Embree
       # on the CPU and works on every host.
       - name: Golden-image regression matrix (software cell)
+        # Pre-clean stale golden_actual/diff PNGs from a cached build
+        # so a render crash can't leave the always-uploaded artifact
+        # populated with a previous run's images. Matches the macOS
+        # job above.
         id: goldens
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue `
+              build/win-debug/golden_actual,
+              build/win-debug/golden_diff
           ctest --test-dir build/win-debug --output-on-failure -L golden_software
           "rc=$LASTEXITCODE" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           exit 0

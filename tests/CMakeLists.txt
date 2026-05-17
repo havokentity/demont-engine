@@ -265,12 +265,20 @@ function(pt_add_golden_cell)
         set(PT_CELL_FAIL_PERCENT 1)
     endif()
 
-    set(_host       ${CMAKE_SYSTEM_NAME})
-    set(_cell_name  golden_${PT_CELL_SCENE}__${PT_CELL_BACKEND}__${PT_CELL_DENOISER})
-    set(_scene_cfg  ${CMAKE_SOURCE_DIR}/tests/goldens/scenes/${PT_CELL_SCENE}.cfg)
-    set(_golden_png ${CMAKE_SOURCE_DIR}/tests/goldens/${_host}/${PT_CELL_SCENE}__${PT_CELL_BACKEND}__${PT_CELL_DENOISER}.png)
-    set(_actual_png ${CMAKE_BINARY_DIR}/golden_actual/${PT_CELL_SCENE}__${PT_CELL_BACKEND}__${PT_CELL_DENOISER}.png)
-    set(_diff_png   ${CMAKE_BINARY_DIR}/golden_diff/${PT_CELL_SCENE}__${PT_CELL_BACKEND}__${PT_CELL_DENOISER}.png)
+    set(_host        ${CMAKE_SYSTEM_NAME})
+    set(_cell_name   golden_${PT_CELL_SCENE}__${PT_CELL_BACKEND}__${PT_CELL_DENOISER})
+    set(_scene_cfg   ${CMAKE_SOURCE_DIR}/tests/goldens/scenes/${PT_CELL_SCENE}.cfg)
+    set(_golden_png  ${CMAKE_SOURCE_DIR}/tests/goldens/${_host}/${PT_CELL_SCENE}__${PT_CELL_BACKEND}__${PT_CELL_DENOISER}.png)
+    set(_actual_png  ${CMAKE_BINARY_DIR}/golden_actual/${PT_CELL_SCENE}__${PT_CELL_BACKEND}__${PT_CELL_DENOISER}.png)
+    set(_diff_png    ${CMAKE_BINARY_DIR}/golden_diff/${PT_CELL_SCENE}__${PT_CELL_BACKEND}__${PT_CELL_DENOISER}.png)
+    # Per-cell working directory. The engine reads demont.cfg /
+    # autoexec.cfg from CWD before applying the smoke-exec fixture, so
+    # using a shared CWD (e.g. CMAKE_BINARY_DIR) would let an archived
+    # cvar from a previous cell or session leak into the baseline.
+    # Per-cell CWD isolates one cell from another; the workflow
+    # pre-cleans golden_workdir/ before ctest so a previous CI run's
+    # archived demont.cfg can't leak across runs either.
+    set(_cell_workdir ${CMAKE_BINARY_DIR}/golden_workdir/${_cell_name})
 
     # Pre-create the actual / diff output directories. imgdiff writes
     # the diff PNG via stb_image_write which doesn't auto-create parent
@@ -280,6 +288,7 @@ function(pt_add_golden_cell)
     # in isolation against a stale actual from a previous run.
     file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/golden_actual)
     file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/golden_diff)
+    file(MAKE_DIRECTORY ${_cell_workdir})
 
     # Build the pt_render_one_frame argument list. Spp / extra are
     # optional pass-throughs.
@@ -321,7 +330,7 @@ function(pt_add_golden_cell)
     # See `Raytracer Plan/TESTING_STRATEGY.md` for the regen workflow.
     add_test(NAME ${_cell_name}_render
         COMMAND $<TARGET_FILE:pt_render_one_frame> ${_render_args}
-        WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+        WORKING_DIRECTORY ${_cell_workdir})
     set_tests_properties(${_cell_name}_render PROPERTIES
         TIMEOUT 120
         LABELS  "golden;golden_${PT_CELL_BACKEND}")

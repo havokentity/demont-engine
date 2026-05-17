@@ -411,10 +411,11 @@ bad-pixel ratio > FAIL_PERCENT %.
    `Engine::Init` BEFORE `csg_scene_` is constructed and BEFORE
    `SeedDefaultPrimitives()` runs (see `src/engine/Engine.cpp`
    around the `pt_smoke_exec` exec). That means
-   CSG-scene commands (`cs_box`, `cs_sphere`, `cs_combine`, ...)
-   and analytic-primitive commands (`prim_*`) are silently dropped
-   today -- they're queued for a future late-phase exec
-   (TODO(#45-followup) in Engine.cpp). Avoid `;` and backtick
+   the CSG console commands (`csg_box`, `csg_sphere`, `csg_cylinder`,
+   `csg_op`, `csg_reset`, `csg_remove`, `csg_dump`) and analytic-
+   primitive commands (`prim_*`) are out of scope -- queued for a
+   future late-phase exec (TODO(#45-followup) in Engine.cpp).
+   Avoid `;` and backtick
    characters inside `#` comments -- the console parser splits
    scripts on `;` even mid-comment, which leaks the post-semicolon
    text as a fresh command.

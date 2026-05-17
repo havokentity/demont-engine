@@ -98,11 +98,17 @@ struct Args {
 
 bool ParsePositiveInt(std::string_view s, int& out) {
     if (s.empty()) return false;
+    constexpr int kCap = 1'000'000;   // sanity cap; well above any real --frames/--spp
     int n = 0;
     for (char c : s) {
         if (c < '0' || c > '9') return false;
-        n = n * 10 + (c - '0');
-        if (n > 1'000'000) return false;   // sanity cap
+        const int digit = c - '0';
+        // Check BEFORE the multiply/add so a long numeric like
+        // "999999999999999999999" can't overflow `int` and invoke UB
+        // in the validator. The cap is 1e6, so n*10 stays well under
+        // INT_MAX as long as n is already below the cap.
+        if (n > (kCap - digit) / 10) return false;
+        n = n * 10 + digit;
     }
     if (n <= 0) return false;
     out = n;
@@ -295,7 +301,18 @@ std::filesystem::path BuildSmokeExec(const Args& a) {
         return {};
     }
 
-    fs::path tmp_dir = fs::temp_directory_path();
+    // The no-arg `temp_directory_path()` throws on failure. This TU
+    // builds under the project's `-fno-exceptions` / `/EHs-c-` policy,
+    // so a throw here would terminate the wrapper instead of returning
+    // the documented kExitIoError. Use the error_code overload.
+    std::error_code tmp_ec;
+    fs::path tmp_dir = fs::temp_directory_path(tmp_ec);
+    if (tmp_ec) {
+        std::fprintf(stderr,
+            "pt_render_one_frame: temp_directory_path failed: %s\n",
+            tmp_ec.message().c_str());
+        return {};
+    }
     // Randomised name so parallel ctest runs don't clobber each other's
     // temp script. ctest's job control runs cells in parallel by default.
     std::random_device rd;
@@ -455,6 +472,21 @@ int main(int argc, char** argv) {
         return kExitOk;
     }
 
+    // Hermetic render setup: demont reads `demont.cfg` and
+    // `autoexec.cfg` from its CWD before applying the smoke-exec
+    // fixture, and the fixture doesn't necessarily pin every
+    // archived cvar (DOF, volumetrics, etc. may not be in the
+    // fixture's pin list). Clean those files from the wrapper's
+    // CWD so the render starts from engine defaults + fixture, not
+    // engine defaults + last run's archive + fixture. ctest sets
+    // CWD to the per-cell workdir (tests/CMakeLists.txt) so this
+    // touch is bounded to that cell's directory.
+    {
+        std::error_code rm_ec;
+        std::filesystem::remove("demont.cfg",   rm_ec);
+        std::filesystem::remove("autoexec.cfg", rm_ec);
+    }
+
     const std::filesystem::path smoke_exec = BuildSmokeExec(a);
     if (smoke_exec.empty()) {
         std::fprintf(stderr,
@@ -465,11 +497,21 @@ int main(int argc, char** argv) {
     const std::filesystem::path demont =
         ResolveDemontPath(std::filesystem::path(argv[0]), a.demontPath);
 
-    if (!std::filesystem::exists(demont)) {
+    // error_code overload (no-throw): the no-arg `exists()` throws on
+    // a filesystem error, but this TU is -fno-exceptions. Use the
+    // explicit ec overload so a probe failure surfaces as
+    // kExitSpawnError instead of terminating.
+    std::error_code demont_ec;
+    const bool demont_present = std::filesystem::exists(demont, demont_ec);
+    if (demont_ec || !demont_present) {
+        const std::string demont_err_msg = demont_ec ? demont_ec.message() : std::string();
         std::fprintf(stderr,
-            "pt_render_one_frame: demont binary not found at '%s'. "
+            "pt_render_one_frame: demont binary not found at '%s'%s%s%s. "
             "Pass --demont PATH to override.\n",
-            demont.string().c_str());
+            demont.string().c_str(),
+            demont_ec ? " (" : "",
+            demont_ec ? demont_err_msg.c_str() : "",
+            demont_ec ? ")" : "");
         std::error_code ec;
         std::filesystem::remove(smoke_exec, ec);
         return kExitSpawnError;

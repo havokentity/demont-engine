@@ -127,9 +127,11 @@ namespace cvar {
             "overrides. Used by the golden-image regression matrix "
             "(issue #45) to lock down per-cell CVAR state (camera, sun, "
             "path-tracer knobs, exposure, capture seed, app_window_*). "
-            "Scene/primitive commands are NOT supported at this exec "
-            "point today (csg_scene_ + SeedDefaultPrimitives have not "
-            "run yet). Typically set via "
+            "CSG console commands (csg_box / csg_sphere / csg_op / "
+            "csg_reset / etc.) are NOT supported at this exec point "
+            "today -- csg_scene_ + SeedDefaultPrimitives have not run "
+            "yet, and several of those handlers dereference csg_scene_ "
+            "before checking it. Typically set via "
             "--smoke-exec=tests/goldens/scenes/cornell_csg.cfg. "
             "Empty = no fixture. NOT CVAR_ARCHIVE -- per-invocation.",
             CVAR_NONE);
@@ -606,13 +608,17 @@ bool Engine::Init() {
     // app_window_*, r_capture_*, etc.) take effect during window
     // creation + first frame.
     //
-    // Scope at THIS exec point: cvar writes only. CSG-scene
-    // (`cs_*`) and analytic-primitive commands are intentionally
-    // out of scope here -- `csg_scene_` is not constructed and
-    // `SeedDefaultPrimitives()` has not run yet (see lines 653 / 659
-    // below). A fixture that issues `cs_*` here is a silent no-op.
+    // Scope at THIS exec point: cvar writes only. CSG console commands
+    // (`csg_box`, `csg_sphere`, `csg_cylinder`, `csg_op`, `csg_reset`,
+    // `csg_remove`, `csg_dump`) are out of scope here -- `csg_scene_`
+    // is not constructed and `SeedDefaultPrimitives()` has not run yet
+    // (see the section below where both happen). And worse than silent:
+    // several of the csg_* handlers dereference `csg_scene_` directly
+    // before checking it, so a fixture that calls them at this point
+    // would *crash* the engine, not no-op. The strict failure path
+    // below catches that as a fixture parse/exec failure.
     // TODO(#45-followup): add a second exec pass after
-    // SeedDefaultPrimitives() so scene/primitive fixtures work too.
+    // SeedDefaultPrimitives() so CSG-touching fixtures work properly.
     //
     // Strict failure mode (unlike demont.cfg / autoexec.cfg above):
     // a smoke-exec fixture that can't be read or that produces a
