@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Rajesh D'Monte
+#
+# LeakSanitizer suppressions for the Linux ASan/UBSan CI job.
+# Referenced via LSAN_OPTIONS=suppressions=... in
+# .github/workflows/linux-sanitizers.yml.
+#
+# Empty by design -- baseline CI is leak-free.  Add a `leak:`-prefixed
+# stack-frame match here ONLY when a confirmed false positive shows up
+# (e.g. a third-party library's deferred-cleanup pattern that LSan can't
+# distinguish from a real leak).  Narrow each entry to the specific
+# stack: never blanket-suppress a whole library.
+#
+# Format: see https://github.com/google/sanitizers/wiki/AddressSanitizerLeakSanitizer#suppressions

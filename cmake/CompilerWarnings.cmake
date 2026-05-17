@@ -22,10 +22,11 @@
 #     in pt_set_compiler_options below).  Enabling `vptr` would produce
 #     a link-time complaint about a missing __ubsan_handle_dynamic_type
 #     symbol and / or false positives on every devirtualised call.
-#   * `function` -- same RTTI requirement.  Catches mismatches between
-#     a function pointer's declared type and the callee's actual type;
-#     without RTTI the runtime check has no way to introspect the
-#     callee.
+#     Both Clang and GCC understand `-fno-sanitize=vptr`.
+#   * `function` -- Clang-only sub-check (same RTTI requirement).  GCC
+#     doesn't ship a `function` UBSan handler, and `-fno-sanitize=function`
+#     under GCC produces "unrecognized argument" diagnostics that combined
+#     with -Werror can fail the build.  Gate the opt-out on Clang.
 #
 # `-fno-sanitize-recover=all` makes every ASan / UBSan diagnostic fatal
 # (default UBSan behaviour is "warn and keep going", which lets bugs
@@ -41,17 +42,24 @@
 if(PT_ENABLE_SANITIZERS AND NOT MSVC)
     set(_pt_san_flags
         -fsanitize=address,undefined
-        -fno-sanitize=vptr,function
+        -fno-sanitize=vptr
         -fno-sanitize-recover=all
         -fno-omit-frame-pointer
         -O1
         -g
     )
-    add_compile_options(${_pt_san_flags})
-    add_link_options(
+    set(_pt_san_link_flags
         -fsanitize=address,undefined
-        -fno-sanitize=vptr,function
+        -fno-sanitize=vptr
     )
+    # `function` is Clang-only; adding it under GCC produces an
+    # unrecognized-argument diagnostic.
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        list(APPEND _pt_san_flags      -fno-sanitize=function)
+        list(APPEND _pt_san_link_flags -fno-sanitize=function)
+    endif()
+    add_compile_options(${_pt_san_flags})
+    add_link_options(${_pt_san_link_flags})
 endif()
 
 function(pt_set_compiler_options target)

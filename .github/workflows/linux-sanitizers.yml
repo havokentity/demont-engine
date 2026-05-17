@@ -70,10 +70,12 @@ jobs:
     env:
       UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
       ASAN_OPTIONS:  "halt_on_error=1:detect_leaks=1:detect_stack_use_after_return=1:abort_on_error=0:strict_string_checks=1"
-      # LSan-only knob: route the suppressions file (added below ONLY
-      # if a clean-shutdown false positive shows up) through the
-      # standard LSAN_OPTIONS env var.  Empty value if the file isn't
-      # present yet is harmless -- LSan ignores nonexistent paths.
+      # LSan-only knob: route the suppressions file through the standard
+      # LSAN_OPTIONS env var.  A missing path is a fatal LSan startup
+      # error on glibc / Linux LSan, so an empty placeholder
+      # `.lsan-suppressions.txt` ships at the repo root.  Add narrow
+      # `leak:`-prefixed entries there only when a confirmed false
+      # positive shows up.
       LSAN_OPTIONS: "suppressions=${{ github.workspace }}/.lsan-suppressions.txt:print_suppressions=0"
     steps:
       - uses: actions/checkout@v4
