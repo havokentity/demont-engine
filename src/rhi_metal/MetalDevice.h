@@ -76,11 +76,13 @@ private:
     // PathTrace tops at 9 (albedo_tex on the Vulkan OptiX-AOV path,
     // never set on Metal, but we keep the same engine API). The SVGF
     // denoise kernels declare 8 storage images at slots 0..7 (below 12
-    // by a wide margin). Bumped from 8 -> 12 so engine slot 8
+    // by a wide margin). Bumped from 8 -> 10 so engine slot 8
     // (normal_tex) isn't silently dropped on the Metal SVGF path; the
     // original 8-slot limit was the only reason normal_tex was gated
-    // to PT_TARGET_SPIRV in the path tracer.
-    TextureHandle              bound_tex_[11] {};
+    // to PT_TARGET_SPIRV in the path tracer. Briefly grew to 11 to
+    // host the #108 accum_stars binding; back to 10 now that the
+    // stateless StarsComposite kernel uses its own dispatch.
+    TextureHandle              bound_tex_[10] {};
     // 11 buffer slots. Slots 0..7 are the original engine layout
     // (mesh_positions / mesh_indices, primitives, marginal /
     // conditional CDFs, exposure_state, analytic-prim bvh_nodes).

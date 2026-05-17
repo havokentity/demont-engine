@@ -231,13 +231,6 @@ private:
     // reset_history.
     std::uint32_t         frame_parity_ = 0;
     bool                  needs_history_clear_ = true;
-    // Issue #46 round-3: stars_in lookup-failure log latch. Encode runs
-    // every frame, so a persistent stale-handle race would otherwise
-    // spam the log once per frame. We emit on the leading edge (first
-    // time per session the lookup fails) and clear when it next
-    // resolves cleanly. Mirrors the one-shot vs spamming pattern used
-    // by other per-frame error paths in this file.
-    bool                  stars_lookup_warn_latched_ = false;
 };
 
 }  // namespace pt::rhi::vk

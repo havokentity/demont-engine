@@ -282,6 +282,12 @@ private:
     std::uint64_t                               tonemap_pipeline_id_   = 0;
     std::uint64_t                               bloom_down_pipeline_id_ = 0;
     std::uint64_t                               bloom_up_pipeline_id_   = 0;
+    // Stateless stars+sun+moon composite (issue #46). Dispatched on
+    // Metal between Denoise() and the bloom pyramid so post-denoise
+    // HDR receives sub-pixel celestials and bloom downsamples those
+    // highlights into halos. Replaces the EMA accum_stars architecture
+    // from #108 -- see shaders/StarsComposite.slang for the rationale.
+    std::uint64_t                               stars_composite_pipeline_id_ = 0;
     std::uint64_t                               perfoverlay_pipeline_id_ = 0;
     std::uint64_t                               perfoverlay_drawlist_id_ = 0;
     std::uint32_t                               perfoverlay_drawlist_capacity_ = 0;
@@ -353,46 +359,6 @@ private:
     // exposure+ACES-encoded sRGB into the swapchain. Co-allocated +
     // resized with the other denoiser-related textures.
     std::uint64_t                               post_denoise_hdr_tex_id_ = 0;
-    // Star-split accumulator (issue #46). RGBA16F at swapchain
-    // resolution; PathTrace.slang writes the per-pixel star
-    // contribution here (peeled out of the primary-miss sky term so
-    // the SVGF a-trous kernel doesn't smudge it), and the post-
-    // denoise finalize / tonemap step adds it back pre-ACES.
-    //
-    // Lifecycle: allocated alongside the rest of the denoiser-related
-    // textures whenever `r_denoiser != off` (i.e. `denoiser_active_`).
-    // The cvar `r_star_split` only gates whether PathTrace.slang
-    // actually writes to it and whether the post-denoise finalize /
-    // Tonemap kernel reads it; the storage itself follows the broader
-    // denoiser texture lifetime so the resize / teardown contract
-    // stays one-shot (no separate "stars-only" allocation state).
-    // Freed alongside the rest on the r_denoiser-off transition.
-    //
-    // When the accumulator isn't allocated or r_star_split is 0, the
-    // post-denoise finalize / Tonemap shaders skip the additive read
-    // entirely via a `stars_present` push flag -- so the texture slot
-    // is bound to a safe 1x1 placeholder purely to satisfy descriptor-
-    // set validity, and the GPU never actually samples it. The engine
-    // reuses the existing `bloom_dummy_tex_id_` (a 1x1 RGBA16F
-    // allocated for bloom-off descriptor validity, declared a few
-    // members below in this header) as that placeholder rather than
-    // allocating a dedicated star-split companion. Previously we paid
-    // ~16 MB at 1080p for a swapchain-sized zero-fill companion; the
-    // push gate plus this reuse makes that allocation unnecessary.
-    std::uint64_t                               accum_stars_tex_id_ = 0;
-    // Tracks whether the star-split accumulator needs a `reset_accum`
-    // pulse on the next frame. Set when the user toggles r_star_split
-    // (so stale stars from a previous run don't bleed in) or when
-    // the texture is reallocated on swapchain resize. Consumed at the
-    // PathTrace dispatch site, where it's OR-ed into the `reset_accum`
-    // push field and then cleared. The engine's accum_dirty_ /
-    // reset_accum flag already handles the primary accum_hdr; we
-    // mirror that for accum_stars rather than overloading the same
-    // flag (the two accumulators can drift in and out of need-reset
-    // state independently: r_star_split toggle resets stars but not
-    // the main accum, for example).
-    bool                                        star_split_reset_pending_ = false;
-
     // Bloom mip chain. mip 0 is half-res of the swapchain; each
     // subsequent mip halves again. Built every frame from
     // post_denoise_hdr_tex_ via threshold + downsample + upsample

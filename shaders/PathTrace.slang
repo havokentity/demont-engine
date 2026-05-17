@@ -119,17 +119,16 @@ Texture2D<float4> moon_map;
 // Vulkan's robust-buffer-access rules.
 // Declared on BOTH Metal and SPIR-V (NOT #ifdef-wrapped). When the
 // declaration was SPIR-V-only, Slang's MSL backend dead-code-eliminated
-// it from the kernel signature, which compacted subsequent texture
-// slots and shifted accum_stars from MSL texture(10) to texture(9).
-// The engine's BindStorageTexture(10, accum_stars) call then landed
-// on an unbound MSL slot, silently dropping every star write/read --
-// see PR #108's regression history. Keeping the declaration on both
-// targets preserves Slang's slot assignment contract: each declared
-// texture gets a stable MSL index in declaration order regardless of
-// backend. The runtime `write_albedo_gbuffer` push gate (set to 0 by
-// the engine on Metal and on non-OptiX-AOV Vulkan dispatches) is the
-// actual run-or-skip switch; the engine binds a placeholder when
-// albedo_tex_id_ is 0 to satisfy descriptor validity.
+// it from the kernel signature, which compacted all subsequent texture
+// slots by one and silently broke every engine-side BindStorageTexture
+// call that landed past it -- see PR #108's regression history.
+// Keeping the declaration on both targets preserves Slang's slot
+// assignment contract: each declared texture gets a stable MSL index
+// in declaration order regardless of backend. The runtime
+// `write_albedo_gbuffer` push gate (set to 0 by the engine on Metal
+// and on non-OptiX-AOV Vulkan dispatches) is the actual run-or-skip
+// switch; the engine binds a placeholder when albedo_tex_id_ is 0 to
+// satisfy descriptor validity.
 [[vk::binding(17, 0)]] RWTexture2D<float4> albedo_tex;
 
 // GPU-resident exposure scalar. Updated each frame by AutoExposure.slang
@@ -198,25 +197,6 @@ Texture2D<float4> moon_map;
 // bindings 19/20.
 [[vk::binding(21, 0)]] StructuredBuffer<float4> sdf_clusters;
 // --- end SDF Phase 1 -------------------------------------------------------
-
-// Star-split accumulator (issue #46). When the denoiser is active and
-// `star_split_enabled` is non-zero, the primary-miss path writes
-// star-only radiance to this texture instead of folding it into
-// frame_radiance / denoise_color. Stars then bypass the SVGF a-trous
-// kernel (which would smudge their sub-pixel energy across a ~17x17
-// region by the third pass) and get composited back in at the
-// post-denoise finalize / tonemap stage. Same RGBA16F format and
-// dimensions as denoise_color; written with the same EMA blend as
-// accum_hdr so 1-spp temporal stability matches the rest of the
-// linear-HDR pipeline. When star-split is off (cvar r_star_split 0 or
-// denoiser_enabled == 0) the engine binds a 1x1 placeholder texture
-// here purely for descriptor-set validity; the shader's
-// `star_split_enabled` gate ensures this slot is never written to in
-// that case, so the placeholder's contents don't matter.
-//
-// Moved from binding 21 to binding 22 to coexist with SDF clusters
-// (which #109 placed at binding 21 before this round-2 merge).
-[[vk::binding(22, 0)]] RWTexture2D<float4> accum_stars;
 
 struct BvhNode {
     float3 aabb_min;
@@ -457,32 +437,23 @@ cbuffer Push {
     //      metres). Default 1e-4. .yzw reserved.
     float4 sdf_params_f;
     // --- end SDF Phase 1 ---------------------------------------------------
-    // Star-split flag (issue #46). 1 = route star contribution out
-    // of frame_radiance and into accum_stars; the post-denoise
-    // finalize stage adds it back pre-tonemap so SVGF's a-trous
-    // kernel never sees the sub-pixel star energy and can't smudge
-    // it across neighbouring sky texels. 0 = legacy behaviour,
-    // stars fold into frame_radiance like any other sky term and
-    // get filtered with the rest. Engine fills this from the
-    // r_star_split cvar gated by denoiser_enabled and a real
-    // accum_stars allocation. The trailing 12 bytes of pad keep the
-    // cbuffer trailing block 16-byte aligned for std140 / MSL.
-    uint star_split_enabled;
-    // Per-dispatch reset pulse for the star-split running mean,
-    // DECOUPLED from `reset_accum`. The engine sets reset_accum=1
-    // every frame when a denoiser is active (accum_hdr must stay
-    // 1-frame for the denoiser's own temporal accumulator to take
-    // over). Using the same flag for accum_stars caused the stars
-    // running mean to reset every frame too -- frame_stars (a
-    // single 1-spp star sample with sub-pixel Halton jitter) became
-    // the entire output, producing visible rapid flicker. This
-    // separate flag fires once per (alloc / resize / r_star_split
-    // toggle) and stays 0 otherwise, so the stars EMA converges
-    // even on the denoised path. See Engine.cpp comment at the
-    // matching push field for the host-side gate.
-    uint reset_stars_accum;
-    uint _pad_star_split1;
-    uint _pad_star_split2;
+    // Celestials composite gate (issue #46). 1 = subtract
+    // starsOnly(rd) + sunDisc(rd) + moonDisc(rd) from the b==0
+    // primary-miss sky term so denoise_color reaches SVGF/MetalFX
+    // celestial-free; the engine's StarsComposite kernel re-adds them
+    // post-denoise with N aperture-sampled rays per pixel (pixel-
+    // sharp stars, clean single-frame bokeh on sun/moon). 0 = legacy
+    // behaviour, celestials fold into frame_radiance and go through
+    // the denoiser. Engine fills this from r_star_split gated by
+    // denoiser_enabled AND procedural sky mode. The trailing 12 bytes
+    // of pad keep the cbuffer trailing block 16-byte aligned for
+    // std140 / MSL. Subtraction is gated on b == 0 only -- secondary
+    // bounces (b > 0) keep the full skyColor() so stars still
+    // contribute to indirect illumination of the scene.
+    uint composite_celestials;
+    uint _pad_celestials0;
+    uint _pad_celestials1;
+    uint _pad_celestials2;
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -531,12 +502,11 @@ cbuffer Frame {
     uint4  sdf_params;
     float4 sdf_params_f;
     // --- end SDF Phase 1 ---------------------------------------------------
-    // See `star_split_enabled` in the Metal Push cbuffer above.
-    uint star_split_enabled;
-    // See `reset_stars_accum` in the Metal Push cbuffer above.
-    uint reset_stars_accum;
-    uint _pad_star_split1;
-    uint _pad_star_split2;
+    // See `composite_celestials` in the Metal Push cbuffer above.
+    uint composite_celestials;
+    uint _pad_celestials0;
+    uint _pad_celestials1;
+    uint _pad_celestials2;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -946,12 +916,15 @@ HitInfo traceScene(float3 ro, float3 rd) {
 //
 // Extracted from procSky() for issue #46: SVGF a-trous smudges these
 // sub-pixel features into surrounding dark sky texels (~17x17 spread
-// by the third pass). When star-split is enabled the engine routes
-// this value out of frame_radiance and into accum_stars so the
-// denoiser never sees it -- composited back in pre-tonemap. The
-// helper is also called from procSky() itself for the legacy
-// (star-split off / denoiser off) path, keeping a single source of
-// truth for the star sampling logic.
+// by the third pass). With the celestials composite enabled the
+// primary-miss code subtracts this value from the sky term so the
+// denoiser never sees it; the engine's StarsComposite kernel re-adds
+// it post-denoise with N aperture-sampled rays per pixel
+// (StarsComposite.slang carries a verbatim copy of this function so
+// any change must mirror there too). The helper is also called from
+// procSky() for the legacy (star-split off / denoiser off) and
+// secondary-bounce paths, so stars still contribute to indirect
+// lighting in the scene.
 float3 starsOnly(float3 rd, float3 sun) {
     float cosTheta = clamp(rd.y, -1.0, 1.0);
     float sun_elev = sun.y;
@@ -1084,11 +1057,11 @@ float3 procSky(float3 rd, float3 sun) {
     sky = lerp(night, sky, day);
 
     // Star contribution. Routed through starsOnly() so the same logic
-    // is reusable from the primary-miss star-split path (issue #46).
-    // When that split is active, the engine subtracts this term from
-    // frame_radiance and writes it to accum_stars instead, so the
-    // SVGF a-trous kernel never sees sub-pixel star energy and can't
-    // smudge it across neighbouring sky texels.
+    // is reusable from the primary-miss celestials-composite path
+    // (issue #46). When the composite is active, the b==0 site
+    // subtracts this term from the sky so the denoiser doesn't see
+    // it; secondary bounces and NEE still call into here through
+    // skyColor() so stars contribute to indirect lighting.
     sky += starsOnly(rd, sun);
 
     // Sun disk: very tight angular radius (~0.25 deg ~= cos > 0.99996).
@@ -1839,16 +1812,15 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // SPIR-V-only, Slang's MSL backend saw albedo_tex as a
         // declared-but-never-used resource and dead-code-eliminated
         // it from the kernel signature -- which compacted all
-        // following texture slots and shifted accum_stars from MSL
-        // texture(10) to texture(9). The engine's
-        // BindStorageTexture(10, accum_stars) call then landed on an
-        // unbound MSL slot, silently dropping every star write/read.
-        // Bug history: this caused PR #108's star-split path to
-        // render zero stars on Mac under any denoiser; the fix
-        // landed in commit <next> by removing the #ifdef wrapper
-        // (write is still runtime-gated so non-AOV dispatches don't
-        // pay for it). Removing the gate ENTIRELY would also work
-        // but costs an RGBA16F write per pixel per frame on non-AOV
+        // following texture slots by one and silently broke every
+        // engine-side BindStorageTexture call that landed past it.
+        // Bug history: this caused PR #108's star-split slot 10
+        // binding to land on the wrong MSL texture, rendering zero
+        // stars on Mac under any denoiser. The fix is to keep the
+        // write site reachable on both backends (write is still
+        // runtime-gated so non-AOV dispatches don't pay for it).
+        // Removing the gate ENTIRELY would also work but costs an
+        // RGBA16F write per pixel per frame on non-AOV
         // modes; the runtime gate keeps that free.
         if (write_albedo_gbuffer != 0u) {
             albedo_tex[tid] = float4(hit_albedo, 0.0);
@@ -1860,21 +1832,19 @@ void main(uint2 tid : SV_DispatchThreadID) {
     // proportional GPU cost; spp=1 is the classic 1-spp interactive mode.
     uint sample_count = (spp == 0u) ? 1u : spp;
     float3 frame_radiance = float3(0.0);
-    // Star-split accumulator for issue #46. When star_split_enabled
-    // AND denoiser_enabled, the primary-miss sky term is split into
-    // (sky_minus_stars, stars_only). frame_radiance gets the former
-    // (denoised normally); this gets the latter (composited back in
-    // post-denoise so the a-trous filter can't smudge it). Stays at 0
-    // when star-split is off; the texture write below is gated, so the
-    // unused slot stays harmless.
-    float3 frame_stars    = float3(0.0);
-    // Star-split gate. star_split_enabled is in the Frame UBO on
-    // Vulkan and the Metal Push cbuffer on Metal, but the field name
-    // and offset are identical from the shader's perspective so this
-    // single expression works on both targets.
-    const bool star_split_active =
+    // Celestials composite gate (issue #46). When set, the b==0
+    // primary-miss code below subtracts starsOnly + sunDisc + moonDisc
+    // from the sky term so denoise_color reaches the denoiser without
+    // sub-pixel celestials. The engine's StarsComposite kernel
+    // (dispatched post-Denoise, pre-bloom on the Metal use_engine_tonemap
+    // path) re-adds them with N aperture-sampled rays per pixel.
+    // Gated on denoiser_enabled + write_hdr_aux because the legacy
+    // (denoiser-off) path's inline tonemap already produces sharp
+    // celestials at 1 spp; the smudge is only a problem under SVGF/
+    // MetalFX.
+    const bool composite_celestials_active =
         (denoiser_enabled != 0u) && (write_hdr_aux != 0u) &&
-        (star_split_enabled != 0u);
+        (composite_celestials != 0u);
     for (uint s = 0u; s < sample_count; ++s) {
         // When MetalFX is on, all pixels of the frame share the same
         // sub-pixel offset (Halton sequence picked on host) so the
@@ -2022,45 +1992,53 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 // b > 0 is a bounce ray escaping; clamp those to kill
                 // fireflies from BSDF-sampled bounces hitting the sun.
                 if (b == 0u) {
-                    // Star-split (issue #46): when the denoiser is on
-                    // and the user opted in (r_star_split 1, default
-                    // on), peel sub-pixel star energy out of the
-                    // primary-miss sky term so the SVGF a-trous kernel
-                    // doesn't smudge it. The peeled value lands in
-                    // frame_stars; the post-denoise finalize stage
-                    // adds it back pre-tonemap. Procedural / BSC star
-                    // paths only -- HDRI mode is a no-op (stars are
-                    // baked into env_map and starsAtPrimaryMiss
-                    // returns 0). Bounce rays (b > 0) keep their
-                    // existing path: clampIndirect already kills
-                    // firefly contributions from sub-pixel stars on
-                    // secondary bounces, and the indirect star
-                    // contribution is small enough that denoiser
-                    // smudging is invisible there.
+                    // Celestials composite (issue #46): when the
+                    // denoiser is on and the user opted in
+                    // (r_star_split 1, default on), peel
+                    //   starsOnly  (sub-pixel BSC / procedural stars)
+                    //   sunDisc    (0.55 deg disc + halo)
+                    //   moonDisc   (0.55 deg disc + textured surface)
+                    // out of the primary-miss sky term so denoise_color
+                    // reaches SVGF/MetalFX as just the procedural sky
+                    // base + NEE indirect contributions. The engine's
+                    // StarsComposite kernel (dispatched post-Denoise,
+                    // pre-bloom) re-adds the three terms per pixel with
+                    // N aperture-sampled rays so:
+                    //   - stars stay sub-pixel sharp (no a-trous smudge
+                    //     across a 17x17 neighbourhood)
+                    //   - sun/moon get a clean bokeh disc in ONE frame
+                    //     (instead of accumulating noisy 1-spp aperture
+                    //     samples through the denoiser's temporal stage)
                     //
-                    // Gate the starsAtPrimaryMiss() call on
-                    // star_split_active so the legacy branch (cvar
-                    // off, denoiser off, etc.) doesn't pay for the
-                    // starmap sample + per-cell hash work whose
-                    // result it would just discard. The split branch
-                    // computes stars_only once and subtracts it from
-                    // sky_full BEFORE the throughput multiply, so the
-                    // active and legacy paths differ by exactly
-                    // `throughput * stars_only` instead of relying on
-                    // the algebraic identity `T*(A+S) - T*S == T*A`
-                    // (which is not bit-identical in fp16 storage
-                    // paths). Also keeps a single source of truth for
-                    // the star sampling logic on the active path -- a
-                    // future change inside procSky's star contribution
-                    // would propagate through both sides via
-                    // starsAtPrimaryMiss without manual re-syncing.
+                    // Procedural sky mode only (engine gate); HDRI mode
+                    // bakes celestials into env_map (can't separate
+                    // without a brightness threshold) and starsOnly /
+                    // sunDisc / moonDisc all early-out on the gradient
+                    // / hdri modes anyway. Bounce rays (b > 0) keep
+                    // their existing path: clampIndirect kills firefly
+                    // contributions from sub-pixel stars on secondary
+                    // bounces, and the indirect contribution to NEE
+                    // light off the moon / sun rests on the
+                    // hdri_lights[] / sun_rad NEE paths (not skyColor
+                    // sampling). So secondary illumination from stars,
+                    // moon and sun is preserved.
                     float3 sky_full = skyColor(rd);
-                    if (star_split_active) {
+                    if (composite_celestials_active) {
+                        // Subtract the same three terms skyColor()
+                        // sums into procSky in mode==2. starsAtPrimaryMiss
+                        // already returns 0 for non-procedural modes
+                        // and the disc helpers self-gate on sun/moon
+                        // elevation, so this is a no-op when sun/moon
+                        // are below the twilight cutoff -- safe to
+                        // call unconditionally on the gated branch.
                         float3 stars_only = starsAtPrimaryMiss(rd);
-                        frame_stars += throughput * stars_only;
-                        radiance    += throughput * (sky_full - stars_only);
+                        float3 sun_d      = sunDisc(rd, sun_and_mode.xyz);
+                        float3 moon_d     = moonDisc(rd, moon_dir_phase,
+                                                     sun_and_mode.xyz);
+                        radiance += throughput *
+                                    (sky_full - stars_only - sun_d - moon_d);
                     } else {
-                        radiance    += throughput * sky_full;
+                        radiance += throughput * sky_full;
                     }
                 } else {
                     radiance += clampIndirect(throughput * skyColor(rd));
@@ -2669,7 +2647,6 @@ void main(uint2 tid : SV_DispatchThreadID) {
         frame_radiance += radiance;
     }
     frame_radiance /= float(sample_count);
-    frame_stars    /= float(sample_count);
 
     // Sanitize: replace NaN / Inf / negative channels with 0 before the
     // running-mean update below. Without this, a single rare bad sample
@@ -2686,15 +2663,10 @@ void main(uint2 tid : SV_DispatchThreadID) {
         bool3 bad = isnan(frame_radiance) || isinf(frame_radiance);
         frame_radiance = select(bad, float3(0.0), max(frame_radiance, float3(0.0)));
     }
-    // Same sanitisation for frame_stars: starsAtPrimaryMiss reads a
-    // host-uploaded RGBA16F starmap which we trust to be clean, but a
-    // NaN in throughput (from an upstream BRDF edge case) would
-    // propagate identically into accum_stars. Snap to 0 so the texture
-    // never carries non-finite state.
-    {
-        bool3 bad = isnan(frame_stars) || isinf(frame_stars);
-        frame_stars = select(bad, float3(0.0), max(frame_stars, float3(0.0)));
-    }
+    // (No frame_stars sanitisation -- accum_stars was retired with the
+    // EMA-based star_split architecture. Stars+sun+moon are now
+    // re-evaluated stateless per frame in StarsComposite.slang post-
+    // denoise; no shader-side history to keep finite.)
 
     // Online running mean. reset_accum=1 starts a fresh average. The
     // `n_new` we record is the count of samples averaged into this
@@ -2772,14 +2744,14 @@ void main(uint2 tid : SV_DispatchThreadID) {
         //     below uses, so the engine Tonemap chain reads the same
         //     accumulated image and just adds bloom on top.
         //
-        // Note (issue #46 star-split): when star_split_active was set
-        // above, the primary-miss code already subtracted the star
-        // contribution from `radiance`, so frame_radiance carries
-        // sky-without-stars. The bypassed stars sit in frame_stars
-        // and are written separately to accum_stars below. With
-        // star-split off, frame_radiance is identical to the
-        // pre-fix value (the subtraction branch never fires) and
-        // frame_stars stays at 0.
+        // Note (issue #46 celestials composite): when
+        // composite_celestials_active was set above, the primary-miss
+        // code subtracted starsOnly + sunDisc + moonDisc from
+        // `radiance`, so frame_radiance carries sky-without-celestials.
+        // The engine's StarsComposite kernel re-adds them post-denoise
+        // (see shaders/StarsComposite.slang). With the gate off,
+        // frame_radiance carries the full sky exactly as the legacy
+        // path did.
         float3 hdr_src = (denoiser_enabled != 0u) ? frame_radiance : avg;
         if (w2j_row0.w > 0.5) {
             denoise_color[tid] = float4(hdr_src, 1.0);
@@ -2787,43 +2759,6 @@ void main(uint2 tid : SV_DispatchThreadID) {
             float3 mapped = acesTonemap(hdr_src * exposure);
             denoise_color[tid] = float4(mapped, 1.0);
         }
-    }
-
-    // Star-split accumulator (issue #46). Same EMA / running-mean
-    // update shape as accum_hdr above, so a static-camera night
-    // scene converges identically and we don't introduce a fresh
-    // noise source on the bypass path. Gate kept tight: only writes
-    // when star_split_active was the gating condition for the
-    // subtraction above -- a write under a slack condition would
-    // leak stars into the legacy / off path's accum_stars (currently
-    // zero) and the finalize stage would composite them twice.
-    if (star_split_active) {
-        // Use `reset_stars_accum` (NOT `reset_accum`): the engine forces
-        // `reset_accum=1` every frame on the denoised path so accum_hdr
-        // stays 1-frame for the denoiser's own temporal accumulator.
-        // Sharing that flag with the stars accumulator caused per-frame
-        // flicker because frame_stars (a 1-spp sample with sub-pixel
-        // jitter) was the entire output. `reset_stars_accum` is fired
-        // only on accum_stars (re)allocation or r_star_split toggles,
-        // letting the stars EMA converge across frames.
-        float4 prev_s = (reset_stars_accum != 0u) ? float4(0,0,0,0) : accum_stars[tid];
-        {
-            // Sanitize prev: mirrors accum_hdr's NaN/Inf guard above.
-            bool3 prev_bad = isnan(prev_s.rgb) || isinf(prev_s.rgb);
-            if (any(prev_bad) || isnan(prev_s.a) || isinf(prev_s.a)) {
-                prev_s = float4(0, 0, 0, 0);
-            }
-        }
-        float n_new_s;
-        float3 avg_s;
-        if (prev_s.a < 0.5 || ema_alpha <= 0.0) {
-            n_new_s = prev_s.a + 1.0;
-            avg_s   = (prev_s.rgb * prev_s.a + frame_stars) / n_new_s;
-        } else {
-            avg_s   = prev_s.rgb * ema_alpha + frame_stars * (1.0 - ema_alpha);
-            n_new_s = min(prev_s.a + 1.0, 1.0 / max(1.0 - ema_alpha, 1e-3));
-        }
-        accum_stars[tid] = float4(avg_s, n_new_s);
     }
 
     // Swapchain write. Apply the OETF on the SPIR-V path so the OS's

@@ -82,6 +82,17 @@ pt_compile_slang(
     ENTRY   main
     TARGETS metal
 )
+# Stateless stars+sun+moon composite. Runs once per frame on Metal
+# between Denoise() and dispatch_bloom_pyramid, so post-denoise HDR
+# gets sub-pixel celestials with their own aperture-sampled bokeh and
+# bloom downsamples those highlights into halos.
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/StarsComposite.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+)
 # SVGF denoiser (svgf_basic / svgf_atrous on r_denoiser). Same Slang
 # sources the Vulkan backend uses; slangc cross-compiles them to MSL.
 # DenoiseFinalize is NOT built on Metal -- the existing Tonemap pipeline
