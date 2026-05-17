@@ -33,7 +33,10 @@ option(PT_ENABLE_OPTIX
     "Build OptiX denoiser (NVIDIA only; needs CUDA Toolkit + OptiX SDK installed)" ON)
 option(PT_ENABLE_TRACY          "Enable Tracy profiler client"          ON)
 # ASan + mimalloc do not coexist cleanly without MI_TRACK_ASAN; opt-in only.
-option(PT_ENABLE_SANITIZERS     "Enable -fsanitize=address,undefined in Debug" OFF)
+# Driven by the linux-asan-ubsan-debug preset in CMakePresets.json on CI;
+# can also be flipped on locally for any host (cmake/CompilerWarnings.cmake
+# applies the flags project-wide, including doctest test binaries).
+option(PT_ENABLE_SANITIZERS     "Enable -fsanitize=address,undefined (clang/gcc)" OFF)
 # AVX-512 build of Embree adds the 16-wide BVH16 intersector for users
 # on Zen 4+ (Ryzen 7000+), Zen 5 (Ryzen 9000+, the project owner's
 # 9950X3D), Threadripper, Xeon Skylake+, Rocket Lake (i9-11900K), and

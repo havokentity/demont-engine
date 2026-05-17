@@ -27,6 +27,11 @@ void ConsoleOverlay::Hide()                                    {}
 void ConsoleOverlay::Toggle()                                  {}
 bool ConsoleOverlay::IsShown() const                           { return false; }
 void ConsoleOverlay::ApplyTheme(std::string_view)              {}
+// Repaint() is wired by Engine.cpp's r_theme / con_font_scale cvar
+// on_change handlers, called unconditionally from Console::Drain
+// regardless of host overlay support.  No native overlay on Linux,
+// so just swallow.
+void ConsoleOverlay::Repaint()                                 {}
 void ConsoleOverlay::NotifyParentResized(int, int)             {}
 void ConsoleOverlay::OnLog(pt::log::Level, const std::string&) {}
 void ConsoleOverlay::SetGlobalInstance(ConsoleOverlay*)        {}

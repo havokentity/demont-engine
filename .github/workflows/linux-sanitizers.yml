@@ -1,0 +1,159 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Rajesh D'Monte
+#
+# Phase 3 of #47 (closes #68).  Linux ASan + UBSan job that builds the
+# linux-asan-ubsan-debug preset and runs ctest under sanitizer
+# instrumentation.  Catches: heap OOB, use-after-free, double-free,
+# signed-integer overflow, alignment violations, unreachable-code UB,
+# null-pointer deref through misaligned cast.  Linux runner because
+# clang's ASan is more reliable on Linux than on macOS-arm64 (where
+# Apple's clang ships a slightly older ASan runtime + the Apple
+# Silicon shadow-memory layout occasionally produces false-positive
+# stack-overflow reports).
+#
+# Scope intentionally narrower than build.yml's main matrix:
+#   - No Vulkan backend (PT_ENABLE_VULKAN_BACKEND=OFF in the preset):
+#     the ubuntu-latest hosted runner has no GPU and no usable Vulkan
+#     ICD; configuring with Vulkan ON would force the SDK install for
+#     a backend that can't run anyway.  ctest stays CPU-only.
+#   - No --smoke-frames invocation: same reason -- requires a working
+#     backend.  PR #77 explicitly removed smoke-test CI wiring for
+#     this exact runner-capability gap.  When a self-hosted runner
+#     with a real GPU shows up (or GitHub opens the Tesla-T4 tier to
+#     OSS), wire it back in here under the sanitizer env.
+#   - Linux software backend doesn't exist yet either (src/CMakeLists.txt
+#     gates rhi_software to APPLE OR WIN32; Linux has no SetDIBitsToDevice
+#     analog implemented).  Adding one is a separate work item.
+#
+# What WE do run:
+#   - The full ctest suite (harness_smoke, cvar_roundtrip, capture_format,
+#     imgdiff_test, plus whatever future tests land under tests/).  Every
+#     test executable links pt_console / pt_capture_encoder / etc. which
+#     themselves carry the project-wide sanitizer flags, so any UB / OOB
+#     in those libraries surfaces here.
+#
+# Triggers: pull_request + push to main, same as build.yml.  No nightly
+# schedule needed (the main matrix is already nightly-scheduled; we
+# don't gain extra signal from a sanitizer-only nightly).
+
+name: Linux Sanitizers
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+# Cancel in-flight runs for the same branch when a newer push lands.
+# Mirrors the build.yml policy -- a force-push to a PR branch shouldn't
+# burn CI minutes finishing the previous run.
+concurrency:
+  group: linux-sanitizers-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-asan-ubsan:
+    name: Linux (clang + ASan/UBSan)
+    runs-on: ubuntu-latest
+    # Halt-on-first-diagnostic + always print a stacktrace.  Combined
+    # with the preset's -fno-sanitize-recover=all this turns any
+    # sanitizer hit into an immediate non-zero exit -- the job fails
+    # on the first bug, not after the run has piled up dozens.
+    #
+    # detect_leaks=1 makes LSan run at process exit (which it does by
+    # default on Linux but is explicit here for documentation).
+    # detect_stack_use_after_return=1 enables ASan's fake-stack
+    # mechanism -- catches the class of bug where a function returns
+    # a pointer into its local stack frame and a later caller
+    # dereferences the stale pointer.
+    env:
+      UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
+      ASAN_OPTIONS:  "halt_on_error=1:detect_leaks=1:detect_stack_use_after_return=1:abort_on_error=0:strict_string_checks=1"
+      # LSan-only knob: route the suppressions file through the standard
+      # LSAN_OPTIONS env var.  A missing path is a fatal LSan startup
+      # error on glibc / Linux LSan, so an empty placeholder
+      # `.lsan-suppressions.txt` ships at the repo root.  Add narrow
+      # `leak:`-prefixed entries there only when a confirmed false
+      # positive shows up.
+      LSAN_OPTIONS: "suppressions=${{ github.workspace }}/.lsan-suppressions.txt:print_suppressions=0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        # ninja-build + clang + cmake drive the configure/build.  GLFW
+        # (fetched via Dependencies.cmake) needs X11 + Wayland dev
+        # headers + wayland-scanner on Linux because GLFW 3.4's
+        # CMakeLists tries to enable both backends and hard-errors if
+        # the codegen tool / protocol package is missing.  We never
+        # actually open a window on the headless runner -- pt_engine
+        # links against libglfw but the tests don't construct one --
+        # but a *configure-time* hard error blocks the whole build.
+        # `clang` on ubuntu-latest (24.04 as of this commit) is currently
+        # clang-18, which has ASan + UBSan parity with mainline LLVM 18.
+        # We don't pin a specific clang version because the sanitizer
+        # ABI is stable enough that ubuntu's rolling clang works fine.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+              ninja-build cmake clang \
+              libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev \
+              libwayland-dev wayland-protocols libxkbcommon-dev
+          clang --version
+          cmake --version
+          ninja --version
+
+      - name: Cache CMake build directory
+        uses: actions/cache@v4
+        with:
+          path: build/linux-asan-ubsan-debug
+          # Cache bust on the same trigger-set as build.yml -- any
+          # CMakeLists / cmake/* change rebuilds.  Sanitizer flag
+          # changes flow through cmake/CompilerWarnings.cmake which
+          # is in the hash set.
+          key: linux-asan-ubsan-${{ hashFiles('CMakeLists.txt', 'cmake/**', '**/CMakeLists.txt', 'CMakePresets.json') }}
+          restore-keys: |
+            linux-asan-ubsan-
+
+      - name: Configure
+        # The preset disables Vulkan + OptiX so no SDK install is
+        # needed; Embree gets auto-fetched as a prebuilt tarball
+        # from the vendored/embree-* release (see EmbreeBinary.cmake).
+        # Even though Embree is ray-tracing code, it stays linked in
+        # because pt_renderer / pt_csg pull it transitively for CPU-
+        # side scene-build helpers; the sanitizer flags propagate into
+        # the project code linking against it.
+        run: cmake --preset linux-asan-ubsan-debug
+
+      - name: Build
+        run: cmake --build build/linux-asan-ubsan-debug --parallel
+
+      - name: Unit tests (ctest)
+        # --output-on-failure prints the doctest report inline on
+        # failure so the CI log shows the exact assertion + file +
+        # line without needing an extra artefact download.  Sanitizer
+        # diagnostics go to stderr from the test binary which ctest
+        # captures here.
+        #
+        # Per-test 60s timeout already set in tests/CMakeLists.txt;
+        # the sanitizer runtime ~2-5x's wall-clock time but our tests
+        # are sub-second so the budget stays generous.
+        run: ctest --test-dir build/linux-asan-ubsan-debug --output-on-failure
+
+      # On failure, upload the ctest log + any test-emitted artefacts
+      # (each doctest binary's WORKING_DIRECTORY is its own binary dir
+      # under build/) for offline triage.  Sanitizer reports are in the
+      # ctest log under "Output:" for the failing test, but we also
+      # grab the Testing/Temporary/*.log files ctest writes on every
+      # run for completeness.
+      - name: Upload ctest artefacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-sanitizers-ctest-log
+          path: |
+            build/linux-asan-ubsan-debug/Testing/**
+            build/linux-asan-ubsan-debug/tests/**/*.png
+            build/linux-asan-ubsan-debug/tests/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
