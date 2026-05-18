@@ -126,15 +126,21 @@ std::uint32_t ParticleSystem::EmitBurst(const EmitSpec& spec) {
         // when pos_radius > 0. For the MVP "uniform-on-sphere" is
         // a cube-sample-then-cull, which is simple and bounded; with
         // a small radius the bias from rejecting outside-corners is
-        // not visible. Cube-only fallback if radius is 0.
+        // not visible. Cube-only fallback if all rejection attempts
+        // miss, so the worst case stays a bounded cube-sample rather
+        // than collapsing all particles to the exact emitter centre
+        // (which would visibly cluster them).
         glm::vec3 off{0.0f};
         if (spec.pos_radius > 0.0f) {
             for (int tries = 0; tries < 4; ++tries) {
                 glm::vec3 t{Uniform11(), Uniform11(), Uniform11()};
-                if (glm::dot(t, t) <= 1.0f) { off = t; break; }
+                off = t;                                  // always retain the latest sample
+                if (glm::dot(t, t) <= 1.0f) break;        // accept the first in-sphere one
             }
-            // If the 4-try rejection loop never hit, off stays at the
-            // last sample (worst case inside a 2x cube, still local).
+            // If the rejection loop never hit, off is the last cube
+            // sample (in the unit cube but outside the unit sphere) --
+            // still local, and free of the all-clump-at-centre bias
+            // that an initial {0,0,0} would produce.
             off *= spec.pos_radius;
         }
         p.pos = spec.pos + off;

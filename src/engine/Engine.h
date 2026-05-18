@@ -300,6 +300,14 @@ private:
     std::uint64_t                               particle_composite_pipeline_id_ = 0;
     std::uint64_t                               particles_storage_id_  = 0;   // float4[3*N]
     std::uint32_t                               particles_storage_capacity_ = 0; // particle slots that fit
+    // Reusable scratch buffer for the per-frame particle upload payload
+    // (the packed 12-float-per-particle GPU layout). Keeping this as an
+    // Engine member rather than a `std::vector` local in RenderFrame()
+    // avoids one alloc + one free per frame at the MVP particle count
+    // (~48 KB at 1024 particles -- not large in isolation, but it's
+    // every frame). Resize-without-shrink semantics mean the
+    // allocation tracks the high-water mark of live particles.
+    std::vector<float>                          particle_upload_scratch_;
     std::uint64_t                               perfoverlay_pipeline_id_ = 0;
     std::uint64_t                               perfoverlay_drawlist_id_ = 0;
     std::uint32_t                               perfoverlay_drawlist_capacity_ = 0;

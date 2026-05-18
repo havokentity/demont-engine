@@ -123,8 +123,13 @@ cbuffer Push {
 //                             dot product in the kernel hot path)
 //
 // Three float4s = 48 bytes per particle, matching the 48-byte upload
-// stride on the host (Particle.size on host is 48 bytes by static_assert,
-// see Engine::RenderFrame's particle upload site).
+// stride on the host. The matching static_assert is on the packed
+// GpuParticle struct that Engine::RenderFrame builds for the upload
+// (sizeof(GpuParticle) == 48). The host-side Particle struct in
+// src/effects/ParticleSystem.h is LARGER (it carries simulation-only
+// fields like vel / age / lifetime / drag that the GPU shader does
+// not need). The 48-byte invariant is therefore on the upload payload,
+// not on the simulation struct.
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
