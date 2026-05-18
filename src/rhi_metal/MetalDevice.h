@@ -72,14 +72,23 @@ private:
     MTL::ComputeCommandEncoder* encoder_    = nullptr;
 
     PipelineHandle             bound_pso_{0};
-    // Texture slot map: large enough for every kernel's max engine slot.
-    // PathTrace tops at 9 (albedo_tex on the Vulkan OptiX-AOV path,
-    // never set on Metal, but we keep the same engine API). The SVGF
-    // denoise kernels declare 8 storage images at slots 0..7 (below 12
-    // by a wide margin). Bumped from 8 -> 12 so engine slot 8
-    // (normal_tex) isn't silently dropped on the Metal SVGF path; the
-    // original 8-slot limit was the only reason normal_tex was gated
-    // to PT_TARGET_SPIRV in the path tracer.
+    // Texture slot map: 11 slots covering every kernel's max engine
+    // slot. PathTrace fills slots 0..10:
+    //   0  output / swapchain
+    //   1  accum_hdr
+    //   2  denoise_color
+    //   3  depth_tex (denoiser-only)
+    //   4  motion_tex (denoiser-only)
+    //   5  env_map (HDRI)
+    //   6  star_map (BSC)
+    //   7  moon_map
+    //   8  normal_tex (SVGF / NRD / OptiX-AOV)
+    //   9  albedo_tex (OptiX-AOV only)
+    //   10 cloud_trans_tex (issue #46 follow-up: R32F per-pixel cloud
+    //      transmittance the path tracer writes and StarsComposite
+    //      reads). On Metal slots above the kernel's actual texture
+    //      count are silently dropped; on Vulkan the slot table in
+    //      VulkanDevice.cpp maps them to vk::binding numbers.
     TextureHandle              bound_tex_[11] {};
     // 11 buffer slots. Slots 0..7 are the original engine layout
     // (mesh_positions / mesh_indices, primitives, marginal /

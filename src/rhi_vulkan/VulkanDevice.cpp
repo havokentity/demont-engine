@@ -108,25 +108,15 @@ constexpr bool kEnableValidation = false;
 // storage buffer) so the descriptor set remains complete; the shader
 // gates the SDF read on push.sdf_params.x > 0.
 // --- end SDF Phase 1 --------------------------------------------------------
-// --- Star-split (#46, round-2 merge) ----------------------------------------
-// Engine texture slot 10 -> vk::binding 22 is the accum_stars storage
-// image used by the star-split bypass of the SVGF a-trous kernel.
-// PathTrace writes; DenoiseFinalize + Tonemap composite back in pre-ACES.
-// Moved from binding 21 because SDF Phase 1 (#109) claimed that binding
-// for its STORAGE BUFFER -- the two would have collided in Vulkan's flat
-// descriptor space, but the SLOT-10 collision was a phantom: the engine
-// keeps separate slot namespaces for textures (`kSlotToTexBinding[]`)
-// and buffers (`kSlotToBufBinding[]`), and on Metal the texture / buffer
-// argument-table indices are likewise distinct. So texture-slot 10 can
-// host accum_stars without conflicting with buffer-slot 10's SDF
-// clusters. Choosing slot 10 (rather than 11) also keeps the Metal
-// declaration-order MSL slot honest: PathTrace.slang declares
-// accum_stars as the 11th texture (0-indexed = MSL texture(10)), and
-// Slang's MSL backend assigns texture indices by declaration order, so
-// the engine must call `BindStorageTexture(10, ...)` for the Metal path
-// to wire up. The earlier slot-11 layout left accum_stars unbound on
-// Metal (MSL texture(11) doesn't exist) -- stars rendered invisibly.
-// --- end Star-split ---------------------------------------------------------
+// --- Cloud transmittance G-buffer (issue #46 follow-up) ---------------------
+// Engine texture slot 10 -> vk::binding 22 is cloud_trans_tex, the R32F
+// per-pixel cloud transmittance the path tracer writes from its
+// volumetric cloud march. Reused the slot number (and binding) that
+// accum_stars (#108) briefly occupied -- accum_stars is gone, slot is
+// free, and re-using it keeps the descriptor pool sizing arithmetic
+// identical to the pre-rewrite state. StarsComposite reads this to
+// attenuate the celestial composite by foreground cloud density.
+// --- end Cloud transmittance ------------------------------------------------
 static constexpr std::uint32_t kNumTexSlots = 11;
 constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     0,  // engine slot 0  -> shader binding 0  (output / swapchain)
@@ -139,13 +129,7 @@ constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     13, // engine slot 7  -> shader binding 13 (moon_map)
     16, // engine slot 8  -> shader binding 16 (normal_tex, SVGF/NRD/OptiX-AOV)
     17, // engine slot 9  -> shader binding 17 (albedo_tex, OptiX AOV only)
-    22, // engine slot 10 -> shader binding 22 (accum_stars, issue #46;
-        //                   moved from binding 21 in round-2 merge with
-        //                   main after SDF Phase 1 #109 took binding 21
-        //                   for its storage buffer. Slot index 10 is
-        //                   shared with the buffer-slot table's SDF
-        //                   entry only by NUMBER; the namespaces are
-        //                   distinct on both backends.)
+    22, // engine slot 10 -> shader binding 22 (cloud_trans_tex, #46 follow-up)
 };
 constexpr std::uint32_t kSlotToBufBinding[11] = {
     0,  // engine slot 0 unused
@@ -343,10 +327,10 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     // tri_bvh_permuted_ids, PR #106 follow-up host-built triangle BVH),
     // binding 21 (SDF cluster buffer, SDF Phase 1 #97; moved from
     // binding 19 to make room for the tri BVH), and binding 22
-    // (accum_stars, issue #46 star-split — PathTrace writes;
-    // DenoiseFinalize reads via its own dedicated layout, not this
-    // shared one — moved from binding 21 because SDF Phase 1 #109 took
-    // that binding for its storage buffer).
+    // (cloud_trans_tex, issue #46 follow-up -- the R32F per-pixel
+    // cloud transmittance the path tracer writes and StarsComposite
+    // reads. Reuses the slot number accum_stars (#108) briefly
+    // occupied before the stateless composite rewrite.)
     constexpr std::uint32_t kMaxWrites = 23;
     std::array<VkDescriptorImageInfo,  kMaxWrites> img_infos {};
     std::array<VkDescriptorBufferInfo, kMaxWrites> buf_infos {};
@@ -984,9 +968,10 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // (PR #106 follow-up) the host-built triangle BVH at bindings 19/20
     // exactly like the HW path does. SDF Phase 1 (#97) adds binding 21
     // for the SDF cluster buffer (moved from binding 19 to make room
-    // for the triangle BVH). Star-split (#46) adds binding 22 for the
-    // accum_stars storage image (moved from binding 21 to make room for
-    // the SDF cluster buffer in round-2 merge with main).
+    // for the triangle BVH). Binding 22 is cloud_trans_tex (R32F
+    // per-pixel cloud transmittance G-buffer, issue #46 follow-up);
+    // reuses the slot accum_stars (#108) briefly occupied before the
+    // stateless composite rewrite freed it.
     {
         std::vector<VkDescriptorSetLayoutBinding> b;
         b.reserve(23);
@@ -1050,17 +1035,11 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // signal.
         add_binding(21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
         // --- end SDF Phase 1 ---
-        // binding 22: accum_stars (issue #46 star-split accumulator;
-        // RGBA16F per-pixel star contribution that PathTrace routes
-        // around the SVGF a-trous kernel, then DenoiseFinalize +
-        // Tonemap composite back in pre-ACES). Always allocated in
-        // the layout so the partially-bound rules cover the off-mode
-        // (denoiser off / r_star_split 0); the engine binds a 1x1
-        // placeholder texture there for descriptor-set validity and
-        // the shaders' `stars_present` / `star_split_enabled` push
-        // gates skip the read/write entirely. Moved here from
-        // binding 21 in the round-2 merge after SDF Phase 1 (#109)
-        // claimed binding 21 for its storage buffer.
+        // Binding 22: cloud_trans_tex. R32F storage image written by
+        // PathTrace's volumetric cloud march, read by StarsComposite
+        // for foreground-cloud occlusion of stars / sun / moon.
+        // Allocated host-side when denoiser_active_; PARTIALLY_BOUND
+        // covers the host-side gate's "no denoiser, no binding" case.
         add_binding(22, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
 
         // UPDATE_AFTER_BIND for every binding so we can rewrite the

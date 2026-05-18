@@ -48,10 +48,13 @@ private:
     VulkanDevice*  device_ = nullptr;
     VkCommandBuffer cb_     = VK_NULL_HANDLE;
     PipelineHandle bound_pipeline_{0};
-    // 12 texture slots gives engine slot 8 (normal_tex for the SVGF/NRD
-    // denoiser, mapped to vk::binding 16) plus 3 spare. Metal stays at
-    // 8 because MetalFX doesn't take a normal input and the path-tracer
-    // shader gates the normal write on PT_TARGET_SPIRV.
+    // 11 texture slots: slots 0..7 are output / accum / denoise_color /
+    // depth / motion / env_map / star_map / moon_map; slot 8 is
+    // normal_tex (SVGF/NRD + OptiX-AOV), slot 9 is albedo_tex (OptiX
+    // AOV only), slot 10 is cloud_trans_tex (issue #46 follow-up
+    // R32F per-pixel cloud transmittance G-buffer the path tracer
+    // writes and StarsComposite reads). Keep in sync with
+    // kSlotToTexBinding[] in VulkanDevice.cpp.
     TextureHandle  bound_tex_[11] {};
     // 11 buffer slots: 8 original (mesh_positions/indices, primitives,
     // marginal/conditional CDFs, exposure_state, analytic-prim bvh_nodes),

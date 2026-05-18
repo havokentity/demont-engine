@@ -33,6 +33,8 @@ extern const unsigned char shader_BloomUp_metal_data[];
 extern const unsigned long shader_BloomUp_metal_size;
 extern const unsigned char shader_PerfOverlay_metal_data[];
 extern const unsigned long shader_PerfOverlay_metal_size;
+extern const unsigned char shader_StarsComposite_metal_data[];
+extern const unsigned long shader_StarsComposite_metal_size;
 }
 
 // MetalFXDenoiser.mm: ObjC++ shim around MTLFXTemporalDenoisedScaler.
@@ -40,7 +42,9 @@ extern "C" void* pt_metalfx_create(void* mtl_device, std::uint32_t w, std::uint3
 extern "C" void  pt_metalfx_destroy(void* scaler);
 extern "C" void  pt_metalfx_encode(void* scaler, void* mtl_cb,
                                     void* color_in, void* depth_in,
-                                    void* motion_in, void* color_out,
+                                    void* motion_in,
+                                    void* normal_in, void* albedo_in,
+                                    void* color_out,
                                     float jitter_x, float jitter_y,
                                     const float* world_to_view_4x4,
                                     const float* view_to_clip_4x4,
@@ -315,6 +319,9 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
     build_pso("bloom_down",  shader_BloomDown_metal_data,    shader_BloomDown_metal_size);
     build_pso("bloom_up",    shader_BloomUp_metal_data,      shader_BloomUp_metal_size);
     build_pso("perfoverlay", shader_PerfOverlay_metal_data,  shader_PerfOverlay_metal_size);
+    build_pso("stars_composite",
+              shader_StarsComposite_metal_data,
+              shader_StarsComposite_metal_size);
 
     cmd_ = std::make_unique<MetalCommandBuffer>(this);
 }
@@ -479,11 +486,20 @@ void MetalDevice::Denoise(const DenoiseDesc& d) {
             metalfx_width_  = w;
             metalfx_height_ = h;
         }
+        // Guidance G-buffers: normal already looked up above for SVGF;
+        // albedo also goes to MetalFX so look it up here. Both default
+        // to nullptr if the engine didn't allocate them (which it
+        // should for SVGF->MetalFX kinds per the want_*_gbuffer gates
+        // in Engine.cpp, but Apple's scaler tolerates nil bindings as
+        // "no guidance for this frame" rather than crashing).
+        auto* albedo_in_chain = LookupTexture(d.albedo_in);
         pt_metalfx_encode(metalfx_scaler_,
                           static_cast<void*>(cmd_->RawCmdBuf()),
                           static_cast<void*>(svgf_metalfx_intermediate_),
                           static_cast<void*>(depth_in),
                           static_cast<void*>(motion_in),
+                          static_cast<void*>(normal_in),
+                          static_cast<void*>(albedo_in_chain),
                           static_cast<void*>(color_out),
                           d.jitter_x, d.jitter_y,
                           d.world_to_view, d.view_to_clip,
@@ -506,11 +522,21 @@ void MetalDevice::Denoise(const DenoiseDesc& d) {
         metalfx_height_ = h;
     }
 
+    // Guidance G-buffers (Apple's MTLFXTemporalDenoisedScaler accepts
+    // normal + diffuse-albedo inputs to weight its spatial filter --
+    // without these MetalFX falls back to a conservative blur that
+    // doesn't converge on static cameras). Engine allocates these for
+    // MetalFX kinds via want_normal_gbuffer / want_albedo_gbuffer; a
+    // nil handle is tolerated by the scaler as "no guidance".
+    auto* normal_in_mfx = LookupTexture(d.normal_in);
+    auto* albedo_in_mfx = LookupTexture(d.albedo_in);
     pt_metalfx_encode(metalfx_scaler_,
                       static_cast<void*>(cmd_->RawCmdBuf()),
                       static_cast<void*>(color_in),
                       static_cast<void*>(depth_in),
                       static_cast<void*>(motion_in),
+                      static_cast<void*>(normal_in_mfx),
+                      static_cast<void*>(albedo_in_mfx),
                       static_cast<void*>(color_out),
                       d.jitter_x, d.jitter_y,
                       d.world_to_view, d.view_to_clip,

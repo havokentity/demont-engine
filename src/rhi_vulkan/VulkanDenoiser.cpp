@@ -319,19 +319,16 @@ bool VulkanNrdDenoiser::BuildLayout() {
     //                  path is a separate Mac-only contract that does
     //                  use the engine's bloom_dummy_tex_id_).
     {
-        // Layout: hdr_in / swap_out / exposure_state / bloom_tex /
-        // stars_tex. The +1 binding (4 = stars_tex) is the issue #46
-        // star-split accumulator -- DenoiseFinalize.slang adds it
-        // pre-ACES so SVGF a-trous never sees sub-pixel star energy.
-        // When stars aren't routed the caller binds a 1x1 placeholder
-        // here purely for descriptor-set validity; the shader's
-        // `stars_present` push gate elides the read in that case.
-        std::array<VkDescriptorSetLayoutBinding, 5> b{};
+        // Layout: hdr_in / swap_out / exposure_state / bloom_tex.
+        // Binding 4 (stars_tex, #108) retired with the stateless
+        // StarsComposite rewrite -- celestials composite Metal-side on
+        // a dedicated pipeline; the Vulkan denoiser path has no stars
+        // compositor in this PR.
+        std::array<VkDescriptorSetLayoutBinding, 4> b{};
         b[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
         b[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
         b[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
         b[3] = { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-        b[4] = { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
         VkDescriptorSetLayoutCreateInfo dslci{};
         dslci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         dslci.bindingCount = static_cast<std::uint32_t>(b.size());
@@ -341,11 +338,9 @@ bool VulkanNrdDenoiser::BuildLayout() {
             return false;
         }
         // Finalize push: width, height, hdr_pipeline, bloom_intensity,
-        // stars_present, 12 bytes pad. 8 x 4 bytes = 32 (16-byte
-        // aligned, std140-friendly). The `stars_present` field is
-        // the gate for the issue-#46 stars_tex additive read at
-        // binding 4 -- 0 means skip the read entirely so a 1x1
-        // placeholder binding is safe.
+        // and 16 trailing bytes of reserved padding kept for layout
+        // stability (DenoiseFinalize.slang still declares the tail as
+        // `_reserved_stars + 3 pad uints` to keep std140 alignment).
         VkPushConstantRange pcr{};
         pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         pcr.offset     = 0;
@@ -407,15 +402,14 @@ bool VulkanNrdDenoiser::BuildDescriptorPool() {
     // Mixed pool sizing for both layouts:
     //   - kSetRing sets of (kPassImages storage images + kPassBuffers
     //     storage buffers) for temporal/atrous.
-    //   - kFinalizeSetRing sets of (4 storage images + 1 storage
-    //     buffer) for the finalize pass: hdr_in, swap_out, bloom_in,
-    //     stars_in (+1 over the legacy 3 is the issue #46 star-split
-    //     accumulator that DenoiseFinalize composites pre-ACES).
+    //   - kFinalizeSetRing sets of (3 storage images + 1 storage
+    //     buffer) for the finalize pass: hdr_in, swap_out, bloom_in
+    //     (stars_in binding 4 retired with the EMA design).
     // Plus a small headroom on each type.
     std::array<VkDescriptorPoolSize, 2> ps{};
     ps[0].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     ps[0].descriptorCount = static_cast<std::uint32_t>(
-        kSetRing * kPassImages + kFinalizeSetRing * 4 + 4);
+        kSetRing * kPassImages + kFinalizeSetRing * 3 + 4);
     ps[1].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     ps[1].descriptorCount = static_cast<std::uint32_t>(
         kSetRing * kPassBuffers + kFinalizeSetRing * 1 + 4);
@@ -928,55 +922,17 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
             v_bloom    = v_output;
             bloom_real = false;
         }
-        // Star-split accumulator (issue #46) at finalize binding 4.
-        // The shader's additive read is gated on a `stars_present`
-        // push flag, so a null or failed-lookup view is safe AS LONG
-        // AS the fallback view is itself a known-safe target (not the
-        // dispatch's own write target). Round-2 fell back to v_output
-        // for descriptor validity; round-3 (this code) replaces that
-        // with the device-owned 1x1 dummy (`dummy_color_id_`, allocated
-        // once at Init for the atrous color_history placeholder slot)
-        // -- same lifetime, same format (RGBA16F), guaranteed not to
-        // be either the read source or the write target of this
-        // dispatch. The shader's `stars_present == 0` gate still
-        // elides the read in this case; the dummy bind is purely
-        // descriptor-set validity. Any future shader edit that adds
-        // an unconditional read of `stars_tex` (e.g. a bloom-on-stars
-        // prepass per follow-up issue #110) will read zeros from the
-        // dummy rather than over-reading the destination HDR.
-        //
-        // The lookup-failure LOG_WARN is rate-limited via a one-shot
-        // latch: per-frame Encode would otherwise spam the log for as
-        // long as a stale-handle race persists. We log on the leading
-        // edge and clear when the lookup next resolves.
-        VkImageView v_stars = (stars_in.id != 0) ? device_->LookupImageView(stars_in)
-                                                : VK_NULL_HANDLE;
-        bool stars_real = (v_stars != VK_NULL_HANDLE);
-        if (!stars_real) {
-            if (stars_in.id != 0 && !stars_lookup_warn_latched_) {
-                LOG_WARN("VulkanDenoiser: stars_in view lookup failed (id={}); "
-                         "binding device-owned 1x1 dummy as a safe-but-unread "
-                         "fallback and forcing stars_present=0 (the shader's "
-                         "gate elides the additive read in this case). "
-                         "Logged once per stale-handle episode.", stars_in.id);
-                stars_lookup_warn_latched_ = true;
-            }
-            v_stars = device_->LookupImageView(TextureHandle{dummy_color_id_});
-            // If even the dummy is unavailable (extremely defensive --
-            // dummy is allocated at Init and lives until Shutdown), fall
-            // back to v_output as a last resort. stars_present stays 0
-            // either way so the shader never reads.
-            if (v_stars == VK_NULL_HANDLE) v_stars = v_output;
-        } else if (stars_lookup_warn_latched_) {
-            stars_lookup_warn_latched_ = false;
-        }
+        // Stars binding 4 retired with the stateless StarsComposite
+        // rewrite (#46). The Vulkan denoiser path doesn't run stars in
+        // this PR -- composite is a Metal-side dispatch.
+        (void)stars_in;
         if (v_final != VK_NULL_HANDLE && b_exp != VK_NULL_HANDLE) {
             VkDescriptorSet fset = finalize_sets_[next_finalize_set_];
             next_finalize_set_ = (next_finalize_set_ + 1) % kFinalizeSetRing;
 
-            VkDescriptorImageInfo  ii[4] {};
+            VkDescriptorImageInfo  ii[3] {};
             VkDescriptorBufferInfo bi    {};
-            VkWriteDescriptorSet   w[5]  {};
+            VkWriteDescriptorSet   w[4]  {};
 
             ii[0].imageView   = v_output;
             ii[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -984,13 +940,11 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
             ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
             ii[2].imageView   = v_bloom;
             ii[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            ii[3].imageView   = v_stars;
-            ii[3].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
             bi.buffer = b_exp;
             bi.offset = 0;
             bi.range  = VK_WHOLE_SIZE;
 
-            for (int i = 0; i < 5; ++i) {
+            for (int i = 0; i < 4; ++i) {
                 w[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                 w[i].dstSet          = fset;
                 w[i].descriptorCount = 1;
@@ -1007,11 +961,8 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
             w[3].dstBinding     = 3;
             w[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             w[3].pImageInfo     = &ii[2];
-            w[4].dstBinding     = 4;
-            w[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            w[4].pImageInfo     = &ii[3];
 
-            vkUpdateDescriptorSets(device_->RawDevice(), 5, w, 0, nullptr);
+            vkUpdateDescriptorSets(device_->RawDevice(), 4, w, 0, nullptr);
 
             // Atrous path's last pass left the chain barrier in place,
             // so the read of `output` is already covered. Basic path
@@ -1027,16 +978,16 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                 std::uint32_t height;
                 std::uint32_t hdr_pipeline;     // 1 = ACES + sRGB; 0 = sRGB OETF only
                 float         bloom_intensity;  // 0 = skip bloom add
-                std::uint32_t stars_present;    // 0 = skip stars_tex read (issue #46)
+                // 16 reserved bytes -- previously held stars_present +
+                // 12 bytes of pad for the EMA-based star_split design.
+                // Kept as padding so the std140 layout stays aligned
+                // and DenoiseFinalize.slang's matching `_reserved_*`
+                // tail block doesn't need a fresh round of edits.
+                std::uint32_t _reserved_stars;
                 std::uint32_t _pad0;
                 std::uint32_t _pad1;
                 std::uint32_t _pad2;
             } fp{};
-            // Phase-0 defensive guard. 6 uints + 1 float + 1 pad =
-            // 32B naturally, assert catches a future "add a vec4" or
-            // reorder. The +16 over the legacy layout is the
-            // stars_present gate (issue #46) plus 12 bytes of
-            // explicit padding for std140 alignment.
             static_assert(sizeof(FinalizePush) == 32,
                           "FinalizePush layout mismatch with DenoiseFinalize.slang");
             static_assert(sizeof(FinalizePush) % 16 == 0,
@@ -1050,12 +1001,7 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
             // collapses to a no-op (otherwise the v_output fallback
             // above would be sampled as bloom -- HDR feedback artifact).
             fp.bloom_intensity = bloom_real ? bloom_intensity : 0.0f;
-            // Same defence-in-depth pattern for stars: only sample
-            // stars_tex when the engine routed a real accumulator AND
-            // its view resolved cleanly. On `stars_real == false` the
-            // binding is the v_output fallback, which the shader must
-            // never actually read.
-            fp.stars_present   = stars_real ? 1u : 0u;
+            fp._reserved_stars = 0u;
             vkCmdPushConstants(cb, finalize_pipe_layout_,
                                VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                sizeof(fp), &fp);
@@ -1123,37 +1069,19 @@ void VulkanNrdDenoiser::EncodeFinalizeOnly(VkCommandBuffer cb,
                             : color_in_view;
     const float effective_bloom = (bloom_in_view != VK_NULL_HANDLE)
                                     ? bloom_intensity : 0.0f;
-    // Star-split slot (issue #46). The shader's additive read of
-    // stars_tex is gated on a `stars_present` push flag, so a null
-    // stars_in_view is safe AS LONG AS the fallback view is itself
-    // a known-safe target. Round-2 fell back to color_in_view for
-    // descriptor validity; round-3 (this code) replaces that with the
-    // device-owned 1x1 dummy (`dummy_color_id_`, allocated once at
-    // Init for the atrous color_history placeholder slot) -- same
-    // lifetime, same format (RGBA16F), guaranteed not to alias either
-    // the read source or the write target of this dispatch. The
-    // shader's `stars_present == 0` gate still elides the read; the
-    // dummy bind is purely descriptor-set validity. Any future shader
-    // edit that adds an unconditional read of `stars_tex` (e.g. a
-    // bloom-on-stars prepass per follow-up issue #110) will read
-    // zeros from the dummy rather than over-reading the source HDR.
-    const bool stars_real = (stars_in_view != VK_NULL_HANDLE);
-    VkImageView v_stars   = stars_real ? stars_in_view : VK_NULL_HANDLE;
-    if (!stars_real) {
-        v_stars = device_->LookupImageView(TextureHandle{dummy_color_id_});
-        // Defensive: dummy lives for the denoiser's lifetime, so a
-        // null lookup here would indicate a torn-down denoiser state.
-        // Fall back to color_in_view as a last resort -- stars_present
-        // stays 0 either way so the shader never reads.
-        if (v_stars == VK_NULL_HANDLE) v_stars = color_in_view;
-    }
+    // Stars binding 4 retired with the stateless StarsComposite
+    // rewrite (#46). Vulkan denoiser path has no stars compositor in
+    // this PR -- the function signature still carries stars_in_view
+    // so VulkanDevice's call sites don't need a signature ripple in
+    // this PR, but the parameter is currently unused.
+    (void)stars_in_view;
 
     VkDescriptorSet fset = finalize_sets_[next_finalize_set_];
     next_finalize_set_   = (next_finalize_set_ + 1) % kFinalizeSetRing;
 
-    VkDescriptorImageInfo  ii[4] {};
+    VkDescriptorImageInfo  ii[3] {};
     VkDescriptorBufferInfo bi    {};
-    VkWriteDescriptorSet   w[5]  {};
+    VkWriteDescriptorSet   w[4]  {};
 
     ii[0].imageView   = color_in_view;
     ii[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -1161,13 +1089,11 @@ void VulkanNrdDenoiser::EncodeFinalizeOnly(VkCommandBuffer cb,
     ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     ii[2].imageView   = v_bloom;
     ii[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    ii[3].imageView   = v_stars;
-    ii[3].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     bi.buffer = exposure_state_buf;
     bi.offset = 0;
     bi.range  = VK_WHOLE_SIZE;
 
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 4; ++i) {
         w[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w[i].dstSet          = fset;
         w[i].descriptorCount = 1;
@@ -1184,10 +1110,7 @@ void VulkanNrdDenoiser::EncodeFinalizeOnly(VkCommandBuffer cb,
     w[3].dstBinding     = 3;
     w[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     w[3].pImageInfo     = &ii[2];
-    w[4].dstBinding     = 4;
-    w[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    w[4].pImageInfo     = &ii[3];
-    vkUpdateDescriptorSets(device_->RawDevice(), 5, w, 0, nullptr);
+    vkUpdateDescriptorSets(device_->RawDevice(), 4, w, 0, nullptr);
 
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, finalize_pipe_);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -1198,16 +1121,15 @@ void VulkanNrdDenoiser::EncodeFinalizeOnly(VkCommandBuffer cb,
         std::uint32_t height;
         std::uint32_t hdr_pipeline;     // 1 = ACES + sRGB; 0 = sRGB OETF only
         float         bloom_intensity;  // 0 = skip bloom add
-        std::uint32_t stars_present;    // 0 = skip stars_tex read (issue #46)
+        // 16 reserved bytes (was stars_present + 3 pad uints for the
+        // EMA-based star_split design). Kept so DenoiseFinalize.slang's
+        // matching `_reserved_*` tail block keeps the std140 layout
+        // aligned without another round of edits.
+        std::uint32_t _reserved_stars;
         std::uint32_t _pad0;
         std::uint32_t _pad1;
         std::uint32_t _pad2;
     } fp{};
-    // Phase-0 defensive guard. Same struct as the chained-denoiser path
-    // above (the two definitions are independent function-local types
-    // but the layout must match the shader's single FinalizePush
-    // cbuffer). Bumped from 16 to 32 bytes in the issue-#46 round-2
-    // review: the trailing 16 carry stars_present + 12 bytes of pad.
     static_assert(sizeof(FinalizePush) == 32,
                   "FinalizePush layout mismatch with DenoiseFinalize.slang");
     static_assert(sizeof(FinalizePush) % 16 == 0,
@@ -1216,7 +1138,7 @@ void VulkanNrdDenoiser::EncodeFinalizeOnly(VkCommandBuffer cb,
     fp.height          = height;
     fp.hdr_pipeline    = hdr_pipeline ? 1u : 0u;
     fp.bloom_intensity = effective_bloom;
-    fp.stars_present   = stars_real ? 1u : 0u;
+    fp._reserved_stars = 0u;
     vkCmdPushConstants(cb, finalize_pipe_layout_,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        sizeof(fp), &fp);
