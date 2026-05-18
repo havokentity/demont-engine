@@ -61,3 +61,22 @@ target_link_libraries(pt_engine
 )
 
 pt_set_compiler_options(pt_engine)
+
+# --- SDF Phase 2 (#98) megakernel-perf gates: host-side mirror -----------
+# The PT_SDF_PROCEDURAL_OPS / PT_SDF_AUTODIFF cache options (see
+# cmake/Slang.cmake) gate the shader-side Phase 2 procedural + Dual3
+# autodiff blocks. The engine needs to know whether the AD path was
+# compiled in so we can emit a [warn] line at startup when
+# r_sdf_normal_mode=0 (forward-AD) but this build doesn't ship it. We
+# mirror both flags into C++ preprocessor land so the warning lives in
+# the same translation unit as the cvar registration.
+if(PT_SDF_PROCEDURAL_OPS)
+    target_compile_definitions(pt_engine PRIVATE PT_SDF_PROCEDURAL_OPS=1)
+else()
+    target_compile_definitions(pt_engine PRIVATE PT_SDF_PROCEDURAL_OPS=0)
+endif()
+if(PT_SDF_AUTODIFF)
+    target_compile_definitions(pt_engine PRIVATE PT_SDF_AUTODIFF=1)
+else()
+    target_compile_definitions(pt_engine PRIVATE PT_SDF_AUTODIFF=0)
+endif()
