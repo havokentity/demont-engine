@@ -234,8 +234,23 @@ bool LoadGltfImage(const cgltf_data*    data,
             err = "embedded data: URI image not supported in MVP -- use .glb or external file";
             return false;
         }
+        // glTF 2.0 spec mandates URI strings be UTF-8 (and either percent-
+        // encoded or a data: URI). std::filesystem::u8path was the historic
+        // "string is UTF-8" path constructor, but it's deprecated in C++20
+        // (libc++ flags -Wdeprecated-declarations on Xcode 26+, breaking
+        // our zero-warning CI gate). The non-deprecated successor takes a
+        // char8_t range, but introducing char8_t at this single call site
+        // would force a u8string round-trip we don't otherwise need.
+        // Constructing std::filesystem::path directly from std::string
+        // matches the existing codebase pattern (see line 427 below and
+        // tools/pt_render_one_frame/main.cpp) and is UTF-8-correct on
+        // every platform we ship to (POSIX + Apple use UTF-8 natively for
+        // path::native_t == std::string; on Windows MSVC path(std::string)
+        // applies the active code page -- if/when we add Windows builds
+        // we'll revisit with a project-wide u8string helper, tracked
+        // alongside any future i18n work).
         const std::filesystem::path candidate =
-            std::filesystem::path(gltf_dir) / std::filesystem::u8path(uri);
+            std::filesystem::path(gltf_dir) / std::filesystem::path(uri);
         pixels = stbi_load(candidate.string().c_str(), &w, &h, &comp, /*req_comp=*/4);
         if (!pixels) {
             err = std::string("stb_image load '") + candidate.string() + "' failed: " +
