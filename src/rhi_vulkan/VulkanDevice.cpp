@@ -1633,10 +1633,26 @@ bool VulkanDevice::RecreateSwapchain() {
         want_w = width_  > 0 ? static_cast<std::uint32_t>(width_)  : 512u;
         want_h = height_ > 0 ? static_cast<std::uint32_t>(height_) : 384u;
     }
-    swap_extent_.width  = std::clamp(want_w,
-                                     caps.minImageExtent.width, caps.maxImageExtent.width);
-    swap_extent_.height = std::clamp(want_h,
-                                     caps.minImageExtent.height, caps.maxImageExtent.height);
+    // Clamp to driver-reported [min, max] range -- but ONLY if the caps
+    // report a sane non-degenerate range. NVIDIA on Win reports
+    // maxImageExtent = 0x0 when the surface has never been driven through
+    // WM_SIZE (headless smoke mode), and clamping 512 into [0,0] silently
+    // collapses to 0 and re-trips the swapchain failure that 9a4bb06 was
+    // supposed to fix. Detect the degenerate case and bypass the clamp.
+    const bool caps_degenerate =
+        caps.maxImageExtent.width  == 0 ||
+        caps.maxImageExtent.height == 0 ||
+        caps.maxImageExtent.width  < caps.minImageExtent.width ||
+        caps.maxImageExtent.height < caps.minImageExtent.height;
+    if (caps_degenerate) {
+        swap_extent_.width  = want_w;
+        swap_extent_.height = want_h;
+    } else {
+        swap_extent_.width  = std::clamp(want_w,
+                                         caps.minImageExtent.width, caps.maxImageExtent.width);
+        swap_extent_.height = std::clamp(want_h,
+                                         caps.minImageExtent.height, caps.maxImageExtent.height);
+    }
     width_  = static_cast<int>(swap_extent_.width);
     height_ = static_cast<int>(swap_extent_.height);
 
