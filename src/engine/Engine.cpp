@@ -7558,6 +7558,17 @@ void Engine::RegisterCommands() {
             v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
         }
     }
+    // Water Phase 1 (#134): tweaking absorption / ior / wave params at
+    // runtime changes the MAT_WATER BRDF output, so reset the temporal
+    // accumulator on each change to avoid stale samples blending in.
+    for (const char* n : {"r_water_absorption_r", "r_water_absorption_g",
+                          "r_water_absorption_b", "r_water_ior",
+                          "r_water_wave_scale",   "r_water_wave_amplitude",
+                          "r_water_wave_speed"}) {
+        if (auto* v = C.FindCVar(n)) {
+            v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+        }
+    }
     // Cloud preset: when set, snap the individual cloud cvars to the
     // preset's parameter set. The user can then nudge individual values
     // without changing the preset name (or set it to "custom" to lock).
