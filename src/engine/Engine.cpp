@@ -10206,7 +10206,35 @@ void Engine::RegisterCommands() {
     // doesn't smear the old field into the new one.
     if (auto* v = C.FindCVar("r_clouds")) {
         v->allowed_values = {"0", "1"};
-        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+        v->on_change = [this](const pt::console::CVar& cv) {
+            accum_dirty_ = true;
+            // One-shot hint (closed issue #178): r_clouds=1 +
+            // r_accum_ema_alpha=0 produces persistent noise because
+            // the cloud-wind dirty trigger keeps resetting the legacy
+            // running-mean accumulator every frame. The cvar
+            // docstring documents this but users still tripped on
+            // it during smoke pass. Surface the hint at the moment
+            // the user enables clouds so the foot-gun is signposted
+            // exactly when they'd hit it.
+            static bool hint_shown = false;
+            if (!hint_shown && cv.GetBool()) {
+                float alpha = 0.0f;
+                if (auto* a = pt::console::Console::Get().FindCVar("r_accum_ema_alpha")) {
+                    alpha = a->GetFloat();
+                }
+                if (alpha == 0.0f) {
+                    LOG_INFO("[hint] r_clouds=1 + r_accum_ema_alpha=0: "
+                             "cloud wind drift will reset the accumulator "
+                             "each frame, persistent noise expected. Set "
+                             "r_accum_ema_alpha to 0.9 for clean output "
+                             "(the engine then skips the cloud-wind dirty "
+                             "trigger and runs an EMA blend), or set "
+                             "r_clouds_wind_x and _z to 0 to freeze wind. "
+                             "Shown once per session.");
+                    hint_shown = true;
+                }
+            }
+        };
     }
     for (const char* n : {"r_clouds_coverage",  "r_clouds_base_height",
                           "r_clouds_top_height","r_clouds_density",
