@@ -179,6 +179,68 @@ FetchContent_Declare(manifold
     SYSTEM
 )
 
+# --- NRD: NVIDIA RayTracingDenoiser (Vulkan-only, opt-in, non-Apple) -------
+# Issue #50 -- stage 1 (scaffolding). Activated only when:
+#   - PT_ENABLE_NRD = ON               (user opt-in; default OFF)
+#   - PT_ENABLE_VULKAN_BACKEND = ON    (NRD's only supported backend in this
+#                                        repo; the DX12 path isn't wired in)
+#   - NOT APPLE                        (NRD doesn't target MoltenVK -- shaders
+#                                        compile via dxc-spirv with HLSL 6.x
+#                                        features MoltenVK's SPIRV-Cross
+#                                        translation layer can't always
+#                                        round-trip; and the Mac path uses
+#                                        Metal + MetalFX anyway, so NRD adds
+#                                        zero value on the user's primary
+#                                        platform).
+# We set PT_NRD_ACTIVE based on the AND of those three; the Vulkan backend's
+# CMakeLists checks PT_NRD_ACTIVE (not PT_ENABLE_NRD directly) so a stale
+# PT_ENABLE_NRD=ON in the cache on Mac doesn't try to link a missing target.
+#
+# Vendoring strategy: FetchContent (consistent with every other dep in this
+# file). v4.17.3 is the latest release as of 2026-05 -- pinned by tag + SHA256
+# of the GitHub archive tarball. NRD itself ships its CMake which recursively
+# fetches MathLib + ShaderMake (their hashes are inside NRD's CMakeLists);
+# we don't have to mirror those here.
+#
+# Defaults overridden for our build:
+#   NRD_STATIC_LIBRARY=ON   -- we link statically; one .a in libdemont rather
+#                              than a runtime .so dependency.
+#   NRD_EMBEDS_SPIRV_SHADERS=ON  -- needed for the Vulkan path (default ON).
+#   NRD_EMBEDS_DXIL_SHADERS=OFF  -- we don't compile a DX12 backend.
+#   NRD_EMBEDS_DXBC_SHADERS=OFF  -- ditto.
+#   NRD_NRI=OFF             -- NRD's bundled higher-level abstraction layer
+#                              (Render Interface). We integrate against the
+#                              raw NRD instance API instead; NRI would mean
+#                              shipping a second graphics-API shim alongside
+#                              the engine's own VulkanDevice.
+set(PT_NRD_ACTIVE OFF)
+if(PT_ENABLE_NRD AND NOT PT_ENABLE_VULKAN_BACKEND)
+    message(STATUS "PT_ENABLE_NRD requires PT_ENABLE_VULKAN_BACKEND; NRD denoiser inactive.")
+endif()
+if(PT_ENABLE_NRD AND APPLE)
+    message(WARNING "PT_ENABLE_NRD is Vulkan-only and the Mac path uses Metal + MetalFX; "
+                    "NRD denoiser inactive on Apple. Use the Vulkan backend on Windows/Linux.")
+endif()
+if(PT_ENABLE_NRD AND PT_ENABLE_VULKAN_BACKEND AND NOT APPLE)
+    set(NRD_STATIC_LIBRARY        ON  CACHE BOOL "" FORCE)
+    set(NRD_EMBEDS_SPIRV_SHADERS  ON  CACHE BOOL "" FORCE)
+    set(NRD_EMBEDS_DXIL_SHADERS   OFF CACHE BOOL "" FORCE)
+    set(NRD_EMBEDS_DXBC_SHADERS   OFF CACHE BOOL "" FORCE)
+    set(NRD_NRI                   OFF CACHE BOOL "" FORCE)
+    # Normal+roughness encoding -- 2 is NRD's default (R10G10B10A2_UNORM oct
+    # packed). We match the default so a future swap to NRD-encoded normals
+    # in the path tracer doesn't have to re-derive the constants.
+    set(NRD_NORMAL_ENCODING       "2" CACHE STRING "" FORCE)
+    set(NRD_ROUGHNESS_ENCODING    "1" CACHE STRING "" FORCE)
+    FetchContent_Declare(nrd
+        URL       https://github.com/NVIDIA-RTX/NRD/archive/refs/tags/v4.17.3.tar.gz
+        URL_HASH  SHA256=8bfc3cbb78c5977404044b263ab984d1b02c23e04860d6a63f22b74c0cfc9e23
+        SYSTEM
+    )
+    set(PT_NRD_ACTIVE ON)
+    message(STATUS "NRD denoiser: enabled (v4.17.3 via FetchContent)")
+endif()
+
 # --- doctest: unit test framework (header-only) ----------------------------
 # Single-header testing framework. Fast compile (the framework header
 # itself is ~7000 lines but only the TU declaring DOCTEST_CONFIG_IMPLEMENT
@@ -264,6 +326,31 @@ if(NOT EMBREE_PREBUILT_FOUND)
 endif()
 if(PT_ENABLE_VULKAN_BACKEND)
     FetchContent_MakeAvailable(vma)
+endif()
+
+# NRD: bring the `NRD` static-library target into the build alongside its
+# auto-generated NRDShaders custom_target (compiles HLSL -> SPIRV via
+# ShaderMake at build time). Block scope so NRD's `-Werror` doesn't escape
+# into the rest of our build (NRD's CMakeLists adds `-Werror` PRIVATE on
+# its own target, so this is technically redundant, but the block also
+# isolates any CMP-policy / CMAKE_CXX_STANDARD touches inside NRD's
+# subtree the same way we do for Embree / Manifold).
+#
+# Also: silence NRD's vendored third-party warnings against our strict
+# warning level (MathLib + ShaderMakeBlob are also compiled here, with
+# their own warning profiles we don't want polluting our build log).
+if(PT_NRD_ACTIVE)
+    block()
+        FetchContent_MakeAvailable(nrd)
+    endblock()
+    if(TARGET NRD)
+        target_compile_options(NRD PRIVATE ${PT_DEP_WARN_SILENCE_FLAG})
+    endif()
+    foreach(_t MathLib ShaderMake ShaderMakeBlob)
+        if(TARGET ${_t})
+            target_compile_options(${_t} PRIVATE ${PT_DEP_WARN_SILENCE_FLAG})
+        endif()
+    endforeach()
 endif()
 
 # Manifold reads the global TRACY_ENABLE cache var (same one we set for our
