@@ -23,6 +23,7 @@
 #include "../renderer/MoonTexture.h"
 #include "../renderer/Camera.h"
 #include "../renderer/Csg/CsgScene.h"
+#include "../renderer/GltfImporter.h"
 #include "../renderer/HdrImage.h"
 #include "../renderer/MeshGen.h"
 #include "../rhi/CommandBuffer.h"
@@ -1092,6 +1093,7 @@ void Engine::ApplyCommandLineCvarOverrides() {
         // shared empty-check above so `--smoke-exec=` with no path
         // doesn't silently disable the override.
         { "--smoke-exec=",         "pt_smoke_exec"        },
+        { "--smoke-late-exec=",    "pt_smoke_late_exec"   },
         { "--smoke-capture-out=",  "pt_smoke_capture_out" },
     };
 
@@ -8402,6 +8404,93 @@ void Engine::RegisterCsgCommands() {
                 return;
             }
             out.FormatLine("csg: root set to {}", id);
+        });
+
+    // glTF 2.0 importer (#79, MVP). Loads a single static mesh from
+    // disk and swaps it into the mesh-path resources (vbuf/ibuf + BVH +
+    // optional BLAS/TLAS) -- the exact same upload path the CSG bake
+    // produces, so the renderer sees no difference between a procedural
+    // CSG mesh and an imported .gltf/.glb. The CSG console commands
+    // (csg_*) continue to work; running `csg_box` etc after a glTF load
+    // will dirty the CSG scene and the next bake overwrites the glTF
+    // mesh on the next frame (intentional -- "last writer wins").
+    // Backend switches (RequestBackendSwitch) force a CSG re-bake which
+    // will also wipe the glTF mesh; re-run `mesh_load_gltf` after the
+    // swap if needed.
+    //
+    // MVP scope: single mesh, single primitive, base-color factor +
+    // optional base-color texture. Texture pixels are decoded and held
+    // on the GltfMesh result for the textured-materials work (#74) to
+    // pick up; the path tracer's shading uniform isn't plumbed for
+    // per-mesh textures yet, so the texture is recorded but not yet
+    // rendered (the mesh ships with whatever default color the shader
+    // applies to CSG meshes).
+    C.RegisterCommand("mesh_load_gltf",
+        "mesh_load_gltf <path>: import a static .gltf/.glb mesh (MVP -- "
+        "no animation/skins/scene-graph; replaces the current mesh).",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 1) {
+                out.PrintLine("usage: mesh_load_gltf <path>");
+                return;
+            }
+            if (!device_) {
+                out.PrintLine("mesh_load_gltf: device not ready");
+                return;
+            }
+
+            std::string err;
+            auto loaded = pt::renderer::LoadGltf(std::string(args[0]), &err);
+            if (!loaded) {
+                out.FormatLine("mesh_load_gltf: {}", err);
+                return;
+            }
+
+            // Drain any in-flight CSG bake worker so we don't race the
+            // resource swap below. EnsureMeshUpdated's main-thread
+            // consume path runs on a different tick than the console
+            // command lane, so if the worker is mid-execution
+            // (bake_phase_ == 1) we have to wait it out before
+            // RebuildMeshResources reallocates the shared
+            // box_vbuf_id_ / box_ibuf_id_ / tri_bvh_* slots.
+            if (bake_phase_.load(std::memory_order_acquire) == 1 &&
+                jobs_ && bake_handle_.internal != nullptr) {
+                jobs_->Wait(bake_handle_);
+            }
+            bake_handle_ = {};
+            // Consume any pending bake result so the next
+            // EnsureMeshUpdated tick doesn't immediately overwrite our
+            // glTF mesh with the stale CSG bake we just superseded.
+            pending_baked_.reset();
+            bake_phase_.store(0, std::memory_order_release);
+            // Also acknowledge the CSG scene as clean so its initial
+            // post-seed Dirty()==true flag (set during Init()) doesn't
+            // re-trigger a bake on the next frame and wipe the glTF
+            // mesh. csg_box / csg_sphere / etc still re-dirty as
+            // intended, so the CSG path stays usable.
+            if (csg_scene_) csg_scene_->AcknowledgeClean();
+            force_mesh_rebuild_ = false;
+
+            // Convert GltfMesh -> BakedMesh (same triangle-soup layout)
+            // and hand it to the existing mesh-upload pipeline.
+            pt::csg::BakedMesh baked;
+            baked.positions = std::move(loaded->positions);
+            baked.normals   = std::move(loaded->normals);
+            baked.indices   = std::move(loaded->indices);
+            RebuildMeshResources(baked);
+            accum_dirty_ = true;
+
+            out.FormatLine("mesh_load_gltf: loaded '{}' ({} verts, {} tris, base color "
+                           "{:.3f} {:.3f} {:.3f} {:.3f}{})",
+                           loaded->source_path,
+                           baked.VertexCount(),
+                           baked.TriangleCount(),
+                           loaded->base_color_factor[0],
+                           loaded->base_color_factor[1],
+                           loaded->base_color_factor[2],
+                           loaded->base_color_factor[3],
+                           loaded->base_color_texture.Empty()
+                               ? ""
+                               : ", base color tex present (not yet rendered -- see #74)");
         });
 }
 
