@@ -347,21 +347,20 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     // path doesn't work on Mac. Partially-bound is core Vulkan 1.2 and
     // supported on every target including MoltenVK.
     //
-    // Capacity: 11 storage_image (one less than kNumTexSlots because
-    // engine texture slot 10 is reserved/unused on the Vulkan path)
-    // + 1 accel_struct + 10 storage_buffer + 1 uniform_buffer = 23,
-    // sized to the worst-case "PathTrace binds everything" dispatch.
-    // kMaxWrites must be >= the total binding count or
-    // vkUpdateDescriptorSets reads off the end of these stack arrays.
-    // The +4 over the legacy 19 is bindings 19/20 (tri_bvh_nodes /
-    // tri_bvh_permuted_ids, PR #106 follow-up host-built triangle BVH),
-    // binding 21 (SDF cluster buffer, SDF Phase 1 #97; moved from
-    // binding 19 to make room for the tri BVH), and binding 22
-    // (cloud_trans_tex, issue #46 follow-up -- the R32F per-pixel
-    // cloud transmittance the path tracer writes and StarsComposite
-    // reads. Reuses the slot number accum_stars (#108) briefly
-    // occupied before the stateless composite rewrite.)
-    constexpr std::uint32_t kMaxWrites = 23;
+    // Capacity: must cover every binding the worst-case "PathTrace
+    // binds everything" dispatch writes. Today that is:
+    //   kNumTexSlots (14)      storage_image writes (loop at line ~436)
+    //   1                      accel_struct (TLAS at binding 2)
+    //   kNumBufSlots - 1 (13)  storage_buffer writes (loop at line ~459
+    //                          starts at s=1; slot 0 is unused)
+    //   1                      uniform_buffer (Frame UBO at binding 14)
+    // Total ceiling: 14 + 1 + 13 + 1 = 29. We size from the slot-table
+    // sizes directly so future slot bumps in VulkanDevice.h don't
+    // silently overflow img_infos/buf_infos/writes. kMaxWrites must
+    // be >= the total binding count or vkUpdateDescriptorSets reads
+    // off the end of these stack arrays.
+    constexpr std::uint32_t kMaxWrites =
+        kNumTexSlots + 1u /*accel*/ + std::size(kSlotToBufBinding) + 1u /*UBO*/;
     std::array<VkDescriptorImageInfo,  kMaxWrites> img_infos {};
     std::array<VkDescriptorBufferInfo, kMaxWrites> buf_infos {};
     std::array<VkWriteDescriptorSetAccelerationStructureKHR, 1> as_infos {};
