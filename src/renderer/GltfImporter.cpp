@@ -7,30 +7,21 @@
 // cgltf is the upstream single-header glTF 2.0 parser (MIT, jkuhlmann).
 // Vendored at third_party/cgltf/cgltf.h, see issue #79 for rationale
 // (single-header + no transitive deps + actively-maintained + the
-// idiomatic choice in the Khronos ecosystem). This TU is the SOLE
-// definer of CGLTF_IMPLEMENTATION in the codebase -- if a future TU
-// needs the parser, it should #include "GltfImporter.h" and call
-// LoadGltf, not redefine the impl.
+// idiomatic choice in the Khronos ecosystem). The implementation is
+// defined in the sibling gltf_impl.cpp TU -- it is the SOLE definer
+// of CGLTF_IMPLEMENTATION in the codebase. If a future TU needs the
+// parser, it should #include "GltfImporter.h" and call LoadGltf, not
+// redefine the impl.
 //
-// Same one-TU-defines-impl pattern applies to stb_image below: the
-// rest of the engine uses stb_image_write (separate symbol table)
-// from src/engine/stb_impl.cpp; we add stb_image's read path here
-// only to decode the optional baseColorTexture. CGLTF and STB share
-// no symbols so it's safe to define both impls in this TU.
+// Same one-TU-defines-impl pattern applies to stb_image (also in
+// gltf_impl.cpp). The rest of the engine uses stb_image_write
+// (separate symbol table) from src/engine/stb_impl.cpp; we add
+// stb_image's read path in gltf_impl.cpp only to decode the optional
+// baseColorTexture.
 //
-// CMakeLists.txt scopes a target-wide warning suppression to just
-// this file -- see src/renderer/CMakeLists.txt.
-#define CGLTF_IMPLEMENTATION
+// CMakeLists.txt scopes a per-file warning suppression to just
+// gltf_impl.cpp -- this TU (project logic) keeps strict warnings.
 #include "../../third_party/cgltf/cgltf.h"
-
-#define STB_IMAGE_IMPLEMENTATION
-#define STBI_NO_HDR        // We use Radiance.hdr via our own loader.
-#define STBI_NO_LINEAR
-#define STBI_NO_PSD
-#define STBI_NO_PIC
-#define STBI_NO_PNM
-#define STBI_NO_GIF
-#define STBI_NO_TGA
 #include "../../third_party/stb/stb_image.h"
 
 #include <algorithm>
