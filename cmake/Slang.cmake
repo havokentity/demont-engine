@@ -1,5 +1,50 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Rajesh D'Monte
+
+# --- SDF Phase 2 (#98) megakernel-perf gates -------------------------------
+#
+# Phase 2 procedural SDFs (sdf_displace_noise / twist / bend / repeat /
+# repeat-limited) plus their Dual3 forward-mode autodiff path are guarded
+# inside SdfPrimitives.slang by PT_SDF_PROCEDURAL_OPS and PT_SDF_AUTODIFF.
+# Default is OFF for both: a perf bisect on the default scene found a
+# ~6 ms/frame regression introduced by the Phase 2 block when its mere
+# presence got inlined into PathTrace's megakernel sphere-trace dispatch.
+#
+# Builds that need procedural SDFs flip PT_SDF_PROCEDURAL_OPS to ON; if
+# they also want the cheaper forward-AD normal path, flip
+# PT_SDF_AUTODIFF on top of that. Flags are CACHE variables so they
+# show up in cmake-gui / ccmake and survive across configures. Both
+# rhi_metal and rhi_vulkan pick them up by way of pt_compile_slang
+# auto-appending them to every Slang invocation -- the module compile
+# and the entry-point compile share the same preprocessor state, which
+# Slang's IR linker depends on.
+option(PT_SDF_PROCEDURAL_OPS
+    "Compile Phase 2 procedural SDF ops + walkers into SdfPrimitives.slang. \
+Default OFF -- presence alone costs ~6 ms/frame on the default scene because \
+Slang's megakernel inlines every branch."
+    OFF)
+option(PT_SDF_AUTODIFF
+    "Compile Dual3 forward-mode autodiff normal path into SdfPrimitives.slang. \
+Default OFF. Requires PT_SDF_PROCEDURAL_OPS=ON to do anything; otherwise the \
+gate inside SdfPrimitives.slang demotes this to OFF automatically."
+    OFF)
+
+# Build the slangc -D... fragment from the cache options. Both pt_compile_slang
+# and pt_compile_slang_module append this to every invocation so module +
+# entry-point preprocessor state stays consistent (Slang's IR linker requires
+# this). Phase 1 analytic CSG is always available; these only toggle the
+# Phase 2 procedural + Dual3 blocks inside SdfPrimitives.slang.
+function(_pt_sdf_defines outVar)
+    set(_d "")
+    if(PT_SDF_PROCEDURAL_OPS)
+        list(APPEND _d "-DPT_SDF_PROCEDURAL_OPS=1")
+    endif()
+    if(PT_SDF_AUTODIFF)
+        list(APPEND _d "-DPT_SDF_AUTODIFF=1")
+    endif()
+    set(${outVar} "${_d}" PARENT_SCOPE)
+endfunction()
+
 # pt_compile_slang_module(SOURCE <file.slang>)
 #
 #   Compiles a Slang source file to a target-agnostic IR module
@@ -45,7 +90,7 @@
 # the source -> library compile at runtime via newLibrary().
 
 function(pt_compile_slang_module)
-    cmake_parse_arguments(M "" "SOURCE" "" ${ARGN})
+    cmake_parse_arguments(M "" "SOURCE" "EXTRA_DEFINES" ${ARGN})
     if(NOT M_SOURCE)
         message(FATAL_ERROR "pt_compile_slang_module needs SOURCE")
     endif()
@@ -54,12 +99,22 @@ function(pt_compile_slang_module)
     set(out_dir "${CMAKE_BINARY_DIR}/shaders")
     file(MAKE_DIRECTORY "${out_dir}")
     set(out "${out_dir}/${name}.slang-module")
+    # EXTRA_DEFINES bakes module-level preprocessor state into the IR
+    # blob. Entry-point shaders that import this module MUST be compiled
+    # with the same defines (their EXTRA_DEFINES list should mirror the
+    # module's), otherwise Slang's IR linker sees disagreeing symbol
+    # tables. The SDF Phase 2 (#98) PT_SDF_PROCEDURAL_OPS / PT_SDF_AUTODIFF
+    # cache options are auto-appended so both rhi_metal + rhi_vulkan
+    # module compiles stay in sync without per-backend CMakeLists edits.
+    _pt_sdf_defines(_sdf_defs)
     if(NOT TARGET slang_module_${name})
         add_custom_command(
             OUTPUT  "${out}"
             COMMAND ${PT_SLANGC_BIN}
                     "${full}"
                     -emit-ir
+                    ${_sdf_defs}
+                    ${M_EXTRA_DEFINES}
                     -Wno-40100
                     -o       "${out}"
             DEPENDS "${full}" "${PT_SLANGC_BIN}"
@@ -136,6 +191,11 @@ function(pt_compile_slang)
         # been renamed to 'main_0'" notice -- it's a side effect of
         # Slang's mangling rules and not something we can avoid in
         # the source.
+        # The SDF Phase 2 cache-option defines are auto-appended so
+        # entry-point compiles stay consistent with the SdfPrimitives
+        # module compile (Slang's IR linker requires matching macro
+        # state across module + entry point).
+        _pt_sdf_defines(_sdf_defs)
         add_custom_command(
             OUTPUT  "${out}"
             COMMAND ${PT_SLANGC_BIN}
@@ -144,6 +204,7 @@ function(pt_compile_slang)
                     -entry   ${SLG_ENTRY}
                     -stage   ${SLG_STAGE}
                     ${slang_defs}
+                    ${_sdf_defs}
                     ${SLG_EXTRA_DEFINES}
                     -I       "${out_dir}"
                     -Wno-40100

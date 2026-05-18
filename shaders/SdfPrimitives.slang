@@ -27,6 +27,45 @@
 //     sdPlane formulas below match his canon).
 //   * Hart, "Sphere tracing: A geometric method for the antialiased
 //     ray tracing of implicit surfaces" (1996) -- the trace loop.
+//
+// ----- compile-time gates --------------------------------------------------
+// PT_SDF_PROCEDURAL_OPS  -- when defined to 1, Phase 2 (#98) procedural ops
+//                           (sdf_displace_noise / twist / bend / repeat /
+//                           repeat-limited) and their noise primitives +
+//                           warp + scalar walkers are compiled in. Default
+//                           OFF: a perf bisect on the default scene found
+//                           ~6 ms/frame regression from this block alone,
+//                           even when no scene cluster uses procedural ops
+//                           -- Slang's megakernel dispatch inlines every
+//                           branch into the sphere-trace inner loop.
+// PT_SDF_AUTODIFF        -- when defined to 1, the Dual3 forward-mode
+//                           autodiff machinery (struct + per-shape Dual3
+//                           SDFs + AD cluster walker + forward-AD normal)
+//                           is compiled in. Only meaningful when
+//                           PT_SDF_PROCEDURAL_OPS is also on (the AD path
+//                           is exclusively used to derive normals through
+//                           procedural ops). Default OFF: when this is OFF
+//                           and the user sets r_sdf_normal_mode=0, the
+//                           host falls back to central differences with a
+//                           [warn] line emitted at engine startup.
+//
+// Builds that need procedural SDFs should pass `-DPT_SDF_PROCEDURAL_OPS=1`
+// to slangc (CMakePresets / pt_compile_slang EXTRA_DEFINES). Builds that
+// also want the forward-AD normal path add `-DPT_SDF_AUTODIFF=1`. Phase 1
+// analytic CSG (sphere / box / torus / smin etc.) is always available.
+#ifndef PT_SDF_PROCEDURAL_OPS
+#define PT_SDF_PROCEDURAL_OPS 0
+#endif
+#ifndef PT_SDF_AUTODIFF
+#define PT_SDF_AUTODIFF 0
+#endif
+// PT_SDF_AUTODIFF without PT_SDF_PROCEDURAL_OPS makes no sense -- the AD
+// walker only ever runs on procedural clusters. Promote the gate so we
+// don't have to repeat the conjunction at every call site.
+#if PT_SDF_AUTODIFF && !PT_SDF_PROCEDURAL_OPS
+#undef PT_SDF_AUTODIFF
+#define PT_SDF_AUTODIFF 0
+#endif
 
 // Wire-format constants. MUST match SdfShape / SdfOp in
 // src/renderer/AnalyticBvh.h. Renumbering one without the other
@@ -455,6 +494,14 @@ float3 sdfClusterNormal(SdfCluster c, float3 p) {
 //
 // All distances and parameters in METRES (project mantra). Per-octave
 // frequencies are 1 / metres. No demo-scaled tricks anywhere.
+//
+// COMPILE GATE: the entire block below (noise primitives + warp helpers
+// + Dual3 autodiff machinery + procedural cluster walkers + central-diff
+// and forward-AD normals) is wrapped in PT_SDF_PROCEDURAL_OPS so default
+// builds compile it out. Perf bisect on the default scene attributed a
+// ~6 ms/frame regression to this entire block when its mere presence
+// got inlined into PathTrace's megakernel sphere-trace dispatch.
+#if PT_SDF_PROCEDURAL_OPS
 
 // Hash-based 3D value-noise field with first derivatives. Distinct
 // from the cloud-noise hash (PathTraceCloud.slang) so SDF clusters
@@ -606,6 +653,12 @@ float sdfWorley3(float3 p, out float3 out_grad) {
 
 // ----- forward-mode autodiff (Dual3) ---------------------------------------
 //
+// COMPILE GATE: Dual3 / forward-AD lives behind PT_SDF_AUTODIFF (nested
+// inside PT_SDF_PROCEDURAL_OPS). When AUTODIFF is OFF and the user sets
+// r_sdf_normal_mode to 0 (forward-AD), the engine logs a [warn] line at
+// startup and the trace falls back to central differences.
+#if PT_SDF_AUTODIFF
+//
 // Dual3 carries a scalar value `v` and a 3-vector gradient `d` of v
 // w.r.t. world-space position. Each Phase 1 leaf SDF returns a Dual3
 // directly via its closed-form gradient (no chain-rule plumbing
@@ -728,6 +781,8 @@ Dual3 evalLeafDistD(float3 p_local, uint shape, float4 params) {
     return r;
 }
 
+#endif // PT_SDF_AUTODIFF (Dual3 struct + leaf SDFs + evalLeafDistD)
+
 // ----- procedural op evaluation (scalar distance only) ---------------------
 //
 // These ops modify the *point* before evaluating the child. The
@@ -819,6 +874,10 @@ float sdfDisplaceNoiseBand(float3 p, float amp, float freq, uint octaves,
 // extended below to handle them in the same flat post-order walk.
 
 // ----- forward-mode AD cluster evaluator -----------------------------------
+//
+// COMPILE GATE: AD cluster walker + warped variant live behind
+// PT_SDF_AUTODIFF (second region, paired with the Dual3 leaves above).
+#if PT_SDF_AUTODIFF
 //
 // Walks the cluster's op-tree once and propagates Dual3 values up to
 // the root. Output: .v = signed distance to the surface (same as
@@ -1040,6 +1099,8 @@ Dual3 sdfClusterDistDWarped(SdfCluster c, float3 p) {
     return sdfClusterDistDN(c, c.node_count, p);
 }
 
+#endif // PT_SDF_AUTODIFF (AD cluster walker + warped variant)
+
 // Scalar distance walker that also handles SDF_OP_DISPLACE_NOISE.
 // Used by `sdfClusterDistWarped` (warp-aware outer wrapper below)
 // and by `sdfClusterTrace`'s inner step loop when the cluster has
@@ -1179,11 +1240,19 @@ float3 sdfClusterNormalCentral(SdfCluster c, float3 p, float h) {
 // Forward-mode AD normal. Cheapest reliable normal for clusters with
 // procedural ops -- one walk of the op-tree, gradient comes out in
 // the resulting Dual3.d. Caller normalizes.
+//
+// COMPILE GATE: PT_SDF_AUTODIFF (third nested region). When OFF the
+// trace falls back to sdfClusterNormalCentral for procedural clusters
+// regardless of the r_sdf_normal_mode cvar.
+#if PT_SDF_AUTODIFF
 float3 sdfClusterNormalForwardAD(SdfCluster c, float3 p) {
     Dual3 r = sdfClusterDistDWarped(c, p);
     float l = length(r.d);
     return l > 1e-12 ? r.d / l : float3(0, 1, 0);
 }
+#endif // PT_SDF_AUTODIFF (forward-AD normal)
+
+#endif // PT_SDF_PROCEDURAL_OPS (Phase 2 procedural ops + walkers + normals)
 
 // ----- tri-planar texture projection (#74 binding point) -------------------
 //
@@ -1275,6 +1344,7 @@ bool sdfClusterTrace(SdfCluster c, float3 ro, float3 rd,
     float  t_end   = min(ts.y, t_max);
     if (t >= t_end) return false;
 
+#if PT_SDF_PROCEDURAL_OPS
     // Phase 2: clusters containing procedural ops (noise displace,
     // twist, bend, repeat, repeat-limited) need the Phase 2 walker
     // for both distance (warp-aware) and normal (forward-AD or
@@ -1286,6 +1356,7 @@ bool sdfClusterTrace(SdfCluster c, float3 ro, float3 rd,
     // both branch on this flag so non-procedural clusters never pay
     // the Phase 2 walker overhead.
     bool procedural = sdfClusterHasProcedural(c);
+#endif
 
     // Step bound: cap max_iters at SDF_MAX_TRACE_ITERS to keep an upper
     // bound on the shader's worst-case work. 256 is a generous Phase 1
@@ -1306,14 +1377,23 @@ bool sdfClusterTrace(SdfCluster c, float3 ro, float3 rd,
     // of the surface to begin with.
     uint iters = min(max_iters, 256u);
     for (uint i = 0u; i < iters; ++i) {
-        float3 p     = ro + rd * t;
+        float3 p = ro + rd * t;
+        float  d;
+#if PT_SDF_PROCEDURAL_OPS
         // Procedural cluster -> warp-aware walker so displace-noise /
         // twist / bend / repeat all contribute to the distance. The
         // Phase 1 path stays the cheap analytic walker for legacy
         // (non-procedural) clusters.
-        float  d     = procedural ? sdfClusterDistWarped(c, p)
-                                   : sdfClusterDist(c, p);
-        float  abs_d = abs(d);
+        d = procedural ? sdfClusterDistWarped(c, p) : sdfClusterDist(c, p);
+#else
+        // Procedural ops compiled out: the only walker available is
+        // the analytic-CSG one. A cluster uploaded with a Phase 2 op
+        // id falls into sdfClusterDist's `else { d = 1e30; }` branch
+        // and the trace silently skips it -- correct behaviour for
+        // a build that opted out of procedural support.
+        d = sdfClusterDist(c, p);
+#endif
+        float abs_d = abs(d);
         if (abs_d < epsilon) {
             out_t = t;
             // Normal source:
@@ -1327,15 +1407,31 @@ bool sdfClusterTrace(SdfCluster c, float3 ro, float3 rd,
             //      currently routes "non-procedural" to the same
             //      path -- the constant exists so per-cluster
             //      override stays cheap to wire on later.)
+#if PT_SDF_PROCEDURAL_OPS
             if (procedural) {
+#  if PT_SDF_AUTODIFF
                 if (normal_mode == SDF_NORMAL_CENTRAL) {
                     out_normal = sdfClusterNormalCentral(c, p, epsilon);
                 } else {
                     out_normal = sdfClusterNormalForwardAD(c, p);
                 }
+#  else
+                // AD path compiled out -> always central differences.
+                // The engine emits a [warn] at startup if
+                // r_sdf_normal_mode is 0 (forward-AD) but this build
+                // doesn't include the AD walker; the cvar continues
+                // to read 0 but the trace silently uses central diff
+                // here so a procedural scene still renders.
+                out_normal = sdfClusterNormalCentral(c, p, epsilon);
+#  endif
             } else {
                 out_normal = normalize(sdfClusterNormal(c, p));
             }
+#else
+            // Procedural ops compiled out: Phase 1 analytic normal
+            // is the only path. normal_mode is unused in this build.
+            out_normal = normalize(sdfClusterNormal(c, p));
+#endif
             return true;
         }
         // Always advance by a strictly-positive step. Floor at epsilon

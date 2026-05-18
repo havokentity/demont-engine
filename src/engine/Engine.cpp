@@ -9834,6 +9834,40 @@ void Engine::RegisterCommands() {
     if (auto* v = C.FindCVar("r_sdf_normal_mode")) {
         v->allowed_values = {"0", "1"};
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+        // Megakernel-perf gate (issue #98 follow-up): emit a [warn] at
+        // startup if the user wants forward-AD normals (r_sdf_normal_mode
+        // == 0) but the build doesn't ship the Dual3 autodiff path
+        // (PT_SDF_AUTODIFF gate OFF in cmake/Slang.cmake). The shader
+        // silently falls back to central differences in that case --
+        // visually similar on the procedural-light defaults but worth
+        // flagging so the user knows to rebuild with
+        // -DPT_SDF_AUTODIFF=ON if they care about the normal-field
+        // continuity that forward-AD provides.
+#if !PT_SDF_AUTODIFF
+        if (v->GetInt() == 0) {
+            LOG_WARN("[sdf] r_sdf_normal_mode=0 (forward-AD) requested but "
+                     "this build was compiled with PT_SDF_AUTODIFF=OFF; "
+                     "shader falls back to 6-tap central differences. "
+                     "Rebuild with -DPT_SDF_AUTODIFF=ON and "
+                     "-DPT_SDF_PROCEDURAL_OPS=ON to restore the forward-AD "
+                     "path. (Procedural-op presence alone costs ~6 ms/"
+                     "frame on the default scene; the gate is OFF by "
+                     "default.)");
+        }
+#endif
+#if !PT_SDF_PROCEDURAL_OPS
+        // Single-shot info hint: the host's sdf_displace_noise /
+        // sdf_twist / etc. console commands stay registered (they're
+        // valuable for tests + host-side wire-format parsing) but
+        // any cluster queued via those falls into sdfClusterDist's
+        // 1e30 sentinel branch on the shader side and disappears.
+        // Surface that up so a user who unwraps the gate at runtime
+        // (vs. the build flag) gets a clear breadcrumb.
+        LOG_INFO("[sdf] PT_SDF_PROCEDURAL_OPS=OFF: procedural-op SDF "
+                 "clusters (sdf_displace_noise / twist / bend / repeat / "
+                 "repeat-limited) are skipped by the sphere-trace. "
+                 "Rebuild with -DPT_SDF_PROCEDURAL_OPS=ON to enable.");
+#endif
     }
     // r_sdf_displace_octaves changes the number of FBM octaves applied
     // by sdf_displace_noise -- the displaced surface shifts as soon as
