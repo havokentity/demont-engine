@@ -132,7 +132,7 @@ constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     17, // engine slot 9  -> shader binding 17 (albedo_tex, OptiX AOV only)
     22, // engine slot 10 -> shader binding 22 (cloud_trans_tex, #46 follow-up)
 };
-constexpr std::uint32_t kSlotToBufBinding[11] = {
+constexpr std::uint32_t kSlotToBufBinding[12] = {
     0,  // engine slot 0 unused
     3,  // engine slot 1 -> shader binding 3  (mesh_positions)
     4,  // engine slot 2 -> shader binding 4  (mesh_indices)
@@ -149,6 +149,10 @@ constexpr std::uint32_t kSlotToBufBinding[11] = {
     // SDF Phase 1 (#97): SDF cluster buffer. Moved here from engine
     // slot 8 / binding 19 to make room for tri_bvh_*.
     21, // engine slot 10 -> shader binding 21 (SDF cluster buffer)
+    // SIGMA shadow visibility buffer (issue #115). R32F per pixel
+    // storage buffer (not a texture -- escapes the 8-RW-texture cap
+    // on Metal that PathTrace was already saturating).
+    23, // engine slot 11 -> shader binding 23 (shadow_vis_buf)
 };
 // Scene TLAS lives at engine accel-slot 2 -> shader binding 2.
 
@@ -943,11 +947,12 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     if (rt_supported_) {
         psizes.push_back({ VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, kTotalSets * 1 + 1 });
     }
-    // 10 storage-buffer bindings per dispatch: mesh_positions, mesh_indices,
+    // 11 storage-buffer bindings per dispatch: mesh_positions, mesh_indices,
     // primitives, marginal_cdf, conditional_cdf, exposure_state, analytic
     // bvh_nodes (binding 18), tri_bvh_nodes (binding 19),
-    // tri_bvh_permuted_ids (binding 20), sdf_clusters (binding 21).
-    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 10 + 4 });
+    // tri_bvh_permuted_ids (binding 20), sdf_clusters (binding 21),
+    // shadow_vis_buf (binding 23, issue #115).
+    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 11 + 4 });
     psizes.push_back({ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,          kTotalSets * 1 + 1 });
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -1042,6 +1047,16 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // Allocated host-side when denoiser_active_; PARTIALLY_BOUND
         // covers the host-side gate's "no denoiser, no binding" case.
         add_binding(22, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        // Binding 23: shadow_vis_buf. R32F per-pixel sun-NEE visibility
+        // storage buffer written by PathTrace's primary-hit pass and
+        // bilateral-filtered by SigmaShadow.slang (issue #115). Storage
+        // BUFFER (not image) because Apple Silicon's 8-RW-texture cap
+        // on PathTrace is already saturated. Allocated host-side when
+        // denoiser_active_ AND r_shadow_demod is on; the engine binds
+        // the placeholder storage buffer at this slot otherwise to keep
+        // the descriptor set complete (the shader's write_shadow_vis
+        // push gate is the runtime "actually touch this buffer" switch).
+        add_binding(23, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
 
         // UPDATE_AFTER_BIND for every binding so we can rewrite the
         // shared descriptor set between dispatches in the same cmd

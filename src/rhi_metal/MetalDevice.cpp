@@ -38,6 +38,9 @@ extern const unsigned char shader_StarsComposite_metal_data[];
 extern const unsigned long shader_StarsComposite_metal_size;
 extern const unsigned char shader_AuroraComposite_metal_data[];
 extern const unsigned long shader_AuroraComposite_metal_size;
+// SIGMA shadow denoiser kernel (issue #115).
+extern const unsigned char shader_SigmaShadow_metal_data[];
+extern const unsigned long shader_SigmaShadow_metal_size;
 }
 
 // MetalFXDenoiser.mm: ObjC++ shim around MTLFXTemporalDenoisedScaler.
@@ -328,6 +331,9 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
     build_pso("aurora_composite",
               shader_AuroraComposite_metal_data,
               shader_AuroraComposite_metal_size);
+    build_pso("sigma_shadow",
+              shader_SigmaShadow_metal_data,
+              shader_SigmaShadow_metal_size);
 
     cmd_ = std::make_unique<MetalCommandBuffer>(this);
 }

@@ -90,7 +90,7 @@ private:
     //      count are silently dropped; on Vulkan the slot table in
     //      VulkanDevice.cpp maps them to vk::binding numbers.
     TextureHandle              bound_tex_[11] {};
-    // 11 buffer slots. Slots 0..7 are the original engine layout
+    // 12 buffer slots. Slots 0..7 are the original engine layout
     // (mesh_positions / mesh_indices, primitives, marginal /
     // conditional CDFs, exposure_state, analytic-prim bvh_nodes).
     // Slots 8/9 were added in the PR #106 follow-up for the triangle
@@ -99,10 +99,15 @@ private:
     // Slot 10 was added by SDF Phase 1 (#97) for the SDF cluster
     // storage buffer (MSL slot 10 in the path tracer's dynamic
     // buffer-slot layout; moved from slot 8 to make room for the
-    // triangle BVH). Keep in sync with the engine's BindBuffer(10,...)
-    // call site.
-    BufferHandle               bound_buf_[11] {};
-    std::size_t                bound_buf_off_[11] {};
+    // triangle BVH). Slot 11 was added by issue #115 for the SIGMA
+    // shadow visibility buffer (R32F per pixel) -- declared as a
+    // storage buffer rather than an RWTexture2D because PathTrace
+    // already sits exactly at Apple Silicon's 8-RW-texture compute
+    // cap; storage buffers escape that quota the same way SVGF's
+    // variance / moments buffers do. Keep in sync with the engine's
+    // BindBuffer(11,...) call site.
+    BufferHandle               bound_buf_[12] {};
+    std::size_t                bound_buf_off_[12] {};
     AccelStructHandle          bound_accel_[4] {};
 
     // Push-constant buffer. Sized to fit the unified PathTrace push

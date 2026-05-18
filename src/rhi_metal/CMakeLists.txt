@@ -105,6 +105,19 @@ pt_compile_slang(
     ENTRY   main
     TARGETS metal
 )
+# SIGMA-style sun-shadow denoiser (issue #115). Runs once per frame
+# between Denoise() and StarsComposite. Reads the noisy per-pixel
+# sun-visibility buffer PathTrace writes, bilateral-filters it with a
+# depth+normal kernel, and multiplies the denoised visibility into the
+# post-radiance-denoise HDR so SVGF/MetalFX-smudged sun-shadow edges
+# get sharp boundaries re-imposed.
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/SigmaShadow.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+)
 # SVGF denoiser (svgf_basic / svgf_atrous on r_denoiser). Same Slang
 # sources the Vulkan backend uses; slangc cross-compiles them to MSL.
 # DenoiseFinalize is NOT built on Metal -- the existing Tonemap pipeline

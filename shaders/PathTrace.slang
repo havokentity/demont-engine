@@ -228,6 +228,44 @@ Texture2D<float4> moon_map;
 [[vk::binding(21, 0)]] StructuredBuffer<float4> sdf_clusters;
 // --- end SDF Phase 1 -------------------------------------------------------
 
+// Sun-NEE shadow-ray visibility G-buffer (issue #115). One float per
+// pixel, row-major (index = y*width + x). 1.0 = primary hit was fully
+// lit by the sun; 0.0 = fully in shadow; partial values from the spp
+// average. Sky pixels (no primary hit) write 1.0 so the downstream
+// SigmaShadow kernel never darkens the sky composite.
+//
+// Storage buffer (NOT texture) is deliberate. Metal's compute pipeline
+// caps RWTexture2D bindings at 8 read_write textures per kernel.
+// PathTrace already sits exactly at that limit: output, accum_hdr,
+// denoise_color, depth_tex, motion_tex, normal_tex, albedo_tex,
+// cloud_trans_tex. A ninth RW texture would fail pipeline
+// compilation on Apple Silicon. Storage buffers (RWStructuredBuffer)
+// don't count toward that quota -- same workaround DenoiseAtrous.slang
+// uses for its variance + moments buffers. Indexing is row-major
+// `y*width + x` so the downstream SigmaShadow kernel can read
+// neighbours via the same arithmetic.
+//
+// IMPORTANT: declared AFTER sdf_clusters so existing Metal slots
+// 0..10 stay undisturbed. Slang's MSL backend assigns Metal buffer
+// slots in DECLARATION order (AS first, then storage buffers); the
+// vk::binding(N) is the Vulkan-only descriptor index. Inserting this
+// buffer anywhere earlier in the file would shift exposure_state /
+// bvh_nodes / tri_bvh_* / sdf_clusters up by one MSL slot and break
+// every engine BindBuffer call past the insertion point (the
+// drilled-down lesson behind the comment above sdf_clusters about
+// declaration order being load-bearing). Lands on Metal slot 11,
+// matching the engine's BindBuffer(11, ...) call site.
+//
+// Allocated alongside the other denoiser textures whenever
+// denoiser_active_ AND r_shadow_demod != 0. The runtime
+// `write_shadow_vis` push flag is the actual run-or-skip switch; when
+// 0 the write site below elides (saves a 4-byte write per pixel per
+// frame on the legacy-shadow path). PathTrace declares the binding
+// unconditionally so Slang's MSL backend doesn't dead-code-eliminate
+// the slot and shift subsequent buffer indices -- same lesson the
+// albedo_tex declaration captures upstream.
+[[vk::binding(23, 0)]] RWStructuredBuffer<float> shadow_vis_buf;
+
 struct BvhNode {
     float3 aabb_min;
     uint   left_first;
@@ -496,8 +534,18 @@ cbuffer Push {
     // contribute to indirect illumination of the scene.
     uint composite_celestials;
     uint _pad_celestials0;
-    uint _pad_celestials1;
-    uint _pad_celestials2;
+    // SIGMA shadow demod gate (issue #115). 1 -> write per-primary-hit
+    // sun-NEE shadow-ray transmittance into `shadow_vis_buf` at the
+    // end of main(); the engine's SigmaShadow kernel will denoise that
+    // buffer with a 5x5 bilateral and multiply the denoised visibility
+    // into the post-radiance-denoise HDR. 0 -> skip the write
+    // entirely (legacy fold-into-radiance behaviour; SVGF / MetalFX
+    // get to smudge sun shadows). The engine sets this from
+    // r_shadow_demod && denoiser_active_ && shadow_vis_buf allocated.
+    // Reuses the trailing pad slot the celestials gate left at the end
+    // of the cbuffer; layout-equivalent.
+    uint write_shadow_vis;
+    uint _pad_shadow_vis;
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -550,8 +598,9 @@ cbuffer Frame {
     // See `composite_celestials` in the Metal Push cbuffer above.
     uint composite_celestials;
     uint _pad_celestials0;
-    uint _pad_celestials1;
-    uint _pad_celestials2;
+    // See `write_shadow_vis` in the Metal Push cbuffer above (issue #115).
+    uint write_shadow_vis;
+    uint _pad_shadow_vis;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -1977,6 +2026,22 @@ void main(uint2 tid : SV_DispatchThreadID) {
     // between samples is well below cloud feature size, so any single
     // sample is a faithful proxy for the unjittered camera ray.
     float frame_cloud_trans = 1.0;
+    // Sun-NEE shadow-ray visibility accumulator (issue #115). Sums the
+    // primary-hit shadow-ray transmittance toward the sun across all
+    // spp samples; divided by sample_count at the end of main() to give
+    // a per-pixel [0,1] visibility for the SigmaShadow denoiser to
+    // bilateral-filter. Per-sample contributions: 1.0 for samples whose
+    // primary ray misses geometry (sky pixels never need shadow
+    // demodulation -- they have no direct-light shadow to denoise),
+    // and the scalar luminance of the sun-NEE shadow-ray transmittance
+    // for samples that hit a surface. Initialized to 0.0; sky pixels
+    // accumulate sample_count*1.0 = sample_count, then divide back to
+    // 1.0 below. Non-Lambert primary hits (metal, dielectric) and the
+    // night-side case (sun below horizon) also contribute 1.0 to avoid
+    // false-shadowing materials that aren't subject to direct-light
+    // shadowing the same way Lambert is (specular reflectance handles
+    // its own occlusion via the bounce ray, not a Lambert-style NEE).
+    float frame_shadow_vis = 0.0;
     for (uint s = 0u; s < sample_count; ++s) {
         // When MetalFX is on, all pixels of the frame share the same
         // sub-pixel offset (Halton sequence picked on host) so the
@@ -2086,6 +2151,66 @@ void main(uint2 tid : SV_DispatchThreadID) {
             primary_t = h.hit ? h.t : primary_t;
             primary_hit = h.hit;
             primary_t_recorded = true;
+            // Sun-NEE shadow visibility (issue #115). One dedicated
+            // shadow ray per spp sample from the primary hit toward the
+            // jittered sun-disc direction. This is INDEPENDENT of the
+            // Lambert NEE branch's shadow ray below -- we want a clean
+            // visibility signal at the primary surface regardless of
+            // material so the SigmaShadow denoiser can produce sharp
+            // sun shadows on metal and dielectric surfaces too (which
+            // a Lambert-only NEE-tap wouldn't capture). Cost is one
+            // extra `transmittance()` call per primary hit, BUT only
+            // when r_shadow_demod is on -- gating on write_shadow_vis
+            // keeps the legacy (denoiser-off or demod-off) path
+            // bitwise-identical to pre-#115 by not touching `seed` or
+            // executing any extra GPU work.
+            //
+            // Contribution rules:
+            //   - sky pixel (no primary hit): 1.0 (no occlusion to denoise)
+            //   - sun below horizon: 1.0 (no shadow possible)
+            //   - surface hit + sun up: scalar luminance of the
+            //     transmittance vector (RGB tint from glass etc.
+            //     reduces to a single visibility scalar -- the demod
+            //     compose is a per-channel-equal multiply by design,
+            //     full chromatic shadows are a follow-up).
+            //
+            // Origin is offset by the normal-aligned bias `nf * 1e-3`
+            // to dodge self-intersection (same constant the NEE branch
+            // below uses). For the b==0 hit we don't yet have the
+            // "flipped" normal nf, so recompute it inline.
+            if (write_shadow_vis != 0u) {
+                if (h.hit) {
+                    float3 sun_dir = sun_and_mode.xyz;
+                    if (sun_dir.y > 0.0) {
+                        float3 hp = ro + rd * h.t;
+                        float ndi_0 = dot(h.normal, rd);
+                        float3 nf_0 = (ndi_0 < 0.0) ? h.normal : -h.normal;
+                        // sampleSunDisc jitters within the sun's
+                        // angular footprint so the visibility
+                        // integrates to a soft penumbra when the
+                        // surface is near the sun's edge shadow.
+                        // Matches what the NEE branch later does so
+                        // both signals converge to the same noiseless
+                        // mean.
+                        float3 sun_jit = sampleSunDisc(sun_dir, seed);
+                        float3 t_vis = transmittance(hp + nf_0 * 1e-3,
+                                                     sun_jit, 1e30);
+                        // Rec.709 luminance flattens RGB transmittance
+                        // to one scalar. For pure shadow (no glass
+                        // between hit and sun), R==G==B so the choice
+                        // of weight doesn't matter; the weighting only
+                        // kicks in with chromatic dielectrics on the
+                        // shadow ray.
+                        float vis_s = dot(t_vis,
+                                          float3(0.2126, 0.7152, 0.0722));
+                        frame_shadow_vis += saturate(vis_s);
+                    } else {
+                        frame_shadow_vis += 1.0;   // sun below horizon
+                    }
+                } else {
+                    frame_shadow_vis += 1.0;       // sky pixel
+                }
+            }
         }
         if (!h.hit) {
             if (mis_enabled != 0u && prev_was_lambert_nee) {
@@ -2919,6 +3044,31 @@ void main(uint2 tid : SV_DispatchThreadID) {
     // cloud march on sample 0 when the layer is active.
     if (denoiser_enabled != 0u) {
         cloud_trans_tex[tid] = frame_cloud_trans;
+    }
+    // Sun-NEE shadow-visibility G-buffer (issue #115). Same gating
+    // shape as cloud_trans_tex above: write_shadow_vis is set by the
+    // engine when r_shadow_demod is on AND a denoiser is active AND
+    // the shadow_vis_buf is actually allocated. Off in the legacy-
+    // shadow path (r_shadow_demod 0) so PathTrace doesn't pay for an
+    // extra storage-buffer write per pixel when the SigmaShadow chain
+    // is disabled. frame_shadow_vis is the sum over spp samples (each
+    // sample contributes its primary-hit shadow-ray transmittance,
+    // with sky pixels + sun-below-horizon samples contributing 1.0).
+    // Average back to [0, 1] before writing so the downstream
+    // SigmaShadow kernel reads a true visibility, not a count.
+    if (write_shadow_vis != 0u) {
+        float vis_mean = frame_shadow_vis / float(sample_count);
+        // Sanitize like the radiance path does. The transmittance call
+        // is clamped saturate() per-sample above, but the average
+        // could touch NaN if a sample slipped through (e.g. a future
+        // transmittance variant returning Inf on a degenerate ray) --
+        // snap to 1.0 so the worst case is "this pixel doesn't get
+        // shadow-demodulated", not "this pixel goes black after
+        // composite multiplies by NaN".
+        if (isnan(vis_mean) || isinf(vis_mean)) vis_mean = 1.0;
+        vis_mean = saturate(vis_mean);
+        uint idx = tid.y * dim.x + tid.x;
+        shadow_vis_buf[idx] = vis_mean;
     }
 
     // Swapchain write. Apply the OETF on the SPIR-V path so the OS's
