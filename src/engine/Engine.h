@@ -347,6 +347,15 @@ private:
     // for future on-demand pipelines. Idempotent and cheap.
     void PrewarmPipelines();
 
+    // Favourites persistence. LoadFavoritesFromDisk reads
+    // `favorites.cfg` (one line per favourite, `#` comments and blank
+    // lines ignored) into Console::favorites_. SaveFavoritesToDisk
+    // writes the current Console::Favorites() vector back to the same
+    // file. Path is resolved relative to CWD, same as demont.cfg.
+    // Both are no-ops if Console::Favorites() is unavailable.
+    void LoadFavoritesFromDisk();
+    void SaveFavoritesToDisk();
+
     // Replace the current mesh-path resources (vertex/index buffers,
     // BLAS, TLAS) with one built from `baked`. Called from EnsureMesh*
     // on the main thread once a worker bake has completed.

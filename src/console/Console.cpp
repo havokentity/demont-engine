@@ -394,6 +394,38 @@ ExecuteResult Console::Execute(std::string_view line) {
 
     auto name = tokens[0];
 
+    // Favourites magic-invocation: `f1`, `f2`, ... `fN` execute the
+    // saved line at that 1-based index. Resolves BEFORE smart-resolve
+    // so it wins decisively over any fuzzy match against cvars or
+    // commands. Falls through to "unknown" if the index is out of
+    // range. in_fav_dispatch_ guards against infinite recursion when
+    // a saved favourite happens to be `fN` itself.
+    if (!in_fav_dispatch_ && !favorites_.empty() &&
+        name.size() >= 2 && name[0] == 'f') {
+        bool all_digits = true;
+        std::size_t idx = 0;
+        for (std::size_t i = 1; i < name.size(); ++i) {
+            if (name[i] < '0' || name[i] > '9') { all_digits = false; break; }
+            idx = idx * 10 + std::size_t(name[i] - '0');
+        }
+        if (all_digits && idx >= 1 && idx <= favorites_.size()) {
+            const std::string saved = favorites_[idx - 1];
+            in_fav_dispatch_ = true;
+            ExecuteResult sub = Execute(saved);
+            in_fav_dispatch_ = false;
+            std::string log = fmt::format("[fav] f{} -> `{}`\n",
+                                           idx, saved);
+            if (!sub.output.empty()) {
+                if (sub.output.back() != '\n') sub.output.push_back('\n');
+                log += sub.output;
+                sub.output = std::move(log);
+            } else {
+                sub.output = std::move(log);
+            }
+            return sub;
+        }
+    }
+
     // Smart command resolution (issue #162). If the first token isn't
     // an exact match, run a prefix search across cvars + commands.
     // - Unique winner: rewrite `name` to the canonical and prepend an
@@ -475,12 +507,25 @@ ExecuteResult Console::Execute(std::string_view line) {
         // path below so error formatting matches PR #159 behaviour.
     }
 
+    // Track this line as "last executed" for the `fav` (no-args)
+    // shortcut, EXCEPT when the line is itself a fav-management
+    // command (otherwise `fav` would end up saving "fav" if you typed
+    // it twice). The comparison uses post-smart-resolve `name` so
+    // even shorthand like `fa` (resolves to `fav`) gets correctly
+    // skipped.
+    auto is_fav_mgmt = [](std::string_view n) {
+        return n == "fav" || n == "unfav" || n == "fav_clear" || n == "list_favs";
+    };
+
     // Try command first.
     if (auto* cmd = FindCommand(name); cmd != nullptr) {
         Output out;
         std::span<const std::string_view> args(tokens.data() + 1, tokens.size() - 1);
         cmd->callback(args, out);
         result.output = resolution_log + out.Buffer();
+        if (!is_fav_mgmt(name)) {
+            last_executed_line_ = std::string(line);
+        }
         return result;
     }
 
@@ -608,6 +653,12 @@ ExecuteResult Console::Execute(std::string_view line) {
         std::string old_value = v->value;
         v->value = std::move(new_value);
         if (v->on_change) v->on_change(*v);
+
+        // Track as last-executed line for fav-save (cvar mutations are
+        // the primary thing users want to save as favourites).
+        if (!is_fav_mgmt(name)) {
+            last_executed_line_ = std::string(line);
+        }
 
         // Cross-cvar dependency warning (issue #161). Evaluated AFTER
         // the value is committed -- the predicate inspects current
@@ -853,6 +904,30 @@ std::vector<Console::CvarChange> Console::Redo() {
     if (undo_stack_.size() > kMaxHistory) undo_stack_.pop_front();
     in_undo_redo_ = false;
     return changes;
+}
+
+void Console::AddFavorite(std::string line) {
+    // Trim leading/trailing whitespace defensively so the saved entry
+    // is the canonical command line. Empty post-trim entries are
+    // rejected (otherwise `fav` on an empty last_executed_line_ would
+    // pollute the list with blanks).
+    while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) {
+        line.erase(line.begin());
+    }
+    while (!line.empty() && (line.back()  == ' ' || line.back()  == '\t')) {
+        line.pop_back();
+    }
+    if (line.empty()) return;
+    favorites_.push_back(std::move(line));
+}
+
+void Console::RemoveFavorite(std::size_t one_based_index) {
+    if (one_based_index == 0 || one_based_index > favorites_.size()) return;
+    favorites_.erase(favorites_.begin() + (one_based_index - 1));
+}
+
+void Console::ClearFavorites() {
+    favorites_.clear();
 }
 
 void Console::QueueExecute(std::string line, Responder responder) {

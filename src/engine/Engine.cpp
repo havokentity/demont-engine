@@ -1205,10 +1205,16 @@ bool Engine::Init() {
         }
     }
     if (skip_cfg_load) {
-        LOG_INFO("engine: --no-cfg given -- skipping demont.cfg + autoexec.cfg load");
+        LOG_INFO("engine: --no-cfg given -- skipping demont.cfg + autoexec.cfg + favorites.cfg load");
     } else {
         exec_if_exists("demont.cfg");      // archived cvars from last quit
         exec_if_exists("autoexec.cfg");    // user-supplied startup script (overrides above)
+        // Favourites are a parallel persistence file -- NOT a console
+        // script. Loaded directly into Console::favorites_ via
+        // LoadFavoritesFromDisk so the f1..fN magic invocation works
+        // from the first line of any session. One favourite per line;
+        // blank lines + leading `#` are ignored.
+        LoadFavoritesFromDisk();
     }
 
     // Command-line cvar overrides land last so they beat both archived
@@ -3921,6 +3927,64 @@ void Engine::EnsurePipelineHandles() {
     // resolve cost is 1 atomic compare per frame until Vulkan grows a
     // real entry.
     resolve(particle_composite_pipeline_id_, "particle_composite");
+}
+
+void Engine::LoadFavoritesFromDisk() {
+    // favorites.cfg lives next to demont.cfg (CWD). One favourite per
+    // line; blank lines and lines starting with '#' are ignored. Read
+    // into Console::favorites_ directly -- this is NOT a console
+    // script (don't ExecuteScript it; the saved lines aren't meant to
+    // run at load time, only when the user types f<N>).
+    FILE* f = std::fopen("favorites.cfg", "rb");
+    if (f == nullptr) return;
+    std::vector<std::string> loaded;
+    char buf[4096];
+    std::string accum;
+    while (std::size_t n = std::fread(buf, 1, sizeof(buf), f)) {
+        accum.append(buf, n);
+    }
+    std::fclose(f);
+    std::size_t i = 0;
+    while (i < accum.size()) {
+        std::size_t end = i;
+        while (end < accum.size() && accum[end] != '\n') ++end;
+        std::string line = accum.substr(i, end - i);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        // Skip blank + comment lines.
+        std::size_t lead = 0;
+        while (lead < line.size() && (line[lead] == ' ' || line[lead] == '\t')) ++lead;
+        if (lead < line.size() && line[lead] != '#') {
+            loaded.push_back(std::move(line));
+        }
+        i = (end < accum.size()) ? end + 1 : end;
+    }
+    pt::console::Console::Get().SetFavorites(std::move(loaded));
+    LOG_INFO("favorites: loaded {} entry(ies) from favorites.cfg",
+             pt::console::Console::Get().FavoriteCount());
+}
+
+void Engine::SaveFavoritesToDisk() {
+    auto& C = pt::console::Console::Get();
+    const auto favs = C.Favorites();
+    // Even if empty, rewrite the file so a cleared list persists as
+    // empty (otherwise an old file would resurrect on next launch).
+    FILE* f = std::fopen("favorites.cfg", "wb");
+    if (f == nullptr) {
+        LOG_WARN("favorites: failed to open favorites.cfg for write");
+        return;
+    }
+    const std::string header =
+        "# demont console favourites. One command line per entry.\n"
+        "# Saved automatically by the `fav` / `unfav` / `fav_clear`\n"
+        "# commands. Lines starting with `#` and blank lines are\n"
+        "# ignored on load. Invocation: type `f1` for the first\n"
+        "# entry, `f2` for the second, etc.\n";
+    std::fwrite(header.data(), 1, header.size(), f);
+    for (const auto& line : favs) {
+        std::fwrite(line.data(), 1, line.size(), f);
+        std::fputc('\n', f);
+    }
+    std::fclose(f);
 }
 
 void Engine::PrewarmPipelines() {
@@ -8995,6 +9059,93 @@ void Engine::RegisterCommands() {
     C.RegisterCommand("defaults",
         "Reset every cvar to its default value. Short alias for cvar_reset_all -- handy before `exec scene.cfg`.",
         reset_all);
+
+    // ---- Favourites ----------------------------------------------------
+    // Persisted shortcut commands. `fav` with no args saves the last
+    // executed line; `fav <line>` saves an explicit line. Saved
+    // favourites can be invoked as `f1`, `f2`, ... `fN` -- Console's
+    // Execute() intercepts that pattern before smart-resolve. The
+    // favourites vector is persisted to favorites.cfg next to
+    // demont.cfg; loaded at Engine::Init, saved after every mutation.
+    auto save_favorites = [this]() { SaveFavoritesToDisk(); };
+
+    C.RegisterCommand("fav",
+        "fav [<command line>]: save a command as a favourite. With no args, saves the last executed line. "
+        "Saved favourites can be invoked as f1, f2, ... fN. Persists across sessions via favorites.cfg.",
+        [save_favorites](auto args, pt::console::Output& out) {
+            auto& Cn = pt::console::Console::Get();
+            std::string line;
+            if (args.empty()) {
+                line = Cn.LastExecutedLine();
+                if (line.empty()) {
+                    out.PrintLine("fav: no last-executed line to save -- run a command first, "
+                                  "or pass an explicit line: `fav r_clouds 1`");
+                    return;
+                }
+            } else {
+                // Re-join the args into a single line (the tokenizer
+                // already split + dequoted them).
+                for (std::size_t i = 0; i < args.size(); ++i) {
+                    if (i) line.push_back(' ');
+                    line.append(args[i]);
+                }
+            }
+            Cn.AddFavorite(line);
+            const std::size_t idx = Cn.FavoriteCount();
+            out.FormatLine("fav: saved as f{} -> `{}`", idx, line);
+            save_favorites();
+        });
+
+    C.RegisterCommand("list_favs",
+        "List all saved favourites with their f1, f2, ... indices.",
+        [](auto, pt::console::Output& out) {
+            auto& Cn = pt::console::Console::Get();
+            const auto favs = Cn.Favorites();
+            if (favs.empty()) {
+                out.PrintLine("(no favourites yet -- run a command then type `fav` to save it)");
+                return;
+            }
+            out.FormatLine("{} favourite(s):", favs.size());
+            for (std::size_t i = 0; i < favs.size(); ++i) {
+                out.FormatLine("  f{}  {}", i + 1, favs[i]);
+            }
+        });
+
+    C.RegisterCommand("unfav",
+        "unfav <N>: remove the favourite at 1-based index N. Subsequent f<K> indices shift down.",
+        [save_favorites](auto args, pt::console::Output& out) {
+            if (args.size() != 1) { out.PrintLine("usage: unfav <N>"); return; }
+            int n = 0;
+            const auto* first = args[0].data();
+            const auto* last  = args[0].data() + args[0].size();
+            const auto r = std::from_chars(first, last, n);
+            if (r.ec != std::errc{} || r.ptr != last || n < 1) {
+                out.FormatLine("unfav: '{}' is not a positive integer", std::string(args[0]));
+                return;
+            }
+            auto& Cn = pt::console::Console::Get();
+            const std::size_t before = Cn.FavoriteCount();
+            if (static_cast<std::size_t>(n) > before) {
+                out.FormatLine("unfav: no favourite at index {} (have {})", n, before);
+                return;
+            }
+            const std::string removed = Cn.Favorites()[std::size_t(n) - 1];
+            Cn.RemoveFavorite(std::size_t(n));
+            out.FormatLine("unfav: removed f{} (`{}`); {} favourite(s) remain",
+                           n, removed, Cn.FavoriteCount());
+            save_favorites();
+        });
+
+    C.RegisterCommand("fav_clear",
+        "Remove all favourites. Wipes favorites.cfg on next save.",
+        [save_favorites](auto, pt::console::Output& out) {
+            auto& Cn = pt::console::Console::Get();
+            const std::size_t before = Cn.FavoriteCount();
+            Cn.ClearFavorites();
+            out.FormatLine("fav_clear: removed {} favourite(s)", before);
+            save_favorites();
+        });
+    // ---- end Favourites -----------------------------------------------
 
     C.RegisterCommand("scene_save",
         "scene_save <path.toml>: write camera + analytic primitives to a TOML file. (CSG state isn't saved yet -- put csg_* commands in autoexec.cfg if you want it to persist.)",

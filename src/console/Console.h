@@ -245,6 +245,31 @@ public:
     std::size_t UndoDepth() const { return undo_stack_.size(); }
     std::size_t RedoDepth() const { return redo_stack_.size(); }
 
+    // Favourites: persisted shortcut commands. AddFavorite pushes the
+    // given line onto the favourites vector; ClearFavorites wipes them;
+    // RemoveFavorite(N) removes the 1-based index. Favorites() returns
+    // the current vector (snapshot copy for read-only iteration).
+    //
+    // Magic invocation: typing `f1`, `f2`, ... `fN` in Execute()
+    // executes the saved line at that 1-based index. The
+    // interpretation happens inside Execute() AFTER the comment-strip
+    // / tokenise pass but BEFORE smart-resolve, so a fN token wins
+    // over any fuzzy match. Out-of-range fN falls through to the
+    // standard unknown-cvar path. Doesn't infinite-recurse because the
+    // in_fav_dispatch_ guard short-circuits nested fN.
+    //
+    // LastExecutedLine() returns the last line that Execute() ran
+    // successfully (excluding favourites-modifying commands so `fav`
+    // never saves itself). The `fav` (no-args) console command pulls
+    // this to save the previous line.
+    void AddFavorite(std::string line);
+    void RemoveFavorite(std::size_t one_based_index);
+    void ClearFavorites();
+    std::vector<std::string> Favorites() const { return favorites_; }
+    std::size_t FavoriteCount() const { return favorites_.size(); }
+    const std::string& LastExecutedLine() const { return last_executed_line_; }
+    void SetFavorites(std::vector<std::string> favs) { favorites_ = std::move(favs); }
+
 private:
     Console() = default;
 
@@ -277,6 +302,18 @@ private:
     // running -- the dependency cvar may be set on a later line.
     // Toggled by the engine around the cfg-load ExecuteScript call.
     bool                      dep_warn_suppressed_ = false;
+
+    // Favourites: persisted shortcut commands. Vector index 0
+    // corresponds to user-facing `f1`. See public AddFavorite /
+    // ClearFavorites / RemoveFavorite for the semantics.
+    std::vector<std::string>  favorites_;
+    // Last line Execute() ran that wasn't itself a fav-management
+    // command. The `fav` (no-args) console command snapshots this
+    // when the user wants to save "the previous thing I just ran".
+    std::string               last_executed_line_;
+    // Guard: prevents a fN dispatch from recursing into itself if a
+    // saved favourite happens to be `f1` (which would loop forever).
+    bool                      in_fav_dispatch_ = false;
 };
 
 // Tokenize a single console line.  Quote-aware ("a b" stays one token).

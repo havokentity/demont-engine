@@ -452,3 +452,99 @@ TEST_CASE("cvar reset: ResetAllCVarsToDefaults restores every cvar in one shot")
     CHECK(cv_int->GetInt() == 42);                // pre-reset value
     CHECK(cv_str->value    == "world");           // pre-reset value
 }
+
+// --- Test 8: favourites ---------------------------------------------------
+// Console::favorites_ + AddFavorite + RemoveFavorite + ClearFavorites +
+// the f<N> magic-invocation path. Engine-side persistence (favorites.cfg)
+// is not exercised here -- that's tested implicitly by the engine's
+// LoadFavoritesFromDisk / SaveFavoritesToDisk on real runs.
+TEST_CASE("favourites: add / list / fN-invoke / remove / clear round-trip") {
+    auto& C = pt::console::Console::Get();
+    // Start from a known state. Other TEST_CASEs may have left
+    // favourites in the singleton.
+    C.ClearFavorites();
+    REQUIRE(C.FavoriteCount() == 0);
+
+    // Register a target cvar we can set + check side-effects against.
+    C.RegisterCVar("test_rt_fav_target", "0", "fav target", pt::console::CVAR_ARCHIVE);
+    auto* v = C.FindCVar("test_rt_fav_target");
+    REQUIRE(v != nullptr);
+
+    // 1) AddFavorite stores the line.
+    C.AddFavorite("test_rt_fav_target 7");
+    CHECK(C.FavoriteCount() == 1);
+    CHECK(C.Favorites()[0] == "test_rt_fav_target 7");
+
+    // 2) Typing `f1` executes the saved line. The Execute() intercept
+    //    runs BEFORE smart-resolve so it wins over any fuzzy match.
+    auto r = C.Execute("f1");
+    CHECK(r.ok);
+    CHECK(v->GetInt() == 7);
+    // Output should include the fav-dispatch log line.
+    CHECK(r.output.find("[fav] f1 ->") != std::string::npos);
+
+    // 3) Add a second favourite. Verify f1 and f2 dispatch independently.
+    C.AddFavorite("test_rt_fav_target 13");
+    CHECK(C.FavoriteCount() == 2);
+    C.Execute("test_rt_fav_target 0");  // reset
+    REQUIRE(v->GetInt() == 0);
+    auto r2 = C.Execute("f2");
+    CHECK(r2.ok);
+    CHECK(v->GetInt() == 13);
+    // f1 still works after f2.
+    C.Execute("f1");
+    CHECK(v->GetInt() == 7);
+
+    // 4) Out-of-range fN falls through to "unknown command or cvar"
+    //    (it's not in the favourites vector, so the magic-intercept
+    //    bypasses it and the standard error path fires).
+    auto r3 = C.Execute("f99");
+    CHECK_FALSE(r3.ok);
+    CHECK(r3.error.find("unknown") != std::string::npos);
+
+    // 5) RemoveFavorite shifts subsequent indices down.
+    C.RemoveFavorite(1);
+    CHECK(C.FavoriteCount() == 1);
+    CHECK(C.Favorites()[0] == "test_rt_fav_target 13");  // was f2 -> now f1
+    C.Execute("test_rt_fav_target 0");
+    C.Execute("f1");
+    CHECK(v->GetInt() == 13);
+
+    // 6) Whitespace-only or empty AddFavorite is a no-op.
+    C.AddFavorite("");
+    C.AddFavorite("   \t  ");
+    CHECK(C.FavoriteCount() == 1);
+
+    // 7) Trim leading/trailing whitespace on save.
+    C.AddFavorite("  test_rt_fav_target 42  ");
+    CHECK(C.Favorites().back() == "test_rt_fav_target 42");
+
+    // 8) ClearFavorites wipes everything.
+    C.ClearFavorites();
+    CHECK(C.FavoriteCount() == 0);
+    // After clear, f1 is unknown.
+    auto r4 = C.Execute("f1");
+    CHECK_FALSE(r4.ok);
+}
+
+// --- Test 9: favourites + recursion guard ---------------------------------
+// A pathological case: someone saves "f1" itself as a favourite. The
+// in_fav_dispatch_ guard prevents the dispatch from recursing forever.
+TEST_CASE("favourites: self-referential favourite (f1 saved as `f1`) doesn't loop") {
+    auto& C = pt::console::Console::Get();
+    C.ClearFavorites();
+    REQUIRE(C.FavoriteCount() == 0);
+    C.AddFavorite("f1");  // saved line IS "f1"
+    REQUIRE(C.FavoriteCount() == 1);
+
+    // Execute f1. The outer call sees first-token "f1", index in range,
+    // calls Execute("f1") with in_fav_dispatch_=true. The inner call
+    // skips the fav-magic branch (guard is set) and falls through to
+    // smart-resolve -> no match -> "unknown command or cvar: f1".
+    // Result: error, NO infinite recursion.
+    auto r = C.Execute("f1");
+    CHECK_FALSE(r.ok);  // inner Execute reports unknown
+    CHECK(r.error.find("unknown") != std::string::npos);
+
+    C.ClearFavorites();
+}
