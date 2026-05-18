@@ -1863,7 +1863,21 @@ void main(uint2 tid : SV_DispatchThreadID) {
             hit_world  = ro0 + rd0 * 1000.0;   // far point so sky still gets motion
             hit_normal = float3(0.0, 0.0, 0.0); // sentinel: sky / no surface
             hit_albedo = float3(0.0, 0.0, 0.0); // sky has no surface albedo
-            depth_view = 1000.0;
+            // Sky sentinel: a value impossibly large for real geometry so
+            // downstream consumers (StarsComposite's sky-pixel gate,
+            // SVGF's edge-stops) can unambiguously distinguish "ray
+            // missed" from "ray hit something very far away." The
+            // previous 1000.0 sentinel collided with real depths: a
+            // camera at altitude looking toward the horizon sees ground
+            // at hundreds of meters of camera-space Z (a grazing ray
+            // skims the ground for a long distance before hitting), and
+            // anything > 1000 m of legitimate geometry tripped the
+            // composite's gate. 1e10 (~10 billion m, beyond Pluto) is
+            // comfortably outside any plausible engine scene scale
+            // (1 unit = 1 metre) and small enough that downstream
+            // numeric ops (depth deltas, edge-stop exponentials) stay
+            // in safe float32 range.
+            depth_view = 1.0e10;
         }
 
         // Pixel-space motion via reprojection. We still need the

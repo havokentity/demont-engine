@@ -416,25 +416,30 @@ void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= dim.x || tid.y >= dim.y) return;
     if (composite_active == 0u) return;
 
-    // Sky-pixel gate. PathTrace.slang's G-buffer pass writes
-    // depth_view = 1000.0 for primary-miss pixels and the real
-    // camera-space Z (typically << 100 in metric units for any normal
-    // scene) for surface hits. Threshold at 500 m so we capture only
-    // sky pixels; anything closer is geometry and we leave it alone.
+    // Sky-pixel gate. PathTrace.slang's G-buffer pass writes a 1e10
+    // sentinel for primary-miss pixels and the real camera-space Z
+    // for surface hits. Threshold at 1e9 unambiguously separates the
+    // two: any plausible geometry depth in a metric-unit engine
+    // (camera height to mountain horizon ~100 km max) sits well below
+    // 1e9, while the 1e10 sky sentinel sits well above. The original
+    // threshold of 500 was wrong -- distant ground at grazing angle
+    // routinely exceeds 500 m of camera-space Z (a camera at altitude
+    // looking toward the horizon skims the ground for a long
+    // distance), so the composite would paint stars onto distant
+    // ground.
     //
     // 5x5 dilation of the geometry mask (2-pixel safety band).
     // PathTrace's G-buffer pass is UNJITTERED (uses uv0 not the
     // jittered uv) so on horizon-boundary pixels the depth value
     // reports whichever side of the edge the pixel CENTER lies on,
     // while the jittered radiance write can hit the opposite side.
-    // The 1-pixel cross dilation that shipped first still let a
-    // couple of stars sit on the horizon line. Widening to a 5x5
-    // box (any depth-min < 500 within 2 pixels gates this pixel out)
-    // gives a robust 2-pixel safety band on all edge orientations,
-    // including diagonal silhouettes. 25 depth_tex reads per pixel
-    // -- the texture cache catches the overlap with neighboring
-    // threads in the threadgroup so the true cost is closer to
-    // 1 miss per thread + cached hits.
+    // Taking the min depth across the 5x5 neighbourhood biases the
+    // gate toward "geometry" at edges -- if ANY of the 25 pixels is a
+    // real surface hit (depth < 1e9), the composite skips, pushing the
+    // star-eligible band 2 pixels inside the sky-side of every edge.
+    // 25 depth_tex reads per pixel; the texture cache catches the
+    // overlap with neighbouring threads in the threadgroup so the
+    // true cost is closer to 1 miss + cached hits per thread.
     int W = int(dim.x) - 1;
     int H = int(dim.y) - 1;
     int2 px = int2(tid.xy);
@@ -446,7 +451,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
             zmin = min(zmin, depth_tex[uint2(xx, yy)]);
         }
     }
-    if (zmin < 500.0) return;
+    if (zmin < 1.0e9) return;
 
     float aperture = dof_params.x;
     float focal_d  = dof_params.y;
