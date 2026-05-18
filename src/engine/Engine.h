@@ -20,6 +20,7 @@
 #include <vector>
 
 namespace pt::app      { class Window; class ConsoleOverlay; class PerfOverlay; }
+namespace pt::audio    { class AudioSystem; }
 namespace pt::jobs     { class JobSystem; }
 namespace pt::console  { class ConsoleServer; }
 namespace pt::rhi      { class Device; struct PipelineHandle; }
@@ -212,6 +213,13 @@ private:
     std::unique_ptr<pt::console::ConsoleServer> server_;
     std::unique_ptr<pt::rhi::Device>            device_;
     std::unique_ptr<pt::renderer::Camera>       camera_;
+    // Audio subsystem (issue #80 MVP -- miniaudio-backed 3D playback).
+    // Init() opens the default device + voice pool; Shutdown() releases
+    // both. Tick(camera_pos, camera_fwd) pushes a listener snapshot
+    // into the audio thread for distance attenuation + stereo panning.
+    // Ray-traced occlusion / reverb / HRTF (the issue's headline) are
+    // deferred to a follow-up that consumes the renderer's TLAS.
+    std::unique_ptr<pt::audio::AudioSystem>     audio_system_;
     std::unique_ptr<pt::csg::CsgScene>          csg_scene_;
     std::unique_ptr<pt::csg::BakedMesh>         pending_baked_;
     pt::jobs::JobSystem::Handle                 bake_handle_{};
