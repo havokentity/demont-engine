@@ -14,6 +14,7 @@
 #include "MetalSvgfDenoiser.h"
 #include "../core/Log.h"
 #include "../core/Memory/Memory.h"
+#include "../core/Tracy.h"
 
 #include <fmt/format.h>
 #include <cstring>
@@ -357,6 +358,7 @@ MetalDevice::~MetalDevice() {
 }
 
 void MetalDevice::Denoise(const DenoiseDesc& d) {
+    PT_ZONE_SCOPED_N("MetalDevice::Denoise");
     if (device_ == nullptr) return;
     if (cmd_ == nullptr || cmd_->RawCmdBuf() == nullptr) {
         // No active command buffer -- caller forgot to AcquireCommandBuffer
@@ -660,6 +662,7 @@ void MetalDevice::DestroyPipeline(PipelineHandle h) {
 
 AccelStructHandle MetalDevice::CreateBLAS(const BLASDesc& d) {
     if (device_ == nullptr || d.vertex_count == 0 || d.index_count == 0) return {0};
+    PT_ZONE_SCOPED_N("MetalDevice::CreateBLAS");
     pt::mem::TagScope scope(pt::MemTag::GpuBuffers);
     auto* pool = NS::AutoreleasePool::alloc()->init();
 
@@ -708,6 +711,7 @@ AccelStructHandle MetalDevice::CreateBLAS(const BLASDesc& d) {
 
 AccelStructHandle MetalDevice::CreateTLAS(const TLASDesc& d) {
     if (device_ == nullptr || d.instances.empty()) return {0};
+    PT_ZONE_SCOPED_N("MetalDevice::CreateTLAS");
     pt::mem::TagScope scope(pt::MemTag::GpuBuffers);
     auto* pool = NS::AutoreleasePool::alloc()->init();
 
@@ -849,6 +853,7 @@ CommandBuffer* MetalDevice::AcquireCommandBuffer() {
 }
 
 void MetalDevice::Submit(CommandBuffer* cb) {
+    PT_ZONE_SCOPED_N("MetalDevice::Submit");
     auto* mcb = static_cast<MetalCommandBuffer*>(cb);
     if (mcb == nullptr || mcb->RawCmdBuf() == nullptr) return;
     mcb->Reset(mcb->RawCmdBuf());  // ends encoder if open
