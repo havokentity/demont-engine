@@ -80,6 +80,84 @@ public float cloud_fbm(float3 p, int octaves) {
     return v;
 }
 
+// 3D curl noise (Bridson et al. 2007, "Curl-Noise for Procedural Fluid
+// Flow"). Curl of a 3D potential field psi(p) = (Px, Py, Pz):
+//     C(p) = ( dPz/dy - dPy/dz,
+//              dPx/dz - dPz/dx,
+//              dPy/dx - dPx/dy )
+// C is divergence-free by construction (div(curl) = 0), so when used
+// as a displacement on the density-sample position it preserves
+// volume on average -- the cloud doesn't grow or shrink globally,
+// it gets sheared into eddies. That's the right "turbulent fluid"
+// character for cumulus filaments and shear-streamer cirrus.
+//
+// Three decorrelated potentials are needed; we tap cloud_value_noise
+// at three large constant offsets so the components don't share a hash.
+// If all three sampled the same scalar field N(q), curl(N,N,N) would
+// reduce to pair-wise gradient differences of one noise (each component
+// = dN/dα - dN/dβ for some axes α,β), which is divergence-free but
+// collapses the displacement onto a locally 2D plane and produces
+// visible stripe artefacts along (1,1,1). Offsets are arbitrary but
+// must be far enough apart that the hash cells don't visibly correlate
+// -- 31.4, 217.7, 853.1 give independent-looking outputs.
+//
+// Derivatives are estimated via central differences with step `h`
+// (one-tenth of the noise period at the curl scale). Cheaper than
+// analytic gradients for value-noise and visually indistinguishable
+// at the scales we care about.
+public float3 cloud_curl_noise(float3 p, float scale) {
+    // scale = cycles/metre; convert to noise-space coordinate
+    float3 q = p * scale;
+    // Central-difference step. The smallest representable feature in
+    // value-noise is ~one cell (h=1 in noise space); 0.1 keeps the
+    // finite difference well inside the smoothed quintic interpolant
+    // where the noise is C2, avoiding stair-step artefacts from
+    // sampling across cell boundaries.
+    const float h = 0.1;
+    const float3 ox = float3(h, 0.0, 0.0);
+    const float3 oy = float3(0.0, h, 0.0);
+    const float3 oz = float3(0.0, 0.0, h);
+    // Three decorrelated potential components. Constant offsets keep
+    // each component's hash domain separate -- without these all three
+    // potentials would sample the same scalar field N(q), so the curl
+    // would degenerate to a trivial differential of one noise:
+    //   curl(N,N,N) = (dN/dy - dN/dz, dN/dz - dN/dx, dN/dx - dN/dy)
+    // -- still divergence-free, but every component is just a pair-wise
+    // gradient difference of the SAME field, so the displacement field
+    // collapses onto a 2D plane locally and produces stripe artefacts
+    // along the (1,1,1) axis instead of true 3D turbulence. The offsets
+    // break that aliasing so each potential has its own independent
+    // hash domain (Bridson 2007, sec. 3).
+    const float3 offX = float3( 31.4, 217.7, 853.1);
+    const float3 offY = float3(853.1,  31.4, 217.7);
+    const float3 offZ = float3(217.7, 853.1,  31.4);
+    // dPx/d{y,z}
+    float Px_yp = cloud_value_noise(q + offX + oy);
+    float Px_yn = cloud_value_noise(q + offX - oy);
+    float Px_zp = cloud_value_noise(q + offX + oz);
+    float Px_zn = cloud_value_noise(q + offX - oz);
+    // dPy/d{x,z}
+    float Py_xp = cloud_value_noise(q + offY + ox);
+    float Py_xn = cloud_value_noise(q + offY - ox);
+    float Py_zp = cloud_value_noise(q + offY + oz);
+    float Py_zn = cloud_value_noise(q + offY - oz);
+    // dPz/d{x,y}
+    float Pz_xp = cloud_value_noise(q + offZ + ox);
+    float Pz_xn = cloud_value_noise(q + offZ - ox);
+    float Pz_yp = cloud_value_noise(q + offZ + oy);
+    float Pz_yn = cloud_value_noise(q + offZ - oy);
+    float inv2h = 1.0 / (2.0 * h);
+    float dPz_dy = (Pz_yp - Pz_yn) * inv2h;
+    float dPy_dz = (Py_zp - Py_zn) * inv2h;
+    float dPx_dz = (Px_zp - Px_zn) * inv2h;
+    float dPz_dx = (Pz_xp - Pz_xn) * inv2h;
+    float dPy_dx = (Py_xp - Py_xn) * inv2h;
+    float dPx_dy = (Px_yp - Px_yn) * inv2h;
+    return float3(dPz_dy - dPy_dz,
+                  dPx_dz - dPz_dx,
+                  dPy_dx - dPx_dy);
+}
+
 // Density at a world-space point. Returns 0 outside the cloud layer
 // or where the noise threshold isn't met. The volumetric march
 // multiplies this by sigma_t to vary extinction along the ray.
@@ -92,8 +170,19 @@ public float cloud_fbm(float3 p, int octaves) {
 // cp1: (base_y, top_y, coverage, peak_sigma_t)
 // cp2: (wind_x, wind_z, freq, time_seconds)
 // cp3: (seed_offset_x, seed_offset_z, detail_amount, rayleigh_int_unused_here)
+// cp4: (curl_amount, curl_scale_cycles_per_m, erosion_amount, _reserved)
+//      curl_amount in [0,1] is the displacement magnitude in metres
+//      applied to the sample position before density evaluation.
+//      curl_scale is the curl-noise frequency in cycles per metre
+//      (independent of cp2.z so coarse cloud bodies can carry fine
+//      curl filaments).
+//      erosion_amount in [0,1] adds a high-frequency edge-erosion
+//      term on top of the existing cp3.z detail noise; eats away
+//      soft cloud margins into wisps without hollowing dense cores.
+//      0 = identical to cp3.z-only behaviour on main.
 public float cloud_density_at(float3 pos,
                               float4 cp1, float4 cp2, float4 cp3,
+                              float4 cp4,
                               int octaves) {
     if (cp1.w <= 0.0) return 0.0;
     float base_y = cp1.x;
@@ -110,6 +199,19 @@ public float cloud_density_at(float3 pos,
     float3 sp = pos
               + float3(cp2.x * cp2.w, 0.0, cp2.y * cp2.w)
               + float3(cp3.x, 0.0, cp3.y);
+    // Curl-noise displacement (Bridson 2007). Applied in world space
+    // BEFORE the noise-frequency scaling so curl_scale stays in the
+    // physically intuitive cycles/metre regime regardless of cp2.z.
+    // Wind-drift the curl input too so the eddy pattern flows with
+    // the cloud body (otherwise turbulent detail looks "pinned" to
+    // world space while the cloud itself drifts past it -- visually
+    // wrong, breaks the fluid-flow illusion). cp4.x = magnitude (m),
+    // cp4.y = curl frequency. 0 = no displacement = identical to the
+    // pre-curl code path (regression-safe gate for r_clouds_curl_amount 0).
+    if (cp4.x > 0.0) {
+        float3 c = cloud_curl_noise(sp, cp4.y);
+        sp += c * cp4.x;
+    }
     sp *= cp2.z;
     // Cumulus body: caller-controlled octaves of quintic-interpolated
     // value-noise fbm. Higher octaves -> more wispy detail, more cost.
@@ -135,6 +237,19 @@ public float cloud_density_at(float3 pos,
         float hi = cloud_fbm(sp * 4.0, 3);
         float edge = (1.0 - density) * (1.0 - density);
         density = saturate(density - hi * cp3.z * edge);
+    }
+    // Secondary high-frequency edge erosion. Same wispy-finger
+    // principle as cp3.z but tuned to a much higher noise frequency
+    // (8x base, vs 4x for the primary detail). Produces the
+    // filamentous outer fringe characteristic of real cumulus seen
+    // up close: cp3.z gives the bulk wispy edge, cp4.z paints the
+    // sub-feature wisps that fade into clear air. Same
+    // (1 - density)^2 edge mask so dense cores stay protected.
+    // 0 = identical to main behaviour (this whole branch elides).
+    if (cp4.z > 0.0) {
+        float hi2 = cloud_fbm(sp * 8.0, 3);
+        float edge2 = (1.0 - density) * (1.0 - density);
+        density = saturate(density - hi2 * cp4.z * edge2);
     }
     // Internal variation: a SOFT secondary fbm gives the cloud volume
     // some texture without holes. Bias toward 1.0 (multiplier 0.75-1.0

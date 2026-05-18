@@ -558,6 +558,9 @@ namespace cvar {
     PT_CVAR(r_clouds_density,        "0.06",     "Peak extinction inside the cloud, in per-metre sigma_t. Real meteorology: light cumulus 0.03-0.05, typical cumulus 0.05-0.10, stratus 0.04-0.08, storm/cumulonimbus 0.10-0.30. Across a 300m cumulus layer, sigma=0.05 gives optical depth ~15 -- mostly opaque core, translucent edges.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_freq,           "0.005",    "Noise frequency in cycles per metre. 0.003 -> ~330m features (slow undulating cumulus), 0.01 -> ~100m features (smaller puffy cumulus). Match to typical horizontal cloud size, not vertical layer thickness.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_detail,         "0.35",     "High-frequency detail amount [0..1]. 0 = soft blobby clouds, 1 = wispy/eroded edges.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_curl_amount,    "0.0",      "Curl-noise displacement magnitude in metres applied to the cloud sample position before density evaluation (Bridson 2007, 'Curl-Noise for Procedural Fluid Flow'). Divergence-free, so it shears the cloud body into filamentous eddies without inflating its volume. 0 disables (default; output bit-equivalent to pre-#117 main so existing CVAR_ARCHIVE scenes that turn on r_clouds keep the old look until the user opts in); 0.3 gives subtle cumulus edge wisps; 0.8+ gives heavily turbulent / sheared-streamer cirrus. Layer-relative magnitude in metres -- scale with r_clouds_freq if you change the bulk feature size.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_curl_scale,     "0.01",     "Curl-noise frequency in cycles per metre. 0.01 = ~100m turbulent eddies (cumulus edge filaments); 0.003 = ~330m large-scale shear (cirrus streamers); 0.03 = ~33m fine wisps (close-up shots, sub-cloud detail). Independent of r_clouds_freq so coarse bulk cloud bodies can still carry fine curl turbulence.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_erosion,        "0.0",      "Secondary high-frequency edge-erosion amount [0..1] layered on top of r_clouds_detail. Eats away soft cloud margins into sub-feature wisps. r_clouds_detail controls the bulk wispy boundary; r_clouds_erosion paints the filamentous fringe on top. 0 = identical to pre-#117 main; 0.3-0.6 gives the characteristic frayed look of close-up cumulus.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_wind_x,         "5.0",      "Wind speed along +X in metres/second. Drifts the cloud field over time. Light breeze 2-3, fresh wind 8-12, gale 20+.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_wind_z,         "0.0",      "Wind speed along +Z in metres/second.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_seed,           "0",        "Per-day noise seed (any float). Same preset + different seed = visually distinct cloud pattern. Use one seed per in-game day so each day has its own weather pattern.", CVAR_ARCHIVE);
@@ -3619,10 +3622,24 @@ void Engine::RenderFrame() {
         // intensity. .w = march sample count (cast to int in shader).
         float vol_params[4];
         // Volumetric cloud parameters. See PathTrace.slang's Push for
-        // the field-by-field layout. Three float4s = 48 bytes.
+        // the field-by-field layout. Four float4s = 64 bytes (was 48
+        // before issue #117 added clouds_p4 for curl-noise + secondary
+        // edge erosion plumbing).
         float clouds_p1[4];   // (base_y, top_y, coverage, peak_density)
         float clouds_p2[4];   // (wind_x, wind_z, freq, time_seconds)
         float clouds_p3[4];   // (seed_offset_x, seed_offset_z, detail_amount, rayleigh_int)
+        // clouds_p4 (#117): (curl_amount_m, curl_scale_cycles_per_m,
+        // erosion_amount, _reserved). curl_amount is the Bridson-2007
+        // curl-noise displacement magnitude in metres applied to the
+        // sample position before density evaluation; 0 disables the
+        // curl branch entirely so r_clouds_curl_amount 0 is bit-exact
+        // versus pre-#117 main. curl_scale is the curl-noise frequency
+        // in cycles per metre (default 0.01 = 100m turbulent eddies,
+        // suitable for cumulus edge wisps). erosion_amount is a
+        // secondary high-frequency erosion term layered on top of
+        // clouds_p3.z so cp3.z controls bulk wispy edges and cp4.z
+        // controls the sub-feature filamentous fringe.
+        float clouds_p4[4];
         // Moon. .xyz = unit vector toward moon (computed from astro),
         // .w = phase angle radians (0 = new, π = full).
         float moon_dir_phase[4];
@@ -4318,6 +4335,12 @@ void Engine::RenderFrame() {
         float wind_x      = 5.0f;
         float wind_z      = 0.0f;
         float seed        = 0.0f;
+        // Issue #117: curl-noise displacement + secondary edge erosion.
+        // Defaults to 0 so existing scenes are bit-equivalent to main
+        // until the user opts in via r_clouds_curl_amount / r_clouds_erosion.
+        float curl_amt    = 0.0f;
+        float curl_scale  = 0.01f;
+        float erosion     = 0.0f;
         if (auto* v = C.FindCVar("r_clouds"))             clouds_on = v->GetBool();
         if (auto* v = C.FindCVar("r_clouds_coverage"))    coverage  = v->GetFloat();
         if (auto* v = C.FindCVar("r_clouds_base_height")) base_y    = v->GetFloat();
@@ -4325,6 +4348,9 @@ void Engine::RenderFrame() {
         if (auto* v = C.FindCVar("r_clouds_density"))     density   = v->GetFloat();
         if (auto* v = C.FindCVar("r_clouds_freq"))        freq      = v->GetFloat();
         if (auto* v = C.FindCVar("r_clouds_detail"))      detail    = v->GetFloat();
+        if (auto* v = C.FindCVar("r_clouds_curl_amount")) curl_amt  = v->GetFloat();
+        if (auto* v = C.FindCVar("r_clouds_curl_scale"))  curl_scale= v->GetFloat();
+        if (auto* v = C.FindCVar("r_clouds_erosion"))     erosion   = v->GetFloat();
         if (auto* v = C.FindCVar("r_clouds_wind_x"))      wind_x    = v->GetFloat();
         if (auto* v = C.FindCVar("r_clouds_wind_z"))      wind_z    = v->GetFloat();
         if (auto* v = C.FindCVar("r_clouds_seed"))        seed      = v->GetFloat();
@@ -4362,6 +4388,15 @@ void Engine::RenderFrame() {
         float rayleigh = 1.0f;
         if (auto* v = C.FindCVar("r_rayleigh")) rayleigh = v->GetFloat();
         push.clouds_p3[3] = rayleigh;
+        // Issue #117: curl-noise displacement + secondary edge erosion.
+        // Gated on clouds_on (when r_clouds 0 the whole density field is
+        // zeroed anyway, but keeping the magnitudes at 0 here keeps the
+        // shader-side `if (cp4.x > 0)` branch off as well -- shaves a few
+        // ALU on the haze-only path).
+        push.clouds_p4[0] = clouds_on ? curl_amt   : 0.0f;
+        push.clouds_p4[1] = curl_scale;
+        push.clouds_p4[2] = clouds_on ? erosion    : 0.0f;
+        push.clouds_p4[3] = 0.0f;   // reserved
     }
 
     // PtPush layout: the trailing 32 bytes here include the SDF Phase 1
@@ -4369,12 +4404,14 @@ void Engine::RenderFrame() {
     // composite gate (issue #46 -- one uint flag plus 12 bytes of
     // explicit padding that the SPIR-V / MSL cbuffer rule would have
     // inserted anyway). Mirrored in PathTrace.slang's Push/Frame block.
-    // 736 (pre-SDF) + 16 (sdf_params uvec4) + 16 (sdf_params_f vec4) +
-    // 16 (composite_celestials + 12 B pad) = 784 B. Vulkan keeps the
-    // first 112 B in push constants and spills the rest into the Frame
-    // UBO (kFrameUboSize = 1024); Metal keeps the whole struct in a
-    // setBytes-style slot.
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16);
+    // 768 (pre-SDF; 112 B push prefix + 656 B spilled tail before SDF)
+    // + 16 (sdf_params uvec4) + 16 (sdf_params_f vec4) +
+    // 16 (composite_celestials + 12 B pad) = 816 B baseline. Issue #117
+    // adds clouds_p4 (curl-noise plumbing) = +16 B for a total 832 B.
+    // Vulkan keeps the first 112 B in push constants and spills the
+    // rest (720 B) into the Frame UBO (kFrameUboSize = 1024); Metal keeps
+    // the whole struct in a setBytes-style slot.
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16);
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
     // cbuffer layout the Slang compiler applies to PathTrace.slang's
@@ -4383,6 +4420,14 @@ void Engine::RenderFrame() {
     // forgets to mirror it the GPU reads from 12 bytes ahead of where
     // the host wrote (the bug class that landed `_pad_before_accum_params`
     // above). Catch the next regression at compile time.
+    // Issue #117: clouds_p4 was inserted between clouds_p3 and
+    // moon_dir_phase. Both anchor the trailing block at a 16-byte
+    // boundary already (all elements above are float4-sized), but
+    // guard explicitly so a future field re-ordering can't silently
+    // slip the std140 layout out from under the shader.
+    static_assert(offsetof(PtPush, clouds_p4) % 16 == 0,
+                  "PtPush::clouds_p4 must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
     static_assert(offsetof(PtPush, accum_params) % 16 == 0,
                   "PtPush::accum_params must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
@@ -7451,6 +7496,8 @@ void Engine::RegisterCommands() {
     for (const char* n : {"r_clouds_coverage",  "r_clouds_base_height",
                           "r_clouds_top_height","r_clouds_density",
                           "r_clouds_freq",      "r_clouds_detail",
+                          "r_clouds_curl_amount", "r_clouds_curl_scale",
+                          "r_clouds_erosion",
                           "r_clouds_wind_x",    "r_clouds_wind_z",
                           "r_clouds_seed"}) {
         if (auto* v = C.FindCVar(n)) {
@@ -7929,6 +7976,17 @@ void Engine::RegisterCommands() {
     set_slider("r_clouds_density",          0.0f,    0.5f,   0.005f);
     set_slider("r_clouds_freq",          0.0005f,   0.02f,  0.0005f);
     set_slider("r_clouds_detail",           0.0f,    1.0f,   0.01f);
+    // Issue #117: curl-noise + secondary edge-erosion sliders.
+    // curl_amount is the magnitude scalar on the curl displacement;
+    // curl output is roughly O(5-10) per component (value-noise central
+    // diff at h=0.1), so amount=0.3 -> ~2m sub-feature shear, amount=1.0
+    // -> ~6-10m heavy-cumulus wisps. Spec keeps [0..1] for the UI but
+    // the shader stays linear so amount>1 still works for storm shots.
+    // curl_scale is cycles/metre (0.001..0.05 spans large shear
+    // streamers to fine close-up wisps).
+    set_slider("r_clouds_curl_amount",      0.0f,    2.0f,  0.01f);
+    set_slider("r_clouds_curl_scale",     0.001f,   0.05f,  0.001f);
+    set_slider("r_clouds_erosion",          0.0f,    1.0f,   0.01f);
     set_slider("r_clouds_wind_x",         -25.0f,   25.0f,   0.5f);
     set_slider("r_clouds_wind_z",         -25.0f,   25.0f,   0.5f);
     set_slider("r_clouds_seed",             0.0f,  100.0f,   1.0f);
