@@ -68,6 +68,34 @@ bool LeafLocalAabb(const SdfNode& n, float (&mn)[3], float (&mx)[3]) {
             // bound infinity.
             return false;
         }
+        // --- SDF Phase 3 (#99) fractal DEs --------------------------------
+        //
+        // All three fractals carry their "effective bound radius" in
+        // params[1] -- the radius of the world-space sphere that
+        // conservatively contains the fractal's iso-surface. We box-
+        // bound that sphere (axis-aligned cube of side 2*R). The
+        // exact iso-surface lies well inside this bound (the
+        // Mandelbulb's reachable extent is ~1.2 m; the Mandelbox's
+        // limit set sits within ~4 m of origin at the canonical
+        // scale=2.5; Apollonian limit set at scale=1.3 stays within
+        // ~2 m). Empty corners pay one sphere-trace AABB-exit hit
+        // before the trace gives up.
+        //
+        // params[1] <= 0 is a host author error -- a fractal with no
+        // bound radius would force a "default world" cube that turns
+        // the sphere-trace into a full-screen tax. Refuse so the
+        // failure surfaces as a clear parse error rather than a 1 fps
+        // mystery.
+        case SDF_SHAPE_MANDELBULB:
+        case SDF_SHAPE_MANDELBOX:
+        case SDF_SHAPE_APOLLONIAN: {
+            float R = n.params[1];
+            if (R <= 0.0f) return false;
+            mn[0] = -R; mn[1] = -R; mn[2] = -R;
+            mx[0] =  R; mx[1] =  R; mx[2] =  R;
+            return true;
+        }
+        // --- end SDF Phase 3 ---
     }
     return false;
 }
