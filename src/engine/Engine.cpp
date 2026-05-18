@@ -674,11 +674,11 @@ namespace cvar {
     // r_aurora == 0 -- the dispatch is elided engine-side.
     PT_CVAR(r_aurora,           "0",
             "Aurora borealis/australis procedural overlay. 0 = off "
-            "(zero cost, dispatch elided), 1 = render curl-noise driven "
-            "aurora ribbons in the upper sky at night (sun below "
-            "horizon). Procedural mode only -- no aurora when r_sky_mode "
-            "= hdri / gradient. See shaders/AuroraComposite.slang for "
-            "the visual construction.",
+            "(zero cost, dispatch elided), 1 = render FBM-noise "
+            "modulated aurora ribbons in the upper sky at night (sun "
+            "below horizon). Procedural mode only -- no aurora when "
+            "r_sky_mode = hdri / gradient. See "
+            "shaders/AuroraComposite.slang for the visual construction.",
             CVAR_ARCHIVE);
     PT_CVAR(r_aurora_intensity, "1.0",
             "Aurora brightness multiplier (0..2). 1.0 = nominal "
@@ -6952,7 +6952,8 @@ void Engine::RenderFrame() {
                 aurora_on != 0 &&
                 (sky_mode_int == 2) &&
                 aurora_composite_pipeline_id_ != 0 &&
-                depth_tex_id_ != 0;
+                depth_tex_id_ != 0 &&
+                cloud_trans_tex_id_ != 0;
         }
         if (aurora_active) {
             cb->BindComputePipeline(pt::rhi::PipelineHandle{aurora_composite_pipeline_id_});
@@ -6962,6 +6963,14 @@ void Engine::RenderFrame() {
             // 1e10 for sky pixels; the shader's 5x5 min-dilation
             // gate at 1e9 lets us avoid painting aurora over geometry.
             cb->BindStorageTexture(1, pt::rhi::TextureHandle{depth_tex_id_});
+            // cloud_trans_tex at engine slot 2 -> Metal MSL texture(2)
+            // by declaration order. PathTrace's cloud march writes the
+            // camera-ray transmittance here (1.0 = no occlusion); the
+            // shader multiplies the aurora contribution by it so the
+            // curtain gets darkened by foreground clouds the same way
+            // StarsComposite darkens stars / sun / moon. Allocated
+            // alongside depth_tex_id_ whenever denoiser_active_.
+            cb->BindStorageTexture(2, pt::rhi::TextureHandle{cloud_trans_tex_id_});
             // No buffer bindings: AuroraComposite is purely
             // texture-driven. BindComputePipeline cleared any prior
             // PathTrace bindings, so max_bound_buf_slot = -1 and Slang's

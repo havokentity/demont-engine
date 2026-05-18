@@ -5,8 +5,8 @@
 //
 // Stateless additive composite mirroring the StarsComposite (#46 / PR
 // #114) pattern: runs once per frame on Metal between Denoise() and
-// dispatch_bloom_pyramid, so post-denoise HDR receives a curl-noise-
-// driven aurora curtain whose highlights then feed the bloom pyramid
+// dispatch_bloom_pyramid, so post-denoise HDR receives an FBM-noise-
+// modulated aurora curtain whose highlights then feed the bloom pyramid
 // and get squashed by the ACES tonemap with the rest of the image.
 //
 // Architectural shape (deliberately the same as StarsComposite):
@@ -55,11 +55,20 @@
 //   through.
 //
 // Bindings (Metal MSL slots assigned in declaration order: hdr_inout
-// -> texture(0), depth_tex -> texture(1); vk::binding tags are for
-// the SPIR-V path, presently un-wired -- Vulkan dispatch is a
-// follow-up, see issue #116 "Out of scope").
-[[vk::binding(0, 0)]] RWTexture2D<float4> hdr_inout;
-[[vk::binding(7, 0)]] RWTexture2D<float>  depth_tex;
+// -> texture(0), depth_tex -> texture(1), cloud_trans_tex ->
+// texture(2); vk::binding tags are for the SPIR-V path, presently
+// un-wired -- Vulkan dispatch is a follow-up, see issue #116
+// "Out of scope").
+//
+// cloud_trans_tex uses the same engine-slot/vk::binding scheme as
+// StarsComposite (PathTrace.slang writes camera-ray cloud-march
+// transmittance there: 1.0 = no occlusion, 0.0 = fully opaque). The
+// aurora composite multiplies by this before the additive write so
+// thick clouds occlude the aurora curtain the same way they occlude
+// stars / sun / moon in the celestial composite.
+[[vk::binding(0, 0)]]  RWTexture2D<float4> hdr_inout;
+[[vk::binding(7, 0)]]  RWTexture2D<float>  depth_tex;
+[[vk::binding(22, 0)]] RWTexture2D<float>  cloud_trans_tex;
 
 // MSL SLOT NOTICE: this kernel binds NO buffers and NO acceleration
 // structures. Slang's MSL backend therefore assigns Push (the only
@@ -110,17 +119,23 @@ cbuffer Push {
 
 // --- Procedural noise helpers ---------------------------------------
 //
-// The aurora ribbon shape comes from a 3D curl-noise field evaluated
-// along the view-ray direction (which is unit-length, so we map it
-// directly to "noise space" coordinates -- the field's spatial period
-// is in radians of angular direction, not metres). Standard hash +
-// value-noise + curl construction:
+// The aurora ribbon shape comes from a 3D value-noise FBM field
+// evaluated along the view-ray direction (which is unit-length, so we
+// map it directly to "noise space" coordinates -- the field's spatial
+// period is in radians of angular direction, not metres). Standard
+// hash + value-noise + fractal-sum construction:
 //
-//   hash3 -> 3 floats in [-1, 1) deterministic per integer cell
-//   noise3 -> smooth-stepped trilinear interpolation of hash3
-//   curl3 -> finite-difference curl of noise3 (a divergence-free
-//            vector field -- the displacement field that gives
-//            ribbon "swirls" rather than just blob-noise)
+//   pcgHash + hashFloat -> deterministic [0, 1) per integer 3D cell
+//   noise3 -> quintic-smoothed trilinear interpolation of hashFloat
+//   fbm    -> 3-octave fractal sum of noise3 with non-integer scale
+//
+// We did originally consider a full curl-noise field (finite-
+// difference curl of three value-noise fields, divergence-free), but
+// the cinematic curtain look we want comes out cleanly enough from
+// directly thresholding FBM at two scales (one for the coarse curtain
+// extent, one for the fine ribbon streaks; see auroraDensity below).
+// The curl construction is left out -- if a future iteration wants
+// the true swirly displacement field this is where to add it.
 //
 // PathTrace.slang's pcgHash is a 32-bit integer hash; we use it here
 // for the corner-value seed and then smoothstep + trilerp upward.
@@ -207,13 +222,13 @@ float fbm(float3 p) {
 //    (south of the oval) there's no aurora -- matches reality for
 //    a Northern-hemisphere observer at latitude << aurora_lat.
 //
-// 3. Ribbon-curtain modulation: the curl-noise field gives us the
-//    streaky vertical-ribbon character. Sampling the fbm at a
-//    direction-space coordinate scaled so a "ribbon" spans ~0.05 rad
-//    (~3 deg), with two octaves at different frequencies -- the
-//    coarse octave defines the curtain location, the fine octave the
-//    flickering shimmer. We threshold the noise with a smoothstep so
-//    most of the sky has zero density and the ribbons are sharp.
+// 3. Ribbon-curtain modulation: the FBM field gives us the streaky
+//    vertical-ribbon character. Sampling the fbm at a direction-space
+//    coordinate scaled so a "ribbon" spans ~0.05 rad (~3 deg), with
+//    two octaves at different frequencies -- the coarse octave defines
+//    the curtain location, the fine octave the flickering shimmer. We
+//    threshold the noise with a smoothstep so most of the sky has
+//    zero density and the ribbons are sharp.
 //
 // 4. Time evolution (animation): when aurora_params.z is on, we
 //    advect the noise lookup by aurora_params.w (time in seconds)
@@ -403,6 +418,19 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float intensity = aurora_params.x;
 
     float3 aurora_col = col * density * night * base_lum * intensity;
+
+    // Cloud occlusion. PathTrace writes the camera-ray cloud-march
+    // transmittance to cloud_trans_tex (1.0 = no cloud, 0.0 = fully
+    // opaque). Multiplying the additive aurora contribution by it
+    // darkens the curtain in proportion to the integrated cloud
+    // density along the camera ray -- so a thick cloud occludes the
+    // aurora and a thin / wispy cloud lets it shine through dimmed.
+    // Mirrors StarsComposite's cloud attenuation so aurora + stars
+    // share the same foreground-cloud treatment. With clouds off
+    // (clouds_p1.w == 0 host-side), trans defaults to 1.0 and this
+    // is a no-op multiply.
+    float cloud_trans = cloud_trans_tex[tid.xy];
+    aurora_col *= cloud_trans;
 
     // Sanitize: clamp any NaN/Inf to zero, never go negative. The
     // procedural noise path can't actually produce non-finite
