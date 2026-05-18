@@ -4881,11 +4881,21 @@ void Engine::RenderFrame() {
         if (push.composite_celestials != 0u &&
             stars_composite_pipeline_id_ != 0 &&
             star_map_tex_id_ != 0 &&
-            moon_map_tex_id_ != 0) {
+            moon_map_tex_id_ != 0 &&
+            depth_tex_id_ != 0) {
             cb->BindComputePipeline(pt::rhi::PipelineHandle{stars_composite_pipeline_id_});
             cb->BindStorageTexture(0, pt::rhi::TextureHandle{tonemap_hdr_source_id});
             cb->BindStorageTexture(1, pt::rhi::TextureHandle{star_map_tex_id_});
             cb->BindStorageTexture(2, pt::rhi::TextureHandle{moon_map_tex_id_});
+            // depth_tex at engine slot 3 -> Metal MSL texture(3) by
+            // declaration order. PathTrace's G-buffer pass writes a
+            // 1000.0 sentinel for sky pixels and a real camera-space Z
+            // for surface hits, which the shader thresholds at 500 to
+            // skip the composite on foreground geometry. depth_tex_id_
+            // is allocated whenever denoiser_active_ (the only path
+            // that runs the composite anyway), so the existence check
+            // above is belt-and-braces.
+            cb->BindStorageTexture(3, pt::rhi::TextureHandle{depth_tex_id_});
             // Same exposure_state inheritance pattern as Tonemap.slang
             // (the dummy `_slot_exposure_state` keeps Push at MSL
             // buf(7)). Re-bind defensively in case PathTrace didn't run.

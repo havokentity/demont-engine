@@ -42,12 +42,22 @@
 // pixel write peels them off.
 //
 // Bindings (Metal MSL slots assigned in declaration order: hdr_inout
-// -> texture(0), star_map -> texture(1), moon_map -> texture(2);
-// vk::binding tags are for the SPIR-V path -- presently not wired,
-// see the TODO at the engine dispatch site).
+// -> texture(0), star_map -> texture(1), moon_map -> texture(2),
+// depth_tex -> texture(3); vk::binding tags are for the SPIR-V path
+// -- presently not wired, see the TODO at the engine dispatch site).
+//
+// depth_tex is PathTrace's per-pixel primary-hit depth G-buffer (linear
+// camera-space Z in world units along the forward axis). Sky pixels --
+// where the primary ray missed the scene -- get a sentinel value of
+// 1000.0 (see PathTrace.slang's G-buffer pass). We composite the
+// celestials ONLY at sky pixels so the stars / sun / moon don't render
+// on top of foreground geometry. Without this gate the composite is an
+// unconditional additive write and stars layer onto the ground plane
+// and other surfaces.
 [[vk::binding(0, 0)]] RWTexture2D<float4> hdr_inout;
 [[vk::binding(1, 0)]] RWTexture2D<float4> star_map;
 [[vk::binding(2, 0)]] RWTexture2D<float4> moon_map;
+[[vk::binding(7, 0)]] RWTexture2D<float>  depth_tex;
 
 // MSL SLOT ALIGNMENT NOTICE -- mirrors AutoExposure.slang / Tonemap.slang.
 // Slang's MSL backend assigns Metal buffer/texture slots in DECLARATION
@@ -383,6 +393,15 @@ void main(uint3 tid : SV_DispatchThreadID) {
 #endif
 
     if (composite_active == 0u) return;
+
+    // Sky-pixel gate. PathTrace.slang's G-buffer pass writes
+    // depth_view = 1000.0 for primary-miss pixels and the real
+    // camera-space Z (typically << 100 in metric units for any normal
+    // scene) for surface hits. Threshold at 500 m so we capture only
+    // sky pixels; anything closer is geometry and we leave it alone.
+    // Without this gate the composite is unconditionally additive and
+    // stars / sun / moon render on top of the ground plane.
+    if (depth_tex[tid.xy] < 500.0) return;
 
     float aperture = dof_params.x;
     float focal_d  = dof_params.y;
