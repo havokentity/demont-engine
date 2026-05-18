@@ -119,18 +119,26 @@ option(PT_BUILD_TOOLS           "Build developer tooling under tools/"  ON)
 # PT_WATER_ENABLED (PR #168, issue #134): MAT_WATER analytic-plane BRDF
 # (Schlick Fresnel + Snell refraction + Beer's-law absorption) + the
 # 8-noise-tap wave-normal helper + the MAT_WATER branch in
-# transmittance(). Default OFF -- water is a niche showcase feature;
-# flipping ON paid +2.99 ms / frame against the Cornell-CSG perf-bisect
-# baseline before the gate landed. Set to ON for builds that actually
-# use the `prim_plane ... water ...` material (e.g. tests/goldens/
-# scenes/water_pool.cfg). The cvars (r_water_absorption_r/g/b,
-# r_water_ior, r_water_wave_*) stay registered regardless of the gate
-# so existing user cfgs don't error out on cvar-not-found; when the
-# gate is OFF and a user sets a non-default value, Engine.cpp emits a
-# single [warn] line at startup.
+# transmittance().
+#
+# Default ON -- preserve functionality. The original gate (PR #168)
+# defaulted OFF because the megakernel paid +2.99 ms / frame on the
+# Cornell-CSG perf-bisect baseline; but that left `prim_plane ... water`
+# materials (e.g. tests/goldens/scenes/water_pool.cfg) rendering as
+# pure-black opaque surfaces, since the MAT_WATER BRDF branch in
+# PathTrace.slang was excised at compile time and the shader had no
+# fallthrough for that material tag. Mirrors the PT_LIGHT_TREE policy
+# (default ON for functionality; power users / perf-bench rigs flip OFF
+# via -DPT_WATER_ENABLED=OFF to recover the megakernel hot-loop slimness
+# on water-less scenes).
+#
+# The cvars (r_water_absorption_r/g/b, r_water_ior, r_water_wave_*)
+# stay registered regardless of the gate so existing user cfgs don't
+# error out on cvar-not-found; when the gate is OFF and a user sets a
+# non-default value, Engine.cpp emits a single [warn] line at startup.
 option(PT_WATER_ENABLED
-    "Compile MAT_WATER BRDF (#134) into the PathTrace megakernel. OFF = -2.99 ms/frame on water-less scenes; ON = water material renders."
-    OFF)
+    "Compile MAT_WATER BRDF (#134) into the PathTrace megakernel. ON (default) = water material renders correctly; OFF = -2.99 ms/frame on water-less scenes (water surfaces will render as opaque-black)."
+    ON)
 
 # PT_LIGHT_TREE (PR #170, issue #129): when ON, PathTrace.slang compiles
 # the Conty Estevez & Kulla 2018 light tree traversal helpers and the
