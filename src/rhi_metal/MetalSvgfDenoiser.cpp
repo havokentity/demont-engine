@@ -289,9 +289,12 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
     // Issue #119 -- demod requires the albedo G-buffer. When the engine
     // didn't allocate it (older r_denoiser kinds, or a transition frame
     // before resize fires) we silently fall back to non-demod behaviour
-    // and bind the dummy placeholder so the kernel's [[texture(12)]]
-    // slot stays well-formed. The kernel's `demod_enabled = 0` push
-    // gate then short-circuits every divide / multiply.
+    // and bind the dummy placeholder so the kernel's albedo slot stays
+    // well-formed. The kernel's `demod_enabled = 0` push gate then
+    // short-circuits every divide / multiply. (See per-encoder slot
+    // maps below for the actual MSL slot the albedo binds at -- it's
+    // not slot 12 even though Slang declares [[vk::binding(12)]];
+    // issue #164.)
     const bool demod_active = albedo_demod_enabled && (albedo_in != nullptr);
     MTL::Texture* albedo_bind = (albedo_in != nullptr) ? albedo_in : dummy_color_;
 
@@ -331,18 +334,22 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
     {
         MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
         enc->setComputePipelineState(temporal_pso_);
-        // Slang MSL slot map for the temporal kernel (kept stable by
-        // Slang's declaration-order policy; verified in the emitted
-        // DenoiseTemporal.metal):
+        // Slang MSL slot map for the temporal kernel (verified in the
+        // emitted DenoiseTemporal.metal):
         //   [[texture(N)]]  -- N matches the Slang [[vk::binding(N,0)]]
-        //                      slot for storage-image bindings 0..7.
-        //   [[texture(12)]] -- Issue #119, sample-only `Texture2D`
-        //                      albedo at binding 12. Sample access does
-        //                      NOT count toward Metal's 8-RW-texture
-        //                      compute cap (which we're already at
-        //                      with slots 0..7), so the slang->MSL
-        //                      emission emits this as a 9th texture
-        //                      argument without crashing.
+        //                      slot for the 8 RW textures at bindings
+        //                      0..7. Slang preserves those positions
+        //                      because they all fit in the [0..7] slot
+        //                      window.
+        //   [[texture(8)]]  -- Issue #119, sample-only `Texture2D`
+        //                      albedo. Declared with [[vk::binding(12)]]
+        //                      so Vulkan's descriptor-set lands it at
+        //                      slot 12, but Slang's MSL emit COMPACTS
+        //                      it down to the next free slot (8) since
+        //                      vk-slot 12 is outside the [0..7] window
+        //                      it preserved for the RW textures. Sample
+        //                      access does NOT count toward Metal's
+        //                      8-RW-texture compute cap.
         //   [[buffer(0..3)]] -- Slang bindings 8..11 map 1:1 onto MSL
         //                       buffer slots 0..3, in declaration order.
         //                       Slot 2 (variance_in_unused) is DCE'd
@@ -352,6 +359,15 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
         //                       is preserved.
         //   [[buffer(4)]]    -- push_constant cbuffer; Slang places it
         //                       AFTER the structured buffers.
+        // Issue #164: the original implementation bound albedo_bind at
+        // slot 12 (matching the Vulkan binding). That's the WRONG slot
+        // for MSL -- slot 12 is unbound, slot 8 is what the kernel
+        // actually reads, and the kernel saw all-zero. isSkyAlbedo()
+        // then returned true for every surface pixel, bypassing the
+        // demod divide AND the remod multiply -- but the chain still
+        // ran a temporal blend on the modulated radiance which produces
+        // visible corruption (R/B channels inflated, G preserved =
+        // magenta on the dawn ground plane). Bind at slot 8 instead.
         enc->setTexture(color_in,           0);
         enc->setTexture(hist_read,          1);
         enc->setTexture(depth_in,           2);
@@ -360,7 +376,7 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
         enc->setTexture(temporal_color_out, 5);
         enc->setTexture(depth_hist_read,    6);
         enc->setTexture(normal_hist_read,   7);
-        enc->setTexture(albedo_bind,       12);
+        enc->setTexture(albedo_bind,        8);
 
         enc->setBuffer(moments_hist_read,   0, 0); // moments_history_in  (binding 8)
         enc->setBuffer(moments_hist_write,  0, 1); // moments_history_out (binding 9)
@@ -422,14 +438,18 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
     if (!atrous_enabled && demod_active) {
         MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
         enc->setComputePipelineState(remod_pso_);
-        // DenoiseRemod.slang slot map:
-        //   [[texture(0)]]  -- demod_in   (RGBA16F demodulated lighting)
-        //   [[texture(1)]]  -- color_out  (RGBA16F textured radiance)
-        //   [[texture(12)]] -- albedo_tex (sample-only)
-        //   [[buffer(0)]]   -- push constants
+        // DenoiseRemod.slang slot map (verified in DenoiseRemod.metal):
+        //   [[texture(0)]] -- demod_in   (RGBA16F demodulated lighting)
+        //   [[texture(1)]] -- color_out  (RGBA16F textured radiance)
+        //   [[texture(2)]] -- albedo_tex (sample-only). Declared with
+        //                     [[vk::binding(12)]] in DenoiseRemod.slang
+        //                     so SPIR-V lands it at descriptor binding
+        //                     12, but Slang's MSL emit compacts it down
+        //                     to the next free slot (2). Issue #164.
+        //   [[buffer(0)]]  -- push constants
         enc->setTexture(hist_write,   0);
         enc->setTexture(output,       1);
-        enc->setTexture(albedo_bind, 12);
+        enc->setTexture(albedo_bind,  2);
         RemodPush rp{};
         rp.width  = w;
         rp.height = h;
@@ -465,16 +485,24 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
                                MTL::Buffer*  var_dst,
                                std::uint32_t step,
                                bool          is_final_pass) {
-            // Slang MSL slot map for the atrous kernel (same policy as
-            // temporal -- bindings 8..11 -> buffers 0..3, push at 4):
+            // Slang MSL slot map for the atrous kernel (same buffer
+            // policy as temporal -- bindings 8..11 -> buffers 0..3,
+            // push at 4):
             //   texture(1, 3, 6, 7) -- declared but DCE'd from kernel
             //     signature. We still bind dummies / parity textures
             //     because Metal silently ignores binds to slots not
             //     present in the kernel signature, and this keeps the
             //     host code symmetric with the Vulkan path.
-            //   texture(12)         -- albedo (sample-only); read for
+            //   texture(8)         -- albedo (sample-only); read for
             //     per-tap demod-divide and (on the final pass when
             //     final_remod is set) the multiply-back into color_out.
+            //     Declared with [[vk::binding(12)]] but Slang's MSL
+            //     emit compacts it to the next free slot (8). Issue
+            //     #164: the original code bound this at slot 12 which
+            //     was unbound -- the kernel read zeros for albedo,
+            //     isSkyAlbedo() returned true everywhere, and the
+            //     multiply-back was silently skipped on surface pixels
+            //     producing magenta ground.
             //   buffer(0, 1)        -- moments_in_unused /
             //     moments_out_unused, also DCE'd. We bind the parity-
             //     side moments buffer at both slots; the shader never
@@ -490,7 +518,7 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
             enc->setTexture(color_dst,         5);
             enc->setTexture(depth_hist_write,  6);
             enc->setTexture(normal_hist_write, 7);
-            enc->setTexture(albedo_bind,      12);
+            enc->setTexture(albedo_bind,       8);
 
             enc->setBuffer(moments_hist_write, 0, 0); // moments_in_unused  (DCE'd)
             enc->setBuffer(moments_hist_write, 0, 1); // moments_out_unused (DCE'd)
@@ -583,9 +611,11 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
             } else {
                 MTL::ComputeCommandEncoder* enc2 = cb->computeCommandEncoder();
                 enc2->setComputePipelineState(remod_pso_);
+                // Same slot fix as the svgf_basic remod dispatch above.
+                // Issue #164: albedo is at MSL slot 2, not 12.
                 enc2->setTexture(hist_write,   0);
                 enc2->setTexture(output,       1);
-                enc2->setTexture(albedo_bind, 12);
+                enc2->setTexture(albedo_bind,  2);
                 RemodPush rp{};
                 rp.width  = w;
                 rp.height = h;

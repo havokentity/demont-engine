@@ -78,8 +78,12 @@ public:
     //     pass multiplies back to produce textured radiance. May be
     //     nullptr when demod is disabled -- the temporal/atrous
     //     kernels still BIND a placeholder (dummy_color_) so MSL has
-    //     a valid argument for the [[texture(12)]] slot, and the
-    //     `demod_enabled` push gate at 0 skips every divide/multiply.
+    //     a valid argument for the albedo slot (MSL slot 8 for the
+    //     9-texture temporal/atrous kernels, slot 2 for the 3-texture
+    //     remod kernel; Slang compacts [[vk::binding(12)]] down to
+    //     the next free slot rather than honouring the vk slot number
+    //     -- issue #164), and the `demod_enabled` push gate at 0
+    //     skips every divide/multiply.
     //   output -- engine-owned linear-HDR target the tonemap chain
     //     reads next (= post_denoise_hdr).
     //   reset_history -- true clears the temporal accumulation.
