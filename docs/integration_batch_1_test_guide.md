@@ -528,8 +528,10 @@ finite-diff both linear and angular velocities at substep end.
 
 **Cvars added:** None new (reuses Phase 1 family).
 
-**New console commands:** `phys_drop_sphere <x> <y> <z> [r] [m]`,
-`phys_drop_box <x> <y> <z> <hx> <hy> <hz> [m]`.
+**New console commands:** `phys_drop_sphere <x> <y> <z> [r] [m] [red green blue]`,
+`phys_drop_box <x> <y> <z> <hx> <hy> <hz> [m] [red green blue]`. The
+trailing RGB triplet is the #181 colored-rigid-body extension; omit it to
+get the pre-#181 warm-grey sphere / cool-blue box defaults.
 
 **Test fixtures:**
 - `tests/goldens/scenes/phys_rb_smoke.cfg`

@@ -12882,15 +12882,24 @@ void Engine::RegisterPhysicsCommands() {
     // first-class rigid body that Phase 2b's SAT narrowphase will
     // start to talk to.
     C.RegisterCommand("phys_drop_sphere",
-        "phys_drop_sphere <x> <y> <z> [radius=0.3] [mass=1.0]: spawn a rigid-body sphere "
-        "(Phase 2a) at the world-space position.",
+        "phys_drop_sphere <x> <y> <z> [radius=0.3] [mass=1.0] [r g b]: spawn a rigid-body "
+        "sphere (Phase 2a) at the world-space position. Optional RGB tint (#181) -- "
+        "default is the warm-grey Lambert from before the colored-bodies patch.",
         [this](auto args, pt::console::Output& out) {
             if (!physics_) { out.PrintLine("phys_drop_sphere: physics system not initialised"); return; }
-            if (args.size() < 3 || args.size() > 5) {
-                out.PrintLine("usage: phys_drop_sphere <x> <y> <z> [radius=0.3] [mass=1.0]");
+            // Accept 3..5 args (back-compat) OR 8 args (full xyz + radius + mass + rgb).
+            // Mass MUST be present before RGB so the parser never has to guess
+            // whether arg[4] is mass or red -- this keeps the back-compat
+            // shape `phys_drop_sphere x y z r m` exact.
+            if (args.size() < 3 || args.size() == 6 || args.size() == 7 || args.size() > 8) {
+                out.PrintLine("usage: phys_drop_sphere <x> <y> <z> [radius=0.3] [mass=1.0] [r g b]");
                 return;
             }
             float x, y, z, radius = 0.3f, mass = 1.0f;
+            // Default warm-grey tint -- matches the pre-#181 hard-coded
+            // appearance so phys_drop_sphere with no color args renders
+            // bit-for-bit identical to integration HEAD.
+            float r_col = 0.85f, g_col = 0.80f, b_col = 0.70f;
             if (!ParseFloat(args[0], x) || !ParseFloat(args[1], y) || !ParseFloat(args[2], z)) {
                 out.PrintLine("phys_drop_sphere: arg parse failed");
                 return;
@@ -12903,12 +12912,22 @@ void Engine::RegisterPhysicsCommands() {
                 out.PrintLine("phys_drop_sphere: bad mass");
                 return;
             }
+            if (args.size() == 8) {
+                if (!ParseFloat(args[5], r_col) || !ParseFloat(args[6], g_col) || !ParseFloat(args[7], b_col)) {
+                    out.PrintLine("phys_drop_sphere: bad r/g/b");
+                    return;
+                }
+            }
             if (radius <= 0.0f) {
                 out.PrintLine("phys_drop_sphere: radius must be > 0");
                 return;
             }
             if (mass < 0.0f) {
                 out.PrintLine("phys_drop_sphere: mass must be >= 0 (0 = kinematic)");
+                return;
+            }
+            if (r_col < 0.0f || g_col < 0.0f || b_col < 0.0f) {
+                out.PrintLine("phys_drop_sphere: rgb components must be >= 0");
                 return;
             }
             const auto h = physics_->AddRigidSphere(glm::vec3{x, y, z}, radius, mass);
@@ -12923,18 +12942,15 @@ void Engine::RegisterPhysicsCommands() {
             p.material    = AnalyticPrim::Lambert;
             p.pos_or_n[0] = x; p.pos_or_n[1] = y; p.pos_or_n[2] = z;
             p.radius_or_d = radius;
-            // Slightly warmer tint than `phys_drop` so a quick glance
-            // distinguishes the rigid-body sphere from a Phase-1
-            // particle in the same scene.
-            p.albedo[0]   = 0.85f; p.albedo[1] = 0.80f; p.albedo[2] = 0.70f;
+            p.albedo[0]   = r_col; p.albedo[1] = g_col; p.albedo[2] = b_col;
             p.roughness   = 0.4f;
             p.ior         = 1.0f;
             primitives_[prim_id] = p;
             physics_->SetRbPrimId(h, prim_id);
             primitives_dirty_ = true;
             accum_dirty_      = true;
-            out.FormatLine("phys_drop_sphere: spawned rigid body handle=0x{:x} prim_id={} @ ({:.2f} {:.2f} {:.2f}) r={:.3f} m={:.3f}",
-                           h, prim_id, x, y, z, radius, mass);
+            out.FormatLine("phys_drop_sphere: spawned rigid body handle=0x{:x} prim_id={} @ ({:.2f} {:.2f} {:.2f}) r={:.3f} m={:.3f} rgb=({:.2f} {:.2f} {:.2f})",
+                           h, prim_id, x, y, z, radius, mass, r_col, g_col, b_col);
         });
 
     // Spawn a rigid-body box (Phase 2a, #138). Phase 2a does NOT
@@ -12947,23 +12963,39 @@ void Engine::RegisterPhysicsCommands() {
     // bounding-sphere RADIUS, which on a 1x1x1m cube is sqrt(3)/2 ~=
     // 0.866 m -- noticeably larger than the inscribed 0.5 m sphere.
     C.RegisterCommand("phys_drop_box",
-        "phys_drop_box <x> <y> <z> <hx> <hy> <hz> [mass=1.0]: spawn a rigid-body box "
-        "(Phase 2a, sphere collision only -- box-box SAT lands in Phase 2b).",
+        "phys_drop_box <x> <y> <z> <hx> <hy> <hz> [mass=1.0] [r g b]: spawn a rigid-body "
+        "box (Phase 2a, sphere collision only -- box-box SAT lands in Phase 2b). Optional "
+        "RGB tint (#181) -- default is the cool blue Lambert from before the colored-bodies patch.",
         [this](auto args, pt::console::Output& out) {
             if (!physics_) { out.PrintLine("phys_drop_box: physics system not initialised"); return; }
-            if (args.size() < 6 || args.size() > 7) {
-                out.PrintLine("usage: phys_drop_box <x> <y> <z> <hx> <hy> <hz> [mass=1.0]");
+            // Back-compat shapes:
+            //   6 args  -> xyz + hxhyhz                          (mass defaults)
+            //   7 args  -> xyz + hxhyhz + mass
+            //   10 args -> xyz + hxhyhz + mass + rgb              (#181)
+            // 8/9 are ambiguous (no clean way to know whether arg[7] starts
+            // rgb or is a typo) so we reject them with the usage string.
+            if (args.size() < 6 || args.size() == 8 || args.size() == 9 || args.size() > 10) {
+                out.PrintLine("usage: phys_drop_box <x> <y> <z> <hx> <hy> <hz> [mass=1.0] [r g b]");
                 return;
             }
             float x, y, z, hx, hy, hz, mass = 1.0f;
+            // Default cool-blue tint -- matches pre-#181 hard-coded
+            // appearance for `phys_drop_box` with no color args.
+            float r_col = 0.60f, g_col = 0.65f, b_col = 0.85f;
             if (!ParseFloat(args[0], x)  || !ParseFloat(args[1], y)  || !ParseFloat(args[2], z) ||
                 !ParseFloat(args[3], hx) || !ParseFloat(args[4], hy) || !ParseFloat(args[5], hz)) {
                 out.PrintLine("phys_drop_box: arg parse failed");
                 return;
             }
-            if (args.size() == 7 && !ParseFloat(args[6], mass)) {
+            if (args.size() >= 7 && !ParseFloat(args[6], mass)) {
                 out.PrintLine("phys_drop_box: bad mass");
                 return;
+            }
+            if (args.size() == 10) {
+                if (!ParseFloat(args[7], r_col) || !ParseFloat(args[8], g_col) || !ParseFloat(args[9], b_col)) {
+                    out.PrintLine("phys_drop_box: bad r/g/b");
+                    return;
+                }
             }
             if (hx <= 0.0f || hy <= 0.0f || hz <= 0.0f) {
                 out.PrintLine("phys_drop_box: all half-extents must be > 0");
@@ -12971,6 +13003,10 @@ void Engine::RegisterPhysicsCommands() {
             }
             if (mass < 0.0f) {
                 out.PrintLine("phys_drop_box: mass must be >= 0 (0 = kinematic)");
+                return;
+            }
+            if (r_col < 0.0f || g_col < 0.0f || b_col < 0.0f) {
+                out.PrintLine("phys_drop_box: rgb components must be >= 0");
                 return;
             }
             const glm::vec3 h_ext{hx, hy, hz};
@@ -12990,17 +13026,15 @@ void Engine::RegisterPhysicsCommands() {
             p.material    = AnalyticPrim::Lambert;
             p.pos_or_n[0] = x; p.pos_or_n[1] = y; p.pos_or_n[2] = z;
             p.radius_or_d = bound_r;
-            // Bluer tint -- distinguishes a box rigid body (bounding
-            // sphere proxy) from a true rigid-body sphere at a glance.
-            p.albedo[0]   = 0.60f; p.albedo[1] = 0.65f; p.albedo[2] = 0.85f;
+            p.albedo[0]   = r_col; p.albedo[1] = g_col; p.albedo[2] = b_col;
             p.roughness   = 0.5f;
             p.ior         = 1.0f;
             primitives_[prim_id] = p;
             physics_->SetRbPrimId(h, prim_id);
             primitives_dirty_ = true;
             accum_dirty_      = true;
-            out.FormatLine("phys_drop_box: spawned rigid body handle=0x{:x} prim_id={} @ ({:.2f} {:.2f} {:.2f}) half=({:.2f} {:.2f} {:.2f}) m={:.3f} bound_r={:.3f}",
-                           h, prim_id, x, y, z, hx, hy, hz, mass, bound_r);
+            out.FormatLine("phys_drop_box: spawned rigid body handle=0x{:x} prim_id={} @ ({:.2f} {:.2f} {:.2f}) half=({:.2f} {:.2f} {:.2f}) m={:.3f} bound_r={:.3f} rgb=({:.2f} {:.2f} {:.2f})",
+                           h, prim_id, x, y, z, hx, hy, hz, mass, bound_r, r_col, g_col, b_col);
         });
 
     C.RegisterCommand("phys_clear",
