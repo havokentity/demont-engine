@@ -2,6 +2,7 @@
 # Copyright (c) 2026 Rajesh D'Monte
 add_subdirectory(core)
 add_subdirectory(console)
+add_subdirectory(audio)
 # Software backend supports Mac (CAMetalLayer present) and Windows
 # (SetDIBitsToDevice present).  Linux/Wayland/X11 would need its own
 # present path -- not implemented, so we gate the subdirectory to

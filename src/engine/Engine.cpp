@@ -9,6 +9,7 @@
 #include "../app/ConsoleOverlay.h"
 #include "../app/PerfOverlay.h"
 #include "../app/Window.h"
+#include "../audio/AudioSystem.h"
 #include "../console/Console.h"
 #include "../console/ConsoleServer.h"
 #include "../core/Diag.h"
@@ -783,6 +784,18 @@ bool Engine::Init() {
     jobs_->Init();
     pt::jobs::JobSystem::SetInstance(jobs_.get());
 
+    // Audio subsystem (issue #80 MVP). Constructed BEFORE the smoke-exec
+    // fixtures run so a fixture can issue `audio_play` calls -- the
+    // device backend (CoreAudio / WASAPI / ALSA) is independent of the
+    // GPU + window so there's no ordering dependency that pushes it
+    // later. Init() failure is non-fatal: the rest of the AudioSystem
+    // API no-ops cleanly when IsRunning() is false so headless / CI
+    // boxes that lack audio continue working.
+    audio_system_ = std::make_unique<pt::audio::AudioSystem>();
+    if (!audio_system_->Init()) {
+        LOG_WARN("audio: subsystem init failed; engine continues without audio");
+    }
+
     // Window. Always created with no graphics-API context; each backend
     // attaches its own CAMetalLayer (or VkSurface for Vulkan) to the
     // NSWindow content view, so no recreate is needed on backend switch.
@@ -1107,6 +1120,13 @@ void Engine::ApplyCommandLineCvarOverrides() {
 }
 
 void Engine::Shutdown() {
+    // Stop the audio device first so its worker thread is gone before
+    // the rest of the engine state it doesn't strictly depend on
+    // (overlay sinks, console server, jobs) starts unwinding. Idempotent
+    // -- safe even if Init() never constructed audio_system_.
+    if (audio_system_) audio_system_->Shutdown();
+    audio_system_.reset();
+
     TearDownDevice();
 
     // P11 persistence: dump every CVAR_ARCHIVE cvar that's been changed
@@ -5670,6 +5690,14 @@ void Engine::Tick(double dt) {
 
     UpdateCamera(dt);
 
+    // Audio listener update: push the freshest camera pose into the
+    // audio subsystem so distance attenuation + stereo pan track the
+    // viewer correctly. No-op when audio_system_ is null or its
+    // device init failed -- the AudioSystem guards itself.
+    if (audio_system_ && camera_) {
+        audio_system_->Tick(camera_->pos, camera_->Forward());
+    }
+
     // Sky animation: advance r_sky_hour by `rate * dt` real-time
     // seconds. Wraps modulo 24. Marks accumulation dirty so the path
     // tracer drops its history each frame the time is actually moving.
@@ -7946,6 +7974,54 @@ void Engine::RegisterCommands() {
     // --- SDF Phase 1 (#97) -----------------------------------------------------
     RegisterSdfCommands();
     // --- end SDF Phase 1 -------------------------------------------------------
+
+    // --- Audio MVP (#80) -------------------------------------------------------
+    // `audio_play <path>`  -- load + play a sound at the current camera
+    //                         position (3D-attenuated stereo pan).
+    // `audio_stop`         -- stop every currently-playing voice.
+    // No reverb / no ray-traced occlusion / no HRTF -- those are Phase B
+    // follow-ups against the renderer's TLAS.
+    C.RegisterCommand("audio_play",
+        "Play a sound file (WAV) at the camera position with 1/r distance "
+        "attenuation and equal-power stereo pan. Usage: audio_play <path> "
+        "(quote the path if it contains spaces, e.g. audio_play \"my asset.wav\")",
+        [this](auto args, pt::console::Output& out) {
+            if (args.empty()) {
+                out.PrintLine("audio_play: missing path argument");
+                return;
+            }
+            if (!audio_system_ || !audio_system_->IsRunning()) {
+                out.PrintLine("audio_play: audio subsystem not running");
+                return;
+            }
+            if (!camera_) {
+                out.PrintLine("audio_play: no camera");
+                return;
+            }
+            const std::string path(args[0]);
+            auto sound = audio_system_->LoadSound(path);
+            if (sound == pt::audio::kInvalidSound) {
+                out.FormatLine("audio_play: failed to load '{}'", path);
+                return;
+            }
+            auto voice = audio_system_->PlaySound(sound, camera_->pos, 1.0f);
+            if (voice == pt::audio::kInvalidVoice) {
+                out.PrintLine("audio_play: voice pool full or play failed");
+                return;
+            }
+            out.FormatLine("audio_play: '{}' voice={}", path, voice);
+        });
+
+    C.RegisterCommand("audio_stop", "Stop every currently-playing audio voice.",
+        [this](auto, pt::console::Output& out) {
+            if (!audio_system_) {
+                out.PrintLine("audio_stop: audio subsystem not initialized");
+                return;
+            }
+            auto n = audio_system_->StopAll();
+            out.FormatLine("audio_stop: stopped {} voice(s)", n);
+        });
+    // --- end Audio MVP ---------------------------------------------------------
 }
 
 namespace {
