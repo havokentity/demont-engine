@@ -261,6 +261,26 @@ pt_add_test(pt_physics_test
     pt_physics_test.cpp
     LINK_TARGETS pt_physics)
 
+# --- Light photometric decomposition (#176) --------------------------------
+# Pins the photometric conversion constants the new `light_*_color` /
+# `light_*_cd` / `light_*_lm` / `light_*_nits` / `light_*_exposed`
+# command variants use to map artist-facing units onto the canonical
+# W/sr (point/spot) and W/m^2/sr (sphere/quad) storage. Covers:
+#   - 1cd = 1/683.002 W/sr at 555nm peak photopic (within 1e-6)
+#   - 100cd point at 5m -> 4 lux illuminance acceptance scenario
+#   - lumen -> W/sr conversion uses 4*pi denominator for isotropic
+#   - nit -> W/m^2/sr equals the cd -> W/sr factor (luminance vs
+#     luminous intensity, same SI definition)
+#   - decomposition algebra final = color * scalar * 2^ev (EV=0,+1,
+#     -1,+3, half-stop)
+#   - cfg round-trip: the save path is canonical-form so the conversion
+#     happens exactly once at input; reload is a pure float identity
+#   - linearity: 2x cd -> 2x W/sr, no hidden non-linearity
+# Pure-math test, no engine link -- the constants are mirrored from
+# Engine.cpp's anonymous namespace per the test's own contract block.
+pt_add_test(pt_light_decompose
+    pt_light_decompose_test.cpp)
+
 # --- pt_renderer/Astronomy unit tests (issue #65) --------------------------
 # JD conversions (J2000 + Unix-epoch reference points), GMST at J2000
 # vs the IAU 1982 formula, sun position at four cardinal solar events

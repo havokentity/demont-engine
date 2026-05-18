@@ -122,6 +122,51 @@ pt_render_one_frame --scene tests/goldens/scenes/light_primitives_mixed.cfg \
 **Scope / known issues:** Naive single-pick scales OK for ~100 lights;
 PR #154 light tree and PR #155 ReSTIR resample to extend further.
 
+### #176 — Industry-standard light ergonomics: color / cd / lm / nits / exposure
+
+**What:** Ergonomic sugar variants over the canonical `light_*`
+primitives. Same physics, same internal W/sr (point/spot) or W/m^2/sr
+(area-light radiance) storage, but artist-facing input in
+chromaticity-color-times-scalar, candela, lumens, nits, and/or
+exposure stops. Conversion is the single-wavelength 555nm peak
+photopic approximation (683.002 lm/W); see the `_cd` / `_lm` /
+`_nits` description text in-engine for the per-variant exact factor.
+
+**Cvars added:** None. New console commands only:
+| Primitive | _color | _cd | _lm | _nits | _exposed |
+|---|---|---|---|---|---|
+| `light_point`  | yes | yes | yes | -- | yes |
+| `light_spot`   | yes | yes | yes | -- | -- |
+| `light_sphere` | yes | -- | -- | yes | -- |
+| `light_quad`   | yes | -- | -- | yes | yes |
+
+**Cfg round-trip:** Save path is canonical (`SaveArchivedCvars` writes
+the W/sr-direct form), so the conversion happens exactly once at
+authoring time. Reloading a saved cfg is a pure float identity.
+
+**How to test:**
+```
+# All three variants below produce the same internal W/sr value:
+light_point        1 0 5 0   0.14641 0.14641 0.14641     # canonical
+light_point_color  2 0 5 0   1 1 1   0.14641             # color * scalar
+light_point_cd     3 0 5 0   1 1 1   100                 # 100 cd -> 0.14641 W/sr
+light_point_lm     4 0 5 0   1 1 1   1255.2              # 4*pi*100 lm -> 0.14641 W/sr
+light_point_exposed 5 0 5 0  1 1 1   0.07321 1.0         # 0.07321 * 2^1 = 0.14641
+
+# Sanity: light_list should report all five at identical (0.146, 0.146, 0.146).
+```
+
+**Test fixture:** `tests/pt_light_decompose_test.cpp` (pure-math pin
+of the conversion constants + decomposition algebra + cfg round-trip
+identity + linearity).
+
+**Scope / known issues:** Single-wavelength (555nm) photopic
+approximation only — per-channel spectral upsampling is out of scope
+(deferred). Spot `_lm` uses the omnidirectional 4*pi conversion so it
+under-states on-axis intensity for narrow cones; prefer `_cd` (which
+maps to on-axis catalog candela directly) for tight-beam authoring.
+IES profile import deferred.
+
 ### PR #147 — SDF fractals: Mandelbulb / Mandelbox / Apollonian (closes #99)
 
 **What:** Three iconic fractal distance estimators as a new SDF

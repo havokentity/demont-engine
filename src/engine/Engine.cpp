@@ -13152,6 +13152,47 @@ pt::renderer::SdfPrim VoxelToSdfCluster(const std::array<float, 3>& center,
     return prim;
 }
 
+// --- Photometric conversion helpers (#176) ---------------------------------
+//
+// Industry-standard light authoring lets the artist think in candela /
+// lumen / chromaticity-color-times-scalar terms rather than raw W/sr.
+// All conversions here are the SINGLE-WAVELENGTH (555nm peak photopic)
+// approximation -- the same shortcut Arnold / RenderMan / Octane take
+// when they expose a `units: lumens` enum on a point light. Per-channel
+// spectral exactness would require a spectral upsampling table from
+// RGB; that's deferred (see issue #176 "Out of scope").
+//
+// 683.002 lm/W is the luminous efficacy of monochromatic radiation at
+// 555nm (peak of the CIE 1924 photopic response curve), the value the
+// SI base-unit definition of the candela pins. So:
+//
+//   1 cd  (= 1 lm/sr) = 1/683.002 W/sr   at 555nm
+//   1 nit (= 1 cd/m^2) = 1/683.002 W/m^2/sr   at 555nm
+//
+// For an OMNIDIRECTIONAL point emitter of luminous intensity I [cd],
+// the total luminous flux is Phi = 4*pi*I [lm]. Inverting for the
+// `_lm` variant gives I_cd = Phi / (4*pi), then W/sr = I_cd / 683.002.
+//
+// The "exposure stop" is a log2 multiplier matching camera EV: each
+// stop doubles brightness, so a final scalar of intensity * 2^ev is
+// applied AFTER the unit conversion. This composes cleanly with the
+// engine's r_exposure tonemap stop (they multiply, but EV-on-light
+// is per-light while r_exposure is global).
+// Kept as a documented anchor: this is the SI value (683.002 lm/W at
+// 555nm peak photopic) all conversions below derive from. Referenced
+// only by comments / docs, hence the [[maybe_unused]] gate.
+[[maybe_unused]] constexpr float kLuminousEfficacy555nm = 683.002f;            // lm/W
+constexpr float kWsrPerCandela          = 1.0f / 683.002f;     // W/sr per cd
+// W/sr per lm for OMNIDIRECTIONAL emission (lm/(4*pi*sr) -> W/sr).
+constexpr float kWsrPerLumenOmni        = 1.0f / (683.002f * 4.0f * 3.14159265358979323846f);
+constexpr float kWm2srPerNit            = 1.0f / 683.002f;     // W/m^2/sr per cd/m^2
+
+// 2^ev. std::exp2f is preferred over std::pow(2,ev) (slightly faster +
+// monotone). For ev=0 returns exactly 1.0f.
+inline float Exposure2x(float ev) {
+    return std::exp2(ev);
+}
+
 }  // namespace
 
 void Engine::RegisterLightCommands() {
@@ -13335,6 +13376,467 @@ void Engine::RegisterLightCommands() {
             out.FormatLine("lights: quad id={} pos=({:.2f} {:.2f} {:.2f}) n=({:.2f} {:.2f} {:.2f}) u_half={} v_half={}",
                            id, x, y, z, nx, ny, nz, uh, vh);
         });
+
+    // --- Ergonomic variants (#176) ----------------------------------------
+    // Industry-standard authoring sugar over the canonical `light_*`
+    // primitives above. All variants compute the same W/sr (point/spot)
+    // or W/m^2/sr (sphere/quad) value as the low-level form and populate
+    // the same `AnalyticLight` struct, so internal math is unchanged.
+    // The cfg-save path (`light_list`-derived SaveArchivedCvars) writes
+    // the canonical W/sr form, so round-trip is preserved -- only the
+    // INPUT parser converts. See the photometric-helpers block above
+    // for the 1cd = 1/683.002 W/sr (555nm peak) reasoning and the
+    // single-wavelength approximation caveat.
+
+    // ---- light_point variants --------------------------------------------
+    C.RegisterCommand("light_point_color",
+        "light_point_color <id> <x> <y> <z> <r> <g> <b> <intensity_wsr>: "
+        "omnidirectional point light authored as color (RGB chromaticity, "
+        "typically in [0,1]) times scalar intensity in W/sr. Final emission "
+        "per channel = color * intensity, written into the same W/sr storage "
+        "the canonical `light_point` uses.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 8) {
+                out.PrintLine("usage: light_point_color <id> <x> <y> <z> <r> <g> <b> <intensity_wsr>");
+                return;
+            }
+            std::uint32_t id;
+            float x, y, z, r, g, b, intens;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z) ||
+                !ParseFloat(args[4], r) || !ParseFloat(args[5], g) || !ParseFloat(args[6], b) ||
+                !ParseFloat(args[7], intens)) {
+                out.PrintLine("light_point_color: arg parse failed");
+                return;
+            }
+            AnalyticLight L{};
+            L.type = AnalyticLight::Point;
+            L.pos[0] = x; L.pos[1] = y; L.pos[2] = z;
+            L.intensity[0] = r * intens;
+            L.intensity[1] = g * intens;
+            L.intensity[2] = b * intens;
+            light_prims_[id] = L;
+            light_prims_dirty_ = true;
+            accum_dirty_       = true;
+            out.FormatLine("lights: point id={} pos=({:.2f} {:.2f} {:.2f}) intensity*color=({:.3f} {:.3f} {:.3f}) W/sr",
+                           id, x, y, z, L.intensity[0], L.intensity[1], L.intensity[2]);
+        });
+
+    C.RegisterCommand("light_point_cd",
+        "light_point_cd <id> <x> <y> <z> <r> <g> <b> <intensity_cd>: "
+        "omnidirectional point light. Intensity in candela (1 cd = 1 lm/sr). "
+        "Internally converted via 1 cd = 1/683.002 W/sr (555nm peak photopic, "
+        "single-wavelength approximation). Final stored value: "
+        "color * (intensity_cd / 683.002) W/sr per channel.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 8) {
+                out.PrintLine("usage: light_point_cd <id> <x> <y> <z> <r> <g> <b> <intensity_cd>");
+                return;
+            }
+            std::uint32_t id;
+            float x, y, z, r, g, b, cd;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z) ||
+                !ParseFloat(args[4], r) || !ParseFloat(args[5], g) || !ParseFloat(args[6], b) ||
+                !ParseFloat(args[7], cd)) {
+                out.PrintLine("light_point_cd: arg parse failed");
+                return;
+            }
+            const float wsr = cd * kWsrPerCandela;
+            AnalyticLight L{};
+            L.type = AnalyticLight::Point;
+            L.pos[0] = x; L.pos[1] = y; L.pos[2] = z;
+            L.intensity[0] = r * wsr;
+            L.intensity[1] = g * wsr;
+            L.intensity[2] = b * wsr;
+            light_prims_[id] = L;
+            light_prims_dirty_ = true;
+            accum_dirty_       = true;
+            out.FormatLine("lights: point id={} pos=({:.2f} {:.2f} {:.2f}) {:.2f} cd -> color*({:.6f}) W/sr",
+                           id, x, y, z, cd, wsr);
+        });
+
+    C.RegisterCommand("light_point_lm",
+        "light_point_lm <id> <x> <y> <z> <r> <g> <b> <total_lumens>: "
+        "omnidirectional point light. Intensity in TOTAL luminous flux (lumens). "
+        "For omnidirectional emission Phi = 4*pi*I so I_cd = Phi / (4*pi); "
+        "internally converted via 1 lm omni = 1 / (683.002 * 4*pi) W/sr "
+        "(555nm peak photopic approximation). Final stored value: "
+        "color * (total_lumens / (683.002 * 4*pi)) W/sr per channel.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 8) {
+                out.PrintLine("usage: light_point_lm <id> <x> <y> <z> <r> <g> <b> <total_lumens>");
+                return;
+            }
+            std::uint32_t id;
+            float x, y, z, r, g, b, lm;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z) ||
+                !ParseFloat(args[4], r) || !ParseFloat(args[5], g) || !ParseFloat(args[6], b) ||
+                !ParseFloat(args[7], lm)) {
+                out.PrintLine("light_point_lm: arg parse failed");
+                return;
+            }
+            const float wsr = lm * kWsrPerLumenOmni;
+            AnalyticLight L{};
+            L.type = AnalyticLight::Point;
+            L.pos[0] = x; L.pos[1] = y; L.pos[2] = z;
+            L.intensity[0] = r * wsr;
+            L.intensity[1] = g * wsr;
+            L.intensity[2] = b * wsr;
+            light_prims_[id] = L;
+            light_prims_dirty_ = true;
+            accum_dirty_       = true;
+            out.FormatLine("lights: point id={} pos=({:.2f} {:.2f} {:.2f}) {:.2f} lm -> color*({:.6f}) W/sr",
+                           id, x, y, z, lm, wsr);
+        });
+
+    C.RegisterCommand("light_point_exposed",
+        "light_point_exposed <id> <x> <y> <z> <r> <g> <b> <intensity_wsr> <ev>: "
+        "omnidirectional point light with explicit exposure stop. Final stored "
+        "value per channel = color * intensity_wsr * 2^ev. Each EV stop doubles "
+        "brightness (camera EV convention); ev=0 is identity, ev=+1 is 2x, "
+        "ev=-1 is 0.5x. Composes with the global r_exposure tonemap (they "
+        "multiply: per-light EV scales emission, r_exposure scales display).",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 9) {
+                out.PrintLine("usage: light_point_exposed <id> <x> <y> <z> <r> <g> <b> <intensity_wsr> <ev>");
+                return;
+            }
+            std::uint32_t id;
+            float x, y, z, r, g, b, intens, ev;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z) ||
+                !ParseFloat(args[4], r) || !ParseFloat(args[5], g) || !ParseFloat(args[6], b) ||
+                !ParseFloat(args[7], intens) || !ParseFloat(args[8], ev)) {
+                out.PrintLine("light_point_exposed: arg parse failed");
+                return;
+            }
+            const float scale = intens * Exposure2x(ev);
+            AnalyticLight L{};
+            L.type = AnalyticLight::Point;
+            L.pos[0] = x; L.pos[1] = y; L.pos[2] = z;
+            L.intensity[0] = r * scale;
+            L.intensity[1] = g * scale;
+            L.intensity[2] = b * scale;
+            light_prims_[id] = L;
+            light_prims_dirty_ = true;
+            accum_dirty_       = true;
+            out.FormatLine("lights: point id={} pos=({:.2f} {:.2f} {:.2f}) intensity={:.3f} W/sr ev={:+.2f} -> color*({:.6f}) W/sr",
+                           id, x, y, z, intens, ev, scale);
+        });
+
+    // ---- light_spot variants ---------------------------------------------
+    // The spot helper closure pulls the shared parse + dir-normalise +
+    // cone-clamp logic out of every variant. unit_to_wsr is the
+    // per-variant conversion factor applied to the scalar input before
+    // multiplying by color.
+    auto spotAddCommon = [this](std::uint32_t id,
+                                float x, float y, float z,
+                                float dx, float dy, float dz,
+                                float outer_deg, float inner_deg,
+                                float r, float g, float b,
+                                float wsr,
+                                pt::console::Output& out,
+                                const char* tag) {
+        const float dlen = std::sqrt(dx*dx + dy*dy + dz*dz);
+        if (dlen < 1e-6f) { out.FormatLine("{}: dir magnitude is zero", tag); return; }
+        dx /= dlen; dy /= dlen; dz /= dlen;
+        if (outer_deg < 0.0f) outer_deg = 0.0f;
+        if (outer_deg > 89.99f) outer_deg = 89.99f;
+        if (inner_deg < 0.0f) inner_deg = 0.0f;
+        if (inner_deg > outer_deg) inner_deg = outer_deg;
+        AnalyticLight L{};
+        L.type = AnalyticLight::Spot;
+        L.pos[0] = x; L.pos[1] = y; L.pos[2] = z;
+        L.dir[0] = dx; L.dir[1] = dy; L.dir[2] = dz;
+        L.intensity[0] = r * wsr;
+        L.intensity[1] = g * wsr;
+        L.intensity[2] = b * wsr;
+        const float deg2rad = 3.14159265358979323846f / 180.0f;
+        L.cos_outer = std::cos(outer_deg * deg2rad);
+        L.cos_inner = std::cos(inner_deg * deg2rad);
+        light_prims_[id] = L;
+        light_prims_dirty_ = true;
+        accum_dirty_       = true;
+        out.FormatLine("lights: spot id={} pos=({:.2f} {:.2f} {:.2f}) dir=({:.2f} {:.2f} {:.2f}) outer={:.1f} inner={:.1f} intensity*color/sr=({:.3f} {:.3f} {:.3f})",
+                       id, x, y, z, dx, dy, dz, outer_deg, inner_deg,
+                       L.intensity[0], L.intensity[1], L.intensity[2]);
+    };
+
+    C.RegisterCommand("light_spot_color",
+        "light_spot_color <id> <x> <y> <z> <dx> <dy> <dz> <outer_deg> <inner_deg> <r> <g> <b> <intensity_wsr>: "
+        "spot light authored as color (RGB chromaticity) times scalar W/sr. "
+        "Cone falloff identical to canonical `light_spot`.",
+        [spotAddCommon](auto args, pt::console::Output& out) {
+            if (args.size() != 13) {
+                out.PrintLine("usage: light_spot_color <id> <x> <y> <z> <dx> <dy> <dz> <outer_deg> <inner_deg> <r> <g> <b> <intensity_wsr>");
+                return;
+            }
+            std::uint32_t id;
+            float x, y, z, dx, dy, dz, outer_deg, inner_deg, r, g, b, intens;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], x)  || !ParseFloat(args[2], y)  || !ParseFloat(args[3], z) ||
+                !ParseFloat(args[4], dx) || !ParseFloat(args[5], dy) || !ParseFloat(args[6], dz) ||
+                !ParseFloat(args[7], outer_deg) || !ParseFloat(args[8], inner_deg) ||
+                !ParseFloat(args[9], r)  || !ParseFloat(args[10], g) || !ParseFloat(args[11], b) ||
+                !ParseFloat(args[12], intens)) {
+                out.PrintLine("light_spot_color: arg parse failed");
+                return;
+            }
+            spotAddCommon(id, x, y, z, dx, dy, dz, outer_deg, inner_deg, r, g, b, intens, out, "light_spot_color");
+        });
+
+    C.RegisterCommand("light_spot_cd",
+        "light_spot_cd <id> <x> <y> <z> <dx> <dy> <dz> <outer_deg> <inner_deg> <r> <g> <b> <intensity_cd>: "
+        "spot light in candela (1 cd = 1/683.002 W/sr at 555nm peak). On-axis "
+        "intensity equals the cd value; cone falloff scales it down between "
+        "outer and inner half-angles.",
+        [spotAddCommon](auto args, pt::console::Output& out) {
+            if (args.size() != 13) {
+                out.PrintLine("usage: light_spot_cd <id> <x> <y> <z> <dx> <dy> <dz> <outer_deg> <inner_deg> <r> <g> <b> <intensity_cd>");
+                return;
+            }
+            std::uint32_t id;
+            float x, y, z, dx, dy, dz, outer_deg, inner_deg, r, g, b, cd;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], x)  || !ParseFloat(args[2], y)  || !ParseFloat(args[3], z) ||
+                !ParseFloat(args[4], dx) || !ParseFloat(args[5], dy) || !ParseFloat(args[6], dz) ||
+                !ParseFloat(args[7], outer_deg) || !ParseFloat(args[8], inner_deg) ||
+                !ParseFloat(args[9], r)  || !ParseFloat(args[10], g) || !ParseFloat(args[11], b) ||
+                !ParseFloat(args[12], cd)) {
+                out.PrintLine("light_spot_cd: arg parse failed");
+                return;
+            }
+            spotAddCommon(id, x, y, z, dx, dy, dz, outer_deg, inner_deg, r, g, b,
+                          cd * kWsrPerCandela, out, "light_spot_cd");
+        });
+
+    C.RegisterCommand("light_spot_lm",
+        "light_spot_lm <id> <x> <y> <z> <dx> <dy> <dz> <outer_deg> <inner_deg> <r> <g> <b> <total_lumens>: "
+        "spot light authored as total emitted luminous flux (lumens) over the "
+        "cone. Uses the omnidirectional 4*pi conversion (1 lm = 1/(683.002*4*pi) W/sr) "
+        "as a single-wavelength approximation -- this UNDER-states the per-steradian "
+        "intensity for narrow cones (treating the lm as if it spread over the full "
+        "sphere). For tighter calibration use `light_spot_cd` with the catalog "
+        "on-axis candela value instead.",
+        [spotAddCommon](auto args, pt::console::Output& out) {
+            if (args.size() != 13) {
+                out.PrintLine("usage: light_spot_lm <id> <x> <y> <z> <dx> <dy> <dz> <outer_deg> <inner_deg> <r> <g> <b> <total_lumens>");
+                return;
+            }
+            std::uint32_t id;
+            float x, y, z, dx, dy, dz, outer_deg, inner_deg, r, g, b, lm;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], x)  || !ParseFloat(args[2], y)  || !ParseFloat(args[3], z) ||
+                !ParseFloat(args[4], dx) || !ParseFloat(args[5], dy) || !ParseFloat(args[6], dz) ||
+                !ParseFloat(args[7], outer_deg) || !ParseFloat(args[8], inner_deg) ||
+                !ParseFloat(args[9], r)  || !ParseFloat(args[10], g) || !ParseFloat(args[11], b) ||
+                !ParseFloat(args[12], lm)) {
+                out.PrintLine("light_spot_lm: arg parse failed");
+                return;
+            }
+            spotAddCommon(id, x, y, z, dx, dy, dz, outer_deg, inner_deg, r, g, b,
+                          lm * kWsrPerLumenOmni, out, "light_spot_lm");
+        });
+
+    // ---- light_sphere variants -------------------------------------------
+    // Sphere area light authoring helper. unit_to_radiance is the
+    // per-variant conversion factor that turns the scalar input into
+    // W/m^2/sr radiance.
+    auto sphereAddCommon = [this](std::uint32_t id,
+                                  float x, float y, float z,
+                                  float radius,
+                                  float r, float g, float b,
+                                  float radiance,
+                                  pt::console::Output& out,
+                                  const char* tag) {
+        if (radius <= 0.0f) { out.FormatLine("{}: radius must be > 0", tag); return; }
+        AnalyticLight L{};
+        L.type = AnalyticLight::Sphere;
+        L.pos[0] = x; L.pos[1] = y; L.pos[2] = z;
+        L.radius = radius;
+        L.intensity[0] = r * radiance;
+        L.intensity[1] = g * radiance;
+        L.intensity[2] = b * radiance;
+        light_prims_[id] = L;
+        light_prims_dirty_ = true;
+        accum_dirty_       = true;
+        out.FormatLine("lights: sphere id={} pos=({:.2f} {:.2f} {:.2f}) r={:.3f} radiance*color=({:.3f} {:.3f} {:.3f}) W/m^2/sr",
+                       id, x, y, z, radius,
+                       L.intensity[0], L.intensity[1], L.intensity[2]);
+    };
+
+    C.RegisterCommand("light_sphere_color",
+        "light_sphere_color <id> <x> <y> <z> <radius> <r> <g> <b> <radiance_wm2sr>: "
+        "spherical diffuse area light authored as color (RGB chromaticity) times "
+        "scalar surface radiance in W/m^2/sr. Same physics as canonical "
+        "`light_sphere`, just decomposed.",
+        [sphereAddCommon](auto args, pt::console::Output& out) {
+            if (args.size() != 9) {
+                out.PrintLine("usage: light_sphere_color <id> <x> <y> <z> <radius> <r> <g> <b> <radiance_wm2sr>");
+                return;
+            }
+            std::uint32_t id;
+            float x, y, z, radius, r, g, b, rad;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z) ||
+                !ParseFloat(args[4], radius) ||
+                !ParseFloat(args[5], r) || !ParseFloat(args[6], g) || !ParseFloat(args[7], b) ||
+                !ParseFloat(args[8], rad)) {
+                out.PrintLine("light_sphere_color: arg parse failed");
+                return;
+            }
+            sphereAddCommon(id, x, y, z, radius, r, g, b, rad, out, "light_sphere_color");
+        });
+
+    C.RegisterCommand("light_sphere_nits",
+        "light_sphere_nits <id> <x> <y> <z> <radius> <r> <g> <b> <luminance_nits>: "
+        "spherical diffuse area light. Luminance in nits (1 nit = 1 cd/m^2). "
+        "Converted to surface radiance via 1 nit = 1/683.002 W/m^2/sr (555nm "
+        "peak photopic, single-wavelength approximation).",
+        [sphereAddCommon](auto args, pt::console::Output& out) {
+            if (args.size() != 9) {
+                out.PrintLine("usage: light_sphere_nits <id> <x> <y> <z> <radius> <r> <g> <b> <luminance_nits>");
+                return;
+            }
+            std::uint32_t id;
+            float x, y, z, radius, r, g, b, nits;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z) ||
+                !ParseFloat(args[4], radius) ||
+                !ParseFloat(args[5], r) || !ParseFloat(args[6], g) || !ParseFloat(args[7], b) ||
+                !ParseFloat(args[8], nits)) {
+                out.PrintLine("light_sphere_nits: arg parse failed");
+                return;
+            }
+            sphereAddCommon(id, x, y, z, radius, r, g, b,
+                            nits * kWm2srPerNit, out, "light_sphere_nits");
+        });
+
+    // ---- light_quad variants ---------------------------------------------
+    // Quad area light authoring helper. unit_to_radiance is the
+    // per-variant conversion factor that turns the scalar input into
+    // W/m^2/sr radiance.
+    auto quadAddCommon = [this](std::uint32_t id,
+                                float x, float y, float z,
+                                float nx, float ny, float nz,
+                                float ux, float uy, float uz,
+                                float uh, float vh,
+                                float r, float g, float b,
+                                float radiance,
+                                pt::console::Output& out,
+                                const char* tag) {
+        const float nlen = std::sqrt(nx*nx + ny*ny + nz*nz);
+        if (nlen < 1e-6f) { out.FormatLine("{}: normal magnitude is zero", tag); return; }
+        nx /= nlen; ny /= nlen; nz /= nlen;
+        const float ndu = nx*ux + ny*uy + nz*uz;
+        float uxo = ux - nx*ndu;
+        float uyo = uy - ny*ndu;
+        float uzo = uz - nz*ndu;
+        const float ulen = std::sqrt(uxo*uxo + uyo*uyo + uzo*uzo);
+        if (ulen < 1e-6f) { out.FormatLine("{}: u-axis collinear with normal", tag); return; }
+        uxo /= ulen; uyo /= ulen; uzo /= ulen;
+        if (uh <= 0.0f || vh <= 0.0f) {
+            out.FormatLine("{}: u_half and v_half must be > 0", tag);
+            return;
+        }
+        AnalyticLight L{};
+        L.type = AnalyticLight::Quad;
+        L.pos[0] = x; L.pos[1] = y; L.pos[2] = z;
+        L.dir[0] = nx; L.dir[1] = ny; L.dir[2] = nz;
+        L.u_vec[0] = uxo * uh; L.u_vec[1] = uyo * uh; L.u_vec[2] = uzo * uh;
+        L.v_half   = vh;
+        L.intensity[0] = r * radiance;
+        L.intensity[1] = g * radiance;
+        L.intensity[2] = b * radiance;
+        light_prims_[id] = L;
+        light_prims_dirty_ = true;
+        accum_dirty_       = true;
+        out.FormatLine("lights: quad id={} pos=({:.2f} {:.2f} {:.2f}) n=({:.2f} {:.2f} {:.2f}) u_half={} v_half={} radiance*color=({:.3f} {:.3f} {:.3f}) W/m^2/sr",
+                       id, x, y, z, nx, ny, nz, uh, vh,
+                       L.intensity[0], L.intensity[1], L.intensity[2]);
+    };
+
+    C.RegisterCommand("light_quad_color",
+        "light_quad_color <id> <x> <y> <z> <nx> <ny> <nz> <ux> <uy> <uz> <u_half> <v_half> <r> <g> <b> <radiance_wm2sr>: "
+        "rectangular diffuse one-sided area light authored as color (RGB chromaticity) "
+        "times scalar surface radiance in W/m^2/sr. Same physics as canonical "
+        "`light_quad`, just decomposed.",
+        [quadAddCommon](auto args, pt::console::Output& out) {
+            if (args.size() != 16) {
+                out.PrintLine("usage: light_quad_color <id> <x> <y> <z> <nx> <ny> <nz> <ux> <uy> <uz> <u_half> <v_half> <r> <g> <b> <radiance_wm2sr>");
+                return;
+            }
+            std::uint32_t id;
+            float x, y, z, nx, ny, nz, ux, uy, uz, uh, vh, r, g, b, rad;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], x)  || !ParseFloat(args[2], y)  || !ParseFloat(args[3], z) ||
+                !ParseFloat(args[4], nx) || !ParseFloat(args[5], ny) || !ParseFloat(args[6], nz) ||
+                !ParseFloat(args[7], ux) || !ParseFloat(args[8], uy) || !ParseFloat(args[9], uz) ||
+                !ParseFloat(args[10], uh) || !ParseFloat(args[11], vh) ||
+                !ParseFloat(args[12], r) || !ParseFloat(args[13], g) || !ParseFloat(args[14], b) ||
+                !ParseFloat(args[15], rad)) {
+                out.PrintLine("light_quad_color: arg parse failed");
+                return;
+            }
+            quadAddCommon(id, x, y, z, nx, ny, nz, ux, uy, uz, uh, vh, r, g, b,
+                          rad, out, "light_quad_color");
+        });
+
+    C.RegisterCommand("light_quad_nits",
+        "light_quad_nits <id> <x> <y> <z> <nx> <ny> <nz> <ux> <uy> <uz> <u_half> <v_half> <r> <g> <b> <luminance_nits>: "
+        "rectangular diffuse one-sided area light. Luminance in nits (1 nit = 1 cd/m^2). "
+        "Converted to surface radiance via 1 nit = 1/683.002 W/m^2/sr (555nm peak "
+        "photopic, single-wavelength approximation). Useful for matching display "
+        "spec sheets directly (e.g. \"500 nit OLED panel\").",
+        [quadAddCommon](auto args, pt::console::Output& out) {
+            if (args.size() != 16) {
+                out.PrintLine("usage: light_quad_nits <id> <x> <y> <z> <nx> <ny> <nz> <ux> <uy> <uz> <u_half> <v_half> <r> <g> <b> <luminance_nits>");
+                return;
+            }
+            std::uint32_t id;
+            float x, y, z, nx, ny, nz, ux, uy, uz, uh, vh, r, g, b, nits;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], x)  || !ParseFloat(args[2], y)  || !ParseFloat(args[3], z) ||
+                !ParseFloat(args[4], nx) || !ParseFloat(args[5], ny) || !ParseFloat(args[6], nz) ||
+                !ParseFloat(args[7], ux) || !ParseFloat(args[8], uy) || !ParseFloat(args[9], uz) ||
+                !ParseFloat(args[10], uh) || !ParseFloat(args[11], vh) ||
+                !ParseFloat(args[12], r) || !ParseFloat(args[13], g) || !ParseFloat(args[14], b) ||
+                !ParseFloat(args[15], nits)) {
+                out.PrintLine("light_quad_nits: arg parse failed");
+                return;
+            }
+            quadAddCommon(id, x, y, z, nx, ny, nz, ux, uy, uz, uh, vh, r, g, b,
+                          nits * kWm2srPerNit, out, "light_quad_nits");
+        });
+
+    C.RegisterCommand("light_quad_exposed",
+        "light_quad_exposed <id> <x> <y> <z> <nx> <ny> <nz> <ux> <uy> <uz> <u_half> <v_half> <r> <g> <b> <radiance_wm2sr> <ev>: "
+        "rectangular diffuse one-sided area light with explicit exposure stop. "
+        "Final stored radiance per channel = color * radiance_wm2sr * 2^ev "
+        "(camera EV convention: each stop doubles brightness).",
+        [quadAddCommon](auto args, pt::console::Output& out) {
+            if (args.size() != 17) {
+                out.PrintLine("usage: light_quad_exposed <id> <x> <y> <z> <nx> <ny> <nz> <ux> <uy> <uz> <u_half> <v_half> <r> <g> <b> <radiance_wm2sr> <ev>");
+                return;
+            }
+            std::uint32_t id;
+            float x, y, z, nx, ny, nz, ux, uy, uz, uh, vh, r, g, b, rad, ev;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], x)  || !ParseFloat(args[2], y)  || !ParseFloat(args[3], z) ||
+                !ParseFloat(args[4], nx) || !ParseFloat(args[5], ny) || !ParseFloat(args[6], nz) ||
+                !ParseFloat(args[7], ux) || !ParseFloat(args[8], uy) || !ParseFloat(args[9], uz) ||
+                !ParseFloat(args[10], uh) || !ParseFloat(args[11], vh) ||
+                !ParseFloat(args[12], r) || !ParseFloat(args[13], g) || !ParseFloat(args[14], b) ||
+                !ParseFloat(args[15], rad) || !ParseFloat(args[16], ev)) {
+                out.PrintLine("light_quad_exposed: arg parse failed");
+                return;
+            }
+            quadAddCommon(id, x, y, z, nx, ny, nz, ux, uy, uz, uh, vh, r, g, b,
+                          rad * Exposure2x(ev), out, "light_quad_exposed");
+        });
+    // --- end #176 ergonomic variants --------------------------------------
 }
 // --- end Light primitives --------------------------------------------------
 
