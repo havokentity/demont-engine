@@ -33,7 +33,13 @@ if(APPLE)
         PUBLIC  "-framework AudioUnit"
     )
 elseif(UNIX)
-    target_link_libraries(pt_audio PUBLIC dl pthread m)
+    # Threads::Threads is the idiomatic CMake imported target for
+    # pthread (works across GCC/Clang/Intel and avoids hard-coding
+    # `-lpthread`). libm is implicitly satisfied by the C++ stdlib on
+    # glibc / libc++; miniaudio's <math.h> usages link through libc++
+    # without an explicit `-lm` on every supported Linux toolchain.
+    find_package(Threads REQUIRED)
+    target_link_libraries(pt_audio PUBLIC dl Threads::Threads)
 elseif(WIN32)
     target_link_libraries(pt_audio PUBLIC ole32)
 endif()
