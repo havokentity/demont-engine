@@ -3478,16 +3478,36 @@ void Engine::EnsurePrimitivesUploaded() {
         }
     }
 
-    LOG_INFO("[bvh] uploaded {} prim(s): {} linear (planes etc), {} finite ({}, {} BVH nodes)",
-             count, linear_prim_count_, count - linear_prim_count_,
-             analytic_bvh_.Empty() ? "linear scan" : "BVH",
-             analytic_bvh_.Empty() ? 0u : static_cast<std::uint32_t>(analytic_bvh_.NodeCount()));
-    if (!analytic_bvh_.Empty() && analytic_bvh_.NodeCount() > 0) {
-        const auto& n0 = analytic_bvh_.Nodes()[0];
-        LOG_INFO("[bvh] root node aabb=[{:.2f},{:.2f},{:.2f} .. {:.2f},{:.2f},{:.2f}] left_first={} count={}",
-                 n0.aabb_min[0], n0.aabb_min[1], n0.aabb_min[2],
-                 n0.aabb_max[0], n0.aabb_max[1], n0.aabb_max[2],
-                 n0.left_first, n0.count);
+    // Dedup log spam: physics moves rigid bodies every frame, which
+    // re-flags primitives_dirty_ and re-enters this function, but the
+    // *count* / linear-vs-finite split / BVH topology only changes
+    // when prims are added/removed/rebuilt. Log only the
+    // structurally-interesting events; per-frame position-only
+    // re-uploads are silent. See Engine.h bvh_last_log_* cache.
+    const std::uint32_t bvh_node_count = analytic_bvh_.Empty()
+        ? 0u
+        : static_cast<std::uint32_t>(analytic_bvh_.NodeCount());
+    const bool bvh_empty = analytic_bvh_.Empty();
+    const bool log_changed =
+        bvh_last_log_count_       != static_cast<std::int64_t>(count) ||
+        bvh_last_log_linear_      != linear_prim_count_                ||
+        bvh_last_log_node_count_  != bvh_node_count                    ||
+        bvh_last_log_empty_       != bvh_empty;
+    if (log_changed) {
+        LOG_INFO("[bvh] uploaded {} prim(s): {} linear (planes etc), {} finite ({}, {} BVH nodes)",
+                 count, linear_prim_count_, count - linear_prim_count_,
+                 bvh_empty ? "linear scan" : "BVH", bvh_node_count);
+        if (!bvh_empty && bvh_node_count > 0) {
+            const auto& n0 = analytic_bvh_.Nodes()[0];
+            LOG_INFO("[bvh] root node aabb=[{:.2f},{:.2f},{:.2f} .. {:.2f},{:.2f},{:.2f}] left_first={} count={}",
+                     n0.aabb_min[0], n0.aabb_min[1], n0.aabb_min[2],
+                     n0.aabb_max[0], n0.aabb_max[1], n0.aabb_max[2],
+                     n0.left_first, n0.count);
+        }
+        bvh_last_log_count_      = static_cast<std::int64_t>(count);
+        bvh_last_log_linear_     = linear_prim_count_;
+        bvh_last_log_node_count_ = bvh_node_count;
+        bvh_last_log_empty_      = bvh_empty;
     }
     primitives_dirty_ = false;
     accum_dirty_      = true;

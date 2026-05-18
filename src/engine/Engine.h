@@ -994,6 +994,18 @@ private:
     // at the console after init was done).
     bool                                        engine_initialized_    = false;
     bool                                        accum_dirty_           = true;
+    // BVH-upload log dedup state. EnsurePrimitivesUploaded fires every
+    // frame that any analytic prim's position changed (e.g. physics
+    // step moved a rigid body), which previously spammed the
+    // "[bvh] uploaded N prim(s)" log line at frame rate. Cache the
+    // last-logged (count, linear_count, bvh_node_count, bvh_empty)
+    // tuple and only emit when something actually changed (add /
+    // remove / topology rebuild). Sentinel -1 forces a log on the
+    // very first upload after init.
+    std::int64_t                                bvh_last_log_count_       = -1;
+    std::uint32_t                               bvh_last_log_linear_      = 0;
+    std::uint32_t                               bvh_last_log_node_count_  = 0;
+    bool                                        bvh_last_log_empty_       = true;
     BackendType                                 current_backend_       = BackendType::None;
     bool                                        mouse_look_active_     = false;
     std::atomic<bool>                           wants_quit_{false};
