@@ -41,10 +41,28 @@
 // the night sky still pick up star light. Only the primary-miss
 // pixel write peels them off.
 //
-// Bindings (Metal MSL slots assigned in declaration order: hdr_inout
-// -> texture(0), star_map -> texture(1), moon_map -> texture(2),
-// depth_tex -> texture(3); vk::binding tags are for the SPIR-V path
-// -- presently not wired, see the TODO at the engine dispatch site).
+// Bindings.
+//
+// Metal MSL slot assignment is by declaration order: hdr_inout ->
+// texture(0), star_map -> texture(1), moon_map -> texture(2),
+// depth_tex -> texture(3), cloud_trans_tex -> texture(4). Engine.cpp's
+// dispatch site binds engine slots 0..4 in that same order.
+//
+// SPIR-V vk::binding numbers align with VulkanDevice's shared 14-slot
+// descriptor set layout via kSlotToTexBinding[]: engine slot 0 -> binding
+// 0 (output / hdr_inout target), slot 1 -> binding 1 (engine reuses the
+// PathTrace accum_hdr slot for star_map -- partially-bound layout
+// tolerates per-dispatch view-format changes since StarsComposite's
+// shader-side image_format("rgba16f") matches the star_map RGBA16F
+// view), slot 2 -> binding 6 (moon_map reuses PathTrace's denoise_color
+// slot, same RGBA16F format), slot 3 -> binding 7 (depth_tex -- same
+// binding as PathTrace's depth G-buffer), slot 4 -> binding 8
+// (cloud_trans_tex reuses motion_tex's slot; shader declares
+// image_format("r32f") to match the cloud_trans view, which differs
+// from PathTrace's rg16f motion_tex declaration -- per-dispatch view
+// rebind handles the format change). The shared layout's TLAS at
+// binding 2 and other unused slots are simply not written by this
+// dispatch (PARTIALLY_BOUND).
 //
 // depth_tex is PathTrace's per-pixel primary-hit depth G-buffer (linear
 // camera-space Z in world units along the forward axis). Sky pixels --
@@ -60,7 +78,7 @@
 // See PathTrace.slang for the NVIDIA Format=Unknown rationale.
 [[vk::binding(0, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> hdr_inout;
 [[vk::binding(1, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> star_map;
-[[vk::binding(2, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> moon_map;
+[[vk::binding(6, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> moon_map;
 [[vk::binding(7, 0), vk::image_format("r32f")]]    RWTexture2D<float>  depth_tex;
 // Cloud transmittance along the camera ray, written by PathTrace's
 // volumetric march at the end of main(). 1.0 = no cloud blocking
@@ -73,11 +91,17 @@
 // b>0 cloud-march integration. This texture only carries the
 // transmittance number the composite needs.
 //
-// vk::binding(22, 0) matches PathTrace.slang's cloud_trans_tex slot;
-// Metal MSL assigns texture(4) by declaration order (slot 0..3 above,
+// vk::binding(8, 0) -- reused from PathTrace's motion_tex slot, the
+// only unified-layout binding immediately compatible with engine slot 4
+// after the kSlotToTexBinding[] mapping. PathTrace declares this slot
+// as rg16f / RWTexture2D<float2> for motion vectors; StarsComposite
+// declares it r32f / RWTexture2D<float> for cloud transmittance. The
+// shared descriptor set layout is format-agnostic (just STORAGE_IMAGE);
+// each dispatch binds a fresh view matching its shader's declaration.
+// Metal MSL assigns texture(4) by declaration order (slots 0..3 above,
 // slot 4 here). Engine binds it at engine slot 4 in the composite
 // dispatch.
-[[vk::binding(22, 0), vk::image_format("r32f")]] RWTexture2D<float>  cloud_trans_tex;
+[[vk::binding(8, 0), vk::image_format("r32f")]] RWTexture2D<float>  cloud_trans_tex;
 
 // MSL SLOT NOTICE: this kernel binds NO buffers and NO acceleration
 // structures. Slang's MSL backend therefore assigns Push (the only
@@ -96,58 +120,115 @@
 // doesn't actually need exposure_state, and the simpler "Push at
 // buf(0), no other buffers" layout removes the failure mode entirely.
 
+// Per-field semantics (used by both target-specific declarations below):
+//   pos_fovtan      -- .xyz camera origin, .w fovYTan
+//   fwd_aspect      -- .xyz forward, .w aspect ratio (width/height)
+//   right_xyz / up_xyz -- camera basis
+//   sun_and_mode    -- .xyz sun dir, .w sky mode (0=gradient,1=hdri,
+//                       2=procedural). Composite runs only in procedural.
+//   exposure_pad    -- .y procedural cell-hash starfield on (1.0),
+//                       .z BSC starmap sample on (1.0),
+//                       .w stars twinkle on (1.0)
+//   w2j_row0..2     -- world->J2000 rotation rows used by starsOnly
+//                       for the BSC sample
+//   moon_dir_phase  -- .xyz unit vec toward moon, .w phase angle (rad)
+//   moon_extra      -- .x r_moon_size, .y distance ratio,
+//                       .z r_moon_brightness
+//   sun_extra       -- .x r_sun_size, .y distance ratio,
+//                       .z vertical-flatten
+//   dof_params      -- .x aperture radius (0 = pinhole),
+//                       .y focal distance,
+//                       .z aperture blade count (0 = round disk,
+//                       3..16 = polygonal)
+//   frame_index     -- frame counter, used by twinkle hash + sample
+//                       pattern rotation
+//   ap_samples      -- per-pixel aperture sample count (1..64).
+//                       1 = single ray through pixel centre; >1 spreads
+//                       samples across the lens aperture (DOF on) or
+//                       sub-pixel jitter (DOF off). Engine sources from
+//                       r_stars_aperture_samples (default 16); cost
+//                       scales linearly with average path length inside
+//                       starsOnly / sunDisc / moonDisc.
+//   composite_active -- 1 -> run the composite (engine's gate for
+//                       r_star_split && procedural sky); 0 -> early-out
+//                       (texture unchanged). Engine also elides the
+//                       dispatch entirely when this would be 0 so the
+//                       only path that observes the early-out is the
+//                       narrow window between gate evaluation in the
+//                       engine and the GPU-side guard here.
+
+#ifdef PT_TARGET_SPIRV
+// Vulkan path. NVIDIA's maxPushConstantsSize is 256B and the engine's
+// shared pipeline layout reserves only the first 112B for hw push
+// constants (VulkanDevice::kPushSplitOffset), with the remainder
+// spilling into a per-frame Frame UBO at vk::binding(14, 0). The host
+// StarsCompositePush struct is contiguous 224B; VulkanCommandBuffer::
+// Dispatch byte-splits it: bytes [0..112) -> vkCmdPushConstants, bytes
+// [112..224) -> the Frame UBO ring buffer. PathTrace.slang already uses
+// this split for its 832B PtPush; StarsComposite follows the same
+// convention so both shaders coexist in the shared layout.
 [[vk::push_constant]]
 cbuffer Push {
-    // Camera basis. Same layout as PathTrace.slang's prefix so a host
-    // PtPush copy can repurpose the leading bytes if we ever share the
-    // struct -- but the engine builds a dedicated StarsCompositePush
-    // today, kept independent so this kernel stays free of the
-    // 736-byte PathTrace tail.
-    float4 pos_fovtan;     // .xyz = camera origin, .w = fovYTan
-    float4 fwd_aspect;     // .xyz = forward, .w = aspect ratio (width/height)
+    float4 pos_fovtan;
+    float4 fwd_aspect;
     float4 right_xyz;
     float4 up_xyz;
-
-    // .xyz = unit vector toward sun, .w = sky mode (0=gradient,
-    // 1=hdri, 2=procedural). We only run the celestials composite in
-    // procedural mode (mode == 2); other modes have stars/sun/moon
-    // baked into env_map or use a fallback gradient.
     float4 sun_and_mode;
-    // .y = 1.0 if procedural cell-hash starfield is active.
-    // .z = 1.0 if BSC starmap should be sampled.
-    // .w = 1.0 if stars should twinkle (atmospheric scintillation).
     float4 exposure_pad;
-    // World->J2000 rotation rows used by starsOnly for the BSC sample.
+    float4 w2j_row0;
+};
+
+// Spilled tail of StarsCompositePush. Layout is byte-equivalent to
+// bytes [112..224) of the host struct in Engine.cpp. Bound by
+// VulkanCommandBuffer::Dispatch from a per-frame ring-buffer UBO.
+// The UBO at binding(14, 0) is shared with PathTrace.slang (which
+// declares its own larger view of the same buffer); each shader
+// reads only the fields it declares, and the engine overwrites only
+// the [0..tail) prefix of the UBO per dispatch -- bytes past the
+// current dispatch's tail retain whatever was there before and are
+// not read.
+[[vk::binding(14, 0)]]
+cbuffer Frame {
+    float4 w2j_row1;
+    float4 w2j_row2;
+    float4 moon_dir_phase;
+    float4 moon_extra;
+    float4 sun_extra;
+    float4 dof_params;
+    uint   frame_index;
+    uint   ap_samples;
+    uint   composite_active;
+    uint   _pad0;
+};
+
+#else  // !PT_TARGET_SPIRV -- Metal MSL path
+
+// Metal lowers [[vk::push_constant]] to a regular setBytes buffer slot
+// with no hw size cap, so we keep the full 224B struct contiguous and
+// avoid the split. Field order MUST match the SPIR-V Push + Frame
+// declarations above (Engine.cpp pushes one contiguous 224B blob).
+[[vk::push_constant]]
+cbuffer Push {
+    float4 pos_fovtan;
+    float4 fwd_aspect;
+    float4 right_xyz;
+    float4 up_xyz;
+    float4 sun_and_mode;
+    float4 exposure_pad;
     float4 w2j_row0;
     float4 w2j_row1;
     float4 w2j_row2;
-    // .xyz = unit vector toward moon, .w = phase angle (radians).
     float4 moon_dir_phase;
-    // .x = r_moon_size, .y = distance ratio, .z = r_moon_brightness.
     float4 moon_extra;
-    // .x = r_sun_size, .y = distance ratio, .z = vertical-flatten.
     float4 sun_extra;
-    // .x = aperture radius (0 = pinhole), .y = focal distance,
-    // .z = aperture blade count (0 = round disk, 3..16 = polygonal).
     float4 dof_params;
-
     uint frame_index;
-    // Per-pixel aperture sample count. 1 = single ray through pixel
-    // centre (no bokeh, no jitter benefit). >1 spreads samples across
-    // the lens aperture (DOF on) or sub-pixel jitter (DOF off) so a
-    // bokeh disc resolves in one frame. Engine sources this from
-    // r_stars_aperture_samples (default 16); cost scales linearly with
-    // the average path length inside starsOnly/sunDisc/moonDisc.
     uint ap_samples;
-    // 1 -> run the composite (engine's gate for r_star_split &&
-    // procedural sky); 0 -> early-out (texture unchanged). Cheaper
-    // than skipping the dispatch entirely because it keeps the
-    // compute-pipeline state binding stable, but the dispatch itself
-    // is still elided engine-side when this is 0 so we don't burn
-    // GPU on an early-return-everywhere kernel.
     uint composite_active;
     uint _pad0;
 };
+
+#endif  // PT_TARGET_SPIRV
 
 // --- ported helpers from PathTrace.slang -----------------------------
 //

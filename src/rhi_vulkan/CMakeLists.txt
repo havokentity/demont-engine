@@ -143,6 +143,17 @@ pt_compile_slang(
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/EditorOverlay.slang
     STAGE compute ENTRY main TARGETS spirv)
+# Stateless celestial composite (issue #46). Reads the post-denoise HDR
+# target and additively writes sun / moon / BSC + procedural stars with
+# aperture-sampled bokeh. On Vulkan this rides the shared 14-slot
+# descriptor set layout via kSlotToTexBinding[] (slot 0 -> binding 0,
+# slot 1 -> binding 1, slot 2 -> binding 6, slot 3 -> binding 7,
+# slot 4 -> binding 8 -- see shader header for the rationale on each
+# reuse). 224B push splits at kPushSplitOffset = 112 into hw push
+# constants + a Frame UBO tail, mirroring PathTrace's split.
+pt_compile_slang(
+    TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/StarsComposite.slang
+    STAGE compute ENTRY main TARGETS spirv)
 # SVGF/NRD denoiser kernels. Each is its own SPIR-V blob; the Vulkan
 # backend's VulkanNrdDenoiser builds a dedicated VkPipelineLayout +
 # 2 VkPipeline handles from these and dispatches them in sequence.

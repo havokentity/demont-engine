@@ -6527,11 +6527,31 @@ void Engine::RenderFrame() {
     //   - sky mode procedural   : only mode the composite handles
     //                             (hdri bakes celestials into env_map,
     //                             gradient sky has none)
-    //   - stars_composite_pipeline_id_ != 0 : Metal-only today; on
-    //                             Vulkan this stays zero so the gate
-    //                             collapses correctly to "no
-    //                             subtraction, legacy path" until the
-    //                             Vulkan compositor lands.
+    //   - stars_composite_pipeline_id_ != 0 : the composite kernel
+    //                             must be registered on the active
+    //                             backend. Both Metal and Vulkan now
+    //                             build + register stars_composite, so
+    //                             the pipeline id is non-zero on either
+    //                             backend. The composite DISPATCH,
+    //                             however, lives inside the
+    //                             `use_engine_tonemap` branch below
+    //                             (Metal-only today -- Tonemap.slang
+    //                             produces black on Vulkan, so the
+    //                             post-denoise tonemap + bloom + composite
+    //                             chain runs inside VulkanNrdDenoiser::
+    //                             Encode on Vulkan with no engine-side
+    //                             hook between the SVGF output and the
+    //                             swap write). To prevent
+    //                             composite_celestials from firing on
+    //                             Vulkan while the dispatch path is
+    //                             unreachable (PathTrace would peel
+    //                             celestials but the composite would
+    //                             never add them back -> empty sky),
+    //                             we ALSO gate this on backend_is_metal
+    //                             below. Removing the metal-only guard
+    //                             will require adding a Vulkan dispatch
+    //                             path for StarsComposite first -- see
+    //                             FOLLOW_UPS / Raytracer Plan.
     //   - cloud_trans_tex_id_ != 0 : composite reads this texture and
     //                             would crash without it.
     //   - depth_tex_id_ != 0   : composite reads this texture for the
@@ -6551,13 +6571,16 @@ void Engine::RenderFrame() {
     {
         bool star_split_on = true;
         if (auto* v = C.FindCVar("r_star_split")) star_split_on = v->GetBool();
+        const bool backend_is_metal =
+            (current_backend_ == pt::rhi::BackendType::Metal);
         engine_composite_active =
             denoiser_active_ &&
             star_split_on &&
             (sky_mode_int == 2) &&
             stars_composite_pipeline_id_ != 0 &&
             cloud_trans_tex_id_ != 0 &&
-            depth_tex_id_ != 0;
+            depth_tex_id_ != 0 &&
+            backend_is_metal;
         push.composite_celestials = engine_composite_active ? 1u : 0u;
     }
     push._pad_star_split = 0u;
@@ -7974,9 +7997,17 @@ void Engine::RenderFrame() {
         // (#108). The stateless StarsComposite rewrite eliminates the
         // accumulator; the Vulkan path's denoiser finalize no longer
         // needs a stars binding. Stars on the Vulkan denoiser route
-        // are a follow-up -- the StarsComposite kernel itself is
-        // backend-agnostic, but the Vulkan dispatch plumbing (fresh
-        // pipeline layout + descriptor set) is the missing piece.
+        // are a follow-up -- the StarsComposite kernel now builds and
+        // registers on Vulkan via this PR (shared 14-slot descriptor
+        // layout via kSlotToTexBinding[] reuse + a 112B push + 112B
+        // Frame UBO tail at binding(14, 0)), but the dispatch site
+        // currently lives inside the Metal-only use_engine_tonemap
+        // branch. A dedicated Vulkan dispatch path (engine-side
+        // post-Denoise hook, or composite-inside-VulkanNrdDenoiser
+        // between atrous and finalize) is the missing piece. Until
+        // then the metal-only guard on engine_composite_active above
+        // keeps push.composite_celestials = 0 on Vulkan so PathTrace
+        // doesn't peel celestials the composite can't add back.
         // Leaving dd.stars_in zero tells the backend the slot is
         // unused; DenoiseFinalize.slang has correspondingly dropped
         // its stars_tex declaration in this PR.
