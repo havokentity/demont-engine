@@ -676,6 +676,7 @@ namespace cvar {
     PT_CVAR(r_clouds_wind_z,         "0.0",      "Wind speed along +Z in metres/second.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_seed,           "0",        "Per-day noise seed (any float). Same preset + different seed = visually distinct cloud pattern. Use one seed per in-game day so each day has its own weather pattern.", CVAR_ARCHIVE);
     PT_CVAR(r_rayleigh,              "30.0",     "Atmospheric Rayleigh scattering scale on the per-channel sea-level sigma (R 5.8e-6, G 13.5e-6, B 33.1e-6 per metre). 1.0 = real Earth atmosphere -- but our typical r_volumetric_density (Mie haze) is ~30x stronger than real-Earth haze, so bumping this to 30 keeps the sky visibly blue at typical haze settings. Drop to 1.0 if you also drop r_volumetric_density to 0.0001-0.0005 (real haze). 0 disables Rayleigh.", CVAR_ARCHIVE);
+    PT_CVAR(r_planet_radius,         "6378137.0", "Planet radius in metres for spherical-Earth atmospheric scattering (issue #51). Default 6,378,137 m = WGS-84 equatorial Earth radius. The path tracer's `atmosphericTransmittance` numerically integrates Mie + Rayleigh optical depth along a chord through a thin shell around a sphere of this radius (centre at world origin + offset so y=0 sits on the surface). Set to 0 to fall back to the legacy planar exponential integral (1/sin(elev) airmass) -- useful as a debug A/B or for tiny-scene tests where curvature is invisible. Real values for other bodies: Moon 1,737,400, Mars 3,389,500, Venus 6,051,800. Affects only the atmosphere integral, not collision / shadow geometry.", CVAR_ARCHIVE);
     PT_CVAR(r_moon_size,             "1.0",      "Moon angular-size multiplier. 1.0 = our default 0.55deg half-angle (already 2x the real 0.27deg, for visibility at typical 60-FOV 1080p). 5+ = dramatic 'big moon' shots; 0.5 = real lunar size (very small). Astronomical distance variation (perigee/apogee) is also applied on top -- supermoons render ~14% bigger than micro-moons.", CVAR_ARCHIVE);
     PT_CVAR(r_sun_size,              "1.0",      "Sun angular-size multiplier. 1.0 = real ~0.55deg half-angle. Astronomical Earth-Sun distance (perihelion/aphelion) modulates this ~3.4% across the year. Bump for cinematic shots.", CVAR_ARCHIVE);
     PT_CVAR(r_sun_horizon_flatten,   "1",        "Atmospheric refraction differentially lifts the sun's lower limb more than its upper limb, vertically squishing the disc into an oval as it nears the horizon (Saemundsson 1986). 1 = physical flatten enabled (vertical-scale ~0.78 at elev=0 / ~21% squish, ~0.87 at 1deg, ~0.97 at 5deg, ~0.99 at 10deg); 0 = render a perfect circle regardless of elevation. Horizontal radius is unchanged either way; r_sun_size stacks on top.", CVAR_ARCHIVE);
@@ -4446,7 +4447,22 @@ void Engine::RenderFrame() {
             s_refr_logged_active = active;
         }
         push.sun_extra[2] = vflat;
-        push.sun_extra[3] = 0.0f;
+        // sun_extra[3] = planet radius in metres for spherical-Earth
+        // atmospheric transmittance (issue #51). The shader's
+        // `atmosphericTransmittance` numerically integrates Mie + Rayleigh
+        // optical depth along the curved chord when this is > 0;
+        // 0 falls back to the legacy planar exponential integral
+        // (1/sin(elev) airmass divergence at horizon).
+        float planet_radius_m = 6378137.0f;
+        if (auto* v = C.FindCVar("r_planet_radius")) planet_radius_m = v->GetFloat();
+        // Negative values are nonsense -- clamp to 0 to mean "disable
+        // curved-Earth, use planar". Anything between 0 and ~Earth radius
+        // produces an unphysical-but-rendered-correctly miniature planet
+        // (clouds touch the horizon sooner). We don't impose an upper
+        // bound so future moonlit / Mars / gas-giant render passes can
+        // pass realistic radii.
+        if (planet_radius_m < 0.0f) planet_radius_m = 0.0f;
+        push.sun_extra[3] = planet_radius_m;
     }
 
     // HDRI multi-light array (computed at HDRI load in ReloadEnvMap).
