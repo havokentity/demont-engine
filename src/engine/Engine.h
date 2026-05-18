@@ -369,6 +369,30 @@ private:
     // the rest of the denoiser-related textures (same denoiser_active_
     // lifecycle as depth_tex / motion_tex / post_denoise_hdr).
     std::uint64_t                               cloud_trans_tex_id_ = 0;
+    // SIGMA shadow visibility G-buffer (issue #115). One-float-per-pixel
+    // storage buffer (NOT a texture: Apple Silicon's 8-RW-texture cap
+    // on PathTrace is already saturated). PathTrace.slang writes the
+    // per-primary-hit sun-NEE shadow-ray transmittance into this buffer
+    // at the end of main(); the engine's SigmaShadow.slang dispatch
+    // (between Denoise() and StarsComposite) does a 5x5 bilateral
+    // filter of that visibility signal and multiplies the denoised
+    // visibility into the post-radiance-denoise HDR, restoring sharp
+    // sun-shadow boundaries that SVGF / MetalFX otherwise smudge across.
+    // 1.0 = unoccluded; 0.0 = fully shadowed; sky pixels write 1.0 so
+    // the SigmaShadow pass never darkens the sky composite. Allocated
+    // alongside the rest of the denoiser-related resources whenever
+    // denoiser_active_ AND r_shadow_demod is on (same lifecycle as
+    // depth_tex / motion_tex / cloud_trans_tex). Sized
+    // width * height * sizeof(float) -> ~8.3 MB at 1080p, trivial vs
+    // the rest of the denoiser texture budget.
+    std::uint64_t                               shadow_vis_buf_id_ = 0;
+    // SigmaShadow compute pipeline (issue #115). Built once at backend
+    // init; same lifecycle as stars_composite_pipeline_id_. Metal-only
+    // today (Vulkan plumbing is a follow-up); on Vulkan this stays
+    // zero so the engine's r_shadow_demod gate collapses to "no
+    // SIGMA dispatch, legacy denoiser shadow behaviour" until the
+    // Vulkan compositor lands.
+    std::uint64_t                               sigma_shadow_pipeline_id_ = 0;
     // Bloom mip chain. mip 0 is half-res of the swapchain; each
     // subsequent mip halves again. Built every frame from
     // post_denoise_hdr_tex_ via threshold + downsample + upsample

@@ -485,6 +485,26 @@ namespace cvar {
             "Higher = smoother sun/moon bokeh with DOF on; "
             "default 16 is the sweet spot.",
             CVAR_ARCHIVE);
+    // Issue #115: SVGF a-trous and MetalFX both smudge hard sun shadows
+    // on flat surfaces because their edge-stops (depth, normal,
+    // luminance) all see ~zero change across a shadow boundary on a
+    // single plane. SIGMA-style fix: write per-pixel sun visibility to
+    // a separate G-buffer, denoise that signal with a depth+normal
+    // bilateral, multiply the denoised visibility into the post-denoise
+    // HDR. NVIDIA's NRD ships this under the name SIGMA; this is our
+    // hand-rolled Slang implementation, Mac-first. Set to 0 to A/B
+    // against the legacy fold-into-radiance behaviour where SVGF /
+    // MetalFX get to smudge sun shadows.
+    PT_CVAR(r_shadow_demod,    "1",
+            "SIGMA-style sun shadow demodulation pass (issue #115). "
+            "1 = write per-pixel sun-NEE visibility to a separate "
+            "G-buffer, denoise it with a depth+normal bilateral, "
+            "multiply the denoised visibility into the post-denoise "
+            "HDR for sharp sun shadows under SVGF / MetalFX. "
+            "0 = legacy fold-into-radiance behaviour where the active "
+            "radiance denoiser smudges sun shadow boundaries. "
+            "No effect when r_denoiser = off.",
+            CVAR_ARCHIVE);
 
     // Camera controls.  Mouse-look engages while RIGHT mouse is held.
     PT_CVAR(cam_speed,         "3.0", "Movement speed (units/sec)",        CVAR_ARCHIVE);
@@ -1184,6 +1204,9 @@ void Engine::TearDownDevice() {
         if (motion_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
         if (post_denoise_hdr_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
         if (cloud_trans_tex_id_      != 0) device_->DestroyTexture(pt::rhi::TextureHandle{cloud_trans_tex_id_});
+        // SIGMA shadow visibility buffer (issue #115). Storage buffer
+        // (not texture) -- see comment at the allocation site.
+        if (shadow_vis_buf_id_       != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{shadow_vis_buf_id_});
         for (auto& id : bloom_mip_tex_id_) {
             if (id != 0) device_->DestroyTexture(pt::rhi::TextureHandle{id});
             id = 0;
@@ -1226,6 +1249,8 @@ void Engine::TearDownDevice() {
     motion_tex_id_           = 0;
     post_denoise_hdr_tex_id_ = 0;
     cloud_trans_tex_id_      = 0;
+    shadow_vis_buf_id_       = 0;
+    sigma_shadow_pipeline_id_ = 0;
     tonemap_pipeline_id_     = 0;
     stars_composite_pipeline_id_ = 0;
     bloom_down_pipeline_id_  = 0;
@@ -2918,6 +2943,13 @@ void Engine::EnsurePipelineHandles() {
     // dispatch site short-circuits. Vulkan stars-composite plumbing is
     // a follow-up.
     resolve(stars_composite_pipeline_id_, "stars_composite");
+    // SIGMA shadow denoiser (issue #115). Metal-only at MVP scope; the
+    // Vulkan backend's pipeline-build worker doesn't register this
+    // name, so resolve leaves the id at 0 and the engine's
+    // r_shadow_demod gate collapses to "no SIGMA dispatch, legacy
+    // denoiser shadow behaviour" on Vulkan until a Vulkan compositor
+    // lands.
+    resolve(sigma_shadow_pipeline_id_, "sigma_shadow");
 }
 
 void Engine::RenderFrame() {
@@ -3065,6 +3097,11 @@ void Engine::RenderFrame() {
             if (albedo_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{albedo_tex_id_});
             if (post_denoise_hdr_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
             if (cloud_trans_tex_id_      != 0) device_->DestroyTexture(pt::rhi::TextureHandle{cloud_trans_tex_id_});
+            // SIGMA shadow visibility buffer (issue #115). Storage
+            // buffer; mirrors the denoiser teardown rule -- the buffer
+            // is allocated by the denoiser-active path and must be
+            // freed when the user flips r_denoiser off.
+            if (shadow_vis_buf_id_       != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{shadow_vis_buf_id_});
             for (auto& id : bloom_mip_tex_id_) {
                 if (id != 0) device_->DestroyTexture(pt::rhi::TextureHandle{id});
                 id = 0;
@@ -3072,6 +3109,7 @@ void Engine::RenderFrame() {
             denoise_color_tex_id_ = depth_tex_id_ = motion_tex_id_ = 0;
             normal_tex_id_ = albedo_tex_id_ = post_denoise_hdr_tex_id_ = 0;
             cloud_trans_tex_id_   = 0;
+            shadow_vis_buf_id_    = 0;
         }
     }
 
@@ -3229,6 +3267,11 @@ void Engine::RenderFrame() {
             if (albedo_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{albedo_tex_id_});
             if (post_denoise_hdr_tex_id_  != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
             if (cloud_trans_tex_id_       != 0) device_->DestroyTexture(pt::rhi::TextureHandle{cloud_trans_tex_id_});
+            // SIGMA shadow visibility buffer (issue #115). Storage
+            // buffer; same denoiser_active_ lifecycle as the textures
+            // above. Resize teardown destroys it before the new
+            // allocation runs further down.
+            if (shadow_vis_buf_id_        != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{shadow_vis_buf_id_});
             // Explicitly zero the IDs here. The subsequent CreateTexture
             // calls overwrite them on the success path, but a CreateTexture
             // failure below leaves the ID still pointing at a freed handle
@@ -3241,6 +3284,7 @@ void Engine::RenderFrame() {
             albedo_tex_id_           = 0;
             post_denoise_hdr_tex_id_ = 0;
             cloud_trans_tex_id_      = 0;
+            shadow_vis_buf_id_       = 0;
         }
         auto color_h = device_->CreateTexture({
             .width = fc.width, .height = fc.height,
@@ -3301,6 +3345,27 @@ void Engine::RenderFrame() {
                 .debug_name = "cloud_trans",
             });
             cloud_trans_tex_id_ = cloud_h.id;
+            // SIGMA shadow visibility buffer (issue #115). One R32F per
+            // pixel of sun-NEE shadow-ray transmittance, written by
+            // PathTrace.slang and bilateral-filtered by SigmaShadow.slang
+            // before being multiplied into post_denoise_hdr. A storage
+            // BUFFER (not a texture) because Metal's compute pipeline
+            // caps RWTexture2D bindings at 8 per kernel and PathTrace
+            // is already exactly at that limit (output, accum_hdr,
+            // denoise_color, depth_tex, motion_tex, normal_tex,
+            // albedo_tex, cloud_trans_tex). A 9th RW texture would fail
+            // pipeline build on Apple Silicon. Same workaround
+            // DenoiseAtrous.slang uses for its variance + moments
+            // buffers. Size: width * height * sizeof(float)
+            // = ~8.3 MB at 1080p, trivial.
+            auto svis_h = device_->CreateBuffer({
+                .size  = static_cast<std::size_t>(fc.width) *
+                         static_cast<std::size_t>(fc.height) *
+                         sizeof(float),
+                .usage = pt::rhi::BufferUsage::Storage,
+                .debug_name = "shadow_vis",
+            });
+            shadow_vis_buf_id_ = svis_h.id;
             // Normal G-buffer: SVGF/NRD use it for edge-aware spatial
             // filtering; the OptiX AOV denoiser uses it as a guide layer.
             // MetalFX ignores normals and the path tracer's normal write is
@@ -3546,6 +3611,30 @@ void Engine::RenderFrame() {
     if (denoiser_active_ && cloud_trans_tex_id_ != 0) {
         cb->BindStorageTexture(10, pt::rhi::TextureHandle{cloud_trans_tex_id_});
     }
+    // Engine buffer slot 11 -> vk::binding 23 (shadow_vis_buf). One
+    // R32F per pixel, sun-NEE shadow-ray transmittance from the path
+    // tracer's primary-hit pass. Storage BUFFER, not a texture --
+    // Apple Silicon's 8-RW-texture cap is already saturated by the
+    // existing PathTrace G-buffer set (see comment at the
+    // shadow_vis_buf declaration in PathTrace.slang).
+    //
+    // ALWAYS bind something to slot 11 (same "max-bound + 1 must land
+    // at the kernel's expected Push slot" rule slots 4/5/7/8/9/10
+    // already follow). When the denoiser is off OR the shadow_vis_buf
+    // hasn't been allocated yet, fall back to the always-present
+    // placeholder storage buffer; the shader gates its reads / writes
+    // on `write_shadow_vis` (set to 0 by the engine when demod is off
+    // OR the buffer is missing) so this binding is dead at runtime --
+    // it only exists to keep Metal's push-slot computation
+    // (max-bound + 1 = slot 12, matching MSL's Push assignment)
+    // stable. Without this fallback the OFF-case push slot would
+    // collapse to 11 and corrupt every push field; first noticed as
+    // the golden_cornell_csg__metal__off_diff regression on the
+    // first build of issue #115.
+    pt::rhi::BufferHandle slot11 = (denoiser_active_ && shadow_vis_buf_id_ != 0)
+        ? pt::rhi::BufferHandle{shadow_vis_buf_id_}
+        : pt::rhi::BufferHandle{placeholder_storage_id_};
+    if (slot11.id != 0) cb->BindBuffer(11, slot11, 0);
     if (env_map_tex_id_ != 0) {
         cb->BindStorageTexture(5, pt::rhi::TextureHandle{env_map_tex_id_});
     }
@@ -3764,7 +3853,19 @@ void Engine::RenderFrame() {
         // a 16-byte boundary, matching the std140 / MSL cbuffer rule
         // Slang applies to the shader-side `Push` / `Frame` blocks.
         std::uint32_t composite_celestials;
-        std::uint32_t _pad_star_split[3];
+        std::uint32_t _pad_star_split;
+        // SIGMA shadow demodulation gate (issue #115). 1 -> PathTrace
+        // writes per-primary-hit sun-NEE shadow-ray transmittance into
+        // shadow_vis_buf at the end of main(); 0 -> skip the write
+        // (legacy fold-into-radiance behaviour, SVGF / MetalFX get to
+        // smudge sun shadows). Engine fills this from r_shadow_demod
+        // gated by denoiser_active_ AND shadow_vis_buf actually being
+        // allocated. See PathTrace.slang's matching Push field and
+        // shaders/SigmaShadow.slang for the downstream consumer.
+        // Occupies the byte slot we shrank `_pad_star_split` for; the
+        // trailing 4-byte pad keeps the cbuffer 16-byte aligned.
+        std::uint32_t write_shadow_vis;
+        std::uint32_t _pad_shadow_vis;
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -3927,7 +4028,42 @@ void Engine::RenderFrame() {
             depth_tex_id_ != 0;
         push.composite_celestials = engine_composite_active ? 1u : 0u;
     }
-    for (auto& v : push._pad_star_split) v = 0u;
+    push._pad_star_split = 0u;
+    push._pad_shadow_vis = 0u;
+    // SIGMA shadow demodulation gate (issue #115). Mirrors the
+    // celestials gate above. PathTrace writes the per-primary-hit
+    // sun-NEE shadow-ray transmittance only when:
+    //   - denoiser_active_                : the smudge only matters
+    //                                        under SVGF / MetalFX; the
+    //                                        legacy 1-spp path already
+    //                                        produces sharp shadows.
+    //   - r_shadow_demod on               : user opted in.
+    //   - sigma_shadow_pipeline_id_ != 0  : Metal-only today; on
+    //                                        Vulkan this stays zero so
+    //                                        the gate collapses to "no
+    //                                        shadow demod, legacy
+    //                                        behaviour" until a Vulkan
+    //                                        SigmaShadow lands.
+    //   - shadow_vis_buf_id_ != 0         : the buffer is actually
+    //                                        allocated. PathTrace
+    //                                        writes into it via
+    //                                        write_shadow_vis; missing
+    //                                        binding would be an
+    //                                        unbound-buffer write.
+    //   - depth_tex_id_ != 0 + normal_tex_id_ checked at dispatch site.
+    {
+        bool shadow_demod_on = true;
+        if (auto* v = C.FindCVar("r_shadow_demod")) {
+            shadow_demod_on = v->GetBool();
+        }
+        const bool engine_shadow_demod_active =
+            denoiser_active_ &&
+            shadow_demod_on &&
+            sigma_shadow_pipeline_id_ != 0 &&
+            shadow_vis_buf_id_ != 0 &&
+            depth_tex_id_ != 0;
+        push.write_shadow_vis = engine_shadow_demod_active ? 1u : 0u;
+    }
 
     // Halton(2,3) sub-pixel jitter sequence in [-0.5, 0.5] each axis.
     // 16-sample period before repeating; ample for the denoiser's
@@ -4950,6 +5086,103 @@ void Engine::RenderFrame() {
         // the explicit barrier).
         cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
                      pt::rhi::BarrierDesc::Stage::ComputeRead});
+
+        // SIGMA-style sun-shadow demodulation (issue #115). Dispatched
+        // BEFORE StarsComposite so the shadow demod multiplies into
+        // the post-radiance-denoise HDR before celestials are added on
+        // top (celestials should stay at full brightness; they're not
+        // subject to direct-sun shadowing the same way the scene
+        // surfaces are). The kernel reads the noisy per-pixel
+        // shadow_vis_buf that PathTrace's primary-hit pass wrote,
+        // bilateral-filters it with a 5x5 depth+normal kernel, and
+        // multiplies the denoised visibility into tonemap_hdr_source_id
+        // in place. Gated on push.write_shadow_vis so we only run when
+        // PathTrace was actually populating the buffer -- otherwise
+        // we'd multiply by uninitialised memory.
+        //
+        // Dispatch gate mirrors push.write_shadow_vis prerequisites
+        // (denoiser_active_, shadow_vis_buf_id_, depth_tex_id_,
+        // sigma_shadow_pipeline_id_) AND adds normal_tex_id_ as a soft
+        // requirement -- the shader has a use_normal=0 fallback path
+        // (depth-only edge stops, slightly lower selectivity) for the
+        // rare denoiser mode that doesn't allocate normals.
+        if (push.write_shadow_vis != 0u &&
+            sigma_shadow_pipeline_id_ != 0 &&
+            shadow_vis_buf_id_ != 0 &&
+            depth_tex_id_ != 0) {
+            cb->BindComputePipeline(pt::rhi::PipelineHandle{sigma_shadow_pipeline_id_});
+            // SigmaShadow texture bindings in declaration order:
+            //   slot 0 hdr_inout       -- post-radiance-denoise HDR
+            //   slot 1 depth_tex       -- camera-space Z (sky gate +
+            //                              depth edge stop)
+            //   slot 2 normal_tex      -- world-space normal (normal
+            //                              edge stop; only meaningful
+            //                              when normal_tex_id_ != 0
+            //                              AND use_normal=1 in push)
+            // Buffer:
+            //   slot 3 shadow_vis_buf  -- R32F per-pixel visibility
+            //                              written by PathTrace
+            //
+            // When normal_tex_id_ is 0 we still need slot 2 bound to
+            // SOMETHING so Metal's pipeline-validation doesn't trip
+            // on a missing storage texture. depth_tex is a different
+            // format (R32F vs RGBA16F), so bloom_dummy_tex_id_ (1x1
+            // RGBA16F, always allocated alongside the denoiser
+            // textures) is the natural placeholder -- the shader's
+            // use_normal=0 path doesn't read it, but Metal validates
+            // the binding regardless of usage.
+            cb->BindStorageTexture(0, pt::rhi::TextureHandle{tonemap_hdr_source_id});
+            cb->BindStorageTexture(1, pt::rhi::TextureHandle{depth_tex_id_});
+            const std::uint64_t sigma_normal_id =
+                (normal_tex_id_ != 0) ? normal_tex_id_ : bloom_dummy_tex_id_;
+            cb->BindStorageTexture(2, pt::rhi::TextureHandle{sigma_normal_id});
+            // shadow_vis_buf lands at MSL buffer(0) -- Slang assigns
+            // buffer slots in declaration order starting at 0, and
+            // SigmaShadow.slang declares no other buffers before Push.
+            // Texture slots are a separate namespace from buffer slots
+            // on Metal, so binding the storage buffer at engine slot 0
+            // here doesn't clash with the hdr_inout texture binding at
+            // engine slot 0 above. Push lands at buffer(1) (max-bound +
+            // 1 = 0 + 1) and MetalCommandBuffer::Dispatch computes that
+            // automatically.
+            cb->BindBuffer(0, pt::rhi::BufferHandle{shadow_vis_buf_id_}, 0);
+
+            struct SigmaShadowPush {
+                std::uint32_t width;
+                std::uint32_t height;
+                std::uint32_t demod_active;
+                std::uint32_t _pad0;
+                float         sigma_depth;
+                float         sigma_normal;
+                std::uint32_t use_normal;
+                std::uint32_t _pad1;
+            } sp{};
+            static_assert(sizeof(SigmaShadowPush) == 32,
+                          "SigmaShadowPush layout must match SigmaShadow.slang");
+            sp.width        = fc.width;
+            sp.height       = fc.height;
+            sp.demod_active = 1u;
+            sp._pad0        = 0u;
+            // Bilateral sigmas: depth as a fraction of local Z (5%
+            // works on the cornell-style fixtures the issue describes),
+            // normal as an exponent on the cosine of normal-difference
+            // (16 = ~30 deg tolerance for "still considered co-planar").
+            // Not yet cvar-tunable; if shadow widths look off on real
+            // scenes we'll plumb r_shadow_sigma_depth / _normal as a
+            // follow-up.
+            sp.sigma_depth  = 0.05f;
+            sp.sigma_normal = 16.0f;
+            sp.use_normal   = (normal_tex_id_ != 0) ? 1u : 0u;
+            sp._pad1        = 0u;
+            cb->PushConstants(&sp, sizeof(sp));
+            cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
+
+            // RAW: StarsComposite about to read+write the HDR we just
+            // wrote. Metal auto-barriers; emitted for documentation
+            // symmetry with the rest of the post-denoise chain.
+            cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                         pt::rhi::BarrierDesc::Stage::ComputeRead});
+        }
 
         // Stateless stars+sun+moon composite (issue #46). Dispatched
         // BEFORE the bloom pyramid so the bloom downsample picks up the
