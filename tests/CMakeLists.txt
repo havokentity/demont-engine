@@ -261,6 +261,23 @@ pt_add_test(pt_physics_test
     pt_physics_test.cpp
     LINK_TARGETS pt_physics)
 
+# --- phys_drop_* RGB arg shapes (PR #189 / issue #181 follow-up) -----------
+# Pins the arg-shape contract for `phys_drop_sphere` (3, 4, 5, or 8 args)
+# and `phys_drop_box` (6, 7, or 10 args) plus the rejection rules
+# (partial-RGB shapes 6/7-arg sphere + 8/9-arg box rejected with usage
+# hint, negative RGB rejected with rgb-non-negative error, HDR-bright
+# RGB > 1.0 accepted as-is). Constructs an Engine with the physics
+# subsystem manually wired, registers the phys_drop_* commands via
+# the friend-struct test access, drives them through Console::Execute,
+# and asserts on BOTH the success-log output string AND the underlying
+# AnalyticPrim albedo so a regression where the two diverge can't
+# slip through. Links pt_engine (which transitively pulls in everything
+# pt_engine needs -- pt_console, pt_physics, pt_renderer, pt_audio,
+# etc.; this is the same surface phys_drop_* runs against in production).
+pt_add_test(phys_drop_args_test
+    phys_drop_args_test.cpp
+    LINK_TARGETS pt_engine)
+
 # --- Light photometric decomposition (#176) --------------------------------
 # Pins the photometric conversion constants the new `light_*_color` /
 # `light_*_cd` / `light_*_lm` / `light_*_nits` / `light_*_exposed`

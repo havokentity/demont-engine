@@ -37,6 +37,17 @@ namespace pt::engine {
 
 using BackendType = pt::rhi::BackendType;
 
+// Test-only access hook (PR #181 follow-up, agent-12 nightly):
+// the `phys_drop_*` RGB arg shapes added in PR #189 are tested by
+// instantiating an Engine, manually wiring up the physics subsystem
+// (without the full Init() path), and driving the registered console
+// commands via Console::Execute. The struct is forward-declared here so
+// Engine can grant it friend access to its private register-commands
+// path + primitives_ map; the definition lives in the test TU
+// (tests/phys_drop_args_test.cpp) and never ships in production
+// binaries -- pt_engine doesn't reference it.
+struct PhysDropArgsTestAccess;
+
 class Engine {
 public:
     Engine();
@@ -163,6 +174,9 @@ public:
     static constexpr std::uint32_t kMaxSmokeEmitters = 16;
 
 private:
+    // Test-only access (PR #181 follow-up, see forward-declaration above).
+    friend struct ::pt::engine::PhysDropArgsTestAccess;
+
     void RegisterCommands();
     void RegisterCsgCommands();
     void RegisterPrimCommands();
