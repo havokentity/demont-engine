@@ -209,7 +209,21 @@ std::vector<CompletionMatch> BuildCompletions(const TokenInfo& token,
         //      invocation as a single suggestion. Restores the prior
         //      ghost-era affordance for things like
         //      `screenshot demonte_screen.ppm`.
+        // First try exact-match on the typed first token. If no exact
+        // hit, fall through to smart-resolve (same ScoreMatch the
+        // Execute path uses) and use the canonical cvar's value list.
+        // Lets users type a shorthand like `den ` + TAB and get
+        // `r_denoiser`'s allowed-value completions, instead of an
+        // empty suggestion list. The resolution surfaces in the menu
+        // header at the call site -- here we just pick the right
+        // cvar's value vector.
         auto* cv = C.FindCVar(token.first_tok);
+        if (cv == nullptr) {
+            auto rr = C.ResolveCommand(token.first_tok);
+            if (!rr.canonical_name.empty()) {
+                cv = C.FindCVar(rr.canonical_name);
+            }
+        }
         if (cv != nullptr) {
             if (!cv->allowed_values.empty()) {
                 // Filter out values whose per-value platform flag
