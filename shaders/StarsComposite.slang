@@ -184,6 +184,10 @@ float3 starsOnly(float3 rd, float3 sun) {
         // (the r_stars_twinkle_speed multiplier; 0 means off). Must
         // match PathTrace.slang's starsOnly() copy verbatim -- see
         // that file's twinkle comment for the full rationale.
+        // Two-sine scintillation centered on 1.0. See PathTrace.slang's
+        // copy for the long-form rationale (incommensurate frequencies
+        // -> quasi-aperiodic waveform that mimics real atmospheric
+        // turbulence; mean 1.0 preserves dim-star visibility).
         if (exposure_pad.w > 0.001) {
             int3 q  = int3(floor(j * 38.0));
             uint qh = uint(q.x + 128) * 65536u
@@ -192,12 +196,16 @@ float3 starsOnly(float3 rd, float3 sun) {
             uint h    = pcgHash(qh + 0xb7e1u);
             float ph  = float(h & 0xFFFFu) * (1.0 / 65536.0);
             float fhz_base = 1.0 + float((h >> 16) & 0xFFu) * (2.0 / 256.0);
-            float fhz = fhz_base * exposure_pad.w;
+            uint h2   = pcgHash(h + 0xc0ffeeu);
+            float ph2 = float(h2 & 0xFFFFu) * (1.0 / 65536.0);
+            float fhz_mult = 2.7 + float((h2 >> 16) & 0xFFu) * (2.6 / 256.0);
+            float speed = exposure_pad.w;
+            float fhz1 = fhz_base * speed;
+            float fhz2 = fhz_base * fhz_mult * speed;
             float t   = float(frame_index) * (1.0 / 60.0);
-            // Centered on 1.0 to preserve mean brightness; see the
-            // PathTrace.slang copy for the rationale (dim stars
-            // disappeared at the old 0.55 mean).
-            float w   = 1.0 + 0.45 * sin(6.28318530718 * (ph + t * fhz));
+            float w   = 1.0
+                      + 0.30 * sin(6.28318530718 * (ph  + t * fhz1))
+                      + 0.15 * sin(6.28318530718 * (ph2 + t * fhz2));
             stars *= w;
         }
         return stars * (1.0 - day);

@@ -969,21 +969,35 @@ float3 starsOnly(float3 rd, float3 sun) {
                     + uint(q.y + 128) * 256u
                     + uint(q.z + 128);
             uint h    = pcgHash(qh + 0xb7e1u);
+            // Two-component scintillation: a single sine looks
+            // metronomic on sharp pixel stars (especially obvious
+            // now that the stateless composite doesn't smear them
+            // through the denoiser). Sum two sines at incommensurate
+            // frequencies -- a dominant low-frequency beat plus a
+            // smaller high-frequency wobble -- and the combined
+            // waveform never quite repeats, mimicking the
+            // quasi-aperiodic look of real atmospheric scintillation
+            // while still feeling rhythmic.
+            //
+            // Component 1: 1-3 Hz base * exposure_pad.w speed,
+            //              amplitude 0.30 (the dominant rhythm).
+            // Component 2: 2.7-5.3x component 1's frequency,
+            //              amplitude 0.15 (the random-feeling
+            //              flicker on top).
+            // Total peak swing 0.45 around mean 1.0, matching the
+            // previous single-sine amplitude.
             float ph  = float(h & 0xFFFFu) * (1.0 / 65536.0);
             float fhz_base = 1.0 + float((h >> 16) & 0xFFu) * (2.0 / 256.0);
-            float fhz = fhz_base * exposure_pad.w;
+            uint h2   = pcgHash(h + 0xc0ffeeu);
+            float ph2 = float(h2 & 0xFFFFu) * (1.0 / 65536.0);
+            float fhz_mult = 2.7 + float((h2 >> 16) & 0xFFu) * (2.6 / 256.0);
+            float speed = exposure_pad.w;
+            float fhz1 = fhz_base * speed;
+            float fhz2 = fhz_base * fhz_mult * speed;
             float t   = float(frame_index) * (1.0 / 60.0);
-            // Center modulation on 1.0 so time-averaged brightness
-            // is conserved. The previous `0.55 + 0.45 * sin` had a
-            // mean of 0.55 -- a 45% dimming of every star on average,
-            // which was invisible on bright stars (well above the
-            // tonemap floor) but knocked dim / distant stars below
-            // the noise floor most of the time, so the user saw the
-            // dim half of the catalog effectively disappear when
-            // twinkle came on. Range now [0.55, 1.45] (peaks above
-            // 1.0 mimic real scintillation flashes); mean 1.0
-            // matches the no-twinkle reference brightness.
-            float w   = 1.0 + 0.45 * sin(6.28318530718 * (ph + t * fhz));
+            float w   = 1.0
+                      + 0.30 * sin(6.28318530718 * (ph  + t * fhz1))
+                      + 0.15 * sin(6.28318530718 * (ph2 + t * fhz2));
             stars *= w;
         }
         // Fade with day so stars vanish at sunrise.
