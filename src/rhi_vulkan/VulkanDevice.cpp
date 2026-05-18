@@ -131,7 +131,7 @@ constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     17, // engine slot 9  -> shader binding 17 (albedo_tex, OptiX AOV only)
     22, // engine slot 10 -> shader binding 22 (cloud_trans_tex, #46 follow-up)
 };
-constexpr std::uint32_t kSlotToBufBinding[11] = {
+constexpr std::uint32_t kSlotToBufBinding[12] = {
     0,  // engine slot 0 unused
     3,  // engine slot 1 -> shader binding 3  (mesh_positions)
     4,  // engine slot 2 -> shader binding 4  (mesh_indices)
@@ -148,6 +148,9 @@ constexpr std::uint32_t kSlotToBufBinding[11] = {
     // SDF Phase 1 (#97): SDF cluster buffer. Moved here from engine
     // slot 8 / binding 19 to make room for tri_bvh_*.
     21, // engine slot 10 -> shader binding 21 (SDF cluster buffer)
+    // Light primitives (#73): analytic light list. Past the SIGMA
+    // #115 / MetalFX specular #118 reservations at 23..26.
+    27, // engine slot 11 -> shader binding 27 (light_prims)
 };
 // Scene TLAS lives at engine accel-slot 2 -> shader binding 2.
 
@@ -319,7 +322,7 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     //
     // Capacity: 11 storage_image (one less than kNumTexSlots because
     // engine texture slot 10 is reserved/unused on the Vulkan path)
-    // + 1 accel_struct + 10 storage_buffer + 1 uniform_buffer = 23,
+    // + 1 accel_struct + 11 storage_buffer + 1 uniform_buffer = 24,
     // sized to the worst-case "PathTrace binds everything" dispatch.
     // kMaxWrites must be >= the total binding count or
     // vkUpdateDescriptorSets reads off the end of these stack arrays.
@@ -331,7 +334,13 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     // cloud transmittance the path tracer writes and StarsComposite
     // reads. Reuses the slot number accum_stars (#108) briefly
     // occupied before the stateless composite rewrite.)
-    constexpr std::uint32_t kMaxWrites = 23;
+    // The +1 to 24 is binding 27 (light_prims, analytic light list
+    // PR #73 follow-up): engine buffer slot 11 -> shader binding 27.
+    // Bump this when adding a new shader binding the descriptor-write
+    // path can populate, or vkUpdateDescriptorSets reads past the end
+    // of the writes/img_infos/buf_infos stack arrays and corrupts the
+    // stack on a fully-bound PathTrace dispatch.
+    constexpr std::uint32_t kMaxWrites = 24;
     std::array<VkDescriptorImageInfo,  kMaxWrites> img_infos {};
     std::array<VkDescriptorBufferInfo, kMaxWrites> buf_infos {};
     std::array<VkWriteDescriptorSetAccelerationStructureKHR, 1> as_infos {};
@@ -1041,6 +1050,14 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // Allocated host-side when denoiser_active_; PARTIALLY_BOUND
         // covers the host-side gate's "no denoiser, no binding" case.
         add_binding(22, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        // --- Light primitives (#73) ---
+        // Binding 27: analytic light list (light_prims). Sits past
+        // bindings 23..26 reserved for SIGMA #115 / MetalFX specular
+        // #118. The engine binds a placeholder storage buffer when
+        // no lights are active; the shader's `light_count > 0` gate
+        // is the runtime signal.
+        add_binding(27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        // --- end Light primitives ---
 
         // UPDATE_AFTER_BIND for every binding so we can rewrite the
         // shared descriptor set between dispatches in the same cmd
