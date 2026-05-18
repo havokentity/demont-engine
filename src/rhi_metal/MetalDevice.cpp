@@ -35,6 +35,8 @@ extern const unsigned char shader_PerfOverlay_metal_data[];
 extern const unsigned long shader_PerfOverlay_metal_size;
 extern const unsigned char shader_StarsComposite_metal_data[];
 extern const unsigned long shader_StarsComposite_metal_size;
+extern const unsigned char shader_ParticleComposite_metal_data[];
+extern const unsigned long shader_ParticleComposite_metal_size;
 }
 
 // MetalFXDenoiser.mm: ObjC++ shim around MTLFXTemporalDenoisedScaler.
@@ -322,6 +324,14 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
     build_pso("stars_composite",
               shader_StarsComposite_metal_data,
               shader_StarsComposite_metal_size);
+    // Screen-space particle composite (#82 MVP). Same dispatch context
+    // as stars_composite -- runs in the use_engine_tonemap branch
+    // after Denoise(), before the bloom pyramid. See
+    // shaders/ParticleComposite.slang + Engine::RenderFrame for the
+    // dispatch site.
+    build_pso("particle_composite",
+              shader_ParticleComposite_metal_data,
+              shader_ParticleComposite_metal_size);
 
     cmd_ = std::make_unique<MetalCommandBuffer>(this);
 }

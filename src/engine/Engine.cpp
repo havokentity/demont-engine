@@ -23,6 +23,7 @@
 #include "../renderer/Csg/CsgScene.h"
 #include "../renderer/HdrImage.h"
 #include "../renderer/MeshGen.h"
+#include "../effects/ParticleSystem.h"
 #include "../rhi/CommandBuffer.h"
 #include "../rhi/Device.h"
 
@@ -486,6 +487,29 @@ namespace cvar {
             "default 16 is the sweet spot.",
             CVAR_ARCHIVE);
 
+    // -------------------------------------------------------------------
+    // Particle / VFX system (issue #82 MVP).
+    //
+    // CPU-side simulation, screen-space billboard composite. Particles
+    // are NOT visible in path-traced reflections / shadows; the
+    // "PT-compatible" headline of #82 is a follow-up (analytic-prim
+    // list + BVH refit). GPU-side simulation is also a follow-up.
+    // See shaders/ParticleComposite.slang for the kernel rationale
+    // and src/effects/ParticleSystem.h for the CPU sim contract.
+    // -------------------------------------------------------------------
+    PT_CVAR(r_particles, "0",
+            "Master toggle for the particle / VFX system (#82 MVP). "
+            "0 disables both the CPU sim tick AND the GPU composite "
+            "dispatch. 1 runs both. Metal-only today; Vulkan dispatch "
+            "is a follow-up.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_particles_max, "1024",
+            "Cap on simultaneously live particles. Cheap to raise "
+            "(per-frame upload is the cost); a few thousand is fine "
+            "for the MVP CPU sim, GPU sim follow-up scales further. "
+            "Default 1024.",
+            CVAR_ARCHIVE);
+
     // Camera controls.  Mouse-look engages while RIGHT mouse is held.
     PT_CVAR(cam_speed,         "3.0", "Movement speed (units/sec)",        CVAR_ARCHIVE);
     PT_CVAR(cam_sprint_mult,   "3.0", "Speed multiplier with shift",       CVAR_ARCHIVE);
@@ -645,6 +669,11 @@ bool Engine::Init() {
     pt::mem::Init();
 
     camera_ = std::make_unique<pt::renderer::Camera>();
+    // ParticleSystem (issue #82 MVP). Pure CPU sim -- safe to
+    // construct before any device exists. The cvar r_particles_max
+    // will be honoured below once Console::Drain has processed the
+    // archived demont.cfg.
+    particles_ = std::make_unique<pt::effects::ParticleSystem>();
 
     pt::hw::Populate();
     auto& hi = pt::hw::GetInfo();
@@ -1200,6 +1229,11 @@ void Engine::TearDownDevice() {
         if (exposure_state_id_      != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{exposure_state_id_});
         if (perfoverlay_drawlist_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{perfoverlay_drawlist_id_});
         if (placeholder_storage_id_  != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{placeholder_storage_id_});
+        // Particle system GPU-side storage buffer (#82 MVP). The
+        // CPU-side ParticleSystem object survives the device teardown
+        // -- it has no GPU resources of its own. Only the per-frame
+        // upload buffer is owned by the device.
+        if (particles_storage_id_   != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{particles_storage_id_});
     }
     scene_tlas_id_        = 0;
     box_blas_id_          = 0;
@@ -1228,6 +1262,9 @@ void Engine::TearDownDevice() {
     cloud_trans_tex_id_      = 0;
     tonemap_pipeline_id_     = 0;
     stars_composite_pipeline_id_ = 0;
+    particle_composite_pipeline_id_ = 0;
+    particles_storage_id_           = 0;
+    particles_storage_capacity_     = 0;
     bloom_down_pipeline_id_  = 0;
     bloom_up_pipeline_id_    = 0;
     perfoverlay_pipeline_id_       = 0;
@@ -2918,6 +2955,11 @@ void Engine::EnsurePipelineHandles() {
     // dispatch site short-circuits. Vulkan stars-composite plumbing is
     // a follow-up.
     resolve(stars_composite_pipeline_id_, "stars_composite");
+    // Same Metal-only story for the particle composite (#82 MVP). The
+    // dispatch site below additionally gates on particle_count > 0 and
+    // r_particles, so the resolve cost is 1 atomic compare per frame
+    // until the Vulkan worker grows a real entry.
+    resolve(particle_composite_pipeline_id_, "particle_composite");
 }
 
 void Engine::RenderFrame() {
@@ -5065,6 +5107,165 @@ void Engine::RenderFrame() {
                          pt::rhi::BarrierDesc::Stage::ComputeRead});
         }
 
+        // ----- Particle / VFX composite (#82 MVP) ------------------------
+        //
+        // Runs in the same use_engine_tonemap branch as StarsComposite,
+        // AFTER stars (so particles overlay celestials too) and BEFORE
+        // the bloom pyramid (so HDR particle highlights downsample into
+        // halos). Reads + writes the SAME tonemap_hdr_source_id in
+        // place; the kernel does additive splats per particle.
+        //
+        // Gates:
+        //   * r_particles == 1 (master toggle, default 0)
+        //   * particle_composite_pipeline_id_ resolved (Metal only today)
+        //   * particles_ live and > 0 active particles
+        //   * depth_tex_id_ allocated (we need the depth gate); this
+        //     implicitly requires denoiser_active_ because the engine
+        //     only allocates depth_tex when a denoiser path is on.
+        //     The bloom-without-denoiser branch has depth_tex_id_ = 0
+        //     so the composite naturally short-circuits. Acceptable
+        //     for the MVP -- particles + bloom-without-denoiser is a
+        //     follow-up.
+        //
+        // The per-frame upload happens here too: rebuild a 3*float4
+        // packed GPU layout from particles_->Particles(), grow the
+        // storage buffer if needed, WriteBuffer the live region.
+        bool r_particles_on = false;
+        if (auto* v = C.FindCVar("r_particles")) r_particles_on = v->GetBool();
+        const bool particle_gate =
+            r_particles_on &&
+            particle_composite_pipeline_id_ != 0 &&
+            particles_ &&
+            particles_->LiveCount() > 0 &&
+            depth_tex_id_ != 0;
+        if (particle_gate) {
+            const auto& live = particles_->Particles();
+            const std::uint32_t pcount =
+                static_cast<std::uint32_t>(live.size());
+            // One-shot info log per process: confirms the composite is
+            // being dispatched against a non-zero particle count.
+            // Without it the symptom of "wrong gate" looks identical to
+            // "no particles painted" -- one log line saves a half-hour
+            // of debug, and the one-shot pattern (static bool) matches
+            // the project's other lazy-init/first-frame log idioms.
+            static bool s_logged_once = false;
+            if (!s_logged_once) {
+                s_logged_once = true;
+                LOG_INFO("particles: first composite dispatch, {} particle(s) live", pcount);
+            }
+            // GPU-side packed representation. Three float4 per particle,
+            // 48 bytes -- matches the ParticleComposite.slang layout in
+            // the kernel's load block.
+            struct GpuParticle {
+                float pos_size[4];     // .xyz = world pos (m), .w = size (m)
+                float color_alpha[4];  // .xyz = HDR rgb, .w = alpha [0..1]
+                float pad_zeye[4];     // .w = precomputed camera-space z
+            };
+            static_assert(sizeof(GpuParticle) == 48,
+                          "GpuParticle must be 48 bytes to match ParticleComposite.slang");
+
+            // (Re)allocate / grow the storage buffer if needed. Pow-2
+            // growth keeps the reallocs amortised; the floor of 64
+            // matches the threadgroup width so a single threadgroup
+            // launch can always run cleanly.
+            std::uint32_t need = pcount;
+            if (need < 64u) need = 64u;
+            if (need > particles_storage_capacity_) {
+                std::uint32_t cap = (particles_storage_capacity_ > 0)
+                                        ? particles_storage_capacity_ : 64u;
+                while (cap < need) cap *= 2u;
+                if (particles_storage_id_ != 0) {
+                    device_->DestroyBuffer(pt::rhi::BufferHandle{particles_storage_id_});
+                    particles_storage_id_ = 0;
+                }
+                auto buf = device_->CreateBuffer({
+                    .size = sizeof(GpuParticle) * cap,
+                    .usage = pt::rhi::BufferUsage::Storage,
+                    .debug_name = "particles_storage",
+                });
+                particles_storage_id_       = buf.id;
+                particles_storage_capacity_ = cap;
+            }
+            if (particles_storage_id_ != 0) {
+                // Build the packed payload. We compute z_eye host-side
+                // (single dot per particle) so the shader doesn't
+                // re-derive it. At the MVP cap of 1024 this is ~3 us on
+                // M4 Max -- negligible.
+                std::vector<GpuParticle> packed(pcount);
+                const glm::vec3 cam_pos  = glm::vec3(push.pos_fovtan[0],
+                                                    push.pos_fovtan[1],
+                                                    push.pos_fovtan[2]);
+                const glm::vec3 cam_fwd  = glm::vec3(push.fwd_aspect[0],
+                                                    push.fwd_aspect[1],
+                                                    push.fwd_aspect[2]);
+                for (std::uint32_t i = 0; i < pcount; ++i) {
+                    const auto& p = live[i];
+                    packed[i].pos_size[0] = p.pos.x;
+                    packed[i].pos_size[1] = p.pos.y;
+                    packed[i].pos_size[2] = p.pos.z;
+                    packed[i].pos_size[3] = p.size;
+                    packed[i].color_alpha[0] = p.color.r;
+                    packed[i].color_alpha[1] = p.color.g;
+                    packed[i].color_alpha[2] = p.color.b;
+                    packed[i].color_alpha[3] = p.color.a;
+                    packed[i].pad_zeye[0] = 0.0f;
+                    packed[i].pad_zeye[1] = 0.0f;
+                    packed[i].pad_zeye[2] = 0.0f;
+                    // z_eye = dot(p.pos - cam_pos, cam_fwd). cam_fwd is
+                    // already unit length (Camera::Forward()).
+                    packed[i].pad_zeye[3] = glm::dot(p.pos - cam_pos, cam_fwd);
+                }
+                device_->WriteBuffer(pt::rhi::BufferHandle{particles_storage_id_},
+                                     packed.data(),
+                                     sizeof(GpuParticle) * pcount, 0);
+
+                cb->BindComputePipeline(pt::rhi::PipelineHandle{particle_composite_pipeline_id_});
+                cb->BindStorageTexture(0, pt::rhi::TextureHandle{tonemap_hdr_source_id});
+                cb->BindStorageTexture(1, pt::rhi::TextureHandle{depth_tex_id_});
+                cb->BindBuffer(0, pt::rhi::BufferHandle{particles_storage_id_});
+
+                struct ParticleCompositePush {
+                    float pos_fovtan[4];
+                    float fwd_aspect[4];
+                    float right_xyz[4];
+                    float up_xyz[4];
+                    std::uint32_t width;
+                    std::uint32_t height;
+                    std::uint32_t particle_count;
+                    std::uint32_t composite_active;
+                    std::uint32_t threads_x;
+                    std::uint32_t _pad0;
+                    std::uint32_t _pad1;
+                    std::uint32_t _pad2;
+                } pp{};
+                static_assert(sizeof(ParticleCompositePush) == 96,
+                              "ParticleCompositePush layout must match ParticleComposite.slang");
+                std::memcpy(pp.pos_fovtan, push.pos_fovtan, sizeof(pp.pos_fovtan));
+                std::memcpy(pp.fwd_aspect, push.fwd_aspect, sizeof(pp.fwd_aspect));
+                std::memcpy(pp.right_xyz,  push.right_xyz,  sizeof(pp.right_xyz));
+                std::memcpy(pp.up_xyz,     push.up_xyz,     sizeof(pp.up_xyz));
+                pp.width            = fc.width;
+                pp.height           = fc.height;
+                pp.particle_count   = pcount;
+                pp.composite_active = 1u;
+                // Threadgroups along X; we keep Y = 1 (so Y has exactly
+                // 8 threads). Each threadgroup = 64 threads = 64
+                // particles. groups_x = ceil(pcount / 64).
+                std::uint32_t groups_x = (pcount + 63u) / 64u;
+                if (groups_x == 0u) groups_x = 1u;
+                pp.threads_x = groups_x * 8u;
+                cb->PushConstants(&pp, sizeof(pp));
+                cb->Dispatch(groups_x, 1, 1);
+
+                // RAW: bloom_down about to read the HDR we just wrote
+                // (additively). Metal auto-barriers; emitted for
+                // documentation symmetry with StarsComposite above.
+                cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                             pt::rhi::BarrierDesc::Stage::ComputeRead});
+            }
+        }
+        // ----- end Particle composite -----------------------------------
+
         if (bloom_can_run) {
             dispatch_bloom_pyramid(tonemap_hdr_source_id);
         }
@@ -5735,6 +5936,24 @@ void Engine::Tick(double dt) {
             if (auto* v = C.FindCVar("r_clouds_wind_z")) wz = v->GetFloat();
             if (wx != 0.0f || wz != 0.0f) accum_dirty_ = true;
         }
+    }
+
+    // Particle / VFX system tick (#82 MVP). CPU sim runs every frame
+    // regardless of r_particles so a user toggling the master flag back
+    // on doesn't see stale particles snap back into existence; instead
+    // particles age naturally even while the composite kernel is off.
+    // SetMaxParticles is cheap (assignment); pushing the cvar each
+    // frame is harmless and lets the user adjust the cap live without
+    // a backend restart.
+    if (particles_) {
+        auto& Cp = pt::console::Console::Get();
+        if (auto* mv = Cp.FindCVar("r_particles_max")) {
+            int m = mv->GetInt();
+            if (m < 0)     m = 0;
+            if (m > 65536) m = 65536;   // hard upper sanity bound
+            particles_->SetMaxParticles(static_cast<std::uint32_t>(m));
+        }
+        particles_->Update(static_cast<float>(dt));
     }
 
     auto t0 = std::chrono::steady_clock::now();
@@ -7946,6 +8165,116 @@ void Engine::RegisterCommands() {
     // --- SDF Phase 1 (#97) -----------------------------------------------------
     RegisterSdfCommands();
     // --- end SDF Phase 1 -------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Particle / VFX (#82 MVP) console commands.
+    //
+    // Subcommands:
+    //   particle_emit smoke <x> <y> <z>   - one-shot smoke puff at position
+    //   particle_emit spark <x> <y> <z>   - one-shot spark burst at position
+    //   particle_emit snow   [x] [y] [z]  - start continuous snow emitter
+    //                                       centred at the given position
+    //                                       (defaults to camera-relative
+    //                                       origin if omitted)
+    //   particle_emit snow_stop           - stop the snow emitter
+    //   particle_clear                    - kill all live particles +
+    //                                       continuous emitters
+    //   particle_count                    - report live particle count
+    //
+    // Parsing notes:
+    //   * Floats use std::strtof (deferred since console args are
+    //     std::string_view) -- copy into a small char buffer first.
+    //     The console splits on whitespace and semicolons before we
+    //     see args, so each arg is a single token.
+    //   * The first arg is the SUBCOMMAND name (smoke / spark / snow /
+    //     snow_stop). The remaining 0..3 args are the optional position.
+    //   * The default x/y/z when omitted is (0, 1.5, 0) -- 1.5 m above
+    //     world origin, the same height as the engineering camera
+    //     default. This matches "spawn at the centre of the canonical
+    //     scene" intent.
+    // -----------------------------------------------------------------------
+    auto parse_float = [](std::string_view s, float& out) -> bool {
+        // strtof needs a NUL-terminated string. std::string copy is
+        // 1 small alloc; cheap relative to console-command latency.
+        std::string tmp(s);
+        char* end = nullptr;
+        float v = std::strtof(tmp.c_str(), &end);
+        if (!end || end == tmp.c_str()) return false;
+        out = v;
+        return true;
+    };
+
+    C.RegisterCommand("particle_emit",
+        "particle_emit <smoke|spark|snow|snow_stop> [x y z]. "
+        "Spawn a preset particle burst (smoke / spark) or start/stop "
+        "the continuous snow emitter at the given world position "
+        "(default 0 1.5 0). Particles are screen-space billboards in "
+        "the MVP -- NOT visible in path-traced reflections.",
+        [this, parse_float](auto args, pt::console::Output& out) {
+            if (!particles_) { out.PrintLine("particle_emit: particle system not initialised"); return; }
+            if (args.empty()) {
+                out.PrintLine("usage: particle_emit <smoke|spark|snow|snow_stop> [x y z]");
+                return;
+            }
+            const std::string sub(args[0]);
+            glm::vec3 at{0.0f, 1.5f, 0.0f};
+            // Optional position. Accept "smoke 1 2 3" and "smoke" both;
+            // partial positions ("smoke 1") error out so the user
+            // doesn't accidentally spawn at a partial location.
+            if (args.size() >= 4) {
+                float x, y, z;
+                if (!parse_float(args[1], x) ||
+                    !parse_float(args[2], y) ||
+                    !parse_float(args[3], z)) {
+                    out.PrintLine("particle_emit: x y z must be numeric");
+                    return;
+                }
+                at = glm::vec3(x, y, z);
+            } else if (args.size() == 2 || args.size() == 3) {
+                out.PrintLine("particle_emit: provide either 0 args (default position) or 3 (x y z)");
+                return;
+            }
+
+            if (sub == "smoke") {
+                auto spec = pt::effects::ParticleSystem::PresetSmoke(at);
+                auto n = particles_->EmitBurst(spec);
+                out.FormatLine("particle_emit smoke: spawned {} particle(s) at ({:.2f}, {:.2f}, {:.2f})",
+                               n, at.x, at.y, at.z);
+            } else if (sub == "spark") {
+                auto spec = pt::effects::ParticleSystem::PresetSpark(at);
+                auto n = particles_->EmitBurst(spec);
+                out.FormatLine("particle_emit spark: spawned {} particle(s) at ({:.2f}, {:.2f}, {:.2f})",
+                               n, at.x, at.y, at.z);
+            } else if (sub == "snow") {
+                // Rate: 50 particles/sec is a comfortable indoor
+                // flurry; the cap throttles it naturally on the way up.
+                auto spec = pt::effects::ParticleSystem::PresetSnow(at);
+                particles_->StartContinuous("snow", spec, 50.0f);
+                out.FormatLine("particle_emit snow: continuous emitter started, centre ({:.2f}, {:.2f}, {:.2f})",
+                               at.x, at.y, at.z);
+            } else if (sub == "snow_stop") {
+                auto n = particles_->StopContinuous("snow");
+                out.FormatLine("particle_emit snow_stop: stopped {} continuous emitter(s)", n);
+            } else {
+                out.FormatLine("particle_emit: unknown preset '{}' (expected smoke|spark|snow|snow_stop)", sub);
+            }
+        });
+
+    C.RegisterCommand("particle_clear",
+        "Kill every live particle + stop all continuous emitters.",
+        [this](auto, pt::console::Output& out) {
+            if (!particles_) { out.PrintLine("particle_clear: particle system not initialised"); return; }
+            particles_->Clear();
+            out.PrintLine("particle_clear: ok");
+        });
+
+    C.RegisterCommand("particle_count",
+        "Report the current live particle count.",
+        [this](auto, pt::console::Output& out) {
+            if (!particles_) { out.PrintLine("particle_count: particle system not initialised"); return; }
+            out.FormatLine("particles live: {} / cap {}",
+                           particles_->LiveCount(), particles_->MaxParticles());
+        });
 }
 
 namespace {

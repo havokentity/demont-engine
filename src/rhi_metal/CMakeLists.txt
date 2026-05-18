@@ -93,6 +93,18 @@ pt_compile_slang(
     ENTRY   main
     TARGETS metal
 )
+# Screen-space particle composite (#82 MVP). Dispatched once per frame
+# on Metal AFTER StarsComposite, BEFORE the bloom pyramid -- same
+# insertion pattern. Reads the engine-uploaded particle storage buffer
+# and additive-splats each particle as a soft Gaussian disc into the
+# post-denoise HDR, depth-gated by the PathTrace G-buffer.
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/ParticleComposite.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+)
 # SVGF denoiser (svgf_basic / svgf_atrous on r_denoiser). Same Slang
 # sources the Vulkan backend uses; slangc cross-compiles them to MSL.
 # DenoiseFinalize is NOT built on Metal -- the existing Tonemap pipeline

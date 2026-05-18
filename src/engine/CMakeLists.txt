@@ -52,6 +52,7 @@ target_link_libraries(pt_engine
     PUBLIC  pt_app_window
     PUBLIC  pt_rhi
     PUBLIC  pt_renderer
+    PUBLIC  pt_effects
     PRIVATE pt_capture_encoder
     PRIVATE tomlplusplus::tomlplusplus
 )
