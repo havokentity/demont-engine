@@ -13,6 +13,7 @@
 #include "../audio/AudioSystem.h"
 #include "../console/Console.h"
 #include "../console/ConsoleServer.h"
+#include "../core/AssetPath.h"
 #include "../core/Diag.h"
 #include "../core/Hardware/HardwareInfo.h"
 #include "../core/Jobs/JobSystem.h"
@@ -2721,7 +2722,7 @@ void Engine::ReloadEnvMap(const std::string& path) {
     }
 
     std::string err;
-    auto img = pt::renderer::LoadRadianceHdr(path, &err);
+    auto img = pt::renderer::LoadRadianceHdr(pt::ResolveAssetPath(path.c_str()), &err);
     if (img.Empty()) {
         LOG_WARN("env_map: failed to load '{}': {}", path, err);
         accum_dirty_ = true;
@@ -3055,7 +3056,7 @@ void Engine::EnsureStarMapUploaded() {
     constexpr std::uint32_t kH   = 4096;
 
     std::string err;
-    auto stars = pt::stars::LoadBsc5(kPath, &err);
+    auto stars = pt::stars::LoadBsc5(pt::ResolveAssetPath(kPath), &err);
     if (stars.empty()) {
         LOG_WARN("starmap: BSC load failed ({}); stars disabled", err);
         star_map_present_ = 0;

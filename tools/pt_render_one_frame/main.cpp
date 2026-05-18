@@ -296,6 +296,31 @@ std::filesystem::path ResolveDemontPath(const std::filesystem::path& self_arg0,
     return build_root.empty() ? c2 : (build_root / "src" / "app" / demont_name);
 }
 
+// Walk up from the wrapper exe looking for an `assets/` subdirectory.
+// Found dir is the asset root we hand to demont via DEMONT_ASSET_ROOT;
+// the engine's pt::ResolveAssetPath() consumes it in lieu of a CWD-
+// relative open. Used to cover ctest's per-cell golden_workdir/<cell>/
+// CWD where the engine would otherwise miss assets/hdri/*.hdr +
+// assets/stars/BSC5.dat. Falls back to empty path -> caller skips the
+// env-var injection -> engine resolves via exe-grandparent (packaged-
+// install layout).
+std::filesystem::path ResolveAssetRoot(const std::filesystem::path& self_arg0) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path self = fs::weakly_canonical(self_arg0, ec);
+    if (ec) self = self_arg0;
+    fs::path dir = self.parent_path();
+    // 6 levels up covers <repo>/build/<preset>/tools/pt_render_one_frame/
+    // and the packaged <install>/bin/ layout, with margin.
+    for (int i = 0; i < 6 && !dir.empty(); ++i) {
+        if (fs::is_directory(dir / "assets", ec)) return dir;
+        fs::path parent = dir.parent_path();
+        if (parent == dir) break;   // hit filesystem root
+        dir = parent;
+    }
+    return {};
+}
+
 // Build a synthesised console-script that the engine exec's via
 // --smoke-exec=<path>. Format is one console command per line; blank
 // lines and lines starting with `#` are ignored by the parser. The
@@ -532,6 +557,27 @@ int main(int argc, char** argv) {
 
     const std::filesystem::path demont =
         ResolveDemontPath(std::filesystem::path(argv[0]), a.demontPath);
+
+    // Propagate the asset root to the child engine via DEMONT_ASSET_ROOT.
+    // ctest sets each cell's CWD to golden_workdir/<cell>/, which makes
+    // the engine's CWD-relative asset opens (env_map sunset.hdr, BSC5)
+    // miss the actual files under <repo>/assets/. Resolving the root
+    // here from the wrapper's exe location (which is fixed by the build
+    // tree layout) and forwarding via env var is robust to whatever CWD
+    // ctest chose. The child inherits the parent env on both Win32
+    // (CreateProcessA with lpEnvironment=nullptr) and POSIX (fork+exec).
+    {
+        const std::filesystem::path asset_root =
+            ResolveAssetRoot(std::filesystem::path(argv[0]));
+        if (!asset_root.empty()) {
+            const std::string s = asset_root.string();
+#if defined(_WIN32)
+            _putenv_s("DEMONT_ASSET_ROOT", s.c_str());
+#else
+            setenv("DEMONT_ASSET_ROOT", s.c_str(), 1);
+#endif
+        }
+    }
 
     // error_code overload (no-throw): the no-arg `exists()` throws on
     // a filesystem error, but this TU is -fno-exceptions. Use the

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Rajesh D'Monte
 add_library(pt_core STATIC
+    AssetPath.cpp
     Diag.cpp
     Log.cpp
     Memory/Memory.cpp
