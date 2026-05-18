@@ -1386,6 +1386,9 @@ void Engine::TearDownDevice() {
         // --- SDF Phase 1 (#97) -------------------------------------------------
         if (sdf_cluster_buffer_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{sdf_cluster_buffer_id_});
         // --- end SDF Phase 1 ---------------------------------------------------
+        // --- Light primitives (#73) --------------------------------------------
+        if (light_buffer_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{light_buffer_id_});
+        // --- end Light primitives ----------------------------------------------
         if (denoise_color_tex_id_    != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
         if (depth_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
         if (motion_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
@@ -1436,6 +1439,12 @@ void Engine::TearDownDevice() {
     sdf_cluster_count_        = 0;
     sdf_prims_dirty_          = true;
     // --- end SDF Phase 1 ---------------------------------------------------
+    // --- Light primitives (#73) --------------------------------------------
+    light_buffer_id_       = 0;
+    light_buffer_capacity_ = 0;
+    light_count_uploaded_  = 0;
+    light_prims_dirty_     = true;        // re-upload on next device
+    // --- end Light primitives ----------------------------------------------
     denoise_color_tex_id_    = 0;
     depth_tex_id_            = 0;
     motion_tex_id_           = 0;
@@ -3121,6 +3130,110 @@ void Engine::EnsureSdfPrimsUploaded() {
 }
 // --- end SDF Phase 1 -------------------------------------------------------
 
+// --- Light primitives (#73) ------------------------------------------------
+//
+// Per-light GPU layout (must match PathTrace.slang's LightRecord +
+// loadLight, kLightStrideFloat4 = 4 float4s = 64 B):
+//
+//   v0.xyz = pos             ;  v0.w   = radius (sphere)
+//   v1.rgb = intensity       ;  v1.w   = type as float (0..3)
+//   v2.xyz = dir (spot axis / quad normal)
+//   v2.w   = cos_outer       (spot)
+//   v3.xyz = u_vec (quad u-half-extent vector); v3.x = cos_inner (spot)
+//   v3.w   = v_half          (quad)
+//
+// Grows by powers of two from a floor of 16 lights -- same allocation
+// pattern as the analytic prim / SDF cluster / BVH-node buffers, so
+// steady-state edits don't reallocate. The shader's NEE block is
+// gated on `light_count > 0`; an empty set leaves the binding
+// resolved to a placeholder but the shader doesn't read it.
+void Engine::EnsureLightsUploaded() {
+    if (!device_) return;
+    if (!light_prims_dirty_) return;
+
+    const std::uint32_t count = static_cast<std::uint32_t>(light_prims_.size());
+    constexpr std::uint32_t kFloatsPerLight = 16;   // 4 float4s
+    constexpr std::uint32_t kBytesPerLight  = sizeof(float) * kFloatsPerLight;
+
+    // Allocate / grow the storage buffer when needed. 16-light floor
+    // matches the analytic-prim convention; doubles up from there.
+    if (count > light_buffer_capacity_) {
+        std::uint32_t new_cap = light_buffer_capacity_ ? light_buffer_capacity_ : 16u;
+        while (new_cap < count) new_cap *= 2u;
+        if (light_buffer_id_ != 0) {
+            device_->WaitIdle();
+            device_->DestroyBuffer(pt::rhi::BufferHandle{light_buffer_id_});
+            light_buffer_id_ = 0;
+        }
+        auto buf = device_->CreateBuffer({
+            .size       = std::size_t(new_cap) * kBytesPerLight,
+            .usage      = pt::rhi::BufferUsage::Storage,
+            .debug_name = "analytic_lights",
+        });
+        if (buf.id == 0) {
+            LOG_ERROR("light buffer allocation failed (capacity {})", new_cap);
+            return;
+        }
+        light_buffer_id_       = buf.id;
+        light_buffer_capacity_ = new_cap;
+    }
+
+    if (count == 0) {
+        light_count_uploaded_ = 0;
+        light_prims_dirty_    = false;
+        accum_dirty_          = true;
+        return;
+    }
+
+    // Allocate enough capacity for the buffer's full footprint (even
+    // unused trailing entries) so the shader's bounds check against
+    // light_count is the only thing that matters.
+    std::vector<float> packed(std::size_t(light_buffer_capacity_) * kFloatsPerLight, 0.0f);
+    std::size_t idx = 0;
+    for (const auto& [id, L] : light_prims_) {
+        const std::size_t off = idx * kFloatsPerLight;
+        // v0: position + sphere radius
+        packed[off + 0]  = L.pos[0];
+        packed[off + 1]  = L.pos[1];
+        packed[off + 2]  = L.pos[2];
+        packed[off + 3]  = L.radius;
+        // v1: intensity + type
+        packed[off + 4]  = L.intensity[0];
+        packed[off + 5]  = L.intensity[1];
+        packed[off + 6]  = L.intensity[2];
+        packed[off + 7]  = static_cast<float>(L.type);
+        // v2: direction + spot cos_outer
+        packed[off + 8]  = L.dir[0];
+        packed[off + 9]  = L.dir[1];
+        packed[off + 10] = L.dir[2];
+        packed[off + 11] = L.cos_outer;
+        // v3: quad u_vec (which also stores spot cos_inner in .x) + quad v_half
+        packed[off + 12] = (L.type == AnalyticLight::Spot) ? L.cos_inner : L.u_vec[0];
+        packed[off + 13] = L.u_vec[1];
+        packed[off + 14] = L.u_vec[2];
+        packed[off + 15] = L.v_half;
+        ++idx;
+    }
+    device_->WriteBuffer(pt::rhi::BufferHandle{light_buffer_id_},
+                         packed.data(), packed.size() * sizeof(float));
+
+    light_count_uploaded_ = count;
+    light_prims_dirty_    = false;
+    accum_dirty_          = true;
+    LOG_INFO("[lights] uploaded {} analytic light(s)", count);
+    for (const auto& [id, L] : light_prims_) {
+        const char* tname = (L.type == AnalyticLight::Point)  ? "point"
+                          : (L.type == AnalyticLight::Spot)   ? "spot"
+                          : (L.type == AnalyticLight::Sphere) ? "sphere"
+                                                              : "quad";
+        LOG_INFO("[lights]   id={} type={} pos=({:.2f},{:.2f},{:.2f}) intensity=({:.2f},{:.2f},{:.2f})",
+                 id, tname,
+                 L.pos[0], L.pos[1], L.pos[2],
+                 L.intensity[0], L.intensity[1], L.intensity[2]);
+    }
+}
+// --- end Light primitives --------------------------------------------------
+
 void Engine::EnsurePipelineHandles() {
     if (!device_) return;
     auto resolve = [&](std::uint64_t& cached, const char* name) {
@@ -3196,6 +3309,9 @@ void Engine::RenderFrame() {
     // --- SDF Phase 1 (#97) -------------------------------------------------
     EnsureSdfPrimsUploaded();
     // --- end SDF Phase 1 ---------------------------------------------------
+    // --- Light primitives (#73) --------------------------------------------
+    EnsureLightsUploaded();
+    // --- end Light primitives ----------------------------------------------
 
     auto& C = pt::console::Console::Get();
 
@@ -3768,6 +3884,8 @@ void Engine::RenderFrame() {
         : pt::rhi::BufferHandle{placeholder_storage_id_};
     if (slot10.id != 0) cb->BindBuffer(10, slot10, 0);
     // --- end SDF Phase 1 ---------------------------------------------------
+    // (light primitives slot bind moved to slot 12 below, since SIGMA
+    // claimed slot 11 for shadow_vis_buf on the integration branch.)
     // P10 G-buffer texture binds. The shader's vk::binding numbers (6/7/8)
     // are Vulkan descriptor slots; on Metal Slang assigns texture(N) in
     // declaration order, so output/accum/denoise_color/depth/motion/env
@@ -3844,6 +3962,22 @@ void Engine::RenderFrame() {
         ? pt::rhi::BufferHandle{shadow_vis_buf_id_}
         : pt::rhi::BufferHandle{placeholder_storage_id_};
     if (slot11.id != 0) cb->BindBuffer(11, slot11, 0);
+    // --- Light primitives (#73) --------------------------------------------
+    // Analytic light list at engine slot 12 (MSL slot order;
+    // vk::binding(27, 0)). Slot 12 because SIGMA's shadow_vis_buf
+    // already claims slot 11 -- light_prims is declared AFTER
+    // shadow_vis_buf in PathTrace.slang so it lands one MSL slot
+    // higher. The shader gates its NEE-to-lights branch on
+    // push.light_count > 0; the binding still has to resolve to a
+    // real buffer to keep Metal's push-slot computation stable
+    // (same lesson the slot11 fallback above captures). Falls back
+    // to the always-present placeholder storage buffer when no
+    // lights are active.
+    pt::rhi::BufferHandle slot12 = (light_buffer_id_ != 0)
+        ? pt::rhi::BufferHandle{light_buffer_id_}
+        : pt::rhi::BufferHandle{placeholder_storage_id_};
+    if (slot12.id != 0) cb->BindBuffer(12, slot12, 0);
+    // --- end Light primitives ----------------------------------------------
     if (env_map_tex_id_ != 0) {
         cb->BindStorageTexture(5, pt::rhi::TextureHandle{env_map_tex_id_});
     }
@@ -4100,6 +4234,19 @@ void Engine::RenderFrame() {
         float vol_phase_g_cloud;
         float vol_multiscatter_oct;
         float _pad_vol;
+        // --- Light primitives (#73) ----------------------------------------
+        // Number of analytic light primitives in the `light_prims`
+        // storage buffer this dispatch. 0 disables the Lambert
+        // NEE-to-lights branch entirely. Sits in its own 16-byte
+        // trailing block (light_count + 3 uint pads): the slot the
+        // light agent originally targeted (_pad_star_split[0]) is now
+        // owned by SIGMA's write_shadow_vis after the integration
+        // merge, so this is a fresh tail block instead of an in-place
+        // reuse. Mirrors PathTrace.slang's matching trailing block in
+        // both the Metal Push cbuffer and the SPIR-V Frame UBO.
+        std::uint32_t light_count;
+        std::uint32_t _pad_light_tail[3];
+        // --- end Light primitives ------------------------------------------
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -4291,6 +4438,11 @@ void Engine::RenderFrame() {
         push.vol_phase_g_cloud    = phase_g;
         push.vol_multiscatter_oct = float(ms_bnc);
     }
+    // Analytic light count (#73). Drives PathTrace.slang's NEE-to-lights
+    // gate; 0 disables it (the binding still resolves to a placeholder
+    // buffer for slot stability -- see slot12 above).
+    push.light_count = light_count_uploaded_;
+    for (auto& v : push._pad_light_tail) v = 0u;
 
     // Halton(2,3) sub-pixel jitter sequence in [-0.5, 0.5] each axis.
     // 16-sample period before repeating; ample for the denoiser's
@@ -4771,7 +4923,7 @@ void Engine::RenderFrame() {
     // Vulkan keeps the first 112 B in push constants and spills the
     // rest into the Frame UBO (kFrameUboSize = 1024); Metal keeps the
     // whole struct in a setBytes-style slot.
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16);
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16);
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
     // cbuffer layout the Slang compiler applies to PathTrace.slang's
@@ -8978,6 +9130,9 @@ void Engine::RegisterCommands() {
     // --- Physics Phase 1 (#132) ------------------------------------------------
     RegisterPhysicsCommands();
     // --- end Physics Phase 1 ---------------------------------------------------
+    // --- Light primitives (#73) ------------------------------------------------
+    RegisterLightCommands();
+    // --- end Light primitives --------------------------------------------------
 }
 
 namespace {
@@ -9921,5 +10076,226 @@ void Engine::StepPhysics(float dt) {
     }
 }
 // --- end Physics Phase 1 ---------------------------------------------------
+// --- Light primitives (#73) ------------------------------------------------
+//
+// Console commands for analytic light primitives. Mirrors the
+// `prim_*` / `sdf_*` convention:
+//   * `light_point <id> <x> <y> <z> <r> <g> <b>` -- omnidirectional
+//      emitter at a point. Intensity is radiant intensity per channel
+//      in W/sr (candela-equivalent).
+//   * `light_spot <id> <x> <y> <z> <dx> <dy> <dz> <outer_deg>
+//      <inner_deg> <r> <g> <b>` -- point with an angular cosine
+//      falloff cone. `dir` is the EMISSION axis (from the emitter
+//      outward into the scene); `outer_deg` / `inner_deg` are the
+//      cone half-angles in degrees (light is full inside inner,
+//      zero outside outer, linear cosine ramp between).
+//   * `light_sphere <id> <x> <y> <z> <radius> <r> <g> <b>` -- diffuse
+//      area emitter on a sphere surface. Intensity is surface
+//      radiance in W/m^2/sr; the integrator samples a uniform point
+//      on the sphere each NEE call.
+//   * `light_quad <id> <x> <y> <z> <nx> <ny> <nz> <ux> <uy> <uz>
+//      <u_half> <v_half> <r> <g> <b>` -- diffuse one-sided rectangle.
+//      `n` is the front-face normal; `u` is the in-plane direction
+//      (re-orthogonalised against n); `u_half` / `v_half` are the
+//      half-extent lengths in metres.
+//   * `light_list` / `light_clear` / `light_remove` -- management.
+
+namespace {
+
+const char* LightTypeName(Engine::AnalyticLight::Type t) {
+    switch (t) {
+        case Engine::AnalyticLight::Point:  return "point";
+        case Engine::AnalyticLight::Spot:   return "spot";
+        case Engine::AnalyticLight::Sphere: return "sphere";
+        case Engine::AnalyticLight::Quad:   return "quad";
+    }
+    return "?";
+}
+
+}  // namespace
+
+void Engine::RegisterLightCommands() {
+    auto& C = pt::console::Console::Get();
+
+    C.RegisterCommand("light_list",
+        "List analytic light primitives.",
+        [this](auto, pt::console::Output& out) {
+            if (light_prims_.empty()) { out.PrintLine("(no lights)"); return; }
+            out.FormatLine("{} analytic light(s):", light_prims_.size());
+            for (const auto& [id, L] : light_prims_) {
+                out.FormatLine("  {:>3}  {:<6}  pos=({:.2f} {:.2f} {:.2f})  intensity=({:.2f} {:.2f} {:.2f})",
+                               id, LightTypeName(L.type),
+                               L.pos[0], L.pos[1], L.pos[2],
+                               L.intensity[0], L.intensity[1], L.intensity[2]);
+            }
+        });
+
+    C.RegisterCommand("light_clear",
+        "Remove all analytic light primitives.",
+        [this](auto, pt::console::Output& out) {
+            light_prims_.clear();
+            light_prims_dirty_ = true;
+            accum_dirty_       = true;
+            out.PrintLine("lights: cleared");
+        });
+
+    C.RegisterCommand("light_remove",
+        "light_remove <id>: drop an analytic light.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 1) { out.PrintLine("usage: light_remove <id>"); return; }
+            std::uint32_t id;
+            if (!ParseUint(args[0], id)) { out.PrintLine("light_remove: id parse failed"); return; }
+            if (light_prims_.erase(id) == 0) {
+                out.FormatLine("light_remove: id {} not found", id);
+                return;
+            }
+            light_prims_dirty_ = true;
+            accum_dirty_       = true;
+            out.FormatLine("lights: removed id {}", id);
+        });
+
+    C.RegisterCommand("light_point",
+        "light_point <id> <x> <y> <z> <r> <g> <b>: add or replace an omnidirectional point light (intensity in W/sr per channel).",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 7) {
+                out.PrintLine("usage: light_point <id> <x> <y> <z> <r> <g> <b>");
+                return;
+            }
+            std::uint32_t id;
+            float x, y, z, r, g, b;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z) ||
+                !ParseFloat(args[4], r) || !ParseFloat(args[5], g) || !ParseFloat(args[6], b)) {
+                out.PrintLine("light_point: arg parse failed");
+                return;
+            }
+            AnalyticLight L{};
+            L.type = AnalyticLight::Point;
+            L.pos[0] = x; L.pos[1] = y; L.pos[2] = z;
+            L.intensity[0] = r; L.intensity[1] = g; L.intensity[2] = b;
+            light_prims_[id] = L;
+            light_prims_dirty_ = true;
+            accum_dirty_       = true;
+            out.FormatLine("lights: point id={} pos=({:.2f} {:.2f} {:.2f})", id, x, y, z);
+        });
+
+    C.RegisterCommand("light_spot",
+        "light_spot <id> <x> <y> <z> <dx> <dy> <dz> <outer_deg> <inner_deg> <r> <g> <b>: add or replace a spot light (W/sr per channel, angular cosine falloff between inner and outer cone half-angles).",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 12) {
+                out.PrintLine("usage: light_spot <id> <x> <y> <z> <dx> <dy> <dz> <outer_deg> <inner_deg> <r> <g> <b>");
+                return;
+            }
+            std::uint32_t id;
+            float x, y, z, dx, dy, dz, outer_deg, inner_deg, r, g, b;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], x)  || !ParseFloat(args[2], y)  || !ParseFloat(args[3], z) ||
+                !ParseFloat(args[4], dx) || !ParseFloat(args[5], dy) || !ParseFloat(args[6], dz) ||
+                !ParseFloat(args[7], outer_deg) || !ParseFloat(args[8], inner_deg) ||
+                !ParseFloat(args[9], r)  || !ParseFloat(args[10], g) || !ParseFloat(args[11], b)) {
+                out.PrintLine("light_spot: arg parse failed");
+                return;
+            }
+            const float dlen = std::sqrt(dx*dx + dy*dy + dz*dz);
+            if (dlen < 1e-6f) { out.PrintLine("light_spot: dir magnitude is zero"); return; }
+            dx /= dlen; dy /= dlen; dz /= dlen;
+            if (outer_deg < 0.0f) outer_deg = 0.0f;
+            if (outer_deg > 89.99f) outer_deg = 89.99f;
+            if (inner_deg < 0.0f) inner_deg = 0.0f;
+            if (inner_deg > outer_deg) inner_deg = outer_deg;
+            AnalyticLight L{};
+            L.type = AnalyticLight::Spot;
+            L.pos[0] = x; L.pos[1] = y; L.pos[2] = z;
+            L.dir[0] = dx; L.dir[1] = dy; L.dir[2] = dz;
+            L.intensity[0] = r; L.intensity[1] = g; L.intensity[2] = b;
+            const float deg2rad = 3.14159265358979323846f / 180.0f;
+            L.cos_outer = std::cos(outer_deg * deg2rad);
+            L.cos_inner = std::cos(inner_deg * deg2rad);
+            light_prims_[id] = L;
+            light_prims_dirty_ = true;
+            accum_dirty_       = true;
+            out.FormatLine("lights: spot id={} pos=({:.2f} {:.2f} {:.2f}) dir=({:.2f} {:.2f} {:.2f}) outer={:.1f} inner={:.1f}",
+                           id, x, y, z, dx, dy, dz, outer_deg, inner_deg);
+        });
+
+    C.RegisterCommand("light_sphere",
+        "light_sphere <id> <x> <y> <z> <radius> <r> <g> <b>: add or replace a spherical diffuse area light (radiance in W/m^2/sr).",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 8) {
+                out.PrintLine("usage: light_sphere <id> <x> <y> <z> <radius> <r> <g> <b>");
+                return;
+            }
+            std::uint32_t id;
+            float x, y, z, radius, r, g, b;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z) ||
+                !ParseFloat(args[4], radius) ||
+                !ParseFloat(args[5], r) || !ParseFloat(args[6], g) || !ParseFloat(args[7], b)) {
+                out.PrintLine("light_sphere: arg parse failed");
+                return;
+            }
+            if (radius <= 0.0f) { out.PrintLine("light_sphere: radius must be > 0"); return; }
+            AnalyticLight L{};
+            L.type = AnalyticLight::Sphere;
+            L.pos[0] = x; L.pos[1] = y; L.pos[2] = z;
+            L.radius = radius;
+            L.intensity[0] = r; L.intensity[1] = g; L.intensity[2] = b;
+            light_prims_[id] = L;
+            light_prims_dirty_ = true;
+            accum_dirty_       = true;
+            out.FormatLine("lights: sphere id={} pos=({:.2f} {:.2f} {:.2f}) r={:.3f}", id, x, y, z, radius);
+        });
+
+    C.RegisterCommand("light_quad",
+        "light_quad <id> <x> <y> <z> <nx> <ny> <nz> <ux> <uy> <uz> <u_half> <v_half> <r> <g> <b>: add or replace a rectangular diffuse one-sided area light (front face = n, u-axis in-plane, both half-extents in metres).",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 15) {
+                out.PrintLine("usage: light_quad <id> <x> <y> <z> <nx> <ny> <nz> <ux> <uy> <uz> <u_half> <v_half> <r> <g> <b>");
+                return;
+            }
+            std::uint32_t id;
+            float x, y, z, nx, ny, nz, ux, uy, uz, uh, vh, r, g, b;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], x)  || !ParseFloat(args[2], y)  || !ParseFloat(args[3], z) ||
+                !ParseFloat(args[4], nx) || !ParseFloat(args[5], ny) || !ParseFloat(args[6], nz) ||
+                !ParseFloat(args[7], ux) || !ParseFloat(args[8], uy) || !ParseFloat(args[9], uz) ||
+                !ParseFloat(args[10], uh) || !ParseFloat(args[11], vh) ||
+                !ParseFloat(args[12], r) || !ParseFloat(args[13], g) || !ParseFloat(args[14], b)) {
+                out.PrintLine("light_quad: arg parse failed");
+                return;
+            }
+            const float nlen = std::sqrt(nx*nx + ny*ny + nz*nz);
+            if (nlen < 1e-6f) { out.PrintLine("light_quad: normal magnitude is zero"); return; }
+            nx /= nlen; ny /= nlen; nz /= nlen;
+            // Re-orthogonalise u against n: u' = normalize(u - n*(n.u)).
+            const float ndu = nx*ux + ny*uy + nz*uz;
+            float uxo = ux - nx*ndu;
+            float uyo = uy - ny*ndu;
+            float uzo = uz - nz*ndu;
+            const float ulen = std::sqrt(uxo*uxo + uyo*uyo + uzo*uzo);
+            if (ulen < 1e-6f) { out.PrintLine("light_quad: u-axis collinear with normal"); return; }
+            uxo /= ulen; uyo /= ulen; uzo /= ulen;
+            if (uh <= 0.0f || vh <= 0.0f) {
+                out.PrintLine("light_quad: u_half and v_half must be > 0");
+                return;
+            }
+            AnalyticLight L{};
+            L.type = AnalyticLight::Quad;
+            L.pos[0] = x; L.pos[1] = y; L.pos[2] = z;
+            L.dir[0] = nx; L.dir[1] = ny; L.dir[2] = nz;
+            // u_vec is stored as the FULL half-extent vector so the
+            // shader can recover both the axis (length-normalised) and
+            // the half-extent (length).
+            L.u_vec[0] = uxo * uh; L.u_vec[1] = uyo * uh; L.u_vec[2] = uzo * uh;
+            L.v_half   = vh;
+            L.intensity[0] = r; L.intensity[1] = g; L.intensity[2] = b;
+            light_prims_[id] = L;
+            light_prims_dirty_ = true;
+            accum_dirty_       = true;
+            out.FormatLine("lights: quad id={} pos=({:.2f} {:.2f} {:.2f}) n=({:.2f} {:.2f} {:.2f}) u_half={} v_half={}",
+                           id, x, y, z, nx, ny, nz, uh, vh);
+        });
+}
+// --- end Light primitives --------------------------------------------------
 
 }  // namespace pt::engine

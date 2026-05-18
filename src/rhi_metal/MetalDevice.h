@@ -105,6 +105,9 @@ private:
     // already sits exactly at Apple Silicon's 8-RW-texture compute
     // cap; storage buffers escape that quota the same way SVGF's
     // variance / moments buffers do. Keep in sync with the engine's
+    // triangle BVH). Slot 11 was added by light primitives (#73) for
+    // the analytic light list (`light_prims`, MSL slot 11; the shader
+    // declares it at vk::binding(27)). Keep in sync with the engine's
     // BindBuffer(11,...) call site.
     BufferHandle               bound_buf_[12] {};
     std::size_t                bound_buf_off_[12] {};

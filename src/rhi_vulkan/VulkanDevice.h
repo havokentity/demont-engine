@@ -68,6 +68,9 @@ private:
     // storage buffer, not an image, because Metal's 8-RW-texture cap
     // on PathTrace was already saturated). Keep this in sync with
     // kSlotToBufBinding[] in VulkanDevice.cpp.
+    // the triangle BVH), and slot 11 added by light primitives (#73)
+    // for the analytic light list (vk::binding 27). Keep this in sync
+    // with kSlotToBufBinding[] in VulkanDevice.cpp.
     BufferHandle   bound_buf_[12] {};
     std::size_t    bound_buf_off_[12] {};
     AccelStructHandle bound_accel_[4] {};

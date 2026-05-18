@@ -266,6 +266,46 @@ Texture2D<float4> moon_map;
 // albedo_tex declaration captures upstream.
 [[vk::binding(23, 0)]] RWStructuredBuffer<float> shadow_vis_buf;
 
+// --- Light primitives (#73) ------------------------------------------------
+// Analytic light list for direct-lighting NEE: point, spot, sphere
+// (area), and quad (area) lights. CPU rebuilds this buffer when the
+// `light_*` console commands mutate the engine's light_prims_ map; the
+// shader's Lambert NEE block picks one entry per sample (uniform over
+// the count) and traces a shadow ray to a sampled point on it.
+//
+// Layout: 4 float4s per light (matches the analytic primitive pattern's
+// declaration-order convention, sized to fit every supported type).
+//
+//   v0.xyz = position             (point/spot center, sphere center,
+//                                   quad center)
+//   v0.w   = radius_or_param      (sphere radius in metres; point/spot/
+//                                   quad: unused -> 0)
+//   v1.rgb = intensity            (per-channel radiant intensity in
+//                                   W/sr for point/spot; per-area
+//                                   radiance W/m^2/sr for sphere/quad;
+//                                   shader integrates by sampled area
+//                                   so the user can read these as the
+//                                   "physical" emitter brightness)
+//   v1.w   = type_as_float        (LIGHT_POINT=0, LIGHT_SPOT=1,
+//                                   LIGHT_SPHERE=2, LIGHT_QUAD=3)
+//   v2.xyz = direction            (spot axis, unit vec; quad normal,
+//                                   unit vec; point/sphere: unused)
+//   v2.w   = cos_outer            (spot outer half-angle cosine; spot
+//                                   only)
+//   v3.xyz = u_extent_or_inner    (quad u-axis half-extent vector, or
+//                                   for spot: x = cos_inner)
+//   v3.w   = v_half_extent        (quad v-axis half-extent magnitude;
+//                                   the v-axis is implicit:
+//                                   normalize(cross(normal, u)))
+//
+// IMPORTANT: declared AFTER shadow_vis_buf so existing Metal slots 0..11
+// are undisturbed (Metal slot allocation is declaration-order based).
+// Light buffer lands on Metal slot 12. On Vulkan the explicit
+// vk::binding(27) is what matters; sits past the SIGMA #115 / MetalFX
+// specular #118 reservations at 23..26.
+[[vk::binding(27, 0)]] StructuredBuffer<float4> light_prims;
+// --- end Light primitives --------------------------------------------------
+
 struct BvhNode {
     float3 aabb_min;
     uint   left_first;
@@ -566,6 +606,16 @@ cbuffer Push {
     float vol_phase_g_cloud;
     float vol_multiscatter_oct;
     float _pad_vol;
+    // --- Light primitives (#73) --------------------------------------------
+    // Number of analytic light primitives in the `light_prims` storage
+    // buffer this dispatch. 0 disables the Lambert NEE-to-lights branch
+    // entirely. Its own 16-byte trailing block (light_count + 12 B pad)
+    // because the SIGMA #115 and hetero clouds #100 blocks already claim
+    // the trailing pad that the original celestials block left behind.
+    uint light_count;
+    uint _pad_light0;
+    uint _pad_light1;
+    uint _pad_light2;
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -626,6 +676,12 @@ cbuffer Frame {
     float vol_phase_g_cloud;
     float vol_multiscatter_oct;
     float _pad_vol;
+    // See `light_count` in the Metal Push cbuffer above (#73). Own
+    // 16-byte trailing block.
+    uint light_count;
+    uint _pad_light0;
+    uint _pad_light1;
+    uint _pad_light2;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -653,6 +709,14 @@ static const uint MAT_DIELECTRIC = 2u;
 
 static const uint PRIM_SPHERE = 0u;
 static const uint PRIM_PLANE  = 1u;
+
+// Light primitive types (#73). Mirrors AnalyticLight::Type on the host.
+// Stored as a float in v1.w of each 4-float4 light record because
+// StructuredBuffer<float4> can't host mixed-type lanes.
+static const uint LIGHT_POINT  = 0u;
+static const uint LIGHT_SPOT   = 1u;
+static const uint LIGHT_SPHERE = 2u;
+static const uint LIGHT_QUAD   = 3u;
 
 static const float3 LIGHT_DIR    = float3(0.4, 1.0, 0.3);
 static const float3 MESH_ALBEDO  = float3(1.00, 0.85, 0.45);   // gold metal default
@@ -1808,6 +1872,205 @@ HdriLightSample sampleHdriLight(inout uint seed) {
     return s;
 }
 
+// ---------- Analytic light primitives NEE (#73) ------------------------
+// First-class scene lights: point / spot / sphere area / quad area.
+// Lifted out of the HDRI sky so a scene can be lit even with no env
+// map (the existing hdri_lights_count > 0 path is sun-on-the-sphere
+// only). Phase 1 sampling is the naive uniform single-pick: choose a
+// light uniformly at random from the count, sample a point on it,
+// trace a shadow ray, accumulate (Le * BRDF * cos / pdf). Variance is
+// fine up to ~100 lights -- beyond that the light tree (#129) takes
+// over with O(log N) importance selection.
+struct LightSample {
+    float3 dir;        // unit vector from hit point toward the light sample
+    float3 Le;         // radiance reaching the surface along dir (no
+                       //   visibility yet -- transmittance() applies that)
+    float  pdf;        // probability density of this sample (solid angle).
+                       //   Selection (1/N) is folded in.
+    float  dist;       // distance from hit to the sampled point (shadow
+                       //   ray t_max). 1e30 sentinel means "no hit"
+                       //   already; not used here.
+};
+
+// 4 float4s per light. Indexed by raw float4 lane offsets to keep the
+// shader independent of how Slang lays the StructuredBuffer out on
+// Metal (declaration-order MSL slot 11, vk::binding 27).
+static const uint kLightStrideFloat4 = 4u;
+
+struct LightRecord {
+    float3 pos;
+    float  radius;
+    float3 intensity;
+    uint   type;
+    float3 dir;        // spot axis / quad normal
+    float  cos_outer;  // spot only
+    float3 u_or_inner; // quad u-half-extent vec; spot: x = cos_inner
+    float  v_half;     // quad v-axis half-extent (length)
+};
+
+LightRecord loadLight(uint idx) {
+    uint base = idx * kLightStrideFloat4;
+    float4 v0 = light_prims[base + 0u];
+    float4 v1 = light_prims[base + 1u];
+    float4 v2 = light_prims[base + 2u];
+    float4 v3 = light_prims[base + 3u];
+    LightRecord L;
+    L.pos        = v0.xyz;
+    L.radius     = v0.w;
+    L.intensity  = v1.rgb;
+    L.type       = uint(v1.w + 0.5);
+    L.dir        = v2.xyz;
+    L.cos_outer  = v2.w;
+    L.u_or_inner = v3.xyz;
+    L.v_half     = v3.w;
+    return L;
+}
+
+// Uniform direction on the unit sphere from two uniform variates --
+// pulled out as a tiny helper so the sphere-light sampler reads
+// naturally. xi.x in [0,1] -> cos(theta) in [-1,1], xi.y -> phi.
+float3 uniformSphereDirection(float2 xi) {
+    float z   = 1.0 - 2.0 * xi.x;
+    float r   = sqrt(max(0.0, 1.0 - z * z));
+    float phi = 6.28318530717958 * xi.y;
+    return float3(r * cos(phi), r * sin(phi), z);
+}
+
+// Sample one analytic light (#73). Uniform over the count for the
+// selection step (1/N); per-light sampling is per-type:
+//   POINT  : delta function. pdf returned as 1.0 in solid angle; the
+//             estimator's cos/pdf reduces to the inverse-square law
+//             baked into Le below.
+//   SPOT   : same as POINT, with an angular falloff window between
+//             cos_inner and cos_outer.
+//   SPHERE : uniform point on the surface (4*pi*r^2 area); pdf is
+//             (area-pdf) * (dist^2 / cos_light), Veach 2.6 standard.
+//   QUAD   : uniform point on the (2u) x (2v) rectangle defined by
+//             pos +/- u +/- v_axis * v_half; same area-to-solid-angle
+//             reciprocal.
+//
+// Returns an unset sample (pdf=0) when light_count == 0 or the chosen
+// type isn't a valid hemisphere direction (back-of-quad, outside spot
+// cone). The caller treats pdf<=0 as "skip this NEE sample".
+LightSample sampleAnalyticLight(float3 hit_pt, float3 n_face, inout uint seed) {
+    LightSample s;
+    s.dir  = float3(0, 1, 0);
+    s.Le   = float3(0.0);
+    s.pdf  = 0.0;
+    s.dist = 1e30;
+    if (light_count == 0u) return s;
+
+    // Uniform single-pick over the active count. Naive Phase 1 -- the
+    // light tree (#129) replaces this with O(log N) selection.
+    float u_pick = randf(seed);
+    uint pick = min(uint(u_pick * float(light_count)), light_count - 1u);
+    float pick_pdf = 1.0 / float(light_count);
+
+    LightRecord L = loadLight(pick);
+
+    if (L.type == LIGHT_POINT) {
+        float3 to_light = L.pos - hit_pt;
+        float  dist2    = max(dot(to_light, to_light), 1e-12);
+        float  dist     = sqrt(dist2);
+        s.dir  = to_light / dist;
+        // Inverse-square falloff: at distance d, irradiance from a
+        // point source of intensity I (W/sr) is I/d^2. The estimator
+        // below evaluates (Le * brdf * cos), with pdf=1 (delta light),
+        // so we encode the geometric falloff into Le.
+        s.Le   = L.intensity / dist2;
+        // Delta light: any non-zero pdf works since cos/pdf collapses;
+        // pick 1.0 so the MIS balance heuristic against a non-delta
+        // BRDF sample naturally pushes toward this strategy.
+        s.pdf  = pick_pdf;
+        s.dist = dist;
+        return s;
+    }
+    if (L.type == LIGHT_SPOT) {
+        float3 to_light = L.pos - hit_pt;
+        float  dist2    = max(dot(to_light, to_light), 1e-12);
+        float  dist     = sqrt(dist2);
+        float3 to_l_dir = to_light / dist;
+        // Spot angular falloff: 1 inside cos_inner, 0 outside cos_outer,
+        // smooth linear ramp in between. Direction from surface toward
+        // the LIGHT is -to_l_dir from the light's emission lobe (the
+        // spot axis points from emitter into the world).
+        float cos_dir = dot(-to_l_dir, normalize(L.dir));
+        float cos_in  = L.u_or_inner.x;
+        float cos_out = L.cos_outer;
+        float falloff = 0.0;
+        if (cos_dir >= cos_in) {
+            falloff = 1.0;
+        } else if (cos_dir > cos_out) {
+            falloff = (cos_dir - cos_out) / max(cos_in - cos_out, 1e-6);
+        }
+        s.dir  = to_l_dir;
+        s.Le   = L.intensity * (falloff / dist2);
+        s.pdf  = pick_pdf;
+        s.dist = dist;
+        return s;
+    }
+    if (L.type == LIGHT_SPHERE) {
+        // Uniform-area sample on the surface of a sphere. A more
+        // efficient sampler (uniform over the visible hemisphere from
+        // the shade point) is an obvious follow-up; uniform-area gives
+        // correct unbiased results -- just higher variance when the
+        // shade point is near the sphere.
+        float2 xi = float2(randf(seed), randf(seed));
+        float3 n_l = uniformSphereDirection(xi);
+        float3 lp  = L.pos + n_l * L.radius;
+        float3 to_light = lp - hit_pt;
+        float  dist2    = max(dot(to_light, to_light), 1e-12);
+        float  dist     = sqrt(dist2);
+        float3 wi       = to_light / dist;
+        // Light surface normal points outward; only the hemisphere
+        // facing the receiver contributes.
+        float cos_light = max(0.0, dot(n_l, -wi));
+        if (cos_light <= 0.0) return s;
+        float area = 4.0 * 3.14159265358979 * L.radius * L.radius;
+        // Solid-angle pdf = (1/area) * dist^2 / cos_light.
+        // Selection pmf folds in via pick_pdf.
+        float pdf_sa = (dist2) / max(area * cos_light, 1e-12);
+        s.dir  = wi;
+        // L.intensity carries area-emitter radiance (W/m^2/sr). The
+        // outgoing radiance toward the receiver is just L.intensity
+        // (no per-point modulation in our Lambertian-emitter model).
+        s.Le   = L.intensity;
+        s.pdf  = pick_pdf * pdf_sa;
+        s.dist = dist;
+        return s;
+    }
+    if (L.type == LIGHT_QUAD) {
+        // Uniform-area on a (2u) x (2v) rectangle. The host packs
+        // u_extent as the FULL half-extent vector (length = u_half);
+        // v-axis is normalize(cross(normal, u)), and v_half is the
+        // half-extent length.
+        float2 xi = float2(randf(seed) * 2.0 - 1.0,
+                           randf(seed) * 2.0 - 1.0);   // [-1, 1]
+        float3 u_vec = L.u_or_inner;
+        float  u_len = length(u_vec);
+        if (u_len < 1e-6) return s;
+        float3 n_quad = normalize(L.dir);
+        float3 v_axis = normalize(cross(n_quad, u_vec));
+        float3 lp = L.pos + u_vec * xi.x + v_axis * (L.v_half * xi.y);
+        float3 to_light = lp - hit_pt;
+        float  dist2    = max(dot(to_light, to_light), 1e-12);
+        float  dist     = sqrt(dist2);
+        float3 wi       = to_light / dist;
+        // One-sided emitter (front face is L.dir).
+        float cos_light = dot(n_quad, -wi);
+        if (cos_light <= 0.0) return s;
+        float area = 4.0 * u_len * L.v_half;
+        float pdf_sa = (dist2) / max(area * cos_light, 1e-12);
+        s.dir  = wi;
+        s.Le   = L.intensity;
+        s.pdf  = pick_pdf * pdf_sa;
+        s.dist = dist;
+        return s;
+    }
+    return s;
+}
+// ---------- end Analytic light primitives NEE --------------------------
+
 // RGB transmittance along a shadow ray. 1.0 = unoccluded, 0.0 = blocked
 // by an opaque hit. Dielectric hits don't block: the ray refracts
 // through (in -> out), continuing toward the light, multiplied by the
@@ -2573,6 +2836,33 @@ void main(uint2 tid : SV_DispatchThreadID) {
         float3 nf  = (ndi < 0.0) ? h.normal : -h.normal;
 
         if (h.mat == MAT_LAMBERT) {
+            // --- Analytic light primitives NEE (#73) -------------------
+            // Direct-lighting from the engine's analytic light list:
+            // point / spot / sphere area / quad area. Fires in EVERY
+            // sky mode (procedural / HDRI / gradient) so scenes can be
+            // lit by lamps regardless of whether an env map is loaded.
+            // Naive uniform single-pick + per-light area sampling;
+            // variance is bounded for ~100 lights, beyond which the
+            // light tree (#129) replaces the picker.
+            if (light_count > 0u) {
+                LightSample ls = sampleAnalyticLight(hit_pt, nf, seed);
+                float n_dot_l = dot(nf, ls.dir);
+                if (ls.pdf > 0.0 && n_dot_l > 0.0) {
+                    // Shadow ray: surface to sampled point on the
+                    // light. Stop t_max just before the light so the
+                    // light's own surface doesn't self-block.
+                    float t_max = max(ls.dist - 1e-3, 0.0);
+                    float3 trans = transmittance(hit_pt + nf * 1e-3,
+                                                 ls.dir, t_max);
+                    if (any(trans > float3(0.0))) {
+                        float3 brdf = h.albedo / 3.14159265358979;
+                        radiance += clampIndirect(
+                            throughput * ls.Le * trans * brdf *
+                            n_dot_l / ls.pdf);
+                    }
+                }
+            }
+            // --- end Analytic light NEE --------------------------------
             if (env_map_present != 0u) {
                 // NEE: importance-sampled env-map direct light. With
                 // MIS, this contribution is weighted by the balance
