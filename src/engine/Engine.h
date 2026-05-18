@@ -25,6 +25,7 @@ namespace pt::console  { class ConsoleServer; }
 namespace pt::rhi      { class Device; struct PipelineHandle; }
 namespace pt::renderer { struct Camera; }
 namespace pt::csg      { class CsgScene; struct BakedMesh; }
+namespace pt::effects  { class ParticleSystem; }
 
 namespace pt::engine {
 
@@ -288,6 +289,25 @@ private:
     // highlights into halos. Replaces the EMA accum_stars architecture
     // from #108 -- see shaders/StarsComposite.slang for the rationale.
     std::uint64_t                               stars_composite_pipeline_id_ = 0;
+    // Screen-space particle composite (#82 MVP). Same dispatch context
+    // as stars_composite -- runs in the use_engine_tonemap branch
+    // AFTER stars composite and BEFORE the bloom pyramid so HDR
+    // particle highlights downsample into halos. CPU-side sim lives
+    // in particles_; the per-frame GPU buffer
+    // (particles_storage_id_) is rebuilt each frame from the live
+    // particle list. Metal-only today, mirroring the Stars composite
+    // (Vulkan dispatch + descriptor wiring is a follow-up).
+    std::uint64_t                               particle_composite_pipeline_id_ = 0;
+    std::uint64_t                               particles_storage_id_  = 0;   // float4[3*N]
+    std::uint32_t                               particles_storage_capacity_ = 0; // particle slots that fit
+    // Reusable scratch buffer for the per-frame particle upload payload
+    // (the packed 12-float-per-particle GPU layout). Keeping this as an
+    // Engine member rather than a `std::vector` local in RenderFrame()
+    // avoids one alloc + one free per frame at the MVP particle count
+    // (~48 KB at 1024 particles -- not large in isolation, but it's
+    // every frame). Resize-without-shrink semantics mean the
+    // allocation tracks the high-water mark of live particles.
+    std::vector<float>                          particle_upload_scratch_;
     std::uint64_t                               perfoverlay_pipeline_id_ = 0;
     std::uint64_t                               perfoverlay_drawlist_id_ = 0;
     std::uint32_t                               perfoverlay_drawlist_capacity_ = 0;
@@ -435,6 +455,17 @@ private:
     // 0 if the load + rasterise failed (so the shader skips sampling).
     std::uint64_t                               star_map_tex_id_       = 0;
     std::uint32_t                               star_map_present_      = 0;
+
+    // CPU-side particle system for issue #82 MVP. Owns the live
+    // particle vector + continuous-emitter slots. Engine::Tick steps
+    // it once per frame; Engine::RenderFrame rebuilds the GPU storage
+    // buffer (particles_storage_id_) from its current state and
+    // dispatches the ParticleComposite kernel.
+    //
+    // unique_ptr instead of inline storage so we can forward-declare
+    // pt::effects::ParticleSystem above and keep Engine.h's include
+    // surface minimal. The fwd-decl needs the pointer to be heap-owned.
+    std::unique_ptr<pt::effects::ParticleSystem> particles_;
 
     // Moon surface texture (procedural, generated at engine init).
     // Equirectangular RGBA16F, 512x256. Sampled in moonDisc() when the

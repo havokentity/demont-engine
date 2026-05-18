@@ -21,5 +21,9 @@ if(PT_ENABLE_VULKAN_BACKEND)
 endif()
 add_subdirectory(rhi)
 add_subdirectory(renderer)
+# Effects layer: CPU-side particle sim MVP (#82). Pure CPU, no RHI
+# deps -- the engine owns the per-frame GPU upload + dispatch in
+# RenderFrame, mirroring the StarsComposite pattern.
+add_subdirectory(effects)
 add_subdirectory(app)
 add_subdirectory(engine)
