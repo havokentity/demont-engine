@@ -9796,26 +9796,27 @@ void Engine::RegisterCommands() {
             v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
         }
     }
-    // Phase 4 (#100) cloud-march cvars: r_vol_density_scale / r_vol_phase_g /
-    // r_vol_multiscatter_bounces feed the cloud march body, so changing
-    // them mid-run alters per-pixel radiance. Without these on_change
-    // hooks the accumulator/denoiser history blends old and new lighting
-    // (smears the tweak across frames), matching the existing r_clouds_*
-    // / r_volumetric_* invalidation pattern.
+    // Phase 4 (#100) cloud-march cvars.
     for (const char* n : {"r_vol_density_scale", "r_vol_phase_g",
                           "r_vol_multiscatter_bounces"}) {
         if (auto* v = C.FindCVar(n)) {
             v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
         }
     }
-    // SDF Phase 3 (#99) fractal tuning cvars: every change reshapes the
-    // fractal DE (different power -> different bulb topology, different
-    // iter count -> different gasket depth, different eps-scale ->
-    // different surface band) so any history accumulation is stale
-    // immediately. Reset accum_dirty_ on change so the denoiser/EMA
-    // doesn't smear the old shape into the new while the user tunes.
+    // SDF Phase 3 (#99) fractal tuning cvars.
     for (const char* n : {"r_sdf_fractal_power", "r_sdf_fractal_iters",
                           "r_sdf_de_eps_scale"}) {
+        if (auto* v = C.FindCVar(n)) {
+            v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+        }
+    }
+    // Water Phase 1 (#134): tweaking absorption / ior / wave params at
+    // runtime changes the MAT_WATER BRDF output, so reset accum_dirty_
+    // to avoid stale samples blending in.
+    for (const char* n : {"r_water_absorption_r", "r_water_absorption_g",
+                          "r_water_absorption_b", "r_water_ior",
+                          "r_water_wave_scale",   "r_water_wave_amplitude",
+                          "r_water_wave_speed"}) {
         if (auto* v = C.FindCVar(n)) {
             v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
         }
