@@ -56,17 +56,18 @@ private:
     // writes and StarsComposite reads). Keep in sync with
     // kSlotToTexBinding[] in VulkanDevice.cpp.
     TextureHandle  bound_tex_[11] {};
-    // 11 buffer slots: 8 original (mesh_positions/indices, primitives,
+    // 12 buffer slots: 8 original (mesh_positions/indices, primitives,
     // marginal/conditional CDFs, exposure_state, analytic-prim bvh_nodes),
     // slots 8/9 for the triangle-BVH (tri_bvh_nodes,
     // tri_bvh_permuted_ids -- the PR #106 follow-up that replaces the
     // SW Möller-Trumbore linear-scan path with a stack-based BVH walk),
-    // plus slot 10 added by SDF Phase 1 (#97) for the SDF cluster
-    // storage buffer (vk::binding 21; moved from binding 19 to make
-    // room for the triangle BVH). Keep this in sync with
-    // kSlotToBufBinding[] in VulkanDevice.cpp.
-    BufferHandle   bound_buf_[11] {};
-    std::size_t    bound_buf_off_[11] {};
+    // slot 10 added by SDF Phase 1 (#97) for the SDF cluster storage
+    // buffer (vk::binding 21; moved from binding 19 to make room for
+    // the triangle BVH), and slot 11 added by light primitives (#73)
+    // for the analytic light list (vk::binding 27). Keep this in sync
+    // with kSlotToBufBinding[] in VulkanDevice.cpp.
+    BufferHandle   bound_buf_[12] {};
+    std::size_t    bound_buf_off_[12] {};
     AccelStructHandle bound_accel_[4] {};
     // Push-constant staging. Sized to fit the full PtPush (~448B today)
     // plus growth headroom so the engine can keep treating push as one

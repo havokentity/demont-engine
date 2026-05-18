@@ -93,10 +93,47 @@ public:
         float    ior         = 1.5f;
     };
 
+    // Analytic light primitive (#73). First-class scene light source for
+    // direct-lighting NEE, parallel to (but independent of) AnalyticPrim.
+    // The engine maintains a map keyed by user id; the set is uploaded
+    // to a single storage buffer when dirty (EnsureLightsUploaded).
+    //
+    // Units mirror real-world emitter physics:
+    //   POINT  intensity in W/sr (candela-equivalent, per channel)
+    //   SPOT   intensity in W/sr at the axis center; multiplied by an
+    //          angular cosine falloff between cos_inner and cos_outer
+    //   SPHERE/QUAD  intensity in W/m^2/sr (radiance of a diffuse
+    //          area emitter). Apparent power scales with the sampled
+    //          area (4*pi*r^2 for sphere, 4*u_half*v_half for quad).
+    //
+    // Phase 1 sampling is naive uniform single-pick; Phase 2 (#129)
+    // wraps a light tree over this list with O(log N) importance
+    // selection. The GPU representation packs into 4 float4s per light
+    // (kFloatsPerLight below) -- see PathTrace.slang's LightRecord for
+    // the lane-by-lane layout.
+    struct AnalyticLight {
+        enum Type : std::uint8_t { Point = 0, Spot = 1, Sphere = 2, Quad = 3 };
+        Type      type        = Point;
+        float     pos[3]      {0, 0, 0};
+        float     radius      = 0.0f;       // sphere radius (m); 0 for point/spot/quad
+        float     intensity[3]{1, 1, 1};    // W/sr (point/spot) or W/m^2/sr (area)
+        float     dir[3]      {0,-1, 0};    // spot axis / quad normal (unit vec)
+        float     cos_outer   = 0.0f;       // spot only -- outer half-angle cosine
+        float     cos_inner   = 0.0f;       // spot only -- inner half-angle cosine
+        float     u_vec[3]    {1, 0, 0};    // quad u-half-extent vector (length = u_half)
+        float     v_half      = 0.0f;       // quad v-axis half-extent (m)
+    };
+
 private:
     void RegisterCommands();
     void RegisterCsgCommands();
     void RegisterPrimCommands();
+    // Console commands for the analytic light primitive set (#73):
+    // `light_point`, `light_spot`, `light_sphere`, `light_quad`, plus
+    // `light_list` / `light_clear` / `light_remove`. Mirrors the
+    // prim_*/sdf_* registration style; the populated map is uploaded
+    // to GPU on the next render frame via EnsureLightsUploaded.
+    void RegisterLightCommands();
     // --- SDF Phase 1 (#97) -------------------------------------------------
     // Console commands for the SDF primitive set (`sdf_sphere`,
     // `sdf_box`, `sdf_smin`, ...). Mirrors the prim_*/csg_* registration
@@ -150,6 +187,14 @@ private:
     // Re-upload the analytic-primitive storage buffer from the in-memory
     // map. Called from RenderFrame whenever primitives_dirty_ is set.
     void EnsurePrimitivesUploaded();
+
+    // Re-upload the analytic-light storage buffer from `light_prims_`
+    // (#73). Called from RenderFrame whenever light_prims_dirty_ is
+    // set. Grows by powers of two from a small floor (16 lights) and
+    // packs each entry into 4 float4s; the path tracer's Lambert NEE
+    // block reads up to `light_prims_count_` records per sample
+    // (uniform single-pick over the count).
+    void EnsureLightsUploaded();
 
     // --- SDF Phase 1 (#97) -------------------------------------------------
     // Re-upload the SDF cluster storage buffer from `sdf_prims_`. Called
@@ -267,6 +312,20 @@ private:
     std::uint32_t                               sdf_cluster_capacity_    = 0;  // clusters that fit
     std::uint32_t                               sdf_cluster_count_       = 0;  // clusters last uploaded
     // --- end SDF Phase 1 ---------------------------------------------------
+
+    // Analytic light primitives (#73) -- point / spot / sphere area /
+    // quad area. Independent of `primitives_`: a separate storage
+    // buffer feeds PathTrace.slang's Lambert NEE-to-lights block. The
+    // map is keyed by user id (same convention as analytic / SDF /
+    // CSG); light_prims_dirty_ schedules a re-upload on the next
+    // render frame. Phase 1 caps the active set at a soft 256 lights
+    // -- naive uniform single-pick variance dominates beyond that and
+    // the light tree (#129) is the answer.
+    std::map<std::uint32_t, AnalyticLight>      light_prims_;
+    bool                                        light_prims_dirty_       = true;
+    std::uint64_t                               light_buffer_id_         = 0;
+    std::uint32_t                               light_buffer_capacity_   = 0;  // lights that fit
+    std::uint32_t                               light_count_uploaded_    = 0;  // lights last uploaded
 
     // Always-allocated 16-byte storage buffer used as a harmless
     // placeholder for any optional binding slot whose primary buffer is
