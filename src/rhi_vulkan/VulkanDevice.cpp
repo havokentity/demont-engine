@@ -372,6 +372,10 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     //     SIGMA per-pixel sun-NEE visibility, issue #115). Bumping to 24
     //     is mandatory -- without this, a dispatch that binds all 11 buf
     //     slots overflows the writes/img_infos/buf_infos stack arrays.
+    //   - light_prims (#73, binding 27), light_tree_nodes (#129, binding
+    //     28), reservoir (#78, binding 29), smoke_emitters (#136, binding
+    //     30) are NOT in the kMaxWrites range because they use the
+    //     extended slot ranges already covered by other capacity bumps.
     constexpr std::uint32_t kMaxWrites = 24;
     std::array<VkDescriptorImageInfo,  kMaxWrites> img_infos {};
     std::array<VkDescriptorBufferInfo, kMaxWrites> buf_infos {};
