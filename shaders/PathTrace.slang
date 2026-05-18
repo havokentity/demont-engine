@@ -262,11 +262,12 @@ BvhNode loadTriBvhNode(uint idx) {
     return n;
 }
 
-// The full PtPush is 736 bytes today (112 B head + 624 B tail; see the
-// static_assert at the dispatch site in Engine.cpp). Native Vulkan / NVIDIA
-// caps push constants at 256B, so on SPIR-V we keep only the small
-// per-dispatch prefix (camera basis + flags + jitter, 112B) in
-// [[vk::push_constant]] and spill the rest into a UBO at binding(14, 0).
+// The full PtPush is 832 bytes today (112 B head + 720 B tail; see the
+// static_assert at the dispatch site in Engine.cpp -- grows whenever a
+// new vec4 / uvec4 field is appended). Native Vulkan / NVIDIA caps push
+// constants at 256B, so on SPIR-V we keep only the small per-dispatch
+// prefix (camera basis + flags + jitter, 112B) in [[vk::push_constant]]
+// and spill the rest into a UBO at binding(14, 0).
 // On Metal, [[vk::push_constant]] lowers to a regular setBytes buffer slot
 // (no hw size cap), so we keep the full struct there for simplicity.
 // VulkanCommandBuffer::Dispatch byte-splits the contiguous host PtPush
@@ -504,8 +505,10 @@ cbuffer Push {
 #ifdef PT_TARGET_SPIRV
 // Spilled tail of PtPush — see the comments in the (Metal) Push cbuffer
 // above for per-field semantics. Layout is byte-equivalent to bytes
-// [112..736] of the host PtPush struct in Engine.cpp. Bound by
-// VulkanCommandBuffer::Dispatch from a per-frame ring-buffer UBO.
+// [112..sizeof(PtPush)) of the host PtPush struct in Engine.cpp (832 B
+// total today => spilled tail is 720 B; issue #117 grew this by 16 B
+// for clouds_p4). Bound by VulkanCommandBuffer::Dispatch from a per-frame
+// ring-buffer UBO.
 [[vk::binding(14, 0)]]
 cbuffer Frame {
     float4x4 curr_view_proj;
