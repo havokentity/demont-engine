@@ -28,6 +28,10 @@ namespace pt::renderer { struct Camera; }
 namespace pt::csg      { class CsgScene; struct BakedMesh; }
 namespace pt::effects  { class ParticleSystem; }
 namespace pt::physics  { class PhysicsSystem; }
+// Voxel destruction Phase 1 (issue #140). VoxelGrid lives in
+// src/destruction/; the engine keeps a small map of voxelized
+// objects + a reserved SDF cluster id range used to render them.
+namespace pt::destruction { class VoxelGrid; }
 
 namespace pt::engine {
 
@@ -158,6 +162,36 @@ private:
     // EnsureSdfPrimsUploaded.
     void RegisterSdfCommands();
     // --- end SDF Phase 1 ---------------------------------------------------
+
+    // --- Voxel destruction Phase 1 (#140) ----------------------------------
+    // Console commands for the voxelization subsystem (`voxelize_object`,
+    // `voxelize_save`, `voxelize_list`, `voxelize_clear`). Mirrors the
+    // sdf_*/prim_*/csg_* style; voxelized objects are stored in
+    // voxel_grids_ keyed by source object id. The render-time injection
+    // into sdf_prims_ happens in SyncVoxelDemoState() once per frame.
+    void RegisterVoxelCommands();
+
+    // Voxelize the source object identified by `source_id`. The
+    // resolution order is CSG mesh root -> SDF cluster id -> analytic
+    // primitive id. The first match wins; subsequent ids are ignored.
+    // Returns true on a successful voxelization (occupied count > 0).
+    // out_summary, if non-null, receives a one-line human summary for
+    // command-output echo. voxel_size in metres (caller supplies the
+    // r_voxel_size cvar value).
+    bool VoxelizeSourceObject(std::uint32_t source_id, float voxel_size,
+                              std::string* out_summary);
+
+    // Mirrors the r_voxelize_demo cvar to the SDF cluster set. When
+    // demo=1 and at least one VoxelGrid is present, each occupied
+    // voxel is injected into sdf_prims_ under a reserved id (range
+    // [kVoxelClusterIdBase, kVoxelClusterIdBase + N)) so the path
+    // tracer renders it as a box via the existing sphere-trace path.
+    // When demo=0, those clusters are removed. Idempotent -- safe to
+    // call every frame; it computes the desired cluster set then
+    // diff-applies. Also flips voxel_demo_active_ for the hide-mesh
+    // gate in RenderFrame.
+    void SyncVoxelDemoState();
+    // --- end Voxel destruction Phase 1 -------------------------------------
     void TearDownDevice();
     void RenderFrame();
 
@@ -366,6 +400,23 @@ private:
     std::uint64_t                               light_buffer_id_         = 0;
     std::uint32_t                               light_buffer_capacity_   = 0;  // lights that fit
     std::uint32_t                               light_count_uploaded_    = 0;  // lights last uploaded
+
+    // --- Voxel destruction Phase 1 (#140) ----------------------------------
+    // VoxelGrids produced by `voxelize_object`, keyed by source object
+    // id (CSG root, SDF cluster id, or analytic-prim id). Renderer
+    // injection happens via SyncVoxelDemoState which spawns one
+    // reserved-id SDF cluster per occupied voxel under each grid.
+    // Reserved cluster id range starts at kVoxelClusterIdBase so it
+    // can't collide with user-issued sdf_* ids.
+    static constexpr std::uint32_t              kVoxelClusterIdBase = 0xF0000000u;
+    std::map<std::uint32_t, std::unique_ptr<pt::destruction::VoxelGrid>> voxel_grids_;
+    // Mirrors r_voxelize_demo for the RenderFrame hide-mesh gate.
+    // Pulled at the start of each frame in SyncVoxelDemoState. When
+    // true AND at least one voxel grid exists, the CSG mesh / TLAS
+    // bindings are suppressed locally so the path tracer renders ONLY
+    // the voxelized form (matches the A/B-toggle requirement in #140).
+    bool                                        voxel_demo_active_       = false;
+    // --- end Voxel destruction Phase 1 -------------------------------------
 
     // Always-allocated 16-byte storage buffer used as a harmless
     // placeholder for any optional binding slot whose primary buffer is

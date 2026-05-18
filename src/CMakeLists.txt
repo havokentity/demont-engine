@@ -30,5 +30,8 @@ add_subdirectory(effects)
 # no RHI deps -- engine writes back particle positions into the
 # AnalyticPrim buffer each frame.
 add_subdirectory(physics)
+# Destruction: voxelisation + connectivity-graph fracture (#140 roadmap).
+# Pure CPU; engine spawns analytic-prim boxes for chunks.
+add_subdirectory(destruction)
 add_subdirectory(app)
 add_subdirectory(engine)
