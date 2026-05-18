@@ -51,10 +51,10 @@
 namespace pt::renderer {
 
 // A parsed glTF base-color texture (deferred plumbing -- see header).
-// width/height in pixels; pixels is tightly packed RGBA8 in linear sRGB
-// space as glTF requires (the spec says baseColorTexture pixels are sRGB
-// encoded, so the consumer must decode to linear before lighting). Empty
-// pixels means "no texture, factor only".
+// width/height in pixels; pixels is tightly packed RGBA8 in sRGB-encoded
+// (nonlinear) space as glTF requires -- the spec says baseColorTexture
+// pixels are sRGB-encoded, so the consumer must decode to linear before
+// lighting. Empty pixels means "no texture, factor only".
 struct GltfBaseColorTexture {
     std::uint32_t            width  = 0;
     std::uint32_t            height = 0;
