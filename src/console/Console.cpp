@@ -602,25 +602,40 @@ namespace {
 // Mirrors the quote/escape handling Execute() does so cfg files can
 // quote a literal `;` inside a string token and have it survive the
 // script-level split.
+//
+// `//` is recognised as a comment marker ONLY at statement start (after
+// optional leading whitespace), matching Execute()'s full-line `//`
+// rule at line ~327. Treating `//` as a comment anywhere outside quotes
+// would mis-parse values like `r_url http://host/path; r_y 1` -- the
+// scanner would swallow the `;` along with everything after `://` into
+// a comment, breaking the user's statement separator. `#` remains
+// inline because Execute() also strips inline `#`, so the two halves
+// agree on what's a comment.
 std::size_t ScanScriptStatementEnd(std::string_view body, std::size_t i) {
-    bool in_quote   = false;
-    bool escape     = false;
-    bool in_comment = false;
+    bool in_quote      = false;
+    bool escape        = false;
+    bool in_comment    = false;
+    bool at_stmt_start = true;  // true until we see any non-whitespace
     std::size_t end = i;
     while (end < body.size()) {
         char c = body[end];
         if (c == '\n') break;
         if (in_comment) { ++end; continue; }
-        if (escape)     { escape = false; ++end; continue; }
-        if (c == '\\')  { escape = true; ++end; continue; }
-        if (c == '"')   { in_quote = !in_quote; ++end; continue; }
+        if (escape)     { escape = false;  ++end; at_stmt_start = false; continue; }
+        if (c == '\\')  { escape = true;   ++end; at_stmt_start = false; continue; }
+        if (c == '"')   { in_quote = !in_quote; ++end; at_stmt_start = false; continue; }
         if (!in_quote) {
+            // '#' is an inline comment marker anywhere (matches Execute()).
             if (c == '#') { in_comment = true; ++end; continue; }
-            if (c == '/' && end + 1 < body.size() && body[end + 1] == '/') {
+            // '//' is ONLY a comment marker at statement start (matches
+            // Execute()'s `if (line.size() >= 2 && line[0] == '/' && line[1] == '/')`).
+            // Mid-statement `//` is data -- preserves URL-shaped values.
+            if (at_stmt_start && c == '/' && end + 1 < body.size() && body[end + 1] == '/') {
                 in_comment = true; end += 2; continue;
             }
             if (c == ';') break;
         }
+        if (c != ' ' && c != '\t') at_stmt_start = false;
         ++end;
     }
     return end;

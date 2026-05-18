@@ -274,7 +274,7 @@ TEST_CASE("cvar allowed_values: auto/prompt/warn gate accepts valid, rejects oth
     CHECK(v->value == "warn");
 }
 
-// --- Test 5: ExecuteScript treats ';' inside '#' / '//' comments as data --
+// --- Test 6: ExecuteScript treats ';' inside '#' / '//' comments as data --
 // Regression for the smoke-exec fatal-init bug discovered 2026-05-18.
 // ExecuteScript splits its body into statements at '\n' and ';', then
 // hands each statement to Execute() which strips '#' / '//' comments.
@@ -354,4 +354,44 @@ TEST_CASE("cvar parser: ';' inside '#' comments is NOT a statement separator") {
     auto* q = C.FindCVar("test_rt_parser_quoted");
     REQUIRE(q != nullptr);
     CHECK(q->value == "a;b;c");
+
+    // GPT-5.5 / Copilot cross-confirmed regression: a `//` appearing
+    // MID-STATEMENT (unquoted) must be data, not a comment marker.
+    // The script-level scanner used to swallow `//host/path; ...` as a
+    // comment, breaking URL-shaped values and silently absorbing the
+    // user's statement separator. Execute() only treats `//` as a
+    // comment at statement start (after optional whitespace); the
+    // scanner now mirrors that exactly.
+    //
+    // Use UNQUOTED URLs here -- the quoted form goes through the
+    // `in_quote=true` branch and never reaches the `//` check, so it
+    // wouldn't actually exercise the fix.
+    C.RegisterCVar("test_rt_parser_url",  "default",  "url-shaped value test",
+                   pt::console::CVAR_ARCHIVE);
+    C.RegisterCVar("test_rt_parser_post", "0",        "post-url cvar test",
+                   pt::console::CVAR_ARCHIVE);
+    auto r6 = C.ExecuteScript(
+        "test_rt_parser_url http://example.com/path; test_rt_parser_post 1");
+    CHECK(r6.ok);
+    auto* url  = C.FindCVar("test_rt_parser_url");
+    auto* post = C.FindCVar("test_rt_parser_post");
+    REQUIRE(url  != nullptr);
+    REQUIRE(post != nullptr);
+    // URL value preserved through the `://`: scanner did NOT treat
+    // the inline `//` as a comment marker.
+    CHECK(url->value  == "http://example.com/path");
+    // Statement separator still split: post-cvar got set.
+    CHECK(post->GetInt() == 1);
+
+    // Full-line `//` comment with leading whitespace -- the `//` is
+    // still recognised as comment-start because at_stmt_start is true
+    // until non-whitespace is seen.
+    C.Execute("test_rt_parser_post 0");
+    REQUIRE(post->GetInt() == 0);
+    auto r7 = C.ExecuteScript(
+        "    // leading-whitespace comment with ; semicolon in it\n"
+        "test_rt_parser_post 1\n");
+    CHECK(r7.ok);
+    CHECK(r7.error.find("unknown") == std::string::npos);
+    CHECK(post->GetInt() == 1);
 }
