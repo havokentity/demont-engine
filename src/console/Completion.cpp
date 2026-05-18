@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
+#include <system_error>
 
 namespace pt::console {
 
@@ -194,6 +196,81 @@ std::vector<CompletionMatch> BuildCompletions(const TokenInfo& token,
             m.description = v.description;
             pool.push_back(std::move(m));
         });
+    } else if (token.first_tok == "exec") {
+        // Filesystem completion for `exec <path>`. Lists the
+        // directory referenced by the typed prefix and offers:
+        //   - subdirectories (suffixed with '/'), and
+        //   - .cfg files (the only file type `exec` consumes).
+        // Path is resolved relative to the CWD demont was launched
+        // from (matches Engine.cpp's exec_smoke fopen path). Empty
+        // typed text lists the current directory.
+        //
+        // The pushed `name` is the FULL path-so-far (so TAB-commit
+        // replaces the typed text wholesale and the user can keep
+        // typing into the new prefix to drill down). The scorer at
+        // the bottom of this function will rank by ScoreMatch against
+        // the typed prefix -- PREFIX/SUBSTRING/FUZZY all work
+        // naturally because the candidate name string contains the
+        // typed prefix verbatim when it's a real path match.
+        namespace fs = std::filesystem;
+        const std::string& typed = token.text;
+        std::string dir_str;
+        std::string partial;
+        if (typed.empty()) {
+            dir_str = ".";
+            partial = "";
+        } else if (typed.back() == '/' || typed.back() == '\\') {
+            dir_str = typed.substr(0, typed.size() - 1);
+            if (dir_str.empty()) dir_str = "/";
+            partial = "";
+        } else {
+            const auto slash = typed.find_last_of("/\\");
+            if (slash == std::string::npos) {
+                dir_str = ".";
+                partial = typed;
+            } else {
+                dir_str = typed.substr(0, slash);
+                if (dir_str.empty()) dir_str = "/";
+                partial = typed.substr(slash + 1);
+            }
+        }
+        std::error_code ec;
+        fs::path dir_path(dir_str);
+        if (fs::is_directory(dir_path, ec)) {
+            for (const auto& entry : fs::directory_iterator(dir_path, ec)) {
+                const std::string fname = entry.path().filename().string();
+                if (fname.empty() || fname[0] == '.') continue;  // skip dotfiles
+                // Prefix filter (case-insensitive) against `partial`.
+                if (!partial.empty()) {
+                    if (fname.size() < partial.size()) continue;
+                    bool prefix_ok = true;
+                    for (std::size_t i = 0; i < partial.size(); ++i) {
+                        if (to_lower_ascii(fname[i]) != to_lower_ascii(partial[i])) {
+                            prefix_ok = false;
+                            break;
+                        }
+                    }
+                    if (!prefix_ok) continue;
+                }
+                const bool is_dir = entry.is_directory(ec);
+                if (!is_dir && entry.path().extension() != ".cfg") continue;
+                // Reconstruct the full typed-path-replacement string.
+                std::string commit;
+                if (dir_str == ".") {
+                    commit = fname;
+                } else {
+                    commit = dir_str;
+                    if (commit.back() != '/' && commit.back() != '\\') commit += '/';
+                    commit += fname;
+                }
+                if (is_dir) commit += '/';
+                CompletionMatch m;
+                m.name        = std::move(commit);
+                m.kind        = CompletionKind::Value;
+                m.value       = is_dir ? "(dir)" : "(cfg)";
+                pool.push_back(std::move(m));
+            }
+        }
     } else {
         // Value position. Three sources, in priority order:
         //   1. CVar with allowed_values  -- list those, tag the
