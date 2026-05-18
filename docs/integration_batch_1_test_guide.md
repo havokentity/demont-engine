@@ -558,9 +558,14 @@ are cached on first override and restored when the cvar transitions back
 to 0, so toggling on/off is non-destructive.
 
 **Speed -> colour mapping (linear-RGB):**
-- 0 m/s   -> blue   `(0.10, 0.30, 1.00)`
-- 5 m/s   -> green  `(0.20, 1.00, 0.30)`
-- 10+ m/s -> red    `(1.00, 0.20, 0.20)` (saturating above)
+- 0 m/s  -> blue   `(0.10, 0.30, 1.00)`
+- 1 m/s  -> green  `(0.20, 1.00, 0.30)`
+- 2+ m/s -> red    `(1.00, 0.20, 0.20)` (saturating above)
+
+The 2 m/s saturation matches the implicit-velocity Verlet terminal
+speed under default settings (`|g| * sdt / (1 - damping) ~= 2.04 m/s`
+at `phys_gravity_y=-9.81`, `phys_substeps=8`, `phys_damping=0.99`,
+60 fps). Bodies stay saturated red above that.
 
 **Cvars added:**
 - `r_phys_debug_visualize` (default `0`, `CVAR_NONE` -- per-invocation, never archived)
@@ -574,12 +579,13 @@ the fixture.
 **How to test:**
 1. `exec tests/goldens/scenes/phys_rb_smoke.cfg`
 2. `r_phys_debug_visualize 1` -- spheres recolour: blue when stationary,
-   green at moderate fall, red at peak descent (~10 m/s under default
-   gravity + damping).
+   green at ~1 m/s, red at the ~2 m/s terminal speed of the default
+   damped Verlet integrator.
 3. Watch them settle: as bodies hit the ground and lose energy they
    transition red -> green -> blue.
 4. `r_phys_debug_visualize 0` -- albedos restore to whatever they were
-   before the viz was enabled.
+   before the viz was enabled (works even when physics is idle).
+5. `toggle r_phys_debug_visualize` cycles 0 <-> 1 from the console.
 
 **Scope / known issues:** Pure debug aid; no perf budget claim. Mid-flight
 edits via `prim_albedo` while the viz is active are overwritten next frame
