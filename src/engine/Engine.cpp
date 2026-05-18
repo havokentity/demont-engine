@@ -1725,7 +1725,12 @@ void Engine::TearDownDevice() {
         if (light_buffer_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{light_buffer_id_});
         // --- end Light primitives ----------------------------------------------
         // --- Light tree (#129) -------------------------------------------------
-        if (light_tree_buffer_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{light_tree_buffer_id_});
+        // Double-buffered: destroy both GPU slots. The async builder
+        // (CPU-side worker + double-buffered host trees) is torn down
+        // in the *engine* dtor where it can't possibly race a frame.
+        for (auto& id : light_tree_buffer_ids_) {
+            if (id != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{id});
+        }
         // --- end Light tree ----------------------------------------------------
         // --- Fluid Phase 1 (#136) ---------------------------------------------
         if (smoke_buffer_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{smoke_buffer_id_});
@@ -1799,9 +1804,13 @@ void Engine::TearDownDevice() {
     light_prims_dirty_     = true;        // re-upload on next device
     // --- end Light primitives ----------------------------------------------
     // --- Light tree (#129) -------------------------------------------------
-    light_tree_buffer_id_           = 0;
+    light_tree_buffer_ids_          = {0, 0};
     light_tree_buffer_capacity_     = 0;
     light_tree_node_count_uploaded_ = 0;
+    light_tree_active_slot_         = 0;
+    light_tree_first_built_         = false;
+    // builder itself is kept across device tears; it's a pure-CPU
+    // worker, never touched the device.
     // --- end Light tree ----------------------------------------------------
     // --- Fluid Phase 1 (#136) ---------------------------------------------
     smoke_buffer_id_       = 0;
@@ -3612,13 +3621,54 @@ void Engine::EnsureLightsUploaded() {
 // --- end Light primitives --------------------------------------------------
 
 // --- Light tree (#129) -----------------------------------------------------
-// Build the hierarchical light tree (Conty Estevez & Kulla 2018) from
-// the analytic light list, pack it into a flat GPU SSBO at engine slot
-// 13 / vk::binding(28), and stamp light_tree_node_count_uploaded_ so
-// the dispatch path knows whether to enable tree traversal. Called by
-// RenderFrame on the same light_prims_dirty_ edge that triggers the
-// light-list re-upload above (one rebuild per light-set mutation;
-// static-light MVP scope).
+// ASYNC REBUILD + DOUBLE-BUFFERED UPLOAD.
+//
+// Old (synchronous) flow:
+//   RenderFrame
+//     -> EnsureLightTreeUploaded
+//        -> BuildLightTree (~3ms for typical scenes; CPU-bound, single-thread)
+//        -> WriteBuffer to slot 13
+//   -> EnsureLightsUploaded
+//   -> the rest of the frame
+//
+// New (async) flow:
+//   RenderFrame
+//     -> EnsureLightTreeUploaded
+//        -> if light_prims_dirty_, snapshot + submit to async builder (~0ms)
+//        -> TryAcquireResult; if a tree is ready, upload it to the
+//           INACTIVE GPU slot then flip light_tree_active_slot_
+//   -> EnsureLightsUploaded
+//   -> the rest of the frame runs IN PARALLEL with the worker's rebuild
+//
+// The worker's CPU work overlaps the engine's render-record + GPU dispatch
+// of frame N; the result is consumed at the top of frame N+1 (or later
+// frames -- it's fine if the worker takes longer than one frame; we'll
+// still keep using the prior tree until the new one lands).
+//
+// DIRTY-BIT GATING. We only kick the worker when light_prims_dirty_ is
+// set (any light mutation -- creation, edit, deletion). Most frames have
+// dirty=false and skip the dispatch entirely. The non-dirty fast path
+// also skips the TryAcquireResult call -- there's nothing in flight, so
+// nothing to acquire.
+//
+// FIRST-FRAME FALLBACK. On the very first dirty edge we run a synchronous
+// build so the path tracer's NEE block has a real tree to traverse on
+// frame 0 (otherwise the binding stays on the placeholder for ~1 frame
+// while the worker spins up, which means worse-than-baseline variance
+// for that frame). Cost: one ~3ms synchronous build on a scene change.
+// All subsequent rebuilds are async.
+//
+// DOUBLE-BUFFERED GPU SLOTS. The path tracer reads slot N during a
+// frame submit; if we want to overwrite while the GPU is still reading
+// we'd need to WaitIdle() (the slow path the old code used on resize).
+// Instead, we keep TWO GPU node buffers of equal capacity and write to
+// the inactive one -- WriteBuffer maps + memcpys into a staging buffer
+// the backend uploads on the next Submit, completely independent of
+// whatever the active slot is doing. After the upload we flip the
+// active-slot index; the bind site reads `light_tree_buffer_ids_[
+// light_tree_active_slot_]` on the next BindBuffer(13, ...). The
+// previously-active slot becomes the WRITE target for the next
+// rebuild -- by the time we touch it the GPU has long since moved on.
 //
 // Empty light set -> node_count = 0; binding falls back to the
 // placeholder buffer at the dispatch site for Metal-push-slot stability.
@@ -3627,88 +3677,167 @@ void Engine::EnsureLightsUploaded() {
 // shadow_vis_buf / light_prims.
 void Engine::EnsureLightTreeUploaded() {
     if (!device_) return;
-    if (!light_prims_dirty_) return;   // hook keyed off the same edge
 
-    // Snapshot the light list in upload order. Engine::EnsureLightsUploaded
-    // (above) packs lights into the GPU buffer in std::map iteration
-    // order (id-sorted); the tree's leaf left_first values index into
-    // that same packed array, so we MUST mirror that ordering exactly.
-    std::vector<pt::renderer::LightInput> inputs;
-    inputs.reserve(light_prims_.size());
-    for (const auto& [id, L] : light_prims_) {
-        pt::renderer::LightInput li;
-        li.type = static_cast<std::uint32_t>(L.type);
-        for (int i = 0; i < 3; ++i) {
-            li.pos[i]       = L.pos[i];
-            li.intensity[i] = L.intensity[i];
-            li.dir[i]       = L.dir[i];
-            li.u_vec[i]     = L.u_vec[i];
-        }
-        li.radius    = L.radius;
-        li.cos_outer = L.cos_outer;
-        li.v_half    = L.v_half;
-        inputs.push_back(li);
-    }
-
-    pt::renderer::LightTree tree;
-    pt::renderer::BuildLightTree(inputs, tree);
-
-    const std::uint32_t node_count =
-        static_cast<std::uint32_t>(tree.nodes.size());
-
-    // Grow the GPU node buffer (powers of two from a 32-node floor;
-    // 16-light scene yields 31 nodes -- 32 is the smallest p2 that
-    // fits without an immediate resize). Capacity is in NODES; each
-    // node is 64 bytes (sizeof(LightTreeNode) -- 4 float4s).
     constexpr std::uint32_t kBytesPerNode = sizeof(pt::renderer::LightTreeNode);
-    if (node_count > light_tree_buffer_capacity_) {
+
+    auto grow_slots_to = [&](std::uint32_t needed_nodes) -> bool {
+        if (needed_nodes <= light_tree_buffer_capacity_ &&
+            light_tree_buffer_ids_[0] != 0 &&
+            light_tree_buffer_ids_[1] != 0) {
+            return true;
+        }
         std::uint32_t new_cap = light_tree_buffer_capacity_
                                   ? light_tree_buffer_capacity_
                                   : 32u;
-        while (new_cap < node_count) new_cap *= 2u;
-        if (light_tree_buffer_id_ != 0) {
-            device_->WaitIdle();
-            device_->DestroyBuffer(
-                pt::rhi::BufferHandle{light_tree_buffer_id_});
-            light_tree_buffer_id_ = 0;
+        while (new_cap < needed_nodes) new_cap *= 2u;
+        // Both slots resize together; the inactive slot might have an
+        // in-flight read but on a resize we *have* to drain the GPU
+        // because the descriptor binding's size is changing. (The
+        // common steady-state path skips this branch entirely.)
+        device_->WaitIdle();
+        for (auto& id : light_tree_buffer_ids_) {
+            if (id != 0) {
+                device_->DestroyBuffer(pt::rhi::BufferHandle{id});
+                id = 0;
+            }
         }
-        auto buf = device_->CreateBuffer({
-            .size       = std::size_t(new_cap) * kBytesPerNode,
-            .usage      = pt::rhi::BufferUsage::Storage,
-            .debug_name = "light_tree_nodes",
-        });
-        if (buf.id == 0) {
-            LOG_ERROR("light tree buffer allocation failed (capacity {})",
-                       new_cap);
+        for (int slot = 0; slot < 2; ++slot) {
+            auto buf = device_->CreateBuffer({
+                .size       = std::size_t(new_cap) * kBytesPerNode,
+                .usage      = pt::rhi::BufferUsage::Storage,
+                .debug_name = (slot == 0) ? "light_tree_nodes_0"
+                                          : "light_tree_nodes_1",
+            });
+            if (buf.id == 0) {
+                LOG_ERROR("light tree buffer allocation failed "
+                          "(capacity {}, slot {})", new_cap, slot);
+                return false;
+            }
+            light_tree_buffer_ids_[slot] = buf.id;
+        }
+        light_tree_buffer_capacity_ = new_cap;
+        // Resize invalidates whatever was uploaded; reset the count so
+        // the consumer falls back to the placeholder until the next
+        // tree lands.
+        light_tree_node_count_uploaded_ = 0;
+        light_tree_first_built_         = false;
+        light_tree_active_slot_         = 0;
+        return true;
+    };
+
+    auto upload_tree_to_slot = [&](const pt::renderer::LightTree& tree,
+                                   int slot) -> bool {
+        const std::uint32_t node_count =
+            static_cast<std::uint32_t>(tree.nodes.size());
+        if (!grow_slots_to(std::max(node_count, 1u))) return false;
+        if (node_count == 0) {
+            // Empty-tree publish: just clear the consumer-visible count.
+            // No upload needed -- the bind site already falls back to
+            // the placeholder when count == 0.
+            light_tree_node_count_uploaded_ = 0;
+            light_tree_first_built_         = true;
+            return true;
+        }
+        // Allocate to FULL capacity (trailing unused nodes zero-init)
+        // so the shader's bounds check against node_count is the only
+        // thing that matters. Same allocation shape as the
+        // pre-double-buffer code.
+        std::vector<pt::renderer::LightTreeNode> packed(
+            light_tree_buffer_capacity_);
+        for (std::uint32_t i = 0; i < node_count; ++i) {
+            packed[i] = tree.nodes[i];
+        }
+        device_->WriteBuffer(
+            pt::rhi::BufferHandle{light_tree_buffer_ids_[slot]},
+            packed.data(),
+            std::size_t(light_tree_buffer_capacity_) * kBytesPerNode);
+        light_tree_node_count_uploaded_ = node_count;
+        light_tree_first_built_         = true;
+        return true;
+    };
+
+    auto snapshot_inputs = [&]() {
+        // Snapshot the light list in upload order. Engine::EnsureLightsUploaded
+        // (below) packs lights into the GPU buffer in std::map iteration
+        // order (id-sorted); the tree's leaf left_first values index into
+        // that same packed array, so we MUST mirror that ordering exactly.
+        std::vector<pt::renderer::LightInput> inputs;
+        inputs.reserve(light_prims_.size());
+        for (const auto& [id, L] : light_prims_) {
+            pt::renderer::LightInput li;
+            li.type = static_cast<std::uint32_t>(L.type);
+            for (int i = 0; i < 3; ++i) {
+                li.pos[i]       = L.pos[i];
+                li.intensity[i] = L.intensity[i];
+                li.dir[i]       = L.dir[i];
+                li.u_vec[i]     = L.u_vec[i];
+            }
+            li.radius    = L.radius;
+            li.cos_outer = L.cos_outer;
+            li.v_half    = L.v_half;
+            inputs.push_back(li);
+        }
+        return inputs;
+    };
+
+    // Lazy-construct the async builder on first call. Engine ctor would
+    // have done it but the renderer header drags in <thread> /
+    // <condition_variable> -- not the kind of thing we want to pull into
+    // Engine.h, so the unique_ptr is built here.
+    if (!light_tree_builder_) {
+        light_tree_builder_ =
+            std::make_unique<pt::renderer::AsyncLightTreeBuilder>();
+    }
+
+    // First-frame fallback: if the light set is dirty AND no tree has
+    // ever been published, run a synchronous build so we don't render
+    // the first frame with the placeholder bound. The user mutated the
+    // scene, expects the very next frame to reflect it -- we trade ~3ms
+    // on that ONE frame for correct first-frame variance. Steady-state
+    // (subsequent dirty edges) takes the async path below.
+    if (light_prims_dirty_ && !light_tree_first_built_) {
+        auto inputs = snapshot_inputs();
+        pt::renderer::LightTree sync_tree;
+        pt::renderer::BuildLightTree(inputs, sync_tree);
+        if (!upload_tree_to_slot(sync_tree, light_tree_active_slot_)) {
             return;
         }
-        light_tree_buffer_id_       = buf.id;
-        light_tree_buffer_capacity_ = new_cap;
+        // Also seed the builder so its internal slot is consistent with
+        // what we just uploaded. The next dirty edge will hand it the
+        // updated inputs and the worker will overwrite the inactive
+        // slot's host-side tree -- that's fine.
+        light_tree_builder_->SubmitInputs(std::move(inputs));
+        LOG_INFO("[light_tree] first-frame sync build -- {} lights, {} nodes",
+                 sync_tree.light_count,
+                 static_cast<std::uint32_t>(sync_tree.nodes.size()));
+        // Don't return: still drop through to the TryAcquireResult /
+        // dispatch path so a same-frame submit doesn't get latched
+        // again on the next call.
+    } else if (light_prims_dirty_) {
+        // Steady-state dirty edge: hand a fresh snapshot to the worker.
+        // The previous build's result (if any) stays in the active GPU
+        // slot until the new one lands.
+        light_tree_builder_->SubmitInputs(snapshot_inputs());
     }
 
-    if (node_count == 0) {
-        light_tree_node_count_uploaded_ = 0;
-        // light_prims_dirty_ is cleared by EnsureLightsUploaded; nothing
-        // else to do for an empty tree.
-        return;
+    // Drain ONE completed result from the worker (if any). Worker may
+    // produce zero or one new tree per frame -- if it queued multiple
+    // dispatches the worker collapsed them into the latest snapshot,
+    // so we only ever publish the freshest.
+    if (light_tree_builder_) {
+        if (const pt::renderer::LightTree* tree =
+                light_tree_builder_->TryAcquireResult()) {
+            const int write_slot = 1 - light_tree_active_slot_;
+            if (upload_tree_to_slot(*tree, write_slot)) {
+                light_tree_active_slot_ = write_slot;
+                LOG_INFO("[light_tree] async-built tree published -- "
+                         "{} lights, {} nodes (slot {})",
+                         tree->light_count,
+                         static_cast<std::uint32_t>(tree->nodes.size()),
+                         write_slot);
+            }
+        }
     }
-
-    // Upload the packed-node array. Allocate to FULL capacity (trailing
-    // unused nodes zero-init) so the shader's bounds check against
-    // node_count is the only thing that matters.
-    std::vector<pt::renderer::LightTreeNode> packed(
-        light_tree_buffer_capacity_);
-    for (std::uint32_t i = 0; i < node_count; ++i) {
-        packed[i] = tree.nodes[i];
-    }
-    device_->WriteBuffer(
-        pt::rhi::BufferHandle{light_tree_buffer_id_},
-        packed.data(),
-        std::size_t(light_tree_buffer_capacity_) * kBytesPerNode);
-
-    light_tree_node_count_uploaded_ = node_count;
-    LOG_INFO("[light_tree] built tree -- {} lights, {} nodes",
-             tree.light_count, node_count);
 }
 // --- end Light tree --------------------------------------------------------
 
@@ -4681,8 +4810,20 @@ void Engine::RenderFrame() {
     // has to resolve to a real buffer for Metal's push-slot computation
     // (same lesson slot11/slot12 fallbacks capture). Falls back to the
     // always-present placeholder storage buffer when no tree is built.
-    pt::rhi::BufferHandle slot13 = (light_tree_buffer_id_ != 0)
-        ? pt::rhi::BufferHandle{light_tree_buffer_id_}
+    //
+    // DOUBLE-BUFFERED: the engine alternates between two GPU node
+    // buffers (light_tree_buffer_ids_[0/1]) so the worker thread can
+    // upload to the inactive slot while the path tracer reads the
+    // active one. `light_tree_active_slot_` is flipped by
+    // EnsureLightTreeUploaded once the worker publishes a new tree.
+    // Until the very first tree has been built we still fall back to
+    // the placeholder, same as before.
+    const std::uint64_t active_lt_buf =
+        light_tree_first_built_
+            ? light_tree_buffer_ids_[light_tree_active_slot_]
+            : 0u;
+    pt::rhi::BufferHandle slot13 = (active_lt_buf != 0)
+        ? pt::rhi::BufferHandle{active_lt_buf}
         : pt::rhi::BufferHandle{placeholder_storage_id_};
     if (slot13.id != 0) cb->BindBuffer(13, slot13, 0);
     // --- end Light tree ----------------------------------------------------
