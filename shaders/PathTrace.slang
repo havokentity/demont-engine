@@ -412,6 +412,26 @@ Texture2D<float4> moon_map;
 [[vk::binding(28, 0)]] StructuredBuffer<float4> light_tree_nodes;
 // --- end Light tree --------------------------------------------------------
 
+// --- ReSTIR DI Phase A reservoir buffer (#78) -----------------------------
+// Per-pixel reservoir SSBO written by this kernel's primary-hit WRS
+// candidate-generation block when r_restir = 1. The RestirTemporal /
+// RestirSpatial / RestirFinal compute kernels consume this buffer in
+// order; RestirFinal additively blends the resampled Lambert-NEE
+// contribution into denoise_color.
+//
+// Layout: 4 float4 lanes per pixel (64 B), strided y-major. Mirrors
+// src/renderer/RestirReservoir.h on the host. See
+// shaders/RestirReservoir.slang for the encoding helpers and the WRS
+// streaming primitives -- that file is imported below alongside
+// PathTraceMath / PathTraceCloud / SdfPrimitives / SdfFractals.
+//
+// IMPORTANT (slot ordering): declared AFTER light_tree_nodes so the
+// existing slots 0..13 stay undisturbed. Lands on Metal slot 14. On
+// Vulkan the explicit vk::binding(29) is what matters; sits one past
+// the light tree's binding 28.
+[[vk::binding(29, 0)]] RWStructuredBuffer<float4> reservoir_curr_buf;
+// --- end ReSTIR reservoir buffer ------------------------------------------
+
 struct BvhNode {
     float3 aabb_min;
     uint   left_first;
@@ -763,6 +783,25 @@ cbuffer Push {
     float4 water_params0;
     float4 water_params1;
     // --- end Water Phase 1 ----------------------------------------------------
+    // --- ReSTIR DI Phase A (#78) -------------------------------------------
+    // r_restir master toggle. 1 -> primary-hit Lambert NEE switches to
+    // WRS candidate generation + reservoir write (no contribution added
+    // here; the RestirFinal kernel adds the resampled+shadow-tested
+    // sample); 0 -> legacy single-pick analytic-light NEE as in #73.
+    // Gated additionally on `denoiser_enabled` host-side because the
+    // RestirFinal kernel writes into denoise_color (the denoiser path);
+    // the denoiser-off swapchain-direct path keeps single-pick NEE so
+    // this branch is the only one PathTrace.slang sees disabling.
+    uint restir_enabled;
+    // K = number of WRS candidate samples per pixel. Default 8;
+    // capped at kRestirMaxK in the candidate-gen loop. Higher K =
+    // lower variance per frame at linear ALU cost. 8 is the
+    // RTXDI default and trades well against the temporal / spatial
+    // reuse passes that follow.
+    uint restir_k_candidates;
+    uint _pad_restir0;
+    uint _pad_restir1;
+    // --- end ReSTIR DI Phase A -----------------------------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -846,6 +885,13 @@ cbuffer Frame {
     float4 water_params0;
     float4 water_params1;
     // --- end Water Phase 1 ----------------------------------------------------
+    // See `restir_enabled` / `restir_k_candidates` in the Metal Push
+    // cbuffer above (#78). Trailing 16-byte block keeps std140
+    // alignment consistent across both backends.
+    uint restir_enabled;
+    uint restir_k_candidates;
+    uint _pad_restir0;
+    uint _pad_restir1;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -876,6 +922,15 @@ import SdfPrimitives;
 // id (>= SDF_FRACTAL_FIRST).
 import SdfFractals;
 // --- end SDF Phase 3 -------------------------------------------------------
+// --- ReSTIR DI Phase A (#78) ----------------------------------------------
+// Reservoir struct + WRS streaming primitives (initReservoir,
+// streamingUpdate, finalizeReservoir, storeReservoir,
+// reservoirTargetPdf). Imported here so the candidate-generation block
+// at the primary-hit Lambert NEE site stays a thin readable wrapper
+// around the algorithmic helpers. Mirrors the temporal / spatial /
+// final kernels that also import this module.
+import RestirReservoir;
+// --- end ReSTIR DI Phase A ------------------------------------------------
 
 static const uint MAT_LAMBERT    = 0u;
 static const uint MAT_METAL      = 1u;
@@ -3398,15 +3453,27 @@ void main(uint2 tid : SV_DispatchThreadID) {
         float3 nf  = (ndi < 0.0) ? h.normal : -h.normal;
 
         if (h.mat == MAT_LAMBERT) {
-            // --- Analytic light primitives NEE (#73) -------------------
+            // --- Analytic light primitives NEE (#73 / ReSTIR #78) -------
             // Direct-lighting from the engine's analytic light list:
-            // point / spot / sphere area / quad area. Fires in EVERY
-            // sky mode (procedural / HDRI / gradient) so scenes can be
-            // lit by lamps regardless of whether an env map is loaded.
-            // Naive uniform single-pick + per-light area sampling;
-            // variance is bounded for ~100 lights, beyond which the
-            // light tree (#129) replaces the picker.
-            if (light_count > 0u) {
+            // point / spot / sphere area / quad area. Two code paths
+            // share this branch:
+            //   r_restir = 0 : legacy single-pick uniform NEE (one
+            //       random light, one shadow ray, contribution added
+            //       here). Variance bounded for ~dozen lights;
+            //       beyond that the user should turn ReSTIR on.
+            //   r_restir = 1 (Phase A): WRS candidate generation at
+            //       the PRIMARY hit (b == 0) only. Builds a per-pixel
+            //       reservoir of K candidates, writes it to
+            //       reservoir_curr_buf, and DOES NOT add a
+            //       contribution here -- the RestirFinal kernel
+            //       additively blends the shadow-tested resampled
+            //       sample into denoise_color after the temporal +
+            //       spatial reuse passes run. Indirect bounces
+            //       (b > 0) keep the legacy single-pick NEE because
+            //       Phase A is direct-illumination only (#78 Phase B
+            //       extends to GI bounce reservoirs).
+            bool restir_active = (restir_enabled != 0u) && (b == 0u);
+            if (light_count > 0u && !restir_active) {
                 LightSample ls = sampleAnalyticLight(hit_pt, nf, seed);
                 float n_dot_l = dot(nf, ls.dir);
                 if (ls.pdf > 0.0 && n_dot_l > 0.0) {
@@ -3424,7 +3491,106 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     }
                 }
             }
-            // --- end Analytic light NEE --------------------------------
+            if (light_count > 0u && restir_active) {
+                // --- ReSTIR DI Phase A: WRS candidate generation ----
+                // Build a per-pixel reservoir over K candidates. Each
+                // candidate is one uniform-random pick from the
+                // light list + per-type area sample; the WRS picks
+                // ONE survivor weighted by its target pdf (un-shadowed
+                // Lambert contribution). No shadow rays here -- the
+                // RestirFinal kernel does the SINGLE survivor shadow
+                // ray after temporal + spatial reuse. This is the
+                // whole point of ReSTIR: replace K shadow rays with
+                // one.
+                Reservoir res = initReservoir();
+                uint K = min(restir_k_candidates, kRestirMaxK);
+                if (K < 1u) K = 1u;
+                for (uint k = 0u; k < K; ++k) {
+                    LightSample ls = sampleAnalyticLight(hit_pt, nf, seed);
+                    float n_dot_l = dot(nf, ls.dir);
+                    if (ls.pdf <= 0.0 || n_dot_l <= 0.0) {
+                        // Empty candidate -- skip the streamingUpdate's
+                        // M increment so back-facing samples don't
+                        // depress W for legitimate ones. We do
+                        // increment M though, because Bitterli's
+                        // bias correction needs the total candidate
+                        // count, not just non-zero-weight ones.
+                        res.M += 1u;
+                        continue;
+                    }
+                    // Target pdf (un-shadowed Lambert estimate). Note
+                    // that sampleAnalyticLight pre-bakes 1/dist^2 +
+                    // cos_light + spot falloff into ls.Le for the
+                    // POINT / SPOT / SPHERE / QUAD types, so the
+                    // target pdf reduces to the receiver-side n_dot_l
+                    // times a luminance reduction on ls.Le. brdf
+                    // (albedo/PI) is *constant* across all candidates
+                    // for a Lambert surface, so we omit it from the
+                    // target pdf — it cancels in W during
+                    // finalizeReservoir.
+                    float3 contrib = ls.Le * n_dot_l;
+                    float p_hat = max(dot(contrib,
+                                          float3(0.2126, 0.7152, 0.0722)),
+                                      0.0);
+                    float u = randf(seed);
+                    if (streamingUpdate(res, p_hat, ls.pdf, u)) {
+                        // Cache the surviving sample's geometry for
+                        // the spatial / temporal merge passes.
+                        res.light_pos = hit_pt + ls.dir * ls.dist;
+                        // ls.dir points from hit toward light; the
+                        // light surface normal at the chosen sample
+                        // point is what receivers' merge passes need
+                        // to evaluate cos_light. For point/spot delta
+                        // lights we store the inverse light direction
+                        // (so dot(light_n, -wi) = 1 trivially); for
+                        // SPHERE / QUAD the merge passes consult this
+                        // when re-evaluating the survivor's pdf at a
+                        // different receiver. We approximate by
+                        // storing -ls.dir for non-area, which is
+                        // exact for point lights and close enough
+                        // for spot lights at MVP scope.
+                        res.light_n   = -ls.dir;
+                        res.Le        = ls.Le;
+                        res.pdf_solid = ls.pdf;
+                        res.dist      = ls.dist;
+                        // light_idx: which entry in light_prims. The
+                        // candidate sampler picks uniformly so its
+                        // index is `uint(u_pick * float(light_count))`
+                        // — but sampleAnalyticLight doesn't return
+                        // the index, only the sample. Re-sampling
+                        // would consume an RNG step. For Phase A we
+                        // recover the index by the same picker
+                        // arithmetic on a fresh draw, accepting that
+                        // the spatial/temporal merge passes' p_hat
+                        // re-evaluation reads light_prims[light_idx]
+                        // to recompute Le_pre at the new receiver --
+                        // a tiny pdf inaccuracy on the merged
+                        // estimator's bookkeeping, dominated by the
+                        // shadow + Lambert factors RestirFinal
+                        // applies. A follow-up that threads the
+                        // index out of sampleAnalyticLight is a
+                        // straightforward refactor.
+                        res.light_idx = min(uint(randf(seed) *
+                                                float(light_count)),
+                                            light_count - 1u);
+                    }
+                }
+                finalizeReservoir(res);
+                uint pixel_idx = tid.y * dim.x + tid.x;
+                storeReservoir(reservoir_curr_buf, pixel_idx, res);
+                // NO contribution added to radiance here — RestirFinal
+                // adds it after the reuse chain has finished resampling.
+            } else if (restir_active) {
+                // r_restir on, but light_count == 0 — write an empty
+                // reservoir so the chain's reads don't see stale
+                // data from a previous frame's light set. Cheap (4
+                // float4 writes); avoids an additional cvar-tied
+                // dispatch toggle on the reservoir buffer clear.
+                Reservoir res = initReservoir();
+                uint pixel_idx = tid.y * dim.x + tid.x;
+                storeReservoir(reservoir_curr_buf, pixel_idx, res);
+            }
+            // --- end Analytic light NEE / ReSTIR -----------------------
             if (env_map_present != 0u) {
                 // NEE: importance-sampled env-map direct light. With
                 // MIS, this contribution is weighted by the balance

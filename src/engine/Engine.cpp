@@ -24,6 +24,7 @@
 #include "../renderer/Astronomy.h"
 #include "../renderer/BscCatalog.h"
 #include "../renderer/MoonTexture.h"
+#include "../renderer/RestirReservoir.h"
 #include "../renderer/Camera.h"
 #include "../renderer/Csg/CsgScene.h"
 #include "../renderer/GltfImporter.h"
@@ -743,6 +744,72 @@ namespace cvar {
             "(per-frame upload is the cost); a few thousand is fine "
             "for the MVP CPU sim, GPU sim follow-up scales further. "
             "Default 1024.",
+            CVAR_ARCHIVE);
+
+    // -------------------------------------------------------------------
+    // ReSTIR DI Phase A (issue #78). Reservoir-based Spatio-Temporal
+    // Importance Resampling for Direct Illumination -- the modern fix
+    // for "many lights at 1 spp": replaces "pick one light + shadow ray"
+    // with "build a reservoir of K weighted candidates, reuse across
+    // screen + time, shadow-test the single survivor". Without it,
+    // light primitives (#73) cap out at the dozen-light regime before
+    // naive NEE picks the wrong one and noise dominates. With it,
+    // hundreds to thousands of lights run cleanly under MetalFX / SVGF
+    // / NRD denoising.
+    //
+    // Phase A scope: DI only (no GI / indirect bounce reservoirs).
+    // Architecture: PathTrace.slang's primary-hit Lambert NEE switches
+    // to WRS candidate generation when r_restir = 1; three compute
+    // passes follow (RestirTemporal, RestirSpatial, RestirFinal) and
+    // additively blend the resampled contribution into denoise_color
+    // before the radiance denoiser. Gated host-side on
+    // `denoiser_active_` -- the denoiser-off path keeps single-pick
+    // NEE (the accumulator handles many-light variance fine at high
+    // spp; ReSTIR is primarily a 1-spp / denoiser-input quality lever).
+    // -------------------------------------------------------------------
+    PT_CVAR(r_restir, "1",
+            "Master toggle for ReSTIR DI Phase A (issue #78). 1 = "
+            "primary-hit Lambert NEE switches to WRS candidate "
+            "generation + reservoir spatiotemporal reuse + shadow "
+            "test on the single survivor; 0 = legacy uniform "
+            "single-pick NEE from issue #73. Only takes effect when "
+            "the denoiser is active (the Phase A composite writes "
+            "into denoise_color). Default 1: ReSTIR is the new "
+            "many-lights baseline.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_restir_temporal, "1",
+            "ReSTIR temporal reuse pass gate. 1 = reproject the "
+            "previous frame's final reservoir via motion vectors and "
+            "MIS-combine with this frame's WRS reservoir (Bitterli "
+            "Algorithm 4). 0 = skip temporal reuse, current-frame "
+            "reservoir flows straight to the spatial pass. Turning "
+            "this off increases per-frame noise but eliminates the "
+            "rare temporal smear under fast camera motion.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_restir_spatial, "1",
+            "ReSTIR spatial reuse pass gate. 1 = sample N=4 jittered "
+            "neighbours in a 10 px disc and MIS-combine with the "
+            "centre reservoir. 0 = skip the spatial pass; survivor "
+            "depends only on the K initial candidates + temporal "
+            "history. The spatial pass is the dominant variance-"
+            "reduction step for static cameras; turning it off is "
+            "mainly a diagnostic for chasing artifacts.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_restir_k_candidates, "8",
+            "Number of initial WRS candidate samples per pixel "
+            "(Bitterli K). 8 is the NVIDIA RTXDI 'balanced' default "
+            "and trades well against temporal / spatial reuse. Higher "
+            "K reduces per-frame variance at linear ALU cost; the "
+            "shader caps at 64. Sub-1 values are clamped to 1.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_restir_bias, "biased",
+            "ReSTIR bias-correction mode. 'biased' (default) = "
+            "straight WRS resampling; cheaper (~30% off the spatial "
+            "pass cost) and visually masked by the radiance denoiser. "
+            "'unbiased' = per-pair MIS weighting in the spatial "
+            "merge, Bitterli's rigorous estimator. 'unbiased' is the "
+            "correct ground-truth setting for offline reference; "
+            "'biased' is what AAA shipped engines use at runtime.",
             CVAR_ARCHIVE);
 
     // Camera controls.  Mouse-look engages while RIGHT mouse is held.
@@ -1581,6 +1648,14 @@ void Engine::TearDownDevice() {
         // SIGMA shadow visibility buffer (issue #115). Storage buffer
         // (not texture) -- see comment at the allocation site.
         if (shadow_vis_buf_id_       != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{shadow_vis_buf_id_});
+        // --- ReSTIR DI Phase A (issue #78) -------------------------------------
+        // Per-pixel reservoir SSBOs. Triple-buffered: curr (PathTrace
+        // output), prev (previous-frame final), swap (spatial-pass
+        // output, swapped into prev at end-of-frame).
+        if (restir_reservoir_curr_buf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{restir_reservoir_curr_buf_id_});
+        if (restir_reservoir_prev_buf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{restir_reservoir_prev_buf_id_});
+        if (restir_reservoir_swap_buf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{restir_reservoir_swap_buf_id_});
+        // --- end ReSTIR DI Phase A ---------------------------------------------
         // MetalFX specular guidance G-buffers (issue #118).
         if (specular_albedo_tex_id_       != 0) device_->DestroyTexture(pt::rhi::TextureHandle{specular_albedo_tex_id_});
         if (roughness_tex_id_             != 0) device_->DestroyTexture(pt::rhi::TextureHandle{roughness_tex_id_});
@@ -1648,6 +1723,16 @@ void Engine::TearDownDevice() {
     cloud_trans_tex_id_      = 0;
     shadow_vis_buf_id_       = 0;
     sigma_shadow_pipeline_id_ = 0;
+    // --- ReSTIR DI Phase A (issue #78) -------------------------------------
+    restir_reservoir_curr_buf_id_ = 0;
+    restir_reservoir_prev_buf_id_ = 0;
+    restir_reservoir_swap_buf_id_ = 0;
+    restir_temporal_pipeline_id_  = 0;
+    restir_spatial_pipeline_id_   = 0;
+    restir_final_pipeline_id_     = 0;
+    restir_alloc_w_               = 0;
+    restir_alloc_h_               = 0;
+    // --- end ReSTIR DI Phase A ---------------------------------------------
     // MetalFX specular guidance G-buffers (issue #118).
     specular_albedo_tex_id_       = 0;
     roughness_tex_id_             = 0;
@@ -3563,6 +3648,19 @@ void Engine::EnsurePipelineHandles() {
     // SIGMA shadow denoiser (issue #115). Metal-only at MVP scope;
     // r_shadow_demod gate collapses to "no SIGMA" on Vulkan.
     resolve(sigma_shadow_pipeline_id_, "sigma_shadow");
+    // --- ReSTIR DI Phase A (issue #78) -------------------------------------
+    // Three compute kernels chained behind PathTrace's WRS
+    // candidate-generation pass: temporal reuse -> spatial reuse ->
+    // final shadow + Lambert composite. Metal-only at Phase A scope;
+    // Vulkan pipeline-build worker has no entry for these names so
+    // the resolve leaves the ids at 0 and the dispatch gates collapse
+    // cleanly to "no ReSTIR, legacy single-pick NEE in PathTrace."
+    // Vulkan plumbing is a follow-up alongside SigmaShadow /
+    // StarsComposite / AuroraComposite -- same shape.
+    resolve(restir_temporal_pipeline_id_, "restir_temporal");
+    resolve(restir_spatial_pipeline_id_,  "restir_spatial");
+    resolve(restir_final_pipeline_id_,    "restir_final");
+    // --- end ReSTIR DI Phase A ---------------------------------------------
     // Screen-space particle composite (#82 MVP). Dispatch site below
     // additionally gates on particle_count > 0 and r_particles, so the
     // resolve cost is 1 atomic compare per frame until Vulkan grows a
@@ -3735,6 +3833,15 @@ void Engine::RenderFrame() {
             // is allocated by the denoiser-active path and must be
             // freed when the user flips r_denoiser off.
             if (shadow_vis_buf_id_       != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{shadow_vis_buf_id_});
+            // --- ReSTIR DI Phase A (issue #78) -----------------------------
+            // Reservoir SSBOs live and die with the denoiser path -- the
+            // Phase A composite writes into denoise_color, which only
+            // exists when a denoiser is active. Freeing here mirrors the
+            // shadow_vis_buf_id_ pattern.
+            if (restir_reservoir_curr_buf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{restir_reservoir_curr_buf_id_});
+            if (restir_reservoir_prev_buf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{restir_reservoir_prev_buf_id_});
+            if (restir_reservoir_swap_buf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{restir_reservoir_swap_buf_id_});
+            // --- end ReSTIR DI Phase A -------------------------------------
             // MetalFX specular guidance G-buffers (issue #118).
             if (specular_albedo_tex_id_       != 0) device_->DestroyTexture(pt::rhi::TextureHandle{specular_albedo_tex_id_});
             if (roughness_tex_id_             != 0) device_->DestroyTexture(pt::rhi::TextureHandle{roughness_tex_id_});
@@ -3747,6 +3854,11 @@ void Engine::RenderFrame() {
             normal_tex_id_ = albedo_tex_id_ = post_denoise_hdr_tex_id_ = 0;
             cloud_trans_tex_id_   = 0;
             shadow_vis_buf_id_    = 0;
+            restir_reservoir_curr_buf_id_ = 0;
+            restir_reservoir_prev_buf_id_ = 0;
+            restir_reservoir_swap_buf_id_ = 0;
+            restir_alloc_w_ = 0;
+            restir_alloc_h_ = 0;
             specular_albedo_tex_id_       = 0;
             roughness_tex_id_             = 0;
             specular_hit_distance_tex_id_ = 0;
@@ -3947,6 +4059,11 @@ void Engine::RenderFrame() {
             // above. Resize teardown destroys it before the new
             // allocation runs further down.
             if (shadow_vis_buf_id_        != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{shadow_vis_buf_id_});
+            // --- ReSTIR DI Phase A (issue #78) -----------------------------
+            if (restir_reservoir_curr_buf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{restir_reservoir_curr_buf_id_});
+            if (restir_reservoir_prev_buf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{restir_reservoir_prev_buf_id_});
+            if (restir_reservoir_swap_buf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{restir_reservoir_swap_buf_id_});
+            // --- end ReSTIR DI Phase A -------------------------------------
             // MetalFX specular guidance G-buffers (issue #118).
             if (specular_albedo_tex_id_       != 0) device_->DestroyTexture(pt::rhi::TextureHandle{specular_albedo_tex_id_});
             if (roughness_tex_id_             != 0) device_->DestroyTexture(pt::rhi::TextureHandle{roughness_tex_id_});
@@ -3964,6 +4081,11 @@ void Engine::RenderFrame() {
             post_denoise_hdr_tex_id_ = 0;
             cloud_trans_tex_id_      = 0;
             shadow_vis_buf_id_       = 0;
+            restir_reservoir_curr_buf_id_ = 0;
+            restir_reservoir_prev_buf_id_ = 0;
+            restir_reservoir_swap_buf_id_ = 0;
+            restir_alloc_w_               = 0;
+            restir_alloc_h_               = 0;
             specular_albedo_tex_id_       = 0;
             roughness_tex_id_             = 0;
             specular_hit_distance_tex_id_ = 0;
@@ -4048,6 +4170,52 @@ void Engine::RenderFrame() {
                 .debug_name = "shadow_vis",
             });
             shadow_vis_buf_id_ = svis_h.id;
+            // --- ReSTIR DI Phase A (issue #78) -----------------------------
+            // Allocate three per-pixel reservoir SSBOs (curr / prev /
+            // swap). Each is sized W * H * sizeof(pt::renderer::Reservoir)
+            // = W * H * 64 B. At 1080p: 127 MB per buffer, ~381 MB total
+            // for the triple ring. Same denoiser_active_ lifecycle as
+            // shadow_vis_buf_id_ above; the buffers are freed and
+            // reallocated on swapchain resize.
+            //
+            // We allocate them unconditionally whenever the denoiser is
+            // active (not gated on r_restir) because the Phase A
+            // dispatch chain SHORT-CIRCUITS cleanly on r_restir=0 via
+            // the per-pass push gates -- but PathTrace.slang's binding
+            // 29 always needs a real buffer to keep Metal's MSL slot
+            // assignment stable (same lesson the
+            // shadow_vis_buf_id_ slot-11 fallback below the dispatch
+            // captures). Cost: 380 MB VRAM standby on a single-buffer
+            // denoiser path the user might not even toggle ReSTIR on
+            // for. Acceptable for Phase A; an optimization that keys
+            // allocation on r_restir = 1 only is a trivial follow-up.
+            std::size_t kReservoirBytesPerPixel =
+                sizeof(pt::renderer::Reservoir);
+            std::size_t reservoir_total_bytes =
+                static_cast<std::size_t>(fc.width) *
+                static_cast<std::size_t>(fc.height) *
+                kReservoirBytesPerPixel;
+            auto reservoir_curr_h = device_->CreateBuffer({
+                .size       = reservoir_total_bytes,
+                .usage      = pt::rhi::BufferUsage::Storage,
+                .debug_name = "restir_reservoir_curr",
+            });
+            auto reservoir_prev_h = device_->CreateBuffer({
+                .size       = reservoir_total_bytes,
+                .usage      = pt::rhi::BufferUsage::Storage,
+                .debug_name = "restir_reservoir_prev",
+            });
+            auto reservoir_swap_h = device_->CreateBuffer({
+                .size       = reservoir_total_bytes,
+                .usage      = pt::rhi::BufferUsage::Storage,
+                .debug_name = "restir_reservoir_swap",
+            });
+            restir_reservoir_curr_buf_id_ = reservoir_curr_h.id;
+            restir_reservoir_prev_buf_id_ = reservoir_prev_h.id;
+            restir_reservoir_swap_buf_id_ = reservoir_swap_h.id;
+            restir_alloc_w_ = fc.width;
+            restir_alloc_h_ = fc.height;
+            // --- end ReSTIR DI Phase A -------------------------------------
             // Normal G-buffer: SVGF/NRD use it for edge-aware spatial
             // filtering; the OptiX AOV denoiser uses it as a guide layer.
             // MetalFX ignores normals and the path tracer's normal write is
@@ -4409,6 +4577,22 @@ void Engine::RenderFrame() {
         : pt::rhi::BufferHandle{placeholder_storage_id_};
     if (slot13.id != 0) cb->BindBuffer(13, slot13, 0);
     // --- end Light tree ----------------------------------------------------
+    // --- ReSTIR DI Phase A (issue #78) -------------------------------------
+    // Reservoir SSBO at engine slot 14 -> Metal MSL slot 14 ->
+    // vk::binding(29). Lands AFTER the light tree at slot 13 (#129).
+    // Always bind something so Metal's push-slot computation
+    // (max-bound + 1 = slot 15) stays stable -- the shader's r_restir
+    // gate elides the WRITE when r_restir = 0 but the binding has to
+    // resolve to a real buffer. Falls back to the always-present
+    // placeholder when ReSTIR resources haven't been allocated yet
+    // (denoiser-off path, or pre-first-frame). Same pattern slot 11
+    // (shadow_vis) / slot 12 (light_prims) / slot 13 (light_tree) follow.
+    pt::rhi::BufferHandle slot14 =
+        (denoiser_active_ && restir_reservoir_curr_buf_id_ != 0)
+            ? pt::rhi::BufferHandle{restir_reservoir_curr_buf_id_}
+            : pt::rhi::BufferHandle{placeholder_storage_id_};
+    if (slot14.id != 0) cb->BindBuffer(14, slot14, 0);
+    // --- end ReSTIR DI Phase A ---------------------------------------------
     // Engine slots 11/12/13 -> vk::bindings 24/25/26: the MetalFX
     // specular-guidance trio (issue #118). Path tracer writes them
     // alongside the existing G-buffers when the write_specular_*_gbuffer
@@ -4727,10 +4911,33 @@ void Engine::RenderFrame() {
         //                .z = wave_speed (animation rate multiplier).
         //                .w = time_seconds (shared accumulator with cloud
         //                                   wind; wraps on 24 h sim window).
-        // Two vec4s = 32 B. Sits at the very end of PtPush.
+        // Two vec4s = 32 B. Sits before the ReSTIR block in PtPush.
         float water_params0[4];
         float water_params1[4];
         // --- end Water Phase 1 -------------------------------------------
+        // --- ReSTIR DI Phase A (issue #78) ---------------------------------
+        // restir_enabled    : 1 -> PathTrace's primary-hit Lambert NEE
+        //                     switches to WRS candidate generation +
+        //                     reservoir write (the Phase A composite
+        //                     adds the resampled+shadow-tested
+        //                     contribution back in via the RestirFinal
+        //                     kernel). 0 -> legacy single-pick NEE
+        //                     from #73 (PathTrace adds contribution
+        //                     directly). Gated host-side on
+        //                     denoiser_active_ so the denoiser-off
+        //                     swapchain-direct path always sees a 0
+        //                     here.
+        // restir_k_candidates : WRS candidate budget per pixel. 8 =
+        //                       NVIDIA RTXDI default; clamped to
+        //                       [1, kRestirMaxK=64] before upload.
+        // Trailing 8 bytes of pad keep the cbuffer trailing block
+        // 16-byte aligned, matching the std140 / MSL rule
+        // PathTrace.slang's matching Push/Frame blocks rely on.
+        std::uint32_t restir_enabled;
+        std::uint32_t restir_k_candidates;
+        std::uint32_t _pad_restir0;
+        std::uint32_t _pad_restir1;
+        // --- end ReSTIR DI Phase A -----------------------------------------
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -4980,6 +5187,60 @@ void Engine::RenderFrame() {
     push.light_tree_enabled = (light_tree_on &&
                                 light_tree_node_count_uploaded_ > 0u) ? 1u : 0u;
     push._pad_light_tail = 0u;
+    // --- ReSTIR DI Phase A (issue #78) -------------------------------------
+    // r_restir master toggle, gated additionally on:
+    //   - denoiser_active_       : Phase A composite writes into denoise_color
+    //   - restir_*_pipeline_id_  : Metal-only at MVP scope; Vulkan gate
+    //                              collapses to 0 cleanly
+    //   - light_count > 0        : nothing to resample when the light
+    //                              list is empty
+    bool restir_user_on = false;
+    if (auto* v = C.FindCVar("r_restir")) restir_user_on = (v->GetInt() != 0);
+    bool restir_dispatch_active =
+        restir_user_on &&
+        denoiser_active_ &&
+        restir_temporal_pipeline_id_ != 0 &&
+        restir_spatial_pipeline_id_  != 0 &&
+        restir_final_pipeline_id_    != 0 &&
+        restir_reservoir_curr_buf_id_ != 0 &&
+        light_count_uploaded_ > 0u;
+    push.restir_enabled = restir_dispatch_active ? 1u : 0u;
+    // One-shot gate diagnostics: ONLY when r_restir = 1 but the gate
+    // evaluates to 0 (so the user-visible "nothing happens" mismatch
+    // gets a diagnostic line per session). When ReSTIR engages
+    // successfully the "Phase A engaged" log inside the dispatch block
+    // below covers it; the silent-success path here avoids spamming
+    // the journal for the common case.
+    {
+        static bool s_restir_gate_failure_logged = false;
+        if (restir_user_on && !restir_dispatch_active &&
+            !s_restir_gate_failure_logged) {
+            LOG_INFO("engine: r_restir=1 but ReSTIR NOT dispatching "
+                     "(denoiser_active={}, pipes_t/s/f={}{}{}, "
+                     "reservoir_buf={}, light_count={}). The dispatch "
+                     "engages when ALL of those are non-zero / true.",
+                     denoiser_active_,
+                     restir_temporal_pipeline_id_ != 0,
+                     restir_spatial_pipeline_id_  != 0,
+                     restir_final_pipeline_id_    != 0,
+                     restir_reservoir_curr_buf_id_ != 0,
+                     light_count_uploaded_);
+            s_restir_gate_failure_logged = true;
+        }
+    }
+    std::uint32_t restir_k = 8u;
+    if (auto* v = C.FindCVar("r_restir_k_candidates")) {
+        int n = v->GetInt();
+        if (n < 1) n = 1;
+        if (n > static_cast<int>(pt::renderer::kRestirMaxK)) {
+            n = static_cast<int>(pt::renderer::kRestirMaxK);
+        }
+        restir_k = static_cast<std::uint32_t>(n);
+    }
+    push.restir_k_candidates = restir_k;
+    push._pad_restir0 = 0u;
+    push._pad_restir1 = 0u;
+    // --- end ReSTIR DI Phase A ---------------------------------------------
 
     // Halton(2,3) sub-pixel jitter sequence in [-0.5, 0.5] each axis.
     // 16-sample period before repeating; ample for the denoiser's
@@ -5501,7 +5762,8 @@ void Engine::RenderFrame() {
     //   +16 analytic light primitives block (#73)
     //   +16 MetalFX specular guidance write gates (#118)
     //   +32 Water Phase 1 (#134) — two vec4s (absorption + ior, wave params)
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16);
+    //   +16 ReSTIR DI Phase A (#78)
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16);
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
     // cbuffer layout the Slang compiler applies to PathTrace.slang's
@@ -5559,12 +5821,271 @@ void Engine::RenderFrame() {
                   "PtPush::light_count must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     // --- end Light tree ----------------------------------------------------
+    // Issue #78 ReSTIR DI Phase A block.
+    static_assert(offsetof(PtPush, restir_enabled) % 16 == 0,
+                  "PtPush::restir_enabled must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
 
     auto wg_x = (fc.width  + 7) / 8;
     auto wg_y = (fc.height + 7) / 8;
     cb->Dispatch(wg_x, wg_y, 1);
+
+    // --- ReSTIR DI Phase A (issue #78) -------------------------------------
+    // Dispatch chain (when ReSTIR is engaged this frame):
+    //   1. RestirTemporal : reads reservoir_curr (just written by
+    //                       PathTrace), reads reservoir_prev
+    //                       (last frame's final), MIS-combines into
+    //                       reservoir_curr.
+    //   2. RestirSpatial  : reads reservoir_curr (post-temporal), MIS-
+    //                       combines with N neighbours, writes
+    //                       reservoir_swap.
+    //   3. RestirFinal    : reads reservoir_swap, shadow-tests the
+    //                       survivor, additively blends the Lambert
+    //                       contribution into denoise_color.
+    //
+    // At end of frame the prev/swap ids are swapped so next frame's
+    // RestirTemporal reads this frame's final reservoir as prev. The
+    // ping-pong avoids per-frame buffer reallocs.
+    if (push.restir_enabled != 0u) {
+        // One-shot logging so operators can verify the ReSTIR chain
+        // engaged for a given session. Logged at INFO once per
+        // engine session to avoid spamming the journal; the same
+        // one-shot pattern SIGMA / particles use to advertise
+        // first-engagement.
+        static bool s_restir_logged = false;
+        if (!s_restir_logged) {
+            LOG_INFO("engine: ReSTIR DI Phase A engaged "
+                     "(K={}, light_count={}, denoiser=on)",
+                     push.restir_k_candidates,
+                     light_count_uploaded_);
+            s_restir_logged = true;
+        }
+        // RAW hazard: PathTrace wrote reservoir_curr_buf in its
+        // candidate-generation block; RestirTemporal is about to read
+        // it. Emit a compute-write -> compute-read barrier. Metal
+        // auto-barriers, but this matters on Vulkan submission ordering.
+        cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                     pt::rhi::BarrierDesc::Stage::ComputeRead});
+
+        std::uint32_t bias_mode_v = pt::renderer::kRestirBiasBiased;
+        if (auto* v = C.FindCVar("r_restir_bias")) {
+            // CVar.value is the canonical string store; r_restir_bias
+            // is a string-valued cvar with allowed_values {biased,
+            // unbiased}, so direct comparison is correct here.
+            if (v->value == "unbiased") {
+                bias_mode_v = pt::renderer::kRestirBiasUnbiased;
+            }
+        }
+        std::uint32_t temporal_on = 1u;
+        if (auto* v = C.FindCVar("r_restir_temporal")) {
+            temporal_on = v->GetBool() ? 1u : 0u;
+        }
+        std::uint32_t spatial_on = 1u;
+        if (auto* v = C.FindCVar("r_restir_spatial")) {
+            spatial_on = v->GetBool() ? 1u : 0u;
+        }
+
+        // --- RestirTemporal -------------------------------------------------
+        if (restir_temporal_pipeline_id_ != 0) {
+            cb->BindComputePipeline(
+                pt::rhi::PipelineHandle{restir_temporal_pipeline_id_});
+            // Texture slot 0: depth_tex (camera-space Z).
+            cb->BindStorageTexture(0, pt::rhi::TextureHandle{depth_tex_id_});
+            // Texture slot 1: motion_tex (reprojection delta).
+            cb->BindStorageTexture(1, pt::rhi::TextureHandle{motion_tex_id_});
+            // Texture slot 2: normal_tex (disocclusion gate). When the
+            // active denoiser doesn't allocate normals (rare; the
+            // engine forces it on for MetalFX so the bind always has
+            // a non-zero id under the dispatch gate above), bind the
+            // 1x1 bloom_dummy as a placeholder to satisfy Metal's
+            // pipeline validation. The shader's disocclusion code
+            // tolerates a black normal -- it just falls back to "no
+            // temporal reuse" for that pixel.
+            const std::uint64_t restir_normal_id =
+                (normal_tex_id_ != 0) ? normal_tex_id_ : bloom_dummy_tex_id_;
+            cb->BindStorageTexture(2, pt::rhi::TextureHandle{restir_normal_id});
+            // Buffer slot 0: reservoir_curr_in (PathTrace output).
+            cb->BindBuffer(0, pt::rhi::BufferHandle{restir_reservoir_curr_buf_id_}, 0);
+            // Buffer slot 1: reservoir_prev_in.
+            cb->BindBuffer(1, pt::rhi::BufferHandle{restir_reservoir_prev_buf_id_}, 0);
+            // Buffer slot 2: reservoir_curr_out (we ping-pong back into
+            // the curr buffer via the spatial pass; the temporal pass
+            // writes a TRANSIENT result that the spatial pass reads).
+            // Use restir_reservoir_swap_buf_id_ here so the temporal
+            // output sits in a different buffer than its inputs --
+            // necessary to avoid the WAR hazard if the spatial pass
+            // reads neighbour pixels at slightly different positions.
+            cb->BindBuffer(2, pt::rhi::BufferHandle{restir_reservoir_swap_buf_id_}, 0);
+            // Buffer slot 3: light_prims (re-evaluate prev survivor's pdf).
+            pt::rhi::BufferHandle restir_lights = (light_buffer_id_ != 0)
+                ? pt::rhi::BufferHandle{light_buffer_id_}
+                : pt::rhi::BufferHandle{placeholder_storage_id_};
+            cb->BindBuffer(3, restir_lights, 0);
+
+            struct RestirTemporalPush {
+                std::uint32_t width;
+                std::uint32_t height;
+                std::uint32_t frame_index;
+                std::uint32_t light_count;
+                float pos_fovtan[4];
+                float fwd_aspect[4];
+                float right_xyz[4];
+                float up_xyz[4];
+                std::uint32_t bias_mode;
+                std::uint32_t restir_enabled;
+                std::uint32_t temporal_enabled;
+                std::uint32_t _pad0;
+            } rt{};
+            static_assert(sizeof(RestirTemporalPush) % 16 == 0,
+                          "RestirTemporalPush must be 16-byte aligned");
+            rt.width            = fc.width;
+            rt.height           = fc.height;
+            rt.frame_index      = push.frame_index;
+            rt.light_count      = light_count_uploaded_;
+            std::memcpy(rt.pos_fovtan, push.pos_fovtan, sizeof(rt.pos_fovtan));
+            std::memcpy(rt.fwd_aspect, push.fwd_aspect, sizeof(rt.fwd_aspect));
+            std::memcpy(rt.right_xyz,  push.right_xyz,  sizeof(rt.right_xyz));
+            std::memcpy(rt.up_xyz,     push.up_xyz,     sizeof(rt.up_xyz));
+            rt.bias_mode        = bias_mode_v;
+            rt.restir_enabled   = 1u;
+            rt.temporal_enabled = temporal_on;
+            rt._pad0            = 0u;
+            cb->PushConstants(&rt, sizeof(rt));
+            cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
+
+            // RAW: temporal wrote restir_reservoir_swap_buf; spatial
+            // about to read it.
+            cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                         pt::rhi::BarrierDesc::Stage::ComputeRead});
+        }
+
+        // --- RestirSpatial --------------------------------------------------
+        if (restir_spatial_pipeline_id_ != 0) {
+            cb->BindComputePipeline(
+                pt::rhi::PipelineHandle{restir_spatial_pipeline_id_});
+            cb->BindStorageTexture(0, pt::rhi::TextureHandle{depth_tex_id_});
+            const std::uint64_t restir_normal_id =
+                (normal_tex_id_ != 0) ? normal_tex_id_ : bloom_dummy_tex_id_;
+            cb->BindStorageTexture(1, pt::rhi::TextureHandle{restir_normal_id});
+            // Input: post-temporal reservoir (swap buffer).
+            cb->BindBuffer(0, pt::rhi::BufferHandle{restir_reservoir_swap_buf_id_}, 0);
+            // Output: final reservoir for this frame, lands in curr
+            // (the spatial pass writes the FINAL survivor that
+            // RestirFinal reads and that becomes next frame's prev).
+            cb->BindBuffer(1, pt::rhi::BufferHandle{restir_reservoir_curr_buf_id_}, 0);
+            pt::rhi::BufferHandle restir_lights = (light_buffer_id_ != 0)
+                ? pt::rhi::BufferHandle{light_buffer_id_}
+                : pt::rhi::BufferHandle{placeholder_storage_id_};
+            cb->BindBuffer(2, restir_lights, 0);
+
+            struct RestirSpatialPush {
+                std::uint32_t width;
+                std::uint32_t height;
+                std::uint32_t frame_index;
+                std::uint32_t light_count;
+                float pos_fovtan[4];
+                float fwd_aspect[4];
+                float right_xyz[4];
+                float up_xyz[4];
+                std::uint32_t bias_mode;
+                std::uint32_t restir_enabled;
+                std::uint32_t spatial_enabled;
+                std::uint32_t _pad0;
+            } rs{};
+            static_assert(sizeof(RestirSpatialPush) % 16 == 0,
+                          "RestirSpatialPush must be 16-byte aligned");
+            rs.width            = fc.width;
+            rs.height           = fc.height;
+            rs.frame_index      = push.frame_index;
+            rs.light_count      = light_count_uploaded_;
+            std::memcpy(rs.pos_fovtan, push.pos_fovtan, sizeof(rs.pos_fovtan));
+            std::memcpy(rs.fwd_aspect, push.fwd_aspect, sizeof(rs.fwd_aspect));
+            std::memcpy(rs.right_xyz,  push.right_xyz,  sizeof(rs.right_xyz));
+            std::memcpy(rs.up_xyz,     push.up_xyz,     sizeof(rs.up_xyz));
+            rs.bias_mode        = bias_mode_v;
+            rs.restir_enabled   = 1u;
+            rs.spatial_enabled  = spatial_on;
+            rs._pad0            = 0u;
+            cb->PushConstants(&rs, sizeof(rs));
+            cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
+
+            cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                         pt::rhi::BarrierDesc::Stage::ComputeRead});
+        }
+
+        // --- RestirFinal ----------------------------------------------------
+        if (restir_final_pipeline_id_ != 0 && albedo_tex_id_ != 0) {
+            cb->BindComputePipeline(
+                pt::rhi::PipelineHandle{restir_final_pipeline_id_});
+            cb->BindStorageTexture(0, pt::rhi::TextureHandle{depth_tex_id_});
+            const std::uint64_t restir_normal_id =
+                (normal_tex_id_ != 0) ? normal_tex_id_ : bloom_dummy_tex_id_;
+            cb->BindStorageTexture(1, pt::rhi::TextureHandle{restir_normal_id});
+            cb->BindStorageTexture(2, pt::rhi::TextureHandle{albedo_tex_id_});
+            cb->BindStorageTexture(3, pt::rhi::TextureHandle{denoise_color_tex_id_});
+            // Input reservoir (post-spatial; lives in curr buf).
+            cb->BindBuffer(0, pt::rhi::BufferHandle{restir_reservoir_curr_buf_id_}, 0);
+            pt::rhi::BufferHandle restir_lights = (light_buffer_id_ != 0)
+                ? pt::rhi::BufferHandle{light_buffer_id_}
+                : pt::rhi::BufferHandle{placeholder_storage_id_};
+            cb->BindBuffer(1, restir_lights, 0);
+            pt::rhi::BufferHandle restir_prims = (prim_buffer_id_ != 0)
+                ? pt::rhi::BufferHandle{prim_buffer_id_}
+                : pt::rhi::BufferHandle{placeholder_storage_id_};
+            cb->BindBuffer(2, restir_prims, 0);
+            // TLAS bind for the shadow trace. Only present on backends
+            // that support RT (Metal always; Vulkan when MoltenVK has
+            // VK_KHR_ray_query).
+            if (tlas_present) {
+                cb->BindAccelStruct(3, pt::rhi::AccelStructHandle{scene_tlas_id_});
+            }
+
+            struct RestirFinalPush {
+                std::uint32_t width;
+                std::uint32_t height;
+                std::uint32_t frame_index;
+                std::uint32_t light_count;
+                float pos_fovtan[4];
+                float fwd_aspect[4];
+                float right_xyz[4];
+                float up_xyz[4];
+                std::uint32_t restir_enabled;
+                std::uint32_t prim_count;
+                std::uint32_t tlas_present;
+                std::uint32_t linear_prim_count;
+            } rf{};
+            static_assert(sizeof(RestirFinalPush) % 16 == 0,
+                          "RestirFinalPush must be 16-byte aligned");
+            rf.width             = fc.width;
+            rf.height            = fc.height;
+            rf.frame_index       = push.frame_index;
+            rf.light_count       = light_count_uploaded_;
+            std::memcpy(rf.pos_fovtan, push.pos_fovtan, sizeof(rf.pos_fovtan));
+            std::memcpy(rf.fwd_aspect, push.fwd_aspect, sizeof(rf.fwd_aspect));
+            std::memcpy(rf.right_xyz,  push.right_xyz,  sizeof(rf.right_xyz));
+            std::memcpy(rf.up_xyz,     push.up_xyz,     sizeof(rf.up_xyz));
+            rf.restir_enabled    = 1u;
+            rf.prim_count        = static_cast<std::uint32_t>(primitives_.size());
+            rf.tlas_present      = tlas_present ? 1u : 0u;
+            rf.linear_prim_count = linear_prim_count_;
+            cb->PushConstants(&rf, sizeof(rf));
+            cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
+
+            // RestirFinal wrote denoise_color; subsequent passes
+            // (denoiser / bloom / tonemap) read it. Emit the
+            // standard compute-write -> compute-read barrier.
+            cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                         pt::rhi::BarrierDesc::Stage::ComputeRead});
+        }
+
+        // End-of-frame ping-pong: swap curr <-> prev so next frame's
+        // RestirTemporal reads THIS frame's final survivor reservoir
+        // (now in curr) as last-frame state.
+        std::swap(restir_reservoir_curr_buf_id_, restir_reservoir_prev_buf_id_);
+    }
+    // --- end ReSTIR DI Phase A ---------------------------------------------
 
     // GPU-side auto-exposure: tiny reduction pass that samples
     // accum_hdr (which the path tracer just wrote) and updates the

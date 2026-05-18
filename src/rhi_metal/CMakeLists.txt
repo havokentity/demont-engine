@@ -46,13 +46,20 @@ pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/SdfPrimitives.slang)
 # body-only iterations don't re-parse the DE code.
 pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/SdfFractals.slang)
 # --- end SDF Phase 3 -------------------------------------------------------
+# --- ReSTIR DI Phase A (issue #78) ----------------------------------------
+# Shared Reservoir struct + WRS streaming primitives. Imported by
+# PathTrace.slang (initial WRS pass) AND by each Restir kernel.
+# Target-agnostic module pattern -- same .slang-module flows into
+# both Metal and SPIR-V (when the Vulkan plumbing follow-up lands).
+pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/RestirReservoir.slang)
+# --- end ReSTIR DI Phase A ------------------------------------------------
 pt_compile_slang(
     TARGET  pt_rhi_metal
     SOURCE  ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
     STAGE   compute
     ENTRY   main
     TARGETS metal
-    MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals
+    MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals RestirReservoir
 )
 pt_compile_slang(
     TARGET  pt_rhi_metal
@@ -118,6 +125,39 @@ pt_compile_slang(
     ENTRY   main
     TARGETS metal
 )
+# --- ReSTIR DI Phase A (issue #78) ----------------------------------------
+# Three compute kernels chained behind PathTrace's WRS candidate-
+# generation pass: RestirTemporal (reproject + MIS-merge prev frame),
+# RestirSpatial (N=4 neighbours in a 10 px disc, MIS-merge),
+# RestirFinal (shadow-test the survivor + additive Lambert composite
+# into denoise_color). Same module-import pattern as PathTrace.slang.
+# Metal-only at MVP scope (matches SigmaShadow / StarsComposite /
+# AuroraComposite); Vulkan plumbing is a follow-up.
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/RestirTemporal.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+    MODULE_DEPS RestirReservoir
+)
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/RestirSpatial.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+    MODULE_DEPS RestirReservoir
+)
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/RestirFinal.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+    MODULE_DEPS RestirReservoir
+)
+# --- end ReSTIR DI Phase A ------------------------------------------------
 # Screen-space particle composite (#82 MVP). Dispatched AFTER
 # StarsComposite + AuroraComposite, BEFORE the bloom pyramid; reads
 # the engine-uploaded particle storage buffer and additive-splats
