@@ -117,8 +117,16 @@ private:
     // the analytic light list (`light_prims`, MSL slot 11; the shader
     // declares it at vk::binding(27)). Keep in sync with the engine's
     // BindBuffer(11,...) call site.
-    BufferHandle               bound_buf_[12] {};
-    std::size_t                bound_buf_off_[12] {};
+    //
+    // Slot 13 added by the hierarchical light tree (#129) for the
+    // packed-node SSBO consumed by PathTrace.slang's O(log N) NEE
+    // picker. MSL slot 13 (declared AFTER light_prims so the existing
+    // slots 0..12 stay put); the shader's matching vk::binding is 28.
+    // Engine binds it via BindBuffer(13, ...), with a placeholder-buffer
+    // fallback when the tree is empty so Metal's push-slot computation
+    // stays stable.
+    BufferHandle               bound_buf_[14] {};
+    std::size_t                bound_buf_off_[14] {};
     AccelStructHandle          bound_accel_[4] {};
 
     // Push-constant buffer. Sized to fit the unified PathTrace push

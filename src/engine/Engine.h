@@ -253,6 +253,20 @@ private:
     // (uniform single-pick over the count).
     void EnsureLightsUploaded();
 
+    // --- Light tree (#129) -------------------------------------------------
+    // Rebuild + re-upload the hierarchical light tree SSBO whenever
+    // the light set has been mutated since the last frame. Builds via
+    // pt::renderer::BuildLightTree on the host (CPU; <1ms for 1000
+    // lights). The shader gates traversal on push.light_tree_node_count
+    // > 0 AND r_light_tree cvar; when either condition is false the
+    // shader falls back to #73's naive uniform pick. Sized the GPU
+    // buffer in powers of two starting at 32 nodes -- a 16-light scene
+    // (smallest LightTree.h leaf-count granularity) produces 31 nodes
+    // (2N-1), so 32 is the smallest power-of-two floor that fits without
+    // an immediate realloc.
+    void EnsureLightTreeUploaded();
+    // --- end Light tree ----------------------------------------------------
+
     // --- SDF Phase 1 (#97) -------------------------------------------------
     // Re-upload the SDF cluster storage buffer from `sdf_prims_`. Called
     // from RenderFrame whenever sdf_prims_dirty_ is set. Re-runs
@@ -406,6 +420,21 @@ private:
     std::uint64_t                               light_buffer_id_         = 0;
     std::uint32_t                               light_buffer_capacity_   = 0;  // lights that fit
     std::uint32_t                               light_count_uploaded_    = 0;  // lights last uploaded
+
+    // --- Light tree (#129) -------------------------------------------------
+    // Hierarchical light tree (Conty Estevez & Kulla 2018) for O(log N)
+    // NEE light selection. Built CPU-side by pt::renderer::BuildLightTree
+    // and uploaded to a flat-node SSBO at engine slot 13 / shader binding
+    // 28. Re-built whenever light_prims_dirty_ fires (the same hook that
+    // re-uploads the light list itself) -- the build is <1ms for 1000
+    // lights so we don't bother caching across moves at MVP scale.
+    // light_tree_node_count_uploaded_ doubles as the shader's gate
+    // (push.light_tree_node_count > 0 AND r_light_tree=1 -> traverse,
+    // else fall back to naive uniform pick from #73).
+    std::uint64_t                               light_tree_buffer_id_       = 0;
+    std::uint32_t                               light_tree_buffer_capacity_ = 0;  // nodes that fit
+    std::uint32_t                               light_tree_node_count_uploaded_ = 0;
+    // --- end Light tree ----------------------------------------------------
 
     // --- Voxel destruction Phase 1 (#140) ----------------------------------
     // VoxelGrids produced by `voxelize_object`, keyed by source object

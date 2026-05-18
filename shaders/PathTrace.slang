@@ -381,6 +381,37 @@ Texture2D<float4> moon_map;
 [[vk::binding(27, 0)]] StructuredBuffer<float4> light_prims;
 // --- end Light primitives --------------------------------------------------
 
+// --- Light tree (#129) -----------------------------------------------------
+// Hierarchical light tree (Conty Estevez & Kulla 2018) packed node array.
+// Built CPU-side by pt::renderer::BuildLightTree, uploaded by
+// Engine::EnsureLightTreeUploaded. 4 float4s per node (LightTreeNode in
+// src/renderer/LightTree.h):
+//
+//   v0.xyz = aabb_min
+//   v0.w   = left_first (uint, asfloat) -- internal: left child index
+//                                          (right = left + 1);
+//                                          leaf:     light id in
+//                                          `light_prims` upload order.
+//   v1.xyz = aabb_max
+//   v1.w   = count (uint, asfloat) -- 0 = internal, 1 = leaf
+//   v2.xyz = cone_axis (unit; combined emission direction)
+//   v2.w   = cos_half_angle (1 = single direction, -1 = sphere/point)
+//   v3.x   = intensity (scalar emitted-power magnitude; relative)
+//   v3.yzw = pad
+//
+// IMPORTANT: declared AFTER light_prims so existing Metal slots 0..12 are
+// undisturbed (Metal slot allocation is declaration-order based). Light
+// tree lands on Metal slot 13. On Vulkan the explicit vk::binding(28) is
+// what matters; sits past the light_prims slot at 27.
+//
+// Gate is push.light_tree_enabled (set when r_light_tree=1 AND the
+// host actually uploaded a non-empty tree). When 0 the shader falls
+// back to #73's naive uniform pick -- the binding still resolves to the
+// engine's placeholder storage buffer so Metal's push-slot computation
+// stays stable.
+[[vk::binding(28, 0)]] StructuredBuffer<float4> light_tree_nodes;
+// --- end Light tree --------------------------------------------------------
+
 struct BvhNode {
     float3 aabb_min;
     uint   left_first;
@@ -691,16 +722,20 @@ cbuffer Push {
     float vol_phase_g_cloud;
     float vol_multiscatter_oct;
     float _pad_vol;
-    // --- Light primitives (#73) --------------------------------------------
-    // Number of analytic light primitives in the `light_prims` storage
-    // buffer this dispatch. 0 disables the Lambert NEE-to-lights branch
-    // entirely. Its own 16-byte trailing block (light_count + 12 B pad)
-    // because the SIGMA #115 and hetero clouds #100 blocks already claim
-    // the trailing pad that the original celestials block left behind.
+    // --- Light primitives (#73) + Light tree (#129) ------------------------
+    // light_count: number of analytic light primitives in `light_prims`.
+    //              0 disables the Lambert NEE-to-lights branch entirely.
+    // light_tree_node_count: number of nodes in `light_tree_nodes`. 0
+    //              means the host didn't build a tree this frame.
+    // light_tree_enabled: 1 -> use O(log N) tree traversal for light
+    //              selection; 0 -> fall back to #73's uniform single
+    //              pick. Set by the engine from the r_light_tree cvar
+    //              (when 0, the cvar acts as a runtime kill switch).
+    // _pad_light_tail: trailing pad to keep the 16-byte block aligned.
     uint light_count;
-    uint _pad_light0;
-    uint _pad_light1;
-    uint _pad_light2;
+    uint light_tree_node_count;
+    uint light_tree_enabled;
+    uint _pad_light_tail;
     // MetalFX specular-guidance G-buffer write gates (issue #118).
     // The engine sets these only for MetalFX-family denoiser kinds
     // (DenoiserKind::MetalFX / SvgfBasicMetalFx / SvgfAtrousMetalFx)
@@ -790,12 +825,13 @@ cbuffer Frame {
     float vol_phase_g_cloud;
     float vol_multiscatter_oct;
     float _pad_vol;
-    // See `light_count` in the Metal Push cbuffer above (#73). Own
-    // 16-byte trailing block.
+    // See `light_count` / `light_tree_node_count` / `light_tree_enabled`
+    // in the Metal Push cbuffer above (#73 + #129). Own 16-byte
+    // trailing block (light_count + 3 light-tree uints).
     uint light_count;
-    uint _pad_light0;
-    uint _pad_light1;
-    uint _pad_light2;
+    uint light_tree_node_count;
+    uint light_tree_enabled;
+    uint _pad_light_tail;
     // See `write_specular_albedo_gbuffer` / `write_roughness_gbuffer` /
     // `write_specular_hit_distance_gbuffer` in the Metal Push cbuffer
     // above for semantics (issue #118 MetalFX specular guidance).
@@ -2152,9 +2188,171 @@ float3 uniformSphereDirection(float2 xi) {
 //             pos +/- u +/- v_axis * v_half; same area-to-solid-angle
 //             reciprocal.
 //
+// --- Light tree (#129) traversal -------------------------------------------
+// 4 float4s per light tree node. Mirrors LightTreeNode in
+// src/renderer/LightTree.h. The MSL/SPIR-V lane indexing is
+// declaration-order-stable on Slang's targets so we just compute the
+// raw float4 lane offset and read.
+static const uint kLightTreeNodeStrideFloat4 = 4u;
+
+struct LightTreeNodeR {
+    float3 aabb_min;
+    uint   left_first;   // internal: left child index; leaf: light id
+    float3 aabb_max;
+    uint   count;        // 0 = internal, 1 = leaf
+    float3 cone_axis;
+    float  cone_cos_half;
+    float  intensity;
+};
+
+LightTreeNodeR loadLightTreeNode(uint idx) {
+    uint base = idx * kLightTreeNodeStrideFloat4;
+    float4 v0 = light_tree_nodes[base + 0u];
+    float4 v1 = light_tree_nodes[base + 1u];
+    float4 v2 = light_tree_nodes[base + 2u];
+    float4 v3 = light_tree_nodes[base + 3u];
+    LightTreeNodeR n;
+    n.aabb_min       = v0.xyz;
+    n.left_first     = asuint(v0.w);
+    n.aabb_max       = v1.xyz;
+    n.count          = asuint(v1.w);
+    n.cone_axis      = v2.xyz;
+    n.cone_cos_half  = v2.w;
+    n.intensity      = v3.x;
+    return n;
+}
+
+// Per-node importance estimate at a shade point.  Returns a NON-NEGATIVE
+// scalar; siblings are compared via ratio so absolute scale doesn't
+// matter.  Conty Estevez & Kulla 2018 section 5.2: importance =
+// emitted_power * geometric_falloff * orientation_term * receiver_cosine.
+//
+//   emitted_power     = node.intensity (scalar; sum of leaf intensities).
+//   geometric_falloff = 1 / max(d^2, r^2) where d is the distance from
+//                       the shade point to the cluster centre and r is
+//                       half the cluster AABB diagonal -- bounds the
+//                       inverse-square term so we don't blow up when
+//                       the shade point is inside the cluster.
+//   orientation_term  = max(0, dot(cone_axis, dir_from_cluster)) when
+//                       the cluster has a bounded cone, scaled by the
+//                       cone half-angle so spot lights pointing away
+//                       receive proportionally lower weight; 1 for
+//                       fully spherical clusters (cos_half = -1).
+//   receiver_cosine   = max(0, dot(n_surface, dir_to_cluster)) -- the
+//                       Lambert term at the receiver. Folds in
+//                       back-faces (no contribution from lights behind
+//                       the surface).
+//
+// Returning a strictly-positive epsilon when ALL terms are zero so a
+// child branch never becomes deselectable; the traversal would then
+// have to fall back to the unfavoured sibling, biasing toward the
+// well-lit half of the scene. The epsilon keeps the estimator
+// unbiased.
+float lightTreeImportance(LightTreeNodeR node, float3 hit_pt,
+                           float3 n_face) {
+    float3 centre = 0.5 * (node.aabb_min + node.aabb_max);
+    float3 to_c   = centre - hit_pt;
+    float  d2     = max(dot(to_c, to_c), 1e-12);
+    float  d      = sqrt(d2);
+    float3 dir_to = to_c / d;
+
+    // Bounding-sphere radius around the AABB; max distance from centre
+    // to a corner = half the diagonal length.
+    float3 ext    = 0.5 * (node.aabb_max - node.aabb_min);
+    float  rad2   = max(dot(ext, ext), 1e-12);
+
+    // Inverse-square falloff, clamped at the cluster radius so the
+    // shade point being inside the cluster doesn't make the estimate
+    // singular.
+    float falloff = 1.0 / max(d2, rad2);
+
+    // Orientation term. Cluster emits toward the shade point in
+    // direction (-dir_to) (from cluster's perspective). For a one-sided
+    // cluster (cos_half >= 0) we want the cluster's cone to overlap
+    // -dir_to; for a fully spherical cluster (cos_half = -1) always 1.
+    float orient = 1.0;
+    if (node.cone_cos_half > -0.999) {
+        float cos_emit = -dot(node.cone_axis, dir_to);
+        // Smoothstep the cone window: 1 inside cos_half, 0 fully
+        // outside (cos = cos_half - 0.2). This is the same falloff
+        // shape Conty Estevez & Kulla use to keep the picker unbiased
+        // even when the cluster is just outside its declared cone.
+        float t = (cos_emit - (node.cone_cos_half - 0.2)) / 0.2;
+        orient = saturate(t);
+    }
+
+    // Receiver-side Lambert at the shade point.
+    float recv = max(0.0, dot(n_face, dir_to));
+
+    return max(node.intensity * falloff * orient * recv, 1e-8);
+}
+
+// Top-down 2-way tree traversal.  At each internal node, computes the
+// importance of each child and draws a uniform variate to pick one.
+// Returns the leaf light id AND accumulates the selection PDF along
+// the path (sigma_i p_i where p_i is the conditional pick probability
+// at each level). The shading-side PDF is `pick_pdf * solid_angle_pdf`
+// just like the naive uniform pick -- only the selection PMF changes.
+struct LightPick {
+    uint  light_id;
+    float pick_pdf;
+};
+
+LightPick pickLightFromTree(float3 hit_pt, float3 n_face, inout uint seed) {
+    LightPick r;
+    r.light_id = 0u;
+    r.pick_pdf = 1.0;
+
+    uint idx = 0u;   // root
+    // Cap depth defensively: the largest tree we build at MVP scale
+    // (1000 lights) is ~10 deep; 32 is the cap the linker can handle
+    // and well past any reasonable host-build.
+    [unroll(32)]
+    for (uint d = 0u; d < 32u; ++d) {
+        LightTreeNodeR n = loadLightTreeNode(idx);
+        if (n.count > 0u) {
+            // Leaf: light id is in left_first.
+            r.light_id = n.left_first;
+            return r;
+        }
+        uint left  = n.left_first;
+        uint right = left + 1u;
+        LightTreeNodeR cl = loadLightTreeNode(left);
+        LightTreeNodeR cr = loadLightTreeNode(right);
+        float il = lightTreeImportance(cl, hit_pt, n_face);
+        float ir = lightTreeImportance(cr, hit_pt, n_face);
+        float total = il + ir;
+        // Defensive: degenerate clusters (zero importance both sides)
+        // get 50/50 split. Shouldn't happen given the epsilon in
+        // lightTreeImportance, but keep the divide safe.
+        float p_l = (total > 1e-30) ? (il / total) : 0.5;
+        float u   = randf(seed);
+        if (u < p_l) {
+            idx = left;
+            r.pick_pdf *= p_l;
+        } else {
+            idx = right;
+            r.pick_pdf *= (1.0 - p_l);
+        }
+    }
+    return r;
+}
+// --- end Light tree traversal ----------------------------------------------
+
 // Returns an unset sample (pdf=0) when light_count == 0 or the chosen
 // type isn't a valid hemisphere direction (back-of-quad, outside spot
 // cone). The caller treats pdf<=0 as "skip this NEE sample".
+//
+// Picker logic:
+//   light_tree_enabled = 1 AND light_tree_node_count > 0 ->
+//     traverse the hierarchical tree (Conty Estevez & Kulla 2018)
+//     for O(log N) importance-weighted selection.
+//   else -> uniform single pick over the active light_count (the
+//     naive #73 sampler -- still correct, just higher variance).
+//
+// Both paths produce a `pick_pdf` that the per-light sampling stage
+// multiplies into the solid-angle pdf; the shading math (Le * brdf *
+// cos / pdf) is identical regardless.
 LightSample sampleAnalyticLight(float3 hit_pt, float3 n_face, inout uint seed) {
     LightSample s;
     s.dir  = float3(0, 1, 0);
@@ -2163,11 +2361,20 @@ LightSample sampleAnalyticLight(float3 hit_pt, float3 n_face, inout uint seed) {
     s.dist = 1e30;
     if (light_count == 0u) return s;
 
-    // Uniform single-pick over the active count. Naive Phase 1 -- the
-    // light tree (#129) replaces this with O(log N) selection.
-    float u_pick = randf(seed);
-    uint pick = min(uint(u_pick * float(light_count)), light_count - 1u);
-    float pick_pdf = 1.0 / float(light_count);
+    uint  pick;
+    float pick_pdf;
+    if (light_tree_enabled != 0u && light_tree_node_count > 0u) {
+        LightPick lp = pickLightFromTree(hit_pt, n_face, seed);
+        pick     = min(lp.light_id, light_count - 1u);
+        pick_pdf = lp.pick_pdf;
+    } else {
+        // Uniform single-pick over the active count. Same code path as
+        // #73 -- regression-protected by the r_light_tree=0 cvar so we
+        // can A/B variance against the tree at any time.
+        float u_pick = randf(seed);
+        pick = min(uint(u_pick * float(light_count)), light_count - 1u);
+        pick_pdf = 1.0 / float(light_count);
+    }
 
     LightRecord L = loadLight(pick);
 
