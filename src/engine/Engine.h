@@ -137,6 +137,31 @@ public:
         float     v_half      = 0.0f;       // quad v-axis half-extent (m)
     };
 
+    // --- Fluid Phase 1 (#136) -- density-injection smoke emitters ----------
+    // Static / parametrically-drifting smoke plumes that ride the existing
+    // volumetric cloud march via additive density contributions inside
+    // cloud_density_at(). Phase 1 has NO solver state, NO advection, NO
+    // grid -- each emitter is a Gaussian density blob whose "current
+    // position" is base + velocity * t (parametric drift). The cloud
+    // march's existing extinction / scatter / NEE pipeline handles
+    // shading; smoke is rim-lit by the sun and ambient-lit by the sky
+    // exactly like clouds, for free.
+    //
+    // Cap of kMaxSmokeEmitters at 16 is plenty for the MVP (chimney +
+    // campfire + a few scattered plumes). The runtime cvar
+    // r_smoke_max_emitters tightens this further so users can dial back
+    // the per-frame cost without recompiling. GPU buffer is always sized
+    // to kMaxSmokeEmitters so a re-upload doesn't reallocate.
+    struct SmokeEmitter {
+        float pos[3]      {0, 1, 0};      // base position in world space (m)
+        float radius      = 1.0f;         // Gaussian falloff radius (m, sigma-equivalent)
+        float density     = 1.0f;         // peak sigma_t contribution (per metre)
+        float velocity[3] {0, 0.2f, 0};   // parametric drift velocity (m/s)
+        float falloff     = 2.0f;         // exponent on (r/radius); 2 = Gaussian-ish
+        float tint[3]     {1, 1, 1};      // optional color tint (multiplier on cloud RGB)
+    };
+    static constexpr std::uint32_t kMaxSmokeEmitters = 16;
+
 private:
     void RegisterCommands();
     void RegisterCsgCommands();
@@ -161,6 +186,18 @@ private:
     // prim_*/sdf_* registration style; the populated map is uploaded
     // to GPU on the next render frame via EnsureLightsUploaded.
     void RegisterLightCommands();
+    // Console commands for the fluid Phase 1 smoke emitter list (#136):
+    // `smoke_emit <x> <y> <z> [radius] [density]` and `smoke_clear`. The
+    // list is uploaded to GPU on the next render frame via
+    // EnsureSmokeEmittersUploaded.
+    void RegisterSmokeCommands();
+    // Re-upload the smoke emitter storage buffer from `smoke_emitters_`
+    // (#136). Called from RenderFrame every frame so the parametric
+    // drift (base + velocity * t) doesn't require a CPU-side dirty
+    // flag -- the GPU sees the current sim time via the per-frame
+    // smoke_params push. Buffer is always sized to kMaxSmokeEmitters so
+    // re-uploads don't reallocate.
+    void EnsureSmokeEmittersUploaded();
     // --- SDF Phase 1 (#97) -------------------------------------------------
     // Console commands for the SDF primitive set (`sdf_sphere`,
     // `sdf_box`, `sdf_smin`, ...). Mirrors the prim_*/csg_* registration
@@ -406,6 +443,27 @@ private:
     std::uint64_t                               light_buffer_id_         = 0;
     std::uint32_t                               light_buffer_capacity_   = 0;  // lights that fit
     std::uint32_t                               light_count_uploaded_    = 0;  // lights last uploaded
+
+    // --- Fluid Phase 1 (#136) -- smoke emitters ----------------------------
+    // Density-injection plumes consumed by cloud_density_at(). Independent
+    // of `primitives_` / `light_prims_` / `sdf_prims_`. Cap kept tight
+    // (kMaxSmokeEmitters = 16) -- each emitter costs one Gaussian-falloff
+    // evaluation per march sample, and the cloud march already eats
+    // ~16 samples per pixel at 1080p, so the per-frame fluid contribution
+    // scales as N * march_samples * pixels. The GPU buffer is sized to
+    // kMaxSmokeEmitters once so re-uploads don't reallocate; runtime cvar
+    // `r_smoke_max_emitters` tightens this further. `smoke_emit` appends
+    // to the back of the vector and stamps `smoke_next_id_` for human-
+    // facing identification in the per-emit echo. `smoke_clear` empties
+    // the vector. The shader-side gate is the per-frame
+    // `r_smoke_enabled` cvar, so the empty-list dispatch is a no-op even
+    // if a buffer is bound.
+    std::vector<SmokeEmitter>                   smoke_emitters_;
+    std::uint64_t                               smoke_buffer_id_         = 0;
+    std::uint32_t                               smoke_buffer_capacity_   = 0;  // emitters that fit
+    std::uint32_t                               smoke_count_uploaded_    = 0;  // emitters last uploaded
+    std::uint32_t                               smoke_next_id_           = 1;  // monotonic id, human-readable
+    // --- end Fluid Phase 1 -------------------------------------------------
 
     // --- Voxel destruction Phase 1 (#140) ----------------------------------
     // VoxelGrids produced by `voxelize_object`, keyed by source object

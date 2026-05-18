@@ -116,9 +116,12 @@ private:
     // triangle BVH). Slot 11 was added by light primitives (#73) for
     // the analytic light list (`light_prims`, MSL slot 11; the shader
     // declares it at vk::binding(27)). Keep in sync with the engine's
-    // BindBuffer(11,...) call site.
-    BufferHandle               bound_buf_[12] {};
-    std::size_t                bound_buf_off_[12] {};
+    // BindBuffer(11,...) call site. Slot 13 was added by fluid smoke
+    // emitters (#136); the array is sized 16 to leave headroom for
+    // upcoming Phase 2+ storage buffers (advection grid, vorticity
+    // confinement) without another resize.
+    BufferHandle               bound_buf_[16] {};
+    std::size_t                bound_buf_off_[16] {};
     AccelStructHandle          bound_accel_[4] {};
 
     // Push-constant buffer. Sized to fit the unified PathTrace push

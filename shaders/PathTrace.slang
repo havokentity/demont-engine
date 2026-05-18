@@ -381,6 +381,28 @@ Texture2D<float4> moon_map;
 [[vk::binding(27, 0)]] StructuredBuffer<float4> light_prims;
 // --- end Light primitives --------------------------------------------------
 
+// --- Fluid Phase 1 (#136) -- smoke emitters --------------------------------
+// Density-injection plume list consumed by cloud_density_at() in
+// PathTraceCloud.slang. Each emitter packs into 3 float4s = 48 B:
+//
+//   v0.xyz = base position (world space, metres)
+//   v0.w   = Gaussian falloff radius (metres)
+//   v1.xyz = parametric drift velocity (m/s)
+//   v1.w   = peak additive sigma_t (per metre)
+//   v2.xyz = colour tint (multiplier on cloud RGB; 1,1,1 = neutral)
+//   v2.w   = falloff exponent on (r/radius); 2 = Gaussian-ish
+//
+// Engine bounds the iteration count to push.smoke_params.x (host clamps
+// to kMaxSmokeEmitters=16). Phase 1 has NO solver; parametric drift
+// only, no advection or pressure. See issue #136 for the staged roadmap.
+//
+// IMPORTANT: declared AFTER light_prims so Metal slot allocation lands
+// this buffer on slot 13 (one beyond slot 12 = light_prims). On Vulkan
+// the explicit vk::binding(28) is what matters; sits past the SIGMA
+// (23) / MetalFX specular (24/25/26) / light (27) reservations.
+[[vk::binding(28, 0)]] StructuredBuffer<float4> smoke_emitters;
+// --- end Fluid Phase 1 -----------------------------------------------------
+
 struct BvhNode {
     float3 aabb_min;
     uint   left_first;
@@ -728,6 +750,15 @@ cbuffer Push {
     float4 water_params0;
     float4 water_params1;
     // --- end Water Phase 1 ----------------------------------------------------
+    // --- Fluid Phase 1 (#136) -- smoke emitters -------------------------------
+    // See Engine.cpp's PtPush::smoke_params for full docs.
+    //   smoke_params.x = smoke_count (number of emitters to iterate;
+    //                     host-clamped to kMaxSmokeEmitters=16).
+    //               .y = smoke_enabled (0/1; r_smoke_enabled gate).
+    //               .z = time_seconds for parametric drift.
+    //               .w = reserved.
+    float4 smoke_params;
+    // --- end Fluid Phase 1 ----------------------------------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -810,6 +841,10 @@ cbuffer Frame {
     float4 water_params0;
     float4 water_params1;
     // --- end Water Phase 1 ----------------------------------------------------
+    // --- Fluid Phase 1 (#136) -- smoke emitters -------------------------------
+    // See `smoke_params` in the Metal Push cbuffer above.
+    float4 smoke_params;
+    // --- end Fluid Phase 1 ----------------------------------------------------
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -2282,15 +2317,86 @@ LightSample sampleAnalyticLight(float3 hit_pt, float3 n_face, inout uint seed) {
 // patterns -- the focal lensing emerges from the geometry the
 // refracted shadow ray traces, not from any fancy sampling.
 //
+// --- Fluid Phase 1 (#136) -- smoke emitters --------------------------------
+// Sums additive Gaussian-falloff density contributions from every
+// active smoke emitter at the given world-space sample point. Returns
+// 0 when smoke is disabled or no emitters are bound; otherwise
+// extinction units (per metre, same as the cloud field's sigma_t).
+//
+// Parametric drift: an emitter's "current position" at time t equals
+// base + velocity * t -- there is NO solver state (Phase 1 MVP per
+// issue #136). Phase 2 introduces an Eulerian grid for real advection.
+//
+// Falloff: density = peak * exp(-(r/radius)^falloff) -- with falloff=2
+// this is a true Gaussian; falloff=1 collapses to exp(-r/radius), a
+// steeper near-source profile; higher exponents harden the core /
+// soften the wings (useful for soot vs steam).
+//
+// Capped at 16 emitters via the kMaxSmokeEmitters constant; the host
+// further clamps via the r_smoke_max_emitters cvar. The loop is
+// `[loop]` instead of `[unroll]` because the bound is push-driven
+// (varies per dispatch); Slang's MSL backend produces tight code
+// either way at N<=16.
+float smoke_density_add(float3 pos) {
+    float smoke_on = smoke_params.y;
+    if (smoke_on <= 0.0) return 0.0;
+    int n = int(smoke_params.x);
+    if (n <= 0) return 0.0;
+    float t = smoke_params.z;
+    // Hard cap so the loop bound is a compile-time-known maximum --
+    // matches kMaxSmokeEmitters on the host. Without this the MSL
+    // backend has to assume an unbounded loop and emits a less-tight
+    // bounds check per iteration.
+    if (n > 16) n = 16;
+    float dens = 0.0;
+    [loop] for (int i = 0; i < n; ++i) {
+        float4 v0 = smoke_emitters[i * 3 + 0];
+        float4 v1 = smoke_emitters[i * 3 + 1];
+        float4 v2 = smoke_emitters[i * 3 + 2];
+        float3 base = v0.xyz;
+        float  radius = max(v0.w, 1e-3);   // guard against div-by-zero
+        float3 vel = v1.xyz;
+        float  peak = v1.w;
+        float  falloff = max(v2.w, 0.25);  // shaping; clamp to keep stable
+        // Parametric drift (Phase 1 MVP -- no advection).
+        float3 cur = base + vel * t;
+        float3 d = pos - cur;
+        float r2 = dot(d, d);
+        // Skip distant samples cheaply: at r = 4 sigmas the Gaussian
+        // weight is ~exp(-16) ~ 1e-7, negligible even at peak
+        // density 1.0. Saves the pow() / exp() pair on the dominant
+        // empty-space samples without changing the visual result.
+        float cutoff = 16.0 * radius * radius;
+        if (r2 > cutoff) continue;
+        float r = sqrt(r2);
+        float u = r / radius;
+        // Generalised "Gaussian": exp(-u^falloff). For falloff=2
+        // this is the canonical Gaussian; falloff=1 = exp(-u)
+        // (sharper near-source); higher values harden the core.
+        float w = exp(-pow(u, falloff));
+        dens += peak * w;
+    }
+    return dens;
+}
+// --- end Fluid Phase 1 -----------------------------------------------------
+
 // Optical depth through the cloud layer along [ro, ro + rd*t_max].
 // Returns 0 when clouds are off or the ray misses the layer; otherwise
 // integrates cloud_density_at across the ray-slab intersection. Used
 // by transmittance() to give clouds genuine shadow-casting behaviour:
 // any NEE shadow ray that grazes a dense cloud loses light.
 float cloud_optical_depth(float3 ro, float3 rd, float t_max) {
-    if (clouds_p1.w <= 0.0) return 0.0;
+    // Fluid Phase 1 (#136): also accumulate smoke density on the
+    // shadow path so opaque smoke blocks sunlight through to the
+    // ground, matching the primary-march visibility.
+    bool smoke_active = (smoke_params.y > 0.0) && (smoke_params.x > 0.0);
+    if (clouds_p1.w <= 0.0 && !smoke_active) return 0.0;
     float base_y = clouds_p1.x;
     float top_y  = clouds_p1.y;
+    if (clouds_p1.w <= 0.0) {
+        base_y = 0.0;
+        top_y  = 2000.0;
+    }
     float ry = rd.y;
     float t_in, t_out;
     if (abs(ry) > 1e-6) {
@@ -2322,8 +2428,13 @@ float cloud_optical_depth(float3 ro, float3 rd, float t_max) {
     [unroll] for (int i = 0; i < Ns; ++i) {
         float t = t_in + (float(i) + 0.5) * dt;
         float3 sp = ro + rd * t;
-        od += cloud_density_at(sp, clouds_p1, clouds_p2, clouds_p3,
-                               clouds_p4, 3) * dt;
+        float dens = cloud_density_at(sp, clouds_p1, clouds_p2, clouds_p3,
+                                       clouds_p4, 3);
+        // Fluid Phase 1 (#136): smoke shows up as additive density on
+        // the shadow path so a sun-NEE ray hitting a plume gets the
+        // correct Beer-Lambert dimming.
+        dens += smoke_density_add(sp);
+        od += dens * dt;
     }
     return od;
 }
@@ -2352,9 +2463,21 @@ float cloud_optical_depth(float3 ro, float3 rd, float t_max) {
 // so the two paths agree on which spans are sky vs. occlusion.
 float cloud_optical_depth_stratified(float3 ro, float3 rd, float t_max,
                                      inout uint seed) {
-    if (clouds_p1.w <= 0.0) return 0.0;
+    // Fluid Phase 1 (#136): also fire the stratified shadow march when
+    // smoke is enabled, so a NEE sun ray through a smoke plume picks
+    // up the correct Beer-Lambert occlusion. Without this, sunset
+    // rim-lighting on smoke would over-brighten -- the smoke would
+    // catch full sun even when it's directly between camera and the
+    // sun. When clouds are off but smoke is on we drop the slab to
+    // ground so smoke at chimney altitude actually gets sampled.
+    bool smoke_active = (smoke_params.y > 0.0) && (smoke_params.x > 0.0);
+    if (clouds_p1.w <= 0.0 && !smoke_active) return 0.0;
     float base_y = clouds_p1.x;
     float top_y  = clouds_p1.y;
+    if (clouds_p1.w <= 0.0) {
+        base_y = 0.0;
+        top_y  = 2000.0;
+    }
     float ry = rd.y;
     float t_in, t_out;
     if (abs(ry) > 1e-6) {
@@ -2382,7 +2505,11 @@ float cloud_optical_depth_stratified(float3 ro, float3 rd, float t_max,
         float xi = randf(seed);
         float t  = t_in + (float(i) + xi) * dt;
         float3 sp = ro + rd * t;
-        od += cloud_density_at(sp, clouds_p1, clouds_p2, clouds_p3, clouds_p4, 4) * dt;
+        float dens = cloud_density_at(sp, clouds_p1, clouds_p2, clouds_p3, clouds_p4, 4);
+        // Fluid Phase 1 (#136): smoke contributions ride the same
+        // shadow-ray transmittance so plumes self-shadow at sunset.
+        dens += smoke_density_add(sp);
+        od += dens * dt;
     }
     return od * dscale;
 }
@@ -3746,9 +3873,25 @@ void main(uint2 tid : SV_DispatchThreadID) {
             //     every lane in a warp executes the same loop iteration
             //     count -- only the early-out work inside the lane
             //     changes.
-            if (clouds_p1.w > 0.0) {
+            // Fluid Phase 1 (#136): the cloud march also drives smoke
+            // emitter rendering -- additive Gaussian density blobs
+            // composed into the same Beer-Lambert / NEE pipeline as
+            // the cloud field. When clouds are off but smoke is on we
+            // still need to march, just with the slab clipped to span
+            // the smoke layer rather than the (unset) cloud band.
+            bool smoke_active = (smoke_params.y > 0.0) && (smoke_params.x > 0.0);
+            if (clouds_p1.w > 0.0 || smoke_active) {
                 float base_y = clouds_p1.x;
                 float top_y  = clouds_p1.y;
+                // When the cloud field is off, drop the slab down to
+                // ground level so chimney / campfire-altitude smoke
+                // (typical y in [0, 50]) actually gets marched. Cap
+                // at 2 km so the per-pixel sample budget doesn't get
+                // wasted in pure-sky pixels.
+                if (clouds_p1.w <= 0.0) {
+                    base_y = 0.0;
+                    top_y  = 2000.0;
+                }
                 float ry = primary_rd.y;
                 float t_in, t_out;
                 if (abs(ry) > 1e-6) {
@@ -3858,6 +4001,14 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                                       clouds_p2, clouds_p3,
                                                       clouds_p4, 6)
                                    * vol_density_scale;
+                        // Fluid Phase 1 (#136): add density-injection
+                        // smoke contributions on top of the procedural
+                        // cloud field. Smoke shares the cloud march's
+                        // NEE, multi-scatter, and aerial-perspective
+                        // pipeline -- it just shows up as "extra
+                        // density" at this sample and gets shaded
+                        // identically to a cloud cell.
+                        dens += smoke_density_add(sp);
                         if (dens <= 0.0) {
                             // Empty cell -- transmittance does not change,
                             // no light scatters in. Skip per-light NEE for
