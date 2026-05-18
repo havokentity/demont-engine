@@ -3744,7 +3744,17 @@ void Engine::RenderFrame() {
     // non-zero. Once all are cached the resolves are no-ops.
     EnsurePipelineHandles();
     if (!device_) return;
-    if (pathtrace_pipeline_id_ == 0) {
+    // Drive the CSG bake state machine BEFORE the loading-screen check so
+    // that on frame 1 the bake gets submitted (phase 0 -> 1), the loading
+    // screen renders, and the PathTrace dispatch is NOT fired with
+    // uninitialised csg_vbuf / csg_ibuf / tri_bvh_nodes / tri_bvh_permuted_ids
+    // descriptors. On NVIDIA, dispatching with uninit mesh descriptors
+    // page-faults the GPU at the first triangle-traversal read -> TDR ->
+    // DEVICE_LOST. MoltenVK runs the same dispatch fine because Apple's
+    // memory zeroing + lax OOB handling masks the race.
+    EnsureMeshUpdated();
+    const bool mesh_pending = (bake_phase_.load(std::memory_order_acquire) != 0);
+    if (pathtrace_pipeline_id_ == 0 || mesh_pending) {
         // Loading frame. Async pipeline build still in flight, so the
         // path tracer / tonemap / overlay dispatches would all no-op
         // and leave the swapchain image in its just-acquired
@@ -3772,7 +3782,8 @@ void Engine::RenderFrame() {
         loading_frame_active_ = false;
     }
 
-    EnsureMeshUpdated();
+    // EnsureMeshUpdated() now runs earlier (above the loading-screen check)
+    // so the CSG bake state machine kicks in before the first dispatch.
     EnsurePrimitivesUploaded();
     // --- Voxel destruction Phase 1 (#140) ----------------------------------
     // Refresh the reserved-id voxel SDF clusters against the current
