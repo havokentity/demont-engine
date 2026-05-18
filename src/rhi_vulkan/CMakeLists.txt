@@ -77,10 +77,18 @@ pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/SdfPrimitives.slang)
 # Iconic-fractal DE library (Mandelbulb / Mandelbox / Apollonian).
 pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/SdfFractals.slang)
 # --- end SDF Phase 3 -------------------------------------------------------
+# --- ReSTIR DI Phase A (issue #78) ----------------------------------------
+# Shared Reservoir struct + WRS streaming primitives imported by
+# PathTrace.slang. The Restir compute kernels themselves are Metal-only
+# at MVP scope (Vulkan dispatch follow-up); we still need the module
+# for the SPIR-V PathTrace build because the candidate-generation
+# block imports it.
+pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/RestirReservoir.slang)
+# --- end ReSTIR DI Phase A ------------------------------------------------
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
     STAGE compute ENTRY main TARGETS spirv
-    MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals)
+    MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals RestirReservoir)
 # Second PathTrace SPIR-V variant without RayQuery, for backends that
 # don't expose VK_KHR_ray_query (Mac-Vulkan on pre-1.3 MoltenVK builds).
 # The two variants share the source file; PT_SPIRV_NO_RAYQUERY strips
@@ -92,7 +100,7 @@ pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
     STAGE compute ENTRY main TARGETS spirv
     VARIANT norq EXTRA_DEFINES -DPT_SPIRV_NO_RAYQUERY
-    MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals)
+    MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals RestirReservoir)
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/Tonemap.slang
     STAGE compute ENTRY main TARGETS spirv)

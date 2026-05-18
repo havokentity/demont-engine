@@ -125,8 +125,15 @@ private:
     // Engine binds it via BindBuffer(13, ...), with a placeholder-buffer
     // fallback when the tree is empty so Metal's push-slot computation
     // stays stable.
-    BufferHandle               bound_buf_[14] {};
-    std::size_t                bound_buf_off_[14] {};
+    //
+    // Issue #78 (ReSTIR DI Phase A) extends to slot 14 for the
+    // per-pixel reservoir SSBO (`reservoir_curr_buf`, MSL slot 14;
+    // vk::binding(29)). Declared AFTER light_tree so the existing
+    // slots 0..13 stay put. Array bumped to 16 to land slot 14
+    // safely AND leave one slot of headroom for the next batched
+    // feature without another bump.
+    BufferHandle               bound_buf_[16] {};
+    std::size_t                bound_buf_off_[16] {};
     AccelStructHandle          bound_accel_[4] {};
 
     // Push-constant buffer. Sized to fit the unified PathTrace push

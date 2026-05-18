@@ -43,6 +43,17 @@ extern const unsigned char shader_SigmaShadow_metal_data[];
 extern const unsigned long shader_SigmaShadow_metal_size;
 extern const unsigned char shader_ParticleComposite_metal_data[];
 extern const unsigned long shader_ParticleComposite_metal_size;
+// ReSTIR DI Phase A kernels (issue #78). Three compute kernels chained
+// behind PathTrace's WRS candidate-generation pass: temporal reuse ->
+// spatial reuse -> final shadow-test + Lambert composite into
+// denoise_color. See shaders/Restir{Temporal,Spatial,Final}.slang for
+// the algorithmic rationale + bindings.
+extern const unsigned char shader_RestirTemporal_metal_data[];
+extern const unsigned long shader_RestirTemporal_metal_size;
+extern const unsigned char shader_RestirSpatial_metal_data[];
+extern const unsigned long shader_RestirSpatial_metal_size;
+extern const unsigned char shader_RestirFinal_metal_data[];
+extern const unsigned long shader_RestirFinal_metal_size;
 }
 
 // MetalFXDenoiser.mm: ObjC++ shim around MTLFXTemporalDenoisedScaler.
@@ -352,6 +363,21 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
     build_pso("particle_composite",
               shader_ParticleComposite_metal_data,
               shader_ParticleComposite_metal_size);
+    // ReSTIR DI Phase A (#78). Dispatched in order after the path
+    // tracer's WRS-initialised reservoir write: temporal reuse,
+    // spatial reuse, final shadow-test + composite. Names mirror the
+    // resolve() calls in Engine::EnsurePipelineHandles so the engine's
+    // dispatch gates collapse to "no ReSTIR" if any of the three
+    // pipelines failed to build.
+    build_pso("restir_temporal",
+              shader_RestirTemporal_metal_data,
+              shader_RestirTemporal_metal_size);
+    build_pso("restir_spatial",
+              shader_RestirSpatial_metal_data,
+              shader_RestirSpatial_metal_size);
+    build_pso("restir_final",
+              shader_RestirFinal_metal_data,
+              shader_RestirFinal_metal_size);
 
     cmd_ = std::make_unique<MetalCommandBuffer>(this);
 }

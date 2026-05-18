@@ -597,6 +597,42 @@ private:
     // SIGMA dispatch, legacy denoiser shadow behaviour" until the
     // Vulkan compositor lands.
     std::uint64_t                               sigma_shadow_pipeline_id_ = 0;
+    // --- ReSTIR DI Phase A (issue #78) -------------------------------------
+    // Per-pixel Reservoir SSBOs for the spatiotemporal resampling chain.
+    // Three buffers form a ping-pong pipeline:
+    //   restir_reservoir_curr_buf_id_ : PathTrace writes the WRS
+    //       candidate-generation output here; RestirTemporal reads it.
+    //   restir_reservoir_prev_buf_id_ : the PREVIOUS frame's final
+    //       reservoir (the buffer that was `curr` last frame is `prev`
+    //       this frame -- we swap ids at end-of-frame).
+    //   restir_reservoir_swap_buf_id_ : scratch for the spatial pass
+    //       output (and serves as next frame's `prev`).
+    //
+    // Each buffer is `width * height * 64 B`. At 1920x1080 that's ~127
+    // MB per buffer; 3 buffers = ~380 MB. Acceptable on M4 Max's 64 GB
+    // unified memory; on dGPU this is also under the 1 GB typical
+    // VRAM budget for the path tracer.
+    //
+    // Allocated whenever `denoiser_active_` AND `r_restir` is on (same
+    // lifecycle gate as shadow_vis_buf_id_). Freed in TearDownDevice
+    // and re-created on swapchain resize -- pixel-strided buffers are
+    // tied to the framebuffer dimensions.
+    std::uint64_t                               restir_reservoir_curr_buf_id_ = 0;
+    std::uint64_t                               restir_reservoir_prev_buf_id_ = 0;
+    std::uint64_t                               restir_reservoir_swap_buf_id_ = 0;
+    // Pipeline ids for the three Restir compute kernels. Built once at
+    // device init (Metal target only at Phase A scope; Vulkan plumbing
+    // is a follow-up, matches the SigmaShadow / StarsComposite
+    // pattern). Zero on backends without these pipelines -> the
+    // dispatch gates short-circuit cleanly.
+    std::uint64_t                               restir_temporal_pipeline_id_ = 0;
+    std::uint64_t                               restir_spatial_pipeline_id_  = 0;
+    std::uint64_t                               restir_final_pipeline_id_    = 0;
+    // Tracked frame width/height we last allocated the reservoir
+    // buffers at. Mismatch -> realloc on the next frame's resize gate.
+    std::uint32_t                               restir_alloc_w_ = 0;
+    std::uint32_t                               restir_alloc_h_ = 0;
+    // --- end ReSTIR DI Phase A ---------------------------------------------
     // MetalFX specular-guidance G-buffers (issue #118). Three textures
     // fed to MTLFXTemporalDenoisedScaler so it can tell specular from
     // diffuse response; without them MetalFX produces 8x8 halos on
