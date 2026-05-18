@@ -98,6 +98,10 @@ pt_compile_slang(
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/DenoiseAtrous.slang
     STAGE compute ENTRY main TARGETS spirv)
+# Issue #119 -- SVGF albedo remodulation pass.
+pt_compile_slang(
+    TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/DenoiseRemod.slang
+    STAGE compute ENTRY main TARGETS spirv)
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/DenoiseFinalize.slang
     STAGE compute ENTRY main TARGETS spirv)

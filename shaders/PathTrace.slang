@@ -1902,15 +1902,17 @@ void main(uint2 tid : SV_DispatchThreadID) {
         if (write_normal_gbuffer != 0u) {
             normal_tex[tid] = float4(hit_normal, 0.0);
         }
-        // Albedo G-buffer: only allocated/bound by the engine when
-        // r_denoiser is optix_hdr_aov / optix_temporal_hdr_aov. The
-        // runtime `write_albedo_gbuffer` push gate is the actual
-        // run-or-skip switch -- the engine sets it to 0 on Metal
-        // (which never uses OptiX AOV anyway) and to 0 on Vulkan
-        // for non-AOV denoisers, so albedo_tex is only ever touched
-        // by the OptiX-AOV path. Vulkan tolerates the unbound slot
-        // via VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT; Metal binds
-        // a placeholder when albedo_tex_id_ is 0.
+        // Albedo G-buffer: allocated/bound by the engine for OptiX AOV
+        // variants, MetalFX (and SVGF->MetalFX chained kinds), AND --
+        // after issue #119 -- the pure SVGF/NRD kinds, which use the
+        // albedo for demodulation (divide-by-albedo into the denoiser
+        // chain, multiply back on output). The runtime
+        // `write_albedo_gbuffer` push gate is the actual run-or-skip
+        // switch -- the engine sets it to 1 whenever albedo_tex_id_
+        // is non-zero (regardless of backend). Vulkan tolerates the
+        // unbound slot for non-consumer kinds via
+        // VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT; Metal binds a
+        // placeholder when albedo_tex_id_ is 0.
         //
         // CRITICAL: keep this write code visible to ALL targets, NOT
         // wrapped in `#ifdef PT_TARGET_SPIRV`. When the write was

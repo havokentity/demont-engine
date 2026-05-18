@@ -302,6 +302,20 @@ namespace cvar {
             "only affects r_denoiser svgf_atrous / nrd (svgf_basic skips "
             "the spatial chain entirely).",
             CVAR_ARCHIVE);
+    PT_CVAR(r_svgf_albedo_demod, "1",
+            "SVGF albedo demodulation (issue #119). 1 = divide the noisy "
+            "radiance by the primary-hit albedo on input to the SVGF "
+            "chain (temporal + a-trous), denoise the lighting-only "
+            "signal so the depth/normal/luminance edge-stops aren't "
+            "fighting surface texture detail, and multiply albedo back "
+            "on the way out. 0 = legacy pre-demod path (full radiance "
+            "through the chain). Affects r_denoiser = svgf_basic / "
+            "svgf_atrous / svgf_basic_metalfx / svgf_atrous_metalfx / "
+            "nrd; non-SVGF denoisers ignore this flag. Sky pixels "
+            "(albedo = 0 sentinel) skip the divide AND the multiply-"
+            "back so emissive radiance from the path tracer's miss "
+            "shader is forwarded unchanged.",
+            CVAR_ARCHIVE);
     PT_CVAR(r_hdr_pipeline,    "1",  "Linear-HDR pipeline through MetalFX. 1 = path tracer writes raw HDR, MetalFX denoises in HDR, post-pass applies exposure+ACES (recommended). 0 = path tracer pre-applies exposure+ACES, MetalFX denoises LDR, tonemap pass is a passthrough copy. Only affects the denoiser-on path.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom,           "1",  "HDR bloom (downsample/upsample pyramid, additive composite before ACES). 0 disables; tonemap then samples a 1x1 zero buffer.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom_threshold, "1.0","Linear-HDR luminance threshold for the bloom extract. Pixels below this value contribute nothing to the pyramid; pixels above contribute proportional to (lum - threshold). The path tracer's pixels are in tonemap-relative units (sun ~30, env ~3) so a threshold of 1.0 picks up only HDR highlights.", CVAR_ARCHIVE);
@@ -3166,18 +3180,27 @@ void Engine::RenderFrame() {
          denoiser_kind_ == DenoiserKind::Nrd                 ||
          denoiser_kind_ == DenoiserKind::OptixHdrAov         ||
          denoiser_kind_ == DenoiserKind::OptixTemporalHdrAov);
-    // Albedo G-buffer: OptiX AOV variants (HdrAov + TemporalHdrAov) AND
+    // Albedo G-buffer: OptiX AOV variants (HdrAov + TemporalHdrAov),
     // MetalFX (and SVGF->MetalFX chained modes, since MetalFX is the
-    // finalizer there too). Apple's MTLFXTemporalDenoisedScaler takes
-    // diffuseAlbedoTexture as a guidance input -- providing it lets
-    // MetalFX preserve surface color edges instead of bleeding them.
-    // SVGF/NRD don't take albedo; non-AOV OptiX HDR models don't either.
+    // finalizer there too), AND the pure SVGF/NRD kinds (issue #119,
+    // for albedo demodulation -- divides noisy radiance by albedo on
+    // input to the SVGF chain, multiplies back on output, so the
+    // depth/normal/luminance edge-stops denoise the lighting signal
+    // rather than fighting texture detail).
+    // Apple's MTLFXTemporalDenoisedScaler also takes diffuseAlbedoTexture
+    // as a guidance input -- providing it lets MetalFX preserve surface
+    // color edges instead of bleeding them.
+    // Plain OptiX HDR models don't take albedo and don't run through
+    // SVGF, so they stay opted out.
     const bool want_albedo_gbuffer =
         (denoiser_kind_ == DenoiserKind::OptixHdrAov         ||
          denoiser_kind_ == DenoiserKind::OptixTemporalHdrAov ||
          denoiser_kind_ == DenoiserKind::MetalFX             ||
          denoiser_kind_ == DenoiserKind::SvgfBasicMetalFx    ||
-         denoiser_kind_ == DenoiserKind::SvgfAtrousMetalFx);
+         denoiser_kind_ == DenoiserKind::SvgfAtrousMetalFx   ||
+         denoiser_kind_ == DenoiserKind::SvgfBasic           ||
+         denoiser_kind_ == DenoiserKind::SvgfAtrous          ||
+         denoiser_kind_ == DenoiserKind::Nrd);
     // Bloom-without-denoiser path: when the user has r_bloom on but
     // no denoiser, the engine still needs `denoise_color` (as the
     // path tracer's linear-HDR output the bloom pyramid samples) and
@@ -3328,7 +3351,8 @@ void Engine::RenderFrame() {
                     .debug_name = "denoise_albedo",
                 });
                 albedo_tex_id_ = albedo_h.id;
-                LOG_INFO("engine: allocated denoise_albedo G-buffer ({}x{} RGBA16F) for OptiX AOV", fc.width, fc.height);
+                LOG_INFO("engine: allocated denoise_albedo G-buffer ({}x{} RGBA16F) "
+                         "(consumers: OptiX AOV, MetalFX, SVGF demod)", fc.width, fc.height);
             } else {
                 albedo_tex_id_ = 0;
             }
@@ -3799,10 +3823,13 @@ void Engine::RenderFrame() {
     // to whether the engine actually owns a normal G-buffer this frame.
     push.write_normal_gbuffer =
         (denoiser_active_ && normal_tex_id_ != 0) ? 1u : 0u;
-    // Same gating logic as write_normal_gbuffer. OptiX-AOV and MetalFX
-    // (and its SVGF-chained variants) take a diffuse albedo guide
+    // Same gating logic as write_normal_gbuffer. OptiX-AOV, MetalFX
+    // (and its SVGF-chained variants), AND the plain SVGF/NRD kinds
+    // (issue #119, albedo demodulation) take a diffuse albedo guide
     // layer; everything else dispatches with binding 17 unbound under
-    // partially-bound semantics.
+    // partially-bound semantics. The runtime gate keys on
+    // albedo_tex_id_ != 0, so it lights up automatically for any
+    // denoiser_kind_ that flips want_albedo_gbuffer above.
     push.write_albedo_gbuffer =
         (denoiser_active_ && albedo_tex_id_ != 0) ? 1u : 0u;
     push.env_map_present  = (env_map_tex_id_ != 0) ? 1u : 0u;
@@ -4605,6 +4632,39 @@ void Engine::RenderFrame() {
             atrous_passes_want = static_cast<std::uint32_t>(n);
         }
         dd.atrous_passes = atrous_passes_want;
+        // Issue #119 -- SVGF albedo demodulation. Cvar-driven; the
+        // backends ignore this for non-SVGF kinds and treat it as
+        // false when albedo_in_ wasn't allocated (so a transient
+        // resize race that lands an SVGF dispatch one frame before
+        // the albedo texture is ready degrades cleanly).
+        //
+        // Toggling r_svgf_albedo_demod mid-run swaps the color space
+        // the SVGF history texture stores (demod-on = lighting only,
+        // demod-off = full radiance), so we have to fire reset_history
+        // when the EFFECTIVE flag changes between frames -- otherwise
+        // the temporal blend lerps the new frame against stale history
+        // in the wrong colour space for up to the temporal window.
+        // The effective flag is the cvar AND-ed with albedo availability
+        // (the backends do the AND themselves, but we mirror it here so
+        // a resize race that drops the albedo binding for one frame
+        // doesn't fire a spurious reset). PR #150 Copilot review.
+        {
+            bool demod_on = true;       // matches CVAR default
+            if (auto* v = C.FindCVar("r_svgf_albedo_demod")) {
+                demod_on = v->GetBool();
+            }
+            dd.albedo_demod_enabled = demod_on;
+            const bool effective_demod = demod_on && (albedo_tex_id_ != 0);
+            if (effective_demod != prev_svgf_albedo_demod_active_) {
+                dd.reset_history = true;
+                LOG_INFO("engine: SVGF albedo demod toggled ({} -> {}); "
+                         "firing reset_history to clear stale {} space",
+                         prev_svgf_albedo_demod_active_ ? "on" : "off",
+                         effective_demod ? "on" : "off",
+                         prev_svgf_albedo_demod_active_ ? "demod" : "radiance");
+            }
+            prev_svgf_albedo_demod_active_ = effective_demod;
+        }
 
         // Top-level Kind: tells the backend which denoiser
         // implementation to dispatch.

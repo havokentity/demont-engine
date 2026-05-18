@@ -49,6 +49,24 @@
 [[vk::binding(9,  0)]] RWStructuredBuffer<float2> moments_history_out; // this-frame (mu1, mu2)
 [[vk::binding(10, 0)]] RWStructuredBuffer<float>  variance_in_unused;  // unread by temporal -- host binds a placeholder
 [[vk::binding(11, 0)]] RWStructuredBuffer<float>  variance_out;        // this-frame initial variance
+// Albedo G-buffer (binding 12). Issue #119: SVGF albedo demodulation.
+// On Vulkan slot 12 is bound as STORAGE_IMAGE (the underlying VkImage
+// has STORAGE_BIT only, never SAMPLED_BIT), so SPIR-V wants
+// Sampled=2 i.e. `RWTexture2D`. On Metal we keep `Texture2D` so the
+// MSL emit is `access::sample` (read-only), which sidesteps Metal's
+// 8-RW-texture compute cap -- the temporal pass already pins 8 RW
+// textures at slots 0..7 and a 9th `RWTexture2D` would trip slangc's
+// MSL output. The host binds this to the engine's albedo_tex (=
+// primary-hit surface albedo) whenever r_svgf_albedo_demod is on;
+// when off the binding is still wired so the descriptor set stays
+// well-formed, but the shader skips every divide / multiply via the
+// runtime `demod_enabled` push gate. Sky pixels (albedo == 0)
+// bypass the divide entirely and forward emissive radiance.
+#ifdef PT_TARGET_SPIRV
+[[vk::binding(12, 0)]] RWTexture2D<float4> albedo_tex;
+#else
+[[vk::binding(12, 0)]] Texture2D<float4>   albedo_tex;
+#endif
 
 [[vk::push_constant]]
 cbuffer Push {
@@ -60,7 +78,64 @@ cbuffer Push {
     float normal_tolerance;
     float min_alpha;
     float _pad1;
+    // Issue #119 -- albedo demodulation gate. 1 = divide color samples
+    // by albedo on input (keeps the temporal pass operating on the
+    // "lighting only" signal, which is what SVGF's edge-stops were
+    // designed to denoise -- texture detail flows through the chain
+    // demodulated and gets restored at the final output stage). 0 =
+    // legacy pre-demod behaviour (full radiance through the chain;
+    // albedo binding still bound but never read). MVP keeps the
+    // demodulated signal demodulated all the way to the OUTPUT write;
+    // the engine adds a separate remod kernel after this pass for
+    // svgf_basic, and the atrous chain remod's on its final pass.
+    uint  demod_enabled;
+    uint  _pad2;
+    uint  _pad3;
+    uint  _pad4;
 };
+
+// Floor on the per-channel albedo divisor. Picked so that:
+//   - Near-black surfaces (5% reflectance) keep their lighting in a
+//     numerically reasonable range without ballooning the variance
+//     denominator past what the A-Trous luminance gate expects.
+// SVGF papers typically use 1e-2 to 1e-3; we use 1e-2 which trades a
+// touch of low-reflectance fidelity for stability on the running
+// variance. Note: sky pixels (albedo == 0 sentinel) bypass demod
+// entirely; see `isSkyAlbedo` below.
+static const float kDemodEps = 0.01;
+
+// Pixels with this much total albedo or less are treated as "no
+// surface" (sky / miss). The path tracer writes float3(0) into
+// albedo_tex at primary miss, so the cutoff just needs to be larger
+// than fp16 zero noise but smaller than any plausible material
+// albedo (PBR diffuse materials are clamped to >= 0.04 by physical
+// constraint).
+static const float kAlbedoSkyEps = 1.0 / 65536.0;
+
+bool isSkyAlbedo(float3 a) {
+    return (a.r + a.g + a.b) <= kAlbedoSkyEps;
+}
+
+// Read color_in[p] in (optionally) demodulated space. When demod is
+// on, divides by max(albedo_tex[p], kDemodEps) per channel so the
+// temporal blend operates on incident lighting rather than reflected
+// radiance. Sky pixels (albedo == 0) bypass demod -- the path
+// tracer's sky / celestials terms are emissive radiance, not
+// reflected radiance, so dividing by anything would corrupt the
+// signal and the remod multiply (by 0) would zero the sky entirely.
+// Returning color_in[p].rgb unchanged for those pixels keeps the
+// final remod a no-op for them: the matching multiply-back site
+// also bypasses sky pixels.
+float3 readDemodColor(uint2 p) {
+    float3 c = color_in[uint2(p)].rgb;
+    if (demod_enabled != 0u) {
+        float3 a = albedo_tex[uint2(p)].rgb;
+        if (!isSkyAlbedo(a)) {
+            c /= max(a, float3(kDemodEps, kDemodEps, kDemodEps));
+        }
+    }
+    return c;
+}
 
 float luminance(float3 c) {
     return dot(c, float3(0.2126, 0.7152, 0.0722));
@@ -124,7 +199,11 @@ ReprojSample sampleHistory(float2 prev_pos, float curr_depth, float3 curr_normal
 
 // 7x7 spatial luminance variance estimate. Used to seed the variance
 // channel for pixels with too-few temporal samples to trust mu2 - mu1^2
-// (Schied 2017 section 4.3). All taps are clamped in-bounds.
+// (Schied 2017 section 4.3). All taps are clamped in-bounds. Reads
+// the demodulated signal when `demod_enabled` is set so the variance
+// represents lighting variance, not material-color variance (the
+// latter would dominate the gate at multi-coloured texture boundaries
+// and re-introduce the bleed demod is supposed to eliminate).
 float spatialVariance(uint2 tid) {
     float sum  = 0.0;
     float sum2 = 0.0;
@@ -133,7 +212,7 @@ float spatialVariance(uint2 tid) {
         [unroll] for (int dx = -3; dx <= 3; ++dx) {
             int2 p = int2(tid) + int2(dx, dy);
             if (p.x < 0 || p.y < 0 || p.x >= int(width) || p.y >= int(height)) continue;
-            float l = luminance(color_in[uint2(p)].rgb);
+            float l = luminance(readDemodColor(uint2(p)));
             sum  += l;
             sum2 += l * l;
             n    += 1.0;
@@ -150,17 +229,26 @@ float spatialVariance(uint2 tid) {
 void main(uint2 tid : SV_DispatchThreadID) {
     if (tid.x >= width || tid.y >= height) return;
 
-    float4 noisy      = color_in[tid];
+    // Read noisy radiance in (optionally) demodulated space. With
+    // demod on, `noisy_rgb` is the divided-by-albedo "incident
+    // lighting" estimate; everything downstream (history blend, moment
+    // update, variance) operates on this signal. The multiply-back to
+    // restore textured radiance happens in a separate remod kernel
+    // (svgf_basic) or the final A-Trous pass (svgf_atrous).
+    float3 noisy_rgb  = readDemodColor(tid);
     float  curr_depth = depth_tex[tid];
     float3 curr_n     = normal_tex[tid].xyz;
-    float  l_now      = luminance(noisy.rgb);
+    float  l_now      = luminance(noisy_rgb);
 
-    // Hard reset path: stamp the noisy color, seed moments at (l_now,
-    // l_now^2) so initial variance is 0 (1-sample regions defer to the
-    // spatial variance fallback below regardless), and write a fresh
-    // variance derived purely from the 7x7 spatial neighborhood.
+    // Hard reset path: stamp the noisy (demodulated) color, seed
+    // moments at (l_now, l_now^2) so initial variance is 0 (1-sample
+    // regions defer to the spatial variance fallback below regardless),
+    // and write a fresh variance derived purely from the 7x7 spatial
+    // neighborhood. The output stays in demod space -- the remod
+    // kernel (or final A-Trous pass) multiplies albedo back on the
+    // way to `output`.
     if (reset_history != 0u) {
-        color_out[tid]                       = float4(noisy.rgb, 1.0);
+        color_out[tid]                       = float4(noisy_rgb, 1.0);
         moments_history_out[pixelIndex(tid)] = float2(l_now, l_now * l_now);
         variance_out[pixelIndex(tid)]        = spatialVariance(tid);
         return;
@@ -182,7 +270,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
     if (!h.valid) {
         // Disocclusion: drop history. Spatial variance carries us until
         // the temporal moments stabilise over the next ~4 frames.
-        color_out[tid]                       = float4(noisy.rgb, 1.0);
+        color_out[tid]                       = float4(noisy_rgb, 1.0);
         moments_history_out[pixelIndex(tid)] = float2(l_now, l_now * l_now);
         variance_out[pixelIndex(tid)]        = spatialVariance(tid);
         return;
@@ -191,18 +279,24 @@ void main(uint2 tid : SV_DispatchThreadID) {
     // Adaptive alpha: 1/(N+1) for the first few samples after reset,
     // then min_alpha steady-state. Same blend factor drives color and
     // moments so they stay in lockstep (a desynced mu1/color would
-    // corrupt variance).
+    // corrupt variance). Both history and current frame are in the
+    // demodulated signal space when demod is on -- the divide happens
+    // at every shader entry into the chain so the cross-frame blend
+    // composes correctly.
     float n     = clamp(h.color.a, 1.0, 32.0);
     float alpha = max(min_alpha, 1.0 / (n + 1.0));
 
-    float3 blended_color = lerp(h.color.rgb, noisy.rgb, alpha);
+    float3 blended_color = lerp(h.color.rgb, noisy_rgb, alpha);
     float2 blended_mom   = lerp(h.moments,
                                 float2(l_now, l_now * l_now),
                                 alpha);
 
     // NaN/Inf shielding -- HDR fireflies must not poison the long-running
-    // mean / second moment.
-    if (any(isnan(blended_color)) || any(isinf(blended_color))) blended_color = noisy.rgb;
+    // mean / second moment. Demodulation can blow up to ~100x the input
+    // on near-black albedo (1/eps = 100 with kDemodEps = 0.01), so this
+    // gate is more load-bearing under demod than it was under straight
+    // radiance.
+    if (any(isnan(blended_color)) || any(isinf(blended_color))) blended_color = noisy_rgb;
     if (any(isnan(blended_mom))   || any(isinf(blended_mom)))   blended_mom   = float2(l_now, l_now * l_now);
 
     float new_count = min(n + 1.0, 32.0);
