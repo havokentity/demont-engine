@@ -4008,17 +4008,21 @@ void Engine::RenderFrame() {
     //                             would crash without it.
     //   - depth_tex_id_ != 0   : composite reads this texture for the
     //                             sky-pixel gate.
+    // sky_mode_int is shared by both the celestials-composite gate
+    // (below) and the SIGMA shadow-demod gate further down -- both
+    // semantically require procedural-sky mode, so resolve r_sky_mode
+    // once and reuse to keep the two gates in sync.
+    int sky_mode_int = 2;
+    if (auto* v = C.FindCVar("r_sky_mode")) {
+        const std::string& m = v->value;
+        sky_mode_int = (m == "procedural") ? 2
+                     : (m == "hdri")       ? 1
+                                           : 0;
+    }
     bool engine_composite_active = false;
     {
         bool star_split_on = true;
         if (auto* v = C.FindCVar("r_star_split")) star_split_on = v->GetBool();
-        int  sky_mode_int = 2;
-        if (auto* v = C.FindCVar("r_sky_mode")) {
-            const std::string& m = v->value;
-            sky_mode_int = (m == "procedural") ? 2
-                         : (m == "hdri")       ? 1
-                                               : 0;
-        }
         engine_composite_active =
             denoiser_active_ &&
             star_split_on &&
@@ -4038,6 +4042,23 @@ void Engine::RenderFrame() {
     //                                        legacy 1-spp path already
     //                                        produces sharp shadows.
     //   - r_shadow_demod on               : user opted in.
+    //   - sky_mode_int == 2 (procedural)  : the visibility we trace is
+    //                                        toward sun_and_mode.xyz, and
+    //                                        only the procedural-sun
+    //                                        lighting path actually uses
+    //                                        that direction. In HDRI mode
+    //                                        the Lambert NEE samples
+    //                                        extracted HDRI clusters
+    //                                        (sampleHdriLight) and never
+    //                                        casts toward sun_and_mode --
+    //                                        demodulating those scenes by
+    //                                        the procedural-sun visibility
+    //                                        incorrectly darkens HDRI
+    //                                        rendering. Gradient mode (0)
+    //                                        has no NEE at all. HDRI/
+    //                                        extracted-light demodulation
+    //                                        is explicitly out of scope
+    //                                        for this PR -- see issue #115.
     //   - sigma_shadow_pipeline_id_ != 0  : Metal-only today; on
     //                                        Vulkan this stays zero so
     //                                        the gate collapses to "no
@@ -4059,6 +4080,7 @@ void Engine::RenderFrame() {
         const bool engine_shadow_demod_active =
             denoiser_active_ &&
             shadow_demod_on &&
+            (sky_mode_int == 2) &&
             sigma_shadow_pipeline_id_ != 0 &&
             shadow_vis_buf_id_ != 0 &&
             depth_tex_id_ != 0;
