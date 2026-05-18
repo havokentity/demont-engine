@@ -7,6 +7,7 @@ add_library(pt_renderer STATIC
     Csg/CsgScene.cpp
     GltfImporter.cpp
     HdrImage.cpp
+    LightTree.cpp
     MoonTexture.cpp
     TriangleBvh.cpp
 )

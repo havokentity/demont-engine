@@ -74,10 +74,12 @@ private:
     // on PathTrace was already saturated). Keep this in sync with
     // kSlotToBufBinding[] in VulkanDevice.cpp.
     // the triangle BVH), and slot 11 added by light primitives (#73)
-    // for the analytic light list (vk::binding 27). Keep this in sync
-    // with kSlotToBufBinding[] in VulkanDevice.cpp.
-    BufferHandle   bound_buf_[12] {};
-    std::size_t    bound_buf_off_[12] {};
+    // for the analytic light list (vk::binding 27). Slot 13 added by
+    // the hierarchical light tree (#129) for the packed-node SSBO at
+    // vk::binding(28); engine slot 12 is reserved for future use.
+    // Keep this in sync with kSlotToBufBinding[] in VulkanDevice.cpp.
+    BufferHandle   bound_buf_[14] {};
+    std::size_t    bound_buf_off_[14] {};
     AccelStructHandle bound_accel_[4] {};
     // Push-constant staging. Sized to fit the full PtPush (~448B today)
     // plus growth headroom so the engine can keep treating push as one

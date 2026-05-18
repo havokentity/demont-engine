@@ -145,7 +145,7 @@ constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     25, // engine slot 12 -> shader binding 25 (roughness_tex, #118)
     26, // engine slot 13 -> shader binding 26 (specular_hit_distance_tex, #118)
 };
-constexpr std::uint32_t kSlotToBufBinding[13] = {
+constexpr std::uint32_t kSlotToBufBinding[14] = {
     0,  // engine slot 0 unused
     3,  // engine slot 1 -> shader binding 3  (mesh_positions)
     4,  // engine slot 2 -> shader binding 4  (mesh_indices)
@@ -172,6 +172,12 @@ constexpr std::uint32_t kSlotToBufBinding[13] = {
     // on the integration branch (declared before light_prims in the
     // shader so the MSL slot also lands one higher).
     27, // engine slot 12 -> shader binding 27 (light_prims)
+    // Hierarchical light tree (#129): packed-node SSBO consumed by
+    // PathTrace.slang's O(log N) NEE picker. Declared AFTER
+    // light_prims in the shader so MSL lands on slot 13; explicit
+    // vk::binding(28) is what matters on SPIR-V (past the MetalFX
+    // specular trio at 24..26 and the light_prims slot at 27).
+    28, // engine slot 13 -> shader binding 28 (light_tree_nodes)
 };
 // Scene TLAS lives at engine accel-slot 2 -> shader binding 2.
 
@@ -1103,6 +1109,16 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         add_binding(25, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
         add_binding(26, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
         // --- end MetalFX specular guidance --------------------------
+        // --- Light tree (#129) -------------------------------------
+        // Binding 28: hierarchical light-tree packed-node SSBO.
+        // 4 float4s per node (LightTreeNode in renderer/LightTree.h).
+        // PathTrace.slang's NEE picker walks this top-down for O(log N)
+        // light selection when push.light_count > 0 AND r_light_tree=1;
+        // engine binds the placeholder storage buffer when the tree is
+        // empty (no lights or cvar=0 with stale data) so the descriptor
+        // set stays complete.
+        add_binding(28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        // --- end Light tree ----------------------------------------
 
         // UPDATE_AFTER_BIND for every binding so we can rewrite the
         // shared descriptor set between dispatches in the same cmd

@@ -28,6 +28,7 @@
 #include "../renderer/Csg/CsgScene.h"
 #include "../renderer/GltfImporter.h"
 #include "../renderer/HdrImage.h"
+#include "../renderer/LightTree.h"
 #include "../renderer/MeshGen.h"
 #include "../effects/ParticleSystem.h"
 #include "../physics/PhysicsSystem.h"
@@ -561,6 +562,21 @@ namespace cvar {
             "and dielectric paths are left on their existing code paths "
             "either way.",
             CVAR_ARCHIVE);
+    // --- Light tree (#129) ----------------------------------------------------
+    PT_CVAR(r_light_tree,      "1",
+            "Hierarchical light tree (Conty Estevez & Kulla 2018) for "
+            "O(log N) NEE light selection. 1 = traverse the tree to pick "
+            "lights weighted by combined cluster importance (intensity * "
+            "geometric falloff * emission-cone cosine); 2x-10x variance "
+            "reduction at 1 spp for scenes with >100 lights. 0 = fall back "
+            "to #73's naive uniform single-pick (regression-protection "
+            "toggle; statistically equivalent to the tree at very low light "
+            "counts, but much higher variance at high counts). The tree "
+            "itself is always built and uploaded; this cvar only flips the "
+            "shader-side picker between tree-traversal and uniform-pick, "
+            "so the runtime cost of toggling is zero.",
+            CVAR_ARCHIVE);
+    // --- end Light tree -------------------------------------------------------
     PT_CVAR(r_hdri_extract_percentile, "0.005",
             "Top-luminance percentile threshold (0..0.5) for HDRI light "
             "cluster extraction. Pixels above this percentile are flood-"
@@ -1554,6 +1570,9 @@ void Engine::TearDownDevice() {
         // --- Light primitives (#73) --------------------------------------------
         if (light_buffer_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{light_buffer_id_});
         // --- end Light primitives ----------------------------------------------
+        // --- Light tree (#129) -------------------------------------------------
+        if (light_tree_buffer_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{light_tree_buffer_id_});
+        // --- end Light tree ----------------------------------------------------
         if (denoise_color_tex_id_    != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
         if (depth_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
         if (motion_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
@@ -1614,6 +1633,14 @@ void Engine::TearDownDevice() {
     light_count_uploaded_  = 0;
     light_prims_dirty_     = true;        // re-upload on next device
     // --- end Light primitives ----------------------------------------------
+    // --- Light tree (#129) -------------------------------------------------
+    light_tree_buffer_id_           = 0;
+    light_tree_buffer_capacity_     = 0;
+    light_tree_node_count_uploaded_ = 0;
+    // light_prims_dirty_ above is the shared rebuild edge -- when the
+    // backend comes back up the next frame, both EnsureLightsUploaded
+    // and EnsureLightTreeUploaded fire from that flag.
+    // --- end Light tree ----------------------------------------------------
     denoise_color_tex_id_    = 0;
     depth_tex_id_            = 0;
     motion_tex_id_           = 0;
@@ -3407,6 +3434,107 @@ void Engine::EnsureLightsUploaded() {
 }
 // --- end Light primitives --------------------------------------------------
 
+// --- Light tree (#129) -----------------------------------------------------
+// Build the hierarchical light tree (Conty Estevez & Kulla 2018) from
+// the analytic light list, pack it into a flat GPU SSBO at engine slot
+// 13 / vk::binding(28), and stamp light_tree_node_count_uploaded_ so
+// the dispatch path knows whether to enable tree traversal. Called by
+// RenderFrame on the same light_prims_dirty_ edge that triggers the
+// light-list re-upload above (one rebuild per light-set mutation;
+// static-light MVP scope).
+//
+// Empty light set -> node_count = 0; binding falls back to the
+// placeholder buffer at the dispatch site for Metal-push-slot stability.
+// The shader's `light_tree_node_count > 0` push gate is the runtime
+// "actually traverse" switch -- same partial-binding pattern as
+// shadow_vis_buf / light_prims.
+void Engine::EnsureLightTreeUploaded() {
+    if (!device_) return;
+    if (!light_prims_dirty_) return;   // hook keyed off the same edge
+
+    // Snapshot the light list in upload order. Engine::EnsureLightsUploaded
+    // (above) packs lights into the GPU buffer in std::map iteration
+    // order (id-sorted); the tree's leaf left_first values index into
+    // that same packed array, so we MUST mirror that ordering exactly.
+    std::vector<pt::renderer::LightInput> inputs;
+    inputs.reserve(light_prims_.size());
+    for (const auto& [id, L] : light_prims_) {
+        pt::renderer::LightInput li;
+        li.type = static_cast<std::uint32_t>(L.type);
+        for (int i = 0; i < 3; ++i) {
+            li.pos[i]       = L.pos[i];
+            li.intensity[i] = L.intensity[i];
+            li.dir[i]       = L.dir[i];
+            li.u_vec[i]     = L.u_vec[i];
+        }
+        li.radius    = L.radius;
+        li.cos_outer = L.cos_outer;
+        li.v_half    = L.v_half;
+        inputs.push_back(li);
+    }
+
+    pt::renderer::LightTree tree;
+    pt::renderer::BuildLightTree(inputs, tree);
+
+    const std::uint32_t node_count =
+        static_cast<std::uint32_t>(tree.nodes.size());
+
+    // Grow the GPU node buffer (powers of two from a 32-node floor;
+    // 16-light scene yields 31 nodes -- 32 is the smallest p2 that
+    // fits without an immediate resize). Capacity is in NODES; each
+    // node is 64 bytes (sizeof(LightTreeNode) -- 4 float4s).
+    constexpr std::uint32_t kBytesPerNode = sizeof(pt::renderer::LightTreeNode);
+    if (node_count > light_tree_buffer_capacity_) {
+        std::uint32_t new_cap = light_tree_buffer_capacity_
+                                  ? light_tree_buffer_capacity_
+                                  : 32u;
+        while (new_cap < node_count) new_cap *= 2u;
+        if (light_tree_buffer_id_ != 0) {
+            device_->WaitIdle();
+            device_->DestroyBuffer(
+                pt::rhi::BufferHandle{light_tree_buffer_id_});
+            light_tree_buffer_id_ = 0;
+        }
+        auto buf = device_->CreateBuffer({
+            .size       = std::size_t(new_cap) * kBytesPerNode,
+            .usage      = pt::rhi::BufferUsage::Storage,
+            .debug_name = "light_tree_nodes",
+        });
+        if (buf.id == 0) {
+            LOG_ERROR("light tree buffer allocation failed (capacity {})",
+                       new_cap);
+            return;
+        }
+        light_tree_buffer_id_       = buf.id;
+        light_tree_buffer_capacity_ = new_cap;
+    }
+
+    if (node_count == 0) {
+        light_tree_node_count_uploaded_ = 0;
+        // light_prims_dirty_ is cleared by EnsureLightsUploaded; nothing
+        // else to do for an empty tree.
+        return;
+    }
+
+    // Upload the packed-node array. Allocate to FULL capacity (trailing
+    // unused nodes zero-init) so the shader's bounds check against
+    // node_count is the only thing that matters.
+    std::vector<pt::renderer::LightTreeNode> packed(
+        light_tree_buffer_capacity_);
+    for (std::uint32_t i = 0; i < node_count; ++i) {
+        packed[i] = tree.nodes[i];
+    }
+    device_->WriteBuffer(
+        pt::rhi::BufferHandle{light_tree_buffer_id_},
+        packed.data(),
+        std::size_t(light_tree_buffer_capacity_) * kBytesPerNode);
+
+    light_tree_node_count_uploaded_ = node_count;
+    LOG_INFO("[light_tree] built tree -- {} lights, {} nodes",
+             tree.light_count, node_count);
+}
+// --- end Light tree --------------------------------------------------------
+
 void Engine::EnsurePipelineHandles() {
     if (!device_) return;
     auto resolve = [&](std::uint64_t& cached, const char* name) {
@@ -3488,7 +3616,12 @@ void Engine::RenderFrame() {
     // --- SDF Phase 1 (#97) -------------------------------------------------
     EnsureSdfPrimsUploaded();
     // --- end SDF Phase 1 ---------------------------------------------------
-    // --- Light primitives (#73) --------------------------------------------
+    // --- Light primitives (#73) + Light tree (#129) ------------------------
+    // Order: tree BEFORE the list, because the tree's "should I rebuild?"
+    // edge is the same `light_prims_dirty_` flag that EnsureLightsUploaded
+    // clears once it's done. The build itself just reads light_prims_;
+    // both ensures consume the same snapshot.
+    EnsureLightTreeUploaded();
     EnsureLightsUploaded();
     // --- end Light primitives ----------------------------------------------
 
@@ -4263,6 +4396,19 @@ void Engine::RenderFrame() {
         : pt::rhi::BufferHandle{placeholder_storage_id_};
     if (slot12.id != 0) cb->BindBuffer(12, slot12, 0);
     // --- end Light primitives ----------------------------------------------
+    // --- Light tree (#129) -------------------------------------------------
+    // Hierarchical light tree at engine slot 13 (MSL slot 13;
+    // vk::binding(28, 0)). Declared AFTER light_prims in PathTrace.slang
+    // so MSL lands one slot higher. The shader gates traversal on
+    // push.light_tree_node_count > 0 AND r_light_tree=1; binding still
+    // has to resolve to a real buffer for Metal's push-slot computation
+    // (same lesson slot11/slot12 fallbacks capture). Falls back to the
+    // always-present placeholder storage buffer when no tree is built.
+    pt::rhi::BufferHandle slot13 = (light_tree_buffer_id_ != 0)
+        ? pt::rhi::BufferHandle{light_tree_buffer_id_}
+        : pt::rhi::BufferHandle{placeholder_storage_id_};
+    if (slot13.id != 0) cb->BindBuffer(13, slot13, 0);
+    // --- end Light tree ----------------------------------------------------
     // Engine slots 11/12/13 -> vk::bindings 24/25/26: the MetalFX
     // specular-guidance trio (issue #118). Path tracer writes them
     // alongside the existing G-buffers when the write_specular_*_gbuffer
@@ -4546,10 +4692,28 @@ void Engine::RenderFrame() {
         float vol_phase_g_cloud;
         float vol_multiscatter_oct;
         float _pad_vol;
-        // --- Light primitives (#73) ----------------------------------------
+        // --- Light primitives (#73) + Light tree (#129) --------------------
+        // light_count: number of analytic light primitives in the
+        // `light_prims` storage buffer this dispatch. 0 disables the
+        // Lambert NEE-to-lights branch entirely.
+        // light_tree_node_count: number of nodes in the hierarchical
+        // light tree SSBO at binding 28. 0 -> shader falls back to
+        // #73's naive uniform pick. Set to 0 when the r_light_tree
+        // cvar is off too, so the cvar acts as a runtime kill switch
+        // without rebuilding shaders or reuploading the tree buffer.
+        // light_tree_enabled: explicit boolean for the shader's
+        // traversal branch; kept separate from node_count so a
+        // future variant can pass a non-zero node_count with the
+        // traversal still gated (e.g. for diagnostics).
+        // Trailing 1 uint pad keeps the block 16-byte aligned for
+        // the std140 / MSL cbuffer rule. Mirrors PathTrace.slang's
+        // matching trailing block in both the Metal Push cbuffer and
+        // the SPIR-V Frame UBO.
         std::uint32_t light_count;
-        std::uint32_t _pad_light_tail[3];
-        // --- end Light primitives ------------------------------------------
+        std::uint32_t light_tree_node_count;
+        std::uint32_t light_tree_enabled;
+        std::uint32_t _pad_light_tail;
+        // --- end Light primitives + Light tree -----------------------------
         // MetalFX specular-guidance G-buffer write gates (issue #118).
         std::uint32_t write_specular_albedo_gbuffer;
         std::uint32_t write_roughness_gbuffer;
@@ -4804,7 +4968,18 @@ void Engine::RenderFrame() {
     // gate; 0 disables it (the binding still resolves to a placeholder
     // buffer for slot stability -- see slot12 above).
     push.light_count = light_count_uploaded_;
-    for (auto& v : push._pad_light_tail) v = 0u;
+    // Light tree (#129). r_light_tree cvar acts as a runtime kill
+    // switch (default 1; set to 0 for the naive uniform-pick fallback,
+    // useful for variance-regression comparison and for fixtures that
+    // exercise the original #73 sampler).
+    bool light_tree_on = true;
+    if (auto* v = C.FindCVar("r_light_tree")) light_tree_on = (v->GetInt() != 0);
+    push.light_tree_node_count = light_tree_on
+        ? light_tree_node_count_uploaded_
+        : 0u;
+    push.light_tree_enabled = (light_tree_on &&
+                                light_tree_node_count_uploaded_ > 0u) ? 1u : 0u;
+    push._pad_light_tail = 0u;
 
     // Halton(2,3) sub-pixel jitter sequence in [-0.5, 0.5] each axis.
     // 16-sample period before repeating; ample for the denoiser's
@@ -5373,6 +5548,17 @@ void Engine::RenderFrame() {
                   "PtPush::water_params1 must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     // --- end Water Phase 1 ---------------------------------------------------
+    // --- Light tree (#129) -------------------------------------------------
+    // light_count is the start of the light primitives + light tree
+    // 16-byte block (light_count + light_tree_node_count +
+    // light_tree_enabled + _pad_light_tail = 4 uints). Anchor it at a
+    // 16-byte boundary so the shader-side cbuffer layout doesn't shift
+    // the light_tree_* fields past where the host writes them. Same
+    // class of bug `_pad_before_accum_params` captures upstream.
+    static_assert(offsetof(PtPush, light_count) % 16 == 0,
+                  "PtPush::light_count must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    // --- end Light tree ----------------------------------------------------
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
 
@@ -9077,6 +9263,13 @@ void Engine::RegisterCommands() {
     // must invalidate accum_hdr so we don't blend pre- and post-toggle
     // samples together (same precedent as r_env_intensity above).
     if (auto* v = C.FindCVar("r_mis")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    // r_light_tree (#129) flips between tree-traversal and uniform-pick.
+    // Same accumulator-reset reasoning as r_mis above -- pre- and
+    // post-toggle samples come from different estimators and shouldn't
+    // be averaged together.
+    if (auto* v = C.FindCVar("r_light_tree")) {
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
     // r_analytic_bvh_threshold changes the linear/BVH split decision;
