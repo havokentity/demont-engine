@@ -179,6 +179,12 @@ private:
     // up the new positions. No-op when `phys_enabled = 0` or no
     // particles exist.
     void StepPhysics(float dt);
+    // Issue #181 -- restore cached pre-viz albedos when the user
+    // toggles r_phys_debug_visualize from 1 back to 0. Lives outside
+    // StepPhysics so the restore runs even when physics is idle
+    // (phys_enabled=0, no live bodies, frame dt non-positive); called
+    // from Tick BEFORE StepPhysics every frame.
+    void MaybeRestorePhysDebugColors();
     // --- end Physics Phase 1 ----------------------------------------------
     // Console commands for the analytic light primitive set (#73):
     // `light_point`, `light_spot`, `light_sphere`, `light_quad`, plus

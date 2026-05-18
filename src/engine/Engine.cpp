@@ -1183,22 +1183,30 @@ namespace cvar {
     // albedo for any sphere driven by the physics layer, colouring it
     // by linear-speed magnitude. Pure debug aid; intentionally NOT
     // archived so it never persists into a normal session. Mapping is
-    // a 3-stop linear ramp in linear-RGB:
-    //   0   m/s -> blue   (0.10, 0.30, 1.00)
-    //   5   m/s -> green  (0.20, 1.00, 0.30)
-    //   10+ m/s -> red    (1.00, 0.20, 0.20)
-    // 10 m/s is the practical ceiling under -9.81 gravity + 0.99
-    // damping per substep on the default 1 m drop fixtures (terminal
-    // velocity in the damped Verlet is ~10 m/s, anything beyond is
-    // saturated). When the cvar transitions 1 -> 0 the engine restores
-    // each overridden prim's original albedo from its per-prim cache,
-    // so toggling the viz on/off is non-destructive even mid-flight.
+    // a 3-stop linear ramp in linear-RGB, calibrated to the default
+    // damped Verlet integrator's implicit-velocity range:
+    //   0 m/s  -> blue   (0.10, 0.30, 1.00)
+    //   1 m/s  -> green  (0.20, 1.00, 0.30)
+    //   2+ m/s -> red    (1.00, 0.20, 0.20)
+    // 2 m/s is the practical terminal speed under default (g=-9.81,
+    // phys_substeps=8, phys_damping=0.99, 60 fps): the implicit-velocity
+    // Verlet caps at |g| * sdt / (1-damping) ~= 2.04 m/s. Users who
+    // raise phys_damping closer to 1.0 (or hit it with Phase 2b+
+    // external impulses) will see saturated red past 2 m/s -- read as
+    // "moving as fast as the system permits". When the cvar transitions
+    // 1 -> 0 the engine restores each overridden prim's original albedo
+    // from its per-prim cache, so toggling the viz on/off is non-
+    // destructive even mid-flight.
     PT_CVAR(r_phys_debug_visualize, "0",
             "Debug: when 1, every analytic-prim sphere driven by the "
             "physics layer (particles + rigid bodies) has its albedo "
             "overridden per frame to encode linear speed magnitude on "
-            "a blue->green->red ramp (0 m/s = blue, 5 m/s = green, "
-            "10+ m/s = red, linearly interpolated between the stops). "
+            "a blue->green->red ramp (0 m/s = blue, 1 m/s = green, "
+            "2+ m/s = red, linearly interpolated between the stops). "
+            "The 2 m/s saturation matches the implicit-velocity Verlet "
+            "terminal speed under default settings (|g| * sdt / "
+            "(1-damping) ~= 2.04 m/s at -9.81 gravity, 8 substeps, "
+            "0.99 damping, 60 fps); bodies stay saturated above that. "
             "Original albedos are cached on first override and restored "
             "when the cvar transitions back to 0 so toggling is non-"
             "destructive. Useful for verifying Phase 1/2a rigid-body "
@@ -8610,6 +8618,12 @@ void Engine::Tick(double dt) {
         particles_->TickAsync(static_cast<float>(dt));
     }
 
+    // r_phys_debug_visualize 1 -> 0 restoration (#181). Runs BEFORE
+    // StepPhysics so the restore fires unconditionally on every Tick,
+    // even when physics is idle and StepPhysics' early returns would
+    // otherwise swallow the falling edge.
+    MaybeRestorePhysDebugColors();
+
     // Physics step (#132): runs after UpdateCamera and before RenderFrame
     // so the per-frame writeback into `primitives_` lands before
     // EnsurePrimitivesUploaded re-packs the analytic-prim buffer +
@@ -11156,9 +11170,11 @@ void Engine::RegisterCommands() {
     // as r_bloom / r_hdr_pipeline (`allowed_values` so tab-completion
     // and the cvar UI treat it as a toggle, rejecting arbitrary
     // numeric values that would otherwise be silently accepted).
+    // r_phys_debug_visualize (#181) is the velocity-magnitude debug
+    // overlay; same on/off semantics, same toggle contract.
     for (const char* n : {"app_vsync", "app_overlay_enabled",
                           "app_auto_open_console", "dev_cheats",
-                          "phys_enabled"}) {
+                          "phys_enabled", "r_phys_debug_visualize"}) {
         if (auto* v = C.FindCVar(n)) v->allowed_values = {"0", "1"};
     }
 
@@ -13109,6 +13125,35 @@ void Engine::RegisterPhysicsCommands() {
         });
 }
 
+void Engine::MaybeRestorePhysDebugColors() {
+    // Issue #181 -- the r_phys_debug_visualize 1 -> 0 falling-edge
+    // restore. Called from Tick BEFORE StepPhysics every frame, so the
+    // restore runs even when StepPhysics' early returns kick in
+    // (physics_ null, no live bodies, phys_enabled=0, frame dt non-
+    // positive). Without this hoist, turning the cvar off while the
+    // simulation was idle would leave the debug-coloured spheres
+    // visible indefinitely until physics started stepping again.
+    auto& C = pt::console::Console::Get();
+    int viz_mode = 0;
+    if (auto* v = C.FindCVar("r_phys_debug_visualize")) viz_mode = v->GetInt();
+
+    if (phys_debug_visualize_prev_ != 0 && viz_mode == 0
+        && !phys_debug_color_cache_.empty()) {
+        for (auto& [prim_id, orig] : phys_debug_color_cache_) {
+            auto it = primitives_.find(prim_id);
+            if (it == primitives_.end()) continue;
+            auto& ap = it->second;
+            ap.albedo[0] = orig[0];
+            ap.albedo[1] = orig[1];
+            ap.albedo[2] = orig[2];
+        }
+        phys_debug_color_cache_.clear();
+        primitives_dirty_ = true;
+        accum_dirty_      = true;
+    }
+    phys_debug_visualize_prev_ = viz_mode;
+}
+
 void Engine::StepPhysics(float dt) {
     if (!physics_) return;
     if (physics_->AliveCount() == 0 && physics_->RbAliveCount() == 0) return;
@@ -13147,38 +13192,24 @@ void Engine::StepPhysics(float dt) {
     // Pull r_phys_debug_visualize once outside the iter callbacks (the
     // C-style ForEach signature can't capture state, and we want the
     // cvar GetInt cost off the per-particle path). 0 = off, 1 = colour
-    // override active. Substep dt is the same value PhysicsSystem::Step
-    // computed internally (clamped_dt / substeps), used to recover the
-    // implicit linear velocity from (curr_pos - prev_pos) / sdt at the
-    // end of the frame.
+    // override active. The 1 -> 0 falling-edge restore lives in
+    // MaybeRestorePhysDebugColors() called from Tick BEFORE this
+    // function (so it runs even when the early returns above kick in);
+    // here we only handle the override-while-active path.
     int viz_mode = 0;
     if (auto* v = C.FindCVar("r_phys_debug_visualize")) viz_mode = v->GetInt();
-    const float inv_sdt = (substeps > 0 && clamped_dt > 0.0f)
-                             ? float(substeps) / clamped_dt
+    // Substep dt is the same value PhysicsSystem::Step computed
+    // internally -- substeps is clamped to [1, 32] there (see Step()),
+    // so mirror that clamp here. Without the mirror, a user with
+    // phys_substeps=0 or negative would see physics run at the
+    // clamped sdt while the viz computed speeds at a wildly
+    // different sdt (or zero, painting everything blue).
+    int clamped_substeps = substeps;
+    if (clamped_substeps < 1)  clamped_substeps = 1;
+    if (clamped_substeps > 32) clamped_substeps = 32;
+    const float inv_sdt = (clamped_dt > 0.0f)
+                             ? float(clamped_substeps) / clamped_dt
                              : 0.0f;
-
-    // Detect the 1 -> 0 falling edge before the writeback path runs.
-    // On the falling edge restore every cached albedo, then drop the
-    // cache so the next 0 -> 1 transition captures fresh originals. We
-    // do this BEFORE the new writeback so the position-only path still
-    // marks primitives_dirty_ = true, getting the restored albedos to
-    // the GPU on the very next frame instead of waiting for the next
-    // structural change.
-    if (phys_debug_visualize_prev_ != 0 && viz_mode == 0
-        && !phys_debug_color_cache_.empty()) {
-        for (auto& [prim_id, orig] : phys_debug_color_cache_) {
-            auto it = primitives_.find(prim_id);
-            if (it == primitives_.end()) continue;
-            auto& ap = it->second;
-            ap.albedo[0] = orig[0];
-            ap.albedo[1] = orig[1];
-            ap.albedo[2] = orig[2];
-        }
-        phys_debug_color_cache_.clear();
-        primitives_dirty_ = true;
-        accum_dirty_      = true;
-    }
-    phys_debug_visualize_prev_ = viz_mode;
 
     // Write each particle's curr_pos back into its paired analytic
     // primitive so RenderFrame's EnsurePrimitivesUploaded sees the
@@ -13201,10 +13232,19 @@ void Engine::StepPhysics(float dt) {
     ctx.color_cache  = &phys_debug_color_cache_;
     ctx.viz_mode     = viz_mode;
     ctx.inv_sdt      = inv_sdt;
-    // Speed -> linear-RGB ramp. Three stops in (speed m/s, r, g, b):
-    //   0 m/s  -> (0.10, 0.30, 1.00)   blue
-    //   5 m/s  -> (0.20, 1.00, 0.30)   green
-    //  10+ m/s -> (1.00, 0.20, 0.20)   red (saturating)
+    // Speed -> linear-RGB ramp. Three stops calibrated to the default
+    // damped Verlet integrator: terminal implicit speed under default
+    // (g=-9.81, phys_substeps=8, phys_damping=0.99, 60 fps) is
+    // |g| * sdt / (1-damping) ~= 2.04 m/s, so the ramp tops out at 2.
+    // Picking the 5/10 m/s thresholds we shipped initially saturated
+    // every default-config falling body to the bottom of the ramp;
+    // 0/1/2 covers the full implicit-velocity range cleanly.
+    //   0 m/s   -> (0.10, 0.30, 1.00)   blue   (stationary)
+    //   1 m/s   -> (0.20, 1.00, 0.30)   green  (mid-fall)
+    //   2+ m/s  -> (1.00, 0.20, 0.20)   red    (terminal, saturating)
+    // Users who set phys_damping > 0.99 (terminal climbs) or supply
+    // external impulses (Phase 2b+) past 2 m/s will see saturated red
+    // -- that's the intent: "moving as fast as the system can manage".
     // Computed in linear-RGB so the ACES tonemap reads it correctly.
     // C++ lambdas-without-captures decay to function pointers via the
     // unary `+`, which lets the C-style ForEach callback dispatch
@@ -13212,15 +13252,15 @@ void Engine::StepPhysics(float dt) {
     ctx.speed_to_rgb = +[](float s, float* out_rgb) {
         float v = s;
         if (v < 0.0f) v = 0.0f;
-        if (v > 10.0f) v = 10.0f;
+        if (v > 2.0f) v = 2.0f;
         constexpr float kStop0[3] = {0.10f, 0.30f, 1.00f};
         constexpr float kStop1[3] = {0.20f, 1.00f, 0.30f};
         constexpr float kStop2[3] = {1.00f, 0.20f, 0.20f};
         const float* a;
         const float* b;
         float t;
-        if (v < 5.0f) { a = kStop0; b = kStop1; t = v * 0.2f; }
-        else          { a = kStop1; b = kStop2; t = (v - 5.0f) * 0.2f; }
+        if (v < 1.0f) { a = kStop0; b = kStop1; t = v; }
+        else          { a = kStop1; b = kStop2; t = v - 1.0f; }
         for (int k = 0; k < 3; ++k) out_rgb[k] = a[k] + (b[k] - a[k]) * t;
     };
 
