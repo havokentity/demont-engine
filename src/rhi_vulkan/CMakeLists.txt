@@ -88,9 +88,20 @@ pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/SdfFractals.slang)
 # block imports it.
 pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/RestirReservoir.slang)
 # --- end ReSTIR DI Phase A ------------------------------------------------
+
+# --- Megakernel feature gates (PR #164) -----------------------------------
+# Same -DPT_WATER_ENABLED translation as the Metal CMakeLists (both targets
+# must define the macro so the same Slang source compiles cleanly to both).
+if(PT_WATER_ENABLED)
+    set(_pt_water_def "-DPT_WATER_ENABLED=1")
+else()
+    set(_pt_water_def "-DPT_WATER_ENABLED=0")
+endif()
+# --- end Megakernel feature gates -----------------------------------------
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
     STAGE compute ENTRY main TARGETS spirv
+    EXTRA_DEFINES ${_pt_water_def}
     MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals RestirReservoir)
 # Second PathTrace SPIR-V variant without RayQuery, for backends that
 # don't expose VK_KHR_ray_query (Mac-Vulkan on pre-1.3 MoltenVK builds).
@@ -102,7 +113,7 @@ pt_compile_slang(
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
     STAGE compute ENTRY main TARGETS spirv
-    VARIANT norq EXTRA_DEFINES -DPT_SPIRV_NO_RAYQUERY
+    VARIANT norq EXTRA_DEFINES -DPT_SPIRV_NO_RAYQUERY ${_pt_water_def}
     MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals RestirReservoir)
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/Tonemap.slang

@@ -3014,7 +3014,17 @@ float3 transmittance(float3 ro, float3 rd, float t_max) {
         // Water (#134) joins dielectric on the transmissive-blocker list.
         // Both refract the shadow ray; only water folds Beer's-law
         // absorption into the transmittance via water_params0.xyz.
+        //
+        // PT_WATER_ENABLED gate: when OFF the MAT_WATER branch is
+        // compiled out -- water is treated like any opaque material
+        // (returns 0 contribution from this shadow ray). Saves
+        // megakernel registers + DAG width in scenes that don't use
+        // water (the common case).
+#if PT_WATER_ENABLED
         bool is_transparent = (h.mat == MAT_DIELECTRIC) || (h.mat == MAT_WATER);
+#else
+        bool is_transparent = (h.mat == MAT_DIELECTRIC);
+#endif
         if (!is_transparent)         return float3(0.0);    // opaque blocker
         if (i == kMaxRefract)        return float3(0.0);    // budget hit
 
@@ -3025,22 +3035,31 @@ float3 transmittance(float3 ro, float3 rd, float t_max) {
         // the transmittance so glancing angles correctly attenuate.
         float ndi   = dot(h.normal, d);
         float3 nf   = (ndi < 0.0) ? h.normal : -h.normal;
+#if PT_WATER_ENABLED
         float interface_ior = (h.mat == MAT_WATER)
             ? clamp(h.ior > 0.0 ? h.ior : water_params0.w, 1.0, 2.4)
             : h.ior;
+#else
+        float interface_ior = h.ior;
+#endif
         float ior_a = (ndi < 0.0) ? 1.0           : interface_ior;
         float ior_b = (ndi < 0.0) ? interface_ior : 1.0;
         float eta   = ior_a / ior_b;
         float cos_i = abs(dot(nf, -d));
+#if PT_WATER_ENABLED
         float r0    = (h.mat == MAT_WATER)
             ? 0.02                             // accurate F0 for water at 0 deg
             : ((ior_a - ior_b) / (ior_a + ior_b)) * ((ior_a - ior_b) / (ior_a + ior_b));
+#else
+        float r0    = ((ior_a - ior_b) / (ior_a + ior_b)) * ((ior_a - ior_b) / (ior_a + ior_b));
+#endif
         float fr    = fresnelSchlick(cos_i, r0);   // reflected fraction
         float3 refracted = refract(d, nf, eta);
         if (length(refracted) < 1e-3) return float3(0.0);   // TIR
         // Transmitted fraction times Beer-ish tint.  Water uses its own
         // per-channel exp(-absorption * nominal_seg) instead of h.albedo
         // (which would be neutral 1,1,1 for a water plane).
+#if PT_WATER_ENABLED
         if (h.mat == MAT_WATER) {
             float3 absorb = water_params0.xyz;
             // Same nominal segment used in the water BRDF branch -- keeps
@@ -3050,6 +3069,9 @@ float3 transmittance(float3 ro, float3 rd, float t_max) {
         } else {
             t *= (1.0 - fr) * h.albedo;
         }
+#else
+        t *= (1.0 - fr) * h.albedo;
+#endif
         // Step past the interface, continue in the refracted direction.
         float advance = h.t + 1e-3;
         o = o + d * advance;
@@ -3066,6 +3088,13 @@ bool occluded(float3 ro, float3 rd, float t_max) {
 }
 
 // --- Water Phase 1 (#134) --------------------------------------------------
+// Gated by PT_WATER_ENABLED: when OFF the entire wave-normal helper and
+// the MAT_WATER BRDF branch below compile out -- a Mac-release build of
+// the megakernel without water support drops ~3 ms / frame off the
+// pathtrace dispatch (8 noise evals + tangent-frame algebra per hit are
+// expensive in the per-thread register pressure they produce, regardless
+// of whether any actual MAT_WATER hit happens).  See PR #164.
+#if PT_WATER_ENABLED
 // Build a perturbed surface normal for MAT_WATER hits.  The geometry stays
 // a flat analytic plane (h.normal is the macro normal); only the SHADING
 // normal is animated.  We approximate the gradient of a 2-octave value-
@@ -3123,6 +3152,7 @@ float3 waterShadingNormal(float3 world_p, float3 macro_n) {
     float3 perturbed = macro_n - amp * (dh_dx * tx + dh_dz * tz);
     return normalize(perturbed);
 }
+#endif  // PT_WATER_ENABLED
 // --- end Water Phase 1 -----------------------------------------------------
 
 [shader("compute")]
@@ -4006,7 +4036,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
             skip_sky_on_miss = false;   // dielectric didn't NEE either
             prev_was_lambert_nee = false;   // specular/refraction: MIS doesn't apply
         }
-        else {  // MAT_WATER (#134)
+#if PT_WATER_ENABLED
+        else if (h.mat == MAT_WATER) {  // (#134)
             // Phase 1 water: shading-normal-perturbed analytic plane with
             // Schlick Fresnel (F0=0.02), Snell refraction via the refract()
             // builtin, and Beer's-law absorption applied to the refracted
@@ -4084,6 +4115,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
             skip_sky_on_miss = false;
             prev_was_lambert_nee = false;
         }
+#endif  // PT_WATER_ENABLED
 
             if (b >= 2u) {
                 float p = max(throughput.r, max(throughput.g, throughput.b));

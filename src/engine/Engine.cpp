@@ -9997,14 +9997,58 @@ void Engine::RegisterCommands() {
     // Water Phase 1 (#134): tweaking absorption / ior / wave params at
     // runtime changes the MAT_WATER BRDF output, so reset accum_dirty_
     // to avoid stale samples blending in.
+    //
+    // PR #164: when the megakernel was built without PT_WATER_ENABLED,
+    // the cvars still register (so saved user configs don't error out
+    // on cvar-not-found) but mutating them is a no-op -- the BRDF that
+    // would have consumed water_params0/1 was compiled out. Emit a single
+    // [warn] line per on_change call so a user who's flipped one of the
+    // r_water_* values without rebuilding gets a clear pointer at why
+    // their scene looks unchanged.
     for (const char* n : {"r_water_absorption_r", "r_water_absorption_g",
                           "r_water_absorption_b", "r_water_ior",
                           "r_water_wave_scale",   "r_water_wave_amplitude",
                           "r_water_wave_speed"}) {
         if (auto* v = C.FindCVar(n)) {
+#if PT_WATER_ENABLED
             v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+#else
+            v->on_change = [this](const pt::console::CVar& cv) {
+                accum_dirty_ = true;
+                LOG_WARN("{} = {} ignored: this build did not enable "
+                         "PT_WATER_ENABLED. Reconfigure with "
+                         "-DPT_WATER_ENABLED=ON to render MAT_WATER.",
+                         cv.name, cv.value);
+            };
+#endif
         }
     }
+#if !PT_WATER_ENABLED
+    // One-shot startup notice: if any r_water_* cvar is non-default (e.g.
+    // the user replayed a cfg that tweaks water), surface the gate state
+    // ONCE before the on_change spam path takes over. Compares string
+    // value to default_value since cvars are string-stored.
+    {
+        bool any_non_default = false;
+        for (const char* n : {"r_water_absorption_r", "r_water_absorption_g",
+                              "r_water_absorption_b", "r_water_ior",
+                              "r_water_wave_scale",   "r_water_wave_amplitude",
+                              "r_water_wave_speed"}) {
+            if (auto* v = C.FindCVar(n);
+                v && v->value != v->default_value) {
+                any_non_default = true;
+                break;
+            }
+        }
+        if (any_non_default) {
+            LOG_WARN("r_water_* cvar(s) set to non-default values, but this "
+                     "build was compiled without PT_WATER_ENABLED -- the "
+                     "MAT_WATER BRDF is not in the megakernel and water "
+                     "materials will render as a no-op.  Reconfigure with "
+                     "-DPT_WATER_ENABLED=ON to restore water rendering.");
+        }
+    }
+#endif
     // Cloud preset: when set, snap the individual cloud cvars to the
     // preset's parameter set. The user can then nudge individual values
     // without changing the preset name (or set it to "custom" to lock).
