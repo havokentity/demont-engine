@@ -19,11 +19,14 @@ target_link_libraries(pt_rhi_vulkan
 # once the user has flipped PT_ENABLE_NRD=ON on a non-Apple build with the
 # Vulkan backend on). When inactive the wrapper file isn't compiled, the
 # NRD lib isn't linked, and PT_ENABLE_NRD is undefined in the source so
-# the #if blocks inside VulkanDenoiser.cpp compile out. Today the wrapper
-# is a scaffold -- it stubs the NRD instance/dispatch translation; the
-# r_denoiser nrd cvar value still routes through the in-house SVGF chain.
-# A follow-up PR will switch routing to VulkanNrdLibDenoiser::Encode once
-# the per-frame Dispatch->VkDispatch translation lands.
+# the #if PT_ENABLE_NRD blocks inside VulkanNrdLibDenoiser.{h,cpp} compile
+# out -- VulkanDenoiser.cpp is unrelated (it's the SVGF placeholder backing
+# the existing r_denoiser nrd cvar value and has no PT_ENABLE_NRD gates).
+# Today the wrapper is a scaffold -- it stubs the NRD instance/dispatch
+# translation; the r_denoiser nrd cvar value still routes through the
+# in-house SVGF chain. A follow-up PR will switch routing to
+# VulkanNrdLibDenoiser::Encode once the per-frame Dispatch->VkDispatch
+# translation lands.
 if(PT_NRD_ACTIVE)
     target_sources(pt_rhi_vulkan PRIVATE VulkanNrdLibDenoiser.cpp)
     target_link_libraries(pt_rhi_vulkan PRIVATE NRD)

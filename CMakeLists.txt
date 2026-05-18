@@ -52,7 +52,12 @@ option(PT_ENABLE_OPTIX
 #
 # Hard-gated to non-Apple in Dependencies.cmake (NRD is Vulkan-only and the
 # Mac path uses Metal + MetalFX); a user passing -DPT_ENABLE_NRD=ON on Mac
-# gets a single warning and the option is force-OFF'd for that configure.
+# gets a single warning and the *active* gate PT_NRD_ACTIVE stays OFF for
+# that configure. The PT_ENABLE_NRD cache value itself is left as the user
+# set it -- every consumer in src/rhi_vulkan/ checks PT_NRD_ACTIVE rather
+# than PT_ENABLE_NRD directly, so a stale =ON in the cache on Apple is
+# harmless: the FetchContent of NRD doesn't run, no target is linked, and
+# the source-side PT_ENABLE_NRD compile-definition stays undefined.
 option(PT_ENABLE_NRD
     "Build NVIDIA NRD denoiser (Vulkan-only; non-Apple platforms; needs ShaderMake/dxc-spirv toolchain)" OFF)
 option(PT_ENABLE_TRACY          "Enable Tracy profiler client"          ON)

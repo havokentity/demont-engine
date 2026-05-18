@@ -42,8 +42,6 @@
 
 #include <NRD.h>
 
-#include <cstring>
-
 namespace pt::rhi::vk {
 
 namespace {
@@ -66,10 +64,12 @@ const char* NrdResultStr(nrd::Result r) {
 
 // Stable identifier for the SIGMA_SHADOW denoiser instance. NRD uses
 // 16-bit identifiers; values are user-chosen and only have to be unique
-// within a single nrd::Instance. We park ours at a recognisable constant
-// so the per-frame GetComputeDispatches(... &kSigmaShadowId, 1, ...) call
-// in the follow-up PR has a stable handle to look up.
-constexpr nrd::Identifier kSigmaShadowId = 0x5160;  // 'SI' nominal
+// within a single nrd::Instance. We park ours at an arbitrary but
+// constant 16-bit value so the per-frame GetComputeDispatches(...,
+// &kSigmaShadowId, 1, ...) call in the follow-up PR has a stable handle
+// to look up. The exact bit pattern doesn't matter; future REBLUR /
+// RELAX additions will pick equally arbitrary but distinct constants.
+constexpr nrd::Identifier kSigmaShadowId = 0x5160;
 
 }  // namespace
 
@@ -99,18 +99,36 @@ bool VulkanNrdLibDenoiser::Init(std::uint32_t width, std::uint32_t height) {
         return false;
     }
 
+    // NRD bakes renderWidth / renderHeight into its DenoiserDesc as
+    // uint16_t. Reject anything that wouldn't survive the cast below
+    // -- the path tracer doesn't have a sensible answer at 65536+
+    // pixels of swapchain extent anyway, but failing loudly here beats
+    // silently truncating the dimension and creating an instance that
+    // generates artifacts at the right edge / bottom of the frame.
+    constexpr std::uint32_t kNrdMaxDim = 65535u;
+    if (width > kNrdMaxDim || height > kNrdMaxDim) {
+        LOG_ERROR("VulkanNrdLibDenoiser::Init: dimension {}x{} exceeds NRD's "
+                  "uint16_t limit ({}x{}) -- refusing to truncate.",
+                  width, height, kNrdMaxDim, kNrdMaxDim);
+        return false;
+    }
+
     // Cached + ready means nothing to do. Init can be safely re-entered.
     if (ready_ && cached_w_ == width && cached_h_ == height) {
         return true;
     }
 
-    // If we previously failed, don't retry -- NRD's CreateInstance is
-    // deterministic; a failure once will fail every subsequent call. The
-    // engine should see Ready()==false and route to the off path.
+    // If we previously failed AT THE SAME DIMENSIONS, don't retry --
+    // NRD's CreateInstance is deterministic; a failure once will fail
+    // every subsequent call with the same inputs. The engine should
+    // see Ready()==false and route to the off path.
     //
-    // Resizes do flush this gate via DestroyAll -> init_attempted_=false,
-    // so a legitimate Init with new dimensions still runs.
-    if (init_attempted_ && !ready_) {
+    // A resize event (width or height changed since the failed attempt)
+    // does bypass this gate: those are functionally different inputs, so
+    // a new attempt may succeed even when the previous one didn't (e.g.
+    // a transient resource-exhaustion failure at the previous extent).
+    if (init_attempted_ && !ready_ &&
+        cached_w_ == width && cached_h_ == height) {
         return false;
     }
     init_attempted_ = true;
@@ -140,6 +158,10 @@ bool VulkanNrdLibDenoiser::Init(std::uint32_t width, std::uint32_t height) {
     // Build CreateInstance descriptor with just SIGMA_SHADOW for now.
     // REBLUR / RELAX add additional `DenoiserDesc{ ..., identifier }` rows;
     // each one would allocate its own pipeline + descriptor pool slice.
+    //
+    // The width/height casts are safe: we rejected width/height > 65535
+    // at the top of this function so the uint32 -> uint16 narrowing here
+    // is value-preserving.
     nrd::DenoiserDesc sigma_desc{};
     sigma_desc.identifier      = kSigmaShadowId;
     sigma_desc.denoiser        = nrd::Denoiser::SIGMA_SHADOW;
@@ -159,6 +181,11 @@ bool VulkanNrdLibDenoiser::Init(std::uint32_t width, std::uint32_t height) {
         LOG_ERROR("VulkanNrdLibDenoiser::Init: nrd::CreateInstance failed "
                   "({} -- {}x{} SIGMA_SHADOW)",
                   NrdResultStr(r), width, height);
+        // Record the failed dimensions so the retry gate can detect a
+        // resize-driven retry (different inputs) vs a same-dim retry
+        // (no point re-running the same failing call).
+        cached_w_ = width;
+        cached_h_ = height;
         return false;
     }
     nrd_inst_ = new_inst;
