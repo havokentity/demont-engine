@@ -48,13 +48,14 @@ private:
     VulkanDevice*  device_ = nullptr;
     VkCommandBuffer cb_     = VK_NULL_HANDLE;
     PipelineHandle bound_pipeline_{0};
-    // 10 texture slots: slots 0..7 are output / accum / denoise_color /
+    // 11 texture slots: slots 0..7 are output / accum / denoise_color /
     // depth / motion / env_map / star_map / moon_map; slot 8 is
-    // normal_tex (SVGF/NRD + OptiX-AOV) and slot 9 is albedo_tex
-    // (OptiX AOV only). Briefly grew to 11 to host the #108 accum_stars
-    // binding; back to 10 now that the stateless StarsComposite kernel
-    // is on its own pipeline.
-    TextureHandle  bound_tex_[10] {};
+    // normal_tex (SVGF/NRD + OptiX-AOV), slot 9 is albedo_tex (OptiX
+    // AOV only), slot 10 is cloud_trans_tex (issue #46 follow-up
+    // R32F per-pixel cloud transmittance G-buffer the path tracer
+    // writes and StarsComposite reads). Keep in sync with
+    // kSlotToTexBinding[] in VulkanDevice.cpp.
+    TextureHandle  bound_tex_[11] {};
     // 11 buffer slots: 8 original (mesh_positions/indices, primitives,
     // marginal/conditional CDFs, exposure_state, analytic-prim bvh_nodes),
     // slots 8/9 for the triangle-BVH (tri_bvh_nodes,

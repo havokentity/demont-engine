@@ -58,6 +58,22 @@
 [[vk::binding(1, 0)]] RWTexture2D<float4> star_map;
 [[vk::binding(2, 0)]] RWTexture2D<float4> moon_map;
 [[vk::binding(7, 0)]] RWTexture2D<float>  depth_tex;
+// Cloud transmittance along the camera ray, written by PathTrace's
+// volumetric march at the end of main(). 1.0 = no cloud blocking
+// (no clouds, ray misses the layer, or layer fully transparent); 0.0
+// = fully opaque cloud. The composite multiplies its celestial
+// contribution by this scalar so stars / sun / moon get correctly
+// occluded by clouds in front of them. Cloud-glow / in-scatter
+// illumination of the cloud BY the sun and moon stays a path-tracer
+// concern -- it's already captured in hdr_inout through the existing
+// b>0 cloud-march integration. This texture only carries the
+// transmittance number the composite needs.
+//
+// vk::binding(22, 0) matches PathTrace.slang's cloud_trans_tex slot;
+// Metal MSL assigns texture(4) by declaration order (slot 0..3 above,
+// slot 4 here). Engine binds it at engine slot 4 in the composite
+// dispatch.
+[[vk::binding(22, 0)]] RWTexture2D<float>  cloud_trans_tex;
 
 // MSL SLOT ALIGNMENT NOTICE -- mirrors AutoExposure.slang / Tonemap.slang.
 // Slang's MSL backend assigns Metal buffer/texture slots in DECLARATION
@@ -538,6 +554,17 @@ void main(uint3 tid : SV_DispatchThreadID) {
         acc += sample_contrib;
     }
     acc *= inv_N;
+
+    // Cloud occlusion. PathTrace writes the camera-ray cloud-march
+    // transmittance to cloud_trans_tex (1.0 = no cloud, 0.0 = fully
+    // opaque). Multiplying the composite by it darkens stars / sun /
+    // moon in proportion to the integrated cloud density along the
+    // camera ray -- so a thick cloud occludes the celestials and a
+    // thin / wispy cloud lets them shine through dimmed. With clouds
+    // off (clouds_p1.w == 0 host-side), trans defaults to 1.0 and
+    // this is a no-op multiply.
+    float cloud_trans = cloud_trans_tex[tid.xy];
+    acc *= cloud_trans;
 
     // Sanitize. starsOnly reads a host-uploaded texture we trust to
     // be clean, but a NaN slipping into the moon-map equirectangular

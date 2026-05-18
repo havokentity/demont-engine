@@ -108,15 +108,16 @@ constexpr bool kEnableValidation = false;
 // storage buffer) so the descriptor set remains complete; the shader
 // gates the SDF read on push.sdf_params.x > 0.
 // --- end SDF Phase 1 --------------------------------------------------------
-// --- Star-split retired (#46) -----------------------------------------------
-// The accum_stars binding (#108) lived at engine texture slot 10 / vk
-// binding 22. The stateless StarsComposite kernel (issue #46) replaces
-// the EMA accumulator: the celestials composite is a Metal-side
-// dispatch on its own pipeline (no shared descriptor set) and Vulkan
-// has no stars compositor in this PR (follow-up). The slot table
-// drops back to 10 entries.
-// --- end Star-split retired -------------------------------------------------
-static constexpr std::uint32_t kNumTexSlots = 10;
+// --- Cloud transmittance G-buffer (issue #46 follow-up) ---------------------
+// Engine texture slot 10 -> vk::binding 22 is cloud_trans_tex, the R32F
+// per-pixel cloud transmittance the path tracer writes from its
+// volumetric cloud march. Reused the slot number (and binding) that
+// accum_stars (#108) briefly occupied -- accum_stars is gone, slot is
+// free, and re-using it keeps the descriptor pool sizing arithmetic
+// identical to the pre-rewrite state. StarsComposite reads this to
+// attenuate the celestial composite by foreground cloud density.
+// --- end Cloud transmittance ------------------------------------------------
+static constexpr std::uint32_t kNumTexSlots = 11;
 constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     0,  // engine slot 0  -> shader binding 0  (output / swapchain)
     1,  // engine slot 1  -> shader binding 1  (accum_hdr)
@@ -128,6 +129,7 @@ constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     13, // engine slot 7  -> shader binding 13 (moon_map)
     16, // engine slot 8  -> shader binding 16 (normal_tex, SVGF/NRD/OptiX-AOV)
     17, // engine slot 9  -> shader binding 17 (albedo_tex, OptiX AOV only)
+    22, // engine slot 10 -> shader binding 22 (cloud_trans_tex, #46 follow-up)
 };
 constexpr std::uint32_t kSlotToBufBinding[11] = {
     0,  // engine slot 0 unused
@@ -317,16 +319,19 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     //
     // Capacity: 11 storage_image (one less than kNumTexSlots because
     // engine texture slot 10 is reserved/unused on the Vulkan path)
-    // + 1 accel_struct + 10 storage_buffer + 1 uniform_buffer = 22,
+    // + 1 accel_struct + 10 storage_buffer + 1 uniform_buffer = 23,
     // sized to the worst-case "PathTrace binds everything" dispatch.
     // kMaxWrites must be >= the total binding count or
     // vkUpdateDescriptorSets reads off the end of these stack arrays.
-    // The +3 over the legacy 19 is bindings 19/20 (tri_bvh_nodes /
-    // tri_bvh_permuted_ids, PR #106 follow-up host-built triangle BVH)
-    // and binding 21 (SDF cluster buffer, SDF Phase 1 #97; moved from
-    // binding 19 to make room for the tri BVH). Binding 22 (accum_stars,
-    // #108) was retired with the stateless StarsComposite rewrite.
-    constexpr std::uint32_t kMaxWrites = 22;
+    // The +4 over the legacy 19 is bindings 19/20 (tri_bvh_nodes /
+    // tri_bvh_permuted_ids, PR #106 follow-up host-built triangle BVH),
+    // binding 21 (SDF cluster buffer, SDF Phase 1 #97; moved from
+    // binding 19 to make room for the tri BVH), and binding 22
+    // (cloud_trans_tex, issue #46 follow-up -- the R32F per-pixel
+    // cloud transmittance the path tracer writes and StarsComposite
+    // reads. Reuses the slot number accum_stars (#108) briefly
+    // occupied before the stateless composite rewrite.)
+    constexpr std::uint32_t kMaxWrites = 23;
     std::array<VkDescriptorImageInfo,  kMaxWrites> img_infos {};
     std::array<VkDescriptorBufferInfo, kMaxWrites> buf_infos {};
     std::array<VkWriteDescriptorSetAccelerationStructureKHR, 1> as_infos {};
@@ -963,12 +968,13 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // (PR #106 follow-up) the host-built triangle BVH at bindings 19/20
     // exactly like the HW path does. SDF Phase 1 (#97) adds binding 21
     // for the SDF cluster buffer (moved from binding 19 to make room
-    // for the triangle BVH). Binding 22 (accum_stars, #108) retired
-    // with the stateless StarsComposite rewrite -- celestials are now
-    // composited Metal-side on a dedicated pipeline.
+    // for the triangle BVH). Binding 22 is cloud_trans_tex (R32F
+    // per-pixel cloud transmittance G-buffer, issue #46 follow-up);
+    // reuses the slot accum_stars (#108) briefly occupied before the
+    // stateless composite rewrite freed it.
     {
         std::vector<VkDescriptorSetLayoutBinding> b;
-        b.reserve(22);
+        b.reserve(23);
         auto add_binding = [&](std::uint32_t binding, VkDescriptorType type) {
             VkDescriptorSetLayoutBinding lb{};
             lb.binding         = binding;
@@ -1029,9 +1035,12 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // signal.
         add_binding(21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
         // --- end SDF Phase 1 ---
-        // Binding 22 (accum_stars, #108) retired. Stars+sun+moon land
-        // post-denoise via shaders/StarsComposite.slang on its own
-        // pipeline; this shared layout no longer needs the slot.
+        // Binding 22: cloud_trans_tex. R32F storage image written by
+        // PathTrace's volumetric cloud march, read by StarsComposite
+        // for foreground-cloud occlusion of stars / sun / moon.
+        // Allocated host-side when denoiser_active_; PARTIALLY_BOUND
+        // covers the host-side gate's "no denoiser, no binding" case.
+        add_binding(22, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
 
         // UPDATE_AFTER_BIND for every binding so we can rewrite the
         // shared descriptor set between dispatches in the same cmd

@@ -1183,6 +1183,7 @@ void Engine::TearDownDevice() {
         if (depth_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
         if (motion_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
         if (post_denoise_hdr_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
+        if (cloud_trans_tex_id_      != 0) device_->DestroyTexture(pt::rhi::TextureHandle{cloud_trans_tex_id_});
         for (auto& id : bloom_mip_tex_id_) {
             if (id != 0) device_->DestroyTexture(pt::rhi::TextureHandle{id});
             id = 0;
@@ -1224,6 +1225,7 @@ void Engine::TearDownDevice() {
     depth_tex_id_            = 0;
     motion_tex_id_           = 0;
     post_denoise_hdr_tex_id_ = 0;
+    cloud_trans_tex_id_      = 0;
     tonemap_pipeline_id_     = 0;
     stars_composite_pipeline_id_ = 0;
     bloom_down_pipeline_id_  = 0;
@@ -3062,12 +3064,14 @@ void Engine::RenderFrame() {
             if (normal_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{normal_tex_id_});
             if (albedo_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{albedo_tex_id_});
             if (post_denoise_hdr_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
+            if (cloud_trans_tex_id_      != 0) device_->DestroyTexture(pt::rhi::TextureHandle{cloud_trans_tex_id_});
             for (auto& id : bloom_mip_tex_id_) {
                 if (id != 0) device_->DestroyTexture(pt::rhi::TextureHandle{id});
                 id = 0;
             }
             denoise_color_tex_id_ = depth_tex_id_ = motion_tex_id_ = 0;
             normal_tex_id_ = albedo_tex_id_ = post_denoise_hdr_tex_id_ = 0;
+            cloud_trans_tex_id_   = 0;
         }
     }
 
@@ -3211,6 +3215,7 @@ void Engine::RenderFrame() {
             if (normal_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{normal_tex_id_});
             if (albedo_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{albedo_tex_id_});
             if (post_denoise_hdr_tex_id_  != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
+            if (cloud_trans_tex_id_       != 0) device_->DestroyTexture(pt::rhi::TextureHandle{cloud_trans_tex_id_});
             // Explicitly zero the IDs here. The subsequent CreateTexture
             // calls overwrite them on the success path, but a CreateTexture
             // failure below leaves the ID still pointing at a freed handle
@@ -3222,6 +3227,7 @@ void Engine::RenderFrame() {
             normal_tex_id_           = 0;
             albedo_tex_id_           = 0;
             post_denoise_hdr_tex_id_ = 0;
+            cloud_trans_tex_id_      = 0;
         }
         auto color_h = device_->CreateTexture({
             .width = fc.width, .height = fc.height,
@@ -3266,6 +3272,22 @@ void Engine::RenderFrame() {
             depth_tex_id_            = depth_h.id;
             motion_tex_id_           = motion_h.id;
             post_denoise_hdr_tex_id_ = post_h.id;
+            // Cloud transmittance G-buffer (issue #46 follow-up).
+            // R32F (matches depth_tex's format; the value is a single
+            // [0,1] scalar so R8_UNORM would be ideal but isn't in
+            // the RHI's TextureFormat enum -- R32F is the existing
+            // single-channel format and the 4x memory cost over R8
+            // is 4.5 MB / 12 MB at 1080p / 4K, trivial vs the rest
+            // of the denoiser texture budget). PathTrace writes the
+            // camera-ray cloud-march transmittance; StarsComposite
+            // reads + multiplies the celestial composite.
+            auto cloud_h = device_->CreateTexture({
+                .width = fc.width, .height = fc.height,
+                .format = pt::rhi::TextureFormat::R32F,
+                .usage  = pt::rhi::TextureUsage::Storage,
+                .debug_name = "cloud_trans",
+            });
+            cloud_trans_tex_id_ = cloud_h.id;
             // Normal G-buffer: SVGF/NRD use it for edge-aware spatial
             // filtering; the OptiX AOV denoiser uses it as a guide layer.
             // MetalFX ignores normals and the path tracer's normal write is
@@ -3501,6 +3523,15 @@ void Engine::RenderFrame() {
     // from the descriptor set rather than as a safe null pass-through.
     if (denoiser_active_ && albedo_tex_id_ != 0) {
         cb->BindStorageTexture(9, pt::rhi::TextureHandle{albedo_tex_id_});
+    }
+    // Engine slot 10 -> vk::binding 22 (cloud_trans_tex). R32F per-
+    // pixel transmittance written by PathTrace's volumetric cloud
+    // march, read by StarsComposite. Allocated alongside the rest of
+    // the denoiser textures (denoiser_active_), so the bind fires
+    // any time the path-tracer dispatch needs to write the G-buffer
+    // for the composite chain.
+    if (denoiser_active_ && cloud_trans_tex_id_ != 0) {
+        cb->BindStorageTexture(10, pt::rhi::TextureHandle{cloud_trans_tex_id_});
     }
     if (env_map_tex_id_ != 0) {
         cb->BindStorageTexture(5, pt::rhi::TextureHandle{env_map_tex_id_});
@@ -4905,7 +4936,8 @@ void Engine::RenderFrame() {
             stars_composite_pipeline_id_ != 0 &&
             star_map_tex_id_ != 0 &&
             moon_map_tex_id_ != 0 &&
-            depth_tex_id_ != 0) {
+            depth_tex_id_ != 0 &&
+            cloud_trans_tex_id_ != 0) {
             cb->BindComputePipeline(pt::rhi::PipelineHandle{stars_composite_pipeline_id_});
             cb->BindStorageTexture(0, pt::rhi::TextureHandle{tonemap_hdr_source_id});
             cb->BindStorageTexture(1, pt::rhi::TextureHandle{star_map_tex_id_});
@@ -4919,6 +4951,12 @@ void Engine::RenderFrame() {
             // that runs the composite anyway), so the existence check
             // above is belt-and-braces.
             cb->BindStorageTexture(3, pt::rhi::TextureHandle{depth_tex_id_});
+            // cloud_trans_tex at engine slot 4 -> Metal MSL texture(4)
+            // by declaration order. PathTrace's cloud march writes the
+            // camera-ray transmittance here (1.0 = no occlusion); the
+            // shader multiplies the celestial contribution by it so
+            // stars / sun / moon get darkened by foreground clouds.
+            cb->BindStorageTexture(4, pt::rhi::TextureHandle{cloud_trans_tex_id_});
             // Same exposure_state inheritance pattern as Tonemap.slang
             // (the dummy `_slot_exposure_state` keeps Push at MSL
             // buf(7)). Re-bind defensively in case PathTrace didn't run.

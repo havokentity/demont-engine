@@ -131,6 +131,36 @@ Texture2D<float4> moon_map;
 // satisfy descriptor validity.
 [[vk::binding(17, 0)]] RWTexture2D<float4> albedo_tex;
 
+// Camera-ray cloud transmittance G-buffer (issue #46 follow-up).
+// Single-channel R32F, written by the path tracer's volumetric cloud
+// march at the END of the bounce/sample loop, read by the post-
+// denoise StarsComposite kernel to attenuate the additive stars +
+// sun + moon contribution. Without this gate the composite is "pure
+// additive" -- stars / sun / moon punch through clouds at full
+// brightness, looking nonphysical. With it, clouds correctly occlude
+// the celestials in proportion to the integrated cloud density along
+// the camera ray.
+//
+// Value semantics: trans_eye_c, the running transmittance product
+// exp(-sum(density * dt)) accumulated through the cloud march. 1.0
+// means "no cloud blocking" (no clouds at all, ray misses the layer,
+// or clouds_p1.w == 0); 0.0 means "fully opaque cloud." Sky-behind-
+// cloud illumination of the cloud (in-scatter glow from moon / sun /
+// skylight) is handled by the EXISTING b>0 / cloud-march integration
+// in the path tracer and is unaffected by this G-buffer write -- this
+// texture only carries the camera-ray transmittance number that the
+// composite needs.
+//
+// Allocated whenever denoiser_active_ (alongside denoise_color,
+// depth_tex, motion_tex). When the denoiser is off, the path tracer's
+// inline swapchain write handles celestial attenuation naturally via
+// the existing volumetric integration, so this texture is unbound
+// and write is gated on denoiser_enabled. Same SPIR-V / MSL
+// declaration-on-both-targets rule as albedo_tex (see that field's
+// comment) -- excluding the declaration from one backend would shift
+// every subsequent texture slot.
+[[vk::binding(22, 0)]] RWTexture2D<float>  cloud_trans_tex;
+
 // GPU-resident exposure scalar. Updated each frame by AutoExposure.slang
 // (when r_auto_exposure = 1) or written once by the engine via
 // WriteBuffer (when r_auto_exposure = 0, holding the manual r_exposure
@@ -1875,6 +1905,17 @@ void main(uint2 tid : SV_DispatchThreadID) {
     const bool composite_celestials_active =
         (denoiser_enabled != 0u) && (write_hdr_aux != 0u) &&
         (composite_celestials != 0u);
+    // Cloud transmittance G-buffer (issue #46 follow-up). Captures the
+    // camera-ray cloud march's running trans_eye_c product so the post-
+    // denoise StarsComposite kernel can attenuate the celestial
+    // composite by it -- without this, stars / sun / moon punch through
+    // clouds at full brightness in the final image. Defaults to 1.0
+    // (no occlusion) when clouds are off, the ray misses the cloud
+    // layer, or no march runs. Captured from sample 0 only -- the
+    // cloud field is smooth enough that the sub-pixel jitter delta
+    // between samples is well below cloud feature size, so any single
+    // sample is a faithful proxy for the unjittered camera ray.
+    float frame_cloud_trans = 1.0;
     for (uint s = 0u; s < sample_count; ++s) {
         // When MetalFX is on, all pixels of the frame share the same
         // sub-pixel offset (Halton sequence picked on host) so the
@@ -2670,6 +2711,14 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         trans_eye_c *= exp(-dens * dtc);
                     }
                     radiance += v_color_c * vol_int;
+                    // G-buffer write source for cloud_trans_tex. Only
+                    // sample 0's value is captured so the texture's
+                    // value is deterministic when the dispatch finishes
+                    // -- with spp>1 the cloud field is smooth enough
+                    // that any single sample is a faithful proxy.
+                    if (s == 0u) {
+                        frame_cloud_trans = trans_eye_c;
+                    }
                 }
             }
         }
@@ -2789,6 +2838,13 @@ void main(uint2 tid : SV_DispatchThreadID) {
             float3 mapped = acesTonemap(hdr_src * exposure);
             denoise_color[tid] = float4(mapped, 1.0);
         }
+        // Cloud-transmittance G-buffer (issue #46 follow-up). Same
+        // write_hdr_aux gate as denoise_color above -- only allocated
+        // / bound when the post-denoise composite chain needs it.
+        // frame_cloud_trans defaults to 1.0 (no cloud, no occlusion)
+        // and is overwritten by the volumetric cloud march on sample 0
+        // when the layer is active and the ray crosses it.
+        cloud_trans_tex[tid] = frame_cloud_trans;
     }
 
     // Swapchain write. Apply the OETF on the SPIR-V path so the OS's

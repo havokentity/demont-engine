@@ -359,6 +359,16 @@ private:
     // exposure+ACES-encoded sRGB into the swapchain. Co-allocated +
     // resized with the other denoiser-related textures.
     std::uint64_t                               post_denoise_hdr_tex_id_ = 0;
+    // Cloud transmittance G-buffer (issue #46 follow-up). R32F
+    // per-pixel, written by PathTrace's volumetric cloud march at the
+    // end of main() and read by StarsComposite to attenuate the
+    // additive celestial contribution. 1.0 = no occlusion (no cloud,
+    // ray misses the layer, or clouds disabled); values < 1.0
+    // darken the stars / sun / moon proportionally so clouds
+    // occlude them in the final composited image. Allocated alongside
+    // the rest of the denoiser-related textures (same denoiser_active_
+    // lifecycle as depth_tex / motion_tex / post_denoise_hdr).
+    std::uint64_t                               cloud_trans_tex_id_ = 0;
     // Bloom mip chain. mip 0 is half-res of the swapchain; each
     // subsequent mip halves again. Built every frame from
     // post_denoise_hdr_tex_ via threshold + downsample + upsample
