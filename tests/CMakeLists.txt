@@ -100,6 +100,16 @@ pt_add_test(cvar_roundtrip
     cvar_roundtrip_test.cpp
     LINK_TARGETS pt_console)
 
+# Cvar UX pass: platform-filtered listing + "0" as off-shorthand for
+# enum cvars. Pins the visibility contract for cvars carrying a
+# CVAR_PLATFORM_* bit (registered everywhere but hidden from
+# EnumerateCVars on the wrong host) and the alias path that rewrites
+# the literal "0" to a matching off / none / disabled allowed token
+# before the value gate runs.
+pt_add_test(cvar_ux
+    cvar_ux_test.cpp
+    LINK_TARGETS pt_console)
+
 # Image-diff compute kernel. Exercises pt::imgdiff::Compute / Passes
 # directly with hand-crafted RGBA8 buffers -- no PNG I/O, no CLI
 # parsing. Groundwork for the golden-image regression matrix (#45);

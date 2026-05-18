@@ -238,6 +238,33 @@ ExecuteResult Console::Execute(std::string_view line) {
             new_value.append(tokens[i]);
         }
 
+        // "0" as off-shorthand. When the user types a literal "0" on an
+        // enum-style cvar (one with allowed_values) and the allowed set
+        // contains exactly one of "off" / "none" / "disabled", rewrite
+        // the incoming value to that canonical token so the standard
+        // allowed_values gate accepts it. Only "0" gets this treatment
+        // -- "1" / "true" / any other digit must still hit the normal
+        // validation path so a bool-stored-as-int cvar like r_clouds
+        // (allowed_values = {"0","1"}) keeps its existing behaviour.
+        if (new_value == "0" && !v->allowed_values.empty()) {
+            auto ieq = [](std::string_view a, std::string_view b) {
+                if (a.size() != b.size()) return false;
+                for (std::size_t i = 0; i < a.size(); ++i) {
+                    char ca = a[i], cb = b[i];
+                    if (ca >= 'A' && ca <= 'Z') ca = static_cast<char>(ca - 'A' + 'a');
+                    if (cb >= 'A' && cb <= 'Z') cb = static_cast<char>(cb - 'A' + 'a');
+                    if (ca != cb) return false;
+                }
+                return true;
+            };
+            for (const auto& a : v->allowed_values) {
+                if (ieq(a, "off") || ieq(a, "none") || ieq(a, "disabled")) {
+                    new_value = a;
+                    break;
+                }
+            }
+        }
+
         // Enforce allowed_values when defined.
         if (!v->allowed_values.empty()) {
             bool ok2 = false;
@@ -491,9 +518,29 @@ void Console::Drain() {
     }
 }
 
+namespace {
+
+// A cvar carrying a CVAR_PLATFORM_* bit that doesn't match the current
+// build is hidden from listing + autocomplete. Registration / set /
+// archive paths still work so demont.cfg sharing across hosts keeps
+// round-tripping.
+inline bool CVarVisibleOnThisPlatform(std::uint32_t flags) {
+#if defined(__APPLE__)
+    if ((flags & CVAR_PLATFORM_WIN) != 0) return false;
+#elif defined(_WIN32)
+    if ((flags & CVAR_PLATFORM_MAC) != 0) return false;
+#else
+    if ((flags & (CVAR_PLATFORM_MAC | CVAR_PLATFORM_WIN)) != 0) return false;
+#endif
+    return true;
+}
+
+}  // namespace
+
 void Console::EnumerateCVars(std::string_view prefix,
                              const std::function<void(CVar&)>& visitor) {
     for (auto& [_, v] : cvars_) {
+        if (!CVarVisibleOnThisPlatform(v.flags)) continue;
         if (prefix.empty() || v.name.starts_with(prefix)) visitor(v);
     }
 }

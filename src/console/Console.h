@@ -21,6 +21,14 @@ enum CVarFlag : std::uint32_t {
     CVAR_ARCHIVE   = 1u << 0,  // persist to config.cfg
     CVAR_READONLY  = 1u << 1,  // engine-set, user cannot mutate
     CVAR_CHEAT     = 1u << 2,  // requires dev_cheats 1
+    // Platform-availability hints. The cvar is still registered on
+    // every platform (so a shared demont.cfg round-trips cleanly across
+    // hosts) but is filtered out of listing / autocomplete pools on the
+    // wrong platform. Default of zero on both bits = "available
+    // everywhere". Mutually exclusive in practice; setting both is
+    // legal but masks the cvar everywhere it isn't built for.
+    CVAR_PLATFORM_MAC = 1u << 3,
+    CVAR_PLATFORM_WIN = 1u << 4,
 };
 
 struct CVar {
