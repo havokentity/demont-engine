@@ -9743,6 +9743,18 @@ void Engine::RegisterCommands() {
             v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
         }
     }
+    // Phase 4 (#100) cloud-march cvars: r_vol_density_scale / r_vol_phase_g /
+    // r_vol_multiscatter_bounces feed the cloud march body, so changing
+    // them mid-run alters per-pixel radiance. Without these on_change
+    // hooks the accumulator/denoiser history blends old and new lighting
+    // (smears the tweak across frames), matching the existing r_clouds_*
+    // / r_volumetric_* invalidation pattern.
+    for (const char* n : {"r_vol_density_scale", "r_vol_phase_g",
+                          "r_vol_multiscatter_bounces"}) {
+        if (auto* v = C.FindCVar(n)) {
+            v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+        }
+    }
     // Cloud preset: when set, snap the individual cloud cvars to the
     // preset's parameter set. The user can then nudge individual values
     // without changing the preset name (or set it to "custom" to lock).

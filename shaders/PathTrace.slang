@@ -707,8 +707,14 @@ cbuffer Push {
     uint write_shadow_vis;
     uint _pad_shadow_vis;
     // --- Heterogeneous volumetric phase 4 (#100) ---------------------------
-    // New 16-byte trailing block for the cloud march. Host pushes from
-    // r_vol_density_scale / r_vol_phase_g_cloud / r_vol_multiscatter_octaves.
+    // Three floats sharing the trailing block. Host pushes them from
+    // r_vol_density_scale / r_vol_phase_g / r_vol_multiscatter_bounces
+    // (engine-side CVar names; the shader names below are kept
+    // descriptive: vol_phase_g_cloud disambiguates from the atmospheric-
+    // haze g, and vol_multiscatter_oct is the shader-side octave count
+    // even though the user-facing CVar is named for the "bounces"
+    // abstraction).
+    //
     //   vol_density_scale     -- linear multiplier on cloud peak sigma_t
     //                            so artists can dial thickness up/down.
     //   vol_phase_g_cloud     -- HG anisotropy for the cloud march
@@ -2734,26 +2740,6 @@ float cloud_optical_depth_stratified(float3 ro, float3 rd, float t_max,
     return od * dscale;
 }
 
-// Phase 4 (#100): RGB transmittance along a shadow ray AT A CLOUD SAMPLE,
-// composed of (sharp stratified cloud-only OD) * (analytical atmospheric
-// transmittance for the long sky leg above the cloud) * (any dielectric
-// path tint hit en route). Decouples the cloud's Beer's-law shadow from
-// the geometry-trace cost: a NEE shadow ray from inside a cloud toward
-// the sun doesn't need to walk the BVH for the empty-sky kilometres
-// after it punches out the top of the cloud layer -- the only
-// occluders along that segment are the cloud itself (handled here
-// stratified) and the air column above (closed-form). Skipping the
-// traceScene over those tens of kilometres is why god rays render fast
-// enough at 16 spp to remain inside the 6 ms 1080p budget.
-float3 cloud_nee_transmittance(float3 ro, float3 rd, inout uint seed) {
-    float od = cloud_optical_depth_stratified(ro, rd, 1e30, seed);
-    float cloud_t = exp(-od);
-    // Atmospheric leg from cloud sample upward to top-of-atmosphere.
-    // 60km is the same cap atmosphericTransmittance internally honours.
-    float3 atm_t = atmosphericTransmittance(ro, rd, 60000.0);
-    return atm_t * float3(cloud_t);
-}
-
 // Analytical atmospheric transmittance (Mie + Rayleigh) along the
 // straight ray segment [ro, ro + rd*t]. Used to give cloud-march
 // samples and (in future) primary-ray surface hits aerial-perspective
@@ -4230,13 +4216,14 @@ void main(uint2 tid : SV_DispatchThreadID) {
             //     self-shadow; with N octaves, each octave reduces the
             //     extinction coefficient by 2^-i so the deeper octaves
             //     act as cheap proxies for multi-scattered light.
-            //   * Stratified cloud-shadow rays via cloud_nee_transmittance
-            //     -- sharper god rays through thin cloud gaps. Skips the
-            //     expensive traceScene call for the open-sky leg above
-            //     the cloud (the cloud + atmosphere is the only occluder
-            //     by construction), which is what keeps the per-sample
-            //     NEE cost under budget when crossing 12+ sub-samples
-            //     stratified along the shadow ray.
+            //   * Stratified cloud-shadow rays via inline
+            //     cloud_optical_depth_stratified * atmosphericTransmittance
+            //     (instead of a traceScene call). Sharper god rays through
+            //     thin cloud gaps. Skips the expensive traceScene call for
+            //     the open-sky leg above the cloud (the cloud + atmosphere
+            //     is the only occluder by construction), which is what
+            //     keeps the per-sample NEE cost under budget when crossing
+            //     12+ sub-samples stratified along the shadow ray.
             //   * Adaptive step size -- when the current sample finds
             //     near-zero density we increment t by the same dtc
             //     anyway (no work skipped); the win is that the per-
@@ -4308,16 +4295,10 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     int   ms_oct     = clamp(int(vol_multiscatter_oct + 0.5),
                                               0, 4);
                     float g_cloud2   = g_cloud * g_cloud;
-                    // Recompute the cloud phase value once per primary
-                    // ray; the cloud march's NEE per-light recomputes
-                    // anyway because its cos_theta is per-light, but
-                    // for the sun/moon main lobe this saves N pow().
-                    float cos_cloud  = dot(primary_rd, -sun_dir);
-                    float phase_cloud = (1.0 - g_cloud2)
-                        / (4.0 * 3.14159265358979
-                            * pow(max(1.0 + g_cloud2
-                                        - 2.0 * g_cloud * cos_cloud, 1e-4),
-                                  1.5));
+                    // (Per-light HG phase is recomputed inside each NEE
+                    // branch below because cos_theta is per-light;
+                    // pre-computing a primary-ray phase value here would
+                    // be dead in the cloud march's hot path.)
                     // In HDRI mode the env map is the canonical sky and the
                     // engine's procedural sun + moon are NOT contributors --
                     // otherwise clouds get double-lit by both the HDRI's
@@ -4428,8 +4409,9 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         if (hdri_lit) {
                             // HDRI extracted-lights NEE: stochastic
                             // single-pick weighted by cluster luminance.
-                            // Phase 4: route the shadow visibility through
-                            // cloud_nee_transmittance so the cloud's own
+                            // Phase 4: compose the shadow visibility inline
+                            // as cloud_optical_depth_stratified *
+                            // atmosphericTransmittance so the cloud's own
                             // stratified Beer-Lambert produces sharp god
                             // rays through holes between cumulus puffs.
                             if (hdri_lights_count > 0u) {
@@ -4501,9 +4483,10 @@ void main(uint2 tid : SV_DispatchThreadID) {
                             // sit ABOVE most of the absorbing atmosphere
                             // and catch brighter / less-reddened light
                             // than the ground does. Phase 4: visibility
-                            // routed through cloud_nee_transmittance for
-                            // the sharp stratified cloud OD that god rays
-                            // need to silhouette through cloud gaps.
+                            // composed inline (cloud_optical_depth_stratified
+                            // * atmosphericTransmittance) for the sharp
+                            // stratified cloud OD that god rays need to
+                            // silhouette through cloud gaps.
                             if (sun_elev > 0.0) {
                                 float h_alt   = max(sp.y, 0.0);
                                 float h_norm  = saturate(h_alt / 8000.0);
