@@ -11796,7 +11796,6 @@ void Engine::RegisterPhysicsCommands() {
                     if (prim_id != 0) vec->push_back(prim_id);
                 },
                 &prim_ids);
-<<<<<<< HEAD
             // Mirror for the rigid-body pool (Phase 2a, #138). Same
             // callback signature shape; different per-element type.
             physics_->ForEachRigidBody(
@@ -11807,20 +11806,16 @@ void Engine::RegisterPhysicsCommands() {
                     if (prim_id != 0) vec->push_back(prim_id);
                 },
                 &prim_ids);
-            for (auto id : prim_ids) primitives_.erase(id);
-            const std::uint32_t removed = static_cast<std::uint32_t>(prim_ids.size());
-=======
             // Count actual erases, not the gathered-id total. If the
             // user nuked some of these prims out-of-band (via
             // prim_remove or by re-issuing prim_sphere with the same
             // id), std::map::erase returns 0 for those slots and the
             // reported count would over-state what phys_clear actually
-            // did. The pool clear below handles the particle side.
+            // did.
             std::uint32_t removed = 0;
             for (auto id : prim_ids) {
                 removed += static_cast<std::uint32_t>(primitives_.erase(id));
             }
->>>>>>> origin/feature/physics-verlet-132
             physics_->Clear();
             if (removed > 0) {
                 primitives_dirty_ = true;
