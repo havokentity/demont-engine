@@ -3,6 +3,8 @@
 
 #include "AnalyticBvh.h"
 
+#include "../core/Tracy.h"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -204,6 +206,7 @@ inline void AabbReset(float (&mn)[3], float (&mx)[3]) {
 }  // namespace
 
 void AnalyticBvh::Build(std::span<const BvhPrim> prims) {
+    PT_ZONE_SCOPED_N("AnalyticBvh::Build");
     nodes_.clear();
     permuted_.clear();
     working_.clear();

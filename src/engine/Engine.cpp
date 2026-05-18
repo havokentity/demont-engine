@@ -16,6 +16,7 @@
 #include "../core/Jobs/JobSystem.h"
 #include "../core/Log.h"
 #include "../core/Memory/Memory.h"
+#include "../core/Tracy.h"
 #include "../renderer/Astronomy.h"
 #include "../renderer/BscCatalog.h"
 #include "../renderer/MoonTexture.h"
@@ -1939,6 +1940,7 @@ void Engine::EnsureMeshUpdated() {
 }
 
 void Engine::RebuildMeshResources(const pt::csg::BakedMesh& baked) {
+    PT_ZONE_SCOPED_N("Engine::RebuildMeshResources");
     if (!device_) return;
 
     // Drain any in-flight GPU work so it's safe to destroy old resources.
@@ -2147,6 +2149,7 @@ void Engine::SeedDefaultPrimitives() {
 }
 
 void Engine::ReloadEnvMap(const std::string& path) {
+    PT_ZONE_SCOPED_N("Engine::ReloadEnvMap");
     if (!device_) {
         // Defer: cvar set before backend is up. Stash the path and apply
         // on the next RequestBackendSwitch.
@@ -2454,6 +2457,7 @@ void Engine::ReloadEnvMap(const std::string& path) {
 void Engine::EnsureMoonMapUploaded() {
     if (!device_) return;
     if (moon_map_tex_id_ != 0) return;
+    PT_ZONE_SCOPED_N("Engine::EnsureMoonMapUploaded");
     // 512x256 = ~1 MB at RGBA16F. The moon disc is tiny on screen
     // (~9-15 px at default r_moon_size), so anything past a 256x
     // near-side coverage is sampled-down to invisibility -- 2K was
@@ -2498,6 +2502,7 @@ void Engine::EnsureMoonMapUploaded() {
 void Engine::EnsureStarMapUploaded() {
     if (!device_) return;
     if (star_map_tex_id_ != 0) return;          // already uploaded on this device
+    PT_ZONE_SCOPED_N("Engine::EnsureStarMapUploaded");
 
     constexpr const char*  kPath = "assets/stars/BSC5.dat";
     // 8192x4096 RGBA16F = 256MB. Trades VRAM for star crispness:
@@ -2921,6 +2926,7 @@ void Engine::EnsurePipelineHandles() {
 }
 
 void Engine::RenderFrame() {
+    PT_ZONE_SCOPED_N("Engine::RenderFrame");
     // Pipelines may still be building on the Vulkan backend's async
     // worker; re-resolve cached ids each frame until each flips
     // non-zero. Once all are cached the resolves are no-ops.
@@ -3075,7 +3081,11 @@ void Engine::RenderFrame() {
         }
     }
 
-    auto fc = device_->BeginFrame();
+    pt::rhi::FrameContext fc;
+    {
+        PT_ZONE_SCOPED_N("Device::BeginFrame");
+        fc = device_->BeginFrame();
+    }
 
     // Camera-movement detection -> reset accumulation.
     auto& cam = *camera_;
@@ -4669,6 +4679,7 @@ void Engine::RenderFrame() {
         // on the first mip for path-tracer firefly resilience) then
         // upsample-add.
         auto dispatch_bloom_pyramid = [&](std::uint64_t source_tex_id) {
+            PT_ZONE_SCOPED_N("Engine::dispatch_bloom_pyramid");
             // Downsample: source_tex -> mip0 (with threshold), then
             // mip0 -> mip1 -> ... -> mip[N-1]. Each step's read of
             // mip[i-1] is the previous step's write -- explicit
@@ -4881,6 +4892,7 @@ void Engine::RenderFrame() {
         // (use_vulkan_bloom_finalize on Vulkan, use_engine_tonemap on
         // Metal) still write the swapchain from denoise_color.
         if (denoiser_active_) {
+            PT_ZONE_SCOPED_N("Device::Denoise");
             device_->Denoise(dd);
         }
 
@@ -4914,6 +4926,7 @@ void Engine::RenderFrame() {
                                   ? pt::rhi::TextureHandle{bloom_mip_tex_id_[0]}
                                   : pt::rhi::TextureHandle{0};
             dd.bloom_intensity = bloom_can_run ? bloom_intensity : 0.0f;
+            PT_ZONE_SCOPED_N("Device::Denoise(FinalizeOnly)");
             device_->Denoise(dd);
         }
 
@@ -5469,8 +5482,14 @@ void Engine::RenderFrame() {
         }
     }
 
-    device_->Submit(cb);
-    device_->EndFrame(cb);
+    {
+        PT_ZONE_SCOPED_N("Device::Submit");
+        device_->Submit(cb);
+    }
+    {
+        PT_ZONE_SCOPED_N("Device::EndFrame (present)");
+        device_->EndFrame(cb);
+    }
 
     // Post-present frame-capture hook. Driven by r_capture_frame_at /
     // r_capture_seq / r_capture_seed -- the cvars' on_change handlers
@@ -5616,6 +5635,7 @@ void Engine::UpdateCamera(double dt) {
 }
 
 void Engine::Tick(double dt) {
+    PT_ZONE_SCOPED_N("Engine::Tick");
     pt::console::Console::Get().Drain();
 
     // Deferred swap screenshot: after Drain may have queued one in
@@ -5955,6 +5975,12 @@ void Engine::Run() {
             // else: device_ bound but loading_frame_active_ -- silently
             // skip this iteration, don't count it, don't fail on it.
         }
+
+        // Tracy frame boundary. Marks one logical frame for the
+        // profiler's flame-graph view -- one tick of the main loop ==
+        // one frame, regardless of whether the device was bound or the
+        // loading-frame path painted. No-op when PT_ENABLE_TRACY is OFF.
+        PT_FRAME_MARK;
     }
     LOG_INFO("Run loop exited.");
 

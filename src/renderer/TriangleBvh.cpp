@@ -3,6 +3,8 @@
 
 #include "TriangleBvh.h"
 
+#include "../core/Tracy.h"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -30,6 +32,7 @@ inline void AabbIncludeTri(float (&mn)[3], float (&mx)[3],
 
 void TriangleBvh::Build(std::span<const float>         positions,
                         std::span<const std::uint32_t> indices) {
+    PT_ZONE_SCOPED_N("TriangleBvh::Build");
     nodes_.clear();
     permuted_.clear();
     working_.clear();
