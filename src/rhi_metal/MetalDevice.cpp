@@ -40,10 +40,19 @@ extern const unsigned long shader_StarsComposite_metal_size;
 // MetalFXDenoiser.mm: ObjC++ shim around MTLFXTemporalDenoisedScaler.
 extern "C" void* pt_metalfx_create(void* mtl_device, std::uint32_t w, std::uint32_t h);
 extern "C" void  pt_metalfx_destroy(void* scaler);
+// pt_metalfx_encode parameters (issue #118 adds the specular-guidance
+// trio: specular_albedo_in / roughness_in / specular_hit_distance_in):
+//   state, mtl_cb, color_in, depth_in, motion_in, normal_in, albedo_in,
+//   specular_albedo_in (#118), roughness_in (#118),
+//   specular_hit_distance_in (#118), color_out, jitter_x, jitter_y,
+//   world_to_view, view_to_clip, reset.
 extern "C" void  pt_metalfx_encode(void* scaler, void* mtl_cb,
                                     void* color_in, void* depth_in,
                                     void* motion_in,
                                     void* normal_in, void* albedo_in,
+                                    void* specular_albedo_in,
+                                    void* roughness_in,
+                                    void* specular_hit_distance_in,
                                     void* color_out,
                                     float jitter_x, float jitter_y,
                                     const float* world_to_view_4x4,
@@ -487,12 +496,17 @@ void MetalDevice::Denoise(const DenoiseDesc& d) {
             metalfx_height_ = h;
         }
         // Guidance G-buffers: normal already looked up above for SVGF;
-        // albedo also goes to MetalFX so look it up here. Both default
-        // to nullptr if the engine didn't allocate them (which it
-        // should for SVGF->MetalFX kinds per the want_*_gbuffer gates
-        // in Engine.cpp, but Apple's scaler tolerates nil bindings as
-        // "no guidance for this frame" rather than crashing).
-        auto* albedo_in_chain = LookupTexture(d.albedo_in);
+        // albedo + specular trio also go to MetalFX so look them up
+        // here. All default to nullptr if the engine didn't allocate
+        // them (which it should for SVGF->MetalFX kinds per the
+        // want_*_gbuffer gates in Engine.cpp, but Apple's scaler
+        // tolerates nil bindings as "no guidance for this frame"
+        // rather than crashing). Issue #118 adds the specular trio:
+        // specular_albedo (F0), roughness, specular_hit_distance.
+        auto* albedo_in_chain               = LookupTexture(d.albedo_in);
+        auto* specular_albedo_in_chain      = LookupTexture(d.specular_albedo_in);
+        auto* roughness_in_chain            = LookupTexture(d.roughness_in);
+        auto* specular_hit_distance_in_chain = LookupTexture(d.specular_hit_distance_in);
         pt_metalfx_encode(metalfx_scaler_,
                           static_cast<void*>(cmd_->RawCmdBuf()),
                           static_cast<void*>(svgf_metalfx_intermediate_),
@@ -500,6 +514,9 @@ void MetalDevice::Denoise(const DenoiseDesc& d) {
                           static_cast<void*>(motion_in),
                           static_cast<void*>(normal_in),
                           static_cast<void*>(albedo_in_chain),
+                          static_cast<void*>(specular_albedo_in_chain),
+                          static_cast<void*>(roughness_in_chain),
+                          static_cast<void*>(specular_hit_distance_in_chain),
                           static_cast<void*>(color_out),
                           d.jitter_x, d.jitter_y,
                           d.world_to_view, d.view_to_clip,
@@ -523,13 +540,20 @@ void MetalDevice::Denoise(const DenoiseDesc& d) {
     }
 
     // Guidance G-buffers (Apple's MTLFXTemporalDenoisedScaler accepts
-    // normal + diffuse-albedo inputs to weight its spatial filter --
-    // without these MetalFX falls back to a conservative blur that
-    // doesn't converge on static cameras). Engine allocates these for
-    // MetalFX kinds via want_normal_gbuffer / want_albedo_gbuffer; a
-    // nil handle is tolerated by the scaler as "no guidance".
-    auto* normal_in_mfx = LookupTexture(d.normal_in);
-    auto* albedo_in_mfx = LookupTexture(d.albedo_in);
+    // normal + diffuse-albedo + specular-trio inputs to weight its
+    // spatial filter -- without these MetalFX falls back to a
+    // conservative blur that doesn't converge on static cameras and
+    // produces 8x8 halos on bright reflections / metals). Engine
+    // allocates these for MetalFX kinds via want_normal_gbuffer /
+    // want_albedo_gbuffer / want_specular_guidance_gbuffers; a nil
+    // handle is tolerated by the scaler as "no guidance" for that
+    // input. Issue #118 added the specular trio: specular_albedo (F0),
+    // roughness, specular_hit_distance.
+    auto* normal_in_mfx                = LookupTexture(d.normal_in);
+    auto* albedo_in_mfx                = LookupTexture(d.albedo_in);
+    auto* specular_albedo_in_mfx       = LookupTexture(d.specular_albedo_in);
+    auto* roughness_in_mfx             = LookupTexture(d.roughness_in);
+    auto* specular_hit_distance_in_mfx = LookupTexture(d.specular_hit_distance_in);
     pt_metalfx_encode(metalfx_scaler_,
                       static_cast<void*>(cmd_->RawCmdBuf()),
                       static_cast<void*>(color_in),
@@ -537,6 +561,9 @@ void MetalDevice::Denoise(const DenoiseDesc& d) {
                       static_cast<void*>(motion_in),
                       static_cast<void*>(normal_in_mfx),
                       static_cast<void*>(albedo_in_mfx),
+                      static_cast<void*>(specular_albedo_in_mfx),
+                      static_cast<void*>(roughness_in_mfx),
+                      static_cast<void*>(specular_hit_distance_in_mfx),
                       static_cast<void*>(color_out),
                       d.jitter_x, d.jitter_y,
                       d.world_to_view, d.view_to_clip,
