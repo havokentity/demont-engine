@@ -49,7 +49,9 @@ static const uint SDF_OP_DISPLACE         = 4u;
 // evaluation (same caveat as Phase 1 ops above). These ops never have
 // a *closed-form* analytic gradient -- the noise / repeat / twist / bend
 // machinery composes through finite-difference or forward-AD numerics
-// instead. See sdfClusterDistAndGradFwd below for the AD path.
+// instead. See sdfClusterDistDN / sdfClusterDistDWarped below for the
+// AD walker; sdfClusterDistProcN / sdfClusterDistWarped for the scalar
+// distance walker the sphere tracer steps through.
 //
 //   SDF_OP_DISPLACE_NOISE  -- adds an FBM-noise band of amplitude
 //                              params[0] (metres), base frequency
@@ -733,18 +735,33 @@ Dual3 evalLeafDistD(float3 p_local, uint shape, float4 params) {
 // The forward-AD path below does the same warp but on a Dual3 so the
 // gradient comes out chained.
 
-// Twist around the Y axis: rotates the (x,z) plane by `rate * y`.
+// Twist around the WORLD Y axis: rotates the (x,z) plane by `rate * y`.
 // Distance returned is the CHILD's distance evaluated at the warped
 // point. Note: the result is *not* a true Lipschitz-1 SDF on the
 // twisted shape -- twist stretches space, so the sphere-tracer must
 // take smaller-than-distance steps in heavily twisted regions. We
 // scale the returned distance by 0.5 to compensate (standard IQ
 // trick); this slows the trace but keeps it correct.
+//
+// PIVOT SEMANTICS: this warp operates on world-space `p` directly,
+// so an off-origin child rotates AROUND the world Y axis rather than
+// around its own vertical axis. A box centred at (-2, 1, 0) wrapped
+// in twist therefore sweeps a wedge of a cylinder around the world
+// origin, not a helix in place. The AABB in AnalyticBvh.cpp
+// (SDF_OP_TWIST case) takes the world-axis cylinder as its bound to
+// keep the slab test conservative under this convention. Users who
+// want a local-pivot twist should pre-translate the child to the
+// origin, twist, and re-translate via a future translate op (a
+// child-local-pivot warp variant is filed as a Phase 3 follow-up).
 float3 sdfWarpTwist(float3 p, float rate) {
     float c = cos(rate * p.y);
     float s = sin(rate * p.y);
     return float3(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
 }
+// Bend around the WORLD X axis: same world-pivot semantics as
+// sdfWarpTwist -- an off-origin child bends around the world X axis
+// rather than its own. The AABB code (SDF_OP_BEND case) bounds the
+// rotation by a cylinder around the world X axis to stay conservative.
 float3 sdfWarpBend(float3 p, float rate) {
     float c = cos(rate * p.x);
     float s = sin(rate * p.x);
@@ -895,14 +912,16 @@ Dual3 sdfClusterDistDN(SdfCluster c, uint nc, float3 p) {
         } else {
             // Warp ops (twist / bend / repeat / repeat-limited) are
             // handled at the outer warped walker (sdfClusterDistDWarped)
-            // -- they should never appear inside this inner walk. If
-            // one does, treat as identity to keep the path defined.
-            rv = (n.op == SDF_OP_TWIST || n.op == SDF_OP_BEND ||
-                  n.op == SDF_OP_REPEAT || n.op == SDF_OP_REPEAT_LIMITED)
-                 ? vv[n.child_a] : 1e30;
-            rg = (n.op == SDF_OP_TWIST || n.op == SDF_OP_BEND ||
-                  n.op == SDF_OP_REPEAT || n.op == SDF_OP_REPEAT_LIMITED)
-                 ? vg[n.child_a] : float3(0, 1, 0);
+            // -- they should never appear inside this inner walk. The
+            // host's wrap_proc rejects nested warps up-front (see the
+            // "warps must be root" invariant comment there). If one
+            // slips through anyway (host bug or hand-crafted cluster),
+            // FAIL VISIBLY rather than silently dropping the warp: emit
+            // the +inf sentinel so the cluster surface vanishes from
+            // the trace -- much easier to spot than a subtly-wrong
+            // shape that lacks the warp it was supposed to have.
+            rv = 1e30;
+            rg = float3(0, 1, 0);
         }
         vv[i] = rv;
         vg[i] = rg;
@@ -968,7 +987,16 @@ Dual3 sdfClusterDistDWarped(SdfCluster c, float3 p) {
         float gz = -st * r.d.x + ct * r.d.z;
         r.d = float3(gx, gy, gz);
         // Lipschitz fudge: twist isn't a 1-Lipschitz SDF; scale
-        // distance down so the sphere-tracer doesn't overshoot.
+        // distance down so the sphere-tracer doesn't overshoot. The
+        // exact safe bound is 1 / (1 + |rate| * r_max) where r_max is
+        // the child's maximum distance from the twist axis (Inigo
+        // Quilez's standard derivation). 0.5 is correct for any
+        // |rate| * r_max <= 1; the Phase 2 fixture (rate=1.8/m,
+        // r_max ~= 0.42 m -> product 0.76) stays within that bound,
+        // and the sphere tracer's per-step epsilon clamp absorbs the
+        // slight overshoot in heavily-twisted regions. A
+        // rate-and-extent-aware scale is filed as a Phase 3 follow-up
+        // for very-high-rate / very-off-axis twists.
         r.v *= 0.5;
         return r;
     } else if (rn.op == SDF_OP_BEND) {
@@ -986,6 +1014,11 @@ Dual3 sdfClusterDistDWarped(SdfCluster c, float3 p) {
         float gy = ct * r.d.y + st * r.d.z;
         float gz = -st * r.d.y + ct * r.d.z;
         r.d = float3(gx, gy, gz);
+        // Same 0.5 Lipschitz fudge as TWIST -- correct for any
+        // |rate| * r_max <= 1 where r_max is the child's maximum
+        // distance from the bend (X) axis. Phase 2 fixture stays
+        // safely under that bound; a rate-aware scale is a Phase 3
+        // follow-up.
         r.v *= 0.5;
         return r;
     } else if (rn.op == SDF_OP_REPEAT) {
@@ -1043,13 +1076,14 @@ float sdfClusterDistProcN(SdfCluster c, uint nc, float3 p) {
         } else {
             // Warp ops shouldn't be evaluated by the inner walker;
             // they're handled by sdfClusterDistWarped at the root.
-            // If one appears as a non-root node, treat as identity
-            // so the path stays defined (and the host's validator
-            // should have rejected the cluster).
-            d = (n.op == SDF_OP_TWIST || n.op == SDF_OP_BEND ||
-                 n.op == SDF_OP_REPEAT || n.op == SDF_OP_REPEAT_LIMITED)
-                ? dists[n.child_a]
-                : 1e30;
+            // The host's wrap_proc rejects nested warps up-front (see
+            // the "warps must be root" invariant on the host side), so
+            // a non-root warp here means an invalid cluster slipped
+            // past validation. FAIL VISIBLY (+inf sentinel) so the
+            // cluster surface disappears from the trace -- much
+            // clearer feedback than silently dropping the warp and
+            // shipping a subtly-wrong shape.
+            d = 1e30;
         }
         dists[i] = d;
     }
@@ -1080,9 +1114,14 @@ float sdfClusterDistWarped(SdfCluster c, float3 p) {
     SdfClusterNode rn = c.nodes[root];
     if (rn.op == SDF_OP_TWIST) {
         float3 wp = sdfWarpTwist(p, rn.params.x);
+        // 0.5 Lipschitz fudge -- mirrors the AD walker's TWIST branch.
+        // Safe for |rate| * r_max <= 1; a rate-aware bound is a
+        // Phase 3 follow-up.
         return 0.5 * sdfClusterDistProcN(c, rn.child_a + 1u, wp);
     } else if (rn.op == SDF_OP_BEND) {
         float3 wp = sdfWarpBend(p, rn.params.x);
+        // Same 0.5 Lipschitz fudge as TWIST -- see the AD walker's
+        // BEND branch for the |rate| * r_max <= 1 safety condition.
         return 0.5 * sdfClusterDistProcN(c, rn.child_a + 1u, wp);
     } else if (rn.op == SDF_OP_REPEAT) {
         float3 wp = sdfWarpRepeat(p, rn.params.xyz);
