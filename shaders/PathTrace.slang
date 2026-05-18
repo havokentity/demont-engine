@@ -956,8 +956,14 @@ float3 starsOnly(float3 rd, float3 sun) {
         // phase + frequency, and the whole star modulates as one
         // unit. (Hashing on raw texel coords made adjacent texels of
         // a multi-texel bright star twinkle out-of-phase, which
-        // averaged flat to the eye.) +/-45%% amplitude over a 3-8 Hz
-        // sinusoid; reads as broadband atmospheric scintillation.
+        // averaged flat to the eye.) +/-45%% amplitude over a 1-3 Hz
+        // sinusoid (period 0.33-1.0 s, the "calm night sky" cadence).
+        // The previous 3-8 Hz range looked natural through the SVGF
+        // a-trous smudge -- the denoiser temporally low-passed the
+        // modulation. With the stateless StarsComposite pass keeping
+        // stars pixel-sharp, the same frequency band reads as too
+        // fast / nervous on-screen; halving it lands on a typical
+        // "in-game stars" look.
         if (exposure_pad.w > 0.5) {
             int3 q  = int3(floor(j * 38.0));   // ~1.5 deg bins
             uint qh = uint(q.x + 128) * 65536u
@@ -965,7 +971,7 @@ float3 starsOnly(float3 rd, float3 sun) {
                     + uint(q.z + 128);
             uint h    = pcgHash(qh + 0xb7e1u);
             float ph  = float(h & 0xFFFFu) * (1.0 / 65536.0);
-            float fhz = 3.0 + float((h >> 16) & 0xFFu) * (5.0 / 256.0);
+            float fhz = 1.0 + float((h >> 16) & 0xFFu) * (2.0 / 256.0);
             float t   = float(frame_index) * (1.0 / 60.0);
             float w   = 0.55 + 0.45 * sin(6.28318530718 * (ph + t * fhz));
             stars *= w;
