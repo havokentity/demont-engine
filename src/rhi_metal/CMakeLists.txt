@@ -54,15 +54,20 @@ pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/SdfFractals.slang)
 pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/RestirReservoir.slang)
 # --- end ReSTIR DI Phase A ------------------------------------------------
 
-# --- Megakernel feature gates (PR #164) -----------------------------------
-# Translate the top-level PT_WATER_ENABLED option into a -DPT_WATER_ENABLED=N
-# slangc define so the #if PT_WATER_ENABLED blocks in PathTrace.slang resolve.
-# Default OFF so a stock `cmake --preset mac-release` strips the water
-# branch and recovers the +2.99 ms / frame regression from #153.
+# --- Megakernel feature gates: slangc defines -----------------------------
+# Translate each top-level PT_* option into a slangc -D flag so the
+# matching `#if PT_*_ENABLED` blocks in PathTrace.slang resolve. Each
+# gate's _pt_*_def variable is then included in EXTRA_DEFINES on the
+# pt_compile_slang() call below.
 if(PT_WATER_ENABLED)
     set(_pt_water_def "-DPT_WATER_ENABLED=1")
 else()
     set(_pt_water_def "-DPT_WATER_ENABLED=0")
+endif()
+if(PT_LIGHT_TREE)
+    set(_pt_light_tree_def "-DPT_LIGHT_TREE_ENABLED=1")
+else()
+    set(_pt_light_tree_def "-DPT_LIGHT_TREE_ENABLED=0")
 endif()
 # --- end Megakernel feature gates -----------------------------------------
 pt_compile_slang(
@@ -72,7 +77,7 @@ pt_compile_slang(
     ENTRY   main
     TARGETS metal
     MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals RestirReservoir
-    EXTRA_DEFINES ${_pt_water_def}
+    EXTRA_DEFINES ${_pt_water_def} ${_pt_light_tree_def}
 )
 pt_compile_slang(
     TARGET  pt_rhi_metal

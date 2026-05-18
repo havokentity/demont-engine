@@ -60,14 +60,30 @@ target_link_libraries(pt_engine
     PRIVATE tomlplusplus::tomlplusplus
 )
 
-# --- Megakernel feature gates (PR #164) -----------------------------------
-# Mirror the shader-side PT_WATER_ENABLED gate into a C++ compile define so
-# Engine.cpp can emit a single startup [warn] when a user has tweaked the
-# r_water_* cvars in a build that compiled out the water BRDF.
+# --- Megakernel feature gates: host-side mirrors --------------------------
+# Each PT_* gate in the top-level CMakeLists.txt also needs a matching
+# C++ compile define on pt_engine so Engine.cpp can detect the build-time
+# state of the corresponding shader subsystem -- typically to emit a
+# single startup [warn] when a user has set the runtime cvar on a build
+# that compiled out the feature, or to force the in-push toggle to OFF
+# regardless of cvar state.
+#
+# PT_WATER_ENABLED (#134, PR #168): Engine.cpp emits a [warn] when
+# r_water_* cvars are non-default and the gate is OFF.
 if(PT_WATER_ENABLED)
     target_compile_definitions(pt_engine PRIVATE PT_WATER_ENABLED=1)
 else()
     target_compile_definitions(pt_engine PRIVATE PT_WATER_ENABLED=0)
+endif()
+
+# PT_LIGHT_TREE (#129, PR #170): when OFF, Engine.cpp forces
+# light_tree_enabled=0 in PtPush so the shader uniform-pick fallback is
+# the only path. Also emits a [warn] when r_light_tree=1 was set in a
+# build that compiled out the hierarchical picker.
+if(PT_LIGHT_TREE)
+    target_compile_definitions(pt_engine PRIVATE PT_LIGHT_TREE_ENABLED=1)
+else()
+    target_compile_definitions(pt_engine PRIVATE PT_LIGHT_TREE_ENABLED=0)
 endif()
 # --- end Megakernel feature gates -----------------------------------------
 

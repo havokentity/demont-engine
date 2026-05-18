@@ -106,30 +106,62 @@ option(PT_BUILD_TESTS           "Build unit tests via doctest"          ON)
 # minimal.
 option(PT_BUILD_TOOLS           "Build developer tooling under tools/"  ON)
 
-# --- Megakernel feature gates (PR #164: perf hardening) --------------------
-# Each PT_*_ENABLED toggle compiles a specific material/shader subsystem
-# in or out of the unified PathTrace.slang megakernel. The compile-time
-# gate matters more than the runtime cost: even with no water primitive
-# in the scene, leaving the water branch in the megakernel inflates the
-# per-thread register pressure of the dispatch, dropping wavefront
-# occupancy across every pixel.
+# --- Megakernel feature gates ----------------------------------------------
+# Each PT_*_ENABLED / PT_*_ON toggle compiles a specific material/shader
+# subsystem in or out of the unified PathTrace.slang megakernel. The
+# compile-time gate matters more than the runtime cost: leaving an unused
+# subsystem in the megakernel inflates per-thread register pressure of the
+# dispatch, dropping wavefront occupancy across every pixel + thrashing
+# Apple Silicon's SIMD instruction cache. (Sibling SDF Phase 2 gate lives
+# in cmake/Slang.cmake -- it gates a Slang module rather than a megakernel
+# branch, so the option is registered closer to the shader-compile glue.)
 #
-# PT_WATER_ENABLED (#134): MAT_WATER analytic-plane BRDF (Schlick Fresnel
-# + Snell refraction + Beer's-law absorption) + the 8-noise-tap wave-
-# normal helper + the MAT_WATER branch in transmittance().
-# Default OFF -- water is a niche showcase feature; flipping ON paid
-# +2.99 ms / frame against the Cornell-CSG perf-bisect baseline before
-# the gate landed. Set to ON for builds that actually use the
-# `prim_plane ... water ...` material (e.g. tests/goldens/scenes/
-# water_pool.cfg).
-#
-# The cvars (r_water_absorption_r/g/b, r_water_ior, r_water_wave_*) stay
-# registered regardless of the gate so existing user cfgs don't error
-# out on cvar-not-found; when the gate is OFF and a user sets a non-
-# default value, Engine.cpp emits a single [warn] line at startup.
+# PT_WATER_ENABLED (PR #168, issue #134): MAT_WATER analytic-plane BRDF
+# (Schlick Fresnel + Snell refraction + Beer's-law absorption) + the
+# 8-noise-tap wave-normal helper + the MAT_WATER branch in
+# transmittance(). Default OFF -- water is a niche showcase feature;
+# flipping ON paid +2.99 ms / frame against the Cornell-CSG perf-bisect
+# baseline before the gate landed. Set to ON for builds that actually
+# use the `prim_plane ... water ...` material (e.g. tests/goldens/
+# scenes/water_pool.cfg). The cvars (r_water_absorption_r/g/b,
+# r_water_ior, r_water_wave_*) stay registered regardless of the gate
+# so existing user cfgs don't error out on cvar-not-found; when the
+# gate is OFF and a user sets a non-default value, Engine.cpp emits a
+# single [warn] line at startup.
 option(PT_WATER_ENABLED
     "Compile MAT_WATER BRDF (#134) into the PathTrace megakernel. OFF = -2.99 ms/frame on water-less scenes; ON = water material renders."
     OFF)
+
+# PT_LIGHT_TREE (PR #170, issue #129): when ON, PathTrace.slang compiles
+# the Conty Estevez & Kulla 2018 light tree traversal helpers and the
+# picker if-branch. The runtime cvar r_light_tree continues to flip
+# between tree-pick and uniform-pick at zero runtime cost. When OFF the
+# traversal helpers + the picker if-branch are excised at compile time.
+# Recovers most of the structural ICache pressure PR #154 introduced
+# even when r_light_tree=0 -- the dead branch still cost ICache +
+# register pressure on Apple Silicon because the Metal compiler cannot
+# fully DCE a function reachable through a uniform runtime branch.
+#
+# Default ON: preserve functionality. Power users / perf benchmarks set
+# -DPT_LIGHT_TREE=OFF to recover megakernel hot-loop slimness; the
+# uniform-pick fallback (#73) still works correctly, just with higher
+# NEE variance on scenes with >100 lights. The cvar `r_light_tree`
+# stays registered either way; when the gate is OFF the cvar is a
+# no-op (the engine forces light_tree_enabled=0 in the push constants
+# regardless of cvar state).
+#
+# Note: the perf-bisect-reported +7.67 ms attribution from PR #154 is
+# NOT actually recovered by gating the shader code alone (default scene
+# has light_count=0 and Apple Silicon's Metal runtime DCEs the dead
+# branch effectively). The cost lives elsewhere (CPU-side per-frame
+# work in LightTree.cpp / EnsureLightTreeUploaded / descriptor binding
+# overhead). This gate is structurally valuable (266 lines / 9 KB
+# SPIR-V dropped when OFF) and templates the pattern for future
+# feature gates, even though the perf delta on the default scene is
+# within run-to-run variance. Follow-up perf investigation queued.
+option(PT_LIGHT_TREE
+    "Compile hierarchical light tree (#129) into the PathTrace megakernel. OFF strips the traversal helpers from SPIR-V (~9 KB) but does not measurably recover the +7.67 ms regression PR #154 introduced (see follow-up); ON = O(log N) importance-weighted light pick (Conty Estevez & Kulla 2018)."
+    ON)
 
 # --- Compiler/warning helper -----------------------------------------------
 include(cmake/CompilerWarnings.cmake)
