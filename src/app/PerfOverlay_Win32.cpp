@@ -185,7 +185,7 @@ bool WinPerf::Init(HWND parent) {
     DWORD gle = GetLastError();
     is_layered_ = (hwnd_ != nullptr);
     if (!hwnd_) {
-        LOG_WARN("PerfOverlay_Win32: layered child create failed (GLE={}), retrying opaque", gle);
+        // Layered child on unrealized parent returns NULL with GLE=0 (undocumented Win32); opaque retry below is the canonical path.
         SetLastError(0);
         hwnd_ = CreateWindowExW(
             0,

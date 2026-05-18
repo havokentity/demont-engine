@@ -419,7 +419,7 @@ bool WinOverlay::Init(HWND parent) {
         // some configurations (especially with Vulkan parents) reject
         // the combination. Retry without WS_EX_LAYERED -- we lose
         // translucency but keep the overlay.
-        LOG_WARN("ConsoleOverlay_Win32: layered child create failed (GLE={}), retrying opaque", gle);
+        // Layered child on unrealized parent returns NULL with GLE=0 (undocumented Win32); opaque retry below is the canonical path.
         SetLastError(0);
         hwnd_ = CreateWindowExW(
             0, class_name, L"",
