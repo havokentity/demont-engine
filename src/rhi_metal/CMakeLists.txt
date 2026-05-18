@@ -93,11 +93,7 @@ pt_compile_slang(
     ENTRY   main
     TARGETS metal
 )
-# Aurora borealis procedural overlay (issue #116). Runs once per
-# frame on Metal AFTER StarsComposite and BEFORE the bloom pyramid;
-# stateless additive composite onto post-denoise HDR. Curl-noise
-# driven ribbon density in the upper-sky elevation band (~100-150 km
-# real altitude, observer-relative).
+# Aurora borealis procedural overlay (issue #116).
 pt_compile_slang(
     TARGET  pt_rhi_metal
     SOURCE  ${CMAKE_SOURCE_DIR}/shaders/AuroraComposite.slang
@@ -105,15 +101,24 @@ pt_compile_slang(
     ENTRY   main
     TARGETS metal
 )
-# SIGMA-style sun-shadow denoiser (issue #115). Runs once per frame
-# between Denoise() and StarsComposite. Reads the noisy per-pixel
-# sun-visibility buffer PathTrace writes, bilateral-filters it with a
-# depth+normal kernel, and multiplies the denoised visibility into the
-# post-radiance-denoise HDR so SVGF/MetalFX-smudged sun-shadow edges
-# get sharp boundaries re-imposed.
+# SIGMA-style sun-shadow denoiser (issue #115). Runs between Denoise()
+# and StarsComposite; bilateral-filters the per-pixel sun-visibility
+# G-buffer, multiplies the denoised visibility back into HDR.
 pt_compile_slang(
     TARGET  pt_rhi_metal
     SOURCE  ${CMAKE_SOURCE_DIR}/shaders/SigmaShadow.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+)
+# Screen-space particle composite (#82 MVP). Dispatched AFTER
+# StarsComposite + AuroraComposite, BEFORE the bloom pyramid; reads
+# the engine-uploaded particle storage buffer and additive-splats
+# each particle as a soft Gaussian disc into the post-denoise HDR,
+# depth-gated by the PathTrace G-buffer.
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/ParticleComposite.slang
     STAGE   compute
     ENTRY   main
     TARGETS metal

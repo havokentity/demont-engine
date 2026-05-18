@@ -41,6 +41,8 @@ extern const unsigned long shader_AuroraComposite_metal_size;
 // SIGMA shadow denoiser kernel (issue #115).
 extern const unsigned char shader_SigmaShadow_metal_data[];
 extern const unsigned long shader_SigmaShadow_metal_size;
+extern const unsigned char shader_ParticleComposite_metal_data[];
+extern const unsigned long shader_ParticleComposite_metal_size;
 }
 
 // MetalFXDenoiser.mm: ObjC++ shim around MTLFXTemporalDenoisedScaler.
@@ -334,6 +336,13 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
     build_pso("sigma_shadow",
               shader_SigmaShadow_metal_data,
               shader_SigmaShadow_metal_size);
+    // Screen-space particle composite (#82 MVP). Runs after the
+    // celestials/aurora composites + the SIGMA shadow demod, before
+    // the bloom pyramid. See shaders/ParticleComposite.slang +
+    // Engine::RenderFrame for the dispatch site.
+    build_pso("particle_composite",
+              shader_ParticleComposite_metal_data,
+              shader_ParticleComposite_metal_size);
 
     cmd_ = std::make_unique<MetalCommandBuffer>(this);
 }
