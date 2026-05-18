@@ -416,24 +416,30 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // scene) for surface hits. Threshold at 500 m so we capture only
     // sky pixels; anything closer is geometry and we leave it alone.
     //
-    // 4-neighbor dilation of the geometry mask. PathTrace's G-buffer
-    // pass is UNJITTERED (uses uv0 not the jittered uv) so on horizon-
-    // boundary pixels the depth value reports whichever side of the
-    // edge the pixel CENTER lies on, while the jittered radiance write
-    // can hit the opposite side. Without dilation, 1-2 stars at the
-    // exact horizon line render on top of the ground edge. Taking the
-    // min depth across the pixel and its 4 cardinal neighbors biases
-    // the gate toward "geometry" at edges, pushing the star-eligible
-    // band 1 pixel inside the sky-side of the horizon.
+    // 5x5 dilation of the geometry mask (2-pixel safety band).
+    // PathTrace's G-buffer pass is UNJITTERED (uses uv0 not the
+    // jittered uv) so on horizon-boundary pixels the depth value
+    // reports whichever side of the edge the pixel CENTER lies on,
+    // while the jittered radiance write can hit the opposite side.
+    // The 1-pixel cross dilation that shipped first still let a
+    // couple of stars sit on the horizon line. Widening to a 5x5
+    // box (any depth-min < 500 within 2 pixels gates this pixel out)
+    // gives a robust 2-pixel safety band on all edge orientations,
+    // including diagonal silhouettes. 25 depth_tex reads per pixel
+    // -- the texture cache catches the overlap with neighboring
+    // threads in the threadgroup so the true cost is closer to
+    // 1 miss per thread + cached hits.
     int W = int(dim.x) - 1;
     int H = int(dim.y) - 1;
     int2 px = int2(tid.xy);
-    float zc = depth_tex[uint2(px)];
-    float zl = depth_tex[uint2(max(px.x - 1, 0), px.y)];
-    float zr = depth_tex[uint2(min(px.x + 1, W), px.y)];
-    float zu = depth_tex[uint2(px.x, max(px.y - 1, 0))];
-    float zb = depth_tex[uint2(px.x, min(px.y + 1, H))];
-    float zmin = min(min(zc, zl), min(zr, min(zu, zb)));
+    float zmin = 1e30;
+    for (int dy = -2; dy <= 2; ++dy) {
+        int yy = clamp(px.y + dy, 0, H);
+        for (int dx = -2; dx <= 2; ++dx) {
+            int xx = clamp(px.x + dx, 0, W);
+            zmin = min(zmin, depth_tex[uint2(xx, yy)]);
+        }
+    }
     if (zmin < 500.0) return;
 
     float aperture = dof_params.x;
