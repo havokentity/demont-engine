@@ -11778,6 +11778,10 @@ void Engine::RegisterPrimCommands() {
         "Remove all analytic primitives.",
         [this](auto, pt::console::Output& out) {
             primitives_.clear();
+            // Drop the r_phys_debug_visualize cache (#181): with every
+            // underlying prim gone, the per-prim cache entries would
+            // just be orphan keys nothing can reference.
+            phys_debug_color_cache_.clear();
             primitives_dirty_ = true;
             accum_dirty_      = true;
             out.PrintLine("primitives: cleared");
@@ -11786,6 +11790,9 @@ void Engine::RegisterPrimCommands() {
     C.RegisterCommand("prim_reset",
         "Reset analytic primitives to the default 3-sphere + ground scene.",
         [this](auto, pt::console::Output& out) {
+            // SeedDefaultPrimitives replaces every prim wholesale, so the
+            // old albedo cache (#181) is referentially stale -- drop it.
+            phys_debug_color_cache_.clear();
             SeedDefaultPrimitives();
             out.PrintLine("primitives: reset to default (red Lambert, gold metal, glass + ground)");
         });
@@ -11800,6 +11807,13 @@ void Engine::RegisterPrimCommands() {
                 out.FormatLine("prim_remove: id {} not found", id);
                 return;
             }
+            // Drop the matching r_phys_debug_visualize cache entry (#181)
+            // if any. The cached albedo was the value present BEFORE the
+            // viz painted over it, but the underlying prim is gone now so
+            // the cached entry would just leak. erase is a no-op when the
+            // key isn't in the cache (the prim was non-phys, or the cvar
+            // was never enabled).
+            phys_debug_color_cache_.erase(id);
             primitives_dirty_ = true;
             accum_dirty_      = true;
             out.FormatLine("primitives: removed id {}", id);
@@ -11840,6 +11854,11 @@ void Engine::RegisterPrimCommands() {
             p.roughness   = roughness;
             p.ior         = ior;
             primitives_[id] = p;
+            // If the user is replacing a sphere that had a cached pre-
+            // viz albedo (#181), the cached value is now stale -- drop
+            // it so a later r_phys_debug_visualize 1 -> 0 transition
+            // restores the NEW albedo just set here, not the old one.
+            phys_debug_color_cache_.erase(id);
             primitives_dirty_ = true;
             accum_dirty_      = true;
             out.FormatLine("primitives: sphere id={} ({} @ {:.2f} {:.2f} {:.2f} r={})",
