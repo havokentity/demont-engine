@@ -2806,6 +2806,68 @@ PipelineHandle VulkanDevice::CreateComputePipeline(const ComputePipelineDesc& d)
     return PipelineHandle{ it->second };
 }
 
+// ---- Predictive pipeline JIT prewarming ---------------------------------
+//
+// Today's Vulkan async pipeline-build worker batches every known kernel
+// at device construction time (see the `pipeline_build_thread_` lambda
+// in CreateDevice). That makes EnsurePipelineWarmed semantically a no-op
+// for the kernels the worker already enqueues -- the build is *already*
+// in flight by the time the engine asks. The value of having the hook
+// even so:
+//
+//   1. Documents the engine -> device "I need this pipeline" intent at
+//      the call site (Engine::Init, Engine::ApplyBackend).
+//   2. Gives backend swap (vulkan -> metal -> vulkan) a uniform path:
+//      after the new VulkanDevice constructor returns, the engine
+//      doesn't have to know whether the new worker has reached a given
+//      kernel yet; it just calls EnsurePipelineWarmed for everything it
+//      cares about and the device handles "already in flight" vs
+//      "needs to be queued" internally.
+//   3. Forward-compatible for kernels the worker doesn't yet build
+//      eagerly (e.g. dynamic pipelines added by a later PR). The
+//      method becomes the queue entry point without each new pipeline
+//      owner touching CreateDevice's hot path.
+//
+// Behaviour:
+//   * If the pipeline is already built (lookup hit), return immediately.
+//   * If the worker is still in flight, also return immediately -- the
+//     hardcoded build_pipeline list will reach this kernel on its own.
+//     There's no per-pipeline ordering signal in the current worker so
+//     "priority" is best-effort; the engine's id==0 dispatch gate keeps
+//     the first few frames safe.
+//   * If the worker has finished AND the name is unknown, log once at
+//     tier-2 diag so engine -> device API drift surfaces visibly. We
+//     deliberately do NOT spawn an ad-hoc build on the calling thread
+//     (that would re-introduce the hitch the worker was built to avoid)
+//     and we do NOT extend the worker mid-flight (the hardcoded blob
+//     list is owned by the worker's lambda capture and not safely
+//     mutable from outside).
+void VulkanDevice::EnsurePipelineWarmed(const char* kernel_name) {
+    if (kernel_name == nullptr || *kernel_name == '\0') return;
+    {
+        std::lock_guard lock(resource_mutex_);
+        if (named_pipelines_.find(std::string(kernel_name))
+            != named_pipelines_.end()) {
+            return;  // already built
+        }
+    }
+    if (!pipelines_ready_.load(std::memory_order_acquire)) {
+        // Worker still running; the hardcoded build_pipeline list will
+        // reach this name (or it won't, but the worker's tier-2 timing
+        // summary will surface the actual built set).
+        return;
+    }
+    // Worker finished and the name is unknown. Surface once for visibility;
+    // tier-2 diag is gated so production runs stay quiet.
+    if (pt::diag::TierEnabled(2)) {
+        PT_DIAG_TIER2("rhi.vulkan",
+                      "EnsurePipelineWarmed: unknown kernel '{}' "
+                      "(worker finished without producing it; engine "
+                      "dispatch will short-circuit on id==0)",
+                      kernel_name);
+    }
+}
+
 // ---- Acceleration structures --------------------------------------------
 
 bool VulkanDevice::BuildAccelerationStructure(

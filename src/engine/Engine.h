@@ -334,6 +334,19 @@ private:
     // no map lookup).  Idempotent: safe to call from RenderFrame.
     void EnsurePipelineHandles();
 
+    // Predictive pipeline JIT prewarming. Signals every compute kernel
+    // the engine knows about to Device::EnsurePipelineWarmed so the
+    // active backend can start (or confirm completion of) the pipeline
+    // build BEFORE the first RenderFrame Dispatch. Called once at the
+    // tail of Init() and once after every RequestBackendSwitch path
+    // creates a fresh device. Gated by the r_pipeline_prewarm cvar
+    // (default 1). On backends that build pipelines synchronously at
+    // device construction (Metal / software) the calls are no-ops by
+    // the base-class default; on Vulkan the worker is already in
+    // flight, so this is a documented handshake + forward-compat hook
+    // for future on-demand pipelines. Idempotent and cheap.
+    void PrewarmPipelines();
+
     // Replace the current mesh-path resources (vertex/index buffers,
     // BLAS, TLAS) with one built from `baked`. Called from EnsureMesh*
     // on the main thread once a worker bake has completed.
