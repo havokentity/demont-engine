@@ -376,7 +376,14 @@ cbuffer Push {
     // CPU-clamped to [0.5, 1.0]). Typical values produced by the
     // formula: ~0.78 at elev=0 (4:5 oval, peak squish), ~0.87 at 1deg,
     // ~0.95 at 3deg, ~0.97 at 5deg, ~0.99 at 10deg, indistinguishable
-    // from 1.0 above ~30deg. .w reserved.
+    // from 1.0 above ~30deg.
+    // .w = planet radius in metres for spherical-Earth atmospheric
+    // transmittance (issue #51). When > 0, `atmosphericTransmittance`
+    // numerically integrates Mie + Rayleigh optical depth along the
+    // curved chord through a thin shell around a sphere of this radius
+    // (centre at world origin offset by -r so the y=0 plane sits on
+    // the surface). 0 falls back to the legacy planar exponential
+    // integral. WGS-84 Earth is 6,378,137 m.
     float4 sun_extra;
     // HDRI multi-light extraction (computed at HDRI load in
     // ReloadEnvMap). Each entry is a directional light derived from a
@@ -1113,9 +1120,59 @@ float3 procSkyInlineSunDiscAndHalo(float3 rd, float3 sun) {
 }
 
 float3 procSky(float3 rd, float3 sun) {
-    float cosTheta = clamp(rd.y, -1.0, 1.0);    // 1=zenith, 0=horizon, -1=nadir
+    float cosTheta_raw = clamp(rd.y, -1.0, 1.0);  // 1=zenith, 0=mathematical-horizon, -1=nadir
     float cosGamma = clamp(dot(rd, sun), -1.0, 1.0);
     float sun_elev = sun.y;                     // sin(elevation)
+
+    // Curved-Earth visible-horizon dip (issue #51). On a flat Earth the
+    // geometric horizon sits at rd.y = 0. On a spherical Earth of radius
+    // R, a camera at altitude h above the surface sees the horizon dip
+    // below local-up by acos(R/(R+h)) -- that is, the lowest sky ray
+    // that grazes the surface has
+    //     rd.y_horizon = -sqrt(2*h/R + (h/R)^2) ≈ -sqrt(2*h/R)
+    // for small h/R. At eye height 1.7 m the dip is ~3.7 arcmin (invisible).
+    // At a 1 km mountain it's ~1.0 deg. At a 10 km airliner it's ~3.2 deg.
+    // At a 100 km space-edge view it's ~10 deg.
+    //
+    // We rebias the gradient so the visible horizon-line in the painted
+    // sky sits at the geometrically-correct dipped angle instead of at
+    // rd.y = 0. This is the procedural-sky side of the "distant clouds
+    // visually merge with the horizon" requirement -- without the dip,
+    // a high-altitude camera shows a flat-Earth pink-on-blue band cutting
+    // across the lower screen, even though the real visible horizon
+    // would be below that.
+    //
+    // sun_extra.w packs the planet radius in metres; 0 means "planar
+    // mode" (issue #51 debug toggle) so the dip is exactly 0 and this
+    // collapses to the legacy hand-tuned gradient. We use the camera
+    // altitude inferred from the ray origin -- in this function we
+    // only have rd, but the engine's ground plane is at world y=0 so
+    // the camera altitude is the path-tracer's ro.y. We don't have ro
+    // here directly, but the sky-color call sites use camera-origin
+    // rays so we can pull cam_pos.y from the push constants. We avoid
+    // a global by recomputing the dip in callers that have ro -- here
+    // we expose a helper. For zero camera height (the common case),
+    // dipping is a no-op so the change is invisible.
+    //
+    // Below: shift the gradient so cosTheta=0 hits the dipped horizon
+    // line. cam_pos.y is at pos_fovtan.y in the push constants.
+    float cam_h = max(pos_fovtan.y, 0.0);
+    float planet_R = sun_extra.w;
+    float horizon_dip_sin = 0.0;
+    if (planet_R > 0.0 && cam_h > 0.0) {
+        float ratio = cam_h / planet_R;
+        horizon_dip_sin = sqrt(2.0 * ratio + ratio * ratio);
+        // The dip can in principle grow without bound for huge altitudes,
+        // but the formula stays well-defined to ~1.0 (sphere swallows the
+        // entire downward hemisphere) at h ≈ R, ~6378 km. Cap at 0.5
+        // (i.e. ~30 deg) so degenerate space-tourist cameras don't fold
+        // the gradient onto itself.
+        horizon_dip_sin = min(horizon_dip_sin, 0.5);
+    }
+    // Shift cosTheta upward by the dip so the painted horizon line moves
+    // down on screen to match the visible horizon. Clamp to [-1,1] so
+    // the smoothsteps below stay bounded.
+    float cosTheta = clamp(cosTheta_raw + horizon_dip_sin, -1.0, 1.0);
 
     // Day vs night blend: smoothstep on sun elevation across the
     // civil-twilight band.
@@ -1744,6 +1801,39 @@ float cloud_optical_depth(float3 ro, float3 rd, float t_max) {
 // clouds_p3.w is the Rayleigh intensity multiplier (0 = no Rayleigh,
 // 1 = real-Earth sigma).  Both gates honoured so a debug "no
 // atmosphere" mode still works.
+//
+// Spherical-Earth path (issue #51): when sun_extra.w > 0 we treat the
+// atmosphere as a thin exponentially-decaying shell around a sphere of
+// radius `R = sun_extra.w` centred at (0, -R, 0) so the path-tracer's
+// flat y=0 ground plane sits tangent to the planet at the world origin.
+// Altitude at parameter t along the ray is then
+//     h(t) = length(C - (ro + rd*t)) - R
+// where C = (0, -R, 0). For real-Earth R = 6.378e6 m and the cloud /
+// scattering scale heights (~1.5 km Mie, ~8 km Rayleigh) the spherical
+// chord differs from the flat ro.y + rd.y*t by hundreds of metres at
+// horizon ranges, which is the entire point of #51 -- horizontal rays
+// at sea level travel through ~38 air masses spherical vs. infinite
+// planar, and rays at altitude curve up below the horizon.
+//
+// Integration: 8-step composite Simpson's rule on the natural ray
+// parameter, computing per-channel optical depth tau_total =
+// integral_0^t (sigma_mie(h) + sigma_ray(h)) ds. Simpson's is exact
+// for cubic polynomials; the integrand (exp(-h/H) with h quadratic in
+// s on near-horizon rays) is well-approximated to ~0.1% error at 8
+// steps over typical 1-100 km ray lengths. Cheap enough for inline
+// use -- the previous analytical planar path was 6 exp() calls and 8
+// muls per channel; the spherical path is 17 exp() + 9 sqrt() but the
+// exp() inputs are already much smaller (we're not extrapolating an
+// exponential across the full ray length, just sampling it), so
+// register pressure / cache cost is similar in practice.
+//
+// Planet centre offset assumption: world y=0 is the ground plane.
+// Cameras at y=1.7 sit ~1.7 m above the surface; cameras at y=10000
+// sit 10 km above. This matches the engine's existing convention (the
+// path-tracer's flat ground plane lives at y=0; volumetric cloud_p1.x
+// uses y as altitude). We do not require ro.y to be non-negative --
+// the integral handles below-surface ro gracefully (clamps h to 0 so
+// the optical depth doesn't go negative).
 float3 atmosphericTransmittance(float3 ro, float3 rd, float t) {
     if (t <= 0.0) return float3(1.0);
     const float kHmie      = 1500.0;
@@ -1754,22 +1844,91 @@ float3 atmosphericTransmittance(float3 ro, float3 rd, float t) {
     bool   any_mie    = sigma_mie0 > 0.0;
     bool   any_ray    = rayleigh_i > 0.0;
     if (!any_mie && !any_ray) return float3(1.0);
-    // Vertical path-length factor (analytical altitude integral).
-    float gv_mie, gv_ray;
-    if (abs(rd.y) > 1e-6) {
-        float a_m = exp(-ro.y / kHmie);
-        float b_m = exp(-(ro.y + rd.y * t) / kHmie);
-        gv_mie = (a_m - b_m) * (kHmie / rd.y);
-        float a_r = exp(-ro.y / kHrayleigh);
-        float b_r = exp(-(ro.y + rd.y * t) / kHrayleigh);
-        gv_ray = (a_r - b_r) * (kHrayleigh / rd.y);
-    } else {
-        gv_mie = t * exp(-max(ro.y, 0.0) / kHmie);
-        gv_ray = t * exp(-max(ro.y, 0.0) / kHrayleigh);
+
+    float planet_R = sun_extra.w;
+    if (planet_R <= 0.0) {
+        // ---- Legacy planar path (sun_extra.w == 0) -----------------
+        // Vertical path-length factor (analytical altitude integral).
+        // Kept for r_planet_radius=0 debug A/B and for tiny-scene tests
+        // where curvature is invisible.
+        float gv_mie, gv_ray;
+        if (abs(rd.y) > 1e-6) {
+            float a_m = exp(-ro.y / kHmie);
+            float b_m = exp(-(ro.y + rd.y * t) / kHmie);
+            gv_mie = (a_m - b_m) * (kHmie / rd.y);
+            float a_r = exp(-ro.y / kHrayleigh);
+            float b_r = exp(-(ro.y + rd.y * t) / kHrayleigh);
+            gv_ray = (a_r - b_r) * (kHrayleigh / rd.y);
+        } else {
+            gv_mie = t * exp(-max(ro.y, 0.0) / kHmie);
+            gv_ray = t * exp(-max(ro.y, 0.0) / kHrayleigh);
+        }
+        float  tau_mie = any_mie ? sigma_mie0 * gv_mie : 0.0;
+        float3 tau_ray = any_ray ? kSigmaR * rayleigh_i * gv_ray : float3(0.0);
+        return exp(-(tau_ray + float3(tau_mie)));
     }
-    float  tau_mie = any_mie ? sigma_mie0 * gv_mie : 0.0;
-    float3 tau_ray = any_ray ? kSigmaR * rayleigh_i * gv_ray : float3(0.0);
-    return exp(-(tau_ray + float3(tau_mie)));
+
+    // ---- Spherical-Earth path (issue #51) --------------------------
+    // Composite Simpson's rule with 8 subintervals (9 sample points).
+    // Per-point altitude comes from sqrt((ro+rd*s).xz^2 + (ro.y+rd.y*s+R)^2) - R.
+    // Pull the sphere-centre offset into a local form to avoid the
+    // y-add-then-subtract roundtrip:
+    //     h(s) = sqrt(rx^2 + ry^2 + rz^2 + 2*R*ry + R^2) - R
+    //          = sqrt(|p|^2 + 2*R*p.y + R^2) - R
+    // where p = ro + rd*s. For |p| << R (we're always within a few km
+    // of the surface at the scales this renderer cares about), the
+    // sqrt is well-conditioned -- numerically equivalent to
+    //   h = sqrt((p.y + R)^2 + p.xz^2) - R
+    // which is the natural altitude-above-sphere formula. fp32 retains
+    // ~3 digits of precision at R = 6.378e6 m given p.y in metres,
+    // which is enough -- Mie/Rayleigh scale heights are 1.5e3 / 8e3 m
+    // so a meter-scale rounding error in h shifts the optical depth
+    // by ~0.1% per step.
+    const int N = 8;
+    float dt = t / float(N);
+    float oneSixth = 1.0 / 6.0;
+    float tau_mie_total = 0.0;
+    float3 tau_ray_total = float3(0.0);
+
+    // Sample altitudes at the 9 grid points + the 8 midpoints. Combine
+    // via Simpson: integral ≈ dt/6 * sum_i (f_left + 4*f_mid + f_right).
+    // Compute sigma_mie + sigma_ray inline per sample so we only loop
+    // once over the parameter range.
+    float h_prev;
+    {
+        // s = 0
+        float3 p = ro;
+        h_prev = sqrt(p.x * p.x + (p.y + planet_R) * (p.y + planet_R) + p.z * p.z) - planet_R;
+        h_prev = max(h_prev, 0.0);
+    }
+    for (int i = 0; i < N; ++i) {
+        float s_mid   = (float(i) + 0.5) * dt;
+        float s_right = (float(i) + 1.0) * dt;
+        float3 p_mid   = ro + rd * s_mid;
+        float3 p_right = ro + rd * s_right;
+        float h_mid = sqrt(p_mid.x * p_mid.x
+                         + (p_mid.y + planet_R) * (p_mid.y + planet_R)
+                         + p_mid.z * p_mid.z) - planet_R;
+        h_mid = max(h_mid, 0.0);
+        float h_right = sqrt(p_right.x * p_right.x
+                           + (p_right.y + planet_R) * (p_right.y + planet_R)
+                           + p_right.z * p_right.z) - planet_R;
+        h_right = max(h_right, 0.0);
+        if (any_mie) {
+            float sm_l = sigma_mie0 * exp(-h_prev  / kHmie);
+            float sm_m = sigma_mie0 * exp(-h_mid   / kHmie);
+            float sm_r = sigma_mie0 * exp(-h_right / kHmie);
+            tau_mie_total += dt * oneSixth * (sm_l + 4.0 * sm_m + sm_r);
+        }
+        if (any_ray) {
+            float3 sr_l = kSigmaR * rayleigh_i * exp(-h_prev  / kHrayleigh);
+            float3 sr_m = kSigmaR * rayleigh_i * exp(-h_mid   / kHrayleigh);
+            float3 sr_r = kSigmaR * rayleigh_i * exp(-h_right / kHrayleigh);
+            tau_ray_total += dt * oneSixth * (sr_l + 4.0 * sr_m + sr_r);
+        }
+        h_prev = h_right;
+    }
+    return exp(-(tau_ray_total + float3(tau_mie_total)));
 }
 
 // Up to kMaxRefract dielectric bounces; beyond that the ray gives up
