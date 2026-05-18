@@ -39,13 +39,20 @@ pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTraceCloud.slang)
 # PathTraceMath / PathTraceCloud above.
 pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/SdfPrimitives.slang)
 # --- end SDF Phase 1 -------------------------------------------------------
+# --- SDF Phase 3 (#99) -----------------------------------------------------
+# Iconic-fractal DE library (Mandelbulb / Mandelbox / Apollonian) +
+# fractal sphere-trace with iteration-relaxed surface epsilon and
+# central-difference normals. Independent module so PathTrace.slang's
+# body-only iterations don't re-parse the DE code.
+pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/SdfFractals.slang)
+# --- end SDF Phase 3 -------------------------------------------------------
 pt_compile_slang(
     TARGET  pt_rhi_metal
     SOURCE  ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
     STAGE   compute
     ENTRY   main
     TARGETS metal
-    MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives
+    MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals
 )
 pt_compile_slang(
     TARGET  pt_rhi_metal
