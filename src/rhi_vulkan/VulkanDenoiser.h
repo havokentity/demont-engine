@@ -95,6 +95,8 @@ public:
                 TextureHandle   depth_in,
                 TextureHandle   motion_in,
                 TextureHandle   normal_in,
+                TextureHandle   albedo_in,      // issue #119: primary-hit albedo G-buffer
+                                                // (id=0 -> demod disabled regardless of flag)
                 TextureHandle   output,         // linear-HDR scratch
                 TextureHandle   final_output,   // tonemapped-LDR target (swapchain)
                 BufferHandle    exposure_state,
@@ -104,7 +106,8 @@ public:
                 bool            atrous_enabled,
                 std::uint32_t   atrous_passes,  // 1..5
                 bool            hdr_pipeline,
-                TextureHandle   stars_in);      // accum_stars (issue #46; id=0 -> dummy)
+                TextureHandle   stars_in,       // accum_stars (issue #46; id=0 -> dummy)
+                bool            albedo_demod_enabled);  // issue #119
 
     // True after Init() succeeded. Used by VulkanDevice::SupportsDenoise.
     bool Ready() const { return ready_; }
@@ -153,9 +156,16 @@ private:
     // Bind a single dispatch's resources into `set` and dispatch with
     // `pipe` + `push`. Bindings 0..7 are storage images (engine-managed
     // G-buffer + denoiser texture history); bindings 8..11 are storage
-    // buffers (moments + variance). See BuildLayout() for per-slot
-    // semantics.
-    static constexpr std::uint32_t kPassImages  = 8;
+    // buffers (moments + variance); binding 12 is the albedo G-buffer
+    // (sample-only on Metal, storage-image with OpImageRead in SPIR-V)
+    // for issue #119's SVGF albedo demodulation. See BuildLayout() for
+    // per-slot semantics.
+    //
+    // kPassImages bumped from 8 -> 9 in PR #119; the 9th image lives at
+    // binding 12 (NOT 8 -- 8..11 stay as the storage-buffer block) so
+    // the existing 0..7 ordering is unchanged. SPIR-V tolerates the
+    // gap; the layout's `b[12]` entry handles it explicitly.
+    static constexpr std::uint32_t kPassImages  = 9;
     static constexpr std::uint32_t kPassBuffers = 4;
     void RecordPass(VkCommandBuffer cb,
                     VkPipeline      pipe,
@@ -167,12 +177,35 @@ private:
                     std::uint32_t   gx,
                     std::uint32_t   gy);
 
+    // Issue #119 -- dispatch the albedo remod kernel between the SVGF
+    // chain's last write (`demod_in_view`, demodulated lighting) and
+    // `color_out_view`. Reads albedo per pixel and multiplies. Used for
+    // svgf_basic and single-pass-atrous demod paths; multi-pass atrous
+    // handles the multiply-back inline on its last pass via the
+    // shader's `final_remod` push flag.
+    void DispatchRemod(VkCommandBuffer cb,
+                       VkImageView     demod_in_view,
+                       VkImageView     color_out_view,
+                       VkImageView     albedo_view,
+                       std::uint32_t   gx,
+                       std::uint32_t   gy);
+
     VulkanDevice*         device_       = nullptr;
     bool                  ready_        = false;
     VkDescriptorSetLayout dset_layout_  = VK_NULL_HANDLE;
     VkPipelineLayout      pipe_layout_  = VK_NULL_HANDLE;
     VkPipeline            temporal_pipe_ = VK_NULL_HANDLE;
     VkPipeline            atrous_pipe_  = VK_NULL_HANDLE;
+    // Issue #119 -- albedo remod pass. Dedicated layout because it
+    // only needs 3 storage images (demod_in / color_out / albedo); the
+    // 12-binding temporal/atrous layout would over-allocate. Same
+    // pool as temporal/atrous.
+    VkDescriptorSetLayout remod_dset_layout_ = VK_NULL_HANDLE;
+    VkPipelineLayout      remod_pipe_layout_ = VK_NULL_HANDLE;
+    VkPipeline            remod_pipe_        = VK_NULL_HANDLE;
+    static constexpr int  kRemodSetRing      = 4;
+    VkDescriptorSet       remod_sets_[kRemodSetRing] {};
+    int                   next_remod_set_    = 0;
     VkDescriptorPool      dpool_        = VK_NULL_HANDLE;
     // DenoiseFinalize uses its own layout (2 storage images + 1
     // storage buffer; different from the temporal/atrous 8-image

@@ -18,6 +18,9 @@ extern const unsigned char shader_DenoiseAtrous_spirv_data[];
 extern const unsigned long shader_DenoiseAtrous_spirv_size;
 extern const unsigned char shader_DenoiseFinalize_spirv_data[];
 extern const unsigned long shader_DenoiseFinalize_spirv_size;
+// Issue #119 -- albedo remod kernel.
+extern const unsigned char shader_DenoiseRemod_spirv_data[];
+extern const unsigned long shader_DenoiseRemod_spirv_size;
 }
 
 namespace pt::rhi::vk {
@@ -50,9 +53,12 @@ VkShaderModule MakeModule(VkDevice dev,
     return m;
 }
 
-// Push struct shared by both denoise kernels. 32 bytes total. Field
-// names are kernel-specific (see DenoiseTemporal.slang / DenoiseAtrous
-// .slang for what each lane means at each call site).
+// Push struct shared by both denoise kernels. 48 bytes total (was 32
+// pre-#119). Field names are kernel-specific (see DenoiseTemporal.slang
+// / DenoiseAtrous.slang for what each lane means at each call site).
+// Issue #119 appended demod_enabled + final_remod (atrous only) and
+// two padding lanes; std140 push blocks align at 16 bytes so 48 is
+// the next multiple after 40.
 struct DenoisePush {
     std::uint32_t width;
     std::uint32_t height;
@@ -62,8 +68,23 @@ struct DenoisePush {
     float         b;                  // temporal: normal_tolerance; atrous: sigma_normal
     float         c;                  // temporal: min_alpha; atrous: sigma_color
     float         pad1;
+    std::uint32_t demod_enabled;     // issue #119; 1 = run on demodulated lighting
+    std::uint32_t final_remod;       // issue #119; atrous-only; multiply albedo back on output write
+    std::uint32_t pad2;
+    std::uint32_t pad3;
 };
-static_assert(sizeof(DenoisePush) == 32, "DenoisePush layout");
+static_assert(sizeof(DenoisePush) == 48, "DenoisePush layout");
+
+// Issue #119 -- 16-byte push struct for the remod-only kernel
+// (DenoiseRemod.slang). Just the dispatch size; the kernel reads
+// demod_in + albedo_tex and writes color_out.
+struct RemodPush {
+    std::uint32_t width;
+    std::uint32_t height;
+    std::uint32_t pad0;
+    std::uint32_t pad1;
+};
+static_assert(sizeof(RemodPush) == 16, "RemodPush layout");
 
 // Two-stage compute-write -> compute-read barrier. Used between sub-
 // passes that write/read the same scratch texture (history_b after
@@ -133,6 +154,10 @@ void VulkanNrdDenoiser::DestroyAll() {
         vkDestroyPipeline(dev, atrous_pipe_, nullptr);
         atrous_pipe_ = VK_NULL_HANDLE;
     }
+    if (remod_pipe_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(dev, remod_pipe_, nullptr);
+        remod_pipe_ = VK_NULL_HANDLE;
+    }
     if (finalize_pipe_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(dev, finalize_pipe_, nullptr);
         finalize_pipe_ = VK_NULL_HANDLE;
@@ -141,6 +166,10 @@ void VulkanNrdDenoiser::DestroyAll() {
         vkDestroyPipelineLayout(dev, pipe_layout_, nullptr);
         pipe_layout_ = VK_NULL_HANDLE;
     }
+    if (remod_pipe_layout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(dev, remod_pipe_layout_, nullptr);
+        remod_pipe_layout_ = VK_NULL_HANDLE;
+    }
     if (finalize_pipe_layout_ != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(dev, finalize_pipe_layout_, nullptr);
         finalize_pipe_layout_ = VK_NULL_HANDLE;
@@ -148,6 +177,10 @@ void VulkanNrdDenoiser::DestroyAll() {
     if (dset_layout_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(dev, dset_layout_, nullptr);
         dset_layout_ = VK_NULL_HANDLE;
+    }
+    if (remod_dset_layout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(dev, remod_dset_layout_, nullptr);
+        remod_dset_layout_ = VK_NULL_HANDLE;
     }
     if (finalize_dset_layout_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(dev, finalize_dset_layout_, nullptr);
@@ -159,6 +192,7 @@ void VulkanNrdDenoiser::DestroyAll() {
         // re-Init().
         for (auto& s : sets_)          s = VK_NULL_HANDLE;
         for (auto& s : finalize_sets_) s = VK_NULL_HANDLE;
+        for (auto& s : remod_sets_)    s = VK_NULL_HANDLE;
         vkDestroyDescriptorPool(dev, dpool_, nullptr);
         dpool_ = VK_NULL_HANDLE;
     }
@@ -250,7 +284,7 @@ bool VulkanNrdDenoiser::Init() {
 bool VulkanNrdDenoiser::BuildLayout() {
     VkDevice dev = device_->RawDevice();
 
-    // ---- temporal/atrous: 8 storage images + 4 storage buffers -----
+    // ---- temporal/atrous: 9 storage images + 4 storage buffers -----
     // Per-slot semantics (shared by both passes; unused bindings are
     // satisfied with dummy / same-format placeholders at runtime):
     //   0  color_in            (storage image, RGBA16F)
@@ -265,20 +299,42 @@ bool VulkanNrdDenoiser::BuildLayout() {
     //   9  moments_history_out (storage buffer, float2[]; atrous: any)
     //   10 variance_in         (storage buffer, float[];  temporal: dummy)
     //   11 variance_out        (storage buffer, float[])
+    //   12 albedo_tex          (storage image, RGBA16F)  -- issue #119
     // The 4 storage buffers replace what would otherwise be 4 more
     // storage images -- Metal compute shaders cap at 8 textures with
     // access::read_write per kernel, and 12 would crash slangc's MSL.
+    // Slot 12's albedo is declared `Texture2D` (sample-only in MSL,
+    // OpImageRead-only in SPIR-V), so it stays under the cap on Metal
+    // and is a STORAGE_IMAGE in Vulkan -- matches the rest of the
+    // engine's "no samplers" compute setup.
     {
-        constexpr std::uint32_t kTotal = kPassImages + kPassBuffers;
+        // Bindings 0..7 storage images, 8..11 storage buffers, 12 storage image.
+        // Non-contiguous: skip 8..11 in the image block and add 12 explicitly.
+        constexpr std::uint32_t kStorageImageSlots = kPassImages;   // 9 total: 0..7 + 12
+        constexpr std::uint32_t kStorageBufferSlots = kPassBuffers; // 4 total: 8..11
+        constexpr std::uint32_t kTotal = kStorageImageSlots + kStorageBufferSlots;
         std::array<VkDescriptorSetLayoutBinding, kTotal> b{};
-        for (std::uint32_t i = 0; i < b.size(); ++i) {
+        for (std::uint32_t i = 0; i < 8u; ++i) {
             b[i].binding         = i;
-            b[i].descriptorType  = (i < kPassImages)
-                                     ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
-                                     : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            b[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             b[i].descriptorCount = 1;
             b[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
         }
+        for (std::uint32_t i = 0; i < kPassBuffers; ++i) {
+            const std::uint32_t idx = 8u + i;
+            b[idx].binding         = idx;
+            b[idx].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            b[idx].descriptorCount = 1;
+            b[idx].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+        // Slot 12 (the 9th storage image). Sits in the last array
+        // entry; layout creation order doesn't require ascending
+        // binding numbers but does require uniqueness, so this lands
+        // at array index 12 with binding 12.
+        b[12].binding         = 12;
+        b[12].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        b[12].descriptorCount = 1;
+        b[12].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
         VkDescriptorSetLayoutCreateInfo dslci{};
         dslci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         dslci.bindingCount = static_cast<std::uint32_t>(b.size());
@@ -299,6 +355,41 @@ bool VulkanNrdDenoiser::BuildLayout() {
         plci.pPushConstantRanges    = &pcr;
         if (vkCreatePipelineLayout(dev, &plci, nullptr, &pipe_layout_) != VK_SUCCESS) {
             LOG_ERROR("VulkanNrdDenoiser: vkCreatePipelineLayout failed");
+            return false;
+        }
+    }
+
+    // ---- remod-only layout: 3 storage images (issue #119) -----------
+    // Bindings: 0 demod_in, 1 color_out, 12 albedo_tex. Mirrors the
+    // DenoiseRemod.slang declarations one-for-one so the shader's
+    // descriptor-set zero binds straight in. Same shader-stage flag as
+    // temporal/atrous, lives in the same descriptor pool (sized
+    // mixed-pool below).
+    {
+        std::array<VkDescriptorSetLayoutBinding, 3> b{};
+        b[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        b[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        b[2] = { 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        VkDescriptorSetLayoutCreateInfo dslci{};
+        dslci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        dslci.bindingCount = static_cast<std::uint32_t>(b.size());
+        dslci.pBindings    = b.data();
+        if (vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &remod_dset_layout_) != VK_SUCCESS) {
+            LOG_ERROR("VulkanNrdDenoiser: remod descriptor set layout failed");
+            return false;
+        }
+        VkPushConstantRange pcr{};
+        pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pcr.offset     = 0;
+        pcr.size       = sizeof(RemodPush);
+        VkPipelineLayoutCreateInfo plci{};
+        plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        plci.setLayoutCount         = 1;
+        plci.pSetLayouts            = &remod_dset_layout_;
+        plci.pushConstantRangeCount = 1;
+        plci.pPushConstantRanges    = &pcr;
+        if (vkCreatePipelineLayout(dev, &plci, nullptr, &remod_pipe_layout_) != VK_SUCCESS) {
+            LOG_ERROR("VulkanNrdDenoiser: remod pipeline layout failed");
             return false;
         }
     }
@@ -391,6 +482,10 @@ bool VulkanNrdDenoiser::BuildPipelines() {
                pipe_layout_, temporal_pipe_, "DenoiseTemporal")) return false;
     if (!build(shader_DenoiseAtrous_spirv_data, shader_DenoiseAtrous_spirv_size,
                pipe_layout_, atrous_pipe_, "DenoiseAtrous")) return false;
+    // Issue #119 -- remod kernel. Built unconditionally so we can flip
+    // r_svgf_albedo_demod at runtime without a backend re-init.
+    if (!build(shader_DenoiseRemod_spirv_data, shader_DenoiseRemod_spirv_size,
+               remod_pipe_layout_, remod_pipe_, "DenoiseRemod")) return false;
     if (!build(shader_DenoiseFinalize_spirv_data, shader_DenoiseFinalize_spirv_size,
                finalize_pipe_layout_, finalize_pipe_, "DenoiseFinalize")) return false;
     return true;
@@ -399,24 +494,26 @@ bool VulkanNrdDenoiser::BuildPipelines() {
 bool VulkanNrdDenoiser::BuildDescriptorPool() {
     VkDevice dev = device_->RawDevice();
 
-    // Mixed pool sizing for both layouts:
+    // Mixed pool sizing for all three layouts:
     //   - kSetRing sets of (kPassImages storage images + kPassBuffers
     //     storage buffers) for temporal/atrous.
     //   - kFinalizeSetRing sets of (3 storage images + 1 storage
     //     buffer) for the finalize pass: hdr_in, swap_out, bloom_in
     //     (stars_in binding 4 retired with the EMA design).
+    //   - kRemodSetRing sets of 3 storage images for the issue #119
+    //     albedo remod pass.
     // Plus a small headroom on each type.
     std::array<VkDescriptorPoolSize, 2> ps{};
     ps[0].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     ps[0].descriptorCount = static_cast<std::uint32_t>(
-        kSetRing * kPassImages + kFinalizeSetRing * 3 + 4);
+        kSetRing * kPassImages + kFinalizeSetRing * 3 + kRemodSetRing * 3 + 4);
     ps[1].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     ps[1].descriptorCount = static_cast<std::uint32_t>(
         kSetRing * kPassBuffers + kFinalizeSetRing * 1 + 4);
 
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpci.maxSets       = static_cast<std::uint32_t>(kSetRing + kFinalizeSetRing);
+    dpci.maxSets       = static_cast<std::uint32_t>(kSetRing + kFinalizeSetRing + kRemodSetRing);
     dpci.poolSizeCount = static_cast<std::uint32_t>(ps.size());
     dpci.pPoolSizes    = ps.data();
     // Sets stay alive for the pool's lifetime; we re-write them via
@@ -449,6 +546,20 @@ bool VulkanNrdDenoiser::BuildDescriptorPool() {
         dsai.pSetLayouts        = layouts.data();
         if (vkAllocateDescriptorSets(dev, &dsai, finalize_sets_) != VK_SUCCESS) {
             LOG_ERROR("VulkanNrdDenoiser: vkAllocateDescriptorSets (finalize) failed");
+            return false;
+        }
+    }
+    // Issue #119 -- remod descriptor set ring.
+    {
+        std::array<VkDescriptorSetLayout, kRemodSetRing> layouts;
+        for (auto& l : layouts) l = remod_dset_layout_;
+        VkDescriptorSetAllocateInfo dsai{};
+        dsai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsai.descriptorPool     = dpool_;
+        dsai.descriptorSetCount = kRemodSetRing;
+        dsai.pSetLayouts        = layouts.data();
+        if (vkAllocateDescriptorSets(dev, &dsai, remod_sets_) != VK_SUCCESS) {
+            LOG_ERROR("VulkanNrdDenoiser: vkAllocateDescriptorSets (remod) failed");
             return false;
         }
     }
@@ -535,12 +646,18 @@ void VulkanNrdDenoiser::RecordPass(VkCommandBuffer cb,
     VkDescriptorImageInfo  img_infos[kPassImages]  {};
     VkDescriptorBufferInfo buf_infos[kPassBuffers] {};
     VkWriteDescriptorSet   writes[kTotal] {};
+    // Image binding map: array indices 0..7 -> bindings 0..7 (the
+    // engine-managed G-buffer block), array index 8 -> binding 12
+    // (issue #119 albedo). The buffer block at bindings 8..11 sits
+    // between, so the image array isn't a 1:1 binding index but the
+    // mapping is fixed at compile time.
     for (std::uint32_t i = 0; i < kPassImages; ++i) {
+        const std::uint32_t binding = (i < 8u) ? i : 12u;
         img_infos[i].imageView   = views[i];
         img_infos[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet          = set;
-        writes[i].dstBinding      = i;
+        writes[i].dstBinding      = binding;
         writes[i].descriptorCount = 1;
         writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         writes[i].pImageInfo      = &img_infos[i];
@@ -552,7 +669,7 @@ void VulkanNrdDenoiser::RecordPass(VkCommandBuffer cb,
         const std::uint32_t w = kPassImages + i;
         writes[w].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[w].dstSet          = set;
-        writes[w].dstBinding      = w;
+        writes[w].dstBinding      = 8u + i;     // storage buffer bindings 8..11
         writes[w].descriptorCount = 1;
         writes[w].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[w].pBufferInfo     = &buf_infos[i];
@@ -566,11 +683,62 @@ void VulkanNrdDenoiser::RecordPass(VkCommandBuffer cb,
     vkCmdDispatch(cb, gx, gy, 1);
 }
 
+void VulkanNrdDenoiser::DispatchRemod(VkCommandBuffer cb,
+                                      VkImageView     demod_in_view,
+                                      VkImageView     color_out_view,
+                                      VkImageView     albedo_view,
+                                      std::uint32_t   gx,
+                                      std::uint32_t   gy) {
+    // Inter-dispatch barrier: the SVGF chain's last shader write to
+    // demod_in_view must be visible to this dispatch's shader read.
+    // Mirrors the ComputeChainBarrier we issue between temporal /
+    // atrous passes elsewhere.
+    ComputeChainBarrier(cb);
+
+    // Pick a remod descriptor set from the ring and update it.
+    VkDescriptorSet set = remod_sets_[next_remod_set_];
+    next_remod_set_ = (next_remod_set_ + 1) % kRemodSetRing;
+
+    VkDescriptorImageInfo img_infos[3] {};
+    img_infos[0].imageView   = demod_in_view;
+    img_infos[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    img_infos[1].imageView   = color_out_view;
+    img_infos[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    img_infos[2].imageView   = albedo_view;
+    img_infos[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkWriteDescriptorSet writes[3] {};
+    // Remod layout bindings: 0 demod_in, 1 color_out, 12 albedo.
+    const std::uint32_t bindings[3] = { 0u, 1u, 12u };
+    for (int i = 0; i < 3; ++i) {
+        writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet          = set;
+        writes[i].dstBinding      = bindings[i];
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[i].pImageInfo      = &img_infos[i];
+    }
+    vkUpdateDescriptorSets(device_->RawDevice(), 3, writes, 0, nullptr);
+
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, remod_pipe_);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            remod_pipe_layout_, 0, 1, &set, 0, nullptr);
+    RemodPush p{};
+    p.width  = cached_w_;
+    p.height = cached_h_;
+    vkCmdPushConstants(cb, remod_pipe_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(p), &p);
+    vkCmdDispatch(cb, gx, gy, 1);
+    // Post-barrier so the finalize pass (or any downstream consumer)
+    // sees the remod write.
+    ComputeChainBarrier(cb);
+}
+
 void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                                TextureHandle   color_in,
                                TextureHandle   depth_in,
                                TextureHandle   motion_in,
                                TextureHandle   normal_in,
+                               TextureHandle   albedo_in,
                                TextureHandle   output,
                                TextureHandle   final_output,
                                BufferHandle    exposure_state,
@@ -580,7 +748,8 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                                bool            atrous_enabled,
                                std::uint32_t   atrous_passes,
                                bool            hdr_pipeline,
-                               TextureHandle   stars_in) {
+                               TextureHandle   stars_in,
+                               bool            albedo_demod_enabled) {
     if (!ready_) return;
     if (cb == VK_NULL_HANDLE) return;
     if (cached_w_ == 0 || cached_h_ == 0) return;
@@ -608,6 +777,13 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
     VkBuffer    b_variance_a     = device_->LookupBuffer(BufferHandle{variance_a_buf_});
     VkBuffer    b_variance_b     = device_->LookupBuffer(BufferHandle{variance_b_buf_});
     VkBuffer    b_dummy_var      = device_->LookupBuffer(BufferHandle{dummy_variance_buf_});
+    // Issue #119 -- albedo view. Falls through to dummy_color_id_
+    // (RGBA16F 1x1) when the engine didn't allocate the albedo
+    // G-buffer for this denoiser kind; in that case `demod_active`
+    // drops to false so the shader skips every divide / multiply.
+    VkImageView v_albedo = (albedo_in.id != 0)
+                              ? device_->LookupImageView(albedo_in)
+                              : v_dummy_c;
     if (v_color_in == VK_NULL_HANDLE || v_depth == VK_NULL_HANDLE ||
         v_motion == VK_NULL_HANDLE   || v_normal == VK_NULL_HANDLE ||
         v_output == VK_NULL_HANDLE   || v_hist_a == VK_NULL_HANDLE ||
@@ -616,12 +792,16 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
         v_normal_hist_b == VK_NULL_HANDLE || v_atrous_a == VK_NULL_HANDLE ||
         v_atrous_b == VK_NULL_HANDLE ||
         v_dummy_c == VK_NULL_HANDLE  || v_dummy_m == VK_NULL_HANDLE ||
+        v_albedo == VK_NULL_HANDLE ||
         b_moments_a == VK_NULL_HANDLE || b_moments_b == VK_NULL_HANDLE ||
         b_variance_a == VK_NULL_HANDLE || b_variance_b == VK_NULL_HANDLE ||
         b_dummy_var == VK_NULL_HANDLE) {
         LOG_WARN("VulkanNrdDenoiser::Encode: missing input resources");
         return;
     }
+    // Effective demod state. Mirrors the Metal backend: demod requires
+    // both the cvar/desc flag AND a real albedo binding.
+    const bool demod_active = albedo_demod_enabled && (albedo_in.id != 0);
 
     const std::uint32_t gx = (cached_w_ + 7) / 8;
     const std::uint32_t gy = (cached_h_ + 7) / 8;
@@ -672,6 +852,10 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
     p1.a             = 0.10f;   // depth_tolerance (relative)
     p1.b             = 0.85f;   // normal_tolerance (cos angle)
     p1.c             = 0.10f;   // min_alpha (steady-state blend)
+    // Issue #119 -- demod gate; temporal never remod's (its color_out
+    // is the SVGF feedback target and must stay demodulated).
+    p1.demod_enabled = demod_active ? 1u : 0u;
+    p1.final_remod   = 0u;
     {
         const VkImageView views[kPassImages] = {
             /*0 color_in          */ v_color_in,
@@ -682,6 +866,9 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
             /*5 color_out         */ v_temporal_color_out,
             /*6 depth_history_in  */ v_depth_hist_read,
             /*7 normal_history_in */ v_normal_hist_read,
+            // Array index 8 -> binding 12 (albedo). RecordPass's
+            // binding-table maps (i < 8) ? i : 12.
+            /*12 albedo_tex       */ v_albedo,
         };
         const VkBuffer buffers[kPassBuffers] = {
             /*8  moments_history_in  */ b_moments_hist_read,
@@ -747,7 +934,8 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
 
         auto atrous_pass = [&](VkImageView color_src, VkImageView color_dst,
                                VkBuffer var_src, VkBuffer var_dst,
-                               std::uint32_t step) {
+                               std::uint32_t step,
+                               bool          is_final_pass) {
             DenoisePush p{};
             p.width         = cached_w_;
             p.height        = cached_h_;
@@ -759,6 +947,12 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                                         // smooth on diffuse surfaces -- 1.0 keeps
                                         // the noise rejection without averaging
                                         // through 4-sigma-wide luminance bands.
+            p.demod_enabled = demod_active ? 1u : 0u;
+            // Final-pass remod fires only when this pass writes
+            // directly to v_output (n_passes >= 2's last pass);
+            // n_passes == 1 routes through the remod kernel below so
+            // its single pass leaves the signal demodulated.
+            p.final_remod   = (demod_active && is_final_pass) ? 1u : 0u;
             const VkImageView views[kPassImages] = {
                 /*0 color_in            */ color_src,
                 /*1 color_history_in    */ v_dummy_c,
@@ -768,6 +962,7 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                 /*5 color_out           */ color_dst,
                 /*6 depth_history_in    */ v_depth_hist_write,
                 /*7 normal_history_in   */ v_normal_hist_write,
+                /*12 albedo_tex         */ v_albedo,
             };
             // Moments slots 8/9 are declared but unused by atrous; bind
             // the parity-side moments buffer (any valid storage buffer
@@ -794,48 +989,62 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
         for (std::uint32_t i = 1; i <= n_passes; ++i) {
             const std::uint32_t step = 1u << (i - 1u);
             VkImageView color_dst;
+            // Identify the pass that writes directly to v_output so it
+            // can do an inline remod (multi-pass demod path). For
+            // n_passes == 1 the pass writes v_hist_write (feedback
+            // target) and the remod compute pass below handles the
+            // multiply-back.
+            bool writes_to_output = false;
             if (i == 1u) {
                 color_dst = v_hist_write;
             } else if (i == n_passes) {
                 color_dst = v_output;
+                writes_to_output = true;
             } else {
                 // After pass 1 v_atrous_a is no longer read, so it's
                 // free to re-enter the ping-pong from pass 3 onward.
                 color_dst = (i % 2u == 0u) ? v_atrous_b : v_atrous_a;
             }
-            atrous_pass(color_src, color_dst, var_src, var_dst, step);
+            atrous_pass(color_src, color_dst, var_src, var_dst, step,
+                        writes_to_output);
             color_src = color_dst;
             std::swap(var_src, var_dst);
         }
 
         if (n_passes == 1u) {
             // One-pass path: pass 1's output sits in v_hist_write (the
-            // feedback target). Publish a copy to v_output. Both
-            // images are RGBA16F at (cached_w_, cached_h_) and stay in
-            // GENERAL layout, so a memory-barrier-only handoff plus
-            // one vkCmdCopyImage is enough.
-            VkImage src_img = device_->LookupImage(TextureHandle{
-                parity_is_a ? history_b_id_ : history_a_id_ });
+            // feedback target). Publish to v_output:
+            //   - demod off: vkCmdCopyImage (RGBA16F GENERAL -> GENERAL).
+            //   - demod on:  dispatch the remod compute kernel so the
+            //     multiply-back happens in `output` while v_hist_write
+            //     stays in demodulated lighting space for next frame.
+            const std::uint64_t one_pass_src_id =
+                parity_is_a ? history_b_id_ : history_a_id_;
+            VkImage src_img = device_->LookupImage(TextureHandle{one_pass_src_id});
             VkImage dst_img = device_->LookupImage(output);
             if (src_img != VK_NULL_HANDLE && dst_img != VK_NULL_HANDLE) {
-                StageBarrier(cb,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-                             VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-                VkImageCopy region{};
-                region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                region.srcSubresource.layerCount = 1;
-                region.dstSubresource            = region.srcSubresource;
-                region.extent.width  = cached_w_;
-                region.extent.height = cached_h_;
-                region.extent.depth  = 1;
-                vkCmdCopyImage(cb,
-                               src_img, VK_IMAGE_LAYOUT_GENERAL,
-                               dst_img, VK_IMAGE_LAYOUT_GENERAL,
-                               1, &region);
-                StageBarrier(cb,
-                             VK_PIPELINE_STAGE_TRANSFER_BIT,        VK_ACCESS_TRANSFER_WRITE_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,  VK_ACCESS_SHADER_READ_BIT);
+                if (!demod_active) {
+                    StageBarrier(cb,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+                    VkImageCopy region{};
+                    region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                    region.srcSubresource.layerCount = 1;
+                    region.dstSubresource            = region.srcSubresource;
+                    region.extent.width  = cached_w_;
+                    region.extent.height = cached_h_;
+                    region.extent.depth  = 1;
+                    vkCmdCopyImage(cb,
+                                   src_img, VK_IMAGE_LAYOUT_GENERAL,
+                                   dst_img, VK_IMAGE_LAYOUT_GENERAL,
+                                   1, &region);
+                    StageBarrier(cb,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,        VK_ACCESS_TRANSFER_WRITE_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,  VK_ACCESS_SHADER_READ_BIT);
+                } else {
+                    DispatchRemod(cb, v_hist_write, v_output, v_albedo, gx, gy);
+                }
             } else {
                 LOG_WARN("VulkanNrdDenoiser::Encode: atrous publish blit lookup miss");
             }
@@ -859,34 +1068,42 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                      reinterpret_cast<void*>(dst_img));
             return;
         }
-        // Compute -> transfer handoff. NB: with the history-copy block
-        // above (which already issued compute_write -> transfer for the
-        // depth/normal hist copies), this barrier is technically
-        // redundant for the current flow -- no compute op writes
-        // color_hist between the temporal pass and here. Kept
-        // defensively so a future refactor that inserts new compute
-        // writes between those points doesn't silently regress
-        // visibility. dstAccess covers both transfer read of
-        // color_hist and transfer write of `output` (theoretical WAW
-        // against any future upstream shader write to output).
-        StageBarrier(cb,
-                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-                     VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-        VkImageCopy region{};
-        region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.srcSubresource.layerCount = 1;
-        region.dstSubresource            = region.srcSubresource;
-        region.extent.width  = cached_w_;
-        region.extent.height = cached_h_;
-        region.extent.depth  = 1;
-        vkCmdCopyImage(cb,
-                       src_img, VK_IMAGE_LAYOUT_GENERAL,
-                       dst_img, VK_IMAGE_LAYOUT_GENERAL,
-                       1, &region);
-        StageBarrier(cb,
-                     VK_PIPELINE_STAGE_TRANSFER_BIT,        VK_ACCESS_TRANSFER_WRITE_BIT,
-                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,  VK_ACCESS_SHADER_READ_BIT);
+        if (!demod_active) {
+            // Compute -> transfer handoff. NB: with the history-copy
+            // block above (which already issued compute_write -> transfer
+            // for the depth/normal hist copies), this barrier is
+            // technically redundant for the current flow -- no compute
+            // op writes color_hist between the temporal pass and here.
+            // Kept defensively so a future refactor that inserts new
+            // compute writes between those points doesn't silently
+            // regress visibility. dstAccess covers both transfer read
+            // of color_hist and transfer write of `output` (theoretical
+            // WAW against any future upstream shader write to output).
+            StageBarrier(cb,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+            VkImageCopy region{};
+            region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.srcSubresource.layerCount = 1;
+            region.dstSubresource            = region.srcSubresource;
+            region.extent.width  = cached_w_;
+            region.extent.height = cached_h_;
+            region.extent.depth  = 1;
+            vkCmdCopyImage(cb,
+                           src_img, VK_IMAGE_LAYOUT_GENERAL,
+                           dst_img, VK_IMAGE_LAYOUT_GENERAL,
+                           1, &region);
+            StageBarrier(cb,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,        VK_ACCESS_TRANSFER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,  VK_ACCESS_SHADER_READ_BIT);
+        } else {
+            // Issue #119 -- svgf_basic with demod on: dispatch the remod
+            // compute kernel to multiply v_hist_write (demodulated
+            // lighting) by albedo into `output`. Keeps v_hist_write in
+            // demod space for next frame's feedback.
+            DispatchRemod(cb, v_hist_write, v_output, v_albedo, gx, gy);
+        }
     }
 
     // ---- Finalize: HDR -> ACES + sRGB -> swapchain --------------------

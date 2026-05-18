@@ -257,6 +257,17 @@ public:
         // SVGF-basic (which skips the spatial chain entirely) and by
         // MetalFX/OptiX.
         std::uint32_t atrous_passes = 1;
+        // Issue #119 -- SVGF albedo demodulation. When true, the
+        // temporal + atrous chain divides the noisy radiance by the
+        // primary-hit albedo on input (operates on incident lighting
+        // rather than reflected radiance) and a dedicated remod pass
+        // multiplies the result back by albedo before the bloom +
+        // tonemap chain consumes it. Driven by `r_svgf_albedo_demod`
+        // (CVAR_ARCHIVE, default 1). Requires the albedo G-buffer to
+        // be allocated (`albedo_in` non-zero); when the engine didn't
+        // allocate it (non-SVGF kinds) the backend silently treats
+        // this flag as false. Ignored by MetalFX / OptiX / FinalizeOnly.
+        bool albedo_demod_enabled = false;
 
         // Which denoiser implementation the backend should route to.
         // The Vulkan backend looks at this to dispatch between

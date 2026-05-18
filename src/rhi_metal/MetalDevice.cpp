@@ -442,11 +442,18 @@ void MetalDevice::Denoise(const DenoiseDesc& d) {
             svgf_target = svgf_metalfx_intermediate_;
         }
 
+        // Issue #119 -- albedo demodulation. Engine pulls albedo_in
+        // alongside the rest of the G-buffer set; nullptr-tolerant
+        // (the kernel binds a dummy when demod is off OR when the
+        // engine didn't allocate albedo for this denoiser kind).
+        auto* albedo_in_svgf = LookupTexture(d.albedo_in);
         svgf_denoiser_->Encode(cmd_->RawCmdBuf(),
                                 color_in, depth_in, motion_in, normal_in,
+                                albedo_in_svgf,
                                 svgf_target,
                                 d.reset_history, atrous_enabled,
-                                d.atrous_passes);
+                                d.atrous_passes,
+                                d.albedo_demod_enabled);
 
         if (!kind_is_svgf_chain) return;
 
