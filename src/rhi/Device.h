@@ -178,6 +178,32 @@ public:
         // Engine allocates + writes this only when r_denoiser is
         // optix_hdr_aov.
         TextureHandle albedo_in;
+        // MetalFX specular-guidance G-buffers (issue #118). Three
+        // textures fed to MTLFXTemporalDenoisedScaler so it can tell
+        // specular from diffuse response and eliminate the 8x8 halos
+        // it otherwise produces around bright reflections / metals.
+        //   specular_albedo_in       -- RGBA16F per-pixel F0 (Fresnel
+        //                               reflectance at normal incidence;
+        //                               metals: F0 = albedo; dielectrics:
+        //                               float3(0.04); Lambert: 0).
+        //   roughness_in             -- R32F single-channel surface
+        //                               roughness in [0, 1].
+        //   specular_hit_distance_in -- R32F distance from camera to
+        //                               specularly-reflected hit (MVP:
+        //                               primary_t * smoothness proxy;
+        //                               see PathTrace.slang's matching
+        //                               texture declaration for the
+        //                               trade-off vs a real second-trace).
+        // Engine allocates them only for DenoiserKind::MetalFX /
+        // SvgfBasicMetalFx / SvgfAtrousMetalFx; nil for all other kinds.
+        // Apple's MTLFXTemporalDenoisedScaler tolerates a nil binding
+        // as "no guidance," so backends consuming the trio can pass
+        // them straight through. SVGF / NRD / OptiX paths ignore them
+        // (their respective issues will wire matching inputs later;
+        // #50 covers NRD).
+        TextureHandle specular_albedo_in;
+        TextureHandle roughness_in;
+        TextureHandle specular_hit_distance_in;
         // Linear-HDR target the denoiser writes to. On Mac/MetalFX this
         // is the post_denoise_hdr intermediate that the Tonemap pipeline
         // reads. On Vulkan with SVGF/NRD it's the same intermediate, but
@@ -257,6 +283,17 @@ public:
         // SVGF-basic (which skips the spatial chain entirely) and by
         // MetalFX/OptiX.
         std::uint32_t atrous_passes = 1;
+        // Issue #119 -- SVGF albedo demodulation. When true, the
+        // temporal + atrous chain divides the noisy radiance by the
+        // primary-hit albedo on input (operates on incident lighting
+        // rather than reflected radiance) and a dedicated remod pass
+        // multiplies the result back by albedo before the bloom +
+        // tonemap chain consumes it. Driven by `r_svgf_albedo_demod`
+        // (CVAR_ARCHIVE, default 1). Requires the albedo G-buffer to
+        // be allocated (`albedo_in` non-zero); when the engine didn't
+        // allocate it (non-SVGF kinds) the backend silently treats
+        // this flag as false. Ignored by MetalFX / OptiX / FinalizeOnly.
+        bool albedo_demod_enabled = false;
 
         // Which denoiser implementation the backend should route to.
         // The Vulkan backend looks at this to dispatch between

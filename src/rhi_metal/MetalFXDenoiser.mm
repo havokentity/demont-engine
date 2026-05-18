@@ -69,6 +69,30 @@ extern "C" void* pt_metalfx_create(void* mtl_device,
         // (normal_tex / albedo_tex are RGBA16F).
         desc.normalTextureFormat        = MTLPixelFormatRGBA16Float;
         desc.diffuseAlbedoTextureFormat = MTLPixelFormatRGBA16Float;
+        // Specular guidance trio (issue #118). Without these MetalFX
+        // produces visible 8x8 halos on bright reflections / metals
+        // because it can't tell specular response apart from diffuse;
+        // with them the scaler reaches DLSS Ray Reconstruction parity
+        // on Apple Silicon for the typical mirror-finish / glossy-metal
+        // case we have on the diamond / glass sphere scene.
+        //
+        // Formats:
+        //   specularAlbedo  -- RGBA16F (per-pixel F0; metals need RGB
+        //                      since gold's F0 is yellow, etc.).
+        //   roughness       -- R16F single-channel. The engine allocates
+        //                      the backing texture as R32F (the RHI
+        //                      doesn't expose R16F today and the
+        //                      precision delta is academic for a guidance
+        //                      input), so we ask MetalFX to read it as
+        //                      R32F here too -- Apple's scaler accepts
+        //                      any single-channel float format for this
+        //                      input; the descriptor just has to declare
+        //                      what the engine actually binds.
+        //   specularHitDist -- R16F single-channel; same R32F-on-the-host
+        //                      reasoning as roughness.
+        desc.specularAlbedoTextureFormat       = MTLPixelFormatRGBA16Float;
+        desc.roughnessTextureFormat            = MTLPixelFormatR32Float;
+        desc.specularHitDistanceTextureFormat  = MTLPixelFormatR32Float;
         // Linear HDR all the way through MetalFX. Output is RGBA16F so
         // temporal reuse can see the full HDR range; the engine runs
         // a dedicated `tonemap` compute kernel after this pass to
@@ -163,6 +187,9 @@ extern "C" void pt_metalfx_encode(void* state,
                                   void* motion_in,
                                   void* normal_in,                  // can be NULL -> skip guidance
                                   void* albedo_in,                  // can be NULL -> skip guidance
+                                  void* specular_albedo_in,         // can be NULL -> skip guidance (issue #118)
+                                  void* roughness_in,               // can be NULL -> skip guidance (issue #118)
+                                  void* specular_hit_distance_in,   // can be NULL -> skip guidance (issue #118)
                                   void* color_out,
                                   float jitter_x,
                                   float jitter_y,
@@ -214,6 +241,17 @@ extern "C" void pt_metalfx_encode(void* state,
             // keep both non-null whenever the denoiser is active.
             st->scaler.normalTexture        = (__bridge id<MTLTexture>)normal_in;
             st->scaler.diffuseAlbedoTexture = (__bridge id<MTLTexture>)albedo_in;
+            // Specular guidance trio (issue #118). Apple's scaler tolerates
+            // a nil binding as "no guidance for this frame," so when the
+            // engine didn't allocate one of these (e.g. caller is on the
+            // SVGF-only path that doesn't request specular guidance) we
+            // pass nil through and the scaler falls back to its
+            // no-specular-data behaviour for that input. With all three
+            // bound the scaler picks up the F0 / roughness / reflection-
+            // depth field and the 8x8 specular halos go away.
+            st->scaler.specularAlbedoTexture      = (__bridge id<MTLTexture>)specular_albedo_in;
+            st->scaler.roughnessTexture           = (__bridge id<MTLTexture>)roughness_in;
+            st->scaler.specularHitDistanceTexture = (__bridge id<MTLTexture>)specular_hit_distance_in;
             st->scaler.outputTexture      = st->output_priv;
             st->scaler.jitterOffsetX      = jitter_x;
             st->scaler.jitterOffsetY      = jitter_y;
@@ -258,7 +296,11 @@ extern "C" void* pt_metalfx_create(void*, std::uint32_t, std::uint32_t) {
     return nullptr;
 }
 extern "C" void pt_metalfx_destroy(void*) {}
-extern "C" void pt_metalfx_encode(void*, void*, void*, void*, void*, void*, void*, void*,
+// 11 void* params: state, cb, color_in, depth_in, motion_in, normal_in,
+// albedo_in, specular_albedo_in (#118), roughness_in (#118),
+// specular_hit_distance_in (#118), color_out.
+extern "C" void pt_metalfx_encode(void*, void*, void*, void*, void*, void*, void*,
+                                   void*, void*, void*, void*,
                                    float, float, const float*, const float*, int) {}
 
 #endif

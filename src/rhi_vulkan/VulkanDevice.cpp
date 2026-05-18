@@ -15,6 +15,7 @@
 #include "../core/Log.h"
 #include "../core/Memory/MemTag.h"
 #include "../core/Memory/Memory.h"
+#include "../core/Tracy.h"
 
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -117,7 +118,17 @@ constexpr bool kEnableValidation = false;
 // identical to the pre-rewrite state. StarsComposite reads this to
 // attenuate the celestial composite by foreground cloud density.
 // --- end Cloud transmittance ------------------------------------------------
-static constexpr std::uint32_t kNumTexSlots = 11;
+// --- MetalFX specular guidance G-buffers (issue #118) -----------------------
+// Engine texture slots 11/12/13 -> vk::bindings 24/25/26 are the three
+// MetalFX TemporalDenoisedScaler specular guidance inputs:
+// specular_albedo (RGBA16F F0), roughness (R32F), specular_hit_distance
+// (R32F). Binding 23 is reserved for #115 SIGMA shadow visibility
+// (parallel-agent coordination). Vulkan declares them for slot
+// stability across the cross-compiled SPIR-V variant but the in-house
+// NRD/SVGF denoiser path doesn't consume them in this PR (#50 covers
+// NRD's roughness/specular-hit-distance inputs).
+// --- end MetalFX specular guidance ------------------------------------------
+static constexpr std::uint32_t kNumTexSlots = 14;
 constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     0,  // engine slot 0  -> shader binding 0  (output / swapchain)
     1,  // engine slot 1  -> shader binding 1  (accum_hdr)
@@ -127,11 +138,14 @@ constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     9,  // engine slot 5  -> shader binding 9  (env_map)
     12, // engine slot 6  -> shader binding 12 (star_map)
     13, // engine slot 7  -> shader binding 13 (moon_map)
-    16, // engine slot 8  -> shader binding 16 (normal_tex, SVGF/NRD/OptiX-AOV)
-    17, // engine slot 9  -> shader binding 17 (albedo_tex, OptiX AOV only)
+    16, // engine slot 8  -> shader binding 16 (normal_tex)
+    17, // engine slot 9  -> shader binding 17 (albedo_tex)
     22, // engine slot 10 -> shader binding 22 (cloud_trans_tex, #46 follow-up)
+    24, // engine slot 11 -> shader binding 24 (specular_albedo_tex, #118)
+    25, // engine slot 12 -> shader binding 25 (roughness_tex, #118)
+    26, // engine slot 13 -> shader binding 26 (specular_hit_distance_tex, #118)
 };
-constexpr std::uint32_t kSlotToBufBinding[11] = {
+constexpr std::uint32_t kSlotToBufBinding[14] = {
     0,  // engine slot 0 unused
     3,  // engine slot 1 -> shader binding 3  (mesh_positions)
     4,  // engine slot 2 -> shader binding 4  (mesh_indices)
@@ -148,6 +162,22 @@ constexpr std::uint32_t kSlotToBufBinding[11] = {
     // SDF Phase 1 (#97): SDF cluster buffer. Moved here from engine
     // slot 8 / binding 19 to make room for tri_bvh_*.
     21, // engine slot 10 -> shader binding 21 (SDF cluster buffer)
+    // SIGMA shadow visibility buffer (issue #115). R32F per pixel
+    // storage buffer (not a texture -- escapes the 8-RW-texture cap
+    // on Metal that PathTrace was already saturating).
+    23, // engine slot 11 -> shader binding 23 (shadow_vis_buf)
+    // Light primitives (#73): analytic light list. Past the SIGMA
+    // #115 / MetalFX specular #118 reservations at 23..26. Lands on
+    // engine slot 12 because shadow_vis_buf already claims slot 11
+    // on the integration branch (declared before light_prims in the
+    // shader so the MSL slot also lands one higher).
+    27, // engine slot 12 -> shader binding 27 (light_prims)
+    // Hierarchical light tree (#129): packed-node SSBO consumed by
+    // PathTrace.slang's O(log N) NEE picker. Declared AFTER
+    // light_prims in the shader so MSL lands on slot 13; explicit
+    // vk::binding(28) is what matters on SPIR-V (past the MetalFX
+    // specular trio at 24..26 and the light_prims slot at 27).
+    28, // engine slot 13 -> shader binding 28 (light_tree_nodes)
 };
 // Scene TLAS lives at engine accel-slot 2 -> shader binding 2.
 
@@ -927,10 +957,12 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // is true; ASKHR isn't a valid descriptor type at all on drivers
     // without VK_KHR_acceleration_structure (e.g. pre-1.3 MoltenVK).
     // The "+4" / "+1" headroom from the original sizing is preserved.
-    // 11 storage_images: +1 over the legacy 10 is the accum_stars
-    // binding 22 added for issue #46 (star-split bypass of SVGF;
-    // moved from binding 21 in round-2 merge with main after SDF
-    // Phase 1 #109 took binding 21 for its storage buffer).
+    // 14 storage_images: 11 was the post-#46 count (bindings 0/1/6/7/8/9/
+    // 12/13/16/17/22). Issue #118 adds three MetalFX specular guidance
+    // G-buffers (specular_albedo / roughness / specular_hit_distance)
+    // at bindings 24/25/26. Vulkan declares them in the descriptor set
+    // for SPIR-V slot stability even though the in-house NRD/SVGF chain
+    // doesn't consume them today (#50 covers NRD's matching inputs).
     // PR #106 follow-up bumps storage_buffer per set from 7 to 9 for
     // tri_bvh_nodes / tri_bvh_permuted_ids (bindings 19/20); SDF
     // Phase 1 (#97) bumps it again from 9 to 10 for the SDF cluster
@@ -938,15 +970,16 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     const std::uint32_t kTotalSets =
         static_cast<std::uint32_t>(kFramesInFlight * kDispatchSetsPerFrame);
     std::vector<VkDescriptorPoolSize> psizes;
-    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kTotalSets * 11 + 4 });
+    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kTotalSets * 14 + 4 });
     if (rt_supported_) {
         psizes.push_back({ VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, kTotalSets * 1 + 1 });
     }
-    // 10 storage-buffer bindings per dispatch: mesh_positions, mesh_indices,
+    // 11 storage-buffer bindings per dispatch: mesh_positions, mesh_indices,
     // primitives, marginal_cdf, conditional_cdf, exposure_state, analytic
     // bvh_nodes (binding 18), tri_bvh_nodes (binding 19),
-    // tri_bvh_permuted_ids (binding 20), sdf_clusters (binding 21).
-    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 10 + 4 });
+    // tri_bvh_permuted_ids (binding 20), sdf_clusters (binding 21),
+    // shadow_vis_buf (binding 23, issue #115).
+    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 11 + 4 });
     psizes.push_back({ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,          kTotalSets * 1 + 1 });
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -958,8 +991,8 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     vkCreateDescriptorPool(device_, &dpci, nullptr, &dpool_);
 
     // ---- Build the unified descriptor set layout ----------------------
-    // 23 bindings when hw RT is available (slot 2 = scene_tlas KHR AS),
-    // 22 otherwise -- the AS descriptor type itself is invalid on
+    // 26 bindings when hw RT is available (slot 2 = scene_tlas KHR AS),
+    // 25 otherwise -- the AS descriptor type itself is invalid on
     // drivers without VK_KHR_acceleration_structure, so the layout has
     // to omit that binding entirely. The matching SPIR-V variant
     // (PathTrace_norq.spv) drops the scene_tlas declaration in lock
@@ -971,10 +1004,14 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // for the triangle BVH). Binding 22 is cloud_trans_tex (R32F
     // per-pixel cloud transmittance G-buffer, issue #46 follow-up);
     // reuses the slot accum_stars (#108) briefly occupied before the
-    // stateless composite rewrite freed it.
+    // stateless composite rewrite freed it. Bindings 24/25/26 (issue
+    // #118 MetalFX specular guidance) are specular_albedo (RGBA16F),
+    // roughness (R32F), specular_hit_distance (R32F). Binding 23 is
+    // reserved for #115 SIGMA shadow visibility (parallel-agent
+    // coordination -- this PR leaves it as a gap).
     {
         std::vector<VkDescriptorSetLayoutBinding> b;
-        b.reserve(23);
+        b.reserve(27);
         auto add_binding = [&](std::uint32_t binding, VkDescriptorType type) {
             VkDescriptorSetLayoutBinding lb{};
             lb.binding         = binding;
@@ -1041,6 +1078,47 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // Allocated host-side when denoiser_active_; PARTIALLY_BOUND
         // covers the host-side gate's "no denoiser, no binding" case.
         add_binding(22, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        // Binding 23: shadow_vis_buf. R32F per-pixel sun-NEE visibility
+        // storage buffer written by PathTrace's primary-hit pass and
+        // bilateral-filtered by SigmaShadow.slang (issue #115). Storage
+        // BUFFER (not image) because Apple Silicon's 8-RW-texture cap
+        // on PathTrace is already saturated. Allocated host-side when
+        // denoiser_active_ AND r_shadow_demod is on; the engine binds
+        // the placeholder storage buffer at this slot otherwise to keep
+        // the descriptor set complete (the shader's write_shadow_vis
+        // push gate is the runtime "actually touch this buffer" switch).
+        add_binding(23, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        // --- Light primitives (#73) ---
+        // Binding 27: analytic light list (light_prims). Sits past
+        // bindings 23..26 reserved for SIGMA #115 / MetalFX specular
+        // #118. The engine binds a placeholder storage buffer when
+        // no lights are active; the shader's `light_count > 0` gate
+        // is the runtime signal.
+        add_binding(27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        // --- end Light primitives ---
+        // --- MetalFX specular guidance G-buffers (issue #118) -------
+        // Binding 23 reserved for #115 SIGMA shadow visibility
+        // (parallel-agent coordination). Bindings 24/25/26 are
+        // specular_albedo (RGBA16F F0), roughness (R32F), and
+        // specular_hit_distance (R32F). Allocated host-side only for
+        // MetalFX-family kinds; PARTIALLY_BOUND keeps the SPIR-V
+        // variant valid on non-MetalFX dispatches where the slots
+        // stay unbound and the shader's write-gate runtime push
+        // elides the write.
+        add_binding(24, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        add_binding(25, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        add_binding(26, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        // --- end MetalFX specular guidance --------------------------
+        // --- Light tree (#129) -------------------------------------
+        // Binding 28: hierarchical light-tree packed-node SSBO.
+        // 4 float4s per node (LightTreeNode in renderer/LightTree.h).
+        // PathTrace.slang's NEE picker walks this top-down for O(log N)
+        // light selection when push.light_count > 0 AND r_light_tree=1;
+        // engine binds the placeholder storage buffer when the tree is
+        // empty (no lights or cvar=0 with stale data) so the descriptor
+        // set stays complete.
+        add_binding(28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        // --- end Light tree ----------------------------------------
 
         // UPDATE_AFTER_BIND for every binding so we can rewrite the
         // shared descriptor set between dispatches in the same cmd
@@ -2533,6 +2611,7 @@ bool VulkanDevice::BuildAccelerationStructure(
 
 AccelStructHandle VulkanDevice::CreateBLAS(const BLASDesc& d) {
     if (!rt_supported_ || d.vertex_count == 0 || d.index_count == 0) return {0};
+    PT_ZONE_SCOPED_N("VulkanDevice::CreateBLAS");
     pt::mem::TagScope scope(pt::MemTag::GpuBuffers);
 
     // Upload vertex + index data into device-local AS-input buffers.
@@ -2605,6 +2684,7 @@ AccelStructHandle VulkanDevice::CreateBLAS(const BLASDesc& d) {
 
 AccelStructHandle VulkanDevice::CreateTLAS(const TLASDesc& d) {
     if (!rt_supported_ || d.instances.empty()) return {0};
+    PT_ZONE_SCOPED_N("VulkanDevice::CreateTLAS");
     pt::mem::TagScope scope(pt::MemTag::GpuBuffers);
 
     // Build the instance buffer.
@@ -2702,6 +2782,7 @@ void VulkanDevice::DestroyAccelStruct(AccelStructHandle h) {
 // ---- Frame loop ---------------------------------------------------------
 
 FrameContext VulkanDevice::BeginFrame() {
+    PT_ZONE_SCOPED_N("VulkanDevice::BeginFrame");
     if (device_ == VK_NULL_HANDLE) return {};
 
     vkWaitForFences(device_, 1, &fence_in_flight_[current_frame_],
@@ -2763,6 +2844,7 @@ CommandBuffer* VulkanDevice::AcquireCommandBuffer() {
 }
 
 void VulkanDevice::Submit(CommandBuffer* cb) {
+    PT_ZONE_SCOPED_N("VulkanDevice::Submit");
     if (cb == nullptr || device_ == VK_NULL_HANDLE) return;
     auto* vcb = static_cast<VulkanCommandBuffer*>(cb);
     VkCommandBuffer cmd = vcb->Raw();
@@ -3102,6 +3184,7 @@ bool VulkanDevice::SupportsDenoise() const {
 }
 
 void VulkanDevice::Denoise(const DenoiseDesc& d) {
+    PT_ZONE_SCOPED_N("VulkanDevice::Denoise");
     if (device_ == VK_NULL_HANDLE) return;
     if (wrapped_cb_ == nullptr || wrapped_cb_->Raw() == VK_NULL_HANDLE) {
         // Engine called Denoise without first AcquireCommandBuffer
@@ -3337,14 +3420,17 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
         (d.quality == DenoiseDesc::Quality::Atrous);
     denoiser_->Encode(wrapped_cb_->Raw(),
                       d.color_in, d.depth_in, d.motion_in,
-                      d.normal_in, d.output,
+                      d.normal_in,
+                      d.albedo_in,           // issue #119
+                      d.output,
                       d.final_output, d.exposure_state,
                       d.bloom_in, d.bloom_intensity,
                       d.reset_history,
                       atrous_enabled,
                       d.atrous_passes,
                       d.hdr_pipeline,
-                      d.stars_in);
+                      d.stars_in,
+                      d.albedo_demod_enabled);  // issue #119
 }
 
 }  // namespace pt::rhi::vk

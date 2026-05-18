@@ -20,11 +20,18 @@
 #include <vector>
 
 namespace pt::app      { class Window; class ConsoleOverlay; class PerfOverlay; }
+namespace pt::audio    { class AudioSystem; }
 namespace pt::jobs     { class JobSystem; }
 namespace pt::console  { class ConsoleServer; }
 namespace pt::rhi      { class Device; struct PipelineHandle; }
 namespace pt::renderer { struct Camera; }
 namespace pt::csg      { class CsgScene; struct BakedMesh; }
+namespace pt::effects  { class ParticleSystem; }
+namespace pt::physics  { class PhysicsSystem; }
+// Voxel destruction Phase 1 (issue #140). VoxelGrid lives in
+// src/destruction/; the engine keeps a small map of voxelized
+// objects + a reserved SDF cluster id range used to render them.
+namespace pt::destruction { class VoxelGrid; }
 
 namespace pt::engine {
 
@@ -83,7 +90,13 @@ public:
     // buffer whenever the set changes.
     struct AnalyticPrim {
         enum Type     : std::uint8_t { Sphere = 0, Plane = 1 };
-        enum Material : std::uint8_t { Lambert = 0, Metal = 1, Dielectric = 2 };
+        // Material enum mirrors PathTrace.slang MAT_* constants. Water is
+        // the Phase 1 (#134) addition: shaded analytic plane with normal-
+        // map waves + Beer's-law absorption + Schlick Fresnel + Snell
+        // refraction. New entries MUST be appended at the end to preserve
+        // the host->shader integer mapping pack_prim writes into the
+        // primitives storage buffer.
+        enum Material : std::uint8_t { Lambert = 0, Metal = 1, Dielectric = 2, Water = 3 };
         Type     type      = Sphere;
         Material material  = Lambert;
         float    pos_or_n[3] {0, 0, 0};   // sphere center / plane normal
@@ -93,10 +106,61 @@ public:
         float    ior         = 1.5f;
     };
 
+    // Analytic light primitive (#73). First-class scene light source for
+    // direct-lighting NEE, parallel to (but independent of) AnalyticPrim.
+    // The engine maintains a map keyed by user id; the set is uploaded
+    // to a single storage buffer when dirty (EnsureLightsUploaded).
+    //
+    // Units mirror real-world emitter physics:
+    //   POINT  intensity in W/sr (candela-equivalent, per channel)
+    //   SPOT   intensity in W/sr at the axis center; multiplied by an
+    //          angular cosine falloff between cos_inner and cos_outer
+    //   SPHERE/QUAD  intensity in W/m^2/sr (radiance of a diffuse
+    //          area emitter). Apparent power scales with the sampled
+    //          area (4*pi*r^2 for sphere, 4*u_half*v_half for quad).
+    //
+    // Phase 1 sampling is naive uniform single-pick; Phase 2 (#129)
+    // wraps a light tree over this list with O(log N) importance
+    // selection. The GPU representation packs into 4 float4s per light
+    // (kFloatsPerLight below) -- see PathTrace.slang's LightRecord for
+    // the lane-by-lane layout.
+    struct AnalyticLight {
+        enum Type : std::uint8_t { Point = 0, Spot = 1, Sphere = 2, Quad = 3 };
+        Type      type        = Point;
+        float     pos[3]      {0, 0, 0};
+        float     radius      = 0.0f;       // sphere radius (m); 0 for point/spot/quad
+        float     intensity[3]{1, 1, 1};    // W/sr (point/spot) or W/m^2/sr (area)
+        float     dir[3]      {0,-1, 0};    // spot axis / quad normal (unit vec)
+        float     cos_outer   = 0.0f;       // spot only -- outer half-angle cosine
+        float     cos_inner   = 0.0f;       // spot only -- inner half-angle cosine
+        float     u_vec[3]    {1, 0, 0};    // quad u-half-extent vector (length = u_half)
+        float     v_half      = 0.0f;       // quad v-axis half-extent (m)
+    };
+
 private:
     void RegisterCommands();
     void RegisterCsgCommands();
     void RegisterPrimCommands();
+    // --- Physics Phase 1 (#132) -------------------------------------------
+    // Console commands for the Verlet physics layer (`phys_drop`,
+    // `phys_clear`, `phys_status`). Cvar registration lives alongside
+    // the other PT_CVAR blocks; this just wires the commands. No-op
+    // when `phys_enabled = 0`.
+    void RegisterPhysicsCommands();
+    // Tick the Verlet integrator + collision pass once per frame, then
+    // write each particle's curr_pos back into the matching analytic
+    // primitive (sphere) in primitives_. Called from Tick BEFORE
+    // RenderFrame's EnsurePrimitivesUploaded so the BVH refit picks
+    // up the new positions. No-op when `phys_enabled = 0` or no
+    // particles exist.
+    void StepPhysics(float dt);
+    // --- end Physics Phase 1 ----------------------------------------------
+    // Console commands for the analytic light primitive set (#73):
+    // `light_point`, `light_spot`, `light_sphere`, `light_quad`, plus
+    // `light_list` / `light_clear` / `light_remove`. Mirrors the
+    // prim_*/sdf_* registration style; the populated map is uploaded
+    // to GPU on the next render frame via EnsureLightsUploaded.
+    void RegisterLightCommands();
     // --- SDF Phase 1 (#97) -------------------------------------------------
     // Console commands for the SDF primitive set (`sdf_sphere`,
     // `sdf_box`, `sdf_smin`, ...). Mirrors the prim_*/csg_* registration
@@ -104,6 +168,36 @@ private:
     // EnsureSdfPrimsUploaded.
     void RegisterSdfCommands();
     // --- end SDF Phase 1 ---------------------------------------------------
+
+    // --- Voxel destruction Phase 1 (#140) ----------------------------------
+    // Console commands for the voxelization subsystem (`voxelize_object`,
+    // `voxelize_save`, `voxelize_list`, `voxelize_clear`). Mirrors the
+    // sdf_*/prim_*/csg_* style; voxelized objects are stored in
+    // voxel_grids_ keyed by source object id. The render-time injection
+    // into sdf_prims_ happens in SyncVoxelDemoState() once per frame.
+    void RegisterVoxelCommands();
+
+    // Voxelize the source object identified by `source_id`. The
+    // resolution order is CSG mesh root -> SDF cluster id -> analytic
+    // primitive id. The first match wins; subsequent ids are ignored.
+    // Returns true on a successful voxelization (occupied count > 0).
+    // out_summary, if non-null, receives a one-line human summary for
+    // command-output echo. voxel_size in metres (caller supplies the
+    // r_voxel_size cvar value).
+    bool VoxelizeSourceObject(std::uint32_t source_id, float voxel_size,
+                              std::string* out_summary);
+
+    // Mirrors the r_voxelize_demo cvar to the SDF cluster set. When
+    // demo=1 and at least one VoxelGrid is present, each occupied
+    // voxel is injected into sdf_prims_ under a reserved id (range
+    // [kVoxelClusterIdBase, kVoxelClusterIdBase + N)) so the path
+    // tracer renders it as a box via the existing sphere-trace path.
+    // When demo=0, those clusters are removed. Idempotent -- safe to
+    // call every frame; it computes the desired cluster set then
+    // diff-applies. Also flips voxel_demo_active_ for the hide-mesh
+    // gate in RenderFrame.
+    void SyncVoxelDemoState();
+    // --- end Voxel destruction Phase 1 -------------------------------------
     void TearDownDevice();
     void RenderFrame();
 
@@ -150,6 +244,28 @@ private:
     // Re-upload the analytic-primitive storage buffer from the in-memory
     // map. Called from RenderFrame whenever primitives_dirty_ is set.
     void EnsurePrimitivesUploaded();
+
+    // Re-upload the analytic-light storage buffer from `light_prims_`
+    // (#73). Called from RenderFrame whenever light_prims_dirty_ is
+    // set. Grows by powers of two from a small floor (16 lights) and
+    // packs each entry into 4 float4s; the path tracer's Lambert NEE
+    // block reads up to `light_prims_count_` records per sample
+    // (uniform single-pick over the count).
+    void EnsureLightsUploaded();
+
+    // --- Light tree (#129) -------------------------------------------------
+    // Rebuild + re-upload the hierarchical light tree SSBO whenever
+    // the light set has been mutated since the last frame. Builds via
+    // pt::renderer::BuildLightTree on the host (CPU; <1ms for 1000
+    // lights). The shader gates traversal on push.light_tree_node_count
+    // > 0 AND r_light_tree cvar; when either condition is false the
+    // shader falls back to #73's naive uniform pick. Sized the GPU
+    // buffer in powers of two starting at 32 nodes -- a 16-light scene
+    // (smallest LightTree.h leaf-count granularity) produces 31 nodes
+    // (2N-1), so 32 is the smallest power-of-two floor that fits without
+    // an immediate realloc.
+    void EnsureLightTreeUploaded();
+    // --- end Light tree ----------------------------------------------------
 
     // --- SDF Phase 1 (#97) -------------------------------------------------
     // Re-upload the SDF cluster storage buffer from `sdf_prims_`. Called
@@ -212,8 +328,31 @@ private:
     std::unique_ptr<pt::console::ConsoleServer> server_;
     std::unique_ptr<pt::rhi::Device>            device_;
     std::unique_ptr<pt::renderer::Camera>       camera_;
+    // Audio subsystem (issue #80 MVP -- miniaudio-backed 3D playback).
+    // Init() opens the default device + voice pool; Shutdown() releases
+    // both. Tick(camera_pos, camera_fwd) pushes a listener snapshot
+    // into the audio thread for distance attenuation + stereo panning.
+    // Ray-traced occlusion / reverb / HRTF (the issue's headline) are
+    // deferred to a follow-up that consumes the renderer's TLAS.
+    std::unique_ptr<pt::audio::AudioSystem>     audio_system_;
     std::unique_ptr<pt::csg::CsgScene>          csg_scene_;
     std::unique_ptr<pt::csg::BakedMesh>         pending_baked_;
+    // --- Physics Phase 1 (#132) -------------------------------------------
+    // Owned by the engine; ticked once per frame from Tick() between
+    // UpdateCamera and RenderFrame so the analytic primitive buffer's
+    // position writeback happens before EnsurePrimitivesUploaded /
+    // BVH refit. Allocated in Init(); destroyed in Shutdown(). Active
+    // only when the `phys_enabled` cvar is non-zero -- otherwise
+    // StepPhysics returns immediately and the engine behaves exactly
+    // like a no-physics build.
+    std::unique_ptr<pt::physics::PhysicsSystem> physics_;
+    // Auto-incrementing id used by `phys_drop` when allocating a new
+    // analytic-prim slot for a spawned sphere. Starts well above the
+    // user-facing prim_sphere id range (which is human-typed and
+    // typically single digits) to keep the namespaces visually
+    // distinct.
+    std::uint32_t                               physics_next_prim_id_ = 100000u;
+    // --- end Physics Phase 1 ----------------------------------------------
     pt::jobs::JobSystem::Handle                 bake_handle_{};
     std::atomic<int>                            bake_phase_{0};   // 0 idle, 1 baking, 2 ready
     // Set on backend switch (RequestBackendSwitch).  TearDownDevice
@@ -268,6 +407,52 @@ private:
     std::uint32_t                               sdf_cluster_count_       = 0;  // clusters last uploaded
     // --- end SDF Phase 1 ---------------------------------------------------
 
+    // Analytic light primitives (#73) -- point / spot / sphere area /
+    // quad area. Independent of `primitives_`: a separate storage
+    // buffer feeds PathTrace.slang's Lambert NEE-to-lights block. The
+    // map is keyed by user id (same convention as analytic / SDF /
+    // CSG); light_prims_dirty_ schedules a re-upload on the next
+    // render frame. Phase 1 caps the active set at a soft 256 lights
+    // -- naive uniform single-pick variance dominates beyond that and
+    // the light tree (#129) is the answer.
+    std::map<std::uint32_t, AnalyticLight>      light_prims_;
+    bool                                        light_prims_dirty_       = true;
+    std::uint64_t                               light_buffer_id_         = 0;
+    std::uint32_t                               light_buffer_capacity_   = 0;  // lights that fit
+    std::uint32_t                               light_count_uploaded_    = 0;  // lights last uploaded
+
+    // --- Light tree (#129) -------------------------------------------------
+    // Hierarchical light tree (Conty Estevez & Kulla 2018) for O(log N)
+    // NEE light selection. Built CPU-side by pt::renderer::BuildLightTree
+    // and uploaded to a flat-node SSBO at engine slot 13 / shader binding
+    // 28. Re-built whenever light_prims_dirty_ fires (the same hook that
+    // re-uploads the light list itself) -- the build is <1ms for 1000
+    // lights so we don't bother caching across moves at MVP scale.
+    // light_tree_node_count_uploaded_ doubles as the shader's gate
+    // (push.light_tree_node_count > 0 AND r_light_tree=1 -> traverse,
+    // else fall back to naive uniform pick from #73).
+    std::uint64_t                               light_tree_buffer_id_       = 0;
+    std::uint32_t                               light_tree_buffer_capacity_ = 0;  // nodes that fit
+    std::uint32_t                               light_tree_node_count_uploaded_ = 0;
+    // --- end Light tree ----------------------------------------------------
+
+    // --- Voxel destruction Phase 1 (#140) ----------------------------------
+    // VoxelGrids produced by `voxelize_object`, keyed by source object
+    // id (CSG root, SDF cluster id, or analytic-prim id). Renderer
+    // injection happens via SyncVoxelDemoState which spawns one
+    // reserved-id SDF cluster per occupied voxel under each grid.
+    // Reserved cluster id range starts at kVoxelClusterIdBase so it
+    // can't collide with user-issued sdf_* ids.
+    static constexpr std::uint32_t              kVoxelClusterIdBase = 0xF0000000u;
+    std::map<std::uint32_t, std::unique_ptr<pt::destruction::VoxelGrid>> voxel_grids_;
+    // Mirrors r_voxelize_demo for the RenderFrame hide-mesh gate.
+    // Pulled at the start of each frame in SyncVoxelDemoState. When
+    // true AND at least one voxel grid exists, the CSG mesh / TLAS
+    // bindings are suppressed locally so the path tracer renders ONLY
+    // the voxelized form (matches the A/B-toggle requirement in #140).
+    bool                                        voxel_demo_active_       = false;
+    // --- end Voxel destruction Phase 1 -------------------------------------
+
     // Always-allocated 16-byte storage buffer used as a harmless
     // placeholder for any optional binding slot whose primary buffer is
     // 0 (e.g. SDF cluster slot 10 when no SDFs exist AND analytic prims
@@ -288,6 +473,25 @@ private:
     // highlights into halos. Replaces the EMA accum_stars architecture
     // from #108 -- see shaders/StarsComposite.slang for the rationale.
     std::uint64_t                               stars_composite_pipeline_id_ = 0;
+    // Stateless aurora borealis composite (issue #116). Dispatched on
+    // Metal AFTER stars_composite (so aurora layers on top of celestials
+    // in HDR space) and BEFORE the bloom pyramid (so bright aurora
+    // ribbons get bloom halos and ACES tonemap squashes them with the
+    // rest of the image). Curl-noise driven procedural ribbon density
+    // at 100-150 km altitude band; see shaders/AuroraComposite.slang.
+    // Zero on Vulkan today -- the Vulkan dispatch is a follow-up, the
+    // engine gate folds correctly to "no aurora" when the id is 0.
+    std::uint64_t                               aurora_composite_pipeline_id_ = 0;
+    // Screen-space particle composite (#82 MVP). Same dispatch context
+    // as stars/aurora -- runs in the use_engine_tonemap branch AFTER
+    // those composites and BEFORE the bloom pyramid so HDR particle
+    // highlights downsample into halos. CPU-side sim lives in
+    // particles_; the per-frame GPU buffer (particles_storage_id_) is
+    // rebuilt each frame from the live particle list. Metal-only
+    // today; Vulkan dispatch + descriptor wiring is a follow-up.
+    std::uint64_t                               particle_composite_pipeline_id_ = 0;
+    std::uint64_t                               particles_storage_id_  = 0;   // float4[3*N]
+    std::uint32_t                               particles_storage_capacity_ = 0; // particle slots that fit
     std::uint64_t                               perfoverlay_pipeline_id_ = 0;
     std::uint64_t                               perfoverlay_drawlist_id_ = 0;
     std::uint32_t                               perfoverlay_drawlist_capacity_ = 0;
@@ -369,6 +573,54 @@ private:
     // the rest of the denoiser-related textures (same denoiser_active_
     // lifecycle as depth_tex / motion_tex / post_denoise_hdr).
     std::uint64_t                               cloud_trans_tex_id_ = 0;
+    // SIGMA shadow visibility G-buffer (issue #115). One-float-per-pixel
+    // storage buffer (NOT a texture: Apple Silicon's 8-RW-texture cap
+    // on PathTrace is already saturated). PathTrace.slang writes the
+    // per-primary-hit sun-NEE shadow-ray transmittance into this buffer
+    // at the end of main(); the engine's SigmaShadow.slang dispatch
+    // (between Denoise() and StarsComposite) does a 5x5 bilateral
+    // filter of that visibility signal and multiplies the denoised
+    // visibility into the post-radiance-denoise HDR, restoring sharp
+    // sun-shadow boundaries that SVGF / MetalFX otherwise smudge across.
+    // 1.0 = unoccluded; 0.0 = fully shadowed; sky pixels write 1.0 so
+    // the SigmaShadow pass never darkens the sky composite. Allocated
+    // alongside the rest of the denoiser-related resources whenever
+    // denoiser_active_ AND r_shadow_demod is on (same lifecycle as
+    // depth_tex / motion_tex / cloud_trans_tex). Sized
+    // width * height * sizeof(float) -> ~8.3 MB at 1080p, trivial vs
+    // the rest of the denoiser texture budget.
+    std::uint64_t                               shadow_vis_buf_id_ = 0;
+    // SigmaShadow compute pipeline (issue #115). Built once at backend
+    // init; same lifecycle as stars_composite_pipeline_id_. Metal-only
+    // today (Vulkan plumbing is a follow-up); on Vulkan this stays
+    // zero so the engine's r_shadow_demod gate collapses to "no
+    // SIGMA dispatch, legacy denoiser shadow behaviour" until the
+    // Vulkan compositor lands.
+    std::uint64_t                               sigma_shadow_pipeline_id_ = 0;
+    // MetalFX specular-guidance G-buffers (issue #118). Three textures
+    // fed to MTLFXTemporalDenoisedScaler so it can tell specular from
+    // diffuse response; without them MetalFX produces 8x8 halos on
+    // bright reflections. Allocated only for MetalFX-family denoiser
+    // kinds (DenoiserKind::MetalFX / SvgfBasicMetalFx / SvgfAtrousMetalFx);
+    // SVGF / NRD / OptiX paths leave them at 0 since they don't accept
+    // these guidance inputs. Same allocation lifecycle as
+    // normal_tex_id_ / albedo_tex_id_.
+    //
+    //   specular_albedo_tex_id_       -- RGBA16F per-pixel F0 (Fresnel
+    //                                    reflectance at normal incidence).
+    //                                    Metals: F0 = albedo; dielectrics:
+    //                                    F0 = float3(0.04); Lambert: 0.
+    //   roughness_tex_id_             -- R16F single-channel surface
+    //                                    roughness in [0, 1]. 0 = mirror,
+    //                                    1 = fully rough.
+    //   specular_hit_distance_tex_id_ -- R16F distance from camera to the
+    //                                    specularly-reflected hit (MVP:
+    //                                    primary_t * smoothness; a future
+    //                                    PR can swap in a real reflection-
+    //                                    ray trace).
+    std::uint64_t                               specular_albedo_tex_id_       = 0;
+    std::uint64_t                               roughness_tex_id_             = 0;
+    std::uint64_t                               specular_hit_distance_tex_id_ = 0;
     // Bloom mip chain. mip 0 is half-res of the swapchain; each
     // subsequent mip halves again. Built every frame from
     // post_denoise_hdr_tex_ via threshold + downsample + upsample
@@ -435,6 +687,17 @@ private:
     // 0 if the load + rasterise failed (so the shader skips sampling).
     std::uint64_t                               star_map_tex_id_       = 0;
     std::uint32_t                               star_map_present_      = 0;
+
+    // CPU-side particle system for issue #82 MVP. Owns the live
+    // particle vector + continuous-emitter slots. Engine::Tick steps
+    // it once per frame; Engine::RenderFrame rebuilds the GPU storage
+    // buffer (particles_storage_id_) from its current state and
+    // dispatches the ParticleComposite kernel.
+    //
+    // unique_ptr instead of inline storage so we can forward-declare
+    // pt::effects::ParticleSystem above and keep Engine.h's include
+    // surface minimal. The fwd-decl needs the pointer to be heap-owned.
+    std::unique_ptr<pt::effects::ParticleSystem> particles_;
 
     // Moon surface texture (procedural, generated at engine init).
     // Equirectangular RGBA16F, 512x256. Sampled in moonDisc() when the

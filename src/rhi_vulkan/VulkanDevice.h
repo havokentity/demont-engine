@@ -48,25 +48,38 @@ private:
     VulkanDevice*  device_ = nullptr;
     VkCommandBuffer cb_     = VK_NULL_HANDLE;
     PipelineHandle bound_pipeline_{0};
-    // 11 texture slots: slots 0..7 are output / accum / denoise_color /
+    // 14 texture slots: slots 0..7 are output / accum / denoise_color /
     // depth / motion / env_map / star_map / moon_map; slot 8 is
-    // normal_tex (SVGF/NRD + OptiX-AOV), slot 9 is albedo_tex (OptiX
-    // AOV only), slot 10 is cloud_trans_tex (issue #46 follow-up
-    // R32F per-pixel cloud transmittance G-buffer the path tracer
-    // writes and StarsComposite reads). Keep in sync with
+    // normal_tex (SVGF/NRD + OptiX-AOV + MetalFX), slot 9 is albedo_tex
+    // (OptiX-AOV + MetalFX), slot 10 is cloud_trans_tex (issue #46
+    // follow-up: R32F per-pixel cloud transmittance G-buffer the path
+    // tracer writes and StarsComposite reads). Slots 11/12/13 (issue
+    // #118) are the MetalFX specular-guidance trio: specular_albedo
+    // (RGBA16F F0), roughness (R32F surface roughness), and
+    // specular_hit_distance (R32F reflection depth). Vulkan mirrors
+    // them for SPIR-V slot stability but the in-house NRD/SVGF chain
+    // doesn't consume them today (#50 will). Keep in sync with
     // kSlotToTexBinding[] in VulkanDevice.cpp.
-    TextureHandle  bound_tex_[11] {};
+    TextureHandle  bound_tex_[14] {};
     // 11 buffer slots: 8 original (mesh_positions/indices, primitives,
     // marginal/conditional CDFs, exposure_state, analytic-prim bvh_nodes),
     // slots 8/9 for the triangle-BVH (tri_bvh_nodes,
     // tri_bvh_permuted_ids -- the PR #106 follow-up that replaces the
     // SW Möller-Trumbore linear-scan path with a stack-based BVH walk),
-    // plus slot 10 added by SDF Phase 1 (#97) for the SDF cluster
-    // storage buffer (vk::binding 21; moved from binding 19 to make
-    // room for the triangle BVH). Keep this in sync with
+    // slot 10 added by SDF Phase 1 (#97) for the SDF cluster storage
+    // buffer (vk::binding 21; moved from binding 19 to make room for
+    // the triangle BVH), and slot 11 added by issue #115 for the SIGMA
+    // shadow visibility R32F-per-pixel buffer (vk::binding 23 -- a
+    // storage buffer, not an image, because Metal's 8-RW-texture cap
+    // on PathTrace was already saturated). Keep this in sync with
     // kSlotToBufBinding[] in VulkanDevice.cpp.
-    BufferHandle   bound_buf_[11] {};
-    std::size_t    bound_buf_off_[11] {};
+    // the triangle BVH), and slot 11 added by light primitives (#73)
+    // for the analytic light list (vk::binding 27). Slot 13 added by
+    // the hierarchical light tree (#129) for the packed-node SSBO at
+    // vk::binding(28); engine slot 12 is reserved for future use.
+    // Keep this in sync with kSlotToBufBinding[] in VulkanDevice.cpp.
+    BufferHandle   bound_buf_[14] {};
+    std::size_t    bound_buf_off_[14] {};
     AccelStructHandle bound_accel_[4] {};
     // Push-constant staging. Sized to fit the full PtPush (~448B today)
     // plus growth headroom so the engine can keep treating push as one

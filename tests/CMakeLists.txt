@@ -197,6 +197,42 @@ pt_add_test(pt_renderer_triangle_bvh
     pt_renderer_triangle_bvh_test.cpp
     LINK_TARGETS pt_renderer)
 
+# --- pt_math vec/mat/quat/transforms unit tests (issue #63) ----------------
+# Phase 3 of #47. These tests pin the glm contract the engine consumes:
+# RH coord system, column-major mat storage, perspectiveRH_ZO depth
+# range, lookAtRH conventions, and the screen-to-world ray reconstruction
+# math. Each test is a separate executable (one TU, one binary) -- same
+# pattern as the other unit-test cells above. They link glm::glm only
+# (no engine target), so they're pure-CPU + deterministic.
+#
+# pt_math_vec_test           -- vec2/vec3/vec4: dot, cross, normalize,
+#                               length, zero/near-zero pathology,
+#                               randomized Cauchy-Schwarz + orthogonality
+# pt_math_mat_test           -- mat3/mat4: identity, multiplication,
+#                               inverse, transpose, determinant,
+#                               column-major storage contract
+# pt_math_quat_test          -- quaternion: identity, angleAxis,
+#                               from Euler, multiplication, conjugate /
+#                               inverse, slerp endpoints + midpoint,
+#                               quat <-> mat3/mat4 round-trip,
+#                               small-angle + full-circle edges
+# pt_math_transforms_test    -- combined: TRS composition + inverse,
+#                               lookAtRH places cam at clip-space origin,
+#                               perspectiveRH_ZO near=0 / far=1 mapping,
+#                               screen-to-world ray reconstruction
+pt_add_test(pt_math_vec
+    pt_math_vec_test.cpp
+    LINK_TARGETS glm::glm)
+pt_add_test(pt_math_mat
+    pt_math_mat_test.cpp
+    LINK_TARGETS glm::glm)
+pt_add_test(pt_math_quat
+    pt_math_quat_test.cpp
+    LINK_TARGETS glm::glm)
+pt_add_test(pt_math_transforms
+    pt_math_transforms_test.cpp
+    LINK_TARGETS glm::glm)
+
 # --- pt_renderer/Astronomy unit tests (issue #65) --------------------------
 # JD conversions (J2000 + Unix-epoch reference points), GMST at J2000
 # vs the IAU 1982 formula, sun position at four cardinal solar events
@@ -213,6 +249,36 @@ pt_add_test(pt_renderer_triangle_bvh
 pt_add_test(pt_renderer_astronomy
     pt_renderer_astronomy_test.cpp
     LINK_TARGETS pt_renderer)
+
+# --- pt_renderer/HdrImage env-map CDF unit tests (issue #66) ---------------
+# Phase 3 of #47. Pins the marginal/conditional luminance-CDF builder
+# the env-map MIS sampler depends on. The CDF feeds NEE / env-map MIS
+# (`r_mis`); a wrong CDF silently biases every sky importance sample.
+#
+# The CDF construction currently lives inlined inside
+# Engine::ReloadEnvMap (src/engine/Engine.cpp ~lines 2369-2413). Until
+# it's factored into a public helper, the test file re-implements the
+# exact same algorithm (BuildEnvCdf reference) and asserts its
+# mathematical contract:
+#   - Marginal CDF is monotone non-decreasing, terminates at 1.0
+#   - Each conditional row's CDF is monotone non-decreasing, terminates
+#     at 1.0 (for lit rows) or stays at 0.0 (for dark rows)
+#   - 4x4 known greyscale image matches a hand-computed reference
+#   - Single bright pixel makes the CDF step exactly at that pixel
+#   - Zero-luminance image leaves CDFs at 0.0 with no NaN/Inf
+#   - Dark-row mixed with lit rows behaves correctly
+#   - Uniform-white image follows sin(theta) lat-long weighting
+#   - Round-trip sampling matches input distribution (chi-square, p > 0.01)
+#   - Closed-form PDF (lum * W * H / (2 pi^2 * total)) matches
+#     pixel-prob / lat-long Jacobian; degenerate guards return 0
+#     (no NaN/Inf)
+#   - Builder is deterministic across runs
+# Pure-header doctest -- no link against pt_renderer (the algorithm is
+# inlined in the test). When ReloadEnvMap's CDF builder is factored
+# into a public function, swap this test over to call that function
+# directly and delete the reference re-impl.
+pt_add_test(hdrimage_cdf
+    hdrimage_cdf_test.cpp)
 
 # ============================================================================
 # Golden-image regression matrix (issue #45)
@@ -493,6 +559,54 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     pt_add_golden_cell(SCENE sdf_smin_row BACKEND vulkan   DENOISER off
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     # --- end SDF Phase 1 ---------------------------------------------------
+
+    # --- Sky / sun / stars / moon matrix (#112) ----------------------------
+    # Follow-up to the #45 MVP: the cornell_csg cell exercises CSG +
+    # analytic BVH but nothing in the procedural sky / astronomy /
+    # stars / moon / clouds stack. Issue #112 lists the regressions
+    # the current matrix would miss (PR #114's stars-stateless-
+    # composite fix is the canonical example -- stars were invisible
+    # under any denoiser and no cornell_csg cell could have caught it).
+    #
+    # Scene coverage:
+    #   procedural_noon       sun @ +60 deg     daytime sky + bright sun disc
+    #   procedural_evening    sun @ +5  deg     sunset orange, long Mie path
+    #   procedural_dawn       sun @ -2  deg     civil twilight, no sun disc
+    #   bsc_night             sun @ -45 deg     BSC stars, star_split path
+    #   lunar_night           astronomical      moon disc, NEE from moon
+    #   bsc_night_clouds      astronomical      stars + cloud occlusion
+    #
+    # Denoiser coverage per scene:
+    #   software/off          -- CI-exercised cell (label golden_software)
+    #   metal/svgf_atrous     -- the user's most common dev-box combo;
+    #                            stresses the denoiser composite path
+    #                            (the star_split bypass-the-a-trous
+    #                            kernel that PR #114 fixed lives here).
+    #
+    # Tolerances: these scenes are noisier than cornell_csg because (a)
+    # procedural sky has more bright HDR pixels which exaggerate FP
+    # roundoff across backends; (b) star_split + clouds + ACES tonemap
+    # each amplify tiny radiance deltas. Default tolerances (16 / 2 / 1)
+    # held in early bring-up; if any cell flakes on cross-host runs the
+    # MAX_DELTA / MEAN_DELTA can be widened per-cell here without
+    # touching the harness.
+    set(_sky_scenes
+        procedural_noon
+        procedural_evening
+        procedural_dawn
+        bsc_night
+        lunar_night
+        bsc_night_clouds)
+    foreach(_scene IN LISTS _sky_scenes)
+        # Software backend / no denoiser -- this is the CI-exercised
+        # cell. Tolerance kept at defaults so a real regression surfaces.
+        pt_add_golden_cell(SCENE ${_scene} BACKEND software DENOISER off)
+        # Metal backend + SVGF a-trous -- the user's primary dev combo
+        # on M-series. Wider tolerance to absorb GPU FP-order variance.
+        pt_add_golden_cell(SCENE ${_scene} BACKEND metal    DENOISER svgf_atrous
+            MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+    endforeach()
+    # --- end #112 sky/sun/stars/moon matrix --------------------------------
 else()
     message(STATUS
         "tests: golden-image matrix skipped -- pt_render_one_frame and/or "
