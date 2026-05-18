@@ -49,10 +49,18 @@ enum SdfShape : std::uint32_t {
     SDF_SHAPE_PLANE        = 5,   // params: unit normal (3), distance d (n . p + d = 0)
     // --- SDF Phase 3 (#99) fractal DEs --------------------------------------
     // For all fractal shapes:
-    //   params[0] = per-shape "scale" (power for MANDELBULB; linear
-    //               step scale for MANDELBOX; radial-shrink scale for
-    //               APOLLONIAN). 0 means "use the r_sdf_fractal_power
-    //               cvar default".
+    //   params[0] = per-shape "scale" (polar power for MANDELBULB;
+    //               linear-step scale for MANDELBOX; radial-shrink
+    //               scale for APOLLONIAN). 0 = use the canonical
+    //               default for this shape:
+    //                 MANDELBULB -> r_sdf_fractal_power cvar (default 8)
+    //                 MANDELBOX  -> 2.5 (hardcoded canonical scale)
+    //                 APOLLONIAN -> 1.3 (hardcoded canonical scale)
+    //               The cvar only applies to MANDELBULB because
+    //               "power" and "scale" are different DE parameters --
+    //               Mandelbox/Apollonian have no useful global default
+    //               so they hold a hardcoded canonical value instead.
+    //               Mirror in shaders/SdfFractals.slang::evalFractalDist.
     //   params[1] = effective bound radius (metres). The host uses
     //               this to size the cluster AABB; rays only enter the
     //               sphere-trace inside this radius. Defaults vary
