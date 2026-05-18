@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 
 namespace pt::renderer {
@@ -163,6 +164,138 @@ bool NodeAabb(const SdfPrim& prim, std::uint32_t idx,
             widen(mn, mx, std::abs(n.params[0]));
             return true;
         }
+        // --- SDF Phase 2 (#98) procedural / noise / domain ops -------------
+        case SDF_OP_DISPLACE_NOISE: {
+            // FBM sums unnormalized octaves with halving amplitude:
+            //   amp * (1 + 1/2 + 1/4 + ... + 2^-(N-1)) = amp * 2 * (1 - 2^-N)
+            // (approaches 2*amp as N -> infinity, ~1.97*amp at 6 octaves).
+            // The sdfDisplaceNoiseBand helper re-centres each octave to
+            // [-1, 1] then weights by the per-octave amp, so the worst-
+            // case band magnitude is the geometric sum above. Widen by
+            // that sum so the displaced surface stays inside the cluster
+            // AABB across all supported octave counts.
+            //
+            // The shader clamps octaves to [1, 6] (matches the host's
+            // sdf_displace_noise command); 6 octaves is the maximum the
+            // bound must cover.
+            float amn[3], amx[3];
+            if (!NodeAabb(prim, n.child_a, amn, amx)) return false;
+            for (int i = 0; i < 3; ++i) { mn[i] = amn[i]; mx[i] = amx[i]; }
+            // Decode the octave count from params[2] (bit-cast int the
+            // same way the host packs it in Engine.cpp's
+            // sdf_displace_noise command). Cap at the shader's 6-octave
+            // hard limit to mirror the runtime path; an invalid value
+            // falls back to the documented [1,6] clamp.
+            std::uint32_t oct_u{};
+            std::memcpy(&oct_u, &n.params[2], sizeof(float));
+            if (oct_u < 1u) oct_u = 1u;
+            if (oct_u > 6u) oct_u = 6u;
+            // sum = 2 * (1 - 2^-N) using float arithmetic; exact for the
+            // tiny N we care about.
+            float sum_scale = 2.0f * (1.0f - std::ldexp(1.0f, -int(oct_u)));
+            widen(mn, mx, std::abs(n.params[0]) * sum_scale);
+            return true;
+        }
+        case SDF_OP_TWIST: {
+            // Twist rotates the (x,z) plane about the WORLD Y axis by
+            // theta = rate * y. The point's distance from the Y axis is
+            // preserved, so any point (px, py, pz) of the child rotates
+            // into a circle of radius sqrt(px^2 + pz^2) at world height
+            // py. The conservative AABB is the union of those circles
+            // over the child's AABB: a cylinder around the Y axis of
+            // radius `max over child of sqrt(x^2 + z^2)`, with the same
+            // y range as the child.
+            //
+            // For an axis-aligned box, that maximum radius is
+            //   sqrt(max(|amn.x|, |amx.x|)^2 + max(|amn.z|, |amx.z|)^2)
+            // -- i.e. take the corner of the projected-onto-xz rectangle
+            // that's farthest from the Y axis.
+            //
+            // NOTE: this differs from the obvious "ball about the
+            // child's centroid" bound. The warp uses the *world* Y axis
+            // (sdfWarpTwist warps `p` directly), so an off-origin child
+            // rotates around the origin and moves outside any
+            // local-centred bound -- those points would then be missed
+            // by the slab test. The world-axis cylinder is the smallest
+            // conservative AABB that handles off-origin children
+            // correctly.
+            float amn[3], amx[3];
+            if (!NodeAabb(prim, n.child_a, amn, amx)) return false;
+            float rx = std::max(std::abs(amn[0]), std::abs(amx[0]));
+            float rz = std::max(std::abs(amn[2]), std::abs(amx[2]));
+            float r  = std::sqrt(rx * rx + rz * rz);
+            mn[0] = -r;    mx[0] = r;
+            mn[1] = amn[1]; mx[1] = amx[1];   // Y is untouched by twist
+            mn[2] = -r;    mx[2] = r;
+            return true;
+        }
+        case SDF_OP_BEND: {
+            // Bend rotates the (y,z) plane about the WORLD X axis by
+            // theta = rate * x. Symmetric to TWIST but the X coordinate
+            // is untouched. Cylinder of radius
+            //   sqrt(max(|amn.y|, |amx.y|)^2 + max(|amn.z|, |amx.z|)^2)
+            // around the X axis, X range preserved from the child.
+            float amn[3], amx[3];
+            if (!NodeAabb(prim, n.child_a, amn, amx)) return false;
+            float ry = std::max(std::abs(amn[1]), std::abs(amx[1]));
+            float rz = std::max(std::abs(amn[2]), std::abs(amx[2]));
+            float r  = std::sqrt(ry * ry + rz * rz);
+            mn[0] = amn[0]; mx[0] = amx[0];   // X is untouched by bend
+            mn[1] = -r;    mx[1] = r;
+            mn[2] = -r;    mx[2] = r;
+            return true;
+        }
+        case SDF_OP_REPEAT: {
+            // Infinite domain repetition. The surface tiles space
+            // forever, so no finite AABB is conservatively correct
+            // for the full repeat. The host wraps this with a
+            // SDF_OP_REPEAT_LIMITED (or carves it via a parent
+            // smooth-intersect with a finite box) in practice. As a
+            // fallback for an explicit infinite repeat, we cap the
+            // bound at +/-1000 m on each axis where the period is
+            // non-zero -- well past the typical scene extent. The
+            // engine logs a warning when this fallback fires.
+            float amn[3], amx[3];
+            if (!NodeAabb(prim, n.child_a, amn, amx)) return false;
+            for (int i = 0; i < 3; ++i) {
+                if (n.params[i] > 1e-6f) {
+                    mn[i] = -1000.0f;
+                    mx[i] =  1000.0f;
+                } else {
+                    mn[i] = amn[i];
+                    mx[i] = amx[i];
+                }
+            }
+            return true;
+        }
+        case SDF_OP_REPEAT_LIMITED: {
+            // Bounded repetition. Cell count = 2 * limit + 1 on each
+            // axis (cells run from -limit to +limit inclusive). Each
+            // cell is the child's bound translated by k * period.
+            float amn[3], amx[3];
+            if (!NodeAabb(prim, n.child_a, amn, amx)) return false;
+            // Decode the packed int3 limit from params[3]. Same
+            // 10-bit lane layout as the shader.
+            std::uint32_t packed{};
+            std::memcpy(&packed, &n.params[3], sizeof(float));
+            int lim[3] = {
+                int( packed         & 0x3ffu),
+                int((packed >> 10) & 0x3ffu),
+                int((packed >> 20) & 0x3ffu),
+            };
+            for (int i = 0; i < 3; ++i) {
+                if (n.params[i] > 1e-6f) {
+                    float span = float(lim[i]) * n.params[i];
+                    mn[i] = amn[i] - span;
+                    mx[i] = amx[i] + span;
+                } else {
+                    mn[i] = amn[i];
+                    mx[i] = amx[i];
+                }
+            }
+            return true;
+        }
+        // --- end SDF Phase 2 ----------------------------------------------
     }
     return false;
 }

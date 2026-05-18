@@ -461,7 +461,12 @@ cbuffer Push {
     //        the heat-map plumbed but not yet visualized; the field is
     //        wired so Phase 2 / fractal tuning can switch it on without
     //        a push-constant reshuffle.
-    //   .w reserved.
+    //   .w = sdf_normal_mode   -- Phase 2 (#98). 0 = forward-mode
+    //        autodiff (default; one walk of the op-tree, gradient via
+    //        Dual3 chain rule), 1 = 6-tap central differences (legacy
+    //        / sanity check). Only meaningful on clusters that contain
+    //        Phase 2 procedural ops -- Phase 1 clusters always use the
+    //        closed-form analytic gradient.
     uint4 sdf_params;
     // .x = r_sdf_epsilon (sphere-trace surface-distance terminator,
     //      metres). Default 1e-4. .yzw reserved.
@@ -670,6 +675,11 @@ void traceSdfClusters(float3 ro, float3 rd, inout HitInfo h) {
     if (count == 0u) return;
     uint  iter_budget = sdf_params.y;
     float epsilon     = sdf_params_f.x;
+    // Phase 2 (#98): sdf_params.w carries r_sdf_normal_mode --
+    // 0 = forward-AD (default), 1 = central-difference. Only applies
+    // to clusters that contain procedural ops; Phase 1 clusters keep
+    // the analytic-gradient path regardless.
+    uint  normal_mode = sdf_params.w;
     for (uint i = 0u; i < count; ++i) {
         SdfCluster c = loadSdfCluster(i);
         float t;
@@ -677,7 +687,8 @@ void traceSdfClusters(float3 ro, float3 rd, inout HitInfo h) {
         // t_min = 1e-3 keeps the start past the camera plane;
         // t_max = h.t bounds the trace to the current closest hit so
         // an SDF cluster behind an existing closer hit short-circuits.
-        if (sdfClusterTrace(c, ro, rd, 1e-3, h.t, iter_budget, epsilon, t, n)) {
+        if (sdfClusterTrace(c, ro, rd, 1e-3, h.t, iter_budget, epsilon,
+                            normal_mode, t, n)) {
             if (t < h.t) {
                 h.hit       = true;
                 h.t         = t;

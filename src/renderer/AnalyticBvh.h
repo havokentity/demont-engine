@@ -43,12 +43,23 @@ enum SdfShape : std::uint32_t {
 // SDF CSG ops. opSmoothUnion / opSmoothSubtract / opSmoothIntersect (k
 // is the smoothing radius in metres); opDisplace adds a scalar bump
 // magnitude to its child. See SdfPrimitives.slang for the formulas.
+//
+// Phase 2 (#98) added procedural ops 5..9. Numeric values are part of
+// the host/shader wire format -- never renumber without updating the
+// matching constants in shaders/SdfPrimitives.slang.
 enum SdfOp : std::uint32_t {
     SDF_OP_LEAF             = 0,   // params: see SdfShape above
     SDF_OP_SMOOTH_UNION     = 1,   // children: a, b; param k
     SDF_OP_SMOOTH_SUBTRACT  = 2,   // children: a, b; param k (b carved from a)
     SDF_OP_SMOOTH_INTERSECT = 3,   // children: a, b; param k
     SDF_OP_DISPLACE         = 4,   // children: a; param amp (analytic bump along normal)
+    // --- SDF Phase 2 (#98) procedural / noise / domain ops -----------------
+    SDF_OP_DISPLACE_NOISE   = 5,   // children: a; params: amp (m), freq (1/m), octaves (uint via asuint)
+    SDF_OP_TWIST            = 6,   // children: a; param: twist rate (rad/m, about Y)
+    SDF_OP_BEND             = 7,   // children: a; param: bend rate (rad/m, about X)
+    SDF_OP_REPEAT           = 8,   // children: a; params: period vec3 (0 = no repeat on that axis)
+    SDF_OP_REPEAT_LIMITED   = 9,   // children: a; params: period vec3, params[3] = packed int3 half-extent
+    // --- end SDF Phase 2 ---------------------------------------------------
 };
 
 // One node in a cluster's flat op-tree. Children are *node indices*
