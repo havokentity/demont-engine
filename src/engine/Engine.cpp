@@ -8755,18 +8755,157 @@ void Engine::RegisterPhysicsCommands() {
                            h, prim_id, x, y, z, radius);
         });
 
+    // Spawn a rigid-body sphere (Phase 2a, #138). Unlike `phys_drop`
+    // which spawns a Phase-1 point-mass Particle, this goes into the
+    // rigid-body pool: it carries orientation + inertia + angular
+    // velocity. Visually identical (sphere-plane / sphere-sphere
+    // collision uses the bounding sphere), but the body is now a
+    // first-class rigid body that Phase 2b's SAT narrowphase will
+    // start to talk to.
+    C.RegisterCommand("phys_drop_sphere",
+        "phys_drop_sphere <x> <y> <z> [radius=0.3] [mass=1.0]: spawn a rigid-body sphere "
+        "(Phase 2a) at the world-space position.",
+        [this](auto args, pt::console::Output& out) {
+            if (!physics_) { out.PrintLine("phys_drop_sphere: physics system not initialised"); return; }
+            if (args.size() < 3 || args.size() > 5) {
+                out.PrintLine("usage: phys_drop_sphere <x> <y> <z> [radius=0.3] [mass=1.0]");
+                return;
+            }
+            float x, y, z, radius = 0.3f, mass = 1.0f;
+            if (!ParseFloat(args[0], x) || !ParseFloat(args[1], y) || !ParseFloat(args[2], z)) {
+                out.PrintLine("phys_drop_sphere: arg parse failed");
+                return;
+            }
+            if (args.size() >= 4 && !ParseFloat(args[3], radius)) {
+                out.PrintLine("phys_drop_sphere: bad radius");
+                return;
+            }
+            if (args.size() >= 5 && !ParseFloat(args[4], mass)) {
+                out.PrintLine("phys_drop_sphere: bad mass");
+                return;
+            }
+            if (radius <= 0.0f) {
+                out.PrintLine("phys_drop_sphere: radius must be > 0");
+                return;
+            }
+            if (mass < 0.0f) {
+                out.PrintLine("phys_drop_sphere: mass must be >= 0 (0 = kinematic)");
+                return;
+            }
+            const auto h = physics_->AddRigidSphere(glm::vec3{x, y, z}, radius, mass);
+            if (h == pt::physics::PhysicsSystem::kInvalidRbHandle) {
+                out.FormatLine("phys_drop_sphere: rigid body pool full ({} max)",
+                               pt::physics::PhysicsSystem::kMaxRigidBodies);
+                return;
+            }
+            const std::uint32_t prim_id = physics_next_prim_id_++;
+            AnalyticPrim p{};
+            p.type        = AnalyticPrim::Sphere;
+            p.material    = AnalyticPrim::Lambert;
+            p.pos_or_n[0] = x; p.pos_or_n[1] = y; p.pos_or_n[2] = z;
+            p.radius_or_d = radius;
+            // Slightly warmer tint than `phys_drop` so a quick glance
+            // distinguishes the rigid-body sphere from a Phase-1
+            // particle in the same scene.
+            p.albedo[0]   = 0.85f; p.albedo[1] = 0.80f; p.albedo[2] = 0.70f;
+            p.roughness   = 0.4f;
+            p.ior         = 1.0f;
+            primitives_[prim_id] = p;
+            physics_->SetRbPrimId(h, prim_id);
+            primitives_dirty_ = true;
+            accum_dirty_      = true;
+            out.FormatLine("phys_drop_sphere: spawned rigid body handle=0x{:x} prim_id={} @ ({:.2f} {:.2f} {:.2f}) r={:.3f} m={:.3f}",
+                           h, prim_id, x, y, z, radius, mass);
+        });
+
+    // Spawn a rigid-body box (Phase 2a, #138). Phase 2a does NOT
+    // implement box-box / box-plane SAT collision -- per issue #138
+    // MVP discipline, boxes use a bounding-sphere collision shape and
+    // will fall to the ground but won't lie flat. Phase 2b lands SAT.
+    // Rendering is also still sphere-only (no shader changes in this
+    // PR), so the box renders as its bounding sphere too. That's
+    // intentional: the visual delta from `phys_drop_sphere` is the
+    // bounding-sphere RADIUS, which on a 1x1x1m cube is sqrt(3)/2 ~=
+    // 0.866 m -- noticeably larger than the inscribed 0.5 m sphere.
+    C.RegisterCommand("phys_drop_box",
+        "phys_drop_box <x> <y> <z> <hx> <hy> <hz> [mass=1.0]: spawn a rigid-body box "
+        "(Phase 2a, sphere collision only -- box-box SAT lands in Phase 2b).",
+        [this](auto args, pt::console::Output& out) {
+            if (!physics_) { out.PrintLine("phys_drop_box: physics system not initialised"); return; }
+            if (args.size() < 6 || args.size() > 7) {
+                out.PrintLine("usage: phys_drop_box <x> <y> <z> <hx> <hy> <hz> [mass=1.0]");
+                return;
+            }
+            float x, y, z, hx, hy, hz, mass = 1.0f;
+            if (!ParseFloat(args[0], x)  || !ParseFloat(args[1], y)  || !ParseFloat(args[2], z) ||
+                !ParseFloat(args[3], hx) || !ParseFloat(args[4], hy) || !ParseFloat(args[5], hz)) {
+                out.PrintLine("phys_drop_box: arg parse failed");
+                return;
+            }
+            if (args.size() == 7 && !ParseFloat(args[6], mass)) {
+                out.PrintLine("phys_drop_box: bad mass");
+                return;
+            }
+            if (hx <= 0.0f || hy <= 0.0f || hz <= 0.0f) {
+                out.PrintLine("phys_drop_box: all half-extents must be > 0");
+                return;
+            }
+            if (mass < 0.0f) {
+                out.PrintLine("phys_drop_box: mass must be >= 0 (0 = kinematic)");
+                return;
+            }
+            const glm::vec3 h_ext{hx, hy, hz};
+            const auto h = physics_->AddRigidBox(glm::vec3{x, y, z}, h_ext, mass);
+            if (h == pt::physics::PhysicsSystem::kInvalidRbHandle) {
+                out.FormatLine("phys_drop_box: rigid body pool full ({} max)",
+                               pt::physics::PhysicsSystem::kMaxRigidBodies);
+                return;
+            }
+            // Render as bounding sphere for Phase 2a -- shader work
+            // (real box primitive in the analytic-prim shader) is
+            // explicitly out of scope per issue #138.
+            const float bound_r = pt::physics::BoxBoundingRadius(h_ext);
+            const std::uint32_t prim_id = physics_next_prim_id_++;
+            AnalyticPrim p{};
+            p.type        = AnalyticPrim::Sphere;
+            p.material    = AnalyticPrim::Lambert;
+            p.pos_or_n[0] = x; p.pos_or_n[1] = y; p.pos_or_n[2] = z;
+            p.radius_or_d = bound_r;
+            // Bluer tint -- distinguishes a box rigid body (bounding
+            // sphere proxy) from a true rigid-body sphere at a glance.
+            p.albedo[0]   = 0.60f; p.albedo[1] = 0.65f; p.albedo[2] = 0.85f;
+            p.roughness   = 0.5f;
+            p.ior         = 1.0f;
+            primitives_[prim_id] = p;
+            physics_->SetRbPrimId(h, prim_id);
+            primitives_dirty_ = true;
+            accum_dirty_      = true;
+            out.FormatLine("phys_drop_box: spawned rigid body handle=0x{:x} prim_id={} @ ({:.2f} {:.2f} {:.2f}) half=({:.2f} {:.2f} {:.2f}) m={:.3f} bound_r={:.3f}",
+                           h, prim_id, x, y, z, hx, hy, hz, mass, bound_r);
+        });
+
     C.RegisterCommand("phys_clear",
-        "Remove all physics-owned analytic primitives and clear the particle pool.",
+        "Remove all physics-owned analytic primitives and clear the particle + rigid-body pools.",
         [this](auto, pt::console::Output& out) {
             if (!physics_) { out.PrintLine("phys_clear: physics system not initialised"); return; }
             // Each live particle has a paired analytic-prim entry --
             // gather the prim ids before clearing so we don't iterate
             // a mutating map.
             std::vector<std::uint32_t> prim_ids;
-            prim_ids.reserve(physics_->AliveCount());
+            prim_ids.reserve(physics_->AliveCount() + physics_->RbAliveCount());
             physics_->ForEach(
                 [](pt::physics::PhysicsSystem::Handle /*h*/,
                    const pt::physics::Particle& /*p*/,
+                   std::uint32_t prim_id, void* user) {
+                    auto* vec = static_cast<std::vector<std::uint32_t>*>(user);
+                    if (prim_id != 0) vec->push_back(prim_id);
+                },
+                &prim_ids);
+            // Mirror for the rigid-body pool (Phase 2a, #138). Same
+            // callback signature shape; different per-element type.
+            physics_->ForEachRigidBody(
+                [](pt::physics::PhysicsSystem::RbHandle /*h*/,
+                   const pt::physics::RigidBody& /*b*/,
                    std::uint32_t prim_id, void* user) {
                     auto* vec = static_cast<std::vector<std::uint32_t>*>(user);
                     if (prim_id != 0) vec->push_back(prim_id);
@@ -8779,7 +8918,7 @@ void Engine::RegisterPhysicsCommands() {
                 primitives_dirty_ = true;
                 accum_dirty_      = true;
             }
-            out.FormatLine("phys_clear: removed {} physics-owned prim(s); particle pool emptied", removed);
+            out.FormatLine("phys_clear: removed {} physics-owned prim(s); particle + rigid-body pools emptied", removed);
         });
 
     C.RegisterCommand("phys_status",
@@ -8795,17 +8934,19 @@ void Engine::RegisterPhysicsCommands() {
             if (auto* v = Cl.FindCVar("phys_substeps"))  sub = v->GetInt();
             if (auto* v = Cl.FindCVar("phys_gravity_y")) gy  = v->GetFloat();
             if (auto* v = Cl.FindCVar("phys_damping"))   dmp = v->GetFloat();
-            out.FormatLine("phys: enabled={} particles={}/{} gravity_y={:.3f} m/s^2 substeps={} damping={:.4f}",
+            out.FormatLine("phys: enabled={} particles={}/{} rigid_bodies={}/{} gravity_y={:.3f} m/s^2 substeps={} damping={:.4f}",
                            en ? 1 : 0,
                            physics_->AliveCount(),
                            physics_->Capacity(),
+                           physics_->RbAliveCount(),
+                           physics_->RbCapacity(),
                            gy, sub, dmp);
         });
 }
 
 void Engine::StepPhysics(float dt) {
     if (!physics_) return;
-    if (physics_->AliveCount() == 0) return;
+    if (physics_->AliveCount() == 0 && physics_->RbAliveCount() == 0) return;
 
     auto& C = pt::console::Console::Get();
     bool enabled = false;
@@ -8858,6 +8999,28 @@ void Engine::StepPhysics(float dt) {
             ap.pos_or_n[2] = p.curr_pos.z;
             // Radius is fixed for now (no growing/shrinking particles
             // in Phase 1); skip writing it.
+            c->any_changed = true;
+        },
+        &ctx);
+
+    // Rigid-body writeback (Phase 2a, #138). Renders as the bounding
+    // sphere -- shaders/* are off-limits per issue #138 so we can't
+    // upload a real OBB primitive yet. Orientation is integrated and
+    // updated but doesn't visibly affect the sphere render; Phase 2b
+    // adds the box analytic-prim shader path and starts using it.
+    physics_->ForEachRigidBody(
+        [](pt::physics::PhysicsSystem::RbHandle /*h*/,
+           const pt::physics::RigidBody& b,
+           std::uint32_t prim_id, void* user) {
+            auto* c = static_cast<Ctx*>(user);
+            if (prim_id == 0) return;
+            auto it = c->prims->find(prim_id);
+            if (it == c->prims->end()) return;
+            auto& ap = it->second;
+            if (ap.type != AnalyticPrim::Sphere) return;
+            ap.pos_or_n[0] = b.curr_pos.x;
+            ap.pos_or_n[1] = b.curr_pos.y;
+            ap.pos_or_n[2] = b.curr_pos.z;
             c->any_changed = true;
         },
         &ctx);
