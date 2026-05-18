@@ -106,6 +106,31 @@ option(PT_BUILD_TESTS           "Build unit tests via doctest"          ON)
 # minimal.
 option(PT_BUILD_TOOLS           "Build developer tooling under tools/"  ON)
 
+# --- Megakernel feature gates (PR #164: perf hardening) --------------------
+# Each PT_*_ENABLED toggle compiles a specific material/shader subsystem
+# in or out of the unified PathTrace.slang megakernel. The compile-time
+# gate matters more than the runtime cost: even with no water primitive
+# in the scene, leaving the water branch in the megakernel inflates the
+# per-thread register pressure of the dispatch, dropping wavefront
+# occupancy across every pixel.
+#
+# PT_WATER_ENABLED (#134): MAT_WATER analytic-plane BRDF (Schlick Fresnel
+# + Snell refraction + Beer's-law absorption) + the 8-noise-tap wave-
+# normal helper + the MAT_WATER branch in transmittance().
+# Default OFF -- water is a niche showcase feature; flipping ON paid
+# +2.99 ms / frame against the Cornell-CSG perf-bisect baseline before
+# the gate landed. Set to ON for builds that actually use the
+# `prim_plane ... water ...` material (e.g. tests/goldens/scenes/
+# water_pool.cfg).
+#
+# The cvars (r_water_absorption_r/g/b, r_water_ior, r_water_wave_*) stay
+# registered regardless of the gate so existing user cfgs don't error
+# out on cvar-not-found; when the gate is OFF and a user sets a non-
+# default value, Engine.cpp emits a single [warn] line at startup.
+option(PT_WATER_ENABLED
+    "Compile MAT_WATER BRDF (#134) into the PathTrace megakernel. OFF = -2.99 ms/frame on water-less scenes; ON = water material renders."
+    OFF)
+
 # --- Compiler/warning helper -----------------------------------------------
 include(cmake/CompilerWarnings.cmake)
 include(cmake/EmbedResource.cmake)

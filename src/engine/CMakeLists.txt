@@ -60,4 +60,15 @@ target_link_libraries(pt_engine
     PRIVATE tomlplusplus::tomlplusplus
 )
 
+# --- Megakernel feature gates (PR #164) -----------------------------------
+# Mirror the shader-side PT_WATER_ENABLED gate into a C++ compile define so
+# Engine.cpp can emit a single startup [warn] when a user has tweaked the
+# r_water_* cvars in a build that compiled out the water BRDF.
+if(PT_WATER_ENABLED)
+    target_compile_definitions(pt_engine PRIVATE PT_WATER_ENABLED=1)
+else()
+    target_compile_definitions(pt_engine PRIVATE PT_WATER_ENABLED=0)
+endif()
+# --- end Megakernel feature gates -----------------------------------------
+
 pt_set_compiler_options(pt_engine)
