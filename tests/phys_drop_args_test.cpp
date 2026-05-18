@@ -54,8 +54,9 @@
 //   We bypass `Engine::Init()` (which would pull in RHI, window,
 //   audio, jobs, the cfg loader, ...) and instead just wire up the
 //   single sub-set the commands need: a PhysicsSystem instance and
-//   the registered console commands. After each test we Clear()
-//   the physics pool so the test order doesn't matter and the
+//   the registered console commands. Each TEST_CASE calls
+//   ResetState() at entry to clear primitives_ + the physics pool +
+//   the prim-id counter so the test order doesn't matter and the
 //   doctest singleton state doesn't bleed across cases.
 //
 //   The test asserts on TWO surfaces per success case:
