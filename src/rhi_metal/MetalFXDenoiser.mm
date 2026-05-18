@@ -58,6 +58,17 @@ extern "C" void* pt_metalfx_create(void* mtl_device,
         desc.colorTextureFormat  = MTLPixelFormatRGBA16Float;
         desc.depthTextureFormat  = MTLPixelFormatR32Float;
         desc.motionTextureFormat = MTLPixelFormatRG16Float;
+        // Guidance G-buffers. Without these MTLFXTemporalDenoisedScaler
+        // has no surface signal to weight its spatial filter -- it falls
+        // back to a conservative TAA-style blur that never fully
+        // converges on a static camera, looking visibly worse than the
+        // path tracer's own accumulated mean. With normal + diffuse
+        // albedo bound, MetalFX gets the same kind of edge-aware
+        // information SVGF uses, and convergence quality jumps
+        // dramatically. Formats match the engine's allocations
+        // (normal_tex / albedo_tex are RGBA16F).
+        desc.normalTextureFormat        = MTLPixelFormatRGBA16Float;
+        desc.diffuseAlbedoTextureFormat = MTLPixelFormatRGBA16Float;
         // Linear HDR all the way through MetalFX. Output is RGBA16F so
         // temporal reuse can see the full HDR range; the engine runs
         // a dedicated `tonemap` compute kernel after this pass to
@@ -150,6 +161,8 @@ extern "C" void pt_metalfx_encode(void* state,
                                   void* color_in,
                                   void* depth_in,
                                   void* motion_in,
+                                  void* normal_in,                  // can be NULL -> skip guidance
+                                  void* albedo_in,                  // can be NULL -> skip guidance
                                   void* color_out,
                                   float jitter_x,
                                   float jitter_y,
@@ -193,6 +206,14 @@ extern "C" void pt_metalfx_encode(void* state,
             st->scaler.colorTexture       = (__bridge id<MTLTexture>)color_in;
             st->scaler.depthTexture       = (__bridge id<MTLTexture>)depth_in;
             st->scaler.motionTexture      = (__bridge id<MTLTexture>)motion_in;
+            // Guidance G-buffers. Engine allocates + fills these for
+            // MetalFX kinds (see want_normal_gbuffer / want_albedo_gbuffer
+            // in Engine.cpp). nil is tolerated by the scaler but degrades
+            // back to the no-guidance behavior, so we'd rather log loudly
+            // if either is missing; the engine's allocation logic should
+            // keep both non-null whenever the denoiser is active.
+            st->scaler.normalTexture        = (__bridge id<MTLTexture>)normal_in;
+            st->scaler.diffuseAlbedoTexture = (__bridge id<MTLTexture>)albedo_in;
             st->scaler.outputTexture      = st->output_priv;
             st->scaler.jitterOffsetX      = jitter_x;
             st->scaler.jitterOffsetY      = jitter_y;
@@ -237,7 +258,7 @@ extern "C" void* pt_metalfx_create(void*, std::uint32_t, std::uint32_t) {
     return nullptr;
 }
 extern "C" void pt_metalfx_destroy(void*) {}
-extern "C" void pt_metalfx_encode(void*, void*, void*, void*, void*, void*,
+extern "C" void pt_metalfx_encode(void*, void*, void*, void*, void*, void*, void*, void*,
                                    float, float, const float*, const float*, int) {}
 
 #endif

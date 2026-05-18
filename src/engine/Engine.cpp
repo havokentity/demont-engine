@@ -3149,22 +3149,35 @@ void Engine::RenderFrame() {
     // and writes the swapchain.
     // SVGF/NRD use the normal G-buffer for edge-aware spatial filtering.
     // The OptiX AOV variants (HdrAov + TemporalHdrAov) also use it as
-    // the normal guide layer alongside albedo. The plain OptiX HDR
-    // variants (Hdr + TemporalHdr) don't need it.
+    // the normal guide layer alongside albedo. MetalFX (macOS 26+
+    // MTLFXTemporalDenoisedScaler) ALSO accepts normal + diffuse albedo
+    // guidance inputs -- without them it falls back to a conservative
+    // blur that doesn't converge on static cameras, looking visibly
+    // worse than the accumulated no-denoiser path. Adding the
+    // MetalFX kinds here so the engine allocates + fills the G-buffer
+    // for them too. The plain OptiX HDR variants (Hdr + TemporalHdr)
+    // don't take normals.
     const bool want_normal_gbuffer =
         (denoiser_kind_ == DenoiserKind::SvgfBasic           ||
          denoiser_kind_ == DenoiserKind::SvgfAtrous          ||
          denoiser_kind_ == DenoiserKind::SvgfBasicMetalFx    ||
          denoiser_kind_ == DenoiserKind::SvgfAtrousMetalFx   ||
+         denoiser_kind_ == DenoiserKind::MetalFX             ||
          denoiser_kind_ == DenoiserKind::Nrd                 ||
          denoiser_kind_ == DenoiserKind::OptixHdrAov         ||
          denoiser_kind_ == DenoiserKind::OptixTemporalHdrAov);
-    // Albedo G-buffer: OptiX AOV variants only (HdrAov + TemporalHdrAov).
-    // SVGF/NRD don't take an albedo input, MetalFX doesn't either, and
-    // the non-AOV OptiX models have no albedo guide layer.
+    // Albedo G-buffer: OptiX AOV variants (HdrAov + TemporalHdrAov) AND
+    // MetalFX (and SVGF->MetalFX chained modes, since MetalFX is the
+    // finalizer there too). Apple's MTLFXTemporalDenoisedScaler takes
+    // diffuseAlbedoTexture as a guidance input -- providing it lets
+    // MetalFX preserve surface color edges instead of bleeding them.
+    // SVGF/NRD don't take albedo; non-AOV OptiX HDR models don't either.
     const bool want_albedo_gbuffer =
-        (denoiser_kind_ == DenoiserKind::OptixHdrAov ||
-         denoiser_kind_ == DenoiserKind::OptixTemporalHdrAov);
+        (denoiser_kind_ == DenoiserKind::OptixHdrAov         ||
+         denoiser_kind_ == DenoiserKind::OptixTemporalHdrAov ||
+         denoiser_kind_ == DenoiserKind::MetalFX             ||
+         denoiser_kind_ == DenoiserKind::SvgfBasicMetalFx    ||
+         denoiser_kind_ == DenoiserKind::SvgfAtrousMetalFx);
     // Bloom-without-denoiser path: when the user has r_bloom on but
     // no denoiser, the engine still needs `denoise_color` (as the
     // path tracer's linear-HDR output the bloom pyramid samples) and
@@ -3779,18 +3792,17 @@ void Engine::RenderFrame() {
     // denoiser_enabled because the depth/motion G-buffer block is
     // denoiser-only; this flag is the narrower "write HDR aux" signal.
     push.write_hdr_aux = need_hdr_aux ? 1u : 0u;
-    // Only the SVGF chain (svgf_basic / svgf_atrous / nrd) and the
-    // OptiX AOV variants consume normal_tex. Other denoisers (metalfx,
-    // plain optix_hdr, optix_temporal_hdr) don't, and the engine
-    // doesn't allocate normal_tex_id_ for them -- so the kernel must
-    // not write to an unbound slot. denoiser_active_ alone isn't
-    // enough; tie the gate to whether the engine actually owns a
-    // normal G-buffer this frame.
+    // SVGF / NRD / OptiX-AOV / MetalFX all consume normal_tex; the plain
+    // OptiX HDR variants do not, and the engine doesn't allocate
+    // normal_tex_id_ for those -- so the kernel must not write to an
+    // unbound slot. denoiser_active_ alone isn't enough; tie the gate
+    // to whether the engine actually owns a normal G-buffer this frame.
     push.write_normal_gbuffer =
         (denoiser_active_ && normal_tex_id_ != 0) ? 1u : 0u;
-    // Same gating logic as write_normal_gbuffer -- only the OptiX AOV
-    // modes own an albedo G-buffer this frame; everything else dispatches
-    // with binding 17 unbound under partially-bound semantics.
+    // Same gating logic as write_normal_gbuffer. OptiX-AOV and MetalFX
+    // (and its SVGF-chained variants) take a diffuse albedo guide
+    // layer; everything else dispatches with binding 17 unbound under
+    // partially-bound semantics.
     push.write_albedo_gbuffer =
         (denoiser_active_ && albedo_tex_id_ != 0) ? 1u : 0u;
     push.env_map_present  = (env_map_tex_id_ != 0) ? 1u : 0u;
@@ -4521,8 +4533,10 @@ void Engine::RenderFrame() {
         dd.depth_in      = pt::rhi::TextureHandle{depth_tex_id_};
         dd.motion_in     = pt::rhi::TextureHandle{motion_tex_id_};
         dd.normal_in     = pt::rhi::TextureHandle{normal_tex_id_};
-        // OptiX AOV only -- 0 in any other mode (the backend's OptixHdr
-        // path validates only color/output and ignores this).
+        // OptiX AOV + MetalFX kinds populate this; everything else has
+        // albedo_tex_id_ == 0 and the backend's nil handle path
+        // tolerates it. MetalFX uses the diffuse albedo as a spatial-
+        // filter guidance signal.
         dd.albedo_in     = pt::rhi::TextureHandle{albedo_tex_id_};
         // Star-split accumulator was wired here for the EMA design
         // (#108). The stateless StarsComposite rewrite eliminates the
