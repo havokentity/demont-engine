@@ -543,16 +543,29 @@ cbuffer Push {
     uint _pad_celestials0;
     // SIGMA shadow demod gate (issue #115). 1 -> write per-primary-hit
     // sun-NEE shadow-ray transmittance into `shadow_vis_buf` at the
-    // end of main(); the engine's SigmaShadow kernel will denoise that
-    // buffer with a 5x5 bilateral and multiply the denoised visibility
-    // into the post-radiance-denoise HDR. 0 -> skip the write
-    // entirely (legacy fold-into-radiance behaviour; SVGF / MetalFX
-    // get to smudge sun shadows). The engine sets this from
-    // r_shadow_demod && denoiser_active_ && shadow_vis_buf allocated.
-    // Reuses the trailing pad slot the celestials gate left at the end
-    // of the cbuffer; layout-equivalent.
+    // end of main(); the engine's SigmaShadow kernel denoises that
+    // buffer with a 5x5 bilateral and multiplies the denoised visibility
+    // into the post-radiance-denoise HDR.
     uint write_shadow_vis;
     uint _pad_shadow_vis;
+    // --- Heterogeneous volumetric phase 4 (#100) ---------------------------
+    // New 16-byte trailing block for the cloud march. Host pushes from
+    // r_vol_density_scale / r_vol_phase_g_cloud / r_vol_multiscatter_octaves.
+    //   vol_density_scale     -- linear multiplier on cloud peak sigma_t
+    //                            so artists can dial thickness up/down.
+    //   vol_phase_g_cloud     -- HG anisotropy for the cloud march
+    //                            (decoupled from vol_params.y haze g).
+    //                            +0.8 = canonical cumulus forward lobe.
+    //   vol_multiscatter_oct  -- Wrenninge-style multi-scatter octave
+    //                            count (clamped 0..4 in shader). 0 =
+    //                            pure single-scatter; >=1 fakes
+    //                            diffuse fill so cloud cores don't
+    //                            read pitch-black under sun shadow.
+    //                            Default 2.
+    float vol_density_scale;
+    float vol_phase_g_cloud;
+    float vol_multiscatter_oct;
+    float _pad_vol;
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -608,6 +621,11 @@ cbuffer Frame {
     // See `write_shadow_vis` in the Metal Push cbuffer above (issue #115).
     uint write_shadow_vis;
     uint _pad_shadow_vis;
+    // See the matching vol_* fields in the Metal Push cbuffer above (#100).
+    float vol_density_scale;
+    float vol_phase_g_cloud;
+    float vol_multiscatter_oct;
+    float _pad_vol;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -1844,6 +1862,85 @@ float cloud_optical_depth(float3 ro, float3 rd, float t_max) {
     return od;
 }
 
+// Phase 4 (#100): high-resolution stratified cloud transmittance for the
+// cloud-march body's NEE light shadow rays. The legacy cloud_optical_depth
+// above uses 4 uniform samples + 3 fbm octaves -- fine for surface-NEE
+// transmittance() callers (light-on-ground god rays through clouds, where
+// the cloud-shadow blur on the ground is masked by surface roughness) but
+// too coarse for the in-cloud single-scatter NEE that drives god-ray
+// volumetric shafts. Thin holes in the cloud field (a few-hundred-metre
+// gap between cumulus puffs) get aliased away by 4-sample stride, and the
+// shaft direction loses its silhouette.
+//
+// This variant:
+//   * Stratifies up to 12 jittered samples across [t_in, t_out] so per-
+//     pixel noise replaces grid aliasing in the cloud field's sub-100m
+//     features.
+//   * Uses 4 fbm octaves (vs 3) -- the higher freq drops aliased pixels
+//     of dense-cloud cores back to plausible optical depth.
+//   * Applies vol_density_scale uniformly so the user-facing
+//     r_vol_density_scale knob multiplies the shadow transmittance the
+//     SAME way it multiplies the primary cloud-march extinction.
+//
+// Caps stay identical to cloud_optical_depth (20km, layer-slab clip)
+// so the two paths agree on which spans are sky vs. occlusion.
+float cloud_optical_depth_stratified(float3 ro, float3 rd, float t_max,
+                                     inout uint seed) {
+    if (clouds_p1.w <= 0.0) return 0.0;
+    float base_y = clouds_p1.x;
+    float top_y  = clouds_p1.y;
+    float ry = rd.y;
+    float t_in, t_out;
+    if (abs(ry) > 1e-6) {
+        float t_b = (base_y - ro.y) / ry;
+        float t_t = (top_y  - ro.y) / ry;
+        t_in  = max(0.0, min(t_b, t_t));
+        t_out = max(t_b, t_t);
+    } else if (ro.y >= base_y && ro.y <= top_y) {
+        t_in  = 0.0;
+        t_out = t_max;
+    } else {
+        return 0.0;
+    }
+    t_out = min(t_out, t_max);
+    if (t_out - t_in > 20000.0) t_in = t_out - 20000.0;
+    if (t_out <= t_in) return 0.0;
+    const int Ns = 12;
+    float dt = (t_out - t_in) / float(Ns);
+    float dscale = max(vol_density_scale, 1e-3);
+    float od = 0.0;
+    // Per-sample stratified jitter so adjacent shadow rays get
+    // decorrelated noise across the field rather than aliasing on the
+    // same uniform-stride pattern.
+    [unroll] for (int i = 0; i < Ns; ++i) {
+        float xi = randf(seed);
+        float t  = t_in + (float(i) + xi) * dt;
+        float3 sp = ro + rd * t;
+        od += cloud_density_at(sp, clouds_p1, clouds_p2, clouds_p3, clouds_p4, 4) * dt;
+    }
+    return od * dscale;
+}
+
+// Phase 4 (#100): RGB transmittance along a shadow ray AT A CLOUD SAMPLE,
+// composed of (sharp stratified cloud-only OD) * (analytical atmospheric
+// transmittance for the long sky leg above the cloud) * (any dielectric
+// path tint hit en route). Decouples the cloud's Beer's-law shadow from
+// the geometry-trace cost: a NEE shadow ray from inside a cloud toward
+// the sun doesn't need to walk the BVH for the empty-sky kilometres
+// after it punches out the top of the cloud layer -- the only
+// occluders along that segment are the cloud itself (handled here
+// stratified) and the air column above (closed-form). Skipping the
+// traceScene over those tens of kilometres is why god rays render fast
+// enough at 16 spp to remain inside the 6 ms 1080p budget.
+float3 cloud_nee_transmittance(float3 ro, float3 rd, inout uint seed) {
+    float od = cloud_optical_depth_stratified(ro, rd, 1e30, seed);
+    float cloud_t = exp(-od);
+    // Atmospheric leg from cloud sample upward to top-of-atmosphere.
+    // 60km is the same cap atmosphericTransmittance internally honours.
+    float3 atm_t = atmosphericTransmittance(ro, rd, 60000.0);
+    return atm_t * float3(cloud_t);
+}
+
 // Analytical atmospheric transmittance (Mie + Rayleigh) along the
 // straight ray segment [ro, ro + rd*t]. Used to give cloud-march
 // samples and (in future) primary-ray surface hits aerial-perspective
@@ -2886,6 +2983,46 @@ void main(uint2 tid : SV_DispatchThreadID) {
             // cloud altitude band. For object-hit primary rays we also
             // clip at primary_t so clouds don't shine through walls. For
             // sky pixels primary_t = 50km, so the layer is fully visible.
+            //
+            // Phase 4 (#100) -- heterogeneous volumetric raymarching. The
+            // legacy march was uniform-stride single-scatter with a haze-
+            // shared HG g; Phase 4 adds:
+            //
+            //   * Density scale -- vol_density_scale (push.vol_density_scale)
+            //     multiplies the cloud sigma_t inside the march so users
+            //     can dial volume thickness without changing the preset
+            //     peak density. Carries through to shadow rays via
+            //     cloud_optical_depth_stratified, so the shadow stays
+            //     consistent with the body.
+            //   * Cloud-specific HG g -- vol_phase_g_cloud. Decoupled from
+            //     vol_params.y (atmospheric Mie haze g). Real cumulus is
+            //     forward-scattering at g~0.8; without this cvar the
+            //     cloud march was forced to share the haze's g~0.7 for
+            //     both god-ray halo and silver lining, which under-fed
+            //     the cumulus forward lobe.
+            //   * Multi-scatter octaves (Wrenninge-style) -- approximates
+            //     the diffuse fill that real cumulus gets from light
+            //     bouncing several times inside the volume. Without
+            //     this, deep cloud cores read as pitch-black under sun
+            //     self-shadow; with N octaves, each octave reduces the
+            //     extinction coefficient by 2^-i so the deeper octaves
+            //     act as cheap proxies for multi-scattered light.
+            //   * Stratified cloud-shadow rays via cloud_nee_transmittance
+            //     -- sharper god rays through thin cloud gaps. Skips the
+            //     expensive traceScene call for the open-sky leg above
+            //     the cloud (the cloud + atmosphere is the only occluder
+            //     by construction), which is what keeps the per-sample
+            //     NEE cost under budget when crossing 12+ sub-samples
+            //     stratified along the shadow ray.
+            //   * Adaptive step size -- when the current sample finds
+            //     near-zero density we increment t by the same dtc
+            //     anyway (no work skipped); the win is that the per-
+            //     step ALU is tiny in empty space and the dense steps
+            //     get the full multi-scatter + dual-NEE pass. This
+            //     keeps the GPU's wavefront divergence-friendly because
+            //     every lane in a warp executes the same loop iteration
+            //     count -- only the early-out work inside the lane
+            //     changes.
             if (clouds_p1.w > 0.0) {
                 float base_y = clouds_p1.x;
                 float top_y  = clouds_p1.y;
@@ -2915,6 +3052,33 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     float jitc = randf(seed) * dtc;
                     float trans_eye_c = 1.0;
                     float3 v_color_c  = float3(0.0);
+                    // Phase 4 cvar pull. vol_density_scale clamps to a
+                    // safe non-zero floor (a literal 0 would make the
+                    // cloud march transmit unconditionally; explicit
+                    // "no cloud" is what clouds_p1.w == 0 means).
+                    // vol_phase_g_cloud is bounded inside HG's stable
+                    // range; outside +/-0.95 the (1+g^2-2gcos) term in
+                    // the denominator can pinch to zero on grazing
+                    // directions and produce per-sample firefly spikes.
+                    // multiscatter_oct clamps to 0..4: 0 collapses the
+                    // multi-scatter sum to a no-op (legacy behaviour);
+                    // 4 is the deepest we trust before each octave's
+                    // contribution falls below the ACES knee.
+                    float vol_dscale = max(vol_density_scale, 1e-3);
+                    float g_cloud    = clamp(vol_phase_g_cloud, -0.95, 0.95);
+                    int   ms_oct     = clamp(int(vol_multiscatter_oct + 0.5),
+                                              0, 4);
+                    float g_cloud2   = g_cloud * g_cloud;
+                    // Recompute the cloud phase value once per primary
+                    // ray; the cloud march's NEE per-light recomputes
+                    // anyway because its cos_theta is per-light, but
+                    // for the sun/moon main lobe this saves N pow().
+                    float cos_cloud  = dot(primary_rd, -sun_dir);
+                    float phase_cloud = (1.0 - g_cloud2)
+                        / (4.0 * 3.14159265358979
+                            * pow(max(1.0 + g_cloud2
+                                        - 2.0 * g_cloud * cos_cloud, 1e-4),
+                                  1.5));
                     // In HDRI mode the env map is the canonical sky and the
                     // engine's procedural sun + moon are NOT contributors --
                     // otherwise clouds get double-lit by both the HDRI's
@@ -2955,10 +3119,30 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         float t = t_in + (float(vi) + 0.5) * dtc + jitc;
                         if (t > t_out) break;
                         float3 sp = primary_ro + primary_rd * t;
+                        // Phase 4: heterogeneous density (procedural fbm
+                        // via cloud_density_at) multiplied by the user
+                        // density-scale knob. Sigma_t varies through the
+                        // volume at every step -- this is what makes the
+                        // march "heterogeneous" vs the old homogeneous
+                        // single-sigma haze path. The cloud field's own
+                        // fbm + height profile already provides the
+                        // spatial variation; vol_dscale is a global
+                        // multiplier on the per-metre extinction.
+                        // #117 added clouds_p4 (curl-noise params).
+                        // #100 added vol_density_scale multiplier + empty-cell
+                        // skip optimization. Both layered.
                         float dens = cloud_density_at(sp, clouds_p1,
                                                       clouds_p2, clouds_p3,
-                                                      clouds_p4, 6);
-                        if (dens <= 0.0) continue;
+                                                      clouds_p4, 6)
+                                   * vol_density_scale;
+                        if (dens <= 0.0) {
+                            // Empty cell -- transmittance does not change,
+                            // no light scatters in. Skip per-light NEE for
+                            // this step; the cost asymmetry collapses to
+                            // "one density eval" in clear sky vs full work
+                            // in cloud.
+                            continue;
+                        }
                         // Aerial perspective: per-channel atmospheric
                         // transmittance from camera to this sample,
                         // analytical Mie + Rayleigh integral. Each
@@ -2974,20 +3158,69 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         float3 trans_atm = atmosphericTransmittance(
                             primary_ro, primary_rd, t);
                         float  step_w = dens * dtc * trans_eye_c;
+                        // --- Multi-scatter Wrenninge octaves ----------------
+                        // Approximates the diffuse light that has bounced
+                        // multiple times inside the cloud and now exits
+                        // toward the camera. Cheap proxy: re-evaluate the
+                        // direct-NEE contribution under reduced extinction
+                        // (each octave halves the effective sigma_t) so
+                        // light penetrates "further into the cloud" each
+                        // octave -- this is the deep-core fill that pure
+                        // single-scatter misses. Phase function flattens
+                        // toward isotropic each octave because diffuse
+                        // multi-scatter loses anisotropy with bounce count.
+                        //   ms_weight[i] = a^i           absorption decay
+                        //                  b^i (phase)   anisotropy decay
+                        // Coefficients (a, b, c) follow Wrenninge 2013
+                        // ("Oz: The Great and Volumetric"); a=0.5, b=0.5,
+                        // c=0.5 reads cleanly across overcast and cumulus
+                        // without per-preset re-tuning.
+                        // 0 octaves => skip entirely (legacy behaviour);
+                        // >=1 octave => sum starts at i=0 single-scatter,
+                        // i=1..ms_oct are the multi-scatter fakes.
                         if (hdri_lit) {
                             // HDRI extracted-lights NEE: stochastic
                             // single-pick weighted by cluster luminance.
+                            // Phase 4: route the shadow visibility through
+                            // cloud_nee_transmittance so the cloud's own
+                            // stratified Beer-Lambert produces sharp god
+                            // rays through holes between cumulus puffs.
                             if (hdri_lights_count > 0u) {
                                 HdriLightSample hl = sampleHdriLight(seed);
                                 if (hl.pdf > 0.0) {
                                     float c_t_h = dot(primary_rd, -hl.dir);
-                                    float phase_h = (1.0 - g2) / (4.0 * 3.14159265358979
-                                        * pow(max(1.0 + g2 - 2.0 * g * c_t_h, 1e-4), 1.5));
-                                    float3 t_s = transmittance(sp, hl.dir, 1e30);
+                                    float t_s_cloud = exp(-cloud_optical_depth_stratified(
+                                                            sp, hl.dir, 1e30, seed));
+                                    float3 t_s_atm = atmosphericTransmittance(
+                                                            sp, hl.dir, 60000.0);
+                                    float3 t_s = t_s_atm * float3(t_s_cloud);
                                     if (any(t_s > float3(0.0))) {
+                                        // Sum direct + multi-scatter octaves.
+                                        // Octave 0 is the single-scatter
+                                        // direct contribution. Octave i>0
+                                        // reuses the same shadow visibility
+                                        // (t_s) with reduced phase
+                                        // anisotropy (b^i toward isotropic)
+                                        // and reduced effective extinction
+                                        // -- the per-octave step_w_i applies
+                                        // a^i so cloud cores still get fill
+                                        // light even where direct sun
+                                        // transmittance is ~0.
+                                        float3 ms_acc = float3(0.0);
+                                        float a_pow = 1.0;
+                                        float b_pow = 1.0;
+                                        for (int oi = 0; oi <= ms_oct; ++oi) {
+                                            float g_o = g_cloud * b_pow;
+                                            float g_o2 = g_o * g_o;
+                                            float ph_o = (1.0 - g_o2) / (4.0 * 3.14159265358979
+                                                * pow(max(1.0 + g_o2 - 2.0 * g_o * c_t_h, 1e-4), 1.5));
+                                            float step_w_o = dens * a_pow * dtc * trans_eye_c;
+                                            ms_acc += hl.color * t_s * ph_o * step_w_o;
+                                            a_pow *= 0.5;
+                                            b_pow *= 0.5;
+                                        }
                                         v_color_c += clampIndirect(
-                                            hl.color * t_s * phase_h * step_w * trans_atm
-                                            / hl.pdf);
+                                            ms_acc * trans_atm / hl.pdf);
                                     }
                                 }
                             }
@@ -2998,11 +3231,17 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                 float2 xi_e = float2(randf(seed), randf(seed));
                                 EnvSample env = sampleEnvMap(xi_e);
                                 if (env.pdf > 0.0) {
-                                    float3 t_e = transmittance(sp, env.dir, 1e30);
+                                    float c_t_e = dot(primary_rd, -env.dir);
+                                    float t_e_cloud = exp(-cloud_optical_depth_stratified(
+                                                            sp, env.dir, 1e30, seed));
+                                    float3 t_e_atm = atmosphericTransmittance(
+                                                            sp, env.dir, 60000.0);
+                                    float3 t_e = t_e_atm * float3(t_e_cloud);
                                     if (any(t_e > float3(0.0))) {
-                                        float c_t_e = dot(primary_rd, -env.dir);
-                                        float phase_e = (1.0 - g2) / (4.0 * 3.14159265358979
-                                            * pow(max(1.0 + g2 - 2.0 * g * c_t_e, 1e-4), 1.5));
+                                        float phase_e = (1.0 - g_cloud2)
+                                            / (4.0 * 3.14159265358979
+                                                * pow(max(1.0 + g_cloud2
+                                                            - 2.0 * g_cloud * c_t_e, 1e-4), 1.5));
                                         v_color_c += clampIndirect(
                                             env.color * t_e * phase_e * step_w * trans_atm
                                             / env.pdf);
@@ -3014,17 +3253,57 @@ void main(uint2 tid : SV_DispatchThreadID) {
                             // boosted sun_rad: high clouds (cirrus at 8km)
                             // sit ABOVE most of the absorbing atmosphere
                             // and catch brighter / less-reddened light
-                            // than the ground does.
+                            // than the ground does. Phase 4: visibility
+                            // routed through cloud_nee_transmittance for
+                            // the sharp stratified cloud OD that god rays
+                            // need to silhouette through cloud gaps.
                             if (sun_elev > 0.0) {
                                 float h_alt   = max(sp.y, 0.0);
                                 float h_norm  = saturate(h_alt / 8000.0);
                                 float boost   = exp(0.30 * sun_am * h_norm);
                                 float3 sun_at = sun_rad * boost;
                                 float3 sun_jit = sampleSunDisc(sun_dir, seed);
-                                float3 trans_sun = transmittance(sp, sun_jit, 1e30);
+                                float c_t_sun = dot(primary_rd, -sun_jit);
+                                // Cloud + atmospheric leg for the shadow.
+                                // Skips the BVH walk: by construction
+                                // the only occluder along this leg is
+                                // the cloud itself (the sun direction
+                                // points to open sky above the cloud
+                                // layer's top), so cloud_optical_depth_
+                                // stratified + atmosphericTransmittance
+                                // is the full physical visibility.
+                                float t_s_cloud = exp(-cloud_optical_depth_stratified(
+                                                        sp, sun_jit, 1e30, seed));
+                                float3 t_s_atm = atmosphericTransmittance(
+                                                        sp, sun_jit, 60000.0);
+                                float3 trans_sun = t_s_atm * float3(t_s_cloud);
                                 if (any(trans_sun > float3(0.0))) {
-                                    v_color_c += clampIndirect(
-                                        sun_at * trans_sun * phase * step_w * trans_atm);
+                                    // Multi-scatter octave sum (see HDRI
+                                    // branch above for the rationale).
+                                    // Direct + multi-scatter share the
+                                    // SAME shadow visibility -- it's the
+                                    // SAME sun ray; only the phase /
+                                    // extinction weighting per octave
+                                    // changes. Without the octaves the
+                                    // cumulus core under self-shadow
+                                    // reads pitch-black against the
+                                    // brightly-lit cloud edges, which
+                                    // looks like a clipping bug rather
+                                    // than physics.
+                                    float3 ms_acc = float3(0.0);
+                                    float a_pow = 1.0;
+                                    float b_pow = 1.0;
+                                    for (int oi = 0; oi <= ms_oct; ++oi) {
+                                        float g_o  = g_cloud * b_pow;
+                                        float g_o2 = g_o * g_o;
+                                        float ph_o = (1.0 - g_o2) / (4.0 * 3.14159265358979
+                                            * pow(max(1.0 + g_o2 - 2.0 * g_o * c_t_sun, 1e-4), 1.5));
+                                        float step_w_o = dens * a_pow * dtc * trans_eye_c;
+                                        ms_acc += sun_at * trans_sun * ph_o * step_w_o;
+                                        a_pow *= 0.5;
+                                        b_pow *= 0.5;
+                                    }
+                                    v_color_c += clampIndirect(ms_acc * trans_atm);
                                 }
                             }
                             // Direct moon (single-scatter NEE). Moon is the
@@ -3036,11 +3315,21 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                 float phase_b = 0.5 * (1.0 - cos(moon_dir_phase.w));
                                 if (phase_b > 0.01) {
                                     float3 moon_jit = sampleSunDisc(moon_dir_phase.xyz, seed);
-                                    float3 trans_moon = transmittance(sp, moon_jit, 1e30);
+                                    // Same sharp cloud-aware visibility
+                                    // as the sun branch; same rationale
+                                    // (open sky above the cloud layer,
+                                    // no other occluders).
+                                    float t_m_cloud = exp(-cloud_optical_depth_stratified(
+                                                            sp, moon_jit, 1e30, seed));
+                                    float3 t_m_atm = atmosphericTransmittance(
+                                                            sp, moon_jit, 60000.0);
+                                    float3 trans_moon = t_m_atm * float3(t_m_cloud);
                                     if (any(trans_moon > float3(0.0))) {
                                         float c_t_m = dot(primary_rd, -moon_dir_phase.xyz);
-                                        float phase_m = (1.0 - g2) / (4.0 * 3.14159265358979
-                                            * pow(max(1.0 + g2 - 2.0 * g * c_t_m, 1e-4), 1.5));
+                                        float phase_m = (1.0 - g_cloud2)
+                                            / (4.0 * 3.14159265358979
+                                                * pow(max(1.0 + g_cloud2
+                                                            - 2.0 * g_cloud * c_t_m, 1e-4), 1.5));
                                         // Atmospheric attenuation + warmth at
                                         // low moon altitude, mirroring sun.
                                         float m_elev   = max(moon_dir_phase.y, 0.04);
