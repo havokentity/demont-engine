@@ -98,7 +98,7 @@ private:
     //   silently dropped; on Vulkan the slot table in
     //   VulkanDevice.cpp maps them to vk::binding numbers.
     TextureHandle              bound_tex_[14] {};
-    // 11 buffer slots. Slots 0..7 are the original engine layout
+    // Buffer slots. Slots 0..7 are the original engine layout
     // (mesh_positions / mesh_indices, primitives, marginal /
     // conditional CDFs, exposure_state, analytic-prim bvh_nodes).
     // Slots 8/9 were added in the PR #106 follow-up for the triangle
@@ -112,11 +112,13 @@ private:
     // storage buffer rather than an RWTexture2D because PathTrace
     // already sits exactly at Apple Silicon's 8-RW-texture compute
     // cap; storage buffers escape that quota the same way SVGF's
-    // variance / moments buffers do. Keep in sync with the engine's
-    // triangle BVH). Slot 11 was added by light primitives (#73) for
-    // the analytic light list (`light_prims`, MSL slot 11; the shader
-    // declares it at vk::binding(27)). Keep in sync with the engine's
-    // BindBuffer(11,...) call site.
+    // variance / moments buffers do.
+    //
+    // Slot 12 was added by light primitives (#73) for the analytic
+    // light list (`light_prims`, MSL slot 12; the shader declares it
+    // at vk::binding(27)). Declared AFTER shadow_vis_buf so the
+    // existing slot 11 stays put. Engine binds it via
+    // BindBuffer(12, ...).
     //
     // Slot 13 added by the hierarchical light tree (#129) for the
     // packed-node SSBO consumed by PathTrace.slang's O(log N) NEE

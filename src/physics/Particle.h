@@ -15,7 +15,7 @@ namespace pt::physics {
 // effective velocity along the contact normal (Jakobsen 2001).
 //
 // Units (per the project's metric-units rule): all positions are in
-// metres, radius is in metres, mass in kilograms. inv_mass (1/m) is
+// metres, radius is in metres, mass in kilograms. inv_mass (1/kg) is
 // stored instead of mass so the integrator's accel * dt * dt factor
 // doesn't divide each step; inv_mass = 0 marks a kinematic particle
 // (gravity doesn't accelerate it, collision doesn't move it -- not

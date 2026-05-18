@@ -353,30 +353,17 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     // path doesn't work on Mac. Partially-bound is core Vulkan 1.2 and
     // supported on every target including MoltenVK.
     //
-    // Capacity: 11 storage_image (kNumTexSlots; slot 10 / binding 22 is
-    // cloud_trans_tex, no unused slots) + 1 accel_struct + 11 storage_buffer
-    // (engine buf slots 1..11 -> bindings 3,4,5,10,11,15,18,19,20,21,23)
-    // + 1 uniform_buffer = 24, sized to the worst-case "PathTrace binds
-    // everything" dispatch. kMaxWrites must be >= the total binding count
-    // or vkUpdateDescriptorSets reads off the end of these stack arrays.
-    // History:
-    //   - +4 over the legacy 19: bindings 19/20 (tri_bvh_nodes /
-    //     tri_bvh_permuted_ids, PR #106 follow-up host-built triangle BVH),
-    //     binding 21 (SDF cluster buffer, SDF Phase 1 #97; moved from
-    //     binding 19 to make room for the tri BVH), binding 22
-    //     (cloud_trans_tex, issue #46 follow-up -- the R32F per-pixel
-    //     cloud transmittance the path tracer writes and StarsComposite
-    //     reads. Reuses the slot number accum_stars (#108) briefly
-    //     occupied before the stateless composite rewrite.)
-    //   - +1 over the previous 23: binding 23 (shadow_vis_buf, R32F
-    //     SIGMA per-pixel sun-NEE visibility, issue #115). Bumping to 24
-    //     is mandatory -- without this, a dispatch that binds all 11 buf
-    //     slots overflows the writes/img_infos/buf_infos stack arrays.
-    //   - light_prims (#73, binding 27), light_tree_nodes (#129, binding
-    //     28), reservoir (#78, binding 29), smoke_emitters (#136, binding
-    //     30) are NOT in the kMaxWrites range because they use the
-    //     extended slot ranges already covered by other capacity bumps.
-    constexpr std::uint32_t kMaxWrites = 24;
+    // Capacity: derived from the slot tables so future slot bumps in
+    // VulkanDevice.h don't silently overflow img_infos / buf_infos /
+    // writes. kMaxWrites must be >= the total binding count or
+    // vkUpdateDescriptorSets reads off the end of these stack arrays.
+    // The derivation: kNumTexSlots storage_image writes + 1 accel_struct
+    // (TLAS at binding 2) + kNumBufSlots storage_buffer writes + 1
+    // uniform_buffer (Frame UBO at binding 14). Today with the slot
+    // tables sized for the full Wave-3 binding set (texture 14, buffer
+    // 16) the ceiling is 14 + 1 + 16 + 1 = 32.
+    constexpr std::uint32_t kMaxWrites =
+        kNumTexSlots + 1u /*accel*/ + std::size(kSlotToBufBinding) + 1u /*UBO*/;
     std::array<VkDescriptorImageInfo,  kMaxWrites> img_infos {};
     std::array<VkDescriptorBufferInfo, kMaxWrites> buf_infos {};
     std::array<VkWriteDescriptorSetAccelerationStructureKHR, 1> as_infos {};
