@@ -4746,6 +4746,23 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         }
                         trans_eye_c *= exp(-dens * dtc);
                     }
+                    // Beer-Lambert background attenuation, opt-in via
+                    // r_cloud_attenuate_background (piggybacked on
+                    // smoke_params.w by Engine.cpp). When ON, the
+                    // existing radiance accumulated for this primary
+                    // ray (sun NEE + sky NEE + indirect) gets
+                    // multiplied by the running transmittance product
+                    // through the cloud volume, so a dense cloud /
+                    // smoke plume actually OCCLUDES bright sky behind
+                    // it. Real volumetric media work this way (Beer-
+                    // Lambert + in-scatter together); the in-scatter
+                    // half was already done by the v_color_c
+                    // accumulation above, this is the missing half.
+                    // Default OFF until all Wave-1 cloud goldens are
+                    // re-rendered (#179).
+                    if (smoke_params.w > 0.5) {
+                        radiance *= trans_eye_c;
+                    }
                     radiance += v_color_c * vol_int;
                     // G-buffer write source for cloud_trans_tex. Only
                     // sample 0's value is captured so the texture's

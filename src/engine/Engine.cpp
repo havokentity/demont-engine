@@ -951,6 +951,22 @@ namespace cvar {
     PT_CVAR(r_vol_density_scale,        "1.0",  "Cloud volumetric density scale (Phase 4, #100). Linear multiplier on the per-step cloud sigma_t inside the cloud march. 0.5 = half-thickness clouds; 2.0 = double-thickness. Carries through to shadow rays so the cloud's Beer-Lambert occlusion stays consistent with the body it casts shadows from. Range: clamped to >=1e-3 shader-side (a literal 0 would render the cloud as a transmissive haze, which is what r_clouds=0 means instead).", CVAR_ARCHIVE);
     PT_CVAR(r_vol_phase_g,              "0.8",  "Cloud Henyey-Greenstein anisotropy g (Phase 4, #100). Decoupled from r_volumetric_anisotropy (which controls the atmospheric haze). +0.8 = canonical cumulus forward-scatter lobe (silver lining around the sun edge); 0 = isotropic; negative = back-scatter. Range [-0.95, 0.95] clamped shader-side; outside that the HG denominator pinches to zero on grazing directions and produces firefly spikes.", CVAR_ARCHIVE);
     PT_CVAR(r_vol_multiscatter_bounces, "2",    "Cloud multi-scatter octaves (Phase 4, #100). Wrenninge-style cheap proxy for diffuse light bouncing several times inside the cloud volume before exiting toward the camera. 0 = pure single-scatter (legacy behaviour; cloud cores under self-shadow read pitch-black); 1-4 = N additional octaves of decaying-extinction (a=0.5 per octave) decaying-anisotropy (b=0.5 per octave) fake bounces. Default 2 matches the issue spec and gives cumulus the bright diffuse fill expected. Clamped to 0..4 shader-side.", CVAR_ARCHIVE);
+    PT_CVAR(r_cloud_attenuate_background, "0",
+            "Apply Beer-Lambert attenuation of the sky / background "
+            "radiance through the cloud + smoke volume. 0 (default, "
+            "back-compat with all Wave-1 cloud goldens) = clouds and "
+            "smoke only ADD in-scattering on top of an unchanged sky; "
+            "dense clouds never appear darker than the sky behind. "
+            "1 = the running transmittance product through the volume "
+            "(trans_eye_c at line ~4747 of PathTrace.slang -- already "
+            "computed for in-scatter weighting and the G-buffer write) "
+            "is also multiplied into the existing radiance, so a dense "
+            "cloud / smoke plume actually OCCLUDES the bright sky "
+            "behind it. This is what 'real smoke darkens the sky' "
+            "expects. Flipping ON requires regen of every cloud golden "
+            "in the regression matrix; the default is OFF until that "
+            "regen lands as part of the Wave-2 smoke/cloud visual "
+            "overhaul (see issue #179).", CVAR_ARCHIVE);
 
     // Volumetric clouds. Layer on top of homogeneous haze: when r_clouds
     // is on, the volumetric march multiplies sigma_t by a position-
@@ -6208,7 +6224,17 @@ void Engine::RenderFrame() {
         push.smoke_params[0] = static_cast<float>(smoke_count_uploaded_);
         push.smoke_params[1] = smoke_on ? 1.0f : 0.0f;
         push.smoke_params[2] = smoke_t;
-        push.smoke_params[3] = 0.0f;
+        // smoke_params.w: piggyback the r_cloud_attenuate_background
+        // flag here (1.0 = apply Beer-Lambert sky attenuation through
+        // the cloud-march volume, 0.0 = legacy in-scatter only). This
+        // slot was reserved on the original PR #136 push struct;
+        // re-using it avoids growing PtPush + bumping the static-assert
+        // sum. See r_cloud_attenuate_background docstring.
+        bool attenuate_bg = false;
+        if (auto* v = C.FindCVar("r_cloud_attenuate_background")) {
+            attenuate_bg = v->GetBool();
+        }
+        push.smoke_params[3] = attenuate_bg ? 1.0f : 0.0f;
     }
     // --- end Fluid Phase 1 -------------------------------------------------
 
