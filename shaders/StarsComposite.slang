@@ -399,9 +399,26 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // camera-space Z (typically << 100 in metric units for any normal
     // scene) for surface hits. Threshold at 500 m so we capture only
     // sky pixels; anything closer is geometry and we leave it alone.
-    // Without this gate the composite is unconditionally additive and
-    // stars / sun / moon render on top of the ground plane.
-    if (depth_tex[tid.xy] < 500.0) return;
+    //
+    // 4-neighbor dilation of the geometry mask. PathTrace's G-buffer
+    // pass is UNJITTERED (uses uv0 not the jittered uv) so on horizon-
+    // boundary pixels the depth value reports whichever side of the
+    // edge the pixel CENTER lies on, while the jittered radiance write
+    // can hit the opposite side. Without dilation, 1-2 stars at the
+    // exact horizon line render on top of the ground edge. Taking the
+    // min depth across the pixel and its 4 cardinal neighbors biases
+    // the gate toward "geometry" at edges, pushing the star-eligible
+    // band 1 pixel inside the sky-side of the horizon.
+    int W = int(dim.x) - 1;
+    int H = int(dim.y) - 1;
+    int2 px = int2(tid.xy);
+    float zc = depth_tex[uint2(px)];
+    float zl = depth_tex[uint2(max(px.x - 1, 0), px.y)];
+    float zr = depth_tex[uint2(min(px.x + 1, W), px.y)];
+    float zu = depth_tex[uint2(px.x, max(px.y - 1, 0))];
+    float zb = depth_tex[uint2(px.x, min(px.y + 1, H))];
+    float zmin = min(min(zc, zl), min(zr, min(zu, zb)));
+    if (zmin < 500.0) return;
 
     float aperture = dof_params.x;
     float focal_d  = dof_params.y;
@@ -414,10 +431,17 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // Per-pixel deterministic offset into the Halton sequence so two
     // adjacent pixels don't share the same N-sample pattern (would
     // produce a visible grid of identical bokeh placements). Hash on
-    // pixel coords + frame_index so the offset is stable per frame
-    // but shifts between frames -- when the camera is still, a moving
-    // moon/sun still integrates over a few frames without aliasing.
-    uint pixel_hash = pcgHash(tid.x * 1973u + tid.y * 9277u + frame_index * 26699u);
+    // pixel coords ONLY -- frame_index is intentionally absent so the
+    // sample pattern is stable frame-to-frame. Adding it back caused a
+    // global twinkle flicker: every frame's sample pattern shifted in
+    // lockstep across all pixels, so each frame all stars simultaneously
+    // got more or fewer samples landing on them. The result read as a
+    // synchronized flicker over the entire star field, overpowering the
+    // intended per-star scintillation that starsOnly() injects via
+    // frame_index inside its own hash. The real twinkle (3-8 Hz per
+    // star, random phases) still works -- it just no longer competes
+    // with the global sample-pattern shift.
+    uint pixel_hash = pcgHash(tid.x * 1973u + tid.y * 9277u);
     uint base_i = pixel_hash & 0xFFFFu;
 
     float3 acc = float3(0.0);
