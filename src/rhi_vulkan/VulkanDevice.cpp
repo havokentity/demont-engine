@@ -212,6 +212,40 @@ VkShaderModule MakeShaderModule(VkDevice dev, const std::uint8_t* bytes,
     return m;
 }
 
+// Small inline switch for the VkResult values the engine actually
+// observes / cares about. Used by the VkResult-correctness-floor log
+// lines so an operator reading "vkQueueSubmit failed: -4" also sees
+// "VK_ERROR_DEVICE_LOST" right next to it without digging through
+// vulkan_core.h. Not exhaustive -- unknown codes get logged as the
+// numeric value alone.
+const char* VkResultToString(VkResult r) {
+    switch (r) {
+        case VK_SUCCESS:                       return "VK_SUCCESS";
+        case VK_NOT_READY:                     return "VK_NOT_READY";
+        case VK_TIMEOUT:                       return "VK_TIMEOUT";
+        case VK_EVENT_SET:                     return "VK_EVENT_SET";
+        case VK_EVENT_RESET:                   return "VK_EVENT_RESET";
+        case VK_INCOMPLETE:                    return "VK_INCOMPLETE";
+        case VK_ERROR_OUT_OF_HOST_MEMORY:      return "VK_ERROR_OUT_OF_HOST_MEMORY";
+        case VK_ERROR_OUT_OF_DEVICE_MEMORY:    return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+        case VK_ERROR_INITIALIZATION_FAILED:   return "VK_ERROR_INITIALIZATION_FAILED";
+        case VK_ERROR_DEVICE_LOST:             return "VK_ERROR_DEVICE_LOST";
+        case VK_ERROR_MEMORY_MAP_FAILED:       return "VK_ERROR_MEMORY_MAP_FAILED";
+        case VK_ERROR_LAYER_NOT_PRESENT:       return "VK_ERROR_LAYER_NOT_PRESENT";
+        case VK_ERROR_EXTENSION_NOT_PRESENT:   return "VK_ERROR_EXTENSION_NOT_PRESENT";
+        case VK_ERROR_FEATURE_NOT_PRESENT:     return "VK_ERROR_FEATURE_NOT_PRESENT";
+        case VK_ERROR_INCOMPATIBLE_DRIVER:     return "VK_ERROR_INCOMPATIBLE_DRIVER";
+        case VK_ERROR_TOO_MANY_OBJECTS:        return "VK_ERROR_TOO_MANY_OBJECTS";
+        case VK_ERROR_FORMAT_NOT_SUPPORTED:    return "VK_ERROR_FORMAT_NOT_SUPPORTED";
+        case VK_ERROR_FRAGMENTED_POOL:         return "VK_ERROR_FRAGMENTED_POOL";
+        case VK_ERROR_OUT_OF_DATE_KHR:         return "VK_ERROR_OUT_OF_DATE_KHR";
+        case VK_ERROR_SURFACE_LOST_KHR:        return "VK_ERROR_SURFACE_LOST_KHR";
+        case VK_SUBOPTIMAL_KHR:                return "VK_SUBOPTIMAL_KHR";
+        case VK_ERROR_VALIDATION_FAILED_EXT:   return "VK_ERROR_VALIDATION_FAILED_EXT";
+        default:                               return "VK_<unknown>";
+    }
+}
+
 bool DeviceSupportsExtension(VkPhysicalDevice pd, const char* name) {
     std::uint32_t n = 0;
     vkEnumerateDeviceExtensionProperties(pd, nullptr, &n, nullptr);
@@ -1400,7 +1434,20 @@ void VulkanDevice::DestroyDevice() {
             optix_denoiser_->DrainCuda();
         }
 #endif
-        vkDeviceWaitIdle(device_);
+        // Pre-teardown wait. If the device is already lost we'll just
+        // log and continue -- there's no meaningful recovery in the
+        // dtor path and skipping the wait would only risk validation
+        // noise as we tear down resources the GPU might still claim it
+        // owns (with no live engine left to care).
+        {
+            const VkResult r = vkDeviceWaitIdle(device_);
+            if (r != VK_SUCCESS) {
+                if (r == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+                LOG_ERROR("VulkanDevice::DestroyDevice: vkDeviceWaitIdle failed: "
+                          "{} ({}). Proceeding with teardown.",
+                          static_cast<int>(r), VkResultToString(r));
+            }
+        }
         // Tear down the denoiser before any of its dependencies
         // (VkPipeline / VkDescriptorPool / VkImageView). The denoiser
         // owns a few textures via device_->DestroyTexture and a few
@@ -1584,7 +1631,20 @@ void VulkanDevice::SavePipelineCache() {
 
 bool VulkanDevice::RecreateSwapchain() {
     if (device_ == VK_NULL_HANDLE) return false;
-    vkDeviceWaitIdle(device_);
+    // Drain the GPU before tearing down the old swapchain. A
+    // DEVICE_LOST here means subsequent vkCreateSwapchainKHR will also
+    // fail; latch and bail rather than crashing inside the
+    // re-creation path.
+    {
+        const VkResult r = vkDeviceWaitIdle(device_);
+        if (r != VK_SUCCESS) {
+            if (r == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+            LOG_ERROR("VulkanDevice::RecreateSwapchain: vkDeviceWaitIdle "
+                      "failed: {} ({}). Aborting swapchain recreate.",
+                      static_cast<int>(r), VkResultToString(r));
+            return false;
+        }
+    }
 
     for (auto v : swap_views_) if (v) vkDestroyImageView(device_, v, nullptr);
     swap_views_.clear();
@@ -1944,7 +2004,15 @@ void VulkanDevice::DestroyBuffer(BufferHandle h) {
     // buffer. Batch teardown should use DestroyBufferNoWait + a single
     // upfront WaitIdle() instead (this method's wait amortises to one
     // per destroy, which is fine in isolation but N× for batches).
-    vkDeviceWaitIdle(device_);
+    {
+        const VkResult r = vkDeviceWaitIdle(device_);
+        if (r != VK_SUCCESS) {
+            if (r == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+            LOG_ERROR("VulkanDevice::DestroyBuffer: vkDeviceWaitIdle "
+                      "failed: {} ({}). Proceeding with destroy.",
+                      static_cast<int>(r), VkResultToString(r));
+        }
+    }
     DestroyBufferNoWait(h);
 }
 
@@ -2027,8 +2095,25 @@ void VulkanDevice::WriteBuffer(BufferHandle h, const void* src, std::size_t size
     si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers    = &once;
-    vkQueueSubmit(graphics_queue_, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(graphics_queue_);
+    {
+        const VkResult sr = vkQueueSubmit(graphics_queue_, 1, &si, VK_NULL_HANDLE);
+        if (sr != VK_SUCCESS) {
+            if (sr == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+            LOG_ERROR("VulkanDevice::WriteBuffer: vkQueueSubmit failed: "
+                      "{} ({}). Upload of {} bytes discarded.",
+                      static_cast<int>(sr), VkResultToString(sr),
+                      static_cast<std::uint64_t>(size));
+        } else {
+            const VkResult wr = vkQueueWaitIdle(graphics_queue_);
+            if (wr != VK_SUCCESS) {
+                if (wr == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+                LOG_ERROR("VulkanDevice::WriteBuffer: vkQueueWaitIdle failed: "
+                          "{} ({}). Upload of {} bytes may be incomplete.",
+                          static_cast<int>(wr), VkResultToString(wr),
+                          static_cast<std::uint64_t>(size));
+            }
+        }
+    }
     vkFreeCommandBuffers(device_, cmd_pool_, 1, &once);
     DestroyBufferImpl(staging);
 }
@@ -2141,8 +2226,25 @@ TextureHandle VulkanDevice::CreateTexture(const TextureDesc& d) {
         si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         si.commandBufferCount = 1;
         si.pCommandBuffers    = &once;
-        vkQueueSubmit(graphics_queue_, 1, &si, VK_NULL_HANDLE);
-        vkQueueWaitIdle(graphics_queue_);
+        {
+            const VkResult sr = vkQueueSubmit(graphics_queue_, 1, &si, VK_NULL_HANDLE);
+            if (sr != VK_SUCCESS) {
+                if (sr == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+                LOG_ERROR("VulkanDevice::CreateTexture: layout-transition "
+                          "vkQueueSubmit failed: {} ({}). Texture {}x{} may "
+                          "be in UNDEFINED layout.",
+                          static_cast<int>(sr), VkResultToString(sr),
+                          d.width, d.height);
+            } else {
+                const VkResult wr = vkQueueWaitIdle(graphics_queue_);
+                if (wr != VK_SUCCESS) {
+                    if (wr == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+                    LOG_ERROR("VulkanDevice::CreateTexture: layout-transition "
+                              "vkQueueWaitIdle failed: {} ({}).",
+                              static_cast<int>(wr), VkResultToString(wr));
+                }
+            }
+        }
         vkFreeCommandBuffers(device_, cmd_pool_, 1, &once);
     }
 
@@ -2258,11 +2360,30 @@ bool VulkanDevice::WriteTexture(TextureHandle h, const void* src,
     si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers    = &once;
-    vkQueueSubmit(graphics_queue_, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(graphics_queue_);
+    bool wt_ok = true;
+    {
+        const VkResult sr = vkQueueSubmit(graphics_queue_, 1, &si, VK_NULL_HANDLE);
+        if (sr != VK_SUCCESS) {
+            if (sr == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+            LOG_ERROR("VulkanDevice::WriteTexture: vkQueueSubmit failed: "
+                      "{} ({}). Texture upload of {} bytes discarded.",
+                      static_cast<int>(sr), VkResultToString(sr),
+                      static_cast<std::uint64_t>(src_size));
+            wt_ok = false;
+        } else {
+            const VkResult wr = vkQueueWaitIdle(graphics_queue_);
+            if (wr != VK_SUCCESS) {
+                if (wr == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+                LOG_ERROR("VulkanDevice::WriteTexture: vkQueueWaitIdle failed: "
+                          "{} ({}). Texture upload may be incomplete.",
+                          static_cast<int>(wr), VkResultToString(wr));
+                wt_ok = false;
+            }
+        }
+    }
     vkFreeCommandBuffers(device_, cmd_pool_, 1, &once);
     DestroyBufferImpl(staging);
-    return true;
+    return wt_ok;
 }
 
 bool VulkanDevice::ReadbackTexture(TextureHandle h, void* dst, std::size_t dst_size,
@@ -2387,17 +2508,38 @@ bool VulkanDevice::ReadbackTexture(TextureHandle h, void* dst, std::size_t dst_s
     si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers    = &cb;
-    vkQueueSubmit(graphics_queue_, 1, &si, fence);
-    vkWaitForFences(device_, 1, &fence, VK_TRUE, UINT64_MAX);
+    bool rt_ok = true;
+    {
+        const VkResult sr = vkQueueSubmit(graphics_queue_, 1, &si, fence);
+        if (sr != VK_SUCCESS) {
+            if (sr == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+            LOG_ERROR("VulkanDevice::ReadbackTexture: vkQueueSubmit failed: "
+                      "{} ({}). Readback discarded.",
+                      static_cast<int>(sr), VkResultToString(sr));
+            rt_ok = false;
+        } else {
+            const VkResult wr = vkWaitForFences(device_, 1, &fence,
+                                                VK_TRUE, UINT64_MAX);
+            if (wr != VK_SUCCESS) {
+                if (wr == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+                LOG_ERROR("VulkanDevice::ReadbackTexture: vkWaitForFences "
+                          "failed: {} ({}). Readback discarded.",
+                          static_cast<int>(wr), VkResultToString(wr));
+                rt_ok = false;
+            }
+        }
+    }
 
-    std::memcpy(dst, staging.mapped, bytes);
-    if (out_w) *out_w = extent.width;
-    if (out_h) *out_h = extent.height;
+    if (rt_ok) {
+        std::memcpy(dst, staging.mapped, bytes);
+        if (out_w) *out_w = extent.width;
+        if (out_h) *out_h = extent.height;
+    }
 
     vkDestroyFence(device_, fence, nullptr);
     vkFreeCommandBuffers(device_, cmd_pool_, 1, &cb);
     DestroyBufferImpl(staging);
-    return true;
+    return rt_ok;
 }
 
 bool VulkanDevice::ReadbackBuffer(BufferHandle h, void* dst, std::size_t bytes) {
@@ -2490,10 +2632,28 @@ bool VulkanDevice::ReadbackBuffer(BufferHandle h, void* dst, std::size_t bytes) 
     si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers    = &cb;
-    bool ok = (vkQueueSubmit(graphics_queue_, 1, &si, fence) == VK_SUCCESS);
-    if (ok) {
-        vkWaitForFences(device_, 1, &fence, VK_TRUE, UINT64_MAX);
-        std::memcpy(dst, staging.mapped, bytes);
+    bool ok = false;
+    {
+        const VkResult sr = vkQueueSubmit(graphics_queue_, 1, &si, fence);
+        if (sr != VK_SUCCESS) {
+            if (sr == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+            LOG_ERROR("VulkanDevice::ReadbackBuffer: vkQueueSubmit failed: "
+                      "{} ({}). Readback of {} bytes discarded.",
+                      static_cast<int>(sr), VkResultToString(sr),
+                      static_cast<std::uint64_t>(bytes));
+        } else {
+            const VkResult wr = vkWaitForFences(device_, 1, &fence,
+                                                VK_TRUE, UINT64_MAX);
+            if (wr != VK_SUCCESS) {
+                if (wr == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+                LOG_ERROR("VulkanDevice::ReadbackBuffer: vkWaitForFences "
+                          "failed: {} ({}). Readback discarded.",
+                          static_cast<int>(wr), VkResultToString(wr));
+            } else {
+                std::memcpy(dst, staging.mapped, bytes);
+                ok = true;
+            }
+        }
     }
 
     vkDestroyFence(device_, fence, nullptr);
@@ -2553,7 +2713,17 @@ bool VulkanDevice::ReadbackSwapchain(void* dst, std::size_t dst_size,
     // that swap_capture_consumed_ is only published after the host
     // Submit returned (so WaitIdle is guaranteed to find the copy
     // queued and wait for its completion rather than no-oping).
-    vkDeviceWaitIdle(device_);
+    {
+        const VkResult r = vkDeviceWaitIdle(device_);
+        if (r != VK_SUCCESS) {
+            if (r == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+            LOG_ERROR("VulkanDevice::ReadbackSwapchain: vkDeviceWaitIdle "
+                      "failed: {} ({}). Returning false; readback discarded.",
+                      static_cast<int>(r), VkResultToString(r));
+            swap_capture_consumed_.store(false, std::memory_order_release);
+            return false;
+        }
+    }
 
     if (swap_capture_staging_.mapped == nullptr) {
         LOG_ERROR("ReadbackSwapchain: staging buffer has no host mapping after consume");
@@ -2583,7 +2753,15 @@ void VulkanDevice::DestroyTexture(TextureHandle h) {
     // texture. Batch teardown should use DestroyTextureNoWait + a single
     // upfront WaitIdle() instead (this method's wait amortises to one
     // per destroy, which is fine in isolation but N× for batches).
-    if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
+    if (device_ != VK_NULL_HANDLE) {
+        const VkResult r = vkDeviceWaitIdle(device_);
+        if (r != VK_SUCCESS) {
+            if (r == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+            LOG_ERROR("VulkanDevice::DestroyTexture: vkDeviceWaitIdle "
+                      "failed: {} ({}). Proceeding with destroy.",
+                      static_cast<int>(r), VkResultToString(r));
+        }
+    }
     DestroyTextureNoWait(h);
 }
 
@@ -2672,9 +2850,40 @@ bool VulkanDevice::BuildAccelerationStructure(
     si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers    = &once;
-    vkQueueSubmit(graphics_queue_, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(graphics_queue_);
+    bool as_build_ok = true;
+    {
+        const VkResult sr = vkQueueSubmit(graphics_queue_, 1, &si, VK_NULL_HANDLE);
+        if (sr != VK_SUCCESS) {
+            if (sr == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+            LOG_ERROR("VulkanDevice::BuildAccelerationStructure: vkQueueSubmit "
+                      "failed: {} ({}). Acceleration-structure build aborted.",
+                      static_cast<int>(sr), VkResultToString(sr));
+            as_build_ok = false;
+        } else {
+            const VkResult wr = vkQueueWaitIdle(graphics_queue_);
+            if (wr != VK_SUCCESS) {
+                if (wr == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+                LOG_ERROR("VulkanDevice::BuildAccelerationStructure: "
+                          "vkQueueWaitIdle failed: {} ({}). AS may be partial.",
+                          static_cast<int>(wr), VkResultToString(wr));
+                as_build_ok = false;
+            }
+        }
+    }
     vkFreeCommandBuffers(device_, cmd_pool_, 1, &once);
+
+    if (!as_build_ok) {
+        // Tear down everything this function allocated -- the caller
+        // assumes a clean state on failure (CreateBLAS / CreateTLAS
+        // simply return AccelStructHandle{0} without touching `entry`).
+        // Order matches the success path's teardown in DestroyAccelStruct:
+        // AS object, then storage buffer, then scratch buffer.
+        pfn_DestroyAccelStruct_(device_, entry.accel, nullptr);
+        entry.accel = VK_NULL_HANDLE;
+        DestroyBufferImpl(storage);
+        DestroyBufferImpl(scratch);
+        return false;
+    }
 
     // 4. Free scratch (no longer needed); keep storage with the entry.
     DestroyBufferImpl(scratch);
@@ -2849,7 +3058,15 @@ void VulkanDevice::DestroyAccelStruct(AccelStructHandle h) {
     std::lock_guard lock(resource_mutex_);
     auto it = accels_.find(h.id);
     if (it == accels_.end()) return;
-    vkDeviceWaitIdle(device_);
+    {
+        const VkResult r = vkDeviceWaitIdle(device_);
+        if (r != VK_SUCCESS) {
+            if (r == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+            LOG_ERROR("VulkanDevice::DestroyAccelStruct: vkDeviceWaitIdle "
+                      "failed: {} ({}). Proceeding with destroy.",
+                      static_cast<int>(r), VkResultToString(r));
+        }
+    }
     if (it->second.accel != VK_NULL_HANDLE && pfn_DestroyAccelStruct_) {
         pfn_DestroyAccelStruct_(device_, it->second.accel, nullptr);
     }
@@ -2863,9 +3080,30 @@ void VulkanDevice::DestroyAccelStruct(AccelStructHandle h) {
 FrameContext VulkanDevice::BeginFrame() {
     PT_ZONE_SCOPED_N("VulkanDevice::BeginFrame");
     if (device_ == VK_NULL_HANDLE) return {};
+    // Once the device has been lost there is no useful work for this
+    // frame -- vkWaitForFences / vkAcquireNextImageKHR will just
+    // re-report DEVICE_LOST and the engine should already be tearing
+    // down. Return an empty FrameContext (width=height=0) so the engine
+    // skips the RenderFrame body cleanly; the smoke harness has
+    // already latched smoke_test_failed_ via IsDeviceLost().
+    if (device_lost_) return {};
 
-    vkWaitForFences(device_, 1, &fence_in_flight_[current_frame_],
-                    VK_TRUE, UINT64_MAX);
+    // Main per-frame wait. If the previous Submit hit DEVICE_LOST the
+    // fence is also in an undefined state -- the spec lets the driver
+    // return DEVICE_LOST here directly. Either way: latch the flag,
+    // LOG_ERROR loud, and bail. Pre-PR this call silently swallowed
+    // -4 and the engine carried on rendering against a dead GPU.
+    const VkResult wait_r = vkWaitForFences(
+        device_, 1, &fence_in_flight_[current_frame_],
+        VK_TRUE, UINT64_MAX);
+    if (wait_r != VK_SUCCESS) {
+        if (wait_r == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+        LOG_ERROR("VulkanDevice::BeginFrame: vkWaitForFences failed: {} ({}). "
+                  "Device {} lost. Frame skipped.",
+                  static_cast<int>(wait_r), VkResultToString(wait_r),
+                  device_lost_ ? "is" : "is not");
+        return {};
+    }
 
     VkResult ar = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX,
                                         sem_image_avail_[current_frame_],
@@ -3022,7 +3260,28 @@ void VulkanDevice::Submit(CommandBuffer* cb) {
     }
 #endif
 
-    vkQueueSubmit(graphics_queue_, 1, &si, fence_in_flight_[current_frame_]);
+    // Main per-frame queue submit. CRITICAL correctness floor: a
+    // ignored VK_ERROR_DEVICE_LOST here is what lets a GPU hang (e.g.
+    // NVIDIA GSP heartbeat timeout on a shader infinite-loop) hide
+    // behind a "smoke-test: rendered N frames" green PR. Latch the
+    // flag, LOG_ERROR loud, and stop signalling capture consumed --
+    // there's nothing in the queue to wait on.
+    const VkResult submit_r = vkQueueSubmit(
+        graphics_queue_, 1, &si, fence_in_flight_[current_frame_]);
+    if (submit_r != VK_SUCCESS) {
+        if (submit_r == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+        LOG_ERROR("VulkanDevice::Submit: vkQueueSubmit failed: {} ({}). "
+                  "Device {} lost. Smoke runs will be marked failed.",
+                  static_cast<int>(submit_r), VkResultToString(submit_r),
+                  device_lost_ ? "is" : "is not");
+        // Do NOT publish swap_capture_consumed_ on a failed submit:
+        // there's no queued copy for a subsequent vkDeviceWaitIdle to
+        // synchronise on, and the staging buffer is undefined. The
+        // capture request stays latched and a future successful submit
+        // (after a hypothetical recovery) can claim it. With device_lost_
+        // = true the engine should be exiting anyway.
+        return;
+    }
 
     // ReadbackSwapchain consume publish: AFTER vkQueueSubmit. By the
     // time another thread observes this flag, the copy is at least
@@ -3228,7 +3487,15 @@ void VulkanDevice::EndFrame(CommandBuffer*) {
 }
 
 void VulkanDevice::WaitIdle() {
-    if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
+    if (device_ == VK_NULL_HANDLE) return;
+    const VkResult r = vkDeviceWaitIdle(device_);
+    if (r != VK_SUCCESS) {
+        if (r == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+        LOG_ERROR("VulkanDevice::WaitIdle: vkDeviceWaitIdle failed: {} ({}). "
+                  "Device {} lost.",
+                  static_cast<int>(r), VkResultToString(r),
+                  device_lost_ ? "is" : "is not");
+    }
 }
 
 void VulkanDevice::Resize(int /*w*/, int /*h*/) {

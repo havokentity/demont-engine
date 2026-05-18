@@ -154,6 +154,15 @@ public:
     virtual const char*  DeviceName()       const = 0;
     virtual std::size_t  CurrentAllocatedBytes() const = 0;
 
+    // True iff a previous Vulkan call returned VK_ERROR_DEVICE_LOST (or
+    // an equivalent terminal status on another backend). Once latched
+    // the backend's per-frame work is effectively a no-op against a
+    // dead device -- the engine polls this at the top of RenderFrame
+    // and in smoke-test mode trips smoke_test_failed_ so a GPU hang
+    // doesn't silently pass CI with all-zero output. Default false for
+    // backends that don't track this yet (Metal / software).
+    virtual bool IsDeviceLost() const { return false; }
+
     // P10 denoiser hook. Backends without a denoiser implementation
     // (software / vulkan today) leave the default no-op. The Metal
     // backend implements it via MTLFXTemporalDenoisedScaler. Must be

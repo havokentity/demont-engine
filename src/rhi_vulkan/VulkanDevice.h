@@ -151,6 +151,7 @@ public:
     bool         SupportsHardwareRT() const override { return rt_supported_; }
     const char*  DeviceName()       const override { return device_name_.c_str(); }
     std::size_t  CurrentAllocatedBytes() const override;
+    bool         IsDeviceLost() const override { return device_lost_; }
 
     // SVGF/NRD denoiser. The denoiser pipelines + scratch textures are
     // NOT built by the async worker -- they're constructed lazily on
@@ -311,6 +312,16 @@ private:
     // (one per resource the engine then tried to create against the
     // dead device) after the first init check failed.
     bool        init_ok_      = false;
+    // VkResult correctness floor (#???): set by any submit / wait / idle
+    // call that returns VK_ERROR_DEVICE_LOST. Once latched the device is
+    // dead -- subsequent vkQueueSubmit / vkWaitForFences will keep
+    // returning the same error, and there's no recovery path short of a
+    // full backend re-init (which the engine doesn't attempt today).
+    // Engine::RenderFrame polls IsDeviceLost() at the top so the per-
+    // frame work no-ops cleanly, and the smoke harness trips
+    // smoke_test_failed_ so ctest sees a non-zero exit instead of
+    // silently writing an all-zero PNG against a hung GPU.
+    bool        device_lost_  = false;
     std::uint32_t frame_index_ = 0;
     std::uint32_t max_push_constant_size_ = 128;
 

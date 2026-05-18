@@ -959,6 +959,13 @@ private:
     // a rejected arg is a hard fail (mode #2 above). In interactive
     // mode, the LOG_ERROR is enough -- no behavioural change.
     bool                                        cli_arg_was_rejected_  = false;
+    // Latched once the backend reports IsDeviceLost(). The smoke-test
+    // loop polls device_->IsDeviceLost() each tick and on the first
+    // observation: logs a LOG_ERROR, requests exit, and (in smoke
+    // mode) trips smoke_test_failed_. This flag is just so the log
+    // line fires once instead of every frame between detection and
+    // the loop actually exiting on wants_quit_.
+    bool                                        device_lost_observed_  = false;
 
     // Snapshot of last camera state, used to detect movement and reset
     // accumulation. (vec4 to keep it trivially copyable.)
