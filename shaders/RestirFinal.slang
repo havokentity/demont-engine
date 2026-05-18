@@ -44,10 +44,13 @@
 // straightforward follow-up but adds a chunk of duplicated code that
 // only matters for fractal-heavy scenes.
 
-[[vk::binding(0, 0)]] RWTexture2D<float>  depth_tex;
-[[vk::binding(1, 0)]] RWTexture2D<float4> normal_tex;
-[[vk::binding(2, 0)]] RWTexture2D<float4> albedo_tex;
-[[vk::binding(3, 0)]] RWTexture2D<float4> denoise_color;
+// vk::image_format: depth_tex R32F, normal_tex / albedo_tex /
+// denoise_color all RGBA16F. See PathTrace.slang for the NVIDIA
+// Format=Unknown rationale.
+[[vk::binding(0, 0), vk::image_format("r32f")]]    RWTexture2D<float>  depth_tex;
+[[vk::binding(1, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> normal_tex;
+[[vk::binding(2, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> albedo_tex;
+[[vk::binding(3, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> denoise_color;
 [[vk::binding(4, 0)]]   StructuredBuffer<float4>  reservoir_in;
 [[vk::binding(5, 0)]]   StructuredBuffer<float4>  light_prims;
 [[vk::binding(6, 0)]]   StructuredBuffer<float4>  primitives;

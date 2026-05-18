@@ -66,9 +66,13 @@
 // aurora composite multiplies by this before the additive write so
 // thick clouds occlude the aurora curtain the same way they occlude
 // stars / sun / moon in the celestial composite.
-[[vk::binding(0, 0)]]  RWTexture2D<float4> hdr_inout;
-[[vk::binding(7, 0)]]  RWTexture2D<float>  depth_tex;
-[[vk::binding(22, 0)]] RWTexture2D<float>  cloud_trans_tex;
+// vk::image_format qualifiers: hdr_inout is post_denoise_hdr (RGBA16F),
+// depth_tex is R32F linear depth, cloud_trans_tex is R32F
+// transmittance. See PathTrace.slang for the NVIDIA Format=Unknown
+// rationale.
+[[vk::binding(0, 0),  vk::image_format("rgba16f")]] RWTexture2D<float4> hdr_inout;
+[[vk::binding(7, 0),  vk::image_format("r32f")]]    RWTexture2D<float>  depth_tex;
+[[vk::binding(22, 0), vk::image_format("r32f")]]    RWTexture2D<float>  cloud_trans_tex;
 
 // MSL SLOT NOTICE: this kernel binds NO buffers and NO acceleration
 // structures. Slang's MSL backend therefore assigns Push (the only

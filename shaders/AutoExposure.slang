@@ -71,8 +71,15 @@
 // gets compiled away by the Vulkan driver's pipeline JIT.
 
 // --- texture slots: padded to put accum_hdr at tex(1) ----------------
-[[vk::binding(0, 0)]]  RWTexture2D<float4> _slot_output;
-[[vk::binding(1, 0)]]  RWTexture2D<float4> accum_hdr;
+// vk::image_format qualifiers added defensively even on this kernel:
+// while AutoExposure only READS accum_hdr, an unqualified storage
+// image still trips NVIDIA's Format=Unknown / StorageImageReadWithoutFormat
+// pathological codegen and the binding's spec-defined semantics
+// require either a format or the without-format feature enabled.
+// _slot_output is the swapchain (rgba8) placeholder PathTrace puts
+// on tex(0); declaring the format matches what the bound view is.
+[[vk::binding(0, 0), vk::image_format("rgba8")]]   RWTexture2D<float4> _slot_output;
+[[vk::binding(1, 0), vk::image_format("rgba32f")]] RWTexture2D<float4> accum_hdr;
 
 // --- buffer slots: AS at buf(0), then 5 storage buffers, then
 //     exposure_state at buf(6). Matches PathTrace's emission order.

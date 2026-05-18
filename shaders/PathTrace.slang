@@ -20,8 +20,17 @@
 // StructuredBuffer<float3> with a 16-byte stride per element on MSL,
 // while the buffer we upload is tightly packed 12-byte float3.
 
-[[vk::binding(0, 0)]] RWTexture2D<float4> output;
-[[vk::binding(1, 0)]] RWTexture2D<float4> accum_hdr;
+// vk::image_format qualifiers on every RWTexture2D below: without an
+// explicit format, Slang emits SPIR-V `OpTypeImage Format=Unknown` +
+// the StorageImageWriteWithoutFormat capability. On NVIDIA Vulkan
+// drivers (596.x family) that combination silently no-op'd
+// OpImageWrite on the full PathTrace kernel, producing all-zero
+// output. Each string here matches the engine's VkImage format from
+// `src/engine/Engine.cpp` `CreateTexture` calls -- see the bug-fix
+// PR for the full mapping table. (See DXC #6153, Slang #5969,
+// NVIDIA bug #1080 family.)
+[[vk::binding(0, 0), vk::image_format("rgba8")]]   RWTexture2D<float4> output;
+[[vk::binding(1, 0), vk::image_format("rgba32f")]] RWTexture2D<float4> accum_hdr;
 // scene_tlas is omitted from the SPIR-V variant when the build defines
 // PT_SPIRV_NO_RAYQUERY (issue #44 fallback for backends without
 // VK_KHR_ray_query, e.g. Mac-Vulkan on pre-1.3 MoltenVK). Without the
@@ -36,9 +45,9 @@
 [[vk::binding(4, 0)]] StructuredBuffer<uint>   mesh_indices;
 [[vk::binding(5, 0)]] StructuredBuffer<float4> primitives;
 // P10 denoiser G-buffer outputs. Only written when denoiser_enabled != 0.
-[[vk::binding(6, 0)]] RWTexture2D<float4> denoise_color;   // RGBA16F per-frame HDR (NOT accumulated)
-[[vk::binding(7, 0)]] RWTexture2D<float>  depth_tex;       // R32F  linear camera-space depth
-[[vk::binding(8, 0)]] RWTexture2D<float2> motion_tex;      // RG16F pixel-space (prev - curr) delta
+[[vk::binding(6, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> denoise_color;   // RGBA16F per-frame HDR (NOT accumulated)
+[[vk::binding(7, 0), vk::image_format("r32f")]]    RWTexture2D<float>  depth_tex;       // R32F  linear camera-space depth
+[[vk::binding(8, 0), vk::image_format("rg16f")]]   RWTexture2D<float2> motion_tex;      // RG16F pixel-space (prev - curr) delta
 // P11 environment map. RGBA32F lat-long HDR; sampled by ray direction
 // when env_map_present != 0. Used for both skybox visibility and
 // indirect lighting in one place (path tracing collapses skybox + IBL).
@@ -60,7 +69,7 @@
 #ifdef PT_TARGET_METAL
 Texture2D<float4> env_map;
 #else
-[[vk::binding(9, 0)]] RWTexture2D<float4> env_map;
+[[vk::binding(9, 0), vk::image_format("rgba32f")]] RWTexture2D<float4> env_map;
 #endif
 
 // P11 MIS / NEE: precomputed CDFs over env_map luminance. marginal_cdf
@@ -77,7 +86,7 @@ Texture2D<float4> env_map;
 #ifdef PT_TARGET_METAL
 Texture2D<float4> star_map;
 #else
-[[vk::binding(12, 0)]] RWTexture2D<float4> star_map;
+[[vk::binding(12, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> star_map;
 #endif
 
 // Procedural moon surface texture, equirectangular RGBA16F generated
@@ -86,7 +95,7 @@ Texture2D<float4> star_map;
 #ifdef PT_TARGET_METAL
 Texture2D<float4> moon_map;
 #else
-[[vk::binding(13, 0)]] RWTexture2D<float4> moon_map;
+[[vk::binding(13, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> moon_map;
 #endif
 
 // G-buffer: world-space normal at primary hit. Written when
@@ -103,7 +112,7 @@ Texture2D<float4> moon_map;
 // normal_tex_id_), so the per-pixel write below skips entirely. Sky
 // pixels (no hit) write float3(0) so the SVGF / atrous edge-stops
 // treat them as "no surface" and skip the normal weight.
-[[vk::binding(16, 0)]] RWTexture2D<float4> normal_tex;
+[[vk::binding(16, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> normal_tex;
 
 // G-buffer: linear-RGB albedo at primary hit. Written when
 // denoiser_enabled != 0 by the SPIR-V/Vulkan path; consumed by the
@@ -129,7 +138,7 @@ Texture2D<float4> moon_map;
 // and on non-OptiX-AOV Vulkan dispatches) is the actual run-or-skip
 // switch; the engine binds a placeholder when albedo_tex_id_ is 0 to
 // satisfy descriptor validity.
-[[vk::binding(17, 0)]] RWTexture2D<float4> albedo_tex;
+[[vk::binding(17, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> albedo_tex;
 
 // Camera-ray cloud transmittance G-buffer (issue #46 follow-up).
 // Single-channel R32F, written by the path tracer's volumetric cloud
@@ -159,7 +168,7 @@ Texture2D<float4> moon_map;
 // declaration-on-both-targets rule as albedo_tex (see that field's
 // comment) -- excluding the declaration from one backend would shift
 // every subsequent texture slot.
-[[vk::binding(22, 0)]] RWTexture2D<float>  cloud_trans_tex;
+[[vk::binding(22, 0), vk::image_format("r32f")]] RWTexture2D<float>  cloud_trans_tex;
 
 // MetalFX specular-guidance G-buffers (issue #118). Apple's
 // MTLFXTemporalDenoisedScaler exposes three optional specular inputs --
@@ -200,7 +209,7 @@ Texture2D<float4> moon_map;
 // path; the host-side bind path is identical (storage image, same
 // VkDescriptorSet entry, same vk::binding number). Issue #118 / Slang
 // docs WTexture2D guidance: a2-03-wgsl-target-specific.md.
-[[vk::binding(24, 0)]] WTexture2D<float4> specular_albedo_tex;
+[[vk::binding(24, 0), vk::image_format("rgba16f")]] WTexture2D<float4> specular_albedo_tex;
 
 // roughness: linear surface roughness in [0, 1]. Single-channel.
 // 0 = perfect mirror, 1 = fully Lambertian. The path tracer's
@@ -211,7 +220,7 @@ Texture2D<float4> moon_map;
 // write 1.0 (fully rough -- MetalFX won't try to sharpen a specular
 // highlight in empty space). See specular_albedo_tex's comment for
 // the WTexture2D vs RWTexture2D rationale (Apple's 8-RW cap).
-[[vk::binding(25, 0)]] WTexture2D<float>  roughness_tex;
+[[vk::binding(25, 0), vk::image_format("r32f")]] WTexture2D<float>  roughness_tex;
 
 // specular_hit_distance: distance from the camera (in world units) to
 // the surface a reflection ray from the primary hit would land on.
@@ -234,7 +243,7 @@ Texture2D<float4> moon_map;
 // determines whether the perf cost is worth it.
 // Sky / no-hit pixels write 0 (no surface). See specular_albedo_tex's
 // comment for the WTexture2D vs RWTexture2D rationale.
-[[vk::binding(26, 0)]] WTexture2D<float>  specular_hit_distance_tex;
+[[vk::binding(26, 0), vk::image_format("r32f")]] WTexture2D<float>  specular_hit_distance_tex;
 
 // GPU-resident exposure scalar. Updated each frame by AutoExposure.slang
 // (when r_auto_exposure = 1) or written once by the engine via

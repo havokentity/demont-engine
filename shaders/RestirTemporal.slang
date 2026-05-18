@@ -56,9 +56,12 @@
 // Push: width/height + camera basis (to reconstruct hit_world from
 // depth + thread id) + light_count.
 
-[[vk::binding(0, 0)]] RWTexture2D<float>  depth_tex;
-[[vk::binding(1, 0)]] RWTexture2D<float2> motion_tex;
-[[vk::binding(2, 0)]] RWTexture2D<float4> normal_tex;
+// vk::image_format: depth_tex R32F, motion_tex RG16F, normal_tex
+// RGBA16F. See PathTrace.slang for the NVIDIA Format=Unknown
+// rationale.
+[[vk::binding(0, 0), vk::image_format("r32f")]]    RWTexture2D<float>  depth_tex;
+[[vk::binding(1, 0), vk::image_format("rg16f")]]   RWTexture2D<float2> motion_tex;
+[[vk::binding(2, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> normal_tex;
 [[vk::binding(3, 0)]]   StructuredBuffer<float4>  reservoir_curr_in;
 [[vk::binding(4, 0)]]   StructuredBuffer<float4>  reservoir_prev_in;
 [[vk::binding(5, 0)]] RWStructuredBuffer<float4>  reservoir_curr_out;
