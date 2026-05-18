@@ -983,9 +983,15 @@ final integration HEAD (`842df2e`) that goes into main:
   ```
 - **Three megakernel-gate PRs (commits `96a257c` + `a9e56ed` +
   `842df2e`):**
-  - PR #168 (water gate, `96a257c`) — `PT_WATER_ENABLED` default
-    OFF, excises MAT_WATER BRDF + 8-noise-tap wave-normal helper.
-    Recovers -2.99 ms/frame on water-less scenes.
+  - PR #168 (water gate, `96a257c`) — `PT_WATER_ENABLED` originally
+    landed default OFF (recovers -2.99 ms/frame on water-less
+    scenes via excising the MAT_WATER BRDF + 8-noise-tap
+    wave-normal helper). Flipped to default ON in a follow-up
+    fix because OFF rendered any `prim_plane ... water` material
+    (e.g. `water_pool.cfg`) as opaque black — the megakernel had
+    no MAT_WATER fallthrough. Power users / perf rigs flip it
+    back to OFF via `-DPT_WATER_ENABLED=OFF` if they don't use
+    water materials.
   - PR #169 (SDF Phase 2 gate, `a9e56ed`) — `PT_SDF_PROCEDURAL_OPS`
     + `PT_SDF_AUTODIFF` default OFF, excises the 862 LoC procedural
     + Dual3 autodiff helpers from `SdfPrimitives.slang`. Recovers
@@ -1004,10 +1010,19 @@ Total perf recovery (Mac-Metal default scene, 300 warmup + 3000
 measurement, two-point):
 - Main baseline: 8.18 ms/frame (122 fps)
 - Integration HEAD pre-fix: 22.62 ms/frame (44 fps)
-- Integration HEAD post-fix (`842df2e`, all gates default): ~11.5
-  ms/frame (~86 fps)
+- Integration HEAD post-fix (`842df2e`, all gates at their original
+  defaults): ~11.5 ms/frame (~86 fps)
 - Remaining gap vs main: ~3 ms/frame (~36 fps). Cause unknown;
   follow-up investigation queued.
+
+Note (water-gate flip): the original measurements above were taken
+with `PT_WATER_ENABLED=OFF`, which has since been flipped to default
+ON to fix the opaque-black water-surface regression. Builds taken
+at the current default give back roughly the original water-gate
+delta (`+2.99 ms/frame`) on the water-less default scene, putting
+the Mac-Metal default-scene baseline at ~14.5 ms/frame (~69 fps).
+Power users / perf bench rigs that don't use water can reclaim the
+saving via `-DPT_WATER_ENABLED=OFF`.
 
 ## How this guide was generated
 
