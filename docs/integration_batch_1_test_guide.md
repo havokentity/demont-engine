@@ -545,6 +545,49 @@ OBB primitive renders via reused analytic-sphere at bounding radius.
 No persistent contacts, no sleeping, no joints / motors / CCD / friction
 / restitution. No capsules.
 
+### PR #186 — r_phys_debug_visualize: colour rigid bodies by velocity (issue #181)
+
+**What:** Per-frame debug aid that overrides each physics-driven sphere's
+albedo to encode linear speed magnitude on a 3-stop linear-RGB ramp.
+Recovers speed from the implicit-velocity Verlet invariant
+`(curr_pos - prev_pos) / sdt` at the end of `Engine::StepPhysics`. Particles
+(Phase 1) and rigid bodies (Phase 2a) both participate. Angular speed on
+rigid bodies is intentionally NOT folded in -- the viz is for translational
+motion, so a tumbling-but-stationary body reads as blue. Original albedos
+are cached on first override and restored when the cvar transitions back
+to 0, so toggling on/off is non-destructive.
+
+**Speed -> colour mapping (linear-RGB):**
+- 0 m/s   -> blue   `(0.10, 0.30, 1.00)`
+- 5 m/s   -> green  `(0.20, 1.00, 0.30)`
+- 10+ m/s -> red    `(1.00, 0.20, 0.20)` (saturating above)
+
+**Cvars added:**
+- `r_phys_debug_visualize` (default `0`, `CVAR_NONE` -- per-invocation, never archived)
+
+**New console commands:** None.
+
+**Test fixtures:** Reuses `tests/goldens/scenes/phys_rb_smoke.cfg` /
+`phys_rb_smoke_late.cfg` -- enable the cvar interactively after `exec`-ing
+the fixture.
+
+**How to test:**
+1. `exec tests/goldens/scenes/phys_rb_smoke.cfg`
+2. `r_phys_debug_visualize 1` -- spheres recolour: blue when stationary,
+   green at moderate fall, red at peak descent (~10 m/s under default
+   gravity + damping).
+3. Watch them settle: as bodies hit the ground and lose energy they
+   transition red -> green -> blue.
+4. `r_phys_debug_visualize 0` -- albedos restore to whatever they were
+   before the viz was enabled.
+
+**Scope / known issues:** Pure debug aid; no perf budget claim. Mid-flight
+edits via `prim_albedo` while the viz is active are overwritten next frame
+and lost on toggle-off (the cache holds the albedo captured on first
+override). Box rigid bodies render as bounding spheres per Phase 2a, so
+the viz colours their bounding sphere; SAT-correct OBB primitive rendering
+is Phase 2b.
+
 ---
 
 ## Sky / Astronomy

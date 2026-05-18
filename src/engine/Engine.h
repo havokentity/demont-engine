@@ -446,6 +446,18 @@ private:
     std::uint64_t                               bvh_node_buffer_id_       = 0;
     std::uint32_t                               bvh_node_buffer_capacity_ = 0;  // nodes that fit
 
+    // Issue #181 -- per-prim albedo cache for the r_phys_debug_visualize
+    // debug aid. Keyed by AnalyticPrim id (the same key as `primitives_`).
+    // Populated lazily on first override (so a user who flips the cvar
+    // partway through a session captures whatever albedo was current at
+    // that moment, including subsequent prim_albedo edits made before
+    // the cvar was enabled). Cleared after restoration on the 1 -> 0
+    // transition so stale entries don't leak across sessions. The
+    // previous-frame cvar value is held in `phys_debug_visualize_prev_`
+    // so we can detect the falling edge.
+    std::map<std::uint32_t, std::array<float, 3>> phys_debug_color_cache_;
+    int                                           phys_debug_visualize_prev_ = 0;
+
     // --- SDF Phase 1 (#97) -------------------------------------------------
     // Signed-distance-field primitives. Independent of `primitives_` --
     // SDFs are a separate shader path (sphere-tracing inside a tight
