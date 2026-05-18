@@ -362,3 +362,109 @@ session.
   re-measuring on every Slang upgrade -- the link cost is the
   bottleneck and any improvement there directly raises the
   break-even point for further extraction.
+
+---
+
+## DONE: SDF Phase 3 fractal showcase (#99, landed 2026-05-18)
+
+Added Mandelbulb / Mandelbox / Apollonian-gasket distance estimators
+as a new fractal-leaf shape variant in the existing SDF cluster
+infrastructure. Lives in `shaders/SdfFractals.slang` as a separate
+Slang IR module so it links into PathTrace.spv (Vulkan) and
+PathTrace.metallib (Metal) the same way `SdfPrimitives.slang` does,
+but stays independent of the Phase 1 analytic SDF library.
+
+### Design tradeoffs
+
+**DE approximation vs exact analytic SDF.** Fractals don't have an
+exact closed-form distance. The DE we ship is a *lower bound* on the
+true distance, recovered by bounded iteration of the per-shape
+escape / fold formula plus the standard `escape-radius / derivative`
+estimator (Hart 1996, Iñigo Quilez "Distance to fractals"). Concrete
+consequences:
+
+1. **The sphere-trace `t += d` advance is still safe.** A lower
+   bound never overshoots the surface, so we don't tunnel through.
+2. **More iterations than analytic SDFs in deep-recursion regions.**
+   Each step covers less ground than an exact-SDF step of the same
+   nominal magnitude. The Phase 3 fixture bumps `r_sdf_max_iters`
+   from the default 128 to 192 for the showcase scene; the hard
+   shader-side ceiling is 512 in `traceSdfFractal` (vs 256 in
+   `sdfClusterTrace` for the analytic library).
+3. **Iteration-relaxed termination.** The issue spec calls for
+   `dist < eps * scale * iter_count` -- we accept a looser hit late
+   in the trace where the DE returns a vanishingly small (but
+   non-zero) distance step after step ("no progress"). The
+   `r_sdf_de_eps_scale` cvar controls the relaxation rate; default
+   1.0 reproduces the canonical formula and 0 falls back to the
+   constant-epsilon trace that matches analytic-SDF behaviour
+   exactly.
+4. **Central-difference normals.** Closed-form gradients don't
+   exist for these iterators. The fractal trace samples the DE four
+   times on a small tetrahedron around the hit point and recovers
+   the normal from the gradient. ~4 extra DE evals per hit; the
+   sampling step is `8 * iter_scaled_eps`, big enough to escape the
+   iteration-relaxed termination band, small enough that the
+   finite-difference error stays below the silhouette noise floor.
+
+**Per-shader noise expectations.** The issue explicitly accepts a
+silhouette-noise floor on fractal pixels -- it's the cost of having
+the visual capability at all. The showcase fixture
+(`tests/goldens/scenes/sdf_fractals.cfg`) renders at 1 spp and is
+expected to show visible per-pixel noise on fractal silhouettes,
+particularly the Mandelbulb's high-curvature thin regions and the
+Apollonian gasket's nested-sphere boundaries. Higher spp converges
+the noise per usual MC; the issue's acceptance criterion is
+"converges with spp" rather than "noise-free at 1 spp."
+
+### Architecture notes (for the next phase)
+
+- **Single-leaf fractal clusters only.** The Phase 3 GPU dispatcher
+  in `PathTrace.slang::traceSdfClusters` only handles single-leaf
+  fractal clusters -- it does NOT route fractals through the
+  smooth-CSG ops in `SdfPrimitives.slang`. Reason: those ops assume
+  exact-distance children, and the DE's approximate distance would
+  produce a wildly-overshooting blend. The host's `combine` helper
+  (in `RegisterSdfCommands`) rejects fractal-as-CSG-child at parse
+  time so the failure is loud.
+- **Wire-format extension.** The host `SdfShape` enum gained ids
+  6/7/8 (`SDF_SHAPE_MANDELBULB/MANDELBOX/APOLLONIAN`); see
+  `src/renderer/AnalyticBvh.h`. The shader-side `evalLeafDist` in
+  `SdfPrimitives.slang` is unmodified -- those shape ids fall
+  through its `if` chain and return `1e30`, but the new dispatcher
+  in `PathTrace.slang` intercepts them before that ever happens so
+  the unreachable-path is harmless.
+- **Push-constant lanes.** The fractal cvars consumed the reserved
+  lanes documented on the Phase 1 push block:
+  `sdf_params.w = r_sdf_fractal_iters`, `sdf_params_f.y =
+  r_sdf_fractal_power`, `sdf_params_f.z = r_sdf_de_eps_scale`. No
+  push-constant reshuffle required.
+- **Denoiser hook (#50).** The issue specifies "per-material
+  variance hint (REBLUR per-pixel hint)" and a motion-vector
+  approximation for fractal pixels. Both of those land WITH the NRD
+  integration in #50 -- the Phase 3 PR plumbs the DE-noise floor
+  but doesn't yet feed a per-material hint to NRD because NRD
+  itself isn't wired yet. When #50 lands, the cluster's material
+  field can carry a "high-variance" flag that REBLUR consumes.
+- **Wavefront PT (#76) payoff.** Fractal pixels are the worst case
+  for warp divergence in the path tracer: adjacent pixels can take
+  wildly different sphere-trace step counts. Wavefront PT recovers
+  most of the lost throughput because the divergent step-count
+  loop becomes one queue-and-drain per phase. The Phase 3 fixture
+  is a good A/B benchmark when #76 lands.
+
+### Out-of-scope for Phase 3 (queued)
+
+- **Mixed fractal + analytic CSG.** Smooth-union of a Mandelbulb
+  with a Phase 1 sphere would need a unified distance evaluator
+  that knew which child's distance was a lower bound vs exact.
+  Doable but not on the Phase 3 critical path.
+- **Animated fractal parameters.** `r_sdf_fractal_power` and per-
+  leaf `params[0]` are static today. Animating them per-frame is
+  free in principle (just a cvar tween or a host-side animation
+  hook) but the denoiser motion-vector path doesn't yet handle
+  topology-changing geometry.
+- **Menger sponge.** Listed as "possibly" in the issue scope; not
+  shipped in the Phase 3 MVP. Add a SHAPE_MENGER variant when
+  there's a real fixture asking for it -- the DE is a simple
+  scale-and-cross-fold and would slot in alongside Apollonian.

@@ -390,6 +390,57 @@ namespace cvar {
             "noise tuning.",
             0);
     // --- end SDF Phase 1 -------------------------------------------------------
+    // --- SDF Phase 3 (#99) fractal cvars ---------------------------------------
+    // Defaults match the issue spec. Three knobs:
+    //   r_sdf_fractal_power : default exponent for Mandelbulb (the
+    //       textbook polar-power formula). 8 is the canonical bulb.
+    //       Mandelbox / Apollonian reuse this slot only as a fallback
+    //       when their per-leaf params[0] is zero; in practice each
+    //       fractal has its own canonical scale (Mandelbox 2.5,
+    //       Apollonian 1.3) and the fixture should set those
+    //       explicitly via the sdf_mandelbox / sdf_apollonian
+    //       commands.
+    //   r_sdf_fractal_iters : per-DE bounded iteration count
+    //       (4..16 practical; 12 is a good Mandelbulb default).
+    //       Independent of r_sdf_max_iters (which caps sphere-trace
+    //       steps, not DE iterations).
+    //   r_sdf_de_eps_scale  : multiplies the iteration-relaxed
+    //       surface-epsilon (`eps * (1 + scale * step_idx)`) in the
+    //       fractal sphere-trace, per the issue's "dist < eps *
+    //       scale * iter_count" relaxation. 0 falls back to the
+    //       constant-epsilon trace (matches analytic-SDF behaviour);
+    //       higher = looser termination = fewer steps wasted in
+    //       deep-recursion no-progress areas at the cost of slightly
+    //       softer silhouettes far from camera.
+    PT_CVAR(r_sdf_fractal_power,      "8",
+            "Default polar exponent for the Mandelbulb DE (textbook "
+            "power-n formula). 8 is the canonical bulb; 2..16 are "
+            "practically interesting. Mandelbox / Apollonian fall "
+            "back to this only when their per-leaf params[0] is zero; "
+            "each has its own canonical scale (Mandelbox 2.5, "
+            "Apollonian 1.3) and the fixture should set those "
+            "explicitly via the sdf_mandelbox / sdf_apollonian "
+            "commands.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_sdf_fractal_iters,      "12",
+            "Per-DE bounded iteration count for fractal SDFs "
+            "(Mandelbulb / Mandelbox / Apollonian). Independent of "
+            "r_sdf_max_iters (which caps sphere-trace STEPS, not the "
+            "per-step DE iteration). 4..16 is the practical range; "
+            "12 captures fine bulb detail with sane perf. Clamped "
+            "to 1..32 in the host.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_sdf_de_eps_scale,       "1.0",
+            "Iteration-relaxed surface-epsilon scale for fractal "
+            "sphere-tracing. The fractal trace terminates when "
+            "dist < r_sdf_epsilon * (1 + r_sdf_de_eps_scale * step_idx) "
+            "so deep-recursion areas accept a slightly looser hit "
+            "rather than burning the full step budget on micro-"
+            "progress. 0 falls back to the constant-epsilon trace "
+            "(matches analytic-SDF behaviour). Higher = fewer wasted "
+            "steps but slightly softer silhouettes far from camera.",
+            CVAR_ARCHIVE);
+    // --- end SDF Phase 3 -------------------------------------------------------
     PT_CVAR(r_mis,             "1",
             "Multiple importance sampling for direct lighting on Lambert "
             "hits under HDRI. 1 = balance-heuristic MIS between env-map "
@@ -4181,23 +4232,31 @@ void Engine::RenderFrame() {
         //   .z/.w reserved for future BVH-side knobs (leaf size,
         //   builder selection).
         std::uint32_t bvh_params[4];
-        // --- SDF Phase 1 (#97) -------------------------------------------------
-        // SDF traversal params.
+        // --- SDF Phase 1 (#97) + Phase 3 (#99) ---------------------------------
+        // SDF traversal params (Phase 1 + Phase 3 fields, packed).
         //   .x = sdf_cluster_count -- number of SDF clusters in the
         //        sdf_clusters buffer. 0 disables the entire SDF path.
         //   .y = sdf_max_iters     -- r_sdf_max_iters cvar, clamped to
         //        1..256 on the host (the shader's hard upper bound).
+        //        Controls sphere-trace STEPS (analytic SDF + fractal),
+        //        NOT the per-DE-eval iteration count.
         //   .z = sdf_debug_iters   -- r_sdf_debug_iters cvar. 1 ->
         //        future iteration-count heat map; Phase 1 just plumbs
         //        the bit through so Phase 2 turns it on without a
         //        push-constant reshuffle.
-        //   .w reserved.
+        //   .w = sdf_fractal_iters -- r_sdf_fractal_iters cvar (Phase 3).
+        //        Per-DE bounded iteration count for the
+        //        Mandelbulb / Mandelbox / Apollonian iterators.
+        //        Independent of .y. Clamped 1..32 on the host.
         std::uint32_t sdf_params[4];
         // .x = r_sdf_epsilon (sphere-trace surface terminator, metres).
-        // .yzw reserved for future SDF-side knobs (LOD distance, normal
-        // bias, etc.).
+        // .y = r_sdf_fractal_power (Phase 3) -- default Mandelbulb
+        //      polar exponent; per-leaf params[0] overrides.
+        // .z = r_sdf_de_eps_scale (Phase 3) -- iteration-relaxed
+        //      surface-epsilon scale, `eps * (1 + scale*step_idx)`.
+        // .w reserved.
         float         sdf_params_f[4];
-        // --- end SDF Phase 1 ---------------------------------------------------
+        // --- end SDF Phase 1 + Phase 3 -----------------------------------------
         // Celestials composite gate (issue #46). 1 = peel
         // starsOnly + sunDisc + moonDisc OUT of the primary-miss sky
         // term so denoise_color stays celestial-free, then the engine's
@@ -4352,15 +4411,32 @@ void Engine::RenderFrame() {
         if (max_iters < 1)   max_iters = 1;
         if (max_iters > 256) max_iters = 256;     // shader clamps the same way
         if (epsilon   < 1e-7f) epsilon = 1e-7f;
+        // --- SDF Phase 3 (#99) fractal cvars -------------------------------
+        // Pack the three fractal knobs into the reserved push slots
+        // (sdf_params.w = iters, sdf_params_f.y = power default,
+        // sdf_params_f.z = de-eps scale). Phase 1's reserved lanes
+        // are now consumed; further additions need a new push block.
+        float  fractal_power     = 8.0f;
+        int    fractal_iters     = 12;
+        float  fractal_de_eps_sc = 1.0f;
+        if (auto* v = C.FindCVar("r_sdf_fractal_power"))   fractal_power     = v->GetFloat();
+        if (auto* v = C.FindCVar("r_sdf_fractal_iters"))   fractal_iters     = v->GetInt();
+        if (auto* v = C.FindCVar("r_sdf_de_eps_scale"))    fractal_de_eps_sc = v->GetFloat();
+        if (fractal_power < 2.0f)  fractal_power = 2.0f;     // power < 2 is degenerate
+        if (fractal_power > 64.0f) fractal_power = 64.0f;    // soft upper cap; shader handles arbitrary
+        if (fractal_iters < 1)     fractal_iters = 1;
+        if (fractal_iters > 32)    fractal_iters = 32;       // shader clamps the same way
+        if (fractal_de_eps_sc < 0.0f) fractal_de_eps_sc = 0.0f;
+        // --- end SDF Phase 3 -----------------------------------------------
         // Disable the entire SDF path when no clusters are active --
         // the shader's gate is sdf_params.x > 0.
         push.sdf_params[0] = sdf_cluster_count_;
         push.sdf_params[1] = static_cast<std::uint32_t>(max_iters);
         push.sdf_params[2] = (debug != 0) ? 1u : 0u;
-        push.sdf_params[3] = 0u;
+        push.sdf_params[3] = static_cast<std::uint32_t>(fractal_iters);
         push.sdf_params_f[0] = epsilon;
-        push.sdf_params_f[1] = 0.0f;
-        push.sdf_params_f[2] = 0.0f;
+        push.sdf_params_f[1] = fractal_power;
+        push.sdf_params_f[2] = fractal_de_eps_sc;
         push.sdf_params_f[3] = 0.0f;
     }
     // --- end SDF Phase 1 ---------------------------------------------------
@@ -9776,6 +9852,30 @@ void Engine::RegisterSdfCommands() {
         }
         const pt::renderer::SdfPrim& A = it_a->second;
         const pt::renderer::SdfPrim& B = it_b->second;
+        // --- SDF Phase 3 (#99) guard --------------------------------------
+        // Reject smooth-CSG combinations involving fractal leaves. The
+        // GPU dispatcher in PathTrace.slang only handles SINGLE-LEAF
+        // fractal clusters in Phase 3 (the smooth-CSG ops in
+        // SdfPrimitives.slang assume exact-distance leaves and would
+        // see the fractal DE's approximate distance as a wildly-
+        // overshooting child, producing a corrupted blend). Lifting
+        // the restriction is a future-future thing.
+        auto cluster_has_fractal = [](const pt::renderer::SdfPrim& p) {
+            for (std::uint32_t i = 0; i < p.node_count; ++i) {
+                if (p.nodes[i].op == pt::renderer::SDF_OP_LEAF &&
+                    pt::renderer::IsSdfFractalShape(p.nodes[i].shape)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (cluster_has_fractal(A) || cluster_has_fractal(B)) {
+            out.FormatLine("sdf_{}: fractal SDF leaves cannot participate in "
+                           "smooth-CSG ops in Phase 3 (issue #99 scope-out)",
+                           tag);
+            return;
+        }
+        // --- end SDF Phase 3 ---
         if (A.node_count + B.node_count + 1 > pt::renderer::SdfPrim::kMaxNodes) {
             out.FormatLine("sdf_{}: combined node count {} exceeds kMaxNodes={}",
                            tag, A.node_count + B.node_count + 1,
@@ -9884,6 +9984,128 @@ void Engine::RegisterSdfCommands() {
             }
             combine(id, a, b, k, pt::renderer::SDF_OP_SMOOTH_SUBTRACT, mat, cr, cg, cb, out, "sdiff");
         });
+
+    // --- SDF Phase 3 (#99) fractal leaves ----------------------------------
+    //
+    // Three iconic-fractal commands. Each adds a SINGLE-LEAF cluster
+    // whose `params[0]` is the per-shape scale knob (Mandelbulb's
+    // polar exponent, Mandelbox's linear-step scale, Apollonian's
+    // radial-shrink scale) and `params[1]` is the world-space effective
+    // bound radius (the host AABB is a cube of side 2*params[1]).
+    // Cluster shading goes through the same Lambert / Metal /
+    // Dielectric material pipeline as the analytic SDF leaves above
+    // -- the BSDF / NEE / denoiser don't care which side of the
+    // shader the hit came from.
+    //
+    // Per the issue spec, fractals can't be combined into smooth-CSG
+    // ops in Phase 3 (they're whole-cluster shapes; the `combine`
+    // helper above rejects them at the host level because the GPU
+    // dispatcher in PathTrace.slang only handles SINGLE-LEAF fractal
+    // clusters). The path-of-least-surprise here is also to make the
+    // host refuse: a future phase can lift the restriction once
+    // mixed-CSG cluster traversal is in.
+
+    C.RegisterCommand("sdf_mandelbulb",
+        "sdf_mandelbulb <id> <power> <bound> <x> <y> <z> <material> <r> <g> <b>: "
+        "add a Mandelbulb fractal SDF leaf. power=8 is canonical; bound is "
+        "the cluster AABB half-extent in metres (1.2 fits the textbook bulb).",
+        [add_leaf](auto args, pt::console::Output& out) {
+            if (args.size() != 10) {
+                out.PrintLine("usage: sdf_mandelbulb <id> <power> <bound> <x> <y> <z> <material> <r> <g> <b>");
+                return;
+            }
+            std::uint32_t id, mat;
+            float power, bound, x, y, z, r, g, b;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], power) || !ParseFloat(args[2], bound) ||
+                !ParseFloat(args[3], x) || !ParseFloat(args[4], y) || !ParseFloat(args[5], z) ||
+                !ParseSdfMaterial(args[6], mat) ||
+                !ParseFloat(args[7], r) || !ParseFloat(args[8], g) || !ParseFloat(args[9], b)) {
+                out.PrintLine("sdf_mandelbulb: arg parse failed");
+                return;
+            }
+            // power=0 is the "use r_sdf_fractal_power cvar default"
+            // sentinel; below 0 is meaningless. Bound must be > 0
+            // because LeafLocalAabb refuses a non-positive bound (else
+            // the cube degenerates and the AABB slab test rejects
+            // every ray).
+            if (power < 0.0f) {
+                out.FormatLine("sdf_mandelbulb: power must be >= 0 (got {})", power);
+                return;
+            }
+            if (bound <= 0.0f) {
+                out.FormatLine("sdf_mandelbulb: bound must be > 0 (got {})", bound);
+                return;
+            }
+            add_leaf(id, pt::renderer::SDF_SHAPE_MANDELBULB,
+                     {power, bound, 0.0f, 0.0f}, x, y, z, mat, r, g, b, out, "mandelbulb");
+        });
+
+    C.RegisterCommand("sdf_mandelbox",
+        "sdf_mandelbox <id> <scale> <bound> <x> <y> <z> <material> <r> <g> <b>: "
+        "add a Mandelbox fractal SDF leaf. scale=2.5 is canonical; bound is "
+        "the cluster AABB half-extent (4.0 typically fits the limit set).",
+        [add_leaf](auto args, pt::console::Output& out) {
+            if (args.size() != 10) {
+                out.PrintLine("usage: sdf_mandelbox <id> <scale> <bound> <x> <y> <z> <material> <r> <g> <b>");
+                return;
+            }
+            std::uint32_t id, mat;
+            float scale, bound, x, y, z, r, g, b;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], scale) || !ParseFloat(args[2], bound) ||
+                !ParseFloat(args[3], x) || !ParseFloat(args[4], y) || !ParseFloat(args[5], z) ||
+                !ParseSdfMaterial(args[6], mat) ||
+                !ParseFloat(args[7], r) || !ParseFloat(args[8], g) || !ParseFloat(args[9], b)) {
+                out.PrintLine("sdf_mandelbox: arg parse failed");
+                return;
+            }
+            // scale=0 maps to the r_sdf_fractal_power cvar fallback;
+            // negative is meaningless (the linear-step magnitude has
+            // to be a positive contraction for the DE to terminate).
+            if (scale < 0.0f) {
+                out.FormatLine("sdf_mandelbox: scale must be >= 0 (got {})", scale);
+                return;
+            }
+            if (bound <= 0.0f) {
+                out.FormatLine("sdf_mandelbox: bound must be > 0 (got {})", bound);
+                return;
+            }
+            add_leaf(id, pt::renderer::SDF_SHAPE_MANDELBOX,
+                     {scale, bound, 0.0f, 0.0f}, x, y, z, mat, r, g, b, out, "mandelbox");
+        });
+
+    C.RegisterCommand("sdf_apollonian",
+        "sdf_apollonian <id> <scale> <bound> <x> <y> <z> <material> <r> <g> <b>: "
+        "add an Apollonian-gasket fractal SDF leaf. scale=1.3 is canonical; "
+        "bound is the cluster AABB half-extent (2.0 typically fits the limit set).",
+        [add_leaf](auto args, pt::console::Output& out) {
+            if (args.size() != 10) {
+                out.PrintLine("usage: sdf_apollonian <id> <scale> <bound> <x> <y> <z> <material> <r> <g> <b>");
+                return;
+            }
+            std::uint32_t id, mat;
+            float scale, bound, x, y, z, r, g, b;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], scale) || !ParseFloat(args[2], bound) ||
+                !ParseFloat(args[3], x) || !ParseFloat(args[4], y) || !ParseFloat(args[5], z) ||
+                !ParseSdfMaterial(args[6], mat) ||
+                !ParseFloat(args[7], r) || !ParseFloat(args[8], g) || !ParseFloat(args[9], b)) {
+                out.PrintLine("sdf_apollonian: arg parse failed");
+                return;
+            }
+            if (scale < 0.0f) {
+                out.FormatLine("sdf_apollonian: scale must be >= 0 (got {})", scale);
+                return;
+            }
+            if (bound <= 0.0f) {
+                out.FormatLine("sdf_apollonian: bound must be > 0 (got {})", bound);
+                return;
+            }
+            add_leaf(id, pt::renderer::SDF_SHAPE_APOLLONIAN,
+                     {scale, bound, 0.0f, 0.0f}, x, y, z, mat, r, g, b, out, "apollonian");
+        });
+    // --- end SDF Phase 3 ---------------------------------------------------
 }
 // --- end SDF Phase 1 -------------------------------------------------------
 

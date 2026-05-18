@@ -547,25 +547,32 @@ cbuffer Push {
     //        scan was O(N) per ray and crushed framerate on Mac-Vulkan;
     //        the BVH walk is O(log N).
     uint4 bvh_params;
-    // --- SDF Phase 1 (#97) -------------------------------------------------
+    // --- SDF Phase 1 (#97) + Phase 3 (#99) ---------------------------------
     // SDF traversal params. See Engine.cpp's PtPush::sdf_params for full
     // docs.
     //   .x = sdf_cluster_count -- number of SDF clusters in
     //        `sdf_clusters`. 0 disables the SDF path entirely.
-    //   .y = sdf_max_iters     -- sphere-trace iteration cap per
-    //        cluster (host cvar r_sdf_max_iters, default 128, clamped
-    //        to 1..256 on the host).
+    //   .y = sdf_max_iters     -- sphere-trace STEP cap per cluster
+    //        (host cvar r_sdf_max_iters, default 128, clamped to
+    //        1..256 on the host). Applies to both analytic SDF and
+    //        fractal clusters.
     //   .z = sdf_debug_iters   -- 1 -> output an iteration heat-map
     //        instead of normal shading for diagnostics. Phase 1 leaves
     //        the heat-map plumbed but not yet visualized; the field is
     //        wired so Phase 2 / fractal tuning can switch it on without
     //        a push-constant reshuffle.
-    //   .w reserved.
+    //   .w = sdf_fractal_iters -- Phase 3, per-DE bounded iteration
+    //        count for fractal SDFs. Independent of .y. Clamped 1..32
+    //        on host.
     uint4 sdf_params;
     // .x = r_sdf_epsilon (sphere-trace surface-distance terminator,
-    //      metres). Default 1e-4. .yzw reserved.
+    //      metres). Default 1e-4.
+    // .y = r_sdf_fractal_power (Phase 3, default Mandelbulb power 8).
+    // .z = r_sdf_de_eps_scale (Phase 3, iteration-relaxed eps scale,
+    //      default 1.0).
+    // .w reserved.
     float4 sdf_params_f;
-    // --- end SDF Phase 1 ---------------------------------------------------
+    // --- end SDF Phase 1 + Phase 3 -----------------------------------------
     // Celestials composite gate (issue #46). 1 = subtract
     // starsOnly(rd) + sunDisc(rd) + moonDisc(rd) from the b==0
     // primary-miss sky term so denoise_color reaches SVGF/MetalFX
@@ -660,11 +667,13 @@ cbuffer Frame {
     float4 accum_params;
     // See `bvh_params` in the Metal Push cbuffer above.
     uint4 bvh_params;
-    // --- SDF Phase 1 (#97) -------------------------------------------------
+    // --- SDF Phase 1 (#97) + Phase 3 (#99) ---------------------------------
     // See `sdf_params` / `sdf_params_f` in the Metal Push cbuffer above.
+    // .w of uint4 is sdf_fractal_iters; .yz of float4 are
+    // r_sdf_fractal_power / r_sdf_de_eps_scale.
     uint4  sdf_params;
     float4 sdf_params_f;
-    // --- end SDF Phase 1 ---------------------------------------------------
+    // --- end SDF Phase 1 + Phase 3 -----------------------------------------
     // See `composite_celestials` in the Metal Push cbuffer above.
     uint composite_celestials;
     uint _pad_celestials0;
@@ -702,6 +711,16 @@ import PathTraceMath;
 // PathTrace.slang iterations don't re-parse it.
 import SdfPrimitives;
 // --- end SDF Phase 1 -------------------------------------------------------
+// --- SDF Phase 3 (#99) -----------------------------------------------------
+// Iconic-fractal DE library (Mandelbulb / Mandelbox / Apollonian).
+// Lives in its own module because the trace path is shape-specific
+// (no smooth-CSG composition with analytic shapes in Phase 3) and
+// normals are recovered by central differences instead of the
+// analytic gradient. traceSdfClusters below dispatches to
+// traceSdfFractal when a single-leaf cluster carries a fractal shape
+// id (>= SDF_FRACTAL_FIRST).
+import SdfFractals;
+// --- end SDF Phase 3 -------------------------------------------------------
 
 static const uint MAT_LAMBERT    = 0u;
 static const uint MAT_METAL      = 1u;
@@ -818,15 +837,70 @@ SdfCluster loadSdfCluster(uint cluster_idx) {
 // any closer hit found. Linear scan -- Phase 1 expects <= 8 clusters,
 // per the issue's perf budget. A future phase will fold this into the
 // analytic-prim BVH as a third leaf-shape tag.
+//
+// Phase 3 (#99): dispatches fractal-leaf clusters to traceSdfFractal
+// (SdfFractals.slang). A cluster is treated as a fractal when its
+// root LEAF node carries a shape id >= SDF_FRACTAL_FIRST. The
+// dispatcher only handles single-leaf fractal clusters; mixed
+// fractal/analytic CSG compositions are scope-out for Phase 3 and
+// the host's `combine` helper rejects them at parse time.
 void traceSdfClusters(float3 ro, float3 rd, inout HitInfo h) {
     uint count = sdf_params.x;
     if (count == 0u) return;
     uint  iter_budget = sdf_params.y;
     float epsilon     = sdf_params_f.x;
+    // --- SDF Phase 3 (#99) cvar unpack -------------------------------------
+    // Fractal-side knobs live in the otherwise-reserved push lanes;
+    // see the Push cbuffer above for the wire convention.
+    uint  fractal_iters    = max(sdf_params.w, 1u);
+    float fractal_power    = sdf_params_f.y;
+    float fractal_de_eps_s = sdf_params_f.z;
+    // --- end SDF Phase 3 ---------------------------------------------------
     for (uint i = 0u; i < count; ++i) {
         SdfCluster c = loadSdfCluster(i);
         float t;
         float3 n;
+        // --- SDF Phase 3 (#99) fractal dispatch ----------------------------
+        // Check the root node (last in post-order) to decide which
+        // trace path to take. A single-leaf cluster (node_count == 1)
+        // whose shape id is in the fractal range goes through the
+        // Phase 3 fractal trace; everything else takes the analytic
+        // path. node_count==0 is a malformed cluster -- the analytic
+        // path's sphereCluster trace returns no-hit so the cluster is
+        // skipped harmlessly.
+        bool is_fractal = false;
+        if (c.node_count > 0u) {
+            SdfClusterNode root = c.nodes[c.node_count - 1u];
+            is_fractal = (root.op == SDF_OP_LEAF) &&
+                         (root.shape >= SDF_FRACTAL_FIRST);
+        }
+        if (is_fractal) {
+            SdfClusterNode root = c.nodes[c.node_count - 1u];
+            // root.center is in cluster-local space (the host packs
+            // the per-node translation into n.center, and Phase 3
+            // fractal leaves use it as the world-space cluster origin).
+            // The cluster AABB is in world space (host already widened
+            // it by params[1] in LeafLocalAabb), so we feed the world
+            // AABB straight through.
+            if (traceSdfFractal(root.shape, root.params, root.center,
+                                c.aabb_min, c.aabb_max,
+                                ro, rd, 1e-3, h.t,
+                                iter_budget, epsilon, fractal_de_eps_s,
+                                fractal_power, fractal_iters,
+                                t, n)) {
+                if (t < h.t) {
+                    h.hit       = true;
+                    h.t         = t;
+                    h.normal    = n;
+                    h.mat       = c.material;
+                    h.albedo    = c.albedo;
+                    h.roughness = c.roughness;
+                    h.ior       = c.ior;
+                }
+            }
+            continue;
+        }
+        // --- end SDF Phase 3 -----------------------------------------------
         // t_min = 1e-3 keeps the start past the camera plane;
         // t_max = h.t bounds the trace to the current closest hit so
         // an SDF cluster behind an existing closer hit short-circuits.

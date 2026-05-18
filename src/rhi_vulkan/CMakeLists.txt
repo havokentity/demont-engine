@@ -73,10 +73,14 @@ pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTraceCloud.slang)
 # Analytic SDF library; same compile-module pattern.
 pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/SdfPrimitives.slang)
 # --- end SDF Phase 1 -------------------------------------------------------
+# --- SDF Phase 3 (#99) -----------------------------------------------------
+# Iconic-fractal DE library (Mandelbulb / Mandelbox / Apollonian).
+pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/SdfFractals.slang)
+# --- end SDF Phase 3 -------------------------------------------------------
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
     STAGE compute ENTRY main TARGETS spirv
-    MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives)
+    MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals)
 # Second PathTrace SPIR-V variant without RayQuery, for backends that
 # don't expose VK_KHR_ray_query (Mac-Vulkan on pre-1.3 MoltenVK builds).
 # The two variants share the source file; PT_SPIRV_NO_RAYQUERY strips
@@ -88,7 +92,7 @@ pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
     STAGE compute ENTRY main TARGETS spirv
     VARIANT norq EXTRA_DEFINES -DPT_SPIRV_NO_RAYQUERY
-    MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives)
+    MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals)
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/Tonemap.slang
     STAGE compute ENTRY main TARGETS spirv)
