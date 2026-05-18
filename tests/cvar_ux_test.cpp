@@ -515,3 +515,85 @@ TEST_CASE("smart resolve: disabled via r_console_smart_resolve = 0") {
     // Restore.
     CHECK(C.Execute("r_console_smart_resolve 1").ok);
 }
+
+// --- on_change firing through Console::Execute ----------------------------
+// Pins the dispatch mechanism that backs the pt_smoke_late_exec
+// runtime fire-and-forget (Engine.cpp install around the
+// "pt_smoke_late_exec runtime fire-and-forget" comment) -- when a
+// cvar gets a value via Console::Execute (which is how interactive
+// console input arrives), the cvar's on_change lambda MUST fire with
+// the new value, so an installed handler can react. Without this the
+// runtime `exec phys_rb_smoke.cfg` workflow that sets
+// pt_smoke_late_exec at runtime would silently no-op.
+TEST_CASE("cvar on_change: fires on Console::Execute set with new value") {
+    auto& C = pt::console::Console::Get();
+
+    C.RegisterCVar("test_ux_oc_target", "",
+                   "on_change witness", pt::console::CVAR_NONE);
+    auto* v = C.FindCVar("test_ux_oc_target");
+    REQUIRE(v != nullptr);
+
+    int   fire_count = 0;
+    std::string captured;
+    v->on_change = [&](const pt::console::CVar& cv) {
+        ++fire_count;
+        captured = cv.value;
+    };
+
+    // Set via the same code path interactive console input uses.
+    CHECK(C.Execute("test_ux_oc_target hello").ok);
+    CHECK(fire_count == 1);
+    CHECK(captured  == "hello");
+
+    // Subsequent set fires again, capturing the latest value.
+    CHECK(C.Execute("test_ux_oc_target world").ok);
+    CHECK(fire_count == 2);
+    CHECK(captured  == "world");
+
+    // Setting to the EXISTING value should still fire (no de-dup at
+    // the dispatch layer -- handlers that care about identity-equality
+    // implement their own filter, the way Engine's pt_smoke_late_exec
+    // handler skips on empty string). This pin documents the
+    // "dispatch always fires" contract.
+    CHECK(C.Execute("test_ux_oc_target world").ok);
+    CHECK(fire_count == 3);
+
+    // Clear the handler so a later test in the same TU isn't poisoned.
+    v->on_change = nullptr;
+}
+
+// --- on_change re-entrancy: handler can set OTHER cvars without locking ---
+// Pins that a handler that calls back into Console (e.g. ExecuteScript
+// in pt_smoke_late_exec) doesn't deadlock or corrupt the in-flight
+// command. The re-entrancy guard lives in the handler itself (see the
+// `static thread_local bool in_late_exec` pattern in Engine.cpp), not
+// in Console -- so this test confirms Console's set path is re-entrant.
+TEST_CASE("cvar on_change: handler can issue further Console::Execute calls") {
+    auto& C = pt::console::Console::Get();
+
+    C.RegisterCVar("test_ux_reentrant_a", "",
+                   "outer cvar", pt::console::CVAR_NONE);
+    C.RegisterCVar("test_ux_reentrant_b", "",
+                   "inner cvar set from outer's handler",
+                   pt::console::CVAR_NONE);
+
+    auto* a = C.FindCVar("test_ux_reentrant_a");
+    REQUIRE(a != nullptr);
+
+    a->on_change = [&](const pt::console::CVar& cv) {
+        // Mirror outer value into inner cvar from within the handler.
+        // This is the dispatch shape pt_smoke_late_exec uses
+        // (handler -> Console::ExecuteScript -> nested command).
+        std::string cmd = "test_ux_reentrant_b ";
+        cmd += cv.value;
+        C.Execute(cmd);
+    };
+
+    CHECK(C.Execute("test_ux_reentrant_a propagated").ok);
+
+    auto* b = C.FindCVar("test_ux_reentrant_b");
+    REQUIRE(b != nullptr);
+    CHECK(b->value == "propagated");
+
+    a->on_change = nullptr;
+}
