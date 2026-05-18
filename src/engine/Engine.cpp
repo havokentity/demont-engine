@@ -177,11 +177,18 @@ namespace cvar {
     PT_CVAR(pt_smoke_late_exec, "",
             "Path to a console-script .cfg fixture exec'd AFTER "
             "SeedDefaultCsgScene + SeedDefaultPrimitives + console "
-            "command registration. Use this for CSG / prim / SDF "
-            "commands that need csg_scene_ + the seeded sets to exist "
-            "first. Same strict-failure semantics as pt_smoke_exec "
-            "(read failure / parse error aborts Init). NOT "
-            "CVAR_ARCHIVE -- per-invocation.",
+            "command registration. Use this for CSG / prim / SDF / "
+            "phys_drop_* commands that need csg_scene_ + the seeded "
+            "sets + PhysicsSystem to exist first. Same strict-failure "
+            "semantics as pt_smoke_exec (read failure / parse error "
+            "aborts Init) during the Init-time read. AFTER Init "
+            "completes, setting this cvar at runtime (e.g. via "
+            "interactive `exec phys_rb_smoke.cfg`) fires an on_change "
+            "handler that loads + executes the script immediately -- "
+            "so a fixture cfg that uses pt_smoke_late_exec works both "
+            "in --smoke-exec=... CLI mode and in interactive console "
+            "exec. Re-entrant sets from inside a late-exec script are "
+            "ignored with a warning. NOT CVAR_ARCHIVE -- per-invocation.",
             CVAR_NONE);
     // --- end SDF Phase 1 -------------------------------------------------------
     PT_CVAR(con_font_scale, "1.0",
@@ -1161,6 +1168,55 @@ bool Engine::Init() {
 
     RegisterCommands();
 
+    // pt_smoke_late_exec runtime fire-and-forget. During Init() the
+    // end-of-Init read block (search for "Late smoke-exec hook" below)
+    // reads the cvar once after all engine init is done. Without this
+    // on_change wiring, an interactive `exec phys_rb_smoke.cfg` issued
+    // at the console AFTER init completes would just set the cvar's
+    // value and silently no-op -- nothing would read it. Wire an
+    // on_change handler that runs the script immediately, but ONLY
+    // after engine_initialized_ has been latched true (so we don't
+    // double-fire during the demont.cfg/autoexec.cfg/pt_smoke_exec
+    // load sequence below where the end-of-Init block handles things).
+    // Re-entry guard prevents infinite loops if a late-exec script
+    // itself sets pt_smoke_late_exec.
+    if (auto* lx = pt::console::Console::Get().FindCVar("pt_smoke_late_exec")) {
+        lx->on_change = [this](const pt::console::CVar& cv) {
+            if (!engine_initialized_) return;
+            if (cv.value.empty())     return;
+            static thread_local bool in_late_exec = false;
+            if (in_late_exec) {
+                LOG_WARN("pt_smoke_late_exec: re-entrant set ignored ('{}')", cv.value);
+                return;
+            }
+            in_late_exec = true;
+            struct Guard { bool& f; ~Guard(){ f = false; } } g{in_late_exec};
+
+            FILE* lf = std::fopen(cv.value.c_str(), "rb");
+            if (lf == nullptr) {
+                LOG_ERROR("pt_smoke_late_exec: '{}' not found", cv.value);
+                return;
+            }
+            std::string lbody; char lbuf[4096];
+            while (auto ln = std::fread(lbuf, 1, sizeof(lbuf), lf)) lbody.append(lbuf, ln);
+            const bool lread_err = (std::ferror(lf) != 0);
+            std::fclose(lf);
+            if (lread_err) {
+                LOG_ERROR("pt_smoke_late_exec '{}': read error", cv.value);
+                return;
+            }
+            auto& Cl = pt::console::Console::Get();
+            Cl.SetSuppressDepWarnings(true);
+            auto lr = Cl.ExecuteScript(lbody);
+            Cl.SetSuppressDepWarnings(false);
+            if (!lr.ok) {
+                LOG_ERROR("pt_smoke_late_exec '{}': {}", cv.value, lr.error);
+                return;
+            }
+            LOG_INFO("loaded late-exec fixture {} (interactive)", cv.value);
+        };
+    }
+
     // Physical lens-flare init. Trace ghost paths for the canonical
     // lens once at startup -- the matrices are independent of frame
     // state so this is amortised across the whole run. Per-frame the
@@ -1531,6 +1587,11 @@ bool Engine::Init() {
     }
     // --- end SDF Phase 1 -------------------------------------------------------
 
+    // Latch BEFORE the success log so any subsequent runtime write to
+    // pt_smoke_late_exec via interactive `exec` triggers the on_change
+    // handler installed near the top of Init() (search for
+    // "pt_smoke_late_exec runtime fire-and-forget").
+    engine_initialized_ = true;
     LOG_INFO("Engine initialized.");
     return true;
 }

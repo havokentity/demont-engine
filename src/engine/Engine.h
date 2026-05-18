@@ -985,6 +985,14 @@ private:
     // a single user-issued `r_sky_city` change emits one warn (for the
     // city itself), not three (city + lat + lon).
     bool                                        astro_chained_update_  = false;
+    // Set true by Init() right before it returns. Used by the
+    // pt_smoke_late_exec on_change handler to know whether the
+    // existing end-of-Init read at line ~1508 has already handled the
+    // current value (init path) or whether the cvar set is a runtime
+    // interactive write that needs immediate execution (post-init
+    // path -- e.g. user typed `exec tests/goldens/scenes/phys_rb_smoke.cfg`
+    // at the console after init was done).
+    bool                                        engine_initialized_    = false;
     bool                                        accum_dirty_           = true;
     BackendType                                 current_backend_       = BackendType::None;
     bool                                        mouse_look_active_     = false;
