@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 
 namespace pt::renderer {
@@ -163,6 +164,92 @@ bool NodeAabb(const SdfPrim& prim, std::uint32_t idx,
             widen(mn, mx, std::abs(n.params[0]));
             return true;
         }
+        // --- SDF Phase 2 (#98) procedural / noise / domain ops -------------
+        case SDF_OP_DISPLACE_NOISE: {
+            // Noise band is centred in [-amp, +amp]. Widen the child's
+            // AABB by amp so the displaced surface stays inside the
+            // bound -- the trace's slab test is the only thing
+            // preventing wasted iterations on empty space.
+            float amn[3], amx[3];
+            if (!NodeAabb(prim, n.child_a, amn, amx)) return false;
+            for (int i = 0; i < 3; ++i) { mn[i] = amn[i]; mx[i] = amx[i]; }
+            widen(mn, mx, std::abs(n.params[0]));
+            return true;
+        }
+        case SDF_OP_TWIST:
+        case SDF_OP_BEND: {
+            // Twist / bend rotate the child's local frame. The exact
+            // worst-case extent is hard to express without a per-axis
+            // arc tracing; we conservatively widen to a ball that
+            // contains all rotations of the child's AABB about its
+            // own centre (rotation never moves points farther than
+            // the AABB's half-diagonal from the original surface).
+            // This is a true superset by construction.
+            float amn[3], amx[3];
+            if (!NodeAabb(prim, n.child_a, amn, amx)) return false;
+            float cx = 0.5f * (amn[0] + amx[0]);
+            float cy = 0.5f * (amn[1] + amx[1]);
+            float cz = 0.5f * (amn[2] + amx[2]);
+            float ex = 0.5f * (amx[0] - amn[0]);
+            float ey = 0.5f * (amx[1] - amn[1]);
+            float ez = 0.5f * (amx[2] - amn[2]);
+            float r = std::sqrt(ex * ex + ey * ey + ez * ez);
+            mn[0] = cx - r; mx[0] = cx + r;
+            mn[1] = cy - r; mx[1] = cy + r;
+            mn[2] = cz - r; mx[2] = cz + r;
+            return true;
+        }
+        case SDF_OP_REPEAT: {
+            // Infinite domain repetition. The surface tiles space
+            // forever, so no finite AABB is conservatively correct
+            // for the full repeat. The host wraps this with a
+            // SDF_OP_REPEAT_LIMITED (or carves it via a parent
+            // smooth-intersect with a finite box) in practice. As a
+            // fallback for an explicit infinite repeat, we cap the
+            // bound at +/-1000 m on each axis where the period is
+            // non-zero -- well past the typical scene extent. The
+            // engine logs a warning when this fallback fires.
+            float amn[3], amx[3];
+            if (!NodeAabb(prim, n.child_a, amn, amx)) return false;
+            for (int i = 0; i < 3; ++i) {
+                if (n.params[i] > 1e-6f) {
+                    mn[i] = -1000.0f;
+                    mx[i] =  1000.0f;
+                } else {
+                    mn[i] = amn[i];
+                    mx[i] = amx[i];
+                }
+            }
+            return true;
+        }
+        case SDF_OP_REPEAT_LIMITED: {
+            // Bounded repetition. Cell count = 2 * limit + 1 on each
+            // axis (cells run from -limit to +limit inclusive). Each
+            // cell is the child's bound translated by k * period.
+            float amn[3], amx[3];
+            if (!NodeAabb(prim, n.child_a, amn, amx)) return false;
+            // Decode the packed int3 limit from params[3]. Same
+            // 10-bit lane layout as the shader.
+            std::uint32_t packed{};
+            std::memcpy(&packed, &n.params[3], sizeof(float));
+            int lim[3] = {
+                int( packed         & 0x3ffu),
+                int((packed >> 10) & 0x3ffu),
+                int((packed >> 20) & 0x3ffu),
+            };
+            for (int i = 0; i < 3; ++i) {
+                if (n.params[i] > 1e-6f) {
+                    float span = float(lim[i]) * n.params[i];
+                    mn[i] = amn[i] - span;
+                    mx[i] = amx[i] + span;
+                } else {
+                    mn[i] = amn[i];
+                    mx[i] = amx[i];
+                }
+            }
+            return true;
+        }
+        // --- end SDF Phase 2 ----------------------------------------------
     }
     return false;
 }

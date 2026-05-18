@@ -384,6 +384,33 @@ namespace cvar {
             "noise tuning.",
             0);
     // --- end SDF Phase 1 -------------------------------------------------------
+    // --- SDF Phase 2 (#98) -----------------------------------------------------
+    PT_CVAR(r_sdf_normal_mode,        "0",
+            "SDF cluster normal evaluation mode: 0 = forward-mode "
+            "autodiff (default; one walk of the op-tree, gradient via "
+            "Dual3 chain rule, ~1.5x distance-eval cost), 1 = 6-tap "
+            "central differences (legacy / sanity check; 6x distance-"
+            "eval cost). Only affects clusters that contain Phase 2 "
+            "procedural ops (sdf_displace_noise / sdf_twist / sdf_bend "
+            "/ sdf_repeat / sdf_repeat_limited) -- Phase 1 (sphere / "
+            "box / smin / ...) always uses the closed-form analytic "
+            "gradient regardless of this setting. Forward-AD is "
+            "continuous in space (no epsilon-jitter that re-rolls per "
+            "bounce -- a variance reducer for the PT) and beats central "
+            "differences once DE complexity rises.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_sdf_displace_octaves,   "4",
+            "Default FBM octave count for sdf_displace_noise. Clamped "
+            "to 1..6 on the host (the shader's unroll bound). Higher = "
+            "more detail at the cost of N noise lookups per distance "
+            "eval. Each octave doubles the frequency and halves the "
+            "amplitude, so 6 covers ~32 m -> ~3 cm spatial range from a "
+            "base frequency of 1 / metre. Per-cluster overrides go via "
+            "the sdf_displace_noise console command's octaves arg; this "
+            "cvar is just the default the command uses when the user "
+            "omits the octaves field.",
+            CVAR_ARCHIVE);
+    // --- end SDF Phase 2 -------------------------------------------------------
     PT_CVAR(r_mis,             "1",
             "Multiple importance sampling for direct lighting on Lambert "
             "hits under HDRI. 1 = balance-heuristic MIS between env-map "
@@ -3859,29 +3886,33 @@ void Engine::RenderFrame() {
             ? tri_bvh_node_count_
             : 0u;
     }
-    // --- SDF Phase 1 (#97) -------------------------------------------------
+    // --- SDF Phase 1 (#97) + Phase 2 (#98) ---------------------------------
     {
-        int    max_iters = 128;
-        float  epsilon   = 1e-4f;
-        int    debug     = 0;
-        if (auto* v = C.FindCVar("r_sdf_max_iters"))   max_iters = v->GetInt();
-        if (auto* v = C.FindCVar("r_sdf_epsilon"))     epsilon   = v->GetFloat();
-        if (auto* v = C.FindCVar("r_sdf_debug_iters")) debug     = v->GetInt();
+        int    max_iters   = 128;
+        float  epsilon     = 1e-4f;
+        int    debug       = 0;
+        int    normal_mode = 0;     // Phase 2: forward-AD (0) or central (1)
+        if (auto* v = C.FindCVar("r_sdf_max_iters"))   max_iters   = v->GetInt();
+        if (auto* v = C.FindCVar("r_sdf_epsilon"))     epsilon     = v->GetFloat();
+        if (auto* v = C.FindCVar("r_sdf_debug_iters")) debug       = v->GetInt();
+        if (auto* v = C.FindCVar("r_sdf_normal_mode")) normal_mode = v->GetInt();
         if (max_iters < 1)   max_iters = 1;
         if (max_iters > 256) max_iters = 256;     // shader clamps the same way
         if (epsilon   < 1e-7f) epsilon = 1e-7f;
+        if (normal_mode < 0) normal_mode = 0;
+        if (normal_mode > 1) normal_mode = 1;     // shader maps >1 to forward-AD
         // Disable the entire SDF path when no clusters are active --
         // the shader's gate is sdf_params.x > 0.
         push.sdf_params[0] = sdf_cluster_count_;
         push.sdf_params[1] = static_cast<std::uint32_t>(max_iters);
         push.sdf_params[2] = (debug != 0) ? 1u : 0u;
-        push.sdf_params[3] = 0u;
+        push.sdf_params[3] = static_cast<std::uint32_t>(normal_mode);
         push.sdf_params_f[0] = epsilon;
         push.sdf_params_f[1] = 0.0f;
         push.sdf_params_f[2] = 0.0f;
         push.sdf_params_f[3] = 0.0f;
     }
-    // --- end SDF Phase 1 ---------------------------------------------------
+    // --- end SDF Phase 1 / 2 -----------------------------------------------
 
     // Celestials composite gate (issue #46). When set, PathTrace.slang
     // subtracts starsOnly + sunDisc + moonDisc + the procSky inline
@@ -7970,6 +8001,20 @@ bool ParseFloat(std::string_view s, float& out) {
     return true;
 }
 
+// Signed integer parser. Used by SDF Phase 2 (#98) `sdf_repeat_limited`
+// for the half-extent triple -- semantically a non-negative cell count
+// but accepting a signed type lets the host reject negative inputs at
+// the parser layer with a clear error rather than silently underflowing
+// the uint cast.
+bool ParseInt(std::string_view s, int& out) {
+    if (s.empty()) return false;
+    int v = 0;
+    auto r = std::from_chars(s.data(), s.data() + s.size(), v);
+    if (r.ec != std::errc{} || r.ptr != s.data() + s.size()) return false;
+    out = v;
+    return true;
+}
+
 }  // namespace
 
 void Engine::RegisterCsgCommands() {
@@ -8610,6 +8655,217 @@ void Engine::RegisterSdfCommands() {
             }
             combine(id, a, b, k, pt::renderer::SDF_OP_SMOOTH_SUBTRACT, mat, cr, cg, cb, out, "sdiff");
         });
+
+    // ----- SDF Phase 2 (#98) procedural / warp / domain ops ----------------
+    //
+    // Single-child wrap commands: take ONE existing SDF cluster id and
+    // wrap it with a Phase 2 procedural op. The child is consumed (its
+    // nodes are inlined into the new cluster and its id is removed from
+    // the active set). Combined node count must not exceed
+    // SdfPrim::kMaxNodes; if it would, the command fails and the child
+    // is left in place.
+    auto wrap_proc = [this](std::uint32_t id,
+                            std::uint32_t a_id,
+                            pt::renderer::SdfOp op,
+                            std::array<float, 4> op_params,
+                            std::uint32_t material,
+                            float r, float g, float b,
+                            pt::console::Output& out,
+                            const char* tag) {
+        auto it_a = sdf_prims_.find(a_id);
+        if (it_a == sdf_prims_.end()) {
+            out.FormatLine("sdf_{}: child id {} not found", tag, a_id);
+            return;
+        }
+        const pt::renderer::SdfPrim& A = it_a->second;
+        if (A.node_count + 1 > pt::renderer::SdfPrim::kMaxNodes) {
+            out.FormatLine("sdf_{}: combined node count {} exceeds kMaxNodes={}",
+                           tag, A.node_count + 1,
+                           pt::renderer::SdfPrim::kMaxNodes);
+            return;
+        }
+        pt::renderer::SdfPrim out_p{};
+        for (std::uint32_t i = 0; i < A.node_count; ++i) out_p.nodes[i] = A.nodes[i];
+        std::uint32_t op_idx = A.node_count;
+        pt::renderer::SdfNode& opn = out_p.nodes[op_idx];
+        opn.op       = op;
+        opn.shape    = 0;
+        // child_a = root of A (last node of A's sub-tree).
+        opn.child_a  = A.node_count - 1u;
+        opn.child_b  = 0;
+        opn.params[0] = op_params[0];
+        opn.params[1] = op_params[1];
+        opn.params[2] = op_params[2];
+        opn.params[3] = op_params[3];
+        out_p.node_count = op_idx + 1;
+        out_p.material   = material;
+        out_p.albedo[0]  = r; out_p.albedo[1] = g; out_p.albedo[2] = b;
+        out_p.roughness  = 0.0f;
+        out_p.ior        = 1.5f;
+        if (!pt::renderer::ComputeSdfAabb(out_p)) {
+            out.FormatLine("sdf_{}: AABB computation failed", tag);
+            return;
+        }
+        sdf_prims_.erase(it_a);
+        sdf_prims_[id]   = out_p;
+        sdf_prims_dirty_ = true;
+        accum_dirty_     = true;
+        LOG_INFO("[sdf] {} id={} (child {}) aabb=[{:.2f},{:.2f},{:.2f} .. {:.2f},{:.2f},{:.2f}]",
+                 tag, id, a_id,
+                 out_p.aabb_min[0], out_p.aabb_min[1], out_p.aabb_min[2],
+                 out_p.aabb_max[0], out_p.aabb_max[1], out_p.aabb_max[2]);
+        out.FormatLine("sdf: {} id={} (child {})", tag, id, a_id);
+    };
+
+    C.RegisterCommand("sdf_displace_noise",
+        "sdf_displace_noise <id> <child_id> <amp_m> <freq_per_m> [octaves] <material> <r> <g> <b>: "
+        "wrap a cluster with an FBM-noise displacement band (amp metres, "
+        "freq 1/metres, octaves 1..6).",
+        [wrap_proc](auto args, pt::console::Output& out) {
+            // Allow octaves arg optional -- 8 args without, 9 with.
+            if (args.size() != 8 && args.size() != 9) {
+                out.PrintLine("usage: sdf_displace_noise <id> <child> <amp> <freq> [octaves] <material> <r> <g> <b>");
+                return;
+            }
+            std::uint32_t id, a, mat;
+            float amp, freq, cr, cg, cb;
+            int   octaves = 4;
+            if (auto* v = pt::console::Console::Get().FindCVar("r_sdf_displace_octaves"))
+                octaves = v->GetInt();
+            std::size_t base = 4;
+            if (!ParseUint(args[0], id) || !ParseUint(args[1], a) ||
+                !ParseFloat(args[2], amp) || !ParseFloat(args[3], freq)) {
+                out.PrintLine("sdf_displace_noise: arg parse failed (id/child/amp/freq)");
+                return;
+            }
+            if (args.size() == 9) {
+                if (!ParseInt(args[4], octaves)) {
+                    out.PrintLine("sdf_displace_noise: octaves parse failed");
+                    return;
+                }
+                base = 5;
+            }
+            if (!ParseSdfMaterial(args[base + 0], mat) ||
+                !ParseFloat(args[base + 1], cr) ||
+                !ParseFloat(args[base + 2], cg) ||
+                !ParseFloat(args[base + 3], cb)) {
+                out.PrintLine("sdf_displace_noise: arg parse failed (material / rgb)");
+                return;
+            }
+            if (amp <= 0.0f || freq <= 0.0f) {
+                out.FormatLine("sdf_displace_noise: amp and freq must be > 0 (got amp={} freq={})", amp, freq);
+                return;
+            }
+            if (octaves < 1)  octaves = 1;
+            if (octaves > 6)  octaves = 6;
+            // Pack the octaves int into the params[2] float lane via
+            // bit-cast (asuint on the shader side recovers it).
+            std::uint32_t oct_u = static_cast<std::uint32_t>(octaves);
+            float oct_f;
+            std::memcpy(&oct_f, &oct_u, sizeof(float));
+            wrap_proc(id, a, pt::renderer::SDF_OP_DISPLACE_NOISE,
+                      {amp, freq, oct_f, 0.0f}, mat, cr, cg, cb, out, "displace_noise");
+        });
+
+    C.RegisterCommand("sdf_twist",
+        "sdf_twist <id> <child_id> <rate_rad_per_m> <material> <r> <g> <b>: "
+        "twist a cluster around the Y axis at `rate` radians per metre of height.",
+        [wrap_proc](auto args, pt::console::Output& out) {
+            if (args.size() != 7) {
+                out.PrintLine("usage: sdf_twist <id> <child> <rate> <material> <r> <g> <b>");
+                return;
+            }
+            std::uint32_t id, a, mat;
+            float rate, cr, cg, cb;
+            if (!ParseUint(args[0], id) || !ParseUint(args[1], a) ||
+                !ParseFloat(args[2], rate) ||
+                !ParseSdfMaterial(args[3], mat) ||
+                !ParseFloat(args[4], cr) || !ParseFloat(args[5], cg) || !ParseFloat(args[6], cb)) {
+                out.PrintLine("sdf_twist: arg parse failed");
+                return;
+            }
+            wrap_proc(id, a, pt::renderer::SDF_OP_TWIST,
+                      {rate, 0.0f, 0.0f, 0.0f}, mat, cr, cg, cb, out, "twist");
+        });
+
+    C.RegisterCommand("sdf_bend",
+        "sdf_bend <id> <child_id> <rate_rad_per_m> <material> <r> <g> <b>: "
+        "bend a cluster along the X axis at `rate` radians per metre.",
+        [wrap_proc](auto args, pt::console::Output& out) {
+            if (args.size() != 7) {
+                out.PrintLine("usage: sdf_bend <id> <child> <rate> <material> <r> <g> <b>");
+                return;
+            }
+            std::uint32_t id, a, mat;
+            float rate, cr, cg, cb;
+            if (!ParseUint(args[0], id) || !ParseUint(args[1], a) ||
+                !ParseFloat(args[2], rate) ||
+                !ParseSdfMaterial(args[3], mat) ||
+                !ParseFloat(args[4], cr) || !ParseFloat(args[5], cg) || !ParseFloat(args[6], cb)) {
+                out.PrintLine("sdf_bend: arg parse failed");
+                return;
+            }
+            wrap_proc(id, a, pt::renderer::SDF_OP_BEND,
+                      {rate, 0.0f, 0.0f, 0.0f}, mat, cr, cg, cb, out, "bend");
+        });
+
+    C.RegisterCommand("sdf_repeat",
+        "sdf_repeat <id> <child_id> <px> <py> <pz> <material> <r> <g> <b>: "
+        "infinite domain repetition with per-axis period (metres; 0 = no repeat on that axis).",
+        [wrap_proc](auto args, pt::console::Output& out) {
+            if (args.size() != 9) {
+                out.PrintLine("usage: sdf_repeat <id> <child> <px> <py> <pz> <material> <r> <g> <b>");
+                return;
+            }
+            std::uint32_t id, a, mat;
+            float px, py, pz, cr, cg, cb;
+            if (!ParseUint(args[0], id) || !ParseUint(args[1], a) ||
+                !ParseFloat(args[2], px) || !ParseFloat(args[3], py) || !ParseFloat(args[4], pz) ||
+                !ParseSdfMaterial(args[5], mat) ||
+                !ParseFloat(args[6], cr) || !ParseFloat(args[7], cg) || !ParseFloat(args[8], cb)) {
+                out.PrintLine("sdf_repeat: arg parse failed");
+                return;
+            }
+            wrap_proc(id, a, pt::renderer::SDF_OP_REPEAT,
+                      {px, py, pz, 0.0f}, mat, cr, cg, cb, out, "repeat");
+        });
+
+    C.RegisterCommand("sdf_repeat_limited",
+        "sdf_repeat_limited <id> <child_id> <px> <py> <pz> <lx> <ly> <lz> <material> <r> <g> <b>: "
+        "bounded domain repetition. <lx ly lz> are integer half-extents (cell-count either side of origin, max 1023).",
+        [wrap_proc](auto args, pt::console::Output& out) {
+            if (args.size() != 12) {
+                out.PrintLine("usage: sdf_repeat_limited <id> <child> <px py pz> <lx ly lz> <material> <r g b>");
+                return;
+            }
+            std::uint32_t id, a, mat;
+            float px, py, pz, cr, cg, cb;
+            int   lx, ly, lz;
+            if (!ParseUint(args[0], id) || !ParseUint(args[1], a) ||
+                !ParseFloat(args[2], px) || !ParseFloat(args[3], py) || !ParseFloat(args[4], pz) ||
+                !ParseInt(args[5], lx) || !ParseInt(args[6], ly) || !ParseInt(args[7], lz) ||
+                !ParseSdfMaterial(args[8], mat) ||
+                !ParseFloat(args[9], cr) || !ParseFloat(args[10], cg) || !ParseFloat(args[11], cb)) {
+                out.PrintLine("sdf_repeat_limited: arg parse failed");
+                return;
+            }
+            if (lx < 0 || ly < 0 || lz < 0 || lx > 1023 || ly > 1023 || lz > 1023) {
+                out.FormatLine("sdf_repeat_limited: limit out of range 0..1023 (got {},{},{})", lx, ly, lz);
+                return;
+            }
+            // Pack the int3 half-extent into the params[3] float lane.
+            // 10 bits per axis -> 0..1023, total 30 bits. Top 2 bits
+            // stay zero so a future flag can move in without a wire-
+            // format break.
+            std::uint32_t packed = (std::uint32_t(lx) & 0x3ffu) |
+                                   ((std::uint32_t(ly) & 0x3ffu) << 10) |
+                                   ((std::uint32_t(lz) & 0x3ffu) << 20);
+            float packed_f;
+            std::memcpy(&packed_f, &packed, sizeof(float));
+            wrap_proc(id, a, pt::renderer::SDF_OP_REPEAT_LIMITED,
+                      {px, py, pz, packed_f}, mat, cr, cg, cb, out, "repeat_limited");
+        });
+    // ----- end SDF Phase 2 (#98) -------------------------------------------
 }
 // --- end SDF Phase 1 -------------------------------------------------------
 
