@@ -28,6 +28,7 @@
 #include "../renderer/HdrImage.h"
 #include "../renderer/MeshGen.h"
 #include "../effects/ParticleSystem.h"
+#include "../physics/PhysicsSystem.h"
 #include "../rhi/CommandBuffer.h"
 #include "../rhi/Device.h"
 
@@ -747,6 +748,46 @@ namespace cvar {
     PT_CVAR(sys_gpu_name,     "?",  "GPU model (filled by RHI)",     CVAR_READONLY);
     PT_CVAR(sys_gpu_unified,  "1",  "1 if unified memory architecture", CVAR_READONLY);
     PT_CVAR(sys_gpu_hwrt,     "0",  "1 if hardware ray tracing supported", CVAR_READONLY);
+
+    // --- Physics Phase 1 (#132) ------------------------------------------
+    // Verlet-PBD physics layer. Off by default -- the path tracer ships
+    // with analytic primitives that are static-by-default; enabling
+    // physics swaps them into kinematically-driven spheres without
+    // changing their visual identity. See src/physics/PhysicsSystem.h
+    // for the integrator details. Stable sphere stacking is a Phase 5
+    // problem -- Phase 1 spheres bounce until damping kills the energy.
+    PT_CVAR(phys_enabled,     "0",
+            "Enable the Verlet physics layer (#132). 0 = no physics (the "
+            "engine acts exactly like a non-physics build, analytic prims "
+            "are static); 1 = step every frame with the current "
+            "phys_gravity_y / phys_substeps / phys_damping settings, "
+            "writing back sphere positions to the analytic-primitive "
+            "buffer before the BVH refit. Phase 5 will add friction, "
+            "restitution, and stacking stability -- expect bouncy spheres "
+            "and a settling pile in Phase 1.",
+            CVAR_ARCHIVE);
+    PT_CVAR(phys_gravity_y,   "-9.81",
+            "Gravitational acceleration along world-Y in metres per "
+            "second squared. -9.81 = Earth, +9.81 = anti-gravity, 0 = "
+            "weightless. 1 world unit = 1 metre per the project's "
+            "metric-units convention.",
+            CVAR_ARCHIVE);
+    PT_CVAR(phys_substeps,    "8",
+            "Inner Verlet substeps per frame (1..32). The collision "
+            "position-correction is a stiff constraint, so the per-frame "
+            "dt is divided into N substeps before the integrator runs. "
+            "8 substeps is the sweet spot for 60 fps + the default "
+            "0.3 m radius: smaller numbers let fast-falling spheres "
+            "tunnel through the ground plane, larger numbers waste CPU.",
+            CVAR_ARCHIVE);
+    PT_CVAR(phys_damping,     "0.99",
+            "Per-substep velocity damping (0.5..1.0). 1.0 = energy-"
+            "conserving (perpetual bounce); the default 0.99 bleeds "
+            "1% per substep so an N=8-substep frame at 60 fps loses "
+            "~38% of kinetic energy per second -- enough to settle a "
+            "pile of spheres in a couple of seconds without making "
+            "the motion feel like syrup.",
+            CVAR_ARCHIVE);
 }  // namespace cvar
 
 }  // namespace
@@ -938,6 +979,13 @@ bool Engine::Init() {
     if (auto* p = C.FindCVar("net_line_port"))    sc.line_port = static_cast<std::uint16_t>(p->GetInt());
     if (auto* p = C.FindCVar("net_bind_address")) sc.bind_address = p->value;
     server_->Start(sc, &C);
+
+    // Physics subsystem (#132) -- Verlet integrator + sphere-plane /
+    // sphere-sphere collision. Allocated unconditionally so the
+    // `phys_drop` console command + `phys_enabled` toggle work
+    // without an engine restart; the system is dormant when
+    // `phys_enabled = 0` (StepPhysics returns immediately).
+    physics_ = std::make_unique<pt::physics::PhysicsSystem>();
 
     // CSG scene -- the source of truth for triangle-mesh geometry from
     // P9 onward. Seeded with the headline drilled-cube scene so first-
@@ -1279,6 +1327,15 @@ void Engine::Shutdown() {
     if (jobs_) jobs_->Shutdown();
     pt::jobs::JobSystem::SetInstance(nullptr);
     jobs_.reset();
+
+    // Physics is pure CPU data -- no device resources to release;
+    // drop it after jobs_ so any future async physics worker (Phase
+    // 4 GPU broadphase) can be joined safely here. Today this is a
+    // plain unique_ptr destruction.
+    if (physics_) {
+        physics_->Clear();
+        physics_.reset();
+    }
 }
 
 void Engine::TearDownDevice() {
@@ -6503,19 +6560,22 @@ void Engine::Tick(double dt) {
     // regardless of r_particles so a user toggling the master flag back
     // on doesn't see stale particles snap back into existence; instead
     // particles age naturally even while the composite kernel is off.
-    // SetMaxParticles is cheap (assignment); pushing the cvar each
-    // frame is harmless and lets the user adjust the cap live without
-    // a backend restart.
     if (particles_) {
         auto& Cp = pt::console::Console::Get();
         if (auto* mv = Cp.FindCVar("r_particles_max")) {
             int m = mv->GetInt();
             if (m < 0)     m = 0;
-            if (m > 65536) m = 65536;   // hard upper sanity bound
+            if (m > 65536) m = 65536;
             particles_->SetMaxParticles(static_cast<std::uint32_t>(m));
         }
         particles_->Update(static_cast<float>(dt));
     }
+
+    // Physics step (#132): runs after UpdateCamera and before RenderFrame
+    // so the per-frame writeback into `primitives_` lands before
+    // EnsurePrimitivesUploaded re-packs the analytic-prim buffer +
+    // refits the BVH. No-op when phys_enabled = 0 or no particles exist.
+    StepPhysics(static_cast<float>(dt));
 
     auto t0 = std::chrono::steady_clock::now();
     RenderFrame();
@@ -8901,6 +8961,9 @@ void Engine::RegisterCommands() {
             out.FormatLine("particles live: {} / cap {}",
                            particles_->LiveCount(), particles_->MaxParticles());
         });
+    // --- Physics Phase 1 (#132) ------------------------------------------------
+    RegisterPhysicsCommands();
+    // --- end Physics Phase 1 ---------------------------------------------------
 }
 
 namespace {
@@ -9654,5 +9717,195 @@ void Engine::RegisterSdfCommands() {
         });
 }
 // --- end SDF Phase 1 -------------------------------------------------------
+
+// --- Physics Phase 1 (#132) ------------------------------------------------
+//
+// Console commands and per-frame tick for the Verlet physics layer.
+// MVP scope is intentionally narrow (see issue #132): sphere-plane and
+// sphere-sphere only, gravity-only forcing, no friction / restitution /
+// stacking. Each spawned physics sphere is paired with an analytic
+// primitive (the renderer's existing sphere intersector); per-frame the
+// physics integrator's curr_pos is written back into the matching
+// AnalyticPrim before RenderFrame's EnsurePrimitivesUploaded re-uploads
+// the buffer + refits the BVH. That single writeback site is the only
+// place the physics layer touches renderer-owned state.
+//
+// `phys_drop <x> <y> <z> [radius]` is the testing entry point: spawns a
+// Lambert grey sphere at the world-space position and registers it with
+// PhysicsSystem so the next StepPhysics tick drops it under gravity.
+// IDs come from `physics_next_prim_id_` (starts at 100000 to keep clear
+// of human-typed `prim_sphere <id>` IDs which are typically single digits).
+//
+// `phys_clear` removes every physics-owned analytic primitive AND clears
+// the particle pool. User-authored prims (via `prim_sphere`) are
+// untouched.
+//
+// `phys_status` dumps the integrator's current state for sanity checks.
+
+void Engine::RegisterPhysicsCommands() {
+    auto& C = pt::console::Console::Get();
+
+    C.RegisterCommand("phys_drop",
+        "phys_drop <x> <y> <z> [radius]: spawn a physics-driven sphere at the "
+        "given world-space position (radius defaults to 0.3 m).",
+        [this](auto args, pt::console::Output& out) {
+            if (!physics_) { out.PrintLine("phys_drop: physics system not initialised"); return; }
+            if (args.size() < 3 || args.size() > 4) {
+                out.PrintLine("usage: phys_drop <x> <y> <z> [radius=0.3]");
+                return;
+            }
+            float x, y, z, radius = 0.3f;
+            if (!ParseFloat(args[0], x) || !ParseFloat(args[1], y) || !ParseFloat(args[2], z)) {
+                out.PrintLine("phys_drop: arg parse failed");
+                return;
+            }
+            if (args.size() == 4 && !ParseFloat(args[3], radius)) {
+                out.PrintLine("phys_drop: bad radius");
+                return;
+            }
+            if (radius <= 0.0f) {
+                out.PrintLine("phys_drop: radius must be > 0");
+                return;
+            }
+            const auto h = physics_->AddParticle(glm::vec3{x, y, z}, radius, 1.0f);
+            if (h == pt::physics::PhysicsSystem::kInvalidHandle) {
+                out.FormatLine("phys_drop: particle pool full ({} max)",
+                               pt::physics::PhysicsSystem::kMaxParticles);
+                return;
+            }
+            // Pair with a fresh analytic-prim slot. Pick a visually-
+            // distinct neutral colour so the spawned sphere reads as
+            // "physics object" without colliding with the user's own
+            // prim_sphere palette.
+            const std::uint32_t prim_id = physics_next_prim_id_++;
+            AnalyticPrim p{};
+            p.type        = AnalyticPrim::Sphere;
+            p.material    = AnalyticPrim::Lambert;
+            p.pos_or_n[0] = x; p.pos_or_n[1] = y; p.pos_or_n[2] = z;
+            p.radius_or_d = radius;
+            p.albedo[0]   = 0.80f; p.albedo[1] = 0.80f; p.albedo[2] = 0.85f;
+            p.roughness   = 0.5f;
+            p.ior         = 1.0f;
+            primitives_[prim_id] = p;
+            physics_->SetPrimId(h, prim_id);
+            primitives_dirty_ = true;
+            accum_dirty_      = true;
+            out.FormatLine("phys_drop: spawned particle handle=0x{:x} prim_id={} @ ({:.2f} {:.2f} {:.2f}) r={:.3f}",
+                           h, prim_id, x, y, z, radius);
+        });
+
+    C.RegisterCommand("phys_clear",
+        "Remove all physics-owned analytic primitives and clear the particle pool.",
+        [this](auto, pt::console::Output& out) {
+            if (!physics_) { out.PrintLine("phys_clear: physics system not initialised"); return; }
+            // Each live particle has a paired analytic-prim entry --
+            // gather the prim ids before clearing so we don't iterate
+            // a mutating map.
+            std::vector<std::uint32_t> prim_ids;
+            prim_ids.reserve(physics_->AliveCount());
+            physics_->ForEach(
+                [](pt::physics::PhysicsSystem::Handle /*h*/,
+                   const pt::physics::Particle& /*p*/,
+                   std::uint32_t prim_id, void* user) {
+                    auto* vec = static_cast<std::vector<std::uint32_t>*>(user);
+                    if (prim_id != 0) vec->push_back(prim_id);
+                },
+                &prim_ids);
+            for (auto id : prim_ids) primitives_.erase(id);
+            const std::uint32_t removed = static_cast<std::uint32_t>(prim_ids.size());
+            physics_->Clear();
+            if (removed > 0) {
+                primitives_dirty_ = true;
+                accum_dirty_      = true;
+            }
+            out.FormatLine("phys_clear: removed {} physics-owned prim(s); particle pool emptied", removed);
+        });
+
+    C.RegisterCommand("phys_status",
+        "Print the current Verlet physics layer status (enabled, particle count, gravity / damping / substeps).",
+        [this](auto, pt::console::Output& out) {
+            if (!physics_) { out.PrintLine("phys_status: physics system not initialised"); return; }
+            auto& Cl = pt::console::Console::Get();
+            bool en = false;
+            int  sub = 8;
+            float gy  = -9.81f;
+            float dmp = 0.99f;
+            if (auto* v = Cl.FindCVar("phys_enabled"))   en  = v->GetBool();
+            if (auto* v = Cl.FindCVar("phys_substeps"))  sub = v->GetInt();
+            if (auto* v = Cl.FindCVar("phys_gravity_y")) gy  = v->GetFloat();
+            if (auto* v = Cl.FindCVar("phys_damping"))   dmp = v->GetFloat();
+            out.FormatLine("phys: enabled={} particles={}/{} gravity_y={:.3f} m/s^2 substeps={} damping={:.4f}",
+                           en ? 1 : 0,
+                           physics_->AliveCount(),
+                           physics_->Capacity(),
+                           gy, sub, dmp);
+        });
+}
+
+void Engine::StepPhysics(float dt) {
+    if (!physics_) return;
+    if (physics_->AliveCount() == 0) return;
+
+    auto& C = pt::console::Console::Get();
+    bool enabled = false;
+    if (auto* v = C.FindCVar("phys_enabled")) enabled = v->GetBool();
+    if (!enabled) return;
+
+    int substeps = 8;
+    float gy     = -9.81f;
+    float damp   = 0.99f;
+    if (auto* v = C.FindCVar("phys_substeps"))  substeps = v->GetInt();
+    if (auto* v = C.FindCVar("phys_gravity_y")) gy       = v->GetFloat();
+    if (auto* v = C.FindCVar("phys_damping"))   damp     = v->GetFloat();
+
+    // Clamp dt to a sane upper bound so a single huge frame (debugger
+    // pause, swapchain hitch, window-drag stall) doesn't fling the
+    // simulation across the world. 1/30 s = 33.3 ms is the floor; a
+    // longer frame than that gets sliced into multiple physics frames.
+    float clamped_dt = dt;
+    constexpr float kMaxStepSec = 1.0f / 30.0f;
+    if (clamped_dt > kMaxStepSec) clamped_dt = kMaxStepSec;
+    if (clamped_dt <= 0.0f)        return;
+
+    physics_->Step(clamped_dt, substeps, gy, damp);
+
+    // Write each particle's curr_pos back into its paired analytic
+    // primitive so RenderFrame's EnsurePrimitivesUploaded sees the
+    // moved sphere. The callback signature is C-style by design so
+    // the physics library stays free of std::function overhead --
+    // we pass `this` as `user` and recover the engine pointer to
+    // mutate `primitives_`.
+    struct Ctx {
+        std::map<std::uint32_t, Engine::AnalyticPrim>* prims = nullptr;
+        bool any_changed = false;
+    };
+    Ctx ctx{ &primitives_, false };
+    physics_->ForEach(
+        [](pt::physics::PhysicsSystem::Handle /*h*/,
+           const pt::physics::Particle& p,
+           std::uint32_t prim_id, void* user) {
+            auto* c = static_cast<Ctx*>(user);
+            if (prim_id == 0) return;
+            auto it = c->prims->find(prim_id);
+            if (it == c->prims->end()) return;
+            auto& ap = it->second;
+            // Only update sphere prims -- planes/etc. share the type
+            // tag space but physics never targets them.
+            if (ap.type != AnalyticPrim::Sphere) return;
+            ap.pos_or_n[0] = p.curr_pos.x;
+            ap.pos_or_n[1] = p.curr_pos.y;
+            ap.pos_or_n[2] = p.curr_pos.z;
+            // Radius is fixed for now (no growing/shrinking particles
+            // in Phase 1); skip writing it.
+            c->any_changed = true;
+        },
+        &ctx);
+
+    if (ctx.any_changed) {
+        primitives_dirty_ = true;
+        accum_dirty_      = true;
+    }
+}
+// --- end Physics Phase 1 ---------------------------------------------------
 
 }  // namespace pt::engine

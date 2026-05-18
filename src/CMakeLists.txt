@@ -26,5 +26,9 @@ add_subdirectory(renderer)
 # deps -- the engine owns the per-frame GPU upload + dispatch in
 # RenderFrame, mirroring the StarsComposite pattern.
 add_subdirectory(effects)
+# Physics: Verlet/XPBD on analytic primitives (#131 roadmap). Pure CPU,
+# no RHI deps -- engine writes back particle positions into the
+# AnalyticPrim buffer each frame.
+add_subdirectory(physics)
 add_subdirectory(app)
 add_subdirectory(engine)

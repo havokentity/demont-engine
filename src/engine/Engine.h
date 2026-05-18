@@ -27,6 +27,7 @@ namespace pt::rhi      { class Device; struct PipelineHandle; }
 namespace pt::renderer { struct Camera; }
 namespace pt::csg      { class CsgScene; struct BakedMesh; }
 namespace pt::effects  { class ParticleSystem; }
+namespace pt::physics  { class PhysicsSystem; }
 
 namespace pt::engine {
 
@@ -99,6 +100,20 @@ private:
     void RegisterCommands();
     void RegisterCsgCommands();
     void RegisterPrimCommands();
+    // --- Physics Phase 1 (#132) -------------------------------------------
+    // Console commands for the Verlet physics layer (`phys_drop`,
+    // `phys_clear`, `phys_status`). Cvar registration lives alongside
+    // the other PT_CVAR blocks; this just wires the commands. No-op
+    // when `phys_enabled = 0`.
+    void RegisterPhysicsCommands();
+    // Tick the Verlet integrator + collision pass once per frame, then
+    // write each particle's curr_pos back into the matching analytic
+    // primitive (sphere) in primitives_. Called from Tick BEFORE
+    // RenderFrame's EnsurePrimitivesUploaded so the BVH refit picks
+    // up the new positions. No-op when `phys_enabled = 0` or no
+    // particles exist.
+    void StepPhysics(float dt);
+    // --- end Physics Phase 1 ----------------------------------------------
     // --- SDF Phase 1 (#97) -------------------------------------------------
     // Console commands for the SDF primitive set (`sdf_sphere`,
     // `sdf_box`, `sdf_smin`, ...). Mirrors the prim_*/csg_* registration
@@ -223,6 +238,22 @@ private:
     std::unique_ptr<pt::audio::AudioSystem>     audio_system_;
     std::unique_ptr<pt::csg::CsgScene>          csg_scene_;
     std::unique_ptr<pt::csg::BakedMesh>         pending_baked_;
+    // --- Physics Phase 1 (#132) -------------------------------------------
+    // Owned by the engine; ticked once per frame from Tick() between
+    // UpdateCamera and RenderFrame so the analytic primitive buffer's
+    // position writeback happens before EnsurePrimitivesUploaded /
+    // BVH refit. Allocated in Init(); destroyed in Shutdown(). Active
+    // only when the `phys_enabled` cvar is non-zero -- otherwise
+    // StepPhysics returns immediately and the engine behaves exactly
+    // like a no-physics build.
+    std::unique_ptr<pt::physics::PhysicsSystem> physics_;
+    // Auto-incrementing id used by `phys_drop` when allocating a new
+    // analytic-prim slot for a spawned sphere. Starts well above the
+    // user-facing prim_sphere id range (which is human-typed and
+    // typically single digits) to keep the namespaces visually
+    // distinct.
+    std::uint32_t                               physics_next_prim_id_ = 100000u;
+    // --- end Physics Phase 1 ----------------------------------------------
     pt::jobs::JobSystem::Handle                 bake_handle_{};
     std::atomic<int>                            bake_phase_{0};   // 0 idle, 1 baking, 2 ready
     // Set on backend switch (RequestBackendSwitch).  TearDownDevice
