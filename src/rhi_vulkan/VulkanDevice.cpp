@@ -1574,11 +1574,46 @@ bool VulkanDevice::RecreateSwapchain() {
     VkSurfaceCapabilitiesKHR caps{};
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(phys_device_, surface_, &caps);
 
-    int fb_w = 0, fb_h = 0;
-    glfwGetFramebufferSize(glfw_window_, &fb_w, &fb_h);
-    swap_extent_.width  = std::clamp(static_cast<std::uint32_t>(fb_w),
+    // Extent fallback chain:
+    //   1. caps.currentExtent (driver-reported "the surface is currently
+    //      this size; you MUST use it" -- correct path on most platforms
+    //      once the window has been mapped + sized). The sentinel
+    //      0xFFFFFFFF means "any size you want", in which case fall
+    //      through.
+    //   2. glfwGetFramebufferSize -- works for normal interactive runs
+    //      where GLFW has driven WM_SIZE / Cocoa resize at least once.
+    //   3. width_ / height_ -- last-resort fallback. The constructor
+    //      seeds these from NativeWindowHandle (the cvar-driven app
+    //      window size), and subsequent RecreateSwapchain calls keep
+    //      them in sync with the last good extent. Required for headless
+    //      smoke mode where the Win32 window is never shown and the
+    //      surface caps + GLFW both report 0x0 before WM_SIZE fires.
+    //      Without this, vkCreateSwapchainKHR fails on native NVIDIA
+    //      Vulkan with imageExtent(0,0). MoltenVK had been masking the
+    //      bug by accepting 0x0 silently.
+    std::uint32_t want_w = 0;
+    std::uint32_t want_h = 0;
+    if (caps.currentExtent.width != 0xFFFFFFFFu &&
+        caps.currentExtent.width  != 0 &&
+        caps.currentExtent.height != 0) {
+        want_w = caps.currentExtent.width;
+        want_h = caps.currentExtent.height;
+    }
+    if (want_w == 0 || want_h == 0) {
+        int fb_w = 0, fb_h = 0;
+        glfwGetFramebufferSize(glfw_window_, &fb_w, &fb_h);
+        if (fb_w > 0 && fb_h > 0) {
+            want_w = static_cast<std::uint32_t>(fb_w);
+            want_h = static_cast<std::uint32_t>(fb_h);
+        }
+    }
+    if (want_w == 0 || want_h == 0) {
+        want_w = width_  > 0 ? static_cast<std::uint32_t>(width_)  : 512u;
+        want_h = height_ > 0 ? static_cast<std::uint32_t>(height_) : 384u;
+    }
+    swap_extent_.width  = std::clamp(want_w,
                                      caps.minImageExtent.width, caps.maxImageExtent.width);
-    swap_extent_.height = std::clamp(static_cast<std::uint32_t>(fb_h),
+    swap_extent_.height = std::clamp(want_h,
                                      caps.minImageExtent.height, caps.maxImageExtent.height);
     width_  = static_cast<int>(swap_extent_.width);
     height_ = static_cast<int>(swap_extent_.height);
