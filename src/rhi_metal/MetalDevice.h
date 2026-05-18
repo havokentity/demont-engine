@@ -72,8 +72,8 @@ private:
     MTL::ComputeCommandEncoder* encoder_    = nullptr;
 
     PipelineHandle             bound_pso_{0};
-    // Texture slot map: 11 slots covering every kernel's max engine
-    // slot. PathTrace fills slots 0..10:
+    // Texture slot map: 14 slots covering every kernel's max engine
+    // slot. PathTrace fills slots 0..13:
     //   0  output / swapchain
     //   1  accum_hdr
     //   2  denoise_color
@@ -82,15 +82,23 @@ private:
     //   5  env_map (HDRI)
     //   6  star_map (BSC)
     //   7  moon_map
-    //   8  normal_tex (SVGF / NRD / OptiX-AOV)
-    //   9  albedo_tex (OptiX-AOV only)
+    //   8  normal_tex (SVGF / NRD / OptiX-AOV / MetalFX)
+    //   9  albedo_tex (OptiX-AOV / MetalFX)
     //   10 cloud_trans_tex (issue #46 follow-up: R32F per-pixel cloud
     //      transmittance the path tracer writes and StarsComposite
     //      reads). On Metal slots above the kernel's actual texture
     //      count are silently dropped; on Vulkan the slot table in
     //      VulkanDevice.cpp maps them to vk::binding numbers.
-    TextureHandle              bound_tex_[11] {};
-    // 12 buffer slots. Slots 0..7 are the original engine layout
+    //   11 specular_albedo_tex (issue #118: RGBA16F per-pixel F0 for
+    //      MetalFX TemporalDenoisedScaler specular guidance)
+    //   12 roughness_tex (issue #118: R32F per-pixel roughness)
+    //   13 specular_hit_distance_tex (issue #118: R32F distance to
+    //      specularly-reflected hit)
+    //   On Metal slots above the kernel's actual texture count are
+    //   silently dropped; on Vulkan the slot table in
+    //   VulkanDevice.cpp maps them to vk::binding numbers.
+    TextureHandle              bound_tex_[14] {};
+    // 11 buffer slots. Slots 0..7 are the original engine layout
     // (mesh_positions / mesh_indices, primitives, marginal /
     // conditional CDFs, exposure_state, analytic-prim bvh_nodes).
     // Slots 8/9 were added in the PR #106 follow-up for the triangle

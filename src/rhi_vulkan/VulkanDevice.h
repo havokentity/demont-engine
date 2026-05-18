@@ -48,15 +48,20 @@ private:
     VulkanDevice*  device_ = nullptr;
     VkCommandBuffer cb_     = VK_NULL_HANDLE;
     PipelineHandle bound_pipeline_{0};
-    // 11 texture slots: slots 0..7 are output / accum / denoise_color /
+    // 14 texture slots: slots 0..7 are output / accum / denoise_color /
     // depth / motion / env_map / star_map / moon_map; slot 8 is
-    // normal_tex (SVGF/NRD + OptiX-AOV), slot 9 is albedo_tex (OptiX
-    // AOV only), slot 10 is cloud_trans_tex (issue #46 follow-up
-    // R32F per-pixel cloud transmittance G-buffer the path tracer
-    // writes and StarsComposite reads). Keep in sync with
+    // normal_tex (SVGF/NRD + OptiX-AOV + MetalFX), slot 9 is albedo_tex
+    // (OptiX-AOV + MetalFX), slot 10 is cloud_trans_tex (issue #46
+    // follow-up: R32F per-pixel cloud transmittance G-buffer the path
+    // tracer writes and StarsComposite reads). Slots 11/12/13 (issue
+    // #118) are the MetalFX specular-guidance trio: specular_albedo
+    // (RGBA16F F0), roughness (R32F surface roughness), and
+    // specular_hit_distance (R32F reflection depth). Vulkan mirrors
+    // them for SPIR-V slot stability but the in-house NRD/SVGF chain
+    // doesn't consume them today (#50 will). Keep in sync with
     // kSlotToTexBinding[] in VulkanDevice.cpp.
-    TextureHandle  bound_tex_[11] {};
-    // 12 buffer slots: 8 original (mesh_positions/indices, primitives,
+    TextureHandle  bound_tex_[14] {};
+    // 11 buffer slots: 8 original (mesh_positions/indices, primitives,
     // marginal/conditional CDFs, exposure_state, analytic-prim bvh_nodes),
     // slots 8/9 for the triangle-BVH (tri_bvh_nodes,
     // tri_bvh_permuted_ids -- the PR #106 follow-up that replaces the
