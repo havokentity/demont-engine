@@ -194,7 +194,10 @@ float3 starsOnly(float3 rd, float3 sun) {
             float fhz_base = 1.0 + float((h >> 16) & 0xFFu) * (2.0 / 256.0);
             float fhz = fhz_base * exposure_pad.w;
             float t   = float(frame_index) * (1.0 / 60.0);
-            float w   = 0.55 + 0.45 * sin(6.28318530718 * (ph + t * fhz));
+            // Centered on 1.0 to preserve mean brightness; see the
+            // PathTrace.slang copy for the rationale (dim stars
+            // disappeared at the old 0.55 mean).
+            float w   = 1.0 + 0.45 * sin(6.28318530718 * (ph + t * fhz));
             stars *= w;
         }
         return stars * (1.0 - day);

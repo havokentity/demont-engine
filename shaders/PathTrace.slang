@@ -973,7 +973,17 @@ float3 starsOnly(float3 rd, float3 sun) {
             float fhz_base = 1.0 + float((h >> 16) & 0xFFu) * (2.0 / 256.0);
             float fhz = fhz_base * exposure_pad.w;
             float t   = float(frame_index) * (1.0 / 60.0);
-            float w   = 0.55 + 0.45 * sin(6.28318530718 * (ph + t * fhz));
+            // Center modulation on 1.0 so time-averaged brightness
+            // is conserved. The previous `0.55 + 0.45 * sin` had a
+            // mean of 0.55 -- a 45% dimming of every star on average,
+            // which was invisible on bright stars (well above the
+            // tonemap floor) but knocked dim / distant stars below
+            // the noise floor most of the time, so the user saw the
+            // dim half of the catalog effectively disappear when
+            // twinkle came on. Range now [0.55, 1.45] (peaks above
+            // 1.0 mimic real scintillation flashes); mean 1.0
+            // matches the no-twinkle reference brightness.
+            float w   = 1.0 + 0.45 * sin(6.28318530718 * (ph + t * fhz));
             stars *= w;
         }
         // Fade with day so stars vanish at sunrise.
