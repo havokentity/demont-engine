@@ -672,6 +672,76 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     pt_add_golden_cell(SCENE smoke_emitter_basic BACKEND metal    DENOISER svgf_atrous
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     # --- end Fluid Phase 1 ------------------------------------------------
+
+    # --- Physics Phase 2a rigid-body fixtures (#138, #181) ----------------
+    # Pins the rigid-body fixture output against a committed PNG so any
+    # accidental regression in:
+    #   * SeedDefaultPrimitives -> phys_drop_sphere / phys_drop_box wiring
+    #   * the integrator's orientation predictor + finite-diff omega
+    #   * bounding-sphere collision against the ground plane
+    #   * the #181 colored-material plumbing (per-body RGB args)
+    #   * pt_smoke_skip_csg_seed / pt_smoke_skip_prim_seed gating
+    # surfaces as an imgdiff failure rather than going unnoticed until
+    # someone notices the demo screenshot is wrong.
+    #
+    # phys_rb_smoke:  small mix of spheres + boxes above the default
+    #                 cornell_csg seed cluster -- exercises the rigid-body
+    #                 path WITH the default scene present.
+    # phys_rb_demo:   tower-of-spheres + row-of-boxes on a CLEAN stage
+    #                 (cornell csg + analytic prim seeds disabled). This
+    #                 is the user-facing "show me the rigid bodies" demo
+    #                 fixture from #181, so it doubles as visual coverage
+    #                 of `pt_smoke_skip_csg_seed` / `pt_smoke_skip_prim_seed`.
+    #
+    # Both scenes set `pt_smoke_late_exec` to a *relative* path
+    # (tests/goldens/scenes/phys_rb_*_late.cfg). At engine init that path
+    # is resolved against the engine's CWD -- but golden cells run each
+    # render in its own per-cell workdir (`golden_workdir/<cell>/`), so a
+    # relative path can't see the source tree. EXTRA below re-sets the
+    # cvar to the absolute path AFTER the scene body inlines (the
+    # synthesised smoke-exec cfg appends --extra below the scene body, so
+    # the absolute value wins the last-writer race before Init's
+    # end-of-Init late-exec reader fires). Mutating the scene cfgs to
+    # hold absolute paths isn't an option because regen-time those paths
+    # would differ across hosts.
+    #
+    # Only the metal/off cells register today -- no software/off goldens
+    # were captured tonight. Add software cells here when those PNGs land
+    # under tests/goldens/Darwin/.
+    #
+    # FRAMES 60: both fixtures' docstrings (and their PR commit messages
+    # PR #184 / PR #189) describe the canonical capture as a "frame 60"
+    # screenshot -- the late-exec heights are tuned to catch the fall
+    # mid-flight at ~60 render frames.
+    #
+    # Tolerances: PhysicsSystem::Step integrates against the real per-
+    # frame wall-clock dt (no fixed-step accumulator -- see comment in
+    # Engine::StepPhysics, "A proper fixed-step accumulator [...] lands
+    # in Phase 5"). That makes the exact body positions at frame 60
+    # non-deterministic across runs (Metal first-frame cost varies with
+    # pipeline-build state, system thermals, etc.), and the imgdiff
+    # tolerances here are sized empirically to absorb that drift on the
+    # local M4 Max box rather than from FP-order variance alone. These
+    # cells will still catch:
+    #   * Complete render failure (black / uniform output)
+    #   * Bodies disappearing entirely (no rigid-body silhouettes left
+    #     to disagree about -> sky+ground delta drops below noise floor
+    #     and a uniform field beats the threshold the OTHER way)
+    #   * Material regressions (e.g. RGB args silently ignored -> all
+    #     bodies render in the default warm-grey instead of the magenta/
+    #     gold/green hues the late-exec specifies)
+    # They will NOT catch subtle physics bugs that only shift body
+    # positions by a few cm. A structural diff (body-count + albedo
+    # histogram) is the right tool for that and is left as future work.
+    pt_add_golden_cell(SCENE phys_rb_smoke BACKEND metal DENOISER off
+        FRAMES 60
+        MAX_DELTA 64 MEAN_DELTA 16 FAIL_PERCENT 10
+        EXTRA "pt_smoke_late_exec ${CMAKE_SOURCE_DIR}/tests/goldens/scenes/phys_rb_smoke_late.cfg")
+    pt_add_golden_cell(SCENE phys_rb_demo  BACKEND metal DENOISER off
+        FRAMES 60
+        MAX_DELTA 64 MEAN_DELTA 12 FAIL_PERCENT 5
+        EXTRA "pt_smoke_late_exec ${CMAKE_SOURCE_DIR}/tests/goldens/scenes/phys_rb_demo_late.cfg")
+    # --- end Physics Phase 2a rigid-body fixtures -------------------------
 else()
     message(STATUS
         "tests: golden-image matrix skipped -- pt_render_one_frame and/or "
