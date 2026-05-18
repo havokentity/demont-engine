@@ -282,6 +282,30 @@ void VulkanCommandBuffer::BindComputePipeline(PipelineHandle p) {
     }
 }
 
+// BATCHED-WRITE CONTRACT.
+//
+// BindStorageTexture / BindBuffer / BindAccelStruct are pure stage ops:
+// they only stash handles into bound_tex_[] / bound_buf_[] /
+// bound_accel_[]. There is NO vkUpdateDescriptorSets call here.
+//
+// The single vkUpdateDescriptorSets call inside VulkanCommandBuffer::
+// Dispatch flushes every staged write at once (storage images, storage
+// buffers, the Frame UBO, AND the acceleration structure via the
+// VkWriteDescriptorSetAccelerationStructureKHR pNext attached to its
+// VkWriteDescriptorSet entry -- all share the same writes[] array, so
+// AS does NOT need a second vkUpdateDescriptorSets call). Driver cost
+// stays O(1) in the number of bound resources per dispatch rather than
+// O(N) one-write-per-resource.
+//
+// Per-frame reset of bound_*[] happens in VulkanCommandBuffer::Reset
+// (called from VulkanDevice::AcquireCommandBuffer at the start of every
+// frame). Between dispatches in the same frame, the engine is expected
+// to rebind every slot the next pipeline reads; PARTIALLY_BOUND
+// tolerates leftover state in slots the next pipeline does not read.
+//
+// If you are tempted to "fix the perf" by calling vkUpdateDescriptorSets
+// inside these three methods: don't. That would re-introduce the N-way
+// driver cost the current design is built around.
 void VulkanCommandBuffer::BindStorageTexture(std::uint32_t slot, TextureHandle t) {
     if (slot < std::size(bound_tex_)) bound_tex_[slot] = t;
 }
