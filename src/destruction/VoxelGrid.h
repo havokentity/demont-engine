@@ -30,6 +30,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace pt::destruction {
@@ -63,6 +64,23 @@ struct VoxelGridHeader {
     std::uint32_t occupied     = 0u;     // count of occupied voxels (cached for stats)
     VoxelMaterial material     {};
 };
+
+// The on-disk cache uses raw struct I/O (`fwrite(&header_, sizeof(...))`)
+// so the layout has to be predictable. These compile-time guards catch
+// the two ways it could silently drift: a non-trivially-copyable field
+// (e.g. std::string) sneaking in, or padding/alignment changing the
+// total size. The size value below is what Clang + libc++ on x86_64 and
+// arm64 produce with the current field set (4*u32 + 1f + 3f + 3f + 4*u32
+// = 56 bytes header tail; VoxelMaterial = u32 + 3f + 1f + 1f = 24 bytes
+// -- total 80). If you reorder or add fields, recompute the expected
+// size, bump VoxelGridHeader::kVersion, and update the on-disk format
+// docs in VoxelGrid.cpp.
+static_assert(std::is_trivially_copyable_v<VoxelGridHeader>,
+              "VoxelGridHeader must be trivially copyable for raw fwrite/fread");
+static_assert(std::is_trivially_copyable_v<VoxelMaterial>,
+              "VoxelMaterial must be trivially copyable (it's embedded in the header)");
+static_assert(sizeof(VoxelGridHeader) == 80,
+              "VoxelGridHeader size changed -- bump kVersion and refresh on-disk format docs");
 
 class VoxelGrid {
 public:

@@ -10461,6 +10461,14 @@ void Engine::RegisterCommands() {
     RegisterSmokeCommands();
     // --- end Fluid Phase 1 -----------------------------------------------------
     // --- Voxel destruction Phase 1 (#140) --------------------------------------
+    // r_voxelize_demo is a boolean toggle so it joins the {"0","1"}
+    // allowed-values pool used by `toggle` and CLI override validation
+    // (mirrors r_caustics / r_dof / r_volumetric / r_clouds above). No
+    // on_change here -- SyncVoxelDemoState already invalidates
+    // accum_dirty_ on the toggle edge.
+    if (auto* v = C.FindCVar("r_voxelize_demo")) {
+        v->allowed_values = {"0", "1"};
+    }
     RegisterVoxelCommands();
     // --- end Voxel destruction Phase 1 -----------------------------------------
 }
@@ -10957,6 +10965,16 @@ void Engine::RegisterSdfCommands() {
                            float r, float g, float b,
                            pt::console::Output& out,
                            const char* tag) {
+        // Reject ids in the reserved-cluster range owned by the voxel
+        // demo (SyncVoxelDemoState assumes nothing else stores
+        // sdf_prims_[id] for id >= kVoxelClusterIdBase and would
+        // silently delete any user-issued cluster in that range on the
+        // next frame). Surface the conflict to the user instead.
+        if (id >= kVoxelClusterIdBase) {
+            out.FormatLine("sdf_{}: id={} is in the reserved voxel-cluster range (>= 0x{:08X}); pick a smaller id",
+                           tag, id, kVoxelClusterIdBase);
+            return;
+        }
         pt::renderer::SdfPrim prim{};
         prim.node_count   = 1;
         prim.material     = material;
@@ -11112,6 +11130,14 @@ void Engine::RegisterSdfCommands() {
         if (a_id == b_id) {
             out.FormatLine("sdf_{}: child_a and child_b must differ (got {} twice)",
                            tag, a_id);
+            return;
+        }
+        // Reserved-range guard. Same as in add_leaf -- a combined
+        // cluster landing at id >= kVoxelClusterIdBase would be deleted
+        // by the next SyncVoxelDemoState pass.
+        if (id >= kVoxelClusterIdBase) {
+            out.FormatLine("sdf_{}: id={} is in the reserved voxel-cluster range (>= 0x{:08X}); pick a smaller id",
+                           tag, id, kVoxelClusterIdBase);
             return;
         }
         auto it_a = sdf_prims_.find(a_id);
@@ -12496,6 +12522,11 @@ bool Engine::VoxelizeSourceObject(std::uint32_t source_id, float voxel_size,
 
     // Replace any prior grid for this source. Push to map.
     voxel_grids_[source_id] = std::move(grid);
+    // Bump the mutation generation so the next SyncVoxelDemoState
+    // observes "voxel content changed" and rebuilds the reserved-id
+    // cluster set. Without the bump the sync's idempotency early-out
+    // would keep the old (stale) cluster set in sdf_prims_.
+    ++voxel_grids_generation_;
 
     // Force a sync next frame so the live demo state matches the new
     // voxel set.
@@ -12517,6 +12548,19 @@ void Engine::SyncVoxelDemoState() {
         want_demo = v->GetBool();
     }
     voxel_demo_active_ = want_demo && !voxel_grids_.empty();
+
+    // Idempotent early-out: if (a) the demo's applied state matches the
+    // current want_demo AND (b) the voxel grids haven't mutated since
+    // the last successful apply, the reserved-id clusters in
+    // sdf_prims_ already match what we'd compute below. Doing the full
+    // erase-and-rebuild every frame (the previous behaviour) burned
+    // ~N voxel inserts per frame AND pinned accum_dirty_ on, which
+    // prevented the accumulator from ever converging while
+    // r_voxelize_demo=1 -- the path tracer would render at 1-spp forever.
+    if (want_demo == voxel_demo_applied_state_ &&
+        voxel_grids_generation_ == voxel_demo_applied_generation_) {
+        return;
+    }
 
     // Compute the desired reserved-id span based on want_demo.
     //
@@ -12558,6 +12602,7 @@ void Engine::SyncVoxelDemoState() {
                 if (!g.Get(i, j, k)) continue;
                 const auto c = g.VoxelCenter(i, j, k);
                 sdf_prims_[next_id] = VoxelToSdfCluster(c, voxel_size, mat);
+                changed = true;
                 ++next_id;
                 if (next_id == 0u) {  // wraparound guard (practical never)
                     LOG_ERROR("[voxel] reserved cluster id space exhausted");
@@ -12565,8 +12610,14 @@ void Engine::SyncVoxelDemoState() {
                 }
             }
         }
-        changed = true;
     }
+
+    // Latch the new applied state so the next sync's early-out works.
+    // Done regardless of `changed` because the only way to reach here
+    // is one of (toggle edge, grid mutation), and both should clear the
+    // dirty bits cleanly.
+    voxel_demo_applied_state_      = want_demo;
+    voxel_demo_applied_generation_ = voxel_grids_generation_;
 
     if (changed) {
         sdf_prims_dirty_ = true;
@@ -12597,6 +12648,9 @@ void Engine::RegisterVoxelCommands() {
         "Drop all voxel grids and remove their reserved SDF clusters.",
         [this](auto, pt::console::Output& out) {
             voxel_grids_.clear();
+            // Bump the generation so Sync notices the grids went away
+            // and rips any stale reserved clusters out of sdf_prims_.
+            ++voxel_grids_generation_;
             // Force the next render to remove any reserved-id clusters.
             SyncVoxelDemoState();
             out.PrintLine("voxelize: cleared");
