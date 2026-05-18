@@ -10,6 +10,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>     // std::snprintf for MakeCachePath
 #include <cstring>
 #include <limits>
 
@@ -290,6 +291,29 @@ bool VoxelizeMesh(std::uint32_t object_id,
         LOG_ERROR("[voxel] mesh id={} empty input (verts={} indices={})",
                   object_id, vertex_count, index_count);
         return false;
+    }
+    if (indices == nullptr) {
+        LOG_ERROR("[voxel] mesh id={} null index buffer", object_id);
+        return false;
+    }
+    // Triangle list invariant: index_count must be a multiple of 3 so
+    // every triangle has all three corners. A short tail is a malformed
+    // input -- refuse rather than silently truncate (and confuse the
+    // PointInMesh +X-parity test with a partial triangle).
+    if ((index_count % 3u) != 0u) {
+        LOG_ERROR("[voxel] mesh id={} index_count={} not a multiple of 3", object_id, index_count);
+        return false;
+    }
+    // Every index must point inside positions[0..vertex_count). Tools
+    // that construct meshes manually (e.g. tests) can emit out-of-range
+    // indices; without this check PointInMesh would read past the
+    // positions buffer.
+    for (std::size_t i = 0; i < index_count; ++i) {
+        if (indices[i] >= vertex_count) {
+            LOG_ERROR("[voxel] mesh id={} index[{}]={} out of range (vertex_count={})",
+                      object_id, i, indices[i], vertex_count);
+            return false;
+        }
     }
     if (voxel_size <= 0.0f) {
         LOG_ERROR("[voxel] mesh id={} voxel_size {} must be > 0", object_id, voxel_size);

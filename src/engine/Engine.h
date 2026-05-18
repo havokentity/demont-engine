@@ -317,6 +317,20 @@ private:
     // bindings are suppressed locally so the path tracer renders ONLY
     // the voxelized form (matches the A/B-toggle requirement in #140).
     bool                                        voxel_demo_active_       = false;
+    // Mutation generation for the voxel grid set. Bumped by anything
+    // that changes the rendered occupancy: a new VoxelizeSourceObject
+    // landing, voxelize_clear, or a future destruction step that
+    // toggles voxels. SyncVoxelDemoState compares
+    // voxel_grids_generation_ against voxel_demo_applied_generation_
+    // to decide whether the desired reserved-cluster set already
+    // matches what's in sdf_prims_ -- when they match AND the demo
+    // toggle hasn't changed since the last sync, the function early-
+    // outs (no rebuild, no accum_dirty_, no sdf_prims_dirty_). Without
+    // this the demo path would assert accum_dirty_ every frame and
+    // pin the path tracer to 1-spp forever while r_voxelize_demo=1.
+    std::uint64_t                               voxel_grids_generation_         = 0u;
+    std::uint64_t                               voxel_demo_applied_generation_  = 0u;
+    bool                                        voxel_demo_applied_state_       = false;
     // --- end Voxel destruction Phase 1 -------------------------------------
 
     // Always-allocated 16-byte storage buffer used as a harmless
