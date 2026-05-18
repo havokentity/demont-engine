@@ -8,28 +8,42 @@ and freeze the desktop.
 ## Smoke-test serialization
 
 Before invoking the `demont` binary (interactive OR `--smoke-frames`),
-acquire a kernel-level lock via `flock` against
-`/tmp/demont_test.lock`:
+acquire an atomic lock via `mkdir`. macOS doesn't ship `flock(1)`, so
+we use `mkdir` on a lockdir — POSIX-guaranteed atomic, no install
+needed, released on shell exit via `trap`.
 
 ```bash
-flock /tmp/demont_test.lock build/mac-release/src/app/demont \
+# Acquire (poll until directory creation succeeds = atomic mutex)
+LOCK=/tmp/demont_test.lockdir
+while ! mkdir "$LOCK" 2>/dev/null; do sleep 0.5; done
+trap 'rmdir "$LOCK"' EXIT
+
+# Diagnostic logging (optional but recommended)
+echo "$(date -Iseconds) <branch> acquired lock" >> /tmp/demont_test_log.txt
+
+# Run demont
+build/mac-release/src/app/demont \
     --smoke-frames=N --r-backend=metal \
     --smoke-exec=PATH/TO/fixture.cfg \
     --smoke-capture-out=captures/your_capture.png
+
+echo "$(date -Iseconds) <branch> released lock" >> /tmp/demont_test_log.txt
+# trap fires on shell exit and releases the lock
 ```
 
-`flock` is POSIX, FIFO-ordered by the kernel, no busy-wait. The lock
-is released the moment your `demont` exits. Concurrent builds
-(`cmake --build`) are fine — only serialize the `demont` invocation
-itself.
+Concurrent BUILDS (`cmake --build`) are fine — only serialize the
+`demont` invocation itself. The poll interval (0.5 s) is small
+relative to typical smoke-test duration (1-5 s) so the contention
+window is brief.
 
-For diagnostic visibility, log entry/exit:
-
+If you can't be bothered with the trap, the minimum-viable form is:
 ```bash
-echo "$(date -Iseconds) <branch> starting smoke" >> /tmp/demont_test_log.txt
-flock /tmp/demont_test.lock build/.../demont --smoke-frames=N ...
-echo "$(date -Iseconds) <branch> done" >> /tmp/demont_test_log.txt
+while ! mkdir /tmp/demont_test.lockdir 2>/dev/null; do sleep 0.5; done
+build/.../demont --smoke-frames=N ...
+rmdir /tmp/demont_test.lockdir
 ```
+But the trap form is safer — it releases the lock even if demont
+crashes or the script is SIGINT'd.
 
 ## Vulkan / NRD work on Mac
 
