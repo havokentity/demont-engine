@@ -258,7 +258,50 @@ namespace cvar {
     PT_CVAR(r_firefly_clamp,   "10",  "Per-contribution firefly clamp (per-channel ceiling on each indirect light contribution: env-NEE, ambient skylight, bounce-to-sky). Suppresses single-sample spikes from BSDF-sampled bounces hitting an HDRI sun pixel, while leaving camera-direct sky unbounded so the sun renders at full intensity. ACES saturates anything above ~5 to ~1.0 for SDR, so 10 preserves visible highlights and kills fireflies. 0 disables.", CVAR_ARCHIVE);
     PT_CVAR(r_quality,         "high",  "Master quality preset that drives r_spp, r_max_bounces, r_caustics, r_refract_bounces, etc. Options: low (fast, no caustics), medium (default-ish), high (caustics, more bounces), ultra (max). 'custom' leaves per-feature cvars as-is.", CVAR_ARCHIVE);
     PT_CVAR(r_caustics,        "1",  "Refractive shadow rays. 1 = NEE rays refract through dielectrics so glass/diamond produce caustic patterns; 0 = treat all dielectrics as opaque shadow blockers (faster, blocks any caustic). Path-tracer-correct in both modes.", CVAR_ARCHIVE);
-    PT_CVAR(r_refract_bounces, "4",  "Maximum dielectric refractions a single shadow ray may chain through before giving up (returns no contribution). Higher catches more multi-facet caustics; lower is faster.", CVAR_ARCHIVE);
+    PT_CVAR(r_refract_bounces, "4",  "Maximum dielectric refractions a single shadow ray may chain through before giving up (returns no contribution). Higher catches more multi-facet caustics; lower is faster. NOTE: water (#134) shares this budget -- needs >=1 to see refracted underwater geometry.", CVAR_ARCHIVE);
+    // --- Water Phase 1 (#134): shaded analytic plane with normal-map waves --
+    // r_water_* cvars feed PathTrace.slang's MAT_WATER BRDF branch via the
+    // water_params0 / water_params1 push fields.  All CVAR_ARCHIVE so a
+    // user's tuning persists across sessions.
+    PT_CVAR(r_water_absorption_r, "0.45",
+            "Per-channel Beer's-law absorption coefficient (1/m) on the RED "
+            "channel for MAT_WATER. Higher = red attenuates faster with "
+            "depth (more teal water). Default 0.45 matches the classic "
+            "Caribbean tint when combined with the green/blue defaults.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_water_absorption_g, "0.15",
+            "Per-channel Beer's-law absorption coefficient (1/m) on the "
+            "GREEN channel for MAT_WATER. Default 0.15.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_water_absorption_b, "0.05",
+            "Per-channel Beer's-law absorption coefficient (1/m) on the "
+            "BLUE channel for MAT_WATER. Default 0.05 -- blue survives "
+            "longest, giving the deep-water blue tint.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_water_ior, "1.33",
+            "Refractive index of water for MAT_WATER. Default 1.33 (real "
+            "water at 20C / 589 nm sodium line). Clamped to [1.0, 2.4] in "
+            "shader since lower than air is unphysical and higher than "
+            "diamond would be nonsense.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_water_wave_scale, "0.3",
+            "Normal-map wave frequency multiplier for MAT_WATER. Default "
+            "0.3 (cycles / m) -- ~3 m surface wavelength, calm-lake feel. "
+            "Higher = finer ripples, lower = longer swell.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_water_wave_amplitude, "0.2",
+            "Surface-normal perturbation strength for MAT_WATER. Default "
+            "0.2 -- subtle ripples without obvious noise patches. The "
+            "perturbation acts only on the SHADING normal in Phase 1; "
+            "the surface itself is geometrically flat. Phase 2 (FFT) "
+            "displaces real geometry.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_water_wave_speed, "1.0",
+            "Wave animation rate multiplier for MAT_WATER. 1.0 is roughly "
+            "physical for a calm lake; 0 freezes the surface (useful for "
+            "deterministic captures / goldens).",
+            CVAR_ARCHIVE);
+    // --- end Water Phase 1 ---------------------------------------------------
     PT_CVAR(r_denoiser,        "off",
             "Denoiser. off = noisy 1-spp, accumulating image only. "
             "metalfx = Mac MetalFX TemporalDenoisedScaler (Apple Silicon "
@@ -4504,30 +4547,26 @@ void Engine::RenderFrame() {
         float vol_multiscatter_oct;
         float _pad_vol;
         // --- Light primitives (#73) ----------------------------------------
-        // Number of analytic light primitives in the `light_prims`
-        // storage buffer this dispatch. 0 disables the Lambert
-        // NEE-to-lights branch entirely. Sits in its own 16-byte
-        // trailing block (light_count + 3 uint pads): the slot the
-        // light agent originally targeted (_pad_star_split[0]) is now
-        // owned by SIGMA's write_shadow_vis after the integration
-        // merge, so this is a fresh tail block instead of an in-place
-        // reuse. Mirrors PathTrace.slang's matching trailing block in
-        // both the Metal Push cbuffer and the SPIR-V Frame UBO.
         std::uint32_t light_count;
         std::uint32_t _pad_light_tail[3];
         // --- end Light primitives ------------------------------------------
         // MetalFX specular-guidance G-buffer write gates (issue #118).
-        // Engine sets these only for MetalFX-family denoiser kinds AND
-        // only when the matching G-buffer texture is allocated; the
-        // shader's matching gate elides the per-pixel write under
-        // partially-bound semantics for non-MetalFX dispatches. The
-        // _pad_specular_gbuffers0 entry keeps the cbuffer trailing
-        // block 16-byte aligned (std140 / MSL rule that the static_assert
-        // block at the end of this struct guards against).
         std::uint32_t write_specular_albedo_gbuffer;
         std::uint32_t write_roughness_gbuffer;
         std::uint32_t write_specular_hit_distance_gbuffer;
         std::uint32_t _pad_specular_gbuffers0;
+        // --- Water Phase 1 (#134) ----------------------------------------
+        // water_params0.xyz = absorption per channel (1/m, Beer's law);
+        //                .w = ior (clamped to [1.0, 2.4] in shader).
+        // water_params1.x  = wave_scale (cycles / m, normal-map noise freq).
+        //                .y = wave_amplitude (normal perturbation strength).
+        //                .z = wave_speed (animation rate multiplier).
+        //                .w = time_seconds (shared accumulator with cloud
+        //                                   wind; wraps on 24 h sim window).
+        // Two vec4s = 32 B. Sits at the very end of PtPush.
+        float water_params0[4];
+        float water_params1[4];
+        // --- end Water Phase 1 -------------------------------------------
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -5235,6 +5274,41 @@ void Engine::RenderFrame() {
         push.clouds_p4[3] = 0.0f;   // reserved
     }
 
+    // --- Water Phase 1 (#134) ----------------------------------------------
+    // Drive PathTrace.slang's MAT_WATER BRDF branch. Defaults match the
+    // cvar defaults registered above; FindCVar nullptr-tolerant in case
+    // a tooling path skipped registration. Time uses the same wrapped
+    // accumulator as clouds_p2.w so the wave field stays fp32-precise
+    // even on long sessions; r_water_wave_speed scales the rate.
+    {
+        float abs_r = 0.45f, abs_g = 0.15f, abs_b = 0.05f;
+        float ior = 1.33f;
+        float wave_scale = 0.3f, wave_amp = 0.2f, wave_speed = 1.0f;
+        if (auto* v = C.FindCVar("r_water_absorption_r"))  abs_r = v->GetFloat();
+        if (auto* v = C.FindCVar("r_water_absorption_g"))  abs_g = v->GetFloat();
+        if (auto* v = C.FindCVar("r_water_absorption_b"))  abs_b = v->GetFloat();
+        if (auto* v = C.FindCVar("r_water_ior"))           ior   = v->GetFloat();
+        if (auto* v = C.FindCVar("r_water_wave_scale"))    wave_scale = v->GetFloat();
+        if (auto* v = C.FindCVar("r_water_wave_amplitude"))wave_amp   = v->GetFloat();
+        if (auto* v = C.FindCVar("r_water_wave_speed"))    wave_speed = v->GetFloat();
+        // Reuse the cloud time accumulator (already wrapped to 24h sim).
+        // Re-derive locally because the cloud block scoped its t_seconds
+        // out of reach. Same wrap rationale: keeps fp32-precise on long
+        // sessions; identical phase across cloud-wind & water-waves.
+        constexpr std::uint64_t kWaterPeriodFrames = 86400ull * 60ull;
+        const float water_t = float(frame_index_ % kWaterPeriodFrames)
+                            * (1.0f / 60.0f);
+        push.water_params0[0] = abs_r;
+        push.water_params0[1] = abs_g;
+        push.water_params0[2] = abs_b;
+        push.water_params0[3] = ior;
+        push.water_params1[0] = wave_scale;
+        push.water_params1[1] = wave_amp;
+        push.water_params1[2] = wave_speed;
+        push.water_params1[3] = water_t;
+    }
+    // --- end Water Phase 1 -------------------------------------------------
+
     // PtPush layout: the trailing 32 bytes here include the SDF Phase 1
     // block (sdf_params uvec4 + sdf_params_f vec4) and the celestials-
     // composite gate (issue #46 -- one uint flag plus 12 bytes of
@@ -5251,7 +5325,8 @@ void Engine::RenderFrame() {
     //   +16 hetero volumetric block (#100)
     //   +16 analytic light primitives block (#73)
     //   +16 MetalFX specular guidance write gates (#118)
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16);
+    //   +32 Water Phase 1 (#134) — two vec4s (absorption + ior, wave params)
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16);
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
     // cbuffer layout the Slang compiler applies to PathTrace.slang's
@@ -5290,6 +5365,14 @@ void Engine::RenderFrame() {
     static_assert(offsetof(PtPush, write_specular_albedo_gbuffer) % 16 == 0,
                   "PtPush::write_specular_albedo_gbuffer must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
+    // --- Water Phase 1 (#134) ------------------------------------------------
+    static_assert(offsetof(PtPush, water_params0) % 16 == 0,
+                  "PtPush::water_params0 must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    static_assert(offsetof(PtPush, water_params1) % 16 == 0,
+                  "PtPush::water_params1 must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    // --- end Water Phase 1 ---------------------------------------------------
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
 
@@ -7712,6 +7795,7 @@ void Engine::RegisterCommands() {
                     case AnalyticPrim::Lambert:    return "lambert";
                     case AnalyticPrim::Metal:      return "metal";
                     case AnalyticPrim::Dielectric: return "dielectric";
+                    case AnalyticPrim::Water:      return "water";
                 }
                 return "?";
             };
@@ -7792,6 +7876,7 @@ void Engine::RegisterCommands() {
                     auto mat = t["material"].value_or<std::string>("lambert");
                     if      (mat == "metal")      p.material = AnalyticPrim::Metal;
                     else if (mat == "dielectric") p.material = AnalyticPrim::Dielectric;
+                    else if (mat == "water")      p.material = AnalyticPrim::Water;
                     else                          p.material = AnalyticPrim::Lambert;
                     if (auto c = t["color"].as_array(); c && c->size() == 3) {
                         p.albedo[0] = float((*c)[0].value_or(1.0));
@@ -9746,6 +9831,7 @@ bool ParseMaterial(std::string_view s, Engine::AnalyticPrim::Material& out) {
     if (s == "lambert")    { out = Engine::AnalyticPrim::Lambert;    return true; }
     if (s == "metal")      { out = Engine::AnalyticPrim::Metal;      return true; }
     if (s == "dielectric") { out = Engine::AnalyticPrim::Dielectric; return true; }
+    if (s == "water")      { out = Engine::AnalyticPrim::Water;      return true; }
     return false;
 }
 const char* MaterialName(Engine::AnalyticPrim::Material m) {
@@ -9753,6 +9839,7 @@ const char* MaterialName(Engine::AnalyticPrim::Material m) {
         case Engine::AnalyticPrim::Lambert:    return "lambert";
         case Engine::AnalyticPrim::Metal:      return "metal";
         case Engine::AnalyticPrim::Dielectric: return "dielectric";
+        case Engine::AnalyticPrim::Water:      return "water";
     }
     return "?";
 }
@@ -9819,7 +9906,7 @@ void Engine::RegisterPrimCommands() {
         });
 
     C.RegisterCommand("prim_sphere",
-        "prim_sphere <id> <x> <y> <z> <radius> <lambert|metal|dielectric> <r> <g> <b> [roughness] [ior]: add or replace a sphere.",
+        "prim_sphere <id> <x> <y> <z> <radius> <lambert|metal|dielectric|water> <r> <g> <b> [roughness] [ior]: add or replace a sphere.",
         [this](auto args, pt::console::Output& out) {
             if (args.size() < 9 || args.size() > 11) {
                 out.PrintLine("usage: prim_sphere <id> <x> <y> <z> <radius> <material> <r> <g> <b> [roughness=0] [ior=1.5]");
@@ -9837,7 +9924,7 @@ void Engine::RegisterPrimCommands() {
             }
             AnalyticPrim::Material mat;
             if (!ParseMaterial(args[5], mat)) {
-                out.FormatLine("prim_sphere: unknown material '{}' (want lambert|metal|dielectric)", args[5]);
+                out.FormatLine("prim_sphere: unknown material '{}' (want lambert|metal|dielectric|water)", args[5]);
                 return;
             }
             if (radius <= 0.0f) { out.PrintLine("prim_sphere: radius must be > 0"); return; }
@@ -9860,7 +9947,7 @@ void Engine::RegisterPrimCommands() {
         });
 
     C.RegisterCommand("prim_plane",
-        "prim_plane <id> <nx> <ny> <nz> <d> <lambert|metal|dielectric> <r> <g> <b>: add or replace an infinite plane (n . p + d = 0).",
+        "prim_plane <id> <nx> <ny> <nz> <d> <lambert|metal|dielectric|water> <r> <g> <b>: add or replace an infinite plane (n . p + d = 0).",
         [this](auto args, pt::console::Output& out) {
             if (args.size() != 9) {
                 out.PrintLine("usage: prim_plane <id> <nx> <ny> <nz> <d> <material> <r> <g> <b>");

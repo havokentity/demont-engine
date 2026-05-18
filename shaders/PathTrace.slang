@@ -701,8 +701,6 @@ cbuffer Push {
     uint _pad_light0;
     uint _pad_light1;
     uint _pad_light2;
-    uint _pad_celestials1;
-    uint _pad_celestials2;
     // MetalFX specular-guidance G-buffer write gates (issue #118).
     // The engine sets these only for MetalFX-family denoiser kinds
     // (DenoiserKind::MetalFX / SvgfBasicMetalFx / SvgfAtrousMetalFx)
@@ -719,6 +717,17 @@ cbuffer Push {
     uint write_roughness_gbuffer;
     uint write_specular_hit_distance_gbuffer;
     uint _pad_specular_gbuffers0;
+    // --- Water Phase 1 (#134) -------------------------------------------------
+    // See Engine.cpp's PtPush::water_params0 / water_params1 for full docs.
+    //   water_params0.xyz = Beer's-law absorption per channel (1/m).
+    //                  .w = refractive index (clamped to [1.0, 2.4] below).
+    //   water_params1.x  = wave_scale (cycles / m).
+    //                  .y = wave_amplitude (normal perturbation strength).
+    //                  .z = wave_speed (animation rate multiplier).
+    //                  .w = time_seconds (shared with cloud-wind accumulator).
+    float4 water_params0;
+    float4 water_params1;
+    // --- end Water Phase 1 ----------------------------------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -787,8 +796,6 @@ cbuffer Frame {
     uint _pad_light0;
     uint _pad_light1;
     uint _pad_light2;
-    uint _pad_celestials1;
-    uint _pad_celestials2;
     // See `write_specular_albedo_gbuffer` / `write_roughness_gbuffer` /
     // `write_specular_hit_distance_gbuffer` in the Metal Push cbuffer
     // above for semantics (issue #118 MetalFX specular guidance).
@@ -798,6 +805,11 @@ cbuffer Frame {
     uint write_roughness_gbuffer;
     uint write_specular_hit_distance_gbuffer;
     uint _pad_specular_gbuffers0;
+    // --- Water Phase 1 (#134) -------------------------------------------------
+    // See `water_params0` / `water_params1` in the Metal Push cbuffer above.
+    float4 water_params0;
+    float4 water_params1;
+    // --- end Water Phase 1 ----------------------------------------------------
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -832,6 +844,11 @@ import SdfFractals;
 static const uint MAT_LAMBERT    = 0u;
 static const uint MAT_METAL      = 1u;
 static const uint MAT_DIELECTRIC = 2u;
+// MAT_WATER (Phase 1, #134): analytic plane with normal-map waves +
+// Schlick Fresnel + Snell refraction + Beer's-law absorption. Driven
+// by water_params0 / water_params1 push fields.  Behaves like a
+// dielectric for visibility/transmittance but with its own BRDF.
+static const uint MAT_WATER      = 3u;
 
 static const uint PRIM_SPHERE = 0u;
 static const uint PRIM_PLANE  = 1u;
@@ -2562,27 +2579,45 @@ float3 transmittance(float3 ro, float3 rd, float t_max) {
     for (int i = 0; i <= kMaxRefract; ++i) {
         HitInfo h = traceScene(o, d);
         if (!h.hit || h.t >= t_max) return t * cloud_t;     // unoccluded
-        if (h.mat != MAT_DIELECTRIC) return float3(0.0);    // opaque blocker
+        // Water (#134) joins dielectric on the transmissive-blocker list.
+        // Both refract the shadow ray; only water folds Beer's-law
+        // absorption into the transmittance via water_params0.xyz.
+        bool is_transparent = (h.mat == MAT_DIELECTRIC) || (h.mat == MAT_WATER);
+        if (!is_transparent)         return float3(0.0);    // opaque blocker
         if (i == kMaxRefract)        return float3(0.0);    // budget hit
 
-        // Refract through the dielectric face. Same Snell + Fresnel
-        // logic as the path-tracer's dielectric BRDF, but we keep
-        // only the transmitted lobe (the reflected lobe doesn't reach
-        // the light along this path). Fresnel is folded into the
-        // transmittance so glancing angles correctly attenuate.
+        // Refract through the dielectric / water face. Same Snell +
+        // Fresnel logic as the path-tracer's dielectric BRDF, but we
+        // keep only the transmitted lobe (the reflected lobe doesn't
+        // reach the light along this path). Fresnel is folded into
+        // the transmittance so glancing angles correctly attenuate.
         float ndi   = dot(h.normal, d);
         float3 nf   = (ndi < 0.0) ? h.normal : -h.normal;
-        float ior_a = (ndi < 0.0) ? 1.0   : h.ior;
-        float ior_b = (ndi < 0.0) ? h.ior : 1.0;
+        float interface_ior = (h.mat == MAT_WATER)
+            ? clamp(h.ior > 0.0 ? h.ior : water_params0.w, 1.0, 2.4)
+            : h.ior;
+        float ior_a = (ndi < 0.0) ? 1.0           : interface_ior;
+        float ior_b = (ndi < 0.0) ? interface_ior : 1.0;
         float eta   = ior_a / ior_b;
         float cos_i = abs(dot(nf, -d));
-        float r0    = (ior_a - ior_b) / (ior_a + ior_b);
-        r0 = r0 * r0;
+        float r0    = (h.mat == MAT_WATER)
+            ? 0.02                             // accurate F0 for water at 0 deg
+            : ((ior_a - ior_b) / (ior_a + ior_b)) * ((ior_a - ior_b) / (ior_a + ior_b));
         float fr    = fresnelSchlick(cos_i, r0);   // reflected fraction
         float3 refracted = refract(d, nf, eta);
         if (length(refracted) < 1e-3) return float3(0.0);   // TIR
-        // Transmitted fraction times Beer-ish tint.
-        t *= (1.0 - fr) * h.albedo;
+        // Transmitted fraction times Beer-ish tint.  Water uses its own
+        // per-channel exp(-absorption * nominal_seg) instead of h.albedo
+        // (which would be neutral 1,1,1 for a water plane).
+        if (h.mat == MAT_WATER) {
+            float3 absorb = water_params0.xyz;
+            // Same nominal segment used in the water BRDF branch -- keeps
+            // shadow-ray attenuation visually consistent with primary-ray
+            // throughput tint when sunlight reaches the underwater geometry.
+            t *= (1.0 - fr) * exp(-absorb * 1.5);
+        } else {
+            t *= (1.0 - fr) * h.albedo;
+        }
         // Step past the interface, continue in the refracted direction.
         float advance = h.t + 1e-3;
         o = o + d * advance;
@@ -2597,6 +2632,66 @@ float3 transmittance(float3 ro, float3 rd, float t_max) {
 bool occluded(float3 ro, float3 rd, float t_max) {
     return all(transmittance(ro, rd, t_max) <= float3(0.0));
 }
+
+// --- Water Phase 1 (#134) --------------------------------------------------
+// Build a perturbed surface normal for MAT_WATER hits.  The geometry stays
+// a flat analytic plane (h.normal is the macro normal); only the SHADING
+// normal is animated.  We approximate the gradient of a 2-octave value-
+// noise scalar field over world-space tangent coords with two finite-
+// difference samples per axis -- cheap (4 noise evals per hit), no curl
+// machinery needed (true curl-noise is solenoidal and unsigned, which is
+// overkill for a shading-only perturbation).
+//
+// Inputs:
+//   world_p : surface hit point in world space (xz used; y irrelevant for
+//             a horizontal water plane).
+//   macro_n : geometric normal (unit, world space).
+//
+// Output: unit normal in world space, perturbed in the plane orthogonal
+// to macro_n.  Amplitude / frequency / time drive comes from water_params1.
+// The macro normal is preserved verbatim when amplitude == 0 (regression-
+// safe path for goldens that pin r_water_wave_amplitude 0).
+float3 waterShadingNormal(float3 world_p, float3 macro_n) {
+    float scale = water_params1.x;
+    float amp   = water_params1.y;
+    float speed = water_params1.z;
+    float t     = water_params1.w * speed;
+    if (amp <= 0.0 || scale <= 0.0) return macro_n;
+
+    // 2-octave fbm-ish sum.  We sample two displaced copies of the noise
+    // field (each animated in a different direction) and finite-difference
+    // them in both x and z.  Mixing two drift directions decorrelates the
+    // axis-aligned ripple lines that a single advected octave produces.
+    // Frequencies match cloud_fbm's 2.02x multiplier so we don't introduce
+    // axis-aligned aliasing artefacts.
+    const float eps = 0.15;
+    float2 p_xz = float2(world_p.x, world_p.z) * scale;
+    // Octave A: drift along +x at unit speed.
+    float2 drift_a = float2(0.13, 0.07) * t;
+    // Octave B: drift along ~diagonal at 2.02x freq.
+    float2 drift_b = float2(-0.09, 0.11) * t;
+
+    float n_px = cloud_value_noise(float3(p_xz.x + eps, 0.0, p_xz.y) + float3(drift_a, 0).xzy)
+               + 0.5 * cloud_value_noise(float3(p_xz.x * 2.02 + eps, 0.0, p_xz.y * 2.02) + float3(drift_b, 0).xzy);
+    float n_nx = cloud_value_noise(float3(p_xz.x - eps, 0.0, p_xz.y) + float3(drift_a, 0).xzy)
+               + 0.5 * cloud_value_noise(float3(p_xz.x * 2.02 - eps, 0.0, p_xz.y * 2.02) + float3(drift_b, 0).xzy);
+    float n_pz = cloud_value_noise(float3(p_xz.x, 0.0, p_xz.y + eps) + float3(drift_a, 0).xzy)
+               + 0.5 * cloud_value_noise(float3(p_xz.x * 2.02, 0.0, p_xz.y * 2.02 + eps) + float3(drift_b, 0).xzy);
+    float n_nz = cloud_value_noise(float3(p_xz.x, 0.0, p_xz.y - eps) + float3(drift_a, 0).xzy)
+               + 0.5 * cloud_value_noise(float3(p_xz.x * 2.02, 0.0, p_xz.y * 2.02 - eps) + float3(drift_b, 0).xzy);
+    float dh_dx = (n_px - n_nx) / (2.0 * eps);
+    float dh_dz = (n_pz - n_nz) / (2.0 * eps);
+    // Build tangent frame at macro_n.  Standard branchless basis.
+    float3 t1 = abs(macro_n.y) < 0.99 ? float3(0, 1, 0) : float3(1, 0, 0);
+    float3 tx = normalize(cross(t1, macro_n));
+    float3 tz = cross(macro_n, tx);
+    // Bump along the tangent frame.  Empirically the noise gradient
+    // magnitude is ~0.5..1.0, so multiplying by amp directly gives a
+    // perceptual rate of perturbation matching the cvar's documented range.
+    float3 perturbed = macro_n - amp * (dh_dx * tx + dh_dz * tz);
+    return normalize(perturbed);
+}
+// --- end Water Phase 1 -----------------------------------------------------
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -3333,7 +3428,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
             skip_sky_on_miss = false;   // metal didn't NEE; sky on miss is real
             prev_was_lambert_nee = false;   // specular bounce: MIS doesn't apply here
         }
-        else {  // dielectric
+        else if (h.mat == MAT_DIELECTRIC) {
             float ior_a = (ndi < 0.0) ? 1.0   : h.ior;
             float ior_b = (ndi < 0.0) ? h.ior : 1.0;
             float eta = ior_a / ior_b;
@@ -3353,6 +3448,84 @@ void main(uint2 tid : SV_DispatchThreadID) {
             }
             skip_sky_on_miss = false;   // dielectric didn't NEE either
             prev_was_lambert_nee = false;   // specular/refraction: MIS doesn't apply
+        }
+        else {  // MAT_WATER (#134)
+            // Phase 1 water: shading-normal-perturbed analytic plane with
+            // Schlick Fresnel (F0=0.02), Snell refraction via the refract()
+            // builtin, and Beer's-law absorption applied to the refracted
+            // segment via a throughput multiply.  No NEE on the water
+            // surface itself -- the reflected / refracted ray inherits the
+            // current throughput and the next bounce handles direct
+            // lighting through whichever medium the ray entered.
+            //
+            // Perturbed shading normal.  Geometric ndi-driven sign was
+            // computed off h.normal (geometric); use it to orient the
+            // shading normal toward the incoming ray, so under-water hits
+            // (sphere submerged) and above-water hits share one branch.
+            float water_ior = clamp(h.ior > 0.0 ? h.ior : water_params0.w,
+                                    1.0, 2.4);
+            float3 shading_n = waterShadingNormal(hit_pt, h.normal);
+            float ndi_s = dot(shading_n, rd);
+            float3 nf_s = (ndi_s < 0.0) ? shading_n : -shading_n;
+
+            float ior_a = (ndi_s < 0.0) ? 1.0       : water_ior;
+            float ior_b = (ndi_s < 0.0) ? water_ior : 1.0;
+            float eta = ior_a / ior_b;
+            float cos_i = abs(dot(nf_s, -rd));
+            // Schlick F0 for water (1.33 vs air = 0.02041).  Hard-coded
+            // here so the cvar can dial ior without the Fresnel split
+            // ratio drifting -- F0=0.02 is the perceptually-correct value
+            // physically-based renderers use even when ior is mildly
+            // perturbed.  fresnelSchlick gives the reflected fraction.
+            const float F0_water = 0.02;
+            float fr = fresnelSchlick(cos_i, F0_water);
+            float3 reflected = reflect(rd, nf_s);
+            float3 refracted = refract(rd, nf_s, eta);
+            bool tir = (length(refracted) < 1e-3);
+            if (tir || randf(seed) < fr) {
+                // Reflection: surface acts like a coated mirror.  No
+                // absorption multiplied -- the reflected ray never
+                // entered the water body.
+                rd = reflected;
+                ro = hit_pt + nf_s * 1e-3;
+            } else {
+                // Refraction: the ray enters the water medium.  Apply
+                // Beer's law along the refracted segment.  We don't yet
+                // know the segment length (it ends at the next surface
+                // hit), so we fold absorption into throughput as a
+                // distance-running attenuation: estimate the path length
+                // as the segment to the next traceScene() hit using the
+                // analytic ray-plane crossing for the *exit* side.
+                //
+                // Phase 1 simplification: apply absorption only when
+                // ENTERING the water body (ndi_s < 0 means the macro
+                // normal pointed away from the incoming ray, so we're
+                // going from air -> water).  When exiting (ndi_s > 0,
+                // ray inside water travelling toward the surface), the
+                // attenuation should already have been folded in by
+                // whatever surface scatter produced the upward ray.
+                //
+                // Approximation: use the macro plane's y coordinate as
+                // the surface altitude.  The refracted ray segment runs
+                // from hit_pt until it intersects scene geometry (next
+                // bounce).  As an MVP we don't track distance per-bounce
+                // through the medium; instead we apply a constant tint
+                // based on a nominal segment of ~h.t magnitude scaled by
+                // 1.5 (the average path length through a few-metres-deep
+                // body).  This is honest about being approximate -- the
+                // user-tunable absorption_r/g/b can be tuned for the
+                // intended look at the intended depth.  Phase 4 (SSS)
+                // will track per-bounce in-medium distance.
+                if (ndi_s < 0.0) {
+                    float seg_estimate = 1.5;     // nominal metres
+                    float3 absorb = water_params0.xyz;
+                    throughput *= exp(-absorb * seg_estimate);
+                }
+                rd = normalize(refracted);
+                ro = hit_pt - nf_s * 1e-3;
+            }
+            skip_sky_on_miss = false;
+            prev_was_lambert_nee = false;
         }
 
             if (b >= 2u) {
