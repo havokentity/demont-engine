@@ -12827,6 +12827,10 @@ void Engine::RegisterSdfCommands() {
 // the particle pool. User-authored prims (via `prim_sphere`) are
 // untouched.
 //
+// `phys_ls` lists every physics-owned body (particles + rigid bodies)
+// with prim_id, position, speed estimate, mass, and Lambert albedo --
+// the introspection counterpart to `phys_drop_*` / `phys_clear`.
+//
 // `phys_status` dumps the integrator's current state for sanity checks.
 
 void Engine::RegisterPhysicsCommands() {
@@ -13103,7 +13107,9 @@ void Engine::RegisterPhysicsCommands() {
         });
 
     C.RegisterCommand("phys_status",
-        "Print the current Verlet physics layer status (enabled, particle count, gravity / damping / substeps).",
+        "Print the current Verlet physics layer status (enabled, particle / rigid-body counts, "
+        "gravity / damping / substeps, debug_viz). One-line summary intended for the chat-style "
+        "console transcript.",
         [this](auto, pt::console::Output& out) {
             if (!physics_) { out.PrintLine("phys_status: physics system not initialised"); return; }
             auto& Cl = pt::console::Console::Get();
@@ -13111,17 +13117,136 @@ void Engine::RegisterPhysicsCommands() {
             int  sub = 8;
             float gy  = -9.81f;
             float dmp = 0.99f;
-            if (auto* v = Cl.FindCVar("phys_enabled"))   en  = v->GetBool();
-            if (auto* v = Cl.FindCVar("phys_substeps"))  sub = v->GetInt();
-            if (auto* v = Cl.FindCVar("phys_gravity_y")) gy  = v->GetFloat();
-            if (auto* v = Cl.FindCVar("phys_damping"))   dmp = v->GetFloat();
-            out.FormatLine("phys: enabled={} particles={}/{} rigid_bodies={}/{} gravity_y={:.3f} m/s^2 substeps={} damping={:.4f}",
+            // debug_viz mirrors r_phys_debug_visualize (#181). Treated as a
+            // straight int so a future ramp/heat-map mode (>1) prints
+            // its raw value rather than getting boolean-coerced to 1.
+            int  viz = 0;
+            if (auto* v = Cl.FindCVar("phys_enabled"))           en  = v->GetBool();
+            if (auto* v = Cl.FindCVar("phys_substeps"))          sub = v->GetInt();
+            if (auto* v = Cl.FindCVar("phys_gravity_y"))         gy  = v->GetFloat();
+            if (auto* v = Cl.FindCVar("phys_damping"))           dmp = v->GetFloat();
+            if (auto* v = Cl.FindCVar("r_phys_debug_visualize")) viz = v->GetInt();
+            out.FormatLine("phys: enabled={} particles={}/{} rigid_bodies={}/{} gravity_y={:.3f} m/s^2 substeps={} damping={:.4f} debug_viz={}",
                            en ? 1 : 0,
                            physics_->AliveCount(),
                            physics_->Capacity(),
                            physics_->RbAliveCount(),
                            physics_->RbCapacity(),
-                           gy, sub, dmp);
+                           gy, sub, dmp, viz);
+        });
+
+    // `phys_ls` -- list every physics-owned body (particles + rigid bodies)
+    // alongside its paired analytic-prim id, position, speed estimate, mass,
+    // and per-body colour. Useful for sanity-checking that a `phys_drop_*`
+    // call actually landed in the pool and is being driven, and for spotting
+    // run-away velocities before `phys_clear` ing the scene.
+    //
+    // Velocity reporting: Verlet stores prev/curr positions, so the implicit
+    // velocity is `(curr - prev) / sdt`. `phys_ls` is a console command (no
+    // tick context), so we derive `sdt` from `phys_substeps` plus a nominal
+    // 1/60 s frame_dt -- matching what StepPhysics would compute on a typical
+    // 60 Hz frame. The resulting speed is therefore an ESTIMATE; if the user
+    // is running at a wildly different frame rate the absolute number will
+    // be off, but the ranking and "is it moving at all?" signal stays
+    // honest. This is the same pragmatic compromise the velocity debug viz
+    // (#181) lives with.
+    C.RegisterCommand("phys_ls",
+        "List every physics-owned body (particles + rigid bodies) with prim_id, position, "
+        "estimated speed (m/s @ 60 Hz), mass, and Lambert albedo.",
+        [this](auto, pt::console::Output& out) {
+            if (!physics_) { out.PrintLine("phys_ls: physics system not initialised"); return; }
+            const std::uint32_t n_particles = physics_->AliveCount();
+            const std::uint32_t n_bodies    = physics_->RbAliveCount();
+            if (n_particles + n_bodies == 0) {
+                out.PrintLine("phys_ls: no rigid bodies");
+                return;
+            }
+            // Pull substep count from cvar so the (curr - prev) / sdt
+            // estimate uses the same value StepPhysics will on the next
+            // tick. Clamp mirrors PhysicsSystem::Step (see comments
+            // there) so a phys_substeps=0 doesn't blow up the divide.
+            auto& Cl = pt::console::Console::Get();
+            int substeps = 8;
+            if (auto* v = Cl.FindCVar("phys_substeps")) substeps = v->GetInt();
+            if (substeps < 1)  substeps = 1;
+            if (substeps > 32) substeps = 32;
+            constexpr float kNominalFrameDt = 1.0f / 60.0f;
+            const float inv_sdt = float(substeps) / kNominalFrameDt;
+
+            // Table header. Widths picked to fit the typical Lambert
+            // primitive: 12-digit prim_id (physics ids start at 100000),
+            // three 7-char position columns, 7-char speed, 6-char mass,
+            // RGB. Fits a standard 80-col terminal at full precision.
+            out.FormatLine("phys_ls: {} particle(s) + {} rigid body(ies)", n_particles, n_bodies);
+            out.PrintLine("  idx  prim_id        pos (x, y, z)                  speed   mass    rgb");
+
+            // Particle pool first. ForEach is a C-style callback, so we
+            // bounce engine state through a Ctx struct. The lambda
+            // captures nothing (decays via unary +) so it can satisfy
+            // the function-pointer signature without an std::function
+            // allocation per call.
+            struct LsCtx {
+                pt::console::Output*                                 out      = nullptr;
+                const std::map<std::uint32_t, Engine::AnalyticPrim>* prims    = nullptr;
+                float                                                inv_sdt  = 0.0f;
+                std::uint32_t                                        idx      = 0;
+                const char*                                          kind     = "particle";
+            };
+            LsCtx ctx{};
+            ctx.out      = &out;
+            ctx.prims    = &primitives_;
+            ctx.inv_sdt  = inv_sdt;
+            ctx.kind     = "particle";
+
+            auto particle_cb = +[](pt::physics::PhysicsSystem::Handle /*h*/,
+                                   const pt::physics::Particle& p,
+                                   std::uint32_t prim_id, void* user) {
+                auto* c = static_cast<LsCtx*>(user);
+                const glm::vec3 dv = p.curr_pos - p.prev_pos;
+                const float speed  = glm::length(dv) * c->inv_sdt;
+                const float mass   = (p.inv_mass > 0.0f) ? (1.0f / p.inv_mass) : 0.0f;
+                float r = 0.0f, g = 0.0f, b = 0.0f;
+                if (auto it = c->prims->find(prim_id); it != c->prims->end()) {
+                    r = it->second.albedo[0];
+                    g = it->second.albedo[1];
+                    b = it->second.albedo[2];
+                }
+                c->out->FormatLine("  [{:>2}] {:<8} {:>12} ({:>6.2f}, {:>6.2f}, {:>6.2f}) {:>6.2f}  {:>5.2f}  ({:.2f}, {:.2f}, {:.2f})",
+                                   c->idx, c->kind, prim_id,
+                                   p.curr_pos.x, p.curr_pos.y, p.curr_pos.z,
+                                   speed, mass, r, g, b);
+                ++c->idx;
+            };
+            physics_->ForEach(particle_cb, &ctx);
+
+            // Rigid bodies second. Same shape; pull mass from RigidBody's
+            // inv_mass (mirrors Particle's storage convention). Speed
+            // uses (curr - prev) / sdt the same way -- rotational
+            // (omega) state is real but intentionally NOT surfaced here:
+            // a phys_ls scan should fit one body per line; users who
+            // care about angular state should reach for a future
+            // phys_inspect <prim_id> command.
+            ctx.kind = "rigid";
+            auto rb_cb = +[](pt::physics::PhysicsSystem::RbHandle /*h*/,
+                             const pt::physics::RigidBody& b,
+                             std::uint32_t prim_id, void* user) {
+                auto* c = static_cast<LsCtx*>(user);
+                const glm::vec3 dv = b.curr_pos - b.prev_pos;
+                const float speed  = glm::length(dv) * c->inv_sdt;
+                const float mass   = (b.inv_mass > 0.0f) ? (1.0f / b.inv_mass) : 0.0f;
+                float r = 0.0f, g = 0.0f, bl = 0.0f;
+                if (auto it = c->prims->find(prim_id); it != c->prims->end()) {
+                    r  = it->second.albedo[0];
+                    g  = it->second.albedo[1];
+                    bl = it->second.albedo[2];
+                }
+                c->out->FormatLine("  [{:>2}] {:<8} {:>12} ({:>6.2f}, {:>6.2f}, {:>6.2f}) {:>6.2f}  {:>5.2f}  ({:.2f}, {:.2f}, {:.2f})",
+                                   c->idx, c->kind, prim_id,
+                                   b.curr_pos.x, b.curr_pos.y, b.curr_pos.z,
+                                   speed, mass, r, g, bl);
+                ++c->idx;
+            };
+            physics_->ForEachRigidBody(rb_cb, &ctx);
         });
 }
 
