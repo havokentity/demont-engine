@@ -234,7 +234,7 @@ namespace cvar {
     // https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/for-best-performance--use-dxgi-flip-model);
     // safe only for software-fresh-start sessions. The cvar takes
     // effect on the next backend (re)initialise. No-op on Mac/Linux.
-    PT_CVAR(r_software_blit,   "vulkan",   "Software backend present path on Windows: vulkan (default; spec-compliant across all backend switches; minimal extra VkInstance) | gdi (legacy SetDIBitsToDevice; broken after vulkan -> software switch per Microsoft DXGI flip-model lockout). No-op on Mac/Linux.", CVAR_ARCHIVE);
+    PT_CVAR(r_software_blit,   "vulkan",   "Software backend present path on Windows: vulkan (default; spec-compliant across all backend switches; minimal extra VkInstance) | gdi (legacy SetDIBitsToDevice; broken after vulkan -> software switch per Microsoft DXGI flip-model lockout). No-op on Mac/Linux.", CVAR_ARCHIVE | CVAR_PLATFORM_WIN);
     // r_software_blit_recreate selects the behaviour when the vulkan ->
     // software switch happens with r_software_blit=gdi (the DXGI flip-
     // model lockout scenario; see r_software_blit docs above and the
@@ -255,7 +255,7 @@ namespace cvar {
     // Takes effect on the next such switch.
     PT_CVAR(r_software_blit_recreate, "auto",
             "Win32 only: behaviour when r_backend switches vulkan -> software with r_software_blit=gdi. auto (default) = in-process HWND recreate so GDI works on the fresh HWND | prompt = MessageBox Restart Now? (Yes spawns fresh process with original argv) | warn = legacy LOG_WARN, manual restart. No-op on Mac/Linux.",
-            CVAR_ARCHIVE);
+            CVAR_ARCHIVE | CVAR_PLATFORM_WIN);
     PT_CVAR(r_max_bounces,     "8",  "Max path bounces per ray",          CVAR_ARCHIVE);
     PT_CVAR(r_spp,             "1",  "Samples per pixel per dispatch (>=1). Higher = cleaner motion frames at proportional GPU cost.", CVAR_ARCHIVE);
     PT_CVAR(r_firefly_clamp,   "10",  "Per-contribution firefly clamp (per-channel ceiling on each indirect light contribution: env-NEE, ambient skylight, bounce-to-sky). Suppresses single-sample spikes from BSDF-sampled bounces hitting an HDRI sun pixel, while leaving camera-direct sky unbounded so the sun renders at full intensity. ACES saturates anything above ~5 to ~1.0 for SDR, so 10 preserves visible highlights and kills fireflies. 0 disables.", CVAR_ARCHIVE);
