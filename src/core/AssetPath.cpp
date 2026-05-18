@@ -21,10 +21,16 @@ namespace pt {
 namespace {
 
 // One-shot resolution of the asset root. Returns DEMONT_ASSET_ROOT when
-// set and non-empty, otherwise the grandparent of the running exe (i.e.
-// <root>/bin/exe -> <root>; <build>/src/app/demont -> <build>/src). Dev
-// builds rely on the pt_render_one_frame wrapper to inject the env var
-// explicitly; the exe-grandparent fallback is the packaged-install path.
+// set and non-empty, otherwise walks up from the running exe looking for
+// a directory containing one of: `assets/` (packaged install or dev tree),
+// `.git/` (dev checkout root), or `CMakeLists.txt` (project root). The
+// walk is necessary because the exe's depth relative to the asset root
+// varies by layout:
+//   packaged install:           <root>/bin/demont               (1 up)
+//   IDE direct dev run:         <root>/build/<preset>/src/app/  (4 up)
+//   ctest cell:                 <root>/build/<preset>/golden_workdir/<cell>/ (4 up)
+//   pt_render_one_frame wrapper sets DEMONT_ASSET_ROOT explicitly so its
+//   child demont never falls through here.
 std::filesystem::path ResolveRootOnce(const char*& source_out) {
     namespace fs = std::filesystem;
 
@@ -34,7 +40,6 @@ std::filesystem::path ResolveRootOnce(const char*& source_out) {
         return fs::path(env);
     }
 
-    source_out = "exe-parent";
 #if defined(_WIN32)
     wchar_t buf[MAX_PATH];
     DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
@@ -59,6 +64,33 @@ std::filesystem::path ResolveRootOnce(const char*& source_out) {
     buf[n] = '\0';
     fs::path exe(buf);
 #endif
+
+    // Walk up from the exe dir looking for a project / install marker.
+    // Bounded at 8 levels; normal layouts need at most 4.
+    std::error_code ec;
+    fs::path dir = exe.parent_path();
+    for (int depth = 0; depth < 8; ++depth) {
+        if (fs::is_directory(dir / "assets", ec)) {
+            source_out = "marker:assets";
+            return dir;
+        }
+        if (fs::exists(dir / ".git", ec)) {
+            source_out = "marker:.git";
+            return dir;
+        }
+        if (fs::exists(dir / "CMakeLists.txt", ec)) {
+            source_out = "marker:CMakeLists.txt";
+            return dir;
+        }
+        const fs::path parent = dir.parent_path();
+        if (parent == dir) break;  // filesystem root
+        dir = parent;
+    }
+
+    // No marker found in 8 levels -- preserve the legacy exe-grandparent
+    // behaviour so packaged installs that lack any marker still resolve
+    // approximately as before.
+    source_out = "exe-grandparent-fallback";
     return exe.parent_path().parent_path();
 }
 
