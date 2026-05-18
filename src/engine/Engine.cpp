@@ -10230,7 +10230,8 @@ void Engine::RegisterCommands() {
     // follow-ups against the renderer's TLAS.
     C.RegisterCommand("audio_play",
         "Play a sound file (WAV) at the camera position with 1/r distance "
-        "attenuation and equal-power stereo pan. Usage: audio_play <path>",
+        "attenuation and equal-power stereo pan. Usage: audio_play <path> "
+        "(quote the path if it contains spaces, e.g. audio_play \"my asset.wav\")",
         [this](auto args, pt::console::Output& out) {
             if (args.empty()) {
                 out.PrintLine("audio_play: missing path argument");

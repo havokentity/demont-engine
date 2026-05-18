@@ -34,6 +34,16 @@
 //   - The miniaudio device callback runs on a high-priority audio thread
 //     and reads voice + listener state via atomics. No allocation, no
 //     locks, no syscalls in the callback.
+//
+// Spatial-audio scope (a clarification to the "what IS wired" block
+// above): moving SOURCES are not supported in MVP. Source pos is fixed
+// at PlaySound time and never re-read by the engine. The LISTENER
+// (camera) can move freely -- Tick() publishes the latest listener
+// pos / fwd each frame and recomputes per-voice stereo gains against
+// the moving camera, so a one-shot fired from a fixed point will
+// attenuate and pan correctly as the camera flies around it. The
+// fixed-source limitation matters only for sounds attached to moving
+// game objects, which is a follow-up.
 
 #pragma once
 

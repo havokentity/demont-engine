@@ -21,7 +21,8 @@
 // the single-header compile-time switches take effect.
 //
 // MA_NO_GENERATION: drops generic generation / waveform helpers (sine,
-//   square, etc.) we don't use.
+//   square, etc.) we don't use. Documented in miniaudio.h's header
+//   compile-time-options table -- not a no-op.
 // MA_NO_ENCODING: drops the writer side (we only decode WAV from disk).
 // MA_NO_VORBIS / MA_NO_FLAC / MA_NO_MP3: lean MVP -- WAV only. miniaudio
 //   itself can natively decode WAV without external deps; vorbis/flac
@@ -77,6 +78,16 @@ inline std::uint32_t GenOf(VoiceHandle h)  { return static_cast<std::uint32_t>(h
 // at MVP scale) and stream from the in-memory buffer in the callback.
 // Mono assets get duplicated to both channels; multi-channel assets are
 // downmixed to mono first then duplicated.
+//
+// Stored in a vector<unique_ptr<Sound>>: the unique_ptr layer is what
+// gives us address-stability across LoadSound calls. push_back on the
+// outer vector may relocate the unique_ptr handles, but the audio
+// callback dereferences via the pointer's value (which is stable across
+// the relocation, since unique_ptr stores a raw heap pointer). Combined
+// with Impl::sound_count -- an atomic snapshot of the valid index range
+// the callback is allowed to see -- this gives the callback a safe
+// read-side without a lock on the hot path. See the LoadSound +
+// DataCallback comments for the publication discipline.
 struct Sound {
     std::vector<float> frames;     // interleaved kChannels samples
     std::uint64_t      frame_count = 0;  // == frames.size() / kChannels
@@ -87,25 +98,49 @@ struct Sound {
 // `sound_id`, `cursor`, `pos`, `gain` atomically; the main thread
 // writes them via PlaySound / Stop.
 //
-// To avoid tearing on the 3D pos vector (writing 3 floats isn't atomic
-// on any architecture), we publish under a sequence-lock-like discipline:
-// the audio callback samples pos exactly ONCE per buffer-fill and the
-// main thread's only mutator is PlaySound (which runs while the slot is
-// inactive). After PlaySound flips `active` to true the audio thread
-// owns the slot's pos field; later movement of the source is NOT
-// supported in MVP (one-shots assumed to be effectively point-in-time
-// for their duration of < 1 s). Moving sources is a follow-up.
+// Threading model:
+//   - The audio callback is the SOLE writer of `cursor` -- the main
+//     thread never touches it after PlaySound's initial zero-init
+//     (which happens while `active==false`, so the callback is not
+//     reading the slot at that point).
+//   - The audio callback is the SOLE entity that flips `active` from
+//     true -> false at voice-natural-end (cursor reached frame_count)
+//     and the SOLE entity that bumps `generation` at that transition.
+//     Stop() does NOT mutate `active` directly; instead it bumps
+//     `stop_request` and the callback observes it on its next pass and
+//     transitions the slot to free (along with the same generation
+//     bump it does on natural completion). This eliminates the
+//     "main thread flips active=false while callback is mid-read"
+//     race that the simpler design had.
+//   - PlaySound is the SOLE writer of `sound_id`, `pos`, `gain`, and
+//     publishes them BEFORE flipping `active` from false -> true via a
+//     release store. The audio callback's first load of `active` on
+//     each pass is an acquire load, so observing `active==true` also
+//     observes the published configuration. After publication the
+//     callback alone owns the slot until it transitions it back to
+//     free, so no further main-thread mutation is permitted.
 struct Voice {
     std::atomic<bool>          active   {false};
     std::atomic<std::uint32_t> generation {1};   // 0 reserved for kInvalidVoice
+    // Mailbox used by Stop() to ask the callback to free the slot at
+    // its next pass. The callback consumes (reset to 0) when it acts.
+    // Avoids the race where Stop()-on-main and callback-end-of-voice
+    // both try to flip `active` and bump `generation`.
+    std::atomic<std::uint32_t> stop_request {0};
+    // sound_id / pos / gain are published BY PlaySound BEFORE the
+    // active.store(true, release) handshake. The callback reads them
+    // AFTER its active.load(acquire) sees true. Both ends are stable
+    // for the duration of the voice (we never mutate them while
+    // active==true).
     SoundHandle                sound_id = kInvalidSound;
-    std::uint64_t              cursor   = 0;     // frame index into sound->frames
     glm::vec3                  pos      {0, 0, 0};
     float                      gain     = 1.0f;
-    // Cached left/right gains computed on PlaySound -- the callback
-    // doesn't try to recompute pan per frame since the listener's
-    // tick rate (~60 Hz) is much faster than a one-shot is typically
-    // long. Updated in Tick() if `track_listener_` is wired later.
+    // cursor is callback-only after PlaySound's initial zero. The main
+    // thread does not read it.
+    std::uint64_t              cursor   = 0;     // frame index into sound->frames
+    // Cached left/right gains computed on PlaySound. Tick() may also
+    // update these while the voice is active; both ends use atomic
+    // load/store so the callback never observes a torn value.
     std::atomic<float>         gain_l   {1.0f};
     std::atomic<float>         gain_r   {1.0f};
 };
@@ -160,23 +195,56 @@ struct AudioSystem::Impl {
     // we're already comfortably below typical worker contention.
     Voice voices[kMaxVoices] {};
 
-    // Sound bank. Index 0 is the kInvalidSound sentinel (never used);
-    // entry at index N is the sound with handle N. Grow-only.
-    std::vector<Sound>                 sounds;
+    // Sound bank. Held by unique_ptr so push_back-induced reallocation
+    // of the outer vector doesn't invalidate the Sound* the audio
+    // callback dereferences. Index 0 is the kInvalidSound sentinel
+    // (never used); entry at index N is the sound with handle N.
+    // Grow-only.
+    //
+    // Publication discipline for cross-thread reads:
+    //   - LoadSound builds a fully-decoded Sound under sounds_mutex,
+    //     stores the unique_ptr into the vector, then atomically
+    //     publishes `sound_count` (release) to make the new entry
+    //     visible to the audio callback.
+    //   - The audio callback loads `sound_count` (acquire) once per
+    //     pass and only reads sounds[0..sound_count-1]. That gives
+    //     it a stable view of the bank for the entire callback.
+    std::vector<std::unique_ptr<Sound>> sounds;
+    std::atomic<std::uint32_t>          sound_count {0};
     std::unordered_map<std::string,
-                       SoundHandle>    path_to_handle;
-    std::mutex                         sounds_mutex;   // guards LoadSound only
+                       SoundHandle>     path_to_handle;
+    std::mutex                          sounds_mutex;   // guards LoadSound bank-side only
 
-    // Atomic listener snapshot consumed by the callback. We avoid
-    // tearing by writing to the inactive slot and flipping
-    // listener_active_.
-    std::atomic<glm::vec3>             listener_pos  {glm::vec3{0, 1.5f, 4.0f}};
-    std::atomic<glm::vec3>             listener_fwd  {glm::vec3{0, 0, -1}};
+    // Atomic listener snapshot consumed by callers of PlaySound (the
+    // callback itself does NOT load these -- it uses the precomputed
+    // gain_l/gain_r atomics on each voice). We store xyz as three
+    // independent atomic<float>s rather than std::atomic<glm::vec3>
+    // because 12-byte atomics are not lock-free on most platforms,
+    // which would violate the header's "no locks" promise.
+    std::atomic<float> listener_pos_x {0.0f};
+    std::atomic<float> listener_pos_y {1.5f};
+    std::atomic<float> listener_pos_z {4.0f};
+    std::atomic<float> listener_fwd_x {0.0f};
+    std::atomic<float> listener_fwd_y {0.0f};
+    std::atomic<float> listener_fwd_z {-1.0f};
+    static_assert(std::atomic<float>::is_always_lock_free,
+                  "audio: atomic<float> must be lock-free for listener publication");
+    static_assert(std::atomic<bool>::is_always_lock_free,
+                  "audio: atomic<bool> must be lock-free for voice publication");
+    static_assert(std::atomic<std::uint32_t>::is_always_lock_free,
+                  "audio: atomic<uint32_t> must be lock-free for generation counter");
 
     Impl() {
-        // Reserve slot 0 for the kInvalidSound sentinel.
-        sounds.emplace_back();
-        sounds[0].path = "<invalid>";
+        // Reserve slot 0 for the kInvalidSound sentinel. Reserve also
+        // pre-allocates a generous upper bound so push_back doesn't
+        // reallocate during typical use; combined with unique_ptr
+        // boxing this gives us both pointer stability AND vector-handle
+        // stability under MVP load.
+        sounds.reserve(256);
+        sounds.emplace_back(std::make_unique<Sound>());
+        sounds[0]->path = "<invalid>";
+        sound_count.store(static_cast<std::uint32_t>(sounds.size()),
+                          std::memory_order_release);
     }
 };
 
@@ -198,20 +266,45 @@ static void DataCallback(ma_device* device, void* output, const void* /*input*/,
     float* out = static_cast<float*>(output);
     std::memset(out, 0, frame_count * kChannels * sizeof(float));
 
+    // Snapshot the published sound-bank size ONCE per callback. The
+    // pairing release store happens in LoadSound after the new entry
+    // is fully constructed; that gives us a safe upper bound on which
+    // indices into impl->sounds we may dereference for the rest of
+    // this callback.
+    const std::uint32_t sound_count =
+        impl->sound_count.load(std::memory_order_acquire);
+
     // Mix every active voice into the output buffer.
     for (std::uint32_t i = 0; i < AudioSystem::kMaxVoices; ++i) {
         Voice& v = impl->voices[i];
         if (!v.active.load(std::memory_order_acquire)) continue;
 
-        const SoundHandle sid = v.sound_id;
-        if (sid == kInvalidSound || sid >= impl->sounds.size()) {
-            // Defensive: shouldn't happen if PlaySound validated. Mute
-            // + free the slot.
+        // Honour an asynchronous Stop() request before doing any work
+        // on this voice. The main thread cannot flip `active` itself
+        // (it would race with the callback's writes to cursor / the
+        // free transition below); instead it bumps stop_request and we
+        // drain it here. Doing the drain at the TOP of the per-voice
+        // pass keeps the slot's transition-to-free atomic with respect
+        // to PlaySound's slot-reclaim CAS (a slot we just freed here
+        // is safe for PlaySound to immediately reuse).
+        if (v.stop_request.exchange(0, std::memory_order_acq_rel) != 0u) {
             v.active.store(false, std::memory_order_release);
             v.generation.fetch_add(1, std::memory_order_acq_rel);
             continue;
         }
-        const Sound& s = impl->sounds[sid];
+
+        // sid / pos / gain were published BY PlaySound BEFORE its
+        // active.store(true, release). Our active.load(acquire) above
+        // is the synchronizing read, so these are stable for the
+        // lifetime of the voice.
+        const SoundHandle sid = v.sound_id;
+        if (sid == kInvalidSound || sid >= sound_count) {
+            // Defensive: shouldn't happen if PlaySound validated.
+            v.active.store(false, std::memory_order_release);
+            v.generation.fetch_add(1, std::memory_order_acq_rel);
+            continue;
+        }
+        const Sound& s = *impl->sounds[sid];
         if (s.frame_count == 0) {
             v.active.store(false, std::memory_order_release);
             v.generation.fetch_add(1, std::memory_order_acq_rel);
@@ -283,27 +376,46 @@ void AudioSystem::Shutdown() {
     if (!running_.exchange(false, std::memory_order_acq_rel)) return;
 
     // Stop the device first so the data callback stops touching `impl_`
-    // before we tear voice state down.
+    // before we tear voice state down. After ma_device_uninit returns,
+    // the audio thread is guaranteed not to be inside DataCallback any
+    // longer, so we can directly clear voice state without going
+    // through the stop_request mailbox.
     ma_device_uninit(&impl_->device);
 
-    StopAll();
+    for (std::uint32_t i = 0; i < kMaxVoices; ++i) {
+        Voice& v = impl_->voices[i];
+        if (v.active.exchange(false, std::memory_order_acq_rel)) {
+            v.generation.fetch_add(1, std::memory_order_acq_rel);
+        }
+        v.stop_request.store(0, std::memory_order_relaxed);
+    }
+    impl_->sound_count.store(0, std::memory_order_release);
     impl_->sounds.clear();
     impl_->path_to_handle.clear();
     // Re-seed the invalid sentinel so a subsequent Init/LoadSound cycle
     // still treats handle 0 as bogus.
-    impl_->sounds.emplace_back();
-    impl_->sounds[0].path = "<invalid>";
+    impl_->sounds.emplace_back(std::make_unique<Sound>());
+    impl_->sounds[0]->path = "<invalid>";
+    impl_->sound_count.store(static_cast<std::uint32_t>(impl_->sounds.size()),
+                             std::memory_order_release);
 
     LOG_INFO("audio: device closed");
 }
 
 void AudioSystem::Tick(const glm::vec3& camera_pos, const glm::vec3& camera_fwd) {
     if (!running_.load(std::memory_order_acquire)) return;
-    impl_->listener_pos.store(camera_pos, std::memory_order_release);
-    impl_->listener_fwd.store(camera_fwd, std::memory_order_release);
+    impl_->listener_pos_x.store(camera_pos.x, std::memory_order_relaxed);
+    impl_->listener_pos_y.store(camera_pos.y, std::memory_order_relaxed);
+    impl_->listener_pos_z.store(camera_pos.z, std::memory_order_release);
+    impl_->listener_fwd_x.store(camera_fwd.x, std::memory_order_relaxed);
+    impl_->listener_fwd_y.store(camera_fwd.y, std::memory_order_relaxed);
+    impl_->listener_fwd_z.store(camera_fwd.z, std::memory_order_release);
     // Per-voice gain re-computation against the current listener so a
     // moving camera attenuates / pans an in-flight one-shot correctly.
-    // (Source pos is fixed at PlaySound time -- see Voice doc comment.)
+    // v.pos is published by PlaySound BEFORE active=true, and we only
+    // observe slots that are currently active. The callback never
+    // mutates v.pos. (Source pos is fixed at PlaySound time -- see
+    // Voice doc comment.)
     for (std::uint32_t i = 0; i < kMaxVoices; ++i) {
         Voice& v = impl_->voices[i];
         if (!v.active.load(std::memory_order_acquire)) continue;
@@ -315,7 +427,12 @@ void AudioSystem::Tick(const glm::vec3& camera_pos, const glm::vec3& camera_fwd)
 }
 
 SoundHandle AudioSystem::LoadSound(std::string_view path) {
-    if (!running_.load(std::memory_order_acquire)) return kInvalidSound;
+    // LoadSound is intentionally callable even when the device is NOT
+    // running -- it only touches the in-memory sound bank and
+    // miniaudio's file-decode path, neither of which depend on an open
+    // playback device. This lets headless / CI builds and tools
+    // pre-load assets before Init(), and PlaySound's `running_` guard
+    // still correctly drops playback attempts on a closed device.
 
     const std::string path_s(path);
     {
@@ -369,8 +486,14 @@ SoundHandle AudioSystem::LoadSound(std::string_view path) {
         auto it = impl_->path_to_handle.find(path_s);
         if (it != impl_->path_to_handle.end()) return it->second;
         h = static_cast<SoundHandle>(impl_->sounds.size());
-        impl_->sounds.push_back(std::move(s));
+        impl_->sounds.push_back(std::make_unique<Sound>(std::move(s)));
         impl_->path_to_handle.emplace(path_s, h);
+        // Publish the new size to the audio callback with release
+        // semantics. The unique_ptr pointee was fully constructed
+        // before push_back, so the callback observing sound_count >= h
+        // is guaranteed to also see the published Sound contents.
+        impl_->sound_count.store(static_cast<std::uint32_t>(impl_->sounds.size()),
+                                 std::memory_order_release);
     }
     LOG_INFO("audio: loaded '{}' ({} frames, {:.2f}s)",
              path_s, frame_count,
@@ -379,44 +502,63 @@ SoundHandle AudioSystem::LoadSound(std::string_view path) {
 }
 
 VoiceHandle AudioSystem::PlaySound(SoundHandle sound, const glm::vec3& pos, float gain) {
+    // PlaySound is documented as called from a single thread (the main
+    // engine thread). Validating the sound handle requires a quick
+    // peek into the bank; we use the atomic sound_count snapshot the
+    // callback also reads -- no mutex needed, and the vector entry at
+    // `sound < sound_count` is guaranteed published because LoadSound
+    // released sound_count AFTER its push_back.
     if (!running_.load(std::memory_order_acquire)) return kInvalidVoice;
     if (sound == kInvalidSound) return kInvalidVoice;
-    {
-        std::lock_guard<std::mutex> lk(impl_->sounds_mutex);
-        if (sound >= impl_->sounds.size() || impl_->sounds[sound].frame_count == 0) {
-            return kInvalidVoice;
-        }
-    }
+    const std::uint32_t known = impl_->sound_count.load(std::memory_order_acquire);
+    if (sound >= known) return kInvalidVoice;
+    if (impl_->sounds[sound]->frame_count == 0) return kInvalidVoice;
 
     // Find an inactive slot. Linear scan is fine at kMaxVoices=64.
+    // We do a simple acquire load to check `active`; PlaySound is the
+    // SOLE caller that flips active from false -> true and is
+    // documented as single-threaded, so no CAS is required to claim
+    // the slot. (If a future commit wants multi-threaded PlaySound,
+    // restore the CAS to true-with-a-configuring-sentinel pattern.)
     for (std::uint32_t i = 0; i < kMaxVoices; ++i) {
         Voice& v = impl_->voices[i];
-        bool expected = false;
-        if (!v.active.compare_exchange_strong(expected, false,
-                                              std::memory_order_acquire,
-                                              std::memory_order_relaxed)) {
-            // already active
-            continue;
-        }
-        // We now own slot `i` (it was inactive and we did NOT flip
-        // active yet -- the CAS only fenced the load. Configure the
-        // voice fully BEFORE we flip active to true; once it goes
-        // active the audio thread is reading.
-        v.sound_id = sound;
-        v.cursor   = 0;
-        v.pos      = pos;
-        v.gain     = gain;
+        if (v.active.load(std::memory_order_acquire)) continue;
+        // Snapshot the current generation BEFORE we publish active=true.
+        // After active=true the audio thread may complete the voice and
+        // bump generation in the same callback pass; reading generation
+        // here gives us the value the handle should encode (the slot's
+        // generation AT the moment we claimed it). Stop(handle) later
+        // does the same compare-against-original gen check.
+        const std::uint32_t handle_gen =
+            v.generation.load(std::memory_order_acquire);
 
-        // Initial pan from the current listener snapshot.
-        glm::vec3 lp = impl_->listener_pos.load(std::memory_order_acquire);
-        glm::vec3 lf = impl_->listener_fwd.load(std::memory_order_acquire);
+        // Configure the voice fully BEFORE we flip active to true; once
+        // it goes active the audio thread is reading.
+        v.sound_id     = sound;
+        v.cursor       = 0;
+        v.pos          = pos;
+        v.gain         = gain;
+        v.stop_request.store(0, std::memory_order_relaxed);
+
+        // Initial pan from the current listener snapshot. Atomic loads
+        // of the three float components -- not torn (each load is
+        // atomic). A brief inconsistency between x/y/z components if
+        // Tick() is mid-update is tolerable: the next Tick() will
+        // recompute gain_l/gain_r anyway and a single-callback bad pan
+        // is inaudible.
+        glm::vec3 lp{ impl_->listener_pos_x.load(std::memory_order_acquire),
+                      impl_->listener_pos_y.load(std::memory_order_acquire),
+                      impl_->listener_pos_z.load(std::memory_order_acquire) };
+        glm::vec3 lf{ impl_->listener_fwd_x.load(std::memory_order_acquire),
+                      impl_->listener_fwd_y.load(std::memory_order_acquire),
+                      impl_->listener_fwd_z.load(std::memory_order_acquire) };
         float l = 1.0f, r = 1.0f;
         ComputeStereoGains(pos, lp, lf, l, r);
         v.gain_l.store(l, std::memory_order_relaxed);
         v.gain_r.store(r, std::memory_order_relaxed);
 
         v.active.store(true, std::memory_order_release);
-        return MakeHandle(i, v.generation.load(std::memory_order_acquire));
+        return MakeHandle(i, handle_gen);
     }
     // Pool exhausted.
     LOG_WARN("audio: voice pool full ({} active voices); dropped one-shot",
@@ -432,8 +574,12 @@ void AudioSystem::Stop(VoiceHandle voice) {
     if (slot >= kMaxVoices) return;
     Voice& v = impl_->voices[slot];
     if (v.generation.load(std::memory_order_acquire) != gen) return;  // stale
-    v.active.store(false, std::memory_order_release);
-    v.generation.fetch_add(1, std::memory_order_acq_rel);
+    // Ask the callback to free the slot on its next pass rather than
+    // flipping `active` ourselves. Direct flipping would race with the
+    // callback's in-flight read of v.cursor (and would race with
+    // PlaySound's reclaim of the same slot in the same callback pass,
+    // since once `active==false` PlaySound treats it as free).
+    v.stop_request.store(1, std::memory_order_release);
 }
 
 std::uint32_t AudioSystem::StopAll() {
@@ -441,8 +587,8 @@ std::uint32_t AudioSystem::StopAll() {
     std::uint32_t n = 0;
     for (std::uint32_t i = 0; i < kMaxVoices; ++i) {
         Voice& v = impl_->voices[i];
-        if (v.active.exchange(false, std::memory_order_acq_rel)) {
-            v.generation.fetch_add(1, std::memory_order_acq_rel);
+        if (v.active.load(std::memory_order_acquire)) {
+            v.stop_request.store(1, std::memory_order_release);
             ++n;
         }
     }
