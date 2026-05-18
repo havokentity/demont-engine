@@ -3884,18 +3884,29 @@ void Engine::RenderFrame() {
     // --- end SDF Phase 1 ---------------------------------------------------
 
     // Celestials composite gate (issue #46). When set, PathTrace.slang
-    // subtracts starsOnly + sunDisc + moonDisc from the primary-miss
-    // sky term so denoise_color carries only the procedural sky base.
-    // The engine's StarsComposite kernel (dispatched after Denoise(),
-    // before bloom_pyramid) re-adds the celestials with N aperture-
-    // sampled rays per pixel, giving clean sub-pixel point sources +
-    // a single-frame bokeh disc on the sun/moon. Gated on
-    // (denoiser_active_ AND r_star_split AND procedural sky) -- the
-    // composite only meaningfully exists on the denoised path
-    // (denoiser-off renders are already sharp inline through
-    // PathTrace's own swapchain write); other sky modes either bake
-    // the celestials into env_map (hdri) or have no celestials
-    // (gradient).
+    // subtracts starsOnly + sunDisc + moonDisc + the procSky inline
+    // sun (disk + halo) from the primary-miss sky term so denoise_color
+    // carries only the procedural sky base. The engine's StarsComposite
+    // kernel (dispatched after Denoise(), before bloom_pyramid) re-adds
+    // the celestials with N aperture-sampled rays per pixel.
+    //
+    // CRITICAL: this gate must NOT fire when the composite dispatch
+    // won't actually run -- otherwise PathTrace peels celestials out
+    // of denoise_color and nothing adds them back. Conditions:
+    //   - denoiser_active_      : composite only exists post-denoise
+    //   - r_star_split on       : user opted in
+    //   - sky mode procedural   : only mode the composite handles
+    //                             (hdri bakes celestials into env_map,
+    //                             gradient sky has none)
+    //   - stars_composite_pipeline_id_ != 0 : Metal-only today; on
+    //                             Vulkan this stays zero so the gate
+    //                             collapses correctly to "no
+    //                             subtraction, legacy path" until the
+    //                             Vulkan compositor lands.
+    //   - cloud_trans_tex_id_ != 0 : composite reads this texture and
+    //                             would crash without it.
+    //   - depth_tex_id_ != 0   : composite reads this texture for the
+    //                             sky-pixel gate.
     bool engine_composite_active = false;
     {
         bool star_split_on = true;
@@ -3908,7 +3919,12 @@ void Engine::RenderFrame() {
                                                : 0;
         }
         engine_composite_active =
-            denoiser_active_ && star_split_on && (sky_mode_int == 2);
+            denoiser_active_ &&
+            star_split_on &&
+            (sky_mode_int == 2) &&
+            stars_composite_pipeline_id_ != 0 &&
+            cloud_trans_tex_id_ != 0 &&
+            depth_tex_id_ != 0;
         push.composite_celestials = engine_composite_active ? 1u : 0u;
     }
     for (auto& v : push._pad_star_split) v = 0u;
@@ -4946,15 +4962,27 @@ void Engine::RenderFrame() {
         // push.composite_celestials so we only dispatch when the path
         // tracer actually peeled the celestials out -- otherwise we'd
         // double-add.
+        // Dispatch gate mirrors the engine_composite_active conditions
+        // above PLUS moon_map availability (always non-zero in practice
+        // -- procedurally generated at engine init -- but belt-and-
+        // braces). star_map is handled by binding the 1x1 bloom_dummy
+        // as a placeholder when BSC isn't loaded, because the shader's
+        // procedural fallback path (r_stars_mode = procedural) doesn't
+        // sample star_map -- gating the dispatch on star_map_tex_id_
+        // != 0 would skip the WHOLE composite (sun + moon + procedural
+        // stars), but PathTrace already subtracted them so the user
+        // would lose all three celestials.
+        const std::uint64_t composite_star_map_id =
+            (star_map_tex_id_ != 0) ? star_map_tex_id_ : bloom_dummy_tex_id_;
         if (push.composite_celestials != 0u &&
             stars_composite_pipeline_id_ != 0 &&
-            star_map_tex_id_ != 0 &&
             moon_map_tex_id_ != 0 &&
             depth_tex_id_ != 0 &&
-            cloud_trans_tex_id_ != 0) {
+            cloud_trans_tex_id_ != 0 &&
+            composite_star_map_id != 0) {
             cb->BindComputePipeline(pt::rhi::PipelineHandle{stars_composite_pipeline_id_});
             cb->BindStorageTexture(0, pt::rhi::TextureHandle{tonemap_hdr_source_id});
-            cb->BindStorageTexture(1, pt::rhi::TextureHandle{star_map_tex_id_});
+            cb->BindStorageTexture(1, pt::rhi::TextureHandle{composite_star_map_id});
             cb->BindStorageTexture(2, pt::rhi::TextureHandle{moon_map_tex_id_});
             // depth_tex at engine slot 3 -> Metal MSL texture(3) by
             // declaration order. PathTrace's G-buffer pass writes a
@@ -4971,12 +4999,18 @@ void Engine::RenderFrame() {
             // shader multiplies the celestial contribution by it so
             // stars / sun / moon get darkened by foreground clouds.
             cb->BindStorageTexture(4, pt::rhi::TextureHandle{cloud_trans_tex_id_});
-            // Same exposure_state inheritance pattern as Tonemap.slang
-            // (the dummy `_slot_exposure_state` keeps Push at MSL
-            // buf(7)). Re-bind defensively in case PathTrace didn't run.
-            if (exposure_state_id_ != 0) {
-                cb->BindBuffer(6, pt::rhi::BufferHandle{exposure_state_id_}, 0);
-            }
+            // No buffer bindings: the StarsComposite kernel doesn't
+            // need exposure_state, and BindComputePipeline above cleared
+            // any PathTrace bindings that would have leaked through.
+            // Slang assigns Push to MSL buf(0); engine computes
+            // push_slot = max(bound_buf_slot)+1 = 0 (no buffer binds),
+            // so setBytes(push, 0) lines up with the kernel's
+            // expectation. The earlier _slot_* dummy declarations
+            // (which forced Push to buf(7) to inherit PathTrace's
+            // exposure_state slot) are gone for the same reason --
+            // they referenced slots BindComputePipeline cleared on
+            // Metal, which would have failed Metal's resource
+            // validation if the runtime-dead-branch ever evaluated.
 
             struct StarsCompositePush {
                 float        pos_fovtan[4];

@@ -1082,6 +1082,36 @@ float3 starsAtPrimaryMiss(float3 rd) {
     return float3(0.0);
 }
 
+// procSky's inline sun disk + halo, factored out so the b==0
+// celestials-composite subtraction can peel them off denoise_color.
+// procSky() ALSO renders an inline sun disk/halo (lines below) on top
+// of the regular `sunDisc()` overlay that skyColor() adds afterwards;
+// without subtracting THIS too, the denoiser still sees a sharp solar
+// disk and StarsComposite paints another sun on top -- two suns, one
+// noisy through SVGF/MetalFX, one clean from the composite. The
+// `wide` sunset-scatter term is INTENTIONALLY excluded: it's a smooth
+// atmospheric gradient (sunset glow across the sky) that benefits from
+// being denoised, isn't localized at the sun direction the same way,
+// and the composite has no equivalent to add back.
+//
+// Mirrored verbatim in shaders/StarsComposite.slang so any tuning here
+// must mirror there too (or the composite will under/over-restore the
+// sun and the disc brightness will drift between
+// composite-on / composite-off A/B).
+float3 procSkyInlineSunDiscAndHalo(float3 rd, float3 sun) {
+    float cosGamma = clamp(dot(rd, sun), -1.0, 1.0);
+    float sun_elev = sun.y;
+    float day      = smoothstep(-0.10, 0.20, sun_elev);
+    float disk     = smoothstep(0.99996, 0.99999, cosGamma);
+    float3 sun_color_high = float3(1.00, 0.95, 0.85);
+    float3 sun_color_low  = float3(1.00, 0.55, 0.20);
+    float3 sun_col = lerp(sun_color_low, sun_color_high, day);
+    float3 result  = disk * 50.0 * sun_col * day;
+    float halo     = pow(max(0.0, cosGamma), 80.0);
+    result += halo * sun_col * 0.30 * day;
+    return result;
+}
+
 float3 procSky(float3 rd, float3 sun) {
     float cosTheta = clamp(rd.y, -1.0, 1.0);    // 1=zenith, 0=horizon, -1=nadir
     float cosGamma = clamp(dot(rd, sun), -1.0, 1.0);
@@ -1124,18 +1154,19 @@ float3 procSky(float3 rd, float3 sun) {
     // skyColor() so stars contribute to indirect lighting.
     sky += starsOnly(rd, sun);
 
-    // Sun disk: very tight angular radius (~0.25 deg ~= cos > 0.99996).
-    float disk = smoothstep(0.99996, 0.99999, cosGamma);
+    // Sun disk + soft halo. Factored into procSkyInlineSunDiscAndHalo
+    // so the celestials-composite subtraction at b==0 can mirror these
+    // exact terms when removing the inline sun from denoise_color.
+    sky += procSkyInlineSunDiscAndHalo(rd, sun);
+
+    // Wider, dimmer secondary scatter (Rayleigh-tinted) extends the
+    // sunset orange across more of the sky. NOT included in the
+    // celestials-composite subtraction -- this is an atmospheric
+    // gradient that should stay in denoise_color and ride through
+    // the denoiser like the rest of the sky color.
     float3 sun_color_high = float3(1.00, 0.95, 0.85);
     float3 sun_color_low  = float3(1.00, 0.55, 0.20);
     float3 sun_col = lerp(sun_color_low, sun_color_high, day);
-    sky += disk * 50.0 * sun_col * day;
-
-    // Soft halo around the sun (Mie-ish, falls off rapidly).
-    float halo = pow(max(0.0, cosGamma), 80.0);
-    sky += halo * sun_col * 0.30 * day;
-    // Wider, dimmer secondary scatter (Rayleigh-tinted) extends the
-    // sunset orange across more of the sky.
     float wide = pow(max(0.0, cosGamma), 6.0);
     sky += wide * sun_col * sunset * 0.50;
 
@@ -2095,19 +2126,27 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     // moon and sun is preserved.
                     float3 sky_full = skyColor(rd);
                     if (composite_celestials_active) {
-                        // Subtract the same three terms skyColor()
-                        // sums into procSky in mode==2. starsAtPrimaryMiss
-                        // already returns 0 for non-procedural modes
-                        // and the disc helpers self-gate on sun/moon
-                        // elevation, so this is a no-op when sun/moon
-                        // are below the twilight cutoff -- safe to
-                        // call unconditionally on the gated branch.
+                        // Subtract every celestial term skyColor()
+                        // injects in mode==2:
+                        //   starsAtPrimaryMiss(rd)        -- BSC / procedural starfield
+                        //   sunDisc(rd, sun)              -- 0.55deg sun disc + atmospheric halo
+                        //   moonDisc(rd, moon, sun)       -- moon disc + textured surface + halo
+                        //   procSkyInlineSunDiscAndHalo() -- procSky's own inline sun
+                        //                                    (factored out into a helper so the
+                        //                                    composite + this subtraction stay
+                        //                                    a single source of truth)
+                        // The disc helpers self-gate on sun/moon elevation,
+                        // and starsAtPrimaryMiss returns 0 outside
+                        // procedural-sky mode, so calling all of them on
+                        // the gated branch is safe (no-op when out of view).
                         float3 stars_only = starsAtPrimaryMiss(rd);
                         float3 sun_d      = sunDisc(rd, sun_and_mode.xyz);
                         float3 moon_d     = moonDisc(rd, moon_dir_phase,
                                                      sun_and_mode.xyz);
+                        float3 proc_sun   = procSkyInlineSunDiscAndHalo(
+                                                rd, sun_and_mode.xyz);
                         radiance += throughput *
-                                    (sky_full - stars_only - sun_d - moon_d);
+                                    (sky_full - stars_only - sun_d - moon_d - proc_sun);
                     } else {
                         radiance += throughput * sky_full;
                     }
@@ -2838,12 +2877,16 @@ void main(uint2 tid : SV_DispatchThreadID) {
             float3 mapped = acesTonemap(hdr_src * exposure);
             denoise_color[tid] = float4(mapped, 1.0);
         }
-        // Cloud-transmittance G-buffer (issue #46 follow-up). Same
-        // write_hdr_aux gate as denoise_color above -- only allocated
-        // / bound when the post-denoise composite chain needs it.
-        // frame_cloud_trans defaults to 1.0 (no cloud, no occlusion)
-        // and is overwritten by the volumetric cloud march on sample 0
-        // when the layer is active and the ray crosses it.
+    }
+    // Cloud-transmittance G-buffer (issue #46 follow-up). DIFFERENT
+    // gate from denoise_color above: write_hdr_aux fires for both
+    // denoiser-active AND bloom-without-denoiser, but cloud_trans_tex
+    // is only allocated for the denoiser-active path. Gate on
+    // denoiser_enabled to avoid writing to an unbound storage texture
+    // when r_bloom=1 / r_denoiser=off. frame_cloud_trans defaults to
+    // 1.0 (no cloud, no occlusion) and is overwritten by the volumetric
+    // cloud march on sample 0 when the layer is active.
+    if (denoiser_enabled != 0u) {
         cloud_trans_tex[tid] = frame_cloud_trans;
     }
 

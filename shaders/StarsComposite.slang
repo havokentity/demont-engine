@@ -75,35 +75,22 @@
 // dispatch.
 [[vk::binding(22, 0)]] RWTexture2D<float>  cloud_trans_tex;
 
-// MSL SLOT ALIGNMENT NOTICE -- mirrors AutoExposure.slang / Tonemap.slang.
-// Slang's MSL backend assigns Metal buffer/texture slots in DECLARATION
-// order. PathTrace.slang binds AS at buf(0) and 5 storage buffers at
-// buf(1..5) and exposure_state at buf(6), so the engine's
+// MSL SLOT NOTICE: this kernel binds NO buffers and NO acceleration
+// structures. Slang's MSL backend therefore assigns Push (the only
+// buffer-class declaration left below) to MSL buf(0). The engine's
 // MetalCommandBuffer::Dispatch computes push_slot = max_bound_buf_slot
-// + 1 = 7. Without padding, this kernel would emit Push at buf(0)
-// because we declare no buffers, and the engine's setBytes(push, 7)
-// would land in an unbound slot -- the kernel would read garbage push
-// state.
+// + 1; with nothing else bound and BindComputePipeline clearing prior
+// bindings on Metal, max_slot = -1, push_slot = 0. Match.
 //
-// Fix: declare the same dummy AS + storage buffer chain that PathTrace
-// uses, in the same order, so Slang puts our Push at buf(7) too. The
-// dummies are referenced inside a runtime-conditional dead branch in
-// main() so Slang's optimizer keeps the slot assignments live. Gated
-// to Metal only -- on SPIR-V the vk::binding annotations route Push to
-// the dedicated push_constant block regardless of declaration order,
-// and these dummies would collide with the shared 17-binding pipeline
-// layout. vk::binding numbers here are out-of-band (18..23) so even
-// if Slang ever cross-checks them on MSL, none collide with a real
-// Vulkan binding.
-#ifdef PT_TARGET_METAL
-[[vk::binding(18, 0)]] RaytracingAccelerationStructure _slot_tlas;        // buf(0)
-[[vk::binding(19, 0)]] StructuredBuffer<float>  _slot_mesh_positions;     // buf(1)
-[[vk::binding(20, 0)]] StructuredBuffer<uint>   _slot_mesh_indices;       // buf(2)
-[[vk::binding(21, 0)]] StructuredBuffer<float4> _slot_primitives;         // buf(3)
-[[vk::binding(22, 0)]] StructuredBuffer<float>  _slot_marginal_cdf;       // buf(4)
-[[vk::binding(23, 0)]] StructuredBuffer<float>  _slot_conditional_cdf;    // buf(5)
-[[vk::binding(15, 0)]] RWStructuredBuffer<float> _slot_exposure_state;    // buf(6)
-#endif
+// An earlier revision declared dummy AS / storage-buffer slots to
+// force Push to buf(7) so the kernel could inherit PathTrace's
+// exposure_state binding. That broke under Metal's
+// BindComputePipeline-clears-state semantics (Copilot review #114):
+// the dummies referenced slots the engine had stopped binding, and
+// Metal's resource validation flagged the dispatch if the runtime-
+// dead retention branch ever evaluated. Reverted -- this kernel
+// doesn't actually need exposure_state, and the simpler "Push at
+// buf(0), no other buffers" layout removes the failure mode entirely.
 
 [[vk::push_constant]]
 cbuffer Push {
@@ -302,6 +289,26 @@ float3 sunDisc(float3 rd, float3 sun_dir) {
     return col * halo * atm * 4.0;
 }
 
+// Mirror of PathTrace.slang's procSkyInlineSunDiscAndHalo. PathTrace
+// SUBTRACTS this term from the b==0 sky so denoise_color is sun-free;
+// this kernel ADDS it back, aperture-sampled, so the sun's bokeh
+// resolves cleanly in one frame (matching what we do for sunDisc and
+// moonDisc). Any change here must mirror the PathTrace copy or the
+// composite-on / composite-off paths will diverge in sun brightness.
+float3 procSkyInlineSunDiscAndHalo(float3 rd, float3 sun) {
+    float cosGamma = clamp(dot(rd, sun), -1.0, 1.0);
+    float sun_elev = sun.y;
+    float day      = smoothstep(-0.10, 0.20, sun_elev);
+    float disk     = smoothstep(0.99996, 0.99999, cosGamma);
+    float3 sun_color_high = float3(1.00, 0.95, 0.85);
+    float3 sun_color_low  = float3(1.00, 0.55, 0.20);
+    float3 sun_col = lerp(sun_color_low, sun_color_high, day);
+    float3 result  = disk * 50.0 * sun_col * day;
+    float halo     = pow(max(0.0, cosGamma), 80.0);
+    result += halo * sun_col * 0.30 * day;
+    return result;
+}
+
 float3 moonDisc(float3 rd, float4 mph, float3 sun_dir_world) {
     if (mph.y < -0.10) return float3(0.0);
     float3 m_dir = mph.xyz;
@@ -407,23 +414,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
     uint2 dim;
     hdr_inout.GetDimensions(dim.x, dim.y);
     if (tid.x >= dim.x || tid.y >= dim.y) return;
-
-    // Force Slang to emit the slot-padding dummies (see top-of-file
-    // notice). Branch is on a uniform value that's never the runtime
-    // texture width, so Slang's optimizer can't prove it dead at
-    // compile time -- every dummy gets a real MSL buf() index.
-#ifdef PT_TARGET_METAL
-    if (dim.x == 0xDEADBEEFu) {
-        let p = _slot_mesh_positions[0];
-        let i = _slot_mesh_indices[0];
-        let q = _slot_primitives[0];
-        let mc = _slot_marginal_cdf[0];
-        let cc = _slot_conditional_cdf[0];
-        let ex = _slot_exposure_state[0];
-        hdr_inout[uint2(0, 0)] = float4(p, float(i), q.x, mc + cc + ex);
-    }
-#endif
-
     if (composite_active == 0u) return;
 
     // Sky-pixel gate. PathTrace.slang's G-buffer pass writes
@@ -548,9 +538,15 @@ void main(uint3 tid : SV_DispatchThreadID) {
         }
 
         float3 sun = sun_and_mode.xyz;
+        // Four-term per-sample sum, mirroring the b==0 subtraction in
+        // PathTrace.slang (starsOnly + sunDisc + moonDisc +
+        // procSkyInlineSunDiscAndHalo). The aperture loop averages
+        // these so DOF naturally resolves the sun / moon bokeh in a
+        // single frame, no temporal accumulation required.
         float3 sample_contrib = starsOnly(rd, sun)
                               + sunDisc(rd, sun)
-                              + moonDisc(rd, moon_dir_phase, sun);
+                              + moonDisc(rd, moon_dir_phase, sun)
+                              + procSkyInlineSunDiscAndHalo(rd, sun);
         acc += sample_contrib;
     }
     acc *= inv_N;
