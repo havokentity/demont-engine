@@ -735,10 +735,13 @@ namespace cvar {
     // and src/effects/ParticleSystem.h for the CPU sim contract.
     // -------------------------------------------------------------------
     PT_CVAR(r_particles, "0",
-            "Master toggle for the particle / VFX system (#82 MVP). "
-            "0 disables both the CPU sim tick AND the GPU composite "
-            "dispatch. 1 runs both. Metal-only today; Vulkan dispatch "
-            "is a follow-up.",
+            "Master toggle for the particle / VFX system composite "
+            "dispatch (#82 MVP). 0 disables the GPU composite kernel "
+            "(no particles painted into the HDR texture). The CPU sim "
+            "tick runs unconditionally so a 0->1 transition doesn't "
+            "snap stale particles into view; existing particles age "
+            "out naturally while the composite is off. Metal-only "
+            "today; Vulkan dispatch is a follow-up.",
             CVAR_ARCHIVE);
     PT_CVAR(r_particles_max, "1024",
             "Cap on simultaneously live particles. Cheap to raise "
@@ -7143,11 +7146,22 @@ void Engine::RenderFrame() {
                 particles_storage_capacity_ = cap;
             }
             if (particles_storage_id_ != 0) {
-                // Build the packed payload. We compute z_eye host-side
-                // (single dot per particle) so the shader doesn't
-                // re-derive it. At the MVP cap of 1024 this is ~3 us on
-                // M4 Max -- negligible.
-                std::vector<GpuParticle> packed(pcount);
+                // Build the packed payload into the Engine-member
+                // scratch buffer (12 floats per particle = one
+                // GpuParticle). resize() keeps the underlying capacity
+                // when shrinking, so steady-state load reuses the same
+                // allocation frame-to-frame and we only pay the alloc
+                // when the live count grows past the previous peak.
+                // At the MVP cap of 1024 this is ~3 us of fill on M4
+                // Max -- the savings are the avoided heap traffic.
+                constexpr std::size_t kFloatsPerParticle =
+                    sizeof(GpuParticle) / sizeof(float);
+                static_assert(kFloatsPerParticle == 12,
+                              "GpuParticle layout must be 12 floats");
+                particle_upload_scratch_.resize(
+                    static_cast<std::size_t>(pcount) * kFloatsPerParticle);
+                auto* packed = reinterpret_cast<GpuParticle*>(
+                    particle_upload_scratch_.data());
                 const glm::vec3 cam_pos  = glm::vec3(push.pos_fovtan[0],
                                                     push.pos_fovtan[1],
                                                     push.pos_fovtan[2]);
@@ -7172,7 +7186,7 @@ void Engine::RenderFrame() {
                     packed[i].pad_zeye[3] = glm::dot(p.pos - cam_pos, cam_fwd);
                 }
                 device_->WriteBuffer(pt::rhi::BufferHandle{particles_storage_id_},
-                                     packed.data(),
+                                     packed,
                                      sizeof(GpuParticle) * pcount, 0);
 
                 cb->BindComputePipeline(pt::rhi::PipelineHandle{particle_composite_pipeline_id_});
@@ -8354,6 +8368,15 @@ void Engine::Run() {
 }
 
 // ----- Commands -------------------------------------------------------------
+
+namespace {
+// Shared with the later anonymous namespace block above
+// RegisterCsgCommands(); declared here so RegisterCommands() (which
+// hosts particle_emit and other commands) can reuse it without
+// duplicating a parse-float lambda. The definition lives in the
+// later block below.
+bool ParseFloat(std::string_view s, float& out);
+}  // namespace
 
 void Engine::RegisterCommands() {
     auto& C = pt::console::Console::Get();
@@ -10296,27 +10319,33 @@ void Engine::RegisterCommands() {
     //     default. This matches "spawn at the centre of the canonical
     //     scene" intent.
     // -----------------------------------------------------------------------
-    auto parse_float = [](std::string_view s, float& out) -> bool {
-        // strtof needs a NUL-terminated string. std::string copy is
-        // 1 small alloc; cheap relative to console-command latency.
-        std::string tmp(s);
-        char* end = nullptr;
-        float v = std::strtof(tmp.c_str(), &end);
-        if (!end || end == tmp.c_str()) return false;
-        out = v;
-        return true;
-    };
-
+    // Reuse the file-scope ParseFloat() helper (defined later in this
+    // TU; forward-declared in the inner anonymous namespace above) so
+    // particle_emit doesn't carry its own duplicate parse-float
+    // lambda. Keeping a single canonical float parser avoids subtle
+    // behaviour drift (e.g. one version trimming whitespace, another
+    // not).
     C.RegisterCommand("particle_emit",
         "particle_emit <smoke|spark|snow|snow_stop> [x y z]. "
         "Spawn a preset particle burst (smoke / spark) or start/stop "
         "the continuous snow emitter at the given world position "
         "(default 0 1.5 0). Particles are screen-space billboards in "
         "the MVP -- NOT visible in path-traced reflections.",
-        [this, parse_float](auto args, pt::console::Output& out) {
+        [this](auto args, pt::console::Output& out) {
             if (!particles_) { out.PrintLine("particle_emit: particle system not initialised"); return; }
             if (args.empty()) {
                 out.PrintLine("usage: particle_emit <smoke|spark|snow|snow_stop> [x y z]");
+                return;
+            }
+            // Reject excess args explicitly. Other commands in this
+            // file (prim_sphere, etc.) bounds-check argc; matching that
+            // convention here surfaces typos like
+            // `particle_emit smoke 1 2 3 extra` rather than silently
+            // ignoring trailing tokens.
+            if (args.size() > 4u) {
+                out.FormatLine(
+                    "particle_emit: too many arguments ({}); expected "
+                    "<smoke|spark|snow|snow_stop> [x y z]", args.size());
                 return;
             }
             const std::string sub(args[0]);
@@ -10324,16 +10353,16 @@ void Engine::RegisterCommands() {
             // Optional position. Accept "smoke 1 2 3" and "smoke" both;
             // partial positions ("smoke 1") error out so the user
             // doesn't accidentally spawn at a partial location.
-            if (args.size() >= 4) {
-                float x, y, z;
-                if (!parse_float(args[1], x) ||
-                    !parse_float(args[2], y) ||
-                    !parse_float(args[3], z)) {
+            if (args.size() == 4u) {
+                float x = 0.0f, y = 0.0f, z = 0.0f;
+                if (!ParseFloat(args[1], x) ||
+                    !ParseFloat(args[2], y) ||
+                    !ParseFloat(args[3], z)) {
                     out.PrintLine("particle_emit: x y z must be numeric");
                     return;
                 }
                 at = glm::vec3(x, y, z);
-            } else if (args.size() == 2 || args.size() == 3) {
+            } else if (args.size() == 2u || args.size() == 3u) {
                 out.PrintLine("particle_emit: provide either 0 args (default position) or 3 (x y z)");
                 return;
             }

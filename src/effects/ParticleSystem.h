@@ -22,11 +22,15 @@
 //     is the real value, 9.81 m/s^2, applied along world -Y.
 //   - dt is clamped to a 1/30 s fixed step inside Update(). A 4x burst
 //     of frame-rate variation (e.g. a window drag pause) won't catapult
-//     particles across the world; they accumulate the remainder and
-//     catch up over the next frames. This is a quick MVP-grade Euler
-//     loop -- there's no sub-stepping; instead the timestep cap keeps
-//     the integration stable for the soft-ballistic motion these
-//     particles do.
+//     particles across the world; the integrator simply advances by
+//     the cap and the time beyond the cap is DROPPED (no sub-stepping,
+//     no accumulator). This is a quick MVP-grade Euler loop -- the
+//     timestep cap keeps the integration stable for the soft-ballistic
+//     motion these particles do, and dropping the over-budget time
+//     reads as a brief slow-mo rather than a catapult or a stutter
+//     burst. Implementing remainder accumulation / sub-stepping is a
+//     follow-up if a future content scene wants smooth visuals through
+//     hitches.
 //
 // What's deferred to follow-up issues (mentioned for the next reader's
 // sanity, not for action here):
@@ -60,12 +64,12 @@ namespace pt::effects {
 struct Particle {
     glm::vec3 pos        {0.0f, 0.0f, 0.0f};   // world-space metres
     glm::vec3 vel        {0.0f, 0.0f, 0.0f};   // m/s
-    glm::vec4 color      {1.0f, 1.0f, 1.0f, 1.0f};   // RGB, A unused (alpha derived from age)
+    glm::vec4 color      {1.0f, 1.0f, 1.0f, 1.0f};   // RGBA, lerped per frame from spawn `color` toward `end_color`. The shader uses .a as the per-particle alpha multiplier on the splat.
     float     age        = 0.0f;                // seconds
     float     lifetime   = 1.0f;                // seconds
     float     size       = 0.05f;               // world-space metres (Gaussian sigma scaled per pixel by the shader)
     float     drag       = 0.0f;                // 1/s linear-drag coefficient (vel *= exp(-drag*dt))
-    glm::vec4 end_color  {1.0f, 1.0f, 1.0f, 1.0f}; // color at age = lifetime (lerped per frame)
+    glm::vec4 end_color  {1.0f, 1.0f, 1.0f, 1.0f}; // color (incl. alpha) at age = lifetime (lerped per frame)
     float     end_size   = 0.05f;                  // size at age = lifetime
     float     gravity_y  = -9.81f;                 // m/s^2, world-Y component (per-particle so smoke can float)
     float     _pad0      = 0.0f;
