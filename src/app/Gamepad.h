@@ -12,8 +12,9 @@
 //
 // The engine polls this every frame from UpdateCamera. Cost is a single
 // glfwGetGamepadState call on slot 0 -- effectively free relative to
-// the rest of the frame work. No hot-plug events: we just check whether
-// slot 0 is present each frame.
+// the rest of the frame work. Connect/disconnect is detected by per-
+// frame edge detection on slot 0 (see LogConnectionTransitions); we do
+// NOT use GLFW's joystick callback / OS-event delivery.
 //
 // MVP scope (issue #83):
 //   - Left stick  -> forward/back + strafe.
@@ -22,7 +23,7 @@
 //
 // Out of scope for MVP (deferred to follow-up):
 //   - Action-binding layer (the issue's full plan).
-//   - Hot-plug events.
+//   - OS callback-style hot-plug events (vs. per-frame polling above).
 //   - Rumble / haptics (would need SDL2 or HIDAPI).
 //   - Button-to-key remapping (jump, fire, etc.).
 
