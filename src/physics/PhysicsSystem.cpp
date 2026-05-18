@@ -13,18 +13,16 @@ namespace {
 
 // Pack / unpack the 32-bit handle: low 8 bits = pool index (0..255),
 // high 24 bits = generation. Index 0 + generation 0 = kInvalidHandle.
-<<<<<<< HEAD
 // Same packing is used for the rigid-body handle (kMaxRigidBodies =
 // 128 fits comfortably in 8 bits) -- the two pools share the encoding
 // but RbHandle is a distinct typedef in the header so the type checker
 // catches a particle handle smuggled into a rigid-body call.
-=======
+//
 // The 24-bit generation is the contract the public Handle docs
 // promise -- truncating to 8 bits here (the previous form) would
 // silently wrap after 256 remove/add cycles per slot and let a stale
 // handle alias a live particle. uint32_t arithmetic + a 24-bit mask
 // keeps the pack/unpack consistent with the storage in Slot.
->>>>>>> origin/feature/physics-verlet-132
 constexpr std::uint32_t kIndexBits = 8u;
 constexpr std::uint32_t kIndexMask = (1u << kIndexBits) - 1u;
 constexpr std::uint32_t kGenBits   = 24u;
