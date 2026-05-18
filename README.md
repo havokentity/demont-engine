@@ -94,10 +94,10 @@ cmake --build build/mac-debug
 
 Requires:
 - Windows 10/11 with current NVIDIA drivers (RTX 2000-series or newer for hardware ray-tracing)
-- [Vulkan SDK 1.3+](https://vulkan.lunarg.com/sdk/home) — sets `VULKAN_SDK` env var
+- [Vulkan SDK 1.3.296+](https://vulkan.lunarg.com/sdk/home) — sets `VULKAN_SDK` env var. 1.4.x SDKs build and run cleanly; no upper bound pinned.
 - CMake ≥ 3.27
 - Ninja
-- MSVC 2022 (Visual Studio Build Tools or full IDE) — or clang-cl as an alternative
+- MSVC 2022 or MSVC 2026 (Build Tools or full IDE) — or clang-cl as an alternative. C++23 support required.
 
 ```pwsh
 cmake --preset win-debug

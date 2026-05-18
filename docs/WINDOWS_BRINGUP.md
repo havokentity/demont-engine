@@ -72,8 +72,14 @@ Not blocking but cosmetic:
 
 Prerequisites:
 - Windows 10/11 with current NVIDIA drivers
-- Vulkan SDK 1.3+ → `VULKAN_SDK` env var must be set
-- CMake ≥ 3.27, Ninja, MSVC 2022 (Build Tools or full IDE)
+- Vulkan SDK 1.3.296+ → `VULKAN_SDK` env var must be set. 1.4.x SDKs
+  (e.g. 1.4.341.1) build and run cleanly; the project doesn't pin a
+  ceiling and the headers are backward-compatible. CI is parked at
+  1.3.296.0 only because LunarG's CDN occasionally 404s on the very
+  newest installers, not because newer SDKs are unsupported.
+- CMake ≥ 3.27, Ninja, MSVC 2022 or MSVC 2026 (Build Tools or full
+  IDE). The `win-debug` preset doesn't pin a compiler major — anything
+  cl ≥ 19.40 with C++23 support works.
 
 ```pwsh
 cmake --preset win-debug
