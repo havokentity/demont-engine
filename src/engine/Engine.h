@@ -708,14 +708,19 @@ private:
     //                                    reflectance at normal incidence).
     //                                    Metals: F0 = albedo; dielectrics:
     //                                    F0 = float3(0.04); Lambert: 0.
-    //   roughness_tex_id_             -- R16F single-channel surface
+    //   roughness_tex_id_             -- R32F single-channel surface
     //                                    roughness in [0, 1]. 0 = mirror,
-    //                                    1 = fully rough.
-    //   specular_hit_distance_tex_id_ -- R16F distance from camera to the
+    //                                    1 = fully rough. (R16F would be
+    //                                    plenty for the precision but the
+    //                                    RHI doesn't expose it today; see
+    //                                    Engine.cpp allocation for the
+    //                                    R16F-vs-R32F trade.)
+    //   specular_hit_distance_tex_id_ -- R32F distance from camera to the
     //                                    specularly-reflected hit (MVP:
     //                                    primary_t * smoothness; a future
     //                                    PR can swap in a real reflection-
-    //                                    ray trace).
+    //                                    ray trace). Same R32F-as-fallback
+    //                                    rationale as roughness_tex_id_.
     std::uint64_t                               specular_albedo_tex_id_       = 0;
     std::uint64_t                               roughness_tex_id_             = 0;
     std::uint64_t                               specular_hit_distance_tex_id_ = 0;

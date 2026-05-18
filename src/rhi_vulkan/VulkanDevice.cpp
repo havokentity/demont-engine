@@ -967,7 +967,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // races on the LATEST host-side binding update). Total sets =
     // kFramesInFlight * kDispatchSetsPerFrame, each set needs the full
     // per-binding allocation:
-    //   11 storage_image + [1 accel_struct] + 10 storage_buffer + 1 ubo
+    //   14 storage_image + [1 accel_struct] + 10 storage_buffer + 1 ubo
     // The accel-struct pool entry is only emitted when rt_supported_
     // is true; ASKHR isn't a valid descriptor type at all on drivers
     // without VK_KHR_acceleration_structure (e.g. pre-1.3 MoltenVK).
