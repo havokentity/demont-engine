@@ -409,4 +409,98 @@ void BuildLightTree(const std::vector<LightInput>& lights,
     dst.root_index  = 0u;
 }
 
+// --- AsyncLightTreeBuilder -------------------------------------------------
+// Persistent worker thread. The work itself is bog-standard CPU code
+// (BuildLightTree is pure host-side, no GPU API surface), so the worker
+// is a free thread with no special scheduling. We don't use the engine's
+// JobSystem here because:
+//   - The build is bursty / dirty-bit-gated, not parallel-divisible,
+//     so a one-shot std::thread carries no per-call setup hit.
+//   - Avoiding the dep on src/core/Jobs/ keeps the renderer lib's
+//     dependency boundary the same shape it was pre-PR (engine -> renderer
+//     only; no engine internals leaking the other way).
+AsyncLightTreeBuilder::AsyncLightTreeBuilder() {
+    worker_ = std::thread([this] { this->WorkerLoop(); });
+}
+
+AsyncLightTreeBuilder::~AsyncLightTreeBuilder() {
+    {
+        std::lock_guard<std::mutex> lk(input_mu_);
+        stop_ = true;
+        // Drop any pending input so the worker doesn't try to do one
+        // more build before checking `stop_`.
+        has_pending_input_ = false;
+        pending_inputs_.clear();
+    }
+    input_cv_.notify_all();
+    if (worker_.joinable()) worker_.join();
+}
+
+void AsyncLightTreeBuilder::SubmitInputs(std::vector<LightInput>&& inputs) {
+    {
+        std::lock_guard<std::mutex> lk(input_mu_);
+        // Replace any not-yet-consumed snapshot. If the worker is
+        // already building from a previous snapshot, that build still
+        // finishes -- its output just gets overwritten when this new
+        // snapshot's build completes. That's intentional: we want the
+        // freshest result, not a queue of stale ones.
+        pending_inputs_   = std::move(inputs);
+        has_pending_input_ = true;
+        build_in_flight_.store(true, std::memory_order_release);
+    }
+    input_cv_.notify_one();
+}
+
+const LightTree* AsyncLightTreeBuilder::TryAcquireResult() {
+    const std::uint32_t gen = result_generation_.load(std::memory_order_acquire);
+    if (gen == last_consumed_generation_) return nullptr;
+    // New tree available. Take the result mutex so we don't race with
+    // the worker flipping `active_slot_` between our load + the read.
+    std::lock_guard<std::mutex> lk(result_mu_);
+    last_consumed_generation_ = result_generation_.load(std::memory_order_acquire);
+    return &slots_[active_slot_];
+}
+
+void AsyncLightTreeBuilder::WorkerLoop() {
+    std::vector<LightInput> local;
+    while (true) {
+        // 1. Wait for a job (or shutdown).
+        {
+            std::unique_lock<std::mutex> lk(input_mu_);
+            input_cv_.wait(lk, [this] {
+                return stop_.load() || has_pending_input_;
+            });
+            if (stop_.load()) return;
+            local = std::move(pending_inputs_);
+            pending_inputs_.clear();
+            has_pending_input_ = false;
+        }
+
+        // 2. Build into the INACTIVE slot. The active slot is being
+        //    read by main; we don't hold result_mu_ for the build
+        //    itself (the expensive step) so main can keep consuming
+        //    the prior tree while we work.
+        int write_slot;
+        {
+            std::lock_guard<std::mutex> lk(result_mu_);
+            write_slot = 1 - active_slot_;
+        }
+        BuildLightTree(local, slots_[write_slot]);
+
+        // 3. Publish the new slot. Single atomic store advances the
+        //    generation counter; the next TryAcquireResult will see
+        //    the new gen and read from the slot we just wrote.
+        {
+            std::lock_guard<std::mutex> lk(result_mu_);
+            active_slot_ = write_slot;
+        }
+        result_generation_.fetch_add(1u, std::memory_order_acq_rel);
+        build_in_flight_.store(false, std::memory_order_release);
+        // Loop back to wait for the next job. If main already kicked
+        // another one while we were building, has_pending_input_ is
+        // true and the condvar wait above returns immediately.
+    }
+}
+// --- end AsyncLightTreeBuilder ---------------------------------------------
+
 }  // namespace pt::renderer

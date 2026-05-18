@@ -50,7 +50,11 @@
 //   v3.yzw = pad (reserved; future ReSTIR DI variance term, mesh-
 //            emitter triangle count, etc.)
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 namespace pt::renderer {
@@ -117,5 +121,106 @@ struct LightTree {
 // allocator churn on rebuilds.
 void BuildLightTree(const std::vector<LightInput>& lights,
                     LightTree& dst);
+
+// --- Async builder ---------------------------------------------------------
+// Persistent worker thread that runs BuildLightTree off the main thread.
+// The main thread only pays the cost of:
+//   1. Snapshotting the light input list (O(N) memcpy).
+//   2. A condvar signal to wake the worker.
+//   3. A try-acquire of the result when it's published.
+//
+// The worker holds two output slots (double-buffered) and writes to the
+// inactive one while the consumer reads the active one. A monotonically
+// increasing generation counter lets the engine detect "a new tree is
+// ready since the last frame" without taking the result mutex.
+//
+// Threading model (single producer = main thread, single consumer =
+// main thread, single worker):
+//   - main: SubmitInputs() pushes a new input set + raises an "input
+//           pending" flag, signals the condvar. Returns immediately.
+//   - worker: waits on the condvar. On wake, drains the pending input
+//           snapshot under a lock, runs BuildLightTree on the inactive
+//           slot, then atomically advances the result generation +
+//           flips the active slot.
+//   - main: TryAcquireResult() compares the worker's generation against
+//           the last-seen generation. If newer, takes the result mutex,
+//           hands back a const pointer to the active slot, and stamps
+//           the new generation as seen. The pointer remains valid until
+//           the next SubmitInputs() -- the worker only ever writes the
+//           INACTIVE slot, so the consumer can keep using the active
+//           one read-only for as long as it likes.
+//
+// SHUTDOWN: dtor signals `stop_`, signals the condvar, joins. Safe to
+// destruct mid-build -- the worker checks `stop_` between dispatch and
+// the next wait.
+//
+// FIRST-FRAME FALLBACK: see Engine::EnsureLightTreeUploaded. The engine
+// runs a synchronous build on the first dirty edge so the first dispatch
+// doesn't bind the placeholder for a noticeable visible-light scene.
+class AsyncLightTreeBuilder {
+public:
+    AsyncLightTreeBuilder();
+    ~AsyncLightTreeBuilder();
+
+    AsyncLightTreeBuilder(const AsyncLightTreeBuilder&)            = delete;
+    AsyncLightTreeBuilder& operator=(const AsyncLightTreeBuilder&) = delete;
+
+    // Hand the worker a fresh input snapshot (moved into the builder).
+    // Wakes the worker if it's currently blocked. Cheap: just a swap +
+    // condvar notify. The caller may continue mutating its own
+    // light_prims_ map without affecting the worker's snapshot.
+    void SubmitInputs(std::vector<LightInput>&& inputs);
+
+    // Non-blocking: if a new tree has been published since the last
+    // successful Acquire, returns a const pointer to it and stamps the
+    // new generation as seen. Otherwise returns nullptr (caller keeps
+    // using whatever it had before -- typically a prior tree still
+    // resident in the GPU buffer).
+    //
+    // The returned pointer is owned by the builder and stays valid
+    // until the NEXT SubmitInputs() call resumes the worker (which will
+    // start writing the OTHER slot, not the one we just handed out).
+    const LightTree* TryAcquireResult();
+
+    // True when a job has been dispatched but the worker hasn't yet
+    // published a result. The engine uses this only for diagnostics --
+    // the consume path keys off TryAcquireResult's nullptr/non-null
+    // return, not this flag.
+    bool BuildInFlight() const { return build_in_flight_.load(std::memory_order_acquire); }
+
+    // True if the worker has ever produced a tree (zero-light snapshots
+    // count). Engine uses this to know whether the first-frame
+    // synchronous-fallback path still needs to run.
+    bool HasResult() const { return result_generation_.load(std::memory_order_acquire) != 0; }
+
+private:
+    void WorkerLoop();
+
+    // --- Worker handle ----------------------------------------------------
+    std::thread worker_;
+    std::atomic<bool> stop_ {false};
+
+    // --- Input handoff (main -> worker) -----------------------------------
+    // Protected by input_mu_. Worker drains under the lock then releases
+    // it before doing the build itself.
+    std::mutex                  input_mu_;
+    std::condition_variable     input_cv_;
+    std::vector<LightInput>     pending_inputs_;
+    bool                        has_pending_input_ {false};
+
+    // --- Result handoff (worker -> main) ----------------------------------
+    // Double-buffered output. `active_slot_` indexes the slot the worker
+    // most-recently published; the OTHER slot is where it writes next.
+    // `result_mu_` guards `active_slot_` + the slot the worker is
+    // currently writing; TryAcquireResult only reads from the active
+    // slot under the mutex.
+    std::mutex                  result_mu_;
+    LightTree                   slots_[2];
+    std::atomic<std::uint32_t>  result_generation_ {0};   // worker-advanced
+    std::uint32_t               last_consumed_generation_ {0};  // main-side
+    int                         active_slot_       {0};   // most-recent published
+    std::atomic<bool>           build_in_flight_   {false};
+};
+// --- end Async builder -----------------------------------------------------
 
 }  // namespace pt::renderer

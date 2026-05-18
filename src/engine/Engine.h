@@ -24,7 +24,7 @@ namespace pt::audio    { class AudioSystem; }
 namespace pt::jobs     { class JobSystem; }
 namespace pt::console  { class ConsoleServer; }
 namespace pt::rhi      { class Device; struct PipelineHandle; }
-namespace pt::renderer { struct Camera; }
+namespace pt::renderer { struct Camera; class AsyncLightTreeBuilder; }
 namespace pt::csg      { class CsgScene; struct BakedMesh; }
 namespace pt::effects  { class ParticleSystem; }
 namespace pt::physics  { class PhysicsSystem; }
@@ -459,9 +459,36 @@ private:
     std::uint32_t                               light_count_uploaded_    = 0;  // lights last uploaded
 
     // --- Light tree (#129) -------------------------------------------------
-    std::uint64_t                               light_tree_buffer_id_       = 0;
-    std::uint32_t                               light_tree_buffer_capacity_ = 0;  // nodes that fit
+    // Double-buffered GPU node buffer. Worker thread runs Rebuild() on
+    // the CPU while main records render commands; once the new tree is
+    // ready the engine uploads it to the inactive slot and atomically
+    // swaps `light_tree_active_slot_`. The path-tracer dispatch binds
+    // whichever slot is active when RenderFrame runs (the previous slot
+    // is left alone -- the GPU may still be sampling it from an
+    // in-flight frame; it can be reused on a later frame, at which
+    // point either WaitIdle on the resize path or just-overwrite-with-
+    // current-data handles the synchronisation).
+    //
+    // SLOT BOOK-KEEPING. `light_tree_buffer_capacity_` is the shared
+    // capacity (both slots are sized identically; we grow them together
+    // so a swap never lands on a too-small slot). `node_count_uploaded_`
+    // is the consumer-visible count -- updated when the engine flips
+    // the active slot. The dispatch path keys on this count + the
+    // active-slot buffer id.
+    std::array<std::uint64_t, 2>                light_tree_buffer_ids_ {0, 0};
+    std::uint32_t                               light_tree_buffer_capacity_ = 0;
     std::uint32_t                               light_tree_node_count_uploaded_ = 0;
+    int                                         light_tree_active_slot_     = 0;
+    // First-tree-ever flag. Until set, the dispatch falls back to the
+    // placeholder (the binding has to resolve to *something* for Metal
+    // push-slot stability; same convention as the rest of the slot-13
+    // path documented in Engine.cpp's bind-site block).
+    bool                                        light_tree_first_built_     = false;
+    // Async builder owning the worker thread + double-buffered CPU
+    // result slots. unique_ptr-of-pimpl so Engine.h doesn't have to
+    // include LightTree.h (the renderer header pulls in <thread>,
+    // <mutex>, <condition_variable> -- not free to drag in here).
+    std::unique_ptr<pt::renderer::AsyncLightTreeBuilder> light_tree_builder_;
     // --- end Light tree ----------------------------------------------------
 
     // --- Fluid Phase 1 (#136) -- smoke emitters ----------------------------
