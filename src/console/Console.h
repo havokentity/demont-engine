@@ -31,6 +31,22 @@ enum CVarFlag : std::uint32_t {
     CVAR_PLATFORM_WIN = 1u << 4,
 };
 
+// Per-allowed-value platform tags (issue #161). Lets a cross-platform
+// cvar like r_denoiser carry a per-value platform mask: e.g.
+// "metalfx" is Mac-only, "nrd_relax" is Win/Linux-only, but
+// "svgf_atrous" is available everywhere. At cvar-set time the gate
+// produces a platform-mismatch error listing only the
+// available-on-this-platform values; the cfg-load path keeps writing
+// the value through anyway (warn-but-no-op) so a shared demont.cfg
+// round-trips across hosts. Mirror of CVAR_PLATFORM_* but per-enum-
+// value.
+enum CVarValueFlag : std::uint32_t {
+    CVAR_VALUE_ANY   = 0,           // available on every platform (default)
+    CVAR_VALUE_MAC   = 1u << 0,
+    CVAR_VALUE_WIN   = 1u << 1,
+    CVAR_VALUE_LINUX = 1u << 2,
+};
+
 struct CVar {
     std::string name;
     std::string value;
@@ -43,6 +59,27 @@ struct CVar {
     // r_clear_color leave it empty).  Also drives tab-completion of the
     // value position in both UIs.
     std::vector<std::string> allowed_values;
+
+    // Optional per-allowed-value platform mask (issue #161). Aligned
+    // 1:1 with `allowed_values` -- a 0 entry (CVAR_VALUE_ANY) means
+    // the value works everywhere; non-zero bits gate the value to
+    // specific platforms. Either left empty (every value is universal)
+    // or sized == allowed_values.size(). When sized, the cvar set
+    // path emits a platform-mismatch error AT CONSOLE-SET TIME, but
+    // the registration / cfg-load path still accepts the write (we
+    // want shared demont.cfg files to round-trip without rejection).
+    std::vector<std::uint32_t> allowed_value_flags;
+
+    // Optional cross-cvar dependency predicate (issue #161). Evaluated
+    // *after* a successful set to print an informational warning when
+    // the cvar's effect is gated on another cvar's state. The lambda
+    // returns true iff the prerequisite holds; on false, the engine
+    // prints `requires_hint` as a one-line `[warn]` so the user sees
+    // *why* their value isn't taking effect. Never blocks the set --
+    // a cfg-load script may set the dependency cvar second, so the
+    // warning is purely informational.
+    std::function<bool()> requires_predicate;
+    std::string           requires_hint;
 
     // Optional numeric range. When slider_max > slider_min, the web UI
     // renders a draggable range slider for the cvar (with a numeric
@@ -127,6 +164,30 @@ public:
     // Force a CVar value past READONLY (engine use only).
     bool SetCVarOverride(std::string_view name, std::string_view value);
 
+    // Cross-cvar dependency warnings (issue #161) are suppressed when
+    // a cfg replay is in progress -- the dependency cvar might be set
+    // on a later line, so warning on every entry would be noisy. Set
+    // to true around the cfg-load ExecuteScript call, then back to
+    // false. No-op otherwise (Execute always honours the predicate).
+    void SetSuppressDepWarnings(bool suppress) { dep_warn_suppressed_ = suppress; }
+    bool DepWarningsSuppressed() const { return dep_warn_suppressed_; }
+
+    // Smart-resolve a typed first-token to its canonical
+    // command/cvar name (issue #162). When the user types
+    // `deno metalfx`, this finds `r_denoiser` as the unique prefix
+    // match and lets Execute() dispatch the canonical name with the
+    // remaining args. Tie-breaking: exact match > unique prefix >
+    // cvars over commands > alphabetical. Honors the per-platform
+    // visibility filter (wrong-platform cvars don't compete in the
+    // candidate pool). Gated by the r_console_smart_resolve cvar
+    // (defaults on; off = strict exact-match like before).
+    struct Resolution {
+        std::string canonical_name;             // non-empty on success
+        std::vector<std::string> ambiguous_matches;  // populated when no winner
+        bool is_exact_match = false;
+    };
+    Resolution ResolveCommand(std::string_view typed);
+
     // Synchronously tokenize and dispatch a single console line on the
     // calling thread.
     ExecuteResult Execute(std::string_view line);
@@ -198,12 +259,29 @@ private:
     // Single-threaded: only Drain() touches these.
     std::string               batch_buffer_;
     bool                      batch_active_ = false;
+
+    // Suppress cross-cvar dependency warnings while a cfg replay is
+    // running -- the dependency cvar may be set on a later line.
+    // Toggled by the engine around the cfg-load ExecuteScript call.
+    bool                      dep_warn_suppressed_ = false;
 };
 
 // Tokenize a single console line.  Quote-aware ("a b" stays one token).
 // Stops at newline; '//' begins a comment for the rest of the line.
 std::vector<std::string_view> TokenizeLine(std::string_view line,
                                            std::string& storage);
+
+// True iff the given CVAR_VALUE_* mask permits the value on the
+// current build's host platform. A mask of 0 (CVAR_VALUE_ANY) always
+// returns true. Used by the cvar-set gate to print a platform-
+// mismatch error when the user picks a wrong-platform enum value.
+bool CVarValueAllowedOnThisPlatform(std::uint32_t value_flags);
+
+// Per-platform tag for the host this build is running on. Used in
+// error messages so the user knows *which* platform is blocking
+// their value (e.g. "metalfx is macOS-only; not available on
+// Windows").
+const char* CurrentPlatformName();
 
 }  // namespace pt::console
 

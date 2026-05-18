@@ -215,6 +215,19 @@ namespace cvar {
     PT_CVAR(r_theme, "hardcore",
             "Web console theme: hardcore|amber|synthwave|matrix|vault|sakura|mono",
             CVAR_ARCHIVE);
+    // Issue #162: console smart-resolve. When 1 (default) a typed
+    // prefix that uniquely matches one cvar/command is auto-resolved
+    // to the canonical name and dispatched, with one info-level log
+    // line showing what we picked. Ambiguous prefixes still fall
+    // back to the candidate-list error. 0 = strict exact-match
+    // (legacy behaviour).
+    PT_CVAR(r_console_smart_resolve, "1",
+            "Console UX: 1 (default) = auto-resolve a typed prefix to "
+            "the unique canonical command/cvar name (e.g. `deno metalfx` "
+            "-> `r_denoiser metalfx`) when there's exactly one prefix "
+            "match. Ambiguous prefixes still error with the candidate "
+            "list. 0 = strict exact-match like before.",
+            CVAR_ARCHIVE);
     // Default backend: Metal on Apple Silicon, Vulkan everywhere else
     // (Windows + Linux use Vulkan + RT extensions; the Metal backend
     // doesn't compile off Apple).
@@ -1126,7 +1139,15 @@ bool Engine::Init() {
     // r_sky_use_astronomical -- without the suppression a user with
     // astro=1 saved would see warnings get superseded a moment later.
     // The post-cfg-load audit a few lines below uses the final state.
+    //
+    // Also suppress the issue #161 cross-cvar dependency warnings
+    // for the same reason -- a cfg might set the dependent cvar on
+    // a line BEFORE the prerequisite cvar (lex / save order is not
+    // semantic order), so warning per line would produce false
+    // positives on every load. After cfg-load completes, the
+    // interactive user-set path re-engages predicate evaluation.
     cfg_loading_ = true;
+    pt::console::Console::Get().SetSuppressDepWarnings(true);
     exec_if_exists("demont.cfg");      // archived cvars from last quit
     exec_if_exists("autoexec.cfg");    // user-supplied startup script (overrides above)
 
@@ -1171,6 +1192,7 @@ bool Engine::Init() {
         if (sf == nullptr) {
             LOG_ERROR("pt_smoke_exec: '{}' not found", sx->value);
             cfg_loading_ = false;
+            pt::console::Console::Get().SetSuppressDepWarnings(false);
             return false;
         }
         std::string sbody; char sbuf[4096];
@@ -1186,17 +1208,20 @@ bool Engine::Init() {
         if (sread_err) {
             LOG_ERROR("pt_smoke_exec '{}': read error", sx->value);
             cfg_loading_ = false;
+            pt::console::Console::Get().SetSuppressDepWarnings(false);
             return false;
         }
         auto sr = pt::console::Console::Get().ExecuteScript(sbody);
         if (!sr.ok) {
             LOG_ERROR("pt_smoke_exec '{}': {}", sx->value, sr.error);
             cfg_loading_ = false;
+            pt::console::Console::Get().SetSuppressDepWarnings(false);
             return false;
         }
         LOG_INFO("loaded smoke-exec fixture {}", sx->value);
     }
     cfg_loading_ = false;
+    pt::console::Console::Get().SetSuppressDepWarnings(false);
 
     // Post-cfg-load astronomy-mode audit. If astro is off after cfg +
     // autoexec + CLI overrides have applied, emit ONE summary warning
@@ -1413,7 +1438,9 @@ bool Engine::Init() {
             LOG_ERROR("pt_smoke_late_exec '{}': read error", lx->value);
             return false;
         }
+        pt::console::Console::Get().SetSuppressDepWarnings(true);
         auto lr = pt::console::Console::Get().ExecuteScript(lbody);
+        pt::console::Console::Get().SetSuppressDepWarnings(false);
         if (!lr.ok) {
             LOG_ERROR("pt_smoke_late_exec '{}': {}", lx->value, lr.error);
             return false;
@@ -9329,24 +9356,20 @@ void Engine::RegisterCommands() {
             }
         };
     }
-    // r_backend: validate against the set of backends actually
-    // compiled into this binary, so the console / web UI only offers
-    // values that can succeed.  Listing "metal" on Windows or
-    // "vulkan" on a build without PT_ENABLE_VULKAN_BACKEND would only
-    // produce confusing error logs at switch time.
+    // r_backend: full canonical value set with per-value platform
+    // tags (issue #161). metal is Mac-only; vulkan and software are
+    // cross-platform. Listing the full set means a shared demont.cfg
+    // with `r_backend metal` round-trips cleanly on Windows, just no-
+    // ops with a clear platform-mismatch error instead of the older
+    // "invalid value" message.
     if (auto* v = C.FindCVar("r_backend")) {
-        v->allowed_values.clear();
-        v->allowed_values.push_back("none");
-#if defined(PT_HAS_SOFTWARE_BACKEND)
-        // Cross-platform (Mac CAMetalLayer present, Windows GDI present).
-        v->allowed_values.push_back("software");
-#endif
-#if defined(__APPLE__)
-        v->allowed_values.push_back("metal");
-#endif
-#if defined(PT_HAS_VULKAN_BACKEND)
-        v->allowed_values.push_back("vulkan");
-#endif
+        v->allowed_values        = {"none", "software", "metal", "vulkan"};
+        v->allowed_value_flags   = {
+            pt::console::CVAR_VALUE_ANY,    // none
+            pt::console::CVAR_VALUE_ANY,    // software
+            pt::console::CVAR_VALUE_MAC,    // metal
+            pt::console::CVAR_VALUE_ANY,    // vulkan (cross-platform; MoltenVK on Mac)
+        };
         v->on_change = [this](const pt::console::CVar& cv) {
             BackendType t = BackendType::None;
             if      (cv.value == "software") t = BackendType::Software;
@@ -9362,7 +9385,12 @@ void Engine::RegisterCommands() {
     // shouldn't see "selected, takes effect, beware DXGI lockout"
     // messages there.
     if (auto* v = C.FindCVar("r_software_blit")) {
-        v->allowed_values = {"vulkan", "gdi"};
+        v->allowed_values      = {"vulkan", "gdi"};
+        // gdi is Win-only; vulkan works everywhere (issue #161).
+        v->allowed_value_flags = {
+            pt::console::CVAR_VALUE_ANY,    // vulkan
+            pt::console::CVAR_VALUE_WIN,    // gdi
+        };
 #if defined(_WIN32)
         v->on_change = [this](const pt::console::CVar& cv) {
             if (cv.value == "gdi" &&
@@ -9593,6 +9621,28 @@ void Engine::RegisterCommands() {
                               "svgf_basic_metalfx", "svgf_atrous_metalfx",
                               "optix_hdr", "optix_hdr_aov",
                               "optix_temporal_hdr", "optix_temporal_hdr_aov"};
+        // Per-value platform tags (issue #161). Mac path is metalfx +
+        // its SVGF composites; Win/Linux path is nrd + the optix
+        // family. SVGF (basic/atrous) is cross-platform. A user with
+        // `r_denoiser nrd` in their demont.cfg on Mac sees a clear
+        // platform-mismatch error listing Mac-only values instead
+        // of getting silently downgraded at RenderFrame time.
+        constexpr auto kAny = pt::console::CVAR_VALUE_ANY;
+        constexpr auto kMac = pt::console::CVAR_VALUE_MAC;
+        constexpr auto kWL  = pt::console::CVAR_VALUE_WIN | pt::console::CVAR_VALUE_LINUX;
+        v->allowed_value_flags = {
+            kAny,   // off
+            kMac,   // metalfx
+            kAny,   // svgf_basic
+            kAny,   // svgf_atrous
+            kWL,    // nrd
+            kMac,   // svgf_basic_metalfx
+            kMac,   // svgf_atrous_metalfx
+            kWL,    // optix_hdr
+            kWL,    // optix_hdr_aov
+            kWL,    // optix_temporal_hdr
+            kWL,    // optix_temporal_hdr_aov
+        };
     }
     if (auto* v = C.FindCVar("r_hdr_pipeline")) {
         v->allowed_values = {"0", "1"};
@@ -10349,6 +10399,138 @@ void Engine::RegisterCommands() {
     // --- Voxel destruction Phase 1 (#140) --------------------------------------
     RegisterVoxelCommands();
     // --- end Voxel destruction Phase 1 -----------------------------------------
+
+    // --- Cross-cvar dependency predicates (issue #161) -------------------------
+    // When the user sets a cvar whose effect requires another cvar to be in
+    // a specific state, evaluate the predicate after the set and emit a
+    // one-line `[warn]` with an actionable hint. NEVER blocks the set:
+    // a cfg-load script may set the dependency cvar later, so the warning
+    // is informational only. The cfg-load suppression already lives in the
+    // engine's broader `cfg_loading_` flag for astro handlers; for the
+    // generic dep-warn path we just trust that the user-typed set sees
+    // the latest engine state.
+    //
+    // Each entry: (dependent_cvar_name, predicate_lambda, hint_text).
+    // The predicate captures Console by reference so it can read the
+    // current value of the prerequisite cvar at the moment the
+    // dependent is set.
+    struct DepEntry {
+        const char* name;
+        std::function<bool()> pred;
+        const char* hint;
+    };
+    auto sky_proc = []() {
+        auto* m = pt::console::Console::Get().FindCVar("r_sky_mode");
+        return m != nullptr && m->value == "procedural";
+    };
+    auto clouds_on = []() {
+        auto* c = pt::console::Console::Get().FindCVar("r_clouds");
+        return c != nullptr && c->GetBool();
+    };
+    auto denoiser_svgf = []() {
+        auto* d = pt::console::Console::Get().FindCVar("r_denoiser");
+        if (d == nullptr) return false;
+        return d->value.rfind("svgf_", 0) == 0 || d->value == "nrd";
+    };
+    // denoiser_metalfx / denoiser_optix predicates would gate
+    // r_metalfx_* / r_optix_* cvars once those tuning knobs land
+    // (issue #161 leaves them as reserved future-work entries). Not
+    // wired up today because no such cvars exist yet.
+    auto smoke_on = []() {
+        auto* s = pt::console::Console::Get().FindCVar("r_smoke_enabled");
+        return s != nullptr && s->GetBool();
+    };
+    auto restir_on = []() {
+        auto* r = pt::console::Console::Get().FindCVar("r_restir");
+        return r != nullptr && r->GetBool();
+    };
+    auto lighttree_on = []() {
+        auto* t = pt::console::Console::Get().FindCVar("r_light_tree");
+        return t != nullptr && t->GetBool();
+    };
+    auto voxdemo_on = []() {
+        auto* d = pt::console::Console::Get().FindCVar("r_voxelize_demo");
+        return d != nullptr && d->GetBool();
+    };
+
+    const std::vector<DepEntry> deps = {
+        // Sky: sun/day cvars are inert unless r_sky_mode procedural.
+        // (Static hint mirrors the issue #161 spec format; the
+        // "current value r_sky_mode=..." dynamic part isn't worth a
+        // hint-builder API for the MVP -- the actionable
+        // `cvar set r_sky_mode procedural` is the high-value bit.)
+        { "r_sun_elevation", sky_proc,
+            "r_sun_elevation only takes effect when r_sky_mode is procedural; "
+            "hint: cvar set r_sky_mode procedural" },
+        { "r_sun_azimuth", sky_proc,
+            "r_sun_azimuth only takes effect when r_sky_mode is procedural; "
+            "hint: cvar set r_sky_mode procedural" },
+        { "r_sky_day", sky_proc,
+            "r_sky_day only takes effect when r_sky_mode is procedural; "
+            "hint: cvar set r_sky_mode procedural" },
+        // Clouds: per-cloud cvars need r_clouds 1 to drive the march.
+        { "r_clouds_coverage",   clouds_on,
+            "r_clouds_coverage only takes effect when r_clouds is 1; "
+            "current value r_clouds=0; "
+            "hint: cvar set r_clouds 1" },
+        { "r_clouds_curl_amount", clouds_on,
+            "r_clouds_curl_amount only takes effect when r_clouds is 1; "
+            "current value r_clouds=0; "
+            "hint: cvar set r_clouds 1" },
+        { "r_clouds_density", clouds_on,
+            "r_clouds_density only takes effect when r_clouds is 1; "
+            "current value r_clouds=0; "
+            "hint: cvar set r_clouds 1" },
+        { "r_clouds_detail", clouds_on,
+            "r_clouds_detail only takes effect when r_clouds is 1; "
+            "current value r_clouds=0; "
+            "hint: cvar set r_clouds 1" },
+        // SVGF tuning: needs an SVGF-family denoiser.
+        { "r_svgf_atrous_passes", denoiser_svgf,
+            "r_svgf_atrous_passes only takes effect when r_denoiser starts "
+            "with svgf_; SVGF inactive on the current denoiser; "
+            "hint: cvar set r_denoiser svgf_atrous" },
+        { "r_svgf_albedo_demod", denoiser_svgf,
+            "r_svgf_albedo_demod only takes effect when r_denoiser starts "
+            "with svgf_; SVGF inactive on the current denoiser; "
+            "hint: cvar set r_denoiser svgf_atrous" },
+        // Smoke: tuning cvars only matter when smoke loop is enabled.
+        { "r_smoke_max_emitters", smoke_on,
+            "r_smoke_max_emitters only takes effect when r_smoke_enabled is 1; "
+            "smoke loop disabled; "
+            "hint: cvar set r_smoke_enabled 1" },
+        // ReSTIR tuning.
+        { "r_restir_k_candidates", restir_on,
+            "r_restir_k_candidates only takes effect when r_restir is 1; "
+            "ReSTIR dispatch skipped; "
+            "hint: cvar set r_restir 1" },
+        { "r_restir_temporal", restir_on,
+            "r_restir_temporal only takes effect when r_restir is 1; "
+            "ReSTIR dispatch skipped; "
+            "hint: cvar set r_restir 1" },
+        { "r_restir_spatial", restir_on,
+            "r_restir_spatial only takes effect when r_restir is 1; "
+            "ReSTIR dispatch skipped; "
+            "hint: cvar set r_restir 1" },
+        // Light tree tuning.
+        { "r_light_tree_max_depth", lighttree_on,
+            "r_light_tree_max_depth only takes effect when r_light_tree is 1; "
+            "naive uniform NEE pick; "
+            "hint: cvar set r_light_tree 1" },
+        // Voxel destruction.
+        { "r_voxel_size", voxdemo_on,
+            "r_voxel_size only takes effect when r_voxelize_demo is 1; "
+            "voxel grids hidden; "
+            "hint: cvar set r_voxelize_demo 1" },
+    };
+
+    for (const auto& d : deps) {
+        auto* v = C.FindCVar(d.name);
+        if (v == nullptr) continue;     // cvar not registered in this build
+        v->requires_predicate = d.pred;
+        v->requires_hint      = d.hint;
+    }
+    // --- end cross-cvar dependency predicates (issue #161) ---------------------
 }
 
 namespace {
