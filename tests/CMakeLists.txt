@@ -197,6 +197,42 @@ pt_add_test(pt_renderer_triangle_bvh
     pt_renderer_triangle_bvh_test.cpp
     LINK_TARGETS pt_renderer)
 
+# --- pt_math vec/mat/quat/transforms unit tests (issue #63) ----------------
+# Phase 3 of #47. These tests pin the glm contract the engine consumes:
+# RH coord system, column-major mat storage, perspectiveRH_ZO depth
+# range, lookAtRH conventions, and the screen-to-world ray reconstruction
+# math. Each test is a separate executable (one TU, one binary) -- same
+# pattern as the other unit-test cells above. They link glm::glm only
+# (no engine target), so they're pure-CPU + deterministic.
+#
+# pt_math_vec_test           -- vec2/vec3/vec4: dot, cross, normalize,
+#                               length, zero/near-zero pathology,
+#                               randomized Cauchy-Schwarz + orthogonality
+# pt_math_mat_test           -- mat3/mat4: identity, multiplication,
+#                               inverse, transpose, determinant,
+#                               column-major storage contract
+# pt_math_quat_test          -- quaternion: identity, angleAxis,
+#                               from Euler, multiplication, conjugate /
+#                               inverse, slerp endpoints + midpoint,
+#                               quat <-> mat3/mat4 round-trip,
+#                               small-angle + full-circle edges
+# pt_math_transforms_test    -- combined: TRS composition + inverse,
+#                               lookAtRH places cam at clip-space origin,
+#                               perspectiveRH_ZO near=0 / far=1 mapping,
+#                               screen-to-world ray reconstruction
+pt_add_test(pt_math_vec
+    pt_math_vec_test.cpp
+    LINK_TARGETS glm::glm)
+pt_add_test(pt_math_mat
+    pt_math_mat_test.cpp
+    LINK_TARGETS glm::glm)
+pt_add_test(pt_math_quat
+    pt_math_quat_test.cpp
+    LINK_TARGETS glm::glm)
+pt_add_test(pt_math_transforms
+    pt_math_transforms_test.cpp
+    LINK_TARGETS glm::glm)
+
 # --- pt_renderer/Astronomy unit tests (issue #65) --------------------------
 # JD conversions (J2000 + Unix-epoch reference points), GMST at J2000
 # vs the IAU 1982 formula, sun position at four cardinal solar events
