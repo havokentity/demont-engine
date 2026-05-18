@@ -493,6 +493,54 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     pt_add_golden_cell(SCENE sdf_smin_row BACKEND vulkan   DENOISER off
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     # --- end SDF Phase 1 ---------------------------------------------------
+
+    # --- Sky / sun / stars / moon matrix (#112) ----------------------------
+    # Follow-up to the #45 MVP: the cornell_csg cell exercises CSG +
+    # analytic BVH but nothing in the procedural sky / astronomy /
+    # stars / moon / clouds stack. Issue #112 lists the regressions
+    # the current matrix would miss (PR #114's stars-stateless-
+    # composite fix is the canonical example -- stars were invisible
+    # under any denoiser and no cornell_csg cell could have caught it).
+    #
+    # Scene coverage:
+    #   procedural_noon       sun @ +60 deg     daytime sky + bright sun disc
+    #   procedural_evening    sun @ +5  deg     sunset orange, long Mie path
+    #   procedural_dawn       sun @ -2  deg     civil twilight, no sun disc
+    #   bsc_night             sun @ -45 deg     BSC stars, star_split path
+    #   lunar_night           astronomical      moon disc, NEE from moon
+    #   bsc_night_clouds      astronomical      stars + cloud occlusion
+    #
+    # Denoiser coverage per scene:
+    #   software/off          -- CI-exercised cell (label golden_software)
+    #   metal/svgf_atrous     -- the user's most common dev-box combo;
+    #                            stresses the denoiser composite path
+    #                            (the star_split bypass-the-a-trous
+    #                            kernel that PR #114 fixed lives here).
+    #
+    # Tolerances: these scenes are noisier than cornell_csg because (a)
+    # procedural sky has more bright HDR pixels which exaggerate FP
+    # roundoff across backends; (b) star_split + clouds + ACES tonemap
+    # each amplify tiny radiance deltas. Default tolerances (16 / 2 / 1)
+    # held in early bring-up; if any cell flakes on cross-host runs the
+    # MAX_DELTA / MEAN_DELTA can be widened per-cell here without
+    # touching the harness.
+    set(_sky_scenes
+        procedural_noon
+        procedural_evening
+        procedural_dawn
+        bsc_night
+        lunar_night
+        bsc_night_clouds)
+    foreach(_scene IN LISTS _sky_scenes)
+        # Software backend / no denoiser -- this is the CI-exercised
+        # cell. Tolerance kept at defaults so a real regression surfaces.
+        pt_add_golden_cell(SCENE ${_scene} BACKEND software DENOISER off)
+        # Metal backend + SVGF a-trous -- the user's primary dev combo
+        # on M-series. Wider tolerance to absorb GPU FP-order variance.
+        pt_add_golden_cell(SCENE ${_scene} BACKEND metal    DENOISER svgf_atrous
+            MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+    endforeach()
+    # --- end #112 sky/sun/stars/moon matrix --------------------------------
 else()
     message(STATUS
         "tests: golden-image matrix skipped -- pt_render_one_frame and/or "
