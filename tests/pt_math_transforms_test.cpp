@@ -195,21 +195,24 @@ TEST_CASE("transform: perspectiveRH_ZO maps near plane to clip-z=0") {
     // -- the actual ratio depends on the projection. We test the
     // simpler invariant: near maps to clip-z 0 after the w-divide, far
     // maps to clip-z 1.
-    const float near  = 0.1f;
-    const float far   = 100.0f;
-    const float fov_y = glm::radians(60.0f);
+    // `near` / `far` are legacy <windows.h> macros (DOS segment-register
+    // holdovers) so MSVC chokes on `const float near = ...`. Use the
+    // `z_near` / `z_far` naming convention to stay portable.
+    const float z_near = 0.1f;
+    const float z_far  = 100.0f;
+    const float fov_y  = glm::radians(60.0f);
     const float aspect = 16.0f / 9.0f;
-    glm::mat4 proj = glm::perspectiveRH_ZO(fov_y, aspect, near, far);
+    glm::mat4 proj = glm::perspectiveRH_ZO(fov_y, aspect, z_near, z_far);
 
     // View-space point on the near plane (on the optical axis).
-    glm::vec4 v_near{0.0f, 0.0f, -near, 1.0f};
+    glm::vec4 v_near{0.0f, 0.0f, -z_near, 1.0f};
     glm::vec4 c_near = proj * v_near;
     // After perspective divide, clip-z / clip-w should be 0.
     REQUIRE(c_near.w != 0.0f);
     CHECK((c_near.z / c_near.w) == doctest::Approx(0.0f).epsilon(kLooseEps));
 
     // Far plane.
-    glm::vec4 v_far{0.0f, 0.0f, -far, 1.0f};
+    glm::vec4 v_far{0.0f, 0.0f, -z_far, 1.0f};
     glm::vec4 c_far = proj * v_far;
     REQUIRE(c_far.w != 0.0f);
     CHECK((c_far.z / c_far.w) == doctest::Approx(1.0f).epsilon(kLooseEps));
@@ -297,14 +300,15 @@ TEST_CASE("transform: pixel-center ray direction matches FOV") {
     // rays from cam.Right/Up/Forward and FovYTan().
     const float fov_y    = glm::radians(60.0f);
     const float aspect   = 1.0f;  // square image -> fov_x == fov_y
-    const float near     = 0.1f;
-    const float far      = 100.0f;
+    // See the earlier near/far block for the Windows-macro rationale.
+    const float z_near   = 0.1f;
+    const float z_far    = 100.0f;
     glm::vec3 cam_pos{0.0f, 0.0f, 5.0f};
     glm::vec3 cam_fwd{0.0f, 0.0f, -1.0f};
     glm::vec3 cam_up{0.0f, 1.0f, 0.0f};
 
     glm::mat4 view = glm::lookAtRH(cam_pos, cam_pos + cam_fwd, cam_up);
-    glm::mat4 proj = glm::perspectiveRH_ZO(fov_y, aspect, near, far);
+    glm::mat4 proj = glm::perspectiveRH_ZO(fov_y, aspect, z_near, z_far);
     glm::mat4 vp_inv = glm::inverse(proj * view);
 
     // Helper lambda: given NDC, return the world-space direction from
