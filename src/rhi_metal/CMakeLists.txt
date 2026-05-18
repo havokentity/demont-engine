@@ -39,13 +39,20 @@ pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTraceCloud.slang)
 # PathTraceMath / PathTraceCloud above.
 pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/SdfPrimitives.slang)
 # --- end SDF Phase 1 -------------------------------------------------------
+# --- SDF Phase 3 (#99) -----------------------------------------------------
+# Iconic-fractal DE library (Mandelbulb / Mandelbox / Apollonian) +
+# fractal sphere-trace with iteration-relaxed surface epsilon and
+# central-difference normals. Independent module so PathTrace.slang's
+# body-only iterations don't re-parse the DE code.
+pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/SdfFractals.slang)
+# --- end SDF Phase 3 -------------------------------------------------------
 pt_compile_slang(
     TARGET  pt_rhi_metal
     SOURCE  ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
     STAGE   compute
     ENTRY   main
     TARGETS metal
-    MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives
+    MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals
 )
 pt_compile_slang(
     TARGET  pt_rhi_metal
@@ -93,6 +100,36 @@ pt_compile_slang(
     ENTRY   main
     TARGETS metal
 )
+# Aurora borealis procedural overlay (issue #116).
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/AuroraComposite.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+)
+# SIGMA-style sun-shadow denoiser (issue #115). Runs between Denoise()
+# and StarsComposite; bilateral-filters the per-pixel sun-visibility
+# G-buffer, multiplies the denoised visibility back into HDR.
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/SigmaShadow.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+)
+# Screen-space particle composite (#82 MVP). Dispatched AFTER
+# StarsComposite + AuroraComposite, BEFORE the bloom pyramid; reads
+# the engine-uploaded particle storage buffer and additive-splats
+# each particle as a soft Gaussian disc into the post-denoise HDR,
+# depth-gated by the PathTrace G-buffer.
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/ParticleComposite.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+)
 # SVGF denoiser (svgf_basic / svgf_atrous on r_denoiser). Same Slang
 # sources the Vulkan backend uses; slangc cross-compiles them to MSL.
 # DenoiseFinalize is NOT built on Metal -- the existing Tonemap pipeline
@@ -114,6 +151,17 @@ pt_compile_slang(
 pt_compile_slang(
     TARGET  pt_rhi_metal
     SOURCE  ${CMAKE_SOURCE_DIR}/shaders/DenoiseAtrous.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+)
+# Issue #119 -- SVGF albedo remodulation pass. Multiplies the
+# demodulated lighting from the SVGF chain by the primary-hit
+# albedo G-buffer to restore textured radiance before bloom + tonemap.
+# Built on Metal alongside the temporal + atrous kernels.
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/DenoiseRemod.slang
     STAGE   compute
     ENTRY   main
     TARGETS metal

@@ -14,6 +14,22 @@ target_link_libraries(pt_rhi_vulkan
     PUBLIC glfw                    # for glfwCreateWindowSurface
 )
 
+# ---- NRD denoiser (NVIDIA RayTracingDenoiser, Vulkan, non-Apple) ----------
+# Issue #50. Gated by PT_NRD_ACTIVE (set by the top-level Dependencies.cmake
+# once the user has flipped PT_ENABLE_NRD=ON on a non-Apple build with the
+# Vulkan backend on). When inactive the wrapper file isn't compiled, the
+# NRD lib isn't linked, and PT_ENABLE_NRD is undefined in the source so
+# the #if blocks inside VulkanDenoiser.cpp compile out. Today the wrapper
+# is a scaffold -- it stubs the NRD instance/dispatch translation; the
+# r_denoiser nrd cvar value still routes through the in-house SVGF chain.
+# A follow-up PR will switch routing to VulkanNrdLibDenoiser::Encode once
+# the per-frame Dispatch->VkDispatch translation lands.
+if(PT_NRD_ACTIVE)
+    target_sources(pt_rhi_vulkan PRIVATE VulkanNrdLibDenoiser.cpp)
+    target_link_libraries(pt_rhi_vulkan PRIVATE NRD)
+    target_compile_definitions(pt_rhi_vulkan PUBLIC PT_ENABLE_NRD=1)
+endif()
+
 # ---- OptiX denoiser (NVIDIA only) -----------------------------------------
 # Adds the OptiX denoiser strategy alongside the SVGF/NRD one. Gated by
 # PT_OPTIX_ACTIVE (set by the top-level CMakeLists once CUDA Toolkit and
@@ -57,10 +73,14 @@ pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTraceCloud.slang)
 # Analytic SDF library; same compile-module pattern.
 pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/SdfPrimitives.slang)
 # --- end SDF Phase 1 -------------------------------------------------------
+# --- SDF Phase 3 (#99) -----------------------------------------------------
+# Iconic-fractal DE library (Mandelbulb / Mandelbox / Apollonian).
+pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/SdfFractals.slang)
+# --- end SDF Phase 3 -------------------------------------------------------
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
     STAGE compute ENTRY main TARGETS spirv
-    MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives)
+    MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals)
 # Second PathTrace SPIR-V variant without RayQuery, for backends that
 # don't expose VK_KHR_ray_query (Mac-Vulkan on pre-1.3 MoltenVK builds).
 # The two variants share the source file; PT_SPIRV_NO_RAYQUERY strips
@@ -72,7 +92,7 @@ pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
     STAGE compute ENTRY main TARGETS spirv
     VARIANT norq EXTRA_DEFINES -DPT_SPIRV_NO_RAYQUERY
-    MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives)
+    MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals)
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/Tonemap.slang
     STAGE compute ENTRY main TARGETS spirv)
@@ -97,6 +117,10 @@ pt_compile_slang(
     STAGE compute ENTRY main TARGETS spirv)
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/DenoiseAtrous.slang
+    STAGE compute ENTRY main TARGETS spirv)
+# Issue #119 -- SVGF albedo remodulation pass.
+pt_compile_slang(
+    TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/DenoiseRemod.slang
     STAGE compute ENTRY main TARGETS spirv)
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/DenoiseFinalize.slang

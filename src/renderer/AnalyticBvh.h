@@ -31,6 +31,15 @@ namespace pt::renderer {
 
 // SDF leaf-primitive kinds. Numeric values are part of the host/shader
 // wire format -- never renumber without bumping the shader too.
+//
+// Ids 0..5 are analytic SDFs evaluated in shaders/SdfPrimitives.slang
+// (closed-form distance + analytic gradient). Ids 6..8 are fractal
+// distance estimators (Phase 3 of #96, see issue #99) evaluated in
+// shaders/SdfFractals.slang with bounded iteration and central-
+// difference normals -- they live in their own shader module because
+// the trace path is shape-specific (no smooth-CSG composition with
+// analytic shapes in Phase 3) and the normal recovery costs ~4 extra
+// DE evaluations per hit.
 enum SdfShape : std::uint32_t {
     SDF_SHAPE_SPHERE       = 0,   // params: radius
     SDF_SHAPE_BOX          = 1,   // params: half-extents (3)
@@ -38,17 +47,54 @@ enum SdfShape : std::uint32_t {
     SDF_SHAPE_TORUS        = 3,   // params: major radius R, minor radius r
     SDF_SHAPE_CAPSULE      = 4,   // params: half-length on +Y axis, radius
     SDF_SHAPE_PLANE        = 5,   // params: unit normal (3), distance d (n . p + d = 0)
+    // --- SDF Phase 3 (#99) fractal DEs --------------------------------------
+    // For all fractal shapes:
+    //   params[0] = per-shape "scale" (power for MANDELBULB; linear
+    //               step scale for MANDELBOX; radial-shrink scale for
+    //               APOLLONIAN). 0 means "use the r_sdf_fractal_power
+    //               cvar default".
+    //   params[1] = effective bound radius (metres). The host uses
+    //               this to size the cluster AABB; rays only enter the
+    //               sphere-trace inside this radius. Defaults vary
+    //               per shape (Mandelbulb ~1.2, Mandelbox ~4.0,
+    //               Apollonian ~2.0); fixture authors override via
+    //               the console-command argument.
+    //   params[2..3] reserved.
+    SDF_SHAPE_MANDELBULB   = 6,
+    SDF_SHAPE_MANDELBOX    = 7,
+    SDF_SHAPE_APOLLONIAN   = 8,
 };
+
+// True when `shape` is a fractal DE (handled by shaders/SdfFractals.slang).
+// Used by the host AABB computation and by the upload path's leaf
+// validation to keep the analytic and fractal code paths cleanly
+// separated.
+inline bool IsSdfFractalShape(std::uint32_t shape) {
+    return shape == SDF_SHAPE_MANDELBULB ||
+           shape == SDF_SHAPE_MANDELBOX  ||
+           shape == SDF_SHAPE_APOLLONIAN;
+}
 
 // SDF CSG ops. opSmoothUnion / opSmoothSubtract / opSmoothIntersect (k
 // is the smoothing radius in metres); opDisplace adds a scalar bump
 // magnitude to its child. See SdfPrimitives.slang for the formulas.
+//
+// Phase 2 (#98) added procedural ops 5..9. Numeric values are part of
+// the host/shader wire format -- never renumber without updating the
+// matching constants in shaders/SdfPrimitives.slang.
 enum SdfOp : std::uint32_t {
     SDF_OP_LEAF             = 0,   // params: see SdfShape above
     SDF_OP_SMOOTH_UNION     = 1,   // children: a, b; param k
     SDF_OP_SMOOTH_SUBTRACT  = 2,   // children: a, b; param k (b carved from a)
     SDF_OP_SMOOTH_INTERSECT = 3,   // children: a, b; param k
     SDF_OP_DISPLACE         = 4,   // children: a; param amp (analytic bump along normal)
+    // --- SDF Phase 2 (#98) procedural / noise / domain ops -----------------
+    SDF_OP_DISPLACE_NOISE   = 5,   // children: a; params: amp (m), freq (1/m), octaves (uint via asuint)
+    SDF_OP_TWIST            = 6,   // children: a; param: twist rate (rad/m, about Y)
+    SDF_OP_BEND             = 7,   // children: a; param: bend rate (rad/m, about X)
+    SDF_OP_REPEAT           = 8,   // children: a; params: period vec3 (0 = no repeat on that axis)
+    SDF_OP_REPEAT_LIMITED   = 9,   // children: a; params: period vec3, params[3] = packed int3 half-extent
+    // --- end SDF Phase 2 ---------------------------------------------------
 };
 
 // One node in a cluster's flat op-tree. Children are *node indices*
