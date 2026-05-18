@@ -1137,6 +1137,33 @@ namespace cvar {
             "1.0 (e.g. 0.999) for longer-lasting motion; values below "
             "~0.95 read as syrup at 60 fps.",
             CVAR_ARCHIVE);
+
+    // Issue #181 visibility polish: per-frame override of analytic-prim
+    // albedo for any sphere driven by the physics layer, colouring it
+    // by linear-speed magnitude. Pure debug aid; intentionally NOT
+    // archived so it never persists into a normal session. Mapping is
+    // a 3-stop linear ramp in linear-RGB:
+    //   0   m/s -> blue   (0.10, 0.30, 1.00)
+    //   5   m/s -> green  (0.20, 1.00, 0.30)
+    //   10+ m/s -> red    (1.00, 0.20, 0.20)
+    // 10 m/s is the practical ceiling under -9.81 gravity + 0.99
+    // damping per substep on the default 1 m drop fixtures (terminal
+    // velocity in the damped Verlet is ~10 m/s, anything beyond is
+    // saturated). When the cvar transitions 1 -> 0 the engine restores
+    // each overridden prim's original albedo from its per-prim cache,
+    // so toggling the viz on/off is non-destructive even mid-flight.
+    PT_CVAR(r_phys_debug_visualize, "0",
+            "Debug: when 1, every analytic-prim sphere driven by the "
+            "physics layer (particles + rigid bodies) has its albedo "
+            "overridden per frame to encode linear speed magnitude on "
+            "a blue->green->red ramp (0 m/s = blue, 5 m/s = green, "
+            "10+ m/s = red, linearly interpolated between the stops). "
+            "Original albedos are cached on first override and restored "
+            "when the cvar transitions back to 0 so toggling is non-"
+            "destructive. Useful for verifying Phase 1/2a rigid-body "
+            "motion in the path-traced view (#181). NOT CVAR_ARCHIVE "
+            "-- per-invocation knob.",
+            CVAR_NONE);
 }  // namespace cvar
 
 }  // namespace
@@ -12915,6 +12942,10 @@ void Engine::RegisterPhysicsCommands() {
                 removed += static_cast<std::uint32_t>(primitives_.erase(id));
             }
             physics_->Clear();
+            // Drop the r_phys_debug_visualize cache (#181). Those
+            // entries are keyed by prim_id; with the underlying prims
+            // gone the cache contents would just leak to no purpose.
+            phys_debug_color_cache_.clear();
             if (removed > 0) {
                 primitives_dirty_ = true;
                 accum_dirty_      = true;
@@ -12979,17 +13010,87 @@ void Engine::StepPhysics(float dt) {
 
     physics_->Step(clamped_dt, substeps, gy, damp);
 
+    // --- Issue #181 velocity-magnitude debug viz --------------------
+    // Pull r_phys_debug_visualize once outside the iter callbacks (the
+    // C-style ForEach signature can't capture state, and we want the
+    // cvar GetInt cost off the per-particle path). 0 = off, 1 = colour
+    // override active. Substep dt is the same value PhysicsSystem::Step
+    // computed internally (clamped_dt / substeps), used to recover the
+    // implicit linear velocity from (curr_pos - prev_pos) / sdt at the
+    // end of the frame.
+    int viz_mode = 0;
+    if (auto* v = C.FindCVar("r_phys_debug_visualize")) viz_mode = v->GetInt();
+    const float inv_sdt = (substeps > 0 && clamped_dt > 0.0f)
+                             ? float(substeps) / clamped_dt
+                             : 0.0f;
+
+    // Detect the 1 -> 0 falling edge before the writeback path runs.
+    // On the falling edge restore every cached albedo, then drop the
+    // cache so the next 0 -> 1 transition captures fresh originals. We
+    // do this BEFORE the new writeback so the position-only path still
+    // marks primitives_dirty_ = true, getting the restored albedos to
+    // the GPU on the very next frame instead of waiting for the next
+    // structural change.
+    if (phys_debug_visualize_prev_ != 0 && viz_mode == 0
+        && !phys_debug_color_cache_.empty()) {
+        for (auto& [prim_id, orig] : phys_debug_color_cache_) {
+            auto it = primitives_.find(prim_id);
+            if (it == primitives_.end()) continue;
+            auto& ap = it->second;
+            ap.albedo[0] = orig[0];
+            ap.albedo[1] = orig[1];
+            ap.albedo[2] = orig[2];
+        }
+        phys_debug_color_cache_.clear();
+        primitives_dirty_ = true;
+        accum_dirty_      = true;
+    }
+    phys_debug_visualize_prev_ = viz_mode;
+
     // Write each particle's curr_pos back into its paired analytic
     // primitive so RenderFrame's EnsurePrimitivesUploaded sees the
     // moved sphere. The callback signature is C-style by design so
     // the physics library stays free of std::function overhead --
     // we pass `this` as `user` and recover the engine pointer to
-    // mutate `primitives_`.
+    // mutate `primitives_`. The Ctx struct also carries the debug-viz
+    // state so the callback can encode speed into albedo when active
+    // without a second pass over the pool.
     struct Ctx {
-        std::map<std::uint32_t, Engine::AnalyticPrim>* prims = nullptr;
-        bool any_changed = false;
+        std::map<std::uint32_t, Engine::AnalyticPrim>* prims        = nullptr;
+        std::map<std::uint32_t, std::array<float, 3>>* color_cache  = nullptr;
+        int   viz_mode                                              = 0;
+        float inv_sdt                                               = 0.0f;
+        void (*speed_to_rgb)(float, float*)                         = nullptr;
+        bool  any_changed                                           = false;
     };
-    Ctx ctx{ &primitives_, false };
+    Ctx ctx{};
+    ctx.prims        = &primitives_;
+    ctx.color_cache  = &phys_debug_color_cache_;
+    ctx.viz_mode     = viz_mode;
+    ctx.inv_sdt      = inv_sdt;
+    // Speed -> linear-RGB ramp. Three stops in (speed m/s, r, g, b):
+    //   0 m/s  -> (0.10, 0.30, 1.00)   blue
+    //   5 m/s  -> (0.20, 1.00, 0.30)   green
+    //  10+ m/s -> (1.00, 0.20, 0.20)   red (saturating)
+    // Computed in linear-RGB so the ACES tonemap reads it correctly.
+    // C++ lambdas-without-captures decay to function pointers via the
+    // unary `+`, which lets the C-style ForEach callback dispatch
+    // through Ctx without paying for std::function indirection.
+    ctx.speed_to_rgb = +[](float s, float* out_rgb) {
+        float v = s;
+        if (v < 0.0f) v = 0.0f;
+        if (v > 10.0f) v = 10.0f;
+        constexpr float kStop0[3] = {0.10f, 0.30f, 1.00f};
+        constexpr float kStop1[3] = {0.20f, 1.00f, 0.30f};
+        constexpr float kStop2[3] = {1.00f, 0.20f, 0.20f};
+        const float* a;
+        const float* b;
+        float t;
+        if (v < 5.0f) { a = kStop0; b = kStop1; t = v * 0.2f; }
+        else          { a = kStop1; b = kStop2; t = (v - 5.0f) * 0.2f; }
+        for (int k = 0; k < 3; ++k) out_rgb[k] = a[k] + (b[k] - a[k]) * t;
+    };
+
     physics_->ForEach(
         [](pt::physics::PhysicsSystem::Handle /*h*/,
            const pt::physics::Particle& p,
@@ -13007,6 +13108,24 @@ void Engine::StepPhysics(float dt) {
             ap.pos_or_n[2] = p.curr_pos.z;
             // Radius is fixed for now (no growing/shrinking particles
             // in Phase 1); skip writing it.
+            if (c->viz_mode == 1) {
+                // Cache the pre-override albedo on first touch so the
+                // 1 -> 0 transition can restore it. Idempotent: the
+                // cache key is prim_id and emplace is a no-op once the
+                // slot exists.
+                auto [cache_it, inserted] = c->color_cache->try_emplace(
+                    prim_id,
+                    std::array<float, 3>{ ap.albedo[0], ap.albedo[1], ap.albedo[2] });
+                (void)cache_it;
+                (void)inserted;
+                const glm::vec3 disp = p.curr_pos - p.prev_pos;
+                const float speed    = glm::length(disp) * c->inv_sdt;
+                float rgb[3];
+                c->speed_to_rgb(speed, rgb);
+                ap.albedo[0] = rgb[0];
+                ap.albedo[1] = rgb[1];
+                ap.albedo[2] = rgb[2];
+            }
             c->any_changed = true;
         },
         &ctx);
@@ -13029,6 +13148,26 @@ void Engine::StepPhysics(float dt) {
             ap.pos_or_n[0] = b.curr_pos.x;
             ap.pos_or_n[1] = b.curr_pos.y;
             ap.pos_or_n[2] = b.curr_pos.z;
+            if (c->viz_mode == 1) {
+                auto [cache_it, inserted] = c->color_cache->try_emplace(
+                    prim_id,
+                    std::array<float, 3>{ ap.albedo[0], ap.albedo[1], ap.albedo[2] });
+                (void)cache_it;
+                (void)inserted;
+                // Rigid bodies expose linear speed via the same
+                // (curr - prev) / sdt implicit-velocity scheme as
+                // particles. Angular speed is intentionally NOT folded
+                // in; the visualisation is for translational motion,
+                // and tumbling-but-stationary bodies should read as
+                // blue (matches the user's intuition of "not moving").
+                const glm::vec3 disp = b.curr_pos - b.prev_pos;
+                const float speed    = glm::length(disp) * c->inv_sdt;
+                float rgb[3];
+                c->speed_to_rgb(speed, rgb);
+                ap.albedo[0] = rgb[0];
+                ap.albedo[1] = rgb[1];
+                ap.albedo[2] = rgb[2];
+            }
             c->any_changed = true;
         },
         &ctx);
