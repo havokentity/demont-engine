@@ -355,9 +355,23 @@ cbuffer Push {
     //              per-channel Rayleigh sigma (5.8/13.5/33.1 ×1e-6 m^-1
     //              for R/G/B at sea level). 1.0 = real atmosphere; >1
     //              boosts the blue tint, 0 disables Rayleigh.
+    //   clouds_p4: (curl_amount, curl_scale, erosion_amount, _reserved)
+    //              issue #117. curl_amount in metres is the magnitude
+    //              of the Bridson-2007 curl-noise displacement applied
+    //              to the noise sample position before density eval --
+    //              gives the cloud body sheared filamentous detail
+    //              (cumulus edge wisps, cirrus streamers). 0 = bypass
+    //              the curl displacement entirely (regression-safe).
+    //              curl_scale is the curl-noise frequency in cycles
+    //              per metre (independent of cp2.z so coarse cloud
+    //              bodies can carry fine curl turbulence).
+    //              erosion_amount is a secondary high-frequency edge
+    //              erosion term added on top of cp3.z; eats soft
+    //              cumulus margins into wisps. 0 = bypass.
     float4 clouds_p1;
     float4 clouds_p2;
     float4 clouds_p3;
+    float4 clouds_p4;
     // Moon. .xyz = unit vector toward the moon (engine computes via
     // Meeus simplified moon-position formulas + observer lat/lon).
     // .w = phase angle in radians (0 = new, π = full); used for both
@@ -506,6 +520,7 @@ cbuffer Frame {
     float4 clouds_p1;
     float4 clouds_p2;
     float4 clouds_p3;
+    float4 clouds_p4;
     float4 moon_dir_phase;
     float4 moon_extra;
     float4 sun_extra;
@@ -1717,7 +1732,8 @@ float cloud_optical_depth(float3 ro, float3 rd, float t_max) {
     [unroll] for (int i = 0; i < Ns; ++i) {
         float t = t_in + (float(i) + 0.5) * dt;
         float3 sp = ro + rd * t;
-        od += cloud_density_at(sp, clouds_p1, clouds_p2, clouds_p3, 3) * dt;
+        od += cloud_density_at(sp, clouds_p1, clouds_p2, clouds_p3,
+                               clouds_p4, 3) * dt;
     }
     return od;
 }
@@ -2656,7 +2672,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         if (t > t_out) break;
                         float3 sp = primary_ro + primary_rd * t;
                         float dens = cloud_density_at(sp, clouds_p1,
-                                                      clouds_p2, clouds_p3, 6);
+                                                      clouds_p2, clouds_p3,
+                                                      clouds_p4, 6);
                         if (dens <= 0.0) continue;
                         // Aerial perspective: per-channel atmospheric
                         // transmittance from camera to this sample,
