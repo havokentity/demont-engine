@@ -56,8 +56,13 @@ bool vec3_approx_equal(const glm::vec3& a, const glm::vec3& b, float eps) {
 }  // namespace
 
 // --- Identity quaternion -------------------------------------------------
-TEST_CASE("quat: default-construct identity") {
-    // glm::quat() default-constructs to identity (w=1, xyz=0).
+TEST_CASE("quat: explicit identity is unit-length and rotates trivially") {
+    // The identity quaternion is (w=1, xyz=0). We construct it
+    // explicitly rather than default-constructing because glm 1.0.1
+    // does not set GLM_FORCE_CTOR_INIT in this project, so
+    // `glm::quat{}` yields uninitialised garbage. Engine code always
+    // builds quaternions via glm::angleAxis() or explicit-init for
+    // the same reason; this test pins the explicit-init contract.
     glm::quat id{1.0f, 0.0f, 0.0f, 0.0f};
     CHECK(id.w == doctest::Approx(1.0f));
     CHECK(id.x == doctest::Approx(0.0f));
