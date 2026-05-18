@@ -389,7 +389,16 @@ Texture2D<float4> moon_map;
 //   v0.w   = Gaussian falloff radius (metres)
 //   v1.xyz = parametric drift velocity (m/s)
 //   v1.w   = peak additive sigma_t (per metre)
-//   v2.xyz = colour tint (multiplier on cloud RGB; 1,1,1 = neutral)
+//   v2.xyz = colour tint (multiplier on the smoke fraction's in-
+//            scattered radiance at the cloud-march sample point;
+//            (1,1,1) = neutral white smoke). Read by
+//            smoke_density_add_tinted() and density-weighted
+//            averaged across overlapping plumes before being
+//            multiplied into the per-light NEE contributions.
+//            The scalar-only shadow paths (cloud_optical_depth /
+//            cloud_optical_depth_stratified) intentionally ignore
+//            this: tint modulates emission TOWARD the camera, not
+//            the transmittance imposed on the sun-NEE leg.
 //   v2.w   = falloff exponent on (r/radius); 2 = Gaussian-ish
 //
 // Engine bounds the iteration count to push.smoke_params.x (host clamps
@@ -2378,6 +2387,59 @@ float smoke_density_add(float3 pos) {
     }
     return dens;
 }
+
+// Tinted variant used at the primary cloud-march sample point so that
+// per-emitter `tint` (v2.xyz on the smoke SSBO) actually modulates the
+// in-scattered radiance for shaded smoke. Pure shadow paths
+// (cloud_optical_depth, cloud_optical_depth_stratified) stay on the
+// scalar density-only version above -- the tint is a multiplier on
+// the radiance the smoke scatters TOWARD the camera, not on the
+// transmittance the smoke imposes on the sun NEE leg.
+//
+// Tint is a density-weighted average of the per-emitter tints sampled
+// at `pos`. When a single plume dominates the sample the returned
+// `tint` is that emitter's tint; when two plumes overlap the result
+// is the in-between blend, matching how a real heterogeneous plume
+// would emit a mixed-colour glow.
+//
+// out_tint is left at float3(1) when there's no smoke contribution at
+// this sample, so a caller that lerps host_lighting * out_tint by the
+// smoke fraction stays a no-op in clear air.
+float smoke_density_add_tinted(float3 pos, out float3 out_tint) {
+    out_tint = float3(1.0, 1.0, 1.0);
+    float smoke_on = smoke_params.y;
+    if (smoke_on <= 0.0) return 0.0;
+    int n = int(smoke_params.x);
+    if (n <= 0) return 0.0;
+    float t = smoke_params.z;
+    if (n > 16) n = 16;
+    float  dens     = 0.0;
+    float3 tint_acc = float3(0.0, 0.0, 0.0);
+    [loop] for (int i = 0; i < n; ++i) {
+        float4 v0 = smoke_emitters[i * 3 + 0];
+        float4 v1 = smoke_emitters[i * 3 + 1];
+        float4 v2 = smoke_emitters[i * 3 + 2];
+        float3 base = v0.xyz;
+        float  radius = max(v0.w, 1e-3);
+        float3 vel = v1.xyz;
+        float  peak = v1.w;
+        float3 tint = v2.xyz;
+        float  falloff = max(v2.w, 0.25);
+        float3 cur = base + vel * t;
+        float3 d = pos - cur;
+        float r2 = dot(d, d);
+        float cutoff = 16.0 * radius * radius;
+        if (r2 > cutoff) continue;
+        float r = sqrt(r2);
+        float u = r / radius;
+        float w = exp(-pow(u, falloff));
+        float di = peak * w;
+        dens     += di;
+        tint_acc += di * tint;
+    }
+    if (dens > 0.0) out_tint = tint_acc / dens;
+    return dens;
+}
 // --- end Fluid Phase 1 -----------------------------------------------------
 
 // Optical depth through the cloud layer along [ro, ro + rd*t_max].
@@ -3997,7 +4059,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         // #117 added clouds_p4 (curl-noise params).
                         // #100 added vol_density_scale multiplier + empty-cell
                         // skip optimization. Both layered.
-                        float dens = cloud_density_at(sp, clouds_p1,
+                        float cloud_dens = cloud_density_at(sp, clouds_p1,
                                                       clouds_p2, clouds_p3,
                                                       clouds_p4, 6)
                                    * vol_density_scale;
@@ -4007,8 +4069,24 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         // NEE, multi-scatter, and aerial-perspective
                         // pipeline -- it just shows up as "extra
                         // density" at this sample and gets shaded
-                        // identically to a cloud cell.
-                        dens += smoke_density_add(sp);
+                        // identically to a cloud cell. The tinted
+                        // variant also returns the density-weighted
+                        // average per-emitter tint (v2.xyz on the
+                        // smoke SSBO) so the NEE radiance contributions
+                        // below can multiply by lerp(white, smoke_tint,
+                        // smoke_fraction) -- this is the missing piece
+                        // that lets per-plume colour actually reach the
+                        // framebuffer instead of being a documented
+                        // no-op.
+                        float3 smoke_tint = float3(1.0);
+                        float  smoke_dens = smoke_density_add_tinted(sp, smoke_tint);
+                        float  dens       = cloud_dens + smoke_dens;
+                        float  smoke_frac = (dens > 0.0) ? (smoke_dens / dens) : 0.0;
+                        // Effective per-light tint at this sample: white
+                        // when there's no smoke contribution (clear-cloud
+                        // sample), tends to the smoke tint as the smoke
+                        // density dominates the local extinction.
+                        float3 light_tint = lerp(float3(1.0), smoke_tint, smoke_frac);
                         if (dens <= 0.0) {
                             // Empty cell -- transmittance does not change,
                             // no light scatters in. Skip per-light NEE for
@@ -4094,7 +4172,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                             b_pow *= 0.5;
                                         }
                                         v_color_c += clampIndirect(
-                                            ms_acc * trans_atm / hl.pdf);
+                                            ms_acc * trans_atm * light_tint / hl.pdf);
                                     }
                                 }
                             }
@@ -4118,7 +4196,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                                             - 2.0 * g_cloud * c_t_e, 1e-4), 1.5));
                                         v_color_c += clampIndirect(
                                             env.color * t_e * phase_e * step_w * trans_atm
-                                            / env.pdf);
+                                            * light_tint / env.pdf);
                                     }
                                 }
                             }
@@ -4177,7 +4255,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                         a_pow *= 0.5;
                                         b_pow *= 0.5;
                                     }
-                                    v_color_c += clampIndirect(ms_acc * trans_atm);
+                                    v_color_c += clampIndirect(ms_acc * trans_atm * light_tint);
                                 }
                             }
                             // Direct moon (single-scatter NEE). Moon is the
@@ -4217,13 +4295,13 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                         // daylight luminance after auto-exposure.
                                         float3 moon_rad = m_col * (0.3 * phase_b * m_atm);
                                         v_color_c += clampIndirect(
-                                            moon_rad * trans_moon * phase_m * step_w * trans_atm);
+                                            moon_rad * trans_moon * phase_m * step_w * trans_atm * light_tint);
                                     }
                                 }
                             }
                             // Diffuse skylight (omnidirectional, no phase
                             // function).
-                            v_color_c += clampIndirect(sky_ambient * step_w * trans_atm);
+                            v_color_c += clampIndirect(sky_ambient * step_w * trans_atm * light_tint);
                         }
                         trans_eye_c *= exp(-dens * dtc);
                     }
