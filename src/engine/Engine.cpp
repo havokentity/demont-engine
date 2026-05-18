@@ -16,6 +16,8 @@
 #include "../core/Jobs/JobSystem.h"
 #include "../core/Log.h"
 #include "../core/Memory/Memory.h"
+#include "../destruction/VoxelGrid.h"
+#include "../destruction/Voxelizer.h"
 #include "../renderer/Astronomy.h"
 #include "../renderer/BscCatalog.h"
 #include "../renderer/MoonTexture.h"
@@ -384,6 +386,29 @@ namespace cvar {
             "noise tuning.",
             0);
     // --- end SDF Phase 1 -------------------------------------------------------
+    // --- Voxel destruction Phase 1 (#140) --------------------------------------
+    PT_CVAR(r_voxel_size,             "0.1",
+            "Voxel side length in metres for the destruction subsystem. "
+            "Default 0.1 m (10 cm chunks) -- the Minecraft / Teardown "
+            "reference size. Voxelization uses this value at the moment "
+            "`voxelize_object` is invoked; lowering it after a voxel grid "
+            "exists does NOT shrink existing voxels (re-run the command). "
+            "Maps directly to VoxelGrid::voxel_size on construction; "
+            "occupied voxels render as analytic boxes via the existing "
+            "SDF cluster path (one cluster per voxel, kSdfShapeBox).",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_voxelize_demo,          "0",
+            "1 = render every voxelized object as its chunky-box pile "
+            "INSTEAD of the source CSG mesh (A/B toggle for the "
+            "destruction Phase 1 visualization). Mesh / TLAS bindings "
+            "are suppressed for the frame so the path tracer sees only "
+            "the voxels; analytic primitives and SDF clusters render "
+            "alongside as usual. 0 reverts to original mesh rendering "
+            "with zero regression -- the voxel SDF clusters are pulled "
+            "out of the upload set so the shader doesn't even iterate "
+            "them. Idempotent on every frame via SyncVoxelDemoState.",
+            CVAR_ARCHIVE);
+    // --- end Voxel destruction Phase 1 -----------------------------------------
     PT_CVAR(r_mis,             "1",
             "Multiple importance sampling for direct lighting on Lambert "
             "hits under HDRI. 1 = balance-heuristic MIS between env-map "
@@ -1025,6 +1050,12 @@ void Engine::ApplyCommandLineCvarOverrides() {
         // doesn't silently disable the override.
         { "--smoke-exec=",         "pt_smoke_exec"        },
         { "--smoke-capture-out=",  "pt_smoke_capture_out" },
+        // Late smoke-exec hook (issue #97, also used by #140's voxel
+        // demo fixture). Runs AFTER the CSG / prim / SDF seed +
+        // command registration so the fixture can issue console
+        // commands like `voxelize_object` or `csg_*` that depend on
+        // those being live.
+        { "--smoke-late-exec=",    "pt_smoke_late_exec"   },
     };
 
     for (int i = 1; i < argc_; ++i) {
@@ -2956,6 +2987,12 @@ void Engine::RenderFrame() {
 
     EnsureMeshUpdated();
     EnsurePrimitivesUploaded();
+    // --- Voxel destruction Phase 1 (#140) ----------------------------------
+    // Refresh the reserved-id voxel SDF clusters against the current
+    // r_voxelize_demo cvar before SDF upload. Sets voxel_demo_active_
+    // for the mesh-hide gate below.
+    SyncVoxelDemoState();
+    // --- end Voxel destruction Phase 1 -------------------------------------
     // --- SDF Phase 1 (#97) -------------------------------------------------
     EnsureSdfPrimsUploaded();
     // --- end SDF Phase 1 ---------------------------------------------------
@@ -3402,7 +3439,16 @@ void Engine::RenderFrame() {
     // order. Our RHI uses separate "slot namespaces" so the user-facing
     // numbers below are 1-based for buffers (the AS, declared at vk slot
     // 2, lands at buffer(0) on Metal; mesh_positions at buffer(1), etc.).
-    bool tlas_present = (scene_tlas_id_ != 0);
+    // Voxel destruction Phase 1 (#140) hide-mesh gate. When the demo
+    // toggle is on AND we have at least one VoxelGrid uploaded, treat
+    // the CSG mesh as absent for this frame so the path tracer sees
+    // ONLY the voxelized form. Both the HW (TLAS) and SW (linear
+    // triangle scan) branches are suppressed via local flags --
+    // scene_tlas_id_ / mesh_tri_count_ themselves are NOT mutated, so
+    // flipping r_voxelize_demo back to 0 instantly restores the mesh
+    // without a re-bake.
+    const bool voxel_hide_mesh = voxel_demo_active_;
+    bool tlas_present = (scene_tlas_id_ != 0) && !voxel_hide_mesh;
     // Software-mesh fallback (mesh_tri_count_ > 0 && !tlas_present):
     // we still bind the vertex + index buffers and let PathTrace.slang
     // linear-scan triangles. Currently exercised on Mac-Vulkan when the
@@ -3410,7 +3456,8 @@ void Engine::RenderFrame() {
     // (pre-1.3); the gold path stays on top of VK_KHR_ray_query when it
     // is available. See VulkanDevice's RT extension probe log.
     const bool sw_mesh_present = (!tlas_present && mesh_tri_count_ > 0 &&
-                                  box_vbuf_id_ != 0 && box_ibuf_id_ != 0);
+                                  box_vbuf_id_ != 0 && box_ibuf_id_ != 0 &&
+                                  !voxel_hide_mesh);
     if (tlas_present) {
         cb->BindAccelStruct(2, pt::rhi::AccelStructHandle{scene_tlas_id_});
         if (box_vbuf_id_ != 0) cb->BindBuffer(1, pt::rhi::BufferHandle{box_vbuf_id_}, 0);
@@ -7946,6 +7993,9 @@ void Engine::RegisterCommands() {
     // --- SDF Phase 1 (#97) -----------------------------------------------------
     RegisterSdfCommands();
     // --- end SDF Phase 1 -------------------------------------------------------
+    // --- Voxel destruction Phase 1 (#140) --------------------------------------
+    RegisterVoxelCommands();
+    // --- end Voxel destruction Phase 1 -----------------------------------------
 }
 
 namespace {
@@ -8612,5 +8662,316 @@ void Engine::RegisterSdfCommands() {
         });
 }
 // --- end SDF Phase 1 -------------------------------------------------------
+
+// --- Voxel destruction Phase 1 (#140) --------------------------------------
+//
+// Voxel commands. The engine voxelizes a source object on demand and
+// stores the resulting VoxelGrid in voxel_grids_ keyed by source id.
+// Per-frame, SyncVoxelDemoState injects the occupied voxels into
+// sdf_prims_ as analytic-box SDF clusters when r_voxelize_demo=1, and
+// pulls them back out when 0. No shader changes are required -- the
+// path tracer treats them as ordinary SDF clusters.
+
+namespace {
+
+// Helper: build a VoxelMaterial from an AnalyticPrim. Material kind
+// mapping matches the wire format (0 Lambert, 1 Metal, 2 Dielectric).
+pt::destruction::VoxelMaterial MaterialFromAnalyticPrim(const Engine::AnalyticPrim& p) {
+    pt::destruction::VoxelMaterial m{};
+    m.kind      = static_cast<std::uint32_t>(p.material);
+    m.albedo    = { p.albedo[0], p.albedo[1], p.albedo[2] };
+    m.roughness = p.roughness;
+    m.ior       = p.ior;
+    return m;
+}
+
+pt::destruction::VoxelMaterial MaterialFromSdfPrim(const pt::renderer::SdfPrim& p) {
+    pt::destruction::VoxelMaterial m{};
+    m.kind      = p.material;
+    m.albedo    = { p.albedo[0], p.albedo[1], p.albedo[2] };
+    m.roughness = p.roughness;
+    m.ior       = p.ior;
+    return m;
+}
+
+// Material for CSG meshes. CsgScene doesn't carry per-node material
+// today, so Phase 1 ships with a fixed default that visually
+// resembles the headline drilled cube (warm metal) -- the goal of
+// `r_voxelize_demo` is the chunk-pile silhouette, not perfect
+// material fidelity. Later phases (issue #139 Phase 4) attach
+// per-voxel material strength.
+pt::destruction::VoxelMaterial DefaultMeshVoxelMaterial() {
+    pt::destruction::VoxelMaterial m{};
+    m.kind      = 1u;     // Metal
+    m.albedo    = { 0.85f, 0.65f, 0.30f };  // gold-ish
+    m.roughness = 0.15f;
+    m.ior       = 1.0f;
+    return m;
+}
+
+// Build a single-LEAF SDF cluster of shape BOX for one occupied
+// voxel. Half-extents are voxel_size/2 on every axis; center is the
+// voxel center in world space. AABB is filled by ComputeSdfAabb so
+// the BVH bound is tight.
+pt::renderer::SdfPrim VoxelToSdfCluster(const std::array<float, 3>& center,
+                                        float voxel_size,
+                                        const pt::destruction::VoxelMaterial& mat) {
+    using namespace pt::renderer;
+    SdfPrim prim{};
+    prim.node_count = 1u;
+    prim.material   = mat.kind;
+    prim.albedo[0]  = mat.albedo[0];
+    prim.albedo[1]  = mat.albedo[1];
+    prim.albedo[2]  = mat.albedo[2];
+    prim.roughness  = mat.roughness;
+    prim.ior        = mat.ior;
+    SdfNode& n   = prim.nodes[0];
+    n.op         = SDF_OP_LEAF;
+    n.shape      = SDF_SHAPE_BOX;
+    n.child_a    = 0u;
+    n.child_b    = 0u;
+    const float h = 0.5f * voxel_size;
+    n.params[0]  = h;
+    n.params[1]  = h;
+    n.params[2]  = h;
+    n.params[3]  = 0.0f;
+    n.center[0]  = center[0];
+    n.center[1]  = center[1];
+    n.center[2]  = center[2];
+    ComputeSdfAabb(prim);
+    return prim;
+}
+
+}  // namespace
+
+bool Engine::VoxelizeSourceObject(std::uint32_t source_id, float voxel_size,
+                                  std::string* out_summary) {
+    if (voxel_size <= 0.0f) {
+        if (out_summary) *out_summary = "voxelize_object: r_voxel_size must be > 0";
+        return false;
+    }
+    auto grid = std::make_unique<pt::destruction::VoxelGrid>();
+
+    // Resolution order: CSG mesh root -> SDF cluster -> analytic
+    // primitive. The first match wins.
+    if (csg_scene_ && csg_scene_->HasRoot() && source_id == csg_scene_->RootId()) {
+        std::string err;
+        pt::csg::BakedMesh baked = csg_scene_->Bake(&err);
+        if (baked.Empty()) {
+            const std::string msg = fmt::format(
+                "voxelize_object: CSG root id={} bake failed ({})",
+                source_id, err.empty() ? "empty mesh" : err);
+            if (out_summary) *out_summary = msg;
+            LOG_ERROR("[voxel] {}", msg);
+            return false;
+        }
+        const auto mat = DefaultMeshVoxelMaterial();
+        if (!pt::destruction::VoxelizeBakedMesh(source_id, baked, voxel_size, mat, *grid)) {
+            const std::string msg = fmt::format(
+                "voxelize_object: CSG root id={} produced 0 voxels", source_id);
+            if (out_summary) *out_summary = msg;
+            LOG_WARN("[voxel] {}", msg);
+            return false;
+        }
+    } else if (auto it = sdf_prims_.find(source_id); it != sdf_prims_.end()) {
+        const auto mat = MaterialFromSdfPrim(it->second);
+        if (!pt::destruction::VoxelizeSdf(source_id, it->second, voxel_size, mat, *grid)) {
+            const std::string msg = fmt::format(
+                "voxelize_object: SDF cluster id={} produced 0 voxels", source_id);
+            if (out_summary) *out_summary = msg;
+            LOG_WARN("[voxel] {}", msg);
+            return false;
+        }
+    } else if (auto pit = primitives_.find(source_id); pit != primitives_.end()) {
+        const auto& p = pit->second;
+        if (p.type != AnalyticPrim::Sphere) {
+            const std::string msg = fmt::format(
+                "voxelize_object: prim id={} is not a finite primitive (plane has infinite extent)",
+                source_id);
+            if (out_summary) *out_summary = msg;
+            LOG_ERROR("[voxel] {}", msg);
+            return false;
+        }
+        const auto mat = MaterialFromAnalyticPrim(p);
+        const float center[3] = { p.pos_or_n[0], p.pos_or_n[1], p.pos_or_n[2] };
+        if (!pt::destruction::VoxelizeSphere(source_id, center, p.radius_or_d,
+                                             voxel_size, mat, *grid)) {
+            const std::string msg = fmt::format(
+                "voxelize_object: sphere id={} produced 0 voxels", source_id);
+            if (out_summary) *out_summary = msg;
+            LOG_WARN("[voxel] {}", msg);
+            return false;
+        }
+    } else {
+        const std::string msg = fmt::format(
+            "voxelize_object: id={} not found (CSG root, SDF cluster, or analytic prim)",
+            source_id);
+        if (out_summary) *out_summary = msg;
+        LOG_ERROR("[voxel] {}", msg);
+        return false;
+    }
+
+    // Replace any prior grid for this source. Push to map.
+    voxel_grids_[source_id] = std::move(grid);
+
+    // Force a sync next frame so the live demo state matches the new
+    // voxel set.
+    accum_dirty_ = true;
+    sdf_prims_dirty_ = true;
+    if (out_summary) {
+        const auto& g = *voxel_grids_[source_id];
+        *out_summary = fmt::format(
+            "voxelize_object id={} dims={}x{}x{} occupied={} voxel_size={}m",
+            source_id, g.DimX(), g.DimY(), g.DimZ(), g.Occupied(), voxel_size);
+    }
+    return true;
+}
+
+void Engine::SyncVoxelDemoState() {
+    // Read the cvar each frame so a toggle takes effect immediately.
+    bool want_demo = false;
+    if (auto* v = pt::console::Console::Get().FindCVar("r_voxelize_demo")) {
+        want_demo = v->GetBool();
+    }
+    voxel_demo_active_ = want_demo && !voxel_grids_.empty();
+
+    // Compute the desired reserved-id span based on want_demo.
+    //
+    // When the demo is off (want_demo=0) the desired set is empty:
+    // we rip every kVoxelClusterIdBase+* entry out of sdf_prims_.
+    // When on, we emit one cluster per occupied voxel across every
+    // VoxelGrid in voxel_grids_, in object-id order. Reserved ids are
+    // contiguous so the next sync's diff is cheap.
+    //
+    // The voxel renderer slot is sdf_prims_ -- reusing the existing
+    // SDF cluster path means the path tracer's loop already handles
+    // them with no shader change. The cost is N sphere-trace loops
+    // per ray (one per voxel cluster); for the 1m^3 / 0.1 m acceptance
+    // scene that's ~1000 trivial box traces which the GPU handles fine.
+
+    // Step 1: erase any existing voxel-reserved clusters from
+    // sdf_prims_.
+    bool changed = false;
+    for (auto it = sdf_prims_.begin(); it != sdf_prims_.end(); ) {
+        if (it->first >= kVoxelClusterIdBase) {
+            it = sdf_prims_.erase(it);
+            changed = true;
+        } else {
+            ++it;
+        }
+    }
+
+    // Step 2: if demo on, repopulate from voxel_grids_.
+    if (want_demo) {
+        std::uint32_t next_id = kVoxelClusterIdBase;
+        for (const auto& [src_id, grid_ptr] : voxel_grids_) {
+            if (!grid_ptr || !grid_ptr->Valid()) continue;
+            const auto& g = *grid_ptr;
+            const float voxel_size = g.VoxelSize();
+            const auto& mat = g.Material();
+            for (std::uint32_t k = 0; k < g.DimZ(); ++k)
+            for (std::uint32_t j = 0; j < g.DimY(); ++j)
+            for (std::uint32_t i = 0; i < g.DimX(); ++i) {
+                if (!g.Get(i, j, k)) continue;
+                const auto c = g.VoxelCenter(i, j, k);
+                sdf_prims_[next_id] = VoxelToSdfCluster(c, voxel_size, mat);
+                ++next_id;
+                if (next_id == 0u) {  // wraparound guard (practical never)
+                    LOG_ERROR("[voxel] reserved cluster id space exhausted");
+                    break;
+                }
+            }
+        }
+        changed = true;
+    }
+
+    if (changed) {
+        sdf_prims_dirty_ = true;
+        accum_dirty_     = true;
+    }
+}
+
+void Engine::RegisterVoxelCommands() {
+    auto& C = pt::console::Console::Get();
+
+    C.RegisterCommand("voxelize_list",
+        "List active voxel grids.",
+        [this](auto, pt::console::Output& out) {
+            if (voxel_grids_.empty()) { out.PrintLine("(no voxel grids)"); return; }
+            out.FormatLine("{} voxel grid(s):", voxel_grids_.size());
+            for (const auto& [id, g] : voxel_grids_) {
+                if (!g) continue;
+                out.FormatLine("  src={:>3}  dims={:>3}x{:>3}x{:>3}  occupied={:>6}  voxel={:.3f}m  aabb=[{:.2f},{:.2f},{:.2f} .. {:.2f},{:.2f},{:.2f}]",
+                               id,
+                               g->DimX(), g->DimY(), g->DimZ(),
+                               g->Occupied(), g->VoxelSize(),
+                               g->Header().aabb_min[0], g->Header().aabb_min[1], g->Header().aabb_min[2],
+                               g->Header().aabb_max[0], g->Header().aabb_max[1], g->Header().aabb_max[2]);
+            }
+        });
+
+    C.RegisterCommand("voxelize_clear",
+        "Drop all voxel grids and remove their reserved SDF clusters.",
+        [this](auto, pt::console::Output& out) {
+            voxel_grids_.clear();
+            // Force the next render to remove any reserved-id clusters.
+            SyncVoxelDemoState();
+            out.PrintLine("voxelize: cleared");
+        });
+
+    C.RegisterCommand("voxelize_object",
+        "voxelize_object <id>: voxelize a source object (CSG root, SDF cluster, or sphere prim) into a voxel grid at the current r_voxel_size.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 1) {
+                out.PrintLine("usage: voxelize_object <id>");
+                return;
+            }
+            std::uint32_t id = 0u;
+            if (!ParseUint(args[0], id)) {
+                out.PrintLine("voxelize_object: id parse failed");
+                return;
+            }
+            float voxel_size = 0.1f;
+            if (auto* v = pt::console::Console::Get().FindCVar("r_voxel_size")) {
+                voxel_size = v->GetFloat();
+            }
+            std::string summary;
+            const bool ok = VoxelizeSourceObject(id, voxel_size, &summary);
+            out.PrintLine(summary);
+            if (ok) {
+                // Force an immediate sync so the next render reflects
+                // the new voxel set without waiting for the cvar mirror.
+                SyncVoxelDemoState();
+            }
+        });
+
+    C.RegisterCommand("voxelize_save",
+        "voxelize_save <dir>: write every active voxel grid to <dir>/voxel_cache_*.bin.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 1) {
+                out.PrintLine("usage: voxelize_save <dir>");
+                return;
+            }
+            if (voxel_grids_.empty()) {
+                out.PrintLine("voxelize_save: nothing to save (no voxel grids)");
+                return;
+            }
+            const std::string dir{args[0]};
+            std::size_t saved = 0u;
+            for (const auto& [id, g] : voxel_grids_) {
+                if (!g) continue;
+                const std::string path = pt::destruction::MakeCachePath(
+                    dir, id, g->VoxelSize(), 0ull);
+                if (g->SaveToFile(path)) {
+                    out.FormatLine("voxelize_save: id={} -> {}", id, path);
+                    ++saved;
+                } else {
+                    out.FormatLine("voxelize_save: id={} write failed", id);
+                }
+            }
+            out.FormatLine("voxelize_save: {} grid(s) written", saved);
+        });
+}
+// --- end Voxel destruction Phase 1 -----------------------------------------
 
 }  // namespace pt::engine
