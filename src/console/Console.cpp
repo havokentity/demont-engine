@@ -266,20 +266,37 @@ Console::Resolution Console::ResolveCommand(std::string_view typed) {
     //    preferred over commands, per issue #162 spec). The maps are
     //    std::map so iteration is alphabetical, satisfying the
     //    final deterministic tie-break.
-    auto matches_prefix = [&](const std::string& name) {
-        if (name.size() >= typed.size() &&
-            name.compare(0, typed.size(), typed) == 0) {
-            return true;
-        }
+    // Two-tier match: first try the typed prefix verbatim, then if
+    // that finds nothing, try the typed prefix minus a trailing `s`
+    // (English-plural relaxation -- "perfs" -> "perf" -> matches
+    // r_perf_overlay; "lights" -> "light" -> matches r_light_*).
+    // The relaxation is a small one-step convenience, NOT a generic
+    // fuzzy / Levenshtein search -- single trailing-s strip handles
+    // the most common interactive shorthand without expanding the
+    // match surface unpredictably.
+    auto starts_with = [](std::string_view body, std::string_view prefix) {
+        return body.size() >= prefix.size() &&
+               body.compare(0, prefix.size(), prefix) == 0;
+    };
+    auto try_prefix = [&](std::string_view prefix, const std::string& name) {
+        if (prefix.empty()) return false;
+        if (starts_with(name, prefix)) return true;
         // Strip an "r_" prefix off the registered name and re-check.
         // Only fires for cvars; commands like `phys_drop_sphere`
         // already match via the raw-prefix branch.
         if (name.size() >= 2 && name[0] == 'r' && name[1] == '_') {
             std::string_view body(name.data() + 2, name.size() - 2);
-            if (body.size() >= typed.size() &&
-                body.compare(0, typed.size(), typed) == 0) {
-                return true;
-            }
+            if (starts_with(body, prefix)) return true;
+        }
+        return false;
+    };
+    auto matches_prefix = [&](const std::string& name) {
+        if (try_prefix(typed, name)) return true;
+        // Plural-strip relaxation. Only fires when typed > 1 char so
+        // a bare `s` doesn't degenerate into an empty-prefix match.
+        if (typed.size() > 1 && typed.back() == 's') {
+            const std::string_view singular(typed.data(), typed.size() - 1);
+            if (try_prefix(singular, name)) return true;
         }
         return false;
     };
@@ -296,17 +313,32 @@ Console::Resolution Console::ResolveCommand(std::string_view typed) {
 
     const std::size_t total = cvar_hits.size() + cmd_hits.size();
     if (total == 0) return r;       // no match -- caller falls back to "unknown" error.
-    if (total == 1) {
-        r.canonical_name = cvar_hits.empty() ? cmd_hits.front() : cvar_hits.front();
-        return r;
+
+    // Top-of-list auto-resolves, regardless of total count. cvars come
+    // first in the candidate list (cvars > commands tie-break per
+    // issue #162 spec), maps iterate alphabetically. So the "top" is
+    // the alphabetically-first cvar that matched, or if no cvars
+    // matched, the alphabetically-first command.
+    //
+    // This means `perf` resolves to `r_perf_overlay` (the shortest
+    // member of the `r_perf_overlay*` family, which is also the
+    // alphabetical-first), even though `r_perf_overlay_mode` and
+    // `r_perf_overlay_scale` also matched. The user's mental model:
+    // "if I typed an unambiguous shorthand, give me the top hit; if
+    // I wanted a longer specialization I'd have typed more." Same
+    // shape as bash tab-completion's first-cycle behaviour.
+    //
+    // ambiguous_matches is still populated when total > 1 so the
+    // caller / log line can surface "(top of N matches)" for
+    // transparency. Callers that WANT the strict-ambiguous behaviour
+    // can opt in by checking ambiguous_matches.size() > 1 and
+    // refusing to apply the top pick.
+    r.canonical_name = cvar_hits.empty() ? cmd_hits.front() : cvar_hits.front();
+    if (total > 1) {
+        r.ambiguous_matches.reserve(total);
+        for (auto& n : cvar_hits) r.ambiguous_matches.push_back(std::move(n));
+        for (auto& n : cmd_hits)  r.ambiguous_matches.push_back(std::move(n));
     }
-    // Multiple hits: ambiguous. Pack both lists into ambiguous_matches
-    // (cvars first, alphabetical, then commands alphabetical) so the
-    // caller can render the list with the canonical tie-break order
-    // baked in.
-    r.ambiguous_matches.reserve(total);
-    for (auto& n : cvar_hits) r.ambiguous_matches.push_back(std::move(n));
-    for (auto& n : cmd_hits)  r.ambiguous_matches.push_back(std::move(n));
     return r;
 }
 
@@ -389,10 +421,37 @@ ExecuteResult Console::Execute(std::string_view line) {
             // storage in place (which would invalidate other tokens'
             // string_views), park the canonical name in
             // `canonical_storage` and rebind `name` to view it.
+            //
+            // When ambiguous_matches is populated (size > 1) the
+            // top-of-list rule auto-picked the alphabetical-first
+            // hit; surface the count + alternates so the user sees
+            // what got chosen and what else was available. When
+            // ambiguous_matches is empty there's a single match and
+            // we use the simpler "(top match)" log line.
             canonical_storage = r.canonical_name;
-            resolution_log = fmt::format(
-                "[console] resolved `{}` -> `{}` (top match)\n",
-                std::string(name), canonical_storage);
+            if (r.ambiguous_matches.size() > 1) {
+                // Build a short list of "what else matched" capped
+                // at 4 entries to avoid swamping interactive output.
+                constexpr std::size_t kCap = 4;
+                std::string alt;
+                std::size_t i = 0;
+                for (const auto& m : r.ambiguous_matches) {
+                    if (m == canonical_storage) continue;  // skip the picked one
+                    if (i >= kCap) { alt += ", ..."; break; }
+                    if (!alt.empty()) alt += ", ";
+                    alt += m;
+                    ++i;
+                }
+                resolution_log = fmt::format(
+                    "[console] resolved `{}` -> `{}` (top of {} matches; "
+                    "alt: {})\n",
+                    std::string(name), canonical_storage,
+                    r.ambiguous_matches.size(), alt);
+            } else {
+                resolution_log = fmt::format(
+                    "[console] resolved `{}` -> `{}` (top match)\n",
+                    std::string(name), canonical_storage);
+            }
             name = std::string_view(canonical_storage);
         } else if (r.canonical_name.empty() && !r.ambiguous_matches.empty()) {
             // Ambiguous -- print at most 8 candidates and a count.

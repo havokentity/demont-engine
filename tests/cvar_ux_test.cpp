@@ -395,23 +395,80 @@ TEST_CASE("smart resolve: unique prefix returns canonical + log line in Execute"
     CHECK(er.output.find("test_ux_sr_uniq_payload") != std::string::npos);
 }
 
-TEST_CASE("smart resolve: ambiguous prefix errors with candidate list") {
+TEST_CASE("smart resolve: ambiguous prefix auto-picks top of list + lists alternates") {
     auto& C = pt::console::Console::Get();
-    // Two cvars sharing the same prefix -- the resolver must surface
-    // both as ambiguous candidates rather than picking one.
+    // Two cvars sharing the same prefix. The resolver auto-picks the
+    // alphabetically-first cvar (top-of-list rule) and surfaces the
+    // alternates in the log line, instead of erroring on the user.
+    //
+    // Pre-PR-NNN behaviour: ambiguous returned an error and the user
+    // had to type more characters to disambiguate. User feedback was
+    // "if it's the top option in the list, that's the one which
+    // should execute, get it?" -- so the resolver now follows
+    // bash-tab-completion-style: first-cycle takes the alphabetical
+    // first; if the user wanted something further down the list,
+    // they type more chars.
     C.RegisterCVar("test_ux_sr_amb_alpha", "1", "amb a", pt::console::CVAR_NONE);
     C.RegisterCVar("test_ux_sr_amb_beta",  "2", "amb b", pt::console::CVAR_NONE);
 
     auto r = C.ResolveCommand("test_ux_sr_amb_");
-    CHECK(r.canonical_name.empty());
+    // Top-of-list = alphabetically-first cvar match.
+    CHECK(r.canonical_name == "test_ux_sr_amb_alpha");
     CHECK_FALSE(r.is_exact_match);
+    // ambiguous_matches still populated for transparency.
     CHECK(r.ambiguous_matches.size() >= 2);
 
-    auto er = C.Execute("test_ux_sr_amb_");
-    CHECK_FALSE(er.ok);
-    CHECK(er.error.find("ambiguous prefix") != std::string::npos);
-    CHECK(er.error.find("test_ux_sr_amb_alpha") != std::string::npos);
-    CHECK(er.error.find("test_ux_sr_amb_beta")  != std::string::npos);
+    // Execute now succeeds (auto-resolves to alpha) and the resolution
+    // log mentions "top of N matches" so the user knows what happened.
+    auto er = C.Execute("test_ux_sr_amb_ 3");
+    CHECK(er.ok);
+    CHECK(er.output.find("top of") != std::string::npos);
+    CHECK(er.output.find("test_ux_sr_amb_alpha") != std::string::npos);
+    // Beta should appear as an alternate in the log, not as a resolution target.
+    CHECK(er.output.find("test_ux_sr_amb_beta") != std::string::npos);
+    // alpha got set to "3", beta is untouched.
+    auto* alpha = C.FindCVar("test_ux_sr_amb_alpha");
+    auto* beta  = C.FindCVar("test_ux_sr_amb_beta");
+    REQUIRE(alpha != nullptr);
+    REQUIRE(beta  != nullptr);
+    CHECK(alpha->value == "3");
+    CHECK(beta->value  == "2");  // unchanged
+}
+
+TEST_CASE("smart resolve: plural-strip relaxation -- `perfs` finds `perf_overlay`") {
+    auto& C = pt::console::Console::Get();
+    // English-plural shorthand: a user typing `perfs` (intending
+    // shorthand for the `perf` family) should resolve to the
+    // alphabetically-first `r_perf_*` cvar. The resolver tries the
+    // typed prefix verbatim first, and if no hits, retries with the
+    // trailing `s` stripped. One-step relaxation, NOT a generic
+    // Levenshtein search.
+    C.RegisterCVar("r_ux_sr_plural_overlay",      "0",   "primary",  pt::console::CVAR_NONE);
+    C.RegisterCVar("r_ux_sr_plural_overlay_mode", "n",   "mode",     pt::console::CVAR_NONE);
+    C.RegisterCVar("r_ux_sr_plural_overlay_scale","1.0", "scale",    pt::console::CVAR_NONE);
+
+    // `ux_sr_plurals` (plural) -> strip-s -> `ux_sr_plural` -> matches
+    // all three (strip-r_ branch); top-of-list picks the
+    // alphabetical-first which is `r_ux_sr_plural_overlay`.
+    auto r = C.ResolveCommand("ux_sr_plurals");
+    CHECK(r.canonical_name == "r_ux_sr_plural_overlay");
+    CHECK_FALSE(r.is_exact_match);
+
+    // Sanity: a `s`-less typed prefix that prefix-matches directly
+    // also works.
+    auto r2 = C.ResolveCommand("ux_sr_plural");
+    CHECK(r2.canonical_name == "r_ux_sr_plural_overlay");
+
+    // Edge case: a bare `s` should not trigger plural-strip (would
+    // degenerate to empty prefix, matching everything). The bare `s`
+    // either matches `s*` cvars / commands or nothing.
+    auto r3 = C.ResolveCommand("s");
+    // The exact result depends on whether ANY production cvar/command
+    // starts with `s`. We don't assert a specific name here; we only
+    // assert that the resolver didn't return EVERY cvar in the
+    // registry (which would happen if plural-strip wrongly fired on a
+    // 1-char input and turned it into an empty prefix).
+    CHECK(r3.ambiguous_matches.size() < 100);
 }
 
 TEST_CASE("smart resolve: no match falls through to unknown-cvar error") {
