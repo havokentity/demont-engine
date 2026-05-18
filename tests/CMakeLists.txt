@@ -205,19 +205,25 @@ pt_add_test(pt_renderer_triangle_bvh
 # pattern as the other unit-test cells above. They link glm::glm only
 # (no engine target), so they're pure-CPU + deterministic.
 #
-# pt_math_vec_test           -- vec2/vec3/vec4: dot, cross, normalize,
+# pt_math_vec (target/ctest name; source: pt_math_vec_test.cpp)
+#                            -- vec2/vec3/vec4: dot, cross, normalize,
 #                               length, zero/near-zero pathology,
 #                               randomized Cauchy-Schwarz + orthogonality
-# pt_math_mat_test           -- mat3/mat4: identity, multiplication,
+# pt_math_mat (target/ctest name; source: pt_math_mat_test.cpp)
+#                            -- mat3/mat4: identity, multiplication,
 #                               inverse, transpose, determinant,
 #                               column-major storage contract
-# pt_math_quat_test          -- quaternion: identity, angleAxis,
+# pt_math_quat (target/ctest name; source: pt_math_quat_test.cpp)
+#                            -- quaternion: identity, angleAxis,
 #                               from Euler, multiplication, conjugate /
 #                               inverse, slerp endpoints + midpoint,
 #                               quat <-> mat3/mat4 round-trip,
 #                               small-angle + full-circle edges
-# pt_math_transforms_test    -- combined: TRS composition + inverse,
-#                               lookAtRH places cam at clip-space origin,
+# pt_math_transforms (target/ctest name; source: pt_math_transforms_test.cpp)
+#                            -- combined: TRS composition + inverse,
+#                               lookAtRH places the camera at the
+#                               view-space origin (clip space only
+#                               exists after applying the projection),
 #                               perspectiveRH_ZO near=0 / far=1 mapping,
 #                               screen-to-world ray reconstruction
 pt_add_test(pt_math_vec

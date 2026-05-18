@@ -250,8 +250,10 @@ TEST_CASE("transform: perspectiveRH_ZO preserves screen-x sign convention") {
 // --- Screen-to-world ray reconstruction ---------------------------------
 TEST_CASE("transform: screen-space ray reconstruction round-trip") {
     // The path-tracer shader reconstructs a world-space ray from each
-    // pixel's NDC coordinate by inverting the view*proj matrix. Test
-    // the inverse direction:
+    // pixel's NDC coordinate by inverting the combined view-projection
+    // matrix. glm uses column vectors, so the build order is
+    // vp = proj * view and the shader inverts that product. Test the
+    // inverse direction:
     //   1. Pick a known world-space point P.
     //   2. Project: clip = proj * view * (P, 1) -> NDC after w-divide.
     //   3. Unproject the NDC point through inverse(proj*view).
@@ -348,8 +350,9 @@ TEST_CASE("transform: pixel-center ray direction matches FOV") {
 
 // --- World-to-screen + screen-to-world stability -----------------------
 TEST_CASE("transform: full chain world->NDC->world is identity") {
-    // Sweep a few world-space points through (view * proj) then back
-    // via inverse. The recovered points must match within tolerance.
+    // Sweep a few world-space points through vp = proj * view (glm's
+    // column-vector convention) then back via inverse. The recovered
+    // points must match within tolerance.
     // This is the regression catch for "ZO got swapped to NO" (clip-z
     // range bug) or "RH got swapped to LH" (handedness bug) -- either
     // would break only one direction of the round-trip and the test

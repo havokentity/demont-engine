@@ -30,6 +30,7 @@
 #include <glm/gtc/constants.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
+#include <algorithm>  // std::min in quat_approx_equal
 #include <cmath>
 
 namespace {
