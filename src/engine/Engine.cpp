@@ -1018,6 +1018,47 @@ namespace cvar {
             "only the first N entries get pushed to GPU each frame. Use to "
             "dial back per-pixel cost on lower-tier GPUs without dropping "
             "specific emitters from the list.", CVAR_ARCHIVE);
+    // --- Fluid Phase 2 (#180) -- advected emission --------------------------
+    // Phase 2 turns each emitter from a single drifting Gaussian into a
+    // CHAIN of P time-staggered "puffs" -- the head sits at the emitter
+    // mouth (age=0), the tail at age=r_smoke_lifetime. Puffs age, advect
+    // along the emitter's velocity scaled by r_smoke_advection_strength,
+    // expand radially via r_smoke_expansion_rate, and fade their density
+    // linearly into the lifetime so the column dissipates rather than
+    // translating rigidly. Still parametric (no solver state); the visible
+    // win over Phase 1 is that smoke now looks like rising / drifting
+    // smoke instead of a moving blob.
+    PT_CVAR(r_smoke_lifetime,          "4.0",
+            "Smoke puff lifetime in seconds (#180). Each emitter spawns a "
+            "chain of r_smoke_puff_count puffs spaced evenly across this "
+            "lifetime; density fades linearly to zero at age=lifetime. "
+            "Larger values = taller, longer-lasting columns; tune together "
+            "with r_smoke_advection_strength (which sets how fast the column "
+            "stretches per second of lifetime). 0 collapses to the Phase 1 "
+            "single-blob model (only the head puff renders).", CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_advection_strength, "1.0",
+            "Multiplier on each emitter's velocity that controls how far "
+            "older puffs drift from the source (#180). 1.0 = use the "
+            "emitter's velocity verbatim (older puffs at age t sit at "
+            "base + velocity * t). 0 = puffs stack at the source (steam-jet "
+            "feel); 2.0+ = stretched plume. Phase 2 has no turbulence -- "
+            "the column is a straight chain along the velocity vector.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_puff_count,        "6",
+            "Number of staggered puffs per emitter (#180). Each puff is a "
+            "Gaussian at a different age along [0, r_smoke_lifetime]; more "
+            "puffs = smoother column at the cost of P density evaluations "
+            "per cloud-march sample per emitter. Hard-clamped to [1, 8] in "
+            "the shader so the inner loop bound is compile-time-known. "
+            "1 mimics Phase 1's single-blob shape.", CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_expansion_rate,    "0.15",
+            "Per-second radial-expansion rate for an aging smoke puff "
+            "(#180). At age t the effective radius is r * (1 + rate * t), "
+            "modelling the turbulent-diffusion broadening of a real rising "
+            "plume. 0 = constant-radius puffs (column has uniform width); "
+            "0.1-0.3 reads as fluffy smoke; >0.5 puffs balloon visibly. "
+            "Stacks with the per-emitter base `radius`.", CVAR_ARCHIVE);
+    // --- end Fluid Phase 2 ---------------------------------------------------
     // --- end Fluid Phase 1 -----------------------------------------------------
     PT_CVAR(r_rayleigh,              "30.0",     "Atmospheric Rayleigh scattering scale on the per-channel sea-level sigma (R 5.8e-6, G 13.5e-6, B 33.1e-6 per metre). 1.0 = real Earth atmosphere -- but our typical r_volumetric_density (Mie haze) is ~30x stronger than real-Earth haze, so bumping this to 30 keeps the sky visibly blue at typical haze settings. Drop to 1.0 if you also drop r_volumetric_density to 0.0001-0.0005 (real haze). 0 disables Rayleigh.", CVAR_ARCHIVE);
     PT_CVAR(r_planet_radius,         "6378137.0", "Planet radius in metres for spherical-Earth atmospheric scattering (issue #51). Default 6,378,137 m = WGS-84 equatorial Earth radius. The path tracer's `atmosphericTransmittance` numerically integrates Mie + Rayleigh optical depth along a chord through a thin shell around a sphere of this radius (centre at world origin + offset so y=0 sits on the surface). Set to 0 to fall back to the legacy planar exponential integral (1/sin(elev) airmass) -- useful as a debug A/B or for tiny-scene tests where curvature is invisible. Real values for other bodies: Moon 1,737,400, Mars 3,389,500, Venus 6,051,800. Affects only the atmosphere integral, not collision / shadow geometry.", CVAR_ARCHIVE);
@@ -5449,10 +5490,19 @@ void Engine::RenderFrame() {
         // smoke_params.x = smoke_count
         //             .y = smoke_enabled (0/1)
         //             .z = time_seconds (parametric drift accumulator)
-        //             .w = reserved
-        // One vec4 = 16 B. Sits at the very end of PtPush.
+        //             .w = r_cloud_attenuate_background flag (added in
+        //                  57fd9ff; piggybacks the reserved slot)
+        // One vec4 = 16 B.
         float smoke_params[4];
         // --- end Fluid Phase 1 -------------------------------------------
+        // --- Fluid Phase 2 (#180) ----------------------------------------
+        // smoke_params2.x = r_smoke_lifetime          (seconds; >=0)
+        //              .y = r_smoke_advection_strength (multiplier on vel)
+        //              .z = r_smoke_puff_count        (1..8, clamped)
+        //              .w = r_smoke_expansion_rate    (per-second radius growth)
+        // One vec4 = 16 B. Drives the inner per-emitter puff-chain loop.
+        float smoke_params2[4];
+        // --- end Fluid Phase 2 -------------------------------------------
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -6343,6 +6393,30 @@ void Engine::RenderFrame() {
             attenuate_bg = v->GetBool();
         }
         push.smoke_params[3] = attenuate_bg ? 1.0f : 0.0f;
+
+        // --- Fluid Phase 2 (#180) -- advected emission --------------------
+        // Pack per-frame Phase 2 knobs. Clamp to safe ranges here so the
+        // shader can trust the inputs without re-validating each pixel.
+        float lifetime = 4.0f;
+        if (auto* v = C.FindCVar("r_smoke_lifetime")) lifetime = v->GetFloat();
+        if (lifetime < 0.0f) lifetime = 0.0f;
+        float adv = 1.0f;
+        if (auto* v = C.FindCVar("r_smoke_advection_strength")) adv = v->GetFloat();
+        int puffs = 6;
+        if (auto* v = C.FindCVar("r_smoke_puff_count")) puffs = v->GetInt();
+        if (puffs < 1) puffs = 1;
+        // Hard upper bound mirrors the shader's compile-time loop cap
+        // (kSmokePuffMax = 8 in PathTrace.slang). Higher values would
+        // multiply the per-pixel cost without a clean perf budget.
+        if (puffs > 8) puffs = 8;
+        float expansion = 0.15f;
+        if (auto* v = C.FindCVar("r_smoke_expansion_rate")) expansion = v->GetFloat();
+        if (expansion < 0.0f) expansion = 0.0f;
+        push.smoke_params2[0] = lifetime;
+        push.smoke_params2[1] = adv;
+        push.smoke_params2[2] = static_cast<float>(puffs);
+        push.smoke_params2[3] = expansion;
+        // --- end Fluid Phase 2 --------------------------------------------
     }
     // --- end Fluid Phase 1 -------------------------------------------------
 
@@ -6366,7 +6440,9 @@ void Engine::RenderFrame() {
     //   +32 Water Phase 1 (#134) — two vec4s (absorption + ior, wave params)
     //   +16 ReSTIR DI Phase A (#78)
     //   +16 Fluid Phase 1 (#136) — smoke_params vec4 (count, enabled, time, _pad)
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16);
+    //   +16 Fluid Phase 2 (#180) — smoke_params2 vec4 (lifetime, adv_strength,
+    //                              puff_count, expansion_rate)
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16);
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
     // cbuffer layout the Slang compiler applies to PathTrace.slang's
@@ -6424,6 +6500,10 @@ void Engine::RenderFrame() {
     // Fluid Phase 1 block (#136).
     static_assert(offsetof(PtPush, smoke_params) % 16 == 0,
                   "PtPush::smoke_params must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    // Fluid Phase 2 block (#180).
+    static_assert(offsetof(PtPush, smoke_params2) % 16 == 0,
+                  "PtPush::smoke_params2 must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
@@ -14075,19 +14155,25 @@ void Engine::RegisterSmokeCommands() {
     auto& C = pt::console::Console::Get();
 
     C.RegisterCommand("smoke_emit",
-        "smoke_emit <x> <y> <z> [radius=1.0] [density=1.0]: add a static smoke "
-        "plume to the cloud density field (#136). Radius is the Gaussian "
-        "falloff sigma in metres; density is the additive sigma_t peak "
-        "(per metre, same units as r_clouds_density). Cap is kMaxSmokeEmitters "
-        "= 16 -- further emits are rejected with an error.",
+        "smoke_emit <x> <y> <z> [radius=1.0] [density=1.0] [vx=0] [vy=0.2] [vz=0]: "
+        "add a smoke plume to the cloud density field (#136). Radius is the "
+        "Gaussian falloff sigma in metres; density is the additive sigma_t peak "
+        "(per metre, same units as r_clouds_density); the optional vx/vy/vz "
+        "trio is the drift velocity in metres/second (defaults to a gentle "
+        "upward 0.2 m/s). Phase 2 (#180) uses this velocity as the chain axis "
+        "for the puff stream -- bump vy to 1-3 for a visible rising column. "
+        "Cap is kMaxSmokeEmitters = 16 -- further emits are rejected.",
         [this](auto args, pt::console::Output& out) {
-            if (args.size() < 3 || args.size() > 5) {
-                out.PrintLine("usage: smoke_emit <x> <y> <z> [radius] [density]");
+            if (args.size() < 3 || args.size() == 6 || args.size() == 7 || args.size() > 8) {
+                out.PrintLine("usage: smoke_emit <x> <y> <z> [radius] [density] [vx vy vz]");
                 return;
             }
             float x, y, z;
             float radius  = 1.0f;
             float density = 1.0f;
+            // Default drift: slight upward bias so plumes look "rising
+            // smoke" out of the box. Falloff exponent 2 = Gaussian-ish.
+            float vx = 0.0f, vy = 0.2f, vz = 0.0f;
             if (!ParseFloat(args[0], x) || !ParseFloat(args[1], y) ||
                 !ParseFloat(args[2], z)) {
                 out.PrintLine("smoke_emit: x y z must be numeric");
@@ -14100,6 +14186,13 @@ void Engine::RegisterSmokeCommands() {
             if (args.size() >= 5 && !ParseFloat(args[4], density)) {
                 out.PrintLine("smoke_emit: density must be numeric");
                 return;
+            }
+            if (args.size() == 8) {
+                if (!ParseFloat(args[5], vx) || !ParseFloat(args[6], vy) ||
+                    !ParseFloat(args[7], vz)) {
+                    out.PrintLine("smoke_emit: vx vy vz must be numeric");
+                    return;
+                }
             }
             if (radius <= 0.0f) {
                 out.PrintLine("smoke_emit: radius must be > 0");
@@ -14118,18 +14211,16 @@ void Engine::RegisterSmokeCommands() {
             E.pos[0] = x; E.pos[1] = y; E.pos[2] = z;
             E.radius = radius;
             E.density = density;
-            // Default drift: slight upward bias so plumes look "rising
-            // smoke" out of the box. Falloff exponent 2 = Gaussian-ish.
-            E.velocity[0] = 0.0f;
-            E.velocity[1] = 0.2f;
-            E.velocity[2] = 0.0f;
+            E.velocity[0] = vx;
+            E.velocity[1] = vy;
+            E.velocity[2] = vz;
             E.falloff = 2.0f;
             E.tint[0] = E.tint[1] = E.tint[2] = 1.0f;
             const std::uint32_t id = smoke_next_id_++;
             smoke_emitters_.push_back(E);
             accum_dirty_ = true;
-            out.FormatLine("smoke: emit id={} at ({:.2f} {:.2f} {:.2f}) radius={:.2f} density={:.2f}",
-                           id, x, y, z, radius, density);
+            out.FormatLine("smoke: emit id={} at ({:.2f} {:.2f} {:.2f}) radius={:.2f} density={:.2f} vel=({:.2f} {:.2f} {:.2f})",
+                           id, x, y, z, radius, density, vx, vy, vz);
         });
 
     C.RegisterCommand("smoke_clear",
