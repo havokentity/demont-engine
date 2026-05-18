@@ -401,12 +401,15 @@ namespace cvar {
             CVAR_ARCHIVE);
     PT_CVAR(r_sdf_displace_octaves,   "4",
             "Default FBM octave count for sdf_displace_noise. Clamped "
-            "to 1..6 on the host (the shader's unroll bound). Higher = "
-            "more detail at the cost of N noise lookups per distance "
-            "eval. Each octave doubles the frequency and halves the "
-            "amplitude, so 6 covers ~32 m -> ~3 cm spatial range from a "
-            "base frequency of 1 / metre. Per-cluster overrides go via "
-            "the sdf_displace_noise console command's octaves arg; this "
+            "to 1..6 on the host -- the shader runs a dynamic loop "
+            "bounded by min(octaves, 6) (deliberately not unrolled to "
+            "keep Metal's XPC compiler from timing out on the chained "
+            "SDF cluster walker), and 6 covers the useful inverse-"
+            "frequency range from 1 m down to ~3 cm. Higher = more "
+            "detail at the cost of N noise lookups per distance eval. "
+            "Each octave doubles the frequency and halves the "
+            "amplitude. Per-cluster overrides go via the "
+            "sdf_displace_noise console command's octaves arg; this "
             "cvar is just the default the command uses when the user "
             "omits the octaves field.",
             CVAR_ARCHIVE);
@@ -3762,7 +3765,7 @@ void Engine::RenderFrame() {
         //   .z/.w reserved for future BVH-side knobs (leaf size,
         //   builder selection).
         std::uint32_t bvh_params[4];
-        // --- SDF Phase 1 (#97) -------------------------------------------------
+        // --- SDF Phase 1 (#97) + Phase 2 (#98) ---------------------------------
         // SDF traversal params.
         //   .x = sdf_cluster_count -- number of SDF clusters in the
         //        sdf_clusters buffer. 0 disables the entire SDF path.
@@ -3772,7 +3775,10 @@ void Engine::RenderFrame() {
         //        future iteration-count heat map; Phase 1 just plumbs
         //        the bit through so Phase 2 turns it on without a
         //        push-constant reshuffle.
-        //   .w reserved.
+        //   .w = sdf_normal_mode   -- r_sdf_normal_mode cvar (Phase 2).
+        //        0 = forward-mode autodiff (default), 1 = 6-tap central
+        //        differences. Host clamps to {0, 1}; shader treats any
+        //        non-zero value as central-difference mode.
         std::uint32_t sdf_params[4];
         // .x = r_sdf_epsilon (sphere-trace surface terminator, metres).
         // .yzw reserved for future SDF-side knobs (LOD distance, normal
@@ -3900,7 +3906,13 @@ void Engine::RenderFrame() {
         if (max_iters > 256) max_iters = 256;     // shader clamps the same way
         if (epsilon   < 1e-7f) epsilon = 1e-7f;
         if (normal_mode < 0) normal_mode = 0;
-        if (normal_mode > 1) normal_mode = 1;     // shader maps >1 to forward-AD
+        // r_sdf_normal_mode is bounded to {0, 1} (allowed_values guard +
+        // this clamp). 0 = forward-AD, 1 = central differences. Values
+        // out of band are clamped UP to 1 (central) rather than back to
+        // 0 because the host treats central-diff as the conservative
+        // fallback: anything but a known good "forward-AD please" value
+        // gets the predictable 6-tap path.
+        if (normal_mode > 1) normal_mode = 1;
         // Disable the entire SDF path when no clusters are active --
         // the shader's gate is sdf_params.x > 0.
         push.sdf_params[0] = sdf_cluster_count_;
@@ -7450,6 +7462,25 @@ void Engine::RegisterCommands() {
     if (auto* v = C.FindCVar("r_refract_bounces")) {
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
+    // --- SDF Phase 2 (#98) -------------------------------------------------
+    // r_sdf_normal_mode switches between forward-AD (0) and central
+    // differences (1). The two paths produce subtly different normals
+    // on procedural clusters (forward-AD is continuous, central is
+    // tap-quantised), so flipping mid-flight bleeds the old normal
+    // field's samples into the new one's accumulator until something
+    // else dirties accum. Match the other renderer-affecting cvars and
+    // reset accum on change.
+    if (auto* v = C.FindCVar("r_sdf_normal_mode")) {
+        v->allowed_values = {"0", "1"};
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    // r_sdf_displace_octaves changes the number of FBM octaves applied
+    // by sdf_displace_noise -- the displaced surface shifts as soon as
+    // a different octave count is sampled, so reset accum too.
+    if (auto* v = C.FindCVar("r_sdf_displace_octaves")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    // --- end SDF Phase 2 ---------------------------------------------------
     if (auto* v = C.FindCVar("r_dof")) {
         v->allowed_values = {"0", "1"};
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
@@ -8664,7 +8695,31 @@ void Engine::RegisterSdfCommands() {
     // the active set). Combined node count must not exceed
     // SdfPrim::kMaxNodes; if it would, the command fails and the child
     // is left in place.
-    auto wrap_proc = [this](std::uint32_t id,
+    //
+    // The host enforces a key invariant: warp ops (TWIST / BEND / REPEAT
+    // / REPEAT_LIMITED) must be the cluster's ROOT op -- the shader's
+    // sdfClusterDistWarped / sdfClusterDistDWarped look only at the
+    // root's op type to pick a warp branch, and the inner walkers
+    // (sdfClusterDistProcN / sdfClusterDistDN) treat non-root warps as
+    // identity sentinels. So wrapping a cluster that already contains a
+    // warp (chaining e.g. sdf_twist around an sdf_bend, or sdf_displace_
+    // noise around an sdf_repeat) would silently drop the inner warp.
+    // Reject such constructions up-front. DISPLACE / DISPLACE_NOISE are
+    // pure point-displacement ops handled inline by the inner walkers,
+    // so they nest cleanly and are allowed.
+    auto child_has_warp = [](const pt::renderer::SdfPrim& P) {
+        for (std::uint32_t i = 0; i < P.node_count; ++i) {
+            auto op = P.nodes[i].op;
+            if (op == pt::renderer::SDF_OP_TWIST ||
+                op == pt::renderer::SDF_OP_BEND  ||
+                op == pt::renderer::SDF_OP_REPEAT ||
+                op == pt::renderer::SDF_OP_REPEAT_LIMITED) {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto wrap_proc = [this, child_has_warp](std::uint32_t id,
                             std::uint32_t a_id,
                             pt::renderer::SdfOp op,
                             std::array<float, 4> op_params,
@@ -8678,6 +8733,24 @@ void Engine::RegisterSdfCommands() {
             return;
         }
         const pt::renderer::SdfPrim& A = it_a->second;
+        // Enforce the "warps must be root" invariant -- see comment
+        // above wrap_proc. DISPLACE_NOISE / DISPLACE-only children are
+        // fine because they don't warp the point.
+        bool wrap_is_warp = (op == pt::renderer::SDF_OP_TWIST ||
+                              op == pt::renderer::SDF_OP_BEND  ||
+                              op == pt::renderer::SDF_OP_REPEAT ||
+                              op == pt::renderer::SDF_OP_REPEAT_LIMITED);
+        if (wrap_is_warp && child_has_warp(A)) {
+            out.FormatLine("sdf_{}: child id {} already contains a warp op "
+                           "(twist / bend / repeat / repeat_limited). The "
+                           "shader only applies a warp at the cluster root, "
+                           "so chaining would silently drop the inner warp. "
+                           "Combine the warps into a single op or apply "
+                           "them to separate clusters and union via "
+                           "sdf_smin.",
+                           tag, a_id);
+            return;
+        }
         if (A.node_count + 1 > pt::renderer::SdfPrim::kMaxNodes) {
             out.FormatLine("sdf_{}: combined node count {} exceeds kMaxNodes={}",
                            tag, A.node_count + 1,
@@ -8811,7 +8884,10 @@ void Engine::RegisterSdfCommands() {
 
     C.RegisterCommand("sdf_repeat",
         "sdf_repeat <id> <child_id> <px> <py> <pz> <material> <r> <g> <b>: "
-        "infinite domain repetition with per-axis period (metres; 0 = no repeat on that axis).",
+        "infinite domain repetition with per-axis period (metres; 0 = no repeat on that axis). "
+        "WARNS: each axis with non-zero period widens the cluster AABB to "
+        "+/-1000 m. Use sdf_repeat_limited if you want a finite, BVH-"
+        "friendly bound.",
         [wrap_proc](auto args, pt::console::Output& out) {
             if (args.size() != 9) {
                 out.PrintLine("usage: sdf_repeat <id> <child> <px> <py> <pz> <material> <r> <g> <b>");
@@ -8825,6 +8901,29 @@ void Engine::RegisterSdfCommands() {
                 !ParseFloat(args[6], cr) || !ParseFloat(args[7], cg) || !ParseFloat(args[8], cb)) {
                 out.PrintLine("sdf_repeat: arg parse failed");
                 return;
+            }
+            // Infinite repeat has no finite conservative AABB; the
+            // host falls back to +/-1000 m on each repeat-active axis
+            // (see AnalyticBvh.cpp SDF_OP_REPEAT). Surface that so
+            // the user isn't surprised by the huge cluster bound (the
+            // BVH slab test still serves it, but every other primitive
+            // becomes a near-miss). For a tight bound use the bounded
+            // variant.
+            bool repeats_any = (std::abs(px) > 1e-6f) ||
+                               (std::abs(py) > 1e-6f) ||
+                               (std::abs(pz) > 1e-6f);
+            if (repeats_any) {
+                LOG_WARN("[sdf] sdf_repeat id={} child={} : infinite repeat "
+                         "has no finite AABB; cluster bound will widen to "
+                         "+/-1000 m on each repeat-active axis "
+                         "(px={:.3f} py={:.3f} pz={:.3f}). Use "
+                         "sdf_repeat_limited for a finite bound.",
+                         id, a, px, py, pz);
+                out.FormatLine("sdf_repeat: warning -- infinite repeat widens "
+                               "AABB to +/-1000 m on active axes "
+                               "(px={:.3f} py={:.3f} pz={:.3f}). Use "
+                               "sdf_repeat_limited for a finite bound.",
+                               px, py, pz);
             }
             wrap_proc(id, a, pt::renderer::SDF_OP_REPEAT,
                       {px, py, pz, 0.0f}, mat, cr, cg, cb, out, "repeat");
