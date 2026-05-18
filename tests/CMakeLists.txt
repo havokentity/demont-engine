@@ -629,6 +629,23 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
             MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     endforeach()
     # --- end #112 sky/sun/stars/moon matrix --------------------------------
+
+    # --- Fluid Phase 1 (#136) -- smoke emitter fixture --------------------
+    # Two density-injection plumes at chimney altitude with clouds off
+    # and procedural sky. Validates: (a) the emitter loop ADDS density
+    # on top of the procedural cloud field; (b) plumes are sun-lit +
+    # sky-lit via the existing cloud-march NEE pipeline; (c)
+    # `r_smoke_enabled` gates the path tracer-side smoke loop. Software
+    # backend is the CI-exercised cell; Metal + SVGF a-trous is the
+    # user's primary dev combo and stresses the denoiser path alongside
+    # the new smoke ssbo binding. Tolerances are widened because the
+    # in-cloud single-scatter path is more sensitive to per-backend FP
+    # ordering than primary-hit Lambert.
+    pt_add_golden_cell(SCENE smoke_emitter_basic BACKEND software DENOISER off
+        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+    pt_add_golden_cell(SCENE smoke_emitter_basic BACKEND metal    DENOISER svgf_atrous
+        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+    # --- end Fluid Phase 1 ------------------------------------------------
 else()
     message(STATUS
         "tests: golden-image matrix skipped -- pt_render_one_frame and/or "

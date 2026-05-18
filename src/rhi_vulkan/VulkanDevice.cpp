@@ -173,10 +173,7 @@ constexpr std::uint32_t kSlotToBufBinding[16] = {
     // shader so the MSL slot also lands one higher).
     27, // engine slot 12 -> shader binding 27 (light_prims)
     // Hierarchical light tree (#129): packed-node SSBO consumed by
-    // PathTrace.slang's O(log N) NEE picker. Declared AFTER
-    // light_prims in the shader so MSL lands on slot 13; explicit
-    // vk::binding(28) is what matters on SPIR-V (past the MetalFX
-    // specular trio at 24..26 and the light_prims slot at 27).
+    // PathTrace.slang's O(log N) NEE picker.
     28, // engine slot 13 -> shader binding 28 (light_tree_nodes)
     // ReSTIR DI Phase A (#78): per-pixel reservoir SSBO.
     29, // engine slot 14 -> shader binding 29 (reservoir_curr_buf)
@@ -357,11 +354,10 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     // VulkanDevice.h don't silently overflow img_infos / buf_infos /
     // writes. kMaxWrites must be >= the total binding count or
     // vkUpdateDescriptorSets reads off the end of these stack arrays.
-    // The derivation: kNumTexSlots storage_image writes + 1 accel_struct
-    // (TLAS at binding 2) + kNumBufSlots storage_buffer writes + 1
-    // uniform_buffer (Frame UBO at binding 14). Today with the slot
-    // tables sized for the full Wave-3 binding set (texture 14, buffer
-    // 16) the ceiling is 14 + 1 + 16 + 1 = 32.
+    // Derivation: kNumTexSlots storage_image writes + 1 accel_struct
+    // (TLAS at binding 2) + std::size(kSlotToBufBinding) storage_buffer
+    // writes + 1 uniform_buffer (Frame UBO at binding 14). Today with
+    // the slot tables at texture 14 / buffer 16: 14 + 1 + 16 + 1 = 32.
     constexpr std::uint32_t kMaxWrites =
         kNumTexSlots + 1u /*accel*/ + std::size(kSlotToBufBinding) + 1u /*UBO*/;
     std::array<VkDescriptorImageInfo,  kMaxWrites> img_infos {};

@@ -9721,6 +9721,15 @@ void Engine::RegisterCommands() {
     if (auto* v = C.FindCVar("r_lens_flare")) {
         v->allowed_values = {"0", "1"};
     }
+    // Fluid Phase 1 (#136): r_smoke_enabled is a strict bool. Matches
+    // the registration pattern used by the other renderer toggles
+    // above so the toggle / cvar-validation chain can treat it
+    // uniformly. r_smoke_max_emitters is an integer in [0,16] and
+    // stays unconstrained here (host-clamps at upload time).
+    if (auto* v = C.FindCVar("r_smoke_enabled")) {
+        v->allowed_values = {"0", "1"};
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
     if (auto* v = C.FindCVar("r_lens_flare_mode")) {
         v->allowed_values = {"sun", "image"};
     }

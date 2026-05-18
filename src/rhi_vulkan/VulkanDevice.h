@@ -71,17 +71,23 @@ private:
     //   10     SDF cluster storage buffer (SDF Phase 1, #97;
     //          vk::binding 21; moved from binding 19 to make room for
     //          the triangle BVH).
-    //   11     SIGMA shadow visibility R32F-per-pixel buffer (issue
-    //          #115; vk::binding 23 -- a storage buffer, not an image,
+    //   11     SIGMA shadow visibility R32F-per-pixel buffer (#115;
+    //          vk::binding 23 -- a storage buffer, not an image,
     //          because Metal's 8-RW-texture cap on PathTrace was
     //          already saturated).
     //   12     light primitives (#73), the analytic light list at
     //          vk::binding 27.
     //   13     hierarchical light tree (#129), packed-node SSBO at
     //          vk::binding 28.
-    // Keep this in sync with kSlotToBufBinding[] in VulkanDevice.cpp.
-    BufferHandle   bound_buf_[14] {};
-    std::size_t    bound_buf_off_[14] {};
+    //   14     ReSTIR DI reservoir SSBO (#78) at vk::binding 29.
+    //   15     smoke emitters (#136, Fluid Phase 1), the density-
+    //          injection SSBO at vk::binding 30.
+    // Pre-#136 the array was [12] which silently dropped any
+    // BindBuffer(>= 12, ...) at the bounds-check in BindBuffer().
+    // Now [16]. Keep this in sync with kSlotToBufBinding[] in
+    // VulkanDevice.cpp.
+    BufferHandle   bound_buf_[16] {};
+    std::size_t    bound_buf_off_[16] {};
     AccelStructHandle bound_accel_[4] {};
     // Push-constant staging. Sized to fit the full PtPush (~448B today)
     // plus growth headroom so the engine can keep treating push as one
