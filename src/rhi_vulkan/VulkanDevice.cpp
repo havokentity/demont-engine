@@ -322,7 +322,7 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     //
     // Capacity: 11 storage_image (one less than kNumTexSlots because
     // engine texture slot 10 is reserved/unused on the Vulkan path)
-    // + 1 accel_struct + 10 storage_buffer + 1 uniform_buffer = 23,
+    // + 1 accel_struct + 11 storage_buffer + 1 uniform_buffer = 24,
     // sized to the worst-case "PathTrace binds everything" dispatch.
     // kMaxWrites must be >= the total binding count or
     // vkUpdateDescriptorSets reads off the end of these stack arrays.
@@ -334,7 +334,13 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     // cloud transmittance the path tracer writes and StarsComposite
     // reads. Reuses the slot number accum_stars (#108) briefly
     // occupied before the stateless composite rewrite.)
-    constexpr std::uint32_t kMaxWrites = 23;
+    // The +1 to 24 is binding 27 (light_prims, analytic light list
+    // PR #73 follow-up): engine buffer slot 11 -> shader binding 27.
+    // Bump this when adding a new shader binding the descriptor-write
+    // path can populate, or vkUpdateDescriptorSets reads past the end
+    // of the writes/img_infos/buf_infos stack arrays and corrupts the
+    // stack on a fully-bound PathTrace dispatch.
+    constexpr std::uint32_t kMaxWrites = 24;
     std::array<VkDescriptorImageInfo,  kMaxWrites> img_infos {};
     std::array<VkDescriptorBufferInfo, kMaxWrites> buf_infos {};
     std::array<VkWriteDescriptorSetAccelerationStructureKHR, 1> as_infos {};
