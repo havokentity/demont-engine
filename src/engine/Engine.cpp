@@ -3384,7 +3384,8 @@ void Engine::RenderFrame() {
             // roughness: R32F single-channel surface roughness in [0,1].
             //   The RHI doesn't expose R16F today and the precision
             //   gap is academic for a guidance input -- R32F costs
-            //   ~8MB/4K vs R16F's ~4MB and saves us a new format slot.
+            //   ~33MB/4K (3840*2160*4B) vs R16F's ~16.5MB and saves
+            //   us a new format slot.
             // specular_hit_distance: R32F single-channel world-units
             //   distance. Same R16F-vs-R32F trade as roughness; using
             //   R32F unifies allocation code with cloud_trans_tex /
