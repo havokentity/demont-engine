@@ -49,7 +49,9 @@ public:
     // returns nullptr from GetParticle instead of silently aliasing
     // the new particle. The high 24 bits are generation, low 8 are
     // the pool index -- keeps the pool small (max 256) and the
-    // generation counter plenty wide for any realistic churn.
+    // generation counter plenty wide for any realistic churn (a
+    // pathological 16M remove+add cycle per slot is the wraparound
+    // bound; at 60 Hz that's ~3.2 years of constant churn).
     using Handle = std::uint32_t;
     static constexpr Handle kInvalidHandle = 0u;
 
@@ -106,11 +108,19 @@ public:
     std::uint32_t GetPrimId(Handle h) const;
 
 private:
+    // Slot generation is the FULL 24 bits the public Handle API
+    // promises, stored in a uint32_t so the bump-on-Remove path never
+    // wraps after 256 churn cycles (the previous uint8_t form did, and
+    // a stale handle could then alias a live particle once the gen
+    // wrapped back to the original value). 24 bits gives ~16M cycles
+    // per slot before wraparound -- big enough that the public API
+    // can document it as "plenty wide for any realistic churn".
     struct Slot {
         Particle      p{};
-        std::uint8_t  generation = 1;  // non-zero so handle 0 stays invalid
+        std::uint32_t generation = 1;  // 24-bit counter packed into Handle
         std::uint8_t  alive      = 0;
-        std::uint16_t pad        = 0;
+        std::uint8_t  pad0       = 0;
+        std::uint16_t pad1       = 0;
         std::uint32_t prim_id    = 0;  // matching key in engine primitives_
     };
 

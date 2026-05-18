@@ -11,18 +11,24 @@ namespace {
 
 // Pack / unpack the 32-bit handle: low 8 bits = pool index (0..255),
 // high 24 bits = generation. Index 0 + generation 0 = kInvalidHandle.
+// The 24-bit generation is the contract the public Handle docs
+// promise -- truncating to 8 bits here (the previous form) would
+// silently wrap after 256 remove/add cycles per slot and let a stale
+// handle alias a live particle. uint32_t arithmetic + a 24-bit mask
+// keeps the pack/unpack consistent with the storage in Slot.
 constexpr std::uint32_t kIndexBits = 8u;
 constexpr std::uint32_t kIndexMask = (1u << kIndexBits) - 1u;
+constexpr std::uint32_t kGenBits   = 24u;
+constexpr std::uint32_t kGenMask   = (1u << kGenBits) - 1u;
 
-inline PhysicsSystem::Handle MakeHandle(std::uint32_t index, std::uint8_t gen) {
-    return (static_cast<std::uint32_t>(gen) << kIndexBits) |
-           (index & kIndexMask);
+inline PhysicsSystem::Handle MakeHandle(std::uint32_t index, std::uint32_t gen) {
+    return ((gen & kGenMask) << kIndexBits) | (index & kIndexMask);
 }
 inline std::uint32_t HandleIndex(PhysicsSystem::Handle h) {
     return h & kIndexMask;
 }
-inline std::uint8_t HandleGen(PhysicsSystem::Handle h) {
-    return static_cast<std::uint8_t>((h >> kIndexBits) & 0xFFu);
+inline std::uint32_t HandleGen(PhysicsSystem::Handle h) {
+    return (h >> kIndexBits) & kGenMask;
 }
 
 }  // namespace
@@ -31,9 +37,12 @@ void PhysicsSystem::Clear() {
     for (auto& s : slots_) {
         if (s.alive) {
             // Bump generation so any outstanding handle to this slot
-            // resolves to nullptr on a subsequent GetParticle.
-            s.generation = static_cast<std::uint8_t>(s.generation + 1u);
-            if (s.generation == 0u) s.generation = 1u;  // skip the all-zero handle
+            // resolves to nullptr on a subsequent GetParticle. Mod
+            // 2^24 (the Handle's gen field width) and skip 0 so the
+            // wraparound case can't synthesize the kInvalidHandle
+            // pattern for an in-use slot.
+            s.generation = (s.generation + 1u) & kGenMask;
+            if (s.generation == 0u) s.generation = 1u;
         }
         s.alive   = 0;
         s.prim_id = 0;
@@ -78,7 +87,9 @@ bool PhysicsSystem::RemoveParticle(Handle h) {
     s.alive      = 0;
     s.prim_id    = 0;
     s.p          = Particle{};
-    s.generation = static_cast<std::uint8_t>(s.generation + 1u);
+    // 24-bit wraparound mod the Handle gen field width; skip 0 so the
+    // wrapped value can't synthesize the kInvalidHandle pattern.
+    s.generation = (s.generation + 1u) & kGenMask;
     if (s.generation == 0u) s.generation = 1u;
     --alive_count_;
     return true;
@@ -152,10 +163,12 @@ void PhysicsSystem::Step(float frame_dt, int substeps,
 void PhysicsSystem::Substep(float sdt, const glm::vec3& accel, float damping) {
     // 1. Predict next positions via velocity-Verlet with damping on
     //    the implicit velocity term (curr - prev). damping = 1 means
-    //    "energy-conserving"; the default 0.99 bleeds 1% per substep
-    //    (at 8 substeps/frame, 60 fps that's ~38% per second --
-    //    enough to settle a bouncy stack into a loose pile in a
-    //    couple seconds without making the system feel like syrup).
+    //    "energy-conserving"; the default 0.99 bleeds 1% of velocity
+    //    per substep. At 8 substeps/frame, 60 fps (480 substeps/sec)
+    //    the residual velocity after one second is 0.99^480 ~= 0.008
+    //    -- aggressive enough to settle a tossed pile into a loose
+    //    heap in about a second of wall time without Phase 5's
+    //    contact-persistence sleeper. See phys_damping cvar docs.
     const float sdt2 = sdt * sdt;
     for (std::uint32_t i = 0; i < kMaxParticles; ++i) {
         auto& s = slots_[i];
@@ -229,6 +242,32 @@ void PhysicsSystem::Substep(float sdt, const glm::vec3& accel, float damping) {
             const float kj = sj.p.inv_mass / inv_sum;
             si.p.curr_pos -= n * (overlap * ki);
             sj.p.curr_pos += n * (overlap * kj);
+        }
+    }
+
+    // 4. Second sphere-plane pass. The sphere-sphere correction
+    //    above can push a lower sphere downward (e.g. when a tower
+    //    of stacked spheres compresses, the bottom one absorbs the
+    //    full chain's overlap and gets pushed below y=radius). Re-
+    //    running the plane projection here guarantees every
+    //    particle ends the substep with bottom-y >= 0, so the
+    //    render-frame sees the ground plane as inviolable instead
+    //    of letting spheres render embedded in the floor.
+    //
+    //    This isn't a full Gauss-Seidel relaxation -- a sphere-
+    //    sphere overlap created here is left to the NEXT substep
+    //    to resolve. At kPhys default substeps=8/frame the residual
+    //    overlap from this last sphere pass is invisible (sub-mm
+    //    at typical 0.3 m radius). A Phase 5 full iterated solver
+    //    is the long-term fix; this is the Phase-1-MVP-correct
+    //    "the ground plane is the ground plane" guarantee.
+    for (std::uint32_t i = 0; i < kMaxParticles; ++i) {
+        auto& s = slots_[i];
+        if (!s.alive) continue;
+        if (s.p.inv_mass <= 0.0f) continue;
+        const float penetration = s.p.radius - s.p.curr_pos.y;
+        if (penetration > 0.0f) {
+            s.p.curr_pos.y += penetration;
         }
     }
 }

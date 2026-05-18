@@ -197,6 +197,21 @@ pt_add_test(pt_renderer_triangle_bvh
     pt_renderer_triangle_bvh_test.cpp
     LINK_TARGETS pt_renderer)
 
+# --- pt_physics unit tests (issue #132) ------------------------------------
+# Phase 1 Verlet physics: handle invalidation (Remove+Add generation
+# bump; 24-bit gen wraparound guard), free-fall trajectory matches
+# closed-form Verlet, damping monotonically bleeds velocity, sphere-
+# plane contact (bottom-y >= 0 after substep), sphere-sphere
+# correction splits overlap by inv_mass, stacked-tower invariant
+# (the post-sphere-sphere plane pass), Clear lifecycle, pool-full
+# kInvalidHandle. Links pt_physics directly so the tests bypass the
+# engine driver and exercise the integrator in isolation.
+# Target is named `pt_physics_test` (not `pt_physics`) to avoid
+# colliding with the pt_physics static library target.
+pt_add_test(pt_physics_test
+    pt_physics_test.cpp
+    LINK_TARGETS pt_physics)
+
 # --- pt_renderer/Astronomy unit tests (issue #65) --------------------------
 # JD conversions (J2000 + Unix-epoch reference points), GMST at J2000
 # vs the IAU 1982 formula, sun position at four cardinal solar events
