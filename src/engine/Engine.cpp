@@ -928,6 +928,29 @@ namespace cvar {
     PT_CVAR(r_clouds_wind_x,         "5.0",      "Wind speed along +X in metres/second. Drifts the cloud field over time. Light breeze 2-3, fresh wind 8-12, gale 20+.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_wind_z,         "0.0",      "Wind speed along +Z in metres/second.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_seed,           "0",        "Per-day noise seed (any float). Same preset + different seed = visually distinct cloud pattern. Use one seed per in-game day so each day has its own weather pattern.", CVAR_ARCHIVE);
+    // --- Fluid Phase 1 (#136) -- smoke emitters --------------------------------
+    // Cheap density-injection plumes that ride the existing cloud march.
+    // r_smoke_enabled gates the shader-side loop entirely (0 = bit-exact
+    // versus pre-#136 main); r_smoke_max_emitters tightens the GPU-side
+    // iteration cap below kMaxSmokeEmitters for situations where the
+    // user wants to dial back per-frame cost without rebuilding the
+    // emitter list. Both ARCHIVE so the preferred config persists.
+    PT_CVAR(r_smoke_enabled,         "0",
+            "Density-injection smoke emitters (fluid Phase 1, #136). When 1, "
+            "every active emitter contributes additive Gaussian-falloff "
+            "density inside cloud_density_at() -- the existing cloud march "
+            "scatters / shades the plume identically to cloud cells. 0 is "
+            "bit-exact vs pre-#136 main (the shader-side loop elides "
+            "entirely). Plumes drift parametrically as base + velocity * t; "
+            "no real fluid simulation (Phase 2+).", CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_max_emitters,    "8",
+            "Per-frame cap on smoke emitters processed inside cloud_density_at "
+            "(#136). Hard-clamped on the host to [0, kMaxSmokeEmitters=16]. "
+            "Even when the engine-side `smoke_emit` list is longer than this, "
+            "only the first N entries get pushed to GPU each frame. Use to "
+            "dial back per-pixel cost on lower-tier GPUs without dropping "
+            "specific emitters from the list.", CVAR_ARCHIVE);
+    // --- end Fluid Phase 1 -----------------------------------------------------
     PT_CVAR(r_rayleigh,              "30.0",     "Atmospheric Rayleigh scattering scale on the per-channel sea-level sigma (R 5.8e-6, G 13.5e-6, B 33.1e-6 per metre). 1.0 = real Earth atmosphere -- but our typical r_volumetric_density (Mie haze) is ~30x stronger than real-Earth haze, so bumping this to 30 keeps the sky visibly blue at typical haze settings. Drop to 1.0 if you also drop r_volumetric_density to 0.0001-0.0005 (real haze). 0 disables Rayleigh.", CVAR_ARCHIVE);
     PT_CVAR(r_planet_radius,         "6378137.0", "Planet radius in metres for spherical-Earth atmospheric scattering (issue #51). Default 6,378,137 m = WGS-84 equatorial Earth radius. The path tracer's `atmosphericTransmittance` numerically integrates Mie + Rayleigh optical depth along a chord through a thin shell around a sphere of this radius (centre at world origin + offset so y=0 sits on the surface). Set to 0 to fall back to the legacy planar exponential integral (1/sin(elev) airmass) -- useful as a debug A/B or for tiny-scene tests where curvature is invisible. Real values for other bodies: Moon 1,737,400, Mars 3,389,500, Venus 6,051,800. Affects only the atmosphere integral, not collision / shadow geometry.", CVAR_ARCHIVE);
     PT_CVAR(r_moon_size,             "1.0",      "Moon angular-size multiplier. 1.0 = our default 0.55deg half-angle (already 2x the real 0.27deg, for visibility at typical 60-FOV 1080p). 5+ = dramatic 'big moon' shots; 0.5 = real lunar size (very small). Astronomical distance variation (perigee/apogee) is also applied on top -- supermoons render ~14% bigger than micro-moons.", CVAR_ARCHIVE);
@@ -1640,6 +1663,9 @@ void Engine::TearDownDevice() {
         // --- Light tree (#129) -------------------------------------------------
         if (light_tree_buffer_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{light_tree_buffer_id_});
         // --- end Light tree ----------------------------------------------------
+        // --- Fluid Phase 1 (#136) ---------------------------------------------
+        if (smoke_buffer_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{smoke_buffer_id_});
+        // --- end Fluid Phase 1 ------------------------------------------------
         if (denoise_color_tex_id_    != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
         if (depth_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
         if (motion_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
@@ -1712,10 +1738,12 @@ void Engine::TearDownDevice() {
     light_tree_buffer_id_           = 0;
     light_tree_buffer_capacity_     = 0;
     light_tree_node_count_uploaded_ = 0;
-    // light_prims_dirty_ above is the shared rebuild edge -- when the
-    // backend comes back up the next frame, both EnsureLightsUploaded
-    // and EnsureLightTreeUploaded fire from that flag.
     // --- end Light tree ----------------------------------------------------
+    // --- Fluid Phase 1 (#136) ---------------------------------------------
+    smoke_buffer_id_       = 0;
+    smoke_buffer_capacity_ = 0;
+    smoke_count_uploaded_  = 0;
+    // --- end Fluid Phase 1 ------------------------------------------------
     denoise_color_tex_id_    = 0;
     depth_tex_id_            = 0;
     motion_tex_id_           = 0;
@@ -3722,6 +3750,11 @@ void Engine::RenderFrame() {
     EnsureLightTreeUploaded();
     EnsureLightsUploaded();
     // --- end Light primitives ----------------------------------------------
+    // --- Fluid Phase 1 (#136) -- smoke emitters ----------------------------
+    // Re-upload every frame so parametric drift (base + velocity * t)
+    // doesn't need a dirty flag. Cheap: 16 emitters * 48 B = 768 B.
+    EnsureSmokeEmittersUploaded();
+    // --- end Fluid Phase 1 -------------------------------------------------
 
     auto& C = pt::console::Console::Get();
 
@@ -4593,6 +4626,19 @@ void Engine::RenderFrame() {
             : pt::rhi::BufferHandle{placeholder_storage_id_};
     if (slot14.id != 0) cb->BindBuffer(14, slot14, 0);
     // --- end ReSTIR DI Phase A ---------------------------------------------
+    // --- Fluid Phase 1 (#136) -- smoke emitters ----------------------------
+    // Smoke emitter list at engine slot 15 (MSL slot order;
+    // vk::binding(30, 0)). The agent originally targeted slot 13 /
+    // binding 28 but that's owned by light tree #129 after the integration
+    // merge -- moved to slot 15 / binding 30 (one past ReSTIR's slot 14 /
+    // binding 29). Always-bound (placeholder fallback) for the same
+    // max-bound + 1 push-slot rule; the shader gates its emitter loop on
+    // push.smoke_params.x > 0 AND push.smoke_params.y != 0.
+    pt::rhi::BufferHandle slot15 = (smoke_buffer_id_ != 0)
+        ? pt::rhi::BufferHandle{smoke_buffer_id_}
+        : pt::rhi::BufferHandle{placeholder_storage_id_};
+    if (slot15.id != 0) cb->BindBuffer(15, slot15, 0);
+    // --- end Fluid Phase 1 -------------------------------------------------
     // Engine slots 11/12/13 -> vk::bindings 24/25/26: the MetalFX
     // specular-guidance trio (issue #118). Path tracer writes them
     // alongside the existing G-buffers when the write_specular_*_gbuffer
@@ -4911,33 +4957,24 @@ void Engine::RenderFrame() {
         //                .z = wave_speed (animation rate multiplier).
         //                .w = time_seconds (shared accumulator with cloud
         //                                   wind; wraps on 24 h sim window).
-        // Two vec4s = 32 B. Sits before the ReSTIR block in PtPush.
+        // Two vec4s = 32 B.
         float water_params0[4];
         float water_params1[4];
         // --- end Water Phase 1 -------------------------------------------
         // --- ReSTIR DI Phase A (issue #78) ---------------------------------
-        // restir_enabled    : 1 -> PathTrace's primary-hit Lambert NEE
-        //                     switches to WRS candidate generation +
-        //                     reservoir write (the Phase A composite
-        //                     adds the resampled+shadow-tested
-        //                     contribution back in via the RestirFinal
-        //                     kernel). 0 -> legacy single-pick NEE
-        //                     from #73 (PathTrace adds contribution
-        //                     directly). Gated host-side on
-        //                     denoiser_active_ so the denoiser-off
-        //                     swapchain-direct path always sees a 0
-        //                     here.
-        // restir_k_candidates : WRS candidate budget per pixel. 8 =
-        //                       NVIDIA RTXDI default; clamped to
-        //                       [1, kRestirMaxK=64] before upload.
-        // Trailing 8 bytes of pad keep the cbuffer trailing block
-        // 16-byte aligned, matching the std140 / MSL rule
-        // PathTrace.slang's matching Push/Frame blocks rely on.
         std::uint32_t restir_enabled;
         std::uint32_t restir_k_candidates;
         std::uint32_t _pad_restir0;
         std::uint32_t _pad_restir1;
         // --- end ReSTIR DI Phase A -----------------------------------------
+        // --- Fluid Phase 1 (#136) ----------------------------------------
+        // smoke_params.x = smoke_count
+        //             .y = smoke_enabled (0/1)
+        //             .z = time_seconds (parametric drift accumulator)
+        //             .w = reserved
+        // One vec4 = 16 B. Sits at the very end of PtPush.
+        float smoke_params[4];
+        // --- end Fluid Phase 1 -------------------------------------------
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -5745,6 +5782,28 @@ void Engine::RenderFrame() {
     }
     // --- end Water Phase 1 -------------------------------------------------
 
+    // --- Fluid Phase 1 (#136) -- smoke emitters ----------------------------
+    // Pack: (count, enabled, time, reserved). count is the actual GPU-side
+    // upload count produced by EnsureSmokeEmittersUploaded above, NOT
+    // the unbounded engine vector size -- already clamped to the cvar
+    // r_smoke_max_emitters AND the hard cap kMaxSmokeEmitters.
+    {
+        bool smoke_on = false;
+        if (auto* v = C.FindCVar("r_smoke_enabled")) smoke_on = v->GetBool();
+        // Reuse the cloud time accumulator (already wrapped to 24h sim
+        // window) so the wave / cloud / smoke drift fields share a
+        // coherent phase. Re-derive locally because the cloud block
+        // scoped its t_seconds out of reach.
+        constexpr std::uint64_t kSmokePeriodFrames = 86400ull * 60ull;
+        const float smoke_t = float(frame_index_ % kSmokePeriodFrames)
+                            * (1.0f / 60.0f);
+        push.smoke_params[0] = static_cast<float>(smoke_count_uploaded_);
+        push.smoke_params[1] = smoke_on ? 1.0f : 0.0f;
+        push.smoke_params[2] = smoke_t;
+        push.smoke_params[3] = 0.0f;
+    }
+    // --- end Fluid Phase 1 -------------------------------------------------
+
     // PtPush layout: the trailing 32 bytes here include the SDF Phase 1
     // block (sdf_params uvec4 + sdf_params_f vec4) and the celestials-
     // composite gate (issue #46 -- one uint flag plus 12 bytes of
@@ -5763,7 +5822,8 @@ void Engine::RenderFrame() {
     //   +16 MetalFX specular guidance write gates (#118)
     //   +32 Water Phase 1 (#134) — two vec4s (absorption + ior, wave params)
     //   +16 ReSTIR DI Phase A (#78)
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16);
+    //   +16 Fluid Phase 1 (#136) — smoke_params vec4 (count, enabled, time, _pad)
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16);
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
     // cbuffer layout the Slang compiler applies to PathTrace.slang's
@@ -5810,20 +5870,17 @@ void Engine::RenderFrame() {
                   "PtPush::water_params1 must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     // --- end Water Phase 1 ---------------------------------------------------
-    // --- Light tree (#129) -------------------------------------------------
-    // light_count is the start of the light primitives + light tree
-    // 16-byte block (light_count + light_tree_node_count +
-    // light_tree_enabled + _pad_light_tail = 4 uints). Anchor it at a
-    // 16-byte boundary so the shader-side cbuffer layout doesn't shift
-    // the light_tree_* fields past where the host writes them. Same
-    // class of bug `_pad_before_accum_params` captures upstream.
+    // Light primitives + light tree 16-byte block anchor (#73 / #129).
     static_assert(offsetof(PtPush, light_count) % 16 == 0,
                   "PtPush::light_count must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
-    // --- end Light tree ----------------------------------------------------
-    // Issue #78 ReSTIR DI Phase A block.
+    // ReSTIR DI Phase A block (#78).
     static_assert(offsetof(PtPush, restir_enabled) % 16 == 0,
                   "PtPush::restir_enabled must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    // Fluid Phase 1 block (#136).
+    static_assert(offsetof(PtPush, smoke_params) % 16 == 0,
+                  "PtPush::smoke_params must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
@@ -10285,6 +10342,9 @@ void Engine::RegisterCommands() {
     // --- Light primitives (#73) ------------------------------------------------
     RegisterLightCommands();
     // --- end Light primitives --------------------------------------------------
+    // --- Fluid Phase 1 (#136) -- smoke emitters --------------------------------
+    RegisterSmokeCommands();
+    // --- end Fluid Phase 1 -----------------------------------------------------
     // --- Voxel destruction Phase 1 (#140) --------------------------------------
     RegisterVoxelCommands();
     // --- end Voxel destruction Phase 1 -----------------------------------------
@@ -12064,6 +12124,165 @@ void Engine::RegisterLightCommands() {
         });
 }
 // --- end Light primitives --------------------------------------------------
+
+// --- Fluid Phase 1 (#136) -- smoke emitters --------------------------------
+// Console commands + GPU upload for the density-injection smoke
+// emitter list. Each emitter packs into one float4 of position+radius
+// (lane v0), one float4 of velocity+density (lane v1), and one float4
+// of tint+falloff (lane v2) -- 3 float4s = 48 B per emitter, mirroring
+// the shader-side SmokeEmitterRecord layout in PathTraceCloud.slang.
+// The buffer is always sized to kMaxSmokeEmitters so re-uploads don't
+// reallocate. EnsureSmokeEmittersUploaded re-uploads every frame so the
+// parametric drift (base + velocity * t) doesn't need a dirty flag;
+// the cost is one bounded WriteBuffer on a tiny (16-emitter) buffer.
+
+void Engine::EnsureSmokeEmittersUploaded() {
+    if (!device_) return;
+    constexpr std::uint32_t kFloatsPerEmitter = 12;   // 3 float4s
+    constexpr std::uint32_t kBytesPerEmitter  = sizeof(float) * kFloatsPerEmitter;
+
+    // Buffer is always sized for the hard cap so a re-upload doesn't
+    // reallocate or stutter the steady-state frame loop.
+    if (smoke_buffer_id_ == 0) {
+        auto buf = device_->CreateBuffer({
+            .size       = std::size_t(kMaxSmokeEmitters) * kBytesPerEmitter,
+            .usage      = pt::rhi::BufferUsage::Storage,
+            .debug_name = "smoke_emitters",
+        });
+        if (buf.id == 0) {
+            LOG_ERROR("smoke emitter buffer allocation failed");
+            return;
+        }
+        smoke_buffer_id_       = buf.id;
+        smoke_buffer_capacity_ = kMaxSmokeEmitters;
+    }
+
+    // Honour the runtime cvar cap. ParseInt-style: clamp to [0, hard cap].
+    auto& C = pt::console::Console::Get();
+    std::uint32_t soft_cap = kMaxSmokeEmitters;
+    if (auto* v = C.FindCVar("r_smoke_max_emitters")) {
+        int n = v->GetInt();
+        if (n < 0) n = 0;
+        if (n > static_cast<int>(kMaxSmokeEmitters)) n = static_cast<int>(kMaxSmokeEmitters);
+        soft_cap = static_cast<std::uint32_t>(n);
+    }
+    const std::uint32_t count = std::min<std::uint32_t>(
+        soft_cap, static_cast<std::uint32_t>(smoke_emitters_.size()));
+
+    // Pack the full buffer footprint (trailing entries zeroed). The
+    // shader's per-frame `smoke_count` push gate is the only thing
+    // that bounds iteration; unused records read as zero density so
+    // even if the shader misses the bound nothing wrong renders.
+    std::vector<float> packed(std::size_t(kMaxSmokeEmitters) * kFloatsPerEmitter, 0.0f);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const auto& E = smoke_emitters_[i];
+        const std::size_t off = std::size_t(i) * kFloatsPerEmitter;
+        // v0: position + radius
+        packed[off + 0]  = E.pos[0];
+        packed[off + 1]  = E.pos[1];
+        packed[off + 2]  = E.pos[2];
+        packed[off + 3]  = E.radius;
+        // v1: velocity + density
+        packed[off + 4]  = E.velocity[0];
+        packed[off + 5]  = E.velocity[1];
+        packed[off + 6]  = E.velocity[2];
+        packed[off + 7]  = E.density;
+        // v2: tint + falloff exponent
+        packed[off + 8]  = E.tint[0];
+        packed[off + 9]  = E.tint[1];
+        packed[off + 10] = E.tint[2];
+        packed[off + 11] = E.falloff;
+    }
+    device_->WriteBuffer(pt::rhi::BufferHandle{smoke_buffer_id_},
+                         packed.data(), packed.size() * sizeof(float));
+    smoke_count_uploaded_ = count;
+}
+
+void Engine::RegisterSmokeCommands() {
+    auto& C = pt::console::Console::Get();
+
+    C.RegisterCommand("smoke_emit",
+        "smoke_emit <x> <y> <z> [radius=1.0] [density=1.0]: add a static smoke "
+        "plume to the cloud density field (#136). Radius is the Gaussian "
+        "falloff sigma in metres; density is the additive sigma_t peak "
+        "(per metre, same units as r_clouds_density). Cap is kMaxSmokeEmitters "
+        "= 16 -- further emits are rejected with an error.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() < 3 || args.size() > 5) {
+                out.PrintLine("usage: smoke_emit <x> <y> <z> [radius] [density]");
+                return;
+            }
+            float x, y, z;
+            float radius  = 1.0f;
+            float density = 1.0f;
+            if (!ParseFloat(args[0], x) || !ParseFloat(args[1], y) ||
+                !ParseFloat(args[2], z)) {
+                out.PrintLine("smoke_emit: x y z must be numeric");
+                return;
+            }
+            if (args.size() >= 4 && !ParseFloat(args[3], radius)) {
+                out.PrintLine("smoke_emit: radius must be numeric");
+                return;
+            }
+            if (args.size() >= 5 && !ParseFloat(args[4], density)) {
+                out.PrintLine("smoke_emit: density must be numeric");
+                return;
+            }
+            if (radius <= 0.0f) {
+                out.PrintLine("smoke_emit: radius must be > 0");
+                return;
+            }
+            if (density <= 0.0f) {
+                out.PrintLine("smoke_emit: density must be > 0");
+                return;
+            }
+            if (smoke_emitters_.size() >= kMaxSmokeEmitters) {
+                out.FormatLine("smoke_emit: cap reached ({} emitters); run smoke_clear first",
+                               kMaxSmokeEmitters);
+                return;
+            }
+            SmokeEmitter E{};
+            E.pos[0] = x; E.pos[1] = y; E.pos[2] = z;
+            E.radius = radius;
+            E.density = density;
+            // Default drift: slight upward bias so plumes look "rising
+            // smoke" out of the box. Falloff exponent 2 = Gaussian-ish.
+            E.velocity[0] = 0.0f;
+            E.velocity[1] = 0.2f;
+            E.velocity[2] = 0.0f;
+            E.falloff = 2.0f;
+            E.tint[0] = E.tint[1] = E.tint[2] = 1.0f;
+            const std::uint32_t id = smoke_next_id_++;
+            smoke_emitters_.push_back(E);
+            accum_dirty_ = true;
+            out.FormatLine("smoke: emit id={} at ({:.2f} {:.2f} {:.2f}) radius={:.2f} density={:.2f}",
+                           id, x, y, z, radius, density);
+        });
+
+    C.RegisterCommand("smoke_clear",
+        "Remove all smoke emitters spawned via smoke_emit (#136).",
+        [this](auto, pt::console::Output& out) {
+            const std::size_t n = smoke_emitters_.size();
+            smoke_emitters_.clear();
+            accum_dirty_ = true;
+            out.FormatLine("smoke: cleared {} emitter(s)", n);
+        });
+
+    C.RegisterCommand("smoke_list",
+        "List active smoke emitters (#136).",
+        [this](auto, pt::console::Output& out) {
+            if (smoke_emitters_.empty()) { out.PrintLine("(no smoke emitters)"); return; }
+            out.FormatLine("{} smoke emitter(s):", smoke_emitters_.size());
+            for (std::size_t i = 0; i < smoke_emitters_.size(); ++i) {
+                const auto& E = smoke_emitters_[i];
+                out.FormatLine("  [{}] pos=({:.2f} {:.2f} {:.2f}) radius={:.2f} density={:.2f} vel=({:.2f} {:.2f} {:.2f})",
+                               i, E.pos[0], E.pos[1], E.pos[2],
+                               E.radius, E.density,
+                               E.velocity[0], E.velocity[1], E.velocity[2]);
+            }
+        });
+}
+// --- end Fluid Phase 1 -----------------------------------------------------
 
 bool Engine::VoxelizeSourceObject(std::uint32_t source_id, float voxel_size,
                                   std::string* out_summary) {

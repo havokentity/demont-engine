@@ -137,6 +137,31 @@ public:
         float     v_half      = 0.0f;       // quad v-axis half-extent (m)
     };
 
+    // --- Fluid Phase 1 (#136) -- density-injection smoke emitters ----------
+    // Static / parametrically-drifting smoke plumes that ride the existing
+    // volumetric cloud march via additive density contributions inside
+    // cloud_density_at(). Phase 1 has NO solver state, NO advection, NO
+    // grid -- each emitter is a Gaussian density blob whose "current
+    // position" is base + velocity * t (parametric drift). The cloud
+    // march's existing extinction / scatter / NEE pipeline handles
+    // shading; smoke is rim-lit by the sun and ambient-lit by the sky
+    // exactly like clouds, for free.
+    //
+    // Cap of kMaxSmokeEmitters at 16 is plenty for the MVP (chimney +
+    // campfire + a few scattered plumes). The runtime cvar
+    // r_smoke_max_emitters tightens this further so users can dial back
+    // the per-frame cost without recompiling. GPU buffer is always sized
+    // to kMaxSmokeEmitters so a re-upload doesn't reallocate.
+    struct SmokeEmitter {
+        float pos[3]      {0, 1, 0};      // base position in world space (m)
+        float radius      = 1.0f;         // Gaussian falloff radius (m, sigma-equivalent)
+        float density     = 1.0f;         // peak sigma_t contribution (per metre)
+        float velocity[3] {0, 0.2f, 0};   // parametric drift velocity (m/s)
+        float falloff     = 2.0f;         // exponent on (r/radius); 2 = Gaussian-ish
+        float tint[3]     {1, 1, 1};      // optional color tint (multiplier on cloud RGB)
+    };
+    static constexpr std::uint32_t kMaxSmokeEmitters = 16;
+
 private:
     void RegisterCommands();
     void RegisterCsgCommands();
@@ -161,6 +186,18 @@ private:
     // prim_*/sdf_* registration style; the populated map is uploaded
     // to GPU on the next render frame via EnsureLightsUploaded.
     void RegisterLightCommands();
+    // Console commands for the fluid Phase 1 smoke emitter list (#136):
+    // `smoke_emit <x> <y> <z> [radius] [density]` and `smoke_clear`. The
+    // list is uploaded to GPU on the next render frame via
+    // EnsureSmokeEmittersUploaded.
+    void RegisterSmokeCommands();
+    // Re-upload the smoke emitter storage buffer from `smoke_emitters_`
+    // (#136). Called from RenderFrame every frame so the parametric
+    // drift (base + velocity * t) doesn't require a CPU-side dirty
+    // flag -- the GPU sees the current sim time via the per-frame
+    // smoke_params push. Buffer is always sized to kMaxSmokeEmitters so
+    // re-uploads don't reallocate.
+    void EnsureSmokeEmittersUploaded();
     // --- SDF Phase 1 (#97) -------------------------------------------------
     // Console commands for the SDF primitive set (`sdf_sphere`,
     // `sdf_box`, `sdf_smin`, ...). Mirrors the prim_*/csg_* registration
@@ -422,19 +459,22 @@ private:
     std::uint32_t                               light_count_uploaded_    = 0;  // lights last uploaded
 
     // --- Light tree (#129) -------------------------------------------------
-    // Hierarchical light tree (Conty Estevez & Kulla 2018) for O(log N)
-    // NEE light selection. Built CPU-side by pt::renderer::BuildLightTree
-    // and uploaded to a flat-node SSBO at engine slot 13 / shader binding
-    // 28. Re-built whenever light_prims_dirty_ fires (the same hook that
-    // re-uploads the light list itself) -- the build is <1ms for 1000
-    // lights so we don't bother caching across moves at MVP scale.
-    // light_tree_node_count_uploaded_ doubles as the shader's gate
-    // (push.light_tree_node_count > 0 AND r_light_tree=1 -> traverse,
-    // else fall back to naive uniform pick from #73).
     std::uint64_t                               light_tree_buffer_id_       = 0;
     std::uint32_t                               light_tree_buffer_capacity_ = 0;  // nodes that fit
     std::uint32_t                               light_tree_node_count_uploaded_ = 0;
     // --- end Light tree ----------------------------------------------------
+
+    // --- Fluid Phase 1 (#136) -- smoke emitters ----------------------------
+    // Density-injection plumes consumed by cloud_density_at(). Each emitter
+    // costs one Gaussian-falloff per cloud-march sample, so cap kept tight.
+    // Engine slot 15 / shader binding 30 (slot 14 taken by ReSTIR
+    // reservoir #78, slot 13 by light tree #129).
+    std::vector<SmokeEmitter>                   smoke_emitters_;
+    std::uint64_t                               smoke_buffer_id_         = 0;
+    std::uint32_t                               smoke_buffer_capacity_   = 0;
+    std::uint32_t                               smoke_count_uploaded_    = 0;
+    std::uint32_t                               smoke_next_id_           = 1;
+    // --- end Fluid Phase 1 -------------------------------------------------
 
     // --- Voxel destruction Phase 1 (#140) ----------------------------------
     // VoxelGrids produced by `voxelize_object`, keyed by source object

@@ -145,7 +145,7 @@ constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     25, // engine slot 12 -> shader binding 25 (roughness_tex, #118)
     26, // engine slot 13 -> shader binding 26 (specular_hit_distance_tex, #118)
 };
-constexpr std::uint32_t kSlotToBufBinding[14] = {
+constexpr std::uint32_t kSlotToBufBinding[16] = {
     0,  // engine slot 0 unused
     3,  // engine slot 1 -> shader binding 3  (mesh_positions)
     4,  // engine slot 2 -> shader binding 4  (mesh_indices)
@@ -178,6 +178,12 @@ constexpr std::uint32_t kSlotToBufBinding[14] = {
     // vk::binding(28) is what matters on SPIR-V (past the MetalFX
     // specular trio at 24..26 and the light_prims slot at 27).
     28, // engine slot 13 -> shader binding 28 (light_tree_nodes)
+    // ReSTIR DI Phase A (#78): per-pixel reservoir SSBO.
+    29, // engine slot 14 -> shader binding 29 (reservoir_curr_buf)
+    // Fluid Phase 1 (#136): smoke emitter list. Originally targeted
+    // engine slot 13 / binding 28 but moved during integration merge
+    // because light tree #129 already owns those.
+    30, // engine slot 15 -> shader binding 30 (smoke_emitters)
 };
 // Scene TLAS lives at engine accel-slot 2 -> shader binding 2.
 
@@ -974,17 +980,17 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     if (rt_supported_) {
         psizes.push_back({ VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, kTotalSets * 1 + 1 });
     }
-    // 13 storage-buffer bindings per dispatch: mesh_positions, mesh_indices,
+    // 15 storage-buffer bindings per dispatch: mesh_positions, mesh_indices,
     // primitives, marginal_cdf, conditional_cdf, exposure_state, analytic
     // bvh_nodes (binding 18), tri_bvh_nodes (binding 19),
     // tri_bvh_permuted_ids (binding 20), sdf_clusters (binding 21),
-    // shadow_vis_buf (binding 23, issue #115), light_prims (binding 27,
-    // #73), light_tree_nodes (binding 28, #129). +8 slack for the next
-    // few additions before we have to bump again -- MoltenVK silently
-    // ignored the prior undersize, but native NVIDIA Vulkan correctly
-    // returns VK_ERROR_OUT_OF_POOL_MEMORY (Win-RTX caught the gap as
-    // 576-requested vs 532-sized after #115 + #73 + #129 landed).
-    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 13 + 8 });
+    // shadow_vis_buf (binding 23, #115), light_prims (binding 27, #73),
+    // light_tree_nodes (binding 28, #129), reservoir_curr_buf
+    // (binding 29, #78 ReSTIR), smoke_emitters (binding 30, #136). +8
+    // slack for upcoming additions before we have to bump again --
+    // MoltenVK silently ignored the prior undersize, but native NVIDIA
+    // Vulkan correctly returns VK_ERROR_OUT_OF_POOL_MEMORY.
+    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 15 + 8 });
     psizes.push_back({ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,          kTotalSets * 1 + 1 });
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -1124,6 +1130,22 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // set stays complete.
         add_binding(28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
         // --- end Light tree ----------------------------------------
+        // --- ReSTIR DI Phase A (#78) -------------------------------
+        // Binding 29: per-pixel reservoir SSBO (RWStructuredBuffer<float4>).
+        // Phase A is Metal-only at dispatch level (engine doesn't dispatch
+        // the RestirTemporal/Spatial/Final kernels on Vulkan yet) but the
+        // descriptor still has to be in the layout because PathTrace.slang
+        // declares the binding unconditionally -- partial-bound means
+        // the unbound case is fine, the shader's r_restir gate elides.
+        add_binding(29, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        // --- end ReSTIR DI Phase A ---------------------------------
+        // --- Fluid Phase 1 (#136) ---------------------------------
+        // Binding 30: smoke emitter list SSBO. Read-only in PathTrace's
+        // cloud_density_at() per-march-sample loop. The shader gates the
+        // iteration on push.smoke_params.x > 0 AND push.smoke_params.y
+        // != 0, so an empty / placeholder buffer is dead at runtime.
+        add_binding(30, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        // --- end Fluid Phase 1 -------------------------------------
 
         // UPDATE_AFTER_BIND for every binding so we can rewrite the
         // shared descriptor set between dispatches in the same cmd
