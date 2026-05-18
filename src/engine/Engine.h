@@ -811,6 +811,16 @@ private:
     glm::mat4                                   prev_view_proj_        { 1.0f };  // identity
     bool                                        prev_view_proj_valid_  = false;
     bool                                        denoiser_active_       = false;
+    // Issue #119 -- previous-frame SVGF albedo-demod effective state.
+    // Tracks what we actually told the backend last frame (i.e. cvar
+    // gated by albedo-texture availability). When this changes
+    // mid-run, the SVGF history texture holds data in the OPPOSITE
+    // colour space (demod-on stores lighting / albedo; demod-off
+    // stores full radiance), so we have to fire reset_history before
+    // the temporal blend lerps stale history against the new
+    // input. Initially false so the first-frame "valid history"
+    // check (prev_view_proj_valid_) drives reset, not this gate.
+    bool                                        prev_svgf_albedo_demod_active_ = false;
     // One-shot state-transition latch for the Vulkan + SVGF/NRD bloom
     // path (built in PR for feature/vulkan-bloom-svgf-nrd). True from
     // the frame the predicate first goes hot until it goes cold; lets
