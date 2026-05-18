@@ -14,6 +14,22 @@ target_link_libraries(pt_rhi_vulkan
     PUBLIC glfw                    # for glfwCreateWindowSurface
 )
 
+# ---- NRD denoiser (NVIDIA RayTracingDenoiser, Vulkan, non-Apple) ----------
+# Issue #50. Gated by PT_NRD_ACTIVE (set by the top-level Dependencies.cmake
+# once the user has flipped PT_ENABLE_NRD=ON on a non-Apple build with the
+# Vulkan backend on). When inactive the wrapper file isn't compiled, the
+# NRD lib isn't linked, and PT_ENABLE_NRD is undefined in the source so
+# the #if blocks inside VulkanDenoiser.cpp compile out. Today the wrapper
+# is a scaffold -- it stubs the NRD instance/dispatch translation; the
+# r_denoiser nrd cvar value still routes through the in-house SVGF chain.
+# A follow-up PR will switch routing to VulkanNrdLibDenoiser::Encode once
+# the per-frame Dispatch->VkDispatch translation lands.
+if(PT_NRD_ACTIVE)
+    target_sources(pt_rhi_vulkan PRIVATE VulkanNrdLibDenoiser.cpp)
+    target_link_libraries(pt_rhi_vulkan PRIVATE NRD)
+    target_compile_definitions(pt_rhi_vulkan PUBLIC PT_ENABLE_NRD=1)
+endif()
+
 # ---- OptiX denoiser (NVIDIA only) -----------------------------------------
 # Adds the OptiX denoiser strategy alongside the SVGF/NRD one. Gated by
 # PT_OPTIX_ACTIVE (set by the top-level CMakeLists once CUDA Toolkit and
