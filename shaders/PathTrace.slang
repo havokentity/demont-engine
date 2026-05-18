@@ -161,6 +161,81 @@ Texture2D<float4> moon_map;
 // every subsequent texture slot.
 [[vk::binding(22, 0)]] RWTexture2D<float>  cloud_trans_tex;
 
+// MetalFX specular-guidance G-buffers (issue #118). Apple's
+// MTLFXTemporalDenoisedScaler exposes three optional specular inputs --
+// without them the scaler can't differentiate specular from diffuse
+// response and exhibits 8x8 halos around bright reflections / metals.
+// PR #114 wired normal + diffuse_albedo; this PR fills the remaining
+// trio so MetalFX can close the gap with DLSS Ray Reconstruction on
+// Apple Silicon.
+//
+// Binding numbers: 24/25/26. Binding 23 is reserved for #115 SIGMA
+// shadow visibility (parallel-agent coordination). The cluster
+// 22 (cloud_trans) / 23 (shadow_vis, #115) / 24-26 (this PR) lives
+// just past the SDF-cluster buffer at 21 and keeps the descriptor
+// pool sizing arithmetic simple.
+//
+// All three are declared on BOTH SPIR-V and Metal targets so Slang's
+// declaration-order MSL slot assignment stays stable -- same rule as
+// normal_tex / albedo_tex / cloud_trans_tex (see albedo_tex's comment
+// for the PR #108 history that motivates this). Runtime writes are
+// gated on the matching push.write_specular_*_gbuffer flag the engine
+// sets only for MetalFX-family denoiser kinds.
+
+// specular_albedo: per-pixel F0 (Fresnel reflectance at normal
+// incidence). RGBA16F so it can carry the full RGB metal tint
+// (metal F0 = surface albedo, NOT a uniform value -- gold is yellow
+// because its specular reflectance is yellow, not because it tints
+// a white diffuse). Dielectrics use the standard float3(0.04) IOR=1.5
+// Schlick approximation; pure Lambert writes float3(0) since it has
+// no specular lobe. Sky / no-hit pixels write float3(0).
+//
+// Declared as WTexture2D (write-only) rather than RWTexture2D because
+// Apple Silicon GPUs cap compute kernels at 8 read_write textures per
+// dispatch, and PathTrace.slang is already at that ceiling (output,
+// accum_hdr, denoise_color, depth_tex, motion_tex, normal_tex,
+// albedo_tex, cloud_trans_tex). Slang's WTexture2D lowers to
+// `texture2d<T, access::write>` on Metal -- not counted against the
+// 8-RW cap. Vulkan's GLSL/SPIR-V emit uses a write-only `imageStore`
+// path; the host-side bind path is identical (storage image, same
+// VkDescriptorSet entry, same vk::binding number). Issue #118 / Slang
+// docs WTexture2D guidance: a2-03-wgsl-target-specific.md.
+[[vk::binding(24, 0)]] WTexture2D<float4> specular_albedo_tex;
+
+// roughness: linear surface roughness in [0, 1]. Single-channel.
+// 0 = perfect mirror, 1 = fully Lambertian. The path tracer's
+// material struct already carries a roughness param on PBR-style
+// hits (used in the GGX BRDF); this G-buffer just exposes it to
+// MetalFX as a guidance input so the scaler can vary its spatial
+// filter aggressiveness by surface response. Sky / no-hit pixels
+// write 1.0 (fully rough -- MetalFX won't try to sharpen a specular
+// highlight in empty space). See specular_albedo_tex's comment for
+// the WTexture2D vs RWTexture2D rationale (Apple's 8-RW cap).
+[[vk::binding(25, 0)]] WTexture2D<float>  roughness_tex;
+
+// specular_hit_distance: distance from the camera (in world units) to
+// the surface a reflection ray from the primary hit would land on.
+// Single-channel. Apple uses this for parallax-correct temporal
+// reprojection of specular highlights -- without it, reflections on
+// moving cameras smear because MetalFX has no way to know the
+// reflected-virtual-image depth differs from the visible-surface
+// depth.
+//
+// MVP semantics: we don't run a second trace per pixel (the full
+// design would re-trace in r = reflect(view_dir, normal) from the
+// primary hit). Instead we use `primary_t` (the distance the camera
+// ray itself travelled) as a proxy, biased by the roughness: at
+// roughness=0 (perfect mirror) the reflected hit is at infinity for
+// curved surfaces / at primary_t for flat ones, so this proxy is
+// closer to right for shorter-distance reflections; at roughness=1
+// the field doesn't matter anyway (MetalFX won't try to reproject
+// a fully-rough surface as a sharp specular). A future PR can
+// replace this with a real reflection-ray trace; the visual diff
+// determines whether the perf cost is worth it.
+// Sky / no-hit pixels write 0 (no surface). See specular_albedo_tex's
+// comment for the WTexture2D vs RWTexture2D rationale.
+[[vk::binding(26, 0)]] WTexture2D<float>  specular_hit_distance_tex;
+
 // GPU-resident exposure scalar. Updated each frame by AutoExposure.slang
 // (when r_auto_exposure = 1) or written once by the engine via
 // WriteBuffer (when r_auto_exposure = 0, holding the manual r_exposure
@@ -484,6 +559,22 @@ cbuffer Push {
     uint _pad_celestials0;
     uint _pad_celestials1;
     uint _pad_celestials2;
+    // MetalFX specular-guidance G-buffer write gates (issue #118).
+    // The engine sets these only for MetalFX-family denoiser kinds
+    // (DenoiserKind::MetalFX / SvgfBasicMetalFx / SvgfAtrousMetalFx)
+    // and only when the matching G-buffer texture is actually
+    // allocated this frame -- same pattern as write_normal_gbuffer /
+    // write_albedo_gbuffer. Under PARTIALLY_BOUND descriptors the
+    // shader must elide the write when the texture is unbound, so
+    // each one gets its own runtime gate rather than collapsing into
+    // a single MetalFX flag (lets future modes pick + choose; e.g.
+    // a roughness-only diagnostic kernel could write just the
+    // roughness gbuffer). Trailing pad keeps the 16-byte alignment
+    // the std140 / MSL cbuffer rule demands.
+    uint write_specular_albedo_gbuffer;
+    uint write_roughness_gbuffer;
+    uint write_specular_hit_distance_gbuffer;
+    uint _pad_specular_gbuffers0;
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -537,6 +628,15 @@ cbuffer Frame {
     uint _pad_celestials0;
     uint _pad_celestials1;
     uint _pad_celestials2;
+    // See `write_specular_albedo_gbuffer` / `write_roughness_gbuffer` /
+    // `write_specular_hit_distance_gbuffer` in the Metal Push cbuffer
+    // above for semantics (issue #118 MetalFX specular guidance).
+    // Layout-equivalent across both targets; trailing pad keeps the
+    // 16-byte block alignment for std140 / MSL.
+    uint write_specular_albedo_gbuffer;
+    uint write_roughness_gbuffer;
+    uint write_specular_hit_distance_gbuffer;
+    uint _pad_specular_gbuffers0;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -1929,6 +2029,78 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // modes; the runtime gate keeps that free.
         if (write_albedo_gbuffer != 0u) {
             albedo_tex[tid] = float4(hit_albedo, 0.0);
+        }
+        // MetalFX specular-guidance G-buffers (issue #118). Three
+        // textures fed to MTLFXTemporalDenoisedScaler so it can tell
+        // specular from diffuse response -- without them the scaler
+        // produces 8x8 halos around bright reflections / metals.
+        //
+        // F0 (specular_albedo) per material kind:
+        //   MAT_METAL      : F0 = albedo (the material colour reflects
+        //                    directly; gold's yellow specular IS its
+        //                    yellow albedo, not a tinted white highlight).
+        //   MAT_DIELECTRIC : F0 = float3(0.04) — the standard Schlick
+        //                    approximation for IOR~1.5 (glass, plastic,
+        //                    coated dielectrics). Engine's dielectric
+        //                    primitives are nominally IOR=1.5 unless
+        //                    overridden in the prim material struct.
+        //   MAT_LAMBERT    : F0 = float3(0) — no specular lobe at all.
+        // Pulled from h0 (not hit_albedo / hit_normal which collapse
+        // to sentinels on sky pixels) so we can preserve the material-
+        // kind discriminator.
+        //
+        // roughness: from h0.roughness directly. The material struct
+        // packs roughness in primitive .v1.a / SDF cluster header /
+        // mesh material — already plumbed through traceScene as h.roughness.
+        //
+        // specular_hit_distance: MVP proxy using `primary_t * (1 - rough)`,
+        // i.e. attenuated by smoothness so a perfect mirror keeps the
+        // full distance and a rough surface trends toward 0 where
+        // MetalFX has no specular reproject to do. A future PR (real
+        // reflection-ray trace from the primary hit) can replace this
+        // with the actual reflected-virtual-image depth; see the
+        // texture's declaration comment for the design trade-off.
+        //
+        // All three are sky-aware: hit_normal == float3(0) means h0.hit
+        // == false, so we write the "no surface" sentinel for that
+        // pixel. roughness sentinel is 1.0 (fully rough -> MetalFX
+        // skips specular handling); F0 + hit_distance sentinel is 0.
+        if (write_specular_albedo_gbuffer != 0u) {
+            float3 f0 = float3(0.0);
+            if (h0.hit) {
+                if      (h0.mat == MAT_METAL)      f0 = h0.albedo;
+                else if (h0.mat == MAT_DIELECTRIC) f0 = float3(0.04);
+                // Lambert keeps f0 = 0.
+            }
+            // WTexture2D.Store(coord, value) instead of subscript
+            // assignment -- WTexture2D is write-only (lowers to Metal
+            // access::write to stay under the 8-RW-texture cap) and
+            // doesn't support the [] = ... HLSL convenience syntax.
+            specular_albedo_tex.Store(tid, float4(f0, 0.0));
+        }
+        if (write_roughness_gbuffer != 0u) {
+            float r = h0.hit ? saturate(h0.roughness) : 1.0;
+            // Lambert lobe is fully rough; the engine's prim seeding
+            // sets h.roughness based on the material's GGX param, but
+            // for MAT_LAMBERT the value is meaningless (Lambert doesn't
+            // have a roughness). Force = 1.0 so MetalFX sees Lambert
+            // pixels as "no specular surface to preserve."
+            if (h0.hit && h0.mat == MAT_LAMBERT) r = 1.0;
+            roughness_tex.Store(tid, r);
+        }
+        if (write_specular_hit_distance_gbuffer != 0u) {
+            float dist = 0.0;
+            if (h0.hit) {
+                // MVP proxy: primary hit distance weighted by smoothness
+                // (1 - roughness). At roughness=0 the reflection comes
+                // from somewhere far past the primary hit, but we don't
+                // trace it -- the value is "as far as we know, primary_t."
+                // At roughness=1 we'd write 0 anyway since MetalFX won't
+                // try to reproject a fully-rough specular.
+                float smoothness = 1.0 - saturate(h0.roughness);
+                dist = h0.t * smoothness;
+            }
+            specular_hit_distance_tex.Store(tid, dist);
         }
     }
 

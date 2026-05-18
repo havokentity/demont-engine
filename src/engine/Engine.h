@@ -369,6 +369,30 @@ private:
     // the rest of the denoiser-related textures (same denoiser_active_
     // lifecycle as depth_tex / motion_tex / post_denoise_hdr).
     std::uint64_t                               cloud_trans_tex_id_ = 0;
+    // MetalFX specular-guidance G-buffers (issue #118). Three textures
+    // fed to MTLFXTemporalDenoisedScaler so it can tell specular from
+    // diffuse response; without them MetalFX produces 8x8 halos on
+    // bright reflections. Allocated only for MetalFX-family denoiser
+    // kinds (DenoiserKind::MetalFX / SvgfBasicMetalFx / SvgfAtrousMetalFx);
+    // SVGF / NRD / OptiX paths leave them at 0 since they don't accept
+    // these guidance inputs. Same allocation lifecycle as
+    // normal_tex_id_ / albedo_tex_id_.
+    //
+    //   specular_albedo_tex_id_       -- RGBA16F per-pixel F0 (Fresnel
+    //                                    reflectance at normal incidence).
+    //                                    Metals: F0 = albedo; dielectrics:
+    //                                    F0 = float3(0.04); Lambert: 0.
+    //   roughness_tex_id_             -- R16F single-channel surface
+    //                                    roughness in [0, 1]. 0 = mirror,
+    //                                    1 = fully rough.
+    //   specular_hit_distance_tex_id_ -- R16F distance from camera to the
+    //                                    specularly-reflected hit (MVP:
+    //                                    primary_t * smoothness; a future
+    //                                    PR can swap in a real reflection-
+    //                                    ray trace).
+    std::uint64_t                               specular_albedo_tex_id_       = 0;
+    std::uint64_t                               roughness_tex_id_             = 0;
+    std::uint64_t                               specular_hit_distance_tex_id_ = 0;
     // Bloom mip chain. mip 0 is half-res of the swapchain; each
     // subsequent mip halves again. Built every frame from
     // post_denoise_hdr_tex_ via threshold + downsample + upsample

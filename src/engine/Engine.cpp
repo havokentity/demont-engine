@@ -1184,6 +1184,10 @@ void Engine::TearDownDevice() {
         if (motion_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
         if (post_denoise_hdr_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
         if (cloud_trans_tex_id_      != 0) device_->DestroyTexture(pt::rhi::TextureHandle{cloud_trans_tex_id_});
+        // MetalFX specular guidance G-buffers (issue #118).
+        if (specular_albedo_tex_id_       != 0) device_->DestroyTexture(pt::rhi::TextureHandle{specular_albedo_tex_id_});
+        if (roughness_tex_id_             != 0) device_->DestroyTexture(pt::rhi::TextureHandle{roughness_tex_id_});
+        if (specular_hit_distance_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{specular_hit_distance_tex_id_});
         for (auto& id : bloom_mip_tex_id_) {
             if (id != 0) device_->DestroyTexture(pt::rhi::TextureHandle{id});
             id = 0;
@@ -1226,6 +1230,10 @@ void Engine::TearDownDevice() {
     motion_tex_id_           = 0;
     post_denoise_hdr_tex_id_ = 0;
     cloud_trans_tex_id_      = 0;
+    // MetalFX specular guidance G-buffers (issue #118).
+    specular_albedo_tex_id_       = 0;
+    roughness_tex_id_             = 0;
+    specular_hit_distance_tex_id_ = 0;
     tonemap_pipeline_id_     = 0;
     stars_composite_pipeline_id_ = 0;
     bloom_down_pipeline_id_  = 0;
@@ -3065,6 +3073,10 @@ void Engine::RenderFrame() {
             if (albedo_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{albedo_tex_id_});
             if (post_denoise_hdr_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
             if (cloud_trans_tex_id_      != 0) device_->DestroyTexture(pt::rhi::TextureHandle{cloud_trans_tex_id_});
+            // MetalFX specular guidance G-buffers (issue #118).
+            if (specular_albedo_tex_id_       != 0) device_->DestroyTexture(pt::rhi::TextureHandle{specular_albedo_tex_id_});
+            if (roughness_tex_id_             != 0) device_->DestroyTexture(pt::rhi::TextureHandle{roughness_tex_id_});
+            if (specular_hit_distance_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{specular_hit_distance_tex_id_});
             for (auto& id : bloom_mip_tex_id_) {
                 if (id != 0) device_->DestroyTexture(pt::rhi::TextureHandle{id});
                 id = 0;
@@ -3072,6 +3084,9 @@ void Engine::RenderFrame() {
             denoise_color_tex_id_ = depth_tex_id_ = motion_tex_id_ = 0;
             normal_tex_id_ = albedo_tex_id_ = post_denoise_hdr_tex_id_ = 0;
             cloud_trans_tex_id_   = 0;
+            specular_albedo_tex_id_       = 0;
+            roughness_tex_id_             = 0;
+            specular_hit_distance_tex_id_ = 0;
         }
     }
 
@@ -3178,6 +3193,21 @@ void Engine::RenderFrame() {
          denoiser_kind_ == DenoiserKind::MetalFX             ||
          denoiser_kind_ == DenoiserKind::SvgfBasicMetalFx    ||
          denoiser_kind_ == DenoiserKind::SvgfAtrousMetalFx);
+    // MetalFX specular-guidance G-buffers (issue #118). Apple's
+    // MTLFXTemporalDenoisedScaler accepts specularAlbedo + roughness +
+    // specularHitDistance as guidance inputs; with PR #114's normal +
+    // diffuseAlbedo plumbing already in place, these close the gap with
+    // DLSS Ray Reconstruction quality on Apple Silicon and kill the
+    // 8x8 specular halos the user reported. Gated on MetalFX-family
+    // kinds only -- SVGF / NRD / OptiX paths don't accept these
+    // (separate issue for SVGF wiring; see #118's "Out of scope"
+    // section). All three travel together: they all feed the same
+    // MTLFXTemporalDenoisedScalerDescriptor so partial allocation
+    // would just stall on a half-bound scaler.
+    const bool want_specular_guidance_gbuffers =
+        (denoiser_kind_ == DenoiserKind::MetalFX             ||
+         denoiser_kind_ == DenoiserKind::SvgfBasicMetalFx    ||
+         denoiser_kind_ == DenoiserKind::SvgfAtrousMetalFx);
     // Bloom-without-denoiser path: when the user has r_bloom on but
     // no denoiser, the engine still needs `denoise_color` (as the
     // path tracer's linear-HDR output the bloom pyramid samples) and
@@ -3214,7 +3244,11 @@ void Engine::RenderFrame() {
             (depth_tex_id_ == 0 || motion_tex_id_ == 0 ||
              post_denoise_hdr_tex_id_ == 0 ||
              (want_normal_gbuffer && normal_tex_id_ == 0) ||
-             (want_albedo_gbuffer && albedo_tex_id_ == 0))))) {
+             (want_albedo_gbuffer && albedo_tex_id_ == 0) ||
+             (want_specular_guidance_gbuffers &&
+              (specular_albedo_tex_id_ == 0 ||
+               roughness_tex_id_ == 0 ||
+               specular_hit_distance_tex_id_ == 0)))))) {
         if (denoise_color_tex_id_     != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
         // depth/motion/normal/albedo/post_denoise_hdr only exist on the
         // denoiser path. Destroy them only when the denoiser path is
@@ -3229,6 +3263,10 @@ void Engine::RenderFrame() {
             if (albedo_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{albedo_tex_id_});
             if (post_denoise_hdr_tex_id_  != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
             if (cloud_trans_tex_id_       != 0) device_->DestroyTexture(pt::rhi::TextureHandle{cloud_trans_tex_id_});
+            // MetalFX specular guidance G-buffers (issue #118).
+            if (specular_albedo_tex_id_       != 0) device_->DestroyTexture(pt::rhi::TextureHandle{specular_albedo_tex_id_});
+            if (roughness_tex_id_             != 0) device_->DestroyTexture(pt::rhi::TextureHandle{roughness_tex_id_});
+            if (specular_hit_distance_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{specular_hit_distance_tex_id_});
             // Explicitly zero the IDs here. The subsequent CreateTexture
             // calls overwrite them on the success path, but a CreateTexture
             // failure below leaves the ID still pointing at a freed handle
@@ -3241,6 +3279,9 @@ void Engine::RenderFrame() {
             albedo_tex_id_           = 0;
             post_denoise_hdr_tex_id_ = 0;
             cloud_trans_tex_id_      = 0;
+            specular_albedo_tex_id_       = 0;
+            roughness_tex_id_             = 0;
+            specular_hit_distance_tex_id_ = 0;
         }
         auto color_h = device_->CreateTexture({
             .width = fc.width, .height = fc.height,
@@ -3332,6 +3373,52 @@ void Engine::RenderFrame() {
             } else {
                 albedo_tex_id_ = 0;
             }
+            // MetalFX specular-guidance G-buffers (issue #118). All
+            // three travel together: they feed the same MetalFX
+            // descriptor (set in pt_metalfx_create), so partial
+            // allocation would just stall the scaler on a nil binding.
+            //
+            // specular_albedo: RGBA16F per-pixel F0 (matches the enum's
+            //   format convention and gives metals room to encode the
+            //   full RGB Fresnel reflectance).
+            // roughness: R32F single-channel surface roughness in [0,1].
+            //   The RHI doesn't expose R16F today and the precision
+            //   gap is academic for a guidance input -- R32F costs
+            //   ~8MB/4K vs R16F's ~4MB and saves us a new format slot.
+            // specular_hit_distance: R32F single-channel world-units
+            //   distance. Same R16F-vs-R32F trade as roughness; using
+            //   R32F unifies allocation code with cloud_trans_tex /
+            //   depth_tex.
+            if (want_specular_guidance_gbuffers) {
+                auto spec_albedo_h = device_->CreateTexture({
+                    .width = fc.width, .height = fc.height,
+                    .format = pt::rhi::TextureFormat::RGBA16F,
+                    .usage  = pt::rhi::TextureUsage::Storage,
+                    .debug_name = "denoise_specular_albedo",
+                });
+                specular_albedo_tex_id_ = spec_albedo_h.id;
+                auto roughness_h = device_->CreateTexture({
+                    .width = fc.width, .height = fc.height,
+                    .format = pt::rhi::TextureFormat::R32F,
+                    .usage  = pt::rhi::TextureUsage::Storage,
+                    .debug_name = "denoise_roughness",
+                });
+                roughness_tex_id_ = roughness_h.id;
+                auto spec_hit_dist_h = device_->CreateTexture({
+                    .width = fc.width, .height = fc.height,
+                    .format = pt::rhi::TextureFormat::R32F,
+                    .usage  = pt::rhi::TextureUsage::Storage,
+                    .debug_name = "denoise_specular_hit_distance",
+                });
+                specular_hit_distance_tex_id_ = spec_hit_dist_h.id;
+                LOG_INFO("engine: allocated MetalFX specular guidance G-buffers ({}x{}) "
+                         "[specular_albedo RGBA16F + roughness R32F + specular_hit_distance R32F]",
+                         fc.width, fc.height);
+            } else {
+                specular_albedo_tex_id_       = 0;
+                roughness_tex_id_             = 0;
+                specular_hit_distance_tex_id_ = 0;
+            }
         }
         prev_view_proj_valid_ = false;        // history is invalid after resize
         if (denoise_color_tex_id_ == 0) {
@@ -3349,7 +3436,11 @@ void Engine::RenderFrame() {
             (depth_tex_id_      == 0 || motion_tex_id_       == 0 ||
              post_denoise_hdr_tex_id_ == 0 ||
              (want_normal_gbuffer && normal_tex_id_ == 0) ||
-             (want_albedo_gbuffer && albedo_tex_id_ == 0))) {
+             (want_albedo_gbuffer && albedo_tex_id_ == 0) ||
+             (want_specular_guidance_gbuffers &&
+              (specular_albedo_tex_id_ == 0 ||
+               roughness_tex_id_ == 0 ||
+               specular_hit_distance_tex_id_ == 0)))) {
             LOG_ERROR("denoiser G-buffer allocation failed at {}x{}", fc.width, fc.height);
             denoiser_active_ = false;
         }
@@ -3545,6 +3636,25 @@ void Engine::RenderFrame() {
     // for the composite chain.
     if (denoiser_active_ && cloud_trans_tex_id_ != 0) {
         cb->BindStorageTexture(10, pt::rhi::TextureHandle{cloud_trans_tex_id_});
+    }
+    // Engine slots 11/12/13 -> vk::bindings 24/25/26: the MetalFX
+    // specular-guidance trio (issue #118). Path tracer writes them
+    // alongside the existing G-buffers when the write_specular_*_gbuffer
+    // push gates are non-zero; MetalFX (and SVGF->MetalFX chained
+    // kinds) consume them via MTLFXTemporalDenoisedScalerDescriptor's
+    // specularAlbedoTexture / roughnessTexture / specularHitDistanceTexture.
+    // Engine allocates them only when want_specular_guidance_gbuffers
+    // is set (see allocation block above); the bind is gated on
+    // non-zero id so non-MetalFX dispatches leave the slots unbound
+    // and the matching push gates elide the shader writes.
+    if (denoiser_active_ && specular_albedo_tex_id_ != 0) {
+        cb->BindStorageTexture(11, pt::rhi::TextureHandle{specular_albedo_tex_id_});
+    }
+    if (denoiser_active_ && roughness_tex_id_ != 0) {
+        cb->BindStorageTexture(12, pt::rhi::TextureHandle{roughness_tex_id_});
+    }
+    if (denoiser_active_ && specular_hit_distance_tex_id_ != 0) {
+        cb->BindStorageTexture(13, pt::rhi::TextureHandle{specular_hit_distance_tex_id_});
     }
     if (env_map_tex_id_ != 0) {
         cb->BindStorageTexture(5, pt::rhi::TextureHandle{env_map_tex_id_});
@@ -3765,6 +3875,18 @@ void Engine::RenderFrame() {
         // Slang applies to the shader-side `Push` / `Frame` blocks.
         std::uint32_t composite_celestials;
         std::uint32_t _pad_star_split[3];
+        // MetalFX specular-guidance G-buffer write gates (issue #118).
+        // Engine sets these only for MetalFX-family denoiser kinds AND
+        // only when the matching G-buffer texture is allocated; the
+        // shader's matching gate elides the per-pixel write under
+        // partially-bound semantics for non-MetalFX dispatches. The
+        // _pad_specular_gbuffers0 entry keeps the cbuffer trailing
+        // block 16-byte aligned (std140 / MSL rule that the static_assert
+        // block at the end of this struct guards against).
+        std::uint32_t write_specular_albedo_gbuffer;
+        std::uint32_t write_roughness_gbuffer;
+        std::uint32_t write_specular_hit_distance_gbuffer;
+        std::uint32_t _pad_specular_gbuffers0;
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -3805,6 +3927,22 @@ void Engine::RenderFrame() {
     // partially-bound semantics.
     push.write_albedo_gbuffer =
         (denoiser_active_ && albedo_tex_id_ != 0) ? 1u : 0u;
+    // MetalFX specular-guidance G-buffer write gates (issue #118). Same
+    // gating logic as the normal/albedo gates: only ever set when the
+    // engine actually owns the matching texture for this dispatch.
+    // The host's want_specular_guidance_gbuffers flag drives allocation
+    // (set only for DenoiserKind::MetalFX / SvgfBasicMetalFx /
+    // SvgfAtrousMetalFx); the runtime gate here is the descriptor-
+    // is-actually-bound signal. Under partially-bound semantics the
+    // shader-side write MUST elide when the slot is unbound; the
+    // per-texture gate is what enables that elision.
+    push.write_specular_albedo_gbuffer =
+        (denoiser_active_ && specular_albedo_tex_id_ != 0) ? 1u : 0u;
+    push.write_roughness_gbuffer =
+        (denoiser_active_ && roughness_tex_id_ != 0) ? 1u : 0u;
+    push.write_specular_hit_distance_gbuffer =
+        (denoiser_active_ && specular_hit_distance_tex_id_ != 0) ? 1u : 0u;
+    push._pad_specular_gbuffers0 = 0u;
     push.env_map_present  = (env_map_tex_id_ != 0) ? 1u : 0u;
     {
         float intensity = 1.0f;
@@ -4370,11 +4508,12 @@ void Engine::RenderFrame() {
     // explicit padding that the SPIR-V / MSL cbuffer rule would have
     // inserted anyway). Mirrored in PathTrace.slang's Push/Frame block.
     // 736 (pre-SDF) + 16 (sdf_params uvec4) + 16 (sdf_params_f vec4) +
-    // 16 (composite_celestials + 12 B pad) = 784 B. Vulkan keeps the
-    // first 112 B in push constants and spills the rest into the Frame
-    // UBO (kFrameUboSize = 1024); Metal keeps the whole struct in a
-    // setBytes-style slot.
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16);
+    // 16 (composite_celestials + 12 B pad) + 16 (issue #118 MetalFX
+    // specular guidance write gates: 3 uint flags + 4 B pad) = 800 B.
+    // Vulkan keeps the first 112 B in push constants and spills the
+    // rest into the Frame UBO (kFrameUboSize = 1024); Metal keeps the
+    // whole struct in a setBytes-style slot.
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16);
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
     // cbuffer layout the Slang compiler applies to PathTrace.slang's
@@ -4399,6 +4538,11 @@ void Engine::RenderFrame() {
     // --- end SDF Phase 1 ---------------------------------------------------
     static_assert(offsetof(PtPush, composite_celestials) % 16 == 0,
                   "PtPush::composite_celestials must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    // Issue #118 MetalFX specular guidance write gates land in their own
+    // 16-byte block right after the composite_celestials block.
+    static_assert(offsetof(PtPush, write_specular_albedo_gbuffer) % 16 == 0,
+                  "PtPush::write_specular_albedo_gbuffer must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
@@ -4554,6 +4698,14 @@ void Engine::RenderFrame() {
         // tolerates it. MetalFX uses the diffuse albedo as a spatial-
         // filter guidance signal.
         dd.albedo_in     = pt::rhi::TextureHandle{albedo_tex_id_};
+        // MetalFX specular-guidance G-buffers (issue #118). Engine
+        // allocates these only for MetalFX-family kinds; for all
+        // other denoiser modes the IDs are 0 and the backend treats
+        // them as "no guidance for this frame" (matching the existing
+        // nil-handle convention used for albedo_in on SVGF/NRD).
+        dd.specular_albedo_in       = pt::rhi::TextureHandle{specular_albedo_tex_id_};
+        dd.roughness_in             = pt::rhi::TextureHandle{roughness_tex_id_};
+        dd.specular_hit_distance_in = pt::rhi::TextureHandle{specular_hit_distance_tex_id_};
         // Star-split accumulator was wired here for the EMA design
         // (#108). The stateless StarsComposite rewrite eliminates the
         // accumulator; the Vulkan path's denoiser finalize no longer
