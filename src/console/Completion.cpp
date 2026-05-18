@@ -212,11 +212,29 @@ std::vector<CompletionMatch> BuildCompletions(const TokenInfo& token,
         auto* cv = C.FindCVar(token.first_tok);
         if (cv != nullptr) {
             if (!cv->allowed_values.empty()) {
-                for (const auto& v : cv->allowed_values) {
+                // Filter out values whose per-value platform flag
+                // (CVAR_VALUE_*) doesn't permit the current build's
+                // host (issue #161 / PR #163). Without this, typing
+                // `r_denoiser <TAB>` on Mac would offer `nrd` and the
+                // OptiX family as completions even though setting any
+                // of them would be rejected at Execute time with a
+                // platform-mismatch error -- the user saw an
+                // autocomplete option, picked it, and then got told
+                // "no, not this platform". Mirrors the same per-value
+                // filter that AllowedValuesForCurrentPlatformCsv()
+                // uses at error-message time so the two surfaces
+                // (suggest + reject) stay consistent.
+                for (std::size_t i = 0; i < cv->allowed_values.size(); ++i) {
+                    const std::uint32_t mask =
+                        (i < cv->allowed_value_flags.size())
+                            ? cv->allowed_value_flags[i]
+                            : 0u;  // CVAR_VALUE_ANY: visible everywhere
+                    if (!CVarValueAllowedOnThisPlatform(mask)) continue;
+                    const auto& v = cv->allowed_values[i];
                     CompletionMatch m;
                     m.name = v;
                     m.kind = CompletionKind::Value;
-                    if (v == cv->value)            m.value = "current";
+                    if (v == cv->value)              m.value = "current";
                     else if (v == cv->default_value) m.value = "default";
                     // description left empty -- same text per row is noise.
                     pool.push_back(std::move(m));
