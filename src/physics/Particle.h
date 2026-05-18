@@ -23,9 +23,16 @@ namespace pt::physics {
 // constraint pinning).
 //
 // Layout note: kept POD-ish so a future Phase 4 GPU port can blit
-// the pool straight into a storage buffer. 16-byte fields keep the
-// struct at 48 bytes -- one fits in a single cache line with room to
-// spare for the engine's per-particle id metadata.
+// the pool straight into a storage buffer. With the project's default
+// glm config (no GLM_FORCE_DEFAULT_ALIGNED_GENTYPES), glm::vec3 is the
+// natural 12-byte packed layout, so the struct lands at 32 bytes on
+// every platform we ship today (two 12-byte vec3s + two 4-byte
+// floats, no trailing padding). Two particles fit per 64-byte cache
+// line. NOT directly std430-compatible: a Phase 4 GPU port would need
+// to either translate to an explicit vec4 layout in the storage
+// buffer (12-byte vec3s in std430 round up to 16, and the float
+// member alignment differs) or define GLM_FORCE_DEFAULT_ALIGNED_GENTYPES
+// at that point. Either path is fine; this struct is the CPU layout.
 struct Particle {
     glm::vec3 prev_pos    {0.0f, 0.0f, 0.0f};
     glm::vec3 curr_pos    {0.0f, 0.0f, 0.0f};

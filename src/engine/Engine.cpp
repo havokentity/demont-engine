@@ -1060,12 +1060,18 @@ namespace cvar {
             "tunnel through the ground plane, larger numbers waste CPU.",
             CVAR_ARCHIVE);
     PT_CVAR(phys_damping,     "0.99",
-            "Per-substep velocity damping (0.5..1.0). 1.0 = energy-"
+            "Per-substep velocity multiplier (0.5..1.0). 1.0 = energy-"
             "conserving (perpetual bounce); the default 0.99 bleeds "
-            "1% per substep so an N=8-substep frame at 60 fps loses "
-            "~38% of kinetic energy per second -- enough to settle a "
-            "pile of spheres in a couple of seconds without making "
-            "the motion feel like syrup.",
+            "1% of the integrator's implicit velocity per substep. At "
+            "phys_substeps=8 and 60 fps that's 8*60=480 substeps/sec, "
+            "so velocity decays as 0.99^480 ~= 0.008 (i.e. ~99% of "
+            "velocity gone after one second, or kinetic energy down "
+            "to ~0.006% of its initial value). The aggressive bleed "
+            "is what lets a tossed pile of spheres settle into a loose "
+            "heap in roughly a second of wall time without needing "
+            "Phase 5's contact-persistence sleeper. Drop closer to "
+            "1.0 (e.g. 0.999) for longer-lasting motion; values below "
+            "~0.95 read as syrup at 60 fps.",
             CVAR_ARCHIVE);
 }  // namespace cvar
 
@@ -10170,9 +10176,14 @@ void Engine::RegisterCommands() {
         v->on_change = astro_handler("r_sky_hour_local");
     }
     // app_vsync / app_overlay_enabled / app_auto_open_console / dev_cheats:
-    // boolean toggles -- accept 0|1.
+    // boolean toggles -- accept 0|1. phys_enabled is the Phase 1
+    // physics master switch and follows the same boolean convention
+    // as r_bloom / r_hdr_pipeline (`allowed_values` so tab-completion
+    // and the cvar UI treat it as a toggle, rejecting arbitrary
+    // numeric values that would otherwise be silently accepted).
     for (const char* n : {"app_vsync", "app_overlay_enabled",
-                          "app_auto_open_console", "dev_cheats"}) {
+                          "app_auto_open_console", "dev_cheats",
+                          "phys_enabled"}) {
         if (auto* v = C.FindCVar(n)) v->allowed_values = {"0", "1"};
     }
 
@@ -11609,11 +11620,20 @@ void Engine::RegisterPhysicsCommands() {
                                pt::physics::PhysicsSystem::kMaxParticles);
                 return;
             }
-            // Pair with a fresh analytic-prim slot. Pick a visually-
-            // distinct neutral colour so the spawned sphere reads as
-            // "physics object" without colliding with the user's own
-            // prim_sphere palette.
-            const std::uint32_t prim_id = physics_next_prim_id_++;
+            // Pair with a fresh analytic-prim slot. physics_next_prim_id_
+            // starts at 100000 to stay clear of human-typed prim_sphere
+            // ids (typically single digits), but a sufficiently
+            // adventurous script can still issue `prim_sphere 100000 ...`
+            // and collide. Probe forward from the candidate until we
+            // hit an unused id so phys_drop NEVER overwrites a user-
+            // authored primitive. The bump keeps the counter monotonic
+            // so the next phys_drop starts past whatever id we landed
+            // on, and a phys_clear will only erase the id we actually
+            // claimed here (recorded via SetPrimId on the particle).
+            std::uint32_t prim_id = physics_next_prim_id_++;
+            while (primitives_.find(prim_id) != primitives_.end()) {
+                prim_id = physics_next_prim_id_++;
+            }
             AnalyticPrim p{};
             p.type        = AnalyticPrim::Sphere;
             p.material    = AnalyticPrim::Lambert;
@@ -11776,6 +11796,7 @@ void Engine::RegisterPhysicsCommands() {
                     if (prim_id != 0) vec->push_back(prim_id);
                 },
                 &prim_ids);
+<<<<<<< HEAD
             // Mirror for the rigid-body pool (Phase 2a, #138). Same
             // callback signature shape; different per-element type.
             physics_->ForEachRigidBody(
@@ -11788,6 +11809,18 @@ void Engine::RegisterPhysicsCommands() {
                 &prim_ids);
             for (auto id : prim_ids) primitives_.erase(id);
             const std::uint32_t removed = static_cast<std::uint32_t>(prim_ids.size());
+=======
+            // Count actual erases, not the gathered-id total. If the
+            // user nuked some of these prims out-of-band (via
+            // prim_remove or by re-issuing prim_sphere with the same
+            // id), std::map::erase returns 0 for those slots and the
+            // reported count would over-state what phys_clear actually
+            // did. The pool clear below handles the particle side.
+            std::uint32_t removed = 0;
+            for (auto id : prim_ids) {
+                removed += static_cast<std::uint32_t>(primitives_.erase(id));
+            }
+>>>>>>> origin/feature/physics-verlet-132
             physics_->Clear();
             if (removed > 0) {
                 primitives_dirty_ = true;
@@ -11837,8 +11870,15 @@ void Engine::StepPhysics(float dt) {
 
     // Clamp dt to a sane upper bound so a single huge frame (debugger
     // pause, swapchain hitch, window-drag stall) doesn't fling the
-    // simulation across the world. 1/30 s = 33.3 ms is the floor; a
-    // longer frame than that gets sliced into multiple physics frames.
+    // simulation across the world. 1/30 s = 33.3 ms is the ceiling --
+    // anything beyond that is discarded (NOT accumulated into a
+    // catch-up loop), so a 200 ms hitch produces 33 ms of physics
+    // motion and the rest is wall-time-only. This is the intentional
+    // Phase 1 behaviour: physics dilates during hitches rather than
+    // burning a full hitch's worth of substeps in the next frame
+    // (which could itself overrun and cascade). A proper fixed-step
+    // accumulator with carry-over lands in Phase 5 alongside the
+    // sleeper / contact-persistence work.
     float clamped_dt = dt;
     constexpr float kMaxStepSec = 1.0f / 30.0f;
     if (clamped_dt > kMaxStepSec) clamped_dt = kMaxStepSec;
