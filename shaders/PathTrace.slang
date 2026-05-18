@@ -435,6 +435,10 @@ Texture2D<float4> moon_map;
 //
 // Engine bounds the iteration count to push.smoke_params.x (host clamps
 // to kMaxSmokeEmitters=16). Phase 1: parametric drift only, no advection.
+// Phase 2 (#180): each emitter expands into a chain of `puff_count`
+// time-staggered Gaussians; per-puff age / fade / advection / radius
+// expansion live entirely in the shader, driven by push.smoke_params2
+// -- no per-emitter storage changes were needed.
 //
 // Declared AFTER reservoir_curr_buf so Metal slot lands at 15; the
 // shader's matching vk::binding is 30 (one past ReSTIR's 29). The agent
@@ -811,9 +815,16 @@ cbuffer Push {
     // smoke_params.x = smoke_count (clamped to kMaxSmokeEmitters=16)
     //             .y = smoke_enabled (0/1; r_smoke_enabled gate)
     //             .z = time_seconds for parametric drift
-    //             .w = reserved
+    //             .w = r_cloud_attenuate_background flag (57fd9ff)
     float4 smoke_params;
     // --- end Fluid Phase 1 ----------------------------------------------------
+    // --- Fluid Phase 2 (#180) -- advected emission ----------------------------
+    // smoke_params2.x = r_smoke_lifetime          (seconds, >= 0)
+    //              .y = r_smoke_advection_strength (multiplier on emitter vel)
+    //              .z = r_smoke_puff_count        (1..8, integer-as-float)
+    //              .w = r_smoke_expansion_rate    (per-second radius growth)
+    float4 smoke_params2;
+    // --- end Fluid Phase 2 ----------------------------------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -906,6 +917,8 @@ cbuffer Frame {
     uint _pad_restir1;
     // See `smoke_params` in the Metal Push cbuffer above (#136).
     float4 smoke_params;
+    // See `smoke_params2` in the Metal Push cbuffer above (#180).
+    float4 smoke_params2;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -2600,20 +2613,38 @@ LightSample sampleAnalyticLight(float3 hit_pt, float3 n_face, inout uint seed) {
 // 0 when smoke is disabled or no emitters are bound; otherwise
 // extinction units (per metre, same as the cloud field's sigma_t).
 //
-// Parametric drift: an emitter's "current position" at time t equals
-// base + velocity * t -- there is NO solver state (Phase 1 MVP per
-// issue #136). Phase 2 introduces an Eulerian grid for real advection.
+// Phase 1 baseline: each emitter is a SINGLE Gaussian whose centre
+// drifts as base + velocity * t. Reads as a translating blob.
 //
-// Falloff: density = peak * exp(-(r/radius)^falloff) -- with falloff=2
+// --- Fluid Phase 2 (#180) -- advected emission -----------------------------
+// Each emitter is now a CHAIN of `puff_count` Gaussians spaced evenly
+// across [0, r_smoke_lifetime] in age. Puff k (k in [0..P-1]) has:
+//   * age_k       = (k / max(P-1, 1)) * lifetime           (seconds)
+//   * pos_k       = base + velocity * advection_strength * age_k
+//   * radius_k    = radius * (1 + expansion_rate * age_k)
+//   * density_k   = peak * (1 - age_k / lifetime)         (linear fade)
+// The head puff (k=0, age=0) sits at the emitter mouth at full density;
+// the tail puff (k=P-1, age=lifetime) has zero density and the farthest
+// position. Result reads as a tapering, dissipating column rather than
+// a rigid translating blob.
+//
+// Fallback: when lifetime <= 0 or puff_count <= 1 the inner loop runs
+// exactly once with age=0, recovering the Phase 1 single-blob shape
+// bit-exact. This is the default-off escape hatch and what an existing
+// scene file with no Phase 2 cvars set gets out-of-the-box.
+//
+// Falloff: density_k * exp(-(r/radius_k)^falloff) -- with falloff=2
 // this is a true Gaussian; falloff=1 collapses to exp(-r/radius), a
 // steeper near-source profile; higher exponents harden the core /
 // soften the wings (useful for soot vs steam).
 //
-// Capped at 16 emitters via the kMaxSmokeEmitters constant; the host
-// further clamps via the r_smoke_max_emitters cvar. The loop is
-// `[loop]` instead of `[unroll]` because the bound is push-driven
-// (varies per dispatch); Slang's MSL backend produces tight code
-// either way at N<=16.
+// Capped at 16 emitters x 8 puffs via the kMaxSmokeEmitters / kSmokePuffMax
+// constants; the host further clamps via r_smoke_max_emitters and
+// r_smoke_puff_count. Inner puff loop is `[loop]` because the bound is
+// push-driven (varies per dispatch); Slang's MSL backend produces tight
+// code at N<=8.
+static const int kSmokePuffMax = 8;
+
 float smoke_density_add(float3 pos) {
     float smoke_on = smoke_params.y;
     if (smoke_on <= 0.0) return 0.0;
@@ -2625,6 +2656,17 @@ float smoke_density_add(float3 pos) {
     // backend has to assume an unbounded loop and emits a less-tight
     // bounds check per iteration.
     if (n > 16) n = 16;
+    // Phase 2 (#180) puff-chain parameters. Clamped on the host but
+    // re-bounded here so a runtime cvar push that arrived early can't
+    // index out of the [1..kSmokePuffMax] range. lifetime <= 0
+    // collapses the chain to a single head puff (Phase 1 fallback).
+    float lifetime   = smoke_params2.x;
+    float adv_strength = smoke_params2.y;
+    int   puff_count = int(smoke_params2.z + 0.5);
+    if (puff_count < 1) puff_count = 1;
+    if (puff_count > kSmokePuffMax) puff_count = kSmokePuffMax;
+    float expansion = max(smoke_params2.w, 0.0);
+    bool  chain     = (lifetime > 0.0) && (puff_count > 1);
     float dens = 0.0;
     [loop] for (int i = 0; i < n; ++i) {
         float4 v0 = smoke_emitters[i * 3 + 0];
@@ -2635,23 +2677,57 @@ float smoke_density_add(float3 pos) {
         float3 vel = v1.xyz;
         float  peak = v1.w;
         float  falloff = max(v2.w, 0.25);  // shaping; clamp to keep stable
-        // Parametric drift (Phase 1 MVP -- no advection).
-        float3 cur = base + vel * t;
-        float3 d = pos - cur;
-        float r2 = dot(d, d);
-        // Skip distant samples cheaply: at r = 4 sigmas the Gaussian
-        // weight is ~exp(-16) ~ 1e-7, negligible even at peak
-        // density 1.0. Saves the pow() / exp() pair on the dominant
-        // empty-space samples without changing the visual result.
-        float cutoff = 16.0 * radius * radius;
-        if (r2 > cutoff) continue;
-        float r = sqrt(r2);
-        float u = r / radius;
-        // Generalised "Gaussian": exp(-u^falloff). For falloff=2
-        // this is the canonical Gaussian; falloff=1 = exp(-u)
-        // (sharper near-source); higher values harden the core.
-        float w = exp(-pow(u, falloff));
-        dens += peak * w;
+        // Cap loop bound by puff_count when chaining; collapse to 1
+        // for the Phase 1 fallback path. Hoisting these into local
+        // scope lets the optimiser fold the early-out for the common
+        // chain=false case.
+        int    P    = chain ? puff_count : 1;
+        float  span = chain ? lifetime    : 1.0;
+        // Sweep a global phase across the lifetime so the chain itself
+        // visibly cycles forward over time -- without this, every
+        // frame samples the SAME age set (just at different drifted
+        // centres if the emitter has velocity), which is fine for a
+        // stretched static column but kills the "rising puffs"
+        // animation the user expects when watching a capture sequence.
+        // The phase wraps in [0, span/P) so neighbouring puffs leap-frog
+        // into each other's slot once per cycle, producing a continuous
+        // upward / outward flow.
+        float pstep = (P > 1) ? (span / float(P - 1)) : 0.0;
+        float t_offset = (pstep > 0.0) ? (t - pstep * floor(t / pstep)) : 0.0;
+        // Cheap early-out: bound the entire chain by the head + tail
+        // bounding sphere. Tail centre = base + vel * adv * lifetime;
+        // tail radius = radius * (1 + expansion * lifetime). Test the
+        // sample against an expanded sphere encompassing both ends --
+        // misses skip the inner loop entirely, which is the dominant
+        // empty-space case.
+        float3 tail_c   = base + vel * (adv_strength * span);
+        float  tail_r   = radius * (1.0 + expansion * span);
+        float3 mid_c    = 0.5 * (base + tail_c);
+        float  half_ext = 0.5 * length(tail_c - base) + max(radius, tail_r) * 4.0;
+        float3 md       = pos - mid_c;
+        if (dot(md, md) > half_ext * half_ext) continue;
+        [loop] for (int k = 0; k < P; ++k) {
+            float a_norm = (P > 1) ? (float(k) / float(P - 1)) : 0.0;
+            float age    = a_norm * span + t_offset;
+            if (age > span) age -= span;   // wrap-around cycle
+            // Linear density fade. peak * (1 - age/lifetime).
+            // No chain => density is just peak (Phase 1 bit-exact).
+            float a_t  = (span > 0.0) ? clamp(age / span, 0.0, 1.0) : 0.0;
+            float dfade = chain ? (1.0 - a_t) : 1.0;
+            float3 cur  = base + vel * (adv_strength * age);
+            float  rad  = radius * (1.0 + expansion * age);
+            float3 d    = pos - cur;
+            float  r2   = dot(d, d);
+            float cutoff = 16.0 * rad * rad;
+            if (r2 > cutoff) continue;
+            float r = sqrt(r2);
+            float u = r / rad;
+            // Generalised "Gaussian": exp(-u^falloff). For falloff=2
+            // this is the canonical Gaussian; falloff=1 = exp(-u)
+            // (sharper near-source); higher values harden the core.
+            float w = exp(-pow(u, falloff));
+            dens += peak * dfade * w;
+        }
     }
     return dens;
 }
@@ -2673,6 +2749,13 @@ float smoke_density_add(float3 pos) {
 // out_tint is left at float3(1) when there's no smoke contribution at
 // this sample, so a caller that lerps host_lighting * out_tint by the
 // smoke fraction stays a no-op in clear air.
+//
+// Phase 2 (#180): inner loop expands each emitter into a chain of
+// puffs; see smoke_density_add() above for the chain semantics. Tint
+// weighting accumulates density (peak * fade * gaussian) so the
+// brightest-density puff dominates the per-sample mix -- matches the
+// physical "the densest, freshest part of the plume colours the
+// transmitted radiance the most" intuition.
 float smoke_density_add_tinted(float3 pos, out float3 out_tint) {
     out_tint = float3(1.0, 1.0, 1.0);
     float smoke_on = smoke_params.y;
@@ -2681,6 +2764,13 @@ float smoke_density_add_tinted(float3 pos, out float3 out_tint) {
     if (n <= 0) return 0.0;
     float t = smoke_params.z;
     if (n > 16) n = 16;
+    float lifetime     = smoke_params2.x;
+    float adv_strength = smoke_params2.y;
+    int   puff_count   = int(smoke_params2.z + 0.5);
+    if (puff_count < 1) puff_count = 1;
+    if (puff_count > kSmokePuffMax) puff_count = kSmokePuffMax;
+    float expansion = max(smoke_params2.w, 0.0);
+    bool  chain     = (lifetime > 0.0) && (puff_count > 1);
     float  dens     = 0.0;
     float3 tint_acc = float3(0.0, 0.0, 0.0);
     [loop] for (int i = 0; i < n; ++i) {
@@ -2693,22 +2783,40 @@ float smoke_density_add_tinted(float3 pos, out float3 out_tint) {
         float  peak = v1.w;
         float3 tint = v2.xyz;
         float  falloff = max(v2.w, 0.25);
-        float3 cur = base + vel * t;
-        float3 d = pos - cur;
-        float r2 = dot(d, d);
-        float cutoff = 16.0 * radius * radius;
-        if (r2 > cutoff) continue;
-        float r = sqrt(r2);
-        float u = r / radius;
-        float w = exp(-pow(u, falloff));
-        float di = peak * w;
-        dens     += di;
-        tint_acc += di * tint;
+        int    P    = chain ? puff_count : 1;
+        float  span = chain ? lifetime    : 1.0;
+        float pstep = (P > 1) ? (span / float(P - 1)) : 0.0;
+        float t_offset = (pstep > 0.0) ? (t - pstep * floor(t / pstep)) : 0.0;
+        float3 tail_c   = base + vel * (adv_strength * span);
+        float  tail_r   = radius * (1.0 + expansion * span);
+        float3 mid_c    = 0.5 * (base + tail_c);
+        float  half_ext = 0.5 * length(tail_c - base) + max(radius, tail_r) * 4.0;
+        float3 md       = pos - mid_c;
+        if (dot(md, md) > half_ext * half_ext) continue;
+        [loop] for (int k = 0; k < P; ++k) {
+            float a_norm = (P > 1) ? (float(k) / float(P - 1)) : 0.0;
+            float age    = a_norm * span + t_offset;
+            if (age > span) age -= span;
+            float a_t   = (span > 0.0) ? clamp(age / span, 0.0, 1.0) : 0.0;
+            float dfade = chain ? (1.0 - a_t) : 1.0;
+            float3 cur  = base + vel * (adv_strength * age);
+            float  rad  = radius * (1.0 + expansion * age);
+            float3 d    = pos - cur;
+            float  r2   = dot(d, d);
+            float cutoff = 16.0 * rad * rad;
+            if (r2 > cutoff) continue;
+            float r = sqrt(r2);
+            float u = r / rad;
+            float w = exp(-pow(u, falloff));
+            float di = peak * dfade * w;
+            dens     += di;
+            tint_acc += di * tint;
+        }
     }
     if (dens > 0.0) out_tint = tint_acc / dens;
     return dens;
 }
-// --- end Fluid Phase 1 -----------------------------------------------------
+// --- end Fluid Phase 1 / Phase 2 -------------------------------------------
 
 // Optical depth through the cloud layer along [ro, ro + rd*t_max].
 // Returns 0 when clouds are off or the ray misses the layer; otherwise
