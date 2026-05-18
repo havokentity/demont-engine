@@ -2,6 +2,8 @@
 // Copyright (c) 2026 Rajesh D'Monte
 #include "MoonTexture.h"
 
+#include "../core/Tracy.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -62,6 +64,7 @@ float fbm(float x, float y, float z, int octaves) {
 }  // namespace
 
 void generateMoonTexture(int width, int height, std::vector<float>& rgba_out) {
+    PT_ZONE_SCOPED_N("moon::generateMoonTexture");
     rgba_out.assign(static_cast<std::size_t>(width) * height * 4, 0.0f);
     constexpr float kPi = 3.14159265358979323846f;
     for (int j = 0; j < height; ++j) {

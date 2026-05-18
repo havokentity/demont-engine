@@ -15,6 +15,7 @@
 #include "../core/Log.h"
 #include "../core/Memory/MemTag.h"
 #include "../core/Memory/Memory.h"
+#include "../core/Tracy.h"
 
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -2533,6 +2534,7 @@ bool VulkanDevice::BuildAccelerationStructure(
 
 AccelStructHandle VulkanDevice::CreateBLAS(const BLASDesc& d) {
     if (!rt_supported_ || d.vertex_count == 0 || d.index_count == 0) return {0};
+    PT_ZONE_SCOPED_N("VulkanDevice::CreateBLAS");
     pt::mem::TagScope scope(pt::MemTag::GpuBuffers);
 
     // Upload vertex + index data into device-local AS-input buffers.
@@ -2605,6 +2607,7 @@ AccelStructHandle VulkanDevice::CreateBLAS(const BLASDesc& d) {
 
 AccelStructHandle VulkanDevice::CreateTLAS(const TLASDesc& d) {
     if (!rt_supported_ || d.instances.empty()) return {0};
+    PT_ZONE_SCOPED_N("VulkanDevice::CreateTLAS");
     pt::mem::TagScope scope(pt::MemTag::GpuBuffers);
 
     // Build the instance buffer.
@@ -2702,6 +2705,7 @@ void VulkanDevice::DestroyAccelStruct(AccelStructHandle h) {
 // ---- Frame loop ---------------------------------------------------------
 
 FrameContext VulkanDevice::BeginFrame() {
+    PT_ZONE_SCOPED_N("VulkanDevice::BeginFrame");
     if (device_ == VK_NULL_HANDLE) return {};
 
     vkWaitForFences(device_, 1, &fence_in_flight_[current_frame_],
@@ -2763,6 +2767,7 @@ CommandBuffer* VulkanDevice::AcquireCommandBuffer() {
 }
 
 void VulkanDevice::Submit(CommandBuffer* cb) {
+    PT_ZONE_SCOPED_N("VulkanDevice::Submit");
     if (cb == nullptr || device_ == VK_NULL_HANDLE) return;
     auto* vcb = static_cast<VulkanCommandBuffer*>(cb);
     VkCommandBuffer cmd = vcb->Raw();
@@ -3102,6 +3107,7 @@ bool VulkanDevice::SupportsDenoise() const {
 }
 
 void VulkanDevice::Denoise(const DenoiseDesc& d) {
+    PT_ZONE_SCOPED_N("VulkanDevice::Denoise");
     if (device_ == VK_NULL_HANDLE) return;
     if (wrapped_cb_ == nullptr || wrapped_cb_->Raw() == VK_NULL_HANDLE) {
         // Engine called Denoise without first AcquireCommandBuffer
