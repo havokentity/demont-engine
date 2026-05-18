@@ -214,6 +214,36 @@ pt_add_test(pt_renderer_astronomy
     pt_renderer_astronomy_test.cpp
     LINK_TARGETS pt_renderer)
 
+# --- pt_renderer/HdrImage env-map CDF unit tests (issue #66) ---------------
+# Phase 3 of #47. Pins the marginal/conditional luminance-CDF builder
+# the env-map MIS sampler depends on. The CDF feeds NEE / env-map MIS
+# (`r_mis`); a wrong CDF silently biases every sky importance sample.
+#
+# The CDF construction currently lives inlined inside
+# Engine::ReloadEnvMap (src/engine/Engine.cpp ~lines 2369-2413). Until
+# it's factored into a public helper, the test file re-implements the
+# exact same algorithm (BuildEnvCdf reference) and asserts its
+# mathematical contract:
+#   - Marginal CDF is monotone non-decreasing, terminates at 1.0
+#   - Each conditional row's CDF is monotone non-decreasing, terminates
+#     at 1.0 (for lit rows) or stays at 0.0 (for dark rows)
+#   - 4x4 known greyscale image matches a hand-computed reference
+#   - Single bright pixel makes the CDF step exactly at that pixel
+#   - Zero-luminance image leaves CDFs at 0.0 with no NaN/Inf
+#   - Dark-row mixed with lit rows behaves correctly
+#   - Uniform-white image follows sin(theta) lat-long weighting
+#   - Round-trip sampling matches input distribution (chi-square, p > 0.01)
+#   - Closed-form PDF (lum * W * H / (2 pi^2 * total)) matches
+#     pixel-prob / lat-long Jacobian; degenerate guards return 0
+#     (no NaN/Inf)
+#   - Builder is deterministic across runs
+# Pure-header doctest -- no link against pt_renderer (the algorithm is
+# inlined in the test). When ReloadEnvMap's CDF builder is factored
+# into a public function, swap this test over to call that function
+# directly and delete the reference re-impl.
+pt_add_test(hdrimage_cdf
+    hdrimage_cdf_test.cpp)
+
 # ============================================================================
 # Golden-image regression matrix (issue #45)
 # ============================================================================
