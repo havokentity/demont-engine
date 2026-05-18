@@ -8734,16 +8734,28 @@ void Engine::RegisterCommands() {
     // Useful for testers running multiple golden-fixture scenes in a
     // row -- prevents the first scene's cvars from leaking into the
     // second's render state.
+    //
+    // Registered under TWO names: the verbose `cvar_reset_all` for
+    // programmatic clarity (smoke scripts, automation), and the short
+    // `defaults` for human use at the console -- the latter is what
+    // testers type before `exec tests/goldens/scenes/<scene>.cfg`
+    // when running from an IDE-launched demont that auto-loads
+    // demont.cfg (and therefore needs a runtime cvar wipe each time
+    // the scene changes).
+    auto reset_all = [](auto, pt::console::Output& out) {
+        std::size_t n = pt::console::Console::Get().ResetAllCVarsToDefaults();
+        if (n == 0) {
+            out.PrintLine("defaults: no cvars differed from default -- nothing to reset.");
+        } else {
+            out.FormatLine("defaults: reset {} cvar(s) to default. r_undo restores.", n);
+        }
+    };
     C.RegisterCommand("cvar_reset_all",
-        "Reset every cvar to its default value. One undo entry covers the whole reset.",
-        [](auto, pt::console::Output& out) {
-            std::size_t n = pt::console::Console::Get().ResetAllCVarsToDefaults();
-            if (n == 0) {
-                out.PrintLine("cvar_reset_all: no cvars differed from default -- nothing to reset.");
-            } else {
-                out.FormatLine("cvar_reset_all: reset {} cvar(s) to default. r_undo restores.", n);
-            }
-        });
+        "Reset every cvar to its default value. One undo entry covers the whole reset. Alias: defaults.",
+        reset_all);
+    C.RegisterCommand("defaults",
+        "Reset every cvar to its default value. Short alias for cvar_reset_all -- handy before `exec scene.cfg`.",
+        reset_all);
 
     C.RegisterCommand("scene_save",
         "scene_save <path.toml>: write camera + analytic primitives to a TOML file. (CSG state isn't saved yet -- put csg_* commands in autoexec.cfg if you want it to persist.)",
