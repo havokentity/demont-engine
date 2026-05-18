@@ -70,8 +70,11 @@
 //     camera-space Z by projecting onto the forward axis and compare
 //     directly. Less-than means "particle is closer" (in front).
 
-[[vk::binding(0, 0)]] RWTexture2D<float4>           hdr_inout;
-[[vk::binding(7, 0)]] RWTexture2D<float>            depth_tex;
+// vk::image_format: hdr_inout is post_denoise_hdr (RGBA16F),
+// depth_tex is R32F linear depth. See PathTrace.slang for the
+// NVIDIA Format=Unknown rationale.
+[[vk::binding(0, 0), vk::image_format("rgba16f")]] RWTexture2D<float4>           hdr_inout;
+[[vk::binding(7, 0), vk::image_format("r32f")]]    RWTexture2D<float>            depth_tex;
 [[vk::binding(20, 0)]] StructuredBuffer<float4>     particles;
 // vk::binding tags are documentation -- the MSL backend assigns Metal
 // slots in declaration order. Engine binds:

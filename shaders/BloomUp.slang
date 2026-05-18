@@ -16,8 +16,10 @@
 // tap, which is fine since the upsample runs on already-shrunken
 // mips.)
 
-[[vk::binding(0, 0)]] RWTexture2D<float4> src;
-[[vk::binding(1, 0)]] RWTexture2D<float4> dst;
+// vk::image_format("rgba16f") matches the bloom_mip texture format.
+// See BloomDown.slang for the NVIDIA Format=Unknown rationale.
+[[vk::binding(0, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> src;
+[[vk::binding(1, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> dst;
 
 // MSL slot padding -- see Tonemap.slang's notice. Aligns Push to
 // MSL buffer(7) so the engine's universal push_slot=7 contract

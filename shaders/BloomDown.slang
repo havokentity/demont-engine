@@ -25,8 +25,11 @@
 //                       at the top of the chain).
 //   slot 1 (texture) : dst -- this mip.
 
-[[vk::binding(0, 0)]] RWTexture2D<float4> src;
-[[vk::binding(1, 0)]] RWTexture2D<float4> dst;
+// vk::image_format("rgba16f") matches the bloom_mip texture format
+// the engine allocates in Engine.cpp (.format = RGBA16F). See the
+// fix-up PR for the NVIDIA Format=Unknown rationale.
+[[vk::binding(0, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> src;
+[[vk::binding(1, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> dst;
 
 // MSL slot padding -- see Tonemap.slang's notice for the full story.
 // Dummies push the Push cbuffer to MSL buffer(7), matching the

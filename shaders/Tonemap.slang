@@ -38,8 +38,16 @@
 // lands at buffer(7) for ALL kernels. Dummies referenced in a
 // runtime-conditional dead branch so Slang's optimizer keeps them.
 
-[[vk::binding(0, 0)]] RWTexture2D<float4> hdr_in;
-[[vk::binding(1, 0)]] RWTexture2D<float4> ldr_out;
+// vk::image_format qualifiers: hdr_in is the RGBA16F denoise_color
+// (the path tracer's HDR output texture for the post-denoise chain);
+// ldr_out is the BGRA8_UNORM swapchain (rgba8 in SPIR-V image-format
+// terms -- Slang/SPIR-V don't distinguish RGBA vs BGRA channel order
+// for storage-image writes). Without the qualifier Slang emits
+// Format=Unknown which NVIDIA's compiler treats as UB; see the fix-up
+// PR for the chain of upstream bugs (DXC #6153 / Slang #5969 /
+// NVIDIA driver 596.x).
+[[vk::binding(0, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> hdr_in;
+[[vk::binding(1, 0), vk::image_format("rgba8")]]   RWTexture2D<float4> ldr_out;
 // Half-res linear HDR bloom layer. The engine builds this each frame
 // via a downsample/upsample pyramid (BloomDown.slang + BloomUp.slang)
 // from the bright pixels of hdr_in. Sampled here with bilinear and
@@ -54,7 +62,7 @@
 // order regardless of the vk::binding number, so the kernel still
 // sees bloom_tex at [[texture(2)]] which matches the engine's
 // BindStorageTexture(2, ...) call.
-[[vk::binding(6, 0)]] RWTexture2D<float4> bloom_tex;
+[[vk::binding(6, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> bloom_tex;
 
 // Star-split accumulator was bound here for the EMA-based design in
 // #108. The stateless StarsComposite kernel (issue #46) runs UPSTREAM

@@ -95,9 +95,11 @@
 // variance + moments buffers; storage buffers don't count against
 // the 8-RW-texture limit on Apple Silicon compute.
 
-[[vk::binding(0, 0)]] RWTexture2D<float4> hdr_inout;
-[[vk::binding(1, 0)]] RWTexture2D<float>  depth_tex;
-[[vk::binding(2, 0)]] RWTexture2D<float4> normal_tex;
+// vk::image_format: hdr_inout RGBA16F, depth_tex R32F, normal_tex RGBA16F.
+// See PathTrace.slang for the NVIDIA Format=Unknown rationale.
+[[vk::binding(0, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> hdr_inout;
+[[vk::binding(1, 0), vk::image_format("r32f")]]    RWTexture2D<float>  depth_tex;
+[[vk::binding(2, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> normal_tex;
 [[vk::binding(3, 0)]] RWStructuredBuffer<float> shadow_vis_buf;
 
 [[vk::push_constant]]

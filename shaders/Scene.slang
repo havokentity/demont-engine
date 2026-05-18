@@ -9,7 +9,9 @@
 // storage texture at slot 0, 64 bytes of push constants at buffer 0
 // (4x float4 == camera basis + fov/aspect).
 
-[[vk::binding(0, 0)]]
+// vk::image_format("rgba8") -- swapchain target; see Clear.slang's
+// comment for the NVIDIA Format=Unknown rationale.
+[[vk::binding(0, 0), vk::image_format("rgba8")]]
 RWTexture2D<float4> output;
 
 [[vk::push_constant]]

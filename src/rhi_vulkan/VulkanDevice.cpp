@@ -758,6 +758,15 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         LOG_ERROR("Vulkan: missing shaderStorageImageRead/WriteWithoutFormat feature");
         return;
     }
+    // Engine shaders carry [[vk::image_format(...)]] qualifiers on every
+    // storage-image binding (see shaders/PathTrace.slang's top comment for
+    // the rationale -- NVIDIA 596.x silently no-op'd OpImageWrite when
+    // Slang emitted SPIR-V Format=Unknown). Enabling these features at
+    // device-creation is a defence-in-depth: it makes the without-format
+    // path spec-defined for any future shader that might forget the
+    // qualifier (instead of being driver-UB).
+    LOG_INFO("Vulkan: shaderStorageImageRead/WriteWithoutFormat features enabled "
+             "(defense-in-depth for SPIR-V image-write paths)");
     if (!supports_update_after_bind) {
         LOG_ERROR("Vulkan: UPDATE_AFTER_BIND features are required for shared descriptor-set dispatch");
         return;

@@ -34,7 +34,10 @@
 //   accent_color_rgba                  : packed 8-bit RGBA for the top hairline.
 //   graph_color_rgba                   : packed 8-bit RGBA for the sparkline.
 
-[[vk::binding(0, 0)]] RWTexture2D<float4>          out_image;
+// vk::image_format("rgba8"): out_image is the BGRA8 swapchain.
+// See PathTrace.slang's top-level comment for the NVIDIA
+// Format=Unknown rationale.
+[[vk::binding(0, 0), vk::image_format("rgba8")]] RWTexture2D<float4>          out_image;
 // Dummy at vk::binding(4) (mesh_indices in PathTrace's layout, also
 // STORAGE_BUFFER in the shared descriptor set, so the type matches).
 // Forced-emitted in a never-taken branch below; on Vulkan the read

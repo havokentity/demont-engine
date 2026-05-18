@@ -29,14 +29,17 @@
 // ping-pongs through both `variance_in` and `variance_out` slots each
 // pass.
 
-[[vk::binding(0,  0)]] RWTexture2D<float4> color_in;            // input radiance (RGBA16F)
-[[vk::binding(1,  0)]] RWTexture2D<float4> color_history_unused;// unread; host binds dummy
-[[vk::binding(2,  0)]] RWTexture2D<float>  depth_tex;           // R32F linear depth
-[[vk::binding(3,  0)]] RWTexture2D<float2> motion_unused;       // unread; host binds dummy
-[[vk::binding(4,  0)]] RWTexture2D<float4> normal_tex;          // RGBA16F world normal
-[[vk::binding(5,  0)]] RWTexture2D<float4> color_out;           // filtered radiance (RGBA16F)
-[[vk::binding(6,  0)]] RWTexture2D<float>  depth_hist_unused;   // unread; host binds anything R32F
-[[vk::binding(7,  0)]] RWTexture2D<float4> normal_hist_unused;  // unread; host binds anything RGBA16F
+// vk::image_format qualifiers below match each binding's engine-side
+// VkImage format. See PathTrace.slang's top-level comment for the
+// NVIDIA Format=Unknown bug rationale.
+[[vk::binding(0,  0), vk::image_format("rgba16f")]] RWTexture2D<float4> color_in;            // input radiance (RGBA16F)
+[[vk::binding(1,  0), vk::image_format("rgba16f")]] RWTexture2D<float4> color_history_unused;// unread; host binds dummy
+[[vk::binding(2,  0), vk::image_format("r32f")]]    RWTexture2D<float>  depth_tex;           // R32F linear depth
+[[vk::binding(3,  0), vk::image_format("rg16f")]]   RWTexture2D<float2> motion_unused;       // unread; host binds dummy
+[[vk::binding(4,  0), vk::image_format("rgba16f")]] RWTexture2D<float4> normal_tex;          // RGBA16F world normal
+[[vk::binding(5,  0), vk::image_format("rgba16f")]] RWTexture2D<float4> color_out;           // filtered radiance (RGBA16F)
+[[vk::binding(6,  0), vk::image_format("r32f")]]    RWTexture2D<float>  depth_hist_unused;   // unread; host binds anything R32F
+[[vk::binding(7,  0), vk::image_format("rgba16f")]] RWTexture2D<float4> normal_hist_unused;  // unread; host binds anything RGBA16F
 // Buffer-backed bindings start at 8. RWStructuredBuffer<T> is a storage
 // buffer in Vulkan / a device pointer in MSL; it does *not* count toward
 // Metal's 8-RW-texture compute limit. Indexing is row-major
@@ -57,7 +60,7 @@
 // albedo texture doesn't count against Metal's 8-`read_write`-texture
 // per-kernel cap.
 #ifdef PT_TARGET_SPIRV
-[[vk::binding(12, 0)]] RWTexture2D<float4> albedo_tex;
+[[vk::binding(12, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> albedo_tex;
 #else
 [[vk::binding(12, 0)]] Texture2D<float4>   albedo_tex;
 #endif

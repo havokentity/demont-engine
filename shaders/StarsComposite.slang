@@ -54,10 +54,14 @@
 // on top of foreground geometry. Without this gate the composite is an
 // unconditional additive write and stars layer onto the ground plane
 // and other surfaces.
-[[vk::binding(0, 0)]] RWTexture2D<float4> hdr_inout;
-[[vk::binding(1, 0)]] RWTexture2D<float4> star_map;
-[[vk::binding(2, 0)]] RWTexture2D<float4> moon_map;
-[[vk::binding(7, 0)]] RWTexture2D<float>  depth_tex;
+// vk::image_format qualifiers: hdr_inout is the post_denoise_hdr /
+// denoise_color RGBA16F target; star_map / moon_map are RGBA16F
+// equirectangular textures; depth_tex is R32F linear depth.
+// See PathTrace.slang for the NVIDIA Format=Unknown rationale.
+[[vk::binding(0, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> hdr_inout;
+[[vk::binding(1, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> star_map;
+[[vk::binding(2, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> moon_map;
+[[vk::binding(7, 0), vk::image_format("r32f")]]    RWTexture2D<float>  depth_tex;
 // Cloud transmittance along the camera ray, written by PathTrace's
 // volumetric march at the end of main(). 1.0 = no cloud blocking
 // (no clouds, ray misses the layer, or layer fully transparent); 0.0
@@ -73,7 +77,7 @@
 // Metal MSL assigns texture(4) by declaration order (slot 0..3 above,
 // slot 4 here). Engine binds it at engine slot 4 in the composite
 // dispatch.
-[[vk::binding(22, 0)]] RWTexture2D<float>  cloud_trans_tex;
+[[vk::binding(22, 0), vk::image_format("r32f")]] RWTexture2D<float>  cloud_trans_tex;
 
 // MSL SLOT NOTICE: this kernel binds NO buffers and NO acceleration
 // structures. Slang's MSL backend therefore assigns Push (the only

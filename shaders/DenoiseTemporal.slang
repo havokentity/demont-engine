@@ -33,14 +33,17 @@
 // three trails reset: color = noisy_now, moments = (l_now, l_now^2),
 // variance falls back to the 7x7 spatial estimate.
 
-[[vk::binding(0,  0)]] RWTexture2D<float4> color_in;            // path-tracer noisy radiance, RGBA16F
-[[vk::binding(1,  0)]] RWTexture2D<float4> color_history_in;    // prev-frame accumulated color, RGBA16F
-[[vk::binding(2,  0)]] RWTexture2D<float>  depth_tex;           // current-frame linear depth, R32F
-[[vk::binding(3,  0)]] RWTexture2D<float2> motion_tex;          // pixel-space motion (prev - curr), RG16F
-[[vk::binding(4,  0)]] RWTexture2D<float4> normal_tex;          // current-frame world-space normal, RGBA16F
-[[vk::binding(5,  0)]] RWTexture2D<float4> color_out;           // accumulated color, RGBA16F (.a = sample count)
-[[vk::binding(6,  0)]] RWTexture2D<float>  depth_history_in;    // prev-frame depth, R32F
-[[vk::binding(7,  0)]] RWTexture2D<float4> normal_history_in;   // prev-frame normal, RGBA16F
+// vk::image_format qualifiers below match each binding's engine-side
+// VkImage format. See PathTrace.slang's top-level comment for the
+// NVIDIA Format=Unknown bug rationale.
+[[vk::binding(0,  0), vk::image_format("rgba16f")]] RWTexture2D<float4> color_in;            // path-tracer noisy radiance, RGBA16F
+[[vk::binding(1,  0), vk::image_format("rgba16f")]] RWTexture2D<float4> color_history_in;    // prev-frame accumulated color, RGBA16F
+[[vk::binding(2,  0), vk::image_format("r32f")]]    RWTexture2D<float>  depth_tex;           // current-frame linear depth, R32F
+[[vk::binding(3,  0), vk::image_format("rg16f")]]   RWTexture2D<float2> motion_tex;          // pixel-space motion (prev - curr), RG16F
+[[vk::binding(4,  0), vk::image_format("rgba16f")]] RWTexture2D<float4> normal_tex;          // current-frame world-space normal, RGBA16F
+[[vk::binding(5,  0), vk::image_format("rgba16f")]] RWTexture2D<float4> color_out;           // accumulated color, RGBA16F (.a = sample count)
+[[vk::binding(6,  0), vk::image_format("r32f")]]    RWTexture2D<float>  depth_history_in;    // prev-frame depth, R32F
+[[vk::binding(7,  0), vk::image_format("rgba16f")]] RWTexture2D<float4> normal_history_in;   // prev-frame normal, RGBA16F
 // Buffer-backed bindings start at 8. Storage *buffers* don't share Metal's
 // 8-texture-with-read_write-access compute limit (we keep 8 RW textures at
 // the cap; 12 RW textures crashed slangc's MSL output). Indexing is
@@ -63,7 +66,7 @@
 // runtime `demod_enabled` push gate. Sky pixels (albedo == 0)
 // bypass the divide entirely and forward emissive radiance.
 #ifdef PT_TARGET_SPIRV
-[[vk::binding(12, 0)]] RWTexture2D<float4> albedo_tex;
+[[vk::binding(12, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> albedo_tex;
 #else
 [[vk::binding(12, 0)]] Texture2D<float4>   albedo_tex;
 #endif

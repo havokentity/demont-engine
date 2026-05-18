@@ -30,8 +30,11 @@
 // kernel cleanly separates "history that next frame divides" from
 // "radiance the rest of the engine consumes."
 
-[[vk::binding(0, 0)]] RWTexture2D<float4> demod_in;     // SVGF chain's last write, demodulated lighting (RGBA16F)
-[[vk::binding(1, 0)]] RWTexture2D<float4> color_out;    // textured radiance for bloom + tonemap (RGBA16F)
+// vk::image_format("rgba16f") on both: demod_in and color_out are
+// both RGBA16F engine textures. See PathTrace.slang for the NVIDIA
+// Format=Unknown rationale.
+[[vk::binding(0, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> demod_in;     // SVGF chain's last write, demodulated lighting (RGBA16F)
+[[vk::binding(1, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> color_out;    // textured radiance for bloom + tonemap (RGBA16F)
 // Read-only albedo binding. Vulkan binds slot 12 as STORAGE_IMAGE
 // (the texture has STORAGE_BIT only), so SPIR-V wants `RWTexture2D`
 // (Sampled=2). On Metal we keep `Texture2D` so the MSL emit is
@@ -40,7 +43,7 @@
 // the engine plumbs the same texture handle into all three passes
 // without divergent layouts.
 #ifdef PT_TARGET_SPIRV
-[[vk::binding(12, 0)]] RWTexture2D<float4> albedo_tex;
+[[vk::binding(12, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> albedo_tex;
 #else
 [[vk::binding(12, 0)]] Texture2D<float4>   albedo_tex;
 #endif
