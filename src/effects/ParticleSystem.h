@@ -50,8 +50,12 @@
 
 #include <glm/glm.hpp>
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <random>
+#include <thread>
 #include <vector>
 
 namespace pt::effects {
@@ -109,13 +113,17 @@ struct ContinuousEmitter {
 class ParticleSystem {
 public:
     ParticleSystem();
-    ~ParticleSystem() = default;
+    ~ParticleSystem();
 
-    // No copies (RNG state + vector are owned). Move is fine.
+    // No copies (RNG state + vector are owned). Move is disabled because
+    // the worker thread (`worker_`) holds a pointer back to *this; moving
+    // the system out from under its own thread would dangle that pointer.
+    // The engine owns ParticleSystem via std::unique_ptr so no copy/move
+    // is actually exercised in practice.
     ParticleSystem(const ParticleSystem&)            = delete;
     ParticleSystem& operator=(const ParticleSystem&) = delete;
-    ParticleSystem(ParticleSystem&&)                 = default;
-    ParticleSystem& operator=(ParticleSystem&&)      = default;
+    ParticleSystem(ParticleSystem&&)                 = delete;
+    ParticleSystem& operator=(ParticleSystem&&)      = delete;
 
     // Set the cap on live particles. Anything past the cap is dropped
     // on spawn. The default (1024) is set in the constructor; the
@@ -123,32 +131,78 @@ public:
     // change. Going BELOW the current live count doesn't truncate
     // existing particles -- new spawns just stop until naturals age
     // out, keeping the cap a soft ceiling under load.
-    void SetMaxParticles(std::uint32_t max) noexcept { max_particles_ = max; }
+    //
+    // Threading: blocks until the async tick (if any) finishes before
+    // mutating max_particles_, so mid-frame cvar changes can't race the
+    // worker thread reading the cap inside EmitBurst().
+    void SetMaxParticles(std::uint32_t max);
     std::uint32_t MaxParticles() const noexcept { return max_particles_; }
 
     // Live particle accessors. Used by the engine to build the GPU
     // upload payload each frame. The vector is contiguous (no holes
     // mid-array); dead particles are compacted-out inside Update().
-    const std::vector<Particle>& Particles() const noexcept { return particles_; }
-    std::uint32_t LiveCount() const noexcept {
+    //
+    // Threading: both block until the async tick finishes so the caller
+    // sees a coherent particle field. The engine calls Particles() once
+    // per frame from the render path, which is exactly the join point
+    // we want; console commands also use these accessors and block the
+    // same way (their cost is invisible -- the worker has long finished
+    // by the time a user types a command).
+    const std::vector<Particle>& Particles() const {
+        WaitForTick();
+        return particles_;
+    }
+    std::uint32_t LiveCount() const {
+        WaitForTick();
         return static_cast<std::uint32_t>(particles_.size());
     }
 
-    // Drive the integrator forward by `dt` seconds. dt is internally
-    // clamped to <= 1/30 s so a hitched main loop doesn't fling
-    // particles across the world (per the header comment block).
+    // Synchronous tick. Kicks the worker and blocks until it finishes.
+    // Kept for tests + any caller that wants the old single-threaded
+    // semantics; the engine's hot path uses TickAsync + WaitForTick
+    // instead so the sim overlaps the rest of the frame's CPU work.
+    //
+    // Internally clamps dt to <= 1/30 s so a hitched main loop doesn't
+    // fling particles across the world (per the header comment block).
     // Steps:
     //   1. Tick continuous emitters; spawn N = floor(rate*dt + acc).
     //   2. Integrate positions: vel += gravity*dt; pos += vel*dt;
     //      vel *= exp(-drag*dt) (analytic-decay linear drag).
     //   3. Lerp color + size from spawn -> end values by t = age/lifetime.
     //   4. Compact -- erase particles with age >= lifetime.
-    void Update(float dt);
+    void Update(float dt) {
+        TickAsync(dt);
+        WaitForTick();
+    }
+
+    // Post an integrator step to the persistent worker thread and
+    // return immediately. The engine kicks this at frame-start so the
+    // CPU sim overlaps physics + render-command-building. The dt is
+    // snapshotted inside the call so the caller is free to mutate the
+    // float afterward; the worker reads the snapshot, not the caller's
+    // variable.
+    //
+    // PRE-CONDITION: any prior TickAsync must have been waited on (the
+    // engine's WaitForTick before reading Particles() satisfies this).
+    // Calling TickAsync twice without a wait will block on the prior
+    // tick to make the misuse harmless rather than corrupt the vector.
+    void TickAsync(float dt);
+
+    // Block until the most recently posted TickAsync finishes. Idempotent
+    // and cheap to call after the worker is already idle -- the implementation
+    // reads an atomic flag and only enters the condition-variable wait
+    // when the tick is in flight. Called automatically by Particles(),
+    // LiveCount(), SetMaxParticles(), EmitBurst(), StartContinuous(),
+    // StopContinuous(), and Clear() so external callers usually don't
+    // need to touch it.
+    void WaitForTick() const;
 
     // One-shot burst spawn. Used by `particle_emit smoke <x> <y> <z>`
     // and `particle_emit spark <x> <y> <z>` console commands. Up to
     // `spec.count` particles are created subject to the live cap;
     // returns how many actually landed.
+    //
+    // Threading: waits for the async tick before mutating particles_.
     std::uint32_t EmitBurst(const EmitSpec& spec);
 
     // Start a continuous emitter. The MVP supports one slot per preset
@@ -162,7 +216,7 @@ public:
     std::uint32_t StopContinuous(const char* name);
     // Clear all live particles and stop every continuous emitter.
     // Used by the `particle_clear` console command.
-    void Clear() noexcept;
+    void Clear();
 
     // Preset builders. Each returns an EmitSpec the caller can hand to
     // EmitBurst (smoke / spark) or StartContinuous (snow). Centralized
@@ -184,6 +238,15 @@ public:
     static EmitSpec PresetSnow(const glm::vec3& centre);
 
 private:
+    // The actual integrator. Runs on `worker_` when posted via TickAsync
+    // and inline when called from EmitBurst (because the spawn path needs
+    // the same emitter pump). All callers are serialised by `tick_in_flight_`
+    // and the start/done condition variable so there's no need for a mutex
+    // around particles_ / emitters_ themselves.
+    void UpdateLocked(float dt);
+
+    void WorkerLoop();
+
     std::vector<Particle>             particles_;
     std::vector<ContinuousEmitter>    emitters_;
     std::uint32_t                     max_particles_ = 1024;
@@ -199,6 +262,26 @@ private:
     // exposed because callers would want a different distribution
     // (Gaussian, anisotropic ...) in nearly every other use.
     float Uniform11();
+
+    // ---- Worker thread plumbing -----------------------------------------
+    //
+    // One persistent thread per ParticleSystem. The engine creates a
+    // single ParticleSystem so there's exactly one worker for the
+    // lifetime of the process. Sized for "one CPU job per frame": when
+    // the worker is idle it parks on the cv; when the main thread calls
+    // TickAsync() it sets pending_dt_, flips tick_in_flight_ = true,
+    // and notifies; the worker wakes, runs UpdateLocked(pending_dt_),
+    // flips tick_in_flight_ = false, notifies waiters.
+    //
+    // shutdown_ is the worker's poison pill; dtor flips it true and
+    // notifies so the worker can fall out of the cv wait and exit.
+    mutable std::mutex              tick_mtx_;
+    mutable std::condition_variable tick_cv_;
+    std::atomic<bool>               tick_in_flight_{false};
+    bool                            tick_requested_  = false;  // guarded by tick_mtx_
+    float                           pending_dt_      = 0.0f;   // guarded by tick_mtx_
+    bool                            shutdown_        = false;  // guarded by tick_mtx_
+    std::thread                     worker_;
 };
 
 }  // namespace pt::effects

@@ -8100,6 +8100,15 @@ void Engine::Tick(double dt) {
     // regardless of r_particles so a user toggling the master flag back
     // on doesn't see stale particles snap back into existence; instead
     // particles age naturally even while the composite kernel is off.
+    //
+    // Threading (perf/particles-async-tick): we kick the integrator on
+    // the ParticleSystem's persistent worker thread via TickAsync and
+    // let it overlap StepPhysics + the rest of the per-frame CPU work.
+    // The render path waits on the result via particles_->Particles()
+    // (which calls WaitForTick internally) before reading the live
+    // vector for upload. The MVP integrator is short (~tens of us at
+    // the 1024-particle cap) but the overlap is free correctness-wise
+    // and a no-op on platforms where the worker would otherwise idle.
     if (particles_) {
         auto& Cp = pt::console::Console::Get();
         if (auto* mv = Cp.FindCVar("r_particles_max")) {
@@ -8108,7 +8117,7 @@ void Engine::Tick(double dt) {
             if (m > 65536) m = 65536;
             particles_->SetMaxParticles(static_cast<std::uint32_t>(m));
         }
-        particles_->Update(static_cast<float>(dt));
+        particles_->TickAsync(static_cast<float>(dt));
     }
 
     // Physics step (#132): runs after UpdateCamera and before RenderFrame
