@@ -34,6 +34,87 @@ ParticleSystem::ParticleSystem()
     // Only one continuous slot in MVP (snow). Reserving avoids the
     // single allocation on first StartContinuous.
     emitters_.reserve(4);
+
+    // Spawn the persistent worker LAST so the member state above is
+    // fully initialised before the thread can observe it. The worker
+    // immediately parks on tick_cv_ until the first TickAsync call.
+    worker_ = std::thread(&ParticleSystem::WorkerLoop, this);
+}
+
+ParticleSystem::~ParticleSystem() {
+    // Drain any in-flight tick first so the worker is in its cv-wait
+    // when we set the poison pill -- otherwise we could miss the
+    // shutdown notify and hang in join().
+    WaitForTick();
+    {
+        std::lock_guard<std::mutex> lk(tick_mtx_);
+        shutdown_ = true;
+    }
+    tick_cv_.notify_all();
+    if (worker_.joinable()) worker_.join();
+}
+
+void ParticleSystem::WorkerLoop() {
+    for (;;) {
+        float dt = 0.0f;
+        {
+            std::unique_lock<std::mutex> lk(tick_mtx_);
+            // Park until either a tick is requested or we're being
+            // torn down. Spurious wakes fall back into the wait via
+            // the predicate.
+            tick_cv_.wait(lk, [this] { return tick_requested_ || shutdown_; });
+            if (shutdown_) return;
+            dt = pending_dt_;
+            tick_requested_ = false;
+        }
+
+        UpdateLocked(dt);
+
+        {
+            std::lock_guard<std::mutex> lk(tick_mtx_);
+            tick_in_flight_.store(false, std::memory_order_release);
+        }
+        // Wake every thread that called WaitForTick(); cheap when no
+        // one is waiting because notify_all on an empty cv is O(1).
+        tick_cv_.notify_all();
+    }
+}
+
+void ParticleSystem::TickAsync(float dt) {
+    // If a prior tick is still running we MUST wait before queuing the
+    // next one, otherwise pending_dt_ would be overwritten mid-tick and
+    // particles_ would be mutated concurrently with the engine's read.
+    // In normal operation the engine waits between frames so this is
+    // a no-op; the defensive wait keeps misuse from corrupting state.
+    WaitForTick();
+
+    {
+        std::lock_guard<std::mutex> lk(tick_mtx_);
+        pending_dt_     = dt;
+        tick_requested_ = true;
+        tick_in_flight_.store(true, std::memory_order_release);
+    }
+    tick_cv_.notify_one();
+}
+
+void ParticleSystem::WaitForTick() const {
+    // Fast path: no tick in flight -> skip the lock entirely. The
+    // acquire-load synchronises with the release-store in WorkerLoop
+    // so by the time tick_in_flight_ reads false the particle field
+    // is fully published.
+    if (!tick_in_flight_.load(std::memory_order_acquire)) return;
+    std::unique_lock<std::mutex> lk(tick_mtx_);
+    tick_cv_.wait(lk, [this] {
+        return !tick_in_flight_.load(std::memory_order_acquire);
+    });
+}
+
+void ParticleSystem::SetMaxParticles(std::uint32_t max) {
+    // Worker reads max_particles_ from inside EmitBurst (called by
+    // UpdateLocked). Wait before mutating so we don't tear the cap
+    // mid-tick.
+    WaitForTick();
+    max_particles_ = max;
 }
 
 float ParticleSystem::Uniform11() {
@@ -41,7 +122,7 @@ float ParticleSystem::Uniform11() {
     return d(rng_);
 }
 
-void ParticleSystem::Update(float dt) {
+void ParticleSystem::UpdateLocked(float dt) {
     // Step 0: clamp dt. See the kMaxTimestep comment above.
     if (dt <= 0.0f) return;
     if (dt > kMaxTimestep) dt = kMaxTimestep;
@@ -112,6 +193,13 @@ void ParticleSystem::Update(float dt) {
 }
 
 std::uint32_t ParticleSystem::EmitBurst(const EmitSpec& spec) {
+    // EmitBurst is re-entered from UpdateLocked (the continuous-emitter
+    // pump calls it inline). We can't WaitForTick() in that case because
+    // we ARE the tick. The atomic flag tells us which call-site we're on:
+    // when set, the worker is mid-tick and our caller is UpdateLocked;
+    // when clear, we're being called from the main thread (console
+    // command) and must wait so we don't race the worker.
+    if (!tick_in_flight_.load(std::memory_order_acquire)) WaitForTick();
     if (spec.count == 0) return 0;
     const std::uint32_t cap    = max_particles_;
     const std::uint32_t live   = static_cast<std::uint32_t>(particles_.size());
@@ -172,6 +260,7 @@ std::uint32_t ParticleSystem::EmitBurst(const EmitSpec& spec) {
 
 void ParticleSystem::StartContinuous(const char* name, const EmitSpec& spec,
                                      float rate) {
+    WaitForTick();  // emitters_ is mutated; worker reads it inside UpdateLocked
     // Hash on name only because the MVP has at most one continuous
     // emitter at a time. We linearly scan; with N <= 4 there's no
     // payoff in moving to a map.
@@ -200,6 +289,7 @@ void ParticleSystem::StartContinuous(const char* name, const EmitSpec& spec,
 }
 
 std::uint32_t ParticleSystem::StopContinuous(const char* /*name*/) {
+    WaitForTick();
     // MVP: stop every continuous emitter unconditionally. A real
     // named-slot map is a follow-up.
     std::uint32_t n = 0;
@@ -209,7 +299,8 @@ std::uint32_t ParticleSystem::StopContinuous(const char* /*name*/) {
     return n;
 }
 
-void ParticleSystem::Clear() noexcept {
+void ParticleSystem::Clear() {
+    WaitForTick();
     particles_.clear();
     emitters_.clear();
 }
