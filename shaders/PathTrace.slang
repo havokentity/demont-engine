@@ -638,14 +638,17 @@ cbuffer Push {
     //        a push-constant reshuffle.
     //   .w = sdf_fractal_iters -- Phase 3, per-DE bounded iteration
     //        count for fractal SDFs. Independent of .y. Clamped 1..32
-    //        on host.
+    //        on host. (Phase 2's sdf_normal_mode toggle lives at
+    //        sdf_params_f.w because Phase 3 claimed this slot first.)
     uint4 sdf_params;
     // .x = r_sdf_epsilon (sphere-trace surface-distance terminator,
     //      metres). Default 1e-4.
     // .y = r_sdf_fractal_power (Phase 3, default Mandelbulb power 8).
     // .z = r_sdf_de_eps_scale (Phase 3, iteration-relaxed eps scale,
     //      default 1.0).
-    // .w reserved.
+    // .w = r_sdf_normal_mode (Phase 2 #98; encoded as float because
+    //      Phase 3 claimed sdf_params.w first). 0.0 = forward-mode AD,
+    //      1.0 = 6-tap central differences.
     float4 sdf_params_f;
     // --- end SDF Phase 1 + Phase 3 -----------------------------------------
     // Celestials composite gate (issue #46). 1 = subtract
@@ -960,6 +963,10 @@ void traceSdfClusters(float3 ro, float3 rd, inout HitInfo h) {
     float fractal_power    = sdf_params_f.y;
     float fractal_de_eps_s = sdf_params_f.z;
     // --- end SDF Phase 3 ---------------------------------------------------
+    // Phase 2 (#98): r_sdf_normal_mode now lives at sdf_params_f.w because
+    // Phase 3 (#99) claimed sdf_params.w first. Encoded as float (0.0 = forward
+    // AD, 1.0 = central differences); the > 0.5 test resolves the toggle.
+    uint  normal_mode = (sdf_params_f.w > 0.5f) ? 1u : 0u;
     for (uint i = 0u; i < count; ++i) {
         SdfCluster c = loadSdfCluster(i);
         float t;
@@ -1008,7 +1015,8 @@ void traceSdfClusters(float3 ro, float3 rd, inout HitInfo h) {
         // t_min = 1e-3 keeps the start past the camera plane;
         // t_max = h.t bounds the trace to the current closest hit so
         // an SDF cluster behind an existing closer hit short-circuits.
-        if (sdfClusterTrace(c, ro, rd, 1e-3, h.t, iter_budget, epsilon, t, n)) {
+        if (sdfClusterTrace(c, ro, rd, 1e-3, h.t, iter_budget, epsilon,
+                            normal_mode, t, n)) {
             if (t < h.t) {
                 h.hit       = true;
                 h.t         = t;
