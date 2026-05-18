@@ -974,12 +974,17 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     if (rt_supported_) {
         psizes.push_back({ VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, kTotalSets * 1 + 1 });
     }
-    // 11 storage-buffer bindings per dispatch: mesh_positions, mesh_indices,
+    // 13 storage-buffer bindings per dispatch: mesh_positions, mesh_indices,
     // primitives, marginal_cdf, conditional_cdf, exposure_state, analytic
     // bvh_nodes (binding 18), tri_bvh_nodes (binding 19),
     // tri_bvh_permuted_ids (binding 20), sdf_clusters (binding 21),
-    // shadow_vis_buf (binding 23, issue #115).
-    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 11 + 4 });
+    // shadow_vis_buf (binding 23, issue #115), light_prims (binding 27,
+    // #73), light_tree_nodes (binding 28, #129). +8 slack for the next
+    // few additions before we have to bump again -- MoltenVK silently
+    // ignored the prior undersize, but native NVIDIA Vulkan correctly
+    // returns VK_ERROR_OUT_OF_POOL_MEMORY (Win-RTX caught the gap as
+    // 576-requested vs 532-sized after #115 + #73 + #129 landed).
+    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 13 + 8 });
     psizes.push_back({ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,          kTotalSets * 1 + 1 });
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
