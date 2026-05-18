@@ -241,10 +241,15 @@ float deApollonian(float3 p_local, float scale, uint iters) {
 //   APOLLONIAN : params.x = scale (radial-shrink magnitude, default 1.3)
 //                params.y = effective bound radius (default 2.0)
 //
-// `power_default` and `iters_default` are the cvar values
-// (r_sdf_fractal_power, r_sdf_fractal_iters) -- the per-shape
-// `params.x` overrides them when non-zero so the cfg author can hold
-// one fractal at power 8 while sweeping another at power 6.
+// `power_default` is the r_sdf_fractal_power cvar and ONLY applies to
+// MANDELBULB -- "power" and "scale" are different DE parameters, so
+// there's no useful single global default for Mandelbox/Apollonian.
+// Their `params.x == 0` falls back to the canonical hardcoded values
+// (2.5 for Mandelbox, 1.3 for Apollonian) instead of the cvar. This
+// matches the AnalyticBvh.h SdfShape contract; keep host docs and
+// shader fallback in lockstep when editing either side.
+// `iters_default` is r_sdf_fractal_iters; it applies to all three
+// shapes since iteration count is the same concept everywhere.
 float evalFractalDist(float3 p_local, uint shape, float4 params,
                        float power_default, uint iters_default) {
     if (shape == SDF_SHAPE_MANDELBULB) {

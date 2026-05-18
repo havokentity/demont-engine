@@ -7533,6 +7533,18 @@ void Engine::RegisterCommands() {
             v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
         }
     }
+    // SDF Phase 3 (#99) fractal tuning cvars: every change reshapes the
+    // fractal DE (different power -> different bulb topology, different
+    // iter count -> different gasket depth, different eps-scale ->
+    // different surface band) so any history accumulation is stale
+    // immediately. Reset accum_dirty_ on change so the denoiser/EMA
+    // doesn't smear the old shape into the new while the user tunes.
+    for (const char* n : {"r_sdf_fractal_power", "r_sdf_fractal_iters",
+                          "r_sdf_de_eps_scale"}) {
+        if (auto* v = C.FindCVar(n)) {
+            v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+        }
+    }
     // Cloud preset: when set, snap the individual cloud cvars to the
     // preset's parameter set. The user can then nudge individual values
     // without changing the preset name (or set it to "custom" to lock).
@@ -8786,9 +8798,13 @@ void Engine::RegisterSdfCommands() {
                 out.PrintLine("sdf_mandelbox: arg parse failed");
                 return;
             }
-            // scale=0 maps to the r_sdf_fractal_power cvar fallback;
-            // negative is meaningless (the linear-step magnitude has
-            // to be a positive contraction for the DE to terminate).
+            // scale=0 maps to the canonical Mandelbox scale (2.5)
+            // hardcoded in the shader's evalFractalDist. The
+            // r_sdf_fractal_power cvar only applies to Mandelbulb;
+            // Mandelbox's "scale" is a different DE parameter (linear-
+            // step magnitude, not polar power). Negative is meaningless
+            // -- the linear-step magnitude has to be a positive
+            // contraction for the DE to terminate.
             if (scale < 0.0f) {
                 out.FormatLine("sdf_mandelbox: scale must be >= 0 (got {})", scale);
                 return;
