@@ -904,13 +904,31 @@ ctest --test-dir build/mac-release -R pt_math --output-on-failure
 
 ## Known issues to be aware of while testing
 
-- **cornell_csg on Vulkan-RTX (NVIDIA RTX 5090 / driver 596.36 / SDK 1.4.341.1):**
-  renders all-black despite PR #165's storage-image hygiene fix. Root
-  cause is suspected NVIDIA-side compiler / driver behaviour rather
-  than engine code. Smoke runs will now exit code 2 with
-  `VK_ERROR_DEVICE_LOST` in the log (per PR #166) rather than silently
-  writing zero pixels and reporting success. Tracking under separate
-  investigation; not a blocker for Mac integration testing.
+- **Vulkan-RTX on NVIDIA driver 596.36 with SDF Phase 2 features ENABLED:**
+  setting `-DPT_SDF_PROCEDURAL_OPS=ON` and/or `-DPT_SDF_AUTODIFF=ON`
+  re-introduces a GPU hang (`VK_ERROR_DEVICE_LOST`) on RTX hardware.
+  The 862 lines of Slang autodiff (`Dual3`) + procedural-SDF helpers
+  added by PR #151 emit SPIR-V that NVIDIA's SASS JIT cannot compile
+  even when the new code is unreachable at runtime. The default build
+  (both gates OFF) is unaffected -- cornell_csg + 5 other test scenes
+  verified rendering correctly on Win-RTX integration HEAD 842df2e.
+  Mac-MoltenVK runs the same shader either way (Apple's translation
+  layer routes around the offending construct). When SDF Phase 2 needs
+  to be exercised, use Mac-Metal or Mac-Vulkan-software-RT for now;
+  fixing the underlying SPIR-V emission requires an in-file bisect of
+  `shaders/SdfPrimitives.slang` to find the offending Slang construct
+  (suspected candidates: `Dual3` autodiff codegen or `sdfWorley3` 3x3x3
+  nested-loop pattern). Deferred to a future wave.
+- **cornell_csg on Vulkan-RTX FIXED** (was broken pre-PR-#169 with
+  all-black DEVICE_LOST). PR #169's SDF gate (default OFF) excises
+  the SPIR-V construct that hung NVIDIA's SASS JIT; all 6 sampled
+  scenes (cornell_csg, procedural_evening, aurora_smoke, sdf_smin_row,
+  light_primitives_smoke, light_tree_200_pts) now render with zero
+  DEVICE_LOST on RTX 5090 + driver 596.36 + Vulkan SDK 1.4.341.1.
+  Win bisect localised the cause to PR #151 SDF Phase 2 commit
+  `d07a264`; PR #169's compile gate happened to wrap exactly that
+  code and is the canonical fix for both the perf regression AND
+  the Vulkan-RTX hang.
 - **Mac-Vulkan is freshly stable** as of this batch (memory:
   `Mac Vulkan was untested before 2026-05-16`). Treat any Mac-Vulkan
   regression vs Mac-Metal as a load-bearing finding -- this is the
@@ -932,25 +950,74 @@ ctest --test-dir build/mac-release -R pt_math --output-on-failure
   the OBB — boxes fall and roll but never lie flat, and may clip into
   each other. Phase 2b will land box-box / box-plane SAT.
 
-## Known incoming work (not in this batch — will land before integration → main)
+## All-in: work that landed after the initial guide commit
 
-The following items are NOT in this batch but are expected to land on
-`integration/parallel-batch-1` before the consolidated merge into main:
+The first version of this guide was written at integration HEAD
+`6a161b5`. The following items landed afterward and are part of the
+final integration HEAD (`842df2e`) that goes into main:
 
-- **Win's bake-race fix** — race condition between CSG bake completion
-  and the first frame's prim-upload, surfacing on Win-Vulkan.
-- **Win's BLAS scratch alignment fix** — minAccelerationStructureScratchOffsetAlignment
-  honouring at BLAS build time.
-- **Three perf-fix follow-ups** — megakernel-split-light-tree,
-  megakernel-gate-sdf-autodiff, megakernel-gate-water. These trim
-  the path-tracer megakernel by lifting infrequently-active code paths
-  behind dispatch-time gates so the steady-state shader stays cheap.
+- **Win's bake-race fix (PR #167, commit `d527383`)** — closes the
+  race between the asynchronous CSG bake state machine and the first
+  frame's PathTrace dispatch. The bake pipeline now gates the
+  loading-screen exit on `bake_phase_` completion; frame 1 cannot
+  dispatch the path tracer against uninitialised csg_vbuf / csg_ibuf
+  / tri_bvh_nodes buffers anymore. Manifested as a Vulkan-RTX
+  DEVICE_LOST on NVIDIA but is a latent race on all backends.
+- **Parser fix (commit `4b1345c`) + `//` semantic alignment
+  (commit `8a09752`)** — `ExecuteScript` no longer splits at `;`
+  inside `#` / `//` comments or inside quoted strings. Fixes the
+  smoke-runner rc=8 failure on the golden-image matrix where
+  fixture comments containing semicolons (e.g.
+  `# (golden-hour, not yet twilight; civil twilight is sun 0 to -6)`)
+  were tokenised into a bogus `civil twilight ...` statement.
+- **Cvar reset feature (commits `1e9f3ec` + `ccb08a4`)** — new
+  `cvar_reset_all` console command + short `defaults` alias + new
+  `--no-cfg` CLI flag (skips demont.cfg + autoexec.cfg load on
+  startup). Lets testers running from an IDE wipe persisted cvar
+  state before exec'ing a golden-fixture scene without manually
+  moving demont.cfg out of the way. Recommended interactive
+  workflow:
+  ```
+  > defaults
+  > exec tests/goldens/scenes/cornell_csg.cfg
+  ```
+- **Three megakernel-gate PRs (commits `96a257c` + `a9e56ed` +
+  `842df2e`):**
+  - PR #168 (water gate, `96a257c`) — `PT_WATER_ENABLED` default
+    OFF, excises MAT_WATER BRDF + 8-noise-tap wave-normal helper.
+    Recovers -2.99 ms/frame on water-less scenes.
+  - PR #169 (SDF Phase 2 gate, `a9e56ed`) — `PT_SDF_PROCEDURAL_OPS`
+    + `PT_SDF_AUTODIFF` default OFF, excises the 862 LoC procedural
+    + Dual3 autodiff helpers from `SdfPrimitives.slang`. Recovers
+    -8.11 ms/frame AND closes the Vulkan-RTX hang (see Known issues
+    above for the open SDF-Phase-2-ON-NVIDIA caveat).
+  - PR #170 (light-tree gate, `842df2e`) — `PT_LIGHT_TREE` default
+    ON; OFF strips ~9 KB of SPIR-V but no measurable perf delta on
+    the default light_count=0 scene (Apple Metal already DCE's the
+    dead branch; the +7.67 ms attribution per-commit walk gave PR
+    #154 is a misattribution, the cost lives in CPU-side per-frame
+    work or descriptor-binding overhead that this PR doesn't touch).
+    Structural cleanup + templates the per-feature compile-gate
+    pattern.
+
+Total perf recovery (Mac-Metal default scene, 300 warmup + 3000
+measurement, two-point):
+- Main baseline: 8.18 ms/frame (122 fps)
+- Integration HEAD pre-fix: 22.62 ms/frame (44 fps)
+- Integration HEAD post-fix (`842df2e`, all gates default): ~11.5
+  ms/frame (~86 fps)
+- Remaining gap vs main: ~3 ms/frame (~36 fps). Cause unknown;
+  follow-up investigation queued.
 
 ## How this guide was generated
 
+Original compile was at integration HEAD `6a161b5`. Updated for HEAD
+`842df2e` (final-batch HEAD: includes Win's bake-race fix, parser
+fix-ups, cvar-reset feature, and three megakernel-gate PRs that close
+the Vulkan-RTX wedge + recover most of the perf regression).
+
 Compiled from PR descriptions and cvar registrations on
-`integration/parallel-batch-1` at HEAD `6a161b5`. To regenerate after
-new PRs land:
+`integration/parallel-batch-1`. To regenerate after new PRs land:
 
 ```
 # 1. List merged PRs and their bodies:
