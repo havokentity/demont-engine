@@ -395,80 +395,67 @@ TEST_CASE("smart resolve: unique prefix returns canonical + log line in Execute"
     CHECK(er.output.find("test_ux_sr_uniq_payload") != std::string::npos);
 }
 
-TEST_CASE("smart resolve: ambiguous prefix auto-picks top of list + lists alternates") {
+TEST_CASE("smart resolve: top of list = ScoreMatch's top-ranked candidate") {
     auto& C = pt::console::Console::Get();
-    // Two cvars sharing the same prefix. The resolver auto-picks the
-    // alphabetically-first cvar (top-of-list rule) and surfaces the
-    // alternates in the log line, instead of erroring on the user.
+    // Multiple cvars share the same prefix. The resolver delegates to
+    // ScoreMatch (same scorer the autocomplete listing uses) so the
+    // listing and Execute agree on what "top option" means by
+    // construction. User feedback: "if it's the top option in the
+    // list, that's the one which should execute, get it?"
     //
-    // Pre-PR-NNN behaviour: ambiguous returned an error and the user
-    // had to type more characters to disambiguate. User feedback was
-    // "if it's the top option in the list, that's the one which
-    // should execute, get it?" -- so the resolver now follows
-    // bash-tab-completion-style: first-cycle takes the alphabetical
-    // first; if the user wanted something further down the list,
-    // they type more chars.
-    C.RegisterCVar("test_ux_sr_amb_alpha", "1", "amb a", pt::console::CVAR_NONE);
-    C.RegisterCVar("test_ux_sr_amb_beta",  "2", "amb b", pt::console::CVAR_NONE);
+    // ScoreMatch's PREFIX tiebreak rewards tightness (shorter names
+    // score higher for the same query). So among equal-prefix matches,
+    // the SHORTER cvar name wins (it's "tighter" -- the query covers
+    // more of the canonical name). Equal tightness falls back to
+    // length-ascending then alphabetical.
+    C.RegisterCVar("test_ux_sr_topscore_long_name",  "1", "longer", pt::console::CVAR_NONE);
+    C.RegisterCVar("test_ux_sr_topscore_short",      "2", "shorter -- highest tightness", pt::console::CVAR_NONE);
 
-    auto r = C.ResolveCommand("test_ux_sr_amb_");
-    // Top-of-list = alphabetically-first cvar match.
-    CHECK(r.canonical_name == "test_ux_sr_amb_alpha");
+    auto r = C.ResolveCommand("test_ux_sr_topscore_");
+    // shorter name -> higher tightness -> wins (listing UI shows
+    // it on top too; Execute picks it -- agreement by construction).
+    CHECK(r.canonical_name == "test_ux_sr_topscore_short");
     CHECK_FALSE(r.is_exact_match);
-    // ambiguous_matches still populated for transparency.
     CHECK(r.ambiguous_matches.size() >= 2);
+    CHECK(r.ambiguous_matches.front() == "test_ux_sr_topscore_short");
 
-    // Execute now succeeds (auto-resolves to alpha) and the resolution
-    // log mentions "top of N matches" so the user knows what happened.
-    auto er = C.Execute("test_ux_sr_amb_ 3");
+    // Execute auto-resolves + logs "top of N" with alternates surfaced.
+    auto er = C.Execute("test_ux_sr_topscore_ 5");
     CHECK(er.ok);
     CHECK(er.output.find("top of") != std::string::npos);
-    CHECK(er.output.find("test_ux_sr_amb_alpha") != std::string::npos);
-    // Beta should appear as an alternate in the log, not as a resolution target.
-    CHECK(er.output.find("test_ux_sr_amb_beta") != std::string::npos);
-    // alpha got set to "3", beta is untouched.
-    auto* alpha = C.FindCVar("test_ux_sr_amb_alpha");
-    auto* beta  = C.FindCVar("test_ux_sr_amb_beta");
-    REQUIRE(alpha != nullptr);
-    REQUIRE(beta  != nullptr);
-    CHECK(alpha->value == "3");
-    CHECK(beta->value  == "2");  // unchanged
+    auto* picked = C.FindCVar("test_ux_sr_topscore_short");
+    REQUIRE(picked != nullptr);
+    CHECK(picked->value == "5");
 }
 
-TEST_CASE("smart resolve: plural-strip relaxation -- `perfs` finds `perf_overlay`") {
+TEST_CASE("smart resolve: trailing `s` is a fuzzy-match char (`perfs` -> `perf_overlay_scale`)") {
     auto& C = pt::console::Console::Get();
-    // English-plural shorthand: a user typing `perfs` (intending
-    // shorthand for the `perf` family) should resolve to the
-    // alphabetically-first `r_perf_*` cvar. The resolver tries the
-    // typed prefix verbatim first, and if no hits, retries with the
-    // trailing `s` stripped. One-step relaxation, NOT a generic
-    // Levenshtein search.
-    C.RegisterCVar("r_ux_sr_plural_overlay",      "0",   "primary",  pt::console::CVAR_NONE);
-    C.RegisterCVar("r_ux_sr_plural_overlay_mode", "n",   "mode",     pt::console::CVAR_NONE);
-    C.RegisterCVar("r_ux_sr_plural_overlay_scale","1.0", "scale",    pt::console::CVAR_NONE);
+    // User-reported case: typing `perfs` on Win to set the perf-overlay
+    // scale cvar. With the legacy plural-strip approach the resolver
+    // turned `perfs` into `perf` and then alphabetically picked the
+    // shortest `r_perf_*` cvar -- which DISAGREED with the autocomplete
+    // listing, where the fuzzy-match layer correctly highlighted
+    // `r_perf_overlay_scale` (the only one whose name contains `s` to
+    // match the trailing query char) as the top option.
+    //
+    // The fix routes Execute through the same ScoreMatch the listing
+    // uses, so `perfs` -> only `r_perf_overlay_scale` scores non-zero
+    // (PREFIX/SUBSTRING fail across the board, FUZZY only succeeds
+    // for the cvar that has the matching `s`).
+    C.RegisterCVar("r_ux_sr_pf_overlay",       "0",   "primary", pt::console::CVAR_NONE);
+    C.RegisterCVar("r_ux_sr_pf_overlay_mode",  "n",   "mode",    pt::console::CVAR_NONE);
+    C.RegisterCVar("r_ux_sr_pf_overlay_scale", "1.0", "scale",   pt::console::CVAR_NONE);
 
-    // `ux_sr_plurals` (plural) -> strip-s -> `ux_sr_plural` -> matches
-    // all three (strip-r_ branch); top-of-list picks the
-    // alphabetical-first which is `r_ux_sr_plural_overlay`.
-    auto r = C.ResolveCommand("ux_sr_plurals");
-    CHECK(r.canonical_name == "r_ux_sr_plural_overlay");
+    // `ux_sr_pfs` mirrors `perfs`. Only `r_ux_sr_pf_overlay_scale`
+    // contains the trailing `s` for the FUZZY layer to land on.
+    auto r = C.ResolveCommand("ux_sr_pfs");
+    CHECK(r.canonical_name == "r_ux_sr_pf_overlay_scale");
     CHECK_FALSE(r.is_exact_match);
 
-    // Sanity: a `s`-less typed prefix that prefix-matches directly
-    // also works.
-    auto r2 = C.ResolveCommand("ux_sr_plural");
-    CHECK(r2.canonical_name == "r_ux_sr_plural_overlay");
-
-    // Edge case: a bare `s` should not trigger plural-strip (would
-    // degenerate to empty prefix, matching everything). The bare `s`
-    // either matches `s*` cvars / commands or nothing.
-    auto r3 = C.ResolveCommand("s");
-    // The exact result depends on whether ANY production cvar/command
-    // starts with `s`. We don't assert a specific name here; we only
-    // assert that the resolver didn't return EVERY cvar in the
-    // registry (which would happen if plural-strip wrongly fired on a
-    // 1-char input and turned it into an empty prefix).
-    CHECK(r3.ambiguous_matches.size() < 100);
+    // Sanity: `ux_sr_pf` (no trailing s) PREFIX-matches all three
+    // r_-stripped bodies. Top = shortest = `ux_sr_pf_overlay`.
+    auto r2 = C.ResolveCommand("ux_sr_pf");
+    CHECK(r2.canonical_name == "r_ux_sr_pf_overlay");
 }
 
 TEST_CASE("smart resolve: no match falls through to unknown-cvar error") {

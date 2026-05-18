@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Rajesh D'Monte
 #include "Console.h"
+#include "Completion.h"
 #include "../core/Log.h"
 
 #include <fmt/format.h>
@@ -266,78 +267,76 @@ Console::Resolution Console::ResolveCommand(std::string_view typed) {
     //    preferred over commands, per issue #162 spec). The maps are
     //    std::map so iteration is alphabetical, satisfying the
     //    final deterministic tie-break.
-    // Two-tier match: first try the typed prefix verbatim, then if
-    // that finds nothing, try the typed prefix minus a trailing `s`
-    // (English-plural relaxation -- "perfs" -> "perf" -> matches
-    // r_perf_overlay; "lights" -> "light" -> matches r_light_*).
-    // The relaxation is a small one-step convenience, NOT a generic
-    // fuzzy / Levenshtein search -- single trailing-s strip handles
-    // the most common interactive shorthand without expanding the
-    // match surface unpredictably.
-    auto starts_with = [](std::string_view body, std::string_view prefix) {
-        return body.size() >= prefix.size() &&
-               body.compare(0, prefix.size(), prefix) == 0;
-    };
-    auto try_prefix = [&](std::string_view prefix, const std::string& name) {
-        if (prefix.empty()) return false;
-        if (starts_with(name, prefix)) return true;
-        // Strip an "r_" prefix off the registered name and re-check.
-        // Only fires for cvars; commands like `phys_drop_sphere`
-        // already match via the raw-prefix branch.
+    // Score-based ranking: delegate to Completion::ScoreMatch so the
+    // resolver and the autocomplete UI agree on what "top match"
+    // means by construction. ScoreMatch ranks in three layers:
+    //   PREFIX    (score ~= 1000 + tightness)
+    //   SUBSTRING (score ~= 500 + word_bonus + tightness)
+    //   FUZZY     (score 100..N, chars-in-order with gaps)
+    //
+    // For each registered name we score against both the raw name
+    // AND its r_-stripped body (cvars are conventionally prefixed
+    // `r_`; user-typed shorthand like `deno` should also score
+    // against the body `denoiser`). Take the max of the two.
+    //
+    // The user-facing rule: "whatever the autocomplete listing shows
+    // on top is what Execute will pick." Earlier code did naive
+    // alphabetical-first within prefix-only matches; that disagreed
+    // with the listing for cases like `perfs` -> autocomplete shows
+    // r_perf_overlay_scale (the only candidate whose name contains
+    // an `s` to match) but Execute picked r_perf_overlay (the
+    // alphabetical-first of the prefix matches after a separate
+    // plural-strip). User flagged the inconsistency.
+    auto score_name = [&](const std::string& name) -> int {
+        int s = ScoreMatch(name, typed, /*spans=*/nullptr);
         if (name.size() >= 2 && name[0] == 'r' && name[1] == '_') {
-            std::string_view body(name.data() + 2, name.size() - 2);
-            if (starts_with(body, prefix)) return true;
+            const std::string_view body(name.data() + 2, name.size() - 2);
+            const int s2 = ScoreMatch(body, typed, /*spans=*/nullptr);
+            if (s2 > s) s = s2;
         }
-        return false;
-    };
-    auto matches_prefix = [&](const std::string& name) {
-        if (try_prefix(typed, name)) return true;
-        // Plural-strip relaxation. Only fires when typed > 1 char so
-        // a bare `s` doesn't degenerate into an empty-prefix match.
-        if (typed.size() > 1 && typed.back() == 's') {
-            const std::string_view singular(typed.data(), typed.size() - 1);
-            if (try_prefix(singular, name)) return true;
-        }
-        return false;
+        return s;
     };
 
-    std::vector<std::string> cvar_hits;
-    std::vector<std::string> cmd_hits;
+    // Collect every cvar / command with a non-zero score.
+    // Within the cvar group we sort by (score desc, length asc, lex);
+    // same for commands. Cvars rank above commands at equal score
+    // (issue #162 tie-break: cvars preferred over commands).
+    struct Scored {
+        int           score;
+        std::size_t   length;
+        std::string   name;
+    };
+    std::vector<Scored> cvar_hits;
+    std::vector<Scored> cmd_hits;
     for (const auto& [_, v] : cvars_) {
         if (!CVarVisibleOnThisPlatform(v.flags)) continue;
-        if (matches_prefix(v.name)) cvar_hits.push_back(v.name);
+        int s = score_name(v.name);
+        if (s > 0) cvar_hits.push_back({s, v.name.size(), v.name});
     }
     for (const auto& [_, c] : commands_) {
-        if (matches_prefix(c.name)) cmd_hits.push_back(c.name);
+        int s = score_name(c.name);
+        if (s > 0) cmd_hits.push_back({s, c.name.size(), c.name});
     }
+
+    auto cmp = [](const Scored& a, const Scored& b) {
+        if (a.score  != b.score)  return a.score  > b.score;   // higher score first
+        if (a.length != b.length) return a.length < b.length;  // shorter first
+        return a.name < b.name;                                // lex
+    };
+    std::stable_sort(cvar_hits.begin(), cvar_hits.end(), cmp);
+    std::stable_sort(cmd_hits.begin(),  cmd_hits.end(),  cmp);
 
     const std::size_t total = cvar_hits.size() + cmd_hits.size();
     if (total == 0) return r;       // no match -- caller falls back to "unknown" error.
 
-    // Top-of-list auto-resolves, regardless of total count. cvars come
-    // first in the candidate list (cvars > commands tie-break per
-    // issue #162 spec), maps iterate alphabetically. So the "top" is
-    // the alphabetically-first cvar that matched, or if no cvars
-    // matched, the alphabetically-first command.
-    //
-    // This means `perf` resolves to `r_perf_overlay` (the shortest
-    // member of the `r_perf_overlay*` family, which is also the
-    // alphabetical-first), even though `r_perf_overlay_mode` and
-    // `r_perf_overlay_scale` also matched. The user's mental model:
-    // "if I typed an unambiguous shorthand, give me the top hit; if
-    // I wanted a longer specialization I'd have typed more." Same
-    // shape as bash tab-completion's first-cycle behaviour.
-    //
-    // ambiguous_matches is still populated when total > 1 so the
-    // caller / log line can surface "(top of N matches)" for
-    // transparency. Callers that WANT the strict-ambiguous behaviour
-    // can opt in by checking ambiguous_matches.size() > 1 and
-    // refusing to apply the top pick.
-    r.canonical_name = cvar_hits.empty() ? cmd_hits.front() : cvar_hits.front();
+    // Top-of-ranked-list wins. Cvars > commands at equal score.
+    r.canonical_name = cvar_hits.empty()
+                           ? cmd_hits.front().name
+                           : cvar_hits.front().name;
     if (total > 1) {
         r.ambiguous_matches.reserve(total);
-        for (auto& n : cvar_hits) r.ambiguous_matches.push_back(std::move(n));
-        for (auto& n : cmd_hits)  r.ambiguous_matches.push_back(std::move(n));
+        for (auto& h : cvar_hits) r.ambiguous_matches.push_back(std::move(h.name));
+        for (auto& h : cmd_hits)  r.ambiguous_matches.push_back(std::move(h.name));
     }
     return r;
 }
