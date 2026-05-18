@@ -5330,6 +5330,17 @@ void Engine::RenderFrame() {
     // switch (default 1; set to 0 for the naive uniform-pick fallback,
     // useful for variance-regression comparison and for fixtures that
     // exercise the original #73 sampler).
+    //
+    // PT_LIGHT_TREE_ENABLED (CMake option PT_LIGHT_TREE) acts as the
+    // *compile-time* gate. When the megakernel was built with the gate
+    // OFF (perf/megakernel-split-light-tree), the shader excises the
+    // traversal helpers and the picker if-branch entirely, so we MUST
+    // force light_tree_enabled=0 in PtPush regardless of cvar state --
+    // otherwise the shader would skip the uniform-pick fallback branch
+    // (which is now its only path) on a stale uniform read. The runtime
+    // cvar is silently a no-op in that case; a one-shot startup [warn]
+    // in the cvar-watch block flags it for the user.
+#if PT_LIGHT_TREE_ENABLED
     bool light_tree_on = true;
     if (auto* v = C.FindCVar("r_light_tree")) light_tree_on = (v->GetInt() != 0);
     push.light_tree_node_count = light_tree_on
@@ -5337,6 +5348,13 @@ void Engine::RenderFrame() {
         : 0u;
     push.light_tree_enabled = (light_tree_on &&
                                 light_tree_node_count_uploaded_ > 0u) ? 1u : 0u;
+#else
+    // PT_LIGHT_TREE=OFF compile-time gate. Force both fields to 0 so
+    // the shader's uniform-pick fallback is always taken; the cvar is
+    // ignored.
+    push.light_tree_node_count = 0u;
+    push.light_tree_enabled    = 0u;
+#endif
     push._pad_light_tail = 0u;
     // --- ReSTIR DI Phase A (issue #78) -------------------------------------
     // r_restir master toggle, gated additionally on:
@@ -10223,9 +10241,46 @@ void Engine::RegisterCommands() {
     // Same accumulator-reset reasoning as r_mis above -- pre- and
     // post-toggle samples come from different estimators and shouldn't
     // be averaged together.
+    //
+    // perf/megakernel-split-light-tree: when the megakernel was built
+    // without PT_LIGHT_TREE_ENABLED, the tree traversal is excised from
+    // the shader entirely, so flipping the cvar is a silent no-op. Mirror
+    // the PT_WATER_ENABLED pattern (PR #164) used elsewhere: emit a single
+    // [warn] on each on_change call so users who flip the cvar without
+    // rebuilding learn why their NEE variance didn't change.
     if (auto* v = C.FindCVar("r_light_tree")) {
+#if PT_LIGHT_TREE_ENABLED
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+#else
+        v->on_change = [this](const pt::console::CVar& cv) {
+            accum_dirty_ = true;
+            LOG_WARN("{} = {} ignored: this build did not enable "
+                     "PT_LIGHT_TREE_ENABLED. Reconfigure with "
+                     "-DPT_LIGHT_TREE=ON to restore the hierarchical "
+                     "light tree picker.",
+                     cv.name, cv.value);
+        };
+#endif
     }
+#if !PT_LIGHT_TREE_ENABLED
+    // One-shot startup notice: if r_light_tree was set to 0 in a user
+    // cfg the perf characteristic is unchanged (uniform-pick is the
+    // only path either way), so no warn. But if a user *expected* the
+    // tree (default value 1) and the megakernel was compiled without
+    // PT_LIGHT_TREE, surface it once so they know variance won't drop.
+    {
+        if (auto* v = C.FindCVar("r_light_tree");
+            v && v->GetInt() != 0) {
+            LOG_WARN("r_light_tree=1 but this build was compiled without "
+                     "PT_LIGHT_TREE_ENABLED -- the megakernel uses the "
+                     "uniform-pick fallback regardless. Variance will not "
+                     "match the tree-pick fixtures. Reconfigure with "
+                     "-DPT_LIGHT_TREE=ON to restore the hierarchical "
+                     "light tree picker (recommended for scenes with "
+                     ">100 lights).");
+        }
+    }
+#endif
     // r_analytic_bvh_threshold changes the linear/BVH split decision;
     // mark primitives_dirty_ so EnsurePrimitivesUploaded re-runs the
     // partition + (re)builds or tears down the BVH accordingly.

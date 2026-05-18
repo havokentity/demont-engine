@@ -395,6 +395,18 @@ Texture2D<float4> moon_map;
 // 4 float4s per node (LightTreeNode in src/renderer/LightTree.h).
 // Declared AFTER light_prims so Metal slot allocation lands at slot 13;
 // Vulkan binding 28.
+//
+// PT_LIGHT_TREE_ENABLED (CMake option PT_LIGHT_TREE, default ON) gates
+// the consuming code (functions + the picker if-branch). The binding
+// itself is *always declared* so Metal buffer-slot assignment stays
+// stable across PT_LIGHT_TREE=ON / =OFF builds. When the gate is OFF,
+// the load helpers + traversal are compiled out (smaller megakernel,
+// less ICache+register pressure on Apple Silicon -- see
+// `perf/megakernel-split-light-tree` regression fix). The host-side
+// Engine continues to upload the SSBO either way; the unused binding
+// in the disabled build is benign (Slang strips its parameter from
+// the emitted shader, but the descriptor-set layout on Vulkan is
+// PARTIALLY_BOUND and the Metal slot table tolerates an unused index).
 [[vk::binding(28, 0)]] StructuredBuffer<float4> light_tree_nodes;
 
 // --- ReSTIR DI Phase A reservoir buffer (#78) ------------------------------
@@ -2265,6 +2277,16 @@ float3 uniformSphereDirection(float2 xi) {
 // src/renderer/LightTree.h. The MSL/SPIR-V lane indexing is
 // declaration-order-stable on Slang's targets so we just compute the
 // raw float4 lane offset and read.
+//
+// PT_LIGHT_TREE_ENABLED gate: the loader/importance/picker helpers
+// below are compiled out when the CMake option PT_LIGHT_TREE=OFF.
+// Cuts ~150 lines of dead-but-emitted megakernel code that hurts
+// ICache + register pressure on Apple Silicon even when the runtime
+// cvar `r_light_tree=0` -- see perf/megakernel-split-light-tree.
+// The runtime cvar continues to work as a no-op toggle in PT_LIGHT_TREE
+// builds; in the disabled build the engine forces light_tree_enabled=0
+// in PtPush so the uniform-pick fallback below is always taken.
+#if PT_LIGHT_TREE_ENABLED
 static const uint kLightTreeNodeStrideFloat4 = 4u;
 
 struct LightTreeNodeR {
@@ -2409,6 +2431,7 @@ LightPick pickLightFromTree(float3 hit_pt, float3 n_face, inout uint seed) {
     }
     return r;
 }
+#endif  // PT_LIGHT_TREE_ENABLED
 // --- end Light tree traversal ----------------------------------------------
 
 // Returns an unset sample (pdf=0) when light_count == 0 or the chosen
@@ -2435,14 +2458,24 @@ LightSample sampleAnalyticLight(float3 hit_pt, float3 n_face, inout uint seed) {
 
     uint  pick;
     float pick_pdf;
+#if PT_LIGHT_TREE_ENABLED
+    // Light-tree path compiled in. The runtime cvar r_light_tree drives
+    // light_tree_enabled/light_tree_node_count from the host so flipping
+    // it to 0 still falls through to the uniform-pick branch at runtime,
+    // with the tree-traversal code present-but-cold in the megakernel.
     if (light_tree_enabled != 0u && light_tree_node_count > 0u) {
         LightPick lp = pickLightFromTree(hit_pt, n_face, seed);
         pick     = min(lp.light_id, light_count - 1u);
         pick_pdf = lp.pick_pdf;
-    } else {
+    } else
+#endif  // PT_LIGHT_TREE_ENABLED
+    {
         // Uniform single-pick over the active count. Same code path as
         // #73 -- regression-protected by the r_light_tree=0 cvar so we
-        // can A/B variance against the tree at any time.
+        // can A/B variance against the tree at any time. In PT_LIGHT_TREE=OFF
+        // builds this branch is *the only path*: the engine never sets
+        // light_tree_enabled and the tree traversal is excised from the
+        // megakernel entirely.
         float u_pick = randf(seed);
         pick = min(uint(u_pick * float(light_count)), light_count - 1u);
         pick_pdf = 1.0 / float(light_count);
