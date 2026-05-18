@@ -1322,6 +1322,20 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         auto build_pipeline = [&](const char* name,
                                   const unsigned char* spirv,
                                   std::size_t          spirv_size) {
+            // Shutdown abort. If DestroyDevice has fired (user closed
+            // the window before this worker finished its sweep), skip
+            // the remaining kernels so the join() in DestroyDevice
+            // doesn't block waiting for us to grind through the rest
+            // of the list. vkCreateComputePipelines on a cold NVIDIA
+            // pipeline cache is the long pole here (~25 s release-build
+            // on PathTrace alone), so without this check the user
+            // perceives a hang on every quit that fires before the
+            // initial sweep finishes. The IN-FLIGHT build (if any)
+            // still completes -- vkCreateComputePipelines is not
+            // abortable mid-flight -- but no NEW builds start.
+            if (pipeline_build_abort_.load(std::memory_order_acquire)) {
+                return;
+            }
             const auto t0 = std::chrono::steady_clock::now();
             auto mod = MakeShaderModule(device_, spirv, spirv_size);
             if (mod == VK_NULL_HANDLE) return;
@@ -1440,6 +1454,17 @@ void VulkanDevice::DestroyDevice() {
     // and reads pipeline_cache_, so we need it stopped before we
     // destroy any of those.  Safe even if the worker is never
     // started (default-constructed std::thread is not joinable).
+    //
+    // Signal abort BEFORE join so the worker bails between any pending
+    // build_pipeline() calls in its sweep rather than completing the
+    // full list. vkCreateComputePipelines can take 20+ seconds on a
+    // cold NVIDIA pipeline cache (PathTrace.spv is the long pole), and
+    // a user who quits during that window would otherwise see the
+    // process linger for the rest of the sweep before exiting. The
+    // currently-running build (if any) still completes -- the Vulkan
+    // call has no mid-flight abort -- but every kernel after it is
+    // skipped, bounding shutdown latency to one in-flight build.
+    pipeline_build_abort_.store(true, std::memory_order_release);
     if (pipeline_build_thread_.joinable()) {
         pipeline_build_thread_.join();
     }

@@ -463,6 +463,15 @@ private:
     // LookupPipeline + CreateComputePipeline-by-name also take.
     std::thread           pipeline_build_thread_;
     std::atomic<bool>     pipelines_ready_{false};
+    // Shutdown-abort signal for the async pipeline builder. DestroyDevice
+    // sets this true BEFORE join() so the worker can short-circuit any
+    // remaining build_pipeline() calls in its list -- without it, quit
+    // blocks for the FULL pipeline-build duration (~25s release-build,
+    // cold NVIDIA pipeline cache) when the user closes the window before
+    // the worker finishes its 7+ kernel sweep. vkCreateComputePipelines
+    // itself is not abortable mid-flight, so the in-flight build still
+    // completes; the abort prevents starting any new builds after it.
+    std::atomic<bool>     pipeline_build_abort_{false};
 
     // SVGF/NRD denoiser. Pointer rather than embedded so the heavy
     // VulkanDenoiser.h doesn't bleed into every translation unit that
