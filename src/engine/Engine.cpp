@@ -440,7 +440,19 @@ namespace cvar {
     PT_CVAR(r_sky_city,        "chennai", "Preset observer location. Selecting one writes r_sky_lat / r_sky_lon to that city's coordinates. 'custom' leaves them as-is. lat/lon are ignored when r_sky_use_astronomical = 0.", CVAR_ARCHIVE);
     PT_CVAR(r_show_stars,      "1",       "Render stars at night (sun below horizon). 0 disables.", CVAR_ARCHIVE);
     PT_CVAR(r_stars_mode,      "bsc",     "Star source: 'bsc' = real Yale Bright Star Catalog (J2000-frame map rotated to local horizon per frame, requires assets/stars/BSC5.dat), 'procedural' = hash-based random starfield (fast, no catalog needed). Falls back to procedural when 'bsc' is requested but the catalog failed to load.", CVAR_ARCHIVE);
-    PT_CVAR(r_stars_twinkle,   "1",       "Per-star atmospheric scintillation. 0 = static field, 1 = each star modulates +/-30%% at 4-8 Hz with a per-texel phase (cheap shader noise, no extra texture lookups).", CVAR_ARCHIVE);
+    PT_CVAR(r_stars_twinkle,   "1",       "Per-star atmospheric scintillation. 0 = static field, 1 = each star modulates +/-45%% at a per-star 1-3 Hz frequency (cheap shader noise, no extra texture lookups). r_stars_twinkle_speed scales the frequency.", CVAR_ARCHIVE);
+    // Tune-knob for the twinkle rate. The shader's base per-star
+    // frequency is 1-3 Hz (period 0.33-1.0 s); this multiplier scales
+    // it -- 0.3 gives 0.3-0.9 Hz (period 1.1-3.3 s, calm-night cadence),
+    // 1.0 keeps the base range, >1 speeds it up toward the legacy 3-8 Hz
+    // band. Plumbed through exposure_pad.w (the same byte the on/off
+    // flag used to occupy); zero still means "twinkle off" so toggling
+    // r_stars_twinkle 0 short-circuits.
+    PT_CVAR(r_stars_twinkle_speed, "0.3",
+            "Multiplier on per-star twinkle frequency. 0.3 (default) "
+            "= calm-night cadence at 0.3-0.9 Hz; 1.0 = 1-3 Hz "
+            "in-game look; >1 speeds up toward dramatic flicker.",
+            CVAR_ARCHIVE);
     // Issue #46: SVGF a-trous smudges sub-pixel stars + erodes the sun
     // and moon discs. When this is on (default), PathTrace.slang
     // subtracts starsOnly + sunDisc + moonDisc from the primary-miss
@@ -4147,7 +4159,18 @@ void Engine::RenderFrame() {
     push.exposure_pad[2] = want_bsc        ? 1.0f : 0.0f;
     bool twinkle = true;
     if (auto* v = C.FindCVar("r_stars_twinkle")) twinkle = v->GetBool();
-    push.exposure_pad[3] = twinkle ? 1.0f : 0.0f;
+    float twinkle_speed = 0.3f;
+    if (auto* v = C.FindCVar("r_stars_twinkle_speed")) twinkle_speed = v->GetFloat();
+    // Clamp non-negative so a typo can't run twinkle backwards (would
+    // alias visually with reversed-direction wrap but is mathematically
+    // valid, so guard rather than abs-clamp -- 0 unambiguously means
+    // "off" downstream and that's the safer end of any user error).
+    if (twinkle_speed < 0.0f) twinkle_speed = 0.0f;
+    // exposure_pad.w doubles as the twinkle-active flag (>0) AND the
+    // frequency multiplier. r_stars_twinkle=0 zeroes it (shader skips
+    // the modulation branch entirely), r_stars_twinkle=1 forwards the
+    // speed multiplier so the shader does fhz_base * exposure_pad.w.
+    push.exposure_pad[3] = twinkle ? twinkle_speed : 0.0f;
 
     // World->J2000 rotation. Always computed; the shader scales the
     // starmap sample by exposure_pad.z so when stars are off the

@@ -180,18 +180,19 @@ float3 starsOnly(float3 rd, float3 sun) {
         if (xi < 0) xi += int(dim.x);
         int yi = clamp(int(floor(v * float(dim.y))), 0, int(dim.y) - 1);
         float3 stars = star_map[uint2(uint(xi), uint(yi))].rgb;
-        // 1-3 Hz per-star scintillation (period 0.33-1.0 s). Must
-        // match PathTrace.slang's starsOnly() copy verbatim, see the
-        // long comment there for the rationale on the slower band vs
-        // the 3-8 Hz the legacy SVGF-smudged path used.
-        if (exposure_pad.w > 0.5) {
+        // Per-star 1-3 Hz base scintillation, scaled by exposure_pad.w
+        // (the r_stars_twinkle_speed multiplier; 0 means off). Must
+        // match PathTrace.slang's starsOnly() copy verbatim -- see
+        // that file's twinkle comment for the full rationale.
+        if (exposure_pad.w > 0.001) {
             int3 q  = int3(floor(j * 38.0));
             uint qh = uint(q.x + 128) * 65536u
                     + uint(q.y + 128) * 256u
                     + uint(q.z + 128);
             uint h    = pcgHash(qh + 0xb7e1u);
             float ph  = float(h & 0xFFFFu) * (1.0 / 65536.0);
-            float fhz = 1.0 + float((h >> 16) & 0xFFu) * (2.0 / 256.0);
+            float fhz_base = 1.0 + float((h >> 16) & 0xFFu) * (2.0 / 256.0);
+            float fhz = fhz_base * exposure_pad.w;
             float t   = float(frame_index) * (1.0 / 60.0);
             float w   = 0.55 + 0.45 * sin(6.28318530718 * (ph + t * fhz));
             stars *= w;
