@@ -3236,17 +3236,31 @@ void main(uint2 tid : SV_DispatchThreadID) {
     // primary-hit shadow-ray transmittance toward the sun across all
     // spp samples; divided by sample_count at the end of main() to give
     // a per-pixel [0,1] visibility for the SigmaShadow denoiser to
-    // bilateral-filter. Per-sample contributions: 1.0 for samples whose
-    // primary ray misses geometry (sky pixels never need shadow
-    // demodulation -- they have no direct-light shadow to denoise),
-    // and the scalar luminance of the sun-NEE shadow-ray transmittance
-    // for samples that hit a surface. Initialized to 0.0; sky pixels
-    // accumulate sample_count*1.0 = sample_count, then divide back to
-    // 1.0 below. Non-Lambert primary hits (metal, dielectric) and the
-    // night-side case (sun below horizon) also contribute 1.0 to avoid
-    // false-shadowing materials that aren't subject to direct-light
-    // shadowing the same way Lambert is (specular reflectance handles
-    // its own occlusion via the bounce ray, not a Lambert-style NEE).
+    // bilateral-filter. Per-sample contributions:
+    //   - sky-miss primary ray  : 1.0 (no surface = no shadow to denoise)
+    //   - sun below horizon     : 1.0 (no procedural sun visibility)
+    //   - surface hit + sun up  : scalar luminance of the sun-NEE
+    //                             shadow-ray transmittance, traced for
+    //                             ANY primary hit regardless of material.
+    //
+    // Material-agnostic by design: metal and dielectric primary hits
+    // also contribute the real visibility (not 1.0). Lambert-only
+    // gating was the original intent and would have left specular /
+    // glass surfaces undenoised, with sharp direct-shadow streaks
+    // visible against smooth indirect lighting. Tracing the visibility
+    // ray for every h.hit case captures the same direct-light signal
+    // the SigmaShadow filter is designed to bilateral-smooth, and the
+    // demod compose later multiplies HDR by this scalar regardless of
+    // BSDF -- so the post-denoise HDR carries the same shadow boundary
+    // sharpness on every material. Cost is one extra transmittance()
+    // call per primary hit, but only when write_shadow_vis != 0 (engine
+    // gates that on procedural sky + denoiser + r_shadow_demod).
+    //
+    // Initialized to 0.0; sky pixels accumulate sample_count*1.0, then
+    // divide back to 1.0 below. Future material gating (e.g. mirrored
+    // metal should arguably bypass the demod) is documented as a
+    // follow-up rather than implemented here, to keep this PR's scope
+    // tight to Lambert-and-friends.
     float frame_shadow_vis = 0.0;
     for (uint s = 0u; s < sample_count; ++s) {
         // When MetalFX is on, all pixels of the frame share the same

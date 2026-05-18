@@ -5160,17 +5160,21 @@ void Engine::RenderFrame() {
     //                             would crash without it.
     //   - depth_tex_id_ != 0   : composite reads this texture for the
     //                             sky-pixel gate.
+    // sky_mode_int is shared by both the celestials-composite gate
+    // (below) and the SIGMA shadow-demod gate further down -- both
+    // semantically require procedural-sky mode, so resolve r_sky_mode
+    // once and reuse to keep the two gates in sync.
+    int sky_mode_int = 2;
+    if (auto* v = C.FindCVar("r_sky_mode")) {
+        const std::string& m = v->value;
+        sky_mode_int = (m == "procedural") ? 2
+                     : (m == "hdri")       ? 1
+                                           : 0;
+    }
     bool engine_composite_active = false;
     {
         bool star_split_on = true;
         if (auto* v = C.FindCVar("r_star_split")) star_split_on = v->GetBool();
-        int  sky_mode_int = 2;
-        if (auto* v = C.FindCVar("r_sky_mode")) {
-            const std::string& m = v->value;
-            sky_mode_int = (m == "procedural") ? 2
-                         : (m == "hdri")       ? 1
-                                               : 0;
-        }
         engine_composite_active =
             denoiser_active_ &&
             star_split_on &&
@@ -5183,7 +5187,32 @@ void Engine::RenderFrame() {
     push._pad_star_split = 0u;
     push._pad_shadow_vis = 0u;
     push._pad_vol        = 0.0f;
-    // SIGMA shadow demodulation gate (issue #115).
+    // SIGMA shadow demodulation gate (issue #115). Mirrors the
+    // celestials gate above. PathTrace writes the per-primary-hit
+    // sun-NEE shadow-ray transmittance only when:
+    //   - denoiser_active_                : the smudge only matters
+    //                                        under SVGF / MetalFX; the
+    //                                        legacy 1-spp path already
+    //                                        produces sharp shadows.
+    //   - r_shadow_demod on               : user opted in.
+    //   - sky_mode_int == 2 (procedural)  : the visibility traced is
+    //                                        toward sun_and_mode.xyz;
+    //                                        only the procedural-sun
+    //                                        lighting path uses that
+    //                                        direction. HDRI mode samples
+    //                                        extracted HDRI clusters and
+    //                                        never casts toward
+    //                                        sun_and_mode -- demodulating
+    //                                        HDRI scenes by procedural
+    //                                        sun visibility incorrectly
+    //                                        darkens them. Gradient mode
+    //                                        has no NEE at all. HDRI
+    //                                        demod is out of scope for
+    //                                        this PR -- see issue #115.
+    //   - sigma_shadow_pipeline_id_ != 0  : Metal-only today.
+    //   - shadow_vis_buf_id_ != 0         : the buffer is actually
+    //                                        allocated.
+    //   - depth_tex_id_ != 0 + normal_tex_id_ checked at dispatch site.
     {
         bool shadow_demod_on = true;
         if (auto* v = C.FindCVar("r_shadow_demod")) {
@@ -5192,6 +5221,7 @@ void Engine::RenderFrame() {
         const bool engine_shadow_demod_active =
             denoiser_active_ &&
             shadow_demod_on &&
+            (sky_mode_int == 2) &&
             sigma_shadow_pipeline_id_ != 0 &&
             shadow_vis_buf_id_ != 0 &&
             depth_tex_id_ != 0;
