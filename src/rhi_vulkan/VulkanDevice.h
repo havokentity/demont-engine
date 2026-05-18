@@ -164,6 +164,23 @@ public:
     bool SupportsDenoise() const override;
     void Denoise(const DenoiseDesc& d) override;
 
+    // Predictive pipeline JIT prewarming (see Device::EnsurePipelineWarmed).
+    // On Vulkan, the constructor already launches an async worker that
+    // builds every known kernel name eagerly, so by the time the engine
+    // calls EnsurePipelineWarmed the relevant build is either:
+    //   * already complete (named_pipelines_.find hits)        -> no-op
+    //   * still in flight inside the worker's hardcoded list   -> no-op
+    //                                                              (the
+    //     worker will reach it on its own)
+    //   * an unknown name (no SPIR-V blob embedded for it)     -> logged
+    //                                                              once
+    //     at tier-2 diag so engine→device API drift surfaces visibly.
+    // Method exists as the documented engine→device handshake so future
+    // dynamic pipelines (loaded from disk, generated at runtime) have a
+    // clean queue-on-demand entry point without each pipeline owner
+    // touching the device construction sequence.
+    void EnsurePipelineWarmed(const char* kernel_name) override;
+
     // Internal accessors used by the command buffer.
     VkDevice         RawDevice()     const { return device_; }
     VkPhysicalDevice RawPhysicalDevice() const { return phys_device_; }

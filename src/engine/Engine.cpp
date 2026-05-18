@@ -269,6 +269,30 @@ namespace cvar {
     PT_CVAR(r_software_blit_recreate, "auto",
             "Win32 only: behaviour when r_backend switches vulkan -> software with r_software_blit=gdi. auto (default) = in-process HWND recreate so GDI works on the fresh HWND | prompt = MessageBox Restart Now? (Yes spawns fresh process with original argv) | warn = legacy LOG_WARN, manual restart. No-op on Mac/Linux.",
             CVAR_ARCHIVE | CVAR_PLATFORM_WIN);
+    // Predictive pipeline JIT prewarming. When 1 (default),
+    // Engine::Init (initial device) and Engine::RequestBackendSwitch
+    // (every subsequent r_backend change) call
+    // Device::EnsurePipelineWarmed for every compute kernel the engine
+    // knows about, giving the active backend a chance to start (or
+    // confirm completion of) the pipeline build BEFORE the first
+    // RenderFrame Dispatch. On backends with an async pipeline-build
+    // worker (Vulkan today), this turns "first dispatch waits for the
+    // worker" into "the worker starts in parallel with the engine's
+    // RegisterCommands / Init tail" so the user-visible loading screen
+    // covers the JIT cost rather than a steady-state frame hitch. On
+    // backends that build pipelines synchronously at device construction
+    // (Metal / software), the call is a no-op by the base class default.
+    // Set 0 to disable for A/B perf testing of the prewarm path; affects
+    // ONLY backend swap / scene transitions -- steady-state ms/frame is
+    // identical with the cvar at 0 or 1.
+    PT_CVAR(r_pipeline_prewarm, "1",
+            "Predictive pipeline JIT prewarming. 1 (default) = Engine "
+            "tells Device which kernels it will dispatch right after "
+            "Init / backend swap so the async pipeline-build worker can "
+            "race ahead; 0 = let the first Dispatch lazily resolve. No "
+            "effect on steady-state perf; reduces or eliminates the "
+            "first-frame hitch after r_backend changes.",
+            CVAR_ARCHIVE);
     PT_CVAR(r_max_bounces,     "8",  "Max path bounces per ray",          CVAR_ARCHIVE);
     PT_CVAR(r_spp,             "1",  "Samples per pixel per dispatch (>=1). Higher = cleaner motion frames at proportional GPU cost.", CVAR_ARCHIVE);
     PT_CVAR(r_firefly_clamp,   "10",  "Per-contribution firefly clamp (per-channel ceiling on each indirect light contribution: env-NEE, ambient skylight, bounce-to-sky). Suppresses single-sample spikes from BSDF-sampled bounces hitting an HDRI sun pixel, while leaving camera-direct sky unbounded so the sun renders at full intensity. ACES saturates anything above ~5 to ~1.0 for SDR, so 10 preserves visible highlights and kills fireflies. 0 disables.", CVAR_ARCHIVE);
@@ -2111,6 +2135,16 @@ void Engine::RequestBackendSwitch(BackendType to) {
     // still in flight, in which case RenderFrame keeps re-resolving
     // each frame until they flip non-zero.
     EnsurePipelineHandles();
+    // Predictive pipeline JIT prewarming. After backend swap the fresh
+    // VulkanDevice's worker is already in flight (it was launched by
+    // the constructor); this call hands the worker an explicit list of
+    // names the engine will dispatch. Today most of those resolve to
+    // "already in the worker's hardcoded build list, no-op" but the
+    // handshake gives future on-demand pipelines a clean entry point
+    // without each new pipeline owner having to touch this function.
+    // Metal / software back-ends override this to a no-op via the
+    // Device::EnsurePipelineWarmed default. See r_pipeline_prewarm.
+    PrewarmPipelines();
 
     // GPU-resident exposure scalar (1 float). AutoExposure.slang
     // updates this each tick when r_auto_exposure=1; engine writes the
@@ -3758,6 +3792,43 @@ void Engine::EnsurePipelineHandles() {
     // resolve cost is 1 atomic compare per frame until Vulkan grows a
     // real entry.
     resolve(particle_composite_pipeline_id_, "particle_composite");
+}
+
+void Engine::PrewarmPipelines() {
+    if (!device_) return;
+    // Cvar gate. Set r_pipeline_prewarm 0 for A/B perf testing of the
+    // prewarm path -- with it off, the engine falls back to the
+    // pre-existing behaviour (first dispatch implicitly forces a
+    // CreateComputePipeline-by-name lookup; on Vulkan the async worker
+    // still builds eagerly via the device constructor but no second
+    // engine-side handshake fires after the constructor returns).
+    auto& C = pt::console::Console::Get();
+    if (auto* v = C.FindCVar("r_pipeline_prewarm"); v && !v->GetBool()) {
+        return;
+    }
+    // Keep this list in lockstep with EnsurePipelineHandles. The two
+    // lists serve different purposes (EnsurePipelineHandles caches the
+    // returned id; PrewarmPipelines signals intent) but cover the same
+    // set of kernel names. Adding a name to one without the other is a
+    // bug: an unknown handle pipeline produces an id==0 dispatch
+    // short-circuit that's correct-but-silent, and an unprewarmed
+    // pipeline produces a one-shot hitch on first dispatch.
+    auto warm = [&](const char* name) {
+        device_->EnsurePipelineWarmed(name);
+    };
+    warm("pathtrace");
+    warm("tonemap");
+    warm("bloom_down");
+    warm("bloom_up");
+    warm("autoexpose");
+    warm("perfoverlay");
+    warm("stars_composite");
+    warm("aurora_composite");
+    warm("sigma_shadow");
+    warm("restir_temporal");
+    warm("restir_spatial");
+    warm("restir_final");
+    warm("particle_composite");
 }
 
 void Engine::RenderFrame() {

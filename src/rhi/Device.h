@@ -373,6 +373,38 @@ public:
     };
     virtual bool SupportsDenoise() const { return false; }
     virtual void Denoise(const DenoiseDesc& /*d*/) {}
+
+    // Predictive pipeline JIT prewarming. Engine signals "I will need
+    // pipeline `kernel_name` soon" so the backend can start (or finish)
+    // building it before the first Dispatch hits a "pipeline not ready"
+    // wait. Idempotent and cheap to call every frame -- once the
+    // pipeline is built, subsequent calls are a single hash-map lookup.
+    //
+    // Trigger points:
+    //   * Engine::Init, after EnsurePipelineHandles, for every name the
+    //     engine knows about.
+    //   * Engine::ApplyBackend, after the new device's
+    //     EnsurePipelineHandles fires, to kick the new device's worker.
+    //   * Driven by the `r_pipeline_prewarm` cvar (default 1).
+    //
+    // Default base-class impl is a no-op:
+    //   * Metal/software backends build pipelines synchronously inside
+    //     the device constructor, so by the time Engine sees a usable
+    //     device pointer every pipeline is already ready.
+    //   * Backends with an async worker (Vulkan) override this to
+    //     enqueue the warm or no-op if the worker is already mid-build
+    //     of the requested kernel.
+    //
+    // Contract:
+    //   * Safe to call from the main thread at any time after
+    //     Device::Create returned a non-null pointer.
+    //   * Unknown / unimplemented names are silently ignored -- a
+    //     pipeline that the backend's worker has no SPIR-V/MSL blob
+    //     for will simply never become available (and the engine's
+    //     dispatch-site id==0 gate keeps it inert). Matches the
+    //     "Metal-only today, Vulkan follow-up" pattern Engine uses
+    //     for stars_composite / sigma_shadow / restir_*.
+    virtual void EnsurePipelineWarmed(const char* /*kernel_name*/) {}
 };
 
 }  // namespace pt::rhi
