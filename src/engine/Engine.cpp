@@ -7015,16 +7015,16 @@ void Engine::RenderFrame() {
         {
             int aurora_on = 0;
             if (auto* v = C.FindCVar("r_aurora")) aurora_on = v->GetInt();
-            int sky_mode_int = 2;
+            int aurora_sky_mode = 2;
             if (auto* v = C.FindCVar("r_sky_mode")) {
                 const std::string& m = v->value;
-                sky_mode_int = (m == "procedural") ? 2
-                             : (m == "hdri")       ? 1
-                                                   : 0;
+                aurora_sky_mode = (m == "procedural") ? 2
+                                : (m == "hdri")       ? 1
+                                                      : 0;
             }
             aurora_active =
                 aurora_on != 0 &&
-                (sky_mode_int == 2) &&
+                (aurora_sky_mode == 2) &&
                 aurora_composite_pipeline_id_ != 0 &&
                 depth_tex_id_ != 0 &&
                 cloud_trans_tex_id_ != 0;
