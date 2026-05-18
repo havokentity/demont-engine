@@ -50,19 +50,23 @@
 [[vk::binding(10, 0)]] RWStructuredBuffer<float>  variance_in_unused;  // unread by temporal -- host binds a placeholder
 [[vk::binding(11, 0)]] RWStructuredBuffer<float>  variance_out;        // this-frame initial variance
 // Albedo G-buffer (binding 12). Issue #119: SVGF albedo demodulation.
-// READ-ONLY `Texture2D` (sample-access in MSL), so it sidesteps Metal's
+// On Vulkan slot 12 is bound as STORAGE_IMAGE (the underlying VkImage
+// has STORAGE_BIT only, never SAMPLED_BIT), so SPIR-V wants
+// Sampled=2 i.e. `RWTexture2D`. On Metal we keep `Texture2D` so the
+// MSL emit is `access::sample` (read-only), which sidesteps Metal's
 // 8-RW-texture compute cap -- the temporal pass already pins 8 RW
-// textures at slots 0..7 and a 9th `RWTexture2D` would have tripped
-// slangc's MSL output. The host binds this to the engine's albedo_tex
-// (= primary-hit surface albedo) whenever r_svgf_albedo_demod is on;
+// textures at slots 0..7 and a 9th `RWTexture2D` would trip slangc's
+// MSL output. The host binds this to the engine's albedo_tex (=
+// primary-hit surface albedo) whenever r_svgf_albedo_demod is on;
 // when off the binding is still wired so the descriptor set stays
 // well-formed, but the shader skips every divide / multiply via the
-// runtime `demod_enabled` push gate. Pixels with zero albedo (sky
-// sentinel) fall through max(.., kDemodEps) -> the divide returns a
-// large but finite lighting estimate, and the multiply-back at the
-// final output write restores the original signal exactly (numeric
-// drift bounded by the eps).
-[[vk::binding(12, 0)]] Texture2D<float4> albedo_tex;
+// runtime `demod_enabled` push gate. Sky pixels (albedo == 0)
+// bypass the divide entirely and forward emissive radiance.
+#ifdef PT_TARGET_SPIRV
+[[vk::binding(12, 0)]] RWTexture2D<float4> albedo_tex;
+#else
+[[vk::binding(12, 0)]] Texture2D<float4>   albedo_tex;
+#endif
 
 [[vk::push_constant]]
 cbuffer Push {

@@ -46,14 +46,21 @@
 [[vk::binding(10, 0)]] RWStructuredBuffer<float>  variance_in;         // variance from previous pass
 [[vk::binding(11, 0)]] RWStructuredBuffer<float>  variance_out;        // filtered variance for next pass
 // Albedo G-buffer (binding 12). Issue #119 -- SVGF albedo demodulation.
-// Sample-only (`Texture2D`) so it doesn't count toward Metal's 8 RW
-// texture cap. The chain runs on the demodulated lighting signal so
-// edge-stops aren't fighting texture detail; on the LAST atrous pass
-// the kernel multiplies by albedo to produce the final remodulated
-// output. Intermediate passes leave the multiply off so the next
-// pass's divide cancels cleanly -- with `final_remod = 0` on
-// intermediate passes the kernel only divides input and forwards.
-[[vk::binding(12, 0)]] Texture2D<float4> albedo_tex;
+// Read-only consumer here (only the remod multiply-back at the end of
+// the kernel reads it). On Vulkan the descriptor-set layout binds slot
+// 12 as a STORAGE_IMAGE, so the SPIR-V image type must be Sampled=2
+// (i.e. `RWTexture2D` in Slang). Using `Texture2D` would emit
+// Sampled=1 (sampled-image) and trip a descriptor-type/shader-type
+// validation error on Vulkan -- the underlying VkImage has
+// `VK_IMAGE_USAGE_STORAGE_BIT` only, never SAMPLED_BIT. On Metal we
+// keep `Texture2D` to declare `access::sample` (read-only), so the
+// albedo texture doesn't count against Metal's 8-`read_write`-texture
+// per-kernel cap.
+#ifdef PT_TARGET_SPIRV
+[[vk::binding(12, 0)]] RWTexture2D<float4> albedo_tex;
+#else
+[[vk::binding(12, 0)]] Texture2D<float4>   albedo_tex;
+#endif
 
 [[vk::push_constant]]
 cbuffer Push {
@@ -95,23 +102,18 @@ bool isSkyAlbedo(float3 a) {
     return (a.r + a.g + a.b) <= kAlbedoSkyEps;
 }
 
-// Read color_in[p] in (optionally) demodulated space. Identical
-// semantics to DenoiseTemporal.slang's helper -- divides by per-tap
-// albedo when demod is on, except for sky pixels (albedo == 0)
-// which carry emissive radiance that must NOT be remodulated.
-// Bypassing demod for sky also makes the variance estimate sensible:
-// dividing sky-luminance by kDemodEps would create a 100x luminance
-// spike that the A-Trous gate would refuse to average through (and
-// so the sky-pixel chain degenerates to pass-through anyway).
+// Read color_in[p] for the A-Trous filter. The input here is already
+// in demodulated lighting space (the temporal pass and any prior
+// A-Trous pass both write the demodulated signal when demod_enabled
+// is set, with intermediate `final_remod = 0` so no multiply-back
+// happens until the final pass). Re-dividing by albedo here would
+// take the chain through `radiance / albedo^N` for N passes, which
+// the single final multiply-back can't recover -- the Copilot review
+// of PR #150 caught this. So we just forward the read unchanged; the
+// `demod_enabled` flag is still meaningful for the final multiply-
+// back at the bottom of the kernel.
 float3 readDemodColor(uint2 p) {
-    float3 c = color_in[uint2(p)].rgb;
-    if (demod_enabled != 0u) {
-        float3 a = albedo_tex[uint2(p)].rgb;
-        if (!isSkyAlbedo(a)) {
-            c /= max(a, float3(kDemodEps, kDemodEps, kDemodEps));
-        }
-    }
-    return c;
+    return color_in[uint2(p)].rgb;
 }
 
 // Binomial-derived 1D weights. The 2D kernel is the outer product:
@@ -152,11 +154,13 @@ float clampVarianceRead(int2 p) {
 void main(uint2 tid : SV_DispatchThreadID) {
     if (tid.x >= width || tid.y >= height) return;
 
-    // Read the centre pixel in (possibly) demodulated space. We
-    // preserve `center.a` for the sample-count tag that rides the
-    // chain alongside the RGB. Issue #119: the entire kernel operates
-    // on demodulated lighting when `demod_enabled` is set; the
-    // multiply-back happens at the final color_out write below.
+    // Read the centre pixel. With demod on, `color_in` is already
+    // demodulated lighting (no extra divide here -- the temporal pass
+    // and prior atrous passes wrote in demod space; see PR #150
+    // Copilot review). We preserve `center.a` for the sample-count
+    // tag that rides the chain alongside the RGB. The multiply-back
+    // happens at the final color_out write below when `final_remod`
+    // is set.
     float4 center_full  = color_in[tid];
     float3 center_rgb   = readDemodColor(tid);
     float4 center       = float4(center_rgb, center_full.a);
@@ -221,11 +225,12 @@ void main(uint2 tid : SV_DispatchThreadID) {
             uint2 q = uint2(q_pix);
 
             float kw = kKernel1D[dx + 2] * kKernel1D[dy + 2];
-            // Demodulated tap: divide-by-albedo for the lighting
-            // estimate at each neighbour. This matches the centre-tap
-            // signal so the luminance edge-stop computes the right
-            // delta. When demod is off, readDemodColor falls through
-            // to the raw radiance read.
+            // Read the neighbour radiance. With demod on, `color_in`
+            // is already in demodulated lighting space (temporal +
+            // intermediate atrous passes leave the multiply-back off),
+            // so `readDemodColor` is a straight pass-through that
+            // matches the centre tap's signal for the luminance
+            // edge-stop. With demod off this is the raw radiance.
             float3 nc_rgb  = readDemodColor(q);
             float  nd      = depth_tex[q];
             float3 nn      = normal_tex[q].xyz;

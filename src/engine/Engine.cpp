@@ -312,8 +312,9 @@ namespace cvar {
             "through the chain). Affects r_denoiser = svgf_basic / "
             "svgf_atrous / svgf_basic_metalfx / svgf_atrous_metalfx / "
             "nrd; non-SVGF denoisers ignore this flag. Sky pixels "
-            "(albedo = 0) divide through a kDemodEps floor so the "
-            "multiply-back is a clean round-trip in fp16.",
+            "(albedo = 0 sentinel) skip the divide AND the multiply-"
+            "back so emissive radiance from the path tracer's miss "
+            "shader is forwarded unchanged.",
             CVAR_ARCHIVE);
     PT_CVAR(r_hdr_pipeline,    "1",  "Linear-HDR pipeline through MetalFX. 1 = path tracer writes raw HDR, MetalFX denoises in HDR, post-pass applies exposure+ACES (recommended). 0 = path tracer pre-applies exposure+ACES, MetalFX denoises LDR, tonemap pass is a passthrough copy. Only affects the denoiser-on path.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom,           "1",  "HDR bloom (downsample/upsample pyramid, additive composite before ACES). 0 disables; tonemap then samples a 1x1 zero buffer.", CVAR_ARCHIVE);
@@ -4636,12 +4637,33 @@ void Engine::RenderFrame() {
         // false when albedo_in_ wasn't allocated (so a transient
         // resize race that lands an SVGF dispatch one frame before
         // the albedo texture is ready degrades cleanly).
+        //
+        // Toggling r_svgf_albedo_demod mid-run swaps the color space
+        // the SVGF history texture stores (demod-on = lighting only,
+        // demod-off = full radiance), so we have to fire reset_history
+        // when the EFFECTIVE flag changes between frames -- otherwise
+        // the temporal blend lerps the new frame against stale history
+        // in the wrong colour space for up to the temporal window.
+        // The effective flag is the cvar AND-ed with albedo availability
+        // (the backends do the AND themselves, but we mirror it here so
+        // a resize race that drops the albedo binding for one frame
+        // doesn't fire a spurious reset). PR #150 Copilot review.
         {
             bool demod_on = true;       // matches CVAR default
             if (auto* v = C.FindCVar("r_svgf_albedo_demod")) {
                 demod_on = v->GetBool();
             }
             dd.albedo_demod_enabled = demod_on;
+            const bool effective_demod = demod_on && (albedo_tex_id_ != 0);
+            if (effective_demod != prev_svgf_albedo_demod_active_) {
+                dd.reset_history = true;
+                LOG_INFO("engine: SVGF albedo demod toggled ({} -> {}); "
+                         "firing reset_history to clear stale {} space",
+                         prev_svgf_albedo_demod_active_ ? "on" : "off",
+                         effective_demod ? "on" : "off",
+                         prev_svgf_albedo_demod_active_ ? "demod" : "radiance");
+            }
+            prev_svgf_albedo_demod_active_ = effective_demod;
         }
 
         // Top-level Kind: tells the backend which denoiser

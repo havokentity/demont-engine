@@ -32,10 +32,18 @@
 
 [[vk::binding(0, 0)]] RWTexture2D<float4> demod_in;     // SVGF chain's last write, demodulated lighting (RGBA16F)
 [[vk::binding(1, 0)]] RWTexture2D<float4> color_out;    // textured radiance for bloom + tonemap (RGBA16F)
-// Sample-only albedo binding, mirroring the slot DenoiseTemporal /
-// DenoiseAtrous use, so the engine plumbs the same texture handle into
-// all three passes without divergent layouts.
-[[vk::binding(12, 0)]] Texture2D<float4> albedo_tex;
+// Read-only albedo binding. Vulkan binds slot 12 as STORAGE_IMAGE
+// (the texture has STORAGE_BIT only), so SPIR-V wants `RWTexture2D`
+// (Sampled=2). On Metal we keep `Texture2D` so the MSL emit is
+// `access::sample`, which doesn't count against the 8-RW-texture
+// per-kernel cap. Same slot DenoiseTemporal / DenoiseAtrous use, so
+// the engine plumbs the same texture handle into all three passes
+// without divergent layouts.
+#ifdef PT_TARGET_SPIRV
+[[vk::binding(12, 0)]] RWTexture2D<float4> albedo_tex;
+#else
+[[vk::binding(12, 0)]] Texture2D<float4>   albedo_tex;
+#endif
 
 [[vk::push_constant]]
 cbuffer Push {
