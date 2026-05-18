@@ -4,7 +4,10 @@
 # Cocoa-specific .mm files build only on Apple. On other platforms we
 # compile a stub TU that provides the same C-extern symbols as no-ops
 # so the Vulkan backend's link is satisfied without a Cocoa runtime.
-set(_pt_window_sources Window.cpp)
+set(_pt_window_sources
+    Window.cpp
+    Gamepad.cpp
+)
 if(APPLE)
     list(APPEND _pt_window_sources
         Window_Cocoa.mm

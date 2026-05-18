@@ -7,6 +7,7 @@
 #include "FrameCapture.h"
 
 #include "../app/ConsoleOverlay.h"
+#include "../app/Gamepad.h"
 #include "../app/PerfOverlay.h"
 #include "../app/Window.h"
 #include "../console/Console.h"
@@ -494,6 +495,34 @@ namespace cvar {
     PT_CVAR(cam_pos,           "0 1.5 4", "Camera position (x y z)",       CVAR_ARCHIVE);
     PT_CVAR(cam_yaw,           "0",       "Yaw in degrees",                CVAR_ARCHIVE);
     PT_CVAR(cam_pitch,         "-11.5",   "Pitch in degrees (clamped +/- 85)", CVAR_ARCHIVE);
+    // Gamepad input (#83). MVP: left stick = translate (forward / strafe),
+    // right stick = look (yaw / pitch), triggers = sprint (analog blend
+    // 0..1, additive with shift-key sprint). GLFW's gamepad API wraps
+    // SDL2's controller DB so Xbox / DualSense / Switch Pro all work
+    // out of the box. No haptics / rumble in MVP -- GLFW doesn't expose
+    // them; would need SDL2 or HIDAPI as a follow-up.
+    PT_CVAR(cam_gamepad,                  "1",
+            "Gamepad input master toggle. 1 = poll slot 0 every frame "
+            "and feed its left/right sticks + triggers into the camera; "
+            "0 = ignore the pad even if connected. Hot-pluggable -- "
+            "no engine restart needed.",
+            CVAR_ARCHIVE);
+    PT_CVAR(cam_gamepad_deadzone,         "0.15",
+            "Radial deadzone on both sticks in [0, 1] of the native "
+            "stick magnitude. Sticks inside this radius read as 0; "
+            "outside it the surviving magnitude is rescaled to [0, 1] "
+            "so there's no snap at the boundary. 0.15 covers the "
+            "typical Xbox / DualSense rest-position jitter; raise to "
+            "0.25 for worn-out sticks, lower toward 0.05 for precision "
+            "aiming.",
+            CVAR_ARCHIVE);
+    PT_CVAR(cam_gamepad_look_sensitivity, "2.0",
+            "Right-stick look sensitivity in radians/second at full "
+            "deflection (post-deadzone magnitude == 1). At 2.0 a full-"
+            "tilt right stick yaws ~115 deg/sec; raise for snappier "
+            "look, lower for cinematic / precision pans. Independent "
+            "of cam_sensitivity (which is mouse degrees/pixel).",
+            CVAR_ARCHIVE);
     // Camera-state slots for the cam_save / cam_load / cam_list / cam_reset
     // commands (registered in RegisterCommands). Slots 1..9 are user-
     // savable via `cam_save [N]`; slot 0 is the engineering default
@@ -5590,7 +5619,37 @@ void Engine::UpdateCamera(double dt) {
     if (auto* v = C.FindCVar("cam_sprint_mult")) sprint = v->GetFloat();
 
     bool shift = window_->IsKeyDown(340) || window_->IsKeyDown(344);  // L/R Shift
-    if (shift) speed *= sprint;
+
+    // Gamepad input (#83). Polled before the sprint multiplier is
+    // applied so the trigger contribution can blend into `sprint_mult`
+    // alongside the shift-key bool. Read deadzone + look sensitivity
+    // from cvars every frame; both are CVAR_ARCHIVE so live edits via
+    // the console propagate immediately.
+    bool   pad_enabled = true;
+    float  pad_dz      = 0.15f;
+    float  pad_look_s  = 2.0f;
+    if (auto* v = C.FindCVar("cam_gamepad"))                  pad_enabled = v->GetBool();
+    if (auto* v = C.FindCVar("cam_gamepad_deadzone"))         pad_dz      = v->GetFloat();
+    if (auto* v = C.FindCVar("cam_gamepad_look_sensitivity")) pad_look_s  = v->GetFloat();
+
+    pt::app::GamepadState pad;
+    if (pad_enabled) {
+        pad = pt::app::PollGamepad(pad_dz);
+        pt::app::LogConnectionTransitions(pad);
+    }
+
+    // Triggers extend the shift-key sprint. We pick the larger of the
+    // two trigger values so either L2 or R2 alone works (different
+    // games prefer different mappings). The result blends linearly
+    // between `speed` (no trigger) and `speed * sprint` (full trigger);
+    // additive with shift so holding both gives the same sprint cap.
+    float trig_max = std::max(pad.left_trigger, pad.right_trigger);
+    bool  sprint_on = shift || trig_max > 0.0f;
+    if (sprint_on) {
+        // Blend factor: shift counts as full trigger.
+        float blend = shift ? 1.0f : trig_max;
+        speed *= 1.0f + (sprint - 1.0f) * blend;
+    }
 
     glm::vec3 fwd   = camera_->Forward();
     glm::vec3 right = camera_->Right();
@@ -5603,6 +5662,30 @@ void Engine::UpdateCamera(double dt) {
     if (window_->IsKeyDown(341)) wm -= glm::vec3(0,1,0);  // L Ctrl
     if (glm::dot(wm, wm) > 0.0f) {
         camera_->pos += glm::normalize(wm) * (speed * static_cast<float>(dt));
+    }
+
+    // Gamepad translation: left stick maps to (strafe, forward). We
+    // scale by stick magnitude (already in [0, 1] post-deadzone) so
+    // partial deflection slows the camera proportionally -- matches
+    // analog stick UX. Sprint multiplier above already factored into
+    // `speed`. Decoupled from the keyboard path so the two can be
+    // used simultaneously (e.g. WASD + look with the right stick).
+    if (pad.connected && (pad.left_x != 0.0f || pad.left_y != 0.0f)) {
+        glm::vec3 pad_move = right * pad.left_x + fwd * pad.left_y;
+        // Don't re-normalise -- stick magnitude IS the intent.
+        camera_->pos += pad_move * (speed * static_cast<float>(dt));
+    }
+
+    // Gamepad look: right stick maps to (yaw, pitch). Sign convention
+    // matches the mouse-look path -- +X yaws right (clockwise from
+    // above), +Y pitches up. Scaled by sensitivity (radians/sec at
+    // full deflection) and dt. Runs whether or not RMB is held so the
+    // pad can drive the camera without engaging mouse-look mode.
+    if (pad.connected && (pad.right_x != 0.0f || pad.right_y != 0.0f)) {
+        float rate    = pad_look_s * static_cast<float>(dt);
+        camera_->yaw   += pad.right_x * rate;
+        camera_->pitch += pad.right_y * rate;
+        camera_->ClampPitch();
     }
 
     // Pull live overrides from cvars if the user typed them.  The
