@@ -23,17 +23,26 @@ extern const unsigned char shader_DenoiseTemporal_metal_data[];
 extern const unsigned long shader_DenoiseTemporal_metal_size;
 extern const unsigned char shader_DenoiseAtrous_metal_data[];
 extern const unsigned long shader_DenoiseAtrous_metal_size;
+// Issue #119 -- albedo remod kernel.
+extern const unsigned char shader_DenoiseRemod_metal_data[];
+extern const unsigned long shader_DenoiseRemod_metal_size;
 }
 
 namespace pt::rhi::mtl {
 
 namespace {
 
-// 32-byte push struct shared by both denoise kernels. Field names are
+// 48-byte push struct shared by both denoise kernels. Field names are
 // kernel-specific (see DenoiseTemporal.slang / DenoiseAtrous.slang) but
 // the layout matches what DenoisePush in VulkanDenoiser.cpp emits, so
 // the Slang MSL emission for the [[vk::push_constant]] cbuffer maps
 // cleanly onto this struct.
+//
+// Layout history:
+//   - Original 32 bytes: width, height, step_or_reset, pad, a, b, c, pad.
+//   - Issue #119 grows to 48 bytes by appending demod_enabled +
+//     final_remod (atrous-only) + 8 bytes of pad. std140 aligns the
+//     push block to 16 bytes; 48 is the next multiple after 32+8 = 40.
 struct DenoisePush {
     std::uint32_t width;
     std::uint32_t height;
@@ -43,8 +52,26 @@ struct DenoisePush {
     float         b;     // temporal: normal_tolerance; atrous: sigma_normal
     float         c;     // temporal: min_alpha; atrous: sigma_color
     float         pad1;
+    // Issue #119 -- demod gate (both kernels) and remod gate (atrous
+    // only). Temporal leaves final_remod unread; atrous reads it on
+    // the LAST pass of its chain when also writing into `output`.
+    std::uint32_t demod_enabled;
+    std::uint32_t final_remod;
+    std::uint32_t pad2;
+    std::uint32_t pad3;
 };
-static_assert(sizeof(DenoisePush) == 32, "DenoisePush layout");
+static_assert(sizeof(DenoisePush) == 48, "DenoisePush layout");
+
+// Issue #119 -- 16-byte push struct for the remod-only kernel
+// (DenoiseRemod.slang). Just enough to carry the dispatch size; the
+// kernel reads `demod_in` + `albedo_tex` and writes `color_out`.
+struct RemodPush {
+    std::uint32_t width;
+    std::uint32_t height;
+    std::uint32_t pad0;
+    std::uint32_t pad1;
+};
+static_assert(sizeof(RemodPush) == 16, "RemodPush layout");
 
 constexpr const char* kEntryPoint = "main_0";  // Slang renames `main`
 
@@ -114,6 +141,7 @@ void MetalSvgfDenoiser::DestroyAll() {
     if (dummy_motion_) { dummy_motion_->release(); dummy_motion_ = nullptr; }
     if (temporal_pso_) { temporal_pso_->release(); temporal_pso_ = nullptr; }
     if (atrous_pso_)   { atrous_pso_->release();   atrous_pso_   = nullptr; }
+    if (remod_pso_)    { remod_pso_->release();    remod_pso_    = nullptr; }
     ready_ = false;
 }
 
@@ -150,7 +178,13 @@ bool MetalSvgfDenoiser::Init() {
     atrous_pso_   = BuildPso(dev, shader_DenoiseAtrous_metal_data,
                               shader_DenoiseAtrous_metal_size,
                               "DenoiseAtrous");
-    if (temporal_pso_ == nullptr || atrous_pso_ == nullptr) {
+    // Issue #119 -- albedo remod pass. Built unconditionally so we can
+    // toggle r_svgf_albedo_demod at runtime without a backend re-init.
+    remod_pso_    = BuildPso(dev, shader_DenoiseRemod_metal_data,
+                              shader_DenoiseRemod_metal_size,
+                              "DenoiseRemod");
+    if (temporal_pso_ == nullptr || atrous_pso_ == nullptr ||
+        remod_pso_ == nullptr) {
         DestroyAll();
         return false;
     }
@@ -236,10 +270,12 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
                                 MTL::Texture*       depth_in,
                                 MTL::Texture*       motion_in,
                                 MTL::Texture*       normal_in,
+                                MTL::Texture*       albedo_in,
                                 MTL::Texture*       output,
                                 bool                reset_history,
                                 bool                atrous_enabled,
-                                std::uint32_t       atrous_passes) {
+                                std::uint32_t       atrous_passes,
+                                bool                albedo_demod_enabled) {
     if (!ready_ || cb == nullptr) return;
     if (color_in == nullptr || depth_in == nullptr || motion_in == nullptr ||
         normal_in == nullptr || output == nullptr) {
@@ -250,6 +286,14 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
         LOG_WARN("MetalSvgfDenoiser::Encode: textures not yet sized");
         return;
     }
+    // Issue #119 -- demod requires the albedo G-buffer. When the engine
+    // didn't allocate it (older r_denoiser kinds, or a transition frame
+    // before resize fires) we silently fall back to non-demod behaviour
+    // and bind the dummy placeholder so the kernel's [[texture(12)]]
+    // slot stays well-formed. The kernel's `demod_enabled = 0` push
+    // gate then short-circuits every divide / multiply.
+    const bool demod_active = albedo_demod_enabled && (albedo_in != nullptr);
+    MTL::Texture* albedo_bind = (albedo_in != nullptr) ? albedo_in : dummy_color_;
 
     // Frame-parity ping-pong for cross-frame textures: history read =
     // parity side, history write = other side. Mirror of
@@ -292,6 +336,13 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
         // DenoiseTemporal.metal):
         //   [[texture(N)]]  -- N matches the Slang [[vk::binding(N,0)]]
         //                      slot for storage-image bindings 0..7.
+        //   [[texture(12)]] -- Issue #119, sample-only `Texture2D`
+        //                      albedo at binding 12. Sample access does
+        //                      NOT count toward Metal's 8-RW-texture
+        //                      compute cap (which we're already at
+        //                      with slots 0..7), so the slang->MSL
+        //                      emission emits this as a 9th texture
+        //                      argument without crashing.
         //   [[buffer(0..3)]] -- Slang bindings 8..11 map 1:1 onto MSL
         //                       buffer slots 0..3, in declaration order.
         //                       Slot 2 (variance_in_unused) is DCE'd
@@ -309,6 +360,7 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
         enc->setTexture(temporal_color_out, 5);
         enc->setTexture(depth_hist_read,    6);
         enc->setTexture(normal_hist_read,   7);
+        enc->setTexture(albedo_bind,       12);
 
         enc->setBuffer(moments_hist_read,   0, 0); // moments_history_in  (binding 8)
         enc->setBuffer(moments_hist_write,  0, 1); // moments_history_out (binding 9)
@@ -322,6 +374,10 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
         p.a             = 0.10f;   // depth_tolerance (relative)
         p.b             = 0.85f;   // normal_tolerance (cos angle)
         p.c             = 0.10f;   // min_alpha (steady-state blend)
+        p.demod_enabled = demod_active ? 1u : 0u;
+        p.final_remod   = 0u;       // temporal never remod's; its color_out
+                                    // is hist_write (the SVGF feedback target)
+                                    // which must stay demodulated.
         enc->setBytes(&p, sizeof(p), 4);
         enc->dispatchThreadgroups(groups, tgsize);
         enc->endEncoding();
@@ -330,6 +386,14 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
     // ---- Depth + normal history copy (blit encoder) ----------------
     // The next frame's temporal pass reads these as the "previous
     // frame's surfaces" for reprojection validation.
+    //
+    // Issue #119 -- with demod ON we'd otherwise have to blit
+    // hist_write -> output for svgf_basic, but hist_write is in
+    // demodulated lighting space and `output` must hold textured
+    // radiance. Defer the svgf_basic publish to a compute remod pass
+    // below in that case; the blit here only takes care of depth +
+    // normal history (and, for the demod-OFF svgf_basic case, the
+    // existing color blit to output).
     {
         MTL::BlitCommandEncoder* blit = cb->blitCommandEncoder();
         MTL::Origin org = MTL::Origin::Make(0, 0, 0);
@@ -339,13 +403,39 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
         blit->copyFromTexture(normal_in, 0, 0, org, sz,
                               normal_hist_write, 0, 0, org);
 
-        if (!atrous_enabled) {
-            // svgf_basic: temporal wrote to hist_write; blit to the
-            // caller's output. Same RGBA16F format, same dims.
+        if (!atrous_enabled && !demod_active) {
+            // svgf_basic, demod off: temporal wrote modulated radiance
+            // to hist_write; blit straight to the caller's output.
+            // Same RGBA16F format, same dims.
             blit->copyFromTexture(hist_write, 0, 0, org, sz,
                                   output,     0, 0, org);
         }
         blit->endEncoding();
+    }
+
+    // ---- svgf_basic + demod ON: remod hist_write -> output ---------
+    // The temporal pass wrote a demodulated-lighting estimate to
+    // hist_write (the SVGF feedback target). Multiply by albedo and
+    // publish into the caller's output so the bloom + tonemap chain
+    // sees textured radiance. Dispatch a compute encoder rather than
+    // a blit so we can sample the albedo per-pixel.
+    if (!atrous_enabled && demod_active) {
+        MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
+        enc->setComputePipelineState(remod_pso_);
+        // DenoiseRemod.slang slot map:
+        //   [[texture(0)]]  -- demod_in   (RGBA16F demodulated lighting)
+        //   [[texture(1)]]  -- color_out  (RGBA16F textured radiance)
+        //   [[texture(12)]] -- albedo_tex (sample-only)
+        //   [[buffer(0)]]   -- push constants
+        enc->setTexture(hist_write,   0);
+        enc->setTexture(output,       1);
+        enc->setTexture(albedo_bind, 12);
+        RemodPush rp{};
+        rp.width  = w;
+        rp.height = h;
+        enc->setBytes(&rp, sizeof(rp), 0);
+        enc->dispatchThreadgroups(groups, tgsize);
+        enc->endEncoding();
     }
 
     // ---- A-Trous chain (atrous_enabled only) -----------------------
@@ -373,7 +463,8 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
                                MTL::Texture* color_dst,
                                MTL::Buffer*  var_src,
                                MTL::Buffer*  var_dst,
-                               std::uint32_t step) {
+                               std::uint32_t step,
+                               bool          is_final_pass) {
             // Slang MSL slot map for the atrous kernel (same policy as
             // temporal -- bindings 8..11 -> buffers 0..3, push at 4):
             //   texture(1, 3, 6, 7) -- declared but DCE'd from kernel
@@ -381,6 +472,9 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
             //     because Metal silently ignores binds to slots not
             //     present in the kernel signature, and this keeps the
             //     host code symmetric with the Vulkan path.
+            //   texture(12)         -- albedo (sample-only); read for
+            //     per-tap demod-divide and (on the final pass when
+            //     final_remod is set) the multiply-back into color_out.
             //   buffer(0, 1)        -- moments_in_unused /
             //     moments_out_unused, also DCE'd. We bind the parity-
             //     side moments buffer at both slots; the shader never
@@ -396,6 +490,7 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
             enc->setTexture(color_dst,         5);
             enc->setTexture(depth_hist_write,  6);
             enc->setTexture(normal_hist_write, 7);
+            enc->setTexture(albedo_bind,      12);
 
             enc->setBuffer(moments_hist_write, 0, 0); // moments_in_unused  (DCE'd)
             enc->setBuffer(moments_hist_write, 0, 1); // moments_out_unused (DCE'd)
@@ -413,6 +508,16 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
                                         // smooth on diffuse surfaces -- 1.0 keeps
                                         // the noise rejection without averaging
                                         // through 4-sigma-wide luminance bands.
+            p.demod_enabled = demod_active ? 1u : 0u;
+            // Final-pass remod fires only when:
+            //   - demod is on
+            //   - this is the chain's last pass
+            //   - the pass is writing directly to `output` (n_passes >=
+            //     2; the n_passes == 1 case writes to hist_write first
+            //     and a separate remod kernel runs after the loop).
+            // Intermediate passes set this 0 so they leave the signal
+            // demodulated for the next pass's divide.
+            p.final_remod   = (demod_active && is_final_pass) ? 1u : 0u;
             enc->setBytes(&p, sizeof(p), 4);
             enc->dispatchThreadgroups(groups, tgsize);
             // Inter-dispatch barrier flushes pending texture AND buffer
@@ -433,17 +538,27 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
         for (std::uint32_t i = 1; i <= n_passes; ++i) {
             const std::uint32_t step = 1u << (i - 1u);
             MTL::Texture* color_dst;
+            // Identify which pass writes directly to the caller's
+            // `output` (so the shader can remod inline). For n_passes
+            // == 1 the pass writes to hist_write (feedback target) and
+            // the remod runs as a separate dispatch below. For
+            // n_passes >= 2 the LAST pass writes to `output` and that
+            // pass takes `is_final_pass = true` so the shader applies
+            // the multiply-back inline.
+            bool writes_to_output = false;
             if (i == 1u) {
                 color_dst = hist_write;
             } else if (i == n_passes) {
                 color_dst = output;
+                writes_to_output = true;
             } else {
                 // Even i -> atrous_b_, odd i -> atrous_a_. After pass 1
                 // atrous_a_ is no longer read, so we're free to reuse
                 // it as a ping-pong scratch for i >= 3.
                 color_dst = (i % 2u == 0u) ? atrous_b_ : atrous_a_;
             }
-            atrous_pass(color_src, color_dst, var_src, var_dst, step);
+            atrous_pass(color_src, color_dst, var_src, var_dst, step,
+                        writes_to_output);
             color_src = color_dst;
             std::swap(var_src, var_dst);
         }
@@ -451,14 +566,33 @@ void MetalSvgfDenoiser::Encode(MTL::CommandBuffer* cb,
 
         if (n_passes == 1u) {
             // One-pass path: pass 1's output sits in hist_write (the
-            // feedback target). Publish a copy to the caller's output.
-            // Same RGBA16F format / dims, both in MTLStorageModePrivate.
-            MTL::BlitCommandEncoder* blit2 = cb->blitCommandEncoder();
-            MTL::Origin org = MTL::Origin::Make(0, 0, 0);
-            MTL::Size   sz  = MTL::Size::Make(w, h, 1);
-            blit2->copyFromTexture(hist_write, 0, 0, org, sz,
-                                   output,     0, 0, org);
-            blit2->endEncoding();
+            // feedback target, kept in demodulated lighting space when
+            // demod is on so the next frame's temporal divide composes
+            // correctly). Publish into the caller's `output`:
+            //   - demod off: blit hist_write -> output (legacy path).
+            //   - demod on:  dispatch the remod compute kernel so the
+            //     albedo multiply-back lands in `output` while
+            //     hist_write keeps its demodulated value for feedback.
+            if (!demod_active) {
+                MTL::BlitCommandEncoder* blit2 = cb->blitCommandEncoder();
+                MTL::Origin org = MTL::Origin::Make(0, 0, 0);
+                MTL::Size   sz  = MTL::Size::Make(w, h, 1);
+                blit2->copyFromTexture(hist_write, 0, 0, org, sz,
+                                       output,     0, 0, org);
+                blit2->endEncoding();
+            } else {
+                MTL::ComputeCommandEncoder* enc2 = cb->computeCommandEncoder();
+                enc2->setComputePipelineState(remod_pso_);
+                enc2->setTexture(hist_write,   0);
+                enc2->setTexture(output,       1);
+                enc2->setTexture(albedo_bind, 12);
+                RemodPush rp{};
+                rp.width  = w;
+                rp.height = h;
+                enc2->setBytes(&rp, sizeof(rp), 0);
+                enc2->dispatchThreadgroups(groups, tgsize);
+                enc2->endEncoding();
+            }
         }
     }
 

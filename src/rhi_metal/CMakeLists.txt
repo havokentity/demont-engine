@@ -155,6 +155,17 @@ pt_compile_slang(
     ENTRY   main
     TARGETS metal
 )
+# Issue #119 -- SVGF albedo remodulation pass. Multiplies the
+# demodulated lighting from the SVGF chain by the primary-hit
+# albedo G-buffer to restore textured radiance before bloom + tonemap.
+# Built on Metal alongside the temporal + atrous kernels.
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/DenoiseRemod.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+)
 
 pt_set_compiler_options(pt_rhi_metal)
 

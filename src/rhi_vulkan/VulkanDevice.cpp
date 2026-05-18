@@ -3404,14 +3404,17 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
         (d.quality == DenoiseDesc::Quality::Atrous);
     denoiser_->Encode(wrapped_cb_->Raw(),
                       d.color_in, d.depth_in, d.motion_in,
-                      d.normal_in, d.output,
+                      d.normal_in,
+                      d.albedo_in,           // issue #119
+                      d.output,
                       d.final_output, d.exposure_state,
                       d.bloom_in, d.bloom_intensity,
                       d.reset_history,
                       atrous_enabled,
                       d.atrous_passes,
                       d.hdr_pipeline,
-                      d.stars_in);
+                      d.stars_in,
+                      d.albedo_demod_enabled);  // issue #119
 }
 
 }  // namespace pt::rhi::vk
