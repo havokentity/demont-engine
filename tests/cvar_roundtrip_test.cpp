@@ -273,3 +273,85 @@ TEST_CASE("cvar allowed_values: auto/prompt/warn gate accepts valid, rejects oth
     CHECK_FALSE(r_case.ok);
     CHECK(v->value == "warn");
 }
+
+// --- Test 5: ExecuteScript treats ';' inside '#' / '//' comments as data --
+// Regression for the smoke-exec fatal-init bug discovered 2026-05-18.
+// ExecuteScript splits its body into statements at '\n' and ';', then
+// hands each statement to Execute() which strips '#' / '//' comments.
+// Previously the script-level split was naive: a fixture comment like
+//   # (golden-hour, not yet twilight; civil twilight is sun 0 to -6)
+// split into a comment-prefix line plus a bogus `civil twilight ...`
+// line, and Execute() reported `unknown command or cvar: 'civil'`.
+// The smoke-runner treats Execute errors as fatal -> engine init
+// aborted -> no golden PNG -> CI failure. Same trap for `;` inside a
+// `// ...` C++-style full-line comment and inside a quoted string.
+//
+// The fix lives in Console.cpp ScanScriptStatementEnd() which makes
+// the script-level scanner comment-aware and quote-aware. This test
+// pins the behaviour so the fixture-comment cleanup doesn't have to
+// be repeated for every new fixture file we add.
+TEST_CASE("cvar parser: ';' inside '#' comments is NOT a statement separator") {
+    auto& C = pt::console::Console::Get();
+
+    C.RegisterCVar("test_rt_parser_aurora", "0", "aurora gate test",
+                   pt::console::CVAR_ARCHIVE);
+
+    // The exact comment shape that broke procedural_evening.cfg /
+    // lunar_night.cfg / bsc_night_clouds.cfg in CI run 26037168862.
+    // Inline '#' comment containing a ';' should be inert; the
+    // subsequent r_aurora set on the next line should still apply.
+    const std::string body =
+        "# (golden-hour, not yet twilight; civil twilight is sun 0 to -6)\n"
+        "test_rt_parser_aurora 1\n";
+    auto r = C.ExecuteScript(body);
+    CHECK(r.ok);                                            // no spurious unknown-cvar errors
+    CHECK(r.error.find("civil")   == std::string::npos);    // 'civil' not parsed as a command
+    CHECK(r.error.find("unknown") == std::string::npos);
+    auto* v = C.FindCVar("test_rt_parser_aurora");
+    REQUIRE(v != nullptr);
+    CHECK(v->GetInt() == 1);                                // the real set after the comment took effect
+
+    // Same with a '//' full-line comment containing ';'.
+    C.Execute("test_rt_parser_aurora 0");
+    REQUIRE(v->GetInt() == 0);
+    const std::string body2 =
+        "// note: tonemap; bloom; lens flare all off below\n"
+        "test_rt_parser_aurora 1\n";
+    auto r2 = C.ExecuteScript(body2);
+    CHECK(r2.ok);
+    CHECK(r2.error.find("unknown") == std::string::npos);
+    CHECK(v->GetInt() == 1);
+
+    // Inline `r_x 0 # comment with ;` form (the documented
+    // shell-style trailing comment) must still drop the comment AND
+    // not treat the ';' as a statement separator that would start a
+    // new statement with leftover comment text.
+    C.Execute("test_rt_parser_aurora 0");
+    const std::string body3 = "test_rt_parser_aurora 1 # turn it on; final state\n";
+    auto r3 = C.ExecuteScript(body3);
+    CHECK(r3.ok);
+    CHECK(r3.error.find("unknown") == std::string::npos);
+    CHECK(v->GetInt() == 1);
+
+    // Sanity: real `;` outside a comment STILL works as a separator
+    // (the user-typed "set two cvars on one line" use case).
+    C.RegisterCVar("test_rt_parser_pair_a", "0", "pair a", pt::console::CVAR_ARCHIVE);
+    C.RegisterCVar("test_rt_parser_pair_b", "0", "pair b", pt::console::CVAR_ARCHIVE);
+    auto r4 = C.ExecuteScript("test_rt_parser_pair_a 7; test_rt_parser_pair_b 9");
+    CHECK(r4.ok);
+    auto* a = C.FindCVar("test_rt_parser_pair_a");
+    auto* b = C.FindCVar("test_rt_parser_pair_b");
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    CHECK(a->GetInt() == 7);
+    CHECK(b->GetInt() == 9);
+
+    // Sanity: quoted `;` is data, not a separator.
+    C.RegisterCVar("test_rt_parser_quoted", "default", "quoted ; test",
+                   pt::console::CVAR_ARCHIVE);
+    auto r5 = C.ExecuteScript("test_rt_parser_quoted \"a;b;c\"");
+    CHECK(r5.ok);
+    auto* q = C.FindCVar("test_rt_parser_quoted");
+    REQUIRE(q != nullptr);
+    CHECK(q->value == "a;b;c");
+}

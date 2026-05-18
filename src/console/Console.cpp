@@ -582,6 +582,52 @@ ExecuteResult Console::Execute(std::string_view line) {
     return result;
 }
 
+namespace {
+
+// Find the end of the next logical statement starting at body[i].
+// Statements end at '\n' OR at ';' that is OUTSIDE of quoted strings
+// AND OUTSIDE of '#' / '//' comments. The body slice [i, end) is then
+// passed to Execute(), which handles in-line comment stripping itself.
+//
+// Keeps the user-typed `r_a 0; r_b 1` two-statement form working while
+// preventing a stray ';' inside a `# ...` or `// ...` comment from
+// erroneously splitting a single comment line into a comment plus a
+// junk command. Without this, a fixture like
+//     # (golden-hour, not yet twilight; civil twilight is sun 0 to -6)
+// would split into a (correctly-stripped) `# (golden-hour, not yet
+// twilight` plus a bogus ` civil twilight is sun 0 to -6)` which the
+// engine reports as `unknown command or cvar: 'civil'` and the smoke
+// runner treats as a fatal init error.
+//
+// Mirrors the quote/escape handling Execute() does so cfg files can
+// quote a literal `;` inside a string token and have it survive the
+// script-level split.
+std::size_t ScanScriptStatementEnd(std::string_view body, std::size_t i) {
+    bool in_quote   = false;
+    bool escape     = false;
+    bool in_comment = false;
+    std::size_t end = i;
+    while (end < body.size()) {
+        char c = body[end];
+        if (c == '\n') break;
+        if (in_comment) { ++end; continue; }
+        if (escape)     { escape = false; ++end; continue; }
+        if (c == '\\')  { escape = true; ++end; continue; }
+        if (c == '"')   { in_quote = !in_quote; ++end; continue; }
+        if (!in_quote) {
+            if (c == '#') { in_comment = true; ++end; continue; }
+            if (c == '/' && end + 1 < body.size() && body[end + 1] == '/') {
+                in_comment = true; end += 2; continue;
+            }
+            if (c == ';') break;
+        }
+        ++end;
+    }
+    return end;
+}
+
+}  // namespace
+
 ExecuteResult Console::ExecuteScript(std::string_view body) {
     ExecuteResult agg;
     // Capture pre-transaction values of every cvar that the script
@@ -593,8 +639,7 @@ ExecuteResult Console::ExecuteScript(std::string_view body) {
     if (!in_undo_redo_) {
         std::size_t i = 0;
         while (i < body.size()) {
-            std::size_t end = i;
-            while (end < body.size() && body[end] != '\n' && body[end] != ';') ++end;
+            std::size_t end = ScanScriptStatementEnd(body, i);
             auto line = body.substr(i, end - i);
             // Find first non-whitespace, then first whitespace (token end).
             std::size_t a = 0;
@@ -614,8 +659,7 @@ ExecuteResult Console::ExecuteScript(std::string_view body) {
 
     std::size_t i = 0;
     while (i < body.size()) {
-        std::size_t end = i;
-        while (end < body.size() && body[end] != '\n' && body[end] != ';') ++end;
+        std::size_t end = ScanScriptStatementEnd(body, i);
         auto line = body.substr(i, end - i);
         auto r = Execute(line);
         if (!r.ok) {
