@@ -8259,6 +8259,33 @@ void Engine::Run() {
         //      flight, or may have failed silently. If we've been
         //      waiting past kSmokeNoDeviceTimeoutSec the in-flight
         //      case is implausible -- treat it as a silent failure.
+        // Device-lost correctness floor (VkResult check work, parallel
+        // PR series): if a vk* call inside the engine's per-frame work
+        // (vkQueueSubmit / vkWaitForFences) latched IsDeviceLost,
+        // there is no useful frame to count -- the GPU is dead and the
+        // engine has been silently rendering against nothing. Fail the
+        // smoke test loud and request a clean exit. The non-smoke
+        // operator gets a single LOG_ERROR (rate-limited by the
+        // already-quit branch) and the loop terminates next iteration.
+        // Independent of, and ordered before, the budget accounting
+        // below so a device-lost on the very last frame still produces
+        // a "fail" verdict instead of a coincidental "rendered N frames"
+        // success.
+        if (device_ && device_->IsDeviceLost() && !device_lost_observed_) {
+            device_lost_observed_ = true;
+            LOG_ERROR("engine: backend device reports DEVICE_LOST "
+                      "(rhi='{}'). Render output from this point is "
+                      "undefined. Requesting exit.",
+                      device_->DeviceName());
+            if (smoke_frame_budget > 0) {
+                LOG_ERROR("smoke-test: device-lost mid-run -- failing "
+                          "the smoke test (exit code 2) instead of "
+                          "reporting silent success against a dead GPU.");
+                smoke_test_failed_ = true;
+            }
+            wants_quit_ = true;
+        }
+
         if (smoke_frame_budget > 0) {
             if (device_ && !loading_frame_active_) {
                 ++smoke_frames_rendered;
