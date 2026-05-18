@@ -145,10 +145,12 @@ TEST_CASE("transform: TRS world-translation lives in column 3") {
 }
 
 // --- world-to-view (lookAtRH) -------------------------------------------
-TEST_CASE("transform: lookAtRH places camera at clip-space origin") {
+TEST_CASE("transform: lookAtRH places camera at view-space origin") {
     // The engine uses lookAtRH everywhere; this is the canonical
     // "world coords -> camera-space coords" transform. After applying
-    // it, the camera's own position should land at the origin.
+    // it, the camera's own position should land at the view-space
+    // origin. (View space is the coord frame before projection -- clip
+    // space comes later, after multiplying by the projection matrix.)
     glm::vec3 cam_pos{2.0f, 3.0f, 4.0f};
     glm::vec3 cam_target{0.0f, 0.0f, 0.0f};
     glm::vec3 cam_up{0.0f, 1.0f, 0.0f};
@@ -318,6 +320,13 @@ TEST_CASE("transform: pixel-center ray direction matches FOV") {
     auto ndc_to_world_dir = [&](float ndcx, float ndcy) {
         glm::vec4 near_h = vp_inv * glm::vec4{ndcx, ndcy, 0.0f, 1.0f};
         glm::vec4 far_h  = vp_inv * glm::vec4{ndcx, ndcy, 1.0f, 1.0f};
+        // Guard the perspective divide: w==0 would produce inf/NaN
+        // directions and silently pass the cos(fov/2) check below as
+        // garbage. Earlier tests pin this on simpler matrices; pin it
+        // here too so a future refactor of inverse() / perspective()
+        // can't slip a degenerate VP_inv past us.
+        REQUIRE(near_h.w != 0.0f);
+        REQUIRE(far_h.w  != 0.0f);
         glm::vec3 near_pos{near_h / near_h.w};
         glm::vec3 far_pos{far_h  / far_h.w};
         return glm::normalize(far_pos - near_pos);
