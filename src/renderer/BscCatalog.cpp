@@ -2,6 +2,8 @@
 // Copyright (c) 2026 Rajesh D'Monte
 #include "BscCatalog.h"
 
+#include "../core/Tracy.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -30,6 +32,7 @@ T read_le(const std::uint8_t*& p) {
 }  // namespace
 
 std::vector<Star> LoadBsc5(const std::string& path, std::string* err) {
+    PT_ZONE_SCOPED_N("stars::LoadBsc5");
     std::vector<Star> stars;
     std::ifstream in(path, std::ios::binary);
     if (!in) {
@@ -106,6 +109,7 @@ std::vector<Star> LoadBsc5(const std::string& path, std::string* err) {
 void RasteriseJ2000Map(const std::vector<Star>& stars,
                        std::uint32_t W, std::uint32_t H,
                        std::vector<float>& out) {
+    PT_ZONE_SCOPED_N("stars::RasteriseJ2000Map");
     out.assign(std::size_t(W) * H * 4, 0.0f);
     if (stars.empty() || W == 0 || H == 0) return;
 

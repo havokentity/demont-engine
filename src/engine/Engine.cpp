@@ -7,8 +7,10 @@
 #include "FrameCapture.h"
 
 #include "../app/ConsoleOverlay.h"
+#include "../app/Gamepad.h"
 #include "../app/PerfOverlay.h"
 #include "../app/Window.h"
+#include "../audio/AudioSystem.h"
 #include "../console/Console.h"
 #include "../console/ConsoleServer.h"
 #include "../core/Diag.h"
@@ -16,13 +18,21 @@
 #include "../core/Jobs/JobSystem.h"
 #include "../core/Log.h"
 #include "../core/Memory/Memory.h"
+#include "../core/Tracy.h"
+#include "../destruction/VoxelGrid.h"
+#include "../destruction/Voxelizer.h"
 #include "../renderer/Astronomy.h"
 #include "../renderer/BscCatalog.h"
 #include "../renderer/MoonTexture.h"
+#include "../renderer/RestirReservoir.h"
 #include "../renderer/Camera.h"
 #include "../renderer/Csg/CsgScene.h"
+#include "../renderer/GltfImporter.h"
 #include "../renderer/HdrImage.h"
+#include "../renderer/LightTree.h"
 #include "../renderer/MeshGen.h"
+#include "../effects/ParticleSystem.h"
+#include "../physics/PhysicsSystem.h"
 #include "../rhi/CommandBuffer.h"
 #include "../rhi/Device.h"
 
@@ -250,7 +260,50 @@ namespace cvar {
     PT_CVAR(r_firefly_clamp,   "10",  "Per-contribution firefly clamp (per-channel ceiling on each indirect light contribution: env-NEE, ambient skylight, bounce-to-sky). Suppresses single-sample spikes from BSDF-sampled bounces hitting an HDRI sun pixel, while leaving camera-direct sky unbounded so the sun renders at full intensity. ACES saturates anything above ~5 to ~1.0 for SDR, so 10 preserves visible highlights and kills fireflies. 0 disables.", CVAR_ARCHIVE);
     PT_CVAR(r_quality,         "high",  "Master quality preset that drives r_spp, r_max_bounces, r_caustics, r_refract_bounces, etc. Options: low (fast, no caustics), medium (default-ish), high (caustics, more bounces), ultra (max). 'custom' leaves per-feature cvars as-is.", CVAR_ARCHIVE);
     PT_CVAR(r_caustics,        "1",  "Refractive shadow rays. 1 = NEE rays refract through dielectrics so glass/diamond produce caustic patterns; 0 = treat all dielectrics as opaque shadow blockers (faster, blocks any caustic). Path-tracer-correct in both modes.", CVAR_ARCHIVE);
-    PT_CVAR(r_refract_bounces, "4",  "Maximum dielectric refractions a single shadow ray may chain through before giving up (returns no contribution). Higher catches more multi-facet caustics; lower is faster.", CVAR_ARCHIVE);
+    PT_CVAR(r_refract_bounces, "4",  "Maximum dielectric refractions a single shadow ray may chain through before giving up (returns no contribution). Higher catches more multi-facet caustics; lower is faster. NOTE: water (#134) shares this budget -- needs >=1 to see refracted underwater geometry.", CVAR_ARCHIVE);
+    // --- Water Phase 1 (#134): shaded analytic plane with normal-map waves --
+    // r_water_* cvars feed PathTrace.slang's MAT_WATER BRDF branch via the
+    // water_params0 / water_params1 push fields.  All CVAR_ARCHIVE so a
+    // user's tuning persists across sessions.
+    PT_CVAR(r_water_absorption_r, "0.45",
+            "Per-channel Beer's-law absorption coefficient (1/m) on the RED "
+            "channel for MAT_WATER. Higher = red attenuates faster with "
+            "depth (more teal water). Default 0.45 matches the classic "
+            "Caribbean tint when combined with the green/blue defaults.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_water_absorption_g, "0.15",
+            "Per-channel Beer's-law absorption coefficient (1/m) on the "
+            "GREEN channel for MAT_WATER. Default 0.15.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_water_absorption_b, "0.05",
+            "Per-channel Beer's-law absorption coefficient (1/m) on the "
+            "BLUE channel for MAT_WATER. Default 0.05 -- blue survives "
+            "longest, giving the deep-water blue tint.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_water_ior, "1.33",
+            "Refractive index of water for MAT_WATER. Default 1.33 (real "
+            "water at 20C / 589 nm sodium line). Clamped to [1.0, 2.4] in "
+            "shader since lower than air is unphysical and higher than "
+            "diamond would be nonsense.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_water_wave_scale, "0.3",
+            "Normal-map wave frequency multiplier for MAT_WATER. Default "
+            "0.3 (cycles / m) -- ~3 m surface wavelength, calm-lake feel. "
+            "Higher = finer ripples, lower = longer swell.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_water_wave_amplitude, "0.2",
+            "Surface-normal perturbation strength for MAT_WATER. Default "
+            "0.2 -- subtle ripples without obvious noise patches. The "
+            "perturbation acts only on the SHADING normal in Phase 1; "
+            "the surface itself is geometrically flat. Phase 2 (FFT) "
+            "displaces real geometry.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_water_wave_speed, "1.0",
+            "Wave animation rate multiplier for MAT_WATER. 1.0 is roughly "
+            "physical for a calm lake; 0 freezes the surface (useful for "
+            "deterministic captures / goldens).",
+            CVAR_ARCHIVE);
+    // --- end Water Phase 1 ---------------------------------------------------
     PT_CVAR(r_denoiser,        "off",
             "Denoiser. off = noisy 1-spp, accumulating image only. "
             "metalfx = Mac MetalFX TemporalDenoisedScaler (Apple Silicon "
@@ -301,6 +354,19 @@ namespace cvar {
             "Clamped to 1..5. Higher passes cost ~1 ms each at 1080p; "
             "only affects r_denoiser svgf_atrous / nrd (svgf_basic skips "
             "the spatial chain entirely).",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_svgf_albedo_demod, "1",
+            "SVGF albedo demodulation (issue #119). 1 = divide the noisy "
+            "radiance by the primary-hit albedo on input to the SVGF "
+            "chain (temporal + a-trous), denoise the lighting-only "
+            "signal so the depth/normal/luminance edge-stops aren't "
+            "fighting surface texture detail, and multiply albedo back "
+            "on the way out. 0 = legacy pre-demod path (full radiance "
+            "through the chain). Affects r_denoiser = svgf_basic / "
+            "svgf_atrous / svgf_basic_metalfx / svgf_atrous_metalfx / "
+            "nrd; non-SVGF denoisers ignore this flag. Sky pixels "
+            "(albedo = 0) divide through a kDemodEps floor so the "
+            "multiply-back is a clean round-trip in fp16.",
             CVAR_ARCHIVE);
     PT_CVAR(r_hdr_pipeline,    "1",  "Linear-HDR pipeline through MetalFX. 1 = path tracer writes raw HDR, MetalFX denoises in HDR, post-pass applies exposure+ACES (recommended). 0 = path tracer pre-applies exposure+ACES, MetalFX denoises LDR, tonemap pass is a passthrough copy. Only affects the denoiser-on path.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom,           "1",  "HDR bloom (downsample/upsample pyramid, additive composite before ACES). 0 disables; tonemap then samples a 1x1 zero buffer.", CVAR_ARCHIVE);
@@ -384,6 +450,107 @@ namespace cvar {
             "noise tuning.",
             0);
     // --- end SDF Phase 1 -------------------------------------------------------
+    // --- SDF Phase 3 (#99) fractal cvars ---------------------------------------
+    // Defaults match the issue spec. Three knobs:
+    //   r_sdf_fractal_power : default exponent for Mandelbulb (the
+    //       textbook polar-power formula). 8 is the canonical bulb.
+    //       Mandelbox / Apollonian reuse this slot only as a fallback
+    //       when their per-leaf params[0] is zero; in practice each
+    //       fractal has its own canonical scale (Mandelbox 2.5,
+    //       Apollonian 1.3) and the fixture should set those
+    //       explicitly via the sdf_mandelbox / sdf_apollonian
+    //       commands.
+    //   r_sdf_fractal_iters : per-DE bounded iteration count
+    //       (4..16 practical; 12 is a good Mandelbulb default).
+    //       Independent of r_sdf_max_iters (which caps sphere-trace
+    //       steps, not DE iterations).
+    //   r_sdf_de_eps_scale  : multiplies the iteration-relaxed
+    //       surface-epsilon (`eps * (1 + scale * step_idx)`) in the
+    //       fractal sphere-trace, per the issue's "dist < eps *
+    //       scale * iter_count" relaxation. 0 falls back to the
+    //       constant-epsilon trace (matches analytic-SDF behaviour);
+    //       higher = looser termination = fewer steps wasted in
+    //       deep-recursion no-progress areas at the cost of slightly
+    //       softer silhouettes far from camera.
+    PT_CVAR(r_sdf_fractal_power,      "8",
+            "Default polar exponent for the Mandelbulb DE (textbook "
+            "power-n formula). 8 is the canonical bulb; 2..16 are "
+            "practically interesting. Mandelbox / Apollonian fall "
+            "back to this only when their per-leaf params[0] is zero; "
+            "each has its own canonical scale (Mandelbox 2.5, "
+            "Apollonian 1.3) and the fixture should set those "
+            "explicitly via the sdf_mandelbox / sdf_apollonian "
+            "commands.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_sdf_fractal_iters,      "12",
+            "Per-DE bounded iteration count for fractal SDFs "
+            "(Mandelbulb / Mandelbox / Apollonian). Independent of "
+            "r_sdf_max_iters (which caps sphere-trace STEPS, not the "
+            "per-step DE iteration). 4..16 is the practical range; "
+            "12 captures fine bulb detail with sane perf. Clamped "
+            "to 1..32 in the host.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_sdf_de_eps_scale,       "1.0",
+            "Iteration-relaxed surface-epsilon scale for fractal "
+            "sphere-tracing. The fractal trace terminates when "
+            "dist < r_sdf_epsilon * (1 + r_sdf_de_eps_scale * step_idx) "
+            "so deep-recursion areas accept a slightly looser hit "
+            "rather than burning the full step budget on micro-"
+            "progress. 0 falls back to the constant-epsilon trace "
+            "(matches analytic-SDF behaviour). Higher = fewer wasted "
+            "steps but slightly softer silhouettes far from camera.",
+            CVAR_ARCHIVE);
+    // --- end SDF Phase 3 -------------------------------------------------------
+    // --- Voxel destruction Phase 1 (#140) --------------------------------------
+    PT_CVAR(r_voxel_size,             "0.1",
+            "Voxel side length in metres for the destruction subsystem. "
+            "Default 0.1 m (10 cm chunks) -- the Minecraft / Teardown "
+            "reference size. Voxelization uses this value at the moment "
+            "`voxelize_object` is invoked; lowering it after a voxel grid "
+            "exists does NOT shrink existing voxels (re-run the command). "
+            "Maps directly to VoxelGrid::voxel_size on construction; "
+            "occupied voxels render as analytic boxes via the existing "
+            "SDF cluster path (one cluster per voxel, kSdfShapeBox).",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_voxelize_demo,          "0",
+            "1 = render every voxelized object as its chunky-box pile "
+            "INSTEAD of the source CSG mesh (A/B toggle for the "
+            "destruction Phase 1 visualization). Mesh / TLAS bindings "
+            "are suppressed for the frame so the path tracer sees only "
+            "the voxels; analytic primitives and SDF clusters render "
+            "alongside as usual. 0 reverts to original mesh rendering "
+            "with zero regression -- the voxel SDF clusters are pulled "
+            "out of the upload set so the shader doesn't even iterate "
+            "them. Idempotent on every frame via SyncVoxelDemoState.",
+            CVAR_ARCHIVE);
+    // --- end Voxel destruction Phase 1 -----------------------------------------
+    // --- SDF Phase 2 (#98) -----------------------------------------------------
+    PT_CVAR(r_sdf_normal_mode,        "0",
+            "SDF cluster normal evaluation mode: 0 = forward-mode "
+            "autodiff (default; one walk of the op-tree, gradient via "
+            "Dual3 chain rule, ~1.5x distance-eval cost), 1 = 6-tap "
+            "central differences (legacy / sanity check; 6x distance-"
+            "eval cost). Only affects clusters that contain Phase 2 "
+            "procedural ops (sdf_displace_noise / sdf_twist / sdf_bend "
+            "/ sdf_repeat / sdf_repeat_limited) -- Phase 1 (sphere / "
+            "box / smin / ...) always uses the closed-form analytic "
+            "gradient regardless of this setting. Forward-AD is "
+            "continuous in space (no epsilon-jitter that re-rolls per "
+            "bounce -- a variance reducer for the PT) and beats central "
+            "differences once DE complexity rises.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_sdf_displace_octaves,   "4",
+            "Default FBM octave count for sdf_displace_noise. Clamped "
+            "to 1..6 on the host (the shader's unroll bound). Higher = "
+            "more detail at the cost of N noise lookups per distance "
+            "eval. Each octave doubles the frequency and halves the "
+            "amplitude, so 6 covers ~32 m -> ~3 cm spatial range from a "
+            "base frequency of 1 / metre. Per-cluster overrides go via "
+            "the sdf_displace_noise console command's octaves arg; this "
+            "cvar is just the default the command uses when the user "
+            "omits the octaves field.",
+            CVAR_ARCHIVE);
+    // --- end SDF Phase 2 -------------------------------------------------------
     PT_CVAR(r_mis,             "1",
             "Multiple importance sampling for direct lighting on Lambert "
             "hits under HDRI. 1 = balance-heuristic MIS between env-map "
@@ -396,6 +563,21 @@ namespace cvar {
             "and dielectric paths are left on their existing code paths "
             "either way.",
             CVAR_ARCHIVE);
+    // --- Light tree (#129) ----------------------------------------------------
+    PT_CVAR(r_light_tree,      "1",
+            "Hierarchical light tree (Conty Estevez & Kulla 2018) for "
+            "O(log N) NEE light selection. 1 = traverse the tree to pick "
+            "lights weighted by combined cluster importance (intensity * "
+            "geometric falloff * emission-cone cosine); 2x-10x variance "
+            "reduction at 1 spp for scenes with >100 lights. 0 = fall back "
+            "to #73's naive uniform single-pick (regression-protection "
+            "toggle; statistically equivalent to the tree at very low light "
+            "counts, but much higher variance at high counts). The tree "
+            "itself is always built and uploaded; this cvar only flips the "
+            "shader-side picker between tree-traversal and uniform-pick, "
+            "so the runtime cost of toggling is zero.",
+            CVAR_ARCHIVE);
+    // --- end Light tree -------------------------------------------------------
     PT_CVAR(r_hdri_extract_percentile, "0.005",
             "Top-luminance percentile threshold (0..0.5) for HDRI light "
             "cluster extraction. Pixels above this percentile are flood-"
@@ -485,6 +667,150 @@ namespace cvar {
             "Higher = smoother sun/moon bokeh with DOF on; "
             "default 16 is the sweet spot.",
             CVAR_ARCHIVE);
+    // Aurora borealis procedural overlay (issue #116). Stateless
+    // post-denoise composite, runs once per frame on Metal between
+    // StarsComposite and the bloom pyramid. Zero performance cost when
+    // r_aurora == 0 -- the dispatch is elided engine-side.
+    PT_CVAR(r_aurora,           "0",
+            "Aurora borealis/australis procedural overlay. 0 = off "
+            "(zero cost, dispatch elided), 1 = render curl-noise driven "
+            "aurora ribbons in the upper sky at night (sun below "
+            "horizon). Procedural mode only -- no aurora when r_sky_mode "
+            "= hdri / gradient. See shaders/AuroraComposite.slang for "
+            "the visual construction.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_aurora_intensity, "1.0",
+            "Aurora brightness multiplier (0..2). 1.0 = nominal "
+            "kilo-rayleigh emission scaled to ~1.5 cd/m^2 in the "
+            "engine's HDR-linear units (comparable to half-moon-lit "
+            "sky); 2.0 = active geomagnetic-storm brightness.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_aurora_lat,       "70",
+            "Magnetic-pole latitude in degrees the aurora oval is "
+            "anchored to (positive = boreal, default 70 deg matches "
+            "the auroral oval around the geomagnetic north pole). "
+            "Drives the pole-alignment falloff: rays pointing toward "
+            "this elevation get full aurora density, rays away from "
+            "it fade smoothly to zero. Reduce toward 30-40 for "
+            "lower-latitude observers (cinematic; real aurora is "
+            "rarely visible that far south).",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_aurora_animate,   "1",
+            "Time-based shimmer animation. 0 = static curtain "
+            "(deterministic frame-to-frame, useful for golden-image "
+            "fixtures); 1 = ribbons drift and the fine-noise layer "
+            "evolves at ~0.03 rad/s for the 'waves traveling along "
+            "the curtain' look.",
+            CVAR_ARCHIVE);
+    // Issue #115: SVGF a-trous and MetalFX both smudge hard sun shadows
+    // on flat surfaces because their edge-stops (depth, normal,
+    // luminance) all see ~zero change across a shadow boundary on a
+    // single plane. SIGMA-style fix: write per-pixel sun visibility to
+    // a separate G-buffer, denoise that signal with a depth+normal
+    // bilateral, multiply the denoised visibility into the post-denoise
+    // HDR. NVIDIA's NRD ships this under the name SIGMA; this is our
+    // hand-rolled Slang implementation, Mac-first. Set to 0 to A/B
+    // against the legacy fold-into-radiance behaviour where SVGF /
+    // MetalFX get to smudge sun shadows.
+    PT_CVAR(r_shadow_demod,    "1",
+            "SIGMA-style sun shadow demodulation pass (issue #115). "
+            "1 = write per-pixel sun-NEE visibility to a separate "
+            "G-buffer, denoise it with a depth+normal bilateral, "
+            "multiply the denoised visibility into the post-denoise "
+            "HDR for sharp sun shadows under SVGF / MetalFX. "
+            "0 = legacy fold-into-radiance behaviour where the active "
+            "radiance denoiser smudges sun shadow boundaries. "
+            "No effect when r_denoiser = off.",
+            CVAR_ARCHIVE);
+
+    // -------------------------------------------------------------------
+    // Particle / VFX system (issue #82 MVP).
+    //
+    // CPU-side simulation, screen-space billboard composite. Particles
+    // are NOT visible in path-traced reflections / shadows; the
+    // "PT-compatible" headline of #82 is a follow-up (analytic-prim
+    // list + BVH refit). GPU-side simulation is also a follow-up.
+    // See shaders/ParticleComposite.slang for the kernel rationale
+    // and src/effects/ParticleSystem.h for the CPU sim contract.
+    // -------------------------------------------------------------------
+    PT_CVAR(r_particles, "0",
+            "Master toggle for the particle / VFX system (#82 MVP). "
+            "0 disables both the CPU sim tick AND the GPU composite "
+            "dispatch. 1 runs both. Metal-only today; Vulkan dispatch "
+            "is a follow-up.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_particles_max, "1024",
+            "Cap on simultaneously live particles. Cheap to raise "
+            "(per-frame upload is the cost); a few thousand is fine "
+            "for the MVP CPU sim, GPU sim follow-up scales further. "
+            "Default 1024.",
+            CVAR_ARCHIVE);
+
+    // -------------------------------------------------------------------
+    // ReSTIR DI Phase A (issue #78). Reservoir-based Spatio-Temporal
+    // Importance Resampling for Direct Illumination -- the modern fix
+    // for "many lights at 1 spp": replaces "pick one light + shadow ray"
+    // with "build a reservoir of K weighted candidates, reuse across
+    // screen + time, shadow-test the single survivor". Without it,
+    // light primitives (#73) cap out at the dozen-light regime before
+    // naive NEE picks the wrong one and noise dominates. With it,
+    // hundreds to thousands of lights run cleanly under MetalFX / SVGF
+    // / NRD denoising.
+    //
+    // Phase A scope: DI only (no GI / indirect bounce reservoirs).
+    // Architecture: PathTrace.slang's primary-hit Lambert NEE switches
+    // to WRS candidate generation when r_restir = 1; three compute
+    // passes follow (RestirTemporal, RestirSpatial, RestirFinal) and
+    // additively blend the resampled contribution into denoise_color
+    // before the radiance denoiser. Gated host-side on
+    // `denoiser_active_` -- the denoiser-off path keeps single-pick
+    // NEE (the accumulator handles many-light variance fine at high
+    // spp; ReSTIR is primarily a 1-spp / denoiser-input quality lever).
+    // -------------------------------------------------------------------
+    PT_CVAR(r_restir, "1",
+            "Master toggle for ReSTIR DI Phase A (issue #78). 1 = "
+            "primary-hit Lambert NEE switches to WRS candidate "
+            "generation + reservoir spatiotemporal reuse + shadow "
+            "test on the single survivor; 0 = legacy uniform "
+            "single-pick NEE from issue #73. Only takes effect when "
+            "the denoiser is active (the Phase A composite writes "
+            "into denoise_color). Default 1: ReSTIR is the new "
+            "many-lights baseline.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_restir_temporal, "1",
+            "ReSTIR temporal reuse pass gate. 1 = reproject the "
+            "previous frame's final reservoir via motion vectors and "
+            "MIS-combine with this frame's WRS reservoir (Bitterli "
+            "Algorithm 4). 0 = skip temporal reuse, current-frame "
+            "reservoir flows straight to the spatial pass. Turning "
+            "this off increases per-frame noise but eliminates the "
+            "rare temporal smear under fast camera motion.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_restir_spatial, "1",
+            "ReSTIR spatial reuse pass gate. 1 = sample N=4 jittered "
+            "neighbours in a 10 px disc and MIS-combine with the "
+            "centre reservoir. 0 = skip the spatial pass; survivor "
+            "depends only on the K initial candidates + temporal "
+            "history. The spatial pass is the dominant variance-"
+            "reduction step for static cameras; turning it off is "
+            "mainly a diagnostic for chasing artifacts.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_restir_k_candidates, "8",
+            "Number of initial WRS candidate samples per pixel "
+            "(Bitterli K). 8 is the NVIDIA RTXDI 'balanced' default "
+            "and trades well against temporal / spatial reuse. Higher "
+            "K reduces per-frame variance at linear ALU cost; the "
+            "shader caps at 64. Sub-1 values are clamped to 1.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_restir_bias, "biased",
+            "ReSTIR bias-correction mode. 'biased' (default) = "
+            "straight WRS resampling; cheaper (~30% off the spatial "
+            "pass cost) and visually masked by the radiance denoiser. "
+            "'unbiased' = per-pair MIS weighting in the spatial "
+            "merge, Bitterli's rigorous estimator. 'unbiased' is the "
+            "correct ground-truth setting for offline reference; "
+            "'biased' is what AAA shipped engines use at runtime.",
+            CVAR_ARCHIVE);
 
     // Camera controls.  Mouse-look engages while RIGHT mouse is held.
     PT_CVAR(cam_speed,         "3.0", "Movement speed (units/sec)",        CVAR_ARCHIVE);
@@ -494,6 +820,34 @@ namespace cvar {
     PT_CVAR(cam_pos,           "0 1.5 4", "Camera position (x y z)",       CVAR_ARCHIVE);
     PT_CVAR(cam_yaw,           "0",       "Yaw in degrees",                CVAR_ARCHIVE);
     PT_CVAR(cam_pitch,         "-11.5",   "Pitch in degrees (clamped +/- 85)", CVAR_ARCHIVE);
+    // Gamepad input (#83). MVP: left stick = translate (forward / strafe),
+    // right stick = look (yaw / pitch), triggers = sprint (analog blend
+    // 0..1, additive with shift-key sprint). GLFW's gamepad API wraps
+    // SDL2's controller DB so Xbox / DualSense / Switch Pro all work
+    // out of the box. No haptics / rumble in MVP -- GLFW doesn't expose
+    // them; would need SDL2 or HIDAPI as a follow-up.
+    PT_CVAR(cam_gamepad,                  "1",
+            "Gamepad input master toggle. 1 = poll slot 0 every frame "
+            "and feed its left/right sticks + triggers into the camera; "
+            "0 = ignore the pad even if connected. Hot-pluggable -- "
+            "no engine restart needed.",
+            CVAR_ARCHIVE);
+    PT_CVAR(cam_gamepad_deadzone,         "0.15",
+            "Radial deadzone on both sticks in [0, 1] of the native "
+            "stick magnitude. Sticks inside this radius read as 0; "
+            "outside it the surviving magnitude is rescaled to [0, 1] "
+            "so there's no snap at the boundary. 0.15 covers the "
+            "typical Xbox / DualSense rest-position jitter; raise to "
+            "0.25 for worn-out sticks, lower toward 0.05 for precision "
+            "aiming.",
+            CVAR_ARCHIVE);
+    PT_CVAR(cam_gamepad_look_sensitivity, "2.0",
+            "Right-stick look sensitivity in radians/second at full "
+            "deflection (post-deadzone magnitude == 1). At 2.0 a full-"
+            "tilt right stick yaws ~115 deg/sec; raise for snappier "
+            "look, lower for cinematic / precision pans. Independent "
+            "of cam_sensitivity (which is mouse degrees/pixel).",
+            CVAR_ARCHIVE);
     // Camera-state slots for the cam_save / cam_load / cam_list / cam_reset
     // commands (registered in RegisterCommands). Slots 1..9 are user-
     // savable via `cam_save [N]`; slot 0 is the engineering default
@@ -543,6 +897,16 @@ namespace cvar {
     PT_CVAR(r_volumetric_intensity, "1.0",  "Linear scale on the volumetric contribution. Useful to dial god rays up/down without changing the underlying density.", CVAR_ARCHIVE);
     PT_CVAR(r_volumetric_samples,   "16",   "March sample count per primary ray (4..64). More = smoother shafts at proportional GPU cost. 16 is a comfortable default with the denoiser on.", CVAR_ARCHIVE);
 
+    // Phase 4 (#100) heterogeneous volumetric raymarching cvars. These
+    // affect the CLOUD march specifically (vol_density_scale, vol_phase_g,
+    // vol_multiscatter_bounces); the atmospheric Mie/Rayleigh haze march
+    // keeps its own r_volumetric_* cvars above. Naming with r_vol_ matches
+    // the issue spec exactly and keeps the haze knobs (r_volumetric_*)
+    // separate so users can tune them independently.
+    PT_CVAR(r_vol_density_scale,        "1.0",  "Cloud volumetric density scale (Phase 4, #100). Linear multiplier on the per-step cloud sigma_t inside the cloud march. 0.5 = half-thickness clouds; 2.0 = double-thickness. Carries through to shadow rays so the cloud's Beer-Lambert occlusion stays consistent with the body it casts shadows from. Range: clamped to >=1e-3 shader-side (a literal 0 would render the cloud as a transmissive haze, which is what r_clouds=0 means instead).", CVAR_ARCHIVE);
+    PT_CVAR(r_vol_phase_g,              "0.8",  "Cloud Henyey-Greenstein anisotropy g (Phase 4, #100). Decoupled from r_volumetric_anisotropy (which controls the atmospheric haze). +0.8 = canonical cumulus forward-scatter lobe (silver lining around the sun edge); 0 = isotropic; negative = back-scatter. Range [-0.95, 0.95] clamped shader-side; outside that the HG denominator pinches to zero on grazing directions and produces firefly spikes.", CVAR_ARCHIVE);
+    PT_CVAR(r_vol_multiscatter_bounces, "2",    "Cloud multi-scatter octaves (Phase 4, #100). Wrenninge-style cheap proxy for diffuse light bouncing several times inside the cloud volume before exiting toward the camera. 0 = pure single-scatter (legacy behaviour; cloud cores under self-shadow read pitch-black); 1-4 = N additional octaves of decaying-extinction (a=0.5 per octave) decaying-anisotropy (b=0.5 per octave) fake bounces. Default 2 matches the issue spec and gives cumulus the bright diffuse fill expected. Clamped to 0..4 shader-side.", CVAR_ARCHIVE);
+
     // Volumetric clouds. Layer on top of homogeneous haze: when r_clouds
     // is on, the volumetric march multiplies sigma_t by a position-
     // sampled cloud density (procedural fbm value-noise). Presets
@@ -558,10 +922,14 @@ namespace cvar {
     PT_CVAR(r_clouds_density,        "0.06",     "Peak extinction inside the cloud, in per-metre sigma_t. Real meteorology: light cumulus 0.03-0.05, typical cumulus 0.05-0.10, stratus 0.04-0.08, storm/cumulonimbus 0.10-0.30. Across a 300m cumulus layer, sigma=0.05 gives optical depth ~15 -- mostly opaque core, translucent edges.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_freq,           "0.005",    "Noise frequency in cycles per metre. 0.003 -> ~330m features (slow undulating cumulus), 0.01 -> ~100m features (smaller puffy cumulus). Match to typical horizontal cloud size, not vertical layer thickness.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_detail,         "0.35",     "High-frequency detail amount [0..1]. 0 = soft blobby clouds, 1 = wispy/eroded edges.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_curl_amount,    "0.3",      "Curl-noise displacement magnitude in metres applied to the cloud sample position before density evaluation (Bridson 2007, 'Curl-Noise for Procedural Fluid Flow'). Divergence-free, so it shears the cloud body into filamentous eddies without inflating its volume. 0 disables (output bit-equivalent to pre-#117 main); 0.3 gives subtle cumulus edge wisps; 0.8+ gives heavily turbulent / sheared-streamer cirrus. Layer-relative magnitude in metres -- scale with r_clouds_freq if you change the bulk feature size.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_curl_scale,     "0.01",     "Curl-noise frequency in cycles per metre. 0.01 = ~100m turbulent eddies (cumulus edge filaments); 0.003 = ~330m large-scale shear (cirrus streamers); 0.03 = ~33m fine wisps (close-up shots, sub-cloud detail). Independent of r_clouds_freq so coarse bulk cloud bodies can still carry fine curl turbulence.", CVAR_ARCHIVE);
+    PT_CVAR(r_clouds_erosion,        "0.0",      "Secondary high-frequency edge-erosion amount [0..1] layered on top of r_clouds_detail. Eats away soft cloud margins into sub-feature wisps. r_clouds_detail controls the bulk wispy boundary; r_clouds_erosion paints the filamentous fringe on top. 0 = identical to pre-#117 main; 0.3-0.6 gives the characteristic frayed look of close-up cumulus.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_wind_x,         "5.0",      "Wind speed along +X in metres/second. Drifts the cloud field over time. Light breeze 2-3, fresh wind 8-12, gale 20+.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_wind_z,         "0.0",      "Wind speed along +Z in metres/second.", CVAR_ARCHIVE);
     PT_CVAR(r_clouds_seed,           "0",        "Per-day noise seed (any float). Same preset + different seed = visually distinct cloud pattern. Use one seed per in-game day so each day has its own weather pattern.", CVAR_ARCHIVE);
     PT_CVAR(r_rayleigh,              "30.0",     "Atmospheric Rayleigh scattering scale on the per-channel sea-level sigma (R 5.8e-6, G 13.5e-6, B 33.1e-6 per metre). 1.0 = real Earth atmosphere -- but our typical r_volumetric_density (Mie haze) is ~30x stronger than real-Earth haze, so bumping this to 30 keeps the sky visibly blue at typical haze settings. Drop to 1.0 if you also drop r_volumetric_density to 0.0001-0.0005 (real haze). 0 disables Rayleigh.", CVAR_ARCHIVE);
+    PT_CVAR(r_planet_radius,         "6378137.0", "Planet radius in metres for spherical-Earth atmospheric scattering (issue #51). Default 6,378,137 m = WGS-84 equatorial Earth radius. The path tracer's `atmosphericTransmittance` numerically integrates Mie + Rayleigh optical depth along a chord through a thin shell around a sphere of this radius (centre at world origin + offset so y=0 sits on the surface). Set to 0 to fall back to the legacy planar exponential integral (1/sin(elev) airmass) -- useful as a debug A/B or for tiny-scene tests where curvature is invisible. Real values for other bodies: Moon 1,737,400, Mars 3,389,500, Venus 6,051,800. Affects only the atmosphere integral, not collision / shadow geometry.", CVAR_ARCHIVE);
     PT_CVAR(r_moon_size,             "1.0",      "Moon angular-size multiplier. 1.0 = our default 0.55deg half-angle (already 2x the real 0.27deg, for visibility at typical 60-FOV 1080p). 5+ = dramatic 'big moon' shots; 0.5 = real lunar size (very small). Astronomical distance variation (perigee/apogee) is also applied on top -- supermoons render ~14% bigger than micro-moons.", CVAR_ARCHIVE);
     PT_CVAR(r_sun_size,              "1.0",      "Sun angular-size multiplier. 1.0 = real ~0.55deg half-angle. Astronomical Earth-Sun distance (perihelion/aphelion) modulates this ~3.4% across the year. Bump for cinematic shots.", CVAR_ARCHIVE);
     PT_CVAR(r_sun_horizon_flatten,   "1",        "Atmospheric refraction differentially lifts the sun's lower limb more than its upper limb, vertically squishing the disc into an oval as it nears the horizon (Saemundsson 1986). 1 = physical flatten enabled (vertical-scale ~0.78 at elev=0 / ~21% squish, ~0.87 at 1deg, ~0.97 at 5deg, ~0.99 at 10deg); 0 = render a perfect circle regardless of elevation. Horizontal radius is unchanged either way; r_sun_size stacks on top.", CVAR_ARCHIVE);
@@ -632,6 +1000,46 @@ namespace cvar {
     PT_CVAR(sys_gpu_name,     "?",  "GPU model (filled by RHI)",     CVAR_READONLY);
     PT_CVAR(sys_gpu_unified,  "1",  "1 if unified memory architecture", CVAR_READONLY);
     PT_CVAR(sys_gpu_hwrt,     "0",  "1 if hardware ray tracing supported", CVAR_READONLY);
+
+    // --- Physics Phase 1 (#132) ------------------------------------------
+    // Verlet-PBD physics layer. Off by default -- the path tracer ships
+    // with analytic primitives that are static-by-default; enabling
+    // physics swaps them into kinematically-driven spheres without
+    // changing their visual identity. See src/physics/PhysicsSystem.h
+    // for the integrator details. Stable sphere stacking is a Phase 5
+    // problem -- Phase 1 spheres bounce until damping kills the energy.
+    PT_CVAR(phys_enabled,     "0",
+            "Enable the Verlet physics layer (#132). 0 = no physics (the "
+            "engine acts exactly like a non-physics build, analytic prims "
+            "are static); 1 = step every frame with the current "
+            "phys_gravity_y / phys_substeps / phys_damping settings, "
+            "writing back sphere positions to the analytic-primitive "
+            "buffer before the BVH refit. Phase 5 will add friction, "
+            "restitution, and stacking stability -- expect bouncy spheres "
+            "and a settling pile in Phase 1.",
+            CVAR_ARCHIVE);
+    PT_CVAR(phys_gravity_y,   "-9.81",
+            "Gravitational acceleration along world-Y in metres per "
+            "second squared. -9.81 = Earth, +9.81 = anti-gravity, 0 = "
+            "weightless. 1 world unit = 1 metre per the project's "
+            "metric-units convention.",
+            CVAR_ARCHIVE);
+    PT_CVAR(phys_substeps,    "8",
+            "Inner Verlet substeps per frame (1..32). The collision "
+            "position-correction is a stiff constraint, so the per-frame "
+            "dt is divided into N substeps before the integrator runs. "
+            "8 substeps is the sweet spot for 60 fps + the default "
+            "0.3 m radius: smaller numbers let fast-falling spheres "
+            "tunnel through the ground plane, larger numbers waste CPU.",
+            CVAR_ARCHIVE);
+    PT_CVAR(phys_damping,     "0.99",
+            "Per-substep velocity damping (0.5..1.0). 1.0 = energy-"
+            "conserving (perpetual bounce); the default 0.99 bleeds "
+            "1% per substep so an N=8-substep frame at 60 fps loses "
+            "~38% of kinetic energy per second -- enough to settle a "
+            "pile of spheres in a couple of seconds without making "
+            "the motion feel like syrup.",
+            CVAR_ARCHIVE);
 }  // namespace cvar
 
 }  // namespace
@@ -645,6 +1053,11 @@ bool Engine::Init() {
     pt::mem::Init();
 
     camera_ = std::make_unique<pt::renderer::Camera>();
+    // ParticleSystem (issue #82 MVP). Pure CPU sim -- safe to
+    // construct before any device exists. The cvar r_particles_max
+    // will be honoured below once Console::Drain has processed the
+    // archived demont.cfg.
+    particles_ = std::make_unique<pt::effects::ParticleSystem>();
 
     pt::hw::Populate();
     auto& hi = pt::hw::GetInfo();
@@ -783,6 +1196,18 @@ bool Engine::Init() {
     jobs_->Init();
     pt::jobs::JobSystem::SetInstance(jobs_.get());
 
+    // Audio subsystem (issue #80 MVP). Constructed BEFORE the smoke-exec
+    // fixtures run so a fixture can issue `audio_play` calls -- the
+    // device backend (CoreAudio / WASAPI / ALSA) is independent of the
+    // GPU + window so there's no ordering dependency that pushes it
+    // later. Init() failure is non-fatal: the rest of the AudioSystem
+    // API no-ops cleanly when IsRunning() is false so headless / CI
+    // boxes that lack audio continue working.
+    audio_system_ = std::make_unique<pt::audio::AudioSystem>();
+    if (!audio_system_->Init()) {
+        LOG_WARN("audio: subsystem init failed; engine continues without audio");
+    }
+
     // Window. Always created with no graphics-API context; each backend
     // attaches its own CAMetalLayer (or VkSurface for Vulkan) to the
     // NSWindow content view, so no recreate is needed on backend switch.
@@ -806,6 +1231,13 @@ bool Engine::Init() {
     if (auto* p = C.FindCVar("net_line_port"))    sc.line_port = static_cast<std::uint16_t>(p->GetInt());
     if (auto* p = C.FindCVar("net_bind_address")) sc.bind_address = p->value;
     server_->Start(sc, &C);
+
+    // Physics subsystem (#132) -- Verlet integrator + sphere-plane /
+    // sphere-sphere collision. Allocated unconditionally so the
+    // `phys_drop` console command + `phys_enabled` toggle work
+    // without an engine restart; the system is dormant when
+    // `phys_enabled = 0` (StepPhysics returns immediately).
+    physics_ = std::make_unique<pt::physics::PhysicsSystem>();
 
     // CSG scene -- the source of truth for triangle-mesh geometry from
     // P9 onward. Seeded with the headline drilled-cube scene so first-
@@ -1024,7 +1456,14 @@ void Engine::ApplyCommandLineCvarOverrides() {
         // shared empty-check above so `--smoke-exec=` with no path
         // doesn't silently disable the override.
         { "--smoke-exec=",         "pt_smoke_exec"        },
+        { "--smoke-late-exec=",    "pt_smoke_late_exec"   },
         { "--smoke-capture-out=",  "pt_smoke_capture_out" },
+        // Late smoke-exec hook (issue #97, also used by #140's voxel
+        // demo fixture). Runs AFTER the CSG / prim / SDF seed +
+        // command registration so the fixture can issue console
+        // commands like `voxelize_object` or `csg_*` that depend on
+        // those being live.
+        { "--smoke-late-exec=",    "pt_smoke_late_exec"   },
     };
 
     for (int i = 1; i < argc_; ++i) {
@@ -1107,6 +1546,13 @@ void Engine::ApplyCommandLineCvarOverrides() {
 }
 
 void Engine::Shutdown() {
+    // Stop the audio device first so its worker thread is gone before
+    // the rest of the engine state it doesn't strictly depend on
+    // (overlay sinks, console server, jobs) starts unwinding. Idempotent
+    // -- safe even if Init() never constructed audio_system_.
+    if (audio_system_) audio_system_->Shutdown();
+    audio_system_.reset();
+
     TearDownDevice();
 
     // P11 persistence: dump every CVAR_ARCHIVE cvar that's been changed
@@ -1139,6 +1585,15 @@ void Engine::Shutdown() {
     if (jobs_) jobs_->Shutdown();
     pt::jobs::JobSystem::SetInstance(nullptr);
     jobs_.reset();
+
+    // Physics is pure CPU data -- no device resources to release;
+    // drop it after jobs_ so any future async physics worker (Phase
+    // 4 GPU broadphase) can be joined safely here. Today this is a
+    // plain unique_ptr destruction.
+    if (physics_) {
+        physics_->Clear();
+        physics_.reset();
+    }
 }
 
 void Engine::TearDownDevice() {
@@ -1179,11 +1634,32 @@ void Engine::TearDownDevice() {
         // --- SDF Phase 1 (#97) -------------------------------------------------
         if (sdf_cluster_buffer_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{sdf_cluster_buffer_id_});
         // --- end SDF Phase 1 ---------------------------------------------------
+        // --- Light primitives (#73) --------------------------------------------
+        if (light_buffer_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{light_buffer_id_});
+        // --- end Light primitives ----------------------------------------------
+        // --- Light tree (#129) -------------------------------------------------
+        if (light_tree_buffer_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{light_tree_buffer_id_});
+        // --- end Light tree ----------------------------------------------------
         if (denoise_color_tex_id_    != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
         if (depth_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
         if (motion_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
         if (post_denoise_hdr_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
         if (cloud_trans_tex_id_      != 0) device_->DestroyTexture(pt::rhi::TextureHandle{cloud_trans_tex_id_});
+        // SIGMA shadow visibility buffer (issue #115). Storage buffer
+        // (not texture) -- see comment at the allocation site.
+        if (shadow_vis_buf_id_       != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{shadow_vis_buf_id_});
+        // --- ReSTIR DI Phase A (issue #78) -------------------------------------
+        // Per-pixel reservoir SSBOs. Triple-buffered: curr (PathTrace
+        // output), prev (previous-frame final), swap (spatial-pass
+        // output, swapped into prev at end-of-frame).
+        if (restir_reservoir_curr_buf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{restir_reservoir_curr_buf_id_});
+        if (restir_reservoir_prev_buf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{restir_reservoir_prev_buf_id_});
+        if (restir_reservoir_swap_buf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{restir_reservoir_swap_buf_id_});
+        // --- end ReSTIR DI Phase A ---------------------------------------------
+        // MetalFX specular guidance G-buffers (issue #118).
+        if (specular_albedo_tex_id_       != 0) device_->DestroyTexture(pt::rhi::TextureHandle{specular_albedo_tex_id_});
+        if (roughness_tex_id_             != 0) device_->DestroyTexture(pt::rhi::TextureHandle{roughness_tex_id_});
+        if (specular_hit_distance_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{specular_hit_distance_tex_id_});
         for (auto& id : bloom_mip_tex_id_) {
             if (id != 0) device_->DestroyTexture(pt::rhi::TextureHandle{id});
             id = 0;
@@ -1200,6 +1676,11 @@ void Engine::TearDownDevice() {
         if (exposure_state_id_      != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{exposure_state_id_});
         if (perfoverlay_drawlist_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{perfoverlay_drawlist_id_});
         if (placeholder_storage_id_  != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{placeholder_storage_id_});
+        // Particle system GPU-side storage buffer (#82 MVP). The
+        // CPU-side ParticleSystem object survives the device teardown
+        // -- it has no GPU resources of its own. Only the per-frame
+        // upload buffer is owned by the device.
+        if (particles_storage_id_   != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{particles_storage_id_});
     }
     scene_tlas_id_        = 0;
     box_blas_id_          = 0;
@@ -1221,13 +1702,47 @@ void Engine::TearDownDevice() {
     sdf_cluster_count_        = 0;
     sdf_prims_dirty_          = true;
     // --- end SDF Phase 1 ---------------------------------------------------
+    // --- Light primitives (#73) --------------------------------------------
+    light_buffer_id_       = 0;
+    light_buffer_capacity_ = 0;
+    light_count_uploaded_  = 0;
+    light_prims_dirty_     = true;        // re-upload on next device
+    // --- end Light primitives ----------------------------------------------
+    // --- Light tree (#129) -------------------------------------------------
+    light_tree_buffer_id_           = 0;
+    light_tree_buffer_capacity_     = 0;
+    light_tree_node_count_uploaded_ = 0;
+    // light_prims_dirty_ above is the shared rebuild edge -- when the
+    // backend comes back up the next frame, both EnsureLightsUploaded
+    // and EnsureLightTreeUploaded fire from that flag.
+    // --- end Light tree ----------------------------------------------------
     denoise_color_tex_id_    = 0;
     depth_tex_id_            = 0;
     motion_tex_id_           = 0;
     post_denoise_hdr_tex_id_ = 0;
     cloud_trans_tex_id_      = 0;
+    shadow_vis_buf_id_       = 0;
+    sigma_shadow_pipeline_id_ = 0;
+    // --- ReSTIR DI Phase A (issue #78) -------------------------------------
+    restir_reservoir_curr_buf_id_ = 0;
+    restir_reservoir_prev_buf_id_ = 0;
+    restir_reservoir_swap_buf_id_ = 0;
+    restir_temporal_pipeline_id_  = 0;
+    restir_spatial_pipeline_id_   = 0;
+    restir_final_pipeline_id_     = 0;
+    restir_alloc_w_               = 0;
+    restir_alloc_h_               = 0;
+    // --- end ReSTIR DI Phase A ---------------------------------------------
+    // MetalFX specular guidance G-buffers (issue #118).
+    specular_albedo_tex_id_       = 0;
+    roughness_tex_id_             = 0;
+    specular_hit_distance_tex_id_ = 0;
     tonemap_pipeline_id_     = 0;
     stars_composite_pipeline_id_ = 0;
+    aurora_composite_pipeline_id_ = 0;
+    particle_composite_pipeline_id_ = 0;
+    particles_storage_id_           = 0;
+    particles_storage_capacity_     = 0;
     bloom_down_pipeline_id_  = 0;
     bloom_up_pipeline_id_    = 0;
     perfoverlay_pipeline_id_       = 0;
@@ -1939,6 +2454,7 @@ void Engine::EnsureMeshUpdated() {
 }
 
 void Engine::RebuildMeshResources(const pt::csg::BakedMesh& baked) {
+    PT_ZONE_SCOPED_N("Engine::RebuildMeshResources");
     if (!device_) return;
 
     // Drain any in-flight GPU work so it's safe to destroy old resources.
@@ -2147,6 +2663,7 @@ void Engine::SeedDefaultPrimitives() {
 }
 
 void Engine::ReloadEnvMap(const std::string& path) {
+    PT_ZONE_SCOPED_N("Engine::ReloadEnvMap");
     if (!device_) {
         // Defer: cvar set before backend is up. Stash the path and apply
         // on the next RequestBackendSwitch.
@@ -2454,6 +2971,7 @@ void Engine::ReloadEnvMap(const std::string& path) {
 void Engine::EnsureMoonMapUploaded() {
     if (!device_) return;
     if (moon_map_tex_id_ != 0) return;
+    PT_ZONE_SCOPED_N("Engine::EnsureMoonMapUploaded");
     // 512x256 = ~1 MB at RGBA16F. The moon disc is tiny on screen
     // (~9-15 px at default r_moon_size), so anything past a 256x
     // near-side coverage is sampled-down to invisibility -- 2K was
@@ -2498,6 +3016,7 @@ void Engine::EnsureMoonMapUploaded() {
 void Engine::EnsureStarMapUploaded() {
     if (!device_) return;
     if (star_map_tex_id_ != 0) return;          // already uploaded on this device
+    PT_ZONE_SCOPED_N("Engine::EnsureStarMapUploaded");
 
     constexpr const char*  kPath = "assets/stars/BSC5.dat";
     // 8192x4096 RGBA16F = 256MB. Trades VRAM for star crispness:
@@ -2896,6 +3415,211 @@ void Engine::EnsureSdfPrimsUploaded() {
 }
 // --- end SDF Phase 1 -------------------------------------------------------
 
+// --- Light primitives (#73) ------------------------------------------------
+//
+// Per-light GPU layout (must match PathTrace.slang's LightRecord +
+// loadLight, kLightStrideFloat4 = 4 float4s = 64 B):
+//
+//   v0.xyz = pos             ;  v0.w   = radius (sphere)
+//   v1.rgb = intensity       ;  v1.w   = type as float (0..3)
+//   v2.xyz = dir (spot axis / quad normal)
+//   v2.w   = cos_outer       (spot)
+//   v3.xyz = u_vec (quad u-half-extent vector); v3.x = cos_inner (spot)
+//   v3.w   = v_half          (quad)
+//
+// Grows by powers of two from a floor of 16 lights -- same allocation
+// pattern as the analytic prim / SDF cluster / BVH-node buffers, so
+// steady-state edits don't reallocate. The shader's NEE block is
+// gated on `light_count > 0`; an empty set leaves the binding
+// resolved to a placeholder but the shader doesn't read it.
+void Engine::EnsureLightsUploaded() {
+    if (!device_) return;
+    if (!light_prims_dirty_) return;
+
+    const std::uint32_t count = static_cast<std::uint32_t>(light_prims_.size());
+    constexpr std::uint32_t kFloatsPerLight = 16;   // 4 float4s
+    constexpr std::uint32_t kBytesPerLight  = sizeof(float) * kFloatsPerLight;
+
+    // Allocate / grow the storage buffer when needed. 16-light floor
+    // matches the analytic-prim convention; doubles up from there.
+    if (count > light_buffer_capacity_) {
+        std::uint32_t new_cap = light_buffer_capacity_ ? light_buffer_capacity_ : 16u;
+        while (new_cap < count) new_cap *= 2u;
+        if (light_buffer_id_ != 0) {
+            device_->WaitIdle();
+            device_->DestroyBuffer(pt::rhi::BufferHandle{light_buffer_id_});
+            light_buffer_id_ = 0;
+        }
+        auto buf = device_->CreateBuffer({
+            .size       = std::size_t(new_cap) * kBytesPerLight,
+            .usage      = pt::rhi::BufferUsage::Storage,
+            .debug_name = "analytic_lights",
+        });
+        if (buf.id == 0) {
+            LOG_ERROR("light buffer allocation failed (capacity {})", new_cap);
+            return;
+        }
+        light_buffer_id_       = buf.id;
+        light_buffer_capacity_ = new_cap;
+    }
+
+    if (count == 0) {
+        light_count_uploaded_ = 0;
+        light_prims_dirty_    = false;
+        accum_dirty_          = true;
+        return;
+    }
+
+    // Allocate enough capacity for the buffer's full footprint (even
+    // unused trailing entries) so the shader's bounds check against
+    // light_count is the only thing that matters.
+    std::vector<float> packed(std::size_t(light_buffer_capacity_) * kFloatsPerLight, 0.0f);
+    std::size_t idx = 0;
+    for (const auto& [id, L] : light_prims_) {
+        const std::size_t off = idx * kFloatsPerLight;
+        // v0: position + sphere radius
+        packed[off + 0]  = L.pos[0];
+        packed[off + 1]  = L.pos[1];
+        packed[off + 2]  = L.pos[2];
+        packed[off + 3]  = L.radius;
+        // v1: intensity + type
+        packed[off + 4]  = L.intensity[0];
+        packed[off + 5]  = L.intensity[1];
+        packed[off + 6]  = L.intensity[2];
+        packed[off + 7]  = static_cast<float>(L.type);
+        // v2: direction + spot cos_outer
+        packed[off + 8]  = L.dir[0];
+        packed[off + 9]  = L.dir[1];
+        packed[off + 10] = L.dir[2];
+        packed[off + 11] = L.cos_outer;
+        // v3: quad u_vec (which also stores spot cos_inner in .x) + quad v_half
+        packed[off + 12] = (L.type == AnalyticLight::Spot) ? L.cos_inner : L.u_vec[0];
+        packed[off + 13] = L.u_vec[1];
+        packed[off + 14] = L.u_vec[2];
+        packed[off + 15] = L.v_half;
+        ++idx;
+    }
+    device_->WriteBuffer(pt::rhi::BufferHandle{light_buffer_id_},
+                         packed.data(), packed.size() * sizeof(float));
+
+    light_count_uploaded_ = count;
+    light_prims_dirty_    = false;
+    accum_dirty_          = true;
+    LOG_INFO("[lights] uploaded {} analytic light(s)", count);
+    for (const auto& [id, L] : light_prims_) {
+        const char* tname = (L.type == AnalyticLight::Point)  ? "point"
+                          : (L.type == AnalyticLight::Spot)   ? "spot"
+                          : (L.type == AnalyticLight::Sphere) ? "sphere"
+                                                              : "quad";
+        LOG_INFO("[lights]   id={} type={} pos=({:.2f},{:.2f},{:.2f}) intensity=({:.2f},{:.2f},{:.2f})",
+                 id, tname,
+                 L.pos[0], L.pos[1], L.pos[2],
+                 L.intensity[0], L.intensity[1], L.intensity[2]);
+    }
+}
+// --- end Light primitives --------------------------------------------------
+
+// --- Light tree (#129) -----------------------------------------------------
+// Build the hierarchical light tree (Conty Estevez & Kulla 2018) from
+// the analytic light list, pack it into a flat GPU SSBO at engine slot
+// 13 / vk::binding(28), and stamp light_tree_node_count_uploaded_ so
+// the dispatch path knows whether to enable tree traversal. Called by
+// RenderFrame on the same light_prims_dirty_ edge that triggers the
+// light-list re-upload above (one rebuild per light-set mutation;
+// static-light MVP scope).
+//
+// Empty light set -> node_count = 0; binding falls back to the
+// placeholder buffer at the dispatch site for Metal-push-slot stability.
+// The shader's `light_tree_node_count > 0` push gate is the runtime
+// "actually traverse" switch -- same partial-binding pattern as
+// shadow_vis_buf / light_prims.
+void Engine::EnsureLightTreeUploaded() {
+    if (!device_) return;
+    if (!light_prims_dirty_) return;   // hook keyed off the same edge
+
+    // Snapshot the light list in upload order. Engine::EnsureLightsUploaded
+    // (above) packs lights into the GPU buffer in std::map iteration
+    // order (id-sorted); the tree's leaf left_first values index into
+    // that same packed array, so we MUST mirror that ordering exactly.
+    std::vector<pt::renderer::LightInput> inputs;
+    inputs.reserve(light_prims_.size());
+    for (const auto& [id, L] : light_prims_) {
+        pt::renderer::LightInput li;
+        li.type = static_cast<std::uint32_t>(L.type);
+        for (int i = 0; i < 3; ++i) {
+            li.pos[i]       = L.pos[i];
+            li.intensity[i] = L.intensity[i];
+            li.dir[i]       = L.dir[i];
+            li.u_vec[i]     = L.u_vec[i];
+        }
+        li.radius    = L.radius;
+        li.cos_outer = L.cos_outer;
+        li.v_half    = L.v_half;
+        inputs.push_back(li);
+    }
+
+    pt::renderer::LightTree tree;
+    pt::renderer::BuildLightTree(inputs, tree);
+
+    const std::uint32_t node_count =
+        static_cast<std::uint32_t>(tree.nodes.size());
+
+    // Grow the GPU node buffer (powers of two from a 32-node floor;
+    // 16-light scene yields 31 nodes -- 32 is the smallest p2 that
+    // fits without an immediate resize). Capacity is in NODES; each
+    // node is 64 bytes (sizeof(LightTreeNode) -- 4 float4s).
+    constexpr std::uint32_t kBytesPerNode = sizeof(pt::renderer::LightTreeNode);
+    if (node_count > light_tree_buffer_capacity_) {
+        std::uint32_t new_cap = light_tree_buffer_capacity_
+                                  ? light_tree_buffer_capacity_
+                                  : 32u;
+        while (new_cap < node_count) new_cap *= 2u;
+        if (light_tree_buffer_id_ != 0) {
+            device_->WaitIdle();
+            device_->DestroyBuffer(
+                pt::rhi::BufferHandle{light_tree_buffer_id_});
+            light_tree_buffer_id_ = 0;
+        }
+        auto buf = device_->CreateBuffer({
+            .size       = std::size_t(new_cap) * kBytesPerNode,
+            .usage      = pt::rhi::BufferUsage::Storage,
+            .debug_name = "light_tree_nodes",
+        });
+        if (buf.id == 0) {
+            LOG_ERROR("light tree buffer allocation failed (capacity {})",
+                       new_cap);
+            return;
+        }
+        light_tree_buffer_id_       = buf.id;
+        light_tree_buffer_capacity_ = new_cap;
+    }
+
+    if (node_count == 0) {
+        light_tree_node_count_uploaded_ = 0;
+        // light_prims_dirty_ is cleared by EnsureLightsUploaded; nothing
+        // else to do for an empty tree.
+        return;
+    }
+
+    // Upload the packed-node array. Allocate to FULL capacity (trailing
+    // unused nodes zero-init) so the shader's bounds check against
+    // node_count is the only thing that matters.
+    std::vector<pt::renderer::LightTreeNode> packed(
+        light_tree_buffer_capacity_);
+    for (std::uint32_t i = 0; i < node_count; ++i) {
+        packed[i] = tree.nodes[i];
+    }
+    device_->WriteBuffer(
+        pt::rhi::BufferHandle{light_tree_buffer_id_},
+        packed.data(),
+        std::size_t(light_tree_buffer_capacity_) * kBytesPerNode);
+
+    light_tree_node_count_uploaded_ = node_count;
+    LOG_INFO("[light_tree] built tree -- {} lights, {} nodes",
+             tree.light_count, node_count);
+}
+// --- end Light tree --------------------------------------------------------
+
 void Engine::EnsurePipelineHandles() {
     if (!device_) return;
     auto resolve = [&](std::uint64_t& cached, const char* name) {
@@ -2918,9 +3642,34 @@ void Engine::EnsurePipelineHandles() {
     // dispatch site short-circuits. Vulkan stars-composite plumbing is
     // a follow-up.
     resolve(stars_composite_pipeline_id_, "stars_composite");
+    // Aurora borealis composite (issue #116). Metal-only at MVP scope;
+    // Vulkan id stays 0 and the gate folds correctly to "no aurora".
+    resolve(aurora_composite_pipeline_id_, "aurora_composite");
+    // SIGMA shadow denoiser (issue #115). Metal-only at MVP scope;
+    // r_shadow_demod gate collapses to "no SIGMA" on Vulkan.
+    resolve(sigma_shadow_pipeline_id_, "sigma_shadow");
+    // --- ReSTIR DI Phase A (issue #78) -------------------------------------
+    // Three compute kernels chained behind PathTrace's WRS
+    // candidate-generation pass: temporal reuse -> spatial reuse ->
+    // final shadow + Lambert composite. Metal-only at Phase A scope;
+    // Vulkan pipeline-build worker has no entry for these names so
+    // the resolve leaves the ids at 0 and the dispatch gates collapse
+    // cleanly to "no ReSTIR, legacy single-pick NEE in PathTrace."
+    // Vulkan plumbing is a follow-up alongside SigmaShadow /
+    // StarsComposite / AuroraComposite -- same shape.
+    resolve(restir_temporal_pipeline_id_, "restir_temporal");
+    resolve(restir_spatial_pipeline_id_,  "restir_spatial");
+    resolve(restir_final_pipeline_id_,    "restir_final");
+    // --- end ReSTIR DI Phase A ---------------------------------------------
+    // Screen-space particle composite (#82 MVP). Dispatch site below
+    // additionally gates on particle_count > 0 and r_particles, so the
+    // resolve cost is 1 atomic compare per frame until Vulkan grows a
+    // real entry.
+    resolve(particle_composite_pipeline_id_, "particle_composite");
 }
 
 void Engine::RenderFrame() {
+    PT_ZONE_SCOPED_N("Engine::RenderFrame");
     // Pipelines may still be building on the Vulkan backend's async
     // worker; re-resolve cached ids each frame until each flips
     // non-zero. Once all are cached the resolves are no-ops.
@@ -2956,9 +3705,23 @@ void Engine::RenderFrame() {
 
     EnsureMeshUpdated();
     EnsurePrimitivesUploaded();
+    // --- Voxel destruction Phase 1 (#140) ----------------------------------
+    // Refresh the reserved-id voxel SDF clusters against the current
+    // r_voxelize_demo cvar before SDF upload. Sets voxel_demo_active_
+    // for the mesh-hide gate below.
+    SyncVoxelDemoState();
+    // --- end Voxel destruction Phase 1 -------------------------------------
     // --- SDF Phase 1 (#97) -------------------------------------------------
     EnsureSdfPrimsUploaded();
     // --- end SDF Phase 1 ---------------------------------------------------
+    // --- Light primitives (#73) + Light tree (#129) ------------------------
+    // Order: tree BEFORE the list, because the tree's "should I rebuild?"
+    // edge is the same `light_prims_dirty_` flag that EnsureLightsUploaded
+    // clears once it's done. The build itself just reads light_prims_;
+    // both ensures consume the same snapshot.
+    EnsureLightTreeUploaded();
+    EnsureLightsUploaded();
+    // --- end Light primitives ----------------------------------------------
 
     auto& C = pt::console::Console::Get();
 
@@ -3065,6 +3828,24 @@ void Engine::RenderFrame() {
             if (albedo_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{albedo_tex_id_});
             if (post_denoise_hdr_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
             if (cloud_trans_tex_id_      != 0) device_->DestroyTexture(pt::rhi::TextureHandle{cloud_trans_tex_id_});
+            // SIGMA shadow visibility buffer (issue #115). Storage
+            // buffer; mirrors the denoiser teardown rule -- the buffer
+            // is allocated by the denoiser-active path and must be
+            // freed when the user flips r_denoiser off.
+            if (shadow_vis_buf_id_       != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{shadow_vis_buf_id_});
+            // --- ReSTIR DI Phase A (issue #78) -----------------------------
+            // Reservoir SSBOs live and die with the denoiser path -- the
+            // Phase A composite writes into denoise_color, which only
+            // exists when a denoiser is active. Freeing here mirrors the
+            // shadow_vis_buf_id_ pattern.
+            if (restir_reservoir_curr_buf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{restir_reservoir_curr_buf_id_});
+            if (restir_reservoir_prev_buf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{restir_reservoir_prev_buf_id_});
+            if (restir_reservoir_swap_buf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{restir_reservoir_swap_buf_id_});
+            // --- end ReSTIR DI Phase A -------------------------------------
+            // MetalFX specular guidance G-buffers (issue #118).
+            if (specular_albedo_tex_id_       != 0) device_->DestroyTexture(pt::rhi::TextureHandle{specular_albedo_tex_id_});
+            if (roughness_tex_id_             != 0) device_->DestroyTexture(pt::rhi::TextureHandle{roughness_tex_id_});
+            if (specular_hit_distance_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{specular_hit_distance_tex_id_});
             for (auto& id : bloom_mip_tex_id_) {
                 if (id != 0) device_->DestroyTexture(pt::rhi::TextureHandle{id});
                 id = 0;
@@ -3072,10 +3853,23 @@ void Engine::RenderFrame() {
             denoise_color_tex_id_ = depth_tex_id_ = motion_tex_id_ = 0;
             normal_tex_id_ = albedo_tex_id_ = post_denoise_hdr_tex_id_ = 0;
             cloud_trans_tex_id_   = 0;
+            shadow_vis_buf_id_    = 0;
+            restir_reservoir_curr_buf_id_ = 0;
+            restir_reservoir_prev_buf_id_ = 0;
+            restir_reservoir_swap_buf_id_ = 0;
+            restir_alloc_w_ = 0;
+            restir_alloc_h_ = 0;
+            specular_albedo_tex_id_       = 0;
+            roughness_tex_id_             = 0;
+            specular_hit_distance_tex_id_ = 0;
         }
     }
 
-    auto fc = device_->BeginFrame();
+    pt::rhi::FrameContext fc;
+    {
+        PT_ZONE_SCOPED_N("Device::BeginFrame");
+        fc = device_->BeginFrame();
+    }
 
     // Camera-movement detection -> reset accumulation.
     auto& cam = *camera_;
@@ -3166,16 +3960,43 @@ void Engine::RenderFrame() {
          denoiser_kind_ == DenoiserKind::Nrd                 ||
          denoiser_kind_ == DenoiserKind::OptixHdrAov         ||
          denoiser_kind_ == DenoiserKind::OptixTemporalHdrAov);
-    // Albedo G-buffer: OptiX AOV variants (HdrAov + TemporalHdrAov) AND
+    // Albedo G-buffer: OptiX AOV variants (HdrAov + TemporalHdrAov),
     // MetalFX (and SVGF->MetalFX chained modes, since MetalFX is the
-    // finalizer there too). Apple's MTLFXTemporalDenoisedScaler takes
-    // diffuseAlbedoTexture as a guidance input -- providing it lets
-    // MetalFX preserve surface color edges instead of bleeding them.
-    // SVGF/NRD don't take albedo; non-AOV OptiX HDR models don't either.
+    // finalizer there too), AND the pure SVGF/NRD kinds (issue #119,
+    // for albedo demodulation -- divides noisy radiance by albedo on
+    // input to the SVGF chain, multiplies back on output, so the
+    // depth/normal/luminance edge-stops denoise the lighting signal
+    // rather than fighting texture detail).
+    // Apple's MTLFXTemporalDenoisedScaler also takes diffuseAlbedoTexture
+    // as a guidance input -- providing it lets MetalFX preserve surface
+    // color edges instead of bleeding them.
+    // Plain OptiX HDR models don't take albedo and don't run through
+    // SVGF, so they stay opted out.
     const bool want_albedo_gbuffer =
         (denoiser_kind_ == DenoiserKind::OptixHdrAov         ||
          denoiser_kind_ == DenoiserKind::OptixTemporalHdrAov ||
          denoiser_kind_ == DenoiserKind::MetalFX             ||
+         denoiser_kind_ == DenoiserKind::SvgfBasicMetalFx    ||
+         denoiser_kind_ == DenoiserKind::SvgfAtrousMetalFx   ||
+         // SVGF / NRD albedo demod (#119): the in-house chain reads
+         // albedo at the demod-divide site too, not just the MetalFX
+         // family. SvgfBasic / SvgfAtrous / Nrd join the gbuffer set.
+         denoiser_kind_ == DenoiserKind::SvgfBasic           ||
+         denoiser_kind_ == DenoiserKind::SvgfAtrous          ||
+         denoiser_kind_ == DenoiserKind::Nrd);
+    // MetalFX specular-guidance G-buffers (issue #118). Apple's
+    // MTLFXTemporalDenoisedScaler accepts specularAlbedo + roughness +
+    // specularHitDistance as guidance inputs; with PR #114's normal +
+    // diffuseAlbedo plumbing already in place, these close the gap with
+    // DLSS Ray Reconstruction quality on Apple Silicon and kill the
+    // 8x8 specular halos the user reported. Gated on MetalFX-family
+    // kinds only -- SVGF / NRD / OptiX paths don't accept these
+    // (separate issue for SVGF wiring; see #118's "Out of scope"
+    // section). All three travel together: they all feed the same
+    // MTLFXTemporalDenoisedScalerDescriptor so partial allocation
+    // would just stall on a half-bound scaler.
+    const bool want_specular_guidance_gbuffers =
+        (denoiser_kind_ == DenoiserKind::MetalFX             ||
          denoiser_kind_ == DenoiserKind::SvgfBasicMetalFx    ||
          denoiser_kind_ == DenoiserKind::SvgfAtrousMetalFx);
     // Bloom-without-denoiser path: when the user has r_bloom on but
@@ -3214,7 +4035,11 @@ void Engine::RenderFrame() {
             (depth_tex_id_ == 0 || motion_tex_id_ == 0 ||
              post_denoise_hdr_tex_id_ == 0 ||
              (want_normal_gbuffer && normal_tex_id_ == 0) ||
-             (want_albedo_gbuffer && albedo_tex_id_ == 0))))) {
+             (want_albedo_gbuffer && albedo_tex_id_ == 0) ||
+             (want_specular_guidance_gbuffers &&
+              (specular_albedo_tex_id_ == 0 ||
+               roughness_tex_id_ == 0 ||
+               specular_hit_distance_tex_id_ == 0)))))) {
         if (denoise_color_tex_id_     != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
         // depth/motion/normal/albedo/post_denoise_hdr only exist on the
         // denoiser path. Destroy them only when the denoiser path is
@@ -3229,6 +4054,20 @@ void Engine::RenderFrame() {
             if (albedo_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{albedo_tex_id_});
             if (post_denoise_hdr_tex_id_  != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
             if (cloud_trans_tex_id_       != 0) device_->DestroyTexture(pt::rhi::TextureHandle{cloud_trans_tex_id_});
+            // SIGMA shadow visibility buffer (issue #115). Storage
+            // buffer; same denoiser_active_ lifecycle as the textures
+            // above. Resize teardown destroys it before the new
+            // allocation runs further down.
+            if (shadow_vis_buf_id_        != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{shadow_vis_buf_id_});
+            // --- ReSTIR DI Phase A (issue #78) -----------------------------
+            if (restir_reservoir_curr_buf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{restir_reservoir_curr_buf_id_});
+            if (restir_reservoir_prev_buf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{restir_reservoir_prev_buf_id_});
+            if (restir_reservoir_swap_buf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{restir_reservoir_swap_buf_id_});
+            // --- end ReSTIR DI Phase A -------------------------------------
+            // MetalFX specular guidance G-buffers (issue #118).
+            if (specular_albedo_tex_id_       != 0) device_->DestroyTexture(pt::rhi::TextureHandle{specular_albedo_tex_id_});
+            if (roughness_tex_id_             != 0) device_->DestroyTexture(pt::rhi::TextureHandle{roughness_tex_id_});
+            if (specular_hit_distance_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{specular_hit_distance_tex_id_});
             // Explicitly zero the IDs here. The subsequent CreateTexture
             // calls overwrite them on the success path, but a CreateTexture
             // failure below leaves the ID still pointing at a freed handle
@@ -3241,6 +4080,15 @@ void Engine::RenderFrame() {
             albedo_tex_id_           = 0;
             post_denoise_hdr_tex_id_ = 0;
             cloud_trans_tex_id_      = 0;
+            shadow_vis_buf_id_       = 0;
+            restir_reservoir_curr_buf_id_ = 0;
+            restir_reservoir_prev_buf_id_ = 0;
+            restir_reservoir_swap_buf_id_ = 0;
+            restir_alloc_w_               = 0;
+            restir_alloc_h_               = 0;
+            specular_albedo_tex_id_       = 0;
+            roughness_tex_id_             = 0;
+            specular_hit_distance_tex_id_ = 0;
         }
         auto color_h = device_->CreateTexture({
             .width = fc.width, .height = fc.height,
@@ -3301,6 +4149,73 @@ void Engine::RenderFrame() {
                 .debug_name = "cloud_trans",
             });
             cloud_trans_tex_id_ = cloud_h.id;
+            // SIGMA shadow visibility buffer (issue #115). One R32F per
+            // pixel of sun-NEE shadow-ray transmittance, written by
+            // PathTrace.slang and bilateral-filtered by SigmaShadow.slang
+            // before being multiplied into post_denoise_hdr. A storage
+            // BUFFER (not a texture) because Metal's compute pipeline
+            // caps RWTexture2D bindings at 8 per kernel and PathTrace
+            // is already exactly at that limit (output, accum_hdr,
+            // denoise_color, depth_tex, motion_tex, normal_tex,
+            // albedo_tex, cloud_trans_tex). A 9th RW texture would fail
+            // pipeline build on Apple Silicon. Same workaround
+            // DenoiseAtrous.slang uses for its variance + moments
+            // buffers. Size: width * height * sizeof(float)
+            // = ~8.3 MB at 1080p, trivial.
+            auto svis_h = device_->CreateBuffer({
+                .size  = static_cast<std::size_t>(fc.width) *
+                         static_cast<std::size_t>(fc.height) *
+                         sizeof(float),
+                .usage = pt::rhi::BufferUsage::Storage,
+                .debug_name = "shadow_vis",
+            });
+            shadow_vis_buf_id_ = svis_h.id;
+            // --- ReSTIR DI Phase A (issue #78) -----------------------------
+            // Allocate three per-pixel reservoir SSBOs (curr / prev /
+            // swap). Each is sized W * H * sizeof(pt::renderer::Reservoir)
+            // = W * H * 64 B. At 1080p: 127 MB per buffer, ~381 MB total
+            // for the triple ring. Same denoiser_active_ lifecycle as
+            // shadow_vis_buf_id_ above; the buffers are freed and
+            // reallocated on swapchain resize.
+            //
+            // We allocate them unconditionally whenever the denoiser is
+            // active (not gated on r_restir) because the Phase A
+            // dispatch chain SHORT-CIRCUITS cleanly on r_restir=0 via
+            // the per-pass push gates -- but PathTrace.slang's binding
+            // 29 always needs a real buffer to keep Metal's MSL slot
+            // assignment stable (same lesson the
+            // shadow_vis_buf_id_ slot-11 fallback below the dispatch
+            // captures). Cost: 380 MB VRAM standby on a single-buffer
+            // denoiser path the user might not even toggle ReSTIR on
+            // for. Acceptable for Phase A; an optimization that keys
+            // allocation on r_restir = 1 only is a trivial follow-up.
+            std::size_t kReservoirBytesPerPixel =
+                sizeof(pt::renderer::Reservoir);
+            std::size_t reservoir_total_bytes =
+                static_cast<std::size_t>(fc.width) *
+                static_cast<std::size_t>(fc.height) *
+                kReservoirBytesPerPixel;
+            auto reservoir_curr_h = device_->CreateBuffer({
+                .size       = reservoir_total_bytes,
+                .usage      = pt::rhi::BufferUsage::Storage,
+                .debug_name = "restir_reservoir_curr",
+            });
+            auto reservoir_prev_h = device_->CreateBuffer({
+                .size       = reservoir_total_bytes,
+                .usage      = pt::rhi::BufferUsage::Storage,
+                .debug_name = "restir_reservoir_prev",
+            });
+            auto reservoir_swap_h = device_->CreateBuffer({
+                .size       = reservoir_total_bytes,
+                .usage      = pt::rhi::BufferUsage::Storage,
+                .debug_name = "restir_reservoir_swap",
+            });
+            restir_reservoir_curr_buf_id_ = reservoir_curr_h.id;
+            restir_reservoir_prev_buf_id_ = reservoir_prev_h.id;
+            restir_reservoir_swap_buf_id_ = reservoir_swap_h.id;
+            restir_alloc_w_ = fc.width;
+            restir_alloc_h_ = fc.height;
+            // --- end ReSTIR DI Phase A -------------------------------------
             // Normal G-buffer: SVGF/NRD use it for edge-aware spatial
             // filtering; the OptiX AOV denoiser uses it as a guide layer.
             // MetalFX ignores normals and the path tracer's normal write is
@@ -3328,9 +4243,56 @@ void Engine::RenderFrame() {
                     .debug_name = "denoise_albedo",
                 });
                 albedo_tex_id_ = albedo_h.id;
-                LOG_INFO("engine: allocated denoise_albedo G-buffer ({}x{} RGBA16F) for OptiX AOV", fc.width, fc.height);
+                LOG_INFO("engine: allocated denoise_albedo G-buffer ({}x{} RGBA16F) "
+                         "(consumers: OptiX AOV, MetalFX, SVGF demod)", fc.width, fc.height);
             } else {
                 albedo_tex_id_ = 0;
+            }
+            // MetalFX specular-guidance G-buffers (issue #118). All
+            // three travel together: they feed the same MetalFX
+            // descriptor (set in pt_metalfx_create), so partial
+            // allocation would just stall the scaler on a nil binding.
+            //
+            // specular_albedo: RGBA16F per-pixel F0 (matches the enum's
+            //   format convention and gives metals room to encode the
+            //   full RGB Fresnel reflectance).
+            // roughness: R32F single-channel surface roughness in [0,1].
+            //   The RHI doesn't expose R16F today and the precision
+            //   gap is academic for a guidance input -- R32F costs
+            //   ~8MB/4K vs R16F's ~4MB and saves us a new format slot.
+            // specular_hit_distance: R32F single-channel world-units
+            //   distance. Same R16F-vs-R32F trade as roughness; using
+            //   R32F unifies allocation code with cloud_trans_tex /
+            //   depth_tex.
+            if (want_specular_guidance_gbuffers) {
+                auto spec_albedo_h = device_->CreateTexture({
+                    .width = fc.width, .height = fc.height,
+                    .format = pt::rhi::TextureFormat::RGBA16F,
+                    .usage  = pt::rhi::TextureUsage::Storage,
+                    .debug_name = "denoise_specular_albedo",
+                });
+                specular_albedo_tex_id_ = spec_albedo_h.id;
+                auto roughness_h = device_->CreateTexture({
+                    .width = fc.width, .height = fc.height,
+                    .format = pt::rhi::TextureFormat::R32F,
+                    .usage  = pt::rhi::TextureUsage::Storage,
+                    .debug_name = "denoise_roughness",
+                });
+                roughness_tex_id_ = roughness_h.id;
+                auto spec_hit_dist_h = device_->CreateTexture({
+                    .width = fc.width, .height = fc.height,
+                    .format = pt::rhi::TextureFormat::R32F,
+                    .usage  = pt::rhi::TextureUsage::Storage,
+                    .debug_name = "denoise_specular_hit_distance",
+                });
+                specular_hit_distance_tex_id_ = spec_hit_dist_h.id;
+                LOG_INFO("engine: allocated MetalFX specular guidance G-buffers ({}x{}) "
+                         "[specular_albedo RGBA16F + roughness R32F + specular_hit_distance R32F]",
+                         fc.width, fc.height);
+            } else {
+                specular_albedo_tex_id_       = 0;
+                roughness_tex_id_             = 0;
+                specular_hit_distance_tex_id_ = 0;
             }
         }
         prev_view_proj_valid_ = false;        // history is invalid after resize
@@ -3349,7 +4311,11 @@ void Engine::RenderFrame() {
             (depth_tex_id_      == 0 || motion_tex_id_       == 0 ||
              post_denoise_hdr_tex_id_ == 0 ||
              (want_normal_gbuffer && normal_tex_id_ == 0) ||
-             (want_albedo_gbuffer && albedo_tex_id_ == 0))) {
+             (want_albedo_gbuffer && albedo_tex_id_ == 0) ||
+             (want_specular_guidance_gbuffers &&
+              (specular_albedo_tex_id_ == 0 ||
+               roughness_tex_id_ == 0 ||
+               specular_hit_distance_tex_id_ == 0)))) {
             LOG_ERROR("denoiser G-buffer allocation failed at {}x{}", fc.width, fc.height);
             denoiser_active_ = false;
         }
@@ -3402,7 +4368,16 @@ void Engine::RenderFrame() {
     // order. Our RHI uses separate "slot namespaces" so the user-facing
     // numbers below are 1-based for buffers (the AS, declared at vk slot
     // 2, lands at buffer(0) on Metal; mesh_positions at buffer(1), etc.).
-    bool tlas_present = (scene_tlas_id_ != 0);
+    // Voxel destruction Phase 1 (#140) hide-mesh gate. When the demo
+    // toggle is on AND we have at least one VoxelGrid uploaded, treat
+    // the CSG mesh as absent for this frame so the path tracer sees
+    // ONLY the voxelized form. Both the HW (TLAS) and SW (linear
+    // triangle scan) branches are suppressed via local flags --
+    // scene_tlas_id_ / mesh_tri_count_ themselves are NOT mutated, so
+    // flipping r_voxelize_demo back to 0 instantly restores the mesh
+    // without a re-bake.
+    const bool voxel_hide_mesh = voxel_demo_active_;
+    bool tlas_present = (scene_tlas_id_ != 0) && !voxel_hide_mesh;
     // Software-mesh fallback (mesh_tri_count_ > 0 && !tlas_present):
     // we still bind the vertex + index buffers and let PathTrace.slang
     // linear-scan triangles. Currently exercised on Mac-Vulkan when the
@@ -3410,7 +4385,8 @@ void Engine::RenderFrame() {
     // (pre-1.3); the gold path stays on top of VK_KHR_ray_query when it
     // is available. See VulkanDevice's RT extension probe log.
     const bool sw_mesh_present = (!tlas_present && mesh_tri_count_ > 0 &&
-                                  box_vbuf_id_ != 0 && box_ibuf_id_ != 0);
+                                  box_vbuf_id_ != 0 && box_ibuf_id_ != 0 &&
+                                  !voxel_hide_mesh);
     if (tlas_present) {
         cb->BindAccelStruct(2, pt::rhi::AccelStructHandle{scene_tlas_id_});
         if (box_vbuf_id_ != 0) cb->BindBuffer(1, pt::rhi::BufferHandle{box_vbuf_id_}, 0);
@@ -3494,6 +4470,8 @@ void Engine::RenderFrame() {
         : pt::rhi::BufferHandle{placeholder_storage_id_};
     if (slot10.id != 0) cb->BindBuffer(10, slot10, 0);
     // --- end SDF Phase 1 ---------------------------------------------------
+    // (light primitives slot bind moved to slot 12 below, since SIGMA
+    // claimed slot 11 for shadow_vis_buf on the integration branch.)
     // P10 G-buffer texture binds. The shader's vk::binding numbers (6/7/8)
     // are Vulkan descriptor slots; on Metal Slang assigns texture(N) in
     // declaration order, so output/accum/denoise_color/depth/motion/env
@@ -3545,6 +4523,94 @@ void Engine::RenderFrame() {
     // for the composite chain.
     if (denoiser_active_ && cloud_trans_tex_id_ != 0) {
         cb->BindStorageTexture(10, pt::rhi::TextureHandle{cloud_trans_tex_id_});
+    }
+    // Engine buffer slot 11 -> vk::binding 23 (shadow_vis_buf). One
+    // R32F per pixel, sun-NEE shadow-ray transmittance from the path
+    // tracer's primary-hit pass. Storage BUFFER, not a texture --
+    // Apple Silicon's 8-RW-texture cap is already saturated by the
+    // existing PathTrace G-buffer set (see comment at the
+    // shadow_vis_buf declaration in PathTrace.slang).
+    //
+    // ALWAYS bind something to slot 11 (same "max-bound + 1 must land
+    // at the kernel's expected Push slot" rule slots 4/5/7/8/9/10
+    // already follow). When the denoiser is off OR the shadow_vis_buf
+    // hasn't been allocated yet, fall back to the always-present
+    // placeholder storage buffer; the shader gates its reads / writes
+    // on `write_shadow_vis` (set to 0 by the engine when demod is off
+    // OR the buffer is missing) so this binding is dead at runtime --
+    // it only exists to keep Metal's push-slot computation
+    // (max-bound + 1 = slot 12, matching MSL's Push assignment)
+    // stable. Without this fallback the OFF-case push slot would
+    // collapse to 11 and corrupt every push field; first noticed as
+    // the golden_cornell_csg__metal__off_diff regression on the
+    // first build of issue #115.
+    pt::rhi::BufferHandle slot11 = (denoiser_active_ && shadow_vis_buf_id_ != 0)
+        ? pt::rhi::BufferHandle{shadow_vis_buf_id_}
+        : pt::rhi::BufferHandle{placeholder_storage_id_};
+    if (slot11.id != 0) cb->BindBuffer(11, slot11, 0);
+    // --- Light primitives (#73) --------------------------------------------
+    // Analytic light list at engine slot 12 (MSL slot order;
+    // vk::binding(27, 0)). Slot 12 because SIGMA's shadow_vis_buf
+    // already claims slot 11 -- light_prims is declared AFTER
+    // shadow_vis_buf in PathTrace.slang so it lands one MSL slot
+    // higher. The shader gates its NEE-to-lights branch on
+    // push.light_count > 0; the binding still has to resolve to a
+    // real buffer to keep Metal's push-slot computation stable
+    // (same lesson the slot11 fallback above captures). Falls back
+    // to the always-present placeholder storage buffer when no
+    // lights are active.
+    pt::rhi::BufferHandle slot12 = (light_buffer_id_ != 0)
+        ? pt::rhi::BufferHandle{light_buffer_id_}
+        : pt::rhi::BufferHandle{placeholder_storage_id_};
+    if (slot12.id != 0) cb->BindBuffer(12, slot12, 0);
+    // --- end Light primitives ----------------------------------------------
+    // --- Light tree (#129) -------------------------------------------------
+    // Hierarchical light tree at engine slot 13 (MSL slot 13;
+    // vk::binding(28, 0)). Declared AFTER light_prims in PathTrace.slang
+    // so MSL lands one slot higher. The shader gates traversal on
+    // push.light_tree_node_count > 0 AND r_light_tree=1; binding still
+    // has to resolve to a real buffer for Metal's push-slot computation
+    // (same lesson slot11/slot12 fallbacks capture). Falls back to the
+    // always-present placeholder storage buffer when no tree is built.
+    pt::rhi::BufferHandle slot13 = (light_tree_buffer_id_ != 0)
+        ? pt::rhi::BufferHandle{light_tree_buffer_id_}
+        : pt::rhi::BufferHandle{placeholder_storage_id_};
+    if (slot13.id != 0) cb->BindBuffer(13, slot13, 0);
+    // --- end Light tree ----------------------------------------------------
+    // --- ReSTIR DI Phase A (issue #78) -------------------------------------
+    // Reservoir SSBO at engine slot 14 -> Metal MSL slot 14 ->
+    // vk::binding(29). Lands AFTER the light tree at slot 13 (#129).
+    // Always bind something so Metal's push-slot computation
+    // (max-bound + 1 = slot 15) stays stable -- the shader's r_restir
+    // gate elides the WRITE when r_restir = 0 but the binding has to
+    // resolve to a real buffer. Falls back to the always-present
+    // placeholder when ReSTIR resources haven't been allocated yet
+    // (denoiser-off path, or pre-first-frame). Same pattern slot 11
+    // (shadow_vis) / slot 12 (light_prims) / slot 13 (light_tree) follow.
+    pt::rhi::BufferHandle slot14 =
+        (denoiser_active_ && restir_reservoir_curr_buf_id_ != 0)
+            ? pt::rhi::BufferHandle{restir_reservoir_curr_buf_id_}
+            : pt::rhi::BufferHandle{placeholder_storage_id_};
+    if (slot14.id != 0) cb->BindBuffer(14, slot14, 0);
+    // --- end ReSTIR DI Phase A ---------------------------------------------
+    // Engine slots 11/12/13 -> vk::bindings 24/25/26: the MetalFX
+    // specular-guidance trio (issue #118). Path tracer writes them
+    // alongside the existing G-buffers when the write_specular_*_gbuffer
+    // push gates are non-zero; MetalFX (and SVGF->MetalFX chained
+    // kinds) consume them via MTLFXTemporalDenoisedScalerDescriptor's
+    // specularAlbedoTexture / roughnessTexture / specularHitDistanceTexture.
+    // Engine allocates them only when want_specular_guidance_gbuffers
+    // is set (see allocation block above); the bind is gated on
+    // non-zero id so non-MetalFX dispatches leave the slots unbound
+    // and the matching push gates elide the shader writes.
+    if (denoiser_active_ && specular_albedo_tex_id_ != 0) {
+        cb->BindStorageTexture(11, pt::rhi::TextureHandle{specular_albedo_tex_id_});
+    }
+    if (denoiser_active_ && roughness_tex_id_ != 0) {
+        cb->BindStorageTexture(12, pt::rhi::TextureHandle{roughness_tex_id_});
+    }
+    if (denoiser_active_ && specular_hit_distance_tex_id_ != 0) {
+        cb->BindStorageTexture(13, pt::rhi::TextureHandle{specular_hit_distance_tex_id_});
     }
     if (env_map_tex_id_ != 0) {
         cb->BindStorageTexture(5, pt::rhi::TextureHandle{env_map_tex_id_});
@@ -3619,10 +4685,24 @@ void Engine::RenderFrame() {
         // intensity. .w = march sample count (cast to int in shader).
         float vol_params[4];
         // Volumetric cloud parameters. See PathTrace.slang's Push for
-        // the field-by-field layout. Three float4s = 48 bytes.
+        // the field-by-field layout. Four float4s = 64 bytes (was 48
+        // before issue #117 added clouds_p4 for curl-noise + secondary
+        // edge erosion plumbing).
         float clouds_p1[4];   // (base_y, top_y, coverage, peak_density)
         float clouds_p2[4];   // (wind_x, wind_z, freq, time_seconds)
         float clouds_p3[4];   // (seed_offset_x, seed_offset_z, detail_amount, rayleigh_int)
+        // clouds_p4 (#117): (curl_amount_m, curl_scale_cycles_per_m,
+        // erosion_amount, _reserved). curl_amount is the Bridson-2007
+        // curl-noise displacement magnitude in metres applied to the
+        // sample position before density evaluation; 0 disables the
+        // curl branch entirely so r_clouds_curl_amount 0 is bit-exact
+        // versus pre-#117 main. curl_scale is the curl-noise frequency
+        // in cycles per metre (default 0.01 = 100m turbulent eddies,
+        // suitable for cumulus edge wisps). erosion_amount is a
+        // secondary high-frequency erosion term layered on top of
+        // clouds_p3.z so cp3.z controls bulk wispy edges and cp4.z
+        // controls the sub-feature filamentous fringe.
+        float clouds_p4[4];
         // Moon. .xyz = unit vector toward moon (computed from astro),
         // .w = phase angle radians (0 = new, π = full).
         float moon_dir_phase[4];
@@ -3735,23 +4815,31 @@ void Engine::RenderFrame() {
         //   .z/.w reserved for future BVH-side knobs (leaf size,
         //   builder selection).
         std::uint32_t bvh_params[4];
-        // --- SDF Phase 1 (#97) -------------------------------------------------
-        // SDF traversal params.
+        // --- SDF Phase 1 (#97) + Phase 3 (#99) ---------------------------------
+        // SDF traversal params (Phase 1 + Phase 3 fields, packed).
         //   .x = sdf_cluster_count -- number of SDF clusters in the
         //        sdf_clusters buffer. 0 disables the entire SDF path.
         //   .y = sdf_max_iters     -- r_sdf_max_iters cvar, clamped to
         //        1..256 on the host (the shader's hard upper bound).
+        //        Controls sphere-trace STEPS (analytic SDF + fractal),
+        //        NOT the per-DE-eval iteration count.
         //   .z = sdf_debug_iters   -- r_sdf_debug_iters cvar. 1 ->
         //        future iteration-count heat map; Phase 1 just plumbs
         //        the bit through so Phase 2 turns it on without a
         //        push-constant reshuffle.
-        //   .w reserved.
+        //   .w = sdf_fractal_iters -- r_sdf_fractal_iters cvar (Phase 3).
+        //        Per-DE bounded iteration count for the
+        //        Mandelbulb / Mandelbox / Apollonian iterators.
+        //        Independent of .y. Clamped 1..32 on the host.
         std::uint32_t sdf_params[4];
         // .x = r_sdf_epsilon (sphere-trace surface terminator, metres).
-        // .yzw reserved for future SDF-side knobs (LOD distance, normal
-        // bias, etc.).
+        // .y = r_sdf_fractal_power (Phase 3) -- default Mandelbulb
+        //      polar exponent; per-leaf params[0] overrides.
+        // .z = r_sdf_de_eps_scale (Phase 3) -- iteration-relaxed
+        //      surface-epsilon scale, `eps * (1 + scale*step_idx)`.
+        // .w reserved.
         float         sdf_params_f[4];
-        // --- end SDF Phase 1 ---------------------------------------------------
+        // --- end SDF Phase 1 + Phase 3 -----------------------------------------
         // Celestials composite gate (issue #46). 1 = peel
         // starsOnly + sunDisc + moonDisc OUT of the primary-miss sky
         // term so denoise_color stays celestial-free, then the engine's
@@ -3763,8 +4851,93 @@ void Engine::RenderFrame() {
         // Followed by 12 bytes of pad so the trailing block lands on
         // a 16-byte boundary, matching the std140 / MSL cbuffer rule
         // Slang applies to the shader-side `Push` / `Frame` blocks.
+        //
+        // Phase 4 (#100) heterogeneous volumetric raymarching repurposes
+        // the original 12-byte trailing pad as three floats:
+        //   vol_density_scale     -- r_vol_density_scale cvar; linear
+        //                            multiplier on the cloud sigma_t
+        //                            inside the cloud march body.
+        //   vol_phase_g_cloud     -- r_vol_phase_g cvar; HG anisotropy
+        //                            for the cloud march, decoupled
+        //                            from vol_params.y (atmospheric
+        //                            haze g).
+        //   vol_multiscatter_oct  -- r_vol_multiscatter_bounces cvar
+        //                            (cast to float; shader clamps to
+        //                            0..4 ints). Number of Wrenninge-
+        //                            style multi-scatter octaves added
+        //                            on top of single-scatter.
         std::uint32_t composite_celestials;
-        std::uint32_t _pad_star_split[3];
+        std::uint32_t _pad_star_split;
+        // SIGMA shadow demodulation gate (issue #115).
+        std::uint32_t write_shadow_vis;
+        std::uint32_t _pad_shadow_vis;
+        // Heterogeneous volumetric cloud march (#100).
+        float vol_density_scale;
+        float vol_phase_g_cloud;
+        float vol_multiscatter_oct;
+        float _pad_vol;
+        // --- Light primitives (#73) + Light tree (#129) --------------------
+        // light_count: number of analytic light primitives in the
+        // `light_prims` storage buffer this dispatch. 0 disables the
+        // Lambert NEE-to-lights branch entirely.
+        // light_tree_node_count: number of nodes in the hierarchical
+        // light tree SSBO at binding 28. 0 -> shader falls back to
+        // #73's naive uniform pick. Set to 0 when the r_light_tree
+        // cvar is off too, so the cvar acts as a runtime kill switch
+        // without rebuilding shaders or reuploading the tree buffer.
+        // light_tree_enabled: explicit boolean for the shader's
+        // traversal branch; kept separate from node_count so a
+        // future variant can pass a non-zero node_count with the
+        // traversal still gated (e.g. for diagnostics).
+        // Trailing 1 uint pad keeps the block 16-byte aligned for
+        // the std140 / MSL cbuffer rule. Mirrors PathTrace.slang's
+        // matching trailing block in both the Metal Push cbuffer and
+        // the SPIR-V Frame UBO.
+        std::uint32_t light_count;
+        std::uint32_t light_tree_node_count;
+        std::uint32_t light_tree_enabled;
+        std::uint32_t _pad_light_tail;
+        // --- end Light primitives + Light tree -----------------------------
+        // MetalFX specular-guidance G-buffer write gates (issue #118).
+        std::uint32_t write_specular_albedo_gbuffer;
+        std::uint32_t write_roughness_gbuffer;
+        std::uint32_t write_specular_hit_distance_gbuffer;
+        std::uint32_t _pad_specular_gbuffers0;
+        // --- Water Phase 1 (#134) ----------------------------------------
+        // water_params0.xyz = absorption per channel (1/m, Beer's law);
+        //                .w = ior (clamped to [1.0, 2.4] in shader).
+        // water_params1.x  = wave_scale (cycles / m, normal-map noise freq).
+        //                .y = wave_amplitude (normal perturbation strength).
+        //                .z = wave_speed (animation rate multiplier).
+        //                .w = time_seconds (shared accumulator with cloud
+        //                                   wind; wraps on 24 h sim window).
+        // Two vec4s = 32 B. Sits before the ReSTIR block in PtPush.
+        float water_params0[4];
+        float water_params1[4];
+        // --- end Water Phase 1 -------------------------------------------
+        // --- ReSTIR DI Phase A (issue #78) ---------------------------------
+        // restir_enabled    : 1 -> PathTrace's primary-hit Lambert NEE
+        //                     switches to WRS candidate generation +
+        //                     reservoir write (the Phase A composite
+        //                     adds the resampled+shadow-tested
+        //                     contribution back in via the RestirFinal
+        //                     kernel). 0 -> legacy single-pick NEE
+        //                     from #73 (PathTrace adds contribution
+        //                     directly). Gated host-side on
+        //                     denoiser_active_ so the denoiser-off
+        //                     swapchain-direct path always sees a 0
+        //                     here.
+        // restir_k_candidates : WRS candidate budget per pixel. 8 =
+        //                       NVIDIA RTXDI default; clamped to
+        //                       [1, kRestirMaxK=64] before upload.
+        // Trailing 8 bytes of pad keep the cbuffer trailing block
+        // 16-byte aligned, matching the std140 / MSL rule
+        // PathTrace.slang's matching Push/Frame blocks rely on.
+        std::uint32_t restir_enabled;
+        std::uint32_t restir_k_candidates;
+        std::uint32_t _pad_restir0;
+        std::uint32_t _pad_restir1;
+        // --- end ReSTIR DI Phase A -----------------------------------------
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -3799,12 +4972,31 @@ void Engine::RenderFrame() {
     // to whether the engine actually owns a normal G-buffer this frame.
     push.write_normal_gbuffer =
         (denoiser_active_ && normal_tex_id_ != 0) ? 1u : 0u;
-    // Same gating logic as write_normal_gbuffer. OptiX-AOV and MetalFX
-    // (and its SVGF-chained variants) take a diffuse albedo guide
+    // Same gating logic as write_normal_gbuffer. OptiX-AOV, MetalFX
+    // (and its SVGF-chained variants), AND the plain SVGF/NRD kinds
+    // (issue #119, albedo demodulation) take a diffuse albedo guide
     // layer; everything else dispatches with binding 17 unbound under
-    // partially-bound semantics.
+    // partially-bound semantics. The runtime gate keys on
+    // albedo_tex_id_ != 0, so it lights up automatically for any
+    // denoiser_kind_ that flips want_albedo_gbuffer above.
     push.write_albedo_gbuffer =
         (denoiser_active_ && albedo_tex_id_ != 0) ? 1u : 0u;
+    // MetalFX specular-guidance G-buffer write gates (issue #118). Same
+    // gating logic as the normal/albedo gates: only ever set when the
+    // engine actually owns the matching texture for this dispatch.
+    // The host's want_specular_guidance_gbuffers flag drives allocation
+    // (set only for DenoiserKind::MetalFX / SvgfBasicMetalFx /
+    // SvgfAtrousMetalFx); the runtime gate here is the descriptor-
+    // is-actually-bound signal. Under partially-bound semantics the
+    // shader-side write MUST elide when the slot is unbound; the
+    // per-texture gate is what enables that elision.
+    push.write_specular_albedo_gbuffer =
+        (denoiser_active_ && specular_albedo_tex_id_ != 0) ? 1u : 0u;
+    push.write_roughness_gbuffer =
+        (denoiser_active_ && roughness_tex_id_ != 0) ? 1u : 0u;
+    push.write_specular_hit_distance_gbuffer =
+        (denoiser_active_ && specular_hit_distance_tex_id_ != 0) ? 1u : 0u;
+    push._pad_specular_gbuffers0 = 0u;
     push.env_map_present  = (env_map_tex_id_ != 0) ? 1u : 0u;
     {
         float intensity = 1.0f;
@@ -3859,29 +5051,52 @@ void Engine::RenderFrame() {
             ? tri_bvh_node_count_
             : 0u;
     }
-    // --- SDF Phase 1 (#97) -------------------------------------------------
+    // --- SDF Phase 1 (#97) + Phase 2 (#98) ---------------------------------
     {
-        int    max_iters = 128;
-        float  epsilon   = 1e-4f;
-        int    debug     = 0;
-        if (auto* v = C.FindCVar("r_sdf_max_iters"))   max_iters = v->GetInt();
-        if (auto* v = C.FindCVar("r_sdf_epsilon"))     epsilon   = v->GetFloat();
-        if (auto* v = C.FindCVar("r_sdf_debug_iters")) debug     = v->GetInt();
+        int    max_iters   = 128;
+        float  epsilon     = 1e-4f;
+        int    debug       = 0;
+        int    normal_mode = 0;     // Phase 2: forward-AD (0) or central (1)
+        if (auto* v = C.FindCVar("r_sdf_max_iters"))   max_iters   = v->GetInt();
+        if (auto* v = C.FindCVar("r_sdf_epsilon"))     epsilon     = v->GetFloat();
+        if (auto* v = C.FindCVar("r_sdf_debug_iters")) debug       = v->GetInt();
+        if (auto* v = C.FindCVar("r_sdf_normal_mode")) normal_mode = v->GetInt();
         if (max_iters < 1)   max_iters = 1;
         if (max_iters > 256) max_iters = 256;     // shader clamps the same way
         if (epsilon   < 1e-7f) epsilon = 1e-7f;
+        // --- SDF Phase 3 (#99) fractal cvars -------------------------------
+        // Pack the three fractal knobs into the reserved push slots
+        // (sdf_params.w = iters, sdf_params_f.y = power default,
+        // sdf_params_f.z = de-eps scale). Phase 1's reserved lanes
+        // are now consumed; further additions need a new push block.
+        float  fractal_power     = 8.0f;
+        int    fractal_iters     = 12;
+        float  fractal_de_eps_sc = 1.0f;
+        if (auto* v = C.FindCVar("r_sdf_fractal_power"))   fractal_power     = v->GetFloat();
+        if (auto* v = C.FindCVar("r_sdf_fractal_iters"))   fractal_iters     = v->GetInt();
+        if (auto* v = C.FindCVar("r_sdf_de_eps_scale"))    fractal_de_eps_sc = v->GetFloat();
+        if (fractal_power < 2.0f)  fractal_power = 2.0f;     // power < 2 is degenerate
+        if (fractal_power > 64.0f) fractal_power = 64.0f;    // soft upper cap; shader handles arbitrary
+        if (fractal_iters < 1)     fractal_iters = 1;
+        if (fractal_iters > 32)    fractal_iters = 32;       // shader clamps the same way
+        if (fractal_de_eps_sc < 0.0f) fractal_de_eps_sc = 0.0f;
+        // --- end SDF Phase 3 -----------------------------------------------
+        if (normal_mode < 0) normal_mode = 0;
+        if (normal_mode > 1) normal_mode = 1;     // shader maps >1 to forward-AD
         // Disable the entire SDF path when no clusters are active --
         // the shader's gate is sdf_params.x > 0.
         push.sdf_params[0] = sdf_cluster_count_;
         push.sdf_params[1] = static_cast<std::uint32_t>(max_iters);
         push.sdf_params[2] = (debug != 0) ? 1u : 0u;
-        push.sdf_params[3] = 0u;
+        push.sdf_params[3] = static_cast<std::uint32_t>(fractal_iters);
         push.sdf_params_f[0] = epsilon;
-        push.sdf_params_f[1] = 0.0f;
-        push.sdf_params_f[2] = 0.0f;
-        push.sdf_params_f[3] = 0.0f;
+        push.sdf_params_f[1] = fractal_power;
+        push.sdf_params_f[2] = fractal_de_eps_sc;
+        // Phase 2 (#98) r_sdf_normal_mode encoded as float here because Phase 3
+        // (#99) claimed sdf_params.w first. 0.0 = forward AD, 1.0 = central diff.
+        push.sdf_params_f[3] = static_cast<float>(normal_mode);
     }
-    // --- end SDF Phase 1 ---------------------------------------------------
+    // --- end SDF Phase 1 / 2 -----------------------------------------------
 
     // Celestials composite gate (issue #46). When set, PathTrace.slang
     // subtracts starsOnly + sunDisc + moonDisc + the procSky inline
@@ -3927,7 +5142,105 @@ void Engine::RenderFrame() {
             depth_tex_id_ != 0;
         push.composite_celestials = engine_composite_active ? 1u : 0u;
     }
-    for (auto& v : push._pad_star_split) v = 0u;
+    push._pad_star_split = 0u;
+    push._pad_shadow_vis = 0u;
+    push._pad_vol        = 0.0f;
+    // SIGMA shadow demodulation gate (issue #115).
+    {
+        bool shadow_demod_on = true;
+        if (auto* v = C.FindCVar("r_shadow_demod")) {
+            shadow_demod_on = v->GetBool();
+        }
+        const bool engine_shadow_demod_active =
+            denoiser_active_ &&
+            shadow_demod_on &&
+            sigma_shadow_pipeline_id_ != 0 &&
+            shadow_vis_buf_id_ != 0 &&
+            depth_tex_id_ != 0;
+        push.write_shadow_vis = engine_shadow_demod_active ? 1u : 0u;
+    }
+    // Heterogeneous volumetric cloud march (#100).
+    {
+        float dscale   = 1.0f;
+        float phase_g  = 0.8f;
+        int   ms_bnc   = 2;
+        if (auto* v = C.FindCVar("r_vol_density_scale"))         dscale  = v->GetFloat();
+        if (auto* v = C.FindCVar("r_vol_phase_g"))               phase_g = v->GetFloat();
+        if (auto* v = C.FindCVar("r_vol_multiscatter_bounces"))  ms_bnc  = v->GetInt();
+        push.vol_density_scale    = dscale;
+        push.vol_phase_g_cloud    = phase_g;
+        push.vol_multiscatter_oct = float(ms_bnc);
+    }
+    // Analytic light count (#73). Drives PathTrace.slang's NEE-to-lights
+    // gate; 0 disables it (the binding still resolves to a placeholder
+    // buffer for slot stability -- see slot12 above).
+    push.light_count = light_count_uploaded_;
+    // Light tree (#129). r_light_tree cvar acts as a runtime kill
+    // switch (default 1; set to 0 for the naive uniform-pick fallback,
+    // useful for variance-regression comparison and for fixtures that
+    // exercise the original #73 sampler).
+    bool light_tree_on = true;
+    if (auto* v = C.FindCVar("r_light_tree")) light_tree_on = (v->GetInt() != 0);
+    push.light_tree_node_count = light_tree_on
+        ? light_tree_node_count_uploaded_
+        : 0u;
+    push.light_tree_enabled = (light_tree_on &&
+                                light_tree_node_count_uploaded_ > 0u) ? 1u : 0u;
+    push._pad_light_tail = 0u;
+    // --- ReSTIR DI Phase A (issue #78) -------------------------------------
+    // r_restir master toggle, gated additionally on:
+    //   - denoiser_active_       : Phase A composite writes into denoise_color
+    //   - restir_*_pipeline_id_  : Metal-only at MVP scope; Vulkan gate
+    //                              collapses to 0 cleanly
+    //   - light_count > 0        : nothing to resample when the light
+    //                              list is empty
+    bool restir_user_on = false;
+    if (auto* v = C.FindCVar("r_restir")) restir_user_on = (v->GetInt() != 0);
+    bool restir_dispatch_active =
+        restir_user_on &&
+        denoiser_active_ &&
+        restir_temporal_pipeline_id_ != 0 &&
+        restir_spatial_pipeline_id_  != 0 &&
+        restir_final_pipeline_id_    != 0 &&
+        restir_reservoir_curr_buf_id_ != 0 &&
+        light_count_uploaded_ > 0u;
+    push.restir_enabled = restir_dispatch_active ? 1u : 0u;
+    // One-shot gate diagnostics: ONLY when r_restir = 1 but the gate
+    // evaluates to 0 (so the user-visible "nothing happens" mismatch
+    // gets a diagnostic line per session). When ReSTIR engages
+    // successfully the "Phase A engaged" log inside the dispatch block
+    // below covers it; the silent-success path here avoids spamming
+    // the journal for the common case.
+    {
+        static bool s_restir_gate_failure_logged = false;
+        if (restir_user_on && !restir_dispatch_active &&
+            !s_restir_gate_failure_logged) {
+            LOG_INFO("engine: r_restir=1 but ReSTIR NOT dispatching "
+                     "(denoiser_active={}, pipes_t/s/f={}{}{}, "
+                     "reservoir_buf={}, light_count={}). The dispatch "
+                     "engages when ALL of those are non-zero / true.",
+                     denoiser_active_,
+                     restir_temporal_pipeline_id_ != 0,
+                     restir_spatial_pipeline_id_  != 0,
+                     restir_final_pipeline_id_    != 0,
+                     restir_reservoir_curr_buf_id_ != 0,
+                     light_count_uploaded_);
+            s_restir_gate_failure_logged = true;
+        }
+    }
+    std::uint32_t restir_k = 8u;
+    if (auto* v = C.FindCVar("r_restir_k_candidates")) {
+        int n = v->GetInt();
+        if (n < 1) n = 1;
+        if (n > static_cast<int>(pt::renderer::kRestirMaxK)) {
+            n = static_cast<int>(pt::renderer::kRestirMaxK);
+        }
+        restir_k = static_cast<std::uint32_t>(n);
+    }
+    push.restir_k_candidates = restir_k;
+    push._pad_restir0 = 0u;
+    push._pad_restir1 = 0u;
+    // --- end ReSTIR DI Phase A ---------------------------------------------
 
     // Halton(2,3) sub-pixel jitter sequence in [-0.5, 0.5] each axis.
     // 16-sample period before repeating; ample for the denoiser's
@@ -4155,7 +5468,22 @@ void Engine::RenderFrame() {
             s_refr_logged_active = active;
         }
         push.sun_extra[2] = vflat;
-        push.sun_extra[3] = 0.0f;
+        // sun_extra[3] = planet radius in metres for spherical-Earth
+        // atmospheric transmittance (issue #51). The shader's
+        // `atmosphericTransmittance` numerically integrates Mie + Rayleigh
+        // optical depth along the curved chord when this is > 0;
+        // 0 falls back to the legacy planar exponential integral
+        // (1/sin(elev) airmass divergence at horizon).
+        float planet_radius_m = 6378137.0f;
+        if (auto* v = C.FindCVar("r_planet_radius")) planet_radius_m = v->GetFloat();
+        // Negative values are nonsense -- clamp to 0 to mean "disable
+        // curved-Earth, use planar". Anything between 0 and ~Earth radius
+        // produces an unphysical-but-rendered-correctly miniature planet
+        // (clouds touch the horizon sooner). We don't impose an upper
+        // bound so future moonlit / Mars / gas-giant render passes can
+        // pass realistic radii.
+        if (planet_radius_m < 0.0f) planet_radius_m = 0.0f;
+        push.sun_extra[3] = planet_radius_m;
     }
 
     // HDRI multi-light array (computed at HDRI load in ReloadEnvMap).
@@ -4318,6 +5646,12 @@ void Engine::RenderFrame() {
         float wind_x      = 5.0f;
         float wind_z      = 0.0f;
         float seed        = 0.0f;
+        // Issue #117: curl-noise displacement + secondary edge erosion.
+        // Defaults to 0 so existing scenes are bit-equivalent to main
+        // until the user opts in via r_clouds_curl_amount / r_clouds_erosion.
+        float curl_amt    = 0.3f;
+        float curl_scale  = 0.01f;
+        float erosion     = 0.0f;
         if (auto* v = C.FindCVar("r_clouds"))             clouds_on = v->GetBool();
         if (auto* v = C.FindCVar("r_clouds_coverage"))    coverage  = v->GetFloat();
         if (auto* v = C.FindCVar("r_clouds_base_height")) base_y    = v->GetFloat();
@@ -4325,6 +5659,9 @@ void Engine::RenderFrame() {
         if (auto* v = C.FindCVar("r_clouds_density"))     density   = v->GetFloat();
         if (auto* v = C.FindCVar("r_clouds_freq"))        freq      = v->GetFloat();
         if (auto* v = C.FindCVar("r_clouds_detail"))      detail    = v->GetFloat();
+        if (auto* v = C.FindCVar("r_clouds_curl_amount")) curl_amt  = v->GetFloat();
+        if (auto* v = C.FindCVar("r_clouds_curl_scale"))  curl_scale= v->GetFloat();
+        if (auto* v = C.FindCVar("r_clouds_erosion"))     erosion   = v->GetFloat();
         if (auto* v = C.FindCVar("r_clouds_wind_x"))      wind_x    = v->GetFloat();
         if (auto* v = C.FindCVar("r_clouds_wind_z"))      wind_z    = v->GetFloat();
         if (auto* v = C.FindCVar("r_clouds_seed"))        seed      = v->GetFloat();
@@ -4362,7 +5699,51 @@ void Engine::RenderFrame() {
         float rayleigh = 1.0f;
         if (auto* v = C.FindCVar("r_rayleigh")) rayleigh = v->GetFloat();
         push.clouds_p3[3] = rayleigh;
+        // Issue #117: curl-noise displacement + secondary edge erosion.
+        // Gated on clouds_on (when r_clouds 0 the whole density field is
+        // zeroed anyway, but keeping the magnitudes at 0 here keeps the
+        // shader-side `if (cp4.x > 0)` branch off as well -- shaves a few
+        // ALU on the haze-only path).
+        push.clouds_p4[0] = clouds_on ? curl_amt   : 0.0f;
+        push.clouds_p4[1] = curl_scale;
+        push.clouds_p4[2] = clouds_on ? erosion    : 0.0f;
+        push.clouds_p4[3] = 0.0f;   // reserved
     }
+
+    // --- Water Phase 1 (#134) ----------------------------------------------
+    // Drive PathTrace.slang's MAT_WATER BRDF branch. Defaults match the
+    // cvar defaults registered above; FindCVar nullptr-tolerant in case
+    // a tooling path skipped registration. Time uses the same wrapped
+    // accumulator as clouds_p2.w so the wave field stays fp32-precise
+    // even on long sessions; r_water_wave_speed scales the rate.
+    {
+        float abs_r = 0.45f, abs_g = 0.15f, abs_b = 0.05f;
+        float ior = 1.33f;
+        float wave_scale = 0.3f, wave_amp = 0.2f, wave_speed = 1.0f;
+        if (auto* v = C.FindCVar("r_water_absorption_r"))  abs_r = v->GetFloat();
+        if (auto* v = C.FindCVar("r_water_absorption_g"))  abs_g = v->GetFloat();
+        if (auto* v = C.FindCVar("r_water_absorption_b"))  abs_b = v->GetFloat();
+        if (auto* v = C.FindCVar("r_water_ior"))           ior   = v->GetFloat();
+        if (auto* v = C.FindCVar("r_water_wave_scale"))    wave_scale = v->GetFloat();
+        if (auto* v = C.FindCVar("r_water_wave_amplitude"))wave_amp   = v->GetFloat();
+        if (auto* v = C.FindCVar("r_water_wave_speed"))    wave_speed = v->GetFloat();
+        // Reuse the cloud time accumulator (already wrapped to 24h sim).
+        // Re-derive locally because the cloud block scoped its t_seconds
+        // out of reach. Same wrap rationale: keeps fp32-precise on long
+        // sessions; identical phase across cloud-wind & water-waves.
+        constexpr std::uint64_t kWaterPeriodFrames = 86400ull * 60ull;
+        const float water_t = float(frame_index_ % kWaterPeriodFrames)
+                            * (1.0f / 60.0f);
+        push.water_params0[0] = abs_r;
+        push.water_params0[1] = abs_g;
+        push.water_params0[2] = abs_b;
+        push.water_params0[3] = ior;
+        push.water_params1[0] = wave_scale;
+        push.water_params1[1] = wave_amp;
+        push.water_params1[2] = wave_speed;
+        push.water_params1[3] = water_t;
+    }
+    // --- end Water Phase 1 -------------------------------------------------
 
     // PtPush layout: the trailing 32 bytes here include the SDF Phase 1
     // block (sdf_params uvec4 + sdf_params_f vec4) and the celestials-
@@ -4370,11 +5751,19 @@ void Engine::RenderFrame() {
     // explicit padding that the SPIR-V / MSL cbuffer rule would have
     // inserted anyway). Mirrored in PathTrace.slang's Push/Frame block.
     // 736 (pre-SDF) + 16 (sdf_params uvec4) + 16 (sdf_params_f vec4) +
-    // 16 (composite_celestials + 12 B pad) = 784 B. Vulkan keeps the
-    // first 112 B in push constants and spills the rest into the Frame
-    // UBO (kFrameUboSize = 1024); Metal keeps the whole struct in a
-    // setBytes-style slot.
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16);
+    // 16 (composite_celestials + 12 B pad) = 784 B baseline. Issue #117
+    // adds clouds_p4 (curl-noise plumbing) = +16 B for a total 800 B.
+    // Vulkan keeps the first 112 B in push constants and spills the
+    // rest into the Frame UBO (kFrameUboSize = 1024); Metal keeps the
+    // whole struct in a setBytes-style slot.
+    // Trailing additions on top of the #117 baseline:
+    //   +16 SIGMA shadow demod block (#115)
+    //   +16 hetero volumetric block (#100)
+    //   +16 analytic light primitives block (#73)
+    //   +16 MetalFX specular guidance write gates (#118)
+    //   +32 Water Phase 1 (#134) — two vec4s (absorption + ior, wave params)
+    //   +16 ReSTIR DI Phase A (#78)
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16);
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
     // cbuffer layout the Slang compiler applies to PathTrace.slang's
@@ -4383,6 +5772,14 @@ void Engine::RenderFrame() {
     // forgets to mirror it the GPU reads from 12 bytes ahead of where
     // the host wrote (the bug class that landed `_pad_before_accum_params`
     // above). Catch the next regression at compile time.
+    // Issue #117: clouds_p4 was inserted between clouds_p3 and
+    // moon_dir_phase. Both anchor the trailing block at a 16-byte
+    // boundary already (all elements above are float4-sized), but
+    // guard explicitly so a future field re-ordering can't silently
+    // slip the std140 layout out from under the shader.
+    static_assert(offsetof(PtPush, clouds_p4) % 16 == 0,
+                  "PtPush::clouds_p4 must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
     static_assert(offsetof(PtPush, accum_params) % 16 == 0,
                   "PtPush::accum_params must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
@@ -4400,12 +5797,295 @@ void Engine::RenderFrame() {
     static_assert(offsetof(PtPush, composite_celestials) % 16 == 0,
                   "PtPush::composite_celestials must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
+    // Issue #118 MetalFX specular guidance write gates land in their own
+    // 16-byte block right after the composite_celestials block.
+    static_assert(offsetof(PtPush, write_specular_albedo_gbuffer) % 16 == 0,
+                  "PtPush::write_specular_albedo_gbuffer must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    // --- Water Phase 1 (#134) ------------------------------------------------
+    static_assert(offsetof(PtPush, water_params0) % 16 == 0,
+                  "PtPush::water_params0 must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    static_assert(offsetof(PtPush, water_params1) % 16 == 0,
+                  "PtPush::water_params1 must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    // --- end Water Phase 1 ---------------------------------------------------
+    // --- Light tree (#129) -------------------------------------------------
+    // light_count is the start of the light primitives + light tree
+    // 16-byte block (light_count + light_tree_node_count +
+    // light_tree_enabled + _pad_light_tail = 4 uints). Anchor it at a
+    // 16-byte boundary so the shader-side cbuffer layout doesn't shift
+    // the light_tree_* fields past where the host writes them. Same
+    // class of bug `_pad_before_accum_params` captures upstream.
+    static_assert(offsetof(PtPush, light_count) % 16 == 0,
+                  "PtPush::light_count must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    // --- end Light tree ----------------------------------------------------
+    // Issue #78 ReSTIR DI Phase A block.
+    static_assert(offsetof(PtPush, restir_enabled) % 16 == 0,
+                  "PtPush::restir_enabled must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
 
     auto wg_x = (fc.width  + 7) / 8;
     auto wg_y = (fc.height + 7) / 8;
     cb->Dispatch(wg_x, wg_y, 1);
+
+    // --- ReSTIR DI Phase A (issue #78) -------------------------------------
+    // Dispatch chain (when ReSTIR is engaged this frame):
+    //   1. RestirTemporal : reads reservoir_curr (just written by
+    //                       PathTrace), reads reservoir_prev
+    //                       (last frame's final), MIS-combines into
+    //                       reservoir_curr.
+    //   2. RestirSpatial  : reads reservoir_curr (post-temporal), MIS-
+    //                       combines with N neighbours, writes
+    //                       reservoir_swap.
+    //   3. RestirFinal    : reads reservoir_swap, shadow-tests the
+    //                       survivor, additively blends the Lambert
+    //                       contribution into denoise_color.
+    //
+    // At end of frame the prev/swap ids are swapped so next frame's
+    // RestirTemporal reads this frame's final reservoir as prev. The
+    // ping-pong avoids per-frame buffer reallocs.
+    if (push.restir_enabled != 0u) {
+        // One-shot logging so operators can verify the ReSTIR chain
+        // engaged for a given session. Logged at INFO once per
+        // engine session to avoid spamming the journal; the same
+        // one-shot pattern SIGMA / particles use to advertise
+        // first-engagement.
+        static bool s_restir_logged = false;
+        if (!s_restir_logged) {
+            LOG_INFO("engine: ReSTIR DI Phase A engaged "
+                     "(K={}, light_count={}, denoiser=on)",
+                     push.restir_k_candidates,
+                     light_count_uploaded_);
+            s_restir_logged = true;
+        }
+        // RAW hazard: PathTrace wrote reservoir_curr_buf in its
+        // candidate-generation block; RestirTemporal is about to read
+        // it. Emit a compute-write -> compute-read barrier. Metal
+        // auto-barriers, but this matters on Vulkan submission ordering.
+        cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                     pt::rhi::BarrierDesc::Stage::ComputeRead});
+
+        std::uint32_t bias_mode_v = pt::renderer::kRestirBiasBiased;
+        if (auto* v = C.FindCVar("r_restir_bias")) {
+            // CVar.value is the canonical string store; r_restir_bias
+            // is a string-valued cvar with allowed_values {biased,
+            // unbiased}, so direct comparison is correct here.
+            if (v->value == "unbiased") {
+                bias_mode_v = pt::renderer::kRestirBiasUnbiased;
+            }
+        }
+        std::uint32_t temporal_on = 1u;
+        if (auto* v = C.FindCVar("r_restir_temporal")) {
+            temporal_on = v->GetBool() ? 1u : 0u;
+        }
+        std::uint32_t spatial_on = 1u;
+        if (auto* v = C.FindCVar("r_restir_spatial")) {
+            spatial_on = v->GetBool() ? 1u : 0u;
+        }
+
+        // --- RestirTemporal -------------------------------------------------
+        if (restir_temporal_pipeline_id_ != 0) {
+            cb->BindComputePipeline(
+                pt::rhi::PipelineHandle{restir_temporal_pipeline_id_});
+            // Texture slot 0: depth_tex (camera-space Z).
+            cb->BindStorageTexture(0, pt::rhi::TextureHandle{depth_tex_id_});
+            // Texture slot 1: motion_tex (reprojection delta).
+            cb->BindStorageTexture(1, pt::rhi::TextureHandle{motion_tex_id_});
+            // Texture slot 2: normal_tex (disocclusion gate). When the
+            // active denoiser doesn't allocate normals (rare; the
+            // engine forces it on for MetalFX so the bind always has
+            // a non-zero id under the dispatch gate above), bind the
+            // 1x1 bloom_dummy as a placeholder to satisfy Metal's
+            // pipeline validation. The shader's disocclusion code
+            // tolerates a black normal -- it just falls back to "no
+            // temporal reuse" for that pixel.
+            const std::uint64_t restir_normal_id =
+                (normal_tex_id_ != 0) ? normal_tex_id_ : bloom_dummy_tex_id_;
+            cb->BindStorageTexture(2, pt::rhi::TextureHandle{restir_normal_id});
+            // Buffer slot 0: reservoir_curr_in (PathTrace output).
+            cb->BindBuffer(0, pt::rhi::BufferHandle{restir_reservoir_curr_buf_id_}, 0);
+            // Buffer slot 1: reservoir_prev_in.
+            cb->BindBuffer(1, pt::rhi::BufferHandle{restir_reservoir_prev_buf_id_}, 0);
+            // Buffer slot 2: reservoir_curr_out (we ping-pong back into
+            // the curr buffer via the spatial pass; the temporal pass
+            // writes a TRANSIENT result that the spatial pass reads).
+            // Use restir_reservoir_swap_buf_id_ here so the temporal
+            // output sits in a different buffer than its inputs --
+            // necessary to avoid the WAR hazard if the spatial pass
+            // reads neighbour pixels at slightly different positions.
+            cb->BindBuffer(2, pt::rhi::BufferHandle{restir_reservoir_swap_buf_id_}, 0);
+            // Buffer slot 3: light_prims (re-evaluate prev survivor's pdf).
+            pt::rhi::BufferHandle restir_lights = (light_buffer_id_ != 0)
+                ? pt::rhi::BufferHandle{light_buffer_id_}
+                : pt::rhi::BufferHandle{placeholder_storage_id_};
+            cb->BindBuffer(3, restir_lights, 0);
+
+            struct RestirTemporalPush {
+                std::uint32_t width;
+                std::uint32_t height;
+                std::uint32_t frame_index;
+                std::uint32_t light_count;
+                float pos_fovtan[4];
+                float fwd_aspect[4];
+                float right_xyz[4];
+                float up_xyz[4];
+                std::uint32_t bias_mode;
+                std::uint32_t restir_enabled;
+                std::uint32_t temporal_enabled;
+                std::uint32_t _pad0;
+            } rt{};
+            static_assert(sizeof(RestirTemporalPush) % 16 == 0,
+                          "RestirTemporalPush must be 16-byte aligned");
+            rt.width            = fc.width;
+            rt.height           = fc.height;
+            rt.frame_index      = push.frame_index;
+            rt.light_count      = light_count_uploaded_;
+            std::memcpy(rt.pos_fovtan, push.pos_fovtan, sizeof(rt.pos_fovtan));
+            std::memcpy(rt.fwd_aspect, push.fwd_aspect, sizeof(rt.fwd_aspect));
+            std::memcpy(rt.right_xyz,  push.right_xyz,  sizeof(rt.right_xyz));
+            std::memcpy(rt.up_xyz,     push.up_xyz,     sizeof(rt.up_xyz));
+            rt.bias_mode        = bias_mode_v;
+            rt.restir_enabled   = 1u;
+            rt.temporal_enabled = temporal_on;
+            rt._pad0            = 0u;
+            cb->PushConstants(&rt, sizeof(rt));
+            cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
+
+            // RAW: temporal wrote restir_reservoir_swap_buf; spatial
+            // about to read it.
+            cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                         pt::rhi::BarrierDesc::Stage::ComputeRead});
+        }
+
+        // --- RestirSpatial --------------------------------------------------
+        if (restir_spatial_pipeline_id_ != 0) {
+            cb->BindComputePipeline(
+                pt::rhi::PipelineHandle{restir_spatial_pipeline_id_});
+            cb->BindStorageTexture(0, pt::rhi::TextureHandle{depth_tex_id_});
+            const std::uint64_t restir_normal_id =
+                (normal_tex_id_ != 0) ? normal_tex_id_ : bloom_dummy_tex_id_;
+            cb->BindStorageTexture(1, pt::rhi::TextureHandle{restir_normal_id});
+            // Input: post-temporal reservoir (swap buffer).
+            cb->BindBuffer(0, pt::rhi::BufferHandle{restir_reservoir_swap_buf_id_}, 0);
+            // Output: final reservoir for this frame, lands in curr
+            // (the spatial pass writes the FINAL survivor that
+            // RestirFinal reads and that becomes next frame's prev).
+            cb->BindBuffer(1, pt::rhi::BufferHandle{restir_reservoir_curr_buf_id_}, 0);
+            pt::rhi::BufferHandle restir_lights = (light_buffer_id_ != 0)
+                ? pt::rhi::BufferHandle{light_buffer_id_}
+                : pt::rhi::BufferHandle{placeholder_storage_id_};
+            cb->BindBuffer(2, restir_lights, 0);
+
+            struct RestirSpatialPush {
+                std::uint32_t width;
+                std::uint32_t height;
+                std::uint32_t frame_index;
+                std::uint32_t light_count;
+                float pos_fovtan[4];
+                float fwd_aspect[4];
+                float right_xyz[4];
+                float up_xyz[4];
+                std::uint32_t bias_mode;
+                std::uint32_t restir_enabled;
+                std::uint32_t spatial_enabled;
+                std::uint32_t _pad0;
+            } rs{};
+            static_assert(sizeof(RestirSpatialPush) % 16 == 0,
+                          "RestirSpatialPush must be 16-byte aligned");
+            rs.width            = fc.width;
+            rs.height           = fc.height;
+            rs.frame_index      = push.frame_index;
+            rs.light_count      = light_count_uploaded_;
+            std::memcpy(rs.pos_fovtan, push.pos_fovtan, sizeof(rs.pos_fovtan));
+            std::memcpy(rs.fwd_aspect, push.fwd_aspect, sizeof(rs.fwd_aspect));
+            std::memcpy(rs.right_xyz,  push.right_xyz,  sizeof(rs.right_xyz));
+            std::memcpy(rs.up_xyz,     push.up_xyz,     sizeof(rs.up_xyz));
+            rs.bias_mode        = bias_mode_v;
+            rs.restir_enabled   = 1u;
+            rs.spatial_enabled  = spatial_on;
+            rs._pad0            = 0u;
+            cb->PushConstants(&rs, sizeof(rs));
+            cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
+
+            cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                         pt::rhi::BarrierDesc::Stage::ComputeRead});
+        }
+
+        // --- RestirFinal ----------------------------------------------------
+        if (restir_final_pipeline_id_ != 0 && albedo_tex_id_ != 0) {
+            cb->BindComputePipeline(
+                pt::rhi::PipelineHandle{restir_final_pipeline_id_});
+            cb->BindStorageTexture(0, pt::rhi::TextureHandle{depth_tex_id_});
+            const std::uint64_t restir_normal_id =
+                (normal_tex_id_ != 0) ? normal_tex_id_ : bloom_dummy_tex_id_;
+            cb->BindStorageTexture(1, pt::rhi::TextureHandle{restir_normal_id});
+            cb->BindStorageTexture(2, pt::rhi::TextureHandle{albedo_tex_id_});
+            cb->BindStorageTexture(3, pt::rhi::TextureHandle{denoise_color_tex_id_});
+            // Input reservoir (post-spatial; lives in curr buf).
+            cb->BindBuffer(0, pt::rhi::BufferHandle{restir_reservoir_curr_buf_id_}, 0);
+            pt::rhi::BufferHandle restir_lights = (light_buffer_id_ != 0)
+                ? pt::rhi::BufferHandle{light_buffer_id_}
+                : pt::rhi::BufferHandle{placeholder_storage_id_};
+            cb->BindBuffer(1, restir_lights, 0);
+            pt::rhi::BufferHandle restir_prims = (prim_buffer_id_ != 0)
+                ? pt::rhi::BufferHandle{prim_buffer_id_}
+                : pt::rhi::BufferHandle{placeholder_storage_id_};
+            cb->BindBuffer(2, restir_prims, 0);
+            // TLAS bind for the shadow trace. Only present on backends
+            // that support RT (Metal always; Vulkan when MoltenVK has
+            // VK_KHR_ray_query).
+            if (tlas_present) {
+                cb->BindAccelStruct(3, pt::rhi::AccelStructHandle{scene_tlas_id_});
+            }
+
+            struct RestirFinalPush {
+                std::uint32_t width;
+                std::uint32_t height;
+                std::uint32_t frame_index;
+                std::uint32_t light_count;
+                float pos_fovtan[4];
+                float fwd_aspect[4];
+                float right_xyz[4];
+                float up_xyz[4];
+                std::uint32_t restir_enabled;
+                std::uint32_t prim_count;
+                std::uint32_t tlas_present;
+                std::uint32_t linear_prim_count;
+            } rf{};
+            static_assert(sizeof(RestirFinalPush) % 16 == 0,
+                          "RestirFinalPush must be 16-byte aligned");
+            rf.width             = fc.width;
+            rf.height            = fc.height;
+            rf.frame_index       = push.frame_index;
+            rf.light_count       = light_count_uploaded_;
+            std::memcpy(rf.pos_fovtan, push.pos_fovtan, sizeof(rf.pos_fovtan));
+            std::memcpy(rf.fwd_aspect, push.fwd_aspect, sizeof(rf.fwd_aspect));
+            std::memcpy(rf.right_xyz,  push.right_xyz,  sizeof(rf.right_xyz));
+            std::memcpy(rf.up_xyz,     push.up_xyz,     sizeof(rf.up_xyz));
+            rf.restir_enabled    = 1u;
+            rf.prim_count        = static_cast<std::uint32_t>(primitives_.size());
+            rf.tlas_present      = tlas_present ? 1u : 0u;
+            rf.linear_prim_count = linear_prim_count_;
+            cb->PushConstants(&rf, sizeof(rf));
+            cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
+
+            // RestirFinal wrote denoise_color; subsequent passes
+            // (denoiser / bloom / tonemap) read it. Emit the
+            // standard compute-write -> compute-read barrier.
+            cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                         pt::rhi::BarrierDesc::Stage::ComputeRead});
+        }
+
+        // End-of-frame ping-pong: swap curr <-> prev so next frame's
+        // RestirTemporal reads THIS frame's final survivor reservoir
+        // (now in curr) as last-frame state.
+        std::swap(restir_reservoir_curr_buf_id_, restir_reservoir_prev_buf_id_);
+    }
+    // --- end ReSTIR DI Phase A ---------------------------------------------
 
     // GPU-side auto-exposure: tiny reduction pass that samples
     // accum_hdr (which the path tracer just wrote) and updates the
@@ -4554,6 +6234,14 @@ void Engine::RenderFrame() {
         // tolerates it. MetalFX uses the diffuse albedo as a spatial-
         // filter guidance signal.
         dd.albedo_in     = pt::rhi::TextureHandle{albedo_tex_id_};
+        // MetalFX specular-guidance G-buffers (issue #118). Engine
+        // allocates these only for MetalFX-family kinds; for all
+        // other denoiser modes the IDs are 0 and the backend treats
+        // them as "no guidance for this frame" (matching the existing
+        // nil-handle convention used for albedo_in on SVGF/NRD).
+        dd.specular_albedo_in       = pt::rhi::TextureHandle{specular_albedo_tex_id_};
+        dd.roughness_in             = pt::rhi::TextureHandle{roughness_tex_id_};
+        dd.specular_hit_distance_in = pt::rhi::TextureHandle{specular_hit_distance_tex_id_};
         // Star-split accumulator was wired here for the EMA design
         // (#108). The stateless StarsComposite rewrite eliminates the
         // accumulator; the Vulkan path's denoiser finalize no longer
@@ -4605,6 +6293,18 @@ void Engine::RenderFrame() {
             atrous_passes_want = static_cast<std::uint32_t>(n);
         }
         dd.atrous_passes = atrous_passes_want;
+        // Issue #119 -- SVGF albedo demodulation. Cvar-driven; the
+        // backends ignore this for non-SVGF kinds and treat it as
+        // false when albedo_in_ wasn't allocated (so a transient
+        // resize race that lands an SVGF dispatch one frame before
+        // the albedo texture is ready degrades cleanly).
+        {
+            bool demod_on = true;       // matches CVAR default
+            if (auto* v = C.FindCVar("r_svgf_albedo_demod")) {
+                demod_on = v->GetBool();
+            }
+            dd.albedo_demod_enabled = demod_on;
+        }
 
         // Top-level Kind: tells the backend which denoiser
         // implementation to dispatch.
@@ -4669,6 +6369,7 @@ void Engine::RenderFrame() {
         // on the first mip for path-tracer firefly resilience) then
         // upsample-add.
         auto dispatch_bloom_pyramid = [&](std::uint64_t source_tex_id) {
+            PT_ZONE_SCOPED_N("Engine::dispatch_bloom_pyramid");
             // Downsample: source_tex -> mip0 (with threshold), then
             // mip0 -> mip1 -> ... -> mip[N-1]. Each step's read of
             // mip[i-1] is the previous step's write -- explicit
@@ -4881,6 +6582,7 @@ void Engine::RenderFrame() {
         // (use_vulkan_bloom_finalize on Vulkan, use_engine_tonemap on
         // Metal) still write the swapchain from denoise_color.
         if (denoiser_active_) {
+            PT_ZONE_SCOPED_N("Device::Denoise");
             device_->Denoise(dd);
         }
 
@@ -4914,6 +6616,7 @@ void Engine::RenderFrame() {
                                   ? pt::rhi::TextureHandle{bloom_mip_tex_id_[0]}
                                   : pt::rhi::TextureHandle{0};
             dd.bloom_intensity = bloom_can_run ? bloom_intensity : 0.0f;
+            PT_ZONE_SCOPED_N("Device::Denoise(FinalizeOnly)");
             device_->Denoise(dd);
         }
 
@@ -4950,6 +6653,103 @@ void Engine::RenderFrame() {
         // the explicit barrier).
         cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
                      pt::rhi::BarrierDesc::Stage::ComputeRead});
+
+        // SIGMA-style sun-shadow demodulation (issue #115). Dispatched
+        // BEFORE StarsComposite so the shadow demod multiplies into
+        // the post-radiance-denoise HDR before celestials are added on
+        // top (celestials should stay at full brightness; they're not
+        // subject to direct-sun shadowing the same way the scene
+        // surfaces are). The kernel reads the noisy per-pixel
+        // shadow_vis_buf that PathTrace's primary-hit pass wrote,
+        // bilateral-filters it with a 5x5 depth+normal kernel, and
+        // multiplies the denoised visibility into tonemap_hdr_source_id
+        // in place. Gated on push.write_shadow_vis so we only run when
+        // PathTrace was actually populating the buffer -- otherwise
+        // we'd multiply by uninitialised memory.
+        //
+        // Dispatch gate mirrors push.write_shadow_vis prerequisites
+        // (denoiser_active_, shadow_vis_buf_id_, depth_tex_id_,
+        // sigma_shadow_pipeline_id_) AND adds normal_tex_id_ as a soft
+        // requirement -- the shader has a use_normal=0 fallback path
+        // (depth-only edge stops, slightly lower selectivity) for the
+        // rare denoiser mode that doesn't allocate normals.
+        if (push.write_shadow_vis != 0u &&
+            sigma_shadow_pipeline_id_ != 0 &&
+            shadow_vis_buf_id_ != 0 &&
+            depth_tex_id_ != 0) {
+            cb->BindComputePipeline(pt::rhi::PipelineHandle{sigma_shadow_pipeline_id_});
+            // SigmaShadow texture bindings in declaration order:
+            //   slot 0 hdr_inout       -- post-radiance-denoise HDR
+            //   slot 1 depth_tex       -- camera-space Z (sky gate +
+            //                              depth edge stop)
+            //   slot 2 normal_tex      -- world-space normal (normal
+            //                              edge stop; only meaningful
+            //                              when normal_tex_id_ != 0
+            //                              AND use_normal=1 in push)
+            // Buffer:
+            //   slot 3 shadow_vis_buf  -- R32F per-pixel visibility
+            //                              written by PathTrace
+            //
+            // When normal_tex_id_ is 0 we still need slot 2 bound to
+            // SOMETHING so Metal's pipeline-validation doesn't trip
+            // on a missing storage texture. depth_tex is a different
+            // format (R32F vs RGBA16F), so bloom_dummy_tex_id_ (1x1
+            // RGBA16F, always allocated alongside the denoiser
+            // textures) is the natural placeholder -- the shader's
+            // use_normal=0 path doesn't read it, but Metal validates
+            // the binding regardless of usage.
+            cb->BindStorageTexture(0, pt::rhi::TextureHandle{tonemap_hdr_source_id});
+            cb->BindStorageTexture(1, pt::rhi::TextureHandle{depth_tex_id_});
+            const std::uint64_t sigma_normal_id =
+                (normal_tex_id_ != 0) ? normal_tex_id_ : bloom_dummy_tex_id_;
+            cb->BindStorageTexture(2, pt::rhi::TextureHandle{sigma_normal_id});
+            // shadow_vis_buf lands at MSL buffer(0) -- Slang assigns
+            // buffer slots in declaration order starting at 0, and
+            // SigmaShadow.slang declares no other buffers before Push.
+            // Texture slots are a separate namespace from buffer slots
+            // on Metal, so binding the storage buffer at engine slot 0
+            // here doesn't clash with the hdr_inout texture binding at
+            // engine slot 0 above. Push lands at buffer(1) (max-bound +
+            // 1 = 0 + 1) and MetalCommandBuffer::Dispatch computes that
+            // automatically.
+            cb->BindBuffer(0, pt::rhi::BufferHandle{shadow_vis_buf_id_}, 0);
+
+            struct SigmaShadowPush {
+                std::uint32_t width;
+                std::uint32_t height;
+                std::uint32_t demod_active;
+                std::uint32_t _pad0;
+                float         sigma_depth;
+                float         sigma_normal;
+                std::uint32_t use_normal;
+                std::uint32_t _pad1;
+            } sp{};
+            static_assert(sizeof(SigmaShadowPush) == 32,
+                          "SigmaShadowPush layout must match SigmaShadow.slang");
+            sp.width        = fc.width;
+            sp.height       = fc.height;
+            sp.demod_active = 1u;
+            sp._pad0        = 0u;
+            // Bilateral sigmas: depth as a fraction of local Z (5%
+            // works on the cornell-style fixtures the issue describes),
+            // normal as an exponent on the cosine of normal-difference
+            // (16 = ~30 deg tolerance for "still considered co-planar").
+            // Not yet cvar-tunable; if shadow widths look off on real
+            // scenes we'll plumb r_shadow_sigma_depth / _normal as a
+            // follow-up.
+            sp.sigma_depth  = 0.05f;
+            sp.sigma_normal = 16.0f;
+            sp.use_normal   = (normal_tex_id_ != 0) ? 1u : 0u;
+            sp._pad1        = 0u;
+            cb->PushConstants(&sp, sizeof(sp));
+            cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
+
+            // RAW: StarsComposite about to read+write the HDR we just
+            // wrote. Metal auto-barriers; emitted for documentation
+            // symmetry with the rest of the post-denoise chain.
+            cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                         pt::rhi::BarrierDesc::Stage::ComputeRead});
+        }
 
         // Stateless stars+sun+moon composite (issue #46). Dispatched
         // BEFORE the bloom pyramid so the bloom downsample picks up the
@@ -5064,6 +6864,265 @@ void Engine::RenderFrame() {
             cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
                          pt::rhi::BarrierDesc::Stage::ComputeRead});
         }
+
+        // Aurora borealis procedural overlay (issue #116). Dispatched
+        // AFTER StarsComposite so aurora ribbons layer over the
+        // celestial layer in HDR space, and BEFORE the bloom pyramid
+        // so bright aurora highlights get bloom halos and ACES
+        // tonemap squashes them with the rest of the image. The
+        // shader is stateless, reads + writes tonemap_hdr_source_id
+        // in place (additive), and only needs hdr_inout + depth_tex.
+        //
+        // Dispatch gate: aurora_composite_pipeline_id_ is Metal-only
+        // (Vulkan stays at 0), depth_tex_id_ must exist (allocated
+        // whenever denoiser_active_, which use_engine_tonemap implies
+        // on Metal). The cvar gate r_aurora is encoded as
+        // aurora_active below; when off we elide the dispatch entirely
+        // so r_aurora 0 is a true no-op.
+        bool aurora_active = false;
+        {
+            int aurora_on = 0;
+            if (auto* v = C.FindCVar("r_aurora")) aurora_on = v->GetInt();
+            int sky_mode_int = 2;
+            if (auto* v = C.FindCVar("r_sky_mode")) {
+                const std::string& m = v->value;
+                sky_mode_int = (m == "procedural") ? 2
+                             : (m == "hdri")       ? 1
+                                                   : 0;
+            }
+            aurora_active =
+                aurora_on != 0 &&
+                (sky_mode_int == 2) &&
+                aurora_composite_pipeline_id_ != 0 &&
+                depth_tex_id_ != 0;
+        }
+        if (aurora_active) {
+            cb->BindComputePipeline(pt::rhi::PipelineHandle{aurora_composite_pipeline_id_});
+            cb->BindStorageTexture(0, pt::rhi::TextureHandle{tonemap_hdr_source_id});
+            // depth_tex at engine slot 1 -> Metal MSL texture(1) by
+            // declaration order. PathTrace's G-buffer pass writes
+            // 1e10 for sky pixels; the shader's 5x5 min-dilation
+            // gate at 1e9 lets us avoid painting aurora over geometry.
+            cb->BindStorageTexture(1, pt::rhi::TextureHandle{depth_tex_id_});
+            // No buffer bindings: AuroraComposite is purely
+            // texture-driven. BindComputePipeline cleared any prior
+            // PathTrace bindings, so max_bound_buf_slot = -1 and Slang's
+            // MSL emission places Push at buf(0). Engine's
+            // push_slot = max+1 = 0. Match.
+
+            struct AuroraCompositePush {
+                float        pos_fovtan[4];
+                float        fwd_aspect[4];
+                float        right_xyz[4];
+                float        up_xyz[4];
+                float        sun_and_mode[4];
+                float        aurora_params[4];
+                std::uint32_t frame_index;
+                std::uint32_t composite_active;
+                std::uint32_t _pad0;
+                std::uint32_t _pad1;
+            } ap{};
+            static_assert(sizeof(AuroraCompositePush) == 112,
+                          "AuroraCompositePush layout must match AuroraComposite.slang");
+            std::memcpy(ap.pos_fovtan,   push.pos_fovtan,   sizeof(ap.pos_fovtan));
+            std::memcpy(ap.fwd_aspect,   push.fwd_aspect,   sizeof(ap.fwd_aspect));
+            std::memcpy(ap.right_xyz,    push.right_xyz,    sizeof(ap.right_xyz));
+            std::memcpy(ap.up_xyz,       push.up_xyz,       sizeof(ap.up_xyz));
+            std::memcpy(ap.sun_and_mode, push.sun_and_mode, sizeof(ap.sun_and_mode));
+
+            // Pack aurora cvars. lat is in degrees user-side, radians
+            // shader-side (cheaper than letting the shader pay for the
+            // conversion every pixel). animate is the flag; time is in
+            // seconds since startup, sourced from frame_index/60.
+            float intensity = 1.0f;
+            if (auto* v = C.FindCVar("r_aurora_intensity")) {
+                intensity = v->GetFloat();
+            }
+            if (intensity < 0.0f) intensity = 0.0f;
+            if (intensity > 2.0f) intensity = 2.0f;
+            float lat_deg = 70.0f;
+            if (auto* v = C.FindCVar("r_aurora_lat")) {
+                lat_deg = v->GetFloat();
+            }
+            float lat_rad = lat_deg * 0.0174532925f;
+            int animate_on = 1;
+            if (auto* v = C.FindCVar("r_aurora_animate")) {
+                animate_on = v->GetInt();
+            }
+            float time_sec = static_cast<float>(push.frame_index) * (1.0f / 60.0f);
+            ap.aurora_params[0] = intensity;
+            ap.aurora_params[1] = lat_rad;
+            ap.aurora_params[2] = animate_on != 0 ? 1.0f : 0.0f;
+            ap.aurora_params[3] = time_sec;
+            ap.frame_index      = push.frame_index;
+            ap.composite_active = 1u;
+            ap._pad0 = 0u;
+            ap._pad1 = 0u;
+            cb->PushConstants(&ap, sizeof(ap));
+            cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
+
+            // RAW: bloom_down about to read the HDR we just wrote.
+            // Metal auto-barriers; emitted for documentation symmetry.
+            cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                         pt::rhi::BarrierDesc::Stage::ComputeRead});
+        }
+        //
+        // Runs in the same use_engine_tonemap branch as StarsComposite,
+        // AFTER stars (so particles overlay celestials too) and BEFORE
+        // the bloom pyramid (so HDR particle highlights downsample into
+        // halos). Reads + writes the SAME tonemap_hdr_source_id in
+        // place; the kernel does additive splats per particle.
+        //
+        // Gates:
+        //   * r_particles == 1 (master toggle, default 0)
+        //   * particle_composite_pipeline_id_ resolved (Metal only today)
+        //   * particles_ live and > 0 active particles
+        //   * depth_tex_id_ allocated (we need the depth gate); this
+        //     implicitly requires denoiser_active_ because the engine
+        //     only allocates depth_tex when a denoiser path is on.
+        //     The bloom-without-denoiser branch has depth_tex_id_ = 0
+        //     so the composite naturally short-circuits. Acceptable
+        //     for the MVP -- particles + bloom-without-denoiser is a
+        //     follow-up.
+        //
+        // The per-frame upload happens here too: rebuild a 3*float4
+        // packed GPU layout from particles_->Particles(), grow the
+        // storage buffer if needed, WriteBuffer the live region.
+        bool r_particles_on = false;
+        if (auto* v = C.FindCVar("r_particles")) r_particles_on = v->GetBool();
+        const bool particle_gate =
+            r_particles_on &&
+            particle_composite_pipeline_id_ != 0 &&
+            particles_ &&
+            particles_->LiveCount() > 0 &&
+            depth_tex_id_ != 0;
+        if (particle_gate) {
+            const auto& live = particles_->Particles();
+            const std::uint32_t pcount =
+                static_cast<std::uint32_t>(live.size());
+            // One-shot info log per process: confirms the composite is
+            // being dispatched against a non-zero particle count.
+            // Without it the symptom of "wrong gate" looks identical to
+            // "no particles painted" -- one log line saves a half-hour
+            // of debug, and the one-shot pattern (static bool) matches
+            // the project's other lazy-init/first-frame log idioms.
+            static bool s_logged_once = false;
+            if (!s_logged_once) {
+                s_logged_once = true;
+                LOG_INFO("particles: first composite dispatch, {} particle(s) live", pcount);
+            }
+            // GPU-side packed representation. Three float4 per particle,
+            // 48 bytes -- matches the ParticleComposite.slang layout in
+            // the kernel's load block.
+            struct GpuParticle {
+                float pos_size[4];     // .xyz = world pos (m), .w = size (m)
+                float color_alpha[4];  // .xyz = HDR rgb, .w = alpha [0..1]
+                float pad_zeye[4];     // .w = precomputed camera-space z
+            };
+            static_assert(sizeof(GpuParticle) == 48,
+                          "GpuParticle must be 48 bytes to match ParticleComposite.slang");
+
+            // (Re)allocate / grow the storage buffer if needed. Pow-2
+            // growth keeps the reallocs amortised; the floor of 64
+            // matches the threadgroup width so a single threadgroup
+            // launch can always run cleanly.
+            std::uint32_t need = pcount;
+            if (need < 64u) need = 64u;
+            if (need > particles_storage_capacity_) {
+                std::uint32_t cap = (particles_storage_capacity_ > 0)
+                                        ? particles_storage_capacity_ : 64u;
+                while (cap < need) cap *= 2u;
+                if (particles_storage_id_ != 0) {
+                    device_->DestroyBuffer(pt::rhi::BufferHandle{particles_storage_id_});
+                    particles_storage_id_ = 0;
+                }
+                auto buf = device_->CreateBuffer({
+                    .size = sizeof(GpuParticle) * cap,
+                    .usage = pt::rhi::BufferUsage::Storage,
+                    .debug_name = "particles_storage",
+                });
+                particles_storage_id_       = buf.id;
+                particles_storage_capacity_ = cap;
+            }
+            if (particles_storage_id_ != 0) {
+                // Build the packed payload. We compute z_eye host-side
+                // (single dot per particle) so the shader doesn't
+                // re-derive it. At the MVP cap of 1024 this is ~3 us on
+                // M4 Max -- negligible.
+                std::vector<GpuParticle> packed(pcount);
+                const glm::vec3 cam_pos  = glm::vec3(push.pos_fovtan[0],
+                                                    push.pos_fovtan[1],
+                                                    push.pos_fovtan[2]);
+                const glm::vec3 cam_fwd  = glm::vec3(push.fwd_aspect[0],
+                                                    push.fwd_aspect[1],
+                                                    push.fwd_aspect[2]);
+                for (std::uint32_t i = 0; i < pcount; ++i) {
+                    const auto& p = live[i];
+                    packed[i].pos_size[0] = p.pos.x;
+                    packed[i].pos_size[1] = p.pos.y;
+                    packed[i].pos_size[2] = p.pos.z;
+                    packed[i].pos_size[3] = p.size;
+                    packed[i].color_alpha[0] = p.color.r;
+                    packed[i].color_alpha[1] = p.color.g;
+                    packed[i].color_alpha[2] = p.color.b;
+                    packed[i].color_alpha[3] = p.color.a;
+                    packed[i].pad_zeye[0] = 0.0f;
+                    packed[i].pad_zeye[1] = 0.0f;
+                    packed[i].pad_zeye[2] = 0.0f;
+                    // z_eye = dot(p.pos - cam_pos, cam_fwd). cam_fwd is
+                    // already unit length (Camera::Forward()).
+                    packed[i].pad_zeye[3] = glm::dot(p.pos - cam_pos, cam_fwd);
+                }
+                device_->WriteBuffer(pt::rhi::BufferHandle{particles_storage_id_},
+                                     packed.data(),
+                                     sizeof(GpuParticle) * pcount, 0);
+
+                cb->BindComputePipeline(pt::rhi::PipelineHandle{particle_composite_pipeline_id_});
+                cb->BindStorageTexture(0, pt::rhi::TextureHandle{tonemap_hdr_source_id});
+                cb->BindStorageTexture(1, pt::rhi::TextureHandle{depth_tex_id_});
+                cb->BindBuffer(0, pt::rhi::BufferHandle{particles_storage_id_});
+
+                struct ParticleCompositePush {
+                    float pos_fovtan[4];
+                    float fwd_aspect[4];
+                    float right_xyz[4];
+                    float up_xyz[4];
+                    std::uint32_t width;
+                    std::uint32_t height;
+                    std::uint32_t particle_count;
+                    std::uint32_t composite_active;
+                    std::uint32_t threads_x;
+                    std::uint32_t _pad0;
+                    std::uint32_t _pad1;
+                    std::uint32_t _pad2;
+                } pp{};
+                static_assert(sizeof(ParticleCompositePush) == 96,
+                              "ParticleCompositePush layout must match ParticleComposite.slang");
+                std::memcpy(pp.pos_fovtan, push.pos_fovtan, sizeof(pp.pos_fovtan));
+                std::memcpy(pp.fwd_aspect, push.fwd_aspect, sizeof(pp.fwd_aspect));
+                std::memcpy(pp.right_xyz,  push.right_xyz,  sizeof(pp.right_xyz));
+                std::memcpy(pp.up_xyz,     push.up_xyz,     sizeof(pp.up_xyz));
+                pp.width            = fc.width;
+                pp.height           = fc.height;
+                pp.particle_count   = pcount;
+                pp.composite_active = 1u;
+                // Threadgroups along X; we keep Y = 1 (so Y has exactly
+                // 8 threads). Each threadgroup = 64 threads = 64
+                // particles. groups_x = ceil(pcount / 64).
+                std::uint32_t groups_x = (pcount + 63u) / 64u;
+                if (groups_x == 0u) groups_x = 1u;
+                pp.threads_x = groups_x * 8u;
+                cb->PushConstants(&pp, sizeof(pp));
+                cb->Dispatch(groups_x, 1, 1);
+
+                // RAW: bloom_down about to read the HDR we just wrote
+                // (additively). Metal auto-barriers; emitted for
+                // documentation symmetry with StarsComposite above.
+                cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                             pt::rhi::BarrierDesc::Stage::ComputeRead});
+            }
+        }
+        // ----- end Particle composite -----------------------------------
 
         if (bloom_can_run) {
             dispatch_bloom_pyramid(tonemap_hdr_source_id);
@@ -5469,8 +7528,14 @@ void Engine::RenderFrame() {
         }
     }
 
-    device_->Submit(cb);
-    device_->EndFrame(cb);
+    {
+        PT_ZONE_SCOPED_N("Device::Submit");
+        device_->Submit(cb);
+    }
+    {
+        PT_ZONE_SCOPED_N("Device::EndFrame (present)");
+        device_->EndFrame(cb);
+    }
 
     // Post-present frame-capture hook. Driven by r_capture_frame_at /
     // r_capture_seq / r_capture_seed -- the cvars' on_change handlers
@@ -5590,7 +7655,37 @@ void Engine::UpdateCamera(double dt) {
     if (auto* v = C.FindCVar("cam_sprint_mult")) sprint = v->GetFloat();
 
     bool shift = window_->IsKeyDown(340) || window_->IsKeyDown(344);  // L/R Shift
-    if (shift) speed *= sprint;
+
+    // Gamepad input (#83). Polled before the sprint multiplier is
+    // applied so the trigger contribution can blend into `sprint_mult`
+    // alongside the shift-key bool. Read deadzone + look sensitivity
+    // from cvars every frame; both are CVAR_ARCHIVE so live edits via
+    // the console propagate immediately.
+    bool   pad_enabled = true;
+    float  pad_dz      = 0.15f;
+    float  pad_look_s  = 2.0f;
+    if (auto* v = C.FindCVar("cam_gamepad"))                  pad_enabled = v->GetBool();
+    if (auto* v = C.FindCVar("cam_gamepad_deadzone"))         pad_dz      = v->GetFloat();
+    if (auto* v = C.FindCVar("cam_gamepad_look_sensitivity")) pad_look_s  = v->GetFloat();
+
+    pt::app::GamepadState pad;
+    if (pad_enabled) {
+        pad = pt::app::PollGamepad(pad_dz);
+        pt::app::LogConnectionTransitions(pad);
+    }
+
+    // Triggers extend the shift-key sprint. We pick the larger of the
+    // two trigger values so either L2 or R2 alone works (different
+    // games prefer different mappings). The result blends linearly
+    // between `speed` (no trigger) and `speed * sprint` (full trigger);
+    // additive with shift so holding both gives the same sprint cap.
+    float trig_max = std::max(pad.left_trigger, pad.right_trigger);
+    bool  sprint_on = shift || trig_max > 0.0f;
+    if (sprint_on) {
+        // Blend factor: shift counts as full trigger.
+        float blend = shift ? 1.0f : trig_max;
+        speed *= 1.0f + (sprint - 1.0f) * blend;
+    }
 
     glm::vec3 fwd   = camera_->Forward();
     glm::vec3 right = camera_->Right();
@@ -5605,6 +7700,30 @@ void Engine::UpdateCamera(double dt) {
         camera_->pos += glm::normalize(wm) * (speed * static_cast<float>(dt));
     }
 
+    // Gamepad translation: left stick maps to (strafe, forward). We
+    // scale by stick magnitude (already in [0, 1] post-deadzone) so
+    // partial deflection slows the camera proportionally -- matches
+    // analog stick UX. Sprint multiplier above already factored into
+    // `speed`. Decoupled from the keyboard path so the two can be
+    // used simultaneously (e.g. WASD + look with the right stick).
+    if (pad.connected && (pad.left_x != 0.0f || pad.left_y != 0.0f)) {
+        glm::vec3 pad_move = right * pad.left_x + fwd * pad.left_y;
+        // Don't re-normalise -- stick magnitude IS the intent.
+        camera_->pos += pad_move * (speed * static_cast<float>(dt));
+    }
+
+    // Gamepad look: right stick maps to (yaw, pitch). Sign convention
+    // matches the mouse-look path -- +X yaws right (clockwise from
+    // above), +Y pitches up. Scaled by sensitivity (radians/sec at
+    // full deflection) and dt. Runs whether or not RMB is held so the
+    // pad can drive the camera without engaging mouse-look mode.
+    if (pad.connected && (pad.right_x != 0.0f || pad.right_y != 0.0f)) {
+        float rate    = pad_look_s * static_cast<float>(dt);
+        camera_->yaw   += pad.right_x * rate;
+        camera_->pitch += pad.right_y * rate;
+        camera_->ClampPitch();
+    }
+
     // Pull live overrides from cvars if the user typed them.  The
     // simplest UX is "if cvar string differs from camera state, apply".
     // We push back the camera state to the cvars on every frame too so
@@ -5616,6 +7735,7 @@ void Engine::UpdateCamera(double dt) {
 }
 
 void Engine::Tick(double dt) {
+    PT_ZONE_SCOPED_N("Engine::Tick");
     pt::console::Console::Get().Drain();
 
     // Deferred swap screenshot: after Drain may have queued one in
@@ -5669,6 +7789,14 @@ void Engine::Tick(double dt) {
     }
 
     UpdateCamera(dt);
+
+    // Audio listener update: push the freshest camera pose into the
+    // audio subsystem so distance attenuation + stereo pan track the
+    // viewer correctly. No-op when audio_system_ is null or its
+    // device init failed -- the AudioSystem guards itself.
+    if (audio_system_ && camera_) {
+        audio_system_->Tick(camera_->pos, camera_->Forward());
+    }
 
     // Sky animation: advance r_sky_hour by `rate * dt` real-time
     // seconds. Wraps modulo 24. Marks accumulation dirty so the path
@@ -5736,6 +7864,27 @@ void Engine::Tick(double dt) {
             if (wx != 0.0f || wz != 0.0f) accum_dirty_ = true;
         }
     }
+
+    // Particle / VFX system tick (#82 MVP). CPU sim runs every frame
+    // regardless of r_particles so a user toggling the master flag back
+    // on doesn't see stale particles snap back into existence; instead
+    // particles age naturally even while the composite kernel is off.
+    if (particles_) {
+        auto& Cp = pt::console::Console::Get();
+        if (auto* mv = Cp.FindCVar("r_particles_max")) {
+            int m = mv->GetInt();
+            if (m < 0)     m = 0;
+            if (m > 65536) m = 65536;
+            particles_->SetMaxParticles(static_cast<std::uint32_t>(m));
+        }
+        particles_->Update(static_cast<float>(dt));
+    }
+
+    // Physics step (#132): runs after UpdateCamera and before RenderFrame
+    // so the per-frame writeback into `primitives_` lands before
+    // EnsurePrimitivesUploaded re-packs the analytic-prim buffer +
+    // refits the BVH. No-op when phys_enabled = 0 or no particles exist.
+    StepPhysics(static_cast<float>(dt));
 
     auto t0 = std::chrono::steady_clock::now();
     RenderFrame();
@@ -5955,6 +8104,12 @@ void Engine::Run() {
             // else: device_ bound but loading_frame_active_ -- silently
             // skip this iteration, don't count it, don't fail on it.
         }
+
+        // Tracy frame boundary. Marks one logical frame for the
+        // profiler's flame-graph view -- one tick of the main loop ==
+        // one frame, regardless of whether the device was bound or the
+        // loading-frame path painted. No-op when PT_ENABLE_TRACY is OFF.
+        PT_FRAME_MARK;
     }
     LOG_INFO("Run loop exited.");
 
@@ -6347,6 +8502,7 @@ void Engine::RegisterCommands() {
                     case AnalyticPrim::Lambert:    return "lambert";
                     case AnalyticPrim::Metal:      return "metal";
                     case AnalyticPrim::Dielectric: return "dielectric";
+                    case AnalyticPrim::Water:      return "water";
                 }
                 return "?";
             };
@@ -6427,6 +8583,7 @@ void Engine::RegisterCommands() {
                     auto mat = t["material"].value_or<std::string>("lambert");
                     if      (mat == "metal")      p.material = AnalyticPrim::Metal;
                     else if (mat == "dielectric") p.material = AnalyticPrim::Dielectric;
+                    else if (mat == "water")      p.material = AnalyticPrim::Water;
                     else                          p.material = AnalyticPrim::Lambert;
                     if (auto c = t["color"].as_array(); c && c->size() == 3) {
                         p.albedo[0] = float((*c)[0].value_or(1.0));
@@ -7451,6 +9608,8 @@ void Engine::RegisterCommands() {
     for (const char* n : {"r_clouds_coverage",  "r_clouds_base_height",
                           "r_clouds_top_height","r_clouds_density",
                           "r_clouds_freq",      "r_clouds_detail",
+                          "r_clouds_curl_amount", "r_clouds_curl_scale",
+                          "r_clouds_erosion",
                           "r_clouds_wind_x",    "r_clouds_wind_z",
                           "r_clouds_seed"}) {
         if (auto* v = C.FindCVar(n)) {
@@ -7625,6 +9784,13 @@ void Engine::RegisterCommands() {
     // must invalidate accum_hdr so we don't blend pre- and post-toggle
     // samples together (same precedent as r_env_intensity above).
     if (auto* v = C.FindCVar("r_mis")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    // r_light_tree (#129) flips between tree-traversal and uniform-pick.
+    // Same accumulator-reset reasoning as r_mis above -- pre- and
+    // post-toggle samples come from different estimators and shouldn't
+    // be averaged together.
+    if (auto* v = C.FindCVar("r_light_tree")) {
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
     // r_analytic_bvh_threshold changes the linear/BVH split decision;
@@ -7929,6 +10095,17 @@ void Engine::RegisterCommands() {
     set_slider("r_clouds_density",          0.0f,    0.5f,   0.005f);
     set_slider("r_clouds_freq",          0.0005f,   0.02f,  0.0005f);
     set_slider("r_clouds_detail",           0.0f,    1.0f,   0.01f);
+    // Issue #117: curl-noise + secondary edge-erosion sliders.
+    // curl_amount is the magnitude scalar on the curl displacement;
+    // curl output is roughly O(5-10) per component (value-noise central
+    // diff at h=0.1), so amount=0.3 -> ~2m sub-feature shear, amount=1.0
+    // -> ~6-10m heavy-cumulus wisps. Spec keeps [0..1] for the UI but
+    // the shader stays linear so amount>1 still works for storm shots.
+    // curl_scale is cycles/metre (0.001..0.05 spans large shear
+    // streamers to fine close-up wisps).
+    set_slider("r_clouds_curl_amount",      0.0f,    2.0f,  0.01f);
+    set_slider("r_clouds_curl_scale",     0.001f,   0.05f,  0.001f);
+    set_slider("r_clouds_erosion",          0.0f,    1.0f,   0.01f);
     set_slider("r_clouds_wind_x",         -25.0f,   25.0f,   0.5f);
     set_slider("r_clouds_wind_z",         -25.0f,   25.0f,   0.5f);
     set_slider("r_clouds_seed",             0.0f,  100.0f,   1.0f);
@@ -7946,6 +10123,171 @@ void Engine::RegisterCommands() {
     // --- SDF Phase 1 (#97) -----------------------------------------------------
     RegisterSdfCommands();
     // --- end SDF Phase 1 -------------------------------------------------------
+
+    // --- Audio MVP (#80) -------------------------------------------------------
+    // `audio_play <path>`  -- load + play a sound at the current camera
+    //                         position (3D-attenuated stereo pan).
+    // `audio_stop`         -- stop every currently-playing voice.
+    // No reverb / no ray-traced occlusion / no HRTF -- those are Phase B
+    // follow-ups against the renderer's TLAS.
+    C.RegisterCommand("audio_play",
+        "Play a sound file (WAV) at the camera position with 1/r distance "
+        "attenuation and equal-power stereo pan. Usage: audio_play <path>",
+        [this](auto args, pt::console::Output& out) {
+            if (args.empty()) {
+                out.PrintLine("audio_play: missing path argument");
+                return;
+            }
+            if (!audio_system_ || !audio_system_->IsRunning()) {
+                out.PrintLine("audio_play: audio subsystem not running");
+                return;
+            }
+            if (!camera_) {
+                out.PrintLine("audio_play: no camera");
+                return;
+            }
+            const std::string path(args[0]);
+            auto sound = audio_system_->LoadSound(path);
+            if (sound == pt::audio::kInvalidSound) {
+                out.FormatLine("audio_play: failed to load '{}'", path);
+                return;
+            }
+            auto voice = audio_system_->PlaySound(sound, camera_->pos, 1.0f);
+            if (voice == pt::audio::kInvalidVoice) {
+                out.PrintLine("audio_play: voice pool full or play failed");
+                return;
+            }
+            out.FormatLine("audio_play: '{}' voice={}", path, voice);
+        });
+
+    C.RegisterCommand("audio_stop", "Stop every currently-playing audio voice.",
+        [this](auto, pt::console::Output& out) {
+            if (!audio_system_) {
+                out.PrintLine("audio_stop: audio subsystem not initialized");
+                return;
+            }
+            auto n = audio_system_->StopAll();
+            out.FormatLine("audio_stop: stopped {} voice(s)", n);
+        });
+    // --- end Audio MVP ---------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Particle / VFX (#82 MVP) console commands.
+    //
+    // Subcommands:
+    //   particle_emit smoke <x> <y> <z>   - one-shot smoke puff at position
+    //   particle_emit spark <x> <y> <z>   - one-shot spark burst at position
+    //   particle_emit snow   [x] [y] [z]  - start continuous snow emitter
+    //                                       centred at the given position
+    //                                       (defaults to camera-relative
+    //                                       origin if omitted)
+    //   particle_emit snow_stop           - stop the snow emitter
+    //   particle_clear                    - kill all live particles +
+    //                                       continuous emitters
+    //   particle_count                    - report live particle count
+    //
+    // Parsing notes:
+    //   * Floats use std::strtof (deferred since console args are
+    //     std::string_view) -- copy into a small char buffer first.
+    //     The console splits on whitespace and semicolons before we
+    //     see args, so each arg is a single token.
+    //   * The first arg is the SUBCOMMAND name (smoke / spark / snow /
+    //     snow_stop). The remaining 0..3 args are the optional position.
+    //   * The default x/y/z when omitted is (0, 1.5, 0) -- 1.5 m above
+    //     world origin, the same height as the engineering camera
+    //     default. This matches "spawn at the centre of the canonical
+    //     scene" intent.
+    // -----------------------------------------------------------------------
+    auto parse_float = [](std::string_view s, float& out) -> bool {
+        // strtof needs a NUL-terminated string. std::string copy is
+        // 1 small alloc; cheap relative to console-command latency.
+        std::string tmp(s);
+        char* end = nullptr;
+        float v = std::strtof(tmp.c_str(), &end);
+        if (!end || end == tmp.c_str()) return false;
+        out = v;
+        return true;
+    };
+
+    C.RegisterCommand("particle_emit",
+        "particle_emit <smoke|spark|snow|snow_stop> [x y z]. "
+        "Spawn a preset particle burst (smoke / spark) or start/stop "
+        "the continuous snow emitter at the given world position "
+        "(default 0 1.5 0). Particles are screen-space billboards in "
+        "the MVP -- NOT visible in path-traced reflections.",
+        [this, parse_float](auto args, pt::console::Output& out) {
+            if (!particles_) { out.PrintLine("particle_emit: particle system not initialised"); return; }
+            if (args.empty()) {
+                out.PrintLine("usage: particle_emit <smoke|spark|snow|snow_stop> [x y z]");
+                return;
+            }
+            const std::string sub(args[0]);
+            glm::vec3 at{0.0f, 1.5f, 0.0f};
+            // Optional position. Accept "smoke 1 2 3" and "smoke" both;
+            // partial positions ("smoke 1") error out so the user
+            // doesn't accidentally spawn at a partial location.
+            if (args.size() >= 4) {
+                float x, y, z;
+                if (!parse_float(args[1], x) ||
+                    !parse_float(args[2], y) ||
+                    !parse_float(args[3], z)) {
+                    out.PrintLine("particle_emit: x y z must be numeric");
+                    return;
+                }
+                at = glm::vec3(x, y, z);
+            } else if (args.size() == 2 || args.size() == 3) {
+                out.PrintLine("particle_emit: provide either 0 args (default position) or 3 (x y z)");
+                return;
+            }
+
+            if (sub == "smoke") {
+                auto spec = pt::effects::ParticleSystem::PresetSmoke(at);
+                auto n = particles_->EmitBurst(spec);
+                out.FormatLine("particle_emit smoke: spawned {} particle(s) at ({:.2f}, {:.2f}, {:.2f})",
+                               n, at.x, at.y, at.z);
+            } else if (sub == "spark") {
+                auto spec = pt::effects::ParticleSystem::PresetSpark(at);
+                auto n = particles_->EmitBurst(spec);
+                out.FormatLine("particle_emit spark: spawned {} particle(s) at ({:.2f}, {:.2f}, {:.2f})",
+                               n, at.x, at.y, at.z);
+            } else if (sub == "snow") {
+                // Rate: 50 particles/sec is a comfortable indoor
+                // flurry; the cap throttles it naturally on the way up.
+                auto spec = pt::effects::ParticleSystem::PresetSnow(at);
+                particles_->StartContinuous("snow", spec, 50.0f);
+                out.FormatLine("particle_emit snow: continuous emitter started, centre ({:.2f}, {:.2f}, {:.2f})",
+                               at.x, at.y, at.z);
+            } else if (sub == "snow_stop") {
+                auto n = particles_->StopContinuous("snow");
+                out.FormatLine("particle_emit snow_stop: stopped {} continuous emitter(s)", n);
+            } else {
+                out.FormatLine("particle_emit: unknown preset '{}' (expected smoke|spark|snow|snow_stop)", sub);
+            }
+        });
+
+    C.RegisterCommand("particle_clear",
+        "Kill every live particle + stop all continuous emitters.",
+        [this](auto, pt::console::Output& out) {
+            if (!particles_) { out.PrintLine("particle_clear: particle system not initialised"); return; }
+            particles_->Clear();
+            out.PrintLine("particle_clear: ok");
+        });
+
+    C.RegisterCommand("particle_count",
+        "Report the current live particle count.",
+        [this](auto, pt::console::Output& out) {
+            if (!particles_) { out.PrintLine("particle_count: particle system not initialised"); return; }
+            out.FormatLine("particles live: {} / cap {}",
+                           particles_->LiveCount(), particles_->MaxParticles());
+        });
+    // --- Physics Phase 1 (#132) ------------------------------------------------
+    RegisterPhysicsCommands();
+    // --- end Physics Phase 1 ---------------------------------------------------
+    // --- Light primitives (#73) ------------------------------------------------
+    RegisterLightCommands();
+    // --- end Light primitives --------------------------------------------------
+    // --- Voxel destruction Phase 1 (#140) --------------------------------------
+    RegisterVoxelCommands();
+    // --- end Voxel destruction Phase 1 -----------------------------------------
 }
 
 namespace {
@@ -7966,6 +10308,20 @@ bool ParseFloat(std::string_view s, float& out) {
     std::string buf(s);
     float v = std::strtof(buf.c_str(), &end);
     if (end == buf.c_str()) return false;
+    out = v;
+    return true;
+}
+
+// Signed integer parser. Used by SDF Phase 2 (#98) `sdf_repeat_limited`
+// for the half-extent triple -- semantically a non-negative cell count
+// but accepting a signed type lets the host reject negative inputs at
+// the parser layer with a clear error rather than silently underflowing
+// the uint cast.
+bool ParseInt(std::string_view s, int& out) {
+    if (s.empty()) return false;
+    int v = 0;
+    auto r = std::from_chars(s.data(), s.data() + s.size(), v);
+    if (r.ec != std::errc{} || r.ptr != s.data() + s.size()) return false;
     out = v;
     return true;
 }
@@ -8094,6 +10450,93 @@ void Engine::RegisterCsgCommands() {
             }
             out.FormatLine("csg: root set to {}", id);
         });
+
+    // glTF 2.0 importer (#79, MVP). Loads a single static mesh from
+    // disk and swaps it into the mesh-path resources (vbuf/ibuf + BVH +
+    // optional BLAS/TLAS) -- the exact same upload path the CSG bake
+    // produces, so the renderer sees no difference between a procedural
+    // CSG mesh and an imported .gltf/.glb. The CSG console commands
+    // (csg_*) continue to work; running `csg_box` etc after a glTF load
+    // will dirty the CSG scene and the next bake overwrites the glTF
+    // mesh on the next frame (intentional -- "last writer wins").
+    // Backend switches (RequestBackendSwitch) force a CSG re-bake which
+    // will also wipe the glTF mesh; re-run `mesh_load_gltf` after the
+    // swap if needed.
+    //
+    // MVP scope: single mesh, single primitive, base-color factor +
+    // optional base-color texture. Texture pixels are decoded and held
+    // on the GltfMesh result for the textured-materials work (#74) to
+    // pick up; the path tracer's shading uniform isn't plumbed for
+    // per-mesh textures yet, so the texture is recorded but not yet
+    // rendered (the mesh ships with whatever default color the shader
+    // applies to CSG meshes).
+    C.RegisterCommand("mesh_load_gltf",
+        "mesh_load_gltf <path>: import a static .gltf/.glb mesh (MVP -- "
+        "no animation/skins/scene-graph; replaces the current mesh).",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 1) {
+                out.PrintLine("usage: mesh_load_gltf <path>");
+                return;
+            }
+            if (!device_) {
+                out.PrintLine("mesh_load_gltf: device not ready");
+                return;
+            }
+
+            std::string err;
+            auto loaded = pt::renderer::LoadGltf(std::string(args[0]), &err);
+            if (!loaded) {
+                out.FormatLine("mesh_load_gltf: {}", err);
+                return;
+            }
+
+            // Drain any in-flight CSG bake worker so we don't race the
+            // resource swap below. EnsureMeshUpdated's main-thread
+            // consume path runs on a different tick than the console
+            // command lane, so if the worker is mid-execution
+            // (bake_phase_ == 1) we have to wait it out before
+            // RebuildMeshResources reallocates the shared
+            // box_vbuf_id_ / box_ibuf_id_ / tri_bvh_* slots.
+            if (bake_phase_.load(std::memory_order_acquire) == 1 &&
+                jobs_ && bake_handle_.internal != nullptr) {
+                jobs_->Wait(bake_handle_);
+            }
+            bake_handle_ = {};
+            // Consume any pending bake result so the next
+            // EnsureMeshUpdated tick doesn't immediately overwrite our
+            // glTF mesh with the stale CSG bake we just superseded.
+            pending_baked_.reset();
+            bake_phase_.store(0, std::memory_order_release);
+            // Also acknowledge the CSG scene as clean so its initial
+            // post-seed Dirty()==true flag (set during Init()) doesn't
+            // re-trigger a bake on the next frame and wipe the glTF
+            // mesh. csg_box / csg_sphere / etc still re-dirty as
+            // intended, so the CSG path stays usable.
+            if (csg_scene_) csg_scene_->AcknowledgeClean();
+            force_mesh_rebuild_ = false;
+
+            // Convert GltfMesh -> BakedMesh (same triangle-soup layout)
+            // and hand it to the existing mesh-upload pipeline.
+            pt::csg::BakedMesh baked;
+            baked.positions = std::move(loaded->positions);
+            baked.normals   = std::move(loaded->normals);
+            baked.indices   = std::move(loaded->indices);
+            RebuildMeshResources(baked);
+            accum_dirty_ = true;
+
+            out.FormatLine("mesh_load_gltf: loaded '{}' ({} verts, {} tris, base color "
+                           "{:.3f} {:.3f} {:.3f} {:.3f}{})",
+                           loaded->source_path,
+                           baked.VertexCount(),
+                           baked.TriangleCount(),
+                           loaded->base_color_factor[0],
+                           loaded->base_color_factor[1],
+                           loaded->base_color_factor[2],
+                           loaded->base_color_factor[3],
+                           loaded->base_color_texture.Empty()
+                               ? ""
+                               : ", base color tex present (not yet rendered -- see #74)");
+        });
 }
 
 namespace {
@@ -8102,6 +10545,7 @@ bool ParseMaterial(std::string_view s, Engine::AnalyticPrim::Material& out) {
     if (s == "lambert")    { out = Engine::AnalyticPrim::Lambert;    return true; }
     if (s == "metal")      { out = Engine::AnalyticPrim::Metal;      return true; }
     if (s == "dielectric") { out = Engine::AnalyticPrim::Dielectric; return true; }
+    if (s == "water")      { out = Engine::AnalyticPrim::Water;      return true; }
     return false;
 }
 const char* MaterialName(Engine::AnalyticPrim::Material m) {
@@ -8109,6 +10553,7 @@ const char* MaterialName(Engine::AnalyticPrim::Material m) {
         case Engine::AnalyticPrim::Lambert:    return "lambert";
         case Engine::AnalyticPrim::Metal:      return "metal";
         case Engine::AnalyticPrim::Dielectric: return "dielectric";
+        case Engine::AnalyticPrim::Water:      return "water";
     }
     return "?";
 }
@@ -8175,7 +10620,7 @@ void Engine::RegisterPrimCommands() {
         });
 
     C.RegisterCommand("prim_sphere",
-        "prim_sphere <id> <x> <y> <z> <radius> <lambert|metal|dielectric> <r> <g> <b> [roughness] [ior]: add or replace a sphere.",
+        "prim_sphere <id> <x> <y> <z> <radius> <lambert|metal|dielectric|water> <r> <g> <b> [roughness] [ior]: add or replace a sphere.",
         [this](auto args, pt::console::Output& out) {
             if (args.size() < 9 || args.size() > 11) {
                 out.PrintLine("usage: prim_sphere <id> <x> <y> <z> <radius> <material> <r> <g> <b> [roughness=0] [ior=1.5]");
@@ -8193,7 +10638,7 @@ void Engine::RegisterPrimCommands() {
             }
             AnalyticPrim::Material mat;
             if (!ParseMaterial(args[5], mat)) {
-                out.FormatLine("prim_sphere: unknown material '{}' (want lambert|metal|dielectric)", args[5]);
+                out.FormatLine("prim_sphere: unknown material '{}' (want lambert|metal|dielectric|water)", args[5]);
                 return;
             }
             if (radius <= 0.0f) { out.PrintLine("prim_sphere: radius must be > 0"); return; }
@@ -8216,7 +10661,7 @@ void Engine::RegisterPrimCommands() {
         });
 
     C.RegisterCommand("prim_plane",
-        "prim_plane <id> <nx> <ny> <nz> <d> <lambert|metal|dielectric> <r> <g> <b>: add or replace an infinite plane (n . p + d = 0).",
+        "prim_plane <id> <nx> <ny> <nz> <d> <lambert|metal|dielectric|water> <r> <g> <b>: add or replace an infinite plane (n . p + d = 0).",
         [this](auto args, pt::console::Output& out) {
             if (args.size() != 9) {
                 out.PrintLine("usage: prim_plane <id> <nx> <ny> <nz> <d> <material> <r> <g> <b>");
@@ -8502,6 +10947,30 @@ void Engine::RegisterSdfCommands() {
         }
         const pt::renderer::SdfPrim& A = it_a->second;
         const pt::renderer::SdfPrim& B = it_b->second;
+        // --- SDF Phase 3 (#99) guard --------------------------------------
+        // Reject smooth-CSG combinations involving fractal leaves. The
+        // GPU dispatcher in PathTrace.slang only handles SINGLE-LEAF
+        // fractal clusters in Phase 3 (the smooth-CSG ops in
+        // SdfPrimitives.slang assume exact-distance leaves and would
+        // see the fractal DE's approximate distance as a wildly-
+        // overshooting child, producing a corrupted blend). Lifting
+        // the restriction is a future-future thing.
+        auto cluster_has_fractal = [](const pt::renderer::SdfPrim& p) {
+            for (std::uint32_t i = 0; i < p.node_count; ++i) {
+                if (p.nodes[i].op == pt::renderer::SDF_OP_LEAF &&
+                    pt::renderer::IsSdfFractalShape(p.nodes[i].shape)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (cluster_has_fractal(A) || cluster_has_fractal(B)) {
+            out.FormatLine("sdf_{}: fractal SDF leaves cannot participate in "
+                           "smooth-CSG ops in Phase 3 (issue #99 scope-out)",
+                           tag);
+            return;
+        }
+        // --- end SDF Phase 3 ---
         if (A.node_count + B.node_count + 1 > pt::renderer::SdfPrim::kMaxNodes) {
             out.FormatLine("sdf_{}: combined node count {} exceeds kMaxNodes={}",
                            tag, A.node_count + B.node_count + 1,
@@ -8610,7 +11079,1220 @@ void Engine::RegisterSdfCommands() {
             }
             combine(id, a, b, k, pt::renderer::SDF_OP_SMOOTH_SUBTRACT, mat, cr, cg, cb, out, "sdiff");
         });
+
+    // --- SDF Phase 3 (#99) fractal leaves ----------------------------------
+    //
+    // Three iconic-fractal commands. Each adds a SINGLE-LEAF cluster
+    // whose `params[0]` is the per-shape scale knob (Mandelbulb's
+    // polar exponent, Mandelbox's linear-step scale, Apollonian's
+    // radial-shrink scale) and `params[1]` is the world-space effective
+    // bound radius (the host AABB is a cube of side 2*params[1]).
+    // Cluster shading goes through the same Lambert / Metal /
+    // Dielectric material pipeline as the analytic SDF leaves above
+    // -- the BSDF / NEE / denoiser don't care which side of the
+    // shader the hit came from.
+    //
+    // Per the issue spec, fractals can't be combined into smooth-CSG
+    // ops in Phase 3 (they're whole-cluster shapes; the `combine`
+    // helper above rejects them at the host level because the GPU
+    // dispatcher in PathTrace.slang only handles SINGLE-LEAF fractal
+    // clusters). The path-of-least-surprise here is also to make the
+    // host refuse: a future phase can lift the restriction once
+    // mixed-CSG cluster traversal is in.
+
+    C.RegisterCommand("sdf_mandelbulb",
+        "sdf_mandelbulb <id> <power> <bound> <x> <y> <z> <material> <r> <g> <b>: "
+        "add a Mandelbulb fractal SDF leaf. power=8 is canonical; bound is "
+        "the cluster AABB half-extent in metres (1.2 fits the textbook bulb).",
+        [add_leaf](auto args, pt::console::Output& out) {
+            if (args.size() != 10) {
+                out.PrintLine("usage: sdf_mandelbulb <id> <power> <bound> <x> <y> <z> <material> <r> <g> <b>");
+                return;
+            }
+            std::uint32_t id, mat;
+            float power, bound, x, y, z, r, g, b;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], power) || !ParseFloat(args[2], bound) ||
+                !ParseFloat(args[3], x) || !ParseFloat(args[4], y) || !ParseFloat(args[5], z) ||
+                !ParseSdfMaterial(args[6], mat) ||
+                !ParseFloat(args[7], r) || !ParseFloat(args[8], g) || !ParseFloat(args[9], b)) {
+                out.PrintLine("sdf_mandelbulb: arg parse failed");
+                return;
+            }
+            // power=0 is the "use r_sdf_fractal_power cvar default"
+            // sentinel; below 0 is meaningless. Bound must be > 0
+            // because LeafLocalAabb refuses a non-positive bound (else
+            // the cube degenerates and the AABB slab test rejects
+            // every ray).
+            if (power < 0.0f) {
+                out.FormatLine("sdf_mandelbulb: power must be >= 0 (got {})", power);
+                return;
+            }
+            if (bound <= 0.0f) {
+                out.FormatLine("sdf_mandelbulb: bound must be > 0 (got {})", bound);
+                return;
+            }
+            add_leaf(id, pt::renderer::SDF_SHAPE_MANDELBULB,
+                     {power, bound, 0.0f, 0.0f}, x, y, z, mat, r, g, b, out, "mandelbulb");
+        });
+
+    C.RegisterCommand("sdf_mandelbox",
+        "sdf_mandelbox <id> <scale> <bound> <x> <y> <z> <material> <r> <g> <b>: "
+        "add a Mandelbox fractal SDF leaf. scale=2.5 is canonical; bound is "
+        "the cluster AABB half-extent (4.0 typically fits the limit set).",
+        [add_leaf](auto args, pt::console::Output& out) {
+            if (args.size() != 10) {
+                out.PrintLine("usage: sdf_mandelbox <id> <scale> <bound> <x> <y> <z> <material> <r> <g> <b>");
+                return;
+            }
+            std::uint32_t id, mat;
+            float scale, bound, x, y, z, r, g, b;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], scale) || !ParseFloat(args[2], bound) ||
+                !ParseFloat(args[3], x) || !ParseFloat(args[4], y) || !ParseFloat(args[5], z) ||
+                !ParseSdfMaterial(args[6], mat) ||
+                !ParseFloat(args[7], r) || !ParseFloat(args[8], g) || !ParseFloat(args[9], b)) {
+                out.PrintLine("sdf_mandelbox: arg parse failed");
+                return;
+            }
+            // scale=0 maps to the r_sdf_fractal_power cvar fallback;
+            // negative is meaningless (the linear-step magnitude has
+            // to be a positive contraction for the DE to terminate).
+            if (scale < 0.0f) {
+                out.FormatLine("sdf_mandelbox: scale must be >= 0 (got {})", scale);
+                return;
+            }
+            if (bound <= 0.0f) {
+                out.FormatLine("sdf_mandelbox: bound must be > 0 (got {})", bound);
+                return;
+            }
+            add_leaf(id, pt::renderer::SDF_SHAPE_MANDELBOX,
+                     {scale, bound, 0.0f, 0.0f}, x, y, z, mat, r, g, b, out, "mandelbox");
+        });
+
+    C.RegisterCommand("sdf_apollonian",
+        "sdf_apollonian <id> <scale> <bound> <x> <y> <z> <material> <r> <g> <b>: "
+        "add an Apollonian-gasket fractal SDF leaf. scale=1.3 is canonical; "
+        "bound is the cluster AABB half-extent (2.0 typically fits the limit set).",
+        [add_leaf](auto args, pt::console::Output& out) {
+            if (args.size() != 10) {
+                out.PrintLine("usage: sdf_apollonian <id> <scale> <bound> <x> <y> <z> <material> <r> <g> <b>");
+                return;
+            }
+            std::uint32_t id, mat;
+            float scale, bound, x, y, z, r, g, b;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], scale) || !ParseFloat(args[2], bound) ||
+                !ParseFloat(args[3], x) || !ParseFloat(args[4], y) || !ParseFloat(args[5], z) ||
+                !ParseSdfMaterial(args[6], mat) ||
+                !ParseFloat(args[7], r) || !ParseFloat(args[8], g) || !ParseFloat(args[9], b)) {
+                out.PrintLine("sdf_apollonian: arg parse failed");
+                return;
+            }
+            if (scale < 0.0f) {
+                out.FormatLine("sdf_apollonian: scale must be >= 0 (got {})", scale);
+                return;
+            }
+            if (bound <= 0.0f) {
+                out.FormatLine("sdf_apollonian: bound must be > 0 (got {})", bound);
+                return;
+            }
+            add_leaf(id, pt::renderer::SDF_SHAPE_APOLLONIAN,
+                     {scale, bound, 0.0f, 0.0f}, x, y, z, mat, r, g, b, out, "apollonian");
+        });
+    // --- end SDF Phase 3 ---------------------------------------------------
+    // ----- SDF Phase 2 (#98) procedural / warp / domain ops ----------------
+    //
+    // Single-child wrap commands: take ONE existing SDF cluster id and
+    // wrap it with a Phase 2 procedural op. The child is consumed (its
+    // nodes are inlined into the new cluster and its id is removed from
+    // the active set). Combined node count must not exceed
+    // SdfPrim::kMaxNodes; if it would, the command fails and the child
+    // is left in place.
+    auto wrap_proc = [this](std::uint32_t id,
+                            std::uint32_t a_id,
+                            pt::renderer::SdfOp op,
+                            std::array<float, 4> op_params,
+                            std::uint32_t material,
+                            float r, float g, float b,
+                            pt::console::Output& out,
+                            const char* tag) {
+        auto it_a = sdf_prims_.find(a_id);
+        if (it_a == sdf_prims_.end()) {
+            out.FormatLine("sdf_{}: child id {} not found", tag, a_id);
+            return;
+        }
+        const pt::renderer::SdfPrim& A = it_a->second;
+        if (A.node_count + 1 > pt::renderer::SdfPrim::kMaxNodes) {
+            out.FormatLine("sdf_{}: combined node count {} exceeds kMaxNodes={}",
+                           tag, A.node_count + 1,
+                           pt::renderer::SdfPrim::kMaxNodes);
+            return;
+        }
+        pt::renderer::SdfPrim out_p{};
+        for (std::uint32_t i = 0; i < A.node_count; ++i) out_p.nodes[i] = A.nodes[i];
+        std::uint32_t op_idx = A.node_count;
+        pt::renderer::SdfNode& opn = out_p.nodes[op_idx];
+        opn.op       = op;
+        opn.shape    = 0;
+        // child_a = root of A (last node of A's sub-tree).
+        opn.child_a  = A.node_count - 1u;
+        opn.child_b  = 0;
+        opn.params[0] = op_params[0];
+        opn.params[1] = op_params[1];
+        opn.params[2] = op_params[2];
+        opn.params[3] = op_params[3];
+        out_p.node_count = op_idx + 1;
+        out_p.material   = material;
+        out_p.albedo[0]  = r; out_p.albedo[1] = g; out_p.albedo[2] = b;
+        out_p.roughness  = 0.0f;
+        out_p.ior        = 1.5f;
+        if (!pt::renderer::ComputeSdfAabb(out_p)) {
+            out.FormatLine("sdf_{}: AABB computation failed", tag);
+            return;
+        }
+        sdf_prims_.erase(it_a);
+        sdf_prims_[id]   = out_p;
+        sdf_prims_dirty_ = true;
+        accum_dirty_     = true;
+        LOG_INFO("[sdf] {} id={} (child {}) aabb=[{:.2f},{:.2f},{:.2f} .. {:.2f},{:.2f},{:.2f}]",
+                 tag, id, a_id,
+                 out_p.aabb_min[0], out_p.aabb_min[1], out_p.aabb_min[2],
+                 out_p.aabb_max[0], out_p.aabb_max[1], out_p.aabb_max[2]);
+        out.FormatLine("sdf: {} id={} (child {})", tag, id, a_id);
+    };
+
+    C.RegisterCommand("sdf_displace_noise",
+        "sdf_displace_noise <id> <child_id> <amp_m> <freq_per_m> [octaves] <material> <r> <g> <b>: "
+        "wrap a cluster with an FBM-noise displacement band (amp metres, "
+        "freq 1/metres, octaves 1..6).",
+        [wrap_proc](auto args, pt::console::Output& out) {
+            // Allow octaves arg optional -- 8 args without, 9 with.
+            if (args.size() != 8 && args.size() != 9) {
+                out.PrintLine("usage: sdf_displace_noise <id> <child> <amp> <freq> [octaves] <material> <r> <g> <b>");
+                return;
+            }
+            std::uint32_t id, a, mat;
+            float amp, freq, cr, cg, cb;
+            int   octaves = 4;
+            if (auto* v = pt::console::Console::Get().FindCVar("r_sdf_displace_octaves"))
+                octaves = v->GetInt();
+            std::size_t base = 4;
+            if (!ParseUint(args[0], id) || !ParseUint(args[1], a) ||
+                !ParseFloat(args[2], amp) || !ParseFloat(args[3], freq)) {
+                out.PrintLine("sdf_displace_noise: arg parse failed (id/child/amp/freq)");
+                return;
+            }
+            if (args.size() == 9) {
+                if (!ParseInt(args[4], octaves)) {
+                    out.PrintLine("sdf_displace_noise: octaves parse failed");
+                    return;
+                }
+                base = 5;
+            }
+            if (!ParseSdfMaterial(args[base + 0], mat) ||
+                !ParseFloat(args[base + 1], cr) ||
+                !ParseFloat(args[base + 2], cg) ||
+                !ParseFloat(args[base + 3], cb)) {
+                out.PrintLine("sdf_displace_noise: arg parse failed (material / rgb)");
+                return;
+            }
+            if (amp <= 0.0f || freq <= 0.0f) {
+                out.FormatLine("sdf_displace_noise: amp and freq must be > 0 (got amp={} freq={})", amp, freq);
+                return;
+            }
+            if (octaves < 1)  octaves = 1;
+            if (octaves > 6)  octaves = 6;
+            // Pack the octaves int into the params[2] float lane via
+            // bit-cast (asuint on the shader side recovers it).
+            std::uint32_t oct_u = static_cast<std::uint32_t>(octaves);
+            float oct_f;
+            std::memcpy(&oct_f, &oct_u, sizeof(float));
+            wrap_proc(id, a, pt::renderer::SDF_OP_DISPLACE_NOISE,
+                      {amp, freq, oct_f, 0.0f}, mat, cr, cg, cb, out, "displace_noise");
+        });
+
+    C.RegisterCommand("sdf_twist",
+        "sdf_twist <id> <child_id> <rate_rad_per_m> <material> <r> <g> <b>: "
+        "twist a cluster around the Y axis at `rate` radians per metre of height.",
+        [wrap_proc](auto args, pt::console::Output& out) {
+            if (args.size() != 7) {
+                out.PrintLine("usage: sdf_twist <id> <child> <rate> <material> <r> <g> <b>");
+                return;
+            }
+            std::uint32_t id, a, mat;
+            float rate, cr, cg, cb;
+            if (!ParseUint(args[0], id) || !ParseUint(args[1], a) ||
+                !ParseFloat(args[2], rate) ||
+                !ParseSdfMaterial(args[3], mat) ||
+                !ParseFloat(args[4], cr) || !ParseFloat(args[5], cg) || !ParseFloat(args[6], cb)) {
+                out.PrintLine("sdf_twist: arg parse failed");
+                return;
+            }
+            wrap_proc(id, a, pt::renderer::SDF_OP_TWIST,
+                      {rate, 0.0f, 0.0f, 0.0f}, mat, cr, cg, cb, out, "twist");
+        });
+
+    C.RegisterCommand("sdf_bend",
+        "sdf_bend <id> <child_id> <rate_rad_per_m> <material> <r> <g> <b>: "
+        "bend a cluster along the X axis at `rate` radians per metre.",
+        [wrap_proc](auto args, pt::console::Output& out) {
+            if (args.size() != 7) {
+                out.PrintLine("usage: sdf_bend <id> <child> <rate> <material> <r> <g> <b>");
+                return;
+            }
+            std::uint32_t id, a, mat;
+            float rate, cr, cg, cb;
+            if (!ParseUint(args[0], id) || !ParseUint(args[1], a) ||
+                !ParseFloat(args[2], rate) ||
+                !ParseSdfMaterial(args[3], mat) ||
+                !ParseFloat(args[4], cr) || !ParseFloat(args[5], cg) || !ParseFloat(args[6], cb)) {
+                out.PrintLine("sdf_bend: arg parse failed");
+                return;
+            }
+            wrap_proc(id, a, pt::renderer::SDF_OP_BEND,
+                      {rate, 0.0f, 0.0f, 0.0f}, mat, cr, cg, cb, out, "bend");
+        });
+
+    C.RegisterCommand("sdf_repeat",
+        "sdf_repeat <id> <child_id> <px> <py> <pz> <material> <r> <g> <b>: "
+        "infinite domain repetition with per-axis period (metres; 0 = no repeat on that axis).",
+        [wrap_proc](auto args, pt::console::Output& out) {
+            if (args.size() != 9) {
+                out.PrintLine("usage: sdf_repeat <id> <child> <px> <py> <pz> <material> <r> <g> <b>");
+                return;
+            }
+            std::uint32_t id, a, mat;
+            float px, py, pz, cr, cg, cb;
+            if (!ParseUint(args[0], id) || !ParseUint(args[1], a) ||
+                !ParseFloat(args[2], px) || !ParseFloat(args[3], py) || !ParseFloat(args[4], pz) ||
+                !ParseSdfMaterial(args[5], mat) ||
+                !ParseFloat(args[6], cr) || !ParseFloat(args[7], cg) || !ParseFloat(args[8], cb)) {
+                out.PrintLine("sdf_repeat: arg parse failed");
+                return;
+            }
+            wrap_proc(id, a, pt::renderer::SDF_OP_REPEAT,
+                      {px, py, pz, 0.0f}, mat, cr, cg, cb, out, "repeat");
+        });
+
+    C.RegisterCommand("sdf_repeat_limited",
+        "sdf_repeat_limited <id> <child_id> <px> <py> <pz> <lx> <ly> <lz> <material> <r> <g> <b>: "
+        "bounded domain repetition. <lx ly lz> are integer half-extents (cell-count either side of origin, max 1023).",
+        [wrap_proc](auto args, pt::console::Output& out) {
+            if (args.size() != 12) {
+                out.PrintLine("usage: sdf_repeat_limited <id> <child> <px py pz> <lx ly lz> <material> <r g b>");
+                return;
+            }
+            std::uint32_t id, a, mat;
+            float px, py, pz, cr, cg, cb;
+            int   lx, ly, lz;
+            if (!ParseUint(args[0], id) || !ParseUint(args[1], a) ||
+                !ParseFloat(args[2], px) || !ParseFloat(args[3], py) || !ParseFloat(args[4], pz) ||
+                !ParseInt(args[5], lx) || !ParseInt(args[6], ly) || !ParseInt(args[7], lz) ||
+                !ParseSdfMaterial(args[8], mat) ||
+                !ParseFloat(args[9], cr) || !ParseFloat(args[10], cg) || !ParseFloat(args[11], cb)) {
+                out.PrintLine("sdf_repeat_limited: arg parse failed");
+                return;
+            }
+            if (lx < 0 || ly < 0 || lz < 0 || lx > 1023 || ly > 1023 || lz > 1023) {
+                out.FormatLine("sdf_repeat_limited: limit out of range 0..1023 (got {},{},{})", lx, ly, lz);
+                return;
+            }
+            // Pack the int3 half-extent into the params[3] float lane.
+            // 10 bits per axis -> 0..1023, total 30 bits. Top 2 bits
+            // stay zero so a future flag can move in without a wire-
+            // format break.
+            std::uint32_t packed = (std::uint32_t(lx) & 0x3ffu) |
+                                   ((std::uint32_t(ly) & 0x3ffu) << 10) |
+                                   ((std::uint32_t(lz) & 0x3ffu) << 20);
+            float packed_f;
+            std::memcpy(&packed_f, &packed, sizeof(float));
+            wrap_proc(id, a, pt::renderer::SDF_OP_REPEAT_LIMITED,
+                      {px, py, pz, packed_f}, mat, cr, cg, cb, out, "repeat_limited");
+        });
+    // ----- end SDF Phase 2 (#98) -------------------------------------------
 }
 // --- end SDF Phase 1 -------------------------------------------------------
+
+// --- Physics Phase 1 (#132) ------------------------------------------------
+//
+// Console commands and per-frame tick for the Verlet physics layer.
+// MVP scope is intentionally narrow (see issue #132): sphere-plane and
+// sphere-sphere only, gravity-only forcing, no friction / restitution /
+// stacking. Each spawned physics sphere is paired with an analytic
+// primitive (the renderer's existing sphere intersector); per-frame the
+// physics integrator's curr_pos is written back into the matching
+// AnalyticPrim before RenderFrame's EnsurePrimitivesUploaded re-uploads
+// the buffer + refits the BVH. That single writeback site is the only
+// place the physics layer touches renderer-owned state.
+//
+// `phys_drop <x> <y> <z> [radius]` is the testing entry point: spawns a
+// Lambert grey sphere at the world-space position and registers it with
+// PhysicsSystem so the next StepPhysics tick drops it under gravity.
+// IDs come from `physics_next_prim_id_` (starts at 100000 to keep clear
+// of human-typed `prim_sphere <id>` IDs which are typically single digits).
+//
+// `phys_clear` removes every physics-owned analytic primitive AND clears
+// the particle pool. User-authored prims (via `prim_sphere`) are
+// untouched.
+//
+// `phys_status` dumps the integrator's current state for sanity checks.
+
+void Engine::RegisterPhysicsCommands() {
+    auto& C = pt::console::Console::Get();
+
+    C.RegisterCommand("phys_drop",
+        "phys_drop <x> <y> <z> [radius]: spawn a physics-driven sphere at the "
+        "given world-space position (radius defaults to 0.3 m).",
+        [this](auto args, pt::console::Output& out) {
+            if (!physics_) { out.PrintLine("phys_drop: physics system not initialised"); return; }
+            if (args.size() < 3 || args.size() > 4) {
+                out.PrintLine("usage: phys_drop <x> <y> <z> [radius=0.3]");
+                return;
+            }
+            float x, y, z, radius = 0.3f;
+            if (!ParseFloat(args[0], x) || !ParseFloat(args[1], y) || !ParseFloat(args[2], z)) {
+                out.PrintLine("phys_drop: arg parse failed");
+                return;
+            }
+            if (args.size() == 4 && !ParseFloat(args[3], radius)) {
+                out.PrintLine("phys_drop: bad radius");
+                return;
+            }
+            if (radius <= 0.0f) {
+                out.PrintLine("phys_drop: radius must be > 0");
+                return;
+            }
+            const auto h = physics_->AddParticle(glm::vec3{x, y, z}, radius, 1.0f);
+            if (h == pt::physics::PhysicsSystem::kInvalidHandle) {
+                out.FormatLine("phys_drop: particle pool full ({} max)",
+                               pt::physics::PhysicsSystem::kMaxParticles);
+                return;
+            }
+            // Pair with a fresh analytic-prim slot. Pick a visually-
+            // distinct neutral colour so the spawned sphere reads as
+            // "physics object" without colliding with the user's own
+            // prim_sphere palette.
+            const std::uint32_t prim_id = physics_next_prim_id_++;
+            AnalyticPrim p{};
+            p.type        = AnalyticPrim::Sphere;
+            p.material    = AnalyticPrim::Lambert;
+            p.pos_or_n[0] = x; p.pos_or_n[1] = y; p.pos_or_n[2] = z;
+            p.radius_or_d = radius;
+            p.albedo[0]   = 0.80f; p.albedo[1] = 0.80f; p.albedo[2] = 0.85f;
+            p.roughness   = 0.5f;
+            p.ior         = 1.0f;
+            primitives_[prim_id] = p;
+            physics_->SetPrimId(h, prim_id);
+            primitives_dirty_ = true;
+            accum_dirty_      = true;
+            out.FormatLine("phys_drop: spawned particle handle=0x{:x} prim_id={} @ ({:.2f} {:.2f} {:.2f}) r={:.3f}",
+                           h, prim_id, x, y, z, radius);
+        });
+
+    // Spawn a rigid-body sphere (Phase 2a, #138). Unlike `phys_drop`
+    // which spawns a Phase-1 point-mass Particle, this goes into the
+    // rigid-body pool: it carries orientation + inertia + angular
+    // velocity. Visually identical (sphere-plane / sphere-sphere
+    // collision uses the bounding sphere), but the body is now a
+    // first-class rigid body that Phase 2b's SAT narrowphase will
+    // start to talk to.
+    C.RegisterCommand("phys_drop_sphere",
+        "phys_drop_sphere <x> <y> <z> [radius=0.3] [mass=1.0]: spawn a rigid-body sphere "
+        "(Phase 2a) at the world-space position.",
+        [this](auto args, pt::console::Output& out) {
+            if (!physics_) { out.PrintLine("phys_drop_sphere: physics system not initialised"); return; }
+            if (args.size() < 3 || args.size() > 5) {
+                out.PrintLine("usage: phys_drop_sphere <x> <y> <z> [radius=0.3] [mass=1.0]");
+                return;
+            }
+            float x, y, z, radius = 0.3f, mass = 1.0f;
+            if (!ParseFloat(args[0], x) || !ParseFloat(args[1], y) || !ParseFloat(args[2], z)) {
+                out.PrintLine("phys_drop_sphere: arg parse failed");
+                return;
+            }
+            if (args.size() >= 4 && !ParseFloat(args[3], radius)) {
+                out.PrintLine("phys_drop_sphere: bad radius");
+                return;
+            }
+            if (args.size() >= 5 && !ParseFloat(args[4], mass)) {
+                out.PrintLine("phys_drop_sphere: bad mass");
+                return;
+            }
+            if (radius <= 0.0f) {
+                out.PrintLine("phys_drop_sphere: radius must be > 0");
+                return;
+            }
+            if (mass < 0.0f) {
+                out.PrintLine("phys_drop_sphere: mass must be >= 0 (0 = kinematic)");
+                return;
+            }
+            const auto h = physics_->AddRigidSphere(glm::vec3{x, y, z}, radius, mass);
+            if (h == pt::physics::PhysicsSystem::kInvalidRbHandle) {
+                out.FormatLine("phys_drop_sphere: rigid body pool full ({} max)",
+                               pt::physics::PhysicsSystem::kMaxRigidBodies);
+                return;
+            }
+            const std::uint32_t prim_id = physics_next_prim_id_++;
+            AnalyticPrim p{};
+            p.type        = AnalyticPrim::Sphere;
+            p.material    = AnalyticPrim::Lambert;
+            p.pos_or_n[0] = x; p.pos_or_n[1] = y; p.pos_or_n[2] = z;
+            p.radius_or_d = radius;
+            // Slightly warmer tint than `phys_drop` so a quick glance
+            // distinguishes the rigid-body sphere from a Phase-1
+            // particle in the same scene.
+            p.albedo[0]   = 0.85f; p.albedo[1] = 0.80f; p.albedo[2] = 0.70f;
+            p.roughness   = 0.4f;
+            p.ior         = 1.0f;
+            primitives_[prim_id] = p;
+            physics_->SetRbPrimId(h, prim_id);
+            primitives_dirty_ = true;
+            accum_dirty_      = true;
+            out.FormatLine("phys_drop_sphere: spawned rigid body handle=0x{:x} prim_id={} @ ({:.2f} {:.2f} {:.2f}) r={:.3f} m={:.3f}",
+                           h, prim_id, x, y, z, radius, mass);
+        });
+
+    // Spawn a rigid-body box (Phase 2a, #138). Phase 2a does NOT
+    // implement box-box / box-plane SAT collision -- per issue #138
+    // MVP discipline, boxes use a bounding-sphere collision shape and
+    // will fall to the ground but won't lie flat. Phase 2b lands SAT.
+    // Rendering is also still sphere-only (no shader changes in this
+    // PR), so the box renders as its bounding sphere too. That's
+    // intentional: the visual delta from `phys_drop_sphere` is the
+    // bounding-sphere RADIUS, which on a 1x1x1m cube is sqrt(3)/2 ~=
+    // 0.866 m -- noticeably larger than the inscribed 0.5 m sphere.
+    C.RegisterCommand("phys_drop_box",
+        "phys_drop_box <x> <y> <z> <hx> <hy> <hz> [mass=1.0]: spawn a rigid-body box "
+        "(Phase 2a, sphere collision only -- box-box SAT lands in Phase 2b).",
+        [this](auto args, pt::console::Output& out) {
+            if (!physics_) { out.PrintLine("phys_drop_box: physics system not initialised"); return; }
+            if (args.size() < 6 || args.size() > 7) {
+                out.PrintLine("usage: phys_drop_box <x> <y> <z> <hx> <hy> <hz> [mass=1.0]");
+                return;
+            }
+            float x, y, z, hx, hy, hz, mass = 1.0f;
+            if (!ParseFloat(args[0], x)  || !ParseFloat(args[1], y)  || !ParseFloat(args[2], z) ||
+                !ParseFloat(args[3], hx) || !ParseFloat(args[4], hy) || !ParseFloat(args[5], hz)) {
+                out.PrintLine("phys_drop_box: arg parse failed");
+                return;
+            }
+            if (args.size() == 7 && !ParseFloat(args[6], mass)) {
+                out.PrintLine("phys_drop_box: bad mass");
+                return;
+            }
+            if (hx <= 0.0f || hy <= 0.0f || hz <= 0.0f) {
+                out.PrintLine("phys_drop_box: all half-extents must be > 0");
+                return;
+            }
+            if (mass < 0.0f) {
+                out.PrintLine("phys_drop_box: mass must be >= 0 (0 = kinematic)");
+                return;
+            }
+            const glm::vec3 h_ext{hx, hy, hz};
+            const auto h = physics_->AddRigidBox(glm::vec3{x, y, z}, h_ext, mass);
+            if (h == pt::physics::PhysicsSystem::kInvalidRbHandle) {
+                out.FormatLine("phys_drop_box: rigid body pool full ({} max)",
+                               pt::physics::PhysicsSystem::kMaxRigidBodies);
+                return;
+            }
+            // Render as bounding sphere for Phase 2a -- shader work
+            // (real box primitive in the analytic-prim shader) is
+            // explicitly out of scope per issue #138.
+            const float bound_r = pt::physics::BoxBoundingRadius(h_ext);
+            const std::uint32_t prim_id = physics_next_prim_id_++;
+            AnalyticPrim p{};
+            p.type        = AnalyticPrim::Sphere;
+            p.material    = AnalyticPrim::Lambert;
+            p.pos_or_n[0] = x; p.pos_or_n[1] = y; p.pos_or_n[2] = z;
+            p.radius_or_d = bound_r;
+            // Bluer tint -- distinguishes a box rigid body (bounding
+            // sphere proxy) from a true rigid-body sphere at a glance.
+            p.albedo[0]   = 0.60f; p.albedo[1] = 0.65f; p.albedo[2] = 0.85f;
+            p.roughness   = 0.5f;
+            p.ior         = 1.0f;
+            primitives_[prim_id] = p;
+            physics_->SetRbPrimId(h, prim_id);
+            primitives_dirty_ = true;
+            accum_dirty_      = true;
+            out.FormatLine("phys_drop_box: spawned rigid body handle=0x{:x} prim_id={} @ ({:.2f} {:.2f} {:.2f}) half=({:.2f} {:.2f} {:.2f}) m={:.3f} bound_r={:.3f}",
+                           h, prim_id, x, y, z, hx, hy, hz, mass, bound_r);
+        });
+
+    C.RegisterCommand("phys_clear",
+        "Remove all physics-owned analytic primitives and clear the particle + rigid-body pools.",
+        [this](auto, pt::console::Output& out) {
+            if (!physics_) { out.PrintLine("phys_clear: physics system not initialised"); return; }
+            // Each live particle has a paired analytic-prim entry --
+            // gather the prim ids before clearing so we don't iterate
+            // a mutating map.
+            std::vector<std::uint32_t> prim_ids;
+            prim_ids.reserve(physics_->AliveCount() + physics_->RbAliveCount());
+            physics_->ForEach(
+                [](pt::physics::PhysicsSystem::Handle /*h*/,
+                   const pt::physics::Particle& /*p*/,
+                   std::uint32_t prim_id, void* user) {
+                    auto* vec = static_cast<std::vector<std::uint32_t>*>(user);
+                    if (prim_id != 0) vec->push_back(prim_id);
+                },
+                &prim_ids);
+            // Mirror for the rigid-body pool (Phase 2a, #138). Same
+            // callback signature shape; different per-element type.
+            physics_->ForEachRigidBody(
+                [](pt::physics::PhysicsSystem::RbHandle /*h*/,
+                   const pt::physics::RigidBody& /*b*/,
+                   std::uint32_t prim_id, void* user) {
+                    auto* vec = static_cast<std::vector<std::uint32_t>*>(user);
+                    if (prim_id != 0) vec->push_back(prim_id);
+                },
+                &prim_ids);
+            for (auto id : prim_ids) primitives_.erase(id);
+            const std::uint32_t removed = static_cast<std::uint32_t>(prim_ids.size());
+            physics_->Clear();
+            if (removed > 0) {
+                primitives_dirty_ = true;
+                accum_dirty_      = true;
+            }
+            out.FormatLine("phys_clear: removed {} physics-owned prim(s); particle + rigid-body pools emptied", removed);
+        });
+
+    C.RegisterCommand("phys_status",
+        "Print the current Verlet physics layer status (enabled, particle count, gravity / damping / substeps).",
+        [this](auto, pt::console::Output& out) {
+            if (!physics_) { out.PrintLine("phys_status: physics system not initialised"); return; }
+            auto& Cl = pt::console::Console::Get();
+            bool en = false;
+            int  sub = 8;
+            float gy  = -9.81f;
+            float dmp = 0.99f;
+            if (auto* v = Cl.FindCVar("phys_enabled"))   en  = v->GetBool();
+            if (auto* v = Cl.FindCVar("phys_substeps"))  sub = v->GetInt();
+            if (auto* v = Cl.FindCVar("phys_gravity_y")) gy  = v->GetFloat();
+            if (auto* v = Cl.FindCVar("phys_damping"))   dmp = v->GetFloat();
+            out.FormatLine("phys: enabled={} particles={}/{} rigid_bodies={}/{} gravity_y={:.3f} m/s^2 substeps={} damping={:.4f}",
+                           en ? 1 : 0,
+                           physics_->AliveCount(),
+                           physics_->Capacity(),
+                           physics_->RbAliveCount(),
+                           physics_->RbCapacity(),
+                           gy, sub, dmp);
+        });
+}
+
+void Engine::StepPhysics(float dt) {
+    if (!physics_) return;
+    if (physics_->AliveCount() == 0 && physics_->RbAliveCount() == 0) return;
+
+    auto& C = pt::console::Console::Get();
+    bool enabled = false;
+    if (auto* v = C.FindCVar("phys_enabled")) enabled = v->GetBool();
+    if (!enabled) return;
+
+    int substeps = 8;
+    float gy     = -9.81f;
+    float damp   = 0.99f;
+    if (auto* v = C.FindCVar("phys_substeps"))  substeps = v->GetInt();
+    if (auto* v = C.FindCVar("phys_gravity_y")) gy       = v->GetFloat();
+    if (auto* v = C.FindCVar("phys_damping"))   damp     = v->GetFloat();
+
+    // Clamp dt to a sane upper bound so a single huge frame (debugger
+    // pause, swapchain hitch, window-drag stall) doesn't fling the
+    // simulation across the world. 1/30 s = 33.3 ms is the floor; a
+    // longer frame than that gets sliced into multiple physics frames.
+    float clamped_dt = dt;
+    constexpr float kMaxStepSec = 1.0f / 30.0f;
+    if (clamped_dt > kMaxStepSec) clamped_dt = kMaxStepSec;
+    if (clamped_dt <= 0.0f)        return;
+
+    physics_->Step(clamped_dt, substeps, gy, damp);
+
+    // Write each particle's curr_pos back into its paired analytic
+    // primitive so RenderFrame's EnsurePrimitivesUploaded sees the
+    // moved sphere. The callback signature is C-style by design so
+    // the physics library stays free of std::function overhead --
+    // we pass `this` as `user` and recover the engine pointer to
+    // mutate `primitives_`.
+    struct Ctx {
+        std::map<std::uint32_t, Engine::AnalyticPrim>* prims = nullptr;
+        bool any_changed = false;
+    };
+    Ctx ctx{ &primitives_, false };
+    physics_->ForEach(
+        [](pt::physics::PhysicsSystem::Handle /*h*/,
+           const pt::physics::Particle& p,
+           std::uint32_t prim_id, void* user) {
+            auto* c = static_cast<Ctx*>(user);
+            if (prim_id == 0) return;
+            auto it = c->prims->find(prim_id);
+            if (it == c->prims->end()) return;
+            auto& ap = it->second;
+            // Only update sphere prims -- planes/etc. share the type
+            // tag space but physics never targets them.
+            if (ap.type != AnalyticPrim::Sphere) return;
+            ap.pos_or_n[0] = p.curr_pos.x;
+            ap.pos_or_n[1] = p.curr_pos.y;
+            ap.pos_or_n[2] = p.curr_pos.z;
+            // Radius is fixed for now (no growing/shrinking particles
+            // in Phase 1); skip writing it.
+            c->any_changed = true;
+        },
+        &ctx);
+
+    // Rigid-body writeback (Phase 2a, #138). Renders as the bounding
+    // sphere -- shaders/* are off-limits per issue #138 so we can't
+    // upload a real OBB primitive yet. Orientation is integrated and
+    // updated but doesn't visibly affect the sphere render; Phase 2b
+    // adds the box analytic-prim shader path and starts using it.
+    physics_->ForEachRigidBody(
+        [](pt::physics::PhysicsSystem::RbHandle /*h*/,
+           const pt::physics::RigidBody& b,
+           std::uint32_t prim_id, void* user) {
+            auto* c = static_cast<Ctx*>(user);
+            if (prim_id == 0) return;
+            auto it = c->prims->find(prim_id);
+            if (it == c->prims->end()) return;
+            auto& ap = it->second;
+            if (ap.type != AnalyticPrim::Sphere) return;
+            ap.pos_or_n[0] = b.curr_pos.x;
+            ap.pos_or_n[1] = b.curr_pos.y;
+            ap.pos_or_n[2] = b.curr_pos.z;
+            c->any_changed = true;
+        },
+        &ctx);
+
+    if (ctx.any_changed) {
+        primitives_dirty_ = true;
+        accum_dirty_      = true;
+    }
+}
+// --- end Physics Phase 1 ---------------------------------------------------
+// --- Light primitives (#73) ------------------------------------------------
+//
+// Console commands for analytic light primitives. Mirrors the
+// `prim_*` / `sdf_*` convention:
+//   * `light_point <id> <x> <y> <z> <r> <g> <b>` -- omnidirectional
+//      emitter at a point. Intensity is radiant intensity per channel
+//      in W/sr (candela-equivalent).
+//   * `light_spot <id> <x> <y> <z> <dx> <dy> <dz> <outer_deg>
+//      <inner_deg> <r> <g> <b>` -- point with an angular cosine
+//      falloff cone. `dir` is the EMISSION axis (from the emitter
+//      outward into the scene); `outer_deg` / `inner_deg` are the
+//      cone half-angles in degrees (light is full inside inner,
+//      zero outside outer, linear cosine ramp between).
+//   * `light_sphere <id> <x> <y> <z> <radius> <r> <g> <b>` -- diffuse
+//      area emitter on a sphere surface. Intensity is surface
+//      radiance in W/m^2/sr; the integrator samples a uniform point
+//      on the sphere each NEE call.
+//   * `light_quad <id> <x> <y> <z> <nx> <ny> <nz> <ux> <uy> <uz>
+//      <u_half> <v_half> <r> <g> <b>` -- diffuse one-sided rectangle.
+//      `n` is the front-face normal; `u` is the in-plane direction
+//      (re-orthogonalised against n); `u_half` / `v_half` are the
+//      half-extent lengths in metres.
+//   * `light_list` / `light_clear` / `light_remove` -- management.
+
+namespace {
+
+const char* LightTypeName(Engine::AnalyticLight::Type t) {
+    switch (t) {
+        case Engine::AnalyticLight::Point:  return "point";
+        case Engine::AnalyticLight::Spot:   return "spot";
+        case Engine::AnalyticLight::Sphere: return "sphere";
+        case Engine::AnalyticLight::Quad:   return "quad";
+    }
+    return "?";
+}
+
+// --- Voxel destruction Phase 1 (#140) --------------------------------------
+//
+// Voxel commands. The engine voxelizes a source object on demand and
+// stores the resulting VoxelGrid in voxel_grids_ keyed by source id.
+// Per-frame, SyncVoxelDemoState injects the occupied voxels into
+// sdf_prims_ as analytic-box SDF clusters when r_voxelize_demo=1, and
+// pulls them back out when 0. No shader changes are required -- the
+// path tracer treats them as ordinary SDF clusters.
+
+// Helper: build a VoxelMaterial from an AnalyticPrim. Material kind
+// mapping matches the wire format (0 Lambert, 1 Metal, 2 Dielectric).
+pt::destruction::VoxelMaterial MaterialFromAnalyticPrim(const Engine::AnalyticPrim& p) {
+    pt::destruction::VoxelMaterial m{};
+    m.kind      = static_cast<std::uint32_t>(p.material);
+    m.albedo    = { p.albedo[0], p.albedo[1], p.albedo[2] };
+    m.roughness = p.roughness;
+    m.ior       = p.ior;
+    return m;
+}
+
+pt::destruction::VoxelMaterial MaterialFromSdfPrim(const pt::renderer::SdfPrim& p) {
+    pt::destruction::VoxelMaterial m{};
+    m.kind      = p.material;
+    m.albedo    = { p.albedo[0], p.albedo[1], p.albedo[2] };
+    m.roughness = p.roughness;
+    m.ior       = p.ior;
+    return m;
+}
+
+// Material for CSG meshes. CsgScene doesn't carry per-node material
+// today, so Phase 1 ships with a fixed default that visually
+// resembles the headline drilled cube (warm metal) -- the goal of
+// `r_voxelize_demo` is the chunk-pile silhouette, not perfect
+// material fidelity. Later phases (issue #139 Phase 4) attach
+// per-voxel material strength.
+pt::destruction::VoxelMaterial DefaultMeshVoxelMaterial() {
+    pt::destruction::VoxelMaterial m{};
+    m.kind      = 1u;     // Metal
+    m.albedo    = { 0.85f, 0.65f, 0.30f };  // gold-ish
+    m.roughness = 0.15f;
+    m.ior       = 1.0f;
+    return m;
+}
+
+// Build a single-LEAF SDF cluster of shape BOX for one occupied
+// voxel. Half-extents are voxel_size/2 on every axis; center is the
+// voxel center in world space. AABB is filled by ComputeSdfAabb so
+// the BVH bound is tight.
+pt::renderer::SdfPrim VoxelToSdfCluster(const std::array<float, 3>& center,
+                                        float voxel_size,
+                                        const pt::destruction::VoxelMaterial& mat) {
+    using namespace pt::renderer;
+    SdfPrim prim{};
+    prim.node_count = 1u;
+    prim.material   = mat.kind;
+    prim.albedo[0]  = mat.albedo[0];
+    prim.albedo[1]  = mat.albedo[1];
+    prim.albedo[2]  = mat.albedo[2];
+    prim.roughness  = mat.roughness;
+    prim.ior        = mat.ior;
+    SdfNode& n   = prim.nodes[0];
+    n.op         = SDF_OP_LEAF;
+    n.shape      = SDF_SHAPE_BOX;
+    n.child_a    = 0u;
+    n.child_b    = 0u;
+    const float h = 0.5f * voxel_size;
+    n.params[0]  = h;
+    n.params[1]  = h;
+    n.params[2]  = h;
+    n.params[3]  = 0.0f;
+    n.center[0]  = center[0];
+    n.center[1]  = center[1];
+    n.center[2]  = center[2];
+    ComputeSdfAabb(prim);
+    return prim;
+}
+
+}  // namespace
+
+void Engine::RegisterLightCommands() {
+    auto& C = pt::console::Console::Get();
+
+    C.RegisterCommand("light_list",
+        "List analytic light primitives.",
+        [this](auto, pt::console::Output& out) {
+            if (light_prims_.empty()) { out.PrintLine("(no lights)"); return; }
+            out.FormatLine("{} analytic light(s):", light_prims_.size());
+            for (const auto& [id, L] : light_prims_) {
+                out.FormatLine("  {:>3}  {:<6}  pos=({:.2f} {:.2f} {:.2f})  intensity=({:.2f} {:.2f} {:.2f})",
+                               id, LightTypeName(L.type),
+                               L.pos[0], L.pos[1], L.pos[2],
+                               L.intensity[0], L.intensity[1], L.intensity[2]);
+            }
+        });
+
+    C.RegisterCommand("light_clear",
+        "Remove all analytic light primitives.",
+        [this](auto, pt::console::Output& out) {
+            light_prims_.clear();
+            light_prims_dirty_ = true;
+            accum_dirty_       = true;
+            out.PrintLine("lights: cleared");
+        });
+
+    C.RegisterCommand("light_remove",
+        "light_remove <id>: drop an analytic light.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 1) { out.PrintLine("usage: light_remove <id>"); return; }
+            std::uint32_t id;
+            if (!ParseUint(args[0], id)) { out.PrintLine("light_remove: id parse failed"); return; }
+            if (light_prims_.erase(id) == 0) {
+                out.FormatLine("light_remove: id {} not found", id);
+                return;
+            }
+            light_prims_dirty_ = true;
+            accum_dirty_       = true;
+            out.FormatLine("lights: removed id {}", id);
+        });
+
+    C.RegisterCommand("light_point",
+        "light_point <id> <x> <y> <z> <r> <g> <b>: add or replace an omnidirectional point light (intensity in W/sr per channel).",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 7) {
+                out.PrintLine("usage: light_point <id> <x> <y> <z> <r> <g> <b>");
+                return;
+            }
+            std::uint32_t id;
+            float x, y, z, r, g, b;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z) ||
+                !ParseFloat(args[4], r) || !ParseFloat(args[5], g) || !ParseFloat(args[6], b)) {
+                out.PrintLine("light_point: arg parse failed");
+                return;
+            }
+            AnalyticLight L{};
+            L.type = AnalyticLight::Point;
+            L.pos[0] = x; L.pos[1] = y; L.pos[2] = z;
+            L.intensity[0] = r; L.intensity[1] = g; L.intensity[2] = b;
+            light_prims_[id] = L;
+            light_prims_dirty_ = true;
+            accum_dirty_       = true;
+            out.FormatLine("lights: point id={} pos=({:.2f} {:.2f} {:.2f})", id, x, y, z);
+        });
+
+    C.RegisterCommand("light_spot",
+        "light_spot <id> <x> <y> <z> <dx> <dy> <dz> <outer_deg> <inner_deg> <r> <g> <b>: add or replace a spot light (W/sr per channel, angular cosine falloff between inner and outer cone half-angles).",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 12) {
+                out.PrintLine("usage: light_spot <id> <x> <y> <z> <dx> <dy> <dz> <outer_deg> <inner_deg> <r> <g> <b>");
+                return;
+            }
+            std::uint32_t id;
+            float x, y, z, dx, dy, dz, outer_deg, inner_deg, r, g, b;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], x)  || !ParseFloat(args[2], y)  || !ParseFloat(args[3], z) ||
+                !ParseFloat(args[4], dx) || !ParseFloat(args[5], dy) || !ParseFloat(args[6], dz) ||
+                !ParseFloat(args[7], outer_deg) || !ParseFloat(args[8], inner_deg) ||
+                !ParseFloat(args[9], r)  || !ParseFloat(args[10], g) || !ParseFloat(args[11], b)) {
+                out.PrintLine("light_spot: arg parse failed");
+                return;
+            }
+            const float dlen = std::sqrt(dx*dx + dy*dy + dz*dz);
+            if (dlen < 1e-6f) { out.PrintLine("light_spot: dir magnitude is zero"); return; }
+            dx /= dlen; dy /= dlen; dz /= dlen;
+            if (outer_deg < 0.0f) outer_deg = 0.0f;
+            if (outer_deg > 89.99f) outer_deg = 89.99f;
+            if (inner_deg < 0.0f) inner_deg = 0.0f;
+            if (inner_deg > outer_deg) inner_deg = outer_deg;
+            AnalyticLight L{};
+            L.type = AnalyticLight::Spot;
+            L.pos[0] = x; L.pos[1] = y; L.pos[2] = z;
+            L.dir[0] = dx; L.dir[1] = dy; L.dir[2] = dz;
+            L.intensity[0] = r; L.intensity[1] = g; L.intensity[2] = b;
+            const float deg2rad = 3.14159265358979323846f / 180.0f;
+            L.cos_outer = std::cos(outer_deg * deg2rad);
+            L.cos_inner = std::cos(inner_deg * deg2rad);
+            light_prims_[id] = L;
+            light_prims_dirty_ = true;
+            accum_dirty_       = true;
+            out.FormatLine("lights: spot id={} pos=({:.2f} {:.2f} {:.2f}) dir=({:.2f} {:.2f} {:.2f}) outer={:.1f} inner={:.1f}",
+                           id, x, y, z, dx, dy, dz, outer_deg, inner_deg);
+        });
+
+    C.RegisterCommand("light_sphere",
+        "light_sphere <id> <x> <y> <z> <radius> <r> <g> <b>: add or replace a spherical diffuse area light (radiance in W/m^2/sr).",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 8) {
+                out.PrintLine("usage: light_sphere <id> <x> <y> <z> <radius> <r> <g> <b>");
+                return;
+            }
+            std::uint32_t id;
+            float x, y, z, radius, r, g, b;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z) ||
+                !ParseFloat(args[4], radius) ||
+                !ParseFloat(args[5], r) || !ParseFloat(args[6], g) || !ParseFloat(args[7], b)) {
+                out.PrintLine("light_sphere: arg parse failed");
+                return;
+            }
+            if (radius <= 0.0f) { out.PrintLine("light_sphere: radius must be > 0"); return; }
+            AnalyticLight L{};
+            L.type = AnalyticLight::Sphere;
+            L.pos[0] = x; L.pos[1] = y; L.pos[2] = z;
+            L.radius = radius;
+            L.intensity[0] = r; L.intensity[1] = g; L.intensity[2] = b;
+            light_prims_[id] = L;
+            light_prims_dirty_ = true;
+            accum_dirty_       = true;
+            out.FormatLine("lights: sphere id={} pos=({:.2f} {:.2f} {:.2f}) r={:.3f}", id, x, y, z, radius);
+        });
+
+    C.RegisterCommand("light_quad",
+        "light_quad <id> <x> <y> <z> <nx> <ny> <nz> <ux> <uy> <uz> <u_half> <v_half> <r> <g> <b>: add or replace a rectangular diffuse one-sided area light (front face = n, u-axis in-plane, both half-extents in metres).",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 15) {
+                out.PrintLine("usage: light_quad <id> <x> <y> <z> <nx> <ny> <nz> <ux> <uy> <uz> <u_half> <v_half> <r> <g> <b>");
+                return;
+            }
+            std::uint32_t id;
+            float x, y, z, nx, ny, nz, ux, uy, uz, uh, vh, r, g, b;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], x)  || !ParseFloat(args[2], y)  || !ParseFloat(args[3], z) ||
+                !ParseFloat(args[4], nx) || !ParseFloat(args[5], ny) || !ParseFloat(args[6], nz) ||
+                !ParseFloat(args[7], ux) || !ParseFloat(args[8], uy) || !ParseFloat(args[9], uz) ||
+                !ParseFloat(args[10], uh) || !ParseFloat(args[11], vh) ||
+                !ParseFloat(args[12], r) || !ParseFloat(args[13], g) || !ParseFloat(args[14], b)) {
+                out.PrintLine("light_quad: arg parse failed");
+                return;
+            }
+            const float nlen = std::sqrt(nx*nx + ny*ny + nz*nz);
+            if (nlen < 1e-6f) { out.PrintLine("light_quad: normal magnitude is zero"); return; }
+            nx /= nlen; ny /= nlen; nz /= nlen;
+            // Re-orthogonalise u against n: u' = normalize(u - n*(n.u)).
+            const float ndu = nx*ux + ny*uy + nz*uz;
+            float uxo = ux - nx*ndu;
+            float uyo = uy - ny*ndu;
+            float uzo = uz - nz*ndu;
+            const float ulen = std::sqrt(uxo*uxo + uyo*uyo + uzo*uzo);
+            if (ulen < 1e-6f) { out.PrintLine("light_quad: u-axis collinear with normal"); return; }
+            uxo /= ulen; uyo /= ulen; uzo /= ulen;
+            if (uh <= 0.0f || vh <= 0.0f) {
+                out.PrintLine("light_quad: u_half and v_half must be > 0");
+                return;
+            }
+            AnalyticLight L{};
+            L.type = AnalyticLight::Quad;
+            L.pos[0] = x; L.pos[1] = y; L.pos[2] = z;
+            L.dir[0] = nx; L.dir[1] = ny; L.dir[2] = nz;
+            // u_vec is stored as the FULL half-extent vector so the
+            // shader can recover both the axis (length-normalised) and
+            // the half-extent (length).
+            L.u_vec[0] = uxo * uh; L.u_vec[1] = uyo * uh; L.u_vec[2] = uzo * uh;
+            L.v_half   = vh;
+            L.intensity[0] = r; L.intensity[1] = g; L.intensity[2] = b;
+            light_prims_[id] = L;
+            light_prims_dirty_ = true;
+            accum_dirty_       = true;
+            out.FormatLine("lights: quad id={} pos=({:.2f} {:.2f} {:.2f}) n=({:.2f} {:.2f} {:.2f}) u_half={} v_half={}",
+                           id, x, y, z, nx, ny, nz, uh, vh);
+        });
+}
+// --- end Light primitives --------------------------------------------------
+
+bool Engine::VoxelizeSourceObject(std::uint32_t source_id, float voxel_size,
+                                  std::string* out_summary) {
+    if (voxel_size <= 0.0f) {
+        if (out_summary) *out_summary = "voxelize_object: r_voxel_size must be > 0";
+        return false;
+    }
+    auto grid = std::make_unique<pt::destruction::VoxelGrid>();
+
+    // Resolution order: CSG mesh root -> SDF cluster -> analytic
+    // primitive. The first match wins.
+    if (csg_scene_ && csg_scene_->HasRoot() && source_id == csg_scene_->RootId()) {
+        std::string err;
+        pt::csg::BakedMesh baked = csg_scene_->Bake(&err);
+        if (baked.Empty()) {
+            const std::string msg = fmt::format(
+                "voxelize_object: CSG root id={} bake failed ({})",
+                source_id, err.empty() ? "empty mesh" : err);
+            if (out_summary) *out_summary = msg;
+            LOG_ERROR("[voxel] {}", msg);
+            return false;
+        }
+        const auto mat = DefaultMeshVoxelMaterial();
+        if (!pt::destruction::VoxelizeBakedMesh(source_id, baked, voxel_size, mat, *grid)) {
+            const std::string msg = fmt::format(
+                "voxelize_object: CSG root id={} produced 0 voxels", source_id);
+            if (out_summary) *out_summary = msg;
+            LOG_WARN("[voxel] {}", msg);
+            return false;
+        }
+    } else if (auto it = sdf_prims_.find(source_id); it != sdf_prims_.end()) {
+        const auto mat = MaterialFromSdfPrim(it->second);
+        if (!pt::destruction::VoxelizeSdf(source_id, it->second, voxel_size, mat, *grid)) {
+            const std::string msg = fmt::format(
+                "voxelize_object: SDF cluster id={} produced 0 voxels", source_id);
+            if (out_summary) *out_summary = msg;
+            LOG_WARN("[voxel] {}", msg);
+            return false;
+        }
+    } else if (auto pit = primitives_.find(source_id); pit != primitives_.end()) {
+        const auto& p = pit->second;
+        if (p.type != AnalyticPrim::Sphere) {
+            const std::string msg = fmt::format(
+                "voxelize_object: prim id={} is not a finite primitive (plane has infinite extent)",
+                source_id);
+            if (out_summary) *out_summary = msg;
+            LOG_ERROR("[voxel] {}", msg);
+            return false;
+        }
+        const auto mat = MaterialFromAnalyticPrim(p);
+        const float center[3] = { p.pos_or_n[0], p.pos_or_n[1], p.pos_or_n[2] };
+        if (!pt::destruction::VoxelizeSphere(source_id, center, p.radius_or_d,
+                                             voxel_size, mat, *grid)) {
+            const std::string msg = fmt::format(
+                "voxelize_object: sphere id={} produced 0 voxels", source_id);
+            if (out_summary) *out_summary = msg;
+            LOG_WARN("[voxel] {}", msg);
+            return false;
+        }
+    } else {
+        const std::string msg = fmt::format(
+            "voxelize_object: id={} not found (CSG root, SDF cluster, or analytic prim)",
+            source_id);
+        if (out_summary) *out_summary = msg;
+        LOG_ERROR("[voxel] {}", msg);
+        return false;
+    }
+
+    // Replace any prior grid for this source. Push to map.
+    voxel_grids_[source_id] = std::move(grid);
+
+    // Force a sync next frame so the live demo state matches the new
+    // voxel set.
+    accum_dirty_ = true;
+    sdf_prims_dirty_ = true;
+    if (out_summary) {
+        const auto& g = *voxel_grids_[source_id];
+        *out_summary = fmt::format(
+            "voxelize_object id={} dims={}x{}x{} occupied={} voxel_size={}m",
+            source_id, g.DimX(), g.DimY(), g.DimZ(), g.Occupied(), voxel_size);
+    }
+    return true;
+}
+
+void Engine::SyncVoxelDemoState() {
+    // Read the cvar each frame so a toggle takes effect immediately.
+    bool want_demo = false;
+    if (auto* v = pt::console::Console::Get().FindCVar("r_voxelize_demo")) {
+        want_demo = v->GetBool();
+    }
+    voxel_demo_active_ = want_demo && !voxel_grids_.empty();
+
+    // Compute the desired reserved-id span based on want_demo.
+    //
+    // When the demo is off (want_demo=0) the desired set is empty:
+    // we rip every kVoxelClusterIdBase+* entry out of sdf_prims_.
+    // When on, we emit one cluster per occupied voxel across every
+    // VoxelGrid in voxel_grids_, in object-id order. Reserved ids are
+    // contiguous so the next sync's diff is cheap.
+    //
+    // The voxel renderer slot is sdf_prims_ -- reusing the existing
+    // SDF cluster path means the path tracer's loop already handles
+    // them with no shader change. The cost is N sphere-trace loops
+    // per ray (one per voxel cluster); for the 1m^3 / 0.1 m acceptance
+    // scene that's ~1000 trivial box traces which the GPU handles fine.
+
+    // Step 1: erase any existing voxel-reserved clusters from
+    // sdf_prims_.
+    bool changed = false;
+    for (auto it = sdf_prims_.begin(); it != sdf_prims_.end(); ) {
+        if (it->first >= kVoxelClusterIdBase) {
+            it = sdf_prims_.erase(it);
+            changed = true;
+        } else {
+            ++it;
+        }
+    }
+
+    // Step 2: if demo on, repopulate from voxel_grids_.
+    if (want_demo) {
+        std::uint32_t next_id = kVoxelClusterIdBase;
+        for (const auto& [src_id, grid_ptr] : voxel_grids_) {
+            if (!grid_ptr || !grid_ptr->Valid()) continue;
+            const auto& g = *grid_ptr;
+            const float voxel_size = g.VoxelSize();
+            const auto& mat = g.Material();
+            for (std::uint32_t k = 0; k < g.DimZ(); ++k)
+            for (std::uint32_t j = 0; j < g.DimY(); ++j)
+            for (std::uint32_t i = 0; i < g.DimX(); ++i) {
+                if (!g.Get(i, j, k)) continue;
+                const auto c = g.VoxelCenter(i, j, k);
+                sdf_prims_[next_id] = VoxelToSdfCluster(c, voxel_size, mat);
+                ++next_id;
+                if (next_id == 0u) {  // wraparound guard (practical never)
+                    LOG_ERROR("[voxel] reserved cluster id space exhausted");
+                    break;
+                }
+            }
+        }
+        changed = true;
+    }
+
+    if (changed) {
+        sdf_prims_dirty_ = true;
+        accum_dirty_     = true;
+    }
+}
+
+void Engine::RegisterVoxelCommands() {
+    auto& C = pt::console::Console::Get();
+
+    C.RegisterCommand("voxelize_list",
+        "List active voxel grids.",
+        [this](auto, pt::console::Output& out) {
+            if (voxel_grids_.empty()) { out.PrintLine("(no voxel grids)"); return; }
+            out.FormatLine("{} voxel grid(s):", voxel_grids_.size());
+            for (const auto& [id, g] : voxel_grids_) {
+                if (!g) continue;
+                out.FormatLine("  src={:>3}  dims={:>3}x{:>3}x{:>3}  occupied={:>6}  voxel={:.3f}m  aabb=[{:.2f},{:.2f},{:.2f} .. {:.2f},{:.2f},{:.2f}]",
+                               id,
+                               g->DimX(), g->DimY(), g->DimZ(),
+                               g->Occupied(), g->VoxelSize(),
+                               g->Header().aabb_min[0], g->Header().aabb_min[1], g->Header().aabb_min[2],
+                               g->Header().aabb_max[0], g->Header().aabb_max[1], g->Header().aabb_max[2]);
+            }
+        });
+
+    C.RegisterCommand("voxelize_clear",
+        "Drop all voxel grids and remove their reserved SDF clusters.",
+        [this](auto, pt::console::Output& out) {
+            voxel_grids_.clear();
+            // Force the next render to remove any reserved-id clusters.
+            SyncVoxelDemoState();
+            out.PrintLine("voxelize: cleared");
+        });
+
+    C.RegisterCommand("voxelize_object",
+        "voxelize_object <id>: voxelize a source object (CSG root, SDF cluster, or sphere prim) into a voxel grid at the current r_voxel_size.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 1) {
+                out.PrintLine("usage: voxelize_object <id>");
+                return;
+            }
+            std::uint32_t id = 0u;
+            if (!ParseUint(args[0], id)) {
+                out.PrintLine("voxelize_object: id parse failed");
+                return;
+            }
+            float voxel_size = 0.1f;
+            if (auto* v = pt::console::Console::Get().FindCVar("r_voxel_size")) {
+                voxel_size = v->GetFloat();
+            }
+            std::string summary;
+            const bool ok = VoxelizeSourceObject(id, voxel_size, &summary);
+            out.PrintLine(summary);
+            if (ok) {
+                // Force an immediate sync so the next render reflects
+                // the new voxel set without waiting for the cvar mirror.
+                SyncVoxelDemoState();
+            }
+        });
+
+    C.RegisterCommand("voxelize_save",
+        "voxelize_save <dir>: write every active voxel grid to <dir>/voxel_cache_*.bin.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 1) {
+                out.PrintLine("usage: voxelize_save <dir>");
+                return;
+            }
+            if (voxel_grids_.empty()) {
+                out.PrintLine("voxelize_save: nothing to save (no voxel grids)");
+                return;
+            }
+            const std::string dir{args[0]};
+            std::size_t saved = 0u;
+            for (const auto& [id, g] : voxel_grids_) {
+                if (!g) continue;
+                const std::string path = pt::destruction::MakeCachePath(
+                    dir, id, g->VoxelSize(), 0ull);
+                if (g->SaveToFile(path)) {
+                    out.FormatLine("voxelize_save: id={} -> {}", id, path);
+                    ++saved;
+                } else {
+                    out.FormatLine("voxelize_save: id={} write failed", id);
+                }
+            }
+            out.FormatLine("voxelize_save: {} grid(s) written", saved);
+        });
+}
+// --- end Voxel destruction Phase 1 -----------------------------------------
 
 }  // namespace pt::engine

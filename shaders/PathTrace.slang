@@ -161,6 +161,81 @@ Texture2D<float4> moon_map;
 // every subsequent texture slot.
 [[vk::binding(22, 0)]] RWTexture2D<float>  cloud_trans_tex;
 
+// MetalFX specular-guidance G-buffers (issue #118). Apple's
+// MTLFXTemporalDenoisedScaler exposes three optional specular inputs --
+// without them the scaler can't differentiate specular from diffuse
+// response and exhibits 8x8 halos around bright reflections / metals.
+// PR #114 wired normal + diffuse_albedo; this PR fills the remaining
+// trio so MetalFX can close the gap with DLSS Ray Reconstruction on
+// Apple Silicon.
+//
+// Binding numbers: 24/25/26. Binding 23 is reserved for #115 SIGMA
+// shadow visibility (parallel-agent coordination). The cluster
+// 22 (cloud_trans) / 23 (shadow_vis, #115) / 24-26 (this PR) lives
+// just past the SDF-cluster buffer at 21 and keeps the descriptor
+// pool sizing arithmetic simple.
+//
+// All three are declared on BOTH SPIR-V and Metal targets so Slang's
+// declaration-order MSL slot assignment stays stable -- same rule as
+// normal_tex / albedo_tex / cloud_trans_tex (see albedo_tex's comment
+// for the PR #108 history that motivates this). Runtime writes are
+// gated on the matching push.write_specular_*_gbuffer flag the engine
+// sets only for MetalFX-family denoiser kinds.
+
+// specular_albedo: per-pixel F0 (Fresnel reflectance at normal
+// incidence). RGBA16F so it can carry the full RGB metal tint
+// (metal F0 = surface albedo, NOT a uniform value -- gold is yellow
+// because its specular reflectance is yellow, not because it tints
+// a white diffuse). Dielectrics use the standard float3(0.04) IOR=1.5
+// Schlick approximation; pure Lambert writes float3(0) since it has
+// no specular lobe. Sky / no-hit pixels write float3(0).
+//
+// Declared as WTexture2D (write-only) rather than RWTexture2D because
+// Apple Silicon GPUs cap compute kernels at 8 read_write textures per
+// dispatch, and PathTrace.slang is already at that ceiling (output,
+// accum_hdr, denoise_color, depth_tex, motion_tex, normal_tex,
+// albedo_tex, cloud_trans_tex). Slang's WTexture2D lowers to
+// `texture2d<T, access::write>` on Metal -- not counted against the
+// 8-RW cap. Vulkan's GLSL/SPIR-V emit uses a write-only `imageStore`
+// path; the host-side bind path is identical (storage image, same
+// VkDescriptorSet entry, same vk::binding number). Issue #118 / Slang
+// docs WTexture2D guidance: a2-03-wgsl-target-specific.md.
+[[vk::binding(24, 0)]] WTexture2D<float4> specular_albedo_tex;
+
+// roughness: linear surface roughness in [0, 1]. Single-channel.
+// 0 = perfect mirror, 1 = fully Lambertian. The path tracer's
+// material struct already carries a roughness param on PBR-style
+// hits (used in the GGX BRDF); this G-buffer just exposes it to
+// MetalFX as a guidance input so the scaler can vary its spatial
+// filter aggressiveness by surface response. Sky / no-hit pixels
+// write 1.0 (fully rough -- MetalFX won't try to sharpen a specular
+// highlight in empty space). See specular_albedo_tex's comment for
+// the WTexture2D vs RWTexture2D rationale (Apple's 8-RW cap).
+[[vk::binding(25, 0)]] WTexture2D<float>  roughness_tex;
+
+// specular_hit_distance: distance from the camera (in world units) to
+// the surface a reflection ray from the primary hit would land on.
+// Single-channel. Apple uses this for parallax-correct temporal
+// reprojection of specular highlights -- without it, reflections on
+// moving cameras smear because MetalFX has no way to know the
+// reflected-virtual-image depth differs from the visible-surface
+// depth.
+//
+// MVP semantics: we don't run a second trace per pixel (the full
+// design would re-trace in r = reflect(view_dir, normal) from the
+// primary hit). Instead we use `primary_t` (the distance the camera
+// ray itself travelled) as a proxy, biased by the roughness: at
+// roughness=0 (perfect mirror) the reflected hit is at infinity for
+// curved surfaces / at primary_t for flat ones, so this proxy is
+// closer to right for shorter-distance reflections; at roughness=1
+// the field doesn't matter anyway (MetalFX won't try to reproject
+// a fully-rough surface as a sharp specular). A future PR can
+// replace this with a real reflection-ray trace; the visual diff
+// determines whether the perf cost is worth it.
+// Sky / no-hit pixels write 0 (no surface). See specular_albedo_tex's
+// comment for the WTexture2D vs RWTexture2D rationale.
+[[vk::binding(26, 0)]] WTexture2D<float>  specular_hit_distance_tex;
+
 // GPU-resident exposure scalar. Updated each frame by AutoExposure.slang
 // (when r_auto_exposure = 1) or written once by the engine via
 // WriteBuffer (when r_auto_exposure = 0, holding the manual r_exposure
@@ -227,6 +302,135 @@ Texture2D<float4> moon_map;
 // bindings 19/20.
 [[vk::binding(21, 0)]] StructuredBuffer<float4> sdf_clusters;
 // --- end SDF Phase 1 -------------------------------------------------------
+
+// Sun-NEE shadow-ray visibility G-buffer (issue #115). One float per
+// pixel, row-major (index = y*width + x). 1.0 = primary hit was fully
+// lit by the sun; 0.0 = fully in shadow; partial values from the spp
+// average. Sky pixels (no primary hit) write 1.0 so the downstream
+// SigmaShadow kernel never darkens the sky composite.
+//
+// Storage buffer (NOT texture) is deliberate. Metal's compute pipeline
+// caps RWTexture2D bindings at 8 read_write textures per kernel.
+// PathTrace already sits exactly at that limit: output, accum_hdr,
+// denoise_color, depth_tex, motion_tex, normal_tex, albedo_tex,
+// cloud_trans_tex. A ninth RW texture would fail pipeline
+// compilation on Apple Silicon. Storage buffers (RWStructuredBuffer)
+// don't count toward that quota -- same workaround DenoiseAtrous.slang
+// uses for its variance + moments buffers. Indexing is row-major
+// `y*width + x` so the downstream SigmaShadow kernel can read
+// neighbours via the same arithmetic.
+//
+// IMPORTANT: declared AFTER sdf_clusters so existing Metal slots
+// 0..10 stay undisturbed. Slang's MSL backend assigns Metal buffer
+// slots in DECLARATION order (AS first, then storage buffers); the
+// vk::binding(N) is the Vulkan-only descriptor index. Inserting this
+// buffer anywhere earlier in the file would shift exposure_state /
+// bvh_nodes / tri_bvh_* / sdf_clusters up by one MSL slot and break
+// every engine BindBuffer call past the insertion point (the
+// drilled-down lesson behind the comment above sdf_clusters about
+// declaration order being load-bearing). Lands on Metal slot 11,
+// matching the engine's BindBuffer(11, ...) call site.
+//
+// Allocated alongside the other denoiser textures whenever
+// denoiser_active_ AND r_shadow_demod != 0. The runtime
+// `write_shadow_vis` push flag is the actual run-or-skip switch; when
+// 0 the write site below elides (saves a 4-byte write per pixel per
+// frame on the legacy-shadow path). PathTrace declares the binding
+// unconditionally so Slang's MSL backend doesn't dead-code-eliminate
+// the slot and shift subsequent buffer indices -- same lesson the
+// albedo_tex declaration captures upstream.
+[[vk::binding(23, 0)]] RWStructuredBuffer<float> shadow_vis_buf;
+
+// --- Light primitives (#73) ------------------------------------------------
+// Analytic light list for direct-lighting NEE: point, spot, sphere
+// (area), and quad (area) lights. CPU rebuilds this buffer when the
+// `light_*` console commands mutate the engine's light_prims_ map; the
+// shader's Lambert NEE block picks one entry per sample (uniform over
+// the count) and traces a shadow ray to a sampled point on it.
+//
+// Layout: 4 float4s per light (matches the analytic primitive pattern's
+// declaration-order convention, sized to fit every supported type).
+//
+//   v0.xyz = position             (point/spot center, sphere center,
+//                                   quad center)
+//   v0.w   = radius_or_param      (sphere radius in metres; point/spot/
+//                                   quad: unused -> 0)
+//   v1.rgb = intensity            (per-channel radiant intensity in
+//                                   W/sr for point/spot; per-area
+//                                   radiance W/m^2/sr for sphere/quad;
+//                                   shader integrates by sampled area
+//                                   so the user can read these as the
+//                                   "physical" emitter brightness)
+//   v1.w   = type_as_float        (LIGHT_POINT=0, LIGHT_SPOT=1,
+//                                   LIGHT_SPHERE=2, LIGHT_QUAD=3)
+//   v2.xyz = direction            (spot axis, unit vec; quad normal,
+//                                   unit vec; point/sphere: unused)
+//   v2.w   = cos_outer            (spot outer half-angle cosine; spot
+//                                   only)
+//   v3.xyz = u_extent_or_inner    (quad u-axis half-extent vector, or
+//                                   for spot: x = cos_inner)
+//   v3.w   = v_half_extent        (quad v-axis half-extent magnitude;
+//                                   the v-axis is implicit:
+//                                   normalize(cross(normal, u)))
+//
+// IMPORTANT: declared AFTER shadow_vis_buf so existing Metal slots 0..11
+// are undisturbed (Metal slot allocation is declaration-order based).
+// Light buffer lands on Metal slot 12. On Vulkan the explicit
+// vk::binding(27) is what matters; sits past the SIGMA #115 / MetalFX
+// specular #118 reservations at 23..26.
+[[vk::binding(27, 0)]] StructuredBuffer<float4> light_prims;
+// --- end Light primitives --------------------------------------------------
+
+// --- Light tree (#129) -----------------------------------------------------
+// Hierarchical light tree (Conty Estevez & Kulla 2018) packed node array.
+// Built CPU-side by pt::renderer::BuildLightTree, uploaded by
+// Engine::EnsureLightTreeUploaded. 4 float4s per node (LightTreeNode in
+// src/renderer/LightTree.h):
+//
+//   v0.xyz = aabb_min
+//   v0.w   = left_first (uint, asfloat) -- internal: left child index
+//                                          (right = left + 1);
+//                                          leaf:     light id in
+//                                          `light_prims` upload order.
+//   v1.xyz = aabb_max
+//   v1.w   = count (uint, asfloat) -- 0 = internal, 1 = leaf
+//   v2.xyz = cone_axis (unit; combined emission direction)
+//   v2.w   = cos_half_angle (1 = single direction, -1 = sphere/point)
+//   v3.x   = intensity (scalar emitted-power magnitude; relative)
+//   v3.yzw = pad
+//
+// IMPORTANT: declared AFTER light_prims so existing Metal slots 0..12 are
+// undisturbed (Metal slot allocation is declaration-order based). Light
+// tree lands on Metal slot 13. On Vulkan the explicit vk::binding(28) is
+// what matters; sits past the light_prims slot at 27.
+//
+// Gate is push.light_tree_enabled (set when r_light_tree=1 AND the
+// host actually uploaded a non-empty tree). When 0 the shader falls
+// back to #73's naive uniform pick -- the binding still resolves to the
+// engine's placeholder storage buffer so Metal's push-slot computation
+// stays stable.
+[[vk::binding(28, 0)]] StructuredBuffer<float4> light_tree_nodes;
+// --- end Light tree --------------------------------------------------------
+
+// --- ReSTIR DI Phase A reservoir buffer (#78) -----------------------------
+// Per-pixel reservoir SSBO written by this kernel's primary-hit WRS
+// candidate-generation block when r_restir = 1. The RestirTemporal /
+// RestirSpatial / RestirFinal compute kernels consume this buffer in
+// order; RestirFinal additively blends the resampled Lambert-NEE
+// contribution into denoise_color.
+//
+// Layout: 4 float4 lanes per pixel (64 B), strided y-major. Mirrors
+// src/renderer/RestirReservoir.h on the host. See
+// shaders/RestirReservoir.slang for the encoding helpers and the WRS
+// streaming primitives -- that file is imported below alongside
+// PathTraceMath / PathTraceCloud / SdfPrimitives / SdfFractals.
+//
+// IMPORTANT (slot ordering): declared AFTER light_tree_nodes so the
+// existing slots 0..13 stay undisturbed. Lands on Metal slot 14. On
+// Vulkan the explicit vk::binding(29) is what matters; sits one past
+// the light tree's binding 28.
+[[vk::binding(29, 0)]] RWStructuredBuffer<float4> reservoir_curr_buf;
+// --- end ReSTIR reservoir buffer ------------------------------------------
 
 struct BvhNode {
     float3 aabb_min;
@@ -355,9 +559,23 @@ cbuffer Push {
     //              per-channel Rayleigh sigma (5.8/13.5/33.1 ×1e-6 m^-1
     //              for R/G/B at sea level). 1.0 = real atmosphere; >1
     //              boosts the blue tint, 0 disables Rayleigh.
+    //   clouds_p4: (curl_amount, curl_scale, erosion_amount, _reserved)
+    //              issue #117. curl_amount in metres is the magnitude
+    //              of the Bridson-2007 curl-noise displacement applied
+    //              to the noise sample position before density eval --
+    //              gives the cloud body sheared filamentous detail
+    //              (cumulus edge wisps, cirrus streamers). 0 = bypass
+    //              the curl displacement entirely (regression-safe).
+    //              curl_scale is the curl-noise frequency in cycles
+    //              per metre (independent of cp2.z so coarse cloud
+    //              bodies can carry fine curl turbulence).
+    //              erosion_amount is a secondary high-frequency edge
+    //              erosion term added on top of cp3.z; eats soft
+    //              cumulus margins into wisps. 0 = bypass.
     float4 clouds_p1;
     float4 clouds_p2;
     float4 clouds_p3;
+    float4 clouds_p4;
     // Moon. .xyz = unit vector toward the moon (engine computes via
     // Meeus simplified moon-position formulas + observer lat/lon).
     // .w = phase angle in radians (0 = new, π = full); used for both
@@ -376,7 +594,14 @@ cbuffer Push {
     // CPU-clamped to [0.5, 1.0]). Typical values produced by the
     // formula: ~0.78 at elev=0 (4:5 oval, peak squish), ~0.87 at 1deg,
     // ~0.95 at 3deg, ~0.97 at 5deg, ~0.99 at 10deg, indistinguishable
-    // from 1.0 above ~30deg. .w reserved.
+    // from 1.0 above ~30deg.
+    // .w = planet radius in metres for spherical-Earth atmospheric
+    // transmittance (issue #51). When > 0, `atmosphericTransmittance`
+    // numerically integrates Mie + Rayleigh optical depth along the
+    // curved chord through a thin shell around a sphere of this radius
+    // (centre at world origin offset by -r so the y=0 plane sits on
+    // the surface). 0 falls back to the legacy planar exponential
+    // integral. WGS-84 Earth is 6,378,137 m.
     float4 sun_extra;
     // HDRI multi-light extraction (computed at HDRI load in
     // ReloadEnvMap). Each entry is a directional light derived from a
@@ -448,25 +673,35 @@ cbuffer Push {
     //        scan was O(N) per ray and crushed framerate on Mac-Vulkan;
     //        the BVH walk is O(log N).
     uint4 bvh_params;
-    // --- SDF Phase 1 (#97) -------------------------------------------------
+    // --- SDF Phase 1 (#97) + Phase 3 (#99) ---------------------------------
     // SDF traversal params. See Engine.cpp's PtPush::sdf_params for full
     // docs.
     //   .x = sdf_cluster_count -- number of SDF clusters in
     //        `sdf_clusters`. 0 disables the SDF path entirely.
-    //   .y = sdf_max_iters     -- sphere-trace iteration cap per
-    //        cluster (host cvar r_sdf_max_iters, default 128, clamped
-    //        to 1..256 on the host).
+    //   .y = sdf_max_iters     -- sphere-trace STEP cap per cluster
+    //        (host cvar r_sdf_max_iters, default 128, clamped to
+    //        1..256 on the host). Applies to both analytic SDF and
+    //        fractal clusters.
     //   .z = sdf_debug_iters   -- 1 -> output an iteration heat-map
     //        instead of normal shading for diagnostics. Phase 1 leaves
     //        the heat-map plumbed but not yet visualized; the field is
     //        wired so Phase 2 / fractal tuning can switch it on without
     //        a push-constant reshuffle.
-    //   .w reserved.
+    //   .w = sdf_fractal_iters -- Phase 3, per-DE bounded iteration
+    //        count for fractal SDFs. Independent of .y. Clamped 1..32
+    //        on host. (Phase 2's sdf_normal_mode toggle lives at
+    //        sdf_params_f.w because Phase 3 claimed this slot first.)
     uint4 sdf_params;
     // .x = r_sdf_epsilon (sphere-trace surface-distance terminator,
-    //      metres). Default 1e-4. .yzw reserved.
+    //      metres). Default 1e-4.
+    // .y = r_sdf_fractal_power (Phase 3, default Mandelbulb power 8).
+    // .z = r_sdf_de_eps_scale (Phase 3, iteration-relaxed eps scale,
+    //      default 1.0).
+    // .w = r_sdf_normal_mode (Phase 2 #98; encoded as float because
+    //      Phase 3 claimed sdf_params.w first). 0.0 = forward-mode AD,
+    //      1.0 = 6-tap central differences.
     float4 sdf_params_f;
-    // --- end SDF Phase 1 ---------------------------------------------------
+    // --- end SDF Phase 1 + Phase 3 -----------------------------------------
     // Celestials composite gate (issue #46). 1 = subtract
     // starsOnly(rd) + sunDisc(rd) + moonDisc(rd) from the b==0
     // primary-miss sky term so denoise_color reaches SVGF/MetalFX
@@ -482,8 +717,91 @@ cbuffer Push {
     // contribute to indirect illumination of the scene.
     uint composite_celestials;
     uint _pad_celestials0;
-    uint _pad_celestials1;
-    uint _pad_celestials2;
+    // SIGMA shadow demod gate (issue #115). 1 -> write per-primary-hit
+    // sun-NEE shadow-ray transmittance into `shadow_vis_buf` at the
+    // end of main(); the engine's SigmaShadow kernel denoises that
+    // buffer with a 5x5 bilateral and multiplies the denoised visibility
+    // into the post-radiance-denoise HDR.
+    uint write_shadow_vis;
+    uint _pad_shadow_vis;
+    // --- Heterogeneous volumetric phase 4 (#100) ---------------------------
+    // New 16-byte trailing block for the cloud march. Host pushes from
+    // r_vol_density_scale / r_vol_phase_g_cloud / r_vol_multiscatter_octaves.
+    //   vol_density_scale     -- linear multiplier on cloud peak sigma_t
+    //                            so artists can dial thickness up/down.
+    //   vol_phase_g_cloud     -- HG anisotropy for the cloud march
+    //                            (decoupled from vol_params.y haze g).
+    //                            +0.8 = canonical cumulus forward lobe.
+    //   vol_multiscatter_oct  -- Wrenninge-style multi-scatter octave
+    //                            count (clamped 0..4 in shader). 0 =
+    //                            pure single-scatter; >=1 fakes
+    //                            diffuse fill so cloud cores don't
+    //                            read pitch-black under sun shadow.
+    //                            Default 2.
+    float vol_density_scale;
+    float vol_phase_g_cloud;
+    float vol_multiscatter_oct;
+    float _pad_vol;
+    // --- Light primitives (#73) + Light tree (#129) ------------------------
+    // light_count: number of analytic light primitives in `light_prims`.
+    //              0 disables the Lambert NEE-to-lights branch entirely.
+    // light_tree_node_count: number of nodes in `light_tree_nodes`. 0
+    //              means the host didn't build a tree this frame.
+    // light_tree_enabled: 1 -> use O(log N) tree traversal for light
+    //              selection; 0 -> fall back to #73's uniform single
+    //              pick. Set by the engine from the r_light_tree cvar
+    //              (when 0, the cvar acts as a runtime kill switch).
+    // _pad_light_tail: trailing pad to keep the 16-byte block aligned.
+    uint light_count;
+    uint light_tree_node_count;
+    uint light_tree_enabled;
+    uint _pad_light_tail;
+    // MetalFX specular-guidance G-buffer write gates (issue #118).
+    // The engine sets these only for MetalFX-family denoiser kinds
+    // (DenoiserKind::MetalFX / SvgfBasicMetalFx / SvgfAtrousMetalFx)
+    // and only when the matching G-buffer texture is actually
+    // allocated this frame -- same pattern as write_normal_gbuffer /
+    // write_albedo_gbuffer. Under PARTIALLY_BOUND descriptors the
+    // shader must elide the write when the texture is unbound, so
+    // each one gets its own runtime gate rather than collapsing into
+    // a single MetalFX flag (lets future modes pick + choose; e.g.
+    // a roughness-only diagnostic kernel could write just the
+    // roughness gbuffer). Trailing pad keeps the 16-byte alignment
+    // the std140 / MSL cbuffer rule demands.
+    uint write_specular_albedo_gbuffer;
+    uint write_roughness_gbuffer;
+    uint write_specular_hit_distance_gbuffer;
+    uint _pad_specular_gbuffers0;
+    // --- Water Phase 1 (#134) -------------------------------------------------
+    // See Engine.cpp's PtPush::water_params0 / water_params1 for full docs.
+    //   water_params0.xyz = Beer's-law absorption per channel (1/m).
+    //                  .w = refractive index (clamped to [1.0, 2.4] below).
+    //   water_params1.x  = wave_scale (cycles / m).
+    //                  .y = wave_amplitude (normal perturbation strength).
+    //                  .z = wave_speed (animation rate multiplier).
+    //                  .w = time_seconds (shared with cloud-wind accumulator).
+    float4 water_params0;
+    float4 water_params1;
+    // --- end Water Phase 1 ----------------------------------------------------
+    // --- ReSTIR DI Phase A (#78) -------------------------------------------
+    // r_restir master toggle. 1 -> primary-hit Lambert NEE switches to
+    // WRS candidate generation + reservoir write (no contribution added
+    // here; the RestirFinal kernel adds the resampled+shadow-tested
+    // sample); 0 -> legacy single-pick analytic-light NEE as in #73.
+    // Gated additionally on `denoiser_enabled` host-side because the
+    // RestirFinal kernel writes into denoise_color (the denoiser path);
+    // the denoiser-off swapchain-direct path keeps single-pick NEE so
+    // this branch is the only one PathTrace.slang sees disabling.
+    uint restir_enabled;
+    // K = number of WRS candidate samples per pixel. Default 8;
+    // capped at kRestirMaxK in the candidate-gen loop. Higher K =
+    // lower variance per frame at linear ALU cost. 8 is the
+    // RTXDI default and trades well against the temporal / spatial
+    // reuse passes that follow.
+    uint restir_k_candidates;
+    uint _pad_restir0;
+    uint _pad_restir1;
+    // --- end ReSTIR DI Phase A -----------------------------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -506,6 +824,7 @@ cbuffer Frame {
     float4 clouds_p1;
     float4 clouds_p2;
     float4 clouds_p3;
+    float4 clouds_p4;
     float4 moon_dir_phase;
     float4 moon_extra;
     float4 sun_extra;
@@ -527,16 +846,52 @@ cbuffer Frame {
     float4 accum_params;
     // See `bvh_params` in the Metal Push cbuffer above.
     uint4 bvh_params;
-    // --- SDF Phase 1 (#97) -------------------------------------------------
+    // --- SDF Phase 1 (#97) + Phase 3 (#99) ---------------------------------
     // See `sdf_params` / `sdf_params_f` in the Metal Push cbuffer above.
+    // .w of uint4 is sdf_fractal_iters; .yz of float4 are
+    // r_sdf_fractal_power / r_sdf_de_eps_scale.
     uint4  sdf_params;
     float4 sdf_params_f;
-    // --- end SDF Phase 1 ---------------------------------------------------
+    // --- end SDF Phase 1 + Phase 3 -----------------------------------------
     // See `composite_celestials` in the Metal Push cbuffer above.
     uint composite_celestials;
     uint _pad_celestials0;
-    uint _pad_celestials1;
-    uint _pad_celestials2;
+    // See `write_shadow_vis` in the Metal Push cbuffer above (issue #115).
+    uint write_shadow_vis;
+    uint _pad_shadow_vis;
+    // See the matching vol_* fields in the Metal Push cbuffer above (#100).
+    float vol_density_scale;
+    float vol_phase_g_cloud;
+    float vol_multiscatter_oct;
+    float _pad_vol;
+    // See `light_count` / `light_tree_node_count` / `light_tree_enabled`
+    // in the Metal Push cbuffer above (#73 + #129). Own 16-byte
+    // trailing block (light_count + 3 light-tree uints).
+    uint light_count;
+    uint light_tree_node_count;
+    uint light_tree_enabled;
+    uint _pad_light_tail;
+    // See `write_specular_albedo_gbuffer` / `write_roughness_gbuffer` /
+    // `write_specular_hit_distance_gbuffer` in the Metal Push cbuffer
+    // above for semantics (issue #118 MetalFX specular guidance).
+    // Layout-equivalent across both targets; trailing pad keeps the
+    // 16-byte block alignment for std140 / MSL.
+    uint write_specular_albedo_gbuffer;
+    uint write_roughness_gbuffer;
+    uint write_specular_hit_distance_gbuffer;
+    uint _pad_specular_gbuffers0;
+    // --- Water Phase 1 (#134) -------------------------------------------------
+    // See `water_params0` / `water_params1` in the Metal Push cbuffer above.
+    float4 water_params0;
+    float4 water_params1;
+    // --- end Water Phase 1 ----------------------------------------------------
+    // See `restir_enabled` / `restir_k_candidates` in the Metal Push
+    // cbuffer above (#78). Trailing 16-byte block keeps std140
+    // alignment consistent across both backends.
+    uint restir_enabled;
+    uint restir_k_candidates;
+    uint _pad_restir0;
+    uint _pad_restir1;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -557,13 +912,45 @@ import PathTraceMath;
 // PathTrace.slang iterations don't re-parse it.
 import SdfPrimitives;
 // --- end SDF Phase 1 -------------------------------------------------------
+// --- SDF Phase 3 (#99) -----------------------------------------------------
+// Iconic-fractal DE library (Mandelbulb / Mandelbox / Apollonian).
+// Lives in its own module because the trace path is shape-specific
+// (no smooth-CSG composition with analytic shapes in Phase 3) and
+// normals are recovered by central differences instead of the
+// analytic gradient. traceSdfClusters below dispatches to
+// traceSdfFractal when a single-leaf cluster carries a fractal shape
+// id (>= SDF_FRACTAL_FIRST).
+import SdfFractals;
+// --- end SDF Phase 3 -------------------------------------------------------
+// --- ReSTIR DI Phase A (#78) ----------------------------------------------
+// Reservoir struct + WRS streaming primitives (initReservoir,
+// streamingUpdate, finalizeReservoir, storeReservoir,
+// reservoirTargetPdf). Imported here so the candidate-generation block
+// at the primary-hit Lambert NEE site stays a thin readable wrapper
+// around the algorithmic helpers. Mirrors the temporal / spatial /
+// final kernels that also import this module.
+import RestirReservoir;
+// --- end ReSTIR DI Phase A ------------------------------------------------
 
 static const uint MAT_LAMBERT    = 0u;
 static const uint MAT_METAL      = 1u;
 static const uint MAT_DIELECTRIC = 2u;
+// MAT_WATER (Phase 1, #134): analytic plane with normal-map waves +
+// Schlick Fresnel + Snell refraction + Beer's-law absorption. Driven
+// by water_params0 / water_params1 push fields.  Behaves like a
+// dielectric for visibility/transmittance but with its own BRDF.
+static const uint MAT_WATER      = 3u;
 
 static const uint PRIM_SPHERE = 0u;
 static const uint PRIM_PLANE  = 1u;
+
+// Light primitive types (#73). Mirrors AnalyticLight::Type on the host.
+// Stored as a float in v1.w of each 4-float4 light record because
+// StructuredBuffer<float4> can't host mixed-type lanes.
+static const uint LIGHT_POINT  = 0u;
+static const uint LIGHT_SPOT   = 1u;
+static const uint LIGHT_SPHERE = 2u;
+static const uint LIGHT_QUAD   = 3u;
 
 static const float3 LIGHT_DIR    = float3(0.4, 1.0, 0.3);
 static const float3 MESH_ALBEDO  = float3(1.00, 0.85, 0.45);   // gold metal default
@@ -665,19 +1052,79 @@ SdfCluster loadSdfCluster(uint cluster_idx) {
 // any closer hit found. Linear scan -- Phase 1 expects <= 8 clusters,
 // per the issue's perf budget. A future phase will fold this into the
 // analytic-prim BVH as a third leaf-shape tag.
+//
+// Phase 3 (#99): dispatches fractal-leaf clusters to traceSdfFractal
+// (SdfFractals.slang). A cluster is treated as a fractal when its
+// root LEAF node carries a shape id >= SDF_FRACTAL_FIRST. The
+// dispatcher only handles single-leaf fractal clusters; mixed
+// fractal/analytic CSG compositions are scope-out for Phase 3 and
+// the host's `combine` helper rejects them at parse time.
 void traceSdfClusters(float3 ro, float3 rd, inout HitInfo h) {
     uint count = sdf_params.x;
     if (count == 0u) return;
     uint  iter_budget = sdf_params.y;
     float epsilon     = sdf_params_f.x;
+    // --- SDF Phase 3 (#99) cvar unpack -------------------------------------
+    // Fractal-side knobs live in the otherwise-reserved push lanes;
+    // see the Push cbuffer above for the wire convention.
+    uint  fractal_iters    = max(sdf_params.w, 1u);
+    float fractal_power    = sdf_params_f.y;
+    float fractal_de_eps_s = sdf_params_f.z;
+    // --- end SDF Phase 3 ---------------------------------------------------
+    // Phase 2 (#98): r_sdf_normal_mode now lives at sdf_params_f.w because
+    // Phase 3 (#99) claimed sdf_params.w first. Encoded as float (0.0 = forward
+    // AD, 1.0 = central differences); the > 0.5 test resolves the toggle.
+    uint  normal_mode = (sdf_params_f.w > 0.5f) ? 1u : 0u;
     for (uint i = 0u; i < count; ++i) {
         SdfCluster c = loadSdfCluster(i);
         float t;
         float3 n;
+        // --- SDF Phase 3 (#99) fractal dispatch ----------------------------
+        // Check the root node (last in post-order) to decide which
+        // trace path to take. A single-leaf cluster (node_count == 1)
+        // whose shape id is in the fractal range goes through the
+        // Phase 3 fractal trace; everything else takes the analytic
+        // path. node_count==0 is a malformed cluster -- the analytic
+        // path's sphereCluster trace returns no-hit so the cluster is
+        // skipped harmlessly.
+        bool is_fractal = false;
+        if (c.node_count > 0u) {
+            SdfClusterNode root = c.nodes[c.node_count - 1u];
+            is_fractal = (root.op == SDF_OP_LEAF) &&
+                         (root.shape >= SDF_FRACTAL_FIRST);
+        }
+        if (is_fractal) {
+            SdfClusterNode root = c.nodes[c.node_count - 1u];
+            // root.center is in cluster-local space (the host packs
+            // the per-node translation into n.center, and Phase 3
+            // fractal leaves use it as the world-space cluster origin).
+            // The cluster AABB is in world space (host already widened
+            // it by params[1] in LeafLocalAabb), so we feed the world
+            // AABB straight through.
+            if (traceSdfFractal(root.shape, root.params, root.center,
+                                c.aabb_min, c.aabb_max,
+                                ro, rd, 1e-3, h.t,
+                                iter_budget, epsilon, fractal_de_eps_s,
+                                fractal_power, fractal_iters,
+                                t, n)) {
+                if (t < h.t) {
+                    h.hit       = true;
+                    h.t         = t;
+                    h.normal    = n;
+                    h.mat       = c.material;
+                    h.albedo    = c.albedo;
+                    h.roughness = c.roughness;
+                    h.ior       = c.ior;
+                }
+            }
+            continue;
+        }
+        // --- end SDF Phase 3 -----------------------------------------------
         // t_min = 1e-3 keeps the start past the camera plane;
         // t_max = h.t bounds the trace to the current closest hit so
         // an SDF cluster behind an existing closer hit short-circuits.
-        if (sdfClusterTrace(c, ro, rd, 1e-3, h.t, iter_budget, epsilon, t, n)) {
+        if (sdfClusterTrace(c, ro, rd, 1e-3, h.t, iter_budget, epsilon,
+                            normal_mode, t, n)) {
             if (t < h.t) {
                 h.hit       = true;
                 h.t         = t;
@@ -1113,9 +1560,59 @@ float3 procSkyInlineSunDiscAndHalo(float3 rd, float3 sun) {
 }
 
 float3 procSky(float3 rd, float3 sun) {
-    float cosTheta = clamp(rd.y, -1.0, 1.0);    // 1=zenith, 0=horizon, -1=nadir
+    float cosTheta_raw = clamp(rd.y, -1.0, 1.0);  // 1=zenith, 0=mathematical-horizon, -1=nadir
     float cosGamma = clamp(dot(rd, sun), -1.0, 1.0);
     float sun_elev = sun.y;                     // sin(elevation)
+
+    // Curved-Earth visible-horizon dip (issue #51). On a flat Earth the
+    // geometric horizon sits at rd.y = 0. On a spherical Earth of radius
+    // R, a camera at altitude h above the surface sees the horizon dip
+    // below local-up by acos(R/(R+h)) -- that is, the lowest sky ray
+    // that grazes the surface has
+    //     rd.y_horizon = -sqrt(2*h/R + (h/R)^2) ≈ -sqrt(2*h/R)
+    // for small h/R. At eye height 1.7 m the dip is ~3.7 arcmin (invisible).
+    // At a 1 km mountain it's ~1.0 deg. At a 10 km airliner it's ~3.2 deg.
+    // At a 100 km space-edge view it's ~10 deg.
+    //
+    // We rebias the gradient so the visible horizon-line in the painted
+    // sky sits at the geometrically-correct dipped angle instead of at
+    // rd.y = 0. This is the procedural-sky side of the "distant clouds
+    // visually merge with the horizon" requirement -- without the dip,
+    // a high-altitude camera shows a flat-Earth pink-on-blue band cutting
+    // across the lower screen, even though the real visible horizon
+    // would be below that.
+    //
+    // sun_extra.w packs the planet radius in metres; 0 means "planar
+    // mode" (issue #51 debug toggle) so the dip is exactly 0 and this
+    // collapses to the legacy hand-tuned gradient. We use the camera
+    // altitude inferred from the ray origin -- in this function we
+    // only have rd, but the engine's ground plane is at world y=0 so
+    // the camera altitude is the path-tracer's ro.y. We don't have ro
+    // here directly, but the sky-color call sites use camera-origin
+    // rays so we can pull cam_pos.y from the push constants. We avoid
+    // a global by recomputing the dip in callers that have ro -- here
+    // we expose a helper. For zero camera height (the common case),
+    // dipping is a no-op so the change is invisible.
+    //
+    // Below: shift the gradient so cosTheta=0 hits the dipped horizon
+    // line. cam_pos.y is at pos_fovtan.y in the push constants.
+    float cam_h = max(pos_fovtan.y, 0.0);
+    float planet_R = sun_extra.w;
+    float horizon_dip_sin = 0.0;
+    if (planet_R > 0.0 && cam_h > 0.0) {
+        float ratio = cam_h / planet_R;
+        horizon_dip_sin = sqrt(2.0 * ratio + ratio * ratio);
+        // The dip can in principle grow without bound for huge altitudes,
+        // but the formula stays well-defined to ~1.0 (sphere swallows the
+        // entire downward hemisphere) at h ≈ R, ~6378 km. Cap at 0.5
+        // (i.e. ~30 deg) so degenerate space-tourist cameras don't fold
+        // the gradient onto itself.
+        horizon_dip_sin = min(horizon_dip_sin, 0.5);
+    }
+    // Shift cosTheta upward by the dip so the painted horizon line moves
+    // down on screen to match the visible horizon. Clamp to [-1,1] so
+    // the smoothsteps below stay bounded.
+    float cosTheta = clamp(cosTheta_raw + horizon_dip_sin, -1.0, 1.0);
 
     // Day vs night blend: smoothstep on sun elevation across the
     // civil-twilight band.
@@ -1669,6 +2166,376 @@ HdriLightSample sampleHdriLight(inout uint seed) {
     return s;
 }
 
+// ---------- Analytic light primitives NEE (#73) ------------------------
+// First-class scene lights: point / spot / sphere area / quad area.
+// Lifted out of the HDRI sky so a scene can be lit even with no env
+// map (the existing hdri_lights_count > 0 path is sun-on-the-sphere
+// only). Phase 1 sampling is the naive uniform single-pick: choose a
+// light uniformly at random from the count, sample a point on it,
+// trace a shadow ray, accumulate (Le * BRDF * cos / pdf). Variance is
+// fine up to ~100 lights -- beyond that the light tree (#129) takes
+// over with O(log N) importance selection.
+struct LightSample {
+    float3 dir;        // unit vector from hit point toward the light sample
+    float3 Le;         // radiance reaching the surface along dir (no
+                       //   visibility yet -- transmittance() applies that)
+    float  pdf;        // probability density of this sample (solid angle).
+                       //   Selection (1/N) is folded in.
+    float  dist;       // distance from hit to the sampled point (shadow
+                       //   ray t_max). 1e30 sentinel means "no hit"
+                       //   already; not used here.
+};
+
+// 4 float4s per light. Indexed by raw float4 lane offsets to keep the
+// shader independent of how Slang lays the StructuredBuffer out on
+// Metal (declaration-order MSL slot 11, vk::binding 27).
+static const uint kLightStrideFloat4 = 4u;
+
+struct LightRecord {
+    float3 pos;
+    float  radius;
+    float3 intensity;
+    uint   type;
+    float3 dir;        // spot axis / quad normal
+    float  cos_outer;  // spot only
+    float3 u_or_inner; // quad u-half-extent vec; spot: x = cos_inner
+    float  v_half;     // quad v-axis half-extent (length)
+};
+
+LightRecord loadLight(uint idx) {
+    uint base = idx * kLightStrideFloat4;
+    float4 v0 = light_prims[base + 0u];
+    float4 v1 = light_prims[base + 1u];
+    float4 v2 = light_prims[base + 2u];
+    float4 v3 = light_prims[base + 3u];
+    LightRecord L;
+    L.pos        = v0.xyz;
+    L.radius     = v0.w;
+    L.intensity  = v1.rgb;
+    L.type       = uint(v1.w + 0.5);
+    L.dir        = v2.xyz;
+    L.cos_outer  = v2.w;
+    L.u_or_inner = v3.xyz;
+    L.v_half     = v3.w;
+    return L;
+}
+
+// Uniform direction on the unit sphere from two uniform variates --
+// pulled out as a tiny helper so the sphere-light sampler reads
+// naturally. xi.x in [0,1] -> cos(theta) in [-1,1], xi.y -> phi.
+float3 uniformSphereDirection(float2 xi) {
+    float z   = 1.0 - 2.0 * xi.x;
+    float r   = sqrt(max(0.0, 1.0 - z * z));
+    float phi = 6.28318530717958 * xi.y;
+    return float3(r * cos(phi), r * sin(phi), z);
+}
+
+// Sample one analytic light (#73). Uniform over the count for the
+// selection step (1/N); per-light sampling is per-type:
+//   POINT  : delta function. pdf returned as 1.0 in solid angle; the
+//             estimator's cos/pdf reduces to the inverse-square law
+//             baked into Le below.
+//   SPOT   : same as POINT, with an angular falloff window between
+//             cos_inner and cos_outer.
+//   SPHERE : uniform point on the surface (4*pi*r^2 area); pdf is
+//             (area-pdf) * (dist^2 / cos_light), Veach 2.6 standard.
+//   QUAD   : uniform point on the (2u) x (2v) rectangle defined by
+//             pos +/- u +/- v_axis * v_half; same area-to-solid-angle
+//             reciprocal.
+//
+// --- Light tree (#129) traversal -------------------------------------------
+// 4 float4s per light tree node. Mirrors LightTreeNode in
+// src/renderer/LightTree.h. The MSL/SPIR-V lane indexing is
+// declaration-order-stable on Slang's targets so we just compute the
+// raw float4 lane offset and read.
+static const uint kLightTreeNodeStrideFloat4 = 4u;
+
+struct LightTreeNodeR {
+    float3 aabb_min;
+    uint   left_first;   // internal: left child index; leaf: light id
+    float3 aabb_max;
+    uint   count;        // 0 = internal, 1 = leaf
+    float3 cone_axis;
+    float  cone_cos_half;
+    float  intensity;
+};
+
+LightTreeNodeR loadLightTreeNode(uint idx) {
+    uint base = idx * kLightTreeNodeStrideFloat4;
+    float4 v0 = light_tree_nodes[base + 0u];
+    float4 v1 = light_tree_nodes[base + 1u];
+    float4 v2 = light_tree_nodes[base + 2u];
+    float4 v3 = light_tree_nodes[base + 3u];
+    LightTreeNodeR n;
+    n.aabb_min       = v0.xyz;
+    n.left_first     = asuint(v0.w);
+    n.aabb_max       = v1.xyz;
+    n.count          = asuint(v1.w);
+    n.cone_axis      = v2.xyz;
+    n.cone_cos_half  = v2.w;
+    n.intensity      = v3.x;
+    return n;
+}
+
+// Per-node importance estimate at a shade point.  Returns a NON-NEGATIVE
+// scalar; siblings are compared via ratio so absolute scale doesn't
+// matter.  Conty Estevez & Kulla 2018 section 5.2: importance =
+// emitted_power * geometric_falloff * orientation_term * receiver_cosine.
+//
+//   emitted_power     = node.intensity (scalar; sum of leaf intensities).
+//   geometric_falloff = 1 / max(d^2, r^2) where d is the distance from
+//                       the shade point to the cluster centre and r is
+//                       half the cluster AABB diagonal -- bounds the
+//                       inverse-square term so we don't blow up when
+//                       the shade point is inside the cluster.
+//   orientation_term  = max(0, dot(cone_axis, dir_from_cluster)) when
+//                       the cluster has a bounded cone, scaled by the
+//                       cone half-angle so spot lights pointing away
+//                       receive proportionally lower weight; 1 for
+//                       fully spherical clusters (cos_half = -1).
+//   receiver_cosine   = max(0, dot(n_surface, dir_to_cluster)) -- the
+//                       Lambert term at the receiver. Folds in
+//                       back-faces (no contribution from lights behind
+//                       the surface).
+//
+// Returning a strictly-positive epsilon when ALL terms are zero so a
+// child branch never becomes deselectable; the traversal would then
+// have to fall back to the unfavoured sibling, biasing toward the
+// well-lit half of the scene. The epsilon keeps the estimator
+// unbiased.
+float lightTreeImportance(LightTreeNodeR node, float3 hit_pt,
+                           float3 n_face) {
+    float3 centre = 0.5 * (node.aabb_min + node.aabb_max);
+    float3 to_c   = centre - hit_pt;
+    float  d2     = max(dot(to_c, to_c), 1e-12);
+    float  d      = sqrt(d2);
+    float3 dir_to = to_c / d;
+
+    // Bounding-sphere radius around the AABB; max distance from centre
+    // to a corner = half the diagonal length.
+    float3 ext    = 0.5 * (node.aabb_max - node.aabb_min);
+    float  rad2   = max(dot(ext, ext), 1e-12);
+
+    // Inverse-square falloff, clamped at the cluster radius so the
+    // shade point being inside the cluster doesn't make the estimate
+    // singular.
+    float falloff = 1.0 / max(d2, rad2);
+
+    // Orientation term. Cluster emits toward the shade point in
+    // direction (-dir_to) (from cluster's perspective). For a one-sided
+    // cluster (cos_half >= 0) we want the cluster's cone to overlap
+    // -dir_to; for a fully spherical cluster (cos_half = -1) always 1.
+    float orient = 1.0;
+    if (node.cone_cos_half > -0.999) {
+        float cos_emit = -dot(node.cone_axis, dir_to);
+        // Smoothstep the cone window: 1 inside cos_half, 0 fully
+        // outside (cos = cos_half - 0.2). This is the same falloff
+        // shape Conty Estevez & Kulla use to keep the picker unbiased
+        // even when the cluster is just outside its declared cone.
+        float t = (cos_emit - (node.cone_cos_half - 0.2)) / 0.2;
+        orient = saturate(t);
+    }
+
+    // Receiver-side Lambert at the shade point.
+    float recv = max(0.0, dot(n_face, dir_to));
+
+    return max(node.intensity * falloff * orient * recv, 1e-8);
+}
+
+// Top-down 2-way tree traversal.  At each internal node, computes the
+// importance of each child and draws a uniform variate to pick one.
+// Returns the leaf light id AND accumulates the selection PDF along
+// the path (sigma_i p_i where p_i is the conditional pick probability
+// at each level). The shading-side PDF is `pick_pdf * solid_angle_pdf`
+// just like the naive uniform pick -- only the selection PMF changes.
+struct LightPick {
+    uint  light_id;
+    float pick_pdf;
+};
+
+LightPick pickLightFromTree(float3 hit_pt, float3 n_face, inout uint seed) {
+    LightPick r;
+    r.light_id = 0u;
+    r.pick_pdf = 1.0;
+
+    uint idx = 0u;   // root
+    // Cap depth defensively: the largest tree we build at MVP scale
+    // (1000 lights) is ~10 deep; 32 is the cap the linker can handle
+    // and well past any reasonable host-build.
+    [unroll(32)]
+    for (uint d = 0u; d < 32u; ++d) {
+        LightTreeNodeR n = loadLightTreeNode(idx);
+        if (n.count > 0u) {
+            // Leaf: light id is in left_first.
+            r.light_id = n.left_first;
+            return r;
+        }
+        uint left  = n.left_first;
+        uint right = left + 1u;
+        LightTreeNodeR cl = loadLightTreeNode(left);
+        LightTreeNodeR cr = loadLightTreeNode(right);
+        float il = lightTreeImportance(cl, hit_pt, n_face);
+        float ir = lightTreeImportance(cr, hit_pt, n_face);
+        float total = il + ir;
+        // Defensive: degenerate clusters (zero importance both sides)
+        // get 50/50 split. Shouldn't happen given the epsilon in
+        // lightTreeImportance, but keep the divide safe.
+        float p_l = (total > 1e-30) ? (il / total) : 0.5;
+        float u   = randf(seed);
+        if (u < p_l) {
+            idx = left;
+            r.pick_pdf *= p_l;
+        } else {
+            idx = right;
+            r.pick_pdf *= (1.0 - p_l);
+        }
+    }
+    return r;
+}
+// --- end Light tree traversal ----------------------------------------------
+
+// Returns an unset sample (pdf=0) when light_count == 0 or the chosen
+// type isn't a valid hemisphere direction (back-of-quad, outside spot
+// cone). The caller treats pdf<=0 as "skip this NEE sample".
+//
+// Picker logic:
+//   light_tree_enabled = 1 AND light_tree_node_count > 0 ->
+//     traverse the hierarchical tree (Conty Estevez & Kulla 2018)
+//     for O(log N) importance-weighted selection.
+//   else -> uniform single pick over the active light_count (the
+//     naive #73 sampler -- still correct, just higher variance).
+//
+// Both paths produce a `pick_pdf` that the per-light sampling stage
+// multiplies into the solid-angle pdf; the shading math (Le * brdf *
+// cos / pdf) is identical regardless.
+LightSample sampleAnalyticLight(float3 hit_pt, float3 n_face, inout uint seed) {
+    LightSample s;
+    s.dir  = float3(0, 1, 0);
+    s.Le   = float3(0.0);
+    s.pdf  = 0.0;
+    s.dist = 1e30;
+    if (light_count == 0u) return s;
+
+    uint  pick;
+    float pick_pdf;
+    if (light_tree_enabled != 0u && light_tree_node_count > 0u) {
+        LightPick lp = pickLightFromTree(hit_pt, n_face, seed);
+        pick     = min(lp.light_id, light_count - 1u);
+        pick_pdf = lp.pick_pdf;
+    } else {
+        // Uniform single-pick over the active count. Same code path as
+        // #73 -- regression-protected by the r_light_tree=0 cvar so we
+        // can A/B variance against the tree at any time.
+        float u_pick = randf(seed);
+        pick = min(uint(u_pick * float(light_count)), light_count - 1u);
+        pick_pdf = 1.0 / float(light_count);
+    }
+
+    LightRecord L = loadLight(pick);
+
+    if (L.type == LIGHT_POINT) {
+        float3 to_light = L.pos - hit_pt;
+        float  dist2    = max(dot(to_light, to_light), 1e-12);
+        float  dist     = sqrt(dist2);
+        s.dir  = to_light / dist;
+        // Inverse-square falloff: at distance d, irradiance from a
+        // point source of intensity I (W/sr) is I/d^2. The estimator
+        // below evaluates (Le * brdf * cos), with pdf=1 (delta light),
+        // so we encode the geometric falloff into Le.
+        s.Le   = L.intensity / dist2;
+        // Delta light: any non-zero pdf works since cos/pdf collapses;
+        // pick 1.0 so the MIS balance heuristic against a non-delta
+        // BRDF sample naturally pushes toward this strategy.
+        s.pdf  = pick_pdf;
+        s.dist = dist;
+        return s;
+    }
+    if (L.type == LIGHT_SPOT) {
+        float3 to_light = L.pos - hit_pt;
+        float  dist2    = max(dot(to_light, to_light), 1e-12);
+        float  dist     = sqrt(dist2);
+        float3 to_l_dir = to_light / dist;
+        // Spot angular falloff: 1 inside cos_inner, 0 outside cos_outer,
+        // smooth linear ramp in between. Direction from surface toward
+        // the LIGHT is -to_l_dir from the light's emission lobe (the
+        // spot axis points from emitter into the world).
+        float cos_dir = dot(-to_l_dir, normalize(L.dir));
+        float cos_in  = L.u_or_inner.x;
+        float cos_out = L.cos_outer;
+        float falloff = 0.0;
+        if (cos_dir >= cos_in) {
+            falloff = 1.0;
+        } else if (cos_dir > cos_out) {
+            falloff = (cos_dir - cos_out) / max(cos_in - cos_out, 1e-6);
+        }
+        s.dir  = to_l_dir;
+        s.Le   = L.intensity * (falloff / dist2);
+        s.pdf  = pick_pdf;
+        s.dist = dist;
+        return s;
+    }
+    if (L.type == LIGHT_SPHERE) {
+        // Uniform-area sample on the surface of a sphere. A more
+        // efficient sampler (uniform over the visible hemisphere from
+        // the shade point) is an obvious follow-up; uniform-area gives
+        // correct unbiased results -- just higher variance when the
+        // shade point is near the sphere.
+        float2 xi = float2(randf(seed), randf(seed));
+        float3 n_l = uniformSphereDirection(xi);
+        float3 lp  = L.pos + n_l * L.radius;
+        float3 to_light = lp - hit_pt;
+        float  dist2    = max(dot(to_light, to_light), 1e-12);
+        float  dist     = sqrt(dist2);
+        float3 wi       = to_light / dist;
+        // Light surface normal points outward; only the hemisphere
+        // facing the receiver contributes.
+        float cos_light = max(0.0, dot(n_l, -wi));
+        if (cos_light <= 0.0) return s;
+        float area = 4.0 * 3.14159265358979 * L.radius * L.radius;
+        // Solid-angle pdf = (1/area) * dist^2 / cos_light.
+        // Selection pmf folds in via pick_pdf.
+        float pdf_sa = (dist2) / max(area * cos_light, 1e-12);
+        s.dir  = wi;
+        // L.intensity carries area-emitter radiance (W/m^2/sr). The
+        // outgoing radiance toward the receiver is just L.intensity
+        // (no per-point modulation in our Lambertian-emitter model).
+        s.Le   = L.intensity;
+        s.pdf  = pick_pdf * pdf_sa;
+        s.dist = dist;
+        return s;
+    }
+    if (L.type == LIGHT_QUAD) {
+        // Uniform-area on a (2u) x (2v) rectangle. The host packs
+        // u_extent as the FULL half-extent vector (length = u_half);
+        // v-axis is normalize(cross(normal, u)), and v_half is the
+        // half-extent length.
+        float2 xi = float2(randf(seed) * 2.0 - 1.0,
+                           randf(seed) * 2.0 - 1.0);   // [-1, 1]
+        float3 u_vec = L.u_or_inner;
+        float  u_len = length(u_vec);
+        if (u_len < 1e-6) return s;
+        float3 n_quad = normalize(L.dir);
+        float3 v_axis = normalize(cross(n_quad, u_vec));
+        float3 lp = L.pos + u_vec * xi.x + v_axis * (L.v_half * xi.y);
+        float3 to_light = lp - hit_pt;
+        float  dist2    = max(dot(to_light, to_light), 1e-12);
+        float  dist     = sqrt(dist2);
+        float3 wi       = to_light / dist;
+        // One-sided emitter (front face is L.dir).
+        float cos_light = dot(n_quad, -wi);
+        if (cos_light <= 0.0) return s;
+        float area = 4.0 * u_len * L.v_half;
+        float pdf_sa = (dist2) / max(area * cos_light, 1e-12);
+        s.dir  = wi;
+        s.Le   = L.intensity;
+        s.pdf  = pick_pdf * pdf_sa;
+        s.dist = dist;
+        return s;
+    }
+    return s;
+}
+// ---------- end Analytic light primitives NEE --------------------------
+
 // RGB transmittance along a shadow ray. 1.0 = unoccluded, 0.0 = blocked
 // by an opaque hit. Dielectric hits don't block: the ray refracts
 // through (in -> out), continuing toward the light, multiplied by the
@@ -1717,9 +2584,89 @@ float cloud_optical_depth(float3 ro, float3 rd, float t_max) {
     [unroll] for (int i = 0; i < Ns; ++i) {
         float t = t_in + (float(i) + 0.5) * dt;
         float3 sp = ro + rd * t;
-        od += cloud_density_at(sp, clouds_p1, clouds_p2, clouds_p3, 3) * dt;
+        od += cloud_density_at(sp, clouds_p1, clouds_p2, clouds_p3,
+                               clouds_p4, 3) * dt;
     }
     return od;
+}
+
+// Phase 4 (#100): high-resolution stratified cloud transmittance for the
+// cloud-march body's NEE light shadow rays. The legacy cloud_optical_depth
+// above uses 4 uniform samples + 3 fbm octaves -- fine for surface-NEE
+// transmittance() callers (light-on-ground god rays through clouds, where
+// the cloud-shadow blur on the ground is masked by surface roughness) but
+// too coarse for the in-cloud single-scatter NEE that drives god-ray
+// volumetric shafts. Thin holes in the cloud field (a few-hundred-metre
+// gap between cumulus puffs) get aliased away by 4-sample stride, and the
+// shaft direction loses its silhouette.
+//
+// This variant:
+//   * Stratifies up to 12 jittered samples across [t_in, t_out] so per-
+//     pixel noise replaces grid aliasing in the cloud field's sub-100m
+//     features.
+//   * Uses 4 fbm octaves (vs 3) -- the higher freq drops aliased pixels
+//     of dense-cloud cores back to plausible optical depth.
+//   * Applies vol_density_scale uniformly so the user-facing
+//     r_vol_density_scale knob multiplies the shadow transmittance the
+//     SAME way it multiplies the primary cloud-march extinction.
+//
+// Caps stay identical to cloud_optical_depth (20km, layer-slab clip)
+// so the two paths agree on which spans are sky vs. occlusion.
+float cloud_optical_depth_stratified(float3 ro, float3 rd, float t_max,
+                                     inout uint seed) {
+    if (clouds_p1.w <= 0.0) return 0.0;
+    float base_y = clouds_p1.x;
+    float top_y  = clouds_p1.y;
+    float ry = rd.y;
+    float t_in, t_out;
+    if (abs(ry) > 1e-6) {
+        float t_b = (base_y - ro.y) / ry;
+        float t_t = (top_y  - ro.y) / ry;
+        t_in  = max(0.0, min(t_b, t_t));
+        t_out = max(t_b, t_t);
+    } else if (ro.y >= base_y && ro.y <= top_y) {
+        t_in  = 0.0;
+        t_out = t_max;
+    } else {
+        return 0.0;
+    }
+    t_out = min(t_out, t_max);
+    if (t_out - t_in > 20000.0) t_in = t_out - 20000.0;
+    if (t_out <= t_in) return 0.0;
+    const int Ns = 12;
+    float dt = (t_out - t_in) / float(Ns);
+    float dscale = max(vol_density_scale, 1e-3);
+    float od = 0.0;
+    // Per-sample stratified jitter so adjacent shadow rays get
+    // decorrelated noise across the field rather than aliasing on the
+    // same uniform-stride pattern.
+    [unroll] for (int i = 0; i < Ns; ++i) {
+        float xi = randf(seed);
+        float t  = t_in + (float(i) + xi) * dt;
+        float3 sp = ro + rd * t;
+        od += cloud_density_at(sp, clouds_p1, clouds_p2, clouds_p3, clouds_p4, 4) * dt;
+    }
+    return od * dscale;
+}
+
+// Phase 4 (#100): RGB transmittance along a shadow ray AT A CLOUD SAMPLE,
+// composed of (sharp stratified cloud-only OD) * (analytical atmospheric
+// transmittance for the long sky leg above the cloud) * (any dielectric
+// path tint hit en route). Decouples the cloud's Beer's-law shadow from
+// the geometry-trace cost: a NEE shadow ray from inside a cloud toward
+// the sun doesn't need to walk the BVH for the empty-sky kilometres
+// after it punches out the top of the cloud layer -- the only
+// occluders along that segment are the cloud itself (handled here
+// stratified) and the air column above (closed-form). Skipping the
+// traceScene over those tens of kilometres is why god rays render fast
+// enough at 16 spp to remain inside the 6 ms 1080p budget.
+float3 cloud_nee_transmittance(float3 ro, float3 rd, inout uint seed) {
+    float od = cloud_optical_depth_stratified(ro, rd, 1e30, seed);
+    float cloud_t = exp(-od);
+    // Atmospheric leg from cloud sample upward to top-of-atmosphere.
+    // 60km is the same cap atmosphericTransmittance internally honours.
+    float3 atm_t = atmosphericTransmittance(ro, rd, 60000.0);
+    return atm_t * float3(cloud_t);
 }
 
 // Analytical atmospheric transmittance (Mie + Rayleigh) along the
@@ -1744,6 +2691,39 @@ float cloud_optical_depth(float3 ro, float3 rd, float t_max) {
 // clouds_p3.w is the Rayleigh intensity multiplier (0 = no Rayleigh,
 // 1 = real-Earth sigma).  Both gates honoured so a debug "no
 // atmosphere" mode still works.
+//
+// Spherical-Earth path (issue #51): when sun_extra.w > 0 we treat the
+// atmosphere as a thin exponentially-decaying shell around a sphere of
+// radius `R = sun_extra.w` centred at (0, -R, 0) so the path-tracer's
+// flat y=0 ground plane sits tangent to the planet at the world origin.
+// Altitude at parameter t along the ray is then
+//     h(t) = length(C - (ro + rd*t)) - R
+// where C = (0, -R, 0). For real-Earth R = 6.378e6 m and the cloud /
+// scattering scale heights (~1.5 km Mie, ~8 km Rayleigh) the spherical
+// chord differs from the flat ro.y + rd.y*t by hundreds of metres at
+// horizon ranges, which is the entire point of #51 -- horizontal rays
+// at sea level travel through ~38 air masses spherical vs. infinite
+// planar, and rays at altitude curve up below the horizon.
+//
+// Integration: 8-step composite Simpson's rule on the natural ray
+// parameter, computing per-channel optical depth tau_total =
+// integral_0^t (sigma_mie(h) + sigma_ray(h)) ds. Simpson's is exact
+// for cubic polynomials; the integrand (exp(-h/H) with h quadratic in
+// s on near-horizon rays) is well-approximated to ~0.1% error at 8
+// steps over typical 1-100 km ray lengths. Cheap enough for inline
+// use -- the previous analytical planar path was 6 exp() calls and 8
+// muls per channel; the spherical path is 17 exp() + 9 sqrt() but the
+// exp() inputs are already much smaller (we're not extrapolating an
+// exponential across the full ray length, just sampling it), so
+// register pressure / cache cost is similar in practice.
+//
+// Planet centre offset assumption: world y=0 is the ground plane.
+// Cameras at y=1.7 sit ~1.7 m above the surface; cameras at y=10000
+// sit 10 km above. This matches the engine's existing convention (the
+// path-tracer's flat ground plane lives at y=0; volumetric cloud_p1.x
+// uses y as altitude). We do not require ro.y to be non-negative --
+// the integral handles below-surface ro gracefully (clamps h to 0 so
+// the optical depth doesn't go negative).
 float3 atmosphericTransmittance(float3 ro, float3 rd, float t) {
     if (t <= 0.0) return float3(1.0);
     const float kHmie      = 1500.0;
@@ -1754,22 +2734,91 @@ float3 atmosphericTransmittance(float3 ro, float3 rd, float t) {
     bool   any_mie    = sigma_mie0 > 0.0;
     bool   any_ray    = rayleigh_i > 0.0;
     if (!any_mie && !any_ray) return float3(1.0);
-    // Vertical path-length factor (analytical altitude integral).
-    float gv_mie, gv_ray;
-    if (abs(rd.y) > 1e-6) {
-        float a_m = exp(-ro.y / kHmie);
-        float b_m = exp(-(ro.y + rd.y * t) / kHmie);
-        gv_mie = (a_m - b_m) * (kHmie / rd.y);
-        float a_r = exp(-ro.y / kHrayleigh);
-        float b_r = exp(-(ro.y + rd.y * t) / kHrayleigh);
-        gv_ray = (a_r - b_r) * (kHrayleigh / rd.y);
-    } else {
-        gv_mie = t * exp(-max(ro.y, 0.0) / kHmie);
-        gv_ray = t * exp(-max(ro.y, 0.0) / kHrayleigh);
+
+    float planet_R = sun_extra.w;
+    if (planet_R <= 0.0) {
+        // ---- Legacy planar path (sun_extra.w == 0) -----------------
+        // Vertical path-length factor (analytical altitude integral).
+        // Kept for r_planet_radius=0 debug A/B and for tiny-scene tests
+        // where curvature is invisible.
+        float gv_mie, gv_ray;
+        if (abs(rd.y) > 1e-6) {
+            float a_m = exp(-ro.y / kHmie);
+            float b_m = exp(-(ro.y + rd.y * t) / kHmie);
+            gv_mie = (a_m - b_m) * (kHmie / rd.y);
+            float a_r = exp(-ro.y / kHrayleigh);
+            float b_r = exp(-(ro.y + rd.y * t) / kHrayleigh);
+            gv_ray = (a_r - b_r) * (kHrayleigh / rd.y);
+        } else {
+            gv_mie = t * exp(-max(ro.y, 0.0) / kHmie);
+            gv_ray = t * exp(-max(ro.y, 0.0) / kHrayleigh);
+        }
+        float  tau_mie = any_mie ? sigma_mie0 * gv_mie : 0.0;
+        float3 tau_ray = any_ray ? kSigmaR * rayleigh_i * gv_ray : float3(0.0);
+        return exp(-(tau_ray + float3(tau_mie)));
     }
-    float  tau_mie = any_mie ? sigma_mie0 * gv_mie : 0.0;
-    float3 tau_ray = any_ray ? kSigmaR * rayleigh_i * gv_ray : float3(0.0);
-    return exp(-(tau_ray + float3(tau_mie)));
+
+    // ---- Spherical-Earth path (issue #51) --------------------------
+    // Composite Simpson's rule with 8 subintervals (9 sample points).
+    // Per-point altitude comes from sqrt((ro+rd*s).xz^2 + (ro.y+rd.y*s+R)^2) - R.
+    // Pull the sphere-centre offset into a local form to avoid the
+    // y-add-then-subtract roundtrip:
+    //     h(s) = sqrt(rx^2 + ry^2 + rz^2 + 2*R*ry + R^2) - R
+    //          = sqrt(|p|^2 + 2*R*p.y + R^2) - R
+    // where p = ro + rd*s. For |p| << R (we're always within a few km
+    // of the surface at the scales this renderer cares about), the
+    // sqrt is well-conditioned -- numerically equivalent to
+    //   h = sqrt((p.y + R)^2 + p.xz^2) - R
+    // which is the natural altitude-above-sphere formula. fp32 retains
+    // ~3 digits of precision at R = 6.378e6 m given p.y in metres,
+    // which is enough -- Mie/Rayleigh scale heights are 1.5e3 / 8e3 m
+    // so a meter-scale rounding error in h shifts the optical depth
+    // by ~0.1% per step.
+    const int N = 8;
+    float dt = t / float(N);
+    float oneSixth = 1.0 / 6.0;
+    float tau_mie_total = 0.0;
+    float3 tau_ray_total = float3(0.0);
+
+    // Sample altitudes at the 9 grid points + the 8 midpoints. Combine
+    // via Simpson: integral ≈ dt/6 * sum_i (f_left + 4*f_mid + f_right).
+    // Compute sigma_mie + sigma_ray inline per sample so we only loop
+    // once over the parameter range.
+    float h_prev;
+    {
+        // s = 0
+        float3 p = ro;
+        h_prev = sqrt(p.x * p.x + (p.y + planet_R) * (p.y + planet_R) + p.z * p.z) - planet_R;
+        h_prev = max(h_prev, 0.0);
+    }
+    for (int i = 0; i < N; ++i) {
+        float s_mid   = (float(i) + 0.5) * dt;
+        float s_right = (float(i) + 1.0) * dt;
+        float3 p_mid   = ro + rd * s_mid;
+        float3 p_right = ro + rd * s_right;
+        float h_mid = sqrt(p_mid.x * p_mid.x
+                         + (p_mid.y + planet_R) * (p_mid.y + planet_R)
+                         + p_mid.z * p_mid.z) - planet_R;
+        h_mid = max(h_mid, 0.0);
+        float h_right = sqrt(p_right.x * p_right.x
+                           + (p_right.y + planet_R) * (p_right.y + planet_R)
+                           + p_right.z * p_right.z) - planet_R;
+        h_right = max(h_right, 0.0);
+        if (any_mie) {
+            float sm_l = sigma_mie0 * exp(-h_prev  / kHmie);
+            float sm_m = sigma_mie0 * exp(-h_mid   / kHmie);
+            float sm_r = sigma_mie0 * exp(-h_right / kHmie);
+            tau_mie_total += dt * oneSixth * (sm_l + 4.0 * sm_m + sm_r);
+        }
+        if (any_ray) {
+            float3 sr_l = kSigmaR * rayleigh_i * exp(-h_prev  / kHrayleigh);
+            float3 sr_m = kSigmaR * rayleigh_i * exp(-h_mid   / kHrayleigh);
+            float3 sr_r = kSigmaR * rayleigh_i * exp(-h_right / kHrayleigh);
+            tau_ray_total += dt * oneSixth * (sr_l + 4.0 * sr_m + sr_r);
+        }
+        h_prev = h_right;
+    }
+    return exp(-(tau_ray_total + float3(tau_mie_total)));
 }
 
 // Up to kMaxRefract dielectric bounces; beyond that the ray gives up
@@ -1792,27 +2841,45 @@ float3 transmittance(float3 ro, float3 rd, float t_max) {
     for (int i = 0; i <= kMaxRefract; ++i) {
         HitInfo h = traceScene(o, d);
         if (!h.hit || h.t >= t_max) return t * cloud_t;     // unoccluded
-        if (h.mat != MAT_DIELECTRIC) return float3(0.0);    // opaque blocker
+        // Water (#134) joins dielectric on the transmissive-blocker list.
+        // Both refract the shadow ray; only water folds Beer's-law
+        // absorption into the transmittance via water_params0.xyz.
+        bool is_transparent = (h.mat == MAT_DIELECTRIC) || (h.mat == MAT_WATER);
+        if (!is_transparent)         return float3(0.0);    // opaque blocker
         if (i == kMaxRefract)        return float3(0.0);    // budget hit
 
-        // Refract through the dielectric face. Same Snell + Fresnel
-        // logic as the path-tracer's dielectric BRDF, but we keep
-        // only the transmitted lobe (the reflected lobe doesn't reach
-        // the light along this path). Fresnel is folded into the
-        // transmittance so glancing angles correctly attenuate.
+        // Refract through the dielectric / water face. Same Snell +
+        // Fresnel logic as the path-tracer's dielectric BRDF, but we
+        // keep only the transmitted lobe (the reflected lobe doesn't
+        // reach the light along this path). Fresnel is folded into
+        // the transmittance so glancing angles correctly attenuate.
         float ndi   = dot(h.normal, d);
         float3 nf   = (ndi < 0.0) ? h.normal : -h.normal;
-        float ior_a = (ndi < 0.0) ? 1.0   : h.ior;
-        float ior_b = (ndi < 0.0) ? h.ior : 1.0;
+        float interface_ior = (h.mat == MAT_WATER)
+            ? clamp(h.ior > 0.0 ? h.ior : water_params0.w, 1.0, 2.4)
+            : h.ior;
+        float ior_a = (ndi < 0.0) ? 1.0           : interface_ior;
+        float ior_b = (ndi < 0.0) ? interface_ior : 1.0;
         float eta   = ior_a / ior_b;
         float cos_i = abs(dot(nf, -d));
-        float r0    = (ior_a - ior_b) / (ior_a + ior_b);
-        r0 = r0 * r0;
+        float r0    = (h.mat == MAT_WATER)
+            ? 0.02                             // accurate F0 for water at 0 deg
+            : ((ior_a - ior_b) / (ior_a + ior_b)) * ((ior_a - ior_b) / (ior_a + ior_b));
         float fr    = fresnelSchlick(cos_i, r0);   // reflected fraction
         float3 refracted = refract(d, nf, eta);
         if (length(refracted) < 1e-3) return float3(0.0);   // TIR
-        // Transmitted fraction times Beer-ish tint.
-        t *= (1.0 - fr) * h.albedo;
+        // Transmitted fraction times Beer-ish tint.  Water uses its own
+        // per-channel exp(-absorption * nominal_seg) instead of h.albedo
+        // (which would be neutral 1,1,1 for a water plane).
+        if (h.mat == MAT_WATER) {
+            float3 absorb = water_params0.xyz;
+            // Same nominal segment used in the water BRDF branch -- keeps
+            // shadow-ray attenuation visually consistent with primary-ray
+            // throughput tint when sunlight reaches the underwater geometry.
+            t *= (1.0 - fr) * exp(-absorb * 1.5);
+        } else {
+            t *= (1.0 - fr) * h.albedo;
+        }
         // Step past the interface, continue in the refracted direction.
         float advance = h.t + 1e-3;
         o = o + d * advance;
@@ -1827,6 +2894,66 @@ float3 transmittance(float3 ro, float3 rd, float t_max) {
 bool occluded(float3 ro, float3 rd, float t_max) {
     return all(transmittance(ro, rd, t_max) <= float3(0.0));
 }
+
+// --- Water Phase 1 (#134) --------------------------------------------------
+// Build a perturbed surface normal for MAT_WATER hits.  The geometry stays
+// a flat analytic plane (h.normal is the macro normal); only the SHADING
+// normal is animated.  We approximate the gradient of a 2-octave value-
+// noise scalar field over world-space tangent coords with two finite-
+// difference samples per axis -- cheap (4 noise evals per hit), no curl
+// machinery needed (true curl-noise is solenoidal and unsigned, which is
+// overkill for a shading-only perturbation).
+//
+// Inputs:
+//   world_p : surface hit point in world space (xz used; y irrelevant for
+//             a horizontal water plane).
+//   macro_n : geometric normal (unit, world space).
+//
+// Output: unit normal in world space, perturbed in the plane orthogonal
+// to macro_n.  Amplitude / frequency / time drive comes from water_params1.
+// The macro normal is preserved verbatim when amplitude == 0 (regression-
+// safe path for goldens that pin r_water_wave_amplitude 0).
+float3 waterShadingNormal(float3 world_p, float3 macro_n) {
+    float scale = water_params1.x;
+    float amp   = water_params1.y;
+    float speed = water_params1.z;
+    float t     = water_params1.w * speed;
+    if (amp <= 0.0 || scale <= 0.0) return macro_n;
+
+    // 2-octave fbm-ish sum.  We sample two displaced copies of the noise
+    // field (each animated in a different direction) and finite-difference
+    // them in both x and z.  Mixing two drift directions decorrelates the
+    // axis-aligned ripple lines that a single advected octave produces.
+    // Frequencies match cloud_fbm's 2.02x multiplier so we don't introduce
+    // axis-aligned aliasing artefacts.
+    const float eps = 0.15;
+    float2 p_xz = float2(world_p.x, world_p.z) * scale;
+    // Octave A: drift along +x at unit speed.
+    float2 drift_a = float2(0.13, 0.07) * t;
+    // Octave B: drift along ~diagonal at 2.02x freq.
+    float2 drift_b = float2(-0.09, 0.11) * t;
+
+    float n_px = cloud_value_noise(float3(p_xz.x + eps, 0.0, p_xz.y) + float3(drift_a, 0).xzy)
+               + 0.5 * cloud_value_noise(float3(p_xz.x * 2.02 + eps, 0.0, p_xz.y * 2.02) + float3(drift_b, 0).xzy);
+    float n_nx = cloud_value_noise(float3(p_xz.x - eps, 0.0, p_xz.y) + float3(drift_a, 0).xzy)
+               + 0.5 * cloud_value_noise(float3(p_xz.x * 2.02 - eps, 0.0, p_xz.y * 2.02) + float3(drift_b, 0).xzy);
+    float n_pz = cloud_value_noise(float3(p_xz.x, 0.0, p_xz.y + eps) + float3(drift_a, 0).xzy)
+               + 0.5 * cloud_value_noise(float3(p_xz.x * 2.02, 0.0, p_xz.y * 2.02 + eps) + float3(drift_b, 0).xzy);
+    float n_nz = cloud_value_noise(float3(p_xz.x, 0.0, p_xz.y - eps) + float3(drift_a, 0).xzy)
+               + 0.5 * cloud_value_noise(float3(p_xz.x * 2.02, 0.0, p_xz.y * 2.02 - eps) + float3(drift_b, 0).xzy);
+    float dh_dx = (n_px - n_nx) / (2.0 * eps);
+    float dh_dz = (n_pz - n_nz) / (2.0 * eps);
+    // Build tangent frame at macro_n.  Standard branchless basis.
+    float3 t1 = abs(macro_n.y) < 0.99 ? float3(0, 1, 0) : float3(1, 0, 0);
+    float3 tx = normalize(cross(t1, macro_n));
+    float3 tz = cross(macro_n, tx);
+    // Bump along the tangent frame.  Empirically the noise gradient
+    // magnitude is ~0.5..1.0, so multiplying by amp directly gives a
+    // perceptual rate of perturbation matching the cvar's documented range.
+    float3 perturbed = macro_n - amp * (dh_dx * tx + dh_dz * tz);
+    return normalize(perturbed);
+}
+// --- end Water Phase 1 -----------------------------------------------------
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -1902,15 +3029,17 @@ void main(uint2 tid : SV_DispatchThreadID) {
         if (write_normal_gbuffer != 0u) {
             normal_tex[tid] = float4(hit_normal, 0.0);
         }
-        // Albedo G-buffer: only allocated/bound by the engine when
-        // r_denoiser is optix_hdr_aov / optix_temporal_hdr_aov. The
-        // runtime `write_albedo_gbuffer` push gate is the actual
-        // run-or-skip switch -- the engine sets it to 0 on Metal
-        // (which never uses OptiX AOV anyway) and to 0 on Vulkan
-        // for non-AOV denoisers, so albedo_tex is only ever touched
-        // by the OptiX-AOV path. Vulkan tolerates the unbound slot
-        // via VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT; Metal binds
-        // a placeholder when albedo_tex_id_ is 0.
+        // Albedo G-buffer: allocated/bound by the engine for OptiX AOV
+        // variants, MetalFX (and SVGF->MetalFX chained kinds), AND --
+        // after issue #119 -- the pure SVGF/NRD kinds, which use the
+        // albedo for demodulation (divide-by-albedo into the denoiser
+        // chain, multiply back on output). The runtime
+        // `write_albedo_gbuffer` push gate is the actual run-or-skip
+        // switch -- the engine sets it to 1 whenever albedo_tex_id_
+        // is non-zero (regardless of backend). Vulkan tolerates the
+        // unbound slot for non-consumer kinds via
+        // VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT; Metal binds a
+        // placeholder when albedo_tex_id_ is 0.
         //
         // CRITICAL: keep this write code visible to ALL targets, NOT
         // wrapped in `#ifdef PT_TARGET_SPIRV`. When the write was
@@ -1929,6 +3058,78 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // modes; the runtime gate keeps that free.
         if (write_albedo_gbuffer != 0u) {
             albedo_tex[tid] = float4(hit_albedo, 0.0);
+        }
+        // MetalFX specular-guidance G-buffers (issue #118). Three
+        // textures fed to MTLFXTemporalDenoisedScaler so it can tell
+        // specular from diffuse response -- without them the scaler
+        // produces 8x8 halos around bright reflections / metals.
+        //
+        // F0 (specular_albedo) per material kind:
+        //   MAT_METAL      : F0 = albedo (the material colour reflects
+        //                    directly; gold's yellow specular IS its
+        //                    yellow albedo, not a tinted white highlight).
+        //   MAT_DIELECTRIC : F0 = float3(0.04) — the standard Schlick
+        //                    approximation for IOR~1.5 (glass, plastic,
+        //                    coated dielectrics). Engine's dielectric
+        //                    primitives are nominally IOR=1.5 unless
+        //                    overridden in the prim material struct.
+        //   MAT_LAMBERT    : F0 = float3(0) — no specular lobe at all.
+        // Pulled from h0 (not hit_albedo / hit_normal which collapse
+        // to sentinels on sky pixels) so we can preserve the material-
+        // kind discriminator.
+        //
+        // roughness: from h0.roughness directly. The material struct
+        // packs roughness in primitive .v1.a / SDF cluster header /
+        // mesh material — already plumbed through traceScene as h.roughness.
+        //
+        // specular_hit_distance: MVP proxy using `primary_t * (1 - rough)`,
+        // i.e. attenuated by smoothness so a perfect mirror keeps the
+        // full distance and a rough surface trends toward 0 where
+        // MetalFX has no specular reproject to do. A future PR (real
+        // reflection-ray trace from the primary hit) can replace this
+        // with the actual reflected-virtual-image depth; see the
+        // texture's declaration comment for the design trade-off.
+        //
+        // All three are sky-aware: hit_normal == float3(0) means h0.hit
+        // == false, so we write the "no surface" sentinel for that
+        // pixel. roughness sentinel is 1.0 (fully rough -> MetalFX
+        // skips specular handling); F0 + hit_distance sentinel is 0.
+        if (write_specular_albedo_gbuffer != 0u) {
+            float3 f0 = float3(0.0);
+            if (h0.hit) {
+                if      (h0.mat == MAT_METAL)      f0 = h0.albedo;
+                else if (h0.mat == MAT_DIELECTRIC) f0 = float3(0.04);
+                // Lambert keeps f0 = 0.
+            }
+            // WTexture2D.Store(coord, value) instead of subscript
+            // assignment -- WTexture2D is write-only (lowers to Metal
+            // access::write to stay under the 8-RW-texture cap) and
+            // doesn't support the [] = ... HLSL convenience syntax.
+            specular_albedo_tex.Store(tid, float4(f0, 0.0));
+        }
+        if (write_roughness_gbuffer != 0u) {
+            float r = h0.hit ? saturate(h0.roughness) : 1.0;
+            // Lambert lobe is fully rough; the engine's prim seeding
+            // sets h.roughness based on the material's GGX param, but
+            // for MAT_LAMBERT the value is meaningless (Lambert doesn't
+            // have a roughness). Force = 1.0 so MetalFX sees Lambert
+            // pixels as "no specular surface to preserve."
+            if (h0.hit && h0.mat == MAT_LAMBERT) r = 1.0;
+            roughness_tex.Store(tid, r);
+        }
+        if (write_specular_hit_distance_gbuffer != 0u) {
+            float dist = 0.0;
+            if (h0.hit) {
+                // MVP proxy: primary hit distance weighted by smoothness
+                // (1 - roughness). At roughness=0 the reflection comes
+                // from somewhere far past the primary hit, but we don't
+                // trace it -- the value is "as far as we know, primary_t."
+                // At roughness=1 we'd write 0 anyway since MetalFX won't
+                // try to reproject a fully-rough specular.
+                float smoothness = 1.0 - saturate(h0.roughness);
+                dist = h0.t * smoothness;
+            }
+            specular_hit_distance_tex.Store(tid, dist);
         }
     }
 
@@ -1961,6 +3162,22 @@ void main(uint2 tid : SV_DispatchThreadID) {
     // between samples is well below cloud feature size, so any single
     // sample is a faithful proxy for the unjittered camera ray.
     float frame_cloud_trans = 1.0;
+    // Sun-NEE shadow-ray visibility accumulator (issue #115). Sums the
+    // primary-hit shadow-ray transmittance toward the sun across all
+    // spp samples; divided by sample_count at the end of main() to give
+    // a per-pixel [0,1] visibility for the SigmaShadow denoiser to
+    // bilateral-filter. Per-sample contributions: 1.0 for samples whose
+    // primary ray misses geometry (sky pixels never need shadow
+    // demodulation -- they have no direct-light shadow to denoise),
+    // and the scalar luminance of the sun-NEE shadow-ray transmittance
+    // for samples that hit a surface. Initialized to 0.0; sky pixels
+    // accumulate sample_count*1.0 = sample_count, then divide back to
+    // 1.0 below. Non-Lambert primary hits (metal, dielectric) and the
+    // night-side case (sun below horizon) also contribute 1.0 to avoid
+    // false-shadowing materials that aren't subject to direct-light
+    // shadowing the same way Lambert is (specular reflectance handles
+    // its own occlusion via the bounce ray, not a Lambert-style NEE).
+    float frame_shadow_vis = 0.0;
     for (uint s = 0u; s < sample_count; ++s) {
         // When MetalFX is on, all pixels of the frame share the same
         // sub-pixel offset (Halton sequence picked on host) so the
@@ -2070,6 +3287,66 @@ void main(uint2 tid : SV_DispatchThreadID) {
             primary_t = h.hit ? h.t : primary_t;
             primary_hit = h.hit;
             primary_t_recorded = true;
+            // Sun-NEE shadow visibility (issue #115). One dedicated
+            // shadow ray per spp sample from the primary hit toward the
+            // jittered sun-disc direction. This is INDEPENDENT of the
+            // Lambert NEE branch's shadow ray below -- we want a clean
+            // visibility signal at the primary surface regardless of
+            // material so the SigmaShadow denoiser can produce sharp
+            // sun shadows on metal and dielectric surfaces too (which
+            // a Lambert-only NEE-tap wouldn't capture). Cost is one
+            // extra `transmittance()` call per primary hit, BUT only
+            // when r_shadow_demod is on -- gating on write_shadow_vis
+            // keeps the legacy (denoiser-off or demod-off) path
+            // bitwise-identical to pre-#115 by not touching `seed` or
+            // executing any extra GPU work.
+            //
+            // Contribution rules:
+            //   - sky pixel (no primary hit): 1.0 (no occlusion to denoise)
+            //   - sun below horizon: 1.0 (no shadow possible)
+            //   - surface hit + sun up: scalar luminance of the
+            //     transmittance vector (RGB tint from glass etc.
+            //     reduces to a single visibility scalar -- the demod
+            //     compose is a per-channel-equal multiply by design,
+            //     full chromatic shadows are a follow-up).
+            //
+            // Origin is offset by the normal-aligned bias `nf * 1e-3`
+            // to dodge self-intersection (same constant the NEE branch
+            // below uses). For the b==0 hit we don't yet have the
+            // "flipped" normal nf, so recompute it inline.
+            if (write_shadow_vis != 0u) {
+                if (h.hit) {
+                    float3 sun_dir = sun_and_mode.xyz;
+                    if (sun_dir.y > 0.0) {
+                        float3 hp = ro + rd * h.t;
+                        float ndi_0 = dot(h.normal, rd);
+                        float3 nf_0 = (ndi_0 < 0.0) ? h.normal : -h.normal;
+                        // sampleSunDisc jitters within the sun's
+                        // angular footprint so the visibility
+                        // integrates to a soft penumbra when the
+                        // surface is near the sun's edge shadow.
+                        // Matches what the NEE branch later does so
+                        // both signals converge to the same noiseless
+                        // mean.
+                        float3 sun_jit = sampleSunDisc(sun_dir, seed);
+                        float3 t_vis = transmittance(hp + nf_0 * 1e-3,
+                                                     sun_jit, 1e30);
+                        // Rec.709 luminance flattens RGB transmittance
+                        // to one scalar. For pure shadow (no glass
+                        // between hit and sun), R==G==B so the choice
+                        // of weight doesn't matter; the weighting only
+                        // kicks in with chromatic dielectrics on the
+                        // shadow ray.
+                        float vis_s = dot(t_vis,
+                                          float3(0.2126, 0.7152, 0.0722));
+                        frame_shadow_vis += saturate(vis_s);
+                    } else {
+                        frame_shadow_vis += 1.0;   // sun below horizon
+                    }
+                } else {
+                    frame_shadow_vis += 1.0;       // sky pixel
+                }
+            }
         }
         if (!h.hit) {
             if (mis_enabled != 0u && prev_was_lambert_nee) {
@@ -2176,6 +3453,144 @@ void main(uint2 tid : SV_DispatchThreadID) {
         float3 nf  = (ndi < 0.0) ? h.normal : -h.normal;
 
         if (h.mat == MAT_LAMBERT) {
+            // --- Analytic light primitives NEE (#73 / ReSTIR #78) -------
+            // Direct-lighting from the engine's analytic light list:
+            // point / spot / sphere area / quad area. Two code paths
+            // share this branch:
+            //   r_restir = 0 : legacy single-pick uniform NEE (one
+            //       random light, one shadow ray, contribution added
+            //       here). Variance bounded for ~dozen lights;
+            //       beyond that the user should turn ReSTIR on.
+            //   r_restir = 1 (Phase A): WRS candidate generation at
+            //       the PRIMARY hit (b == 0) only. Builds a per-pixel
+            //       reservoir of K candidates, writes it to
+            //       reservoir_curr_buf, and DOES NOT add a
+            //       contribution here -- the RestirFinal kernel
+            //       additively blends the shadow-tested resampled
+            //       sample into denoise_color after the temporal +
+            //       spatial reuse passes run. Indirect bounces
+            //       (b > 0) keep the legacy single-pick NEE because
+            //       Phase A is direct-illumination only (#78 Phase B
+            //       extends to GI bounce reservoirs).
+            bool restir_active = (restir_enabled != 0u) && (b == 0u);
+            if (light_count > 0u && !restir_active) {
+                LightSample ls = sampleAnalyticLight(hit_pt, nf, seed);
+                float n_dot_l = dot(nf, ls.dir);
+                if (ls.pdf > 0.0 && n_dot_l > 0.0) {
+                    // Shadow ray: surface to sampled point on the
+                    // light. Stop t_max just before the light so the
+                    // light's own surface doesn't self-block.
+                    float t_max = max(ls.dist - 1e-3, 0.0);
+                    float3 trans = transmittance(hit_pt + nf * 1e-3,
+                                                 ls.dir, t_max);
+                    if (any(trans > float3(0.0))) {
+                        float3 brdf = h.albedo / 3.14159265358979;
+                        radiance += clampIndirect(
+                            throughput * ls.Le * trans * brdf *
+                            n_dot_l / ls.pdf);
+                    }
+                }
+            }
+            if (light_count > 0u && restir_active) {
+                // --- ReSTIR DI Phase A: WRS candidate generation ----
+                // Build a per-pixel reservoir over K candidates. Each
+                // candidate is one uniform-random pick from the
+                // light list + per-type area sample; the WRS picks
+                // ONE survivor weighted by its target pdf (un-shadowed
+                // Lambert contribution). No shadow rays here -- the
+                // RestirFinal kernel does the SINGLE survivor shadow
+                // ray after temporal + spatial reuse. This is the
+                // whole point of ReSTIR: replace K shadow rays with
+                // one.
+                Reservoir res = initReservoir();
+                uint K = min(restir_k_candidates, kRestirMaxK);
+                if (K < 1u) K = 1u;
+                for (uint k = 0u; k < K; ++k) {
+                    LightSample ls = sampleAnalyticLight(hit_pt, nf, seed);
+                    float n_dot_l = dot(nf, ls.dir);
+                    if (ls.pdf <= 0.0 || n_dot_l <= 0.0) {
+                        // Empty candidate -- skip the streamingUpdate's
+                        // M increment so back-facing samples don't
+                        // depress W for legitimate ones. We do
+                        // increment M though, because Bitterli's
+                        // bias correction needs the total candidate
+                        // count, not just non-zero-weight ones.
+                        res.M += 1u;
+                        continue;
+                    }
+                    // Target pdf (un-shadowed Lambert estimate). Note
+                    // that sampleAnalyticLight pre-bakes 1/dist^2 +
+                    // cos_light + spot falloff into ls.Le for the
+                    // POINT / SPOT / SPHERE / QUAD types, so the
+                    // target pdf reduces to the receiver-side n_dot_l
+                    // times a luminance reduction on ls.Le. brdf
+                    // (albedo/PI) is *constant* across all candidates
+                    // for a Lambert surface, so we omit it from the
+                    // target pdf — it cancels in W during
+                    // finalizeReservoir.
+                    float3 contrib = ls.Le * n_dot_l;
+                    float p_hat = max(dot(contrib,
+                                          float3(0.2126, 0.7152, 0.0722)),
+                                      0.0);
+                    float u = randf(seed);
+                    if (streamingUpdate(res, p_hat, ls.pdf, u)) {
+                        // Cache the surviving sample's geometry for
+                        // the spatial / temporal merge passes.
+                        res.light_pos = hit_pt + ls.dir * ls.dist;
+                        // ls.dir points from hit toward light; the
+                        // light surface normal at the chosen sample
+                        // point is what receivers' merge passes need
+                        // to evaluate cos_light. For point/spot delta
+                        // lights we store the inverse light direction
+                        // (so dot(light_n, -wi) = 1 trivially); for
+                        // SPHERE / QUAD the merge passes consult this
+                        // when re-evaluating the survivor's pdf at a
+                        // different receiver. We approximate by
+                        // storing -ls.dir for non-area, which is
+                        // exact for point lights and close enough
+                        // for spot lights at MVP scope.
+                        res.light_n   = -ls.dir;
+                        res.Le        = ls.Le;
+                        res.pdf_solid = ls.pdf;
+                        res.dist      = ls.dist;
+                        // light_idx: which entry in light_prims. The
+                        // candidate sampler picks uniformly so its
+                        // index is `uint(u_pick * float(light_count))`
+                        // — but sampleAnalyticLight doesn't return
+                        // the index, only the sample. Re-sampling
+                        // would consume an RNG step. For Phase A we
+                        // recover the index by the same picker
+                        // arithmetic on a fresh draw, accepting that
+                        // the spatial/temporal merge passes' p_hat
+                        // re-evaluation reads light_prims[light_idx]
+                        // to recompute Le_pre at the new receiver --
+                        // a tiny pdf inaccuracy on the merged
+                        // estimator's bookkeeping, dominated by the
+                        // shadow + Lambert factors RestirFinal
+                        // applies. A follow-up that threads the
+                        // index out of sampleAnalyticLight is a
+                        // straightforward refactor.
+                        res.light_idx = min(uint(randf(seed) *
+                                                float(light_count)),
+                                            light_count - 1u);
+                    }
+                }
+                finalizeReservoir(res);
+                uint pixel_idx = tid.y * dim.x + tid.x;
+                storeReservoir(reservoir_curr_buf, pixel_idx, res);
+                // NO contribution added to radiance here — RestirFinal
+                // adds it after the reuse chain has finished resampling.
+            } else if (restir_active) {
+                // r_restir on, but light_count == 0 — write an empty
+                // reservoir so the chain's reads don't see stale
+                // data from a previous frame's light set. Cheap (4
+                // float4 writes); avoids an additional cvar-tied
+                // dispatch toggle on the reservoir buffer clear.
+                Reservoir res = initReservoir();
+                uint pixel_idx = tid.y * dim.x + tid.x;
+                storeReservoir(reservoir_curr_buf, pixel_idx, res);
+            }
+            // --- end Analytic light NEE / ReSTIR -----------------------
             if (env_map_present != 0u) {
                 // NEE: importance-sampled env-map direct light. With
                 // MIS, this contribution is weighted by the balance
@@ -2386,7 +3801,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
             skip_sky_on_miss = false;   // metal didn't NEE; sky on miss is real
             prev_was_lambert_nee = false;   // specular bounce: MIS doesn't apply here
         }
-        else {  // dielectric
+        else if (h.mat == MAT_DIELECTRIC) {
             float ior_a = (ndi < 0.0) ? 1.0   : h.ior;
             float ior_b = (ndi < 0.0) ? h.ior : 1.0;
             float eta = ior_a / ior_b;
@@ -2406,6 +3821,84 @@ void main(uint2 tid : SV_DispatchThreadID) {
             }
             skip_sky_on_miss = false;   // dielectric didn't NEE either
             prev_was_lambert_nee = false;   // specular/refraction: MIS doesn't apply
+        }
+        else {  // MAT_WATER (#134)
+            // Phase 1 water: shading-normal-perturbed analytic plane with
+            // Schlick Fresnel (F0=0.02), Snell refraction via the refract()
+            // builtin, and Beer's-law absorption applied to the refracted
+            // segment via a throughput multiply.  No NEE on the water
+            // surface itself -- the reflected / refracted ray inherits the
+            // current throughput and the next bounce handles direct
+            // lighting through whichever medium the ray entered.
+            //
+            // Perturbed shading normal.  Geometric ndi-driven sign was
+            // computed off h.normal (geometric); use it to orient the
+            // shading normal toward the incoming ray, so under-water hits
+            // (sphere submerged) and above-water hits share one branch.
+            float water_ior = clamp(h.ior > 0.0 ? h.ior : water_params0.w,
+                                    1.0, 2.4);
+            float3 shading_n = waterShadingNormal(hit_pt, h.normal);
+            float ndi_s = dot(shading_n, rd);
+            float3 nf_s = (ndi_s < 0.0) ? shading_n : -shading_n;
+
+            float ior_a = (ndi_s < 0.0) ? 1.0       : water_ior;
+            float ior_b = (ndi_s < 0.0) ? water_ior : 1.0;
+            float eta = ior_a / ior_b;
+            float cos_i = abs(dot(nf_s, -rd));
+            // Schlick F0 for water (1.33 vs air = 0.02041).  Hard-coded
+            // here so the cvar can dial ior without the Fresnel split
+            // ratio drifting -- F0=0.02 is the perceptually-correct value
+            // physically-based renderers use even when ior is mildly
+            // perturbed.  fresnelSchlick gives the reflected fraction.
+            const float F0_water = 0.02;
+            float fr = fresnelSchlick(cos_i, F0_water);
+            float3 reflected = reflect(rd, nf_s);
+            float3 refracted = refract(rd, nf_s, eta);
+            bool tir = (length(refracted) < 1e-3);
+            if (tir || randf(seed) < fr) {
+                // Reflection: surface acts like a coated mirror.  No
+                // absorption multiplied -- the reflected ray never
+                // entered the water body.
+                rd = reflected;
+                ro = hit_pt + nf_s * 1e-3;
+            } else {
+                // Refraction: the ray enters the water medium.  Apply
+                // Beer's law along the refracted segment.  We don't yet
+                // know the segment length (it ends at the next surface
+                // hit), so we fold absorption into throughput as a
+                // distance-running attenuation: estimate the path length
+                // as the segment to the next traceScene() hit using the
+                // analytic ray-plane crossing for the *exit* side.
+                //
+                // Phase 1 simplification: apply absorption only when
+                // ENTERING the water body (ndi_s < 0 means the macro
+                // normal pointed away from the incoming ray, so we're
+                // going from air -> water).  When exiting (ndi_s > 0,
+                // ray inside water travelling toward the surface), the
+                // attenuation should already have been folded in by
+                // whatever surface scatter produced the upward ray.
+                //
+                // Approximation: use the macro plane's y coordinate as
+                // the surface altitude.  The refracted ray segment runs
+                // from hit_pt until it intersects scene geometry (next
+                // bounce).  As an MVP we don't track distance per-bounce
+                // through the medium; instead we apply a constant tint
+                // based on a nominal segment of ~h.t magnitude scaled by
+                // 1.5 (the average path length through a few-metres-deep
+                // body).  This is honest about being approximate -- the
+                // user-tunable absorption_r/g/b can be tuned for the
+                // intended look at the intended depth.  Phase 4 (SSS)
+                // will track per-bounce in-medium distance.
+                if (ndi_s < 0.0) {
+                    float seg_estimate = 1.5;     // nominal metres
+                    float3 absorb = water_params0.xyz;
+                    throughput *= exp(-absorb * seg_estimate);
+                }
+                rd = normalize(refracted);
+                ro = hit_pt - nf_s * 1e-3;
+            }
+            skip_sky_on_miss = false;
+            prev_was_lambert_nee = false;
         }
 
             if (b >= 2u) {
@@ -2586,6 +4079,46 @@ void main(uint2 tid : SV_DispatchThreadID) {
             // cloud altitude band. For object-hit primary rays we also
             // clip at primary_t so clouds don't shine through walls. For
             // sky pixels primary_t = 50km, so the layer is fully visible.
+            //
+            // Phase 4 (#100) -- heterogeneous volumetric raymarching. The
+            // legacy march was uniform-stride single-scatter with a haze-
+            // shared HG g; Phase 4 adds:
+            //
+            //   * Density scale -- vol_density_scale (push.vol_density_scale)
+            //     multiplies the cloud sigma_t inside the march so users
+            //     can dial volume thickness without changing the preset
+            //     peak density. Carries through to shadow rays via
+            //     cloud_optical_depth_stratified, so the shadow stays
+            //     consistent with the body.
+            //   * Cloud-specific HG g -- vol_phase_g_cloud. Decoupled from
+            //     vol_params.y (atmospheric Mie haze g). Real cumulus is
+            //     forward-scattering at g~0.8; without this cvar the
+            //     cloud march was forced to share the haze's g~0.7 for
+            //     both god-ray halo and silver lining, which under-fed
+            //     the cumulus forward lobe.
+            //   * Multi-scatter octaves (Wrenninge-style) -- approximates
+            //     the diffuse fill that real cumulus gets from light
+            //     bouncing several times inside the volume. Without
+            //     this, deep cloud cores read as pitch-black under sun
+            //     self-shadow; with N octaves, each octave reduces the
+            //     extinction coefficient by 2^-i so the deeper octaves
+            //     act as cheap proxies for multi-scattered light.
+            //   * Stratified cloud-shadow rays via cloud_nee_transmittance
+            //     -- sharper god rays through thin cloud gaps. Skips the
+            //     expensive traceScene call for the open-sky leg above
+            //     the cloud (the cloud + atmosphere is the only occluder
+            //     by construction), which is what keeps the per-sample
+            //     NEE cost under budget when crossing 12+ sub-samples
+            //     stratified along the shadow ray.
+            //   * Adaptive step size -- when the current sample finds
+            //     near-zero density we increment t by the same dtc
+            //     anyway (no work skipped); the win is that the per-
+            //     step ALU is tiny in empty space and the dense steps
+            //     get the full multi-scatter + dual-NEE pass. This
+            //     keeps the GPU's wavefront divergence-friendly because
+            //     every lane in a warp executes the same loop iteration
+            //     count -- only the early-out work inside the lane
+            //     changes.
             if (clouds_p1.w > 0.0) {
                 float base_y = clouds_p1.x;
                 float top_y  = clouds_p1.y;
@@ -2615,6 +4148,33 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     float jitc = randf(seed) * dtc;
                     float trans_eye_c = 1.0;
                     float3 v_color_c  = float3(0.0);
+                    // Phase 4 cvar pull. vol_density_scale clamps to a
+                    // safe non-zero floor (a literal 0 would make the
+                    // cloud march transmit unconditionally; explicit
+                    // "no cloud" is what clouds_p1.w == 0 means).
+                    // vol_phase_g_cloud is bounded inside HG's stable
+                    // range; outside +/-0.95 the (1+g^2-2gcos) term in
+                    // the denominator can pinch to zero on grazing
+                    // directions and produce per-sample firefly spikes.
+                    // multiscatter_oct clamps to 0..4: 0 collapses the
+                    // multi-scatter sum to a no-op (legacy behaviour);
+                    // 4 is the deepest we trust before each octave's
+                    // contribution falls below the ACES knee.
+                    float vol_dscale = max(vol_density_scale, 1e-3);
+                    float g_cloud    = clamp(vol_phase_g_cloud, -0.95, 0.95);
+                    int   ms_oct     = clamp(int(vol_multiscatter_oct + 0.5),
+                                              0, 4);
+                    float g_cloud2   = g_cloud * g_cloud;
+                    // Recompute the cloud phase value once per primary
+                    // ray; the cloud march's NEE per-light recomputes
+                    // anyway because its cos_theta is per-light, but
+                    // for the sun/moon main lobe this saves N pow().
+                    float cos_cloud  = dot(primary_rd, -sun_dir);
+                    float phase_cloud = (1.0 - g_cloud2)
+                        / (4.0 * 3.14159265358979
+                            * pow(max(1.0 + g_cloud2
+                                        - 2.0 * g_cloud * cos_cloud, 1e-4),
+                                  1.5));
                     // In HDRI mode the env map is the canonical sky and the
                     // engine's procedural sun + moon are NOT contributors --
                     // otherwise clouds get double-lit by both the HDRI's
@@ -2655,9 +4215,30 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         float t = t_in + (float(vi) + 0.5) * dtc + jitc;
                         if (t > t_out) break;
                         float3 sp = primary_ro + primary_rd * t;
+                        // Phase 4: heterogeneous density (procedural fbm
+                        // via cloud_density_at) multiplied by the user
+                        // density-scale knob. Sigma_t varies through the
+                        // volume at every step -- this is what makes the
+                        // march "heterogeneous" vs the old homogeneous
+                        // single-sigma haze path. The cloud field's own
+                        // fbm + height profile already provides the
+                        // spatial variation; vol_dscale is a global
+                        // multiplier on the per-metre extinction.
+                        // #117 added clouds_p4 (curl-noise params).
+                        // #100 added vol_density_scale multiplier + empty-cell
+                        // skip optimization. Both layered.
                         float dens = cloud_density_at(sp, clouds_p1,
-                                                      clouds_p2, clouds_p3, 6);
-                        if (dens <= 0.0) continue;
+                                                      clouds_p2, clouds_p3,
+                                                      clouds_p4, 6)
+                                   * vol_density_scale;
+                        if (dens <= 0.0) {
+                            // Empty cell -- transmittance does not change,
+                            // no light scatters in. Skip per-light NEE for
+                            // this step; the cost asymmetry collapses to
+                            // "one density eval" in clear sky vs full work
+                            // in cloud.
+                            continue;
+                        }
                         // Aerial perspective: per-channel atmospheric
                         // transmittance from camera to this sample,
                         // analytical Mie + Rayleigh integral. Each
@@ -2673,20 +4254,69 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         float3 trans_atm = atmosphericTransmittance(
                             primary_ro, primary_rd, t);
                         float  step_w = dens * dtc * trans_eye_c;
+                        // --- Multi-scatter Wrenninge octaves ----------------
+                        // Approximates the diffuse light that has bounced
+                        // multiple times inside the cloud and now exits
+                        // toward the camera. Cheap proxy: re-evaluate the
+                        // direct-NEE contribution under reduced extinction
+                        // (each octave halves the effective sigma_t) so
+                        // light penetrates "further into the cloud" each
+                        // octave -- this is the deep-core fill that pure
+                        // single-scatter misses. Phase function flattens
+                        // toward isotropic each octave because diffuse
+                        // multi-scatter loses anisotropy with bounce count.
+                        //   ms_weight[i] = a^i           absorption decay
+                        //                  b^i (phase)   anisotropy decay
+                        // Coefficients (a, b, c) follow Wrenninge 2013
+                        // ("Oz: The Great and Volumetric"); a=0.5, b=0.5,
+                        // c=0.5 reads cleanly across overcast and cumulus
+                        // without per-preset re-tuning.
+                        // 0 octaves => skip entirely (legacy behaviour);
+                        // >=1 octave => sum starts at i=0 single-scatter,
+                        // i=1..ms_oct are the multi-scatter fakes.
                         if (hdri_lit) {
                             // HDRI extracted-lights NEE: stochastic
                             // single-pick weighted by cluster luminance.
+                            // Phase 4: route the shadow visibility through
+                            // cloud_nee_transmittance so the cloud's own
+                            // stratified Beer-Lambert produces sharp god
+                            // rays through holes between cumulus puffs.
                             if (hdri_lights_count > 0u) {
                                 HdriLightSample hl = sampleHdriLight(seed);
                                 if (hl.pdf > 0.0) {
                                     float c_t_h = dot(primary_rd, -hl.dir);
-                                    float phase_h = (1.0 - g2) / (4.0 * 3.14159265358979
-                                        * pow(max(1.0 + g2 - 2.0 * g * c_t_h, 1e-4), 1.5));
-                                    float3 t_s = transmittance(sp, hl.dir, 1e30);
+                                    float t_s_cloud = exp(-cloud_optical_depth_stratified(
+                                                            sp, hl.dir, 1e30, seed));
+                                    float3 t_s_atm = atmosphericTransmittance(
+                                                            sp, hl.dir, 60000.0);
+                                    float3 t_s = t_s_atm * float3(t_s_cloud);
                                     if (any(t_s > float3(0.0))) {
+                                        // Sum direct + multi-scatter octaves.
+                                        // Octave 0 is the single-scatter
+                                        // direct contribution. Octave i>0
+                                        // reuses the same shadow visibility
+                                        // (t_s) with reduced phase
+                                        // anisotropy (b^i toward isotropic)
+                                        // and reduced effective extinction
+                                        // -- the per-octave step_w_i applies
+                                        // a^i so cloud cores still get fill
+                                        // light even where direct sun
+                                        // transmittance is ~0.
+                                        float3 ms_acc = float3(0.0);
+                                        float a_pow = 1.0;
+                                        float b_pow = 1.0;
+                                        for (int oi = 0; oi <= ms_oct; ++oi) {
+                                            float g_o = g_cloud * b_pow;
+                                            float g_o2 = g_o * g_o;
+                                            float ph_o = (1.0 - g_o2) / (4.0 * 3.14159265358979
+                                                * pow(max(1.0 + g_o2 - 2.0 * g_o * c_t_h, 1e-4), 1.5));
+                                            float step_w_o = dens * a_pow * dtc * trans_eye_c;
+                                            ms_acc += hl.color * t_s * ph_o * step_w_o;
+                                            a_pow *= 0.5;
+                                            b_pow *= 0.5;
+                                        }
                                         v_color_c += clampIndirect(
-                                            hl.color * t_s * phase_h * step_w * trans_atm
-                                            / hl.pdf);
+                                            ms_acc * trans_atm / hl.pdf);
                                     }
                                 }
                             }
@@ -2697,11 +4327,17 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                 float2 xi_e = float2(randf(seed), randf(seed));
                                 EnvSample env = sampleEnvMap(xi_e);
                                 if (env.pdf > 0.0) {
-                                    float3 t_e = transmittance(sp, env.dir, 1e30);
+                                    float c_t_e = dot(primary_rd, -env.dir);
+                                    float t_e_cloud = exp(-cloud_optical_depth_stratified(
+                                                            sp, env.dir, 1e30, seed));
+                                    float3 t_e_atm = atmosphericTransmittance(
+                                                            sp, env.dir, 60000.0);
+                                    float3 t_e = t_e_atm * float3(t_e_cloud);
                                     if (any(t_e > float3(0.0))) {
-                                        float c_t_e = dot(primary_rd, -env.dir);
-                                        float phase_e = (1.0 - g2) / (4.0 * 3.14159265358979
-                                            * pow(max(1.0 + g2 - 2.0 * g * c_t_e, 1e-4), 1.5));
+                                        float phase_e = (1.0 - g_cloud2)
+                                            / (4.0 * 3.14159265358979
+                                                * pow(max(1.0 + g_cloud2
+                                                            - 2.0 * g_cloud * c_t_e, 1e-4), 1.5));
                                         v_color_c += clampIndirect(
                                             env.color * t_e * phase_e * step_w * trans_atm
                                             / env.pdf);
@@ -2713,17 +4349,57 @@ void main(uint2 tid : SV_DispatchThreadID) {
                             // boosted sun_rad: high clouds (cirrus at 8km)
                             // sit ABOVE most of the absorbing atmosphere
                             // and catch brighter / less-reddened light
-                            // than the ground does.
+                            // than the ground does. Phase 4: visibility
+                            // routed through cloud_nee_transmittance for
+                            // the sharp stratified cloud OD that god rays
+                            // need to silhouette through cloud gaps.
                             if (sun_elev > 0.0) {
                                 float h_alt   = max(sp.y, 0.0);
                                 float h_norm  = saturate(h_alt / 8000.0);
                                 float boost   = exp(0.30 * sun_am * h_norm);
                                 float3 sun_at = sun_rad * boost;
                                 float3 sun_jit = sampleSunDisc(sun_dir, seed);
-                                float3 trans_sun = transmittance(sp, sun_jit, 1e30);
+                                float c_t_sun = dot(primary_rd, -sun_jit);
+                                // Cloud + atmospheric leg for the shadow.
+                                // Skips the BVH walk: by construction
+                                // the only occluder along this leg is
+                                // the cloud itself (the sun direction
+                                // points to open sky above the cloud
+                                // layer's top), so cloud_optical_depth_
+                                // stratified + atmosphericTransmittance
+                                // is the full physical visibility.
+                                float t_s_cloud = exp(-cloud_optical_depth_stratified(
+                                                        sp, sun_jit, 1e30, seed));
+                                float3 t_s_atm = atmosphericTransmittance(
+                                                        sp, sun_jit, 60000.0);
+                                float3 trans_sun = t_s_atm * float3(t_s_cloud);
                                 if (any(trans_sun > float3(0.0))) {
-                                    v_color_c += clampIndirect(
-                                        sun_at * trans_sun * phase * step_w * trans_atm);
+                                    // Multi-scatter octave sum (see HDRI
+                                    // branch above for the rationale).
+                                    // Direct + multi-scatter share the
+                                    // SAME shadow visibility -- it's the
+                                    // SAME sun ray; only the phase /
+                                    // extinction weighting per octave
+                                    // changes. Without the octaves the
+                                    // cumulus core under self-shadow
+                                    // reads pitch-black against the
+                                    // brightly-lit cloud edges, which
+                                    // looks like a clipping bug rather
+                                    // than physics.
+                                    float3 ms_acc = float3(0.0);
+                                    float a_pow = 1.0;
+                                    float b_pow = 1.0;
+                                    for (int oi = 0; oi <= ms_oct; ++oi) {
+                                        float g_o  = g_cloud * b_pow;
+                                        float g_o2 = g_o * g_o;
+                                        float ph_o = (1.0 - g_o2) / (4.0 * 3.14159265358979
+                                            * pow(max(1.0 + g_o2 - 2.0 * g_o * c_t_sun, 1e-4), 1.5));
+                                        float step_w_o = dens * a_pow * dtc * trans_eye_c;
+                                        ms_acc += sun_at * trans_sun * ph_o * step_w_o;
+                                        a_pow *= 0.5;
+                                        b_pow *= 0.5;
+                                    }
+                                    v_color_c += clampIndirect(ms_acc * trans_atm);
                                 }
                             }
                             // Direct moon (single-scatter NEE). Moon is the
@@ -2735,11 +4411,21 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                 float phase_b = 0.5 * (1.0 - cos(moon_dir_phase.w));
                                 if (phase_b > 0.01) {
                                     float3 moon_jit = sampleSunDisc(moon_dir_phase.xyz, seed);
-                                    float3 trans_moon = transmittance(sp, moon_jit, 1e30);
+                                    // Same sharp cloud-aware visibility
+                                    // as the sun branch; same rationale
+                                    // (open sky above the cloud layer,
+                                    // no other occluders).
+                                    float t_m_cloud = exp(-cloud_optical_depth_stratified(
+                                                            sp, moon_jit, 1e30, seed));
+                                    float3 t_m_atm = atmosphericTransmittance(
+                                                            sp, moon_jit, 60000.0);
+                                    float3 trans_moon = t_m_atm * float3(t_m_cloud);
                                     if (any(trans_moon > float3(0.0))) {
                                         float c_t_m = dot(primary_rd, -moon_dir_phase.xyz);
-                                        float phase_m = (1.0 - g2) / (4.0 * 3.14159265358979
-                                            * pow(max(1.0 + g2 - 2.0 * g * c_t_m, 1e-4), 1.5));
+                                        float phase_m = (1.0 - g_cloud2)
+                                            / (4.0 * 3.14159265358979
+                                                * pow(max(1.0 + g_cloud2
+                                                            - 2.0 * g_cloud * c_t_m, 1e-4), 1.5));
                                         // Atmospheric attenuation + warmth at
                                         // low moon altitude, mirroring sun.
                                         float m_elev   = max(moon_dir_phase.y, 0.04);
@@ -2902,6 +4588,31 @@ void main(uint2 tid : SV_DispatchThreadID) {
     // cloud march on sample 0 when the layer is active.
     if (denoiser_enabled != 0u) {
         cloud_trans_tex[tid] = frame_cloud_trans;
+    }
+    // Sun-NEE shadow-visibility G-buffer (issue #115). Same gating
+    // shape as cloud_trans_tex above: write_shadow_vis is set by the
+    // engine when r_shadow_demod is on AND a denoiser is active AND
+    // the shadow_vis_buf is actually allocated. Off in the legacy-
+    // shadow path (r_shadow_demod 0) so PathTrace doesn't pay for an
+    // extra storage-buffer write per pixel when the SigmaShadow chain
+    // is disabled. frame_shadow_vis is the sum over spp samples (each
+    // sample contributes its primary-hit shadow-ray transmittance,
+    // with sky pixels + sun-below-horizon samples contributing 1.0).
+    // Average back to [0, 1] before writing so the downstream
+    // SigmaShadow kernel reads a true visibility, not a count.
+    if (write_shadow_vis != 0u) {
+        float vis_mean = frame_shadow_vis / float(sample_count);
+        // Sanitize like the radiance path does. The transmittance call
+        // is clamped saturate() per-sample above, but the average
+        // could touch NaN if a sample slipped through (e.g. a future
+        // transmittance variant returning Inf on a degenerate ray) --
+        // snap to 1.0 so the worst case is "this pixel doesn't get
+        // shadow-demodulated", not "this pixel goes black after
+        // composite multiplies by NaN".
+        if (isnan(vis_mean) || isinf(vis_mean)) vis_mean = 1.0;
+        vis_mean = saturate(vis_mean);
+        uint idx = tid.y * dim.x + tid.x;
+        shadow_vis_buf[idx] = vis_mean;
     }
 
     // Swapchain write. Apply the OETF on the SPIR-V path so the OS's

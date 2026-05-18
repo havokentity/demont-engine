@@ -14,6 +14,7 @@
 #include "MetalSvgfDenoiser.h"
 #include "../core/Log.h"
 #include "../core/Memory/Memory.h"
+#include "../core/Tracy.h"
 
 #include <fmt/format.h>
 #include <cstring>
@@ -35,15 +36,42 @@ extern const unsigned char shader_PerfOverlay_metal_data[];
 extern const unsigned long shader_PerfOverlay_metal_size;
 extern const unsigned char shader_StarsComposite_metal_data[];
 extern const unsigned long shader_StarsComposite_metal_size;
+extern const unsigned char shader_AuroraComposite_metal_data[];
+extern const unsigned long shader_AuroraComposite_metal_size;
+// SIGMA shadow denoiser kernel (issue #115).
+extern const unsigned char shader_SigmaShadow_metal_data[];
+extern const unsigned long shader_SigmaShadow_metal_size;
+extern const unsigned char shader_ParticleComposite_metal_data[];
+extern const unsigned long shader_ParticleComposite_metal_size;
+// ReSTIR DI Phase A kernels (issue #78). Three compute kernels chained
+// behind PathTrace's WRS candidate-generation pass: temporal reuse ->
+// spatial reuse -> final shadow-test + Lambert composite into
+// denoise_color. See shaders/Restir{Temporal,Spatial,Final}.slang for
+// the algorithmic rationale + bindings.
+extern const unsigned char shader_RestirTemporal_metal_data[];
+extern const unsigned long shader_RestirTemporal_metal_size;
+extern const unsigned char shader_RestirSpatial_metal_data[];
+extern const unsigned long shader_RestirSpatial_metal_size;
+extern const unsigned char shader_RestirFinal_metal_data[];
+extern const unsigned long shader_RestirFinal_metal_size;
 }
 
 // MetalFXDenoiser.mm: ObjC++ shim around MTLFXTemporalDenoisedScaler.
 extern "C" void* pt_metalfx_create(void* mtl_device, std::uint32_t w, std::uint32_t h);
 extern "C" void  pt_metalfx_destroy(void* scaler);
+// pt_metalfx_encode parameters (issue #118 adds the specular-guidance
+// trio: specular_albedo_in / roughness_in / specular_hit_distance_in):
+//   state, mtl_cb, color_in, depth_in, motion_in, normal_in, albedo_in,
+//   specular_albedo_in (#118), roughness_in (#118),
+//   specular_hit_distance_in (#118), color_out, jitter_x, jitter_y,
+//   world_to_view, view_to_clip, reset.
 extern "C" void  pt_metalfx_encode(void* scaler, void* mtl_cb,
                                     void* color_in, void* depth_in,
                                     void* motion_in,
                                     void* normal_in, void* albedo_in,
+                                    void* specular_albedo_in,
+                                    void* roughness_in,
+                                    void* specular_hit_distance_in,
                                     void* color_out,
                                     float jitter_x, float jitter_y,
                                     const float* world_to_view_4x4,
@@ -322,6 +350,34 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
     build_pso("stars_composite",
               shader_StarsComposite_metal_data,
               shader_StarsComposite_metal_size);
+    build_pso("aurora_composite",
+              shader_AuroraComposite_metal_data,
+              shader_AuroraComposite_metal_size);
+    build_pso("sigma_shadow",
+              shader_SigmaShadow_metal_data,
+              shader_SigmaShadow_metal_size);
+    // Screen-space particle composite (#82 MVP). Runs after the
+    // celestials/aurora composites + the SIGMA shadow demod, before
+    // the bloom pyramid. See shaders/ParticleComposite.slang +
+    // Engine::RenderFrame for the dispatch site.
+    build_pso("particle_composite",
+              shader_ParticleComposite_metal_data,
+              shader_ParticleComposite_metal_size);
+    // ReSTIR DI Phase A (#78). Dispatched in order after the path
+    // tracer's WRS-initialised reservoir write: temporal reuse,
+    // spatial reuse, final shadow-test + composite. Names mirror the
+    // resolve() calls in Engine::EnsurePipelineHandles so the engine's
+    // dispatch gates collapse to "no ReSTIR" if any of the three
+    // pipelines failed to build.
+    build_pso("restir_temporal",
+              shader_RestirTemporal_metal_data,
+              shader_RestirTemporal_metal_size);
+    build_pso("restir_spatial",
+              shader_RestirSpatial_metal_data,
+              shader_RestirSpatial_metal_size);
+    build_pso("restir_final",
+              shader_RestirFinal_metal_data,
+              shader_RestirFinal_metal_size);
 
     cmd_ = std::make_unique<MetalCommandBuffer>(this);
 }
@@ -357,6 +413,7 @@ MetalDevice::~MetalDevice() {
 }
 
 void MetalDevice::Denoise(const DenoiseDesc& d) {
+    PT_ZONE_SCOPED_N("MetalDevice::Denoise");
     if (device_ == nullptr) return;
     if (cmd_ == nullptr || cmd_->RawCmdBuf() == nullptr) {
         // No active command buffer -- caller forgot to AcquireCommandBuffer
@@ -442,11 +499,18 @@ void MetalDevice::Denoise(const DenoiseDesc& d) {
             svgf_target = svgf_metalfx_intermediate_;
         }
 
+        // Issue #119 -- albedo demodulation. Engine pulls albedo_in
+        // alongside the rest of the G-buffer set; nullptr-tolerant
+        // (the kernel binds a dummy when demod is off OR when the
+        // engine didn't allocate albedo for this denoiser kind).
+        auto* albedo_in_svgf = LookupTexture(d.albedo_in);
         svgf_denoiser_->Encode(cmd_->RawCmdBuf(),
                                 color_in, depth_in, motion_in, normal_in,
+                                albedo_in_svgf,
                                 svgf_target,
                                 d.reset_history, atrous_enabled,
-                                d.atrous_passes);
+                                d.atrous_passes,
+                                d.albedo_demod_enabled);
 
         if (!kind_is_svgf_chain) return;
 
@@ -487,12 +551,17 @@ void MetalDevice::Denoise(const DenoiseDesc& d) {
             metalfx_height_ = h;
         }
         // Guidance G-buffers: normal already looked up above for SVGF;
-        // albedo also goes to MetalFX so look it up here. Both default
-        // to nullptr if the engine didn't allocate them (which it
-        // should for SVGF->MetalFX kinds per the want_*_gbuffer gates
-        // in Engine.cpp, but Apple's scaler tolerates nil bindings as
-        // "no guidance for this frame" rather than crashing).
-        auto* albedo_in_chain = LookupTexture(d.albedo_in);
+        // albedo + specular trio also go to MetalFX so look them up
+        // here. All default to nullptr if the engine didn't allocate
+        // them (which it should for SVGF->MetalFX kinds per the
+        // want_*_gbuffer gates in Engine.cpp, but Apple's scaler
+        // tolerates nil bindings as "no guidance for this frame"
+        // rather than crashing). Issue #118 adds the specular trio:
+        // specular_albedo (F0), roughness, specular_hit_distance.
+        auto* albedo_in_chain               = LookupTexture(d.albedo_in);
+        auto* specular_albedo_in_chain      = LookupTexture(d.specular_albedo_in);
+        auto* roughness_in_chain            = LookupTexture(d.roughness_in);
+        auto* specular_hit_distance_in_chain = LookupTexture(d.specular_hit_distance_in);
         pt_metalfx_encode(metalfx_scaler_,
                           static_cast<void*>(cmd_->RawCmdBuf()),
                           static_cast<void*>(svgf_metalfx_intermediate_),
@@ -500,6 +569,9 @@ void MetalDevice::Denoise(const DenoiseDesc& d) {
                           static_cast<void*>(motion_in),
                           static_cast<void*>(normal_in),
                           static_cast<void*>(albedo_in_chain),
+                          static_cast<void*>(specular_albedo_in_chain),
+                          static_cast<void*>(roughness_in_chain),
+                          static_cast<void*>(specular_hit_distance_in_chain),
                           static_cast<void*>(color_out),
                           d.jitter_x, d.jitter_y,
                           d.world_to_view, d.view_to_clip,
@@ -523,13 +595,20 @@ void MetalDevice::Denoise(const DenoiseDesc& d) {
     }
 
     // Guidance G-buffers (Apple's MTLFXTemporalDenoisedScaler accepts
-    // normal + diffuse-albedo inputs to weight its spatial filter --
-    // without these MetalFX falls back to a conservative blur that
-    // doesn't converge on static cameras). Engine allocates these for
-    // MetalFX kinds via want_normal_gbuffer / want_albedo_gbuffer; a
-    // nil handle is tolerated by the scaler as "no guidance".
-    auto* normal_in_mfx = LookupTexture(d.normal_in);
-    auto* albedo_in_mfx = LookupTexture(d.albedo_in);
+    // normal + diffuse-albedo + specular-trio inputs to weight its
+    // spatial filter -- without these MetalFX falls back to a
+    // conservative blur that doesn't converge on static cameras and
+    // produces 8x8 halos on bright reflections / metals). Engine
+    // allocates these for MetalFX kinds via want_normal_gbuffer /
+    // want_albedo_gbuffer / want_specular_guidance_gbuffers; a nil
+    // handle is tolerated by the scaler as "no guidance" for that
+    // input. Issue #118 added the specular trio: specular_albedo (F0),
+    // roughness, specular_hit_distance.
+    auto* normal_in_mfx                = LookupTexture(d.normal_in);
+    auto* albedo_in_mfx                = LookupTexture(d.albedo_in);
+    auto* specular_albedo_in_mfx       = LookupTexture(d.specular_albedo_in);
+    auto* roughness_in_mfx             = LookupTexture(d.roughness_in);
+    auto* specular_hit_distance_in_mfx = LookupTexture(d.specular_hit_distance_in);
     pt_metalfx_encode(metalfx_scaler_,
                       static_cast<void*>(cmd_->RawCmdBuf()),
                       static_cast<void*>(color_in),
@@ -537,6 +616,9 @@ void MetalDevice::Denoise(const DenoiseDesc& d) {
                       static_cast<void*>(motion_in),
                       static_cast<void*>(normal_in_mfx),
                       static_cast<void*>(albedo_in_mfx),
+                      static_cast<void*>(specular_albedo_in_mfx),
+                      static_cast<void*>(roughness_in_mfx),
+                      static_cast<void*>(specular_hit_distance_in_mfx),
                       static_cast<void*>(color_out),
                       d.jitter_x, d.jitter_y,
                       d.world_to_view, d.view_to_clip,
@@ -660,6 +742,7 @@ void MetalDevice::DestroyPipeline(PipelineHandle h) {
 
 AccelStructHandle MetalDevice::CreateBLAS(const BLASDesc& d) {
     if (device_ == nullptr || d.vertex_count == 0 || d.index_count == 0) return {0};
+    PT_ZONE_SCOPED_N("MetalDevice::CreateBLAS");
     pt::mem::TagScope scope(pt::MemTag::GpuBuffers);
     auto* pool = NS::AutoreleasePool::alloc()->init();
 
@@ -708,6 +791,7 @@ AccelStructHandle MetalDevice::CreateBLAS(const BLASDesc& d) {
 
 AccelStructHandle MetalDevice::CreateTLAS(const TLASDesc& d) {
     if (device_ == nullptr || d.instances.empty()) return {0};
+    PT_ZONE_SCOPED_N("MetalDevice::CreateTLAS");
     pt::mem::TagScope scope(pt::MemTag::GpuBuffers);
     auto* pool = NS::AutoreleasePool::alloc()->init();
 
@@ -849,6 +933,7 @@ CommandBuffer* MetalDevice::AcquireCommandBuffer() {
 }
 
 void MetalDevice::Submit(CommandBuffer* cb) {
+    PT_ZONE_SCOPED_N("MetalDevice::Submit");
     auto* mcb = static_cast<MetalCommandBuffer*>(cb);
     if (mcb == nullptr || mcb->RawCmdBuf() == nullptr) return;
     mcb->Reset(mcb->RawCmdBuf());  // ends encoder if open

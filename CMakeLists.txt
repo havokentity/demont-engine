@@ -13,7 +13,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
 endif()
 
 project(demont
-    VERSION 0.3.29
+    VERSION 0.3.30
     DESCRIPTION "DeMonT Engine -- non-rasterized real-time game engine. Path-traced every pixel, mesh CSG via Manifold. Metal + MetalFX denoiser on Apple Silicon, Vulkan + SVGF compute denoiser on NVIDIA RTX."
     LANGUAGES C CXX
 )
@@ -31,6 +31,30 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(PT_ENABLE_VULKAN_BACKEND "Build Vulkan/MoltenVK backend (P4+)"   ON)
 option(PT_ENABLE_OPTIX
     "Build OptiX denoiser (NVIDIA only; needs CUDA Toolkit + OptiX SDK installed)" ON)
+# NVIDIA RayTracingDenoiser (NRD) library integration -- issue #50.
+#
+# When ON, top-level Dependencies.cmake fetches NRD v4.17.3 via FetchContent
+# and the Vulkan backend compiles VulkanNrdLibDenoiser.cpp + links libNRD.
+# When OFF (default), neither the fetch nor the link happens -- the engine
+# still compiles + runs, the `r_denoiser nrd` cvar value keeps aliasing the
+# in-house SVGF chain (its long-standing behaviour). Default OFF because:
+#   1. NRD is Vulkan-only and Apple Silicon (the project's primary platform)
+#      can never use it -- forcing a 4 MB+ dep on every configure would be
+#      pure overhead for those users.
+#   2. NRD's CMake spawns a custom_target that invokes its `ShaderMake` /
+#      `dxc-spirv` toolchain to compile HLSL -> SPIR-V at configure time.
+#      That's a non-trivial transitive-dep chain that platform packagers
+#      may not have set up; opt-in keeps the default `cmake --preset
+#      mac-release` configure path identical to before this PR.
+#   3. The integration is staged -- v0.3.30 lands the scaffolding (CMake
+#      gates + VulkanNrdLibDenoiser stub) so a follow-up PR can land the
+#      actual per-frame Dispatch translation without re-touching CMake.
+#
+# Hard-gated to non-Apple in Dependencies.cmake (NRD is Vulkan-only and the
+# Mac path uses Metal + MetalFX); a user passing -DPT_ENABLE_NRD=ON on Mac
+# gets a single warning and the option is force-OFF'd for that configure.
+option(PT_ENABLE_NRD
+    "Build NVIDIA NRD denoiser (Vulkan-only; non-Apple platforms; needs ShaderMake/dxc-spirv toolchain)" OFF)
 option(PT_ENABLE_TRACY          "Enable Tracy profiler client"          ON)
 # ASan + mimalloc do not coexist cleanly without MI_TRACK_ASAN; opt-in only.
 # Driven by the linux-asan-ubsan-debug preset in CMakePresets.json on CI;

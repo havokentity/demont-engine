@@ -4,6 +4,7 @@
 
 #include "../core/Diag.h"
 #include "../core/Log.h"
+#include "../core/Tracy.h"
 
 #include <algorithm>
 #include <cmath>
@@ -94,6 +95,7 @@ bool DecodeScanlineRle(std::FILE* f, std::uint32_t width,
 }  // namespace
 
 HdrImage LoadRadianceHdr(const std::string& path, std::string* out_error) {
+    PT_ZONE_SCOPED_N("renderer::LoadRadianceHdr");
     HdrImage img;
     auto fail = [&](const char* msg) -> HdrImage {
         if (out_error) *out_error = msg;

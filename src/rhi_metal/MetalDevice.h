@@ -72,8 +72,8 @@ private:
     MTL::ComputeCommandEncoder* encoder_    = nullptr;
 
     PipelineHandle             bound_pso_{0};
-    // Texture slot map: 11 slots covering every kernel's max engine
-    // slot. PathTrace fills slots 0..10:
+    // Texture slot map: 14 slots covering every kernel's max engine
+    // slot. PathTrace fills slots 0..13:
     //   0  output / swapchain
     //   1  accum_hdr
     //   2  denoise_color
@@ -82,15 +82,23 @@ private:
     //   5  env_map (HDRI)
     //   6  star_map (BSC)
     //   7  moon_map
-    //   8  normal_tex (SVGF / NRD / OptiX-AOV)
-    //   9  albedo_tex (OptiX-AOV only)
+    //   8  normal_tex (SVGF / NRD / OptiX-AOV / MetalFX)
+    //   9  albedo_tex (OptiX-AOV / MetalFX)
     //   10 cloud_trans_tex (issue #46 follow-up: R32F per-pixel cloud
     //      transmittance the path tracer writes and StarsComposite
     //      reads). On Metal slots above the kernel's actual texture
     //      count are silently dropped; on Vulkan the slot table in
     //      VulkanDevice.cpp maps them to vk::binding numbers.
-    TextureHandle              bound_tex_[11] {};
-    // 11 buffer slots. Slots 0..7 are the original engine layout
+    //   11 specular_albedo_tex (issue #118: RGBA16F per-pixel F0 for
+    //      MetalFX TemporalDenoisedScaler specular guidance)
+    //   12 roughness_tex (issue #118: R32F per-pixel roughness)
+    //   13 specular_hit_distance_tex (issue #118: R32F distance to
+    //      specularly-reflected hit)
+    //   On Metal slots above the kernel's actual texture count are
+    //   silently dropped; on Vulkan the slot table in
+    //   VulkanDevice.cpp maps them to vk::binding numbers.
+    TextureHandle              bound_tex_[14] {};
+    // Buffer slots. Slots 0..7 are the original engine layout
     // (mesh_positions / mesh_indices, primitives, marginal /
     // conditional CDFs, exposure_state, analytic-prim bvh_nodes).
     // Slots 8/9 were added in the PR #106 follow-up for the triangle
@@ -99,10 +107,35 @@ private:
     // Slot 10 was added by SDF Phase 1 (#97) for the SDF cluster
     // storage buffer (MSL slot 10 in the path tracer's dynamic
     // buffer-slot layout; moved from slot 8 to make room for the
-    // triangle BVH). Keep in sync with the engine's BindBuffer(10,...)
-    // call site.
-    BufferHandle               bound_buf_[11] {};
-    std::size_t                bound_buf_off_[11] {};
+    // triangle BVH). Slot 11 was added by issue #115 for the SIGMA
+    // shadow visibility buffer (R32F per pixel) -- declared as a
+    // storage buffer rather than an RWTexture2D because PathTrace
+    // already sits exactly at Apple Silicon's 8-RW-texture compute
+    // cap; storage buffers escape that quota the same way SVGF's
+    // variance / moments buffers do.
+    //
+    // Slot 12 was added by light primitives (#73) for the analytic
+    // light list (`light_prims`, MSL slot 12; the shader declares it
+    // at vk::binding(27)). Declared AFTER shadow_vis_buf so the
+    // existing slot 11 stays put. Engine binds it via
+    // BindBuffer(12, ...).
+    //
+    // Slot 13 added by the hierarchical light tree (#129) for the
+    // packed-node SSBO consumed by PathTrace.slang's O(log N) NEE
+    // picker. MSL slot 13 (declared AFTER light_prims so the existing
+    // slots 0..12 stay put); the shader's matching vk::binding is 28.
+    // Engine binds it via BindBuffer(13, ...), with a placeholder-buffer
+    // fallback when the tree is empty so Metal's push-slot computation
+    // stays stable.
+    //
+    // Issue #78 (ReSTIR DI Phase A) extends to slot 14 for the
+    // per-pixel reservoir SSBO (`reservoir_curr_buf`, MSL slot 14;
+    // vk::binding(29)). Declared AFTER light_tree so the existing
+    // slots 0..13 stay put. Array bumped to 16 to land slot 14
+    // safely AND leave one slot of headroom for the next batched
+    // feature without another bump.
+    BufferHandle               bound_buf_[16] {};
+    std::size_t                bound_buf_off_[16] {};
     AccelStructHandle          bound_accel_[4] {};
 
     // Push-constant buffer. Sized to fit the unified PathTrace push

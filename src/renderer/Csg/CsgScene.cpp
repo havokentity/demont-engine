@@ -3,6 +3,7 @@
 #include "CsgScene.h"
 
 #include "../../core/Log.h"
+#include "../../core/Tracy.h"
 
 #include <manifold/manifold.h>
 
@@ -298,6 +299,7 @@ void CsgScene::AcknowledgeClean() {
 }
 
 BakedMesh CsgScene::Bake(std::string* out_error) const {
+    PT_ZONE_SCOPED_N("CsgScene::Bake");
     BakedMesh result;
     std::shared_ptr<manifold::Manifold> root;
     {

@@ -72,6 +72,14 @@ public:
     // before this).
     //   color_in / depth_in / motion_in / normal_in -- engine-owned
     //     G-buffer textures (path tracer wrote these earlier in `cb`).
+    //   albedo_in -- engine-owned primary-hit albedo G-buffer (issue
+    //     #119). Required when `albedo_demod_enabled` is true; the
+    //     SVGF chain divides input radiance by this and the remod
+    //     pass multiplies back to produce textured radiance. May be
+    //     nullptr when demod is disabled -- the temporal/atrous
+    //     kernels still BIND a placeholder (dummy_color_) so MSL has
+    //     a valid argument for the [[texture(12)]] slot, and the
+    //     `demod_enabled` push gate at 0 skips every divide/multiply.
     //   output -- engine-owned linear-HDR target the tonemap chain
     //     reads next (= post_denoise_hdr).
     //   reset_history -- true clears the temporal accumulation.
@@ -84,15 +92,22 @@ public:
     //     1 = 5x5 (default), 2 = 9x9, 3 = 17x17, 4 = 33x33,
     //     5 = 65x65 (canonical SVGF / Schied 2017). Ignored when
     //     atrous_enabled is false.
+    //   albedo_demod_enabled -- issue #119. True keeps the entire
+    //     SVGF chain in demodulated lighting space; the remod kernel
+    //     (svgf_basic, or one-pass atrous) or the final atrous pass
+    //     (multi-pass atrous) multiplies albedo back before writing
+    //     to `output`.
     void Encode(MTL::CommandBuffer* cb,
                 MTL::Texture*       color_in,
                 MTL::Texture*       depth_in,
                 MTL::Texture*       motion_in,
                 MTL::Texture*       normal_in,
+                MTL::Texture*       albedo_in,
                 MTL::Texture*       output,
                 bool                reset_history,
                 bool                atrous_enabled,
-                std::uint32_t       atrous_passes);
+                std::uint32_t       atrous_passes,
+                bool                albedo_demod_enabled);
 
     bool Ready() const { return ready_; }
 
@@ -104,6 +119,12 @@ private:
     bool                        ready_        = false;
     MTL::ComputePipelineState*  temporal_pso_ = nullptr;
     MTL::ComputePipelineState*  atrous_pso_   = nullptr;
+    // Issue #119 -- remodulation kernel. Reads the SVGF chain's last
+    // demodulated write and the albedo G-buffer, writes the textured
+    // radiance into `output`. Only dispatched when albedo_demod is
+    // on AND the chain's last writer wasn't already remod-capable
+    // (the multi-pass atrous final pass handles it inline).
+    MTL::ComputePipelineState*  remod_pso_    = nullptr;
 
     // Scratch resources (owned). Cross-frame ping-pong:
     //   history_*         RGBA16F texture (rgb = first-A-Trous output, a = sample count)
