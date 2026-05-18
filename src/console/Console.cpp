@@ -146,6 +146,170 @@ bool Console::SetCVarOverride(std::string_view name, std::string_view value) {
     return true;
 }
 
+// ---------- Platform-visibility / per-value-gate helpers ------------------
+// Defined here (before Execute / ResolveCommand) because both methods
+// consult them. The free-function versions
+// (CVarValueAllowedOnThisPlatform, CurrentPlatformName) are part of the
+// public surface declared in Console.h; the anon-namespace helpers
+// (CVarVisibleOnThisPlatform, AllowedValuesForCurrentPlatformCsv,
+// ValueFlagsFor, PlatformsFromMask) are TU-local.
+
+namespace {
+
+// A cvar carrying a CVAR_PLATFORM_* bit that doesn't match the current
+// build is hidden from listing + autocomplete. Registration / set /
+// archive paths still work so demont.cfg sharing across hosts keeps
+// round-tripping.
+inline bool CVarVisibleOnThisPlatform(std::uint32_t flags) {
+#if defined(__APPLE__)
+    if ((flags & CVAR_PLATFORM_WIN) != 0) return false;
+#elif defined(_WIN32)
+    if ((flags & CVAR_PLATFORM_MAC) != 0) return false;
+#else
+    if ((flags & (CVAR_PLATFORM_MAC | CVAR_PLATFORM_WIN)) != 0) return false;
+#endif
+    return true;
+}
+
+// Build a CSV of allowed values that pass the per-value platform
+// filter on this host. Used by the error message when the user picks
+// a wrong-platform enum value, so the message lists only values that
+// would actually be accepted.
+std::string AllowedValuesForCurrentPlatformCsv(const CVar& v) {
+    std::string out;
+    for (std::size_t i = 0; i < v.allowed_values.size(); ++i) {
+        std::uint32_t mask = (i < v.allowed_value_flags.size())
+                                 ? v.allowed_value_flags[i]
+                                 : 0u;
+        if (!CVarValueAllowedOnThisPlatform(mask)) continue;
+        if (!out.empty()) out += ", ";
+        out += v.allowed_values[i];
+    }
+    return out;
+}
+
+// Find the CVAR_VALUE_* mask aligned with `value` inside the cvar's
+// allowed set. Returns 0 if the value isn't in the set (caller still
+// has to consult allowed_values).
+std::uint32_t ValueFlagsFor(const CVar& v, std::string_view value) {
+    for (std::size_t i = 0; i < v.allowed_values.size(); ++i) {
+        if (v.allowed_values[i] != value) continue;
+        return (i < v.allowed_value_flags.size())
+                   ? v.allowed_value_flags[i]
+                   : 0u;
+    }
+    return 0u;
+}
+
+// Translate a value-platform mask into a human-readable platform list
+// ("macOS", "Windows/Linux", etc) for the platform-mismatch error.
+std::string PlatformsFromMask(std::uint32_t mask) {
+    std::string s;
+    auto add = [&](const char* p) {
+        if (!s.empty()) s += "/";
+        s += p;
+    };
+    if (mask & CVAR_VALUE_MAC)   add("macOS");
+    if (mask & CVAR_VALUE_WIN)   add("Windows");
+    if (mask & CVAR_VALUE_LINUX) add("Linux");
+    return s;
+}
+
+}  // namespace
+
+bool CVarValueAllowedOnThisPlatform(std::uint32_t value_flags) {
+    if (value_flags == 0u) return true;     // CVAR_VALUE_ANY
+#if defined(__APPLE__)
+    return (value_flags & CVAR_VALUE_MAC) != 0u;
+#elif defined(_WIN32)
+    return (value_flags & CVAR_VALUE_WIN) != 0u;
+#else
+    return (value_flags & CVAR_VALUE_LINUX) != 0u;
+#endif
+}
+
+const char* CurrentPlatformName() {
+#if defined(__APPLE__)
+    return "macOS";
+#elif defined(_WIN32)
+    return "Windows";
+#else
+    return "Linux";
+#endif
+}
+
+Console::Resolution Console::ResolveCommand(std::string_view typed) {
+    Resolution r;
+    if (typed.empty()) return r;
+
+    // 1. Exact match wins immediately, no resolution log needed.
+    if (auto it = cvars_.find(typed); it != cvars_.end()) {
+        r.canonical_name = it->second.name;
+        r.is_exact_match = true;
+        return r;
+    }
+    if (auto it = commands_.find(typed); it != commands_.end()) {
+        r.canonical_name = it->second.name;
+        r.is_exact_match = true;
+        return r;
+    }
+
+    // 2. Gather every cvar/command whose canonical name starts with
+    //    `typed`. For cvars conventionally prefixed with "r_" we also
+    //    accept the post-"r_" body as a typed prefix so `deno` ->
+    //    `r_denoiser` works per the issue #162 acceptance examples.
+    //    This is a small one-step relaxation, not a fuzzy/substring
+    //    search; the test in `cvar_ux_test.cpp` covers both the
+    //    raw-prefix and the strip-r_ paths.
+    //
+    //    Cvars come first in the candidate list (tie-break: cvars
+    //    preferred over commands, per issue #162 spec). The maps are
+    //    std::map so iteration is alphabetical, satisfying the
+    //    final deterministic tie-break.
+    auto matches_prefix = [&](const std::string& name) {
+        if (name.size() >= typed.size() &&
+            name.compare(0, typed.size(), typed) == 0) {
+            return true;
+        }
+        // Strip an "r_" prefix off the registered name and re-check.
+        // Only fires for cvars; commands like `phys_drop_sphere`
+        // already match via the raw-prefix branch.
+        if (name.size() >= 2 && name[0] == 'r' && name[1] == '_') {
+            std::string_view body(name.data() + 2, name.size() - 2);
+            if (body.size() >= typed.size() &&
+                body.compare(0, typed.size(), typed) == 0) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    std::vector<std::string> cvar_hits;
+    std::vector<std::string> cmd_hits;
+    for (const auto& [_, v] : cvars_) {
+        if (!CVarVisibleOnThisPlatform(v.flags)) continue;
+        if (matches_prefix(v.name)) cvar_hits.push_back(v.name);
+    }
+    for (const auto& [_, c] : commands_) {
+        if (matches_prefix(c.name)) cmd_hits.push_back(c.name);
+    }
+
+    const std::size_t total = cvar_hits.size() + cmd_hits.size();
+    if (total == 0) return r;       // no match -- caller falls back to "unknown" error.
+    if (total == 1) {
+        r.canonical_name = cvar_hits.empty() ? cmd_hits.front() : cvar_hits.front();
+        return r;
+    }
+    // Multiple hits: ambiguous. Pack both lists into ambiguous_matches
+    // (cvars first, alphabetical, then commands alphabetical) so the
+    // caller can render the list with the canonical tie-break order
+    // baked in.
+    r.ambiguous_matches.reserve(total);
+    for (auto& n : cvar_hits) r.ambiguous_matches.push_back(std::move(n));
+    for (auto& n : cmd_hits)  r.ambiguous_matches.push_back(std::move(n));
+    return r;
+}
+
 ExecuteResult Console::Execute(std::string_view line) {
     ExecuteResult result;
 
@@ -199,20 +363,75 @@ ExecuteResult Console::Execute(std::string_view line) {
 
     auto name = tokens[0];
 
+    // Smart command resolution (issue #162). If the first token isn't
+    // an exact match, run a prefix search across cvars + commands.
+    // - Unique winner: rewrite `name` to the canonical and prepend an
+    //   info line so the user sees what we picked.
+    // - Ambiguous (>1 match): return an error listing candidates,
+    //   capped at 8 with `... (N more)`, asking for more chars.
+    // - Zero match: fall through to the existing "unknown command or
+    //   cvar" error path.
+    // Gated by the r_console_smart_resolve cvar so users who prefer
+    // strict matching can turn it off (default 1 = on).
+    bool smart_on = true;
+    if (auto* sm = FindCVar("r_console_smart_resolve");
+        sm != nullptr) {
+        smart_on = sm->GetBool();
+    }
+
+    std::string resolution_log;
+    std::string canonical_storage;
+    if (smart_on) {
+        Resolution r = ResolveCommand(name);
+        if (!r.canonical_name.empty() && !r.is_exact_match) {
+            // Rewrite the first token to the canonical name. The
+            // tokens span points into `storage`; rather than mutate
+            // storage in place (which would invalidate other tokens'
+            // string_views), park the canonical name in
+            // `canonical_storage` and rebind `name` to view it.
+            canonical_storage = r.canonical_name;
+            resolution_log = fmt::format(
+                "[console] resolved `{}` -> `{}` (top match)\n",
+                std::string(name), canonical_storage);
+            name = std::string_view(canonical_storage);
+        } else if (r.canonical_name.empty() && !r.ambiguous_matches.empty()) {
+            // Ambiguous -- print at most 8 candidates and a count.
+            constexpr std::size_t kCap = 8;
+            std::string msg = fmt::format(
+                "ambiguous prefix `{}`: ", std::string(name));
+            const std::size_t n = r.ambiguous_matches.size();
+            const std::size_t shown = std::min(n, kCap);
+            for (std::size_t i = 0; i < shown; ++i) {
+                if (i) msg += ", ";
+                msg += r.ambiguous_matches[i];
+            }
+            if (n > kCap) {
+                msg += fmt::format(", ... ({} more)", n - kCap);
+            }
+            msg += "\n        type more characters to disambiguate";
+            result.ok = false;
+            result.error = std::move(msg);
+            return result;
+        }
+        // else: zero match -- fall through to the existing "unknown"
+        // path below so error formatting matches PR #159 behaviour.
+    }
+
     // Try command first.
     if (auto* cmd = FindCommand(name); cmd != nullptr) {
         Output out;
         std::span<const std::string_view> args(tokens.data() + 1, tokens.size() - 1);
         cmd->callback(args, out);
-        result.output = out.Buffer();
+        result.output = resolution_log + out.Buffer();
         return result;
     }
 
     // Then cvar: with no argument we read; with one or more we set.
     if (auto* v = FindCVar(name); v != nullptr) {
         if (tokens.size() == 1) {
-            result.output = fmt::format("{} = \"{}\"  (default \"{}\")",
-                                        v->name, v->value, v->default_value);
+            result.output = resolution_log + fmt::format(
+                "{} = \"{}\"  (default \"{}\")",
+                v->name, v->value, v->default_value);
             return result;
         }
         if ((v->flags & CVAR_READONLY) != 0) {
@@ -285,11 +504,76 @@ ExecuteResult Console::Execute(std::string_view line) {
             }
         }
 
+        // Per-value platform gate (issue #161). A cross-platform cvar
+        // (e.g. r_denoiser) can carry a per-allowed-value platform
+        // mask; picking a wrong-platform value at the console errors
+        // with a platform-mismatch message that lists only the
+        // available-on-this-platform values. NOTE: the value still
+        // gets written so a cfg-load that's running through Execute
+        // doesn't bounce a saved-on-other-host value back to default
+        // -- the error path here only fires when allowed_value_flags
+        // is populated AND the user-typed value is gated off, AND
+        // we're inside an interactive Execute call. We could also
+        // check that the value is allowed_values-valid first (which
+        // it must be by this point), so we don't have to redo that.
+        if (!v->allowed_value_flags.empty()) {
+            std::uint32_t mask = ValueFlagsFor(*v, new_value);
+            if (!CVarValueAllowedOnThisPlatform(mask)) {
+                std::string platforms = PlatformsFromMask(mask);
+                std::string available = AllowedValuesForCurrentPlatformCsv(*v);
+                // Still write the value so a portable demont.cfg
+                // round-trips cleanly: same model as PR #159's
+                // CVAR_PLATFORM_* flag-bit cvars. The error is
+                // returned so the interactive caller knows the
+                // value won't take effect *on this host*.
+                std::string old_value = v->value;
+                v->value = new_value;
+                // Don't fire on_change for an inactive value -- the
+                // engine handler would just try to switch backends
+                // we can't actually use.
+                result.ok = false;
+                result.error = fmt::format(
+                    "{}={} is {}-only; not available on {}.\n"
+                    "        Available on this platform: {}",
+                    v->name, new_value, platforms,
+                    CurrentPlatformName(), available);
+                // result.output records that the value was still
+                // written (cfg round-trip preserved) so the caller
+                // / cfg loader sees the state mutation.
+                result.output = resolution_log + fmt::format(
+                    "{}: \"{}\" -> \"{}\" (inactive: platform-gated)",
+                    v->name, old_value, v->value);
+                return result;
+            }
+        }
+
         std::string old_value = v->value;
         v->value = std::move(new_value);
         if (v->on_change) v->on_change(*v);
-        result.output = fmt::format("{}: \"{}\" -> \"{}\"",
-                                    v->name, old_value, v->value);
+
+        // Cross-cvar dependency warning (issue #161). Evaluated AFTER
+        // the value is committed -- the predicate inspects current
+        // engine state; if it's false, we emit a one-line `[warn]`
+        // hint that includes the prerequisite and a fix suggestion.
+        // Never blocks the set. This matters for cfg-load order: a
+        // user's demont.cfg that sets the dependent cvar before the
+        // dependency would otherwise produce a spurious warning at
+        // every line, so we suppress warnings while replaying scripts
+        // (the cfg loader uses ExecuteScript which sets a flag --
+        // see ExecuteScript() below) and only warn on real
+        // interactive sets.
+        std::string warn_line;
+        if (!dep_warn_suppressed_ &&
+            v->requires_predicate && !v->requires_predicate()) {
+            warn_line = fmt::format("[warn] {}", v->requires_hint);
+        }
+
+        result.output = resolution_log + fmt::format(
+            "{}: \"{}\" -> \"{}\"", v->name, old_value, v->value);
+        if (!warn_line.empty()) {
+            result.output.push_back('\n');
+            result.output.append(warn_line);
+        }
         return result;
     }
 
@@ -517,25 +801,6 @@ void Console::Drain() {
         }
     }
 }
-
-namespace {
-
-// A cvar carrying a CVAR_PLATFORM_* bit that doesn't match the current
-// build is hidden from listing + autocomplete. Registration / set /
-// archive paths still work so demont.cfg sharing across hosts keeps
-// round-tripping.
-inline bool CVarVisibleOnThisPlatform(std::uint32_t flags) {
-#if defined(__APPLE__)
-    if ((flags & CVAR_PLATFORM_WIN) != 0) return false;
-#elif defined(_WIN32)
-    if ((flags & CVAR_PLATFORM_MAC) != 0) return false;
-#else
-    if ((flags & (CVAR_PLATFORM_MAC | CVAR_PLATFORM_WIN)) != 0) return false;
-#endif
-    return true;
-}
-
-}  // namespace
 
 void Console::EnumerateCVars(std::string_view prefix,
                              const std::function<void(CVar&)>& visitor) {
