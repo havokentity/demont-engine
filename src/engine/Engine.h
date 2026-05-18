@@ -83,7 +83,13 @@ public:
     // buffer whenever the set changes.
     struct AnalyticPrim {
         enum Type     : std::uint8_t { Sphere = 0, Plane = 1 };
-        enum Material : std::uint8_t { Lambert = 0, Metal = 1, Dielectric = 2 };
+        // Material enum mirrors PathTrace.slang MAT_* constants. Water is
+        // the Phase 1 (#134) addition: shaded analytic plane with normal-
+        // map waves + Beer's-law absorption + Schlick Fresnel + Snell
+        // refraction. New entries MUST be appended at the end to preserve
+        // the host->shader integer mapping pack_prim writes into the
+        // primitives storage buffer.
+        enum Material : std::uint8_t { Lambert = 0, Metal = 1, Dielectric = 2, Water = 3 };
         Type     type      = Sphere;
         Material material  = Lambert;
         float    pos_or_n[3] {0, 0, 0};   // sphere center / plane normal
