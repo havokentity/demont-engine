@@ -543,6 +543,16 @@ namespace cvar {
     PT_CVAR(r_volumetric_intensity, "1.0",  "Linear scale on the volumetric contribution. Useful to dial god rays up/down without changing the underlying density.", CVAR_ARCHIVE);
     PT_CVAR(r_volumetric_samples,   "16",   "March sample count per primary ray (4..64). More = smoother shafts at proportional GPU cost. 16 is a comfortable default with the denoiser on.", CVAR_ARCHIVE);
 
+    // Phase 4 (#100) heterogeneous volumetric raymarching cvars. These
+    // affect the CLOUD march specifically (vol_density_scale, vol_phase_g,
+    // vol_multiscatter_bounces); the atmospheric Mie/Rayleigh haze march
+    // keeps its own r_volumetric_* cvars above. Naming with r_vol_ matches
+    // the issue spec exactly and keeps the haze knobs (r_volumetric_*)
+    // separate so users can tune them independently.
+    PT_CVAR(r_vol_density_scale,        "1.0",  "Cloud volumetric density scale (Phase 4, #100). Linear multiplier on the per-step cloud sigma_t inside the cloud march. 0.5 = half-thickness clouds; 2.0 = double-thickness. Carries through to shadow rays so the cloud's Beer-Lambert occlusion stays consistent with the body it casts shadows from. Range: clamped to >=1e-3 shader-side (a literal 0 would render the cloud as a transmissive haze, which is what r_clouds=0 means instead).", CVAR_ARCHIVE);
+    PT_CVAR(r_vol_phase_g,              "0.8",  "Cloud Henyey-Greenstein anisotropy g (Phase 4, #100). Decoupled from r_volumetric_anisotropy (which controls the atmospheric haze). +0.8 = canonical cumulus forward-scatter lobe (silver lining around the sun edge); 0 = isotropic; negative = back-scatter. Range [-0.95, 0.95] clamped shader-side; outside that the HG denominator pinches to zero on grazing directions and produces firefly spikes.", CVAR_ARCHIVE);
+    PT_CVAR(r_vol_multiscatter_bounces, "2",    "Cloud multi-scatter octaves (Phase 4, #100). Wrenninge-style cheap proxy for diffuse light bouncing several times inside the cloud volume before exiting toward the camera. 0 = pure single-scatter (legacy behaviour; cloud cores under self-shadow read pitch-black); 1-4 = N additional octaves of decaying-extinction (a=0.5 per octave) decaying-anisotropy (b=0.5 per octave) fake bounces. Default 2 matches the issue spec and gives cumulus the bright diffuse fill expected. Clamped to 0..4 shader-side.", CVAR_ARCHIVE);
+
     // Volumetric clouds. Layer on top of homogeneous haze: when r_clouds
     // is on, the volumetric march multiplies sigma_t by a position-
     // sampled cloud density (procedural fbm value-noise). Presets
@@ -3763,8 +3773,25 @@ void Engine::RenderFrame() {
         // Followed by 12 bytes of pad so the trailing block lands on
         // a 16-byte boundary, matching the std140 / MSL cbuffer rule
         // Slang applies to the shader-side `Push` / `Frame` blocks.
+        //
+        // Phase 4 (#100) heterogeneous volumetric raymarching repurposes
+        // the original 12-byte trailing pad as three floats:
+        //   vol_density_scale     -- r_vol_density_scale cvar; linear
+        //                            multiplier on the cloud sigma_t
+        //                            inside the cloud march body.
+        //   vol_phase_g_cloud     -- r_vol_phase_g cvar; HG anisotropy
+        //                            for the cloud march, decoupled
+        //                            from vol_params.y (atmospheric
+        //                            haze g).
+        //   vol_multiscatter_oct  -- r_vol_multiscatter_bounces cvar
+        //                            (cast to float; shader clamps to
+        //                            0..4 ints). Number of Wrenninge-
+        //                            style multi-scatter octaves added
+        //                            on top of single-scatter.
         std::uint32_t composite_celestials;
-        std::uint32_t _pad_star_split[3];
+        float vol_density_scale;
+        float vol_phase_g_cloud;
+        float vol_multiscatter_oct;
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -3927,7 +3954,23 @@ void Engine::RenderFrame() {
             depth_tex_id_ != 0;
         push.composite_celestials = engine_composite_active ? 1u : 0u;
     }
-    for (auto& v : push._pad_star_split) v = 0u;
+    // Phase 4 (#100) cvar pull. Defaults match the issue spec:
+    //   r_vol_density_scale       1.0   neutral linear scale
+    //   r_vol_phase_g             0.8   canonical cumulus forward lobe
+    //   r_vol_multiscatter_bounces 2    Wrenninge octave count
+    // Clamping happens shader-side (see PathTrace.slang's cloud march
+    // body) so cvar interaction stays self-documenting in the shader.
+    {
+        float dscale   = 1.0f;
+        float phase_g  = 0.8f;
+        int   ms_bnc   = 2;
+        if (auto* v = C.FindCVar("r_vol_density_scale"))       dscale  = v->GetFloat();
+        if (auto* v = C.FindCVar("r_vol_phase_g"))             phase_g = v->GetFloat();
+        if (auto* v = C.FindCVar("r_vol_multiscatter_bounces")) ms_bnc = v->GetInt();
+        push.vol_density_scale    = dscale;
+        push.vol_phase_g_cloud    = phase_g;
+        push.vol_multiscatter_oct = float(ms_bnc);
+    }
 
     // Halton(2,3) sub-pixel jitter sequence in [-0.5, 0.5] each axis.
     // 16-sample period before repeating; ample for the denoiser's
