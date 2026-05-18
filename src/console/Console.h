@@ -213,6 +213,19 @@ public:
     // for values that contain spaces is wrapped in double quotes.
     int SaveArchivedCvars(const std::string& path);
 
+    // Reset every cvar to its registered `default_value`. Useful for
+    // clean-room testing: pair with `--no-cfg` CLI flag (which skips
+    // demont.cfg + autoexec.cfg load) or call interactively as
+    // `cvar_reset_all` to wipe a session's mutations without
+    // restarting the engine. Returns the number of cvars whose value
+    // actually changed (cvars already at default contribute 0). The
+    // `on_change` hook fires for each changed cvar exactly once so any
+    // engine-side state derived from cvar values (sky mode, denoiser
+    // pipeline selection, etc.) re-syncs to defaults on the same call.
+    // Records a single undo entry covering every cvar reset, so a
+    // subsequent Undo() restores the pre-reset state in one step.
+    std::size_t ResetAllCVarsToDefaults();
+
     // Cvar undo / redo. Each ExecuteScript transaction captures the
     // pre-values of every cvar it touched and pushes them as one
     // entry on the undo stack. Undo() pops the top and restores;

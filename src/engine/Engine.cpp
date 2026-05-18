@@ -1161,8 +1161,31 @@ bool Engine::Init() {
     // interactive user-set path re-engages predicate evaluation.
     cfg_loading_ = true;
     pt::console::Console::Get().SetSuppressDepWarnings(true);
-    exec_if_exists("demont.cfg");      // archived cvars from last quit
-    exec_if_exists("autoexec.cfg");    // user-supplied startup script (overrides above)
+
+    // `--no-cfg` (bare flag, no `=value`) skips BOTH demont.cfg and
+    // autoexec.cfg load. Lets a tester run a golden-fixture scene
+    // against a guaranteed-default cvar state without first having to
+    // `mv demont.cfg demont.cfg.bak`. Pairs naturally with the
+    // `cvar_reset_all` console command for runtime resets. The flag
+    // parses here -- BEFORE the cfg-load calls below -- because the
+    // generic `--<cvar>=value` override pass runs AFTER cfg load and
+    // can't be used to express "don't load the cfg in the first place."
+    bool skip_cfg_load = false;
+    if (argv_ != nullptr) {
+        for (int i = 1; i < argc_; ++i) {
+            if (argv_[i] == nullptr) continue;
+            if (std::string_view(argv_[i]) == "--no-cfg") {
+                skip_cfg_load = true;
+                break;
+            }
+        }
+    }
+    if (skip_cfg_load) {
+        LOG_INFO("engine: --no-cfg given -- skipping demont.cfg + autoexec.cfg load");
+    } else {
+        exec_if_exists("demont.cfg");      // archived cvars from last quit
+        exec_if_exists("autoexec.cfg");    // user-supplied startup script (overrides above)
+    }
 
     // Command-line cvar overrides land last so they beat both archived
     // and autoexec values. Currently this is the entry point for
@@ -8702,6 +8725,24 @@ void Engine::RegisterCommands() {
                 [&](pt::console::Command& c) {
                     out.FormatLine("{} -- {}", c.name, c.description);
                 });
+        });
+
+    // Reset every cvar to its default value -- pair with the `--no-cfg`
+    // CLI flag for fully clean-room testing, or call interactively to
+    // undo a session's mutations without restarting the engine. Single
+    // undo entry so a follow-up `r_undo` restores the pre-reset state.
+    // Useful for testers running multiple golden-fixture scenes in a
+    // row -- prevents the first scene's cvars from leaking into the
+    // second's render state.
+    C.RegisterCommand("cvar_reset_all",
+        "Reset every cvar to its default value. One undo entry covers the whole reset.",
+        [](auto, pt::console::Output& out) {
+            std::size_t n = pt::console::Console::Get().ResetAllCVarsToDefaults();
+            if (n == 0) {
+                out.PrintLine("cvar_reset_all: no cvars differed from default -- nothing to reset.");
+            } else {
+                out.FormatLine("cvar_reset_all: reset {} cvar(s) to default. r_undo restores.", n);
+            }
         });
 
     C.RegisterCommand("scene_save",

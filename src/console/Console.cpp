@@ -712,6 +712,42 @@ ExecuteResult Console::ExecuteScript(std::string_view body) {
     return agg;
 }
 
+std::size_t Console::ResetAllCVarsToDefaults() {
+    // Snapshot pre-values into an undo entry so this whole reset is
+    // one Undo() away from being rolled back. The snapshot only
+    // contains cvars whose current value actually differs from the
+    // default -- cvars already at default contribute nothing.
+    CvarSnapshot pre;
+    for (auto& [name, cv] : cvars_) {
+        if (cv.value != cv.default_value) {
+            pre[name] = cv.value;
+        }
+    }
+
+    // No-op fast path: nothing to reset. Skip the on_change cascade
+    // and the undo push so the call is observably free.
+    if (pre.empty()) return 0;
+
+    // Apply the reset. Use the same in_undo_redo_ guard as Undo() so
+    // each on_change firing doesn't push its own per-cvar undo entry;
+    // the single batched entry below is the only one the user sees.
+    in_undo_redo_ = true;
+    for (auto& [name, cv] : cvars_) {
+        if (cv.value == cv.default_value) continue;
+        cv.value = cv.default_value;
+        if (cv.on_change) cv.on_change(cv);
+    }
+    in_undo_redo_ = false;
+
+    // Record the batched undo entry. Invalidates redo (consistent
+    // with ExecuteScript's edit semantics).
+    undo_stack_.push_back(pre);
+    if (undo_stack_.size() > kMaxHistory) undo_stack_.pop_front();
+    redo_stack_.clear();
+
+    return pre.size();
+}
+
 std::vector<Console::CvarChange> Console::Undo() {
     std::vector<CvarChange> changes;
     if (undo_stack_.empty()) return changes;

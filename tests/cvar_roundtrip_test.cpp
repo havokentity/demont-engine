@@ -395,3 +395,60 @@ TEST_CASE("cvar parser: ';' inside '#' comments is NOT a statement separator") {
     CHECK(r7.error.find("unknown") == std::string::npos);
     CHECK(post->GetInt() == 1);
 }
+
+// --- Test 7: ResetAllCVarsToDefaults -------------------------------------
+// Clean-room testing helper: wipe every cvar back to its registered
+// default in one call, with a single undo entry so the whole reset can
+// be rolled back. Pair with the `--no-cfg` CLI flag (skips demont.cfg
+// and autoexec.cfg load) for tests that need a guaranteed-clean cvar
+// state without manually `mv`-ing config files around.
+TEST_CASE("cvar reset: ResetAllCVarsToDefaults restores every cvar in one shot") {
+    auto& C = pt::console::Console::Get();
+
+    // Three differently-shaped cvars: int with on_change, plain float,
+    // and a string. Verifies on_change fires AND a non-defaulted cvar
+    // gets counted AND a defaulted cvar contributes nothing.
+    int on_change_fires = 0;
+    auto* cv_int   = C.RegisterCVar("test_rt_reset_int",  "0",        "int + on_change",
+                                    pt::console::CVAR_ARCHIVE,
+                                    [&](const pt::console::CVar&) { ++on_change_fires; });
+    auto* cv_float = C.RegisterCVar("test_rt_reset_float","3.14",     "float",
+                                    pt::console::CVAR_ARCHIVE);
+    auto* cv_str   = C.RegisterCVar("test_rt_reset_str",  "hello",    "string",
+                                    pt::console::CVAR_ARCHIVE);
+    REQUIRE(cv_int   != nullptr);
+    REQUIRE(cv_float != nullptr);
+    REQUIRE(cv_str   != nullptr);
+
+    // Mutate two of three; leave the float at default.
+    REQUIRE(C.Execute("test_rt_reset_int 42").ok);
+    REQUIRE(C.Execute("test_rt_reset_str world").ok);
+    REQUIRE(cv_int->GetInt() == 42);
+    REQUIRE(cv_str->value == "world");
+    REQUIRE(cv_float->GetFloat() == doctest::Approx(3.14f));
+    on_change_fires = 0;  // discard the on_change from the set above
+
+    // Reset. Expect: 2 cvars changed (int, str); float was already at
+    // default and contributes 0. The on_change hook fires once for the
+    // int (not for the float that didn't change, not for the str that
+    // has no hook).
+    std::size_t n = C.ResetAllCVarsToDefaults();
+    CHECK(n >= 2);  // there ARE other archive cvars in this singleton
+                    // so n may be larger if those got reset too; the
+                    // strict lower bound is 2 (our two mutated cvars).
+    CHECK(cv_int->GetInt()      == 0);            // default restored
+    CHECK(cv_str->value         == "hello");      // default restored
+    CHECK(cv_float->GetFloat()  == doctest::Approx(3.14f));  // unchanged
+    CHECK(on_change_fires       == 1);            // int's hook fired once
+
+    // Calling reset again is a no-op: every cvar is now at default.
+    std::size_t n2 = C.ResetAllCVarsToDefaults();
+    CHECK(n2 == 0);
+
+    // Single undo entry covers the whole reset -- one Undo() call
+    // restores both our cvars in one transaction.
+    auto changes = C.Undo();
+    CHECK(changes.size() >= 2);
+    CHECK(cv_int->GetInt() == 42);                // pre-reset value
+    CHECK(cv_str->value    == "world");           // pre-reset value
+}
