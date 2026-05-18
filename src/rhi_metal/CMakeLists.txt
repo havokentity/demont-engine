@@ -93,6 +93,18 @@ pt_compile_slang(
     ENTRY   main
     TARGETS metal
 )
+# Aurora borealis procedural overlay (issue #116). Runs once per
+# frame on Metal AFTER StarsComposite and BEFORE the bloom pyramid;
+# stateless additive composite onto post-denoise HDR. Curl-noise
+# driven ribbon density in the upper-sky elevation band (~100-150 km
+# real altitude, observer-relative).
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/AuroraComposite.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+)
 # SVGF denoiser (svgf_basic / svgf_atrous on r_denoiser). Same Slang
 # sources the Vulkan backend uses; slangc cross-compiles them to MSL.
 # DenoiseFinalize is NOT built on Metal -- the existing Tonemap pipeline

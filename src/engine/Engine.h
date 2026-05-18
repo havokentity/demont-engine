@@ -288,6 +288,15 @@ private:
     // highlights into halos. Replaces the EMA accum_stars architecture
     // from #108 -- see shaders/StarsComposite.slang for the rationale.
     std::uint64_t                               stars_composite_pipeline_id_ = 0;
+    // Stateless aurora borealis composite (issue #116). Dispatched on
+    // Metal AFTER stars_composite (so aurora layers on top of celestials
+    // in HDR space) and BEFORE the bloom pyramid (so bright aurora
+    // ribbons get bloom halos and ACES tonemap squashes them with the
+    // rest of the image). Curl-noise driven procedural ribbon density
+    // at 100-150 km altitude band; see shaders/AuroraComposite.slang.
+    // Zero on Vulkan today -- the Vulkan dispatch is a follow-up, the
+    // engine gate folds correctly to "no aurora" when the id is 0.
+    std::uint64_t                               aurora_composite_pipeline_id_ = 0;
     std::uint64_t                               perfoverlay_pipeline_id_ = 0;
     std::uint64_t                               perfoverlay_drawlist_id_ = 0;
     std::uint32_t                               perfoverlay_drawlist_capacity_ = 0;
