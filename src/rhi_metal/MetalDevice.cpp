@@ -35,6 +35,8 @@ extern const unsigned char shader_PerfOverlay_metal_data[];
 extern const unsigned long shader_PerfOverlay_metal_size;
 extern const unsigned char shader_StarsComposite_metal_data[];
 extern const unsigned long shader_StarsComposite_metal_size;
+extern const unsigned char shader_AuroraComposite_metal_data[];
+extern const unsigned long shader_AuroraComposite_metal_size;
 }
 
 // MetalFXDenoiser.mm: ObjC++ shim around MTLFXTemporalDenoisedScaler.
@@ -322,6 +324,9 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
     build_pso("stars_composite",
               shader_StarsComposite_metal_data,
               shader_StarsComposite_metal_size);
+    build_pso("aurora_composite",
+              shader_AuroraComposite_metal_data,
+              shader_AuroraComposite_metal_size);
 
     cmd_ = std::make_unique<MetalCommandBuffer>(this);
 }
