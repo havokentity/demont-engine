@@ -4217,7 +4217,18 @@ void main(uint2 tid : SV_DispatchThreadID) {
         //     all N samples land inside the cloud, not in empty air.
         // The two contributions add into `radiance`. Both share the
         // sun radiance and HG phase setup below.
-        if ((vol_params.x > 0.0 || clouds_p1.w > 0.0 || clouds_p3.w > 0.0)
+        //
+        // Smoke (#136) piggybacks on the cloud march -- the inner branch
+        // at ~4378 enables the slab when smoke_active even with clouds
+        // off, but the OUTER gate must also include smoke_active or the
+        // whole block is skipped on a smoke-only scene (r_clouds 0 +
+        // r_volumetric 0 + r_smoke_enabled 1). Without this OR-clause
+        // smoke_emit plumes never render despite the inner-branch logic
+        // being correct. Mirrors the (smoke_params.y > 0 && smoke_params.x > 0)
+        // gate used inside the cloud-march body.
+        bool smoke_active_outer = (smoke_params.y > 0.0) && (smoke_params.x > 0.0);
+        if ((vol_params.x > 0.0 || clouds_p1.w > 0.0 || clouds_p3.w > 0.0
+             || smoke_active_outer)
             && primary_t_recorded) {
             float  g         = vol_params.y;
             float  vol_int   = vol_params.z;
