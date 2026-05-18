@@ -7682,6 +7682,15 @@ void Engine::RegisterCommands() {
         v->allowed_values = {"0", "1"};
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
+    // r_planet_radius (issue #51) toggles atmosphericTransmittance
+    // between the planar and curved-Earth branches AND rebiases
+    // procSky's horizon line. Without an accum reset, A/B-toggling
+    // this against a non-zero accumulator (which the
+    // sunset_altitude_planar fixture explicitly does) blends pre- and
+    // post-change samples in the temporal mean until the camera moves.
+    if (auto* v = C.FindCVar("r_planet_radius")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
     if (auto* v = C.FindCVar("r_exposure")) {
         v->on_change = [this](const pt::console::CVar& cv) {
             accum_dirty_ = true;

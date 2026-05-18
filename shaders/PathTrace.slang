@@ -1119,6 +1119,21 @@ float3 procSkyInlineSunDiscAndHalo(float3 rd, float3 sun) {
     return result;
 }
 
+// procSky -- procedural sky gradient + sun halo.
+//
+// PRECONDITION / approximation: the horizon-dip rebias is driven by
+// the CAMERA altitude (push_constants.pos_fovtan.y), not the per-call
+// ray origin. procSky() is invoked from primary camera rays AND from
+// secondary bounces (mirror reflections, NEE sky lookups deep inside
+// traceScene). For a high-altitude camera, a reflective puddle on the
+// ground will sample procSky() with rd.y > 0 and still see the 10 km
+// dipped horizon as if the puddle itself were at 10 km. The visible
+// effect is small (the puddle reflects mostly upper hemisphere, where
+// the dip has zero visual impact -- the bias only shifts the painted
+// horizon LINE downward) and the alternative (plumbing per-ray ro
+// through every traceScene call) is a much larger surgery for what
+// is essentially a procedural-mode debug visual. If/when we move the
+// sky to a per-hit transmittance LUT, this approximation goes away.
 float3 procSky(float3 rd, float3 sun) {
     float cosTheta_raw = clamp(rd.y, -1.0, 1.0);  // 1=zenith, 0=mathematical-horizon, -1=nadir
     float cosGamma = clamp(dot(rd, sun), -1.0, 1.0);
@@ -1820,12 +1835,29 @@ float cloud_optical_depth(float3 ro, float3 rd, float t_max) {
 // integral_0^t (sigma_mie(h) + sigma_ray(h)) ds. Simpson's is exact
 // for cubic polynomials; the integrand (exp(-h/H) with h quadratic in
 // s on near-horizon rays) is well-approximated to ~0.1% error at 8
-// steps over typical 1-100 km ray lengths. Cheap enough for inline
-// use -- the previous analytical planar path was 6 exp() calls and 8
-// muls per channel; the spherical path is 17 exp() + 9 sqrt() but the
-// exp() inputs are already much smaller (we're not extrapolating an
-// exponential across the full ray length, just sampling it), so
-// register pressure / cache cost is similar in practice.
+// steps over typical 1-100 km ray lengths.
+//
+// Cost (N=8): 17 sqrt() (1 initial boundary + 8 midpoints + 8 right
+// boundaries; left boundaries are cached from the previous iteration's
+// right boundary), 17 scalar exp() for Mie when enabled (likewise
+// cached -- 1 + 8 + 8) and 17 vector exp() for Rayleigh when enabled
+// (same cache). The previous planar path was 6 exp() + 8 muls per
+// channel; this spherical path is ~3x more expensive on both exp and
+// sqrt but the exp() arguments are altitude/scale-height (already
+// small magnitudes), so register pressure and divergence are similar
+// in practice. Boundary caching (h_prev / sm_prev / sr_prev) halves
+// the exp() count vs. the naive 3-exp-per-iteration formulation.
+//
+// PRECONDITION: `rd` must be unit-length. The integrand `dt = t / N`
+// is treated as a step in metres along the ray when computing
+// altitudes via `p = ro + rd*s`, so a non-normalized direction would
+// corrupt BOTH the per-sample altitude AND the integration measure.
+// All three current call sites (PathTrace.slang:2595, 2832 and the
+// cloud-shadow march -- all pass primary_rd which is normalized at
+// generation in genPrimaryRay) satisfy this. The function does NOT
+// renormalize defensively; future callers that pass an inverse-
+// reciprocal-scaled or world-space-difference vector MUST normalize
+// first.
 //
 // Planet centre offset assumption: world y=0 is the ground plane.
 // Cameras at y=1.7 sit ~1.7 m above the surface; cameras at y=10000
@@ -1893,13 +1925,22 @@ float3 atmosphericTransmittance(float3 ro, float3 rd, float t) {
     // Sample altitudes at the 9 grid points + the 8 midpoints. Combine
     // via Simpson: integral ≈ dt/6 * sum_i (f_left + 4*f_mid + f_right).
     // Compute sigma_mie + sigma_ray inline per sample so we only loop
-    // once over the parameter range.
+    // once over the parameter range. We cache the per-channel sigma at
+    // each right boundary so the next iteration's left-boundary sigma
+    // is a lookup instead of a fresh exp() -- halves the exp() count
+    // across the 8 subintervals (see cost note in the header comment).
     float h_prev;
+    float  sm_prev = 0.0;
+    float3 sr_prev = float3(0.0);
     {
-        // s = 0
+        // s = 0 boundary: seed h_prev and the cached sigma values so
+        // iteration 0 can reuse them as its left boundary instead of
+        // recomputing the s=0 exp() inside the loop.
         float3 p = ro;
         h_prev = sqrt(p.x * p.x + (p.y + planet_R) * (p.y + planet_R) + p.z * p.z) - planet_R;
         h_prev = max(h_prev, 0.0);
+        if (any_mie) sm_prev = sigma_mie0           * exp(-h_prev / kHmie);
+        if (any_ray) sr_prev = kSigmaR * rayleigh_i * exp(-h_prev / kHrayleigh);
     }
     for (int i = 0; i < N; ++i) {
         float s_mid   = (float(i) + 0.5) * dt;
@@ -1915,16 +1956,18 @@ float3 atmosphericTransmittance(float3 ro, float3 rd, float t) {
                            + p_right.z * p_right.z) - planet_R;
         h_right = max(h_right, 0.0);
         if (any_mie) {
-            float sm_l = sigma_mie0 * exp(-h_prev  / kHmie);
+            float sm_l = sm_prev;
             float sm_m = sigma_mie0 * exp(-h_mid   / kHmie);
             float sm_r = sigma_mie0 * exp(-h_right / kHmie);
             tau_mie_total += dt * oneSixth * (sm_l + 4.0 * sm_m + sm_r);
+            sm_prev = sm_r;
         }
         if (any_ray) {
-            float3 sr_l = kSigmaR * rayleigh_i * exp(-h_prev  / kHrayleigh);
+            float3 sr_l = sr_prev;
             float3 sr_m = kSigmaR * rayleigh_i * exp(-h_mid   / kHrayleigh);
             float3 sr_r = kSigmaR * rayleigh_i * exp(-h_right / kHrayleigh);
             tau_ray_total += dt * oneSixth * (sr_l + 4.0 * sr_m + sr_r);
+            sr_prev = sr_r;
         }
         h_prev = h_right;
     }
