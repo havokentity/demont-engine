@@ -486,6 +486,41 @@ namespace cvar {
             "Higher = smoother sun/moon bokeh with DOF on; "
             "default 16 is the sweet spot.",
             CVAR_ARCHIVE);
+    // Aurora borealis procedural overlay (issue #116). Stateless
+    // post-denoise composite, runs once per frame on Metal between
+    // StarsComposite and the bloom pyramid. Zero performance cost when
+    // r_aurora == 0 -- the dispatch is elided engine-side.
+    PT_CVAR(r_aurora,           "0",
+            "Aurora borealis/australis procedural overlay. 0 = off "
+            "(zero cost, dispatch elided), 1 = render curl-noise driven "
+            "aurora ribbons in the upper sky at night (sun below "
+            "horizon). Procedural mode only -- no aurora when r_sky_mode "
+            "= hdri / gradient. See shaders/AuroraComposite.slang for "
+            "the visual construction.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_aurora_intensity, "1.0",
+            "Aurora brightness multiplier (0..2). 1.0 = nominal "
+            "kilo-rayleigh emission scaled to ~1.5 cd/m^2 in the "
+            "engine's HDR-linear units (comparable to half-moon-lit "
+            "sky); 2.0 = active geomagnetic-storm brightness.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_aurora_lat,       "70",
+            "Magnetic-pole latitude in degrees the aurora oval is "
+            "anchored to (positive = boreal, default 70 deg matches "
+            "the auroral oval around the geomagnetic north pole). "
+            "Drives the pole-alignment falloff: rays pointing toward "
+            "this elevation get full aurora density, rays away from "
+            "it fade smoothly to zero. Reduce toward 30-40 for "
+            "lower-latitude observers (cinematic; real aurora is "
+            "rarely visible that far south).",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_aurora_animate,   "1",
+            "Time-based shimmer animation. 0 = static curtain "
+            "(deterministic frame-to-frame, useful for golden-image "
+            "fixtures); 1 = ribbons drift and the fine-noise layer "
+            "evolves at ~0.03 rad/s for the 'waves traveling along "
+            "the curtain' look.",
+            CVAR_ARCHIVE);
 
     // Camera controls.  Mouse-look engages while RIGHT mouse is held.
     PT_CVAR(cam_speed,         "3.0", "Movement speed (units/sec)",        CVAR_ARCHIVE);
@@ -1257,6 +1292,7 @@ void Engine::TearDownDevice() {
     cloud_trans_tex_id_      = 0;
     tonemap_pipeline_id_     = 0;
     stars_composite_pipeline_id_ = 0;
+    aurora_composite_pipeline_id_ = 0;
     bloom_down_pipeline_id_  = 0;
     bloom_up_pipeline_id_    = 0;
     perfoverlay_pipeline_id_       = 0;
@@ -2947,6 +2983,11 @@ void Engine::EnsurePipelineHandles() {
     // dispatch site short-circuits. Vulkan stars-composite plumbing is
     // a follow-up.
     resolve(stars_composite_pipeline_id_, "stars_composite");
+    // Aurora borealis composite (issue #116). Same Metal-only story as
+    // stars_composite -- Vulkan backend has no "aurora_composite"
+    // pipeline registered, so the id stays 0 and the dispatch gate
+    // collapses to "no aurora". Vulkan plumbing is a follow-up.
+    resolve(aurora_composite_pipeline_id_, "aurora_composite");
 }
 
 void Engine::RenderFrame() {
@@ -5086,6 +5127,108 @@ void Engine::RenderFrame() {
             sc.ap_samples = static_cast<std::uint32_t>(ap_n);
             sc._pad0 = 0u;
             cb->PushConstants(&sc, sizeof(sc));
+            cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
+
+            // RAW: bloom_down about to read the HDR we just wrote.
+            // Metal auto-barriers; emitted for documentation symmetry.
+            cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                         pt::rhi::BarrierDesc::Stage::ComputeRead});
+        }
+
+        // Aurora borealis procedural overlay (issue #116). Dispatched
+        // AFTER StarsComposite so aurora ribbons layer over the
+        // celestial layer in HDR space, and BEFORE the bloom pyramid
+        // so bright aurora highlights get bloom halos and ACES
+        // tonemap squashes them with the rest of the image. The
+        // shader is stateless, reads + writes tonemap_hdr_source_id
+        // in place (additive), and only needs hdr_inout + depth_tex.
+        //
+        // Dispatch gate: aurora_composite_pipeline_id_ is Metal-only
+        // (Vulkan stays at 0), depth_tex_id_ must exist (allocated
+        // whenever denoiser_active_, which use_engine_tonemap implies
+        // on Metal). The cvar gate r_aurora is encoded as
+        // aurora_active below; when off we elide the dispatch entirely
+        // so r_aurora 0 is a true no-op.
+        bool aurora_active = false;
+        {
+            int aurora_on = 0;
+            if (auto* v = C.FindCVar("r_aurora")) aurora_on = v->GetInt();
+            int sky_mode_int = 2;
+            if (auto* v = C.FindCVar("r_sky_mode")) {
+                const std::string& m = v->value;
+                sky_mode_int = (m == "procedural") ? 2
+                             : (m == "hdri")       ? 1
+                                                   : 0;
+            }
+            aurora_active =
+                aurora_on != 0 &&
+                (sky_mode_int == 2) &&
+                aurora_composite_pipeline_id_ != 0 &&
+                depth_tex_id_ != 0;
+        }
+        if (aurora_active) {
+            cb->BindComputePipeline(pt::rhi::PipelineHandle{aurora_composite_pipeline_id_});
+            cb->BindStorageTexture(0, pt::rhi::TextureHandle{tonemap_hdr_source_id});
+            // depth_tex at engine slot 1 -> Metal MSL texture(1) by
+            // declaration order. PathTrace's G-buffer pass writes
+            // 1e10 for sky pixels; the shader's 5x5 min-dilation
+            // gate at 1e9 lets us avoid painting aurora over geometry.
+            cb->BindStorageTexture(1, pt::rhi::TextureHandle{depth_tex_id_});
+            // No buffer bindings: AuroraComposite is purely
+            // texture-driven. BindComputePipeline cleared any prior
+            // PathTrace bindings, so max_bound_buf_slot = -1 and Slang's
+            // MSL emission places Push at buf(0). Engine's
+            // push_slot = max+1 = 0. Match.
+
+            struct AuroraCompositePush {
+                float        pos_fovtan[4];
+                float        fwd_aspect[4];
+                float        right_xyz[4];
+                float        up_xyz[4];
+                float        sun_and_mode[4];
+                float        aurora_params[4];
+                std::uint32_t frame_index;
+                std::uint32_t composite_active;
+                std::uint32_t _pad0;
+                std::uint32_t _pad1;
+            } ap{};
+            static_assert(sizeof(AuroraCompositePush) == 112,
+                          "AuroraCompositePush layout must match AuroraComposite.slang");
+            std::memcpy(ap.pos_fovtan,   push.pos_fovtan,   sizeof(ap.pos_fovtan));
+            std::memcpy(ap.fwd_aspect,   push.fwd_aspect,   sizeof(ap.fwd_aspect));
+            std::memcpy(ap.right_xyz,    push.right_xyz,    sizeof(ap.right_xyz));
+            std::memcpy(ap.up_xyz,       push.up_xyz,       sizeof(ap.up_xyz));
+            std::memcpy(ap.sun_and_mode, push.sun_and_mode, sizeof(ap.sun_and_mode));
+
+            // Pack aurora cvars. lat is in degrees user-side, radians
+            // shader-side (cheaper than letting the shader pay for the
+            // conversion every pixel). animate is the flag; time is in
+            // seconds since startup, sourced from frame_index/60.
+            float intensity = 1.0f;
+            if (auto* v = C.FindCVar("r_aurora_intensity")) {
+                intensity = v->GetFloat();
+            }
+            if (intensity < 0.0f) intensity = 0.0f;
+            if (intensity > 2.0f) intensity = 2.0f;
+            float lat_deg = 70.0f;
+            if (auto* v = C.FindCVar("r_aurora_lat")) {
+                lat_deg = v->GetFloat();
+            }
+            float lat_rad = lat_deg * 0.0174532925f;
+            int animate_on = 1;
+            if (auto* v = C.FindCVar("r_aurora_animate")) {
+                animate_on = v->GetInt();
+            }
+            float time_sec = static_cast<float>(push.frame_index) * (1.0f / 60.0f);
+            ap.aurora_params[0] = intensity;
+            ap.aurora_params[1] = lat_rad;
+            ap.aurora_params[2] = animate_on != 0 ? 1.0f : 0.0f;
+            ap.aurora_params[3] = time_sec;
+            ap.frame_index      = push.frame_index;
+            ap.composite_active = 1u;
+            ap._pad0 = 0u;
+            ap._pad1 = 0u;
+            cb->PushConstants(&ap, sizeof(ap));
             cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
 
             // RAW: bloom_down about to read the HDR we just wrote.
