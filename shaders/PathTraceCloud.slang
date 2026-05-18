@@ -92,11 +92,14 @@ public float cloud_fbm(float3 p, int octaves) {
 // character for cumulus filaments and shear-streamer cirrus.
 //
 // Three decorrelated potentials are needed; we tap cloud_value_noise
-// at three large constant offsets so the components don't share a hash
-// (which would collapse curl to the trivial radial field of a single
-// noise gradient). Offsets are arbitrary but must be far enough apart
-// that the hash cells don't visibly correlate -- 31.4, 217.7, 853.1
-// give independent-looking outputs.
+// at three large constant offsets so the components don't share a hash.
+// If all three sampled the same scalar field N(q), curl(N,N,N) would
+// reduce to pair-wise gradient differences of one noise (each component
+// = dN/dα - dN/dβ for some axes α,β), which is divergence-free but
+// collapses the displacement onto a locally 2D plane and produces
+// visible stripe artefacts along (1,1,1). Offsets are arbitrary but
+// must be far enough apart that the hash cells don't visibly correlate
+// -- 31.4, 217.7, 853.1 give independent-looking outputs.
 //
 // Derivatives are estimated via central differences with step `h`
 // (one-tenth of the noise period at the curl scale). Cheaper than
@@ -115,9 +118,16 @@ public float3 cloud_curl_noise(float3 p, float scale) {
     const float3 oy = float3(0.0, h, 0.0);
     const float3 oz = float3(0.0, 0.0, h);
     // Three decorrelated potential components. Constant offsets keep
-    // each component's hash domain separate -- without these, all
-    // three Px/Py/Pz would alias to the same noise field and curl
-    // would collapse to zero almost everywhere.
+    // each component's hash domain separate -- without these all three
+    // potentials would sample the same scalar field N(q), so the curl
+    // would degenerate to a trivial differential of one noise:
+    //   curl(N,N,N) = (dN/dy - dN/dz, dN/dz - dN/dx, dN/dx - dN/dy)
+    // -- still divergence-free, but every component is just a pair-wise
+    // gradient difference of the SAME field, so the displacement field
+    // collapses onto a 2D plane locally and produces stripe artefacts
+    // along the (1,1,1) axis instead of true 3D turbulence. The offsets
+    // break that aliasing so each potential has its own independent
+    // hash domain (Bridson 2007, sec. 3).
     const float3 offX = float3( 31.4, 217.7, 853.1);
     const float3 offY = float3(853.1,  31.4, 217.7);
     const float3 offZ = float3(217.7, 853.1,  31.4);
