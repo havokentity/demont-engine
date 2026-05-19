@@ -4378,10 +4378,24 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 // user-tunable absorption_r/g/b can be tuned for the
                 // intended look at the intended depth.  Phase 4 (SSS)
                 // will track per-bounce in-medium distance.
+                float3 absorb = water_params0.xyz;
                 if (ndi_s < 0.0) {
-                    float seg_estimate = 1.5;     // nominal metres
-                    float3 absorb = water_params0.xyz;
+                    // Entering water from air. Phase 1 simplification:
+                    // nominal 1.5m segment estimate for downward path.
+                    float seg_estimate = 1.5;
                     throughput *= exp(-absorb * seg_estimate);
+                } else if (b == 0u) {
+                    // Exiting water from below on a camera primary ray
+                    // (b == 0). The camera is underwater -- the ray
+                    // traveled distance h.t through water before reaching
+                    // the surface. Apply Beer's law for that exact
+                    // segment so the underwater view picks up the water
+                    // tint instead of looking like clear glass.
+                    //
+                    // Bounded for b > 0 to avoid double-tinting the
+                    // above-water -> submerged-sphere -> back-up path
+                    // (which is already nominally tinted at entry).
+                    throughput *= exp(-absorb * h.t);
                 }
                 rd = normalize(refracted);
                 ro = hit_pt - nf_s * 1e-3;
