@@ -164,7 +164,7 @@ export class WebSocketClient {
     return this.send({ type: 'list_scene' });
   }
 
-  selectObject(kind: 'prim' | 'light' | 'csg' | 'sdf' | 'smoke' | 'none', objId?: number): Promise<WsResult> {
+  selectObject(kind: 'prim' | 'light' | 'sdf' | 'rb' | 'csg' | 'smoke' | 'none', objId?: number): Promise<WsResult> {
     if (kind === 'none') {
       return this.send({ type: 'select', kind: 'none' });
     }

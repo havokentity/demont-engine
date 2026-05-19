@@ -506,15 +506,25 @@ void ConsoleServer::HandleWsMessage(mg_connection* conn, std::string_view payloa
         return;
     }
     if (type == "select") {
-        // Editor selection set. {"type":"select","kind":"prim","id":N}.
+        // Editor selection set. {"type":"select","kind":"prim","obj_id":N}.
         // The hook owns the SelectionKind mapping (the server doesn't
         // know about the engine's enum). The selection_change broadcast
         // is fired from the engine side AFTER it applies the mutation
         // so panels / native overlays that subscribe to that topic see
         // the same payload as a click-driven selection.
+        //
+        // The object id is delivered in `obj_id` so it doesn't collide
+        // with the optional top-level `id` field that every inbound
+        // message can carry as a request-id (echoed back in `result`
+        // for client-side matching -- a string in the TS WS client).
+        // For backward compat with older clients that put the object
+        // id in `id` as a JSON number, we fall through to that field
+        // when `obj_id` isn't present.
         std::string kind = msg.value("kind", std::string{});
         std::uint32_t sel_id = 0;
-        if (msg.contains("id") && msg["id"].is_number_unsigned()) {
+        if (msg.contains("obj_id") && msg["obj_id"].is_number_unsigned()) {
+            sel_id = msg["obj_id"].get<std::uint32_t>();
+        } else if (msg.contains("id") && msg["id"].is_number_unsigned()) {
             sel_id = msg["id"].get<std::uint32_t>();
         }
         if (select_handler_) select_handler_(kind, sel_id);

@@ -115,7 +115,18 @@ export interface SceneSnapshot {
 // and the `selection_change` event topic. SelectionKind::None is
 // represented by `null`.
 
-export type SelectionKind = 'prim' | 'light' | 'csg' | 'sdf' | 'smoke';
+// Selection kinds the engine recognises. Mirrors SelectionKind in
+// src/engine/Engine.h and the strings emitted by
+// SelectionKindToString in src/editor/SceneGraph.cpp:
+//   'prim'  -- analytic primitive (sphere / plane)
+//   'light' -- analytic light (point / spot / sphere / quad)
+//   'sdf'   -- SDF cluster
+//   'rb'    -- rigid body (physics)
+// 'csg' and 'smoke' are reserved for forward compat with kinds the
+// engine may emit later (the Engine enum doesn't include them yet,
+// but SceneGraph.cpp tolerates unknown top-level array names, so a
+// future kind shows up in the hierarchy automatically).
+export type SelectionKind = 'prim' | 'light' | 'sdf' | 'rb' | 'csg' | 'smoke';
 
 export interface Selection {
   kind: SelectionKind;
