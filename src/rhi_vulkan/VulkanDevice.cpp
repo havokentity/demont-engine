@@ -3690,28 +3690,38 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
         return;
     }
 
-    // ---- Dispatch-routing trace. Logged once per Kind transition
-    // (off->svgf, svgf->optix, etc.) so the engine -> RHI plumbing
-    // boundary is observable for any future denoiser-routing bug.
-    // Earned its keep on the OptiX bring-up: revealed that the
-    // engine routing was correct (kind=1 dispatched cleanly) and
-    // isolated the failures to optixInit + optixDenoiserComputeIntensity
+    // ---- Dispatch-routing trace. Logged at most once per Kind value
+    // (off->svgf, svgf->optix, svgf-no-finalize, etc.) so the engine
+    // -> RHI plumbing boundary is observable for any future denoiser-
+    // routing bug. Earned its keep on the OptiX bring-up: revealed
+    // that the engine routing was correct (kind=1 dispatched cleanly)
+    // and isolated the failures to optixInit + optixDenoiserComputeIntensity
     // upstream. Stays in -- matches the engine's "log on state
-    // transitions" philosophy and costs nothing per frame after the
-    // first dispatch (static guard latches once kind is logged).
+    // transitions" philosophy and costs nothing per frame after each
+    // Kind has been seen once.
+    //
+    // Bitmask, not a last-kind latch: the B1 dual-Denoise sequence
+    // (issue #46) intentionally alternates Kind::SvgfNoFinalize and
+    // Kind::FinalizeOnly within a single frame, so a `last_kind != k`
+    // gate would fire every dispatch. The bitmask preserves the
+    // "log new routing once" intent while ignoring the routine
+    // alternation.
+    //
     // Will move to PT_DIAG(2) when the r_diagnostic_level cvar lands
     // (see follow-up).
     {
-        static int s_last_logged_kind = -1;
+        static std::uint32_t s_logged_kinds_mask = 0u;
         const int k = static_cast<int>(d.kind);
-        if (k != s_last_logged_kind) {
+        const std::uint32_t bit = (k >= 0 && k < 32) ? (1u << k) : 0u;
+        if (bit != 0u && (s_logged_kinds_mask & bit) == 0u) {
             LOG_INFO("VulkanDevice::Denoise: dispatching kind={} "
                      "(0=Svgf, 1=OptixHdr, 2=OptixHdrAov, "
                      "3=OptixTemporalHdr, 4=OptixTemporalHdrAov, "
-                     "5=MetalFX, 6=SvgfMetalFx, 7=FinalizeOnly), "
+                     "5=MetalFX, 6=SvgfMetalFx, 7=FinalizeOnly, "
+                     "8=SvgfNoFinalize), "
                      "color={} out={} normal={} depth={} motion={}",
                      k, d.color_in.id, d.output.id, d.normal_in.id, d.depth_in.id, d.motion_in.id);
-            s_last_logged_kind = k;
+            s_logged_kinds_mask |= bit;
         }
     }
 
