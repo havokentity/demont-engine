@@ -275,31 +275,61 @@ LightSummary CombineSummaries(const LightSummary& a, const LightSummary& b) {
     return p;
 }
 
+// Write a leaf node IN PLACE at out_nodes[dst_idx]. Caller is
+// responsible for having sized out_nodes so dst_idx is valid.
+inline void WriteLeafAt(const LightSummary& s,
+                        std::vector<LightTreeNode>& out_nodes,
+                        std::uint32_t dst_idx) {
+    LightTreeNode& node = out_nodes[dst_idx];
+    for (int i = 0; i < 3; ++i) {
+        node.aabb_min[i] = s.aabb_min[i];
+        node.aabb_max[i] = s.aabb_max[i];
+        node.cone_axis[i] = s.cone_axis[i];
+    }
+    node.cone_cos_half = s.cone_cos_half;
+    node.intensity     = s.intensity;
+    node.left_first    = s.light_id;
+    node.count         = 1u;
+}
+
 // Recursive top-down build. Splits the [begin, end) range of leaves
-// along the longest centroid-axis at the median, allocates an internal
-// node with two consecutive child nodes, and returns its index. Leaves
-// (single-light ranges) return a leaf node index. Stack depth is
-// ceil(log2 N); N=1000 -> depth 10, well under any sane reentrant cap.
-std::uint32_t BuildRecursive(std::vector<LightSummary>& leaves,
-                              std::vector<LightTreeNode>& out_nodes,
-                              std::uint32_t begin, std::uint32_t end) {
+// along the longest centroid-axis at the median, then writes the
+// internal/leaf node IN PLACE at out_nodes[dst_idx] (caller pre-allocates
+// the slot so the parent can guarantee its two children's indices are
+// CONTIGUOUS: right = left + 1, the invariant the shader's traversal
+// relies on in pickLightFromTree()).
+//
+// Slot allocation pattern at an internal node:
+//   dst_idx               = parent (pre-allocated by caller)
+//   children_first        = out_nodes.size() at entry; reserve TWO
+//                           slots here -- left at children_first,
+//                           right at children_first + 1.
+//   Then recurse to fill each child's subtree.
+//
+// This replaces an earlier append-then-recurse scheme that was buggy:
+// the previous code reserved only the parent slot then let the left
+// recursive call append its own slot, which made the left ROOT live at
+// (parent + 1) and the right ROOT live at (parent + 1 + left_subtree_size)
+// -- so right = left + 1 was true ONLY when the left subtree was a
+// single leaf (#177).  At N>=4 the right subtree became unreachable
+// because the shader follows left_first+1, which on the original code
+// pointed back into the LEFT subtree's interior.
+//
+// Stack depth is ceil(log2 N); N=1000 -> depth 10, well under any
+// reentrant cap.  We pre-reserved 2N slots before the first recurse
+// in the caller so writes via dst_idx never trigger a realloc; the
+// children_first appends do trigger growth but never invalidate any
+// dst_idx slot (we always write the parent slot AFTER the children
+// have been built, but we hold dst_idx as an INDEX, not a pointer).
+void BuildRecursive(std::vector<LightSummary>& leaves,
+                    std::vector<LightTreeNode>& out_nodes,
+                    std::uint32_t begin, std::uint32_t end,
+                    std::uint32_t dst_idx) {
     const std::uint32_t n = end - begin;
 
     if (n == 1) {
-        const LightSummary& s = leaves[begin];
-        LightTreeNode node;
-        for (int i = 0; i < 3; ++i) {
-            node.aabb_min[i] = s.aabb_min[i];
-            node.aabb_max[i] = s.aabb_max[i];
-            node.cone_axis[i] = s.cone_axis[i];
-        }
-        node.cone_cos_half = s.cone_cos_half;
-        node.intensity     = s.intensity;
-        node.left_first    = s.light_id;
-        node.count         = 1u;
-        const std::uint32_t idx = static_cast<std::uint32_t>(out_nodes.size());
-        out_nodes.push_back(node);
-        return idx;
+        WriteLeafAt(leaves[begin], out_nodes, dst_idx);
+        return;
     }
 
     // Compute centroid AABB to choose the split axis. Using centroid
@@ -345,19 +375,20 @@ std::uint32_t BuildRecursive(std::vector<LightSummary>& leaves,
                          });
     }
 
-    // Reserve a slot for THIS node before recursing -- children must
-    // be contiguous (right = left + 1) so the GPU traversal can derive
-    // the right child's index without a per-node "right_child" word.
-    // We allocate slot now with placeholder data, then patch after the
-    // children are built; their indices are guaranteed contiguous
-    // because the left subtree's recursion completes before the right
-    // subtree starts writing.
-    const std::uint32_t my_idx = static_cast<std::uint32_t>(out_nodes.size());
-    out_nodes.emplace_back();  // placeholder; patched below.
+    // Reserve two CONTIGUOUS child slots before recursing. The shader
+    // computes right = left + 1, so both children must live at adjacent
+    // indices. We append two placeholders here -- their indices are
+    // guaranteed adjacent regardless of how many nodes each subtree
+    // eventually produces, because each subtree's own recursion gets a
+    // pre-allocated dst slot and only emits FURTHER child placeholders
+    // (which sit beyond our right child's slot in the vector).
+    const std::uint32_t left_idx  = static_cast<std::uint32_t>(out_nodes.size());
+    out_nodes.emplace_back();   // child A placeholder
+    out_nodes.emplace_back();   // child B placeholder
+    const std::uint32_t right_idx = left_idx + 1u;
 
-    const std::uint32_t left_idx  = BuildRecursive(leaves, out_nodes, begin, mid);
-    const std::uint32_t right_idx = BuildRecursive(leaves, out_nodes, mid, end);
-    (void)right_idx;  // right is by construction left_idx + (left subtree size).
+    BuildRecursive(leaves, out_nodes, begin, mid, left_idx);
+    BuildRecursive(leaves, out_nodes, mid,   end, right_idx);
 
     // Combine child summaries from the just-written child nodes. The
     // child nodes hold the same cluster summary we just computed
@@ -367,7 +398,12 @@ std::uint32_t BuildRecursive(std::vector<LightSummary>& leaves,
     // [mid, end) partition we just consumed -- the partition was
     // CORRECT at recurse time, but the bookkeeping is cleaner if we
     // just read what we wrote).
-    LightTreeNode& self = out_nodes[my_idx];
+    //
+    // IMPORTANT: each child's recursive subtree may have done many
+    // emplace_back()s into out_nodes. The vector may have reallocated.
+    // We never hold a pointer or reference across the recursive call,
+    // only indices.
+    LightTreeNode& self = out_nodes[dst_idx];
     const LightTreeNode& cl = out_nodes[left_idx];
     const LightTreeNode& cr = out_nodes[right_idx];
     UnionAabb(self.aabb_min, self.aabb_max,
@@ -379,7 +415,6 @@ std::uint32_t BuildRecursive(std::vector<LightSummary>& leaves,
                   self.cone_axis, self.cone_cos_half);
     self.left_first = left_idx;
     self.count      = 0u;  // internal
-    return my_idx;
 }
 
 }  // namespace
@@ -400,10 +435,18 @@ void BuildLightTree(const std::vector<LightInput>& lights,
         leaves.push_back(MakeLeafSummary(lights[i], i));
     }
 
-    dst.nodes.reserve(2u * lights.size());   // 2N-1 nodes upper bound
+    // Reserve worst-case capacity up front. The 2N-1 bound is for a
+    // full binary tree with N leaves. We allocate one root slot here
+    // and let BuildRecursive append children pair-wise into the
+    // remaining capacity; the reservation prevents grow-and-realloc
+    // mid-build so any references we DO take (we only take indices,
+    // but the reserved capacity also avoids cache-thrash on rebuild).
+    dst.nodes.reserve(2u * lights.size());
+    dst.nodes.emplace_back();   // root slot
 
     BuildRecursive(leaves, dst.nodes, 0u,
-                    static_cast<std::uint32_t>(leaves.size()));
+                    static_cast<std::uint32_t>(leaves.size()),
+                    /*dst_idx=*/0u);
 
     dst.light_count = static_cast<std::uint32_t>(lights.size());
     dst.root_index  = 0u;

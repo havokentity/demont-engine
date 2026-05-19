@@ -331,6 +331,30 @@ pt_add_test(pt_renderer_astronomy
     pt_renderer_astronomy_test.cpp
     LINK_TARGETS pt_renderer)
 
+# --- pt_renderer/LightTree unit tests (issue #129 + #177) -----------------
+# Pins the hierarchical-light-tree builder against the GPU's
+# (right = left + 1) reachability invariant.  Pre-fix (PR #177) the
+# builder reserved one slot for the parent then let recursive calls
+# append the left subtree at parent+1 and the right subtree at
+# parent + 1 + |left subtree|, so right was only at left + 1 when the
+# left subtree was a single leaf.  At N >= 4 the right subtree became
+# unreachable from the root and the shader's `pickLightFromTree` walk
+# could only see half of the input lights.
+#
+# Coverage:
+#   - empty input -> empty tree (no leak, no crash)
+#   - N=1 -> single leaf node
+#   - N=4 explicit cell (the size that exposed the bug)
+#   - N=1..256 exhaustive sweep + 200/500/1000 MVP-scale samples
+#   - coincident-lights fallback path (centroid AABB collapses to 0)
+#   - parent-AABB-encloses-children + intensity-sums-to-children
+#     structural invariants (would catch a "swapped left/right" or
+#     "wrong combine" regression even on a future leaf-layout change)
+# Links pt_renderer (where BuildLightTree lives).
+pt_add_test(pt_renderer_light_tree
+    pt_renderer_light_tree_test.cpp
+    LINK_TARGETS pt_renderer)
+
 # --- pt_renderer/HdrImage env-map CDF unit tests (issue #66) ---------------
 # Phase 3 of #47. Pins the marginal/conditional luminance-CDF builder
 # the env-map MIS sampler depends on. The CDF feeds NEE / env-map MIS
