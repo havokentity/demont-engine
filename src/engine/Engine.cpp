@@ -1716,6 +1716,10 @@ bool Engine::Init() {
             constexpr int kF3 = 292;
             constexpr int kF4 = 293;
             constexpr int kF5 = 294;
+            // Gizmo-mode hotkeys for the editor 3D gizmo overlay.
+            constexpr int kG     = 71;   // GLFW_KEY_G
+            constexpr int kR     = 82;   // GLFW_KEY_R
+            constexpr int kS     = 83;   // GLFW_KEY_S
             if (key == kGrave) {
                 if (overlay_) {
                     overlay_->Toggle();
@@ -1747,7 +1751,44 @@ bool Engine::Init() {
                 pt::console::Console::Get().QueueExecute(
                     fmt::format("panel_open {}", panel),
                     {});
+                return;
             }
+            // Gizmo-mode hotkeys (issue: editor 3D gizmos). Match
+            // Blender's G/R/S convention. We don't fire them while
+            // the console overlay is active (typing into the console
+            // shouldn't switch modes) and we DO fire them while WASD
+            // is held -- the engine's WASD lookup polls IsKeyDown(W)
+            // continuously, not via the per-press handler, so the
+            // press hook doesn't fight movement.
+            if (overlay_ && overlay_->IsShown()) return;
+            // Gate gizmo hotkeys on three predicates:
+            //   1. r_editor_gizmo is on (otherwise a fat-fingered G in a
+            //      screenshot run shouldn't flip mode).
+            //   2. A primitive is selected. Without selection the
+            //      gizmo isn't drawn -- and S in particular doubles
+            //      as the camera-backward key, so we keep the
+            //      pass-through path while no prim is being edited.
+            //   3. RMB camera look isn't active (the user is
+            //      flying the camera, not editing).
+            //
+            // When all three hold, G/R/S re-purpose to gizmo mode
+            // toggles. Pressing S still feeds IsKeyDown(83) in the
+            // same frame, so the camera will continue stepping
+            // backward while the user picks a mode -- documented
+            // limitation; a follow-up will introduce a `gizmo_active`
+            // input-mode bracket that suppresses WASD.
+            auto& C = pt::console::Console::Get();
+            bool gz_enabled = true;
+            if (auto* v = C.FindCVar("r_editor_gizmo")) gz_enabled = v->GetBool();
+            // selected_kind_ is the canonical PR #201 selection state;
+            // only analytic-prim selections drive the gizmo today.
+            if (!gz_enabled ||
+                selected_kind_ != SelectionKind::AnalyticPrim ||
+                selected_prim_id_ == 0) return;
+            if (mouse_look_active_) return;
+            if (key == kG) { C.SetCVarOverride("gizmo_mode", "translate"); return; }
+            if (key == kR) { C.SetCVarOverride("gizmo_mode", "rotate");    return; }
+            if (key == kS) { C.SetCVarOverride("gizmo_mode", "scale");     return; }
         });
     }
 
@@ -2121,6 +2162,7 @@ void Engine::TearDownDevice() {
         // released by device_.reset() below, same as tonemap / bloom.
         if (exposure_state_id_      != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{exposure_state_id_});
         if (perfoverlay_drawlist_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{perfoverlay_drawlist_id_});
+        if (editor_overlay_segs_buf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{editor_overlay_segs_buf_id_});
         if (placeholder_storage_id_  != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{placeholder_storage_id_});
         // Particle system GPU-side storage buffer (#82 MVP). The
         // CPU-side ParticleSystem object survives the device teardown
@@ -2200,6 +2242,9 @@ void Engine::TearDownDevice() {
     perfoverlay_pipeline_id_       = 0;
     perfoverlay_drawlist_id_       = 0;
     perfoverlay_drawlist_capacity_ = 0;
+    editor_overlay_pipeline_id_      = 0;
+    editor_overlay_segs_buf_id_      = 0;
+    editor_overlay_segs_buf_capacity_ = 0;
     bloom_dummy_tex_id_      = 0;
     for (auto& id : bloom_mip_tex_id_) id = 0;
     for (auto& w  : bloom_mip_w_)      w  = 0;
@@ -2532,6 +2577,24 @@ void Engine::RequestBackendSwitch(BackendType to) {
         });
         perfoverlay_drawlist_id_       = buf.id;
         perfoverlay_drawlist_capacity_ = kPerfDrawCapacity;
+    }
+
+    // Editor 3D-transform gizmo segment buffer (issue: editor 3D gizmos).
+    // One Segment record = 3 * float4 = 48 bytes; the engine writes the
+    // CPU-built list each frame via WriteBuffer and the shader iterates
+    // [0, num_segments). Sized to comfortably hold the rotate-mode
+    // worst case: 3 rings @ 32 segments + 24 translate-mode segments
+    // for the scale gizmo's three cubes = ~120 segments. Pick 256 for
+    // safety -> 12 KB.
+    {
+        constexpr std::uint32_t kEditorOverlayCapacity = 256;
+        auto buf = device_->CreateBuffer({
+            .size = sizeof(float) * 12u * kEditorOverlayCapacity,
+            .usage = pt::rhi::BufferUsage::Storage,
+            .debug_name = "editor_overlay_segments",
+        });
+        editor_overlay_segs_buf_id_       = buf.id;
+        editor_overlay_segs_buf_capacity_ = kEditorOverlayCapacity;
     }
 
     // Always-present placeholder storage buffer. Used as a harmless
@@ -4333,6 +4396,12 @@ void Engine::EnsurePipelineHandles() {
     resolve(bloom_up_pipeline_id_,     "bloom_up");
     resolve(autoexpose_pipeline_id_,   "autoexpose");
     resolve(perfoverlay_pipeline_id_,  "perfoverlay");
+    // Editor 3D-transform gizmo overlay (issue: editor 3D gizmos).
+    // Resolves on Metal + Vulkan; Software creates the pipeline by
+    // name on demand inside CreateComputePipeline so we get an id
+    // back even though the kernel itself is the CPU-side
+    // SoftwareDevice::RunEditorOverlay path.
+    resolve(editor_overlay_pipeline_id_, "editor_overlay");
     // Metal-only today; the Vulkan backend's pipeline-build worker has
     // no entry for this name, so resolve will leave the id at 0 and the
     // dispatch site short-circuits. Vulkan stars-composite plumbing is
@@ -8732,6 +8801,86 @@ void Engine::RenderFrame() {
         vulkan_optix_bloom_engaged_ = false;
     }
 
+    // ---- Editor 3D-transform gizmo dispatch (issue: editor 3D gizmos) ----
+    //
+    // Post-tonemap, pre-perf-overlay. Writing into the swapchain image
+    // means the gizmo doesn't get ACES'd (so it reads cleanly at any
+    // exposure -- desirable for editor handles) but DOES sit underneath
+    // the perf HUD. Gated on selected_prim_id_ being non-zero AND
+    // r_editor_gizmo (the cvar gate is enforced inside
+    // UpdateEditorGizmoFrame so the segment buffer stays cleared on
+    // disable).
+    UpdateEditorGizmoFrame();
+    // One-shot log so we know the dispatch is firing (very useful when
+    // wiring up new backends or first-run-after-merge debugging). The
+    // static gates this to exactly one print per process lifetime.
+    if (editor_overlay_pipeline_id_ != 0 &&
+        editor_overlay_segs_buf_id_ != 0 &&
+        editor_gizmo_.SegmentCount() > 0) {
+        static bool s_logged_once = false;
+        if (!s_logged_once) {
+            LOG_INFO("editor_overlay: first dispatch, segments={} "
+                     "(selected_prim_id={}, mode={})",
+                     editor_gizmo_.SegmentCount(),
+                     selected_prim_id_,
+                     static_cast<int>(editor_gizmo_.GetMode()));
+            s_logged_once = true;
+        }
+        // Compute-after-compute barrier on the swapchain image. Same
+        // shape as the PerfOverlay barrier below: tonemap (or Optix /
+        // SVGF finalize) wrote the swapchain; this kernel reads +
+        // writes it.
+        cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                     pt::rhi::BarrierDesc::Stage::ComputeWrite});
+        cb->BindComputePipeline(pt::rhi::PipelineHandle{editor_overlay_pipeline_id_});
+        cb->BindStorageTexture(0, fc.swapchain_image);
+        cb->BindBuffer(1, pt::rhi::BufferHandle{editor_overlay_segs_buf_id_}, 0);
+
+        // Push layout mirrors shaders/EditorOverlay.slang:
+        //   float4 pos_fovtan, fwd_aspect, right_xyz, up_xyz;
+        //   uint   num_segments, _pad0, _pad1, _pad2;
+        struct EditorOverlayPush {
+            float        pos_fovtan[4];
+            float        fwd_aspect[4];
+            float        right_xyz[4];
+            float        up_xyz[4];
+            std::uint32_t num_segments;
+            std::uint32_t _pad0;
+            std::uint32_t _pad1;
+            std::uint32_t _pad2;
+        } ep{};
+        static_assert(sizeof(EditorOverlayPush) == 80,
+                      "EditorOverlayPush must match shaders/EditorOverlay.slang");
+
+        const auto& C2 = *camera_;
+        const glm::vec3 fwd_v   = C2.Forward();
+        const glm::vec3 right_v = C2.Right();
+        const glm::vec3 up_v    = C2.Up();
+        const float aspect_ratio = (fc.height > 0)
+                                      ? float(fc.width) / float(fc.height)
+                                      : 1.0f;
+        ep.pos_fovtan[0] = C2.pos.x;
+        ep.pos_fovtan[1] = C2.pos.y;
+        ep.pos_fovtan[2] = C2.pos.z;
+        ep.pos_fovtan[3] = C2.FovYTan();
+        ep.fwd_aspect[0] = fwd_v.x;
+        ep.fwd_aspect[1] = fwd_v.y;
+        ep.fwd_aspect[2] = fwd_v.z;
+        ep.fwd_aspect[3] = aspect_ratio;
+        ep.right_xyz[0] = right_v.x;
+        ep.right_xyz[1] = right_v.y;
+        ep.right_xyz[2] = right_v.z;
+        ep.right_xyz[3] = 0.0f;
+        ep.up_xyz[0] = up_v.x;
+        ep.up_xyz[1] = up_v.y;
+        ep.up_xyz[2] = up_v.z;
+        ep.up_xyz[3] = 0.0f;
+        ep.num_segments = std::min(editor_gizmo_.SegmentCount(),
+                                   editor_overlay_segs_buf_capacity_);
+        cb->PushConstants(&ep, sizeof(ep));
+        cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
+    }
+
     // RHI-mode perf overlay: final compute pass that composites a panel
     // + sparkline onto the post-tonemap swapchain image.  Skipped when
     // the user picked native mode or set r_perf_overlay 0.  No text
@@ -12073,6 +12222,7 @@ void Engine::RegisterCommands() {
 
     RegisterCsgCommands();
     RegisterPrimCommands();
+    RegisterEditorGizmoCommands();
     // --- SDF Phase 1 (#97) -----------------------------------------------------
     RegisterSdfCommands();
     // --- end SDF Phase 1 -------------------------------------------------------
@@ -13161,6 +13311,305 @@ void Engine::RegisterPrimCommands() {
                            pt::editor::SelectionKindToString(kind_int), id);
         });
     // --- end Editor backend selection setter -------------------------------
+}
+
+// --- Editor 3D-transform gizmo (issue: editor 3D gizmos) -------------------
+//
+// Registers the cvars + commands the gizmo subsystem reads / dispatches.
+// Cvars:
+//   r_editor_gizmo      -- master on/off switch (default 1).
+//   gizmo_mode          -- "translate" | "rotate" | "scale" (default
+//                          "translate"). G / R / S hotkeys flip this
+//                          via SetCVarOverride from the engine's
+//                          key handler.
+//   r_editor_gizmo_xray -- 1 = always-on-top (default; v1 only mode),
+//                          0 = z-test against depth_tex (deferred to
+//                          a follow-up; see EditorOverlay.slang).
+//
+// Commands:
+//   gizmo_select <prim_id>    -- set selected_prim_id_ to <prim_id> (or
+//                                0 to deselect). Used by tests and as
+//                                the manual fallback until agent-19's
+//                                raycast pick path lands.
+//   prim_set_pos <id> <x> <y> <z>
+//                              -- mutate the position of the analytic
+//                                primitive at <id>. This is the
+//                                dispatch path the gizmo drag loop
+//                                uses; lifting it out into a console
+//                                command means undo/redo + the
+//                                eventual snapshot system route the
+//                                same way through Console::Execute as
+//                                the user typing the line manually.
+//                                Agent-19's branch introduces a
+//                                richer per-kind dispatch (Sphere /
+//                                Csg / Sdf); on merge our local
+//                                command will defer to that.
+void Engine::RegisterEditorGizmoCommands() {
+    auto& C = pt::console::Console::Get();
+
+    C.RegisterCVar("r_editor_gizmo", "1",
+        "Editor 3D-transform gizmo master switch. 1 = render an XYZ "
+        "axis triad (translate mode) / ring set (rotate) / cube tips "
+        "(scale) over the selected analytic primitive; 0 = no gizmo. "
+        "Has no effect when nothing is selected (selected_prim_id_ "
+        "== 0).",
+        pt::console::CVAR_ARCHIVE);
+
+    C.RegisterCVar("gizmo_mode", "translate",
+        "Editor gizmo mode: translate | rotate | scale. The G / R / "
+        "S hotkeys flip this via SetCVarOverride from the engine's "
+        "key handler. Rotate mode does NOT currently dispatch a "
+        "rotation mutation (analytic prims don't carry orientation "
+        "in this codebase); it draws three rings for visual feedback "
+        "only. Scale mode mutates radius_or_d for spheres.",
+        pt::console::CVAR_ARCHIVE);
+
+    C.RegisterCVar("r_editor_gizmo_xray", "1",
+        "Editor gizmo z-test mode. 1 = always-on-top (Blender's "
+        "default, current v1 behaviour); 0 = z-test against the "
+        "scene's primary-hit depth buffer (deferred -- depth_tex is "
+        "only allocated when the denoiser is active, so the kernel "
+        "transparently falls back to always-on-top until that "
+        "lifecycle plumbing lands).",
+        pt::console::CVAR_ARCHIVE);
+
+    // gizmo_select is a thin wrapper around the canonical
+    // SetSelection(kind, id) that agent-19's PR #201 introduced. We
+    // keep it as a separate command because the existing select cmd
+    // takes <kind> <id> -- the editor's "I want to focus on prim N"
+    // shorthand is more ergonomic and matches the hotkey workflow.
+    C.RegisterCommand("gizmo_select",
+        "gizmo_select <prim_id> -- focus the editor gizmo on an "
+        "analytic primitive. Pass 0 to deselect (gizmo hides).",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 1) {
+                out.PrintLine("usage: gizmo_select <prim_id>");
+                return;
+            }
+            std::uint32_t id = 0;
+            if (!ParseUint(args[0], id)) {
+                out.PrintLine("gizmo_select: id parse failed");
+                return;
+            }
+            if (id != 0 && primitives_.find(id) == primitives_.end()) {
+                out.FormatLine("gizmo_select: id {} is not in primitives_", id);
+                return;
+            }
+            SetSelection(id == 0 ? SelectionKind::None
+                                 : SelectionKind::AnalyticPrim,
+                         id);
+            // End any in-flight drag when the selection changes so a
+            // stale drag from the previous prim doesn't bleed into the
+            // new one.
+            if (editor_gizmo_.IsDragging()) editor_gizmo_.EndDrag();
+            if (id == 0) out.PrintLine("editor: selection cleared");
+            else         out.FormatLine("editor: selected prim id={}", id);
+        });
+
+    // prim_set_pos is provided by agent-19's PR #201 with richer
+    // plane-normal handling + WebSocket scene_dirty broadcast. The
+    // gizmo drag loop just dispatches `prim_set_pos` via
+    // Console::Execute and inherits that behaviour for free.
+
+    C.RegisterCommand("prim_set_radius",
+        "prim_set_radius <id> <r> -- set the radius of an analytic "
+        "sphere primitive. Used by the editor gizmo scale-mode drag.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 2) {
+                out.PrintLine("usage: prim_set_radius <id> <r>");
+                return;
+            }
+            std::uint32_t id = 0;
+            float r = 0.0f;
+            if (!ParseUint(args[0], id) || !ParseFloat(args[1], r)) {
+                out.PrintLine("prim_set_radius: arg parse failed");
+                return;
+            }
+            if (r <= 0.0f) {
+                out.PrintLine("prim_set_radius: radius must be > 0");
+                return;
+            }
+            auto it = primitives_.find(id);
+            if (it == primitives_.end()) {
+                out.FormatLine("prim_set_radius: id {} not found", id);
+                return;
+            }
+            if (it->second.type != AnalyticPrim::Sphere) {
+                out.FormatLine("prim_set_radius: id {} is not a sphere", id);
+                return;
+            }
+            it->second.radius_or_d = r;
+            primitives_dirty_ = true;
+            accum_dirty_      = true;
+            out.FormatLine("primitives: id {} radius -> {:.3f}", id, r);
+        });
+}
+
+// --- Editor 3D-transform gizmo per-frame work (issue: editor 3D gizmos) ----
+//
+// Called from RenderFrame BEFORE the editor_overlay compute dispatch.
+// Responsibilities:
+//   1. Sync editor_gizmo_'s mode from the gizmo_mode cvar.
+//   2. Look up the selected primitive; bail (no upload, no dispatch) if
+//      nothing is selected or the id has been removed.
+//   3. Compute the per-frame gizmo size from the prim's radius.
+//   4. Run hit-test against the polled cursor position to find which
+//      axis (if any) the mouse is hovering -- yellow-highlight that one.
+//   5. Drive the click+drag state machine via the LMB edge detect:
+//        prev=false, now=true  -> begin drag if hovering an axis
+//        prev=true, now=true   -> update drag (dispatch prim_set_pos)
+//        prev=true, now=false  -> end drag
+//      Esc while dragging restores the pre-drag position.
+//   6. Rebuild the segment list and WriteBuffer it to
+//      editor_overlay_segs_buf_id_.
+//
+// LMB hit-test is intentionally gated on r_editor_gizmo (so the user
+// can keep the gizmo visible but disable interaction for screenshot
+// scenarios) AND on the absence of mouse_look_active_ -- RMB camera
+// look should never compete with gizmo drag.
+void Engine::UpdateEditorGizmoFrame() {
+    if (!device_ || !window_ || !camera_) return;
+
+    auto& C = pt::console::Console::Get();
+    // Master switch + mode pull.
+    bool gizmo_enabled = true;
+    if (auto* v = C.FindCVar("r_editor_gizmo")) gizmo_enabled = v->GetBool();
+
+    {
+        std::string mode = "translate";
+        if (auto* v = C.FindCVar("gizmo_mode")) mode = v->value;
+        if      (mode == "rotate") editor_gizmo_.SetMode(pt::renderer::EditorOverlay::Mode::Rotate);
+        else if (mode == "scale")  editor_gizmo_.SetMode(pt::renderer::EditorOverlay::Mode::Scale);
+        else                       editor_gizmo_.SetMode(pt::renderer::EditorOverlay::Mode::Translate);
+    }
+
+    editor_gizmo_.ClearSegments();
+
+    // Gizmo gates on the editor's canonical selection state. Today we
+    // only handle analytic-prim selections; Csg / Sdf / RigidBody
+    // gizmos are a follow-up (those scopes don't expose a unified
+    // "position / radius" the gizmo can dispatch over yet).
+    const bool selection_active =
+        selected_kind_ == SelectionKind::AnalyticPrim &&
+        selected_prim_id_ != 0;
+    if (!selection_active || !gizmo_enabled) {
+        // Drop any in-flight drag if the user just cleared the selection
+        // mid-drag (or toggled the master switch off).
+        if (editor_gizmo_.IsDragging()) editor_gizmo_.EndDrag();
+        return;
+    }
+    auto it = primitives_.find(selected_prim_id_);
+    if (it == primitives_.end()) {
+        // Selection points at a primitive that was removed since.
+        SetSelection(SelectionKind::None, 0);
+        if (editor_gizmo_.IsDragging()) editor_gizmo_.EndDrag();
+        return;
+    }
+    // Planes have no canonical position to gizmo over (n + d, not
+    // a centre point). Silently skip until plane manipulation has
+    // a meaningful UX.
+    if (it->second.type != AnalyticPrim::Sphere) {
+        if (editor_gizmo_.IsDragging()) editor_gizmo_.EndDrag();
+        return;
+    }
+
+    const glm::vec3 origin{it->second.pos_or_n[0],
+                           it->second.pos_or_n[1],
+                           it->second.pos_or_n[2]};
+    const float gizmo_size = std::max(0.5f, it->second.radius_or_d * 1.5f);
+    const float aspect = (accum_h_ > 0)
+                           ? float(accum_w_) / float(accum_h_)
+                           : 1.0f;
+
+    // Cursor + LMB state.
+    double mx = 0.0, my = 0.0;
+    window_->GetCursorPos(mx, my);
+    const bool lmb_down = window_->IsMouseButtonDown(0); // GLFW_MOUSE_BUTTON_LEFT
+    // Gate clicks when the camera is being mouse-looked (RMB held). The
+    // gizmo dragging an axis while the user is also yawing the camera
+    // would be deeply confusing.
+    const bool mouse_look = mouse_look_active_;
+
+    pt::renderer::EditorOverlay::Axis hovered =
+        pt::renderer::EditorOverlay::Axis::None;
+    if (!mouse_look) {
+        hovered = editor_gizmo_.HitTest(origin, gizmo_size,
+                                        *camera_, aspect,
+                                        accum_w_, accum_h_,
+                                        mx, my, /*radius_px=*/10.0f);
+    }
+
+    // Esc-during-drag: abort and restore pre-drag origin.
+    const bool esc_pressed = window_->IsKeyDown(256); // GLFW_KEY_ESCAPE
+    if (esc_pressed && editor_gizmo_.IsDragging()) {
+        // Restore via the same console-routed mutation path so undo
+        // / snapshot semantics line up with the normal drag.
+        const glm::vec3 pre = editor_drag_pre_pos_;
+        auto cmd = fmt::format("prim_set_pos {} {} {} {}",
+                               selected_prim_id_, pre.x, pre.y, pre.z);
+        pt::console::Console::Get().Execute(cmd);
+        editor_gizmo_.EndDrag();
+        prev_lmb_down_ = false;
+    }
+
+    // LMB edge detect.
+    if (!mouse_look) {
+        if (lmb_down && !prev_lmb_down_) {
+            // Press edge. Start drag iff hovering an axis.
+            if (hovered != pt::renderer::EditorOverlay::Axis::None) {
+                editor_drag_pre_pos_ = origin;
+                editor_gizmo_.BeginDrag(hovered, origin,
+                                        *camera_, aspect,
+                                        accum_w_, accum_h_,
+                                        mx, my);
+            }
+        } else if (lmb_down && prev_lmb_down_ && editor_gizmo_.IsDragging()) {
+            // Continuing drag. Compute new world pos and dispatch
+            // prim_set_pos via Console::Execute so the engine's
+            // existing accum_dirty / primitives_dirty handling +
+            // future undo machinery route uniformly.
+            const glm::vec3 new_pos =
+                editor_gizmo_.UpdateDrag(*camera_, aspect,
+                                         accum_w_, accum_h_, mx, my);
+            // Skip the dispatch if the delta is sub-millimetre; cuts
+            // the ~60 Hz Execute() churn when the mouse is still.
+            if (glm::distance(new_pos, origin) > 1e-4f) {
+                auto cmd = fmt::format("prim_set_pos {} {} {} {}",
+                                       selected_prim_id_,
+                                       new_pos.x, new_pos.y, new_pos.z);
+                pt::console::Console::Get().Execute(cmd);
+            }
+        } else if (!lmb_down && prev_lmb_down_) {
+            // Release edge.
+            editor_gizmo_.EndDrag();
+        }
+    }
+    prev_lmb_down_ = lmb_down;
+
+    // Geometry build. Use the (possibly updated) origin from
+    // primitives_ -- it may have changed during this same frame if
+    // the drag dispatched prim_set_pos above.
+    auto fresh = primitives_.find(selected_prim_id_);
+    glm::vec3 build_origin = origin;
+    if (fresh != primitives_.end()) {
+        build_origin = glm::vec3{fresh->second.pos_or_n[0],
+                                 fresh->second.pos_or_n[1],
+                                 fresh->second.pos_or_n[2]};
+    }
+    const pt::renderer::EditorOverlay::Axis hl =
+        editor_gizmo_.IsDragging() ? editor_gizmo_.DragAxis() : hovered;
+    editor_gizmo_.AppendGizmo(build_origin, gizmo_size, hl);
+
+    // Upload to GPU.
+    if (editor_overlay_segs_buf_id_ != 0 && editor_gizmo_.SegmentCount() > 0) {
+        const std::uint32_t cap = editor_overlay_segs_buf_capacity_;
+        const std::uint32_t n   = std::min(editor_gizmo_.SegmentCount(), cap);
+        device_->WriteBuffer(
+            pt::rhi::BufferHandle{editor_overlay_segs_buf_id_},
+            editor_gizmo_.Segments().data(),
+            std::size_t(n) * sizeof(pt::renderer::EditorOverlay::Segment),
+            0);
+    }
 }
 
 // --- SDF Phase 1 (#97) -----------------------------------------------------

@@ -50,6 +50,12 @@ extern const unsigned char shader_AutoExposure_spirv_data[];
 extern const unsigned long shader_AutoExposure_spirv_size;
 extern const unsigned char shader_PerfOverlay_spirv_data[];
 extern const unsigned long shader_PerfOverlay_spirv_size;
+// Editor 3D-transform gizmo overlay. Compute kernel that rasterizes
+// world-space line segments into the swapchain. Built alongside the
+// other Vulkan-side overlays; engine dispatches it only when the editor
+// has a selected primitive AND r_editor_gizmo is non-zero.
+extern const unsigned char shader_EditorOverlay_spirv_data[];
+extern const unsigned long shader_EditorOverlay_spirv_size;
 // Bloom pyramid (BloomDown/Up). Compiled to SPIR-V and embedded
 // alongside the other compute shaders. Each declares only 2
 // storage-image bindings (src + dst) on Vulkan, which is compatible
@@ -1383,6 +1389,14 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         }
         build_pipeline("autoexpose",  shader_AutoExposure_spirv_data, shader_AutoExposure_spirv_size);
         build_pipeline("perfoverlay", shader_PerfOverlay_spirv_data,  shader_PerfOverlay_spirv_size);
+        // Editor 3D-transform gizmo overlay (issue: editor 3D gizmos).
+        // Re-uses the shared 23-binding descriptor layout; the kernel
+        // only touches engine texture slot 0 (swapchain) and engine
+        // buffer slot 1 (segments at vk::binding(3)). All other slots
+        // are inherited unread.
+        build_pipeline("editor_overlay",
+                       shader_EditorOverlay_spirv_data,
+                       shader_EditorOverlay_spirv_size);
         // Bloom pyramid pipelines. These re-use the shared 20-binding
         // pipeline layout (their only real bindings are 0 and 1, both
         // storage images, which the shared layout supports). The MSL

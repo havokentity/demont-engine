@@ -137,6 +137,12 @@ pt_compile_slang(
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/PerfOverlay.slang
     STAGE compute ENTRY main TARGETS spirv)
+# Editor 3D-transform gizmo overlay. Compute kernel that rasterizes
+# world-space line segments into the swapchain. See
+# shaders/EditorOverlay.slang for the binding contract.
+pt_compile_slang(
+    TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/EditorOverlay.slang
+    STAGE compute ENTRY main TARGETS spirv)
 # SVGF/NRD denoiser kernels. Each is its own SPIR-V blob; the Vulkan
 # backend's VulkanNrdDenoiser builds a dedicated VkPipelineLayout +
 # 2 VkPipeline handles from these and dispatches them in sequence.

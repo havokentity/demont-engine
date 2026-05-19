@@ -114,6 +114,18 @@ pt_compile_slang(
     ENTRY   main
     TARGETS metal
 )
+# Editor 3D-transform gizmo overlay. Compute kernel that rasterizes
+# world-space line segments (projected via the camera matrices in the
+# push constants) over the post-tonemap swapchain image. Dispatched
+# only when the editor has a primitive selected; otherwise the engine
+# skips the binding chain entirely.
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/EditorOverlay.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+)
 # Stateless stars+sun+moon composite. Runs once per frame on Metal
 # between Denoise() and dispatch_bloom_pyramid, so post-denoise HDR
 # gets sub-pixel celestials with their own aperture-sampled bokeh and

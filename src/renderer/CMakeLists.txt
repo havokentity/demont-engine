@@ -5,6 +5,7 @@ add_library(pt_renderer STATIC
     Astronomy.cpp
     BscCatalog.cpp
     Csg/CsgScene.cpp
+    EditorOverlay.cpp
     GltfImporter.cpp
     gltf_impl.cpp
     HdrImage.cpp

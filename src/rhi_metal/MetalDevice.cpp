@@ -34,6 +34,12 @@ extern const unsigned char shader_BloomUp_metal_data[];
 extern const unsigned long shader_BloomUp_metal_size;
 extern const unsigned char shader_PerfOverlay_metal_data[];
 extern const unsigned long shader_PerfOverlay_metal_size;
+// Editor 3D-transform gizmo overlay. Compute kernel that rasterizes
+// world-space line segments into the swapchain. Dispatched only when
+// the engine has a selected primitive (and r_editor_gizmo != 0); see
+// shaders/EditorOverlay.slang for the layout.
+extern const unsigned char shader_EditorOverlay_metal_data[];
+extern const unsigned long shader_EditorOverlay_metal_size;
 extern const unsigned char shader_StarsComposite_metal_data[];
 extern const unsigned long shader_StarsComposite_metal_size;
 extern const unsigned char shader_AuroraComposite_metal_data[];
@@ -347,6 +353,9 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
     build_pso("bloom_down",  shader_BloomDown_metal_data,    shader_BloomDown_metal_size);
     build_pso("bloom_up",    shader_BloomUp_metal_data,      shader_BloomUp_metal_size);
     build_pso("perfoverlay", shader_PerfOverlay_metal_data,  shader_PerfOverlay_metal_size);
+    build_pso("editor_overlay",
+              shader_EditorOverlay_metal_data,
+              shader_EditorOverlay_metal_size);
     build_pso("stars_composite",
               shader_StarsComposite_metal_data,
               shader_StarsComposite_metal_size);
