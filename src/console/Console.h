@@ -270,6 +270,29 @@ public:
     const std::string& LastExecutedLine() const { return last_executed_line_; }
     void SetFavorites(std::vector<std::string> favs) { favorites_ = std::move(favs); }
 
+    // Console input history (the up-arrow scroll-back). Push a line on
+    // submit; the platform overlay seeds its in-memory history from
+    // History() at Init and walks it on Up/Down. Persisted across
+    // sessions by Engine::Save/LoadConsoleHistoryToDisk to
+    // `console_history.txt` next to demont.cfg. Cap kMaxHistoryDepth
+    // entries -- oldest get dropped FIFO. Empty / whitespace-only
+    // submissions are rejected (would be useless on up-arrow walk).
+    //
+    // Why this lives in Console and not in the overlay: the macOS +
+    // Win32 + (stub) Linux overlays each own their own platform
+    // history buffer for live walk, but they ALL submit via
+    // Console::Execute -- so Console is the one place every command
+    // line is guaranteed to pass through. Holding history here gives
+    // us a single, cross-platform, headless-friendly persistence
+    // store. The overlays mirror Console::history_ into their native
+    // structures on Init.
+    static constexpr std::size_t kMaxHistoryDepth = 256;
+    void PushHistory(std::string line);
+    void ClearHistory();
+    std::vector<std::string> History() const { return history_; }
+    std::size_t HistoryCount() const { return history_.size(); }
+    void SetHistory(std::vector<std::string> hist);
+
 private:
     Console() = default;
 
@@ -314,6 +337,12 @@ private:
     // Guard: prevents a fN dispatch from recursing into itself if a
     // saved favourite happens to be `f1` (which would loop forever).
     bool                      in_fav_dispatch_ = false;
+
+    // Console input history (up-arrow scroll-back). Front is oldest,
+    // back is newest. Capped at kMaxHistoryDepth -- on overflow we
+    // pop_front so the WAS-typed cap is the most recent N. See public
+    // PushHistory / History / SetHistory for semantics.
+    std::vector<std::string>  history_;
 };
 
 // Tokenize a single console line.  Quote-aware ("a b" stays one token).

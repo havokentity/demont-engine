@@ -375,6 +375,18 @@ private:
     void LoadFavoritesFromDisk();
     void SaveFavoritesToDisk();
 
+    // Console-history persistence. LoadConsoleHistoryFromDisk reads
+    // `console_history.txt` (one line per history entry; blank lines
+    // and `#` comments ignored) into Console::history_ so the
+    // up-arrow scroll-back survives across demont sessions.
+    // SaveConsoleHistoryToDisk writes the current Console::History()
+    // back, capped to the most recent Console::kMaxHistoryDepth
+    // entries. Path is resolved relative to CWD, same as demont.cfg
+    // and favorites.cfg. --no-cfg skips the load (consistent with the
+    // demont.cfg / autoexec.cfg / favorites.cfg skip).
+    void LoadConsoleHistoryFromDisk();
+    void SaveConsoleHistoryToDisk();
+
     // Replace the current mesh-path resources (vertex/index buffers,
     // BLAS, TLAS) with one built from `baked`. Called from EnsureMesh*
     // on the main thread once a worker bake has completed.

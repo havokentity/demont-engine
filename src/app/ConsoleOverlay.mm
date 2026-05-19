@@ -712,6 +712,13 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
     if (self.history.count > 200) [self.history removeObjectAtIndex:0];
     self.historyPos = self.history.count;
 
+    // Mirror into Console::history_ so the cross-platform persistence
+    // path (Engine::SaveConsoleHistoryToDisk -> console_history.txt)
+    // sees every submitted line. PushHistory dedups against the
+    // immediate predecessor and trims to kMaxHistoryDepth -- safe to
+    // call unconditionally on every submit.
+    pt::console::Console::Get().PushHistory(std::string([line UTF8String]));
+
     [self appendLine:line level:@"input"];
 
     // ExecuteScript so pasted multi-statement lines (separated by ';'
@@ -1708,6 +1715,23 @@ bool ConsoleOverlay::Init(void* ns_window) {
     // change. Cheap (one cvar lookup + float compare); no-op when the
     // cvar is at its default.
     [panel.consoleView applyFontScale];
+
+    // Seed the up-arrow walk buffer from Console::history_. The Engine
+    // populates that vector via LoadConsoleHistoryFromDisk BEFORE
+    // ConsoleOverlay::Init runs (see Engine::Init), so previous-
+    // session lines are already in place. We mirror them into the
+    // NSMutableArray that drives Up/Down arrow walks, then set
+    // historyPos to count so the first Up press recalls the most
+    // recent entry. Empty history (first launch or --no-cfg) makes
+    // this a no-op.
+    {
+        auto persisted = pt::console::Console::Get().History();
+        for (const auto& entry : persisted) {
+            NSString* ns = [NSString stringWithUTF8String:entry.c_str()];
+            if (ns != nil) [panel.consoleView.history addObject:ns];
+        }
+        panel.consoleView.historyPos = panel.consoleView.history.count;
+    }
 
     // Forward log lines into the overlay (the panel's contentView).
     return true;

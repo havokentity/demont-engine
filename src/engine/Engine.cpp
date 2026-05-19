@@ -1353,7 +1353,7 @@ bool Engine::Init() {
         }
     }
     if (skip_cfg_load) {
-        LOG_INFO("engine: --no-cfg given -- skipping demont.cfg + autoexec.cfg + favorites.cfg load");
+        LOG_INFO("engine: --no-cfg given -- skipping demont.cfg + autoexec.cfg + favorites.cfg + console_history.txt load");
     } else {
         exec_if_exists("demont.cfg");      // archived cvars from last quit
         exec_if_exists("autoexec.cfg");    // user-supplied startup script (overrides above)
@@ -1363,6 +1363,12 @@ bool Engine::Init() {
         // from the first line of any session. One favourite per line;
         // blank lines + leading `#` are ignored.
         LoadFavoritesFromDisk();
+        // Console up-arrow history (parallel persistence file, NOT a
+        // console script). Loaded directly into Console::history_ so
+        // the platform overlay can seed its native walk buffer from
+        // Console::History() during Init below. One line per entry;
+        // blank lines + leading `#` are ignored.
+        LoadConsoleHistoryFromDisk();
     }
 
     // Command-line cvar overrides land last so they beat both archived
@@ -1841,6 +1847,16 @@ void Engine::Shutdown() {
     // SaveState). Done BEFORE RemoveAllSinks + overlay->Shutdown so
     // both the in-memory deques and the log sink are still wired.
     if (overlay_) overlay_->SaveState("demont_console.state");
+
+    // Cross-platform console-input-history persistence. The Win32
+    // overlay's SaveState above writes a richer state file
+    // (history + scrollback) but it's Win32-only. console_history.txt
+    // is the cross-platform up-arrow-only file that every host
+    // (macOS, Linux, headless test) writes -- backed by Console's own
+    // history_ vector, which platform overlays mirror via
+    // PushHistory on submit. Safe to call alongside overlay_->SaveState
+    // -- the two files coexist (SaveState is .state, history is .txt).
+    SaveConsoleHistoryToDisk();
 
     pt::log::RemoveAllSinks();
     if (overlay_) overlay_->Shutdown();
@@ -4155,6 +4171,78 @@ void Engine::SaveFavoritesToDisk() {
     std::fwrite(header.data(), 1, header.size(), f);
     for (const auto& line : favs) {
         std::fwrite(line.data(), 1, line.size(), f);
+        std::fputc('\n', f);
+    }
+    std::fclose(f);
+}
+
+void Engine::LoadConsoleHistoryFromDisk() {
+    // console_history.txt lives next to demont.cfg (CWD). One history
+    // entry per line; blank lines + lines starting with '#' are
+    // ignored (so users can hand-edit and leave comments).
+    //
+    // Loaded directly into Console::history_ via SetHistory -- the
+    // platform overlay seeds its native walk buffer from
+    // Console::History() during Init, so this MUST run BEFORE
+    // overlay_->Init() to take effect on the first frame.
+    //
+    // Missing file is fine (first launch, deleted file). All other
+    // errors are warnings -- a malformed history file should never
+    // wedge engine startup.
+    FILE* f = std::fopen("console_history.txt", "rb");
+    if (f == nullptr) return;
+    std::vector<std::string> loaded;
+    char buf[4096];
+    std::string accum;
+    while (std::size_t n = std::fread(buf, 1, sizeof(buf), f)) {
+        accum.append(buf, n);
+    }
+    std::fclose(f);
+    std::size_t i = 0;
+    while (i < accum.size()) {
+        std::size_t end = i;
+        while (end < accum.size() && accum[end] != '\n') ++end;
+        std::string line = accum.substr(i, end - i);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        // Skip blank + comment lines (after optional leading
+        // whitespace -- mirrors LoadFavoritesFromDisk).
+        std::size_t lead = 0;
+        while (lead < line.size() && (line[lead] == ' ' || line[lead] == '\t')) ++lead;
+        if (lead < line.size() && line[lead] != '#') {
+            loaded.push_back(std::move(line));
+        }
+        i = (end < accum.size()) ? end + 1 : end;
+    }
+    pt::console::Console::Get().SetHistory(std::move(loaded));
+    LOG_INFO("console history: loaded {} entry(ies) from console_history.txt",
+             pt::console::Console::Get().HistoryCount());
+}
+
+void Engine::SaveConsoleHistoryToDisk() {
+    auto& C = pt::console::Console::Get();
+    const auto hist = C.History();
+    // Even if empty, rewrite the file so a cleared list persists as
+    // empty across launches -- otherwise an old file would resurrect
+    // history the user explicitly cleared.
+    FILE* f = std::fopen("console_history.txt", "wb");
+    if (f == nullptr) {
+        LOG_WARN("console history: failed to open console_history.txt for write");
+        return;
+    }
+    const std::string header =
+        "# demont console input history. One command line per entry.\n"
+        "# Auto-written at engine shutdown so the up-arrow scroll-back\n"
+        "# survives across sessions. Lines starting with `#` and blank\n"
+        "# lines are ignored on load. Capped at the most recent\n"
+        "# Console::kMaxHistoryDepth entries -- safe to hand-edit.\n";
+    std::fwrite(header.data(), 1, header.size(), f);
+    // Cap on write too as a defence-in-depth: PushHistory already
+    // trims, but SetHistory could in theory deliver an over-large
+    // vector if a future caller bypasses it.
+    const std::size_t kCap = pt::console::Console::kMaxHistoryDepth;
+    const std::size_t start = hist.size() > kCap ? hist.size() - kCap : 0;
+    for (std::size_t k = start; k < hist.size(); ++k) {
+        std::fwrite(hist[k].data(), 1, hist[k].size(), f);
         std::fputc('\n', f);
     }
     std::fclose(f);
