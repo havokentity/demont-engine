@@ -357,7 +357,7 @@ Texture2D<float4> moon_map;
 // shader's Lambert NEE block picks one entry per sample (uniform over
 // the count) and traces a shadow ray to a sampled point on it.
 //
-// Layout: 4 float4s per light (matches the analytic primitive pattern's
+// Layout: 5 float4s per light (matches the analytic primitive pattern's
 // declaration-order convention, sized to fit every supported type).
 //
 //   v0.xyz = position             (point/spot center, sphere center,
@@ -381,6 +381,12 @@ Texture2D<float4> moon_map;
 //   v3.w   = v_half_extent        (quad v-axis half-extent magnitude;
 //                                   the v-axis is implicit:
 //                                   normalize(cross(normal, u)))
+//   v4.xyzw = orient quaternion   (rotation gizmo follow-up to #206;
+//                                   xyzw, identity (0,0,0,1) leaves the
+//                                   stored dir / u_vec unchanged. Spot
+//                                   rotates `dir` before the cone test;
+//                                   quad rotates `dir` and `u_vec`
+//                                   before area-sample math.)
 //
 // IMPORTANT: declared AFTER shadow_vis_buf so existing Metal slots 0..11
 // are undisturbed (Metal slot allocation is declaration-order based).
@@ -2426,20 +2432,25 @@ struct LightSample {
                        //   already; not used here.
 };
 
-// 4 float4s per light. Indexed by raw float4 lane offsets to keep the
+// 5 float4s per light. Indexed by raw float4 lane offsets to keep the
 // shader independent of how Slang lays the StructuredBuffer out on
-// Metal (declaration-order MSL slot 11, vk::binding 27).
-static const uint kLightStrideFloat4 = 4u;
+// Metal (declaration-order MSL slot 11, vk::binding 27). v4 carries
+// the rotation-gizmo orientation quaternion (xyzw); spot rotates its
+// `dir` by it before the cone test, quad rotates both `dir` (normal)
+// and the assembled u-extent at sample time. Identity (0,0,0,1)
+// short-circuits to a no-op via quatRotate.
+static const uint kLightStrideFloat4 = 5u;
 
 struct LightRecord {
     float3 pos;
     float  radius;
     float3 intensity;
     uint   type;
-    float3 dir;        // spot axis / quad normal
+    float3 dir;        // spot axis / quad normal (pre-rotation)
     float  cos_outer;  // spot only
-    float3 u_or_inner; // quad u-half-extent vec; spot: x = cos_inner
+    float3 u_or_inner; // quad u-half-extent vec (pre-rotation); spot: x = cos_inner
     float  v_half;     // quad v-axis half-extent (length)
+    float4 orient;     // orientation quaternion (xyzw); identity = (0,0,0,1)
 };
 
 LightRecord loadLight(uint idx) {
@@ -2448,6 +2459,7 @@ LightRecord loadLight(uint idx) {
     float4 v1 = light_prims[base + 1u];
     float4 v2 = light_prims[base + 2u];
     float4 v3 = light_prims[base + 3u];
+    float4 v4 = light_prims[base + 4u];
     LightRecord L;
     L.pos        = v0.xyz;
     L.radius     = v0.w;
@@ -2457,6 +2469,7 @@ LightRecord loadLight(uint idx) {
     L.cos_outer  = v2.w;
     L.u_or_inner = v3.xyz;
     L.v_half     = v3.w;
+    L.orient     = v4;
     return L;
 }
 
@@ -2719,8 +2732,12 @@ LightSample sampleAnalyticLight(float3 hit_pt, float3 n_face, inout uint seed) {
         // Spot angular falloff: 1 inside cos_inner, 0 outside cos_outer,
         // smooth linear ramp in between. Direction from surface toward
         // the LIGHT is -to_l_dir from the light's emission lobe (the
-        // spot axis points from emitter into the world).
-        float cos_dir = dot(-to_l_dir, normalize(L.dir));
+        // spot axis points from emitter into the world). Rotate the
+        // stored axis through the orientation quaternion so the editor
+        // rotate gizmo can tilt the cone without mutating L.dir.
+        // Identity quat (0,0,0,1) leaves the axis unchanged.
+        float3 axis   = normalize(quatRotate(L.orient, L.dir));
+        float cos_dir = dot(-to_l_dir, axis);
         float cos_in  = L.u_or_inner.x;
         float cos_out = L.cos_outer;
         float falloff = 0.0;
@@ -2769,13 +2786,16 @@ LightSample sampleAnalyticLight(float3 hit_pt, float3 n_face, inout uint seed) {
         // Uniform-area on a (2u) x (2v) rectangle. The host packs
         // u_extent as the FULL half-extent vector (length = u_half);
         // v-axis is normalize(cross(normal, u)), and v_half is the
-        // half-extent length.
+        // half-extent length. Both the normal and the u-extent vector
+        // are rotated through the orientation quaternion so the
+        // editor rotate gizmo can tilt the quad in-place. Identity
+        // (0,0,0,1) leaves the stored frame untouched.
         float2 xi = float2(randf(seed) * 2.0 - 1.0,
                            randf(seed) * 2.0 - 1.0);   // [-1, 1]
-        float3 u_vec = L.u_or_inner;
+        float3 u_vec = quatRotate(L.orient, L.u_or_inner);
         float  u_len = length(u_vec);
         if (u_len < 1e-6) return s;
-        float3 n_quad = normalize(L.dir);
+        float3 n_quad = normalize(quatRotate(L.orient, L.dir));
         float3 v_axis = normalize(cross(n_quad, u_vec));
         float3 lp = L.pos + u_vec * xi.x + v_axis * (L.v_half * xi.y);
         float3 to_light = lp - hit_pt;

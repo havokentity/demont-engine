@@ -152,6 +152,14 @@ json SerializeScene(const pt::engine::Engine& engine) {
             {"type",      LightTypeName(L.type)},
             {"pos",       {L.pos[0], L.pos[1], L.pos[2]}},
             {"intensity", {L.intensity[0], L.intensity[1], L.intensity[2]}},
+            // Orientation quaternion (xyzw). Identity (0,0,0,1) for
+            // non-rotated lights. Rotation gizmo follow-up to #206:
+            // spot's cone axis and quad's normal + u-extent are
+            // rotated through this at shader time. Point / sphere
+            // lights are rotation-symmetric so the value is inert
+            // but still surfaced so inspector panels read a stable
+            // orientation state.
+            {"orient",    {L.orient[0], L.orient[1], L.orient[2], L.orient[3]}},
         };
         if (L.type == pt::engine::Engine::AnalyticLight::Spot) {
             j["dir"]       = {L.dir[0], L.dir[1], L.dir[2]};
