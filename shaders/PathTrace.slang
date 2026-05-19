@@ -840,6 +840,19 @@ cbuffer Push {
     //                .z/.w reserved.
     float4 motion_blur_params;
     // --- end Motion blur ------------------------------------------------------
+    // --- Editor backend (agent-19) -------------------------------------------
+    // editor_params.x = selected_prim_id (0 = no selection / paint nothing).
+    //              .y = r_editor_outline gate (0/1; 0 forces the outline
+    //                                          off regardless of .x).
+    //              .z = selected_kind  (mirrors host SelectionKind enum;
+    //                                   only AnalyticPrim paints today).
+    //              .w reserved.
+    // Host writes the EFFECTIVE id into .x (zero when the cvar gate is
+    // off or kind != AnalyticPrim) so the shader can collapse the
+    // outline test to a single "if (.x != 0 && prim_id == .x)" without
+    // re-reading .y / .z on every prim hit.
+    uint4 editor_params;
+    // --- end Editor backend ---------------------------------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -936,6 +949,8 @@ cbuffer Frame {
     float4 smoke_params2;
     // See `motion_blur_params` in the Metal Push cbuffer above (#85).
     float4 motion_blur_params;
+    // See `editor_params` in the Metal Push cbuffer above (agent-19).
+    uint4 editor_params;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -1022,6 +1037,14 @@ struct HitInfo {
     // the additive-emitter pattern used for emissive sphere/quad area
     // lights.
     float3 emission;
+    // Editor backend (agent-19): user-facing id of the analytic prim
+    // that produced this hit. Sourced from primitives[idx*5 + 2].w
+    // (the same v2.w slot the host now bakes the AnalyticPrim map key
+    // into via asuint reinterpretation). 0 on mesh / SDF / miss paths
+    // -- those overwrite the field explicitly. The per-bounce loop
+    // tints emission with magenta at silhouette edges when this id
+    // matches editor_params.x.
+    uint prim_id;
 };
 
 // Test a single analytic primitive at `primitives[idx*5 + 0..4]` against
@@ -1053,6 +1076,12 @@ void testAnalyticPrim(uint idx, float3 ro, float3 rd, float shutter_t01, inout H
     float4 v3 = primitives[idx * 5u + 3u];
     float4 v4 = primitives[idx * 5u + 4u];
     uint type = uint(v2.x);
+    // v2.w carries the user-facing prim id bit-reinterpreted as float
+    // by the host (Engine::EnsurePrimitivesUploaded). The editor
+    // outline path reads this through HitInfo::prim_id to compare
+    // against editor_params.x. Non-editor frames pay just one extra
+    // asuint() per hit -- negligible vs the BRDF / NEE downstream.
+    uint user_id = asuint(v2.w);
     float t;
     if (type == PRIM_SPHERE) {
         // Lerp from prev_pos (v3.xyz) toward curr_pos (v0.xyz) at the
@@ -1068,6 +1097,7 @@ void testAnalyticPrim(uint idx, float3 ro, float3 rd, float shutter_t01, inout H
             h.roughness = v1.a;
             h.ior = v2.z;
             h.emission = v4.rgb;
+            h.prim_id = user_id;
         }
     } else if (type == PRIM_PLANE) {
         if (intersectPlane(ro, rd, v0.xyz, v0.w, t) && t < h.t) {
@@ -1078,6 +1108,7 @@ void testAnalyticPrim(uint idx, float3 ro, float3 rd, float shutter_t01, inout H
             h.roughness = v1.a;
             h.ior = v2.z;
             h.emission = v4.rgb;
+            h.prim_id = user_id;
         }
     }
 }
@@ -1202,6 +1233,12 @@ void traceSdfClusters(float3 ro, float3 rd, inout HitInfo h) {
                     // analytic-prim hit's emission doesn't leak through
                     // when this fractal hit lands closer.
                     h.emission  = float3(0.0);
+                    // Editor backend (agent-19): SDF clusters aren't on
+                    // the analytic-prim outline path; reset the id so
+                    // editor_params.x can't accidentally light up a
+                    // fractal hit that landed closer than a selected
+                    // sphere.
+                    h.prim_id   = 0u;
                 }
             }
             continue;
@@ -1222,6 +1259,8 @@ void traceSdfClusters(float3 ro, float3 rd, inout HitInfo h) {
                 h.ior       = c.ior;
                 // SDF doesn't source emission -- see fractal branch above.
                 h.emission  = float3(0.0);
+                // Editor backend (agent-19): see fractal-branch comment.
+                h.prim_id   = 0u;
             }
         }
     }
@@ -1256,6 +1295,11 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01) {
     // field MUST start at 0 so a miss + later overwrite by a
     // non-emissive hit doesn't keep a stale glow.
     h.emission = float3(0.0);
+    // Editor backend (agent-19): start with no prim_id; analytic-prim
+    // hits overwrite this from v2.w, non-analytic hit paths leave it
+    // at 0 so the outline gate's id-match check never accidentally
+    // matches a SDF / mesh hit when editor_params.x is non-zero.
+    h.prim_id = 0u;
 
     // Analytic primitives. Each occupies 5 consecutive float4s in
     // `primitives` after #85 (motion blur) + #181 polish (emission):
@@ -1380,6 +1424,12 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01) {
                 // analytic-prim hit's emission doesn't leak through when
                 // this mesh hit is closer.
                 h.emission = float3(0.0);
+                // Editor backend (agent-19): mesh hits aren't in the
+                // analytic-prim outline scope; clear the id so a
+                // selected sphere can't "shine through" a closer mesh
+                // hit because the stale prim_id was left from the
+                // analytic prim test that ran first.
+                h.prim_id = 0u;
             }
         }
     } else
@@ -1488,6 +1538,9 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01) {
             // SW mesh path doesn't source emission either -- clear for
             // the same reason as the HW path above.
             h.emission = float3(0.0);
+            // Editor backend (agent-19): same id-clear as the HW mesh
+            // branch above; mesh hits aren't in the outline scope.
+            h.prim_id = 0u;
         }
     }
     return h;
@@ -3937,6 +3990,30 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 radiance += throughput * h.emission;
             } else {
                 radiance += clampIndirect(throughput * h.emission);
+            }
+        }
+
+        // Editor backend (agent-19): magenta silhouette outline around
+        // the currently-selected analytic primitive. Only paints on the
+        // primary ray (b == 0) so accumulated bounces don't smear the
+        // outline through the scene; only on hits whose user-facing
+        // prim_id matches editor_params.x (the host writes the
+        // EFFECTIVE id there: 0 when the gate is off OR kind !=
+        // AnalyticPrim, so the != 0 check is enough). The silhouette
+        // condition `dot(h.normal, -rd) < 0.2` keeps the ring at the
+        // grazing-angle rim of the body where the surface bends away
+        // from the camera; the body interior renders normally so the
+        // user still sees their material. Magenta (1, 0, 1) was chosen
+        // for high contrast on both bright and dark scenes.
+        //
+        // Bit-identical when no selection is set OR r_editor_outline is
+        // 0: editor_params.x == 0 short-circuits before the per-pixel
+        // silhouette dot product, so non-editor frames pay exactly one
+        // u32 compare per primary hit -- no measurable cost.
+        if (b == 0u && editor_params.x != 0u && h.prim_id == editor_params.x) {
+            float rim = saturate(0.2 - dot(h.normal, -rd)) * 5.0;
+            if (rim > 0.0) {
+                radiance += throughput * float3(8.0, 0.0, 8.0) * rim;
             }
         }
 

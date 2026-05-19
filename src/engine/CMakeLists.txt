@@ -56,6 +56,7 @@ target_link_libraries(pt_engine
     PUBLIC  pt_effects
     PUBLIC  pt_physics
     PUBLIC  pt_destruction
+    PUBLIC  pt_editor
     PRIVATE pt_capture_encoder
     PRIVATE tomlplusplus::tomlplusplus
 )

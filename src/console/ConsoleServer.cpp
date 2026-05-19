@@ -469,6 +469,42 @@ void ConsoleServer::HandleWsMessage(mg_connection* conn, std::string_view payloa
         return;
     }
 
+    // --- Editor backend (agent-19): list_scene + select dispatch ----------
+    if (type == "list_scene") {
+        // Editor scene-graph snapshot. The hook returns the full JSON
+        // body so the server doesn't need to depend on pt_editor /
+        // pt_engine -- only the engine knows how to populate it. When
+        // the hook isn't installed we reply with an empty scene so the
+        // client gets a deterministic shape rather than a parse error.
+        json scene_obj;
+        if (scene_dump_handler_) {
+            const std::string body = scene_dump_handler_();
+            scene_obj = json::parse(body, nullptr, /*allow_exceptions=*/false);
+            if (scene_obj.is_discarded()) scene_obj = json::object();
+        } else {
+            scene_obj = json::object();
+        }
+        reply(json{{"ok", true}, {"scene", scene_obj}});
+        return;
+    }
+    if (type == "select") {
+        // Editor selection set. {"type":"select","kind":"prim","id":N}.
+        // The hook owns the SelectionKind mapping (the server doesn't
+        // know about the engine's enum). The selection_change broadcast
+        // is fired from the engine side AFTER it applies the mutation
+        // so panels / native overlays that subscribe to that topic see
+        // the same payload as a click-driven selection.
+        std::string kind = msg.value("kind", std::string{});
+        std::uint32_t sel_id = 0;
+        if (msg.contains("id") && msg["id"].is_number_unsigned()) {
+            sel_id = msg["id"].get<std::uint32_t>();
+        }
+        if (select_handler_) select_handler_(kind, sel_id);
+        reply(json{{"ok", true}});
+        return;
+    }
+    // --- end Editor backend ----------------------------------------------
+
     if (type == "subscribe" || type == "unsubscribe") {
         std::vector<std::string> topics;
         if (msg.contains("topics") && msg["topics"].is_array()) {

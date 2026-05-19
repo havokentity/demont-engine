@@ -89,6 +89,14 @@ public:
     // speed adjustment or zoom.
     void ConsumeScrollDelta(double& dx, double& dy);
 
+    // Absolute cursor position in window-local content-area coordinates
+    // (origin at top-left, +Y downwards, in screen units, NOT framebuffer
+    // pixels on high-DPI displays). Returns (0, 0) when the window
+    // handle isn't live. Used by the editor's LMB-pick path to map a
+    // cursor location to a primary ray. Unlike ConsumeMouseDelta this
+    // is a pure snapshot -- it doesn't update the delta baseline.
+    void GetCursorPos(double& x, double& y) const;
+
 private:
     static void OnResize(GLFWwindow* w, int width, int height);
     static void OnKey(GLFWwindow* w, int key, int scancode, int action, int mods);

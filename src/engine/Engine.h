@@ -53,6 +53,26 @@ struct PhysDropArgsTestAccess;
 // Defined in the test TU only; pt_engine never references it.
 struct CamBookmarksTestAccess;
 
+// --- Editor backend foundation (agent-19 / editor-mode) -------------------
+// Selection target kind. Mirrored on the WebSocket protocol (the
+// "selection_change" event's "kind" field is one of the lowercase
+// stringified names). Distinguishes which scene-side map a selected id
+// refers to: analytic primitives live in Engine::primitives_, lights in
+// light_prims_, SDF clusters in sdf_prims_, rigid bodies in the physics
+// system. The kind matters because all four namespaces use independent
+// 32-bit ids; the same numeric value can refer to four different things.
+//
+// None is the "no selection" sentinel paired with id == 0 -- the editor
+// uses this to clear the highlight when the user clicks empty space.
+enum class SelectionKind : std::uint8_t {
+    None = 0,
+    AnalyticPrim,
+    Light,
+    SdfCluster,
+    RigidBody,
+};
+// --- end Editor backend foundation ----------------------------------------
+
 class Engine {
 public:
     Engine();
@@ -99,6 +119,31 @@ public:
     void Tick(double dt);
 
     static Engine* Instance();
+
+    // --- Editor backend (agent-19) ----------------------------------------
+    // Selection state. Read by the path tracer (for the magenta silhouette
+    // outline gated by r_editor_outline), by the WebSocket protocol's
+    // selection_change event, and by future gizmo / property-panel agents
+    // (20 React, 21 native overlay, 22 3D gizmos). SetSelection is the
+    // canonical mutation point: it updates both fields atomically (within
+    // the main-thread Drain/Tick pattern -- no cross-thread writes), marks
+    // accum_dirty_ so the outline change takes effect on the next frame,
+    // and broadcasts a `selection_change` WebSocket event when a
+    // ConsoleServer is live so connected clients can sync their UI.
+    //
+    // Threading: these are mutated only from the main thread (Engine::Tick
+    // -> HandleMouseInput, or Console::Drain -> registered console
+    // commands). WebSocket worker threads must go through the
+    // QueueExecute path or hit them via the public SetSelection from a
+    // command handler -- never write directly.
+    SelectionKind  GetSelectionKind() const noexcept { return selected_kind_; }
+    std::uint32_t  GetSelectionId()   const noexcept { return selected_prim_id_; }
+    void SetSelection(SelectionKind kind, std::uint32_t id);
+    // Read-only accessors live below the AnalyticPrim / AnalyticLight
+    // struct definitions (their types are nested in Engine and not
+    // visible here yet). See the second editor-backend block further
+    // down in this class.
+    // --- end Editor backend ------------------------------------------------
 
 public:
     // Analytic primitive description, mirrors the GPU layout (3 float4s per
@@ -193,6 +238,24 @@ public:
         float tint[3]     {1, 1, 1};      // optional color tint (multiplier on cloud RGB)
     };
     static constexpr std::uint32_t kMaxSmokeEmitters = 16;
+
+    // --- Editor backend (agent-19) accessors -----------------------------
+    // Read-only views into the engine's owned scene state for
+    // pt::editor::SerializeScene. The nested AnalyticPrim /
+    // AnalyticLight types aren't visible at the top of this class
+    // (they're declared above in this same public block), so the
+    // accessors have to live here -- below the struct definitions but
+    // still inside the public area. Returning const refs keeps the
+    // hot-path GPU writeback fast and lets the serializer iterate
+    // without owning storage. Callers must not race a concurrent
+    // mutation; in practice the only mutators are RegisterPrimCommands
+    // / phys writeback / RegisterLightCommands etc., all of which run
+    // on the main thread under Console::Drain.
+    const std::map<std::uint32_t, AnalyticPrim>&     Primitives()   const noexcept { return primitives_; }
+    const std::map<std::uint32_t, AnalyticLight>&    Lights()       const noexcept { return light_prims_; }
+    const std::map<std::uint32_t, pt::renderer::SdfPrim>& SdfPrims() const noexcept { return sdf_prims_; }
+    const pt::physics::PhysicsSystem*                Physics()      const noexcept { return physics_.get(); }
+    // --- end Editor backend accessors ------------------------------------
 
 private:
     // Test-only access (PR #181 follow-up, see forward-declaration above).
@@ -321,6 +384,28 @@ private:
     void ApplyCommandLineCvarOverrides();
 
     void UpdateCamera(double dt);
+
+    // --- Editor backend (agent-19) ----------------------------------------
+    // LMB-press-edge raycast pick. Reads window cursor position, casts a
+    // primary ray from the camera through that pixel using the same FOV /
+    // basis the path tracer uses, walks `primitives_` for the nearest
+    // analytic-prim hit, then calls SetSelection with the result. Mouse
+    // is checked with edge-detect (rising-edge only, not held) via
+    // lmb_was_down_ so a single press fires exactly one pick. Gated to
+    // skip when RMB is held (mouse-look mode) or the console overlay is
+    // shown -- both override "viewport click = pick" semantics. Called
+    // every frame from Tick before RenderFrame. Cheap: O(prim_count) ray
+    // tests on the CPU, ~hundreds of prims handled trivially on M4 Max.
+    void HandleMouseInput();
+
+    // Editor-side LMB-press latch for the rising-edge detector. Tracks
+    // the previous frame's IsMouseButtonDown(0) so we can distinguish
+    // a fresh press from a held-down state. Reset whenever the gate
+    // suppresses the pick path (RMB held / console focused / no window)
+    // so the user can't accidentally fire a pick by releasing RMB while
+    // still holding LMB.
+    bool                                        lmb_was_down_ = false;
+    // --- end Editor backend ------------------------------------------------
 
     // Drains any in-flight CSG bake job, keeps the engine's vertex/index
     // buffers + BLAS + TLAS in sync with the current scene, and -- if the
@@ -1138,6 +1223,18 @@ private:
     float                                       last_cam_yaw_      = 0.0f;
     float                                       last_cam_pitch_    = 0.0f;
     float                                       last_cam_fov_      = 0.0f;
+
+    // --- Editor backend (agent-19) ----------------------------------------
+    // Currently-selected scene entity. The shader's outline highlight reads
+    // selected_prim_id_ via PtPush::selected_prim_id and emits a magenta
+    // silhouette around any analytic-prim hit whose id matches AND
+    // selected_kind_ == AnalyticPrim. Light / SdfCluster / RigidBody kinds
+    // are reserved for future agents (20/22) and currently don't paint
+    // an outline. id == 0 + kind == None is the "no selection" state.
+    // Both mutated together via SetSelection.
+    std::uint32_t                               selected_prim_id_  = 0;
+    SelectionKind                               selected_kind_     = SelectionKind::None;
+    // --- end Editor backend ------------------------------------------------
 };
 
 }  // namespace pt::engine

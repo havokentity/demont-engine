@@ -233,6 +233,12 @@ void Window::ConsumeScrollDelta(double& dx, double& dy) {
     scroll_accum_y_ = 0.0;
 }
 
+void Window::GetCursorPos(double& x, double& y) const {
+    x = y = 0.0;
+    if (handle_ == nullptr) return;
+    glfwGetCursorPos(handle_, &x, &y);
+}
+
 void Window::OnScroll(GLFWwindow* w, double dx, double dy) {
     auto* self = static_cast<Window*>(glfwGetWindowUserPointer(w));
     if (self == nullptr) return;

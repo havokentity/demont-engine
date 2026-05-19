@@ -34,4 +34,10 @@ add_subdirectory(physics)
 # Pure CPU; engine spawns analytic-prim boxes for chunks.
 add_subdirectory(destruction)
 add_subdirectory(app)
+# Editor backend foundation (#editor-mode, agent-19): scene-graph snapshot
+# API consumed by the upcoming React web panel (agent-20), native overlay
+# panel (agent-21), and 3D gizmos (agent-22). Depends only on renderer +
+# physics + nlohmann_json; built before pt_engine so Engine.cpp can call
+# into pt::editor::SerializeScene from the scene_dump_json command.
+add_subdirectory(editor)
 add_subdirectory(engine)
