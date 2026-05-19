@@ -29,9 +29,24 @@ web/editor/
 └── panels/
     ├── scene-hierarchy/    # agent-21
     ├── inspector/          # agent-22
-    ├── asset-browser/      # future
-    └── toolbar/            # MVP demo (live)
+    ├── asset-browser/      # wave-7 #20 (scenes / hdri / glTF browser)
+    └── toolbar/            # wave-7 #20 (gizmo mode, undo/redo, snap, space)
 ```
+
+## Global keyboard shortcuts
+
+The shell installs a window-level keydown handler for every panel that
+inherits from `<Shell>` (opt out via `installShortcuts={false}`):
+
+| Shortcut | Action |
+| --- | --- |
+| `Cmd/Ctrl+Z` | `scene_undo` (pops the last prim/light mutation) |
+| `Cmd/Ctrl+Shift+Z` / `Ctrl+Y` | `scene_redo` (reapplies the popped mutation) |
+| `G` / `R` / `S` | `gizmo_mode translate` / `rotate` / `scale` |
+
+The handler skips dispatch when focus is in an `<input>` /
+`<textarea>` / `contenteditable` element so a number-field that
+expects the user to type `s` still works.
 
 Each panel has:
 - `package.json` -- name only, no extra deps
