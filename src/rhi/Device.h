@@ -362,6 +362,24 @@ public:
             // can no-op the call -- the engine's caller checks
             // SupportsDenoise() / current_backend_ before issuing.
             FinalizeOnly,
+            // Run the SVGF / NRD temporal+spatial chain (same as Kind::
+            // Svgf) but STOP before the trailing DenoiseFinalize dispatch
+            // -- i.e. emit the denoised linear-HDR result into `output`
+            // and skip bloom composite + ACES + sRGB OETF + swapchain
+            // write. Used by the engine's Vulkan StarsComposite path
+            // (issue #46): the engine needs an opportunity to dispatch
+            // its stateless celestial composite kernel between the
+            // a-trous chain output and the swap write. A subsequent
+            // Denoise(Kind::FinalizeOnly) call then reads the composited
+            // result and produces the final swap. Vulkan-only today
+            // (Metal still routes StarsComposite through use_engine_
+            // tonemap which sits between SVGF output and Tonemap.slang;
+            // Vulkan can't because Tonemap.slang produces a black
+            // swapchain there). Inputs are identical to Kind::Svgf
+            // except `output` MUST be a caller-owned intermediate (the
+            // engine's post_denoise_hdr_tex) -- the swap is written by
+            // the follow-up FinalizeOnly call.
+            SvgfNoFinalize,
         };
         Kind kind = Kind::Svgf;
         // Required by MetalFX TemporalDenoisedScaler. Column-major 4x4

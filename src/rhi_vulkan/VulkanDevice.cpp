@@ -75,6 +75,20 @@ extern const unsigned long shader_BloomUp_spirv_size;
 // rest of the small-push pipelines.
 extern const unsigned char shader_Tonemap_spirv_data[];
 extern const unsigned long shader_Tonemap_spirv_size;
+// StarsComposite (issue #46). Stateless additive composite of sun /
+// moon / BSC + procedural stars with aperture-sampled bokeh, dispatched
+// AFTER the denoiser writes post_denoise_hdr and BEFORE the bloom
+// pyramid. Mac was the reference implementation; this Vulkan SPIR-V
+// build closes the cross-backend gap (the prior SVGF-atrous-on-Vulkan
+// "stars dim under spatial filter" regression was rooted in the missing
+// composite -- with celestials baked into PathTrace's denoiser input,
+// the bilateral filter smeared their energy across dark sky pixels).
+// Rides the shared pipeline layout via kSlotToTexBinding[] reuse;
+// 224B push splits at kPushSplitOffset = 112 into hw push + Frame UBO
+// tail. See shaders/StarsComposite.slang's binding header for the
+// per-slot rationale.
+extern const unsigned char shader_StarsComposite_spirv_data[];
+extern const unsigned long shader_StarsComposite_spirv_size;
 }
 
 namespace pt::rhi::vk {
@@ -1423,6 +1437,19 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // makes the 624-byte TonePush fit Vulkan's 256B push-constant
         // limit.
         build_pipeline("tonemap",     shader_Tonemap_spirv_data,      shader_Tonemap_spirv_size);
+        // StarsComposite (issue #46). Rides the shared pipeline layout
+        // -- engine slots 0..4 map through kSlotToTexBinding[] to
+        // descriptor bindings 0, 1, 6, 7, 8 which the shader's
+        // vk::binding declarations align to. With this registered,
+        // Engine::EnsurePipelineHandles' resolve("stars_composite")
+        // hits and engine_composite_active goes true on Vulkan, closing
+        // the cross-backend asymmetry that made stars dim under
+        // svgf_atrous (the bilateral filter was smearing primary-miss
+        // celestials that should have been peeled off pre-denoise and
+        // re-added post-denoise, as the Mac path already does).
+        build_pipeline("stars_composite",
+                       shader_StarsComposite_spirv_data,
+                       shader_StarsComposite_spirv_size);
         pipelines_ready_.store(true, std::memory_order_release);
 
         // Skip the per-pipeline timing-string construction below tier 2.
@@ -3889,12 +3916,28 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
 
     const bool atrous_enabled =
         (d.quality == DenoiseDesc::Quality::Atrous);
+    // Issue #46 -- Kind::SvgfNoFinalize: skip the trailing DenoiseFinalize
+    // dispatch (bloom composite + ACES + sRGB OETF + swap write) so the
+    // engine can dispatch StarsComposite between the SVGF output and the
+    // finalize. The denoised result still lands in d.output
+    // (post_denoise_hdr); the engine then issues a follow-up
+    // Denoise(Kind::FinalizeOnly) call with color_in pointing at that
+    // same texture to write the swap. Zeroing final_output here trips
+    // the existing `if (final_output.id != 0 ...)` gate inside
+    // VulkanNrdDenoiser::Encode at the finalize block -- the dispatch
+    // path already supports final_output=0 as a defensive fallback for
+    // partially-wired callers, so we lean on that instead of plumbing
+    // a fresh skip-finalize flag through Encode's parameter list.
+    const TextureHandle effective_final_output =
+        (d.kind == DenoiseDesc::Kind::SvgfNoFinalize)
+            ? TextureHandle{0}
+            : d.final_output;
     denoiser_->Encode(wrapped_cb_->Raw(),
                       d.color_in, d.depth_in, d.motion_in,
                       d.normal_in,
                       d.albedo_in,           // issue #119
                       d.output,
-                      d.final_output, d.exposure_state,
+                      effective_final_output, d.exposure_state,
                       d.bloom_in, d.bloom_intensity,
                       d.reset_history,
                       atrous_enabled,
