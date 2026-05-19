@@ -857,6 +857,20 @@ cbuffer Push {
     //                .z/.w reserved.
     float4 motion_blur_params;
     // --- end Motion blur ------------------------------------------------------
+    // --- Underwater medium tracking (Phase 4, #134) --------------------------
+    // Per-ray "in-water" state Phase 4. Host scans analytic primitives for
+    // MAT_WATER planes at engine push setup time and checks whether the
+    // camera position sits below any of them; if so .x = 1.0 (initial
+    // primary ray starts inside the water medium and gets Beer's-law
+    // attenuation applied per-segment in the bounce loop). .yzw carry the
+    // configurable "deep water void" RGB tint the sky-on-miss fallback
+    // returns when an underwater bounce ray escapes to the empty horizon
+    // (vs. returning sky-blue, which would break the deep-water illusion).
+    // Defaults near-black so unconfigured scenes still read as proper
+    // underwater dark on TIR / deep miss. Pulled from r_water_deep_color_r/g/b
+    // cvars (registered alongside the existing r_water_* family).
+    float4 water_state;
+    // --- end Underwater medium tracking --------------------------------------
     // --- Editor backend (agent-19) -------------------------------------------
     // editor_params.x = selected_prim_id (0 = no selection / paint nothing).
     //              .y = r_editor_outline gate (0/1; 0 forces the outline
@@ -968,6 +982,8 @@ cbuffer Frame {
     float4 smoke_params3;
     // See `motion_blur_params` in the Metal Push cbuffer above (#85).
     float4 motion_blur_params;
+    // See `water_state` in the Metal Push cbuffer above (Phase 4, #134).
+    float4 water_state;
     // See `editor_params` in the Metal Push cbuffer above (agent-19).
     uint4 editor_params;
 };
@@ -3979,6 +3995,27 @@ void main(uint2 tid : SV_DispatchThreadID) {
         bool   skip_sky_on_miss   = false;
         bool   prev_was_lambert_nee = false;   // previous bounce was Lambert with env-map NEE
         float  prev_lambert_brdf_pdf = 0.0;    // cosine-hemisphere PDF of the bounce dir sampled there
+        // --- Underwater medium tracking (Phase 4, #134) ----------------------
+        // Per-ray "is this segment travelling through a water medium?" flag.
+        // Initialised from water_state.x (host scans analytic primitives at
+        // push setup time and sets 1.0 when the camera position is below
+        // any MAT_WATER plane). Flipped by the MAT_WATER / MAT_DIELECTRIC
+        // refract paths in the bounce loop below.
+        //
+        // When in_water == 1 the per-bounce step:
+        //   * applies exp(-water_params0.xyz * segment_length) to throughput
+        //     over the segment just traversed (replaces the old nominal
+        //     1.5m entry-side estimate with the exact distance the ray
+        //     travelled before hitting the next surface)
+        //   * sky-on-miss returns water_state.yzw (deep-water tint) instead
+        //     of skyColor(rd), so TIR rays from underwater don't escape to
+        //     the bright horizon when the scene runs out of geometry below
+        //     the water plane.
+        //
+        // TIR at MAT_WATER / MAT_DIELECTRIC keeps in_water unchanged (the
+        // ray stays in the same medium); only the refract branch toggles.
+        int in_water = (water_state.x > 0.5) ? 1 : 0;
+        // --- end Underwater medium tracking ---------------------------------
 
         // Save primary-ray params for the volumetric march (single
         // scatter along the camera ray, evaluated after the bounce
@@ -4066,7 +4103,48 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 }
             }
         }
+#if PT_WATER_ENABLED
+        // --- Underwater medium tracking (Phase 4, #134) ---------------------
+        // Apply Beer's-law attenuation over the segment we just traced. The
+        // ray travelled distance `h.t` through whatever medium `in_water`
+        // currently identifies (set by ray-gen, flipped only by the
+        // MAT_WATER refract path -- MAT_DIELECTRIC is intentionally left
+        // out per the Phase 4 simplification, see the in_water docstring
+        // at the bounce-loop preamble). This replaces the old per-bounce
+        // nominal 1.5m estimate at MAT_WATER ingress with the exact path
+        // length, and also tints the camera-underwater primary segment
+        // (subsuming the b == 0 special case from b2690ac).
+        //
+        // Misses (h.hit == false) skip this: in_water + miss is caught
+        // by the deep-water tint fallback below.
+        if (in_water == 1 && h.hit) {
+            float3 absorb = water_params0.xyz;
+            throughput *= exp(-absorb * h.t);
+        }
+        // --- end Underwater medium tracking ---------------------------------
+#endif  // PT_WATER_ENABLED
         if (!h.hit) {
+#if PT_WATER_ENABLED
+            // --- Underwater sky-miss override (Phase 4, #134) ---------------
+            // Ray escaped to infinity while inside the water medium. We do
+            // NOT call skyColor(rd) here -- a TIR-reflected underwater ray
+            // looking back down at empty space should die to deep-water
+            // void, not pick up bright sky-blue from the procedural sky
+            // model. water_state.yzw is the tunable deep-water tint
+            // (r_water_deep_color_r/g/b, defaults near-black). Multiply
+            // by throughput so segment absorption + Fresnel attenuations
+            // along the way also dim the deep tint -- a TIR ray with a
+            // long underwater path before escaping fades to black.
+            if (in_water == 1) {
+                if (b == 0u) {
+                    radiance += throughput * water_state.yzw;
+                } else {
+                    radiance += clampIndirect(throughput * water_state.yzw);
+                }
+                break;
+            }
+            // --- end Underwater sky-miss override ---------------------------
+#endif  // PT_WATER_ENABLED
             if (mis_enabled != 0u && prev_was_lambert_nee) {
                 // MIS path: previous bounce was a Lambert hit that did
                 // env-map NEE. The NEE side already contributed its
@@ -4584,13 +4662,15 @@ void main(uint2 tid : SV_DispatchThreadID) {
         }
 #if PT_WATER_ENABLED
         else if (h.mat == MAT_WATER) {  // (#134)
-            // Phase 1 water: shading-normal-perturbed analytic plane with
+            // Water material: shading-normal-perturbed analytic plane with
             // Schlick Fresnel (F0=0.02), Snell refraction via the refract()
-            // builtin, and Beer's-law absorption applied to the refracted
-            // segment via a throughput multiply.  No NEE on the water
-            // surface itself -- the reflected / refracted ray inherits the
-            // current throughput and the next bounce handles direct
-            // lighting through whichever medium the ray entered.
+            // builtin, and Beer's-law absorption applied per-segment over
+            // the bounce loop (see the segment-absorption block at the
+            // top of the loop body and water_state at the bounce-loop
+            // preamble). No NEE on the water surface itself -- the
+            // reflected / refracted ray inherits the current throughput
+            // and the next bounce handles direct lighting through
+            // whichever medium the ray entered.
             //
             // Perturbed shading normal.  Geometric ndi-driven sign was
             // computed off h.normal (geometric); use it to orient the
@@ -4617,57 +4697,31 @@ void main(uint2 tid : SV_DispatchThreadID) {
             float3 refracted = refract(rd, nf_s, eta);
             bool tir = (length(refracted) < 1e-3);
             if (tir || randf(seed) < fr) {
-                // Reflection: surface acts like a coated mirror.  No
-                // absorption multiplied -- the reflected ray never
-                // entered the water body.
+                // Reflection (incl. TIR): surface acts like a coated
+                // mirror. Ray stays in the SAME medium it was already
+                // in, so in_water is unchanged. The next bounce loop
+                // iteration will apply per-segment Beer's law if the
+                // ray is still underwater.
                 rd = reflected;
                 ro = hit_pt + nf_s * 1e-3;
             } else {
-                // Refraction: the ray enters the water medium.  Apply
-                // Beer's law along the refracted segment.  We don't yet
-                // know the segment length (it ends at the next surface
-                // hit), so we fold absorption into throughput as a
-                // distance-running attenuation: estimate the path length
-                // as the segment to the next traceScene() hit using the
-                // analytic ray-plane crossing for the *exit* side.
+                // Refraction: the ray crosses the water interface.
+                // ndi_s < 0 means the shading normal pointed away from
+                // the incoming ray -- we were OUTSIDE the water body
+                // and are entering. ndi_s > 0 means we were INSIDE and
+                // are exiting back into air. Flip the per-ray medium
+                // state accordingly.
                 //
-                // Phase 1 simplification: apply absorption only when
-                // ENTERING the water body (ndi_s < 0 means the macro
-                // normal pointed away from the incoming ray, so we're
-                // going from air -> water).  When exiting (ndi_s > 0,
-                // ray inside water travelling toward the surface), the
-                // attenuation should already have been folded in by
-                // whatever surface scatter produced the upward ray.
-                //
-                // Approximation: use the macro plane's y coordinate as
-                // the surface altitude.  The refracted ray segment runs
-                // from hit_pt until it intersects scene geometry (next
-                // bounce).  As an MVP we don't track distance per-bounce
-                // through the medium; instead we apply a constant tint
-                // based on a nominal segment of ~h.t magnitude scaled by
-                // 1.5 (the average path length through a few-metres-deep
-                // body).  This is honest about being approximate -- the
-                // user-tunable absorption_r/g/b can be tuned for the
-                // intended look at the intended depth.  Phase 4 (SSS)
-                // will track per-bounce in-medium distance.
-                float3 absorb = water_params0.xyz;
+                // Per-segment Beer's law happens at the top of the next
+                // bounce iteration via the segment-absorption block.
+                // This branch only flips state and re-aims the ray; the
+                // previous nominal 1.5m entry estimate (and the b == 0
+                // exit-side hack from b2690ac) are subsumed by the new
+                // generic per-bounce attenuation.
                 if (ndi_s < 0.0) {
-                    // Entering water from air. Phase 1 simplification:
-                    // nominal 1.5m segment estimate for downward path.
-                    float seg_estimate = 1.5;
-                    throughput *= exp(-absorb * seg_estimate);
-                } else if (b == 0u) {
-                    // Exiting water from below on a camera primary ray
-                    // (b == 0). The camera is underwater -- the ray
-                    // traveled distance h.t through water before reaching
-                    // the surface. Apply Beer's law for that exact
-                    // segment so the underwater view picks up the water
-                    // tint instead of looking like clear glass.
-                    //
-                    // Bounded for b > 0 to avoid double-tinting the
-                    // above-water -> submerged-sphere -> back-up path
-                    // (which is already nominally tinted at entry).
-                    throughput *= exp(-absorb * h.t);
+                    in_water = 1;
+                } else {
+                    in_water = 0;
                 }
                 rd = normalize(refracted);
                 ro = hit_pt - nf_s * 1e-3;
