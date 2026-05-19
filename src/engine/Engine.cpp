@@ -1060,6 +1060,40 @@ namespace cvar {
             "Stacks with the per-emitter base `radius`.", CVAR_ARCHIVE);
     // --- end Fluid Phase 2 ---------------------------------------------------
     // --- end Fluid Phase 1 -----------------------------------------------------
+    // --- Motion blur (#85) ----------------------------------------------------
+    // Cook-1984 style stochastic shutter-time sampling. Each primary ray
+    // picks a uniform random t in [0, shutter_speed]; sphere primitives
+    // lerp between prev_pos_or_n and pos_or_n at t/shutter_speed. The
+    // engine snapshots curr -> prev once per StepPhysics tick so the
+    // delta encodes one frame's displacement.
+    //
+    // r_motion_blur 0 is bit-identical to pre-#85 main: the shader's
+    // sphere position read collapses to a plain pos_or_n (lerp factor
+    // forced to 1.0 even with motion-blur off-path, so the prev_pos
+    // packed into the primitive buffer is simply ignored).
+    PT_CVAR(r_motion_blur,             "0",
+            "Per-ray stochastic shutter-time sampling for motion blur "
+            "(Cook 1984). 0 = off, bit-identical to pre-#85 (no shutter "
+            "jitter, sphere positions read straight from pos_or_n). 1 = "
+            "each primary ray picks t ~ U(0, r_shutter_speed) and the "
+            "scene is queried at that shutter time. Sphere primitives "
+            "lerp between prev_pos_or_n (last frame's position) and "
+            "pos_or_n (current) by t / shutter_speed -- visible streak "
+            "length scales with per-frame body displacement. Combined "
+            "with multi-spp accumulation this gives temporal anti-"
+            "aliasing for free. Planes don't move so they're unaffected.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_shutter_speed,           "0.0167",
+            "Shutter open duration in seconds (#85) for motion blur "
+            "sampling. Default 1/60 s = 0.0167 s matches a 60 fps render "
+            "loop with a 'full' shutter -- a body moving 5 m/s shows a "
+            "streak ~8 cm long. 1/240 s = 0.0042 s gives a tighter "
+            "shutter (less smear, sharper motion); 1/30 s = 0.0333 s "
+            "doubles the smear for cinematic blur. Real cinema shutters "
+            "are typically 180 degrees of frame time (1/48 s at 24 fps); "
+            "matching that on a 60 fps render means 1/120 s = 0.0083 s. "
+            "Only consulted when r_motion_blur == 1.", CVAR_ARCHIVE);
+    // --- end Motion blur ------------------------------------------------------
     PT_CVAR(r_rayleigh,              "30.0",     "Atmospheric Rayleigh scattering scale on the per-channel sea-level sigma (R 5.8e-6, G 13.5e-6, B 33.1e-6 per metre). 1.0 = real Earth atmosphere -- but our typical r_volumetric_density (Mie haze) is ~30x stronger than real-Earth haze, so bumping this to 30 keeps the sky visibly blue at typical haze settings. Drop to 1.0 if you also drop r_volumetric_density to 0.0001-0.0005 (real haze). 0 disables Rayleigh.", CVAR_ARCHIVE);
     PT_CVAR(r_planet_radius,         "6378137.0", "Planet radius in metres for spherical-Earth atmospheric scattering (issue #51). Default 6,378,137 m = WGS-84 equatorial Earth radius. The path tracer's `atmosphericTransmittance` numerically integrates Mie + Rayleigh optical depth along a chord through a thin shell around a sphere of this radius (centre at world origin + offset so y=0 sits on the surface). Set to 0 to fall back to the legacy planar exponential integral (1/sin(elev) airmass) -- useful as a debug A/B or for tiny-scene tests where curvature is invisible. Real values for other bodies: Moon 1,737,400, Mars 3,389,500, Venus 6,051,800. Affects only the atmosphere integral, not collision / shadow geometry.", CVAR_ARCHIVE);
     PT_CVAR(r_moon_size,             "1.0",      "Moon angular-size multiplier. 1.0 = our default 0.55deg half-angle (already 2x the real 0.27deg, for visibility at typical 60-FOV 1080p). 5+ = dramatic 'big moon' shots; 0.5 = real lunar size (very small). Astronomical distance variation (perigee/apogee) is also applied on top -- supermoons render ~14% bigger than micro-moons.", CVAR_ARCHIVE);
@@ -2950,6 +2984,10 @@ void Engine::SeedDefaultPrimitives() {
         p.type        = AnalyticPrim::Sphere;
         p.material    = mat;
         p.pos_or_n[0] = x; p.pos_or_n[1] = y; p.pos_or_n[2] = z;
+        // Motion blur (#85): seed prev_pos == curr_pos so a newly-spawned
+        // body produces a zero-length lerp on its first rendered frame
+        // (no spurious streak from an uninitialized prev_pos).
+        p.prev_pos_or_n[0] = x; p.prev_pos_or_n[1] = y; p.prev_pos_or_n[2] = z;
         p.radius_or_d = r;
         p.albedo[0]   = color[0]; p.albedo[1] = color[1]; p.albedo[2] = color[2];
         p.roughness   = roughness;
@@ -2962,6 +3000,9 @@ void Engine::SeedDefaultPrimitives() {
         p.type        = AnalyticPrim::Plane;
         p.material    = mat;
         p.pos_or_n[0] = nx; p.pos_or_n[1] = ny; p.pos_or_n[2] = nz;
+        // Planes don't move (infinite extent); prev_pos == pos_or_n
+        // keeps the GPU layout uniform without special-casing.
+        p.prev_pos_or_n[0] = nx; p.prev_pos_or_n[1] = ny; p.prev_pos_or_n[2] = nz;
         p.radius_or_d = d;
         p.albedo[0]   = color[0]; p.albedo[1] = color[1]; p.albedo[2] = color[2];
         p.roughness   = 0.0f;
@@ -3418,7 +3459,14 @@ void Engine::EnsurePrimitivesUploaded() {
     if (!primitives_dirty_) return;
 
     const std::uint32_t count = static_cast<std::uint32_t>(primitives_.size());
-    constexpr std::uint32_t kFloatsPerPrim = 12;   // 3 float4s
+    // Motion blur (#85): each primitive now occupies 4 float4s (16 floats)
+    // instead of 3. The trailing float4 packs prev_pos_or_n (sphere center
+    // at the previous frame) so PathTrace.slang's testAnalyticPrim can
+    // lerp toward pos_or_n at the ray's shutter-time sample. Layout-only
+    // change for `r_motion_blur 0`: the shader's per-prim load now reads
+    // 4 float4s per prim, but the lerp factor collapses to 1.0 when
+    // motion blur is off so the rendered position is bit-identical.
+    constexpr std::uint32_t kFloatsPerPrim = 16;   // 4 float4s
     constexpr std::uint32_t kBytesPerPrim  = sizeof(float) * kFloatsPerPrim;
 
     // Allocate / grow the storage buffer when needed. We grow by powers
@@ -3484,6 +3532,18 @@ void Engine::EnsurePrimitivesUploaded() {
     finite_order.resize(finite_prims.size());
     for (std::uint32_t i = 0; i < finite_prims.size(); ++i) finite_order[i] = i;
 
+    // Motion blur (#85): the BVH AABB must encompass the SWEPT VOLUME
+    // of each sphere from prev_pos to curr_pos so the shader's shutter-
+    // time-sampled hit test isn't culled. Inflate the bounding radius
+    // by the per-frame displacement magnitude and shift center to the
+    // midpoint of prev / curr. When motion blur is off (or no body
+    // moved this frame) the delta is zero and the input matches the
+    // pre-#85 single-frame bound exactly -- BVH topology stays bit-
+    // identical for static / unmoving scenes.
+    bool motion_blur_active = false;
+    if (auto* v = pt::console::Console::Get().FindCVar("r_motion_blur")) {
+        motion_blur_active = v->GetBool();
+    }
     const bool build_bvh = static_cast<std::uint32_t>(finite_prims.size()) >= bvh_threshold;
     if (build_bvh) {
         std::vector<pt::renderer::BvhPrim> bvh_input;
@@ -3491,13 +3551,34 @@ void Engine::EnsurePrimitivesUploaded() {
         for (std::uint32_t i = 0; i < finite_prims.size(); ++i) {
             const AnalyticPrim& p = *finite_prims[i];
             pt::renderer::BvhPrim bp{};
-            bp.center[0] = p.pos_or_n[0];
-            bp.center[1] = p.pos_or_n[1];
-            bp.center[2] = p.pos_or_n[2];
-            // Sphere bounding radius = radius. Future finite types
-            // (box, disk, cylinder) should compute a bounding-sphere
-            // radius here from their extent.
-            bp.radius    = p.radius_or_d;
+            float cx = p.pos_or_n[0];
+            float cy = p.pos_or_n[1];
+            float cz = p.pos_or_n[2];
+            float radius_inflate = 0.0f;
+            if (motion_blur_active) {
+                const float dx = p.pos_or_n[0] - p.prev_pos_or_n[0];
+                const float dy = p.pos_or_n[1] - p.prev_pos_or_n[1];
+                const float dz = p.pos_or_n[2] - p.prev_pos_or_n[2];
+                const float disp = std::sqrt(dx * dx + dy * dy + dz * dz);
+                if (disp > 0.0f) {
+                    // Midpoint between prev and curr; inflate radius by
+                    // half the displacement so the AABB contains BOTH
+                    // sphere positions (and every interpolated position
+                    // in between, since the lerp travels a straight line).
+                    cx = 0.5f * (p.pos_or_n[0] + p.prev_pos_or_n[0]);
+                    cy = 0.5f * (p.pos_or_n[1] + p.prev_pos_or_n[1]);
+                    cz = 0.5f * (p.pos_or_n[2] + p.prev_pos_or_n[2]);
+                    radius_inflate = 0.5f * disp;
+                }
+            }
+            bp.center[0] = cx;
+            bp.center[1] = cy;
+            bp.center[2] = cz;
+            // Sphere bounding radius = radius + half-displacement when
+            // motion blur is active. Future finite types (box, disk,
+            // cylinder) should compute a bounding-sphere radius here
+            // from their extent.
+            bp.radius    = p.radius_or_d + radius_inflate;
             bp.prim_id   = i;
             bvh_input.push_back(bp);
         }
@@ -3529,6 +3610,16 @@ void Engine::EnsurePrimitivesUploaded() {
         packed[off + 9]  = static_cast<float>(p.material);
         packed[off + 10] = p.ior;
         packed[off + 11] = 0.0f;
+        // Motion blur (#85). v3.xyz = prev_pos (last frame's center for
+        // spheres; same as pos_or_n for planes since planes don't move).
+        // The shader reads this when r_motion_blur != 0 to lerp the
+        // sphere center at the ray's shutter time. Layout collapses to
+        // a no-op when motion blur is off (the load happens but the
+        // lerp factor is forced to 1.0).
+        packed[off + 12] = p.prev_pos_or_n[0];
+        packed[off + 13] = p.prev_pos_or_n[1];
+        packed[off + 14] = p.prev_pos_or_n[2];
+        packed[off + 15] = 0.0f;
     };
     for (std::size_t i = 0; i < infinite_prims.size(); ++i) {
         pack_prim(i, *infinite_prims[i]);
@@ -5832,6 +5923,26 @@ void Engine::RenderFrame() {
         // One vec4 = 16 B. Drives the inner per-emitter puff-chain loop.
         float smoke_params2[4];
         // --- end Fluid Phase 2 -------------------------------------------
+        // --- Motion blur (#85) -------------------------------------------
+        // motion_blur_params.x = r_motion_blur (1 = enable shutter-time
+        //                       jitter + per-prim prev_pos lerp; 0 =
+        //                       legacy single-frame sampling, bit-exact
+        //                       vs pre-#85 main even though prev_pos is
+        //                       still packed into the primitive buffer).
+        //                .y = r_shutter_speed in seconds. Currently
+        //                       unused on the shader side (the lerp
+        //                       factor is just U(0,1) over the shutter
+        //                       window; the host snapshots prev/curr
+        //                       once per StepPhysics tick so a longer
+        //                       shutter visually scales the streak
+        //                       through how often the user calls render
+        //                       between physics steps -- a hook for
+        //                       future per-ray shutter weighting if we
+        //                       ever decouple physics dt from frame dt).
+        //                .z/.w reserved.
+        // One vec4 = 16 B.
+        float motion_blur_params[4];
+        // --- end Motion blur ---------------------------------------------
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -6748,6 +6859,24 @@ void Engine::RenderFrame() {
         // --- end Fluid Phase 2 --------------------------------------------
     }
     // --- end Fluid Phase 1 -------------------------------------------------
+    // --- Motion blur (#85) -------------------------------------------------
+    // Pack r_motion_blur + r_shutter_speed for the shader. r_motion_blur
+    // is the master gate; r_shutter_speed is plumbed even though the
+    // shader currently lerps over U(0,1) within the per-frame
+    // prev/curr window (per-ray shutter weighting is a future hook --
+    // see PtPush::motion_blur_params docstring above).
+    {
+        bool motion_blur_on = false;
+        if (auto* v = C.FindCVar("r_motion_blur")) motion_blur_on = v->GetBool();
+        float shutter_s = 0.0167f;
+        if (auto* v = C.FindCVar("r_shutter_speed")) shutter_s = v->GetFloat();
+        if (shutter_s < 0.0f) shutter_s = 0.0f;
+        push.motion_blur_params[0] = motion_blur_on ? 1.0f : 0.0f;
+        push.motion_blur_params[1] = shutter_s;
+        push.motion_blur_params[2] = 0.0f;
+        push.motion_blur_params[3] = 0.0f;
+    }
+    // --- end Motion blur ---------------------------------------------------
 
     // PtPush layout: the trailing 32 bytes here include the SDF Phase 1
     // block (sdf_params uvec4 + sdf_params_f vec4) and the celestials-
@@ -6771,7 +6900,9 @@ void Engine::RenderFrame() {
     //   +16 Fluid Phase 1 (#136) — smoke_params vec4 (count, enabled, time, _pad)
     //   +16 Fluid Phase 2 (#180) — smoke_params2 vec4 (lifetime, adv_strength,
     //                              puff_count, expansion_rate)
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16);
+    //   +16 Motion blur (#85) — motion_blur_params vec4 (enabled, shutter_speed,
+    //                              _pad, _pad)
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16);
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
     // cbuffer layout the Slang compiler applies to PathTrace.slang's
@@ -6833,6 +6964,10 @@ void Engine::RenderFrame() {
     // Fluid Phase 2 block (#180).
     static_assert(offsetof(PtPush, smoke_params2) % 16 == 0,
                   "PtPush::smoke_params2 must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    // Motion blur block (#85).
+    static_assert(offsetof(PtPush, motion_blur_params) % 16 == 0,
+                  "PtPush::motion_blur_params must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
@@ -9804,6 +9939,12 @@ void Engine::RegisterCommands() {
                         p.pos_or_n[1] = float((*pn)[1].value_or(0.0));
                         p.pos_or_n[2] = float((*pn)[2].value_or(0.0));
                     }
+                    // Motion blur (#85): seed prev == curr for freshly
+                    // loaded primitives so they don't streak from the
+                    // origin on their first rendered frame.
+                    p.prev_pos_or_n[0] = p.pos_or_n[0];
+                    p.prev_pos_or_n[1] = p.pos_or_n[1];
+                    p.prev_pos_or_n[2] = p.pos_or_n[2];
                     auto r_key = (p.type == AnalyticPrim::Plane) ? "d" : "radius";
                     p.radius_or_d = float(t[r_key].value_or<double>(0.5));
                     auto mat = t["material"].value_or<std::string>("lambert");
@@ -12274,6 +12415,9 @@ void Engine::RegisterPrimCommands() {
             p.type        = AnalyticPrim::Sphere;
             p.material    = mat;
             p.pos_or_n[0] = x; p.pos_or_n[1] = y; p.pos_or_n[2] = z;
+            // Motion blur (#85): seed prev == curr so a newly added prim
+            // produces no streak on the first frame.
+            p.prev_pos_or_n[0] = x; p.prev_pos_or_n[1] = y; p.prev_pos_or_n[2] = z;
             p.radius_or_d = radius;
             p.albedo[0]   = r; p.albedo[1] = g; p.albedo[2] = b;
             p.roughness   = roughness;
@@ -12319,6 +12463,9 @@ void Engine::RegisterPrimCommands() {
             p.type        = AnalyticPrim::Plane;
             p.material    = mat;
             p.pos_or_n[0] = nx; p.pos_or_n[1] = ny; p.pos_or_n[2] = nz;
+            // Planes don't move; prev_pos == pos_or_n keeps the GPU layout
+            // uniform without special-casing the plane branch.
+            p.prev_pos_or_n[0] = nx; p.prev_pos_or_n[1] = ny; p.prev_pos_or_n[2] = nz;
             p.radius_or_d = d;
             p.albedo[0]   = r; p.albedo[1] = g; p.albedo[2] = b;
             p.roughness   = 0.0f;
@@ -13211,6 +13358,9 @@ void Engine::RegisterPhysicsCommands() {
             p.type        = AnalyticPrim::Sphere;
             p.material    = AnalyticPrim::Lambert;
             p.pos_or_n[0] = x; p.pos_or_n[1] = y; p.pos_or_n[2] = z;
+            // Motion blur (#85): seed prev == curr so a freshly spawned
+            // body produces no spurious streak on its first frame.
+            p.prev_pos_or_n[0] = x; p.prev_pos_or_n[1] = y; p.prev_pos_or_n[2] = z;
             p.radius_or_d = radius;
             p.albedo[0]   = 0.80f; p.albedo[1] = 0.80f; p.albedo[2] = 0.85f;
             p.roughness   = 0.5f;
@@ -13290,6 +13440,9 @@ void Engine::RegisterPhysicsCommands() {
             p.type        = AnalyticPrim::Sphere;
             p.material    = AnalyticPrim::Lambert;
             p.pos_or_n[0] = x; p.pos_or_n[1] = y; p.pos_or_n[2] = z;
+            // Motion blur (#85): seed prev == curr so a freshly spawned
+            // body produces no spurious streak on its first frame.
+            p.prev_pos_or_n[0] = x; p.prev_pos_or_n[1] = y; p.prev_pos_or_n[2] = z;
             p.radius_or_d = radius;
             p.albedo[0]   = r_col; p.albedo[1] = g_col; p.albedo[2] = b_col;
             p.roughness   = 0.4f;
@@ -13374,6 +13527,9 @@ void Engine::RegisterPhysicsCommands() {
             p.type        = AnalyticPrim::Sphere;
             p.material    = AnalyticPrim::Lambert;
             p.pos_or_n[0] = x; p.pos_or_n[1] = y; p.pos_or_n[2] = z;
+            // Motion blur (#85): seed prev == curr so a freshly spawned
+            // body produces no spurious streak on its first frame.
+            p.prev_pos_or_n[0] = x; p.prev_pos_or_n[1] = y; p.prev_pos_or_n[2] = z;
             p.radius_or_d = bound_r;
             p.albedo[0]   = r_col; p.albedo[1] = g_col; p.albedo[2] = b_col;
             p.roughness   = 0.5f;
@@ -13730,6 +13886,14 @@ void Engine::StepPhysics(float dt) {
             // Only update sphere prims -- planes/etc. share the type
             // tag space but physics never targets them.
             if (ap.type != AnalyticPrim::Sphere) return;
+            // Motion blur (#85): snapshot the previous curr_pos to
+            // prev_pos_or_n BEFORE writing the new curr_pos. The shader
+            // lerps between prev_pos_or_n and pos_or_n at the ray's
+            // shutter-time sample so a falling body shows a streak
+            // proportional to its per-frame displacement.
+            ap.prev_pos_or_n[0] = ap.pos_or_n[0];
+            ap.prev_pos_or_n[1] = ap.pos_or_n[1];
+            ap.prev_pos_or_n[2] = ap.pos_or_n[2];
             ap.pos_or_n[0] = p.curr_pos.x;
             ap.pos_or_n[1] = p.curr_pos.y;
             ap.pos_or_n[2] = p.curr_pos.z;
@@ -13772,6 +13936,11 @@ void Engine::StepPhysics(float dt) {
             if (it == c->prims->end()) return;
             auto& ap = it->second;
             if (ap.type != AnalyticPrim::Sphere) return;
+            // Motion blur (#85): snapshot prev_pos before writing curr.
+            // See the Particle callback above for the design note.
+            ap.prev_pos_or_n[0] = ap.pos_or_n[0];
+            ap.prev_pos_or_n[1] = ap.pos_or_n[1];
+            ap.prev_pos_or_n[2] = ap.pos_or_n[2];
             ap.pos_or_n[0] = b.curr_pos.x;
             ap.pos_or_n[1] = b.curr_pos.y;
             ap.pos_or_n[2] = b.curr_pos.z;
