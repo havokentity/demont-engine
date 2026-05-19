@@ -738,6 +738,26 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     # --- end Fluid Phase 1 ------------------------------------------------
 
+    # --- Wave 7 (#24) -- procedural-raymarched cloud mode -----------------
+    # Pins the new r_clouds_mode procedural_raymarched code path against
+    # a committed PNG so regressions in either the CloudsRaymarch
+    # pre-pass or the CloudsComposite alpha-blend surface immediately.
+    # Same cloud-bearing scene as the existing godrays fixture (sunset
+    # + broken cumulus) so visual comparison vs the path-traced output
+    # is direct. Tolerances widened versus cornell_csg because cloud
+    # raymarch + light-march density evaluation involves more fbm
+    # taps than the analytic-geometry path; cross-backend FP-order
+    # variance accumulates faster.
+    #
+    # software backend SKIPPED -- the software RHI doesn't run compute
+    # pipelines, so the raymarched cloud pre-pass collapses to its
+    # gate-off path and the cell would just match the pathtraced
+    # software golden (no signal). Metal + denoised is the canonical
+    # raymarched-clouds capture.
+    pt_add_golden_cell(SCENE clouds_raymarched BACKEND metal DENOISER svgf_atrous
+        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
+    # --- end Wave 7 (#24) -------------------------------------------------
+
     # --- Physics Phase 2a rigid-body fixtures (#138, #181) ----------------
     # Pins the rigid-body fixture output against a committed PNG so any
     # accidental regression in:

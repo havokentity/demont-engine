@@ -44,6 +44,13 @@ extern const unsigned char shader_StarsComposite_metal_data[];
 extern const unsigned long shader_StarsComposite_metal_size;
 extern const unsigned char shader_AuroraComposite_metal_data[];
 extern const unsigned long shader_AuroraComposite_metal_size;
+// Wave 7 (#24): procedural raymarched cloud pre-pass (CloudsRaymarch)
+// and the alpha-composite kernel (CloudsComposite). Built unconditionally
+// but only dispatched when r_clouds_mode == procedural_raymarched.
+extern const unsigned char shader_CloudsRaymarch_metal_data[];
+extern const unsigned long shader_CloudsRaymarch_metal_size;
+extern const unsigned char shader_CloudsComposite_metal_data[];
+extern const unsigned long shader_CloudsComposite_metal_size;
 // SIGMA shadow denoiser kernel (issue #115).
 extern const unsigned char shader_SigmaShadow_metal_data[];
 extern const unsigned long shader_SigmaShadow_metal_size;
@@ -362,6 +369,16 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
     build_pso("aurora_composite",
               shader_AuroraComposite_metal_data,
               shader_AuroraComposite_metal_size);
+    // Wave 7 (#24): procedural raymarched cloud pre-pass + composite.
+    // Built unconditionally; engine elides the dispatch when
+    // r_clouds_mode == pathtraced (default), so registering the PSO has
+    // no runtime cost on the legacy path.
+    build_pso("clouds_raymarch",
+              shader_CloudsRaymarch_metal_data,
+              shader_CloudsRaymarch_metal_size);
+    build_pso("clouds_composite",
+              shader_CloudsComposite_metal_data,
+              shader_CloudsComposite_metal_size);
     build_pso("sigma_shadow",
               shader_SigmaShadow_metal_data,
               shader_SigmaShadow_metal_size);
