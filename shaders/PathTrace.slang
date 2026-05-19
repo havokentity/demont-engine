@@ -4028,7 +4028,20 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // water (already attenuated by per-segment Beer's law inside the
         // bounce loop; atmospheric terms would double-dim and add
         // air-only Mie/Rayleigh in-scatter to a water-only segment).
+        //
+        // Pinned to false when PT_WATER_ENABLED is compiled off: the
+        // water BRDF + in-loop segment absorption + sky-miss override
+        // are all excised at compile time, so even if the host still
+        // sets water_state.x from a MAT_WATER plane scan, this build
+        // has no water medium to actually attenuate the primary ray.
+        // Skipping the atmospheric march without compensating would
+        // strip aerial perspective / volumetric in-scatter from
+        // unrelated scenes that happen to mention `water` in a cfg.
+#if PT_WATER_ENABLED
         bool primary_in_water = (in_water == 1);
+#else
+        bool primary_in_water = false;
+#endif
         // --- end Underwater medium tracking ---------------------------------
 
         // Save primary-ray params for the volumetric march (single
