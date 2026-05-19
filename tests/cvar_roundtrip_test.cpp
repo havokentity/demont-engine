@@ -548,3 +548,110 @@ TEST_CASE("favourites: self-referential favourite (f1 saved as `f1`) doesn't loo
 
     C.ClearFavorites();
 }
+
+// --- Test 10: console input history round-trip ----------------------------
+// Console::history_ + PushHistory + SetHistory + History +
+// ClearHistory. The Engine-side persistence (console_history.txt via
+// Load/SaveConsoleHistoryToDisk) is exercised implicitly by real demont
+// runs; this test pins the in-memory Console API + the rules that the
+// on-disk format depends on (trim, blank-line reject, dedup,
+// kMaxHistoryDepth cap).
+TEST_CASE("console history: push / list / set / clear round-trip") {
+    auto& C = pt::console::Console::Get();
+    // Start clean -- other TEST_CASEs may have pushed entries into the
+    // singleton.
+    C.ClearHistory();
+    REQUIRE(C.HistoryCount() == 0);
+
+    // 1) PushHistory appends.
+    C.PushHistory("r_exposure 0.05");
+    CHECK(C.HistoryCount() == 1);
+    CHECK(C.History()[0] == "r_exposure 0.05");
+
+    // 2) Push more, verify FIFO ordering (oldest at front, newest at back).
+    C.PushHistory("phys_drop_sphere 1 2 3");
+    C.PushHistory("r_spp 4");
+    CHECK(C.HistoryCount() == 3);
+    CHECK(C.History()[0] == "r_exposure 0.05");
+    CHECK(C.History()[1] == "phys_drop_sphere 1 2 3");
+    CHECK(C.History()[2] == "r_spp 4");
+
+    // 3) Blank / whitespace-only pushes are no-ops. The persisted file
+    //    ignores blank lines, and walking up-arrow onto a blank would
+    //    surprise the user.
+    C.PushHistory("");
+    C.PushHistory("   \t  ");
+    CHECK(C.HistoryCount() == 3);
+
+    // 4) Push trims leading + trailing whitespace.
+    C.PushHistory("  csg_dump  ");
+    CHECK(C.HistoryCount() == 4);
+    CHECK(C.History().back() == "csg_dump");
+
+    // 5) Consecutive duplicates are coalesced (bash HISTCONTROL=ignoredups).
+    C.PushHistory("csg_dump");
+    CHECK(C.HistoryCount() == 4);  // unchanged
+    // But a NON-consecutive repeat IS kept -- previous entry must
+    // differ.
+    C.PushHistory("r_spp 8");
+    C.PushHistory("csg_dump");
+    CHECK(C.HistoryCount() == 6);
+    CHECK(C.History().back() == "csg_dump");
+
+    // 6) SetHistory replaces the whole vector (mirrors what
+    //    LoadConsoleHistoryFromDisk does at startup).
+    std::vector<std::string> seeded{
+        "fav r_exposure 0.05",
+        "fav r_spp 16",
+        "r_theme synthwave",
+    };
+    C.SetHistory(seeded);
+    CHECK(C.HistoryCount() == 3);
+    CHECK(C.History()[0] == "fav r_exposure 0.05");
+    CHECK(C.History()[1] == "fav r_spp 16");
+    CHECK(C.History()[2] == "r_theme synthwave");
+
+    // 7) ClearHistory wipes everything.
+    C.ClearHistory();
+    CHECK(C.HistoryCount() == 0);
+    CHECK(C.History().empty());
+}
+
+// --- Test 11: console history -- depth cap --------------------------------
+// kMaxHistoryDepth caps the buffer at the most recent N entries. Both
+// PushHistory (one-at-a-time) and SetHistory (bulk-load) must enforce
+// the cap so a long-running session OR a hand-edited
+// console_history.txt with too many lines can't unbounded-grow.
+TEST_CASE("console history: depth cap enforced on push + bulk-load") {
+    auto& C = pt::console::Console::Get();
+    C.ClearHistory();
+
+    const std::size_t kCap = pt::console::Console::kMaxHistoryDepth;
+    REQUIRE(kCap > 0);
+
+    // 1) Push (kCap + 50) UNIQUE entries one-by-one. The cap should
+    //    trim the oldest 50, leaving the most recent kCap.
+    for (std::size_t i = 0; i < kCap + 50; ++i) {
+        C.PushHistory(std::string("cmd_") + std::to_string(i));
+    }
+    CHECK(C.HistoryCount() == kCap);
+    // First retained entry is the (50)th push (cmd_50); last is
+    // the (kCap+49)th push (cmd_<kCap+49>).
+    CHECK(C.History().front() == std::string("cmd_") + std::to_string(50));
+    CHECK(C.History().back()  == std::string("cmd_") + std::to_string(kCap + 49));
+
+    // 2) SetHistory with an oversized vector trims to kCap from the
+    //    front (oldest dropped). Mirrors a hand-edited
+    //    console_history.txt with too many lines.
+    std::vector<std::string> over;
+    over.reserve(kCap + 25);
+    for (std::size_t i = 0; i < kCap + 25; ++i) {
+        over.push_back(std::string("seed_") + std::to_string(i));
+    }
+    C.SetHistory(over);
+    CHECK(C.HistoryCount() == kCap);
+    CHECK(C.History().front() == std::string("seed_") + std::to_string(25));
+    CHECK(C.History().back()  == std::string("seed_") + std::to_string(kCap + 24));
+
+    C.ClearHistory();
+}

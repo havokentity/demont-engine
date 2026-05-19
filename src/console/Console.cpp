@@ -930,6 +930,41 @@ void Console::ClearFavorites() {
     favorites_.clear();
 }
 
+void Console::PushHistory(std::string line) {
+    // Trim leading/trailing whitespace defensively. Empty post-trim
+    // entries are rejected -- up-arrow walking onto a blank line
+    // would surprise the user and pollute the persisted file.
+    while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) {
+        line.erase(line.begin());
+    }
+    while (!line.empty() && (line.back()  == ' ' || line.back()  == '\t')) {
+        line.pop_back();
+    }
+    if (line.empty()) return;
+    // Coalesce consecutive duplicates: if the user types the same
+    // command back-to-back, only keep one copy at the tail. (Bash-
+    // style HISTCONTROL=ignoredups behaviour; users expect this.)
+    if (!history_.empty() && history_.back() == line) return;
+    history_.push_back(std::move(line));
+    if (history_.size() > kMaxHistoryDepth) {
+        history_.erase(history_.begin(),
+                       history_.begin() + (history_.size() - kMaxHistoryDepth));
+    }
+}
+
+void Console::ClearHistory() {
+    history_.clear();
+}
+
+void Console::SetHistory(std::vector<std::string> hist) {
+    history_ = std::move(hist);
+    // Enforce the cap on bulk-load too. Trim oldest entries (front).
+    if (history_.size() > kMaxHistoryDepth) {
+        history_.erase(history_.begin(),
+                       history_.begin() + (history_.size() - kMaxHistoryDepth));
+    }
+}
+
 void Console::QueueExecute(std::string line, Responder responder) {
     std::lock_guard lock(queue_mutex_);
     queue_.push_back({std::move(line), std::move(responder)});
