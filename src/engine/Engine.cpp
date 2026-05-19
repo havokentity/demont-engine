@@ -1353,7 +1353,7 @@ bool Engine::Init() {
         }
     }
     if (skip_cfg_load) {
-        LOG_INFO("engine: --no-cfg given -- skipping demont.cfg + autoexec.cfg + favorites.cfg + console_history.txt load");
+        LOG_INFO("engine: --no-cfg given -- skipping demont.cfg + autoexec.cfg + favorites.cfg + console_history.txt + camera_bookmarks.cfg load");
     } else {
         exec_if_exists("demont.cfg");      // archived cvars from last quit
         exec_if_exists("autoexec.cfg");    // user-supplied startup script (overrides above)
@@ -1369,6 +1369,10 @@ bool Engine::Init() {
         // Console::History() during Init below. One line per entry;
         // blank lines + leading `#` are ignored.
         LoadConsoleHistoryFromDisk();
+        // Named camera bookmarks (cam_save_named / cam_load_named) --
+        // same per-line cfg pattern, but key/value parsed into
+        // camera_bookmarks_ rather than a console-favourites vector.
+        LoadCameraBookmarksFromDisk();
     }
 
     // Command-line cvar overrides land last so they beat both archived
@@ -4246,6 +4250,235 @@ void Engine::SaveConsoleHistoryToDisk() {
         std::fputc('\n', f);
     }
     std::fclose(f);
+}
+
+void Engine::LoadCameraBookmarksFromDisk() {
+    // camera_bookmarks.cfg lives next to demont.cfg + favorites.cfg
+    // (CWD). One bookmark per line: `<name> <x> <y> <z> <yaw_deg>
+    // <pitch_deg> <fov_deg>` (seven whitespace-separated tokens; the
+    // first is the user-chosen mnemonic, the remaining six are the
+    // same float format the numeric cam_slot_N cvars use). Blank
+    // lines and lines whose first non-space char is `#` are ignored.
+    // Malformed lines are skipped with a warning rather than aborting
+    // the load -- a corrupted entry shouldn't take the whole file
+    // down with it. Duplicate names: last one wins (std::map insert
+    // via `bookmarks[name] = state`).
+    FILE* f = std::fopen("camera_bookmarks.cfg", "rb");
+    if (f == nullptr) return;
+    std::string accum;
+    char buf[4096];
+    while (std::size_t n = std::fread(buf, 1, sizeof(buf), f)) {
+        accum.append(buf, n);
+    }
+    std::fclose(f);
+
+    camera_bookmarks_.clear();
+    std::size_t i = 0;
+    std::size_t loaded = 0, skipped = 0;
+    while (i < accum.size()) {
+        std::size_t end = i;
+        while (end < accum.size() && accum[end] != '\n') ++end;
+        std::string line = accum.substr(i, end - i);
+        i = (end < accum.size()) ? end + 1 : end;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+
+        // Skip blanks + comment lines.
+        std::size_t lead = 0;
+        while (lead < line.size() && (line[lead] == ' ' || line[lead] == '\t')) ++lead;
+        if (lead >= line.size()) continue;
+        if (line[lead] == '#')   continue;
+
+        // Split into name + tail-of-six-floats. We don't validate the
+        // floats here; the cam_load_named parser does that on use,
+        // and a malformed value is an error message rather than a
+        // silent load failure.
+        std::size_t name_end = lead;
+        while (name_end < line.size() && line[name_end] != ' ' && line[name_end] != '\t') ++name_end;
+        if (name_end == lead) { ++skipped; continue; }
+        std::string name = line.substr(lead, name_end - lead);
+        std::size_t state_start = name_end;
+        while (state_start < line.size() && (line[state_start] == ' ' || line[state_start] == '\t')) ++state_start;
+        if (state_start >= line.size()) { ++skipped; continue; }
+        std::string state = line.substr(state_start);
+        camera_bookmarks_[std::move(name)] = std::move(state);
+        ++loaded;
+    }
+    if (skipped > 0) {
+        LOG_WARN("camera_bookmarks: skipped {} malformed line(s) in camera_bookmarks.cfg",
+                 skipped);
+    }
+    LOG_INFO("camera_bookmarks: loaded {} bookmark(s) from camera_bookmarks.cfg",
+             loaded);
+}
+
+void Engine::SaveCameraBookmarksToDisk() {
+    // Always rewrite, even if camera_bookmarks_ is empty -- otherwise
+    // a cleared-all-bookmarks state would silently resurrect the
+    // stale file on next launch. Same convention as SaveFavoritesToDisk.
+    FILE* f = std::fopen("camera_bookmarks.cfg", "wb");
+    if (f == nullptr) {
+        LOG_WARN("camera_bookmarks: failed to open camera_bookmarks.cfg for write");
+        return;
+    }
+    const std::string header =
+        "# demont named camera bookmarks. One bookmark per line:\n"
+        "#   <name> <x> <y> <z> <yaw_deg> <pitch_deg> <fov_deg>\n"
+        "# Saved automatically by `cam_save_named` and\n"
+        "# `cam_delete_bookmark`. Lines starting with `#` and blank\n"
+        "# lines are ignored on load. Invocation: type\n"
+        "# `cam_load_named <name>` to restore a viewpoint.\n";
+    std::fwrite(header.data(), 1, header.size(), f);
+    for (const auto& [name, state] : camera_bookmarks_) {
+        std::fwrite(name.data(), 1, name.size(), f);
+        std::fputc(' ', f);
+        std::fwrite(state.data(), 1, state.size(), f);
+        std::fputc('\n', f);
+    }
+    std::fclose(f);
+}
+
+void Engine::RegisterCameraBookmarkCommands() {
+    // Named-camera-bookmark commands -- complements the numeric
+    // cam_slot_1..9 system in RegisterCommands. Bookmarks are keyed
+    // by user-chosen mnemonic (`overhead`, `closeup`, `cornell_3q`),
+    // share the same six-float "x y z yaw_deg pitch_deg fov_deg"
+    // serialization, and persist to camera_bookmarks.cfg (rewritten
+    // on every save / delete).
+    auto& C = pt::console::Console::Get();
+
+    // Local copies of the camera-state format / parse helpers used by
+    // the numeric cam_slot system. Kept as no-capture lambdas so
+    // they're copy-constructible into the std::function commands.
+    const auto fmt_cam_state = [](const pt::renderer::Camera& c) -> std::string {
+        constexpr float kRadToDeg = 57.29577951308232f;
+        return fmt::format("{:.6f} {:.6f} {:.6f} {:.4f} {:.4f} {:.3f}",
+                           c.pos.x, c.pos.y, c.pos.z,
+                           c.yaw   * kRadToDeg,
+                           c.pitch * kRadToDeg,
+                           c.fov_deg);
+    };
+    const auto parse_cam_state = [](std::string_view s, pt::renderer::Camera& out) -> bool {
+        constexpr float kDegToRad = 0.017453292519943295f;
+        std::istringstream iss{std::string(s)};
+        float x, y, z, yaw_d, pitch_d, fov_d;
+        if (!(iss >> x >> y >> z >> yaw_d >> pitch_d >> fov_d)) return false;
+        out.pos     = glm::vec3(x, y, z);
+        out.yaw     = yaw_d   * kDegToRad;
+        out.pitch   = pitch_d * kDegToRad;
+        out.fov_deg = fov_d;
+        out.ClampPitch();
+        return true;
+    };
+    // Name validation: must be a single non-empty token containing
+    // only printable ASCII excluding whitespace and `#` (the cfg
+    // comment prefix). Allows identifier-style chars (a-z, A-Z, 0-9,
+    // underscore, hyphen, dot). The cfg file's line-per-bookmark
+    // format means embedded whitespace would split the parse on
+    // load; the token-level ban covers that.
+    const auto is_valid_bookmark_name = [](std::string_view name) -> bool {
+        if (name.empty()) return false;
+        for (char c : name) {
+            if (c <= ' ' || c == '#' || c == 0x7f) return false;
+        }
+        return true;
+    };
+
+    C.RegisterCommand("cam_save_named",
+        "cam_save_named <name>: capture the current camera state into "
+        "a named bookmark (e.g. `cam_save_named overhead`). Name must "
+        "be a single non-empty token without whitespace or '#'. "
+        "Persists to camera_bookmarks.cfg.",
+        [this, fmt_cam_state, is_valid_bookmark_name](auto args, pt::console::Output& out) {
+            if (!camera_) { out.PrintLine("cam_save_named: no camera"); return; }
+            if (args.size() != 1) {
+                out.PrintLine("usage: cam_save_named <name>");
+                return;
+            }
+            if (!is_valid_bookmark_name(args[0])) {
+                out.FormatLine("cam_save_named: invalid name '{}' (must be a single "
+                               "non-empty token without whitespace or '#')",
+                               std::string(args[0]));
+                return;
+            }
+            std::string name(args[0]);
+            const std::string state = fmt_cam_state(*camera_);
+            const bool replaced = camera_bookmarks_.contains(name);
+            camera_bookmarks_[name] = state;
+            SaveCameraBookmarksToDisk();
+            if (replaced) {
+                out.FormatLine("cam_save_named: replaced '{}' = {}", name, state);
+            } else {
+                out.FormatLine("cam_save_named: saved '{}' = {}", name, state);
+            }
+        });
+
+    C.RegisterCommand("cam_load_named",
+        "cam_load_named <name>: restore the camera from a named "
+        "bookmark saved with cam_save_named. Use cam_list_bookmarks "
+        "to see available names. Fires the active denoiser's "
+        "history-reset flag so the temporal denoise pipeline "
+        "(SVGF/NRD/MetalFX/OptiX-temporal) doesn't blend pre-teleport "
+        "content forward.",
+        [this, parse_cam_state](auto args, pt::console::Output& out) {
+            if (!camera_) { out.PrintLine("cam_load_named: no camera"); return; }
+            if (args.size() != 1) {
+                out.PrintLine("usage: cam_load_named <name>");
+                return;
+            }
+            const std::string name(args[0]);
+            auto it = camera_bookmarks_.find(name);
+            if (it == camera_bookmarks_.end()) {
+                out.FormatLine("cam_load_named: no bookmark named '{}' "
+                               "(use cam_list_bookmarks to see saved names)",
+                               name);
+                return;
+            }
+            if (!parse_cam_state(it->second, *camera_)) {
+                out.FormatLine("cam_load_named: bookmark '{}' contents malformed: '{}'",
+                               name, it->second);
+                return;
+            }
+            prev_view_proj_valid_ = false;  // active denoiser reset_history (SVGF/NRD/MetalFX/OptiX-temporal)
+            out.FormatLine("cam_load_named: '{}' = {}", name, it->second);
+        });
+
+    C.RegisterCommand("cam_list_bookmarks",
+        "List all named camera bookmarks (saved via cam_save_named). "
+        "Output is sorted alphabetically; numeric slots 1..9 are "
+        "listed by `cam_list` instead.",
+        [this](auto, pt::console::Output& out) {
+            if (camera_bookmarks_.empty()) {
+                out.PrintLine("(no camera bookmarks yet -- use "
+                              "`cam_save_named <name>` to save one)");
+                return;
+            }
+            out.FormatLine("{} bookmark(s):", camera_bookmarks_.size());
+            for (const auto& [name, state] : camera_bookmarks_) {
+                out.FormatLine("  {}  {}", name, state);
+            }
+        });
+
+    C.RegisterCommand("cam_delete_bookmark",
+        "cam_delete_bookmark <name>: remove a named camera bookmark. "
+        "Rewrites camera_bookmarks.cfg so the deletion persists.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 1) {
+                out.PrintLine("usage: cam_delete_bookmark <name>");
+                return;
+            }
+            const std::string name(args[0]);
+            auto it = camera_bookmarks_.find(name);
+            if (it == camera_bookmarks_.end()) {
+                out.FormatLine("cam_delete_bookmark: no bookmark named '{}'",
+                               name);
+                return;
+            }
+            camera_bookmarks_.erase(it);
+            SaveCameraBookmarksToDisk();
+            out.FormatLine("cam_delete_bookmark: removed '{}' "
+                           "({} bookmark(s) remain)",
+                           name, camera_bookmarks_.size());
+        });
 }
 
 void Engine::PrewarmPipelines() {
@@ -9293,6 +9526,14 @@ void Engine::RegisterCommands() {
                 }
             }
         });
+
+    // ---- Named camera bookmarks (cam_save_named / cam_load_named) -----
+    // Commands live in a dedicated registration function for two
+    // reasons: (1) keeps RegisterCommands shorter; (2) the unit test
+    // wires JUST these commands without dragging in the rest of the
+    // RegisterCommands body (which captures `this` across audio /
+    // RHI / window state that isn't initialised in the test harness).
+    RegisterCameraBookmarkCommands();
 
     C.RegisterCommand("sys_info", "Summarize hardware.",
         [](auto, pt::console::Output& out) {

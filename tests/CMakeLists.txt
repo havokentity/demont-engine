@@ -278,6 +278,22 @@ pt_add_test(phys_drop_args_test
     phys_drop_args_test.cpp
     LINK_TARGETS pt_engine)
 
+# --- Named camera bookmarks (cam_save_named / cam_load_named) ----------------
+# Pins the named-camera-bookmark commands added on
+# `feat/cam-named-bookmarks`. Round-trips save -> load (camera pose
+# preserved within ClampPitch tolerance), replace semantics
+# (re-saving same name overwrites without error), rejection paths
+# (empty / '#'-prefixed name, missing bookmark on load), listing
+# (empty + populated), deletion, and the cfg-file persistence path
+# (SaveCameraBookmarksToDisk -> LoadCameraBookmarksFromDisk recovers
+# the same map verbatim). Friend-struct CamBookmarksTestAccess wires
+# JUST RegisterCameraBookmarkCommands + a camera_ unique_ptr -- the
+# full RegisterCommands path would capture `this` across audio /
+# RHI / window state that isn't initialised in the test harness.
+pt_add_test(cam_bookmarks_test
+    cam_bookmarks_test.cpp
+    LINK_TARGETS pt_engine)
+
 # --- Light photometric decomposition (#176) --------------------------------
 # Pins the photometric conversion constants the new `light_*_color` /
 # `light_*_cd` / `light_*_lm` / `light_*_nits` / `light_*_exposed`
