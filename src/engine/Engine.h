@@ -16,6 +16,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <string>
@@ -146,6 +147,21 @@ public:
     // call this after the mutation so editor panels stay in sync.
     // No-op when no ConsoleServer is bound.
     void BroadcastSceneDirty();
+    // Scene undo/redo (task #18). Capture a full-scene snapshot
+    // BEFORE a mutating console command so scene_undo can restore.
+    // Mutators that want undo coverage MUST call PushSceneSnapshot()
+    // as the first line after argument validation passes but BEFORE
+    // any state changes. Snapshot is shallow-copy of the four
+    // mutable maps + selection state -- O(N) per call where N is
+    // total entity count, fine for editor interactive use.
+    //
+    // Stack cap: 50 entries (matches Console cvar undo). Older
+    // entries drop silently. SceneUndo pops the top and pushes
+    // current state to scene_redo_stack_; SceneRedo reverses.
+    void PushSceneSnapshot();
+    bool SceneUndo();   // returns true if a snapshot was popped + applied
+    bool SceneRedo();
+    void ClearSceneUndoHistory();
     // Read-only accessors live below the AnalyticPrim / AnalyticLight
     // struct definitions (their types are nested in Engine and not
     // visible here yet). See the second editor-backend block further
@@ -736,6 +752,25 @@ private:
     std::uint64_t                               light_buffer_id_         = 0;
     std::uint32_t                               light_buffer_capacity_   = 0;  // lights that fit
     std::uint32_t                               light_count_uploaded_    = 0;  // lights last uploaded
+
+    // --- Scene undo/redo state (task #18) ----------------------------------
+    // Full-scene snapshot for scene_undo/scene_redo. Captured before
+    // each mutating console command (prim_set_* / light_set_* / etc).
+    // O(N) copy per snapshot; bounded by kMaxSceneUndoHistory so the
+    // stack stays under ~50*Nprim*sizeof(AnalyticPrim) bytes (single-
+    // digit MB at typical N).
+    struct SceneSnapshot {
+        std::map<std::uint32_t, AnalyticPrim>          prims;
+        std::map<std::uint32_t, AnalyticLight>         lights;
+        SelectionKind                                  sel_kind = SelectionKind::None;
+        std::uint32_t                                  sel_id   = 0;
+    };
+    std::deque<SceneSnapshot>                   scene_undo_stack_;
+    std::deque<SceneSnapshot>                   scene_redo_stack_;
+    bool                                        in_scene_undo_redo_     = false;
+    static constexpr std::size_t                kMaxSceneUndoHistory    = 50;
+    SceneSnapshot CaptureSceneSnapshot() const;
+    void          ApplySceneSnapshot(const SceneSnapshot& s);
 
     // --- Light tree (#129) -------------------------------------------------
     // Double-buffered GPU node buffer. Worker thread runs Rebuild() on

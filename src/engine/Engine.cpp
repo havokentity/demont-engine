@@ -9732,6 +9732,78 @@ void Engine::BroadcastSceneDirty() {
     }
 }
 
+// --- Scene undo/redo (task #18) ----------------------------------------
+// Snapshot the four mutable maps + selection state. Shallow copies
+// (std::map deep-copy is cheap at typical N <= a few hundred).
+Engine::SceneSnapshot Engine::CaptureSceneSnapshot() const {
+    SceneSnapshot s;
+    s.prims    = primitives_;
+    s.lights   = light_prims_;
+    s.sel_kind = selected_kind_;
+    s.sel_id   = selected_prim_id_;
+    return s;
+}
+
+void Engine::ApplySceneSnapshot(const SceneSnapshot& s) {
+    primitives_       = s.prims;
+    light_prims_      = s.lights;
+    selected_kind_    = s.sel_kind;
+    selected_prim_id_ = s.sel_id;
+    primitives_dirty_  = true;
+    light_prims_dirty_ = true;
+    accum_dirty_       = true;
+    BroadcastSceneDirty();
+}
+
+void Engine::PushSceneSnapshot() {
+    // Don't snapshot while we're INSIDE SceneUndo/SceneRedo apply --
+    // would create circular history. Mirror Console's in_undo_redo_
+    // guard pattern.
+    if (in_scene_undo_redo_) return;
+    scene_undo_stack_.push_back(CaptureSceneSnapshot());
+    if (scene_undo_stack_.size() > kMaxSceneUndoHistory) {
+        scene_undo_stack_.pop_front();
+    }
+    // Any new mutation invalidates redo (consistent with how text
+    // editors / cvar undo behave -- you can't redo past a divergence).
+    scene_redo_stack_.clear();
+}
+
+bool Engine::SceneUndo() {
+    if (scene_undo_stack_.empty()) return false;
+    in_scene_undo_redo_ = true;
+    // Push CURRENT state to redo so SceneRedo can recover from this
+    // undo step. Then pop the undo top + apply.
+    scene_redo_stack_.push_back(CaptureSceneSnapshot());
+    if (scene_redo_stack_.size() > kMaxSceneUndoHistory) {
+        scene_redo_stack_.pop_front();
+    }
+    SceneSnapshot s = std::move(scene_undo_stack_.back());
+    scene_undo_stack_.pop_back();
+    ApplySceneSnapshot(s);
+    in_scene_undo_redo_ = false;
+    return true;
+}
+
+bool Engine::SceneRedo() {
+    if (scene_redo_stack_.empty()) return false;
+    in_scene_undo_redo_ = true;
+    scene_undo_stack_.push_back(CaptureSceneSnapshot());
+    if (scene_undo_stack_.size() > kMaxSceneUndoHistory) {
+        scene_undo_stack_.pop_front();
+    }
+    SceneSnapshot s = std::move(scene_redo_stack_.back());
+    scene_redo_stack_.pop_back();
+    ApplySceneSnapshot(s);
+    in_scene_undo_redo_ = false;
+    return true;
+}
+
+void Engine::ClearSceneUndoHistory() {
+    scene_undo_stack_.clear();
+    scene_redo_stack_.clear();
+}
+
 void Engine::HandleMouseInput() {
     // Bail if any prerequisite isn't satisfied. We also reset the
     // edge-detect latch so releasing the gating condition (closing the
@@ -11458,6 +11530,51 @@ void Engine::RegisterCommands() {
             for (const auto& c : changes) {
                 out.FormatLine("  {}: \"{}\" -> \"{}\"", c.name, c.from, c.to);
             }
+        });
+
+    // Scene undo/redo (task #18). Separate from cvar undo/redo because
+    // they snapshot different state: cvar undo captures cvar values
+    // touched by Console::ExecuteScript; scene undo captures the four
+    // mutable maps (prims, lights, sdf, rigid_bodies) before a
+    // mutating console command. Instrumented mutators call
+    // Engine::PushSceneSnapshot() to push pre-state; scene_undo /
+    // scene_redo pop + apply.
+    C.RegisterCommand("scene_undo",
+        "Roll back the most recent prim/light scene mutation "
+        "(prim_set_*, light_set_*, prim_delete, prim_duplicate, etc). "
+        "Restores the full primitives + lights state + selection from "
+        "the snapshot taken just before that command. Stack cap 50. "
+        "Separate from cvar undo (use the `undo` command for cvars).",
+        [this](auto, pt::console::Output& out) {
+            if (!SceneUndo()) {
+                out.PrintLine("scene_undo: history is empty");
+                return;
+            }
+            out.FormatLine("scene_undo: restored {} prim(s) + {} light(s) "
+                           "from snapshot; redo available",
+                           primitives_.size(), light_prims_.size());
+        });
+
+    C.RegisterCommand("scene_redo",
+        "Reapply the most recently scene_undo'd mutation. Cleared by "
+        "any new prim/light mutation.",
+        [this](auto, pt::console::Output& out) {
+            if (!SceneRedo()) {
+                out.PrintLine("scene_redo: nothing to redo");
+                return;
+            }
+            out.FormatLine("scene_redo: reapplied snapshot; now {} prim(s) "
+                           "+ {} light(s)",
+                           primitives_.size(), light_prims_.size());
+        });
+
+    C.RegisterCommand("scene_undo_clear",
+        "Clear the scene undo + redo stacks. Useful before a known-"
+        "clean baseline so future scene_undo doesn't wander further "
+        "back than expected.",
+        [this](auto, pt::console::Output& out) {
+            ClearSceneUndoHistory();
+            out.PrintLine("scene_undo_clear: stacks cleared");
         });
 
     C.RegisterCommand("dump_moon_pos",
@@ -13543,6 +13660,7 @@ void Engine::RegisterPrimCommands() {
             }
             std::uint32_t id; AnalyticPrim* p = nullptr;
             if (!find_prim(args[0], out, id, p)) return;
+            PushSceneSnapshot();
             float x, y, z;
             if (!ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z)) {
                 out.PrintLine("prim_set_pos: float parse failed");
@@ -13581,6 +13699,7 @@ void Engine::RegisterPrimCommands() {
             }
             std::uint32_t id; AnalyticPrim* p = nullptr;
             if (!find_prim(args[0], out, id, p)) return;
+            PushSceneSnapshot();
             float r, g, b;
             if (!ParseFloat(args[1], r) || !ParseFloat(args[2], g) || !ParseFloat(args[3], b)) {
                 out.PrintLine("prim_set_albedo: float parse failed");
@@ -13608,6 +13727,7 @@ void Engine::RegisterPrimCommands() {
             }
             std::uint32_t id; AnalyticPrim* p = nullptr;
             if (!find_prim(args[0], out, id, p)) return;
+            PushSceneSnapshot();
             float r, g, b;
             if (!ParseFloat(args[1], r) || !ParseFloat(args[2], g) || !ParseFloat(args[3], b)) {
                 out.PrintLine("prim_set_emission: float parse failed");
@@ -13631,6 +13751,7 @@ void Engine::RegisterPrimCommands() {
             }
             std::uint32_t id; AnalyticPrim* p = nullptr;
             if (!find_prim(args[0], out, id, p)) return;
+            PushSceneSnapshot();
             float v;
             if (!ParseFloat(args[1], v)) {
                 out.PrintLine("prim_set_roughness: float parse failed");
@@ -13655,6 +13776,7 @@ void Engine::RegisterPrimCommands() {
             }
             std::uint32_t id; AnalyticPrim* p = nullptr;
             if (!find_prim(args[0], out, id, p)) return;
+            PushSceneSnapshot();
             float v;
             if (!ParseFloat(args[1], v)) {
                 out.PrintLine("prim_set_ior: float parse failed");
@@ -13684,6 +13806,7 @@ void Engine::RegisterPrimCommands() {
             }
             std::uint32_t id; AnalyticPrim* p = nullptr;
             if (!find_prim(args[0], out, id, p)) return;
+            PushSceneSnapshot();
             AnalyticPrim::Material mat;
             if (!ParseMaterial(args[1], mat)) {
                 out.FormatLine("prim_set_material: unknown material '{}' "
@@ -13721,6 +13844,7 @@ void Engine::RegisterPrimCommands() {
             }
             std::uint32_t id; AnalyticPrim* p = nullptr;
             if (!find_prim(args[0], out, id, p)) return;
+            PushSceneSnapshot();
             float qx, qy, qz, qw;
             if (!ParseFloat(args[1], qx) || !ParseFloat(args[2], qy) ||
                 !ParseFloat(args[3], qz) || !ParseFloat(args[4], qw)) {
@@ -13756,6 +13880,7 @@ void Engine::RegisterPrimCommands() {
             }
             std::uint32_t id; AnalyticPrim* p = nullptr;
             if (!find_prim(args[0], out, id, p)) return;
+            PushSceneSnapshot();
             float pitch_deg, yaw_deg, roll_deg;
             if (!ParseFloat(args[1], pitch_deg) ||
                 !ParseFloat(args[2], yaw_deg)   ||
@@ -13799,10 +13924,12 @@ void Engine::RegisterPrimCommands() {
                 out.PrintLine("prim_delete: id parse failed");
                 return;
             }
-            if (primitives_.erase(id) == 0) {
+            if (primitives_.find(id) == primitives_.end()) {
                 out.FormatLine("prim_delete: id {} not found", id);
                 return;
             }
+            PushSceneSnapshot();
+            primitives_.erase(id);
             phys_debug_color_cache_.erase(id);
             // Drop the editor selection if it pointed at the body we
             // just deleted -- otherwise the outline shader would chase
@@ -13851,6 +13978,7 @@ void Engine::RegisterPrimCommands() {
                     return;
                 }
             }
+            PushSceneSnapshot();
             AnalyticPrim copy = it->second;
             primitives_[new_id] = copy;
             primitives_dirty_ = true;
@@ -16376,6 +16504,7 @@ void Engine::RegisterLightCommands() {
     C.RegisterCommand("light_clear",
         "Remove all analytic light primitives.",
         [this](auto, pt::console::Output& out) {
+            if (!light_prims_.empty()) PushSceneSnapshot();
             light_prims_.clear();
             light_prims_dirty_ = true;
             accum_dirty_       = true;
@@ -16389,10 +16518,12 @@ void Engine::RegisterLightCommands() {
             if (args.size() != 1) { out.PrintLine("usage: light_remove <id>"); return; }
             std::uint32_t id;
             if (!ParseUint(args[0], id)) { out.PrintLine("light_remove: id parse failed"); return; }
-            if (light_prims_.erase(id) == 0) {
+            if (light_prims_.find(id) == light_prims_.end()) {
                 out.FormatLine("light_remove: id {} not found", id);
                 return;
             }
+            PushSceneSnapshot();
+            light_prims_.erase(id);
             light_prims_dirty_ = true;
             accum_dirty_       = true;
             BroadcastSceneDirty();
@@ -17033,6 +17164,7 @@ void Engine::RegisterLightCommands() {
             }
             auto it = light_prims_.find(id);
             if (it == light_prims_.end()) { out.FormatLine("light_set_pos: id {} not found", id); return; }
+            PushSceneSnapshot();
             it->second.pos[0] = x; it->second.pos[1] = y; it->second.pos[2] = z;
             light_prims_dirty_ = true;
             accum_dirty_       = true;
@@ -17057,6 +17189,7 @@ void Engine::RegisterLightCommands() {
             }
             auto it = light_prims_.find(id);
             if (it == light_prims_.end()) { out.FormatLine("light_set_intensity: id {} not found", id); return; }
+            PushSceneSnapshot();
             it->second.intensity[0] = r; it->second.intensity[1] = g; it->second.intensity[2] = b;
             light_prims_dirty_ = true;
             accum_dirty_       = true;
@@ -17084,6 +17217,7 @@ void Engine::RegisterLightCommands() {
             }
             const float len = std::sqrt(nx*nx + ny*ny + nz*nz);
             if (len < 1e-6f) { out.PrintLine("light_set_dir: zero-length direction rejected"); return; }
+            PushSceneSnapshot();
             it->second.dir[0] = nx / len; it->second.dir[1] = ny / len; it->second.dir[2] = nz / len;
             light_prims_dirty_ = true;
             accum_dirty_       = true;
@@ -17110,6 +17244,7 @@ void Engine::RegisterLightCommands() {
             if (it->second.type != AnalyticLight::Spot) {
                 out.FormatLine("light_set_cone: id {} is not a spot light", id); return;
             }
+            PushSceneSnapshot();
             const float deg2rad = 3.14159265358979323846f / 180.0f;
             it->second.cos_inner = std::cos(inner_deg * deg2rad);
             it->second.cos_outer = std::cos(outer_deg * deg2rad);
@@ -17133,8 +17268,10 @@ void Engine::RegisterLightCommands() {
             auto it = light_prims_.find(id);
             if (it == light_prims_.end()) { out.FormatLine("light_set_size: id {} not found", id); return; }
             if (it->second.type == AnalyticLight::Sphere) {
+                PushSceneSnapshot();
                 it->second.radius = r;
             } else if (it->second.type == AnalyticLight::Quad) {
+                PushSceneSnapshot();
                 it->second.v_half = r;
             } else {
                 out.FormatLine("light_set_size: id {} is {} -- no size to set",
@@ -17183,6 +17320,7 @@ void Engine::RegisterLightCommands() {
                 out.FormatLine("light_set_rotation: id {} not found", id);
                 return;
             }
+            PushSceneSnapshot();
             const float inv = 1.0f / mag;
             it->second.orient[0] = qx * inv;
             it->second.orient[1] = qy * inv;
@@ -17219,6 +17357,7 @@ void Engine::RegisterLightCommands() {
                 out.FormatLine("light_set_rotation_euler: id {} not found", id);
                 return;
             }
+            PushSceneSnapshot();
             // XYZ-intrinsic Euler -> quaternion. Half-angle formulation
             // produces a unit quaternion straight out so we don't need
             // the normalisation step. Matches prim_set_rotation_euler
