@@ -145,6 +145,30 @@ pt_compile_slang(
     ENTRY   main
     TARGETS metal
 )
+# Wave 7 (#24) -- procedural raymarched cloud pre-pass.
+# Two compute kernels paired by the engine when r_clouds_mode ==
+# procedural_raymarched: CloudsRaymarch writes clouds_color_tex +
+# cloud_trans_tex; CloudsComposite blends clouds_color_tex into the
+# path-traced HDR (after StarsComposite, before bloom). When the cvar
+# is at the default "pathtraced" the engine elides BOTH dispatches so
+# zero runtime cost on the legacy path. Imports PathTraceCloud (the
+# shared cloud-density module) so the raymarch and the inline cloud
+# march sample the SAME procedural field with the same parameters.
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/CloudsRaymarch.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+    MODULE_DEPS PathTraceCloud
+)
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/CloudsComposite.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+)
 # SIGMA-style sun-shadow denoiser (issue #115). Runs between Denoise()
 # and StarsComposite; bilateral-filters the per-pixel sun-visibility
 # G-buffer, multiplies the denoised visibility back into HDR.

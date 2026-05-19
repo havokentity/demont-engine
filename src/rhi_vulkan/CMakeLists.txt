@@ -154,6 +154,19 @@ pt_compile_slang(
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/StarsComposite.slang
     STAGE compute ENTRY main TARGETS spirv)
+# Wave 7 (#24) -- procedural raymarched cloud pre-pass + composite.
+# Imports PathTraceCloud (the shared cloud-density module) so the
+# raymarch and the inline cloud march sample the SAME procedural field.
+# Both kernels compile to SPIR-V on Vulkan; pipeline registration is in
+# VulkanDevice.cpp's pipeline-build worker. When r_clouds_mode ==
+# pathtraced (default) the engine elides both dispatches.
+pt_compile_slang(
+    TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/CloudsRaymarch.slang
+    STAGE compute ENTRY main TARGETS spirv
+    MODULE_DEPS PathTraceCloud)
+pt_compile_slang(
+    TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/CloudsComposite.slang
+    STAGE compute ENTRY main TARGETS spirv)
 # SVGF/NRD denoiser kernels. Each is its own SPIR-V blob; the Vulkan
 # backend's VulkanNrdDenoiser builds a dedicated VkPipelineLayout +
 # 2 VkPipeline handles from these and dispatches them in sequence.

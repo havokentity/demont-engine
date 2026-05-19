@@ -877,6 +877,33 @@ private:
     // Zero on Vulkan today -- the Vulkan dispatch is a follow-up, the
     // engine gate folds correctly to "no aurora" when the id is 0.
     std::uint64_t                               aurora_composite_pipeline_id_ = 0;
+    // Wave 7 (#24): procedural raymarched cloud pre-pass + composite.
+    // clouds_raymarch_pipeline_id_   -- compute kernel that raymarches
+    //   the cloud layer in a dedicated pass BEFORE PathTrace. Writes
+    //   clouds_color_tex_ids_[active] (pre-multiplied RGBA in-scatter +
+    //   alpha) and cloud_trans_tex_id_ (R32F camera-ray transmittance,
+    //   same slot StarsComposite reads in pathtraced mode).
+    // clouds_composite_pipeline_id_  -- alpha-blends the pre-pass output
+    //   into the path-traced HDR (after StarsComposite, before bloom).
+    //
+    // BOTH pipelines are dispatched only when r_clouds_mode ==
+    // procedural_raymarched. The default pathtraced mode elides both
+    // dispatches entirely so the legacy code path pays zero per-frame
+    // cost. Registered on every backend so swapping the cvar at runtime
+    // doesn't need a backend rebuild.
+    std::uint64_t                               clouds_raymarch_pipeline_id_ = 0;
+    std::uint64_t                               clouds_composite_pipeline_id_ = 0;
+    // RGBA16F clouds-color G-buffers, ping-pong pair for temporal EMA.
+    // Frame N writes [active], reads [other]; engine swaps `active`
+    // index each frame so the previous-frame output is always
+    // available as the EMA history target. When the temporal_alpha
+    // cvar is 0 (default; golden-test-friendly), the kernel ignores
+    // the history texture so the swap is harmless but cheap.
+    std::uint64_t                               clouds_color_tex_ids_[2] = {0, 0};
+    std::uint32_t                               clouds_color_active_     = 0;
+    // Last-allocated dimensions; if the swapchain resizes we re-create.
+    std::uint32_t                               clouds_color_alloc_w_    = 0;
+    std::uint32_t                               clouds_color_alloc_h_    = 0;
     // Screen-space particle composite (#82 MVP). Same dispatch context
     // as stars/aurora -- runs in the use_engine_tonemap branch AFTER
     // those composites and BEFORE the bloom pyramid so HDR particle

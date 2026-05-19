@@ -89,6 +89,13 @@ extern const unsigned long shader_Tonemap_spirv_size;
 // per-slot rationale.
 extern const unsigned char shader_StarsComposite_spirv_data[];
 extern const unsigned long shader_StarsComposite_spirv_size;
+// Wave 7 (#24): procedural raymarched cloud pre-pass + composite.
+// Built unconditionally; engine elides the dispatch when r_clouds_mode
+// == pathtraced (default).
+extern const unsigned char shader_CloudsRaymarch_spirv_data[];
+extern const unsigned long shader_CloudsRaymarch_spirv_size;
+extern const unsigned char shader_CloudsComposite_spirv_data[];
+extern const unsigned long shader_CloudsComposite_spirv_size;
 }
 
 namespace pt::rhi::vk {
@@ -1450,6 +1457,22 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         build_pipeline("stars_composite",
                        shader_StarsComposite_spirv_data,
                        shader_StarsComposite_spirv_size);
+        // Wave 7 (#24): procedural raymarched cloud pre-pass and
+        // composite. Rides the shared 23-binding pipeline layout: the
+        // raymarch kernel uses bindings 0/1/2 (clouds_color_tex /
+        // cloud_trans_tex / clouds_color_prev) and gets Frame UBO at
+        // binding 14 for the parameter spill; the composite kernel uses
+        // bindings 0/1/2 (hdr_inout / clouds_color_tex / depth_tex).
+        // No special push-constant split needed -- both kernels' Push
+        // structs fit under the 112B hw cap on Vulkan.
+        // When r_clouds_mode == pathtraced (default) the engine never
+        // dispatches either pipeline, so registration is a one-time cost.
+        build_pipeline("clouds_raymarch",
+                       shader_CloudsRaymarch_spirv_data,
+                       shader_CloudsRaymarch_spirv_size);
+        build_pipeline("clouds_composite",
+                       shader_CloudsComposite_spirv_data,
+                       shader_CloudsComposite_spirv_size);
         pipelines_ready_.store(true, std::memory_order_release);
 
         // Skip the per-pipeline timing-string construction below tier 2.

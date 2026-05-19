@@ -890,6 +890,22 @@ cbuffer Push {
     // re-reading .y / .z on every prim hit.
     uint4 editor_params;
     // --- end Editor backend ---------------------------------------------------
+    // --- Clouds dual-mode gate (#24) -----------------------------------------
+    // clouds_runtime.x = r_clouds_mode enum
+    //                    0 = pathtraced (legacy inline cloud march runs
+    //                                    in this kernel, this slot un-used)
+    //                    1 = procedural_raymarched (the CloudsRaymarch
+    //                                    compute pre-pass owns the cloud
+    //                                    sampling; this kernel SKIPS the
+    //                                    entire cloud-march block and
+    //                                    also skips writing cloud_trans_tex,
+    //                                    leaving the pre-pass's value
+    //                                    in place for StarsComposite to read).
+    //              .y/.z/.w reserved.
+    // Defaults to 0 in unset configurations so the existing inline cloud
+    // path stays bit-for-bit preserved for old scenes / old configs.
+    uint4 clouds_runtime;
+    // --- end Clouds dual-mode gate -------------------------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -992,6 +1008,8 @@ cbuffer Frame {
     float4 water_state;
     // See `editor_params` in the Metal Push cbuffer above (agent-19).
     uint4 editor_params;
+    // See `clouds_runtime` in the Metal Push cbuffer above (#24, Wave 7).
+    uint4 clouds_runtime;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -5031,7 +5049,26 @@ void main(uint2 tid : SV_DispatchThreadID) {
             // still need to march, just with the slab clipped to span
             // the smoke layer rather than the (unset) cloud band.
             bool smoke_active = (smoke_params.y > 0.0) && (smoke_params.x > 0.0);
-            if (clouds_p1.w > 0.0 || smoke_active) {
+            // Wave 7 (#24): when r_clouds_mode == procedural_raymarched
+            // the inline cloud-march below is replaced by a dedicated
+            // compute pre-pass (CloudsRaymarch.slang). The pre-pass
+            // owns clouds_color_tex + cloud_trans_tex writes; PathTrace
+            // skips the cloud-density sampling entirely so the two
+            // modes don't double-count cloud in-scatter / cloud
+            // transmittance. The smoke-only branch below (when
+            // clouds_p1.w <= 0 && smoke_active) STILL runs since the
+            // raymarched cloud pre-pass doesn't handle smoke.
+            //
+            // Pathtraced mode (clouds_runtime.x == 0) preserves the
+            // existing inline march bit-for-bit -- this gate adds zero
+            // ALU on that path because the Slang optimizer constant-
+            // folds the comparison when the same value is supplied for
+            // every dispatch (default cvar = 0). Even on a runtime
+            // value, the cost is one uniform branch.
+            bool clouds_raymarched_mode = (clouds_runtime.x != 0u);
+            bool inline_cloud_march_active =
+                (clouds_p1.w > 0.0 && !clouds_raymarched_mode) || smoke_active;
+            if (inline_cloud_march_active) {
                 float base_y = clouds_p1.x;
                 float top_y  = clouds_p1.y;
                 // When the cloud field is off, drop the slab down to
@@ -5163,10 +5200,19 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         // #117 added clouds_p4 (curl-noise params).
                         // #100 added vol_density_scale multiplier + empty-cell
                         // skip optimization. Both layered.
-                        float cloud_dens = cloud_density_at(sp, clouds_p1,
-                                                      clouds_p2, clouds_p3,
-                                                      clouds_p4, 6)
-                                   * vol_density_scale;
+                        // Wave 7 (#24): when r_clouds_mode == raymarched
+                        // the cloud field is sampled entirely by the
+                        // CloudsRaymarch pre-pass; the inline march here
+                        // skips cloud_density_at to avoid double-counting
+                        // cloud in-scatter when the composite step layers
+                        // the pre-pass result on top of the PT output.
+                        // Smoke-only paths still get the normal behaviour
+                        // (smoke is NOT handled by the raymarch pre-pass).
+                        float cloud_dens = clouds_raymarched_mode
+                            ? 0.0
+                            : cloud_density_at(sp, clouds_p1,
+                                               clouds_p2, clouds_p3,
+                                               clouds_p4, 6) * vol_density_scale;
                         // Fluid Phase 1 (#136): add density-injection
                         // smoke contributions on top of the procedural
                         // cloud field. Smoke shares the cloud march's
@@ -5565,7 +5611,14 @@ void main(uint2 tid : SV_DispatchThreadID) {
     // when r_bloom=1 / r_denoiser=off. frame_cloud_trans defaults to
     // 1.0 (no cloud, no occlusion) and is overwritten by the volumetric
     // cloud march on sample 0 when the layer is active.
-    if (denoiser_enabled != 0u) {
+    //
+    // Wave 7 (#24): when r_clouds_mode == procedural_raymarched the
+    // CloudsRaymarch compute pre-pass already wrote cloud_trans_tex
+    // with the camera-ray transmittance from its raymarch. PathTrace
+    // must NOT overwrite that value here -- the pre-pass's number
+    // is the authoritative cloud transmittance in that mode.
+    // StarsComposite reads cloud_trans_tex identically in both modes.
+    if (denoiser_enabled != 0u && clouds_runtime.x == 0u) {
         cloud_trans_tex[tid] = frame_cloud_trans;
     }
     // Sun-NEE shadow-visibility G-buffer (issue #115). Same gating
