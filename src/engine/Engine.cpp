@@ -22,6 +22,7 @@
 #include "../core/Tracy.h"
 #include "../destruction/VoxelGrid.h"
 #include "../destruction/Voxelizer.h"
+#include "../editor/SceneGraph.h"
 #include "../renderer/Astronomy.h"
 #include "../renderer/BscCatalog.h"
 #include "../renderer/MoonTexture.h"
@@ -1538,6 +1539,40 @@ bool Engine::Init() {
     if (auto* p = C.FindCVar("net_line_port"))    sc.line_port = static_cast<std::uint16_t>(p->GetInt());
     if (auto* p = C.FindCVar("net_bind_address")) sc.bind_address = p->value;
     server_->Start(sc, &C);
+
+    // Editor backend (agent-19): wire WebSocket protocol hooks. Both
+    // run on the civetweb worker thread; the select handler is safe
+    // because it goes through QueueExecute (which is thread-safe). The
+    // scene-dump handler reads engine maps and is documented (per
+    // SerializeScene's threading notes) as caller-races-mutations'-
+    // problem -- in practice the only mutations come from
+    // Console::Drain on the main thread, and the dump reply is built
+    // off a single read of those maps, so a torn read is essentially
+    // impossible during normal play.
+    server_->SetSelectHandler(
+        [](std::string_view kind, std::uint32_t id) {
+            const int k = pt::editor::SelectionKindFromString(kind);
+            // QueueExecute is the canonical main-thread crossing. We
+            // funnel the selection through a console line so the same
+            // command path UI buttons / scripts use also flows here --
+            // future change-tracking (undo, history) plugs in once.
+            //
+            // Format: "select_set <kind> <id>" (a thin internal alias
+            // around SetSelection; registered below in RegisterCommands).
+            std::string line = fmt::format("select_set {} {}",
+                                           pt::editor::SelectionKindToString(k), id);
+            pt::console::Console::Get().QueueExecute(std::move(line),
+                                                     pt::console::Responder{});
+        });
+    server_->SetSceneDumpHandler([this]() -> std::string {
+        // Build the JSON tree on the worker thread. SerializeScene only
+        // reads `const` accessors; the caller-races-mutations contract
+        // means we trust the engine not to be tearing the maps apart
+        // while the worker thread is iterating. In the live use case
+        // (Drain runs on main, scene mutations land there too) this
+        // never races.
+        return pt::editor::SerializeScene(*this).dump();
+    });
 
     // Physics subsystem (#132) -- Verlet integrator + sphere-plane /
     // sphere-sphere collision. Allocated unconditionally so the
@@ -3516,13 +3551,23 @@ void Engine::EnsurePrimitivesUploaded() {
     // AnalyticPrim::type field matches.
     constexpr std::uint32_t kPrimPlane  = 1u;
 
-    std::vector<const AnalyticPrim*> infinite_prims;
-    std::vector<const AnalyticPrim*> finite_prims;
+    // Track each prim's user-facing id alongside its pointer so we can
+    // bake the id into v2.w of the packed GPU layout below. The editor
+    // outline shader (agent-19) compares this against the
+    // selected_prim_id push field; without uploading the id the shader
+    // would only see the GPU-reorder index (post-BVH permutation),
+    // which has no stable user-visible meaning.
+    struct PrimWithId {
+        const AnalyticPrim* p;
+        std::uint32_t       id;
+    };
+    std::vector<PrimWithId> infinite_prims;
+    std::vector<PrimWithId> finite_prims;
     infinite_prims.reserve(count);
     finite_prims.reserve(count);
     for (const auto& [id, p] : primitives_) {
-        if (p.type == kPrimPlane) infinite_prims.push_back(&p);
-        else                       finite_prims.push_back(&p);
+        if (p.type == kPrimPlane) infinite_prims.push_back({&p, id});
+        else                       finite_prims.push_back({&p, id});
     }
 
     // Decide whether to build the BVH. Default threshold is 16 finite
@@ -3556,7 +3601,7 @@ void Engine::EnsurePrimitivesUploaded() {
         std::vector<pt::renderer::BvhPrim> bvh_input;
         bvh_input.reserve(finite_prims.size());
         for (std::uint32_t i = 0; i < finite_prims.size(); ++i) {
-            const AnalyticPrim& p = *finite_prims[i];
+            const AnalyticPrim& p = *finite_prims[i].p;
             pt::renderer::BvhPrim bp{};
             float cx = p.pos_or_n[0];
             float cy = p.pos_or_n[1];
@@ -3603,7 +3648,8 @@ void Engine::EnsurePrimitivesUploaded() {
     //                                            BVH leaf order (if BVH built)
     //                                            or in arbitrary order (linear path)
     std::vector<float> packed(std::size_t(count) * kFloatsPerPrim, 0.0f);
-    auto pack_prim = [&](std::size_t out_idx, const AnalyticPrim& p) {
+    auto pack_prim = [&](std::size_t out_idx, const AnalyticPrim& p,
+                         std::uint32_t user_id) {
         std::size_t off = out_idx * kFloatsPerPrim;
         // v0 -- xyz: center / normal,  w: radius / d
         packed[off + 0]  = p.pos_or_n[0];
@@ -3615,11 +3661,20 @@ void Engine::EnsurePrimitivesUploaded() {
         packed[off + 5]  = p.albedo[1];
         packed[off + 6]  = p.albedo[2];
         packed[off + 7]  = p.roughness;
-        // v2 -- x: type, y: material, z: ior, w: pad
+        // v2 -- x: type, y: material, z: ior, w: user prim id (uint
+        // reinterpreted as float; recovered shader-side via asuint()).
+        // The id was previously an unused 0.0f pad; the editor backend
+        // (agent-19) repurposed it so PathTrace.slang can compare a
+        // hit's prim id against editor_params.x for the outline gate.
+        // Same asuint() pattern bvh_nodes.w lanes already use.
         packed[off + 8]  = static_cast<float>(p.type);
         packed[off + 9]  = static_cast<float>(p.material);
         packed[off + 10] = p.ior;
-        packed[off + 11] = 0.0f;
+        {
+            float id_as_float;
+            std::memcpy(&id_as_float, &user_id, sizeof(float));
+            packed[off + 11] = id_as_float;
+        }
         // v3 -- xyz: prev_pos (motion blur, #85), w: pad. The shader
         // reads this when r_motion_blur != 0 to lerp the sphere center
         // at the ray's shutter time. Layout collapses to a no-op when
@@ -3638,10 +3693,11 @@ void Engine::EnsurePrimitivesUploaded() {
         packed[off + 19] = 0.0f;
     };
     for (std::size_t i = 0; i < infinite_prims.size(); ++i) {
-        pack_prim(i, *infinite_prims[i]);
+        pack_prim(i, *infinite_prims[i].p, infinite_prims[i].id);
     }
     for (std::size_t i = 0; i < finite_order.size(); ++i) {
-        pack_prim(linear_prim_count_ + i, *finite_prims[finite_order[i]]);
+        const auto& src = finite_prims[finite_order[i]];
+        pack_prim(linear_prim_count_ + i, *src.p, src.id);
     }
     device_->WriteBuffer(pt::rhi::BufferHandle{prim_buffer_id_},
                          packed.data(), packed.size() * sizeof(float));
@@ -8975,6 +9031,159 @@ void Engine::UpdateCamera(double dt) {
     }
 }
 
+// --- Editor backend (agent-19) -------------------------------------------
+void Engine::SetSelection(SelectionKind kind, std::uint32_t id) {
+    // None always pairs with id=0 so the (kind, id) state is canonical:
+    // ambiguity between "kind=None, id=42" and "kind=AnalyticPrim, id=0"
+    // would let outline tests misbehave.
+    if (kind == SelectionKind::None) id = 0;
+
+    const bool changed = (kind != selected_kind_) || (id != selected_prim_id_);
+    if (!changed) return;
+
+    selected_kind_     = kind;
+    selected_prim_id_  = id;
+    // Outline visibility changes the rendered image even though the
+    // scene geometry is unchanged -- accumulating onto the previous
+    // history would leave a ghost of the OLD selection. accum_dirty_
+    // resets the EMA / running-mean accumulator so the next frame is a
+    // clean sample of the new outline state.
+    accum_dirty_       = true;
+
+    // Notify connected editor clients. The kind / id payload mirrors
+    // the WebSocket `select` incoming message so the same parser works
+    // for both directions. SerializeScene's "selection" field also
+    // matches this schema. We emit even when there's no server bound
+    // (no-op) so the call site doesn't need a redundant guard.
+    if (server_) {
+        const char* kind_str = pt::editor::SelectionKindToString(static_cast<int>(kind));
+        auto data = fmt::format(R"({{"kind":"{}","id":{}}})", kind_str, id);
+        server_->BroadcastEvent("selection_change", data);
+    }
+}
+
+void Engine::HandleMouseInput() {
+    // Bail if any prerequisite isn't satisfied. We also reset the
+    // edge-detect latch so releasing the gating condition (closing the
+    // console overlay, releasing RMB) doesn't immediately fire a
+    // spurious pick from a button that was held during the suppressed
+    // interval.
+    if (!window_ || !camera_) {
+        lmb_was_down_ = false;
+        return;
+    }
+    // RMB = mouse-look mode; suppress picks because the cursor is
+    // captured and the user is panning the view.
+    if (window_->IsMouseButtonDown(1)) {
+        lmb_was_down_ = false;
+        return;
+    }
+    // Console overlay focus: a click inside the overlay should be
+    // consumed by the overlay's text field, not by the viewport pick
+    // path. Treat "shown" as "focused" for the purposes of this gate;
+    // it's a strict superset, and the cost is one extra frame of pick
+    // suppression when the user opens the overlay -- not noticeable.
+    if (overlay_ && overlay_->IsShown()) {
+        lmb_was_down_ = false;
+        return;
+    }
+
+    const bool lmb_now = window_->IsMouseButtonDown(0);
+    if (!lmb_now) {
+        lmb_was_down_ = false;
+        return;
+    }
+    // Edge detect: only fire on the press, not on every frame the
+    // button is held. Without this a held click would re-pick whatever
+    // is under the cursor every frame, which feels broken (and burns
+    // accum resets).
+    if (lmb_was_down_) return;
+    lmb_was_down_ = true;
+
+    // Map window-local cursor position to a primary ray. We use the
+    // window's content-area dimensions (NOT the framebuffer pixels on
+    // high-DPI: GLFW's cursor is in screen units, and so is
+    // Window::Width/Height). The path tracer's camera basis uses the
+    // same convention so a cursor at the center of the viewport maps
+    // exactly to the center primary ray. Slight DPI mismatch on
+    // 2x-scale Mac displays produces a sub-pixel offset that's well
+    // inside the click tolerance of the sphere intersect.
+    double cx = 0.0, cy = 0.0;
+    window_->GetCursorPos(cx, cy);
+    const int w = window_->Width();
+    const int h = window_->Height();
+    if (w <= 0 || h <= 0) return;
+    // Clamp to viewport so an out-of-window cursor doesn't produce a
+    // wildly off-axis ray. Negative / over-max coords come from GLFW
+    // briefly during window-drag operations.
+    if (cx < 0.0)       cx = 0.0;
+    if (cx > double(w)) cx = double(w);
+    if (cy < 0.0)       cy = 0.0;
+    if (cy > double(h)) cy = double(h);
+
+    // NDC-space pixel coordinates: (-1..+1) horizontally, (+1..-1)
+    // vertically (Y flipped because cursor origin is top-left while
+    // ray Y points up). Pixel center offset of 0.5 keeps the math
+    // consistent with the shader's gl_GlobalInvocationID.xy + 0.5 form.
+    const float u = (float(cx) + 0.5f) / float(w) * 2.0f - 1.0f;
+    const float v = 1.0f - (float(cy) + 0.5f) / float(h) * 2.0f;
+    const float aspect = float(w) / float(h);
+    const float tan_half_fov = camera_->FovYTan();
+
+    const glm::vec3 fwd   = camera_->Forward();
+    const glm::vec3 right = camera_->Right();
+    const glm::vec3 up    = camera_->Up();
+    const glm::vec3 ro    = camera_->pos;
+    const glm::vec3 rd    = glm::normalize(
+        fwd + right * (u * aspect * tan_half_fov) + up * (v * tan_half_fov));
+
+    // Walk primitives_ for the nearest hit. Match the GPU shader's
+    // intersectSphere / intersectPlane epsilons (1e-4f on the
+    // positive-t check) so the CPU pick agrees with what the user
+    // visually saw -- a sphere that's visibly painted on-pixel always
+    // accepts the click.
+    std::uint32_t best_id = 0;
+    float         best_t  = 1e30f;
+    bool          best_hit = false;
+    for (const auto& [id, p] : primitives_) {
+        float t = 0.0f;
+        if (p.type == AnalyticPrim::Sphere) {
+            const glm::vec3 c{p.pos_or_n[0], p.pos_or_n[1], p.pos_or_n[2]};
+            const glm::vec3 oc = ro - c;
+            const float bb = glm::dot(oc, rd);
+            const float cc = glm::dot(oc, oc) - p.radius_or_d * p.radius_or_d;
+            const float disc = bb * bb - cc;
+            if (disc < 0.0f) continue;
+            const float h_ = std::sqrt(disc);
+            const float t0 = -bb - h_;
+            const float t1 = -bb + h_;
+            if (t0 > 1e-4f) t = t0;
+            else if (t1 > 1e-4f) t = t1;
+            else continue;
+        } else {
+            // Plane. n.p + d = 0; ray hits at t = -(n.ro + d) / (n.rd).
+            const glm::vec3 n{p.pos_or_n[0], p.pos_or_n[1], p.pos_or_n[2]};
+            const float denom = glm::dot(n, rd);
+            if (std::fabs(denom) < 1e-6f) continue;
+            const float th = -(glm::dot(n, ro) + p.radius_or_d) / denom;
+            if (th <= 1e-4f) continue;
+            t = th;
+        }
+        if (t < best_t) {
+            best_t   = t;
+            best_id  = id;
+            best_hit = true;
+        }
+    }
+
+    if (best_hit) {
+        SetSelection(SelectionKind::AnalyticPrim, best_id);
+    } else {
+        SetSelection(SelectionKind::None, 0);
+    }
+}
+// --- end Editor backend --------------------------------------------------
+
 void Engine::Tick(double dt) {
     PT_ZONE_SCOPED_N("Engine::Tick");
     pt::console::Console::Get().Drain();
@@ -9030,6 +9239,13 @@ void Engine::Tick(double dt) {
     }
 
     UpdateCamera(dt);
+
+    // Editor mode (agent-19): LMB raycast pick. Runs after UpdateCamera
+    // so the camera basis the picker uses for ray construction matches
+    // exactly what the path tracer will dispatch on this frame's
+    // RenderFrame. Internally suppressed when RMB is held (mouse-look
+    // is active) or the console overlay is shown.
+    HandleMouseInput();
 
     // Audio listener update: push the freshest camera pose into the
     // audio subsystem so distance attenuation + stereo pan track the
@@ -12532,6 +12748,332 @@ void Engine::RegisterPrimCommands() {
             out.FormatLine("primitives: plane id={} ({} n=({:.2f} {:.2f} {:.2f}) d={:.3f})",
                            id, MaterialName(mat), nx, ny, nz, d);
         });
+
+    // --- Editor backend (agent-19) property-edit dispatch -------------------
+    // Fine-grained mutators for the editor agents' property panels. Each
+    // sets primitives_dirty_ + accum_dirty_ so the GPU sees the update
+    // (BVH refit + accum reset) on the next frame. Going through the
+    // console keeps the change-tracking + WebSocket scene_dirty broadcast
+    // path in the loop -- UI agents MUST NOT mutate primitives_ directly.
+    //
+    // Undo: skipped for prim ops in this PR (the cvar-undo snapshot
+    // mechanism only tracks cvars, not the primitives map). Flagged as a
+    // follow-up for the editor roadmap; once a prim-undo recorder lands
+    // it will hook in here.
+
+    auto find_prim = [this](std::string_view sv,
+                            pt::console::Output& out,
+                            std::uint32_t& out_id,
+                            AnalyticPrim*& out_prim) -> bool {
+        if (!ParseUint(sv, out_id)) {
+            out.FormatLine("prim id parse failed: '{}'", sv);
+            return false;
+        }
+        auto it = primitives_.find(out_id);
+        if (it == primitives_.end()) {
+            out.FormatLine("prim id {} not found", out_id);
+            return false;
+        }
+        out_prim = &it->second;
+        return true;
+    };
+
+    auto broadcast_scene_dirty = [this]() {
+        if (server_) {
+            // Clients should re-fetch via list_scene; the payload is a
+            // single tombstone field rather than a per-prim diff so the
+            // server-side state stays O(1) per mutation regardless of
+            // how many editor clients are connected.
+            server_->BroadcastEvent("scene_dirty", "{}");
+        }
+    };
+
+    C.RegisterCommand("prim_set_pos",
+        "prim_set_pos <id> <x> <y> <z>: move a primitive (sphere center or "
+        "plane normal). For planes, the magnitude is normalized.",
+        [this, find_prim, broadcast_scene_dirty]
+        (auto args, pt::console::Output& out) {
+            if (args.size() != 4) {
+                out.PrintLine("usage: prim_set_pos <id> <x> <y> <z>");
+                return;
+            }
+            std::uint32_t id; AnalyticPrim* p = nullptr;
+            if (!find_prim(args[0], out, id, p)) return;
+            float x, y, z;
+            if (!ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z)) {
+                out.PrintLine("prim_set_pos: float parse failed");
+                return;
+            }
+            if (p->type == AnalyticPrim::Plane) {
+                // Treat (x,y,z) as the new plane normal; renormalize so a
+                // typed (1,1,0) becomes a valid unit vector before
+                // upload. Same magnitude check `prim_plane` uses.
+                const float len = std::sqrt(x*x + y*y + z*z);
+                if (len < 1e-6f) {
+                    out.PrintLine("prim_set_pos: zero-magnitude plane normal");
+                    return;
+                }
+                x /= len; y /= len; z /= len;
+            }
+            p->pos_or_n[0] = x; p->pos_or_n[1] = y; p->pos_or_n[2] = z;
+            // Sphere prev_pos is normally the previous frame's position
+            // (motion blur). A direct teleport via prim_set_pos should
+            // produce a zero-length streak on the next frame -- snap
+            // prev to the new pos. Plane prev mirrors pos by convention.
+            p->prev_pos_or_n[0] = x; p->prev_pos_or_n[1] = y; p->prev_pos_or_n[2] = z;
+            primitives_dirty_ = true;
+            accum_dirty_      = true;
+            broadcast_scene_dirty();
+            out.FormatLine("prim_set_pos: id {} -> ({:.3f} {:.3f} {:.3f})", id, x, y, z);
+        });
+
+    C.RegisterCommand("prim_set_albedo",
+        "prim_set_albedo <id> <r> <g> <b>: set primitive base color (linear).",
+        [this, find_prim, broadcast_scene_dirty]
+        (auto args, pt::console::Output& out) {
+            if (args.size() != 4) {
+                out.PrintLine("usage: prim_set_albedo <id> <r> <g> <b>");
+                return;
+            }
+            std::uint32_t id; AnalyticPrim* p = nullptr;
+            if (!find_prim(args[0], out, id, p)) return;
+            float r, g, b;
+            if (!ParseFloat(args[1], r) || !ParseFloat(args[2], g) || !ParseFloat(args[3], b)) {
+                out.PrintLine("prim_set_albedo: float parse failed");
+                return;
+            }
+            p->albedo[0] = r; p->albedo[1] = g; p->albedo[2] = b;
+            // Drop the cached pre-viz albedo (#181) -- next falling-edge
+            // restore would otherwise paint the previous albedo over the
+            // value the user just typed.
+            phys_debug_color_cache_.erase(id);
+            primitives_dirty_ = true;
+            accum_dirty_      = true;
+            broadcast_scene_dirty();
+            out.FormatLine("prim_set_albedo: id {} -> ({:.3f} {:.3f} {:.3f})", id, r, g, b);
+        });
+
+    C.RegisterCommand("prim_set_emission",
+        "prim_set_emission <id> <r> <g> <b>: set per-prim radiant emission "
+        "(W/sr per channel). Non-zero makes the prim self-luminous (#181).",
+        [this, find_prim, broadcast_scene_dirty]
+        (auto args, pt::console::Output& out) {
+            if (args.size() != 4) {
+                out.PrintLine("usage: prim_set_emission <id> <r> <g> <b>");
+                return;
+            }
+            std::uint32_t id; AnalyticPrim* p = nullptr;
+            if (!find_prim(args[0], out, id, p)) return;
+            float r, g, b;
+            if (!ParseFloat(args[1], r) || !ParseFloat(args[2], g) || !ParseFloat(args[3], b)) {
+                out.PrintLine("prim_set_emission: float parse failed");
+                return;
+            }
+            p->emission[0] = r; p->emission[1] = g; p->emission[2] = b;
+            primitives_dirty_ = true;
+            accum_dirty_      = true;
+            broadcast_scene_dirty();
+            out.FormatLine("prim_set_emission: id {} -> ({:.3f} {:.3f} {:.3f})", id, r, g, b);
+        });
+
+    C.RegisterCommand("prim_set_roughness",
+        "prim_set_roughness <id> <v>: 0 = mirror, 1 = fully rough. "
+        "Mainly affects MAT_METAL surfaces.",
+        [this, find_prim, broadcast_scene_dirty]
+        (auto args, pt::console::Output& out) {
+            if (args.size() != 2) {
+                out.PrintLine("usage: prim_set_roughness <id> <v>");
+                return;
+            }
+            std::uint32_t id; AnalyticPrim* p = nullptr;
+            if (!find_prim(args[0], out, id, p)) return;
+            float v;
+            if (!ParseFloat(args[1], v)) {
+                out.PrintLine("prim_set_roughness: float parse failed");
+                return;
+            }
+            if (v < 0.0f) v = 0.0f;
+            if (v > 1.0f) v = 1.0f;
+            p->roughness = v;
+            primitives_dirty_ = true;
+            accum_dirty_      = true;
+            broadcast_scene_dirty();
+            out.FormatLine("prim_set_roughness: id {} -> {:.3f}", id, v);
+        });
+
+    C.RegisterCommand("prim_set_ior",
+        "prim_set_ior <id> <v>: refractive index (dielectric / water).",
+        [this, find_prim, broadcast_scene_dirty]
+        (auto args, pt::console::Output& out) {
+            if (args.size() != 2) {
+                out.PrintLine("usage: prim_set_ior <id> <v>");
+                return;
+            }
+            std::uint32_t id; AnalyticPrim* p = nullptr;
+            if (!find_prim(args[0], out, id, p)) return;
+            float v;
+            if (!ParseFloat(args[1], v)) {
+                out.PrintLine("prim_set_ior: float parse failed");
+                return;
+            }
+            // Clamp to the same [1.0, 2.4] range the water-Phase 1 shader
+            // uses; outside this range the Fresnel + refraction math
+            // produces visually broken results (TIR everywhere or
+            // negative critical-angle).
+            if (v < 1.0f) v = 1.0f;
+            if (v > 2.4f) v = 2.4f;
+            p->ior = v;
+            primitives_dirty_ = true;
+            accum_dirty_      = true;
+            broadcast_scene_dirty();
+            out.FormatLine("prim_set_ior: id {} -> {:.3f}", id, v);
+        });
+
+    C.RegisterCommand("prim_set_material",
+        "prim_set_material <id> <lambert|metal|dielectric|water>: swap "
+        "BRDF model. Existing albedo / roughness / ior are preserved.",
+        [this, find_prim, broadcast_scene_dirty]
+        (auto args, pt::console::Output& out) {
+            if (args.size() != 2) {
+                out.PrintLine("usage: prim_set_material <id> <lambert|metal|dielectric|water>");
+                return;
+            }
+            std::uint32_t id; AnalyticPrim* p = nullptr;
+            if (!find_prim(args[0], out, id, p)) return;
+            AnalyticPrim::Material mat;
+            if (!ParseMaterial(args[1], mat)) {
+                out.FormatLine("prim_set_material: unknown material '{}' "
+                               "(want lambert|metal|dielectric|water)",
+                               args[1]);
+                return;
+            }
+            p->material = mat;
+            primitives_dirty_ = true;
+            accum_dirty_      = true;
+            broadcast_scene_dirty();
+            out.FormatLine("prim_set_material: id {} -> {}", id, MaterialName(mat));
+        });
+
+    C.RegisterCommand("prim_delete",
+        "prim_delete <id>: remove a primitive (editor alias for prim_remove). "
+        "Clears the editor selection when the deleted prim was selected.",
+        [this, broadcast_scene_dirty](auto args, pt::console::Output& out) {
+            if (args.size() != 1) {
+                out.PrintLine("usage: prim_delete <id>");
+                return;
+            }
+            std::uint32_t id;
+            if (!ParseUint(args[0], id)) {
+                out.PrintLine("prim_delete: id parse failed");
+                return;
+            }
+            if (primitives_.erase(id) == 0) {
+                out.FormatLine("prim_delete: id {} not found", id);
+                return;
+            }
+            phys_debug_color_cache_.erase(id);
+            // Drop the editor selection if it pointed at the body we
+            // just deleted -- otherwise the outline shader would chase
+            // a now-dangling id forever (a freshly-spawned prim that
+            // reuses the slot would pick up the highlight).
+            if (selected_kind_ == SelectionKind::AnalyticPrim &&
+                selected_prim_id_ == id) {
+                SetSelection(SelectionKind::None, 0);
+            }
+            primitives_dirty_ = true;
+            accum_dirty_      = true;
+            broadcast_scene_dirty();
+            out.FormatLine("prim_delete: removed id {}", id);
+        });
+
+    C.RegisterCommand("prim_duplicate",
+        "prim_duplicate <id>: clone a primitive into a new id, return the "
+        "new id. The new id is the next available slot above the source.",
+        [this, broadcast_scene_dirty](auto args, pt::console::Output& out) {
+            if (args.size() != 1) {
+                out.PrintLine("usage: prim_duplicate <id>");
+                return;
+            }
+            std::uint32_t id;
+            if (!ParseUint(args[0], id)) {
+                out.PrintLine("prim_duplicate: id parse failed");
+                return;
+            }
+            auto it = primitives_.find(id);
+            if (it == primitives_.end()) {
+                out.FormatLine("prim_duplicate: id {} not found", id);
+                return;
+            }
+            // Find the next unused id. Walk from max(source+1, 1).
+            // O(N) over the primitives map -- fine for hundreds of
+            // entries; the editor doesn't need a faster allocator
+            // here. Start above the source so a freshly-typed
+            // `prim_duplicate 1` lands at id=2 (if free) for an
+            // intuitive sequential id pattern.
+            std::uint32_t new_id = id + 1u;
+            if (new_id == 0u) new_id = 1u;  // wraparound paranoia
+            while (primitives_.count(new_id) != 0u) {
+                ++new_id;
+                if (new_id == 0u) {
+                    out.PrintLine("prim_duplicate: id space exhausted");
+                    return;
+                }
+            }
+            AnalyticPrim copy = it->second;
+            primitives_[new_id] = copy;
+            primitives_dirty_ = true;
+            accum_dirty_      = true;
+            broadcast_scene_dirty();
+            out.FormatLine("prim_duplicate: cloned id {} -> {}", id, new_id);
+        });
+    // --- end Editor backend property-edit dispatch -------------------------
+
+    // --- Editor backend (agent-19) scene-graph dump command ----------------
+    // Returns the same JSON tree the WebSocket `list_scene` message
+    // produces. Useful at the console prompt for ad-hoc scene
+    // inspection without a UI client connected.
+    C.RegisterCommand("scene_dump_json",
+        "Print the editor scene-graph snapshot (primitives / lights / sdf / "
+        "rigid bodies + current selection) as a JSON tree.",
+        [this](auto, pt::console::Output& out) {
+            const auto j = pt::editor::SerializeScene(*this);
+            // dump(2) for human-readable pretty-print; the WebSocket
+            // path uses dump() (compact) since the wire is parsed.
+            out.PrintLine(j.dump(2));
+        });
+    // --- end Editor backend scene-graph dump -------------------------------
+
+    // --- Editor backend (agent-19) selection setter ------------------------
+    // Thin console wrapper around Engine::SetSelection so the
+    // WebSocket select handler can route through QueueExecute -> Drain
+    // and land on the main thread for the actual state mutation. Also
+    // exposed to scripts so an autoexec can seed an initial selection
+    // for e.g. a scripted scene tour.
+    //
+    // Format: `select_set <none|prim|light|sdf|rb> <id>`
+    // none + id=0 clears the selection. Any other (kind, id=0) pair is
+    // treated as a clear too (SetSelection normalises None to id=0
+    // anyway). Unknown kind strings fall through to "none" so a
+    // mistyped command doesn't silently latch a wrong-kind selection.
+    C.RegisterCommand("select_set",
+        "select_set <none|prim|light|sdf|rb> <id>: set the editor "
+        "selection. Used by the WebSocket select message and scripts.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 2) {
+                out.PrintLine("usage: select_set <none|prim|light|sdf|rb> <id>");
+                return;
+            }
+            const int kind_int = pt::editor::SelectionKindFromString(args[0]);
+            std::uint32_t id = 0;
+            if (!ParseUint(args[1], id)) {
+                out.PrintLine("select_set: id parse failed");
+                return;
+            }
+            SetSelection(static_cast<SelectionKind>(kind_int), id);
+            out.FormatLine("select_set: kind={} id={}",
+                           pt::editor::SelectionKindToString(kind_int), id);
+        });
+    // --- end Editor backend selection setter -------------------------------
 }
 
 // --- SDF Phase 1 (#97) -----------------------------------------------------

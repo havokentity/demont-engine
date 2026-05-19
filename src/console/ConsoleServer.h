@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -59,6 +60,24 @@ public:
     // (e.g. R"({"fps":142.3})").
     void BroadcastEvent(std::string_view topic, std::string_view data_json);
 
+    // --- Editor backend (agent-19) ---------------------------------------
+    // Hooks for the editor-mode WebSocket protocol. Each callback runs
+    // on the civetweb worker thread that handled the inbound message,
+    // so implementations MUST either be lock-free + thread-safe (the
+    // selection setter can do this trivially -- it's a single (kind,id)
+    // pair) or queue a console command via Console::QueueExecute for
+    // main-thread execution. The serializer returns a JSON string body
+    // ready to embed in the WebSocket reply.
+    //
+    // Both hooks default to no-op when unset: `list_scene` replies with
+    // an empty object, `select` becomes a parse-only acknowledgement.
+    // The engine wires both in Init() right after Start().
+    using SelectFn = std::function<void(std::string_view kind, std::uint32_t id)>;
+    using SceneDumpFn = std::function<std::string()>;
+    void SetSelectHandler(SelectFn fn)        { select_handler_     = std::move(fn); }
+    void SetSceneDumpHandler(SceneDumpFn fn)  { scene_dump_handler_ = std::move(fn); }
+    // --- end Editor backend ----------------------------------------------
+
     // Forward a log line to subscribers of the "log" topic.  Wired as a
     // pt::log::Sink at startup.
     static void OnLog(pt::log::Level level, const std::string& body);
@@ -98,6 +117,16 @@ private:
     socket_handle_t       line_fd_  = kInvalidSocket;
     std::thread           line_thread_;
     std::vector<std::thread> line_workers_;
+
+    // --- Editor backend (agent-19) ---------------------------------------
+    // Set via SetSelectHandler / SetSceneDumpHandler. Read inside
+    // HandleWsMessage on the civetweb worker thread; the engine sets
+    // these once at Init time so a mutex is unnecessary (write-once
+    // before any WebSocket clients can connect, since the listener
+    // only accepts after Start() returns).
+    SelectFn              select_handler_;
+    SceneDumpFn           scene_dump_handler_;
+    // --- end Editor backend ----------------------------------------------
 };
 
 }  // namespace pt::console
