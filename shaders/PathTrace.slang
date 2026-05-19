@@ -3999,8 +3999,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // Per-ray "is this segment travelling through a water medium?" flag.
         // Initialised from water_state.x (host scans analytic primitives at
         // push setup time and sets 1.0 when the camera position is below
-        // any MAT_WATER plane). Flipped by the MAT_WATER / MAT_DIELECTRIC
-        // refract paths in the bounce loop below.
+        // any MAT_WATER plane). Flipped only by the MAT_WATER refract path
+        // in the bounce loop below.
         //
         // When in_water == 1 the per-bounce step:
         //   * applies exp(-water_params0.xyz * segment_length) to throughput
@@ -4012,8 +4012,14 @@ void main(uint2 tid : SV_DispatchThreadID) {
         //     the bright horizon when the scene runs out of geometry below
         //     the water plane.
         //
-        // TIR at MAT_WATER / MAT_DIELECTRIC keeps in_water unchanged (the
-        // ray stays in the same medium); only the refract branch toggles.
+        // TIR at MAT_WATER keeps in_water unchanged (the ray stays in the
+        // same medium); only the refract branch toggles. MAT_DIELECTRIC is
+        // intentionally left out of the flip -- a glass body submerged in
+        // water is rare enough that the simplification (continue
+        // attenuating with water absorption for the short segment inside
+        // the glass) is preferable to a per-bounce stack of medium
+        // identifiers. Documented as a Phase 4 simplification; a proper
+        // multi-medium stack lands in Phase 5 SSS work.
         int in_water = (water_state.x > 0.5) ? 1 : 0;
         // --- end Underwater medium tracking ---------------------------------
 

@@ -7297,12 +7297,14 @@ void Engine::RenderFrame() {
     //          integral.
     {
         // Scan analytic primitives for MAT_WATER planes. Each MAT_WATER
-        // plane is defined by normal `pos_or_n` and offset `radius_or_d`
-        // (so the plane equation is dot(normal, x) = d). The camera is
-        // "below" the surface if dot(normal, cam_pos) <= d -- i.e. the
-        // camera sits on the side opposite the normal. For the typical
-        // horizontal water plane (normal = (0, 1, 0), d = surface_y),
-        // this collapses to cam.pos.y <= d.
+        // plane is defined by normal `pos_or_n` and offset `radius_or_d`,
+        // following the engine's plane convention `dot(n, p) + d = 0`
+        // (the same form `prim_plane`'s help text documents and that
+        // intersectPlane uses on both CPU and shader paths). The camera
+        // sits "below" the surface -- on the side opposite the normal --
+        // when dot(n, cam) + d <= 0. For the typical horizontal water
+        // surface at y = H stored as normal = (0, 1, 0) + d = -H, this
+        // collapses to cam.pos.y <= H, which is what users expect.
         //
         // Multiple water planes are allowed (e.g. an indoor pool above
         // an aquarium): camera is in-water if it sits below ANY of them.
@@ -7318,8 +7320,9 @@ void Engine::RenderFrame() {
             const float ny = p.pos_or_n[1];
             const float nz = p.pos_or_n[2];
             const float d  = p.radius_or_d;
-            const float side = nx * cam.pos.x + ny * cam.pos.y + nz * cam.pos.z;
-            if (side <= d) { cam_in_water = true; break; }
+            const float signed_dist =
+                nx * cam.pos.x + ny * cam.pos.y + nz * cam.pos.z + d;
+            if (signed_dist <= 0.0f) { cam_in_water = true; break; }
         }
         float deep_r = 0.0f, deep_g = 0.0f, deep_b = 0.0f;
         if (auto* v = C.FindCVar("r_water_deep_color_r")) deep_r = v->GetFloat();
