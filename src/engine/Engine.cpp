@@ -7306,6 +7306,16 @@ void Engine::RenderFrame() {
         // surface at y = H stored as normal = (0, 1, 0) + d = -H, this
         // collapses to cam.pos.y <= H, which is what users expect.
         //
+        // Orientation: PR #207 added a unit quaternion per analytic prim
+        // (AnalyticPrim::orient[4]) that the shader uses to rotate plane
+        // normals at intersect time via quatRotate (see PRIM_PLANE branch
+        // in testAnalyticPrim). We mirror that rotation here so a rotated
+        // water plane's below-the-surface half-space matches what the
+        // shader actually intersects; otherwise a non-identity orient
+        // would seed in_water from the stored (unrotated) half-space,
+        // not the visible one. Identity orient (0, 0, 0, 1) collapses
+        // to the original n_raw so unrotated planes are unchanged.
+        //
         // Multiple water planes are allowed (e.g. an indoor pool above
         // an aquarium): camera is in-water if it sits below ANY of them.
         // Conservative AND-vs-OR: a configuration of two water planes
@@ -7316,12 +7326,19 @@ void Engine::RenderFrame() {
         for (const auto& [id, p] : primitives_) {
             if (p.type != AnalyticPrim::Plane) continue;
             if (p.material != AnalyticPrim::Water) continue;
-            const float nx = p.pos_or_n[0];
-            const float ny = p.pos_or_n[1];
-            const float nz = p.pos_or_n[2];
+            // Rotate the stored normal by the orientation quaternion --
+            // matches the shader's PRIM_PLANE quatRotate path (see
+            // PathTrace.slang testAnalyticPrim). quatRotate(q, v) =
+            // v + 2 * cross(u, cross(u, v) + w * v) with q = (u, w).
+            const glm::vec3 n_raw{p.pos_or_n[0], p.pos_or_n[1],
+                                  p.pos_or_n[2]};
+            const glm::vec3 u{p.orient[0], p.orient[1], p.orient[2]};
+            const float    qw = p.orient[3];
+            const glm::vec3 n =
+                n_raw + 2.0f * glm::cross(u, glm::cross(u, n_raw) + qw * n_raw);
             const float d  = p.radius_or_d;
             const float signed_dist =
-                nx * cam.pos.x + ny * cam.pos.y + nz * cam.pos.z + d;
+                n.x * cam.pos.x + n.y * cam.pos.y + n.z * cam.pos.z + d;
             if (signed_dist <= 0.0f) { cam_in_water = true; break; }
         }
         float deep_r = 0.0f, deep_g = 0.0f, deep_b = 0.0f;
