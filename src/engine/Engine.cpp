@@ -344,6 +344,21 @@ namespace cvar {
     PT_CVAR(r_quality,         "high",  "Master quality preset that drives r_spp, r_max_bounces, r_caustics, r_refract_bounces, etc. Options: low (fast, no caustics), medium (default-ish), high (caustics, more bounces), ultra (max). 'custom' leaves per-feature cvars as-is.", CVAR_ARCHIVE);
     PT_CVAR(r_caustics,        "1",  "Refractive shadow rays. 1 = NEE rays refract through dielectrics so glass/diamond produce caustic patterns; 0 = treat all dielectrics as opaque shadow blockers (faster, blocks any caustic). Path-tracer-correct in both modes.", CVAR_ARCHIVE);
     PT_CVAR(r_refract_bounces, "4",  "Maximum dielectric refractions a single shadow ray may chain through before giving up (returns no contribution). Higher catches more multi-facet caustics; lower is faster. NOTE: water (#134) shares this budget -- needs >=1 to see refracted underwater geometry.", CVAR_ARCHIVE);
+    // ---- Editor backend (agent-19 / PR #201) -------------------------------
+    // Master gate for the magenta silhouette outline drawn around the
+    // currently-selected analytic primitive. The host folds this gate
+    // into PtPush::editor_params.y (and forces .x to 0 when this is 0)
+    // so the shader can early-out on a single uint compare. 1 = outline
+    // visible when an AnalyticPrim is selected; 0 = no outline regardless
+    // of selection. Bit-identical to pre-PR-#201 frames when no selection
+    // is set even with the gate on.
+    PT_CVAR(r_editor_outline, "1",
+            "Magenta silhouette outline for the selected analytic "
+            "primitive. 1 = outline drawn at dot(n,-rd) < 0.2 silhouette "
+            "edges when a prim is selected; 0 = no outline. Bit-identical "
+            "to pre-editor frames when no selection is set.",
+            CVAR_ARCHIVE);
+    // ---- end Editor backend -------------------------------------------------
     // --- Water Phase 1 (#134): shaded analytic plane with normal-map waves --
     // r_water_* cvars feed PathTrace.slang's MAT_WATER BRDF branch via the
     // water_params0 / water_params1 push fields.  All CVAR_ARCHIVE so a
@@ -6315,6 +6330,22 @@ void Engine::RenderFrame() {
         // One vec4 = 16 B.
         float water_state[4];
         // --- end Underwater medium tracking ------------------------------
+        // --- Editor backend (agent-19 / PR #201, host wired in #210) -----
+        // editor_params.x = selected_prim_id (0 = no selection / paint
+        //                   nothing). Host writes the EFFECTIVE id here
+        //                   (zero when r_editor_outline == 0 OR the
+        //                   selected_kind_ != SelectionKind::AnalyticPrim)
+        //                   so PathTrace.slang can collapse the outline
+        //                   test to a single "if (.x != 0 && prim_id == .x)"
+        //                   without re-reading .y / .z on every prim hit.
+        //              .y = r_editor_outline gate (0/1; 0 forces the
+        //                   outline off regardless of .x).
+        //              .z = selected_kind (mirrors host SelectionKind
+        //                   enum; only AnalyticPrim paints today).
+        //              .w reserved.
+        // One uvec4 = 16 B.
+        std::uint32_t editor_params[4];
+        // --- end Editor backend ------------------------------------------
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -7392,6 +7423,28 @@ void Engine::RenderFrame() {
     }
     // --- end Underwater medium tracking ------------------------------------
 
+    // --- Editor backend (agent-19 / PR #201, host wired in #210) ------------
+    // Pack the selection-outline state for PathTrace.slang. .x is the
+    // EFFECTIVE selected prim id: zero when the cvar gate is off or the
+    // active selection kind isn't AnalyticPrim, otherwise selected_prim_id_.
+    // Folding the gate into .x lets the shader early-out on a single uint
+    // compare without re-reading .y / .z on every analytic-prim hit. .y
+    // still carries the raw gate so other shader paths can branch on it
+    // independently; .z mirrors the host SelectionKind enum so future
+    // Light / SdfCluster / RigidBody outline variants can dispatch without
+    // another push field.
+    {
+        bool outline_on = true;
+        if (auto* v = C.FindCVar("r_editor_outline")) outline_on = v->GetBool();
+        const bool paint = outline_on &&
+                           selected_kind_ == SelectionKind::AnalyticPrim;
+        push.editor_params[0] = paint ? selected_prim_id_ : 0u;
+        push.editor_params[1] = outline_on ? 1u : 0u;
+        push.editor_params[2] = static_cast<std::uint32_t>(selected_kind_);
+        push.editor_params[3] = 0u;
+    }
+    // --- end Editor backend -------------------------------------------------
+
     // PtPush layout: the trailing 32 bytes here include the SDF Phase 1
     // block (sdf_params uvec4 + sdf_params_f vec4) and the celestials-
     // composite gate (issue #46 -- one uint flag plus 12 bytes of
@@ -7419,7 +7472,9 @@ void Engine::RenderFrame() {
     //   +16 Motion blur (#85) — motion_blur_params vec4 (enabled, shutter_speed,
     //                              _pad, _pad)
     //   +16 Water Phase 4 (#134) — water_state vec4 (in_water flag, deep_color_rgb)
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16);
+    //   +16 Editor backend (#201/#210) — editor_params uvec4 (selected_prim_id,
+    //                              r_editor_outline gate, selected_kind, _pad)
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16);
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
     // cbuffer layout the Slang compiler applies to PathTrace.slang's
@@ -7493,6 +7548,10 @@ void Engine::RenderFrame() {
     // Water Phase 4 underwater medium tracking (#134).
     static_assert(offsetof(PtPush, water_state) % 16 == 0,
                   "PtPush::water_state must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    // Editor backend block (agent-19 / PR #201, host wired in #210).
+    static_assert(offsetof(PtPush, editor_params) % 16 == 0,
+                  "PtPush::editor_params must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
