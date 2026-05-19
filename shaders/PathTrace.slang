@@ -4021,6 +4021,14 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // identifiers. Documented as a Phase 4 simplification; a proper
         // multi-medium stack lands in Phase 5 SSS work.
         int in_water = (water_state.x > 0.5) ? 1 : 0;
+        // Whether the camera primary ray was underwater at ray-gen.
+        // Latched once so the post-bounce atmospheric / volumetric march
+        // can skip the surface aerial perspective + Mie/Rayleigh in-
+        // scatter terms when the primary segment was traversed through
+        // water (already attenuated by per-segment Beer's law inside the
+        // bounce loop; atmospheric terms would double-dim and add
+        // air-only Mie/Rayleigh in-scatter to a water-only segment).
+        bool primary_in_water = (in_water == 1);
         // --- end Underwater medium tracking ---------------------------------
 
         // Save primary-ray params for the volumetric march (single
@@ -4761,7 +4769,14 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // multiplied by atmosphericTransmittance(0, sample_t) inside
         // the loop) so they compose correctly with the surface's
         // aerial-perspective term.
-        if (primary_hit) {
+        // Skip surface aerial perspective when the primary segment was
+        // underwater (Phase 4, #134): the camera-to-surface segment was
+        // already attenuated by per-segment Beer's law in the bounce
+        // loop; multiplying by atmospheric transmittance would double-
+        // dim AND mix air-tuned Mie/Rayleigh sigmas with what's actually
+        // a water medium. The HDRI-haze additive at line ~4791 is also
+        // sky-coloured so it's wrong underwater for the same reason.
+        if (primary_hit && !primary_in_water) {
             float3 trans_atm_surf = atmosphericTransmittance(
                 primary_ro, primary_rd, primary_t);
             radiance *= trans_atm_surf;
@@ -4814,9 +4829,18 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // being correct. Mirrors the (smoke_params.y > 0 && smoke_params.x > 0)
         // gate used inside the cloud-march body.
         bool smoke_active_outer = (smoke_params.y > 0.0) && (smoke_params.x > 0.0);
+        // Skip atmospheric in-scatter / cloud / smoke march when the
+        // primary segment was underwater (Phase 4, #134): all three
+        // contributions assume an air medium with sky-coloured single
+        // scatter, which doesn't apply when the primary ray travelled
+        // through water before hitting (or missing) scene geometry.
+        // A proper subsurface scattering integral lands in Phase 5; for
+        // Phase 4 we just don't add air-only volumetric terms to an
+        // underwater frame.
         if ((vol_params.x > 0.0 || clouds_p1.w > 0.0 || clouds_p3.w > 0.0
              || smoke_active_outer)
-            && primary_t_recorded) {
+            && primary_t_recorded
+            && !primary_in_water) {
             float  g         = vol_params.y;
             float  vol_int   = vol_params.z;
             int    N         = max(1, int(vol_params.w));
