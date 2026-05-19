@@ -84,7 +84,7 @@ constexpr std::size_t kAccumParamsOffset = 720;
 //            v0.xyz for planes). Ignored by the SW tracer (which always
 //            samples at the current frame), but reserved here so the
 //            stride matches PathTrace.slang.
-// 4 float4 per prim = 16 floats = 64 bytes.
+// 5 float4 per prim = 20 floats = 80 bytes.
 constexpr std::uint32_t kPrimSphere = 0u;
 constexpr std::uint32_t kPrimPlane  = 1u;
 constexpr std::uint32_t kMatLambert = 0u;
@@ -172,9 +172,9 @@ void TraceScene(const glm::vec3& ro, const glm::vec3& rd,
 
     // Analytic primitives.
     for (std::uint32_t i = 0; i < prim_count; ++i) {
-        // Stride bumped from 12 floats (3 float4) to 16 floats (4 float4)
-        // for motion blur (#85) -- v3 holds prev_pos for the GPU shader
-        // but the SW tracer ignores it (no shutter sampling here).
+        // Stride bumped from 12 floats (3 float4) to 20 floats (5 float4):
+        // v3 holds prev_pos (motion blur #85) and v4 holds emission (#181).
+        // SW tracer ignores both (no shutter sampling / emissive surf term).
         const float* v0 = prim_data + i * kFloatsPerPrim + 0u;
         const float* v1 = prim_data + i * kFloatsPerPrim + 4u;
         const float* v2 = prim_data + i * kFloatsPerPrim + 8u;
@@ -284,8 +284,8 @@ void RunPathTraceKernel(SoftwareDevice& device,
             prim_data  = reinterpret_cast<const float*>(pb->data.data());
             prim_count = push->prim_count;
             // Don't trust prim_count past the buffer's capacity.
-            // Motion blur (#85): prim stride is now 64 bytes (4 float4)
-            // instead of 48 (3 float4) -- v3 carries prev_pos.
+            // Prim stride is now 80 bytes (5 float4): v3 carries prev_pos
+            // (motion blur #85) and v4 carries emission (#181).
             constexpr std::size_t kBytesPerPrim = kFloatsPerPrim * sizeof(float);
             std::uint32_t max_prims = static_cast<std::uint32_t>(pb->size / kBytesPerPrim);
             if (prim_count > max_prims) prim_count = max_prims;
