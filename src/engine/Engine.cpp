@@ -1082,13 +1082,16 @@ namespace cvar {
             "feel); 2.0+ = stretched plume. Phase 2 has no turbulence -- "
             "the column is a straight chain along the velocity vector.",
             CVAR_ARCHIVE);
-    PT_CVAR(r_smoke_puff_count,        "6",
+    PT_CVAR(r_smoke_puff_count,        "12",
             "Number of staggered puffs per emitter (#180). Each puff is a "
             "Gaussian at a different age along [0, r_smoke_lifetime]; more "
             "puffs = smoother column at the cost of P density evaluations "
-            "per cloud-march sample per emitter. Hard-clamped to [1, 8] in "
+            "per cloud-march sample per emitter. Hard-clamped to [1, 16] in "
             "the shader so the inner loop bound is compile-time-known. "
-            "1 mimics Phase 1's single-blob shape.", CVAR_ARCHIVE);
+            "Wave-6 bumped the cap from 8 to 16 and the default from 6 to "
+            "12 so the chain reads as a continuous column out-of-the-box "
+            "rather than a string of discrete blobs. 1 mimics Phase 1's "
+            "single-blob shape.", CVAR_ARCHIVE);
     PT_CVAR(r_smoke_expansion_rate,    "0.15",
             "Per-second radial-expansion rate for an aging smoke puff "
             "(#180). At age t the effective radius is r * (1 + rate * t), "
@@ -1097,6 +1100,50 @@ namespace cvar {
             "0.1-0.3 reads as fluffy smoke; >0.5 puffs balloon visibly. "
             "Stacks with the per-emitter base `radius`.", CVAR_ARCHIVE);
     // --- end Fluid Phase 2 ---------------------------------------------------
+    // --- Fluid wave-6 -- "looks like smoke" pass --------------------------
+    // Visual fidelity knobs added so smoke_emitter_basic.cfg renders as
+    // recognisable smoke (turbulence detail, exponential decay tail,
+    // age-driven tint) instead of a smooth puff-chain blob. All four
+    // defaults are tuned for the cigarette-column reference scene so
+    // `exec smoke_emitter_basic.cfg` reads like smoke out-of-the-box.
+    // 0 values collapse each contribution to a no-op, so a user can
+    // dial back the wave-6 character without recompiling.
+    PT_CVAR(r_smoke_turbulence_scale,   "4.0",
+            "Smoke turbulence noise frequency in cycles per metre "
+            "(wave-6). Modulates the per-puff Gaussian density by a "
+            "3-octave fbm so the column reads as wispy turbulent smoke "
+            "rather than a smooth blob. Low values (1-2) = large soft "
+            "wisps; default 4 = fine high-frequency detail; 8+ = very "
+            "fine sub-feature wisps (e.g. close-up cigarette smoke). "
+            "Pairs with r_smoke_turbulence_amplitude.", CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_turbulence_amplitude, "0.6",
+            "Strength of the turbulence noise modulation on smoke density "
+            "(wave-6). 0 = no modulation, bit-identical to Phase 2's "
+            "smooth Gaussian puff. 1 = density fully replaced by the "
+            "noise pattern (very wispy, may hollow out the column). "
+            "0.4-0.7 reads as natural fluffy smoke with visible internal "
+            "structure. The noise is sampled in puff-local coords so the "
+            "wisp pattern moves with the puff as it advects.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_decay_shape,         "2.0",
+            "Exponent on the per-puff age-fade curve (wave-6). Density "
+            "at age t = peak * pow(1 - t / lifetime, exp). Exp=1 "
+            "recovers Phase 2's linear fade bit-exact (slow tail-off). "
+            "Exp=2 (default) keeps the head puff denser and lets the "
+            "tail wisp away faster -- the characteristic 'fresh puff, "
+            "vanishing tail' shape of real smoke columns. Exp=3-4 "
+            "sharpens that further for short-lived puffs (e.g. steam "
+            "jets). Hard-clamped to >=1.", CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_age_tint_strength,   "0.2",
+            "Amount of age-driven warm-to-cool tint applied to each "
+            "smoke puff (wave-6). Fresh puffs get a faintly warm yellow "
+            "cast, older puffs drift toward a cool grey-blue. 0 = no "
+            "age tint (puff colour == per-emitter tint, Phase 2 "
+            "behaviour). 0.2 (default) reads as natural cigarette/wood "
+            "smoke. 1.0 maxes the warm/cool contrast for stylized "
+            "smoke. Stacks multiplicatively with the per-emitter tint "
+            "(v2.xyz on the smoke SSBO).", CVAR_ARCHIVE);
+    // --- end Fluid wave-6 -----------------------------------------------------
     // --- end Fluid Phase 1 -----------------------------------------------------
     // --- Motion blur (#85) ----------------------------------------------------
     // Cook-1984 style stochastic shutter-time sampling. Each primary ray
@@ -6138,11 +6185,19 @@ void Engine::RenderFrame() {
         // --- Fluid Phase 2 (#180) ----------------------------------------
         // smoke_params2.x = r_smoke_lifetime          (seconds; >=0)
         //              .y = r_smoke_advection_strength (multiplier on vel)
-        //              .z = r_smoke_puff_count        (1..8, clamped)
+        //              .z = r_smoke_puff_count        (1..16, clamped)
         //              .w = r_smoke_expansion_rate    (per-second radius growth)
         // One vec4 = 16 B. Drives the inner per-emitter puff-chain loop.
         float smoke_params2[4];
         // --- end Fluid Phase 2 -------------------------------------------
+        // --- Fluid wave-6 "looks like smoke" -----------------------------
+        // smoke_params3.x = r_smoke_turbulence_scale     (noise freq, cycles/m)
+        //              .y = r_smoke_turbulence_amplitude (0..1 modulation)
+        //              .z = r_smoke_decay_shape          (>=1 exponent on age fade)
+        //              .w = r_smoke_age_tint_strength    (0..1 age-driven tint)
+        // One vec4 = 16 B. All four read by smoke_density_add* in PathTrace.slang.
+        float smoke_params3[4];
+        // --- end Fluid wave-6 --------------------------------------------
         // --- Motion blur (#85) -------------------------------------------
         // motion_blur_params.x = r_motion_blur (1 = enable shutter-time
         //                       jitter + per-prim prev_pos lerp; 0 =
@@ -7102,13 +7157,15 @@ void Engine::RenderFrame() {
         if (lifetime < 0.0f) lifetime = 0.0f;
         float adv = 1.0f;
         if (auto* v = C.FindCVar("r_smoke_advection_strength")) adv = v->GetFloat();
-        int puffs = 6;
+        int puffs = 12;
         if (auto* v = C.FindCVar("r_smoke_puff_count")) puffs = v->GetInt();
         if (puffs < 1) puffs = 1;
         // Hard upper bound mirrors the shader's compile-time loop cap
-        // (kSmokePuffMax = 8 in PathTrace.slang). Higher values would
-        // multiply the per-pixel cost without a clean perf budget.
-        if (puffs > 8) puffs = 8;
+        // (kSmokePuffMax = 16 in PathTrace.slang). Wave-6 bumped from 8
+        // to 16 so the chain reads as a continuous column rather than a
+        // string of discrete blobs. Higher values would multiply the
+        // per-pixel cost without a clean perf budget.
+        if (puffs > 16) puffs = 16;
         float expansion = 0.15f;
         if (auto* v = C.FindCVar("r_smoke_expansion_rate")) expansion = v->GetFloat();
         if (expansion < 0.0f) expansion = 0.0f;
@@ -7117,6 +7174,30 @@ void Engine::RenderFrame() {
         push.smoke_params2[2] = static_cast<float>(puffs);
         push.smoke_params2[3] = expansion;
         // --- end Fluid Phase 2 --------------------------------------------
+        // --- Fluid wave-6 -- "looks like smoke" ---------------------------
+        // Pack the per-frame visual-fidelity knobs that drive turbulence
+        // detail, age-fade shape, and age-driven tint. All defaults
+        // chosen so smoke_emitter_basic.cfg renders as recognisable
+        // smoke out of the box without per-scene tuning.
+        float turb_scale = 4.0f;
+        if (auto* v = C.FindCVar("r_smoke_turbulence_scale")) turb_scale = v->GetFloat();
+        if (turb_scale < 0.0f) turb_scale = 0.0f;
+        float turb_amp = 0.6f;
+        if (auto* v = C.FindCVar("r_smoke_turbulence_amplitude")) turb_amp = v->GetFloat();
+        if (turb_amp < 0.0f) turb_amp = 0.0f;
+        if (turb_amp > 1.0f) turb_amp = 1.0f;
+        float decay_shape = 2.0f;
+        if (auto* v = C.FindCVar("r_smoke_decay_shape")) decay_shape = v->GetFloat();
+        if (decay_shape < 1.0f) decay_shape = 1.0f;
+        float age_tint = 0.2f;
+        if (auto* v = C.FindCVar("r_smoke_age_tint_strength")) age_tint = v->GetFloat();
+        if (age_tint < 0.0f) age_tint = 0.0f;
+        if (age_tint > 1.0f) age_tint = 1.0f;
+        push.smoke_params3[0] = turb_scale;
+        push.smoke_params3[1] = turb_amp;
+        push.smoke_params3[2] = decay_shape;
+        push.smoke_params3[3] = age_tint;
+        // --- end Fluid wave-6 ---------------------------------------------
     }
     // --- end Fluid Phase 1 -------------------------------------------------
     // --- Motion blur (#85) -------------------------------------------------
@@ -7160,9 +7241,11 @@ void Engine::RenderFrame() {
     //   +16 Fluid Phase 1 (#136) — smoke_params vec4 (count, enabled, time, _pad)
     //   +16 Fluid Phase 2 (#180) — smoke_params2 vec4 (lifetime, adv_strength,
     //                              puff_count, expansion_rate)
+    //   +16 Fluid wave-6      — smoke_params3 vec4 (turb_scale, turb_amp,
+    //                              decay_shape, age_tint_strength)
     //   +16 Motion blur (#85) — motion_blur_params vec4 (enabled, shutter_speed,
     //                              _pad, _pad)
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16);
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16);
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
     // cbuffer layout the Slang compiler applies to PathTrace.slang's
@@ -7224,6 +7307,10 @@ void Engine::RenderFrame() {
     // Fluid Phase 2 block (#180).
     static_assert(offsetof(PtPush, smoke_params2) % 16 == 0,
                   "PtPush::smoke_params2 must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    // Fluid wave-6 block ("looks like smoke" turbulence + age-tint).
+    static_assert(offsetof(PtPush, smoke_params3) % 16 == 0,
+                  "PtPush::smoke_params3 must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     // Motion blur block (#85).
     static_assert(offsetof(PtPush, motion_blur_params) % 16 == 0,
@@ -13788,6 +13875,54 @@ void Engine::RegisterEditorGizmoCommands() {
                            glm::degrees(new_yaw),
                            glm::degrees(new_pitch));
         });
+
+    // --- prim_set_normal (wave-6 #25 inspector follow-up) -----------------
+    // Set the normal of an analytic plane primitive. Input is auto-
+    // normalised. Note that this rotates the plane about the origin's
+    // projection on the new normal -- d is preserved, so the geometric
+    // plane n.p + d = 0 simply uses a new n. To tilt + reposition, the
+    // inspector should also dispatch prim_set_plane_d in the same batch.
+    C.RegisterCommand("prim_set_normal",
+        "prim_set_normal <id> <nx> <ny> <nz>: set the normal of an analytic "
+        "plane primitive. Input is auto-normalised. d (plane offset) is "
+        "preserved, so the plane rotates around the origin's projection "
+        "on the new normal -- to tilt + reposition, also dispatch "
+        "prim_set_plane_d in the same batch.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 4) {
+                out.PrintLine("usage: prim_set_normal <id> <nx> <ny> <nz>");
+                return;
+            }
+            std::uint32_t id = 0;
+            float nx, ny, nz;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], nx) || !ParseFloat(args[2], ny) || !ParseFloat(args[3], nz)) {
+                out.PrintLine("prim_set_normal: arg parse failed");
+                return;
+            }
+            const float len = std::sqrt(nx*nx + ny*ny + nz*nz);
+            if (len < 1e-6f) {
+                out.PrintLine("prim_set_normal: zero-length normal rejected");
+                return;
+            }
+            auto it = primitives_.find(id);
+            if (it == primitives_.end()) {
+                out.FormatLine("prim_set_normal: id {} not found", id);
+                return;
+            }
+            if (it->second.type != AnalyticPrim::Plane) {
+                out.FormatLine("prim_set_normal: id {} is not a plane", id);
+                return;
+            }
+            it->second.pos_or_n[0] = nx / len;
+            it->second.pos_or_n[1] = ny / len;
+            it->second.pos_or_n[2] = nz / len;
+            primitives_dirty_ = true;
+            accum_dirty_      = true;
+            BroadcastSceneDirty();
+            out.FormatLine("primitives: id {} normal -> ({:.3f} {:.3f} {:.3f})",
+                           id, it->second.pos_or_n[0], it->second.pos_or_n[1], it->second.pos_or_n[2]);
+        });
 }
 
 // --- Editor 3D-transform gizmo per-frame work (issue: editor 3D gizmos) ----
@@ -16305,6 +16440,141 @@ void Engine::RegisterLightCommands() {
                           rad * Exposure2x(ev), out, "light_quad_exposed");
         });
     // --- end #176 ergonomic variants --------------------------------------
+
+    // --- Inspector setter family (wave-6 #25 follow-up) -------------------
+    // Atomic per-field setters so the property inspector dispatches one
+    // command per field commit instead of re-emitting the full composite
+    // light_point / light_spot / light_sphere / light_quad constructor
+    // every time a user nudges a single axis. Each setter validates id +
+    // type, mutates in place, marks dirty, and broadcasts scene_dirty so
+    // editor panels re-fetch via list_scene. Mirrors the prim_set_* family
+    // shape introduced by agent-19 + wave-5 polish (8cd8164).
+
+    C.RegisterCommand("light_set_pos",
+        "light_set_pos <id> <x> <y> <z>: move any analytic light (point/spot/sphere/quad).",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 4) { out.PrintLine("usage: light_set_pos <id> <x> <y> <z>"); return; }
+            std::uint32_t id; float x, y, z;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z)) {
+                out.PrintLine("light_set_pos: arg parse failed"); return;
+            }
+            auto it = light_prims_.find(id);
+            if (it == light_prims_.end()) { out.FormatLine("light_set_pos: id {} not found", id); return; }
+            it->second.pos[0] = x; it->second.pos[1] = y; it->second.pos[2] = z;
+            light_prims_dirty_ = true;
+            accum_dirty_       = true;
+            BroadcastSceneDirty();
+            out.FormatLine("lights: id {} pos -> ({:.2f} {:.2f} {:.2f})", id, x, y, z);
+        });
+
+    C.RegisterCommand("light_set_intensity",
+        "light_set_intensity <id> <r> <g> <b>: set raw intensity per channel "
+        "(W/sr for point/spot, W/m^2/sr for sphere/quad). Bypasses the "
+        "photometric cd/lm/nits conversion -- writes the engine-internal "
+        "value directly.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 4) { out.PrintLine("usage: light_set_intensity <id> <r> <g> <b>"); return; }
+            std::uint32_t id; float r, g, b;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], r) || !ParseFloat(args[2], g) || !ParseFloat(args[3], b)) {
+                out.PrintLine("light_set_intensity: arg parse failed"); return;
+            }
+            if (r < 0.0f || g < 0.0f || b < 0.0f) {
+                out.PrintLine("light_set_intensity: components must be >= 0"); return;
+            }
+            auto it = light_prims_.find(id);
+            if (it == light_prims_.end()) { out.FormatLine("light_set_intensity: id {} not found", id); return; }
+            it->second.intensity[0] = r; it->second.intensity[1] = g; it->second.intensity[2] = b;
+            light_prims_dirty_ = true;
+            accum_dirty_       = true;
+            BroadcastSceneDirty();
+            out.FormatLine("lights: id {} intensity -> ({:.3f} {:.3f} {:.3f})", id, r, g, b);
+        });
+
+    C.RegisterCommand("light_set_dir",
+        "light_set_dir <id> <nx> <ny> <nz>: set spot-light axis OR quad "
+        "normal. Input is auto-normalised. No-op (warns) for point/sphere "
+        "lights which have no direction.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 4) { out.PrintLine("usage: light_set_dir <id> <nx> <ny> <nz>"); return; }
+            std::uint32_t id; float nx, ny, nz;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], nx) || !ParseFloat(args[2], ny) || !ParseFloat(args[3], nz)) {
+                out.PrintLine("light_set_dir: arg parse failed"); return;
+            }
+            auto it = light_prims_.find(id);
+            if (it == light_prims_.end()) { out.FormatLine("light_set_dir: id {} not found", id); return; }
+            if (it->second.type != AnalyticLight::Spot && it->second.type != AnalyticLight::Quad) {
+                out.FormatLine("light_set_dir: id {} is type {} -- no direction to set",
+                               id, LightTypeName(it->second.type));
+                return;
+            }
+            const float len = std::sqrt(nx*nx + ny*ny + nz*nz);
+            if (len < 1e-6f) { out.PrintLine("light_set_dir: zero-length direction rejected"); return; }
+            it->second.dir[0] = nx / len; it->second.dir[1] = ny / len; it->second.dir[2] = nz / len;
+            light_prims_dirty_ = true;
+            accum_dirty_       = true;
+            BroadcastSceneDirty();
+            out.FormatLine("lights: id {} dir -> ({:.3f} {:.3f} {:.3f})",
+                           id, it->second.dir[0], it->second.dir[1], it->second.dir[2]);
+        });
+
+    C.RegisterCommand("light_set_cone",
+        "light_set_cone <id> <inner_deg> <outer_deg>: set spot-light half-angles "
+        "(inner <= outer; both 0..90). No-op (warns) for non-spot types.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 3) { out.PrintLine("usage: light_set_cone <id> <inner_deg> <outer_deg>"); return; }
+            std::uint32_t id; float inner_deg, outer_deg;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], inner_deg) || !ParseFloat(args[2], outer_deg)) {
+                out.PrintLine("light_set_cone: arg parse failed"); return;
+            }
+            if (inner_deg < 0.0f || outer_deg > 90.0f || inner_deg > outer_deg) {
+                out.PrintLine("light_set_cone: require 0 <= inner <= outer <= 90 (degrees)"); return;
+            }
+            auto it = light_prims_.find(id);
+            if (it == light_prims_.end()) { out.FormatLine("light_set_cone: id {} not found", id); return; }
+            if (it->second.type != AnalyticLight::Spot) {
+                out.FormatLine("light_set_cone: id {} is not a spot light", id); return;
+            }
+            const float deg2rad = 3.14159265358979323846f / 180.0f;
+            it->second.cos_inner = std::cos(inner_deg * deg2rad);
+            it->second.cos_outer = std::cos(outer_deg * deg2rad);
+            light_prims_dirty_ = true;
+            accum_dirty_       = true;
+            BroadcastSceneDirty();
+            out.FormatLine("lights: id {} cone -> inner={:.2f}deg outer={:.2f}deg", id, inner_deg, outer_deg);
+        });
+
+    C.RegisterCommand("light_set_size",
+        "light_set_size <id> <r>: set sphere-light radius OR quad-light v_half "
+        "(for quad, use sister command light_set_uhalf for the U axis). "
+        "No-op (warns) for point/spot types.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 2) { out.PrintLine("usage: light_set_size <id> <r>"); return; }
+            std::uint32_t id; float r;
+            if (!ParseUint(args[0], id) || !ParseFloat(args[1], r)) {
+                out.PrintLine("light_set_size: arg parse failed"); return;
+            }
+            if (r < 0.0f) { out.PrintLine("light_set_size: size must be >= 0"); return; }
+            auto it = light_prims_.find(id);
+            if (it == light_prims_.end()) { out.FormatLine("light_set_size: id {} not found", id); return; }
+            if (it->second.type == AnalyticLight::Sphere) {
+                it->second.radius = r;
+            } else if (it->second.type == AnalyticLight::Quad) {
+                it->second.v_half = r;
+            } else {
+                out.FormatLine("light_set_size: id {} is {} -- no size to set",
+                               id, LightTypeName(it->second.type));
+                return;
+            }
+            light_prims_dirty_ = true;
+            accum_dirty_       = true;
+            BroadcastSceneDirty();
+            out.FormatLine("lights: id {} size -> {:.3f}", id, r);
+        });
+    // --- end inspector setter family --------------------------------------
 }
 // --- end Light primitives --------------------------------------------------
 

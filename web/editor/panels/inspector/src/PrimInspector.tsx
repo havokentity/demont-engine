@@ -54,12 +54,25 @@ export function PrimInspector({ prim, exec }: PrimInspectorProps) {
   const sphereR = prim.type === 'sphere' ? (prim.radius ?? 1) : 1;
 
   // For spheres: prim_set_pos updates the centre.
-  // For planes: prim_set_pos repurposes <x y z> as the normal vector.
-  // The engine command is documented as "move a primitive (sphere
-  // center or plane normal)".
+  // For planes: prim_set_pos historically repurposed <x y z> as the
+  // normal. As of wave-6 #25 the engine has prim_set_normal which is
+  // the proper command; setPos sticks with prim_set_pos for spheres
+  // and we use setNormal for planes below.
   const setPos = useCallback(
     (x: number, y: number, z: number) => {
       exec(`prim_set_pos ${id} ${fmt(x)} ${fmt(y)} ${fmt(z)}`);
+    },
+    [exec, id],
+  );
+  const setNormal = useCallback(
+    (nx: number, ny: number, nz: number) => {
+      exec(`prim_set_normal ${id} ${fmt(nx)} ${fmt(ny)} ${fmt(nz)}`);
+    },
+    [exec, id],
+  );
+  const setPlaneD = useCallback(
+    (v: number) => {
+      exec(`prim_set_plane_d ${id} ${fmt(v)}`);
     },
     [exec, id],
   );
@@ -94,7 +107,7 @@ export function PrimInspector({ prim, exec }: PrimInspectorProps) {
   }, [exec, id]);
 
   const radiusEditable = prim.type === 'sphere';
-  const planeDEditable = false;
+  const planeDEditable = prim.type === 'plane';  // prim_set_plane_d landed in 8cd8164
 
   return (
     <>
@@ -146,22 +159,22 @@ export function PrimInspector({ prim, exec }: PrimInspectorProps) {
                   axis="X"
                   label="Nx"
                   value={normal[0]}
-                  onCommit={(v) => setPos(v, normal[1], normal[2])}
-                  onScrub={(v) => setPos(v, normal[1], normal[2])}
+                  onCommit={(v) => setNormal(v, normal[1], normal[2])}
+                  onScrub={(v) => setNormal(v, normal[1], normal[2])}
                 />
                 <NumberField
                   axis="Y"
                   label="Ny"
                   value={normal[1]}
-                  onCommit={(v) => setPos(normal[0], v, normal[2])}
-                  onScrub={(v) => setPos(normal[0], v, normal[2])}
+                  onCommit={(v) => setNormal(normal[0], v, normal[2])}
+                  onScrub={(v) => setNormal(normal[0], v, normal[2])}
                 />
                 <NumberField
                   axis="Z"
                   label="Nz"
                   value={normal[2]}
-                  onCommit={(v) => setPos(normal[0], normal[1], v)}
-                  onScrub={(v) => setPos(normal[0], normal[1], v)}
+                  onCommit={(v) => setNormal(normal[0], normal[1], v)}
+                  onScrub={(v) => setNormal(normal[0], normal[1], v)}
                 />
               </div>
             </div>
@@ -169,9 +182,9 @@ export function PrimInspector({ prim, exec }: PrimInspectorProps) {
               <label>D</label>
               <NumberField
                 value={planeD}
-                onCommit={() => { /* no engine command yet */ }}
+                onCommit={setPlaneD}
+                onScrub={setPlaneD}
                 disabled={!planeDEditable}
-                title={planeDEditable ? '' : 'Plane distance edit not yet wired in engine'}
               />
             </div>
           </>
