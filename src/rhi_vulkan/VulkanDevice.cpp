@@ -172,7 +172,7 @@ constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     25, // engine slot 12 -> shader binding 25 (roughness_tex, #118)
     26, // engine slot 13 -> shader binding 26 (specular_hit_distance_tex, #118)
 };
-constexpr std::uint32_t kSlotToBufBinding[16] = {
+constexpr std::uint32_t kSlotToBufBinding[24] = {
     0,  // engine slot 0 unused
     3,  // engine slot 1 -> shader binding 3  (mesh_positions)
     4,  // engine slot 2 -> shader binding 4  (mesh_indices)
@@ -208,6 +208,16 @@ constexpr std::uint32_t kSlotToBufBinding[16] = {
     // engine slot 13 / binding 28 but moved during integration merge
     // because light tree #129 already owns those.
     30, // engine slot 15 -> shader binding 30 (smoke_emitters)
+    // Fluid Phase 3 (#22): SPH particle splat list. One past smoke
+    // emitters.
+    31, // engine slot 16 -> shader binding 31 (sph_particles)
+    0,  // engine slot 17 unused
+    0,  // engine slot 18 unused
+    0,  // engine slot 19 unused
+    0,  // engine slot 20 unused
+    0,  // engine slot 21 unused
+    0,  // engine slot 22 unused
+    0,  // engine slot 23 unused
 };
 // Scene TLAS lives at engine accel-slot 2 -> shader binding 2.
 

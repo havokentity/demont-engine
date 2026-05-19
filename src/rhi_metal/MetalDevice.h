@@ -131,11 +131,15 @@ private:
     //
     // Issue #136 (smoke emitters) extends to slot 15 for the smoke
     // emitter list SSBO (`smoke_emitters`, MSL slot 15;
-    // vk::binding(30)). Declared AFTER reservoir. Array sized 16 to
-    // fit all five new SSBOs plus one slot of headroom; bump again
-    // before adding more.
-    BufferHandle               bound_buf_[16] {};
-    std::size_t                bound_buf_off_[16] {};
+    // vk::binding(30)). Declared AFTER reservoir.
+    //
+    // Issue #22 (Fluid Phase 3 SPH smoke fluid sim) extends to slot
+    // 16 for the SPH particle splat list SSBO (`sph_particles`, MSL
+    // slot 16; vk::binding(31)). Declared AFTER smoke_emitters.
+    // Array sized 24 to fit all six SSBOs plus a handful of slots of
+    // headroom; bump again before adding more.
+    BufferHandle               bound_buf_[24] {};
+    std::size_t                bound_buf_off_[24] {};
     AccelStructHandle          bound_accel_[4] {};
 
     // Push-constant buffer. Sized to fit the unified PathTrace push

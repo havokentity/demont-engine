@@ -36,6 +36,7 @@
 #include "../renderer/MeshGen.h"
 #include "../effects/ParticleSystem.h"
 #include "../physics/PhysicsSystem.h"
+#include "../physics/SmokeSPH.h"
 #include "../rhi/CommandBuffer.h"
 #include "../rhi/Device.h"
 
@@ -1268,6 +1269,109 @@ namespace cvar {
             "smoke. Stacks multiplicatively with the per-emitter tint "
             "(v2.xyz on the smoke SSBO).", CVAR_ARCHIVE);
     // --- end Fluid wave-6 -----------------------------------------------------
+    // --- Fluid Phase 3 (#22) -- SPH smoke fluid sim ---------------------------
+    // Phase 3 replaces (or augments) the procedural puff-chain with a
+    // particle-based Smoothed Particle Hydrodynamics solver (Müller 2003).
+    // The CPU solver integrates particles against gravity + buoyancy +
+    // pressure + viscosity + wind + shockwaves at fixed 1/120s sub-steps;
+    // the GPU sees the live particle splat list as a 2-float4 SSBO and
+    // splats Gaussians at each particle inside the same cloud-march
+    // pipeline the Phase 1/2 emitters use.
+    //
+    // r_smoke_mode is the master selector. `procedural` keeps Phase 2
+    // bit-exact (defaults preserve goldens); `sph` switches to the
+    // particle solver; `both` lets the two contributions stack for
+    // a hybrid render. Phase 2 emitters added via `smoke_emit` also
+    // act as SPH emitters when r_smoke_mode != procedural -- their
+    // (pos, radius, velocity, density) become the SPH emitter
+    // parameters and the velocity also controls the upward thermal
+    // bias (hot smoke rises faster than the procedural advection).
+    PT_CVAR(r_smoke_mode,                "procedural",
+            "Smoke simulation mode (Fluid Phase 3, #22). 'procedural' = "
+            "Phase 2 puff-chain (default; preserves existing goldens). "
+            "'sph' = particle-based Smoothed Particle Hydrodynamics "
+            "solver; smoke responds to gravity + buoyancy + wind + "
+            "shockwaves. 'both' = both contributions stacked (hybrid "
+            "render). The SPH solver runs on the CPU at fixed 1/120s "
+            "sub-steps; per-frame cost scales with r_smoke_sph_max_particles.");
+    PT_CVAR(r_smoke_sph_max_particles,   "1024",
+            "Cap on SPH particles per frame (#22). Default 1024 keeps "
+            "the per-frame cost well under 1 ms on M4 Max even at 8 "
+            "sub-steps. Higher = finer plume resolution; lower = "
+            "cheaper at the cost of visibly coarser blobs. Hard "
+            "upper bound 4096 (shader-side cap).", CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_sph_emit_rate,       "120.0",
+            "Particles per emitter per second when r_smoke_mode != "
+            "procedural (#22). Each emitter spawns at this rate; "
+            "fractional debt accumulates across sub-steps for "
+            "smooth spawning. 120/s lets one emitter saturate a "
+            "1024-particle pool in ~8 s (matched to default "
+            "particle lifetime). Set 0 to freeze the population.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_sph_particle_lifetime, "6.0",
+            "SPH particle lifetime in seconds (#22). Particles "
+            "despawn after this. Combined with r_smoke_sph_emit_rate "
+            "this sets the steady-state population: rate * lifetime. "
+            "Default 6.0 s * 120/s = 720 particles in steady state.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_sph_particle_radius, "0.3",
+            "Initial splat radius (m) per SPH particle (#22). "
+            "Drives the per-particle Gaussian falloff in the shader. "
+            "Larger = smoother / fluffier column; smaller = grainier "
+            "but each particle covers less screen area. 0.3 m is "
+            "tuned for the default 1024-particle column.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_sph_render_radius_scale, "1.0",
+            "Host-side multiplier applied to each SPH particle's "
+            "render radius before upload (#22). Lets the user "
+            "balloon the splat without touching the simulation "
+            "scale -- bigger blobs = denser-looking column.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_sph_render_density_scale, "2.0",
+            "Per-particle splat peak density multiplier (#22). The "
+            "shader sees peak = (rho/rho0) * this. 2.0 reads as a "
+            "dense plume; 0.5 reads as wispy.", CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_sph_density_floor, "0.5",
+            "Render-side density-floor offset (#22). Subtracted from "
+            "each particle's splat density before exp() falloff so "
+            "ambient-pressure quiescent particles don't fill the "
+            "world with a uniform fog. 0.5 = clip splat density "
+            "below rest-density; 0 = no clip.", CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_buoyancy,            "0.75",
+            "Buoyancy strength scaler for SPH smoke (#22). 1 = "
+            "Boussinesq's natural formula scaled by the particle's "
+            "thermal excess vs ambient. With the default T_p=600 K "
+            "and T_air=293 K, the natural-formula upward force is "
+            "~1.05 g; scale=0.75 gives net upward acceleration ~3 "
+            "m/s^2 after subtracting gravity -- a steady chimney "
+            "rise rate. 0 disables thermal lift (cold smoke / soot). "
+            "Values >= 2 lead to particles rocketing off-screen.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_emitter_temp,        "600",
+            "Emission temperature in Kelvin for SPH smoke (#22). "
+            "Particles spawn at this temperature and cool exponentially "
+            "toward ambient (293 K). 600 K = typical chimney smoke; "
+            "1000+ K = hot fire plume.", CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_viscosity,           "0.05",
+            "SPH viscosity coefficient (mu) for the smoke solver "
+            "(#22). Real air mu ~= 1.8e-5; we run several orders "
+            "higher because the integrator can't resolve real-air "
+            "Reynolds numbers and we WANT visible smoothing. 0 = no "
+            "viscosity (chaotic free particles); 0.05 reads as "
+            "coherent smoke. > 0.2 gets gloopy.", CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_wind_x,              "0.0",
+            "Global horizontal wind velocity (m/s) along +X applied "
+            "to SPH particles (#22). Drives the plume sideways; the "
+            "column leans into the wind at steady state. Pairs with "
+            "r_smoke_wind_y / r_smoke_wind_z.", CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_wind_y,              "0.0",
+            "Global vertical wind velocity (m/s) along +Y applied "
+            "to SPH particles (#22). Positive = updraft; negative = "
+            "downdraft. Stacks with buoyancy.", CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_wind_z,              "0.0",
+            "Global horizontal wind velocity (m/s) along +Z applied "
+            "to SPH particles (#22).", CVAR_ARCHIVE);
+    // --- end Fluid Phase 3 ----------------------------------------------------
     // --- end Fluid Phase 1 -----------------------------------------------------
     // --- Motion blur (#85) ----------------------------------------------------
     // Cook-1984 style stochastic shutter-time sampling. Each primary ray
@@ -1789,6 +1893,14 @@ bool Engine::Init() {
     // `phys_enabled = 0` (StepPhysics returns immediately).
     physics_ = std::make_unique<pt::physics::PhysicsSystem>();
 
+    // SmokeSPH subsystem (Fluid Phase 3, #22). Allocated unconditionally
+    // for the same reason as PhysicsSystem -- the smoke_shockwave_at /
+    // smoke_sph_clear commands need a valid solver, and the per-frame
+    // StepSmokeSPH early-outs when r_smoke_mode == procedural OR no
+    // particles are alive. Cap is pushed via r_smoke_sph_max_particles
+    // before the first emitter spawn.
+    smoke_sph_ = std::make_unique<pt::sph::SmokeSPH>();
+
     // CSG scene -- the source of truth for triangle-mesh geometry from
     // P9 onward. Seeded with the headline drilled-cube scene so first-
     // frame renders something interesting. SDF Phase 1 (#97) fixtures
@@ -2298,6 +2410,11 @@ void Engine::TearDownDevice() {
         // --- Fluid Phase 1 (#136) ---------------------------------------------
         if (smoke_buffer_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{smoke_buffer_id_});
         // --- end Fluid Phase 1 ------------------------------------------------
+        // --- Fluid Phase 3 (#22) ---------------------------------------------
+        if (sph_particle_buffer_id_ != 0) {
+            device_->DestroyBuffer(pt::rhi::BufferHandle{sph_particle_buffer_id_});
+        }
+        // --- end Fluid Phase 3 -----------------------------------------------
         if (denoise_color_tex_id_    != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
         if (depth_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
         if (motion_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
@@ -2381,6 +2498,9 @@ void Engine::TearDownDevice() {
     // --- end Light tree ----------------------------------------------------
     // --- Fluid Phase 1 (#136) ---------------------------------------------
     smoke_buffer_id_       = 0;
+    sph_particle_buffer_id_     = 0;
+    sph_particle_capacity_      = 0;
+    sph_particle_count_uploaded_ = 0;
     smoke_buffer_capacity_ = 0;
     smoke_count_uploaded_  = 0;
     // --- end Fluid Phase 1 ------------------------------------------------
@@ -5159,6 +5279,12 @@ void Engine::RenderFrame() {
     // doesn't need a dirty flag. Cheap: 16 emitters * 48 B = 768 B.
     EnsureSmokeEmittersUploaded();
     // --- end Fluid Phase 1 -------------------------------------------------
+    // --- Fluid Phase 3 (#22) -- SPH particle upload ------------------------
+    // Re-upload the live particle splat list. Bound to slot 16 by the
+    // path-tracer dispatch bind block below. Cheap at the default 1024
+    // cap (~32 KB / frame).
+    EnsureSmokeSphUploaded();
+    // --- end Fluid Phase 3 -------------------------------------------------
 
     auto& C = pt::console::Console::Get();
 
@@ -6091,6 +6217,17 @@ void Engine::RenderFrame() {
         : pt::rhi::BufferHandle{placeholder_storage_id_};
     if (slot15.id != 0) cb->BindBuffer(15, slot15, 0);
     // --- end Fluid Phase 1 -------------------------------------------------
+    // --- Fluid Phase 3 (#22) -- SPH particle SSBO --------------------------
+    // SPH particle list at engine slot 16 / vk::binding 31. Always-bound
+    // (placeholder fallback) for the same max-bound + 1 push-slot rule
+    // smoke_emitters obeys; the shader's smoke_sph_density_add gates on
+    // push.smoke_sph_params.x > 0. Buffer is updated by
+    // EnsureSmokeSphUploaded earlier in the frame.
+    pt::rhi::BufferHandle slot16 = (sph_particle_buffer_id_ != 0)
+        ? pt::rhi::BufferHandle{sph_particle_buffer_id_}
+        : pt::rhi::BufferHandle{placeholder_storage_id_};
+    if (slot16.id != 0) cb->BindBuffer(16, slot16, 0);
+    // --- end Fluid Phase 3 -------------------------------------------------
     // Engine slots 11/12/13 -> vk::bindings 24/25/26: the MetalFX
     // specular-guidance trio (issue #118). Path tracer writes them
     // alongside the existing G-buffers when the write_specular_*_gbuffer
@@ -6446,6 +6583,19 @@ void Engine::RenderFrame() {
         // One vec4 = 16 B. All four read by smoke_density_add* in PathTrace.slang.
         float smoke_params3[4];
         // --- end Fluid wave-6 --------------------------------------------
+        // --- Fluid Phase 3 (#22) -- SPH smoke fluid sim -------------------
+        // smoke_sph_params.x = sph_particle_count_uploaded (0 disables
+        //                       the smoke_sph_density_add loop)
+        //                 .y = smoke_mode enum (0 procedural, 1 sph, 2 both)
+        //                 .z = render_density_floor (per-particle splat
+        //                       density floor; subtracted before exp()
+        //                       falloff so ambient-pressure particles
+        //                       don't fill the world with fog)
+        //                 .w = sph_particle_capacity (informational; the
+        //                       shader uses .x as the loop bound)
+        // One vec4 = 16 B.
+        float smoke_sph_params[4];
+        // --- end Fluid Phase 3 -------------------------------------------
         // --- Motion blur (#85) -------------------------------------------
         // motion_blur_params.x = r_motion_blur (1 = enable shutter-time
         //                       jitter + per-prim prev_pos lerp; 0 =
@@ -7552,6 +7702,38 @@ void Engine::RenderFrame() {
         push.smoke_params3[2] = decay_shape;
         push.smoke_params3[3] = age_tint;
         // --- end Fluid wave-6 ---------------------------------------------
+        // --- Fluid Phase 3 (#22) -- SPH push fields -----------------------
+        // Pack: (count, mode, density_floor, capacity). When r_smoke_mode
+        // != procedural AND the solver has live particles, .x is
+        // non-zero and the shader's smoke_sph_density_add loop runs.
+        // Procedural mode pins .x = 0 so the loop is bypassed (loop bound
+        // is push-driven; Slang's MSL backend folds the early-out).
+        std::string smoke_mode_str = "procedural";
+        if (auto* v = C.FindCVar("r_smoke_mode")) smoke_mode_str = v->value;
+        // 0 = procedural, 1 = sph, 2 = both.
+        int smoke_mode_int = 0;
+        if (smoke_mode_str == "sph")  smoke_mode_int = 1;
+        if (smoke_mode_str == "both") smoke_mode_int = 2;
+        bool sph_consumed = (smoke_mode_int != 0);
+        float floor_dens = 0.5f;
+        if (auto* v = C.FindCVar("r_smoke_sph_density_floor")) floor_dens = v->GetFloat();
+        if (floor_dens < 0.0f) floor_dens = 0.0f;
+        push.smoke_sph_params[0] = sph_consumed
+            ? static_cast<float>(sph_particle_count_uploaded_)
+            : 0.0f;
+        push.smoke_sph_params[1] = static_cast<float>(smoke_mode_int);
+        push.smoke_sph_params[2] = floor_dens;
+        push.smoke_sph_params[3] = static_cast<float>(sph_particle_capacity_);
+        // When the SPH mode is "sph" (not "both"), suppress the
+        // procedural smoke_density_add loop by zeroing smoke_params.x
+        // so the shader's loop bound becomes 0 (no contribution).
+        // The Phase 2 emitter list stays on the GPU side as the
+        // SOURCE of SPH emitters; just the procedural visualisation
+        // is skipped.
+        if (smoke_mode_int == 1) {
+            push.smoke_params[0] = 0.0f;
+        }
+        // --- end Fluid Phase 3 --------------------------------------------
     }
     // --- end Fluid Phase 1 -------------------------------------------------
     // --- Motion blur (#85) -------------------------------------------------
@@ -7764,6 +7946,8 @@ void Engine::RenderFrame() {
     //                              puff_count, expansion_rate)
     //   +16 Fluid wave-6      — smoke_params3 vec4 (turb_scale, turb_amp,
     //                              decay_shape, age_tint_strength)
+    //   +16 Fluid Phase 3 (#22) — smoke_sph_params vec4 (count, mode,
+    //                              density_floor, capacity)
     //   +16 Motion blur (#85) — motion_blur_params vec4 (enabled, shutter_speed,
     //                              _pad, _pad)
     //   +16 Water Phase 4 (#134) — water_state vec4 (in_water flag, deep_color_rgb)
@@ -7773,7 +7957,9 @@ void Engine::RenderFrame() {
     //   +32 Mesh motion blur (#21 wave-7) — mesh_motion_prev + mesh_motion_curr,
     //                              two vec4s: prev_translation.xyz + active flag,
     //                              curr_translation.xyz + _pad
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 32);
+    //   +16 Smoke SPH Phase 3 (#22 wave-7) — smoke_sph_params vec4 (count, mode,
+    //                              density_floor, capacity)
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 32 + 16);
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
     // cbuffer layout the Slang compiler applies to PathTrace.slang's
@@ -7839,6 +8025,10 @@ void Engine::RenderFrame() {
     // Fluid wave-6 block ("looks like smoke" turbulence + age-tint).
     static_assert(offsetof(PtPush, smoke_params3) % 16 == 0,
                   "PtPush::smoke_params3 must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    // Fluid Phase 3 SPH block (#22).
+    static_assert(offsetof(PtPush, smoke_sph_params) % 16 == 0,
+                  "PtPush::smoke_sph_params must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     // Motion blur block (#85).
     static_assert(offsetof(PtPush, motion_blur_params) % 16 == 0,
@@ -10600,6 +10790,13 @@ void Engine::Tick(double dt) {
     // EnsurePrimitivesUploaded re-packs the analytic-prim buffer +
     // refits the BVH. No-op when phys_enabled = 0 or no particles exist.
     StepPhysics(static_cast<float>(dt));
+
+    // --- Fluid Phase 3 (#22) -- SPH smoke step ---------------------------
+    // Step the SmokeSPH solver BEFORE RenderFrame so the particle
+    // buffer reflects the current frame's positions when the path
+    // tracer reads them. No-op when r_smoke_mode == procedural.
+    StepSmokeSPH(static_cast<float>(dt));
+    // --- end Fluid Phase 3 -----------------------------------------------
 
     auto t0 = std::chrono::steady_clock::now();
     RenderFrame();
@@ -13606,6 +13803,10 @@ void Engine::RegisterCommands() {
     // --- Fluid Phase 1 (#136) -- smoke emitters --------------------------------
     RegisterSmokeCommands();
     // --- end Fluid Phase 1 -----------------------------------------------------
+    // --- Fluid Phase 3 (#22) -- SPH smoke commands -----------------------------
+    // smoke_shockwave_at, smoke_sph_clear, smoke_sph_list, smoke_sph_status.
+    RegisterSmokeSphCommands();
+    // --- end Fluid Phase 3 -----------------------------------------------------
     // --- Voxel destruction Phase 1 (#140) --------------------------------------
     // r_voxelize_demo is a boolean toggle so it joins the {"0","1"}
     // allowed-values pool used by `toggle` and CLI override validation
@@ -18226,6 +18427,227 @@ void Engine::RegisterSmokeCommands() {
         });
 }
 // --- end Fluid Phase 1 -----------------------------------------------------
+
+// --- Fluid Phase 3 (#22) -- SPH smoke fluid sim ------------------------
+// CPU SPH solver step + GPU upload + console commands. The solver
+// owns the particle pool (pt::sph::SmokeSPH); the engine bridges
+// between the solver, the smoke_emitters_ list (which becomes the
+// solver's emitter set when r_smoke_mode != procedural), and the
+// shader's particle SSBO (slot 16 / vk::binding 31).
+
+void Engine::StepSmokeSPH(float dt) {
+    if (!smoke_sph_) return;
+    auto& C = pt::console::Console::Get();
+
+    // Determine the mode. When procedural, the solver still gets to
+    // age out any particles in flight from a previous mode switch,
+    // but we don't spawn new ones.
+    std::string mode = "procedural";
+    if (auto* v = C.FindCVar("r_smoke_mode")) mode = v->value;
+    const bool sph_mode = (mode == "sph") || (mode == "both");
+
+    // Update tunables. All cvars are pulled each frame so live edits
+    // (via console) take effect on the next tick.
+    auto& cfg = smoke_sph_->MutableConfig();
+    if (auto* v = C.FindCVar("r_smoke_buoyancy")) {
+        const float b = v->GetFloat();
+        cfg.buoyancy_scale = (b >= 0.0f) ? b : 0.0f;
+    }
+    if (auto* v = C.FindCVar("r_smoke_viscosity")) {
+        const float mu = v->GetFloat();
+        cfg.viscosity = (mu >= 0.0f) ? mu : 0.0f;
+    }
+    float wind_x = 0.0f, wind_y = 0.0f, wind_z = 0.0f;
+    if (auto* v = C.FindCVar("r_smoke_wind_x")) wind_x = v->GetFloat();
+    if (auto* v = C.FindCVar("r_smoke_wind_y")) wind_y = v->GetFloat();
+    if (auto* v = C.FindCVar("r_smoke_wind_z")) wind_z = v->GetFloat();
+    cfg.wind = glm::vec3(wind_x, wind_y, wind_z);
+
+    // Apply r_smoke_sph_max_particles. SetMaxParticles is idempotent
+    // when the value matches.
+    int cap = 1024;
+    if (auto* v = C.FindCVar("r_smoke_sph_max_particles")) cap = v->GetInt();
+    if (cap < 16)   cap = 16;
+    if (cap > 4096) cap = 4096;
+    smoke_sph_->SetMaxParticles(static_cast<std::uint32_t>(cap));
+
+    // Translate the smoke_emitters_ list into SmokeSPH emitter
+    // params each tick. spawn_rate / lifetime / particle radius
+    // come from the new r_smoke_sph_* cvars (per-emitter values are
+    // outside Phase 3 scope; one rate applies to all emitters).
+    float emit_rate = 0.0f;
+    if (sph_mode) {
+        if (auto* v = C.FindCVar("r_smoke_sph_emit_rate")) emit_rate = v->GetFloat();
+        if (emit_rate < 0.0f) emit_rate = 0.0f;
+    }
+    float lifetime = 6.0f;
+    if (auto* v = C.FindCVar("r_smoke_sph_particle_lifetime")) lifetime = v->GetFloat();
+    if (lifetime < 0.1f) lifetime = 0.1f;
+    float prad = 0.3f;
+    if (auto* v = C.FindCVar("r_smoke_sph_particle_radius")) prad = v->GetFloat();
+    if (prad < 0.01f) prad = 0.01f;
+    float emit_temp = 600.0f;
+    if (auto* v = C.FindCVar("r_smoke_emitter_temp")) emit_temp = v->GetFloat();
+    if (emit_temp < 50.0f) emit_temp = 50.0f;
+
+    std::vector<pt::sph::SmokeSPH::EmitterParams> sph_emitters;
+    sph_emitters.reserve(smoke_emitters_.size());
+    for (const auto& E : smoke_emitters_) {
+        pt::sph::SmokeSPH::EmitterParams ep;
+        ep.pos        = glm::vec3(E.pos[0], E.pos[1], E.pos[2]);
+        ep.velocity   = glm::vec3(E.velocity[0], E.velocity[1], E.velocity[2]);
+        ep.radius     = E.radius;
+        ep.temperature_kelvin = emit_temp;
+        ep.spawn_rate = emit_rate;
+        ep.lifetime_s = lifetime;
+        ep.particle_radius = prad;
+        ep.particle_mass   = 0.02f;
+        ep.initial_density_offset = 0.0f;
+        sph_emitters.push_back(ep);
+    }
+    smoke_sph_->SetEmitters(std::move(sph_emitters));
+
+    // Run the solver. The solver itself is a no-op when nothing is
+    // alive and no emitters are bound.
+    smoke_sph_->Step(dt);
+
+    // Diagnostic log: emit alive-count + centre-of-mass once when
+    // SPH mode first kicks on. Subsequent ticks are silent unless
+    // the mode changes back. Lets a smoke-test verify the solver is
+    // alive without spamming the log at 60 fps.
+    static bool sph_log_armed = true;
+    if (sph_mode) {
+        if (sph_log_armed && smoke_sph_->AliveCount() > 0) {
+            const auto stats = smoke_sph_->ComputeGridStats();
+            const auto com = smoke_sph_->ComputeCentreOfMass();
+            LOG_INFO("smoke_sph: mode={} alive={} cap={} mean_density={:.3f} "
+                     "com=({:.2f} {:.2f} {:.2f}) wind=({:.2f} {:.2f} {:.2f})",
+                     mode, stats.live_particles, smoke_sph_->MaxParticles(),
+                     stats.mean_density, com.x, com.y, com.z,
+                     cfg.wind.x, cfg.wind.y, cfg.wind.z);
+            sph_log_armed = false;
+        }
+    } else {
+        sph_log_armed = true;
+    }
+}
+
+void Engine::EnsureSmokeSphUploaded() {
+    if (!device_) return;
+    if (!smoke_sph_) return;
+    constexpr std::uint32_t kFloatsPerParticle = 8;  // 2 float4s = 32 B
+    constexpr std::uint32_t kBytesPerParticle  = sizeof(float) * kFloatsPerParticle;
+
+    // Cap the GPU buffer at the maximum the user could request. We
+    // allocate once on first use; later changes to r_smoke_sph_max_particles
+    // trigger a reallocate.
+    const std::uint32_t desired_cap = smoke_sph_->MaxParticles();
+    if (sph_particle_buffer_id_ == 0 || sph_particle_capacity_ != desired_cap) {
+        if (sph_particle_buffer_id_ != 0) {
+            device_->DestroyBuffer(pt::rhi::BufferHandle{sph_particle_buffer_id_});
+            sph_particle_buffer_id_ = 0;
+        }
+        // Floor at one particle's worth so the buffer is always
+        // non-zero (the placeholder fallback in BindBuffer would
+        // otherwise kick in, which is fine but wastes a re-bind).
+        const std::uint32_t cap_alloc = std::max<std::uint32_t>(desired_cap, 1u);
+        auto buf = device_->CreateBuffer({
+            .size       = std::size_t(cap_alloc) * kBytesPerParticle,
+            .usage      = pt::rhi::BufferUsage::Storage,
+            .debug_name = "sph_particles",
+        });
+        if (buf.id == 0) {
+            LOG_ERROR("SPH particle buffer allocation failed");
+            return;
+        }
+        sph_particle_buffer_id_  = buf.id;
+        sph_particle_capacity_   = cap_alloc;
+    }
+
+    // Pack the alive particles. PackForGpu returns the number written.
+    float rad_scale = 1.0f;
+    auto& C = pt::console::Console::Get();
+    if (auto* v = C.FindCVar("r_smoke_sph_render_radius_scale")) rad_scale = v->GetFloat();
+    if (rad_scale <= 0.0f) rad_scale = 1.0f;
+    float dens_scale = 2.0f;
+    if (auto* v = C.FindCVar("r_smoke_sph_render_density_scale")) dens_scale = v->GetFloat();
+    if (dens_scale < 0.0f) dens_scale = 0.0f;
+
+    std::vector<float> packed(std::size_t(sph_particle_capacity_) * kFloatsPerParticle, 0.0f);
+    const std::uint32_t n = smoke_sph_->PackForGpu(packed.data(),
+        static_cast<std::uint32_t>(packed.size()), rad_scale, dens_scale);
+    device_->WriteBuffer(pt::rhi::BufferHandle{sph_particle_buffer_id_},
+                         packed.data(), packed.size() * sizeof(float));
+    sph_particle_count_uploaded_ = n;
+}
+
+void Engine::RegisterSmokeSphCommands() {
+    auto& C = pt::console::Console::Get();
+
+    C.RegisterCommand("smoke_shockwave_at",
+        "smoke_shockwave_at <x> <y> <z> <strength_J> [radius=5]: "
+        "queue a radial impulse at world-space (x,y,z) with the given "
+        "total energy in joules (#22). Each SPH particle within "
+        "`radius` metres receives an outward impulse proportional to "
+        "sqrt(2*E/m) * (1 - dist/radius). Stacks if called multiple "
+        "times per frame. Requires r_smoke_mode != procedural to "
+        "have visible effect (the procedural puff-chain ignores the "
+        "queue).",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() < 4 || args.size() > 5) {
+                out.PrintLine("usage: smoke_shockwave_at <x> <y> <z> <strength_J> [radius]");
+                return;
+            }
+            float x, y, z, e_j;
+            float radius = 5.0f;
+            if (!ParseFloat(args[0], x) || !ParseFloat(args[1], y) ||
+                !ParseFloat(args[2], z) || !ParseFloat(args[3], e_j)) {
+                out.PrintLine("smoke_shockwave_at: numeric args required");
+                return;
+            }
+            if (args.size() == 5 && !ParseFloat(args[4], radius)) {
+                out.PrintLine("smoke_shockwave_at: radius must be numeric");
+                return;
+            }
+            if (radius <= 0.0f) radius = 5.0f;
+            if (!smoke_sph_) {
+                out.PrintLine("smoke_shockwave_at: SPH solver unavailable");
+                return;
+            }
+            smoke_sph_->QueueShockwave(glm::vec3(x, y, z), std::max(e_j, 0.0f), radius);
+            accum_dirty_ = true;
+            out.FormatLine("smoke: queued shockwave at ({:.2f} {:.2f} {:.2f}) "
+                           "strength={:.2f} J radius={:.2f} m",
+                           x, y, z, e_j, radius);
+        });
+
+    C.RegisterCommand("smoke_sph_clear",
+        "Drop all SPH particles + emitter spawn debt (#22). Idempotent.",
+        [this](auto, pt::console::Output& out) {
+            if (!smoke_sph_) { out.PrintLine("(SPH solver unavailable)"); return; }
+            smoke_sph_->Clear();
+            sph_particle_count_uploaded_ = 0;
+            accum_dirty_ = true;
+            out.PrintLine("smoke: SPH particles cleared");
+        });
+
+    C.RegisterCommand("smoke_sph_status",
+        "Report SPH solver state: live particles, mode, grid stats (#22).",
+        [this](auto, pt::console::Output& out) {
+            if (!smoke_sph_) { out.PrintLine("(SPH solver unavailable)"); return; }
+            const auto stats = smoke_sph_->ComputeGridStats();
+            auto& CC = pt::console::Console::Get();
+            std::string mode = "procedural";
+            if (auto* v = CC.FindCVar("r_smoke_mode")) mode = v->value;
+            out.FormatLine(
+                "smoke_sph: mode={} alive={} cap={} uploaded={} "
+                "buckets={} max_bucket_pop={} mean_density={:.3f}",
+                mode, stats.live_particles, smoke_sph_->MaxParticles(),
+                sph_particle_count_uploaded_, stats.buckets,
+                stats.max_bucket_pop, stats.mean_density);
+        });
+}
+// --- end Fluid Phase 3 -----------------------------------------------------
 
 bool Engine::VoxelizeSourceObject(std::uint32_t source_id, float voxel_size,
                                   std::string* out_summary) {
