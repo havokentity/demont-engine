@@ -821,10 +821,27 @@ cbuffer Push {
     // --- Fluid Phase 2 (#180) -- advected emission ----------------------------
     // smoke_params2.x = r_smoke_lifetime          (seconds, >= 0)
     //              .y = r_smoke_advection_strength (multiplier on emitter vel)
-    //              .z = r_smoke_puff_count        (1..8, integer-as-float)
+    //              .z = r_smoke_puff_count        (1..16, integer-as-float)
     //              .w = r_smoke_expansion_rate    (per-second radius growth)
     float4 smoke_params2;
     // --- end Fluid Phase 2 ----------------------------------------------------
+    // --- Fluid wave-6 -- "looks like smoke" pass ------------------------------
+    // smoke_params3.x = r_smoke_turbulence_scale   (cycles per puff radius;
+    //                    larger = finer wisps, ~4 = high-freq fine detail).
+    //              .y = r_smoke_turbulence_amplitude (0=no modulation; 1=full
+    //                    replacement of the Gaussian by noise-modulated
+    //                    density; ~0.6 reads as natural).
+    //              .z = r_smoke_decay_shape (exponent on the age-fade curve.
+    //                    1 = legacy linear (1 - age/lifetime); 2 = quadratic
+    //                    so heads stay denser and tails wisp away faster.
+    //                    3-4 give a sharper "fresh head, vanishing tail" look).
+    //              .w = r_smoke_age_tint_strength (0..1 amount of age-driven
+    //                    warm->cool tint applied to fresh vs old puffs. 0
+    //                    disables the gradient; 0.2-0.3 reads as natural
+    //                    real-world smoke; 1.0 maxes out the warm/cool
+    //                    contrast across the lifetime).
+    float4 smoke_params3;
+    // --- end Fluid wave-6 -----------------------------------------------------
     // --- Motion blur (#85) ----------------------------------------------------
     // motion_blur_params.x = r_motion_blur (1 = stochastic shutter-time
     //                         sampling for per-ray motion blur; 0 = legacy
@@ -947,6 +964,8 @@ cbuffer Frame {
     float4 smoke_params;
     // See `smoke_params2` in the Metal Push cbuffer above (#180).
     float4 smoke_params2;
+    // See `smoke_params3` in the Metal Push cbuffer above (wave-6).
+    float4 smoke_params3;
     // See `motion_blur_params` in the Metal Push cbuffer above (#85).
     float4 motion_blur_params;
     // See `editor_params` in the Metal Push cbuffer above (agent-19).
@@ -2801,12 +2820,64 @@ LightSample sampleAnalyticLight(float3 hit_pt, float3 n_face, inout uint seed) {
 // steeper near-source profile; higher exponents harden the core /
 // soften the wings (useful for soot vs steam).
 //
-// Capped at 16 emitters x 8 puffs via the kMaxSmokeEmitters / kSmokePuffMax
+// Capped at 16 emitters x 16 puffs via the kMaxSmokeEmitters / kSmokePuffMax
 // constants; the host further clamps via r_smoke_max_emitters and
 // r_smoke_puff_count. Inner puff loop is `[loop]` because the bound is
 // push-driven (varies per dispatch); Slang's MSL backend produces tight
-// code at N<=8.
-static const int kSmokePuffMax = 8;
+// code at N<=16.
+//
+// Wave-6 "looks like smoke" upgrades:
+//   * kSmokePuffMax bumped from 8 -> 16 so a column reads as continuous
+//     rather than as a string of discrete blobs.
+//   * Per-puff density modulated by a 3-octave fbm (cloud_fbm) so the
+//     Gaussian core gets natural wispy turbulence detail instead of a
+//     smooth blob look.
+//   * Age-fade curve takes an exponent (smoke_params3.z) so the head
+//     stays dense and the tail wisps away faster than the legacy linear
+//     fade; exp=1 recovers Phase 2's bit-exact (1 - age/lifetime) shape.
+static const int kSmokePuffMax = 16;
+
+// Smoke-specific 3-octave fbm sampling using the cloud_fbm helper imported
+// from PathTraceCloud. Sampled in WORLD space (not puff-local) so adjacent
+// overlapping puffs see DECORRELATED noise contributions -- this is what
+// lets the chain of puffs read as a single continuous turbulent column
+// rather than a stack of identically-textured blobs.
+//
+// Returns a noise value in roughly [0..1]. Sample positions are scaled
+// by `freq` (cycles per metre at the base radius) which the host pushes
+// via smoke_params3.x; freq=4 reads as fine high-frequency wisps.
+float smoke_turbulence_noise(float3 world_pos, float age, float freq) {
+    // Domain-warp by age in seconds: the warp offset is small relative
+    // to the noise period so older puffs see a slightly shifted slice
+    // of the underlying field. Combined with the world-space input this
+    // gives each puff its own portion of noise, so overlap blends
+    // multi-frequency rather than just multiplying the same pattern.
+    float3 warp = float3(age * 0.7, age * 1.3, age * 0.5);
+    float3 q = world_pos * freq + warp;
+    // 3 octaves: enough for fine wisps without inflating the per-sample
+    // cost dramatically. Octave count fixed at compile time (not a
+    // cvar) -- the visual difference between 3 and 4 is small but the
+    // perf delta is ~25%; keep it tight.
+    return cloud_fbm(q, 3);
+}
+
+// 3D curl-style noise displacement for domain-warping the smoke sample
+// position. Returns a vector roughly in [-1..1]^3 that we displace the
+// sample position by before density evaluation. Three decorrelated
+// noise taps at large offsets -- similar idea to cloud_curl_noise in
+// PathTraceCloud.slang but cheap (one fbm per component, no central
+// differences) since visual divergence-freeness doesn't matter for the
+// smoke silhouette breakup. The point is to PERTURB the Gaussian's
+// centre as seen from a given world point so the COMBINED chain of
+// puffs no longer reads as a smooth oval body.
+float3 smoke_warp_offset(float3 world_pos, float age, float freq) {
+    float3 q = world_pos * freq + float3(age * 0.5, age * 0.8, age * 1.1);
+    float nx = cloud_fbm(q + float3(  0.0,   0.0,   0.0), 2);
+    float ny = cloud_fbm(q + float3(173.7, 211.3,  31.7), 2);
+    float nz = cloud_fbm(q + float3(311.1,  47.3, 593.9), 2);
+    // Each octave-2 fbm returns [0..1]; centre to [-1..1] then return.
+    return float3(2.0 * nx - 1.0, 2.0 * ny - 1.0, 2.0 * nz - 1.0);
+}
 
 float smoke_density_add(float3 pos) {
     float smoke_on = smoke_params.y;
@@ -2830,6 +2901,10 @@ float smoke_density_add(float3 pos) {
     if (puff_count > kSmokePuffMax) puff_count = kSmokePuffMax;
     float expansion = max(smoke_params2.w, 0.0);
     bool  chain     = (lifetime > 0.0) && (puff_count > 1);
+    // Wave-6 turbulence + decay-shape knobs (smoke_params3).
+    float turb_freq  = max(smoke_params3.x, 0.0);
+    float turb_amp   = clamp(smoke_params3.y, 0.0, 1.0);
+    float decay_exp  = max(smoke_params3.z, 1.0);
     float dens = 0.0;
     [loop] for (int i = 0; i < n; ++i) {
         float4 v0 = smoke_emitters[i * 3 + 0];
@@ -2873,13 +2948,36 @@ float smoke_density_add(float3 pos) {
             float a_norm = (P > 1) ? (float(k) / float(P - 1)) : 0.0;
             float age    = a_norm * span + t_offset;
             if (age > span) age -= span;   // wrap-around cycle
-            // Linear density fade. peak * (1 - age/lifetime).
+            // Age-fade curve. peak * pow(1 - age/lifetime, decay_exp).
+            // decay_exp = 1 recovers Phase 2's linear fade bit-exact;
+            // decay_exp = 2 (default) keeps heads denser and tails wisp
+            // away faster -- the characteristic "fresh puff, vanishing
+            // tail" shape of real smoke columns.
             // No chain => density is just peak (Phase 1 bit-exact).
             float a_t  = (span > 0.0) ? clamp(age / span, 0.0, 1.0) : 0.0;
-            float dfade = chain ? (1.0 - a_t) : 1.0;
+            float dfade = chain ? pow(1.0 - a_t, decay_exp) : 1.0;
             float3 cur  = base + vel * (adv_strength * age);
             float  rad  = radius * (1.0 + expansion * age);
-            float3 d    = pos - cur;
+            // Wave-6 domain warp: displace the sample position before
+            // the puff-Gaussian lookup so each puff's silhouette is
+            // BENT by the noise field rather than just modulated. This
+            // is the missing piece that makes the COMBINED chain of
+            // puffs look like turbulent wisps instead of a smooth oval
+            // (per-puff multiplicative noise alone gets averaged away
+            // by 16 overlapping Gaussians; warping the LOOKUP position
+            // affects every puff that sees this world point, so the
+            // perturbation accumulates rather than cancelling).
+            // Warp magnitude grows with age so head puffs (the freshest
+            // source) stay relatively crisp and tail puffs get strongly
+            // perturbed -- real smoke columns are sharp at the source
+            // and increasingly diffuse upward.
+            float3 pos_warped = pos;
+            if (turb_amp > 0.0 && turb_freq > 0.0) {
+                float warp_mag = rad * turb_amp * (0.3 + 0.7 * a_t);
+                float3 ofs = smoke_warp_offset(pos, age, turb_freq * 0.5);
+                pos_warped = pos + ofs * warp_mag;
+            }
+            float3 d    = pos_warped - cur;
             float  r2   = dot(d, d);
             float cutoff = 16.0 * rad * rad;
             if (r2 > cutoff) continue;
@@ -2889,7 +2987,40 @@ float smoke_density_add(float3 pos) {
             // this is the canonical Gaussian; falloff=1 = exp(-u)
             // (sharper near-source); higher values harden the core.
             float w = exp(-pow(u, falloff));
-            dens += peak * dfade * w;
+            // Wave-6 turbulence modulation. Sample noise in WORLD space
+            // (not puff-local) so overlapping puffs see decorrelated
+            // wisps -- this is what produces visible internal structure
+            // when the puff chain overlaps densely. amp=0 collapses to
+            // Phase 2 bit-exact; amp=1 lets noise fully ERODE the
+            // Gaussian wings into wisps. freq is in cycles/m for
+            // intuitive scene tuning. The per-puff age adds a small
+            // domain warp so the column appears to flow rather than
+            // being pinned to world coords.
+            //
+            // EDGE erosion: weight the modulation by (1-w)^2 so the
+            // dense core (w~1) is barely modulated -- preserves a
+            // recognisable column body -- but the soft Gaussian outer
+            // wings (small w, where w*turb dominates the silhouette)
+            // get the FULL amp range of noise subtraction. Below the
+            // erosion threshold the density goes negative and gets
+            // clamped to 0, producing the wispy fingered silhouette
+            // of real smoke vs. a smooth Gaussian oval. Same
+            // (1-density)^2 wing-mask idea as cloud_density_at's
+            // hi-frequency edge erosion (PathTraceCloud.slang).
+            float turb_contrib = peak * dfade * w;
+            if (turb_amp > 0.0 && turb_freq > 0.0) {
+                float n_val = smoke_turbulence_noise(pos, age, turb_freq);
+                float edge  = (1.0 - w) * (1.0 - w);
+                // n_val [0..1] -> bias [-1..+1]; multiplied by amp and
+                // edge to keep dense cores stable. Cores keep ~peak*w,
+                // wings get sculpted into wisps.
+                float bias  = (2.0 * n_val - 1.0) * turb_amp * edge;
+                // Center sample modulation (small w, large edge) can
+                // push density well below 0, which max() clamps. Body
+                // samples (large w, edge~0) are nearly unmodulated.
+                turb_contrib = max(0.0, turb_contrib * (1.0 + bias) - turb_amp * edge * 0.3);
+            }
+            dens += turb_contrib;
         }
     }
     return dens;
@@ -2934,6 +3065,11 @@ float smoke_density_add_tinted(float3 pos, out float3 out_tint) {
     if (puff_count > kSmokePuffMax) puff_count = kSmokePuffMax;
     float expansion = max(smoke_params2.w, 0.0);
     bool  chain     = (lifetime > 0.0) && (puff_count > 1);
+    // Wave-6 turbulence + decay-shape + age-tint knobs.
+    float turb_freq    = max(smoke_params3.x, 0.0);
+    float turb_amp     = clamp(smoke_params3.y, 0.0, 1.0);
+    float decay_exp    = max(smoke_params3.z, 1.0);
+    float age_tint_str = clamp(smoke_params3.w, 0.0, 1.0);
     float  dens     = 0.0;
     float3 tint_acc = float3(0.0, 0.0, 0.0);
     [loop] for (int i = 0; i < n; ++i) {
@@ -2961,19 +3097,54 @@ float smoke_density_add_tinted(float3 pos, out float3 out_tint) {
             float age    = a_norm * span + t_offset;
             if (age > span) age -= span;
             float a_t   = (span > 0.0) ? clamp(age / span, 0.0, 1.0) : 0.0;
-            float dfade = chain ? (1.0 - a_t) : 1.0;
+            // Wave-6: pow(1-age, decay_exp) tail-wisp shape (see
+            // smoke_density_add for rationale; decay_exp=1 is bit-exact
+            // legacy linear fade).
+            float dfade = chain ? pow(1.0 - a_t, decay_exp) : 1.0;
             float3 cur  = base + vel * (adv_strength * age);
             float  rad  = radius * (1.0 + expansion * age);
-            float3 d    = pos - cur;
+            // Wave-6 domain warp: see smoke_density_add for rationale.
+            // Keep both functions identical so the tinted in-scatter
+            // path and the shadow path agree on silhouette geometry.
+            float3 pos_warped = pos;
+            if (turb_amp > 0.0 && turb_freq > 0.0) {
+                float warp_mag = rad * turb_amp * (0.3 + 0.7 * a_t);
+                float3 ofs = smoke_warp_offset(pos, age, turb_freq * 0.5);
+                pos_warped = pos + ofs * warp_mag;
+            }
+            float3 d    = pos_warped - cur;
             float  r2   = dot(d, d);
             float cutoff = 16.0 * rad * rad;
             if (r2 > cutoff) continue;
             float r = sqrt(r2);
             float u = r / rad;
             float w = exp(-pow(u, falloff));
+            // Wave-6 turbulence modulation (see smoke_density_add for
+            // shape rationale; amp=0 collapses to Phase 2 bit-exact).
+            // Edge-erosion form: wings get sculpted into wisps, core
+            // stays stable.
             float di = peak * dfade * w;
+            if (turb_amp > 0.0 && turb_freq > 0.0) {
+                float n_val = smoke_turbulence_noise(pos, age, turb_freq);
+                float edge  = (1.0 - w) * (1.0 - w);
+                float bias  = (2.0 * n_val - 1.0) * turb_amp * edge;
+                di = max(0.0, di * (1.0 + bias) - turb_amp * edge * 0.3);
+            }
+            // Wave-6 age tint gradient. Lerps the per-emitter base tint
+            // toward a slightly cooler grey-blue as the puff ages -- the
+            // characteristic real-world look of older smoke that has
+            // drifted up and cooled. age_tint_str=0 collapses to
+            // legacy behaviour (per-puff tint == per-emitter tint).
+            // Fresh puffs (a_t~0) get a faintly WARM tint; old puffs
+            // (a_t~1) get a faintly COOL tint. Centred so the
+            // density-weighted average roughly matches the legacy mean
+            // and exposure stays comparable.
+            float3 warm = float3(1.06, 1.00, 0.93);   // subtle yellow
+            float3 cool = float3(0.93, 0.96, 1.05);   // subtle blue-grey
+            float3 age_mod = lerp(warm, cool, a_t);
+            float3 puff_tint = lerp(tint, tint * age_mod, age_tint_str);
             dens     += di;
-            tint_acc += di * tint;
+            tint_acc += di * puff_tint;
         }
     }
     if (dens > 0.0) out_tint = tint_acc / dens;
@@ -4776,7 +4947,28 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 // gradient takes over visually.
                 if (t_out - t_in > 30000.0) t_in = t_out - 30000.0;
                 if (t_out > t_in) {
+                    // Wave-6: when smoke is active (especially smoke-only
+                    // scenes where the cloud field is off), the per-pixel
+                    // sample budget needs to be high enough that small
+                    // (~1-3m radius) smoke columns get more than 1 sample.
+                    // The legacy max(N, 12) was tuned for big diffuse
+                    // clouds where 12 samples across a 30km span is
+                    // plenty; for a 100m smoke march span 12 samples gives
+                    // 8m step, larger than the per-puff radius so the
+                    // shape reads as a single solid blob.
+                    //
+                    // Heuristic: when smoke is active and the march span
+                    // is short (< 200m, i.e. ground-level chimney /
+                    // campfire range, not horizon-spanning cloud bank),
+                    // bump Nc so dtc lands ~0.3-1m -- finer than the
+                    // smallest typical smoke puff radius. Bounded at 48
+                    // so the per-pixel cost stays under budget even when
+                    // r_volumetric_samples is the default 16.
                     int   Nc = max(N, 12);    // user slider can ask for more
+                    if (smoke_active && (t_out - t_in) < 200.0) {
+                        int target = int((t_out - t_in) * 1.0 + 0.5);  // ~1 sample/m
+                        Nc = clamp(target, Nc, 48);
+                    }
                     float dtc = (t_out - t_in) / float(Nc);
                     float jitc = randf(seed) * dtc;
                     float trans_eye_c = 1.0;
