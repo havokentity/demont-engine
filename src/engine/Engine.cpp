@@ -6279,6 +6279,39 @@ void Engine::RenderFrame() {
         restir_final_pipeline_id_    != 0 &&
         restir_reservoir_curr_buf_id_ != 0 &&
         light_count_uploaded_ > 0u;
+    // Issue #164 -- ReSTIR + MetalFX integration. MTLFXTemporalDenoisedScaler
+    // applies a TAA neighborhood color clamp that rejects bright per-pixel
+    // WRS spikes as outliers, nuking the ReSTIR-supplied analytic-light
+    // contribution to near-invisibility. The cleanest fix at MVP scope is
+    // to force-disable ReSTIR's primary-hit replacement when MetalFX is
+    // the active denoiser, so PathTrace's legacy per-spp single-light NEE
+    // runs inline and MetalFX sees dense per-pixel light contribution
+    // (which it handles correctly -- see the no-ReSTIR baseline showing
+    // brilliant floor lighting on the same scene). SVGF / NRD / OptiX
+    // keep ReSTIR engaged since their spatial filter spreads the spikes
+    // correctly.
+    //
+    // Gated AT the dispatch flag rather than the cvar so r_restir stays
+    // user-controllable -- the engine just refuses to engage the ReSTIR
+    // chain on MetalFX-family kinds. Must run BEFORE the PushConstants
+    // emit below (line 6837) so PathTrace.slang sees push.restir_enabled
+    // == 0 and falls into the legacy NEE branch.
+    const bool kind_is_metalfx_family =
+        (denoiser_kind_ == DenoiserKind::MetalFX             ||
+         denoiser_kind_ == DenoiserKind::SvgfBasicMetalFx    ||
+         denoiser_kind_ == DenoiserKind::SvgfAtrousMetalFx);
+    if (kind_is_metalfx_family && restir_dispatch_active) {
+        static bool s_restir_force_off_logged = false;
+        if (!s_restir_force_off_logged) {
+            LOG_INFO("engine: ReSTIR force-disabled for MetalFX-family kind "
+                     "(issue #164) -- MetalFX's TAA neighborhood clamp "
+                     "rejects ReSTIR's 1-survivor spike pattern, leaving "
+                     "analytic lights invisible. Falling back to PathTrace's "
+                     "per-spp legacy NEE for many-light variance.");
+            s_restir_force_off_logged = true;
+        }
+        restir_dispatch_active = false;
+    }
     push.restir_enabled = restir_dispatch_active ? 1u : 0u;
     // One-shot gate diagnostics: ONLY when r_restir = 1 but the gate
     // evaluates to 0 (so the user-visible "nothing happens" mismatch
@@ -6288,7 +6321,14 @@ void Engine::RenderFrame() {
     // the journal for the common case.
     {
         static bool s_restir_gate_failure_logged = false;
+        // Skip this generic gate-failure log when the MetalFX-family
+        // gate above already explained the disengagement (issue #164):
+        // the dedicated "ReSTIR force-disabled for MetalFX-family kind"
+        // log is the user-actionable message, and emitting the generic
+        // "denoiser_active=true, pipes=truetruetrue, ..." right after
+        // it would be redundant noise.
         if (restir_user_on && !restir_dispatch_active &&
+            !kind_is_metalfx_family &&
             !s_restir_gate_failure_logged) {
             LOG_INFO("engine: r_restir=1 but ReSTIR NOT dispatching "
                      "(denoiser_active={}, pipes_t/s/f={}{}{}, "
