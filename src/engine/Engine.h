@@ -1006,6 +1006,52 @@ private:
     // perf-cliff warning fires once per process, not on every CSG bake.
     bool                                        sw_mesh_perf_warning_fired_ = false;
 
+    // Mesh motion blur (wave-7 #21 follow-up to PR #85 analytic-prim
+    // motion blur). The baked CSG / glTF mesh sits in its
+    // untransformed "rest" frame (world origin for the canonical CSG
+    // demo bake). To extend Cook-1984 shutter-time sampling to
+    // triangle meshes without doubling vertex memory (the per-vertex
+    // prev-position buffer alternative), the engine tracks a per-mesh
+    // world translation pair (prev, curr). The shader computes
+    // effective(t01) = lerp(prev, curr, t01) at each ray's shutter
+    // sample and shifts the mesh ray origin by -effective(t01) before
+    // intersection -- equivalent to translating the baked mesh by
+    // +effective(t01) but compatible with the existing
+    // identity-transform TLAS so no per-frame BLAS / TLAS rebuild is
+    // required. Translation preserves normals so the existing
+    // ObjectToWorld normal pipeline is unchanged.
+    //
+    // The "current world position" of the mesh is
+    // mesh_curr_translation_ -- that's where shutter_t01 = 1.0 lands
+    // the rendered mesh, which the host pins as the no-motion-blur
+    // case (PR #85 plumbing). `mesh_step` snapshots curr -> prev
+    // BEFORE applying its delta, so one step produces exactly one
+    // shutter window of streak from prev to curr. Sequential steps
+    // chain the streak: each frame's prev is the previous frame's
+    // curr. `mesh_motion_reset` clears both.
+    //
+    // The translations are deliberately NOT zeroed on every CSG
+    // bake: a fresh bake replaces the vertex set in the baked
+    // (untransformed) frame, but any world-space translation the
+    // user has applied via `mesh_step` is independent of that frame
+    // and should survive a rebake (the alternative would teleport a
+    // moving mesh back to origin on every CSG topology edit). The
+    // CSG bake itself is async (see EnsureMeshUpdated), which is
+    // why the no-reset rule matters in practice: a late-exec fixture
+    // that issues `mesh_step` immediately after Init would otherwise
+    // have its translation wiped by the bake-complete Tick.
+    //
+    // Scope is intentionally translation-only (no rotation): rigid-
+    // body rotation around the mesh centroid would require either a
+    // per-instance transform in the TLAS (which we don't have yet)
+    // or transforming each ray's direction too, which would couple
+    // back into normal handling. Pure translation covers the
+    // headline use case (a rigid mesh slid across a frame) and the
+    // acceptance bar (streaked-mesh consistent with streaked-sphere
+    // in the analytic-prim path).
+    float                                       mesh_curr_translation_[3] = {0.0f, 0.0f, 0.0f};
+    float                                       mesh_prev_translation_[3] = {0.0f, 0.0f, 0.0f};
+
     // P10 denoiser G-buffer textures. Allocated lazily when r_denoiser
     // moves off "off" and freed on backend teardown / when denoiser is
     // disabled. Re-allocated on swapchain resize alongside accum_hdr.

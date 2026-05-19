@@ -827,6 +827,44 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
         MAX_DELTA 64 MEAN_DELTA 12 FAIL_PERCENT 5
         EXTRA "pt_smoke_late_exec ${CMAKE_SOURCE_DIR}/tests/goldens/scenes/phys_rb_demo_late.cfg")
     # --- end Physics Phase 2a rigid-body fixtures -------------------------
+
+    # --- Mesh motion blur (wave-7 #21, follow-up to PR #85) ---------------
+    # motion_blur_mesh fixture exercises PathTrace.slang's mesh ray-shift
+    # path: the CSG mesh is translated by one canonical frame of motion
+    # (2 m/s × 1/60 s = 0.033 m in +X) BEFORE the render, so the shader's
+    # mesh_motion_params.w gate fires and stochastic shutter-time samples
+    # smear the mesh from origin to +0.033 m. The result is a streaked
+    # CSG silhouette mirroring the analytic-prim streaks PR #85 shipped.
+    #
+    # Tolerances: mesh motion blur amplifies per-ray variance because
+    # every primary ray is now sampled at a different shutter time
+    # within the prev->curr window. The default cornell_csg (16/2/1)
+    # is too tight at r_spp=1; tolerances here are sized empirically so
+    # any non-trivial regression in the mesh shift path surfaces while
+    # the stochastic noise floor stays within budget.
+    #
+    # software + metal cells register today (Mac-side dev box). The
+    # vulkan cell is intentionally NOT registered yet: Mac-Vulkan
+    # verification was blocked at PR time by an unrelated SDF Phase 2
+    # worktree saturating the GPU pipeline cache. Win-side Claude
+    # captures the Vulkan golden after the integration branch lands.
+    # The fixture's pt_smoke_late_exec value is a *relative* path
+    # (tests/goldens/scenes/motion_blur_mesh_late.cfg). At engine init
+    # that path is resolved against the engine's CWD -- but golden
+    # cells run each render in its own per-cell workdir
+    # (golden_workdir/<cell>/), so a relative path can't see the source
+    # tree. EXTRA below re-sets the cvar to the absolute path AFTER the
+    # scene body inlines (the synthesised smoke-exec cfg appends --extra
+    # below the scene body, so the absolute value wins the last-writer
+    # race before Init's end-of-Init late-exec reader fires). Mirrors
+    # the phys_rb_smoke wiring.
+    pt_add_golden_cell(SCENE motion_blur_mesh BACKEND software DENOISER off
+        MAX_DELTA 64 MEAN_DELTA 8 FAIL_PERCENT 5
+        EXTRA "pt_smoke_late_exec ${CMAKE_SOURCE_DIR}/tests/goldens/scenes/motion_blur_mesh_late.cfg")
+    pt_add_golden_cell(SCENE motion_blur_mesh BACKEND metal    DENOISER off
+        MAX_DELTA 64 MEAN_DELTA 8 FAIL_PERCENT 5
+        EXTRA "pt_smoke_late_exec ${CMAKE_SOURCE_DIR}/tests/goldens/scenes/motion_blur_mesh_late.cfg")
+    # --- end Mesh motion blur fixture -------------------------------------
 else()
     message(STATUS
         "tests: golden-image matrix skipped -- pt_render_one_frame and/or "

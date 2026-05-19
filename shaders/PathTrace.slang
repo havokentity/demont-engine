@@ -906,6 +906,40 @@ cbuffer Push {
     // path stays bit-for-bit preserved for old scenes / old configs.
     uint4 clouds_runtime;
     // --- end Clouds dual-mode gate -------------------------------------------
+    // --- Mesh motion blur (wave-7 #21, follow-up to motion_blur_params #85) ---
+    // mesh_motion_prev.xyz = prev_translation (world-space metres). Where
+    //                       the mesh was last frame. Combined with curr
+    //                       below, the shader computes per-ray effective
+    //                       translation lerp(prev, curr, t01) at the
+    //                       shutter sample t01 ∈ [0, 1] (0 = start of
+    //                       shutter, 1 = end), then shifts the mesh ray
+    //                       origin by -lerp(prev, curr, t01) before
+    //                       intersection. Equivalent to translating the
+    //                       baked mesh by +lerp(prev, curr, t01) while
+    //                       keeping the TLAS identity-transformed, so no
+    //                       per-frame BLAS / TLAS rebuild is needed.
+    //                 .w = mesh_motion_active flag (0/1). Host gates
+    //                       this on (r_motion_blur != 0 AND prev != curr)
+    //                       OR the mesh has been translated away from
+    //                       its baked origin. When 0, the shader skips
+    //                       the shift entirely (saves a vec3 add per
+    //                       mesh hit on truly-static scenes).
+    // mesh_motion_curr.xyz = curr_translation (world-space metres). Where
+    //                       the mesh is this frame. When r_motion_blur
+    //                       is off, the shader forces shutter_t01 = 1.0
+    //                       (PR #85 plumbing) so the lerp collapses to
+    //                       curr -- the mesh renders at its current
+    //                       world position with zero streak.
+    //                 .w = reserved.
+    //
+    // Layout collapses to a no-op on truly-static scenes (prev == curr ==
+    // origin, .w stays 0): the shader's mesh hit path is bit-identical to
+    // pre-#21. Translation preserves normals, so the existing ObjectToWorld
+    // normal pipeline on the HW path is unchanged (q.CommittedObjectToWorld4x3()
+    // stays identity because we keep the TLAS instance transform identity).
+    float4 mesh_motion_prev;
+    float4 mesh_motion_curr;
+    // --- end Mesh motion blur -------------------------------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -1010,6 +1044,10 @@ cbuffer Frame {
     uint4 editor_params;
     // See `clouds_runtime` in the Metal Push cbuffer above (#24, Wave 7).
     uint4 clouds_runtime;
+    // See `mesh_motion_prev` / `mesh_motion_curr` in the Metal Push
+    // cbuffer above (wave-7 #21).
+    float4 mesh_motion_prev;
+    float4 mesh_motion_curr;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -1468,10 +1506,37 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01) {
     // PT_SPIRV_NO_RAYQUERY remove the HW branch entirely so the SPIR-V
     // module doesn't declare the RayQueryKHR capability and can load on
     // drivers without VK_KHR_ray_query (e.g. older MoltenVK).
+    //
+    // Mesh motion blur (wave-7 #21, follow-up to PR #85): the baked
+    // mesh sits in its untransformed "rest" frame (world origin for
+    // the canonical CSG demo bake). The engine carries two world-
+    // space translations -- prev (last frame) and curr (this frame)
+    // -- and the shader computes per-ray effective translation
+    //   effective(t01) = lerp(prev, curr, t01)
+    // at shutter sample t01 ∈ [0, 1]. Translating the mesh by
+    // +effective(t01) is mathematically equivalent to SHIFTING THE
+    // RAY ORIGIN by -effective(t01) before intersection against the
+    // static baked mesh. When r_motion_blur is off the shader forces
+    // t01 = 1.0 (PR #85 plumbing in the per-sample loop) so the lerp
+    // collapses to curr -- the mesh renders at its current world
+    // position with zero streak.
+    //
+    // The .w gate on mesh_motion_prev shortcuts the entire shift
+    // when the mesh has neither moved nor been translated -- the
+    // common static-scene case. Both the HW RayQuery and SW BVH
+    // paths use the same shifted origin so the streak is consistent
+    // across backends. The TLAS instance transform stays identity --
+    // no per-frame BLAS / TLAS rebuild is required. Translation
+    // preserves normals so q.CommittedObjectToWorld4x3() returning
+    // identity is still correct downstream.
+    float3 mesh_shift = (mesh_motion_prev.w > 0.5)
+                            ? lerp(mesh_motion_prev.xyz, mesh_motion_curr.xyz, shutter_t01)
+                            : float3(0.0, 0.0, 0.0);
+    float3 ro_mesh = ro - mesh_shift;
 #if !defined(PT_TARGET_SPIRV) || !defined(PT_SPIRV_NO_RAYQUERY)
     if (tlas_present != 0u) {
         RayDesc r;
-        r.Origin    = ro;
+        r.Origin    = ro_mesh;
         r.Direction = rd;
         r.TMin      = 1e-3;
         r.TMax      = h.t;     // limit search to current closest
@@ -1529,6 +1594,16 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01) {
         // path (the `else` above attaches to the `if (tlas_present)`
         // block, which is preprocessed out for that variant).
         //
+        // Mesh motion blur (wave-7 #21): we walk the BVH with
+        // ro_mesh = ro - mesh_shift(t01) instead of ro, which puts the
+        // intersection in the static-mesh frame. The AABB-slab cull,
+        // Möller-Trumbore intersect, and returned `t_tri` are all in
+        // that frame -- but because the static mesh is just a
+        // translation of the moving mesh, the same ray parameter `t`
+        // satisfies (ro + t*rd) on the moving mesh. So the host
+        // doesn't need to know whether the hit came from the HW or SW
+        // path; both return the same `t`.
+        //
         // Walker mirrors the analytic-BVH walker above: iterative stack
         // (depth 64 covers >1B triangles via balanced log2 splits with
         // headroom), per-node AABB-slab test culls subtrees beyond
@@ -1554,7 +1629,7 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01) {
             while (sp > 0) {
                 uint idx = stack[--sp];
                 BvhNode node = loadTriBvhNode(idx);
-                if (!intersectAabb(ro, rd_inv, node.aabb_min, node.aabb_max, t_mesh)) continue;
+                if (!intersectAabb(ro_mesh, rd_inv, node.aabb_min, node.aabb_max, t_mesh)) continue;
                 if (node.count > 0u) {
                     // Leaf: test the contiguous range of permuted tri ids.
                     for (uint k = 0u; k < node.count; ++k) {
@@ -1577,7 +1652,7 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01) {
                         float  det = dot(e1, pv);
                         if (abs(det) < 1e-8) continue;
                         float inv_det = 1.0 / det;
-                        float3 tvec = ro - v0;
+                        float3 tvec = ro_mesh - v0;
                         float u = dot(tvec, pv) * inv_det;
                         if (u < 0.0 || u > 1.0) continue;
                         float3 qv = cross(tvec, e1);
