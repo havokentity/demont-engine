@@ -22,6 +22,7 @@
 #include "../core/Tracy.h"
 #include "../destruction/VoxelGrid.h"
 #include "../destruction/Voxelizer.h"
+#include "../editor/EditorRoutes.h"
 #include "../editor/SceneGraph.h"
 #include "../renderer/Astronomy.h"
 #include "../renderer/BscCatalog.h"
@@ -72,6 +73,15 @@
 #    define WIN32_LEAN_AND_MEAN
 #  endif
 #  include <windows.h>
+#else
+// POSIX needs fork() / execl() / setsid() / access() / kill() for the
+// editor panel-spawn / panel-close path. Pulled in unconditionally on
+// non-Win32 so the linker doesn't have to chase undefined references
+// to the wrappers used inside SpawnPanelBrowser / KillPanelPid.
+#  include <signal.h>
+#  include <sys/types.h>
+#  include <sys/wait.h>
+#  include <unistd.h>
 #endif
 
 namespace pt::engine {
@@ -94,6 +104,33 @@ namespace cvar {
             CVAR_ARCHIVE);
     PT_CVAR(app_overlay_enabled, "1",
             "Enable the in-window native console overlay (backtick toggles)", CVAR_ARCHIVE);
+    // ---- Editor scaffold (agent-20) ----------------------------------------
+    // CSV list of panels to auto-open on engine init, AFTER the
+    // WebSocket server is up. Each entry is one of the known panel
+    // names (scene-hierarchy / inspector / asset-browser / toolbar).
+    // Whitespace around commas is trimmed; unknown names are warned
+    // and skipped. Empty string (default) = no panels auto-open.
+    PT_CVAR(r_editor_panels_autoopen, "",
+            "Comma-separated list of editor panels to open on engine "
+            "init. Names: scene-hierarchy, inspector, asset-browser, "
+            "toolbar. Example: \"scene-hierarchy,inspector\". Empty "
+            "(default) = no auto-open. Panels are spawned as Chrome "
+            "--app windows; if Chrome / Edge isn't found, the engine "
+            "logs a warning and continues.",
+            CVAR_ARCHIVE);
+    // Dev mode: when 1, panel_open targets the Vite dev server URL
+    // (http://localhost:5173/panels/<name>/) instead of the
+    // embedded /editor/<name>. Lets you iterate on React code with
+    // HMR while the engine runs. Requires `npm run dev` in
+    // web/editor/ to be alive on port 5173.
+    PT_CVAR(r_editor_dev_mode, "0",
+            "Editor panel dev mode. 0 = panels load from the engine's "
+            "embedded /editor/<name> route. 1 = panels load from the "
+            "Vite dev server at http://localhost:5173/panels/<name>/. "
+            "Start the dev server with `npm run dev` in web/editor/. "
+            "Useful for HMR while iterating on panel React code.",
+            CVAR_ARCHIVE);
+    // ---- end Editor scaffold -----------------------------------------------
     PT_CVAR(pt_smoke_frames, "0",
             "Smoke-test frame budget. >0 = render this many frames then "
             "exit cleanly (exit code 0). 0 = run normally until the user "
@@ -1674,11 +1711,42 @@ bool Engine::Init() {
 
         window_->SetKeyHandler([this](int key, int /*mods*/) {
             constexpr int kGrave = 96;  // GLFW_KEY_GRAVE_ACCENT
-            if (key != kGrave) return;
-            if (overlay_) {
-                overlay_->Toggle();
-            } else {
-                OpenWebConsole();
+            // GLFW function-key codes (matches GLFW3 header constants).
+            constexpr int kF2 = 291;
+            constexpr int kF3 = 292;
+            constexpr int kF4 = 293;
+            constexpr int kF5 = 294;
+            if (key == kGrave) {
+                if (overlay_) {
+                    overlay_->Toggle();
+                } else {
+                    OpenWebConsole();
+                }
+                return;
+            }
+            // Editor panel hotkeys (#agent-20). The keys map 1:1 to
+            // the four known panels; firing the existing console
+            // command keeps the spawn-PID tracking centralised in
+            // RegisterEditorCommands.
+            //
+            // The native console overlay's text-input mode swallows
+            // key events at the platform layer (NSEvent on macOS,
+            // WM_CHAR on Win32) before they reach GLFW, so we don't
+            // need a separate "console active" gate here -- a key
+            // event reaching this handler implies the game window is
+            // the responder, not the console field.
+            const char* panel = nullptr;
+            switch (key) {
+                case kF2: panel = "scene-hierarchy"; break;
+                case kF3: panel = "inspector";       break;
+                case kF4: panel = "asset-browser";   break;
+                case kF5: panel = "toolbar";         break;
+                default: break;
+            }
+            if (panel != nullptr) {
+                pt::console::Console::Get().QueueExecute(
+                    fmt::format("panel_open {}", panel),
+                    {});
             }
         });
     }
@@ -1747,6 +1815,17 @@ bool Engine::Init() {
     // handler installed near the top of Init() (search for
     // "pt_smoke_late_exec runtime fire-and-forget").
     engine_initialized_ = true;
+
+    // Editor scaffold (agent-20): if r_editor_panels_autoopen is non-
+    // empty, spawn each listed panel now -- after the WebSocket server
+    // is up + command registration is done so the spawned Chrome
+    // --app window can immediately connect to /ws and serve its
+    // bundle. Smoke-test mode skips this so headless CI doesn't try
+    // to launch browsers.
+    if (auto* sf = C.FindCVar("pt_smoke_frames"); sf == nullptr || sf->GetInt() == 0) {
+        OpenAutoOpenedPanels();
+    }
+
     LOG_INFO("Engine initialized.");
     return true;
 }
@@ -12181,6 +12260,14 @@ void Engine::RegisterCommands() {
     RegisterVoxelCommands();
     // --- end Voxel destruction Phase 1 -----------------------------------------
 
+    // --- Editor scaffold (agent-20) --------------------------------------------
+    // panel_open / panel_close / panel_open_all / panel_close_all / panels.
+    // Safe to register before the WebSocket server is up -- the
+    // commands only consult net_port / net_bind_address at invoke
+    // time, and r_editor_panels_autoopen is fired later from Init().
+    RegisterEditorCommands();
+    // --- end Editor scaffold ---------------------------------------------------
+
     // --- Cross-cvar dependency predicates (issue #161) -------------------------
     // When the user sets a cvar whose effect requires another cvar to be in
     // a specific state, evaluate the predicate after the set and emit a
@@ -15841,5 +15928,392 @@ void Engine::RegisterVoxelCommands() {
         });
 }
 // --- end Voxel destruction Phase 1 -----------------------------------------
+
+// =============================================================================
+// Editor scaffold (agent-20) -- React+Vite multi-panel commands.
+// =============================================================================
+
+namespace {
+
+// Helper: pull the active engine HTTP host + port + dev-mode from the
+// cvars. Centralised so panel_open / OpenAutoOpenedPanels don't both
+// re-implement the lookup.
+struct EditorEndpoint {
+    std::string host = "localhost";
+    int         port = 27960;
+    bool        dev_mode = false;
+};
+
+EditorEndpoint ReadEditorEndpoint() {
+    EditorEndpoint e;
+    auto& C = pt::console::Console::Get();
+    if (auto* v = C.FindCVar("net_bind_address");
+        v != nullptr && !v->value.empty() && v->value != "0.0.0.0") {
+        e.host = v->value;
+    }
+    if (auto* v = C.FindCVar("net_port")) e.port = v->GetInt();
+    if (auto* v = C.FindCVar("r_editor_dev_mode")) e.dev_mode = v->GetBool();
+    return e;
+}
+
+// Split a CSV cvar value into trimmed, non-empty tokens. Whitespace
+// around each comma is stripped (so "a , b" parses as ["a","b"]).
+std::vector<std::string> SplitCsv(std::string_view s) {
+    std::vector<std::string> out;
+    std::size_t i = 0;
+    while (i < s.size()) {
+        std::size_t j = i;
+        while (j < s.size() && s[j] != ',') ++j;
+        std::string_view tok = s.substr(i, j - i);
+        // ltrim / rtrim
+        std::size_t a = 0, b = tok.size();
+        while (a < b && (tok[a] == ' ' || tok[a] == '\t')) ++a;
+        while (b > a && (tok[b-1] == ' ' || tok[b-1] == '\t')) --b;
+        if (b > a) out.emplace_back(tok.substr(a, b - a));
+        i = (j == s.size()) ? j : j + 1;
+    }
+    return out;
+}
+
+}  // namespace
+
+int Engine::SpawnPanelBrowser(const std::string& panel_name,
+                              const std::string& url,
+                              std::string* out_diag) {
+#if defined(__APPLE__)
+    // macOS: `open -na 'Google Chrome' --args --app=<url>` spawns a
+    // detached Chrome --app window. On chrome-missing, fall back to
+    // Edge then Safari (Safari can't do --app mode but at least opens
+    // the URL).
+    //
+    // We need a PID to track for later panel_close. `open` itself
+    // exits as soon as it asks LaunchServices to spawn the target,
+    // so its PID isn't useful. Use posix_spawn -> /usr/bin/open with
+    // a wait-for-the-target hint? No -- the cleanest path on macOS is
+    // to run Chrome directly:
+    //   `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --app=<url>`
+    // because then we own the child PID directly.
+    const char* kChromiumPaths[] = {
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        nullptr,
+    };
+    const char* chosen = nullptr;
+    for (int i = 0; kChromiumPaths[i] != nullptr; ++i) {
+        if (::access(kChromiumPaths[i], X_OK) == 0) {
+            chosen = kChromiumPaths[i];
+            break;
+        }
+    }
+    if (chosen != nullptr) {
+        pid_t pid = ::fork();
+        if (pid == 0) {
+            // Child: detach from terminal + replace with the browser.
+            // setsid() so the browser survives if the parent dies.
+            ::setsid();
+            std::string app_arg = "--app=" + url;
+            // Pass a per-panel user-data-dir argument so multiple
+            // `panel_open` invocations don't fall through to a single
+            // existing Chrome window (Chrome refuses to spawn a new
+            // PID when an existing instance can satisfy the URL). The
+            // dir is ephemeral but persistent across runs so the
+            // window remembers its size.
+            const char* home_env = std::getenv("HOME");
+            std::string udd_arg = "--user-data-dir=" +
+                std::string(home_env != nullptr ? home_env : "/tmp") +
+                "/.demont_editor/" + panel_name;
+            execl(chosen, chosen,
+                  app_arg.c_str(),
+                  udd_arg.c_str(),
+                  "--no-first-run",
+                  "--no-default-browser-check",
+                  nullptr);
+            // execl returned -- failure; bail loud.
+            std::_Exit(127);
+        }
+        if (pid > 0) {
+            if (out_diag) {
+                *out_diag = fmt::format("spawned {} via {} (pid {})",
+                                        panel_name, chosen, pid);
+            }
+            return static_cast<int>(pid);
+        }
+        // fork() failed; fall through to the `open` fallback.
+    }
+
+    // Final fallback: `open` the URL in the default browser. We can't
+    // track the resulting PID -- so panel_close on this panel will
+    // print a "no tracked PID" diagnostic. Better than nothing.
+    auto cmd = fmt::format("/usr/bin/open '{}' >/dev/null 2>&1", url);
+    int rc = std::system(cmd.c_str());
+    if (out_diag) {
+        if (rc == 0) {
+            *out_diag = fmt::format(
+                "opened {} in default browser (no Chromium found; close "
+                "manually -- panel_close won't track this window)",
+                panel_name);
+        } else {
+            *out_diag = fmt::format(
+                "failed to open {} ({}). No Chromium browser detected "
+                "and `/usr/bin/open` returned {}.",
+                panel_name, url, rc);
+        }
+    }
+    return 0;
+#elif defined(_WIN32)
+    // Windows: try chrome.exe / msedge.exe in standard install paths.
+    // CreateProcessA gives us a PROCESS_INFORMATION with a real PID
+    // we can hold onto for panel_close (TerminateProcess on the
+    // matching HANDLE).
+    const char* kChromiumExes[] = {
+        "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+        "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+        "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+        "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+        nullptr,
+    };
+    const char* chosen = nullptr;
+    for (int i = 0; kChromiumExes[i] != nullptr; ++i) {
+        DWORD attr = GetFileAttributesA(kChromiumExes[i]);
+        if (attr != INVALID_FILE_ATTRIBUTES &&
+            !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+            chosen = kChromiumExes[i];
+            break;
+        }
+    }
+    if (chosen != nullptr) {
+        const char* profile_env = std::getenv("USERPROFILE");
+        std::string udd = std::string(profile_env != nullptr ? profile_env : "C:\\Temp")
+                          + "\\.demont_editor\\" + panel_name;
+        std::string cmdline = fmt::format(
+            "\"{}\" --app={} --user-data-dir=\"{}\" --no-first-run --no-default-browser-check",
+            chosen, url, udd);
+        STARTUPINFOA si{};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        // mutable buffer for CreateProcessA
+        std::vector<char> buf(cmdline.begin(), cmdline.end());
+        buf.push_back('\0');
+        BOOL ok = CreateProcessA(nullptr, buf.data(), nullptr, nullptr, FALSE,
+                                 DETACHED_PROCESS, nullptr, nullptr, &si, &pi);
+        if (ok) {
+            CloseHandle(pi.hThread);
+            // We keep the process handle on close indirectly by PID,
+            // re-opening with OpenProcess in KillPanelPid.
+            CloseHandle(pi.hProcess);
+            if (out_diag) {
+                *out_diag = fmt::format("spawned {} via {} (pid {})",
+                                        panel_name, chosen,
+                                        static_cast<int>(pi.dwProcessId));
+            }
+            return static_cast<int>(pi.dwProcessId);
+        }
+    }
+    // Fallback: `start` via cmd.exe.
+    auto cmd = fmt::format("cmd /c start \"\" \"{}\"", url);
+    std::system(cmd.c_str());
+    if (out_diag) {
+        *out_diag = fmt::format(
+            "opened {} in default browser (Chromium not found; "
+            "panel_close won't track this window)", panel_name);
+    }
+    return 0;
+#else
+    // Other Unix: try xdg-open. PID tracking not implemented for now.
+    auto cmd = fmt::format("xdg-open '{}' >/dev/null 2>&1 &", url);
+    std::system(cmd.c_str());
+    if (out_diag) {
+        *out_diag = fmt::format(
+            "opened {} via xdg-open (no PID tracked)", panel_name);
+    }
+    return 0;
+#endif
+}
+
+void Engine::KillPanelPid(int pid) {
+    if (pid <= 0) return;
+#if defined(_WIN32)
+    HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE,
+                           static_cast<DWORD>(pid));
+    if (h != nullptr) {
+        TerminateProcess(h, 0);
+        CloseHandle(h);
+    }
+#else
+    // SIGTERM first; Chrome's app-mode windows exit cleanly on this.
+    ::kill(static_cast<pid_t>(pid), SIGTERM);
+#endif
+}
+
+void Engine::OpenAutoOpenedPanels() {
+    auto& C = pt::console::Console::Get();
+    auto* cv = C.FindCVar("r_editor_panels_autoopen");
+    if (cv == nullptr || cv->value.empty()) return;
+    auto endpoint = ReadEditorEndpoint();
+    auto panels = SplitCsv(cv->value);
+    for (const auto& name : panels) {
+        if (!pt::editor::IsKnownPanel(name)) {
+            LOG_WARN("r_editor_panels_autoopen: unknown panel '{}' (skipped)", name);
+            continue;
+        }
+        if (auto it = open_panels_pids_.find(name);
+            it != open_panels_pids_.end() && it->second > 0) {
+            // Already tracked open (e.g. user toggled the cvar at
+            // runtime and we re-entered here). Skip silently.
+            continue;
+        }
+        auto url = pt::editor::BuildPanelUrl(name, endpoint.host,
+                                             endpoint.port,
+                                             endpoint.dev_mode);
+        std::string diag;
+        int pid = SpawnPanelBrowser(name, url, &diag);
+        if (pid > 0) open_panels_pids_[name] = pid;
+        LOG_INFO("editor: autoopen {} -> {}", name, diag);
+    }
+}
+
+void Engine::RegisterEditorCommands() {
+    auto& C = pt::console::Console::Get();
+
+    // `panel_open <name>` -- spawn the panel in a new Chrome --app
+    // window. Defaults to scene-hierarchy if no arg given so the
+    // F2 hotkey can just dispatch `panel_open` with the panel name.
+    auto* cmd_open = C.RegisterCommand("panel_open",
+        "Open an editor panel in a Chrome --app window. Usage: "
+        "panel_open <name>. Names: scene-hierarchy, inspector, "
+        "asset-browser, toolbar. Use `panels` to list state. "
+        "Honors r_editor_dev_mode (Vite dev server URL when 1).",
+        [this](auto args, pt::console::Output& out) {
+            if (args.empty()) {
+                out.PrintLine(
+                    "panel_open: name required. Try: panel_open scene-hierarchy");
+                return;
+            }
+            std::string name(args[0]);
+            if (!pt::editor::IsKnownPanel(name)) {
+                out.FormatLine(
+                    "panel_open: unknown panel '{}'. Known: "
+                    "scene-hierarchy, inspector, asset-browser, toolbar",
+                    name);
+                return;
+            }
+            // If we already have a tracked PID, the user probably
+            // wants to re-focus -- but we can't programmatically
+            // raise a Chrome --app window from another process. Just
+            // spawn another window; Chrome will refuse the duplicate
+            // user-data-dir lock and bail. Better behaviour: tell
+            // the user to use panel_close first.
+            if (auto it = open_panels_pids_.find(name);
+                it != open_panels_pids_.end() && it->second > 0) {
+                out.FormatLine(
+                    "panel_open: {} already open (pid {}). "
+                    "Use `panel_close {}` first to spawn a fresh window.",
+                    name, it->second, name);
+                return;
+            }
+            auto endpoint = ReadEditorEndpoint();
+            auto url = pt::editor::BuildPanelUrl(name, endpoint.host,
+                                                 endpoint.port,
+                                                 endpoint.dev_mode);
+            std::string diag;
+            int pid = SpawnPanelBrowser(name, url, &diag);
+            if (pid > 0) open_panels_pids_[name] = pid;
+            out.PrintLine(diag);
+            out.FormatLine("panel_open: url = {}", url);
+        });
+    if (cmd_open != nullptr) cmd_open->default_args = "scene-hierarchy";
+
+    C.RegisterCommand("panel_close",
+        "Close an editor panel previously opened via panel_open. "
+        "Usage: panel_close <name>. Only panels with a tracked PID "
+        "can be closed -- if the panel was opened in the default "
+        "browser (no Chromium found at panel_open time), close the "
+        "window manually.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.empty()) {
+                out.PrintLine("panel_close: name required");
+                return;
+            }
+            std::string name(args[0]);
+            auto it = open_panels_pids_.find(name);
+            if (it == open_panels_pids_.end() || it->second <= 0) {
+                out.FormatLine(
+                    "panel_close: no tracked PID for '{}' "
+                    "(never opened or opened in default browser)", name);
+                return;
+            }
+            KillPanelPid(it->second);
+            int pid = it->second;
+            open_panels_pids_.erase(it);
+            out.FormatLine("panel_close: killed {} (pid {})", name, pid);
+        });
+
+    C.RegisterCommand("panel_open_all",
+        "Open every known editor panel in Chrome --app windows. "
+        "Skips panels already tracked as open.",
+        [this](auto /*args*/, pt::console::Output& out) {
+            auto endpoint = ReadEditorEndpoint();
+            int opened = 0, skipped = 0;
+            for (std::size_t i = 0; i < pt::editor::KnownPanelCount(); ++i) {
+                std::string name = pt::editor::KnownPanels()[i];
+                if (auto it = open_panels_pids_.find(name);
+                    it != open_panels_pids_.end() && it->second > 0) {
+                    ++skipped;
+                    out.FormatLine("  skip {} (pid {})", name, it->second);
+                    continue;
+                }
+                auto url = pt::editor::BuildPanelUrl(name, endpoint.host,
+                                                     endpoint.port,
+                                                     endpoint.dev_mode);
+                std::string diag;
+                int pid = SpawnPanelBrowser(name, url, &diag);
+                if (pid > 0) open_panels_pids_[name] = pid;
+                ++opened;
+                out.FormatLine("  open {} -> {}", name, diag);
+            }
+            out.FormatLine("panel_open_all: {} opened, {} skipped",
+                           opened, skipped);
+        });
+
+    C.RegisterCommand("panel_close_all",
+        "Close every editor panel with a tracked PID.",
+        [this](auto /*args*/, pt::console::Output& out) {
+            int closed = 0;
+            for (auto& [name, pid] : open_panels_pids_) {
+                if (pid > 0) {
+                    KillPanelPid(pid);
+                    out.FormatLine("  close {} (pid {})", name, pid);
+                    pid = 0;
+                    ++closed;
+                }
+            }
+            open_panels_pids_.clear();
+            out.FormatLine("panel_close_all: {} closed", closed);
+        });
+
+    C.RegisterCommand("panels",
+        "List editor panels and their open/closed state.",
+        [this](auto /*args*/, pt::console::Output& out) {
+            auto endpoint = ReadEditorEndpoint();
+            out.FormatLine("editor panels (engine endpoint http://{}:{}, dev_mode={})",
+                           endpoint.host, endpoint.port,
+                           endpoint.dev_mode ? "on" : "off");
+            for (std::size_t i = 0; i < pt::editor::KnownPanelCount(); ++i) {
+                std::string name = pt::editor::KnownPanels()[i];
+                auto it = open_panels_pids_.find(name);
+                int pid = (it != open_panels_pids_.end()) ? it->second : 0;
+                auto url = pt::editor::BuildPanelUrl(name, endpoint.host,
+                                                     endpoint.port,
+                                                     endpoint.dev_mode);
+                if (pid > 0) {
+                    out.FormatLine("  {:<18} OPEN (pid {})  {}", name, pid, url);
+                } else {
+                    out.FormatLine("  {:<18} closed         {}", name, url);
+                }
+            }
+        });
+}
 
 }  // namespace pt::engine

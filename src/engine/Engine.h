@@ -348,6 +348,36 @@ private:
     // gate in RenderFrame.
     void SyncVoxelDemoState();
     // --- end Voxel destruction Phase 1 -------------------------------------
+
+    // --- Editor scaffold (agent-20) ----------------------------------------
+    // Console commands for the React+Vite editor shell:
+    //   `panel_open <name>`       spawns Chrome --app at the panel URL
+    //   `panel_close <name>`      kills the tracked PID
+    //   `panel_open_all`          opens every known panel
+    //   `panel_close_all`         closes every tracked panel
+    //   `panels`                  prints the known panels + per-panel state
+    // The spawned-PID table lives in open_panels_pids_ keyed by panel
+    // name. Hotkeys F2/F3/F4/F5 fire panel_open via the existing key
+    // handler in Init().
+    void RegisterEditorCommands();
+    // Internal: spawn the panel in a fresh Chrome --app window. Tries
+    // Chrome -> Edge -> default browser fallback (which won't be
+    // app-mode but at least opens). Returns the spawned PID (0 on
+    // failure or if no Chromium browser was found). out_diag, if
+    // non-null, gets a one-line summary for the console echo.
+    int  SpawnPanelBrowser(const std::string& panel_name,
+                           const std::string& url,
+                           std::string* out_diag);
+    // Internal: kill a previously-spawned panel PID. Tolerates a
+    // missing/exited PID without throwing.
+    void KillPanelPid(int pid);
+    // Re-read r_editor_panels_autoopen and open every listed panel.
+    // Called once at the tail of Init() (after the WebSocket server
+    // is up and command registration is done). No-op if the cvar is
+    // empty.
+    void OpenAutoOpenedPanels();
+    // --- end Editor scaffold ----------------------------------------------
+
     void TearDownDevice();
     void RenderFrame();
 
@@ -544,6 +574,15 @@ private:
     std::size_t                                 perf_history_pos_ = 0;
     std::unique_ptr<pt::jobs::JobSystem>        jobs_;
     std::unique_ptr<pt::console::ConsoleServer> server_;
+    // Editor scaffold (agent-20): tracks the OS pids of Chrome --app
+    // windows the engine has spawned via panel_open. Indexed by panel
+    // name (e.g. "scene-hierarchy"). A non-zero value means the
+    // engine successfully forked a process and we own its lifecycle
+    // (panel_close kills it). 0 / missing entries mean either the
+    // panel has never been opened or the spawned process exited
+    // independently. Cleared on engine shutdown (spawned processes
+    // are NOT killed -- they outlive the engine on purpose).
+    std::map<std::string, int>                  open_panels_pids_;
     std::unique_ptr<pt::rhi::Device>            device_;
     std::unique_ptr<pt::renderer::Camera>       camera_;
     // Named camera bookmarks. Parallel persistence to the numeric

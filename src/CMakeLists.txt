@@ -1,6 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Rajesh D'Monte
 add_subdirectory(core)
+# pt_editor -- editor-mode foundation library. Holds:
+#   - agent-19: scene-graph snapshot (SerializeScene) consumed by
+#     pt_engine's list_scene WS handler.
+#   - agent-20: URL router + embedded React/Vite editor bundle,
+#     consumed by pt_console's HTTP handler to serve `/editor/<panel>`
+#     and the generated panel asset tree.
+# Depends only on renderer + physics + nlohmann_json; built before
+# pt_console so the console's HTTP handler can call
+# pt::editor::ResolveRoute(), and before pt_engine so Engine.cpp can
+# call pt::editor::SerializeScene.
+add_subdirectory(editor)
 add_subdirectory(console)
 add_subdirectory(audio)
 # Software backend supports Mac (CAMetalLayer present) and Windows
@@ -34,10 +45,4 @@ add_subdirectory(physics)
 # Pure CPU; engine spawns analytic-prim boxes for chunks.
 add_subdirectory(destruction)
 add_subdirectory(app)
-# Editor backend foundation (#editor-mode, agent-19): scene-graph snapshot
-# API consumed by the upcoming React web panel (agent-20), native overlay
-# panel (agent-21), and 3D gizmos (agent-22). Depends only on renderer +
-# physics + nlohmann_json; built before pt_engine so Engine.cpp can call
-# into pt::editor::SerializeScene from the scene_dump_json command.
-add_subdirectory(editor)
 add_subdirectory(engine)

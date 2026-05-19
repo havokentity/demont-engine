@@ -4,6 +4,8 @@
 #include "Console.h"
 #include "../core/Diag.h"
 #include "../core/Log.h"
+#include "../editor/EditorAssets.h"
+#include "../editor/EditorRoutes.h"
 
 #include <civetweb.h>
 #include <nlohmann/json.hpp>
@@ -288,6 +290,22 @@ int ConsoleServer::HttpHandler(mg_connection* conn, void* cbdata) {
                        web_console_css_data, web_console_css_size);
         return 200;
     }
+
+    // Editor routes (React+Vite multi-panel). pt::editor::ResolveRoute
+    // handles three cases internally:
+    //   - `/editor`                synthesised panel index
+    //   - `/editor/<panel>`        rewrites to the panel's index.html
+    //   - `/panels/<...>`          direct lookup in the embedded table
+    //   - `/shared/<...>`          ditto
+    // A miss returns nullptr -> 404 fall-through.
+    if (uri == "/editor" || uri.starts_with("/editor/") ||
+        uri.starts_with("/panels/") || uri.starts_with("/shared/")) {
+        if (const auto* asset = pt::editor::ResolveRoute(uri)) {
+            SendStaticHttp(conn, asset->mime, asset->data, asset->size);
+            return 200;
+        }
+    }
+
     mg_send_http_error(conn, 404, "%s", "not found");
     return 404;
 }
