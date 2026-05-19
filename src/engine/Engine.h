@@ -1279,6 +1279,21 @@ private:
     bool                                        bvh_last_log_empty_       = true;
     BackendType                                 current_backend_       = BackendType::None;
     bool                                        mouse_look_active_     = false;
+    // cam_warp_smooth tween state. While cam_tween_active_ is true,
+    // UpdateCamera() lerps the camera state from (start_*) toward
+    // (target_*) over cam_tween_duration_ seconds. Smoothstep easing
+    // gives a cinematic in/out feel without needing a full keyframe
+    // system. Cleared when the lerp completes OR when the user
+    // touches WASD / RMB-look (manual control aborts the tween).
+    bool                                        cam_tween_active_      = false;
+    double                                      cam_tween_t_seconds_   = 0.0;
+    double                                      cam_tween_duration_    = 0.0;
+    float                                       cam_tween_start_pos_[3]    {0, 0, 0};
+    float                                       cam_tween_target_pos_[3]   {0, 0, 0};
+    float                                       cam_tween_start_yaw_       = 0.0f;
+    float                                       cam_tween_target_yaw_      = 0.0f;
+    float                                       cam_tween_start_pitch_     = 0.0f;
+    float                                       cam_tween_target_pitch_    = 0.0f;
     std::atomic<bool>                           wants_quit_{false};
     // Smoke-test mode: set true by Run() when the smoke-test outcome is
     // a failure. Three failure modes feed it:

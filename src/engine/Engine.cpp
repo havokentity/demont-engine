@@ -9135,8 +9135,41 @@ void Engine::UpdateCamera(double dt) {
     if (!camera_ || !window_) return;
     auto& C = pt::console::Console::Get();
 
+    // cam_warp_smooth tween advance. Runs BEFORE the WASD / RMB-look
+    // input handling so manual control inputs detected below can abort
+    // the tween cleanly. Smoothstep easing (3t^2 - 2t^3) for cinematic
+    // in/out feel. Lerps position linearly; lerps yaw/pitch directly
+    // (the cam_warp_smooth command pre-normalised yaw to the shortest
+    // path so this just interpolates a small delta).
+    if (cam_tween_active_) {
+        cam_tween_t_seconds_ += dt;
+        double tf = cam_tween_t_seconds_ / cam_tween_duration_;
+        if (tf >= 1.0) {
+            tf = 1.0;
+            cam_tween_active_ = false;   // snap to target on final frame
+        }
+        // Smoothstep s = 3t^2 - 2t^3.
+        const float t = static_cast<float>(tf);
+        const float s = t * t * (3.0f - 2.0f * t);
+        camera_->pos = glm::vec3(
+            cam_tween_start_pos_[0] + (cam_tween_target_pos_[0] - cam_tween_start_pos_[0]) * s,
+            cam_tween_start_pos_[1] + (cam_tween_target_pos_[1] - cam_tween_start_pos_[1]) * s,
+            cam_tween_start_pos_[2] + (cam_tween_target_pos_[2] - cam_tween_start_pos_[2]) * s);
+        camera_->yaw   = cam_tween_start_yaw_   + (cam_tween_target_yaw_   - cam_tween_start_yaw_)   * s;
+        camera_->pitch = cam_tween_start_pitch_ + (cam_tween_target_pitch_ - cam_tween_start_pitch_) * s;
+        camera_->ClampPitch();
+        accum_dirty_ = true;
+    }
+
     // Mouse-look: hold right mouse to capture, release to free the cursor.
     bool rmb = window_->IsMouseButtonDown(1);   // GLFW_MOUSE_BUTTON_RIGHT == 1
+    // Abort any active tween if the user takes manual control via
+    // RMB-look or WASD (the WASD check happens further down via the
+    // speed/sprint multiplier; cancel pre-emptively here on RMB and
+    // we'll cancel again in the WASD branch if the user moved).
+    if (rmb && cam_tween_active_) {
+        cam_tween_active_ = false;
+    }
     if (rmb && !mouse_look_active_) {
         window_->SetCursorMode(0x00034003);     // GLFW_CURSOR_DISABLED
         mouse_look_active_ = true;
@@ -9223,6 +9256,8 @@ void Engine::UpdateCamera(double dt) {
     if (window_->IsKeyDown(341)) wm -= glm::vec3(0,1,0);  // L Ctrl
     if (glm::dot(wm, wm) > 0.0f) {
         camera_->pos += glm::normalize(wm) * (speed * static_cast<float>(dt));
+        // WASD input takes manual control -- abort any in-flight tween.
+        cam_tween_active_ = false;
     }
 
     // Gamepad translation: left stick maps to (strafe, forward). We
@@ -13598,8 +13633,160 @@ void Engine::RegisterEditorGizmoCommands() {
             camera_->pitch    = glm::radians(-15.0f);
             camera_->ClampPitch();
             accum_dirty_ = true;
+            cam_tween_active_ = false;   // any manual snap aborts in-flight tween
             out.FormatLine("cam_warp_to: framed prim id {} at distance {:.2f}",
                            id, dist);
+        });
+
+    // --- cam_warp ---------------------------------------------------------
+    // Generic camera teleport. Three arg shapes:
+    //   cam_warp <x> <y> <z>                              (just position; keep yaw/pitch)
+    //   cam_warp <x> <y> <z> <yaw_deg> <pitch_deg>        (position + explicit orientation)
+    //   cam_warp <x> <y> <z> look_at <lx> <ly> <lz>       (position + auto-orient toward target)
+    // Snaps immediately. Use cam_warp_smooth for tweened motion.
+    C.RegisterCommand("cam_warp",
+        "cam_warp <x> <y> <z> [yaw_deg pitch_deg | look_at lx ly lz]: "
+        "snap the camera to a position, optionally with explicit "
+        "orientation or look-at target. Aborts any in-flight smooth tween.",
+        [this](auto args, pt::console::Output& out) {
+            if (!camera_) { out.PrintLine("cam_warp: camera not initialised"); return; }
+            const auto n = args.size();
+            if (n != 3 && n != 5 && n != 7) {
+                out.PrintLine("usage: cam_warp <x> <y> <z> [yaw_deg pitch_deg | look_at lx ly lz]");
+                return;
+            }
+            float x, y, z;
+            if (!ParseFloat(args[0], x) || !ParseFloat(args[1], y) || !ParseFloat(args[2], z)) {
+                out.PrintLine("cam_warp: position parse failed");
+                return;
+            }
+            float new_yaw   = camera_->yaw;
+            float new_pitch = camera_->pitch;
+            if (n == 5) {
+                float yaw_deg, pitch_deg;
+                if (!ParseFloat(args[3], yaw_deg) || !ParseFloat(args[4], pitch_deg)) {
+                    out.PrintLine("cam_warp: yaw/pitch parse failed");
+                    return;
+                }
+                new_yaw   = glm::radians(yaw_deg);
+                new_pitch = glm::radians(pitch_deg);
+            } else if (n == 7) {
+                if (args[3] != "look_at") {
+                    out.PrintLine("cam_warp: 7-arg form must use 'look_at <lx> <ly> <lz>'");
+                    return;
+                }
+                float lx, ly, lz;
+                if (!ParseFloat(args[4], lx) || !ParseFloat(args[5], ly) || !ParseFloat(args[6], lz)) {
+                    out.PrintLine("cam_warp: look_at target parse failed");
+                    return;
+                }
+                glm::vec3 dir = glm::vec3(lx - x, ly - y, lz - z);
+                float len = glm::length(dir);
+                if (len < 1e-6f) {
+                    out.PrintLine("cam_warp: look_at target coincident with eye -- keeping orientation");
+                } else {
+                    dir /= len;
+                    // Camera convention (src/renderer/Camera.h): forward =
+                    // (sin(yaw)*cos(pitch), sin(pitch), -cos(yaw)*cos(pitch)).
+                    // Invert: pitch = asin(dir.y); yaw = atan2(dir.x, -dir.z).
+                    new_pitch = std::asin(std::clamp(dir.y, -1.0f, 1.0f));
+                    new_yaw   = std::atan2(dir.x, -dir.z);
+                }
+            }
+            camera_->pos      = glm::vec3(x, y, z);
+            camera_->yaw      = new_yaw;
+            camera_->pitch    = new_pitch;
+            camera_->ClampPitch();
+            accum_dirty_ = true;
+            cam_tween_active_ = false;
+            out.FormatLine("cam_warp: pos=({:.2f} {:.2f} {:.2f}) yaw={:.1f} pitch={:.1f}",
+                           x, y, z,
+                           glm::degrees(camera_->yaw),
+                           glm::degrees(camera_->pitch));
+        });
+
+    // --- cam_warp_smooth --------------------------------------------------
+    // Same arg shapes as cam_warp BUT prefixed with a duration in
+    // seconds. UpdateCamera() lerps with smoothstep easing toward the
+    // target until duration elapses. Any WASD / RMB-look input cancels
+    // the tween. Useful for cinematic camera moves, scripted demos,
+    // and the editor "Goto" button when you want a smooth feel.
+    C.RegisterCommand("cam_warp_smooth",
+        "cam_warp_smooth <duration_sec> <x> <y> <z> [yaw_deg pitch_deg | look_at lx ly lz]: "
+        "tweened cam_warp with smoothstep easing over duration_sec. "
+        "Manual WASD / RMB-look aborts the tween.",
+        [this](auto args, pt::console::Output& out) {
+            if (!camera_) { out.PrintLine("cam_warp_smooth: camera not initialised"); return; }
+            const auto n = args.size();
+            if (n != 4 && n != 6 && n != 8) {
+                out.PrintLine("usage: cam_warp_smooth <duration_sec> <x> <y> <z> "
+                              "[yaw_deg pitch_deg | look_at lx ly lz]");
+                return;
+            }
+            float dur, x, y, z;
+            if (!ParseFloat(args[0], dur) ||
+                !ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z)) {
+                out.PrintLine("cam_warp_smooth: arg parse failed");
+                return;
+            }
+            if (dur <= 0.0f) {
+                out.PrintLine("cam_warp_smooth: duration must be > 0 (use cam_warp for instant)");
+                return;
+            }
+            float new_yaw   = camera_->yaw;
+            float new_pitch = camera_->pitch;
+            if (n == 6) {
+                float yaw_deg, pitch_deg;
+                if (!ParseFloat(args[4], yaw_deg) || !ParseFloat(args[5], pitch_deg)) {
+                    out.PrintLine("cam_warp_smooth: yaw/pitch parse failed");
+                    return;
+                }
+                new_yaw   = glm::radians(yaw_deg);
+                new_pitch = glm::radians(pitch_deg);
+            } else if (n == 8) {
+                if (args[4] != "look_at") {
+                    out.PrintLine("cam_warp_smooth: 8-arg form must use 'look_at <lx> <ly> <lz>'");
+                    return;
+                }
+                float lx, ly, lz;
+                if (!ParseFloat(args[5], lx) || !ParseFloat(args[6], ly) || !ParseFloat(args[7], lz)) {
+                    out.PrintLine("cam_warp_smooth: look_at target parse failed");
+                    return;
+                }
+                glm::vec3 dir = glm::vec3(lx - x, ly - y, lz - z);
+                float len = glm::length(dir);
+                if (len >= 1e-6f) {
+                    dir /= len;
+                    new_pitch = std::asin(std::clamp(dir.y, -1.0f, 1.0f));
+                    new_yaw   = std::atan2(dir.x, -dir.z);
+                }
+            }
+            // Stash start state. Lerp angles via shortest-path: if the
+            // target yaw differs from start by more than pi, wrap it
+            // around so the camera spins the short way.
+            cam_tween_start_pos_[0] = camera_->pos.x;
+            cam_tween_start_pos_[1] = camera_->pos.y;
+            cam_tween_start_pos_[2] = camera_->pos.z;
+            cam_tween_target_pos_[0] = x;
+            cam_tween_target_pos_[1] = y;
+            cam_tween_target_pos_[2] = z;
+            cam_tween_start_yaw_     = camera_->yaw;
+            cam_tween_start_pitch_   = camera_->pitch;
+            cam_tween_target_pitch_  = new_pitch;
+            constexpr float kPi  = 3.14159265358979323846f;
+            constexpr float kTau = kPi * 2.0f;
+            float yaw_delta = new_yaw - camera_->yaw;
+            // Normalise to (-pi, pi].
+            while (yaw_delta >  kPi) yaw_delta -= kTau;
+            while (yaw_delta < -kPi) yaw_delta += kTau;
+            cam_tween_target_yaw_ = camera_->yaw + yaw_delta;
+            cam_tween_t_seconds_  = 0.0;
+            cam_tween_duration_   = static_cast<double>(dur);
+            cam_tween_active_     = true;
+            out.FormatLine("cam_warp_smooth: tweening over {:.2f}s to ({:.2f} {:.2f} {:.2f}) yaw={:.1f} pitch={:.1f}",
+                           dur, x, y, z,
+                           glm::degrees(new_yaw),
+                           glm::degrees(new_pitch));
         });
 }
 
