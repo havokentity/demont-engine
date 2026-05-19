@@ -1464,6 +1464,15 @@ void WinOverlay::SubmitInput() {
         scroll_lines_ = 0;
     }
 
+    // Mirror into Console::history_ so the cross-platform persistence
+    // path (Engine::SaveConsoleHistoryToDisk -> console_history.txt)
+    // sees every submitted line. The Win32 .state file remains the
+    // richer history + scrollback persistence -- but
+    // console_history.txt is the canonical, hand-editable, cross-
+    // platform up-arrow store. Done OUTSIDE the state_mutex_ since
+    // Console has its own synchronisation.
+    pt::console::Console::Get().PushHistory(line);
+
     // Console::QueueExecute is thread-safe; the responder fires from
     // the engine main thread when Drain() runs.
     pt::console::Console::Get().QueueExecute(line,
