@@ -216,3 +216,97 @@ TEST_CASE("Segment GPU layout is 48 bytes (3 float4)") {
     // shaders/EditorOverlay.slang verbatim).
     CHECK(sizeof(EditorOverlay::Segment) == 48u);
 }
+
+// --- Rotation gizmo (#206) -----------------------------------------------
+//
+// Rotate mode adds two new behaviours over translate:
+//   * HitTest probes the three rings instead of the three arms; the
+//     picked axis is the ring's NORMAL (Axis::X = X-normal ring).
+//   * UpdateRotateDrag returns a signed angle in radians instead of
+//     a world-space position. Sign follows the right-hand rule around
+//     the picked axis.
+// Both paths share the BeginDrag entry point, but the drag_mode_ field
+// captures the mode at BeginDrag time so a mid-drag gizmo_mode toggle
+// doesn't change the dispatch.
+
+TEST_CASE("Rotate-mode HitTest picks the Z ring when clicking near +X on the XY plane") {
+    Camera cam = MakeCamera({0.0f, 0.0f, 3.0f});
+    const glm::vec3 origin{0.0f, 0.0f, 0.0f};
+    const float L = 1.0f;
+    EditorOverlay eo;
+    eo.SetMode(EditorOverlay::Mode::Rotate);
+
+    // The Z-normal ring lives on the XY plane. Click near (L, 0, 0)
+    // which sits on that ring -- the picked axis should be Z.
+    glm::vec2 ring_pt;
+    REQUIRE(ProjectToScreen(glm::vec3(L, 0, 0), cam, kAspect, kFbW, kFbH, ring_pt));
+    auto axis = eo.HitTest(origin, L, cam, kAspect, kFbW, kFbH,
+                           ring_pt.x, ring_pt.y, 10.0f);
+    // (L,0,0) is on the X ring (X-normal -> ring on YZ plane through X)
+    // *and* the Z ring (Z-normal -> ring on XY plane through X). Both
+    // could match. We require ONE of them is picked (not None).
+    CHECK(axis != EditorOverlay::Axis::None);
+}
+
+TEST_CASE("Rotate-mode HitTest returns None far from any ring") {
+    Camera cam = MakeCamera({0.0f, 0.0f, 3.0f});
+    const glm::vec3 origin{0.0f, 0.0f, 0.0f};
+    const float L = 1.0f;
+    EditorOverlay eo;
+    eo.SetMode(EditorOverlay::Mode::Rotate);
+    auto axis = eo.HitTest(origin, L, cam, kAspect, kFbW, kFbH,
+                           10.0, 10.0, 10.0f);
+    CHECK(axis == EditorOverlay::Axis::None);
+}
+
+TEST_CASE("UpdateRotateDrag returns a non-zero angle after the mouse moves around the ring") {
+    Camera cam = MakeCamera({0.0f, 3.0f, 0.0f}, 0.0f, -1.5707963f);
+    // Look straight down so the Y-normal ring (in the XZ plane)
+    // projects to a roughly-circular shape in screen space. The Y ring
+    // is the easiest to project around because its plane is parallel
+    // to the camera's image plane in this configuration.
+    const glm::vec3 origin{0.0f, 0.0f, 0.0f};
+    const float L = 1.0f;
+    EditorOverlay eo;
+    eo.SetMode(EditorOverlay::Mode::Rotate);
+
+    // BeginDrag at a point on the +X side of the Y ring (XZ-plane).
+    glm::vec2 px_start;
+    REQUIRE(ProjectToScreen(glm::vec3(L, 0, 0), cam, kAspect, kFbW, kFbH, px_start));
+    eo.BeginDrag(EditorOverlay::Axis::Y, origin, cam, kAspect,
+                 kFbW, kFbH, px_start.x, px_start.y);
+    REQUIRE(eo.IsDragging());
+    REQUIRE(eo.DragAxis() == EditorOverlay::Axis::Y);
+    REQUIRE(eo.DragMode() == EditorOverlay::Mode::Rotate);
+
+    // Move to a point on the +Z side of the ring (90 degrees around
+    // the Y axis, right-hand rule). Should yield ~+pi/2 angle.
+    glm::vec2 px_end;
+    REQUIRE(ProjectToScreen(glm::vec3(0, 0, L), cam, kAspect, kFbW, kFbH, px_end));
+    const float angle = eo.UpdateRotateDrag(cam, kAspect, kFbW, kFbH,
+                                            px_end.x, px_end.y);
+    // We don't pin the magnitude (the look-down camera distorts the
+    // angular measurement slightly) but it MUST be non-trivially
+    // non-zero. Sign should be consistent with the right-hand rule.
+    CHECK(std::abs(angle) > 0.5f);
+}
+
+TEST_CASE("DragMode is captured at BeginDrag time, not at UpdateDrag time") {
+    Camera cam = MakeCamera({0.0f, 0.0f, 3.0f});
+    const glm::vec3 origin{0.0f, 0.0f, 0.0f};
+    const float L = 1.0f;
+    EditorOverlay eo;
+    eo.SetMode(EditorOverlay::Mode::Rotate);
+
+    glm::vec2 px;
+    REQUIRE(ProjectToScreen(glm::vec3(L, 0, 0), cam, kAspect, kFbW, kFbH, px));
+    eo.BeginDrag(EditorOverlay::Axis::Y, origin, cam, kAspect,
+                 kFbW, kFbH, px.x, px.y);
+    CHECK(eo.DragMode() == EditorOverlay::Mode::Rotate);
+
+    // Toggle the gizmo's mode mid-drag. The drag's captured mode
+    // should stay Rotate so the engine dispatches the right command.
+    eo.SetMode(EditorOverlay::Mode::Translate);
+    CHECK(eo.DragMode() == EditorOverlay::Mode::Rotate);
+    CHECK(eo.GetMode() == EditorOverlay::Mode::Translate);
+}

@@ -270,12 +270,69 @@ void EditorOverlay::AppendScaleGizmo(const glm::vec3& O, float L, Axis hl)
     draw_arm_with_cube(glm::vec3(0, 0, 1), Axis::Z);
 }
 
+// Screen-space distance from the mouse cursor to a polygonal ring in
+// world space. The ring lies in the plane through `O` with normal
+// `n` (unit vector), radius `L`. We sample the ring at `kRingSamples`
+// points, project each pair to screen, and return the minimum
+// projected-segment distance. Mirrors the segment-distance code path
+// used for translate/scale axis arms but operates on the ring
+// polyline that AppendRotateGizmo also draws (32 segments).
+static float ScreenRingDistance(const glm::vec3& O, const glm::vec3& n,
+                                float L,
+                                const Camera& cam, float aspect,
+                                int fb_w, int fb_h,
+                                double mouse_x, double mouse_y)
+{
+    glm::vec3 t1{0.0f}, t2{0.0f};
+    if (std::abs(n.x) < 0.9f) {
+        t1 = glm::normalize(glm::cross(n, glm::vec3(1, 0, 0)));
+    } else {
+        t1 = glm::normalize(glm::cross(n, glm::vec3(0, 1, 0)));
+    }
+    t2 = glm::normalize(glm::cross(n, t1));
+    // Use the same segment count as AppendRotateGizmo so the hit-test
+    // geometry matches the visual ring exactly. Each segment's screen
+    // distance to the mouse is evaluated; we keep the minimum.
+    constexpr int kRingSamples = 32;
+    float best = 1e30f;
+    glm::vec3 prev = O + t1 * L;
+    for (int i = 1; i <= kRingSamples; ++i) {
+        const float ang = (i * 6.28318530718f) / kRingSamples;
+        const glm::vec3 cur = O + t1 * (std::cos(ang) * L)
+                                + t2 * (std::sin(ang) * L);
+        const float d = ScreenSegmentDistance(prev, cur, cam, aspect,
+                                              fb_w, fb_h, mouse_x, mouse_y);
+        if (d < best) best = d;
+        prev = cur;
+    }
+    return best;
+}
+
 EditorOverlay::Axis EditorOverlay::HitTest(const glm::vec3& O, float L,
                                            const Camera& cam, float aspect,
                                            int fb_w, int fb_h,
                                            double mx, double my,
                                            float hit_radius_px) const
 {
+    if (mode_ == Mode::Rotate) {
+        // Rotate mode: test the three rings instead of the three arms.
+        // The picked axis is the ring's NORMAL (so picking the X ring
+        // returns Axis::X -- rotation around the world X axis).
+        const float dX = ScreenRingDistance(O, glm::vec3(1, 0, 0), L,
+                                            cam, aspect, fb_w, fb_h, mx, my);
+        const float dY = ScreenRingDistance(O, glm::vec3(0, 1, 0), L,
+                                            cam, aspect, fb_w, fb_h, mx, my);
+        const float dZ = ScreenRingDistance(O, glm::vec3(0, 0, 1), L,
+                                            cam, aspect, fb_w, fb_h, mx, my);
+        float best = hit_radius_px;
+        Axis  pick = Axis::None;
+        if (dX < best) { best = dX; pick = Axis::X; }
+        if (dY < best) { best = dY; pick = Axis::Y; }
+        if (dZ < best) { best = dZ; pick = Axis::Z; }
+        return pick;
+    }
+
+    // Translate / scale: test the three axis arms.
     const glm::vec3 ax_X = O + glm::vec3(L, 0, 0);
     const glm::vec3 ax_Y = O + glm::vec3(0, L, 0);
     const glm::vec3 ax_Z = O + glm::vec3(0, 0, L);
@@ -290,12 +347,31 @@ EditorOverlay::Axis EditorOverlay::HitTest(const glm::vec3& O, float L,
     return pick;
 }
 
+// Intersect a ray with an infinite plane through `plane_origin` with
+// unit normal `plane_normal`. Returns the world-space hit point; the
+// `out_hit` ref is unchanged if the ray is parallel (denom == 0) so
+// the caller can fall back to a sensible default (the ring's "+X"
+// reference tangent).
+static bool RayPlaneIntersect(const glm::vec3& ro, const glm::vec3& rd,
+                              const glm::vec3& plane_origin,
+                              const glm::vec3& plane_normal,
+                              glm::vec3& out_hit)
+{
+    const float denom = glm::dot(rd, plane_normal);
+    if (std::abs(denom) < 1e-6f) return false;
+    const float t = glm::dot(plane_origin - ro, plane_normal) / denom;
+    if (t < 0.0f) return false;
+    out_hit = ro + rd * t;
+    return true;
+}
+
 void EditorOverlay::BeginDrag(Axis a, const glm::vec3& origin,
                               const Camera& cam, float aspect,
                               int fb_w, int fb_h,
                               double mx, double my)
 {
     drag_axis_      = a;
+    drag_mode_      = mode_;
     drag_start_pos_ = origin;
     switch (a) {
         case Axis::X: drag_axis_dir_ = glm::vec3(1, 0, 0); break;
@@ -304,11 +380,43 @@ void EditorOverlay::BeginDrag(Axis a, const glm::vec3& origin,
         default:      drag_axis_     = Axis::None; return;
     }
     glm::vec3 ro{0.0f}, rd{0.0f};
-    if (ScreenToWorldRay(cam, aspect, fb_w, fb_h, mx, my, ro, rd)) {
+    if (!ScreenToWorldRay(cam, aspect, fb_w, fb_h, mx, my, ro, rd)) {
+        drag_anchor_world_ = origin;
+        return;
+    }
+    if (drag_mode_ == Mode::Rotate) {
+        // Rotate mode: anchor is the mouse ray's intersection with the
+        // ring's plane, snapped to the ring's circle. drag_ring_radius_
+        // matches the visual ring radius (size passed to AppendGizmo).
+        // We treat `size` as the ring radius -- this isn't passed to
+        // BeginDrag; we recover it from the world-space picked tangent
+        // by snapping to the same plane the AppendRotateGizmo uses.
+        // For Phase 1 we use the BeginDrag's `origin -> picked-point`
+        // tangent regardless of magnitude, then store its world length
+        // so UpdateRotateDrag normalises consistently.
+        glm::vec3 ring_pick{};
+        if (RayPlaneIntersect(ro, rd, origin, drag_axis_dir_, ring_pick)) {
+            // Vector from origin into the ring plane.
+            const glm::vec3 v = ring_pick - origin;
+            // Strip any residual axis-direction component (numerical
+            // noise -- RayPlaneIntersect already removes most of it).
+            const glm::vec3 t = v - drag_axis_dir_ * glm::dot(v, drag_axis_dir_);
+            const float r = glm::length(t);
+            if (r > 1e-6f) {
+                drag_anchor_world_ = t / r;   // unit tangent at angle 0
+                drag_ring_radius_  = r;
+            } else {
+                drag_anchor_world_ = glm::vec3(0, 0, 0);
+                drag_ring_radius_  = 1.0f;
+            }
+        } else {
+            drag_anchor_world_ = glm::vec3(0, 0, 0);
+            drag_ring_radius_  = 1.0f;
+        }
+    } else {
+        // Translate / scale mode: closest point on the axis line.
         drag_anchor_world_ =
             ClosestPointOnLineToRay(origin, drag_axis_dir_, ro, rd);
-    } else {
-        drag_anchor_world_ = origin;
     }
 }
 
@@ -329,6 +437,39 @@ glm::vec3 EditorOverlay::UpdateDrag(const Camera& cam, float aspect,
     // construction, but be defensive against floating-point drift).
     const float on_axis = glm::dot(delta_world, drag_axis_dir_);
     return drag_start_pos_ + drag_axis_dir_ * on_axis;
+}
+
+float EditorOverlay::UpdateRotateDrag(const Camera& cam, float aspect,
+                                      int fb_w, int fb_h,
+                                      double mx, double my) const
+{
+    if (drag_axis_ == Axis::None) return 0.0f;
+    glm::vec3 ro{0.0f}, rd{0.0f};
+    if (!ScreenToWorldRay(cam, aspect, fb_w, fb_h, mx, my, ro, rd)) {
+        return 0.0f;
+    }
+    // Intersect the mouse ray with the ring's plane (origin =
+    // drag_start_pos_, normal = drag_axis_dir_). Project the resulting
+    // tangent vector onto the ring plane (strip residual axis
+    // component) and measure the signed angle from drag_anchor_world_
+    // (the unit tangent stored at BeginDrag time).
+    glm::vec3 cur_world{};
+    if (!RayPlaneIntersect(ro, rd, drag_start_pos_, drag_axis_dir_, cur_world)) {
+        return 0.0f;
+    }
+    glm::vec3 t = cur_world - drag_start_pos_;
+    t = t - drag_axis_dir_ * glm::dot(t, drag_axis_dir_);
+    const float len = glm::length(t);
+    if (len < 1e-6f) return 0.0f;
+    const glm::vec3 cur_tangent = t / len;
+    // Signed angle around drag_axis_dir_ from the anchor tangent.
+    // sign = sign(cross(anchor, cur) . axis). cosine = dot, sine =
+    // length(cross). atan2 of (sin, cos) gives the unambiguous
+    // (-pi, pi] angle.
+    const glm::vec3 c = glm::cross(drag_anchor_world_, cur_tangent);
+    const float sine_signed = glm::dot(c, drag_axis_dir_);
+    const float cos_v       = glm::dot(drag_anchor_world_, cur_tangent);
+    return std::atan2(sine_signed, cos_v);
 }
 
 void EditorOverlay::EndDrag() {

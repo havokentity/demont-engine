@@ -76,9 +76,9 @@ cbuffer Push {
     uint   linear_prim_count;     // analytic-prim "always-linear" prefix
 };
 
-// Match PathTrace's analytic primitive layout: float4 * 5 per prim
-// after #85 (motion blur, v3=prev_pos) + #181 polish (emission, v4),
-// PRIM_SPHERE = 0, PRIM_PLANE = 1.
+// Match PathTrace's analytic primitive layout: float4 * 6 per prim
+// after #85 (motion blur, v3=prev_pos) + #181 polish (emission, v4)
+// + #206 rotation gizmo (orient quat, v5). PRIM_SPHERE = 0, PRIM_PLANE = 1.
 static const uint PRIM_SPHERE = 0u;
 static const uint PRIM_PLANE  = 1u;
 
@@ -107,15 +107,16 @@ float shadowVis(float3 ro, float3 rd, float t_max) {
     // counts > r_analytic_bvh_threshold, but the linear loop is fine
     // for shadow rays at MVP scale and avoids the BVH traversal code
     // duplication).
-    // Stride is 5 float4s per prim after #85 (motion blur, v3=prev_pos)
-    // and #181 polish (emission, v4). Shadow rays don't read v1/v2/v3/v4
-    // contents -- only v0 (center + radius) and v2 (type) -- so we
-    // just index those two at the new stride and skip the others. The
-    // stride MUST stay in sync with Engine.cpp's kFloatsPerPrim and
-    // PathTrace.slang's testAnalyticPrim (also `idx * 5u`).
+    // Stride is 6 float4s per prim after #85 (motion blur, v3=prev_pos),
+    // #181 polish (emission, v4), and #206 rotation gizmo (orient, v5).
+    // Shadow rays don't read v1/v2/v3/v4/v5 contents -- only v0 (center
+    // + radius) and v2 (type) -- so we just index those two at the new
+    // stride and skip the others. The stride MUST stay in sync with
+    // Engine.cpp's kFloatsPerPrim and PathTrace.slang's testAnalyticPrim
+    // (also `idx * 6u`).
     for (uint i = 0u; i < prim_count; ++i) {
-        float4 v0 = primitives[i * 5u + 0u];
-        float4 v2 = primitives[i * 5u + 2u];
+        float4 v0 = primitives[i * 6u + 0u];
+        float4 v2 = primitives[i * 6u + 2u];
         uint type = uint(v2.x);
         float t;
         if (type == PRIM_SPHERE) {

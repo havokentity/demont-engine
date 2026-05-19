@@ -86,6 +86,12 @@ public:
     // `hit_radius_px`. Returns Axis::None if no axis is within
     // tolerance. The origin + size match the same values passed to
     // AppendGizmo.
+    //
+    // The hit-test geometry follows the current mode_:
+    //   Translate / Scale -- tests the three axis arms (lines from
+    //     origin to origin + axis * size).
+    //   Rotate            -- tests the three rings (one per axis
+    //     plane); the picked axis is the ring's normal.
     Axis HitTest(const glm::vec3& origin, float size,
                  const Camera& cam, float aspect,
                  int fb_w, int fb_h,
@@ -95,21 +101,36 @@ public:
     // Drag math. Engine state machine calls these as the mouse moves.
     //
     // BeginDrag captures the world-space gizmo origin AND a reference
-    // world point on the axis line closest to the current mouse ray.
-    // Subsequent UpdateDrag calls compute the world-space delta along
-    // the axis as the mouse-ray-axis closest-point moves.
+    // world point. For translate / scale mode this is the closest
+    // point on the axis line to the current mouse ray. For rotate
+    // mode it is the closest point on the ring (origin-centred,
+    // ring_axis-normal, size-radius) to the mouse ray -- used as the
+    // angle-zero tangent for subsequent UpdateRotateDrag calls.
+    //
+    // The caller passes the current mode in addition to the axis so a
+    // mid-mode-change drag isn't ambiguous; drag_mode_ is captured.
     void  BeginDrag(Axis a, const glm::vec3& origin,
                     const Camera& cam, float aspect,
                     int fb_w, int fb_h,
                     double mouse_x, double mouse_y);
     bool  IsDragging() const noexcept { return drag_axis_ != Axis::None; }
     Axis  DragAxis() const noexcept { return drag_axis_; }
+    // Mode the drag was initiated with -- mirrors the current mode_
+    // at BeginDrag time so the engine's drag-update path can pick the
+    // right dispatch even if gizmo_mode is toggled mid-drag.
+    Mode  DragMode() const noexcept { return drag_mode_; }
     // Returns the new world-space origin given the current mouse
     // position. The caller compares against the stored drag_start_pos_
-    // to compute the delta.
+    // to compute the delta. Translate / scale path.
     glm::vec3 UpdateDrag(const Camera& cam, float aspect,
                          int fb_w, int fb_h,
                          double mouse_x, double mouse_y) const;
+    // Returns the signed rotation angle in radians around the dragged
+    // ring's axis since BeginDrag. Rotate-mode path. Positive sign
+    // follows the right-hand rule around drag_axis_dir_.
+    float UpdateRotateDrag(const Camera& cam, float aspect,
+                           int fb_w, int fb_h,
+                           double mouse_x, double mouse_y) const;
     void  EndDrag();
     // Cancel the in-flight drag without applying any further updates.
     // Engine uses this on Esc to revert to drag_start_pos_.
@@ -134,13 +155,25 @@ private:
 
     // Drag state.
     Axis      drag_axis_      = Axis::None;
+    // Mode at BeginDrag time. Captured so a mid-drag mode toggle
+    // doesn't change which UpdateDrag overload is correct.
+    Mode      drag_mode_      = Mode::Translate;
     glm::vec3 drag_start_pos_ { 0.0f };
-    // World-space closest point along the axis line at drag start.
-    // Subtracting subsequent closest-points gives the delta to apply.
+    // Translate / scale mode: world-space closest point on the axis
+    // line to the mouse ray at drag start. Subtracting subsequent
+    // closest-points gives the delta to apply.
+    // Rotate mode: world-space anchor tangent (origin + offset on the
+    // ring plane) computed at BeginDrag. UpdateRotateDrag measures
+    // the signed angle from this anchor's projected-onto-ring tangent
+    // to the current mouse's projected-onto-ring tangent.
     glm::vec3 drag_anchor_world_ { 0.0f };
     // World-space axis direction (unit vector). Stored at BeginDrag
-    // so UpdateDrag doesn't need to re-derive it.
+    // so UpdateDrag doesn't need to re-derive it. For rotate mode
+    // this is the ring's normal (the axis we rotate AROUND).
     glm::vec3 drag_axis_dir_  { 1.0f, 0.0f, 0.0f };
+    // Rotate mode: radius of the active ring (world units). Equals
+    // the `size` passed to BeginDrag.
+    float     drag_ring_radius_ { 1.0f };
 };
 
 // Compute the closest point on a 3D line (origin + t * dir) to a

@@ -1027,18 +1027,18 @@ struct HitInfo {
     float  roughness;
     float  ior;
     // Per-prim radiant emission (W/sr per channel). Populated by
-    // testAnalyticPrim from primitives[idx*5 + 4].xyz (stride bumped
-    // to 5 float4s after #85 motion-blur added v3=prev_pos and #181
-    // polish added v4=emission). Mesh / SDF hit paths reset this to 0
-    // on overwrite -- emission is currently only sourced from
-    // analytic-prim hits (#181 polish: emissive rigid bodies via
-    // phys_drop_* emission args). The per-bounce loop adds
-    // `throughput * h.emission` to radiance BEFORE BRDF eval, matching
-    // the additive-emitter pattern used for emissive sphere/quad area
-    // lights.
+    // testAnalyticPrim from primitives[idx*6 + 4].xyz (stride bumped
+    // to 6 float4s after #85 motion-blur added v3=prev_pos, #181
+    // polish added v4=emission, and #206 rotation gizmo added
+    // v5=orient). Mesh / SDF hit paths reset this to 0 on overwrite
+    // -- emission is currently only sourced from analytic-prim hits
+    // (#181 polish: emissive rigid bodies via phys_drop_* emission
+    // args). The per-bounce loop adds `throughput * h.emission` to
+    // radiance BEFORE BRDF eval, matching the additive-emitter pattern
+    // used for emissive sphere/quad area lights.
     float3 emission;
     // Editor backend (agent-19): user-facing id of the analytic prim
-    // that produced this hit. Sourced from primitives[idx*5 + 2].w
+    // that produced this hit. Sourced from primitives[idx*6 + 2].w
     // (the same v2.w slot the host now bakes the AnalyticPrim map key
     // into via asuint reinterpretation). 0 on mesh / SDF / miss paths
     // -- those overwrite the field explicitly. The per-bounce loop
@@ -1047,16 +1047,28 @@ struct HitInfo {
     uint prim_id;
 };
 
-// Test a single analytic primitive at `primitives[idx*5 + 0..4]` against
+// Rotate a 3-vector by a unit quaternion (xyzw). Standard
+// q * (0, v) * q^-1 in optimised cross-product form: equals
+//   v + 2 * cross(q.xyz, cross(q.xyz, v) + q.w * v)
+// Used by the plane intersect path so a rotate-gizmo dispatch to
+// the host actually tilts the rendered plane. Identity quat (0,0,0,1)
+// is a no-op: cross(zero, anything) == 0, so rotated == v exactly.
+float3 quatRotate(float4 q, float3 v) {
+    float3 u = q.xyz;
+    return v + 2.0 * cross(u, cross(u, v) + q.w * v);
+}
+
+// Test a single analytic primitive at `primitives[idx*6 + 0..5]` against
 // (ro, rd) and update `h` if it's a closer hit. Centralizes the per-prim
 // dispatch so the linear-loop and BVH-leaf paths share one body.
 //
-// Stride is 5 float4s (20 floats) after #85 (motion blur, v3=prev_pos)
-// and #181 polish (emission, v4):
-//   v0 = pos / radius   v1 = albedo / roughness   v2 = type/mat/ior
+// Stride is 6 float4s (24 floats) after #85 (motion blur, v3=prev_pos),
+// #181 polish (emission, v4), and #206 rotation gizmo (orient, v5):
+//   v0 = pos / radius   v1 = albedo / roughness   v2 = type/mat/ior/id
 //   v3 = prev_pos / pad (motion blur)
 //   v4 = emission / pad (self-emissive rigid bodies)
-// Must stay in sync with Engine.cpp's kFloatsPerPrim = 20.
+//   v5 = orient quaternion (rotation gizmo)
+// Must stay in sync with Engine.cpp's kFloatsPerPrim = 24.
 //
 // Motion blur (#85): `shutter_t01` is the per-ray shutter sample in
 // [0, 1] -- 0 = start of shutter (== prev_pos), 1 = end (== curr_pos =
@@ -1069,12 +1081,20 @@ struct HitInfo {
 // non-emissive prims have v4.rgb == 0 so the cost is just one load.
 // The per-bounce loop adds throughput * h.emission to radiance BEFORE
 // BRDF eval.
+//
+// Orientation (#206): spheres are rotation-symmetric so v5 is ignored
+// for PRIM_SPHERE. For PRIM_PLANE we rotate v0.xyz (the stored normal)
+// by the quaternion to get the effective world-space normal, and the
+// plane equation becomes (rotated_normal . p + d == 0). The default
+// identity quat (0,0,0,1) is a no-op in quatRotate so existing planes
+// render bit-identically.
 void testAnalyticPrim(uint idx, float3 ro, float3 rd, float shutter_t01, inout HitInfo h) {
-    float4 v0 = primitives[idx * 5u + 0u];
-    float4 v1 = primitives[idx * 5u + 1u];
-    float4 v2 = primitives[idx * 5u + 2u];
-    float4 v3 = primitives[idx * 5u + 3u];
-    float4 v4 = primitives[idx * 5u + 4u];
+    float4 v0 = primitives[idx * 6u + 0u];
+    float4 v1 = primitives[idx * 6u + 1u];
+    float4 v2 = primitives[idx * 6u + 2u];
+    float4 v3 = primitives[idx * 6u + 3u];
+    float4 v4 = primitives[idx * 6u + 4u];
+    float4 v5 = primitives[idx * 6u + 5u];
     uint type = uint(v2.x);
     // v2.w carries the user-facing prim id bit-reinterpreted as float
     // by the host (Engine::EnsurePrimitivesUploaded). The editor
@@ -1100,9 +1120,13 @@ void testAnalyticPrim(uint idx, float3 ro, float3 rd, float shutter_t01, inout H
             h.prim_id = user_id;
         }
     } else if (type == PRIM_PLANE) {
-        if (intersectPlane(ro, rd, v0.xyz, v0.w, t) && t < h.t) {
+        // Rotate the stored normal by the orientation quaternion. With
+        // the default identity orient (0,0,0,1) the cross-product form
+        // collapses to v0.xyz so untouched planes are bit-identical.
+        float3 plane_n = quatRotate(v5, v0.xyz);
+        if (intersectPlane(ro, rd, plane_n, v0.w, t) && t < h.t) {
             h.hit = true; h.t = t;
-            h.normal = v0.xyz;
+            h.normal = plane_n;
             h.mat = uint(v2.y);
             h.albedo = v1.rgb;
             h.roughness = v1.a;
@@ -3976,7 +4000,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
         float3 nf  = (ndi < 0.0) ? h.normal : -h.normal;
 
         // Per-prim emission (#181 polish). h.emission is sourced from
-        // primitives[idx*5 + 4].xyz in testAnalyticPrim, units W/sr per
+        // primitives[idx*6 + 4].xyz in testAnalyticPrim, units W/sr per
         // channel. Adds `throughput * emission` BEFORE the BRDF eval so
         // the body itself glows AND illuminates nearby surfaces via
         // bounce-sampled rays that land on it. Camera-ray (b==0) hits

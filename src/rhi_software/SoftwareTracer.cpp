@@ -83,13 +83,14 @@ constexpr std::size_t kAccumParamsOffset = 720;
 //   v2.z   = ior; v2.w = pad
 //   v3.xyz = prev_pos_or_n (motion blur, #85; ignored here)
 //   v4.xyz = emission (W/sr per channel, #181 polish); v4.w = pad
-// 5 float4 per prim = 20 floats = 80 bytes. The stride MUST stay in
-// sync with Engine.cpp's kFloatsPerPrim (20) and PathTrace.slang's
-// testAnalyticPrim (reads at idx*5 stride).
+//   v5.xyzw = orient quaternion (rotation gizmo, #206)
+// 6 float4 per prim = 24 floats = 96 bytes. The stride MUST stay in
+// sync with Engine.cpp's kFloatsPerPrim (24) and PathTrace.slang's
+// testAnalyticPrim (reads at idx*6 stride).
 constexpr std::uint32_t kPrimSphere = 0u;
 constexpr std::uint32_t kPrimPlane  = 1u;
 constexpr std::uint32_t kMatLambert = 0u;
-constexpr std::uint32_t kFloatsPerPrim = 20u;
+constexpr std::uint32_t kFloatsPerPrim = 24u;
 
 struct HitInfo {
     bool      hit = false;
@@ -129,6 +130,16 @@ inline bool IntersectPlane(const glm::vec3& ro, const glm::vec3& rd,
     float t_ = -(glm::dot(n, ro) + d) / denom;
     if (t_ > 1e-4f) { t = t_; return true; }
     return false;
+}
+
+// Rotate a vector by a unit quaternion (xyzw). Mirrors the
+// PathTrace.slang quatRotate helper -- standard q*(0,v)*q^-1 in
+// cross-product form. Identity (0,0,0,1) is a no-op so untouched
+// planes render bit-identically through the SW tracer.
+inline glm::vec3 QuatRotateVec(const float* q4, const glm::vec3& v) {
+    glm::vec3 u{q4[0], q4[1], q4[2]};
+    float w = q4[3];
+    return v + 2.0f * glm::cross(u, glm::cross(u, v) + w * v);
 }
 
 // Procedural sky: a Preetham-lite analytic gradient. Lerps from
@@ -176,10 +187,12 @@ void TraceScene(const glm::vec3& ro, const glm::vec3& rd,
     out.hit = false;
     out.t   = 1e30f;
 
-    // Analytic primitives. Stride is `kFloatsPerPrim` = 20 (5 float4s
+    // Analytic primitives. Stride is `kFloatsPerPrim` = 24 (6 float4s
     // per prim) -- see the layout comment at the top of this file.
     // v3 = prev_pos (motion blur, #85; SW path skips it). v4 carries
-    // per-prim emission (#181 polish).
+    // per-prim emission (#181 polish). v5 carries the orientation
+    // quaternion (#206); spheres ignore it, planes use it to rotate
+    // the stored normal at intersect time.
     for (std::uint32_t i = 0; i < prim_count; ++i) {
         const float* v0 = prim_data + i * kFloatsPerPrim + 0u;
         const float* v1 = prim_data + i * kFloatsPerPrim + 4u;
@@ -187,6 +200,7 @@ void TraceScene(const glm::vec3& ro, const glm::vec3& rd,
         // v3 (prev_pos for motion blur) intentionally unread -- SW
         // tracer always samples at the current frame's position.
         const float* v4 = prim_data + i * kFloatsPerPrim + 16u;
+        const float* v5 = prim_data + i * kFloatsPerPrim + 20u;
         std::uint32_t type = static_cast<std::uint32_t>(v2[0]);
         glm::vec3 albedo{v1[0], v1[1], v1[2]};
         glm::vec3 emission{v4[0], v4[1], v4[2]};
@@ -205,7 +219,12 @@ void TraceScene(const glm::vec3& ro, const glm::vec3& rd,
                 out.emission = emission;
             }
         } else if (type == kPrimPlane) {
-            glm::vec3 n{v0[0], v0[1], v0[2]};
+            // Rotate the stored normal by the orientation quaternion.
+            // With the default identity quat (0,0,0,1) QuatRotateVec
+            // returns v0.xyz exactly, so untouched planes are bit-
+            // identical to the pre-#206 SW tracer output.
+            glm::vec3 n_raw{v0[0], v0[1], v0[2]};
+            glm::vec3 n = QuatRotateVec(v5, n_raw);
             float d = v0[3];
             if (IntersectPlane(ro, rd, n, d, t) && t < out.t) {
                 out.hit = true;
@@ -302,9 +321,10 @@ void RunPathTraceKernel(SoftwareDevice& device,
             prim_count = push->prim_count;
             // Don't trust prim_count past the buffer's capacity. The
             // per-prim byte size MUST match Engine.cpp's kBytesPerPrim:
-            //   kFloatsPerPrim * sizeof(float) = 20 * 4 = 80 bytes,
+            //   kFloatsPerPrim * sizeof(float) = 24 * 4 = 96 bytes,
             // after #85 (motion blur, v3=prev_pos) + #181 polish
-            // (emission, v4) grew the stride from 48 -> 64 -> 80.
+            // (emission, v4) + #206 (orient quat, v5) grew the stride
+            // from 48 -> 64 -> 80 -> 96.
             constexpr std::size_t kBytesPerPrim = kFloatsPerPrim * sizeof(float);
             std::uint32_t max_prims = static_cast<std::uint32_t>(pb->size / kBytesPerPrim);
             if (prim_count > max_prims) prim_count = max_prims;
