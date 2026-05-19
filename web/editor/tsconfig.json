@@ -30,6 +30,7 @@
   "include": [
     "shared/src/**/*",
     "panels/*/src/**/*",
+    "panels/*/__tests__/**/*",
     "vite.config.ts"
   ]
 }

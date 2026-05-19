@@ -1,0 +1,336 @@
+/*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Rajesh D'Monte
+ *
+ * Scene Hierarchy panel styling. Builds on top of the shared
+ * theme.css CSS variables (--bg, --fg, --accent, --magenta, ...);
+ * everything here is panel-specific. Compact density -- the panel
+ * is expected to be docked to a side monitor with limited width.
+ */
+
+/* ----- Search / toolbar row ------------------------------------- */
+.sh-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elev);
+  flex: 0 0 auto;
+}
+
+.sh-search {
+  flex: 1 1 auto;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  padding: 4px 8px;
+  font-family: 'SF Mono', Menlo, Consolas, 'Source Code Pro', monospace;
+  font-size: 12px;
+  outline: none;
+}
+
+.sh-search:focus {
+  border-color: var(--accent-dim);
+  box-shadow: 0 0 0 1px var(--accent-glow);
+}
+
+.sh-search::placeholder {
+  color: var(--fg-dim);
+}
+
+.sh-search-clear {
+  background: transparent;
+  color: var(--fg-muted);
+  border: 1px solid transparent;
+  font-family: inherit;
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.sh-search-clear:hover {
+  color: var(--fg);
+  border-color: var(--border-strong);
+}
+
+.sh-refresh {
+  background: var(--bg);
+  color: var(--fg-muted);
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  padding: 4px 8px;
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.sh-refresh:hover {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+
+.sh-refresh:disabled {
+  color: var(--fg-dim);
+  cursor: not-allowed;
+}
+
+/* The Shell wraps content in `<main class="editor-body">` with 12px of
+   padding. We negate it from inside via negative margin (without
+   adding back the padding) so the tree + toolbar extend edge-to-edge
+   of the panel -- matching VS Code / Unity / Blender's Outliner
+   aesthetic. The `box-sizing: border-box` reset in theme.css means
+   width: 100% + the negative margin still pulls the right edge over;
+   we override that with a fixed-by-calc width below. */
+.sh-body {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: calc(100% + 24px);
+  margin: -12px;
+}
+
+/* ----- Tree ----------------------------------------------------- */
+.sh-tree {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 4px 0;
+  font-family: 'SF Mono', Menlo, Consolas, 'Source Code Pro', monospace;
+  font-size: 12px;
+}
+
+.sh-section {
+  margin: 0;
+}
+
+.sh-section-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  cursor: pointer;
+  user-select: none;
+  color: var(--fg-muted);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.sh-section-header:hover {
+  color: var(--fg);
+  background: var(--bg-elev);
+}
+
+.sh-section-chevron {
+  display: inline-block;
+  width: 9px;
+  text-align: center;
+  color: var(--fg-dim);
+  transition: transform 0.1s ease;
+}
+
+.sh-section-chevron.is-open {
+  transform: rotate(90deg);
+}
+
+.sh-section-icon {
+  font-size: 13px;
+  line-height: 1;
+}
+
+.sh-section-title {
+  flex: 1 1 auto;
+}
+
+.sh-section-count {
+  color: var(--fg-dim);
+  font-size: 11px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0 6px;
+  line-height: 1.4;
+  min-width: 20px;
+  text-align: center;
+}
+
+.sh-section-body {
+  display: flex;
+  flex-direction: column;
+}
+
+/* ----- Row ----------------------------------------------------- */
+.sh-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px 3px 22px;  /* indent under section chevron */
+  cursor: pointer;
+  user-select: none;
+  color: var(--fg);
+  border-left: 2px solid transparent;
+  line-height: 1.4;
+}
+
+.sh-row:hover {
+  background: var(--bg-elev);
+}
+
+.sh-row.is-selected {
+  background: var(--accent-glow);
+  border-left-color: var(--accent);
+  color: var(--accent);
+}
+
+.sh-row.is-selected .sh-row-id {
+  color: var(--accent-dim);
+}
+
+.sh-row-icon {
+  font-size: 13px;
+  line-height: 1;
+  width: 14px;
+  text-align: center;
+  flex: 0 0 auto;
+}
+
+.sh-row-swatch {
+  width: 10px;
+  height: 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 2px;
+  flex: 0 0 auto;
+  /* the background-color comes from inline style */
+}
+
+/* Emissive primitives get a tiny glow ring to show they emit light. */
+.sh-row-swatch.is-emissive {
+  box-shadow: 0 0 4px 1px currentColor;
+}
+
+.sh-row-name {
+  flex: 1 1 auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sh-row-name mark {
+  background: var(--warn);
+  color: var(--bg);
+  padding: 0 1px;
+  border-radius: 1px;
+}
+
+.sh-row-id {
+  color: var(--fg-dim);
+  font-size: 11px;
+  flex: 0 0 auto;
+}
+
+/* ----- Empty state --------------------------------------------- */
+.sh-empty {
+  padding: 32px 24px;
+  text-align: center;
+  color: var(--fg-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.sh-empty h4 {
+  color: var(--fg);
+  margin: 0 0 8px 0;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.sh-empty .sh-empty-example {
+  display: inline-block;
+  margin: 8px 0;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 8px;
+  font-family: 'SF Mono', Menlo, Consolas, 'Source Code Pro', monospace;
+  font-size: 11px;
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.sh-empty .sh-empty-example:hover {
+  border-color: var(--accent-dim);
+  background: var(--bg);
+}
+
+.sh-empty .sh-empty-hint {
+  font-size: 11px;
+  color: var(--fg-dim);
+  margin-top: 8px;
+}
+
+.sh-filter-empty {
+  padding: 16px 24px;
+  text-align: center;
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+
+/* ----- Context menu -------------------------------------------- */
+.sh-menu {
+  position: fixed;
+  z-index: 9000;
+  min-width: 160px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  padding: 4px 0;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5),
+              0 0 0 1px rgba(0, 0, 0, 0.4);
+  font-size: 12px;
+  user-select: none;
+}
+
+.sh-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  color: var(--fg);
+  cursor: pointer;
+  background: transparent;
+  border: none;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+}
+
+.sh-menu-item:hover:not(:disabled) {
+  background: var(--accent-glow);
+  color: var(--accent);
+}
+
+.sh-menu-item:disabled {
+  color: var(--fg-dim);
+  cursor: not-allowed;
+}
+
+.sh-menu-item.is-danger:hover:not(:disabled) {
+  background: rgba(255, 74, 94, 0.15);
+  color: var(--error);
+}
+
+.sh-menu-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
+}
+
+.sh-menu-shortcut {
+  margin-left: auto;
+  color: var(--fg-dim);
+  font-size: 11px;
+}

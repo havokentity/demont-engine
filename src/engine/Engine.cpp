@@ -9995,6 +9995,71 @@ void Engine::RegisterCommands() {
             out.PrintLine("cam_reset: pos=(0, 1.5, 4) yaw=0 pitch=-11.46 fov=60");
         });
 
+    // Editor "Focus camera on target" -- frame a world-space point from a
+    // canonical offset. Used by the scene-hierarchy panel's right-click
+    // "Focus camera" action (agent-21); the panel passes the selected
+    // primitive's centre and we drop the camera into a comfortable
+    // viewing distance, with yaw/pitch aimed at the target.
+    //
+    // Heuristic: stand 3m behind (+Z) and 1m above the target, look down
+    // ~15deg. This roughly matches the Blender "frame selected"
+    // shortcut for objects near the origin without needing the engine
+    // to know the prim's bounding radius (which the editor panel may not
+    // have for SDF clusters / rigid bodies).
+    C.RegisterCommand("cam_focus",
+        "cam_focus <x> <y> <z>: jump the camera so it looks at the given "
+        "world-space point from a canonical 3m back / 1m up offset. "
+        "Fires the active denoiser's history-reset flag so the "
+        "temporal denoise pipeline doesn't blend pre-jump content "
+        "forward. Used by the editor scene-hierarchy panel's "
+        "right-click 'Focus camera'.",
+        [this](auto args, pt::console::Output& out) {
+            if (!camera_) { out.PrintLine("cam_focus: no camera"); return; }
+            if (args.size() != 3) {
+                out.PrintLine("usage: cam_focus <x> <y> <z>");
+                return;
+            }
+            float tx = 0.0f, ty = 0.0f, tz = 0.0f;
+            const auto parse_f = [](std::string_view s, float& f) -> bool {
+                std::string tmp(s);
+                char* end = nullptr;
+                const float v = std::strtof(tmp.c_str(), &end);
+                if (end == tmp.c_str() || end == nullptr) return false;
+                f = v;
+                return true;
+            };
+            if (!parse_f(args[0], tx) || !parse_f(args[1], ty) || !parse_f(args[2], tz)) {
+                out.PrintLine("cam_focus: failed to parse x/y/z (expected 3 floats)");
+                return;
+            }
+            // Canonical viewing offset: 3m back along +Z, 1m above. Then
+            // recompute yaw / pitch so the camera Forward() vector points
+            // at the target. yaw=0 + pitch=-0.262rad (~-15deg) is exact
+            // when the camera is at (tx, ty+1, tz+3) and the target is
+            // at (tx, ty, tz); we still recompute from atan2 so any
+            // future offset change keeps the aim correct.
+            const glm::vec3 target(tx, ty, tz);
+            const glm::vec3 new_pos(tx, ty + 1.0f, tz + 3.0f);
+            const glm::vec3 dir = target - new_pos;
+            // Forward(yaw, pitch) = (sin(yaw)*cos(pitch), sin(pitch), -cos(yaw)*cos(pitch))
+            // Invert: pitch = asin(dir.y / |dir|), yaw = atan2(dir.x, -dir.z).
+            const float len = std::sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+            float yaw = 0.0f;
+            float pitch = 0.0f;
+            if (len > 1e-6f) {
+                pitch = std::asin(dir.y / len);
+                yaw   = std::atan2(dir.x, -dir.z);
+            }
+            camera_->pos   = new_pos;
+            camera_->yaw   = yaw;
+            camera_->pitch = pitch;
+            camera_->ClampPitch();
+            prev_view_proj_valid_ = false;
+            out.FormatLine("cam_focus: target=({:.3f}, {:.3f}, {:.3f}) "
+                           "pos=({:.3f}, {:.3f}, {:.3f})",
+                           tx, ty, tz, new_pos.x, new_pos.y, new_pos.z);
+        });
+
     C.RegisterCommand("cam_list",
         "List camera slots: 0 = engineering default (read-only), "
         "1..9 = user-savable. Empty slots show <empty>.",
