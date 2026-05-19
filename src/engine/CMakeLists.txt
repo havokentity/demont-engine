@@ -56,6 +56,11 @@ target_link_libraries(pt_engine
     PUBLIC  pt_effects
     PUBLIC  pt_physics
     PUBLIC  pt_destruction
+    # pt_editor: scene-graph snapshot (agent-19) + URL router for the
+    # React+Vite editor shell (agent-20). Engine.cpp uses
+    # pt::editor::SerializeScene from the list_scene WS path and
+    # pt::editor::BuildPanelUrl / IsKnownPanel from the
+    # panel_open / panel_close / panels console commands.
     PUBLIC  pt_editor
     PRIVATE pt_capture_encoder
     PRIVATE tomlplusplus::tomlplusplus

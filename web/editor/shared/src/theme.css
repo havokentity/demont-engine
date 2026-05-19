@@ -1,0 +1,292 @@
+/*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Rajesh D'Monte
+ *
+ * Editor panels share the same colour variables as the console UI
+ * (web/console.css). This is a stripped subset of those vars --
+ * just the named colours, no font / scan / grain assets, so each
+ * Chrome --app window can drop this in via a single import without
+ * dragging the full console aesthetic in. The default theme is
+ * "hardcore" (deep near-black + electric cyan + hot magenta) to
+ * match the console; future themes will be selectable via the
+ * existing r_theme cvar.
+ */
+
+:root,
+:root[data-theme="hardcore"] {
+  --bg:        #06080d;
+  --bg-elev:   #0c1018;
+  --bg-glass:  rgba(12, 16, 24, 0.7);
+  --fg:        #e7eaf2;
+  --fg-muted:  #6f7892;
+  --fg-dim:    #3b4257;
+  --border:    #182032;
+  --border-strong: #28324a;
+
+  --accent:        #00f0ff;
+  --accent-dim:    #007a85;
+  --accent-glow:   rgba(0, 240, 255, 0.18);
+
+  --magenta:       #ff3a8c;
+  --warn:          #ffc73a;
+  --error:         #ff4a5e;
+  --ok:            #4afc92;
+}
+
+:root[data-theme="amber"] {
+  --bg:        #0e0d0c;
+  --bg-elev:   #15130f;
+  --bg-glass:  rgba(21, 19, 15, 0.7);
+  --fg:        #e8e3d6;
+  --fg-muted:  #8a8478;
+  --fg-dim:    #5a5650;
+  --border:    #2a2722;
+  --border-strong: #3a3630;
+
+  --accent:        #e89968;
+  --accent-dim:    #a06d44;
+  --accent-glow:   rgba(232, 153, 104, 0.15);
+
+  --magenta:       #d97757;
+  --warn:          #b8a868;
+  --error:         #d97757;
+  --ok:            #88a878;
+}
+
+:root[data-theme="synthwave"] {
+  --bg:        #0c0820;
+  --bg-elev:   #16102f;
+  --bg-glass:  rgba(22, 16, 47, 0.7);
+  --fg:        #f0e6ff;
+  --fg-muted:  #8c7eb8;
+  --fg-dim:    #4a4080;
+  --border:    #2a2150;
+  --border-strong: #3d3170;
+
+  --accent:        #ff5fbf;
+  --accent-dim:    #aa3088;
+  --accent-glow:   rgba(255, 95, 191, 0.22);
+
+  --magenta:       #b46cff;
+  --warn:          #ffa040;
+  --error:         #ff3060;
+  --ok:            #4cf0a8;
+}
+
+/* ----- Reset / page-level ------------------------------------------------ */
+
+* {
+  box-sizing: border-box;
+}
+
+html, body, #app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text',
+               'Segoe UI', Roboto, sans-serif;
+  font-size: 13px;
+  line-height: 1.45;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ----- Shell layout ----------------------------------------------------- */
+
+.editor-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.editor-shell .editor-body {
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: 12px;
+  background: var(--bg);
+}
+
+/* ----- TitleBar --------------------------------------------------------- */
+
+.editor-titlebar {
+  display: flex;
+  align-items: center;
+  height: 32px;
+  padding: 0 12px;
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  user-select: none;
+  flex: 0 0 auto;
+}
+
+.editor-titlebar .titlebar-brand {
+  color: var(--accent);
+  font-weight: 600;
+  margin-right: 10px;
+}
+
+.editor-titlebar .titlebar-title {
+  color: var(--fg);
+  flex: 1 1 auto;
+}
+
+.editor-titlebar .titlebar-status {
+  color: var(--fg-muted);
+  font-size: 11px;
+  margin-left: auto;
+}
+
+.editor-titlebar .titlebar-status.is-open  { color: var(--ok); }
+.editor-titlebar .titlebar-status.is-error { color: var(--error); }
+.editor-titlebar .titlebar-status.is-connecting { color: var(--warn); }
+.editor-titlebar .titlebar-status.is-closed { color: var(--fg-muted); }
+
+/* ----- Toolbar ---------------------------------------------------------- */
+
+.editor-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.editor-toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 4px;
+  border-right: 1px solid var(--border);
+}
+
+.editor-toolbar-group:last-child {
+  border-right: none;
+}
+
+.editor-toolbar-button {
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid transparent;
+  padding: 3px 8px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 3px;
+}
+
+.editor-toolbar-button:hover {
+  background: var(--bg);
+  border-color: var(--border-strong);
+}
+
+.editor-toolbar-button:active,
+.editor-toolbar-button.is-active {
+  background: var(--accent-glow);
+  border-color: var(--accent-dim);
+  color: var(--accent);
+}
+
+.editor-toolbar-button:disabled {
+  color: var(--fg-dim);
+  cursor: not-allowed;
+}
+
+/* ----- StatusBar -------------------------------------------------------- */
+
+.editor-statusbar {
+  display: flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 12px;
+  font-size: 11px;
+  color: var(--fg-muted);
+  background: var(--bg-elev);
+  border-top: 1px solid var(--border);
+  flex: 0 0 auto;
+  gap: 16px;
+}
+
+.editor-statusbar .status-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.editor-statusbar .status-cell strong {
+  color: var(--fg);
+  font-weight: 500;
+}
+
+/* ----- Placeholder ------------------------------------------------------ */
+
+.editor-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 40px;
+  flex-direction: column;
+  gap: 12px;
+  text-align: center;
+}
+
+.editor-placeholder h3 {
+  color: var(--fg);
+  margin: 0;
+  font-weight: 500;
+  font-size: 14px;
+}
+
+.editor-placeholder p {
+  color: var(--fg-muted);
+  max-width: 480px;
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.editor-placeholder code {
+  background: var(--bg-elev);
+  color: var(--accent);
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 11.5px;
+}
+
+/* ----- Generic utility -------------------------------------------------- */
+
+.dim { color: var(--fg-muted); }
+.error-text { color: var(--error); }
+.warn-text { color: var(--warn); }
+.ok-text { color: var(--ok); }
+
+button {
+  font-family: inherit;
+}
+
+/* Subtle scrollbar that respects dark theme. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 5px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--accent-dim);
+}

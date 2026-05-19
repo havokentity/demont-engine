@@ -11,6 +11,10 @@ target_include_directories(pt_console PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(pt_console
     PUBLIC  pt_core
     PUBLIC  nlohmann_json::nlohmann_json
+    # pt_editor: URL router + embedded React/Vite editor bundle. The
+    # HttpHandler delegates `/editor/...`, `/panels/...`, and
+    # `/shared/...` URIs to pt::editor::ResolveRoute.
+    PRIVATE pt_editor
     PRIVATE civetweb-c-library
 )
 
