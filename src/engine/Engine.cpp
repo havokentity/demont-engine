@@ -4118,7 +4118,7 @@ void Engine::EnsureSdfPrimsUploaded() {
 // --- Light primitives (#73) ------------------------------------------------
 //
 // Per-light GPU layout (must match PathTrace.slang's LightRecord +
-// loadLight, kLightStrideFloat4 = 4 float4s = 64 B):
+// loadLight, kLightStrideFloat4 = 5 float4s = 80 B):
 //
 //   v0.xyz = pos             ;  v0.w   = radius (sphere)
 //   v1.rgb = intensity       ;  v1.w   = type as float (0..3)
@@ -4126,6 +4126,9 @@ void Engine::EnsureSdfPrimsUploaded() {
 //   v2.w   = cos_outer       (spot)
 //   v3.xyz = u_vec (quad u-half-extent vector); v3.x = cos_inner (spot)
 //   v3.w   = v_half          (quad)
+//   v4.xyzw = orient quaternion (xyzw, unit) -- rotates dir / u_vec
+//             at shader time so the gizmo can drive the cone-axis /
+//             quad-frame without mutating the stored vectors.
 //
 // Grows by powers of two from a floor of 16 lights -- same allocation
 // pattern as the analytic prim / SDF cluster / BVH-node buffers, so
@@ -4137,7 +4140,7 @@ void Engine::EnsureLightsUploaded() {
     if (!light_prims_dirty_) return;
 
     const std::uint32_t count = static_cast<std::uint32_t>(light_prims_.size());
-    constexpr std::uint32_t kFloatsPerLight = 16;   // 4 float4s
+    constexpr std::uint32_t kFloatsPerLight = 20;   // 5 float4s
     constexpr std::uint32_t kBytesPerLight  = sizeof(float) * kFloatsPerLight;
 
     // Allocate / grow the storage buffer when needed. 16-light floor
@@ -4197,6 +4200,16 @@ void Engine::EnsureLightsUploaded() {
         packed[off + 13] = L.u_vec[1];
         packed[off + 14] = L.u_vec[2];
         packed[off + 15] = L.v_half;
+        // v4: orientation quaternion (xyzw). Spot lights rotate `dir`
+        // through this before the cone-angle test; quad lights rotate
+        // both `dir` (normal) and the u-extent vec assembled at sample
+        // time. Point/sphere are rotation-symmetric so the shader
+        // shortcuts the rotation; the data is still uploaded so the
+        // editor/inspector reads a stable value.
+        packed[off + 16] = L.orient[0];
+        packed[off + 17] = L.orient[1];
+        packed[off + 18] = L.orient[2];
+        packed[off + 19] = L.orient[3];
         ++idx;
     }
     device_->WriteBuffer(pt::rhi::BufferHandle{light_buffer_id_},
@@ -4360,16 +4373,37 @@ void Engine::EnsureLightTreeUploaded() {
         // (below) packs lights into the GPU buffer in std::map iteration
         // order (id-sorted); the tree's leaf left_first values index into
         // that same packed array, so we MUST mirror that ordering exactly.
+        //
+        // Direction / u-extent vectors are pre-rotated through the
+        // light's orientation quaternion so the tree's cone-axis
+        // aggregation reflects the visible cone (the NEE shader does
+        // the same rotation at sample time via L.orient). Identity
+        // quat (0,0,0,1) yields the original axis unchanged.
         std::vector<pt::renderer::LightInput> inputs;
         inputs.reserve(light_prims_.size());
         for (const auto& [id, L] : light_prims_) {
             pt::renderer::LightInput li;
             li.type = static_cast<std::uint32_t>(L.type);
+            // quatRotate(q, v) = v + 2 * cross(u, cross(u, v) + w * v).
+            // Inlined here so the engine doesn't need to import a math
+            // header just for this single helper.
+            const float qx = L.orient[0], qy = L.orient[1];
+            const float qz = L.orient[2], qw = L.orient[3];
+            auto rotate = [qx, qy, qz, qw](const float v[3], float out[3]) {
+                const float cx = qy * v[2] - qz * v[1] + qw * v[0];
+                const float cy = qz * v[0] - qx * v[2] + qw * v[1];
+                const float cz = qx * v[1] - qy * v[0] + qw * v[2];
+                out[0] = v[0] + 2.0f * (qy * cz - qz * cy);
+                out[1] = v[1] + 2.0f * (qz * cx - qx * cz);
+                out[2] = v[2] + 2.0f * (qx * cy - qy * cx);
+            };
+            float dir_rot[3];   rotate(L.dir,   dir_rot);
+            float u_vec_rot[3]; rotate(L.u_vec, u_vec_rot);
             for (int i = 0; i < 3; ++i) {
                 li.pos[i]       = L.pos[i];
                 li.intensity[i] = L.intensity[i];
-                li.dir[i]       = L.dir[i];
-                li.u_vec[i]     = L.u_vec[i];
+                li.dir[i]       = dir_rot[i];
+                li.u_vec[i]     = u_vec_rot[i];
             }
             li.radius    = L.radius;
             li.cos_outer = L.cos_outer;
@@ -14067,66 +14101,102 @@ void Engine::UpdateEditorGizmoFrame() {
 
     editor_gizmo_.ClearSegments();
 
-    // Gizmo gates on the editor's canonical selection state. Today we
-    // only handle analytic-prim selections; Csg / Sdf / RigidBody
-    // gizmos are a follow-up (those scopes don't expose a unified
-    // "position / radius" the gizmo can dispatch over yet).
-    const bool selection_active =
-        selected_kind_ == SelectionKind::AnalyticPrim &&
-        selected_prim_id_ != 0;
-    if (!selection_active || !gizmo_enabled) {
+    // Gizmo gates on the editor's canonical selection state. Analytic
+    // primitives (sphere / plane) drive prim_set_pos + prim_set_rotation;
+    // analytic lights (point / spot / sphere / quad) drive
+    // light_set_pos + light_set_rotation. Csg / Sdf / RigidBody gizmos
+    // are a follow-up (those scopes don't expose a unified "position /
+    // rotation" the gizmo can dispatch over yet).
+    const bool sel_prim  = selected_kind_ == SelectionKind::AnalyticPrim &&
+                           selected_prim_id_ != 0;
+    const bool sel_light = selected_kind_ == SelectionKind::Light &&
+                           selected_prim_id_ != 0;
+    if ((!sel_prim && !sel_light) || !gizmo_enabled) {
         // Drop any in-flight drag if the user just cleared the selection
         // mid-drag (or toggled the master switch off).
         if (editor_gizmo_.IsDragging()) editor_gizmo_.EndDrag();
         return;
     }
-    auto it = primitives_.find(selected_prim_id_);
-    if (it == primitives_.end()) {
-        // Selection points at a primitive that was removed since.
+    auto prim_it  = sel_prim  ? primitives_.find(selected_prim_id_)
+                              : primitives_.end();
+    auto light_it = sel_light ? light_prims_.find(selected_prim_id_)
+                              : light_prims_.end();
+    if ((sel_prim  && prim_it  == primitives_.end()) ||
+        (sel_light && light_it == light_prims_.end())) {
+        // Selection points at an entity that was removed since.
         SetSelection(SelectionKind::None, 0);
         if (editor_gizmo_.IsDragging()) editor_gizmo_.EndDrag();
         return;
     }
 
-    // Gizmo origin selection:
-    //   Sphere: world-space sphere center stored in pos_or_n.
-    //   Plane : no canonical world center; we render the gizmo at the
-    //           foot of the perpendicular from the world origin to the
-    //           plane (point on the plane closest to (0,0,0)) so the
-    //           rotate rings sit on the surface itself rather than at
-    //           infinity. This is purely a placement choice -- the
-    //           prim_set_rotation dispatch only mutates orient[].
+    // Dispatch name prefix selected from the selection kind. The gizmo
+    // routes through the console so command-line parity, undo
+    // bookkeeping, and the websocket scene_dirty broadcast all stay
+    // single-sourced (the prim_set_* / light_set_* handlers above own
+    // the writes).
+    const char* set_pos_cmd      = sel_light ? "light_set_pos"
+                                             : "prim_set_pos";
+    const char* set_rotation_cmd = sel_light ? "light_set_rotation"
+                                             : "prim_set_rotation";
+
+    // Gizmo origin + size selection:
+    //   PRIM Sphere: world-space sphere center stored in pos_or_n.
+    //   PRIM Plane : no canonical world center; render at the foot of
+    //                the perpendicular from the world origin to the
+    //                plane (point on the plane closest to (0,0,0)) so
+    //                the rotate rings sit on the surface itself rather
+    //                than at infinity. Purely a placement choice --
+    //                prim_set_rotation only mutates orient[].
+    //   LIGHT (any): anchored at L.pos. Size derived from sphere
+    //                radius / quad max(u,v) / spot 1.0 default.
     glm::vec3 origin{0.0f};
     float gizmo_size = 1.0f;
-    const bool is_plane = (it->second.type == AnalyticPrim::Plane);
-    if (is_plane) {
-        // Planes have nothing physical to translate / scale, so we
-        // only surface them for rotate mode. Translate / scale mode
-        // skips planes for now (a "move plane along its normal" UX
-        // would dispatch prim_set_pos on radius_or_d, but that's
-        // out of scope for #206 -- the rotation gizmo only).
-        if (editor_gizmo_.GetMode() != pt::renderer::EditorOverlay::Mode::Rotate) {
-            if (editor_gizmo_.IsDragging()) editor_gizmo_.EndDrag();
-            // Build no geometry for planes outside rotate mode.
-            return;
+    bool  is_plane   = false;
+    if (sel_prim) {
+        is_plane = (prim_it->second.type == AnalyticPrim::Plane);
+        if (is_plane) {
+            // Planes have nothing physical to translate / scale, so we
+            // only surface them for rotate mode. Translate / scale mode
+            // skips planes (a "move plane along its normal" UX would
+            // dispatch prim_set_pos on radius_or_d, out of scope here).
+            if (editor_gizmo_.GetMode() != pt::renderer::EditorOverlay::Mode::Rotate) {
+                if (editor_gizmo_.IsDragging()) editor_gizmo_.EndDrag();
+                return;
+            }
+            // foot = -d * n (since n is unit, n . foot + d == 0 implies
+            // foot . n == -d, so foot = -d * n is the point on the
+            // plane nearest the world origin).
+            const glm::vec3 n_raw{prim_it->second.pos_or_n[0],
+                                  prim_it->second.pos_or_n[1],
+                                  prim_it->second.pos_or_n[2]};
+            const float d = prim_it->second.radius_or_d;
+            origin     = n_raw * (-d);
+            gizmo_size = 1.5f;   // fixed world-units arm/ring length
+        } else {
+            // Sphere path: gizmo anchored at the sphere center, sized
+            // relative to the radius like the existing translate gizmo.
+            origin = glm::vec3{prim_it->second.pos_or_n[0],
+                               prim_it->second.pos_or_n[1],
+                               prim_it->second.pos_or_n[2]};
+            gizmo_size = std::max(0.5f, prim_it->second.radius_or_d * 1.5f);
         }
-        // Project world origin onto the plane: foot = -d * n (since
-        // n is unit, n . foot + d == 0 implies foot . n == -d, so
-        // foot = -d * n is the point on the plane nearest the
-        // world origin -- a stable "centre" anchor for the rings).
-        const glm::vec3 n_raw{it->second.pos_or_n[0],
-                              it->second.pos_or_n[1],
-                              it->second.pos_or_n[2]};
-        const float d = it->second.radius_or_d;
-        origin     = n_raw * (-d);
-        gizmo_size = 1.5f;   // fixed world-units arm/ring length
     } else {
-        // Sphere path: gizmo anchored at the sphere center, sized
-        // relative to the radius like the existing translate gizmo.
-        origin = glm::vec3{it->second.pos_or_n[0],
-                           it->second.pos_or_n[1],
-                           it->second.pos_or_n[2]};
-        gizmo_size = std::max(0.5f, it->second.radius_or_d * 1.5f);
+        // Light path: anchored at L.pos. Sphere lights use their radius;
+        // quad lights use max(|u_vec|, v_half) so the gizmo wraps the
+        // emitter footprint; point/spot fall back to a sensible default
+        // (1.5m) since they have no canonical extent.
+        const auto& L = light_it->second;
+        origin = glm::vec3{L.pos[0], L.pos[1], L.pos[2]};
+        if (L.type == AnalyticLight::Sphere) {
+            gizmo_size = std::max(0.5f, L.radius * 1.5f);
+        } else if (L.type == AnalyticLight::Quad) {
+            const float u_len = std::sqrt(L.u_vec[0]*L.u_vec[0] +
+                                          L.u_vec[1]*L.u_vec[1] +
+                                          L.u_vec[2]*L.u_vec[2]);
+            gizmo_size = std::max(0.5f, std::max(u_len, L.v_half) * 1.5f);
+        } else {
+            gizmo_size = 1.5f;
+        }
     }
     const float aspect = (accum_h_ > 0)
                            ? float(accum_w_) / float(accum_h_)
@@ -14153,13 +14223,15 @@ void Engine::UpdateEditorGizmoFrame() {
     // Esc-during-drag: abort and restore pre-drag state. The restored
     // command depends on which dispatch path the drag is on -- a
     // translate/scale drag rewinds the position; a rotate drag rewinds
-    // the orientation quaternion.
+    // the orientation quaternion. set_*_cmd resolves to the prim_ or
+    // light_ prefix based on the active selection kind.
     const bool esc_pressed = window_->IsKeyDown(256); // GLFW_KEY_ESCAPE
     if (esc_pressed && editor_gizmo_.IsDragging()) {
         // Restore via the same console-routed mutation path so undo
         // / snapshot semantics line up with the normal drag.
         if (editor_gizmo_.DragMode() == pt::renderer::EditorOverlay::Mode::Rotate) {
-            auto cmd = fmt::format("prim_set_rotation {} {} {} {} {}",
+            auto cmd = fmt::format("{} {} {} {} {} {}",
+                                   set_rotation_cmd,
                                    selected_prim_id_,
                                    editor_drag_pre_orient_[0],
                                    editor_drag_pre_orient_[1],
@@ -14168,7 +14240,8 @@ void Engine::UpdateEditorGizmoFrame() {
             pt::console::Console::Get().Execute(cmd);
         } else {
             const glm::vec3 pre = editor_drag_pre_pos_;
-            auto cmd = fmt::format("prim_set_pos {} {} {} {}",
+            auto cmd = fmt::format("{} {} {} {} {}",
+                                   set_pos_cmd,
                                    selected_prim_id_, pre.x, pre.y, pre.z);
             pt::console::Console::Get().Execute(cmd);
         }
@@ -14183,13 +14256,15 @@ void Engine::UpdateEditorGizmoFrame() {
             if (hovered != pt::renderer::EditorOverlay::Axis::None) {
                 editor_drag_pre_pos_ = origin;
                 // Snapshot the pre-drag orient so an Esc-during-drag
-                // can rewind. Reading from primitives_ keeps the
-                // composition consistent if a previous frame's drag
-                // already advanced the orient.
-                editor_drag_pre_orient_[0] = it->second.orient[0];
-                editor_drag_pre_orient_[1] = it->second.orient[1];
-                editor_drag_pre_orient_[2] = it->second.orient[2];
-                editor_drag_pre_orient_[3] = it->second.orient[3];
+                // can rewind. Source depends on selection kind --
+                // primitives_ for prims, light_prims_ for lights.
+                const float* pre_orient =
+                    sel_light ? light_it->second.orient
+                              : prim_it->second.orient;
+                editor_drag_pre_orient_[0] = pre_orient[0];
+                editor_drag_pre_orient_[1] = pre_orient[1];
+                editor_drag_pre_orient_[2] = pre_orient[2];
+                editor_drag_pre_orient_[3] = pre_orient[3];
                 editor_gizmo_.BeginDrag(hovered, origin,
                                         *camera_, aspect,
                                         accum_w_, accum_h_,
@@ -14239,22 +14314,24 @@ void Engine::UpdateEditorGizmoFrame() {
                     const float ny = dqw * pre_y - dqx * pre_z + dqy * pre_w + dqz * pre_x;
                     const float nz = dqw * pre_z + dqx * pre_y - dqy * pre_x + dqz * pre_w;
                     const float nw = dqw * pre_w - dqx * pre_x - dqy * pre_y - dqz * pre_z;
-                    auto cmd = fmt::format("prim_set_rotation {} {} {} {} {}",
+                    auto cmd = fmt::format("{} {} {} {} {} {}",
+                                           set_rotation_cmd,
                                            selected_prim_id_, nx, ny, nz, nw);
                     pt::console::Console::Get().Execute(cmd);
                 }
             } else {
                 // Translate / scale: compute new world pos and dispatch
-                // prim_set_pos via Console::Execute so the engine's
-                // existing accum_dirty / primitives_dirty handling +
-                // future undo machinery route uniformly.
+                // {prim,light}_set_pos via Console::Execute so the
+                // engine's accum_dirty / dirty-flag handling + future
+                // undo machinery route uniformly.
                 const glm::vec3 new_pos =
                     editor_gizmo_.UpdateDrag(*camera_, aspect,
                                              accum_w_, accum_h_, mx, my);
                 // Skip the dispatch if the delta is sub-millimetre; cuts
                 // the ~60 Hz Execute() churn when the mouse is still.
                 if (glm::distance(new_pos, origin) > 1e-4f) {
-                    auto cmd = fmt::format("prim_set_pos {} {} {} {}",
+                    auto cmd = fmt::format("{} {} {} {} {}",
+                                           set_pos_cmd,
                                            selected_prim_id_,
                                            new_pos.x, new_pos.y, new_pos.z);
                     pt::console::Console::Get().Execute(cmd);
@@ -14267,34 +14344,44 @@ void Engine::UpdateEditorGizmoFrame() {
     }
     prev_lmb_down_ = lmb_down;
 
-    // Geometry build. Use the (possibly updated) origin from
-    // primitives_ -- it may have changed during this same frame if
-    // the drag dispatched prim_set_pos / prim_set_rotation above.
-    // For planes, recompute the foot-of-perpendicular in case the
-    // normal was rotated; for spheres, just re-read the center.
-    auto fresh = primitives_.find(selected_prim_id_);
+    // Geometry build. Use the (possibly updated) origin from the live
+    // entity -- it may have changed during this same frame if the drag
+    // dispatched a set_pos / set_rotation above. For prim planes,
+    // recompute the foot-of-perpendicular in case the normal was
+    // rotated; for prim spheres and all lights, just re-read the
+    // center / pos.
     glm::vec3 build_origin = origin;
-    if (fresh != primitives_.end()) {
-        if (is_plane) {
-            // Re-derive plane normal post-rotation so the rings move
-            // with the visible plane. The shader applies orient at
-            // intersect time, so for the gizmo we apply it here too.
-            const float qx = fresh->second.orient[0];
-            const float qy = fresh->second.orient[1];
-            const float qz = fresh->second.orient[2];
-            const float qw = fresh->second.orient[3];
-            const glm::vec3 n_raw{fresh->second.pos_or_n[0],
-                                  fresh->second.pos_or_n[1],
-                                  fresh->second.pos_or_n[2]};
-            // quatRotate(q, v) = v + 2 * cross(u, cross(u, v) + w * v)
-            const glm::vec3 u{qx, qy, qz};
-            const glm::vec3 n = n_raw + 2.0f *
-                glm::cross(u, glm::cross(u, n_raw) + qw * n_raw);
-            build_origin = n * (-fresh->second.radius_or_d);
-        } else {
-            build_origin = glm::vec3{fresh->second.pos_or_n[0],
-                                     fresh->second.pos_or_n[1],
-                                     fresh->second.pos_or_n[2]};
+    if (sel_prim) {
+        auto fresh = primitives_.find(selected_prim_id_);
+        if (fresh != primitives_.end()) {
+            if (is_plane) {
+                // Re-derive plane normal post-rotation so the rings move
+                // with the visible plane. The shader applies orient at
+                // intersect time, so for the gizmo we apply it here too.
+                const float qx = fresh->second.orient[0];
+                const float qy = fresh->second.orient[1];
+                const float qz = fresh->second.orient[2];
+                const float qw = fresh->second.orient[3];
+                const glm::vec3 n_raw{fresh->second.pos_or_n[0],
+                                      fresh->second.pos_or_n[1],
+                                      fresh->second.pos_or_n[2]};
+                // quatRotate(q, v) = v + 2 * cross(u, cross(u, v) + w * v)
+                const glm::vec3 u{qx, qy, qz};
+                const glm::vec3 n = n_raw + 2.0f *
+                    glm::cross(u, glm::cross(u, n_raw) + qw * n_raw);
+                build_origin = n * (-fresh->second.radius_or_d);
+            } else {
+                build_origin = glm::vec3{fresh->second.pos_or_n[0],
+                                         fresh->second.pos_or_n[1],
+                                         fresh->second.pos_or_n[2]};
+            }
+        }
+    } else {
+        auto fresh = light_prims_.find(selected_prim_id_);
+        if (fresh != light_prims_.end()) {
+            build_origin = glm::vec3{fresh->second.pos[0],
+                                     fresh->second.pos[1],
+                                     fresh->second.pos[2]};
         }
     }
     const pt::renderer::EditorOverlay::Axis hl =
@@ -16794,6 +16881,102 @@ void Engine::RegisterLightCommands() {
             accum_dirty_       = true;
             BroadcastSceneDirty();
             out.FormatLine("lights: id {} size -> {:.3f}", id, r);
+        });
+
+    // --- Rotation gizmo dispatch (mirrors prim_set_rotation) -----------------
+    // Sets a light's orientation quaternion. Input is a raw xyzw tuple
+    // which we normalize before storing (a non-unit quat would alter the
+    // rotation angle through the shader's quatRotate formula). Point and
+    // sphere lights are rotation-symmetric so the orient has no visible
+    // effect but we still store it (selection-driven UI observation
+    // reads a stable value). Spot rotates its axis at shader time; quad
+    // rotates normal + u-extent.
+    C.RegisterCommand("light_set_rotation",
+        "light_set_rotation <id> <qx> <qy> <qz> <qw>: set the light's "
+        "orientation quaternion (xyzw). Input is normalized. Identity is "
+        "(0, 0, 0, 1). Point / sphere lights are rotation-symmetric so "
+        "this is visually a no-op for them; spot tilts its cone axis, "
+        "quad tilts its normal + u-extent in place.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 5) {
+                out.PrintLine("usage: light_set_rotation <id> <qx> <qy> <qz> <qw>");
+                return;
+            }
+            std::uint32_t id; float qx, qy, qz, qw;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], qx) || !ParseFloat(args[2], qy) ||
+                !ParseFloat(args[3], qz) || !ParseFloat(args[4], qw)) {
+                out.PrintLine("light_set_rotation: arg parse failed");
+                return;
+            }
+            const float mag = std::sqrt(qx*qx + qy*qy + qz*qz + qw*qw);
+            if (mag < 1e-6f) {
+                out.PrintLine("light_set_rotation: zero-magnitude quaternion");
+                return;
+            }
+            auto it = light_prims_.find(id);
+            if (it == light_prims_.end()) {
+                out.FormatLine("light_set_rotation: id {} not found", id);
+                return;
+            }
+            const float inv = 1.0f / mag;
+            it->second.orient[0] = qx * inv;
+            it->second.orient[1] = qy * inv;
+            it->second.orient[2] = qz * inv;
+            it->second.orient[3] = qw * inv;
+            light_prims_dirty_ = true;
+            accum_dirty_       = true;
+            BroadcastSceneDirty();
+            out.FormatLine("light_set_rotation: id {} -> ({:.4f} {:.4f} {:.4f} {:.4f})",
+                           id, it->second.orient[0], it->second.orient[1],
+                           it->second.orient[2], it->second.orient[3]);
+        });
+
+    C.RegisterCommand("light_set_rotation_euler",
+        "light_set_rotation_euler <id> <pitch_deg> <yaw_deg> <roll_deg>: "
+        "set the light's orientation from Euler angles (XYZ order, "
+        "degrees). Converts internally to the canonical quaternion "
+        "stored on the light.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 4) {
+                out.PrintLine("usage: light_set_rotation_euler <id> <pitch_deg> <yaw_deg> <roll_deg>");
+                return;
+            }
+            std::uint32_t id; float pitch_deg, yaw_deg, roll_deg;
+            if (!ParseUint(args[0], id) ||
+                !ParseFloat(args[1], pitch_deg) ||
+                !ParseFloat(args[2], yaw_deg)   ||
+                !ParseFloat(args[3], roll_deg)) {
+                out.PrintLine("light_set_rotation_euler: arg parse failed");
+                return;
+            }
+            auto it = light_prims_.find(id);
+            if (it == light_prims_.end()) {
+                out.FormatLine("light_set_rotation_euler: id {} not found", id);
+                return;
+            }
+            // XYZ-intrinsic Euler -> quaternion. Half-angle formulation
+            // produces a unit quaternion straight out so we don't need
+            // the normalisation step. Matches prim_set_rotation_euler
+            // verbatim so light + prim rotations compose identically.
+            const float kDeg2Rad = 3.14159265358979323846f / 180.0f;
+            const float hx = pitch_deg * kDeg2Rad * 0.5f;
+            const float hy = yaw_deg   * kDeg2Rad * 0.5f;
+            const float hz = roll_deg  * kDeg2Rad * 0.5f;
+            const float cx = std::cos(hx), sx = std::sin(hx);
+            const float cy = std::cos(hy), sy = std::sin(hy);
+            const float cz = std::cos(hz), sz = std::sin(hz);
+            // q = qz * qy * qx (roll then yaw then pitch).
+            it->second.orient[0] = sx * cy * cz + cx * sy * sz;
+            it->second.orient[1] = cx * sy * cz - sx * cy * sz;
+            it->second.orient[2] = cx * cy * sz + sx * sy * cz;
+            it->second.orient[3] = cx * cy * cz - sx * sy * sz;
+            light_prims_dirty_ = true;
+            accum_dirty_       = true;
+            BroadcastSceneDirty();
+            out.FormatLine("light_set_rotation_euler: id {} -> quat ({:.4f} {:.4f} {:.4f} {:.4f})",
+                           id, it->second.orient[0], it->second.orient[1],
+                           it->second.orient[2], it->second.orient[3]);
         });
     // --- end inspector setter family --------------------------------------
 }

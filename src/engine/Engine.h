@@ -211,7 +211,7 @@ public:
     //
     // Phase 1 sampling is naive uniform single-pick; Phase 2 (#129)
     // wraps a light tree over this list with O(log N) importance
-    // selection. The GPU representation packs into 4 float4s per light
+    // selection. The GPU representation packs into 5 float4s per light
     // (kFloatsPerLight below) -- see PathTrace.slang's LightRecord for
     // the lane-by-lane layout.
     struct AnalyticLight {
@@ -225,6 +225,15 @@ public:
         float     cos_inner   = 0.0f;       // spot only -- inner half-angle cosine
         float     u_vec[3]    {1, 0, 0};    // quad u-half-extent vector (length = u_half)
         float     v_half      = 0.0f;       // quad v-axis half-extent (m)
+        // Per-light orientation (rotation gizmo follow-up to #206).
+        // Unit quaternion stored as xyzw; identity (0,0,0,1) leaves the
+        // light's stored dir / u_vec untouched. Point and sphere lights
+        // are rotation-symmetric so their orient is visually inert;
+        // spot lights rotate `dir` through `orient` before the cone-
+        // angle test; quad lights rotate both `dir` (normal) and
+        // `u_vec` before the area sample. Driven by light_set_rotation
+        // (mirror of prim_set_rotation) + the editor rotate gizmo.
+        float     orient[4]   {0, 0, 0, 1};
     };
 
     // --- Fluid Phase 1 (#136) -- density-injection smoke emitters ----------

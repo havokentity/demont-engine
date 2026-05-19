@@ -102,13 +102,22 @@ struct LightRec {
     float  cos_outer;
     float3 u_or_inner;
     float  v_half;
+    float4 orient;     // rotation gizmo (xyzw); identity = (0,0,0,1)
 };
 
-static const uint kLightStride = 4u;
+static const uint kLightStride = 5u;
 static const uint LIGHT_POINT  = 0u;
 static const uint LIGHT_SPOT   = 1u;
 static const uint LIGHT_SPHERE = 2u;
 static const uint LIGHT_QUAD   = 3u;
+
+// Local copy of PathTrace.slang's quatRotate; the ReSTIR modules don't
+// import PathTrace so the helper lives here. Identity (0,0,0,1) yields
+// v unchanged: cross(zero, anything) = 0.
+float3 lightQuatRotate(float4 q, float3 v) {
+    float3 u = q.xyz;
+    return v + 2.0 * cross(u, cross(u, v) + q.w * v);
+}
 
 LightRec loadLight(uint idx) {
     uint base = idx * kLightStride;
@@ -116,6 +125,7 @@ LightRec loadLight(uint idx) {
     float4 v1 = light_prims[base + 1u];
     float4 v2 = light_prims[base + 2u];
     float4 v3 = light_prims[base + 3u];
+    float4 v4 = light_prims[base + 4u];
     LightRec L;
     L.pos        = v0.xyz;
     L.radius     = v0.w;
@@ -125,6 +135,7 @@ LightRec loadLight(uint idx) {
     L.cos_outer  = v2.w;
     L.u_or_inner = v3.xyz;
     L.v_half     = v3.w;
+    L.orient     = v4;
     return L;
 }
 
@@ -143,7 +154,11 @@ float neighbourSurvivorPdf(Reservoir nbr, float3 hit_pt, float3 hit_n) {
     if (L.type == LIGHT_POINT) {
         Le_pre = L.intensity / dist2;
     } else if (L.type == LIGHT_SPOT) {
-        float cos_dir = dot(-wi, normalize(L.dir));
+        // Rotate the spot axis through the orientation quaternion so the
+        // target-pdf evaluation matches PathTrace's NEE math (identity
+        // quat is a no-op).
+        float3 axis   = normalize(lightQuatRotate(L.orient, L.dir));
+        float cos_dir = dot(-wi, axis);
         float cos_in  = L.u_or_inner.x;
         float cos_out = L.cos_outer;
         float falloff = 0.0;
