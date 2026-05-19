@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace pt::app      { class Window; class ConsoleOverlay; class PerfOverlay; }
@@ -46,6 +47,11 @@ using BackendType = pt::rhi::BackendType;
 // path + primitives_ map; the definition lives in the test TU and
 // never ships in production binaries -- pt_engine doesn't reference it.
 struct PhysDropArgsTestAccess;
+// Test-only access for tests/cam_bookmarks_test.cpp -- pins the
+// cam_save_named / cam_load_named / cam_list_bookmarks /
+// cam_delete_bookmark contract end-to-end via Console::Execute.
+// Defined in the test TU only; pt_engine never references it.
+struct CamBookmarksTestAccess;
 
 class Engine {
 public:
@@ -175,10 +181,19 @@ public:
 private:
     // Test-only access (PR #181 follow-up, see forward-declaration above).
     friend struct ::pt::engine::PhysDropArgsTestAccess;
+    // Test-only access for the named-camera-bookmark commands.
+    friend struct ::pt::engine::CamBookmarksTestAccess;
 
     void RegisterCommands();
     void RegisterCsgCommands();
     void RegisterPrimCommands();
+    // Named camera bookmark commands (cam_save_named / cam_load_named /
+    // cam_list_bookmarks / cam_delete_bookmark). Split out from
+    // RegisterCommands so the unit test can wire just these (the full
+    // RegisterCommands path pulls in audio / RHI / window / etc. via
+    // its captured `this`). Idempotent in the same try_emplace sense
+    // as the rest of Console::RegisterCommand.
+    void RegisterCameraBookmarkCommands();
     // --- Physics Phase 1 (#132) -------------------------------------------
     // Console commands for the Verlet physics layer (`phys_drop`,
     // `phys_clear`, `phys_status`). Cvar registration lives alongside
@@ -387,6 +402,18 @@ private:
     void LoadConsoleHistoryFromDisk();
     void SaveConsoleHistoryToDisk();
 
+    // Named-camera-bookmark persistence. Mirrors the favorites.cfg
+    // pattern: `camera_bookmarks.cfg` lives next to demont.cfg, one
+    // bookmark per line as `<name> <x> <y> <z> <yaw_deg> <pitch_deg>
+    // <fov_deg>` (seven whitespace-separated tokens). `#` comments and
+    // blank lines are ignored on load. The bookmarks themselves are
+    // held in `camera_bookmarks_` (name -> serialized state string,
+    // same six-float format the numeric cam_save 1..9 slots use).
+    // Loaded at Init(), saved after every mutating command
+    // (cam_save_named / cam_delete_bookmark).
+    void LoadCameraBookmarksFromDisk();
+    void SaveCameraBookmarksToDisk();
+
     // Replace the current mesh-path resources (vertex/index buffers,
     // BLAS, TLAS) with one built from `baked`. Called from EnsureMesh*
     // on the main thread once a worker bake has completed.
@@ -418,6 +445,16 @@ private:
     std::unique_ptr<pt::console::ConsoleServer> server_;
     std::unique_ptr<pt::rhi::Device>            device_;
     std::unique_ptr<pt::renderer::Camera>       camera_;
+    // Named camera bookmarks. Parallel persistence to the numeric
+    // cam_slot_1..9 cvars, keyed by user-supplied token (e.g.
+    // "overhead", "closeup", "cornell_3q") instead of a 1..9 index.
+    // Value is the same serialized "x y z yaw_deg pitch_deg fov_deg"
+    // six-float string the slot system uses, so the parse/format
+    // helpers in RegisterCommands are shared. Persisted to
+    // `camera_bookmarks.cfg` next to demont.cfg / favorites.cfg --
+    // loaded at Init, rewritten on every cam_save_named /
+    // cam_delete_bookmark. Empty by default; no compile-time entries.
+    std::map<std::string, std::string>          camera_bookmarks_;
     // Audio subsystem (issue #80 MVP -- miniaudio-backed 3D playback).
     // Init() opens the default device + voice pool; Shutdown() releases
     // both. Tick(camera_pos, camera_fwd) pushes a listener snapshot
