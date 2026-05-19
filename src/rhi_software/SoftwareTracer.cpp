@@ -69,26 +69,27 @@ constexpr std::size_t kSunAndModeOffset = 240;
 constexpr std::size_t kAccumParamsOffset = 720;
 
 // Analytic prim layout (matches PathTrace.slang's `primitives` SSBO).
-// Motion blur (#85): bumped from 3 float4 to 4 float4 to carry prev_pos
-// alongside the existing per-prim fields. Software-backend renders here
-// always use the CURRENT-frame position (v0.xyz); the host packs prev
-// into v3.xyz for the GPU shader's shutter-time lerp but the SW path
-// doesn't implement motion blur (no per-pixel shutter sampling -- the
-// SW backend is the fallback for headless / no-GPU envs).
+// Stride grew over time: 3 -> 4 in #85 (motion blur, added prev_pos)
+// -> 5 in #181 polish (added per-prim emission). The software backend
+// reads v0 (current-frame center), v1 (albedo), v2 (type/material),
+// and v4 (emission). v3 (prev_pos) is reserved for the shader's
+// shutter-time lerp; SW path doesn't implement motion blur (no per-
+// pixel shutter sampling -- SW is the fallback for headless / no-GPU
+// envs) so it skips v3.
 //
 //   v0.xyz = sphere center or plane normal; v0.w = sphere radius or plane d
 //   v1.rgb = albedo; v1.a = roughness
 //   v2.x   = type (0 sphere / 1 plane); v2.y = material
 //   v2.z   = ior; v2.w = pad
-//   v3.xyz = prev_pos_or_n (sphere center at previous frame; same as
-//            v0.xyz for planes). Ignored by the SW tracer (which always
-//            samples at the current frame), but reserved here so the
-//            stride matches PathTrace.slang.
-// 4 float4 per prim = 16 floats = 64 bytes.
+//   v3.xyz = prev_pos_or_n (motion blur, #85; ignored here)
+//   v4.xyz = emission (W/sr per channel, #181 polish); v4.w = pad
+// 5 float4 per prim = 20 floats = 80 bytes. The stride MUST stay in
+// sync with Engine.cpp's kFloatsPerPrim (20) and PathTrace.slang's
+// testAnalyticPrim (reads at idx*5 stride).
 constexpr std::uint32_t kPrimSphere = 0u;
 constexpr std::uint32_t kPrimPlane  = 1u;
 constexpr std::uint32_t kMatLambert = 0u;
-constexpr std::uint32_t kFloatsPerPrim = 16u;
+constexpr std::uint32_t kFloatsPerPrim = 20u;
 
 struct HitInfo {
     bool      hit = false;
@@ -96,6 +97,11 @@ struct HitInfo {
     glm::vec3 normal{0, 1, 0};
     glm::vec3 albedo{0.5f};
     std::uint32_t mat = kMatLambert;
+    // Per-prim emission (#181 polish). Zero on non-emissive prims;
+    // testScene-equivalent adds this to the radiance accumulator before
+    // BRDF eval, same as the GPU shader path. Mesh / non-analytic hits
+    // overwrite to zero so a previous prim's emission doesn't leak.
+    glm::vec3 emission{0.0f};
 };
 
 // Ray-sphere intersection (closest positive root). Returns hit-t in t
@@ -170,16 +176,20 @@ void TraceScene(const glm::vec3& ro, const glm::vec3& rd,
     out.hit = false;
     out.t   = 1e30f;
 
-    // Analytic primitives.
+    // Analytic primitives. Stride is `kFloatsPerPrim` = 20 (5 float4s
+    // per prim) -- see the layout comment at the top of this file.
+    // v3 = prev_pos (motion blur, #85; SW path skips it). v4 carries
+    // per-prim emission (#181 polish).
     for (std::uint32_t i = 0; i < prim_count; ++i) {
-        // Stride bumped from 12 floats (3 float4) to 16 floats (4 float4)
-        // for motion blur (#85) -- v3 holds prev_pos for the GPU shader
-        // but the SW tracer ignores it (no shutter sampling here).
         const float* v0 = prim_data + i * kFloatsPerPrim + 0u;
         const float* v1 = prim_data + i * kFloatsPerPrim + 4u;
         const float* v2 = prim_data + i * kFloatsPerPrim + 8u;
+        // v3 (prev_pos for motion blur) intentionally unread -- SW
+        // tracer always samples at the current frame's position.
+        const float* v4 = prim_data + i * kFloatsPerPrim + 16u;
         std::uint32_t type = static_cast<std::uint32_t>(v2[0]);
         glm::vec3 albedo{v1[0], v1[1], v1[2]};
+        glm::vec3 emission{v4[0], v4[1], v4[2]};
         std::uint32_t mat = static_cast<std::uint32_t>(v2[1]);
         float t = 0.0f;
         if (type == kPrimSphere) {
@@ -192,6 +202,7 @@ void TraceScene(const glm::vec3& ro, const glm::vec3& rd,
                 out.normal = glm::normalize(hit_pt - center);
                 out.albedo = albedo;
                 out.mat = mat;
+                out.emission = emission;
             }
         } else if (type == kPrimPlane) {
             glm::vec3 n{v0[0], v0[1], v0[2]};
@@ -202,6 +213,7 @@ void TraceScene(const glm::vec3& ro, const glm::vec3& rd,
                 out.normal = n;
                 out.albedo = albedo;
                 out.mat = mat;
+                out.emission = emission;
             }
         }
     }
@@ -234,6 +246,11 @@ void TraceScene(const glm::vec3& ro, const glm::vec3& rd,
             // yet.
             out.albedo = glm::vec3{1.00f, 0.85f, 0.45f};
             out.mat    = kMatLambert;
+            // Mesh path doesn't source emission -- clear so a prior
+            // analytic-prim hit's emission doesn't leak through when
+            // this mesh hit is closer. Mirrors the GPU testAnalyticPrim
+            // -> mesh-hit chain in PathTrace.slang.
+            out.emission = glm::vec3{0.0f};
         }
     }
 }
@@ -283,9 +300,11 @@ void RunPathTraceKernel(SoftwareDevice& device,
         if (pb != nullptr) {
             prim_data  = reinterpret_cast<const float*>(pb->data.data());
             prim_count = push->prim_count;
-            // Don't trust prim_count past the buffer's capacity.
-            // Motion blur (#85): prim stride is now 64 bytes (4 float4)
-            // instead of 48 (3 float4) -- v3 carries prev_pos.
+            // Don't trust prim_count past the buffer's capacity. The
+            // per-prim byte size MUST match Engine.cpp's kBytesPerPrim:
+            //   kFloatsPerPrim * sizeof(float) = 20 * 4 = 80 bytes,
+            // after #85 (motion blur, v3=prev_pos) + #181 polish
+            // (emission, v4) grew the stride from 48 -> 64 -> 80.
             constexpr std::size_t kBytesPerPrim = kFloatsPerPrim * sizeof(float);
             std::uint32_t max_prims = static_cast<std::uint32_t>(pb->size / kBytesPerPrim);
             if (prim_count > max_prims) prim_count = max_prims;
@@ -409,7 +428,13 @@ void RunPathTraceKernel(SoftwareDevice& device,
                             lit = h0.albedo * sun_rad * n_dot_l;
                         }
                     }
-                    col = ambient + lit;
+                    // Per-prim emission (#181 polish). Mirrors the GPU
+                    // hit-handler at PathTrace.slang:~3850: emission adds
+                    // directly to the radiance accumulator before the
+                    // BRDF eval. Zero on non-emissive prims and on mesh
+                    // hits (TraceScene resets emission on the mesh
+                    // branch by overwrite-from-default, which is 0).
+                    col = ambient + lit + h0.emission;
                 }
                 // Sanitize the new sample: NaN / Inf / negative
                 // channels become 0.  Without this a single bad sample
