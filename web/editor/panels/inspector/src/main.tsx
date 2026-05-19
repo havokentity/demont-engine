@@ -1,29 +1,31 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Rajesh D'Monte
+//
+// Property Inspector panel entry. The Shell sets up the long-lived
+// WebSocket client, scene-store wiring, and selection-change
+// subscriptions; this file just instantiates it and passes the client
+// down to <App> via the withClient render prop.
+//
+// Implementation:
+//   - main.tsx (here) -- React root + Shell
+//   - App.tsx         -- selection/scene watcher, action dispatch
+//   - PrimInspector   -- analytic-primitive property grid
+//   - LightInspector  -- analytic-light property grid
+//   - NumberField     -- scrub-drag numeric input
+//   - Slider          -- slider + numeric readout combo
+//   - ColorField      -- sRGB <-> linear color picker with HSV plane
+//   - inspector.css   -- panel-local styles (uses theme.css vars)
+
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Shell, Placeholder } from '@demont/editor-shared';
+import { Shell } from '@demont/editor-shared';
 import '@demont/editor-shared/theme.css';
+import './inspector.css';
+import { App } from './App';
 
 const root = createRoot(document.getElementById('app')!);
 root.render(
   <StrictMode>
-    <Shell title="Inspector">
-      <Placeholder
-        title="Inspector"
-        agent="agent-22"
-        description={
-          <>
-            Property grid for the current selection. Subscribes to{' '}
-            <code>selection_change</code>; on edit, dispatches{' '}
-            <code>prim_set_pos / prim_set_albedo / prim_set_emission /
-            prim_set_roughness / prim_set_ior / prim_set_material</code> (or
-            the light equivalents) via WebSocket <code>exec</code>. The
-            shell already wires selection state into the store -- agent-22
-            replaces this placeholder with the property editor.
-          </>
-        }
-      />
-    </Shell>
+    <Shell title="Inspector" withClient={(client) => <App client={client} />} />
   </StrictMode>,
 );
