@@ -269,6 +269,15 @@ pt_add_test(pt_physics_test
     pt_physics_test.cpp
     LINK_TARGETS pt_physics)
 
+# --- pt_sph SmokeSPH unit tests (Fluid Phase 3, #22) -----------------------
+# Pins the CPU SPH smoke solver's mechanics: Clear lifecycle, particle
+# cap enforcement, emitter spawn rate, gravity / buoyancy / wind /
+# shockwave force responses, and the PackForGpu 2-float4-per-particle
+# layout the path-tracer slot 16 SSBO consumes.
+pt_add_test(pt_smoke_sph
+    pt_smoke_sph_test.cpp
+    LINK_TARGETS pt_physics)
+
 # --- phys_drop_* RGB arg shapes (PR #189 / issue #181 follow-up) -----------
 # Pins the arg-shape contract for `phys_drop_sphere` (3, 4, 5, or 8 args)
 # and `phys_drop_box` (6, 7, or 10 args) plus the rejection rules
@@ -757,6 +766,24 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     pt_add_golden_cell(SCENE clouds_raymarched BACKEND metal DENOISER svgf_atrous
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
     # --- end Wave 7 (#24) -------------------------------------------------
+
+    # --- Fluid Phase 3 (#22) -- SPH smoke wind fixture ---------------------
+    # SPH-driven smoke column with horizontal wind. Acceptance bar from
+    # the issue body: smoke responds to r_smoke_wind cvar; column drifts
+    # sideways instead of straight up.
+    #
+    # Tolerances generous (similar to phys_rb_* fixtures) because the
+    # SPH solver's per-frame integration is not bit-deterministic across
+    # build types -- the spatial-hash bucket order depends on small
+    # FP ordering differences. We're proving the gross visual shape
+    # (column leans into wind), not per-pixel equivalence.
+    #
+    # Metal only at first; software backend goldens can be added once
+    # the Metal one is committed.
+    pt_add_golden_cell(SCENE smoke_phase3_wind BACKEND metal DENOISER off
+        FRAMES 90
+        MAX_DELTA 64 MEAN_DELTA 16 FAIL_PERCENT 10)
+    # --- end Fluid Phase 3 ------------------------------------------------
 
     # --- Physics Phase 2a rigid-body fixtures (#138, #181) ----------------
     # Pins the rigid-body fixture output against a committed PNG so any

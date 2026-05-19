@@ -82,12 +82,14 @@ private:
     //   14     ReSTIR DI reservoir SSBO (#78) at vk::binding 29.
     //   15     smoke emitters (#136, Fluid Phase 1), the density-
     //          injection SSBO at vk::binding 30.
+    //   16     SPH particles (#22, Fluid Phase 3), the splat list
+    //          SSBO at vk::binding 31.
     // Pre-#136 the array was [12] which silently dropped any
     // BindBuffer(>= 12, ...) at the bounds-check in BindBuffer().
-    // Now [16]. Keep this in sync with kSlotToBufBinding[] in
+    // Now [24]. Keep this in sync with kSlotToBufBinding[] in
     // VulkanDevice.cpp.
-    BufferHandle   bound_buf_[16] {};
-    std::size_t    bound_buf_off_[16] {};
+    BufferHandle   bound_buf_[24] {};
+    std::size_t    bound_buf_off_[24] {};
     AccelStructHandle bound_accel_[4] {};
     // Push-constant staging. Sized to fit the full PtPush (~1040B
     // today, wave-7 #21 added mesh_motion_prev + mesh_motion_curr)

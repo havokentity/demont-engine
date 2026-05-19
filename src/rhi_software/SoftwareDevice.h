@@ -103,7 +103,10 @@ class SoftwareVulkanPresent;  // defined in SoftwareVulkanPresent.h
 // calls in Engine.cpp, which are MSL-style indices on Metal and
 // Vulkan-binding-mapped indices on Vulkan; we just need them stable.
 struct BindState {
-    std::uint64_t buffers[16]      {};   // BufferHandle.id by slot
+    // 24 slots: bumped from 16 to fit Fluid Phase 3 (#22) SPH
+    // particle SSBO at engine slot 16. Slot count must match the
+    // Metal / Vulkan equivalents.
+    std::uint64_t buffers[24]      {};   // BufferHandle.id by slot
     std::uint64_t textures[16]     {};   // TextureHandle.id by slot
     std::uint64_t accel_structs[4] {};   // AccelStructHandle.id by accel-slot
 };

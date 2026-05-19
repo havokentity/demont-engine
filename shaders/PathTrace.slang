@@ -453,6 +453,30 @@ Texture2D<float4> moon_map;
 [[vk::binding(30, 0)]] StructuredBuffer<float4> smoke_emitters;
 // --- end Fluid Phase 1 -----------------------------------------------------
 
+// --- Fluid Phase 3 (#22) -- SPH particle splat list ------------------------
+// SPH particle list packed 2 float4s per particle (32 B):
+//   v0.xyz = world-space position (m)
+//   v0.w   = splat radius (m)
+//   v1.x   = splat density (peak additive sigma_t; per-particle Gaussian
+//            magnitude in the same units as smoke_emitters' v1.w)
+//   v1.y   = age normalised [0..1] (0 = freshly emitted, 1 = end of life)
+//   v1.zw  = reserved
+//
+// The host runs a CPU SPH solver (pt::sph::SmokeSPH) that owns the
+// particle pool + spatial hash + neighbour-summed pressure/viscosity
+// integration; the GPU only sees the integrated splat list each frame.
+// Cap is push.smoke_sph_params.x particles -- the engine clamps it on
+// upload and the shader bounds the loop with `[loop]` so the SPV /
+// MSL backend produces a tight (variable-bound) loop rather than
+// unrolling.
+//
+// Engine slot 16 / vk::binding 31 lands one past smoke_emitters
+// (slot 15 / binding 30). Always-bound (placeholder fallback) for the
+// same max-bound + 1 push-slot rule that smoke_emitters obeys; the
+// shader's smoke_sph_density_add gates on push.smoke_sph_params.x > 0.
+[[vk::binding(31, 0)]] StructuredBuffer<float4> sph_particles;
+// --- end Fluid Phase 3 -----------------------------------------------------
+
 struct BvhNode {
     float3 aabb_min;
     uint   left_first;
@@ -848,6 +872,23 @@ cbuffer Push {
     //                    contrast across the lifetime).
     float4 smoke_params3;
     // --- end Fluid wave-6 -----------------------------------------------------
+    // --- Fluid Phase 3 (#22) -- SPH fluid sim ---------------------------------
+    // smoke_sph_params.x = sph_particle_count   (0 disables SPH consumption;
+    //                       host clamps to push.smoke_sph_params.w cap)
+    //                 .y = smoke_mode (0 = procedural, 1 = sph, 2 = both)
+    //                       The integer values are bit-encoded so the
+    //                       shader gate is a single int cast; only mode 1
+    //                       and mode 2 read sph_particles[].
+    //                 .z = render_density_floor (clamp value subtracted
+    //                       from the per-particle splat density so an
+    //                       in-cell quiescent particle reads as zero --
+    //                       prevents the SPH-mode rest-density from
+    //                       filling the world with a uniform fog).
+    //                 .w = particle_buffer_cap (host-side max upload,
+    //                       informational; the shader only iterates
+    //                       smoke_sph_params.x particles).
+    float4 smoke_sph_params;
+    // --- end Fluid Phase 3 ----------------------------------------------------
     // --- Motion blur (#85) ----------------------------------------------------
     // motion_blur_params.x = r_motion_blur (1 = stochastic shutter-time
     //                         sampling for per-ray motion blur; 0 = legacy
@@ -1036,6 +1077,8 @@ cbuffer Frame {
     float4 smoke_params2;
     // See `smoke_params3` in the Metal Push cbuffer above (wave-6).
     float4 smoke_params3;
+    // See `smoke_sph_params` in the Metal Push cbuffer above (Phase 3, #22).
+    float4 smoke_sph_params;
     // See `motion_blur_params` in the Metal Push cbuffer above (#85).
     float4 motion_blur_params;
     // See `water_state` in the Metal Push cbuffer above (Phase 4, #134).
@@ -3281,6 +3324,113 @@ float smoke_density_add_tinted(float3 pos, out float3 out_tint) {
 }
 // --- end Fluid Phase 1 / Phase 2 -------------------------------------------
 
+// --- Fluid Phase 3 (#22) -- SPH particle density splat ---------------------
+// Sums Gaussian splats from the SPH particle list at world-space sample
+// `pos`. Each particle is a small Gaussian with falloff exp(-(r/rad)^2);
+// the integration over the ray-march body still happens in the
+// cloud-march loop above, this function just contributes a scalar
+// density at the sample point.
+//
+// The CPU SPH solver (pt::sph::SmokeSPH) integrates the particle pool
+// against pressure / viscosity / gravity / buoyancy / wind / shockwaves
+// each engine Tick; the GPU only sees the pos/radius/density triple
+// per live particle and treats each as a sub-emitter. There's no per-
+// particle ageing in this function -- the host already mapped age to
+// the splat density before upload (older particles fade) so the shader
+// can stay branch-light.
+//
+// Cost: O(N) per sample. For N = 1024 default cap, an empty-space
+// cull (early-out on AABB-against-pos distance) keeps the cost flat
+// in the common case where most particles are far from any given
+// march sample. The early-out lives inside the loop body as a
+// cutoff-vs-r2 test (cheap when the smoke column is compact).
+//
+// smoke_sph_params.y = mode gate: 0 = OFF (function returns 0; the
+// procedural smoke_density_add still drives the field), 1 = SPH ONLY
+// (procedural is bypassed by the host's smoke_params.y override), or
+// 2 = BOTH (additive). The gate happens at the call site, not here --
+// this function unconditionally accumulates whatever's in the buffer.
+float smoke_sph_density_add(float3 pos) {
+    int n = int(smoke_sph_params.x);
+    if (n <= 0) return 0.0;
+    // Hard cap mirrors the host upload cap (r_smoke_sph_max_particles).
+    // The shader doesn't trust the runtime push value beyond a sanity
+    // bound; misconfigured host could push n > buffer capacity and we
+    // don't want a SSBO out-of-bounds read.
+    int cap = int(smoke_sph_params.w);
+    if (cap > 0 && n > cap) n = cap;
+    if (n > 4096) n = 4096;
+    float floor_d = smoke_sph_params.z;
+    float dens = 0.0;
+    [loop] for (int i = 0; i < n; ++i) {
+        float4 v0 = sph_particles[i * 2 + 0];
+        float4 v1 = sph_particles[i * 2 + 1];
+        float3 pp = v0.xyz;
+        float  rad = max(v0.w, 1e-3);
+        float  peak = max(v1.x - floor_d, 0.0);
+        if (peak <= 0.0) continue;
+        float3 d = pos - pp;
+        float r2 = dot(d, d);
+        float cutoff = 9.0 * rad * rad;   // 3-sigma; outside ~zero contribution
+        if (r2 > cutoff) continue;
+        // Gaussian splat: peak * exp(-(r/rad)^2). Same shape as the
+        // legacy Phase 2 puff (falloff=2 default) so visual style
+        // matches when switching r_smoke_mode procedural -> sph.
+        float u2 = r2 / (rad * rad);
+        float w  = exp(-u2);
+        dens += peak * w;
+    }
+    return dens;
+}
+
+// Tinted variant for the in-scatter path. Reads the same particle
+// buffer but returns out_tint = white (no per-particle tint stored
+// today; the Phase 3 particle SSBO uses v1 fields for density / age).
+// A future expansion could add per-particle temperature -> tint mapping
+// (cool blue-grey for old particles, warm white for hot fresh
+// particles) using the same age_mod gradient as the Phase 2 path.
+// Keep the API parallel to smoke_density_add_tinted so the call site
+// in PathTrace can blindly add the two contributions.
+float smoke_sph_density_add_tinted(float3 pos, out float3 out_tint) {
+    out_tint = float3(1.0, 1.0, 1.0);
+    int n = int(smoke_sph_params.x);
+    if (n <= 0) return 0.0;
+    int cap = int(smoke_sph_params.w);
+    if (cap > 0 && n > cap) n = cap;
+    if (n > 4096) n = 4096;
+    float floor_d = smoke_sph_params.z;
+    float dens = 0.0;
+    float3 tint_acc = float3(0.0, 0.0, 0.0);
+    [loop] for (int i = 0; i < n; ++i) {
+        float4 v0 = sph_particles[i * 2 + 0];
+        float4 v1 = sph_particles[i * 2 + 1];
+        float3 pp = v0.xyz;
+        float  rad = max(v0.w, 1e-3);
+        float  peak = max(v1.x - floor_d, 0.0);
+        if (peak <= 0.0) continue;
+        float3 d = pos - pp;
+        float r2 = dot(d, d);
+        float cutoff = 9.0 * rad * rad;
+        if (r2 > cutoff) continue;
+        float u2 = r2 / (rad * rad);
+        float w  = exp(-u2);
+        float di = peak * w;
+        // Simple per-particle age tint: fresh = neutral white, old =
+        // slight cool blue-grey. Same idea as the Phase 2 age tint but
+        // driven by the host-baked v1.y normalised-age scalar so the
+        // shader doesn't need access to emitter records.
+        float a_norm = saturate(v1.y);
+        float3 warm = float3(1.04, 1.00, 0.95);
+        float3 cool = float3(0.94, 0.96, 1.04);
+        float3 ptint = lerp(warm, cool, a_norm);
+        dens     += di;
+        tint_acc += di * ptint;
+    }
+    if (dens > 0.0) out_tint = tint_acc / dens;
+    return dens;
+}
+// --- end Fluid Phase 3 -----------------------------------------------------
+
 // Optical depth through the cloud layer along [ro, ro + rd*t_max].
 // Returns 0 when clouds are off or the ray misses the layer; otherwise
 // integrates cloud_density_at across the ray-slab intersection. Used
@@ -3290,7 +3440,15 @@ float cloud_optical_depth(float3 ro, float3 rd, float t_max) {
     // Fluid Phase 1 (#136): also accumulate smoke density on the
     // shadow path so opaque smoke blocks sunlight through to the
     // ground, matching the primary-march visibility.
+    // Smoke is "active" when either the procedural Phase 2 emitters
+    // are bound (smoke_params.y gate + count) OR the Phase 3 SPH
+    // particles are bound (smoke_sph_params.x > 0). The host's mode
+    // selection in r_smoke_mode collapses one of the two to zero so
+    // only one path contributes per frame; the OR keeps the gate
+    // logic generic.
     bool smoke_active = (smoke_params.y > 0.0) && (smoke_params.x > 0.0);
+    bool sph_active   = (smoke_sph_params.x > 0.0);
+    smoke_active = smoke_active || sph_active;
     if (clouds_p1.w <= 0.0 && !smoke_active) return 0.0;
     float base_y = clouds_p1.x;
     float top_y  = clouds_p1.y;
@@ -3335,6 +3493,11 @@ float cloud_optical_depth(float3 ro, float3 rd, float t_max) {
         // the shadow path so a sun-NEE ray hitting a plume gets the
         // correct Beer-Lambert dimming.
         dens += smoke_density_add(sp);
+        // Fluid Phase 3 (#22): SPH particles also contribute to shadow
+        // optical depth so an SPH-mode plume occludes the sun NEE leg
+        // identically to the procedural plume. Returns 0 when no SPH
+        // particles are bound -- no branch needed.
+        dens += smoke_sph_density_add(sp);
         od += dens * dt;
     }
     return od;
@@ -3371,7 +3534,15 @@ float cloud_optical_depth_stratified(float3 ro, float3 rd, float t_max,
     // catch full sun even when it's directly between camera and the
     // sun. When clouds are off but smoke is on we drop the slab to
     // ground so smoke at chimney altitude actually gets sampled.
+    // Smoke is "active" when either the procedural Phase 2 emitters
+    // are bound (smoke_params.y gate + count) OR the Phase 3 SPH
+    // particles are bound (smoke_sph_params.x > 0). The host's mode
+    // selection in r_smoke_mode collapses one of the two to zero so
+    // only one path contributes per frame; the OR keeps the gate
+    // logic generic.
     bool smoke_active = (smoke_params.y > 0.0) && (smoke_params.x > 0.0);
+    bool sph_active   = (smoke_sph_params.x > 0.0);
+    smoke_active = smoke_active || sph_active;
     if (clouds_p1.w <= 0.0 && !smoke_active) return 0.0;
     float base_y = clouds_p1.x;
     float top_y  = clouds_p1.y;
@@ -3410,6 +3581,9 @@ float cloud_optical_depth_stratified(float3 ro, float3 rd, float t_max,
         // Fluid Phase 1 (#136): smoke contributions ride the same
         // shadow-ray transmittance so plumes self-shadow at sunset.
         dens += smoke_density_add(sp);
+        // Fluid Phase 3 (#22): SPH particles too -- same self-
+        // shadowing semantics. Returns 0 when no SPH particles bound.
+        dens += smoke_sph_density_add(sp);
         od += dens * dt;
     }
     return od * dscale;
@@ -4955,6 +5129,11 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // being correct. Mirrors the (smoke_params.y > 0 && smoke_params.x > 0)
         // gate used inside the cloud-march body.
         bool smoke_active_outer = (smoke_params.y > 0.0) && (smoke_params.x > 0.0);
+        // Fluid Phase 3 (#22): SPH particles bound -> the smoke-only
+        // outer cloud-march gate must trigger so the splat list gets
+        // marched against the slab. Mirror the gate semantics from
+        // cloud_optical_depth.
+        if (smoke_sph_params.x > 0.0) smoke_active_outer = true;
         // Skip atmospheric in-scatter / cloud / smoke march when the
         // primary segment was underwater (Phase 4, #134): all three
         // contributions assume an air medium with sky-coloured single
@@ -5123,7 +5302,15 @@ void main(uint2 tid : SV_DispatchThreadID) {
             // the cloud field. When clouds are off but smoke is on we
             // still need to march, just with the slab clipped to span
             // the smoke layer rather than the (unset) cloud band.
+            // Smoke is "active" when either the procedural Phase 2 emitters
+            // are bound (smoke_params.y gate + count) OR the Phase 3 SPH
+            // particles are bound (smoke_sph_params.x > 0). The host's mode
+            // selection in r_smoke_mode collapses one of the two to zero so
+            // only one path contributes per frame; the OR keeps the gate
+            // logic generic.
             bool smoke_active = (smoke_params.y > 0.0) && (smoke_params.x > 0.0);
+            bool sph_active   = (smoke_sph_params.x > 0.0);
+            smoke_active = smoke_active || sph_active;
             // Wave 7 (#24): when r_clouds_mode == procedural_raymarched
             // the inline cloud-march below is replaced by a dedicated
             // compute pre-pass (CloudsRaymarch.slang). The pre-pass
@@ -5305,6 +5492,25 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         // no-op.
                         float3 smoke_tint = float3(1.0);
                         float  smoke_dens = smoke_density_add_tinted(sp, smoke_tint);
+                        // Fluid Phase 3 (#22): the SPH particle splat
+                        // list contributes a parallel density + tint
+                        // here. The two tinted contributions blend by
+                        // their respective density weights so an SPH-
+                        // mode plume picks up its age gradient (warm
+                        // fresh -> cool old) the same way the Phase 2
+                        // procedural plume does. Returns 0 / white
+                        // when no SPH particles are bound.
+                        float3 sph_tint   = float3(1.0);
+                        float  sph_dens   = smoke_sph_density_add_tinted(sp, sph_tint);
+                        // Density-weighted blend of the two tints so a
+                        // plume that's a mix of both contributions sees
+                        // its NEE radiance painted by the heavier one.
+                        float combined_smoke = smoke_dens + sph_dens;
+                        if (combined_smoke > 0.0) {
+                            smoke_tint = (smoke_dens * smoke_tint + sph_dens * sph_tint)
+                                          / combined_smoke;
+                        }
+                        smoke_dens = combined_smoke;
                         float  dens       = cloud_dens + smoke_dens;
                         float  smoke_frac = (dens > 0.0) ? (smoke_dens / dens) : 0.0;
                         // Effective per-light tint at this sample: white

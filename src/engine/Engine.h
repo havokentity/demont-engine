@@ -31,6 +31,7 @@ namespace pt::renderer { struct Camera; class AsyncLightTreeBuilder; }
 namespace pt::csg      { class CsgScene; struct BakedMesh; }
 namespace pt::effects  { class ParticleSystem; }
 namespace pt::physics  { class PhysicsSystem; }
+namespace pt::sph      { class SmokeSPH; }
 // Voxel destruction Phase 1 (issue #140). VoxelGrid lives in
 // src/destruction/; the engine keeps a small map of voxelized
 // objects + a reserved SDF cluster id range used to render them.
@@ -364,6 +365,19 @@ private:
     // smoke_params push. Buffer is always sized to kMaxSmokeEmitters so
     // re-uploads don't reallocate.
     void EnsureSmokeEmittersUploaded();
+    // --- Fluid Phase 3 (#22) -- SPH smoke fluid sim ---------------------
+    // Step the SmokeSPH solver one frame, then upload the live particle
+    // splat list to the GPU. Called from Tick when r_smoke_mode != procedural.
+    // No-op when there are no SPH emitters / particles.
+    void StepSmokeSPH(float dt);
+    // Re-upload the SPH particle buffer (sph_particle_buffer_id_) from the
+    // SmokeSPH solver each frame. Buffer is always sized to the SPH cap.
+    // Cheap: 32 B per particle, 32 KB at the 1024 default cap.
+    void EnsureSmokeSphUploaded();
+    // Console commands for SPH control: smoke_shockwave_at, smoke_sph_clear,
+    // smoke_sph_list. The r_smoke_* cvars are registered alongside the
+    // Phase 2 cvars in the RegisterCommands cvar block.
+    void RegisterSmokeSphCommands();
     // --- SDF Phase 1 (#97) -------------------------------------------------
     // Console commands for the SDF primitive set (`sdf_sphere`,
     // `sdf_box`, `sdf_smin`, ...). Mirrors the prim_*/csg_* registration
@@ -816,6 +830,27 @@ private:
     std::uint32_t                               smoke_count_uploaded_    = 0;
     std::uint32_t                               smoke_next_id_           = 1;
     // --- end Fluid Phase 1 -------------------------------------------------
+
+    // --- Fluid Phase 3 (#22) -- SPH smoke fluid sim ------------------------
+    // Smoothed Particle Hydrodynamics fluid solver. Replaces (or augments)
+    // the Phase 1/2 procedural plume with a particle-based simulation that
+    // responds to:
+    //   * r_smoke_wind <wx> <wy> <wz>  -- global wind force (m/s)
+    //   * smoke_shockwave_at <x> <y> <z> <strength_J> -- radial impulse
+    //   * Per-emitter buoyancy (thermal force; hot smoke rises faster)
+    //
+    // The solver runs on the CPU each Tick at fixed sub-steps (1/120s)
+    // and uploads the live particle splat list to engine slot 16 /
+    // vk::binding 31. The path tracer's smoke_sph_density_add reads
+    // the buffer when r_smoke_mode != procedural.
+    //
+    // CPU solver: pt::sph::SmokeSPH. Pimpl-style unique_ptr keeps the
+    // header transitive include cost low (SmokeSPH.h pulls in glm).
+    std::unique_ptr<pt::sph::SmokeSPH>          smoke_sph_;
+    std::uint64_t                               sph_particle_buffer_id_   = 0;
+    std::uint32_t                               sph_particle_capacity_    = 0;
+    std::uint32_t                               sph_particle_count_uploaded_ = 0;
+    // --- end Fluid Phase 3 -------------------------------------------------
 
     // --- Voxel destruction Phase 1 (#140) ----------------------------------
     // VoxelGrids produced by `voxelize_object`, keyed by source object
