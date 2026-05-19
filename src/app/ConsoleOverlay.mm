@@ -721,21 +721,44 @@ static PtThemePalette PtPaletteForTheme(NSString* name) {
 
     [self appendLine:line level:@"input"];
 
-    // ExecuteScript so pasted multi-statement lines (separated by ';'
-    // or '\n') run as a sequence -- e.g. "r_clouds 1; r_volumetric 1".
-    auto result = pt::console::Console::Get().ExecuteScript(
-        std::string_view([line UTF8String]));
-    if (!result.output.empty()) {
-        NSString* o = [NSString stringWithUTF8String:result.output.c_str()];
-        while (o.length > 0 && [o characterAtIndex:o.length - 1] == '\n') {
-            o = [o substringToIndex:o.length - 1];
-        }
-        [self appendLine:o level:@"out"];
-    }
-    if (!result.ok) {
-        NSString* e = [NSString stringWithUTF8String:result.error.c_str()];
-        [self appendLine:[NSString stringWithFormat:@"error: %@", e] level:@"error"];
-    }
+    // QueueExecute (not ExecuteScript directly) so the bare-line '['
+    // / ']' batch protocol Console::Drain implements works here the
+    // same way it does for the web console + the Win32 overlay --
+    // type `[` on its own line to open a batched block, then any
+    // number of commands, then `]` on its own line to commit them
+    // as one undo step. Pasted multi-statement lines (separated by
+    // ';' or '\n') still work because Drain routes non-batch lines
+    // through ExecuteScript identically.
+    //
+    // The responder fires from the engine main thread when Drain()
+    // runs, so the captured `self` must outlive that callback.
+    // ConsoleOverlay lives for the engine lifetime so this is fine.
+    __weak PtConsoleView* weakSelf = self;
+    pt::console::Console::Get().QueueExecute(
+        std::string([line UTF8String]),
+        [weakSelf](const pt::console::ExecuteResult& r) {
+            // Hop to main thread for UI mutation; capture results by
+            // value since the original r is destroyed when Drain pops
+            // this responder off the queue.
+            std::string out_copy = r.output;
+            std::string err_copy = r.error;
+            bool ok = r.ok;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                PtConsoleView* s = weakSelf;
+                if (!s) return;
+                if (!out_copy.empty()) {
+                    NSString* o = [NSString stringWithUTF8String:out_copy.c_str()];
+                    while (o.length > 0 && [o characterAtIndex:o.length - 1] == '\n') {
+                        o = [o substringToIndex:o.length - 1];
+                    }
+                    [s appendLine:o level:@"out"];
+                }
+                if (!ok) {
+                    NSString* e = [NSString stringWithUTF8String:err_copy.c_str()];
+                    [s appendLine:[NSString stringWithFormat:@"error: %@", e] level:@"error"];
+                }
+            });
+        });
 }
 
 - (void)submitInput {
