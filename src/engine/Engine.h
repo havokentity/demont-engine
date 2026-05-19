@@ -120,6 +120,14 @@ public:
         float    albedo[3]   {1, 1, 1};
         float    roughness   = 0.0f;
         float    ior         = 1.5f;
+        // Motion blur (#85). Previous frame's sphere center, used by
+        // PathTrace.slang to lerp the sphere position at the ray's
+        // shutter-time sample. Initialized to pos_or_n so static prims
+        // produce a zero-length lerp (no motion → bit-identical to the
+        // motion-blur-off path). The engine snapshots curr → prev once
+        // per frame in StepPhysics before writing the new curr_pos.
+        // Unused for plane primitives (infinite extent never moves).
+        float    prev_pos_or_n[3] {0, 0, 0};
     };
 
     // Analytic light primitive (#73). First-class scene light source for

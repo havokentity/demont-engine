@@ -68,15 +68,27 @@ constexpr std::size_t kSunAndModeOffset = 240;
 // + Engine.cpp's PtPush.accum_params for the canonical doc.
 constexpr std::size_t kAccumParamsOffset = 720;
 
-// Analytic prim layout (matches PathTrace.slang's `primitives` SSBO):
+// Analytic prim layout (matches PathTrace.slang's `primitives` SSBO).
+// Motion blur (#85): bumped from 3 float4 to 4 float4 to carry prev_pos
+// alongside the existing per-prim fields. Software-backend renders here
+// always use the CURRENT-frame position (v0.xyz); the host packs prev
+// into v3.xyz for the GPU shader's shutter-time lerp but the SW path
+// doesn't implement motion blur (no per-pixel shutter sampling -- the
+// SW backend is the fallback for headless / no-GPU envs).
+//
 //   v0.xyz = sphere center or plane normal; v0.w = sphere radius or plane d
 //   v1.rgb = albedo; v1.a = roughness
 //   v2.x   = type (0 sphere / 1 plane); v2.y = material
 //   v2.z   = ior; v2.w = pad
-// 3 float4 per prim = 12 floats = 48 bytes.
+//   v3.xyz = prev_pos_or_n (sphere center at previous frame; same as
+//            v0.xyz for planes). Ignored by the SW tracer (which always
+//            samples at the current frame), but reserved here so the
+//            stride matches PathTrace.slang.
+// 4 float4 per prim = 16 floats = 64 bytes.
 constexpr std::uint32_t kPrimSphere = 0u;
 constexpr std::uint32_t kPrimPlane  = 1u;
 constexpr std::uint32_t kMatLambert = 0u;
+constexpr std::uint32_t kFloatsPerPrim = 16u;
 
 struct HitInfo {
     bool      hit = false;
@@ -160,9 +172,12 @@ void TraceScene(const glm::vec3& ro, const glm::vec3& rd,
 
     // Analytic primitives.
     for (std::uint32_t i = 0; i < prim_count; ++i) {
-        const float* v0 = prim_data + i * 12u + 0u;
-        const float* v1 = prim_data + i * 12u + 4u;
-        const float* v2 = prim_data + i * 12u + 8u;
+        // Stride bumped from 12 floats (3 float4) to 16 floats (4 float4)
+        // for motion blur (#85) -- v3 holds prev_pos for the GPU shader
+        // but the SW tracer ignores it (no shutter sampling here).
+        const float* v0 = prim_data + i * kFloatsPerPrim + 0u;
+        const float* v1 = prim_data + i * kFloatsPerPrim + 4u;
+        const float* v2 = prim_data + i * kFloatsPerPrim + 8u;
         std::uint32_t type = static_cast<std::uint32_t>(v2[0]);
         glm::vec3 albedo{v1[0], v1[1], v1[2]};
         std::uint32_t mat = static_cast<std::uint32_t>(v2[1]);
@@ -269,7 +284,10 @@ void RunPathTraceKernel(SoftwareDevice& device,
             prim_data  = reinterpret_cast<const float*>(pb->data.data());
             prim_count = push->prim_count;
             // Don't trust prim_count past the buffer's capacity.
-            std::uint32_t max_prims = static_cast<std::uint32_t>(pb->size / 48);
+            // Motion blur (#85): prim stride is now 64 bytes (4 float4)
+            // instead of 48 (3 float4) -- v3 carries prev_pos.
+            constexpr std::size_t kBytesPerPrim = kFloatsPerPrim * sizeof(float);
+            std::uint32_t max_prims = static_cast<std::uint32_t>(pb->size / kBytesPerPrim);
             if (prim_count > max_prims) prim_count = max_prims;
         }
     }

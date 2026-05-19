@@ -825,6 +825,21 @@ cbuffer Push {
     //              .w = r_smoke_expansion_rate    (per-second radius growth)
     float4 smoke_params2;
     // --- end Fluid Phase 2 ----------------------------------------------------
+    // --- Motion blur (#85) ----------------------------------------------------
+    // motion_blur_params.x = r_motion_blur (1 = stochastic shutter-time
+    //                         sampling for per-ray motion blur; 0 = legacy
+    //                         single-frame sphere positions, bit-exact vs
+    //                         pre-#85 even though the primitive buffer
+    //                         still carries v3=prev_pos for every prim).
+    //                .y = r_shutter_speed in seconds. Currently informational
+    //                      only -- the shader's lerp factor is U(0,1) over
+    //                      the prev/curr window the host snapshots once
+    //                      per StepPhysics tick; a longer shutter just
+    //                      means the user is content with the streak
+    //                      magnitude produced at the current frame rate.
+    //                .z/.w reserved.
+    float4 motion_blur_params;
+    // --- end Motion blur ------------------------------------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -919,6 +934,8 @@ cbuffer Frame {
     float4 smoke_params;
     // See `smoke_params2` in the Metal Push cbuffer above (#180).
     float4 smoke_params2;
+    // See `motion_blur_params` in the Metal Push cbuffer above (#85).
+    float4 motion_blur_params;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -996,19 +1013,36 @@ struct HitInfo {
     float  ior;
 };
 
-// Test a single analytic primitive at `primitives[idx*3 + 0..2]` against
+// Test a single analytic primitive at `primitives[idx*4 + 0..3]` against
 // (ro, rd) and update `h` if it's a closer hit. Centralizes the per-prim
 // dispatch so the linear-loop and BVH-leaf paths share one body.
-void testAnalyticPrim(uint idx, float3 ro, float3 rd, inout HitInfo h) {
-    float4 v0 = primitives[idx * 3u + 0u];
-    float4 v1 = primitives[idx * 3u + 1u];
-    float4 v2 = primitives[idx * 3u + 2u];
+//
+// Motion blur (#85): the primitive stride is 4 float4s (16 floats),
+// with v3.xyz holding prev_pos_or_n (last frame's sphere center). The
+// `shutter_t01` parameter is the per-ray shutter sample in [0, 1] --
+// 0 = sample at start of shutter (== prev_pos), 1 = sample at end of
+// shutter (== curr_pos = v0.xyz). When the host's motion-blur master
+// gate is off it forces shutter_t01 = 1.0 at every call site so the
+// sphere center collapses to v0.xyz exactly (legacy rendering path).
+// Planes don't move so they ignore the shutter-time param.
+void testAnalyticPrim(uint idx, float3 ro, float3 rd, float shutter_t01, inout HitInfo h) {
+    float4 v0 = primitives[idx * 4u + 0u];
+    float4 v1 = primitives[idx * 4u + 1u];
+    float4 v2 = primitives[idx * 4u + 2u];
+    float4 v3 = primitives[idx * 4u + 3u];
     uint type = uint(v2.x);
     float t;
     if (type == PRIM_SPHERE) {
-        if (intersectSphere(ro, rd, v0.xyz, v0.w, t) && t < h.t) {
+        // Lerp from prev_pos (v3.xyz) toward curr_pos (v0.xyz) at the
+        // shutter-time sample. When motion_blur_params.x == 0 the host
+        // forces shutter_t01 to 1.0 so the lerp collapses to v0.xyz
+        // (bit-identical to pre-#85 behaviour). When motion_blur is on
+        // the engine snapshots curr -> prev once per StepPhysics tick
+        // so the per-frame displacement is encoded in (v0.xyz - v3.xyz).
+        float3 sphere_center = lerp(v3.xyz, v0.xyz, shutter_t01);
+        if (intersectSphere(ro, rd, sphere_center, v0.w, t) && t < h.t) {
             h.hit = true; h.t = t;
-            h.normal = normalize(ro + rd * t - v0.xyz);
+            h.normal = normalize(ro + rd * t - sphere_center);
             h.mat = uint(v2.y);
             h.albedo = v1.rgb;
             h.roughness = v1.a;
@@ -1180,17 +1214,18 @@ bool intersectAabb(float3 ro, float3 rd_inv, float3 mn, float3 mx, float t_max) 
     return tmax >= max(tmin, 0.0) && tmin <= t_max;
 }
 
-HitInfo traceScene(float3 ro, float3 rd) {
+HitInfo traceScene(float3 ro, float3 rd, float shutter_t01) {
     HitInfo h;
     h.hit = false; h.t = 1e30;
     h.normal = float3(0,1,0); h.mat = MAT_LAMBERT;
     h.albedo = float3(0.5); h.roughness = 0.0; h.ior = 1.0;
 
-    // Analytic primitives. Each occupies 3 consecutive float4s in
-    // `primitives`:
-    //   v0 = (xyz: center / normal,  w: radius / d)
+    // Analytic primitives. Motion blur (#85): each occupies 4 consecutive
+    // float4s in `primitives`:
+    //   v0 = (xyz: center (current frame) / plane normal,  w: radius / d)
     //   v1 = (rgb: albedo,           a: roughness)
     //   v2 = (x: type,  y: material, z: ior, w: pad)
+    //   v3 = (xyz: prev_pos_or_n (sphere center at previous frame), w: pad)
     //
     // The host partitions the buffer at upload time so the first
     // `linear_prim_count` entries are infinite-extent prims (planes)
@@ -1198,16 +1233,22 @@ HitInfo traceScene(float3 ro, float3 rd) {
     // AABB. The remainder is either linear-scanned (when bvh_params.y
     // == 0, i.e. count below r_analytic_bvh_threshold) or traversed
     // via the BVH whose flat node array lives in `bvh_nodes`.
+    //
+    // shutter_t01 is the per-ray shutter sample in [0, 1] -- 0 = beginning
+    // of shutter window (lerp factor 0 -> sphere at prev_pos), 1 = end
+    // of shutter (sphere at curr_pos). The host forces shutter_t01 = 1.0
+    // when motion blur is off so sphere centers collapse to v0.xyz
+    // (bit-identical to pre-#85 path).
     uint linear_prim_count = bvh_params.x;
     uint bvh_node_count    = bvh_params.y;
     // Linear pass over the infinite-extent segment first.
     for (uint i = 0u; i < linear_prim_count && i < prim_count; ++i) {
-        testAnalyticPrim(i, ro, rd, h);
+        testAnalyticPrim(i, ro, rd, shutter_t01, h);
     }
     if (bvh_node_count == 0u) {
         // BVH inactive: linear-scan the rest of the buffer too.
         for (uint i = linear_prim_count; i < prim_count; ++i) {
-            testAnalyticPrim(i, ro, rd, h);
+            testAnalyticPrim(i, ro, rd, shutter_t01, h);
         }
     } else {
         // Iterative BVH traversal with a small local stack. Depth is
@@ -1226,7 +1267,7 @@ HitInfo traceScene(float3 ro, float3 rd) {
                 // Leaf: test the contiguous prim range.
                 uint base = node.left_first + linear_prim_count;
                 for (uint k = 0u; k < node.count; ++k) {
-                    testAnalyticPrim(base + k, ro, rd, h);
+                    testAnalyticPrim(base + k, ro, rd, shutter_t01, h);
                 }
             } else {
                 // Internal: push both children. Stack-depth guard.
@@ -3135,7 +3176,13 @@ float3 atmosphericTransmittance(float3 ro, float3 rd, float t) {
 // Up to kMaxRefract dielectric bounces; beyond that the ray gives up
 // (returns 0) so a pathological all-glass scene can't loop forever.
 // TIR also returns 0 (light can't pass that interface).
-float3 transmittance(float3 ro, float3 rd, float t_max) {
+//
+// Motion blur (#85): shutter_t01 is the shutter-time sample the calling
+// path-trace iteration used for its primary ray. Threading it through
+// to the shadow-ray scene query keeps the shadow consistent with the
+// rendered surface -- a sphere that primary-hit at the prev-frame end
+// of its swept volume should cast a shadow against that same position.
+float3 transmittance(float3 ro, float3 rd, float t_max, float shutter_t01) {
     // Cloud optical depth along the original (un-refracted) ray. Real
     // clouds live in a layer high above the scene -- approximating the
     // shadow as the straight-line cloud path is fine because no glass
@@ -3150,7 +3197,7 @@ float3 transmittance(float3 ro, float3 rd, float t_max) {
     float3 o = ro;
     float3 d = rd;
     for (int i = 0; i <= kMaxRefract; ++i) {
-        HitInfo h = traceScene(o, d);
+        HitInfo h = traceScene(o, d, shutter_t01);
         if (!h.hit || h.t >= t_max) return t * cloud_t;     // unoccluded
         // Water (#134) joins dielectric on the transmissive-blocker list.
         // Both refract the shadow ray; only water folds Beer's-law
@@ -3224,8 +3271,10 @@ float3 transmittance(float3 ro, float3 rd, float t_max) {
 
 // Convenience predicate around transmittance() for the metal /
 // dielectric branches that just want the legacy boolean answer.
-bool occluded(float3 ro, float3 rd, float t_max) {
-    return all(transmittance(ro, rd, t_max) <= float3(0.0));
+// Motion blur (#85): forwards shutter_t01 to keep shadow geometry
+// consistent with the primary ray that originated the test.
+bool occluded(float3 ro, float3 rd, float t_max, float shutter_t01) {
+    return all(transmittance(ro, rd, t_max, shutter_t01) <= float3(0.0));
 }
 
 // --- Water Phase 1 (#134) --------------------------------------------------
@@ -3316,7 +3365,15 @@ void main(uint2 tid : SV_DispatchThreadID) {
         float3 rd0 = normalize(fwd_aspect.xyz
                              + right_xyz.xyz * (uv0.x * fwd_aspect.w * pos_fovtan.w)
                              + up_xyz.xyz    * (uv0.y * pos_fovtan.w));
-        HitInfo h0 = traceScene(ro0, rd0);
+        // Motion blur (#85): the G-buffer pass writes the depth + motion
+        // textures the denoiser uses for temporal reprojection. Pass
+        // shutter_t01 = 1.0 (current frame position) so the depth read
+        // by the denoiser stays stable from frame to frame -- a shutter
+        // jittered into a half-streak position would feed the denoiser
+        // a mismatched depth and the reprojection would smear. The
+        // visible motion-blur streak is produced by the SHADING pass
+        // (per-sample shutter_t01 inside the spp loop below).
+        HitInfo h0 = traceScene(ro0, rd0, 1.0);
 
         float3 hit_world;
         float3 hit_normal;
@@ -3548,6 +3605,19 @@ void main(uint2 tid : SV_DispatchThreadID) {
         }
         float2 uv = ((float2(tid) + 0.5 + jitter) / float2(dim)) * 2.0 - 1.0;
         uv.y = -uv.y;
+        // Motion blur (#85): pick a uniform shutter-time sample per ray.
+        // 0 = beginning of the shutter window, 1 = end. When the host
+        // gate is off (motion_blur_params.x == 0) we pin t01 to 1.0 so
+        // the sphere center lerp collapses to v0.xyz (current frame
+        // position), which is the bit-exact pre-#85 sampling. The
+        // shutter_speed cvar (motion_blur_params.y) is intentionally
+        // not folded into the lerp factor: the prev/curr snapshot
+        // already encodes the per-frame displacement, and a longer
+        // shutter just means the user is happy with the streak length
+        // produced by that displacement at the current frame rate.
+        float shutter_t01 = (motion_blur_params.x > 0.5)
+                                ? randf(seed)
+                                : 1.0;
 
         float3 ro = pos_fovtan.xyz;
         float3 rd = normalize(fwd_aspect.xyz
@@ -3635,7 +3705,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
         bool   primary_hit = false;
 
         for (uint b = 0u; b < max_bounces; ++b) {
-        HitInfo h = traceScene(ro, rd);
+        HitInfo h = traceScene(ro, rd, shutter_t01);
         if (b == 0u) {
             // Sky pixels (no hit) keep the 50km default so cloud
             // marches reach the layer; object hits override.
@@ -3685,7 +3755,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         // mean.
                         float3 sun_jit = sampleSunDisc(sun_dir, seed);
                         float3 t_vis = transmittance(hp + nf_0 * 1e-3,
-                                                     sun_jit, 1e30);
+                                                     sun_jit, 1e30, shutter_t01);
                         // Rec.709 luminance flattens RGB transmittance
                         // to one scalar. For pure shadow (no glass
                         // between hit and sun), R==G==B so the choice
@@ -3731,7 +3801,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     // origin (offset by nf*1e-3 from the surface).
                     float pdf_env = pdfEnvMapDir(rd);
                     float w_brdf  = misBalance(prev_lambert_brdf_pdf, pdf_env);
-                    float3 trans  = transmittance(ro, rd, 1e30);
+                    float3 trans  = transmittance(ro, rd, 1e30, shutter_t01);
                     radiance += clampIndirect(throughput * skyColor(rd) * trans * w_brdf);
                 }
             } else if (!skip_sky_on_miss) {
@@ -3837,7 +3907,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     // light's own surface doesn't self-block.
                     float t_max = max(ls.dist - 1e-3, 0.0);
                     float3 trans = transmittance(hit_pt + nf * 1e-3,
-                                                 ls.dir, t_max);
+                                                 ls.dir, t_max, shutter_t01);
                     if (any(trans > float3(0.0))) {
                         float3 brdf = h.albedo / 3.14159265358979;
                         radiance += clampIndirect(
@@ -3963,7 +4033,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     // between this hit and the light -- 1.0 free path,
                     // 0.0 fully blocked, in-between for refraction
                     // through glass / diamond meshes (caustics).
-                    float3 trans = transmittance(hit_pt + nf * 1e-3, env.dir, 1e30);
+                    float3 trans = transmittance(hit_pt + nf * 1e-3, env.dir, 1e30, shutter_t01);
                     if (any(trans > float3(0.0))) {
                         float3 brdf = h.albedo / 3.14159265358979;
                         float pdf_brdf_at_env = n_dot_l * (1.0 / 3.14159265358979);
@@ -3996,7 +4066,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     HdriLightSample hl = sampleHdriLight(seed);
                     float n_dot_l = dot(nf, hl.dir);
                     if (n_dot_l > 0.0 && hl.pdf > 0.0) {
-                        float3 t_s = transmittance(hit_pt + nf * 1e-3, hl.dir, 1e30);
+                        float3 t_s = transmittance(hit_pt + nf * 1e-3, hl.dir, 1e30, shutter_t01);
                         if (any(t_s > float3(0.0))) {
                             float3 brdf = h.albedo / 3.14159265358979;
                             radiance += clampIndirect(
@@ -4058,7 +4128,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     float n_dot_l = max(0.0, dot(nf, sun_dir));
                     float3 sun_jit = sampleSunDisc(sun_dir, seed);
                     float3 trans  = (n_dot_l > 0.0)
-                        ? transmittance(hit_pt + nf * 1e-3, sun_jit, 1e30)
+                        ? transmittance(hit_pt + nf * 1e-3, sun_jit, 1e30, shutter_t01)
                         : float3(0.0);
                     if (n_dot_l > 0.0 && any(trans > float3(0.0))) {
                         // Atmospheric attenuation: optical depth times
@@ -4100,7 +4170,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         float3 moon_jit = sampleSunDisc(moon_dir_phase.xyz, seed);
                         float ndl = max(0.0, dot(nf, moon_jit));
                         if (ndl > 0.0) {
-                            float3 t_m = transmittance(hit_pt + nf * 1e-3, moon_jit, 1e30);
+                            float3 t_m = transmittance(hit_pt + nf * 1e-3, moon_jit, 1e30, shutter_t01);
                             if (any(t_m > float3(0.0))) {
                                 // Atmospheric attenuation + warmth at low
                                 // moon altitude, mirroring sun radiance.
@@ -4428,7 +4498,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     float3 sigma_total = sigma_ray + float3(sigma_mie);
                     if (sun_elev > 0.0) {
                         float3 sun_jit = sampleSunDisc(sun_dir, seed);
-                        float3 trans_sun = transmittance(sp, sun_jit, 1e30);
+                        float3 trans_sun = transmittance(sp, sun_jit, 1e30, shutter_t01);
                         if (any(trans_sun > float3(0.0))) {
                             float3 in_scatter =
                                   float3(sigma_mie) * phase_mie_v
