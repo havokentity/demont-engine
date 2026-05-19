@@ -6529,29 +6529,19 @@ void Engine::RenderFrame() {
     //                             gradient sky has none)
     //   - stars_composite_pipeline_id_ != 0 : the composite kernel
     //                             must be registered on the active
-    //                             backend. Both Metal and Vulkan now
-    //                             build + register stars_composite, so
-    //                             the pipeline id is non-zero on either
-    //                             backend. The composite DISPATCH,
-    //                             however, lives inside the
-    //                             `use_engine_tonemap` branch below
-    //                             (Metal-only today -- Tonemap.slang
-    //                             produces black on Vulkan, so the
-    //                             post-denoise tonemap + bloom + composite
-    //                             chain runs inside VulkanNrdDenoiser::
-    //                             Encode on Vulkan with no engine-side
-    //                             hook between the SVGF output and the
-    //                             swap write). To prevent
-    //                             composite_celestials from firing on
-    //                             Vulkan while the dispatch path is
-    //                             unreachable (PathTrace would peel
-    //                             celestials but the composite would
-    //                             never add them back -> empty sky),
-    //                             we ALSO gate this on backend_is_metal
-    //                             below. Removing the metal-only guard
-    //                             will require adding a Vulkan dispatch
-    //                             path for StarsComposite first -- see
-    //                             FOLLOW_UPS / Raytracer Plan.
+    //                             backend. Both Metal and Vulkan build
+    //                             + register stars_composite. The
+    //                             dispatch lives in two places:
+    //                             (a) Metal: inside the
+    //                                 `use_engine_tonemap` branch
+    //                                 between SVGF output and Tonemap.
+    //                             (b) Vulkan: inside the dual-Denoise
+    //                                 sequence (SvgfNoFinalize ->
+    //                                 StarsComposite -> FinalizeOnly)
+    //                                 since Tonemap.slang doesn't reach
+    //                                 the swap on Vulkan -- see issue
+    //                                 #46 + the dual-Denoise comment
+    //                                 block below.
     //   - cloud_trans_tex_id_ != 0 : composite reads this texture and
     //                             would crash without it.
     //   - depth_tex_id_ != 0   : composite reads this texture for the
@@ -6571,16 +6561,13 @@ void Engine::RenderFrame() {
     {
         bool star_split_on = true;
         if (auto* v = C.FindCVar("r_star_split")) star_split_on = v->GetBool();
-        const bool backend_is_metal =
-            (current_backend_ == pt::rhi::BackendType::Metal);
         engine_composite_active =
             denoiser_active_ &&
             star_split_on &&
             (sky_mode_int == 2) &&
             stars_composite_pipeline_id_ != 0 &&
             cloud_trans_tex_id_ != 0 &&
-            depth_tex_id_ != 0 &&
-            backend_is_metal;
+            depth_tex_id_ != 0;
         push.composite_celestials = engine_composite_active ? 1u : 0u;
     }
     push._pad_star_split = 0u;
@@ -8356,6 +8343,133 @@ void Engine::RenderFrame() {
             dispatch_bloom_pyramid(denoise_color_tex_id_);
         }
 
+        // StarsComposite (issue #46) dispatch helper -- factored out so
+        // the Metal use_engine_tonemap path (further down) and the
+        // Vulkan dual-Denoise path (right below) can share the same
+        // bindings + push layout without duplicating the dispatch code.
+        // Performs the stateless celestial composite over `target_tex_id`
+        // in place. Reads no buffer bindings (StarsComposite kernel is
+        // exposure-free). The dispatch is gated on the same conditions
+        // as engine_composite_active above PLUS moon_map / cloud_trans
+        // availability (always non-zero in practice -- procedurally
+        // generated at engine init -- but belt-and-braces against init
+        // races). star_map_tex_id_ falls back to bloom_dummy_tex_id_
+        // when BSC isn't loaded; the shader's procedural-stars path
+        // doesn't sample star_map so the placeholder is never read,
+        // and gating on star_map_tex_id_ != 0 would lose sun+moon+
+        // procedural-stars in that case.
+        auto composite_stars_to = [&](std::uint64_t target_tex_id) {
+            const std::uint64_t composite_star_map_id =
+                (star_map_tex_id_ != 0) ? star_map_tex_id_ : bloom_dummy_tex_id_;
+            if (push.composite_celestials == 0u ||
+                stars_composite_pipeline_id_ == 0 ||
+                moon_map_tex_id_ == 0 ||
+                depth_tex_id_ == 0 ||
+                cloud_trans_tex_id_ == 0 ||
+                composite_star_map_id == 0) {
+                return;
+            }
+            cb->BindComputePipeline(pt::rhi::PipelineHandle{stars_composite_pipeline_id_});
+            cb->BindStorageTexture(0, pt::rhi::TextureHandle{target_tex_id});
+            cb->BindStorageTexture(1, pt::rhi::TextureHandle{composite_star_map_id});
+            cb->BindStorageTexture(2, pt::rhi::TextureHandle{moon_map_tex_id_});
+            cb->BindStorageTexture(3, pt::rhi::TextureHandle{depth_tex_id_});
+            cb->BindStorageTexture(4, pt::rhi::TextureHandle{cloud_trans_tex_id_});
+
+            struct StarsCompositePush {
+                float        pos_fovtan[4];
+                float        fwd_aspect[4];
+                float        right_xyz[4];
+                float        up_xyz[4];
+                float        sun_and_mode[4];
+                float        exposure_pad[4];
+                float        w2j_row0[4];
+                float        w2j_row1[4];
+                float        w2j_row2[4];
+                float        moon_dir_phase[4];
+                float        moon_extra[4];
+                float        sun_extra[4];
+                float        dof_params[4];
+                std::uint32_t frame_index;
+                std::uint32_t ap_samples;
+                std::uint32_t composite_active;
+                std::uint32_t _pad0;
+            } sc{};
+            static_assert(sizeof(StarsCompositePush) == 224,
+                          "StarsCompositePush layout must match StarsComposite.slang");
+            std::memcpy(sc.pos_fovtan,     push.pos_fovtan,     sizeof(sc.pos_fovtan));
+            std::memcpy(sc.fwd_aspect,     push.fwd_aspect,     sizeof(sc.fwd_aspect));
+            std::memcpy(sc.right_xyz,      push.right_xyz,      sizeof(sc.right_xyz));
+            std::memcpy(sc.up_xyz,         push.up_xyz,         sizeof(sc.up_xyz));
+            std::memcpy(sc.sun_and_mode,   push.sun_and_mode,   sizeof(sc.sun_and_mode));
+            std::memcpy(sc.exposure_pad,   push.exposure_pad,   sizeof(sc.exposure_pad));
+            std::memcpy(sc.w2j_row0,       push.w2j_row0,       sizeof(sc.w2j_row0));
+            std::memcpy(sc.w2j_row1,       push.w2j_row1,       sizeof(sc.w2j_row1));
+            std::memcpy(sc.w2j_row2,       push.w2j_row2,       sizeof(sc.w2j_row2));
+            std::memcpy(sc.moon_dir_phase, push.moon_dir_phase, sizeof(sc.moon_dir_phase));
+            std::memcpy(sc.moon_extra,     push.moon_extra,     sizeof(sc.moon_extra));
+            std::memcpy(sc.sun_extra,      push.sun_extra,      sizeof(sc.sun_extra));
+            std::memcpy(sc.dof_params,     push.dof_params,     sizeof(sc.dof_params));
+            sc.frame_index      = push.frame_index;
+            sc.composite_active = 1u;
+            int ap_n = 16;
+            if (auto* v = C.FindCVar("r_stars_aperture_samples")) {
+                ap_n = v->GetInt();
+            }
+            if (ap_n < 1)  ap_n = 1;
+            if (ap_n > 64) ap_n = 64;
+            sc.ap_samples = static_cast<std::uint32_t>(ap_n);
+            sc._pad0 = 0u;
+            cb->PushConstants(&sc, sizeof(sc));
+            cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
+
+            // RAW: the downstream consumer (bloom_down on Metal,
+            // FinalizeOnly's bloom + ACES read on Vulkan) is about to
+            // read the HDR we just wrote.
+            cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                         pt::rhi::BarrierDesc::Stage::ComputeRead});
+        };
+
+        // Vulkan dual-Denoise dispatch path (issue #46). On Vulkan the
+        // engine-side Tonemap.slang produces a black swapchain (the
+        // descriptor-visibility bug documented in the use_engine_tonemap
+        // comment block above), so we can't run the Metal-style
+        // sequence of "SVGF -> StarsComposite -> Tonemap -> swap".
+        // Instead split the single Denoise(Svgf) call into:
+        //   1) Denoise(SvgfNoFinalize) -- runs the SVGF / NRD chain,
+        //      leaves the denoised linear-HDR in dd.output
+        //      (post_denoise_hdr_tex_id_), and skips the internal
+        //      DenoiseFinalize dispatch.
+        //   2) composite_stars_to(post_denoise_hdr_tex_id_) -- reads +
+        //      writes the same texture, additively layering sun / moon /
+        //      stars with aperture-sampled bokeh.
+        //   3) Denoise(FinalizeOnly) -- reads post_denoise_hdr_tex_id_,
+        //      composites bloom_mip[0] pre-ACES, applies sRGB OETF,
+        //      writes the swap. Reuses VulkanNrdDenoiser::
+        //      EncodeFinalizeOnly's dedicated 4-binding layout that the
+        //      bloom-without-denoiser path already exercises, so this
+        //      sidesteps the Tonemap.slang issue entirely.
+        // Gated on !kind_is_optix because the OptiX path runs on a
+        // private cb behind a CUDA-Vulkan timeline semaphore -- the
+        // engine cb can't safely interleave a StarsComposite dispatch
+        // between OptiX's input copy and its deferred finalize. OptiX +
+        // StarsComposite is its own follow-up if a user needs it.
+        const bool vulkan_dual_denoise =
+            (!backend_is_metal && denoiser_active_ &&
+             engine_composite_active && !kind_is_optix &&
+             device_->SupportsDenoise() &&
+             post_denoise_hdr_tex_id_ != 0);
+        if (vulkan_dual_denoise && !vulkan_dual_denoise_engaged_) {
+            LOG_INFO("engine: vulkan dual-Denoise + StarsComposite engaged "
+                     "-- SvgfNoFinalize -> composite -> FinalizeOnly "
+                     "(post_denoise_hdr id={}, swap={}x{})",
+                     post_denoise_hdr_tex_id_, fc.width, fc.height);
+            vulkan_dual_denoise_engaged_ = true;
+        } else if (!vulkan_dual_denoise && vulkan_dual_denoise_engaged_) {
+            LOG_INFO("engine: vulkan dual-Denoise + StarsComposite disengaged");
+            vulkan_dual_denoise_engaged_ = false;
+        }
+
         // Skip the denoiser dispatch in the bloom-without-denoiser
         // path (Metal or Vulkan) -- no denoiser is active, so `dd`
         // above was just unused setup work. The downstream branches
@@ -8363,7 +8477,30 @@ void Engine::RenderFrame() {
         // Metal) still write the swapchain from denoise_color.
         if (denoiser_active_) {
             PT_ZONE_SCOPED_N("Device::Denoise");
-            device_->Denoise(dd);
+            if (vulkan_dual_denoise) {
+                // Step 1: SVGF chain that stops before the internal
+                // DenoiseFinalize dispatch. VulkanDevice::Denoise reads
+                // dd.kind and (for SvgfNoFinalize) routes through
+                // VulkanNrdDenoiser::Encode with final_output=0, which
+                // leaves the denoised linear-HDR in dd.output.
+                dd.kind = pt::rhi::Device::DenoiseDesc::Kind::SvgfNoFinalize;
+                device_->Denoise(dd);
+                // Step 2: stateless celestial composite over the same
+                // texture. composite_stars_to issues its own RAW barrier
+                // before returning, so the FinalizeOnly read is covered.
+                composite_stars_to(post_denoise_hdr_tex_id_);
+                // Step 3: bloom composite + ACES + sRGB OETF + swap write.
+                // Reuse the same `dd` but swap kind, color_in, and
+                // final_output. bloom_in / bloom_intensity /
+                // exposure_state / hdr_pipeline were set above by the
+                // Svgf-path setup and apply to FinalizeOnly identically.
+                dd.kind         = pt::rhi::Device::DenoiseDesc::Kind::FinalizeOnly;
+                dd.color_in     = pt::rhi::TextureHandle{post_denoise_hdr_tex_id_};
+                dd.final_output = fc.swapchain_image;
+                device_->Denoise(dd);
+            } else {
+                device_->Denoise(dd);
+            }
         }
 
         // Vulkan bloom-without-denoiser: build the bloom pyramid from
@@ -8531,119 +8668,22 @@ void Engine::RenderFrame() {
                          pt::rhi::BarrierDesc::Stage::ComputeRead});
         }
 
-        // Stateless stars+sun+moon composite (issue #46). Dispatched
-        // BEFORE the bloom pyramid so the bloom downsample picks up the
-        // celestial highlights and produces real halos around them, and
-        // BEFORE Tonemap so the ACES curve squashes the combined image
-        // as one piece. The composite kernel reads + writes
-        // tonemap_hdr_source_id in place (additive); PathTrace.slang's
-        // primary-miss subtraction (push.composite_celestials) already
-        // ensured this texture is celestial-free coming in. Gated on
-        // push.composite_celestials so we only dispatch when the path
-        // tracer actually peeled the celestials out -- otherwise we'd
-        // double-add.
-        // Dispatch gate mirrors the engine_composite_active conditions
-        // above PLUS moon_map availability (always non-zero in practice
-        // -- procedurally generated at engine init -- but belt-and-
-        // braces). star_map is handled by binding the 1x1 bloom_dummy
-        // as a placeholder when BSC isn't loaded, because the shader's
-        // procedural fallback path (r_stars_mode = procedural) doesn't
-        // sample star_map -- gating the dispatch on star_map_tex_id_
-        // != 0 would skip the WHOLE composite (sun + moon + procedural
-        // stars), but PathTrace already subtracted them so the user
-        // would lose all three celestials.
-        const std::uint64_t composite_star_map_id =
-            (star_map_tex_id_ != 0) ? star_map_tex_id_ : bloom_dummy_tex_id_;
-        if (push.composite_celestials != 0u &&
-            stars_composite_pipeline_id_ != 0 &&
-            moon_map_tex_id_ != 0 &&
-            depth_tex_id_ != 0 &&
-            cloud_trans_tex_id_ != 0 &&
-            composite_star_map_id != 0) {
-            cb->BindComputePipeline(pt::rhi::PipelineHandle{stars_composite_pipeline_id_});
-            cb->BindStorageTexture(0, pt::rhi::TextureHandle{tonemap_hdr_source_id});
-            cb->BindStorageTexture(1, pt::rhi::TextureHandle{composite_star_map_id});
-            cb->BindStorageTexture(2, pt::rhi::TextureHandle{moon_map_tex_id_});
-            // depth_tex at engine slot 3 -> Metal MSL texture(3) by
-            // declaration order. PathTrace's G-buffer pass writes a
-            // 1000.0 sentinel for sky pixels and a real camera-space Z
-            // for surface hits, which the shader thresholds at 500 to
-            // skip the composite on foreground geometry. depth_tex_id_
-            // is allocated whenever denoiser_active_ (the only path
-            // that runs the composite anyway), so the existence check
-            // above is belt-and-braces.
-            cb->BindStorageTexture(3, pt::rhi::TextureHandle{depth_tex_id_});
-            // cloud_trans_tex at engine slot 4 -> Metal MSL texture(4)
-            // by declaration order. PathTrace's cloud march writes the
-            // camera-ray transmittance here (1.0 = no occlusion); the
-            // shader multiplies the celestial contribution by it so
-            // stars / sun / moon get darkened by foreground clouds.
-            cb->BindStorageTexture(4, pt::rhi::TextureHandle{cloud_trans_tex_id_});
-            // No buffer bindings: the StarsComposite kernel doesn't
-            // need exposure_state, and BindComputePipeline above cleared
-            // any PathTrace bindings that would have leaked through.
-            // Slang assigns Push to MSL buf(0); engine computes
-            // push_slot = max(bound_buf_slot)+1 = 0 (no buffer binds),
-            // so setBytes(push, 0) lines up with the kernel's
-            // expectation. The earlier _slot_* dummy declarations
-            // (which forced Push to buf(7) to inherit PathTrace's
-            // exposure_state slot) are gone for the same reason --
-            // they referenced slots BindComputePipeline cleared on
-            // Metal, which would have failed Metal's resource
-            // validation if the runtime-dead-branch ever evaluated.
-
-            struct StarsCompositePush {
-                float        pos_fovtan[4];
-                float        fwd_aspect[4];
-                float        right_xyz[4];
-                float        up_xyz[4];
-                float        sun_and_mode[4];
-                float        exposure_pad[4];
-                float        w2j_row0[4];
-                float        w2j_row1[4];
-                float        w2j_row2[4];
-                float        moon_dir_phase[4];
-                float        moon_extra[4];
-                float        sun_extra[4];
-                float        dof_params[4];
-                std::uint32_t frame_index;
-                std::uint32_t ap_samples;
-                std::uint32_t composite_active;
-                std::uint32_t _pad0;
-            } sc{};
-            static_assert(sizeof(StarsCompositePush) == 224,
-                          "StarsCompositePush layout must match StarsComposite.slang");
-            std::memcpy(sc.pos_fovtan,     push.pos_fovtan,     sizeof(sc.pos_fovtan));
-            std::memcpy(sc.fwd_aspect,     push.fwd_aspect,     sizeof(sc.fwd_aspect));
-            std::memcpy(sc.right_xyz,      push.right_xyz,      sizeof(sc.right_xyz));
-            std::memcpy(sc.up_xyz,         push.up_xyz,         sizeof(sc.up_xyz));
-            std::memcpy(sc.sun_and_mode,   push.sun_and_mode,   sizeof(sc.sun_and_mode));
-            std::memcpy(sc.exposure_pad,   push.exposure_pad,   sizeof(sc.exposure_pad));
-            std::memcpy(sc.w2j_row0,       push.w2j_row0,       sizeof(sc.w2j_row0));
-            std::memcpy(sc.w2j_row1,       push.w2j_row1,       sizeof(sc.w2j_row1));
-            std::memcpy(sc.w2j_row2,       push.w2j_row2,       sizeof(sc.w2j_row2));
-            std::memcpy(sc.moon_dir_phase, push.moon_dir_phase, sizeof(sc.moon_dir_phase));
-            std::memcpy(sc.moon_extra,     push.moon_extra,     sizeof(sc.moon_extra));
-            std::memcpy(sc.sun_extra,      push.sun_extra,      sizeof(sc.sun_extra));
-            std::memcpy(sc.dof_params,     push.dof_params,     sizeof(sc.dof_params));
-            sc.frame_index      = push.frame_index;
-            sc.composite_active = 1u;
-            int ap_n = 16;
-            if (auto* v = C.FindCVar("r_stars_aperture_samples")) {
-                ap_n = v->GetInt();
-            }
-            if (ap_n < 1)  ap_n = 1;
-            if (ap_n > 64) ap_n = 64;
-            sc.ap_samples = static_cast<std::uint32_t>(ap_n);
-            sc._pad0 = 0u;
-            cb->PushConstants(&sc, sizeof(sc));
-            cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
-
-            // RAW: bloom_down about to read the HDR we just wrote.
-            // Metal auto-barriers; emitted for documentation symmetry.
-            cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
-                         pt::rhi::BarrierDesc::Stage::ComputeRead});
-        }
+        // Stateless stars+sun+moon composite (issue #46). Metal-side
+        // call site -- dispatched BEFORE the bloom pyramid so the bloom
+        // downsample picks up the celestial highlights and produces
+        // real halos, and BEFORE Tonemap so the ACES curve squashes the
+        // combined image as one piece. tonemap_hdr_source_id is
+        // post_denoise_hdr when the denoiser is active, denoise_color
+        // otherwise; either way it's the HDR target the engine Tonemap
+        // chain will read next. The composite kernel reads + writes
+        // this texture in place (additive); PathTrace.slang's primary-
+        // miss subtraction (push.composite_celestials) already ensured
+        // it's celestial-free coming in. composite_stars_to internally
+        // gates on push.composite_celestials so calling it on the
+        // non-composite-active frame is a cheap no-op. The Vulkan
+        // call site is in the dual-Denoise branch above (between
+        // SvgfNoFinalize output and FinalizeOnly swap write).
+        composite_stars_to(tonemap_hdr_source_id);
 
         // Aurora borealis procedural overlay (issue #116). Dispatched
         // AFTER StarsComposite so aurora ribbons layer over the

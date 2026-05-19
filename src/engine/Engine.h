@@ -1179,6 +1179,13 @@ private:
     // each toggle" pattern and making "did bloom actually disengage?"
     // ungreppable in user logs. Member-based latch matches SVGF.
     bool                                        vulkan_optix_bloom_engaged_       = false;
+    // Issue #46 -- Vulkan dual-Denoise + StarsComposite engagement
+    // latch. The dual-Denoise path swaps the single Denoise(Svgf)
+    // call for the SvgfNoFinalize -> StarsComposite -> FinalizeOnly
+    // sequence whenever engine_composite_active goes true on Vulkan.
+    // Edge-detect lets us log "engaged"/"disengaged" once per
+    // r_star_split / r_sky_mode toggle instead of every frame.
+    bool                                        vulkan_dual_denoise_engaged_      = false;
     // Which denoiser kind the active backend is running. metalfx is
     // Mac-only; svgf_basic/svgf_atrous/nrd route through the in-house
     // SVGF chain on EITHER backend -- VulkanNrdDenoiser on Vulkan,

@@ -3916,12 +3916,28 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
 
     const bool atrous_enabled =
         (d.quality == DenoiseDesc::Quality::Atrous);
+    // Issue #46 -- Kind::SvgfNoFinalize: skip the trailing DenoiseFinalize
+    // dispatch (bloom composite + ACES + sRGB OETF + swap write) so the
+    // engine can dispatch StarsComposite between the SVGF output and the
+    // finalize. The denoised result still lands in d.output
+    // (post_denoise_hdr); the engine then issues a follow-up
+    // Denoise(Kind::FinalizeOnly) call with color_in pointing at that
+    // same texture to write the swap. Zeroing final_output here trips
+    // the existing `if (final_output.id != 0 ...)` gate inside
+    // VulkanNrdDenoiser::Encode at the finalize block -- the dispatch
+    // path already supports final_output=0 as a defensive fallback for
+    // partially-wired callers, so we lean on that instead of plumbing
+    // a fresh skip-finalize flag through Encode's parameter list.
+    const TextureHandle effective_final_output =
+        (d.kind == DenoiseDesc::Kind::SvgfNoFinalize)
+            ? TextureHandle{0}
+            : d.final_output;
     denoiser_->Encode(wrapped_cb_->Raw(),
                       d.color_in, d.depth_in, d.motion_in,
                       d.normal_in,
                       d.albedo_in,           // issue #119
                       d.output,
-                      d.final_output, d.exposure_state,
+                      effective_final_output, d.exposure_state,
                       d.bloom_in, d.bloom_intensity,
                       d.reset_history,
                       atrous_enabled,
