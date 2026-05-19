@@ -207,6 +207,14 @@ pt_add_test(pt_renderer_triangle_bvh
     pt_renderer_triangle_bvh_test.cpp
     LINK_TARGETS pt_renderer)
 
+# --- Editor 3D-transform gizmo unit tests (issue: editor 3D gizmos) --------
+# pt::renderer::EditorOverlay's hit-test + drag math + segment buffer
+# layout. Pure host-side: no GPU, no device, no shader compile -- just
+# the projection / ray / closest-point primitives the gizmo runs on.
+pt_add_test(pt_renderer_editor_overlay
+    pt_renderer_editor_overlay_test.cpp
+    LINK_TARGETS pt_renderer)
+
 # --- pt_math vec/mat/quat/transforms unit tests (issue #63) ----------------
 # Phase 3 of #47. These tests pin the glm contract the engine consumes:
 # RH coord system, column-major mat storage, perspectiveRH_ZO depth

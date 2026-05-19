@@ -119,6 +119,15 @@ void SoftwareCommandBuffer::Dispatch(std::uint32_t /*gx*/, std::uint32_t /*gy*/,
         RunPathTraceKernel(*device_, *this);
         return;
     }
+    if (name == "editor_overlay") {
+        // 3D-transform gizmo overlay (issue: editor 3D gizmos). CPU
+        // port of shaders/EditorOverlay.slang -- projects world-space
+        // line segments to screen space and writes anti-aliased lines
+        // onto the slot-0 output texture (the engine binds the
+        // swapchain-backing scratch texture for Software).
+        device_->RunEditorOverlay(*this);
+        return;
+    }
     // tonemap / autoexpose / bloom_down / bloom_up / perfoverlay --
     // intentionally skipped on Software. The path-trace kernel already
     // ACES-tonemaps inline and writes the final colour to the slot-0
@@ -728,6 +737,174 @@ std::size_t SoftwareDevice::CurrentAllocatedBytes() const {
 void SoftwareDevice::StashClear(float r, float g, float b, float a) {
     pending_clear_[0] = r; pending_clear_[1] = g;
     pending_clear_[2] = b; pending_clear_[3] = a;
+}
+
+// CPU port of shaders/EditorOverlay.slang. Walks the engine-supplied
+// segment list and rasterizes each onto the output texture by per-pixel
+// distance-to-segment, alpha-blending the result. The texture is stored
+// RGBA32F internally; the path tracer's slot-0 write was already
+// clamped to [0,1] for display, and we honour that range here too --
+// the present pack step clamps again so out-of-range values would be
+// truncated anyway. The segment buffer layout matches the Slang
+// declaration: 3 float4s per segment (endpoint A + thickness,
+// endpoint B + reserved depth bias, RGB colour + pad).
+void SoftwareDevice::RunEditorOverlay(SoftwareCommandBuffer& cb) {
+    BackedTexture* out_tex = GetTexture(TextureHandle{cb.binds.textures[0]});
+    if (out_tex == nullptr) return;
+    BackedBuffer*  segs    = GetBuffer(BufferHandle{cb.binds.buffers[1]});
+    if (segs == nullptr) return;
+
+    // Push layout (mirrors shaders/EditorOverlay.slang):
+    //   float4 pos_fovtan, fwd_aspect, right_xyz, up_xyz;
+    //   uint   num_segments, _pad0, _pad1, _pad2;
+    // 4 * 16 + 16 = 80 bytes.
+    if (cb.push_constants_size < 80u) return;
+    const auto* pf = reinterpret_cast<const float*>(cb.push_constants_buf);
+    const auto* pu = reinterpret_cast<const std::uint32_t*>(cb.push_constants_buf);
+    const float pos_x   = pf[ 0]; const float pos_y   = pf[ 1];
+    const float pos_z   = pf[ 2]; const float fovYTan = pf[ 3];
+    const float fwd_x   = pf[ 4]; const float fwd_y   = pf[ 5];
+    const float fwd_z   = pf[ 6]; const float aspect  = pf[ 7];
+    const float right_x = pf[ 8]; const float right_y = pf[ 9];
+    const float right_z = pf[10];
+    const float up_x    = pf[12]; const float up_y    = pf[13];
+    const float up_z    = pf[14];
+    const std::uint32_t num_segments = pu[16];
+    if (num_segments == 0u) return;
+
+    const std::uint32_t w = out_tex->width;
+    const std::uint32_t h = out_tex->height;
+    if (w == 0u || h == 0u) return;
+
+    // Cast segment data. Buffer was written by engine as float4 entries
+    // (3 per segment) -- 12 floats per segment.
+    const auto* sf = reinterpret_cast<const float*>(segs->data.data());
+    const std::size_t total_floats = segs->data.size() / sizeof(float);
+    const std::uint32_t max_segs   = static_cast<std::uint32_t>(total_floats / 12u);
+    const std::uint32_t n_segs     = std::min(num_segments, max_segs);
+
+    auto srgb_encode = [](float c) {
+        if (c <= 0.0f) return 0.0f;
+        if (c >= 1.0f) return 1.0f;
+        return c <= 0.0031308f ? 12.92f * c
+                               : 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f;
+    };
+
+    // Pre-project every endpoint to screen space, skip segments behind
+    // the camera. Cuts the per-pixel cost from "3 dot products + a few
+    // divides per segment" to "linear interp from cached float2s".
+    struct ProjSeg {
+        float ax, ay;        // pixel space
+        float bx, by;
+        float r, g, b;       // sRGB-encoded display colour
+        float half_thick;    // pixel half-thickness
+    };
+    std::vector<ProjSeg> proj;
+    proj.reserve(n_segs);
+    for (std::uint32_t i = 0; i < n_segs; ++i) {
+        const float* s = sf + std::size_t(i) * 12u;
+        const float ax_w = s[0], ay_w = s[1], az_w = s[2];
+        const float half_t = std::max(s[3], 0.5f);
+        const float bx_w = s[4], by_w = s[5], bz_w = s[6];
+        // s[7] reserved (depth bias) -- unused in v1.
+        const float cr   = s[8], cg = s[9], cb_col = s[10];
+
+        // Project A
+        float dxa = ax_w - pos_x, dya = ay_w - pos_y, dza = az_w - pos_z;
+        float z_a = dxa * fwd_x + dya * fwd_y + dza * fwd_z;
+        if (z_a <= 0.001f) continue;
+        float xs_a = (dxa * right_x + dya * right_y + dza * right_z) / z_a;
+        float ys_a = (dxa * up_x    + dya * up_y    + dza * up_z)    / z_a;
+        // Project B
+        float dxb = bx_w - pos_x, dyb = by_w - pos_y, dzb = bz_w - pos_z;
+        float z_b = dxb * fwd_x + dyb * fwd_y + dzb * fwd_z;
+        if (z_b <= 0.001f) continue;
+        float xs_b = (dxb * right_x + dyb * right_y + dzb * right_z) / z_b;
+        float ys_b = (dxb * up_x    + dyb * up_y    + dzb * up_z)    / z_b;
+
+        float u_a = xs_a / (fovYTan * aspect);
+        float v_a = ys_a / fovYTan;
+        float u_b = xs_b / (fovYTan * aspect);
+        float v_b = ys_b / fovYTan;
+
+        ProjSeg p;
+        p.ax = (u_a * 0.5f + 0.5f) * float(w);
+        p.ay = (1.0f - (v_a * 0.5f + 0.5f)) * float(h);
+        p.bx = (u_b * 0.5f + 0.5f) * float(w);
+        p.by = (1.0f - (v_b * 0.5f + 0.5f)) * float(h);
+        p.r = srgb_encode(cr);
+        p.g = srgb_encode(cg);
+        p.b = srgb_encode(cb_col);
+        p.half_thick = half_t;
+        proj.push_back(p);
+    }
+    if (proj.empty()) return;
+
+    // Compute the bounding box across all projected segments to avoid
+    // scanning the entire framebuffer when the gizmo only occupies a
+    // small region. Pad by 2 pixels for the anti-alias feather.
+    float min_x = float(w), min_y = float(h);
+    float max_x = 0.0f,     max_y = 0.0f;
+    for (const auto& p : proj) {
+        float lo_x = std::min(p.ax, p.bx) - (p.half_thick + 2.0f);
+        float hi_x = std::max(p.ax, p.bx) + (p.half_thick + 2.0f);
+        float lo_y = std::min(p.ay, p.by) - (p.half_thick + 2.0f);
+        float hi_y = std::max(p.ay, p.by) + (p.half_thick + 2.0f);
+        if (lo_x < min_x) min_x = lo_x;
+        if (lo_y < min_y) min_y = lo_y;
+        if (hi_x > max_x) max_x = hi_x;
+        if (hi_y > max_y) max_y = hi_y;
+    }
+    const std::int32_t x0 = std::clamp(static_cast<std::int32_t>(std::floor(min_x)), 0,
+                                       static_cast<std::int32_t>(w) - 1);
+    const std::int32_t y0 = std::clamp(static_cast<std::int32_t>(std::floor(min_y)), 0,
+                                       static_cast<std::int32_t>(h) - 1);
+    const std::int32_t x1 = std::clamp(static_cast<std::int32_t>(std::ceil(max_x)), 0,
+                                       static_cast<std::int32_t>(w) - 1);
+    const std::int32_t y1 = std::clamp(static_cast<std::int32_t>(std::ceil(max_y)), 0,
+                                       static_cast<std::int32_t>(h) - 1);
+    if (x1 < x0 || y1 < y0) return;
+
+    for (std::int32_t py = y0; py <= y1; ++py) {
+        float fy = float(py) + 0.5f;
+        for (std::int32_t px = x0; px <= x1; ++px) {
+            float fx = float(px) + 0.5f;
+            float pix_r = out_tex->data[(std::size_t(py) * w + px) * 4 + 0];
+            float pix_g = out_tex->data[(std::size_t(py) * w + px) * 4 + 1];
+            float pix_b = out_tex->data[(std::size_t(py) * w + px) * 4 + 2];
+            bool changed = false;
+            for (const auto& s : proj) {
+                float vx = s.bx - s.ax;
+                float vy = s.by - s.ay;
+                float wx = fx - s.ax;
+                float wy = fy - s.ay;
+                float len2 = vx * vx + vy * vy;
+                float d;
+                if (len2 < 1e-6f) {
+                    float dx = fx - s.ax, dy = fy - s.ay;
+                    d = std::sqrt(dx * dx + dy * dy);
+                } else {
+                    float t = std::clamp((wx * vx + wy * vy) / len2, 0.0f, 1.0f);
+                    float qx = s.ax + t * vx;
+                    float qy = s.ay + t * vy;
+                    float dx = fx - qx, dy = fy - qy;
+                    d = std::sqrt(dx * dx + dy * dy);
+                }
+                if (d > s.half_thick + 1.0f) continue;
+                float aa = std::clamp((s.half_thick + 1.0f) - d, 0.0f, 1.0f);
+                if (aa <= 0.0f) continue;
+                pix_r = pix_r * (1.0f - aa) + s.r * aa;
+                pix_g = pix_g * (1.0f - aa) + s.g * aa;
+                pix_b = pix_b * (1.0f - aa) + s.b * aa;
+                changed = true;
+            }
+            if (changed) {
+                out_tex->data[(std::size_t(py) * w + px) * 4 + 0] = pix_r;
+                out_tex->data[(std::size_t(py) * w + px) * 4 + 1] = pix_g;
+                out_tex->data[(std::size_t(py) * w + px) * 4 + 2] = pix_b;
+            }
+        }
+    }
 }
 
 SoftwarePipeline* SoftwareDevice::GetPipeline(PipelineHandle h) {

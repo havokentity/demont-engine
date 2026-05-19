@@ -1,0 +1,218 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Rajesh D'Monte
+//
+// Unit tests for pt::renderer::EditorOverlay (issue: editor 3D gizmos).
+//
+// The gizmo class is mostly responsible for two things: building the
+// per-frame line-segment buffer (which the GPU rasterizer consumes) and
+// solving the screen-space hit-test + drag math that picks an axis.
+// Both are pure-function deterministic with no GPU dependency, so we
+// validate them here without spinning up a device.
+//
+// What's covered:
+//   * ProjectToScreen / ScreenToWorldRay round-trip -- a world-space
+//     point projected to screen pixels and then re-cast as a ray must
+//     return to the same point (within float epsilon).
+//   * ClosestPointOnLineToRay: parallel rays return the line origin
+//     (degenerate fallback); a ray that crosses the line gives the
+//     correct closest point.
+//   * EditorOverlay::HitTest: clicking near the X arm picks Axis::X;
+//     clicking off-gizmo returns Axis::None.
+//   * EditorOverlay::BeginDrag + UpdateDrag: dragging the X arm along
+//     a known mouse-delta moves the gizmo origin along the X axis only
+//     (Y and Z stay pinned).
+//   * Mode switching produces different segment counts (translate vs
+//     rotate vs scale ring/cube geometry).
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest/doctest.h>
+
+#include "../src/renderer/Camera.h"
+#include "../src/renderer/EditorOverlay.h"
+
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+
+#include <cmath>
+
+using namespace pt::renderer;
+
+namespace {
+
+constexpr int   kFbW    = 1920;
+constexpr int   kFbH    = 1080;
+constexpr float kAspect = float(kFbW) / float(kFbH);
+constexpr float kEps    = 1e-3f;
+
+Camera MakeCamera(glm::vec3 pos = {0.0f, 0.0f, 3.0f},
+                  float yaw = 0.0f, float pitch = 0.0f,
+                  float fov = 60.0f)
+{
+    Camera c;
+    c.pos     = pos;
+    c.yaw     = yaw;
+    c.pitch   = pitch;
+    c.fov_deg = fov;
+    return c;
+}
+
+}  // namespace
+
+TEST_CASE("ProjectToScreen round-trips via ScreenToWorldRay") {
+    Camera cam = MakeCamera();
+    // Point one unit in front of the camera (since fwd = -Z when
+    // yaw=pitch=0, the world-Z direction is -1 from cam.pos.z=3).
+    const glm::vec3 wp{0.0f, 0.0f, 0.0f};   // origin, 3 m in front of cam
+    glm::vec2 px;
+    REQUIRE(ProjectToScreen(wp, cam, kAspect, kFbW, kFbH, px));
+
+    // Centre of the screen because the point lies on the camera forward.
+    CHECK(px.x == doctest::Approx(kFbW * 0.5f).epsilon(0.005));
+    CHECK(px.y == doctest::Approx(kFbH * 0.5f).epsilon(0.005));
+
+    glm::vec3 ro{0.0f}, rd{0.0f};
+    REQUIRE(ScreenToWorldRay(cam, kAspect, kFbW, kFbH, px.x, px.y, ro, rd));
+    CHECK(ro.x == doctest::Approx(cam.pos.x).epsilon(kEps));
+    CHECK(ro.y == doctest::Approx(cam.pos.y).epsilon(kEps));
+    CHECK(ro.z == doctest::Approx(cam.pos.z).epsilon(kEps));
+    // Ray should head toward (0,0,0) from cam.pos: direction = -z.
+    CHECK(rd.z == doctest::Approx(-1.0f).epsilon(kEps));
+}
+
+TEST_CASE("ProjectToScreen returns false for points behind camera") {
+    Camera cam = MakeCamera();
+    // World point BEHIND the camera (cam at z=3, world point at z=10
+    // -- behind because forward = -Z).
+    const glm::vec3 behind{0.0f, 0.0f, 10.0f};
+    glm::vec2 px;
+    CHECK_FALSE(ProjectToScreen(behind, cam, kAspect, kFbW, kFbH, px));
+}
+
+TEST_CASE("ClosestPointOnLineToRay handles parallel rays gracefully") {
+    // Both lines along +X axis but at different Y heights.
+    glm::vec3 lo{0, 0, 0};
+    glm::vec3 ld{1, 0, 0};
+    glm::vec3 ro{1, 5, 0};
+    glm::vec3 rd{1, 0, 0};   // parallel
+    const glm::vec3 q = ClosestPointOnLineToRay(lo, ld, ro, rd);
+    // Degenerate fallback returns line_origin.
+    CHECK(q.x == doctest::Approx(lo.x));
+    CHECK(q.y == doctest::Approx(lo.y));
+    CHECK(q.z == doctest::Approx(lo.z));
+}
+
+TEST_CASE("ClosestPointOnLineToRay picks correct intersection") {
+    // Line: X axis through origin.
+    glm::vec3 lo{0, 0, 0};
+    glm::vec3 ld{1, 0, 0};
+    // Ray from above (high Y) pointing at the X=2 point on the X axis.
+    glm::vec3 ro{2, 5, 0};
+    glm::vec3 rd{0, -1, 0};
+    const glm::vec3 q = ClosestPointOnLineToRay(lo, ld, ro, rd);
+    CHECK(q.x == doctest::Approx(2.0f).epsilon(kEps));
+    CHECK(q.y == doctest::Approx(0.0f).epsilon(kEps));
+    CHECK(q.z == doctest::Approx(0.0f).epsilon(kEps));
+}
+
+TEST_CASE("EditorOverlay::HitTest detects axis under mouse") {
+    Camera cam = MakeCamera({0.0f, 0.0f, 3.0f});
+    const glm::vec3 origin{0.0f, 0.0f, 0.0f};
+    const float L = 1.0f;
+    EditorOverlay eo;
+
+    // Project the X-axis tip to screen so we know where to click.
+    glm::vec2 tip;
+    REQUIRE(ProjectToScreen(origin + glm::vec3(L, 0, 0),
+                            cam, kAspect, kFbW, kFbH, tip));
+    glm::vec2 base;
+    REQUIRE(ProjectToScreen(origin, cam, kAspect, kFbW, kFbH, base));
+    // Click halfway down the arm.
+    const glm::vec2 mid = (base + tip) * 0.5f;
+    auto axis = eo.HitTest(origin, L, cam, kAspect, kFbW, kFbH,
+                           mid.x, mid.y, 10.0f);
+    CHECK(axis == EditorOverlay::Axis::X);
+
+    // Click far from any axis -> no hit.
+    auto miss = eo.HitTest(origin, L, cam, kAspect, kFbW, kFbH,
+                           10.0, 10.0, 10.0f);
+    CHECK(miss == EditorOverlay::Axis::None);
+}
+
+TEST_CASE("EditorOverlay drag moves origin along the chosen axis only") {
+    Camera cam = MakeCamera({0.0f, 0.0f, 3.0f});
+    const glm::vec3 origin{0.0f, 0.0f, 0.0f};
+    const float L = 1.0f;
+    EditorOverlay eo;
+
+    // Begin drag at the X axis midpoint.
+    glm::vec2 tip;  glm::vec2 base;
+    REQUIRE(ProjectToScreen(origin + glm::vec3(L, 0, 0),
+                            cam, kAspect, kFbW, kFbH, tip));
+    REQUIRE(ProjectToScreen(origin, cam, kAspect, kFbW, kFbH, base));
+    const glm::vec2 mid = (base + tip) * 0.5f;
+    eo.BeginDrag(EditorOverlay::Axis::X, origin, cam, kAspect,
+                 kFbW, kFbH, mid.x, mid.y);
+    REQUIRE(eo.IsDragging());
+    REQUIRE(eo.DragAxis() == EditorOverlay::Axis::X);
+
+    // Move the mouse 100 px to the right along the X arm projection.
+    // We sample BeginDrag's anchor point in screen, push it 100 px
+    // along the arm's projected direction.
+    glm::vec2 arm_dir = glm::normalize(tip - base);
+    glm::vec2 new_mouse = mid + arm_dir * 100.0f;
+    glm::vec3 moved = eo.UpdateDrag(cam, kAspect, kFbW, kFbH,
+                                    new_mouse.x, new_mouse.y);
+
+    // Drag must keep Y and Z pinned -- only X moves.
+    CHECK(moved.y == doctest::Approx(0.0f).epsilon(kEps));
+    CHECK(moved.z == doctest::Approx(0.0f).epsilon(kEps));
+    // X delta should be non-zero in the direction of the drag.
+    CHECK(moved.x > kEps);
+}
+
+TEST_CASE("EditorOverlay segment count differs by mode") {
+    EditorOverlay eo;
+    const glm::vec3 origin{0.0f};
+    const float L = 1.0f;
+
+    eo.SetMode(EditorOverlay::Mode::Translate);
+    eo.ClearSegments();
+    eo.AppendGizmo(origin, L, EditorOverlay::Axis::None);
+    const std::uint32_t translate_n = eo.SegmentCount();
+    CHECK(translate_n > 0u);
+
+    eo.SetMode(EditorOverlay::Mode::Rotate);
+    eo.ClearSegments();
+    eo.AppendGizmo(origin, L, EditorOverlay::Axis::None);
+    const std::uint32_t rotate_n = eo.SegmentCount();
+    CHECK(rotate_n > 0u);
+    // Rotate gizmo draws ring polylines -- expect strictly more
+    // segments than the translate arrow triad.
+    CHECK(rotate_n > translate_n);
+
+    eo.SetMode(EditorOverlay::Mode::Scale);
+    eo.ClearSegments();
+    eo.AppendGizmo(origin, L, EditorOverlay::Axis::None);
+    const std::uint32_t scale_n = eo.SegmentCount();
+    CHECK(scale_n > 0u);
+}
+
+TEST_CASE("Hovered axis is yellow-tinted in segment colour") {
+    EditorOverlay eo;
+    eo.SetMode(EditorOverlay::Mode::Translate);
+    eo.ClearSegments();
+    eo.AppendGizmo(glm::vec3(0.0f), 1.0f, EditorOverlay::Axis::X);
+    // First segment is the X shaft. Highlighted == bright yellow.
+    REQUIRE(eo.SegmentCount() > 0);
+    const auto& s = eo.Segments()[0];
+    CHECK(s.color.r > 0.8f);
+    CHECK(s.color.g > 0.8f);
+    CHECK(s.color.b < 0.3f);
+}
+
+TEST_CASE("Segment GPU layout is 48 bytes (3 float4)") {
+    // Catches future reorderings that would silently corrupt the
+    // shader's segment iteration (the layout MUST match
+    // shaders/EditorOverlay.slang verbatim).
+    CHECK(sizeof(EditorOverlay::Segment) == 48u);
+}

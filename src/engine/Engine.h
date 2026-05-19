@@ -5,6 +5,7 @@
 #include "../app/Window.h"
 #include "../core/Jobs/JobSystem.h"
 #include "../renderer/AnalyticBvh.h"
+#include "../renderer/EditorOverlay.h"
 #include "../renderer/TriangleBvh.h"
 #include "../rhi/Types.h"
 #include "CaptureFormat.h"
@@ -266,6 +267,21 @@ private:
     void RegisterCommands();
     void RegisterCsgCommands();
     void RegisterPrimCommands();
+    // Editor 3D-transform gizmo console hooks (gizmo_mode, gizmo_select,
+    // r_editor_gizmo*, prim_set_radius). Registered AFTER PR #201's
+    // existing RegisterEditorCommands so both run on the same Init
+    // sweep; the two sets of commands don't collide. Distinct from
+    // RegisterEditorCommands() (which agent-20 owns for the React
+    // shell's panel_* commands) so the dependency direction stays
+    // explicit -- this method lives in Engine.cpp's editor-gizmo
+    // block, agent-20's RegisterEditorCommands stays in its block.
+    void RegisterEditorGizmoCommands();
+    // Per-frame work for the editor gizmo: read selection, build the
+    // segment list, run hit-test + drag math from polled input, upload
+    // to the GPU buffer. Called from RenderFrame BEFORE the gizmo
+    // dispatch so the buffer is populated by the time the kernel
+    // binds it. No-op when selected_kind_ != AnalyticPrim.
+    void UpdateEditorGizmoFrame();
     // Named camera bookmark commands (cam_save_named / cam_load_named /
     // cam_list_bookmarks / cam_delete_bookmark). Split out from
     // RegisterCommands so the unit test can wire just these (the full
@@ -826,6 +842,35 @@ private:
     std::uint64_t                               perfoverlay_pipeline_id_ = 0;
     std::uint64_t                               perfoverlay_drawlist_id_ = 0;
     std::uint32_t                               perfoverlay_drawlist_capacity_ = 0;
+
+    // ---- Editor 3D-transform gizmo (issue: editor 3D gizmos) ----------------
+    // Pipeline + storage buffer for the world-space gizmo line list the
+    // EditorOverlay.slang kernel rasterizes onto the swapchain. The
+    // segment buffer is sized to a generous worst case (the rotate
+    // gizmo's 3 rings @ 32 segments + safety margin -- ~256 segments
+    // max -> 12 KB upload); only the prefix of `editor_gizmo_segs_count`
+    // entries is consumed by the shader, so dispatch with selection off
+    // is free apart from the cleared-segment write.
+    //
+    // editor_gizmo_ owns the geometry-build + hit-test math; the engine
+    // just shovels its segment list into the GPU buffer each frame the
+    // gizmo is active. Selection state lives on `selected_prim_id_` /
+    // `selected_kind_` (declared below in the editor block contributed
+    // by PR #201 / agent-19); the gizmo gates on selected_kind_ ==
+    // SelectionKind::AnalyticPrim so future Csg/Sdf selections cleanly
+    // don't fire the analytic-only gizmo path.
+    pt::renderer::EditorOverlay                 editor_gizmo_;
+    std::uint64_t                               editor_overlay_pipeline_id_ = 0;
+    std::uint64_t                               editor_overlay_segs_buf_id_ = 0;
+    std::uint32_t                               editor_overlay_segs_buf_capacity_ = 0;
+    // Mouse-button-1 edge detect for click + drag. True one frame
+    // after LMB transitions down->up; lets us start drags on the
+    // press edge, not on every frame LMB stays down.
+    bool                                        prev_lmb_down_ = false;
+    // Pre-drag origin captured in BeginDrag; restored on Esc-during-drag.
+    glm::vec3                                   editor_drag_pre_pos_ { 0.0f };
+    // ---- end Editor gizmo ---------------------------------------------------
+
     std::uint64_t                               autoexpose_pipeline_id_ = 0;
     std::uint64_t                               accum_texture_id_      = 0;
     // GPU-side exposure scalar: AutoExposure.slang updates this when

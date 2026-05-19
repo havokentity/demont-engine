@@ -182,6 +182,14 @@ public:
     // EndFrame uploads it to the Metal drawable instead.
     void StashClear(float r, float g, float b, float a);
 
+    // CPU port of shaders/EditorOverlay.slang. Projects the engine-
+    // uploaded gizmo line list (engine buffer slot 1) onto the
+    // slot-0 output texture, anti-aliasing thin lines via per-pixel
+    // distance-to-segment. Push constants follow the same layout as
+    // the Slang push (camera basis + segment count); see
+    // SoftwareDevice.cpp's implementation for the parsing detail.
+    void RunEditorOverlay(SoftwareCommandBuffer& cb);
+
     // Internals used by SoftwareCommandBuffer + SoftwareTracer.
     SoftwarePipeline* GetPipeline(PipelineHandle h);
     BackedBuffer*     GetBuffer(BufferHandle h);
