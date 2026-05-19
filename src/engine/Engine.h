@@ -128,6 +128,14 @@ public:
         // per frame in StepPhysics before writing the new curr_pos.
         // Unused for plane primitives (infinite extent never moves).
         float    prev_pos_or_n[3] {0, 0, 0};
+        // Per-prim radiant emission (#181 polish). Units: W/sr per channel,
+        // consistent with AnalyticLight::intensity for point/spot lights
+        // (PR #185 photometric work). Default (0,0,0) -- non-emissive,
+        // bit-for-bit identical to the pre-emission HEAD. When non-zero,
+        // PathTrace.slang's hit handler adds throughput * emission to
+        // radiance BEFORE the BRDF eval, matching the additive-emitter
+        // pattern used for emissive sphere/quad area lights.
+        float    emission[3] {0, 0, 0};
     };
 
     // Analytic light primitive (#73). First-class scene light source for

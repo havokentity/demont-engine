@@ -528,10 +528,16 @@ finite-diff both linear and angular velocities at substep end.
 
 **Cvars added:** None new (reuses Phase 1 family).
 
-**New console commands:** `phys_drop_sphere <x> <y> <z> [r] [m] [red green blue]`,
-`phys_drop_box <x> <y> <z> <hx> <hy> <hz> [m] [red green blue]`. The
-trailing RGB triplet is the #181 colored-rigid-body extension; omit it to
-get the pre-#181 warm-grey sphere / cool-blue box defaults.
+**New console commands:** `phys_drop_sphere <x> <y> <z> [r] [m] [red green blue] [emit_r emit_g emit_b]`,
+`phys_drop_box <x> <y> <z> <hx> <hy> <hz> [m] [red green blue] [emit_r emit_g emit_b]`.
+The trailing RGB triplet is the #181 colored-rigid-body extension (omit
+to get the pre-#181 warm-grey sphere / cool-blue box defaults); the
+trailing emission triplet is the #181-polish emissive-rigid-body
+extension (units W/sr per channel, consistent with AnalyticLight
+intensity from PR #185, omit to get a non-emissive body). E.g.
+`phys_drop_sphere 0 5 0 0.3 1.0 1.0 0.0 0.0 5.0 5.0 5.0` spawns a red
+diffuse sphere with 5 W/sr per-channel white-emissive glow that
+illuminates nearby surfaces via the bounce path.
 
 **Test fixtures:**
 - `tests/goldens/scenes/phys_rb_smoke.cfg`

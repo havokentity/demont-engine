@@ -1011,34 +1011,54 @@ struct HitInfo {
     float3 albedo;
     float  roughness;
     float  ior;
+    // Per-prim radiant emission (W/sr per channel). Populated by
+    // testAnalyticPrim from primitives[idx*5 + 4].xyz (stride bumped
+    // to 5 float4s after #85 motion-blur added v3=prev_pos and #181
+    // polish added v4=emission). Mesh / SDF hit paths reset this to 0
+    // on overwrite -- emission is currently only sourced from
+    // analytic-prim hits (#181 polish: emissive rigid bodies via
+    // phys_drop_* emission args). The per-bounce loop adds
+    // `throughput * h.emission` to radiance BEFORE BRDF eval, matching
+    // the additive-emitter pattern used for emissive sphere/quad area
+    // lights.
+    float3 emission;
 };
 
-// Test a single analytic primitive at `primitives[idx*4 + 0..3]` against
+// Test a single analytic primitive at `primitives[idx*5 + 0..4]` against
 // (ro, rd) and update `h` if it's a closer hit. Centralizes the per-prim
 // dispatch so the linear-loop and BVH-leaf paths share one body.
 //
-// Motion blur (#85): the primitive stride is 4 float4s (16 floats),
-// with v3.xyz holding prev_pos_or_n (last frame's sphere center). The
-// `shutter_t01` parameter is the per-ray shutter sample in [0, 1] --
-// 0 = sample at start of shutter (== prev_pos), 1 = sample at end of
-// shutter (== curr_pos = v0.xyz). When the host's motion-blur master
-// gate is off it forces shutter_t01 = 1.0 at every call site so the
-// sphere center collapses to v0.xyz exactly (legacy rendering path).
-// Planes don't move so they ignore the shutter-time param.
+// Stride is 5 float4s (20 floats) after #85 (motion blur, v3=prev_pos)
+// and #181 polish (emission, v4):
+//   v0 = pos / radius   v1 = albedo / roughness   v2 = type/mat/ior
+//   v3 = prev_pos / pad (motion blur)
+//   v4 = emission / pad (self-emissive rigid bodies)
+// Must stay in sync with Engine.cpp's kFloatsPerPrim = 20.
+//
+// Motion blur (#85): `shutter_t01` is the per-ray shutter sample in
+// [0, 1] -- 0 = start of shutter (== prev_pos), 1 = end (== curr_pos =
+// v0.xyz). When the host's motion-blur gate is off it forces
+// shutter_t01 = 1.0 so the sphere center collapses to v0.xyz
+// (bit-identical to pre-#85 behaviour). Planes don't move so they
+// ignore the shutter-time param.
+//
+// Emission (#181 polish): v4.rgb feeds h.emission unconditionally;
+// non-emissive prims have v4.rgb == 0 so the cost is just one load.
+// The per-bounce loop adds throughput * h.emission to radiance BEFORE
+// BRDF eval.
 void testAnalyticPrim(uint idx, float3 ro, float3 rd, float shutter_t01, inout HitInfo h) {
-    float4 v0 = primitives[idx * 4u + 0u];
-    float4 v1 = primitives[idx * 4u + 1u];
-    float4 v2 = primitives[idx * 4u + 2u];
-    float4 v3 = primitives[idx * 4u + 3u];
+    float4 v0 = primitives[idx * 5u + 0u];
+    float4 v1 = primitives[idx * 5u + 1u];
+    float4 v2 = primitives[idx * 5u + 2u];
+    float4 v3 = primitives[idx * 5u + 3u];
+    float4 v4 = primitives[idx * 5u + 4u];
     uint type = uint(v2.x);
     float t;
     if (type == PRIM_SPHERE) {
         // Lerp from prev_pos (v3.xyz) toward curr_pos (v0.xyz) at the
-        // shutter-time sample. When motion_blur_params.x == 0 the host
-        // forces shutter_t01 to 1.0 so the lerp collapses to v0.xyz
-        // (bit-identical to pre-#85 behaviour). When motion_blur is on
-        // the engine snapshots curr -> prev once per StepPhysics tick
-        // so the per-frame displacement is encoded in (v0.xyz - v3.xyz).
+        // shutter-time sample. The engine snapshots curr -> prev once
+        // per StepPhysics tick so the per-frame displacement is encoded
+        // in (v0.xyz - v3.xyz).
         float3 sphere_center = lerp(v3.xyz, v0.xyz, shutter_t01);
         if (intersectSphere(ro, rd, sphere_center, v0.w, t) && t < h.t) {
             h.hit = true; h.t = t;
@@ -1047,6 +1067,7 @@ void testAnalyticPrim(uint idx, float3 ro, float3 rd, float shutter_t01, inout H
             h.albedo = v1.rgb;
             h.roughness = v1.a;
             h.ior = v2.z;
+            h.emission = v4.rgb;
         }
     } else if (type == PRIM_PLANE) {
         if (intersectPlane(ro, rd, v0.xyz, v0.w, t) && t < h.t) {
@@ -1056,6 +1077,7 @@ void testAnalyticPrim(uint idx, float3 ro, float3 rd, float shutter_t01, inout H
             h.albedo = v1.rgb;
             h.roughness = v1.a;
             h.ior = v2.z;
+            h.emission = v4.rgb;
         }
     }
 }
@@ -1176,6 +1198,10 @@ void traceSdfClusters(float3 ro, float3 rd, inout HitInfo h) {
                     h.albedo    = c.albedo;
                     h.roughness = c.roughness;
                     h.ior       = c.ior;
+                    // SDF doesn't source emission; clear so a previous
+                    // analytic-prim hit's emission doesn't leak through
+                    // when this fractal hit lands closer.
+                    h.emission  = float3(0.0);
                 }
             }
             continue;
@@ -1194,6 +1220,8 @@ void traceSdfClusters(float3 ro, float3 rd, inout HitInfo h) {
                 h.albedo    = c.albedo;
                 h.roughness = c.roughness;
                 h.ior       = c.ior;
+                // SDF doesn't source emission -- see fractal branch above.
+                h.emission  = float3(0.0);
             }
         }
     }
@@ -1219,13 +1247,23 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01) {
     h.hit = false; h.t = 1e30;
     h.normal = float3(0,1,0); h.mat = MAT_LAMBERT;
     h.albedo = float3(0.5); h.roughness = 0.0; h.ior = 1.0;
+    // Default emission is zero (non-emissive). testAnalyticPrim
+    // overwrites this from v4.rgb (#181 polish slot) when a closer
+    // prim hit lands; non-analytic hit paths (mesh, SDF, fractal)
+    // explicitly reset to zero on overwrite since they don't source
+    // emission. Initialising here avoids a stale-emission leak from
+    // a previous frame's HitInfo -- HitInfo is stack-local but the
+    // field MUST start at 0 so a miss + later overwrite by a
+    // non-emissive hit doesn't keep a stale glow.
+    h.emission = float3(0.0);
 
-    // Analytic primitives. Motion blur (#85): each occupies 4 consecutive
-    // float4s in `primitives`:
+    // Analytic primitives. Each occupies 5 consecutive float4s in
+    // `primitives` after #85 (motion blur) + #181 polish (emission):
     //   v0 = (xyz: center (current frame) / plane normal,  w: radius / d)
     //   v1 = (rgb: albedo,           a: roughness)
     //   v2 = (x: type,  y: material, z: ior, w: pad)
     //   v3 = (xyz: prev_pos_or_n (sphere center at previous frame), w: pad)
+    //   v4 = (xyz: emission (W/sr per channel),                     w: pad)
     //
     // The host partitions the buffer at upload time so the first
     // `linear_prim_count` entries are infinite-extent prims (planes)
@@ -1338,6 +1376,10 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01) {
                 h.albedo = MESH_ALBEDO;
                 h.roughness = 0.05;
                 h.ior = 1.0;
+                // Mesh path doesn't source emission -- clear so a prior
+                // analytic-prim hit's emission doesn't leak through when
+                // this mesh hit is closer.
+                h.emission = float3(0.0);
             }
         }
     } else
@@ -1443,6 +1485,9 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01) {
             h.albedo = MESH_ALBEDO;
             h.roughness = 0.05;
             h.ior = 1.0;
+            // SW mesh path doesn't source emission either -- clear for
+            // the same reason as the HW path above.
+            h.emission = float3(0.0);
         }
     }
     return h;
@@ -3876,6 +3921,24 @@ void main(uint2 tid : SV_DispatchThreadID) {
         float3 hit_pt = ro + rd * h.t;
         float  ndi = dot(h.normal, rd);
         float3 nf  = (ndi < 0.0) ? h.normal : -h.normal;
+
+        // Per-prim emission (#181 polish). h.emission is sourced from
+        // primitives[idx*5 + 4].xyz in testAnalyticPrim, units W/sr per
+        // channel. Adds `throughput * emission` BEFORE the BRDF eval so
+        // the body itself glows AND illuminates nearby surfaces via
+        // bounce-sampled rays that land on it. Camera-ray (b==0) hits
+        // get full unclamped emission; bounce-ray (b>0) hits go through
+        // clampIndirect to kill firefly contributions from tiny bright
+        // emitters that bounce rays happen to land on after a Lambert
+        // surface (the high-variance estimator). Zero emission is the
+        // default; non-emissive prims pay just one float3 add per hit.
+        if (any(h.emission > float3(0.0))) {
+            if (b == 0u) {
+                radiance += throughput * h.emission;
+            } else {
+                radiance += clampIndirect(throughput * h.emission);
+            }
+        }
 
         if (h.mat == MAT_LAMBERT) {
             // --- Analytic light primitives NEE (#73 / ReSTIR #78) -------
