@@ -9290,6 +9290,18 @@ void Engine::SetSelection(SelectionKind kind, std::uint32_t id) {
     }
 }
 
+void Engine::BroadcastSceneDirty() {
+    // Wave-5 polish: editor clients (scene-hierarchy, inspector, etc)
+    // re-fetch via list_scene on this event. Payload is a single
+    // tombstone object rather than a per-prim diff so server-side
+    // state stays O(1) per mutation regardless of how many editor
+    // clients are connected. No-op when no ConsoleServer is bound
+    // (e.g. headless --smoke-frames builds).
+    if (server_) {
+        server_->BroadcastEvent("scene_dirty", "{}");
+    }
+}
+
 void Engine::HandleMouseInput() {
     // Bail if any prerequisite isn't satisfied. We also reset the
     // edge-detect latch so releasing the gating condition (closing the
@@ -13080,15 +13092,11 @@ void Engine::RegisterPrimCommands() {
         return true;
     };
 
-    auto broadcast_scene_dirty = [this]() {
-        if (server_) {
-            // Clients should re-fetch via list_scene; the payload is a
-            // single tombstone field rather than a per-prim diff so the
-            // server-side state stays O(1) per mutation regardless of
-            // how many editor clients are connected.
-            server_->BroadcastEvent("scene_dirty", "{}");
-        }
-    };
+    // Wave-5 polish: this used to be a local lambda. Promoted to an
+    // Engine member (BroadcastSceneDirty) so light_*, prim_set_radius,
+    // and any future mutator outside this function can also fire it.
+    // Local alias kept for in-function ergonomics.
+    auto broadcast_scene_dirty = [this]() { BroadcastSceneDirty(); };
 
     C.RegisterCommand("prim_set_pos",
         "prim_set_pos <id> <x> <y> <z>: move a primitive (sphere center or "
@@ -13506,7 +13514,92 @@ void Engine::RegisterEditorGizmoCommands() {
             it->second.radius_or_d = r;
             primitives_dirty_ = true;
             accum_dirty_      = true;
+            BroadcastSceneDirty();
             out.FormatLine("primitives: id {} radius -> {:.3f}", id, r);
+        });
+
+    // --- prim_set_plane_d -----------------------------------------------
+    // Inspector "plane d" field stays disabled until this exists. Lets
+    // the user slide a water/floor plane along its normal without
+    // re-creating it. For a plane with normal n and d the plane
+    // equation is n.p + d = 0, so increasing d moves the plane in the
+    // -n direction (toward negative-y for a y-up floor).
+    C.RegisterCommand("prim_set_plane_d",
+        "prim_set_plane_d <id> <d>: set the d coefficient of an analytic "
+        "plane primitive (plane eq: n.p + d = 0). Used by the editor "
+        "inspector to slide a plane along its normal.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 2) {
+                out.PrintLine("usage: prim_set_plane_d <id> <d>");
+                return;
+            }
+            std::uint32_t id = 0;
+            float d = 0.0f;
+            if (!ParseUint(args[0], id) || !ParseFloat(args[1], d)) {
+                out.PrintLine("prim_set_plane_d: arg parse failed");
+                return;
+            }
+            auto it = primitives_.find(id);
+            if (it == primitives_.end()) {
+                out.FormatLine("prim_set_plane_d: id {} not found", id);
+                return;
+            }
+            if (it->second.type != AnalyticPrim::Plane) {
+                out.FormatLine("prim_set_plane_d: id {} is not a plane", id);
+                return;
+            }
+            it->second.radius_or_d = d;
+            primitives_dirty_ = true;
+            accum_dirty_      = true;
+            BroadcastSceneDirty();
+            out.FormatLine("primitives: id {} plane.d -> {:.3f}", id, d);
+        });
+
+    // --- cam_warp_to ------------------------------------------------------
+    // Editor "Goto" button -> nice framing of the selected prim without
+    // the cam_slot_9 hack agent-22 was using. Snaps the camera to a
+    // pleasant viewing position: 3 units back + 1 unit up from the
+    // prim, looking down ~15 degrees. Pure snap, no tween (could be
+    // animated in a follow-up but snap is responsive + obvious).
+    C.RegisterCommand("cam_warp_to",
+        "cam_warp_to <prim_id>: snap the camera to frame an analytic "
+        "primitive. Editor 'Goto' button calls this.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 1) {
+                out.PrintLine("usage: cam_warp_to <prim_id>");
+                return;
+            }
+            std::uint32_t id = 0;
+            if (!ParseUint(args[0], id)) {
+                out.PrintLine("cam_warp_to: id parse failed");
+                return;
+            }
+            auto it = primitives_.find(id);
+            if (it == primitives_.end()) {
+                out.FormatLine("cam_warp_to: id {} not found", id);
+                return;
+            }
+            const auto& p = it->second;
+            if (!camera_) {
+                out.PrintLine("cam_warp_to: camera not initialised");
+                return;
+            }
+            // For spheres frame at radius * 4 distance; for planes use a
+            // nominal 4-unit back-off (plane is infinite, framing is
+            // arbitrary -- just place the camera somewhere it can see
+            // the plane normal end-on).
+            float dist = (p.type == AnalyticPrim::Sphere)
+                       ? std::max(p.radius_or_d * 4.0f, 2.0f)
+                       : 4.0f;
+            camera_->pos = glm::vec3(p.pos_or_n[0],
+                                     p.pos_or_n[1] + dist * 0.25f,
+                                     p.pos_or_n[2] + dist);
+            camera_->yaw      = 0.0f;
+            camera_->pitch    = glm::radians(-15.0f);
+            camera_->ClampPitch();
+            accum_dirty_ = true;
+            out.FormatLine("cam_warp_to: framed prim id {} at distance {:.2f}",
+                           id, dist);
         });
 }
 
@@ -15392,6 +15485,7 @@ void Engine::RegisterLightCommands() {
             light_prims_.clear();
             light_prims_dirty_ = true;
             accum_dirty_       = true;
+            BroadcastSceneDirty();
             out.PrintLine("lights: cleared");
         });
 
@@ -15407,6 +15501,7 @@ void Engine::RegisterLightCommands() {
             }
             light_prims_dirty_ = true;
             accum_dirty_       = true;
+            BroadcastSceneDirty();
             out.FormatLine("lights: removed id {}", id);
         });
 
@@ -15432,6 +15527,7 @@ void Engine::RegisterLightCommands() {
             light_prims_[id] = L;
             light_prims_dirty_ = true;
             accum_dirty_       = true;
+            BroadcastSceneDirty();
             out.FormatLine("lights: point id={} pos=({:.2f} {:.2f} {:.2f})", id, x, y, z);
         });
 
@@ -15470,6 +15566,7 @@ void Engine::RegisterLightCommands() {
             light_prims_[id] = L;
             light_prims_dirty_ = true;
             accum_dirty_       = true;
+            BroadcastSceneDirty();
             out.FormatLine("lights: spot id={} pos=({:.2f} {:.2f} {:.2f}) dir=({:.2f} {:.2f} {:.2f}) outer={:.1f} inner={:.1f}",
                            id, x, y, z, dx, dy, dz, outer_deg, inner_deg);
         });
@@ -15499,6 +15596,7 @@ void Engine::RegisterLightCommands() {
             light_prims_[id] = L;
             light_prims_dirty_ = true;
             accum_dirty_       = true;
+            BroadcastSceneDirty();
             out.FormatLine("lights: sphere id={} pos=({:.2f} {:.2f} {:.2f}) r={:.3f}", id, x, y, z, radius);
         });
 
@@ -15548,6 +15646,7 @@ void Engine::RegisterLightCommands() {
             light_prims_[id] = L;
             light_prims_dirty_ = true;
             accum_dirty_       = true;
+            BroadcastSceneDirty();
             out.FormatLine("lights: quad id={} pos=({:.2f} {:.2f} {:.2f}) n=({:.2f} {:.2f} {:.2f}) u_half={} v_half={}",
                            id, x, y, z, nx, ny, nz, uh, vh);
         });
@@ -15593,6 +15692,7 @@ void Engine::RegisterLightCommands() {
             light_prims_[id] = L;
             light_prims_dirty_ = true;
             accum_dirty_       = true;
+            BroadcastSceneDirty();
             out.FormatLine("lights: point id={} pos=({:.2f} {:.2f} {:.2f}) intensity*color=({:.3f} {:.3f} {:.3f}) W/sr",
                            id, x, y, z, L.intensity[0], L.intensity[1], L.intensity[2]);
         });
@@ -15627,6 +15727,7 @@ void Engine::RegisterLightCommands() {
             light_prims_[id] = L;
             light_prims_dirty_ = true;
             accum_dirty_       = true;
+            BroadcastSceneDirty();
             out.FormatLine("lights: point id={} pos=({:.2f} {:.2f} {:.2f}) {:.2f} cd -> color*({:.6f}) W/sr",
                            id, x, y, z, cd, wsr);
         });
@@ -15662,6 +15763,7 @@ void Engine::RegisterLightCommands() {
             light_prims_[id] = L;
             light_prims_dirty_ = true;
             accum_dirty_       = true;
+            BroadcastSceneDirty();
             out.FormatLine("lights: point id={} pos=({:.2f} {:.2f} {:.2f}) {:.2f} lm -> color*({:.6f}) W/sr",
                            id, x, y, z, lm, wsr);
         });
@@ -15697,6 +15799,7 @@ void Engine::RegisterLightCommands() {
             light_prims_[id] = L;
             light_prims_dirty_ = true;
             accum_dirty_       = true;
+            BroadcastSceneDirty();
             out.FormatLine("lights: point id={} pos=({:.2f} {:.2f} {:.2f}) intensity={:.3f} W/sr ev={:+.2f} -> color*({:.6f}) W/sr",
                            id, x, y, z, intens, ev, scale);
         });
@@ -15734,6 +15837,7 @@ void Engine::RegisterLightCommands() {
         light_prims_[id] = L;
         light_prims_dirty_ = true;
         accum_dirty_       = true;
+        BroadcastSceneDirty();
         out.FormatLine("lights: spot id={} pos=({:.2f} {:.2f} {:.2f}) dir=({:.2f} {:.2f} {:.2f}) outer={:.1f} inner={:.1f} intensity*color/sr=({:.3f} {:.3f} {:.3f})",
                        id, x, y, z, dx, dy, dz, outer_deg, inner_deg,
                        L.intensity[0], L.intensity[1], L.intensity[2]);
@@ -15837,6 +15941,7 @@ void Engine::RegisterLightCommands() {
         light_prims_[id] = L;
         light_prims_dirty_ = true;
         accum_dirty_       = true;
+        BroadcastSceneDirty();
         out.FormatLine("lights: sphere id={} pos=({:.2f} {:.2f} {:.2f}) r={:.3f} radiance*color=({:.3f} {:.3f} {:.3f}) W/m^2/sr",
                        id, x, y, z, radius,
                        L.intensity[0], L.intensity[1], L.intensity[2]);
@@ -15928,6 +16033,7 @@ void Engine::RegisterLightCommands() {
         light_prims_[id] = L;
         light_prims_dirty_ = true;
         accum_dirty_       = true;
+        BroadcastSceneDirty();
         out.FormatLine("lights: quad id={} pos=({:.2f} {:.2f} {:.2f}) n=({:.2f} {:.2f} {:.2f}) u_half={} v_half={} radiance*color=({:.3f} {:.3f} {:.3f}) W/m^2/sr",
                        id, x, y, z, nx, ny, nz, uh, vh,
                        L.intensity[0], L.intensity[1], L.intensity[2]);

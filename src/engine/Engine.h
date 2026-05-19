@@ -140,6 +140,12 @@ public:
     SelectionKind  GetSelectionKind() const noexcept { return selected_kind_; }
     std::uint32_t  GetSelectionId()   const noexcept { return selected_prim_id_; }
     void SetSelection(SelectionKind kind, std::uint32_t id);
+    // Broadcast a scene_dirty WebSocket event so editor clients
+    // re-fetch via list_scene. Any console command that mutates
+    // primitives_ / light_prims_ / sdf_prims_ / rigid_bodies_ MUST
+    // call this after the mutation so editor panels stay in sync.
+    // No-op when no ConsoleServer is bound.
+    void BroadcastSceneDirty();
     // Read-only accessors live below the AnalyticPrim / AnalyticLight
     // struct definitions (their types are nested in Engine and not
     // visible here yet). See the second editor-backend block further
