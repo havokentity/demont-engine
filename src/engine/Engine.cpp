@@ -55,6 +55,7 @@
 #include <cmath>      // std::sqrt for cam-teleport detection
 #include <cstdlib>
 #include <ctime>
+#include <filesystem>  // list_assets: directory_iterator over assets/
 #include <numbers>
 #include <numeric>
 #include <sstream>    // std::istringstream for cam_load slot parsing
@@ -10918,6 +10919,85 @@ void Engine::RegisterCommands() {
         });
     // ---- end Favourites -----------------------------------------------
 
+    // list_assets <subdir> -- enumerate files under the workspace
+    // assets/ root (or, for the special key "scenes", the
+    // tests/goldens/scenes/ directory). Designed for the React
+    // asset-browser panel; emits one path per line so the web client
+    // can split on '\n' without parsing JSON. Hidden files (starting
+    // with '.') are skipped.
+    //
+    // Recognised subdirs:
+    //   hdri    -- assets/hdri (HDR environment maps)
+    //   meshes  -- assets/meshes (.obj etc; presently empty)
+    //   gltf    -- assets/gltf (.glb / .gltf imports)
+    //   scenes  -- tests/goldens/scenes (engine-shipped .cfg fixtures)
+    //   ""      -- top-level assets/ listing (mostly subdirs)
+    C.RegisterCommand("list_assets",
+        "list_assets <subdir>: list files under the workspace assets "
+        "root. Recognised subdirs: hdri | meshes | gltf | scenes. "
+        "Emits one path per line, relative to the workspace. Used by "
+        "the React asset-browser panel.",
+        [](auto args, pt::console::Output& out) {
+            std::string sub = args.empty() ? std::string{}
+                                           : std::string(args[0]);
+            // Normalise the subdir token to one of the recognised
+            // roots. We resolve relative to the CWD (the engine is
+            // typically launched from the repo root).
+            std::filesystem::path root;
+            if      (sub == "scenes") root = "tests/goldens/scenes";
+            else if (sub == "hdri")   root = "assets/hdri";
+            else if (sub == "meshes") root = "assets/meshes";
+            else if (sub == "gltf")   root = "assets/gltf";
+            else if (sub.empty())     root = "assets";
+            else {
+                out.FormatLine("list_assets: unknown subdir '{}'. "
+                               "Try: hdri | meshes | gltf | scenes", sub);
+                return;
+            }
+
+            std::error_code ec;
+            if (!std::filesystem::is_directory(root, ec)) {
+                out.FormatLine("list_assets: '{}' is not a directory",
+                               root.string());
+                return;
+            }
+
+            // Sort entries for deterministic output (the panel renders
+            // them as-is). directory_iterator is unspecified-order on
+            // every platform.
+            std::vector<std::string> entries;
+            for (const auto& e : std::filesystem::directory_iterator(root, ec)) {
+                if (ec) break;
+                const auto& p = e.path();
+                const auto name = p.filename().string();
+                if (name.empty() || name[0] == '.') continue;
+                // For the scenes subdir, restrict to .cfg / .toml.
+                // For hdri/meshes/gltf, keep the obvious extensions.
+                if (sub == "scenes") {
+                    const auto ext = p.extension().string();
+                    if (ext != ".cfg" && ext != ".toml") continue;
+                } else if (sub == "hdri") {
+                    if (p.extension() != ".hdr" &&
+                        p.extension() != ".exr") continue;
+                } else if (sub == "meshes") {
+                    const auto ext = p.extension().string();
+                    if (ext != ".obj" && ext != ".ply" &&
+                        ext != ".stl") continue;
+                } else if (sub == "gltf") {
+                    if (p.extension() != ".gltf" &&
+                        p.extension() != ".glb") continue;
+                }
+                entries.push_back(p.lexically_normal().generic_string());
+            }
+            std::sort(entries.begin(), entries.end());
+
+            for (const auto& s2 : entries) {
+                out.PrintLine(s2);
+            }
+            out.FormatLine("(list_assets: {} entries under '{}')",
+                           entries.size(), root.generic_string());
+        });
+
     C.RegisterCommand("scene_save",
         "scene_save <path.toml>: write camera + analytic primitives to a TOML file. (CSG state isn't saved yet -- put csg_* commands in autoexec.cfg if you want it to persist.)",
         [this](auto args, pt::console::Output& out) {
@@ -14094,6 +14174,29 @@ void Engine::RegisterEditorGizmoCommands() {
         "only allocated when the denoiser is active, so the kernel "
         "transparently falls back to always-on-top until that "
         "lifecycle plumbing lands).",
+        pt::console::CVAR_ARCHIVE);
+
+    // gizmo_snap / gizmo_space -- toolbar-driven gizmo behaviour
+    // (wave-7 #20). The drag dispatch in EditorOverlay reads these
+    // when present; if either is missing/empty the gizmo behaves the
+    // way it did before -- continuous drag in world space. Defaulting
+    // both to 'off' / 'world' keeps the existing behaviour intact for
+    // headless / golden runs.
+    C.RegisterCVar("gizmo_snap", "0",
+        "Editor gizmo snap-to-grid toggle. 1 = quantize the drag delta "
+        "to the nearest gizmo_snap_step world unit (default 0.1 m for "
+        "translate, 5 deg for rotate). 0 = continuous (default). "
+        "Wired by the wave-7 React toolbar.",
+        pt::console::CVAR_ARCHIVE);
+
+    C.RegisterCVar("gizmo_space", "world",
+        "Editor gizmo transform space: world | local. Currently a "
+        "metadata cvar consumed by the React toolbar's selector -- "
+        "the analytic-prim gizmo dispatch is world-space only; setting "
+        "this to 'local' is a no-op for spheres and planes. Reserved "
+        "for the rotation-aware gizmo path (#206 follow-up) which "
+        "needs to know whether the drag deltas live in object frame "
+        "or world frame.",
         pt::console::CVAR_ARCHIVE);
 
     // gizmo_select is a thin wrapper around the canonical

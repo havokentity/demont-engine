@@ -25,6 +25,7 @@ import { useEffect, useMemo, useRef, type ReactNode } from 'react';
 import { useSceneStore, bindClientToStore } from '../store';
 import { WebSocketClient } from '../ws-client';
 import { wsEndpoint } from '../endpoint';
+import { installEditorShortcuts } from '../keyboard';
 import { TitleBar } from './TitleBar';
 import { StatusBar, StatusCell } from './StatusBar';
 
@@ -39,6 +40,12 @@ export interface ShellProps {
   // panels should reach for `useSceneStore(...)` instead.
   withClient?: (client: WebSocketClient) => ReactNode;
   children?: ReactNode;
+  // When true, install the global keyboard shortcut handler
+  // (Cmd/Ctrl+Z = scene_undo, Cmd/Ctrl+Shift+Z = scene_redo,
+  // G / R / S = gizmo_mode). Default true; set to false if a panel
+  // wants to install its own bindings without the shell's
+  // interference.
+  installShortcuts?: boolean;
 }
 
 export function Shell({
@@ -46,6 +53,7 @@ export function Shell({
   extraTopics = [],
   withClient,
   children,
+  installShortcuts = true,
 }: ShellProps) {
   // The WebSocket client is created exactly once per panel. We hold
   // it in a ref so React strict mode's double-mount during dev
@@ -89,7 +97,16 @@ export function Shell({
       void fetchScene();
     });
 
+    // Global keyboard shortcuts (wave-7 #20): undo/redo + gizmo mode.
+    // Installed on every panel so a user with the inspector focused
+    // can still Cmd+Z to undo a hierarchy mutation. Opt-out via the
+    // installShortcuts prop.
+    const uninstallShortcuts = installShortcuts
+      ? installEditorShortcuts(client)
+      : () => { /* noop */ };
+
     return () => {
+      uninstallShortcuts();
       off();
       unbind();
       client.close();

@@ -54,9 +54,9 @@ Chrome --app window when spawned via the console (<code>panel_open &lt;name&gt;<
   <li><a href="/editor/inspector"><strong>Inspector</strong>
       <span>Property editor for the current selection</span></a></li>
   <li><a href="/editor/asset-browser"><strong>Asset Browser</strong>
-      <span>HDRIs, glTF, scene presets</span></a></li>
+      <span>Scenes, HDRIs, glTF imports -- click to load</span></a></li>
   <li><a href="/editor/toolbar"><strong>Toolbar</strong>
-      <span>Common console commands as buttons</span></a></li>
+      <span>Gizmo mode, undo/redo, snap, transform space</span></a></li>
 </ul>
 <footer>Console: <a href="/" style="color:#00f0ff">/</a></footer>
 </body></html>

@@ -32,3 +32,9 @@ export { StatusBar } from './components/StatusBar';
 export { Placeholder } from './components/Placeholder';
 
 export { wsEndpoint } from './endpoint';
+
+export {
+  installEditorShortcuts,
+  type ShortcutAction,
+  type InstallShortcutsOpts,
+} from './keyboard';
