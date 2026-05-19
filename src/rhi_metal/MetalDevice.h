@@ -140,18 +140,21 @@ private:
 
     // Push-constant buffer. Sized to fit the unified PathTrace push
     // plus growth headroom for upcoming features (DOF, MIS PDFs,
-    // bloom params, ...). PathTrace push is currently 1040 bytes after
-    // Wave 7 (#24) added the 16-byte `clouds_runtime` block at the tail;
-    // earlier this had to be bumped from 1024 to 2048 because the
-    // truncation silently zeroed the last 16 bytes and produced a
-    // black-frame regression on cloud-bearing scenes. 2048 leaves room
-    // for several more 16-byte blocks before another resize.
+    // bloom params, ...). PathTrace push is currently ~1056 bytes after
+    // Wave 7 (#24) added the 16-byte `clouds_runtime` block at the tail
+    // and Wave 7 (#21) added 32 bytes for mesh_motion_prev +
+    // mesh_motion_curr. Earlier this had to be bumped from 1024 to 2048
+    // because the truncation silently zeroed the last bytes and produced
+    // a black-frame regression on cloud-bearing scenes (#24) plus a
+    // mesh-motion-blur-silently-failing regression (#21). 2048 leaves
+    // room for several more 16-byte blocks before another resize.
     // PushConstants() silently truncates beyond this size, so when
     // adding push fields make sure the buffer is still big enough --
     // a too-small buffer manifests as the last fields being all-zero
-    // at runtime (e.g. DOF appearing to do nothing). Metal's setBytes
-    // accepts up to 4KB so bump as needed; check the C++ static_assert
-    // on sizeof(PtPush) and grow this in lockstep.
+    // (or pre-existing garbage) at runtime (e.g. DOF appearing to do
+    // nothing, mesh motion blur silently failing, clouds going black).
+    // Metal's setBytes accepts up to 4KB so bump as needed; check the
+    // C++ static_assert on sizeof(PtPush) and grow this in lockstep.
     std::uint8_t  push_buf_[2048] {};
     std::size_t   push_size_ = 0;
 };

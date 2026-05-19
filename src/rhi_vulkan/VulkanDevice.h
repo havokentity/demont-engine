@@ -89,12 +89,18 @@ private:
     BufferHandle   bound_buf_[16] {};
     std::size_t    bound_buf_off_[16] {};
     AccelStructHandle bound_accel_[4] {};
-    // Push-constant staging. Sized to fit the full PtPush (~448B today)
+    // Push-constant staging. Sized to fit the full PtPush (~1040B
+    // today, wave-7 #21 added mesh_motion_prev + mesh_motion_curr)
     // plus growth headroom so the engine can keep treating push as one
     // contiguous blob across backends. On SPIR-V, Dispatch byte-splits:
     // first kPushConstantSize bytes -> vkCmdPushConstants (within hw
     // limit), remainder -> per-frame Frame UBO at vk::binding(14, 0).
-    std::uint8_t   push_buf_[1024] {};
+    // PushConstants() silently truncates beyond this size, so when
+    // adding push fields make sure the buffer is still big enough --
+    // a too-small buffer manifests as the last fields being all-zero
+    // (or pre-existing garbage) at runtime. Mirrors the Metal-side
+    // push_buf_ sizing rationale in MetalDevice.h.
+    std::uint8_t   push_buf_[2048] {};
     std::size_t    push_size_ = 0;
 };
 

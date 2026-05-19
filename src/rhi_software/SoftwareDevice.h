@@ -124,7 +124,13 @@ public:
 
     PipelineHandle bound_pipeline{0};
     BindState      binds {};
-    std::uint8_t   push_constants_buf[768] {};   // PtPush is ~736B today
+    // PtPush is ~1040B today (wave-7 #21 added mesh_motion_prev +
+    // mesh_motion_curr two float4s). PushConstants() silently truncates
+    // beyond this size, so when adding push fields make sure the
+    // buffer stays big enough -- a too-small buffer manifests as the
+    // last fields reading as zero / garbage at runtime. Mirrors the
+    // Metal-side push_buf_ sizing rationale in MetalDevice.h.
+    std::uint8_t   push_constants_buf[2048] {};
     std::size_t    push_constants_size = 0;
 
 private:

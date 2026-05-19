@@ -3183,6 +3183,23 @@ void Engine::RebuildMeshResources(const pt::csg::BakedMesh& baked) {
     tri_bvh_ = pt::renderer::TriangleBvh{};
     mesh_tri_count_ = 0;
 
+    // Mesh motion blur (wave-7 #21): we intentionally do NOT zero
+    // mesh_curr_translation_ / mesh_prev_translation_ here. A bake
+    // replaces the vertex set in the *baked* (untransformed) frame;
+    // any world-space translation the user has applied via
+    // `mesh_step` / loaded scene state is independent of that frame
+    // and should survive a rebake (the alternative would teleport a
+    // moving mesh back to origin on every CSG topology edit, which
+    // is the opposite of what the user wants). Explicit reset is
+    // available via `mesh_motion_reset` for the cases where the user
+    // really does want a clean slate (e.g. starting a new test
+    // scene). The CSG bake itself is async (see EnsureMeshUpdated),
+    // which is why the no-reset rule matters in practice: a
+    // late-exec fixture that issues `mesh_step` immediately after
+    // Init would otherwise have its translation wiped by the
+    // bake-complete Tick.
+    (void)0;
+
     const std::size_t vbytes = sizeof(float) * baked.positions.size();
     const std::size_t ibytes = sizeof(std::uint32_t) * baked.indices.size();
     auto vbuf = device_->CreateBuffer({
@@ -6504,6 +6521,47 @@ void Engine::RenderFrame() {
         //              (e.g. half-res mode, temporal toggle).
         std::uint32_t clouds_runtime[4];
         // --- end Clouds dual-mode ----------------------------------------
+        // --- Mesh motion blur (wave-7 #21, follow-up to PR #85) ---------
+        // The baked CSG / glTF mesh sits in its untransformed "rest"
+        // frame (world origin for the canonical CSG demo bake). The
+        // engine carries two per-mesh world-space translations:
+        //   mesh_motion_prev.xyz  -- where the mesh was last frame
+        //   mesh_motion_curr.xyz  -- where the mesh is this frame
+        // The shader computes per-ray effective translation
+        //   effective(t01) = lerp(prev, curr, t01)
+        // and shifts the mesh ray origin by -effective(t01) before
+        // intersection at shutter sample t01 ∈ [0, 1]. This is
+        // mathematically equivalent to translating the baked mesh by
+        // +effective(t01), but stays compatible with the existing
+        // identity-transform TLAS so no per-frame BLAS / TLAS rebuild
+        // is required. Translation preserves normals so the existing
+        // ObjectToWorld normal pipeline on the HW path is unchanged
+        // (q.CommittedObjectToWorld4x3() stays identity).
+        //
+        // When r_motion_blur is off, the host forces shutter_t01 = 1.0
+        // in PathTrace.slang so effective() collapses to curr -- the
+        // mesh renders at its "current" world position with zero
+        // streak. When motion blur is on, t01 ~ U(0, 1) and the
+        // shader's stochastic shutter-time sampling produces the
+        // Cook-1984 streak between prev and curr.
+        //
+        //   mesh_motion_prev.xyz = prev_translation (world metres).
+        //   mesh_motion_prev.w   = mesh_motion_active flag (0/1).
+        //                          1.0 only when r_motion_blur != 0
+        //                          AND prev != curr (mesh moved this
+        //                          frame). When 0, the shader skips
+        //                          the shift entirely so static
+        //                          scenes pay zero overhead.
+        //   mesh_motion_curr.xyz = curr_translation (world metres).
+        //   mesh_motion_curr.w   = reserved.
+        //
+        // Two vec4 = 32 B. Layout collapses to a no-op on static
+        // scenes -- both prev and curr stay at (0, 0, 0) and the .w
+        // gate stays 0 so the shader's mesh branch is bit-identical
+        // to pre-#21.
+        float mesh_motion_prev[4];
+        float mesh_motion_curr[4];
+        // --- end Mesh motion blur ----------------------------------------
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -7502,6 +7560,7 @@ void Engine::RenderFrame() {
     // shader currently lerps over U(0,1) within the per-frame
     // prev/curr window (per-ray shutter weighting is a future hook --
     // see PtPush::motion_blur_params docstring above).
+    bool motion_blur_active_for_mesh = false;
     {
         bool motion_blur_on = false;
         if (auto* v = C.FindCVar("r_motion_blur")) motion_blur_on = v->GetBool();
@@ -7512,8 +7571,53 @@ void Engine::RenderFrame() {
         push.motion_blur_params[1] = shutter_s;
         push.motion_blur_params[2] = 0.0f;
         push.motion_blur_params[3] = 0.0f;
+        motion_blur_active_for_mesh = motion_blur_on;
     }
     // --- end Motion blur ---------------------------------------------------
+    // --- Mesh motion blur (wave-7 #21) -------------------------------------
+    // Pack the per-mesh world-space translations so PathTrace.slang can
+    // shift the ray origin by -lerp(prev, curr, t01) at each ray's
+    // shutter sample. The lerp factor t01 is computed in the shader
+    // (motion_blur_params.x gate forces it to 1.0 when motion blur is
+    // off so the static-scene case collapses to "render at curr").
+    //
+    // .w of mesh_motion_prev carries the motion_active gate: 1.0 only
+    // when r_motion_blur is on AND prev != curr. When 0, the shader's
+    // mesh branch skips the shift entirely (the baked mesh is at the
+    // origin and curr is also 0, so ro_mesh = ro is correct anyway --
+    // the gate is a perf hint).
+    {
+        const bool moved =
+            (mesh_prev_translation_[0] != mesh_curr_translation_[0]) ||
+            (mesh_prev_translation_[1] != mesh_curr_translation_[1]) ||
+            (mesh_prev_translation_[2] != mesh_curr_translation_[2]);
+        const bool translated =
+            (mesh_curr_translation_[0] != 0.0f) ||
+            (mesh_curr_translation_[1] != 0.0f) ||
+            (mesh_curr_translation_[2] != 0.0f) ||
+            (mesh_prev_translation_[0] != 0.0f) ||
+            (mesh_prev_translation_[1] != 0.0f) ||
+            (mesh_prev_translation_[2] != 0.0f);
+        // The shader's shift path runs whenever the mesh has been
+        // moved (translated != 0) OR is moving (moved). On a pure
+        // static scene both are false and the shader sees w == 0 and
+        // skips the shift entirely. On a "moved but not moving"
+        // scene (e.g. user issued `mesh_step 0.5 0 0` once and the
+        // mesh is rendered every frame at curr) prev == curr but
+        // translated is true -- we still need the shift to render
+        // the mesh at curr instead of at the baked origin.
+        const bool active =
+            (motion_blur_active_for_mesh && moved) || translated;
+        push.mesh_motion_prev[0] = mesh_prev_translation_[0];
+        push.mesh_motion_prev[1] = mesh_prev_translation_[1];
+        push.mesh_motion_prev[2] = mesh_prev_translation_[2];
+        push.mesh_motion_prev[3] = active ? 1.0f : 0.0f;
+        push.mesh_motion_curr[0] = mesh_curr_translation_[0];
+        push.mesh_motion_curr[1] = mesh_curr_translation_[1];
+        push.mesh_motion_curr[2] = mesh_curr_translation_[2];
+        push.mesh_motion_curr[3] = 0.0f;
+    }
+    // --- end Mesh motion blur ----------------------------------------------
     // --- Underwater medium tracking (Phase 4, #134) ------------------------
     // Pack:
     //   .x = 1.0 if camera position is inside any MAT_WATER plane's
@@ -7666,7 +7770,10 @@ void Engine::RenderFrame() {
     //   +16 Editor backend (#201/#210) — editor_params uvec4 (selected_prim_id,
     //                              r_editor_outline gate, selected_kind, _pad)
     //   +16 Clouds dual-mode (Wave 7, #24) — clouds_runtime uvec4 (mode, _,_,_)
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16);
+    //   +32 Mesh motion blur (#21 wave-7) — mesh_motion_prev + mesh_motion_curr,
+    //                              two vec4s: prev_translation.xyz + active flag,
+    //                              curr_translation.xyz + _pad
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 32);
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
     // cbuffer layout the Slang compiler applies to PathTrace.slang's
@@ -7748,6 +7855,13 @@ void Engine::RenderFrame() {
     // Clouds dual-mode block (Wave 7, #24).
     static_assert(offsetof(PtPush, clouds_runtime) % 16 == 0,
                   "PtPush::clouds_runtime must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    // Mesh motion blur block (wave-7 #21).
+    static_assert(offsetof(PtPush, mesh_motion_prev) % 16 == 0,
+                  "PtPush::mesh_motion_prev must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    static_assert(offsetof(PtPush, mesh_motion_curr) % 16 == 0,
+                  "PtPush::mesh_motion_curr must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
@@ -13891,6 +14005,75 @@ void Engine::RegisterCsgCommands() {
                            loaded->base_color_texture.Empty()
                                ? ""
                                : ", base color tex present (not yet rendered -- see #74)");
+        });
+
+    // Mesh motion blur (wave-7 #21). `mesh_step` advances the mesh's
+    // world-space translation by an absolute delta (metres) per
+    // physics tick / scripted update; the engine snapshots the
+    // previous translation FIRST so PathTrace.slang can lerp ray
+    // origins across the shutter window for proper Cook-1984
+    // streaks. Pure-translation rigid-body case only (rotation is
+    // out of scope for #21 -- see Engine.h's mesh_curr_translation_
+    // docstring). `mesh_motion_reset` clears prev == curr so static
+    // captures render with zero blur.
+    C.RegisterCommand("mesh_step",
+        "mesh_step <dx> <dy> <dz>: advance the mesh's world-space "
+        "translation by (dx, dy, dz) metres for this frame. The "
+        "previous translation is snapshotted FIRST so PathTrace.slang "
+        "lerps ray origins across the shutter window when r_motion_blur "
+        "is on. Pure translation -- rotation around the centroid is "
+        "out of scope for wave-7 #21.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 3) {
+                out.PrintLine("usage: mesh_step <dx> <dy> <dz>");
+                return;
+            }
+            float dx = 0.0f, dy = 0.0f, dz = 0.0f;
+            if (!ParseFloat(args[0], dx) ||
+                !ParseFloat(args[1], dy) ||
+                !ParseFloat(args[2], dz)) {
+                out.PrintLine("mesh_step: arg parse failed");
+                return;
+            }
+            // Snapshot curr -> prev BEFORE applying the delta so the
+            // resulting prev/curr pair brackets exactly one frame of
+            // motion. Mirrors the prev_pos_or_n snapshot pattern on
+            // the analytic-prim path (RbState::SnapshotPrev) -- one
+            // step of motion produces exactly one shutter window of
+            // streak.
+            mesh_prev_translation_[0] = mesh_curr_translation_[0];
+            mesh_prev_translation_[1] = mesh_curr_translation_[1];
+            mesh_prev_translation_[2] = mesh_curr_translation_[2];
+            mesh_curr_translation_[0] += dx;
+            mesh_curr_translation_[1] += dy;
+            mesh_curr_translation_[2] += dz;
+            accum_dirty_ = true;
+            out.FormatLine("mesh_step: prev=({:.4f} {:.4f} {:.4f}) curr=({:.4f} {:.4f} {:.4f}) delta=({:.4f} {:.4f} {:.4f})",
+                           mesh_prev_translation_[0], mesh_prev_translation_[1], mesh_prev_translation_[2],
+                           mesh_curr_translation_[0], mesh_curr_translation_[1], mesh_curr_translation_[2],
+                           dx, dy, dz);
+        });
+
+    C.RegisterCommand("mesh_motion_reset",
+        "mesh_motion_reset: zero the mesh's prev/curr world translations. "
+        "Static captures render with zero blur after this (the shader's "
+        "(prev - curr) shift collapses to identity). Does NOT bake the "
+        "current translation into the mesh -- subsequent mesh_step "
+        "commands resume from origin.",
+        [this](auto, pt::console::Output& out) {
+            mesh_prev_translation_[0] = mesh_prev_translation_[1] = mesh_prev_translation_[2] = 0.0f;
+            mesh_curr_translation_[0] = mesh_curr_translation_[1] = mesh_curr_translation_[2] = 0.0f;
+            accum_dirty_ = true;
+            out.PrintLine("mesh_motion_reset: prev/curr translations cleared");
+        });
+
+    C.RegisterCommand("mesh_pos",
+        "mesh_pos: print the mesh's prev / curr world-space translation "
+        "in metres (introspection / golden-cell verification helper).",
+        [this](auto, pt::console::Output& out) {
+            out.FormatLine("mesh_pos: prev=({:.4f} {:.4f} {:.4f}) curr=({:.4f} {:.4f} {:.4f})",
+                           mesh_prev_translation_[0], mesh_prev_translation_[1], mesh_prev_translation_[2],
+                           mesh_curr_translation_[0], mesh_curr_translation_[1], mesh_curr_translation_[2]);
         });
 }
 
