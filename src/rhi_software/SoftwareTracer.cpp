@@ -88,7 +88,7 @@ constexpr std::size_t kAccumParamsOffset = 720;
 constexpr std::uint32_t kPrimSphere = 0u;
 constexpr std::uint32_t kPrimPlane  = 1u;
 constexpr std::uint32_t kMatLambert = 0u;
-constexpr std::uint32_t kFloatsPerPrim = 16u;
+constexpr std::uint32_t kFloatsPerPrim = 20u;  // 5 float4s (motion blur v3 + emission v4)
 
 struct HitInfo {
     bool      hit = false;

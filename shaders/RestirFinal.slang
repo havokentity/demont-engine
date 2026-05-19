@@ -107,9 +107,13 @@ float shadowVis(float3 ro, float3 rd, float t_max) {
     // for shadow rays at MVP scale and avoids the BVH traversal code
     // duplication).
     for (uint i = 0u; i < prim_count; ++i) {
-        float4 v0 = primitives[i * 3u + 0u];
-        float4 v1 = primitives[i * 3u + 1u];
-        float4 v2 = primitives[i * 3u + 2u];
+        // Stride 5 float4s (was 3 pre-#85, 4 after motion-blur landed
+        // in PR #198, 5 after the #181 emissive followup added v4).
+        // Shadow-cast only needs v0/v2 -- v1/v3/v4 unread here -- but
+        // the stride must match the host's kFloatsPerPrim=20 layout.
+        float4 v0 = primitives[i * 5u + 0u];
+        float4 v1 = primitives[i * 5u + 1u];
+        float4 v2 = primitives[i * 5u + 2u];
         uint type = uint(v2.x);
         float t;
         if (type == PRIM_SPHERE) {

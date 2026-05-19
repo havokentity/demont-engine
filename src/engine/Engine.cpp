@@ -3459,14 +3459,19 @@ void Engine::EnsurePrimitivesUploaded() {
     if (!primitives_dirty_) return;
 
     const std::uint32_t count = static_cast<std::uint32_t>(primitives_.size());
-    // Motion blur (#85): each primitive now occupies 4 float4s (16 floats)
-    // instead of 3. The trailing float4 packs prev_pos_or_n (sphere center
-    // at the previous frame) so PathTrace.slang's testAnalyticPrim can
-    // lerp toward pos_or_n at the ray's shutter-time sample. Layout-only
-    // change for `r_motion_blur 0`: the shader's per-prim load now reads
-    // 4 float4s per prim, but the lerp factor collapses to 1.0 when
-    // motion blur is off so the rendered position is bit-identical.
-    constexpr std::uint32_t kFloatsPerPrim = 16;   // 4 float4s
+    // 5 float4s per prim (20 floats). Layout:
+    //   v0 = (xyz: pos_or_n,        w: radius_or_d)
+    //   v1 = (rgb: albedo,          a: roughness)
+    //   v2 = (x: type, y: material, z: ior, w: pad)
+    //   v3 = (xyz: prev_pos_or_n,   w: pad)            -- motion blur (#85)
+    //   v4 = (rgb: emission W/sr,   w: pad)            -- #181 emissive
+    // Bumped from 3 -> 4 when motion blur landed (#85, PR #198) for
+    // the prev_pos slot, then 4 -> 5 in the #181 emissive followup so
+    // emission can live in its own float4 instead of stealing v3.
+    // testAnalyticPrim in PathTrace.slang + the prim-stride scan in
+    // RestirFinal.slang BOTH read v3 (motion blur); PathTrace also
+    // reads v4 for emission -- keep host stride + shader strides in sync.
+    constexpr std::uint32_t kFloatsPerPrim = 20;   // 5 float4s
     constexpr std::uint32_t kBytesPerPrim  = sizeof(float) * kFloatsPerPrim;
 
     // Allocate / grow the storage buffer when needed. We grow by powers
@@ -3610,16 +3615,21 @@ void Engine::EnsurePrimitivesUploaded() {
         packed[off + 9]  = static_cast<float>(p.material);
         packed[off + 10] = p.ior;
         packed[off + 11] = 0.0f;
-        // Motion blur (#85). v3.xyz = prev_pos (last frame's center for
-        // spheres; same as pos_or_n for planes since planes don't move).
-        // The shader reads this when r_motion_blur != 0 to lerp the
-        // sphere center at the ray's shutter time. Layout collapses to
-        // a no-op when motion blur is off (the load happens but the
-        // lerp factor is forced to 1.0).
+        // v3 (slots 12..15): prev_pos + pad. Motion blur (#85) -- the
+        // shader lerps from prev_pos to pos_or_n at the ray's
+        // shutter-time sample. Initialized to pos_or_n so static prims
+        // produce a no-op lerp.
         packed[off + 12] = p.prev_pos_or_n[0];
         packed[off + 13] = p.prev_pos_or_n[1];
         packed[off + 14] = p.prev_pos_or_n[2];
         packed[off + 15] = 0.0f;
+        // v4 (slots 16..19): emission RGB + pad. #181 emissive
+        // followup. Default zero (non-emissive). Shader's hit handler
+        // adds radiance += throughput * emission.
+        packed[off + 16] = p.emission[0];
+        packed[off + 17] = p.emission[1];
+        packed[off + 18] = p.emission[2];
+        packed[off + 19] = 0.0f;
     };
     for (std::size_t i = 0; i < infinite_prims.size(); ++i) {
         pack_prim(i, *infinite_prims[i]);
@@ -13390,8 +13400,14 @@ void Engine::RegisterPhysicsCommands() {
             // Mass MUST be present before RGB so the parser never has to guess
             // whether arg[4] is mass or red -- this keeps the back-compat
             // shape `phys_drop_sphere x y z r m` exact.
-            if (args.size() < 3 || args.size() == 6 || args.size() == 7 || args.size() > 8) {
-                out.PrintLine("usage: phys_drop_sphere <x> <y> <z> [radius=0.3] [mass=1.0] [r g b]");
+            // Valid arg counts:
+            //   3..5  back-compat (no color, no emission)
+            //   8     xyz + r + m + albedo                              (#181)
+            //   11    xyz + r + m + albedo + emission                   (#181 emissive followup)
+            const auto n_args = args.size();
+            const bool valid_shape = (n_args >= 3 && n_args <= 5) || n_args == 8 || n_args == 11;
+            if (!valid_shape) {
+                out.PrintLine("usage: phys_drop_sphere <x> <y> <z> [radius=0.3] [mass=1.0] [r g b] [emit_r emit_g emit_b]");
                 return;
             }
             float x, y, z, radius = 0.3f, mass = 1.0f;
@@ -13399,6 +13415,7 @@ void Engine::RegisterPhysicsCommands() {
             // appearance so phys_drop_sphere with no color args renders
             // bit-for-bit identical to integration HEAD.
             float r_col = 0.85f, g_col = 0.80f, b_col = 0.70f;
+            float emit_r = 0.0f, emit_g = 0.0f, emit_b = 0.0f;
             if (!ParseFloat(args[0], x) || !ParseFloat(args[1], y) || !ParseFloat(args[2], z)) {
                 out.PrintLine("phys_drop_sphere: arg parse failed");
                 return;
@@ -13411,9 +13428,15 @@ void Engine::RegisterPhysicsCommands() {
                 out.PrintLine("phys_drop_sphere: bad mass");
                 return;
             }
-            if (args.size() == 8) {
+            if (n_args >= 8) {
                 if (!ParseFloat(args[5], r_col) || !ParseFloat(args[6], g_col) || !ParseFloat(args[7], b_col)) {
                     out.PrintLine("phys_drop_sphere: bad r/g/b");
+                    return;
+                }
+            }
+            if (n_args == 11) {
+                if (!ParseFloat(args[8], emit_r) || !ParseFloat(args[9], emit_g) || !ParseFloat(args[10], emit_b)) {
+                    out.PrintLine("phys_drop_sphere: bad emit_r/g/b");
                     return;
                 }
             }
@@ -13427,6 +13450,10 @@ void Engine::RegisterPhysicsCommands() {
             }
             if (r_col < 0.0f || g_col < 0.0f || b_col < 0.0f) {
                 out.PrintLine("phys_drop_sphere: rgb components must be >= 0");
+                return;
+            }
+            if (emit_r < 0.0f || emit_g < 0.0f || emit_b < 0.0f) {
+                out.PrintLine("phys_drop_sphere: emission components must be >= 0 (W/sr)");
                 return;
             }
             const auto h = physics_->AddRigidSphere(glm::vec3{x, y, z}, radius, mass);
@@ -13444,15 +13471,16 @@ void Engine::RegisterPhysicsCommands() {
             // body produces no spurious streak on its first frame.
             p.prev_pos_or_n[0] = x; p.prev_pos_or_n[1] = y; p.prev_pos_or_n[2] = z;
             p.radius_or_d = radius;
-            p.albedo[0]   = r_col; p.albedo[1] = g_col; p.albedo[2] = b_col;
+            p.albedo[0]   = r_col;  p.albedo[1]   = g_col;  p.albedo[2]   = b_col;
+            p.emission[0] = emit_r; p.emission[1] = emit_g; p.emission[2] = emit_b;
             p.roughness   = 0.4f;
             p.ior         = 1.0f;
             primitives_[prim_id] = p;
             physics_->SetRbPrimId(h, prim_id);
             primitives_dirty_ = true;
             accum_dirty_      = true;
-            out.FormatLine("phys_drop_sphere: spawned rigid body handle=0x{:x} prim_id={} @ ({:.2f} {:.2f} {:.2f}) r={:.3f} m={:.3f} rgb=({:.2f} {:.2f} {:.2f})",
-                           h, prim_id, x, y, z, radius, mass, r_col, g_col, b_col);
+            out.FormatLine("phys_drop_sphere: spawned rigid body handle=0x{:x} prim_id={} @ ({:.2f} {:.2f} {:.2f}) r={:.3f} m={:.3f} rgb=({:.2f} {:.2f} {:.2f}) emit=({:.2f} {:.2f} {:.2f})",
+                           h, prim_id, x, y, z, radius, mass, r_col, g_col, b_col, emit_r, emit_g, emit_b);
         });
 
     // Spawn a rigid-body box (Phase 2a, #138). Phase 2a does NOT
@@ -13470,32 +13498,41 @@ void Engine::RegisterPhysicsCommands() {
         "RGB tint (#181) -- default is the cool blue Lambert from before the colored-bodies patch.",
         [this](auto args, pt::console::Output& out) {
             if (!physics_) { out.PrintLine("phys_drop_box: physics system not initialised"); return; }
-            // Back-compat shapes:
-            //   6 args  -> xyz + hxhyhz                          (mass defaults)
-            //   7 args  -> xyz + hxhyhz + mass
-            //   10 args -> xyz + hxhyhz + mass + rgb              (#181)
-            // 8/9 are ambiguous (no clean way to know whether arg[7] starts
-            // rgb or is a typo) so we reject them with the usage string.
-            if (args.size() < 6 || args.size() == 8 || args.size() == 9 || args.size() > 10) {
-                out.PrintLine("usage: phys_drop_box <x> <y> <z> <hx> <hy> <hz> [mass=1.0] [r g b]");
+            // Valid arg counts:
+            //   6     xyz + hxhyhz (mass + color defaults)
+            //   7     xyz + hxhyhz + mass
+            //   10    xyz + hxhyhz + mass + albedo                       (#181)
+            //   13    xyz + hxhyhz + mass + albedo + emission            (#181 emissive followup)
+            // 8/9/11/12 are ambiguous partials, rejected with usage.
+            const auto n_args = args.size();
+            const bool valid_shape = n_args == 6 || n_args == 7 || n_args == 10 || n_args == 13;
+            if (!valid_shape) {
+                out.PrintLine("usage: phys_drop_box <x> <y> <z> <hx> <hy> <hz> [mass=1.0] [r g b] [emit_r emit_g emit_b]");
                 return;
             }
             float x, y, z, hx, hy, hz, mass = 1.0f;
             // Default cool-blue tint -- matches pre-#181 hard-coded
             // appearance for `phys_drop_box` with no color args.
             float r_col = 0.60f, g_col = 0.65f, b_col = 0.85f;
+            float emit_r = 0.0f, emit_g = 0.0f, emit_b = 0.0f;
             if (!ParseFloat(args[0], x)  || !ParseFloat(args[1], y)  || !ParseFloat(args[2], z) ||
                 !ParseFloat(args[3], hx) || !ParseFloat(args[4], hy) || !ParseFloat(args[5], hz)) {
                 out.PrintLine("phys_drop_box: arg parse failed");
                 return;
             }
-            if (args.size() >= 7 && !ParseFloat(args[6], mass)) {
+            if (n_args >= 7 && !ParseFloat(args[6], mass)) {
                 out.PrintLine("phys_drop_box: bad mass");
                 return;
             }
-            if (args.size() == 10) {
+            if (n_args >= 10) {
                 if (!ParseFloat(args[7], r_col) || !ParseFloat(args[8], g_col) || !ParseFloat(args[9], b_col)) {
                     out.PrintLine("phys_drop_box: bad r/g/b");
+                    return;
+                }
+            }
+            if (n_args == 13) {
+                if (!ParseFloat(args[10], emit_r) || !ParseFloat(args[11], emit_g) || !ParseFloat(args[12], emit_b)) {
+                    out.PrintLine("phys_drop_box: bad emit_r/g/b");
                     return;
                 }
             }
@@ -13509,6 +13546,10 @@ void Engine::RegisterPhysicsCommands() {
             }
             if (r_col < 0.0f || g_col < 0.0f || b_col < 0.0f) {
                 out.PrintLine("phys_drop_box: rgb components must be >= 0");
+                return;
+            }
+            if (emit_r < 0.0f || emit_g < 0.0f || emit_b < 0.0f) {
+                out.PrintLine("phys_drop_box: emission components must be >= 0 (W/sr)");
                 return;
             }
             const glm::vec3 h_ext{hx, hy, hz};
@@ -13531,7 +13572,8 @@ void Engine::RegisterPhysicsCommands() {
             // body produces no spurious streak on its first frame.
             p.prev_pos_or_n[0] = x; p.prev_pos_or_n[1] = y; p.prev_pos_or_n[2] = z;
             p.radius_or_d = bound_r;
-            p.albedo[0]   = r_col; p.albedo[1] = g_col; p.albedo[2] = b_col;
+            p.albedo[0]   = r_col;  p.albedo[1]   = g_col;  p.albedo[2]   = b_col;
+            p.emission[0] = emit_r; p.emission[1] = emit_g; p.emission[2] = emit_b;
             p.roughness   = 0.5f;
             p.ior         = 1.0f;
             primitives_[prim_id] = p;

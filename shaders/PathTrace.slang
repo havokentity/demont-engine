@@ -1011,34 +1011,39 @@ struct HitInfo {
     float3 albedo;
     float  roughness;
     float  ior;
+    // Self-emission read from primitives[idx*4 + 3].rgb (PR #181
+    // followup). Zero for non-emissive prims (default). Hit handler
+    // adds `radiance += throughput * emission` before BRDF switch.
+    float3 emission;
 };
 
-// Test a single analytic primitive at `primitives[idx*4 + 0..3]` against
-// (ro, rd) and update `h` if it's a closer hit. Centralizes the per-prim
-// dispatch so the linear-loop and BVH-leaf paths share one body.
+// Test a single analytic primitive at `primitives[idx*5 + 0..4]` against
+// (ro, rd) and update `h` if it's a closer hit.
 //
-// Motion blur (#85): the primitive stride is 4 float4s (16 floats),
-// with v3.xyz holding prev_pos_or_n (last frame's sphere center). The
-// `shutter_t01` parameter is the per-ray shutter sample in [0, 1] --
-// 0 = sample at start of shutter (== prev_pos), 1 = sample at end of
-// shutter (== curr_pos = v0.xyz). When the host's motion-blur master
-// gate is off it forces shutter_t01 = 1.0 at every call site so the
-// sphere center collapses to v0.xyz exactly (legacy rendering path).
-// Planes don't move so they ignore the shutter-time param.
+// Motion blur (#85): prim stride is 5 float4s (was 4 before the #181
+// emissive followup added v4). v3.xyz holds prev_pos_or_n (last
+// frame's sphere center). The `shutter_t01` parameter is the per-ray
+// shutter sample in [0, 1] -- 0 = start (prev_pos), 1 = end (curr_pos
+// = v0.xyz). When motion blur is off the host forces shutter_t01 =
+// 1.0 so the sphere center collapses to v0.xyz exactly.
+//
+// Emission (#181 followup): v4.rgb holds per-prim self-emission in
+// W/sr. The hit handler downstream adds `radiance += throughput *
+// h.emission` before the BRDF switch.
 void testAnalyticPrim(uint idx, float3 ro, float3 rd, float shutter_t01, inout HitInfo h) {
-    float4 v0 = primitives[idx * 4u + 0u];
-    float4 v1 = primitives[idx * 4u + 1u];
-    float4 v2 = primitives[idx * 4u + 2u];
-    float4 v3 = primitives[idx * 4u + 3u];
+    float4 v0 = primitives[idx * 5u + 0u];
+    float4 v1 = primitives[idx * 5u + 1u];
+    float4 v2 = primitives[idx * 5u + 2u];
+    float4 v3 = primitives[idx * 5u + 3u];
+    float4 v4 = primitives[idx * 5u + 4u];
     uint type = uint(v2.x);
     float t;
     if (type == PRIM_SPHERE) {
-        // Lerp from prev_pos (v3.xyz) toward curr_pos (v0.xyz) at the
-        // shutter-time sample. When motion_blur_params.x == 0 the host
-        // forces shutter_t01 to 1.0 so the lerp collapses to v0.xyz
-        // (bit-identical to pre-#85 behaviour). When motion_blur is on
-        // the engine snapshots curr -> prev once per StepPhysics tick
-        // so the per-frame displacement is encoded in (v0.xyz - v3.xyz).
+        // Lerp prev_pos (v3.xyz) -> curr_pos (v0.xyz) at the shutter
+        // time. shutter_t01 = 1.0 collapses to v0.xyz (motion-blur-off
+        // bit-identical). When on, the per-frame displacement is
+        // (v0.xyz - v3.xyz) and the engine snapshots curr -> prev each
+        // StepPhysics tick.
         float3 sphere_center = lerp(v3.xyz, v0.xyz, shutter_t01);
         if (intersectSphere(ro, rd, sphere_center, v0.w, t) && t < h.t) {
             h.hit = true; h.t = t;
@@ -1047,6 +1052,7 @@ void testAnalyticPrim(uint idx, float3 ro, float3 rd, float shutter_t01, inout H
             h.albedo = v1.rgb;
             h.roughness = v1.a;
             h.ior = v2.z;
+            h.emission = v4.rgb;
         }
     } else if (type == PRIM_PLANE) {
         if (intersectPlane(ro, rd, v0.xyz, v0.w, t) && t < h.t) {
@@ -1056,6 +1062,7 @@ void testAnalyticPrim(uint idx, float3 ro, float3 rd, float shutter_t01, inout H
             h.albedo = v1.rgb;
             h.roughness = v1.a;
             h.ior = v2.z;
+            h.emission = v4.rgb;
         }
     }
 }
@@ -1219,13 +1226,16 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01) {
     h.hit = false; h.t = 1e30;
     h.normal = float3(0,1,0); h.mat = MAT_LAMBERT;
     h.albedo = float3(0.5); h.roughness = 0.0; h.ior = 1.0;
+    h.emission = float3(0.0);
 
-    // Analytic primitives. Motion blur (#85): each occupies 4 consecutive
-    // float4s in `primitives`:
+    // Analytic primitives. Each occupies 5 consecutive float4s in
+    // `primitives` (#85 added v3 for motion blur, #181-followup
+    // added v4 for emission):
     //   v0 = (xyz: center (current frame) / plane normal,  w: radius / d)
-    //   v1 = (rgb: albedo,           a: roughness)
-    //   v2 = (x: type,  y: material, z: ior, w: pad)
-    //   v3 = (xyz: prev_pos_or_n (sphere center at previous frame), w: pad)
+    //   v1 = (rgb: albedo,                                 a: roughness)
+    //   v2 = (x: type, y: material, z: ior, w: pad)
+    //   v3 = (xyz: prev_pos_or_n (sphere center at prev frame), w: pad)
+    //   v4 = (rgb: emission W/sr,                          w: pad)
     //
     // The host partitions the buffer at upload time so the first
     // `linear_prim_count` entries are infinite-extent prims (planes)
@@ -3876,6 +3886,14 @@ void main(uint2 tid : SV_DispatchThreadID) {
         float3 hit_pt = ro + rd * h.t;
         float  ndi = dot(h.normal, rd);
         float3 nf  = (ndi < 0.0) ? h.normal : -h.normal;
+
+        // Self-emission contribution (PR #181 followup). Non-emissive
+        // prims have h.emission == 0 -- no-op for them. Emissive
+        // analytic prims (e.g. a phys_drop_sphere with emit r g b > 0)
+        // act as moving area lights -- the ray that LANDS on the
+        // emissive prim gets its surface radiance added here, while
+        // the BRDF still evaluates below for indirect contribution.
+        radiance += throughput * h.emission;
 
         if (h.mat == MAT_LAMBERT) {
             // --- Analytic light primitives NEE (#73 / ReSTIR #78) -------

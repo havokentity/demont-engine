@@ -292,7 +292,70 @@ TEST_CASE("phys_drop_sphere: 8-arg with full RGB applies custom albedo") {
     CHECK(approx(p->albedo[0], 0.9f));
     CHECK(approx(p->albedo[1], 0.1f));
     CHECK(approx(p->albedo[2], 0.05f));
+    // Emission defaults to zero in 8-arg shape (no emit triplet).
+    CHECK(approx(p->emission[0], 0.0f));
+    CHECK(approx(p->emission[1], 0.0f));
+    CHECK(approx(p->emission[2], 0.0f));
+}
 
+// --- #181 emissive followup: 11-arg / 13-arg emission shapes -------------
+TEST_CASE("phys_drop_sphere: 11-arg with full RGB + emission applies both") {
+    auto& acc = pt::engine::PhysDropArgsTestAccess::Get();
+    acc.ResetState();
+    auto& C = pt::console::Console::Get();
+
+    // Black albedo + bright orange emission -- a self-luminous body
+    // whose surface BRDF returns nothing (no reflected light) but
+    // glows on its own. Useful to verify the emission path doesn't
+    // depend on albedo.
+    auto r = C.Execute("phys_drop_sphere 0 5 0 0.3 1.0 0.0 0.0 0.0 8.0 1.5 0.5");
+    CHECK(r.ok);
+    CHECK(contains(r.output, "rgb=(0.00 0.00 0.00)"));
+    CHECK(contains(r.output, "emit=(8.00 1.50 0.50)"));
+
+    const auto id = acc.LastSpawnedId();
+    REQUIRE(id != 0u);
+    auto* p = acc.FindPrim(id);
+    REQUIRE(p != nullptr);
+    CHECK(approx(p->emission[0], 8.0f));
+    CHECK(approx(p->emission[1], 1.5f));
+    CHECK(approx(p->emission[2], 0.5f));
+}
+
+TEST_CASE("phys_drop_sphere: 9-arg partial emission rejected") {
+    auto& acc = pt::engine::PhysDropArgsTestAccess::Get();
+    acc.ResetState();
+    auto& C = pt::console::Console::Get();
+
+    // 8 args = valid albedo only; adding ONE emission arg is partial
+    // and the parser must reject with the usage hint rather than
+    // silently misparsing.
+    auto r = C.Execute("phys_drop_sphere 0 5 0 0.3 1.0 0.5 0.5 0.5 2.0");
+    CHECK(r.ok);                                              // command was found
+    CHECK(contains(r.output, "usage"));                       // rejection hint fired
+    CHECK_FALSE(contains(r.output, "spawned rigid body"));    // no spawn happened
+}
+
+TEST_CASE("phys_drop_sphere: 10-arg partial emission rejected") {
+    auto& acc = pt::engine::PhysDropArgsTestAccess::Get();
+    acc.ResetState();
+    auto& C = pt::console::Console::Get();
+
+    auto r = C.Execute("phys_drop_sphere 0 5 0 0.3 1.0 0.5 0.5 0.5 2.0 1.0");
+    CHECK(r.ok);
+    CHECK(contains(r.output, "usage"));
+    CHECK_FALSE(contains(r.output, "spawned rigid body"));
+}
+
+TEST_CASE("phys_drop_sphere: negative emission component rejected") {
+    auto& acc = pt::engine::PhysDropArgsTestAccess::Get();
+    acc.ResetState();
+    auto& C = pt::console::Console::Get();
+
+    auto r = C.Execute("phys_drop_sphere 0 5 0 0.3 1.0 0.5 0.5 0.5 -1.0 0.0 0.0");
+    CHECK(r.ok);
+    CHECK(contains(r.output, "emission components must be >= 0"));
+    CHECK_FALSE(contains(r.output, "spawned rigid body"));
 }
 
 TEST_CASE("phys_drop_sphere: 6-arg partial RGB rejected with usage hint") {
