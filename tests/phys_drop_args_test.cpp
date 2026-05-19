@@ -114,8 +114,14 @@ struct PhysDropArgsTestAccess {
     // instance; the Console singleton's command map still points at
     // this engine's `this`, so dispatch is safe.
     static PhysDropArgsTestAccess& Get() {
-        static PhysDropArgsTestAccess instance;
-        return instance;
+        // Intentionally-leaked heap allocation. The owned Engine's
+        // destructor would run Shutdown() at process exit -- which
+        // writes demont.cfg into the test working dir, flushes log
+        // sinks, etc. -- breaking hermeticity. A function-static
+        // pointer that's never deleted lets the OS reap the memory
+        // at exit without invoking ~Engine().
+        static PhysDropArgsTestAccess* instance = new PhysDropArgsTestAccess();
+        return *instance;
     }
 
     // Reset between tests so prim ids start fresh + the physics pool
