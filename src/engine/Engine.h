@@ -188,6 +188,12 @@ public:
         // radiance BEFORE the BRDF eval, matching the additive-emitter
         // pattern used for emissive sphere/quad area lights.
         float    emission[3] {0, 0, 0};
+        // Per-prim orientation (rotation gizmo / #206). Unit quaternion
+        // stored as xyzw, identity is (0,0,0,1). Spheres ignore this
+        // (rotation-symmetric). Planes rotate their normal at intersect
+        // time: effective_normal = quatRotate(orient, v0.xyz). Drives
+        // the editor rotate-mode gizmo dispatch (prim_set_rotation).
+        float    orient[4] {0, 0, 0, 1};
     };
 
     // Analytic light primitive (#73). First-class scene light source for
@@ -875,6 +881,15 @@ private:
     bool                                        prev_lmb_down_ = false;
     // Pre-drag origin captured in BeginDrag; restored on Esc-during-drag.
     glm::vec3                                   editor_drag_pre_pos_ { 0.0f };
+    // Pre-drag orientation quaternion captured in BeginDrag for
+    // rotate-mode (#206). Stored xyzw; identity is (0,0,0,1). The
+    // rotate dispatch builds a delta quaternion from the drag angle
+    // and multiplies it onto this stored pre-drag orient so the
+    // composition keeps the pre-drag rotation as a fixed origin (no
+    // accumulating-error problem from re-reading the prim's current
+    // orient every frame). Esc-during-drag restores via
+    // `prim_set_rotation <id> <qx qy qz qw>`.
+    float                                       editor_drag_pre_orient_[4] {0.0f, 0.0f, 0.0f, 1.0f};
     // ---- end Editor gizmo ---------------------------------------------------
 
     std::uint64_t                               autoexpose_pipeline_id_ = 0;

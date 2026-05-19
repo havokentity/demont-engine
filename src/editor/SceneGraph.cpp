@@ -127,6 +127,11 @@ json SerializeScene(const pt::engine::Engine& engine) {
             {"emission",  {p.emission[0], p.emission[1], p.emission[2]}},
             {"roughness", p.roughness},
             {"ior",       p.ior},
+            // Orientation quaternion (xyzw). Identity (0,0,0,1) for
+            // non-rotated prims. Drives the rotate gizmo (#206); the
+            // Property Inspector / Scene Hierarchy panels read this
+            // to display the prim's rotation state.
+            {"orient",    {p.orient[0], p.orient[1], p.orient[2], p.orient[3]}},
         };
         if (p.type == pt::engine::Engine::AnalyticPrim::Sphere) {
             j["pos"]    = {p.pos_or_n[0], p.pos_or_n[1], p.pos_or_n[2]};

@@ -3636,21 +3636,26 @@ void Engine::EnsurePrimitivesUploaded() {
     if (!primitives_dirty_) return;
 
     const std::uint32_t count = static_cast<std::uint32_t>(primitives_.size());
-    // 5 float4s (20 floats) per primitive after #85 motion blur (which
+    // 6 float4s (24 floats) per primitive after #85 motion blur (which
     // added v3 = prev_pos_or_n for shutter-time position lerp) AND #181
-    // polish (which adds v4 = emission for self-emissive rigid bodies).
+    // polish (which adds v4 = emission for self-emissive rigid bodies)
+    // AND #206 rotation gizmo (which adds v5 = orient quaternion so
+    // analytic planes can tilt under the editor's rotate gizmo).
     // Layout:
     //   v0 = (xyz: center / normal,  w: radius / d)
     //   v1 = (rgb: albedo,           a: roughness)
-    //   v2 = (x: type,  y: material, z: ior, w: pad)
+    //   v2 = (x: type,  y: material, z: ior, w: user-prim id)
     //   v3 = (xyz: prev_pos,         w: pad)   -- motion blur, #85
     //   v4 = (rgb: emission W/sr,    w: pad)   -- self-emission, #181
-    // Shaders use `idx * 5u` to step prims; PathTrace.slang's
+    //   v5 = (xyzw: orient quat)               -- rotation gizmo, #206
+    // Shaders use `idx * 6u` to step prims; PathTrace.slang's
     // testAnalyticPrim, RestirFinal.slang's shadowVis, and
     // SoftwareTracer.cpp's analytic-prim scan all MUST step at this
-    // stride. Off-paths (r_motion_blur == 0, emission == 0) pay only
-    // the extra load cost; rendered output is bit-identical.
-    constexpr std::uint32_t kFloatsPerPrim = 20;   // 5 float4s
+    // stride. Off-paths (identity orient, no motion blur, no emission)
+    // pay only the extra load cost; rendered output is bit-identical
+    // when orient == identity (the shader gates the quat-rotate on the
+    // identity check).
+    constexpr std::uint32_t kFloatsPerPrim = 24;   // 6 float4s
     constexpr std::uint32_t kBytesPerPrim  = sizeof(float) * kFloatsPerPrim;
 
     // Allocate / grow the storage buffer when needed. We grow by powers
@@ -3833,6 +3838,15 @@ void Engine::EnsurePrimitivesUploaded() {
         packed[off + 17] = p.emission[1];
         packed[off + 18] = p.emission[2];
         packed[off + 19] = 0.0f;
+        // v5 -- xyzw: orientation quaternion (rotation gizmo, #206).
+        // Identity is (0,0,0,1) so non-rotated prims read as a no-op
+        // quat-rotate on the shader side. Spheres ignore this (rotation
+        // -symmetric). Planes rotate v0.xyz by this quaternion at
+        // intersect time to derive the effective world-space normal.
+        packed[off + 20] = p.orient[0];
+        packed[off + 21] = p.orient[1];
+        packed[off + 22] = p.orient[2];
+        packed[off + 23] = p.orient[3];
     };
     for (std::size_t i = 0; i < infinite_prims.size(); ++i) {
         pack_prim(i, *infinite_prims[i].p, infinite_prims[i].id);
@@ -13299,6 +13313,94 @@ void Engine::RegisterPrimCommands() {
             out.FormatLine("prim_set_material: id {} -> {}", id, MaterialName(mat));
         });
 
+    // --- Rotation gizmo dispatch (#206) -------------------------------------
+    // Sets a primitive's orientation quaternion. Input is a raw xyzw
+    // tuple which we normalize before storing (a non-unit quat would
+    // alter both the rotation angle and the vector magnitude through
+    // the shader's quatRotate formula). Spheres are rotation-symmetric
+    // so the orientation has no visible effect but we still store it
+    // (so a later change of primitive type or selection-driven UI
+    // observation reads a stable value). Planes rotate their stored
+    // normal by this quaternion in the shader -- see PathTrace.slang
+    // testAnalyticPrim's PRIM_PLANE branch.
+    C.RegisterCommand("prim_set_rotation",
+        "prim_set_rotation <id> <qx> <qy> <qz> <qw>: set the primitive's "
+        "orientation quaternion (xyzw). Input is normalized. Identity is "
+        "(0, 0, 0, 1). Spheres are rotation-symmetric so this is visually "
+        "a no-op for them; planes tilt their normal by the rotation.",
+        [this, find_prim, broadcast_scene_dirty]
+        (auto args, pt::console::Output& out) {
+            if (args.size() != 5) {
+                out.PrintLine("usage: prim_set_rotation <id> <qx> <qy> <qz> <qw>");
+                return;
+            }
+            std::uint32_t id; AnalyticPrim* p = nullptr;
+            if (!find_prim(args[0], out, id, p)) return;
+            float qx, qy, qz, qw;
+            if (!ParseFloat(args[1], qx) || !ParseFloat(args[2], qy) ||
+                !ParseFloat(args[3], qz) || !ParseFloat(args[4], qw)) {
+                out.PrintLine("prim_set_rotation: float parse failed");
+                return;
+            }
+            const float mag = std::sqrt(qx * qx + qy * qy + qz * qz + qw * qw);
+            if (mag < 1e-6f) {
+                out.PrintLine("prim_set_rotation: zero-magnitude quaternion");
+                return;
+            }
+            const float inv = 1.0f / mag;
+            p->orient[0] = qx * inv;
+            p->orient[1] = qy * inv;
+            p->orient[2] = qz * inv;
+            p->orient[3] = qw * inv;
+            primitives_dirty_ = true;
+            accum_dirty_      = true;
+            broadcast_scene_dirty();
+            out.FormatLine("prim_set_rotation: id {} -> ({:.4f} {:.4f} {:.4f} {:.4f})",
+                           id, p->orient[0], p->orient[1], p->orient[2], p->orient[3]);
+        });
+
+    C.RegisterCommand("prim_set_rotation_euler",
+        "prim_set_rotation_euler <id> <pitch_deg> <yaw_deg> <roll_deg>: set "
+        "the primitive's orientation from Euler angles (XYZ order, degrees). "
+        "Converts internally to the canonical quaternion stored on the prim.",
+        [this, find_prim, broadcast_scene_dirty]
+        (auto args, pt::console::Output& out) {
+            if (args.size() != 4) {
+                out.PrintLine("usage: prim_set_rotation_euler <id> <pitch_deg> <yaw_deg> <roll_deg>");
+                return;
+            }
+            std::uint32_t id; AnalyticPrim* p = nullptr;
+            if (!find_prim(args[0], out, id, p)) return;
+            float pitch_deg, yaw_deg, roll_deg;
+            if (!ParseFloat(args[1], pitch_deg) ||
+                !ParseFloat(args[2], yaw_deg)   ||
+                !ParseFloat(args[3], roll_deg)) {
+                out.PrintLine("prim_set_rotation_euler: float parse failed");
+                return;
+            }
+            // XYZ-intrinsic Euler -> quaternion. Half-angle formulation
+            // produces a unit quaternion straight out so we don't need
+            // the normalisation step that prim_set_rotation does.
+            const float kDeg2Rad = 3.14159265358979323846f / 180.0f;
+            const float hx = pitch_deg * kDeg2Rad * 0.5f;
+            const float hy = yaw_deg   * kDeg2Rad * 0.5f;
+            const float hz = roll_deg  * kDeg2Rad * 0.5f;
+            const float cx = std::cos(hx), sx = std::sin(hx);
+            const float cy = std::cos(hy), sy = std::sin(hy);
+            const float cz = std::cos(hz), sz = std::sin(hz);
+            // Quaternion q = qz * qy * qx (roll then yaw then pitch).
+            // Standard XYZ-intrinsic Tait-Bryan composition.
+            p->orient[0] = sx * cy * cz + cx * sy * sz;
+            p->orient[1] = cx * sy * cz - sx * cy * sz;
+            p->orient[2] = cx * cy * sz + sx * sy * cz;
+            p->orient[3] = cx * cy * cz - sx * sy * sz;
+            primitives_dirty_ = true;
+            accum_dirty_      = true;
+            broadcast_scene_dirty();
+            out.FormatLine("prim_set_rotation_euler: id {} -> quat ({:.4f} {:.4f} {:.4f} {:.4f})",
+                           id, p->orient[0], p->orient[1], p->orient[2], p->orient[3]);
+        });
+
     C.RegisterCommand("prim_delete",
         "prim_delete <id>: remove a primitive (editor alias for prim_remove). "
         "Clears the editor selection when the deleted prim was selected.",
@@ -13850,18 +13952,47 @@ void Engine::UpdateEditorGizmoFrame() {
         if (editor_gizmo_.IsDragging()) editor_gizmo_.EndDrag();
         return;
     }
-    // Planes have no canonical position to gizmo over (n + d, not
-    // a centre point). Silently skip until plane manipulation has
-    // a meaningful UX.
-    if (it->second.type != AnalyticPrim::Sphere) {
-        if (editor_gizmo_.IsDragging()) editor_gizmo_.EndDrag();
-        return;
-    }
 
-    const glm::vec3 origin{it->second.pos_or_n[0],
+    // Gizmo origin selection:
+    //   Sphere: world-space sphere center stored in pos_or_n.
+    //   Plane : no canonical world center; we render the gizmo at the
+    //           foot of the perpendicular from the world origin to the
+    //           plane (point on the plane closest to (0,0,0)) so the
+    //           rotate rings sit on the surface itself rather than at
+    //           infinity. This is purely a placement choice -- the
+    //           prim_set_rotation dispatch only mutates orient[].
+    glm::vec3 origin{0.0f};
+    float gizmo_size = 1.0f;
+    const bool is_plane = (it->second.type == AnalyticPrim::Plane);
+    if (is_plane) {
+        // Planes have nothing physical to translate / scale, so we
+        // only surface them for rotate mode. Translate / scale mode
+        // skips planes for now (a "move plane along its normal" UX
+        // would dispatch prim_set_pos on radius_or_d, but that's
+        // out of scope for #206 -- the rotation gizmo only).
+        if (editor_gizmo_.GetMode() != pt::renderer::EditorOverlay::Mode::Rotate) {
+            if (editor_gizmo_.IsDragging()) editor_gizmo_.EndDrag();
+            // Build no geometry for planes outside rotate mode.
+            return;
+        }
+        // Project world origin onto the plane: foot = -d * n (since
+        // n is unit, n . foot + d == 0 implies foot . n == -d, so
+        // foot = -d * n is the point on the plane nearest the
+        // world origin -- a stable "centre" anchor for the rings).
+        const glm::vec3 n_raw{it->second.pos_or_n[0],
+                              it->second.pos_or_n[1],
+                              it->second.pos_or_n[2]};
+        const float d = it->second.radius_or_d;
+        origin     = n_raw * (-d);
+        gizmo_size = 1.5f;   // fixed world-units arm/ring length
+    } else {
+        // Sphere path: gizmo anchored at the sphere center, sized
+        // relative to the radius like the existing translate gizmo.
+        origin = glm::vec3{it->second.pos_or_n[0],
                            it->second.pos_or_n[1],
                            it->second.pos_or_n[2]};
-    const float gizmo_size = std::max(0.5f, it->second.radius_or_d * 1.5f);
+        gizmo_size = std::max(0.5f, it->second.radius_or_d * 1.5f);
+    }
     const float aspect = (accum_h_ > 0)
                            ? float(accum_w_) / float(accum_h_)
                            : 1.0f;
@@ -13884,15 +14015,28 @@ void Engine::UpdateEditorGizmoFrame() {
                                         mx, my, /*radius_px=*/10.0f);
     }
 
-    // Esc-during-drag: abort and restore pre-drag origin.
+    // Esc-during-drag: abort and restore pre-drag state. The restored
+    // command depends on which dispatch path the drag is on -- a
+    // translate/scale drag rewinds the position; a rotate drag rewinds
+    // the orientation quaternion.
     const bool esc_pressed = window_->IsKeyDown(256); // GLFW_KEY_ESCAPE
     if (esc_pressed && editor_gizmo_.IsDragging()) {
         // Restore via the same console-routed mutation path so undo
         // / snapshot semantics line up with the normal drag.
-        const glm::vec3 pre = editor_drag_pre_pos_;
-        auto cmd = fmt::format("prim_set_pos {} {} {} {}",
-                               selected_prim_id_, pre.x, pre.y, pre.z);
-        pt::console::Console::Get().Execute(cmd);
+        if (editor_gizmo_.DragMode() == pt::renderer::EditorOverlay::Mode::Rotate) {
+            auto cmd = fmt::format("prim_set_rotation {} {} {} {} {}",
+                                   selected_prim_id_,
+                                   editor_drag_pre_orient_[0],
+                                   editor_drag_pre_orient_[1],
+                                   editor_drag_pre_orient_[2],
+                                   editor_drag_pre_orient_[3]);
+            pt::console::Console::Get().Execute(cmd);
+        } else {
+            const glm::vec3 pre = editor_drag_pre_pos_;
+            auto cmd = fmt::format("prim_set_pos {} {} {} {}",
+                                   selected_prim_id_, pre.x, pre.y, pre.z);
+            pt::console::Console::Get().Execute(cmd);
+        }
         editor_gizmo_.EndDrag();
         prev_lmb_down_ = false;
     }
@@ -13903,26 +14047,83 @@ void Engine::UpdateEditorGizmoFrame() {
             // Press edge. Start drag iff hovering an axis.
             if (hovered != pt::renderer::EditorOverlay::Axis::None) {
                 editor_drag_pre_pos_ = origin;
+                // Snapshot the pre-drag orient so an Esc-during-drag
+                // can rewind. Reading from primitives_ keeps the
+                // composition consistent if a previous frame's drag
+                // already advanced the orient.
+                editor_drag_pre_orient_[0] = it->second.orient[0];
+                editor_drag_pre_orient_[1] = it->second.orient[1];
+                editor_drag_pre_orient_[2] = it->second.orient[2];
+                editor_drag_pre_orient_[3] = it->second.orient[3];
                 editor_gizmo_.BeginDrag(hovered, origin,
                                         *camera_, aspect,
                                         accum_w_, accum_h_,
                                         mx, my);
             }
         } else if (lmb_down && prev_lmb_down_ && editor_gizmo_.IsDragging()) {
-            // Continuing drag. Compute new world pos and dispatch
-            // prim_set_pos via Console::Execute so the engine's
-            // existing accum_dirty / primitives_dirty handling +
-            // future undo machinery route uniformly.
-            const glm::vec3 new_pos =
-                editor_gizmo_.UpdateDrag(*camera_, aspect,
-                                         accum_w_, accum_h_, mx, my);
-            // Skip the dispatch if the delta is sub-millimetre; cuts
-            // the ~60 Hz Execute() churn when the mouse is still.
-            if (glm::distance(new_pos, origin) > 1e-4f) {
-                auto cmd = fmt::format("prim_set_pos {} {} {} {}",
-                                       selected_prim_id_,
-                                       new_pos.x, new_pos.y, new_pos.z);
-                pt::console::Console::Get().Execute(cmd);
+            // Continuing drag. Branch on the drag mode captured at
+            // BeginDrag time so a mid-drag gizmo_mode toggle doesn't
+            // change the dispatch path mid-motion.
+            if (editor_gizmo_.DragMode() == pt::renderer::EditorOverlay::Mode::Rotate) {
+                // Rotate drag: compute the signed angle around the
+                // ring axis since BeginDrag, build the delta quat
+                // (axis-angle), compose with the pre-drag orient,
+                // dispatch prim_set_rotation. The composition is
+                // new_orient = delta_q * pre_orient so the gizmo's
+                // axis lives in world space (not in the prim's local
+                // frame), matching user expectation.
+                const float angle = editor_gizmo_.UpdateRotateDrag(
+                    *camera_, aspect, accum_w_, accum_h_, mx, my);
+                // Sub-half-degree threshold cuts Execute() churn when
+                // the mouse is roughly still.
+                constexpr float kAngleEps = 1.0e-3f;
+                if (std::abs(angle) > kAngleEps) {
+                    // Build delta quat from axis-angle.
+                    const glm::vec3 ax = [&]() {
+                        switch (editor_gizmo_.DragAxis()) {
+                            case pt::renderer::EditorOverlay::Axis::X: return glm::vec3(1, 0, 0);
+                            case pt::renderer::EditorOverlay::Axis::Y: return glm::vec3(0, 1, 0);
+                            case pt::renderer::EditorOverlay::Axis::Z: return glm::vec3(0, 0, 1);
+                            default: return glm::vec3(0, 0, 1);
+                        }
+                    }();
+                    const float ha = angle * 0.5f;
+                    const float s  = std::sin(ha);
+                    const float c  = std::cos(ha);
+                    // dq = (ax * s, c) in (xyz, w) order.
+                    const float dqx = ax.x * s;
+                    const float dqy = ax.y * s;
+                    const float dqz = ax.z * s;
+                    const float dqw = c;
+                    // Compose: new = dq * pre. Hamilton product.
+                    const float pre_x = editor_drag_pre_orient_[0];
+                    const float pre_y = editor_drag_pre_orient_[1];
+                    const float pre_z = editor_drag_pre_orient_[2];
+                    const float pre_w = editor_drag_pre_orient_[3];
+                    const float nx = dqw * pre_x + dqx * pre_w + dqy * pre_z - dqz * pre_y;
+                    const float ny = dqw * pre_y - dqx * pre_z + dqy * pre_w + dqz * pre_x;
+                    const float nz = dqw * pre_z + dqx * pre_y - dqy * pre_x + dqz * pre_w;
+                    const float nw = dqw * pre_w - dqx * pre_x - dqy * pre_y - dqz * pre_z;
+                    auto cmd = fmt::format("prim_set_rotation {} {} {} {} {}",
+                                           selected_prim_id_, nx, ny, nz, nw);
+                    pt::console::Console::Get().Execute(cmd);
+                }
+            } else {
+                // Translate / scale: compute new world pos and dispatch
+                // prim_set_pos via Console::Execute so the engine's
+                // existing accum_dirty / primitives_dirty handling +
+                // future undo machinery route uniformly.
+                const glm::vec3 new_pos =
+                    editor_gizmo_.UpdateDrag(*camera_, aspect,
+                                             accum_w_, accum_h_, mx, my);
+                // Skip the dispatch if the delta is sub-millimetre; cuts
+                // the ~60 Hz Execute() churn when the mouse is still.
+                if (glm::distance(new_pos, origin) > 1e-4f) {
+                    auto cmd = fmt::format("prim_set_pos {} {} {} {}",
+                                           selected_prim_id_,
+                                           new_pos.x, new_pos.y, new_pos.z);
+                    pt::console::Console::Get().Execute(cmd);
+                }
             }
         } else if (!lmb_down && prev_lmb_down_) {
             // Release edge.
@@ -13933,13 +14134,33 @@ void Engine::UpdateEditorGizmoFrame() {
 
     // Geometry build. Use the (possibly updated) origin from
     // primitives_ -- it may have changed during this same frame if
-    // the drag dispatched prim_set_pos above.
+    // the drag dispatched prim_set_pos / prim_set_rotation above.
+    // For planes, recompute the foot-of-perpendicular in case the
+    // normal was rotated; for spheres, just re-read the center.
     auto fresh = primitives_.find(selected_prim_id_);
     glm::vec3 build_origin = origin;
     if (fresh != primitives_.end()) {
-        build_origin = glm::vec3{fresh->second.pos_or_n[0],
-                                 fresh->second.pos_or_n[1],
-                                 fresh->second.pos_or_n[2]};
+        if (is_plane) {
+            // Re-derive plane normal post-rotation so the rings move
+            // with the visible plane. The shader applies orient at
+            // intersect time, so for the gizmo we apply it here too.
+            const float qx = fresh->second.orient[0];
+            const float qy = fresh->second.orient[1];
+            const float qz = fresh->second.orient[2];
+            const float qw = fresh->second.orient[3];
+            const glm::vec3 n_raw{fresh->second.pos_or_n[0],
+                                  fresh->second.pos_or_n[1],
+                                  fresh->second.pos_or_n[2]};
+            // quatRotate(q, v) = v + 2 * cross(u, cross(u, v) + w * v)
+            const glm::vec3 u{qx, qy, qz};
+            const glm::vec3 n = n_raw + 2.0f *
+                glm::cross(u, glm::cross(u, n_raw) + qw * n_raw);
+            build_origin = n * (-fresh->second.radius_or_d);
+        } else {
+            build_origin = glm::vec3{fresh->second.pos_or_n[0],
+                                     fresh->second.pos_or_n[1],
+                                     fresh->second.pos_or_n[2]};
+        }
     }
     const pt::renderer::EditorOverlay::Axis hl =
         editor_gizmo_.IsDragging() ? editor_gizmo_.DragAxis() : hovered;
