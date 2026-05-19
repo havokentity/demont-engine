@@ -387,6 +387,35 @@ namespace cvar {
             "deterministic captures / goldens).",
             CVAR_ARCHIVE);
     // --- end Water Phase 1 ---------------------------------------------------
+    // --- Water Phase 4 (#134) deep-water tint --------------------------------
+    // Per-ray underwater medium tracking: when a bounce ray (TIR-reflected
+    // back down, or any underwater bounce that misses scene geometry)
+    // escapes to the empty "deep water" horizon, returning skyColor(rd)
+    // would punch a bright sky-blue hole through the underwater rendering.
+    // r_water_deep_color_r/g/b is the RGB tint that replaces sky on
+    // those misses; defaults to near-black so deep-water voids read as
+    // honest darkness rather than tinted-but-bright sky. Throughput
+    // (per-segment Beer's law applied along the way) still modulates
+    // these values, so a short underwater ray escaping picks up more
+    // of the deep tint than a long-path ray that fades to true black.
+    PT_CVAR(r_water_deep_color_r, "0.0",
+            "Deep-water void colour (RED channel) returned by the shader "
+            "when an underwater ray escapes scene geometry to infinity. "
+            "Default 0.0 (true black). Multiplied by the ray's running "
+            "throughput so per-segment Beer's-law attenuation along the "
+            "underwater path still applies. Raise above 0 for a tunable "
+            "'water glow' look that mimics deep-water ambient scattering "
+            "without a full volumetric integral. Linear RGB units.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_water_deep_color_g, "0.0",
+            "Deep-water void colour (GREEN channel). See "
+            "r_water_deep_color_r for full semantics. Default 0.0.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_water_deep_color_b, "0.0",
+            "Deep-water void colour (BLUE channel). See "
+            "r_water_deep_color_r for full semantics. Default 0.0.",
+            CVAR_ARCHIVE);
+    // --- end Water Phase 4 ---------------------------------------------------
     PT_CVAR(r_denoiser,        "off",
             "Denoiser. off = noisy 1-spp, accumulating image only. "
             "metalfx = Mac MetalFX TemporalDenoisedScaler (Apple Silicon "
@@ -6232,6 +6261,26 @@ void Engine::RenderFrame() {
         // One vec4 = 16 B.
         float motion_blur_params[4];
         // --- end Motion blur ---------------------------------------------
+        // --- Underwater medium tracking (Phase 4, #134) ------------------
+        // water_state.x = camera_initial_in_water flag (0.0 / 1.0). The
+        //                 engine scans the analytic-primitives map for
+        //                 MAT_WATER planes once per dispatch (cheap; the
+        //                 scene typically has 0 or 1 water plane) and
+        //                 checks whether cam.pos.y is below any of them
+        //                 along the plane's normal-projected half-space.
+        //                 When 1.0, PathTrace.slang's bounce loop starts
+        //                 in_water = 1 so per-segment Beer's-law
+        //                 attenuation fires on the camera primary ray
+        //                 without needing the legacy b == 0 special case.
+        //             .y/.z/.w = r_water_deep_color_r/g/b -- the RGB tint
+        //                 the shader returns when an in-water ray misses
+        //                 scene geometry and would otherwise sample
+        //                 skyColor(rd). Defaults to (0, 0, 0) so deep-
+        //                 water voids read as honest black; raise per
+        //                 cvar for tunable scattering ambient.
+        // One vec4 = 16 B.
+        float water_state[4];
+        // --- end Underwater medium tracking ------------------------------
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -7232,6 +7281,82 @@ void Engine::RenderFrame() {
         push.motion_blur_params[3] = 0.0f;
     }
     // --- end Motion blur ---------------------------------------------------
+    // --- Underwater medium tracking (Phase 4, #134) ------------------------
+    // Pack:
+    //   .x = 1.0 if camera position is inside any MAT_WATER plane's
+    //        below-the-surface half-space, else 0.0. The shader uses
+    //        this to seed `in_water = 1` at ray-gen so the camera
+    //        primary ray's segment through the water medium gets the
+    //        new generic per-bounce Beer's-law attenuation (replacing
+    //        the b == 0 special case from b2690ac).
+    //   .yzw = r_water_deep_color_r/g/b -- the RGB the shader returns
+    //          when an in-water ray escapes scene geometry to infinity.
+    //          Defaults to (0, 0, 0) so deep-water voids read as
+    //          honest black; raise per-cvar for tunable scattering
+    //          ambient that fakes deep-water glow without a volumetric
+    //          integral.
+    {
+        // Scan analytic primitives for MAT_WATER planes. Each MAT_WATER
+        // plane is defined by normal `pos_or_n` and offset `radius_or_d`,
+        // following the engine's plane convention `dot(n, p) + d = 0`
+        // (the same form `prim_plane`'s help text documents and that
+        // intersectPlane uses on both CPU and shader paths). The camera
+        // sits "below" the surface -- on the side opposite the normal --
+        // when dot(n, cam) + d <= 0. For the typical horizontal water
+        // surface at y = H stored as normal = (0, 1, 0) + d = -H, this
+        // collapses to cam.pos.y <= H, which is what users expect.
+        //
+        // Orientation: PR #207 added a unit quaternion per analytic prim
+        // (AnalyticPrim::orient[4]) that the shader uses to rotate plane
+        // normals at intersect time via quatRotate (see PRIM_PLANE branch
+        // in testAnalyticPrim). We mirror that rotation here so a rotated
+        // water plane's below-the-surface half-space matches what the
+        // shader actually intersects; otherwise a non-identity orient
+        // would seed in_water from the stored (unrotated) half-space,
+        // not the visible one. Identity orient (0, 0, 0, 1) collapses
+        // to the original n_raw so unrotated planes are unchanged.
+        //
+        // Multiple water planes are allowed (e.g. an indoor pool above
+        // an aquarium): camera is in-water if it sits below ANY of them.
+        // Conservative AND-vs-OR: a configuration of two water planes
+        // that's actually a thin slab would mark "below" for both, and
+        // we'd want in_water = 1 between them anyway. The general N-water
+        // case is rare; this OR-fold is good enough for Phase 4.
+        bool cam_in_water = false;
+        for (const auto& [id, p] : primitives_) {
+            if (p.type != AnalyticPrim::Plane) continue;
+            if (p.material != AnalyticPrim::Water) continue;
+            // Rotate the stored normal by the orientation quaternion --
+            // matches the shader's PRIM_PLANE quatRotate path (see
+            // PathTrace.slang testAnalyticPrim). quatRotate(q, v) =
+            // v + 2 * cross(u, cross(u, v) + w * v) with q = (u, w).
+            const glm::vec3 n_raw{p.pos_or_n[0], p.pos_or_n[1],
+                                  p.pos_or_n[2]};
+            const glm::vec3 u{p.orient[0], p.orient[1], p.orient[2]};
+            const float    qw = p.orient[3];
+            const glm::vec3 n =
+                n_raw + 2.0f * glm::cross(u, glm::cross(u, n_raw) + qw * n_raw);
+            const float d  = p.radius_or_d;
+            const float signed_dist =
+                n.x * cam.pos.x + n.y * cam.pos.y + n.z * cam.pos.z + d;
+            if (signed_dist <= 0.0f) { cam_in_water = true; break; }
+        }
+        float deep_r = 0.0f, deep_g = 0.0f, deep_b = 0.0f;
+        if (auto* v = C.FindCVar("r_water_deep_color_r")) deep_r = v->GetFloat();
+        if (auto* v = C.FindCVar("r_water_deep_color_g")) deep_g = v->GetFloat();
+        if (auto* v = C.FindCVar("r_water_deep_color_b")) deep_b = v->GetFloat();
+        // Clamp to [0, +inf) -- negative deep tint would subtract energy
+        // from the in-flight throughput on miss, which is unphysical and
+        // would hide debugging via NaNs once the radiance accumulates.
+        if (deep_r < 0.0f) deep_r = 0.0f;
+        if (deep_g < 0.0f) deep_g = 0.0f;
+        if (deep_b < 0.0f) deep_b = 0.0f;
+        push.water_state[0] = cam_in_water ? 1.0f : 0.0f;
+        push.water_state[1] = deep_r;
+        push.water_state[2] = deep_g;
+        push.water_state[3] = deep_b;
+    }
+    // --- end Underwater medium tracking ------------------------------------
 
     // PtPush layout: the trailing 32 bytes here include the SDF Phase 1
     // block (sdf_params uvec4 + sdf_params_f vec4) and the celestials-
@@ -7259,7 +7384,8 @@ void Engine::RenderFrame() {
     //                              decay_shape, age_tint_strength)
     //   +16 Motion blur (#85) — motion_blur_params vec4 (enabled, shutter_speed,
     //                              _pad, _pad)
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16);
+    //   +16 Water Phase 4 (#134) — water_state vec4 (in_water flag, deep_color_rgb)
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16);
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
     // cbuffer layout the Slang compiler applies to PathTrace.slang's
@@ -7329,6 +7455,10 @@ void Engine::RenderFrame() {
     // Motion blur block (#85).
     static_assert(offsetof(PtPush, motion_blur_params) % 16 == 0,
                   "PtPush::motion_blur_params must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    // Water Phase 4 underwater medium tracking (#134).
+    static_assert(offsetof(PtPush, water_state) % 16 == 0,
+                  "PtPush::water_state must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
@@ -11837,7 +11967,9 @@ void Engine::RegisterCommands() {
     for (const char* n : {"r_water_absorption_r", "r_water_absorption_g",
                           "r_water_absorption_b", "r_water_ior",
                           "r_water_wave_scale",   "r_water_wave_amplitude",
-                          "r_water_wave_speed"}) {
+                          "r_water_wave_speed",
+                          "r_water_deep_color_r", "r_water_deep_color_g",
+                          "r_water_deep_color_b"}) {
         if (auto* v = C.FindCVar(n)) {
 #if PT_WATER_ENABLED
             v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
@@ -11862,7 +11994,9 @@ void Engine::RegisterCommands() {
         for (const char* n : {"r_water_absorption_r", "r_water_absorption_g",
                               "r_water_absorption_b", "r_water_ior",
                               "r_water_wave_scale",   "r_water_wave_amplitude",
-                              "r_water_wave_speed"}) {
+                              "r_water_wave_speed",
+                              "r_water_deep_color_r", "r_water_deep_color_g",
+                              "r_water_deep_color_b"}) {
             if (auto* v = C.FindCVar(n);
                 v && v->value != v->default_value) {
                 any_non_default = true;
