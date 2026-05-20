@@ -16911,7 +16911,7 @@ void Engine::AppendLightIconsForViewport() {
         // Chromaticity = intensity normalised to its peak channel; a
         // black light falls back to neutral inside AppendLightIcon.
         const float peak = std::max({L.intensity[0], L.intensity[1], L.intensity[2]});
-        glm::vec3 color = (peak > 0.0f)
+        const glm::vec3 color = (peak > 0.0f)
             ? glm::vec3{L.intensity[0] / peak, L.intensity[1] / peak, L.intensity[2] / peak}
             : glm::vec3{0.7f};
         const bool highlighted =
