@@ -37,6 +37,7 @@
 #include "../effects/ParticleSystem.h"
 #include "../physics/PhysicsSystem.h"
 #include "../physics/SmokeSPH.h"
+#include "../physics/OceanFFT.h"   // Wave 8 (#25) FFT ocean surface
 #include "../rhi/CommandBuffer.h"
 #include "../rhi/Device.h"
 
@@ -433,6 +434,77 @@ namespace cvar {
             "r_water_deep_color_r for full semantics. Default 0.0.",
             CVAR_ARCHIVE);
     // --- end Water Phase 4 ---------------------------------------------------
+    // --- Wave 8 ocean (#25) -- FFT Tessendorf ocean surface ------------------
+    // Master gate + tunables for the CPU FFT ocean (pt::ocean::OceanFFT).
+    // When r_ocean is 0 the engine skips the solver step + texture upload
+    // entirely and the host pushes ocean_params0.x = 0, so PathTrace.slang's
+    // MAT_WATER branch falls back to the bit-exact Phase 1 analytic-plane
+    // wave-normal path -- zero added cost, existing water goldens unaffected.
+    // All units are SI: g = 9.81 m/s^2, wind in m/s, tile size in metres.
+    PT_CVAR(r_ocean, "0",
+            "Master gate for the FFT Tessendorf ocean surface (#25). 0 = "
+            "off (MAT_WATER planes use the Phase 1 analytic-plane wave "
+            "normal; zero added cost). 1 = on: the CPU FFT solver "
+            "synthesises an animated displacement + normal texture from "
+            "the Phillips spectrum and PathTrace.slang ray-marches the "
+            "displaced heightfield off any MAT_WATER plane. Metal + Vulkan "
+            "only -- the Software backend's hand-written CPU tracer ignores "
+            "the ocean textures and renders the flat analytic water plane.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_ocean_wind_speed, "12.0",
+            "Ocean wind speed in m/s (#25). Drives the Phillips "
+            "characteristic length L = windSpeed^2 / g (g = 9.81), hence "
+            "the dominant wavelength. 12 m/s = a fresh Beaufort-6 breeze "
+            "(~30 m dominant swell, visible whitecaps). Higher = longer, "
+            "taller waves.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_ocean_wind_dir_deg, "0.0",
+            "Ocean wind direction in degrees in the world XZ plane (#25). "
+            "0 = +X. The Phillips directional term suppresses waves "
+            "travelling perpendicular to the wind, so this steers the "
+            "dominant swell direction.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_ocean_amplitude, "0.0002",
+            "Phillips spectral amplitude A (#25), the overall RMS wave-"
+            "height scale. Dimensionless. At the 50 m default tile + 12 m/s "
+            "wind, 0.0002 gives roughly +/-1.5 m peak crests (a moderate "
+            "sea); scales linearly. 0 = dead-calm flat water (no "
+            "displacement).",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_ocean_choppiness, "1.0",
+            "Ocean choppiness lambda in [0, 1.5] (#25). 0 = round "
+            "sinusoidal swells; >0 applies the Tessendorf horizontal "
+            "Gerstner displacement that sharpens wave crests into the "
+            "characteristic pinched-peak ocean look. Also drives foam "
+            "(foam accumulates where the choppy displacement folds).",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_ocean_tile_size, "50.0",
+            "Ocean FFT patch size in metres (#25). The N x N FFT grid "
+            "spans this many metres and tiles seamlessly across the water "
+            "plane in world XZ. Larger = broader, lower-frequency swells; "
+            "smaller = tighter chop. Default 50 m.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_ocean_foam_threshold, "0.5",
+            "Ocean foam Jacobian threshold (#25). Foam accumulates where "
+            "the horizontal-displacement Jacobian determinant drops below "
+            "this (folding/pinching crests). Lower = less foam, higher = "
+            "more spray. Only meaningful when r_ocean_choppiness > 0.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_ocean_grid_size, "256",
+            "Ocean FFT grid resolution (#25), a power of two (clamped to "
+            "{64,128,256,512}). 256 is the Tessendorf reference default. "
+            "512 sharpens crest detail at ~4x the per-frame CPU FFT cost. "
+            "Changing this rebuilds the base spectrum + reallocates the "
+            "displacement/normal textures.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_ocean_march_steps, "64",
+            "Max heightfield ray-march steps for the ocean surface (#25), "
+            "clamped 8..256. The path tracer steps along each ray from the "
+            "analytic water plane sampling the displacement texture until "
+            "the ray crosses the displaced surface. More steps = fewer "
+            "missed thin crests at grazing angles, at GPU cost.",
+            CVAR_ARCHIVE);
+    // --- end Wave 8 ocean ----------------------------------------------------
     PT_CVAR(r_denoiser,        "off",
             "Denoiser. off = noisy 1-spp, accumulating image only. "
             "metalfx = Mac MetalFX TemporalDenoisedScaler (Apple Silicon "
@@ -1932,6 +2004,13 @@ bool Engine::Init() {
     // before the first emitter spawn.
     smoke_sph_ = std::make_unique<pt::sph::SmokeSPH>();
 
+    // --- Wave 8 ocean (#25) ---
+    // FFT ocean solver. Allocated unconditionally (cheap when idle -- the
+    // per-frame StepOcean early-outs when r_ocean == 0). The first
+    // Update() with r_ocean on builds the base Phillips spectrum lazily.
+    ocean_ = std::make_unique<pt::ocean::OceanFFT>();
+    // --- end Wave 8 ocean ---
+
     // CSG scene -- the source of truth for triangle-mesh geometry from
     // P9 onward. Seeded with the headline drilled-cube scene so first-
     // frame renders something interesting. SDF Phase 1 (#97) fixtures
@@ -2446,6 +2525,10 @@ void Engine::TearDownDevice() {
             device_->DestroyBuffer(pt::rhi::BufferHandle{sph_particle_buffer_id_});
         }
         // --- end Fluid Phase 3 -----------------------------------------------
+        // --- Wave 8 ocean (#25) ----------------------------------------------
+        if (ocean_disp_tex_id_   != 0) device_->DestroyTexture(pt::rhi::TextureHandle{ocean_disp_tex_id_});
+        if (ocean_normal_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{ocean_normal_tex_id_});
+        // --- end Wave 8 ocean ------------------------------------------------
         if (denoise_color_tex_id_    != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
         if (depth_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
         if (motion_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
@@ -2535,6 +2618,15 @@ void Engine::TearDownDevice() {
     smoke_buffer_capacity_ = 0;
     smoke_count_uploaded_  = 0;
     // --- end Fluid Phase 1 ------------------------------------------------
+    // --- Wave 8 ocean (#25) -----------------------------------------------
+    // Zero the texture handles so EnsureOceanUploaded reallocates on the
+    // next device. The CPU solver (ocean_) survives -- it owns no GPU
+    // resources -- and ocean_time_ persists so the animation is
+    // continuous across a device recreate.
+    ocean_disp_tex_id_   = 0;
+    ocean_normal_tex_id_ = 0;
+    ocean_tex_grid_      = 0;
+    // --- end Wave 8 ocean -------------------------------------------------
     denoise_color_tex_id_    = 0;
     depth_tex_id_            = 0;
     motion_tex_id_           = 0;
@@ -6293,6 +6385,20 @@ void Engine::RenderFrame() {
     if (star_map_tex_id_ != 0) {
         cb->BindStorageTexture(6, pt::rhi::TextureHandle{star_map_tex_id_});
     }
+    // --- Wave 8 ocean (#25) ------------------------------------------------
+    // FFT ocean displacement (slot 14) + normal (slot 15). Read-only in the
+    // shader (Texture2D on Metal -- off the 8-RW cap; RWTexture2D on
+    // Vulkan). Bound only when allocated (r_ocean was on at least once);
+    // the shader samples them only when ocean_params0.x != 0, so on the
+    // off path the slots stay unbound (PARTIALLY_BOUND on Vulkan covers
+    // it). On Metal, slots above a kernel's texture count are dropped.
+    if (ocean_disp_tex_id_ != 0) {
+        cb->BindStorageTexture(14, pt::rhi::TextureHandle{ocean_disp_tex_id_});
+    }
+    if (ocean_normal_tex_id_ != 0) {
+        cb->BindStorageTexture(15, pt::rhi::TextureHandle{ocean_normal_tex_id_});
+    }
+    // --- end Wave 8 ocean --------------------------------------------------
 
     std::uint32_t bounces = 8;
     if (auto* v = C.FindCVar("r_max_bounces")) bounces = (std::uint32_t)v->GetInt();
@@ -6754,6 +6860,31 @@ void Engine::RenderFrame() {
         float mesh_motion_prev[4];
         float mesh_motion_curr[4];
         // --- end Mesh motion blur ----------------------------------------
+        // --- Wave 8 ocean (#25) ------------------------------------------
+        // FFT Tessendorf ocean surface params. Two vec4 = 32 B. Matches
+        // PathTrace.slang's `ocean_params0` / `ocean_params1` in BOTH the
+        // Metal Push cbuffer and the SPIR-V Frame UBO spilled tail (added
+        // at the very end so existing field offsets are untouched).
+        //   ocean_params0.x = ocean_enabled (0 -> shader's MAT_WATER
+        //                     branch uses the Phase 1 analytic wave
+        //                     normal; non-zero -> ray-march the
+        //                     displaced FFT heightfield).
+        //                .y = tile_size_m (metres per displacement-texture
+        //                     tile; world XZ / tile -> UV).
+        //                .z = choppiness (lateral Gerstner displacement
+        //                     scale; informs the ray-march's horizontal
+        //                     search slack).
+        //                .w = max_disp_y (peak |height| this frame, m;
+        //                     the heightfield march brackets the plane
+        //                     by +/- this so it only searches the band
+        //                     the surface actually occupies).
+        //   ocean_params1.x = march_steps (cast to int; capped 8..256).
+        //                .y = grid_size (texels per tile edge; the shader
+        //                     uses it to size the bilinear fetch wrap).
+        //                .z/.w reserved.
+        float ocean_params0[4];
+        float ocean_params1[4];
+        // --- end Wave 8 ocean --------------------------------------------
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -7897,6 +8028,42 @@ void Engine::RenderFrame() {
         push.mesh_motion_curr[3] = 0.0f;
     }
     // --- end Mesh motion blur ----------------------------------------------
+    // --- Wave 8 ocean (#25) ------------------------------------------------
+    // Gate + parameters for the FFT ocean ray-march. The gate is set ONLY
+    // when r_ocean != 0 AND the displacement texture is actually allocated
+    // (StepOcean uploads it). On the Software backend (CPU tracer) the
+    // textures aren't sampled, so the gate is harmless there. When off,
+    // ocean_params0.x == 0 keeps the shader's MAT_WATER branch on the
+    // Phase 1 analytic-plane path -- bit-exact, zero added cost.
+    {
+        int ocean_gate = 0;
+        if (auto* v = C.FindCVar("r_ocean")) ocean_gate = v->GetInt();
+        const bool ocean_on =
+            (ocean_gate != 0) && (ocean_disp_tex_id_ != 0) &&
+            (ocean_normal_tex_id_ != 0);
+
+        float tile = 50.0f;
+        if (auto* v = C.FindCVar("r_ocean_tile_size")) tile = v->GetFloat();
+        if (tile < 1.0f) tile = 1.0f;
+        float choppy = 1.0f;
+        if (auto* v = C.FindCVar("r_ocean_choppiness")) choppy = v->GetFloat();
+        int march = 64;
+        if (auto* v = C.FindCVar("r_ocean_march_steps")) march = v->GetInt();
+        if (march < 8)   march = 8;
+        if (march > 256) march = 256;
+
+        push.ocean_params0[0] = ocean_on ? 1.0f : 0.0f;
+        push.ocean_params0[1] = tile;
+        push.ocean_params0[2] = choppy;
+        // Peak |height| this frame (m). A small slack added so the march's
+        // upper bracket clears the tallest crest even mid-interpolation.
+        push.ocean_params0[3] = ocean_max_disp_y_ * 1.25f + 0.05f;
+        push.ocean_params1[0] = static_cast<float>(march);
+        push.ocean_params1[1] = static_cast<float>(ocean_tex_grid_);
+        push.ocean_params1[2] = 0.0f;
+        push.ocean_params1[3] = 0.0f;
+    }
+    // --- end Wave 8 ocean --------------------------------------------------
     // --- Underwater medium tracking (Phase 4, #134) ------------------------
     // Pack:
     //   .x = 1.0 if camera position is inside any MAT_WATER plane's
@@ -8061,8 +8228,12 @@ void Engine::RenderFrame() {
     //                              struct between dof_params and vol_params;
     //                              added here as a trailing +16 since the
     //                              assert only checks the total byte size.
+    //   +32 Wave 8 ocean (#25) — ocean_params0 + ocean_params1, two vec4s
+    //                              (enabled/tile/choppy/max_disp_y +
+    //                               march_steps/grid/_/_)
     static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 32 + 16
-                  + 16 /* Wave 8 spectral (#27): spectral_params */);
+                  + 16 /* Wave 8 spectral (#27): spectral_params */
+                  + 32 /* Wave 8 ocean (#25): ocean_params0 + ocean_params1 */);
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
     // cbuffer layout the Slang compiler applies to PathTrace.slang's
@@ -10954,6 +11125,14 @@ void Engine::Tick(double dt) {
     // tracer reads them. No-op when r_smoke_mode == procedural.
     StepSmokeSPH(static_cast<float>(dt));
     // --- end Fluid Phase 3 -----------------------------------------------
+
+    // --- Wave 8 ocean (#25) -- FFT ocean step ----------------------------
+    // Advance the FFT ocean BEFORE RenderFrame so the displacement +
+    // normal textures the path tracer samples reflect the current frame's
+    // surface. No-op when r_ocean == 0 (the solver isn't stepped and the
+    // textures aren't re-uploaded).
+    StepOcean(static_cast<float>(dt));
+    // --- end Wave 8 ocean ------------------------------------------------
 
     auto t0 = std::chrono::steady_clock::now();
     RenderFrame();
@@ -18760,6 +18939,127 @@ void Engine::EnsureSmokeSphUploaded() {
                          packed.data(), packed.size() * sizeof(float));
     sph_particle_count_uploaded_ = n;
 }
+
+// --- Wave 8 ocean (#25) ----------------------------------------------------
+void Engine::StepOcean(float dt) {
+    if (!ocean_) return;
+    auto& C = pt::console::Console::Get();
+
+    int gate = 0;
+    if (auto* v = C.FindCVar("r_ocean")) gate = v->GetInt();
+    if (gate == 0) {
+        // Ocean off: don't step the solver or re-upload textures. The
+        // host pushes ocean_params0.x = 0 in BuildAndDispatch so the
+        // shader's MAT_WATER branch keeps the Phase 1 analytic-plane
+        // wave-normal path bit-exact. We deliberately leave ocean_time_
+        // untouched so re-enabling resumes a continuous animation.
+        ocean_max_disp_y_ = 0.0f;
+        return;
+    }
+
+    // Pull tunables from cvars each frame so live console edits take
+    // effect next tick. All real SI units (g = 9.81, wind m/s, tile m).
+    auto& cfg = ocean_->MutableConfig();
+    if (auto* v = C.FindCVar("r_ocean_wind_speed")) {
+        const float ws = v->GetFloat();
+        cfg.wind_speed = (ws > 0.0f) ? ws : 0.001f;
+    }
+    if (auto* v = C.FindCVar("r_ocean_wind_dir_deg")) {
+        cfg.wind_dir_rad = v->GetFloat() * (3.14159265358979f / 180.0f);
+    }
+    if (auto* v = C.FindCVar("r_ocean_amplitude")) {
+        const float a = v->GetFloat();
+        cfg.amplitude = (a >= 0.0f) ? a : 0.0f;
+    }
+    if (auto* v = C.FindCVar("r_ocean_choppiness")) {
+        float ch = v->GetFloat();
+        if (ch < 0.0f)  ch = 0.0f;
+        if (ch > 1.5f)  ch = 1.5f;
+        cfg.choppiness = ch;
+    }
+    if (auto* v = C.FindCVar("r_ocean_tile_size")) {
+        const float ts = v->GetFloat();
+        cfg.patch_size_m = (ts > 1.0f) ? ts : 1.0f;
+    }
+    if (auto* v = C.FindCVar("r_ocean_foam_threshold")) {
+        cfg.foam_threshold = v->GetFloat();
+    }
+    if (auto* v = C.FindCVar("r_ocean_grid_size")) {
+        int g = v->GetInt();
+        // Snap to the nearest supported power-of-two in {64,128,256,512}.
+        std::uint32_t gs = 256u;
+        if      (g <= 96)  gs = 64u;
+        else if (g <= 192) gs = 128u;
+        else if (g <= 384) gs = 256u;
+        else               gs = 512u;
+        cfg.grid_size = gs;
+    }
+
+    // Advance the absolute sim clock. The spectrum evolution
+    // H0*exp(i*w*t) is a closed-form function of absolute time, so
+    // accumulating dt keeps the surface frame-rate independent and lets
+    // the golden fixture's fixed frame count warm the sim to a known
+    // (within FP tolerance) state.
+    ocean_time_ += static_cast<double>(dt);
+    ocean_->Update(ocean_time_);
+    ocean_max_disp_y_ = ocean_->MaxDisplacementY();
+
+    EnsureOceanUploaded();
+}
+
+void Engine::EnsureOceanUploaded() {
+    if (!device_ || !ocean_) return;
+    const std::uint32_t grid = ocean_->GridSize();
+    if (grid == 0u) return;
+
+    // (Re)allocate the displacement + normal textures on first use or
+    // when the grid size changed. RGBA32F (not 16F) so the negative,
+    // wide-range displacement + slope values survive without the f16
+    // precision loss that would shimmer the heightfield ray-march at
+    // grazing angles. Two N^2 RGBA32F textures = 2 MB at N=256.
+    if (ocean_disp_tex_id_ == 0 || ocean_normal_tex_id_ == 0 ||
+        ocean_tex_grid_ != grid) {
+        if (ocean_disp_tex_id_ != 0) {
+            device_->DestroyTexture(pt::rhi::TextureHandle{ocean_disp_tex_id_});
+            ocean_disp_tex_id_ = 0;
+        }
+        if (ocean_normal_tex_id_ != 0) {
+            device_->DestroyTexture(pt::rhi::TextureHandle{ocean_normal_tex_id_});
+            ocean_normal_tex_id_ = 0;
+        }
+        auto disp = device_->CreateTexture({
+            .width = grid, .height = grid,
+            .format = pt::rhi::TextureFormat::RGBA32F,
+            .usage  = pt::rhi::TextureUsage::Storage,
+            .debug_name = "ocean_displacement",
+        });
+        auto nrm = device_->CreateTexture({
+            .width = grid, .height = grid,
+            .format = pt::rhi::TextureFormat::RGBA32F,
+            .usage  = pt::rhi::TextureUsage::Storage,
+            .debug_name = "ocean_normal",
+        });
+        if (disp.id == 0 || nrm.id == 0) {
+            LOG_ERROR("ocean: displacement/normal texture allocation failed");
+            if (disp.id != 0) device_->DestroyTexture(disp);
+            if (nrm.id  != 0) device_->DestroyTexture(nrm);
+            return;
+        }
+        ocean_disp_tex_id_   = disp.id;
+        ocean_normal_tex_id_ = nrm.id;
+        ocean_tex_grid_      = grid;
+        LOG_INFO("ocean: FFT displacement + normal textures {}x{} RGBA32F",
+                 grid, grid);
+    }
+
+    const auto& disp_rgba = ocean_->DisplacementRGBA();
+    const auto& nrm_rgba  = ocean_->NormalRGBA();
+    device_->WriteTexture(pt::rhi::TextureHandle{ocean_disp_tex_id_},
+                          disp_rgba.data(), disp_rgba.size() * sizeof(float));
+    device_->WriteTexture(pt::rhi::TextureHandle{ocean_normal_tex_id_},
+                          nrm_rgba.data(), nrm_rgba.size() * sizeof(float));
+}
+// --- end Wave 8 ocean ------------------------------------------------------
 
 void Engine::RegisterSmokeSphCommands() {
     auto& C = pt::console::Console::Get();

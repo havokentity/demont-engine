@@ -94,10 +94,16 @@ private:
     //   12 roughness_tex (issue #118: R32F per-pixel roughness)
     //   13 specular_hit_distance_tex (issue #118: R32F distance to
     //      specularly-reflected hit)
+    //   14 ocean_displacement (Wave 8 #25: RGBA32F FFT ocean displacement
+    //      xyz + foam.w; read-only Texture2D on Metal -- OFF the 8-RW cap)
+    //   15 ocean_normal (Wave 8 #25: RGBA32F FFT ocean surface normal;
+    //      read-only Texture2D on Metal)
     //   On Metal slots above the kernel's actual texture count are
     //   silently dropped; on Vulkan the slot table in
-    //   VulkanDevice.cpp maps them to vk::binding numbers.
-    TextureHandle              bound_tex_[14] {};
+    //   VulkanDevice.cpp maps them to vk::binding numbers. Array sized 16
+    //   to fit the two Wave 8 ocean textures at slots 14/15; bump again
+    //   before adding more.
+    TextureHandle              bound_tex_[16] {};
     // Buffer slots. Slots 0..7 are the original engine layout
     // (mesh_positions / mesh_indices, primitives, marginal /
     // conditional CDFs, exposure_state, analytic-prim bvh_nodes).

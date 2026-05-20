@@ -58,9 +58,14 @@ private:
     // (RGBA16F F0), roughness (R32F surface roughness), and
     // specular_hit_distance (R32F reflection depth). Vulkan mirrors
     // them for SPIR-V slot stability but the in-house NRD/SVGF chain
-    // doesn't consume them today (#50 will). Keep in sync with
-    // kSlotToTexBinding[] in VulkanDevice.cpp.
-    TextureHandle  bound_tex_[14] {};
+    // doesn't consume them today (#50 will).
+    // Slots 14/15 (Wave 8 ocean, #25) are the FFT ocean displacement +
+    // normal textures (RGBA32F; vk::binding 32/33). The array was [14]
+    // pre-#25 which silently dropped BindStorageTexture(>= 14, ...) at
+    // the bounds-check in BindStorageTexture() -- the ocean read all
+    // zeros on Vulkan until this was bumped to [16]. Keep in sync with
+    // kSlotToTexBinding[] / kNumTexSlots in VulkanDevice.cpp.
+    TextureHandle  bound_tex_[16] {};
     // 14 buffer slots:
     //   0..7   original engine layout (mesh_positions / mesh_indices,
     //          primitives, marginal / conditional CDFs, exposure_state,

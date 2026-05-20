@@ -245,6 +245,32 @@ Texture2D<float4> moon_map;
 // comment for the WTexture2D vs RWTexture2D rationale.
 [[vk::binding(26, 0), vk::image_format("r32f")]] WTexture2D<float>  specular_hit_distance_tex;
 
+// --- Wave 8 ocean (#25) ----------------------------------------------------
+// FFT Tessendorf ocean displacement + normal textures, written CPU-side by
+// pt::ocean::OceanFFT and uploaded each frame (RGBA32F). The path tracer
+// SAMPLES them (read-only) while ray-marching the displaced heightfield off
+// any MAT_WATER plane, so -- exactly like env_map / star_map / moon_map --
+// they're declared as read-only Texture2D on Metal (which keeps them OFF
+// Apple Silicon's 8-RW-texture compute cap that PathTrace already saturates)
+// and RWTexture2D on Vulkan (whose descriptor layout already wires storage
+// images; switching to sampled images there would cascade through the
+// pipeline layout for no gain). vk::binding 32/33 sit one past the SPH
+// particle SSBO's 31 -- the next free bindings on the integration branch.
+//
+// ocean_displacement: .xyz = world-space displacement (m, y = height,
+//                     xz = choppy Gerstner lateral push), .w = foam in
+//                     [0,1]. ocean_normal: .xyz = unit world normal.
+// Both tile every ocean_params0.y metres of world XZ. Gated entirely by
+// ocean_params0.x -- when 0 the MAT_WATER branch never touches these.
+#ifdef PT_TARGET_METAL
+Texture2D<float4> ocean_displacement;
+Texture2D<float4> ocean_normal;
+#else
+[[vk::binding(32, 0), vk::image_format("rgba32f")]] RWTexture2D<float4> ocean_displacement;
+[[vk::binding(33, 0), vk::image_format("rgba32f")]] RWTexture2D<float4> ocean_normal;
+#endif
+// --- end Wave 8 ocean ------------------------------------------------------
+
 // GPU-resident exposure scalar. Updated each frame by AutoExposure.slang
 // (when r_auto_exposure = 1) or written once by the engine via
 // WriteBuffer (when r_auto_exposure = 0, holding the manual r_exposure
@@ -992,6 +1018,17 @@ cbuffer Push {
     float4 mesh_motion_prev;
     float4 mesh_motion_curr;
     // --- end Mesh motion blur -------------------------------------------------
+    // --- Wave 8 ocean (#25) ---------------------------------------------------
+    // FFT ocean ray-march parameters. See Engine.cpp's PtPush::ocean_params0
+    // / ocean_params1 for the full field-by-field layout.
+    //   ocean_params0.x = ocean_enabled (0 -> Phase 1 analytic wave normal)
+    //                .y = tile_size_m (world XZ / tile -> displacement UV)
+    //                .z = choppiness (lateral displacement scale)
+    //                .w = max_disp_y (peak |height| this frame, m)
+    //   ocean_params1.x = march_steps (int) ; .y = grid_size ; .zw reserved.
+    float4 ocean_params0;
+    float4 ocean_params1;
+    // --- end Wave 8 ocean -----------------------------------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -1106,6 +1143,11 @@ cbuffer Frame {
     // cbuffer above (wave-7 #21).
     float4 mesh_motion_prev;
     float4 mesh_motion_curr;
+    // --- Wave 8 ocean (#25) ---------------------------------------------------
+    // See `ocean_params0` / `ocean_params1` in the Metal Push cbuffer above.
+    float4 ocean_params0;
+    float4 ocean_params1;
+    // --- end Wave 8 ocean -----------------------------------------------------
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -3997,6 +4039,182 @@ float3 waterShadingNormal(float3 world_p, float3 macro_n) {
     float3 perturbed = macro_n - amp * (dh_dx * tx + dh_dz * tz);
     return normalize(perturbed);
 }
+
+// --- Wave 8 ocean (#25) -- FFT heightfield ray-march -----------------------
+// Bilinear, wrap-around fetch of the ocean textures in tile-UV space. The
+// CPU FFT output tiles seamlessly, so we wrap with frac() and lerp four
+// texels. Manual filtering (integer fetches + lerp) avoids needing a Slang
+// SamplerState, matching how env_map is read by integer index elsewhere.
+//
+// The fetch is split into a target-agnostic weight computation
+// (oceanBilinearTexels) + two thin per-texture wrappers, because the two
+// ocean textures are declared as read-only Texture2D on Metal but
+// RWTexture2D on Vulkan -- a single helper taking the texture as a
+// parameter can't bind to both types across backends, so we index the
+// global textures directly inside the per-texture wrappers.
+struct OceanTexel {
+    uint2 c00; uint2 c10; uint2 c01; uint2 c11;
+    float tx;  float ty;
+};
+OceanTexel oceanBilinearTexels(float2 uv, uint grid) {
+    OceanTexel o;
+    float2 f = frac(uv);
+    if (f.x < 0.0) f.x += 1.0;
+    if (f.y < 0.0) f.y += 1.0;
+    float gx = f.x * float(grid) - 0.5;
+    float gy = f.y * float(grid) - 0.5;
+    int x0 = int(floor(gx));
+    int y0 = int(floor(gy));
+    o.tx = gx - float(x0);
+    o.ty = gy - float(y0);
+    uint x0u = uint((x0 % int(grid) + int(grid)) % int(grid));
+    uint y0u = uint((y0 % int(grid) + int(grid)) % int(grid));
+    uint x1u = (x0u + 1u) % grid;
+    uint y1u = (y0u + 1u) % grid;
+    o.c00 = uint2(x0u, y0u);
+    o.c10 = uint2(x1u, y0u);
+    o.c01 = uint2(x0u, y1u);
+    o.c11 = uint2(x1u, y1u);
+    return o;
+}
+float4 oceanFetchDisp(float2 uv, uint grid) {
+    OceanTexel o = oceanBilinearTexels(uv, grid);
+    float4 c00 = ocean_displacement[o.c00];
+    float4 c10 = ocean_displacement[o.c10];
+    float4 c01 = ocean_displacement[o.c01];
+    float4 c11 = ocean_displacement[o.c11];
+    return lerp(lerp(c00, c10, o.tx), lerp(c01, c11, o.tx), o.ty);
+}
+float4 oceanFetchNormal(float2 uv, uint grid) {
+    OceanTexel o = oceanBilinearTexels(uv, grid);
+    float4 c00 = ocean_normal[o.c00];
+    float4 c10 = ocean_normal[o.c10];
+    float4 c01 = ocean_normal[o.c01];
+    float4 c11 = ocean_normal[o.c11];
+    return lerp(lerp(c00, c10, o.tx), lerp(c01, c11, o.tx), o.ty);
+}
+
+// Sampled ocean surface height (world-space Y displacement, metres) at a
+// world XZ point. plane_y is the analytic water-plane height; the displaced
+// surface sits at plane_y + height.
+float oceanHeightAt(float3 world_p, float plane_y) {
+    float tile = ocean_params0.y;
+    uint  grid = uint(max(ocean_params1.y, 1.0));
+    float2 uv  = float2(world_p.x, world_p.z) / max(tile, 1e-3);
+    float4 d   = oceanFetchDisp(uv, grid);
+    return plane_y + d.y;
+}
+
+// Result of the ocean heightfield ray-march.
+struct OceanHit {
+    bool   hit;
+    float  t;          // ray parameter of the displaced-surface crossing
+    float3 normal;     // FFT surface normal at the hit
+    float  foam;       // foam coverage [0,1] at the hit
+};
+
+// Ray-march the FFT ocean heightfield starting from (and bounded by) the
+// analytic water-plane intersection. Standard relief-mapping linear search +
+// one bisection refinement: step the ray downward through the displacement
+// band [plane_y - h_max, plane_y + h_max], detecting the first sample where
+// the ray crosses from above the surface to below it.
+//
+//   ro, rd   : ray origin / unit direction (world space).
+//   plane_n  : analytic water-plane normal (used only to early-out on
+//              edge-on rays).
+//   plane_y  : world-space Y of the flat water plane.
+//   plane_t  : ray parameter at the analytic plane crossing (far bound).
+//   max_steps: linear-search step budget (ocean_params1.x).
+OceanHit oceanRayMarch(float3 ro, float3 rd, float3 plane_n,
+                       float plane_y, float plane_t, int max_steps) {
+    OceanHit oh;
+    oh.hit = false; oh.t = plane_t;
+    oh.normal = plane_n; oh.foam = 0.0;
+
+    float h_max = max(ocean_params0.w, 0.01);   // peak |height| + slack (m)
+    uint  grid  = uint(max(ocean_params1.y, 1.0));
+    float tile  = ocean_params0.y;
+
+    // Rays nearly parallel to the surface: the heightfield march is
+    // ill-conditioned (a tiny |rd.y| explodes the vertical search into a
+    // huge t-range). Fall back to the analytic plane hit + FFT normal at
+    // the plane crossing -- visually fine at the horizon where these rays
+    // graze, and avoids a pathological step count.
+    if (abs(rd.y) < 1e-3) {
+        float3 pp = ro + rd * plane_t;
+        float2 uv = float2(pp.x, pp.z) / max(tile, 1e-3);
+        oh.normal = normalize(oceanFetchNormal(uv, grid).xyz);
+        oh.foam   = oceanFetchDisp(uv, grid).w;
+        oh.t = plane_t;
+        oh.hit = true;
+        return oh;
+    }
+
+    // Entry/exit of the displacement band along the ray. The surface lives
+    // within plane_y +/- h_max; clamp the search to where the ray is inside
+    // that slab so we don't waste steps in empty space.
+    float t_top = (plane_y + h_max - ro.y) / rd.y;
+    float t_bot = (plane_y - h_max - ro.y) / rd.y;
+    float t_enter = min(t_top, t_bot);
+    float t_exit  = max(t_top, t_bot);
+    t_enter = max(t_enter, 0.0);
+    // Never march past the analytic plane: it's the guaranteed backstop.
+    t_exit  = min(t_exit, plane_t + h_max / max(abs(rd.y), 1e-3));
+    if (t_exit <= t_enter) {
+        // Degenerate band: just take the plane.
+        oh.t = plane_t; oh.hit = true;
+        float3 pp = ro + rd * plane_t;
+        float2 uv = float2(pp.x, pp.z) / max(tile, 1e-3);
+        oh.normal = normalize(oceanFetchNormal(uv, grid).xyz);
+        oh.foam   = oceanFetchDisp(uv, grid).w;
+        return oh;
+    }
+
+    int steps = clamp(max_steps, 8, 256);
+    float dt  = (t_exit - t_enter) / float(steps);
+
+    float t_prev = t_enter;
+    float3 p_prev = ro + rd * t_prev;
+    // diff > 0 means the ray point is ABOVE the surface.
+    float diff_prev = p_prev.y - oceanHeightAt(p_prev, plane_y);
+
+    bool found = false;
+    float t_hit = plane_t;
+    [loop]
+    for (int i = 1; i <= steps; ++i) {
+        float t_cur = t_enter + dt * float(i);
+        float3 p_cur = ro + rd * t_cur;
+        float diff_cur = p_cur.y - oceanHeightAt(p_cur, plane_y);
+        if (diff_prev > 0.0 && diff_cur <= 0.0) {
+            // Crossing in [t_prev, t_cur]. One linear bisection on diff
+            // gives a sub-step-accurate intersection (relief-mapping
+            // secant step).
+            float w = diff_prev / max(diff_prev - diff_cur, 1e-5);
+            t_hit = lerp(t_prev, t_cur, w);
+            found = true;
+            break;
+        }
+        t_prev = t_cur;
+        p_prev = p_cur;
+        diff_prev = diff_cur;
+    }
+
+    if (!found) {
+        // No crossing found within the band: this ray skims over the
+        // wave crests and continues to the flat plane (or misses). Use
+        // the analytic plane as the surface so water still reads as a
+        // continuous sheet rather than dropping rays through to the sky.
+        t_hit = plane_t;
+    }
+
+    float3 ph = ro + rd * t_hit;
+    float2 uvh = float2(ph.x, ph.z) / max(tile, 1e-3);
+    oh.normal = normalize(oceanFetchNormal(uvh, grid).xyz);
+    oh.foam   = oceanFetchDisp(uvh, grid).w;
+    oh.t      = t_hit;
+    oh.hit    = true;
+    return oh;
+}
 #endif  // PT_WATER_ENABLED
 // --- end Water Phase 1 -----------------------------------------------------
 
@@ -4029,6 +4247,20 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // visible motion-blur streak is produced by the SHADING pass
         // (per-sample shutter_t01 inside the spp loop below).
         HitInfo h0 = traceScene(ro0, rd0, 1.0);
+        // Wave 8 ocean (#25): displace the G-buffer's water-plane hit too so
+        // the denoiser's depth + normal match the shaded displaced surface
+        // (otherwise the SVGF/MetalFX reprojection would see a flat plane
+        // where the shading pass renders waves). Same gate + march as the
+        // shading pass above.
+#if PT_WATER_ENABLED
+        if (ocean_params0.x != 0.0 && h0.hit && h0.mat == MAT_WATER &&
+            abs(h0.normal.y) > 0.5) {
+            float plane_y0 = (ro0 + rd0 * h0.t).y;
+            OceanHit oo0 = oceanRayMarch(ro0, rd0, h0.normal, plane_y0, h0.t,
+                                         int(ocean_params1.x));
+            if (oo0.hit) { h0.t = oo0.t; h0.normal = oo0.normal; }
+        }
+#endif
 
         float3 hit_world;
         float3 hit_normal;
@@ -4433,6 +4665,30 @@ void main(uint2 tid : SV_DispatchThreadID) {
 
         for (uint b = 0u; b < max_bounces; ++b) {
         HitInfo h = traceScene(ro, rd, shutter_t01);
+        // --- Wave 8 ocean (#25) -- displace the analytic water plane --------
+        // When the FFT ocean is on (ocean_params0.x != 0) and the ray hit a
+        // MAT_WATER analytic plane, ray-march the displaced FFT heightfield
+        // off that plane and overwrite h.t / h.normal with the displaced
+        // crossing + FFT surface normal. Doing this BEFORE primary_t is
+        // recorded (and before hit_pt / the MAT_WATER BRDF branch below)
+        // flows the displaced depth + normal through the G-buffer, aerial
+        // perspective, Beer's-law segment, and shading uniformly. h.albedo's
+        // alpha carries the per-hit foam coverage for the BRDF branch.
+        float ocean_foam_here = 0.0;
+#if PT_WATER_ENABLED
+        if (ocean_params0.x != 0.0 && h.hit && h.mat == MAT_WATER &&
+            abs(h.normal.y) > 0.5) {
+            float plane_y = (ro + rd * h.t).y;   // analytic plane height
+            OceanHit oo = oceanRayMarch(ro, rd, h.normal, plane_y, h.t,
+                                        int(ocean_params1.x));
+            if (oo.hit) {
+                h.t = oo.t;
+                h.normal = oo.normal;
+                ocean_foam_here = oo.foam;
+            }
+        }
+#endif
+        // --- end Wave 8 ocean -----------------------------------------------
         if (b == 0u) {
             // Sky pixels (no hit) keep the 50km default so cloud
             // marches reach the layer; object hits override.
@@ -5091,7 +5347,37 @@ void main(uint2 tid : SV_DispatchThreadID) {
             // (sphere submerged) and above-water hits share one branch.
             float water_ior = clamp(h.ior > 0.0 ? h.ior : water_params0.w,
                                     1.0, 2.4);
-            float3 shading_n = waterShadingNormal(hit_pt, h.normal);
+            // FFT ocean (#25): when on, h.normal already carries the
+            // displaced FFT surface normal from the heightfield march --
+            // use it directly instead of re-perturbing with the Phase 1
+            // value-noise wave normal (which would double-bump the
+            // surface). Off -> the Phase 1 analytic wave normal as before.
+            float3 shading_n = (ocean_params0.x != 0.0)
+                                   ? h.normal
+                                   : waterShadingNormal(hit_pt, h.normal);
+            // Foam: where the choppy displacement folds, the crest is
+            // breaking -- short-circuit the transparent-water BRDF and
+            // treat the surface as a bright Lambertian whitecap. Stochastic
+            // pick weighted by foam coverage keeps it cheap and dithered.
+            if (ocean_params0.x != 0.0 && ocean_foam_here > 0.0 &&
+                randf(seed) < ocean_foam_here) {
+                // Diffuse white spray. Bounce a cosine-weighted ray off the
+                // FFT normal; the next bounce gathers sky/sun light so foam
+                // reads as a self-shadowing matte-white surface.
+                float3 nf_foam = (dot(h.normal, rd) < 0.0) ? h.normal : -h.normal;
+                throughput *= float3(0.8, 0.82, 0.85);   // sea-foam albedo
+                rd = sampleCosineHemisphere(nf_foam, seed);
+                ro = hit_pt + nf_foam * 1e-3;
+                skip_sky_on_miss = false;
+                prev_was_lambert_nee = false;
+                if (b >= 2u) {
+                    float pf = max(throughput.r, max(throughput.g, throughput.b));
+                    pf = clamp(pf, 0.05, 1.0);
+                    if (randf(seed) > pf) break;
+                    throughput /= pf;
+                }
+                continue;
+            }
             float ndi_s = dot(shading_n, rd);
             float3 nf_s = (ndi_s < 0.0) ? shading_n : -shading_n;
 
