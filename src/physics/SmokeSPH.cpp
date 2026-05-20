@@ -233,12 +233,17 @@ std::uint32_t SmokeSPH::PackForGpu(float* dst_floats,
         // ratio == 1 unless particles are highly compressed, which
         // we don't see in low-Re smoke. Pure constant-per-particle
         // density gives a more controllable, predictable splat.
-        // Age fade applies a (1 - age/life)^1.5 cubic-ish curve so
-        // particles wisp out at the end of their life rather than
-        // popping off the buffer with full opacity.
+        // Wave 8 (#28): steeper (1 - age/life)^2 age-fade (was ^1.5) so
+        // density concentrates in the YOUNG near-emitter particles --
+        // a dense bright base -- while older particles thin out faster
+        // into wispy edges. Paired with the shader's age tint gradient
+        // (fresh bright -> old grey), this gives the plume a coherent
+        // dense core + wispy crown instead of a uniform-density haze
+        // (the PR's "hazy cloud, not a sharp columnar plume" symptom).
         const float a_norm  = (lifetime_ref > 0.0f)
                               ? std::min(p.age / lifetime_ref, 1.0f) : 0.0f;
-        const float fade    = std::pow(std::max(1.0f - a_norm, 0.0f), 1.5f);
+        const float one_m   = std::max(1.0f - a_norm, 0.0f);
+        const float fade    = one_m * one_m;
         o[4] = render_density_scale * fade;
         o[5] = a_norm;
         o[6] = 0.0f;

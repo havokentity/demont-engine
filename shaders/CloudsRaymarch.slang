@@ -38,7 +38,10 @@
 //      by HG phase + powder term + altitude-boosted sun radiance to
 //      get the in-scatter contribution; multiply by camera-ray
 //      transmittance accumulated so far. Accumulate into the running
-//      colour.
+//      colour. A multi-octave multiple-scattering approximation
+//      (Wrenninge/Schneider/Hillaire) brightens the cloud body to
+//      match the real-cloud look that single-scatter alone misses --
+//      see msScatter() below (Wave 8 #28).
 //   5. Advance camera-ray transmittance: T_cam *= exp(-sigma_t * dt).
 //   6. Write { rgb = in_scatter, a = 1 - T_cam } to clouds_color_tex
 //      and T_cam to cloud_trans_tex (StarsComposite reads this slot
@@ -110,10 +113,10 @@ cbuffer Frame {
     float4 clouds_p2;
     float4 clouds_p3;
     float4 clouds_p4;
-    // .x vol_density_scale, .y vol_phase_g_cloud, .z vol_multiscatter_oct,
-    // .w sun_radiance_scale (we collapse sun_rad to a scalar through the
-    // exposure_pad chain on the host side -- simpler than re-deriving it
-    // from sky mode every kernel).
+    // .x vol_density_scale, .y vol_phase_g_cloud, .z vol_multiscatter_oct
+    // (Wrenninge octave count, clamped 0..4 in shader),
+    // .w vol_intensity (r_volumetric_intensity -- the final v_color *
+    // vol_int multiplier the inline path-traced march applies; Wave 8 #28).
     float4 raymarch_params;
     // .x temporal_alpha (0 disables EMA, [0,1]), .y resolution_scale
     // (1.0 = full-res; 0.5 = half-res; engine clamps).
@@ -122,7 +125,10 @@ cbuffer Frame {
     float4 raymarch_quality;
     // Sun & moon radiance (linear RGB). These are pre-computed by the
     // engine to match PathTrace.slang's sun_rad/moon_rad derivation so
-    // the pre-pass matches the inline march's lighting.
+    // the pre-pass matches the inline march's lighting (Wave 8 #28).
+    // sun_radiance.w carries sun_am (1/sin(elevation)) so the kernel can
+    // apply the same per-sample altitude boost exp(0.30*sun_am*h_norm)
+    // the inline march uses for high clouds.
     float4 sun_radiance;
     float4 moon_radiance;
     // Sky-tint ambient (PathTrace's sky_ambient term, baked into a
@@ -257,6 +263,57 @@ float powderTerm(float dens, float dt_layer) {
     return 1.0 - exp(-max(dens, 0.0) * dt_layer * 2.0);
 }
 
+// Multi-octave multiple-scattering approximation (Wave 8 #28).
+// Real clouds are bright because photons scatter MANY times inside the
+// volume before exiting toward the eye; a single light-march toward the
+// sun captures only the first bounce and renders the cloud body far too
+// dark. The standard real-time trick (Wrenninge 2013 "Oz: The Great and
+// Volumetric"; Schneider 2015; Hillaire 2016) sums N octaves where each
+// octave attenuates the scattering coefficient + transmittance and
+// flattens the phase function toward isotropic:
+//
+//   L = Σ_{n=0..N}  a^n · phase(g·c^n) · T_sun^(b^n)
+//
+//   a (energy decay)         -- 0.5: each octave contributes half the
+//                               previous octave's energy.
+//   b (extinction decay)     -- 0.5: deeper octaves see the sun through
+//                               HALF the optical depth (T^(b^n) -> 1),
+//                               i.e. light that bounced its way deeper
+//                               into the cloud. This is the term that
+//                               actually fills in self-shadowed cores.
+//   c (anisotropy decay)     -- 0.5: multi-scattered light loses
+//                               directionality, so the phase lobe
+//                               flattens toward isotropic each octave.
+//
+// Octave 0 (a^0=b^0=c^0=1) is exactly the single-scatter term, so
+// N=0 reduces to the legacy behaviour. The inline path-traced march in
+// PathTrace.slang uses the SAME (a,b,c)=(0.5,0.5,0.5) coefficients on
+// its octave sum (it attenuates the per-octave step weight + phase g but
+// reuses one shadow transmittance); we additionally raise T_sun to b^n
+// so the raymarch's coarser single light-march still brightens cores
+// realistically. `c_view` is the camera-ray vs light cosine; `g` the
+// base HG anisotropy; `T_sun` the Beer-Lambert sun transmittance at the
+// sample; `n_oct` the octave count (clamped 0..6).
+float3 msScatter(float c_view, float g, float T_sun, int n_oct) {
+    float3 acc = float3(0.0);
+    float a_pow = 1.0;   // a^n  energy
+    float b_pow = 1.0;   // b^n  extinction
+    float c_pow = 1.0;   // c^n  anisotropy
+    [unroll(7)] for (int n = 0; n <= n_oct; ++n) {
+        float g_o = g * c_pow;
+        float ph  = hgPhase(c_view, g_o);
+        // T_sun in [0,1]; pow(T, b^n) >= T for b^n <= 1, so deeper
+        // octaves transmit MORE -- the multi-scatter fill. Guard the
+        // pow against T==0 (pow(0, +x)=0 is fine, but keep it explicit).
+        float T_o = pow(max(T_sun, 1e-4), b_pow);
+        acc += a_pow * ph * T_o;
+        a_pow *= 0.5;
+        b_pow *= 0.5;
+        c_pow *= 0.5;
+    }
+    return acc;
+}
+
 // Slab intersection: cloud layer is [base_y, top_y].
 // Returns (t_in, t_out); when ray misses the slab, t_out < t_in.
 float2 slabIntersect(float3 ro, float3 rd, float base_y, float top_y) {
@@ -278,7 +335,17 @@ float2 slabIntersect(float3 ro, float3 rd, float base_y, float top_y) {
 void main(uint3 tid : SV_DispatchThreadID) {
     uint2 dim;
     clouds_color_tex.GetDimensions(dim.x, dim.y);
-    if (tid.x >= dim.x || tid.y >= dim.y) return;
+    // Wave 8 (#28): sub-resolution rendering. The clouds_color/cloud_trans
+    // textures are allocated at FULL res, but at res_scale < 1 the engine
+    // dispatches only (W*scale, H*scale) groups, so each low-res invocation
+    // owns a (1/scale)^2 block of the screen and writes the top-left
+    // quadrant of the full-res texture 1:1. ldim is the active low-res
+    // grid; gate against it so trailing threads in the last (rounded-up)
+    // workgroup don't write stale texels with out-of-range rays.
+    float res_scale = clamp(raymarch_quality.y, 0.05, 1.0);
+    uint2 ldim = uint2(max(1u, uint(float(dim.x) * res_scale + 0.5)),
+                       max(1u, uint(float(dim.y) * res_scale + 0.5)));
+    if (tid.x >= ldim.x || tid.y >= ldim.y) return;
 
     // Composite-active early-out: clouds disabled or mode != raymarched.
     // Engine elides the dispatch entirely in those cases but the guard
@@ -307,8 +374,15 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // When temporal EMA is off, suppress jitter so the output is
     // deterministic frame-to-frame for the golden test path.
     if (raymarch_params.x <= 0.0) { jx = 0.0; jy = 0.0; }
+    // Map the low-res invocation to the CENTRE of the full-res block it
+    // represents: normalised UV uses the LOW-RES grid dimensions (ldim),
+    // not the full-res texture size, so a half-res thread at (cx,cy)
+    // reconstructs the ray through full-res pixel (cx+0.5)/scale rather
+    // than (cx+0.5) (which would bias every sample toward the top-left of
+    // the screen). At res_scale == 1, ldim == dim and this is identical to
+    // the previous full-res math (Wave 8 #28).
     float2 uv = (float2(float(tid.x) + 0.5 + jx,
-                        float(tid.y) + 0.5 + jy) / float2(dim))
+                        float(tid.y) + 0.5 + jy) / float2(ldim))
               * 2.0 - 1.0;
     uv.y = -uv.y;   // Slang/Vulkan UV convention: y flipped.
     float3 rd = normalize(fwd_aspect.xyz
@@ -334,6 +408,12 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // March parameters.
     float vol_dscale = max(raymarch_params.x, 1e-3);
     float g_cloud    = clamp(raymarch_params.y, -0.95, 0.95);
+    // Wave 8 (#28): multi-scatter octave count + final intensity scale,
+    // matching the inline path-traced cloud march. ms_oct clamps 0..4
+    // (deeper octaves fall below the ACES knee); vol_int is the final
+    // v_color * vol_int multiplier (r_volumetric_intensity).
+    int   ms_oct  = clamp(int(raymarch_params.z + 0.5), 0, 4);
+    float vol_int = max(raymarch_params.w, 0.0);
     int   light_steps = clamp(int(raymarch_quality.z + 0.5), 1, 16);
     int   N = clamp(int(raymarch_quality.w + 0.5), 8, 128);
     float dt = (t_out - t_in) / float(N);
@@ -344,6 +424,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
     float3 sun_dir = sun_and_mode.xyz;
     float3 sun_rad = sun_radiance.xyz;
+    float  sun_am  = sun_radiance.w;   // 1/sin(elev) for altitude boost
     float3 moon_dir = moon_dir_phase.xyz;
     float3 moon_rad = moon_radiance.xyz;
     float3 ambient  = sky_ambient.xyz;
@@ -362,15 +443,27 @@ void main(uint3 tid : SV_DispatchThreadID) {
         if (dens > 0.0) {
             // Light-march toward sun (and moon if active).
             float c_sun = dot(rd, -sun_dir);
-            float ph_sun = hgPhase(c_sun, g_cloud);
             float T_sun = (sun_dir.y > 0.0)
                 ? lightMarch(sp, sun_dir, clouds_p1, clouds_p2, clouds_p3, clouds_p4, vol_dscale, light_steps)
                 : 0.0;
             float c_moon = dot(rd, -moon_dir);
-            float ph_moon = hgPhase(c_moon, g_cloud);
             float T_moon = (moon_dir_phase.y > 0.0)
                 ? lightMarch(sp, moon_dir, clouds_p1, clouds_p2, clouds_p3, clouds_p4, vol_dscale, light_steps)
                 : 0.0;
+            // Multi-octave multiple-scattering (Wave 8 #28). Single-scatter
+            // (T_sun * hgPhase) alone renders the cloud body far too dark;
+            // msScatter sums N octaves to approximate the diffuse fill from
+            // light that bounced multiple times inside the volume. Reduces
+            // to the legacy single-scatter term when ms_oct == 0.
+            float3 ms_sun  = msScatter(c_sun,  g_cloud, T_sun,  ms_oct);
+            float3 ms_moon = msScatter(c_moon, g_cloud, T_moon, ms_oct);
+            // Altitude-boosted sun radiance: high clouds sit above most of
+            // the absorbing atmosphere and catch brighter, less-reddened
+            // light than the ground. Matches the inline march's
+            // exp(0.30 * sun_am * h_norm) over an 8 km reference height.
+            float h_norm = saturate(max(sp.y, 0.0) / 8000.0);
+            float boost  = (sun_am > 0.0) ? exp(0.30 * sun_am * h_norm) : 1.0;
+            float3 sun_at = sun_rad * boost;
             // Powder term: dark-bottom approximation per Schneider 2015.
             float powder = powderTerm(dens, dt);
             // Mix the powder term in at 40% strength so cloud cores
@@ -383,8 +476,8 @@ void main(uint3 tid : SV_DispatchThreadID) {
             // the inline cloud march's accumulation rule.
             float step_w = dens * dt * trans_cam;
             float3 contrib = float3(0.0);
-            contrib += sun_rad  * ph_sun  * T_sun  * powder_mix;
-            contrib += moon_rad * ph_moon * T_moon * powder_mix;
+            contrib += sun_at   * ms_sun  * powder_mix;
+            contrib += moon_rad * ms_moon * powder_mix;
             contrib += ambient;     // omnidirectional fill
             in_scatter += contrib * step_w;
             // Advance camera-ray transmittance.
@@ -396,6 +489,11 @@ void main(uint3 tid : SV_DispatchThreadID) {
         }
         t += dt;
     }
+    // Apply the final volumetric-intensity scale (r_volumetric_intensity),
+    // matching the inline path-traced march's `radiance += v_color * vol_int`
+    // (Wave 8 #28). Skip when vol_int <= 0 so a degenerate config doesn't
+    // zero out the clouds entirely -- treat 0 as "neutral 1.0".
+    in_scatter *= (vol_int > 0.0) ? vol_int : 1.0;
 
     // Premultiplied alpha. `alpha = 1 - trans_cam` so the composite
     //   final = clouds.rgb + (1 - clouds.a) * scene_radiance
