@@ -996,6 +996,28 @@ private:
     // so existing goldens stay bit-for-bit unchanged. See
     // shaders/HeightFog.slang.
     std::uint64_t                               height_fog_pipeline_id_ = 0;
+    // God rays / crepuscular light shafts (Wave 9). Dedicated
+    // screen-space pass dispatched on Metal AFTER stars/aurora and
+    // BEFORE the bloom pyramid (so the additive HDR shafts feed bloom +
+    // ACES with the rest of the frame). The single GodRays.slang kernel
+    // runs twice per frame when r_godrays is on: pass 0 builds an
+    // occlusion/light mask into godrays_mask_tex_id_ from depth_tex +
+    // HDR luminance, pass 1 radial-blurs that mask toward the sun's
+    // screen position and adds the shafts onto the HDR target. Both
+    // dispatches are elided when r_godrays == 0 so the default-off path
+    // is bit-for-bit unchanged. Zero on Vulkan today (the dispatch is a
+    // follow-up like aurora / SIGMA / ReSTIR); the engine gate folds to
+    // "no god rays" when the id is 0.
+    std::uint64_t                               godrays_pipeline_id_ = 0;
+    // RGBA16F scratch the GodRays pass writes its mask into (pass 0) and
+    // reads back (pass 1). Bound at engine texture slot 18 -> Metal MSL
+    // texture(1) by declaration order, vk::binding 37. Allocated on the
+    // denoiser-active lifecycle alongside cloud_trans_tex (the god-rays
+    // dispatch only runs in the use_engine_tonemap branch, which on
+    // Metal requires a denoiser, so depth_tex + this scratch always
+    // coexist). Re-created on swapchain resize with the other HDR-aux
+    // textures.
+    std::uint64_t                               godrays_mask_tex_id_ = 0;
     // Wave 7 (#24): procedural raymarched cloud pre-pass + composite.
     // clouds_raymarch_pipeline_id_   -- compute kernel that raymarches
     //   the cloud layer in a dedicated pass BEFORE PathTrace. Writes

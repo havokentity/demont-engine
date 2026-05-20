@@ -1034,6 +1034,60 @@ namespace cvar {
             "No effect when r_denoiser = off.",
             CVAR_ARCHIVE);
 
+    // God rays / crepuscular light shafts (Wave 9). Dedicated
+    // screen-space pass dispatched on Metal AFTER StarsComposite /
+    // AuroraComposite and BEFORE the bloom pyramid -- the classic
+    // "radial blur from the sun's screen position through depth-buffer
+    // occluders" technique (Mitchell 2007 / GPU Gems 3 ch.13), not a
+    // full volumetric march. Two dispatches of GodRays.slang (mask
+    // build, then radial blur + additive composite). Zero performance
+    // cost when r_godrays == 0 -- both dispatches are elided engine-side
+    // so the default-off path is bit-for-bit identical to before.
+    PT_CVAR(r_godrays,          "0",
+            "God rays / crepuscular light shafts as a screen-space pass "
+            "(Wave 9). 0 = off (zero cost, both dispatches elided), "
+            "1 = radial-blur the sky/sun light visible through scene "
+            "occluders (e.g. cloud gaps) outward from the sun's screen "
+            "position, producing visible shafts. Cheap GPU Gems 3 "
+            "post-process technique, not a volumetric march. Metal-only "
+            "today; Vulkan dispatch is a follow-up. See "
+            "shaders/GodRays.slang for the scattering construction.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_godrays_density,  "0.85",
+            "God-ray radial-blur reach (0..1). Controls how far each "
+            "pixel's sample march walks toward the sun screen position: "
+            "the per-step vector is (pixel - sun) * density / samples. "
+            "Lower = shorter / tighter shafts hugging the sun; ~0.85 "
+            "lets shafts sweep most of the way across the frame for the "
+            "broken-cumulus sunset look.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_godrays_decay,    "0.95",
+            "Per-sample exponential attenuation along the march (0..1). "
+            "Each successive sample toward the sun is multiplied by this "
+            "factor, so shafts fade with distance from the bright source. "
+            "Closer to 1 = longer, slower-fading shafts; lower values "
+            "clamp the shafts close to the gaps they emanate from.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_godrays_weight,   "0.40",
+            "Per-sample accumulation weight. Scales each mask sample "
+            "before it is summed into the shaft; combines with exposure "
+            "to set overall shaft brightness. Raise for denser, brighter "
+            "shafts; lower for a subtle glow.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_godrays_exposure, "1.6",
+            "Final god-ray intensity multiplier applied to the summed "
+            "shaft before it is added (tinted by the warm sun colour) "
+            "onto the HDR image. Tuned with r_godrays_weight so the "
+            "shafts read clearly on clouds_godrays.cfg without blowing "
+            "out the sky.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_godrays_samples,  "96",
+            "Number of radial-blur samples marched per pixel toward the "
+            "sun (1..256). More samples = smoother shafts with fewer "
+            "stepping artefacts at the cost of more texture fetches. 96 "
+            "is a good quality/cost balance at the fixture's 768x432.",
+            CVAR_ARCHIVE);
+
     // -------------------------------------------------------------------
     // Particle / VFX system (issue #82 MVP).
     //
@@ -2642,6 +2696,8 @@ void Engine::TearDownDevice() {
         if (motion_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{motion_tex_id_});
         if (post_denoise_hdr_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
         if (cloud_trans_tex_id_      != 0) device_->DestroyTexture(pt::rhi::TextureHandle{cloud_trans_tex_id_});
+        // God-rays mask scratch (Wave 9).
+        if (godrays_mask_tex_id_     != 0) device_->DestroyTexture(pt::rhi::TextureHandle{godrays_mask_tex_id_});
         // Wave 7 (#24): raymarched cloud pre-pass ping-pong textures.
         if (clouds_color_tex_ids_[0] != 0) device_->DestroyTexture(pt::rhi::TextureHandle{clouds_color_tex_ids_[0]});
         if (clouds_color_tex_ids_[1] != 0) device_->DestroyTexture(pt::rhi::TextureHandle{clouds_color_tex_ids_[1]});
@@ -2740,6 +2796,7 @@ void Engine::TearDownDevice() {
     motion_tex_id_           = 0;
     post_denoise_hdr_tex_id_ = 0;
     cloud_trans_tex_id_      = 0;
+    godrays_mask_tex_id_     = 0;
     shadow_vis_buf_id_       = 0;
     sigma_shadow_pipeline_id_ = 0;
     // --- ReSTIR DI Phase A (issue #78) -------------------------------------
@@ -2759,6 +2816,9 @@ void Engine::TearDownDevice() {
     tonemap_pipeline_id_     = 0;
     stars_composite_pipeline_id_ = 0;
     aurora_composite_pipeline_id_ = 0;
+    // God rays / crepuscular light shafts (Wave 9).
+    godrays_pipeline_id_     = 0;
+    godrays_mask_tex_id_     = 0;
     // Wave 7 (#24): raymarched cloud pre-pass + composite.
     clouds_raymarch_pipeline_id_  = 0;
     clouds_composite_pipeline_id_ = 0;
@@ -5245,6 +5305,11 @@ void Engine::EnsurePipelineHandles() {
     // "no fog" on Vulkan and on any backend where the pipeline failed
     // to build (id stays 0).
     resolve(height_fog_pipeline_id_, "height_fog");
+    // God rays / crepuscular light shafts (Wave 9). Metal-only at this
+    // scope; the Vulkan pipeline-build worker has no entry for this name
+    // so resolve leaves the id at 0 and the dispatch gate collapses to
+    // "no god rays". Vulkan plumbing is a follow-up.
+    resolve(godrays_pipeline_id_, "godrays");
     // Wave 7 (#24): procedural raymarched cloud pre-pass + composite.
     // Registered on every backend that builds the SPIR-V / MSL blobs
     // (Metal + Vulkan). When r_clouds_mode == pathtraced (default) the
@@ -5669,6 +5734,7 @@ void Engine::PrewarmPipelines() {
     // after toggling r_fog 1 doesn't stutter on first-dispatch pipeline
     // state object build.
     warm("height_fog");
+    warm("godrays");
     warm("sigma_shadow");
     warm("restir_temporal");
     warm("restir_spatial");
@@ -5863,6 +5929,10 @@ void Engine::RenderFrame() {
             if (albedo_tex_id_           != 0) device_->DestroyTexture(pt::rhi::TextureHandle{albedo_tex_id_});
             if (post_denoise_hdr_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
             if (cloud_trans_tex_id_      != 0) device_->DestroyTexture(pt::rhi::TextureHandle{cloud_trans_tex_id_});
+            // God-rays mask scratch (Wave 9). Allocated on the
+            // denoiser-active path; freed when the user flips r_denoiser
+            // off, mirroring cloud_trans_tex.
+            if (godrays_mask_tex_id_     != 0) device_->DestroyTexture(pt::rhi::TextureHandle{godrays_mask_tex_id_});
             // Wave 7 (#24): raymarched cloud ping-pong textures.
             if (clouds_color_tex_ids_[0] != 0) device_->DestroyTexture(pt::rhi::TextureHandle{clouds_color_tex_ids_[0]});
             if (clouds_color_tex_ids_[1] != 0) device_->DestroyTexture(pt::rhi::TextureHandle{clouds_color_tex_ids_[1]});
@@ -5891,6 +5961,7 @@ void Engine::RenderFrame() {
             denoise_color_tex_id_ = depth_tex_id_ = motion_tex_id_ = 0;
             normal_tex_id_ = albedo_tex_id_ = post_denoise_hdr_tex_id_ = 0;
             cloud_trans_tex_id_   = 0;
+            godrays_mask_tex_id_  = 0;
             shadow_vis_buf_id_    = 0;
             restir_reservoir_curr_buf_id_ = 0;
             restir_reservoir_prev_buf_id_ = 0;
@@ -6092,6 +6163,9 @@ void Engine::RenderFrame() {
             if (albedo_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{albedo_tex_id_});
             if (post_denoise_hdr_tex_id_  != 0) device_->DestroyTexture(pt::rhi::TextureHandle{post_denoise_hdr_tex_id_});
             if (cloud_trans_tex_id_       != 0) device_->DestroyTexture(pt::rhi::TextureHandle{cloud_trans_tex_id_});
+            // God-rays mask scratch (Wave 9). Same denoiser-active
+            // lifecycle + resize-driven re-allocation as cloud_trans_tex.
+            if (godrays_mask_tex_id_      != 0) device_->DestroyTexture(pt::rhi::TextureHandle{godrays_mask_tex_id_});
             // Wave 7 (#24): raymarched cloud ping-pong pair. Same
             // denoiser-active lifecycle + resize-driven re-allocation
             // as cloud_trans_tex above.
@@ -6123,6 +6197,7 @@ void Engine::RenderFrame() {
             albedo_tex_id_           = 0;
             post_denoise_hdr_tex_id_ = 0;
             cloud_trans_tex_id_      = 0;
+            godrays_mask_tex_id_     = 0;
             // Wave 7 (#24).
             clouds_color_tex_ids_[0] = 0;
             clouds_color_tex_ids_[1] = 0;
@@ -6197,6 +6272,21 @@ void Engine::RenderFrame() {
                 .debug_name = "cloud_trans",
             });
             cloud_trans_tex_id_ = cloud_h.id;
+            // God-rays mask scratch (Wave 9). RGBA16F full-res; GodRays
+            // pass 0 writes the occlusion/light mask, pass 1 reads it.
+            // Same denoiser-active lifecycle + resize re-allocation as
+            // cloud_trans above (the god-rays dispatch only runs in the
+            // use_engine_tonemap branch, which requires a denoiser on
+            // Metal). Allocated unconditionally with the other HDR-aux
+            // textures rather than gated on r_godrays so toggling the
+            // cvar at runtime doesn't need a texture realloc mid-frame.
+            auto godrays_h = device_->CreateTexture({
+                .width = fc.width, .height = fc.height,
+                .format = pt::rhi::TextureFormat::RGBA16F,
+                .usage  = pt::rhi::TextureUsage::Storage,
+                .debug_name = "godrays_mask",
+            });
+            godrays_mask_tex_id_ = godrays_h.id;
             // Wave 7 (#24): clouds_color ping-pong pair. RGBA16F (linear
             // HDR pre-multiplied in-scatter + alpha). Allocated only when
             // the denoiser is on (same lifecycle as cloud_trans_tex) so
@@ -10593,6 +10683,153 @@ void Engine::RenderFrame() {
             }
         }
         // ----- end Particle composite -----------------------------------
+
+        // God rays / crepuscular light shafts (Wave 9). Dedicated
+        // screen-space pass, dispatched here AFTER stars / aurora /
+        // particles (so the shafts layer over every other additive HDR
+        // contribution) and BEFORE the bloom pyramid (so bright shafts
+        // bloom + ACES-tonemap with the rest of the frame). This is the
+        // classic GPU Gems 3 ch.13 radial-blur-from-the-sun technique,
+        // not a volumetric march:
+        //   pass 0 -- GodRays.slang builds an occlusion/light mask into
+        //             godrays_mask_tex (bright at sky/sun pixels, dark
+        //             where geometry occludes, using depth_tex + the HDR
+        //             luminance so shafts pick up the colour of the sky
+        //             showing through cloud gaps).
+        //   pass 1 -- radial-blurs that mask toward the sun's screen
+        //             position and adds the warm-tinted shafts onto the
+        //             HDR target in place.
+        // Gate: r_godrays on, pipeline resolved (Metal-only today),
+        // depth_tex + godrays_mask allocated (both ride the denoiser-
+        // active lifecycle that use_engine_tonemap implies on Metal).
+        // When r_godrays == 0 we elide BOTH dispatches so the default
+        // path is bit-for-bit unchanged.
+        bool godrays_on = false;
+        if (auto* v = C.FindCVar("r_godrays")) godrays_on = v->GetBool();
+        const bool godrays_active =
+            godrays_on &&
+            godrays_pipeline_id_ != 0 &&
+            depth_tex_id_ != 0 &&
+            godrays_mask_tex_id_ != 0;
+        if (godrays_active) {
+            // Project the sun's world direction to screen UV, mirroring
+            // the lens-flare projection below. When the sun is in front
+            // of the camera the projected UV may still land off-screen
+            // (sun near the frame edge) -- we keep the real projected UV
+            // (the radial march in the shader naturally walks toward an
+            // off-screen origin and clamps its taps to the screen edge,
+            // so shafts still converge on the correct azimuth). The only
+            // hard gate is "sun behind camera": with fwd_dot <= 0 there
+            // is no meaningful screen origin, so we flag sun_visible = 0
+            // and pass 1 adds nothing.
+            const glm::vec3 sun_world{push.sun_and_mode[0],
+                                      push.sun_and_mode[1],
+                                      push.sun_and_mode[2]};
+            const float fwd_dot = glm::dot(sun_world, fwd);
+            float gr_sun_uv_x = 0.5f, gr_sun_uv_y = 0.5f;
+            float gr_sun_visible = 0.0f;
+            if (fwd_dot > 1e-3f) {
+                const float right_dot = glm::dot(sun_world, right);
+                const float up_dot    = glm::dot(sun_world, up);
+                const float ft = cam.FovYTan();
+                const float xs = (right_dot / fwd_dot) / (ft * aspect);
+                const float ys = (up_dot    / fwd_dot) / ft;
+                gr_sun_uv_x = xs * 0.5f + 0.5f;
+                gr_sun_uv_y = -ys * 0.5f + 0.5f;
+                gr_sun_visible = 1.0f;
+            }
+
+            // Read tuned cvars with the documented defaults as fallback.
+            float gr_density  = 0.85f;
+            float gr_decay    = 0.95f;
+            float gr_weight   = 0.40f;
+            float gr_exposure = 1.6f;
+            int   gr_samples  = 96;
+            if (auto* v = C.FindCVar("r_godrays_density"))  gr_density  = v->GetFloat();
+            if (auto* v = C.FindCVar("r_godrays_decay"))    gr_decay    = v->GetFloat();
+            if (auto* v = C.FindCVar("r_godrays_weight"))   gr_weight   = v->GetFloat();
+            if (auto* v = C.FindCVar("r_godrays_exposure")) gr_exposure = v->GetFloat();
+            if (auto* v = C.FindCVar("r_godrays_samples"))  gr_samples  = v->GetInt();
+            if (gr_samples < 1)   gr_samples = 1;
+            if (gr_samples > 256) gr_samples = 256;
+            // Decay must stay in [0,1) so the geometric series converges;
+            // density/weight/exposure clamp to non-negative so a stray
+            // negative cvar can't subtract energy from the HDR.
+            if (gr_decay < 0.0f) gr_decay = 0.0f;
+            if (gr_decay > 1.0f) gr_decay = 1.0f;
+            if (gr_density  < 0.0f) gr_density  = 0.0f;
+            if (gr_weight   < 0.0f) gr_weight   = 0.0f;
+            if (gr_exposure < 0.0f) gr_exposure = 0.0f;
+
+            // 128-byte contiguous push, identical layout on Metal +
+            // SPIR-V (stays under the 256B / kPushSplitOffset budget so
+            // no Vulkan UBO spill). Field order MUST match GodRays.slang's
+            // Push cbuffer.
+            struct GodRaysPush {
+                float pos_fovtan[4];
+                float fwd_aspect[4];
+                float right_xyz[4];
+                float up_xyz[4];
+                float sun_and_mode[4];
+                float sun_uv_px[4];   // .xy sun UV, .z visible, .w decay
+                float gr_params0[4];  // .x pass, .y density, .z weight, .w exposure
+                float gr_params1[4];  // .x samples, rest pad
+            } gp{};
+            static_assert(sizeof(GodRaysPush) == 128,
+                          "GodRaysPush layout must match GodRays.slang");
+            std::memcpy(gp.pos_fovtan,   push.pos_fovtan,   sizeof(gp.pos_fovtan));
+            std::memcpy(gp.fwd_aspect,   push.fwd_aspect,   sizeof(gp.fwd_aspect));
+            std::memcpy(gp.right_xyz,    push.right_xyz,    sizeof(gp.right_xyz));
+            std::memcpy(gp.up_xyz,       push.up_xyz,       sizeof(gp.up_xyz));
+            std::memcpy(gp.sun_and_mode, push.sun_and_mode, sizeof(gp.sun_and_mode));
+            gp.sun_uv_px[0] = gr_sun_uv_x;
+            gp.sun_uv_px[1] = gr_sun_uv_y;
+            gp.sun_uv_px[2] = gr_sun_visible;
+            gp.sun_uv_px[3] = gr_decay;
+            gp.gr_params0[1] = gr_density;
+            gp.gr_params0[2] = gr_weight;
+            gp.gr_params0[3] = gr_exposure;
+            gp.gr_params1[0] = static_cast<float>(gr_samples);
+
+            // Texture binding follows the AuroraComposite pattern: a
+            // standalone Metal kernel gets MSL texture indices assigned
+            // by Slang in DECLARATION order (hdr_inout -> texture(0),
+            // mask_tex -> texture(1), depth_tex -> texture(2)), so the
+            // engine binds at those same low slot numbers. The shader's
+            // vk::binding tags (0 / 37 / 7) are the SPIR-V identities and
+            // are ignored on Metal; godrays_mask's reserved binding 37 /
+            // engine slot 18 only comes into play when the Vulkan
+            // dispatch is wired (a follow-up -- the pipeline id is 0 on
+            // Vulkan today and this block never runs there). bound_tex_
+            // was bumped to [20] on both backends to cover that future
+            // slot-18 bind. BindComputePipeline clears prior bindings, so
+            // each dispatch re-binds; max_bound_buf_slot = -1 puts the
+            // push at MSL buf(0).
+            cb->BindComputePipeline(pt::rhi::PipelineHandle{godrays_pipeline_id_});
+            cb->BindStorageTexture(0, pt::rhi::TextureHandle{tonemap_hdr_source_id});
+            cb->BindStorageTexture(1, pt::rhi::TextureHandle{godrays_mask_tex_id_});
+            cb->BindStorageTexture(2, pt::rhi::TextureHandle{depth_tex_id_});
+
+            // Pass 0: build the mask into godrays_mask_tex.
+            gp.gr_params0[0] = 0.0f;
+            cb->PushConstants(&gp, sizeof(gp));
+            cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
+            // RAW: pass 1 reads godrays_mask that pass 0 just wrote.
+            // Metal auto-barriers; emitted for documentation symmetry
+            // with the rest of the post-denoise chain.
+            cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                         pt::rhi::BarrierDesc::Stage::ComputeRead});
+
+            // Pass 1: radial blur + additive composite onto the HDR.
+            gp.gr_params0[0] = 1.0f;
+            cb->PushConstants(&gp, sizeof(gp));
+            cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
+            // RAW: bloom_down (or the tonemap read) about to read the HDR
+            // we just wrote.
+            cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                         pt::rhi::BarrierDesc::Stage::ComputeRead});
+        }
+        // ----- end God rays ----------------------------------------------
 
         if (bloom_can_run) {
             dispatch_bloom_pyramid(tonemap_hdr_source_id);

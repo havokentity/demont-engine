@@ -103,12 +103,17 @@ private:
     //      same way env_map / star_map / moon_map / ocean_* do. Lands at
     //      MSL texture index 16 because ocean (#25) took 14/15 on the
     //      integration branch, so PBR rebased one slot up).
+    //   18 godrays_mask (Wave 9: RGBA16F scratch the GodRays pass writes
+    //      its occlusion/light mask into in pass 0 and reads back in
+    //      pass 1; vk::binding 37). Slot 17 is intentionally left as a
+    //      gap so the engine slot number matches the documented Wave 9
+    //      reservation (slot 18 / binding 37) rather than packing tight.
     //   On Metal slots above the kernel's actual texture count are
     //   silently dropped; on Vulkan the slot table in
-    //   VulkanDevice.cpp maps them to vk::binding numbers. Array sized 18
-    //   to fit ocean at 14/15 + pbr_atlas at 16, plus one slot of
-    //   headroom; bump again before adding more.
-    TextureHandle              bound_tex_[18] {};
+    //   VulkanDevice.cpp maps them to vk::binding numbers. Array sized 20
+    //   to fit ocean at 14/15 + pbr_atlas at 16 + godrays_mask at 18,
+    //   plus one slot of headroom; bump again before adding more.
+    TextureHandle              bound_tex_[20] {};
     // Buffer slots. Slots 0..7 are the original engine layout
     // (mesh_positions / mesh_indices, primitives, marginal /
     // conditional CDFs, exposure_state, analytic-prim bvh_nodes).

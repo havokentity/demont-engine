@@ -63,9 +63,15 @@ private:
     // normal textures (RGBA32F; vk::binding 32/33). The array was [14]
     // pre-#25 which silently dropped BindStorageTexture(>= 14, ...) at
     // the bounds-check in BindStorageTexture() -- the ocean read all
-    // zeros on Vulkan until this was bumped to [16]. Keep in sync with
-    // kSlotToTexBinding[] / kNumTexSlots in VulkanDevice.cpp.
-    TextureHandle  bound_tex_[16] {};
+    // zeros on Vulkan until this was bumped to [16]. Wave 9 god rays
+    // bumps it again to [20]: kNumTexSlots is now 19 (gap slot 17 +
+    // godrays_mask scratch at slot 18 -> vk::binding 37), and the
+    // descriptor-write loop iterates `s < kNumTexSlots` reading
+    // bound_tex_[s], so the backing array MUST be >= kNumTexSlots to
+    // avoid reading past the end (pbr_atlas at slot 16 already sat right
+    // at the old [16] boundary). Keep in sync with kSlotToTexBinding[] /
+    // kNumTexSlots in VulkanDevice.cpp.
+    TextureHandle  bound_tex_[20] {};
     // 14 buffer slots:
     //   0..7   original engine layout (mesh_positions / mesh_indices,
     //          primitives, marginal / conditional CDFs, exposure_state,

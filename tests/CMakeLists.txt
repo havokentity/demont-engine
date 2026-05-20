@@ -795,6 +795,27 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
     # --- end Wave 7 (#24) -------------------------------------------------
 
+    # --- Wave 9 -- god rays / crepuscular light shafts --------------------
+    # Pins the dedicated screen-space god-rays pass (GodRays.slang) ON
+    # against the sunset + broken-cumulus clouds_godrays fixture: the sun
+    # sits low and centred, broken cumulus leaves gaps, and r_godrays 1
+    # radial-blurs the sky/sun light through those gaps into visible
+    # shafts. EXTRA flips r_godrays on (the fixture leaves it off so the
+    # default render path stays bit-for-bit identical to its own golden).
+    #
+    # Metal + denoised is the canonical capture (the god-rays dispatch
+    # rides the use_engine_tonemap branch, which on Metal requires a
+    # denoiser; software backend doesn't run compute pipelines and would
+    # collapse the pass to its gate-off path, matching the no-godrays
+    # golden -- no signal). Tolerances match the clouds_raymarched cell:
+    # the cloud march + radial-blur accumulation involve many fbm /
+    # texture taps so cross-backend FP-order variance is wider than the
+    # analytic-geometry cornell baseline.
+    pt_add_golden_cell(SCENE clouds_godrays BACKEND metal DENOISER svgf_atrous
+        EXTRA "r_godrays 1"
+        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
+    # --- end Wave 9 -------------------------------------------------------
+
     # --- Fluid Phase 3 (#22) -- SPH smoke wind fixture ---------------------
     # SPH-driven smoke column with horizontal wind. Acceptance bar from
     # the issue body: smoke responds to r_smoke_wind cvar; column drifts
