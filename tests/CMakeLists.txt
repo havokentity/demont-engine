@@ -1097,6 +1097,36 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     pt_add_golden_cell(SCENE height_fog BACKEND metal DENOISER svgf_atrous
         MAX_DELTA 48 MEAN_DELTA 8 FAIL_PERCENT 6)
     # --- end Wave 9 volumetric height fog ---------------------------------
+
+    # --- Wave 9 advanced materials (#wave9) ------------------------------
+    # Three fixtures exercising the new BSDF lobe extensions, all routed
+    # through the push-constant material-override array (prim storage stride
+    # untouched). Metal is the build + acceptance target. Tolerances match
+    # the other stochastic specular cells (spectral / dof: 48/6/4) because
+    # the VNDF-sampled anisotropic + clearcoat lobes and the random-walk SSS
+    # have a higher 1-spp noise floor than flat cornell_csg, and the
+    # highlight streak / coat gloss are high-frequency features that
+    # exaggerate cross-backend FP-order deltas. The committed flat-material
+    # goldens (cornell_csg, sky, smoke, water, pbr_textured) are UNAFFECTED:
+    # a prim with no mat_ext_flags never appears in the override array, so
+    # the per-hit lookup short-circuits and the base material renders
+    # bit-for-bit.
+    #
+    # brushed_metal: anisotropic GGX metal sphere -- the sun's specular
+    # highlight stretches into a brushed streak (vs an isotropic dot).
+    pt_add_golden_cell(SCENE brushed_metal BACKEND metal DENOISER off
+        MAX_DELTA 48 MEAN_DELTA 6 FAIL_PERCENT 4)
+    # car_paint: red Lambert pigment + clearcoat -- a crisp white gloss
+    # highlight from the clear lacquer floats on the saturated red body.
+    pt_add_golden_cell(SCENE car_paint BACKEND metal DENOISER off
+        MAX_DELTA 48 MEAN_DELTA 6 FAIL_PERCENT 4)
+    # subsurface: backlit translucent wax sphere -- the bounded random-walk
+    # SSS transmits warm light through the thin rim. This is the highest-
+    # variance estimator of the three (a multi-step random walk per path),
+    # so the tolerances are widened a notch beyond the specular cells.
+    pt_add_golden_cell(SCENE subsurface BACKEND metal DENOISER off
+        MAX_DELTA 64 MEAN_DELTA 8 FAIL_PERCENT 6)
+    # --- end Wave 9 advanced materials -----------------------------------
 else()
     message(STATUS
         "tests: golden-image matrix skipped -- pt_render_one_frame and/or "

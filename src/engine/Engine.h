@@ -232,7 +232,54 @@ public:
         std::uint32_t roughness_tex = 0xFFFFFFFFu;
         std::uint32_t metallic_tex  = 0xFFFFFFFFu;
         // --- end Wave 8 PBR -------------------------------------------------
+        // --- Wave 9 advanced materials --------------------------------------
+        // Optional BSDF lobe extensions layered on top of the base Material.
+        // mat_ext_flags is a bitmask; default 0 = no extension, which keeps
+        // the existing lambert / metal / dielectric / water render bit-for-
+        // bit (the shader gates every extension lobe on its flag bit, and
+        // an all-zero override slot is never uploaded). The host packs the
+        // params of any prim with mat_ext_flags != 0 into a small fixed
+        // PtPush override array keyed by user id, so the prim storage-buffer
+        // stride stays 7 float4s (no cross-file kFloatsPerPrim change).
+        //   bit 0 (kMatExtAnisotropic) : anisotropic GGX specular (brushed
+        //          metal). Uses aniso_amount + aniso_rotation; the base
+        //          Material should be Metal so the specular lobe fires.
+        //   bit 1 (kMatExtClearcoat)   : Disney-style clearcoat lobe over
+        //          the base BSDF. Uses clearcoat_weight + clearcoat_rough.
+        //   bit 2 (kMatExtSubsurface)  : bounded random-walk subsurface
+        //          scattering. Uses subsurface_radius (mean free path, m)
+        //          + subsurface_color (per-channel single-scatter albedo).
+        std::uint32_t mat_ext_flags     = 0u;
+        // Anisotropic GGX (bit 0). aniso_amount in [-1, 1]: 0 = isotropic,
+        // +1 stretches the highlight along the tangent, -1 along the
+        // bitangent. aniso_rotation rotates the tangent frame about the
+        // surface normal (radians) so the brushed-metal streak can point
+        // any direction.
+        float    aniso_amount   = 0.0f;
+        float    aniso_rotation = 0.0f;
+        // Clearcoat (bit 1). weight in [0, 1] = strength of the coat lobe;
+        // roughness in [0, 1] = coat microfacet roughness (0 = mirror gloss,
+        // car-paint lacquer is ~0.03..0.1). IOR is fixed at 1.5 (lacquer).
+        float    clearcoat_weight    = 0.0f;
+        float    clearcoat_roughness = 0.03f;
+        // Subsurface (bit 2). radius = scattering mean free path in metres
+        // (skin ~0.001..0.003 m, wax ~0.005..0.02 m, marble ~0.003..0.01 m).
+        // color = per-channel single-scatter albedo (RGB tint of the
+        // diffused light; reds survive deeper than blues for skin).
+        float    subsurface_radius  = 0.005f;
+        float    subsurface_color[3]{0.9f, 0.7f, 0.6f};
+        // --- end Wave 9 advanced materials ----------------------------------
     };
+    // Wave 9 advanced-material extension flag bits (see AnalyticPrim::
+    // mat_ext_flags). Mirrors PathTrace.slang's MAT_EXT_* constants.
+    static constexpr std::uint32_t kMatExtAnisotropic = 1u << 0;
+    static constexpr std::uint32_t kMatExtClearcoat   = 1u << 1;
+    static constexpr std::uint32_t kMatExtSubsurface  = 1u << 2;
+    // Max number of prims that can carry a material extension simultaneously
+    // (uploaded via PtPush::mat_overrides). Sized for the test fixtures plus
+    // headroom; a prim with mat_ext_flags != 0 beyond this cap renders with
+    // its base material (the shader simply finds no override slot).
+    static constexpr std::uint32_t kMaxMatOverrides = 8;
 
     // Analytic light primitive (#73). First-class scene light source for
     // direct-lighting NEE, parallel to (but independent of) AnalyticPrim.
