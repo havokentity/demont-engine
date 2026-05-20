@@ -615,6 +615,24 @@ namespace cvar {
     PT_CVAR(r_bloom_intensity, "0.05","Linear blend factor of the bloom layer added on top of the HDR image before tonemap. 0 disables, 1 makes the bloom layer dominate. Realistic camera lens flare is in the 0.02-0.10 range.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom_mips,      "5",  "How many mip levels the bloom pyramid uses (1..5). More mips = a softer / wider halo; fewer mips = a tighter glow. Capped to kBloomMips at compile time.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom_radius,    "1.0","Per-mip upsample 'spread' multiplier. 1.0 = pixel-accurate dual-filter blur; >1 widens each upsample tap (softer, more diffuse halo); <1 tightens it (sharper core, less spread). Real range 0.5..3.0.", CVAR_ARCHIVE);
+    // --- Wave 10 bloom/bokeh ---
+    // r_bloom_strength is a final gain on the composited bloom layer,
+    // multiplied on top of r_bloom_intensity at the Tonemap composite.
+    // Splitting it out from r_bloom_intensity lets the energy-preserving
+    // dual-filter pyramid keep a fixed per-mip blend (the Jimenez "Next
+    // Gen Post" tent-upsample normalisation) while the artist scales the
+    // overall glow with one knob. Default 1.0 == the pre-wave-10 composite
+    // (c += r_bloom_intensity * bloom), so existing bloom goldens stay
+    // bit-for-bit.
+    PT_CVAR(r_bloom_strength,  "1.0","Final gain on the composited bloom layer (multiplied on top of r_bloom_intensity). 1.0 = neutral (matches the pre-wave-10 look); >1 brightens the halo, <1 dims it. Real cinematic range 0.5..2.0.", CVAR_ARCHIVE);
+    // Lens dirt: a screen-space grime field (procedural -- smudges +
+    // specks + a faint radial sheen) that modulates the bloom layer so
+    // bright sources "smear" through the dirt on the front element. Off
+    // by default so the bloom composite is unchanged; r_lens_dirt 1 mixes
+    // the dirt mask into the bloom add by r_lens_dirt_strength.
+    PT_CVAR(r_lens_dirt,       "0",   "Lens-dirt overlay on bloom. 0 = clean lens (bloom unmodulated, bit-for-bit with the pre-wave-10 composite). 1 = a procedural screen-space grime field modulates the bloom layer so bright highlights smear through the dirt, like a real uncleaned front element.", CVAR_ARCHIVE);
+    PT_CVAR(r_lens_dirt_strength, "0.6", "How strongly the dirt field is mixed into the bloom modulation (0..1). 0 = clean (dirt has no effect even when r_lens_dirt is on); 1 = the dirt field fully gates the bloom (dark grime kills bloom there, bright smudges boost it). 0.6 is a tasteful default streaky-but-readable look.", CVAR_ARCHIVE);
+    // --- end Wave 10 bloom/bokeh ---
     PT_CVAR(r_lens_flare,      "0",   "Lens flare. Image-based ghost reflections sampled from the bloom layer at mirror-across-centre positions. 0 disables.", CVAR_ARCHIVE);
     PT_CVAR(r_lens_flare_intensity, "0.15", "Linear blend strength of the flare layer. Real-camera lens flare is typically 0.1-0.3 of the bright source.", CVAR_ARCHIVE);
     PT_CVAR(r_lens_flare_dispersion, "0.012", "Per-channel scale offset for chromatic aberration on ghosts. 0 = achromatic (white ghosts), >0 = colourful rainbow fringe along ghost edges. Real lenses 0.01-0.03.", CVAR_ARCHIVE);
@@ -11164,7 +11182,20 @@ void Engine::RenderFrame() {
             // identical to the previous post-denoise behaviour.
             std::uint32_t tonemap_op;
             std::uint32_t _pad_stars_align;
-            // 48 bytes of padding to advance ghosts[] forward to host
+            // --- Wave 10 bloom/bokeh ---
+            // Reclaimed from the head of the old 48-byte _pad_to_push_split
+            // run (now 36 bytes) so ghosts[] still lands at offset 112 --
+            // the layout, sizeof, and offsetof asserts below are all
+            // UNCHANGED. r_bloom_strength gain + lens-dirt gate + dirt
+            // strength, consumed by Tonemap.slang's bloom composite. All
+            // three default to the bit-for-bit-with-pre-wave-10 values
+            // (strength 1.0, dirt off, strength ignored) so existing bloom
+            // goldens are untouched.
+            float        bloom_strength;     // final gain on the bloom add (1.0 = neutral)
+            std::uint32_t lens_dirt;         // 0 = clean lens, 1 = procedural dirt modulates bloom
+            float        lens_dirt_strength; // 0..1 mix of the dirt field into the bloom modulation
+            // --- end Wave 10 bloom/bokeh ---
+            // 36 bytes of padding to advance ghosts[] forward to host
             // offset 112 -- the Vulkan push-constant split boundary
             // (VulkanDevice::kPushSplitOffset). The first 112 bytes of
             // this struct go to vkCmdPushConstants on the SPIR-V path;
@@ -11176,7 +11207,7 @@ void Engine::RenderFrame() {
             // through setBytes; the padding is dead weight (~0.05% of
             // a frame's CPU push budget) but keeps a single host-side
             // TonePush shape across both backends.
-            float        _pad_to_push_split[12];   // 12 * 4 = 48 bytes
+            float        _pad_to_push_split[9];   // 9 * 4 = 36 bytes
             PtShaderGhost ghosts[lensflare::kMaxGhosts];
         } tp{};
         static_assert(sizeof(TonePush) % 16 == 0, "TonePush 16-byte aligned");
@@ -11194,6 +11225,27 @@ void Engine::RenderFrame() {
         tp.passthrough      = hdr_pipeline ? 0u : 1u;
         tp.bloom_intensity  = (bloom_on && bloom_h.id == bloom_mip_tex_id_[0])
                                 ? bloom_intensity : 0.0f;
+        // --- Wave 10 bloom/bokeh ---
+        // r_bloom_strength scales the composited bloom on top of
+        // bloom_intensity; r_lens_dirt gates the procedural dirt overlay
+        // and r_lens_dirt_strength sets its mix. Defaults (1.0 / 0 / 0.6)
+        // reproduce the pre-wave-10 composite exactly (strength 1, dirt
+        // off -> dirt branch elided in the shader), so bloom goldens stay
+        // bit-for-bit. The dirt gate also requires bloom to have actually
+        // run, mirroring the flare gate below.
+        {
+            float bstr = 1.0f;
+            bool  dirt_on = false;
+            float dstr = 0.6f;
+            if (auto* v = C.FindCVar("r_bloom_strength"))      bstr    = v->GetFloat();
+            if (auto* v = C.FindCVar("r_lens_dirt"))           dirt_on = v->GetBool();
+            if (auto* v = C.FindCVar("r_lens_dirt_strength"))  dstr    = v->GetFloat();
+            tp.bloom_strength     = bstr;
+            tp.lens_dirt          = (dirt_on && bloom_on &&
+                                     bloom_h.id == bloom_mip_tex_id_[0]) ? 1u : 0u;
+            tp.lens_dirt_strength = std::clamp(dstr, 0.0f, 1.0f);
+        }
+        // --- end Wave 10 bloom/bokeh ---
         // Flare also samples the bloom mip, so it depends on bloom
         // having actually run. If bloom is off the bloom_tex slot is
         // the 1x1 placeholder and the flare loop would just sample

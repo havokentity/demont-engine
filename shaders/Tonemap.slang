@@ -175,14 +175,28 @@ cbuffer Push {
     // kept so ghosts[] stays at offset 112 across both backends.
     uint  _reserved_stars_align;
     // --- end Wave 9 tonemap ---
-    // 48 bytes of padding to push the ghost array forward to host
-    // offset 112 (the Vulkan kPushSplitOffset boundary). On Vulkan
-    // only the first 112 bytes hit vkCmdPushConstants; bytes
-    // [112..624] (the ghost array) spill into the Frame UBO declared
-    // at vk::binding(14, 0) below. On Metal the whole 624-byte block
-    // goes through setBytes -- the padding is wasted but keeps a
-    // single host-side TonePush layout shared across both backends.
-    float4 _pad_to_push_split[3];
+    // --- Wave 10 bloom/bokeh ---
+    // Mirrors the three reclaimed scalars at the head of the host
+    // TonePush's old pad run (Engine.cpp). bloom_strength is a final
+    // gain on the bloom composite (1.0 == the pre-wave-10 look);
+    // lens_dirt gates the procedural dirt overlay; lens_dirt_strength
+    // is its 0..1 mix. These three scalars occupy host bytes [64..75]
+    // (the back half of cbuffer register 4) -- one float slot (offset
+    // 76) plus the two float4s below pad ghosts[] back to offset 112.
+    float bloom_strength;       // host offset 64
+    uint  lens_dirt;            // host offset 68
+    float lens_dirt_strength;   // host offset 72
+    float _pad_w10_tail;        // host offset 76 -- fills cbuffer register 4
+    // --- end Wave 10 bloom/bokeh ---
+    // 32 bytes of padding (two float4s at host offsets 80 + 96) to push
+    // the ghost array forward to host offset 112 (the Vulkan
+    // kPushSplitOffset boundary). On Vulkan only the first 112 bytes hit
+    // vkCmdPushConstants; bytes [112..624] (the ghost array) spill into
+    // the Frame UBO declared at vk::binding(14, 0) below. On Metal the
+    // whole 624-byte block goes through setBytes -- the padding is wasted
+    // but keeps a single host-side TonePush layout shared across both
+    // backends.
+    float4 _pad_to_push_split[2];
 #ifndef PT_TARGET_SPIRV
     // Metal path: ghosts live in the push struct.
     GhostShader ghosts[kPhysGhostMax];
@@ -327,6 +341,73 @@ float3 srgb_oetf(float3 c) {
 #define PT_SRGB_ENCODE(x) (x)
 #endif
 
+// --- Wave 10 bloom/bokeh: procedural lens dirt ----------------------------
+// A screen-space grime field standing in for the smudges, dust and oil
+// haze on a real camera's front element. Returns a per-pixel MULTIPLIER
+// centred near 1.0: <1 where the glass is relatively clean, >1 on bright
+// smudges that catch and smear the bloom. The host gates this entirely
+// behind r_lens_dirt (lens_dirt == 1), so when it's off the bloom add is
+// byte-identical to the pre-wave-10 composite -- no goldens move.
+//
+// Built from three layers, all analytic (no texture binding -> no churn
+// to the shared Vulkan descriptor layout, and a clean checkout
+// reproduces it bit-for-bit):
+//   * value-noise smudges  -- low-frequency soft oily blobs
+//   * dust specks          -- high-frequency thresholded bright dots
+//   * radial edge sheen     -- dirt pools toward the frame edge, and
+//                              grazing light there scatters more
+// uv is normalised [0,1] screen space; aspect corrects the noise lattice
+// so smudges stay round on non-square framebuffers.
+float lens_dirt_hash(float2 p) {
+    // Cheap 2D value hash (same family as PathTrace.slang's pcg-ish
+    // float hashes). Deterministic across backends.
+    p = frac(p * float2(123.34, 456.21));
+    p += dot(p, p + 45.32);
+    return frac(p.x * p.y);
+}
+float lens_dirt_value_noise(float2 p) {
+    float2 i = floor(p);
+    float2 f = frac(p);
+    float2 u = f * f * (3.0 - 2.0 * f);   // smoothstep interpolant
+    float a = lens_dirt_hash(i + float2(0.0, 0.0));
+    float b = lens_dirt_hash(i + float2(1.0, 0.0));
+    float c = lens_dirt_hash(i + float2(0.0, 1.0));
+    float d = lens_dirt_hash(i + float2(1.0, 1.0));
+    return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
+}
+float lens_dirt_mask(float2 uv, float aspect) {
+    // Aspect-correct lattice coords so blobs/specks stay round.
+    float2 p = float2(uv.x * aspect, uv.y);
+
+    // Smudge layer: two octaves of value noise. Centred on 0 by the
+    // -0.5 bias so it pushes the multiplier both up and down around 1.
+    float smudge = lens_dirt_value_noise(p * 6.0) * 0.6
+                 + lens_dirt_value_noise(p * 13.0) * 0.4;
+    smudge = smudge - 0.5;                       // [-0.5, 0.5]
+
+    // Dust specks: sparse bright pinpoints. Threshold a high-frequency
+    // hash so only the top few percent of cells light up, then sharpen.
+    float speck_cells = lens_dirt_hash(floor(p * 60.0));
+    float speck = saturate((speck_cells - 0.90) / 0.10);
+    speck = speck * speck;                        // tighten the dots
+
+    // Radial edge sheen: grime accumulates toward the frame edge and
+    // grazing rays there scatter more, so bias the multiplier up with
+    // the squared distance from screen centre.
+    float2 d = uv - 0.5;
+    float r2 = dot(d, d) * 4.0;                    // ~1 at the frame edge
+    float edge = r2 * r2;                          // soft, edge-weighted
+
+    // Compose into a multiplier around 1.0. Smudges modulate +/-, specks
+    // and edge sheen only add. Clamp so a dark smudge can dim bloom
+    // toward (but not past) zero and a bright speck can roughly double it.
+    // The smudge gain (1.3) is the dominant character -- it gives the
+    // patchy "wiped but not clean" look on the bloom halos.
+    float m = 1.0 + smudge * 1.3 + speck * 1.6 + edge * 0.6;
+    return clamp(m, 0.0, 2.5);
+}
+// --- end Wave 10 bloom/bokeh: procedural lens dirt ------------------------
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
@@ -396,7 +477,24 @@ void main(uint3 tid : SV_DispatchThreadID) {
         float3 b11 = bloom_tex[uint2(p11)].rgb;
         float3 b0  = lerp(b00, b10, t.x);
         float3 b1  = lerp(b01, b11, t.x);
-        c += bloom_intensity * lerp(b0, b1, t.y);
+        float3 bloom = lerp(b0, b1, t.y);
+        // --- Wave 10 bloom/bokeh ---
+        // r_bloom_strength gain on the energy-preserving pyramid (1.0 ==
+        // the pre-wave-10 composite). Lens dirt, when enabled, modulates
+        // the bloom by the procedural grime field so bright sources smear
+        // through the dirt; lens_dirt_strength lerps between a clean lens
+        // (mask 1.0) and the full dirt mask. Both branches collapse to the
+        // original `bloom_intensity * bloom` at defaults (strength 1.0,
+        // dirt off), keeping bloom goldens bit-for-bit.
+        float3 add = (bloom_intensity * bloom_strength) * bloom;
+        if (lens_dirt != 0u) {
+            float2 uv = (float2(tid.xy) + 0.5) / float2(dim);
+            float aspect = float(dim.x) / float(max(dim.y, 1u));
+            float mask = lens_dirt_mask(uv, aspect);
+            add *= lerp(1.0, mask, lens_dirt_strength);
+        }
+        c += add;
+        // --- end Wave 10 bloom/bokeh ---
     }
 
     // Lens flare. Reflections off internal lens elements appear in a
