@@ -1105,6 +1105,16 @@ cbuffer Push {
     // Default is all-0xFFFFFFFF so an untextured mesh renders bit-identically.
     uint4 mesh_tex_indices;
     // --- end Wave 8 PBR -------------------------------------------------------
+    // --- Wave 9 ocean-foam ----------------------------------------------------
+    // FFT-ocean foam shading hints. The CPU solver bakes the foam coverage
+    // (crest-fold + wind whitecaps + persistence) into ocean_displacement.w;
+    // these only tune the BRDF blend.
+    //   .x = foam_amount (intensity; 0 -> skip foam, leave the clean
+    //        specular sea; >0 widens the foam-blend threshold a touch).
+    //   .y = foam_coverage gain (informational; wind ramp is baked CPU-side).
+    //   .zw reserved.
+    float4 ocean_foam_params;
+    // --- end Wave 9 ocean-foam ------------------------------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -1226,6 +1236,8 @@ cbuffer Frame {
     // --- end Wave 8 ocean -----------------------------------------------------
     // See `mesh_tex_indices` in the Metal Push cbuffer above (Wave 8 #26).
     uint4 mesh_tex_indices;
+    // See `ocean_foam_params` in the Metal Push cbuffer above (Wave 9).
+    float4 ocean_foam_params;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -5654,17 +5666,41 @@ void main(uint2 tid : SV_DispatchThreadID) {
             float3 shading_n = (ocean_params0.x != 0.0)
                                    ? h.normal
                                    : waterShadingNormal(hit_pt, h.normal);
-            // Foam: where the choppy displacement folds, the crest is
-            // breaking -- short-circuit the transparent-water BRDF and
-            // treat the surface as a bright Lambertian whitecap. Stochastic
-            // pick weighted by foam coverage keeps it cheap and dithered.
-            if (ocean_params0.x != 0.0 && ocean_foam_here > 0.0 &&
-                randf(seed) < ocean_foam_here) {
-                // Diffuse white spray. Bounce a cosine-weighted ray off the
-                // FFT normal; the next bounce gathers sky/sun light so foam
-                // reads as a self-shadowing matte-white surface.
+            // --- Wave 9 ocean-foam ------------------------------------------
+            // Foam: where the choppy displacement folds (crest breaking) OR a
+            // wind-driven whitecap rides a crest, blend the transparent-water
+            // BRDF toward a bright, rough Lambertian froth. The CPU solver
+            // bakes crest-fold + wind-coverage + persistence into
+            // ocean_displacement.w (-> ocean_foam_here); here we map that raw
+            // coverage through a threshold+smoothstep into a perceptual foam
+            // mask, then stochastically pick foam-vs-water weighted by the
+            // mask. The smoothstep keeps foam off the clean flanks (low
+            // coverage reads as 0) while letting it bloom on crests and in
+            // choppy troughs; foam_amount (ocean_foam_params.x) widens the
+            // lower threshold so cranking intensity spreads broader froth, and
+            // 0 skips foam entirely (clean specular sea, A/B-stable).
+            float foam_amt = ocean_foam_params.x;
+            // Threshold ramp: foam starts at `lo` and saturates at `hi`.
+            // Higher foam_amt drops `lo` toward 0 (foam appears earlier ->
+            // broader coverage) without ever exceeding `hi`.
+            float foam_lo = clamp(0.35 - 0.25 * saturate(foam_amt - 1.0) - 0.30 * min(foam_amt, 1.0), 0.02, 0.35);
+            float foam_mask = smoothstep(foam_lo, 0.85, ocean_foam_here);
+            foam_mask = saturate(foam_mask * max(foam_amt, 0.0));
+            if (ocean_params0.x != 0.0 && foam_amt > 0.0 && foam_mask > 0.0 &&
+                randf(seed) < foam_mask) {
+                // Bright near-white sea-foam albedo. Real whitecap froth is a
+                // dense air-water microbubble scatterer with ~0.9 diffuse
+                // reflectance and a faint cool tint (Rayleigh-biased skylight
+                // in the bubble interstices). Brighter + whiter than the
+                // wave-8 (0.8,0.82,0.85) so breaking crests read as crisp
+                // whitecaps against the dark specular sea. The mask already
+                // gated coverage, so shade full-strength foam here.
                 float3 nf_foam = (dot(h.normal, rd) < 0.0) ? h.normal : -h.normal;
-                throughput *= float3(0.8, 0.82, 0.85);   // sea-foam albedo
+                throughput *= float3(0.92, 0.94, 0.96);   // sea-foam albedo
+                // Diffuse/rough froth: cosine-weighted bounce off the FFT
+                // normal so the next bounce gathers sky+sun and foam reads as
+                // a self-shadowing matte-white surface (no specular highlight,
+                // unlike the clean water it overrides).
                 rd = sampleCosineHemisphere(nf_foam, seed);
                 ro = hit_pt + nf_foam * 1e-3;
                 skip_sky_on_miss = false;
@@ -5677,6 +5713,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 }
                 continue;
             }
+            // --- end Wave 9 ocean-foam --------------------------------------
             float ndi_s = dot(shading_n, rd);
             float3 nf_s = (ndi_s < 0.0) ? shading_n : -shading_n;
 

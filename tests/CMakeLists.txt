@@ -827,6 +827,27 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
         MAX_DELTA 64 MEAN_DELTA 16 FAIL_PERCENT 10)
     # --- end FFT ocean surface --------------------------------------------
 
+    # --- Ocean foam + whitecaps (Wave 9) ----------------------------------
+    # Pins the Wave 9 foam shading on top of the FFT ocean: a Beaufort-7
+    # (16 m/s) wind drives a choppy sea whose breaking crests + wind-driven
+    # whitecaps shade as bright, rough, near-white Lambertian froth (the
+    # ocean_foam.cfg fixture uses a daylight sun + higher exposure so the
+    # foam reads as white in the PNG, unlike ocean_fft.cfg's dark sunset
+    # which hides it). The cell catches regressions in:
+    #   * the CPU foam model (crest-fold Jacobian foam + wind-coverage ramp
+    #     + temporal persistence packed into ocean_displacement.w)
+    #   * the MAT_WATER foam BRDF blend (threshold/smoothstep -> bright
+    #     diffuse whitecap override of the specular water surface)
+    #   * r_ocean_foam_amount / _persistence / _coverage plumbing
+    # FRAMES 120 + generous tolerances for the same wall-clock-dt /
+    # foam-fleck-flicker reasons documented on the ocean_fft cell above.
+    # Metal-only (software gates the ocean off; a Vulkan cell can land once
+    # this Metal PNG is committed).
+    pt_add_golden_cell(SCENE ocean_foam BACKEND metal DENOISER svgf_atrous
+        FRAMES 120
+        MAX_DELTA 64 MEAN_DELTA 16 FAIL_PERCENT 10)
+    # --- end Ocean foam + whitecaps ---------------------------------------
+
     # --- Physics Phase 2a rigid-body fixtures (#138, #181) ----------------
     # Pins the rigid-body fixture output against a committed PNG so any
     # accidental regression in:

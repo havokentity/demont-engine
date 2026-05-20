@@ -39,7 +39,10 @@ namespace pt::ocean {
 //   5. Pack into the displacement texture (RGBA16F: xyz = world-space
 //      displacement in metres, w = foam) and a normal texture
 //      (RGBA16F: xyz = unit world normal). Foam accumulates where the
-//      horizontal-displacement Jacobian folds (det < threshold).
+//      horizontal-displacement Jacobian folds (det < threshold) AND on
+//      wind-driven whitecap crests (Wave 9), then persists with a decay
+//      trail so broken crests fade over seconds rather than blinking off
+//      the instant the Jacobian unfolds.
 //
 // Real units throughout: 1 world unit = 1 metre, g = 9.81 m/s^2,
 // windSpeed in m/s. No demo-scaled fudge factors -- the Phillips
@@ -89,6 +92,33 @@ public:
         // horizontal-displacement Jacobian determinant drops below this
         // (folding crests). Lower = less foam. 0.5 is a moderate spray.
         float foam_threshold = 0.5f;
+
+        // --- Wave 9 ocean-foam (#27 sibling) ---------------------------------
+        // Foam intensity multiplier on the instantaneous Jacobian-fold foam
+        // (and the persistence trail). 1 = the raw [0,1] crest coverage;
+        // >1 spreads brighter, broader whitecaps; 0 disables crest foam.
+        // Clamped >= 0 on the host.
+        float foam_amount = 1.0f;
+
+        // Foam persistence (lifetime) in [0, 1). Foam lingers after a crest
+        // breaks instead of vanishing the instant the Jacobian unfolds: each
+        // frame the accumulated foam decays by `foam_persistence^dt`-ish and
+        // is re-maxed with the fresh instantaneous foam (so a passing crest
+        // leaves a fading streak). 0 = no memory (pure instantaneous foam,
+        // matching the Wave 8 behaviour); 0.92 is a few-second trail at 60
+        // fps. Clamped to [0, 0.999] on the host.
+        float foam_persistence = 0.92f;
+
+        // Whitecap-coverage exponent driving the wind dependence. Real
+        // oceanography (Monahan/Wu): whitecap fractional area is ~zero in
+        // light air and rises sharply above the ~7 m/s whitecap-onset wind.
+        // We model the coverage bias as a smooth ramp centred on
+        // kWhitecapOnsetMps, and `foam_coverage` scales how aggressively the
+        // ramp lifts the foam floor: 1 = the reference Beaufort ramp, >1
+        // pushes whitecaps onto lower-wind seas, 0 removes the wind term
+        // (crest foam only). Clamped >= 0 on the host.
+        float foam_coverage = 1.0f;
+        // --- end Wave 9 ocean-foam -------------------------------------------
 
         // Gravity (m/s^2). Earth deep-water dispersion w = sqrt(g*k).
         float gravity = 9.81f;
@@ -173,6 +203,20 @@ private:
     std::vector<float> disp_rgba_;
     std::vector<float> normal_rgba_;
     float              max_disp_y_ = 0.0f;
+
+    // --- Wave 9 ocean-foam (#27 sibling) -------------------------------------
+    // Persistent foam buffer (one scalar per grid cell, row-major). Foam
+    // breaks on a crest, then lingers and fades: each Update() decays this
+    // by foam_persistence^dt and re-maxes with the fresh instantaneous
+    // Jacobian-fold foam, so the value packed into disp_rgba_[.w] carries
+    // both the live crest froth AND the fading trail of recently-broken
+    // crests. Sized lazily to grid_size^2; reset on a grid-size change.
+    std::vector<float> foam_accum_;
+    // Absolute sim time of the previous Update(), to derive the per-frame
+    // dt for the persistence decay (Update takes absolute time, not a delta).
+    // Negative => no previous frame yet (first Update seeds the buffer).
+    double             last_t_ = -1.0;
+    // --- end Wave 9 ocean-foam -----------------------------------------------
 
     // Cached config snapshot used to detect when the base spectrum must
     // be rebuilt (any of grid_size / patch / wind / amplitude / seed).
