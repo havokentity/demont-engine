@@ -164,7 +164,18 @@ constexpr bool kEnableValidation = false;
 // material strip atlas. Ocean took 32/33, so PBR rebased one slot up to 34
 // (and mesh_uvs to buffer binding 35). kNumTexSlots bumped 14 -> 17 to fit
 // ocean at 14/15 + pbr_atlas at 16.
-static constexpr std::uint32_t kNumTexSlots = 17;
+// Wave 9 god rays: engine texture slot 18 -> vk::binding 37 is the
+// GodRays occlusion/light-mask scratch (RGBA16F). kNumTexSlots bumped
+// 17 -> 19 to fit it; slot 17 is an intentional gap (the Metal slot
+// number is what's reserved as "18" in MetalDevice.h, so the Vulkan
+// table keeps the same slot index). The god-rays Vulkan dispatch is a
+// follow-up (pipeline id stays 0, like aurora / SIGMA / ReSTIR), so
+// neither slot 17 nor slot 18 is ever actually bound on Vulkan today --
+// the binding-37 declaration + pool reservation exist only so the
+// shared descriptor-set layout stays a superset of every kernel's
+// declared bindings. A sibling fog agent owns binding 36; leave it
+// alone.
+static constexpr std::uint32_t kNumTexSlots = 19;
 constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     0,  // engine slot 0  -> shader binding 0  (output / swapchain)
     1,  // engine slot 1  -> shader binding 1  (accum_hdr)
@@ -187,6 +198,11 @@ constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     // The kernel only READS it (uploaded once via WriteTexture), like
     // env_map / star_map / moon_map.
     34, // engine slot 16 -> shader binding 34 (pbr_atlas, #26)
+    37, // engine slot 17 -> shader binding 37 (Wave 9 gap; never bound on
+        //                   Vulkan -- placeholder mapped to the god-rays
+        //                   scratch binding so the table value references a
+        //                   declared binding)
+    37, // engine slot 18 -> shader binding 37 (godrays_mask scratch, Wave 9)
 };
 constexpr std::uint32_t kSlotToBufBinding[24] = {
     0,  // engine slot 0 unused
@@ -1094,8 +1110,9 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     std::vector<VkDescriptorPoolSize> psizes;
     // Wave 8 ocean (#25) bumps storage_image per set from 14 to 16 for
     // ocean_displacement + ocean_normal (bindings 32/33); Wave 8 PBR (#26)
-    // adds pbr_atlas (binding 34) for a total of 17.
-    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kTotalSets * 17 + 4 });
+    // adds pbr_atlas (binding 34) for a total of 17. Wave 9 god rays adds
+    // godrays_mask (binding 37) for a total of 18.
+    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kTotalSets * 18 + 4 });
     if (rt_supported_) {
         psizes.push_back({ VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, kTotalSets * 1 + 1 });
     }
@@ -1307,6 +1324,18 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         add_binding(34, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
         add_binding(35, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
         // --- end Wave 8 PBR ----------------------------------------
+        // --- Wave 9 god rays ---------------------------------------
+        // Binding 37: godrays_mask scratch (RGBA16F storage image). The
+        // GodRays.slang pass writes its occlusion/light mask here in
+        // pass 0 and reads it back in pass 1. Engine texture slot 18 ->
+        // binding 37 via kSlotToTexBinding[]. Declared unconditionally
+        // so the shared descriptor-set layout is a superset of every
+        // kernel's bindings; PARTIALLY_BOUND covers the (current) Vulkan
+        // case where the god-rays pipeline isn't built and the engine
+        // never binds the slot. A sibling fog agent owns binding 36 --
+        // declared in its own PR; not touched here.
+        add_binding(37, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        // --- end Wave 9 god rays -----------------------------------
 
         // UPDATE_AFTER_BIND for every binding so we can rewrite the
         // shared descriptor set between dispatches in the same cmd

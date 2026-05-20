@@ -44,6 +44,12 @@ extern const unsigned char shader_StarsComposite_metal_data[];
 extern const unsigned long shader_StarsComposite_metal_size;
 extern const unsigned char shader_AuroraComposite_metal_data[];
 extern const unsigned long shader_AuroraComposite_metal_size;
+// God rays / crepuscular light shafts (Wave 9). Screen-space radial
+// blur from the sun's screen position through depth-buffer occluders.
+// Built unconditionally; engine elides both dispatches when r_godrays
+// == 0 (default) so registering the PSO costs nothing on the legacy path.
+extern const unsigned char shader_GodRays_metal_data[];
+extern const unsigned long shader_GodRays_metal_size;
 // Wave 7 (#24): procedural raymarched cloud pre-pass (CloudsRaymarch)
 // and the alpha-composite kernel (CloudsComposite). Built unconditionally
 // but only dispatched when r_clouds_mode == procedural_raymarched.
@@ -373,6 +379,13 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
     build_pso("aurora_composite",
               shader_AuroraComposite_metal_data,
               shader_AuroraComposite_metal_size);
+    // God rays / crepuscular light shafts (Wave 9). One entry point,
+    // dispatched twice by the engine (mask build, then radial blur +
+    // additive composite). Built unconditionally; the r_godrays gate in
+    // Engine::RenderFrame elides both dispatches when off.
+    build_pso("godrays",
+              shader_GodRays_metal_data,
+              shader_GodRays_metal_size);
     // Wave 7 (#24): procedural raymarched cloud pre-pass + composite.
     // Built unconditionally; engine elides the dispatch when
     // r_clouds_mode == pathtraced (default), so registering the PSO has

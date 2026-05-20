@@ -145,6 +145,19 @@ pt_compile_slang(
     ENTRY   main
     TARGETS metal
 )
+# God rays / crepuscular light shafts (Wave 9). Screen-space radial
+# blur from the sun's screen position through depth-buffer occluders
+# (GPU Gems 3 ch.13). One entry point, dispatched twice by the engine
+# (pass 0 builds the occlusion mask into the reserved scratch texture,
+# pass 1 radial-blurs it and adds the shafts onto the HDR). Gated by
+# r_godrays; default off elides both dispatches.
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/GodRays.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+)
 # Wave 7 (#24) -- procedural raymarched cloud pre-pass.
 # Two compute kernels paired by the engine when r_clouds_mode ==
 # procedural_raymarched: CloudsRaymarch writes clouds_color_tex +
