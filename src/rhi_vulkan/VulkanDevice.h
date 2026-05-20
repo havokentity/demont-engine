@@ -337,10 +337,12 @@ public:
     // path, corrupting MoltenVK renders (cornell_csg cube rendered black
     // because a shading field landed in the dropped region). The runtime
     // LOG_ERROR fired but nothing failed the build. Bumped to 2048 (16-byte
-    // aligned, ~560 B headroom) and added the kFrameUboTailFits compile-time
-    // guard below so the next PtPush growth fails the BUILD instead of
-    // silently corrupting Vulkan output. Min guaranteed Vulkan UBO range is
-    // 16 KiB so 2048 is comfortably within budget.
+    // aligned, ~560 B headroom) and paired with a compile-time
+    // static_assert at the PtPush dispatch site in Engine.cpp
+    // (sizeof(PtPush) - kPushSplitOffset <= 2048) so the next PtPush growth
+    // fails the BUILD instead of silently corrupting Vulkan output. Keep the
+    // 2048 literal there in lockstep with this constant. Min guaranteed
+    // Vulkan UBO range is 16 KiB so 2048 is comfortably within budget.
     static constexpr std::size_t   kFrameUboSize    = 2048;
 
 private:
