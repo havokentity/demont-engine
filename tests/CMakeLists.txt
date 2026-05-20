@@ -278,6 +278,17 @@ pt_add_test(pt_smoke_sph
     pt_smoke_sph_test.cpp
     LINK_TARGETS pt_physics)
 
+# --- FFT ocean surface (Wave 8, #25) ---------------------------------------
+# Pins the CPU Tessendorf ocean solver: Phillips-spectrum determinism,
+# the deep-water dispersion w = sqrt(g*k) time evolution, the radix-2
+# inverse FFT, unit-length upward normals, foam clamped to [0,1], and
+# the wind -> RMS-height scaling (Phillips L = V^2/g). Links pt_physics
+# only -- the solver is a leaf module with no RHI / engine dependency.
+pt_add_test(pt_ocean_fft
+    pt_ocean_fft_test.cpp
+    LINK_TARGETS pt_physics)
+# --- end FFT ocean surface -------------------------------------------------
+
 # --- phys_drop_* RGB arg shapes (PR #189 / issue #181 follow-up) -----------
 # Pins the arg-shape contract for `phys_drop_sphere` (3, 4, 5, or 8 args)
 # and `phys_drop_box` (6, 7, or 10 args) plus the rejection rules
@@ -784,6 +795,37 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
         FRAMES 90
         MAX_DELTA 64 MEAN_DELTA 16 FAIL_PERCENT 10)
     # --- end Fluid Phase 3 ------------------------------------------------
+
+    # --- FFT ocean surface (Wave 8, #25) ----------------------------------
+    # Pins the CPU Tessendorf FFT ocean against a committed PNG: the
+    # displacement + normal textures bind at engine slots 14/15
+    # (vk::binding 32/33), the MAT_WATER branch ray-marches the displaced
+    # heightfield, and choppy crests + foam render at a low sunset sun.
+    #
+    # FRAMES 120: the ocean animation advances by the per-frame wall-clock
+    # dt (ocean_time_ accumulates), so the surface needs a stretch of
+    # frames to evolve from the t=0 spectrum into a developed sea before
+    # the capture. 120 frames warms it well past the dominant-wave period.
+    #
+    # Tolerances generous (like the SPH / rigid-body fixtures) because the
+    # animation is keyed to wall-clock dt rather than a fixed step, so the
+    # exact surface phase at capture time is not bit-deterministic across
+    # runs / hosts. The cell still catches gross regressions: the ocean
+    # gate failing to engage (flat plane), the textures not binding (black
+    # / sky-through water), or the ray-march dropping rays through the
+    # surface. Metal-only at first; software gates the ocean off (its CPU
+    # tracer ignores the textures) so no software cell, and a Vulkan cell
+    # can land once the Metal PNG is committed.
+    # Measured run-to-run variance on the dev M4 Max is tiny (~18 bad
+    # pixels, mean delta < 1.0) -- the wall-clock dt over 120 frames is
+    # consistent enough that the surface converges to nearly the same
+    # phase -- but the foam flecks flicker a few pixels and cross-host /
+    # cross-build FP ordering will widen that, so the thresholds match
+    # the SPH / rigid-body cells' generosity.
+    pt_add_golden_cell(SCENE ocean_fft BACKEND metal DENOISER svgf_atrous
+        FRAMES 120
+        MAX_DELTA 64 MEAN_DELTA 16 FAIL_PERCENT 10)
+    # --- end FFT ocean surface --------------------------------------------
 
     # --- Physics Phase 2a rigid-body fixtures (#138, #181) ----------------
     # Pins the rigid-body fixture output against a committed PNG so any

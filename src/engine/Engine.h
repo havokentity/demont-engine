@@ -32,6 +32,7 @@ namespace pt::csg      { class CsgScene; struct BakedMesh; }
 namespace pt::effects  { class ParticleSystem; }
 namespace pt::physics  { class PhysicsSystem; }
 namespace pt::sph      { class SmokeSPH; }
+namespace pt::ocean    { class OceanFFT; }  // Wave 8 (#25) FFT ocean surface
 // Voxel destruction Phase 1 (issue #140). VoxelGrid lives in
 // src/destruction/; the engine keeps a small map of voxelized
 // objects + a reserved SDF cluster id range used to render them.
@@ -851,6 +852,38 @@ private:
     std::uint32_t                               sph_particle_capacity_    = 0;
     std::uint32_t                               sph_particle_count_uploaded_ = 0;
     // --- end Fluid Phase 3 -------------------------------------------------
+
+    // --- Wave 8 ocean (#25) -- FFT Tessendorf ocean surface ----------------
+    // CPU FFT ocean solver (pt::ocean::OceanFFT). Builds a Phillips-
+    // spectrum height field, time-evolves it by the deep-water dispersion
+    // w = sqrt(g*k), inverse-FFTs to a displacement (xyz + foam) + normal
+    // field, and uploads them to two RGBA16F textures the path tracer
+    // samples (read-only) while ray-marching the displaced heightfield off
+    // any MAT_WATER plane. CPU FFT (not GPU compute) keeps the feature
+    // backend-agnostic: Metal / Vulkan sample the uploaded textures with no
+    // new compute pipeline, and the Software CPU tracer simply ignores them.
+    //
+    // ocean_disp_tex_id_   -> engine texture slot 14 / vk::binding 32
+    // ocean_normal_tex_id_ -> engine texture slot 15 / vk::binding 33
+    //
+    // The solver runs each Tick (StepOcean) when r_ocean != 0 and the
+    // textures re-upload via EnsureOceanUploaded. ocean_time_ accumulates
+    // wall-clock dt so the spectrum evolution H0*exp(i*w*t) is frame-rate
+    // independent. Pimpl-style unique_ptr keeps OceanFFT.h's <complex> +
+    // glm include cost out of every Engine.h consumer.
+    std::unique_ptr<pt::ocean::OceanFFT>        ocean_;
+    std::uint64_t                               ocean_disp_tex_id_   = 0;
+    std::uint64_t                               ocean_normal_tex_id_ = 0;
+    std::uint32_t                               ocean_tex_grid_      = 0;  // grid size of the live textures
+    double                                      ocean_time_          = 0.0;  // accumulated sim seconds
+    float                                       ocean_max_disp_y_    = 0.0f; // peak |height| this frame (m)
+    // Step the ocean FFT solver one frame (advances ocean_time_ by dt) and
+    // refresh the displacement + normal textures. No-op when r_ocean == 0.
+    void StepOcean(float dt);
+    // (Re)allocate + upload the ocean displacement / normal textures from
+    // the solver's current fields. Reallocates on grid-size change.
+    void EnsureOceanUploaded();
+    // --- end Wave 8 ocean --------------------------------------------------
 
     // --- Voxel destruction Phase 1 (#140) ----------------------------------
     // VoxelGrids produced by `voxelize_object`, keyed by source object

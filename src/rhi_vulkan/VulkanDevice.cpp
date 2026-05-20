@@ -155,7 +155,12 @@ constexpr bool kEnableValidation = false;
 // NRD/SVGF denoiser path doesn't consume them in this PR (#50 covers
 // NRD's roughness/specular-hit-distance inputs).
 // --- end MetalFX specular guidance ------------------------------------------
-static constexpr std::uint32_t kNumTexSlots = 14;
+// Wave 8 ocean (#25): engine texture slots 14/15 -> vk::binding 32/33 are
+// the FFT ocean displacement + normal textures (RGBA32F, written CPU-side
+// and read-only-sampled by the path tracer's heightfield ray-march). 32/33
+// sit one past the SPH particle SSBO's binding 31 -- the next free bindings
+// on the integration branch. kNumTexSlots bumped 14 -> 16 to fit them.
+static constexpr std::uint32_t kNumTexSlots = 16;
 constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     0,  // engine slot 0  -> shader binding 0  (output / swapchain)
     1,  // engine slot 1  -> shader binding 1  (accum_hdr)
@@ -171,6 +176,8 @@ constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     24, // engine slot 11 -> shader binding 24 (specular_albedo_tex, #118)
     25, // engine slot 12 -> shader binding 25 (roughness_tex, #118)
     26, // engine slot 13 -> shader binding 26 (specular_hit_distance_tex, #118)
+    32, // engine slot 14 -> shader binding 32 (ocean_displacement, #25)
+    33, // engine slot 15 -> shader binding 33 (ocean_normal, #25)
 };
 constexpr std::uint32_t kSlotToBufBinding[24] = {
     0,  // engine slot 0 unused
@@ -1072,7 +1079,9 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     const std::uint32_t kTotalSets =
         static_cast<std::uint32_t>(kFramesInFlight * kDispatchSetsPerFrame);
     std::vector<VkDescriptorPoolSize> psizes;
-    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kTotalSets * 14 + 4 });
+    // Wave 8 ocean (#25) bumps storage_image per set from 14 to 16 for
+    // ocean_displacement + ocean_normal (bindings 32/33).
+    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kTotalSets * 16 + 4 });
     if (rt_supported_) {
         psizes.push_back({ VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, kTotalSets * 1 + 1 });
     }
@@ -1086,7 +1095,11 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // slack for upcoming additions before we have to bump again --
     // MoltenVK silently ignored the prior undersize, but native NVIDIA
     // Vulkan correctly returns VK_ERROR_OUT_OF_POOL_MEMORY.
-    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 15 + 8 });
+    // 16 storage-buffer bindings per dispatch now: the 15 listed above
+    // plus sph_particles (binding 31, #22) -- its layout entry was added
+    // alongside the Wave 8 ocean bindings (the #22 PR added only the
+    // engine slot-table mapping). +8 slack retained for future additions.
+    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 16 + 8 });
     psizes.push_back({ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,          kTotalSets * 1 + 1 });
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -1242,6 +1255,26 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // != 0, so an empty / placeholder buffer is dead at runtime.
         add_binding(30, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
         // --- end Fluid Phase 1 -------------------------------------
+        // --- Fluid Phase 3 (#22) -----------------------------------
+        // Binding 31: SPH particle splat list SSBO. PathTrace.slang
+        // declares vk::binding(31) unconditionally; without the matching
+        // layout entry the shader reads an undeclared binding (only the
+        // engine slot-table entry was added by #22). Declared here so the
+        // descriptor layout is complete -- PARTIALLY_BOUND covers the
+        // Metal-only-dispatch case where the engine never binds it on
+        // Vulkan (smoke_sph_params.x stays 0, so the loop is dead anyway).
+        add_binding(31, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        // --- end Fluid Phase 3 -------------------------------------
+        // --- Wave 8 ocean (#25) ------------------------------------
+        // Bindings 32/33: FFT ocean displacement + normal storage images
+        // (RGBA32F). Declared as RWTexture2D on the SPIR-V target (Vulkan
+        // wires them as STORAGE_IMAGE). Read-only-sampled by the path
+        // tracer's heightfield ray-march; PARTIALLY_BOUND covers frames
+        // where r_ocean is off and the engine leaves them unbound (the
+        // shader's ocean_params0.x gate elides the sample).
+        add_binding(32, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        add_binding(33, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        // --- end Wave 8 ocean --------------------------------------
 
         // UPDATE_AFTER_BIND for every binding so we can rewrite the
         // shared descriptor set between dispatches in the same cmd
