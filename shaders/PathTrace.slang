@@ -744,7 +744,7 @@ cbuffer Push {
     // contribution amplitude on cloud / surface BRDF rays.
     float4 moon_dir_phase;
     // Moon extras. .x = r_moon_size, .y = astronomical distance ratio
-    // (mean/current; perigee ~1.06, apogee ~0.95), .z = r_moon_brightness
+    // (mean/current; perigee ~1.06, apogee ~0.95), .z = r_moon_disc_brightness
     // (disc-multiplier scale, 1.0 = post-ACES-tuned baseline). .w reserved.
     float4 moon_extra;
     // Sun extras. .x = r_sun_size, .y = Earth-Sun distance ratio
@@ -1164,6 +1164,13 @@ cbuffer Push {
     //                    slope/power/sat or a Reinhard white point).
     uint4 tonemap_params;
     // --- end Wave 9 tonemap ---------------------------------------------------
+    // --- Sun disc brightness (r_sun_disc_brightness) -------------------------------
+    // .x = r_sun_disc_brightness disc multiplier; .yzw reserved. sun_extra was full
+    // (size / dist-ratio / vflat / planet-radius), so the daytime mirror of the
+    // r_moon_disc_brightness disc knob (moon_extra.z) overflows into its own vec4.
+    // Scales sunDisc() only -- never the cloud march / NEE lighting.
+    float4 sun_extra2;
+    // --- end Sun disc brightness ----------------------------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -1305,6 +1312,8 @@ cbuffer Frame {
     // Metal Push cbuffer above. tonemap_params.x = r_tonemap_op enum.
     uint4 tonemap_params;
     // --- end Wave 9 tonemap ---
+    // See `sun_extra2` in the Metal Push cbuffer above (r_sun_disc_brightness).
+    float4 sun_extra2;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -3149,14 +3158,20 @@ float3 sunDisc(float3 rd, float3 sun_dir) {
         halo = pow(t_h, falloff);
     }
 
+    // r_sun_disc_brightness disc multiplier (sun_extra2.x) -- the daytime mirror
+    // of moonDisc's moon_extra.z knob. Disc and halo scale together so the
+    // surrounding bloom stays proportionate. Default 1.0 reproduces the
+    // historical hardcoded disc intensity bit-for-bit. Scales only the
+    // rendered disc here, never the sun_rad NEE / cloud-march lighting.
+    float bright = max(sun_extra2.x, 0.0);
     if (inside_disc) {
         // Bright disc -- sun is enormously brighter than anything
         // else; ACES will clip the centre to white but the limb +
         // halo carry the warmth.
-        return col * (250.0 * atm)
-             + col * halo * atm * 4.0;
+        return (col * (250.0 * atm)
+             + col * halo * atm * 4.0) * bright;
     }
-    return col * halo * atm * 4.0;
+    return col * halo * atm * 4.0 * bright;
 }
 
 // Moon disc + halo. Real lunar angular radius is 0.00465 rad (~0.27deg
@@ -3286,7 +3301,7 @@ float3 moonDisc(float3 rd, float4 mph, float3 sun_dir_world) {
         float limb = 0.55 + 0.45 * sqrt(saturate(t_d));
 
         // Disc multiplier 3.5 baseline scaled by user-controlled
-        // r_moon_brightness (moon_extra.z). 1.0 = baseline; 0.7
+        // r_moon_disc_brightness (moon_extra.z). 1.0 = baseline; 0.7
         // (default) reads as a softer night moon where surface texture
         // stays well below the ACES knee. Halo scales with brightness
         // so the surrounding bloom stays proportionate.

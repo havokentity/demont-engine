@@ -1770,7 +1770,8 @@ namespace cvar {
     PT_CVAR(r_moon_size,             "1.0",      "Moon angular-size multiplier. 1.0 = our default 0.55deg half-angle (already 2x the real 0.27deg, for visibility at typical 60-FOV 1080p). 5+ = dramatic 'big moon' shots; 0.5 = real lunar size (very small). Astronomical distance variation (perigee/apogee) is also applied on top -- supermoons render ~14% bigger than micro-moons.", CVAR_ARCHIVE);
     PT_CVAR(r_sun_size,              "1.0",      "Sun angular-size multiplier. 1.0 = real ~0.55deg half-angle. Astronomical Earth-Sun distance (perihelion/aphelion) modulates this ~3.4% across the year. Bump for cinematic shots.", CVAR_ARCHIVE);
     PT_CVAR(r_sun_horizon_flatten,   "1",        "Atmospheric refraction differentially lifts the sun's lower limb more than its upper limb, vertically squishing the disc into an oval as it nears the horizon (Saemundsson 1986). 1 = physical flatten enabled (vertical-scale ~0.78 at elev=0 / ~21% squish, ~0.87 at 1deg, ~0.97 at 5deg, ~0.99 at 10deg); 0 = render a perfect circle regardless of elevation. Horizontal radius is unchanged either way; r_sun_size stacks on top.", CVAR_ARCHIVE);
-    PT_CVAR(r_moon_brightness,       "0.7",      "Moon disc brightness multiplier. 1.0 = the post-ACES-tuned default; 0.7 reads as a softer night-sky moon where surface texture stays under the ACES knee. Drop further for a darker moon, raise toward 1.5+ for an artificial bright-moon look.", CVAR_ARCHIVE);
+    PT_CVAR(r_moon_disc_brightness,       "0.7",      "Moon disc brightness multiplier. 1.0 = the post-ACES-tuned default; 0.7 reads as a softer night-sky moon where surface texture stays under the ACES knee. Drop further for a darker moon, raise toward 1.5+ for an artificial bright-moon look. Scales ONLY the rendered moon disc + halo -- the moonlight the moon casts on clouds/surfaces (single-scatter NEE) is independent of this knob.", CVAR_ARCHIVE);
+    PT_CVAR(r_sun_disc_brightness,        "1.0",      "Sun disc brightness multiplier, the daytime counterpart to r_moon_disc_brightness. 1.0 = the historical hardcoded disc intensity (post-ACES-tuned default). Scales ONLY the rendered sun disc + halo, NOT the sunlight the sun casts on clouds/atmosphere/surfaces, so it stays a pure look knob regardless of r_clouds_mode. Raise toward 1.5+ for a hotter cinematic disc, drop for a softer sun, 0 hides the disc (scene lighting unchanged).", CVAR_ARCHIVE);
 
     PT_CVAR(dev_cheats,        "0",    "Gate for CHEAT-flagged cvars",   0);
     PT_CVAR(dev_log_level,     "info", "error|warn|info|debug",          0);
@@ -7561,6 +7562,21 @@ void Engine::RenderFrame() {
         //   One uvec4 = 16 B; appended to the static_assert sum below.
         std::uint32_t tonemap_params[4];
         // --- end Wave 9 tonemap ------------------------------------------
+        // --- Sun disc brightness (r_sun_disc_brightness) -----------------
+        // sun_extra was full (size / dist-ratio / vflat / planet-radius),
+        // so the sun-disc brightness multiplier gets its own vec4, appended
+        // at the struct tail (a pure append leaves every existing field's
+        // offset untouched).
+        //   .x = r_sun_disc_brightness -- scales the rendered sun disc + halo
+        //        only (the daytime mirror of r_moon_disc_brightness, which
+        //        lives in moon_extra.z). Default 1.0 = the historical
+        //        hardcoded disc intensity, so an untouched cvar renders
+        //        bit-identically. Deliberately NOT applied to the cloud
+        //        march / NEE lighting in either r_clouds_mode -- this is a
+        //        pure disc look knob.
+        //   .yzw reserved.
+        float sun_extra2[4];
+        // --- end Sun disc brightness -------------------------------------
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -8103,7 +8119,7 @@ void Engine::RenderFrame() {
         }
         push.moon_extra[1] = moon_dist_ratio;
         float moon_bright = 0.7f;
-        if (auto* v = C.FindCVar("r_moon_brightness")) moon_bright = v->GetFloat();
+        if (auto* v = C.FindCVar("r_moon_disc_brightness")) moon_bright = v->GetFloat();
         if (moon_bright < 0.0f) moon_bright = 0.0f;
         if (moon_bright > 5.0f) moon_bright = 5.0f;
         push.moon_extra[2] = moon_bright;
@@ -8211,6 +8227,21 @@ void Engine::RenderFrame() {
         // pass realistic radii.
         if (planet_radius_m < 0.0f) planet_radius_m = 0.0f;
         push.sun_extra[3] = planet_radius_m;
+    }
+    {
+        // Sun disc brightness (r_sun_disc_brightness) -- daytime mirror of the
+        // r_moon_disc_brightness disc knob (moon_extra.z). Same [0, 5] clamp so
+        // the two cvars behave symmetrically; default 1.0 reproduces the
+        // historical hardcoded disc intensity bit-for-bit. Scales only the
+        // rendered sunDisc(), never the cloud march / NEE lighting.
+        float sun_bright = 1.0f;
+        if (auto* v = C.FindCVar("r_sun_disc_brightness")) sun_bright = v->GetFloat();
+        if (sun_bright < 0.0f) sun_bright = 0.0f;
+        if (sun_bright > 5.0f) sun_bright = 5.0f;
+        push.sun_extra2[0] = sun_bright;
+        push.sun_extra2[1] = 0.0f;
+        push.sun_extra2[2] = 0.0f;
+        push.sun_extra2[3] = 0.0f;
     }
 
     // HDRI multi-light array (computed at HDRI load in ReloadEnvMap).
@@ -9060,6 +9091,10 @@ void Engine::RenderFrame() {
     //                              only checks the total byte size. Tail
     //                              (sizeof - 112) stays well under the
     //                              2048 B Vulkan Frame-UBO budget.
+    //   +16 Sun disc brightness — sun_extra2 vec4 (r_sun_disc_brightness disc
+    //                              multiplier; .yzw reserved). sun_extra was
+    //                              full, so the daytime mirror of the
+    //                              r_moon_disc_brightness disc knob overflows here.
     static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 32 + 16
                   + 16 /* Wave 8 spectral (#27): spectral_params */
                   + 32 /* Wave 8 ocean (#25): ocean_params0 + ocean_params1 */
@@ -9069,7 +9104,8 @@ void Engine::RenderFrame() {
                   + 16  /* Wave 9 materials: mat_override_count */
                   + 384 /* Wave 9 materials: mat_overrides[8 * 12] */
                   + 16 /* Wave 9 tonemap (#27 follow-up): tonemap_params */
-                  + 16 /* Wave 10 bloom/bokeh: dof_bokeh_params */);
+                  + 16 /* Wave 10 bloom/bokeh: dof_bokeh_params */
+                  + 16 /* Sun disc brightness (r_sun_disc_brightness): sun_extra2 */);
     // Vulkan spilled-tail budget guard. The Vulkan backend keeps the first
     // 112 B of PtPush in push constants and uploads the REMAINDER through a
     // per-frame UBO of kFrameUboSize bytes (src/rhi_vulkan/VulkanDevice.h).
@@ -9134,6 +9170,10 @@ void Engine::RenderFrame() {
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     static_assert(offsetof(PtPush, mat_overrides) % 16 == 0,
                   "PtPush::mat_overrides must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    // Sun disc brightness: sun_extra2 vec4 (r_sun_disc_brightness).
+    static_assert(offsetof(PtPush, sun_extra2) % 16 == 0,
+                  "PtPush::sun_extra2 must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     // --- SDF Phase 1 (#97) -------------------------------------------------
     static_assert(offsetof(PtPush, sdf_params) % 16 == 0,
@@ -9285,20 +9325,25 @@ void Engine::RenderFrame() {
         if (res_scale > 1.0f) res_scale = 1.0f;
 
         // --- Wave 8 polish (#28): cloud radiance parity --------------------
-        // The Wave-7 scaffolding set sun_radiance = r_sun_brightness (a cvar
-        // that was never registered, so it defaulted to 1.0) and dropped the
-        // atmospheric transmittance / warmth / vol_intensity scaling that
-        // the inline path-traced cloud march in PathTrace.slang applies. The
-        // result was a raymarched cloud layer ~14-80x too dim (near-black at
-        // the sunset elevation of clouds_godrays.cfg). Reconstruct the SAME
-        // radiance the inline march derives (PathTrace.slang ~L5162-5172,
-        // L5434, L5720-5729) so the two modes match in brightness.
+        // The Wave-7 scaffolding set sun_radiance straight from a sun-
+        // brightness multiplier (an unregistered cvar back then, so always
+        // 1.0) and dropped the atmospheric transmittance / warmth /
+        // vol_intensity scaling that the inline path-traced cloud march in
+        // PathTrace.slang applies. The result was a raymarched cloud layer
+        // ~14-80x too dim (near-black at the sunset elevation of
+        // clouds_godrays.cfg). Reconstruct the SAME radiance the inline
+        // march derives (PathTrace.slang ~L5162-5172, L5434, L5720-5729)
+        // so the two modes match in brightness.
         //
-        // Optional brightness multipliers stay layered on top (default 1.0)
-        // so a future r_sun_brightness / r_moon_brightness cvar still works.
-        float sun_brightness = 1.0f, moon_brightness = 1.0f;
-        if (auto* v = C.FindCVar("r_sun_brightness"))  sun_brightness  = v->GetFloat();
-        if (auto* v = C.FindCVar("r_moon_brightness")) moon_brightness = v->GetFloat();
+        // r_sun_disc_brightness / r_moon_disc_brightness are DISC-ONLY look
+        // knobs: they scale sunDisc() / moonDisc() (via sun_extra2.x /
+        // moon_extra.z) and nothing else. The inline cloud march pointedly
+        // does NOT scale its sun_rad / moon_rad by them, so this raymarched
+        // pre-pass must not either -- otherwise the two r_clouds_mode paths
+        // would disagree and r_moon_disc_brightness 0 would black out
+        // raymarched clouds while leaving inline clouds moonlit (the disc-
+        // vs-lighting split bsc_night_clouds.cfg documents and relies on).
+        // Cloud lighting therefore stays independent of both cvars here.
         const float kPi = 3.14159265358979f;
         // Sun radiance: matches the inline march's sun_rad. sun_elev_v is
         // sin(elevation) == sun_dir.y (the same `sun_elev` the shader uses).
@@ -9361,8 +9406,7 @@ void Engine::RenderFrame() {
         // Raymarch parameters. raymarch_params.w now carries the
         // volumetric intensity (vol_params.z / r_volumetric_intensity) so
         // the shader applies the SAME final v_color * vol_int multiplier
-        // the inline march does (was sun_brightness, which is folded into
-        // the radiance triplets below instead). (Wave 8 #28.)
+        // the inline march does. (Wave 8 #28.)
         float vol_int = push.vol_params[2];
         cp.raymarch_params[0] = push.vol_density_scale;
         cp.raymarch_params[1] = push.vol_phase_g_cloud;
@@ -9376,9 +9420,9 @@ void Engine::RenderFrame() {
         // inline path-traced cloud march (Wave 8 #28). sun_radiance.w
         // carries sun_am (1/sin(elev)) so the shader can apply the same
         // per-sample altitude boost exp(0.30 * sun_am * h_norm).
-        cp.sun_radiance[0] = sun_rad_r * sun_brightness;
-        cp.sun_radiance[1] = sun_rad_g * sun_brightness;
-        cp.sun_radiance[2] = sun_rad_b * sun_brightness;
+        cp.sun_radiance[0] = sun_rad_r;
+        cp.sun_radiance[1] = sun_rad_g;
+        cp.sun_radiance[2] = sun_rad_b;
         cp.sun_radiance[3] = sun_am;
         // Moon radiance: matches PathTrace's moon NEE colour
         // (m_col * 0.3 * phase_b * m_atm). moon_dir_phase.w is the phase
@@ -9401,14 +9445,14 @@ void Engine::RenderFrame() {
             moon_rad_g = m_col_g * m_scale;
             moon_rad_b = m_col_b * m_scale;
         }
-        cp.moon_radiance[0] = moon_rad_r * moon_brightness;
-        cp.moon_radiance[1] = moon_rad_g * moon_brightness;
-        cp.moon_radiance[2] = moon_rad_b * moon_brightness;
+        cp.moon_radiance[0] = moon_rad_r;
+        cp.moon_radiance[1] = moon_rad_g;
+        cp.moon_radiance[2] = moon_rad_b;
         cp.moon_radiance[3] = 0.0f;
         // Diffuse sky ambient: sun_rad * (0.7,0.85,1.0) * 0.15/pi.
-        cp.sky_ambient[0] = sun_rad_r * sun_brightness * 0.70f * ambient_k;
-        cp.sky_ambient[1] = sun_rad_g * sun_brightness * 0.85f * ambient_k;
-        cp.sky_ambient[2] = sun_rad_b * sun_brightness * 1.00f * ambient_k;
+        cp.sky_ambient[0] = sun_rad_r * 0.70f * ambient_k;
+        cp.sky_ambient[1] = sun_rad_g * 0.85f * ambient_k;
+        cp.sky_ambient[2] = sun_rad_b * 1.00f * ambient_k;
         cp.sky_ambient[3] = 0.0f;
         cp.frame_index      = push.frame_index;
         cp.composite_active = 1u;
@@ -15318,7 +15362,8 @@ void Engine::RegisterCommands() {
     set_slider("r_rayleigh",               0.0f, 100.0f,  0.5f);
     set_slider("r_moon_size",              0.5f,  20.0f,  0.1f);
     set_slider("r_sun_size",               0.5f,  20.0f,  0.1f);
-    set_slider("r_moon_brightness",        0.0f,   3.0f,  0.05f);
+    set_slider("r_moon_disc_brightness",   0.0f,   3.0f,  0.05f);
+    set_slider("r_sun_disc_brightness",    0.0f,   3.0f,  0.05f);
     set_slider("r_clouds_coverage",         0.0f,    1.0f,   0.01f);
     set_slider("r_clouds_base_height",      0.0f, 12000.0f, 25.0f);
     set_slider("r_clouds_top_height",      50.0f, 14000.0f, 25.0f);
@@ -20215,7 +20260,7 @@ void Engine::RegisterLightCommands() {
 
     C.RegisterCommand("light_set_size",
         "light_set_size <id> <r>: set sphere-light radius OR quad-light v_half "
-        "(for quad, use sister command light_set_uhalf for the U axis). "
+        "(for a quad's U half-extent, use the sister command light_set_uhalf). "
         "No-op (warns) for point/spot types.",
         [this](auto args, pt::console::Output& out) {
             if (args.size() != 2) { out.PrintLine("usage: light_set_size <id> <r>"); return; }
@@ -20241,6 +20286,51 @@ void Engine::RegisterLightCommands() {
             accum_dirty_       = true;
             BroadcastSceneDirty();
             out.FormatLine("lights: id {} size -> {:.3f}", id, r);
+        });
+
+    // Sister to light_set_size for the OTHER quad half-extent. The quad's
+    // u_vec stores axis * u_half (length == u_half), so we rescale it to
+    // the requested length while preserving its in-plane axis direction.
+    // light_set_size drives v_half (a scalar) instead. Quad-only -- there
+    // is no U half-extent on sphere/point/spot lights.
+    C.RegisterCommand("light_set_uhalf",
+        "light_set_uhalf <id> <r>: set a quad-light's U half-extent (m) by "
+        "rescaling its u_vec to length r, preserving the in-plane axis "
+        "direction (set via light_set_dir / light_set_rotation). Sister "
+        "command to light_set_size, which drives the quad's V half-extent. "
+        "No-op (warns) for point/spot/sphere types.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() != 2) { out.PrintLine("usage: light_set_uhalf <id> <r>"); return; }
+            std::uint32_t id; float r;
+            if (!ParseUint(args[0], id) || !ParseFloat(args[1], r)) {
+                out.PrintLine("light_set_uhalf: arg parse failed"); return;
+            }
+            if (r < 0.0f) { out.PrintLine("light_set_uhalf: size must be >= 0"); return; }
+            auto it = light_prims_.find(id);
+            if (it == light_prims_.end()) { out.FormatLine("light_set_uhalf: id {} not found", id); return; }
+            if (it->second.type != AnalyticLight::Quad) {
+                out.FormatLine("light_set_uhalf: id {} is {} -- only quad lights have a U half-extent",
+                               id, LightTypeName(it->second.type));
+                return;
+            }
+            float* u = it->second.u_vec;
+            const float len = std::sqrt(u[0]*u[0] + u[1]*u[1] + u[2]*u[2]);
+            if (len < 1e-6f) {
+                // u_vec packs axis * u_half; a zero-length vector has lost its
+                // axis, so there's no direction to preserve and r/len would be
+                // a division by ~0. Only reachable if u_half was driven to 0
+                // earlier -- re-author the quad via light_quad to restore the
+                // in-plane axis.
+                out.FormatLine("light_set_uhalf: id {} has a degenerate u-axis -- re-author via light_quad", id);
+                return;
+            }
+            PushSceneSnapshot();
+            const float s = r / len;
+            u[0] *= s; u[1] *= s; u[2] *= s;
+            light_prims_dirty_ = true;
+            accum_dirty_       = true;
+            BroadcastSceneDirty();
+            out.FormatLine("lights: id {} u_half -> {:.3f}", id, r);
         });
 
     // --- Rotation gizmo dispatch (mirrors prim_set_rotation) -----------------
