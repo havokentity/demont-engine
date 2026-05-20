@@ -19,7 +19,7 @@ struct EmbeddedAsset;
 // translates that into a 404.
 const EmbeddedAsset* ResolveRoute(std::string_view uri);
 
-// The four known editor panels (matches web/editor/vite.config.ts).
+// The known editor panels (matches web/editor/vite.config.ts).
 // Useful for the `panels` console command and the autoopen cvar.
 // Exposed as a contiguous null-terminated array so the call site
 // doesn't have to know the count statically.

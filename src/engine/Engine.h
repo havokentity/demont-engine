@@ -315,6 +315,19 @@ public:
     const std::map<std::uint32_t, AnalyticLight>&    Lights()       const noexcept { return light_prims_; }
     const std::map<std::uint32_t, pt::renderer::SdfPrim>& SdfPrims() const noexcept { return sdf_prims_; }
     const pt::physics::PhysicsSystem*                Physics()      const noexcept { return physics_.get(); }
+    // Reverse lookup of the PBR-atlas tile -> source-path map. The
+    // Material Editor panel reads this (via SerializeScene) so it can
+    // display the assigned texture path for each map slot without
+    // tracking write-only state client-side. Returns an empty string
+    // for kPbrNoTexTile or any tile that was never loaded from a path
+    // (e.g. a procedural test tile). O(N) over the (small) atlas map.
+    std::string PbrTilePath(std::uint32_t tile) const {
+        if (tile == kPbrNoTexTile) return {};
+        for (const auto& [path, idx] : pbr_tile_by_path_) {
+            if (idx == tile) return path;
+        }
+        return {};
+    }
     // --- end Editor backend accessors ------------------------------------
 
 private:
@@ -445,8 +458,8 @@ private:
     //   `panel_close_all`         closes every tracked panel
     //   `panels`                  prints the known panels + per-panel state
     // The spawned-PID table lives in open_panels_pids_ keyed by panel
-    // name. Hotkeys F2/F3/F4/F5 fire panel_open via the existing key
-    // handler in Init().
+    // name. Hotkeys F2/F3/F4/F5/F6 fire panel_open via the existing
+    // key handler in Init().
     void RegisterEditorCommands();
     // Internal: spawn the panel in a fresh Chrome --app window. Tries
     // Chrome -> Edge -> default browser fallback (which won't be

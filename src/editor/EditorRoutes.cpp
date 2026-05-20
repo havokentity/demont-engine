@@ -16,6 +16,7 @@ constexpr const char* kPanels[] = {
     "inspector",
     "asset-browser",
     "toolbar",
+    "material-editor",
     nullptr,
 };
 constexpr std::size_t kPanelCount = sizeof(kPanels) / sizeof(kPanels[0]) - 1;
@@ -57,6 +58,8 @@ Chrome --app window when spawned via the console (<code>panel_open &lt;name&gt;<
       <span>Scenes, HDRIs, glTF imports -- click to load</span></a></li>
   <li><a href="/editor/toolbar"><strong>Toolbar</strong>
       <span>Gizmo mode, undo/redo, snap, transform space</span></a></li>
+  <li><a href="/editor/material-editor"><strong>Material Editor</strong>
+      <span>PBR material control: albedo / roughness / textures / emission</span></a></li>
 </ul>
 <footer>Console: <a href="/" style="color:#00f0ff">/</a></footer>
 </body></html>

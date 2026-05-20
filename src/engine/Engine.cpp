@@ -116,7 +116,8 @@ namespace cvar {
     // ---- Editor scaffold (agent-20) ----------------------------------------
     // CSV list of panels to auto-open on engine init, AFTER the
     // WebSocket server is up. Each entry is one of the known panel
-    // names (scene-hierarchy / inspector / asset-browser / toolbar).
+    // names (scene-hierarchy / inspector / asset-browser / toolbar /
+    // material-editor).
     // Whitespace around commas is trimmed; unknown names are warned
     // and skipped. Empty string (default) = no panels auto-open.
     PT_CVAR(r_editor_panels_autoopen, "",
@@ -2115,6 +2116,7 @@ bool Engine::Init() {
             constexpr int kF3 = 292;
             constexpr int kF4 = 293;
             constexpr int kF5 = 294;
+            constexpr int kF6 = 295;  // material-editor (wave-9)
             // Gizmo-mode hotkeys for the editor 3D gizmo overlay.
             constexpr int kG     = 71;   // GLFW_KEY_G
             constexpr int kR     = 82;   // GLFW_KEY_R
@@ -2127,10 +2129,10 @@ bool Engine::Init() {
                 }
                 return;
             }
-            // Editor panel hotkeys (#agent-20). The keys map 1:1 to
-            // the four known panels; firing the existing console
-            // command keeps the spawn-PID tracking centralised in
-            // RegisterEditorCommands.
+            // Editor panel hotkeys (#agent-20; F6 added wave-9). The
+            // keys map 1:1 to the known panels; firing the existing
+            // console command keeps the spawn-PID tracking centralised
+            // in RegisterEditorCommands.
             //
             // The native console overlay's text-input mode swallows
             // key events at the platform layer (NSEvent on macOS,
@@ -2144,6 +2146,7 @@ bool Engine::Init() {
                 case kF3: panel = "inspector";       break;
                 case kF4: panel = "asset-browser";   break;
                 case kF5: panel = "toolbar";         break;
+                case kF6: panel = "material-editor"; break;
                 default: break;
             }
             if (panel != nullptr) {
@@ -12267,9 +12270,9 @@ void Engine::RegisterCommands() {
     //   ""      -- top-level assets/ listing (mostly subdirs)
     C.RegisterCommand("list_assets",
         "list_assets <subdir>: list files under the workspace assets "
-        "root. Recognised subdirs: hdri | meshes | gltf | scenes. "
-        "Emits one path per line, relative to the workspace. Used by "
-        "the React asset-browser panel.",
+        "root. Recognised subdirs: hdri | meshes | gltf | scenes | "
+        "textures. Emits one path per line, relative to the workspace. "
+        "Used by the React asset-browser + material-editor panels.",
         [](auto args, pt::console::Output& out) {
             std::string sub = args.empty() ? std::string{}
                                            : std::string(args[0]);
@@ -12277,14 +12280,16 @@ void Engine::RegisterCommands() {
             // roots. We resolve relative to the CWD (the engine is
             // typically launched from the repo root).
             std::filesystem::path root;
-            if      (sub == "scenes") root = "tests/goldens/scenes";
-            else if (sub == "hdri")   root = "assets/hdri";
-            else if (sub == "meshes") root = "assets/meshes";
-            else if (sub == "gltf")   root = "assets/gltf";
-            else if (sub.empty())     root = "assets";
+            if      (sub == "scenes")   root = "tests/goldens/scenes";
+            else if (sub == "hdri")     root = "assets/hdri";
+            else if (sub == "meshes")   root = "assets/meshes";
+            else if (sub == "gltf")     root = "assets/gltf";
+            else if (sub == "textures") root = "assets/textures";
+            else if (sub.empty())       root = "assets";
             else {
                 out.FormatLine("list_assets: unknown subdir '{}'. "
-                               "Try: hdri | meshes | gltf | scenes", sub);
+                               "Try: hdri | meshes | gltf | scenes | textures",
+                               sub);
                 return;
             }
 
@@ -12319,6 +12324,14 @@ void Engine::RegisterCommands() {
                 } else if (sub == "gltf") {
                     if (p.extension() != ".gltf" &&
                         p.extension() != ".glb") continue;
+                } else if (sub == "textures") {
+                    // PBR maps loaded via prim_set_*_tex / mesh_set_*_tex.
+                    // stb_image handles png/jpg/tga/bmp; restrict to those
+                    // so non-image files in assets/textures/ don't clutter
+                    // the material-editor browse list.
+                    const auto ext = p.extension().string();
+                    if (ext != ".png" && ext != ".jpg" && ext != ".jpeg" &&
+                        ext != ".tga" && ext != ".bmp") continue;
                 }
                 entries.push_back(p.lexically_normal().generic_string());
             }
@@ -20071,8 +20084,8 @@ void Engine::RegisterEditorCommands() {
     auto* cmd_open = C.RegisterCommand("panel_open",
         "Open an editor panel in a Chrome --app window. Usage: "
         "panel_open <name>. Names: scene-hierarchy, inspector, "
-        "asset-browser, toolbar. Use `panels` to list state. "
-        "Honors r_editor_dev_mode (Vite dev server URL when 1).",
+        "asset-browser, toolbar, material-editor. Use `panels` to list "
+        "state. Honors r_editor_dev_mode (Vite dev server URL when 1).",
         [this](auto args, pt::console::Output& out) {
             if (args.empty()) {
                 out.PrintLine(
@@ -20083,7 +20096,8 @@ void Engine::RegisterEditorCommands() {
             if (!pt::editor::IsKnownPanel(name)) {
                 out.FormatLine(
                     "panel_open: unknown panel '{}'. Known: "
-                    "scene-hierarchy, inspector, asset-browser, toolbar",
+                    "scene-hierarchy, inspector, asset-browser, toolbar, "
+                    "material-editor",
                     name);
                 return;
             }
