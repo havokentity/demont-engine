@@ -8952,6 +8952,25 @@ void Engine::RenderFrame() {
                   + 16  /* Wave 9 materials: mat_override_count */
                   + 384 /* Wave 9 materials: mat_overrides[8 * 12] */
                   + 16 /* Wave 9 tonemap (#27 follow-up): tonemap_params */);
+    // Vulkan spilled-tail budget guard. The Vulkan backend keeps the first
+    // 112 B of PtPush in push constants and uploads the REMAINDER through a
+    // per-frame UBO of kFrameUboSize bytes (src/rhi_vulkan/VulkanDevice.h).
+    // If the tail (sizeof(PtPush) - 112) outgrows that UBO the backend's
+    // memcpy silently clamps and Vulkan renders corrupt -- exactly the
+    // black-cube MoltenVK regression that waves 8-9 introduced when the tail
+    // crossed 1024 B with nothing failing the build (CI runs software
+    // goldens only, so the corruption was invisible). This compile-time
+    // guard turns the next overflow into a BUILD error on every backend.
+    // Keep the literal in lockstep with kFrameUboSize (currently 2048); the
+    // two can't share a constant without coupling the engine to the Vulkan
+    // backend header, so they're mirrored with this cross-reference instead.
+    static_assert(sizeof(PtPush) - 112 <= 2048,
+                  "PtPush spilled tail (sizeof - 112) exceeds the Vulkan "
+                  "kFrameUboSize budget (2048 B). Bump kFrameUboSize in "
+                  "src/rhi_vulkan/VulkanDevice.h AND this literal together, "
+                  "or the Vulkan backend will silently truncate the tail and "
+                  "render corrupt. See the cornell_csg MoltenVK black-cube "
+                  "regression for what this looks like.");
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
     // cbuffer layout the Slang compiler applies to PathTrace.slang's
