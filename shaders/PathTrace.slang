@@ -3365,6 +3365,38 @@ float smoke_density_add_tinted(float3 pos, out float3 out_tint) {
 // (procedural is bypassed by the host's smoke_params.y override), or
 // 2 = BOTH (additive). The gate happens at the call site, not here --
 // this function unconditionally accumulates whatever's in the buffer.
+
+// --- Wave 8 polish (#28) ---------------------------------------------------
+// SPH plume read fix: the Phase 3 splat used a wide soft Gaussian
+// (exp(-(r/rad)^2)) which, summed over ~800-2048 heavily-overlapping
+// particles, smeared the column into a uniform haze with no coherent
+// vertical structure (the PR flagged "renders as a hazy cloud rather than
+// a sharp columnar plume"). Tighten the kernel so each particle's density
+// concentrates in its core: a steeper Gaussian exp(-kSphSplatSharp * u2)
+// shrinks the effective FWHM by sqrt(kSphSplatSharp), so neighbouring
+// splats overlap in a dense core + fall off fast at the edges rather than
+// blending into fog. kSphSplatSharp = 3.0 reads as a coherent plume at the
+// default particle radius without going grainy. 3-sigma cutoff is kept
+// (the steeper kernel is ~0 well before it). Returns the per-particle
+// splat weight for squared normalised radius u2 = r^2 / rad^2.
+//
+// kSphSplatGain compensates the optical-depth loss from sharpening: a
+// steeper Gaussian has a smaller integral, so without a gain the column
+// would go MORE transparent (the opposite of "coherent plume"). The gain
+// boosts the peak so the plume core becomes optically thick enough to
+// OCCLUDE the bright sky behind it -- the Beer-Lambert occlusion is what
+// reads as a solid smoke column; a thin in-scatter-only column just
+// washes into a bright sky. 4x is tuned so the plume core goes optically
+// thick (Beer-Lambert transmittance -> ~0 through the column), letting
+// the smoke's own grey in-scatter colour replace the bright sky behind it
+// rather than glowing translucently over it.
+static const float kSphSplatSharp = 3.0;
+static const float kSphSplatGain  = 4.0;
+float sph_splat_weight(float u2) {
+    return kSphSplatGain * exp(-kSphSplatSharp * u2);
+}
+// --- end Wave 8 polish (#28) -----------------------------------------------
+
 float smoke_sph_density_add(float3 pos) {
     int n = int(smoke_sph_params.x);
     if (n <= 0) return 0.0;
@@ -3388,24 +3420,23 @@ float smoke_sph_density_add(float3 pos) {
         float r2 = dot(d, d);
         float cutoff = 9.0 * rad * rad;   // 3-sigma; outside ~zero contribution
         if (r2 > cutoff) continue;
-        // Gaussian splat: peak * exp(-(r/rad)^2). Same shape as the
-        // legacy Phase 2 puff (falloff=2 default) so visual style
-        // matches when switching r_smoke_mode procedural -> sph.
+        // Wave 8 (#28): sharpened Gaussian splat (sph_splat_weight) so the
+        // column reads as a coherent plume instead of overlapping soft haze.
         float u2 = r2 / (rad * rad);
-        float w  = exp(-u2);
+        float w  = sph_splat_weight(u2);
         dens += peak * w;
     }
     return dens;
 }
 
 // Tinted variant for the in-scatter path. Reads the same particle
-// buffer but returns out_tint = white (no per-particle tint stored
-// today; the Phase 3 particle SSBO uses v1 fields for density / age).
-// A future expansion could add per-particle temperature -> tint mapping
-// (cool blue-grey for old particles, warm white for hot fresh
-// particles) using the same age_mod gradient as the Phase 2 path.
-// Keep the API parallel to smoke_density_add_tinted so the call site
-// in PathTrace can blindly add the two contributions.
+// buffer and returns the density-weighted average per-particle tint via
+// out_tint. Wave 8 (#28): the tint is now an age gradient (bright white
+// for fresh near-emitter particles -> dim cool grey for old diluted
+// ones, driven by the host-baked v1.y normalised-age scalar) so the
+// column gets vertical structure -- a dense white base fading to a wispy
+// grey crown. Keep the API parallel to smoke_density_add_tinted so the
+// call site in PathTrace can blindly add the two contributions.
 float smoke_sph_density_add_tinted(float3 pos, out float3 out_tint) {
     out_tint = float3(1.0, 1.0, 1.0);
     int n = int(smoke_sph_params.x);
@@ -3427,17 +3458,30 @@ float smoke_sph_density_add_tinted(float3 pos, out float3 out_tint) {
         float r2 = dot(d, d);
         float cutoff = 9.0 * rad * rad;
         if (r2 > cutoff) continue;
+        // Wave 8 (#28): sharpened splat (matches smoke_sph_density_add).
         float u2 = r2 / (rad * rad);
-        float w  = exp(-u2);
+        float w  = sph_splat_weight(u2);
         float di = peak * w;
-        // Simple per-particle age tint: fresh = neutral white, old =
-        // slight cool blue-grey. Same idea as the Phase 2 age tint but
-        // driven by the host-baked v1.y normalised-age scalar so the
-        // shader doesn't need access to emitter records.
-        float a_norm = saturate(v1.y);
-        float3 warm = float3(1.04, 1.00, 0.95);
-        float3 cool = float3(0.94, 0.96, 1.04);
-        float3 ptint = lerp(warm, cool, a_norm);
+        // Wave 8 (#28): age-driven tint COHESION for vertical plume
+        // structure. Younger particles (near the emitter, a_norm -> 0)
+        // read bright/white -- freshly-lofted hot smoke is optically dense
+        // and reflective; older particles (a_norm -> 1) read as a dimmer,
+        // desaturated grey as the puff dilutes and cools. This gives the
+        // column a white dense base fading to a wispy grey crown rather
+        // than a uniform tint top-to-bottom. The host bakes the density
+        // age-fade into v1.x (PackForGpu) so this is purely the colour
+        // gradient; the two together produce the columnar read.
+        float a_norm  = saturate(v1.y);
+        // Age-driven tint cohesion (Wave 8 #28). Fresh near-emitter
+        // particles read bright + faintly warm (hot, optically dense
+        // smoke catching the sun); aged/diluted particles fade to a
+        // dimmer cool grey wisp. The brightness gradient (paired with the
+        // density age-fade baked into v1.x by PackForGpu) gives the plume
+        // a bright coherent base fading to a grey crown -- the vertical
+        // structure that turns a flat blob into a recognisable plume.
+        float3 fresh  = float3(1.15, 1.10, 1.02);   // bright warm-white base
+        float3 old    = float3(0.55, 0.57, 0.62);   // dim cool grey crown
+        float3 ptint  = lerp(fresh, old, a_norm);
         dens     += di;
         tint_acc += di * ptint;
     }

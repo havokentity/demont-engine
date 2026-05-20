@@ -1321,12 +1321,16 @@ namespace cvar {
             "shockwaves. 'both' = both contributions stacked (hybrid "
             "render). The SPH solver runs on the CPU at fixed 1/120s "
             "sub-steps; per-frame cost scales with r_smoke_sph_max_particles.");
-    PT_CVAR(r_smoke_sph_max_particles,   "1024",
-            "Cap on SPH particles per frame (#22). Default 1024 keeps "
-            "the per-frame cost well under 1 ms on M4 Max even at 8 "
-            "sub-steps. Higher = finer plume resolution; lower = "
-            "cheaper at the cost of visibly coarser blobs. Hard "
-            "upper bound 4096 (shader-side cap).", CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_sph_max_particles,   "2048",
+            "Cap on SPH particles per frame (#22). Default 2048 (raised "
+            "from 1024 in Wave 8 #28: the denser pool closes the plume "
+            "read -- more particles fill the column volume so it reads "
+            "as a coherent plume rather than scattered blobs -- and the "
+            "per-frame cost is dominated by other passes, not the O(N) "
+            "splat loop which has a 3-sigma early-out). Higher = finer "
+            "plume resolution; lower = cheaper at the cost of visibly "
+            "coarser blobs. Hard upper bound 4096 (shader-side cap).",
+            CVAR_ARCHIVE);
     PT_CVAR(r_smoke_sph_emit_rate,       "120.0",
             "Particles per emitter per second when r_smoke_mode != "
             "procedural (#22). Each emitter spawns at this rate; "
@@ -8226,18 +8230,39 @@ void Engine::RenderFrame() {
         if (res_scale < 0.25f) res_scale = 0.25f;
         if (res_scale > 1.0f) res_scale = 1.0f;
 
-        // Sun + moon brightness. Used to scale the radiance triplets
-        // below so the raymarched clouds match the path-traced clouds'
-        // overall luminance (single-scale heuristic; close enough for
-        // visual parity, exact match would require re-deriving the
-        // analytic atmospheric transmittance per sample).
+        // --- Wave 8 polish (#28): cloud radiance parity --------------------
+        // The Wave-7 scaffolding set sun_radiance = r_sun_brightness (a cvar
+        // that was never registered, so it defaulted to 1.0) and dropped the
+        // atmospheric transmittance / warmth / vol_intensity scaling that
+        // the inline path-traced cloud march in PathTrace.slang applies. The
+        // result was a raymarched cloud layer ~14-80x too dim (near-black at
+        // the sunset elevation of clouds_godrays.cfg). Reconstruct the SAME
+        // radiance the inline march derives (PathTrace.slang ~L5162-5172,
+        // L5434, L5720-5729) so the two modes match in brightness.
+        //
+        // Optional brightness multipliers stay layered on top (default 1.0)
+        // so a future r_sun_brightness / r_moon_brightness cvar still works.
         float sun_brightness = 1.0f, moon_brightness = 1.0f;
         if (auto* v = C.FindCVar("r_sun_brightness"))  sun_brightness  = v->GetFloat();
         if (auto* v = C.FindCVar("r_moon_brightness")) moon_brightness = v->GetFloat();
-        float sun_elev_v = push.sun_and_mode[1];   // y of sun_dir
-        float ambient_scale = (sun_elev_v > 0.0f)
-            ? sun_brightness * 0.15f * (1.0f / 3.14159265358979f)
-            : 0.0f;
+        const float kPi = 3.14159265358979f;
+        // Sun radiance: matches the inline march's sun_rad. sun_elev_v is
+        // sin(elevation) == sun_dir.y (the same `sun_elev` the shader uses).
+        const float sun_elev_v = push.sun_and_mode[1];   // y of sun_dir
+        float sun_rad_r = 0.0f, sun_rad_g = 0.0f, sun_rad_b = 0.0f;
+        float sun_am = 0.0f;
+        if (sun_elev_v > 0.0f) {
+            sun_am = 1.0f / std::max(sun_elev_v, 0.04f);
+            const float t_atm = std::exp(-0.30f * sun_am);
+            const float warmth = std::clamp((sun_am - 1.0f) * 0.30f, 0.0f, 1.0f);
+            const float scale = 80.0f * t_atm;
+            // lerp((1.00,0.97,0.92), (1.55,0.40,0.12), warmth) * scale.
+            sun_rad_r = (1.00f + (1.55f - 1.00f) * warmth) * scale;
+            sun_rad_g = (0.97f + (0.40f - 0.97f) * warmth) * scale;
+            sun_rad_b = (0.92f + (0.12f - 0.92f) * warmth) * scale;
+        }
+        // Diffuse skylight ambient: sun_rad * (0.7,0.85,1.0) * 0.15 / pi.
+        const float ambient_k = (sun_elev_v > 0.0f) ? (0.15f / kPi) : 0.0f;
 
         struct CloudsRaymarchPush {
             float pos_fovtan[4];
@@ -8279,30 +8304,57 @@ void Engine::RenderFrame() {
         std::memcpy(cp.clouds_p2,      push.clouds_p2,      sizeof(cp.clouds_p2));
         std::memcpy(cp.clouds_p3,      push.clouds_p3,      sizeof(cp.clouds_p3));
         std::memcpy(cp.clouds_p4,      push.clouds_p4,      sizeof(cp.clouds_p4));
-        // Raymarch parameters.
+        // Raymarch parameters. raymarch_params.w now carries the
+        // volumetric intensity (vol_params.z / r_volumetric_intensity) so
+        // the shader applies the SAME final v_color * vol_int multiplier
+        // the inline march does (was sun_brightness, which is folded into
+        // the radiance triplets below instead). (Wave 8 #28.)
+        float vol_int = push.vol_params[2];
         cp.raymarch_params[0] = push.vol_density_scale;
         cp.raymarch_params[1] = push.vol_phase_g_cloud;
         cp.raymarch_params[2] = push.vol_multiscatter_oct;
-        cp.raymarch_params[3] = sun_brightness;
+        cp.raymarch_params[3] = vol_int;
         cp.raymarch_quality[0] = tem_alpha;
         cp.raymarch_quality[1] = res_scale;
         cp.raymarch_quality[2] = float(light_steps);
         cp.raymarch_quality[3] = float(samples);
-        // Sun + moon radiance (linear RGB). Slight warm tint on sun
-        // matches sunset-canonical look; cool tint on moon matches
-        // PathTrace's moon NEE colour. ambient is the diffuse sky fill
-        // (15% of sun irradiance / pi, blue-tinted).
-        cp.sun_radiance[0] = sun_brightness;
-        cp.sun_radiance[1] = sun_brightness * 0.95f;
-        cp.sun_radiance[2] = sun_brightness * 0.85f;
-        cp.sun_radiance[3] = 0.0f;
-        cp.moon_radiance[0] = moon_brightness * 0.30f;
-        cp.moon_radiance[1] = moon_brightness * 0.32f;
-        cp.moon_radiance[2] = moon_brightness * 0.40f;
+        // Sun + moon radiance (linear RGB), reconstructed to match the
+        // inline path-traced cloud march (Wave 8 #28). sun_radiance.w
+        // carries sun_am (1/sin(elev)) so the shader can apply the same
+        // per-sample altitude boost exp(0.30 * sun_am * h_norm).
+        cp.sun_radiance[0] = sun_rad_r * sun_brightness;
+        cp.sun_radiance[1] = sun_rad_g * sun_brightness;
+        cp.sun_radiance[2] = sun_rad_b * sun_brightness;
+        cp.sun_radiance[3] = sun_am;
+        // Moon radiance: matches PathTrace's moon NEE colour
+        // (m_col * 0.3 * phase_b * m_atm). moon_dir_phase.w is the phase
+        // angle in radians; phase_b = 0.5*(1-cos(phase)).
+        float moon_elev_v = push.moon_dir_phase[1];
+        float moon_rad_r = 0.0f, moon_rad_g = 0.0f, moon_rad_b = 0.0f;
+        if (moon_elev_v > 0.0f) {
+            const float phase_b =
+                0.5f * (1.0f - std::cos(push.moon_dir_phase[3]));
+            const float m_elev = std::max(moon_elev_v, 0.04f);
+            const float m_am = 1.0f / m_elev;
+            const float m_atm = std::exp(-0.30f * m_am);
+            const float m_warmth = std::clamp((m_am - 1.0f) * 0.18f, 0.0f, 1.0f);
+            // lerp((0.92,0.94,1.00), (1.20,0.65,0.40), m_warmth).
+            const float m_col_r = 0.92f + (1.20f - 0.92f) * m_warmth;
+            const float m_col_g = 0.94f + (0.65f - 0.94f) * m_warmth;
+            const float m_col_b = 1.00f + (0.40f - 1.00f) * m_warmth;
+            const float m_scale = 0.3f * phase_b * m_atm;
+            moon_rad_r = m_col_r * m_scale;
+            moon_rad_g = m_col_g * m_scale;
+            moon_rad_b = m_col_b * m_scale;
+        }
+        cp.moon_radiance[0] = moon_rad_r * moon_brightness;
+        cp.moon_radiance[1] = moon_rad_g * moon_brightness;
+        cp.moon_radiance[2] = moon_rad_b * moon_brightness;
         cp.moon_radiance[3] = 0.0f;
-        cp.sky_ambient[0] = ambient_scale * 0.70f;
-        cp.sky_ambient[1] = ambient_scale * 0.85f;
-        cp.sky_ambient[2] = ambient_scale * 1.00f;
+        // Diffuse sky ambient: sun_rad * (0.7,0.85,1.0) * 0.15/pi.
+        cp.sky_ambient[0] = sun_rad_r * sun_brightness * 0.70f * ambient_k;
+        cp.sky_ambient[1] = sun_rad_g * sun_brightness * 0.85f * ambient_k;
+        cp.sky_ambient[2] = sun_rad_b * sun_brightness * 1.00f * ambient_k;
         cp.sky_ambient[3] = 0.0f;
         cp.frame_index      = push.frame_index;
         cp.composite_active = 1u;

@@ -26,9 +26,11 @@ namespace pt::sph {
 // against a fixed substep dt (1/120 s by default) so the integrator
 // stays stable even when the frame dt jitters.
 //
-// Particle count: parameterised. Default cap 1024 keeps the per-frame
-// cost well below 1 ms at 120 substeps; raise via the host cvar
-// r_smoke_sph_max_particles when more visual fidelity is needed.
+// Particle count: parameterised. The standalone class default cap is
+// 1024; the engine raises it via r_smoke_sph_max_particles (default 2048
+// since Wave 8 #28 -- a denser pool reads as a coherent plume). Per-frame
+// cost stays well below 1 ms at 120 substeps; raise toward the 4096 cap
+// when more visual fidelity is needed.
 //
 // Particles are spawned by SmokeEmitter records in the engine (each
 // emitter pushes ~r_smoke_sph_emit_rate particles per second from
