@@ -5674,20 +5674,24 @@ void main(uint2 tid : SV_DispatchThreadID) {
             float focal_d  = dof_params.y;
             int   blades   = int(dof_params.z + 0.5);
             float u1 = randf(seed), u2 = randf(seed);
-            // Concentric-disk mapping (Shirley-Chiu): square (u1,u2) ->
-            // uniformly distributed unit disk. This is the common base
-            // for both the round and polygonal apertures so the blades=0
-            // path stays bit-identical to the pre-wave-10 sampler.
-            float2 ap = ptConcentricDisk(u1, u2);
             // --- Wave 10 bloom/bokeh ---
-            // Polygonal iris: warp the disk sample onto a regular N-gon by
-            // scaling its radius by the polygon's boundary distance at the
-            // sample angle (rotated by the blade orientation). Maps the
-            // uniform disk to a uniform-ish polygon fill, giving the
-            // classic 5-/6-/8-sided bokeh. blades < 3 keeps the round disk.
-            if (blades >= 3) {
-                ap = ptPolygonWarp(ap, blades, dof_params.w);
-            }
+            // Round aperture (blades < 3): concentric-disk mapping
+            // (Shirley-Chiu) of the square (u1,u2) onto a uniformly
+            // distributed unit disk -- bit-identical to the pre-wave-10
+            // sampler. Polygonal iris (blades >= 3): an AREA-UNIFORM sample
+            // of the regular N-gon drawn directly from (u1,u2) via the
+            // wedge/triangle method (rotated by the blade orientation
+            // dof_params.w), giving the classic 5-/6-/8-sided bokeh with a
+            // physically-correct (unbiased) uniform density. Both branches
+            // consume exactly the same two uniforms, so the seed stream
+            // after this block is identical regardless of blade count.
+            // (The earlier disk->polygon radial warp was area-biased -- the
+            // map's Jacobian varied with the sample angle, over-weighting the
+            // polygon toward its vertices and skewing DOF integration. See
+            // PR #235.)
+            float2 ap = (blades >= 3)
+                          ? ptPolygonSample(u1, u2, blades, dof_params.w)
+                          : ptConcentricDisk(u1, u2);
             // Cat's-eye / optical vignetting: off-axis image points see a
             // pupil partly occluded by the rear elements, clipping the
             // bokeh into a lemon shape squeezed toward frame centre. uv is

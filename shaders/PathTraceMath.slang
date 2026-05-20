@@ -235,24 +235,54 @@ public float2 ptConcentricDisk(float u1, float u2) {
     return r * float2(cos(phi), sin(phi));
 }
 
-// Warp a unit-disk sample onto a regular N-gon (circumradius 1) rotated by
-// rot_rad.  Scales the sample's radius by the polygon's boundary distance
-// at the sample angle: for a regular N-gon the boundary radius at angle
-// theta is cos(pi/N) / cos(theta_folded), where theta_folded folds theta
-// into one [-pi/N, pi/N] wedge.  The unit circle thus maps to the inscribed
-// polygon and the disk's interior fills the polygon -- the classic 5-/6-/8-
-// sided bokeh.  blades is assumed >= 3 (the caller keeps the round disk for
-// fewer).  Mirrored in StarsComposite.slang.
-public float2 ptPolygonWarp(float2 ap, int blades, float rot_rad) {
+// Area-uniform sample of a regular N-gon aperture (circumradius 1) rotated
+// by rot_rad, drawn DIRECTLY from two canonical uniforms (u1,u2) in [0,1]^2
+// rather than by warping a disk sample.
+//
+// Why not the old disk->polygon radial scaling (r' = r * cos(pi/N)/cos(theta
+// folded))?  That map's Jacobian is poly_r(theta)^2, which varies with the
+// sample angle, so a uniform disk density becomes a NON-uniform polygon
+// density (PDF ~ 1/R(theta)^2).  The thin-lens camera path applies no
+// importance weight to the lens sample, so the biased density makes the
+// integrated bokeh brightness/structure physically wrong (the polygon fills
+// preferentially toward the vertices vs the flats).  See PR #235.
+//
+// The unbiased construction is the standard triangle-fan: a regular N-gon
+// is N congruent isoceles triangles sharing the aperture centre.  (a) pick
+// one wedge uniformly, (b) uniform-area sample that triangle with the
+// sqrt-barycentric parameterization, (c) the polygon orientation falls out
+// of placing the vertices at angle rot_rad.  Each triangle has equal area
+// and is chosen with probability 1/N, so the marginal density is uniform
+// over the whole polygon -- an unbiased aperture sample.  The polygon keeps
+// the old circumradius (1, vertices on the unit circle) and inradius
+// cos(pi/N), so the bokeh SIZE is unchanged; only its interior density is
+// corrected from biased to uniform.
+//
+// Reusing u1 for BOTH the wedge pick and the in-triangle radius (via the
+// fractional part u1*N - k) keeps the sampler at two uniforms, matching the
+// disk path's RNG draw count so the blades>=3 path doesn't shift the seed
+// stream relative to blades=0.  The fractional part of a uniform is itself
+// uniform on [0,1] and independent of the integer part, so this is exact,
+// not an approximation.  blades is assumed >= 3 (the caller keeps the round
+// disk for fewer).  Mirrored verbatim in StarsComposite.slang.
+public float2 ptPolygonSample(float u1, float u2, int blades, float rot_rad) {
     float n = float(blades);
-    float r = length(ap);
-    if (r < 1e-6) return ap;                     // centre sample -- no warp
-    float theta = atan2(ap.y, ap.x) - rot_rad;
     float wedge = 6.28318530717958 / n;          // 2*pi / N
-    // Fold theta into [-wedge/2, wedge/2] around the nearest wedge centre.
-    float folded = theta - wedge * floor(theta / wedge + 0.5);
-    float poly_r = cos(3.14159265358979 / n) / max(cos(folded), 1e-4);
-    return ap * poly_r;
+    // (a) Pick a wedge k in [0, N-1] uniformly, then recycle the fractional
+    //     part as a fresh uniform for the in-triangle radius parameter.
+    float kf = floor(u1 * n);
+    float ku = u1 * n - kf;                       // fractional part, ~U[0,1]
+    // (c) Two adjacent polygon vertices on the unit circumradius circle.
+    //     V0 (the aperture centre) is the origin, so its barycentric term
+    //     drops out of the blend below.
+    float a0 = rot_rad + kf * wedge;
+    float a1 = a0 + wedge;
+    float2 V1 = float2(cos(a0), sin(a0));
+    float2 V2 = float2(cos(a1), sin(a1));
+    // (b) Uniform-area sample of triangle (0, V1, V2) via the sqrt-bary map:
+    //     p = (1-su)*V0 + su*(1-u2)*V1 + su*u2*V2, with V0 = 0.
+    float su = sqrt(ku);
+    return su * ((1.0 - u2) * V1 + u2 * V2);
 }
 
 // Cat's-eye / optical vignetting.  Off-axis image points see an entrance

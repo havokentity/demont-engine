@@ -14527,6 +14527,15 @@ void Engine::RegisterCommands() {
     if (auto* v = C.FindCVar("r_lens_flare")) {
         v->allowed_values = {"0", "1"};
     }
+    // Wave 10 (PR #235): r_lens_dirt is a strict boolean toggle (clean lens
+    // vs procedural grime overlay on the bloom), so it follows the same
+    // allowed_values contract as r_bloom / r_lens_flare -- the web UI then
+    // renders it as a toggle and tab-completion / cvar validation reject
+    // arbitrary numeric strings that would otherwise be silently accepted.
+    // Like bloom/flare it's a post-tonemap effect, so no accum reset.
+    if (auto* v = C.FindCVar("r_lens_dirt")) {
+        v->allowed_values = {"0", "1"};
+    }
     // Fluid Phase 1 (#136): r_smoke_enabled is a strict bool. Matches
     // the registration pattern used by the other renderer toggles
     // above so the toggle / cvar-validation chain can treat it
@@ -14631,6 +14640,21 @@ void Engine::RegisterCommands() {
     if (auto* v = C.FindCVar("r_dof_blades")) {
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
+    // --- Wave 10 polygonal bokeh (PR #235): r_dof_blade_rotation and
+    // r_dof_cateye both feed PathTrace.slang's primary-ray aperture
+    // sampler (the N-gon orientation and the off-axis cat's-eye squeeze),
+    // so changing either at runtime reshapes the lens sample exactly like
+    // the sibling r_dof_* params above. They were missing the accum reset,
+    // so a mid-flight tweak smeared the old aperture's accumulated bokeh
+    // into the new shape until something else dirtied the accumulator.
+    // Reset accum on change to match every other thin-lens cvar.
+    if (auto* v = C.FindCVar("r_dof_blade_rotation")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    if (auto* v = C.FindCVar("r_dof_cateye")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    // --- end Wave 10 polygonal bokeh ---
     if (auto* v = C.FindCVar("r_volumetric")) {
         v->allowed_values = {"0", "1"};
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
@@ -15313,6 +15337,13 @@ void Engine::RegisterCommands() {
     set_slider("r_bloom_intensity",     0.0f,   1.0f,  0.005f);
     set_slider("r_bloom_mips",          1.0f,   5.0f,  1.0f);
     set_slider("r_bloom_radius",        0.5f,   3.0f,  0.05f);
+    // Wave 10 (PR #235): artist-facing bloom/lens-dirt gains. r_bloom_strength
+    // is the final composite gain (1.0 neutral, cinematic 0.5..2.0 per its
+    // docstring); r_lens_dirt_strength is the dirt-field mix (0 clean .. 1
+    // full gate). Registered as sliders alongside the other r_bloom_* knobs
+    // so the web UI renders them as range inputs rather than text boxes.
+    set_slider("r_bloom_strength",      0.0f,   2.0f,  0.01f);
+    set_slider("r_lens_dirt_strength",  0.0f,   1.0f,  0.01f);
     set_slider("r_lens_flare_intensity",      0.0f, 1.0f,  0.005f);
     set_slider("r_lens_flare_dispersion",     0.0f, 0.05f, 0.001f);
     set_slider("r_lens_flare_count",          1.0f, 6.0f,  1.0f);

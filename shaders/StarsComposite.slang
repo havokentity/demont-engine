@@ -502,13 +502,16 @@ float halton(uint i, uint base) {
 }
 
 // --- Wave 10 bloom/bokeh: thin-lens aperture sampling --------------------
-// VERBATIM duplicate of the ptConcentricDisk / ptPolygonWarp / ptCatEye
-// helpers in PathTraceMath.slang. Duplicated rather than imported because
-// this kernel is a self-contained TU (it does not import PathTraceMath,
-// like the rest of the composite shaders); the sun/moon bokeh MUST match
-// the path tracer's primary-ray sampler exactly so the celestials' bokeh
-// lines up with the out-of-focus geometry the path tracer renders. Keep
-// the math identical to the PathTraceMath copy if either side changes.
+// VERBATIM duplicate of the ptConcentricDisk / ptPolygonSample / ptCatEye
+// helpers in PathTraceMath.slang (renamed dof* to match this file's
+// convention; bodies are line-for-line identical). Duplicated rather than
+// imported because this kernel is a self-contained TU (it does not import
+// PathTraceMath, like the rest of the composite shaders); the sun/moon
+// bokeh MUST match the path tracer's primary-ray sampler exactly so the
+// celestials' bokeh lines up with the out-of-focus geometry the path tracer
+// renders. KEEP THE MATH IDENTICAL to the PathTraceMath copy if either side
+// changes -- dofPolygonSample below mirrors ptPolygonSample's area-uniform
+// N-gon sampler (PR #235); the two must not drift.
 float2 dofConcentricDisk(float u1, float u2) {
     float a = 2.0 * u1 - 1.0;
     float b = 2.0 * u2 - 1.0;
@@ -523,15 +526,25 @@ float2 dofConcentricDisk(float u1, float u2) {
     }
     return r * float2(cos(phi), sin(phi));
 }
-float2 dofPolygonWarp(float2 ap, int blades, float rot_rad) {
+// Area-uniform regular-N-gon aperture sample (circumradius 1, rotated by
+// rot_rad) drawn directly from (u1,u2). Triangle-fan method: pick a wedge
+// uniformly (recycling the fractional part of u1*N as the in-triangle
+// radius parameter so only two uniforms are consumed), then uniform-area
+// sample that triangle with the sqrt-barycentric map. Unbiased over the
+// polygon (unlike the old disk->polygon radial warp, whose angle-varying
+// Jacobian skewed the density toward the vertices). Body is line-for-line
+// identical to ptPolygonSample() in PathTraceMath.slang -- see PR #235.
+float2 dofPolygonSample(float u1, float u2, int blades, float rot_rad) {
     float n = float(blades);
-    float r = length(ap);
-    if (r < 1e-6) return ap;
-    float theta = atan2(ap.y, ap.x) - rot_rad;
-    float wedge = 6.28318530717958 / n;
-    float folded = theta - wedge * floor(theta / wedge + 0.5);
-    float poly_r = cos(3.14159265358979 / n) / max(cos(folded), 1e-4);
-    return ap * poly_r;
+    float wedge = 6.28318530717958 / n;          // 2*pi / N
+    float kf = floor(u1 * n);
+    float ku = u1 * n - kf;                       // fractional part, ~U[0,1]
+    float a0 = rot_rad + kf * wedge;
+    float a1 = a0 + wedge;
+    float2 V1 = float2(cos(a0), sin(a0));
+    float2 V2 = float2(cos(a1), sin(a1));
+    float su = sqrt(ku);
+    return su * ((1.0 - u2) * V1 + u2 * V2);
 }
 float2 dofCatEye(float2 ap, float2 uv, float strength) {
     float ecc = saturate(length(uv));
@@ -641,17 +654,18 @@ void main(uint3 tid : SV_DispatchThreadID) {
             // sampler exactly so the composite's bokeh shape lines up with
             // the rest of the rendered scene's bokeh (out-of-focus geometry
             // through the path tracer). blades < 3 -> round disk via the
-            // Shirley-Chiu concentric mapping; blades >= 3 -> the disk
-            // sample warped onto a regular N-gon (rotated by dof_params.w),
-            // with optional cat's-eye edge vignetting from
+            // Shirley-Chiu concentric mapping; blades >= 3 -> an area-uniform
+            // regular-N-gon sample drawn directly from (u1,u2) (rotated by
+            // dof_params.w), with optional cat's-eye edge vignetting from
             // dof_bokeh_params.x. Defaults (blades 0, cateye 0) keep the
-            // round disc bit-for-bit with the pre-wave-10 sampler.
+            // round disc bit-for-bit with the pre-wave-10 sampler. The N-gon
+            // path is the unbiased triangle-fan sampler (PR #235), identical
+            // to PathTrace.slang's camera sampler.
             float u1 = halton(si, 5u);
             float u2 = halton(si, 7u);
-            float2 ap = dofConcentricDisk(u1, u2);
-            if (blades >= 3) {
-                ap = dofPolygonWarp(ap, blades, dof_params.w);
-            }
+            float2 ap = (blades >= 3)
+                          ? dofPolygonSample(u1, u2, blades, dof_params.w)
+                          : dofConcentricDisk(u1, u2);
             if (dof_bokeh_params.x > 0.0) {
                 ap = dofCatEye(ap, uv, dof_bokeh_params.x);
             }
