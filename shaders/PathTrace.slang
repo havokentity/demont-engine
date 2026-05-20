@@ -666,8 +666,17 @@ cbuffer Push {
     //   .y = focal distance (world units).
     //   .z = aperture blade count (0 = round disk; 3..16 = polygonal
     //        iris -> polygonal bokeh).
-    //   .w reserved.
+    //   .w = blade rotation in radians (Wave 10; orients the polygon,
+    //        ignored for the round disk).
     float4 dof_params;
+    // --- Wave 10 bloom/bokeh ---
+    // Polygonal-bokeh extras.
+    //   .x = cat's-eye / optical-vignetting strength (0 = round bokeh
+    //        across the frame, bit-for-bit with the pre-wave-10 aperture;
+    //        1 = strong off-axis lemon clipping).
+    //   .y/.z/.w reserved.
+    float4 dof_bokeh_params;
+    // --- end Wave 10 bloom/bokeh ---
     // --- Wave 8 spectral (#27) ---
     // Spectral dispersion (hero-wavelength) parameters.
     //   .x = enabled flag (0 = achromatic RGB dielectric path, bit-stable
@@ -1175,6 +1184,10 @@ cbuffer Frame {
     float4 w2j_row1;
     float4 w2j_row2;
     float4 dof_params;
+    // --- Wave 10 bloom/bokeh --- see the matching field in the Metal
+    // Push cbuffer above for per-lane semantics. Layout-equivalent.
+    float4 dof_bokeh_params;
+    // --- end Wave 10 bloom/bokeh ---
     // --- Wave 8 spectral (#27) --- see the matching field in the Metal
     // Push cbuffer above for per-lane semantics. Layout-equivalent.
     float4 spectral_params;
@@ -5661,38 +5674,30 @@ void main(uint2 tid : SV_DispatchThreadID) {
             float focal_d  = dof_params.y;
             int   blades   = int(dof_params.z + 0.5);
             float u1 = randf(seed), u2 = randf(seed);
-            float2 ap;
-            if (blades < 3) {
-                // Concentric-disk mapping (Shirley-Chiu): square
-                // (u1,u2) -> uniformly distributed unit disk.
-                float a = 2.0 * u1 - 1.0;
-                float b = 2.0 * u2 - 1.0;
-                float r, phi;
-                if (abs(a) > abs(b)) {
-                    r = a;
-                    phi = (3.14159265358979 / 4.0) * (b / max(abs(a), 1e-6));
-                } else {
-                    r = b;
-                    phi = (3.14159265358979 / 2.0) -
-                          (3.14159265358979 / 4.0) * (a / max(abs(b), 1e-6));
-                }
-                ap = r * float2(cos(phi), sin(phi));
-            } else {
-                // Polygon sampling: pick a triangular wedge of the
-                // regular n-gon, sample uniformly inside it. Bokeh
-                // gets that classic 5-/6-/8-sided look.
-                float n = float(blades);
-                float wedge = 6.28318530717958 / n;
-                int   i = int(floor(u1 * n));
-                float r1 = frac(u1 * n);
-                float r2 = u2;
-                if (r1 + r2 > 1.0) { r1 = 1.0 - r1; r2 = 1.0 - r2; }
-                float a0 = float(i) * wedge;
-                float a1 = a0 + wedge;
-                float2 p0 = float2(cos(a0), sin(a0));
-                float2 p1 = float2(cos(a1), sin(a1));
-                ap = r1 * p0 + r2 * p1;
+            // Concentric-disk mapping (Shirley-Chiu): square (u1,u2) ->
+            // uniformly distributed unit disk. This is the common base
+            // for both the round and polygonal apertures so the blades=0
+            // path stays bit-identical to the pre-wave-10 sampler.
+            float2 ap = ptConcentricDisk(u1, u2);
+            // --- Wave 10 bloom/bokeh ---
+            // Polygonal iris: warp the disk sample onto a regular N-gon by
+            // scaling its radius by the polygon's boundary distance at the
+            // sample angle (rotated by the blade orientation). Maps the
+            // uniform disk to a uniform-ish polygon fill, giving the
+            // classic 5-/6-/8-sided bokeh. blades < 3 keeps the round disk.
+            if (blades >= 3) {
+                ap = ptPolygonWarp(ap, blades, dof_params.w);
             }
+            // Cat's-eye / optical vignetting: off-axis image points see a
+            // pupil partly occluded by the rear elements, clipping the
+            // bokeh into a lemon shape squeezed toward frame centre. uv is
+            // the pixel's normalised [-1,1] screen position, so |uv| is the
+            // image eccentricity. Strength 0 leaves the bokeh round
+            // (bit-for-bit with the pre-wave-10 aperture).
+            if (dof_bokeh_params.x > 0.0) {
+                ap = ptCatEye(ap, uv, dof_bokeh_params.x);
+            }
+            // --- end Wave 10 bloom/bokeh ---
             float3 lens_off = right_xyz.xyz * (ap.x * aperture)
                             + up_xyz.xyz    * (ap.y * aperture);
             float3 focus_p  = ro + rd * focal_d;

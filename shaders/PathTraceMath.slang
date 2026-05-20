@@ -212,3 +212,70 @@ public bool intersectPlane(float3 ro, float3 rd, float3 n, float d, out float t)
     t = -(dot(ro, n) + d) / denom;
     return t > 1e-3;
 }
+
+// --- Wave 10 bloom/bokeh: thin-lens aperture sampling --------------------
+// Shirley-Chiu concentric-disk mapping: square (u1,u2) in [0,1]^2 -> a
+// uniformly distributed point on the unit disk.  This is the common base
+// for the round and polygonal apertures; verbatim the math the camera-ray
+// block used inline before wave-10, so blades=0 stays bit-for-bit.
+// Mirrored in StarsComposite.slang (self-contained TU -- the sun/moon
+// bokeh must match this sampler exactly).
+public float2 ptConcentricDisk(float u1, float u2) {
+    float a = 2.0 * u1 - 1.0;
+    float b = 2.0 * u2 - 1.0;
+    float r, phi;
+    if (abs(a) > abs(b)) {
+        r = a;
+        phi = (3.14159265358979 / 4.0) * (b / max(abs(a), 1e-6));
+    } else {
+        r = b;
+        phi = (3.14159265358979 / 2.0) -
+              (3.14159265358979 / 4.0) * (a / max(abs(b), 1e-6));
+    }
+    return r * float2(cos(phi), sin(phi));
+}
+
+// Warp a unit-disk sample onto a regular N-gon (circumradius 1) rotated by
+// rot_rad.  Scales the sample's radius by the polygon's boundary distance
+// at the sample angle: for a regular N-gon the boundary radius at angle
+// theta is cos(pi/N) / cos(theta_folded), where theta_folded folds theta
+// into one [-pi/N, pi/N] wedge.  The unit circle thus maps to the inscribed
+// polygon and the disk's interior fills the polygon -- the classic 5-/6-/8-
+// sided bokeh.  blades is assumed >= 3 (the caller keeps the round disk for
+// fewer).  Mirrored in StarsComposite.slang.
+public float2 ptPolygonWarp(float2 ap, int blades, float rot_rad) {
+    float n = float(blades);
+    float r = length(ap);
+    if (r < 1e-6) return ap;                     // centre sample -- no warp
+    float theta = atan2(ap.y, ap.x) - rot_rad;
+    float wedge = 6.28318530717958 / n;          // 2*pi / N
+    // Fold theta into [-wedge/2, wedge/2] around the nearest wedge centre.
+    float folded = theta - wedge * floor(theta / wedge + 0.5);
+    float poly_r = cos(3.14159265358979 / n) / max(cos(folded), 1e-4);
+    return ap * poly_r;
+}
+
+// Cat's-eye / optical vignetting.  Off-axis image points see an entrance
+// pupil partly occluded by the rear elements, so the bokeh clips into a
+// lemon shape squeezed toward frame centre.  `uv` is the pixel's
+// normalised [-1,1] screen position (|uv| ~ image eccentricity), strength
+// in [0,1].  We compress the lens-sample component along the radial-to-
+// centre axis by a factor that grows with eccentricity, which is the
+// physically-correct narrowing of the pupil off-axis.  strength 0 (or an
+// on-axis pixel) returns ap unchanged, so the bokeh stays round there.
+public float2 ptCatEye(float2 ap, float2 uv, float strength) {
+    float ecc = saturate(length(uv));            // 0 at centre, ~1 at corner
+    float squeeze = strength * ecc;
+    if (squeeze < 1e-5) return ap;
+    float2 radial = (ecc > 1e-5) ? (uv / length(uv)) : float2(1.0, 0.0);
+    float2 tangent = float2(-radial.y, radial.x);
+    // Decompose the lens sample into radial + tangential, narrow the radial
+    // part (the axis along which the pupil is occluded). Up to ~70% squeeze
+    // at the frame corner for strength 1 -- a strong but still readable
+    // lemon, matching a fast lens wide open.
+    float ar = dot(ap, radial);
+    float at = dot(ap, tangent);
+    ar *= (1.0 - 0.7 * squeeze);
+    return radial * ar + tangent * at;
+}
+// --- end Wave 10 bloom/bokeh ---------------------------------------------

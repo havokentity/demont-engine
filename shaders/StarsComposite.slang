@@ -195,6 +195,11 @@ cbuffer Frame {
     float4 moon_extra;
     float4 sun_extra;
     float4 dof_params;
+    // --- Wave 10 bloom/bokeh --- cat's-eye strength in .x (the sun/moon
+    // bokeh shares the path tracer's polygonal-iris + cat's-eye sampler).
+    // dof_params.w carries the blade rotation (already copied from PtPush).
+    float4 dof_bokeh_params;
+    // --- end Wave 10 bloom/bokeh ---
     uint   frame_index;
     uint   ap_samples;
     uint   composite_active;
@@ -222,6 +227,9 @@ cbuffer Push {
     float4 moon_extra;
     float4 sun_extra;
     float4 dof_params;
+    // --- Wave 10 bloom/bokeh --- mirrors the SPIR-V Frame field above.
+    float4 dof_bokeh_params;
+    // --- end Wave 10 bloom/bokeh ---
     uint frame_index;
     uint ap_samples;
     uint composite_active;
@@ -493,6 +501,51 @@ float halton(uint i, uint base) {
     return r;
 }
 
+// --- Wave 10 bloom/bokeh: thin-lens aperture sampling --------------------
+// VERBATIM duplicate of the ptConcentricDisk / ptPolygonWarp / ptCatEye
+// helpers in PathTraceMath.slang. Duplicated rather than imported because
+// this kernel is a self-contained TU (it does not import PathTraceMath,
+// like the rest of the composite shaders); the sun/moon bokeh MUST match
+// the path tracer's primary-ray sampler exactly so the celestials' bokeh
+// lines up with the out-of-focus geometry the path tracer renders. Keep
+// the math identical to the PathTraceMath copy if either side changes.
+float2 dofConcentricDisk(float u1, float u2) {
+    float a = 2.0 * u1 - 1.0;
+    float b = 2.0 * u2 - 1.0;
+    float r, phi;
+    if (abs(a) > abs(b)) {
+        r = a;
+        phi = (3.14159265358979 / 4.0) * (b / max(abs(a), 1e-6));
+    } else {
+        r = b;
+        phi = (3.14159265358979 / 2.0) -
+              (3.14159265358979 / 4.0) * (a / max(abs(b), 1e-6));
+    }
+    return r * float2(cos(phi), sin(phi));
+}
+float2 dofPolygonWarp(float2 ap, int blades, float rot_rad) {
+    float n = float(blades);
+    float r = length(ap);
+    if (r < 1e-6) return ap;
+    float theta = atan2(ap.y, ap.x) - rot_rad;
+    float wedge = 6.28318530717958 / n;
+    float folded = theta - wedge * floor(theta / wedge + 0.5);
+    float poly_r = cos(3.14159265358979 / n) / max(cos(folded), 1e-4);
+    return ap * poly_r;
+}
+float2 dofCatEye(float2 ap, float2 uv, float strength) {
+    float ecc = saturate(length(uv));
+    float squeeze = strength * ecc;
+    if (squeeze < 1e-5) return ap;
+    float2 radial = (ecc > 1e-5) ? (uv / length(uv)) : float2(1.0, 0.0);
+    float2 tangent = float2(-radial.y, radial.x);
+    float ar = dot(ap, radial);
+    float at = dot(ap, tangent);
+    ar *= (1.0 - 0.7 * squeeze);
+    return radial * ar + tangent * at;
+}
+// --- end Wave 10 bloom/bokeh ---------------------------------------------
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
@@ -584,41 +637,23 @@ void main(uint3 tid : SV_DispatchThreadID) {
                            + up_xyz.xyz    * (uv.y * pos_fovtan.w));
 
         if (dof_on) {
-            // Aperture sample matches PathTrace.slang's primary-ray
-            // DOF sampler exactly so the composite's bokeh shape lines
-            // up with the rest of the rendered scene's bokeh (out-of-
-            // focus geometry through the path tracer). blades < 3 ->
-            // round disk via Shirley-Chiu concentric mapping;
-            // blades >= 3 -> regular n-gon wedge sampling for the
-            // polygonal-iris look.
+            // Aperture sample matches PathTrace.slang's primary-ray DOF
+            // sampler exactly so the composite's bokeh shape lines up with
+            // the rest of the rendered scene's bokeh (out-of-focus geometry
+            // through the path tracer). blades < 3 -> round disk via the
+            // Shirley-Chiu concentric mapping; blades >= 3 -> the disk
+            // sample warped onto a regular N-gon (rotated by dof_params.w),
+            // with optional cat's-eye edge vignetting from
+            // dof_bokeh_params.x. Defaults (blades 0, cateye 0) keep the
+            // round disc bit-for-bit with the pre-wave-10 sampler.
             float u1 = halton(si, 5u);
             float u2 = halton(si, 7u);
-            float2 ap;
-            if (blades < 3) {
-                float a = 2.0 * u1 - 1.0;
-                float b = 2.0 * u2 - 1.0;
-                float r, phi;
-                if (abs(a) > abs(b)) {
-                    r = a;
-                    phi = (3.14159265358979 / 4.0) * (b / max(abs(a), 1e-6));
-                } else {
-                    r = b;
-                    phi = (3.14159265358979 / 2.0) -
-                          (3.14159265358979 / 4.0) * (a / max(abs(b), 1e-6));
-                }
-                ap = r * float2(cos(phi), sin(phi));
-            } else {
-                float n = float(blades);
-                float wedge = 6.28318530717958 / n;
-                int   k = int(floor(u1 * n));
-                float r1 = frac(u1 * n);
-                float r2 = u2;
-                if (r1 + r2 > 1.0) { r1 = 1.0 - r1; r2 = 1.0 - r2; }
-                float a0 = float(k) * wedge;
-                float a1 = a0 + wedge;
-                float2 p0 = float2(cos(a0), sin(a0));
-                float2 p1 = float2(cos(a1), sin(a1));
-                ap = r1 * p0 + r2 * p1;
+            float2 ap = dofConcentricDisk(u1, u2);
+            if (blades >= 3) {
+                ap = dofPolygonWarp(ap, blades, dof_params.w);
+            }
+            if (dof_bokeh_params.x > 0.0) {
+                ap = dofCatEye(ap, uv, dof_bokeh_params.x);
             }
             float3 lens_off = right_xyz.xyz * (ap.x * aperture)
                             + up_xyz.xyz    * (ap.y * aperture);

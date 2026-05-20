@@ -1214,6 +1214,26 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     pt_add_golden_cell(SCENE bloom_lensdirt BACKEND metal DENOISER off
         MAX_DELTA 48 MEAN_DELTA 6 FAIL_PERCENT 4)
     # --- end Wave 10 bloom + lens dirt ------------------------------------
+
+    # --- Wave 10 polygonal bokeh ------------------------------------------
+    # Same receding row of emissive spheres as the dof_bokeh cell, but with
+    # a HEXAGONAL aperture (r_dof_blades 6) plus a blade rotation and
+    # cat's-eye edge vignetting. The out-of-focus highlights render as
+    # six-sided bokeh polygons (squeezed into lemons toward the frame edge)
+    # instead of round discs. The cell guards the polygonal-iris path: the
+    # concentric-disk-to-N-gon warp, the blade rotation, and the cat's-eye
+    # off-axis squeeze in PathTrace.slang's camera-ray block.
+    #
+    # Metal golden cell. The circular-bokeh regression (r_dof_blades 0 +
+    # r_dof_cateye 0 -> round discs) is the default aperture path already
+    # pinned bit-for-bit by the dof_bokeh cell, so no extra "round" cell is
+    # needed for the goldens-preserved half of the bar. Tolerances match
+    # the dof_bokeh cell (the scene is identical apart from the aperture
+    # shape, so the stochastic aperture-integration noise floor is the
+    # same regime).
+    pt_add_golden_cell(SCENE dof_bokeh_blades BACKEND metal DENOISER off
+        MAX_DELTA 48 MEAN_DELTA 6 FAIL_PERCENT 4)
+    # --- end Wave 10 polygonal bokeh --------------------------------------
 else()
     message(STATUS
         "tests: golden-image matrix skipped -- pt_render_one_frame and/or "
