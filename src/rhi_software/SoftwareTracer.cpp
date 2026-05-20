@@ -84,13 +84,17 @@ constexpr std::size_t kAccumParamsOffset = 720;
 //   v3.xyz = prev_pos_or_n (motion blur, #85; ignored here)
 //   v4.xyz = emission (W/sr per channel, #181 polish); v4.w = pad
 //   v5.xyzw = orient quaternion (rotation gizmo, #206)
-// 6 float4 per prim = 24 floats = 96 bytes. The stride MUST stay in
-// sync with Engine.cpp's kFloatsPerPrim (24) and PathTrace.slang's
-// testAnalyticPrim (reads at idx*6 stride).
+//   v6.xyzw = PBR texture tile indices (albedo/normal/rough/metallic,
+//             Wave 8 #26; ignored here -- the SW fallback doesn't sample
+//             textures, so textured prims render with their flat v1
+//             albedo on this path)
+// 7 float4 per prim = 28 floats = 112 bytes. The stride MUST stay in
+// sync with Engine.cpp's kFloatsPerPrim (28) and PathTrace.slang's
+// testAnalyticPrim (reads at idx*7 stride; Wave 8 #26 bumped 6->7).
 constexpr std::uint32_t kPrimSphere = 0u;
 constexpr std::uint32_t kPrimPlane  = 1u;
 constexpr std::uint32_t kMatLambert = 0u;
-constexpr std::uint32_t kFloatsPerPrim = 24u;
+constexpr std::uint32_t kFloatsPerPrim = 28u;
 
 struct HitInfo {
     bool      hit = false;
@@ -187,12 +191,13 @@ void TraceScene(const glm::vec3& ro, const glm::vec3& rd,
     out.hit = false;
     out.t   = 1e30f;
 
-    // Analytic primitives. Stride is `kFloatsPerPrim` = 24 (6 float4s
+    // Analytic primitives. Stride is `kFloatsPerPrim` = 28 (7 float4s
     // per prim) -- see the layout comment at the top of this file.
     // v3 = prev_pos (motion blur, #85; SW path skips it). v4 carries
     // per-prim emission (#181 polish). v5 carries the orientation
     // quaternion (#206); spheres ignore it, planes use it to rotate
-    // the stored normal at intersect time.
+    // the stored normal at intersect time. v6 carries PBR texture tile
+    // indices (Wave 8 #26); the SW fallback doesn't sample textures.
     for (std::uint32_t i = 0; i < prim_count; ++i) {
         const float* v0 = prim_data + i * kFloatsPerPrim + 0u;
         const float* v1 = prim_data + i * kFloatsPerPrim + 4u;
@@ -321,10 +326,11 @@ void RunPathTraceKernel(SoftwareDevice& device,
             prim_count = push->prim_count;
             // Don't trust prim_count past the buffer's capacity. The
             // per-prim byte size MUST match Engine.cpp's kBytesPerPrim:
-            //   kFloatsPerPrim * sizeof(float) = 24 * 4 = 96 bytes,
+            //   kFloatsPerPrim * sizeof(float) = 28 * 4 = 112 bytes,
             // after #85 (motion blur, v3=prev_pos) + #181 polish
-            // (emission, v4) + #206 (orient quat, v5) grew the stride
-            // from 48 -> 64 -> 80 -> 96.
+            // (emission, v4) + #206 (orient quat, v5) + Wave 8 #26 (PBR
+            // texture tiles, v6) grew the stride from 48 -> 64 -> 80 ->
+            // 96 -> 112.
             constexpr std::size_t kBytesPerPrim = kFloatsPerPrim * sizeof(float);
             std::uint32_t max_prims = static_cast<std::uint32_t>(pb->size / kBytesPerPrim);
             if (prim_count > max_prims) prim_count = max_prims;

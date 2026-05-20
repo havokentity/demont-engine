@@ -270,6 +270,52 @@ Texture2D<float4> ocean_normal;
 [[vk::binding(33, 0), vk::image_format("rgba32f")]] RWTexture2D<float4> ocean_normal;
 #endif
 // --- end Wave 8 ocean ------------------------------------------------------
+// --- Wave 8 PBR (#26) -- material texture atlas ---------------------------
+// All PBR material maps (albedo / normal / roughness / metallic) for every
+// material are packed into ONE vertical-strip atlas so the path tracer
+// takes exactly ONE extra texture binding. Layout: kPbrTileSize-square
+// tiles stacked vertically (atlas is kPbrTileSize wide, kPbrAtlasTiles *
+// kPbrTileSize tall). A material's per-map tile index selects the vertical
+// band; samplePbrTileLinear() wraps the in-tile UV with frac() so tiling
+// textures repeat cleanly.
+//
+// FORMAT: RGBA8_UNORM linear storage. The engine stores source PNG/JPG
+// bytes (which for albedo are sRGB-encoded) AS-IS, and the shader applies
+// the sRGB EOTF only to albedo samples via samplePbrTileSrgb() -- so we
+// never double-gamma, and the same atlas hosts both colour (albedo) and
+// linear data (normal / roughness / metallic) maps. The shader reads
+// float4 (the RHI normalizes RGBA8 -> [0,1] on fetch).
+//
+// CRITICAL -- declared LAST in texture-declaration order (after ocean_normal,
+// which Wave 8 #25 placed at MSL index 15) so on Metal pbr_atlas lands at
+// MSL texture index 16 WITHOUT shifting any of the existing 0..15 texture-
+// index assignments. On Metal it's a sample-only Texture2D (no vk::binding)
+// -- this escapes Apple Silicon's 8-read_write-texture compute cap exactly
+// like env_map / star_map / moon_map / ocean_* do, and the textured path is
+// verified correct there. On Vulkan it's an RWTexture2D storage-image view
+// at vk::binding 34 -- ocean (#25) took 32/33 on the integration branch, so
+// PBR rebased one slot up to 34 (pbr_atlas) + 35 (mesh_uvs). The kernel only
+// ever READS it (uploaded once by the engine via WriteTexture).
+//
+// KNOWN LIMITATION (Vulkan/MoltenVK): the textured render is correct on
+// Metal + the flat-color path is bit-perfect on all three backends, but
+// sampling this atlas returns zero on MoltenVK (textured surfaces read
+// black). This is the "Mac-Vulkan pixel-correctness historically
+// unverified" class of issue -- a high storage-image descriptor binding on
+// Apple Silicon. RGBA32F was tried (env_map's working format) with no
+// change, so it is a descriptor-wiring quirk, not a format issue. Deferred:
+// native-Vulkan (NVIDIA) verification + a SAMPLED_IMAGE+sampler descriptor
+// path are the likely fixes.
+#ifdef PT_TARGET_METAL
+Texture2D<float4> pbr_atlas;
+#else
+[[vk::binding(34, 0), vk::image_format("rgba8")]] RWTexture2D<float4> pbr_atlas;
+#endif
+// Tile geometry -- MUST match Engine.h's kPbrTileSize / kPbrAtlasTiles.
+static const uint kPbrTileSize   = 256u;
+static const uint kPbrAtlasTiles = 16u;
+static const uint kPbrNoTexTile  = 0xFFFFFFFFu;
+// --- end Wave 8 PBR -------------------------------------------------------
 
 // GPU-resident exposure scalar. Updated each frame by AutoExposure.slang
 // (when r_auto_exposure = 1) or written once by the engine via
@@ -502,6 +548,29 @@ Texture2D<float4> ocean_normal;
 // shader's smoke_sph_density_add gates on push.smoke_sph_params.x > 0.
 [[vk::binding(31, 0)]] StructuredBuffer<float4> sph_particles;
 // --- end Fluid Phase 3 -----------------------------------------------------
+
+// --- Wave 8 PBR (#26) -- mesh UVs -----------------------------------------
+// Per-vertex texture coordinates parallel to mesh_positions (2 floats =
+// u, v per vertex). float-typed (not float2) for the same reason
+// mesh_positions is float-typed: Slang gives StructuredBuffer<float2> a
+// 16-byte stride on MSL while the host uploads tightly-packed 8-byte
+// float2. The shader reads mesh_uvs[vid*2 + 0/1].
+//
+// CRITICAL -- declared LAST in buffer-declaration order (after
+// sph_particles) so on Metal it lands at MSL buffer slot 17 (one past
+// sph_particles' slot 16) WITHOUT shifting any of the existing 1..16
+// buffer-slot assignments. The engine binds it at engine slot 17 and the
+// push-constant slot moves to 18 (max-bound + 1) accordingly. (Ocean #25's
+// displacement/normal are TEXTURES, not buffers, so they don't shift the
+// Metal buffer-slot numbering -- mesh_uvs stays at buffer slot 17.) On
+// Vulkan the explicit vk::binding(35) is what matters: ocean (#25) took
+// 32/33 and PBR's pbr_atlas rebased to 34, so mesh_uvs sits at 35 (the
+// Frame UBO claims binding 14, env CDFs 10/11). Only read on a mesh hit
+// when push.mesh_tex_indices has a non-kPbrNoTexTile channel; when the
+// mesh has no UVs the host binds a placeholder and forces the tile indices
+// to kPbrNoTexTile so the buffer is never sampled.
+[[vk::binding(35, 0)]] StructuredBuffer<float>  mesh_uvs;
+// --- end Wave 8 PBR -------------------------------------------------------
 
 struct BvhNode {
     float3 aabb_min;
@@ -1029,6 +1098,13 @@ cbuffer Push {
     float4 ocean_params0;
     float4 ocean_params1;
     // --- end Wave 8 ocean -----------------------------------------------------
+    // --- Wave 8 PBR (#26) -- mesh material texture tiles ----------------------
+    // .x = albedo_tex, .y = normal_tex, .z = roughness_tex, .w = metallic_tex.
+    // kPbrNoTexTile (0xFFFFFFFF) on a channel means the mesh's matching map
+    // is unset and the shader falls back to MESH_ALBEDO / fixed roughness.
+    // Default is all-0xFFFFFFFF so an untextured mesh renders bit-identically.
+    uint4 mesh_tex_indices;
+    // --- end Wave 8 PBR -------------------------------------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -1148,6 +1224,8 @@ cbuffer Frame {
     float4 ocean_params0;
     float4 ocean_params1;
     // --- end Wave 8 ocean -----------------------------------------------------
+    // See `mesh_tex_indices` in the Metal Push cbuffer above (Wave 8 #26).
+    uint4 mesh_tex_indices;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -1211,6 +1289,122 @@ static const uint LIGHT_QUAD   = 3u;
 static const float3 LIGHT_DIR    = float3(0.4, 1.0, 0.3);
 static const float3 MESH_ALBEDO  = float3(1.00, 0.85, 0.45);   // gold metal default
 
+// --- Wave 8 PBR (#26) -- texture atlas sampling ---------------------------
+// The atlas is sampled with manual bilinear filtering over integer texel
+// fetches, matching the env_map / star_map sampling style already used in
+// this shader (there is no SamplerState bound -- the engine's texture
+// pipeline is fetch-only, which keeps the cross-backend binding model
+// simple). A material's `tile` index selects a kPbrTileSize-square band
+// stacked vertically in the atlas; the in-tile UV is wrapped with frac()
+// so tiling textures (checkerboards, brick, ...) repeat seamlessly.
+//
+// sRGB: the atlas stores raw bytes. samplePbrTileLinear() returns them
+// verbatim (correct for normal / roughness / metallic data maps);
+// samplePbrTileSrgb() applies the sRGB->linear EOTF (correct for albedo
+// colour maps). Splitting at the call site is what prevents double-gamma.
+
+// sRGB (IEC 61966-2-1) electro-optical transfer function: encoded ->
+// linear. Inverse of the OETF used by Tonemap.slang / linearToSrgb here.
+float3 srgbToLinear(float3 c) {
+    float3 lo = c / 12.92;
+    float3 hi = pow(max((c + 0.055) / 1.055, 0.0), float3(2.4));
+    return select(c <= 0.04045, lo, hi);
+}
+
+// Bilinear-fetch one atlas tile at the (wrapped) tile-local UV. Returns
+// the raw RGBA (no colour-space conversion). `tile` MUST be a valid
+// (non-kPbrNoTexTile) index; callers gate on that before calling.
+float4 samplePbrTileLinear(uint tile, float2 uv) {
+    // Wrap into [0,1) so tiling textures repeat; frac handles negatives.
+    float2 fuv = frac(uv);
+    // Tile-local pixel coordinate (continuous), then split into the
+    // four surrounding texels for the bilinear blend.
+    float fx = fuv.x * float(kPbrTileSize) - 0.5;
+    float fy = fuv.y * float(kPbrTileSize) - 0.5;
+    float fx0 = floor(fx);
+    float fy0 = floor(fy);
+    float tx = fx - fx0;
+    float ty = fy - fy0;
+    int   ix0 = int(fx0);
+    int   iy0 = int(fy0);
+    // Clamp within the tile (wrap the in-tile coordinate so the bilinear
+    // tap at the tile edge samples the opposite edge -- seamless tiling).
+    int W = int(kPbrTileSize);
+    int ix1 = ((ix0 + 1) % W + W) % W;
+    int iy1 = ((iy0 + 1) % W + W) % W;
+    ix0 = (ix0 % W + W) % W;
+    iy0 = (iy0 % W + W) % W;
+    // Vertical-strip atlas: row offset = tile * kPbrTileSize.
+    uint row_base = tile * kPbrTileSize;
+    float4 c00 = pbr_atlas[uint2(uint(ix0), row_base + uint(iy0))];
+    float4 c10 = pbr_atlas[uint2(uint(ix1), row_base + uint(iy0))];
+    float4 c01 = pbr_atlas[uint2(uint(ix0), row_base + uint(iy1))];
+    float4 c11 = pbr_atlas[uint2(uint(ix1), row_base + uint(iy1))];
+    float4 cx0 = lerp(c00, c10, tx);
+    float4 cx1 = lerp(c01, c11, tx);
+    return lerp(cx0, cx1, ty);
+}
+
+// Albedo sample: bilinear fetch + sRGB->linear decode.
+float3 samplePbrTileSrgb(uint tile, float2 uv) {
+    return srgbToLinear(samplePbrTileLinear(tile, uv).rgb);
+}
+
+// Build a tangent-space basis from a geometric normal + the surface UV
+// gradient. For analytic prims we don't have per-vertex tangents, so we
+// derive an arbitrary-but-stable tangent orthogonal to n (Duff et al.
+// 2017 branchless ONB). Mesh hits could supply a UV-derivative tangent
+// later; the perturbation strength is small enough that the arbitrary
+// frame reads correctly for the test maps. Returns the perturbed
+// world-space normal given a tangent-space normal-map sample in [-1,1].
+float3 applyNormalMap(float3 n, float3 ts_normal) {
+    // Duff branchless orthonormal basis.
+    float s = (n.z >= 0.0) ? 1.0 : -1.0;
+    float a = -1.0 / (s + n.z);
+    float b = n.x * n.y * a;
+    float3 t = float3(1.0 + s * n.x * n.x * a, s * b, -s * n.x);
+    float3 bt = float3(b, s + n.y * n.y * a, -n.y);
+    float3 perturbed = ts_normal.x * t + ts_normal.y * bt + ts_normal.z * n;
+    return normalize(perturbed);
+}
+
+// Apply a material's PBR texture maps to a hit in place. Reads the four
+// tile indices in h.tex_tiles; for each non-kPbrNoTexTile channel,
+// samples the atlas at h.uv and overwrites the corresponding flat value.
+// Bit-identical no-op when every tile == kPbrNoTexTile (the default), so
+// untextured surfaces keep their flat-color render. Called once per hit,
+// right before the BSDF dispatch, so ALL material branches (Lambert /
+// metal / dielectric) see the textured values for free.
+void applyPbrTextures(inout HitInfo h) {
+    // Albedo (sRGB-decoded, multiplies the flat tint so a white flat
+    // albedo passes the texture through unchanged).
+    if (h.tex_tiles.x != kPbrNoTexTile) {
+        h.albedo *= samplePbrTileSrgb(h.tex_tiles.x, h.uv);
+    }
+    // Roughness (linear; .r scales the flat roughness, so a flat 1.0
+    // roughness with a gradient map yields the map directly).
+    if (h.tex_tiles.z != kPbrNoTexTile) {
+        float r = samplePbrTileLinear(h.tex_tiles.z, h.uv).r;
+        h.roughness = saturate(h.roughness * r);
+    }
+    // Metallic (linear; .r drives a Lambert->metal switch above 0.5).
+    // Analytic prims pick their BSDF from the Material enum, but a
+    // metallic map lets a Lambert-typed material turn metal where the
+    // map is white (parity with glTF metalness; modest scope).
+    if (h.tex_tiles.w != kPbrNoTexTile) {
+        float m = samplePbrTileLinear(h.tex_tiles.w, h.uv).r;
+        if (m > 0.5 && h.mat == MAT_LAMBERT) h.mat = MAT_METAL;
+    }
+    // Normal map (tangent-space, [0,1]->[-1,1]). Perturb the shading
+    // normal LAST so the metallic/roughness reads above used the
+    // geometric normal's UV (the UV is independent of the normal anyway).
+    if (h.tex_tiles.y != kPbrNoTexTile) {
+        float3 ts = samplePbrTileLinear(h.tex_tiles.y, h.uv).rgb * 2.0 - 1.0;
+        h.normal = applyNormalMap(h.normal, ts);
+    }
+}
+// --- end Wave 8 PBR -------------------------------------------------------
+
 // pcgHash, randf, sampleCosineHemisphere, sampleSunDisc,
 // kSunAngularRadius, fresnelSchlick, intersectSphere, intersectPlane:
 // imported from PathTraceMath at the top of this file.
@@ -1224,10 +1418,10 @@ struct HitInfo {
     float  roughness;
     float  ior;
     // Per-prim radiant emission (W/sr per channel). Populated by
-    // testAnalyticPrim from primitives[idx*6 + 4].xyz (stride bumped
-    // to 6 float4s after #85 motion-blur added v3=prev_pos, #181
-    // polish added v4=emission, and #206 rotation gizmo added
-    // v5=orient). Mesh / SDF hit paths reset this to 0 on overwrite
+    // testAnalyticPrim from primitives[idx*7 + 4].xyz (stride bumped
+    // to 7 float4s after #85 motion-blur added v3=prev_pos, #181
+    // polish added v4=emission, #206 rotation gizmo added v5=orient,
+    // and Wave 8 #26 added v6=PBR texture tiles). Mesh / SDF hit paths reset this to 0 on overwrite
     // -- emission is currently only sourced from analytic-prim hits
     // (#181 polish: emissive rigid bodies via phys_drop_* emission
     // args). The per-bounce loop adds `throughput * h.emission` to
@@ -1235,13 +1429,26 @@ struct HitInfo {
     // used for emissive sphere/quad area lights.
     float3 emission;
     // Editor backend (agent-19): user-facing id of the analytic prim
-    // that produced this hit. Sourced from primitives[idx*6 + 2].w
+    // that produced this hit. Sourced from primitives[idx*7 + 2].w
     // (the same v2.w slot the host now bakes the AnalyticPrim map key
     // into via asuint reinterpretation). 0 on mesh / SDF / miss paths
     // -- those overwrite the field explicitly. The per-bounce loop
     // tints emission with magenta at silhouette edges when this id
     // matches editor_params.x.
     uint prim_id;
+    // --- Wave 8 PBR (#26) -----------------------------------------------
+    // Surface UV at the hit (procedural for analytic prims: sphere
+    // lat/long, plane world-XZ; barycentric-interpolated for meshes).
+    // Used to sample the PBR texture atlas. Defaults to (0,0) on the
+    // miss / SDF paths (they don't sample textures).
+    float2 uv;
+    // Per-material PBR texture tile indices into the strip atlas. uint
+    // kPbrNoTexTile (0xFFFFFFFF) = no texture, use the flat values above.
+    // x=albedo (sRGB-decoded), y=normal (tangent-space), z=roughness,
+    // w=metallic. All default to kPbrNoTexTile so non-textured hits skip
+    // the sample entirely and render bit-identically to the flat path.
+    uint4 tex_tiles;
+    // --- end Wave 8 PBR -------------------------------------------------
 };
 
 // Rotate a 3-vector by a unit quaternion (xyzw). Standard
@@ -1255,17 +1462,20 @@ float3 quatRotate(float4 q, float3 v) {
     return v + 2.0 * cross(u, cross(u, v) + q.w * v);
 }
 
-// Test a single analytic primitive at `primitives[idx*6 + 0..5]` against
+// Test a single analytic primitive at `primitives[idx*7 + 0..6]` against
 // (ro, rd) and update `h` if it's a closer hit. Centralizes the per-prim
 // dispatch so the linear-loop and BVH-leaf paths share one body.
 //
-// Stride is 6 float4s (24 floats) after #85 (motion blur, v3=prev_pos),
-// #181 polish (emission, v4), and #206 rotation gizmo (orient, v5):
+// Stride is 7 float4s (28 floats) after #85 (motion blur, v3=prev_pos),
+// #181 polish (emission, v4), #206 rotation gizmo (orient, v5), and
+// Wave 8 #26 (PBR texture tiles, v6):
 //   v0 = pos / radius   v1 = albedo / roughness   v2 = type/mat/ior/id
 //   v3 = prev_pos / pad (motion blur)
 //   v4 = emission / pad (self-emissive rigid bodies)
 //   v5 = orient quaternion (rotation gizmo)
-// Must stay in sync with Engine.cpp's kFloatsPerPrim = 24.
+//   v6 = albedo/normal/roughness/metallic texture tile indices (PBR #26;
+//        uint via asuint, kPbrNoTexTile == 0xFFFFFFFF means no texture)
+// Must stay in sync with Engine.cpp's kFloatsPerPrim = 28.
 //
 // Motion blur (#85): `shutter_t01` is the per-ray shutter sample in
 // [0, 1] -- 0 = start of shutter (== prev_pos), 1 = end (== curr_pos =
@@ -1286,12 +1496,19 @@ float3 quatRotate(float4 q, float3 v) {
 // identity quat (0,0,0,1) is a no-op in quatRotate so existing planes
 // render bit-identically.
 void testAnalyticPrim(uint idx, float3 ro, float3 rd, float shutter_t01, inout HitInfo h) {
-    float4 v0 = primitives[idx * 6u + 0u];
-    float4 v1 = primitives[idx * 6u + 1u];
-    float4 v2 = primitives[idx * 6u + 2u];
-    float4 v3 = primitives[idx * 6u + 3u];
-    float4 v4 = primitives[idx * 6u + 4u];
-    float4 v5 = primitives[idx * 6u + 5u];
+    float4 v0 = primitives[idx * 7u + 0u];
+    float4 v1 = primitives[idx * 7u + 1u];
+    float4 v2 = primitives[idx * 7u + 2u];
+    float4 v3 = primitives[idx * 7u + 3u];
+    float4 v4 = primitives[idx * 7u + 4u];
+    float4 v5 = primitives[idx * 7u + 5u];
+    // Wave 8 PBR (#26): v6 holds the 4 texture tile indices (uint via
+    // asuint). kPbrNoTexTile == 0xFFFFFFFF on every channel for the
+    // default (untextured) prim, so reading them is one extra load and
+    // the shading path's sample gate skips when all are kPbrNoTexTile.
+    float4 v6 = primitives[idx * 7u + 6u];
+    uint4 tex_tiles = uint4(asuint(v6.x), asuint(v6.y),
+                            asuint(v6.z), asuint(v6.w));
     uint type = uint(v2.x);
     // v2.w carries the user-facing prim id bit-reinterpreted as float
     // by the host (Engine::EnsurePrimitivesUploaded). The editor
@@ -1308,13 +1525,23 @@ void testAnalyticPrim(uint idx, float3 ro, float3 rd, float shutter_t01, inout H
         float3 sphere_center = lerp(v3.xyz, v0.xyz, shutter_t01);
         if (intersectSphere(ro, rd, sphere_center, v0.w, t) && t < h.t) {
             h.hit = true; h.t = t;
-            h.normal = normalize(ro + rd * t - sphere_center);
+            float3 sn = normalize(ro + rd * t - sphere_center);
+            h.normal = sn;
             h.mat = uint(v2.y);
             h.albedo = v1.rgb;
             h.roughness = v1.a;
             h.ior = v2.z;
             h.emission = v4.rgb;
             h.prim_id = user_id;
+            // Wave 8 PBR (#26): procedural lat/long UV for spheres.
+            // u = longitude in [0,1) from atan2 (seam at -x), v = latitude
+            // in [0,1] from asin (0 at south pole, 1 at north). Matches the
+            // common equirectangular sphere mapping so an equirect texture
+            // wraps without distortion at the equator.
+            const float kPI = 3.14159265358979;
+            h.uv = float2(0.5 + atan2(sn.z, sn.x) / (2.0 * kPI),
+                          0.5 - asin(clamp(sn.y, -1.0, 1.0)) / kPI);
+            h.tex_tiles = tex_tiles;
         }
     } else if (type == PRIM_PLANE) {
         // Rotate the stored normal by the orientation quaternion. With
@@ -1330,6 +1557,24 @@ void testAnalyticPrim(uint idx, float3 ro, float3 rd, float shutter_t01, inout H
             h.ior = v2.z;
             h.emission = v4.rgb;
             h.prim_id = user_id;
+            // Wave 8 PBR (#26): procedural planar UV from the world-space
+            // hit point. Project onto the two axes most orthogonal to the
+            // plane normal so an arbitrarily-oriented plane still gets a
+            // sensible 2D parameterization; 1 UV unit = 1 metre (the
+            // texture tiles every metre via the shader's frac() wrap).
+            // Default-up floor (normal = +y) reduces to (x, z).
+            float3 hp = ro + rd * t;
+            float3 an = abs(plane_n);
+            float2 puv;
+            if (an.y >= an.x && an.y >= an.z) {
+                puv = float2(hp.x, hp.z);          // horizontal plane: XZ
+            } else if (an.x >= an.z) {
+                puv = float2(hp.z, hp.y);          // x-facing: ZY
+            } else {
+                puv = float2(hp.x, hp.y);          // z-facing: XY
+            }
+            h.uv = puv;
+            h.tex_tiles = tex_tiles;
         }
     }
 }
@@ -1521,9 +1766,17 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01) {
     // at 0 so the outline gate's id-match check never accidentally
     // matches a SDF / mesh hit when editor_params.x is non-zero.
     h.prim_id = 0u;
+    // Wave 8 PBR (#26): default to no UV and no texture tiles. Only the
+    // analytic-prim + mesh hit paths populate these; the SDF / fractal /
+    // miss paths leave them at the defaults so the shading-side texture
+    // sample is skipped (every tile == kPbrNoTexTile) and those surfaces
+    // render with their flat albedo exactly as before.
+    h.uv = float2(0.0, 0.0);
+    h.tex_tiles = uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
 
-    // Analytic primitives. Each occupies 5 consecutive float4s in
-    // `primitives` after #85 (motion blur) + #181 polish (emission):
+    // Analytic primitives. Each occupies 7 consecutive float4s in
+    // `primitives` after #85 (motion blur), #181 polish (emission),
+    // #206 (orient), and Wave 8 #26 (PBR texture tiles):
     //   v0 = (xyz: center (current frame) / plane normal,  w: radius / d)
     //   v1 = (rgb: albedo,           a: roughness)
     //   v2 = (x: type,  y: material, z: ior, w: pad)
@@ -1678,6 +1931,18 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01) {
                 // hit because the stale prim_id was left from the
                 // analytic prim test that ran first.
                 h.prim_id = 0u;
+                // Wave 8 PBR (#26): barycentric-interpolate the per-vertex
+                // UVs (mesh_uvs parallel to mesh_positions) and carry the
+                // mesh's material texture tiles. Bary from the HW query is
+                // (b1, b2) for v1/v2; v0 weight = 1 - b1 - b2. When the
+                // mesh has no UV buffer the host forces mesh_tex_indices
+                // to kPbrNoTexTile so the sample is skipped (h.uv stays 0).
+                float2 bary = q.CommittedTriangleBarycentrics();
+                float2 uv0 = float2(mesh_uvs[i0 * 2 + 0], mesh_uvs[i0 * 2 + 1]);
+                float2 uv1 = float2(mesh_uvs[i1 * 2 + 0], mesh_uvs[i1 * 2 + 1]);
+                float2 uv2 = float2(mesh_uvs[i2 * 2 + 0], mesh_uvs[i2 * 2 + 1]);
+                h.uv = uv0 * (1.0 - bary.x - bary.y) + uv1 * bary.x + uv2 * bary.y;
+                h.tex_tiles = mesh_tex_indices;
             }
         }
     } else
@@ -1799,6 +2064,31 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01) {
             // Editor backend (agent-19): same id-clear as the HW mesh
             // branch above; mesh hits aren't in the outline scope.
             h.prim_id = 0u;
+            // Wave 8 PBR (#26): the closest-hit loop discarded its
+            // Möller-Trumbore (u, v), so re-derive barycentrics at the
+            // hit point in the shifted (static-mesh) frame -- the same
+            // frame v0/v1/v2 live in. Cramer's-rule projection onto the
+            // triangle's edge basis. Then interpolate the per-vertex UVs.
+            float3 hp_mesh = ro_mesh + rd * t_mesh;
+            float3 e1b = v1 - v0;
+            float3 e2b = v2 - v0;
+            float3 dp  = hp_mesh - v0;
+            float d00 = dot(e1b, e1b);
+            float d01 = dot(e1b, e2b);
+            float d11 = dot(e2b, e2b);
+            float d20 = dot(dp, e1b);
+            float d21 = dot(dp, e2b);
+            float denom = d00 * d11 - d01 * d01;
+            float bw1 = 0.0, bw2 = 0.0;
+            if (abs(denom) > 1e-20) {
+                bw1 = (d11 * d20 - d01 * d21) / denom;   // weight of v1
+                bw2 = (d00 * d21 - d01 * d20) / denom;   // weight of v2
+            }
+            float2 uv0 = float2(mesh_uvs[i0 * 2u + 0u], mesh_uvs[i0 * 2u + 1u]);
+            float2 uv1 = float2(mesh_uvs[i1 * 2u + 0u], mesh_uvs[i1 * 2u + 1u]);
+            float2 uv2 = float2(mesh_uvs[i2 * 2u + 0u], mesh_uvs[i2 * 2u + 1u]);
+            h.uv = uv0 * (1.0 - bw1 - bw2) + uv1 * bw1 + uv2 * bw2;
+            h.tex_tiles = mesh_tex_indices;
         }
     }
     return h;
@@ -4898,11 +5188,20 @@ void main(uint2 tid : SV_DispatchThreadID) {
         }
 
         float3 hit_pt = ro + rd * h.t;
+
+        // Wave 8 PBR (#26): apply the hit material's texture maps in place
+        // BEFORE deriving the front-facing normal (so a normal map feeds
+        // nf) and BEFORE the BSDF dispatch (so every material branch sees
+        // textured albedo / roughness / metallic). No-op + bit-identical
+        // when the material has no texture tiles (the default), because
+        // applyPbrTextures gates each sample on tile != kPbrNoTexTile.
+        applyPbrTextures(h);
+
         float  ndi = dot(h.normal, rd);
         float3 nf  = (ndi < 0.0) ? h.normal : -h.normal;
 
         // Per-prim emission (#181 polish). h.emission is sourced from
-        // primitives[idx*6 + 4].xyz in testAnalyticPrim, units W/sr per
+        // primitives[idx*7 + 4].xyz in testAnalyticPrim, units W/sr per
         // channel. Adds `throughput * emission` BEFORE the BRDF eval so
         // the body itself glows AND illuminates nearby surfaces via
         // bounce-sampled rays that land on it. Camera-ray (b==0) hits

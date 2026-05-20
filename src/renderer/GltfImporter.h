@@ -71,6 +71,13 @@ struct GltfMesh {
     std::vector<float>         positions;   // 3 floats per vertex
     std::vector<float>         normals;     // 3 floats per vertex
     std::vector<std::uint32_t> indices;     // 3 per triangle
+    // Wave 8 PBR (#26): per-vertex texture coordinates from TEXCOORD_0.
+    // 2 floats (u, v) per vertex, parallel to positions. Empty when the
+    // primitive has no TEXCOORD_0 attribute (the engine then renders the
+    // mesh with its flat material -- no texture sampling). glTF UVs use
+    // the top-left origin convention (v=0 at the top of the image), the
+    // same as the engine's texel-fetch atlas sampling.
+    std::vector<float>         uvs;
 
     // Material -- base color only (MVP). RGBA in linear space (glTF's
     // pbrMetallicRoughness.baseColorFactor is already linear per spec).

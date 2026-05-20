@@ -31,6 +31,10 @@ build_win.bat
 !CMakePresets.json
 demont_console.state
 
+# Console runtime scratch files (written next to the binary at runtime).
+console_history.txt
+favorites.cfg
+
 # Local screenshot / capture dumps from FrameCapture, smoke tests,
 # and ad-hoc renderdoc-style triage. Not committed -- per-host
 # scratch.
