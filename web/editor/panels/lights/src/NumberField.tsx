@@ -149,10 +149,18 @@ export function NumberField({
   }, []);
 
   // ---- Scrub-drag ----
+  // The document-level pointer listeners for an active scrub are bound
+  // with this controller's signal, so a single controller.abort() in
+  // endScrub() tears down pointermove + pointerup + pointercancel in one
+  // shot (covers both the pointerup and pointercancel exits). Without
+  // this the pointermove handler would leak after the first drag (it
+  // early-returns on every move) and pointercancel {once:true} listeners
+  // could accumulate across drags that never fire a cancel.
   const scrubStateRef = useRef<{
     lastX: number;
     pointerId: number;
     el: HTMLElement;
+    abort: AbortController;
   } | null>(null);
 
   const endScrub = useCallback(
@@ -160,6 +168,8 @@ export function NumberField({
       const s = scrubStateRef.current;
       if (!s) return;
       scrubStateRef.current = null;
+      // Detach all document listeners bound for this scrub at once.
+      s.abort.abort();
       try {
         s.el.releasePointerCapture(s.pointerId);
       } catch {
@@ -228,25 +238,33 @@ export function NumberField({
           // ignore
         }
       }
+      const abort = new AbortController();
       scrubStateRef.current = {
         lastX: e.clientX,
         pointerId: e.pointerId,
         el,
+        abort,
       };
       setScrubbing(true);
-      document.addEventListener('pointermove', onScrubMove);
-      document.addEventListener('pointerup', onScrubUp, { once: true });
-      document.addEventListener('pointercancel', () => endScrub(false), { once: true });
+      // Listen on document so the drag survives leaving the label. All
+      // three are bound with the same signal so endScrub()'s abort()
+      // removes them together -- no leaked pointermove handler, no
+      // accumulating pointercancel listeners across drags.
+      const { signal } = abort;
+      document.addEventListener('pointermove', onScrubMove, { signal });
+      document.addEventListener('pointerup', onScrubUp, { signal });
+      document.addEventListener('pointercancel', () => endScrub(false), { signal });
     },
     [disabled, value, onScrubMove, onScrubUp, endScrub],
   );
 
+  // Cleanup on unmount: abort any in-flight scrub so its document
+  // listeners (bound with the controller's signal) are detached.
   useEffect(() => {
     return () => {
-      document.removeEventListener('pointermove', onScrubMove);
-      document.removeEventListener('pointerup', onScrubUp);
+      scrubStateRef.current?.abort.abort();
     };
-  }, [onScrubMove, onScrubUp]);
+  }, []);
 
   const axisClass = useMemo(() => {
     if (!axis) return '';
