@@ -326,10 +326,24 @@ public:
     // VulkanCommandBuffer::Dispatch LOG_ERRORs once if the tail ever exceeds
     // this size, since silently clamping the memcpy truncates the GPU-side
     // view of trailing fields (write_hdr_aux, write_normal_gbuffer etc.) and
-    // turns rendering corruption into a silent visual bug. PtPush tail today
-    // is 608 B (HDRI multi-light + flags); bump this constant whenever the
-    // static_assert fires.
-    static constexpr std::size_t   kFrameUboSize    = 1024;
+    // turns rendering corruption into a silent visual bug.
+    //
+    // CAPACITY HISTORY: was 1024 through wave-7. Waves 8-9 grew the tail
+    // cumulatively well past that -- spectral dispersion + DoF (#27), PBR
+    // material textures (#26), FFT ocean (#25), ocean foam, Hosek sky,
+    // height fog, god rays, advanced materials (anisotropic/clearcoat/
+    // subsurface, +400 B alone), tonemap operators -- to ~1488 B. The old
+    // 1024 cap silently truncated ~464 B of trailing fields on the Vulkan
+    // path, corrupting MoltenVK renders (cornell_csg cube rendered black
+    // because a shading field landed in the dropped region). The runtime
+    // LOG_ERROR fired but nothing failed the build. Bumped to 2048 (16-byte
+    // aligned, ~560 B headroom) and paired with a compile-time
+    // static_assert at the PtPush dispatch site in Engine.cpp
+    // (sizeof(PtPush) - kPushSplitOffset <= 2048) so the next PtPush growth
+    // fails the BUILD instead of silently corrupting Vulkan output. Keep the
+    // 2048 literal there in lockstep with this constant. Min guaranteed
+    // Vulkan UBO range is 16 KiB so 2048 is comfortably within budget.
+    static constexpr std::size_t   kFrameUboSize    = 2048;
 
 private:
     void DestroyDevice();
