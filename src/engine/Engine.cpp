@@ -833,9 +833,18 @@ namespace cvar {
     // "procedural". The sun position drives both the sky colour gradient
     // and the disk; positive elevation = above horizon (day), negative =
     // below (night); azimuth in degrees, 0 = -Z (north), 90 = +X (east).
-    PT_CVAR(r_sky_mode,        "hdri", "Sky rendering: gradient (cheap fallback) | hdri (sample r_env_map) | procedural (analytic with sun position). Defaults to hdri so the bundled sunset.hdr is visible out of the box.", CVAR_ARCHIVE);
+    PT_CVAR(r_sky_mode,        "hdri", "Sky rendering: gradient (cheap fallback) | hdri (sample r_env_map) | procedural (analytic with sun position) | hosek (Hosek-Wilkie physically-based analytic sky-dome, driven by r_sky_turbidity + r_sky_ground_albedo + sun position). Defaults to hdri so the bundled sunset.hdr is visible out of the box.", CVAR_ARCHIVE);
     PT_CVAR(r_sun_elevation,   "30.0", "Sun elevation in degrees above horizon (-90..90). Drives day/sunset/night blend in procedural sky. Overridden when r_sky_use_astronomical = 1.", CVAR_ARCHIVE);
     PT_CVAR(r_sun_azimuth,     "135.0","Sun azimuth in degrees (0=north, 90=east, 180=south, 270=west). Overridden when r_sky_use_astronomical = 1.", CVAR_ARCHIVE);
+    // --- Wave 9 hosek-sky ---
+    // Hosek-Wilkie (2012) physically-based sky parameters. Used only when
+    // r_sky_mode = hosek. Both are real physical quantities -- no demo
+    // fudge: turbidity is the standard atmospheric turbidity T (ratio of
+    // total to molecular optical thickness) and ground albedo is the
+    // hemispherical reflectance of the terrain the sky-dome sits over.
+    PT_CVAR(r_sky_turbidity,      "3.0",  "Atmospheric turbidity for the Hosek-Wilkie sky (r_sky_mode = hosek). Real range ~1 (pure pristine air, deep saturated blue) .. 10 (heavy haze/dust, washed-out white horizon). 2-4 = clear day, 6-10 = hazy/urban. Clamped to [1,10]. Ignored unless r_sky_mode = hosek.", CVAR_ARCHIVE);
+    PT_CVAR(r_sky_ground_albedo,  "0.10", "Ground hemispherical albedo fed into the Hosek-Wilkie sky coefficient fit (r_sky_mode = hosek). 0 = black ground (no upwelling skylight boost), ~0.1 = typical soil/vegetation, ~0.3 = sand, ~0.8 = fresh snow (brightens the lower sky). Clamped to [0,1]. Ignored unless r_sky_mode = hosek.", CVAR_ARCHIVE);
+    // --- end Wave 9 hosek-sky ---
 
     // Astronomical sky parameters. r_sky_use_astronomical=1 overrides
     // the manual sun cvars with positions computed from observer
@@ -7282,6 +7291,22 @@ void Engine::RenderFrame() {
         //   .zw reserved (0).
         float ocean_foam_params[4];
         // --- end Wave 9 ocean-foam ---------------------------------------
+        // --- Wave 9 hosek-sky --------------------------------------------
+        // Hosek-Wilkie (2012) physically-based sky parameters. Read by
+        // PathTrace.slang's hosekSky() only when sky mode == 3 (hosek).
+        //   .x = turbidity      (r_sky_turbidity, real T clamped [1,10]).
+        //   .y = ground albedo  (r_sky_ground_albedo, clamped [0,1]).
+        //   .z = solar zenith angle in radians (acos(sun_dir.y), so the
+        //        shader recovers elevation = pi/2 - z without re-deriving
+        //        it from the packed sun vector).
+        //   .w reserved.
+        // One vec4 = 16 B. Appended at the very end so every existing
+        // field offset is untouched (other agents own bindings 32-37 and
+        // distinct push regions; this only grows the trailing block).
+        // Matches PathTrace.slang's `hosek_params` in BOTH the Metal Push
+        // cbuffer and the SPIR-V Frame UBO spilled tail.
+        float hosek_params[4];
+        // --- end Wave 9 hosek-sky ----------------------------------------
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -7967,9 +7992,40 @@ void Engine::RenderFrame() {
     std::uint32_t sky_mode_id = 2;
     if      (sky_mode_str == "gradient")   sky_mode_id = 0;
     else if (sky_mode_str == "hdri")       sky_mode_id = (env_map_tex_id_ != 0) ? 1u : 0u;
+    // --- Wave 9 hosek-sky ---
+    // mode 3 = Hosek-Wilkie physically-based sky. Like the procedural
+    // path it owns the sky procedurally (no env_map), so env_map_present
+    // stays 0 and the shader's Lambert NEE block takes the procedural
+    // sun-NEE + skyColor()-ambient branch, with skyColor() now returning
+    // the Hosek dome -- env lighting and the visible sky stay consistent.
+    else if (sky_mode_str == "hosek")      sky_mode_id = 3;
+    // --- end Wave 9 hosek-sky ---
     else /* procedural (default) */        sky_mode_id = 2;
     push.sun_and_mode[3] = float(sky_mode_id);
     push.env_map_present = (sky_mode_id == 1u) ? 1u : 0u;
+    // --- Wave 9 hosek-sky ---
+    // Fill the Hosek-Wilkie parameters. Read by the shader only in mode
+    // 3, but always populated (cheap) so a mid-render r_sky_mode switch
+    // to hosek picks up live turbidity/albedo without a frame of stale
+    // data. Solar zenith angle = acos(sun_dir.y); sun_and_mode[1] (= the
+    // sun's y component) was filled above.
+    {
+        float turbidity = 3.0f;
+        if (auto* v = C.FindCVar("r_sky_turbidity")) turbidity = v->GetFloat();
+        if (turbidity < 1.0f)  turbidity = 1.0f;
+        if (turbidity > 10.0f) turbidity = 10.0f;
+        float ground_albedo = 0.10f;
+        if (auto* v = C.FindCVar("r_sky_ground_albedo")) ground_albedo = v->GetFloat();
+        if (ground_albedo < 0.0f) ground_albedo = 0.0f;
+        if (ground_albedo > 1.0f) ground_albedo = 1.0f;
+        const float sun_y  = push.sun_and_mode[1];
+        const float zenith = std::acos(std::clamp(sun_y, -1.0f, 1.0f));
+        push.hosek_params[0] = turbidity;
+        push.hosek_params[1] = ground_albedo;
+        push.hosek_params[2] = zenith;
+        push.hosek_params[3] = 0.0f;
+    }
+    // --- end Wave 9 hosek-sky ---
 
     bool auto_exp = false;
     if (auto* v = C.FindCVar("r_auto_exposure")) auto_exp = v->GetBool();
@@ -8661,11 +8717,14 @@ void Engine::RenderFrame() {
     //                              roughness, metallic mesh-material tiles)
     //   +16 Wave 9 ocean-foam — ocean_foam_params vec4 (foam_amount,
     //                              foam_coverage gain, _reserved, _reserved)
+    //   +16 Wave 9 hosek-sky — hosek_params vec4 (turbidity, ground albedo,
+    //                              solar zenith, _reserved)
     static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 32 + 16
                   + 16 /* Wave 8 spectral (#27): spectral_params */
                   + 32 /* Wave 8 ocean (#25): ocean_params0 + ocean_params1 */
                   + 16 /* Wave 8 PBR (#26): mesh_tex_indices */
-                  + 16 /* Wave 9 ocean-foam: ocean_foam_params */);
+                  + 16 /* Wave 9 ocean-foam: ocean_foam_params */
+                  + 16 /* Wave 9 hosek-sky: hosek_params (turbidity, ground albedo, solar zenith) */);
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
     // cbuffer layout the Slang compiler applies to PathTrace.slang's
@@ -8768,6 +8827,12 @@ void Engine::RenderFrame() {
     // Wave 8 PBR (#26): mesh material texture tiles uvec4.
     static_assert(offsetof(PtPush, mesh_tex_indices) % 16 == 0,
                   "PtPush::mesh_tex_indices must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    // Wave 9 hosek-sky: hosek_params vec4 (turbidity, ground albedo,
+    // solar zenith). Trailing field; guard so a future re-order can't
+    // slip it off the std140 / MSL boundary.
+    static_assert(offsetof(PtPush, hosek_params) % 16 == 0,
+                  "PtPush::hosek_params must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
@@ -14217,7 +14282,7 @@ void Engine::RegisterCommands() {
     }
     // Sky cvars: changing any of them invalidates accumulation.
     if (auto* v = C.FindCVar("r_sky_mode")) {
-        v->allowed_values = {"gradient", "hdri", "procedural"};
+        v->allowed_values = {"gradient", "hdri", "procedural", "hosek"};
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
     if (auto* v = C.FindCVar("r_sun_elevation")) {
@@ -14761,9 +14826,13 @@ void Engine::RegisterCommands() {
         std::function<bool()> pred;
         const char* hint;
     };
+    // True for sky modes that consume the manual sun-position cvars:
+    // procedural and hosek (Wave 9). Both derive the sun direction from
+    // r_sun_elevation / r_sun_azimuth (or the astronomical override), so
+    // those cvars are NOT inert in either mode.
     auto sky_proc = []() {
         auto* m = pt::console::Console::Get().FindCVar("r_sky_mode");
-        return m != nullptr && m->value == "procedural";
+        return m != nullptr && (m->value == "procedural" || m->value == "hosek");
     };
     auto clouds_on = []() {
         auto* c = pt::console::Console::Get().FindCVar("r_clouds");
