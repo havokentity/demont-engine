@@ -741,6 +741,23 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     endforeach()
     # --- end #112 sky/sun/stars/moon matrix --------------------------------
 
+    # --- Wave 9 hosek-sky --------------------------------------------------
+    # Hosek-Wilkie physically-based sky (r_sky_mode hosek). Daytime sun
+    # at +50 deg, camera yawed toward the sun azimuth so the frame shows
+    # the zenith-to-horizon gradient AND the sun-side forward-scatter
+    # glow. The Lambert ground plane in the fixture is lit by the same
+    # hosekSky() radiance (visible-dome / env-lighting consistency). The
+    # metal cell is the Wave 9 build+test target; software gives the
+    # CI-exercised deterministic baseline. Tolerances mirror the #112
+    # sky cells -- bright HDR sky pixels exaggerate cross-backend FP
+    # roundoff, and the analytic Hosek fit has more transcendental ops
+    # (exp/pow per channel) than the procedural gradient.
+    pt_add_golden_cell(SCENE sky_hosek BACKEND software DENOISER off
+        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+    pt_add_golden_cell(SCENE sky_hosek BACKEND metal    DENOISER off
+        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+    # --- end Wave 9 hosek-sky ----------------------------------------------
+
     # --- Fluid Phase 1 (#136) -- smoke emitter fixture --------------------
     # Two density-injection plumes at chimney altitude with clouds off
     # and procedural sky. Validates: (a) the emitter loop ADDS density
