@@ -1144,6 +1144,17 @@ cbuffer Push {
     //   [s*3 + 2] c: subsurface_color.rgb, _pad
     float4 mat_overrides[8 * 3];
     // --- end Wave 9 advanced materials ----------------------------------------
+    // --- Wave 9 tonemap (#27 follow-up) ---------------------------------------
+    // tonemap_params.x = r_tonemap_op enum (0 aces / 1 agx / 2 khronos_pbr
+    //                    _neutral / 3 reinhard / 4 linear). Drives both the
+    //                    inline denoiser-off swapchain write here and the
+    //                    matching field in Tonemap.slang's post-denoise pass.
+    //                    Default 0 keeps the ACES path byte-identical so
+    //                    committed goldens are unchanged.
+    //              .yzw reserved (future per-operator knobs, e.g. AgX look
+    //                    slope/power/sat or a Reinhard white point).
+    uint4 tonemap_params;
+    // --- end Wave 9 tonemap ---------------------------------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -1277,6 +1288,10 @@ cbuffer Frame {
     uint4 mat_override_count;
     float4 mat_overrides[8 * 3];
     // --- end Wave 9 advanced materials ----------------------------------------
+    // --- Wave 9 tonemap (#27 follow-up) --- see the matching field in the
+    // Metal Push cbuffer above. tonemap_params.x = r_tonemap_op enum.
+    uint4 tonemap_params;
+    // --- end Wave 9 tonemap ---
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -3373,6 +3388,125 @@ float3 acesTonemap(float3 c) {
     const float a = 2.51, b = 0.03, d = 2.43, e = 0.59, f = 0.14;
     return saturate((c*(a*c+b))/(c*(d*c+e)+f));
 }
+
+// --- Wave 9 tonemap (#27 follow-up) ---------------------------------------
+// Modern display-transform operators selectable at runtime via the
+// r_tonemap_op cvar (host packs the enum into tonemap_params.x). ACES
+// (op 0) stays the engine default and the existing call sites collapse to
+// the unchanged acesTonemap() above, so committed goldens are bit-for-bit
+// preserved. The AgX + Khronos PBR Neutral curves are duplicated verbatim
+// in shaders/Tonemap.slang (the post-denoise Metal pass) -- same reasoning
+// as acesTonemap / srgb_oetf: each kernel stays a self-contained TU and any
+// drift between the inline (denoiser-off) and post-pass (denoiser-on) copies
+// would show as a visible A/B diff, so the constants MUST stay identical.
+//
+// Operator enum (mirror of pt::engine kTonemapOp* in Engine.cpp):
+//   0 = aces      (Narkowicz fit, default)
+//   1 = agx       (Troy Sobotka AgX, Minimal/Filament 6th-order fit)
+//   2 = khronos_pbr_neutral (Khronos glTF reference)
+//   3 = reinhard  (extended Reinhard, white point 1)
+//   4 = linear    (clamp only -- debug / pass-through)
+static const uint kTonemapAces     = 0u;
+static const uint kTonemapAgx      = 1u;
+static const uint kTonemapKhronos  = 2u;
+static const uint kTonemapReinhard = 3u;
+static const uint kTonemapLinear   = 4u;
+
+// AgX -- "Minimal AgX" by Benjamin Wrensch (a compact fit of Troy
+// Sobotka's AgX), the same approximation Filament ships. Three stages:
+//   1. transform into the AgX working space (a desaturating 3x3 matrix),
+//   2. log2 encode over the [-12.47, +4.026] EV range and normalise to
+//      [0, 1], then push through a per-channel 6th-order sigmoid polynomial,
+//   3. apply the AgX "punchy" look (slope/power/saturation) and the inverse
+//      working-space matrix, ending in sRGB-display linear.
+// Input is scene-linear (post-exposure). Output is display-linear sRGB; the
+// sRGB OETF is applied separately at the swapchain-write site, exactly as
+// for ACES. The curve already lands in [0, 1] so no extra saturate() needed.
+float3 agxDefaultContrastApprox(float3 x) {
+    float3 x2 = x * x;
+    float3 x4 = x2 * x2;
+    return  + 15.5     * x4 * x2
+            - 40.14    * x4 * x
+            + 31.96    * x4
+            - 6.868    * x2 * x
+            + 0.4298   * x2
+            + 0.1191   * x
+            - 0.00232;
+}
+float3 agxTonemap(float3 c) {
+    // AgX inset (working-space) matrix -- rows match the Filament/Wrensch
+    // constants. Slang float3x3 is column-major on construction, so build
+    // it from explicit rows via transpose of the row layout: we encode each
+    // matrix-vector product as dot()s to stay layout-agnostic.
+    const float3 ir0 = float3(0.842479062253094,  0.0784335999999992, 0.0792237451477643);
+    const float3 ir1 = float3(0.0423282422610123, 0.878468636469772,  0.0791661274605434);
+    const float3 ir2 = float3(0.0423756549057051, 0.0784336,          0.879142973793104);
+    float3 v = float3(dot(ir0, c), dot(ir1, c), dot(ir2, c));
+
+    // Log2 encode, normalise to [0,1] over the AgX EV window.
+    const float kMinEv = -12.47393;
+    const float kMaxEv =   4.026069;
+    v = clamp(log2(max(v, 1e-10)), kMinEv, kMaxEv);
+    v = (v - kMinEv) / (kMaxEv - kMinEv);
+
+    // Sigmoid contrast.
+    v = agxDefaultContrastApprox(v);
+
+    // AgX "punchy" look: gamma + per-channel saturation about luma.
+    const float3 kLuma = float3(0.2126, 0.7152, 0.0722);
+    float luma = dot(v, kLuma);
+    const float3 offset = float3(0.0);
+    const float3 slope  = float3(1.0);
+    const float3 power  = float3(1.0);
+    const float  sat    = 1.0;
+    v = pow(max(v * slope + offset, float3(0.0)), power);
+    v = luma + sat * (v - luma);
+
+    // Inverse (outset) matrix back to sRGB-display linear.
+    const float3 or0 = float3( 1.19687900512017,  -0.0980208811401368, -0.0990297440797205);
+    const float3 or1 = float3(-0.0528968517574562, 1.15190312990417,   -0.0989611768448433);
+    const float3 or2 = float3(-0.0529716355144438,-0.0980434501171241,  1.15107367264116);
+    v = float3(dot(or0, v), dot(or1, v), dot(or2, v));
+    return saturate(v);
+}
+
+// Khronos PBR Neutral -- the official glTF-Sample-Viewer neutral tone
+// mapper (Khronos 3D Formats group). Designed to preserve material albedo
+// and hue: it leaves the darks/mids untouched, compresses only the bright
+// tail, and desaturates toward white as luminance approaches the ceiling so
+// saturated highlights roll off without hue shift. Reference is ~15 lines.
+float3 khronosPbrNeutralTonemap(float3 c) {
+    const float startCompression = 0.8 - 0.04;
+    const float desaturation     = 0.15;
+
+    float x = min(c.r, min(c.g, c.b));
+    float offset = (x < 0.08) ? (x - 6.25 * x * x) : 0.04;
+    c -= offset;
+
+    float peak = max(c.r, max(c.g, c.b));
+    if (peak < startCompression) return c;
+
+    const float d = 1.0 - startCompression;
+    float newPeak = 1.0 - d * d / (peak + d - startCompression);
+    c *= newPeak / peak;
+
+    float g = 1.0 - 1.0 / (desaturation * (peak - newPeak) + 1.0);
+    return lerp(c, float3(newPeak), g);
+}
+
+// Dispatch on the operator enum. Input is scene-linear (post-exposure);
+// output is display-linear (sRGB OETF applied at the call site). op == 0
+// returns exactly acesTonemap(c) so the existing default is byte-identical.
+float3 tonemapDispatch(float3 c, uint op) {
+    switch (op) {
+        case kTonemapAgx:      return agxTonemap(c);
+        case kTonemapKhronos:  return khronosPbrNeutralTonemap(c);
+        case kTonemapReinhard: return saturate(c / (1.0 + c));
+        case kTonemapLinear:   return saturate(c);
+        default:               return acesTonemap(c);   // kTonemapAces
+    }
+}
+// --- end Wave 9 tonemap ---------------------------------------------------
 
 #if defined(PT_TARGET_SPIRV)
 // Standard sRGB OETF (linear -> nonlinear, IEC 61966-2-1: linear seg
@@ -7358,7 +7492,9 @@ void main(uint2 tid : SV_DispatchThreadID) {
         if (w2j_row0.w > 0.5) {
             denoise_color[tid] = float4(hdr_src, 1.0);
         } else {
-            float3 mapped = acesTonemap(hdr_src * exposure);
+            // --- Wave 9 tonemap --- operator from tonemap_params.x (op 0
+            // == acesTonemap, byte-identical to the previous default).
+            float3 mapped = tonemapDispatch(hdr_src * exposure, tonemap_params.x);
             denoise_color[tid] = float4(mapped, 1.0);
         }
     }
@@ -7410,7 +7546,9 @@ void main(uint2 tid : SV_DispatchThreadID) {
     // EOTF-on-display gives back the original linear values. On Metal
     // the swapchain's BGRA8Unorm_sRGB pixel format encodes implicitly
     // on Apple silicon storage writes -- nothing for the shader to do.
-    float3 ldr = acesTonemap(avg * exposure);
+    // --- Wave 9 tonemap --- operator from tonemap_params.x (op 0 ==
+    // acesTonemap so the inline denoiser-off swapchain write is unchanged).
+    float3 ldr = tonemapDispatch(avg * exposure, tonemap_params.x);
 #if defined(PT_TARGET_SPIRV)
     ldr = srgb_oetf(ldr);
 #endif

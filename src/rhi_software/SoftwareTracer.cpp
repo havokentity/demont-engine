@@ -182,6 +182,71 @@ inline glm::vec3 SrgbOetf(glm::vec3 c) {
     return glm::vec3{enc(c.r), enc(c.g), enc(c.b)};
 }
 
+// --- Wave 9 tonemap (#27 follow-up) ----------------------------------------
+// Host-side mirrors of the AgX + Khronos PBR Neutral operators the GPU
+// paths apply (shaders/PathTrace.slang + shaders/Tonemap.slang). The
+// software backend is a crude preview tracer, so its absolute pixels never
+// matched the GPU paths -- but it MUST still honour r_tonemap_op so the
+// cvar isn't silently a no-op on this backend (the engine's "no demo
+// shortcuts" rule). Constants are kept identical to the shader copies.
+inline glm::vec3 AgxTonemap(glm::vec3 c) {
+    auto contrast = [](glm::vec3 x) {
+        glm::vec3 x2 = x * x;
+        glm::vec3 x4 = x2 * x2;
+        return 15.5f * x4 * x2 - 40.14f * x4 * x + 31.96f * x4
+             - 6.868f * x2 * x + 0.4298f * x2 + 0.1191f * x - 0.00232f;
+    };
+    const glm::vec3 ir0{0.842479062253094f,  0.0784335999999992f, 0.0792237451477643f};
+    const glm::vec3 ir1{0.0423282422610123f, 0.878468636469772f,  0.0791661274605434f};
+    const glm::vec3 ir2{0.0423756549057051f, 0.0784336f,          0.879142973793104f};
+    glm::vec3 v{glm::dot(ir0, c), glm::dot(ir1, c), glm::dot(ir2, c)};
+
+    const float kMinEv = -12.47393f, kMaxEv = 4.026069f;
+    v = glm::clamp(glm::vec3{std::log2(std::max(v.x, 1e-10f)),
+                             std::log2(std::max(v.y, 1e-10f)),
+                             std::log2(std::max(v.z, 1e-10f))},
+                   glm::vec3(kMinEv), glm::vec3(kMaxEv));
+    v = (v - kMinEv) / (kMaxEv - kMinEv);
+    v = contrast(v);
+
+    const glm::vec3 kLuma{0.2126f, 0.7152f, 0.0722f};
+    float luma = glm::dot(v, kLuma);
+    v = luma + (v - luma);  // sat = 1, slope = 1, power = 1, offset = 0
+
+    const glm::vec3 or0{ 1.19687900512017f,  -0.0980208811401368f, -0.0990297440797205f};
+    const glm::vec3 or1{-0.0528968517574562f, 1.15190312990417f,   -0.0989611768448433f};
+    const glm::vec3 or2{-0.0529716355144438f,-0.0980434501171241f,  1.15107367264116f};
+    v = glm::vec3{glm::dot(or0, v), glm::dot(or1, v), glm::dot(or2, v)};
+    return glm::clamp(v, glm::vec3(0.0f), glm::vec3(1.0f));
+}
+inline glm::vec3 KhronosPbrNeutralTonemap(glm::vec3 c) {
+    const float startCompression = 0.8f - 0.04f;
+    const float desaturation     = 0.15f;
+    float x = std::min(c.r, std::min(c.g, c.b));
+    float offset = (x < 0.08f) ? (x - 6.25f * x * x) : 0.04f;
+    c -= offset;
+    float peak = std::max(c.r, std::max(c.g, c.b));
+    if (peak < startCompression) return c;
+    const float d = 1.0f - startCompression;
+    float newPeak = 1.0f - d * d / (peak + d - startCompression);
+    c *= newPeak / peak;
+    float g = 1.0f - 1.0f / (desaturation * (peak - newPeak) + 1.0f);
+    return glm::mix(c, glm::vec3(newPeak), g);
+}
+// Dispatch on the r_tonemap_op enum (0 aces / 1 agx / 2 khronos_pbr_neutral
+// / 3 reinhard / 4 linear). op 0 returns AcesNarkowicz(c), byte-identical
+// to the previous unconditional ACES path.
+inline glm::vec3 TonemapDispatch(glm::vec3 c, std::uint32_t op) {
+    switch (op) {
+        case 1u: return AgxTonemap(c);
+        case 2u: return KhronosPbrNeutralTonemap(c);
+        case 3u: return glm::clamp(c / (1.0f + c), glm::vec3(0.0f), glm::vec3(1.0f));
+        case 4u: return glm::clamp(c, glm::vec3(0.0f), glm::vec3(1.0f));
+        default: return AcesNarkowicz(c);
+    }
+}
+// --- end Wave 9 tonemap ----------------------------------------------------
+
 // Single hit test against analytic prims + (optional) Embree TLAS.
 // Closest-hit semantics.
 void TraceScene(const glm::vec3& ro, const glm::vec3& rd,
@@ -360,6 +425,21 @@ void RunPathTraceKernel(SoftwareDevice& device,
         }
     }
 
+    // --- Wave 9 tonemap (#27 follow-up) ---
+    // r_tonemap_op enum, packed by the engine into PtPush::tonemap_params --
+    // the LAST 16-byte block of the struct. The software backend always
+    // receives the full Metal-style push (no Vulkan split), so tonemap_params
+    // .x sits at push_constants_size - 16. Read defensively: if the push is
+    // somehow short, fall back to op 0 (aces) so a malformed dispatch can't
+    // reach into out-of-range bytes. Mirrors the GPU paths' tonemap_params.x.
+    std::uint32_t tonemap_op = 0u;
+    if (cmd.push_constants_size >= 16) {
+        std::memcpy(&tonemap_op,
+                    cmd.push_constants_buf + cmd.push_constants_size - 16,
+                    sizeof(std::uint32_t));
+        if (tonemap_op > 4u) tonemap_op = 0u;
+    }
+
     // EMA history-retention factor (r_accum_ema_alpha).  0 = legacy
     // online running mean; >0 = EMA blend with effective window
     // ~1/(1-alpha).  Read defensively -- engine may push less than the
@@ -524,7 +604,10 @@ void RunPathTraceKernel(SoftwareDevice& device,
                 // matches the GPU backends: noise falls as 1/sqrt(N)
                 // for running-mean mode, floor at the EMA variance
                 // floor for EMA mode.
-                glm::vec3 tonemapped = SrgbOetf(AcesNarkowicz(avg * exposure));
+                // --- Wave 9 tonemap --- operator from r_tonemap_op
+                // (tonemap_op == 0 -> AcesNarkowicz, unchanged default).
+                glm::vec3 tonemapped =
+                    SrgbOetf(TonemapDispatch(avg * exposure, tonemap_op));
                 row[x * 4 + 0] = tonemapped.r;
                 row[x * 4 + 1] = tonemapped.g;
                 row[x * 4 + 2] = tonemapped.b;

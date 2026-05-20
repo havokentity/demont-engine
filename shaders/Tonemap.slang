@@ -161,14 +161,20 @@ cbuffer Push {
     uint  flare_mode_physical;
     // Number of valid entries in ghosts[]. 0 = skip the physical loop.
     uint  physical_ghost_count;
-    // Reserved (8 bytes). Previously `stars_present + _pad_stars_align`
-    // for the EMA-based star_split design (#108). Kept as padding so
-    // TonePush::ghosts stays at offset 112 -- the Vulkan kPushSplitOffset
-    // boundary that splits push constants (first 112 B) from the Frame
-    // UBO ghost array tail. Removing these 8 bytes would shift the
-    // ghosts[] array and break the cross-backend layout contract.
-    uint  _reserved_stars_present;
+    // --- Wave 9 tonemap (#27 follow-up) ---
+    // tonemap_op: r_tonemap_op enum (0 aces / 1 agx / 2 khronos_pbr_neutral
+    // / 3 reinhard / 4 linear). Reclaimed from `_reserved_stars_present`
+    // (one of the two reserved uints left behind by the EMA-based star_split
+    // design #108). Stays a uint at the SAME byte offset so TonePush::ghosts
+    // remains at offset 112 -- the Vulkan kPushSplitOffset boundary that
+    // splits push constants (first 112 B) from the Frame UBO ghost-array
+    // tail. The post-denoise pass reads this at all three tonemap call
+    // sites below; op 0 (aces) is byte-identical to the previous behaviour.
+    uint  tonemap_op;
+    // Reserved (4 bytes). The other half of the old #108 star_split pad;
+    // kept so ghosts[] stays at offset 112 across both backends.
     uint  _reserved_stars_align;
+    // --- end Wave 9 tonemap ---
     // 48 bytes of padding to push the ghost array forward to host
     // offset 112 (the Vulkan kPushSplitOffset boundary). On Vulkan
     // only the first 112 bytes hit vkCmdPushConstants; bytes
@@ -204,6 +210,103 @@ float3 acesTonemap(float3 c) {
     const float a = 2.51, b = 0.03, ck = 2.43, d = 0.59, e = 0.14;
     return saturate((c * (a * c + b)) / (c * (ck * c + d) + e));
 }
+
+// --- Wave 9 tonemap (#27 follow-up) ---------------------------------------
+// Modern display-transform operators, selectable via the r_tonemap_op cvar
+// (host packs the enum into TonePush::tonemap_op). VERBATIM duplicate of the
+// helpers in PathTrace.slang's inline tonemap -- duplicated rather than
+// shared for the same reason acesTonemap above is: this kernel is a single
+// self-contained TU, and any drift between the two copies would show as a
+// visible A/B diff between the denoiser-on (this pass) and denoiser-off
+// (inline) paths. Keep the constants identical to the PathTrace.slang copy.
+//
+// Operator enum (mirror of pt::engine ParseTonemapOp + the kTonemap*
+// constants in PathTrace.slang):
+//   0 = aces / 1 = agx / 2 = khronos_pbr_neutral / 3 = reinhard / 4 = linear
+static const uint kTonemapAces     = 0u;
+static const uint kTonemapAgx      = 1u;
+static const uint kTonemapKhronos  = 2u;
+static const uint kTonemapReinhard = 3u;
+static const uint kTonemapLinear   = 4u;
+
+// AgX -- "Minimal AgX" (Benjamin Wrensch fit of Troy Sobotka's AgX), the
+// same approximation Filament ships. See PathTrace.slang for the per-stage
+// derivation. Input scene-linear (post-exposure); output display-linear
+// sRGB (the OETF is applied at the swapchain-write site, as for ACES).
+float3 agxDefaultContrastApprox(float3 x) {
+    float3 x2 = x * x;
+    float3 x4 = x2 * x2;
+    return  + 15.5     * x4 * x2
+            - 40.14    * x4 * x
+            + 31.96    * x4
+            - 6.868    * x2 * x
+            + 0.4298   * x2
+            + 0.1191   * x
+            - 0.00232;
+}
+float3 agxTonemap(float3 c) {
+    const float3 ir0 = float3(0.842479062253094,  0.0784335999999992, 0.0792237451477643);
+    const float3 ir1 = float3(0.0423282422610123, 0.878468636469772,  0.0791661274605434);
+    const float3 ir2 = float3(0.0423756549057051, 0.0784336,          0.879142973793104);
+    float3 v = float3(dot(ir0, c), dot(ir1, c), dot(ir2, c));
+
+    const float kMinEv = -12.47393;
+    const float kMaxEv =   4.026069;
+    v = clamp(log2(max(v, 1e-10)), kMinEv, kMaxEv);
+    v = (v - kMinEv) / (kMaxEv - kMinEv);
+
+    v = agxDefaultContrastApprox(v);
+
+    const float3 kLuma = float3(0.2126, 0.7152, 0.0722);
+    float luma = dot(v, kLuma);
+    const float3 offset = float3(0.0);
+    const float3 slope  = float3(1.0);
+    const float3 power  = float3(1.0);
+    const float  sat    = 1.0;
+    v = pow(max(v * slope + offset, float3(0.0)), power);
+    v = luma + sat * (v - luma);
+
+    const float3 or0 = float3( 1.19687900512017,  -0.0980208811401368, -0.0990297440797205);
+    const float3 or1 = float3(-0.0528968517574562, 1.15190312990417,   -0.0989611768448433);
+    const float3 or2 = float3(-0.0529716355144438,-0.0980434501171241,  1.15107367264116);
+    v = float3(dot(or0, v), dot(or1, v), dot(or2, v));
+    return saturate(v);
+}
+
+// Khronos PBR Neutral -- the official glTF-Sample-Viewer neutral tone
+// mapper. Preserves material albedo + hue; compresses only the bright tail
+// and desaturates toward white near the ceiling. See PathTrace.slang copy.
+float3 khronosPbrNeutralTonemap(float3 c) {
+    const float startCompression = 0.8 - 0.04;
+    const float desaturation     = 0.15;
+
+    float x = min(c.r, min(c.g, c.b));
+    float offset = (x < 0.08) ? (x - 6.25 * x * x) : 0.04;
+    c -= offset;
+
+    float peak = max(c.r, max(c.g, c.b));
+    if (peak < startCompression) return c;
+
+    const float d = 1.0 - startCompression;
+    float newPeak = 1.0 - d * d / (peak + d - startCompression);
+    c *= newPeak / peak;
+
+    float g = 1.0 - 1.0 / (desaturation * (peak - newPeak) + 1.0);
+    return lerp(c, float3(newPeak), g);
+}
+
+// Dispatch on the operator enum. op == 0 returns exactly acesTonemap(c) so
+// the default post-denoise path stays byte-identical to pre-Wave-9.
+float3 tonemapDispatch(float3 c, uint op) {
+    switch (op) {
+        case kTonemapAgx:      return agxTonemap(c);
+        case kTonemapKhronos:  return khronosPbrNeutralTonemap(c);
+        case kTonemapReinhard: return saturate(c / (1.0 + c));
+        case kTonemapLinear:   return saturate(c);
+        default:               return acesTonemap(c);   // kTonemapAces
+    }
+}
+// --- end Wave 9 tonemap ---------------------------------------------------
 
 // sRGB OETF (linear -> nonlinear) applied at swapchain-write sites on
 // the SPIR-V path. Mirror of PathTrace.slang's helper -- see that
@@ -469,7 +572,10 @@ void main(uint3 tid : SV_DispatchThreadID) {
             // On Metal PT_SRGB_ENCODE is identity; the swapchain is sRGB-
             // formatted and Apple silicon auto-encodes on store.
             float3 ldr_phys = PT_SRGB_ENCODE(
-                (passthrough != 0u) ? c : acesTonemap(c * exposure_state[0]));
+                // --- Wave 9 tonemap --- op from TonePush::tonemap_op (0
+                // == acesTonemap, so the default post-denoise path is
+                // byte-identical to pre-Wave-9).
+                (passthrough != 0u) ? c : tonemapDispatch(c * exposure_state[0], tonemap_op));
             ldr_out[tid.xy] = float4(ldr_phys, 1.0);
             return;
         }
@@ -530,7 +636,10 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 c += flare_intensity * flare;
             }
             float3 ldr_sun = PT_SRGB_ENCODE(
-                (passthrough != 0u) ? c : acesTonemap(c * exposure_state[0]));
+                // --- Wave 9 tonemap --- op from TonePush::tonemap_op (0
+                // == acesTonemap, so the default post-denoise path is
+                // byte-identical to pre-Wave-9).
+                (passthrough != 0u) ? c : tonemapDispatch(c * exposure_state[0], tonemap_op));
             ldr_out[tid.xy] = float4(ldr_sun, 1.0);
             return;
         }
@@ -666,7 +775,9 @@ void main(uint3 tid : SV_DispatchThreadID) {
             return;
         }
     }
+    // --- Wave 9 tonemap --- op from TonePush::tonemap_op (0 == acesTonemap,
+    // so the default post-denoise path is byte-identical to pre-Wave-9).
     float3 ldr = PT_SRGB_ENCODE(
-        (passthrough != 0u) ? c : acesTonemap(c * exposure_state[0]));
+        (passthrough != 0u) ? c : tonemapDispatch(c * exposure_state[0], tonemap_op));
     ldr_out[tid.xy] = float4(ldr, 1.0);
 }
