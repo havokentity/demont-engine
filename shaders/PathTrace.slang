@@ -7375,6 +7375,19 @@ void main(uint2 tid : SV_DispatchThreadID) {
                             v_color_c += clampIndirect(sky_ambient * step_w * trans_atm * light_tint);
                         }
                         trans_eye_c *= exp(-dens * dtc);
+                        // Early termination (Beer-Lambert front-to-back): once the
+                        // accumulated eye transmittance is near zero the cloud is
+                        // opaque along this ray, so every remaining march sample
+                        // contributes step_w = dens*dtc*trans_eye_c ~ 0 while still
+                        // paying a full multi-octave cloud_density_at + per-light
+                        // shadow transmittance() march (and now the multi-scatter
+                        // octave loop above). Bailing here skips the often-majority
+                        // back-half samples on thick cloud pixels. Output changes by
+                        // < ~1e-3 radiance -- under the golden tolerance and verified
+                        // a no-op on the committed cloud goldens. Same SPIR-V / MSL
+                        // codegen so Metal and Vulkan bail identically (no new
+                        // cross-backend divergence). Threshold 0.003 ~= 99.7% opaque.
+                        if (trans_eye_c < 0.003) break;
                     }
                     // Beer-Lambert background attenuation, opt-in via
                     // r_cloud_attenuate_background (piggybacked on
