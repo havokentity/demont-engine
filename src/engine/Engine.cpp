@@ -1024,6 +1024,18 @@ namespace cvar {
     PT_CVAR(r_dof_aperture,    "0.05","Aperture radius in world units. Bigger = more blur on out-of-focus pixels. Real-camera analogue: focal_length / f_number; e.g. 50mm at f/2.8 ~= 0.018 (assuming the scene is in metres).", CVAR_ARCHIVE);
     PT_CVAR(r_dof_focal_distance, "5.0", "Distance from camera (world units) where the scene is in perfect focus. Closer / farther pixels get bokeh proportional to their distance from this plane.", CVAR_ARCHIVE);
     PT_CVAR(r_dof_blades,      "0",   "Aperture blade count. 0 = perfectly round disk (circular bokeh). 5/6/8 = polygonal iris (matching real lens aperture blades) -- gives polygonal bokeh on out-of-focus highlights.", CVAR_ARCHIVE);
+    // --- Wave 8 spectral (#27) ---
+    // Spectral dispersion for dielectrics. Each path samples one hero
+    // wavelength in [380,730] nm (stratified across the pixel's spp
+    // samples); the dielectric BSDF refracts it with the wavelength-
+    // dependent Cauchy IOR n(lambda) = B + C/lambda^2, so different
+    // wavelengths bend differently -> real prism rainbows + chromatic
+    // glass edges. Spectral radiance is reconstructed to RGB via the CIE
+    // 1931 colour-matching functions (Wyman 2013 analytic fit). Off by
+    // default -> the achromatic RGB dielectric path runs unchanged.
+    PT_CVAR(r_spectral,        "0",   "Spectral dispersion for dielectrics (per-ray hero-wavelength sampling). 0 = achromatic RGB glass (default, bit-stable). 1 = wavelength-dependent refraction via Cauchy IOR -> prism rainbows + chromatic edges on glass. Converges over the temporal accumulator (or spp>1).", CVAR_ARCHIVE);
+    PT_CVAR(r_spectral_cauchy_c, "0.00420", "Default Cauchy C coefficient (micrometre^2) for dielectric dispersion when r_spectral is on. n(lambda) = B + C/lambda^2 with B solved so the curve passes through the material's nominal IOR at the d-line (587.6 nm). Crown glass BK7 ~= 0.00420 (Abbe V_d ~= 64); flint glasses (SF11 ~= 0.0127) disperse more. 0 = achromatic.", CVAR_ARCHIVE);
+    // --- end ---
     // Volumetrics: single-scatter ray march along primary rays, NEE
     // toward sun at each sample. Atmospheric haze + god rays through
     // gaps in geometry (sun shafts).
@@ -6316,6 +6328,17 @@ void Engine::RenderFrame() {
         // distance (world units). .z = aperture blade count (0 =
         // round disk, 3..16 = polygonal iris). .w reserved.
         float dof_params[4];
+        // --- Wave 8 spectral (#27) ---
+        // Spectral dispersion (hero-wavelength) params.
+        //   .x = enabled flag (0 = achromatic RGB dielectric path, bit-
+        //        stable with pre-#27 goldens; 1 = per-ray hero-wavelength
+        //        sampling with Cauchy IOR -> real prism dispersion).
+        //   .y = default Cauchy C coefficient (micrometre^2) for dielectric
+        //        materials; the material's nominal IOR anchors the curve at
+        //        the d-line (587.6 nm). BK7 crown glass ~= 0.00420.
+        //   .z/.w reserved. One vec4 = 16 B (see static_assert sum below).
+        float spectral_params[4];
+        // --- end ---
         // .x = density (0 disables). .y = HG anisotropy. .z =
         // intensity. .w = march sample count (cast to int in shader).
         float vol_params[4];
@@ -7493,6 +7516,26 @@ void Engine::RenderFrame() {
         push.dof_params[3] = 0.0f;
     }
 
+    // --- Wave 8 spectral (#27) ---
+    // Spectral dispersion gate. When r_spectral is off, spectral_params.x
+    // stays 0.0 so PathTrace.slang takes the verbatim achromatic dielectric
+    // path (no extra seed draw, weight (1,1,1)) -- existing goldens are
+    // preserved bit-for-bit. The Cauchy C coefficient defaults to BK7 crown
+    // glass and is clamped non-negative (a negative C would invert the
+    // dispersion direction, which is unphysical for normal-dispersion glass).
+    {
+        bool  spectral_on = false;
+        if (auto* v = C.FindCVar("r_spectral")) spectral_on = v->GetBool();
+        float cauchy_c = 0.00420f;
+        if (auto* v = C.FindCVar("r_spectral_cauchy_c")) cauchy_c = v->GetFloat();
+        if (cauchy_c < 0.0f) cauchy_c = 0.0f;
+        push.spectral_params[0] = spectral_on ? 1.0f : 0.0f;
+        push.spectral_params[1] = cauchy_c;
+        push.spectral_params[2] = 0.0f;
+        push.spectral_params[3] = 0.0f;
+    }
+    // --- end ---
+
     {
         bool  vol_on  = false;
         float density = 0.02f, anisotropy = 0.7f, intensity = 1.0f;
@@ -7959,7 +8002,13 @@ void Engine::RenderFrame() {
     //                              curr_translation.xyz + _pad
     //   +16 Smoke SPH Phase 3 (#22 wave-7) — smoke_sph_params vec4 (count, mode,
     //                              density_floor, capacity)
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 32 + 16);
+    //   +16 Wave 8 spectral (#27) — spectral_params vec4 (enabled, cauchy_c,
+    //                              _reserved, _reserved). Inserted in the
+    //                              struct between dof_params and vol_params;
+    //                              added here as a trailing +16 since the
+    //                              assert only checks the total byte size.
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 32 + 16
+                  + 16 /* Wave 8 spectral (#27): spectral_params */);
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
     // cbuffer layout the Slang compiler applies to PathTrace.slang's
@@ -7975,6 +8024,12 @@ void Engine::RenderFrame() {
     // slip the std140 layout out from under the shader.
     static_assert(offsetof(PtPush, clouds_p4) % 16 == 0,
                   "PtPush::clouds_p4 must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    // Wave 8 spectral (#27): spectral_params sits between dof_params and
+    // vol_params; both neighbours are vec4-sized so it stays 16-byte
+    // aligned, but guard explicitly so a future re-order can't slip it.
+    static_assert(offsetof(PtPush, spectral_params) % 16 == 0,
+                  "PtPush::spectral_params must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     static_assert(offsetof(PtPush, accum_params) % 16 == 0,
                   "PtPush::accum_params must be 16-byte aligned to match "
