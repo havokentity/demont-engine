@@ -40,9 +40,9 @@ name: Linux Sanitizers
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, integration/parallel-batch-1 ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, integration/parallel-batch-1 ]
   workflow_dispatch:
 
 # Cancel in-flight runs for the same branch when a newer push lands.
