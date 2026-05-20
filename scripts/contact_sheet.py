@@ -47,8 +47,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import platform
-import shutil
 import subprocess
 import sys
 import time
@@ -256,7 +254,10 @@ def render_cell(cell: Cell, *, render_tool: Path, backend: str, frames_cap: int 
     extra_cmds = list(cell.extra)
     if cell.late_exec:
         abs_late = REPO_ROOT / "tests" / "goldens" / "scenes" / cell.late_exec
-        extra_cmds.append(f"pt_smoke_late_exec {abs_late}")
+        # Quote the path: the console tokenizer splits on spaces, and the
+        # repo can live under a path that contains them (e.g. the dev box's
+        # "/Volumes/XTRM 5 Media/..."). The console supports quoted tokens.
+        extra_cmds.append(f'pt_smoke_late_exec "{abs_late}"')
     extra_joined = "\n".join(extra_cmds)
 
     args: list[str] = [
@@ -432,11 +433,9 @@ def build_montage(rendered: list[tuple[Cell, Path | None, str]], *,
                 col = 0
                 row_top += tile_total_h + pad
         # Advance y past whatever rows this section consumed.
-        rows_used = section_rows(len(cells))
-        y = row_top + ((tile_total_h + pad) if col != 0 else 0)
-        # If the last row was partial (col != 0) we already accounted the
-        # final row_top; if it was full (col == 0) row_top already points
-        # past it. Normalise:
+        # Advance y past this section. If the last row was full (col == 0)
+        # row_top already points past it; if partial (col != 0) add the
+        # final row's height.
         if col == 0:
             y = row_top
         else:
@@ -504,10 +503,9 @@ def main() -> int:
     try:
         import PIL  # noqa: F401
     except ImportError:
-        print("ERROR: Pillow (PIL) is required for the montage step.\n"
-              "       Install it with:  python3 -m pip install Pillow\n"
-              "       (Individual tile PNGs can still be produced, but this "
-              "harness composites them in one pass.)", file=sys.stderr)
+        print("ERROR: Pillow (PIL) is required to run this harness.\n"
+              "       Install it with:  python3 -m pip install Pillow",
+              file=sys.stderr)
         return 2
 
     render_tool = args.render_tool or default_render_tool()
