@@ -142,11 +142,20 @@ describe('advanced material command builders', () => {
       'prim_set_subsurface 4 0 1 1 1',
     );
   });
-  it('ADV_DEFAULTS match the engine prim_set_* defaults', () => {
+  it('ADV_DEFAULTS are the editor UI seeds (every lobe off)', () => {
+    // These are the panel's UI seed values, NOT the engine's AnalyticPrim
+    // struct member-initializers. Every lobe starts off so opening the
+    // panel never silently enables an extension (each setter clears its
+    // mat_ext_flags bit when weight/radius is 0). Deliberately diverges
+    // from Engine.h's per-lobe defaults (subsurface_radius = 0.005f,
+    // subsurface_color = {0.9, 0.7, 0.6}), which only apply once the
+    // corresponding flag bit is set -- and the engine default is
+    // mat_ext_flags = 0, i.e. all lobes disabled.
     expect(ADV_DEFAULTS.anisoAmount).toBe(0);
+    expect(ADV_DEFAULTS.anisoRotationDeg).toBe(0);
     expect(ADV_DEFAULTS.clearcoatWeight).toBe(0);
     expect(ADV_DEFAULTS.clearcoatRoughness).toBeCloseTo(0.03, 6);
-    expect(ADV_DEFAULTS.subsurfaceRadius).toBe(0);
+    expect(ADV_DEFAULTS.subsurfaceRadius).toBe(0); // off, not engine's 0.005
     expect(ADV_DEFAULTS.subsurfaceColor).toEqual([1, 1, 1]);
   });
 });

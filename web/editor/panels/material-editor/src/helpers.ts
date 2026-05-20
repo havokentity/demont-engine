@@ -43,14 +43,26 @@ export function setTexCommand(slot: TexSlot): string {
 // "assigning is the supported path" caveat the Normal Map section already
 // carries for normal-strength.
 
-/** Default values for the Advanced material lobes, matching the engine's
- *  PT_CVAR / command defaults in src/engine/Engine.cpp (prim_set_*). */
+/** Seed values for the Advanced material *editor UI* -- NOT a mirror of
+ *  the engine's AnalyticPrim struct member-initializers. Every lobe starts
+ *  "off" so opening the panel never silently enables an extension: each
+ *  setter clears its mat_ext_flags bit when its weight/radius is 0.
+ *
+ *  Note this deliberately differs from the engine struct defaults in
+ *  src/engine/Engine.h (clearcoat_roughness = 0.03f, subsurface_radius =
+ *  0.005f, subsurface_color = {0.9, 0.7, 0.6}). Those struct values only
+ *  take effect once the corresponding mat_ext_flags bit is set, and the
+ *  engine default is mat_ext_flags = 0 (all lobes disabled) -- so "off"
+ *  here matches the engine's actual rendered default, not its per-lobe
+ *  member-initializers. The UI surfaces the engine's tuned values only
+ *  after the user enables a lobe; until then these neutral seeds keep the
+ *  controls inert. */
 export const ADV_DEFAULTS = {
   anisoAmount: 0,        // 0 = isotropic
   anisoRotationDeg: 0,
-  clearcoatWeight: 0,    // 0 = off
+  clearcoatWeight: 0,    // 0 = off (clears the clearcoat flag)
   clearcoatRoughness: 0.03,
-  subsurfaceRadius: 0,   // 0 = off (metres)
+  subsurfaceRadius: 0,   // 0 = off (clears the subsurface flag); metres
   subsurfaceColor: [1, 1, 1] as [number, number, number],
 } as const;
 
