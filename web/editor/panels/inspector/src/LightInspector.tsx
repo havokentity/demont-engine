@@ -1,27 +1,33 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Rajesh D'Monte
 //
-// Property inspector for analytic lights. The engine doesn't have
-// per-field setters for lights (no `light_set_pos` etc); the only
-// available editors are the composite type constructors:
-//   light_point  <id> x y z r g b
-//   light_spot   <id> x y z dx dy dz outer_deg inner_deg r g b
-//   light_sphere <id> x y z radius r g b
-//   light_quad   <id> x y z nx ny nz ux uy uz u_half v_half r g b
+// Property inspector for analytic lights. Each field commit dispatches
+// an ATOMIC per-field setter (mirroring the prim_set_* family):
 //
-// On any field commit we re-emit the appropriate full-state command
-// with the latest values. That's what the underlying engine update
-// requires and it keeps the editor flow uniform with prims (one
-// console line per commit).
+//   light_set_pos       <id> <x> <y> <z>             (any type)
+//   light_set_intensity <id> <r> <g> <b>             (raw W/sr or W/m^2/sr)
+//   light_set_dir       <id> <nx> <ny> <nz>          (spot axis / quad normal)
+//   light_set_cone      <id> <inner_deg> <outer_deg> (spot only)
+//   light_set_size      <id> <r>                     (sphere radius / quad v_half)
+//   light_set_uhalf     <id> <r>                     (quad U half-extent)
 //
-// Caveat: light_* commands flag light_prims_dirty_ for the renderer
-// but DON'T currently broadcast scene_dirty (unlike prim_set_*). So a
-// light edit dispatches and renders, but the inspector won't refetch
-// via the shell's scene_dirty path. The local field state (NumberField
-// / ColorField mirrors) stays in sync with what the user typed, so
-// the UX still feels live -- the round-trip just doesn't happen. A
-// future engine-side patch can plug scene_dirty into the light_*
-// handlers to close the loop.
+// Each setter validates id + type, mutates the light in place, and
+// broadcasts scene_dirty -- so the shell re-fetches via list_scene and
+// the edited field round-trips. (The composite light_point / light_spot
+// / ... constructors broadcast scene_dirty too, but firing a single
+// field per commit avoids rebuilding the whole light from a
+// possibly-stale snapshot.)
+//
+// Two engine quirks the dispatch respects:
+//   - light_set_cone takes inner THEN outer -- the OPPOSITE argument
+//     order of the composite light_spot constructor (outer then inner).
+//   - a quad's two half-extents use different setters: light_set_uhalf
+//     drives U (the engine rescales u_vec to the new length, preserving
+//     its in-plane axis) while light_set_size drives V.
+//
+// Intensity is authored as raw radiometric RGB via the HDR ColorField,
+// unlike the dedicated Lights panel which layers photometric cd / lm /
+// nit / EV authoring on top of the same light_set_intensity write path.
 
 import { useCallback } from 'react';
 import { NumberField } from './NumberField';
@@ -81,64 +87,66 @@ export function LightInspector({ light, exec }: LightInspectorProps) {
   const u_vec = light.u_vec ?? ([1, 0, 0] as [number, number, number]);
   const v_half = light.v_half ?? 0.5;
 
-  // Rebuild the canonical engine command from a partial override.
-  // `over` carries whichever field changed; everything else falls back
-  // to the latest known state from the scene snapshot.
-  const emit = useCallback(
-    (over: Partial<{
-      pos: [number, number, number];
-      intensity: [number, number, number];
-      dir: [number, number, number];
-      outerDeg: number;
-      innerDeg: number;
-      radius: number;
-      uVec: [number, number, number];
-      uHalf: number;
-      vHalf: number;
-    }>) => {
-      const p = over.pos ?? pos;
-      const I = over.intensity ?? intensity;
-      switch (light.type) {
-        case 'point':
-          exec(`light_point ${id} ${fmt(p[0])} ${fmt(p[1])} ${fmt(p[2])} ${fmt(I[0])} ${fmt(I[1])} ${fmt(I[2])}`);
-          break;
-        case 'spot': {
-          const d = over.dir ?? dir;
-          const oDeg = over.outerDeg ?? outerDeg;
-          const iDeg = over.innerDeg ?? innerDeg;
-          exec(`light_spot ${id} ${fmt(p[0])} ${fmt(p[1])} ${fmt(p[2])} ${fmt(d[0])} ${fmt(d[1])} ${fmt(d[2])} ${fmt(oDeg, 2)} ${fmt(iDeg, 2)} ${fmt(I[0])} ${fmt(I[1])} ${fmt(I[2])}`);
-          break;
-        }
-        case 'sphere': {
-          const r = over.radius ?? sphereRadius;
-          exec(`light_sphere ${id} ${fmt(p[0])} ${fmt(p[1])} ${fmt(p[2])} ${fmt(r)} ${fmt(I[0])} ${fmt(I[1])} ${fmt(I[2])}`);
-          break;
-        }
-        case 'quad': {
-          const n = over.dir ?? dir;
-          // u_vec is unit-normalised by the engine; the editor exposes
-          // u_half separately as a scalar. Reconstruct via either the
-          // override or the existing u_vec direction.
-          let uDir: [number, number, number];
-          let uHalf: number;
-          if (over.uVec) {
-            uDir = over.uVec;
-            uHalf = over.uHalf ?? vecLen(over.uVec) ?? 0.5;
-          } else {
-            const baseLen = vecLen(u_vec) || 1;
-            uDir = [u_vec[0] / baseLen, u_vec[1] / baseLen, u_vec[2] / baseLen];
-            uHalf = over.uHalf ?? baseLen;
-          }
-          const vH = over.vHalf ?? v_half;
-          exec(`light_quad ${id} ${fmt(p[0])} ${fmt(p[1])} ${fmt(p[2])} ${fmt(n[0])} ${fmt(n[1])} ${fmt(n[2])} ${fmt(uDir[0])} ${fmt(uDir[1])} ${fmt(uDir[2])} ${fmt(uHalf)} ${fmt(vH)} ${fmt(I[0])} ${fmt(I[1])} ${fmt(I[2])}`);
-          break;
-        }
-      }
+  // ---- atomic per-field dispatch ----
+  // Each setter receives the full new field value as args, so the
+  // closures only depend on [exec, id] -- no full-state reconstruction
+  // from a snapshot that may already be one scene_dirty behind.
+  const emitPos = useCallback(
+    (p: [number, number, number]) => {
+      exec(`light_set_pos ${id} ${fmt(p[0])} ${fmt(p[1])} ${fmt(p[2])}`);
     },
-    [exec, id, light.type, pos, intensity, dir, outerDeg, innerDeg, sphereRadius, u_vec, v_half],
+    [exec, id],
   );
 
-  // Compute the u_half scalar from the stored u_vec magnitude.
+  const emitDir = useCallback(
+    (d: [number, number, number]) => {
+      // light_set_dir auto-normalises and rejects zero-length; skip the
+      // degenerate case so we don't fire a command the engine warns on.
+      if (vecLen(d) < 1e-6) return;
+      exec(`light_set_dir ${id} ${fmt(d[0])} ${fmt(d[1])} ${fmt(d[2])}`);
+    },
+    [exec, id],
+  );
+
+  const emitCone = useCallback(
+    (innerD: number, outerD: number) => {
+      // Engine requires 0 <= inner <= outer <= 90 and takes inner first.
+      const o = Math.max(0, Math.min(90, outerD));
+      const i = Math.max(0, Math.min(o, innerD));
+      exec(`light_set_cone ${id} ${fmt(i, 2)} ${fmt(o, 2)}`);
+    },
+    [exec, id],
+  );
+
+  const emitSize = useCallback(
+    (r: number) => {
+      exec(`light_set_size ${id} ${fmt(Math.max(0, r))}`);
+    },
+    [exec, id],
+  );
+
+  const emitUHalf = useCallback(
+    (r: number) => {
+      // light_set_uhalf rescales u_vec to length r; the engine rejects
+      // negatives and warns on a degenerate (zero-length) u-axis.
+      exec(`light_set_uhalf ${id} ${fmt(Math.max(0, r))}`);
+    },
+    [exec, id],
+  );
+
+  const emitIntensity = useCallback(
+    (rgb: [number, number, number]) => {
+      // light_set_intensity rejects negative channels.
+      const r = Math.max(0, rgb[0]);
+      const g = Math.max(0, rgb[1]);
+      const b = Math.max(0, rgb[2]);
+      exec(`light_set_intensity ${id} ${fmt(r)} ${fmt(g)} ${fmt(b)}`);
+    },
+    [exec, id],
+  );
+
+  // The stored u_vec packs axis * half-extent, so its length is the U
+  // half-extent shown here; emitUHalf writes it via light_set_uhalf.
   const uHalfDisplay = vecLen(u_vec);
 
   return (
@@ -151,20 +159,20 @@ export function LightInspector({ light, exec }: LightInspectorProps) {
             <NumberField
               axis="X"
               value={pos[0]}
-              onCommit={(v) => emit({ pos: [v, pos[1], pos[2]] })}
-              onScrub={(v) => emit({ pos: [v, pos[1], pos[2]] })}
+              onCommit={(v) => emitPos([v, pos[1], pos[2]])}
+              onScrub={(v) => emitPos([v, pos[1], pos[2]])}
             />
             <NumberField
               axis="Y"
               value={pos[1]}
-              onCommit={(v) => emit({ pos: [pos[0], v, pos[2]] })}
-              onScrub={(v) => emit({ pos: [pos[0], v, pos[2]] })}
+              onCommit={(v) => emitPos([pos[0], v, pos[2]])}
+              onScrub={(v) => emitPos([pos[0], v, pos[2]])}
             />
             <NumberField
               axis="Z"
               value={pos[2]}
-              onCommit={(v) => emit({ pos: [pos[0], pos[1], v] })}
-              onScrub={(v) => emit({ pos: [pos[0], pos[1], v] })}
+              onCommit={(v) => emitPos([pos[0], pos[1], v])}
+              onScrub={(v) => emitPos([pos[0], pos[1], v])}
             />
           </div>
         </div>
@@ -175,20 +183,20 @@ export function LightInspector({ light, exec }: LightInspectorProps) {
               <NumberField
                 axis="X"
                 value={dir[0]}
-                onCommit={(v) => emit({ dir: [v, dir[1], dir[2]] })}
-                onScrub={(v) => emit({ dir: [v, dir[1], dir[2]] })}
+                onCommit={(v) => emitDir([v, dir[1], dir[2]])}
+                onScrub={(v) => emitDir([v, dir[1], dir[2]])}
               />
               <NumberField
                 axis="Y"
                 value={dir[1]}
-                onCommit={(v) => emit({ dir: [dir[0], v, dir[2]] })}
-                onScrub={(v) => emit({ dir: [dir[0], v, dir[2]] })}
+                onCommit={(v) => emitDir([dir[0], v, dir[2]])}
+                onScrub={(v) => emitDir([dir[0], v, dir[2]])}
               />
               <NumberField
                 axis="Z"
                 value={dir[2]}
-                onCommit={(v) => emit({ dir: [dir[0], dir[1], v] })}
-                onScrub={(v) => emit({ dir: [dir[0], dir[1], v] })}
+                onCommit={(v) => emitDir([dir[0], dir[1], v])}
+                onScrub={(v) => emitDir([dir[0], dir[1], v])}
               />
             </div>
           </div>
@@ -199,8 +207,8 @@ export function LightInspector({ light, exec }: LightInspectorProps) {
             <NumberField
               value={sphereRadius}
               min={0.0001}
-              onCommit={(v) => emit({ radius: v })}
-              onScrub={(v) => emit({ radius: v })}
+              onCommit={(v) => emitSize(v)}
+              onScrub={(v) => emitSize(v)}
             />
           </div>
         )}
@@ -211,8 +219,8 @@ export function LightInspector({ light, exec }: LightInspectorProps) {
               <NumberField
                 value={uHalfDisplay}
                 min={0.0001}
-                onCommit={(v) => emit({ uHalf: v })}
-                onScrub={(v) => emit({ uHalf: v })}
+                onCommit={(v) => emitUHalf(v)}
+                onScrub={(v) => emitUHalf(v)}
               />
             </div>
             <div className="insp-row">
@@ -220,8 +228,8 @@ export function LightInspector({ light, exec }: LightInspectorProps) {
               <NumberField
                 value={v_half}
                 min={0.0001}
-                onCommit={(v) => emit({ vHalf: v })}
-                onScrub={(v) => emit({ vHalf: v })}
+                onCommit={(v) => emitSize(v)}
+                onScrub={(v) => emitSize(v)}
               />
             </div>
           </>
@@ -238,8 +246,8 @@ export function LightInspector({ light, exec }: LightInspectorProps) {
           <label>Intensity</label>
           <ColorField
             value={intensity}
-            onCommit={(rgb) => emit({ intensity: rgb })}
-            onScrub={(rgb) => emit({ intensity: rgb })}
+            onCommit={(rgb) => emitIntensity(rgb)}
+            onScrub={(rgb) => emitIntensity(rgb)}
             allowHdr
           />
         </div>
@@ -253,8 +261,8 @@ export function LightInspector({ light, exec }: LightInspectorProps) {
                 max={89.99}
                 step={0.1}
                 precision={2}
-                onCommit={(v) => emit({ outerDeg: v })}
-                onScrub={(v) => emit({ outerDeg: v })}
+                onCommit={(v) => emitCone(innerDeg, v)}
+                onScrub={(v) => emitCone(innerDeg, v)}
               />
             </div>
             <div className="insp-row">
@@ -265,8 +273,8 @@ export function LightInspector({ light, exec }: LightInspectorProps) {
                 max={89.99}
                 step={0.1}
                 precision={2}
-                onCommit={(v) => emit({ innerDeg: v })}
-                onScrub={(v) => emit({ innerDeg: v })}
+                onCommit={(v) => emitCone(v, outerDeg)}
+                onScrub={(v) => emitCone(v, outerDeg)}
               />
             </div>
           </>
