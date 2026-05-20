@@ -497,6 +497,32 @@ namespace cvar {
             "this (folding/pinching crests). Lower = less foam, higher = "
             "more spray. Only meaningful when r_ocean_choppiness > 0.",
             CVAR_ARCHIVE);
+    // --- Wave 9 ocean-foam ---------------------------------------------------
+    PT_CVAR(r_ocean_foam_amount, "1.0",
+            "Ocean foam intensity (wave-9). Multiplies the combined "
+            "crest-fold + whitecap foam coverage before it is shaded as a "
+            "bright near-white Lambertian froth. 1 = physical [0,1] "
+            "coverage; >1 spreads brighter, broader foam; 0 disables foam "
+            "(the surface stays a clean specular sea). Only meaningful with "
+            "r_ocean 1.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_ocean_foam_persistence, "0.92",
+            "Ocean foam persistence / lifetime in [0, 1) (wave-9). Foam "
+            "lingers after a crest breaks: each frame the accumulated foam "
+            "decays by persistence^(dt*60) and is re-maxed with fresh foam, "
+            "so a passing crest leaves a fading streak. 0 = no memory "
+            "(instantaneous foam, the wave-8 look); 0.92 ~= a few-second "
+            "trail. Clamped to [0, 0.999].",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_ocean_foam_coverage, "1.0",
+            "Ocean whitecap-coverage gain (wave-9). Scales the wind-driven "
+            "foam that grows with wind speed: real seas show ~no whitecaps "
+            "below ~7 m/s and a sharp rise above it (Monahan/Wu). 1 = the "
+            "reference Beaufort ramp; >1 pushes whitecaps onto lower-wind "
+            "seas; 0 removes the wind term (crest-fold foam only). Ties to "
+            "r_ocean_wind_speed.",
+            CVAR_ARCHIVE);
+    // --- end Wave 9 ocean-foam -----------------------------------------------
     PT_CVAR(r_ocean_grid_size, "256",
             "Ocean FFT grid resolution (#25), a power of two (clamped to "
             "{64,128,256,512}). 256 is the Tessendorf reference default. "
@@ -7171,6 +7197,18 @@ void Engine::RenderFrame() {
         // One uvec4 = 16 B.
         std::uint32_t mesh_tex_indices[4];
         // --- end Wave 8 PBR ----------------------------------------------
+        // --- Wave 9 ocean-foam -------------------------------------------
+        // FFT-ocean foam shading params. One vec4 = 16 B, appended at the
+        // very end so existing field offsets are untouched.
+        //   .x = foam_amount (intensity multiplier; the CPU solver already
+        //        bakes this into the displacement.w coverage, so the shader
+        //        uses it only to widen the foam-blend threshold a touch as
+        //        intensity rises -- 0 here lets the shader fully skip foam).
+        //   .y = foam_coverage gain (informational / future use; the wind
+        //        ramp is applied CPU-side into displacement.w).
+        //   .zw reserved (0).
+        float ocean_foam_params[4];
+        // --- end Wave 9 ocean-foam ---------------------------------------
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -8348,6 +8386,25 @@ void Engine::RenderFrame() {
         push.ocean_params1[1] = static_cast<float>(ocean_tex_grid_);
         push.ocean_params1[2] = 0.0f;
         push.ocean_params1[3] = 0.0f;
+
+        // --- Wave 9 ocean-foam ---------------------------------------------
+        // The CPU solver already bakes foam_amount + the wind-coverage ramp
+        // into the displacement.w channel, so the shader needs only these
+        // tuning hints. foam_amount widens the foam-blend threshold a touch
+        // as intensity rises (so high intensity reads as broader froth, not
+        // just brighter), and 0 lets the shader skip the foam blend entirely
+        // (clean specular sea -- handy for A/B and bit-stable off-foam).
+        float foam_amt = 1.0f;
+        if (auto* v = C.FindCVar("r_ocean_foam_amount")) foam_amt = v->GetFloat();
+        if (foam_amt < 0.0f) foam_amt = 0.0f;
+        float foam_cov = 1.0f;
+        if (auto* v = C.FindCVar("r_ocean_foam_coverage")) foam_cov = v->GetFloat();
+        if (foam_cov < 0.0f) foam_cov = 0.0f;
+        push.ocean_foam_params[0] = ocean_on ? foam_amt : 0.0f;
+        push.ocean_foam_params[1] = foam_cov;
+        push.ocean_foam_params[2] = 0.0f;
+        push.ocean_foam_params[3] = 0.0f;
+        // --- end Wave 9 ocean-foam -----------------------------------------
     }
     // --- end Wave 8 ocean --------------------------------------------------
     // --- Wave 8 PBR (#26) -- mesh material texture tiles -------------------
@@ -8529,10 +8586,13 @@ void Engine::RenderFrame() {
     //                               march_steps/grid/_/_)
     //   +16 Wave 8 PBR (#26) — mesh_tex_indices uvec4 (albedo, normal,
     //                              roughness, metallic mesh-material tiles)
+    //   +16 Wave 9 ocean-foam — ocean_foam_params vec4 (foam_amount,
+    //                              foam_coverage gain, _reserved, _reserved)
     static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 32 + 16
                   + 16 /* Wave 8 spectral (#27): spectral_params */
                   + 32 /* Wave 8 ocean (#25): ocean_params0 + ocean_params1 */
-                  + 16 /* Wave 8 PBR (#26): mesh_tex_indices */);
+                  + 16 /* Wave 8 PBR (#26): mesh_tex_indices */
+                  + 16 /* Wave 9 ocean-foam: ocean_foam_params */);
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
     // cbuffer layout the Slang compiler applies to PathTrace.slang's
@@ -19427,6 +19487,22 @@ void Engine::StepOcean(float dt) {
     if (auto* v = C.FindCVar("r_ocean_foam_threshold")) {
         cfg.foam_threshold = v->GetFloat();
     }
+    // --- Wave 9 ocean-foam ---------------------------------------------------
+    if (auto* v = C.FindCVar("r_ocean_foam_amount")) {
+        const float fa = v->GetFloat();
+        cfg.foam_amount = (fa >= 0.0f) ? fa : 0.0f;
+    }
+    if (auto* v = C.FindCVar("r_ocean_foam_persistence")) {
+        float fp = v->GetFloat();
+        if (fp < 0.0f)    fp = 0.0f;
+        if (fp > 0.999f)  fp = 0.999f;
+        cfg.foam_persistence = fp;
+    }
+    if (auto* v = C.FindCVar("r_ocean_foam_coverage")) {
+        const float fc = v->GetFloat();
+        cfg.foam_coverage = (fc >= 0.0f) ? fc : 0.0f;
+    }
+    // --- end Wave 9 ocean-foam -----------------------------------------------
     if (auto* v = C.FindCVar("r_ocean_grid_size")) {
         int g = v->GetInt();
         // Snap to the nearest supported power-of-two in {64,128,256,512}.

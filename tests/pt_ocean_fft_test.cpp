@@ -52,6 +52,17 @@ float RmsHeight(const std::vector<float>& disp) {
     }
     return n ? static_cast<float>(std::sqrt(sum2 / static_cast<double>(n))) : 0.0f;
 }
+
+// Mean foam coverage over the grid (disp .w / index 3 channel).
+float MeanFoam(const std::vector<float>& disp) {
+    double sum = 0.0;
+    std::size_t n = 0;
+    for (std::size_t i = 0; i < disp.size(); i += 4) {
+        sum += disp[i + 3];
+        ++n;
+    }
+    return n ? static_cast<float>(sum / static_cast<double>(n)) : 0.0f;
+}
 }  // namespace
 
 TEST_CASE("OceanFFT::Update fills correctly-sized finite buffers") {
@@ -160,6 +171,74 @@ TEST_CASE("OceanFFT higher wind => larger RMS wave height") {
     const float rms_gale = RmsHeight(gale.DisplacementRGBA());
     CHECK(rms_gale > rms_calm);
 }
+
+// --- Wave 9 ocean-foam -----------------------------------------------------
+TEST_CASE("OceanFFT higher wind => more whitecap foam coverage") {
+    // Monahan/Wu: whitecap fractional area is ~0 in light air and rises
+    // sharply past the ~7 m/s onset. With the choppy Jacobian fold disabled
+    // (choppiness ~0), the only foam source is the wind-coverage term, so a
+    // stronger wind must lift the mean foam coverage. Same seed/grid -> the
+    // only varying input is the wind speed.
+    OceanFFT calm, gale;
+    for (auto* o : {&calm, &gale}) {
+        o->MutableConfig().grid_size       = 128;
+        o->MutableConfig().choppiness      = 0.0f;   // no Jacobian-fold foam
+        o->MutableConfig().foam_persistence = 0.0f;  // instantaneous (no trail)
+        o->MutableConfig().foam_amount     = 1.0f;
+        o->MutableConfig().foam_coverage   = 1.0f;
+    }
+    calm.MutableConfig().wind_speed = 4.0f;   // below whitecap onset
+    gale.MutableConfig().wind_speed = 20.0f;  // strong gale
+    calm.Update(1.0);
+    gale.Update(1.0);
+    const float foam_calm = MeanFoam(calm.DisplacementRGBA());
+    const float foam_gale = MeanFoam(gale.DisplacementRGBA());
+    CHECK(foam_gale > foam_calm);
+    // The light-air sea should be (near-)foamless from the wind term alone.
+    CHECK(foam_calm < 0.05f);
+}
+
+TEST_CASE("OceanFFT foam persistence leaves a fading trail") {
+    // Foam should linger after a crest unfolds rather than vanishing the
+    // instant the Jacobian relaxes. Warm a choppy sea so foam accumulates,
+    // then advance time by a small dt with foam generation suppressed
+    // (amplitude 0 collapses the surface -> no fresh foam): with persistence
+    // ON the accumulated foam must survive (decayed but > 0), and the decayed
+    // value must be strictly less than the pre-decay coverage.
+    OceanFFT o;
+    o.MutableConfig().grid_size       = 64;
+    o.MutableConfig().choppiness      = 1.3f;
+    o.MutableConfig().foam_persistence = 0.92f;
+    o.Update(0.0);
+    o.Update(0.10);   // dt = 0.10 s -- warm a developed, foamy sea
+    const float foam_before = MeanFoam(o.DisplacementRGBA());
+    REQUIRE(foam_before > 0.0f);
+    // Kill fresh foam generation (flat surface => no Jacobian fold, no wind
+    // crest) but keep stepping time: only the persistence trail remains.
+    o.MutableConfig().amplitude    = 0.0f;
+    o.MutableConfig().foam_coverage = 0.0f;   // also drop the wind term
+    o.Update(0.12);   // dt = 0.02 s -> one frame of decay, no new foam
+    const float foam_after = MeanFoam(o.DisplacementRGBA());
+    CHECK(foam_after > 0.0f);            // foam lingered (didn't blink off)
+    CHECK(foam_after < foam_before);     // but faded
+}
+
+TEST_CASE("OceanFFT foam_amount 0 => no foam") {
+    // The intensity dial at 0 must produce a clean, foamless sea regardless
+    // of choppiness / wind (the shader also skips the foam blend, but the
+    // CPU coverage should already be zero).
+    OceanFFT o;
+    o.MutableConfig().grid_size  = 64;
+    o.MutableConfig().choppiness = 1.4f;
+    o.MutableConfig().wind_speed = 20.0f;
+    o.MutableConfig().foam_amount = 0.0f;
+    o.Update(2.0);
+    const auto& disp = o.DisplacementRGBA();
+    for (std::size_t i = 0; i < disp.size(); i += 4) {
+        CHECK(disp[i + 3] == doctest::Approx(0.0f).epsilon(1e-6f));
+    }
+}
+// --- end Wave 9 ocean-foam -------------------------------------------------
 
 TEST_CASE("OceanFFT MaxDisplacementY tracks the height field") {
     OceanFFT o;

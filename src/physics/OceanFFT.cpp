@@ -282,20 +282,81 @@ void OceanFFT::Update(double t_seconds) {
     // pinching -- accumulate foam there. Uses central differences of the
     // already-packed lateral displacement field (wraps at the tile edge
     // because the field is periodic).
-    if (lambda > 0.0f) {
-        for (std::uint32_t iy = 0u; iy < N; ++iy) {
-            const std::uint32_t yp = (iy + 1u) % N;
-            const std::uint32_t ym = (iy + N - 1u) % N;
-            for (std::uint32_t ix = 0u; ix < N; ++ix) {
-                const std::uint32_t xp = (ix + 1u) % N;
-                const std::uint32_t xm = (ix + N - 1u) % N;
-                const std::size_t c  = static_cast<std::size_t>(iy) * N + ix;
-                const std::size_t rx = static_cast<std::size_t>(iy) * N + xp;
-                const std::size_t lx = static_cast<std::size_t>(iy) * N + xm;
-                const std::size_t uz = static_cast<std::size_t>(yp) * N + ix;
-                const std::size_t dz = static_cast<std::size_t>(ym) * N + ix;
+    //
+    // --- Wave 9 ocean-foam (#27 sibling) -------------------------------------
+    // Three additions over the Wave 8 instantaneous-Jacobian foam:
+    //   1. Wind-driven whitecap coverage. Real oceanography (Monahan 1980,
+    //      Wu 1979): whitecap fractional area W is ~0 in light air and rises
+    //      sharply past the ~7 m/s whitecap-onset wind. We model a smooth
+    //      [0,1] coverage bias `wind_cov` that lifts the foam floor on the
+    //      wave crests as wind increases, gated by the local (normalised)
+    //      crest height so the froth concentrates on the tops of waves
+    //      rather than smearing across troughs.
+    //   2. foam_amount intensity multiplier on the combined foam.
+    //   3. Temporal persistence: foam lingers after a crest breaks. We keep
+    //      a per-cell accumulation buffer, decay it by foam_persistence^dt
+    //      each frame, and re-max it with the fresh instantaneous foam, so
+    //      a passing crest leaves a fading streak (matching how real
+    //      whitecaps dissipate over seconds rather than vanishing instantly).
+    const float foam_amount   = std::max(cfg_.foam_amount, 0.0f);
+    const float foam_cov_gain = std::max(cfg_.foam_coverage, 0.0f);
+    const float persistence   = std::clamp(cfg_.foam_persistence, 0.0f, 0.999f);
 
-                // d(Dx)/dx, d(Dx)/dz, d(Dz)/dx, d(Dz)/dz.
+    // Whitecap-onset coverage ramp. Centred on kWhitecapOnsetMps (~7 m/s,
+    // the Beaufort-4/5 threshold where whitecaps become widespread); the
+    // smoothstep over [onset-width, onset+width] gives the characteristic
+    // sharp rise. `foam_coverage` scales the result and can push the onset
+    // earlier (>1) or remove the wind term entirely (0).
+    constexpr float kWhitecapOnsetMps = 7.0f;
+    constexpr float kWhitecapWidthMps = 5.0f;
+    const float ws = cfg_.wind_speed;
+    float wind_cov = (ws - (kWhitecapOnsetMps - kWhitecapWidthMps)) /
+                     (2.0f * kWhitecapWidthMps);
+    wind_cov = std::clamp(wind_cov, 0.0f, 1.0f);
+    wind_cov = wind_cov * wind_cov * (3.0f - 2.0f * wind_cov);  // smoothstep
+    wind_cov *= foam_cov_gain;
+    wind_cov = std::clamp(wind_cov, 0.0f, 1.0f);
+
+    // Per-frame dt for the persistence decay. Update() takes ABSOLUTE sim
+    // time, so the dt is the delta from the previous call. First frame (or
+    // a backward/zero step, e.g. a paused sim) seeds with no decay.
+    float dt = (last_t_ >= 0.0) ? static_cast<float>(t_seconds - last_t_) : 0.0f;
+    if (dt < 0.0f) dt = 0.0f;
+    last_t_ = t_seconds;
+    // decay = persistence^dt, normalised so a frame at ~60 fps (dt~0.0167)
+    // barely fades and a long pause fades fully. Guard persistence==0 ->
+    // decay 0 (pure instantaneous foam, the Wave 8 behaviour).
+    const float decay = (persistence > 0.0f) ? std::pow(persistence, dt * 60.0f)
+                                             : 0.0f;
+
+    // (Re)size the persistence buffer; reset on a grid-size change.
+    if (foam_accum_.size() != cells) {
+        foam_accum_.assign(cells, 0.0f);
+    }
+
+    // Crest-height normaliser for the wind-coverage gate: bias foam toward
+    // the upper portion of the wave field. max_disp_y_ is this frame's peak
+    // |height|; cells above ~40% of the peak count as "crest".
+    const float h_norm = (max_disp_y_ > 1e-4f) ? (1.0f / max_disp_y_) : 0.0f;
+
+    for (std::uint32_t iy = 0u; iy < N; ++iy) {
+        const std::uint32_t yp = (iy + 1u) % N;
+        const std::uint32_t ym = (iy + N - 1u) % N;
+        for (std::uint32_t ix = 0u; ix < N; ++ix) {
+            const std::uint32_t xp = (ix + 1u) % N;
+            const std::uint32_t xm = (ix + N - 1u) % N;
+            const std::size_t c  = static_cast<std::size_t>(iy) * N + ix;
+            const std::size_t rx = static_cast<std::size_t>(iy) * N + xp;
+            const std::size_t lx = static_cast<std::size_t>(iy) * N + xm;
+            const std::size_t uz = static_cast<std::size_t>(yp) * N + ix;
+            const std::size_t dz = static_cast<std::size_t>(ym) * N + ix;
+
+            // Instantaneous Jacobian-fold foam (Wave 8). Only meaningful when
+            // the choppy lateral displacement is active (lambda > 0); a
+            // round-swell sea (lambda == 0) never folds, so its foam comes
+            // purely from the wind-coverage term below.
+            float foam_inst = 0.0f;
+            if (lambda > 0.0f) {
                 const float dDxdx = (disp_rgba_[rx * 4u + 0u] - disp_rgba_[lx * 4u + 0u]) / (2.0f * dxz);
                 const float dDxdz = (disp_rgba_[uz * 4u + 0u] - disp_rgba_[dz * 4u + 0u]) / (2.0f * dxz);
                 const float dDzdx = (disp_rgba_[rx * 4u + 2u] - disp_rgba_[lx * 4u + 2u]) / (2.0f * dxz);
@@ -308,12 +369,40 @@ void OceanFFT::Update(double t_seconds) {
 
                 // Foam coverage: 0 above threshold, ramps to 1 as det
                 // crosses zero (full fold). Clamp to [0, 1].
-                float foam = (foam_thresh - det) / std::max(foam_thresh, 1e-3f);
-                foam = std::clamp(foam, 0.0f, 1.0f);
-                disp_rgba_[c * 4u + 3u] = foam;
+                foam_inst = (foam_thresh - det) / std::max(foam_thresh, 1e-3f);
+                foam_inst = std::clamp(foam_inst, 0.0f, 1.0f);
             }
+
+            // Wind-driven whitecap contribution, gated by crest height: a
+            // smooth [0,1] ramp over the top 60% of the wave field, scaled
+            // by the wind coverage. This is the "whitecaps grow with wind"
+            // term -- it adds froth to crests even where the Jacobian hasn't
+            // folded, and rises sharply once wind passes the onset speed.
+            float wind_foam = 0.0f;
+            if (wind_cov > 0.0f && h_norm > 0.0f) {
+                const float hn = disp_rgba_[c * 4u + 1u] * h_norm;  // height / peak, ~[-1,1]
+                float crest = (hn - 0.4f) / 0.6f;                   // 0 at 40% peak -> 1 at peak
+                crest = std::clamp(crest, 0.0f, 1.0f);
+                crest = crest * crest * (3.0f - 2.0f * crest);      // smoothstep
+                wind_foam = wind_cov * crest;
+            }
+
+            // Combine: the stronger of the two foam sources, lifted by the
+            // intensity dial. Both are physically "fraction of surface that
+            // is froth", so a max (not a sum) keeps coverage in [0,1].
+            float foam_now = std::max(foam_inst, wind_foam) * foam_amount;
+            foam_now = std::clamp(foam_now, 0.0f, 1.0f);
+
+            // Temporal persistence: decay the trail, re-max with the live
+            // foam. The accumulated value (clamped) is what the shader reads.
+            float acc = foam_accum_[c] * decay;
+            acc = std::max(acc, foam_now);
+            acc = std::clamp(acc, 0.0f, 1.0f);
+            foam_accum_[c] = acc;
+            disp_rgba_[c * 4u + 3u] = acc;
         }
     }
+    // --- end Wave 9 ocean-foam -----------------------------------------------
 }
 
 }  // namespace pt::ocean
