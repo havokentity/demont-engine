@@ -892,6 +892,38 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
         MAX_DELTA 64 MEAN_DELTA 8 FAIL_PERCENT 5
         EXTRA "pt_smoke_late_exec ${CMAKE_SOURCE_DIR}/tests/goldens/scenes/motion_blur_mesh_late.cfg")
     # --- end Mesh motion blur fixture -------------------------------------
+
+    # --- Wave 8 spectral dispersion (#27) ---------------------------------
+    # Glass-sphere prism with r_spectral 1: per-ray hero-wavelength
+    # sampling refracts each wavelength by its own Cauchy IOR, producing
+    # chromatic fringing on the glass + a dispersed (rainbow) caustic.
+    # Metal golden cell (the acceptance target). Tolerances are widened
+    # like the SDF / smoke cells because the hero-wavelength estimator
+    # is a stochastic single-wavelength-per-path integrator -- its 1-spp
+    # noise floor over 64 accumulated frames is higher than the
+    # achromatic dielectric path, and the per-channel spectral weight
+    # amplifies tiny cross-backend FP-order deltas. The cell guards the
+    # dispersion pipeline end-to-end (Cauchy IOR + CIE reconstruction);
+    # the achromatic-glass regression is already covered bit-for-bit by
+    # the cornell_csg cells (r_spectral defaults to 0).
+    pt_add_golden_cell(SCENE spectral_prism BACKEND metal DENOISER off
+        MAX_DELTA 48 MEAN_DELTA 6 FAIL_PERCENT 4)
+    # --- end Wave 8 spectral dispersion -----------------------------------
+
+    # --- Wave 8 thin-lens depth of field (#27) ----------------------------
+    # Row of emissive spheres receding from the camera; only the middle
+    # sphere sits on the focus plane (sharp), the rest blur into bokeh
+    # discs with strength proportional to their distance from focus.
+    # Metal golden cell. The fixture sets photographic params (85mm
+    # f/2.0, focus 7.23 m) and r_spp 8 because thin-lens DOF integrates
+    # over the aperture disc -- each sample lands on a different lens
+    # point, so the defocus regions need more samples per frame to
+    # settle. Tolerances widened like the other stochastic cells; the
+    # pinhole regression (r_dof 0 -> every sphere sharp) is the default
+    # path already covered bit-for-bit by cornell_csg / the other cells.
+    pt_add_golden_cell(SCENE dof_bokeh BACKEND metal DENOISER off
+        MAX_DELTA 48 MEAN_DELTA 6 FAIL_PERCENT 4)
+    # --- end Wave 8 thin-lens depth of field ------------------------------
 else()
     message(STATUS
         "tests: golden-image matrix skipped -- pt_render_one_frame and/or "

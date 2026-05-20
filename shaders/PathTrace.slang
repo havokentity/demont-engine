@@ -573,6 +573,17 @@ cbuffer Push {
     //        iris -> polygonal bokeh).
     //   .w reserved.
     float4 dof_params;
+    // --- Wave 8 spectral (#27) ---
+    // Spectral dispersion (hero-wavelength) parameters.
+    //   .x = enabled flag (0 = achromatic RGB dielectric path, bit-stable
+    //        with pre-#27 goldens; 1 = per-ray hero-wavelength sampling
+    //        with wavelength-dependent IOR -> real prism dispersion).
+    //   .y = default Cauchy C coefficient in micrometre^2 for dielectric
+    //        materials (crown glass BK7 ~= 0.00420). The material's nominal
+    //        IOR (h.ior) anchors the Cauchy curve at the d-line (587.6 nm).
+    //   .z/.w reserved.
+    float4 spectral_params;
+    // --- end ---
     // Volumetric single-scatter parameters.
     //   .x = extinction coefficient (per world unit). 0 disables.
     //   .y = Henyey-Greenstein anisotropy g in [-1, 1]. +0.7 gives
@@ -1001,6 +1012,10 @@ cbuffer Frame {
     float4 w2j_row1;
     float4 w2j_row2;
     float4 dof_params;
+    // --- Wave 8 spectral (#27) --- see the matching field in the Metal
+    // Push cbuffer above for per-lane semantics. Layout-equivalent.
+    float4 spectral_params;
+    // --- end ---
     float4 vol_params;
     float4 clouds_p1;
     float4 clouds_p2;
@@ -4201,6 +4216,30 @@ void main(uint2 tid : SV_DispatchThreadID) {
         }
         float2 uv = ((float2(tid) + 0.5 + jitter) / float2(dim)) * 2.0 - 1.0;
         uv.y = -uv.y;
+        // --- Wave 8 spectral (#27) ---
+        // Per-ray hero-wavelength sampling. Each path samples ONE wavelength
+        // lambda in [380, 730] nm, stratified across the pixel's spp samples
+        // for fast spectral convergence. The dielectric BSDF (below) bends
+        // that wavelength by its own Cauchy IOR -> dispersion; the path's
+        // RGB radiance is then weighted by the CIE-derived per-wavelength
+        // sRGB response (spectral_weight) so averaging many wavelengths
+        // reconstructs full colour. spectral_weight is normalised so a flat
+        // (non-dispersive) spectrum reconstructs the achromatic RGB image in
+        // expectation -- which is why spectral mode only diverges from the
+        // RGB path where IOR actually varies with lambda.
+        //
+        // Strict bit-stability when OFF: the heroWavelength() call consumes
+        // one randf(seed) draw, so it is gated entirely behind the host flag.
+        // With spectral off, hero_lambda stays at the sentinel, the dielectric
+        // path uses h.ior unchanged, spectral_weight is (1,1,1), and NO extra
+        // seed draw happens -- the legacy RGB path is preserved bit-for-bit.
+        float  hero_lambda    = -1.0;          // <0 sentinel = spectral off
+        float3 spectral_weight = float3(1.0);
+        if (spectral_params.x > 0.5) {
+            hero_lambda     = heroWavelength(s, sample_count, seed);
+            spectral_weight = spectralWeightSRGB(hero_lambda);
+        }
+        // --- end ---
         // Motion blur (#85): pick a uniform shutter-time sample per ray.
         // 0 = beginning of the shutter window, 1 = end. When the host
         // gate is off (motion_blur_params.x == 0) we pin t01 to 1.0 so
@@ -4954,8 +4993,24 @@ void main(uint2 tid : SV_DispatchThreadID) {
             prev_was_lambert_nee = false;   // specular bounce: MIS doesn't apply here
         }
         else if (h.mat == MAT_DIELECTRIC) {
-            float ior_a = (ndi < 0.0) ? 1.0   : h.ior;
-            float ior_b = (ndi < 0.0) ? h.ior : 1.0;
+            // --- Wave 8 spectral (#27) ---
+            // Wavelength-dependent index of refraction. When spectral mode
+            // is off (hero_lambda < 0), mat_ior == h.ior exactly so this
+            // branch is bit-identical to the pre-#27 achromatic path. When
+            // on, the material's nominal IOR (h.ior, taken as the index at
+            // the d-line) anchors a real Cauchy curve and the hero
+            // wavelength reads its own index off it -- shorter wavelengths
+            // get a higher index and bend more, which is dispersion. The
+            // default Cauchy C (spectral_params.y, BK7 crown glass) governs
+            // the spread; the host could later source a per-material Abbe
+            // number via abbeToCauchyC().
+            float mat_ior = h.ior;
+            if (hero_lambda >= 0.0) {
+                mat_ior = cauchyIOR(h.ior, spectral_params.y, hero_lambda);
+            }
+            // --- end ---
+            float ior_a = (ndi < 0.0) ? 1.0     : mat_ior;
+            float ior_b = (ndi < 0.0) ? mat_ior : 1.0;
             float eta = ior_a / ior_b;
             float cos_i = abs(dot(nf, -rd));
             float r0 = (ior_a - ior_b) / (ior_a + ior_b);
@@ -5768,7 +5823,19 @@ void main(uint2 tid : SV_DispatchThreadID) {
             }
         }
 
-        frame_radiance += radiance;
+        // --- Wave 8 spectral (#27) ---
+        // Fold this path's hero-wavelength radiance into the frame estimate.
+        // With spectral OFF, hero_lambda < 0 so we take the verbatim
+        // pre-#27 accumulation (no multiply) -- bit-stable goldens. With
+        // spectral ON, weight the path's radiance by the wavelength's
+        // normalised CIE sRGB response so the spp-average (and the temporal
+        // accumulator at 1 spp) reconstructs the dispersed colour image.
+        if (hero_lambda >= 0.0) {
+            frame_radiance += radiance * spectral_weight;
+        } else {
+            frame_radiance += radiance;
+        }
+        // --- end ---
     }
     frame_radiance /= float(sample_count);
 

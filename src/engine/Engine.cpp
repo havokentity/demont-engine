@@ -1020,10 +1020,37 @@ namespace cvar {
     // at a random sample on the aperture and aims through the focal-
     // plane intersection of the pinhole ray. Bokeh shape comes from
     // the aperture sampling distribution (round disk vs polygon).
-    PT_CVAR(r_dof,             "0",   "Depth of field. 0 = pinhole camera (everything sharp). 1 = thin-lens with r_dof_aperture / r_dof_focal_distance.", CVAR_ARCHIVE);
-    PT_CVAR(r_dof_aperture,    "0.05","Aperture radius in world units. Bigger = more blur on out-of-focus pixels. Real-camera analogue: focal_length / f_number; e.g. 50mm at f/2.8 ~= 0.018 (assuming the scene is in metres).", CVAR_ARCHIVE);
-    PT_CVAR(r_dof_focal_distance, "5.0", "Distance from camera (world units) where the scene is in perfect focus. Closer / farther pixels get bokeh proportional to their distance from this plane.", CVAR_ARCHIVE);
+    PT_CVAR(r_dof,             "0",   "Depth of field. 0 = pinhole camera (everything sharp). 1 = thin-lens with real photographic params (r_dof_fstop / r_dof_focal_length_mm / r_dof_focus_distance_m).", CVAR_ARCHIVE);
+    // --- Wave 8 DoF (#27) ---
+    // Real photographic thin-lens controls. The entrance-pupil diameter
+    // is focal_length / f-number (the textbook definition of f-stop), so
+    // the world-space lens radius the shader samples is
+    //   lens_radius_m = (focal_length_mm / fstop) / 2 / 1000
+    // since 1 world unit = 1 metre. A 50mm lens at f/2.8 -> ~17.9mm pupil
+    // -> 0.00893 m radius. Smaller f-number = wider pupil = shallower
+    // depth of field (more bokeh). The focus distance is in metres
+    // (= world units) directly. r_dof_aperture below is an optional
+    // manual override for users who want to dial the world-space radius
+    // by hand (0 = derive from fstop + focal length, the default).
+    PT_CVAR(r_dof_fstop,          "2.8", "Lens f-number (f/N). Aperture diameter = focal_length / fstop, so smaller = wider aperture = shallower depth of field + bigger bokeh. Real lenses: f/1.4 (very shallow), f/2.8, f/8 (deep). Only used when r_dof_aperture is 0 (the default derive-from-optics path).", CVAR_ARCHIVE);
+    PT_CVAR(r_dof_focal_length_mm, "50.0", "Lens focal length in millimetres (35 = wide, 50 = normal, 85 = portrait tele). With the f-number, sets the entrance-pupil diameter = focal_length / fstop; the world-space lens radius is half that, in metres (1 world unit = 1 m). Longer focal length at the same f-stop = wider pupil = shallower depth of field.", CVAR_ARCHIVE);
+    PT_CVAR(r_dof_focus_distance_m, "5.0", "Distance from the camera (metres) of the focus plane -- everything at this depth is sharp; nearer / farther blurs proportional to its distance from it. Tip: the dof_focus_here console command sets this to whatever is under the screen centre.", CVAR_ARCHIVE);
+    PT_CVAR(r_dof_aperture,    "0.0", "Manual aperture-radius override in world units (metres). 0 (default) = derive the radius from r_dof_fstop + r_dof_focal_length_mm (the physical path). >0 overrides those with an explicit world-space lens radius, for when you want to dial bokeh by hand.", CVAR_ARCHIVE);
+    PT_CVAR(r_dof_focal_distance, "0.0", "DEPRECATED alias for r_dof_focus_distance_m (kept for old configs / the legacy dof_focus_here writes). 0 = use r_dof_focus_distance_m; >0 overrides it. Prefer r_dof_focus_distance_m.", CVAR_ARCHIVE);
     PT_CVAR(r_dof_blades,      "0",   "Aperture blade count. 0 = perfectly round disk (circular bokeh). 5/6/8 = polygonal iris (matching real lens aperture blades) -- gives polygonal bokeh on out-of-focus highlights.", CVAR_ARCHIVE);
+    // --- end ---
+    // --- Wave 8 spectral (#27) ---
+    // Spectral dispersion for dielectrics. Each path samples one hero
+    // wavelength in [380,730] nm (stratified across the pixel's spp
+    // samples); the dielectric BSDF refracts it with the wavelength-
+    // dependent Cauchy IOR n(lambda) = B + C/lambda^2, so different
+    // wavelengths bend differently -> real prism rainbows + chromatic
+    // glass edges. Spectral radiance is reconstructed to RGB via the CIE
+    // 1931 colour-matching functions (Wyman 2013 analytic fit). Off by
+    // default -> the achromatic RGB dielectric path runs unchanged.
+    PT_CVAR(r_spectral,        "0",   "Spectral dispersion for dielectrics (per-ray hero-wavelength sampling). 0 = achromatic RGB glass (default, bit-stable). 1 = wavelength-dependent refraction via Cauchy IOR -> prism rainbows + chromatic edges on glass. Converges over the temporal accumulator (or spp>1).", CVAR_ARCHIVE);
+    PT_CVAR(r_spectral_cauchy_c, "0.00420", "Default Cauchy C coefficient (micrometre^2) for dielectric dispersion when r_spectral is on. n(lambda) = B + C/lambda^2 with B solved so the curve passes through the material's nominal IOR at the d-line (587.6 nm). Crown glass BK7 ~= 0.00420 (Abbe V_d ~= 64); flint glasses (SF11 ~= 0.0127) disperse more. 0 = achromatic.", CVAR_ARCHIVE);
+    // --- end ---
     // Volumetrics: single-scatter ray march along primary rays, NEE
     // toward sun at each sample. Atmospheric haze + god rays through
     // gaps in geometry (sun shafts).
@@ -6316,6 +6343,17 @@ void Engine::RenderFrame() {
         // distance (world units). .z = aperture blade count (0 =
         // round disk, 3..16 = polygonal iris). .w reserved.
         float dof_params[4];
+        // --- Wave 8 spectral (#27) ---
+        // Spectral dispersion (hero-wavelength) params.
+        //   .x = enabled flag (0 = achromatic RGB dielectric path, bit-
+        //        stable with pre-#27 goldens; 1 = per-ray hero-wavelength
+        //        sampling with Cauchy IOR -> real prism dispersion).
+        //   .y = default Cauchy C coefficient (micrometre^2) for dielectric
+        //        materials; the material's nominal IOR anchors the curve at
+        //        the d-line (587.6 nm). BK7 crown glass ~= 0.00420.
+        //   .z/.w reserved. One vec4 = 16 B (see static_assert sum below).
+        float spectral_params[4];
+        // --- end ---
         // .x = density (0 disables). .y = HG anisotropy. .z =
         // intensity. .w = march sample count (cast to int in shader).
         float vol_params[4];
@@ -7480,18 +7518,73 @@ void Engine::RenderFrame() {
         push.w2j_row1[3] = caustics ? float(refract_bounces) : 0.0f;
     }
 
+    // --- Wave 8 DoF (#27) ---
+    // Thin-lens depth of field with real photographic parameters. The
+    // shader (PathTrace.slang camera-ray block) consumes dof_params as
+    // (lens_radius_world, focus_distance_world, blade_count, _) and does
+    // the concentric-disk / polygon aperture sample + focal-plane
+    // reprojection. The HOST derives the world-space lens radius from
+    // the optics here so the cvars stay photographic:
+    //
+    //   entrance-pupil diameter  = focal_length_mm / fstop      (mm)
+    //   lens_radius (world / m)  = diameter / 2 / 1000          (1 wu = 1 m)
+    //
+    // e.g. 50mm at f/2.8 -> 17.857mm pupil -> 0.008929 m radius. A wider
+    // aperture (lower f-number, longer focal length) gives a larger lens
+    // disc -> stronger out-of-focus blur, exactly as on a real camera.
+    // r_dof_aperture > 0 is a manual world-radius override (skips the
+    // optics); r_dof_focal_distance > 0 is the deprecated focus-distance
+    // alias (the legacy dof_focus_here command + old configs write it).
     {
         bool dof_on = false;
         if (auto* v = C.FindCVar("r_dof")) dof_on = v->GetBool();
-        float aperture = 0.0f, focal_dist = 5.0f, blades = 0.0f;
-        if (auto* v = C.FindCVar("r_dof_aperture"))        aperture   = v->GetFloat();
-        if (auto* v = C.FindCVar("r_dof_focal_distance"))  focal_dist = v->GetFloat();
-        if (auto* v = C.FindCVar("r_dof_blades"))          blades     = float(v->GetInt());
-        push.dof_params[0] = dof_on ? aperture : 0.0f;
-        push.dof_params[1] = focal_dist;
+        float fstop = 2.8f, focal_len_mm = 50.0f, focus_dist = 5.0f;
+        float aperture_override = 0.0f, focus_dist_legacy = 0.0f, blades = 0.0f;
+        if (auto* v = C.FindCVar("r_dof_fstop"))            fstop             = v->GetFloat();
+        if (auto* v = C.FindCVar("r_dof_focal_length_mm"))  focal_len_mm      = v->GetFloat();
+        if (auto* v = C.FindCVar("r_dof_focus_distance_m")) focus_dist        = v->GetFloat();
+        if (auto* v = C.FindCVar("r_dof_aperture"))         aperture_override = v->GetFloat();
+        if (auto* v = C.FindCVar("r_dof_focal_distance"))   focus_dist_legacy = v->GetFloat();
+        if (auto* v = C.FindCVar("r_dof_blades"))           blades            = float(v->GetInt());
+        // Derive the world-space lens radius from f-stop + focal length
+        // unless the manual override is set. Guard the divisor so a
+        // zero / negative f-number can't blow up to an infinite pupil.
+        float lens_radius;
+        if (aperture_override > 0.0f) {
+            lens_radius = aperture_override;
+        } else if (fstop > 0.0f && focal_len_mm > 0.0f) {
+            lens_radius = (focal_len_mm / fstop) * 0.5f / 1000.0f;
+        } else {
+            lens_radius = 0.0f;   // degenerate optics -> pinhole (no DoF)
+        }
+        // Deprecated focal-distance alias wins when explicitly set (>0).
+        float focus = (focus_dist_legacy > 0.0f) ? focus_dist_legacy : focus_dist;
+        push.dof_params[0] = dof_on ? lens_radius : 0.0f;
+        push.dof_params[1] = focus;
         push.dof_params[2] = blades;
         push.dof_params[3] = 0.0f;
     }
+    // --- end ---
+
+    // --- Wave 8 spectral (#27) ---
+    // Spectral dispersion gate. When r_spectral is off, spectral_params.x
+    // stays 0.0 so PathTrace.slang takes the verbatim achromatic dielectric
+    // path (no extra seed draw, weight (1,1,1)) -- existing goldens are
+    // preserved bit-for-bit. The Cauchy C coefficient defaults to BK7 crown
+    // glass and is clamped non-negative (a negative C would invert the
+    // dispersion direction, which is unphysical for normal-dispersion glass).
+    {
+        bool  spectral_on = false;
+        if (auto* v = C.FindCVar("r_spectral")) spectral_on = v->GetBool();
+        float cauchy_c = 0.00420f;
+        if (auto* v = C.FindCVar("r_spectral_cauchy_c")) cauchy_c = v->GetFloat();
+        if (cauchy_c < 0.0f) cauchy_c = 0.0f;
+        push.spectral_params[0] = spectral_on ? 1.0f : 0.0f;
+        push.spectral_params[1] = cauchy_c;
+        push.spectral_params[2] = 0.0f;
+        push.spectral_params[3] = 0.0f;
+    }
+    // --- end ---
 
     {
         bool  vol_on  = false;
@@ -7959,7 +8052,13 @@ void Engine::RenderFrame() {
     //                              curr_translation.xyz + _pad
     //   +16 Smoke SPH Phase 3 (#22 wave-7) — smoke_sph_params vec4 (count, mode,
     //                              density_floor, capacity)
-    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 32 + 16);
+    //   +16 Wave 8 spectral (#27) — spectral_params vec4 (enabled, cauchy_c,
+    //                              _reserved, _reserved). Inserted in the
+    //                              struct between dof_params and vol_params;
+    //                              added here as a trailing +16 since the
+    //                              assert only checks the total byte size.
+    static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 32 + 16
+                  + 16 /* Wave 8 spectral (#27): spectral_params */);
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
     // cbuffer layout the Slang compiler applies to PathTrace.slang's
@@ -7975,6 +8074,12 @@ void Engine::RenderFrame() {
     // slip the std140 layout out from under the shader.
     static_assert(offsetof(PtPush, clouds_p4) % 16 == 0,
                   "PtPush::clouds_p4 must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    // Wave 8 spectral (#27): spectral_params sits between dof_params and
+    // vol_params; both neighbours are vec4-sized so it stays 16-byte
+    // aligned, but guard explicitly so a future re-order can't slip it.
+    static_assert(offsetof(PtPush, spectral_params) % 16 == 0,
+                  "PtPush::spectral_params must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     static_assert(offsetof(PtPush, accum_params) % 16 == 0,
                   "PtPush::accum_params must be 16-byte aligned to match "
@@ -12419,7 +12524,7 @@ void Engine::RegisterCommands() {
 
     C.RegisterCommand("dof_focus_here",
         "Auto-focus DOF on whatever's at the centre of the screen. "
-        "Writes the hit distance into r_dof_focal_distance and turns "
+        "Writes the hit distance into r_dof_focus_distance_m and turns "
         "r_dof on if it wasn't already.",
         [this](auto args, pt::console::Output& out) {
             (void)args;
@@ -12460,10 +12565,16 @@ void Engine::RegisterCommands() {
             }
 
             auto& C2 = pt::console::Console::Get();
-            C2.SetCVarOverride("r_dof_focal_distance", std::to_string(best_t));
+            // Wave 8 DoF (#27): write the canonical metric focus-distance
+            // cvar (r_dof_focus_distance_m). Also clear the deprecated
+            // r_dof_focal_distance alias so a stale value from an old
+            // config can't override the fresh tap-to-focus pick (the
+            // engine prefers the legacy alias when it is > 0).
+            C2.SetCVarOverride("r_dof_focus_distance_m", std::to_string(best_t));
+            C2.SetCVarOverride("r_dof_focal_distance", "0");
             C2.SetCVarOverride("r_dof", "1");
             accum_dirty_ = true;
-            out.FormatLine("dof_focus_here: focal distance set to {:.3f} (r_dof on)",
+            out.FormatLine("dof_focus_here: focus distance set to {:.3f} m (r_dof on)",
                            best_t);
         });
 
@@ -12933,6 +13044,19 @@ void Engine::RegisterCommands() {
         v->allowed_values = {"0", "1"};
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
+    // --- Wave 8 DoF (#27): reset the accumulator when any thin-lens
+    // parameter changes (the lens-disc geometry shifts, so the
+    // accumulated bokeh would otherwise smear across the change).
+    if (auto* v = C.FindCVar("r_dof_fstop")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    if (auto* v = C.FindCVar("r_dof_focal_length_mm")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    if (auto* v = C.FindCVar("r_dof_focus_distance_m")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    // --- end ---
     if (auto* v = C.FindCVar("r_dof_aperture")) {
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
@@ -13585,8 +13709,12 @@ void Engine::RegisterCommands() {
     set_slider("cam_speed",         0.1f,   30.0f,  0.1f);
     set_slider("cam_sprint_mult",   1.0f,   10.0f,  0.1f);
     set_slider("cam_sensitivity",   0.01f,   1.0f,  0.01f);
+    // Wave 8 DoF (#27): photographic thin-lens sliders (primary controls).
+    set_slider("r_dof_fstop",            0.7f,  22.0f,  0.1f);
+    set_slider("r_dof_focal_length_mm", 12.0f, 200.0f,  1.0f);
+    set_slider("r_dof_focus_distance_m", 0.1f, 100.0f,  0.1f);
     set_slider("r_dof_aperture",        0.0f,   1.0f,  0.001f);
-    set_slider("r_dof_focal_distance",  0.1f, 100.0f,  0.1f);
+    set_slider("r_dof_focal_distance",  0.0f, 100.0f,  0.1f);
     set_slider("r_dof_blades",          0.0f,  16.0f,  1.0f);
     set_slider("r_volumetric_density",     0.0f,  0.20f, 0.001f);
     set_slider("r_volumetric_anisotropy", -0.95f, 0.95f, 0.01f);
