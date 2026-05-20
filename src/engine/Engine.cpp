@@ -1654,6 +1654,47 @@ namespace cvar {
     PT_CVAR(r_smoke_wind_z,              "0.0",
             "Global horizontal wind velocity (m/s) along +Z applied "
             "to SPH particles (#22).", CVAR_ARCHIVE);
+    // --- Wave 9 sph-3b: curl-noise turbulence ---------------------------------
+    PT_CVAR(r_smoke_curl_strength,       "6.0",
+            "SPH smoke curl-noise turbulence strength (m/s^2, wave-9 "
+            "phase-3b). A divergence-free curl of a procedural noise "
+            "potential is added as a per-particle acceleration so the "
+            "plume folds and billows with believable smoke turbulence "
+            "instead of rising as a uniform blob. 0 disables (the legacy "
+            "wave-8 smooth column). ~6 reads as visible curl without "
+            "overpowering the buoyant rise; > 15 gets chaotic.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_curl_frequency,      "0.35",
+            "SPH curl-noise spatial frequency (1/m, wave-9 phase-3b). "
+            "Eddy size is ~1/freq metres. 0.35 -> ~3 m swirls, matching "
+            "the smoke column width. Higher = finer busier curl; lower = "
+            "broad lazy swirls.", CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_curl_time_rate,      "0.5",
+            "SPH curl-noise time-evolution rate (1/s, wave-9 phase-3b). "
+            "The turbulence field morphs over time so eddies are born, "
+            "drift, and dissipate rather than being a frozen pattern. "
+            "0.5 -> ~2 s eddy life. 0 freezes the field.", CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_curl_lateral_gain,   "1.6",
+            "SPH curl-noise lateral-billow gain (wave-9 phase-3b). "
+            "Amplifies horizontal swirl vs vertical churn so the rising "
+            "column billows outward rather than tumbling randomly in y. "
+            "1.0 = isotropic.", CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_buoyancy_variation,  "0.35",
+            "SPH per-particle buoyancy variation (fraction, wave-9 "
+            "phase-3b). Each particle's lift is scaled by 1 +/- this so "
+            "parcels loft at different rates -- a billowing plume front "
+            "rather than a rigid rising slug. 0 = uniform rise.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_pressure_stiffness,  "1.5",
+            "SPH pressure-EOS stiffness k (wave-9 phase-3b). The Tait "
+            "EOS pressure is p = k*(rho - rho0); higher k = stiffer = "
+            "more inter-particle repulsion = a WIDER, more diffuse "
+            "column. The wave-8 default (5) over-dispersed the plume into "
+            "a thin 30 m-wide haze; 1.5 keeps it a coherent ~10 m "
+            "column. Lower (0.5) reads as a tight dense chimney; higher "
+            "(>5) as a billowing diffuse cloud. Pairs with the bounded "
+            "XSPH viscosity for column coherence.", CVAR_ARCHIVE);
+    // --- end Wave 9 sph-3b ----------------------------------------------------
     // --- end Fluid Phase 3 ----------------------------------------------------
     // --- end Fluid Phase 1 -----------------------------------------------------
     // --- Motion blur (#85) ----------------------------------------------------
@@ -20326,6 +20367,33 @@ void Engine::StepSmokeSPH(float dt) {
     if (auto* v = C.FindCVar("r_smoke_wind_y")) wind_y = v->GetFloat();
     if (auto* v = C.FindCVar("r_smoke_wind_z")) wind_z = v->GetFloat();
     cfg.wind = glm::vec3(wind_x, wind_y, wind_z);
+
+    // --- Wave 9 sph-3b: curl-noise turbulence + buoyancy variation ---------
+    if (auto* v = C.FindCVar("r_smoke_curl_strength")) {
+        const float s = v->GetFloat();
+        cfg.curl_strength = (s >= 0.0f) ? s : 0.0f;
+    }
+    if (auto* v = C.FindCVar("r_smoke_curl_frequency")) {
+        const float f = v->GetFloat();
+        cfg.curl_frequency = (f > 1e-4f) ? f : 1e-4f;
+    }
+    if (auto* v = C.FindCVar("r_smoke_curl_time_rate")) {
+        const float r = v->GetFloat();
+        cfg.curl_time_rate = (r >= 0.0f) ? r : 0.0f;
+    }
+    if (auto* v = C.FindCVar("r_smoke_curl_lateral_gain")) {
+        const float g = v->GetFloat();
+        cfg.curl_lateral_gain = (g >= 0.0f) ? g : 0.0f;
+    }
+    if (auto* v = C.FindCVar("r_smoke_buoyancy_variation")) {
+        const float bv = v->GetFloat();
+        cfg.buoyancy_variation = (bv < 0.0f) ? 0.0f : (bv > 1.0f ? 1.0f : bv);
+    }
+    if (auto* v = C.FindCVar("r_smoke_pressure_stiffness")) {
+        const float k = v->GetFloat();
+        cfg.pressure_stiffness = (k >= 0.0f) ? k : 0.0f;
+    }
+    // --- end Wave 9 sph-3b -------------------------------------------------
 
     // Apply r_smoke_sph_max_particles. SetMaxParticles is idempotent
     // when the value matches.

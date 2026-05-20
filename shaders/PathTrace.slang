@@ -4511,9 +4511,47 @@ float smoke_density_add_tinted(float3 pos, out float3 out_tint) {
 // rather than glowing translucently over it.
 static const float kSphSplatSharp = 3.0;
 static const float kSphSplatGain  = 4.0;
+// --- Wave 9 sph-3b -------------------------------------------------------
+// Phase 3b: the single sharpened Gaussian (Wave 8) still read as a thin
+// radial haze (no opaque body, no recognizable column). The fix is a
+// 2-LOBE splat -- a dense narrow CORE plus a soft wide HALO -- so the
+// plume core goes optically thick (recognizable opaque smoke body) while
+// the edges stay wispy and the halo fills the gaps BETWEEN particles so
+// the column reads as one continuous body rather than a cloud of discrete
+// blobs.
+//
+//   * Core lobe: high amplitude (kSphCoreGain), steep falloff
+//     (kSphCoreSharp) -> a tight, very dense kernel. Summed over the
+//     overlapping near-emitter particles this drives the eye-ray
+//     transmittance through the column core to ~0 (Beer-Lambert
+//     occlusion), which is what makes the body read as solid smoke
+//     instead of a translucent glow over the bright sky.
+//   * Halo lobe: low amplitude (kSphHaloGain), gentle falloff
+//     (kSphHaloSharp) -> a broad soft skirt out to the 3-sigma cutoff.
+//     It bridges inter-particle gaps so the surface stays continuous and
+//     gives the wispy fade at the column edge.
+//
+// The two-lobe sum has a markedly higher peak-to-skirt ratio than a
+// single Gaussian of the same support, which is exactly the "dense core +
+// wispy edge" profile that reads as a plume. Tuned at the smoke_phase3
+// default particle radius; the 3-sigma cutoff (9*rad^2) is unchanged so
+// the per-sample particle culling cost is identical to Wave 8.
+static const float kSphCoreSharp = 7.0;   // steep -> tight dense core
+static const float kSphCoreGain  = 7.0;   // tall   -> optically-thick body
+static const float kSphHaloSharp = 1.1;   // gentle -> broad soft skirt
+static const float kSphHaloGain  = 0.9;   // low    -> wispy continuous edge
 float sph_splat_weight(float u2) {
-    return kSphSplatGain * exp(-kSphSplatSharp * u2);
+    // exp(-7*u2) core for the opaque body + exp(-1.1*u2) halo for the
+    // gap-filling wispy skirt. (Legacy Wave-8 kSphSplatSharp/Gain kept
+    // referenced below so a single-lobe fallback stays trivially
+    // re-derivable.)
+    return kSphCoreGain * exp(-kSphCoreSharp * u2)
+         + kSphHaloGain * exp(-kSphHaloSharp * u2);
 }
+// Reference the Wave-8 constants so they don't warn as unused while the
+// 2-lobe kernel is the active path (kept for documentation / fallback).
+static const float kSphSplatLegacyRef = kSphSplatGain * 0.0 + kSphSplatSharp * 0.0;
+// --- end Wave 9 sph-3b ---------------------------------------------------
 // --- end Wave 8 polish (#28) -----------------------------------------------
 
 float smoke_sph_density_add(float3 pos) {

@@ -17,9 +17,13 @@ namespace pt::sph {
 // Müller 2003 formulation:
 //   * Density via kernel sum over neighbours (poly6).
 //   * Pressure via stiff Tait/EOS: p = k * (rho - rho0).
-//   * Forces: pressure gradient (spiky kernel), viscosity (Müller
-//     laplacian), gravity, thermal buoyancy, optional global wind,
-//     and impulse shockwaves for explosions.
+//   * Forces: pressure gradient (spiky kernel), gravity, thermal
+//     buoyancy, optional global wind + curl-noise turbulence
+//     (wave-9), and impulse shockwaves for explosions.
+//   * Viscosity: bounded XSPH velocity smoothing (wave-9; replaced the
+//     explicit Müller viscosity-laplacian force, which was numerically
+//     unstable at the high mu values smoke wants). The Müller laplacian
+//     kernel is retained as a documented primitive.
 //
 // Spatial hash grid (uniform-cell, bucket-per-cell) for O(N)
 // neighbour lookup. Cell size == kernel radius h. Particles update
@@ -89,11 +93,14 @@ public:
 
         // Pressure stiffness (Tait k). Stiff EOS keeps the column
         // close to rho0 without resorting to a true incompressible
-        // projection. Higher = stiffer = more spring-like. Smoke is
-        // a low-density medium so a soft EOS suffices; 5 reads as
-        // fluid without exploding at the kernel-scaled cell size
-        // we ran into experimentally.
-        float pressure_stiffness = 5.0f;
+        // projection. Higher = stiffer = more spring-like = a WIDER,
+        // more diffuse column (the pressure gradient pushes particles
+        // apart harder). Wave 9 sph-3b lowered the default from 5 to
+        // 1.5: at 5 the inter-particle repulsion over-dispersed the
+        // plume into a thin ~30 m-wide haze; 1.5 keeps it a coherent
+        // ~10 m column that reads as a recognizable dense plume. The
+        // engine overrides via r_smoke_pressure_stiffness.
+        float pressure_stiffness = 1.5f;
 
         // Viscosity mu (kg/m/s). Air mu ~= 1.8e-5; we run several
         // orders higher because (a) the SPH integrator at 120 Hz is
@@ -147,6 +154,56 @@ public:
         // default substep_dt would request 4 substeps; we cap at 8
         // to avoid the death spiral when frames spike.
         int   max_substeps_per_frame = 8;
+
+        // --- Wave 9 sph-3b: turbulence / structure -----------------------
+        // Curl-noise force perturbation (m/s^2). A divergence-free curl of
+        // a procedural value-noise potential field, sampled at the
+        // particle position, is added as a per-particle acceleration. Curl
+        // noise is the canonical way to give particle smoke the rising +
+        // curling structure of real turbulence WITHOUT a full fluid
+        // pressure-projection grid: because curl(F) is divergence-free the
+        // particles swirl and fold but don't spuriously compress or
+        // disperse, so the column keeps its mass while gaining internal
+        // structure. 0 disables (legacy Wave-8 behaviour).
+        //
+        // Strength is in m/s^2 -- it's an acceleration, mass-independent
+        // (like buoyancy/wind), so all particles see the same curl field
+        // regardless of their mass. ~6 m/s^2 reads as visible smoke
+        // turbulence at the spatial scale below without overpowering the
+        // buoyant rise.
+        float curl_strength = 6.0f;
+
+        // Curl-noise spatial frequency (1/m). Sets the size of the
+        // turbulent eddies: 1/freq metres per swirl. Real smoke shows
+        // structure at a range of scales; we use a single dominant scale
+        // ~2-3 m (freq ~0.35) which matches the eddy size that reads as
+        // "smoke curl" at the smoke_phase3 column width. Higher = finer
+        // (busier) curl; lower = broad lazy swirls.
+        float curl_frequency = 0.35f;
+
+        // Curl-noise time evolution rate (1/s). The potential field
+        // animates over time so the turbulence isn't a frozen static
+        // pattern -- eddies are born, drift, and dissipate. 0.5 = the
+        // field morphs on a ~2 s timescale, matching the visual life of a
+        // smoke eddy.
+        float curl_time_rate = 0.5f;
+
+        // Curl vertical-coherence gain (dimensionless). The curl field's
+        // horizontal (xz) components are amplified relative to the
+        // vertical (y) component by this factor so the turbulence
+        // preferentially folds the column SIDEWAYS (lateral billowing)
+        // while the buoyant rise stays coherent vertically -- real
+        // chimney plumes billow outward as they rise rather than churning
+        // randomly in y. 1.0 = isotropic curl.
+        float curl_lateral_gain = 1.6f;
+
+        // Per-particle buoyancy variation (fractional, 0..1). Each
+        // particle's buoyancy_scale is multiplied by (1 +/- this), seeded
+        // deterministically per particle, so the column doesn't rise as a
+        // single rigid slug -- some parcels loft faster, producing the
+        // billowing front of a real plume. 0 = uniform rise (legacy).
+        float buoyancy_variation = 0.35f;
+        // --- end Wave 9 sph-3b -------------------------------------------
     };
 
     // Active shockwave event. Queued via QueueShockwave, applied
@@ -291,6 +348,15 @@ private:
     static float kernel_spiky_grad_coef(float r, float h, float h6);
     static float kernel_visc_laplacian(float r, float h, float h6);
 
+    // --- Wave 9 sph-3b ---
+    // Divergence-free curl-noise sample at world position p (m) and sim
+    // time t (s). Returns an acceleration direction (unit-ish, scaled by
+    // cfg_.curl_strength + lateral gain by the caller). Built as the
+    // analytic curl of a 3-component value-noise potential field so the
+    // result is incompressible (no spurious smoke compression/dispersal).
+    glm::vec3 CurlNoise(const glm::vec3& p, float t) const;
+    // --- end Wave 9 sph-3b ---
+
     // Hash a discrete grid cell (gx, gy, gz) into the bucket table.
     // Uses the standard Müller large-prime hash; bucket count must
     // be coprime with the primes (we round up to next prime).
@@ -307,6 +373,18 @@ private:
     std::vector<float>                      pressure_;
     std::vector<float>                      temperature_;
     std::vector<glm::vec3>                  force_;
+    // --- Wave 9 sph-3b ---
+    // Per-particle buoyancy-bias multiplier (around 1.0), seeded once at
+    // spawn from the emitter RNG so the column rises with parcel-to-parcel
+    // variation rather than as a rigid slug. Lives in a parallel scratch
+    // array (kept out of the 32 B GPU Particle layout, which is full).
+    std::vector<float>                      buoy_bias_;
+    // Per-particle XSPH velocity correction (normalised weighted-mean
+    // neighbour velocity minus own velocity), computed in the force pass
+    // and applied as a bounded convex blend at integration. Stable
+    // replacement for the explicit Müller viscosity force.
+    std::vector<glm::vec3>                  xsph_corr_;
+    // --- end Wave 9 sph-3b ---
 
     // Spatial hash grid. Stored as parallel arrays: bucket_first_[h]
     // is the first index into bucket_next_ for hash h; bucket_next_[i]
