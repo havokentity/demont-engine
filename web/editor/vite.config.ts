@@ -21,6 +21,9 @@ const panels = [
   'toolbar',
   'material-editor',
   'lights',
+  // BEGIN panel: render-settings (wave-10)
+  'render-settings',
+  // END panel: render-settings (wave-10)
 ];
 
 const input: Record<string, string> = {};

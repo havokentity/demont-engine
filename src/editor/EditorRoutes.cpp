@@ -18,6 +18,9 @@ constexpr const char* kPanels[] = {
     "toolbar",
     "material-editor",
     "lights",
+    // BEGIN panel: render-settings (wave-10)
+    "render-settings",
+    // END panel: render-settings (wave-10)
     nullptr,
 };
 constexpr std::size_t kPanelCount = sizeof(kPanels) / sizeof(kPanels[0]) - 1;
@@ -63,6 +66,10 @@ Chrome --app window when spawned via the console (<code>panel_open &lt;name&gt;<
       <span>PBR material control: albedo / roughness / textures / emission</span></a></li>
   <li><a href="/editor/lights"><strong>Lights</strong>
       <span>Analytic light list + per-light inspector (photometric)</span></a></li>
+  <!-- BEGIN panel: render-settings (wave-10) -->
+  <li><a href="/editor/render-settings"><strong>Render Settings</strong>
+      <span>Tone map / sky / clouds / fog / god rays / ocean / DoF / spectral / smoke</span></a></li>
+  <!-- END panel: render-settings (wave-10) -->
 </ul>
 <footer>Console: <a href="/" style="color:#00f0ff">/</a></footer>
 </body></html>

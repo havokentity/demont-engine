@@ -31,6 +31,74 @@ export function setTexCommand(slot: TexSlot): string {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Advanced material extensions (wave-9 anisotropy / clearcoat / subsurface).
+//
+// These three console commands set per-prim "material extension" lobes the
+// engine layers over the base BRDF. They are WRITE-ONLY from the editor's
+// POV: SceneGraph.cpp does not (yet) serialise aniso/clearcoat/subsurface
+// back into the list_scene snapshot, so the panel can't read the current
+// engine value -- the Advanced controls drive local UI state seeded from
+// the documented defaults and dispatch the setter. Mirrors the existing
+// "assigning is the supported path" caveat the Normal Map section already
+// carries for normal-strength.
+
+/** Seed values for the Advanced material *editor UI* -- NOT a mirror of
+ *  the engine's AnalyticPrim struct member-initializers. Every lobe starts
+ *  "off" so opening the panel never silently enables an extension: each
+ *  setter clears its mat_ext_flags bit when its weight/radius is 0.
+ *
+ *  Note this deliberately differs from the engine struct defaults in
+ *  src/engine/Engine.h (clearcoat_roughness = 0.03f, subsurface_radius =
+ *  0.005f, subsurface_color = {0.9, 0.7, 0.6}). Those struct values only
+ *  take effect once the corresponding mat_ext_flags bit is set, and the
+ *  engine default is mat_ext_flags = 0 (all lobes disabled) -- so "off"
+ *  here matches the engine's actual rendered default, not its per-lobe
+ *  member-initializers. The UI surfaces the engine's tuned values only
+ *  after the user enables a lobe; until then these neutral seeds keep the
+ *  controls inert. */
+export const ADV_DEFAULTS = {
+  anisoAmount: 0,        // 0 = isotropic
+  anisoRotationDeg: 0,
+  clearcoatWeight: 0,    // 0 = off (clears the clearcoat flag)
+  clearcoatRoughness: 0.03,
+  subsurfaceRadius: 0,   // 0 = off (clears the subsurface flag); metres
+  subsurfaceColor: [1, 1, 1] as [number, number, number],
+} as const;
+
+/** Build `prim_set_anisotropy <id> <amount> <rotation_deg>`. amount in
+ *  [-1,1]; rotation in degrees (the command converts to radians). */
+export function anisotropyCommand(
+  id: number,
+  amount: number,
+  rotationDeg: number,
+): string {
+  return `prim_set_anisotropy ${id} ${fmt(amount)} ${fmt(rotationDeg)}`;
+}
+
+/** Build `prim_set_clearcoat <id> <weight> <roughness>`. Both in [0,1].
+ *  weight 0 clears the clearcoat flag. */
+export function clearcoatCommand(
+  id: number,
+  weight: number,
+  roughness: number,
+): string {
+  return `prim_set_clearcoat ${id} ${fmt(weight)} ${fmt(roughness)}`;
+}
+
+/** Build `prim_set_subsurface <id> <radius_m> <r> <g> <b>`. radius is the
+ *  mean-free-path in metres (0 clears the flag); color is the per-channel
+ *  single-scatter albedo in [0,1]. */
+export function subsurfaceCommand(
+  id: number,
+  radiusM: number,
+  color: readonly [number, number, number],
+): string {
+  return `prim_set_subsurface ${id} ${fmt(radiusM)} ${fmt(color[0])} ${fmt(
+    color[1],
+  )} ${fmt(color[2])}`;
+}
+
 /** Format a float for a console command line. Trims trailing zeros but
  *  keeps the value lossless to 4 decimals (matching the inspector's
  *  prim_set_* dispatch precision). Non-finite -> "0". */

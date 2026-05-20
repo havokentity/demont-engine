@@ -1,0 +1,381 @@
+/*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Rajesh D'Monte
+ *
+ * Render Settings panel-local styles. Colour vars come from the shared
+ * theme.css so themes (hardcore / amber / synthwave) apply uniformly.
+ *
+ * This file carries two style groups:
+ *   1. `.rs-*` rules for the Render Settings layout (collapsible
+ *      sections, toggles, selects, the gate pills).
+ *   2. `.insp-*` rules for the Slider / NumberField components copied
+ *      verbatim from the inspector / material-editor panels (those
+ *      components hard-code the `insp-` class prefix, so we ship the
+ *      matching styles here). Kept in lockstep with material-editor.css.
+ */
+
+/* ===== Root =========================================================== */
+
+.rs-root {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12px;
+}
+
+/* ===== Header ========================================================= */
+
+.rs-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.rs-header-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.rs-title {
+  color: var(--fg);
+  font-weight: 600;
+  font-size: 13px;
+  letter-spacing: 0.02em;
+}
+
+.rs-sub {
+  color: var(--fg-dim);
+  font-size: 10.5px;
+}
+
+.rs-refresh {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  background: var(--bg);
+  color: var(--fg-muted);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.rs-refresh:hover {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+
+/* ===== Offline banner ================================================= */
+
+.rs-banner {
+  padding: 6px 10px;
+  background: rgba(255, 199, 58, 0.1);
+  border: 1px solid var(--warn);
+  border-radius: 4px;
+  color: var(--warn);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* ===== Section (collapsible) ========================================== */
+
+.rs-section {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.rs-section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  color: var(--fg-muted);
+}
+
+.rs-section-head:hover {
+  color: var(--fg);
+}
+
+.rs-section.is-open .rs-section-head {
+  border-bottom: 1px solid var(--border);
+}
+
+.rs-caret {
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 12px;
+  color: var(--fg-dim);
+  transition: transform 0.12s ease;
+}
+
+.rs-caret.is-open {
+  transform: rotate(90deg);
+}
+
+.rs-section-title {
+  flex: 1 1 auto;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.rs-section-badge {
+  flex: 0 0 auto;
+}
+
+.rs-gate-pill {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 8px;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: var(--bg);
+  color: var(--fg-dim);
+  border: 1px solid var(--border-strong);
+}
+
+.rs-gate-pill.is-on {
+  background: var(--accent-glow);
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+
+.rs-section-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+}
+
+/* ===== Row (label + control) ========================================== */
+
+.rs-row {
+  display: grid;
+  grid-template-columns: 96px 1fr;
+  align-items: center;
+  gap: 8px;
+  min-height: 24px;
+}
+
+.rs-row > label {
+  color: var(--fg-muted);
+  font-size: 11.5px;
+  user-select: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ===== Select ========================================================= */
+
+.rs-select {
+  width: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  height: 22px;
+  padding: 0 6px;
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.rs-select:focus {
+  outline: none;
+  border-color: var(--accent-dim);
+}
+
+/* ===== Toggle (switch) ================================================ */
+
+.rs-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 22px;
+  padding: 0 8px 0 3px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 11px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  color: var(--fg-muted);
+  width: fit-content;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+
+.rs-toggle-knob {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--fg-dim);
+  transition: background 0.12s ease, transform 0.12s ease;
+}
+
+.rs-toggle.is-on {
+  background: var(--accent-glow);
+  border-color: var(--accent-dim);
+  color: var(--accent);
+}
+
+.rs-toggle.is-on .rs-toggle-knob {
+  background: var(--accent);
+  transform: translateX(2px);
+}
+
+.rs-toggle-label {
+  user-select: none;
+  min-width: 20px;
+  text-align: left;
+}
+
+/* ===== Footer ========================================================= */
+
+.rs-footer {
+  padding: 2px 4px 4px;
+}
+
+.rs-hint {
+  margin: 0;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--fg-dim);
+}
+
+.rs-hint code {
+  background: var(--bg-elev);
+  color: var(--accent);
+  padding: 1px 4px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 10px;
+}
+
+/* ======================================================================
+ * Copied component styles (`.insp-*`) for Slider / NumberField. Kept in
+ * lockstep with the inspector panel's inspector.css + material-editor.css
+ * -- if those components change their class names, update all three.
+ * Only the subset Slider + NumberField reference is included (no
+ * ColorField styles -- the Render Settings panel uses no color picker).
+ * ==================================================================== */
+
+/* ----- NumberField ----------------------------------------------------- */
+
+.insp-num {
+  display: flex;
+  align-items: stretch;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  overflow: hidden;
+  height: 22px;
+}
+
+.insp-num.is-scrubbing { background: var(--accent-glow); }
+.insp-num.is-focus { border-color: var(--accent-dim); }
+
+.insp-num-axis {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  cursor: ew-resize;
+  user-select: none;
+  color: var(--fg-muted);
+  font-size: 10.5px;
+  font-weight: 600;
+  background: var(--bg-elev);
+  border-right: 1px solid var(--border);
+}
+
+.insp-num-axis:hover {
+  color: var(--accent);
+}
+
+.insp-num-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: transparent;
+  color: var(--fg);
+  border: none;
+  outline: none;
+  font: inherit;
+  font-size: 11.5px;
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  padding: 0 5px;
+  text-align: right;
+}
+
+.insp-num-input:disabled {
+  color: var(--fg-dim);
+}
+
+/* ----- Slider ---------------------------------------------------------- */
+
+.insp-slider-row {
+  display: grid;
+  grid-template-columns: 1fr 56px;
+  gap: 6px;
+  align-items: center;
+}
+
+.insp-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 18px;
+  background: transparent;
+  cursor: pointer;
+  margin: 0;
+}
+
+.insp-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 2px;
+}
+
+.insp-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  background: var(--accent);
+  border-radius: 50%;
+  margin-top: -5px;
+  border: 1px solid var(--accent-dim);
+}
+
+.insp-slider:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.insp-slider:focus {
+  outline: none;
+}
+.insp-slider:focus::-webkit-slider-thumb {
+  box-shadow: 0 0 0 2px var(--accent-glow);
+}

@@ -520,7 +520,7 @@ private:
     //   `panel_close_all`         closes every tracked panel
     //   `panels`                  prints the known panels + per-panel state
     // The spawned-PID table lives in open_panels_pids_ keyed by panel
-    // name. Hotkeys F2/F3/F4/F5/F6/F7 fire panel_open via the existing
+    // name. Hotkeys F2/F3/F4/F5/F6/F7/F8 fire panel_open via the existing
     // key handler in Init().
     void RegisterEditorCommands();
     // Internal: spawn the panel in a fresh Chrome --app window. Tries

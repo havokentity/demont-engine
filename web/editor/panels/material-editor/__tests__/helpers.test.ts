@@ -15,6 +15,10 @@ import {
   isEmissive,
   rgbCss,
   MATERIAL_TYPES,
+  anisotropyCommand,
+  clearcoatCommand,
+  subsurfaceCommand,
+  ADV_DEFAULTS,
 } from '../src/helpers';
 
 describe('setTexCommand', () => {
@@ -117,6 +121,42 @@ describe('isEmissive', () => {
   });
   it('false when undefined', () => {
     expect(isEmissive(undefined)).toBe(false);
+  });
+});
+
+describe('advanced material command builders', () => {
+  it('anisotropyCommand emits id + amount + rotation', () => {
+    expect(anisotropyCommand(3, 0.5, 45)).toBe('prim_set_anisotropy 3 0.5 45');
+    // Trims trailing zeros via fmt.
+    expect(anisotropyCommand(0, -1.0, 0)).toBe('prim_set_anisotropy 0 -1 0');
+  });
+  it('clearcoatCommand emits id + weight + roughness', () => {
+    expect(clearcoatCommand(2, 1, 0.03)).toBe('prim_set_clearcoat 2 1 0.03');
+    expect(clearcoatCommand(7, 0, 0.5)).toBe('prim_set_clearcoat 7 0 0.5');
+  });
+  it('subsurfaceCommand emits id + radius + rgb', () => {
+    expect(subsurfaceCommand(1, 0.002, [0.9, 0.5, 0.4])).toBe(
+      'prim_set_subsurface 1 0.002 0.9 0.5 0.4',
+    );
+    expect(subsurfaceCommand(4, 0, [1, 1, 1])).toBe(
+      'prim_set_subsurface 4 0 1 1 1',
+    );
+  });
+  it('ADV_DEFAULTS are the editor UI seeds (every lobe off)', () => {
+    // These are the panel's UI seed values, NOT the engine's AnalyticPrim
+    // struct member-initializers. Every lobe starts off so opening the
+    // panel never silently enables an extension (each setter clears its
+    // mat_ext_flags bit when weight/radius is 0). Deliberately diverges
+    // from Engine.h's per-lobe defaults (subsurface_radius = 0.005f,
+    // subsurface_color = {0.9, 0.7, 0.6}), which only apply once the
+    // corresponding flag bit is set -- and the engine default is
+    // mat_ext_flags = 0, i.e. all lobes disabled.
+    expect(ADV_DEFAULTS.anisoAmount).toBe(0);
+    expect(ADV_DEFAULTS.anisoRotationDeg).toBe(0);
+    expect(ADV_DEFAULTS.clearcoatWeight).toBe(0);
+    expect(ADV_DEFAULTS.clearcoatRoughness).toBeCloseTo(0.03, 6);
+    expect(ADV_DEFAULTS.subsurfaceRadius).toBe(0); // off, not engine's 0.005
+    expect(ADV_DEFAULTS.subsurfaceColor).toEqual([1, 1, 1]);
   });
 });
 
