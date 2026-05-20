@@ -481,7 +481,14 @@ pt_add_test(scene_serialize
 # target's host directory, matching what their runtime would produce.
 function(pt_add_golden_cell)
     set(_options)
-    set(_oneval SCENE BACKEND DENOISER FRAMES SPP MAX_DELTA MEAN_DELTA FAIL_PERCENT)
+    # TAG (optional): a disambiguating suffix appended to the cell name and
+    # the golden / actual / diff PNG basenames, e.g. TAG agx yields
+    # `golden_<scene>__<backend>__<denoiser>__agx`. Lets two cells share the
+    # same scene/backend/denoiser triple but differ in EXTRA (e.g. one per
+    # tone-mapping operator, Wave 9 #27) without colliding ctest test names
+    # or golden filenames. Empty (default) = the historical naming with no
+    # suffix, so existing cells + their committed goldens are unaffected.
+    set(_oneval SCENE BACKEND DENOISER FRAMES SPP MAX_DELTA MEAN_DELTA FAIL_PERCENT TAG)
     set(_multival EXTRA)
     cmake_parse_arguments(PT_CELL "${_options}" "${_oneval}" "${_multival}" ${ARGN})
 
@@ -549,12 +556,21 @@ function(pt_add_golden_cell)
         set(PT_CELL_FAIL_PERCENT 1)
     endif()
 
+    # Optional TAG suffix on the cell name + PNG basenames. `_tag_suffix`
+    # is `__<tag>` when TAG is set, else empty -- so the unsuffixed naming
+    # is preserved bit-for-bit for callers that don't pass TAG.
+    set(_tag_suffix "")
+    if(NOT "${PT_CELL_TAG}" STREQUAL "")
+        set(_tag_suffix "__${PT_CELL_TAG}")
+    endif()
+
     set(_host        ${CMAKE_SYSTEM_NAME})
-    set(_cell_name   golden_${PT_CELL_SCENE}__${PT_CELL_BACKEND}__${PT_CELL_DENOISER})
+    set(_stem        ${PT_CELL_SCENE}__${PT_CELL_BACKEND}__${PT_CELL_DENOISER}${_tag_suffix})
+    set(_cell_name   golden_${_stem})
     set(_scene_cfg   ${CMAKE_SOURCE_DIR}/tests/goldens/scenes/${PT_CELL_SCENE}.cfg)
-    set(_golden_png  ${CMAKE_SOURCE_DIR}/tests/goldens/${_host}/${PT_CELL_SCENE}__${PT_CELL_BACKEND}__${PT_CELL_DENOISER}.png)
-    set(_actual_png  ${CMAKE_BINARY_DIR}/golden_actual/${PT_CELL_SCENE}__${PT_CELL_BACKEND}__${PT_CELL_DENOISER}.png)
-    set(_diff_png    ${CMAKE_BINARY_DIR}/golden_diff/${PT_CELL_SCENE}__${PT_CELL_BACKEND}__${PT_CELL_DENOISER}.png)
+    set(_golden_png  ${CMAKE_SOURCE_DIR}/tests/goldens/${_host}/${_stem}.png)
+    set(_actual_png  ${CMAKE_BINARY_DIR}/golden_actual/${_stem}.png)
+    set(_diff_png    ${CMAKE_BINARY_DIR}/golden_diff/${_stem}.png)
     # Per-cell working directory. The engine reads demont.cfg /
     # autoexec.cfg from CWD before applying the smoke-exec fixture, so
     # using a shared CWD (e.g. CMAKE_BINARY_DIR) would let an archived
@@ -1127,6 +1143,36 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     pt_add_golden_cell(SCENE subsurface BACKEND metal DENOISER off
         MAX_DELTA 64 MEAN_DELTA 8 FAIL_PERCENT 6)
     # --- end Wave 9 advanced materials -----------------------------------
+
+    # --- Wave 9 tone-mapping operators (#27 follow-up) --------------------
+    # AgX + Khronos PBR Neutral pinned on a daytime (procedural_noon) and a
+    # night (bsc_night) scene so each new operator is regression-locked. The
+    # ACES default needs no new cell -- the existing procedural_noon /
+    # bsc_night `software off` goldens already pin op 0 and stay bit-for-bit
+    # unchanged (op 0 collapses to the previous unconditional ACES path on
+    # every backend). The EXTRA cvar selects the operator; the TAG suffix
+    # disambiguates the cell name + golden filename from the ACES cell that
+    # shares the same scene/backend/denoiser triple.
+    #
+    # Backend: software / off. The operator is a pure post-exposure pixel
+    # transform applied identically on every backend (the engine packs
+    # r_tonemap_op into PtPush::tonemap_params for the GPU paths and
+    # SoftwareTracer reads the same field), so the software backend -- the
+    # deterministic CI lane (label golden_software) -- is the right place to
+    # pin the operator math. Default tolerances (16/2/1): the operator curve
+    # is deterministic given the seed-pinned scene, so the only variance is
+    # the path tracer's accumulator noise floor, same as the sibling ACES
+    # cell. Metal/Vulkan apply the identical curve; a dedicated GPU cell can
+    # be added later if cross-backend operator drift ever needs pinning.
+    pt_add_golden_cell(SCENE procedural_noon BACKEND software DENOISER off
+        TAG agx     EXTRA "r_tonemap_op agx")
+    pt_add_golden_cell(SCENE procedural_noon BACKEND software DENOISER off
+        TAG khronos EXTRA "r_tonemap_op khronos_pbr_neutral")
+    pt_add_golden_cell(SCENE bsc_night       BACKEND software DENOISER off
+        TAG agx     EXTRA "r_tonemap_op agx")
+    pt_add_golden_cell(SCENE bsc_night       BACKEND software DENOISER off
+        TAG khronos EXTRA "r_tonemap_op khronos_pbr_neutral")
+    # --- end Wave 9 tone-mapping operators --------------------------------
 else()
     message(STATUS
         "tests: golden-image matrix skipped -- pt_render_one_frame and/or "

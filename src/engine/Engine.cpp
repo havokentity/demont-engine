@@ -98,6 +98,13 @@ namespace {
 
 Engine* g_instance = nullptr;
 
+// --- Wave 9 tonemap (#27 follow-up) ---
+// r_tonemap_op string -> operator enum lives in pt::engine::capture
+// (CaptureEncoder.h) as the single source of truth shared with the capture
+// encoders. Aliased here so the PtPush / TonePush fills below read naturally.
+using pt::engine::capture::ParseTonemapOp;
+// --- end Wave 9 tonemap ---
+
 // ---- CVars (registered statically) ----------------------------------------
 namespace cvar {
     using namespace pt::console;
@@ -623,6 +630,20 @@ namespace cvar {
     PT_CVAR(r_exposure_target, "0.18",  "Middle-grey target for auto-exposure. 0.18 matches the Zone-V/Munsell middle-grey convention; lower values aim for a darker overall look.", CVAR_ARCHIVE);
     PT_CVAR(r_eye_adapt_speed, "0.20",  "Per-update interpolation factor for auto-exposure (0..1). Smaller = slower eye adaptation. The update fires every frame on the GPU (single-workgroup reduction over accum_hdr), so 0.20 settles ~80% in 5 frames, ~95% in 16 frames -- roughly 'eye-adapted in a quarter second at 60fps'.", CVAR_ARCHIVE);
     PT_CVAR(r_eye_model,       "human", "Preset 'iris/lens' tuning: human (default), cat (better dim-light dynamic range), owl (nocturnal -- huge max), dslr_iso100 (locked, narrow), dslr_iso6400 (locked, high gain), phone (auto, modest range), linear (no tonemap, debug). Selecting a preset writes r_exposure_min/max/target/r_eye_adapt_speed; 'custom' leaves them as-is.", CVAR_ARCHIVE);
+    // --- Wave 9 tonemap (#27 follow-up) ---
+    // HDR->LDR display transform applied after exposure. allowed_values
+    // (attached in Engine::Engine so the web console renders a dropdown)
+    // restricts writes to the five operators below. 'aces' is the default
+    // and is byte-identical to the pre-Wave-9 curve. AgX (Troy Sobotka,
+    // Minimal/Filament fit) gives a filmic, gently-desaturating highlight
+    // roll-off; 'khronos_pbr_neutral' (the glTF reference operator)
+    // preserves material hue + albedo and only compresses the bright tail;
+    // 'reinhard' is the classic c/(1+c) for reference; 'linear' clamps only
+    // (debug). The operator is read every frame at the inline swapchain
+    // write (PathTrace.slang) and the post-denoise pass (Tonemap.slang) so
+    // switching it takes effect on the next frame with no rebuild.
+    PT_CVAR(r_tonemap_op,      "aces", "HDR->LDR tone-mapping operator applied after exposure: aces (default, ACES Narkowicz -- preserves existing goldens) | agx (Troy Sobotka AgX, filmic with desaturating highlight roll-off) | khronos_pbr_neutral (Khronos glTF reference -- preserves hue + material albedo, compresses only highlights) | reinhard (classic c/(1+c)) | linear (clamp only, debug). Read every frame, no rebuild needed.", CVAR_ARCHIVE);
+    // --- end Wave 9 tonemap ---
     PT_CVAR(r_env_map,         "assets/hdri/sunset.hdr",
             "Path to a Radiance .hdr environment map. Used when r_sky_mode = hdri. "
             "Default points at the bundled CC0 sunset HDRI; resolves relative to CWD.",
@@ -1826,7 +1847,20 @@ namespace cvar {
 
 }  // namespace
 
-Engine::Engine()  { g_instance = this; }
+Engine::Engine() {
+    g_instance = this;
+    // --- Wave 9 tonemap (#27 follow-up) ---
+    // Attach allowed_values to r_tonemap_op so the console rejects bad
+    // writes ("invalid value 'X' (expected one of: aces|agx|...)") and the
+    // web console / editor renders a dropdown. PT_CVAR doesn't surface
+    // allowed_values, so set it on the registered CVar* here -- the static
+    // PT_CVAR initializer above has already run by the time any Engine is
+    // constructed in main(). Mirrors FrameCapture's r_capture_format setup.
+    if (auto* v = pt::console::Console::Get().FindCVar("r_tonemap_op")) {
+        v->allowed_values = {"aces", "agx", "khronos_pbr_neutral",
+                             "reinhard", "linear"};
+    }
+}
 Engine::~Engine() { Shutdown(); if (g_instance == this) g_instance = nullptr; }
 
 Engine* Engine::Instance() { return g_instance; }
@@ -7423,6 +7457,17 @@ void Engine::RenderFrame() {
         // kMaxMatOverrides * 3 float4 = 8 * 48 = 384 B.
         float mat_overrides[Engine::kMaxMatOverrides * 12];
         // --- end Wave 9 advanced materials -------------------------------
+        // --- Wave 9 tonemap (#27 follow-up) ------------------------------
+        // tonemap_params.x = r_tonemap_op enum (0 aces / 1 agx / 2 khronos
+        //   _pbr_neutral / 3 reinhard / 4 linear). Selects the HDR->LDR
+        //   display transform applied at the inline denoiser-off swapchain
+        //   write in PathTrace.slang (and mirrored into Tonemap.slang's
+        //   TonePush for the post-denoise Metal pass). Default 0 (aces)
+        //   keeps the existing curve byte-identical so committed goldens
+        //   don't move. .yzw reserved for future per-operator knobs.
+        //   One uvec4 = 16 B; appended to the static_assert sum below.
+        std::uint32_t tonemap_params[4];
+        // --- end Wave 9 tonemap ------------------------------------------
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -8705,6 +8750,20 @@ void Engine::RenderFrame() {
         push.mat_override_count[0] = slot;
     }
     // --- end Wave 9 advanced materials -------------------------------------
+    // --- Wave 9 tonemap (#27 follow-up) ------------------------------------
+    // Select the HDR->LDR display transform. r_tonemap_op's allowed_values
+    // (registered in RegisterCvars) gates the string at write time; map it
+    // to the shader enum here. Default 0 (aces) so the inline denoiser-off
+    // swapchain write stays byte-identical to pre-Wave-9.
+    {
+        std::string op = "aces";
+        if (auto* v = C.FindCVar("r_tonemap_op")) op = v->value;
+        push.tonemap_params[0] = ParseTonemapOp(op);
+        push.tonemap_params[1] = 0u;
+        push.tonemap_params[2] = 0u;
+        push.tonemap_params[3] = 0u;
+    }
+    // --- end Wave 9 tonemap ------------------------------------------------
     // --- Underwater medium tracking (Phase 4, #134) ------------------------
     // Pack:
     //   .x = 1.0 if camera position is inside any MAT_WATER plane's
@@ -8882,6 +8941,8 @@ void Engine::RenderFrame() {
     //   +384 Wave 9 materials — mat_overrides[kMaxMatOverrides * 12] floats
     //                              (8 slots * 3 float4 = anisotropic +
     //                               clearcoat + subsurface per-prim params)
+    //   +16 Wave 9 tonemap (#27 follow-up) — tonemap_params uvec4
+    //                              (r_tonemap_op enum, 3 reserved)
     static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 32 + 16
                   + 16 /* Wave 8 spectral (#27): spectral_params */
                   + 32 /* Wave 8 ocean (#25): ocean_params0 + ocean_params1 */
@@ -8889,7 +8950,8 @@ void Engine::RenderFrame() {
                   + 16 /* Wave 9 ocean-foam: ocean_foam_params */
                   + 16 /* Wave 9 hosek-sky: hosek_params (turbidity, ground albedo, solar zenith) */
                   + 16  /* Wave 9 materials: mat_override_count */
-                  + 384 /* Wave 9 materials: mat_overrides[8 * 12] */);
+                  + 384 /* Wave 9 materials: mat_overrides[8 * 12] */
+                  + 16 /* Wave 9 tonemap (#27 follow-up): tonemap_params */);
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
     // cbuffer layout the Slang compiler applies to PathTrace.slang's
@@ -11031,13 +11093,16 @@ void Engine::RenderFrame() {
             // 16-byte boundary for std140 / Metal struct rules.
             std::uint32_t flare_mode_physical;
             std::uint32_t physical_ghost_count;
-            // Star-split present flag (issue #46). 1 -> Tonemap.slang
-            // adds stars_tex to the HDR colour pre-bloom; 0 -> skip
-            // the additive read entirely (the slot is bound to a
-            // 1x1 placeholder for descriptor validity but the shader
-            // never samples it). Mirrors `stars_present` in
-            // Tonemap.slang's Push cbuffer at the same byte offset.
-            std::uint32_t stars_present;
+            // --- Wave 9 tonemap (#27 follow-up) ---
+            // tonemap_op: r_tonemap_op enum (0 aces / 1 agx / 2 khronos_pbr
+            // _neutral / 3 reinhard / 4 linear). Reclaimed from the old
+            // `stars_present` flag (dead since the StarsComposite rewrite
+            // dropped stars_tex from Tonemap.slang). Stays a uint at the
+            // SAME offset so TonePush::ghosts remains at offset 112 (the
+            // Vulkan push/UBO split). Mirrors `tonemap_op` in Tonemap.slang's
+            // Push cbuffer at the same byte offset; op 0 (aces) is byte-
+            // identical to the previous post-denoise behaviour.
+            std::uint32_t tonemap_op;
             std::uint32_t _pad_stars_align;
             // 48 bytes of padding to advance ghosts[] forward to host
             // offset 112 -- the Vulkan push-constant split boundary
@@ -11091,12 +11156,17 @@ void Engine::RenderFrame() {
         tp.flare_threshold  = flare_thresh;
         tp.flare_mode_sun       = flare_sun_m  ? 1u : 0u;
         tp.flare_mode_physical  = flare_phys_m ? 1u : 0u;
-        // stars_present + _pad_stars_align kept in TonePush for layout
-        // stability (TonePush::ghosts must stay at offset 112 for the
-        // Vulkan push/UBO split); set to zero -- the shader no longer
-        // reads them since stars_tex was dropped from Tonemap.slang in
-        // the StarsComposite rewrite.
-        tp.stars_present        = 0u;
+        // --- Wave 9 tonemap (#27 follow-up) ---
+        // Select the post-denoise display transform. Same enum + parse as
+        // the inline PtPush path so denoiser-on and denoiser-off agree.
+        // Default 0 (aces) keeps the post-denoise pass byte-identical.
+        {
+            std::string op = "aces";
+            if (auto* tv = C.FindCVar("r_tonemap_op")) op = tv->value;
+            tp.tonemap_op = ParseTonemapOp(op);
+        }
+        // _pad_stars_align kept for layout stability (TonePush::ghosts must
+        // stay at offset 112 for the Vulkan push/UBO split); set to zero.
         tp._pad_stars_align     = 0u;
         tp.flare_size       = flare_size;
         tp.sun_uv[0]        = sun_uv_x;
@@ -12454,6 +12524,16 @@ void Engine::Run() {
                             exposure = v;
                         }
                     }
+                    // --- Wave 9 tonemap (#27 follow-up) ---
+                    // Apply the same r_tonemap_op operator the on-screen
+                    // GPU paths use to the host-side smoke capture, so the
+                    // golden PNGs pin the selected operator. Default 0
+                    // (aces) keeps every existing golden byte-identical.
+                    std::uint32_t tonemap_op = 0u;
+                    if (auto* tv = pt::console::Console::Get()
+                                       .FindCVar("r_tonemap_op")) {
+                        tonemap_op = ParseTonemapOp(tv->value);
+                    }
 
                     // Parent dir is created here rather than relying on
                     // operator-supplied conventions; ctest cells write
@@ -12467,7 +12547,7 @@ void Engine::Run() {
                     }
 
                     const bool ok = pt::engine::capture::EncodeAndWritePng(
-                        png_path, raw, rb_w, rb_h, kind, exposure);
+                        png_path, raw, rb_w, rb_h, kind, exposure, tonemap_op);
                     if (!ok) {
                         LOG_ERROR("smoke-capture: EncodeAndWritePng failed "
                                   "for '{}'. Failing the smoke test "
@@ -13396,32 +13476,27 @@ void Engine::RegisterCommands() {
                 }
             }
 
+            // --- Wave 9 tonemap (#27 follow-up) ---
+            // HDR targets (accum / denoise_color / bloom_mip0) honour
+            // r_tonemap_op so a screenshot matches the on-screen operator.
+            // depth / motion / swap are unaffected (no tonemap). op 0
+            // (aces) is byte-identical to the previous inline ACES lambda.
+            std::uint32_t screenshot_tonemap_op = 0u;
+            if (auto* tv = pt::console::Console::Get().FindCVar("r_tonemap_op")) {
+                screenshot_tonemap_op = ParseTonemapOp(tv->value);
+            }
+
             // Convert to 8-bit RGB. ACES tonemap for HDR; depth gets a
             // grayscale ramp (0=black, 1=white); motion encodes (R = +x
             // mapped to [0..1], G = +y mapped, B=0) so directionality
             // is visible. Half-float decode is a portable IEEE 754
             // binary16 unpack (see lambda below) -- works on MSVC too.
-            auto tonemap = [exp = screenshot_exposure](float c) -> std::uint8_t {
-                c *= exp;
-                const float a = 2.51f, b = 0.03f, d = 2.43f, e = 0.59f, f = 0.14f;
-                float x = (c * (a * c + b)) / (c * (d * c + e) + f);
-                if (x < 0.0f) x = 0.0f;
-                if (x > 1.0f) x = 1.0f;
-                // sRGB OETF (linear -> nonlinear) so the stored 8-bit
-                // values match what the on-screen path writes to the
-                // swapchain after PathTrace.slang / Tonemap.slang's
-                // srgb_oetf().  Without this the PPM is linear LDR
-                // and viewers (which assume sRGB) re-apply the EOTF,
-                // producing a visibly darker image than what's on
-                // screen.  Same piecewise OETF as the shader.
-                if (x <= 0.0031308f) {
-                    x = x * 12.92f;
-                } else {
-                    x = 1.055f * std::pow(x, 1.0f / 2.4f) - 0.055f;
-                }
-                if (x > 1.0f) x = 1.0f;
-                return static_cast<std::uint8_t>(x * 255.0f + 0.5f);
-            };
+            // --- Wave 9 tonemap --- the HDR per-channel ACES + sRGB lambda
+            // that used to live here was replaced by the shared per-pixel
+            // pt::engine::capture::TonemapHdrPixel dispatch (so AgX / Khronos
+            // / Reinhard / linear all route through one operator table). The
+            // op-0 (aces) branch of that helper is byte-identical to the old
+            // lambda, so screenshots default exactly as before.
             // Portable IEEE 754 binary16 -> binary32 decode. Apple Clang
             // and GCC have __fp16 as an extension and we used to lean on
             // it here, but MSVC has no equivalent (and _Float16 has
@@ -13509,7 +13584,12 @@ void Engine::RegisterCommands() {
                         };
                         dst[0] = clamp01(r); dst[1] = clamp01(g); dst[2] = clamp01(b);
                     } else {
-                        dst[0] = tonemap(r); dst[1] = tonemap(g); dst[2] = tonemap(b);
+                        // --- Wave 9 tonemap --- HDR targets through the
+                        // shared per-pixel operator dispatch (op 0 == the
+                        // previous per-channel ACES, byte-identical).
+                        pt::engine::capture::TonemapHdrPixel(
+                            r, g, b, screenshot_exposure,
+                            screenshot_tonemap_op, dst);
                     }
                 }
             }

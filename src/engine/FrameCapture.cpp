@@ -100,6 +100,17 @@ float ResolveExposure(pt::rhi::Device* device,
     return ok ? v : fallback;
 }
 
+// --- Wave 9 tonemap (#27 follow-up) ---
+// Read r_tonemap_op and map it to the encoder enum via the shared
+// capture::ParseTonemapOp so the captured PNG/PPM applies the same display
+// transform as the on-screen GPU paths. Missing cvar -> 0 (aces), so
+// existing goldens are unchanged.
+std::uint32_t ResolveTonemapOp() {
+    auto* cv = pt::console::Console::Get().FindCVar("r_tonemap_op");
+    if (cv == nullptr) return 0u;
+    return pt::engine::capture::ParseTonemapOp(cv->value);
+}
+
 // captures/ subdir relative to the working directory. Created on first
 // use, ignored on already-exists. CWD-relative matches the screenshot
 // command's path-handling so dev-checkout vs install-tree behaves the
@@ -213,6 +224,8 @@ bool DoCapture(pt::rhi::Device*  device,
 
     const float exposure = ResolveExposure(device, exposure_state_buf_id,
                                            exposure_fallback);
+    // --- Wave 9 tonemap --- HDR->LDR operator for the host-side encode.
+    const std::uint32_t tonemap_op = ResolveTonemapOp();
 
     // Sanitize the operator-controllable filename parts so e.g.
     // `r_capture_seq "../../etc 5 1"` or `r_denoiser` containing
@@ -237,10 +250,10 @@ bool DoCapture(pt::rhi::Device*  device,
     bool ok = false;
     switch (output_fmt) {
         case OutputFormat::Png:
-            ok = EncodeAndWritePng(path, raw, w, h, source, exposure);
+            ok = EncodeAndWritePng(path, raw, w, h, source, exposure, tonemap_op);
             break;
         case OutputFormat::Ppm:
-            ok = EncodeAndWritePpm(path, raw, w, h, source, exposure);
+            ok = EncodeAndWritePpm(path, raw, w, h, source, exposure, tonemap_op);
             break;
     }
     if (!ok) {
