@@ -2345,6 +2345,9 @@ bool Engine::Init() {
             constexpr int kF5 = 294;
             constexpr int kF6 = 295;  // material-editor (wave-9)
             constexpr int kF7 = 296;  // lights (wave-9)
+            // BEGIN panel: render-settings (wave-10)
+            constexpr int kF8 = 297;  // render-settings (wave-10)
+            // END panel: render-settings (wave-10)
             // Gizmo-mode hotkeys for the editor 3D gizmo overlay.
             constexpr int kG     = 71;   // GLFW_KEY_G
             constexpr int kR     = 82;   // GLFW_KEY_R
@@ -2376,6 +2379,9 @@ bool Engine::Init() {
                 case kF5: panel = "toolbar";         break;
                 case kF6: panel = "material-editor"; break;
                 case kF7: panel = "lights";          break;
+                // BEGIN panel: render-settings (wave-10)
+                case kF8: panel = "render-settings"; break;
+                // END panel: render-settings (wave-10)
                 default: break;
             }
             if (panel != nullptr) {
@@ -21249,8 +21255,9 @@ void Engine::RegisterEditorCommands() {
     auto* cmd_open = C.RegisterCommand("panel_open",
         "Open an editor panel in a Chrome --app window. Usage: "
         "panel_open <name>. Names: scene-hierarchy, inspector, "
-        "asset-browser, toolbar, material-editor, lights. Use `panels` to "
-        "list state. Honors r_editor_dev_mode (Vite dev server URL when 1).",
+        "asset-browser, toolbar, material-editor, lights, render-settings. "
+        "Use `panels` to list state. Honors r_editor_dev_mode (Vite dev "
+        "server URL when 1).",
         [this](auto args, pt::console::Output& out) {
             if (args.empty()) {
                 out.PrintLine(
@@ -21262,7 +21269,7 @@ void Engine::RegisterEditorCommands() {
                 out.FormatLine(
                     "panel_open: unknown panel '{}'. Known: "
                     "scene-hierarchy, inspector, asset-browser, toolbar, "
-                    "material-editor, lights",
+                    "material-editor, lights, render-settings",
                     name);
                 return;
             }

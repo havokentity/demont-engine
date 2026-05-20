@@ -36,6 +36,7 @@ import { ColorField } from './ColorField';
 import { Slider } from './Slider';
 import { NumberField } from './NumberField';
 import { TexturePicker } from './TexturePicker';
+import { AdvancedMaterial } from './AdvancedMaterial';
 import {
   fmt,
   rgbCss,
@@ -466,6 +467,12 @@ export function MaterialEditor({ client }: MaterialEditorProps) {
           </div>
         </section>
       )}
+
+      <AdvancedMaterial
+        id={prim.id}
+        isMetal={prim.material === 'metal'}
+        exec={exec}
+      />
     </div>
   );
 }

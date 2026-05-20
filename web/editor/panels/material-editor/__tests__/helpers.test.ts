@@ -15,6 +15,10 @@ import {
   isEmissive,
   rgbCss,
   MATERIAL_TYPES,
+  anisotropyCommand,
+  clearcoatCommand,
+  subsurfaceCommand,
+  ADV_DEFAULTS,
 } from '../src/helpers';
 
 describe('setTexCommand', () => {
@@ -117,6 +121,33 @@ describe('isEmissive', () => {
   });
   it('false when undefined', () => {
     expect(isEmissive(undefined)).toBe(false);
+  });
+});
+
+describe('advanced material command builders', () => {
+  it('anisotropyCommand emits id + amount + rotation', () => {
+    expect(anisotropyCommand(3, 0.5, 45)).toBe('prim_set_anisotropy 3 0.5 45');
+    // Trims trailing zeros via fmt.
+    expect(anisotropyCommand(0, -1.0, 0)).toBe('prim_set_anisotropy 0 -1 0');
+  });
+  it('clearcoatCommand emits id + weight + roughness', () => {
+    expect(clearcoatCommand(2, 1, 0.03)).toBe('prim_set_clearcoat 2 1 0.03');
+    expect(clearcoatCommand(7, 0, 0.5)).toBe('prim_set_clearcoat 7 0 0.5');
+  });
+  it('subsurfaceCommand emits id + radius + rgb', () => {
+    expect(subsurfaceCommand(1, 0.002, [0.9, 0.5, 0.4])).toBe(
+      'prim_set_subsurface 1 0.002 0.9 0.5 0.4',
+    );
+    expect(subsurfaceCommand(4, 0, [1, 1, 1])).toBe(
+      'prim_set_subsurface 4 0 1 1 1',
+    );
+  });
+  it('ADV_DEFAULTS match the engine prim_set_* defaults', () => {
+    expect(ADV_DEFAULTS.anisoAmount).toBe(0);
+    expect(ADV_DEFAULTS.clearcoatWeight).toBe(0);
+    expect(ADV_DEFAULTS.clearcoatRoughness).toBeCloseTo(0.03, 6);
+    expect(ADV_DEFAULTS.subsurfaceRadius).toBe(0);
+    expect(ADV_DEFAULTS.subsurfaceColor).toEqual([1, 1, 1]);
   });
 });
 

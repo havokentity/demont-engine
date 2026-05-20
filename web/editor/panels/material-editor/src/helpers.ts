@@ -31,6 +31,62 @@ export function setTexCommand(slot: TexSlot): string {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Advanced material extensions (wave-9 anisotropy / clearcoat / subsurface).
+//
+// These three console commands set per-prim "material extension" lobes the
+// engine layers over the base BRDF. They are WRITE-ONLY from the editor's
+// POV: SceneGraph.cpp does not (yet) serialise aniso/clearcoat/subsurface
+// back into the list_scene snapshot, so the panel can't read the current
+// engine value -- the Advanced controls drive local UI state seeded from
+// the documented defaults and dispatch the setter. Mirrors the existing
+// "assigning is the supported path" caveat the Normal Map section already
+// carries for normal-strength.
+
+/** Default values for the Advanced material lobes, matching the engine's
+ *  PT_CVAR / command defaults in src/engine/Engine.cpp (prim_set_*). */
+export const ADV_DEFAULTS = {
+  anisoAmount: 0,        // 0 = isotropic
+  anisoRotationDeg: 0,
+  clearcoatWeight: 0,    // 0 = off
+  clearcoatRoughness: 0.03,
+  subsurfaceRadius: 0,   // 0 = off (metres)
+  subsurfaceColor: [1, 1, 1] as [number, number, number],
+} as const;
+
+/** Build `prim_set_anisotropy <id> <amount> <rotation_deg>`. amount in
+ *  [-1,1]; rotation in degrees (the command converts to radians). */
+export function anisotropyCommand(
+  id: number,
+  amount: number,
+  rotationDeg: number,
+): string {
+  return `prim_set_anisotropy ${id} ${fmt(amount)} ${fmt(rotationDeg)}`;
+}
+
+/** Build `prim_set_clearcoat <id> <weight> <roughness>`. Both in [0,1].
+ *  weight 0 clears the clearcoat flag. */
+export function clearcoatCommand(
+  id: number,
+  weight: number,
+  roughness: number,
+): string {
+  return `prim_set_clearcoat ${id} ${fmt(weight)} ${fmt(roughness)}`;
+}
+
+/** Build `prim_set_subsurface <id> <radius_m> <r> <g> <b>`. radius is the
+ *  mean-free-path in metres (0 clears the flag); color is the per-channel
+ *  single-scatter albedo in [0,1]. */
+export function subsurfaceCommand(
+  id: number,
+  radiusM: number,
+  color: readonly [number, number, number],
+): string {
+  return `prim_set_subsurface ${id} ${fmt(radiusM)} ${fmt(color[0])} ${fmt(
+    color[1],
+  )} ${fmt(color[2])}`;
+}
+
 /** Format a float for a console command line. Trims trailing zeros but
  *  keeps the value lossless to 4 decimals (matching the inspector's
  *  prim_set_* dispatch precision). Non-finite -> "0". */

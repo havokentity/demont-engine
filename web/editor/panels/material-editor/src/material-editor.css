@@ -156,6 +156,18 @@
   user-select: none;
 }
 
+.mtl-subhead {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--fg-muted);
+  margin: 4px 0 0 0;
+  letter-spacing: 0.02em;
+}
+
+.mtl-subhead:first-of-type {
+  margin-top: 0;
+}
+
 .mtl-hint {
   margin: 2px 0 0 0;
   font-size: 10.5px;
