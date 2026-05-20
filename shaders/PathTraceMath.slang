@@ -212,3 +212,100 @@ public bool intersectPlane(float3 ro, float3 rd, float3 n, float d, out float t)
     t = -(dot(ro, n) + d) / denom;
     return t > 1e-3;
 }
+
+// --- Wave 10 bloom/bokeh: thin-lens aperture sampling --------------------
+// Shirley-Chiu concentric-disk mapping: square (u1,u2) in [0,1]^2 -> a
+// uniformly distributed point on the unit disk.  This is the common base
+// for the round and polygonal apertures; verbatim the math the camera-ray
+// block used inline before wave-10, so blades=0 stays bit-for-bit.
+// Mirrored in StarsComposite.slang (self-contained TU -- the sun/moon
+// bokeh must match this sampler exactly).
+public float2 ptConcentricDisk(float u1, float u2) {
+    float a = 2.0 * u1 - 1.0;
+    float b = 2.0 * u2 - 1.0;
+    float r, phi;
+    if (abs(a) > abs(b)) {
+        r = a;
+        phi = (3.14159265358979 / 4.0) * (b / max(abs(a), 1e-6));
+    } else {
+        r = b;
+        phi = (3.14159265358979 / 2.0) -
+              (3.14159265358979 / 4.0) * (a / max(abs(b), 1e-6));
+    }
+    return r * float2(cos(phi), sin(phi));
+}
+
+// Area-uniform sample of a regular N-gon aperture (circumradius 1) rotated
+// by rot_rad, drawn DIRECTLY from two canonical uniforms (u1,u2) in [0,1]^2
+// rather than by warping a disk sample.
+//
+// Why not the old disk->polygon radial scaling (r' = r * cos(pi/N)/cos(theta
+// folded))?  That map's Jacobian is poly_r(theta)^2, which varies with the
+// sample angle, so a uniform disk density becomes a NON-uniform polygon
+// density (PDF ~ 1/R(theta)^2).  The thin-lens camera path applies no
+// importance weight to the lens sample, so the biased density makes the
+// integrated bokeh brightness/structure physically wrong (the polygon fills
+// preferentially toward the vertices vs the flats).  See PR #235.
+//
+// The unbiased construction is the standard triangle-fan: a regular N-gon
+// is N congruent isoceles triangles sharing the aperture centre.  (a) pick
+// one wedge uniformly, (b) uniform-area sample that triangle with the
+// sqrt-barycentric parameterization, (c) the polygon orientation falls out
+// of placing the vertices at angle rot_rad.  Each triangle has equal area
+// and is chosen with probability 1/N, so the marginal density is uniform
+// over the whole polygon -- an unbiased aperture sample.  The polygon keeps
+// the old circumradius (1, vertices on the unit circle) and inradius
+// cos(pi/N), so the bokeh SIZE is unchanged; only its interior density is
+// corrected from biased to uniform.
+//
+// Reusing u1 for BOTH the wedge pick and the in-triangle radius (via the
+// fractional part u1*N - k) keeps the sampler at two uniforms, matching the
+// disk path's RNG draw count so the blades>=3 path doesn't shift the seed
+// stream relative to blades=0.  The fractional part of a uniform is itself
+// uniform on [0,1] and independent of the integer part, so this is exact,
+// not an approximation.  blades is assumed >= 3 (the caller keeps the round
+// disk for fewer).  Mirrored verbatim in StarsComposite.slang.
+public float2 ptPolygonSample(float u1, float u2, int blades, float rot_rad) {
+    float n = float(blades);
+    float wedge = 6.28318530717958 / n;          // 2*pi / N
+    // (a) Pick a wedge k in [0, N-1] uniformly, then recycle the fractional
+    //     part as a fresh uniform for the in-triangle radius parameter.
+    float kf = floor(u1 * n);
+    float ku = u1 * n - kf;                       // fractional part, ~U[0,1]
+    // (c) Two adjacent polygon vertices on the unit circumradius circle.
+    //     V0 (the aperture centre) is the origin, so its barycentric term
+    //     drops out of the blend below.
+    float a0 = rot_rad + kf * wedge;
+    float a1 = a0 + wedge;
+    float2 V1 = float2(cos(a0), sin(a0));
+    float2 V2 = float2(cos(a1), sin(a1));
+    // (b) Uniform-area sample of triangle (0, V1, V2) via the sqrt-bary map:
+    //     p = (1-su)*V0 + su*(1-u2)*V1 + su*u2*V2, with V0 = 0.
+    float su = sqrt(ku);
+    return su * ((1.0 - u2) * V1 + u2 * V2);
+}
+
+// Cat's-eye / optical vignetting.  Off-axis image points see an entrance
+// pupil partly occluded by the rear elements, so the bokeh clips into a
+// lemon shape squeezed toward frame centre.  `uv` is the pixel's
+// normalised [-1,1] screen position (|uv| ~ image eccentricity), strength
+// in [0,1].  We compress the lens-sample component along the radial-to-
+// centre axis by a factor that grows with eccentricity, which is the
+// physically-correct narrowing of the pupil off-axis.  strength 0 (or an
+// on-axis pixel) returns ap unchanged, so the bokeh stays round there.
+public float2 ptCatEye(float2 ap, float2 uv, float strength) {
+    float ecc = saturate(length(uv));            // 0 at centre, ~1 at corner
+    float squeeze = strength * ecc;
+    if (squeeze < 1e-5) return ap;
+    float2 radial = (ecc > 1e-5) ? (uv / length(uv)) : float2(1.0, 0.0);
+    float2 tangent = float2(-radial.y, radial.x);
+    // Decompose the lens sample into radial + tangential, narrow the radial
+    // part (the axis along which the pupil is occluded). Up to ~70% squeeze
+    // at the frame corner for strength 1 -- a strong but still readable
+    // lemon, matching a fast lens wide open.
+    float ar = dot(ap, radial);
+    float at = dot(ap, tangent);
+    ar *= (1.0 - 0.7 * squeeze);
+    return radial * ar + tangent * at;
+}
+// --- end Wave 10 bloom/bokeh ---------------------------------------------

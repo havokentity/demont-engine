@@ -1186,6 +1186,54 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     pt_add_golden_cell(SCENE bsc_night       BACKEND software DENOISER off
         TAG khronos EXTRA "r_tonemap_op khronos_pbr_neutral")
     # --- end Wave 9 tone-mapping operators --------------------------------
+
+    # --- Wave 10 bloom + lens dirt ----------------------------------------
+    # A cluster of bright emissive spheres against a near-black sky drives
+    # the energy-preserving dual-filter bloom pyramid hard; the procedural
+    # lens-dirt overlay (r_lens_dirt 1) modulates the resulting halos
+    # through a screen-space grime field. The cell guards the bloom
+    # composite end-to-end: the pyramid build (13-tap Karis downsample +
+    # tent upsample), the r_bloom_strength gain, and the dirt modulation
+    # in Tonemap.slang.
+    #
+    # Metal-only: the bloom composite runs in the engine's Tonemap.slang
+    # dispatch (the use_engine_tonemap branch), which is Metal's post-
+    # process path; the bloom-off default (r_bloom 0 -> halo-free frame)
+    # is already covered bit-for-bit by every other committed golden, and
+    # the clean-lens default (r_lens_dirt 0) collapses the composite to
+    # the pre-wave-10 `bloom_intensity * bloom` add, so no extra "dirt
+    # off" cell is needed for the goldens-preserved half of the bar.
+    #
+    # Tolerances widened like the other stochastic Metal cells: the bloom
+    # halo is a smooth low-frequency layer over the 4-spp path-traced
+    # emissive cores, so the dominant per-pixel variance is the underlying
+    # radiance noise floor rather than the bloom math (deterministic given
+    # the seed). The thresholds catch bloom failing to engage (no halos),
+    # the strength gain being dropped (dim halos), or the dirt modulation
+    # breaking (uniform or absent grime).
+    pt_add_golden_cell(SCENE bloom_lensdirt BACKEND metal DENOISER off
+        MAX_DELTA 48 MEAN_DELTA 6 FAIL_PERCENT 4)
+    # --- end Wave 10 bloom + lens dirt ------------------------------------
+
+    # --- Wave 10 polygonal bokeh ------------------------------------------
+    # Same receding row of emissive spheres as the dof_bokeh cell, but with
+    # a HEXAGONAL aperture (r_dof_blades 6) plus a blade rotation and
+    # cat's-eye edge vignetting. The out-of-focus highlights render as
+    # six-sided bokeh polygons (squeezed into lemons toward the frame edge)
+    # instead of round discs. The cell guards the polygonal-iris path: the
+    # concentric-disk-to-N-gon warp, the blade rotation, and the cat's-eye
+    # off-axis squeeze in PathTrace.slang's camera-ray block.
+    #
+    # Metal golden cell. The circular-bokeh regression (r_dof_blades 0 +
+    # r_dof_cateye 0 -> round discs) is the default aperture path already
+    # pinned bit-for-bit by the dof_bokeh cell, so no extra "round" cell is
+    # needed for the goldens-preserved half of the bar. Tolerances match
+    # the dof_bokeh cell (the scene is identical apart from the aperture
+    # shape, so the stochastic aperture-integration noise floor is the
+    # same regime).
+    pt_add_golden_cell(SCENE dof_bokeh_blades BACKEND metal DENOISER off
+        MAX_DELTA 48 MEAN_DELTA 6 FAIL_PERCENT 4)
+    # --- end Wave 10 polygonal bokeh --------------------------------------
 else()
     message(STATUS
         "tests: golden-image matrix skipped -- pt_render_one_frame and/or "

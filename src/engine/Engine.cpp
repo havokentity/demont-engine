@@ -615,6 +615,24 @@ namespace cvar {
     PT_CVAR(r_bloom_intensity, "0.05","Linear blend factor of the bloom layer added on top of the HDR image before tonemap. 0 disables, 1 makes the bloom layer dominate. Realistic camera lens flare is in the 0.02-0.10 range.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom_mips,      "5",  "How many mip levels the bloom pyramid uses (1..5). More mips = a softer / wider halo; fewer mips = a tighter glow. Capped to kBloomMips at compile time.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom_radius,    "1.0","Per-mip upsample 'spread' multiplier. 1.0 = pixel-accurate dual-filter blur; >1 widens each upsample tap (softer, more diffuse halo); <1 tightens it (sharper core, less spread). Real range 0.5..3.0.", CVAR_ARCHIVE);
+    // --- Wave 10 bloom/bokeh ---
+    // r_bloom_strength is a final gain on the composited bloom layer,
+    // multiplied on top of r_bloom_intensity at the Tonemap composite.
+    // Splitting it out from r_bloom_intensity lets the energy-preserving
+    // dual-filter pyramid keep a fixed per-mip blend (the Jimenez "Next
+    // Gen Post" tent-upsample normalisation) while the artist scales the
+    // overall glow with one knob. Default 1.0 == the pre-wave-10 composite
+    // (c += r_bloom_intensity * bloom), so existing bloom goldens stay
+    // bit-for-bit.
+    PT_CVAR(r_bloom_strength,  "1.0","Final gain on the composited bloom layer (multiplied on top of r_bloom_intensity). 1.0 = neutral (matches the pre-wave-10 look); >1 brightens the halo, <1 dims it. Real cinematic range 0.5..2.0.", CVAR_ARCHIVE);
+    // Lens dirt: a screen-space grime field (procedural -- smudges +
+    // specks + a faint radial sheen) that modulates the bloom layer so
+    // bright sources "smear" through the dirt on the front element. Off
+    // by default so the bloom composite is unchanged; r_lens_dirt 1 mixes
+    // the dirt mask into the bloom add by r_lens_dirt_strength.
+    PT_CVAR(r_lens_dirt,       "0",   "Lens-dirt overlay on bloom. 0 = clean lens (bloom unmodulated, bit-for-bit with the pre-wave-10 composite). 1 = a procedural screen-space grime field modulates the bloom layer so bright highlights smear through the dirt, like a real uncleaned front element.", CVAR_ARCHIVE);
+    PT_CVAR(r_lens_dirt_strength, "0.6", "How strongly the dirt field is mixed into the bloom modulation (0..1). 0 = clean (dirt has no effect even when r_lens_dirt is on); 1 = the dirt field fully gates the bloom (dark grime kills bloom there, bright smudges boost it). 0.6 is a tasteful default streaky-but-readable look.", CVAR_ARCHIVE);
+    // --- end Wave 10 bloom/bokeh ---
     PT_CVAR(r_lens_flare,      "0",   "Lens flare. Image-based ghost reflections sampled from the bloom layer at mirror-across-centre positions. 0 disables.", CVAR_ARCHIVE);
     PT_CVAR(r_lens_flare_intensity, "0.15", "Linear blend strength of the flare layer. Real-camera lens flare is typically 0.1-0.3 of the bright source.", CVAR_ARCHIVE);
     PT_CVAR(r_lens_flare_dispersion, "0.012", "Per-channel scale offset for chromatic aberration on ghosts. 0 = achromatic (white ghosts), >0 = colourful rainbow fringe along ghost edges. Real lenses 0.01-0.03.", CVAR_ARCHIVE);
@@ -1290,6 +1308,22 @@ namespace cvar {
     PT_CVAR(r_dof_aperture,    "0.0", "Manual aperture-radius override in world units (metres). 0 (default) = derive the radius from r_dof_fstop + r_dof_focal_length_mm (the physical path). >0 overrides those with an explicit world-space lens radius, for when you want to dial bokeh by hand.", CVAR_ARCHIVE);
     PT_CVAR(r_dof_focal_distance, "0.0", "DEPRECATED alias for r_dof_focus_distance_m (kept for old configs / the legacy dof_focus_here writes). 0 = use r_dof_focus_distance_m; >0 overrides it. Prefer r_dof_focus_distance_m.", CVAR_ARCHIVE);
     PT_CVAR(r_dof_blades,      "0",   "Aperture blade count. 0 = perfectly round disk (circular bokeh). 5/6/8 = polygonal iris (matching real lens aperture blades) -- gives polygonal bokeh on out-of-focus highlights.", CVAR_ARCHIVE);
+    // --- Wave 10 bloom/bokeh ---
+    // Blade rotation orients the polygonal iris (degrees). A real lens's
+    // bokeh polygon is fixed by how the blades were assembled; this lets
+    // the user dial the flat-side-up vs point-up look. Ignored when
+    // r_dof_blades < 3 (round disk has no orientation). Default 0.
+    PT_CVAR(r_dof_blade_rotation, "0.0", "Rotation of the polygonal aperture in degrees (orients the bokeh polygon -- flat-side-up vs point-up). Only meaningful when r_dof_blades >= 3; the round disk (0 blades) ignores it. Default 0.", CVAR_ARCHIVE);
+    // Cat's-eye (optical vignetting): out-of-focus highlights toward the
+    // frame edge get clipped into a lens / lemon shape because the rear
+    // elements occlude part of the entrance pupil off-axis. 0 = no
+    // vignetting (uniform bokeh across the frame, bit-for-bit with the
+    // pre-wave-10 disc/polygon); 1 = strong cat's-eye at the edges. The
+    // sample's lens offset is squeezed along the radial-to-centre axis in
+    // proportion to its image-point eccentricity, which is the physically
+    // correct way the pupil narrows off-axis. Default 0.
+    PT_CVAR(r_dof_cateye,      "0.0", "Cat's-eye / optical-vignetting strength (0..1). 0 = bokeh discs stay round across the whole frame (bit-for-bit with the pre-wave-10 aperture). 1 = strong cat's-eye -- out-of-focus highlights toward the frame edge squeeze into the lemon shape a real fast lens produces off-axis. Default 0.", CVAR_ARCHIVE);
+    // --- end Wave 10 bloom/bokeh ---
     // --- end ---
     // --- Wave 8 spectral (#27) ---
     // Spectral dispersion for dielectrics. Each path samples one hero
@@ -7006,8 +7040,20 @@ void Engine::RenderFrame() {
         float w2j_row2[4];
         // .x = aperture radius (0 = pinhole, no DOF). .y = focal
         // distance (world units). .z = aperture blade count (0 =
-        // round disk, 3..16 = polygonal iris). .w reserved.
+        // round disk, 3..16 = polygonal iris).
+        // .w = blade rotation in radians (Wave 10; orients the polygon,
+        //      ignored for the round disk).
         float dof_params[4];
+        // --- Wave 10 bloom/bokeh ---
+        // Polygonal-bokeh extras that didn't fit in dof_params.
+        //   .x = cat's-eye / optical-vignetting strength (0 = round bokeh
+        //        everywhere -- bit-for-bit with the pre-wave-10 aperture;
+        //        1 = strong off-axis lemon clipping).
+        //   .y/.z/.w reserved. One vec4 = 16 B (appended to the push-tail
+        //        static_assert sum below; tail stays well under the 2048 B
+        //        Vulkan Frame-UBO budget).
+        float dof_bokeh_params[4];
+        // --- end Wave 10 bloom/bokeh ---
         // --- Wave 8 spectral (#27) ---
         // Spectral dispersion (hero-wavelength) params.
         //   .x = enabled flag (0 = achromatic RGB dielectric path, bit-
@@ -8336,12 +8382,17 @@ void Engine::RenderFrame() {
         if (auto* v = C.FindCVar("r_dof")) dof_on = v->GetBool();
         float fstop = 2.8f, focal_len_mm = 50.0f, focus_dist = 5.0f;
         float aperture_override = 0.0f, focus_dist_legacy = 0.0f, blades = 0.0f;
+        // --- Wave 10 bloom/bokeh ---
+        float blade_rot_deg = 0.0f, cateye = 0.0f;
+        // --- end Wave 10 bloom/bokeh ---
         if (auto* v = C.FindCVar("r_dof_fstop"))            fstop             = v->GetFloat();
         if (auto* v = C.FindCVar("r_dof_focal_length_mm"))  focal_len_mm      = v->GetFloat();
         if (auto* v = C.FindCVar("r_dof_focus_distance_m")) focus_dist        = v->GetFloat();
         if (auto* v = C.FindCVar("r_dof_aperture"))         aperture_override = v->GetFloat();
         if (auto* v = C.FindCVar("r_dof_focal_distance"))   focus_dist_legacy = v->GetFloat();
         if (auto* v = C.FindCVar("r_dof_blades"))           blades            = float(v->GetInt());
+        if (auto* v = C.FindCVar("r_dof_blade_rotation"))   blade_rot_deg     = v->GetFloat();
+        if (auto* v = C.FindCVar("r_dof_cateye"))           cateye            = v->GetFloat();
         // Derive the world-space lens radius from f-stop + focal length
         // unless the manual override is set. Guard the divisor so a
         // zero / negative f-number can't blow up to an infinite pupil.
@@ -8358,7 +8409,19 @@ void Engine::RenderFrame() {
         push.dof_params[0] = dof_on ? lens_radius : 0.0f;
         push.dof_params[1] = focus;
         push.dof_params[2] = blades;
-        push.dof_params[3] = 0.0f;
+        // --- Wave 10 bloom/bokeh ---
+        // Blade rotation in radians (orients the polygon; the shader
+        // ignores it for the round disk). Cat's-eye strength clamped to
+        // [0,1]. Both default to 0 so blades 0 + cateye 0 reproduces the
+        // pre-wave-10 aperture sample bit-for-bit (the dof_bokeh golden
+        // is unaffected).
+        constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+        push.dof_params[3]       = blade_rot_deg * kDegToRad;
+        push.dof_bokeh_params[0] = std::clamp(cateye, 0.0f, 1.0f);
+        push.dof_bokeh_params[1] = 0.0f;
+        push.dof_bokeh_params[2] = 0.0f;
+        push.dof_bokeh_params[3] = 0.0f;
+        // --- end Wave 10 bloom/bokeh ---
     }
     // --- end ---
 
@@ -8990,6 +9053,13 @@ void Engine::RenderFrame() {
     //                               clearcoat + subsurface per-prim params)
     //   +16 Wave 9 tonemap (#27 follow-up) — tonemap_params uvec4
     //                              (r_tonemap_op enum, 3 reserved)
+    //   +16 Wave 10 bloom/bokeh — dof_bokeh_params vec4 (cat's-eye
+    //                              strength, 3 reserved). Inserted in the
+    //                              struct right after dof_params; added
+    //                              here as a trailing +16 since the assert
+    //                              only checks the total byte size. Tail
+    //                              (sizeof - 112) stays well under the
+    //                              2048 B Vulkan Frame-UBO budget.
     static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 32 + 16
                   + 16 /* Wave 8 spectral (#27): spectral_params */
                   + 32 /* Wave 8 ocean (#25): ocean_params0 + ocean_params1 */
@@ -8998,7 +9068,8 @@ void Engine::RenderFrame() {
                   + 16 /* Wave 9 hosek-sky: hosek_params (turbidity, ground albedo, solar zenith) */
                   + 16  /* Wave 9 materials: mat_override_count */
                   + 384 /* Wave 9 materials: mat_overrides[8 * 12] */
-                  + 16 /* Wave 9 tonemap (#27 follow-up): tonemap_params */);
+                  + 16 /* Wave 9 tonemap (#27 follow-up): tonemap_params */
+                  + 16 /* Wave 10 bloom/bokeh: dof_bokeh_params */);
     // Vulkan spilled-tail budget guard. The Vulkan backend keeps the first
     // 112 B of PtPush in push constants and uploads the REMAINDER through a
     // per-frame UBO of kFrameUboSize bytes (src/rhi_vulkan/VulkanDevice.h).
@@ -9011,6 +9082,8 @@ void Engine::RenderFrame() {
     // Keep the literal in lockstep with kFrameUboSize (currently 2048); the
     // two can't share a constant without coupling the engine to the Vulkan
     // backend header, so they're mirrored with this cross-reference instead.
+    // Wave 10 bloom/bokeh adds dof_bokeh_params (+16): tail is now 1504 B,
+    // still ~544 B under the 2048 budget.
     static_assert(sizeof(PtPush) - 112 <= 2048,
                   "PtPush spilled tail (sizeof - 112) exceeds the Vulkan "
                   "kFrameUboSize budget (2048 B). Bump kFrameUboSize in "
@@ -9034,8 +9107,14 @@ void Engine::RenderFrame() {
     static_assert(offsetof(PtPush, clouds_p4) % 16 == 0,
                   "PtPush::clouds_p4 must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
-    // Wave 8 spectral (#27): spectral_params sits between dof_params and
-    // vol_params; both neighbours are vec4-sized so it stays 16-byte
+    // Wave 10 bloom/bokeh: dof_bokeh_params sits between dof_params and
+    // spectral_params; both neighbours are vec4-sized so it stays 16-byte
+    // aligned, but guard explicitly so a future re-order can't slip it.
+    static_assert(offsetof(PtPush, dof_bokeh_params) % 16 == 0,
+                  "PtPush::dof_bokeh_params must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    // Wave 8 spectral (#27): spectral_params sits between dof_bokeh_params
+    // and vol_params; both neighbours are vec4-sized so it stays 16-byte
     // aligned, but guard explicitly so a future re-order can't slip it.
     static_assert(offsetof(PtPush, spectral_params) % 16 == 0,
                   "PtPush::spectral_params must be 16-byte aligned to match "
@@ -10170,12 +10249,18 @@ void Engine::RenderFrame() {
                 float        moon_extra[4];
                 float        sun_extra[4];
                 float        dof_params[4];
+                // --- Wave 10 bloom/bokeh ---
+                // Cat's-eye strength in .x; the sun/moon bokeh shares the
+                // path tracer's polygonal-iris + cat's-eye sampler. Blade
+                // rotation rides dof_params.w (copied from PtPush below).
+                float        dof_bokeh_params[4];
+                // --- end Wave 10 bloom/bokeh ---
                 std::uint32_t frame_index;
                 std::uint32_t ap_samples;
                 std::uint32_t composite_active;
                 std::uint32_t _pad0;
             } sc{};
-            static_assert(sizeof(StarsCompositePush) == 224,
+            static_assert(sizeof(StarsCompositePush) == 240,
                           "StarsCompositePush layout must match StarsComposite.slang");
             std::memcpy(sc.pos_fovtan,     push.pos_fovtan,     sizeof(sc.pos_fovtan));
             std::memcpy(sc.fwd_aspect,     push.fwd_aspect,     sizeof(sc.fwd_aspect));
@@ -10190,6 +10275,12 @@ void Engine::RenderFrame() {
             std::memcpy(sc.moon_extra,     push.moon_extra,     sizeof(sc.moon_extra));
             std::memcpy(sc.sun_extra,      push.sun_extra,      sizeof(sc.sun_extra));
             std::memcpy(sc.dof_params,     push.dof_params,     sizeof(sc.dof_params));
+            // --- Wave 10 bloom/bokeh --- carry cat's-eye strength (+ the
+            // reserved lanes) so the sun/moon bokeh matches the path
+            // tracer's polygonal-iris + cat's-eye sampler.
+            std::memcpy(sc.dof_bokeh_params, push.dof_bokeh_params,
+                        sizeof(sc.dof_bokeh_params));
+            // --- end Wave 10 bloom/bokeh ---
             sc.frame_index      = push.frame_index;
             sc.composite_active = 1u;
             int ap_n = 16;
@@ -11170,7 +11261,20 @@ void Engine::RenderFrame() {
             // identical to the previous post-denoise behaviour.
             std::uint32_t tonemap_op;
             std::uint32_t _pad_stars_align;
-            // 48 bytes of padding to advance ghosts[] forward to host
+            // --- Wave 10 bloom/bokeh ---
+            // Reclaimed from the head of the old 48-byte _pad_to_push_split
+            // run (now 36 bytes) so ghosts[] still lands at offset 112 --
+            // the layout, sizeof, and offsetof asserts below are all
+            // UNCHANGED. r_bloom_strength gain + lens-dirt gate + dirt
+            // strength, consumed by Tonemap.slang's bloom composite. All
+            // three default to the bit-for-bit-with-pre-wave-10 values
+            // (strength 1.0, dirt off, strength ignored) so existing bloom
+            // goldens are untouched.
+            float        bloom_strength;     // final gain on the bloom add (1.0 = neutral)
+            std::uint32_t lens_dirt;         // 0 = clean lens, 1 = procedural dirt modulates bloom
+            float        lens_dirt_strength; // 0..1 mix of the dirt field into the bloom modulation
+            // --- end Wave 10 bloom/bokeh ---
+            // 36 bytes of padding to advance ghosts[] forward to host
             // offset 112 -- the Vulkan push-constant split boundary
             // (VulkanDevice::kPushSplitOffset). The first 112 bytes of
             // this struct go to vkCmdPushConstants on the SPIR-V path;
@@ -11182,7 +11286,7 @@ void Engine::RenderFrame() {
             // through setBytes; the padding is dead weight (~0.05% of
             // a frame's CPU push budget) but keeps a single host-side
             // TonePush shape across both backends.
-            float        _pad_to_push_split[12];   // 12 * 4 = 48 bytes
+            float        _pad_to_push_split[9];   // 9 * 4 = 36 bytes
             PtShaderGhost ghosts[lensflare::kMaxGhosts];
         } tp{};
         static_assert(sizeof(TonePush) % 16 == 0, "TonePush 16-byte aligned");
@@ -11200,6 +11304,27 @@ void Engine::RenderFrame() {
         tp.passthrough      = hdr_pipeline ? 0u : 1u;
         tp.bloom_intensity  = (bloom_on && bloom_h.id == bloom_mip_tex_id_[0])
                                 ? bloom_intensity : 0.0f;
+        // --- Wave 10 bloom/bokeh ---
+        // r_bloom_strength scales the composited bloom on top of
+        // bloom_intensity; r_lens_dirt gates the procedural dirt overlay
+        // and r_lens_dirt_strength sets its mix. Defaults (1.0 / 0 / 0.6)
+        // reproduce the pre-wave-10 composite exactly (strength 1, dirt
+        // off -> dirt branch elided in the shader), so bloom goldens stay
+        // bit-for-bit. The dirt gate also requires bloom to have actually
+        // run, mirroring the flare gate below.
+        {
+            float bstr = 1.0f;
+            bool  dirt_on = false;
+            float dstr = 0.6f;
+            if (auto* v = C.FindCVar("r_bloom_strength"))      bstr    = v->GetFloat();
+            if (auto* v = C.FindCVar("r_lens_dirt"))           dirt_on = v->GetBool();
+            if (auto* v = C.FindCVar("r_lens_dirt_strength"))  dstr    = v->GetFloat();
+            tp.bloom_strength     = bstr;
+            tp.lens_dirt          = (dirt_on && bloom_on &&
+                                     bloom_h.id == bloom_mip_tex_id_[0]) ? 1u : 0u;
+            tp.lens_dirt_strength = std::clamp(dstr, 0.0f, 1.0f);
+        }
+        // --- end Wave 10 bloom/bokeh ---
         // Flare also samples the bloom mip, so it depends on bloom
         // having actually run. If bloom is off the bloom_tex slot is
         // the 1x1 placeholder and the flare loop would just sample
@@ -14408,6 +14533,15 @@ void Engine::RegisterCommands() {
     if (auto* v = C.FindCVar("r_lens_flare")) {
         v->allowed_values = {"0", "1"};
     }
+    // Wave 10 (PR #235): r_lens_dirt is a strict boolean toggle (clean lens
+    // vs procedural grime overlay on the bloom), so it follows the same
+    // allowed_values contract as r_bloom / r_lens_flare -- the web UI then
+    // renders it as a toggle and tab-completion / cvar validation reject
+    // arbitrary numeric strings that would otherwise be silently accepted.
+    // Like bloom/flare it's a post-tonemap effect, so no accum reset.
+    if (auto* v = C.FindCVar("r_lens_dirt")) {
+        v->allowed_values = {"0", "1"};
+    }
     // Fluid Phase 1 (#136): r_smoke_enabled is a strict bool. Matches
     // the registration pattern used by the other renderer toggles
     // above so the toggle / cvar-validation chain can treat it
@@ -14512,6 +14646,21 @@ void Engine::RegisterCommands() {
     if (auto* v = C.FindCVar("r_dof_blades")) {
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
+    // --- Wave 10 polygonal bokeh (PR #235): r_dof_blade_rotation and
+    // r_dof_cateye both feed PathTrace.slang's primary-ray aperture
+    // sampler (the N-gon orientation and the off-axis cat's-eye squeeze),
+    // so changing either at runtime reshapes the lens sample exactly like
+    // the sibling r_dof_* params above. They were missing the accum reset,
+    // so a mid-flight tweak smeared the old aperture's accumulated bokeh
+    // into the new shape until something else dirtied the accumulator.
+    // Reset accum on change to match every other thin-lens cvar.
+    if (auto* v = C.FindCVar("r_dof_blade_rotation")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    if (auto* v = C.FindCVar("r_dof_cateye")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    // --- end Wave 10 polygonal bokeh ---
     if (auto* v = C.FindCVar("r_volumetric")) {
         v->allowed_values = {"0", "1"};
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
@@ -15194,6 +15343,13 @@ void Engine::RegisterCommands() {
     set_slider("r_bloom_intensity",     0.0f,   1.0f,  0.005f);
     set_slider("r_bloom_mips",          1.0f,   5.0f,  1.0f);
     set_slider("r_bloom_radius",        0.5f,   3.0f,  0.05f);
+    // Wave 10 (PR #235): artist-facing bloom/lens-dirt gains. r_bloom_strength
+    // is the final composite gain (1.0 neutral, cinematic 0.5..2.0 per its
+    // docstring); r_lens_dirt_strength is the dirt-field mix (0 clean .. 1
+    // full gate). Registered as sliders alongside the other r_bloom_* knobs
+    // so the web UI renders them as range inputs rather than text boxes.
+    set_slider("r_bloom_strength",      0.0f,   2.0f,  0.01f);
+    set_slider("r_lens_dirt_strength",  0.0f,   1.0f,  0.01f);
     set_slider("r_lens_flare_intensity",      0.0f, 1.0f,  0.005f);
     set_slider("r_lens_flare_dispersion",     0.0f, 0.05f, 0.001f);
     set_slider("r_lens_flare_count",          1.0f, 6.0f,  1.0f);
