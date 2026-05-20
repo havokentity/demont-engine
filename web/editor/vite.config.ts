@@ -20,6 +20,7 @@ const panels = [
   'asset-browser',
   'toolbar',
   'material-editor',
+  'lights',
 ];
 
 const input: Record<string, string> = {};

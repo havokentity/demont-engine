@@ -122,7 +122,7 @@ namespace cvar {
     PT_CVAR(r_editor_panels_autoopen, "",
             "Comma-separated list of editor panels to open on engine "
             "init. Names: scene-hierarchy, inspector, asset-browser, "
-            "toolbar. Example: \"scene-hierarchy,inspector\". Empty "
+            "toolbar, lights. Example: \"scene-hierarchy,inspector\". Empty "
             "(default) = no auto-open. Panels are spawned as Chrome "
             "--app windows; if Chrome / Edge isn't found, the engine "
             "logs a warning and continues.",
@@ -2269,6 +2269,7 @@ bool Engine::Init() {
             constexpr int kF4 = 293;
             constexpr int kF5 = 294;
             constexpr int kF6 = 295;  // material-editor (wave-9)
+            constexpr int kF7 = 296;  // lights (wave-9)
             // Gizmo-mode hotkeys for the editor 3D gizmo overlay.
             constexpr int kG     = 71;   // GLFW_KEY_G
             constexpr int kR     = 82;   // GLFW_KEY_R
@@ -2299,6 +2300,7 @@ bool Engine::Init() {
                 case kF4: panel = "asset-browser";   break;
                 case kF5: panel = "toolbar";         break;
                 case kF6: panel = "material-editor"; break;
+                case kF7: panel = "lights";          break;
                 default: break;
             }
             if (panel != nullptr) {
@@ -11753,6 +11755,7 @@ void Engine::HandleMouseInput() {
     std::uint32_t best_id = 0;
     float         best_t  = 1e30f;
     bool          best_hit = false;
+    bool          best_is_light = false;
     for (const auto& [id, p] : primitives_) {
         float t = 0.0f;
         if (p.type == AnalyticPrim::Sphere) {
@@ -11784,8 +11787,51 @@ void Engine::HandleMouseInput() {
         }
     }
 
+    // --- Wave 9 light-gizmo: pick analytic lights via a billboard handle ---
+    // Lights have no surface geometry, so the prim ray-vs-shape test above
+    // can never hit them. Give each light a screen-stable spherical pick
+    // handle at L.pos: radius grows with camera distance so the clickable
+    // target stays roughly constant in pixels (~kPickAngularSize half-
+    // angle), with a small world-space floor so a light right on top of
+    // the camera is still clickable. This co-located handle is the same
+    // anchor the EditorOverlay light icon draws at, so the user clicks
+    // exactly what they see. Lights compete in the same nearest-t race as
+    // prims; on a tie-ish overlap the closer surface wins.
+    {
+        // tan(half-angle); ~0.045 rad ≈ 2.6 deg apparent radius. Matches
+        // the icon's on-screen footprint closely enough to feel direct.
+        constexpr float kPickAngularSize = 0.045f;
+        constexpr float kMinPickRadius   = 0.12f;   // metres
+        for (const auto& [id, L] : light_prims_) {
+            const glm::vec3 c{L.pos[0], L.pos[1], L.pos[2]};
+            const float dist = glm::length(c - ro);
+            const float r_pick = std::max(kMinPickRadius, dist * kPickAngularSize);
+            const glm::vec3 oc = ro - c;
+            const float bb = glm::dot(oc, rd);
+            const float cc = glm::dot(oc, oc) - r_pick * r_pick;
+            const float disc = bb * bb - cc;
+            if (disc < 0.0f) continue;
+            const float h_ = std::sqrt(disc);
+            const float t0 = -bb - h_;
+            const float t1 = -bb + h_;
+            float t;
+            if (t0 > 1e-4f) t = t0;
+            else if (t1 > 1e-4f) t = t1;
+            else continue;
+            if (t < best_t) {
+                best_t        = t;
+                best_id       = id;
+                best_hit      = true;
+                best_is_light = true;
+            }
+        }
+    }
+    // --- end Wave 9 light-gizmo pick ---------------------------------------
+
     if (best_hit) {
-        SetSelection(SelectionKind::AnalyticPrim, best_id);
+        SetSelection(best_is_light ? SelectionKind::Light
+                                   : SelectionKind::AnalyticPrim,
+                     best_id);
     } else {
         SetSelection(SelectionKind::None, 0);
     }
@@ -16798,6 +16844,84 @@ void Engine::UpdateEditorGizmoFrame() {
 
     editor_gizmo_.ClearSegments();
 
+    // --- Wave 9 light-gizmo: per-light viewport icons ----------------------
+    // Draw a small sun-burst marker for EVERY analytic light, regardless
+    // of selection, so lights (which have no surface geometry) are
+    // visible and pickable in the viewport. The marker is co-located
+    // with the click-pick handle in HandleMouseInput. We do this BEFORE
+    // the selection-gizmo build below (and outside its early-returns) so
+    // the icons render even when nothing -- or a prim -- is selected.
+    AppendLightIconsForViewport();
+    // --- end Wave 9 light-gizmo icons --------------------------------------
+
+    // Build the translate/rotate/scale gizmo for the current selection.
+    // All the click+drag state-machine + early-return logic lives in the
+    // helper so this function can always fall through to the single GPU
+    // upload below (the light icons need to upload even when the gizmo
+    // build bails on "nothing selected").
+    BuildSelectionGizmo(gizmo_enabled);
+
+    // Upload to GPU. Covers both the light icons and (when present) the
+    // selection gizmo segments.
+    if (editor_overlay_segs_buf_id_ != 0 && editor_gizmo_.SegmentCount() > 0) {
+        const std::uint32_t cap = editor_overlay_segs_buf_capacity_;
+        const std::uint32_t n   = std::min(editor_gizmo_.SegmentCount(), cap);
+        device_->WriteBuffer(
+            pt::rhi::BufferHandle{editor_overlay_segs_buf_id_},
+            editor_gizmo_.Segments().data(),
+            std::size_t(n) * sizeof(pt::renderer::EditorOverlay::Segment),
+            0);
+    }
+}
+
+// --- Wave 9 light-gizmo ------------------------------------------------------
+// Append a viewport icon for every analytic light into editor_gizmo_'s
+// segment list. Each glyph is sized so it stays roughly screen-stable
+// (scales with camera distance) and tinted by the light's chromaticity;
+// the currently-selected light is highlighted. Bounded against the
+// overlay segment capacity so a scene with many lights never overruns
+// the GPU buffer (the selection gizmo, built afterwards, then competes
+// for whatever headroom remains -- but the gizmo is the priority, so we
+// reserve room for it).
+void Engine::AppendLightIconsForViewport() {
+    if (light_prims_.empty() || !camera_) return;
+
+    // Reserve headroom for the selection gizmo (rotate mode is the
+    // heaviest at ~96 segments + tips). Each light icon is 14 segments.
+    constexpr std::uint32_t kGizmoReserve = 128;
+    const std::uint32_t cap = editor_overlay_segs_buf_capacity_;
+    const std::uint32_t icon_budget = (cap > kGizmoReserve)
+                                          ? (cap - kGizmoReserve) : 0u;
+    constexpr std::uint32_t kSegmentsPerIcon = 14;
+    const std::uint32_t max_icons = icon_budget / kSegmentsPerIcon;
+
+    // Screen-stable angular size: icon arm length grows with distance so
+    // the on-screen footprint stays ~constant. Matches the pick handle's
+    // kPickAngularSize in HandleMouseInput so click target == visual.
+    constexpr float kIconAngularSize = 0.055f;   // tan(half-angle) ~3.1 deg
+    constexpr float kMinIconSize     = 0.15f;    // metres
+
+    const glm::vec3 cam_pos = camera_->pos;
+    std::uint32_t drawn = 0;
+    for (const auto& [id, L] : light_prims_) {
+        if (drawn >= max_icons) break;
+        const glm::vec3 o{L.pos[0], L.pos[1], L.pos[2]};
+        const float dist = glm::length(o - cam_pos);
+        const float size = std::max(kMinIconSize, dist * kIconAngularSize);
+        // Chromaticity = intensity normalised to its peak channel; a
+        // black light falls back to neutral inside AppendLightIcon.
+        const float peak = std::max({L.intensity[0], L.intensity[1], L.intensity[2]});
+        const glm::vec3 color = (peak > 0.0f)
+            ? glm::vec3{L.intensity[0] / peak, L.intensity[1] / peak, L.intensity[2] / peak}
+            : glm::vec3{0.7f};
+        const bool highlighted =
+            selected_kind_ == SelectionKind::Light && selected_prim_id_ == id;
+        editor_gizmo_.AppendLightIcon(o, size, color, highlighted);
+        ++drawn;
+    }
+}
+
+void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
     // Gizmo gates on the editor's canonical selection state. Analytic
     // primitives (sphere / plane) drive prim_set_pos + prim_set_rotation;
     // analytic lights (point / spot / sphere / quad) drive
@@ -17084,18 +17208,8 @@ void Engine::UpdateEditorGizmoFrame() {
     const pt::renderer::EditorOverlay::Axis hl =
         editor_gizmo_.IsDragging() ? editor_gizmo_.DragAxis() : hovered;
     editor_gizmo_.AppendGizmo(build_origin, gizmo_size, hl);
-
-    // Upload to GPU.
-    if (editor_overlay_segs_buf_id_ != 0 && editor_gizmo_.SegmentCount() > 0) {
-        const std::uint32_t cap = editor_overlay_segs_buf_capacity_;
-        const std::uint32_t n   = std::min(editor_gizmo_.SegmentCount(), cap);
-        device_->WriteBuffer(
-            pt::rhi::BufferHandle{editor_overlay_segs_buf_id_},
-            editor_gizmo_.Segments().data(),
-            std::size_t(n) * sizeof(pt::renderer::EditorOverlay::Segment),
-            0);
-    }
 }
+// --- end Wave 9 light-gizmo --------------------------------------------------
 
 // --- SDF Phase 1 (#97) -----------------------------------------------------
 //
@@ -20730,8 +20844,8 @@ void Engine::RegisterEditorCommands() {
     auto* cmd_open = C.RegisterCommand("panel_open",
         "Open an editor panel in a Chrome --app window. Usage: "
         "panel_open <name>. Names: scene-hierarchy, inspector, "
-        "asset-browser, toolbar, material-editor. Use `panels` to list "
-        "state. Honors r_editor_dev_mode (Vite dev server URL when 1).",
+        "asset-browser, toolbar, material-editor, lights. Use `panels` to "
+        "list state. Honors r_editor_dev_mode (Vite dev server URL when 1).",
         [this](auto args, pt::console::Output& out) {
             if (args.empty()) {
                 out.PrintLine(
@@ -20743,7 +20857,7 @@ void Engine::RegisterEditorCommands() {
                 out.FormatLine(
                     "panel_open: unknown panel '{}'. Known: "
                     "scene-hierarchy, inspector, asset-browser, toolbar, "
-                    "material-editor",
+                    "material-editor, lights",
                     name);
                 return;
             }

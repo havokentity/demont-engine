@@ -1,0 +1,619 @@
+/*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Rajesh D'Monte
+ *
+ * Lights panel styles. Colour vars come from the shared theme.css so
+ * the panel themes uniformly with the rest of the editor. Field-level
+ * classes (lp-num / lp-slider / lp-color / ...) mirror the Property
+ * Inspector's field styling so the two panels read consistently; the
+ * lp- prefix keeps the Lights panel self-contained (each panel is its
+ * own Vite entry).
+ */
+
+/* ----- Layout ----------------------------------------------------------- */
+
+.lp-body {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  font-size: 12px;
+  gap: 8px;
+}
+
+/* ----- Toolbar (add buttons) -------------------------------------------- */
+
+.lp-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 6px 8px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.lp-toolbar-label {
+  color: var(--fg-muted);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.lp-add-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  padding: 3px 8px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  border-radius: 3px;
+  text-transform: capitalize;
+  transition: background 0.1s ease;
+}
+
+.lp-add-btn:hover {
+  background: var(--accent-glow);
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+
+.lp-refresh {
+  margin-left: auto;
+  background: var(--bg);
+  color: var(--fg-muted);
+  border: 1px solid var(--border-strong);
+  padding: 3px 9px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  border-radius: 3px;
+}
+
+.lp-refresh:hover {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+
+/* ----- List ------------------------------------------------------------- */
+
+.lp-list {
+  flex: 0 1 auto;
+  max-height: 38%;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px;
+}
+
+.lp-row-item {
+  display: grid;
+  grid-template-columns: 18px 1fr auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: 3px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.lp-row-item:hover {
+  background: var(--bg);
+}
+
+.lp-row-item.is-selected {
+  background: var(--accent-glow);
+  outline: 1px solid var(--accent-dim);
+}
+
+.lp-row-icon {
+  text-align: center;
+}
+
+.lp-row-name {
+  color: var(--fg);
+  text-transform: capitalize;
+}
+
+.lp-row-id {
+  color: var(--fg-muted);
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 11px;
+}
+
+.lp-row-intensity {
+  color: var(--fg-muted);
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  min-width: 38px;
+  text-align: right;
+}
+
+.lp-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: 6px;
+  padding: 20px;
+}
+
+.lp-empty h4 {
+  margin: 0;
+  color: var(--fg);
+  font-weight: 500;
+}
+
+.lp-empty p {
+  margin: 0;
+  color: var(--fg-muted);
+  max-width: 320px;
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
+.lp-empty code {
+  background: var(--bg);
+  color: var(--accent);
+  padding: 1px 5px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 11px;
+}
+
+/* ----- Inspector -------------------------------------------------------- */
+
+.lp-inspector {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.lp-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.lp-badge {
+  display: inline-block;
+  padding: 2px 7px;
+  background: var(--accent-glow);
+  color: var(--accent);
+  border: 1px solid var(--accent-dim);
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: capitalize;
+}
+
+.lp-badge.is-light {
+  background: rgba(255, 199, 58, 0.12);
+  color: var(--warn);
+  border-color: rgba(255, 199, 58, 0.4);
+}
+
+.lp-badge.is-readonly {
+  background: var(--bg);
+  color: var(--fg-muted);
+  border-color: var(--border-strong);
+  font-weight: 500;
+}
+
+.lp-id {
+  color: var(--fg-muted);
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 11px;
+  flex: 1 1 auto;
+}
+
+.lp-goto {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  padding: 3px 9px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  border-radius: 3px;
+  transition: background 0.1s ease;
+}
+
+.lp-goto:hover {
+  background: var(--accent-glow);
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+
+.lp-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.lp-section-title {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+  margin: 0 0 2px 0;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.lp-row {
+  display: grid;
+  grid-template-columns: 90px 1fr;
+  align-items: center;
+  gap: 8px;
+  min-height: 24px;
+}
+
+.lp-row > label {
+  color: var(--fg-muted);
+  font-size: 11.5px;
+  user-select: none;
+}
+
+.lp-vec3 {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 4px;
+}
+
+/* ----- NumberField ------------------------------------------------------ */
+
+.lp-num {
+  display: flex;
+  align-items: stretch;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  overflow: hidden;
+  height: 22px;
+}
+
+.lp-num.is-x { border-left: 2px solid #e84a4a; }
+.lp-num.is-y { border-left: 2px solid #4ae868; }
+.lp-num.is-z { border-left: 2px solid #4a8cff; }
+.lp-num.is-scrubbing { background: var(--accent-glow); }
+.lp-num.is-focus { border-color: var(--accent-dim); }
+
+.lp-num-axis {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  padding: 0 4px;
+  cursor: ew-resize;
+  user-select: none;
+  color: var(--fg-muted);
+  font-size: 10.5px;
+  font-weight: 600;
+  background: var(--bg-elev);
+  border-right: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.lp-num-axis:hover {
+  color: var(--accent);
+}
+
+.lp-num-axis.is-x { color: #ff8080; }
+.lp-num-axis.is-y { color: #80ff8c; }
+.lp-num-axis.is-z { color: #809cff; }
+
+.lp-num-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: transparent;
+  color: var(--fg);
+  border: none;
+  outline: none;
+  font: inherit;
+  font-size: 11.5px;
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  padding: 0 5px;
+  text-align: right;
+}
+
+.lp-num-input:disabled {
+  color: var(--fg-dim);
+}
+
+/* ----- Select ----------------------------------------------------------- */
+
+.lp-select {
+  width: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  height: 22px;
+  padding: 0 6px;
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.lp-select:focus {
+  outline: none;
+  border-color: var(--accent-dim);
+}
+
+/* ----- Slider ----------------------------------------------------------- */
+
+.lp-slider-row {
+  display: grid;
+  grid-template-columns: 1fr 56px;
+  gap: 6px;
+  align-items: center;
+}
+
+.lp-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 18px;
+  background: transparent;
+  cursor: pointer;
+  margin: 0;
+}
+
+.lp-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 2px;
+}
+
+.lp-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  background: var(--accent);
+  border-radius: 50%;
+  margin-top: -5px;
+  border: 1px solid var(--accent-dim);
+}
+
+.lp-slider:focus { outline: none; }
+.lp-slider:focus::-webkit-slider-thumb {
+  box-shadow: 0 0 0 2px var(--accent-glow);
+}
+
+/* ----- Exposure stepper ------------------------------------------------- */
+
+.lp-ev {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+}
+
+.lp-ev-btn {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  height: 22px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  border-radius: 3px;
+}
+
+.lp-ev-btn:hover {
+  background: var(--accent-glow);
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+
+/* ----- Color field ------------------------------------------------------ */
+
+.lp-color {
+  display: grid;
+  grid-template-columns: 26px 1fr;
+  gap: 6px;
+  align-items: stretch;
+}
+
+.lp-swatch {
+  height: 22px;
+  border-radius: 3px;
+  border: 1px solid var(--border-strong);
+  cursor: pointer;
+  background-image:
+    linear-gradient(45deg, #555 25%, transparent 25%),
+    linear-gradient(-45deg, #555 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #555 75%),
+    linear-gradient(-45deg, transparent 75%, #555 75%);
+  background-size: 8px 8px;
+  background-position: 0 0, 0 4px, 4px -4px, -4px 0;
+  position: relative;
+  overflow: hidden;
+}
+
+.lp-swatch-fill {
+  position: absolute;
+  inset: 0;
+}
+
+.lp-swatch:hover {
+  border-color: var(--accent-dim);
+}
+
+.lp-hex {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  height: 22px;
+  padding: 0 6px;
+  font: inherit;
+  font-size: 11px;
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  outline: none;
+  text-transform: uppercase;
+}
+
+.lp-hex:focus {
+  border-color: var(--accent-dim);
+}
+
+.lp-popover {
+  position: fixed;
+  z-index: 100;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  padding: 8px;
+  width: 200px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.lp-sv-plane {
+  position: relative;
+  width: 100%;
+  height: 130px;
+  border-radius: 3px;
+  cursor: crosshair;
+  overflow: hidden;
+  user-select: none;
+  touch-action: none;
+}
+
+.lp-sv-cursor {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  border: 2px solid white;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  box-shadow: 0 0 2px black;
+}
+
+.lp-hue-bar {
+  position: relative;
+  height: 12px;
+  border-radius: 2px;
+  cursor: pointer;
+  background: linear-gradient(to right,
+    #ff0000 0%, #ffff00 16.66%, #00ff00 33.33%,
+    #00ffff 50%, #0000ff 66.66%, #ff00ff 83.33%, #ff0000 100%);
+  user-select: none;
+  touch-action: none;
+}
+
+.lp-hue-cursor {
+  position: absolute;
+  top: -2px;
+  width: 4px;
+  height: 16px;
+  background: white;
+  border: 1px solid black;
+  border-radius: 2px;
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+.lp-rgb-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.lp-rgb-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 10px;
+  color: var(--fg-muted);
+}
+
+.lp-rgb-grid input {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  height: 20px;
+  padding: 0 4px;
+  font: inherit;
+  font-size: 11px;
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  outline: none;
+}
+
+.lp-rgb-grid input:focus { border-color: var(--accent-dim); }
+
+/* ----- Actions ---------------------------------------------------------- */
+
+.lp-actions {
+  display: flex;
+  gap: 6px;
+  padding-top: 4px;
+}
+
+.lp-btn {
+  flex: 1 1 auto;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  padding: 5px 10px;
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+  border-radius: 3px;
+  transition: background 0.1s ease;
+}
+
+.lp-btn:hover {
+  background: var(--accent-glow);
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+
+.lp-btn.is-danger {
+  border-color: rgba(255, 74, 94, 0.4);
+  color: var(--error);
+}
+
+.lp-btn.is-danger:hover {
+  background: rgba(255, 74, 94, 0.15);
+  border-color: var(--error);
+  color: var(--error);
+}
+
+.lp-btn.is-confirm {
+  background: rgba(255, 74, 94, 0.2);
+  border-color: var(--error);
+  color: var(--error);
+  font-weight: 600;
+}

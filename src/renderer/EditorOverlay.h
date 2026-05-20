@@ -67,6 +67,21 @@ public:
     // Pass Axis::None when no hover.
     void AppendGizmo(const glm::vec3& origin, float size, Axis hovered_axis);
 
+    // --- Wave 9 light-gizmo ---
+    // Append a small in-viewport icon for a light at `origin`. Lights
+    // have no surface geometry, so this billboard-ish glyph (a 3D
+    // sun-burst built from short line segments) is both the visual
+    // marker AND co-located with the click-pick handle in
+    // Engine::HandleMouseInput, so the user selects exactly what they
+    // see. `size` is the world-space arm length (the engine scales it
+    // with camera distance so the icon stays roughly screen-stable).
+    // `color` tints the glyph (typically the light's chromaticity);
+    // `highlighted` brightens it for the currently-selected light.
+    // Pure line segments -- no shader change required.
+    void AppendLightIcon(const glm::vec3& origin, float size,
+                         const glm::vec3& color, bool highlighted);
+    // --- end Wave 9 light-gizmo ---
+
     // GPU upload accessors.
     const std::vector<Segment>& Segments() const noexcept { return segs_; }
     std::uint32_t                SegmentCount() const noexcept {

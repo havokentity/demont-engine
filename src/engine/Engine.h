@@ -352,8 +352,23 @@ private:
     // segment list, run hit-test + drag math from polled input, upload
     // to the GPU buffer. Called from RenderFrame BEFORE the gizmo
     // dispatch so the buffer is populated by the time the kernel
-    // binds it. No-op when selected_kind_ != AnalyticPrim.
+    // binds it. Always draws the per-light viewport icons (Wave 9);
+    // the translate/rotate/scale handle is drawn only when a prim or
+    // light is selected.
     void UpdateEditorGizmoFrame();
+    // --- Wave 9 light-gizmo ---
+    // Append a sun-burst marker for every analytic light into the
+    // overlay segment list (called every frame, independent of
+    // selection, so lights stay visible + pickable). Bounded against
+    // the overlay segment capacity.
+    void AppendLightIconsForViewport();
+    // Build the selection transform gizmo (translate / rotate / scale)
+    // + run its click-drag state machine. Split out of
+    // UpdateEditorGizmoFrame so the latter can always fall through to a
+    // single GPU upload covering both the light icons and the gizmo.
+    // No-op when nothing editable is selected or the gizmo is disabled.
+    void BuildSelectionGizmo(bool gizmo_enabled);
+    // --- end Wave 9 light-gizmo ---
     // Named camera bookmark commands (cam_save_named / cam_load_named /
     // cam_list_bookmarks / cam_delete_bookmark). Split out from
     // RegisterCommands so the unit test can wire just these (the full
@@ -458,7 +473,7 @@ private:
     //   `panel_close_all`         closes every tracked panel
     //   `panels`                  prints the known panels + per-panel state
     // The spawned-PID table lives in open_panels_pids_ keyed by panel
-    // name. Hotkeys F2/F3/F4/F5/F6 fire panel_open via the existing
+    // name. Hotkeys F2/F3/F4/F5/F6/F7 fire panel_open via the existing
     // key handler in Init().
     void RegisterEditorCommands();
     // Internal: spawn the panel in a fresh Chrome --app window. Tries
