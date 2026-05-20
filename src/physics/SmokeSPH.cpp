@@ -484,9 +484,13 @@ void SmokeSPH::Substep(float sdt) {
     // 4. Force pass. For each particle, accumulate:
     //   * pressure gradient toward neighbours (repulsion when over-
     //     compressed -> pushes particles apart).
-    //   * viscosity laplacian (smoothing of velocity field; Müller
-    //     formulation: F_visc = mu * sum_j (m_j / rho_j) * (v_j - v_i)
-    //     * laplacian_W).
+    //   * NOTE: viscosity is NOT a force term anymore. Müller's explicit
+    //     viscosity-laplacian force was unstable at high mu, so wave-9
+    //     replaced it with bounded XSPH velocity smoothing -- the
+    //     poly6-weighted neighbour-velocity average is accumulated here
+    //     (when viscosity > 0) into xsph_corr_ and applied as a convex
+    //     velocity blend in the integrate step, not added to force_.
+    //     See the XSPH note inside the loop below.
     //   * gravity (constant accel * mass; expressed as a force here).
     //   * Buoyancy: F_b = -rho_air * V * g * (T_air - T_p) / T_p,
     //     simplified as buoyancy_scale * (T_p - T_air) / T_air * (-g)
@@ -524,6 +528,15 @@ void SmokeSPH::Substep(float sdt) {
         glm::vec3 xsph_dv(0.0f);
         float     xsph_wsum = 0.0f;
         const float mass_i = (!emitters_.empty()) ? emitters_[0].particle_mass : 0.001f;
+        // The XSPH correction is only ever consumed when the integrate
+        // step's eps > 0, which happens iff cfg_.viscosity > 0 (eps =
+        // clamp(viscosity*4, 0, 0.5)). When viscosity is disabled the
+        // poly6 evaluation + accumulation below is dead work, so gate it
+        // off and skip the extra kernel_poly6 per neighbour. Behaviour is
+        // identical for viscosity > 0; for viscosity == 0 xsph_corr_[i]
+        // is forced to zero (it would have been blended by eps == 0
+        // anyway, so this is purely a perf gate, not a behaviour change).
+        const bool accumulate_xsph = (cfg_.viscosity > 0.0f);
         for (std::size_t j : scratch) {
             if (j == i) continue;
             const auto d   = particles_[i].pos - particles_[j].pos;
@@ -538,16 +551,19 @@ void SmokeSPH::Substep(float sdt) {
             f_pressure += -mass_i * ((pressure_[i] + pressure_[j]) / (2.0f * rho_j))
                            * coef * dir;
             // XSPH: poly6-mass-weighted neighbour velocity difference.
-            const float w6 = kernel_poly6(r2, h2, h9);
-            xsph_dv   += (mass_i / rho_j) * (particles_[j].vel - particles_[i].vel) * w6;
-            xsph_wsum += (mass_i / rho_j) * w6;
+            if (accumulate_xsph) {
+                const float w6 = kernel_poly6(r2, h2, h9);
+                xsph_dv   += (mass_i / rho_j) * (particles_[j].vel - particles_[i].vel) * w6;
+                xsph_wsum += (mass_i / rho_j) * w6;
+            }
         }
         // Stash the (normalised) XSPH velocity correction for this
         // particle; applied as a bounded blend at integration. Dividing
         // by the weight sum makes it a true weighted average so the eps
         // blend factor is scale-free (independent of neighbour count).
-        xsph_corr_[i] = (xsph_wsum > 1e-8f) ? (xsph_dv / xsph_wsum)
-                                            : glm::vec3(0.0f);
+        xsph_corr_[i] = (accumulate_xsph && xsph_wsum > 1e-8f)
+                            ? (xsph_dv / xsph_wsum)
+                            : glm::vec3(0.0f);
         // Gravity acts on the particle's mass.
         glm::vec3 f_gravity = cfg_.gravity * mass_i;
         // Buoyancy via simplified Boussinesq. F = -m * g * scale *

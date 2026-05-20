@@ -280,10 +280,14 @@ TEST_CASE("SmokeSPH curl-noise perturbs particle motion (deterministically)") {
     CHECK(glm::length(still - glm::vec3(3.0f, 3.0f, 3.0f)) < 1e-4f);
     // Curl on -> particle is deflected away from rest.
     CHECK(glm::length(curled1 - glm::vec3(3.0f, 3.0f, 3.0f)) > 0.05f);
-    // Deterministic: two runs land bit-identical.
-    CHECK(curled1.x == doctest::Approx(curled2.x));
-    CHECK(curled1.y == doctest::Approx(curled2.y));
-    CHECK(curled1.z == doctest::Approx(curled2.z));
+    // Deterministic: two runs land bit-identical. Use exact float
+    // equality (not doctest::Approx) -- the curl-noise path is a pure
+    // function of (position, time) with no RNG or float-order ambiguity,
+    // so re-running the same inputs reproduces the same bits exactly.
+    // This is what goldens rely on, so the assertion matches the wording.
+    CHECK(curled1.x == curled2.x);
+    CHECK(curled1.y == curled2.y);
+    CHECK(curled1.z == curled2.z);
 }
 
 TEST_CASE("SmokeSPH high-viscosity XSPH stays stable (no explosion)") {

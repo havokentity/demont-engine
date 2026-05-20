@@ -188,7 +188,7 @@ public:
         // smoke eddy.
         float curl_time_rate = 0.5f;
 
-        // Curl vertical-coherence gain (dimensionless). The curl field's
+        // Curl lateral gain (dimensionless). The curl field's
         // horizontal (xz) components are amplified relative to the
         // vertical (y) component by this factor so the turbulence
         // preferentially folds the column SIDEWAYS (lateral billowing)
