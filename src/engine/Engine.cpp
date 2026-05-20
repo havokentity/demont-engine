@@ -940,6 +940,70 @@ namespace cvar {
             "evolves at ~0.03 rad/s for the 'waves traveling along "
             "the curtain' look.",
             CVAR_ARCHIVE);
+    // --- Wave 9 height-fog ---------------------------------------------
+    // Volumetric height fog: physically-based exponential-height-falloff
+    // atmospheric fog, applied as a dedicated post-radiance composite
+    // (shaders/HeightFog.slang) dispatched after the SIGMA shadow demod
+    // and before the celestial / cloud / aurora composites. All units
+    // metric (1 world unit = 1 m). Defaults OFF so existing goldens stay
+    // bit-for-bit unchanged -- the engine elides the dispatch when
+    // r_fog == 0. Metal-only at wave scope (Vulkan wiring is a follow-up).
+    PT_CVAR(r_fog,              "0",
+            "Volumetric height fog (wave-9). 0 = off (zero cost, dispatch "
+            "elided), 1 = integrate physically-based exponential-height "
+            "atmospheric fog along the camera ray and Beer-Lambert blend "
+            "the in-scatter into the HDR. Distant geometry fades into the "
+            "fog colour, near geometry stays clear, the sun side brightens "
+            "via a Henyey-Greenstein phase. Metal-only today. See "
+            "shaders/HeightFog.slang.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_fog_density,      "0.02",
+            "Fog extinction coefficient at the base height r_fog_base_y, "
+            "in 1/m (real units). Light haze ~0.001-0.005 (visibility km+), "
+            "moderate fog ~0.01-0.05, thick valley/radiation fog ~0.1+. "
+            "Density falls off exponentially with altitude above the base "
+            "(see r_fog_scale_height). Default 0.02 = a moderate ground "
+            "haze. Only meaningful when r_fog 1.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_fog_base_y,       "0.0",
+            "Fog base altitude in metres -- the height at which the "
+            "density equals r_fog_density. Density is clamped to the base "
+            "value below this height (single-layer model) and decays "
+            "exponentially above it. Default 0.0 (sea level / ground "
+            "plane). Only meaningful when r_fog 1.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_fog_scale_height, "300.0",
+            "Fog scale height in metres -- the e-folding distance of the "
+            "exponential density falloff (density drops by 1/e every "
+            "r_fog_scale_height metres of altitude above r_fog_base_y). "
+            "Real radiation fog ~100 m; marine / haze boundary layers "
+            "~500-1000 m. Default 300 m. Only meaningful when r_fog 1.",
+            CVAR_ARCHIVE);
+    // r_fog_color_{r,g,b} is the linear-RGB tint of the fog in-scatter
+    // (both the ambient term and the sun forward-scatter lobe are
+    // multiplied by it). Three scalar cvars matching the established
+    // r_water_deep_color_{r,g,b} convention. Default a neutral cool grey
+    // (slightly blue) for a believable atmospheric haze.
+    PT_CVAR(r_fog_color_r,      "0.55",
+            "Fog in-scatter tint, red channel (linear RGB, 0..1+). See "
+            "r_fog_color_g/b. Default 0.55 (cool neutral haze).",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_fog_color_g,      "0.62",
+            "Fog in-scatter tint, green channel (linear RGB). See "
+            "r_fog_color_r. Default 0.62.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_fog_color_b,      "0.72",
+            "Fog in-scatter tint, blue channel (linear RGB). See "
+            "r_fog_color_r. Default 0.72 (slight blue cast).",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_fog_sun_anisotropy, "0.6",
+            "Henyey-Greenstein phase anisotropy g for the fog sun "
+            "forward-scatter lobe, in (-1, 1). g>0 brightens the fog "
+            "toward the sun (forward scatter -- the 'glowing haze around "
+            "the sun' look); 0 = isotropic; g<0 back-scatter. Clamped to "
+            "+-0.95 shader-side. Default 0.6. Only meaningful when r_fog 1.",
+            CVAR_ARCHIVE);
+    // --- end Wave 9 height-fog -----------------------------------------
     // Issue #115: SVGF a-trous and MetalFX both smudge hard sun shadows
     // on flat surfaces because their edge-stops (depth, normal,
     // luminance) all see ~zero change across a shadow boundary on a
@@ -5167,6 +5231,11 @@ void Engine::EnsurePipelineHandles() {
     // Aurora borealis composite (issue #116). Metal-only at MVP scope;
     // Vulkan id stays 0 and the gate folds correctly to "no aurora".
     resolve(aurora_composite_pipeline_id_, "aurora_composite");
+    // Volumetric height fog (wave-9). Metal-only at wave scope (Vulkan
+    // descriptor wiring is a follow-up). The r_fog gate collapses to
+    // "no fog" on Vulkan and on any backend where the pipeline failed
+    // to build (id stays 0).
+    resolve(height_fog_pipeline_id_, "height_fog");
     // Wave 7 (#24): procedural raymarched cloud pre-pass + composite.
     // Registered on every backend that builds the SPIR-V / MSL blobs
     // (Metal + Vulkan). When r_clouds_mode == pathtraced (default) the
@@ -5587,6 +5656,10 @@ void Engine::PrewarmPipelines() {
     warm("perfoverlay");
     warm("stars_composite");
     warm("aurora_composite");
+    // Volumetric height fog (wave-9): warm the PSO so the first frame
+    // after toggling r_fog 1 doesn't stutter on first-dispatch pipeline
+    // state object build.
+    warm("height_fog");
     warm("sigma_shadow");
     warm("restir_temporal");
     warm("restir_spatial");
@@ -10006,6 +10079,116 @@ void Engine::RenderFrame() {
             cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
                          pt::rhi::BarrierDesc::Stage::ComputeRead});
         }
+
+        // --- Wave 9 height-fog ---------------------------------------
+        // Volumetric height fog. Dispatched AFTER the SIGMA shadow demod
+        // and BEFORE the celestial / cloud / aurora composites: fog
+        // attenuates the path-traced scene radiance (geometry) that the
+        // denoise chain resolved, then the sun / moon / stars / clouds
+        // composite on TOP -- those bodies sit above the exponential-
+        // height fog layer, so they should show through the haze rather
+        // than be dimmed by it (the analytic density is ~zero at
+        // celestial altitudes anyway). The kernel reads depth_tex,
+        // integrates the closed-form exponential-height fog along the
+        // camera ray (eye -> primary-hit distance, or a finite far-cap
+        // for sky pixels so the horizon hazes over), and Beer-Lambert
+        // blends the in-scatter into tonemap_hdr_source_id in place.
+        //
+        // Gate: r_fog == 1 (default 0), height_fog_pipeline_id_ resolved
+        // (Metal only today), depth_tex_id_ allocated (needed for the
+        // hit distance; implies denoiser_active_, which use_engine_tonemap
+        // requires on Metal). When r_fog == 0 we elide the dispatch
+        // entirely so the default path is a true no-op and the committed
+        // goldens stay bit-for-bit unchanged.
+        bool fog_active = false;
+        if (auto* v = C.FindCVar("r_fog")) fog_active = v->GetBool();
+        fog_active = fog_active &&
+                     height_fog_pipeline_id_ != 0 &&
+                     depth_tex_id_ != 0;
+        if (fog_active) {
+            cb->BindComputePipeline(pt::rhi::PipelineHandle{height_fog_pipeline_id_});
+            // HeightFog texture bindings in declaration order:
+            //   slot 0 hdr_inout  -- post-radiance-denoise HDR (RW blend)
+            //   slot 1 depth_tex  -- camera-space Z (hit distance + sky gate)
+            cb->BindStorageTexture(0, pt::rhi::TextureHandle{tonemap_hdr_source_id});
+            cb->BindStorageTexture(1, pt::rhi::TextureHandle{depth_tex_id_});
+            // No buffer / AS bindings: HeightFog is purely texture-driven.
+            // BindComputePipeline cleared prior PathTrace bindings, so
+            // max_bound_buf_slot = -1 and Slang's MSL emission places Push
+            // at buf(0). Engine push_slot = max+1 = 0. Match (same rule as
+            // AuroraComposite).
+            struct HeightFogPush {
+                float pos_fovtan[4];
+                float fwd_aspect[4];
+                float right_xyz[4];
+                float up_xyz[4];
+                float sun_and_mode[4];
+                float fog_params[4];   // sigma0, base_y, scale_height, hg_g
+                float fog_tint[4];     // rgb tint, sun in-scatter lum scale
+                float fog_runtime[4];  // active, far_cap_m, ambient, _reserved
+            } fp{};
+            static_assert(sizeof(HeightFogPush) == 128,
+                          "HeightFogPush layout must match HeightFog.slang");
+            // Camera basis + sun direction: copy straight from PtPush so
+            // the ray reconstruction in the shader matches the path
+            // tracer's primary rays exactly.
+            std::memcpy(fp.pos_fovtan,   push.pos_fovtan,   sizeof(fp.pos_fovtan));
+            std::memcpy(fp.fwd_aspect,   push.fwd_aspect,   sizeof(fp.fwd_aspect));
+            std::memcpy(fp.right_xyz,    push.right_xyz,    sizeof(fp.right_xyz));
+            std::memcpy(fp.up_xyz,       push.up_xyz,       sizeof(fp.up_xyz));
+            std::memcpy(fp.sun_and_mode, push.sun_and_mode, sizeof(fp.sun_and_mode));
+            // Fog parameters (real metric units; see the cvar registrations).
+            float fog_density = 0.02f;
+            if (auto* v = C.FindCVar("r_fog_density")) fog_density = v->GetFloat();
+            if (fog_density < 0.0f) fog_density = 0.0f;
+            float fog_base_y = 0.0f;
+            if (auto* v = C.FindCVar("r_fog_base_y")) fog_base_y = v->GetFloat();
+            float fog_scale_h = 300.0f;
+            if (auto* v = C.FindCVar("r_fog_scale_height")) fog_scale_h = v->GetFloat();
+            if (fog_scale_h < 1.0f) fog_scale_h = 1.0f;   // shader also guards
+            float fog_g = 0.6f;
+            if (auto* v = C.FindCVar("r_fog_sun_anisotropy")) fog_g = v->GetFloat();
+            fp.fog_params[0] = fog_density;
+            fp.fog_params[1] = fog_base_y;
+            fp.fog_params[2] = fog_scale_h;
+            fp.fog_params[3] = fog_g;
+            float fog_r = 0.55f, fog_gc = 0.62f, fog_b = 0.72f;
+            if (auto* v = C.FindCVar("r_fog_color_r")) fog_r  = v->GetFloat();
+            if (auto* v = C.FindCVar("r_fog_color_g")) fog_gc = v->GetFloat();
+            if (auto* v = C.FindCVar("r_fog_color_b")) fog_b  = v->GetFloat();
+            fp.fog_tint[0] = fog_r;
+            fp.fog_tint[1] = fog_gc;
+            fp.fog_tint[2] = fog_b;
+            // Sun in-scatter luminance scale. The fog colour times the
+            // HG phase lobe times this gives the sun-side brightening; a
+            // modest value keeps the haze from blowing out next to the
+            // bright sun disc. In the engine's HDR-linear units the sky
+            // sits at order ~1-10, so 2.0 reads as a clear forward-scatter
+            // glow without clipping. Fixed (not a cvar) -- the visible
+            // knobs are density / scale-height / colour / anisotropy.
+            fp.fog_tint[3] = 2.0f;
+            fp.fog_runtime[0] = 1.0f;     // composite active
+            // Far-cap distance for sky (primary-miss) pixels. The
+            // analytic horizon integral converges as t->inf for an upward
+            // ray (density decays), but a near-horizontal sky ray would
+            // accumulate unbounded optical depth; cap it at 50 km so the
+            // horizon saturates to the fog colour the way real aerial
+            // perspective does, without an actual infinite integral.
+            fp.fog_runtime[1] = 50000.0f;
+            // Ambient sky-tint in-scatter scale (the always-on portion of
+            // the fog colour, independent of sun direction). Keeps fog
+            // visible on the anti-sun side and at night. Order-1 in the
+            // engine's HDR-linear units.
+            fp.fog_runtime[2] = 1.0f;
+            fp.fog_runtime[3] = 0.0f;
+            cb->PushConstants(&fp, sizeof(fp));
+            cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
+            // RAW: StarsComposite about to read the HDR we just wrote.
+            // Metal auto-barriers; emitted for documentation symmetry.
+            cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                         pt::rhi::BarrierDesc::Stage::ComputeRead});
+        }
+        // --- end Wave 9 height-fog -----------------------------------
 
         // Stateless stars+sun+moon composite (issue #46). Metal-side
         // call site -- dispatched BEFORE the bloom pyramid so the bloom

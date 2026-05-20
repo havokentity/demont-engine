@@ -984,6 +984,18 @@ private:
     // Zero on Vulkan today -- the Vulkan dispatch is a follow-up, the
     // engine gate folds correctly to "no aurora" when the id is 0.
     std::uint64_t                               aurora_composite_pipeline_id_ = 0;
+    // Volumetric height fog (wave-9). Stateless analytic exponential-
+    // height fog composite. Dispatched on Metal AFTER the SIGMA shadow
+    // demod and BEFORE the celestial / cloud / aurora composites: fog
+    // attenuates the path-traced scene radiance (geometry), then the
+    // celestial bodies + clouds layer over the hazed result. Reads
+    // depth_tex, composites the Beer-Lambert in-scatter into the HDR in
+    // place. Zero on Vulkan today (Metal is the wave-9 build+test
+    // target); the dispatch gate folds to "no fog" when the id is 0.
+    // The engine elides the dispatch entirely when r_fog == 0 (default),
+    // so existing goldens stay bit-for-bit unchanged. See
+    // shaders/HeightFog.slang.
+    std::uint64_t                               height_fog_pipeline_id_ = 0;
     // Wave 7 (#24): procedural raymarched cloud pre-pass + composite.
     // clouds_raymarch_pipeline_id_   -- compute kernel that raymarches
     //   the cloud layer in a dedicated pass BEFORE PathTrace. Writes

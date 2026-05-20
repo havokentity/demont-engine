@@ -51,6 +51,10 @@ extern const unsigned char shader_CloudsRaymarch_metal_data[];
 extern const unsigned long shader_CloudsRaymarch_metal_size;
 extern const unsigned char shader_CloudsComposite_metal_data[];
 extern const unsigned long shader_CloudsComposite_metal_size;
+// Volumetric height fog (wave-9). Stateless analytic exponential-height
+// fog composite. Built unconditionally; dispatched only when r_fog != 0.
+extern const unsigned char shader_HeightFog_metal_data[];
+extern const unsigned long shader_HeightFog_metal_size;
 // SIGMA shadow denoiser kernel (issue #115).
 extern const unsigned char shader_SigmaShadow_metal_data[];
 extern const unsigned long shader_SigmaShadow_metal_size;
@@ -379,6 +383,12 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
     build_pso("clouds_composite",
               shader_CloudsComposite_metal_data,
               shader_CloudsComposite_metal_size);
+    // Volumetric height fog (wave-9). Registered unconditionally; the
+    // engine elides the dispatch when r_fog == 0 (default), so the PSO
+    // build is the only cost on the legacy path.
+    build_pso("height_fog",
+              shader_HeightFog_metal_data,
+              shader_HeightFog_metal_size);
     build_pso("sigma_shadow",
               shader_SigmaShadow_metal_data,
               shader_SigmaShadow_metal_size);
