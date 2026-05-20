@@ -63,7 +63,10 @@ target_link_libraries(pt_engine
     # panel_open / panel_close / panels console commands.
     PUBLIC  pt_editor
     PRIVATE pt_capture_encoder
-    PRIVATE tomlplusplus::tomlplusplus
+    # Wave 9 scene save/load replaced the TOML scene_save with JSON
+    # (pt::editor::SceneToJson, reached via pt_editor's nlohmann_json).
+    # pt_engine no longer references toml++ directly; the dependency
+    # stays FetchContent-declared at the top level for any future use.
 )
 
 # --- Megakernel feature gates: host-side mirrors --------------------------

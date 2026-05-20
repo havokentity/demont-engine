@@ -7,7 +7,9 @@
 #include "../physics/RigidBody.h"
 #include "../renderer/AnalyticBvh.h"
 
+#include <array>
 #include <cstring>
+#include <string>
 #include <string_view>
 
 namespace pt::editor {
@@ -230,6 +232,380 @@ json SerializeScene(const pt::engine::Engine& engine) {
     };
 
     return out;
+}
+
+// --- Wave 9 scene save/load ------------------------------------------------
+
+namespace {
+
+// Format version baked into the document so a future incompatible
+// schema change can be detected. Bump only on a breaking change; the
+// reader accepts any version <= kSceneFormatVersion (forward fields are
+// ignored, missing fields default).
+constexpr int kSceneFormatVersion = 1;
+
+using AnalyticPrim  = pt::engine::Engine::AnalyticPrim;
+using AnalyticLight = pt::engine::Engine::AnalyticLight;
+
+// ---- enum <-> string round-trip helpers -----------------------------------
+
+AnalyticPrim::Material PrimMaterialFromName(std::string_view s) {
+    if (s == "metal")      return AnalyticPrim::Metal;
+    if (s == "dielectric") return AnalyticPrim::Dielectric;
+    if (s == "water")      return AnalyticPrim::Water;
+    return AnalyticPrim::Lambert;
+}
+
+std::uint32_t SdfMaterialFromName(std::string_view s) {
+    if (s == "metal")      return 1u;
+    if (s == "dielectric") return 2u;
+    return 0u;  // lambert
+}
+
+AnalyticLight::Type LightTypeFromName(std::string_view s) {
+    if (s == "spot")   return AnalyticLight::Spot;
+    if (s == "sphere") return AnalyticLight::Sphere;
+    if (s == "quad")   return AnalyticLight::Quad;
+    return AnalyticLight::Point;
+}
+
+// SDF leaf-shape <-> string. Mirrors pt::renderer::SdfShape; kept as a
+// string in the file so the wire format survives an enum renumber.
+const char* SdfShapeName(std::uint32_t shape) {
+    switch (shape) {
+        case pt::renderer::SDF_SHAPE_SPHERE:      return "sphere";
+        case pt::renderer::SDF_SHAPE_BOX:         return "box";
+        case pt::renderer::SDF_SHAPE_ROUNDED_BOX: return "rounded_box";
+        case pt::renderer::SDF_SHAPE_TORUS:       return "torus";
+        case pt::renderer::SDF_SHAPE_CAPSULE:     return "capsule";
+        case pt::renderer::SDF_SHAPE_PLANE:       return "plane";
+    }
+    return "sphere";
+}
+std::uint32_t SdfShapeFromName(std::string_view s) {
+    if (s == "box")         return pt::renderer::SDF_SHAPE_BOX;
+    if (s == "rounded_box") return pt::renderer::SDF_SHAPE_ROUNDED_BOX;
+    if (s == "torus")       return pt::renderer::SDF_SHAPE_TORUS;
+    if (s == "capsule")     return pt::renderer::SDF_SHAPE_CAPSULE;
+    if (s == "plane")       return pt::renderer::SDF_SHAPE_PLANE;
+    return pt::renderer::SDF_SHAPE_SPHERE;
+}
+
+const char* SdfOpName(std::uint32_t op) {
+    switch (op) {
+        case pt::renderer::SDF_OP_LEAF:             return "leaf";
+        case pt::renderer::SDF_OP_SMOOTH_UNION:     return "smooth_union";
+        case pt::renderer::SDF_OP_SMOOTH_SUBTRACT:  return "smooth_subtract";
+        case pt::renderer::SDF_OP_SMOOTH_INTERSECT: return "smooth_intersect";
+        case pt::renderer::SDF_OP_DISPLACE:         return "displace";
+    }
+    return "leaf";
+}
+std::uint32_t SdfOpFromName(std::string_view s) {
+    if (s == "smooth_union")     return pt::renderer::SDF_OP_SMOOTH_UNION;
+    if (s == "smooth_subtract")  return pt::renderer::SDF_OP_SMOOTH_SUBTRACT;
+    if (s == "smooth_intersect") return pt::renderer::SDF_OP_SMOOTH_INTERSECT;
+    if (s == "displace")         return pt::renderer::SDF_OP_DISPLACE;
+    return pt::renderer::SDF_OP_LEAF;
+}
+
+// ---- JSON array readers (fixed-length, default-preserving) -----------------
+//
+// Read an N-element float array from `node[key]`; leaves `dst` untouched
+// if the field is absent / wrong-shaped (so the struct default stands).
+template <std::size_t N>
+void ReadFloatN(const json& node, const char* key, float (&dst)[N]) {
+    auto it = node.find(key);
+    if (it == node.end() || !it->is_array() || it->size() != N) return;
+    for (std::size_t i = 0; i < N; ++i) {
+        if ((*it)[i].is_number()) dst[i] = (*it)[i].get<float>();
+    }
+}
+
+float ReadFloat(const json& node, const char* key, float fallback) {
+    auto it = node.find(key);
+    if (it != node.end() && it->is_number()) return it->get<float>();
+    return fallback;
+}
+
+std::uint32_t ReadU32(const json& node, const char* key, std::uint32_t fallback) {
+    auto it = node.find(key);
+    if (it != node.end() && it->is_number_integer()) return it->get<std::uint32_t>();
+    if (it != node.end() && it->is_number_unsigned()) return it->get<std::uint32_t>();
+    return fallback;
+}
+
+std::string ReadStr(const json& node, const char* key, std::string fallback) {
+    auto it = node.find(key);
+    if (it != node.end() && it->is_string()) return it->get<std::string>();
+    return fallback;
+}
+
+// Stable JSON id key. ids are user-supplied uint32 map keys.
+std::uint32_t ReadId(const json& node, std::uint32_t fallback) {
+    return ReadU32(node, "id", fallback);
+}
+
+}  // namespace
+
+nlohmann::json SceneToJson(const SceneData& scene) {
+    json out;
+    out["format"]  = "demont-scene";
+    out["version"] = kSceneFormatVersion;
+
+    // Camera. Angles persisted in degrees (human-readable, and matches
+    // the cam_yaw / cam_pitch cvar convention).
+    if (scene.has_camera) {
+        const auto& c = scene.camera;
+        out["camera"] = {
+            {"pos",   {c.pos.x, c.pos.y, c.pos.z}},
+            {"yaw",   glm::degrees(c.yaw)},
+            {"pitch", glm::degrees(c.pitch)},
+            {"fov",   c.fov_deg},
+        };
+    }
+
+    // Analytic primitives -- full editable state (geometry, material,
+    // albedo, emission, roughness, ior, orientation, texture tiles).
+    json prims = json::array();
+    for (const auto& [id, p] : scene.prims) {
+        json j = {
+            {"id",        id},
+            {"type",      (p.type == AnalyticPrim::Sphere) ? "sphere" : "plane"},
+            {"material",  MaterialName(p.material)},
+            {"albedo",    {p.albedo[0],   p.albedo[1],   p.albedo[2]}},
+            {"emission",  {p.emission[0], p.emission[1], p.emission[2]}},
+            {"roughness", p.roughness},
+            {"ior",       p.ior},
+            {"orient",    {p.orient[0], p.orient[1], p.orient[2], p.orient[3]}},
+        };
+        if (p.type == AnalyticPrim::Sphere) {
+            j["pos"]    = {p.pos_or_n[0], p.pos_or_n[1], p.pos_or_n[2]};
+            j["radius"] = p.radius_or_d;
+        } else {
+            j["normal"] = {p.pos_or_n[0], p.pos_or_n[1], p.pos_or_n[2]};
+            j["d"]      = p.radius_or_d;
+        }
+        // Texture tiles only emitted when set (kNoTexTile == 0xFFFFFFFF).
+        // Absent => "no texture", which is the load-time default, so a
+        // texture-free prim round-trips to the same bytes.
+        constexpr std::uint32_t kNoTex = 0xFFFFFFFFu;
+        if (p.albedo_tex    != kNoTex) j["albedo_tex"]    = p.albedo_tex;
+        if (p.normal_tex    != kNoTex) j["normal_tex"]    = p.normal_tex;
+        if (p.roughness_tex != kNoTex) j["roughness_tex"] = p.roughness_tex;
+        if (p.metallic_tex  != kNoTex) j["metallic_tex"]  = p.metallic_tex;
+        prims.push_back(std::move(j));
+    }
+    out["primitives"] = std::move(prims);
+
+    // Analytic lights -- raw struct fields (NOT the degree-based
+    // authoring form), so a light round-trips byte-exact regardless of
+    // which authoring command (canonical or ergonomic variant) created
+    // it. dir / cos_* / u_vec / v_half are written for every type and
+    // simply inert for types that don't read them.
+    json lights = json::array();
+    for (const auto& [id, L] : scene.lights) {
+        json j = {
+            {"id",        id},
+            {"type",      LightTypeName(L.type)},
+            {"pos",       {L.pos[0], L.pos[1], L.pos[2]}},
+            {"radius",    L.radius},
+            {"intensity", {L.intensity[0], L.intensity[1], L.intensity[2]}},
+            {"dir",       {L.dir[0], L.dir[1], L.dir[2]}},
+            {"cos_outer", L.cos_outer},
+            {"cos_inner", L.cos_inner},
+            {"u_vec",     {L.u_vec[0], L.u_vec[1], L.u_vec[2]}},
+            {"v_half",    L.v_half},
+            {"orient",    {L.orient[0], L.orient[1], L.orient[2], L.orient[3]}},
+        };
+        lights.push_back(std::move(j));
+    }
+    out["lights"] = std::move(lights);
+
+    // SDF clusters -- full flat node tree (lossless). The AABB is NOT
+    // persisted; it's recomputed on load from the nodes.
+    json sdfs = json::array();
+    for (const auto& [id, S] : scene.sdf) {
+        json nodes = json::array();
+        for (std::uint32_t i = 0; i < S.node_count && i < pt::renderer::SdfPrim::kMaxNodes; ++i) {
+            const auto& n = S.nodes[i];
+            nodes.push_back({
+                {"op",      SdfOpName(n.op)},
+                {"shape",   SdfShapeName(n.shape)},
+                {"child_a", n.child_a},
+                {"child_b", n.child_b},
+                {"params",  {n.params[0], n.params[1], n.params[2], n.params[3]}},
+                {"center",  {n.center[0], n.center[1], n.center[2]}},
+            });
+        }
+        sdfs.push_back({
+            {"id",        id},
+            {"material",  SdfMaterialName(S.material)},
+            {"albedo",    {S.albedo[0], S.albedo[1], S.albedo[2]}},
+            {"roughness", S.roughness},
+            {"ior",       S.ior},
+            {"nodes",     std::move(nodes)},
+        });
+    }
+    out["sdf"] = std::move(sdfs);
+
+    // Render cvars (name/value pairs). Emitted as an object; insertion
+    // order is preserved by nlohmann's ordered_json default only if the
+    // build uses it -- to keep the file stable regardless, we emit an
+    // ARRAY of {name,value} so order is guaranteed.
+    json cvars = json::array();
+    for (const auto& [name, value] : scene.cvars) {
+        cvars.push_back({{"name", name}, {"value", value}});
+    }
+    out["cvars"] = std::move(cvars);
+
+    return out;
+}
+
+bool SceneFromJson(const nlohmann::json& doc, SceneData& out, std::string& err) {
+    if (!doc.is_object()) {
+        err = "scene document root is not a JSON object";
+        return false;
+    }
+    // Version gate. Accept anything we can read (<= current). A document
+    // claiming a NEWER version may use fields we don't understand; we
+    // still parse best-effort but warn via err being left empty (the
+    // caller treats false as fatal, true as success, so we return true
+    // and let unknown fields be ignored).
+    if (auto it = doc.find("version"); it != doc.end() && it->is_number_integer()) {
+        if (it->get<int>() > kSceneFormatVersion) {
+            // Soft-accept: newer minor additions are field-additive.
+            // (No hard fail -- keeps old binaries able to load files
+            // written by a slightly newer one, dropping unknown fields.)
+        }
+    }
+
+    out = SceneData{};
+
+    // Camera (optional).
+    if (auto it = doc.find("camera"); it != doc.end() && it->is_object()) {
+        const json& c = *it;
+        out.has_camera = true;
+        if (auto p = c.find("pos"); p != c.end() && p->is_array() && p->size() == 3) {
+            out.camera.pos = glm::vec3((*p)[0].get<float>(),
+                                       (*p)[1].get<float>(),
+                                       (*p)[2].get<float>());
+        }
+        out.camera.yaw     = glm::radians(ReadFloat(c, "yaw",   0.0f));
+        out.camera.pitch   = glm::radians(ReadFloat(c, "pitch", 0.0f));
+        out.camera.fov_deg = ReadFloat(c, "fov",   60.0f);
+        out.camera.ClampPitch();
+    }
+
+    // Analytic primitives.
+    if (auto it = doc.find("primitives"); it != doc.end() && it->is_array()) {
+        std::uint32_t auto_id = 1;
+        for (const json& j : *it) {
+            if (!j.is_object()) continue;
+            AnalyticPrim p{};
+            const std::string type = ReadStr(j, "type", "sphere");
+            p.type = (type == "plane") ? AnalyticPrim::Plane : AnalyticPrim::Sphere;
+            if (p.type == AnalyticPrim::Sphere) {
+                ReadFloatN(j, "pos", p.pos_or_n);
+                p.radius_or_d = ReadFloat(j, "radius", 0.5f);
+            } else {
+                ReadFloatN(j, "normal", p.pos_or_n);
+                p.radius_or_d = ReadFloat(j, "d", 0.0f);
+            }
+            // Seed prev == curr so a freshly loaded prim doesn't streak
+            // from the origin on its first motion-blur frame (#85).
+            p.prev_pos_or_n[0] = p.pos_or_n[0];
+            p.prev_pos_or_n[1] = p.pos_or_n[1];
+            p.prev_pos_or_n[2] = p.pos_or_n[2];
+            p.material = PrimMaterialFromName(ReadStr(j, "material", "lambert"));
+            ReadFloatN(j, "albedo",   p.albedo);
+            ReadFloatN(j, "emission", p.emission);
+            p.roughness = ReadFloat(j, "roughness", 0.0f);
+            p.ior       = ReadFloat(j, "ior", 1.5f);
+            ReadFloatN(j, "orient", p.orient);
+            p.albedo_tex    = ReadU32(j, "albedo_tex",    0xFFFFFFFFu);
+            p.normal_tex    = ReadU32(j, "normal_tex",    0xFFFFFFFFu);
+            p.roughness_tex = ReadU32(j, "roughness_tex", 0xFFFFFFFFu);
+            p.metallic_tex  = ReadU32(j, "metallic_tex",  0xFFFFFFFFu);
+            out.prims[ReadId(j, auto_id)] = p;
+            ++auto_id;
+        }
+    }
+
+    // Analytic lights.
+    if (auto it = doc.find("lights"); it != doc.end() && it->is_array()) {
+        std::uint32_t auto_id = 1;
+        for (const json& j : *it) {
+            if (!j.is_object()) continue;
+            AnalyticLight L{};
+            L.type = LightTypeFromName(ReadStr(j, "type", "point"));
+            ReadFloatN(j, "pos", L.pos);
+            L.radius = ReadFloat(j, "radius", 0.0f);
+            ReadFloatN(j, "intensity", L.intensity);
+            ReadFloatN(j, "dir", L.dir);
+            L.cos_outer = ReadFloat(j, "cos_outer", 0.0f);
+            L.cos_inner = ReadFloat(j, "cos_inner", 0.0f);
+            ReadFloatN(j, "u_vec", L.u_vec);
+            L.v_half = ReadFloat(j, "v_half", 0.0f);
+            ReadFloatN(j, "orient", L.orient);
+            out.lights[ReadId(j, auto_id)] = L;
+            ++auto_id;
+        }
+    }
+
+    // SDF clusters -- rebuild the node tree, then recompute the AABB.
+    if (auto it = doc.find("sdf"); it != doc.end() && it->is_array()) {
+        std::uint32_t auto_id = 1;
+        for (const json& j : *it) {
+            if (!j.is_object()) continue;
+            pt::renderer::SdfPrim S{};
+            S.material  = SdfMaterialFromName(ReadStr(j, "material", "lambert"));
+            ReadFloatN(j, "albedo", S.albedo);
+            S.roughness = ReadFloat(j, "roughness", 0.0f);
+            S.ior       = ReadFloat(j, "ior", 1.5f);
+            std::uint32_t count = 0;
+            if (auto nit = j.find("nodes"); nit != j.end() && nit->is_array()) {
+                for (const json& nj : *nit) {
+                    if (count >= pt::renderer::SdfPrim::kMaxNodes) break;
+                    if (!nj.is_object()) continue;
+                    pt::renderer::SdfNode& n = S.nodes[count];
+                    n.op      = SdfOpFromName(ReadStr(nj, "op", "leaf"));
+                    n.shape   = SdfShapeFromName(ReadStr(nj, "shape", "sphere"));
+                    n.child_a = ReadU32(nj, "child_a", 0);
+                    n.child_b = ReadU32(nj, "child_b", 0);
+                    ReadFloatN(nj, "params", n.params);
+                    ReadFloatN(nj, "center", n.center);
+                    ++count;
+                }
+            }
+            S.node_count = count;
+            // Recompute the world AABB from the node tree. If the tree is
+            // degenerate / empty, ComputeSdfAabb returns false -- skip
+            // the cluster rather than upload a zero-extent bound that
+            // silently misses every ray.
+            if (count > 0 && pt::renderer::ComputeSdfAabb(S)) {
+                out.sdf[ReadId(j, auto_id)] = S;
+            }
+            ++auto_id;
+        }
+    }
+
+    // Render cvars.
+    if (auto it = doc.find("cvars"); it != doc.end() && it->is_array()) {
+        for (const json& j : *it) {
+            if (!j.is_object()) continue;
+            auto name = j.find("name");
+            auto value = j.find("value");
+            if (name != j.end() && name->is_string() &&
+                value != j.end() && value->is_string()) {
+                out.cvars.emplace_back(name->get<std::string>(),
+                                       value->get<std::string>());
+            }
+        }
+    }
+
+    err.clear();
+    return true;
 }
 
 }  // namespace pt::editor

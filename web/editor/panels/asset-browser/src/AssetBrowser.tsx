@@ -1,23 +1,32 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Rajesh D'Monte
 //
-// Asset Browser panel content. Three categories surfaced as tabs:
+// Asset Browser panel content. Categories surfaced as tabs:
 //
-//   Scenes  -> .cfg under tests/goldens/scenes/  -> `exec <path>`
+//   Scenes  -> saved scenes (scenes/*.json) -> `scene_load <name>`, plus
+//              shipped .cfg fixtures (tests/goldens/scenes/) -> `exec <path>`
 //   HDRIs   -> *.hdr under assets/hdri/          -> `r_env_map <path>`
 //   Meshes  -> .obj/.glb/.gltf under assets/...  -> `mesh_load_gltf <path>`
 //
-// The list is fetched on demand from the engine via the new
-// `list_assets <subdir>` console command (added in wave-7 #20). Each
-// row is single-click to apply + draggable; dropping inside the
-// viewport reuses the same dispatch path. The asset browser doesn't
-// need its own raycast picker -- the engine already turns drops into
-// origin-spawned objects via the cvar / exec the browser dispatches.
+// The list is fetched on demand from the engine via the
+// `list_assets <subdir>` console command (added in wave-7 #20). The
+// Scenes tab additionally calls `scene_list` (wave-9 scene save/load)
+// so scenes written by `scene_save` show up and load on click. Each row
+// is single-click to apply + draggable; dropping inside the viewport
+// reuses the same dispatch path. The asset browser doesn't need its own
+// raycast picker -- the engine already turns drops into origin-spawned
+// objects via the cvar / exec the browser dispatches.
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { DragEvent as ReactDragEvent } from 'react';
 import type { WebSocketClient } from '@demont/editor-shared';
-import { parseListAssetsOutput } from './helpers';
+import {
+  mergeSceneEntries,
+  parseListAssetsOutput,
+  parseSceneFixtureOutput,
+  parseSceneListOutput,
+  type SceneEntry,
+} from './helpers';
 
 type Category = 'scenes' | 'hdri' | 'meshes' | 'gltf';
 
@@ -42,9 +51,13 @@ const CATEGORIES: CategoryDef[] = [
     key: 'scenes',
     title: 'Scenes',
     subdir: 'scenes',
+    // The Scenes tab computes per-entry dispatch in fetchItems (saved
+    // scenes -> `scene_load`, fixtures -> `exec`), so this template is
+    // unused for scenes; kept non-empty to satisfy the shared shape.
     dispatch: (path) => `exec ${path}`,
     emptyHint:
-      'Place .cfg fixtures under tests/goldens/scenes/. Examples ship with the engine.',
+      'Save the current scene with `scene_save <name>` (writes scenes/<name>.json), ' +
+      'or drop .cfg fixtures under tests/goldens/scenes/.',
   },
   {
     key: 'hdri',
@@ -94,34 +107,82 @@ function categoryDef(cat: Category): CategoryDef {
   return CATEGORIES.find((c) => c.key === cat)!;
 }
 
+// Uniform list item the panel renders regardless of category. For the
+// generic asset categories `name` is the filename, `secondary` is the
+// workspace-relative path, and `dispatch` is the cvar/exec line. For the
+// Scenes tab the SceneEntry maps onto the same shape (secondary shows
+// the dispatch verb so the user can tell a saved scene from a fixture).
+interface AssetItem {
+  name: string;
+  secondary: string;
+  dispatch: string;
+}
+
 interface RowProps {
-  path: string;
+  item: AssetItem;
   selected: boolean;
   onClick: () => void;
   onDragStart: (e: ReactDragEvent<HTMLDivElement>) => void;
 }
 
-function Row({ path, selected, onClick, onDragStart }: RowProps) {
-  // Filename for the primary display; full path is the tooltip.
-  const name = path.split('/').pop() || path;
+function Row({ item, selected, onClick, onDragStart }: RowProps) {
   return (
     <div
       className={`assets-row${selected ? ' is-selected' : ''}`}
-      title={path}
+      title={item.dispatch}
       onClick={onClick}
       draggable
       onDragStart={onDragStart}
     >
-      <span className="assets-name">{name}</span>
-      <span className="assets-path">{path}</span>
+      <span className="assets-name">{item.name}</span>
+      <span className="assets-path">{item.secondary}</span>
     </div>
   );
+}
+
+// Fetch one category's items. The Scenes tab is special: it merges
+// saved scenes (`scene_list` -> `scene_load <name>`) with the shipped
+// .cfg fixtures (`list_assets scenes` -> `exec <path>`). Every other
+// category maps `list_assets <subdir>` paths through the category's
+// dispatch template.
+async function fetchItems(
+  client: WebSocketClient,
+  cat: Category,
+): Promise<AssetItem[]> {
+  if (cat === 'scenes') {
+    let saved: SceneEntry[] = [];
+    let fixtures: SceneEntry[] = [];
+    try {
+      const r = await client.exec('scene_list');
+      if (r.ok) saved = parseSceneListOutput(String(r.output ?? ''));
+    } catch {
+      /* leave saved empty */
+    }
+    try {
+      const r = await client.exec('list_assets scenes');
+      if (r.ok) fixtures = parseSceneFixtureOutput(String(r.output ?? ''));
+    } catch {
+      /* leave fixtures empty */
+    }
+    return mergeSceneEntries(saved, fixtures).map((e) => ({
+      name: e.name,
+      secondary: e.kind === 'saved' ? 'saved · scene_load' : 'fixture · exec',
+      dispatch: e.dispatch,
+    }));
+  }
+  const def = categoryDef(cat);
+  const paths = await fetchAssets(client, def.subdir);
+  return paths.map((p) => ({
+    name: p.split('/').pop() || p,
+    secondary: p,
+    dispatch: def.dispatch(p),
+  }));
 }
 
 export function AssetBrowser({ client }: AssetBrowserProps) {
   const [active, setActive] = useState<Category>('scenes');
   const [filter, setFilter] = useState<string>('');
-  const [paths, setPaths] = useState<Record<Category, string[]>>({
+  const [items, setItems] = useState<Record<Category, AssetItem[]>>({
     scenes: [],
     hdri: [],
     gltf: [],
@@ -142,9 +203,8 @@ export function AssetBrowser({ client }: AssetBrowserProps) {
   const refresh = useCallback(
     async (cat: Category) => {
       setLoading((s) => ({ ...s, [cat]: true }));
-      const def = categoryDef(cat);
-      const out = await fetchAssets(client, def.subdir);
-      setPaths((s) => ({ ...s, [cat]: out }));
+      const out = await fetchItems(client, cat);
+      setItems((s) => ({ ...s, [cat]: out }));
       setLoading((s) => ({ ...s, [cat]: false }));
     },
     [client],
@@ -158,9 +218,7 @@ export function AssetBrowser({ client }: AssetBrowserProps) {
   }, [refresh]);
 
   const dispatchAsset = useCallback(
-    async (cat: Category, path: string) => {
-      const def = categoryDef(cat);
-      const line = def.dispatch(path);
+    async (line: string) => {
       setLastDispatch(line);
       setLastError('');
       try {
@@ -181,23 +239,24 @@ export function AssetBrowser({ client }: AssetBrowserProps) {
   // also available via dataTransfer.getData('text/plain') for any
   // future native overlay that listens.
   const handleDragStart = useCallback(
-    (cat: Category, path: string) =>
-      (e: ReactDragEvent<HTMLDivElement>) => {
-        const def = categoryDef(cat);
-        const line = def.dispatch(path);
-        e.dataTransfer.setData('application/x-demont-asset', line);
-        e.dataTransfer.setData('text/plain', line);
-        e.dataTransfer.effectAllowed = 'copy';
-      },
+    (line: string) => (e: ReactDragEvent<HTMLDivElement>) => {
+      e.dataTransfer.setData('application/x-demont-asset', line);
+      e.dataTransfer.setData('text/plain', line);
+      e.dataTransfer.effectAllowed = 'copy';
+    },
     [],
   );
 
   const visible = useMemo(() => {
-    const all = paths[active] ?? [];
+    const all = items[active] ?? [];
     if (!filter) return all;
     const f = filter.toLowerCase();
-    return all.filter((p) => p.toLowerCase().includes(f));
-  }, [paths, active, filter]);
+    return all.filter(
+      (it) =>
+        it.name.toLowerCase().includes(f) ||
+        it.secondary.toLowerCase().includes(f),
+    );
+  }, [items, active, filter]);
 
   return (
     <div className="assets-root">
@@ -211,7 +270,7 @@ export function AssetBrowser({ client }: AssetBrowserProps) {
           >
             {c.title}
             <span className="assets-tab-count">
-              {paths[c.key]?.length ?? 0}
+              {items[c.key]?.length ?? 0}
             </span>
           </button>
         ))}
@@ -245,13 +304,13 @@ export function AssetBrowser({ client }: AssetBrowserProps) {
             <p className="dim">{categoryDef(active).emptyHint}</p>
           </div>
         )}
-        {visible.map((p) => (
+        {visible.map((it) => (
           <Row
-            key={p}
-            path={p}
+            key={it.dispatch}
+            item={it}
             selected={false}
-            onClick={() => void dispatchAsset(active, p)}
-            onDragStart={handleDragStart(active, p)}
+            onClick={() => void dispatchAsset(it.dispatch)}
+            onDragStart={handleDragStart(it.dispatch)}
           />
         ))}
       </main>
