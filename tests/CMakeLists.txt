@@ -633,8 +633,21 @@ function(pt_add_golden_cell)
     add_test(NAME ${_cell_name}_render
         COMMAND $<TARGET_FILE:pt_render_one_frame> ${_render_args}
         WORKING_DIRECTORY ${_cell_workdir})
+    # TIMEOUT 300 (was 120): the *first* software-backend render in the
+    # matrix pays a one-time cold-start tax that the rest of the cells
+    # do not. On the Windows runner that tax is large and variable --
+    # SoftwareVulkanPresent probes `vkCreateInstance`, which fails on the
+    # headless GPU-less runner and falls back to GDI present, and the
+    # process also eats first-run shader/JIT warm-up. The same cornell_csg
+    # software cell that completes in ~77s on a warm runner has been
+    # observed to spend the entire 120s budget just reaching "Software
+    # backend online" on a loaded one (CI run 26155110144), tripping a
+    # spurious ctest Timeout that is unrelated to render correctness.
+    # 300s gives the cold first render comfortable headroom while still
+    # bounding a genuinely-hung render. Pixel output is unaffected, so all
+    # committed goldens stay bit-for-bit.
     set_tests_properties(${_cell_name}_render PROPERTIES
-        TIMEOUT 120
+        TIMEOUT 300
         LABELS  "golden;golden_${PT_CELL_BACKEND}")
 
     if(EXISTS ${_golden_png})

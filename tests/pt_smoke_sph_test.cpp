@@ -19,6 +19,8 @@
 //   * Wind drives particles toward the configured wind speed
 //   * QueueShockwave applies a radial impulse exactly once
 //   * PackForGpu produces a contiguous 2-float4-per-particle layout
+//   * (wave-9 sph-3b) Curl-noise perturbs particle motion deterministically
+//   * (wave-9 sph-3b) High-viscosity XSPH stays stable (no explosion)
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -27,6 +29,8 @@
 
 #include <glm/glm.hpp>
 
+#include <algorithm>
+#include <cmath>
 #include <vector>
 
 using pt::sph::SmokeSPH;
@@ -95,6 +99,7 @@ TEST_CASE("SmokeSPH gravity drives an isolated particle downward") {
     cfg.buoyancy_scale = 0.0f;     // pure gravity
     cfg.air_drag       = 0.0f;     // no drag
     cfg.wind           = glm::vec3(0.0f);
+    cfg.curl_strength  = 0.0f;     // wave-9: isolate gravity (no turbulence)
     SmokeSPH::Particle p;
     p.pos = glm::vec3(0.0f, 10.0f, 0.0f);
     p.vel = glm::vec3(0.0f);
@@ -130,6 +135,8 @@ TEST_CASE("SmokeSPH buoyancy lifts a hot isolated particle") {
     cfg2.air_drag       = 0.0f;
     cfg2.wind           = glm::vec3(0.0f);
     cfg2.thermal_decay  = 0.0f;
+    cfg2.curl_strength  = 0.0f;    // wave-9: isolate buoyancy
+    cfg2.buoyancy_variation = 0.0f;
     std::vector<SmokeSPH::EmitterParams> ems;
     SmokeSPH::EmitterParams em;
     em.pos = glm::vec3(0.0f, 2.0f, 0.0f);
@@ -179,6 +186,7 @@ TEST_CASE("SmokeSPH wind drives a still particle toward wind speed") {
     cfg.viscosity      = 0.0f;
     cfg.wind           = glm::vec3(3.0f, 0.0f, 0.0f);   // 3 m/s along +X
     cfg.air_drag       = 5.0f;                          // strong drag for quick settle
+    cfg.curl_strength  = 0.0f;     // wave-9: isolate wind drag
     SmokeSPH::Particle p;
     p.pos = glm::vec3(0.0f);
     p.vel = glm::vec3(0.0f);
@@ -202,6 +210,7 @@ TEST_CASE("SmokeSPH::QueueShockwave applies a radial impulse") {
     cfg.air_drag       = 0.0f;
     cfg.viscosity      = 0.0f;
     cfg.wind           = glm::vec3(0.0f);
+    cfg.curl_strength  = 0.0f;     // wave-9: isolate shockwave impulse
     SmokeSPH::Particle p;
     p.pos = glm::vec3(1.0f, 0.0f, 0.0f);   // 1m to the right of origin
     p.vel = glm::vec3(0.0f);
@@ -238,4 +247,84 @@ TEST_CASE("SmokeSPH::PackForGpu produces 2-float4-per-particle layout") {
     CHECK(buf[4] > 0.0f);
     // v1.y = normalised age (0 at spawn)
     CHECK(buf[5] == doctest::Approx(0.0f));
+}
+
+// --- Wave 9 sph-3b -----------------------------------------------------
+
+TEST_CASE("SmokeSPH curl-noise perturbs particle motion (deterministically)") {
+    // An isolated particle in zero gravity / buoyancy / wind feels ONLY
+    // the curl-noise force. With curl off it stays put; with curl on it
+    // is deflected. The deflection must be deterministic (bit-identical
+    // across two runs) so goldens stay reproducible.
+    auto run = [](float curl) {
+        SmokeSPH s;
+        s.SetMaxParticles(2);
+        auto& cfg = s.MutableConfig();
+        cfg.gravity        = glm::vec3(0.0f);
+        cfg.buoyancy_scale = 0.0f;
+        cfg.air_drag       = 0.0f;
+        cfg.viscosity      = 0.0f;
+        cfg.wind           = glm::vec3(0.0f);
+        cfg.curl_strength  = curl;
+        SmokeSPH::Particle p;
+        p.pos = glm::vec3(3.0f, 3.0f, 3.0f);  // off-origin so the noise is non-trivial
+        p.vel = glm::vec3(0.0f);
+        REQUIRE(s.SpawnParticle(p));
+        for (int i = 0; i < 30; ++i) s.Step(1.0f / 60.0f);
+        return s.Particles()[0].pos;
+    };
+    const glm::vec3 still   = run(0.0f);
+    const glm::vec3 curled1 = run(8.0f);
+    const glm::vec3 curled2 = run(8.0f);
+    // Curl off -> no force -> particle does not move.
+    CHECK(glm::length(still - glm::vec3(3.0f, 3.0f, 3.0f)) < 1e-4f);
+    // Curl on -> particle is deflected away from rest.
+    CHECK(glm::length(curled1 - glm::vec3(3.0f, 3.0f, 3.0f)) > 0.05f);
+    // Deterministic: two runs land bit-identical. Use exact float
+    // equality (not doctest::Approx) -- the curl-noise path is a pure
+    // function of (position, time) with no RNG or float-order ambiguity,
+    // so re-running the same inputs reproduces the same bits exactly.
+    // This is what goldens rely on, so the assertion matches the wording.
+    CHECK(curled1.x == curled2.x);
+    CHECK(curled1.y == curled2.y);
+    CHECK(curled1.z == curled2.z);
+}
+
+TEST_CASE("SmokeSPH high-viscosity XSPH stays stable (no explosion)") {
+    // The wave-8 explicit Müller viscosity force exploded the column at
+    // high mu (particles flung to y~100 m). The wave-9 bounded XSPH blend
+    // must instead SMOOTH the cloud: with a strong mu the live particles
+    // stay within a sane domain (no detonation) and the population is not
+    // decimated by particles flying past the cull bounds.
+    SmokeSPH s;
+    s.SetMaxParticles(512);
+    auto& cfg = s.MutableConfig();
+    cfg.viscosity         = 1.0f;     // very high -- would explode pre-fix
+    cfg.pressure_stiffness = 1.0f;
+    cfg.curl_strength     = 0.0f;     // isolate viscosity stability
+    std::vector<SmokeSPH::EmitterParams> ems;
+    SmokeSPH::EmitterParams em;
+    em.pos = glm::vec3(0.0f, 2.0f, 0.0f);
+    em.velocity = glm::vec3(0.0f, 3.0f, 0.0f);
+    em.radius = 0.5f;
+    em.spawn_rate = 300.0f;
+    em.lifetime_s = 100.0f;           // long life so nothing ages out
+    em.temperature_kelvin = 600.0f;
+    em.particle_radius = 0.2f;
+    em.particle_mass = 0.02f;
+    ems.push_back(em);
+    s.SetEmitters(std::move(ems));
+    for (int i = 0; i < 60; ++i) s.Step(1.0f / 60.0f);
+    // Population survived (not flung past the +/-1km cull bounds).
+    CHECK(s.AliveCount() > 100u);
+    // No particle detonated to an absurd position.
+    float max_abs = 0.0f;
+    for (std::size_t i = 0; i < s.Particles().size(); ++i) {
+        if (!s.IsAlive(i)) continue;
+        const auto& p = s.Particles()[i].pos;
+        max_abs = std::max(max_abs, std::max(std::abs(p.x), std::max(std::abs(p.y), std::abs(p.z))));
+    }
+    // A stable cohesive plume stays compact (well under 50 m in 1 s);
+    // the pre-fix explicit viscosity sent particles past 100 m.
+    CHECK(max_abs < 50.0f);
 }
