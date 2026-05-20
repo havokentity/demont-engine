@@ -19,6 +19,7 @@ const panels = [
   'inspector',
   'asset-browser',
   'toolbar',
+  'material-editor',
 ];
 
 const input: Record<string, string> = {};

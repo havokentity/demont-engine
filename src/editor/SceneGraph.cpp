@@ -140,6 +140,22 @@ json SerializeScene(const pt::engine::Engine& engine) {
             j["normal"] = {p.pos_or_n[0], p.pos_or_n[1], p.pos_or_n[2]};
             j["d"]      = p.radius_or_d;
         }
+        // Wave 8 PBR (#26) texture-map state for the Material Editor panel
+        // (wave-9). For each of the four maps we emit a boolean "is a
+        // texture assigned" plus the source path (empty when flat). The
+        // path lets the panel display + dedupe the assignment; the
+        // boolean keeps consumers that don't care about the path simple.
+        // kNoTexTile (0xFFFFFFFF) -> flat (no texture), matching the
+        // shader's per-channel gate. PbrTilePath returns "" for kNoTexTile.
+        constexpr std::uint32_t kNoTex = 0xFFFFFFFFu;
+        j["albedo_tex"]         = (p.albedo_tex    != kNoTex);
+        j["normal_tex"]         = (p.normal_tex    != kNoTex);
+        j["roughness_tex"]      = (p.roughness_tex != kNoTex);
+        j["metallic_tex"]       = (p.metallic_tex  != kNoTex);
+        j["albedo_tex_path"]    = engine.PbrTilePath(p.albedo_tex);
+        j["normal_tex_path"]    = engine.PbrTilePath(p.normal_tex);
+        j["roughness_tex_path"] = engine.PbrTilePath(p.roughness_tex);
+        j["metallic_tex_path"]  = engine.PbrTilePath(p.metallic_tex);
         prims.push_back(std::move(j));
     }
     out["primitives"] = std::move(prims);
