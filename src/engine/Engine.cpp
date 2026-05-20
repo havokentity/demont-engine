@@ -50,8 +50,6 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
-#define TOML_EXCEPTIONS 0
-#include <toml++/toml.h>
 #include <cstdint>
 
 #include <fmt/format.h>
@@ -64,6 +62,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>  // list_assets: directory_iterator over assets/
+#include <fstream>     // scene_save / scene_load JSON file I/O
 #include <numbers>
 #include <numeric>
 #include <sstream>    // std::istringstream for cam_load slot parsing
@@ -12889,134 +12888,216 @@ void Engine::RegisterCommands() {
                            entries.size(), root.generic_string());
         });
 
+    // --- Wave 9 scene save/load -------------------------------------------
+    //
+    // Lossless, file-backed scene serialization. Supersedes the old
+    // camera+prims-only TOML scene_save: this round-trips analytic
+    // primitives, analytic lights (all 4 types), SDF clusters (full node
+    // tree), the camera pose, AND a curated set of render cvars
+    // (lighting / integrator / post) -- everything needed to reconstruct
+    // the editable scene in a fresh engine.
+    //
+    // Format: JSON via nlohmann_json (already a dependency; already used
+    // for the editor scene-graph payload). The serialization logic lives
+    // in pt::editor::{SceneToJson,SceneFromJson} (unit-tested in
+    // tests/scene_serialize_test.cpp); this block is the host glue:
+    // SceneData <-> the engine's private maps + file I/O.
+    //
+    // Saved scenes live under scenes/<name>.json (workspace-relative).
+    // `scene_save <name>` / `scene_load <name>` take a bare name; a name
+    // containing a path separator or a .json extension is treated as an
+    // explicit path so power users can save anywhere. The .cfg-replay
+    // fixtures under tests/goldens/scenes/ are a SEPARATE mechanism
+    // (`exec <file>`) and are untouched.
+
+    // Curated render-cvar allowlist serialized with the scene. Kept
+    // small + focused on what defines a scene's look (lighting,
+    // integrator, post) -- NOT device / window / debug cvars. Mirrors
+    // the set the golden .cfg fixtures pin. Reading current values goes
+    // through Console::FindCVar; applying goes through the cvar's own
+    // validated set path (ExecuteScript) so out-of-range values can't
+    // poison engine state.
+    static constexpr const char* kSceneCvars[] = {
+        // Sky / sun (the de-facto scene lighting when no analytic lights).
+        "r_sky_mode", "r_sky_use_astronomical", "r_sun_elevation",
+        "r_sun_azimuth", "r_env_map", "r_show_stars", "r_clouds",
+        // Path-tracer integrator.
+        "r_spp", "r_max_bounces", "r_firefly_clamp", "r_caustics",
+        "r_refract_bounces",
+        // Exposure / post.
+        "r_auto_exposure", "r_exposure", "r_hdr_pipeline", "r_bloom",
+        "r_lens_flare",
+    };
+
+    // Resolve a scene <name|path> argument to a concrete file path.
+    // Bare name -> scenes/<name>.json; an explicit path (has a separator
+    // or a .json extension) is used verbatim, defaulting the extension
+    // to .json when none is present.
+    auto resolve_scene_path = [](std::string_view arg) -> std::filesystem::path {
+        std::filesystem::path p{std::string(arg)};
+        const bool has_sep = arg.find('/') != std::string_view::npos ||
+                             arg.find('\\') != std::string_view::npos;
+        const bool has_ext = p.has_extension();
+        if (!has_sep && !has_ext) {
+            return std::filesystem::path("scenes") / (std::string(arg) + ".json");
+        }
+        if (!has_ext) p.replace_extension(".json");
+        return p;
+    };
+
     C.RegisterCommand("scene_save",
-        "scene_save <path.toml>: write camera + analytic primitives to a TOML file. (CSG state isn't saved yet -- put csg_* commands in autoexec.cfg if you want it to persist.)",
-        [this](auto args, pt::console::Output& out) {
-            if (args.size() != 1) { out.PrintLine("usage: scene_save <path.toml>"); return; }
-            std::string path(args[0]);
+        "scene_save <name>: serialize the full scene (primitives + lights + "
+        "SDF clusters + camera + key render cvars) to scenes/<name>.json. "
+        "Pass an explicit path (with a separator or extension) to save "
+        "elsewhere.",
+        [this, resolve_scene_path](auto args, pt::console::Output& out) {
+            if (args.size() != 1) { out.PrintLine("usage: scene_save <name>"); return; }
+            const std::filesystem::path path = resolve_scene_path(args[0]);
 
-            toml::table root;
-
-            // Camera.
-            auto& cam = *camera_;
-            toml::array pos_arr{cam.pos.x, cam.pos.y, cam.pos.z};
-            toml::table cam_tbl;
-            cam_tbl.insert("pos",   std::move(pos_arr));
-            cam_tbl.insert("yaw",   double(glm::degrees(cam.yaw)));
-            cam_tbl.insert("pitch", double(glm::degrees(cam.pitch)));
-            cam_tbl.insert("fov",   double(cam.fov_deg));
-            root.insert("camera", std::move(cam_tbl));
-
-            // Primitives.
-            auto mat_name = [](AnalyticPrim::Material m) {
-                switch (m) {
-                    case AnalyticPrim::Lambert:    return "lambert";
-                    case AnalyticPrim::Metal:      return "metal";
-                    case AnalyticPrim::Dielectric: return "dielectric";
-                    case AnalyticPrim::Water:      return "water";
+            // Build the lossless SceneData from current engine state.
+            pt::editor::SceneData scene;
+            scene.has_camera = (camera_ != nullptr);
+            if (camera_) scene.camera = *camera_;
+            scene.prims  = primitives_;
+            scene.lights = light_prims_;
+            scene.sdf    = sdf_prims_;
+            auto& C2 = pt::console::Console::Get();
+            for (const char* name : kSceneCvars) {
+                if (auto* v = C2.FindCVar(name)) {
+                    scene.cvars.emplace_back(v->name, v->value);
                 }
-                return "?";
-            };
-            toml::array prims_arr;
-            for (const auto& [id, p] : primitives_) {
-                toml::table t;
-                t.insert("id", int64_t(id));
-                t.insert("type", p.type == AnalyticPrim::Sphere ? "sphere" : "plane");
-                toml::array pn{double(p.pos_or_n[0]), double(p.pos_or_n[1]), double(p.pos_or_n[2])};
-                if (p.type == AnalyticPrim::Sphere) {
-                    t.insert("center", std::move(pn));
-                    t.insert("radius", double(p.radius_or_d));
-                } else {
-                    t.insert("normal", std::move(pn));
-                    t.insert("d",      double(p.radius_or_d));
-                }
-                t.insert("material", mat_name(p.material));
-                t.insert("color", toml::array{double(p.albedo[0]), double(p.albedo[1]), double(p.albedo[2])});
-                t.insert("roughness", double(p.roughness));
-                t.insert("ior",       double(p.ior));
-                prims_arr.push_back(std::move(t));
             }
-            root.insert("primitives", std::move(prims_arr));
 
+            const nlohmann::json doc = pt::editor::SceneToJson(scene);
+
+            std::error_code ec;
+            if (path.has_parent_path()) {
+                std::filesystem::create_directories(path.parent_path(), ec);
+            }
             std::ofstream f(path, std::ios::binary | std::ios::trunc);
-            if (!f.is_open()) { out.FormatLine("scene_save: cannot open '{}'", path); return; }
-            f << "# DeMonT Engine scene -- generated by scene_save\n\n";
-            f << root;
-            out.FormatLine("scene: saved {} primitive(s) + camera to {}", primitives_.size(), path);
+            if (!f.is_open()) {
+                out.FormatLine("scene_save: cannot open '{}'", path.generic_string());
+                return;
+            }
+            f << doc.dump(2) << '\n';
+            if (!f) {
+                out.FormatLine("scene_save: write error on '{}'", path.generic_string());
+                return;
+            }
+            out.FormatLine("scene: saved {} prim(s) + {} light(s) + {} sdf + camera to {}",
+                           scene.prims.size(), scene.lights.size(),
+                           scene.sdf.size(), path.generic_string());
         });
 
     C.RegisterCommand("scene_load",
-        "scene_load <path.toml>: replace current camera + analytic primitives with the contents of a TOML scene file.",
-        [this](auto args, pt::console::Output& out) {
-            if (args.size() != 1) { out.PrintLine("usage: scene_load <path.toml>"); return; }
-            std::string path(args[0]);
+        "scene_load <name>: clear the current scene and restore primitives + "
+        "lights + SDF clusters + camera + render cvars from "
+        "scenes/<name>.json (or an explicit path).",
+        [this, resolve_scene_path](auto args, pt::console::Output& out) {
+            if (args.size() != 1) { out.PrintLine("usage: scene_load <name>"); return; }
+            const std::filesystem::path path = resolve_scene_path(args[0]);
 
-            auto parsed = toml::parse_file(path);
-            if (!parsed) {
-                out.FormatLine("scene_load: parse error in {}: {}",
-                               path, std::string(parsed.error().description()));
+            std::ifstream f(path, std::ios::binary);
+            if (!f.is_open()) {
+                out.FormatLine("scene_load: cannot open '{}'", path.generic_string());
                 return;
             }
-            const toml::table& root = parsed.table();
+            nlohmann::json doc =
+                nlohmann::json::parse(f, nullptr, /*allow_exceptions=*/false);
+            if (doc.is_discarded()) {
+                out.FormatLine("scene_load: '{}' is not valid JSON",
+                               path.generic_string());
+                return;
+            }
 
-            // Camera (optional).
-            if (auto* cam_node = root.get("camera"); cam_node && cam_node->is_table()) {
-                const auto& ct = *cam_node->as_table();
-                if (auto pos = ct["pos"].as_array(); pos && pos->size() == 3) {
-                    camera_->pos = glm::vec3(
-                        float((*pos)[0].value_or(0.0)),
-                        float((*pos)[1].value_or(0.0)),
-                        float((*pos)[2].value_or(0.0)));
-                }
-                if (auto v = ct["yaw"].value<double>())   camera_->yaw     = glm::radians(float(*v));
-                if (auto v = ct["pitch"].value<double>()) camera_->pitch   = glm::radians(float(*v));
-                if (auto v = ct["fov"].value<double>())   camera_->fov_deg = float(*v);
+            pt::editor::SceneData scene;
+            std::string err;
+            if (!pt::editor::SceneFromJson(doc, scene, err)) {
+                out.FormatLine("scene_load: parse error in '{}': {}",
+                               path.generic_string(), err);
+                return;
+            }
+
+            // Snapshot BEFORE mutating so scene_undo can restore the
+            // pre-load scene (mirrors prim_*/light_* command discipline).
+            PushSceneSnapshot();
+
+            // Apply prims + lights through the shared snapshot path so
+            // editor panels get BroadcastSceneDirty + the GPU re-upload
+            // dirty bits flip consistently. This REPLACES the current
+            // sets (a fresh load is a full scene swap, not a merge).
+            SceneSnapshot snap;
+            snap.prims    = scene.prims;
+            snap.lights   = scene.lights;
+            snap.sel_kind = SelectionKind::None;   // selection doesn't survive a load
+            snap.sel_id   = 0;
+            // Guard the apply so it doesn't push its own undo entry on
+            // top of the one we just captured.
+            in_scene_undo_redo_ = true;
+            ApplySceneSnapshot(snap);
+            in_scene_undo_redo_ = false;
+
+            // SDF clusters are not part of SceneSnapshot -- restore them
+            // directly and flip the SDF upload dirty bit.
+            sdf_prims_       = scene.sdf;
+            sdf_prims_dirty_ = true;
+
+            // Camera pose (optional in the file).
+            if (scene.has_camera && camera_) {
+                *camera_ = scene.camera;
                 camera_->ClampPitch();
             }
 
-            // Primitives (replaces the entire set).
-            primitives_.clear();
-            if (auto* prims_node = root.get("primitives"); prims_node && prims_node->is_array()) {
-                for (const auto& el : *prims_node->as_array()) {
-                    if (!el.is_table()) continue;
-                    const auto& t = *el.as_table();
-                    AnalyticPrim p{};
-                    p.type = (t["type"].value_or<std::string>("sphere") == "plane")
-                                 ? AnalyticPrim::Plane : AnalyticPrim::Sphere;
-                    auto pn_key = (p.type == AnalyticPrim::Plane) ? "normal" : "center";
-                    if (auto pn = t[pn_key].as_array(); pn && pn->size() == 3) {
-                        p.pos_or_n[0] = float((*pn)[0].value_or(0.0));
-                        p.pos_or_n[1] = float((*pn)[1].value_or(0.0));
-                        p.pos_or_n[2] = float((*pn)[2].value_or(0.0));
-                    }
-                    // Motion blur (#85): seed prev == curr for freshly
-                    // loaded primitives so they don't streak from the
-                    // origin on their first rendered frame.
-                    p.prev_pos_or_n[0] = p.pos_or_n[0];
-                    p.prev_pos_or_n[1] = p.pos_or_n[1];
-                    p.prev_pos_or_n[2] = p.pos_or_n[2];
-                    auto r_key = (p.type == AnalyticPrim::Plane) ? "d" : "radius";
-                    p.radius_or_d = float(t[r_key].value_or<double>(0.5));
-                    auto mat = t["material"].value_or<std::string>("lambert");
-                    if      (mat == "metal")      p.material = AnalyticPrim::Metal;
-                    else if (mat == "dielectric") p.material = AnalyticPrim::Dielectric;
-                    else if (mat == "water")      p.material = AnalyticPrim::Water;
-                    else                          p.material = AnalyticPrim::Lambert;
-                    if (auto c = t["color"].as_array(); c && c->size() == 3) {
-                        p.albedo[0] = float((*c)[0].value_or(1.0));
-                        p.albedo[1] = float((*c)[1].value_or(1.0));
-                        p.albedo[2] = float((*c)[2].value_or(1.0));
-                    }
-                    p.roughness = float(t["roughness"].value_or<double>(0.0));
-                    p.ior       = float(t["ior"].value_or<double>(1.5));
-                    auto id = std::uint32_t(t["id"].value_or<int64_t>(int64_t(primitives_.size() + 1)));
-                    primitives_[id] = p;
+            // Render cvars -- apply through ExecuteScript so each cvar's
+            // own validation / on_change runs (e.g. r_env_map reload,
+            // r_sky_mode gating). Values with spaces (paths) are quoted.
+            auto& C2 = pt::console::Console::Get();
+            for (const auto& [name, value] : scene.cvars) {
+                if (C2.FindCVar(name) == nullptr) continue;  // unknown cvar -> skip
+                std::string line = name;
+                line += ' ';
+                if (value.find(' ') != std::string::npos) {
+                    line += '"';
+                    line += value;
+                    line += '"';
+                } else {
+                    line += value;
                 }
+                C2.ExecuteScript(line);
             }
-            primitives_dirty_ = true;
-            accum_dirty_      = true;
-            out.FormatLine("scene: loaded {} primitive(s) from {}", primitives_.size(), path);
+
+            accum_dirty_ = true;
+            out.FormatLine("scene: loaded {} prim(s) + {} light(s) + {} sdf + {} cvar(s) from {}",
+                           scene.prims.size(), scene.lights.size(),
+                           scene.sdf.size(), scene.cvars.size(),
+                           path.generic_string());
         });
+
+    C.RegisterCommand("scene_list",
+        "scene_list: enumerate saved scenes (scenes/*.json). One name per "
+        "line, suitable for the asset-browser Scenes tab.",
+        [](auto, pt::console::Output& out) {
+            const std::filesystem::path root{"scenes"};
+            std::error_code ec;
+            if (!std::filesystem::is_directory(root, ec)) {
+                out.PrintLine("(no saved scenes -- scenes/ does not exist yet)");
+                return;
+            }
+            std::vector<std::string> names;
+            for (const auto& e :
+                     std::filesystem::directory_iterator(root, ec)) {
+                if (ec) break;
+                const auto& p = e.path();
+                if (p.extension() != ".json") continue;
+                const auto fn = p.filename().string();
+                if (fn.empty() || fn[0] == '.') continue;
+                names.push_back(p.stem().string());
+            }
+            std::sort(names.begin(), names.end());
+            for (const auto& n : names) out.PrintLine(n);
+            out.FormatLine("({} saved scene(s) under 'scenes/')", names.size());
+        });
+    // --- end Wave 9 scene save/load ---------------------------------------
 
     if (auto* cmd = C.RegisterCommand("screenshot",
         "screenshot <name> [accum|denoise_color|bloom_mip0|swap|depth|motion]: dump the target render texture to disk. Output format is selected by r_capture_format (png|ppm); the matching extension is auto-appended to <name>, overriding any extension you typed. ACES-tonemapped for HDR inputs (accum / denoise_color / bloom_mip0); the swap target dumps the actual presented 8-bit BGRA bytes after the engine's sRGB OETF, no host-side tonemap.",

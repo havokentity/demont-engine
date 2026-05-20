@@ -4,7 +4,12 @@
 // Pure-logic tests for the Asset Browser helpers.
 
 import { describe, expect, it } from 'vitest';
-import { parseListAssetsOutput } from '../src/helpers';
+import {
+  mergeSceneEntries,
+  parseListAssetsOutput,
+  parseSceneFixtureOutput,
+  parseSceneListOutput,
+} from '../src/helpers';
 
 describe('parseListAssetsOutput', () => {
   it('returns one entry per non-summary line', () => {
@@ -43,5 +48,66 @@ describe('parseListAssetsOutput', () => {
       'assets/gltf/Box.glb',
       'assets/gltf/Box.gltf',
     ]);
+  });
+});
+
+// --- Wave 9 scene save/load ------------------------------------------------
+
+describe('parseSceneListOutput', () => {
+  it('maps bare scene names to scene_load dispatch', () => {
+    const raw =
+      'lobby\n' + 'studio\n' + "(2 saved scene(s) under 'scenes/')\n";
+    expect(parseSceneListOutput(raw)).toEqual([
+      { name: 'lobby', dispatch: 'scene_load lobby', kind: 'saved' },
+      { name: 'studio', dispatch: 'scene_load studio', kind: 'saved' },
+    ]);
+  });
+
+  it('returns [] when only the summary line is present', () => {
+    expect(parseSceneListOutput("(0 saved scene(s) under 'scenes/')\n")).toEqual(
+      [],
+    );
+  });
+});
+
+describe('parseSceneFixtureOutput', () => {
+  it('maps fixture paths to exec dispatch with filename display', () => {
+    const raw =
+      'tests/goldens/scenes/cornell_csg.cfg\n' +
+      "(list_assets: 1 entries under 'tests/goldens/scenes')\n";
+    expect(parseSceneFixtureOutput(raw)).toEqual([
+      {
+        name: 'cornell_csg.cfg',
+        dispatch: 'exec tests/goldens/scenes/cornell_csg.cfg',
+        kind: 'fixture',
+      },
+    ]);
+  });
+});
+
+describe('mergeSceneEntries', () => {
+  it('lists saved scenes first, then fixtures, each sorted by name', () => {
+    const saved = parseSceneListOutput('studio\nlobby\n');
+    const fixtures = parseSceneFixtureOutput(
+      'tests/goldens/scenes/zebra.cfg\ntests/goldens/scenes/alpha.cfg\n',
+    );
+    const merged = mergeSceneEntries(saved, fixtures);
+    expect(merged.map((e) => e.dispatch)).toEqual([
+      'scene_load lobby',
+      'scene_load studio',
+      'exec tests/goldens/scenes/alpha.cfg',
+      'exec tests/goldens/scenes/zebra.cfg',
+    ]);
+  });
+
+  it('de-duplicates by dispatch line', () => {
+    const a = parseSceneListOutput('lobby\nlobby\n');
+    const merged = mergeSceneEntries(a, []);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]?.dispatch).toBe('scene_load lobby');
+  });
+
+  it('handles both sources empty', () => {
+    expect(mergeSceneEntries([], [])).toEqual([]);
   });
 });

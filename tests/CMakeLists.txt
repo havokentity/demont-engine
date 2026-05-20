@@ -413,6 +413,22 @@ pt_add_test(pt_renderer_light_tree
 pt_add_test(hdrimage_cdf
     hdrimage_cdf_test.cpp)
 
+# --- Wave 9 scene save/load round-trip -------------------------------------
+# Pins pt::editor::SceneToJson / SceneFromJson -- the lossless JSON
+# serializer behind the scene_save / scene_load console commands. The
+# feature's acceptance bar is a save -> clear -> load round-trip that
+# reproduces prims (varied materials) + lights (all 4 types) + camera +
+# SDF clusters + render cvars exactly; this test asserts that at the
+# serialization layer (bit-exact float compares; no GPU, no Engine
+# instance). Links pt_editor (where the serializer lives). pt_editor
+# already exposes pt_renderer / pt_physics PUBLIC, so AnalyticPrim /
+# AnalyticLight (Engine.h, header-only structs), pt::renderer::SdfPrim +
+# ComputeSdfAabb, and pt::renderer::Camera all resolve without pulling
+# in pt_engine / the GPU backends.
+pt_add_test(scene_serialize
+    scene_serialize_test.cpp
+    LINK_TARGETS pt_editor)
+
 # ============================================================================
 # Golden-image regression matrix (issue #45)
 # ============================================================================

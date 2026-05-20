@@ -27,6 +27,16 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "../engine/Engine.h"          // AnalyticPrim / AnalyticLight (nested)
+#include "../renderer/AnalyticBvh.h"   // pt::renderer::SdfPrim
+#include "../renderer/Camera.h"        // pt::renderer::Camera
+
 namespace pt::engine { class Engine; }
 
 namespace pt::editor {
@@ -72,5 +82,57 @@ nlohmann::json SerializeScene(const pt::engine::Engine& engine);
 // protocol uses. Unknown / missing strings collapse to None.
 const char*               SelectionKindToString(int kind);
 int                       SelectionKindFromString(std::string_view s);
+
+// --- Wave 9 scene save/load ------------------------------------------------
+//
+// Round-trippable, file-backed scene description. Where SerializeScene
+// above is a one-way, display-oriented snapshot for editor panels
+// (e.g. it emits only the SDF AABB header, not the node tree), SceneData
+// is the lossless model the on-disk save/load uses: every field needed
+// to reconstruct the editable scene byte-for-byte.
+//
+// Format choice (see PR): JSON via nlohmann_json. The engine already
+// vendors nlohmann_json and already serializes the live scene to JSON
+// for the editor scene-graph panel (SerializeScene). Reusing JSON --
+// and the same flat per-entry schema -- means the save file and the
+// editor's live payload share one shape, so there's no second format to
+// keep in sync. JSON also round-trips float fields with full precision.
+//
+// The serializer operates on plain data (the engine's public POD scene
+// structs + a cvar key/value list); it does NOT touch GPU state or an
+// Engine instance, so it is unit-testable in isolation (see
+// tests/scene_serialize_test.cpp). The Engine builds a SceneData from
+// its private maps for save, and applies a parsed SceneData back through
+// ApplySceneSnapshot + the SDF / camera / cvar paths for load.
+struct SceneData {
+    // Whether a camera block was present. On save it's always written;
+    // on load a missing camera leaves the engine camera untouched.
+    bool                                         has_camera = false;
+    pt::renderer::Camera                         camera{};
+
+    // Analytic primitives / lights, keyed by user id (same key space the
+    // engine maps use). Reuses the engine's nested POD structs directly.
+    std::map<std::uint32_t, pt::engine::Engine::AnalyticPrim>  prims;
+    std::map<std::uint32_t, pt::engine::Engine::AnalyticLight> lights;
+
+    // SDF clusters, full node tree (lossless). AABB is recomputed on
+    // load via pt::renderer::ComputeSdfAabb so a stale stored AABB can't
+    // desync the sphere-trace bound.
+    std::map<std::uint32_t, pt::renderer::SdfPrim>             sdf;
+
+    // Selected render cvars, name -> value strings (insertion-ordered so
+    // the file is stable / diffable). Empty is legal.
+    std::vector<std::pair<std::string, std::string>>          cvars;
+};
+
+// Serialize a SceneData to the canonical JSON document. Pretty-printed
+// (2-space indent) so saved scenes diff cleanly under version control.
+nlohmann::json SceneToJson(const SceneData& scene);
+
+// Parse a JSON document (as produced by SceneToJson) back into a
+// SceneData. Returns false and fills `err` on a structural error
+// (missing/!object root). Unknown fields are ignored; missing optional
+// fields fall back to the struct defaults. SDF AABBs are recomputed.
+bool SceneFromJson(const nlohmann::json& doc, SceneData& out, std::string& err);
 
 }  // namespace pt::editor
