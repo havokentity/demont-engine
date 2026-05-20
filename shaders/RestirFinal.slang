@@ -107,16 +107,17 @@ float shadowVis(float3 ro, float3 rd, float t_max) {
     // counts > r_analytic_bvh_threshold, but the linear loop is fine
     // for shadow rays at MVP scale and avoids the BVH traversal code
     // duplication).
-    // Stride is 6 float4s per prim after #85 (motion blur, v3=prev_pos),
-    // #181 polish (emission, v4), and #206 rotation gizmo (orient, v5).
-    // Shadow rays don't read v1/v2/v3/v4/v5 contents -- only v0 (center
+    // Stride is 7 float4s per prim after #85 (motion blur, v3=prev_pos),
+    // #181 polish (emission, v4), #206 rotation gizmo (orient, v5), and
+    // Wave 8 #26 (PBR texture tiles, v6).
+    // Shadow rays don't read v1/v2/v3/v4/v5/v6 contents -- only v0 (center
     // + radius) and v2 (type) -- so we just index those two at the new
     // stride and skip the others. The stride MUST stay in sync with
     // Engine.cpp's kFloatsPerPrim and PathTrace.slang's testAnalyticPrim
-    // (also `idx * 6u`).
+    // (also `idx * 7u` -- Wave 8 #26 bumped this from 6u).
     for (uint i = 0u; i < prim_count; ++i) {
-        float4 v0 = primitives[i * 6u + 0u];
-        float4 v2 = primitives[i * 6u + 2u];
+        float4 v0 = primitives[i * 7u + 0u];
+        float4 v2 = primitives[i * 7u + 2u];
         uint type = uint(v2.x);
         float t;
         if (type == PRIM_SPHERE) {

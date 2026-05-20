@@ -966,6 +966,31 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     pt_add_golden_cell(SCENE dof_bokeh BACKEND metal DENOISER off
         MAX_DELTA 48 MEAN_DELTA 6 FAIL_PERCENT 4)
     # --- end Wave 8 thin-lens depth of field ------------------------------
+
+    # --- Wave 8 PBR (#26) -- textured-material fixture --------------------
+    # pbr_textured exercises the PBR texture path: an analytic sphere +
+    # ground plane wearing albedo (sRGB checkerboard) + normal (tangent-
+    # space bumps) + roughness (gradient) maps from assets/textures/. The
+    # fixture loads the committed test PNGs via prim_set_*_tex, so a clean
+    # checkout reproduces it. Covers procedural UVs (sphere lat/long,
+    # plane world-XZ), strip-atlas bilinear sampling + per-tile wrap, the
+    # sRGB-decode-only-on-albedo split, and normal-map perturbation.
+    #
+    # Tolerances: textured surfaces add per-pixel detail that exaggerates
+    # cross-backend FP-order variance vs the flat cornell_csg cell (the
+    # checkerboard edges + normal-map bumps are high-frequency), so the
+    # thresholds match the sdf_smin_row cell (32/4/2) rather than the
+    # tight default. software + metal + vulkan all register; CI runs the
+    # software cell (label golden_software). The committed flat-color
+    # goldens (cornell_csg, sky, smoke, water) are UNAFFECTED -- materials
+    # with no texture index render bit-for-bit as before.
+    pt_add_golden_cell(SCENE pbr_textured BACKEND software DENOISER off
+        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+    pt_add_golden_cell(SCENE pbr_textured BACKEND metal    DENOISER off
+        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+    pt_add_golden_cell(SCENE pbr_textured BACKEND vulkan   DENOISER off
+        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+    # --- end Wave 8 PBR fixture -------------------------------------------
 else()
     message(STATUS
         "tests: golden-image matrix skipped -- pt_render_one_frame and/or "

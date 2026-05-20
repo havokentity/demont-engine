@@ -41,6 +41,12 @@
 #include "../rhi/CommandBuffer.h"
 #include "../rhi/Device.h"
 
+// Wave 8 PBR (#26): stb_image for loading material textures (PNG / JPG)
+// into the atlas. STB_IMAGE_IMPLEMENTATION is defined exactly once in the
+// renderer lib's gltf_impl.cpp (which pt_engine links); this is the
+// declaration-only include, same pattern GltfImporter.cpp uses.
+#include "../../third_party/stb/stb_image.h"
+
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -3414,6 +3420,16 @@ void Engine::RebuildMeshResources(const pt::csg::BakedMesh& baked) {
     if (box_blas_id_   != 0) device_->DestroyAccelStruct(pt::rhi::AccelStructHandle{box_blas_id_});
     if (box_vbuf_id_   != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{box_vbuf_id_});
     if (box_ibuf_id_   != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{box_ibuf_id_});
+    // Wave 8 PBR (#26): the mesh UV buffer follows vbuf/ibuf's lifetime.
+    // A CSG rebake produces no UVs (BakedMesh has none), so destroy the
+    // stale glTF UV buffer here; the gltf load path re-uploads it via
+    // UploadMeshUvs after RebuildMeshResources. Leaving it null makes the
+    // host force mesh_tex_indices to kPbrNoTexTile so the mesh renders
+    // flat (the bit-identical pre-#26 path) until UVs are uploaded.
+    if (mesh_uv_buf_id_ != 0) {
+        device_->DestroyBuffer(pt::rhi::BufferHandle{mesh_uv_buf_id_});
+        mesh_uv_buf_id_ = 0;
+    }
     // PR #106 follow-up: triangle BVH SSBOs live alongside vbuf/ibuf
     // and follow the same lifetime -- a new bake invalidates the
     // previous tree, so destroy + reallocate. Same WaitIdle() above
@@ -3590,6 +3606,193 @@ void Engine::RebuildMeshResources(const pt::csg::BakedMesh& baked) {
         (void)sw_mesh_perf_warning_fired_;
     }
 }
+
+// --- Wave 8 PBR (#26) -- mesh UVs + material texture atlas ----------------
+
+void Engine::UploadMeshUvs(const std::vector<float>& uvs,
+                           std::uint32_t vertex_count) {
+    if (!device_) return;
+    // Always start clean -- RebuildMeshResources already destroyed the
+    // previous buffer, but guard against double-upload on the same mesh.
+    if (mesh_uv_buf_id_ != 0) {
+        device_->WaitIdle();
+        device_->DestroyBuffer(pt::rhi::BufferHandle{mesh_uv_buf_id_});
+        mesh_uv_buf_id_ = 0;
+    }
+    // No UVs (or mismatched count) -> leave the buffer null; the dispatch
+    // path forces mesh_tex_indices to kPbrNoTexTile so the mesh renders
+    // flat (bit-identical to the pre-#26 mesh path).
+    if (uvs.empty() || uvs.size() != std::size_t(vertex_count) * 2u) {
+        if (!uvs.empty()) {
+            LOG_WARN("UploadMeshUvs: UV count {} != vertex_count*2 ({}); rendering mesh flat",
+                     uvs.size(), std::size_t(vertex_count) * 2u);
+        }
+        return;
+    }
+    const std::size_t bytes = uvs.size() * sizeof(float);
+    auto buf = device_->CreateBuffer({
+        .size = bytes, .usage = pt::rhi::BufferUsage::Storage,
+        .debug_name = "mesh_uvs",
+    });
+    if (buf.id == 0) {
+        LOG_ERROR("UploadMeshUvs: UV buffer allocation failed ({} bytes)", bytes);
+        return;
+    }
+    device_->WriteBuffer(buf, uvs.data(), bytes);
+    mesh_uv_buf_id_ = buf.id;
+    accum_dirty_ = true;
+}
+
+bool Engine::EnsurePbrAtlas() {
+    if (!device_) return false;
+    if (pbr_atlas_tex_id_ != 0) return true;   // already allocated
+    const std::uint32_t w = kPbrTileSize;
+    const std::uint32_t h = kPbrTileSize * kPbrAtlasTiles;
+    auto tex = device_->CreateTexture({
+        .width  = w,
+        .height = h,
+        // RGBA8_UNORM (linear storage): the atlas hosts BOTH sRGB-encoded
+        // albedo bytes and linear data bytes; the shader decodes albedo
+        // tiles via the sRGB EOTF so we never double-gamma. A _SRGB format
+        // would wrongly decode the normal/roughness/metallic tiles.
+        .format = pt::rhi::TextureFormat::RGBA8_UNORM,
+        .usage  = pt::rhi::TextureUsage::Sampled,
+        .debug_name = "pbr_atlas",
+    });
+    if (tex.id == 0) {
+        LOG_ERROR("EnsurePbrAtlas: atlas texture allocation failed ({}x{})", w, h);
+        return false;
+    }
+    pbr_atlas_tex_id_ = tex.id;
+    // Staging copy: whole atlas RGBA8, zero-cleared except tile 0 = flat
+    // white (1,1,1,1) so an albedo material that points at the reserved
+    // tile multiplies through to its flat tint unchanged.
+    pbr_atlas_staging_.assign(std::size_t(w) * h * 4u, 0u);
+    for (std::size_t i = 0; i < std::size_t(w) * kPbrTileSize * 4u; ++i) {
+        pbr_atlas_staging_[i] = 255u;   // tile 0 rows: opaque white
+    }
+    next_pbr_tile_ = 1u;
+    pbr_tile_by_path_.clear();
+    device_->WriteTexture(pt::rhi::TextureHandle{pbr_atlas_tex_id_},
+                          pbr_atlas_staging_.data(),
+                          pbr_atlas_staging_.size());
+    return true;
+}
+
+std::uint32_t Engine::AddPbrTileFromPixels(const std::uint8_t* rgba,
+                                           const std::string& key) {
+    if (!EnsurePbrAtlas()) return kPbrNoTexTile;
+    if (next_pbr_tile_ >= kPbrAtlasTiles) {
+        LOG_WARN("AddPbrTileFromPixels: atlas full ({} tiles); reusing tile 0",
+                 kPbrAtlasTiles);
+        return kPbrNoTexTile;
+    }
+    const std::uint32_t tile = next_pbr_tile_++;
+    const std::size_t row_stride = std::size_t(kPbrTileSize) * 4u;
+    const std::size_t tile_off   = std::size_t(tile) * kPbrTileSize * row_stride;
+    std::memcpy(pbr_atlas_staging_.data() + tile_off, rgba,
+                std::size_t(kPbrTileSize) * row_stride);
+    // Re-upload the whole atlas (4 MiB at defaults). WaitIdle so we don't
+    // race an in-flight dispatch reading the atlas.
+    device_->WaitIdle();
+    device_->WriteTexture(pt::rhi::TextureHandle{pbr_atlas_tex_id_},
+                          pbr_atlas_staging_.data(),
+                          pbr_atlas_staging_.size());
+    if (!key.empty()) pbr_tile_by_path_[key] = tile;
+    accum_dirty_ = true;
+    return tile;
+}
+
+std::uint32_t Engine::LoadPbrTextureTile(const std::string& path) {
+    if (!device_) return kPbrNoTexTile;
+    // De-dupe by the user-supplied path (before resolution) so the same
+    // string maps to one tile regardless of CWD.
+    if (auto it = pbr_tile_by_path_.find(path); it != pbr_tile_by_path_.end()) {
+        return it->second;
+    }
+    if (!EnsurePbrAtlas()) return kPbrNoTexTile;
+    // Resolve repo-relative asset paths (e.g. "assets/textures/foo.png")
+    // the same way the HDRI / BSC loaders do, so the golden harness can
+    // run the fixture from any CWD.
+    const std::string resolved = pt::ResolveAssetPath(path.c_str());
+    int w = 0, h = 0, comp = 0;
+    // Force RGBA8 (4 components). stb returns top-left-origin rows, the
+    // same convention the shader's texel-fetch sampling + glTF UVs use.
+    std::uint8_t* px = stbi_load(resolved.c_str(), &w, &h, &comp, /*req_comp=*/4);
+    if (px == nullptr || w <= 0 || h <= 0) {
+        LOG_WARN("pbr texture load '{}' (resolved '{}') failed: {}", path, resolved,
+                 stbi_failure_reason() ? stbi_failure_reason() : "unknown");
+        if (px) stbi_image_free(px);
+        return kPbrNoTexTile;
+    }
+    // Nearest-neighbour resample to the fixed tile size. Keeps the loader
+    // dependency-free (no stb_image_resize) and is adequate for the
+    // checkerboard / gradient / normal test maps; production assets
+    // authored at 256^2 hit the 1:1 fast path.
+    std::vector<std::uint8_t> tile(std::size_t(kPbrTileSize) * kPbrTileSize * 4u);
+    for (std::uint32_t ty = 0; ty < kPbrTileSize; ++ty) {
+        const std::uint32_t sy =
+            static_cast<std::uint32_t>(std::uint64_t(ty) * h / kPbrTileSize);
+        for (std::uint32_t tx = 0; tx < kPbrTileSize; ++tx) {
+            const std::uint32_t sx =
+                static_cast<std::uint32_t>(std::uint64_t(tx) * w / kPbrTileSize);
+            const std::size_t src = (std::size_t(sy) * w + sx) * 4u;
+            const std::size_t dst = (std::size_t(ty) * kPbrTileSize + tx) * 4u;
+            tile[dst + 0] = px[src + 0];
+            tile[dst + 1] = px[src + 1];
+            tile[dst + 2] = px[src + 2];
+            tile[dst + 3] = px[src + 3];
+        }
+    }
+    stbi_image_free(px);
+    const std::uint32_t idx = AddPbrTileFromPixels(tile.data(), path);
+    if (idx != kPbrNoTexTile) {
+        LOG_INFO("pbr texture '{}' -> atlas tile {} ({}x{} resampled to {}^2)",
+                 path, idx, w, h, kPbrTileSize);
+    }
+    return idx;
+}
+
+void Engine::AssignOrQueuePbrTex(bool is_mesh, std::uint32_t prim_id,
+                                 int slot, const std::string& path) {
+    // Device not ready yet (fixture exec during Init runs before the RHI
+    // device boots) -> queue and resolve on the first frame.
+    if (device_ == nullptr) {
+        pending_pbr_tex_.push_back({is_mesh, prim_id, slot, path});
+        return;
+    }
+    const std::uint32_t tile = LoadPbrTextureTile(path);
+    if (tile == kPbrNoTexTile) return;   // load already logged a warning
+    if (is_mesh) {
+        switch (slot) {
+            case 0: mesh_albedo_tex_    = tile; break;
+            case 1: mesh_normal_tex_    = tile; break;
+            case 2: mesh_roughness_tex_ = tile; break;
+            case 3: mesh_metallic_tex_  = tile; break;
+        }
+    } else if (auto it = primitives_.find(prim_id); it != primitives_.end()) {
+        switch (slot) {
+            case 0: it->second.albedo_tex    = tile; break;
+            case 1: it->second.normal_tex    = tile; break;
+            case 2: it->second.roughness_tex = tile; break;
+            case 3: it->second.metallic_tex  = tile; break;
+        }
+        primitives_dirty_ = true;
+    }
+    accum_dirty_ = true;
+}
+
+void Engine::ResolvePendingPbrTextures() {
+    if (pending_pbr_tex_.empty() || device_ == nullptr) return;
+    // Drain into a local so AssignOrQueuePbrTex (which won't re-queue now
+    // that device_ is non-null) can't re-enter the same vector.
+    std::vector<PendingPbrTex> queue;
+    queue.swap(pending_pbr_tex_);
+    for (const auto& e : queue) {
+        AssignOrQueuePbrTex(e.is_mesh, e.prim_id, e.slot, e.path);
+    }
+}
+// --- end Wave 8 PBR -------------------------------------------------------
 
 void Engine::SeedDefaultPrimitives() {
     primitives_.clear();
@@ -4075,6 +4278,12 @@ void Engine::EnsureStarMapUploaded() {
 
 void Engine::EnsurePrimitivesUploaded() {
     if (!device_) return;
+    // Wave 8 PBR (#26): resolve any fixture-time texture assignments now
+    // that the device is up. This loads each queued image into an atlas
+    // tile and writes the tile index into the prim / mesh material slot,
+    // flagging primitives_dirty_ so the (re)pack below picks it up. No-op
+    // once the queue is drained (the common steady-state case).
+    ResolvePendingPbrTextures();
     if (!primitives_dirty_) return;
 
     const std::uint32_t count = static_cast<std::uint32_t>(primitives_.size());
@@ -4090,14 +4299,26 @@ void Engine::EnsurePrimitivesUploaded() {
     //   v3 = (xyz: prev_pos,         w: pad)   -- motion blur, #85
     //   v4 = (rgb: emission W/sr,    w: pad)   -- self-emission, #181
     //   v5 = (xyzw: orient quat)               -- rotation gizmo, #206
-    // Shaders use `idx * 6u` to step prims; PathTrace.slang's
-    // testAnalyticPrim, RestirFinal.slang's shadowVis, and
-    // SoftwareTracer.cpp's analytic-prim scan all MUST step at this
-    // stride. Off-paths (identity orient, no motion blur, no emission)
-    // pay only the extra load cost; rendered output is bit-identical
-    // when orient == identity (the shader gates the quat-rotate on the
-    // identity check).
-    constexpr std::uint32_t kFloatsPerPrim = 24;   // 6 float4s
+    //   v6 = (x: albedo_tex,  y: normal_tex,  z: roughness_tex,
+    //         w: metallic_tex)                 -- PBR texture tiles, Wave 8 #26
+    // --- Wave 8 PBR (#26) STRIDE BUMP: 6 -> 7 float4s (24 -> 28 floats) ---
+    // The PBR texture-tile indices in v6 are uint values bit-reinterpreted
+    // as float (recovered shader-side via asuint(), same trick v2.w's
+    // user-prim id uses). 0xFFFFFFFF means "no texture, use the flat v1
+    // albedo / roughness" -- the default for every prim, so a scene with
+    // no textures packs v6 = (0xFFFFFFFF x4) and the shader's texture-
+    // sample gate is skipped, preserving the flat-color render bit-for-bit.
+    //
+    // Shaders use `idx * 7u` to step prims; this stride MUST stay in sync
+    // across FOUR sites (a known footgun -- there are matching comments in
+    // each): PathTrace.slang's testAnalyticPrim, RestirFinal.slang's
+    // shadowVis, SoftwareTracer.cpp's analytic-prim scan, and this
+    // kFloatsPerPrim. Off-paths (identity orient, no motion blur, no
+    // emission, no texture) pay only the extra load cost; rendered output
+    // is bit-identical when orient == identity AND all tex tiles are
+    // kPbrNoTexTile (the shaders gate the quat-rotate + texture sample on
+    // those checks).
+    constexpr std::uint32_t kFloatsPerPrim = 28;   // 7 float4s (Wave 8 #26: was 24)
     constexpr std::uint32_t kBytesPerPrim  = sizeof(float) * kFloatsPerPrim;
 
     // Allocate / grow the storage buffer when needed. We grow by powers
@@ -4289,6 +4510,23 @@ void Engine::EnsurePrimitivesUploaded() {
         packed[off + 21] = p.orient[1];
         packed[off + 22] = p.orient[2];
         packed[off + 23] = p.orient[3];
+        // v6 -- PBR texture tile indices (Wave 8 #26). uint reinterpreted
+        // as float; recovered shader-side via asuint(). kPbrNoTexTile
+        // (0xFFFFFFFF) = no texture, use the flat v1 albedo / roughness
+        // (the default for every prim, so this collapses to a no-op and
+        // the flat-color render is bit-identical). x=albedo, y=normal,
+        // z=roughness, w=metallic.
+        {
+            auto u2f = [](std::uint32_t u) {
+                float f;
+                std::memcpy(&f, &u, sizeof(float));
+                return f;
+            };
+            packed[off + 24] = u2f(p.albedo_tex);
+            packed[off + 25] = u2f(p.normal_tex);
+            packed[off + 26] = u2f(p.roughness_tex);
+            packed[off + 27] = u2f(p.metallic_tex);
+        }
     };
     for (std::size_t i = 0; i < infinite_prims.size(); ++i) {
         pack_prim(i, *infinite_prims[i].p, infinite_prims[i].id);
@@ -6351,6 +6589,21 @@ void Engine::RenderFrame() {
         : pt::rhi::BufferHandle{placeholder_storage_id_};
     if (slot16.id != 0) cb->BindBuffer(16, slot16, 0);
     // --- end Fluid Phase 3 -------------------------------------------------
+    // --- Wave 8 PBR (#26) -- mesh UVs --------------------------------------
+    // Per-vertex mesh UV buffer at engine slot 17 / vk::binding 33. ALWAYS
+    // bind something (placeholder storage fallback) -- this is the LAST
+    // buffer slot, so Metal computes the push-constant slot as max-bound
+    // + 1 = 18, and leaving 17 unbound would collapse it back to 17 and
+    // corrupt every push field (the same lesson slots 11..16 capture).
+    // The shader only reads mesh_uvs on a mesh hit when mesh_tex_indices
+    // has a non-kPbrNoTexTile channel; the host forces those to
+    // kPbrNoTexTile when mesh_uv_buf_id_ == 0, so the placeholder is
+    // never sampled.
+    pt::rhi::BufferHandle slot17 = (mesh_uv_buf_id_ != 0)
+        ? pt::rhi::BufferHandle{mesh_uv_buf_id_}
+        : pt::rhi::BufferHandle{placeholder_storage_id_};
+    if (slot17.id != 0) cb->BindBuffer(17, slot17, 0);
+    // --- end Wave 8 PBR ----------------------------------------------------
     // Engine slots 11/12/13 -> vk::bindings 24/25/26: the MetalFX
     // specular-guidance trio (issue #118). Path tracer writes them
     // alongside the existing G-buffers when the write_specular_*_gbuffer
@@ -6399,6 +6652,25 @@ void Engine::RenderFrame() {
         cb->BindStorageTexture(15, pt::rhi::TextureHandle{ocean_normal_tex_id_});
     }
     // --- end Wave 8 ocean --------------------------------------------------
+    // --- Wave 8 PBR (#26) -- material texture atlas ------------------------
+    // Engine texture slot 16 -> MSL texture 16 / vk::binding 34. (Ocean #25
+    // took slots 14/15 -> bindings 32/33 on the integration branch, so PBR
+    // rebased one slot up: atlas at engine slot 16 / vk::binding 34, and
+    // mesh_uvs at vk::binding 35.) Bind the strip atlas only when it's been
+    // allocated (lazily, on first texture load). Textures don't enter
+    // Metal's push-slot computation (only buffers do), so an unbound atlas
+    // slot is harmless on Metal -- the shader never reads it because every
+    // material's tile stays kPbrNoTexTile until a texture is loaded. On
+    // Vulkan the binding is PARTIALLY_BOUND so the unallocated case leaves
+    // slot 34 unwritten; the shader is gated not to read it (every tile
+    // kPbrNoTexTile). We do NOT bind a placeholder here because the bloom
+    // dummy is RGBA16F and the atlas binding is declared rgba8 -- a
+    // format-mismatched view would trip Vulkan validation for a binding
+    // that's never read anyway.
+    if (pbr_atlas_tex_id_ != 0) {
+        cb->BindStorageTexture(16, pt::rhi::TextureHandle{pbr_atlas_tex_id_});
+    }
+    // --- end Wave 8 PBR ----------------------------------------------------
 
     std::uint32_t bounces = 8;
     if (auto* v = C.FindCVar("r_max_bounces")) bounces = (std::uint32_t)v->GetInt();
@@ -6885,6 +7157,17 @@ void Engine::RenderFrame() {
         float ocean_params0[4];
         float ocean_params1[4];
         // --- end Wave 8 ocean --------------------------------------------
+        // --- Wave 8 PBR (#26) -- mesh material texture tiles -------------
+        // The single CSG / glTF mesh has one material. Its PBR texture
+        // tile indices into the strip atlas are pushed here (uint4):
+        //   .x = albedo_tex, .y = normal_tex, .z = roughness_tex,
+        //   .w = metallic_tex.
+        // kPbrNoTexTile (0xFFFFFFFF) on a channel = no texture, use the
+        // flat MESH_ALBEDO / fixed roughness. Default is all-0xFFFFFFFF
+        // so an untextured mesh renders bit-identically to pre-#26.
+        // One uvec4 = 16 B.
+        std::uint32_t mesh_tex_indices[4];
+        // --- end Wave 8 PBR ----------------------------------------------
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -8064,6 +8347,16 @@ void Engine::RenderFrame() {
         push.ocean_params1[3] = 0.0f;
     }
     // --- end Wave 8 ocean --------------------------------------------------
+    // --- Wave 8 PBR (#26) -- mesh material texture tiles -------------------
+    // Default all-kPbrNoTexTile (set by the `PtPush push{}` aggregate
+    // already, but be explicit). When the mesh has a UV buffer AND the
+    // user set a tile via `mesh_set_*_tex`, the shader interpolates UVs
+    // and samples the atlas; otherwise it falls back to MESH_ALBEDO.
+    push.mesh_tex_indices[0] = (mesh_uv_buf_id_ != 0) ? mesh_albedo_tex_    : 0xFFFFFFFFu;
+    push.mesh_tex_indices[1] = (mesh_uv_buf_id_ != 0) ? mesh_normal_tex_    : 0xFFFFFFFFu;
+    push.mesh_tex_indices[2] = (mesh_uv_buf_id_ != 0) ? mesh_roughness_tex_ : 0xFFFFFFFFu;
+    push.mesh_tex_indices[3] = (mesh_uv_buf_id_ != 0) ? mesh_metallic_tex_  : 0xFFFFFFFFu;
+    // --- end Wave 8 PBR ----------------------------------------------------
     // --- Underwater medium tracking (Phase 4, #134) ------------------------
     // Pack:
     //   .x = 1.0 if camera position is inside any MAT_WATER plane's
@@ -8231,9 +8524,12 @@ void Engine::RenderFrame() {
     //   +32 Wave 8 ocean (#25) — ocean_params0 + ocean_params1, two vec4s
     //                              (enabled/tile/choppy/max_disp_y +
     //                               march_steps/grid/_/_)
+    //   +16 Wave 8 PBR (#26) — mesh_tex_indices uvec4 (albedo, normal,
+    //                              roughness, metallic mesh-material tiles)
     static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 32 + 16
                   + 16 /* Wave 8 spectral (#27): spectral_params */
-                  + 32 /* Wave 8 ocean (#25): ocean_params0 + ocean_params1 */);
+                  + 32 /* Wave 8 ocean (#25): ocean_params0 + ocean_params1 */
+                  + 16 /* Wave 8 PBR (#26): mesh_tex_indices */);
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
     // cbuffer layout the Slang compiler applies to PathTrace.slang's
@@ -8332,6 +8628,10 @@ void Engine::RenderFrame() {
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     static_assert(offsetof(PtPush, mesh_motion_curr) % 16 == 0,
                   "PtPush::mesh_motion_curr must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    // Wave 8 PBR (#26): mesh material texture tiles uvec4.
+    static_assert(offsetof(PtPush, mesh_tex_indices) % 16 == 0,
+                  "PtPush::mesh_tex_indices must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
@@ -14544,6 +14844,13 @@ void Engine::RegisterCsgCommands() {
             if (csg_scene_) csg_scene_->AcknowledgeClean();
             force_mesh_rebuild_ = false;
 
+            // Wave 8 PBR (#26): grab the UVs + vertex count BEFORE the
+            // move below empties loaded->positions. BakedMesh has no UV
+            // field (CSG bakes produce none), so glTF UVs are uploaded
+            // separately via UploadMeshUvs after RebuildMeshResources.
+            std::vector<float> gltf_uvs    = std::move(loaded->uvs);
+            const std::uint32_t gltf_vcount = loaded->VertexCount();
+
             // Convert GltfMesh -> BakedMesh (same triangle-soup layout)
             // and hand it to the existing mesh-upload pipeline.
             pt::csg::BakedMesh baked;
@@ -14551,6 +14858,11 @@ void Engine::RegisterCsgCommands() {
             baked.normals   = std::move(loaded->normals);
             baked.indices   = std::move(loaded->indices);
             RebuildMeshResources(baked);
+            // Upload UVs parallel to the freshly-rebuilt mesh_positions.
+            // RebuildMeshResources cleared any stale UV buffer, so this is
+            // the authoritative UV set for the loaded mesh (empty => the
+            // mesh renders flat until UVs / a textured mesh load).
+            UploadMeshUvs(gltf_uvs, gltf_vcount);
             accum_dirty_ = true;
 
             out.FormatLine("mesh_load_gltf: loaded '{}' ({} verts, {} tris, base color "
@@ -15003,6 +15315,124 @@ void Engine::RegisterPrimCommands() {
             broadcast_scene_dirty();
             out.FormatLine("prim_set_ior: id {} -> {:.3f}", id, v);
         });
+
+    // --- Wave 8 PBR (#26) -- per-prim texture assignment -------------------
+    // Shared body for the four prim_set_*_tex commands: parse <id> <path>,
+    // then assign-or-queue the texture (the load is deferred to the first
+    // frame when invoked from a fixture before the RHI device boots; it
+    // resolves immediately for interactive use). `which` selects which of
+    // albedo/normal/roughness/metallic to set.
+    auto set_prim_tex = [this, find_prim, broadcast_scene_dirty]
+        (std::string_view cmd, int which,
+         auto args, pt::console::Output& out) {
+        if (args.size() != 2) {
+            out.FormatLine("usage: {} <id> <path>", cmd);
+            return;
+        }
+        std::uint32_t id; AnalyticPrim* p = nullptr;
+        if (!find_prim(args[0], out, id, p)) return;
+        PushSceneSnapshot();
+        AssignOrQueuePbrTex(/*is_mesh=*/false, id, which, std::string(args[1]));
+        broadcast_scene_dirty();
+        out.FormatLine("{}: id {} -> '{}'{}", cmd, id, args[1],
+                       device_ ? "" : " (queued -- resolves on first frame)");
+    };
+    C.RegisterCommand("prim_set_albedo_tex",
+        "prim_set_albedo_tex <id> <path>: assign an albedo (base color) "
+        "texture to a primitive. PNG/JPG; interpreted as sRGB. Procedural "
+        "UVs: sphere lat/long, plane world-XZ (1 tile / metre).",
+        [set_prim_tex](auto args, pt::console::Output& out) {
+            set_prim_tex("prim_set_albedo_tex", 0, args, out);
+        });
+    C.RegisterCommand("prim_set_normal_tex",
+        "prim_set_normal_tex <id> <path>: assign a tangent-space normal "
+        "map to a primitive (linear, [0,1]->[-1,1]).",
+        [set_prim_tex](auto args, pt::console::Output& out) {
+            set_prim_tex("prim_set_normal_tex", 1, args, out);
+        });
+    C.RegisterCommand("prim_set_roughness_tex",
+        "prim_set_roughness_tex <id> <path>: assign a roughness map "
+        "(linear; .r scales the flat roughness).",
+        [set_prim_tex](auto args, pt::console::Output& out) {
+            set_prim_tex("prim_set_roughness_tex", 2, args, out);
+        });
+    C.RegisterCommand("prim_set_metallic_tex",
+        "prim_set_metallic_tex <id> <path>: assign a metallic map "
+        "(linear; .r>0.5 turns a Lambert prim metal where the map is white).",
+        [set_prim_tex](auto args, pt::console::Output& out) {
+            set_prim_tex("prim_set_metallic_tex", 3, args, out);
+        });
+    C.RegisterCommand("prim_clear_tex",
+        "prim_clear_tex <id>: remove all PBR texture maps from a primitive "
+        "(reverts to its flat albedo / roughness).",
+        [this, find_prim, broadcast_scene_dirty]
+        (auto args, pt::console::Output& out) {
+            if (args.size() != 1) {
+                out.PrintLine("usage: prim_clear_tex <id>");
+                return;
+            }
+            std::uint32_t id; AnalyticPrim* p = nullptr;
+            if (!find_prim(args[0], out, id, p)) return;
+            PushSceneSnapshot();
+            p->albedo_tex = p->normal_tex = p->roughness_tex =
+                p->metallic_tex = 0xFFFFFFFFu;
+            primitives_dirty_ = true;
+            accum_dirty_      = true;
+            broadcast_scene_dirty();
+            out.FormatLine("prim_clear_tex: id {} -> flat", id);
+        });
+
+    // --- mesh material textures (mesh_load_gltf supplies the UVs) ----------
+    auto set_mesh_tex = [this](std::string_view cmd, int which,
+                               auto args, pt::console::Output& out) {
+        if (args.size() != 1) {
+            out.FormatLine("usage: {} <path>", cmd);
+            return;
+        }
+        // Note: we do NOT gate on mesh_uv_buf_id_ here because the mesh
+        // may not be loaded yet at fixture-exec time. The shader forces
+        // mesh_tex_indices to kPbrNoTexTile when the mesh has no UVs, so
+        // assigning a tile before a UV-bearing mesh is loaded is harmless
+        // (it just won't be sampled until UVs exist).
+        AssignOrQueuePbrTex(/*is_mesh=*/true, /*prim_id=*/0u, which,
+                            std::string(args[0]));
+        out.FormatLine("{}: mesh -> '{}'{}", cmd, args[0],
+                       device_ ? "" : " (queued -- resolves on first frame)");
+    };
+    C.RegisterCommand("mesh_set_albedo_tex",
+        "mesh_set_albedo_tex <path>: assign an albedo texture to the loaded "
+        "mesh (uses the mesh's glTF UVs; sRGB).",
+        [set_mesh_tex](auto args, pt::console::Output& out) {
+            set_mesh_tex("mesh_set_albedo_tex", 0, args, out);
+        });
+    C.RegisterCommand("mesh_set_normal_tex",
+        "mesh_set_normal_tex <path>: assign a tangent-space normal map to "
+        "the loaded mesh.",
+        [set_mesh_tex](auto args, pt::console::Output& out) {
+            set_mesh_tex("mesh_set_normal_tex", 1, args, out);
+        });
+    C.RegisterCommand("mesh_set_roughness_tex",
+        "mesh_set_roughness_tex <path>: assign a roughness map to the "
+        "loaded mesh.",
+        [set_mesh_tex](auto args, pt::console::Output& out) {
+            set_mesh_tex("mesh_set_roughness_tex", 2, args, out);
+        });
+    C.RegisterCommand("mesh_set_metallic_tex",
+        "mesh_set_metallic_tex <path>: assign a metallic map to the loaded "
+        "mesh.",
+        [set_mesh_tex](auto args, pt::console::Output& out) {
+            set_mesh_tex("mesh_set_metallic_tex", 3, args, out);
+        });
+    C.RegisterCommand("mesh_clear_tex",
+        "mesh_clear_tex: remove all PBR texture maps from the loaded mesh.",
+        [this](auto args, pt::console::Output& out) {
+            (void)args;
+            mesh_albedo_tex_ = mesh_normal_tex_ = mesh_roughness_tex_ =
+                mesh_metallic_tex_ = 0xFFFFFFFFu;
+            accum_dirty_ = true;
+            out.PrintLine("mesh_clear_tex: mesh -> flat");
+        });
+    // --- end Wave 8 PBR ----------------------------------------------------
 
     C.RegisterCommand("prim_set_material",
         "prim_set_material <id> <lambert|metal|dielectric|water>: swap "

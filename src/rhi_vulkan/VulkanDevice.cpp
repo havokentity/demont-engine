@@ -159,8 +159,12 @@ constexpr bool kEnableValidation = false;
 // the FFT ocean displacement + normal textures (RGBA32F, written CPU-side
 // and read-only-sampled by the path tracer's heightfield ray-march). 32/33
 // sit one past the SPH particle SSBO's binding 31 -- the next free bindings
-// on the integration branch. kNumTexSlots bumped 14 -> 16 to fit them.
-static constexpr std::uint32_t kNumTexSlots = 16;
+// on the integration branch.
+// Wave 8 PBR (#26): engine texture slot 16 -> vk::binding 34 is the
+// material strip atlas. Ocean took 32/33, so PBR rebased one slot up to 34
+// (and mesh_uvs to buffer binding 35). kNumTexSlots bumped 14 -> 17 to fit
+// ocean at 14/15 + pbr_atlas at 16.
+static constexpr std::uint32_t kNumTexSlots = 17;
 constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     0,  // engine slot 0  -> shader binding 0  (output / swapchain)
     1,  // engine slot 1  -> shader binding 1  (accum_hdr)
@@ -178,6 +182,11 @@ constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     26, // engine slot 13 -> shader binding 26 (specular_hit_distance_tex, #118)
     32, // engine slot 14 -> shader binding 32 (ocean_displacement, #25)
     33, // engine slot 15 -> shader binding 33 (ocean_normal, #25)
+    // Wave 8 PBR (#26): material texture strip atlas. Ocean (#25) took
+    // bindings 32/33, so the atlas rebased to the next free binding 34.
+    // The kernel only READS it (uploaded once via WriteTexture), like
+    // env_map / star_map / moon_map.
+    34, // engine slot 16 -> shader binding 34 (pbr_atlas, #26)
 };
 constexpr std::uint32_t kSlotToBufBinding[24] = {
     0,  // engine slot 0 unused
@@ -218,7 +227,11 @@ constexpr std::uint32_t kSlotToBufBinding[24] = {
     // Fluid Phase 3 (#22): SPH particle splat list. One past smoke
     // emitters.
     31, // engine slot 16 -> shader binding 31 (sph_particles)
-    0,  // engine slot 17 unused
+    // Wave 8 PBR (#26): per-vertex mesh UV buffer. Ocean (#25) took
+    // bindings 32/33 and pbr_atlas rebased to 34, so mesh_uvs sits at
+    // binding 35. Read only on a mesh hit when mesh_tex_indices has a
+    // non-kPbrNoTexTile channel.
+    35, // engine slot 17 -> shader binding 35 (mesh_uvs)
     0,  // engine slot 18 unused
     0,  // engine slot 19 unused
     0,  // engine slot 20 unused
@@ -1080,26 +1093,30 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         static_cast<std::uint32_t>(kFramesInFlight * kDispatchSetsPerFrame);
     std::vector<VkDescriptorPoolSize> psizes;
     // Wave 8 ocean (#25) bumps storage_image per set from 14 to 16 for
-    // ocean_displacement + ocean_normal (bindings 32/33).
-    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kTotalSets * 16 + 4 });
+    // ocean_displacement + ocean_normal (bindings 32/33); Wave 8 PBR (#26)
+    // adds pbr_atlas (binding 34) for a total of 17.
+    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kTotalSets * 17 + 4 });
     if (rt_supported_) {
         psizes.push_back({ VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, kTotalSets * 1 + 1 });
     }
-    // 15 storage-buffer bindings per dispatch: mesh_positions, mesh_indices,
+    // 18 storage-buffer bindings per dispatch: mesh_positions, mesh_indices,
     // primitives, marginal_cdf, conditional_cdf, exposure_state, analytic
     // bvh_nodes (binding 18), tri_bvh_nodes (binding 19),
     // tri_bvh_permuted_ids (binding 20), sdf_clusters (binding 21),
     // shadow_vis_buf (binding 23, #115), light_prims (binding 27, #73),
     // light_tree_nodes (binding 28, #129), reservoir_curr_buf
-    // (binding 29, #78 ReSTIR), smoke_emitters (binding 30, #136). +8
-    // slack for upcoming additions before we have to bump again --
+    // (binding 29, #78 ReSTIR), smoke_emitters (binding 30, #136),
+    // sph_particles (binding 31, #22 -- previously missing from the
+    // Vulkan layout, added with Wave 8), mesh_uvs (binding 33, #26).
+    // +8 slack for upcoming additions before we have to bump again --
     // MoltenVK silently ignored the prior undersize, but native NVIDIA
     // Vulkan correctly returns VK_ERROR_OUT_OF_POOL_MEMORY.
-    // 16 storage-buffer bindings per dispatch now: the 15 listed above
+    // 17 storage-buffer bindings per dispatch now: the 15 base bindings
     // plus sph_particles (binding 31, #22) -- its layout entry was added
     // alongside the Wave 8 ocean bindings (the #22 PR added only the
-    // engine slot-table mapping). +8 slack retained for future additions.
-    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 16 + 8 });
+    // engine slot-table mapping) -- plus mesh_uvs (binding 35, #26 PBR).
+    // +8 slack retained for future additions.
+    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 17 + 8 });
     psizes.push_back({ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,          kTotalSets * 1 + 1 });
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -1131,7 +1148,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // coordination -- this PR leaves it as a gap).
     {
         std::vector<VkDescriptorSetLayoutBinding> b;
-        b.reserve(27);
+        b.reserve(31);   // Wave 8 #26 added bindings 31/32/33 (+ closed the 31 gap)
         auto add_binding = [&](std::uint32_t binding, VkDescriptorType type) {
             VkDescriptorSetLayoutBinding lb{};
             lb.binding         = binding;
@@ -1256,13 +1273,16 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         add_binding(30, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
         // --- end Fluid Phase 1 -------------------------------------
         // --- Fluid Phase 3 (#22) -----------------------------------
-        // Binding 31: SPH particle splat list SSBO. PathTrace.slang
-        // declares vk::binding(31) unconditionally; without the matching
-        // layout entry the shader reads an undeclared binding (only the
-        // engine slot-table entry was added by #22). Declared here so the
-        // descriptor layout is complete -- PARTIALLY_BOUND covers the
-        // Metal-only-dispatch case where the engine never binds it on
-        // Vulkan (smoke_sph_params.x stays 0, so the loop is dead anyway).
+        // Binding 31: SPH particle splat list SSBO (sph_particles).
+        // PathTrace.slang declares vk::binding(31) unconditionally, so the
+        // layout MUST include it or vkCreateComputePipelines rejects the
+        // SPIR-V module (a declared binding absent from the layout is a
+        // validation error even under PARTIALLY_BOUND). The engine binds a
+        // placeholder when no SPH sim is active; the shader gates the splat
+        // loop on push.smoke_sph_params.x > 0. NOTE: both the Wave 8 ocean
+        // (#25) and PBR (#26) PRs independently spotted this missing entry
+        // (the #22 PR added only the engine slot-table mapping); declared
+        // ONCE here in the merged result.
         add_binding(31, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
         // --- end Fluid Phase 3 -------------------------------------
         // --- Wave 8 ocean (#25) ------------------------------------
@@ -1275,6 +1295,18 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         add_binding(32, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
         add_binding(33, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
         // --- end Wave 8 ocean --------------------------------------
+        // --- Wave 8 PBR (#26) --------------------------------------
+        // Binding 34: pbr_atlas material texture strip atlas (storage
+        // image; the kernel only reads it, uploaded once via WriteTexture
+        // like env_map). Binding 35: mesh_uvs per-vertex UV SSBO. Both
+        // declared unconditionally in PathTrace.slang. Ocean (#25) took
+        // 32/33, so PBR rebased one slot up to 34/35. PARTIALLY_BOUND
+        // covers the "no textures / no mesh UVs" case where the engine
+        // binds a placeholder; the shader's per-material tile gate
+        // (tile != kPbrNoTexTile) is the runtime "actually sample" switch.
+        add_binding(34, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        add_binding(35, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        // --- end Wave 8 PBR ----------------------------------------
 
         // UPDATE_AFTER_BIND for every binding so we can rewrite the
         // shared descriptor set between dispatches in the same cmd

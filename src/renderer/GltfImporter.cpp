@@ -342,12 +342,18 @@ std::optional<GltfMesh> LoadGltf(const std::string& path, std::string* out_error
     // --- Positions (REQUIRED) ----------------------------------------
     const cgltf_accessor* pos_acc = nullptr;
     const cgltf_accessor* nrm_acc = nullptr;
+    // Wave 8 PBR (#26): the first UV set (TEXCOORD_0). Optional -- many
+    // hand-modeled / procedurally-generated meshes omit it, in which case
+    // the engine renders the mesh flat (no texture sampling).
+    const cgltf_accessor* uv_acc = nullptr;
     for (cgltf_size a = 0; a < prim.attributes_count; ++a) {
         const cgltf_attribute& attr = prim.attributes[a];
         if (attr.type == cgltf_attribute_type_position && attr.index == 0) {
             pos_acc = attr.data;
         } else if (attr.type == cgltf_attribute_type_normal && attr.index == 0) {
             nrm_acc = attr.data;
+        } else if (attr.type == cgltf_attribute_type_texcoord && attr.index == 0) {
+            uv_acc = attr.data;
         }
     }
     if (!pos_acc) return fail("primitive has no POSITION attribute");
@@ -401,6 +407,29 @@ std::optional<GltfMesh> LoadGltf(const std::string& path, std::string* out_error
                      path, nrm_acc->count, pos_acc->count);
         }
         SynthesizeNormals(out.positions, out.indices, out.normals);
+    }
+
+    // --- UVs (TEXCOORD_0, optional -- Wave 8 PBR #26) ----------------
+    // Read the first UV set into 2-floats-per-vertex layout parallel to
+    // positions. Skipped when the count mismatches positions (a
+    // malformed file) -- the mesh then renders flat rather than sampling
+    // a misaligned texture. The world-transform fold below does NOT
+    // touch UVs (texture coordinates are invariant under the node's
+    // affine world transform).
+    if (uv_acc && uv_acc->count == pos_acc->count) {
+        out.uvs.resize(uv_acc->count * 2, 0.0f);
+        for (cgltf_size v = 0; v < uv_acc->count; ++v) {
+            if (!cgltf_accessor_read_float(uv_acc, v, &out.uvs[v * 2], 2)) {
+                // Non-fatal: drop UVs, render flat.
+                LOG_WARN("glTF '{}': TEXCOORD_0 read failed at vertex {}, dropping UVs",
+                         path, static_cast<std::uint64_t>(v));
+                out.uvs.clear();
+                break;
+            }
+        }
+    } else if (uv_acc) {
+        LOG_INFO("glTF '{}': TEXCOORD_0 accessor count {} != POSITION count {}, dropping UVs",
+                 path, uv_acc->count, pos_acc->count);
     }
 
     // --- World transform from root node ------------------------------
