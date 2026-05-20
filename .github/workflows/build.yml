@@ -5,9 +5,9 @@ name: Build
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, integration/parallel-batch-1 ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, integration/parallel-batch-1 ]
   # Allow running from the Actions tab manually -- also useful for
   # forcing a nightly build outside the schedule.
   workflow_dispatch:
