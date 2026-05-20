@@ -133,7 +133,7 @@
 //                       for the BSC sample
 //   moon_dir_phase  -- .xyz unit vec toward moon, .w phase angle (rad)
 //   moon_extra      -- .x r_moon_size, .y distance ratio,
-//                       .z r_moon_brightness
+//                       .z r_moon_disc_brightness
 //   sun_extra       -- .x r_sun_size, .y distance ratio,
 //                       .z vertical-flatten
 //   dof_params      -- .x aperture radius (0 = pinhole),
