@@ -909,6 +909,21 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     pt_add_golden_cell(SCENE spectral_prism BACKEND metal DENOISER off
         MAX_DELTA 48 MEAN_DELTA 6 FAIL_PERCENT 4)
     # --- end Wave 8 spectral dispersion -----------------------------------
+
+    # --- Wave 8 thin-lens depth of field (#27) ----------------------------
+    # Row of emissive spheres receding from the camera; only the middle
+    # sphere sits on the focus plane (sharp), the rest blur into bokeh
+    # discs with strength proportional to their distance from focus.
+    # Metal golden cell. The fixture sets photographic params (85mm
+    # f/2.0, focus 7.23 m) and r_spp 8 because thin-lens DOF integrates
+    # over the aperture disc -- each sample lands on a different lens
+    # point, so the defocus regions need more samples per frame to
+    # settle. Tolerances widened like the other stochastic cells; the
+    # pinhole regression (r_dof 0 -> every sphere sharp) is the default
+    # path already covered bit-for-bit by cornell_csg / the other cells.
+    pt_add_golden_cell(SCENE dof_bokeh BACKEND metal DENOISER off
+        MAX_DELTA 48 MEAN_DELTA 6 FAIL_PERCENT 4)
+    # --- end Wave 8 thin-lens depth of field ------------------------------
 else()
     message(STATUS
         "tests: golden-image matrix skipped -- pt_render_one_frame and/or "
