@@ -1012,6 +1012,37 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     pt_add_golden_cell(SCENE pbr_textured BACKEND vulkan   DENOISER off
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     # --- end Wave 8 PBR fixture -------------------------------------------
+
+    # --- Wave 9 volumetric height fog -------------------------------------
+    # height_fog exercises the dedicated HeightFog.slang composite: a row
+    # of Lambert spheres receding down -Z under a procedural low-sun sky,
+    # with r_fog 1. The analytic exponential-height fog integrates along
+    # each camera ray so the near spheres stay clear, the far ones fade
+    # into the fog colour, the ground hazes to the horizon, and the
+    # sun-side sky brightens via the HG forward-scatter lobe. The cell
+    # guards the fog pipeline end-to-end (closed-form optical depth +
+    # Beer-Lambert composite + camera-ray reconstruction from the depth
+    # G-buffer).
+    #
+    # Metal-only -- Metal is the wave-9 build+test target (the fog
+    # dispatch is gated to the Metal `use_engine_tonemap` post-denoise
+    # chain; Vulkan descriptor wiring is a follow-up). The r_fog 0
+    # default path is a true no-op (dispatch elided) and is already
+    # covered bit-for-bit by every other committed golden, so no extra
+    # "fog off" cell is needed for the goldens-preserved half of the
+    # acceptance bar.
+    #
+    # Tolerances widened like the other procedural-sky cells: the fog
+    # in-scatter is a smooth low-frequency term layered over the 1-spp
+    # path-traced scene, so the dominant per-pixel variance is the
+    # underlying radiance noise floor (same regime as procedural_evening)
+    # rather than the fog math, which is deterministic. The thresholds
+    # catch the fog failing to engage (haze-free frame), the depth
+    # reconstruction breaking (uniform fog ignoring distance), or the
+    # composite blowing out / zeroing the scene.
+    pt_add_golden_cell(SCENE height_fog BACKEND metal DENOISER svgf_atrous
+        MAX_DELTA 48 MEAN_DELTA 8 FAIL_PERCENT 6)
+    # --- end Wave 9 volumetric height fog ---------------------------------
 else()
     message(STATUS
         "tests: golden-image matrix skipped -- pt_render_one_frame and/or "

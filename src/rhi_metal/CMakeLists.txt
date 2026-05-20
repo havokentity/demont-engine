@@ -169,6 +169,19 @@ pt_compile_slang(
     ENTRY   main
     TARGETS metal
 )
+# Volumetric height fog (wave-9). Dedicated stateless composite that
+# integrates the closed-form exponential-height-falloff atmospheric fog
+# along the camera ray (eye -> primary-hit depth) and Beer-Lambert blends
+# the in-scatter into the post-denoise HDR. Built unconditionally; the
+# engine elides the dispatch when r_fog == 0 (default) so existing goldens
+# stay bit-for-bit unchanged. See shaders/HeightFog.slang.
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/HeightFog.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+)
 # SIGMA-style sun-shadow denoiser (issue #115). Runs between Denoise()
 # and StarsComposite; bilateral-filters the per-pixel sun-visibility
 # G-buffer, multiplies the denoised visibility back into HDR.
