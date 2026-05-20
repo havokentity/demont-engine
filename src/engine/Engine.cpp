@@ -7398,6 +7398,31 @@ void Engine::RenderFrame() {
         // cbuffer and the SPIR-V Frame UBO spilled tail.
         float hosek_params[4];
         // --- end Wave 9 hosek-sky ----------------------------------------
+        // --- Wave 9 advanced materials -----------------------------------
+        // Per-prim BSDF lobe extensions, keyed by user prim id. The host
+        // packs every primitive whose AnalyticPrim::mat_ext_flags != 0 into
+        // this small fixed array (default zero count -> the shader's
+        // override lookup is skipped on every hit, so existing materials
+        // render bit-for-bit). This deliberately avoids widening the
+        // analytic-prim storage-buffer stride (kFloatsPerPrim stays 28 / 7
+        // float4s) -- the highest cross-file-conflict change -- because the
+        // advanced materials are only needed on a handful of hero prims.
+        //
+        // mat_override_count.x = number of valid slots in mat_overrides
+        //                        (0..kMaxMatOverrides). .yzw pad.
+        // One uvec4 = 16 B.
+        std::uint32_t mat_override_count[4];
+        // Each override is 3 float4s (48 B):
+        //   a.x = prim_id (uint via memcpy; matched against the hit's
+        //         user-facing prim id), a.y = ext_flags bitmask (uint via
+        //         memcpy), a.z = aniso_amount [-1,1], a.w = aniso_rotation
+        //         (radians).
+        //   b.x = clearcoat_weight, b.y = clearcoat_roughness,
+        //         b.z = subsurface_radius (m), b.w reserved.
+        //   c.xyz = subsurface_color (single-scatter albedo), c.w reserved.
+        // kMaxMatOverrides * 3 float4 = 8 * 48 = 384 B.
+        float mat_overrides[Engine::kMaxMatOverrides * 12];
+        // --- end Wave 9 advanced materials -------------------------------
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -8637,6 +8662,49 @@ void Engine::RenderFrame() {
     push.mesh_tex_indices[2] = (mesh_uv_buf_id_ != 0) ? mesh_roughness_tex_ : 0xFFFFFFFFu;
     push.mesh_tex_indices[3] = (mesh_uv_buf_id_ != 0) ? mesh_metallic_tex_  : 0xFFFFFFFFu;
     // --- end Wave 8 PBR ----------------------------------------------------
+    // --- Wave 9 advanced materials -----------------------------------------
+    // Pack every primitive whose mat_ext_flags != 0 into the fixed-size
+    // PtPush::mat_overrides array, keyed by user prim id. Default zero
+    // count -> the shader skips the per-hit override lookup entirely, so a
+    // scene with no advanced materials renders bit-for-bit as before. We
+    // cap at kMaxMatOverrides; extra flagged prims silently fall back to
+    // their base material (no override slot found shader-side).
+    {
+        std::memset(push.mat_overrides, 0, sizeof(push.mat_overrides));
+        push.mat_override_count[0] = 0u;
+        push.mat_override_count[1] = 0u;
+        push.mat_override_count[2] = 0u;
+        push.mat_override_count[3] = 0u;
+        auto u2f = [](std::uint32_t u) {
+            float f;
+            std::memcpy(&f, &u, sizeof(float));
+            return f;
+        };
+        std::uint32_t slot = 0;
+        for (const auto& [id, p] : primitives_) {
+            if (p.mat_ext_flags == 0u) continue;
+            if (slot >= Engine::kMaxMatOverrides) break;
+            float* o = &push.mat_overrides[slot * 12];
+            // a: prim_id / ext_flags / aniso_amount / aniso_rotation
+            o[0]  = u2f(id);
+            o[1]  = u2f(p.mat_ext_flags);
+            o[2]  = p.aniso_amount;
+            o[3]  = p.aniso_rotation;
+            // b: clearcoat_weight / clearcoat_roughness / subsurface_radius
+            o[4]  = p.clearcoat_weight;
+            o[5]  = p.clearcoat_roughness;
+            o[6]  = p.subsurface_radius;
+            o[7]  = 0.0f;
+            // c: subsurface_color (single-scatter albedo) / pad
+            o[8]  = p.subsurface_color[0];
+            o[9]  = p.subsurface_color[1];
+            o[10] = p.subsurface_color[2];
+            o[11] = 0.0f;
+            ++slot;
+        }
+        push.mat_override_count[0] = slot;
+    }
+    // --- end Wave 9 advanced materials -------------------------------------
     // --- Underwater medium tracking (Phase 4, #134) ------------------------
     // Pack:
     //   .x = 1.0 if camera position is inside any MAT_WATER plane's
@@ -8810,12 +8878,18 @@ void Engine::RenderFrame() {
     //                              foam_coverage gain, _reserved, _reserved)
     //   +16 Wave 9 hosek-sky — hosek_params vec4 (turbidity, ground albedo,
     //                              solar zenith, _reserved)
+    //   +16  Wave 9 materials — mat_override_count uvec4 (count, _,_,_)
+    //   +384 Wave 9 materials — mat_overrides[kMaxMatOverrides * 12] floats
+    //                              (8 slots * 3 float4 = anisotropic +
+    //                               clearcoat + subsurface per-prim params)
     static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 32 + 16
                   + 16 /* Wave 8 spectral (#27): spectral_params */
                   + 32 /* Wave 8 ocean (#25): ocean_params0 + ocean_params1 */
                   + 16 /* Wave 8 PBR (#26): mesh_tex_indices */
                   + 16 /* Wave 9 ocean-foam: ocean_foam_params */
-                  + 16 /* Wave 9 hosek-sky: hosek_params (turbidity, ground albedo, solar zenith) */);
+                  + 16 /* Wave 9 hosek-sky: hosek_params (turbidity, ground albedo, solar zenith) */
+                  + 16  /* Wave 9 materials: mat_override_count */
+                  + 384 /* Wave 9 materials: mat_overrides[8 * 12] */);
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
     // cbuffer layout the Slang compiler applies to PathTrace.slang's
@@ -8843,6 +8917,16 @@ void Engine::RenderFrame() {
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     static_assert(offsetof(PtPush, bvh_params) % 16 == 0,
                   "PtPush::bvh_params must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    // Wave 9 advanced materials: mat_override_count (uvec4) + mat_overrides
+    // (float4 array) both append after mesh_tex_indices; mesh_tex_indices is
+    // a uvec4 so the block stays 16-byte aligned, but guard explicitly so a
+    // future re-order can't slip the std140 / MSL layout.
+    static_assert(offsetof(PtPush, mat_override_count) % 16 == 0,
+                  "PtPush::mat_override_count must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    static_assert(offsetof(PtPush, mat_overrides) % 16 == 0,
+                  "PtPush::mat_overrides must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     // --- SDF Phase 1 (#97) -------------------------------------------------
     static_assert(offsetof(PtPush, sdf_params) % 16 == 0,
@@ -16004,6 +16088,160 @@ void Engine::RegisterPrimCommands() {
             broadcast_scene_dirty();
             out.FormatLine("prim_set_ior: id {} -> {:.3f}", id, v);
         });
+
+    // --- Wave 9 advanced materials -----------------------------------------
+    // Anisotropic GGX (brushed metal). Sets the MAT_EXT_ANISOTROPIC flag bit
+    // and the (amount, rotation) params. The base material should be `metal`
+    // so the specular lobe fires; the host packs these into PtPush's
+    // mat_overrides array keyed by prim id (the prim storage-buffer stride
+    // is untouched). amount in [-1,1]: 0 = isotropic, +1 stretches the
+    // highlight along the tangent, -1 along the bitangent. rotation (degrees)
+    // spins the tangent frame about the surface normal so the brushed streak
+    // can point any direction. amount == 0 clears the flag, restoring the
+    // isotropic metal path bit-for-bit.
+    C.RegisterCommand("prim_set_anisotropy",
+        "prim_set_anisotropy <id> <amount[-1..1]> [rotation_deg]: anisotropic "
+        "GGX specular (brushed metal) on a metal prim. amount 0 = isotropic.",
+        [this, find_prim, broadcast_scene_dirty]
+        (auto args, pt::console::Output& out) {
+            if (args.size() < 2 || args.size() > 3) {
+                out.PrintLine("usage: prim_set_anisotropy <id> <amount[-1..1]> [rotation_deg]");
+                return;
+            }
+            std::uint32_t id; AnalyticPrim* p = nullptr;
+            if (!find_prim(args[0], out, id, p)) return;
+            PushSceneSnapshot();
+            float amount = 0.0f, rot_deg = 0.0f;
+            if (!ParseFloat(args[1], amount)) {
+                out.PrintLine("prim_set_anisotropy: amount parse failed");
+                return;
+            }
+            if (args.size() == 3 && !ParseFloat(args[2], rot_deg)) {
+                out.PrintLine("prim_set_anisotropy: rotation parse failed");
+                return;
+            }
+            if (amount < -1.0f) amount = -1.0f;
+            if (amount >  1.0f) amount =  1.0f;
+            p->aniso_amount   = amount;
+            p->aniso_rotation = rot_deg * 0.01745329252f;   // deg -> rad
+            if (amount != 0.0f) {
+                p->mat_ext_flags |= kMatExtAnisotropic;
+            } else {
+                p->mat_ext_flags &= ~kMatExtAnisotropic;
+            }
+            primitives_dirty_ = true;
+            accum_dirty_      = true;
+            broadcast_scene_dirty();
+            out.FormatLine("prim_set_anisotropy: id {} -> amount {:.3f} rot {:.1f} deg",
+                           id, amount, rot_deg);
+        });
+
+    // Clearcoat (car paint / lacquer). Sets the MAT_EXT_CLEARCOAT flag bit
+    // plus the (weight, roughness) params. weight in [0,1] is the strength
+    // of the clear-lacquer gloss lobe layered over the base material;
+    // roughness in [0,1] is the coat microfacet roughness (0 = mirror
+    // gloss, automotive lacquer is ~0.03..0.1). The coat IOR is fixed at
+    // 1.5 (lacquer). Composes with ANY base material -- a metal-flake car
+    // paint is a metallic base + clearcoat, a glossy plastic is a coloured
+    // Lambert base + clearcoat. weight == 0 clears the flag.
+    C.RegisterCommand("prim_set_clearcoat",
+        "prim_set_clearcoat <id> <weight[0..1]> [roughness[0..1]]: clearcoat "
+        "(car paint) gloss lobe over the base material. weight 0 = off.",
+        [this, find_prim, broadcast_scene_dirty]
+        (auto args, pt::console::Output& out) {
+            if (args.size() < 2 || args.size() > 3) {
+                out.PrintLine("usage: prim_set_clearcoat <id> <weight[0..1]> [roughness[0..1]]");
+                return;
+            }
+            std::uint32_t id; AnalyticPrim* p = nullptr;
+            if (!find_prim(args[0], out, id, p)) return;
+            PushSceneSnapshot();
+            float weight = 0.0f, rough = 0.03f;
+            if (!ParseFloat(args[1], weight)) {
+                out.PrintLine("prim_set_clearcoat: weight parse failed");
+                return;
+            }
+            if (args.size() == 3 && !ParseFloat(args[2], rough)) {
+                out.PrintLine("prim_set_clearcoat: roughness parse failed");
+                return;
+            }
+            if (weight < 0.0f) weight = 0.0f;
+            if (weight > 1.0f) weight = 1.0f;
+            if (rough  < 0.0f) rough  = 0.0f;
+            if (rough  > 1.0f) rough  = 1.0f;
+            p->clearcoat_weight    = weight;
+            p->clearcoat_roughness = rough;
+            if (weight > 0.0f) {
+                p->mat_ext_flags |= kMatExtClearcoat;
+            } else {
+                p->mat_ext_flags &= ~kMatExtClearcoat;
+            }
+            primitives_dirty_ = true;
+            accum_dirty_      = true;
+            broadcast_scene_dirty();
+            out.FormatLine("prim_set_clearcoat: id {} -> weight {:.3f} rough {:.3f}",
+                           id, weight, rough);
+        });
+
+    // Subsurface scattering (skin / wax / marble). Sets the
+    // MAT_EXT_SUBSURFACE flag bit plus the (radius, color) params. radius is
+    // the scattering mean free path in METRES (skin ~0.001..0.003, wax
+    // ~0.005..0.02, marble ~0.003..0.01) -- matching the engine's 1-unit-
+    // per-metre convention. color is the per-channel single-scatter albedo
+    // (the RGB tint of the diffused light; reds survive deeper than blues
+    // for skin / wax). The base material is shaded by the random walk, not
+    // its BSDF -- a lambert base is the natural choice. radius <= 0 clears
+    // the flag.
+    C.RegisterCommand("prim_set_subsurface",
+        "prim_set_subsurface <id> <radius_m> [r g b]: subsurface scattering "
+        "(skin/wax/marble). radius = mean free path in metres. radius 0 = off.",
+        [this, find_prim, broadcast_scene_dirty]
+        (auto args, pt::console::Output& out) {
+            if (args.size() != 2 && args.size() != 5) {
+                out.PrintLine("usage: prim_set_subsurface <id> <radius_m> [r g b]");
+                return;
+            }
+            std::uint32_t id; AnalyticPrim* p = nullptr;
+            if (!find_prim(args[0], out, id, p)) return;
+            PushSceneSnapshot();
+            float radius = 0.0f;
+            if (!ParseFloat(args[1], radius)) {
+                out.PrintLine("prim_set_subsurface: radius parse failed");
+                return;
+            }
+            float cr = p->subsurface_color[0];
+            float cg = p->subsurface_color[1];
+            float cb = p->subsurface_color[2];
+            if (args.size() == 5) {
+                if (!ParseFloat(args[2], cr) || !ParseFloat(args[3], cg) ||
+                    !ParseFloat(args[4], cb)) {
+                    out.PrintLine("prim_set_subsurface: color parse failed");
+                    return;
+                }
+            }
+            // Clamp the single-scatter albedo to [0,1] (an albedo > 1 would
+            // gain energy per scatter and diverge). radius is a positive
+            // length; a tiny floor keeps sigma_s finite shader-side.
+            cr = std::clamp(cr, 0.0f, 1.0f);
+            cg = std::clamp(cg, 0.0f, 1.0f);
+            cb = std::clamp(cb, 0.0f, 1.0f);
+            if (radius < 0.0f) radius = 0.0f;
+            p->subsurface_radius   = radius;
+            p->subsurface_color[0] = cr;
+            p->subsurface_color[1] = cg;
+            p->subsurface_color[2] = cb;
+            if (radius > 0.0f) {
+                p->mat_ext_flags |= kMatExtSubsurface;
+            } else {
+                p->mat_ext_flags &= ~kMatExtSubsurface;
+            }
+            primitives_dirty_ = true;
+            accum_dirty_      = true;
+            broadcast_scene_dirty();
+            out.FormatLine("prim_set_subsurface: id {} -> mfp {:.4f} m color ({:.2f} {:.2f} {:.2f})",
+                           id, radius, cr, cg, cb);
+        });
+    // --- end Wave 9 advanced materials -------------------------------------
 
     // --- Wave 8 PBR (#26) -- per-prim texture assignment -------------------
     // Shared body for the four prim_set_*_tex commands: parse <id> <path>,

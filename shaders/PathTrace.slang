@@ -1126,6 +1126,24 @@ cbuffer Push {
     //   .w reserved.
     float4 hosek_params;
     // --- end Wave 9 hosek-sky ---
+    // --- Wave 9 advanced materials --------------------------------------------
+    // Per-prim BSDF lobe extensions, keyed by user prim id. See Engine.cpp's
+    // PtPush::mat_override_count / mat_overrides for the host layout + the
+    // rationale for routing these through the push constant instead of the
+    // analytic-prim storage buffer (keeps kFloatsPerPrim at 28 / 7 float4s).
+    //   mat_override_count.x = number of valid slots (0..kMaxMatOverrides).
+    //                          0 -> the per-hit lookup is skipped entirely
+    //                          so non-extended materials are bit-for-bit.
+    uint4 mat_override_count;
+    // kMaxMatOverrides slots, 3 float4 each. Flattened to a float4 array so
+    // the std140 / MSL layout matches the host's float[96] exactly.
+    //   [s*3 + 0] a: asfloat(prim_id), asfloat(ext_flags), aniso_amount,
+    //                aniso_rotation
+    //   [s*3 + 1] b: clearcoat_weight, clearcoat_roughness,
+    //                subsurface_radius, _pad
+    //   [s*3 + 2] c: subsurface_color.rgb, _pad
+    float4 mat_overrides[8 * 3];
+    // --- end Wave 9 advanced materials ----------------------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -1253,6 +1271,12 @@ cbuffer Frame {
     // See `hosek_params` in the Metal Push cbuffer above.
     float4 hosek_params;
     // --- end Wave 9 hosek-sky ---
+    // --- Wave 9 advanced materials --------------------------------------------
+    // See `mat_override_count` / `mat_overrides` in the Metal Push cbuffer
+    // above. Layout-equivalent across both targets.
+    uint4 mat_override_count;
+    float4 mat_overrides[8 * 3];
+    // --- end Wave 9 advanced materials ----------------------------------------
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -1301,6 +1325,17 @@ static const uint MAT_DIELECTRIC = 2u;
 // by water_params0 / water_params1 push fields.  Behaves like a
 // dielectric for visibility/transmittance but with its own BRDF.
 static const uint MAT_WATER      = 3u;
+
+// --- Wave 9 advanced materials --------------------------------------------
+// Optional BSDF lobe extension flags (bitmask). Mirrors Engine.h's
+// kMatExt* constants. A hit's extension flags come from the push-constant
+// mat_overrides array (keyed by prim id), NOT the prim storage buffer, so
+// the analytic-prim stride stays 7 float4s. Default 0 = no extension =
+// existing material render, bit-for-bit.
+static const uint MAT_EXT_ANISOTROPIC = 1u << 0;   // anisotropic GGX (brushed metal)
+static const uint MAT_EXT_CLEARCOAT   = 1u << 1;   // Disney clearcoat lobe (car paint)
+static const uint MAT_EXT_SUBSURFACE  = 1u << 2;   // random-walk SSS (skin/wax/marble)
+// --- end Wave 9 advanced materials ----------------------------------------
 
 static const uint PRIM_SPHERE = 0u;
 static const uint PRIM_PLANE  = 1u;
@@ -1476,7 +1511,373 @@ struct HitInfo {
     // the sample entirely and render bit-identically to the flat path.
     uint4 tex_tiles;
     // --- end Wave 8 PBR -------------------------------------------------
+    // --- Wave 9 advanced materials --------------------------------------
+    // BSDF lobe extension flags + params for this hit, resolved from the
+    // push-constant mat_overrides array by prim id (see resolveMatExt).
+    // mat_ext == 0 (the default for every prim without an override slot)
+    // means no extension lobe -- the material renders exactly as before.
+    uint   mat_ext;          // MAT_EXT_* bitmask
+    float  aniso_amount;     // [-1,1] anisotropy (0 = isotropic)
+    float  aniso_rotation;   // tangent-frame rotation about the normal (rad)
+    float  clearcoat_weight; // [0,1] clearcoat lobe strength
+    float  clearcoat_rough;  // [0,1] clearcoat microfacet roughness
+    float  subsurface_radius;// scattering mean free path (m)
+    float3 subsurface_color; // per-channel single-scatter albedo
+    // --- end Wave 9 advanced materials ----------------------------------
 };
+
+// Forward declaration: the subsurface random walk (below) re-traces the
+// scene to find the medium boundary, but traceScene is defined further
+// down. Declare it here so the SSS helper links.
+HitInfo traceScene(float3 ro, float3 rd, float shutter_t01);
+
+// --- Wave 9 advanced materials: per-hit extension lookup ------------------
+// Resolve the BSDF lobe extension for a hit by scanning the push-constant
+// mat_overrides array for a slot whose prim id matches h.prim_id. Called
+// once per hit (after applyPbrTextures, before the BSDF dispatch). When
+// mat_override_count.x == 0 -- the case for every scene with no advanced
+// material -- the loop body never runs, so this is a single compare and
+// the existing materials stay bit-for-bit. The match is by USER prim id
+// (stable across the host's BVH reorder), so it works regardless of where
+// the prim landed in the storage buffer.
+void resolveMatExt(inout HitInfo h) {
+    uint n = min(mat_override_count.x, 8u);
+    if (n == 0u || h.prim_id == 0u) return;
+    [loop]
+    for (uint s = 0u; s < n; ++s) {
+        float4 a = mat_overrides[s * 3u + 0u];
+        if (asuint(a.x) != h.prim_id) continue;
+        float4 b = mat_overrides[s * 3u + 1u];
+        float4 c = mat_overrides[s * 3u + 2u];
+        h.mat_ext           = asuint(a.y);
+        h.aniso_amount      = a.z;
+        h.aniso_rotation    = a.w;
+        h.clearcoat_weight  = b.x;
+        h.clearcoat_rough   = b.y;
+        h.subsurface_radius = b.z;
+        h.subsurface_color  = c.xyz;
+        return;
+    }
+}
+
+// --- Wave 9 anisotropic GGX (brushed metal) -------------------------------
+// Heitz 2014 "Understanding the Masking-Shadowing Function in Microfacet-
+// Based BRDFs" anisotropic GGX. The microfacet normal distribution and the
+// Smith height-correlated masking-shadowing term both take separate
+// roughnesses (alpha_x, alpha_y) along the tangent / bitangent. We sample
+// the visible-normal distribution (VNDF, Heitz 2018 JCGT) so the importance
+// sample matches the masking term -- this keeps the estimator low-variance
+// at grazing angles and energy-conserving.
+//
+// Build an orthonormal tangent frame (t, bt, n) from the shading normal and
+// a rotation about it. The reference tangent is the Duff et al. 2017
+// branchless basis (same one applyNormalMap uses); aniso_rotation then spins
+// (t, bt) about n so the brushed streak can point any direction. For UV-
+// derived tangents on textured meshes a future change can pass a real
+// tangent here; the arbitrary-but-stable frame is correct for analytic
+// prims (the highlight is rotation-symmetric about n until anisotropy bends
+// it, and aniso_rotation gives explicit control).
+void anisoTangentFrame(float3 n, float rot, out float3 t, out float3 bt) {
+    float s = (n.z >= 0.0) ? 1.0 : -1.0;
+    float a = -1.0 / (s + n.z);
+    float bb = n.x * n.y * a;
+    float3 t0 = float3(1.0 + s * n.x * n.x * a, s * bb, -s * n.x);
+    float3 bt0 = float3(bb, s + n.y * n.y * a, -n.y);
+    float cr = cos(rot);
+    float sr = sin(rot);
+    t  = normalize(cr * t0 + sr * bt0);
+    bt = normalize(cross(n, t));
+}
+
+// Map an isotropic roughness + anisotropy in [-1,1] to (alpha_x, alpha_y).
+// aspect = sqrt(1 - 0.9 * |aniso|) follows the Disney convention (the 0.9
+// cap keeps alpha non-zero so the highlight never collapses to a delta).
+// Positive aniso stretches along the tangent (alpha_x large), negative along
+// the bitangent. Roughness is squared to alpha (perceptual-linear remap,
+// matching the isotropic GGX convention used elsewhere).
+void anisoAlpha(float roughness, float aniso, out float ax, out float ay) {
+    float r = clamp(roughness, 0.02, 1.0);
+    float alpha = r * r;
+    float a = clamp(aniso, -1.0, 1.0);
+    float aspect = sqrt(1.0 - 0.9 * abs(a));
+    float ax_ = alpha / aspect;
+    float ay_ = alpha * aspect;
+    if (a < 0.0) { float tmp = ax_; ax_ = ay_; ay_ = tmp; }
+    ax = clamp(ax_, 0.001, 1.0);
+    ay = clamp(ay_, 0.001, 1.0);
+}
+
+// Sample the GGX VNDF for a view direction expressed in the local tangent
+// frame (Heitz 2018, "Sampling the GGX Distribution of Visible Normals").
+// `ve` is the (positive-hemisphere) view direction in local space where
+// z = normal. Returns the sampled micro-normal in local space.
+float3 sampleGgxVndfLocal(float3 ve, float ax, float ay, float u1, float u2) {
+    // Section 3.2: stretch the view to the hemisphere config.
+    float3 vh = normalize(float3(ax * ve.x, ay * ve.y, ve.z));
+    float lensq = vh.x * vh.x + vh.y * vh.y;
+    float3 t1 = lensq > 0.0 ? float3(-vh.y, vh.x, 0.0) * rsqrt(lensq)
+                            : float3(1.0, 0.0, 0.0);
+    float3 t2 = cross(vh, t1);
+    float r = sqrt(u1);
+    float phi = 6.28318530717958 * u2;
+    float p1 = r * cos(phi);
+    float p2 = r * sin(phi);
+    float sc = 0.5 * (1.0 + vh.z);
+    p2 = (1.0 - sc) * sqrt(max(0.0, 1.0 - p1 * p1)) + sc * p2;
+    float3 nh = p1 * t1 + p2 * t2 +
+                sqrt(max(0.0, 1.0 - p1 * p1 - p2 * p2)) * vh;
+    // Unstretch back to the ellipsoid config.
+    return normalize(float3(ax * nh.x, ay * nh.y, max(0.0, nh.z)));
+}
+
+// Smith height-correlated masking-shadowing G2 for anisotropic GGX, plus
+// the Lambda terms (Heitz 2014 eq. 72/99). l, v are local-space (z=normal).
+float ggxLambdaAniso(float3 w, float ax, float ay) {
+    // w is normalized; guard the degenerate w.z ~ 1 case.
+    float az2 = w.z * w.z;
+    if (az2 >= 0.9999) return 0.0;
+    float t2 = (ax * ax * w.x * w.x + ay * ay * w.y * w.y) / max(az2, 1e-8);
+    return 0.5 * (-1.0 + sqrt(1.0 + t2));
+}
+float ggxG2Aniso(float3 l, float3 v, float ax, float ay) {
+    return 1.0 / (1.0 + ggxLambdaAniso(l, ax, ay) + ggxLambdaAniso(v, ax, ay));
+}
+
+// Importance-sample the anisotropic GGX specular lobe and return the
+// outgoing (reflected) direction in WORLD space plus the BRDF weight to
+// multiply into throughput. The VNDF sample makes the weight collapse to
+// the masking ratio G2(l,v)/G1(v) -- the standard low-variance microfacet
+// estimator -- with the Fresnel folded in by the caller (metal uses the
+// albedo as F0). `wo` is the direction FROM the surface toward the viewer
+// (i.e. -rd). On a back-facing or degenerate sample, returns weight 0 so
+// the caller can terminate the path.
+struct AnisoSample {
+    float3 dir;     // world-space reflected direction (toward next bounce)
+    float3 weight;  // multiply into throughput (includes F0 + masking)
+    bool   valid;
+};
+AnisoSample sampleAnisoGgx(float3 n, float3 wo, float3 f0,
+                           float roughness, float aniso, float rot,
+                           inout uint seed) {
+    AnisoSample r;
+    r.dir = reflect(-wo, n);
+    r.weight = float3(0.0);
+    r.valid = false;
+    float ax, ay;
+    anisoAlpha(roughness, aniso, ax, ay);
+    float3 t, bt;
+    anisoTangentFrame(n, rot, t, bt);
+    // World -> local (z = n). wo into local space.
+    float3 vl = float3(dot(wo, t), dot(wo, bt), dot(wo, n));
+    if (vl.z <= 0.0) return r;
+    float u1 = randf(seed);
+    float u2 = randf(seed);
+    float3 hl = sampleGgxVndfLocal(vl, ax, ay, u1, u2);
+    // Reflect the local view about the sampled micro-normal.
+    float3 ll = reflect(-vl, hl);
+    if (ll.z <= 0.0) return r;
+    // VNDF estimator weight: F * G2(l,v) / G1(v). With G1(v) =
+    // 1/(1+Lambda(v)), the ratio is (1+Lambda(v)) * G2.
+    float g2 = ggxG2Aniso(ll, vl, ax, ay);
+    float lam_v = ggxLambdaAniso(vl, ax, ay);
+    float g1v_inv = 1.0 + lam_v;     // 1 / G1(v)
+    // Fresnel at the micro-facet (Schlick, per-channel F0). cos = dot(v, h).
+    float voh = clamp(dot(vl, hl), 0.0, 1.0);
+    float fc = pow(1.0 - voh, 5.0);
+    float3 F = f0 + (float3(1.0) - f0) * fc;
+    r.weight = F * g2 * g1v_inv;
+    // Local -> world.
+    r.dir = normalize(ll.x * t + ll.y * bt + ll.z * n);
+    r.valid = true;
+    return r;
+}
+// --- end Wave 9 anisotropic GGX -------------------------------------------
+
+// --- Wave 9 clearcoat (car paint / lacquer) -------------------------------
+// A second specular lobe layered on top of the base BSDF: a thin dielectric
+// coat (IOR 1.5, F0 = ((1.5-1)/(1.5+1))^2 = 0.04) with its own roughness.
+// Standard layered model evaluated stochastically -- at a hit we reflect off
+// the coat with probability p = clearcoat_weight * Fresnel(coat), otherwise
+// the ray transmits through the coat and the base material shades it. This
+// keeps the estimator unbiased and energy-conserving (the coat lobe's
+// throughput weight is F/p == 1/clearcoat_weight when chosen, the base
+// material's bounce just continues) and composes with ANY base BSDF
+// (lambert / metal / dielectric). The coat is a clear lacquer so it
+// reflects the environment independently of the base colour -- the gloss
+// flake-over-pigment look of automotive paint.
+//
+// kClearcoatF0 is the air->lacquer Schlick base reflectance. The coat
+// reflection uses an isotropic GGX VNDF sample (reuse the anisotropic
+// machinery with ax == ay) so the gloss highlight is sharp at low coat
+// roughness and broadens smoothly as roughness rises.
+static const float kClearcoatF0  = 0.04;
+static const float kClearcoatIOR = 1.5;
+
+// Schlick Fresnel reflectance of the clearcoat at the given view cosine.
+float clearcoatFresnel(float cos_v) {
+    float fc = pow(1.0 - clamp(cos_v, 0.0, 1.0), 5.0);
+    return kClearcoatF0 + (1.0 - kClearcoatF0) * fc;
+}
+
+// Sample the clearcoat reflection lobe. Returns the world-space reflected
+// direction + the BRDF weight (G2/G1 masking ratio; Fresnel + the 1/p
+// selection weight are folded in by the caller). wo points toward the
+// viewer (-rd). valid == false on a below-horizon sample.
+struct CoatSample {
+    float3 dir;
+    float3 weight;   // masking ratio (scalar, broadcast)
+    bool   valid;
+};
+CoatSample sampleClearcoat(float3 n, float3 wo, float roughness,
+                           inout uint seed) {
+    CoatSample r;
+    r.dir = reflect(-wo, n);
+    r.weight = float3(0.0);
+    r.valid = false;
+    float a;
+    {
+        float ax, ay;
+        anisoAlpha(roughness, 0.0, ax, ay);   // isotropic: ax == ay
+        a = ax;
+    }
+    // Local frame (z = n) via the Duff ONB (rotation 0).
+    float3 t, bt;
+    anisoTangentFrame(n, 0.0, t, bt);
+    float3 vl = float3(dot(wo, t), dot(wo, bt), dot(wo, n));
+    if (vl.z <= 0.0) return r;
+    float u1 = randf(seed);
+    float u2 = randf(seed);
+    float3 hl = sampleGgxVndfLocal(vl, a, a, u1, u2);
+    float3 ll = reflect(-vl, hl);
+    if (ll.z <= 0.0) return r;
+    float g2 = ggxG2Aniso(ll, vl, a, a);
+    float g1v_inv = 1.0 + ggxLambdaAniso(vl, a, a);
+    r.weight = float3(g2 * g1v_inv);
+    r.dir = normalize(ll.x * t + ll.y * bt + ll.z * n);
+    r.valid = true;
+    return r;
+}
+// --- end Wave 9 clearcoat -------------------------------------------------
+
+// --- Wave 9 subsurface scattering (skin / wax / marble) -------------------
+// Bounded random-walk SSS: the physically-grounded choice for a path
+// tracer. A ray entering a translucent material refracts (matched-IOR here,
+// so it transmits straight in), then takes free-flight steps through the
+// medium -- each step length is exponentially distributed by the scattering
+// coefficient sigma_s = 1 / mean-free-path -- bouncing off a Henyey-
+// Greenstein phase function at each scatter event and losing energy to the
+// per-channel single-scatter albedo (subsurface_color: reds survive deeper
+// than blues, the hallmark of skin / wax). When a free flight would carry
+// the ray past the medium boundary the ray EXITS there and resumes the
+// normal bounce loop in air. The walk is capped at kSssMaxSteps so deep
+// absorption terminates cleanly instead of looping forever.
+//
+// Mean free path is in metres (skin ~1-3 mm, wax ~5-20 mm, marble ~3-10
+// mm), matching the engine's 1-unit-per-metre convention. The boundary is
+// found by re-tracing the scene from inside the medium -- for a convex prim
+// (sphere) intersectSphere returns the far-wall exit distance, so a single
+// isolated SSS body diffuses correctly.
+static const uint kSssMaxSteps = 24u;
+
+// Sample a scattered direction from the Henyey-Greenstein phase function
+// about the incoming direction `wi` (the direction of travel). g in
+// (-1, 1): 0 = isotropic, >0 forward-scattering (skin / wax are mildly
+// forward, g ~ 0.2..0.8), <0 back-scattering. Standard inverse-CDF form.
+float3 sampleHenyeyGreenstein(float3 wi, float g, inout uint seed) {
+    float u1 = randf(seed);
+    float u2 = randf(seed);
+    float cos_t;
+    if (abs(g) < 1e-3) {
+        cos_t = 1.0 - 2.0 * u1;        // isotropic
+    } else {
+        float sq = (1.0 - g * g) / (1.0 - g + 2.0 * g * u1);
+        cos_t = (1.0 + g * g - sq * sq) / (2.0 * g);
+    }
+    cos_t = clamp(cos_t, -1.0, 1.0);
+    float sin_t = sqrt(max(0.0, 1.0 - cos_t * cos_t));
+    float phi = 6.28318530717958 * u2;
+    // Build an orthonormal basis around wi and rotate.
+    float3 w = normalize(wi);
+    float3 ax = abs(w.x) > 0.9 ? float3(0, 1, 0) : float3(1, 0, 0);
+    float3 t = normalize(cross(w, ax));
+    float3 b = cross(w, t);
+    return normalize(sin_t * cos(phi) * t + sin_t * sin(phi) * b + cos_t * w);
+}
+
+// Result of the random walk: the exit ray origin / direction (in air,
+// ready for the normal bounce loop) plus the throughput tint accumulated
+// from the per-scatter single-scatter albedo. `escaped` is true when the
+// ray exited the medium (continue the bounce loop); false when the walk hit
+// the step cap deep inside (the path is absorbed -- terminate).
+struct SssWalk {
+    float3 ro;
+    float3 rd;
+    float3 tint;     // multiply into throughput
+    bool   escaped;
+};
+SssWalk subsurfaceRandomWalk(float3 entry_pt, float3 in_dir, float3 normal,
+                             float mfp, float3 albedo, float shutter_t01,
+                             inout uint seed) {
+    SssWalk w;
+    w.tint = float3(1.0);
+    w.escaped = false;
+    // Step just inside the surface along the incoming direction (matched-
+    // IOR transmission -- the translucent diffusion look doesn't need the
+    // refractive bend, and skipping it avoids TIR trapping the walk).
+    float3 nf = (dot(normal, in_dir) < 0.0) ? normal : -normal;
+    float3 ro = entry_pt - nf * 1e-3;
+    float3 rd = in_dir;
+    // Scattering coefficient (1/m). Guard a tiny mfp so sigma stays finite.
+    float sigma_s = 1.0 / max(mfp, 1e-4);
+    // Mildly forward-scattering phase (skin / wax). 0.3 is a reasonable
+    // tissue-like default; the look is dominated by mfp + albedo anyway.
+    const float g_sss = 0.3;
+    w.ro = ro;
+    w.rd = rd;
+    [loop]
+    for (uint i = 0u; i < kSssMaxSteps; ++i) {
+        // Free-flight distance to the next scatter event.
+        float u = randf(seed);
+        float d = -log(max(1e-6, 1.0 - u)) / sigma_s;
+        // Distance to the medium boundary along rd (re-trace the scene;
+        // from inside a convex prim this is the far-wall exit).
+        HitInfo bh = traceScene(ro, rd, shutter_t01);
+        float t_exit = bh.hit ? bh.t : 1e30;
+        if (d < t_exit) {
+            // Scatter event inside the medium. Lose energy to the single-
+            // scatter albedo, then pick a new HG direction and continue.
+            ro = ro + rd * d;
+            w.tint *= albedo;
+            rd = sampleHenyeyGreenstein(rd, g_sss, seed);
+            // Russian-roulette the walk once the tint dims so deep, dark
+            // media don't burn the full step budget every path.
+            float pr = max(w.tint.r, max(w.tint.g, w.tint.b));
+            if (i >= 3u) {
+                pr = clamp(pr, 0.02, 1.0);
+                if (randf(seed) > pr) { w.escaped = false; return w; }
+                w.tint /= pr;
+            }
+        } else {
+            // Reached the boundary -- exit into air just past the surface
+            // and hand control back to the bounce loop. The exit direction
+            // is the (HG-randomized) walk direction, which is what gives
+            // the soft, depth-tinted translucency.
+            float3 exit_pt = ro + rd * t_exit;
+            float3 exit_n = bh.hit ? bh.normal : nf;
+            // Nudge outside along the OUTWARD normal at the exit (the exit
+            // normal points along the wall; pick the side the ray leaves).
+            float3 eo = (dot(exit_n, rd) > 0.0) ? exit_n : -exit_n;
+            w.ro = exit_pt + eo * 1e-3;
+            w.rd = rd;
+            w.escaped = true;
+            return w;
+        }
+    }
+    // Hit the step cap deep inside the medium -- treat as absorbed.
+    w.escaped = false;
+    return w;
+}
+// --- end Wave 9 subsurface scattering -------------------------------------
 
 // Rotate a 3-vector by a unit quaternion (xyzw). Standard
 // q * (0, v) * q^-1 in optimised cross-product form: equals
@@ -1800,6 +2201,18 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01) {
     // render with their flat albedo exactly as before.
     h.uv = float2(0.0, 0.0);
     h.tex_tiles = uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
+    // Wave 9 advanced materials: default to no extension lobe. resolveMatExt
+    // (called once at the hit site, after applyPbrTextures) fills these from
+    // the push-constant mat_overrides array when the hit's prim id matches
+    // an override slot. mat_ext == 0 leaves every advanced lobe inert so the
+    // base material renders bit-for-bit.
+    h.mat_ext           = 0u;
+    h.aniso_amount      = 0.0;
+    h.aniso_rotation    = 0.0;
+    h.clearcoat_weight  = 0.0;
+    h.clearcoat_rough   = 0.03;
+    h.subsurface_radius = 0.005;
+    h.subsurface_color  = float3(0.9, 0.7, 0.6);
 
     // Analytic primitives. Each occupies 7 consecutive float4s in
     // `primitives` after #85 (motion blur), #181 polish (emission),
@@ -5437,6 +5850,13 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // applyPbrTextures gates each sample on tile != kPbrNoTexTile.
         applyPbrTextures(h);
 
+        // Wave 9 advanced materials (#wave9): resolve any per-prim BSDF
+        // lobe extension (anisotropic / clearcoat / subsurface) from the
+        // push-constant override array by prim id. No-op + bit-identical
+        // when the scene has no advanced materials (mat_override_count.x ==
+        // 0 short-circuits inside resolveMatExt).
+        resolveMatExt(h);
+
         float  ndi = dot(h.normal, rd);
         float3 nf  = (ndi < 0.0) ? h.normal : -h.normal;
 
@@ -5481,6 +5901,86 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 radiance += throughput * float3(8.0, 0.0, 8.0) * rim;
             }
         }
+
+        // --- Wave 9 clearcoat (car paint) lobe (#wave9) -------------------
+        // Stochastic layered model: a hit carrying MAT_EXT_CLEARCOAT first
+        // tests the clear lacquer coat. With probability p = weight *
+        // Fresnel(coat) the ray reflects off the coat (an independent GGX
+        // gloss lobe, IOR 1.5) and this bounce is done; otherwise it
+        // transmits through the coat and falls through to the base material
+        // dispatch below, attenuated by (1 - p) folded into the selection
+        // (the base path keeps full throughput because the complementary
+        // 1/(1-p) weight cancels the (1-p) transmission -- standard
+        // one-sample MIS-free lobe selection). Bit-identical when the flag
+        // is clear (h.mat_ext defaults 0, so this whole block is skipped).
+        if ((h.mat_ext & MAT_EXT_CLEARCOAT) != 0u && h.clearcoat_weight > 0.0) {
+            float cos_v = clamp(dot(nf, -rd), 0.0, 1.0);
+            float fc = clearcoatFresnel(cos_v);
+            float p_coat = clamp(h.clearcoat_weight * fc, 0.0, 0.99);
+            if (randf(seed) < p_coat) {
+                // Reflect off the coat. The VNDF weight is the masking
+                // ratio; the Fresnel + 1/p selection weight is folded here
+                // so the coat lobe is energy-conserving. (F/p == 1 since
+                // p == weight*F and we divide by weight; the residual
+                // weight factor keeps multi-coat compositions correct.)
+                CoatSample cs = sampleClearcoat(nf, -rd, h.clearcoat_rough, seed);
+                if (!cs.valid) { break; }
+                // throughput *= F * G2/G1 / p_coat. F == fc (scalar,
+                // achromatic lacquer), p_coat == weight*fc, so F/p_coat ==
+                // 1/weight; the masking ratio cs.weight remains.
+                throughput *= cs.weight * (fc / p_coat);
+                ro = hit_pt + nf * 1e-3;
+                rd = cs.dir;
+                skip_sky_on_miss = false;
+                prev_was_lambert_nee = false;
+                // Russian roulette (mirror the per-material tail below so a
+                // continue here doesn't skip path termination).
+                if (b >= 2u) {
+                    float pr = max(throughput.r, max(throughput.g, throughput.b));
+                    pr = clamp(pr, 0.05, 1.0);
+                    if (randf(seed) > pr) break;
+                    throughput /= pr;
+                }
+                continue;
+            }
+            // Coat transmission: divide by the complementary probability so
+            // the base material below carries unbiased energy. (1 - p_coat)
+            // > 0 always holds because p_coat is clamped to <= 0.99.
+            throughput /= (1.0 - p_coat);
+        }
+        // --- end Wave 9 clearcoat lobe ------------------------------------
+
+        // --- Wave 9 subsurface scattering (#wave9) ------------------------
+        // A hit carrying MAT_EXT_SUBSURFACE runs a bounded random walk
+        // through the medium INSTEAD of the base BSDF dispatch: the ray
+        // transmits into the surface, scatters off an HG phase function with
+        // per-channel single-scatter albedo until it either exits the body
+        // (resume the bounce loop in air) or is absorbed deep inside
+        // (terminate). This gives the soft, depth-tinted translucency of
+        // skin / wax / marble. Bit-identical when the flag is clear (the
+        // block is skipped and the base material shades as before).
+        if ((h.mat_ext & MAT_EXT_SUBSURFACE) != 0u) {
+            SssWalk sw = subsurfaceRandomWalk(hit_pt, rd, h.normal,
+                                              h.subsurface_radius,
+                                              h.subsurface_color,
+                                              shutter_t01, seed);
+            throughput *= sw.tint;
+            if (!sw.escaped) { break; }   // absorbed deep in the medium
+            ro = sw.ro;
+            rd = sw.rd;
+            skip_sky_on_miss = false;
+            prev_was_lambert_nee = false;
+            // Russian roulette (mirror the per-material tail so a continue
+            // here doesn't skip path termination).
+            if (b >= 2u) {
+                float pr = max(throughput.r, max(throughput.g, throughput.b));
+                pr = clamp(pr, 0.05, 1.0);
+                if (randf(seed) > pr) break;
+                throughput /= pr;
+            }
+            continue;
+        }
+        // --- end Wave 9 subsurface scattering -----------------------------
 
         if (h.mat == MAT_LAMBERT) {
             // --- Analytic light primitives NEE (#73 / ReSTIR #78) -------
@@ -5823,11 +6323,28 @@ void main(uint2 tid : SV_DispatchThreadID) {
             }
         }
         else if (h.mat == MAT_METAL) {
-            float3 r = reflect(rd, nf);
-            r = normalize(r + h.roughness * (sampleCosineHemisphere(nf, seed) - nf));
-            throughput *= h.albedo;
-            ro = hit_pt + nf * 1e-3;
-            rd = r;
+            // Wave 9 (#wave9): anisotropic GGX (brushed metal) when the
+            // prim carries the MAT_EXT_ANISOTROPIC flag. The base metal F0
+            // is the albedo (a metal's specular reflectance IS its colour),
+            // so a VNDF-sampled anisotropic lobe with Fresnel folded in
+            // gives a physically-grounded stretched highlight. The default
+            // (flag clear) keeps the cheap isotropic roughness-perturbed
+            // mirror bit-for-bit, so existing metal goldens are unaffected.
+            if ((h.mat_ext & MAT_EXT_ANISOTROPIC) != 0u) {
+                AnisoSample asmp = sampleAnisoGgx(nf, -rd, h.albedo,
+                                                  h.roughness, h.aniso_amount,
+                                                  h.aniso_rotation, seed);
+                if (!asmp.valid) { break; }   // sampled below the horizon
+                throughput *= asmp.weight;
+                ro = hit_pt + nf * 1e-3;
+                rd = asmp.dir;
+            } else {
+                float3 r = reflect(rd, nf);
+                r = normalize(r + h.roughness * (sampleCosineHemisphere(nf, seed) - nf));
+                throughput *= h.albedo;
+                ro = hit_pt + nf * 1e-3;
+                rd = r;
+            }
             skip_sky_on_miss = false;   // metal didn't NEE; sky on miss is real
             prev_was_lambert_nee = false;   // specular bounce: MIS doesn't apply here
         }
