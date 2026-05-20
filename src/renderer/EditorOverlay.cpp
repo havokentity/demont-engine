@@ -270,6 +270,70 @@ void EditorOverlay::AppendScaleGizmo(const glm::vec3& O, float L, Axis hl)
     draw_arm_with_cube(glm::vec3(0, 0, 1), Axis::Z);
 }
 
+// --- Wave 9 light-gizmo ---
+void EditorOverlay::AppendLightIcon(const glm::vec3& O, float size,
+                                    const glm::vec3& color, bool highlighted)
+{
+    if (size <= 0.0f) return;
+
+    // Highlighted lights read brighter + warmer so the selected one
+    // stands out among many. We blend the tint toward the gizmo's
+    // yellow highlight rather than discarding the chromaticity entirely
+    // so a selected red light still hints red.
+    glm::vec3 c = color;
+    // Guard against an all-zero (black) light: render the marker in a
+    // neutral grey so it's still visible / pickable.
+    if (c.x + c.y + c.z < 1e-4f) c = glm::vec3(0.7f);
+    float thickness = 1.5f;
+    if (highlighted) {
+        const glm::vec3 hl{1.0f, 0.95f, 0.10f};
+        c = glm::mix(c, hl, 0.6f);
+        // Lift overall brightness a touch so the selected glyph pops.
+        c = glm::min(c * 1.4f + glm::vec3(0.15f), glm::vec3(1.0f));
+        thickness = 2.0f;
+    }
+
+    auto emit = [&](const glm::vec3& a, const glm::vec3& b) {
+        Segment s;
+        s.a = a;
+        s.half_thickness = thickness;
+        s.b = b;
+        s.depth_bias = 0.0f;
+        s.color = c;
+        s._pad = 0.0f;
+        segs_.push_back(s);
+    };
+
+    // Sun-burst: short rays from the centre. The 6 cardinal arms make
+    // the "+" read at any view angle; the 8 cube-corner diagonals fill
+    // it out to a star so it never collapses to a single line when the
+    // camera looks straight down an axis. A small inner gap keeps the
+    // centre open (Blender's light empty / Unity's light gizmo vibe).
+    const float inner = size * 0.18f;   // gap radius
+    const float outer = size;           // ray tip radius
+    const float diag  = size * 0.72f;   // diagonal rays a bit shorter
+
+    const glm::vec3 axes[6] = {
+        {+1, 0, 0}, {-1, 0, 0},
+        {0, +1, 0}, {0, -1, 0},
+        {0, 0, +1}, {0, 0, -1},
+    };
+    for (const auto& d : axes) {
+        emit(O + d * inner, O + d * outer);
+    }
+
+    const float s3 = 0.57735027f;   // 1/sqrt(3): unit diagonal component
+    for (int i = 0; i < 8; ++i) {
+        const glm::vec3 d{
+            (i & 1) ? s3 : -s3,
+            (i & 2) ? s3 : -s3,
+            (i & 4) ? s3 : -s3,
+        };
+        emit(O + d * inner, O + d * diag);
+    }
+}
+// --- end Wave 9 light-gizmo ---
+
 // Screen-space distance from the mouse cursor to a polygonal ring in
 // world space. The ring lies in the plane through `O` with normal
 // `n` (unit vector), radius `L`. We sample the ring at `kRingSamples`
