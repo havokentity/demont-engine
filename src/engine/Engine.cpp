@@ -290,10 +290,10 @@ namespace cvar {
             "list. 0 = strict exact-match like before.",
             CVAR_ARCHIVE);
     // Default backend: Metal on Apple Silicon, Vulkan everywhere else
-    // (Windows + Linux use Vulkan + RT extensions; the Metal backend
-    // doesn't compile off Apple).
+    // (Windows + Linux use native Vulkan + RT extensions; the Metal
+    // backend doesn't compile off Apple).
 #if defined(__APPLE__)
-    PT_CVAR(r_backend,         "metal",    "One of none|software|metal|vulkan",CVAR_ARCHIVE);
+    PT_CVAR(r_backend,         "metal",    "One of none|software|metal (vulkan is Windows/Linux only)",CVAR_ARCHIVE);
 #else
     PT_CVAR(r_backend,         "vulkan",   "One of none|software|vulkan",      CVAR_ARCHIVE);
 #endif
@@ -2316,6 +2316,16 @@ bool Engine::Init() {
     // Boot the requested backend so the window renders something on
     // startup (defaults to "software" -- the only one online today).
     if (auto* v = C.FindCVar("r_backend")) {
+        // Shared configs can still contain r_backend=vulkan from a
+        // Windows/Linux run. On macOS the Vulkan backend is intentionally
+        // not built; normalize to Metal before the direct boot path below
+        // would otherwise bypass the console's per-value platform gate.
+#if defined(__APPLE__)
+        if (v->value == "vulkan") {
+            LOG_WARN("r_backend=vulkan is Windows/Linux-only; starting Metal on macOS.");
+            v->value = "metal";
+        }
+#endif
         BackendType t = BackendType::None;
         if      (v->value == "software") t = BackendType::Software;
         else if (v->value == "metal")    t = BackendType::Metal;
@@ -3628,11 +3638,10 @@ void Engine::EnsureMeshUpdated() {
     // exposing hardware ray tracing. The fast path (Metal Ray Tracing,
     // Vulkan VK_KHR_ray_query, Embree on the software backend) builds
     // a BLAS/TLAS in CreateBLAS/CreateTLAS; the slow-fallback path
-    // (e.g. Mac-Vulkan on MoltenVK builds without VK_KHR_ray_query --
-    // anything pre-MoltenVK 1.3) uploads the baked vertex + index
-    // buffer and lets PathTrace.slang linear-scan triangles via the
-    // mesh_tri_count > 0 branch. RebuildMeshResources chooses the
-    // path automatically based on device_->SupportsHardwareRT().
+    // uploads the baked vertex + index buffer and lets PathTrace.slang
+    // linear-scan triangles via the mesh_tri_count > 0 branch.
+    // RebuildMeshResources chooses the path automatically based on
+    // device_->SupportsHardwareRT().
     if (!csg_scene_) return;
 
     // Phase 2: the worker has a result waiting. Pull it onto the main
@@ -3813,14 +3822,12 @@ void Engine::RebuildMeshResources(const pt::csg::BakedMesh& baked) {
     }
 
     // BLAS/TLAS build is conditional on hardware ray tracing. When the
-    // backend can't host an AS (Mac-Vulkan on pre-1.3 MoltenVK is the
-    // motivating case -- it doesn't expose VK_KHR_acceleration_structure),
-    // the engine still uploads the vertex + index buffers above and lets
-    // PathTrace.slang linear-scan triangles via the mesh_tri_count > 0
-    // branch. Performance scales linearly with TriangleCount() on that
-    // path, which is fine for sub-1k-tri scenes like the headline CSG
-    // demos but should not be relied on for production-size meshes --
-    // see the one-shot warning below.
+    // backend can't host an AS, the engine still uploads the vertex +
+    // index buffers above and lets PathTrace.slang linear-scan triangles
+    // via the mesh_tri_count > 0 branch. Performance scales linearly
+    // with TriangleCount() on that path, which is fine for sub-1k-tri
+    // scenes like the headline CSG demos but should not be relied on for
+    // production-size meshes -- see the one-shot warning below.
     if (device_->SupportsHardwareRT()) {
         pt::rhi::BLASDesc blas_desc{
             .vertex_positions = baked.positions.data(),
@@ -3876,10 +3883,10 @@ void Engine::RebuildMeshResources(const pt::csg::BakedMesh& baked) {
         // scan) no longer applies now that the SW path uses a real
         // BVH. The walker's runtime cost scales O(log N), so the
         // 1080p / 6-bounce / 1k-tri case that motivated PR #106 sits
-        // around ~30 FPS instead of ~1 FPS on Mac-Vulkan -- the
-        // empirical knee where SW becomes uncomfortable is closer to
-        // ~100k tris now (mostly bounded by AABB-fetch bandwidth, not
-        // intersect count). We keep the one-shot guard variable
+        // around ~30 FPS instead of ~1 FPS -- the empirical knee where
+        // SW becomes uncomfortable is closer to ~100k tris now (mostly
+        // bounded by AABB-fetch bandwidth, not intersect count). We keep
+        // the one-shot guard variable
         // declared in Engine.h so a future "warn at 100k+ tris on SW
         // backend" check can drop in here without re-plumbing.
         (void)sw_mesh_perf_warning_fired_;
@@ -5877,8 +5884,8 @@ void Engine::RenderFrame() {
     // uninitialised csg_vbuf / csg_ibuf / tri_bvh_nodes / tri_bvh_permuted_ids
     // descriptors. On NVIDIA, dispatching with uninit mesh descriptors
     // page-faults the GPU at the first triangle-traversal read -> TDR ->
-    // DEVICE_LOST. MoltenVK runs the same dispatch fine because Apple's
-    // memory zeroing + lax OOB handling masks the race.
+    // DEVICE_LOST. Some drivers may mask the race with memory zeroing or
+    // lax OOB handling, so keep this guard explicit.
     EnsureMeshUpdated();
     const bool mesh_pending = (bake_phase_.load(std::memory_order_acquire) != 0);
     if (pathtrace_pipeline_id_ == 0 || mesh_pending) {
@@ -6658,10 +6665,7 @@ void Engine::RenderFrame() {
     bool tlas_present = (scene_tlas_id_ != 0) && !voxel_hide_mesh;
     // Software-mesh fallback (mesh_tri_count_ > 0 && !tlas_present):
     // we still bind the vertex + index buffers and let PathTrace.slang
-    // linear-scan triangles. Currently exercised on Mac-Vulkan when the
-    // installed MoltenVK build doesn't expose VK_KHR_acceleration_structure
-    // (pre-1.3); the gold path stays on top of VK_KHR_ray_query when it
-    // is available. See VulkanDevice's RT extension probe log.
+    // linear-scan triangles when hardware RT is unavailable.
     const bool sw_mesh_present = (!tlas_present && mesh_tri_count_ > 0 &&
                                   box_vbuf_id_ != 0 && box_ibuf_id_ != 0 &&
                                   !voxel_hide_mesh);
@@ -7679,10 +7683,9 @@ void Engine::RenderFrame() {
         // mesh branch walks the tri-BVH (engine slots 8/9) when this
         // is non-zero AND .z is non-zero (mesh present, no TLAS). PR
         // #106 follow-up: replaces the previous O(N) Möller-Trumbore
-        // linear scan with O(log N) stack-based BVH traversal -- fixes
-        // the ~1 FPS @1080p perf cliff on Mac-Vulkan (MoltenVK without
-        // VK_KHR_ray_query). If the build failed (allocation failure
-        // -- rare but possible on memory-tight devices), .w stays at
+        // linear scan with O(log N) stack-based BVH traversal. If the
+        // build failed (allocation failure -- rare but possible on
+        // memory-tight devices), .w stays at
         // 0 and the SW mesh branch short-circuits to "no hit", which
         // is a benign failure mode (mesh stays invisible) compared to
         // a per-ray full scan.
@@ -9111,7 +9114,7 @@ void Engine::RenderFrame() {
     // per-frame UBO of kFrameUboSize bytes (src/rhi_vulkan/VulkanDevice.h).
     // If the tail (sizeof(PtPush) - 112) outgrows that UBO the backend's
     // memcpy silently clamps and Vulkan renders corrupt -- exactly the
-    // black-cube MoltenVK regression that waves 8-9 introduced when the tail
+    // native Vulkan black-cube regression that waves 8-9 introduced when the tail
     // crossed 1024 B with nothing failing the build (CI runs software
     // goldens only, so the corruption was invisible). This compile-time
     // guard turns the next overflow into a BUILD error on every backend.
@@ -9125,7 +9128,7 @@ void Engine::RenderFrame() {
                   "kFrameUboSize budget (2048 B). Bump kFrameUboSize in "
                   "src/rhi_vulkan/VulkanDevice.h AND this literal together, "
                   "or the Vulkan backend will silently truncate the tail and "
-                  "render corrupt. See the cornell_csg MoltenVK black-cube "
+                  "render corrupt. See the cornell_csg Vulkan black-cube "
                   "regression for what this looks like.");
     // Alignment guards: every vec4 / uvec4 field in the host PtPush
     // must sit on a 16-byte boundary to match the std140 / MSL
@@ -9677,8 +9680,8 @@ void Engine::RenderFrame() {
                 : pt::rhi::BufferHandle{placeholder_storage_id_};
             cb->BindBuffer(2, restir_prims, 0);
             // TLAS bind for the shadow trace. Only present on backends
-            // that support RT (Metal always; Vulkan when MoltenVK has
-            // VK_KHR_ray_query).
+            // that support RT (Metal always; native Vulkan when
+            // VK_KHR_ray_query is available).
             if (tlas_present) {
                 cb->BindAccelStruct(3, pt::rhi::AccelStructHandle{scene_tlas_id_});
             }
@@ -12550,8 +12553,8 @@ void Engine::Run() {
     std::uint32_t smoke_frames_rendered = 0;
 
     // Smoke-test hang detector. If the device_ never becomes non-null
-    // (backend init failed silently, MoltenVK refused to create on the
-    // host, Metal hardware-RT requirement unmet on a virtual GPU, etc.)
+    // (backend init failed silently, Metal hardware-RT requirement unmet
+    // on a virtual GPU, etc.)
     // the existing post-device frame counter would NEVER fire, and the
     // pre-device sleep loop further down would idle indefinitely. On a
     // CI runner that means the job burns until the workflow timeout
@@ -14266,18 +14269,23 @@ void Engine::RegisterCommands() {
         };
     }
     // r_backend: full canonical value set with per-value platform
-    // tags (issue #161). metal is Mac-only; vulkan and software are
-    // cross-platform. Listing the full set means a shared demont.cfg
-    // with `r_backend metal` round-trips cleanly on Windows, just no-
-    // ops with a clear platform-mismatch error instead of the older
-    // "invalid value" message.
+    // tags (issue #161). metal is Mac-only; vulkan is Windows/Linux
+    // only; software is available where the software present path is
+    // built. Listing the full set means a shared demont.cfg with
+    // `r_backend metal` or `r_backend vulkan` round-trips cleanly on
+    // the other OSes, just no-ops with a clear platform-mismatch error
+    // instead of the older "invalid value" message.
     if (auto* v = C.FindCVar("r_backend")) {
+        constexpr auto kAny      = pt::console::CVAR_VALUE_ANY;
+        constexpr auto kMac      = pt::console::CVAR_VALUE_MAC;
+        constexpr auto kWinLinux = pt::console::CVAR_VALUE_WIN |
+                                   pt::console::CVAR_VALUE_LINUX;
         v->allowed_values        = {"none", "software", "metal", "vulkan"};
         v->allowed_value_flags   = {
-            pt::console::CVAR_VALUE_ANY,    // none
-            pt::console::CVAR_VALUE_ANY,    // software
-            pt::console::CVAR_VALUE_MAC,    // metal
-            pt::console::CVAR_VALUE_ANY,    // vulkan (cross-platform; MoltenVK on Mac)
+            kAny,       // none
+            kAny,       // software
+            kMac,       // metal
+            kWinLinux,  // vulkan
         };
         v->on_change = [this](const pt::console::CVar& cv) {
             BackendType t = BackendType::None;

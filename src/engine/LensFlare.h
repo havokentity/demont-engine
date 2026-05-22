@@ -31,10 +31,10 @@
 namespace pt::engine::lensflare {
 
 // Maximums sized to keep the tonemap push struct under ~600 bytes
-// (well within Metal's >>4KB budget; matches what MoltenVK can handle
-// on Apple Silicon for the Vulkan path). For a 6-reflective-surface
-// lens there are at most C(6, 2) = 15 ghost paths, so 16 slots are
-// enough to capture every ghost the canonical lens can produce.
+// (well within Metal's >>4KB budget and Vulkan's push/tail budget).
+// For a 6-reflective-surface lens there are at most C(6, 2) = 15 ghost
+// paths, so 16 slots are enough to capture every ghost the canonical
+// lens can produce.
 constexpr int kMaxLensSurfaces = 16;
 constexpr int kMaxGhosts       = 16;
 

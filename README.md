@@ -31,8 +31,8 @@
 | **NVIDIA RTX** (Windows / Linux, RTX 2000-series and up) | Vulkan (`VK_KHR_ray_query` + `VK_KHR_acceleration_structure`) | NRD or SVGF | queued — see [`FOLLOW_UPS.md`](Raytracer%20Plan/FOLLOW_UPS.md) |
 | Software fallback (any) | CPU compute | none | bring-up only |
 
-Built on C++23 with a three-backend RHI (Software / Metal / Vulkan),
-Slang shaders that cross-compile to MSL and SPIR-V, and a unified
+Built on C++23 with a platform RHI (Software / Metal on macOS, native
+Vulkan on Windows/Linux), Slang shaders that cross-compile to MSL and SPIR-V, and a unified
 path-tracing kernel that intersects analytic primitives **and**
 triangle meshes (via hardware ray query) in one pass.
 
@@ -64,7 +64,7 @@ accumulation when the camera is stationary.
 | Phase | Status |
 |---|---|
 | P0–P3 toolchain, RHI, Software + Metal backends | ✓ |
-| P4 Vulkan via MoltenVK | ✓ |
+| P4 Native Vulkan (Windows/Linux) | ✓ |
 | P5 FPS camera + analytic primitives | ✓ |
 | P6 Materials (Lambert / metal / dielectric) | ✓ |
 | P7 Path tracing + HDR accumulation + ACES tonemap | ✓ |
@@ -81,8 +81,8 @@ accumulation when the camera is stationary.
 ### macOS (Apple Silicon)
 
 Requires macOS 26+ (for MetalFX TemporalDenoisedScaler), CMake ≥ 3.27,
-Ninja, Apple's clang, Vulkan SDK (optional but recommended for the
-Vulkan backend on Mac via MoltenVK).
+Ninja, and Apple's clang. Vulkan/MoltenVK is intentionally not built on
+macOS; the native Apple path is Metal.
 
 ```sh
 cmake --preset mac-debug
@@ -152,7 +152,7 @@ echo "csg_dump"          | nc localhost 27961
 
 | | |
 |---|---|
-| `r_backend` | `none` / `software` / `metal` / `vulkan` |
+| `r_backend` | macOS: `none` / `software` / `metal`; Windows/Linux: `none` / `software` / `vulkan` |
 | `r_denoiser` | `off` / `metalfx` (Mac); A/B with `toggle r_denoiser` |
 | `r_spp` | samples per pixel per dispatch (1..32). Higher = cleaner motion at proportional GPU cost. |
 | `r_max_bounces` | path-tracer bounce cap (default 8) |
@@ -173,7 +173,7 @@ src/
   rhi_software/  CPU compute (used as a clear+present today).
   rhi_metal/     Metal backend (metal-cpp + Slang→MSL),
                  MetalFXDenoiser shim, hardware ray query.
-  rhi_vulkan/    Vulkan backend via MoltenVK on Mac, native on Windows.
+  rhi_vulkan/    Native Vulkan backend for Windows/Linux.
   renderer/      Camera, MeshGen, Csg/CsgScene (Manifold-backed).
   console/       CVar/Command registry + civetweb WS/HTTP server +
                  raw line-protocol TCP server.

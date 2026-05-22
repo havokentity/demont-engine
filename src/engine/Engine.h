@@ -1202,9 +1202,7 @@ private:
     // box_vbuf_id_ / box_ibuf_id_ are populated (whether or not
     // scene_tlas_id_ is). Drives the software linear-scan branch in
     // PathTrace.slang via bvh_params.z when scene_tlas_id_ == 0 -- which
-    // happens on backends that lack hardware ray tracing (notably
-    // Mac-Vulkan on pre-1.3 MoltenVK builds that don't expose
-    // VK_KHR_acceleration_structure / VK_KHR_ray_query).
+    // happens on backends that lack hardware ray tracing.
     std::uint32_t                               mesh_tri_count_        = 0;
     // Triangle BVH for the SW mesh path (PR #106 follow-up). Built
     // alongside the vbuf/ibuf upload in RebuildMeshResources from the
@@ -1214,7 +1212,7 @@ private:
     // constants; the shader's SW mesh branch walks the tree there
     // instead of the previous O(N) Möller-Trumbore linear scan, fixing
     // the ~1 FPS @1080p perf cliff that PR #106 introduced on
-    // Mac-Vulkan (MoltenVK without VK_KHR_ray_query).
+    // the software mesh path.
     //
     // The build is unconditional (runs on both RT-capable and SW-only
     // backends) so the dispatch site is dispatch-uniform; the HW path
@@ -1501,7 +1499,7 @@ private:
     // sRGB EOTF only to tiles a material flags as albedo. Tile 0 is
     // reserved as a flat white (1,1,1,1) tile. Allocated lazily on first
     // texture use. (Verified correct on Metal; see the KNOWN LIMITATION in
-    // PathTrace.slang for the Vulkan/MoltenVK textured-read gap.)
+    // PathTrace.slang for the Vulkan textured-read gap.)
     static constexpr std::uint32_t              kPbrTileSize   = 256u;
     static constexpr std::uint32_t              kPbrAtlasTiles = 16u;
     static constexpr std::uint32_t              kPbrNoTexTile  = 0xFFFFFFFFu;

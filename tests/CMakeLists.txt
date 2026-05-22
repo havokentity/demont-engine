@@ -188,9 +188,8 @@ pt_add_test(pt_csg_scene
 
 # --- pt_renderer/TriangleBvh unit tests ------------------------------------
 # Triangle-BVH-on-host follow-up to PR #106 (issue #44). The SW
-# Möller-Trumbore linear-scan PR #106 shipped to make Mac-Vulkan render
-# CSG meshes on MoltenVK was O(N) per ray; on a 1k-tri scene this
-# crushed framerate to ~1 FPS at 1080p. The TriangleBvh class replaces
+# Möller-Trumbore linear-scan path was O(N) per ray; on a 1k-tri scene
+# this crushed framerate to ~1 FPS at 1080p. The TriangleBvh class replaces
 # that with O(log N) stack-based traversal of a host-built BVH that
 # the engine uploads alongside vbuf / ibuf. Coverage mirrors the
 # AnalyticBvh test pattern:
@@ -459,9 +458,9 @@ pt_add_test(scene_serialize
 # under its own banner so parallel agent branches appending other
 # pt_add_test(...) blocks at the end of this file rebase cleanly.
 
-# MVP cut: 1 scene x 3 backends x 1 denoiser = 3 cells. The matrix
-# expands later (see "Add a cell" in TESTING_STRATEGY.md) -- the
-# helper below is generic over (scene, backend, denoiser).
+# MVP cut: one scene across the compiled backends. The matrix expands
+# later (see "Add a cell" in TESTING_STRATEGY.md) -- the helper below
+# is generic over (scene, backend, denoiser).
 #
 # The function name is pt_add_golden_cell -- each call registers
 # *two* ctest tests: `${_cell_name}_render` (runs the harness) and
@@ -696,18 +695,17 @@ function(pt_add_golden_cell)
 endfunction()
 
 # --- MVP cells --------------------------------------------------------------
-# 1 scene (cornell_csg) x 3 backends (software/metal/vulkan) x 1
-# denoiser (off).
+# 1 scene (cornell_csg) x compiled backends x 1 denoiser (off).
 #
 # CI mapping today (.github/workflows/build.yml uses `-L golden_software`
 # on both the macOS and Windows lanes): the hosted GitHub runners do
 # not have GPUs that survive Metal / Vulkan init reliably -- the macOS
 # runner ships a paravirtualised Apple-GPU, and the Windows lane runs
 # on a generic VM without an NVIDIA / AMD ICD -- so CI exercises the
-# software backend on both. Metal and Vulkan cells still REGISTER on
-# Mac (so a local `ctest` against a real M-series picks them up) and
-# the matrix expands cleanly to real hardware once a self-hosted
-# runner with a GPU shows up. Each host's CI step filters via the
+# software backend on both. Metal cells still register on Mac (so a
+# local `ctest` against a real M-series picks them up); Vulkan cells
+# register on Windows/Linux builds where PT_ENABLE_VULKAN_BACKEND is
+# enabled. Each host's CI step filters via the
 # `golden_software` label; other ctest LABELS (`golden`,
 # `golden_metal`, `golden_vulkan`, `golden_missing`) are for local /
 # future use.
@@ -1016,11 +1014,9 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # any non-trivial regression in the mesh shift path surfaces while
     # the stochastic noise floor stays within budget.
     #
-    # software + metal cells register today (Mac-side dev box). The
-    # vulkan cell is intentionally NOT registered yet: Mac-Vulkan
-    # verification was blocked at PR time by an unrelated SDF Phase 2
-    # worktree saturating the GPU pipeline cache. Win-side Claude
-    # captures the Vulkan golden after the integration branch lands.
+    # software + metal cells register today on macOS. Vulkan validation
+    # belongs on a Windows/Linux Vulkan host after the integration
+    # branch lands.
     # The fixture's pt_smoke_late_exec value is a *relative* path
     # (tests/goldens/scenes/motion_blur_mesh_late.cfg). At engine init
     # that path is resolved against the engine's CWD -- but golden

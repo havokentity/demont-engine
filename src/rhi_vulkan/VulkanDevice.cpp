@@ -40,10 +40,10 @@ extern const unsigned char shader_PathTrace_spirv_data[];
 extern const unsigned long shader_PathTrace_spirv_size;
 // no-RayQuery variant. Built by src/rhi_vulkan/CMakeLists.txt with
 // -DPT_SPIRV_NO_RAYQUERY; used in place of the RT-enabled blob above
-// on backends that don't expose VK_KHR_ray_query (Mac-Vulkan on
-// pre-MoltenVK-1.3 builds). The two are functionally equivalent except
-// for the mesh-traversal path: gold variant uses RayQuery, norq
-// variant falls back to a linear scan via bvh_params.z.
+// on drivers that don't expose VK_KHR_ray_query. The two are
+// functionally equivalent except for the mesh-traversal path: gold
+// variant uses RayQuery, norq variant falls back to a linear scan via
+// bvh_params.z.
 extern const unsigned char shader_PathTrace_norq_spirv_data[];
 extern const unsigned long shader_PathTrace_norq_spirv_size;
 extern const unsigned char shader_AutoExposure_spirv_data[];
@@ -214,8 +214,8 @@ constexpr std::uint32_t kSlotToBufBinding[24] = {
     15, // engine slot 6 -> shader binding 15 (exposure_state)
     18, // engine slot 7 -> shader binding 18 (analytic-prim BVH nodes)
     // PR #106 follow-up: triangle BVH (host-built; replaces the
-    // O(N) Möller-Trumbore SW linear-scan path that #106 shipped for
-    // Mac-Vulkan / MoltenVK without VK_KHR_ray_query).
+    // O(N) Möller-Trumbore SW linear-scan path used when Vulkan lacks
+    // VK_KHR_ray_query).
     19, // engine slot 8 -> shader binding 19 (tri_bvh_nodes)
     20, // engine slot 9 -> shader binding 20 (tri_bvh_permuted_ids)
     // SDF Phase 1 (#97): SDF cluster buffer. Moved here from engine
@@ -476,10 +476,8 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     // the shader is required not to access them (the pipeline's SPIR-V
     // dictates which bindings it reads/writes). This replaces the older
     // strategy of writing VK_NULL_HANDLE to unbound slots via
-    // VK_EXT_robustness2.nullDescriptor -- MoltenVK on Apple Silicon
-    // reports the extension but with nullDescriptor=false, so the null
-    // path doesn't work on Mac. Partially-bound is core Vulkan 1.2 and
-    // supported on every target including MoltenVK.
+    // VK_EXT_robustness2.nullDescriptor. Partially-bound is core Vulkan
+    // 1.2 and broadly supported on our native Vulkan targets.
     //
     // Capacity: derived from the slot tables so future slot bumps in
     // VulkanDevice.h don't silently overflow img_infos / buf_infos /
@@ -731,10 +729,6 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     std::uint32_t glfw_ext_n = 0;
     const char** glfw_exts = glfwGetRequiredInstanceExtensions(&glfw_ext_n);
     std::vector<const char*> exts(glfw_exts, glfw_exts + glfw_ext_n);
-#if defined(__APPLE__)
-    exts.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
-    exts.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
-#endif
     if (kEnableValidation) {
         exts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     }
@@ -747,11 +741,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     VkInstanceCreateInfo ici{};
     ici.sType                   = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     ici.pApplicationInfo        = &ai;
-#if defined(__APPLE__)
-    ici.flags                   = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
-#else
     ici.flags                   = 0;
-#endif
     ici.enabledExtensionCount   = static_cast<std::uint32_t>(exts.size());
     ici.ppEnabledExtensionNames = exts.data();
     ici.enabledLayerCount       = static_cast<std::uint32_t>(layers.size());
@@ -838,11 +828,11 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     bool has_deferred_host_op = DeviceSupportsExtension(phys_device_, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
     rt_supported_ = has_ray_query && has_accel_struct && has_deferred_host_op;
     // One-line log for the bringup gate so the cause of a missing RT
-    // path is obvious in the console. Pre-MoltenVK-1.3 builds report
-    // 'ray_query=false accel_struct=false' here; on those drivers
-    // the engine falls back to a CPU-built triangle BVH for CSG meshes
-    // (see Engine::RebuildMeshResources + the bvh_tris software path
-    // in PathTrace.slang).
+    // path is obvious in the console. On drivers without ray query /
+    // acceleration-structure support, the engine falls back to a
+    // CPU-built triangle BVH for CSG meshes (see
+    // Engine::RebuildMeshResources + the bvh_tris software path in
+    // PathTrace.slang).
     LOG_INFO("Vulkan RT extension presence: ray_query={} accel_struct={} deferred_host_op={} -> hw_rt={}",
              has_ray_query, has_accel_struct, has_deferred_host_op, rt_supported_);
 
@@ -905,7 +895,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     if (!supports_partially_bound) {
         // PARTIALLY_BOUND lets dispatches leave unused slots in the
         // 20-binding shared layout unwritten. Core Vulkan 1.2 feature;
-        // present on every desktop driver and MoltenVK.
+        // present on our native desktop Vulkan targets.
         LOG_ERROR("Vulkan: descriptorBindingPartiallyBound is required by Vulkan descriptor binding strategy");
         return;
     }
@@ -931,9 +921,6 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
 
     std::vector<const char*> dexts;
     dexts.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
-#if defined(__APPLE__)
-    dexts.push_back("VK_KHR_portability_subset");
-#endif
     if (rt_supported_) {
         dexts.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
         dexts.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
@@ -982,7 +969,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // PARTIALLY_BOUND lets dispatches leave unused slots in the shared
     // 20-binding layout unwritten -- the descriptor-write path skips
     // them, the shader is required not to access them. Replaces the
-    // older nullDescriptor-based scheme that MoltenVK doesn't support.
+    // older nullDescriptor-based scheme.
     v12.descriptorBindingPartiallyBound = VK_TRUE;
 #if defined(PT_ENABLE_OPTIX)
     // Timeline semaphores: required by VulkanOptixDenoiser to fence
@@ -1093,7 +1080,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     //   14 storage_image + [1 accel_struct] + 10 storage_buffer + 1 ubo
     // The accel-struct pool entry is only emitted when rt_supported_
     // is true; ASKHR isn't a valid descriptor type at all on drivers
-    // without VK_KHR_acceleration_structure (e.g. pre-1.3 MoltenVK).
+    // without VK_KHR_acceleration_structure.
     // The "+4" / "+1" headroom from the original sizing is preserved.
     // 14 storage_images: 11 was the post-#46 count (bindings 0/1/6/7/8/9/
     // 12/13/16/17/22). Issue #118 adds three MetalFX specular guidance
@@ -1125,9 +1112,9 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // (binding 29, #78 ReSTIR), smoke_emitters (binding 30, #136),
     // sph_particles (binding 31, #22 -- previously missing from the
     // Vulkan layout, added with Wave 8), mesh_uvs (binding 33, #26).
-    // +8 slack for upcoming additions before we have to bump again --
-    // MoltenVK silently ignored the prior undersize, but native NVIDIA
-    // Vulkan correctly returns VK_ERROR_OUT_OF_POOL_MEMORY.
+    // +8 slack for upcoming additions before we have to bump again.
+    // Native NVIDIA Vulkan correctly returns VK_ERROR_OUT_OF_POOL_MEMORY
+    // for undersized pools.
     // 17 storage-buffer bindings per dispatch now: the 15 base bindings
     // plus sph_particles (binding 31, #22) -- its layout entry was added
     // alongside the Wave 8 ocean bindings (the #22 PR added only the
@@ -1501,7 +1488,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // rt_supported_ -> RT-enabled blob (RayQuery + scene_tlas binding);
         // !rt_supported_ -> norq blob (no RayQueryKHR capability, mesh
         // traversal degrades to the linear-scan path in PathTrace.slang).
-        // The norq variant exists because some MoltenVK builds don't
+        // The norq variant exists because some Vulkan drivers don't
         // expose VK_KHR_ray_query at all -- loading the RT-enabled blob
         // on those drivers fails vkCreateShaderModule with a
         // "RayQueryKHR capability declared but rayQuery feature missing"
@@ -1889,8 +1876,7 @@ bool VulkanDevice::RecreateSwapchain() {
     //      smoke mode where the Win32 window is never shown and the
     //      surface caps + GLFW both report 0x0 before WM_SIZE fires.
     //      Without this, vkCreateSwapchainKHR fails on native NVIDIA
-    //      Vulkan with imageExtent(0,0). MoltenVK had been masking the
-    //      bug by accepting 0x0 silently.
+    //      Vulkan with imageExtent(0,0).
     std::uint32_t want_w = 0;
     std::uint32_t want_h = 0;
     if (caps.currentExtent.width != 0xFFFFFFFFu &&

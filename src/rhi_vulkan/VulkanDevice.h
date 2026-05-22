@@ -334,8 +334,8 @@ public:
     // height fog, god rays, advanced materials (anisotropic/clearcoat/
     // subsurface, +400 B alone), tonemap operators -- to ~1488 B. The old
     // 1024 cap silently truncated ~464 B of trailing fields on the Vulkan
-    // path, corrupting MoltenVK renders (cornell_csg cube rendered black
-    // because a shading field landed in the dropped region). The runtime
+    // path, corrupting native Vulkan renders (cornell_csg cube rendered
+    // black because a shading field landed in the dropped region). The runtime
     // LOG_ERROR fired but nothing failed the build. Bumped to 2048 (16-byte
     // aligned, ~560 B headroom) and paired with a compile-time
     // static_assert at the PtPush dispatch site in Engine.cpp
@@ -460,7 +460,7 @@ private:
     // against the larger layout. Every binding is flagged
     // PARTIALLY_BOUND so dispatches can leave unused slots unwritten
     // without validation noise (no dependence on
-    // VK_EXT_robustness2.nullDescriptor, which MoltenVK doesn't expose).
+    // VK_EXT_robustness2.nullDescriptor).
     VkDescriptorSetLayout shared_dset_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout      shared_pipe_layout_ = VK_NULL_HANDLE;
 

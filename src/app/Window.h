@@ -19,7 +19,7 @@ public:
 
     // Always created with no graphics API context attached -- backends
     // attach their own CAMetalLayer (Metal, Software-via-Metal-present)
-    // or VkSurface (Vulkan via MoltenVK).
+    // or VkSurface (native Vulkan on Windows/Linux).
     bool Create(int w, int h, std::string_view title);
     void Destroy();
 

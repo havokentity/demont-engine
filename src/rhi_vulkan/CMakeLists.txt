@@ -110,8 +110,8 @@ pt_compile_slang(
     STAGE compute ENTRY main TARGETS spirv
     EXTRA_DEFINES ${_pt_water_def} ${_pt_light_tree_def}
     MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals RestirReservoir)
-# Second PathTrace SPIR-V variant without RayQuery, for backends that
-# don't expose VK_KHR_ray_query (Mac-Vulkan on pre-1.3 MoltenVK builds).
+# Second PathTrace SPIR-V variant without RayQuery, for Vulkan drivers that
+# don't expose VK_KHR_ray_query.
 # The two variants share the source file; PT_SPIRV_NO_RAYQUERY strips
 # the scene_tlas binding + the HW RayQuery branch, so the SPIR-V module
 # never declares the RayQueryKHR capability and loads cleanly on those

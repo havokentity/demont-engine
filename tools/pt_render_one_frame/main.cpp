@@ -64,7 +64,11 @@ void PrintUsage(std::FILE* out) {
         "Required:\n"
         "  --scene PATH         Path to a console-script .cfg fixture\n"
         "                       (loaded by the engine before backend init).\n"
+#if defined(__APPLE__)
+        "  --backend NAME       One of software | metal. Vulkan is Windows/Linux only.\n"
+#else
         "  --backend NAME       One of software | metal | vulkan.\n"
+#endif
         "  --out PATH           Destination PNG for the final frame.\n"
         "\n"
         "Optional:\n"
@@ -180,12 +184,22 @@ bool ParseArgs(int argc, char** argv, Args& a) {
         std::fprintf(stderr, "pt_render_one_frame: --out is required\n");
         return false;
     }
+#if defined(__APPLE__)
+    if (a.backend != "software" && a.backend != "metal") {
+        std::fprintf(stderr,
+            "pt_render_one_frame: --backend must be one of "
+            "{software,metal}; Vulkan is Windows/Linux-only; got '%s'\n",
+            a.backend.c_str());
+        return false;
+    }
+#else
     if (a.backend != "software" && a.backend != "metal" && a.backend != "vulkan") {
         std::fprintf(stderr,
             "pt_render_one_frame: --backend must be one of "
             "{software,metal,vulkan}; got '%s'\n", a.backend.c_str());
         return false;
     }
+#endif
     // Validate --denoiser against the full superset of r_denoiser
     // values the engine accepts (per the PT_CVAR description in
     // src/engine/Engine.cpp). The engine does NOT have an

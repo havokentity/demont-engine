@@ -28,7 +28,15 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # --- Project options --------------------------------------------------------
-option(PT_ENABLE_VULKAN_BACKEND "Build Vulkan/MoltenVK backend (P4+)"   ON)
+set(_PT_ENABLE_VULKAN_BACKEND_DEFAULT ON)
+if(APPLE)
+    set(_PT_ENABLE_VULKAN_BACKEND_DEFAULT OFF)
+endif()
+option(PT_ENABLE_VULKAN_BACKEND "Build native Vulkan backend (Windows/Linux)" ${_PT_ENABLE_VULKAN_BACKEND_DEFAULT})
+if(APPLE AND PT_ENABLE_VULKAN_BACKEND)
+    message(STATUS "PT_ENABLE_VULKAN_BACKEND is disabled on Apple; macOS uses the Metal backend.")
+    set(PT_ENABLE_VULKAN_BACKEND OFF CACHE BOOL "Build native Vulkan backend (Windows/Linux)" FORCE)
+endif()
 option(PT_ENABLE_OPTIX
     "Build OptiX denoiser (NVIDIA only; needs CUDA Toolkit + OptiX SDK installed)" ON)
 # NVIDIA RayTracingDenoiser (NRD) library integration -- issue #50.
@@ -175,7 +183,7 @@ option(PT_LIGHT_TREE
 include(cmake/CompilerWarnings.cmake)
 include(cmake/EmbedResource.cmake)
 
-# --- Vulkan (LunarG SDK installed system-wide on Mac) ----------------------
+# --- Vulkan (native Windows/Linux only) ------------------------------------
 if(PT_ENABLE_VULKAN_BACKEND)
     find_package(Vulkan REQUIRED)
     if(Vulkan_FOUND)

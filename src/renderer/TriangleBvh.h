@@ -11,9 +11,9 @@ namespace pt::renderer {
 
 // Flat-linear binary BVH over triangle primitives. Follow-up to PR #106:
 // the SW Möller-Trumbore linear-scan path that #106 added to
-// PathTrace.slang for Mac-Vulkan (MoltenVK without VK_KHR_ray_query) is
-// O(N) per ray, which crushed framerate on even modest CSG meshes
-// (~1 FPS at 1080p on the 1032-tri cornell_csg scene on an M4 Max).
+// PathTrace.slang is O(N) per ray, which crushed framerate on even
+// modest CSG meshes (~1 FPS at 1080p on the 1032-tri cornell_csg
+// scene on an M4 Max).
 // This class mirrors AnalyticBvh's structure so the renderer can build
 // it on the same async bake thread that produces the BakedMesh and
 // upload it as two SSBOs alongside the existing vbuf / ibuf.
