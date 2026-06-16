@@ -1155,6 +1155,10 @@ private:
     bool                                        prev_lmb_down_ = false;
     // Pre-drag origin captured in BeginDrag; restored on Esc-during-drag.
     glm::vec3                                   editor_drag_pre_pos_ { 0.0f };
+    // Pre-drag scalar extents for scale-mode. A = sphere radius or quad
+    // U half-extent; B = quad V half-extent.
+    float                                       editor_drag_pre_scale_a_ = 1.0f;
+    float                                       editor_drag_pre_scale_b_ = 1.0f;
     // Pre-drag orientation quaternion captured in BeginDrag for
     // rotate-mode (#206). Stored xyzw; identity is (0,0,0,1). The
     // rotate dispatch builds a delta quaternion from the drag angle

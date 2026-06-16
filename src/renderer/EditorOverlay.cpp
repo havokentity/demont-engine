@@ -102,6 +102,47 @@ static float ScreenSegmentDistance(const glm::vec3& wa, const glm::vec3& wb,
     return glm::length(m - q);
 }
 
+static bool PointInScreenTriangle(const glm::vec2& p,
+                                  const glm::vec2& a,
+                                  const glm::vec2& b,
+                                  const glm::vec2& c)
+{
+    auto edge = [](const glm::vec2& u, const glm::vec2& v, const glm::vec2& q) {
+        const glm::vec2 e = v - u;
+        const glm::vec2 w = q - u;
+        return e.x * w.y - e.y * w.x;
+    };
+    // Reject degenerate (near-zero-area) triangles. A plane handle viewed
+    // edge-on projects to a sliver; its three edge functions all collapse
+    // toward zero, and the sign test below would then report every point on
+    // that line as "inside" -- letting an edge-on plane handle hijack the
+    // whole axis arm beneath it. Such a handle has no clickable area anyway.
+    const float area2 = edge(a, b, c);   // 2x signed screen-space area
+    if (std::abs(area2) < 1.0f) return false;
+    const float e0 = edge(a, b, p);
+    const float e1 = edge(b, c, p);
+    const float e2 = edge(c, a, p);
+    const bool has_neg = (e0 < 0.0f) || (e1 < 0.0f) || (e2 < 0.0f);
+    const bool has_pos = (e0 > 0.0f) || (e1 > 0.0f) || (e2 > 0.0f);
+    return !(has_neg && has_pos);
+}
+
+static bool ScreenTriangleContains(const glm::vec3& wa,
+                                   const glm::vec3& wb,
+                                   const glm::vec3& wc,
+                                   const Camera& cam, float aspect,
+                                   int fb_w, int fb_h,
+                                   double mouse_x, double mouse_y)
+{
+    glm::vec2 pa, pb, pc;
+    if (!ProjectToScreen(wa, cam, aspect, fb_w, fb_h, pa)) return false;
+    if (!ProjectToScreen(wb, cam, aspect, fb_w, fb_h, pb)) return false;
+    if (!ProjectToScreen(wc, cam, aspect, fb_w, fb_h, pc)) return false;
+    const glm::vec2 m{static_cast<float>(mouse_x),
+                      static_cast<float>(mouse_y)};
+    return PointInScreenTriangle(m, pa, pb, pc);
+}
+
 // ============================================================================
 // EditorOverlay
 // ============================================================================
@@ -115,12 +156,33 @@ void EditorOverlay::ClearSegments() {
 }
 
 glm::vec3 EditorOverlay::ColorFor(Axis a, Axis hl) const {
-    if (a == hl) return glm::vec3(1.0f, 0.95f, 0.10f);   // yellow highlight
+    if (a == hl ||
+        (hl == Axis::XY && (a == Axis::X || a == Axis::Y)) ||
+        (hl == Axis::YZ && (a == Axis::Y || a == Axis::Z)) ||
+        (hl == Axis::ZX && (a == Axis::Z || a == Axis::X))) {
+        return glm::vec3(1.0f, 0.95f, 0.10f);   // yellow highlight
+    }
     switch (a) {
-        case Axis::X: return glm::vec3(0.95f, 0.15f, 0.18f);
-        case Axis::Y: return glm::vec3(0.20f, 0.85f, 0.20f);
-        case Axis::Z: return glm::vec3(0.20f, 0.40f, 1.00f);
-        default:      return glm::vec3(0.85f, 0.85f, 0.85f);
+        case Axis::X:
+        case Axis::YZ: return glm::vec3(0.95f, 0.15f, 0.18f);
+        case Axis::Y:
+        case Axis::ZX: return glm::vec3(0.20f, 0.85f, 0.20f);
+        case Axis::Z:
+        case Axis::XY: return glm::vec3(0.20f, 0.40f, 1.00f);
+        default:       return glm::vec3(0.85f, 0.85f, 0.85f);
+    }
+}
+
+float EditorOverlay::FillColorCodeFor(Axis a, Axis hl) const {
+    if (a == hl) return 10.0f;
+    switch (a) {
+        case Axis::X:
+        case Axis::YZ: return 1.0f;
+        case Axis::Y:
+        case Axis::ZX: return 2.0f;
+        case Axis::Z:
+        case Axis::XY: return 3.0f;
+        default:       return 0.0f;
     }
 }
 
@@ -134,6 +196,20 @@ void EditorOverlay::EmitAxisSegment(const glm::vec3& a, const glm::vec3& b,
     s.b = b;
     s.depth_bias = 0.0f;
     s.color = ColorFor(axis, hovered_or_dragged);
+    segs_.push_back(s);
+}
+
+void EditorOverlay::EmitFilledTriangle(const glm::vec3& a, const glm::vec3& b,
+                                       const glm::vec3& c,
+                                       Axis axis, Axis hovered_or_dragged)
+{
+    Segment s;
+    s.a = a;
+    s.half_thickness = -1.0f;
+    s.b = b;
+    s.depth_bias = 0.0f;
+    s.color = c;
+    s._pad = FillColorCodeFor(axis, hovered_or_dragged);
     segs_.push_back(s);
 }
 
@@ -180,6 +256,7 @@ void EditorOverlay::AppendTranslateGizmo(const glm::vec3& O, float L,
                                            + ortho2 * (std::sin(t0) * tip_r);
             const glm::vec3 p1 = shaft_end + ortho1 * (std::cos(t1) * tip_r)
                                            + ortho2 * (std::sin(t1) * tip_r);
+            EmitFilledTriangle(p0, p1, tip_end, a, hl);
             // perimeter -> apex (two ribs per fan slice)
             EmitAxisSegment(p0, tip_end, a, hl, 1.0f);
             // perimeter ring segment
@@ -194,6 +271,26 @@ void EditorOverlay::AppendTranslateGizmo(const glm::vec3& O, float L,
     draw_arm(glm::vec3(1, 0, 0), Axis::X);
     draw_arm(glm::vec3(0, 1, 0), Axis::Y);
     draw_arm(glm::vec3(0, 0, 1), Axis::Z);
+
+    auto draw_plane_handle = [&](const glm::vec3& u,
+                                 const glm::vec3& v,
+                                 Axis plane_axis) {
+        const float lo = L * 0.18f;
+        const float hi = L * 0.38f;
+        const glm::vec3 p00 = O + u * lo + v * lo;
+        const glm::vec3 p10 = O + u * hi + v * lo;
+        const glm::vec3 p11 = O + u * hi + v * hi;
+        const glm::vec3 p01 = O + u * lo + v * hi;
+        EmitFilledTriangle(p00, p10, p11, plane_axis, hl);
+        EmitFilledTriangle(p00, p11, p01, plane_axis, hl);
+        EmitAxisSegment(p00, p10, plane_axis, hl, 1.0f);
+        EmitAxisSegment(p10, p11, plane_axis, hl, 1.0f);
+        EmitAxisSegment(p11, p01, plane_axis, hl, 1.0f);
+        EmitAxisSegment(p01, p00, plane_axis, hl, 1.0f);
+    };
+    draw_plane_handle(glm::vec3(1, 0, 0), glm::vec3(0, 1, 0), Axis::XY);
+    draw_plane_handle(glm::vec3(0, 1, 0), glm::vec3(0, 0, 1), Axis::YZ);
+    draw_plane_handle(glm::vec3(0, 0, 1), glm::vec3(1, 0, 0), Axis::ZX);
 }
 
 void EditorOverlay::AppendRotateGizmo(const glm::vec3& O, float L, Axis hl)
@@ -396,6 +493,30 @@ EditorOverlay::Axis EditorOverlay::HitTest(const glm::vec3& O, float L,
         return pick;
     }
 
+    if (mode_ == Mode::Translate) {
+        auto hit_plane = [&](const glm::vec3& u,
+                             const glm::vec3& v,
+                             Axis plane_axis) -> Axis {
+            const float lo = L * 0.18f;
+            const float hi = L * 0.38f;
+            const glm::vec3 p00 = O + u * lo + v * lo;
+            const glm::vec3 p10 = O + u * hi + v * lo;
+            const glm::vec3 p11 = O + u * hi + v * hi;
+            const glm::vec3 p01 = O + u * lo + v * hi;
+            if (ScreenTriangleContains(p00, p10, p11, cam, aspect, fb_w, fb_h, mx, my) ||
+                ScreenTriangleContains(p00, p11, p01, cam, aspect, fb_w, fb_h, mx, my)) {
+                return plane_axis;
+            }
+            return Axis::None;
+        };
+        Axis plane = hit_plane(glm::vec3(1, 0, 0), glm::vec3(0, 1, 0), Axis::XY);
+        if (plane != Axis::None) return plane;
+        plane = hit_plane(glm::vec3(0, 1, 0), glm::vec3(0, 0, 1), Axis::YZ);
+        if (plane != Axis::None) return plane;
+        plane = hit_plane(glm::vec3(0, 0, 1), glm::vec3(1, 0, 0), Axis::ZX);
+        if (plane != Axis::None) return plane;
+    }
+
     // Translate / scale: test the three axis arms.
     const glm::vec3 ax_X = O + glm::vec3(L, 0, 0);
     const glm::vec3 ax_Y = O + glm::vec3(0, L, 0);
@@ -429,6 +550,12 @@ static bool RayPlaneIntersect(const glm::vec3& ro, const glm::vec3& rd,
     return true;
 }
 
+static bool IsTranslatePlaneAxis(EditorOverlay::Axis a) {
+    return a == EditorOverlay::Axis::XY ||
+           a == EditorOverlay::Axis::YZ ||
+           a == EditorOverlay::Axis::ZX;
+}
+
 void EditorOverlay::BeginDrag(Axis a, const glm::vec3& origin,
                               const Camera& cam, float aspect,
                               int fb_w, int fb_h,
@@ -438,10 +565,13 @@ void EditorOverlay::BeginDrag(Axis a, const glm::vec3& origin,
     drag_mode_      = mode_;
     drag_start_pos_ = origin;
     switch (a) {
-        case Axis::X: drag_axis_dir_ = glm::vec3(1, 0, 0); break;
-        case Axis::Y: drag_axis_dir_ = glm::vec3(0, 1, 0); break;
-        case Axis::Z: drag_axis_dir_ = glm::vec3(0, 0, 1); break;
-        default:      drag_axis_     = Axis::None; return;
+        case Axis::X:  drag_axis_dir_ = glm::vec3(1, 0, 0); break;
+        case Axis::Y:  drag_axis_dir_ = glm::vec3(0, 1, 0); break;
+        case Axis::Z:  drag_axis_dir_ = glm::vec3(0, 0, 1); break;
+        case Axis::XY: drag_axis_dir_ = glm::vec3(0, 0, 1); break;
+        case Axis::YZ: drag_axis_dir_ = glm::vec3(1, 0, 0); break;
+        case Axis::ZX: drag_axis_dir_ = glm::vec3(0, 1, 0); break;
+        default:       drag_axis_     = Axis::None; return;
     }
     glm::vec3 ro{0.0f}, rd{0.0f};
     if (!ScreenToWorldRay(cam, aspect, fb_w, fb_h, mx, my, ro, rd)) {
@@ -477,6 +607,13 @@ void EditorOverlay::BeginDrag(Axis a, const glm::vec3& origin,
             drag_anchor_world_ = glm::vec3(0, 0, 0);
             drag_ring_radius_  = 1.0f;
         }
+    } else if (IsTranslatePlaneAxis(a)) {
+        glm::vec3 plane_pick{};
+        if (RayPlaneIntersect(ro, rd, origin, drag_axis_dir_, plane_pick)) {
+            drag_anchor_world_ = plane_pick;
+        } else {
+            drag_anchor_world_ = origin;
+        }
     } else {
         // Translate / scale mode: closest point on the axis line.
         drag_anchor_world_ =
@@ -492,6 +629,15 @@ glm::vec3 EditorOverlay::UpdateDrag(const Camera& cam, float aspect,
     glm::vec3 ro{0.0f}, rd{0.0f};
     if (!ScreenToWorldRay(cam, aspect, fb_w, fb_h, mx, my, ro, rd)) {
         return drag_start_pos_;
+    }
+    if (IsTranslatePlaneAxis(drag_axis_)) {
+        glm::vec3 cur{};
+        if (!RayPlaneIntersect(ro, rd, drag_start_pos_, drag_axis_dir_, cur)) {
+            return drag_start_pos_;
+        }
+        glm::vec3 delta_world = cur - drag_anchor_world_;
+        delta_world -= drag_axis_dir_ * glm::dot(delta_world, drag_axis_dir_);
+        return drag_start_pos_ + delta_world;
     }
     const glm::vec3 cur = ClosestPointOnLineToRay(drag_start_pos_,
                                                   drag_axis_dir_, ro, rd);

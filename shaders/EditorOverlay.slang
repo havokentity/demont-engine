@@ -55,13 +55,14 @@ RWTexture2D<float4> out_image;
 // declaration order.
 [[vk::binding(4, 0)]] StructuredBuffer<uint>     _slot_dummy0;
 
-// Segment list. Each segment occupies 3 float4s (48 bytes):
+// Segment list. Each record occupies 3 float4s (48 bytes):
 //   s0.xyz = world-space endpoint A
-//   s0.w   = pixel half-thickness (e.g. 1.5 for a 3-pixel line)
+//   s0.w   = pixel half-thickness (e.g. 1.5 for a 3-pixel line);
+//            negative means "filled triangle"
 //   s1.xyz = world-space endpoint B
 //   s1.w   = unused (reserved for future depth-bias)
-//   s2.xyz = colour (linear, the kernel applies sRGB encoding inline)
-//   s2.w   = unused (alignment padding)
+//   s2.xyz = line colour OR triangle vertex C
+//   s2.w   = triangle colour code
 [[vk::binding(3, 0)]] RWStructuredBuffer<float4> segments;
 
 [[vk::push_constant]]
@@ -101,6 +102,29 @@ float seg_dist(float px, float py,
     float qy = y0 + t * vy;
     float dx = px - qx, dy = py - qy;
     return sqrt(dx * dx + dy * dy);
+}
+
+float edge2(float2 a, float2 b, float2 p) {
+    float2 e = b - a;
+    float2 w = p - a;
+    return e.x * w.y - e.y * w.x;
+}
+
+bool point_in_tri(float2 p, float2 a, float2 b, float2 c) {
+    float e0 = edge2(a, b, p);
+    float e1 = edge2(b, c, p);
+    float e2 = edge2(c, a, p);
+    bool has_neg = (e0 < 0.0) || (e1 < 0.0) || (e2 < 0.0);
+    bool has_pos = (e0 > 0.0) || (e1 > 0.0) || (e2 > 0.0);
+    return !(has_neg && has_pos);
+}
+
+float3 fill_color_from_code(float code) {
+    if (code > 9.5) return float3(1.0, 0.95, 0.10);
+    if (code > 2.5) return float3(0.20, 0.40, 1.00);
+    if (code > 1.5) return float3(0.20, 0.85, 0.20);
+    if (code > 0.5) return float3(0.95, 0.15, 0.18);
+    return float3(0.85, 0.85, 0.85);
 }
 
 // Project a world-space point into screen-space pixels via the
@@ -178,13 +202,29 @@ void main(uint3 tid : SV_DispatchThreadID) {
         float4 s2 = segments[base + 2u];
 
         float3 wa  = s0.xyz;
-        float half_thickness = max(s0.w, 0.5);
+        float half_thickness = s0.w;
         float3 wb  = s1.xyz;
         float3 col = s2.xyz;
 
         bool behind_a = false, behind_b = false;
         float2 pa = project(wa, dim, behind_a);
         float2 pb = project(wb, dim, behind_b);
+        if (half_thickness < 0.0) {
+            bool behind_c = false;
+            float2 pc = project(s2.xyz, dim, behind_c);
+            if (behind_a || behind_b || behind_c) continue;
+            float2 p = float2(fx, fy);
+            if (!point_in_tri(p, pa, pb, pc)) continue;
+            float d0 = seg_dist(fx, fy, pa.x, pa.y, pb.x, pb.y);
+            float d1 = seg_dist(fx, fy, pb.x, pb.y, pc.x, pc.y);
+            float d2 = seg_dist(fx, fy, pc.x, pc.y, pa.x, pa.y);
+            float edge_d = min(d0, min(d1, d2));
+            float aa = 0.42 * saturate(edge_d + 0.5);
+            float3 src_dpy = srgb_encode(fill_color_from_code(s2.w));
+            dst.rgb = lerp(dst.rgb, src_dpy, aa);
+            continue;
+        }
+        half_thickness = max(half_thickness, 0.5);
         // If either endpoint is behind the camera, skip the segment
         // entirely. Cheap and avoids near-plane clipping math; the
         // gizmo is small relative to camera near plane in typical use.

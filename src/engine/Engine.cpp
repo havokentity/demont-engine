@@ -12139,6 +12139,83 @@ void Engine::HandleMouseInput() {
     const glm::vec3 rd    = glm::normalize(
         fwd + right * (u * aspect * tan_half_fov) + up * (v * tan_half_fov));
 
+    // If the current selection already owns a visible transform gizmo under
+    // this cursor press, let BuildSelectionGizmo consume the same LMB edge and
+    // start the drag. Otherwise the scene raycast below can pick an unrelated
+    // object behind the handle (often an infinite plane) and steal the click.
+    {
+        auto& C = pt::console::Console::Get();
+        bool gizmo_enabled = true;
+        if (auto* gv = C.FindCVar("r_editor_gizmo")) gizmo_enabled = gv->GetBool();
+
+        if (gizmo_enabled) {
+            std::string mode = "translate";
+            if (auto* mv = C.FindCVar("gizmo_mode")) mode = mv->value;
+            if      (mode == "rotate") editor_gizmo_.SetMode(pt::renderer::EditorOverlay::Mode::Rotate);
+            else if (mode == "scale")  editor_gizmo_.SetMode(pt::renderer::EditorOverlay::Mode::Scale);
+            else                       editor_gizmo_.SetMode(pt::renderer::EditorOverlay::Mode::Translate);
+
+            const bool sel_prim = selected_kind_ == SelectionKind::AnalyticPrim &&
+                                  selected_prim_id_ != 0;
+            const bool sel_light = selected_kind_ == SelectionKind::Light &&
+                                   selected_prim_id_ != 0;
+            glm::vec3 gizmo_origin{0.0f};
+            float gizmo_size = 1.0f;
+            bool can_hit_gizmo = false;
+
+            if (sel_prim) {
+                auto it = primitives_.find(selected_prim_id_);
+                if (it != primitives_.end()) {
+                    const auto& p = it->second;
+                    if (p.type == AnalyticPrim::Plane) {
+                        if (editor_gizmo_.GetMode() == pt::renderer::EditorOverlay::Mode::Rotate) {
+                            const glm::vec3 n{p.pos_or_n[0], p.pos_or_n[1], p.pos_or_n[2]};
+                            gizmo_origin = n * (-p.radius_or_d);
+                            gizmo_size = 1.5f;
+                            can_hit_gizmo = true;
+                        }
+                    } else {
+                        gizmo_origin = glm::vec3{p.pos_or_n[0], p.pos_or_n[1], p.pos_or_n[2]};
+                        gizmo_size = std::max(0.5f, p.radius_or_d * 1.5f);
+                        can_hit_gizmo = true;
+                    }
+                }
+            } else if (sel_light) {
+                auto it = light_prims_.find(selected_prim_id_);
+                if (it != light_prims_.end()) {
+                    const auto& L = it->second;
+                    if (editor_gizmo_.GetMode() != pt::renderer::EditorOverlay::Mode::Scale ||
+                        L.type == AnalyticLight::Sphere ||
+                        L.type == AnalyticLight::Quad) {
+                        gizmo_origin = glm::vec3{L.pos[0], L.pos[1], L.pos[2]};
+                        if (L.type == AnalyticLight::Sphere) {
+                            gizmo_size = std::max(0.5f, L.radius * 1.5f);
+                        } else if (L.type == AnalyticLight::Quad) {
+                            const float u_len = std::sqrt(L.u_vec[0]*L.u_vec[0] +
+                                                          L.u_vec[1]*L.u_vec[1] +
+                                                          L.u_vec[2]*L.u_vec[2]);
+                            gizmo_size = std::max(0.5f, std::max(u_len, L.v_half) * 1.5f);
+                        } else {
+                            gizmo_size = 1.5f;
+                        }
+                        can_hit_gizmo = true;
+                    }
+                }
+            }
+
+            const int hit_w = accum_w_ > 0 ? accum_w_ : w;
+            const int hit_h = accum_h_ > 0 ? accum_h_ : h;
+            const float hit_aspect = (hit_h > 0) ? float(hit_w) / float(hit_h) : aspect;
+            if (can_hit_gizmo &&
+                editor_gizmo_.HitTest(gizmo_origin, gizmo_size,
+                                      *camera_, hit_aspect, hit_w, hit_h,
+                                      cx, cy, /*hit_radius_px=*/10.0f) !=
+                    pt::renderer::EditorOverlay::Axis::None) {
+                return;
+            }
+        }
+    }
+
     // Walk primitives_ for the nearest hit. Match the GPU shader's
     // intersectSphere / intersectPlane epsilons (1e-4f on the
     // positive-t check) so the CPU pick agrees with what the user
@@ -17597,9 +17674,15 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
     } else {
         // Light path: anchored at L.pos. Sphere lights use their radius;
         // quad lights use max(|u_vec|, v_half) so the gizmo wraps the
-        // emitter footprint; point/spot fall back to a sensible default
-        // (1.5m) since they have no canonical extent.
+        // emitter footprint. Point/spot lights have no scalar extent, so
+        // scale mode skips them.
         const auto& L = light_it->second;
+        if (editor_gizmo_.GetMode() == pt::renderer::EditorOverlay::Mode::Scale &&
+            L.type != AnalyticLight::Sphere &&
+            L.type != AnalyticLight::Quad) {
+            if (editor_gizmo_.IsDragging()) editor_gizmo_.EndDrag();
+            return;
+        }
         origin = glm::vec3{L.pos[0], L.pos[1], L.pos[2]};
         if (L.type == AnalyticLight::Sphere) {
             gizmo_size = std::max(0.5f, L.radius * 1.5f);
@@ -17652,6 +17735,29 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
                                    editor_drag_pre_orient_[2],
                                    editor_drag_pre_orient_[3]);
             pt::console::Console::Get().Execute(cmd);
+        } else if (editor_gizmo_.DragMode() == pt::renderer::EditorOverlay::Mode::Scale) {
+            if (sel_prim) {
+                auto cmd = fmt::format("prim_set_radius {} {}",
+                                       selected_prim_id_,
+                                       editor_drag_pre_scale_a_);
+                pt::console::Console::Get().Execute(cmd);
+            } else if (sel_light) {
+                if (light_it->second.type == AnalyticLight::Sphere) {
+                    auto cmd = fmt::format("light_set_size {} {}",
+                                           selected_prim_id_,
+                                           editor_drag_pre_scale_a_);
+                    pt::console::Console::Get().Execute(cmd);
+                } else if (light_it->second.type == AnalyticLight::Quad) {
+                    auto cmd_u = fmt::format("light_set_uhalf {} {}",
+                                             selected_prim_id_,
+                                             editor_drag_pre_scale_a_);
+                    auto cmd_v = fmt::format("light_set_size {} {}",
+                                             selected_prim_id_,
+                                             editor_drag_pre_scale_b_);
+                    pt::console::Console::Get().Execute(cmd_u);
+                    pt::console::Console::Get().Execute(cmd_v);
+                }
+            }
         } else {
             const glm::vec3 pre = editor_drag_pre_pos_;
             auto cmd = fmt::format("{} {} {} {} {}",
@@ -17679,6 +17785,24 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
                 editor_drag_pre_orient_[1] = pre_orient[1];
                 editor_drag_pre_orient_[2] = pre_orient[2];
                 editor_drag_pre_orient_[3] = pre_orient[3];
+                editor_drag_pre_scale_a_ = 1.0f;
+                editor_drag_pre_scale_b_ = 1.0f;
+                if (editor_gizmo_.GetMode() == pt::renderer::EditorOverlay::Mode::Scale) {
+                    if (sel_prim) {
+                        editor_drag_pre_scale_a_ = prim_it->second.radius_or_d;
+                        editor_drag_pre_scale_b_ = prim_it->second.radius_or_d;
+                    } else if (sel_light) {
+                        if (light_it->second.type == AnalyticLight::Sphere) {
+                            editor_drag_pre_scale_a_ = light_it->second.radius;
+                            editor_drag_pre_scale_b_ = light_it->second.radius;
+                        } else if (light_it->second.type == AnalyticLight::Quad) {
+                            const float* u = light_it->second.u_vec;
+                            const float u_len = std::sqrt(u[0]*u[0] + u[1]*u[1] + u[2]*u[2]);
+                            editor_drag_pre_scale_a_ = std::max(u_len, 1.0e-4f);
+                            editor_drag_pre_scale_b_ = std::max(light_it->second.v_half, 1.0e-4f);
+                        }
+                    }
+                }
                 editor_gizmo_.BeginDrag(hovered, origin,
                                         *camera_, aspect,
                                         accum_w_, accum_h_,
@@ -17733,8 +17857,52 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
                                            selected_prim_id_, nx, ny, nz, nw);
                     pt::console::Console::Get().Execute(cmd);
                 }
+            } else if (editor_gizmo_.DragMode() == pt::renderer::EditorOverlay::Mode::Scale) {
+                const glm::vec3 new_pos =
+                    editor_gizmo_.UpdateDrag(*camera_, aspect,
+                                             accum_w_, accum_h_, mx, my);
+                const glm::vec3 delta = new_pos - editor_drag_pre_pos_;
+                const glm::vec3 ax = [&]() {
+                    switch (editor_gizmo_.DragAxis()) {
+                        case pt::renderer::EditorOverlay::Axis::X: return glm::vec3(1, 0, 0);
+                        case pt::renderer::EditorOverlay::Axis::Y: return glm::vec3(0, 1, 0);
+                        case pt::renderer::EditorOverlay::Axis::Z: return glm::vec3(0, 0, 1);
+                        default: return glm::vec3(1, 0, 0);
+                    }
+                }();
+                const float drag_amount = glm::dot(delta, ax);
+                constexpr float kMinScale = 1.0e-3f;
+                if (std::abs(drag_amount) > 1.0e-4f) {
+                    if (sel_prim) {
+                        const float r = std::max(kMinScale,
+                                                 editor_drag_pre_scale_a_ + drag_amount);
+                        auto cmd = fmt::format("prim_set_radius {} {}",
+                                               selected_prim_id_, r);
+                        pt::console::Console::Get().Execute(cmd);
+                    } else if (sel_light) {
+                        if (light_it->second.type == AnalyticLight::Sphere) {
+                            const float r = std::max(kMinScale,
+                                                     editor_drag_pre_scale_a_ + drag_amount);
+                            auto cmd = fmt::format("light_set_size {} {}",
+                                                   selected_prim_id_, r);
+                            pt::console::Console::Get().Execute(cmd);
+                        } else if (light_it->second.type == AnalyticLight::Quad) {
+                            const float u = std::max(kMinScale,
+                                                     editor_drag_pre_scale_a_ + drag_amount);
+                            const float factor = u / std::max(editor_drag_pre_scale_a_, kMinScale);
+                            const float v = std::max(kMinScale,
+                                                     editor_drag_pre_scale_b_ * factor);
+                            auto cmd_u = fmt::format("light_set_uhalf {} {}",
+                                                     selected_prim_id_, u);
+                            auto cmd_v = fmt::format("light_set_size {} {}",
+                                                     selected_prim_id_, v);
+                            pt::console::Console::Get().Execute(cmd_u);
+                            pt::console::Console::Get().Execute(cmd_v);
+                        }
+                    }
+                }
             } else {
-                // Translate / scale: compute new world pos and dispatch
+                // Translate: compute new world pos and dispatch
                 // {prim,light}_set_pos via Console::Execute so the
                 // engine's accum_dirty / dirty-flag handling + future
                 // undo machinery route uniformly.
