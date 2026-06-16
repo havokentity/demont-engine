@@ -794,116 +794,231 @@ void SoftwareDevice::RunEditorOverlay(SoftwareCommandBuffer& cb) {
     // the camera. Cuts the per-pixel cost from "3 dot products + a few
     // divides per segment" to "linear interp from cached float2s".
     struct ProjSeg {
-        float ax, ay;        // pixel space
-        float bx, by;
-        float r, g, b;       // sRGB-encoded display colour
-        float half_thick;    // pixel half-thickness
+      float ax, ay; // pixel space
+      float bx, by;
+      float cx, cy;     // filled-triangle C vertex
+      float r, g, b;    // sRGB-encoded display colour
+      float half_thick; // pixel half-thickness
+      bool filled;
+    };
+    auto fill_color_from_code = [](float code, float &r, float &g, float &b) {
+      if (code > 9.5f) {
+        r = 1.0f;
+        g = 0.95f;
+        b = 0.10f;
+      } else if (code > 2.5f) {
+        r = 0.20f;
+        g = 0.40f;
+        b = 1.00f;
+      } else if (code > 1.5f) {
+        r = 0.20f;
+        g = 0.85f;
+        b = 0.20f;
+      } else if (code > 0.5f) {
+        r = 0.95f;
+        g = 0.15f;
+        b = 0.18f;
+      } else {
+        r = 0.85f;
+        g = 0.85f;
+        b = 0.85f;
+      }
     };
     std::vector<ProjSeg> proj;
     proj.reserve(n_segs);
     for (std::uint32_t i = 0; i < n_segs; ++i) {
-        const float* s = sf + std::size_t(i) * 12u;
-        const float ax_w = s[0], ay_w = s[1], az_w = s[2];
-        const float half_t = std::max(s[3], 0.5f);
-        const float bx_w = s[4], by_w = s[5], bz_w = s[6];
-        // s[7] reserved (depth bias) -- unused in v1.
-        const float cr   = s[8], cg = s[9], cb_col = s[10];
+      const float *s = sf + std::size_t(i) * 12u;
+      const float ax_w = s[0], ay_w = s[1], az_w = s[2];
+      const float half_t = s[3];
+      const float bx_w = s[4], by_w = s[5], bz_w = s[6];
+      // s[7] reserved (depth bias) -- unused in v1.
+      const float cr = s[8], cg = s[9], cb_col = s[10];
+      const bool filled = half_t < 0.0f;
 
-        // Project A
-        float dxa = ax_w - pos_x, dya = ay_w - pos_y, dza = az_w - pos_z;
-        float z_a = dxa * fwd_x + dya * fwd_y + dza * fwd_z;
-        if (z_a <= 0.001f) continue;
-        float xs_a = (dxa * right_x + dya * right_y + dza * right_z) / z_a;
-        float ys_a = (dxa * up_x    + dya * up_y    + dza * up_z)    / z_a;
-        // Project B
-        float dxb = bx_w - pos_x, dyb = by_w - pos_y, dzb = bz_w - pos_z;
-        float z_b = dxb * fwd_x + dyb * fwd_y + dzb * fwd_z;
-        if (z_b <= 0.001f) continue;
-        float xs_b = (dxb * right_x + dyb * right_y + dzb * right_z) / z_b;
-        float ys_b = (dxb * up_x    + dyb * up_y    + dzb * up_z)    / z_b;
+      // Project A
+      float dxa = ax_w - pos_x, dya = ay_w - pos_y, dza = az_w - pos_z;
+      float z_a = dxa * fwd_x + dya * fwd_y + dza * fwd_z;
+      if (z_a <= 0.001f)
+        continue;
+      float xs_a = (dxa * right_x + dya * right_y + dza * right_z) / z_a;
+      float ys_a = (dxa * up_x + dya * up_y + dza * up_z) / z_a;
+      // Project B
+      float dxb = bx_w - pos_x, dyb = by_w - pos_y, dzb = bz_w - pos_z;
+      float z_b = dxb * fwd_x + dyb * fwd_y + dzb * fwd_z;
+      if (z_b <= 0.001f)
+        continue;
+      float xs_b = (dxb * right_x + dyb * right_y + dzb * right_z) / z_b;
+      float ys_b = (dxb * up_x + dyb * up_y + dzb * up_z) / z_b;
 
-        float u_a = xs_a / (fovYTan * aspect);
-        float v_a = ys_a / fovYTan;
-        float u_b = xs_b / (fovYTan * aspect);
-        float v_b = ys_b / fovYTan;
+      float u_a = xs_a / (fovYTan * aspect);
+      float v_a = ys_a / fovYTan;
+      float u_b = xs_b / (fovYTan * aspect);
+      float v_b = ys_b / fovYTan;
 
-        ProjSeg p;
-        p.ax = (u_a * 0.5f + 0.5f) * float(w);
-        p.ay = (1.0f - (v_a * 0.5f + 0.5f)) * float(h);
-        p.bx = (u_b * 0.5f + 0.5f) * float(w);
-        p.by = (1.0f - (v_b * 0.5f + 0.5f)) * float(h);
+      ProjSeg p;
+      p.ax = (u_a * 0.5f + 0.5f) * float(w);
+      p.ay = (1.0f - (v_a * 0.5f + 0.5f)) * float(h);
+      p.bx = (u_b * 0.5f + 0.5f) * float(w);
+      p.by = (1.0f - (v_b * 0.5f + 0.5f)) * float(h);
+      p.cx = p.ax;
+      p.cy = p.ay;
+      p.filled = filled;
+      if (filled) {
+        const float cx_w = cr, cy_w = cg, cz_w = cb_col;
+        float dxc = cx_w - pos_x, dyc = cy_w - pos_y, dzc = cz_w - pos_z;
+        float z_c = dxc * fwd_x + dyc * fwd_y + dzc * fwd_z;
+        if (z_c <= 0.001f)
+          continue;
+        float xs_c = (dxc * right_x + dyc * right_y + dzc * right_z) / z_c;
+        float ys_c = (dxc * up_x + dyc * up_y + dzc * up_z) / z_c;
+        float u_c = xs_c / (fovYTan * aspect);
+        float v_c = ys_c / fovYTan;
+        p.cx = (u_c * 0.5f + 0.5f) * float(w);
+        p.cy = (1.0f - (v_c * 0.5f + 0.5f)) * float(h);
+        float lr, lg, lb;
+        fill_color_from_code(s[11], lr, lg, lb);
+        p.r = srgb_encode(lr);
+        p.g = srgb_encode(lg);
+        p.b = srgb_encode(lb);
+        p.half_thick = 0.0f;
+      } else {
         p.r = srgb_encode(cr);
         p.g = srgb_encode(cg);
         p.b = srgb_encode(cb_col);
-        p.half_thick = half_t;
-        proj.push_back(p);
+        p.half_thick = std::max(half_t, 0.5f);
+      }
+      proj.push_back(p);
     }
-    if (proj.empty()) return;
+    if (proj.empty())
+      return;
 
     // Compute the bounding box across all projected segments to avoid
     // scanning the entire framebuffer when the gizmo only occupies a
     // small region. Pad by 2 pixels for the anti-alias feather.
     float min_x = float(w), min_y = float(h);
-    float max_x = 0.0f,     max_y = 0.0f;
-    for (const auto& p : proj) {
-        float lo_x = std::min(p.ax, p.bx) - (p.half_thick + 2.0f);
-        float hi_x = std::max(p.ax, p.bx) + (p.half_thick + 2.0f);
-        float lo_y = std::min(p.ay, p.by) - (p.half_thick + 2.0f);
-        float hi_y = std::max(p.ay, p.by) + (p.half_thick + 2.0f);
-        if (lo_x < min_x) min_x = lo_x;
-        if (lo_y < min_y) min_y = lo_y;
-        if (hi_x > max_x) max_x = hi_x;
-        if (hi_y > max_y) max_y = hi_y;
+    float max_x = 0.0f, max_y = 0.0f;
+    for (const auto &p : proj) {
+      const float min_px =
+          p.filled ? std::min({p.ax, p.bx, p.cx}) : std::min(p.ax, p.bx);
+      const float max_px =
+          p.filled ? std::max({p.ax, p.bx, p.cx}) : std::max(p.ax, p.bx);
+      const float min_py =
+          p.filled ? std::min({p.ay, p.by, p.cy}) : std::min(p.ay, p.by);
+      const float max_py =
+          p.filled ? std::max({p.ay, p.by, p.cy}) : std::max(p.ay, p.by);
+      float lo_x = min_px - (p.half_thick + 2.0f);
+      float hi_x = max_px + (p.half_thick + 2.0f);
+      float lo_y = min_py - (p.half_thick + 2.0f);
+      float hi_y = max_py + (p.half_thick + 2.0f);
+      if (lo_x < min_x)
+        min_x = lo_x;
+      if (lo_y < min_y)
+        min_y = lo_y;
+      if (hi_x > max_x)
+        max_x = hi_x;
+      if (hi_y > max_y)
+        max_y = hi_y;
     }
-    const std::int32_t x0 = std::clamp(static_cast<std::int32_t>(std::floor(min_x)), 0,
-                                       static_cast<std::int32_t>(w) - 1);
-    const std::int32_t y0 = std::clamp(static_cast<std::int32_t>(std::floor(min_y)), 0,
-                                       static_cast<std::int32_t>(h) - 1);
-    const std::int32_t x1 = std::clamp(static_cast<std::int32_t>(std::ceil(max_x)), 0,
-                                       static_cast<std::int32_t>(w) - 1);
-    const std::int32_t y1 = std::clamp(static_cast<std::int32_t>(std::ceil(max_y)), 0,
-                                       static_cast<std::int32_t>(h) - 1);
-    if (x1 < x0 || y1 < y0) return;
+    const std::int32_t x0 =
+        std::clamp(static_cast<std::int32_t>(std::floor(min_x)), 0,
+                   static_cast<std::int32_t>(w) - 1);
+    const std::int32_t y0 =
+        std::clamp(static_cast<std::int32_t>(std::floor(min_y)), 0,
+                   static_cast<std::int32_t>(h) - 1);
+    const std::int32_t x1 =
+        std::clamp(static_cast<std::int32_t>(std::ceil(max_x)), 0,
+                   static_cast<std::int32_t>(w) - 1);
+    const std::int32_t y1 =
+        std::clamp(static_cast<std::int32_t>(std::ceil(max_y)), 0,
+                   static_cast<std::int32_t>(h) - 1);
+    if (x1 < x0 || y1 < y0)
+      return;
 
     for (std::int32_t py = y0; py <= y1; ++py) {
-        float fy = float(py) + 0.5f;
-        for (std::int32_t px = x0; px <= x1; ++px) {
-            float fx = float(px) + 0.5f;
-            float pix_r = out_tex->data[(std::size_t(py) * w + px) * 4 + 0];
-            float pix_g = out_tex->data[(std::size_t(py) * w + px) * 4 + 1];
-            float pix_b = out_tex->data[(std::size_t(py) * w + px) * 4 + 2];
-            bool changed = false;
-            for (const auto& s : proj) {
-                float vx = s.bx - s.ax;
-                float vy = s.by - s.ay;
-                float wx = fx - s.ax;
-                float wy = fy - s.ay;
-                float len2 = vx * vx + vy * vy;
-                float d;
-                if (len2 < 1e-6f) {
-                    float dx = fx - s.ax, dy = fy - s.ay;
-                    d = std::sqrt(dx * dx + dy * dy);
-                } else {
-                    float t = std::clamp((wx * vx + wy * vy) / len2, 0.0f, 1.0f);
-                    float qx = s.ax + t * vx;
-                    float qy = s.ay + t * vy;
-                    float dx = fx - qx, dy = fy - qy;
-                    d = std::sqrt(dx * dx + dy * dy);
-                }
-                if (d > s.half_thick + 1.0f) continue;
-                float aa = std::clamp((s.half_thick + 1.0f) - d, 0.0f, 1.0f);
-                if (aa <= 0.0f) continue;
-                pix_r = pix_r * (1.0f - aa) + s.r * aa;
-                pix_g = pix_g * (1.0f - aa) + s.g * aa;
-                pix_b = pix_b * (1.0f - aa) + s.b * aa;
-                changed = true;
+      float fy = float(py) + 0.5f;
+      for (std::int32_t px = x0; px <= x1; ++px) {
+        float fx = float(px) + 0.5f;
+        float pix_r = out_tex->data[(std::size_t(py) * w + px) * 4 + 0];
+        float pix_g = out_tex->data[(std::size_t(py) * w + px) * 4 + 1];
+        float pix_b = out_tex->data[(std::size_t(py) * w + px) * 4 + 2];
+        bool changed = false;
+        for (const auto &s : proj) {
+          auto seg_dist_px = [](float px_, float py_, float x0_, float y0_,
+                                float x1_, float y1_) {
+            float vx_ = x1_ - x0_;
+            float vy_ = y1_ - y0_;
+            float wx_ = px_ - x0_;
+            float wy_ = py_ - y0_;
+            float len2_ = vx_ * vx_ + vy_ * vy_;
+            if (len2_ < 1e-6f) {
+              float dx_ = px_ - x0_, dy_ = py_ - y0_;
+              return std::sqrt(dx_ * dx_ + dy_ * dy_);
             }
-            if (changed) {
-                out_tex->data[(std::size_t(py) * w + px) * 4 + 0] = pix_r;
-                out_tex->data[(std::size_t(py) * w + px) * 4 + 1] = pix_g;
-                out_tex->data[(std::size_t(py) * w + px) * 4 + 2] = pix_b;
-            }
+            float t_ = std::clamp((wx_ * vx_ + wy_ * vy_) / len2_, 0.0f, 1.0f);
+            float qx_ = x0_ + t_ * vx_;
+            float qy_ = y0_ + t_ * vy_;
+            float dx_ = px_ - qx_, dy_ = py_ - qy_;
+            return std::sqrt(dx_ * dx_ + dy_ * dy_);
+          };
+          if (s.filled) {
+            auto edge = [](float ax_, float ay_, float bx_, float by_,
+                           float px_, float py_) {
+              float ex_ = bx_ - ax_;
+              float ey_ = by_ - ay_;
+              float wx_ = px_ - ax_;
+              float wy_ = py_ - ay_;
+              return ex_ * wy_ - ey_ * wx_;
+            };
+            const float e0 = edge(s.ax, s.ay, s.bx, s.by, fx, fy);
+            const float e1 = edge(s.bx, s.by, s.cx, s.cy, fx, fy);
+            const float e2 = edge(s.cx, s.cy, s.ax, s.ay, fx, fy);
+            const bool has_neg = (e0 < 0.0f) || (e1 < 0.0f) || (e2 < 0.0f);
+            const bool has_pos = (e0 > 0.0f) || (e1 > 0.0f) || (e2 > 0.0f);
+            if (has_neg && has_pos)
+              continue;
+            const float d0 = seg_dist_px(fx, fy, s.ax, s.ay, s.bx, s.by);
+            const float d1 = seg_dist_px(fx, fy, s.bx, s.by, s.cx, s.cy);
+            const float d2 = seg_dist_px(fx, fy, s.cx, s.cy, s.ax, s.ay);
+            const float edge_d = std::min(d0, std::min(d1, d2));
+            const float aa = 0.42f * std::clamp(edge_d + 0.5f, 0.0f, 1.0f);
+            pix_r = pix_r * (1.0f - aa) + s.r * aa;
+            pix_g = pix_g * (1.0f - aa) + s.g * aa;
+            pix_b = pix_b * (1.0f - aa) + s.b * aa;
+            changed = true;
+            continue;
+          }
+          float vx = s.bx - s.ax;
+          float vy = s.by - s.ay;
+          float wx = fx - s.ax;
+          float wy = fy - s.ay;
+          float len2 = vx * vx + vy * vy;
+          float d;
+          if (len2 < 1e-6f) {
+            float dx = fx - s.ax, dy = fy - s.ay;
+            d = std::sqrt(dx * dx + dy * dy);
+          } else {
+            float t = std::clamp((wx * vx + wy * vy) / len2, 0.0f, 1.0f);
+            float qx = s.ax + t * vx;
+            float qy = s.ay + t * vy;
+            float dx = fx - qx, dy = fy - qy;
+            d = std::sqrt(dx * dx + dy * dy);
+          }
+          if (d > s.half_thick + 1.0f)
+            continue;
+          float aa = std::clamp((s.half_thick + 1.0f) - d, 0.0f, 1.0f);
+          if (aa <= 0.0f)
+            continue;
+          pix_r = pix_r * (1.0f - aa) + s.r * aa;
+          pix_g = pix_g * (1.0f - aa) + s.g * aa;
+          pix_b = pix_b * (1.0f - aa) + s.b * aa;
+          changed = true;
         }
+        if (changed) {
+          out_tex->data[(std::size_t(py) * w + px) * 4 + 0] = pix_r;
+          out_tex->data[(std::size_t(py) * w + px) * 4 + 1] = pix_g;
+          out_tex->data[(std::size_t(py) * w + px) * 4 + 2] = pix_b;
+        }
+      }
     }
 }
 

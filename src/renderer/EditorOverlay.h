@@ -47,8 +47,13 @@ public:
     // Per-axis IDs returned by HitTest / passed into BeginDrag. Z is
     // the path-tracer's world-Z which is "into the screen" in the
     // default camera orientation, but the gizmo arrows are world-axis-
-    // aligned regardless of camera, so the labels stay X/Y/Z.
-    enum class Axis : std::uint8_t { None = 0, X = 1, Y = 2, Z = 3 };
+    // aligned regardless of camera, so the labels stay X/Y/Z. XY/YZ/ZX
+    // are translate-mode plane handles that move along two axes at once.
+    enum class Axis : std::uint8_t {
+        None = 0,
+        X = 1, Y = 2, Z = 3,
+        XY = 4, YZ = 5, ZX = 6
+    };
 
     EditorOverlay();
 
@@ -103,8 +108,9 @@ public:
     // AppendGizmo.
     //
     // The hit-test geometry follows the current mode_:
-    //   Translate / Scale -- tests the three axis arms (lines from
-    //     origin to origin + axis * size).
+    //   Translate        -- tests the three plane handles first, then
+    //     the three axis arms (lines from origin to origin + axis * size).
+    //   Scale            -- tests the three axis arms.
     //   Rotate            -- tests the three rings (one per axis
     //     plane); the picked axis is the ring's normal.
     Axis HitTest(const glm::vec3& origin, float size,
@@ -161,9 +167,13 @@ private:
     void EmitAxisSegment(const glm::vec3& a, const glm::vec3& b,
                          Axis axis, Axis hovered_or_dragged,
                          float thickness = 1.5f);
+    void EmitFilledTriangle(const glm::vec3& a, const glm::vec3& b,
+                            const glm::vec3& c,
+                            Axis axis, Axis hovered_or_dragged);
     // Per-axis colours: X = red, Y = green, Z = blue. Yellow when
     // hovered / dragged (Blender convention).
     glm::vec3 ColorFor(Axis a, Axis hovered_or_dragged) const;
+    float FillColorCodeFor(Axis a, Axis hovered_or_dragged) const;
 
     std::vector<Segment> segs_;
     Mode  mode_ = Mode::Translate;

@@ -17,7 +17,8 @@
 //     (degenerate fallback); a ray that crosses the line gives the
 //     correct closest point.
 //   * EditorOverlay::HitTest: clicking near the X arm picks Axis::X;
-//     clicking off-gizmo returns Axis::None.
+//     clicking inside a translate plane handle picks that plane; clicking
+//     off-gizmo returns Axis::None.
 //   * EditorOverlay::BeginDrag + UpdateDrag: dragging the X arm along
 //     a known mouse-delta moves the gizmo origin along the X axis only
 //     (Y and Z stay pinned).
@@ -126,7 +127,9 @@ TEST_CASE("EditorOverlay::HitTest detects axis under mouse") {
                             cam, kAspect, kFbW, kFbH, tip));
     glm::vec2 base;
     REQUIRE(ProjectToScreen(origin, cam, kAspect, kFbW, kFbH, base));
-    // Click halfway down the arm.
+    // Click halfway down the arm. (The translate plane handles lie in
+    // planes that this dead-on camera views edge-on, so they project to
+    // degenerate slivers and must NOT hijack the axis pick here.)
     const glm::vec2 mid = (base + tip) * 0.5f;
     auto axis = eo.HitTest(origin, L, cam, kAspect, kFbW, kFbH,
                            mid.x, mid.y, 10.0f);
@@ -136,6 +139,33 @@ TEST_CASE("EditorOverlay::HitTest detects axis under mouse") {
     auto miss = eo.HitTest(origin, L, cam, kAspect, kFbW, kFbH,
                            10.0, 10.0, 10.0f);
     CHECK(miss == EditorOverlay::Axis::None);
+}
+
+TEST_CASE("Translate-mode plane handle picks two-axis plane and drags within it") {
+    Camera cam = MakeCamera({0.0f, 0.0f, 3.0f});
+    const glm::vec3 origin{0.0f, 0.0f, 0.0f};
+    const float L = 1.0f;
+    EditorOverlay eo;
+    eo.SetMode(EditorOverlay::Mode::Translate);
+
+    // XY plane handle spans 0.18L..0.38L along +X/+Y.
+    const glm::vec3 handle_center = origin + glm::vec3(0.28f, 0.28f, 0.0f);
+    glm::vec2 px;
+    REQUIRE(ProjectToScreen(handle_center, cam, kAspect, kFbW, kFbH, px));
+
+    auto axis = eo.HitTest(origin, L, cam, kAspect, kFbW, kFbH,
+                           px.x, px.y, 10.0f);
+    REQUIRE(axis == EditorOverlay::Axis::XY);
+
+    eo.BeginDrag(axis, origin, cam, kAspect, kFbW, kFbH, px.x, px.y);
+    REQUIRE(eo.IsDragging());
+    REQUIRE(eo.DragAxis() == EditorOverlay::Axis::XY);
+
+    glm::vec3 moved = eo.UpdateDrag(cam, kAspect, kFbW, kFbH,
+                                    px.x + 80.0f, px.y - 60.0f);
+    CHECK(moved.z == doctest::Approx(0.0f).epsilon(kEps));
+    CHECK(std::abs(moved.x) > kEps);
+    CHECK(std::abs(moved.y) > kEps);
 }
 
 TEST_CASE("EditorOverlay drag moves origin along the chosen axis only") {
