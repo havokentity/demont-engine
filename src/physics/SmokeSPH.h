@@ -105,14 +105,14 @@ public:
         // XSPH velocity-smoothing blend (DIMENSIONLESS -- not a
         // physical viscosity since the Wave-9 XSPH rewrite). The
         // integrator maps it to a per-substep convex blend toward the
-        // neighbourhood-mean velocity: eps = clamp(viscosity * 4,
+        // neighbourhood-mean velocity: eps = clamp(xsph_blend * 4,
         // 0, 0.5), so 0 = free particles, 0.05 (default) = ~0.2 blend
         // per 1/120 s substep, and everything >= 0.125 saturates the
         // 0.5 cap. Do NOT plug in a physical mu (air's 1.8e-5 kg/m/s
-        // yields eps ~ 7e-5, i.e. no smoothing at all); the field --
-        // and the r_smoke_viscosity cvar that feeds it -- keeps the
-        // historical name only until the lockstep rename lands.
-        float viscosity = 0.05f;
+        // yields eps ~ 7e-5, i.e. no smoothing at all). Fed by the
+        // r_smoke_xsph_blend cvar (renamed with this field from
+        // "viscosity" in lockstep).
+        float xsph_blend = 0.05f;
 
         // Gravity (m/s^2). Earth: -9.81 along -Y.
         glm::vec3 gravity {0.0f, -9.81f, 0.0f};

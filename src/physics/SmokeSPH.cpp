@@ -551,21 +551,21 @@ void SmokeSPH::Substep(float sdt) {
         // Because that's a convex blend toward the local mean, the
         // correction magnitude is bounded by the velocity spread itself
         // and can never overshoot regardless of eps in [0,1] -- so the
-        // r_smoke_viscosity knob can now be raised for a coherent
+        // r_smoke_xsph_blend knob can now be raised for a coherent
         // gloopy column without the solver exploding. eps is mapped from
         // the viscosity cvar in the integrate step.
         glm::vec3 xsph_dv(0.0f);
         float     xsph_wsum = 0.0f;
         const float mass_i = (!emitters_.empty()) ? emitters_[0].particle_mass : 0.001f;
         // The XSPH correction is only ever consumed when the integrate
-        // step's eps > 0, which happens iff cfg_.viscosity > 0 (eps =
+        // step's eps > 0, which happens iff cfg_.xsph_blend > 0 (eps =
         // clamp(viscosity*4, 0, 0.5)). When viscosity is disabled the
         // poly6 evaluation + accumulation below is dead work, so gate it
         // off and skip the extra kernel_poly6 per neighbour. Behaviour is
         // identical for viscosity > 0; for viscosity == 0 xsph_corr_[i]
         // is forced to zero (it would have been blended by eps == 0
         // anyway, so this is purely a perf gate, not a behaviour change).
-        const bool accumulate_xsph = (cfg_.viscosity > 0.0f);
+        const bool accumulate_xsph = (cfg_.xsph_blend > 0.0f);
         for (std::size_t j : scratch) {
             if (j == i) continue;
             const auto d   = particles_[i].pos - particles_[j].pos;
@@ -699,7 +699,7 @@ void SmokeSPH::Substep(float sdt) {
     // would erase all relative motion / structure). eps == 0 when
     // viscosity == 0 -> free particles, exactly the legacy no-viscosity
     // behaviour.
-    const float xsph_eps = std::min(std::max(cfg_.viscosity * 4.0f, 0.0f), 0.5f);
+    const float xsph_eps = std::min(std::max(cfg_.xsph_blend * 4.0f, 0.0f), 0.5f);
     for (std::size_t i = 0; i < particles_.size(); ++i) {
         if (!alive_[i]) continue;
         const float mass_i = (!emitters_.empty()) ? emitters_[0].particle_mass : 0.001f;

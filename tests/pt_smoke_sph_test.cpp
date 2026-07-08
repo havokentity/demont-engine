@@ -183,7 +183,7 @@ TEST_CASE("SmokeSPH wind drives a still particle toward wind speed") {
     auto& cfg = s.MutableConfig();
     cfg.gravity        = glm::vec3(0.0f);  // disable gravity
     cfg.buoyancy_scale = 0.0f;
-    cfg.viscosity      = 0.0f;
+    cfg.xsph_blend      = 0.0f;
     cfg.wind           = glm::vec3(3.0f, 0.0f, 0.0f);   // 3 m/s along +X
     cfg.air_drag       = 5.0f;                          // strong drag for quick settle
     cfg.curl_strength  = 0.0f;     // wave-9: isolate wind drag
@@ -208,7 +208,7 @@ TEST_CASE("SmokeSPH::QueueShockwave applies a radial impulse") {
     cfg.gravity        = glm::vec3(0.0f);
     cfg.buoyancy_scale = 0.0f;
     cfg.air_drag       = 0.0f;
-    cfg.viscosity      = 0.0f;
+    cfg.xsph_blend      = 0.0f;
     cfg.wind           = glm::vec3(0.0f);
     cfg.curl_strength  = 0.0f;     // wave-9: isolate shockwave impulse
     SmokeSPH::Particle p;
@@ -263,7 +263,7 @@ TEST_CASE("SmokeSPH curl-noise perturbs particle motion (deterministically)") {
         cfg.gravity        = glm::vec3(0.0f);
         cfg.buoyancy_scale = 0.0f;
         cfg.air_drag       = 0.0f;
-        cfg.viscosity      = 0.0f;
+        cfg.xsph_blend      = 0.0f;
         cfg.wind           = glm::vec3(0.0f);
         cfg.curl_strength  = curl;
         SmokeSPH::Particle p;
@@ -299,7 +299,7 @@ TEST_CASE("SmokeSPH high-viscosity XSPH stays stable (no explosion)") {
     SmokeSPH s;
     s.SetMaxParticles(512);
     auto& cfg = s.MutableConfig();
-    cfg.viscosity         = 1.0f;     // very high -- would explode pre-fix
+    cfg.xsph_blend         = 1.0f;     // very high -- would explode pre-fix
     cfg.pressure_stiffness = 1.0f;
     cfg.curl_strength     = 0.0f;     // isolate viscosity stability
     std::vector<SmokeSPH::EmitterParams> ems;

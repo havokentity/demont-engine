@@ -401,12 +401,27 @@ nlohmann::json SceneToJson(const SceneData& scene) {
         }
         // Texture tiles only emitted when set (kNoTexTile == 0xFFFFFFFF).
         // Absent => "no texture", which is the load-time default, so a
-        // texture-free prim round-trips to the same bytes.
+        // texture-free prim round-trips to the same bytes. The raw
+        // indices are SESSION-LOCAL hints only -- the durable record is
+        // the *_tex_path strings below, which the loader re-resolves
+        // through the texture loader and uses to rewrite the indices.
         constexpr std::uint32_t kNoTex = 0xFFFFFFFFu;
         if (p.albedo_tex    != kNoTex) j["albedo_tex"]    = p.albedo_tex;
         if (p.normal_tex    != kNoTex) j["normal_tex"]    = p.normal_tex;
         if (p.roughness_tex != kNoTex) j["roughness_tex"] = p.roughness_tex;
         if (p.metallic_tex  != kNoTex) j["metallic_tex"]  = p.metallic_tex;
+        if (auto pit = scene.prim_tex_paths.find(id);
+            pit != scene.prim_tex_paths.end()) {
+            static constexpr const char* kPathKeys[4] = {
+                "albedo_tex_path", "normal_tex_path",
+                "roughness_tex_path", "metallic_tex_path",
+            };
+            for (int ch = 0; ch < 4; ++ch) {
+                if (!pit->second[ch].empty()) {
+                    j[kPathKeys[ch]] = pit->second[ch];
+                }
+            }
+        }
         prims.push_back(std::move(j));
     }
     out["primitives"] = std::move(prims);
@@ -540,7 +555,19 @@ bool SceneFromJson(const nlohmann::json& doc, SceneData& out, std::string& err) 
             p.normal_tex    = ReadU32(j, "normal_tex",    0xFFFFFFFFu);
             p.roughness_tex = ReadU32(j, "roughness_tex", 0xFFFFFFFFu);
             p.metallic_tex  = ReadU32(j, "metallic_tex",  0xFFFFFFFFu);
-            out.prims[ReadId(j, auto_id)] = p;
+            const std::uint32_t prim_id = ReadId(j, auto_id);
+            // Durable texture record: paths, re-resolved by the engine
+            // at load time (the raw indices above are session-local).
+            std::array<std::string, 4> tex_paths{
+                ReadStr(j, "albedo_tex_path",    ""),
+                ReadStr(j, "normal_tex_path",    ""),
+                ReadStr(j, "roughness_tex_path", ""),
+                ReadStr(j, "metallic_tex_path",  ""),
+            };
+            const bool any_path = !tex_paths[0].empty() || !tex_paths[1].empty() ||
+                                  !tex_paths[2].empty() || !tex_paths[3].empty();
+            if (any_path) out.prim_tex_paths[prim_id] = std::move(tex_paths);
+            out.prims[prim_id] = p;
             ++auto_id;
         }
     }

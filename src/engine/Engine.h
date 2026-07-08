@@ -532,8 +532,14 @@ private:
                            const std::string& url,
                            std::string* out_diag);
     // Internal: kill a previously-spawned panel PID. Tolerates a
-    // missing/exited PID without throwing.
+    // missing/exited PID without throwing (probes liveness first so a
+    // recycled PID is never signalled).
     void KillPanelPid(int pid);
+    // Internal: true iff the panel PID still names a live process.
+    // Spawned browsers are reparented to init/launchd, so the engine
+    // can't reap them -- this probe is how stale open_panels_pids_
+    // entries get detected and swept.
+    bool IsPanelPidAlive(int pid);
     // Re-read r_editor_panels_autoopen and open every listed panel.
     // Called once at the tail of Init() (after the WebSocket server
     // is up and command registration is done). No-op if the cvar is
@@ -782,12 +788,24 @@ private:
     // StepPhysics returns immediately and the engine behaves exactly
     // like a no-physics build.
     std::unique_ptr<pt::physics::PhysicsSystem> physics_;
-    // Auto-incrementing id used by `phys_drop` when allocating a new
-    // analytic-prim slot for a spawned sphere. Starts well above the
-    // user-facing prim_sphere id range (which is human-typed and
-    // typically single digits) to keep the namespaces visually
-    // distinct.
+    // Auto-incrementing id used by the phys_drop* commands when
+    // allocating a new analytic-prim slot for a spawned body. Starts
+    // well above the user-facing prim_sphere id range (which is
+    // human-typed and typically single digits) to keep the namespaces
+    // visually distinct.
     std::uint32_t                               physics_next_prim_id_ = 100000u;
+    // Claim the next free physics prim id, probing past any id the
+    // user already authored (`prim_sphere 100000 ...` is legal), so a
+    // phys_drop* spawn NEVER overwrites a user primitive. All three
+    // spawn commands (phys_drop / phys_drop_sphere / phys_drop_box)
+    // must allocate through here.
+    std::uint32_t AllocPhysicsPrimId() {
+        std::uint32_t id = physics_next_prim_id_++;
+        while (primitives_.find(id) != primitives_.end()) {
+            id = physics_next_prim_id_++;
+        }
+        return id;
+    }
     // --- end Physics Phase 1 ----------------------------------------------
     pt::jobs::JobSystem::Handle                 bake_handle_{};
     std::atomic<int>                            bake_phase_{0};   // 0 idle, 1 baking, 2 ready
@@ -878,6 +896,12 @@ private:
     struct SceneSnapshot {
         std::map<std::uint32_t, AnalyticPrim>          prims;
         std::map<std::uint32_t, AnalyticLight>         lights;
+        // SDF clusters ride along so scene_load -> scene_undo restores
+        // the WHOLE pre-load scene (the sdf map used to be skipped,
+        // leaving the loaded file's clusters behind -- a mixed scene
+        // neither file described). Cheap: the map is small and already
+        // value-copied for scene_save.
+        std::map<std::uint32_t, pt::renderer::SdfPrim> sdf;
         SelectionKind                                  sel_kind = SelectionKind::None;
         std::uint32_t                                  sel_id   = 0;
     };
@@ -928,6 +952,12 @@ private:
     // reservoir #78, slot 13 by light tree #129).
     std::vector<SmokeEmitter>                   smoke_emitters_;
     std::uint64_t                               smoke_buffer_id_         = 0;
+    // GPU emitter buffer is stale vs smoke_emitters_. Set by the
+    // smoke_emit / smoke_clear commands + buffer (re)creation;
+    // EnsureSmokeEmittersUploaded clears it. Prevents a per-frame
+    // WriteBuffer (a synchronous queue-draining upload on Vulkan,
+    // issue #57) for records that only change on explicit mutation.
+    bool                                        smoke_emitters_gpu_dirty_ = true;
     std::uint32_t                               smoke_buffer_capacity_   = 0;
     std::uint32_t                               smoke_count_uploaded_    = 0;
     std::uint32_t                               smoke_next_id_           = 1;
@@ -1675,6 +1705,12 @@ private:
     // "pipelines ready" message on exit -- avoids a per-frame log
     // spam during the 1-3s build window.
     bool                                        loading_frame_active_  = false;
+    // True while Run() is executing with a smoke-frame budget
+    // (pt_smoke_frames > 0). Tick reads it to freeze dt-integrating
+    // subsystems during un-counted loading frames so golden captures
+    // see a deterministic sim state at frame 0 (the dt pin alone
+    // doesn't cover a load-dependent NUMBER of pre-capture steps).
+    bool                                        smoke_fixed_dt_active_ = false;
     // Set true while Init() is sourcing demont.cfg / autoexec.cfg /
     // command-line cvar overrides. Astronomy-only cvar on_change
     // handlers consult this so they don't fire false-positive

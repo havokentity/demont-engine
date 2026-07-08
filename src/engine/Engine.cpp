@@ -1673,13 +1673,15 @@ namespace cvar {
             "Particles spawn at this temperature and cool exponentially "
             "toward ambient (293 K). 600 K = typical chimney smoke; "
             "1000+ K = hot fire plume.", CVAR_ARCHIVE);
-    PT_CVAR(r_smoke_viscosity,           "0.05",
-            "SPH viscosity coefficient (mu) for the smoke solver "
-            "(#22). Real air mu ~= 1.8e-5; we run several orders "
-            "higher because the integrator can't resolve real-air "
-            "Reynolds numbers and we WANT visible smoothing. 0 = no "
-            "viscosity (chaotic free particles); 0.05 reads as "
-            "coherent smoke. > 0.2 gets gloopy.", CVAR_ARCHIVE);
+    PT_CVAR(r_smoke_xsph_blend,          "0.05",
+            "XSPH velocity-smoothing blend for the smoke solver (#22). "
+            "DIMENSIONLESS -- not a physical viscosity: the integrator "
+            "maps it to a per-substep convex blend toward the local "
+            "mean velocity, eps = clamp(value * 4, 0, 0.5). 0 = free "
+            "chaotic particles; 0.05 reads as coherent smoke; values "
+            ">= 0.125 saturate the 0.5 cap (no further effect). "
+            "Renamed from r_smoke_viscosity, whose kg/(m*s) framing "
+            "was wrong post-XSPH-rewrite.", CVAR_ARCHIVE);
     PT_CVAR(r_smoke_wind_x,              "0.0",
             "Global horizontal wind velocity (m/s) along +X applied "
             "to SPH particles (#22). Drives the plume sideways; the "
@@ -1731,7 +1733,7 @@ namespace cvar {
             "a thin 30 m-wide haze; 1.5 keeps it a coherent ~10 m "
             "column. Lower (0.5) reads as a tight dense chimney; higher "
             "(>5) as a billowing diffuse cloud. Pairs with the bounded "
-            "XSPH viscosity for column coherence.", CVAR_ARCHIVE);
+            "r_smoke_xsph_blend smoothing for column coherence.", CVAR_ARCHIVE);
     // --- end Wave 9 sph-3b ----------------------------------------------------
     // --- end Fluid Phase 3 ----------------------------------------------------
     // --- end Fluid Phase 1 -----------------------------------------------------
@@ -2116,13 +2118,11 @@ bool Engine::Init() {
     // (`csg_box`, `csg_sphere`, `csg_cylinder`, `csg_op`, `csg_reset`,
     // `csg_remove`, `csg_dump`) are out of scope here -- `csg_scene_`
     // is not constructed and `SeedDefaultPrimitives()` has not run yet
-    // (see the section below where both happen). And worse than silent:
-    // several of the csg_* handlers dereference `csg_scene_` directly
-    // before checking it, so a fixture that calls them at this point
-    // would *crash* the engine, not no-op. The strict failure path
-    // below catches that as a fixture parse/exec failure.
-    // TODO(#45-followup): add a second exec pass after
-    // SeedDefaultPrimitives() so CSG-touching fixtures work properly.
+    // (see the section below where both happen). Every csg_* handler
+    // null-guards csg_scene_ and prints a "not initialised yet" error,
+    // and CSG-touching fixtures use `pt_smoke_late_exec`, which runs
+    // after SeedDefaultPrimitives() -- that IS the second exec pass the
+    // original #45 follow-up asked for.
     //
     // Strict failure mode (unlike demont.cfg / autoexec.cfg above):
     // a smoke-exec fixture that can't be read or that produces a
@@ -2589,10 +2589,22 @@ int OpenUrlInBrowser(const std::string& url) {
         }
 #if defined(__APPLE__)
         ::execl("/usr/bin/open", "open", url.c_str(), (char*)nullptr);
-#else
-        ::execlp("xdg-open", "xdg-open", url.c_str(), (char*)nullptr);
-#endif
         std::_Exit(127);  // exec failed
+#else
+        // xdg-open on desktop-less setups can fall back to exec'ing
+        // $BROWSER SYNCHRONOUSLY and only exit when the browser does.
+        // macOS `open` returns in milliseconds so the parent can wait
+        // for its real exit status; here we double-fork instead so a
+        // long-lived launcher can never block the engine thread, and
+        // the grandchild is reparented to init (no zombie).
+        ::setsid();
+        const pid_t grandchild = ::fork();
+        if (grandchild == 0) {
+            ::execlp("xdg-open", "xdg-open", url.c_str(), (char*)nullptr);
+            std::_Exit(127);
+        }
+        std::_Exit(grandchild > 0 ? 0 : 126);
+#endif
     }
     int status = 0;
     if (::waitpid(pid, &status, 0) != pid) return -1;
@@ -5977,8 +5989,12 @@ void Engine::RenderFrame() {
     EnsureLightsUploaded();
     // --- end Light primitives ----------------------------------------------
     // --- Fluid Phase 1 (#136) -- smoke emitters ----------------------------
-    // Re-upload every frame so parametric drift (base + velocity * t)
-    // doesn't need a dirty flag. Cheap: 16 emitters * 48 B = 768 B.
+    // Uploads only when the emitter set actually changed (dirty flag
+    // set by smoke_emit / smoke_clear). Parametric drift is computed
+    // IN-SHADER from smoke_params time, so the records themselves are
+    // static between mutations -- and on Vulkan every WriteBuffer is a
+    // synchronous queue-draining upload (issue #57), so per-frame
+    // rewrites were pure waste.
     EnsureSmokeEmittersUploaded();
     // --- end Fluid Phase 1 -------------------------------------------------
     // --- Fluid Phase 3 (#22) -- SPH particle upload ------------------------
@@ -6084,6 +6100,28 @@ void Engine::RenderFrame() {
             LOG_INFO("engine: r_denoiser=optix_temporal_hdr_aov -- NVIDIA OptiX denoiser "
                      "(TEMPORAL_AOV model: motion + history + albedo + normal guides) "
                      "via CUDA-Vulkan interop active");
+        }
+        if (want_denoiser && device_) {
+            // Kind SWITCH with the denoiser still on: free the
+            // guidance G-buffers the NEW kind doesn't consume. The
+            // realloc block below only fires for textures a wanted
+            // flag says are missing, so without this the specular
+            // trio from a MetalFX-family kind stayed allocated (and
+            // the write gates -- keyed on texture-id != 0 -- kept the
+            // path tracer writing G-buffers nothing reads) until the
+            // denoiser was toggled fully off.
+            const bool new_kind_wants_specular =
+                (want_kind == DenoiserKind::MetalFX          ||
+                 want_kind == DenoiserKind::SvgfBasicMetalFx ||
+                 want_kind == DenoiserKind::SvgfAtrousMetalFx);
+            if (!new_kind_wants_specular) {
+                if (specular_albedo_tex_id_       != 0) device_->DestroyTexture(pt::rhi::TextureHandle{specular_albedo_tex_id_});
+                if (roughness_tex_id_             != 0) device_->DestroyTexture(pt::rhi::TextureHandle{roughness_tex_id_});
+                if (specular_hit_distance_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{specular_hit_distance_tex_id_});
+                specular_albedo_tex_id_       = 0;
+                roughness_tex_id_             = 0;
+                specular_hit_distance_tex_id_ = 0;
+            }
         }
         if (!want_denoiser && device_) {
             if (denoise_color_tex_id_    != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
@@ -6202,6 +6240,20 @@ void Engine::RenderFrame() {
         accum_texture_id_ = h.id;
         if (accum_texture_id_ == 0) {
             LOG_ERROR("CreateTexture(RGBA32F {}x{}) failed", fc.width, fc.height);
+            // BeginFrame already ran (Vulkan: the swapchain image is
+            // acquired and the acquire semaphore has a pending
+            // signal), so a bare return would leave the frame
+            // unbalanced -- the next BeginFrame re-acquires with the
+            // same semaphore and the swapchain wedges. Mirror the
+            // loading-frame shape: clear + submit + EndFrame, THEN
+            // bail.
+            auto* cb = device_->AcquireCommandBuffer();
+            if (cb) {
+                constexpr float kFailRgba[4] = { 0.10f, 0.02f, 0.02f, 1.0f };
+                cb->ClearStorageTexture(fc.swapchain_image, kFailRgba);
+                device_->Submit(cb);
+            }
+            device_->EndFrame(cb);
             return;
         }
         accum_w_ = static_cast<int>(fc.width);
@@ -9149,6 +9201,25 @@ void Engine::RenderFrame() {
                   + 16 /* Wave 9 tonemap (#27 follow-up): tonemap_params */
                   + 16 /* Wave 10 bloom/bokeh: dof_bokeh_params */
                   + 16 /* Sun disc brightness (r_sun_disc_brightness): sun_extra2 */);
+    // Raw-byte offsets the SOFTWARE tracer mirrors (SoftwareTracer.cpp:
+    // kSunAndModeOffset / kAccumParamsOffset / kTonemapParamsOffset).
+    // The CPU backend decodes these fields straight out of the pushed
+    // byte blob; a mid-struct insert once moved accum_params 720 -> 784
+    // and the tracer silently read hdri_lights_col[6] as the EMA factor
+    // (and sun_extra2's landing after tonemap_params turned every
+    // non-ACES tonemap op into ACES on the software backend). These
+    // asserts turn the next field insert into a build error on all
+    // platforms -- update BOTH sides together.
+    static_assert(offsetof(PtPush, sun_and_mode) == 240,
+                  "PtPush::sun_and_mode moved -- update kSunAndModeOffset "
+                  "in src/rhi_software/SoftwareTracer.cpp in lockstep");
+    static_assert(offsetof(PtPush, accum_params) == 784,
+                  "PtPush::accum_params moved -- update kAccumParamsOffset "
+                  "in src/rhi_software/SoftwareTracer.cpp in lockstep");
+    static_assert(offsetof(PtPush, tonemap_params) == 1600,
+                  "PtPush::tonemap_params moved -- update "
+                  "kTonemapParamsOffset in src/rhi_software/SoftwareTracer.cpp "
+                  "in lockstep");
     // Vulkan spilled-tail budget guard. The Vulkan backend keeps the first
     // 112 B of PtPush in push constants and uploads the REMAINDER through a
     // per-frame UBO of kFrameUboSize bytes (src/rhi_vulkan/VulkanDevice.h).
@@ -11999,6 +12070,14 @@ void Engine::SetSelection(SelectionKind kind, std::uint32_t id) {
     const bool changed = (kind != selected_kind_) || (id != selected_prim_id_);
     if (!changed) return;
 
+    // Kill any in-flight gizmo drag before retargeting the selection.
+    // A WebSocket `select`, scene_undo, or script select arriving
+    // mid-drag used to leave IsDragging() true, so the next gizmo
+    // frame dispatched prim_set_pos / light_set_* on the NEW id using
+    // the OLD object's drag anchor -- teleporting the newly selected
+    // object to the cursor.
+    if (editor_gizmo_.IsDragging()) editor_gizmo_.EndDrag();
+
     selected_kind_     = kind;
     selected_prim_id_  = id;
     // Outline visibility changes the rendered image even though the
@@ -12039,18 +12118,25 @@ Engine::SceneSnapshot Engine::CaptureSceneSnapshot() const {
     SceneSnapshot s;
     s.prims    = primitives_;
     s.lights   = light_prims_;
+    s.sdf      = sdf_prims_;
     s.sel_kind = selected_kind_;
     s.sel_id   = selected_prim_id_;
     return s;
 }
 
 void Engine::ApplySceneSnapshot(const SceneSnapshot& s) {
+    // A snapshot apply retargets the scene under the cursor -- kill
+    // any in-flight gizmo drag so it can't keep dispatching moves
+    // against whatever ids the restored maps happen to contain.
+    if (editor_gizmo_.IsDragging()) editor_gizmo_.EndDrag();
     primitives_       = s.prims;
     light_prims_      = s.lights;
+    sdf_prims_        = s.sdf;
     selected_kind_    = s.sel_kind;
     selected_prim_id_ = s.sel_id;
     primitives_dirty_  = true;
     light_prims_dirty_ = true;
+    sdf_prims_dirty_   = true;
     accum_dirty_       = true;
     BroadcastSceneDirty();
 }
@@ -12060,6 +12146,15 @@ void Engine::PushSceneSnapshot() {
     // would create circular history. Mirror Console's in_undo_redo_
     // guard pattern.
     if (in_scene_undo_redo_) return;
+    // Coalesce gizmo drags: the per-frame prim_set_pos / light_set_* /
+    // prim_set_radius dispatches during a drag would otherwise push
+    // ~60 snapshots/s and evict the entire 50-entry undo history in
+    // under a second of dragging (scene_undo then rewinds the drag
+    // one sub-millimetre micro-step at a time). The BeginDrag edge
+    // pushes exactly ONE pre-drag snapshot -- before IsDragging()
+    // flips true -- so a post-drag scene_undo jumps cleanly back to
+    // the pre-drag pose.
+    if (editor_gizmo_.IsDragging()) return;
     scene_undo_stack_.push_back(CaptureSceneSnapshot());
     if (scene_undo_stack_.size() > kMaxSceneUndoHistory) {
         scene_undo_stack_.pop_front();
@@ -12103,6 +12198,19 @@ void Engine::ClearSceneUndoHistory() {
     scene_undo_stack_.clear();
     scene_redo_stack_.clear();
 }
+
+namespace {
+
+// Rotate v by an orient quaternion stored xyzw. Mirrors
+// PathTrace.slang's quatRotate so CPU-side picking and gizmo
+// anchoring agree with what the shader renders:
+//   quatRotate(q, v) = v + 2 * cross(q.xyz, cross(q.xyz, v) + q.w * v)
+inline glm::vec3 QuatRotateXyzw(const float q[4], const glm::vec3& v) {
+    const glm::vec3 u{q[0], q[1], q[2]};
+    return v + 2.0f * glm::cross(u, glm::cross(u, v) + q[3] * v);
+}
+
+}  // namespace
 
 void Engine::HandleMouseInput() {
     // Bail if any prerequisite isn't satisfied. We also reset the
@@ -12209,7 +12317,15 @@ void Engine::HandleMouseInput() {
                     const auto& p = it->second;
                     if (p.type == AnalyticPrim::Plane) {
                         if (editor_gizmo_.GetMode() == pt::renderer::EditorOverlay::Mode::Rotate) {
-                            const glm::vec3 n{p.pos_or_n[0], p.pos_or_n[1], p.pos_or_n[2]};
+                            // Foot-of-perpendicular from the ORIENT-
+                            // rotated normal -- the shader intersects
+                            // the rotated plane, and BuildSelectionGizmo
+                            // draws the rings there; hit-testing at the
+                            // unrotated foot left the visible rings
+                            // ungrabbable after the first rotation.
+                            const glm::vec3 n = QuatRotateXyzw(
+                                p.orient,
+                                glm::vec3{p.pos_or_n[0], p.pos_or_n[1], p.pos_or_n[2]});
                             gizmo_origin = n * (-p.radius_or_d);
                             gizmo_size = 1.5f;
                             can_hit_gizmo = true;
@@ -12282,7 +12398,12 @@ void Engine::HandleMouseInput() {
             else continue;
         } else {
             // Plane. n.p + d = 0; ray hits at t = -(n.ro + d) / (n.rd).
-            const glm::vec3 n{p.pos_or_n[0], p.pos_or_n[1], p.pos_or_n[2]};
+            // The shader rotates the plane normal by the orient quat at
+            // intersect time (PathTrace.slang quatRotate) -- do the same
+            // here so clicking the RENDERED rotated plane selects it.
+            const glm::vec3 n = QuatRotateXyzw(
+                p.orient,
+                glm::vec3{p.pos_or_n[0], p.pos_or_n[1], p.pos_or_n[2]});
             const float denom = glm::dot(n, rd);
             if (std::fabs(denom) < 1e-6f) continue;
             const float th = -(glm::dot(n, ro) + p.radius_or_d) / denom;
@@ -12418,10 +12539,23 @@ void Engine::Tick(double dt) {
         audio_system_->Tick(camera_->pos, camera_->Forward());
     }
 
+    // Golden-capture determinism: while the engine is still painting
+    // loading frames (async CSG bake / cold pipeline build in flight)
+    // the frame is NOT counted against the smoke budget -- but the
+    // dt-integrating subsystems used to advance anyway, so the number
+    // of pre-capture 1/60 s steps varied with scheduler load (the bake
+    // takes 1 frame or 3+ under a parallel ctest run), shifting
+    // physics / ocean / SPH / sky state at frame 0 of the capture.
+    // Freeze them during loading frames in smoke mode; interactive
+    // runs are unaffected. This closes the residual nondeterminism
+    // hole left after the dt pin (5d57b29).
+    const bool freeze_sims_for_capture =
+        smoke_fixed_dt_active_ && loading_frame_active_;
+
     // Sky animation: advance r_sky_hour by `rate * dt` real-time
     // seconds. Wraps modulo 24. Marks accumulation dirty so the path
     // tracer drops its history each frame the time is actually moving.
-    {
+    if (!freeze_sims_for_capture) {
         auto& C = pt::console::Console::Get();
         bool animate = false;
         if (auto* v = C.FindCVar("r_sky_animate")) animate = v->GetBool();
@@ -12498,7 +12632,7 @@ void Engine::Tick(double dt) {
     // vector for upload. The MVP integrator is short (~tens of us at
     // the 1024-particle cap) but the overlap is free correctness-wise
     // and a no-op on platforms where the worker would otherwise idle.
-    if (particles_) {
+    if (particles_ && !freeze_sims_for_capture) {
         auto& Cp = pt::console::Console::Get();
         if (auto* mv = Cp.FindCVar("r_particles_max")) {
             int m = mv->GetInt();
@@ -12519,13 +12653,13 @@ void Engine::Tick(double dt) {
     // so the per-frame writeback into `primitives_` lands before
     // EnsurePrimitivesUploaded re-packs the analytic-prim buffer +
     // refits the BVH. No-op when phys_enabled = 0 or no particles exist.
-    StepPhysics(static_cast<float>(dt));
+    if (!freeze_sims_for_capture) StepPhysics(static_cast<float>(dt));
 
     // --- Fluid Phase 3 (#22) -- SPH smoke step ---------------------------
     // Step the SmokeSPH solver BEFORE RenderFrame so the particle
     // buffer reflects the current frame's positions when the path
     // tracer reads them. No-op when r_smoke_mode == procedural.
-    StepSmokeSPH(static_cast<float>(dt));
+    if (!freeze_sims_for_capture) StepSmokeSPH(static_cast<float>(dt));
     // --- end Fluid Phase 3 -----------------------------------------------
 
     // --- Wave 8 ocean (#25) -- FFT ocean step ----------------------------
@@ -12533,7 +12667,7 @@ void Engine::Tick(double dt) {
     // normal textures the path tracer samples reflect the current frame's
     // surface. No-op when r_ocean == 0 (the solver isn't stepped and the
     // textures aren't re-uploaded).
-    StepOcean(static_cast<float>(dt));
+    if (!freeze_sims_for_capture) StepOcean(static_cast<float>(dt));
     // --- end Wave 8 ocean ------------------------------------------------
 
     auto t0 = std::chrono::steady_clock::now();
@@ -12643,11 +12777,13 @@ void Engine::Run() {
     // budget would just be confusing -- the budget is a launch
     // parameter, not a runtime knob.
     std::uint32_t smoke_frame_budget = 0;
+    smoke_fixed_dt_active_ = false;
     if (auto* v = pt::console::Console::Get().FindCVar("pt_smoke_frames")) {
         const int n = v->GetInt();
         if (n > 0) smoke_frame_budget = static_cast<std::uint32_t>(n);
     }
     if (smoke_frame_budget > 0) {
+        smoke_fixed_dt_active_ = true;
         LOG_INFO("smoke-test mode: will render {} frame(s) then exit cleanly",
                  smoke_frame_budget);
         // If any CLI arg was rejected at parse time (allowed-values
@@ -13540,6 +13676,22 @@ void Engine::RegisterCommands() {
             scene.prims  = primitives_;
             scene.lights = light_prims_;
             scene.sdf    = sdf_prims_;
+            // Texture assignments persist as PATHS -- the tile indices
+            // in AnalyticPrim are session-local (handed out in load
+            // order), so the loader re-resolves these and rewrites the
+            // indices. PbrTilePath returns "" for kNoTexTile.
+            for (const auto& [pid, pr] : primitives_) {
+                std::array<std::string, 4> paths{
+                    PbrTilePath(pr.albedo_tex),
+                    PbrTilePath(pr.normal_tex),
+                    PbrTilePath(pr.roughness_tex),
+                    PbrTilePath(pr.metallic_tex),
+                };
+                if (!paths[0].empty() || !paths[1].empty() ||
+                    !paths[2].empty() || !paths[3].empty()) {
+                    scene.prim_tex_paths[pid] = std::move(paths);
+                }
+            }
             auto& C2 = pt::console::Console::Get();
             for (const char* name : kSceneCvars) {
                 if (auto* v = C2.FindCVar(name)) {
@@ -13608,6 +13760,7 @@ void Engine::RegisterCommands() {
             SceneSnapshot snap;
             snap.prims    = scene.prims;
             snap.lights   = scene.lights;
+            snap.sdf      = scene.sdf;
             snap.sel_kind = SelectionKind::None;   // selection doesn't survive a load
             snap.sel_id   = 0;
             // Guard the apply so it doesn't push its own undo entry on
@@ -13616,10 +13769,31 @@ void Engine::RegisterCommands() {
             ApplySceneSnapshot(snap);
             in_scene_undo_redo_ = false;
 
-            // SDF clusters are not part of SceneSnapshot -- restore them
-            // directly and flip the SDF upload dirty bit.
-            sdf_prims_       = scene.sdf;
-            sdf_prims_dirty_ = true;
+            // Re-resolve texture PATHS into this session's atlas tiles.
+            // The indices restored above are session-local hints from
+            // the save-time session; without this re-resolution the
+            // prims would sample unallocated / wrong tiles after a
+            // restart (textures silently vanishing or swapping). A
+            // path that fails to load drops that channel to flat.
+            for (const auto& [pid, paths] : scene.prim_tex_paths) {
+                auto pit = primitives_.find(pid);
+                if (pit == primitives_.end()) continue;
+                constexpr std::uint32_t kNoTex = 0xFFFFFFFFu;
+                std::uint32_t* slots[4] = {
+                    &pit->second.albedo_tex, &pit->second.normal_tex,
+                    &pit->second.roughness_tex, &pit->second.metallic_tex,
+                };
+                for (int ch = 0; ch < 4; ++ch) {
+                    if (paths[ch].empty()) continue;
+                    const std::uint32_t tile = LoadPbrTextureTile(paths[ch]);
+                    *slots[ch] = (tile != kNoTex) ? tile : kNoTex;
+                    if (tile == kNoTex) {
+                        LOG_WARN("scene_load: texture '{}' failed to load "
+                                 "(prim {} channel {})", paths[ch], pid, ch);
+                    }
+                }
+            }
+            primitives_dirty_ = true;
 
             // Camera pose (optional in the file).
             if (scene.has_camera && camera_) {
@@ -14165,11 +14339,14 @@ void Engine::RegisterCommands() {
 
     // Scene undo/redo (task #18). Separate from cvar undo/redo because
     // they snapshot different state: cvar undo captures cvar values
-    // touched by Console::ExecuteScript; scene undo captures the four
-    // mutable maps (prims, lights, sdf, rigid_bodies) before a
-    // mutating console command. Instrumented mutators call
-    // Engine::PushSceneSnapshot() to push pre-state; scene_undo /
-    // scene_redo pop + apply.
+    // touched by Console::ExecuteScript; scene undo captures the
+    // prims, lights, and SDF-cluster maps plus the selection before a
+    // mutating console command. Rigid bodies are NOT captured -- the
+    // physics pool holds live integration state (Verlet history,
+    // contacts) that a map copy can't meaningfully restore; phys_*
+    // spawns are therefore outside undo's contract. Instrumented
+    // mutators call Engine::PushSceneSnapshot() to push pre-state;
+    // scene_undo / scene_redo pop + apply.
     C.RegisterCommand("scene_undo",
         "Roll back the most recent prim/light scene mutation "
         "(prim_set_*, light_set_*, prim_delete, prim_duplicate, etc). "
@@ -15890,12 +16067,21 @@ bool ParseUint(std::string_view s, std::uint32_t& out) {
     return true;
 }
 
+// Strict float parser: whole-token consume (like ParseUint above, so
+// "1.5abc" is rejected instead of silently parsing as 1.5) and finite
+// values only. Every prim_/light_/sdf_/phys_/cam_ command routes
+// through here, and none of them has a downstream isfinite() check --
+// a "nan" radius used to pass the `radius <= 0` guard and poison the
+// analytic BVH + accumulation buffer for the whole scene, and "inf"
+// intensities sailed straight into NEE. Rejecting non-finite input
+// centrally fixes all ~190 call sites at once.
 bool ParseFloat(std::string_view s, float& out) {
     if (s.empty()) return false;
     char* end = nullptr;
     std::string buf(s);
     float v = std::strtof(buf.c_str(), &end);
-    if (end == buf.c_str()) return false;
+    if (end != buf.c_str() + buf.size()) return false;
+    if (!std::isfinite(v)) return false;
     out = v;
     return true;
 }
@@ -15940,6 +16126,7 @@ void Engine::RegisterCsgCommands() {
         "csg_box <id> <sx> <sy> <sz> <tx> <ty> <tz>: add a box leaf.",
         [this](auto args, pt::console::Output& out) {
             if (args.size() != 7) { out.PrintLine("usage: csg_box <id> <sx> <sy> <sz> <tx> <ty> <tz>"); return; }
+            if (!csg_scene_) { out.PrintLine("csg_box: CSG scene not initialised yet (csg_* is unavailable during early cfg exec -- use pt_smoke_late_exec)"); return; }
             std::uint32_t id;
             float sx, sy, sz, tx, ty, tz;
             if (!ParseUint(args[0], id) ||
@@ -15959,6 +16146,7 @@ void Engine::RegisterCsgCommands() {
         "csg_sphere <id> <radius> <segments> <tx> <ty> <tz>: add a sphere leaf.",
         [this](auto args, pt::console::Output& out) {
             if (args.size() != 6) { out.PrintLine("usage: csg_sphere <id> <radius> <segments> <tx> <ty> <tz>"); return; }
+            if (!csg_scene_) { out.PrintLine("csg_sphere: CSG scene not initialised yet (csg_* is unavailable during early cfg exec -- use pt_smoke_late_exec)"); return; }
             std::uint32_t id, segs;
             float radius, tx, ty, tz;
             if (!ParseUint(args[0], id) || !ParseFloat(args[1], radius) ||
@@ -15978,6 +16166,7 @@ void Engine::RegisterCsgCommands() {
         "csg_cylinder <id> <radius> <height> <segments> <tx> <ty> <tz>: add a cylinder leaf.",
         [this](auto args, pt::console::Output& out) {
             if (args.size() != 7) { out.PrintLine("usage: csg_cylinder <id> <radius> <height> <segments> <tx> <ty> <tz>"); return; }
+            if (!csg_scene_) { out.PrintLine("csg_cylinder: CSG scene not initialised yet (csg_* is unavailable during early cfg exec -- use pt_smoke_late_exec)"); return; }
             std::uint32_t id, segs;
             float radius, height, tx, ty, tz;
             if (!ParseUint(args[0], id) || !ParseFloat(args[1], radius) || !ParseFloat(args[2], height) ||
@@ -15998,6 +16187,7 @@ void Engine::RegisterCsgCommands() {
         "csg_op <id> <union|subtract|intersect> <left_id> <right_id>: combine two nodes.",
         [this](auto args, pt::console::Output& out) {
             if (args.size() != 4) { out.PrintLine("usage: csg_op <id> <union|subtract|intersect> <left> <right>"); return; }
+            if (!csg_scene_) { out.PrintLine("csg_op: CSG scene not initialised yet (csg_* is unavailable during early cfg exec -- use pt_smoke_late_exec)"); return; }
             std::uint32_t id, l, r;
             if (!ParseUint(args[0], id) || !ParseUint(args[2], l) || !ParseUint(args[3], r)) {
                 out.PrintLine("csg_op: id parse failed");
@@ -16019,6 +16209,7 @@ void Engine::RegisterCsgCommands() {
         "csg_remove <id>: drop a node (and any internal nodes referencing it).",
         [this](auto args, pt::console::Output& out) {
             if (args.size() != 1) { out.PrintLine("usage: csg_remove <id>"); return; }
+            if (!csg_scene_) { out.PrintLine("csg_remove: CSG scene not initialised yet (csg_* is unavailable during early cfg exec -- use pt_smoke_late_exec)"); return; }
             std::uint32_t id;
             if (!ParseUint(args[0], id)) { out.PrintLine("csg_remove: id parse failed"); return; }
             std::size_t n = csg_scene_->Remove(id);
@@ -16030,6 +16221,7 @@ void Engine::RegisterCsgCommands() {
         "csg_set_root <id>: render the subtree rooted at <id>.",
         [this](auto args, pt::console::Output& out) {
             if (args.size() != 1) { out.PrintLine("usage: csg_set_root <id>"); return; }
+            if (!csg_scene_) { out.PrintLine("csg_set_root: CSG scene not initialised yet (csg_* is unavailable during early cfg exec -- use pt_smoke_late_exec)"); return; }
             std::uint32_t id;
             if (!ParseUint(args[0], id)) { out.PrintLine("csg_set_root: id parse failed"); return; }
             if (!csg_scene_->SetRoot(id)) {
@@ -16260,6 +16452,7 @@ void Engine::RegisterPrimCommands() {
     C.RegisterCommand("prim_clear",
         "Remove all analytic primitives.",
         [this](auto, pt::console::Output& out) {
+            PushSceneSnapshot();
             primitives_.clear();
             // Drop the r_phys_debug_visualize cache (#181): with every
             // underlying prim gone, the per-prim cache entries would
@@ -16267,6 +16460,7 @@ void Engine::RegisterPrimCommands() {
             phys_debug_color_cache_.clear();
             primitives_dirty_ = true;
             accum_dirty_      = true;
+            BroadcastSceneDirty();
             out.PrintLine("primitives: cleared");
         });
 
@@ -16275,8 +16469,10 @@ void Engine::RegisterPrimCommands() {
         [this](auto, pt::console::Output& out) {
             // SeedDefaultPrimitives replaces every prim wholesale, so the
             // old albedo cache (#181) is referentially stale -- drop it.
+            PushSceneSnapshot();
             phys_debug_color_cache_.clear();
             SeedDefaultPrimitives();
+            BroadcastSceneDirty();
             out.PrintLine("primitives: reset to default (red Lambert, gold metal, glass + ground)");
         });
 
@@ -16286,10 +16482,14 @@ void Engine::RegisterPrimCommands() {
             if (args.size() != 1) { out.PrintLine("usage: prim_remove <id>"); return; }
             std::uint32_t id;
             if (!ParseUint(args[0], id)) { out.PrintLine("prim_remove: id parse failed"); return; }
-            if (primitives_.erase(id) == 0) {
+            if (primitives_.find(id) == primitives_.end()) {
                 out.FormatLine("prim_remove: id {} not found", id);
                 return;
             }
+            // Undo + editor parity with prim_delete (its documented
+            // alias): snapshot the pre-state and tell the panels.
+            PushSceneSnapshot();
+            primitives_.erase(id);
             // Drop the matching r_phys_debug_visualize cache entry (#181)
             // if any. The cached albedo was the value present BEFORE the
             // viz painted over it, but the underlying prim is gone now so
@@ -16299,6 +16499,7 @@ void Engine::RegisterPrimCommands() {
             phys_debug_color_cache_.erase(id);
             primitives_dirty_ = true;
             accum_dirty_      = true;
+            BroadcastSceneDirty();
             out.FormatLine("primitives: removed id {}", id);
         });
 
@@ -16339,6 +16540,7 @@ void Engine::RegisterPrimCommands() {
             p.albedo[0]   = r; p.albedo[1] = g; p.albedo[2] = b;
             p.roughness   = roughness;
             p.ior         = ior;
+            PushSceneSnapshot();
             primitives_[id] = p;
             // If the user is replacing a sphere that had a cached pre-
             // viz albedo (#181), the cached value is now stale -- drop
@@ -16347,6 +16549,7 @@ void Engine::RegisterPrimCommands() {
             phys_debug_color_cache_.erase(id);
             primitives_dirty_ = true;
             accum_dirty_      = true;
+            BroadcastSceneDirty();
             out.FormatLine("primitives: sphere id={} ({} @ {:.2f} {:.2f} {:.2f} r={})",
                            id, MaterialName(mat), x, y, z, radius);
         });
@@ -16387,9 +16590,11 @@ void Engine::RegisterPrimCommands() {
             p.albedo[0]   = r; p.albedo[1] = g; p.albedo[2] = b;
             p.roughness   = 0.0f;
             p.ior         = 1.0f;
+            PushSceneSnapshot();
             primitives_[id] = p;
             primitives_dirty_ = true;
             accum_dirty_      = true;
+            BroadcastSceneDirty();
             out.FormatLine("primitives: plane id={} ({} n=({:.2f} {:.2f} {:.2f}) d={:.3f})",
                            id, MaterialName(mat), nx, ny, nz, d);
         });
@@ -16440,7 +16645,6 @@ void Engine::RegisterPrimCommands() {
             }
             std::uint32_t id; AnalyticPrim* p = nullptr;
             if (!find_prim(args[0], out, id, p)) return;
-            PushSceneSnapshot();
             float x, y, z;
             if (!ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z)) {
                 out.PrintLine("prim_set_pos: float parse failed");
@@ -16457,6 +16661,7 @@ void Engine::RegisterPrimCommands() {
                 }
                 x /= len; y /= len; z /= len;
             }
+            PushSceneSnapshot();
             p->pos_or_n[0] = x; p->pos_or_n[1] = y; p->pos_or_n[2] = z;
             // Sphere prev_pos is normally the previous frame's position
             // (motion blur). A direct teleport via prim_set_pos should
@@ -16479,12 +16684,12 @@ void Engine::RegisterPrimCommands() {
             }
             std::uint32_t id; AnalyticPrim* p = nullptr;
             if (!find_prim(args[0], out, id, p)) return;
-            PushSceneSnapshot();
             float r, g, b;
             if (!ParseFloat(args[1], r) || !ParseFloat(args[2], g) || !ParseFloat(args[3], b)) {
                 out.PrintLine("prim_set_albedo: float parse failed");
                 return;
             }
+            PushSceneSnapshot();
             p->albedo[0] = r; p->albedo[1] = g; p->albedo[2] = b;
             // Drop the cached pre-viz albedo (#181) -- next falling-edge
             // restore would otherwise paint the previous albedo over the
@@ -16507,12 +16712,12 @@ void Engine::RegisterPrimCommands() {
             }
             std::uint32_t id; AnalyticPrim* p = nullptr;
             if (!find_prim(args[0], out, id, p)) return;
-            PushSceneSnapshot();
             float r, g, b;
             if (!ParseFloat(args[1], r) || !ParseFloat(args[2], g) || !ParseFloat(args[3], b)) {
                 out.PrintLine("prim_set_emission: float parse failed");
                 return;
             }
+            PushSceneSnapshot();
             p->emission[0] = r; p->emission[1] = g; p->emission[2] = b;
             primitives_dirty_ = true;
             accum_dirty_      = true;
@@ -16531,12 +16736,12 @@ void Engine::RegisterPrimCommands() {
             }
             std::uint32_t id; AnalyticPrim* p = nullptr;
             if (!find_prim(args[0], out, id, p)) return;
-            PushSceneSnapshot();
             float v;
             if (!ParseFloat(args[1], v)) {
                 out.PrintLine("prim_set_roughness: float parse failed");
                 return;
             }
+            PushSceneSnapshot();
             if (v < 0.0f) v = 0.0f;
             if (v > 1.0f) v = 1.0f;
             p->roughness = v;
@@ -16556,12 +16761,12 @@ void Engine::RegisterPrimCommands() {
             }
             std::uint32_t id; AnalyticPrim* p = nullptr;
             if (!find_prim(args[0], out, id, p)) return;
-            PushSceneSnapshot();
             float v;
             if (!ParseFloat(args[1], v)) {
                 out.PrintLine("prim_set_ior: float parse failed");
                 return;
             }
+            PushSceneSnapshot();
             // Clamp to the same [1.0, 2.4] range the water-Phase 1 shader
             // uses; outside this range the Fresnel + refraction math
             // produces visually broken results (TIR everywhere or
@@ -16596,7 +16801,6 @@ void Engine::RegisterPrimCommands() {
             }
             std::uint32_t id; AnalyticPrim* p = nullptr;
             if (!find_prim(args[0], out, id, p)) return;
-            PushSceneSnapshot();
             float amount = 0.0f, rot_deg = 0.0f;
             if (!ParseFloat(args[1], amount)) {
                 out.PrintLine("prim_set_anisotropy: amount parse failed");
@@ -16606,6 +16810,7 @@ void Engine::RegisterPrimCommands() {
                 out.PrintLine("prim_set_anisotropy: rotation parse failed");
                 return;
             }
+            PushSceneSnapshot();
             if (amount < -1.0f) amount = -1.0f;
             if (amount >  1.0f) amount =  1.0f;
             p->aniso_amount   = amount;
@@ -16641,7 +16846,6 @@ void Engine::RegisterPrimCommands() {
             }
             std::uint32_t id; AnalyticPrim* p = nullptr;
             if (!find_prim(args[0], out, id, p)) return;
-            PushSceneSnapshot();
             float weight = 0.0f, rough = 0.03f;
             if (!ParseFloat(args[1], weight)) {
                 out.PrintLine("prim_set_clearcoat: weight parse failed");
@@ -16651,6 +16855,7 @@ void Engine::RegisterPrimCommands() {
                 out.PrintLine("prim_set_clearcoat: roughness parse failed");
                 return;
             }
+            PushSceneSnapshot();
             if (weight < 0.0f) weight = 0.0f;
             if (weight > 1.0f) weight = 1.0f;
             if (rough  < 0.0f) rough  = 0.0f;
@@ -16689,7 +16894,6 @@ void Engine::RegisterPrimCommands() {
             }
             std::uint32_t id; AnalyticPrim* p = nullptr;
             if (!find_prim(args[0], out, id, p)) return;
-            PushSceneSnapshot();
             float radius = 0.0f;
             if (!ParseFloat(args[1], radius)) {
                 out.PrintLine("prim_set_subsurface: radius parse failed");
@@ -16705,6 +16909,7 @@ void Engine::RegisterPrimCommands() {
                     return;
                 }
             }
+            PushSceneSnapshot();
             // Clamp the single-scatter albedo to [0,1] (an albedo > 1 would
             // gain energy per scatter and diverge). radius is a positive
             // length; a tiny floor keeps sigma_s finite shader-side.
@@ -16858,7 +17063,6 @@ void Engine::RegisterPrimCommands() {
             }
             std::uint32_t id; AnalyticPrim* p = nullptr;
             if (!find_prim(args[0], out, id, p)) return;
-            PushSceneSnapshot();
             AnalyticPrim::Material mat;
             if (!ParseMaterial(args[1], mat)) {
                 out.FormatLine("prim_set_material: unknown material '{}' "
@@ -16866,6 +17070,7 @@ void Engine::RegisterPrimCommands() {
                                args[1]);
                 return;
             }
+            PushSceneSnapshot();
             p->material = mat;
             primitives_dirty_ = true;
             accum_dirty_      = true;
@@ -17133,10 +17338,10 @@ void Engine::RegisterEditorGizmoCommands() {
     C.RegisterCVar("gizmo_mode", "translate",
         "Editor gizmo mode: translate | rotate | scale. The G / R / "
         "S hotkeys flip this via SetCVarOverride from the engine's "
-        "key handler. Rotate mode does NOT currently dispatch a "
-        "rotation mutation (analytic prims don't carry orientation "
-        "in this codebase); it draws three rings for visual feedback "
-        "only. Scale mode mutates radius_or_d for spheres.",
+        "key handler. Rotate mode dispatches prim_set_rotation / "
+        "light_set_rotation (orient quaternion, #206 follow-up); "
+        "scale mode dispatches prim_set_radius for spheres and "
+        "light_set_size / light_set_uhalf for sphere / quad lights.",
         pt::console::CVAR_ARCHIVE);
 
     C.RegisterCVar("r_editor_gizmo_xray", "1",
@@ -17236,6 +17441,7 @@ void Engine::RegisterEditorGizmoCommands() {
                 out.FormatLine("prim_set_radius: id {} is not a sphere", id);
                 return;
             }
+            PushSceneSnapshot();
             it->second.radius_or_d = r;
             primitives_dirty_ = true;
             accum_dirty_      = true;
@@ -17273,6 +17479,7 @@ void Engine::RegisterEditorGizmoCommands() {
                 out.FormatLine("prim_set_plane_d: id {} is not a plane", id);
                 return;
             }
+            PushSceneSnapshot();
             it->second.radius_or_d = d;
             primitives_dirty_ = true;
             accum_dirty_      = true;
@@ -17517,6 +17724,7 @@ void Engine::RegisterEditorGizmoCommands() {
                 out.FormatLine("prim_set_normal: id {} is not a plane", id);
                 return;
             }
+            PushSceneSnapshot();
             it->second.pos_or_n[0] = nx / len;
             it->second.pos_or_n[1] = ny / len;
             it->second.pos_or_n[2] = nz / len;
@@ -17711,11 +17919,15 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
             // foot = -d * n (since n is unit, n . foot + d == 0 implies
             // foot . n == -d, so foot = -d * n is the point on the
             // plane nearest the world origin).
-            const glm::vec3 n_raw{prim_it->second.pos_or_n[0],
-                                  prim_it->second.pos_or_n[1],
-                                  prim_it->second.pos_or_n[2]};
+            const glm::vec3 n = QuatRotateXyzw(
+                prim_it->second.orient,
+                glm::vec3{prim_it->second.pos_or_n[0],
+                          prim_it->second.pos_or_n[1],
+                          prim_it->second.pos_or_n[2]});
             const float d = prim_it->second.radius_or_d;
-            origin     = n_raw * (-d);
+            // Foot of the ORIENT-rotated plane, matching the drawn
+            // geometry (build_origin below) and the pre-hit-test.
+            origin     = n * (-d);
             gizmo_size = 1.5f;   // fixed world-units arm/ring length
         } else {
             // Sphere path: gizmo anchored at the sphere center, sized
@@ -17820,7 +18032,12 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
             pt::console::Console::Get().Execute(cmd);
         }
         editor_gizmo_.EndDrag();
-        prev_lmb_down_ = false;
+        // The button is still physically held (Esc cancelled the drag,
+        // not the click) -- keep prev_lmb_down_ true so the edge
+        // detector below doesn't see a manufactured press edge this
+        // same frame and instantly re-grab the gizmo. A fresh drag
+        // needs a real release + re-press.
+        prev_lmb_down_ = true;
     }
 
     // LMB edge detect.
@@ -17857,6 +18074,10 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
                         }
                     }
                 }
+                // One undo snapshot per drag, pushed while
+                // IsDragging() is still false (PushSceneSnapshot
+                // ignores calls made during the drag itself).
+                PushSceneSnapshot();
                 editor_gizmo_.BeginDrag(hovered, origin,
                                         *camera_, aspect,
                                         accum_w_, accum_h_,
@@ -17994,17 +18215,11 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
                 // Re-derive plane normal post-rotation so the rings move
                 // with the visible plane. The shader applies orient at
                 // intersect time, so for the gizmo we apply it here too.
-                const float qx = fresh->second.orient[0];
-                const float qy = fresh->second.orient[1];
-                const float qz = fresh->second.orient[2];
-                const float qw = fresh->second.orient[3];
-                const glm::vec3 n_raw{fresh->second.pos_or_n[0],
-                                      fresh->second.pos_or_n[1],
-                                      fresh->second.pos_or_n[2]};
-                // quatRotate(q, v) = v + 2 * cross(u, cross(u, v) + w * v)
-                const glm::vec3 u{qx, qy, qz};
-                const glm::vec3 n = n_raw + 2.0f *
-                    glm::cross(u, glm::cross(u, n_raw) + qw * n_raw);
+                const glm::vec3 n = QuatRotateXyzw(
+                    fresh->second.orient,
+                    glm::vec3{fresh->second.pos_or_n[0],
+                              fresh->second.pos_or_n[1],
+                              fresh->second.pos_or_n[2]});
                 build_origin = n * (-fresh->second.radius_or_d);
             } else {
                 build_origin = glm::vec3{fresh->second.pos_or_n[0],
@@ -18898,10 +19113,7 @@ void Engine::RegisterPhysicsCommands() {
             // so the next phys_drop starts past whatever id we landed
             // on, and a phys_clear will only erase the id we actually
             // claimed here (recorded via SetPrimId on the particle).
-            std::uint32_t prim_id = physics_next_prim_id_++;
-            while (primitives_.find(prim_id) != primitives_.end()) {
-                prim_id = physics_next_prim_id_++;
-            }
+            const std::uint32_t prim_id = AllocPhysicsPrimId();
             AnalyticPrim p{};
             p.type        = AnalyticPrim::Sphere;
             p.material    = AnalyticPrim::Lambert;
@@ -19004,7 +19216,7 @@ void Engine::RegisterPhysicsCommands() {
                                pt::physics::PhysicsSystem::kMaxRigidBodies);
                 return;
             }
-            const std::uint32_t prim_id = physics_next_prim_id_++;
+            const std::uint32_t prim_id = AllocPhysicsPrimId();
             AnalyticPrim p{};
             p.type        = AnalyticPrim::Sphere;
             p.material    = AnalyticPrim::Lambert;
@@ -19110,7 +19322,7 @@ void Engine::RegisterPhysicsCommands() {
             // (real box primitive in the analytic-prim shader) is
             // explicitly out of scope per issue #138.
             const float bound_r = pt::physics::BoxBoundingRadius(h_ext);
-            const std::uint32_t prim_id = physics_next_prim_id_++;
+            const std::uint32_t prim_id = AllocPhysicsPrimId();
             AnalyticPrim p{};
             p.type        = AnalyticPrim::Sphere;
             p.material    = AnalyticPrim::Lambert;
@@ -20694,6 +20906,7 @@ void Engine::EnsureSmokeEmittersUploaded() {
         }
         smoke_buffer_id_       = buf.id;
         smoke_buffer_capacity_ = kMaxSmokeEmitters;
+        smoke_emitters_gpu_dirty_ = true;
     }
 
     // Honour the runtime cvar cap. ParseInt-style: clamp to [0, hard cap].
@@ -20707,6 +20920,20 @@ void Engine::EnsureSmokeEmittersUploaded() {
     }
     const std::uint32_t count = std::min<std::uint32_t>(
         soft_cap, static_cast<std::uint32_t>(smoke_emitters_.size()));
+
+    // Skip the upload when nothing changed. Emitter records are static
+    // between smoke_emit / smoke_clear mutations (positions drift
+    // parametrically IN-SHADER via smoke_params time, not host-side),
+    // so re-writing the buffer every frame was pure waste -- and on
+    // Vulkan each WriteBuffer is a synchronous staging upload +
+    // vkQueueWaitIdle that drains the whole GPU queue mid-frame
+    // (issue #57). The dirty flag is set by the mutating commands and
+    // by buffer (re)creation; the count check additionally catches a
+    // live r_smoke_max_emitters change.
+    if (!smoke_emitters_gpu_dirty_ && count == smoke_count_uploaded_) {
+        return;
+    }
+    smoke_emitters_gpu_dirty_ = false;
 
     // Pack the full buffer footprint (trailing entries zeroed). The
     // shader's per-frame `smoke_count` push gate is the only thing
@@ -20804,6 +21031,7 @@ void Engine::RegisterSmokeCommands() {
             E.tint[0] = E.tint[1] = E.tint[2] = 1.0f;
             const std::uint32_t id = smoke_next_id_++;
             smoke_emitters_.push_back(E);
+            smoke_emitters_gpu_dirty_ = true;
             accum_dirty_ = true;
             out.FormatLine("smoke: emit id={} at ({:.2f} {:.2f} {:.2f}) radius={:.2f} density={:.2f} vel=({:.2f} {:.2f} {:.2f})",
                            id, x, y, z, radius, density, vx, vy, vz);
@@ -20814,6 +21042,7 @@ void Engine::RegisterSmokeCommands() {
         [this](auto, pt::console::Output& out) {
             const std::size_t n = smoke_emitters_.size();
             smoke_emitters_.clear();
+            smoke_emitters_gpu_dirty_ = true;
             accum_dirty_ = true;
             out.FormatLine("smoke: cleared {} emitter(s)", n);
         });
@@ -20859,9 +21088,9 @@ void Engine::StepSmokeSPH(float dt) {
         const float b = v->GetFloat();
         cfg.buoyancy_scale = (b >= 0.0f) ? b : 0.0f;
     }
-    if (auto* v = C.FindCVar("r_smoke_viscosity")) {
-        const float mu = v->GetFloat();
-        cfg.viscosity = (mu >= 0.0f) ? mu : 0.0f;
+    if (auto* v = C.FindCVar("r_smoke_xsph_blend")) {
+        const float blend = v->GetFloat();
+        cfg.xsph_blend = (blend >= 0.0f) ? blend : 0.0f;
     }
     float wind_x = 0.0f, wind_y = 0.0f, wind_z = 0.0f;
     if (auto* v = C.FindCVar("r_smoke_wind_x")) wind_x = v->GetFloat();
@@ -21006,6 +21235,14 @@ void Engine::EnsureSmokeSphUploaded() {
     if (auto* v = C.FindCVar("r_smoke_sph_render_density_scale")) dens_scale = v->GetFloat();
     if (dens_scale < 0.0f) dens_scale = 0.0f;
 
+    // Live particles move every substep, so a populated sim genuinely
+    // needs a fresh upload each frame -- but the DEFAULT scene has no
+    // SPH smoke at all, and re-uploading 64 KB of zeros per frame cost
+    // a full vkQueueWaitIdle on Vulkan (issue #57). Skip when the sim
+    // is empty and the GPU-side count is already zero.
+    if (smoke_sph_->AliveCount() == 0 && sph_particle_count_uploaded_ == 0) {
+        return;
+    }
     std::vector<float> packed(std::size_t(sph_particle_capacity_) * kFloatsPerParticle, 0.0f);
     const std::uint32_t n = smoke_sph_->PackForGpu(packed.data(),
         static_cast<std::uint32_t>(packed.size()), rad_scale, dens_scale);
@@ -21621,7 +21858,21 @@ int Engine::SpawnPanelBrowser(const std::string& panel_name,
             }
             return static_cast<int>(browser_pid);
         }
-        // fork() failed somewhere; fall through to the `open` fallback.
+        if (pid > 0) {
+            // The intermediate forked -- the browser is very likely up
+            // even though the pid read came back short (pipe failure /
+            // EINTR / intermediate killed). Falling through to the
+            // default-browser fallback here opened the panel TWICE.
+            // Report the spawn with an untracked PID instead.
+            if (out_diag) {
+                *out_diag = fmt::format(
+                    "spawned {} via {} but its PID could not be read -- "
+                    "panel_close won't track this window",
+                    panel_name, chosen);
+            }
+            return 0;
+        }
+        // fork() itself failed; fall through to the `open` fallback.
     }
 
     // Final fallback: `open` the URL in the default browser. We can't
@@ -21710,8 +21961,29 @@ int Engine::SpawnPanelBrowser(const std::string& panel_name,
 #endif
 }
 
+bool Engine::IsPanelPidAlive(int pid) {
+    if (pid <= 0) return false;
+#if defined(_WIN32)
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                           static_cast<DWORD>(pid));
+    if (h == nullptr) return false;
+    DWORD code = 0;
+    const bool alive = GetExitCodeProcess(h, &code) && code == STILL_ACTIVE;
+    CloseHandle(h);
+    return alive;
+#else
+    // Signal 0 probes existence without delivering anything. The
+    // browser was reparented to init at spawn, so the engine can never
+    // reap it -- ESRCH is the only "it's gone" signal we get.
+    return ::kill(static_cast<pid_t>(pid), 0) == 0;
+#endif
+}
+
 void Engine::KillPanelPid(int pid) {
     if (pid <= 0) return;
+    // Never signal a PID that's already gone -- after PID reuse in a
+    // long session, SIGTERM would land on an unrelated process.
+    if (!IsPanelPidAlive(pid)) return;
 #if defined(_WIN32)
     HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE,
                            static_cast<DWORD>(pid));
@@ -21739,8 +22011,10 @@ void Engine::OpenAutoOpenedPanels() {
         if (auto it = open_panels_pids_.find(name);
             it != open_panels_pids_.end() && it->second > 0) {
             // Already tracked open (e.g. user toggled the cvar at
-            // runtime and we re-entered here). Skip silently.
-            continue;
+            // runtime and we re-entered here). Skip silently -- unless
+            // the window was closed by hand and the PID is stale.
+            if (IsPanelPidAlive(it->second)) continue;
+            open_panels_pids_.erase(it);
         }
         auto url = pt::editor::BuildPanelUrl(name, endpoint.host,
                                              endpoint.port,
@@ -21787,11 +22061,21 @@ void Engine::RegisterEditorCommands() {
             // the user to use panel_close first.
             if (auto it = open_panels_pids_.find(name);
                 it != open_panels_pids_.end() && it->second > 0) {
-                out.FormatLine(
-                    "panel_open: {} already open (pid {}). "
-                    "Use `panel_close {}` first to spawn a fresh window.",
-                    name, it->second, name);
-                return;
+                // A window the user closed with its own close button
+                // leaves a stale tracked PID (the browser is init's
+                // child, so we never reap it). Probe liveness before
+                // refusing -- otherwise panel_open is blocked forever
+                // and the suggested panel_close would SIGTERM a
+                // possibly recycled PID.
+                if (!IsPanelPidAlive(it->second)) {
+                    open_panels_pids_.erase(it);
+                } else {
+                    out.FormatLine(
+                        "panel_open: {} already open (pid {}). "
+                        "Use `panel_close {}` first to spawn a fresh window.",
+                        name, it->second, name);
+                    return;
+                }
             }
             auto endpoint = ReadEditorEndpoint();
             auto url = pt::editor::BuildPanelUrl(name, endpoint.host,

@@ -28,6 +28,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <array>
 #include <map>
 #include <string>
 #include <utility>
@@ -119,6 +120,16 @@ struct SceneData {
     // load via pt::renderer::ComputeSdfAabb so a stale stored AABB can't
     // desync the sphere-trace bound.
     std::map<std::uint32_t, pt::renderer::SdfPrim>             sdf;
+
+    // Per-prim PBR texture PATHS (albedo / normal / roughness /
+    // metallic; empty string = no map on that channel). The AnalyticPrim
+    // structs above carry raw atlas TILE INDICES, which are session-
+    // local (tiles are handed out in load order) -- persisting only the
+    // indices meant textures silently vanished or swapped after a
+    // save / restart / load round-trip. The engine fills these from
+    // PbrTilePath() on save and re-resolves them through
+    // LoadPbrTextureTile() on load, rewriting the indices.
+    std::map<std::uint32_t, std::array<std::string, 4>>        prim_tex_paths;
 
     // Selected render cvars, name -> value strings (insertion-ordered so
     // the file is stable / diffable). Empty is legal.
