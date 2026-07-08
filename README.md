@@ -16,8 +16,8 @@
 
 > A real-time game engine that **never rasterizes**. Every pixel is a
 > ray. Path tracing is the renderer; mesh CSG via Manifold is the
-> headline; modern temporal denoisers (MetalFX on Apple, NRD on Vulkan)
-> keep the frame interactive at 1 sample per pixel.
+> headline; modern temporal denoisers (MetalFX on Apple, SVGF / OptiX
+> on Vulkan) keep the frame interactive at 1 sample per pixel.
 >
 > **DeMonT** = **De** **Mon**te Carlo-esque **T**racer — *-esque*
 > because the algorithm will keep evolving (MIS, ReSTIR, bidirectional
@@ -28,8 +28,8 @@
 | Platform | Backend | Denoiser | Status |
 |---|---|---|---|
 | **Apple Silicon** (M-series, macOS 26+) | Metal (hardware RT) | MetalFX TemporalDenoisedScaler | ✓ primary |
-| **NVIDIA RTX** (Windows / Linux, RTX 2000-series and up) | Vulkan (`VK_KHR_ray_query` + `VK_KHR_acceleration_structure`) | NRD or SVGF | queued — see [`FOLLOW_UPS.md`](Raytracer%20Plan/FOLLOW_UPS.md) |
-| Software fallback (any) | CPU compute | none | bring-up only |
+| **NVIDIA RTX** (Windows / Linux, RTX 2000-series and up) | Vulkan (`VK_KHR_ray_query` + `VK_KHR_acceleration_structure`) | SVGF (basic / à-trous) or OptiX HDR / temporal; NRD library queued | ✓ supported (since v0.3.0) |
+| Software fallback (any) | CPU reference path tracer (Embree-traced meshes + analytic primitives) | none | reference / bring-up |
 
 Built on C++23 with a platform RHI (Software / Metal on macOS, native
 Vulkan on Windows/Linux), Slang shaders that cross-compile to MSL and SPIR-V, and a unified
@@ -55,9 +55,10 @@ glass, soft shadows from area lights — all without an `if-rasterizer`
 switch in the codebase.
 
 The cost is the noise floor and the GPU bill. Both are addressed by
-modern temporal denoisers (MetalFX TemporalDenoisedScaler today, NRD on
-the Vulkan side once Windows lands) and by the path tracer's own
-accumulation when the camera is stationary.
+modern temporal denoisers (MetalFX TemporalDenoisedScaler on Apple,
+the in-house SVGF chain on both Metal and Vulkan, OptiX HDR / temporal
+variants on NVIDIA) and by the path tracer's own accumulation when the
+camera is stationary.
 
 ## Status
 
@@ -72,9 +73,14 @@ accumulation when the camera is stationary.
 | **P9 Mesh CSG via Manifold (headline)** | ✓ |
 | Renderer unification (analytic + mesh in one shader) | ✓ |
 | **P10 MetalFX TemporalDenoisedScaler (Mac)** | ✓ |
-| Vulkan denoiser (NRD or SVGF) for Windows / 5090 | queued — see FOLLOW_UPS |
+| Vulkan denoiser: SVGF (basic / à-trous) on both backends + OptiX on NVIDIA | ✓ (`nrd` aliases the à-trous chain until the NRD library is wired) |
 | P11 MIS, env maps, archived cvars, scene I/O | ✓ |
-| P12 Windows bringup with native Vulkan | in-progress (`feature/windows-nvidia`) |
+| P12 Windows bringup with native Vulkan | ✓ (PR #1, merged 2026-05-08 → v0.3.0) |
+
+Post-P12 work — SDF raymarching phases 1–3 (#97–#99), the React scene
+editor, the physics / destruction arcs, and the integration waves — is
+tracked in GitHub issues and the `v0.3.x` release tags rather than
+phase rows here.
 
 ## Build
 
@@ -153,12 +159,12 @@ echo "csg_dump"          | nc localhost 27961
 | | |
 |---|---|
 | `r_backend` | macOS: `none` / `software` / `metal`; Windows/Linux: `none` / `software` / `vulkan` |
-| `r_denoiser` | `off` / `metalfx` (Mac); A/B with `toggle r_denoiser` |
+| `r_denoiser` | `off` / `metalfx` / `svgf_basic` / `svgf_atrous` / `svgf_basic_metalfx` / `svgf_atrous_metalfx` / `nrd` / `optix_hdr` / `optix_hdr_aov` / `optix_temporal_hdr` / `optix_temporal_hdr_aov`. Mac accepts the metalfx / svgf / nrd set; NVIDIA Vulkan adds the optix variants. `list_cvars r_denoiser` prints the full matrix; A/B with `toggle r_denoiser` |
 | `r_spp` | samples per pixel per dispatch (1..32). Higher = cleaner motion at proportional GPU cost. |
 | `r_max_bounces` | path-tracer bounce cap (default 8) |
 | `csg_*` | live CSG editing — `csg_box`, `csg_sphere`, `csg_op subtract …`, `csg_set_root`, `csg_dump`, … |
 | `prim_*` | analytic primitives — `prim_sphere`, `prim_plane`, `prim_remove`, `prim_list`, … |
-| `screenshot <path.ppm> [accum\|denoise_color\|depth\|motion]` | in-app GPU readback to PPM, no OS Screen Recording permission needed |
+| `screenshot <name> [accum\|denoise_color\|bloom_mip0\|swap\|depth\|motion]` | in-app GPU readback, no OS Screen Recording permission needed. Format comes from `r_capture_format` (`png`, default, or `ppm`) — the matching extension is auto-appended to `<name>`, overriding any extension you typed |
 | `toggle <cvar>` | cycle a cvar's allowed_values — quick A/B for any boolean / enum |
 | `web_console` | open the browser UI on demand |
 
@@ -170,19 +176,32 @@ src/
             Jobs (enkiTS), Hardware (sysctl introspection)
   rhi/      Render Hardware Interface — Device / CommandBuffer /
             Handles / Resources / Denoise. Backend-agnostic.
-  rhi_software/  CPU compute (used as a clear+present today).
+  rhi_software/  CPU reference path tracer — Embree-traced meshes +
+                 analytic primitives, Lambert direct lighting.
   rhi_metal/     Metal backend (metal-cpp + Slang→MSL),
                  MetalFXDenoiser shim, hardware ray query.
   rhi_vulkan/    Native Vulkan backend for Windows/Linux.
-  renderer/      Camera, MeshGen, Csg/CsgScene (Manifold-backed).
+  renderer/      Camera, MeshGen, Csg/CsgScene (Manifold-backed),
+                 AnalyticBvh (incl. SDF clusters), LightTree,
+                 GltfImporter, HdrImage, Astronomy/BscCatalog.
+  physics/       PhysicsSystem (Verlet + rigid body), SmokeSPH,
+                 OceanFFT.
+  destruction/   VoxelGrid + Voxelizer (CSG mesh → voxel box pile).
+  effects/       ParticleSystem.
+  audio/         AudioSystem.
+  editor/        EditorRoutes (panel HTTP/WS routes) + SceneGraph.
   console/       CVar/Command registry + civetweb WS/HTTP server +
                  raw line-protocol TCP server.
   app/           GLFW window, Cocoa bridges, native NSPanel overlay.
   engine/        Top-level orchestrator + the unified path-trace pass.
-shaders/   PathTrace.slang  ← the only kernel: analytic + mesh + materials
-web/       Embedded vanilla-JS console UI (no build step)
+shaders/   PathTrace.slang megakernel + 28 more .slang kernels
+           (SVGF denoise chain, ReSTIR, bloom, clouds, SDF libraries,
+           tonemap / post).
+web/       Vanilla-JS console UI at the top level (no build step) +
+           editor/ — React 18 + Vite multi-panel scene editor whose
+           npm build is embedded into the binary by cmake/Editor.cmake.
 cmake/     SetupBinaries, Slang.cmake (compile_slang),
-           EmbedResource.cmake, Dependencies.cmake
+           EmbedResource.cmake, Dependencies.cmake, Editor.cmake
 ```
 
 ## License

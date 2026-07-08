@@ -11,10 +11,11 @@ What remains here:
 1. **Long-term roadmap** (Engine vision: soft-body + voxel
    destruction) -- too big for an issue body, gets a thin tracker
    (#52) for GitHub visibility.
-2. **Speculative / "if there's a real need"** items (Web UI editor,
-   Analytical CSG, More analytic primitives) -- not actionable
-   today; the design sketch lives here so the next future-us picks
-   it up with context.
+2. **Speculative / "if there's a real need"** items (More analytic
+   primitives) -- not actionable today; the design sketch lives here
+   so the next future-us picks it up with context. The Web UI editor
+   and Analytical CSG sketches that used to sit in this bucket have
+   since shipped and are annotated DONE below.
 3. **DONE / landed entries** kept as design archeology -- how we
    built things, what the trade-offs were, what we measured.
 
@@ -57,12 +58,32 @@ geometry, secondary rays, and HDR lighting. Voxels in particular are
 rasterization-cost penalty for millions of small primitives — just a
 DDA traversal cost that scales with effective surface area.
 
+**Progress (as of 2026-07-08):** step 1 has landed, and a physics
+substrate grew underneath the later steps:
+
+- **Voxel destruction Phase 1** (`src/destruction/` — VoxelGrid +
+  Voxelizer, issue #140): voxelizes the CSG mesh and renders it as an
+  analytic-box pile. Console surface: `voxelize_object` /
+  `voxelize_save` / `voxelize_list` / `voxelize_clear` plus
+  `r_voxel_size` / `r_voxelize_demo`. The dedicated DDA traversal
+  shader + sparse brick/chunk layout sketched below is still open.
+- **`src/physics/`**: Verlet particle core Phase 1 (#132), rigid-body
+  Phase 2a — orientation + inertia + angular velocity (#138), driven
+  by `phys_drop` / `phys_drop_sphere` / `phys_drop_box` /
+  `phys_clear` / `phys_status` / `phys_ls`; SPH smoke sim (#216);
+  OceanFFT water.
+- **Still future:** XPBD soft-body, stress-graph fracture, node+beam
+  vehicles, Jolt.
+
 **Order of operations when picked up:**
 
 1. **Voxel module + ray-trace path** (no physics yet). DDA traversal
    shader, sparse 3D grid representation, brick / chunk layout.
+   *✓ Phase 1 landed (analytic-box pile; DDA + bricks still open).*
 2. **XPBD soft-body solver** as a separate `pt::physics::Xpbd` module.
    Tested first against a hanging cloth, then a bouncing jelly cube.
+   *(Not started — but the Verlet + rigid-body substrate in
+   `src/physics/` (#132, #138) is the stepping stone.)*
 3. **Voxel destruction**: stress graph over voxel chunks, fracture on
    threshold, freed chunks become rigid bodies.
 4. **BeamNG-style node+beam solver** for vehicles, on top of XPBD.
@@ -80,17 +101,27 @@ GitHub tracker: **#52**.
 
 ---
 
-## Web UI scene editor
+## Web UI scene editor ✓ DONE (superseded)
 
-**Status (speculative):** All scene editing is via console commands
-today (typed or pasted into the web/in-game console).
+**Status:** Shipped — as a React 18 + Vite multi-panel editor under
+`web/editor/`, not the vanilla-JS side panel sketched below. Seven
+panels (scene-hierarchy, inspector, asset-browser, toolbar,
+material-editor, lights, render-settings) are registered in
+`src/editor/EditorRoutes.cpp` and served from the engine's HTTP
+server; each opens in its own Chrome `--app` window via `panel_open`
+/ `panel_close` / `panel_open_all` / `panels` (F2–F8 hotkeys
+in-engine). Panel state lives in a zustand store fed by the console
+WebSocket's scene protocol (`list_scene`, selection, property edits
+via `src/editor/SceneGraph.cpp`), with a viewport gizmo overlay for
+transforms and undo/redo. The npm build is embedded into the binary
+by `cmake/Editor.cmake`. See `web/editor/CONTRIBUTING.md` for the
+workspace layout and panel-authoring guide.
 
-**Why not filed as an issue:** the console is enough to drive the
-demo. A real editor is a meaningful chunk of vanilla-JS work and not
-on the critical path for any headline work item. Worth picking up if
-someone wants to onboard non-developer scene authors.
+Live re-bake through the engine's async bake job — the one hard
+requirement in the original sketch — is exactly how the shipped
+panels drive edits, so nothing from the sketch remains open.
 
-**Plan if picked up:**
+**Original sketch (kept as design archeology):**
 - Add a side panel showing the current `prim_list` + CSG tree.
 - Sliders for primitive transforms; each input change → throttled
   `prim_sphere <id> ...` or `csg_set_transform ...` command.
@@ -119,23 +150,33 @@ cover):**
 
 ---
 
-## Analytical CSG (SDFs / boolean of analytic primitives)
+## Analytical CSG (SDFs / boolean of analytic primitives) ✓ DONE (SDF path)
 
-**Status (speculative):** CSG today goes through Manifold (mesh
-booleans). Analytic booleans (sphere - cylinder etc.) require ray
-marching against an SDF or hit-test trees.
+**Status:** The **SDF path** below shipped as the SDF cluster system
+(Phases 1–3, issues #97 / #98 / #99): analytic SDF leaves
+(`sdf_sphere` / `sdf_box` / `sdf_round_box` / `sdf_torus` /
+`sdf_capsule`) combined with smooth booleans (`sdf_smin` / `sdf_smax`
+/ `sdf_sdiff`), procedural ops (`sdf_displace_noise` / `sdf_twist` /
+`sdf_bend` / `sdf_repeat` / `sdf_repeat_limited`), and fractal DEs
+(`sdf_mandelbulb` / `sdf_mandelbox` / `sdf_apollonian`) —
+sphere-traced inside the path-trace kernel via
+`shaders/SdfPrimitives.slang` and `shaders/SdfFractals.slang`, folded
+into `AnalyticBvh` as the third hit type the sketch predicted. See
+the SDF Phase 3 DONE entry below for the fractal-DE trade-offs.
+Mesh CSG via Manifold remains the headline for exact booleans.
 
-**Why not filed as an issue:** Mesh CSG is the headline. Analytic
-CSG is a different algorithm (raymarched SDFs or inside-outside hit
-walks); we'd want it only when the user has a use case the current
-pipeline can't cover.
+**Still unpicked:** the **hit-walk path** (exact, non-marched boolean
+of analytic primitives by sorting leaf hits and walking the tree) and
+a `pt::csg::AnalyticCsgScene` mirroring `CsgScene`'s API — worth
+doing only if a use case needs exact analytic booleans that neither
+the raymarched SDF clusters nor Manifold covers.
 
-**Plan if picked up:**
+**Original sketch (kept as design archeology):**
 - Maintain a parallel `pt::csg::AnalyticCsgScene` with leaf
   primitives + boolean nodes, mirroring `CsgScene`'s API.
 - Two implementation paths:
   - **SDF path:** evaluate `min/max/-` of leaf SDFs in the shader,
-    ray-march.
+    ray-march. *(← this is what shipped)*
   - **Hit-walk path:** intersect ray with all leaves, sort hits,
     walk the tree to determine which segment is inside the result.
 - The unified renderer already supports both an analytic primitive

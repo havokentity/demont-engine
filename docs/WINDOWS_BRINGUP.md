@@ -1,11 +1,16 @@
 # Windows / NVIDIA bringup — Claude handoff
 
+> **HISTORICAL** — PR #1 merged 2026-05-08 as `v0.3.0`; the
+> `feature/windows-nvidia` branch is deleted and Windows/Vulkan is
+> mainline (the open mismatches below were resolved before merge).
+> Kept as bringup archeology — do not follow the branch instructions.
+
 > Self-contained context-restore for a fresh Claude session running on
 > the user's Windows + NVIDIA RTX box. The previous Mac session got
 > this branch through CI; runtime testing happens here.
 
-**Branch:** `feature/windows-nvidia` (PR #1, *open*, **not merged**)
-**Target tag:** `v0.3.0` once runtime is proven and the PR lands
+**Branch:** `feature/windows-nvidia` (PR #1, merged 2026-05-08; branch deleted)
+**Target tag:** `v0.3.0` — shipped when the PR landed
 **Phase in plan:** P12 — Windows bringup with native Vulkan
 (the 13-phase plan lives in `Raytracer Plan/*.html`)
 

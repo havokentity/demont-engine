@@ -1,5 +1,11 @@
 # Vulkan swapchain sRGB encoding fix — deploy & test
 
+> **HISTORICAL (2026-07-08):** this fix shipped with the Windows
+> bringup (PR #1, merged 2026-05-08) and lives on `main`; the
+> `feature/windows-nvidia` branch referenced below has been deleted.
+> Kept as deploy/test archeology — for a fresh checkout just build
+> `main`.
+
 > Commit landed. Pull, build, test, decide.
 
 ## TL;DR for the user
@@ -39,13 +45,11 @@ linear correctly instead of double-decoding.
 ## How to deploy
 
 ```sh
-git fetch origin feature/windows-nvidia
-git reset --hard origin/feature/windows-nvidia    # or rebase / merge
+# Historical instructions -- the branch is merged + deleted; today this
+# is just: git pull on main, then
 cmake --build build/win-debug --parallel
 .\build\win-debug\src\app\demont.exe
 ```
-
-If Win Claude has local in-flight work, rebase rather than reset.
 
 ## What to expect visually
 

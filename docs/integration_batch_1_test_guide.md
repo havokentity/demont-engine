@@ -1,19 +1,26 @@
 # demont-engine: integration/parallel-batch-1 — manual test guide
 
+> **HISTORICAL** — batch-1 was promoted to `main` on 2026-05-18 and
+> integration waves 2–10 have landed on top since. Counts pinned below
+> (44/44 golden cells, "freshly stable" Vulkan-RTX floor) describe the
+> batch-1 snapshot, not HEAD. Kept as the manual-test archive for the
+> batch; the per-feature "How to test" recipes still work as
+> regression checks.
+
 This guide enumerates every feature / fix / change that landed in
-`integration/parallel-batch-1` so you can smoke-test before the
-consolidated `integration → main` merge. Organized by area; each entry
-lists the PR number, what it does, new cvars / cfg fields, recommended
-test fixture, and scope / known limitations.
+`integration/parallel-batch-1`; it was written to smoke-test the batch
+before the consolidated `integration → main` merge. Organized by area;
+each entry lists the PR number, what it does, new cvars / cfg fields,
+recommended test fixture, and scope / known limitations.
 
 **Integration HEAD when written:** `6a161b5313840f7d2c215493a29cb3f2b33cc05d`
 **Branch fork point from main:** `d3df587` (`docs(agents): use mkdir-lockdir (portable) instead of flock (linux-only)`)
 **Total PRs merged into batch-1:** 26 feature/fix PRs (#120-#128, #137, #141-#159, #163, #165, #166)
 
-This is the first integration batch since the parallel-agent protocol
+This was the first integration batch since the parallel-agent protocol
 went live. Roughly two dozen feature branches were merged into the
-shared integration branch over a single weekend; this guide is the
-manual-test inventory needed before promoting integration to main.
+shared integration branch over a single weekend; this guide was the
+manual-test inventory used before promoting integration to main.
 
 > Caveat from project memory: Mac-Vulkan was historically untested
 > before 2026-05-16 -- the user ran Metal + Software on Mac only.
