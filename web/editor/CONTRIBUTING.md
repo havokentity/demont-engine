@@ -210,20 +210,29 @@ type SceneObject = AnalyticPrim | AnalyticLight | UnknownObject;
 interface AnalyticPrim {
   kind: 'prim';
   id: number;
-  type: 0 | 1;            // Sphere | Plane
-  material: 0 | 1 | 2 | 3; // Lambert | Metal | Dielectric | Water
-  pos: [number, number, number];
-  radius: number;
+  type: 'sphere' | 'plane';  // lowercase string names on the wire
+  material: 'lambert' | 'metal' | 'dielectric' | 'water';
+  // Sphere records carry pos + radius; plane records carry
+  // normal + d (distance from origin) instead.
+  pos?: [number, number, number];
+  radius?: number;
+  normal?: [number, number, number];
+  d?: number;
   albedo: [number, number, number];
   roughness: number;
   ior: number;
   emission: [number, number, number];
+  orient?: [number, number, number, number];  // quaternion, xyzw
 }
 ```
 
-The engine-side JSON shape may be either a flat `objects[]` array OR
-per-kind buckets (`prims[]`, `lights[]`, ...). The store's
-`flattenScene()` helper handles both -- you always read
+The engine's `SerializeScene` (src/editor/SceneGraph.cpp) emits
+per-kind buckets -- `primitives[]`, `lights[]`, `sdf[]`,
+`rigid_bodies[]` -- and stamps every record with a `kind`
+discriminator (`'prim' | 'light' | 'sdf' | 'rb'`, the same strings
+the `select` command and `selection_change` event use). The store's
+`flattenScene()` helper flattens the buckets, preserving each
+record's own `kind` -- you always read
 `useSceneStore(s => s.objects)`.
 
 ## Engine commands and cvars

@@ -79,6 +79,7 @@ void CollectRigidBody(pt::physics::PhysicsSystem::RbHandle h,
     const float vy = b.curr_pos.y - b.prev_pos.y;
     const float vz = b.curr_pos.z - b.prev_pos.z;
     json j = {
+        {"kind",         "rb"},
         {"id",           h},
         {"prim_id",      prim_id},
         {"pos",          {b.curr_pos.x, b.curr_pos.y, b.curr_pos.z}},
@@ -118,10 +119,14 @@ int SelectionKindFromString(std::string_view s) {
 json SerializeScene(const pt::engine::Engine& engine) {
     json out;
 
-    // Analytic primitives.
+    // Analytic primitives. Every record carries a `kind` discriminator
+    // matching SelectionKindToString so the panels' store can bucket
+    // objects without guessing from the top-level array name (the
+    // Scene Hierarchy sections key on kind ∈ {prim, light, sdf, rb}).
     json prims = json::array();
     for (const auto& [id, p] : engine.Primitives()) {
         json j = {
+            {"kind",      "prim"},
             {"id",        id},
             {"type",      (p.type == pt::engine::Engine::AnalyticPrim::Sphere) ? "sphere" : "plane"},
             {"material",  MaterialName(p.material)},
@@ -166,6 +171,7 @@ json SerializeScene(const pt::engine::Engine& engine) {
     json lights = json::array();
     for (const auto& [id, L] : engine.Lights()) {
         json j = {
+            {"kind",      "light"},
             {"id",        id},
             {"type",      LightTypeName(L.type)},
             {"pos",       {L.pos[0], L.pos[1], L.pos[2]}},
@@ -200,6 +206,7 @@ json SerializeScene(const pt::engine::Engine& engine) {
     json sdfs = json::array();
     for (const auto& [id, S] : engine.SdfPrims()) {
         json j = {
+            {"kind",       "sdf"},
             {"id",         id},
             {"node_count", S.node_count},
             {"aabb_min",   {S.aabb_min[0], S.aabb_min[1], S.aabb_min[2]}},

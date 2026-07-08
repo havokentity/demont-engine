@@ -45,25 +45,34 @@ export type LightTypeId = keyof typeof LightTypeName;
 export interface AnalyticPrim {
   kind: 'prim';
   id: number;
-  type: PrimTypeId;
-  type_name: string;
-  material: MaterialId;
-  material_name: string;
-  // For Sphere: pos = sphere center; radius = sphere radius.
-  // For Plane: pos = plane normal; radius = plane d (distance from origin).
-  pos: [number, number, number];
-  radius: number;
+  // SerializeScene emits the lowercase string name ('sphere' | 'plane');
+  // the numeric enum id is tolerated for older snapshots.
+  type: PrimTypeId | string;
+  // Optional legacy alias -- the engine emits `type`, not `type_name`.
+  type_name?: string;
+  material: MaterialId | string;
+  material_name?: string;
+  // Sphere: pos = center, radius = sphere radius.
+  // Plane: the engine emits `normal` + `d` instead of pos/radius.
+  pos?: [number, number, number];
+  radius?: number;
+  normal?: [number, number, number];
+  d?: number;
   albedo: [number, number, number];
   roughness: number;
   ior: number;
   emission: [number, number, number];
+  // Orientation quaternion (xyzw); identity for unrotated prims.
+  orient?: [number, number, number, number];
 }
 
 export interface AnalyticLight {
   kind: 'light';
   id: number;
-  type: LightTypeId;
-  type_name: string;
+  // Lowercase string name ('point' | 'spot' | 'sphere' | 'quad') as
+  // emitted by SerializeScene; numeric id tolerated for older snapshots.
+  type: LightTypeId | string;
+  type_name?: string;
   pos: [number, number, number];
   // sphere only -- 0 for point/spot/quad
   radius: number;
