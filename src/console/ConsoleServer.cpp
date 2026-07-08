@@ -10,6 +10,9 @@
 #include <civetweb.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <array>
+
 #include <fmt/format.h>
 
 // Cross-platform sockets: POSIX BSD on macOS/Linux, Winsock2 on Windows.
@@ -316,17 +319,29 @@ int ConsoleServer::WsConnectHandler(const mg_connection* conn, void* cbdata) {
     auto* self = static_cast<ConsoleServer*>(cbdata);
     const auto* req = mg_get_request_info(conn);
 
-    // Origin check: same-origin or absent (raw clients).
+    // Origin check: same-origin, absent (raw clients), or the Vite dev
+    // servers. In dev mode (r_editor_dev_mode) the panels are served
+    // from Vite on :5173 (dev) / :5174 (preview) -- see
+    // web/editor/vite.config.ts (strictPort) -- but their WebSocket
+    // still targets the engine's HTTP port directly (endpoint.ts), so
+    // the handshake arrives with a cross-origin Origin header.
     if (req != nullptr) {
         for (int i = 0; i < req->num_headers; ++i) {
             if (PT_STRCASECMP(req->http_headers[i].name, "Origin") == 0) {
                 std::string origin = req->http_headers[i].value
                                      ? req->http_headers[i].value : "";
-                std::string ok1 = fmt::format("http://{}:{}",
-                    self->config_.bind_address, self->config_.http_port);
-                std::string ok2 = fmt::format("http://localhost:{}",
-                    self->config_.http_port);
-                if (origin != ok1 && origin != ok2) {
+                const std::array<std::string, 6> allowed = {
+                    fmt::format("http://{}:{}",
+                        self->config_.bind_address, self->config_.http_port),
+                    fmt::format("http://localhost:{}", self->config_.http_port),
+                    std::string("http://localhost:5173"),
+                    std::string("http://localhost:5174"),
+                    std::string("http://127.0.0.1:5173"),
+                    std::string("http://127.0.0.1:5174"),
+                };
+                const bool ok = std::find(allowed.begin(), allowed.end(),
+                                          origin) != allowed.end();
+                if (!ok) {
                     LOG_WARN("WS rejected: bad Origin '{}'", origin);
                     return 1;  // reject
                 }
