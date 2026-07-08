@@ -4039,6 +4039,7 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
                                     : VK_NULL_HANDLE;
         VkBuffer    exposure_buf = LookupBuffer(d.exposure_state);
 
+        denoiser_->SetTonemapOp(d.tonemap_op);
         denoiser_->EncodeFinalizeOnly(wrapped_cb_->Raw(),
                                       color_view, output_view,
                                       exposure_buf,
@@ -4105,6 +4106,7 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
         (d.kind == DenoiseDesc::Kind::SvgfNoFinalize)
             ? TextureHandle{0}
             : d.final_output;
+    denoiser_->SetTonemapOp(d.tonemap_op);
     denoiser_->Encode(wrapped_cb_->Raw(),
                       d.color_in, d.depth_in, d.motion_in,
                       d.normal_in,

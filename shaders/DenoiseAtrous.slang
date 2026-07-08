@@ -324,7 +324,12 @@ void main(uint2 tid : SV_DispatchThreadID) {
     if (demod_enabled != 0u && final_remod != 0u) {
         float3 a = albedo_tex[uint2(tid)].rgb;
         if (!isSkyAlbedo(a)) {
-            filtered_color *= a;
+            // Multiply back by the SAME clamped divisor the demod pass
+            // used (max(a, kDemodEps) per channel) so demod<->remod is
+            // an exact round trip -- raw albedo darkened any channel
+            // below the eps floor 10x (kept in lockstep with
+            // DenoiseRemod.slang).
+            filtered_color *= max(a, float3(kDemodEps, kDemodEps, kDemodEps));
         }
     }
     // Preserve the sample-count tag from the input so subsequent

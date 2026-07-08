@@ -3412,6 +3412,36 @@ float3 skyColor(float3 rd) {
              + sunDisc(rd, sun_and_mode.xyz);
 }
 
+// Sky WITHOUT the sun/moon disc + halo overlays. The diffuse-ambient
+// estimator in the Lambert NEE block must not see the celestial discs:
+// sun and moon direct light are integrated by their own NEE blocks
+// (with real shadow rays), so an ambient tap that includes disc/halo
+// radiance double-counts them with NO visibility test -- sun-facing
+// slopes at sunset read visibly too bright and receive unshadowed
+// "ambient" sun. Mirrors the composite-subtraction at the primary-miss
+// branch, which is the single source of truth for which terms count as
+// celestial overlays.
+float3 skyColorBase(float3 rd) {
+    uint mode = uint(sun_and_mode.w);
+    if (mode == 3u) {
+        // Hosek-Wilkie dome radiance carries no inline disc; skyColor
+        // adds sunDisc/moonDisc on top, which is exactly what we skip.
+        return hosekSky(rd, sun_and_mode.xyz);
+    }
+    if (mode == 2u) {
+        // procSky bakes its own inline sun disc + halo -- subtract it
+        // with the same helper the celestial composite uses.
+        return procSky(rd, sun_and_mode.xyz)
+             - procSkyInlineSunDiscAndHalo(rd, sun_and_mode.xyz);
+    }
+    if (env_map_present != 0u) {
+        // HDRI path adds no procedural overlays; the map IS the base.
+        return skyColor(rd);
+    }
+    float t = clamp(0.5 * (rd.y + 1.0), 0.0, 1.0);
+    return lerp(float3(0.50, 0.55, 0.62), float3(1.0, 1.0, 1.0), t);
+}
+
 float3 acesTonemap(float3 c) {
     const float a = 2.51, b = 0.03, d = 2.43, e = 0.59, f = 0.14;
     return saturate((c*(a*c+b))/(c*(d*c+e)+f));
@@ -3495,6 +3525,12 @@ float3 agxTonemap(float3 c) {
     const float3 or1 = float3(-0.0528968517574562, 1.15190312990417,   -0.0989611768448433);
     const float3 or2 = float3(-0.0529716355144438,-0.0980434501171241,  1.15107367264116);
     v = float3(dot(or0, v), dot(or1, v), dot(or2, v));
+    // Linearize out of AgX's base encoding. The sigmoid fit above
+    // outputs in the AgX working encoding (~sRGB 2.2-gamma); the
+    // reference (Wrensch's agxEotf, Filament) applies pow(2.2) here.
+    // Without it the swapchain's sRGB OETF encodes an ALREADY-encoded
+    // signal -- washed-out, lifted-black AgX frames.
+    v = pow(max(v, float3(0.0)), float3(2.2));
     return saturate(v);
 }
 
@@ -3728,6 +3764,11 @@ struct LightSample {
     float  dist;       // distance from hit to the sampled point (shadow
                        //   ray t_max). 1e30 sentinel means "no hit"
                        //   already; not used here.
+    uint   light_idx;  // which light_prims entry the sample came from --
+                       //   the ReSTIR reservoir stores this so the
+                       //   temporal/spatial merge passes re-evaluate
+                       //   p_hat against the light that actually
+                       //   produced the survivor.
 };
 
 // 5 float4s per light. Indexed by raw float4 lane offsets to keep the
@@ -3976,6 +4017,7 @@ LightSample sampleAnalyticLight(float3 hit_pt, float3 n_face, inout uint seed) {
     s.Le   = float3(0.0);
     s.pdf  = 0.0;
     s.dist = 1e30;
+    s.light_idx = 0u;
     if (light_count == 0u) return s;
 
     uint  pick;
@@ -4004,6 +4046,7 @@ LightSample sampleAnalyticLight(float3 hit_pt, float3 n_face, inout uint seed) {
     }
 
     LightRecord L = loadLight(pick);
+    s.light_idx = pick;
 
     if (L.type == LIGHT_POINT) {
         float3 to_light = L.pos - hit_pt;
@@ -5022,7 +5065,8 @@ float3 atmosphericTransmittance(float3 ro, float3 rd, float t) {
 // to the shadow-ray scene query keeps the shadow consistent with the
 // rendered surface -- a sphere that primary-hit at the prev-frame end
 // of its swept volume should cast a shadow against that same position.
-float3 transmittance(float3 ro, float3 rd, float t_max, float shutter_t01) {
+float3 transmittance(float3 ro, float3 rd, float t_max, float shutter_t01,
+                     int start_in_water = 0) {
     // Cloud optical depth along the original (un-refracted) ray. Real
     // clouds live in a layer high above the scene -- approximating the
     // shadow as the straight-line cloud path is fine because no glass
@@ -5036,8 +5080,28 @@ float3 transmittance(float3 ro, float3 rd, float t_max, float shutter_t01) {
     float3 t = float3(1.0);
     float3 o = ro;
     float3 d = rd;
+#if PT_WATER_ENABLED
+    // Per-segment Beer's-law bookkeeping. Callers whose shadow ray
+    // starts underwater (Lambert NEE from submerged geometry) pass
+    // start_in_water = 1; each MAT_WATER refraction below flips the
+    // state. The camera/bounce path applies EXACT per-segment
+    // absorption, and the old fixed "nominal 1.5 m per crossing"
+    // shortcut here let direct sun light reach a 10 m sea floor at
+    // near-full strength while the viewing path was dimmed by the
+    // true exp(-absorb * depth) -- deep water looked sun-lit from
+    // above but murky to the eye.
+    int sr_in_water = start_in_water;
+#endif
     for (int i = 0; i <= kMaxRefract; ++i) {
         HitInfo h = traceScene(o, d, shutter_t01);
+#if PT_WATER_ENABLED
+        // Absorb along however much of this segment lies in water --
+        // up to the hit, or up to t_max on the final unoccluded leg.
+        if (sr_in_water == 1) {
+            float seg = h.hit ? min(h.t, t_max) : t_max;
+            t *= exp(-water_params0.xyz * max(seg, 0.0));
+        }
+#endif
         if (!h.hit || h.t >= t_max) return t * cloud_t;     // unoccluded
         // Water (#134) joins dielectric on the transmissive-blocker list.
         // Both refract the shadow ray; only water folds Beer's-law
@@ -5089,11 +5153,12 @@ float3 transmittance(float3 ro, float3 rd, float t_max, float shutter_t01) {
         // (which would be neutral 1,1,1 for a water plane).
 #if PT_WATER_ENABLED
         if (h.mat == MAT_WATER) {
-            float3 absorb = water_params0.xyz;
-            // Same nominal segment used in the water BRDF branch -- keeps
-            // shadow-ray attenuation visually consistent with primary-ray
-            // throughput tint when sunlight reaches the underwater geometry.
-            t *= (1.0 - fr) * exp(-absorb * 1.5);
+            // Fresnel-transmitted fraction only. Absorption is applied
+            // per-SEGMENT at the top of the loop (matching the exact
+            // Beer's law the camera path uses), so crossing the
+            // interface just flips which side of the surface we're on.
+            t *= (1.0 - fr);
+            sr_in_water = 1 - sr_in_water;
         } else {
             t *= (1.0 - fr) * h.albedo;
         }
@@ -6103,28 +6168,29 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // tests the clear lacquer coat. With probability p = weight *
         // Fresnel(coat) the ray reflects off the coat (an independent GGX
         // gloss lobe, IOR 1.5) and this bounce is done; otherwise it
-        // transmits through the coat and falls through to the base material
-        // dispatch below, attenuated by (1 - p) folded into the selection
-        // (the base path keeps full throughput because the complementary
-        // 1/(1-p) weight cancels the (1-p) transmission -- standard
-        // one-sample MIS-free lobe selection). Bit-identical when the flag
-        // is clear (h.mat_ext defaults 0, so this whole block is skipped).
+        // transmits through the coat and falls through to the base
+        // material dispatch below. Selecting the branch WITH probability
+        // p and NOT reweighting either side leaves the physical energy
+        // split in expectation: coat = p * G2/G1 = weight*F*G2/G1, base
+        // = (1 - weight*F) * base_reflectance. (The previous form divided
+        // the coat by p and the base by (1-p), cancelling both losses --
+        // total reflectance F + base > 1, so a coated white sphere GAINED
+        // energy in a furnace test and brightened every bounce.)
+        // Bit-identical when the flag is clear (h.mat_ext defaults 0, so
+        // this whole block is skipped).
         if ((h.mat_ext & MAT_EXT_CLEARCOAT) != 0u && h.clearcoat_weight > 0.0) {
             float cos_v = clamp(dot(nf, -rd), 0.0, 1.0);
             float fc = clearcoatFresnel(cos_v);
             float p_coat = clamp(h.clearcoat_weight * fc, 0.0, 0.99);
             if (randf(seed) < p_coat) {
-                // Reflect off the coat. The VNDF weight is the masking
-                // ratio; the Fresnel + 1/p selection weight is folded here
-                // so the coat lobe is energy-conserving. (F/p == 1 since
-                // p == weight*F and we divide by weight; the residual
-                // weight factor keeps multi-coat compositions correct.)
+                // Reflect off the coat. cs.weight is the VNDF masking
+                // ratio G2/G1; the Fresnel * weight energy factor is
+                // carried by the selection probability itself (one-
+                // sample estimator), so no 1/p reweight -- that's what
+                // keeps the layer energy-conserving.
                 CoatSample cs = sampleClearcoat(nf, -rd, h.clearcoat_rough, seed);
                 if (!cs.valid) { break; }
-                // throughput *= F * G2/G1 / p_coat. F == fc (scalar,
-                // achromatic lacquer), p_coat == weight*fc, so F/p_coat ==
-                // 1/weight; the masking ratio cs.weight remains.
-                throughput *= cs.weight * (fc / p_coat);
+                throughput *= cs.weight;
                 ro = hit_pt + nf * 1e-3;
                 rd = cs.dir;
                 skip_sky_on_miss = false;
@@ -6139,10 +6205,11 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 }
                 continue;
             }
-            // Coat transmission: divide by the complementary probability so
-            // the base material below carries unbiased energy. (1 - p_coat)
-            // > 0 always holds because p_coat is clamped to <= 0.99.
-            throughput /= (1.0 - p_coat);
+            // Coat transmission: NO reweight. The (1 - p_coat) selection
+            // probability IS the coat's physical transmission loss in
+            // expectation -- dividing it back out (the old form) handed
+            // the base its full unattenuated energy on top of the coat's
+            // Fresnel reflection.
         }
         // --- end Wave 9 clearcoat lobe ------------------------------------
 
@@ -6208,12 +6275,20 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     // light's own surface doesn't self-block.
                     float t_max = max(ls.dist - 1e-3, 0.0);
                     float3 trans = transmittance(hit_pt + nf * 1e-3,
-                                                 ls.dir, t_max, shutter_t01);
+                                                 ls.dir, t_max, shutter_t01,
+                                                 in_water);
                     if (any(trans > float3(0.0))) {
                         float3 brdf = h.albedo / 3.14159265358979;
-                        radiance += clampIndirect(
-                            throughput * ls.Le * trans * brdf *
-                            n_dot_l / ls.pdf);
+                        float3 c = throughput * ls.Le * trans * brdf *
+                                   n_dot_l / ls.pdf;
+                        // Direct light at the primary hit is a LOW-
+                        // variance estimate -- clamping it dims bright
+                        // close lights ~2.5x and visibly flattens the
+                        // inverse-square falloff (the procedural sun
+                        // NEE is deliberately unclamped for the same
+                        // reason). The clamp earns its keep only on
+                        // the high-variance indirect bounces.
+                        radiance += (b == 0u) ? c : clampIndirect(c);
                     }
                 }
             }
@@ -6279,26 +6354,16 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         res.Le        = ls.Le;
                         res.pdf_solid = ls.pdf;
                         res.dist      = ls.dist;
-                        // light_idx: which entry in light_prims. The
-                        // candidate sampler picks uniformly so its
-                        // index is `uint(u_pick * float(light_count))`
-                        // — but sampleAnalyticLight doesn't return
-                        // the index, only the sample. Re-sampling
-                        // would consume an RNG step. For Phase A we
-                        // recover the index by the same picker
-                        // arithmetic on a fresh draw, accepting that
-                        // the spatial/temporal merge passes' p_hat
-                        // re-evaluation reads light_prims[light_idx]
-                        // to recompute Le_pre at the new receiver --
-                        // a tiny pdf inaccuracy on the merged
-                        // estimator's bookkeeping, dominated by the
-                        // shadow + Lambert factors RestirFinal
-                        // applies. A follow-up that threads the
-                        // index out of sampleAnalyticLight is a
-                        // straightforward refactor.
-                        res.light_idx = min(uint(randf(seed) *
-                                                float(light_count)),
-                                            light_count - 1u);
+                        // light_idx: the entry the SURVIVOR was
+                        // actually sampled from, threaded out of
+                        // sampleAnalyticLight. The previous form drew
+                        // a fresh independent uniform index here --
+                        // wrong with probability (N-1)/N -- so the
+                        // temporal/spatial merge passes recomputed
+                        // p_hat (and light type / intensity / spot
+                        // params) against an unrelated light and the
+                        // reuse chain resampled garbage.
+                        res.light_idx = ls.light_idx;
                     }
                 }
                 finalizeReservoir(res);
@@ -6334,7 +6399,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     // between this hit and the light -- 1.0 free path,
                     // 0.0 fully blocked, in-between for refraction
                     // through glass / diamond meshes (caustics).
-                    float3 trans = transmittance(hit_pt + nf * 1e-3, env.dir, 1e30, shutter_t01);
+                    float3 trans = transmittance(hit_pt + nf * 1e-3, env.dir, 1e30, shutter_t01, in_water);
                     if (any(trans > float3(0.0))) {
                         float3 brdf = h.albedo / 3.14159265358979;
                         float pdf_brdf_at_env = n_dot_l * (1.0 / 3.14159265358979);
@@ -6367,11 +6432,17 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     HdriLightSample hl = sampleHdriLight(seed);
                     float n_dot_l = dot(nf, hl.dir);
                     if (n_dot_l > 0.0 && hl.pdf > 0.0) {
-                        float3 t_s = transmittance(hit_pt + nf * 1e-3, hl.dir, 1e30, shutter_t01);
+                        float3 t_s = transmittance(hit_pt + nf * 1e-3, hl.dir, 1e30, shutter_t01, in_water);
                         if (any(t_s > float3(0.0))) {
                             float3 brdf = h.albedo / 3.14159265358979;
-                            radiance += clampIndirect(
-                                throughput * hl.color * t_s * brdf * n_dot_l / hl.pdf);
+                            float3 c = throughput * hl.color * t_s *
+                                       brdf * n_dot_l / hl.pdf;
+                            // Same convention as the analytic-light NEE:
+                            // direct light at the primary hit stays
+                            // unclamped (low variance; clamping dims
+                            // bright sun clusters), indirect bounces
+                            // keep the firefly clamp.
+                            radiance += (b == 0u) ? c : clampIndirect(c);
                         }
                     }
                 }
@@ -6384,34 +6455,18 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 // incomplete, not a missing engine feature. Pick an
                 // HDRI with the moon baked in or switch r_sky_mode to
                 // procedural.
-                // Diffuse skylight ambient via cosine-weighted hemisphere
-                // sample. Previous version sampled skyColor() at the
-                // surface normal exactly -- a single-direction shortcut
-                // that causes severe per-pixel fireflies on HDRI scenes:
-                // every pixel whose surface normal happens to align with
-                // the HDRI sun direction (a 1e6-nit pixel) gets a huge
-                // single-sample contribution, producing the classic
-                // sphere-speckle pattern visible on Lambert surfaces
-                // under sunset/noon HDRIs. Cosine-weighted hemisphere
-                // sampling integrates properly: the per-frame value is
-                // a random hemisphere tap, and spp + temporal averaging
-                // converges to the true diffuse irradiance. Bypasses
-                // cloud occlusion intentionally (skyColor reads env_map
-                // directly), so cloud-shadowed surfaces still receive
-                // ambient light -- the same approximation the original
-                // hack made, just without the firefly artifact.
-                {
-                    float xi_a = randf(seed), xi_b = randf(seed);
-                    float r    = sqrt(xi_a);
-                    float phi  = 6.28318530717958 * xi_b;
-                    float3 t1  = abs(nf.y) < 0.99 ? float3(0, 1, 0) : float3(1, 0, 0);
-                    float3 tx  = normalize(cross(t1, nf));
-                    float3 ty  = cross(nf, tx);
-                    float3 amb_dir = tx * (r * cos(phi))
-                                   + ty * (r * sin(phi))
-                                   + nf * sqrt(max(0.0, 1.0 - xi_a));
-                    radiance += clampIndirect(throughput * h.albedo * skyColor(amb_dir));
-                }
+                // NO separate diffuse "ambient" tap here. Env-NEE above
+                // (importance-sampled from the HDRI CDF) plus the MIS-
+                // weighted bounce-ray sky-miss complement (or, with MIS
+                // off, env-NEE alone with the miss suppressed) already
+                // form a COMPLETE estimator of the diffuse environment
+                // integral. A previous cosine-hemisphere "ambient" tap
+                // here re-integrated the same integral a second time --
+                // a clean 2x over-count of diffuse env light (white-
+                // furnace: albedo-1 Lambert under a uniform L=1 map
+                // returned exitant 2.0). The two RNG draws it consumed
+                // are gone with it; HDRI goldens regenerate darker by
+                // the duplicated diffuse term.
                 // With MIS we KEEP the bounce-ray sky-miss contribution
                 // and balance-heuristic-weight both sides. Without MIS
                 // we suppress the miss to avoid double-counting NEE.
@@ -6429,7 +6484,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     float n_dot_l = max(0.0, dot(nf, sun_dir));
                     float3 sun_jit = sampleSunDisc(sun_dir, seed);
                     float3 trans  = (n_dot_l > 0.0)
-                        ? transmittance(hit_pt + nf * 1e-3, sun_jit, 1e30, shutter_t01)
+                        ? transmittance(hit_pt + nf * 1e-3, sun_jit, 1e30,
+                                        shutter_t01, in_water)
                         : float3(0.0);
                     if (n_dot_l > 0.0 && any(trans > float3(0.0))) {
                         // Atmospheric attenuation: optical depth times
@@ -6471,7 +6527,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         float3 moon_jit = sampleSunDisc(moon_dir_phase.xyz, seed);
                         float ndl = max(0.0, dot(nf, moon_jit));
                         if (ndl > 0.0) {
-                            float3 t_m = transmittance(hit_pt + nf * 1e-3, moon_jit, 1e30, shutter_t01);
+                            float3 t_m = transmittance(hit_pt + nf * 1e-3, moon_jit, 1e30, shutter_t01, in_water);
                             if (any(t_m > float3(0.0))) {
                                 // Atmospheric attenuation + warmth at low
                                 // moon altitude, mirroring sun radiance.
@@ -6495,12 +6551,16 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         }
                     }
                 }
-                // Calculated diffuse skylight ambient (matches the
-                // env_map branch above). Sample the procedural sky
-                // model at the surface normal -- single-direction
-                // Lambert ambient approximation, real and derived
-                // from the sky model rather than hardcoded RGB.
-                radiance += throughput * h.albedo * skyColor(nf);
+                // Calculated diffuse skylight ambient. Sample the sky
+                // BASE dome at the surface normal -- single-direction
+                // Lambert ambient approximation, real and derived from
+                // the sky model rather than hardcoded RGB. Deliberately
+                // skyColorBase, not skyColor: the full sky includes the
+                // sun disc + up-to-8-degree horizon halo and the moon
+                // disc, and a normal pointing near a celestial body
+                // would receive its direct radiance as unshadowed
+                // "ambient" ON TOP of the explicit sun/moon NEE above.
+                radiance += throughput * h.albedo * skyColorBase(nf);
                 skip_sky_on_miss = true;
             }
             throughput *= h.albedo;
@@ -6881,13 +6941,21 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 float  sigma_0 = vol_params.x;
                 float  t_far   = min(primary_t, 60000.0);
                 float  dt      = t_far / float(N);
-                float  jitter  = randf(seed) * dt;
+                // Stratified jitter IN [0, 1) of a cell -- combined with
+                // the plain (vi + jit) offset below this covers
+                // [0, t_far) exactly. The old mid-cell + full-cell-
+                // jitter form sampled [0.5dt, t_far + 0.5dt): the first
+                // half step of haze in front of the camera (~1.9 km at
+                // the 60 km / 16-sample default!) was NEVER sampled --
+                // a bias no amount of temporal accumulation converges
+                // away, and ground fog is densest exactly there.
+                float  jitter  = randf(seed);
                 float3 trans_eye = float3(1.0);
                 float3 v_color = float3(0.0);
                 float phase_mie_v = phase;   // HG, computed earlier
                 float phase_ray_v = (3.0 / (16.0 * kPi)) * (1.0 + cos_theta * cos_theta);
                 for (int vi = 0; vi < N; ++vi) {
-                    float t = (float(vi) + 0.5) * dt + jitter;
+                    float t = (float(vi) + jitter) * dt;
                     if (t >= t_far) break;
                     float3 sp = primary_ro + primary_rd * t;
                     float h = max(sp.y, 0.0);
@@ -7048,7 +7116,10 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         Nc = clamp(target, Nc, 48);
                     }
                     float dtc = (t_out - t_in) / float(Nc);
-                    float jitc = randf(seed) * dtc;
+                    // Stratified: (vi + jitc) * dtc covers the slab
+                    // exactly (see the Mie/Rayleigh march above for the
+                    // half-cell-bias rationale).
+                    float jitc = randf(seed);
                     float trans_eye_c = 1.0;
                     float3 v_color_c  = float3(0.0);
                     // Phase 4 cvar pull. vol_density_scale clamps to a
@@ -7109,7 +7180,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         }
                     }
                     for (int vi = 0; vi < Nc; ++vi) {
-                        float t = t_in + (float(vi) + 0.5) * dtc + jitc;
+                        float t = t_in + (float(vi) + jitc) * dtc;
                         if (t > t_out) break;
                         float3 sp = primary_ro + primary_rd * t;
                         // Phase 4: heterogeneous density (procedural fbm

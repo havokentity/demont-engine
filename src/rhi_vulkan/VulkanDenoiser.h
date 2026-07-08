@@ -112,6 +112,14 @@ public:
     // True after Init() succeeded. Used by VulkanDevice::SupportsDenoise.
     bool Ready() const { return ready_; }
 
+    // r_tonemap_op enum for the finalize dispatch (0 aces / 1 agx /
+    // 2 khronos_pbr_neutral / 3 reinhard / 4 linear). Set by
+    // VulkanDevice::Denoise from DenoiseDesc::tonemap_op each frame,
+    // ahead of Encode / EncodeFinalizeOnly. Setter instead of another
+    // Encode parameter: both encode paths read it and the signatures
+    // are long enough already.
+    void SetTonemapOp(std::uint32_t op) { tonemap_op_ = op; }
+
     // Encode JUST the DenoiseFinalize compute dispatch (HDR -> ACES + sRGB
     // -> swapchain) without running any of the SVGF passes that
     // normally precede it. Exposed so the OptiX denoiser path can
@@ -192,6 +200,9 @@ private:
 
     VulkanDevice*         device_       = nullptr;
     bool                  ready_        = false;
+    // Current r_tonemap_op enum for the finalize dispatch -- see
+    // SetTonemapOp(). 0 (ACES) preserves the historical behaviour.
+    std::uint32_t         tonemap_op_   = 0u;
     VkDescriptorSetLayout dset_layout_  = VK_NULL_HANDLE;
     VkPipelineLayout      pipe_layout_  = VK_NULL_HANDLE;
     VkPipeline            temporal_pipe_ = VK_NULL_HANDLE;

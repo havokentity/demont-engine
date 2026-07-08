@@ -230,6 +230,9 @@ inline glm::vec3 AgxTonemap(glm::vec3 c) {
     const glm::vec3 or1{-0.0528968517574562f, 1.15190312990417f,   -0.0989611768448433f};
     const glm::vec3 or2{-0.0529716355144438f,-0.0980434501171241f,  1.15107367264116f};
     v = glm::vec3{glm::dot(or0, v), glm::dot(or1, v), glm::dot(or2, v)};
+    // Linearize out of AgX's base encoding (pow 2.2, per Wrensch's
+    // agxEotf / Filament) -- kept byte-identical with the Slang copies.
+    v = glm::pow(glm::max(v, glm::vec3(0.0f)), glm::vec3(2.2f));
     return glm::clamp(v, glm::vec3(0.0f), glm::vec3(1.0f));
 }
 inline glm::vec3 KhronosPbrNeutralTonemap(glm::vec3 c) {

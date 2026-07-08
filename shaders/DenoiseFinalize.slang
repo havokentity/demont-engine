@@ -60,14 +60,14 @@
 cbuffer Push {
     uint  width;
     uint  height;
-    uint  hdr_pipeline;     // 1 = apply ACES + sRGB; 0 = sRGB OETF only
+    uint  hdr_pipeline;     // 1 = apply tonemap + sRGB; 0 = sRGB OETF only
     float bloom_intensity;  // 0 = skip bloom add entirely
-    // Reserved (16 bytes). Previously `stars_present + 3 pad uints`
-    // for the EMA-based star_split design (#108). Kept as padding so
-    // the push block stays a multiple of 16, matching the std140
-    // cbuffer rule, and so VulkanDenoiser::FinalizePush on the host
-    // side doesn't need a separate layout change in this PR.
-    uint  _reserved_stars;
+    // r_tonemap_op enum: 0 aces / 1 agx / 2 khronos_pbr_neutral /
+    // 3 reinhard / 4 linear. Repurposed from the retired
+    // `_reserved_stars` lane (same offset, layout unchanged) so the
+    // Vulkan denoiser-on path honours the operator like every other
+    // swapchain-write site instead of hard-coding ACES.
+    uint  tonemap_op;
     uint  _pad0;
     uint  _pad1;
     uint  _pad2;
@@ -77,6 +77,85 @@ float3 acesTonemap(float3 c) {
     const float a = 2.51, b = 0.03, d = 2.43, e = 0.59, f = 0.14;
     return saturate((c * (a * c + b)) / (c * (d * c + e) + f));
 }
+
+// --- r_tonemap_op operators ------------------------------------------------
+// Verbatim copies of the Tonemap.slang implementations (self-contained
+// TU convention -- keep byte-identical with that file and the
+// PathTrace.slang / CaptureEncoder.cpp / SoftwareTracer.cpp copies).
+float3 agxDefaultContrastApprox(float3 x) {
+    float3 x2 = x * x;
+    float3 x4 = x2 * x2;
+    return  + 15.5     * x4 * x2
+            - 40.14    * x4 * x
+            + 31.96    * x4
+            - 6.868    * x2 * x
+            + 0.4298   * x2
+            + 0.1191   * x
+            - 0.00232;
+}
+float3 agxTonemap(float3 c) {
+    const float3 ir0 = float3(0.842479062253094,  0.0784335999999992, 0.0792237451477643);
+    const float3 ir1 = float3(0.0423282422610123, 0.878468636469772,  0.0791661274605434);
+    const float3 ir2 = float3(0.0423756549057051, 0.0784336,          0.879142973793104);
+    float3 v = float3(dot(ir0, c), dot(ir1, c), dot(ir2, c));
+
+    const float kMinEv = -12.47393;
+    const float kMaxEv =   4.026069;
+    v = clamp(log2(max(v, 1e-10)), kMinEv, kMaxEv);
+    v = (v - kMinEv) / (kMaxEv - kMinEv);
+
+    v = agxDefaultContrastApprox(v);
+
+    const float3 kLuma = float3(0.2126, 0.7152, 0.0722);
+    float luma = dot(v, kLuma);
+    const float3 offset = float3(0.0);
+    const float3 slope  = float3(1.0);
+    const float3 power  = float3(1.0);
+    const float  sat    = 1.0;
+    v = pow(max(v * slope + offset, float3(0.0)), power);
+    v = luma + sat * (v - luma);
+
+    const float3 or0 = float3( 1.19687900512017,  -0.0980208811401368, -0.0990297440797205);
+    const float3 or1 = float3(-0.0528968517574562, 1.15190312990417,   -0.0989611768448433);
+    const float3 or2 = float3(-0.0529716355144438,-0.0980434501171241,  1.15107367264116);
+    v = float3(dot(or0, v), dot(or1, v), dot(or2, v));
+    // Linearize out of AgX's base encoding. The sigmoid fit above
+    // outputs in the AgX working encoding (~sRGB 2.2-gamma); the
+    // reference (Wrensch's agxEotf, Filament) applies pow(2.2) here.
+    // Without it the swapchain's sRGB OETF encodes an ALREADY-encoded
+    // signal -- washed-out, lifted-black AgX frames.
+    v = pow(max(v, float3(0.0)), float3(2.2));
+    return saturate(v);
+}
+float3 khronosPbrNeutralTonemap(float3 c) {
+    const float startCompression = 0.8 - 0.04;
+    const float desaturation     = 0.15;
+
+    float x = min(c.r, min(c.g, c.b));
+    float offset = (x < 0.08) ? (x - 6.25 * x * x) : 0.04;
+    c -= offset;
+
+    float peak = max(c.r, max(c.g, c.b));
+    if (peak < startCompression) return c;
+
+    const float d = 1.0 - startCompression;
+    float newPeak = 1.0 - d * d / (peak + d - startCompression);
+    c *= newPeak / peak;
+
+    float g = 1.0 - 1.0 / (desaturation * (peak - newPeak) + 1.0);
+    return lerp(c, float3(newPeak), g);
+}
+float3 reinhardTonemap(float3 c) {
+    return saturate(c / (1.0 + c));
+}
+float3 applyTonemapOp(float3 c, uint op) {
+    if (op == 1u) return agxTonemap(c);
+    if (op == 2u) return khronosPbrNeutralTonemap(c);
+    if (op == 3u) return reinhardTonemap(c);
+    if (op == 4u) return saturate(c);   // linear (exposure-only)
+    return acesTonemap(c);
+}
+// --- end r_tonemap_op operators ---------------------------------------------
 
 // Standard sRGB OETF. Vulkan storage-image writes to a *_SRGB swapchain
 // don't auto-encode (only color-attachment writes do). The Vulkan path
@@ -131,9 +210,11 @@ void main(uint2 tid : SV_DispatchThreadID) {
     }
 
     if (hdr_pipeline != 0u) {
-        // Linear HDR in -- apply exposure + ACES, then sRGB OETF.
+        // Linear HDR in -- apply exposure + the selected tonemap
+        // operator, then sRGB OETF. Op 0 (ACES) preserves the previous
+        // behaviour bit-for-bit.
         float exposure = exposure_state[0];
-        c = acesTonemap(c * exposure);
+        c = applyTonemapOp(c * exposure, tonemap_op);
     }
     // sRGB encode runs in either branch: hdr_pipeline=0 case has
     // already-tonemapped LDR-ish values that still need the OETF

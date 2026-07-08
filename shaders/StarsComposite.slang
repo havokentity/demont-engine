@@ -162,9 +162,9 @@
 // shared pipeline layout reserves only the first 112B for hw push
 // constants (VulkanDevice::kPushSplitOffset), with the remainder
 // spilling into a per-frame Frame UBO at vk::binding(14, 0). The host
-// StarsCompositePush struct is contiguous 224B; VulkanCommandBuffer::
+// StarsCompositePush struct is contiguous 240B; VulkanCommandBuffer::
 // Dispatch byte-splits it: bytes [0..112) -> vkCmdPushConstants, bytes
-// [112..224) -> the Frame UBO ring buffer. PathTrace.slang already uses
+// [112..240) -> the Frame UBO ring buffer. PathTrace.slang already uses
 // this split for its 832B PtPush; StarsComposite follows the same
 // convention so both shaders coexist in the shared layout.
 [[vk::push_constant]]
@@ -179,7 +179,7 @@ cbuffer Push {
 };
 
 // Spilled tail of StarsCompositePush. Layout is byte-equivalent to
-// bytes [112..224) of the host struct in Engine.cpp. Bound by
+// bytes [112..240) of the host struct in Engine.cpp. Bound by
 // VulkanCommandBuffer::Dispatch from a per-frame ring-buffer UBO.
 // The UBO at binding(14, 0) is shared with PathTrace.slang (which
 // declares its own larger view of the same buffer); each shader
@@ -209,9 +209,9 @@ cbuffer Frame {
 #else  // !PT_TARGET_SPIRV -- Metal MSL path
 
 // Metal lowers [[vk::push_constant]] to a regular setBytes buffer slot
-// with no hw size cap, so we keep the full 224B struct contiguous and
+// with no hw size cap, so we keep the full 240B struct contiguous and
 // avoid the split. Field order MUST match the SPIR-V Push + Frame
-// declarations above (Engine.cpp pushes one contiguous 224B blob).
+// declarations above (Engine.cpp pushes one contiguous 240B blob).
 [[vk::push_constant]]
 cbuffer Push {
     float4 pos_fovtan;
@@ -375,11 +375,18 @@ float3 sunDisc(float3 rd, float3 sun_dir) {
         float falloff = lerp(8.0, 3.0, saturate(1.0 - sun_dir.y));
         halo = pow(t_h, falloff);
     }
+    // r_sun_disc_brightness (moon_extra.w on this kernel's push --
+    // sun_extra is full). PathTrace subtracts its own brightness-scaled
+    // sunDisc() from the b==0 sky term before this kernel re-adds the
+    // disc, so WITHOUT the same multiplier here the cvar silently
+    // no-op'd whenever the star-split composite was active (the
+    // default). Default 1.0 keeps existing captures bit-for-bit.
+    float bright = max(moon_extra.w, 0.0);
     if (inside_disc) {
-        return col * (250.0 * atm)
-             + col * halo * atm * 4.0;
+        return (col * (250.0 * atm)
+             + col * halo * atm * 4.0) * bright;
     }
-    return col * halo * atm * 4.0;
+    return col * halo * atm * 4.0 * bright;
 }
 
 // Mirror of PathTrace.slang's procSkyInlineSunDiscAndHalo. PathTrace

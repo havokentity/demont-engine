@@ -284,6 +284,12 @@ float3 agxTonemap(float3 c) {
     const float3 or1 = float3(-0.0528968517574562, 1.15190312990417,   -0.0989611768448433);
     const float3 or2 = float3(-0.0529716355144438,-0.0980434501171241,  1.15107367264116);
     v = float3(dot(or0, v), dot(or1, v), dot(or2, v));
+    // Linearize out of AgX's base encoding. The sigmoid fit above
+    // outputs in the AgX working encoding (~sRGB 2.2-gamma); the
+    // reference (Wrensch's agxEotf, Filament) applies pow(2.2) here.
+    // Without it the swapchain's sRGB OETF encodes an ALREADY-encoded
+    // signal -- washed-out, lifted-black AgX frames.
+    v = pow(max(v, float3(0.0)), float3(2.2));
     return saturate(v);
 }
 

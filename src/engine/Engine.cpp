@@ -360,7 +360,7 @@ namespace cvar {
             CVAR_ARCHIVE);
     PT_CVAR(r_max_bounces,     "8",  "Max path bounces per ray",          CVAR_ARCHIVE);
     PT_CVAR(r_spp,             "1",  "Samples per pixel per dispatch (>=1). Higher = cleaner motion frames at proportional GPU cost.", CVAR_ARCHIVE);
-    PT_CVAR(r_firefly_clamp,   "10",  "Per-contribution firefly clamp (per-channel ceiling on each indirect light contribution: env-NEE, ambient skylight, bounce-to-sky). Suppresses single-sample spikes from BSDF-sampled bounces hitting an HDRI sun pixel, while leaving camera-direct sky unbounded so the sun renders at full intensity. ACES saturates anything above ~5 to ~1.0 for SDR, so 10 preserves visible highlights and kills fireflies. 0 disables.", CVAR_ARCHIVE);
+    PT_CVAR(r_firefly_clamp,   "10",  "Per-contribution firefly clamp (per-channel ceiling on INDIRECT light contributions: env-NEE, skylight, bounce-to-sky, and NEE at bounce depth >= 1). Direct NEE at the primary hit is deliberately UNCLAMPED -- it is a low-variance estimate, and clamping it dimmed bright close lights and flattened the inverse-square falloff (the procedural sun NEE was always unclamped for the same reason). Camera-direct sky is also unbounded so the sun renders at full intensity. ACES saturates anything above ~5 to ~1.0 for SDR, so 10 preserves visible highlights and kills fireflies. 0 disables.", CVAR_ARCHIVE);
     PT_CVAR(r_quality,         "high",  "Master quality preset that drives r_spp, r_max_bounces, r_caustics, r_refract_bounces, etc. Options: low (fast, no caustics), medium (default-ish), high (caustics, more bounces), ultra (max). 'custom' leaves per-feature cvars as-is.", CVAR_ARCHIVE);
     PT_CVAR(r_caustics,        "1",  "Refractive shadow rays. 1 = NEE rays refract through dielectrics so glass/diamond produce caustic patterns; 0 = treat all dielectrics as opaque shadow blockers (faster, blocks any caustic). Path-tracer-correct in both modes.", CVAR_ARCHIVE);
     PT_CVAR(r_refract_bounces, "4",  "Maximum dielectric refractions a single shadow ray may chain through before giving up (returns no contribution). Higher catches more multi-facet caustics; lower is faster. NOTE: water (#134) shares this budget -- needs >=1 to see refracted underwater geometry.", CVAR_ARCHIVE);
@@ -615,7 +615,7 @@ namespace cvar {
             CVAR_ARCHIVE);
     PT_CVAR(r_hdr_pipeline,    "1",  "Linear-HDR pipeline through MetalFX. 1 = path tracer writes raw HDR, MetalFX denoises in HDR, post-pass applies exposure+ACES (recommended). 0 = path tracer pre-applies exposure+ACES, MetalFX denoises LDR, tonemap pass is a passthrough copy. Only affects the denoiser-on path.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom,           "1",  "HDR bloom (downsample/upsample pyramid, additive composite before ACES). 0 disables; tonemap then samples a 1x1 zero buffer.", CVAR_ARCHIVE);
-    PT_CVAR(r_bloom_threshold, "1.0","Linear-HDR luminance threshold for the bloom extract. Pixels below this value contribute nothing to the pyramid; pixels above contribute proportional to (lum - threshold). The path tracer's pixels are in tonemap-relative units (sun ~30, env ~3) so a threshold of 1.0 picks up only HDR highlights.", CVAR_ARCHIVE);
+    PT_CVAR(r_bloom_threshold, "1.0","Linear-HDR luminance gate for the bloom extract: a smoothstep across [threshold-0.5, threshold+0.5] scales each pixel's FULL colour (a pixel past the knee contributes its entire radiance -- this is a soft gate, not a (lum - threshold) extract). The path tracer's pixels are in tonemap-relative units (sun ~30, env ~3) so a threshold of 1.0 picks up only HDR highlights.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom_intensity, "0.05","Linear blend factor of the bloom layer added on top of the HDR image before tonemap. 0 disables, 1 makes the bloom layer dominate. Realistic camera lens flare is in the 0.02-0.10 range.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom_mips,      "5",  "How many mip levels the bloom pyramid uses (1..5). More mips = a softer / wider halo; fewer mips = a tighter glow. Capped to kBloomMips at compile time.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom_radius,    "1.0","Per-mip upsample 'spread' multiplier. 1.0 = pixel-accurate dual-filter blur; >1 widens each upsample tap (softer, more diffuse halo); <1 tightens it (sharper core, less spread). Real range 0.5..3.0.", CVAR_ARCHIVE);
@@ -8218,7 +8218,14 @@ void Engine::RenderFrame() {
         if (moon_bright < 0.0f) moon_bright = 0.0f;
         if (moon_bright > 5.0f) moon_bright = 5.0f;
         push.moon_extra[2] = moon_bright;
-        push.moon_extra[3] = 0.0f;
+        // .w carries r_sun_disc_brightness for the StarsComposite
+        // kernel (its own sunDisc() copy needs the multiplier, and
+        // moon_extra already rides the StarsCompositePush while
+        // sun_extra is full: size / dist-ratio / vflat / planet-radius).
+        // PathTrace itself reads the same value from sun_extra2.x.
+        float sc_sun_bright = 1.0f;
+        if (auto* v = C.FindCVar("r_sun_disc_brightness")) sc_sun_bright = v->GetFloat();
+        push.moon_extra[3] = std::clamp(sc_sun_bright, 0.0f, 5.0f);
     }
     {
         float sun_size = 1.0f;
@@ -10127,6 +10134,15 @@ void Engine::RenderFrame() {
         bool dd_hdr_pipeline = true;
         if (auto* v = C.FindCVar("r_hdr_pipeline")) dd_hdr_pipeline = v->GetBool();
         dd.hdr_pipeline = dd_hdr_pipeline;
+        // r_tonemap_op rides along so the Vulkan finalize kernel applies
+        // the SAME operator as every other swapchain-write site (it used
+        // to hard-code ACES -- screen and `screenshot` captures disagreed
+        // for any non-default operator whenever a denoiser was on).
+        {
+            std::string op = "aces";
+            if (auto* tv = C.FindCVar("r_tonemap_op")) op = tv->value;
+            dd.tonemap_op = ParseTonemapOp(op);
+        }
         // MetalFX wants worldToView and viewToClip separately, so pass
         // them rather than the combined view*proj. glm matrices are
         // column-major, matching simd_float4x4 on the consumer end.

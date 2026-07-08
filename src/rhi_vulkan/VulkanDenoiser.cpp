@@ -1195,12 +1195,12 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
                 std::uint32_t height;
                 std::uint32_t hdr_pipeline;     // 1 = ACES + sRGB; 0 = sRGB OETF only
                 float         bloom_intensity;  // 0 = skip bloom add
-                // 16 reserved bytes -- previously held stars_present +
-                // 12 bytes of pad for the EMA-based star_split design.
-                // Kept as padding so the std140 layout stays aligned
-                // and DenoiseFinalize.slang's matching `_reserved_*`
-                // tail block doesn't need a fresh round of edits.
-                std::uint32_t _reserved_stars;
+                // r_tonemap_op enum (0 aces / 1 agx / 2 khronos /
+                // 3 reinhard / 4 linear). Repurposed from the retired
+                // `_reserved_stars` lane -- same offset, layout
+                // unchanged -- so the denoiser-on swapchain honours
+                // the operator instead of hard-coding ACES.
+                std::uint32_t tonemap_op;
                 std::uint32_t _pad0;
                 std::uint32_t _pad1;
                 std::uint32_t _pad2;
@@ -1218,7 +1218,7 @@ void VulkanNrdDenoiser::Encode(VkCommandBuffer cb,
             // collapses to a no-op (otherwise the v_output fallback
             // above would be sampled as bloom -- HDR feedback artifact).
             fp.bloom_intensity = bloom_real ? bloom_intensity : 0.0f;
-            fp._reserved_stars = 0u;
+            fp.tonemap_op      = tonemap_op_;
             vkCmdPushConstants(cb, finalize_pipe_layout_,
                                VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                sizeof(fp), &fp);
@@ -1336,13 +1336,11 @@ void VulkanNrdDenoiser::EncodeFinalizeOnly(VkCommandBuffer cb,
     struct FinalizePush {
         std::uint32_t width;
         std::uint32_t height;
-        std::uint32_t hdr_pipeline;     // 1 = ACES + sRGB; 0 = sRGB OETF only
+        std::uint32_t hdr_pipeline;     // 1 = tonemap + sRGB; 0 = sRGB OETF only
         float         bloom_intensity;  // 0 = skip bloom add
-        // 16 reserved bytes (was stars_present + 3 pad uints for the
-        // EMA-based star_split design). Kept so DenoiseFinalize.slang's
-        // matching `_reserved_*` tail block keeps the std140 layout
-        // aligned without another round of edits.
-        std::uint32_t _reserved_stars;
+        // r_tonemap_op enum, repurposed from the retired
+        // `_reserved_stars` lane (same offset, layout unchanged).
+        std::uint32_t tonemap_op;
         std::uint32_t _pad0;
         std::uint32_t _pad1;
         std::uint32_t _pad2;
@@ -1355,7 +1353,7 @@ void VulkanNrdDenoiser::EncodeFinalizeOnly(VkCommandBuffer cb,
     fp.height          = height;
     fp.hdr_pipeline    = hdr_pipeline ? 1u : 0u;
     fp.bloom_intensity = effective_bloom;
-    fp._reserved_stars = 0u;
+    fp.tonemap_op      = tonemap_op_;
     vkCmdPushConstants(cb, finalize_pipe_layout_,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        sizeof(fp), &fp);

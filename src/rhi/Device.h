@@ -253,11 +253,19 @@ public:
         float         bloom_intensity = 0.0f;
         // Vulkan SVGF/NRD only: r_hdr_pipeline value (1 = path tracer
         // wrote raw linear HDR into color_in, denoiser finalize applies
-        // ACES + sRGB; 0 = path tracer already tonemapped into color_in,
-        // finalize applies sRGB OETF only). MetalFX ignores it -- the
-        // existing Tonemap.slang pipeline keys on the same flag via its
-        // own push.
+        // the selected tonemap + sRGB; 0 = path tracer already
+        // tonemapped into color_in, finalize applies sRGB OETF only).
+        // MetalFX ignores it -- the existing Tonemap.slang pipeline
+        // keys on the same flag via its own push.
         bool hdr_pipeline = true;
+        // Vulkan SVGF/NRD only: r_tonemap_op enum (0 aces / 1 agx /
+        // 2 khronos_pbr_neutral / 3 reinhard / 4 linear). The finalize
+        // kernel used to hard-code ACES, so on Vulkan every denoiser-on
+        // frame ignored the operator the swapchain-off path, Metal, and
+        // the PPM/PNG captures all honoured -- screen and screenshot
+        // disagreed. MetalFX ignores it (Tonemap.slang reads the same
+        // enum from TonePush).
+        std::uint32_t tonemap_op = 0u;
         // (stars_in retired with the EMA-based star_split design;
         // celestials now composite Metal-side via shaders/StarsComposite.slang
         // before the bloom pyramid. The Vulkan denoiser path has no

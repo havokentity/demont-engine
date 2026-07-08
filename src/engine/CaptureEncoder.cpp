@@ -122,7 +122,10 @@ void AgxTonemap(float& r, float& g, float& b) {
     float o0 =  1.19687900512017f * v0 - 0.0980208811401368f * v1 - 0.0990297440797205f * v2;
     float o1 = -0.0528968517574562f * v0 + 1.15190312990417f * v1 - 0.0989611768448433f * v2;
     float o2 = -0.0529716355144438f * v0 - 0.0980434501171241f * v1 + 1.15107367264116f * v2;
-    r = Clamp01(o0); g = Clamp01(o1); b = Clamp01(o2);
+    // Linearize out of AgX's base encoding (pow 2.2, per Wrensch's
+    // agxEotf / Filament) -- kept byte-identical with the Slang copies.
+    auto lin = [](float v) { return std::pow(v < 0.0f ? 0.0f : v, 2.2f); };
+    r = Clamp01(lin(o0)); g = Clamp01(lin(o1)); b = Clamp01(lin(o2));
 }
 
 // Khronos PBR Neutral -- the official glTF reference operator.

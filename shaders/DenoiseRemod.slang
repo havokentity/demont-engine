@@ -63,6 +63,11 @@ cbuffer Push {
 // for those pixels to preserve the original signal.
 static const float kAlbedoSkyEps = 1.0 / 65536.0;
 
+// Floor on the per-channel albedo divisor. Kept in lockstep with
+// DenoiseTemporal.slang / DenoiseAtrous.slang -- the multiply-back
+// below must use the SAME clamped value the demod divide used.
+static const float kDemodEps = 0.01;
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void main(uint2 tid : SV_DispatchThreadID) {
@@ -74,8 +79,13 @@ void main(uint2 tid : SV_DispatchThreadID) {
     // textured radiance. Preserve the sample-count tag in .a so
     // downstream consumers still see how converged the source pixel
     // was (matches the temporal / atrous passes upstream).
+    // Multiply back by the SAME clamped divisor the demod pass used
+    // (max(a, kDemodEps) per channel). Using raw albedo here made
+    // demod<->remod lossy for any channel below the eps floor -- a
+    // saturated red with blue = 0.001 came back 10x too dark in blue,
+    // hue-shifting the whole denoised surface.
     float3 rgb = (a.r + a.g + a.b > kAlbedoSkyEps)
-                     ? (demod.rgb * a)
+                     ? (demod.rgb * max(a, float3(kDemodEps, kDemodEps, kDemodEps)))
                      : demod.rgb;
     color_out[tid] = float4(rgb, demod.a);
 }

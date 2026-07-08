@@ -141,16 +141,24 @@ void main(uint3 tid : SV_DispatchThreadID) {
         float wm = 1.0 / (1.0 + dot(m, float3(0.2126, 0.7152, 0.0722)));
         float wsum = wj + wk + wl + wm + 1e-6;
         float3 inner = (j*wj + k*wk + l*wl + m*wm) / wsum;
-        // Same Karis on the centre + outer ring -- weight each
-        // contribution group by its overall luminance so one
-        // rogue tap can't dominate a whole mip's brightness.
+        // Karis weighting applies to the INNER 4-tap group only
+        // (above); the centre + outer-ring taps use the plain COD
+        // weights below. That asymmetry is deliberate-enough in
+        // practice -- the inner group dominates the energy (0.5
+        // weight) so damping fireflies there removes most of the
+        // flicker -- but don't come here expecting a full Karis
+        // average over all 13 taps.
         result = e         * 0.125
                + inner     * 0.5
                + (a+c+g+i) * (0.125 / 4.0)
                + (b+d+f+h) * (0.25  / 4.0);
-        // Soft luminance threshold: smoothstep around `threshold`
-        // with a 1/2 stop knee gives a perceptually smooth on/off
-        // for what enters the pyramid.
+        // Soft luminance GATE: smoothstep of the pixel's luminance
+        // across [threshold - 0.5, threshold + 0.5] (an ABSOLUTE
+        // half-luminance knee, not stops), scaling the FULL colour.
+        // A pixel just past the knee contributes its entire radiance
+        // -- this is a gate, not a (lum - threshold) soft-knee
+        // extract. Keep the r_bloom_threshold cvar help in lockstep
+        // with this description.
         float lum  = dot(result, float3(0.2126, 0.7152, 0.0722));
         float knee = 0.5;
         float w    = smoothstep(threshold - knee, threshold + knee, lum);
