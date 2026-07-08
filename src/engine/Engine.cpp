@@ -12688,9 +12688,23 @@ void Engine::Run() {
     constexpr double kSmokeNoDeviceTimeoutSec = 10.0;
     const auto       run_start                = clk::now();
 
+    // Smoke mode pins dt to the nominal 60 Hz step so every golden
+    // capture is deterministic. Wall-clock dt feeds the ocean FFT
+    // phase, foam-persistence decay, smoke advection and physics
+    // substeps; under load (e.g. the full ctest run) frame times
+    // stretch and a time-animated fixture drifts visibly from its
+    // golden -- golden_ocean_foam__metal__svgf_atrous failed with
+    // 23.6% bad pixels purely from scheduling jitter. The aurora
+    // overlay already renders from frame_index * (1/60) for exactly
+    // this reason; this extends the same convention to the whole
+    // Tick. Interactive runs are unaffected.
+    constexpr double kSmokeFixedDt = 1.0 / 60.0;
+
     while (!wants_quit_ && !window_->ShouldClose()) {
         auto now = clk::now();
-        double dt = std::chrono::duration<double>(now - last).count();
+        double dt = (smoke_frame_budget > 0)
+                        ? kSmokeFixedDt
+                        : std::chrono::duration<double>(now - last).count();
         last = now;
 
         window_->PollEvents();
