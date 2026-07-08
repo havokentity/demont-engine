@@ -60,6 +60,10 @@ const char* LightTypeName(pt::engine::Engine::AnalyticLight::Type t) {
 // match. Each call appends one JSON object to the user-supplied array.
 struct RbCollector {
     json* arr;
+    // 1 / substep_dt of the physics system's most recent Step, for
+    // converting the Verlet per-substep displacement to real m/s.
+    // 0 when physics hasn't stepped yet.
+    float inv_sdt;
 };
 
 void CollectRigidBody(pt::physics::PhysicsSystem::RbHandle h,
@@ -68,16 +72,17 @@ void CollectRigidBody(pt::physics::PhysicsSystem::RbHandle h,
     auto* c = static_cast<RbCollector*>(user);
     const bool is_kinematic = (b.inv_mass == 0.0f);
     const float mass = is_kinematic ? 0.0f : (1.0f / b.inv_mass);
-    // Verlet implicit velocity: (curr - prev) / dt. We don't have dt
-    // here so the velocity reported is the per-substep delta, which is
-    // what the engine itself writes back. Editor consumers should treat
-    // it as an instantaneous velocity sample (already in m / substep,
-    // which equals m/s at the default 60 Hz substep). Good enough for
-    // the property panel; a future Phase X can promote the physics
-    // system to track velocity explicitly.
-    const float vx = b.curr_pos.x - b.prev_pos.x;
-    const float vy = b.curr_pos.y - b.prev_pos.y;
-    const float vz = b.curr_pos.z - b.prev_pos.z;
+    // Verlet implicit velocity: (curr - prev) is the displacement over
+    // ONE SUBSTEP (sdt = frame_dt / phys_substeps, i.e. ~1/480 s at
+    // the defaults -- NOT 1/60), so scale by the physics system's real
+    // substep rate to report m/s. The metric-units house rule means a
+    // 2 m/s falling sphere must read as ~2 in the property panel, not
+    // 0.004. inv_sdt is 0 before the first physics Step; the raw
+    // (tiny) delta is the best available answer then.
+    const float inv_sdt = (c->inv_sdt > 0.0f) ? c->inv_sdt : 1.0f;
+    const float vx = (b.curr_pos.x - b.prev_pos.x) * inv_sdt;
+    const float vy = (b.curr_pos.y - b.prev_pos.y) * inv_sdt;
+    const float vz = (b.curr_pos.z - b.prev_pos.z) * inv_sdt;
     json j = {
         {"kind",         "rb"},
         {"id",           h},
@@ -225,7 +230,8 @@ json SerializeScene(const pt::engine::Engine& engine) {
     // array in a tiny adaptor struct.
     json rbs = json::array();
     if (auto* phys = engine.Physics(); phys != nullptr) {
-        RbCollector ctx{ &rbs };
+        const float sdt = phys->LastSubstepDt();
+        RbCollector ctx{ &rbs, (sdt > 0.0f) ? (1.0f / sdt) : 0.0f };
         phys->ForEachRigidBody(&CollectRigidBody, &ctx);
     }
     out["rigid_bodies"] = std::move(rbs);

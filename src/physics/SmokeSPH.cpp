@@ -209,26 +209,31 @@ void SmokeSPH::Clear() {
     rng_state_.clear();
     pending_shocks_.clear();
     time_seconds_ = 0.0f;
+    time_debt_    = 0.0f;
     Reallocate();
 }
 
 void SmokeSPH::SetMaxParticles(std::uint32_t cap) {
     if (cap == max_particles_) return;
     max_particles_ = cap;
-    // Drop overflowing particles (tail) if we shrank the pool.
-    if (particles_.size() > cap) {
-        particles_.resize(cap);
-        alive_.resize(cap, 0);
-        density_.resize(cap, 0.0f);
-        pressure_.resize(cap, 0.0f);
-        temperature_.resize(cap, cfg_.ambient_temperature_kelvin);
-        force_.resize(cap, glm::vec3(0.0f));
-        buoy_bias_.resize(cap, 1.0f);  // Wave 9 sph-3b
-        xsph_corr_.resize(cap, glm::vec3(0.0f));  // Wave 9 sph-3b
-        alive_count_ = 0;
-        for (std::uint8_t a : alive_) alive_count_ += (a != 0) ? 1u : 0u;
-    }
-    Reallocate();
+    // Preserve the live pool across the resize -- the header contract
+    // is "particles above the cap are dropped from the tail", not
+    // "the plume vanishes". (This used to resize and then call
+    // Reallocate(), whose assign()s wiped every particle on ANY cap
+    // change, so the shrink-preservation below was dead code and a
+    // one-notch cvar nudge blanked the smoke column.) Only the hash
+    // tables are rebuilt; their geometry depends on the cap.
+    particles_.resize(cap, Particle{});
+    alive_.resize(cap, 0);
+    density_.resize(cap, 0.0f);
+    pressure_.resize(cap, 0.0f);
+    temperature_.resize(cap, cfg_.ambient_temperature_kelvin);
+    force_.resize(cap, glm::vec3(0.0f));
+    buoy_bias_.resize(cap, 1.0f);  // Wave 9 sph-3b
+    xsph_corr_.resize(cap, glm::vec3(0.0f));  // Wave 9 sph-3b
+    alive_count_ = 0;
+    for (std::uint8_t a : alive_) alive_count_ += (a != 0) ? 1u : 0u;
+    RebuildBucketTables();
 }
 
 void SmokeSPH::SetEmitters(std::vector<EmitterParams> emitters) {
@@ -275,11 +280,31 @@ void SmokeSPH::Step(float frame_dt) {
     // 30 fps -> 1/30 s -> 4 substeps at the default 1/120 sdt.
     if (frame_dt > 1.0f / 30.0f) frame_dt = 1.0f / 30.0f;
 
+    // Fixed-timestep accumulator: bank the frame's dt and run one full
+    // substep per banked 1/120 s, carrying the remainder into the next
+    // frame. The previous ceil(frame_dt / sdt) rounded EVERY frame's
+    // substep count up with no remainder tracking, so simulated time
+    // outran wall-clock time at any frame rate whose dt is not an
+    // exact multiple of sdt -- at 90 fps the plume simulated 16.7 ms
+    // per 11.1 ms frame (1.5x real speed), violating the 1-unit-=-1-m
+    // real-physics contract (buoyant rise in m/s was only correct at
+    // exactly 60 / 120 fps). Golden captures are unaffected: smoke
+    // mode pins dt to 1/60, an exact multiple of sdt.
     const float sdt = cfg_.substep_dt;
-    int substeps    = static_cast<int>(std::ceil(frame_dt / sdt));
+    time_debt_ += frame_dt;
+    int substeps = static_cast<int>(time_debt_ / sdt);
     if (substeps > cfg_.max_substeps_per_frame) {
         substeps = cfg_.max_substeps_per_frame;
+        // Discard the excess debt when capped -- carrying it would
+        // re-create the death spiral the cap exists to prevent.
+        time_debt_ = 0.0f;
+    } else {
+        time_debt_ -= static_cast<float>(substeps) * sdt;
     }
+    // Always integrate at least one substep when there is anything to
+    // do this frame: pending shockwaves are applied + drained inside
+    // the first Substep, and a zero-substep frame would strand them
+    // (and newly-enabled emitters) until the debt accumulates.
     if (substeps < 1) substeps = 1;
 
     for (int s = 0; s < substeps; ++s) {
@@ -422,6 +447,10 @@ void SmokeSPH::Reallocate() {
     force_.assign(max_particles_, glm::vec3(0.0f));
     buoy_bias_.assign(max_particles_, 1.0f);          // Wave 9 sph-3b
     xsph_corr_.assign(max_particles_, glm::vec3(0.0f)); // Wave 9 sph-3b
+    RebuildBucketTables();
+}
+
+void SmokeSPH::RebuildBucketTables() {
     // Bucket count = next-prime( 2 * max_particles ). 2x oversample
     // keeps the average bucket population around 0.5 -> low collision
     // rate. Cap to a sane minimum so a 0-particle pool still hashes
@@ -610,25 +639,47 @@ void SmokeSPH::Substep(float sdt) {
     //    by clearing pending_shocks_ here -- subsequent substeps in
     //    the same Step() see an empty queue and skip.
     //
-    //    Energy-based impulse: dv = sqrt(2 * E / m) * (1 - dist/r_eff)
-    //    falling off linearly to zero at the radius edge. Direction
-    //    radial outward from the shock centre.
+    //    Energy-based impulse, honouring the header contract that
+    //    `strength` is the TOTAL energy in joules divided across the
+    //    affected particles. Each particle's speed kick keeps the
+    //    linear radial falloff shape w = 1 - dist/r_eff, scaled so the
+    //    imparted kinetic energy sums to E regardless of how many
+    //    particles sit in the radius:
+    //        dv_i = w_i * sqrt(2E / (m * sum_j w_j^2))
+    //        =>  sum_i (1/2) m dv_i^2 = E.
+    //    (The old form gave EVERY particle the full sqrt(2E/m)*w_i
+    //    kick, so the blast energy scaled linearly with particle
+    //    count -- a dense cloud received hundreds of times the
+    //    documented energy.) A single particle at the centre still
+    //    receives exactly the old sqrt(2E/m).
     if (!pending_shocks_.empty()) {
         const float mass_p = (!emitters_.empty()) ? emitters_[0].particle_mass : 0.001f;
         for (const auto& s : pending_shocks_) {
+            const float r_eff = std::max(s.radius, 1e-3f);
+            // Pass 1: falloff-weight energy normaliser.
+            float sum_w2 = 0.0f;
             for (std::size_t i = 0; i < particles_.size(); ++i) {
                 if (!alive_[i]) continue;
                 const auto d      = particles_[i].pos - s.centre;
                 const float dist2 = glm::dot(d, d);
-                const float r_eff = std::max(s.radius, 1e-3f);
+                if (dist2 > r_eff * r_eff) continue;
+                const float dist = std::sqrt(std::max(dist2, 1e-6f));
+                const float w    = 1.0f - (dist / r_eff);
+                sum_w2 += w * w;
+            }
+            if (sum_w2 <= 0.0f) continue;  // nothing in radius
+            const float dv_scale = std::sqrt(2.0f * std::max(s.strength, 0.0f)
+                                             / (std::max(mass_p, 1e-6f) * sum_w2));
+            // Pass 2: apply the radial kicks.
+            for (std::size_t i = 0; i < particles_.size(); ++i) {
+                if (!alive_[i]) continue;
+                const auto d      = particles_[i].pos - s.centre;
+                const float dist2 = glm::dot(d, d);
                 if (dist2 > r_eff * r_eff) continue;
                 const float dist  = std::sqrt(std::max(dist2, 1e-6f));
                 const glm::vec3 dir = d / dist;
-                const float falloff = 1.0f - (dist / r_eff);
-                const float speed   = std::sqrt(2.0f * std::max(s.strength, 0.0f)
-                                                / std::max(mass_p, 1e-6f))
-                                       * falloff;
-                particles_[i].vel += dir * speed;
+                const float w       = 1.0f - (dist / r_eff);
+                particles_[i].vel += dir * (w * dv_scale);
             }
         }
         pending_shocks_.clear();
@@ -791,10 +842,28 @@ void SmokeSPH::GatherNeighbours(std::size_t i, std::vector<std::size_t>& out) co
     const int gx0 = FloorToInt(p.pos.x / h);
     const int gy0 = FloorToInt(p.pos.y / h);
     const int gz0 = FloorToInt(p.pos.z / h);
+    // Two of the 27 distinct neighbourhood cells can hash into the
+    // SAME bucket (bucket_count_ ~ 2x the particle cap puts the
+    // chance of at least one intra-3x3x3 collision around 8% per
+    // particle per substep). Walking that bucket once per colliding
+    // cell appended its particles twice, double-counting them in both
+    // the density and pressure-force sums -- when the colliding
+    // bucket was the particle's own cell, the doubled self poly6(0)
+    // term roughly doubled its density and kicked a pressure spike.
+    // Dedupe at the bucket level: 27 entries, the tiny quadratic scan
+    // is noise next to the chain walks it prevents.
+    std::uint32_t seen[27];
+    int seen_n = 0;
     for (int dz = -1; dz <= 1; ++dz) {
         for (int dy = -1; dy <= 1; ++dy) {
             for (int dx = -1; dx <= 1; ++dx) {
                 const std::uint32_t hk = HashCell(gx0 + dx, gy0 + dy, gz0 + dz);
+                bool dup = false;
+                for (int s = 0; s < seen_n; ++s) {
+                    if (seen[s] == hk) { dup = true; break; }
+                }
+                if (dup) continue;
+                seen[seen_n++] = hk;
                 std::uint32_t k = bucket_first_[hk];
                 while (k != kEnd) {
                     out.push_back(k);

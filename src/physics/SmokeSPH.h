@@ -102,11 +102,16 @@ public:
         // engine overrides via r_smoke_pressure_stiffness.
         float pressure_stiffness = 1.5f;
 
-        // Viscosity mu (kg/m/s). Air mu ~= 1.8e-5; we run several
-        // orders higher because (a) the SPH integrator at 120 Hz is
-        // way too coarse to resolve Re~real-air turbulence; (b) we
-        // WANT visible smoothing so the column reads as a coherent
-        // plume rather than as a cloud of independent particles.
+        // XSPH velocity-smoothing blend (DIMENSIONLESS -- not a
+        // physical viscosity since the Wave-9 XSPH rewrite). The
+        // integrator maps it to a per-substep convex blend toward the
+        // neighbourhood-mean velocity: eps = clamp(viscosity * 4,
+        // 0, 0.5), so 0 = free particles, 0.05 (default) = ~0.2 blend
+        // per 1/120 s substep, and everything >= 0.125 saturates the
+        // 0.5 cap. Do NOT plug in a physical mu (air's 1.8e-5 kg/m/s
+        // yields eps ~ 7e-5, i.e. no smoothing at all); the field --
+        // and the r_smoke_viscosity cvar that feeds it -- keeps the
+        // historical name only until the lockstep rename lands.
         float viscosity = 0.05f;
 
         // Gravity (m/s^2). Earth: -9.81 along -Y.
@@ -146,8 +151,10 @@ public:
 
         // Substep dt (s). Fixed 1/120 s for stability under the
         // Müller-stiff EOS. The Step() entry-point clamps the frame
-        // dt and runs floor(frame_dt / substep_dt) substeps + 1
-        // half-substep for the remainder.
+        // dt, banks it into a time accumulator, and runs one full
+        // substep per banked substep_dt -- the fractional remainder
+        // carries into the next frame so simulated time tracks
+        // wall-clock time at any frame rate.
         float substep_dt = 1.0f / 120.0f;
 
         // Hard cap on substeps per frame. A 30-fps frame dt at the
@@ -320,9 +327,15 @@ public:
     glm::vec3 ComputeCentreOfMass() const;
 
 private:
-    // Allocate / reset internal storage to max_particles_. Called
-    // on Clear() and SetMaxParticles().
+    // Allocate / reset internal storage to max_particles_, wiping the
+    // pool. Called on Clear() and first Step(). SetMaxParticles does
+    // NOT call this -- it resizes in place to preserve live particles.
     void Reallocate();
+
+    // (Re)build the spatial-hash bucket tables for the current
+    // max_particles_. Split out of Reallocate() so SetMaxParticles can
+    // rebuild the hash geometry without wiping the particle pool.
+    void RebuildBucketTables();
 
     // Single fixed-substep integration step. Caller drives substep
     // count + emitter spawning.
@@ -367,6 +380,12 @@ private:
     std::vector<std::uint8_t>               alive_;
     std::uint32_t                           alive_count_ = 0;
     std::uint32_t                           max_particles_ = 1024;
+
+    // Fixed-timestep accumulator (s). Step() banks each frame's dt here
+    // and drains it one substep_dt at a time, carrying the fractional
+    // remainder so simulated time tracks wall-clock time at any frame
+    // rate (ceil'ing per-frame ran the sim up to 1.67x real speed).
+    float                                   time_debt_ = 0.0f;
 
     // Per-particle scratch: SPH density (kg/m^3) + pressure (Pa).
     std::vector<float>                      density_;

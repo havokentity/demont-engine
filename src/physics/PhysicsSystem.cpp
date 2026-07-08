@@ -61,7 +61,7 @@ void PhysicsSystem::Clear() {
     // so stale RbHandles can't accidentally aliase a refilled slot.
     for (auto& rb : rb_slots_) {
         if (rb.alive) {
-            rb.generation = static_cast<std::uint8_t>(rb.generation + 1u);
+            rb.generation = (rb.generation + 1u) & kGenMask;
             if (rb.generation == 0u) rb.generation = 1u;
         }
         rb.alive   = 0;
@@ -167,6 +167,10 @@ void PhysicsSystem::Step(float frame_dt, int substeps,
     if (substeps > 32) substeps = 32;
 
     const float sdt = frame_dt / static_cast<float>(substeps);
+    // Remember the substep dt so consumers of the Verlet implicit
+    // velocity (curr - prev, a per-substep displacement) can convert
+    // it to real m/s -- see LastSubstepDt().
+    last_substep_dt_ = sdt;
     const glm::vec3 accel{0.0f, gravity_y, 0.0f};
 
     // Sanitize damping. < 0 or > 1 would blow energy up; we cap at
@@ -409,7 +413,7 @@ bool PhysicsSystem::RemoveRigidBody(RbHandle h) {
     s.alive      = 0;
     s.prim_id    = 0;
     s.body       = RigidBody{};
-    s.generation = static_cast<std::uint8_t>(s.generation + 1u);
+    s.generation = (s.generation + 1u) & kGenMask;
     if (s.generation == 0u) s.generation = 1u;
     --rb_alive_count_;
     return true;

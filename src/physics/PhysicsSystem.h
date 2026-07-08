@@ -160,6 +160,12 @@ public:
     std::uint32_t RbCapacity()   const { return kMaxRigidBodies; }
     // --- end Phase 2a rigid bodies ----------------------------------
 
+    // Substep dt (s) of the most recent Step() call. The Verlet pools
+    // store implicit velocity as a per-substep displacement
+    // (curr - prev); dividing by this converts it to real m/s.
+    // 0 until the first Step() -- callers must guard.
+    float LastSubstepDt() const { return last_substep_dt_; }
+
 private:
     // Slot generation is the FULL 24 bits the public Handle API
     // promises, stored in a uint32_t so the bump-on-Remove path never
@@ -185,11 +191,18 @@ private:
     void Substep(float sdt, const glm::vec3& accel, float damping);
 
     // --- Phase 2a rigid bodies (#138) -------------------------------
+    // generation is uint32_t for the same reason as Slot::generation
+    // above: the handle API packs a 24-bit generation, and the old
+    // uint8_t here truncated it to a period-255 counter -- 255
+    // remove/add cycles on a slot (phys_clear + phys_drop churn) let a
+    // stale RbHandle validate against the new occupant and silently
+    // read / re-pair an unrelated body.
     struct RbSlot {
         RigidBody     body{};
-        std::uint8_t  generation = 1;
+        std::uint32_t generation = 1;  // 24-bit counter packed into RbHandle
         std::uint8_t  alive      = 0;
-        std::uint16_t pad        = 0;
+        std::uint8_t  pad0       = 0;
+        std::uint16_t pad1       = 0;
         std::uint32_t prim_id    = 0;
     };
 
@@ -210,6 +223,9 @@ private:
 
     std::vector<Slot> slots_{kMaxParticles};
     std::uint32_t     alive_count_ = 0;
+
+    // Substep dt of the most recent Step() -- see LastSubstepDt().
+    float last_substep_dt_ = 0.0f;
 };
 
 }  // namespace pt::physics
