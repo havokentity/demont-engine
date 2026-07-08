@@ -5,6 +5,15 @@
 // console-output parser can be unit-tested without spinning up a
 // WebSocket client.
 
+/** Quote a path argument for a console command line. The engine's
+ *  tokenizer (src/console/Console.cpp TokenizeLine) splits unquoted
+ *  tokens on whitespace but is quote-aware with backslash escapes, so
+ *  a path containing spaces must be wrapped; embedded quotes and
+ *  backslashes are escaped to survive the tokenizer's unescape pass. */
+export function quoteArg(path: string): string {
+  return `"${path.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
 /** Parse the output of `list_assets <subdir>` into an array of
  *  workspace-relative paths. The engine emits one path per line plus
  *  a trailing `(list_assets: N entries under '<dir>')` summary --
@@ -47,7 +56,7 @@ export interface SceneEntry {
 export function parseSceneListOutput(out: string): SceneEntry[] {
   return parseListAssetsOutput(out).map((name) => ({
     name,
-    dispatch: `scene_load ${name}`,
+    dispatch: `scene_load ${quoteArg(name)}`,
     kind: 'saved' as const,
   }));
 }
@@ -57,7 +66,7 @@ export function parseSceneListOutput(out: string): SceneEntry[] {
 export function parseSceneFixtureOutput(out: string): SceneEntry[] {
   return parseListAssetsOutput(out).map((path) => ({
     name: path.split('/').pop() || path,
-    dispatch: `exec ${path}`,
+    dispatch: `exec ${quoteArg(path)}`,
     kind: 'fixture' as const,
   }));
 }

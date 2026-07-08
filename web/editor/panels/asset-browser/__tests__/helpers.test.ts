@@ -9,7 +9,24 @@ import {
   parseListAssetsOutput,
   parseSceneFixtureOutput,
   parseSceneListOutput,
+  quoteArg,
 } from '../src/helpers';
+
+describe('quoteArg', () => {
+  it('wraps a plain path in double quotes', () => {
+    expect(quoteArg('assets/hdri/sunset.hdr')).toBe('"assets/hdri/sunset.hdr"');
+  });
+
+  it('preserves spaces inside the quotes', () => {
+    expect(quoteArg('assets/textures/wood planks.png')).toBe(
+      '"assets/textures/wood planks.png"',
+    );
+  });
+
+  it('escapes embedded quotes and backslashes for the tokenizer', () => {
+    expect(quoteArg('we"ird\\path')).toBe('"we\\"ird\\\\path"');
+  });
+});
 
 describe('parseListAssetsOutput', () => {
   it('returns one entry per non-summary line', () => {
@@ -58,8 +75,8 @@ describe('parseSceneListOutput', () => {
     const raw =
       'lobby\n' + 'studio\n' + "(2 saved scene(s) under 'scenes/')\n";
     expect(parseSceneListOutput(raw)).toEqual([
-      { name: 'lobby', dispatch: 'scene_load lobby', kind: 'saved' },
-      { name: 'studio', dispatch: 'scene_load studio', kind: 'saved' },
+      { name: 'lobby', dispatch: 'scene_load "lobby"', kind: 'saved' },
+      { name: 'studio', dispatch: 'scene_load "studio"', kind: 'saved' },
     ]);
   });
 
@@ -78,7 +95,7 @@ describe('parseSceneFixtureOutput', () => {
     expect(parseSceneFixtureOutput(raw)).toEqual([
       {
         name: 'cornell_csg.cfg',
-        dispatch: 'exec tests/goldens/scenes/cornell_csg.cfg',
+        dispatch: 'exec "tests/goldens/scenes/cornell_csg.cfg"',
         kind: 'fixture',
       },
     ]);
@@ -93,10 +110,10 @@ describe('mergeSceneEntries', () => {
     );
     const merged = mergeSceneEntries(saved, fixtures);
     expect(merged.map((e) => e.dispatch)).toEqual([
-      'scene_load lobby',
-      'scene_load studio',
-      'exec tests/goldens/scenes/alpha.cfg',
-      'exec tests/goldens/scenes/zebra.cfg',
+      'scene_load "lobby"',
+      'scene_load "studio"',
+      'exec "tests/goldens/scenes/alpha.cfg"',
+      'exec "tests/goldens/scenes/zebra.cfg"',
     ]);
   });
 
@@ -104,7 +121,7 @@ describe('mergeSceneEntries', () => {
     const a = parseSceneListOutput('lobby\nlobby\n');
     const merged = mergeSceneEntries(a, []);
     expect(merged).toHaveLength(1);
-    expect(merged[0]?.dispatch).toBe('scene_load lobby');
+    expect(merged[0]?.dispatch).toBe('scene_load "lobby"');
   });
 
   it('handles both sources empty', () => {

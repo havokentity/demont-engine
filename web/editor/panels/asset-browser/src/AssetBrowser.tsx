@@ -25,6 +25,7 @@ import {
   parseListAssetsOutput,
   parseSceneFixtureOutput,
   parseSceneListOutput,
+  quoteArg,
   type SceneEntry,
 } from './helpers';
 
@@ -39,8 +40,9 @@ interface CategoryDef {
   title: string;
   subdir: string;
   // Console command template; `{path}` is replaced with the asset's
-  // workspace-relative path. We don't pre-quote -- the engine's
-  // tokenizer accepts unquoted relative paths fine.
+  // workspace-relative path, quoted via quoteArg -- the engine's
+  // tokenizer splits unquoted tokens on whitespace, so a filename
+  // with a space would otherwise truncate the argument.
   dispatch: (path: string) => string;
   // User-facing description shown when the category is empty.
   emptyHint: string;
@@ -54,7 +56,7 @@ const CATEGORIES: CategoryDef[] = [
     // The Scenes tab computes per-entry dispatch in fetchItems (saved
     // scenes -> `scene_load`, fixtures -> `exec`), so this template is
     // unused for scenes; kept non-empty to satisfy the shared shape.
-    dispatch: (path) => `exec ${path}`,
+    dispatch: (path) => `exec ${quoteArg(path)}`,
     emptyHint:
       'Save the current scene with `scene_save <name>` (writes scenes/<name>.json), ' +
       'or drop .cfg fixtures under tests/goldens/scenes/.',
@@ -63,7 +65,7 @@ const CATEGORIES: CategoryDef[] = [
     key: 'hdri',
     title: 'HDRIs',
     subdir: 'hdri',
-    dispatch: (path) => `r_env_map ${path}`,
+    dispatch: (path) => `r_env_map ${quoteArg(path)}`,
     emptyHint:
       'Drop .hdr environment maps into assets/hdri/. Click to set as the active sky.',
   },
@@ -71,7 +73,7 @@ const CATEGORIES: CategoryDef[] = [
     key: 'gltf',
     title: 'glTF',
     subdir: 'gltf',
-    dispatch: (path) => `mesh_load_gltf ${path}`,
+    dispatch: (path) => `mesh_load_gltf ${quoteArg(path)}`,
     emptyHint:
       'Drop .glb / .gltf files into assets/gltf/. Click to import as the current mesh.',
   },
@@ -83,7 +85,7 @@ const CATEGORIES: CategoryDef[] = [
     // surface the error path for the user. .obj support is tracked
     // separately. We still list the directory so users can see what
     // they have.
-    dispatch: (path) => `mesh_load_gltf ${path}`,
+    dispatch: (path) => `mesh_load_gltf ${quoteArg(path)}`,
     emptyHint:
       'No .obj / .ply / .stl importer wired yet; this category is informational only.',
   },

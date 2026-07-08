@@ -2,8 +2,11 @@
 // Copyright (c) 2026 Rajesh D'Monte
 //
 // Slider + number-readout combo. Commit semantics match NumberField:
-//   - dragging the slider fires throttled onScrub (~50ms)
+//   - dragging the slider fires throttled onScrub (~50ms, with a
+//     trailing flush so the last value of a burst is never dropped)
 //   - releasing the slider fires onCommit
+//   - keyboard changes (arrow keys) scrub too and commit on key
+//     release / blur
 //   - the number readout uses NumberField (Enter/Esc/blur commit)
 //
 // The component is presentational; the parent owns the value via the
@@ -39,7 +42,11 @@ export function Slider({
   // round-tripping through the engine.
   const [local, setLocal] = useState<number>(value);
   const lastScrubTsRef = useRef<number>(0);
+  const trailingTimerRef = useRef<number | null>(null);
   const draggingRef = useRef<boolean>(false);
+  // Set when a keyboard-driven change lands (arrow keys never see
+  // pointer events); commit happens on key release / blur instead.
+  const pendingKeyCommitRef = useRef<boolean>(false);
 
   useEffect(() => {
     if (!draggingRef.current) {
@@ -47,18 +54,41 @@ export function Slider({
     }
   }, [value]);
 
+  const clearTrailing = useCallback(() => {
+    if (trailingTimerRef.current != null) {
+      window.clearTimeout(trailingTimerRef.current);
+      trailingTimerRef.current = null;
+    }
+  }, []);
+
+  // Drop any pending trailing scrub on unmount.
+  useEffect(() => clearTrailing, [clearTrailing]);
+
   const onChange = useCallback(
     (e: ChangeEvent<HTMLInputElement>) => {
       const next = parseFloat(e.target.value);
       if (!Number.isFinite(next)) return;
       setLocal(next);
+      if (!draggingRef.current) pendingKeyCommitRef.current = true;
+      if (!onScrub) return;
+      clearTrailing();
       const now = performance.now();
-      if (onScrub && now - lastScrubTsRef.current > kScrubThrottleMs) {
+      const elapsed = now - lastScrubTsRef.current;
+      if (elapsed > kScrubThrottleMs) {
         lastScrubTsRef.current = now;
         onScrub(next);
+      } else {
+        // Trailing edge: schedule the last value of a fast burst so
+        // the engine always sees the final scrub position (a plain
+        // leading-edge throttle would silently drop it).
+        trailingTimerRef.current = window.setTimeout(() => {
+          trailingTimerRef.current = null;
+          lastScrubTsRef.current = performance.now();
+          onScrub(next);
+        }, kScrubThrottleMs - elapsed);
       }
     },
-    [onScrub],
+    [onScrub, clearTrailing],
   );
 
   const onPointerDown = useCallback(() => {
@@ -68,8 +98,21 @@ export function Slider({
   const onPointerUp = useCallback(() => {
     if (!draggingRef.current) return;
     draggingRef.current = false;
+    pendingKeyCommitRef.current = false;
+    clearTrailing();  // the commit below supersedes any pending scrub
     onCommit(local);
-  }, [local, onCommit]);
+  }, [local, onCommit, clearTrailing]);
+
+  // Keyboard-driven changes (arrow keys / PgUp / Home / ...) fire
+  // onChange with no pointer events, so the pointerup commit never
+  // runs -- commit on key release and blur instead. Gated on the
+  // pending flag so unrelated keys (Tab) don't dispatch commands.
+  const commitPendingKey = useCallback(() => {
+    if (!pendingKeyCommitRef.current) return;
+    pendingKeyCommitRef.current = false;
+    clearTrailing();
+    onCommit(local);
+  }, [local, onCommit, clearTrailing]);
 
   return (
     <div className="insp-slider-row">
@@ -84,6 +127,8 @@ export function Slider({
         onChange={onChange}
         onPointerDown={onPointerDown}
         onPointerUp={onPointerUp}
+        onKeyUp={commitPendingKey}
+        onBlur={commitPendingKey}
       />
       <NumberField
         value={local}

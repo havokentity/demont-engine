@@ -21,6 +21,15 @@ export const MATERIAL_TYPES: MaterialType[] = [
   'water',
 ];
 
+/** Quote a path argument for a console command line. The engine's
+ *  tokenizer (src/console/Console.cpp TokenizeLine) splits unquoted
+ *  tokens on whitespace but is quote-aware with backslash escapes, so
+ *  a path containing spaces must be wrapped; embedded quotes and
+ *  backslashes are escaped to survive the tokenizer's unescape pass. */
+export function quoteArg(path: string): string {
+  return `"${path.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
 /** The prim_set_*_tex console command name for a texture slot. */
 export function setTexCommand(slot: TexSlot): string {
   switch (slot) {

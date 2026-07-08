@@ -176,13 +176,10 @@ export function App({ client }: AppProps) {
   }, [selection?.kind, selection?.id, scene, dirtyTick]);
 
   // ---- Header actions ----
-  // The engine doesn't expose a "cam_warp <x y z>" command -- the only
-  // teleport path is cam_load which reads from a cam_slot_N cvar. We
-  // reuse slot 9 as a scratch: write the desired pos+yaw+pitch+fov
-  // state, then fire cam_load 9. The user's slot-9 is clobbered as a
-  // side-effect; the panel surfaces this in the button's title attr.
-  // (Future: add a dedicated `cam_focus` engine command so we don't
-  // need the slot bounce.)
+  // cam_focus computes the canonical back-and-up framing offset on the
+  // engine side and resets the temporal denoiser history so the next
+  // frame is a clean sample of the new viewpoint. Scene-hierarchy and
+  // the lights panel dispatch the same command for their Goto actions.
   const onGoto = useCallback(() => {
     if (!selection) return;
     let target: [number, number, number] | null = null;
@@ -193,18 +190,8 @@ export function App({ client }: AppProps) {
       target = light.pos;
     }
     if (!target) return;
-    // Stand 4 m back along +Z and 1 m up; aim along -Z (yaw=0)
-    // looking slightly down (~-12 deg). FOV=60 is the engine default.
-    const offset = 4;
-    const camX = target[0];
-    const camY = target[1] + 1;
-    const camZ = target[2] + offset;
-    const camStateLine =
-      `cam_slot_9 "${camX.toFixed(4)} ${camY.toFixed(4)} ${camZ.toFixed(4)} 0.0 -12.0 60.0"`;
-    void client.exec(camStateLine);
-    // cam_load resets the temporal denoiser history so the next frame
-    // is a clean sample of the new viewpoint -- no smearing.
-    void client.exec('cam_load 9');
+    void client.exec(`cam_focus ${target[0]} ${target[1]} ${target[2]}`)
+      .catch(() => { /* engine offline */ });
   }, [client, selection, prim, light]);
 
   const onDuplicate = useCallback(async () => {
@@ -234,22 +221,18 @@ export function App({ client }: AppProps) {
       return;
     }
     if (selection.kind === 'prim') {
-      void client.exec(`prim_delete ${selection.id}`);
+      void client.exec(`prim_delete ${selection.id}`).catch(() => { /* engine offline */ });
     } else if (selection.kind === 'light') {
-      void client.exec(`light_remove ${selection.id}`);
+      void client.exec(`light_remove ${selection.id}`).catch(() => { /* engine offline */ });
     }
     setConfirmDelete(false);
   }, [client, selection, confirmDelete]);
 
   // ---- Render ----
 
-  // No selection -- engine reports kind='none' or no payload at all.
-  // The store may collapse SelectionKind::None to a record whose .kind
-  // is the literal string "none" (engine SelectionKindToString emits
-  // it). The TS SelectionKind union doesn't admit "none" but the
-  // runtime value can; we test via string compare.
-  const isNone = !selection || (selection.kind as string) === 'none';
-  if (isNone) {
+  // No selection -- the store maps the engine's {kind:'none'} payload
+  // to null (selectionFromPayload in shared/src/store.ts).
+  if (!selection) {
     return (
       <div className="insp-empty">
         <h3>No object selected.</h3>
@@ -263,7 +246,7 @@ export function App({ client }: AppProps) {
 
   // Unsupported (sdf / smoke / csg / rb) -- the engine has selection
   // state for them but no editor mutation path yet.
-  if (selection && selection.kind !== 'prim' && selection.kind !== 'light') {
+  if (selection.kind !== 'prim' && selection.kind !== 'light') {
     return (
       <div className="insp-empty">
         <h3>{selection.kind} #{selection.id}</h3>
@@ -302,7 +285,7 @@ export function App({ client }: AppProps) {
           <button
             className="insp-goto"
             onClick={onGoto}
-            title="Frame object in viewport (overwrites cam_slot_9)"
+            title="Frame object in viewport (cam_focus)"
           >
             Goto
           </button>
@@ -333,7 +316,7 @@ export function App({ client }: AppProps) {
           <button
             className="insp-goto"
             onClick={onGoto}
-            title="Frame light in viewport (overwrites cam_slot_9)"
+            title="Frame light in viewport (cam_focus)"
           >
             Goto
           </button>

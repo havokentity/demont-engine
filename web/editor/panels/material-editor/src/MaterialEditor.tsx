@@ -43,6 +43,7 @@ import {
   decomposeEmission,
   composeEmission,
   MATERIAL_TYPES,
+  quoteArg,
   setTexCommand,
   type TexSlot,
   type MaterialType,
@@ -222,7 +223,9 @@ export function MaterialEditor({ client }: MaterialEditorProps) {
   // ---- Texture-map setters --------------------------------------------
   const handleAssignTex = useCallback(
     (slot: TexSlot, path: string) => {
-      exec(`${setTexCommand(slot)} ${id} ${path}`);
+      // Quote the path -- the console tokenizer splits unquoted args
+      // on whitespace, truncating e.g. 'wood planks.png'.
+      exec(`${setTexCommand(slot)} ${id} ${quoteArg(path)}`);
     },
     [exec, id],
   );
@@ -251,7 +254,7 @@ export function MaterialEditor({ client }: MaterialEditorProps) {
       try {
         await client.exec(`prim_clear_tex ${id}`);
         for (const { s, p } of survivors) {
-          await client.exec(`${setTexCommand(s)} ${id} ${p}`);
+          await client.exec(`${setTexCommand(s)} ${id} ${quoteArg(p)}`);
         }
       } catch {
         // Engine offline; the next scene_dirty refetch reconciles state.
@@ -262,8 +265,9 @@ export function MaterialEditor({ client }: MaterialEditorProps) {
 
   // ---- Render ----------------------------------------------------------
 
-  const isNone = !selection || (selection.kind as string) === 'none';
-  if (isNone) {
+  // No selection -- the store maps the engine's {kind:'none'} payload
+  // to null (selectionFromPayload in shared/src/store.ts).
+  if (!selection) {
     return (
       <div className="mtl-empty">
         <h3>No material selected.</h3>
@@ -275,7 +279,7 @@ export function MaterialEditor({ client }: MaterialEditorProps) {
     );
   }
 
-  if (selection && selection.kind !== 'prim') {
+  if (selection.kind !== 'prim') {
     return (
       <div className="mtl-empty">
         <h3>{selection.kind} #{selection.id}</h3>

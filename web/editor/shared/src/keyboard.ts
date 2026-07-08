@@ -61,6 +61,10 @@ export function installEditorShortcuts(
 ): () => void {
   const { onAction, gizmoShortcuts = true } = opts;
 
+  // Fire-and-forget dispatch: exec() rejects while the engine is down
+  // ('socket not open'), so swallow instead of spamming unhandledrejection.
+  const fire = (line: string) => void client.exec(line).catch(() => { /* engine offline */ });
+
   const handler = (e: KeyboardEvent) => {
     if (isEditingTarget(e.target)) return;
 
@@ -74,10 +78,10 @@ export function installEditorShortcuts(
     if (meta && k === 'z') {
       e.preventDefault();
       if (e.shiftKey) {
-        void client.exec('scene_redo');
+        fire('scene_redo');
         onAction?.('scene_redo');
       } else {
-        void client.exec('scene_undo');
+        fire('scene_undo');
         onAction?.('scene_undo');
       }
       return;
@@ -87,7 +91,7 @@ export function installEditorShortcuts(
       // it doesn't hurt to also bind it -- the meta-key gate filters
       // out plain 'y' typing in non-editing contexts.
       e.preventDefault();
-      void client.exec('scene_redo');
+      fire('scene_redo');
       onAction?.('scene_redo');
       return;
     }
@@ -96,17 +100,17 @@ export function installEditorShortcuts(
     // These don't take meta; bare G / R / S press.
     if (gizmoShortcuts && !meta && !e.altKey && !e.shiftKey) {
       if (k === 'g') {
-        void client.exec('gizmo_mode translate');
+        fire('gizmo_mode translate');
         onAction?.('gizmo_translate');
         return;
       }
       if (k === 'r') {
-        void client.exec('gizmo_mode rotate');
+        fire('gizmo_mode rotate');
         onAction?.('gizmo_rotate');
         return;
       }
       if (k === 's') {
-        void client.exec('gizmo_mode scale');
+        fire('gizmo_mode scale');
         onAction?.('gizmo_scale');
         return;
       }

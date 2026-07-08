@@ -74,20 +74,25 @@ export interface AnalyticLight {
   type: LightTypeId | string;
   type_name?: string;
   pos: [number, number, number];
-  // sphere only -- 0 for point/spot/quad
-  radius: number;
   // intensity in W/sr (point/spot) or W/m^2/sr (area)
   intensity: [number, number, number];
-  // spot axis / quad normal (unit vec); zeros for point lights
-  dir: [number, number, number];
+  // Orientation quaternion (xyzw); identity for unrotated lights.
+  orient?: [number, number, number, number];
+  // The per-type extras below are emitted CONDITIONALLY by
+  // SerializeScene (src/editor/SceneGraph.cpp) -- absent for other
+  // light types, so always guard before dereferencing.
+  // sphere only -- emitter radius (m)
+  radius?: number;
+  // spot + quad only -- spot axis / quad normal (unit vec)
+  dir?: [number, number, number];
   // spot only -- outer half-angle cosine
-  cos_outer: number;
+  cos_outer?: number;
   // spot only -- inner half-angle cosine
-  cos_inner: number;
+  cos_inner?: number;
   // quad only -- u half-extent vector (length = u_half)
-  u_vec: [number, number, number];
+  u_vec?: [number, number, number];
   // quad only -- v half-extent (m)
-  v_half: number;
+  v_half?: number;
 }
 
 // Catch-all for the "we haven't typed this yet" kinds the engine may

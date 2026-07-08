@@ -405,11 +405,11 @@ export function SceneHierarchy({ client }: SceneHierarchyProps) {
     // engine side and resets the denoiser history. See
     // Engine::RegisterCommands ("cam_focus") for the math; we just
     // pass the world-space target.
-    void client.exec(`cam_focus ${x} ${y} ${z}`);
+    void client.exec(`cam_focus ${x} ${y} ${z}`).catch(() => { /* engine offline */ });
   }, [objects, client]);
 
   const duplicateObject = useCallback((id: number) => {
-    void client.exec(`prim_duplicate ${id}`);
+    void client.exec(`prim_duplicate ${id}`).catch(() => { /* engine offline */ });
   }, [client]);
 
   const deleteObject = useCallback((id: number) => {
@@ -420,7 +420,7 @@ export function SceneHierarchy({ client }: SceneHierarchyProps) {
       `This cannot be undone -- the engine doesn't keep a history.`,
     );
     if (!ok) return;
-    void client.exec(`prim_delete ${id}`);
+    void client.exec(`prim_delete ${id}`).catch(() => { /* engine offline */ });
   }, [client]);
 
   // ---- auto-scroll the selected row into view --------------------------
@@ -578,7 +578,7 @@ function EmptyState({ client }: { client: WebSocketClient }) {
       <button
         type="button"
         className="sh-empty-example"
-        onClick={() => void client.exec(example)}
+        onClick={() => void client.exec(example).catch(() => { /* engine offline */ })}
         title="Click to run this command in the engine"
       >
         {example}

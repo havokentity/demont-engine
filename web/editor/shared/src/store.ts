@@ -115,6 +115,21 @@ function flattenScene(s: SceneSnapshot | null): SceneObject[] {
   return out;
 }
 
+// Map a raw engine selection payload to the store's Selection-or-null
+// shape. The engine represents SelectionKind::None as {kind:'none',
+// id:0} (SelectionKindToString in src/editor/SceneGraph.cpp) both in
+// the selection_change event and the list_scene snapshot's `selection`
+// field -- 'none' is not part of the SelectionKind union, so it maps
+// to null here.
+export function selectionFromPayload(
+  d: { kind?: string; id?: number } | null | undefined,
+): Selection | null {
+  if (!d || !d.kind || d.kind === 'none' || typeof d.id !== 'number') {
+    return null;
+  }
+  return { kind: d.kind as SelectionKind, id: d.id };
+}
+
 export const useSceneStore = create<SceneStore>((set, get) => ({
   connectionStatus: 'connecting',
   setConnectionStatus: (s) => set({ connectionStatus: s }),
@@ -181,12 +196,8 @@ export function bindClientToStore(
   unsubscribers.push(ws.onStatus((s) => store().setConnectionStatus(s)));
 
   unsubscribers.push(ws.onEvent('selection_change', (e) => {
-    const d = e.data as { kind?: SelectionKind; id?: number; selected?: boolean } | null;
-    if (!d || d.selected === false || !d.kind || typeof d.id !== 'number') {
-      store().setSelection(null);
-    } else {
-      store().setSelection({ kind: d.kind, id: d.id });
-    }
+    const d = e.data as { kind?: string; id?: number } | null;
+    store().setSelection(selectionFromPayload(d));
   }));
 
   unsubscribers.push(ws.onEvent('scene_dirty', () => {

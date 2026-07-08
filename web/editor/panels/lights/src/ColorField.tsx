@@ -206,6 +206,35 @@ export function ColorField({
     return () => document.removeEventListener('pointerdown', onDocPointerDown, true);
   }, [open, closePopover]);
 
+  // Drag plumbing shared by the SV plane + hue bar. Document-level
+  // listeners for an active drag are bound with one AbortController
+  // signal (same pattern as NumberField's scrub fix, #237): a single
+  // abort() detaches pointermove + pointerup + pointercancel together,
+  // and the unmount cleanup below aborts any in-flight drag so a
+  // cancel-terminated or mid-drag-unmounted popover can't keep
+  // dispatching scrubs from a stale closure.
+  const dragAbortRef = useRef<AbortController | null>(null);
+  const beginDrag = useCallback(
+    (el: HTMLElement, pointerId: number, onMove: (ev: PointerEvent) => void) => {
+      dragAbortRef.current?.abort();  // never two live drags
+      const abort = new AbortController();
+      dragAbortRef.current = abort;
+      const onEnd = () => {
+        if (dragAbortRef.current === abort) dragAbortRef.current = null;
+        abort.abort();
+        try { el.releasePointerCapture(pointerId); } catch { /* ignore */ }
+      };
+      const { signal } = abort;
+      document.addEventListener('pointermove', onMove, { signal });
+      document.addEventListener('pointerup', onEnd, { signal });
+      document.addEventListener('pointercancel', onEnd, { signal });
+    },
+    [],
+  );
+  useEffect(() => {
+    return () => { dragAbortRef.current?.abort(); };
+  }, []);
+
   const svPlaneRef = useRef<HTMLDivElement>(null);
   const onSvPointerDown = useCallback(
     (e: ReactPointerEvent<HTMLDivElement>) => {
@@ -227,16 +256,9 @@ export function ColorField({
         setDraftAndScrub(lin);
       };
       update(e.clientX, e.clientY);
-      const onMove = (ev: PointerEvent) => update(ev.clientX, ev.clientY);
-      const onUp = () => {
-        document.removeEventListener('pointermove', onMove);
-        document.removeEventListener('pointerup', onUp);
-        try { el.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
-      };
-      document.addEventListener('pointermove', onMove);
-      document.addEventListener('pointerup', onUp);
+      beginDrag(el, e.pointerId, (ev) => update(ev.clientX, ev.clientY));
     },
-    [disabled, hsv, hdrMultiplier, setDraftAndScrub],
+    [disabled, hsv, hdrMultiplier, setDraftAndScrub, beginDrag],
   );
 
   const hueBarRef = useRef<HTMLDivElement>(null);
@@ -260,16 +282,9 @@ export function ColorField({
         setDraftAndScrub(lin);
       };
       update(e.clientX);
-      const onMove = (ev: PointerEvent) => update(ev.clientX);
-      const onUp = () => {
-        document.removeEventListener('pointermove', onMove);
-        document.removeEventListener('pointerup', onUp);
-        try { el.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
-      };
-      document.addEventListener('pointermove', onMove);
-      document.addEventListener('pointerup', onUp);
+      beginDrag(el, e.pointerId, (ev) => update(ev.clientX));
     },
-    [disabled, hsv, hdrMultiplier, setDraftAndScrub],
+    [disabled, hsv, hdrMultiplier, setDraftAndScrub, beginDrag],
   );
 
   const onHexChange = useCallback((e: ChangeEvent<HTMLInputElement>) => {

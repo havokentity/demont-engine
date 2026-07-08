@@ -8,10 +8,12 @@
 //   - shared/Shell mounts the WS client + fetches list_scene
 //   - selection_change + scene_dirty are mirrored into useSceneStore
 //   - this component reads `scene` (the raw snapshot) + `selection` from
-//     the store, parses the `lights[]` array directly (the inspector
-//     panel does the same -- the flattened `objects[]` tags lights with
-//     kind="lights", not the "light" SelectionKind string), and emits
-//     select / exec over the WS via the passed client
+//     the store, parses the `lights[]` array directly for the defensive
+//     per-field coercion in helpers.ts (the flattened `objects[]` also
+//     carries the records -- SerializeScene stamps them kind:'light'
+//     and flattenScene preserves that -- the inspector panel uses the
+//     same raw-snapshot approach), and emits select / exec over the WS
+//     via the passed client
 //
 // Writes flow through the engine's atomic `light_set_*` setters (via
 // LightInspector) and the `light_point` / `light_spot` / `light_sphere`
@@ -188,7 +190,7 @@ export function LightsPanel({ client }: LightsPanelProps) {
       window.setTimeout(() => setConfirmDelete(false), 2500);
       return;
     }
-    void client.exec(`light_remove ${selectedLight.id}`);
+    void client.exec(`light_remove ${selectedLight.id}`).catch(() => { /* engine offline */ });
     setConfirmDelete(false);
   }, [client, selectedLight, confirmDelete]);
 
@@ -199,7 +201,7 @@ export function LightsPanel({ client }: LightsPanelProps) {
     if (!selectedLight) return;
     const [x, y, z] = selectedLight.pos;
     if (![x, y, z].every(Number.isFinite)) return;
-    void client.exec(`cam_focus ${x} ${y} ${z}`);
+    void client.exec(`cam_focus ${x} ${y} ${z}`).catch(() => { /* engine offline */ });
   }, [client, selectedLight]);
 
   // ---- auto-scroll the selected row into view ----

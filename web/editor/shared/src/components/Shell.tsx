@@ -22,7 +22,7 @@
 //   </Shell>
 
 import { useEffect, useMemo, useRef, type ReactNode } from 'react';
-import { useSceneStore, bindClientToStore } from '../store';
+import { useSceneStore, bindClientToStore, selectionFromPayload } from '../store';
 import { WebSocketClient } from '../ws-client';
 import { wsEndpoint } from '../endpoint';
 import { installEditorShortcuts } from '../keyboard';
@@ -55,9 +55,12 @@ export function Shell({
   children,
   installShortcuts = true,
 }: ShellProps) {
-  // The WebSocket client is created exactly once per panel. We hold
-  // it in a ref so React strict mode's double-mount during dev
-  // doesn't open + close + reopen the socket on every reload.
+  // The WebSocket client is created exactly once per panel and held in
+  // a ref: render-prop consumers (`withClient`) capture the instance,
+  // so it must stay identical for the panel's lifetime. React strict
+  // mode's dev-only setup->cleanup->setup cycle reuses the same
+  // instance -- the effect cleanup close()s the socket and the second
+  // setup start()s it again (WebSocketClient survives close+start).
   const clientRef = useRef<WebSocketClient | null>(null);
 
   if (clientRef.current == null) {
@@ -80,7 +83,19 @@ export function Shell({
       try {
         const r = await client.listScene();
         if (r.ok && r.scene && typeof r.scene === 'object') {
-          useSceneStore.getState().setScene(r.scene);
+          const store = useSceneStore.getState();
+          store.setScene(r.scene);
+          // Re-sync selection from the snapshot's `selection` field.
+          // SerializeScene emits it for exactly this case: a restarted
+          // engine only broadcasts selection_change on a *change*, so
+          // a reconnecting panel would otherwise keep a stale (possibly
+          // id-reused) selection forever.
+          const sel = (r.scene as {
+            selection?: { kind?: string; id?: number };
+          }).selection;
+          if (sel && typeof sel === 'object') {
+            store.setSelection(selectionFromPayload(sel));
+          }
         }
       } catch {
         // Socket not open yet, or the engine doesn't support
@@ -118,8 +133,11 @@ export function Shell({
       offStatus();
       off();
       unbind();
+      // Close the socket but keep the client instance in the ref:
+      // strict mode re-runs this effect without re-rendering, so the
+      // second setup must find the same (reusable) client -- nulling
+      // the ref here would leave it reading null and crash the panel.
       client.close();
-      clientRef.current = null;
     };
     // The clientRef is intentionally stable; we don't want the effect
     // to re-run when extraTopics changes (we'd lose subscriptions).

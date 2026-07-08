@@ -6,10 +6,11 @@
 // LightRecord parse can be unit-tested without a DOM / WebSocket shim.
 //
 // The panel reads the engine's SerializeScene `lights[]` array directly
-// (NOT the store's flattened `objects[]`, whose `kind` tag is derived
-// from the top-level array name and so reads "lights" rather than the
-// "light" SelectionKind string). The inspector panel uses the same
-// raw-snapshot approach; we mirror it for resilience.
+// rather than the store's flattened `objects[]` (which since 5a953ba
+// would also work -- SerializeScene stamps every light record with
+// kind:'light' and flattenScene preserves it) because parseLights adds
+// the defensive per-field coercion below. The inspector panel uses the
+// same raw-snapshot approach; we mirror it for resilience.
 
 export type LightType = 'point' | 'spot' | 'sphere' | 'quad';
 
@@ -104,11 +105,11 @@ export function vecLen(v: [number, number, number]): number {
 
 // ---------------------------------------------------------------------------
 // Raw-snapshot parsing. The engine's SerializeScene emits a top-level
-// `lights[]` array of records WITHOUT a `kind` field; each record has
-// id / type / pos / intensity / orient and type-specific extras
-// (dir / cos_* for spot, radius for sphere, dir / u_vec / v_half for
-// quad). We coerce defensively -- a malformed entry is dropped rather
-// than crashing the panel.
+// `lights[]` array of records stamped with kind:'light' (since
+// 5a953ba); each record has id / type / pos / intensity / orient and
+// type-specific extras (dir / cos_* for spot, radius for sphere,
+// dir / u_vec / v_half for quad). We coerce defensively -- a malformed
+// entry is dropped rather than crashing the panel.
 
 function asVec3(v: unknown, fallback: [number, number, number]): [number, number, number] {
   if (Array.isArray(v) && v.length >= 3) {

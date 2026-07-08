@@ -99,19 +99,19 @@ function ToolbarBody({ client }: ToolbarBodyProps) {
   const setGizmoMode = useCallback(
     (m: GizmoMode) => {
       setMode(m);  // optimistic; refresh() corrects on next tick
-      void client.exec(`gizmo_mode ${m}`);
+      void client.exec(`gizmo_mode ${m}`).catch(() => { /* engine offline */ });
     },
     [client],
   );
 
   const undo = useCallback(() => {
-    void client.exec('scene_undo');
+    void client.exec('scene_undo').catch(() => { /* engine offline */ });
     setLastShortcut('undo');
     window.setTimeout(() => setLastShortcut(''), 600);
   }, [client]);
 
   const redo = useCallback(() => {
-    void client.exec('scene_redo');
+    void client.exec('scene_redo').catch(() => { /* engine offline */ });
     setLastShortcut('redo');
     window.setTimeout(() => setLastShortcut(''), 600);
   }, [client]);
@@ -119,13 +119,13 @@ function ToolbarBody({ client }: ToolbarBodyProps) {
   const toggleSnap = useCallback(() => {
     const next = !snap;
     setSnap(next);
-    void client.exec(`gizmo_snap ${next ? 1 : 0}`);
+    void client.exec(`gizmo_snap ${next ? 1 : 0}`).catch(() => { /* engine offline */ });
   }, [client, snap]);
 
   const setGizmoSpace = useCallback(
     (sp: GizmoSpace) => {
       setSpace(sp);
-      void client.exec(`gizmo_space ${sp}`);
+      void client.exec(`gizmo_space ${sp}`).catch(() => { /* engine offline */ });
     },
     [client],
   );

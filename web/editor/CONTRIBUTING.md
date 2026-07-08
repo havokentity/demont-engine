@@ -30,7 +30,10 @@ web/editor/
     ├── scene-hierarchy/    # agent-21
     ├── inspector/          # agent-22
     ├── asset-browser/      # wave-7 #20 (scenes / hdri / glTF browser)
-    └── toolbar/            # wave-7 #20 (gizmo mode, undo/redo, snap, space)
+    ├── toolbar/            # wave-7 #20 (gizmo mode, undo/redo, snap, space)
+    ├── material-editor/    # wave-9 (PBR material grid + texture maps)
+    ├── lights/             # wave-9 (light list + photometric authoring)
+    └── render-settings/    # wave-10 (renderer / denoiser / tonemap cvars)
 ```
 
 ## Global keyboard shortcuts
@@ -120,9 +123,11 @@ echoes it back so the client can match request <-> reply.
 
 Known event topics:
 - `log` -- forwarded `LOG_INFO/WARN/ERROR` lines
-- `selection_change` -- **(agent-19)** `data: { kind, id, selected }`
+- `selection_change` -- **(agent-19)** `data: { kind, id }`; deselection
+  is `{ kind: 'none', id: 0 }` (the store maps it to `selection: null`)
 - `scene_dirty` -- **(agent-19)** scene mutated; client should refetch
-- `frame_stats` -- (future, not in agent-20 scope)
+- `frame_stats` -- ~10 Hz perf sample:
+  `data: { fps, frame_ms, trace_ms, backend, resolution: [w, h] }`
 
 ## How to write a new panel
 
@@ -258,6 +263,9 @@ Hotkeys (fired by the GLFW key handler in `Engine::Init`):
 | F3 | `panel_open inspector` |
 | F4 | `panel_open asset-browser` |
 | F5 | `panel_open toolbar` |
+| F6 | `panel_open material-editor` |
+| F7 | `panel_open lights` |
+| F8 | `panel_open render-settings` |
 
 ## Why zustand?
 
@@ -275,8 +283,15 @@ pattern is the dominant concern.
 
 ## Tests
 
-There are no automated panel tests yet. The shell currently has zero
-runtime checks beyond TypeScript types -- panels are expected to:
+`npm test` runs the vitest suite (happy-dom environment). Coverage
+today:
+- `shared/__tests__/keyboard.test.ts` -- the global shortcut dispatcher
+- `panels/*/__tests__/helpers.test.ts` -- pure-logic helpers for the
+  asset-browser, lights, material-editor, render-settings, and
+  scene-hierarchy panels
+
+There is no CI wiring yet (no vitest / typecheck step under
+`.github/workflows/`), so panels are additionally expected to:
 1. Pass `npm run typecheck` (run in CI when we add it).
 2. Render in a Chrome `--app` window without console errors.
 3. Show a graceful "engine offline" state when the WebSocket can't

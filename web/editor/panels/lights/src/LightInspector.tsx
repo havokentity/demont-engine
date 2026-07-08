@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Rajesh D'Monte
 //
-// Per-light property editor for the Lights panel. Unlike the Property
-// Inspector's LightInspector (which predates the atomic setters and
-// re-emits the full `light_point` / `light_spot` / ... composite
-// command on every field commit), this editor dispatches the ATOMIC
-// per-field setters the engine grew in #176 / #211:
+// Per-light property editor for the Lights panel. Like the Property
+// Inspector's LightInspector (which dispatches the same atomic
+// per-field setters since #238), this editor drives the ATOMIC
+// setters the engine grew in #176 / #211:
 //
 //   light_set_pos       <id> <x> <y> <z>
 //   light_set_intensity <id> <r> <g> <b>          (raw W/sr or W/m^2/sr)
