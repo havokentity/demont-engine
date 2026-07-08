@@ -60,13 +60,26 @@ static_assert(sizeof(PtPushHead) == 112, "PtPushHead must mirror engine's first 
 // smaller struct than expected (e.g. the Vulkan-SPIRV head-only push).
 constexpr std::size_t kSunAndModeOffset = 240;
 
-// Accumulator parameters offset inside the engine's full PtPush. The
-// `accum_params` field sits at byte 720 (after the 4-uint header tail
-// at 704: hdri_lights_count / write_normal_gbuffer / write_hdr_aux /
-// mis_enabled).  .x is the r_accum_ema_alpha EMA-history-retention
-// factor; .y/.z/.w reserved.  See PathTrace.slang's Push.accum_params
-// + Engine.cpp's PtPush.accum_params for the canonical doc.
-constexpr std::size_t kAccumParamsOffset = 720;
+// Accumulator parameters offset inside the engine's full PtPush.
+// `accum_params` sits at byte 784 in the current layout -- it moved
+// from 720 as clouds_p4 (#117), spectral_params (#27),
+// dof_bokeh_params (wave 10) and the write_albedo/pad churn were each
+// inserted ahead of it, and this raw-byte mirror silently kept reading
+// hdri_lights_col[6] until the offset was re-derived (offsetof probe
+// against the PtPush definition, cross-checked by the static_assert
+// beside PtPush in Engine.cpp).  .x is the r_accum_ema_alpha EMA-
+// history-retention factor; .y/.z/.w reserved.  See PathTrace.slang's
+// Push.accum_params + Engine.cpp's PtPush for the canonical doc.
+constexpr std::size_t kAccumParamsOffset = 784;
+
+// r_tonemap_op offset inside the engine's full PtPush. tonemap_params
+// is NOT the last 16-byte block anymore -- sun_extra2 (#239) was
+// appended after it, so the old `push_constants_size - 16` read
+// decoded sun_extra2.x (a float, default 1.0f = 0x3F800000) as the
+// tonemap enum and the >4 clamp silently forced ACES for every
+// operator on the software backend. Fixed offset, asserted in
+// lockstep with the struct by Engine.cpp's static_assert block.
+constexpr std::size_t kTonemapParamsOffset = 1600;
 
 // Analytic prim layout (matches PathTrace.slang's `primitives` SSBO).
 // Stride grew over time: 3 -> 4 in #85 (motion blur, added prev_pos)
@@ -426,16 +439,15 @@ void RunPathTraceKernel(SoftwareDevice& device,
     }
 
     // --- Wave 9 tonemap (#27 follow-up) ---
-    // r_tonemap_op enum, packed by the engine into PtPush::tonemap_params --
-    // the LAST 16-byte block of the struct. The software backend always
-    // receives the full Metal-style push (no Vulkan split), so tonemap_params
-    // .x sits at push_constants_size - 16. Read defensively: if the push is
+    // r_tonemap_op enum, packed by the engine into PtPush::tonemap_params
+    // at a fixed offset (see kTonemapParamsOffset -- it stopped being the
+    // last block when sun_extra2 landed). Read defensively: if the push is
     // somehow short, fall back to op 0 (aces) so a malformed dispatch can't
     // reach into out-of-range bytes. Mirrors the GPU paths' tonemap_params.x.
     std::uint32_t tonemap_op = 0u;
-    if (cmd.push_constants_size >= 16) {
+    if (cmd.push_constants_size >= kTonemapParamsOffset + 16) {
         std::memcpy(&tonemap_op,
-                    cmd.push_constants_buf + cmd.push_constants_size - 16,
+                    cmd.push_constants_buf + kTonemapParamsOffset,
                     sizeof(std::uint32_t));
         if (tonemap_op > 4u) tonemap_op = 0u;
     }

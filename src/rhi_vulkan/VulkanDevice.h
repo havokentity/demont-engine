@@ -343,6 +343,21 @@ public:
     // fails the BUILD instead of silently corrupting Vulkan output. Keep the
     // 2048 literal there in lockstep with this constant. Min guaranteed
     // Vulkan UBO range is 16 KiB so 2048 is comfortably within budget.
+    //
+    // SLICING: this is the size of ONE dispatch's slice, not the whole
+    // buffer. Each frame_ubos_[frame] allocation actually holds
+    // kDispatchSetsPerFrame slices and every Dispatch writes + binds its
+    // own slice (offset = slice * kFrameUboSize). One shared region per
+    // frame slot was a record-time/execution-time hazard: the memcpy
+    // happens at record time but the GPU reads at execution time, so the
+    // LAST-recorded dispatch's tail clobbered every earlier dispatch in
+    // the same command buffer (PathTrace's Frame view-proj matrices were
+    // overwritten by StarsComposite's 128 B tail on the dual-Denoise
+    // path, corrupting SVGF reprojection). The descriptor sets got a
+    // per-dispatch ring for exactly this hazard; the UBO memory behind
+    // them now rings the same way. 2048 is a multiple of 256, the
+    // spec-maximum minUniformBufferOffsetAlignment, so the slice offsets
+    // are always legal dynamic-free descriptor offsets.
     static constexpr std::size_t   kFrameUboSize    = 2048;
 
 private:
@@ -631,10 +646,16 @@ public:
     // kDispatchSetsPerFrame dispatches -- which would re-introduce
     // the sharing bug for whichever dispatches collide; bump the
     // constant if you see it.
-    VkDescriptorSet AcquireDispatchDescriptorSet() {
-        VkDescriptorSet s = dsets_[current_frame_][next_dispatch_set_];
+    struct DispatchSlot {
+        VkDescriptorSet set;
+        int             slice;  // ring index; also this dispatch's
+                                // Frame-UBO slice (offset slice *
+                                // kFrameUboSize into frame_ubos_)
+    };
+    DispatchSlot AcquireDispatchDescriptorSet() {
+        const int slice = next_dispatch_set_;
         next_dispatch_set_ = (next_dispatch_set_ + 1) % kDispatchSetsPerFrame;
-        return s;
+        return { dsets_[current_frame_][slice], slice };
     }
     VkPipelineLayout    SharedPipelineLayout() const { return shared_pipe_layout_; }
     const BufferEntry&  CurrentFrameUbo() const { return frame_ubos_[current_frame_]; }

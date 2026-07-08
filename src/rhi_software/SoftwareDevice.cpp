@@ -507,7 +507,7 @@ bool SoftwareDevice::WriteTexture(TextureHandle h, const void* src, std::size_t 
 }
 
 void SoftwareDevice::WriteBuffer(BufferHandle h, const void* src, std::size_t size,
-                                  std::size_t /*offset*/) {
+                                  std::size_t offset) {
     BackedBuffer* b = nullptr;
     {
         std::lock_guard lock(resource_mutex_);
@@ -515,8 +515,16 @@ void SoftwareDevice::WriteBuffer(BufferHandle h, const void* src, std::size_t si
         if (it != buffers_.end()) b = it->second.get();
     }
     if (b == nullptr) return;
-    if (size > b->data.size()) size = b->data.size();
-    std::memcpy(b->data.data(), src, size);
+    // Honor the Device.h contract like the GPU backends: write at
+    // `offset`, and reject out-of-range regions loudly (Vulkan-style)
+    // instead of clamping -- a clamped partial write is a silent
+    // software-vs-GPU divergence waiting for a golden to catch it.
+    if (offset > b->data.size() || size > b->data.size() - offset) {
+        LOG_ERROR("WriteBuffer: copy region (offset {} + size {}) exceeds "
+                  "buffer size {}", offset, size, b->data.size());
+        return;
+    }
+    std::memcpy(b->data.data() + offset, src, size);
 }
 
 FrameContext SoftwareDevice::BeginFrame() {

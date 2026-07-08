@@ -745,6 +745,16 @@ void MetalDevice::WriteBuffer(BufferHandle h, const void* src, std::size_t size,
     if (buf == nullptr) return;
     auto* dst = static_cast<std::uint8_t*>(buf->contents());
     if (dst == nullptr) return;   // not shared / not CPU-mapped
+    // Reject out-of-range regions instead of silently writing past the
+    // MTLBuffer into adjacent heap memory. Mirrors the Vulkan backend's
+    // guard so a caller size bug fails loudly on every platform rather
+    // than corrupting the primary (Metal) one silently.
+    const std::size_t len = buf->length();
+    if (dst_offset > len || size > len - dst_offset) {
+        LOG_ERROR("WriteBuffer: copy region (offset {} + size {}) exceeds "
+                  "buffer size {}", dst_offset, size, len);
+        return;
+    }
     std::memcpy(dst + dst_offset, src, size);
 }
 

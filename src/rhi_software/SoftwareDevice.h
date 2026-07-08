@@ -105,9 +105,14 @@ class SoftwareVulkanPresent;  // defined in SoftwareVulkanPresent.h
 struct BindState {
     // 24 slots: bumped from 16 to fit Fluid Phase 3 (#22) SPH
     // particle SSBO at engine slot 16. Slot count must match the
-    // Metal / Vulkan equivalents.
+    // Metal / Vulkan equivalents (bound_tex_[20] there -- textures
+    // was left at 16 when buffers was bumped, silently dropping
+    // BindStorageTexture for engine slots 16 (pbr_atlas) and 18
+    // (godrays_mask); harmless while the CPU kernel ignores those
+    // slots, but the exact 'array too small, feature reads zeros'
+    // class the Vulkan ocean-slot regression documented).
     std::uint64_t buffers[24]      {};   // BufferHandle.id by slot
-    std::uint64_t textures[16]     {};   // TextureHandle.id by slot
+    std::uint64_t textures[20]     {};   // TextureHandle.id by slot
     std::uint64_t accel_structs[4] {};   // AccelStructHandle.id by accel-slot
 };
 

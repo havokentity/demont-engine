@@ -467,7 +467,8 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     // bloom_pyramid's last bloom_down dispatch had bound there
     // (a 320x180 bloom mip), bounds-checking PathTrace's writes to
     // 320x180 instead of 1280x720. See dsets_ comment in VulkanDevice.h.
-    auto dset = device_->AcquireDispatchDescriptorSet();
+    const auto slot = device_->AcquireDispatchDescriptorSet();
+    VkDescriptorSet dset = slot.set;
 
     // Build the descriptor write list. Each binding in the shared layout
     // is marked VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, so slots the
@@ -590,9 +591,21 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
     }
 
-    // ---- Frame UBO at binding 14 (per-frame ring) ---------------------
+    // ---- Frame UBO at binding 14 (per-dispatch slice) ------------------
     {
         const auto& ubo = device_->CurrentFrameUbo();
+        // Each dispatch writes + binds its OWN kFrameUboSize slice of the
+        // frame's UBO allocation, indexed by the same ring cursor as the
+        // descriptor set. The memcpy happens at record time but the GPU
+        // reads at execution time, so a single shared region per frame
+        // slot meant the last-recorded dispatch's tail clobbered every
+        // earlier dispatch in the command buffer (StarsComposite's 128 B
+        // tail overwrote the view-proj matrices PathTrace's Frame cbuffer
+        // decodes from the same bytes -- corrupted SVGF reprojection on
+        // the dual-Denoise path). Same hazard the per-dispatch descriptor
+        // ring already solved for the sets themselves.
+        const VkDeviceSize slice_off =
+            static_cast<VkDeviceSize>(slot.slice) * VulkanDevice::kFrameUboSize;
         // Copy spilled tail if push exceeds the on-chip range.
         if (push_size_ > VulkanDevice::kPushSplitOffset && ubo.mapped != nullptr) {
             std::size_t tail = push_size_ - VulkanDevice::kPushSplitOffset;
@@ -612,10 +625,10 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
                 }
                 tail = VulkanDevice::kFrameUboSize;
             }
-            std::memcpy(ubo.mapped,
+            std::memcpy(static_cast<std::uint8_t*>(ubo.mapped) + slice_off,
                         push_buf_ + VulkanDevice::kPushSplitOffset, tail);
         }
-        add_buffer(VulkanDevice::kFrameUboBinding, ubo.buffer, 0,
+        add_buffer(VulkanDevice::kFrameUboBinding, ubo.buffer, slice_off,
                    VulkanDevice::kFrameUboSize,
                    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
     }
@@ -1397,8 +1410,12 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     }
 
     // ---- Per-frame Frame UBO ring ------------------------------------
+    // kDispatchSetsPerFrame slices of kFrameUboSize each, so every
+    // dispatch in a frame owns a private slice (see the kFrameUboSize
+    // comment in VulkanDevice.h for the record-vs-execution clobber this
+    // prevents). 2 frames x 24 slices x 2 KiB = 96 KiB total.
     for (int i = 0; i < kFramesInFlight; ++i) {
-        if (!CreateBufferImpl(kFrameUboSize,
+        if (!CreateBufferImpl(kFrameUboSize * kDispatchSetsPerFrame,
                               VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
                                 | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -2255,14 +2272,22 @@ void VulkanDevice::WriteBuffer(BufferHandle h, const void* src, std::size_t size
 
     // Stage CPU bytes through a transient host-visible buffer, then
     // vkCmdCopyBuffer to the device-local destination.  Synchronous
-    // submit-and-wait -- the call sites are scene-load time (mesh
-    // upload, env CDF upload) and rare cvar-change events
-    // (r_exposure flip, etc.), not every frame.  The 5-15 ms stall
-    // is user-initiated and acceptable on a knob change; we'd want
-    // a vkCmdUpdateBuffer-based fast-path queued into the next
-    // frame's command buffer if this ever moves into the per-frame
-    // loop.  See Raytracer Plan/FOLLOW_UPS.md "WriteBuffer fast
-    // path for tiny runtime updates" if you hit a hitch on a knob.
+    // submit-and-wait.
+    //
+    // PERF WARNING (issue #57): this path was designed for scene-load
+    // time (mesh upload, env CDF upload) and rare cvar-change events,
+    // but the engine now calls WriteBuffer EVERY FRAME from several
+    // sites when their features are active -- SPH particle splats,
+    // smoke emitters, GPU particles, the perf-overlay drawlist, and
+    // gizmo/light-icon line segments.  Each call is a full
+    // vkQueueWaitIdle (draining the whole GPU queue mid-frame and
+    // defeating the 2-deep frames-in-flight ring) plus a transient
+    // VkBuffer+VkDeviceMemory allocate/free.  On Metal the same RHI
+    // call is a bare memcpy into shared memory.  The fix tracked in
+    // issue #57 is a vkCmdUpdateBuffer fast-path (<= 64 KiB) recorded
+    // into the current frame's command buffer, or a persistently-
+    // mapped per-frame staging ring; keep the synchronous path only
+    // for load-time bulk uploads.
     BufferEntry staging{};
     if (!CreateBufferImpl(size,
                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -3373,11 +3398,36 @@ FrameContext VulkanDevice::BeginFrame() {
     VkResult ar = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX,
                                         sem_image_avail_[current_frame_],
                                         VK_NULL_HANDLE, &current_swap_index_);
-    if (ar == VK_ERROR_OUT_OF_DATE_KHR || ar == VK_SUBOPTIMAL_KHR) {
+    // VK_SUBOPTIMAL_KHR is a SUCCESS code: the image was acquired and
+    // sem_image_avail_ has a pending signal. Recreating + re-acquiring
+    // on the same semaphore here violated
+    // VUID-vkAcquireNextImageKHR-semaphore-01286 (the semaphore must
+    // have no pending operations) -- render this frame on the
+    // slightly-stale swapchain instead; the present path already sees
+    // SUBOPTIMAL/OUT_OF_DATE at vkQueuePresentKHR and recreates for
+    // the NEXT frame with the semaphore safely unsignaled.
+    if (ar == VK_ERROR_OUT_OF_DATE_KHR) {
+        // Hard failure: nothing was acquired, no pending signal on the
+        // semaphore, so recreate-and-retry is legal here.
         RecreateSwapchain();
         ar = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX,
                                    sem_image_avail_[current_frame_],
                                    VK_NULL_HANDLE, &current_swap_index_);
+    }
+    if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) {
+        // Retry failed too (surface lost, another OUT_OF_DATE mid-
+        // recreate, device lost). current_swap_index_ was NOT written,
+        // so Submit/EndFrame would index freshly-rebuilt swap_images_ /
+        // sem_render_done_ with a stale index -- skip the frame
+        // entirely rather than submit against dangling state. NOTE:
+        // the in-flight fence is intentionally NOT reset on this path;
+        // it stays signaled so the next BeginFrame's wait returns
+        // immediately.
+        if (ar == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+        LOG_ERROR("VulkanDevice::BeginFrame: vkAcquireNextImageKHR failed: "
+                  "{} ({}). Frame skipped.",
+                  static_cast<int>(ar), VkResultToString(ar));
+        return {};
     }
 
     vkResetFences(device_, 1, &fence_in_flight_[current_frame_]);
