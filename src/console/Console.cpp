@@ -57,7 +57,20 @@ std::vector<std::string_view> TokenizeLine(std::string_view line, std::string& s
     while (i < line.size()) {
         skip_ws();
         if (i >= line.size()) break;
-        if (i + 1 < line.size() && line[i] == '/' && line[i + 1] == '/') break;
+        // '//' opens a comment ONLY at statement start (first-token
+        // position), mirroring Execute()'s full-line `//` rule and
+        // ScanScriptStatementEnd's at_stmt_start handling. Treating
+        // token-start '//' as a comment ANYWHERE (as this used to)
+        // disagreed with the statement scanner: the scanner kept a
+        // trailing `// note; text` as data and split at the ';',
+        // while the tokenizer half thought it was comment -- and a
+        // `//server/share`-shaped value was silently dropped, turning
+        // the set into a read. Inline comments are '#' only (stripped
+        // by Execute() before we run); mid-line '//' is data.
+        if (spans.empty() && i + 1 < line.size() &&
+            line[i] == '/' && line[i + 1] == '/') {
+            break;
+        }
 
         std::size_t start = storage.size();
         if (line[i] == '"') {
@@ -91,6 +104,54 @@ std::vector<std::string_view> TokenizeLine(std::string_view line, std::string& s
     for (auto [off, len] : spans) {
         out.emplace_back(storage.data() + off, len);
     }
+    return out;
+}
+
+std::string QuoteForConsole(std::string_view value) {
+    // Bare only when non-empty and free of anything the tokenizer,
+    // Execute()'s inline-'#' strip, or ScanScriptStatementEnd treats
+    // specially:
+    //   ' ' '\t'      token separators
+    //   '"' '\\'      flip quote / escape state in the comment strip
+    //                 and the statement scanner
+    //   '#'           inline comment marker (Execute + scanner)
+    //   ';'           statement separator (scanner)
+    //   '\n' '\r'     line structure of cfg files
+    //   leading "//"  comment-at-statement-start (TokenizeLine)
+    // An empty value must also be quoted: an unquoted `name ` line
+    // trims to one token and Execute() treats it as a READ, silently
+    // dropping the set.
+    bool needs_quotes = value.empty() || value.starts_with("//");
+    if (!needs_quotes) {
+        for (char c : value) {
+            if (c == ' ' || c == '\t' || c == '"' || c == '\\' ||
+                c == '#' || c == ';' || c == '\n' || c == '\r') {
+                needs_quotes = true;
+                break;
+            }
+        }
+    }
+    if (!needs_quotes) return std::string(value);
+
+    // Quoted form. Escape exactly what TokenizeLine's quoted-token
+    // branch unescapes ('\\' '\"' '\n' '\t') -- no more, no less --
+    // so the round trip is byte-exact. A raw '\r' inside quotes is
+    // data to the tokenizer (only TRAILING '\r' gets trimmed, and a
+    // quoted value never ends the raw line), so it passes through
+    // unescaped; emitting "\\r" would decode to a literal 'r'.
+    std::string out;
+    out.reserve(value.size() + 2);
+    out.push_back('"');
+    for (char c : value) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\t': out += "\\t";  break;
+            default:   out.push_back(c); break;
+        }
+    }
+    out.push_back('"');
     return out;
 }
 
@@ -403,12 +464,21 @@ ExecuteResult Console::Execute(std::string_view line) {
     if (!in_fav_dispatch_ && !favorites_.empty() &&
         name.size() >= 2 && name[0] == 'f') {
         bool all_digits = true;
+        bool in_range   = true;
         std::size_t idx = 0;
         for (std::size_t i = 1; i < name.size(); ++i) {
             if (name[i] < '0' || name[i] > '9') { all_digits = false; break; }
             idx = idx * 10 + std::size_t(name[i] - '0');
+            // Once idx exceeds the favourites count it can only grow
+            // with further digits, so bail to the out-of-range fall-
+            // through now. Also the overflow guard: unchecked
+            // accumulation wraps std::size_t, so a 20+-digit index
+            // like f18446744073709551617 (2^64 + 1) would alias f1
+            // and silently execute the wrong favourite instead of
+            // erroring as "unknown".
+            if (idx > favorites_.size()) { in_range = false; break; }
         }
-        if (all_digits && idx >= 1 && idx <= favorites_.size()) {
+        if (all_digits && in_range && idx >= 1 && idx <= favorites_.size()) {
             const std::string saved = favorites_[idx - 1];
             in_fav_dispatch_ = true;
             ExecuteResult sub = Execute(saved);
@@ -630,6 +700,7 @@ ExecuteResult Console::Execute(std::string_view line) {
                 // returned so the interactive caller knows the
                 // value won't take effect *on this host*.
                 std::string old_value = v->value;
+                RecordTxnPreValue(v->name, old_value);
                 v->value = new_value;
                 // Don't fire on_change for an inactive value -- the
                 // engine handler would just try to switch backends
@@ -651,6 +722,7 @@ ExecuteResult Console::Execute(std::string_view line) {
         }
 
         std::string old_value = v->value;
+        RecordTxnPreValue(v->name, old_value);
         v->value = std::move(new_value);
         if (v->on_change) v->on_change(*v);
 
@@ -752,33 +824,38 @@ std::size_t ScanScriptStatementEnd(std::string_view body, std::size_t i) {
 
 }  // namespace
 
+// Record a cvar's pre-write value into the open undo transaction
+// (first write per name wins, so a script that sets the same cvar
+// twice still snapshots the true pre-script value). No-op unless an
+// outermost ExecuteScript has the capture flag up; also skipped while
+// Undo()/Redo() replay values through Execute() -- their writes must
+// not spawn a fresh undo entry, Undo() maintains the redo stack
+// itself.
+void Console::RecordTxnPreValue(const std::string& name,
+                                const std::string& value) {
+    if (!txn_capture_active_ || in_undo_redo_) return;
+    txn_pre_values_.try_emplace(name, value);
+}
+
 ExecuteResult Console::ExecuteScript(std::string_view body) {
     ExecuteResult agg;
-    // Capture pre-transaction values of every cvar that the script
-    // tries to set. Implemented by parsing the first token of each
-    // statement; if that token names a known cvar, snapshot its
-    // current value. Statements that target commands (no cvar match)
-    // contribute nothing to the snapshot.
-    CvarSnapshot pre;
-    if (!in_undo_redo_) {
-        std::size_t i = 0;
-        while (i < body.size()) {
-            std::size_t end = ScanScriptStatementEnd(body, i);
-            auto line = body.substr(i, end - i);
-            // Find first non-whitespace, then first whitespace (token end).
-            std::size_t a = 0;
-            while (a < line.size() && (line[a] == ' ' || line[a] == '\t')) ++a;
-            std::size_t b = a;
-            while (b < line.size() && line[b] != ' ' && line[b] != '\t') ++b;
-            if (b > a) {
-                std::string_view name = line.substr(a, b - a);
-                auto it = cvars_.find(std::string(name));
-                if (it != cvars_.end() && pre.find(it->first) == pre.end()) {
-                    pre[it->first] = it->second.value;
-                }
-            }
-            i = (end < body.size()) ? end + 1 : end;
-        }
+    // Undo capture: while the flag below is up, Execute() records the
+    // pre-write value of every cvar it actually commits (see the
+    // RecordTxnPreValue hooks at its two write sites). Capturing at
+    // set time -- rather than pre-parsing each statement's first
+    // token, as this used to -- means writes that arrive via
+    // smart-resolve shorthand (`deno svgf_atrous` -> r_denoiser) or an
+    // fN favourite dispatch land in the snapshot too; the token-parse
+    // approach missed both, so those sets were invisible to Undo()
+    // and it would silently revert an older, unrelated transaction.
+    // Only the OUTERMOST ExecuteScript owns the transaction: a nested
+    // call (e.g. a command whose callback replays a script) folds its
+    // writes into the enclosing entry rather than splitting the undo
+    // history mid-transaction.
+    const bool capture_here = !in_undo_redo_ && !txn_capture_active_;
+    if (capture_here) {
+        txn_capture_active_ = true;
+        txn_pre_values_.clear();
     }
 
     std::size_t i = 0;
@@ -803,14 +880,16 @@ ExecuteResult Console::ExecuteScript(std::string_view body) {
     // Build the actual diff: only push cvars whose value really
     // changed during this script. Skip the entry entirely if nothing
     // changed (typing a no-op or a query).
-    if (!in_undo_redo_) {
+    if (capture_here) {
+        txn_capture_active_ = false;
         CvarSnapshot diff;
-        for (auto& [name, old] : pre) {
+        for (auto& [name, old] : txn_pre_values_) {
             auto it = cvars_.find(name);
             if (it != cvars_.end() && it->second.value != old) {
                 diff[name] = old;
             }
         }
+        txn_pre_values_.clear();
         if (!diff.empty()) {
             undo_stack_.push_back(std::move(diff));
             if (undo_stack_.size() > kMaxHistory) undo_stack_.pop_front();
@@ -873,8 +952,12 @@ std::vector<Console::CvarChange> Console::Undo() {
         fwd[name] = current;
         // Set value via Execute so any allowed_values check, on_change
         // hook, and cascading on_change side effects fire as if the
-        // user typed the rollback.
-        std::string line = name + " " + old;
+        // user typed the rollback. The value goes through
+        // QuoteForConsole -- an unquoted rebuild would turn an
+        // empty-string restore into a one-token READ (value never
+        // restored) and lose everything after an unquoted '#' to the
+        // inline-comment strip.
+        std::string line = name + " " + QuoteForConsole(old);
         Execute(line);
         changes.push_back({name, std::move(current), old});
     }
@@ -896,7 +979,9 @@ std::vector<Console::CvarChange> Console::Redo() {
         if (it == cvars_.end()) continue;
         std::string current = it->second.value;
         back[name] = current;
-        std::string line = name + " " + val;
+        // Same QuoteForConsole rationale as Undo() above: empty and
+        // '#'-bearing values must survive the line rebuild.
+        std::string line = name + " " + QuoteForConsole(val);
         Execute(line);
         changes.push_back({name, std::move(current), val});
     }
@@ -966,8 +1051,36 @@ void Console::SetHistory(std::vector<std::string> hist) {
 }
 
 void Console::QueueExecute(std::string line, Responder responder) {
-    std::lock_guard lock(queue_mutex_);
-    queue_.push_back({std::move(line), std::move(responder)});
+    // Bounded queue. The network threads enqueue freely while Drain()
+    // only runs once per engine tick -- a flooding client (or a
+    // well-behaved one talking to a main thread stalled in a long
+    // scene load / cold pipeline build) could otherwise grow the
+    // queue without bound. Same OOM class the bracket-batch path in
+    // Drain() caps at 1 MiB: the console is process-shared state and
+    // an allocation failure here takes the whole engine down. On
+    // overflow the command is dropped and the client told, instead of
+    // dying.
+    constexpr std::size_t kMaxQueueDepth = 1024;
+    constexpr std::size_t kMaxQueueBytes = 4u * 1024u * 1024u;
+    bool overflow = false;
+    {
+        std::lock_guard lock(queue_mutex_);
+        if (queue_.size() >= kMaxQueueDepth ||
+            queue_bytes_ + line.size() > kMaxQueueBytes) {
+            overflow = true;
+        } else {
+            queue_bytes_ += line.size();
+            queue_.push_back({std::move(line), std::move(responder)});
+        }
+    }
+    // Responder runs outside queue_mutex_ so a responder that takes
+    // its own lock (the WS path locks ws_mutex_) can't nest under it.
+    if (overflow && responder) {
+        ExecuteResult r;
+        r.ok    = false;
+        r.error = "console queue full (engine not draining); command dropped";
+        responder(r);
+    }
 }
 
 void Console::Drain() {
@@ -975,6 +1088,7 @@ void Console::Drain() {
     {
         std::lock_guard lock(queue_mutex_);
         std::swap(local, queue_);
+        queue_bytes_ = 0;
     }
     for (auto& pe : local) {
         // Trim leading/trailing whitespace to detect lone `[` / `]`.
@@ -1091,11 +1205,14 @@ int Console::SaveArchivedCvars(const std::string& path) {
     for (auto& [name, cv] : cvars_) {
         if ((cv.flags & CVAR_ARCHIVE) == 0) continue;
         if (cv.value == cv.default_value)   continue;       // don't bloat with defaults
-        const bool needs_quotes = (cv.value.find(' ') != std::string::npos);
-        f << cv.name << ' ';
-        if (needs_quotes) f << '"' << cv.value << '"';
-        else              f << cv.value;
-        f << '\n';
+        // QuoteForConsole keeps simple values bare (`r_spp 4`) and
+        // quotes + escapes anything the replay path would mangle:
+        // an unquoted '#' gets chopped by the inline-comment strip,
+        // an unquoted ';' splits into a bogus second statement, an
+        // embedded '"' garbles tokenization, and a non-default EMPTY
+        // value written bare reloads as a query -- silently reverting
+        // the cvar to default on the next launch.
+        f << cv.name << ' ' << QuoteForConsole(cv.value) << '\n';
         ++n;
     }
     return n;

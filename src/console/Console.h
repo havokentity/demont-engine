@@ -209,8 +209,10 @@ public:
 
     // Persistence (P11). Writes every CVAR_ARCHIVE cvar whose current
     // value differs from its default as `<name> <value>` lines to `path`.
-    // Returns the number of lines written, or -1 on file error. Quoting
-    // for values that contain spaces is wrapped in double quotes.
+    // Returns the number of lines written, or -1 on file error. Values
+    // are rendered via QuoteForConsole so anything the reader treats
+    // specially (spaces, '#', ';', '"', '\\', tabs, empty string)
+    // survives the write -> replay round trip.
     int SaveArchivedCvars(const std::string& path);
 
     // Reset every cvar to its registered `default_value`. Useful for
@@ -305,12 +307,29 @@ private:
     };
     std::mutex                queue_mutex_;
     std::deque<PendingExec>   queue_;
+    // Total bytes of command text currently queued. Maintained under
+    // queue_mutex_; QueueExecute uses it (plus a depth cap) to bound
+    // how much a flooding client can buffer between Drain() calls.
+    std::size_t               queue_bytes_ = 0;
 
     // Single transaction snapshot: name -> pre-transaction value.
     using CvarSnapshot = std::map<std::string, std::string>;
     std::deque<CvarSnapshot>  undo_stack_;
     std::deque<CvarSnapshot>  redo_stack_;
     bool                      in_undo_redo_ = false;   // suppress nested capture
+
+    // Undo-transaction accumulator (set-time capture). While an
+    // outermost ExecuteScript transaction is open, Execute() records
+    // each committed cvar's pre-write value here (first write per name
+    // wins) via RecordTxnPreValue. ExecuteScript diffs the map on
+    // completion to build the undo entry. Capturing at set time --
+    // rather than pre-parsing statement first-tokens -- is what makes
+    // writes routed through smart-resolve shorthand or fN favourite
+    // dispatch visible to Undo(); see ExecuteScript() for the full
+    // rationale.
+    CvarSnapshot              txn_pre_values_;
+    bool                      txn_capture_active_ = false;
+    void RecordTxnPreValue(const std::string& name, const std::string& value);
 
     // Bracket-batch mode (`[` ... `]`). When the user sends a line
     // containing only `[`, subsequent lines are buffered (not
@@ -346,9 +365,24 @@ private:
 };
 
 // Tokenize a single console line.  Quote-aware ("a b" stays one token).
-// Stops at newline; '//' begins a comment for the rest of the line.
+// '//' begins a comment ONLY at statement start (first-token position),
+// matching Execute()'s full-line `//` rule and ScanScriptStatementEnd's
+// at_stmt_start handling; mid-line '//' is data so `//server/share`-
+// shaped values survive. '#' is the only inline comment marker and is
+// stripped by Execute() before tokenizing.
 std::vector<std::string_view> TokenizeLine(std::string_view line,
                                            std::string& storage);
+
+// Inverse of TokenizeLine's quoted-token unescape: render `value` as a
+// single token that tokenizes back to exactly `value`. Values made
+// purely of characters no parser layer treats specially pass through
+// bare (keeps `r_spp 4` human-readable on disk); anything else --
+// spaces, tabs, '#', ';', '"', '\\', newlines, a leading "//", or the
+// empty string -- comes back double-quoted with '\\' '"' '\n' '\t'
+// escaped. Shared by every writer that rebuilds console lines from
+// stored values (SaveArchivedCvars, Undo/Redo, the WS set_cvar
+// handler) so writer and reader can't drift apart.
+std::string QuoteForConsole(std::string_view value);
 
 // True iff the given CVAR_VALUE_* mask permits the value on the
 // current build's host platform. A mask of 0 (CVAR_VALUE_ANY) always

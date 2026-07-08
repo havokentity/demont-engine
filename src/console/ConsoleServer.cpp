@@ -58,9 +58,11 @@
    inline bool pt_sock_valid(pt_sock_t s) { return s >= 0; }
 #endif
 
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <memory>
 #include <utility>
 
 namespace {
@@ -107,6 +109,22 @@ const char* LevelName(pt::log::Level lv) {
         case pt::log::Level::Error: return "error";
     }
     return "info";
+}
+
+// Safe string-field read for untrusted wire JSON. nlohmann's
+// json::value<std::string>() calls get<std::string>() whenever the key
+// EXISTS, and a type mismatch there JSON_THROWs -- but pt_console
+// builds with JSON_NOEXCEPTION under -fno-exceptions, which maps
+// JSON_THROW straight to std::abort(). So a single message like
+// {"type":"select","id":5} (a documented legacy shape: numeric object
+// id in `id`) would kill the whole engine process before the guarded
+// numeric fallback could run. Every string field read in
+// HandleWsMessage goes through this instead: absent key OR wrong-typed
+// value yields "" -- the same result value() gives for an absent key.
+std::string StrField(const json& m, const char* key) {
+    auto it = m.find(key);
+    return (it != m.end() && it->is_string()) ? it->get<std::string>()
+                                              : std::string{};
 }
 
 void SendStaticHttp(mg_connection* conn, const char* mime,
@@ -252,6 +270,21 @@ void ConsoleServer::Stop() {
         PT_SOCK_CLOSE(s);
         line_fd_ = kInvalidSocket;
     }
+    // Wake every per-client worker parked in a blocking recv().
+    // Closing the listen socket above only unblocks the accept loop;
+    // accepted client sockets are independent, so a connected-but-
+    // idle client would otherwise hold its worker in recv() forever
+    // and the joins below would hang engine shutdown. shutdown() --
+    // not close() -- so the worker still owns the fd's lifetime and
+    // closes it on loop exit as usual. Workers racing between accept
+    // and set-insertion are safe too: they re-check line_run_ (now
+    // false) before their first recv().
+    {
+        std::lock_guard lock(line_clients_mutex_);
+        for (socket_handle_t cfd : line_clients_) {
+            ::shutdown(static_cast<pt_sock_t>(cfd), PT_SOCK_SHUTDOWN_BOTH);
+        }
+    }
     if (line_thread_.joinable()) line_thread_.join();
     for (auto& t : line_workers_) {
         if (t.joinable()) t.join();
@@ -325,27 +358,55 @@ int ConsoleServer::WsConnectHandler(const mg_connection* conn, void* cbdata) {
     // web/editor/vite.config.ts (strictPort) -- but their WebSocket
     // still targets the engine's HTTP port directly (endpoint.ts), so
     // the handshake arrives with a cross-origin Origin header.
+    //
+    // A browser's Origin carries the host the user DIALED, never the
+    // address we bound: pages served by the engine build their WS URL
+    // from location.host (console.js / endpoint.ts). So the primary
+    // same-origin test compares Origin against "http://" + the
+    // request's own Host header -- that's what keeps non-loopback
+    // binds working (net_bind_address=0.0.0.0 never appears in a real
+    // Origin, and a LAN client dials the machine's LAN IP). The
+    // literal spellings below back that up: both loopback names for
+    // the engine port (localhost vs 127.0.0.1 are distinct origins to
+    // a browser), the configured bind_address form for explicit
+    // single-IP binds, and the Vite dev/preview pairs.
     if (req != nullptr) {
+        const char* origin_hdr = nullptr;
+        const char* host_hdr   = nullptr;
         for (int i = 0; i < req->num_headers; ++i) {
             if (PT_STRCASECMP(req->http_headers[i].name, "Origin") == 0) {
-                std::string origin = req->http_headers[i].value
-                                     ? req->http_headers[i].value : "";
-                const std::array<std::string, 6> allowed = {
+                origin_hdr = req->http_headers[i].value;
+            } else if (PT_STRCASECMP(req->http_headers[i].name, "Host") == 0) {
+                host_hdr = req->http_headers[i].value;
+            }
+        }
+        if (origin_hdr != nullptr) {
+            const std::string origin = origin_hdr;
+            bool ok = false;
+            // Same-origin via the Host header (host:port as dialed).
+            if (host_hdr != nullptr && *host_hdr != '\0') {
+                ok = (origin == fmt::format("http://{}", host_hdr));
+            }
+            if (!ok) {
+                const std::array<std::string, 7> allowed = {
+                    fmt::format("http://localhost:{}", self->config_.http_port),
+                    fmt::format("http://127.0.0.1:{}", self->config_.http_port),
+                    // Inert when bind_address is 0.0.0.0 / a loopback
+                    // duplicate; matches when the user bound one
+                    // explicit LAN IP.
                     fmt::format("http://{}:{}",
                         self->config_.bind_address, self->config_.http_port),
-                    fmt::format("http://localhost:{}", self->config_.http_port),
                     std::string("http://localhost:5173"),
                     std::string("http://localhost:5174"),
                     std::string("http://127.0.0.1:5173"),
                     std::string("http://127.0.0.1:5174"),
                 };
-                const bool ok = std::find(allowed.begin(), allowed.end(),
-                                          origin) != allowed.end();
-                if (!ok) {
-                    LOG_WARN("WS rejected: bad Origin '{}'", origin);
-                    return 1;  // reject
-                }
-                break;
+                ok = std::find(allowed.begin(), allowed.end(),
+                               origin) != allowed.end();
+            }
+            if (!ok) {
+                LOG_WARN("WS rejected: bad Origin '{}'", origin);
+                return 1;  // reject
             }
         }
     }
@@ -366,6 +427,20 @@ int ConsoleServer::WsDataHandler(mg_connection* conn, int op, char* data,
     auto* self = static_cast<ConsoleServer*>(cbdata);
     (void)op;
     if ((op & 0xF) == MG_WEBSOCKET_OPCODE_CONNECTION_CLOSE) return 0;
+    // Cap inbound frames. civetweb buffers the whole text frame before
+    // this callback fires, and without a cap the payload would flow
+    // wholesale into Console's exec queue and sit there until the next
+    // Drain() -- one client could balloon memory far past anything the
+    // engine budgets for. 1 MiB matches the bracket-batch cap in
+    // Console::Drain(): same OOM class, same budget.
+    constexpr std::size_t kMaxWsPayloadBytes = 1u * 1024u * 1024u;
+    if (len > kMaxWsPayloadBytes) {
+        LOG_WARN("WS message dropped: {} bytes exceeds {} byte cap",
+                 len, kMaxWsPayloadBytes);
+        self->SendWs(conn,
+                     R"({"type":"result","ok":false,"error":"message too large"})");
+        return 1;  // keep the connection; just drop the oversized frame
+    }
     if (data != nullptr && len > 0) {
         self->HandleWsMessage(conn, std::string_view(data, len));
     }
@@ -393,8 +468,14 @@ void ConsoleServer::HandleWsMessage(mg_connection* conn, std::string_view payloa
         return;
     }
 
-    std::string type = msg.value("type", std::string{});
-    std::string id   = msg.value("id",   std::string{});
+    // All field reads below use StrField (see anon namespace above):
+    // msg.value<std::string>() aborts the process on a type-mismatched
+    // field in this JSON_NOEXCEPTION build, and every byte here is
+    // untrusted wire input. `id` in particular is a NUMBER in the
+    // legacy select protocol (see the select handler below), so it
+    // must tolerate non-string values by design.
+    std::string type = StrField(msg, "type");
+    std::string id   = StrField(msg, "id");
 
     auto reply = [&](const json& body) {
         json out = body;
@@ -404,7 +485,7 @@ void ConsoleServer::HandleWsMessage(mg_connection* conn, std::string_view payloa
     };
 
     if (type == "exec") {
-        std::string line = msg.value("line", std::string{});
+        std::string line = StrField(msg, "line");
         Console::Get().QueueExecute(std::move(line),
             [conn, id, this](const ExecuteResult& r) {
                 json body{{"ok", r.ok}};
@@ -419,7 +500,7 @@ void ConsoleServer::HandleWsMessage(mg_connection* conn, std::string_view payloa
     }
 
     if (type == "get_cvar") {
-        std::string name = msg.value("name", std::string{});
+        std::string name = StrField(msg, "name");
         auto* v = Console::Get().FindCVar(name);
         if (v == nullptr) {
             reply(json{{"ok", false},
@@ -446,9 +527,30 @@ void ConsoleServer::HandleWsMessage(mg_connection* conn, std::string_view payloa
     }
 
     if (type == "set_cvar") {
-        std::string name  = msg.value("name",  std::string{});
-        std::string value = msg.value("value", std::string{});
-        std::string line  = fmt::format("{} \"{}\"", name, value);
+        std::string name  = StrField(msg, "name");
+        std::string value = StrField(msg, "value");
+        // `name` is concatenated into the console line UNQUOTED, so
+        // gate it to identifier characters -- every registered cvar /
+        // command name is a C identifier (PT_CVAR / PT_COMMAND
+        // stringize variable names). Without this, a name like
+        // "x;dev_cheats 1" would smuggle a second statement past the
+        // single-cvar contract of set_cvar.
+        const bool name_ok = !name.empty() &&
+            std::all_of(name.begin(), name.end(), [](unsigned char c) {
+                return std::isalnum(c) != 0 || c == '_';
+            });
+        if (!name_ok) {
+            reply(json{{"ok", false},
+                       {"error", fmt::format("bad cvar name: {}", name)}});
+            return;
+        }
+        // QuoteForConsole escapes '\' and '"' (the exact inverse of
+        // TokenizeLine's unescape), so a value containing a literal
+        // double quote can't break out of the quoting -- previously
+        // `a";dev_cheats 1;"` became `r_x "a";dev_cheats 1;""` and
+        // the quote-aware ';' splitter in ExecuteScript ran the
+        // injected statement.
+        std::string line = fmt::format("{} {}", name, QuoteForConsole(value));
         Console::Get().QueueExecute(std::move(line),
             [conn, id, this](const ExecuteResult& r) {
                 json body{{"ok", r.ok}};
@@ -463,7 +565,7 @@ void ConsoleServer::HandleWsMessage(mg_connection* conn, std::string_view payloa
     }
 
     if (type == "list_cvars") {
-        std::string prefix = msg.value("prefix", std::string{});
+        std::string prefix = StrField(msg, "prefix");
         json arr = json::array();
         Console::Get().EnumerateCVars(prefix, [&arr](CVar& v) {
             json entry{
@@ -488,7 +590,7 @@ void ConsoleServer::HandleWsMessage(mg_connection* conn, std::string_view payloa
     }
 
     if (type == "list_commands") {
-        std::string prefix = msg.value("prefix", std::string{});
+        std::string prefix = StrField(msg, "prefix");
         json arr = json::array();
         Console::Get().EnumerateCommands(prefix, [&arr](Command& c) {
             json entry{
@@ -535,7 +637,7 @@ void ConsoleServer::HandleWsMessage(mg_connection* conn, std::string_view payloa
         // For backward compat with older clients that put the object
         // id in `id` as a JSON number, we fall through to that field
         // when `obj_id` isn't present.
-        std::string kind = msg.value("kind", std::string{});
+        std::string kind = StrField(msg, "kind");
         std::uint32_t sel_id = 0;
         if (msg.contains("obj_id") && msg["obj_id"].is_number_unsigned()) {
             sel_id = msg["obj_id"].get<std::uint32_t>();
@@ -630,6 +732,14 @@ void ConsoleServer::LineAcceptLoop() {
 
 void ConsoleServer::LineClientLoop(socket_handle_t fd_) {
     auto fd = static_cast<pt_sock_t>(fd_);
+    // Register with the live-client set so Stop() can ::shutdown() this
+    // socket and break us out of the blocking recv() below -- closing
+    // the LISTEN socket alone doesn't wake accepted clients, and the
+    // join in Stop() would otherwise hang on an idle connection.
+    {
+        std::lock_guard lock(line_clients_mutex_);
+        line_clients_.insert(fd_);
+    }
     std::string buf;
     buf.reserve(256);
     char chunk[256];
@@ -650,22 +760,41 @@ void ConsoleServer::LineClientLoop(socket_handle_t fd_) {
                 start = i + 1;
                 if (line.empty()) continue;
 
-                // Synchronously execute on the main-thread queue and reply.
-                std::mutex m;
-                std::condition_variable cv;
+                // Synchronously execute on the main-thread queue and
+                // reply. The rendezvous state is heap-shared with the
+                // responder: Console::Drain() may run long AFTER the
+                // 2 s wait below gives up (cold pipeline builds and
+                // heavy scene loads block the main thread for far
+                // longer), and the queued responder fires whenever
+                // Drain finally gets to it. Capturing stack locals by
+                // reference here would have that late call writing
+                // through dangling pointers -- a destroyed mutex and
+                // ExecuteResult, or a torn-down thread stack if the
+                // client disconnected. The shared_ptr keeps the state
+                // alive for however late the responder fires; a
+                // timed-out client simply never sees the reply.
+                struct SyncState {
+                    std::mutex              m;
+                    std::condition_variable cv;
+                    bool                    done = false;
+                    ExecuteResult           result;
+                };
+                auto st = std::make_shared<SyncState>();
+                Console::Get().QueueExecute(line,
+                    [st](const ExecuteResult& r) {
+                        std::lock_guard lock(st->m);
+                        st->result = r;
+                        st->done = true;
+                        st->cv.notify_one();
+                    });
                 bool done = false;
                 ExecuteResult result;
-                Console::Get().QueueExecute(line,
-                    [&](const ExecuteResult& r) {
-                        std::lock_guard lock(m);
-                        result = r;
-                        done = true;
-                        cv.notify_one();
-                    });
                 {
-                    std::unique_lock lock(m);
-                    cv.wait_for(lock, std::chrono::seconds(2),
-                                [&]{ return done; });
+                    std::unique_lock lock(st->m);
+                    st->cv.wait_for(lock, std::chrono::seconds(2),
+                                    [&]{ return st->done; });
+                    done = st->done;
+                    if (done) result = st->result;
                 }
                 if (done) {
                     if (result.ok) {
@@ -685,6 +814,28 @@ void ConsoleServer::LineClientLoop(socket_handle_t fd_) {
             }
         }
         if (start > 0) buf.erase(0, start);
+
+        // Per-line cap on the residual (no '\n' seen yet). A client
+        // that streams bytes without ever sending a newline would
+        // otherwise grow `buf` until allocation failure kills the
+        // process -- the same OOM class the bracket-batch path in
+        // Console::Drain() caps at 1 MiB, but one transport layer
+        // below it. 64 KiB dwarfs any sane console line (the largest
+        // replay scripts in this codebase are batched line-by-line),
+        // so tripping it means a broken or hostile client: tell it
+        // why, then drop the connection.
+        constexpr std::size_t kMaxLineBytes = 64u * 1024u;
+        if (buf.size() > kMaxLineBytes) {
+            LOG_WARN("line client dropped: unterminated line exceeds "
+                     "{} byte cap", kMaxLineBytes);
+            const char err[] = "error: line too long\n";
+            ::send(fd, err, static_cast<int>(sizeof(err) - 1), 0);
+            break;
+        }
+    }
+    {
+        std::lock_guard lock(line_clients_mutex_);
+        line_clients_.erase(fd_);
     }
     PT_SOCK_CLOSE(fd);
 }

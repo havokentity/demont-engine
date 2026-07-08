@@ -117,6 +117,16 @@ private:
     socket_handle_t       line_fd_  = kInvalidSocket;
     std::thread           line_thread_;
     std::vector<std::thread> line_workers_;
+    // Live per-client sockets, guarded by line_clients_mutex_. Each
+    // worker inserts its fd on entry and erases it on exit; Stop()
+    // walks the set and ::shutdown()s every fd to break workers out
+    // of a blocking recv(). Closing the LISTEN socket alone doesn't
+    // wake accepted clients, so without this a connected-but-idle
+    // client (a forgotten `nc` session) would park its worker in
+    // recv() forever and the joins in Stop() would hang engine
+    // shutdown.
+    std::mutex            line_clients_mutex_;
+    std::set<socket_handle_t> line_clients_;
 
     // --- Editor backend (agent-19) ---------------------------------------
     // Set via SetSelectHandler / SetSceneDumpHandler. Read inside
