@@ -28,9 +28,11 @@
 
 #include "renderer/LightTree.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <random>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -272,4 +274,150 @@ TEST_CASE("LightTree: parent AABB encloses both children's AABBs") {
         CHECK(p.intensity == doctest::Approx(cl.intensity + cr.intensity)
                                 .epsilon(1e-4f));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Selection-PMF correctness (the NEE estimator divides by pick_pdf).
+//
+// The reachability tests above prove every leaf CAN be reached. They say
+// nothing about the PROBABILITY of reaching it -- and PathTrace.slang
+// divides each NEE sample by `pick_pdf` (sampleAnalyticLight), so a bug
+// that keeps every leaf reachable while mis-accumulating pick_pdf (wrong
+// sibling's probability, a broken importance ratio) silently biases all
+// many-light direct lighting while every existing assertion stays green.
+//
+// `LeafPickProbability` mirrors pickLightFromTree's math exactly: at each
+// internal node the child importances give p_left = il / (il + ir), and
+// pick_pdf is the product of the conditional probabilities along the
+// root-to-leaf path. Because each light has exactly one leaf, and exactly
+// one path reaches it, pick_pdf(L) IS the selection PMF -- so the
+// probabilities over all leaves must sum to exactly 1. That is a
+// deterministic invariant; no Monte Carlo (and no flakiness) required.
+
+// Host mirror of PathTrace.slang's lightTreeImportance().
+float MirrorImportance(const pt::renderer::LightTreeNode& node,
+                       const float hit_pt[3], const float n_face[3]) {
+    const float cx = 0.5f * (node.aabb_min[0] + node.aabb_max[0]);
+    const float cy = 0.5f * (node.aabb_min[1] + node.aabb_max[1]);
+    const float cz = 0.5f * (node.aabb_min[2] + node.aabb_max[2]);
+    float to[3] = {cx - hit_pt[0], cy - hit_pt[1], cz - hit_pt[2]};
+    const float d2 = std::max(to[0]*to[0] + to[1]*to[1] + to[2]*to[2], 1e-12f);
+    const float inv_d = 1.0f / std::sqrt(d2);
+    const float dir_to[3] = {to[0]*inv_d, to[1]*inv_d, to[2]*inv_d};
+
+    const float ex = 0.5f * (node.aabb_max[0] - node.aabb_min[0]);
+    const float ey = 0.5f * (node.aabb_max[1] - node.aabb_min[1]);
+    const float ez = 0.5f * (node.aabb_max[2] - node.aabb_min[2]);
+    const float rad2 = std::max(ex*ex + ey*ey + ez*ez, 1e-12f);
+
+    const float falloff = 1.0f / std::max(d2, rad2);
+
+    float orient = 1.0f;
+    if (node.cone_cos_half > -0.999f) {
+        const float cos_emit = -(node.cone_axis[0]*dir_to[0] +
+                                 node.cone_axis[1]*dir_to[1] +
+                                 node.cone_axis[2]*dir_to[2]);
+        const float t = (cos_emit - (node.cone_cos_half - 0.2f)) / 0.2f;
+        orient = std::clamp(t, 0.0f, 1.0f);
+    }
+    const float recv = std::max(0.0f, n_face[0]*dir_to[0] +
+                                      n_face[1]*dir_to[1] +
+                                      n_face[2]*dir_to[2]);
+    return std::max(node.intensity * falloff * orient * recv, 1e-8f);
+}
+
+// Accumulate each leaf's selection probability by walking every
+// root-to-leaf path, exactly as pickLightFromTree would sample it.
+void CollectLeafPickProbabilities(
+        const LightTree& tree, std::uint32_t idx, double p_path,
+        const float hit_pt[3], const float n_face[3],
+        std::unordered_map<std::uint32_t, double>& out) {
+    REQUIRE(idx < tree.nodes.size());
+    const auto& n = tree.nodes[idx];
+    if (n.count == 1u) {          // leaf
+        out[n.left_first] += p_path;
+        return;
+    }
+    const std::uint32_t left  = n.left_first;
+    const std::uint32_t right = left + 1u;
+    REQUIRE(right < tree.nodes.size());
+    const float il = MirrorImportance(tree.nodes[left],  hit_pt, n_face);
+    const float ir = MirrorImportance(tree.nodes[right], hit_pt, n_face);
+    const float total = il + ir;
+    const double p_l = (total > 1e-30f) ? double(il) / double(total) : 0.5;
+    CollectLeafPickProbabilities(tree, left,  p_path * p_l,        hit_pt, n_face, out);
+    CollectLeafPickProbabilities(tree, right, p_path * (1.0 - p_l), hit_pt, n_face, out);
+}
+
+TEST_CASE("LightTree: selection PMF sums to 1 and reaches every leaf") {
+    // A shade point off to one side with a tilted normal, so the
+    // importance terms (falloff, orientation, receiver cosine) all
+    // actually vary between clusters rather than collapsing to a
+    // uniform split.
+    const float hit_pt[3] = {2.5f, 1.0f, -3.0f};
+    float n_face[3] = {0.3f, 0.9f, 0.2f};
+    const float inv = 1.0f / std::sqrt(n_face[0]*n_face[0] +
+                                       n_face[1]*n_face[1] +
+                                       n_face[2]*n_face[2]);
+    n_face[0] *= inv; n_face[1] *= inv; n_face[2] *= inv;
+
+    for (int n : {1, 2, 3, 4, 7, 16, 64, 200}) {
+        auto lights = MakeLights(n, static_cast<std::uint32_t>(n) * 7u + 1u);
+        LightTree tree;
+        BuildLightTree(lights, tree);
+
+        std::unordered_map<std::uint32_t, double> pmf;
+        CollectLeafPickProbabilities(tree, tree.root_index, 1.0,
+                                     hit_pt, n_face, pmf);
+
+        // Every light is reachable with NON-ZERO probability. (The
+        // epsilon floor in lightTreeImportance exists precisely so no
+        // branch becomes deselectable; a regression that lets an
+        // importance hit exactly 0 would strand a whole subtree.)
+        CHECK_MESSAGE(pmf.size() == static_cast<std::size_t>(n),
+            "N=", n, ": PMF covers ", pmf.size(), " of ", n, " lights");
+        for (const auto& [id, p] : pmf) {
+            CHECK_MESSAGE(p > 0.0, "N=", n, ": light ", id,
+                          " has zero selection probability");
+        }
+
+        // The estimator divides by pick_pdf, so the PMF must normalise.
+        double sum = 0.0;
+        for (const auto& [id, p] : pmf) sum += p;
+        CHECK_MESSAGE(sum == doctest::Approx(1.0).epsilon(1e-9),
+            "N=", n, ": selection PMF sums to ", sum, ", not 1.0 -- NEE "
+            "samples divided by pick_pdf would be biased");
+    }
+}
+
+TEST_CASE("LightTree: brighter cluster is picked more often (importance is used)") {
+    // Two lights equidistant from the shade point, one 100x brighter.
+    // A picker that ignored importance (or inverted the ratio) would
+    // split 50/50 or favour the dim light -- both caught here, while
+    // the reachability tests would stay green.
+    std::vector<LightInput> lights(2);
+    lights[0].type = 0u;                                  // point
+    lights[0].pos[0] = -4.0f; lights[0].pos[1] = 3.0f;
+    lights[0].intensity[0] = lights[0].intensity[1] = lights[0].intensity[2] = 1.0f;
+    lights[1].type = 0u;
+    lights[1].pos[0] =  4.0f; lights[1].pos[1] = 3.0f;
+    lights[1].intensity[0] = lights[1].intensity[1] = lights[1].intensity[2] = 100.0f;
+
+    LightTree tree;
+    BuildLightTree(lights, tree);
+
+    const float hit_pt[3] = {0.0f, 0.0f, 0.0f};
+    const float n_face[3] = {0.0f, 1.0f, 0.0f};   // facing both equally
+    std::unordered_map<std::uint32_t, double> pmf;
+    CollectLeafPickProbabilities(tree, tree.root_index, 1.0, hit_pt, n_face, pmf);
+
+    REQUIRE(pmf.count(0u) == 1u);
+    REQUIRE(pmf.count(1u) == 1u);
+    CHECK_MESSAGE(pmf[1u] > pmf[0u],
+        "the 100x brighter light (id 1, p=", pmf[1u], ") must be picked more "
+        "often than the dim one (id 0, p=", pmf[0u], ") -- importance is "
+        "either ignored or inverted");
+    // Symmetric geometry => the split should track the intensity ratio.
+    CHECK(pmf[1u] / (pmf[0u] + pmf[1u]) > 0.9);
+    CHECK(pmf[0u] + pmf[1u] == doctest::Approx(1.0).epsilon(1e-9));
 }
