@@ -97,6 +97,14 @@ export function Shell({
       void fetchScene();
     });
 
+    // Re-fetch whenever the socket (re)opens. Without this a panel
+    // that outlives an engine restart -- or loses the connection --
+    // shows the stale pre-disconnect snapshot until the next scene
+    // mutation happens to tick scene_dirty.
+    const offStatus = client.onStatus((s) => {
+      if (s === 'open') void fetchScene();
+    });
+
     // Global keyboard shortcuts (wave-7 #20): undo/redo + gizmo mode.
     // Installed on every panel so a user with the inspector focused
     // can still Cmd+Z to undo a hierarchy mutation. Opt-out via the
@@ -107,6 +115,7 @@ export function Shell({
 
     return () => {
       uninstallShortcuts();
+      offStatus();
       off();
       unbind();
       client.close();
