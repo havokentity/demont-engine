@@ -33,7 +33,6 @@
 #include "../renderer/GltfImporter.h"
 #include "../renderer/HdrImage.h"
 #include "../renderer/LightTree.h"
-#include "../renderer/MeshGen.h"
 #include "../effects/ParticleSystem.h"
 #include "../physics/PhysicsSystem.h"
 #include "../physics/SmokeSPH.h"

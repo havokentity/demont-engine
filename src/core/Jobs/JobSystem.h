@@ -14,8 +14,10 @@ class TaskScheduler;
 namespace pt::jobs {
 
 // Thin wrapper over enkiTS. One worker per physical performance core unless
-// overridden. Submit returns a Handle that can be Waited on; if you don't
-// need to wait, fire-and-forget by ignoring the handle.
+// overridden. Submit returns a Handle that the caller MUST eventually
+// Wait() -- the wrapped task object (and its std::function captures) is
+// only freed inside Wait, so fire-and-forget by dropping the handle is
+// a per-submit leak, not a supported pattern.
 class JobSystem {
 public:
     JobSystem();

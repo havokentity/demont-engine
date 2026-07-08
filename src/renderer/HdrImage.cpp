@@ -44,8 +44,14 @@ void DecodeRGBE(const std::uint8_t* src, float* dst) {
 bool DecodeScanlineRle(std::FILE* f, std::uint32_t width,
                        std::vector<std::uint8_t>& scanline_rgbe) {
     if (width < 8 || width > 0x7fff) {
-        // Old format: not RLE -- fall back to caller.
-        return false;
+        // Outside the range the new-RLE encoding is defined for -- the
+        // Radiance spec stores such scanlines FLAT (width*4 raw RGBE
+        // bytes). Returning false here was treated as fatal by the
+        // caller, so any legitimate .hdr narrower than 8 px or wider
+        // than 32767 px refused to load with "scanline decode failed".
+        scanline_rgbe.resize(std::size_t(width) * 4);
+        return std::fread(scanline_rgbe.data(), 1, std::size_t(width) * 4, f)
+               == std::size_t(width) * 4;
     }
     std::uint8_t marker[4];
     if (std::fread(marker, 1, 4, f) != 4) return false;

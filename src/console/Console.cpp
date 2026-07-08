@@ -1070,7 +1070,7 @@ void Console::QueueExecute(std::string line, Responder responder) {
             overflow = true;
         } else {
             queue_bytes_ += line.size();
-            queue_.push_back({std::move(line), std::move(responder)});
+            queue_.push_back({std::move(line), std::move(responder), {}});
         }
     }
     // Responder runs outside queue_mutex_ so a responder that takes
@@ -1083,6 +1083,20 @@ void Console::QueueExecute(std::string line, Responder responder) {
     }
 }
 
+void Console::QueueTask(std::function<void()> task) {
+    if (!task) return;
+    // Same bounded-queue discipline as QueueExecute (a flooding client
+    // must not grow the queue without bound). Tasks carry no command
+    // text, so they only count against the depth cap. A dropped read
+    // task simply never replies -- the WS client's request times out,
+    // which is the same failure the depth cap already produces for
+    // exec.
+    constexpr std::size_t kMaxQueueDepth = 1024;
+    std::lock_guard lock(queue_mutex_);
+    if (queue_.size() >= kMaxQueueDepth) return;
+    queue_.push_back({std::string{}, Responder{}, std::move(task)});
+}
+
 void Console::Drain() {
     std::deque<PendingExec> local;
     {
@@ -1091,6 +1105,12 @@ void Console::Drain() {
         queue_bytes_ = 0;
     }
     for (auto& pe : local) {
+        // Main-thread read task (QueueTask): runs here, where Execute()
+        // also runs, so it can safely read cvars_ / commands_.
+        if (pe.task) {
+            pe.task();
+            continue;
+        }
         // Trim leading/trailing whitespace to detect lone `[` / `]`.
         std::string_view trimmed = pe.line;
         while (!trimmed.empty() &&

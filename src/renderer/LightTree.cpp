@@ -262,18 +262,10 @@ void CombineCones(const float axis_a[3], float cos_half_a,
     }
 }
 
-// Combine two child summaries into a parent cluster summary.
-LightSummary CombineSummaries(const LightSummary& a, const LightSummary& b) {
-    LightSummary p;
-    UnionAabb(p.aabb_min, p.aabb_max,
-              a.aabb_min, a.aabb_max,
-              b.aabb_min, b.aabb_max);
-    p.intensity = a.intensity + b.intensity;
-    CombineCones(a.cone_axis, a.cone_cos_half,
-                  b.cone_axis, b.cone_cos_half,
-                  p.cone_axis, p.cone_cos_half);
-    return p;
-}
+// (CombineSummaries was deleted: the PR #196 in-place rebuild folds
+// child cluster data directly at the bottom of BuildRecursive, which
+// is the single authoritative reduction -- a stale copy here invited
+// edits that silently changed nothing in the shipped tree.)
 
 // Write a leaf node IN PLACE at out_nodes[dst_idx]. Caller is
 // responsible for having sized out_nodes so dst_idx is valid.

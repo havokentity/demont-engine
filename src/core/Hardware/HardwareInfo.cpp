@@ -6,6 +6,7 @@
 #include <fmt/format.h>
 
 #include <cstdint>
+#include <thread>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -87,7 +88,20 @@ void PopulateApple(Info& info) {
 }
 
 #else
-void PopulateApple(Info&) {}
+// Non-Apple fallback: no sysctl introspection, but leaving cpu_pcores
+// at its default 1 sized JobSystem::Init(0) to a SINGLE worker on
+// 16-core Windows/Linux boxes (a supported native-Vulkan platform) --
+// every CSG bake and ParallelFor serialized onto one thread.
+// hardware_concurrency() counts logical cores (SMT included), which
+// slightly over-provisions vs the Apple physical-P-core count, but a
+// few extra workers beat a 1/16th-throughput job system.
+void PopulateApple(Info& info) {
+    const unsigned n = std::thread::hardware_concurrency();
+    info.cpu_pcores = (n > 0u) ? static_cast<int>(n) : 1;
+    info.cpu_ecores = 0;
+    LOG_WARN("HardwareInfo: detailed hardware detection is macOS-only; "
+             "using hardware_concurrency() = {} for worker sizing", n);
+}
 #endif
 
 }  // namespace

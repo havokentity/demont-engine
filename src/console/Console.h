@@ -199,6 +199,15 @@ public:
     // Thread-safe enqueue from the network threads.  The main thread drains
     // these once per Engine::Tick.
     void QueueExecute(std::string line, Responder responder);
+    // Thread-safe enqueue of arbitrary READ work to run on the main
+    // thread at the next Drain(). Network threads must not touch
+    // cvars_ / commands_ directly: Execute() reassigns CVar::value
+    // (a std::string) on the main thread, so a concurrent read from a
+    // civetweb worker is a data race on a string that may be
+    // reallocating -- torn or freed-buffer reads. get_cvar /
+    // list_cvars route their snapshot through here for the same reason
+    // exec / set_cvar route their writes through QueueExecute.
+    void QueueTask(std::function<void()> task);
     void Drain();
 
     // Iteration (sorted by name).  Optional prefix filter for tab-completion.
@@ -304,6 +313,9 @@ private:
     struct PendingExec {
         std::string line;
         Responder   responder;
+        // When set, this entry is a main-thread read task (QueueTask)
+        // rather than a command line; `line` / `responder` are unused.
+        std::function<void()> task;
     };
     std::mutex                queue_mutex_;
     std::deque<PendingExec>   queue_;

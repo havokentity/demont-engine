@@ -116,7 +116,17 @@ private:
     std::atomic<bool>     line_run_{false};
     socket_handle_t       line_fd_  = kInvalidSocket;
     std::thread           line_thread_;
+    // Accepted-client workers. Guarded by line_workers_mutex_ because
+    // the accept loop appends while finished workers publish their
+    // thread id for reaping. LineAcceptLoop joins finished workers on
+    // each accept, so a monitoring script polling once a second
+    // (`echo fps | nc ... ` -- the intended use) can't accumulate
+    // thousands of unjoined threads (and their reserved stacks) over
+    // the engine's lifetime; Stop() joins whatever remains.
+    std::mutex               line_workers_mutex_;
     std::vector<std::thread> line_workers_;
+    // Thread ids of workers that have returned and can be joined.
+    std::vector<std::thread::id> line_workers_done_;
     // Live per-client sockets, guarded by line_clients_mutex_. Each
     // worker inserts its fd on entry and erases it on exit; Stop()
     // walks the set and ::shutdown()s every fd to break workers out

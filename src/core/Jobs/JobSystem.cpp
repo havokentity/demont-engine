@@ -15,7 +15,9 @@ namespace {
 
 JobSystem* g_instance = nullptr;
 
-// Wraps a std::function and self-deletes after one invocation.
+// Wraps a std::function. Deleted by JobSystem::Wait() -- it does NOT
+// self-delete, so every Submit()ed handle must be Waited (see the
+// header contract) or the task object + its captures leak.
 class FnTask : public enki::ITaskSet {
 public:
     explicit FnTask(std::function<void()> fn) : fn_(std::move(fn)) {

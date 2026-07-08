@@ -286,10 +286,18 @@ void ConsoleServer::Stop() {
         }
     }
     if (line_thread_.joinable()) line_thread_.join();
-    for (auto& t : line_workers_) {
+    // Move the worker handles out under the lock, then join OUTSIDE it:
+    // an exiting worker takes line_workers_mutex_ to publish itself as
+    // reapable, so joining while holding it would deadlock.
+    std::vector<std::thread> to_join;
+    {
+        std::lock_guard workers_lock(line_workers_mutex_);
+        to_join.swap(line_workers_);
+        line_workers_done_.clear();
+    }
+    for (auto& t : to_join) {
         if (t.joinable()) t.join();
     }
-    line_workers_.clear();
 
     if (ctx_ != nullptr) {
         mg_stop(ctx_);
@@ -382,30 +390,55 @@ int ConsoleServer::WsConnectHandler(const mg_connection* conn, void* cbdata) {
         }
         if (origin_hdr != nullptr) {
             const std::string origin = origin_hdr;
+            // Fixed allowlist of the host:port spellings we'll ever
+            // legitimately be dialed as. Both loopback names (localhost
+            // and 127.0.0.1 are distinct origins to a browser), the
+            // configured bind_address for an explicit single-IP bind,
+            // and the Vite dev/preview pairs.
+            const std::array<std::string, 7> allowed = {
+                fmt::format("http://localhost:{}", self->config_.http_port),
+                fmt::format("http://127.0.0.1:{}", self->config_.http_port),
+                // Inert when bind_address is 0.0.0.0 / a loopback
+                // duplicate; matches when the user bound one explicit
+                // LAN IP.
+                fmt::format("http://{}:{}",
+                    self->config_.bind_address, self->config_.http_port),
+                std::string("http://localhost:5173"),
+                std::string("http://localhost:5174"),
+                std::string("http://127.0.0.1:5173"),
+                std::string("http://127.0.0.1:5174"),
+            };
+            auto in_allowlist = [&](const std::string& s) {
+                return std::find(allowed.begin(), allowed.end(), s)
+                       != allowed.end();
+            };
+
+            // Validate the HOST header against the allowlist FIRST. The
+            // same-origin fast-path below compares Origin to Host, but
+            // Host is attacker-controlled -- a DNS-rebinding page
+            // (evil.com rebound to 127.0.0.1) sends matching
+            // Origin: http://evil.com:PORT and Host: evil.com:PORT,
+            // which a bare Origin==Host test accepts, handing a
+            // malicious web page full unauthenticated console/exec
+            // access on a loopback-bound engine. Rejecting unknown
+            // Hosts kills rebinding on both paths.
+            const bool host_ok = (host_hdr != nullptr && *host_hdr != '\0')
+                                 && in_allowlist(fmt::format("http://{}", host_hdr));
+
             bool ok = false;
-            // Same-origin via the Host header (host:port as dialed).
-            if (host_hdr != nullptr && *host_hdr != '\0') {
+            if (host_ok) {
+                // Same-origin: Origin equals the (now-vetted) Host.
                 ok = (origin == fmt::format("http://{}", host_hdr));
             }
             if (!ok) {
-                const std::array<std::string, 7> allowed = {
-                    fmt::format("http://localhost:{}", self->config_.http_port),
-                    fmt::format("http://127.0.0.1:{}", self->config_.http_port),
-                    // Inert when bind_address is 0.0.0.0 / a loopback
-                    // duplicate; matches when the user bound one
-                    // explicit LAN IP.
-                    fmt::format("http://{}:{}",
-                        self->config_.bind_address, self->config_.http_port),
-                    std::string("http://localhost:5173"),
-                    std::string("http://localhost:5174"),
-                    std::string("http://127.0.0.1:5173"),
-                    std::string("http://127.0.0.1:5174"),
-                };
-                ok = std::find(allowed.begin(), allowed.end(),
-                               origin) != allowed.end();
+                // Cross-origin but explicitly allowed (Vite dev panels
+                // dialing the engine port; a client on one loopback
+                // spelling served from the other).
+                ok = in_allowlist(origin);
             }
             if (!ok) {
-                LOG_WARN("WS rejected: bad Origin '{}'", origin);
+                LOG_WARN("WS rejected: bad Origin '{}' (Host '{}')",
+                         origin, host_hdr ? host_hdr : "");
                 return 1;  // reject
             }
         }
@@ -500,29 +533,40 @@ void ConsoleServer::HandleWsMessage(mg_connection* conn, std::string_view payloa
     }
 
     if (type == "get_cvar") {
+        // Snapshot on the MAIN thread: Execute() reassigns CVar::value
+        // (a std::string) there, and reading it from this civetweb
+        // worker races a reallocating string. Same reason exec /
+        // set_cvar route their writes through the queue.
         std::string name = StrField(msg, "name");
-        auto* v = Console::Get().FindCVar(name);
-        if (v == nullptr) {
-            reply(json{{"ok", false},
-                       {"error", fmt::format("unknown cvar: {}", name)}});
-            return;
-        }
-        json cvarObj{
-            {"name",        v->name},
-            {"value",       v->value},
-            {"default",     v->default_value},
-            {"description", v->description},
-            {"flags",       v->flags},
-        };
-        if (!v->allowed_values.empty()) {
-            cvarObj["allowed_values"] = v->allowed_values;
-        }
-        if (v->slider_max > v->slider_min) {
-            cvarObj["slider_min"]  = v->slider_min;
-            cvarObj["slider_max"]  = v->slider_max;
-            cvarObj["slider_step"] = v->slider_step;
-        }
-        reply(json{{"ok", true}, {"cvar", cvarObj}});
+        Console::Get().QueueTask([conn, id, name, this]() {
+            json body;
+            auto* v = Console::Get().FindCVar(name);
+            if (v == nullptr) {
+                body = json{{"ok", false},
+                            {"error", fmt::format("unknown cvar: {}", name)}};
+            } else {
+                json cvarObj{
+                    {"name",        v->name},
+                    {"value",       v->value},
+                    {"default",     v->default_value},
+                    {"description", v->description},
+                    {"flags",       v->flags},
+                };
+                if (!v->allowed_values.empty()) {
+                    cvarObj["allowed_values"] = v->allowed_values;
+                }
+                if (v->slider_max > v->slider_min) {
+                    cvarObj["slider_min"]  = v->slider_min;
+                    cvarObj["slider_max"]  = v->slider_max;
+                    cvarObj["slider_step"] = v->slider_step;
+                }
+                body = json{{"ok", true}, {"cvar", cvarObj}};
+            }
+            body["type"] = "result";
+            if (!id.empty()) body["id"] = id;
+            std::lock_guard lock(this->ws_mutex_);
+            if (this->ws_clients_.contains(conn)) SendWs(conn, body.dump());
+        });
         return;
     }
 
@@ -565,31 +609,43 @@ void ConsoleServer::HandleWsMessage(mg_connection* conn, std::string_view payloa
     }
 
     if (type == "list_cvars") {
+        // Main-thread snapshot -- see the get_cvar comment. A panel
+        // polling list_cvars while another drags a slider used to copy
+        // CVar::value strings out from under Execute()'s reassignment.
         std::string prefix = StrField(msg, "prefix");
-        json arr = json::array();
-        Console::Get().EnumerateCVars(prefix, [&arr](CVar& v) {
-            json entry{
-                {"name",        v.name},
-                {"value",       v.value},
-                {"default",     v.default_value},
-                {"description", v.description},
-                {"flags",       v.flags},
-            };
-            if (!v.allowed_values.empty()) {
-                entry["allowed_values"] = v.allowed_values;
-            }
-            if (v.slider_max > v.slider_min) {
-                entry["slider_min"]  = v.slider_min;
-                entry["slider_max"]  = v.slider_max;
-                entry["slider_step"] = v.slider_step;
-            }
-            arr.push_back(entry);
+        Console::Get().QueueTask([conn, id, prefix, this]() {
+            json arr = json::array();
+            Console::Get().EnumerateCVars(prefix, [&arr](CVar& v) {
+                json entry{
+                    {"name",        v.name},
+                    {"value",       v.value},
+                    {"default",     v.default_value},
+                    {"description", v.description},
+                    {"flags",       v.flags},
+                };
+                if (!v.allowed_values.empty()) {
+                    entry["allowed_values"] = v.allowed_values;
+                }
+                if (v.slider_max > v.slider_min) {
+                    entry["slider_min"]  = v.slider_min;
+                    entry["slider_max"]  = v.slider_max;
+                    entry["slider_step"] = v.slider_step;
+                }
+                arr.push_back(entry);
+            });
+            json body{{"ok", true}, {"cvars", arr}};
+            body["type"] = "result";
+            if (!id.empty()) body["id"] = id;
+            std::lock_guard lock(this->ws_mutex_);
+            if (this->ws_clients_.contains(conn)) SendWs(conn, body.dump());
         });
-        reply(json{{"ok", true}, {"cvars", arr}});
         return;
     }
 
     if (type == "list_commands") {
+        // Safe to read from this worker: commands_ is populated during
+        // Engine::Init registration and never mutated afterwards (no
+        // command registers/unregisters at runtime), unlike CVar::value.
         std::string prefix = StrField(msg, "prefix");
         json arr = json::array();
         Console::Get().EnumerateCommands(prefix, [&arr](Command& c) {
@@ -725,8 +781,32 @@ void ConsoleServer::LineAcceptLoop() {
             if (!line_run_) break;
             continue;
         }
-        line_workers_.emplace_back(&ConsoleServer::LineClientLoop, this,
-                                   static_cast<socket_handle_t>(cfd));
+        // Reap workers that finished since the last accept -- otherwise
+        // each short-lived `nc` connection leaves a joinable
+        // std::thread (stack mapping + kernel object) parked until
+        // Stop(). Extract under the lock, join after releasing it (the
+        // exiting worker needs the same mutex to publish itself).
+        std::vector<std::thread> finished;
+        {
+            std::lock_guard lock(line_workers_mutex_);
+            for (auto it = line_workers_.begin(); it != line_workers_.end();) {
+                auto done = std::find(line_workers_done_.begin(),
+                                      line_workers_done_.end(),
+                                      it->get_id());
+                if (done != line_workers_done_.end()) {
+                    finished.push_back(std::move(*it));
+                    line_workers_done_.erase(done);
+                    it = line_workers_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            line_workers_.emplace_back(&ConsoleServer::LineClientLoop, this,
+                                       static_cast<socket_handle_t>(cfd));
+        }
+        for (auto& t : finished) {
+            if (t.joinable()) t.join();
+        }
     }
 }
 
@@ -838,6 +918,11 @@ void ConsoleServer::LineClientLoop(socket_handle_t fd_) {
         line_clients_.erase(fd_);
     }
     PT_SOCK_CLOSE(fd);
+    {
+        // Publish self as reapable; the next accept (or Stop) joins us.
+        std::lock_guard lock(line_workers_mutex_);
+        line_workers_done_.push_back(std::this_thread::get_id());
+    }
 }
 
 }  // namespace pt::console

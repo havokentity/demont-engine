@@ -5,8 +5,13 @@
 #include "Log.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <string>
+
+#if defined(__APPLE__)
+#  include <mach-o/dyld.h>   // _NSGetExecutablePath
+#endif
 
 #if defined(_WIN32)
 #  define WIN32_LEAN_AND_MEAN
@@ -52,6 +57,28 @@ std::filesystem::path ResolveRootOnce(const char*& source_out) {
         return fs::path();
     }
     fs::path exe(buf, buf + n);
+#elif defined(__APPLE__)
+    // macOS has no /proc, so the Linux readlink below always failed
+    // here -- every direct `demont` launch on the PRIMARY platform
+    // logged a warning and silently fell back to CWD-relative asset
+    // resolution (which only happens to work when the CWD is the repo
+    // root; a Finder launch or `cd build && ./src/app/demont` found no
+    // assets/hdri, assets/stars/BSC5.dat, ...). _NSGetExecutablePath
+    // is the documented equivalent: call once to size, retry, then
+    // canonicalize to resolve the symlinks it may return.
+    std::uint32_t bufsize = 0;
+    _NSGetExecutablePath(nullptr, &bufsize);   // sets bufsize
+    std::string raw(bufsize, '\0');
+    if (bufsize == 0 || _NSGetExecutablePath(raw.data(), &bufsize) != 0) {
+        LOG_WARN("AssetPath: _NSGetExecutablePath failed; "
+                 "asset root falls back to CWD");
+        source_out = "cwd-fallback";
+        return fs::path();
+    }
+    raw.resize(std::strlen(raw.c_str()));
+    std::error_code exe_ec;
+    fs::path exe = fs::weakly_canonical(fs::path(raw), exe_ec);
+    if (exe_ec) exe = fs::path(raw);   // canonicalize is best-effort
 #else
     char buf[PATH_MAX];
     ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);

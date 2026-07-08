@@ -37,7 +37,12 @@ void* FrameArena::Alloc(std::size_t size, std::size_t align) {
     if (base_ == nullptr) return nullptr;
     auto cur = reinterpret_cast<std::uintptr_t>(base_) + offset_;
     auto pad = (align - (cur & (align - 1))) & (align - 1);
-    if (offset_ + pad + size > capacity_) return nullptr;
+    // Subtraction form so a huge `size` (e.g. a count*stride multiply
+    // that wrapped) can't overflow the sum, pass the check, and hand
+    // back an out-of-bounds pointer.
+    if (pad > capacity_ - offset_ || size > capacity_ - offset_ - pad) {
+        return nullptr;
+    }
     offset_ += pad;
     void* result = base_ + offset_;
     offset_ += size;

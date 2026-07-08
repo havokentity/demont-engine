@@ -40,6 +40,7 @@
 #include <glm/geometric.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <unordered_map>
@@ -203,13 +204,23 @@ struct AudioSystem::Impl {
     //
     // Publication discipline for cross-thread reads:
     //   - LoadSound builds a fully-decoded Sound under sounds_mutex,
-    //     stores the unique_ptr into the vector, then atomically
+    //     stores the unique_ptr into the bank, then atomically
     //     publishes `sound_count` (release) to make the new entry
     //     visible to the audio callback.
     //   - The audio callback loads `sound_count` (acquire) once per
     //     pass and only reads sounds[0..sound_count-1]. That gives
     //     it a stable view of the bank for the entire callback.
-    std::vector<std::unique_ptr<Sound>> sounds;
+    //
+    // FIXED array, not a vector: the callback dereferences
+    // `sounds[sid]`, i.e. it reads the POINTER ARRAY itself. A
+    // vector's push_back past its reserve() headroom reallocates that
+    // array and frees the old one -- a use-after-free on the real-time
+    // audio thread the moment the bank outgrew 256 distinct sounds.
+    // unique_ptr boxing kept the *pointees* stable but never the
+    // backing store. Loads past capacity are refused with a warning.
+    static constexpr std::uint32_t kMaxSounds = 256;
+    std::array<std::unique_ptr<Sound>, kMaxSounds> sounds {};
+    std::uint32_t                       sound_size = 0;  // guarded by sounds_mutex
     std::atomic<std::uint32_t>          sound_count {0};
     std::unordered_map<std::string,
                        SoundHandle>     path_to_handle;
@@ -235,16 +246,11 @@ struct AudioSystem::Impl {
                   "audio: atomic<uint32_t> must be lock-free for generation counter");
 
     Impl() {
-        // Reserve slot 0 for the kInvalidSound sentinel. Reserve also
-        // pre-allocates a generous upper bound so push_back doesn't
-        // reallocate during typical use; combined with unique_ptr
-        // boxing this gives us both pointer stability AND vector-handle
-        // stability under MVP load.
-        sounds.reserve(256);
-        sounds.emplace_back(std::make_unique<Sound>());
+        // Slot 0 is the kInvalidSound sentinel.
+        sounds[0] = std::make_unique<Sound>();
         sounds[0]->path = "<invalid>";
-        sound_count.store(static_cast<std::uint32_t>(sounds.size()),
-                          std::memory_order_release);
+        sound_size = 1;
+        sound_count.store(sound_size, std::memory_order_release);
     }
 };
 
@@ -390,14 +396,14 @@ void AudioSystem::Shutdown() {
         v.stop_request.store(0, std::memory_order_relaxed);
     }
     impl_->sound_count.store(0, std::memory_order_release);
-    impl_->sounds.clear();
+    for (auto& s : impl_->sounds) s.reset();
     impl_->path_to_handle.clear();
     // Re-seed the invalid sentinel so a subsequent Init/LoadSound cycle
     // still treats handle 0 as bogus.
-    impl_->sounds.emplace_back(std::make_unique<Sound>());
+    impl_->sounds[0] = std::make_unique<Sound>();
     impl_->sounds[0]->path = "<invalid>";
-    impl_->sound_count.store(static_cast<std::uint32_t>(impl_->sounds.size()),
-                             std::memory_order_release);
+    impl_->sound_size = 1;
+    impl_->sound_count.store(impl_->sound_size, std::memory_order_release);
 
     LOG_INFO("audio: device closed");
 }
@@ -485,15 +491,20 @@ SoundHandle AudioSystem::LoadSound(std::string_view path) {
         // same path between our first lookup and now.
         auto it = impl_->path_to_handle.find(path_s);
         if (it != impl_->path_to_handle.end()) return it->second;
-        h = static_cast<SoundHandle>(impl_->sounds.size());
-        impl_->sounds.push_back(std::make_unique<Sound>(std::move(s)));
+        if (impl_->sound_size >= Impl::kMaxSounds) {
+            LOG_WARN("audio: sound bank full ({} distinct sounds); "
+                     "'{}' not loaded", Impl::kMaxSounds, path_s);
+            return kInvalidSound;
+        }
+        h = static_cast<SoundHandle>(impl_->sound_size);
+        impl_->sounds[h] = std::make_unique<Sound>(std::move(s));
         impl_->path_to_handle.emplace(path_s, h);
         // Publish the new size to the audio callback with release
-        // semantics. The unique_ptr pointee was fully constructed
-        // before push_back, so the callback observing sound_count >= h
-        // is guaranteed to also see the published Sound contents.
-        impl_->sound_count.store(static_cast<std::uint32_t>(impl_->sounds.size()),
-                                 std::memory_order_release);
+        // semantics. The unique_ptr pointee was fully constructed and
+        // the slot written before this store, so a callback observing
+        // sound_count > h also sees the published Sound contents.
+        ++impl_->sound_size;
+        impl_->sound_count.store(impl_->sound_size, std::memory_order_release);
     }
     LOG_INFO("audio: loaded '{}' ({} frames, {:.2f}s)",
              path_s, frame_count,

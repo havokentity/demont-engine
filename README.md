@@ -181,7 +181,7 @@ src/
   rhi_metal/     Metal backend (metal-cpp + Slang→MSL),
                  MetalFXDenoiser shim, hardware ray query.
   rhi_vulkan/    Native Vulkan backend for Windows/Linux.
-  renderer/      Camera, MeshGen, Csg/CsgScene (Manifold-backed),
+  renderer/      Camera, Csg/CsgScene (Manifold-backed),
                  AnalyticBvh (incl. SDF clusters), LightTree,
                  GltfImporter, HdrImage, Astronomy/BscCatalog.
   physics/       PhysicsSystem (Verlet + rigid body), SmokeSPH,

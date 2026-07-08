@@ -223,7 +223,12 @@ std::size_t CsgScene::Remove(std::uint32_t id) {
     while (!dead.empty()) {
         const std::uint32_t d = dead.back();
         dead.pop_back();
-        impl_->nodes.erase(d);
+        // A node referencing two dead operands (e.g. Combine(x, op, a, a),
+        // or cascades that hit both children) gets queued once per
+        // reference -- erase() returns 0 on the repeat, and counting it
+        // anyway inflated the "removed N node(s)" console report. Skip
+        // the duplicate entirely (its references were already scanned).
+        if (impl_->nodes.erase(d) == 0) continue;
         ++removed;
         if (impl_->root_id == d) impl_->root_id = 0;
         for (auto it = impl_->nodes.begin(); it != impl_->nodes.end(); ++it) {

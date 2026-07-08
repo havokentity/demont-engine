@@ -27,9 +27,12 @@ public:
 
     ~PoolAllocator() { ReleaseAll(); }
 
+    // Returns nullptr when a needed slab allocation fails (OOM) --
+    // callers must handle it like any allocator failure.
     template <typename... Args>
     T* Acquire(Args&&... args) {
         if (free_list_ == nullptr) Grow();
+        if (free_list_ == nullptr) return nullptr;  // Grow() failed
         Slot* slot = free_list_;
         free_list_ = slot->next;
         ++live_;
