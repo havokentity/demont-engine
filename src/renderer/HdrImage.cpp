@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <numbers>
 #include <cstdio>
 #include <cstring>
 
@@ -163,6 +164,58 @@ HdrImage LoadRadianceHdr(const std::string& path, std::string* out_error) {
                   path, img.width, img.height,
                   img.width * img.height);
     return img;
+}
+
+double BuildEnvCdf(const std::vector<float>& rgb,
+                   std::uint32_t W, std::uint32_t H,
+                   const std::vector<std::uint8_t>& light_mask,
+                   std::vector<float>& out_marginal,
+                   std::vector<float>& out_conditional) {
+    out_marginal.assign(H, 0.0f);
+    out_conditional.assign(std::size_t(W) * H, 0.0f);
+    const bool use_mask = !light_mask.empty();
+    double total = 0.0;
+    for (std::uint32_t v = 0; v < H; ++v) {
+        // Lat-long solid-angle Jacobian: rows near the poles subtend
+        // less solid angle, so weight by sin(theta) at the row centre.
+        const double sin_theta =
+            std::sin(std::numbers::pi * (double(v) + 0.5) / double(H));
+        double row_sum = 0.0;
+        for (std::uint32_t u = 0; u < W; ++u) {
+            const std::size_t pi = std::size_t(v) * W + u;
+            const float r = rgb[pi * 3 + 0];
+            const float g = rgb[pi * 3 + 1];
+            const float b = rgb[pi * 3 + 2];
+            const float lum_raw = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+            const float lum = (use_mask && light_mask[pi]) ? 0.0f : lum_raw;
+            row_sum += double(lum) * sin_theta;
+            out_conditional[pi] = float(row_sum);   // unnormalized prefix sum
+        }
+        // Normalize within the row to [0, 1].
+        const double norm = (row_sum > 0.0) ? (1.0 / row_sum) : 0.0;
+        for (std::uint32_t u = 0; u < W; ++u) {
+            const std::size_t pi = std::size_t(v) * W + u;
+            out_conditional[pi] = float(double(out_conditional[pi]) * norm);
+        }
+        out_marginal[v] = float(row_sum);
+        total += row_sum;
+    }
+    // Marginal: prefix-sum + normalize so marginal[H-1] == 1.0.
+    {
+        const double norm = (total > 0.0) ? (1.0 / total) : 0.0;
+        double prefix = 0.0;
+        for (std::uint32_t v = 0; v < H; ++v) {
+            prefix += out_marginal[v];
+            out_marginal[v] = float(prefix * norm);
+        }
+        // Force the last entry to exactly 1.0 to absorb prefix-sum FP
+        // drift -- but only when there IS luminance. An all-black env
+        // map must yield an all-zero marginal (there is no drift to
+        // guard, and "no light" should not look like a valid CDF); the
+        // shader gates env-NEE on env_total_luminance <= 0 either way.
+        if (H > 0 && total > 0.0) out_marginal[H - 1] = 1.0f;
+    }
+    return total;
 }
 
 }  // namespace pt::renderer

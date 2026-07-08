@@ -8,18 +8,13 @@
 //
 // Where the algorithm lives
 // -------------------------
-// The CDF builder is currently inlined inside `Engine::ReloadEnvMap`
-// (src/engine/Engine.cpp ~lines 2369-2413). It is intentionally NOT
-// exposed as a public function -- the engine owns the lifetime of the
-// device-side CDF buffers and there's no caller outside of
-// `ReloadEnvMap` today. Until that algorithm is refactored into a
-// public helper, this test file re-implements the exact same algorithm
-// as a reference and validates its mathematical invariants. The
-// reference and engine implementations are intentionally identical at
-// the formula level: the test verifies the formula (monotone CDF,
-// terminates at 1.0, matches a known reference distribution, samples
-// reproduce input distribution within Chi-square) holds, which catches
-// any algorithmic regression in either the engine OR the reference.
+// `pt::renderer::BuildEnvCdf` (src/renderer/HdrImage.{h,cpp}) -- the
+// SAME function `Engine::ReloadEnvMap` calls. This test used to carry a
+// private re-implementation of the builder and assert against that,
+// which meant it could not fail when the engine's copy drifted; it had
+// already drifted (the mirror never applied the extracted-light mask).
+// The builder is now shared, so every assertion below gates the shipped
+// code path.
 //
 // The shader-side PDF formula is documented in
 // `shaders/PathTrace.slang::sampleEnvMap()`:
@@ -43,6 +38,8 @@
 // integration level and is not in scope here per the issue.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include "../src/renderer/HdrImage.h"
+
 #include <doctest/doctest.h>
 
 #include <algorithm>
@@ -57,60 +54,16 @@ namespace {
 
 // Reference implementation of the CDF builder. Mirrors the algorithm
 // in Engine::ReloadEnvMap (src/engine/Engine.cpp, around line 2369).
-// Inputs: tightly-packed RGB float buffer (W*H*3) in row-major order.
-// Outputs (passed by reference, resized inside):
-//   * conditional: length W*H. For each row v, conditional[v*W + 0..W-1]
-//     is a monotonically-non-decreasing 1D CDF over columns. If the row
-//     has nonzero luminance, conditional[v*W + W-1] == 1.0 exactly
-//     (after the row-normalisation pass).  If the row is all-zero,
-//     every conditional[v*W + u] is 0.0.
-//   * marginal: length H. Monotonically-non-decreasing 1D CDF over
-//     rows; if the image has any nonzero luminance, marginal[H-1] is
-//     forced to 1.0 (FP-drift guard).
-// Returns total = sum_{v,u} lum(u,v) * sin(theta_v), the integral that
-// the shader uses to convert pixel-space probability to solid-angle
-// PDF.
+// Thin adaptor so the existing tests keep their 4-arg call shape. The
+// engine passes a light_mask (extracted bright clusters excluded from
+// env-NEE); these tests exercise the unmasked path, which is the same
+// code with an empty mask.
 double BuildEnvCdf(const std::vector<float>& rgb,
                    std::uint32_t W, std::uint32_t H,
                    std::vector<float>& marginal,
                    std::vector<float>& conditional) {
-    marginal.assign(H, 0.0f);
-    conditional.assign(std::size_t(W) * H, 0.0f);
-    double total = 0.0;
-    for (std::uint32_t v = 0; v < H; ++v) {
-        const double sin_theta =
-            std::sin(std::numbers::pi * (double(v) + 0.5) / double(H));
-        double row_sum = 0.0;
-        for (std::uint32_t u = 0; u < W; ++u) {
-            const std::size_t pi = std::size_t(v) * W + u;
-            const float r = rgb[pi * 3 + 0];
-            const float g = rgb[pi * 3 + 1];
-            const float b = rgb[pi * 3 + 2];
-            const float lum = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-            const double weight = double(lum) * sin_theta;
-            row_sum += weight;
-            conditional[pi] = float(row_sum);   // unnormalized prefix sum
-        }
-        // Normalize within row to [0, 1]. Zero-luminance rows stay 0.
-        const double norm = (row_sum > 0.0) ? (1.0 / row_sum) : 0.0;
-        for (std::uint32_t u = 0; u < W; ++u) {
-            conditional[std::size_t(v) * W + u] = float(
-                double(conditional[std::size_t(v) * W + u]) * norm);
-        }
-        marginal[v] = float(row_sum);
-        total += row_sum;
-    }
-    // Marginal: prefix-sum + normalize so marginal[H-1] == 1.0.
-    {
-        const double norm = (total > 0.0) ? (1.0 / total) : 0.0;
-        double prefix = 0.0;
-        for (std::uint32_t v = 0; v < H; ++v) {
-            prefix += marginal[v];
-            marginal[v] = float(prefix * norm);
-        }
-        if (H > 0 && total > 0.0) marginal[H - 1] = 1.0f;
-    }
-    return total;
+    static const std::vector<std::uint8_t> kNoMask;
+    return pt::renderer::BuildEnvCdf(rgb, W, H, kNoMask, marginal, conditional);
 }
 
 // Helper: paint a single (r,g,b) color at every pixel of a WxH image.

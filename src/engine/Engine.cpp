@@ -4404,45 +4404,22 @@ void Engine::ReloadEnvMap(const std::string& path) {
     // texture data itself keeps the bright pixels intact so camera-
     // direct rays still see the visible bright pixels in the sky.
     std::vector<float> rgba(std::size_t(W) * H * 4);
-    std::vector<float> conditional(std::size_t(W) * H);     // CDF per row
-    std::vector<float> marginal(H);                          // CDF over rows
-    double total = 0.0;
     for (std::uint32_t v = 0; v < H; ++v) {
-        const double sin_theta = std::sin(std::numbers::pi * (double(v) + 0.5) / double(H));
-        double row_sum = 0.0;
         for (std::uint32_t u = 0; u < W; ++u) {
             const std::size_t pi = std::size_t(v) * W + u;
-            float r = img.rgb[pi * 3 + 0];
-            float g = img.rgb[pi * 3 + 1];
-            float b = img.rgb[pi * 3 + 2];
-            rgba[pi * 4 + 0] = r;
-            rgba[pi * 4 + 1] = g;
-            rgba[pi * 4 + 2] = b;
+            rgba[pi * 4 + 0] = img.rgb[pi * 3 + 0];
+            rgba[pi * 4 + 1] = img.rgb[pi * 3 + 1];
+            rgba[pi * 4 + 2] = img.rgb[pi * 3 + 2];
             rgba[pi * 4 + 3] = 1.0f;
-            const float lum_raw = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-            const float lum = light_mask[pi] ? 0.0f : lum_raw;
-            const double weight = double(lum) * sin_theta;
-            row_sum += weight;
-            conditional[pi] = float(row_sum);   // unnormalized prefix sum within row
         }
-        // Normalize within row to [0, 1].
-        const double norm = (row_sum > 0.0) ? (1.0 / row_sum) : 0.0;
-        for (std::uint32_t u = 0; u < W; ++u) {
-            conditional[std::size_t(v) * W + u] = float(double(conditional[std::size_t(v) * W + u]) * norm);
-        }
-        marginal[v] = float(row_sum);
-        total += row_sum;
     }
-    // Marginal: prefix-sum + normalize so marginal[H-1] == 1.0.
-    {
-        const double norm = (total > 0.0) ? (1.0 / total) : 0.0;
-        double prefix = 0.0;
-        for (std::uint32_t v = 0; v < H; ++v) {
-            prefix += marginal[v];
-            marginal[v] = float(prefix * norm);
-        }
-        if (H > 0) marginal[H - 1] = 1.0f;       // guard against fp drift
-    }
+    // Single source of truth, shared with tests/hdrimage_cdf_test (the
+    // test used to re-implement this and had already drifted -- its copy
+    // never applied light_mask).
+    std::vector<float> conditional;   // CDF per row
+    std::vector<float> marginal;      // CDF over rows
+    const double total = pt::renderer::BuildEnvCdf(img.rgb, W, H, light_mask,
+                                                   marginal, conditional);
     env_total_luminance_ = float(total);
 
     auto tex = device_->CreateTexture({

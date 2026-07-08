@@ -410,7 +410,8 @@ pt_add_test(pt_renderer_light_tree
 # into a public function, swap this test over to call that function
 # directly and delete the reference re-impl.
 pt_add_test(hdrimage_cdf
-    hdrimage_cdf_test.cpp)
+    hdrimage_cdf_test.cpp
+    LINK_TARGETS pt_renderer)
 
 # --- Wave 9 scene save/load round-trip -------------------------------------
 # Pins pt::editor::SceneToJson / SceneFromJson -- the lossless JSON
@@ -736,6 +737,48 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     # --- end SDF Phase 1 ---------------------------------------------------
 
+    # --- Previously-orphaned baselines -------------------------------------
+    # These four Darwin goldens shipped for months with NO registered cell:
+    # the PNGs sat in tests/goldens/Darwin/ and were dutifully refreshed by
+    # regen commits as if they gated something, while ctest never rendered
+    # the scenes at all. A regression in MAT_WATER medium tracking (#206),
+    # the GPU light-tree traversal at 200 lights (#129), the SDF fractal
+    # distance estimators (#99), or the aurora composite (#116) would have
+    # shipped green. Registered here, with tolerances matching sdf_smin_row
+    # (all four render bit-identically run-to-run on the M4 Max now that
+    # smoke-mode dt is pinned + the sims are frozen during loading frames).
+    pt_add_golden_cell(SCENE water_pool         BACKEND metal DENOISER off
+        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+    pt_add_golden_cell(SCENE light_tree_200_pts BACKEND metal DENOISER off
+        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+    pt_add_golden_cell(SCENE sdf_fractals       BACKEND metal DENOISER off
+        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+    # aurora_smoke MUST run with a denoiser: AuroraComposite is dispatched
+    # only inside the use_engine_tonemap branch, which is gated on
+    # denoiser_active_ (Engine.cpp). The old aurora_smoke__metal__off.png
+    # baseline therefore contained NO AURORA AT ALL (measured: 0.00%
+    # green-dominant pixels in the upper sky, plain night blue) -- it was
+    # captured through the wrapper's `off` override, which is written after
+    # the fixture body and so beat the fixture's own `r_denoiser
+    # svgf_atrous` line. That file is deleted; this cell captures the
+    # feature the fixture documents (measured: 5.08% green-dominant).
+    pt_add_golden_cell(SCENE aurora_smoke       BACKEND metal DENOISER svgf_atrous
+        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+    # sdf_phase2_procedural is NOT registered unconditionally: the fixture
+    # exercises displaced / procedural SDF ops that are compiled out unless
+    # PT_SDF_PROCEDURAL_OPS=ON (default OFF), and in a default build it
+    # renders as empty terrain -- a cell here would pin the FEATURE-DISABLED
+    # image and pass forever. Gate it on the option instead, so a build that
+    # enables the feature also gates it. (Vulkan is excluded on purpose:
+    # PT_SDF_PROCEDURAL_OPS=ON + PT_SDF_AUTODIFF=ON hangs the SPIR-V
+    # pipeline build on both MoltenVK and NVIDIA -- the autodiff IR
+    # complexity, not a driver bug.)
+    if(PT_SDF_PROCEDURAL_OPS)
+        pt_add_golden_cell(SCENE sdf_phase2_procedural BACKEND metal DENOISER off
+            MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+    endif()
+    # --- end previously-orphaned baselines ---------------------------------
+
     # --- Sky / sun / stars / moon matrix (#112) ----------------------------
     # Follow-up to the #45 MVP: the cornell_csg cell exercises CSG +
     # analytic BVH but nothing in the procedural sky / astronomy /
@@ -888,21 +931,19 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # frames to evolve from the t=0 spectrum into a developed sea before
     # the capture. 120 frames warms it well past the dominant-wave period.
     #
-    # Tolerances generous (like the SPH / rigid-body fixtures) because the
-    # animation is keyed to wall-clock dt rather than a fixed step, so the
-    # exact surface phase at capture time is not bit-deterministic across
-    # runs / hosts. The cell still catches gross regressions: the ocean
-    # gate failing to engage (flat plane), the textures not binding (black
-    # / sky-through water), or the ray-march dropping rays through the
-    # surface. Metal-only at first; software gates the ocean off (its CPU
-    # tracer ignores the textures) so no software cell, and a Vulkan cell
-    # can land once the Metal PNG is committed.
-    # Measured run-to-run variance on the dev M4 Max is tiny (~18 bad
-    # pixels, mean delta < 1.0) -- the wall-clock dt over 120 frames is
-    # consistent enough that the surface converges to nearly the same
-    # phase -- but the foam flecks flicker a few pixels and cross-host /
-    # cross-build FP ordering will widen that, so the thresholds match
-    # the SPH / rigid-body cells' generosity.
+    # Tolerances remain generous, but NOT for the reason this comment used
+    # to give: smoke-mode dt is pinned to 1/60 (commit 5d57b29) and the
+    # dt-integrating sims are frozen during un-counted loading frames, so
+    # the surface phase at capture IS deterministic -- run-to-run diffs on
+    # the dev M4 Max measure bit-identical (max_delta 0.0). What the
+    # thresholds still have to absorb is cross-host / cross-build GPU
+    # FP-ordering, which is unmeasured here. The cell catches gross
+    # regressions: the ocean gate failing to engage (flat plane), the
+    # textures not binding (black / sky-through water), or the ray-march
+    # dropping rays through the surface. Metal-only at first; software
+    # gates the ocean off (its CPU tracer ignores the textures) so no
+    # software cell, and a Vulkan cell can land once the Metal PNG is
+    # committed. Tighten once cross-host variance is actually measured.
     pt_add_golden_cell(SCENE ocean_fft BACKEND metal DENOISER svgf_atrous
         FRAMES 120
         MAX_DELTA 64 MEAN_DELTA 16 FAIL_PERCENT 10)
@@ -970,28 +1011,36 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # screenshot -- the late-exec heights are tuned to catch the fall
     # mid-flight at ~60 render frames.
     #
-    # Tolerances: PhysicsSystem::Step integrates against the real per-
-    # frame wall-clock dt (no fixed-step accumulator -- see comment in
-    # Engine::StepPhysics, "A proper fixed-step accumulator [...] lands
-    # in Phase 5"). That makes the exact body positions at frame 60
-    # non-deterministic across runs (Metal first-frame cost varies with
-    # pipeline-build state, system thermals, etc.), and the imgdiff
-    # tolerances here are sized empirically to absorb that drift on the
-    # local M4 Max box rather than from FP-order variance alone. These
-    # cells will still catch:
+    # Tolerances: smoke-mode dt is pinned to 1/60 (commit 5d57b29) and the
+    # sims are frozen during un-counted loading frames, so body positions
+    # at frame 60 are DETERMINISTIC -- measured bit-identical run-to-run
+    # (max_delta 0.0) on the dev M4 Max. The old 64/16/10 thresholds were
+    # sized for wall-clock-dt drift that no longer exists, and were loose
+    # enough to hide the very regression the list below claims to catch.
+    # Measured by actually re-rendering the fixture with the RGB args
+    # stripped (bodies fall back to their default tints): mean delta 2.97,
+    # bad pixels 2.49% -- imgdiff PASSES under 64/16/10 (Passes() requires
+    # mean <= MEAN_DELTA and bad% <= FAIL_PERCENT, and both cleared). The
+    # five colored bodies simply cover too little of the frame to move a
+    # whole-image mean. Tightened to the sdf_smin_row tolerances (32/4/2),
+    # under which that same regressed render FAILS on the bad-pixel gate
+    # (2.67% > 2%), while the real capture is bit-identical to the golden
+    # (max_delta 0.0). Remaining headroom absorbs cross-host FP ordering.
+    #
+    # These cells catch:
     #   * Complete render failure (black / uniform output)
-    #   * Bodies disappearing entirely (no rigid-body silhouettes left
-    #     to disagree about -> sky+ground delta drops below noise floor
-    #     and a uniform field beats the threshold the OTHER way)
-    #   * Material regressions (e.g. RGB args silently ignored -> all
-    #     bodies render in the default warm-grey instead of the magenta/
-    #     gold/green hues the late-exec specifies)
-    # They will NOT catch subtle physics bugs that only shift body
-    # positions by a few cm. A structural diff (body-count + albedo
-    # histogram) is the right tool for that and is left as future work.
+    #   * Bodies disappearing entirely
+    #   * Material regressions on phys_rb_smoke (RGB args silently
+    #     ignored -> bodies render in the default tint instead of the
+    #     magenta/gold/green hues its late-exec specifies)
+    # NOTE: phys_rb_demo_late.cfg spawns its bodies WITHOUT RGB args, so
+    # the color-regression coverage above belongs to phys_rb_smoke only.
+    # Neither cell catches subtle physics bugs that shift body positions
+    # by a few cm; a structural diff (body-count + albedo histogram) is
+    # the right tool for that and is left as future work.
     pt_add_golden_cell(SCENE phys_rb_smoke BACKEND metal DENOISER off
         FRAMES 60
-        MAX_DELTA 64 MEAN_DELTA 16 FAIL_PERCENT 10
+        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2
         EXTRA "pt_smoke_late_exec ${CMAKE_SOURCE_DIR}/tests/goldens/scenes/phys_rb_smoke_late.cfg")
     pt_add_golden_cell(SCENE phys_rb_demo  BACKEND metal DENOISER off
         FRAMES 60

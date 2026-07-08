@@ -29,4 +29,32 @@ struct HdrImage {
 // human-readable diagnostic.
 HdrImage LoadRadianceHdr(const std::string& path, std::string* out_error = nullptr);
 
+// Build the 2D importance-sampling CDF the path tracer's env-map NEE
+// walks: a per-row conditional CDF over u, and a marginal CDF over v,
+// both weighted by luminance * sin(theta) (the lat-long solid-angle
+// Jacobian). Returns the total (unnormalized) weight, which the engine
+// publishes as env_total_luminance.
+//
+// `light_mask` (optional; empty = none) zeroes the CDF luminance of any
+// pixel belonging to an extracted bright cluster, so env-map NEE skips
+// those -- the shader lights them through the separate directional
+// hdri_lights NEE instead, and double-counting them here would bias the
+// estimator. The env_map TEXTURE keeps the bright pixels intact so
+// camera-direct rays still see the sun.
+//
+// Outputs are sized W*H (conditional) and H (marginal). marginal[H-1] is
+// forced to exactly 1.0 to absorb prefix-sum FP drift when the image has
+// any luminance; an all-black image yields an all-zero marginal (and a
+// zero return), which the shader treats as "env-NEE disabled".
+//
+// This is the single source of truth: Engine::ReloadEnvMap and
+// tests/hdrimage_cdf_test both call it, so the test can no longer pass
+// against a private re-implementation that has drifted from the shipped
+// code (it had -- the mirror never applied light_mask).
+double BuildEnvCdf(const std::vector<float>& rgb,
+                   std::uint32_t W, std::uint32_t H,
+                   const std::vector<std::uint8_t>& light_mask,
+                   std::vector<float>& out_marginal,
+                   std::vector<float>& out_conditional);
+
 }  // namespace pt::renderer
