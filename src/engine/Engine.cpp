@@ -81,11 +81,15 @@
 #    define WIN32_LEAN_AND_MEAN
 #  endif
 #  include <windows.h>
+#  include <shellapi.h>  // ShellExecuteA (OpenUrlInBrowser)
 #else
 // POSIX needs fork() / execl() / setsid() / access() / kill() for the
-// editor panel-spawn / panel-close path. Pulled in unconditionally on
-// non-Win32 so the linker doesn't have to chase undefined references
-// to the wrappers used inside SpawnPanelBrowser / KillPanelPid.
+// editor panel-spawn / panel-close path, plus open()/dup2() so spawned
+// launchers can be silenced without a shell redirect. Pulled in
+// unconditionally on non-Win32 so the linker doesn't have to chase
+// undefined references to the wrappers used inside SpawnPanelBrowser /
+// KillPanelPid / OpenUrlInBrowser.
+#  include <fcntl.h>
 #  include <signal.h>
 #  include <sys/types.h>
 #  include <sys/wait.h>
@@ -2553,6 +2557,51 @@ bool Engine::Init() {
     return true;
 }
 
+namespace {
+
+// Hand `url` to the platform's URL launcher WITHOUT routing through a
+// shell. The previous std::system() formulation interpolated the URL
+// into a shell command line, and the URL embeds cvar-controlled text
+// (net_bind_address / panel names) -- settable from config files and
+// the web console -- so a value carrying shell metacharacters became
+// a command-injection surface. exec/ShellExecute pass the URL as a
+// plain argument: no quoting surface at all.
+//
+// Returns 0 on success. `open`/`xdg-open` exit as soon as they hand
+// the URL to the OS, so the blocking waitpid is milliseconds and
+// yields the launcher's real exit status for diagnostics (the old
+// macOS path logged it; the old Windows/Linux paths threw it away).
+int OpenUrlInBrowser(const std::string& url) {
+#if defined(_WIN32)
+    HINSTANCE h = ShellExecuteA(nullptr, "open", url.c_str(),
+                                nullptr, nullptr, SW_SHOWNORMAL);
+    return (reinterpret_cast<INT_PTR>(h) > 32) ? 0 : 1;
+#else
+    const pid_t pid = ::fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        // Child: silence the launcher, then become it.
+        int devnull = ::open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            ::dup2(devnull, STDOUT_FILENO);
+            ::dup2(devnull, STDERR_FILENO);
+            if (devnull > STDERR_FILENO) ::close(devnull);
+        }
+#if defined(__APPLE__)
+        ::execl("/usr/bin/open", "open", url.c_str(), (char*)nullptr);
+#else
+        ::execlp("xdg-open", "xdg-open", url.c_str(), (char*)nullptr);
+#endif
+        std::_Exit(127);  // exec failed
+    }
+    int status = 0;
+    if (::waitpid(pid, &status, 0) != pid) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
+}
+
+}  // namespace
+
 void Engine::OpenWebConsole() {
     auto* C  = &pt::console::Console::Get();
     auto* p  = C->FindCVar("net_port");
@@ -2563,17 +2612,8 @@ void Engine::OpenWebConsole() {
     auto url = fmt::format("http://{}:{}/", host, port);
     LOG_INFO("Opening console: {}", url);
 
-#if defined(__APPLE__)
-    auto cmd = fmt::format("/usr/bin/open '{}' >/dev/null 2>&1", url);
-    int rc = std::system(cmd.c_str());
-    if (rc != 0) LOG_WARN("`open` returned {} -- visit {} manually", rc, url);
-#elif defined(_WIN32)
-    auto cmd = fmt::format("cmd /c start \"\" \"{}\"", url);
-    std::system(cmd.c_str());
-#else
-    auto cmd = fmt::format("xdg-open '{}' >/dev/null 2>&1 &", url);
-    std::system(cmd.c_str());
-#endif
+    int rc = OpenUrlInBrowser(url);
+    if (rc != 0) LOG_WARN("URL launcher returned {} -- visit {} manually", rc, url);
 }
 
 void Engine::ApplyCommandLineCvarOverrides() {
@@ -21502,46 +21542,78 @@ int Engine::SpawnPanelBrowser(const std::string& panel_name,
         }
     }
     if (chosen != nullptr) {
+        // Double-fork: the intermediate child forks the browser and
+        // exits immediately, so the browser is reparented to launchd
+        // and can never sit as a zombie inside the long-running engine
+        // (a single fork left one unreaped zombie per closed panel).
+        // A pipe carries the browser's real PID back to the parent for
+        // panel_close tracking; the parent reaps only the short-lived
+        // intermediate.
+        int pidpipe[2] = {-1, -1};
+        if (::pipe(pidpipe) != 0) { pidpipe[0] = pidpipe[1] = -1; }
         pid_t pid = ::fork();
         if (pid == 0) {
-            // Child: detach from terminal + replace with the browser.
+            // Intermediate child: detach from terminal, spawn browser.
             // setsid() so the browser survives if the parent dies.
             ::setsid();
-            std::string app_arg = "--app=" + url;
-            // Pass a per-panel user-data-dir argument so multiple
-            // `panel_open` invocations don't fall through to a single
-            // existing Chrome window (Chrome refuses to spawn a new
-            // PID when an existing instance can satisfy the URL). The
-            // dir is ephemeral but persistent across runs so the
-            // window remembers its size.
-            const char* home_env = std::getenv("HOME");
-            std::string udd_arg = "--user-data-dir=" +
-                std::string(home_env != nullptr ? home_env : "/tmp") +
-                "/.demont_editor/" + panel_name;
-            execl(chosen, chosen,
-                  app_arg.c_str(),
-                  udd_arg.c_str(),
-                  "--no-first-run",
-                  "--no-default-browser-check",
-                  nullptr);
-            // execl returned -- failure; bail loud.
-            std::_Exit(127);
+            if (pidpipe[0] >= 0) ::close(pidpipe[0]);
+            pid_t browser = ::fork();
+            if (browser == 0) {
+                if (pidpipe[1] >= 0) ::close(pidpipe[1]);
+                std::string app_arg = "--app=" + url;
+                // Pass a per-panel user-data-dir argument so multiple
+                // `panel_open` invocations don't fall through to a single
+                // existing Chrome window (Chrome refuses to spawn a new
+                // PID when an existing instance can satisfy the URL). The
+                // dir is ephemeral but persistent across runs so the
+                // window remembers its size.
+                const char* home_env = std::getenv("HOME");
+                std::string udd_arg = "--user-data-dir=" +
+                    std::string(home_env != nullptr ? home_env : "/tmp") +
+                    "/.demont_editor/" + panel_name;
+                execl(chosen, chosen,
+                      app_arg.c_str(),
+                      udd_arg.c_str(),
+                      "--no-first-run",
+                      "--no-default-browser-check",
+                      (char*)nullptr);
+                // execl returned -- failure; bail loud.
+                std::_Exit(127);
+            }
+            if (pidpipe[1] >= 0) {
+                (void)!::write(pidpipe[1], &browser, sizeof(browser));
+                ::close(pidpipe[1]);
+            }
+            std::_Exit(browser > 0 ? 0 : 126);
         }
+        if (pidpipe[1] >= 0) ::close(pidpipe[1]);
+        pid_t browser_pid = -1;
         if (pid > 0) {
+            if (pidpipe[0] >= 0 &&
+                ::read(pidpipe[0], &browser_pid, sizeof(browser_pid))
+                    != static_cast<ssize_t>(sizeof(browser_pid))) {
+                browser_pid = -1;
+            }
+            // The intermediate exits immediately -- reap it now so it
+            // never lingers.
+            int status = 0;
+            (void)::waitpid(pid, &status, 0);
+        }
+        if (pidpipe[0] >= 0) ::close(pidpipe[0]);
+        if (browser_pid > 0) {
             if (out_diag) {
                 *out_diag = fmt::format("spawned {} via {} (pid {})",
-                                        panel_name, chosen, pid);
+                                        panel_name, chosen, browser_pid);
             }
-            return static_cast<int>(pid);
+            return static_cast<int>(browser_pid);
         }
-        // fork() failed; fall through to the `open` fallback.
+        // fork() failed somewhere; fall through to the `open` fallback.
     }
 
     // Final fallback: `open` the URL in the default browser. We can't
     // track the resulting PID -- so panel_close on this panel will
     // print a "no tracked PID" diagnostic. Better than nothing.
-    auto cmd = fmt::format("/usr/bin/open '{}' >/dev/null 2>&1", url);
-    int rc = std::system(cmd.c_str());
+    int rc = OpenUrlInBrowser(url);
     if (out_diag) {
         if (rc == 0) {
             *out_diag = fmt::format(
@@ -21605,9 +21677,8 @@ int Engine::SpawnPanelBrowser(const std::string& panel_name,
             return static_cast<int>(pi.dwProcessId);
         }
     }
-    // Fallback: `start` via cmd.exe.
-    auto cmd = fmt::format("cmd /c start \"\" \"{}\"", url);
-    std::system(cmd.c_str());
+    // Fallback: hand the URL to the shell association (no cmd.exe).
+    (void)OpenUrlInBrowser(url);
     if (out_diag) {
         *out_diag = fmt::format(
             "opened {} in default browser (Chromium not found; "
@@ -21616,8 +21687,7 @@ int Engine::SpawnPanelBrowser(const std::string& panel_name,
     return 0;
 #else
     // Other Unix: try xdg-open. PID tracking not implemented for now.
-    auto cmd = fmt::format("xdg-open '{}' >/dev/null 2>&1 &", url);
-    std::system(cmd.c_str());
+    (void)OpenUrlInBrowser(url);
     if (out_diag) {
         *out_diag = fmt::format(
             "opened {} via xdg-open (no PID tracked)", panel_name);

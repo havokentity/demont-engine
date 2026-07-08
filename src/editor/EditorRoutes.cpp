@@ -131,12 +131,33 @@ const EmbeddedAsset* ResolveRoute(std::string_view uri) {
     return FindAsset(uri);
 }
 
+namespace {
+
+// True iff `h` looks like a plain hostname / IPv4 literal: ASCII
+// letters, digits, dots and dashes only. The host comes from the
+// net_bind_address cvar (settable from config files and the console);
+// anything fancier -- spaces, slashes, '@', '#', '?' -- could smuggle
+// path / userinfo / fragment syntax into the URL handed to the
+// browser spawner. Reject-to-localhost rather than escape: there is
+// no legitimate bind address that fails this test.
+bool IsSafeHost(std::string_view h) {
+    if (h.empty()) return false;
+    for (const char c : h) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '.' || c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
 std::string BuildPanelUrl(std::string_view panel,
                           std::string_view host,
                           int port,
                           bool dev_mode) {
     std::string h(host);
-    if (h.empty() || h == "0.0.0.0") h = "localhost";
+    if (h.empty() || h == "0.0.0.0" || !IsSafeHost(h)) h = "localhost";
 
     if (dev_mode) {
         // Vite dev server. Pass an engine_port query so the panel can
