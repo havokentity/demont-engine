@@ -781,6 +781,41 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # feature the fixture documents (measured: 5.08% green-dominant).
     pt_add_golden_cell(SCENE aurora_smoke       BACKEND metal DENOISER svgf_atrous
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+    # ReSTIR DI final-shading coverage (issue #78). light_primitives_mixed
+    # is the ONLY fixture that combines analytic lights (light_count > 0:
+    # point + spot + sphere + quad) with a denoiser -- and that exact
+    # combination is what dispatches RestirFinal (gated on albedo_tex_id_,
+    # i.e. a denoiser being active, AND light_count > 0, with r_restir on by
+    # default). Every other svgf_atrous cell above is a sky / procedural /
+    # smoke scene with no analytic lights, so RestirFinal early-outs on
+    # light_count == 0 and the ReSTIR final-shading path never ran under any
+    # test. That gap hid a Metal RHI bug where RestirFinal's acceleration
+    # structure (declared AFTER its SSBOs -> Metal buffer(3), not buffer(0))
+    # was bound at the hardcoded buffer(0), clobbering the reservoir SSBO
+    # and pushing the push-constant block off buffer(4) so the kernel read a
+    # zero width/height and contributed NOTHING -- ReSTIR direct lighting
+    # was a silent no-op on Metal whenever the denoiser was on. This cell
+    # renders the analytic lights THROUGH the ReSTIR reservoir + shadow-test
+    # path, so it pins the corrected output (per-pipeline buffer indices
+    # parsed from the emitted MSL; see MetalDevice.cpp) and fails loudly if
+    # the AS/push placement regresses. DENOISER svgf_atrous is mandatory:
+    # the `off` override would disable the denoiser and skip RestirFinal
+    # entirely (same reason aurora_smoke must run with a denoiser above).
+    #
+    # Tolerances are TIGHTER than the 32/4/2 used elsewhere because the
+    # scene is mostly black (sun below horizon; the four analytic lights are
+    # the only illumination). Losing ReSTIR entirely -- the exact regression
+    # this cell guards -- only moves the small lit fraction of pixels, so a
+    # loose FAIL_PERCENT/MEAN_DELTA would let the bug pass. Measured on the
+    # M4 Max: the bug-vs-fixed diff is mean_delta 2.67 with 6.4% of pixels
+    # past MAX_DELTA 16; the fixed render is bit-identical run-to-run (no
+    # meshes -> no TLAS build entropy). 16/2/2 fails the bug on BOTH signals
+    # (bad% 6.4 > 2 and mean 2.67 > 2) with headroom while passing the
+    # deterministic golden. Widen per-cell if it ever flakes across Apple
+    # GPU generations (this cell is a local M-series guard; CI runs the
+    # software lane).
+    pt_add_golden_cell(SCENE light_primitives_mixed BACKEND metal DENOISER svgf_atrous
+        MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 2)
     # sdf_phase2_procedural is NOT registered unconditionally: the fixture
     # exercises displaced / procedural SDF ops that are compiled out unless
     # PT_SDF_PROCEDURAL_OPS=ON (default OFF), and in a default build it

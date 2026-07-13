@@ -117,6 +117,85 @@ NS::String* NsStr(const char* utf8) {
 
 constexpr const char* kClearEntryPoint = "main_0";  // Slang renames `main`
 
+// Parse the Metal resource layout Slang assigned a kernel from its emitted
+// MSL: the acceleration structure + push-constant buffer() indices, plus a
+// bitmask of the SSBO buffer() indices and the texture() indices the kernel
+// actually declares. Dispatch uses these so the shader's own output -- not
+// a fixed convention -- decides where every resource binds. Slang numbers
+// buffer-class resources (SSBOs, the AS, the push block) in declaration
+// order, so the AS is buffer(0) only when it's declared before every SSBO
+// (PathTrace); RestirFinal declares it last (AS@3, push@4), which the old
+// hardcoded AS@0 / push@(max_ssbo+1) got wrong.
+//
+// Every [[buffer(N)]] / [[texture(N)]] attribute lives in the single kernel
+// signature, so a linear scan suffices. For a buffer, the owning parameter
+// (text back to the preceding '(' or ',') classifies it: an
+// `acceleration_structure` type -> AS index; a `constant` address-space
+// pointer (Slang's lowering of push/cbuffer) -> push index; anything else
+// (`device*`) -> an SSBO whose bit is set in ssbo_buf_mask. Every texture
+// index sets its bit in tex_mask. Indices are < 32 in these kernels (the
+// bound arrays are 24/20 wide), so a uint32 mask covers them; a stray
+// larger index is ignored rather than shifted out of range.
+void ParseMetalBindingLayout(const std::string& msl, MetalPipeline& out) {
+    out.accel_buf_index = -1;
+    out.push_buf_index  = -1;
+    out.ssbo_buf_mask   = 0;
+    out.tex_mask        = 0;
+
+    auto scan = [&](std::string_view tok, bool is_buffer) {
+        std::size_t search = 0;
+        for (;;) {
+            const std::size_t attr_pos = msl.find(tok, search);
+            if (attr_pos == std::string::npos) break;
+            const std::size_t num_start = attr_pos + tok.size();
+            const std::size_t num_end   = msl.find(')', num_start);
+            if (num_end == std::string::npos) break;
+            search = num_end + 1;
+            std::int32_t idx = 0;
+            bool have_digit = false;
+            for (std::size_t i = num_start; i < num_end; ++i) {
+                const char c = msl[i];
+                if (c < '0' || c > '9') { have_digit = false; break; }
+                idx = idx * 10 + (c - '0');
+                have_digit = true;
+            }
+            if (!have_digit) continue;
+            const bool in_mask_range = (idx >= 0 && idx < 32);
+            if (!is_buffer) {
+                if (in_mask_range) out.tex_mask |= (1u << idx);
+                continue;
+            }
+            // Classify the owning buffer parameter. Its declaration is the
+            // text from the previous separator up to this attribute;
+            // rfind searches strictly before attr_pos (the '[' of the
+            // attribute), so the attribute's own '(' can't be the separator.
+            const std::size_t prev_paren = msl.rfind('(', attr_pos);
+            const std::size_t prev_comma = msl.rfind(',', attr_pos);
+            std::size_t decl_start = std::string::npos;
+            if (prev_paren != std::string::npos) decl_start = prev_paren;
+            if (prev_comma != std::string::npos &&
+                (decl_start == std::string::npos || prev_comma > decl_start)) {
+                decl_start = prev_comma;
+            }
+            const std::string_view decl =
+                (decl_start == std::string::npos)
+                    ? std::string_view(msl).substr(0, attr_pos)
+                    : std::string_view(msl).substr(decl_start + 1,
+                                                   attr_pos - decl_start - 1);
+            if (decl.find("acceleration_structure") != std::string_view::npos) {
+                out.accel_buf_index = idx;
+            } else if (decl.find("constant*")  != std::string_view::npos ||
+                       decl.find("constant *") != std::string_view::npos) {
+                out.push_buf_index = idx;
+            } else if (in_mask_range) {
+                out.ssbo_buf_mask |= (1u << idx);
+            }
+        }
+    };
+    scan("[[buffer(",  /*is_buffer=*/true);
+    scan("[[texture(", /*is_buffer=*/false);
+}
+
 }  // namespace
 
 // ---------- MetalCommandBuffer -------------------------------------------
@@ -149,12 +228,12 @@ void MetalCommandBuffer::FlushEncoder() { EndEncoderIfActive(); }
 
 void MetalCommandBuffer::BindComputePipeline(PipelineHandle p) {
     bound_pso_ = p;
-    // Clear all binding state so each pipeline starts fresh. Without
-    // this, the previous pipeline's leftover buffer/AS slots would
-    // skew the push-constant slot calculation in Dispatch() (which is
-    // computed as max-bound-buffer + 1) and the new pipeline's push
-    // constants would land at the wrong Metal buffer index. Anything
-    // the new pipeline needs must be re-bound after this call.
+    // Clear all binding state so each pipeline starts fresh. Without this,
+    // a previous pipeline's leftover buffer/texture/AS slots could be
+    // re-bound into the new pipeline's dispatch (partially-bound state
+    // leaking across pipelines). Anything the new pipeline needs must be
+    // re-bound after this call. (Push/AS placement itself now comes from
+    // the pipeline's parsed MetalPipeline indices, not from bound state.)
     push_size_ = 0;
     for (auto& t : bound_tex_)     t = TextureHandle{0};
     for (auto& b : bound_buf_)     b = BufferHandle{0};
@@ -185,54 +264,66 @@ void MetalCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     if (mtl_cb_ == nullptr || !bound_pso_) return;
     EnsureEncoder();
 
-    auto* pso = device_->LookupPipeline(bound_pso_);
-    if (pso == nullptr) return;
-    encoder_->setComputePipelineState(pso);
+    const MetalPipeline* mp = device_->LookupPipeline(bound_pso_);
+    if (mp == nullptr || mp->pso == nullptr) return;
+    encoder_->setComputePipelineState(mp->pso);
 
-    // Storage textures.
+    // The engine addresses each resource by a numeric slot that it picks to
+    // equal the Metal index Slang assigned. Rather than trust that blindly,
+    // bind an engine slot only when the parsed layout confirms the shader
+    // declares that index as the matching resource kind. A slot the kernel
+    // doesn't declare (a Slang-dead-code-eliminated buffer, or a texture a
+    // sibling pipeline uses) is simply skipped -- Metal would ignore the
+    // bind anyway, but skipping keeps the shader's emitted layout the single
+    // authority for what lands where.
     for (std::uint32_t i = 0; i < std::size(bound_tex_); ++i) {
         if (!bound_tex_[i]) continue;
+        if (i >= 32 || !(mp->tex_mask & (1u << i))) continue;
         auto* tex = device_->LookupTexture(bound_tex_[i]);
         if (tex != nullptr) encoder_->setTexture(tex, i);
     }
-    // Bound buffers.
     for (std::uint32_t i = 0; i < std::size(bound_buf_); ++i) {
         if (!bound_buf_[i]) continue;
+        // A buffer bind must never land on the index the kernel uses for its
+        // acceleration structure or push block: that is exactly the silent
+        // clobber this change eliminates. If the engine ever binds an SSBO
+        // there, refuse it loudly instead of overwriting the AS/push.
+        if (static_cast<std::int32_t>(i) == mp->accel_buf_index ||
+            static_cast<std::int32_t>(i) == mp->push_buf_index) {
+            LOG_WARN("Metal Dispatch: buffer bound at slot {} collides with "
+                     "this pipeline's {} index; skipping to avoid a clobber",
+                     i, (static_cast<std::int32_t>(i) == mp->accel_buf_index)
+                            ? "acceleration-structure" : "push-constant");
+            continue;
+        }
+        if (i >= 32 || !(mp->ssbo_buf_mask & (1u << i))) continue;
         auto* buf = device_->LookupBuffer(bound_buf_[i]);
         if (buf != nullptr) encoder_->setBuffer(buf, bound_buf_off_[i], i);
     }
-    // Slang's MSL output assigns Metal buffer slots in this order:
-    //   AS (if present)        -> slot 0
-    //   storage buffers        -> next slots, in declaration order
-    //   push constant block    -> next slot after all the above
-    // The Engine binds AS via BindAccelStruct and buffers via
-    // BindBuffer(slot, ...) using the SAME slot number Slang assigned
-    // (no abstraction here yet); push_slot is computed as max(bound
-    // buffer/AS slot) + 1 so it lands wherever Slang put it.
-    bool has_accel = false;
-    AccelStructHandle accel_handle{0};
-    for (auto& a : bound_accel_) {
-        if (a.id != 0) { has_accel = true; accel_handle = a; break; }
-    }
-
-    std::int32_t max_slot = -1;   // -1 = nothing yet
-    if (has_accel) max_slot = 0;
-    for (std::uint32_t i = 0; i < std::size(bound_buf_); ++i) {
-        if (bound_buf_[i]) max_slot = std::max(max_slot, static_cast<std::int32_t>(i));
-    }
-
-    if (has_accel) {
-        auto* as = device_->LookupAccelStruct(accel_handle);
-        if (as != nullptr) {
-            encoder_->setAccelerationStructure(as, 0);
-            device_->UseAllAccelStructs(encoder_);
+    // The acceleration structure and the push-constant block share the
+    // buffer() namespace with the SSBOs but are bound separately, at the
+    // indices Slang assigned (parsed into MetalPipeline). Those indices vary
+    // per kernel: PathTrace declares the AS first (AS@0, push@18) while
+    // RestirFinal declares it after its SSBOs (AS@3, push@4). -1 means the
+    // kernel declares no such resource.
+    if (mp->accel_buf_index >= 0) {
+        AccelStructHandle accel_handle{0};
+        for (auto& a : bound_accel_) {
+            if (a.id != 0) { accel_handle = a; break; }
+        }
+        if (accel_handle.id != 0) {
+            auto* as = device_->LookupAccelStruct(accel_handle);
+            if (as != nullptr) {
+                encoder_->setAccelerationStructure(
+                    as, static_cast<NS::UInteger>(mp->accel_buf_index));
+                device_->UseAllAccelStructs(encoder_);
+            }
         }
     }
 
-    std::uint32_t push_slot = (max_slot < 0) ? 0u
-                                             : static_cast<std::uint32_t>(max_slot + 1);
-    if (push_size_ > 0) {
-        encoder_->setBytes(push_buf_, push_size_, push_slot);
+    if (push_size_ > 0 && mp->push_buf_index >= 0) {
+        encoder_->setBytes(push_buf_, push_size_,
+                           static_cast<NS::UInteger>(mp->push_buf_index));
     }
 
     // Threadgroup size MUST match the kernel's [numthreads(...)]
@@ -358,9 +449,27 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
                       psoErr ? psoErr->localizedDescription()->utf8String() : "?");
             return;
         }
+        // Recover the kernel's Metal resource layout (AS + push indices,
+        // SSBO + texture masks) so Dispatch binds every resource where the
+        // shader actually declares it instead of assuming a fixed
+        // convention (AS@0 / push@(max_ssbo+1) / slot == index).
+        MetalPipeline mp{};
+        mp.pso = pso;
+        ParseMetalBindingLayout(nul_terminated, mp);
+        // Every demont compute kernel takes a push-constant block (at least
+        // width/height), so a -1 here means the MSL signature scan failed
+        // to recognise it -- e.g. a future Slang release changed how it
+        // lowers push/cbuffer. Left silent, Dispatch would skip setBytes and
+        // the kernel would read a zero-filled push and no-op (the exact
+        // failure mode this whole change fixes). Flag it loudly instead.
+        if (mp.push_buf_index < 0) {
+            LOG_WARN("'{}' shader: no push-constant buffer index parsed from "
+                     "MSL; push constants will not be bound (Slang output "
+                     "format change?)", kernel_name);
+        }
         std::lock_guard lock(resource_mutex_);
         auto id = next_id_++;
-        pipelines_.emplace(id, pso);
+        pipelines_.emplace(id, mp);
         named_pipelines_.emplace(kernel_name, id);
     };
 
@@ -446,7 +555,7 @@ MetalDevice::~MetalDevice() {
     }
     {
         std::lock_guard lock(resource_mutex_);
-        for (auto& [_, p] : pipelines_) if (p) p->release();
+        for (auto& [_, p] : pipelines_) if (p.pso) p.pso->release();
         for (auto& [_, t] : textures_)  if (t) t->release();
         for (auto& [_, b] : buffers_)   if (b) b->release();
         for (auto& [_, a] : accels_)    if (a) a->release();
@@ -792,7 +901,7 @@ void MetalDevice::DestroyTexture(TextureHandle h) {
 void MetalDevice::DestroyPipeline(PipelineHandle h) {
     std::lock_guard lock(resource_mutex_);
     if (auto it = pipelines_.find(h.id); it != pipelines_.end()) {
-        if (it->second) it->second->release();
+        if (it->second.pso) it->second.pso->release();
         pipelines_.erase(it);
     }
 }
@@ -1105,10 +1214,10 @@ std::size_t MetalDevice::CurrentAllocatedBytes() const {
     return device_->currentAllocatedSize();
 }
 
-MTL::ComputePipelineState* MetalDevice::LookupPipeline(PipelineHandle h) {
+const MetalPipeline* MetalDevice::LookupPipeline(PipelineHandle h) {
     std::lock_guard lock(resource_mutex_);
     auto it = pipelines_.find(h.id);
-    return it == pipelines_.end() ? nullptr : it->second;
+    return it == pipelines_.end() ? nullptr : &it->second;
 }
 
 MTL::Texture* MetalDevice::LookupTexture(TextureHandle h) {
