@@ -382,6 +382,23 @@ pt_add_test(pt_renderer_light_tree
     pt_renderer_light_tree_test.cpp
     LINK_TARGETS pt_renderer)
 
+# --- Hosek-Wilkie sky cook unit tests (real ArHosekSkyModel dataset) -------
+# Pins the physics the previous fabricated coefficient tables destroyed:
+#   - a strongly blue-dominant zenith on a clear day (b/r ~3.3), with exact
+#     magnitude spot-checks so a corrupted/truncated embedded dataset fails
+#   - the zenith blue channel never clamps to 0 as turbidity rises to 10
+#     (the specific "olive/yellow-grey sky" regression the audit found), and
+#     desaturation toward white is monotone (never inverts)
+#   - ground albedo brightens the dome (correct sign; the old response was
+#     near-inert / partly backwards)
+#   - the cook stays finite at + beyond the [1,10] turbidity / [0,90deg]
+#     elevation domain edges (no OOB index, no pow() of a negative base)
+# Pure-header doctest against engine/HosekSkyModel.h -- no link needed (the
+# cook + eval + embedded dataset are all header-only, inline constexpr). This
+# is the CI-portable guard for the Hosek fix; the GPU golden only runs on Mac.
+pt_add_test(pt_hosek_sky
+    pt_hosek_sky_test.cpp)
+
 # --- pt_renderer/HdrImage env-map CDF unit tests (issue #66) ---------------
 # Phase 3 of #47. Pins the marginal/conditional luminance-CDF builder
 # the env-map MIS sampler depends on. The CDF feeds NEE / env-map MIS

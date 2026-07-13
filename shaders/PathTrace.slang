@@ -1171,6 +1171,19 @@ cbuffer Push {
     // Scales sunDisc() only -- never the cloud march / NEE lighting.
     float4 sun_extra2;
     // --- end Sun disc brightness ----------------------------------------------
+    // --- Wave 9 hosek-sky: cooked coefficients (real dataset) -----------------
+    // Cooked per-frame on the CPU from the real Hosek-Wilkie RGB dataset
+    // (src/engine/HosekSkyModel.h::Cook, called from Engine.cpp). Read only
+    // when sky mode == 3 (hosek). hosek_cfg[i].xyz = the RGB values of shape
+    // coefficient i in the reference index order:
+    //   [0]=A [1]=B [2]=C [3]=D [4]=E [5]=F [6]=G [7]=I(sqrt-zenith) [8]=H(Mie g).
+    // hosek_radiance.xyz = per-channel radiance magnitude L_M, already scaled
+    // into engine HDR units (kHosekRadianceScale). .w lanes unused. 10 vec4 =
+    // 160 B, appended at the very tail so every existing field offset is
+    // untouched. Mirrored in the SPIR-V Frame block below + Engine.cpp PtPush.
+    float4 hosek_cfg[9];
+    float4 hosek_radiance;
+    // --- end Wave 9 hosek-sky cooked coefficients -----------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -1314,6 +1327,11 @@ cbuffer Frame {
     // --- end Wave 9 tonemap ---
     // See `sun_extra2` in the Metal Push cbuffer above (r_sun_disc_brightness).
     float4 sun_extra2;
+    // See `hosek_cfg` / `hosek_radiance` in the Metal Push cbuffer above
+    // (Wave 9 hosek-sky cooked coefficients). Layout-equivalent: 10 vec4
+    // appended at the tail. Bytes [tail] of the host PtPush.
+    float4 hosek_cfg[9];
+    float4 hosek_radiance;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -2753,22 +2771,25 @@ float3 procSkyInlineSunDiscAndHalo(float3 rd, float3 sun) {
 // --- Wave 9 hosek-sky -------------------------------------------------------
 // Hosek-Wilkie (2012) physically-based analytic sky-dome radiance.
 //
-// IMPLEMENTATION CHOICE: this is the compact GPU-friendly *analytic fit*
-// to the Hosek-Wilkie model (the closed-form polynomial approximation
-// popularised by Andrew Helmer's "An Analytic Approximation of the
-// Hosek-Wilkie Skylight Model", a.k.a. the ~60-line shadertoy version),
-// NOT the full ~40 KB "ArHosekSkyModel" RGB coefficient dataset. The
-// fit reproduces the same 9-term radiance shape function F(theta,gamma)
-// and drives all 9 coefficients (A..I) plus the per-channel radiance
-// magnitude L_M directly from (turbidity, ground albedo, solar
-// elevation) via embedded polynomial datasets. It captures the physical
-// behaviour the acceptance bar asks for -- horizon brightening, sun-side
-// forward-scatter glow, the zenith-to-horizon gradient, and the way all
-// of those shift with turbidity and sun height -- without the heavy
-// dataset. Turbidity and solar zenith are passed as REAL physical
-// quantities from the host (no demo fudge).
+// This is the REAL Hosek-Wilkie model, driven by the reference
+// ArHosekSkyModel RGB coefficient dataset (Hosek & Wilkie, "An Analytic
+// Model for Full Spectral Sky-Dome Radiance", SIGGRAPH 2012; reference
+// code v1.4a). The dataset's per-turbidity/albedo/elevation "cook" step --
+// which turns the 3 uniforms (turbidity, ground albedo, solar elevation)
+// into the 9 shape coefficients A..I plus a radiance magnitude L_M per RGB
+// channel -- runs ONCE per frame on the CPU (see src/engine/HosekSkyModel.h
+// and Engine.cpp), and the cooked coefficients arrive here in the push
+// constant (hosek_cfg / hosek_radiance). This shader evaluates only the
+// cheap per-view-direction shape function, exactly the reference
+// architecture (cook once, evaluate per direction).
 //
-// Radiance model (per channel c):
+// [History: this function previously fabricated the ~130 coefficients as
+// hand-authored round numbers falsely attributed to a "Helmer fit". Those
+// tables collapsed the blue channel at the zenith (dark olive sky, blue
+// clamping to 0 at high turbidity). They are gone; every number now traces
+// to the reference dataset.]
+//
+// Radiance model (per channel c), evaluated below from the cooked coeffs:
 //   L(theta, gamma) = F_c(theta, gamma) * Z_c
 //   F(theta, gamma) = (1 + A*exp(B / (cos(theta) + 0.01)))
 //                   * (C + D*exp(E*gamma) + F*cos^2(gamma)
@@ -2777,29 +2798,6 @@ float3 procSkyInlineSunDiscAndHalo(float3 rd, float3 sun) {
 // where theta is the angle from zenith, gamma the angle from the sun,
 // and Z_c the channel radiance magnitude (the model's "L_M").
 
-// Embedded coefficient datasets for the analytic fit. Each of the 9
-// shape coefficients A..I is a degree-? polynomial in the solar
-// elevation parameter, with turbidity- and albedo-dependent terms.
-// These are the standard fit tables (Helmer's coefficient matrices,
-// matching the Hosek-Wilkie RGB dataset's behaviour). Layout: one
-// float3 (RGB) per polynomial term.
-//
-// The fit evaluates each coefficient as a cubic in `s = pow(elev, 1/3)`
-// (elev in [0,1] = sun height above horizon, 0 at/below horizon, 1 at
-// zenith) blended linearly across turbidity and quadratically across the
-// gamma-dependent forward-scatter terms. We follow the published packing:
-// coeff(t, a, s) = base(s) + a*albedo_term(s) + (t-1)*turbidity_term(s).
-
-// helper: cubic in s with 4 float3 control values (Bezier-style basis
-// used by the published fit for smooth elevation dependence).
-float3 hosekCubic(float3 c0, float3 c1, float3 c2, float3 c3, float s) {
-    float is = 1.0 - s;
-    return c0 * (is*is*is)
-         + c1 * (3.0 * s * is*is)
-         + c2 * (3.0 * s*s * is)
-         + c3 * (s*s*s);
-}
-
 // chi term -- Mie-style forward-scatter lobe in the radiance shape.
 float3 hosekChi(float3 g, float cos_gamma) {
     float3 num = 1.0 + cos_gamma * cos_gamma;
@@ -2807,97 +2805,11 @@ float3 hosekChi(float3 g, float cos_gamma) {
     return num / pow(max(den, float3(1e-4)), float3(1.5));
 }
 
-// Compute the 9 RGB shape coefficients + RGB radiance magnitude for the
-// given turbidity T (1..10), ground albedo, and solar elevation
-// (radians above horizon). Outputs the A..I terms in cA..cI and the
-// per-channel radiance magnitude in radZ.
-//
-// The coefficient values below are the compact analytic-fit constants
-// (the well-known Helmer fit reproducing the Hosek RGB dataset). They
-// are intentionally a fit, not the per-bin dataset -- see the function
-// header above for the rationale.
-void hosekCoeffs(float T, float albedo, float elev,
-                 out float3 cA, out float3 cB, out float3 cC,
-                 out float3 cD, out float3 cE, out float3 cF,
-                 out float3 cG, out float3 cH, out float3 cI,
-                 out float3 radZ) {
-    // Elevation parameter for the cubic basis: cube-root warps the
-    // [0,1] elevation so the fit packs more resolution near the horizon
-    // where the gradient changes fastest (matches the published fit).
-    float ev = clamp(elev / 1.5707963267948966, 0.0, 1.0);   // 0..1
-    float s  = pow(ev, 1.0 / 3.0);
-    float tt = clamp(T, 1.0, 10.0);
-    float tn = (tt - 1.0) / 9.0;     // normalised turbidity 0..1
-
-    // A: zenith-darkening / horizon-gradient strength (always negative;
-    // larger |A| = sharper horizon brightening). Reddens with turbidity.
-    cA = hosekCubic(float3(-1.10, -1.10, -1.12),
-                    float3(-1.20, -1.22, -1.30),
-                    float3(-0.95, -1.00, -1.18),
-                    float3(-1.02, -1.06, -1.20), s)
-       + tn   * float3(-0.42, -0.30, -0.18)
-       + albedo * float3(-0.02, -0.02, -0.02);
-    // B: horizon-gradient falloff sharpness (negative).
-    cB = hosekCubic(float3(-0.28, -0.28, -0.30),
-                    float3(-0.42, -0.40, -0.36),
-                    float3(-0.18, -0.20, -0.24),
-                    float3(-0.12, -0.14, -0.18), s)
-       + tn * float3(-0.10, -0.09, -0.07);
-    // C: constant ambient term (raises with turbidity haze).
-    cC = hosekCubic(float3(0.18, 0.24, 0.40),
-                    float3(0.30, 0.36, 0.52),
-                    float3(0.62, 0.66, 0.78),
-                    float3(0.88, 0.90, 0.96), s)
-       + tn   * float3(0.55, 0.42, 0.22)
-       + albedo * float3(0.08, 0.08, 0.10);
-    // D: exp(E*gamma) magnitude -- the broad sun-side glow. Stronger and
-    // warmer at high turbidity.
-    cD = hosekCubic(float3(-1.30, -1.45, -1.70),
-                    float3(-0.95, -1.10, -1.40),
-                    float3(-0.55, -0.70, -1.00),
-                    float3(-0.30, -0.42, -0.70), s)
-       + tn * float3(2.40, 1.90, 1.20);
-    // E: exp falloff rate of the sun-side glow (negative; controls how
-    // tightly the glow hugs the sun).
-    cE = hosekCubic(float3(-0.30, -0.28, -0.26),
-                    float3(-0.24, -0.22, -0.20),
-                    float3(-0.14, -0.13, -0.12),
-                    float3(-0.085, -0.080, -0.075), s)
-       - tn * float3(0.020, 0.018, 0.015);
-    // F: cos^2(gamma) backscatter term.
-    cF = hosekCubic(float3(0.16, 0.16, 0.18),
-                    float3(0.30, 0.30, 0.30),
-                    float3(0.42, 0.44, 0.46),
-                    float3(0.50, 0.52, 0.55), s)
-       + albedo * float3(0.10, 0.10, 0.10);
-    // G: Mie forward-scatter (chi) magnitude near the solar disc.
-    cG = hosekCubic(float3(0.02, 0.02, 0.02),
-                    float3(0.04, 0.04, 0.04),
-                    float3(0.06, 0.06, 0.07),
-                    float3(0.08, 0.08, 0.09), s)
-       + tn * float3(0.06, 0.05, 0.04);
-    // H: Mie asymmetry g in chi (0..1; rises with turbidity = more
-    // forward-peaked aerosol scattering).
-    cH = float3(0.70, 0.70, 0.70) + tn * float3(0.18, 0.18, 0.18);
-    // I: sqrt(cos theta) zenith-gradient sweetener.
-    cI = hosekCubic(float3(0.92, 0.92, 0.90),
-                    float3(0.86, 0.86, 0.84),
-                    float3(0.80, 0.80, 0.78),
-                    float3(0.74, 0.74, 0.72), s);
-
-    // Per-channel radiance magnitude (the model's L_M / "Z"). Drives the
-    // overall sky brightness and its blue->warm shift with sun height.
-    // Encodes the daytime blue-dominant zenith and the warm low-sun
-    // reddening. Scaled to land in tonemap-relative HDR units consistent
-    // with the procedural sun NEE (so env lighting reads correctly).
-    float sky_blue  = lerp(0.10, 1.0, smoothstep(0.0, 0.35, ev)); // dark at horizon-sun
-    float3 day_chroma = float3(0.46, 0.62, 1.00);   // blue-dominant clear-sky tint
-    float3 low_chroma = float3(1.00, 0.66, 0.42);   // warm low-sun tint
-    float3 chroma = lerp(low_chroma, day_chroma, smoothstep(0.02, 0.20, ev));
-    // Turbidity desaturates (haze pushes toward white/grey).
-    chroma = lerp(chroma, float3(0.85, 0.85, 0.88), tn * 0.55);
-    radZ = chroma * (sky_blue * (2.2 + tn * 1.4));
-}
+// (The per-frame "cook" that turns turbidity/albedo/elevation into the 9
+// coefficients A..I + radiance L_M lives on the CPU now --
+// src/engine/HosekSkyModel.h::Cook, called from Engine.cpp -- and the
+// cooked values arrive in hosek_cfg[] / hosek_radiance in the push. This
+// used to be a fabricated hand-tuned table; see the header note above.)
 
 // Hosek-Wilkie sky radiance for view direction rd given the sun
 // direction. Mirrors procSky's contract: returns HDR linear radiance,
@@ -2911,13 +2823,19 @@ float3 hosekSky(float3 rd, float3 sun) {
     float cos_gamma = clamp(dot(rd, sun), -1.0, 1.0);
     float gamma     = acos(cos_gamma);
 
-    // Solar elevation above the horizon (radians). hosek_params.z carries
-    // the zenith angle; elevation = pi/2 - zenith.
-    float sun_elev = 1.5707963267948966 - hosek_params.z;
-
-    float3 cA, cB, cC, cD, cE, cF, cG, cH, cI, radZ;
-    hosekCoeffs(hosek_params.x, hosek_params.y, sun_elev,
-                cA, cB, cC, cD, cE, cF, cG, cH, cI, radZ);
+    // Cooked coefficients (real Hosek-Wilkie RGB dataset), computed on the
+    // CPU this frame and delivered in the push. Reference index order:
+    //   [0]=A [1]=B [2]=C [3]=D [4]=E [5]=F [6]=G [7]=I(sqrt) [8]=H(Mie g).
+    float3 cA = hosek_cfg[0].xyz;
+    float3 cB = hosek_cfg[1].xyz;
+    float3 cC = hosek_cfg[2].xyz;
+    float3 cD = hosek_cfg[3].xyz;
+    float3 cE = hosek_cfg[4].xyz;
+    float3 cF = hosek_cfg[5].xyz;
+    float3 cG = hosek_cfg[6].xyz;
+    float3 cI = hosek_cfg[7].xyz;   // sqrt(cos theta) zenith coefficient
+    float3 cH = hosek_cfg[8].xyz;   // Mie asymmetry g
+    float3 radZ = hosek_radiance.xyz;
 
     // Radiance shape function F(theta, gamma), evaluated per channel.
     float3 expM = float3(1.0) + cA * exp(cB / (cos_theta + 0.01));

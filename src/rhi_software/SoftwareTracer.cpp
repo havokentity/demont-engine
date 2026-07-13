@@ -12,6 +12,7 @@
 #include "SoftwareDevice.h"
 
 #include "../core/Log.h"
+#include "engine/HosekSkyModel.h"   // Wave 9 hosek-sky: real ArHosekSkyModel cook
 
 #include <embree4/rtcore.h>
 #include <glm/glm.hpp>
@@ -80,6 +81,19 @@ constexpr std::size_t kAccumParamsOffset = 784;
 // operator on the software backend. Fixed offset, asserted in
 // lockstep with the struct by Engine.cpp's static_assert block.
 constexpr std::size_t kTonemapParamsOffset = 1600;
+
+// Sky mode is packed into sun_and_mode.w (float), i.e. the 4th float of
+// the sun_and_mode vec4. 3 == Hosek-Wilkie. See PtPush::sun_and_mode.
+constexpr std::size_t kSkyModeOffset = kSunAndModeOffset + 12;
+
+// Hosek-Wilkie params offset inside the engine's full PtPush. hosek_params
+// sits at byte 1184 (asserted in lockstep by Engine.cpp's static_assert
+// block). .x = turbidity [1,10], .y = ground albedo [0,1], .z = solar
+// zenith angle (rad). The software backend re-cooks the real Hosek RGB
+// dataset from these three uniforms (see engine/HosekSkyModel.h) so the
+// CI-exercised software golden actually renders the Hosek dome instead of
+// the generic ProcSky fallback.
+constexpr std::size_t kHosekParamsOffset = 1184;
 
 // Analytic prim layout (matches PathTrace.slang's `primitives` SSBO).
 // Stride grew over time: 3 -> 4 in #85 (motion blur, added prev_pos)
@@ -176,6 +190,35 @@ inline glm::vec3 ProcSky(const glm::vec3& dir, const glm::vec3& sun_dir) {
     float disc = (cos_sun > 0.9998f) ? 2.5f : 0.0f;
     glm::vec3 sun_col{1.0f, 0.92f, 0.78f};
     return sky + sun_col * (halo + disc);
+}
+
+// Hosek-Wilkie physically-based sky dome (r_sky_mode = hosek). The CPU
+// mirror of PathTrace.slang::hosekSky: evaluates the per-direction shape
+// function F(theta, gamma) from the cooked RGB coefficients and multiplies
+// by the channel radiance L_M (already scaled). theta = angle from zenith,
+// gamma = angle from the sun. Returns HDR linear radiance (the caller
+// applies r_exposure + tonemap, same as every other sky path). No BSC
+// starmap here -- the software backend is a headless preview tracer and
+// binds no star texture; the night floor stands in for the star field.
+inline glm::vec3 HosekSky(const glm::vec3& dir, const glm::vec3& sun_dir,
+                          const pt::hosek::Cooked& ck) {
+    const float cos_theta = glm::clamp(dir.y, 0.0f, 1.0f);
+    const float cos_gamma = glm::clamp(glm::dot(dir, sun_dir), -1.0f, 1.0f);
+    const float gamma     = std::acos(cos_gamma);
+    glm::vec3 sky{0.0f};
+    for (int c = 0; c < 3; ++c) {
+        const double F = pt::hosek::RadianceInternal(ck.cfg[c], cos_theta,
+                                                     cos_gamma, gamma);
+        sky[c] = static_cast<float>(std::max(F, 0.0) * ck.rad[c]
+                                    * pt::hosek::kHosekRadianceScale);
+    }
+    // Fade the model out just under the horizon (F rings negative below it),
+    // then blend to a deep-navy night floor as the sun drops -- both mirror
+    // the shader so the software preview tracks the GPU look.
+    sky *= glm::smoothstep(-0.05f, 0.02f, dir.y);
+    const float day = glm::smoothstep(-0.10f, 0.20f, sun_dir.y);
+    sky = glm::mix(glm::vec3{0.005f, 0.010f, 0.030f}, sky, day);
+    return glm::max(sky, glm::vec3(0.0f));
 }
 
 // ACES Narkowicz approximation, well-matched to the engine's
@@ -385,6 +428,39 @@ void RunPathTraceKernel(SoftwareDevice& device,
         sun_dir = glm::normalize(sun_dir);
     }
 
+    // Sky mode + Hosek cook. Decode sun_and_mode.w (== 3 for Hosek-Wilkie)
+    // and, when active, re-cook the real ArHosekSkyModel RGB dataset from
+    // (turbidity, ground albedo, solar zenith) in hosek_params -- ONCE here,
+    // before the per-pixel loop, since the cook is a per-frame uniform. This
+    // is what makes the CI-exercised software golden actually exercise the
+    // Hosek path (it previously ignored r_sky_mode and pinned a near-black
+    // ProcSky gradient). Cook clamps below-horizon suns; the night floor in
+    // HosekSky handles the rest.
+    bool hosek_active = false;
+    pt::hosek::Cooked hosek_ck{};
+    if (cmd.push_constants_size >= kSkyModeOffset + 4) {
+        float sky_mode_f = 0.0f;
+        std::memcpy(&sky_mode_f, cmd.push_constants_buf + kSkyModeOffset, sizeof(float));
+        if (static_cast<int>(sky_mode_f + 0.5f) == 3 &&
+            cmd.push_constants_size >= kHosekParamsOffset + 16) {
+            const float* hp = reinterpret_cast<const float*>(
+                cmd.push_constants_buf + kHosekParamsOffset);
+            const float turbidity = hp[0];
+            const float albedo    = hp[1];
+            const float zenith    = hp[2];
+            const float sun_elev  = 1.5707963267948966f - zenith;
+            hosek_ck = pt::hosek::Cook(turbidity, albedo, sun_elev);
+            hosek_active = true;
+        }
+    }
+    // Unified sky lookup used at primary miss AND for the sky-lit ambient
+    // term, so the Lambert floor under a Hosek sky is lit by Hosek skylight
+    // (the env-lighting consistency the fixture checks).
+    auto sky_radiance = [&](const glm::vec3& d) -> glm::vec3 {
+        return hosek_active ? HosekSky(d, sun_dir, hosek_ck)
+                            : ProcSky(d, sun_dir);
+    };
+
     // Resolve bound resources. Output texture must exist; the accum
     // texture is optional but allocated by the engine in steady state
     // (binding 1). Writing to both lets the engine's screenshot
@@ -525,7 +601,7 @@ void RunPathTraceKernel(SoftwareDevice& device,
 
                 glm::vec3 col{0.0f};
                 if (!h0.hit) {
-                    col = ProcSky(rd, sun_dir);
+                    col = sky_radiance(rd);
                 } else {
                     // Lambert direct lighting from the procedural sun.
                     // Shadow test: trace from a slightly-offset hit
@@ -537,7 +613,7 @@ void RunPathTraceKernel(SoftwareDevice& device,
                     glm::vec3 nf = (glm::dot(h0.normal, rd) < 0.0f)
                         ? h0.normal : -h0.normal;
                     float n_dot_l = std::max(0.0f, glm::dot(nf, sun_dir));
-                    glm::vec3 ambient = h0.albedo * ProcSky(nf, sun_dir) * 0.30f;
+                    glm::vec3 ambient = h0.albedo * sky_radiance(nf) * 0.30f;
 
                     glm::vec3 lit{0.0f};
                     if (n_dot_l > 0.0f) {

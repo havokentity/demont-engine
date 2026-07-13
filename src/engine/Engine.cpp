@@ -5,6 +5,7 @@
 #include "CaptureEncoder.h"
 #include "CaptureFormat.h"
 #include "FrameCapture.h"
+#include "HosekSkyModel.h"   // Wave 9 hosek-sky: real ArHosekSkyModel RGB cook
 
 #include "../app/ConsoleOverlay.h"
 #include "../app/Gamepad.h"
@@ -7649,6 +7650,19 @@ void Engine::RenderFrame() {
         //   .yzw reserved.
         float sun_extra2[4];
         // --- end Sun disc brightness -------------------------------------
+        // --- Wave 9 hosek-sky: cooked coefficients (real dataset) --------
+        // Cooked once per frame from the real Hosek-Wilkie RGB dataset
+        // (HosekSkyModel.h::Cook) whenever r_sky_mode is resolvable; read by
+        // PathTrace.slang::hosekSky only when sky mode == 3. hosek_cfg[i] =
+        // (r,g,b,_) of shape coefficient i in the reference index order
+        //   [0]=A [1]=B [2]=C [3]=D [4]=E [5]=F [6]=G [7]=I(sqrt) [8]=H(Mie g);
+        // hosek_radiance = (r,g,b,_) radiance magnitude L_M, pre-scaled by
+        // kHosekRadianceScale. 9 + 1 = 10 vec4 = 160 B, a pure tail append so
+        // every existing field offset is untouched. Mirrored in
+        // PathTrace.slang's Push (Metal) + Frame (Vulkan) blocks.
+        float hosek_cfg[9][4];
+        float hosek_radiance[4];
+        // --- end Wave 9 hosek-sky cooked coefficients --------------------
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -8387,6 +8401,31 @@ void Engine::RenderFrame() {
         push.hosek_params[1] = ground_albedo;
         push.hosek_params[2] = zenith;
         push.hosek_params[3] = 0.0f;
+        // Cook the REAL Hosek-Wilkie RGB dataset into the 9 shape
+        // coefficients A..I + radiance magnitude L_M per channel (once per
+        // frame, cheap). Delivered to the shader in hosek_cfg[] /
+        // hosek_radiance; the cheap per-view-direction shape function is
+        // evaluated GPU-side (PathTrace.slang::hosekSky). Replaces the
+        // previous fabricated coefficient tables. hosek_cfg[i].xyz = RGB of
+        // coefficient i in the reference index order. The solar elevation
+        // fed to the cook is the sun's angle ABOVE the horizon; Cook clamps
+        // below-horizon suns to 0 (the shader handles night separately).
+        {
+            const float sun_elev = 1.5707963267948966f - zenith;
+            const pt::hosek::Cooked ck =
+                pt::hosek::Cook(turbidity, ground_albedo, sun_elev);
+            for (int i = 0; i < 9; ++i) {
+                push.hosek_cfg[i][0] = static_cast<float>(ck.cfg[0][i]);
+                push.hosek_cfg[i][1] = static_cast<float>(ck.cfg[1][i]);
+                push.hosek_cfg[i][2] = static_cast<float>(ck.cfg[2][i]);
+                push.hosek_cfg[i][3] = 0.0f;
+            }
+            for (int c = 0; c < 3; ++c) {
+                push.hosek_radiance[c] = static_cast<float>(
+                    ck.rad[c] * pt::hosek::kHosekRadianceScale);
+            }
+            push.hosek_radiance[3] = 0.0f;
+        }
     }
     // --- end Wave 9 hosek-sky ---
 
@@ -9173,6 +9212,11 @@ void Engine::RenderFrame() {
     //                              multiplier; .yzw reserved). sun_extra was
     //                              full, so the daytime mirror of the
     //                              r_moon_disc_brightness disc knob overflows here.
+    //   +160 Wave 9 hosek-sky cooked coeffs — hosek_cfg[9] + hosek_radiance,
+    //                              ten vec4s carrying the 9 shape coefficients
+    //                              A..I + radiance L_M per RGB channel, cooked
+    //                              per frame from the real ArHosekSkyModel RGB
+    //                              dataset (replaces the old fabricated tables).
     static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 32 + 16
                   + 16 /* Wave 8 spectral (#27): spectral_params */
                   + 32 /* Wave 8 ocean (#25): ocean_params0 + ocean_params1 */
@@ -9183,7 +9227,8 @@ void Engine::RenderFrame() {
                   + 384 /* Wave 9 materials: mat_overrides[8 * 12] */
                   + 16 /* Wave 9 tonemap (#27 follow-up): tonemap_params */
                   + 16 /* Wave 10 bloom/bokeh: dof_bokeh_params */
-                  + 16 /* Sun disc brightness (r_sun_disc_brightness): sun_extra2 */);
+                  + 16 /* Sun disc brightness (r_sun_disc_brightness): sun_extra2 */
+                  + 160 /* Wave 9 hosek-sky cooked coeffs: hosek_cfg[9] + hosek_radiance */);
     // Raw-byte offsets the SOFTWARE tracer mirrors (SoftwareTracer.cpp:
     // kSunAndModeOffset / kAccumParamsOffset / kTonemapParamsOffset).
     // The CPU backend decodes these fields straight out of the pushed
@@ -9203,6 +9248,13 @@ void Engine::RenderFrame() {
                   "PtPush::tonemap_params moved -- update "
                   "kTonemapParamsOffset in src/rhi_software/SoftwareTracer.cpp "
                   "in lockstep");
+    // Wave 9 hosek-sky: the software backend re-cooks the Hosek dome from
+    // (turbidity, ground albedo, solar zenith) it reads out of hosek_params
+    // at this fixed offset (SoftwareTracer.cpp kHosekParamsOffset). Pin it so
+    // a mid-struct insert can't silently slide it out from under the tracer.
+    static_assert(offsetof(PtPush, hosek_params) == 1184,
+                  "PtPush::hosek_params moved -- update kHosekParamsOffset "
+                  "in src/rhi_software/SoftwareTracer.cpp in lockstep");
     // Vulkan spilled-tail budget guard. The Vulkan backend keeps the first
     // 112 B of PtPush in push constants and uploads the REMAINDER through a
     // per-frame UBO of kFrameUboSize bytes (src/rhi_vulkan/VulkanDevice.h).
@@ -9215,8 +9267,9 @@ void Engine::RenderFrame() {
     // Keep the literal in lockstep with kFrameUboSize (currently 2048); the
     // two can't share a constant without coupling the engine to the Vulkan
     // backend header, so they're mirrored with this cross-reference instead.
-    // Wave 10 bloom/bokeh adds dof_bokeh_params (+16): tail is now 1504 B,
-    // still ~544 B under the 2048 budget.
+    // Wave 10 bloom/bokeh adds dof_bokeh_params (+16): tail was 1504 B.
+    // Wave 9 hosek-sky cooked coeffs add +160 (hosek_cfg[9] + hosek_radiance):
+    // tail is now 1664 B, still ~384 B under the 2048 budget.
     static_assert(sizeof(PtPush) - 112 <= 2048,
                   "PtPush spilled tail (sizeof - 112) exceeds the Vulkan "
                   "kFrameUboSize budget (2048 B). Bump kFrameUboSize in "
@@ -15652,6 +15705,12 @@ void Engine::RegisterCommands() {
     set_slider("r_sky_day",          0.0f,    31.0f,  1.0f);
     set_slider("r_sky_lat",         -90.0f,  90.0f,  0.1f);
     set_slider("r_sky_lon",      -180.0f,  180.0f,  0.1f);
+    // Hosek-Wilkie sky (r_sky_mode = hosek). Real physical ranges: turbidity
+    // [1,10] (1 = pristine air, 10 = heavy haze; the model's valid domain);
+    // ground albedo [0,1] hemispherical reflectance. The web console omitted
+    // both, so they rendered as free-form text boxes with no discoverable range.
+    set_slider("r_sky_turbidity",     1.0f,   10.0f,  0.1f);
+    set_slider("r_sky_ground_albedo", 0.0f,    1.0f,  0.01f);
     set_slider("cam_fov",          20.0f,  120.0f,  0.5f);
     set_slider("cam_speed",         0.1f,   30.0f,  0.1f);
     set_slider("cam_sprint_mult",   1.0f,   10.0f,  0.1f);
