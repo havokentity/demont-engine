@@ -1232,15 +1232,20 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // Allocated host-side when denoiser_active_; PARTIALLY_BOUND
         // covers the host-side gate's "no denoiser, no binding" case.
         add_binding(22, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
-        // Binding 23: shadow_vis_buf. R32F per-pixel sun-NEE visibility
-        // storage buffer written by PathTrace's primary-hit pass and
-        // bilateral-filtered by SigmaShadow.slang (issue #115). Storage
+        // Binding 23: shadow_vis_buf. Packed 4-floats-per-pixel storage
+        // buffer [vis, S.rgb] -- sun-NEE visibility + unshadowed direct-sun
+        // radiance S -- written by PathTrace's primary-hit pass and
+        // bilateral-filtered by SigmaShadow.slang (issue #115, B10 demod).
+        // (SIGMA is Metal-only today; Vulkan binds the slot for descriptor-
+        // set completeness but write_shadow_vis stays 0 without the Metal
+        // SigmaShadow pipeline.) Storage
         // BUFFER (not image) because Apple Silicon's 8-RW-texture cap
-        // on PathTrace is already saturated. Allocated host-side when
-        // denoiser_active_ AND r_shadow_demod is on; the engine binds
-        // the placeholder storage buffer at this slot otherwise to keep
-        // the descriptor set complete (the shader's write_shadow_vis
-        // push gate is the runtime "actually touch this buffer" switch).
+        // on PathTrace is already saturated. Allocated host-side whenever
+        // denoiser_active_ (NOT gated on r_shadow_demod); the engine binds
+        // the placeholder storage buffer at this slot when it is absent to
+        // keep the descriptor set complete. The shader's write_shadow_vis
+        // push gate (r_shadow_demod + backend gates) is the runtime
+        // "actually touch this buffer" switch.
         add_binding(23, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
         // --- Light primitives (#73) ---
         // Binding 27: analytic light list (light_prims). Sits past

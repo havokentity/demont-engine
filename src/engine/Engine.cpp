@@ -6502,10 +6502,13 @@ void Engine::RenderFrame() {
             clouds_color_active_  = 0;
             clouds_color_alloc_w_ = fc.width;
             clouds_color_alloc_h_ = fc.height;
-            // SIGMA shadow visibility buffer (issue #115). One R32F per
-            // pixel of sun-NEE shadow-ray transmittance, written by
-            // PathTrace.slang and bilateral-filtered by SigmaShadow.slang
-            // before being multiplied into post_denoise_hdr. A storage
+            // SIGMA shadow + direct-sun G-buffer (issue #115, B10 demod).
+            // FOUR floats per pixel, packed [vis, S.r, S.g, S.b]: the
+            // sun-NEE shadow-ray visibility plus the unshadowed primary-hit
+            // direct-sun radiance S. PathTrace.slang writes it (and
+            // subtracts the shadowed sun from the denoiser input);
+            // SigmaShadow.slang bilateral-filters the visibility and
+            // re-adds `S * vis_denoised` into post_denoise_hdr. A storage
             // BUFFER (not a texture) because Metal's compute pipeline
             // caps RWTexture2D bindings at 8 per kernel and PathTrace
             // is already exactly at that limit (output, accum_hdr,
@@ -6513,12 +6516,12 @@ void Engine::RenderFrame() {
             // albedo_tex, cloud_trans_tex). A 9th RW texture would fail
             // pipeline build on Apple Silicon. Same workaround
             // DenoiseAtrous.slang uses for its variance + moments
-            // buffers. Size: width * height * sizeof(float)
-            // = ~8.3 MB at 1080p, trivial.
+            // buffers. Size: width * height * 4 * sizeof(float)
+            // = ~33 MB at 1080p, trivial vs the denoiser texture budget.
             auto svis_h = device_->CreateBuffer({
                 .size  = static_cast<std::size_t>(fc.width) *
                          static_cast<std::size_t>(fc.height) *
-                         sizeof(float),
+                         4u * sizeof(float),
                 .usage = pt::rhi::BufferUsage::Storage,
                 .debug_name = "shadow_vis",
             });
@@ -6875,10 +6878,12 @@ void Engine::RenderFrame() {
     if (denoiser_active_ && cloud_trans_tex_id_ != 0) {
         cb->BindStorageTexture(10, pt::rhi::TextureHandle{cloud_trans_tex_id_});
     }
-    // Engine buffer slot 11 -> vk::binding 23 (shadow_vis_buf). One
-    // R32F per pixel, sun-NEE shadow-ray transmittance from the path
-    // tracer's primary-hit pass. Storage BUFFER, not a texture --
-    // Apple Silicon's 8-RW-texture cap is already saturated by the
+    // Engine buffer slot 11 -> vk::binding 23 (shadow_vis_buf). FOUR
+    // floats per pixel, packed [vis, S.rgb] -- sun-NEE shadow-ray
+    // visibility plus the unshadowed primary-hit direct-sun radiance S
+    // (B10 demod) from the path tracer's primary-hit pass. Storage
+    // BUFFER, not a texture -- Apple Silicon's 8-RW-texture cap is
+    // already saturated by the
     // existing PathTrace G-buffer set (see comment at the
     // shadow_vis_buf declaration in PathTrace.slang).
     //
@@ -7920,9 +7925,23 @@ void Engine::RenderFrame() {
         if (auto* v = C.FindCVar("r_shadow_demod")) {
             shadow_demod_on = v->GetBool();
         }
+        // B10: the SIGMA demod re-adds the unshadowed sun in LINEAR HDR
+        // units (SigmaShadow.slang: hdr += S * vis_denoised). That only
+        // makes sense in the HDR pipeline, where the denoiser + SigmaShadow
+        // operate on linear HDR and the tonemap runs last. In the legacy
+        // LDR pipeline (r_hdr_pipeline 0) PathTrace pre-tonemaps the
+        // denoiser input, so adding linear S would blow out the image;
+        // gate the whole demod off there (PathTrace also guards its sun
+        // subtraction on w2j_row0.w > 0.5). r_hdr_pipeline defaults to 1,
+        // so every committed golden + interactive default is unaffected.
+        bool hdr_pipeline_on = true;
+        if (auto* v = C.FindCVar("r_hdr_pipeline")) {
+            hdr_pipeline_on = v->GetBool();
+        }
         const bool engine_shadow_demod_active =
             denoiser_active_ &&
             shadow_demod_on &&
+            hdr_pipeline_on &&
             (sky_mode_int == 2) &&
             sigma_shadow_pipeline_id_ != 0 &&
             shadow_vis_buf_id_ != 0 &&
@@ -10678,8 +10697,9 @@ void Engine::RenderFrame() {
             //                              when normal_tex_id_ != 0
             //                              AND use_normal=1 in push)
             // Buffer:
-            //   slot 3 shadow_vis_buf  -- R32F per-pixel visibility
-            //                              written by PathTrace
+            //   slot 3 shadow_vis_buf  -- packed [vis, S.rgb] x4 floats
+            //                              per pixel written by PathTrace
+            //                              (visibility + unshadowed sun S)
             //
             // When normal_tex_id_ is 0 we still need slot 2 bound to
             // SOMETHING so Metal's pipeline-validation doesn't trip

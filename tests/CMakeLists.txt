@@ -1331,6 +1331,28 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     pt_add_golden_cell(SCENE dof_bokeh_blades BACKEND metal DENOISER off
         MAX_DELTA 48 MEAN_DELTA 6 FAIL_PERCENT 4)
     # --- end Wave 10 polygonal bokeh --------------------------------------
+
+    # --- SIGMA sun-shadow demod (issue #115, B10) -------------------------
+    # A procedural-sun shadow across a Lambert ground with a POINT LIGHT
+    # sitting inside the sun umbra. This is the cell the demod bug shipped
+    # without: before B10, SigmaShadow.slang composited `hdr *= vis`,
+    # multiplying the WHOLE post-denoise HDR -- point light + indirect GI
+    # included -- by the sun visibility, so the shadow interior rendered
+    # pure black. The fix demodulates only the direct sun (PathTrace
+    # subtracts it from the denoiser input; SigmaShadow re-adds S *
+    # vis_denoised), so the umbra keeps its point-light pool + indirect
+    # fill while the sun-shadow edge stays crisp.
+    #
+    # Metal + svgf_atrous only: SIGMA is Metal-only and the demod path
+    # only runs with a denoiser active (r_shadow_demod gate). The cell is
+    # a sensitive regression guard -- reverting to the whole-image multiply
+    # blacks out the entire umbra (the ~40% of the frame in shadow),
+    # far past these thresholds. Deterministic (no meshes -> no TLAS build
+    # entropy); default-ish tolerances with a little headroom for Apple
+    # GPU FP-order variance.
+    pt_add_golden_cell(SCENE shadow_umbra_point BACKEND metal DENOISER svgf_atrous
+        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+    # --- end SIGMA sun-shadow demod ---------------------------------------
 else()
     message(STATUS
         "tests: golden-image matrix skipped -- pt_render_one_frame and/or "
