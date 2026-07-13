@@ -289,38 +289,35 @@ void MetalCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     constexpr std::size_t kNumTexSlots = sizeof(bound_tex_) / sizeof(bound_tex_[0]);
     constexpr std::size_t kNumBufSlots = sizeof(bound_buf_) / sizeof(bound_buf_[0]);
 
-    // Storage textures -> one setTextures:withRange:.
-    {
+    // Storage textures -> one setTextures:withRange:. The flush spans the
+    // whole table, not just up to the highest staged slot: a slot the kernel
+    // declares (tex_mask) but this dispatch leaves unstaged (or whose handle
+    // fails to resolve) is left nullptr and explicitly cleared here, so it
+    // can never read a stale texture bound by an earlier dispatch on this
+    // encoder. Skipped only when the kernel declares no texture at all --
+    // then no slot is ever read, so a stale binding is unobservable.
+    if (mp->tex_mask != 0) {
         const MTL::Texture* tex_table[kNumTexSlots] = {};
-        std::int32_t        max_tex_slot            = -1;
         for (std::uint32_t i = 0; i < kNumTexSlots; ++i) {
             if (!bound_tex_[i]) continue;
             if (i >= 32 || !(mp->tex_mask & (1u << i))) continue;
             auto* tex = device_->LookupTexture(bound_tex_[i]);
-            if (tex != nullptr) {
-                tex_table[i] = tex;
-                max_tex_slot = static_cast<std::int32_t>(i);
-            }
+            if (tex != nullptr) tex_table[i] = tex;
         }
-        if (max_tex_slot >= 0) {
-            encoder_->setTextures(
-                tex_table,
-                NS::Range::Make(0, static_cast<NS::UInteger>(max_tex_slot + 1)));
-        }
+        encoder_->setTextures(tex_table, NS::Range::Make(0, kNumTexSlots));
     }
 
-    // Storage buffers -> one setBuffers:offsets:withRange:.
-    {
+    // Storage buffers -> one setBuffers:offsets:withRange:. Same whole-table
+    // flush as the textures above, so a declared-but-unstaged SSBO slot is
+    // nil'd rather than left holding a stale buffer. The AS/push indices sit
+    // in this same buffer() namespace but are owned by the separate binds
+    // below (issued after this flush), so a buffer staged onto one of them is
+    // refused (left nullptr) with a loud warning -- never a silent clobber.
+    if (mp->ssbo_buf_mask != 0) {
         const MTL::Buffer* buf_table[kNumBufSlots]   = {};
         NS::UInteger       buf_offsets[kNumBufSlots] = {};
-        std::int32_t       max_buf_slot              = -1;
         for (std::uint32_t i = 0; i < kNumBufSlots; ++i) {
             if (!bound_buf_[i]) continue;
-            // A buffer bind must never land on the index the kernel uses for
-            // its acceleration structure or push block: that is exactly the
-            // silent clobber the parsed-layout change eliminates. If the
-            // engine ever binds an SSBO there, refuse it loudly (leave the
-            // table slot nullptr) instead of overwriting the AS/push.
             if (static_cast<std::int32_t>(i) == mp->accel_buf_index ||
                 static_cast<std::int32_t>(i) == mp->push_buf_index) {
                 LOG_WARN("Metal Dispatch: buffer bound at slot {} collides with "
@@ -334,14 +331,10 @@ void MetalCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
             if (buf != nullptr) {
                 buf_table[i]   = buf;
                 buf_offsets[i] = static_cast<NS::UInteger>(bound_buf_off_[i]);
-                max_buf_slot   = static_cast<std::int32_t>(i);
             }
         }
-        if (max_buf_slot >= 0) {
-            encoder_->setBuffers(
-                buf_table, buf_offsets,
-                NS::Range::Make(0, static_cast<NS::UInteger>(max_buf_slot + 1)));
-        }
+        encoder_->setBuffers(buf_table, buf_offsets,
+                             NS::Range::Make(0, kNumBufSlots));
     }
     // The acceleration structure and the push-constant block share the
     // buffer() namespace with the SSBOs but are bound separately, at the
