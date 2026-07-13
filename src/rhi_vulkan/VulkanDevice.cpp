@@ -1240,11 +1240,12 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // set completeness but write_shadow_vis stays 0 without the Metal
         // SigmaShadow pipeline.) Storage
         // BUFFER (not image) because Apple Silicon's 8-RW-texture cap
-        // on PathTrace is already saturated. Allocated host-side when
-        // denoiser_active_ AND r_shadow_demod is on; the engine binds
-        // the placeholder storage buffer at this slot otherwise to keep
-        // the descriptor set complete (the shader's write_shadow_vis
-        // push gate is the runtime "actually touch this buffer" switch).
+        // on PathTrace is already saturated. Allocated host-side whenever
+        // denoiser_active_ (NOT gated on r_shadow_demod); the engine binds
+        // the placeholder storage buffer at this slot when it is absent to
+        // keep the descriptor set complete. The shader's write_shadow_vis
+        // push gate (r_shadow_demod + backend gates) is the runtime
+        // "actually touch this buffer" switch.
         add_binding(23, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
         // --- Light primitives (#73) ---
         // Binding 27: analytic light list (light_prims). Sits past

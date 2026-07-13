@@ -1366,8 +1366,12 @@ private:
     // unoccluded, 0.0 = fully shadowed; sky pixels write vis=1.0, S=0 so
     // the SigmaShadow pass never darkens the sky composite. Allocated
     // alongside the rest of the denoiser-related resources whenever
-    // denoiser_active_ AND r_shadow_demod is on (same lifecycle as
-    // depth_tex / motion_tex / cloud_trans_tex). Sized
+    // denoiser_active_ (same lifecycle as depth_tex / motion_tex /
+    // cloud_trans_tex) -- NOT gated on r_shadow_demod. The runtime
+    // push flag write_shadow_vis (denoiser_active_ && r_shadow_demod &&
+    // procedural sun && HDR pipeline && Metal SIGMA pipeline built) is
+    // what actually gates the PathTrace writes + the SigmaShadow dispatch;
+    // when it is 0 the buffer is bound but never touched. Sized
     // width * height * 4 * sizeof(float) -> ~33 MB at 1080p, trivial vs
     // the rest of the denoiser texture budget.
     std::uint64_t                               shadow_vis_buf_id_ = 0;
