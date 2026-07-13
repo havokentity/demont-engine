@@ -15,6 +15,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -909,6 +910,13 @@ private:
     std::deque<SceneSnapshot>                   scene_redo_stack_;
     bool                                        in_scene_undo_redo_     = false;
     static constexpr std::size_t                kMaxSceneUndoHistory    = 50;
+    // Cadence coalescing for PushSceneSnapshot: web/script panels scrub
+    // by firing setter commands over the console (~20 Hz) with no
+    // engine-side drag state, so IsDragging() can't collapse them. A
+    // burst of pushes spaced tighter than a human makes discrete edits
+    // folds into its first (pre-burst) snapshot. See PushSceneSnapshot.
+    std::chrono::steady_clock::time_point       last_scene_snapshot_tp_{};
+    static constexpr double                     kSceneSnapshotCoalesceSeconds = 0.15;
     SceneSnapshot CaptureSceneSnapshot() const;
     void          ApplySceneSnapshot(const SceneSnapshot& s);
 

@@ -39,6 +39,7 @@ ParticleSystem::ParticleSystem()
     // fully initialised before the thread can observe it. The worker
     // immediately parks on tick_cv_ until the first TickAsync call.
     worker_ = std::thread(&ParticleSystem::WorkerLoop, this);
+    worker_id_ = worker_.get_id();
 }
 
 ParticleSystem::~ParticleSystem() {
@@ -195,11 +196,13 @@ void ParticleSystem::UpdateLocked(float dt) {
 std::uint32_t ParticleSystem::EmitBurst(const EmitSpec& spec) {
     // EmitBurst is re-entered from UpdateLocked (the continuous-emitter
     // pump calls it inline). We can't WaitForTick() in that case because
-    // we ARE the tick. The atomic flag tells us which call-site we're on:
-    // when set, the worker is mid-tick and our caller is UpdateLocked;
-    // when clear, we're being called from the main thread (console
-    // command) and must wait so we don't race the worker.
-    if (!tick_in_flight_.load(std::memory_order_acquire)) WaitForTick();
+    // we ARE the tick. Disambiguate by THREAD IDENTITY, not the flag:
+    // tick_in_flight_ is set true by TickAsync before the worker even
+    // wakes and stays true for the whole tick, so a main-thread console
+    // EmitBurst landing in that window would (wrongly) skip the wait and
+    // mutate particles_ concurrently with the worker. The worker's id is
+    // the only reliable signal that we are the re-entrant caller.
+    if (std::this_thread::get_id() != worker_id_) WaitForTick();
     if (spec.count == 0) return 0;
     const std::uint32_t cap    = max_particles_;
     const std::uint32_t live   = static_cast<std::uint32_t>(particles_.size());

@@ -67,6 +67,10 @@ export function NumberField({
   const snapshotRef = useRef<number>(value);
   const valueRef = useRef<number>(value);
   const editingRef = useRef<boolean>(false);
+  // Set true by Escape immediately before blur() so the synchronous
+  // onBlur it triggers cancels the edit instead of committing the
+  // still-typed DOM value (the setText restore hasn't flushed yet).
+  const cancellingRef = useRef<boolean>(false);
   const lastScrubTsRef = useRef<number>(0);
 
   const [text, setText] = useState<string>(() => formatNumber(value, precision));
@@ -112,6 +116,10 @@ export function NumberField({
     (e: FocusEvent<HTMLInputElement>) => {
       editingRef.current = false;
       setFocused(false);
+      if (cancellingRef.current) {
+        cancellingRef.current = false;
+        return;
+      }
       commit(e.target.value);
     },
     [commit],
@@ -136,6 +144,7 @@ export function NumberField({
       if (e.key === 'Escape') {
         e.preventDefault();
         editingRef.current = false;
+        cancellingRef.current = true;
         setText(formatNumber(snapshotRef.current, precision));
         e.currentTarget.blur();
         return;
