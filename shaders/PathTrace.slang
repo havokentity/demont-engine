@@ -4682,7 +4682,7 @@ float cloud_optical_depth(float3 ro, float3 rd, float t_max) {
     // far more than the cloud field's coherence length. 20km is plenty
     // to capture the shadow of any reasonable cloud bank in front of
     // the sun, and limits the sample budget.
-    if (t_out - t_in > 20000.0) t_in = t_out - 20000.0;
+    if (t_out - t_in > 20000.0) t_out = t_in + 20000.0;  // keep the NEAR window (t_in is the entry nearest the ray origin)
     if (t_out <= t_in) return 0.0;
     // 4 coarse samples + 3 fbm octaves for the shadow ray. Beer-Lambert
     // exp(-OD) only needs a rough density estimate to look right.
@@ -4769,7 +4769,7 @@ float cloud_optical_depth_stratified(float3 ro, float3 rd, float t_max,
         return 0.0;
     }
     t_out = min(t_out, t_max);
-    if (t_out - t_in > 20000.0) t_in = t_out - 20000.0;
+    if (t_out - t_in > 20000.0) t_out = t_in + 20000.0;  // keep the NEAR window (t_in is the entry nearest the ray origin)
     if (t_out <= t_in) return 0.0;
     const int Ns = 12;
     float dt = (t_out - t_in) / float(Ns);
@@ -6163,6 +6163,19 @@ void main(uint2 tid : SV_DispatchThreadID) {
         }
         // --- end Wave 9 subsurface scattering -----------------------------
 
+        // ReSTIR: every primary-hit pixel must (re)write its reservoir slot
+        // each frame. PathTrace only builds a reservoir inside the
+        // MAT_LAMBERT branch below, so a non-Lambert primary hit (metal /
+        // dielectric / water) would leave this pixel's slot holding a prior
+        // frame's reservoir from the ping-pong buffer -- which RestirFinal
+        // then shades as phantom diffuse light on the chrome/glass surface.
+        // Stamp an empty reservoir here first; the MAT_LAMBERT branch
+        // overwrites it with the real one when it builds it.
+        if ((restir_enabled != 0u) && (b == 0u) && h.mat != MAT_LAMBERT) {
+            uint pixel_idx = tid.y * dim.x + tid.x;
+            storeReservoir(reservoir_curr_buf, pixel_idx, initReservoir());
+        }
+
         if (h.mat == MAT_LAMBERT) {
             // --- Analytic light primitives NEE (#73 / ReSTIR #78) -------
             // Direct-lighting from the engine's analytic light list:
@@ -6810,7 +6823,12 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                float3(1.55, 0.40, 0.12), warmth)
                         * (80.0 * t_atm);
             }
-            float cos_theta = dot(primary_rd, -sun_dir);
+            // HG in-scatter cosine: incident light propagates as -sun_dir
+            // (sun_dir points toward the sun), outgoing toward camera is
+            // -primary_rd, so cos = dot(-sun_dir,-primary_rd) =
+            // dot(primary_rd, sun_dir). Peaks the forward haze glow toward
+            // the sun (dot(...,-sun_dir) had it on the anti-solar side).
+            float cos_theta = dot(primary_rd, sun_dir);
             float g2 = g * g;
             float phase = (1.0 - g2)
                         / (4.0 * 3.14159265358979
@@ -6989,6 +7007,15 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 if (clouds_p1.w <= 0.0) {
                     base_y = 0.0;
                     top_y  = 2000.0;
+                } else if (smoke_active) {
+                    // Clouds ON but smoke is also active: the cloud band
+                    // (base_y..top_y, ~250-800 m) doesn't cover ground-level
+                    // chimney / campfire smoke (y in [0,50]). Without
+                    // extending the slab down to the ground the plume is
+                    // never sampled -- invisible and shadowless -- whenever
+                    // the cloud layer happens to be enabled. Keep the cloud
+                    // top; just lower the floor so the march spans both.
+                    base_y = min(base_y, 0.0);
                 }
                 float ry = primary_rd.y;
                 float t_in, t_out;
@@ -7009,7 +7036,13 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 // than cloud features and looks worse than just
                 // marching the closer 30km. Beyond 30km the sky
                 // gradient takes over visually.
-                if (t_out - t_in > 30000.0) t_in = t_out - 30000.0;
+                // Keep the NEAR 30 km window [t_in, t_in+30km], not the far
+                // one: t_in is the slab entry nearest the ray origin, so a
+                // plume/cloud a few tens of metres ahead must stay inside
+                // the marched span. The old t_in = t_out - 30000 kept the
+                // farthest 30 km and silently dropped the near field (its
+                // own comment says it marches "the closer 30km").
+                if (t_out - t_in > 30000.0) t_out = t_in + 30000.0;
                 if (t_out > t_in) {
                     // Wave-6: when smoke is active (especially smoke-only
                     // scenes where the cloud field is off), the per-pixel
@@ -7223,7 +7256,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                             if (hdri_lights_count > 0u) {
                                 HdriLightSample hl = sampleHdriLight(seed);
                                 if (hl.pdf > 0.0) {
-                                    float c_t_h = dot(primary_rd, -hl.dir);
+                                    float c_t_h = dot(primary_rd, hl.dir);
                                     float t_s_cloud = exp(-cloud_optical_depth_stratified(
                                                             sp, hl.dir, 1e30, seed));
                                     float3 t_s_atm = atmosphericTransmittance(
@@ -7266,7 +7299,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                 float2 xi_e = float2(randf(seed), randf(seed));
                                 EnvSample env = sampleEnvMap(xi_e);
                                 if (env.pdf > 0.0) {
-                                    float c_t_e = dot(primary_rd, -env.dir);
+                                    float c_t_e = dot(primary_rd, env.dir);
                                     float t_e_cloud = exp(-cloud_optical_depth_stratified(
                                                             sp, env.dir, 1e30, seed));
                                     float3 t_e_atm = atmosphericTransmittance(
@@ -7299,7 +7332,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                 float boost   = exp(0.30 * sun_am * h_norm);
                                 float3 sun_at = sun_rad * boost;
                                 float3 sun_jit = sampleSunDisc(sun_dir, seed);
-                                float c_t_sun = dot(primary_rd, -sun_jit);
+                                float c_t_sun = dot(primary_rd, sun_jit);
                                 // Cloud + atmospheric leg for the shadow.
                                 // Skips the BVH walk: by construction
                                 // the only occluder along this leg is
@@ -7361,7 +7394,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                                             sp, moon_jit, 60000.0);
                                     float3 trans_moon = t_m_atm * float3(t_m_cloud);
                                     if (any(trans_moon > float3(0.0))) {
-                                        float c_t_m = dot(primary_rd, -moon_dir_phase.xyz);
+                                        float c_t_m = dot(primary_rd, moon_dir_phase.xyz);
                                         float phase_m = (1.0 - g_cloud2)
                                             / (4.0 * 3.14159265358979
                                                 * pow(max(1.0 + g_cloud2
@@ -7461,7 +7494,16 @@ void main(uint2 tid : SV_DispatchThreadID) {
     // the good ones for that pixel.
     {
         bool3 bad = isnan(frame_radiance) || isinf(frame_radiance);
-        frame_radiance = select(bad, float3(0.0), max(frame_radiance, float3(0.0)));
+        // Kill NaN/Inf always (they poison the running mean forever). But do
+        // NOT clamp negative channels in spectral mode: the hero-wavelength
+        // sRGB weights are legitimately negative for out-of-gamut
+        // monochromatic light, and those signed lobes must survive into the
+        // temporal mean so they cancel there. Zeroing them per frame biases
+        // the estimator warm/bright (~+40% red). Negatives are clamped only
+        // at display (hdr_src below), leaving the accumulator unbiased.
+        bool spectral_on = (spectral_params.x > 0.5);
+        float3 clean = spectral_on ? frame_radiance : max(frame_radiance, float3(0.0));
+        frame_radiance = select(bad, float3(0.0), clean);
     }
     // (No frame_stars sanitisation -- accum_stars was retired with the
     // EMA-based star_split architecture. Stars+sun+moon are now
@@ -7552,7 +7594,12 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // (see shaders/StarsComposite.slang). With the gate off,
         // frame_radiance carries the full sky exactly as the legacy
         // path did.
-        float3 hdr_src = (denoiser_enabled != 0u) ? frame_radiance : avg;
+        // Clamp negatives here, post-reconstruction: spectral mode lets
+        // signed CMF lobes into the accumulator (see the sanitiser above),
+        // so guard the tonemapper / denoiser / HDR aux from ever seeing
+        // negative colour. No-op for non-spectral (already >= 0).
+        float3 hdr_src = max((denoiser_enabled != 0u) ? frame_radiance : avg,
+                             float3(0.0));
         if (w2j_row0.w > 0.5) {
             denoise_color[tid] = float4(hdr_src, 1.0);
         } else {

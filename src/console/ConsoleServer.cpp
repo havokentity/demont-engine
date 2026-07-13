@@ -184,6 +184,16 @@ bool ConsoleServer::Start(const Config& cfg, Console* console) {
         "decode_url",           "no",
         "enable_keep_alive",    "yes",
         "websocket_timeout_ms", "3600000",
+        // Bound blocking socket writes (mg_websocket_write -> push_all
+        // loops up to REQUEST_TIMEOUT). Left at the 30s default, a single
+        // backgrounded/throttled browser tab that stops draining its
+        // socket freezes the whole engine for 30s, because BroadcastEvent
+        // writes to every client while holding ws_mutex_ on the main
+        // thread. On loopback a healthy client drains in microseconds, so
+        // 2s is an ample ceiling; a client that blows it is genuinely
+        // wedged and dropping the frame is correct. WS *reads* keep the
+        // long websocket_timeout_ms above, so idle sockets aren't closed.
+        "request_timeout_ms",   "2000",
         nullptr,
     };
 
@@ -662,20 +672,33 @@ void ConsoleServer::HandleWsMessage(mg_connection* conn, std::string_view payloa
 
     // --- Editor backend (agent-19): list_scene + select dispatch ----------
     if (type == "list_scene") {
-        // Editor scene-graph snapshot. The hook returns the full JSON
-        // body so the server doesn't need to depend on pt_editor /
-        // pt_engine -- only the engine knows how to populate it. When
-        // the hook isn't installed we reply with an empty scene so the
-        // client gets a deterministic shape rather than a parse error.
-        json scene_obj;
-        if (scene_dump_handler_) {
-            const std::string body = scene_dump_handler_();
-            scene_obj = json::parse(body, nullptr, /*allow_exceptions=*/false);
-            if (scene_obj.is_discarded()) scene_obj = json::object();
-        } else {
-            scene_obj = json::object();
-        }
-        reply(json{{"ok", true}, {"scene", scene_obj}});
+        // Editor scene-graph snapshot. The hook (installed at
+        // Engine::Init) runs pt::editor::SerializeScene, which iterates
+        // the engine's live std::maps (primitives_/light_prims_/
+        // sdf_prims_) and the physics rigid-body pool. The MAIN thread
+        // mutates those same containers in Console::Drain() (scene_load,
+        // prim_remove/prim_duplicate, phys_drop, ...), so building the
+        // snapshot on this civetweb worker thread is a data race /
+        // use-after-free. Marshal it to the main thread exactly like
+        // get_cvar / list_cvars, and send the reply under ws_mutex_ with
+        // a liveness check (the connection may close before the task
+        // runs). When the hook isn't installed we reply with an empty
+        // scene so the client gets a deterministic shape.
+        Console::Get().QueueTask([conn, id, this]() {
+            json scene_obj;
+            if (scene_dump_handler_) {
+                const std::string body = scene_dump_handler_();
+                scene_obj = json::parse(body, nullptr, /*allow_exceptions=*/false);
+                if (scene_obj.is_discarded()) scene_obj = json::object();
+            } else {
+                scene_obj = json::object();
+            }
+            json body{{"ok", true}, {"scene", scene_obj}};
+            body["type"] = "result";
+            if (!id.empty()) body["id"] = id;
+            std::lock_guard lock(this->ws_mutex_);
+            if (this->ws_clients_.contains(conn)) SendWs(conn, body.dump());
+        });
         return;
     }
     if (type == "select") {

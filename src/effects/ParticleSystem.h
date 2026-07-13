@@ -282,6 +282,12 @@ private:
     float                           pending_dt_      = 0.0f;   // guarded by tick_mtx_
     bool                            shutdown_        = false;  // guarded by tick_mtx_
     std::thread                     worker_;
+    // Identity of worker_, cached once at spawn. EmitBurst uses it to
+    // tell a re-entrant worker-thread call (from UpdateLocked, must not
+    // wait) from a main-thread console call (must WaitForTick). Set
+    // before any tick can run, then only read -- no synchronisation
+    // needed. See EmitBurst.
+    std::thread::id                 worker_id_{};
 };
 
 }  // namespace pt::effects

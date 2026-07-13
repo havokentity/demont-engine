@@ -12200,6 +12200,25 @@ void Engine::PushSceneSnapshot() {
     // flips true -- so a post-drag scene_undo jumps cleanly back to
     // the pre-drag pose.
     if (editor_gizmo_.IsDragging()) return;
+    // Cadence coalescing for the OTHER drag source: the React inspector /
+    // lights / material panels scrub by firing setter commands over the
+    // WebSocket (~20 Hz, kScrubThrottleMs=50) that land here as ordinary
+    // console mutations with no engine-side drag state, so IsDragging()
+    // above never catches them and each one would push a snapshot --
+    // flooding and evicting the 50-entry history exactly like the native
+    // drag used to. Fold a tight burst into its first (pre-burst)
+    // snapshot: skip when the previous push was closer than a human makes
+    // distinct edits. The window sits above the 50 ms scrub throttle but
+    // far below deliberate edit spacing, so discrete edits keep their own
+    // undo entries. Only affects granularity, never correctness; this
+    // path is console-thread only and has no bearing on render goldens.
+    const auto now = std::chrono::steady_clock::now();
+    const double since_last =
+        std::chrono::duration<double>(now - last_scene_snapshot_tp_).count();
+    last_scene_snapshot_tp_ = now;
+    if (since_last < kSceneSnapshotCoalesceSeconds && !scene_undo_stack_.empty()) {
+        return;
+    }
     scene_undo_stack_.push_back(CaptureSceneSnapshot());
     if (scene_undo_stack_.size() > kMaxSceneUndoHistory) {
         scene_undo_stack_.pop_front();

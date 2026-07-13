@@ -241,10 +241,20 @@ void CombineCones(const float axis_a[3], float cos_half_a,
         const float inv = 1.0f / perp_len;
         perp[0] *= inv; perp[1] *= inv; perp[2] *= inv;
     } else {
-        // Axes collinear -- rotation direction undefined; use as-is.
+        // axis_b has no component perpendicular to axis_a, so the
+        // rotation direction is undefined. Two sub-cases:
+        //  - axes point the SAME way (dot_ab > 0): the union cone is
+        //    just axis_a with the half-angle already stored above.
+        //  - axes are ANTIPODAL (dot_ab < 0, e.g. a back-to-back spot
+        //    pair): no sub-pi cone around either axis can bound both
+        //    children. Keeping cos(theta_c) (~0) here would exclude
+        //    child B's emitters and zero that subtree's orientation
+        //    weight during light sampling, so fall back to the fully
+        //    spherical sentinel instead.
         out_axis[0] = axis_a[0];
         out_axis[1] = axis_a[1];
         out_axis[2] = axis_a[2];
+        if (dot_ab < 0.0f) out_cos_half = -1.0f;
         return;
     }
     out_axis[0] = cos_r * axis_a[0] + sin_r * perp[0];

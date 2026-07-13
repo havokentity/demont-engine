@@ -442,11 +442,18 @@ void main(uint3 tid : SV_DispatchThreadID) {
                    * vol_dscale;
         if (dens > 0.0) {
             // Light-march toward sun (and moon if active).
-            float c_sun = dot(rd, -sun_dir);
+            // HG scattering cosine is between the incident light
+            // propagation (-sun_dir, since sun_dir points TOWARD the sun)
+            // and the outgoing propagation toward the camera (-rd):
+            // dot(-sun_dir, -rd) = dot(rd, sun_dir). hgPhase peaks at +1
+            // for g>0, so this puts the forward "silver lining" lobe on
+            // the sunward side (looking toward the sun through cloud),
+            // which dot(rd, -sun_dir) had inverted to the anti-solar side.
+            float c_sun = dot(rd, sun_dir);
             float T_sun = (sun_dir.y > 0.0)
                 ? lightMarch(sp, sun_dir, clouds_p1, clouds_p2, clouds_p3, clouds_p4, vol_dscale, light_steps)
                 : 0.0;
-            float c_moon = dot(rd, -moon_dir);
+            float c_moon = dot(rd, moon_dir);
             float T_moon = (moon_dir_phase.y > 0.0)
                 ? lightMarch(sp, moon_dir, clouds_p1, clouds_p2, clouds_p3, clouds_p4, vol_dscale, light_steps)
                 : 0.0;

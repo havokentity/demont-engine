@@ -85,6 +85,11 @@ float3 reconstructHit(uint2 tid, float z) {
     float2 uv  = (float2(tid) + 0.5) / dim;
     float2 uv0 = uv * 2.0 - 1.0;
     uv0.x *= fwd_aspect.w;
+    // Match PathTrace's G-buffer primary ray, which flips NDC y
+    // (uv0.y = -uv0.y) before building rd. Without this the reconstructed
+    // hit is mirrored vertically about the view axis, so temporal/spatial
+    // reuse evaluates the survivor's target pdf at the wrong world point.
+    uv0.y = -uv0.y;
     float3 rd = normalize(fwd_aspect.xyz
                           + right_xyz.xyz * (uv0.x * pos_fovtan.w)
                           + up_xyz.xyz    * (uv0.y * pos_fovtan.w));
