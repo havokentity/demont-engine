@@ -1352,19 +1352,23 @@ private:
     std::uint64_t                               cloud_trans_tex_id_ = 0;
     // SIGMA shadow visibility G-buffer (issue #115). One-float-per-pixel
     // storage buffer (NOT a texture: Apple Silicon's 8-RW-texture cap
-    // on PathTrace is already saturated). PathTrace.slang writes the
-    // per-primary-hit sun-NEE shadow-ray transmittance into this buffer
-    // at the end of main(); the engine's SigmaShadow.slang dispatch
-    // (between Denoise() and StarsComposite) does a 5x5 bilateral
-    // filter of that visibility signal and multiplies the denoised
-    // visibility into the post-radiance-denoise HDR, restoring sharp
-    // sun-shadow boundaries that SVGF / MetalFX otherwise smudge across.
-    // 1.0 = unoccluded; 0.0 = fully shadowed; sky pixels write 1.0 so
+    // on PathTrace is already saturated). PathTrace.slang writes a packed
+    // 4-floats-per-pixel record [vis, S.rgb] at the end of main(): the
+    // per-primary-hit sun-NEE shadow-ray visibility plus the UNSHADOWED
+    // direct-sun radiance S (B10 demod). PathTrace also subtracts the
+    // shadowed sun from the denoiser input; the engine's SigmaShadow.slang
+    // dispatch (between Denoise() and StarsComposite) does a 5x5 bilateral
+    // filter of the visibility channel and RE-ADDS `S * vis_denoised` into
+    // the post-radiance-denoise HDR, restoring sharp sun-shadow boundaries
+    // that SVGF / MetalFX otherwise smudge across -- WITHOUT darkening the
+    // point/area lights or GI that also occupy the umbra (the old
+    // whole-image `hdr *= vis` multiply blacked those out). vis: 1.0 =
+    // unoccluded, 0.0 = fully shadowed; sky pixels write vis=1.0, S=0 so
     // the SigmaShadow pass never darkens the sky composite. Allocated
     // alongside the rest of the denoiser-related resources whenever
     // denoiser_active_ AND r_shadow_demod is on (same lifecycle as
     // depth_tex / motion_tex / cloud_trans_tex). Sized
-    // width * height * sizeof(float) -> ~8.3 MB at 1080p, trivial vs
+    // width * height * 4 * sizeof(float) -> ~33 MB at 1080p, trivial vs
     // the rest of the denoiser texture budget.
     std::uint64_t                               shadow_vis_buf_id_ = 0;
     // SigmaShadow compute pipeline (issue #115). Built once at backend

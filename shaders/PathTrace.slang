@@ -384,11 +384,20 @@ static const uint kPbrNoTexTile  = 0xFFFFFFFFu;
 [[vk::binding(21, 0)]] StructuredBuffer<float4> sdf_clusters;
 // --- end SDF Phase 1 -------------------------------------------------------
 
-// Sun-NEE shadow-ray visibility G-buffer (issue #115). One float per
-// pixel, row-major (index = y*width + x). 1.0 = primary hit was fully
-// lit by the sun; 0.0 = fully in shadow; partial values from the spp
-// average. Sky pixels (no primary hit) write 1.0 so the downstream
-// SigmaShadow kernel never darkens the sky composite.
+// Sun-NEE shadow + direct-sun G-buffer (issue #115, B10 demod). FOUR
+// floats per pixel, row-major with a stride of 4 (base = 4*(y*width+x)):
+//   [+0] sun visibility -- 1.0 = primary hit fully lit; 0.0 = fully in
+//        shadow; partial from the spp average. Sky pixels (no primary
+//        hit) write 1.0 so SigmaShadow never darkens the sky composite.
+//   [+1..3] S.rgb -- the UNSHADOWED primary-hit direct-sun radiance
+//        (throughput * sun_rad * brdf * n_dot_l, aerial-perspective and
+//        spectral weighted to match the sun term inside frame_radiance).
+//        SigmaShadow re-modulates ONLY this term post-denoise
+//        (hdr += S * vis_denoised) after PathTrace subtracted the
+//        shadowed sun from the denoiser input -- so the sun shadow stays
+//        crisp while lights / GI in the umbra are untouched.
+// Non-Lambert primary hits, sky pixels, and sun-below-horizon samples
+// leave S = 0, so the re-modulation is a no-op there.
 //
 // Storage buffer (NOT texture) is deliberate. Metal's compute pipeline
 // caps RWTexture2D bindings at 8 read_write textures per kernel.
@@ -5549,6 +5558,19 @@ void main(uint2 tid : SV_DispatchThreadID) {
     // proportional GPU cost; spp=1 is the classic 1-spp interactive mode.
     uint sample_count = (spp == 0u) ? 1u : spp;
     float3 frame_radiance = float3(0.0);
+    // SIGMA sun-shadow demodulation accumulators (issue #115, B10 fix).
+    // Only touched when write_shadow_vis != 0 (Metal SIGMA path, procedural
+    // sun). frame_sun_direct is the UNSHADOWED primary-hit direct-sun
+    // radiance S; it is packed into shadow_vis_buf and re-modulated
+    // post-denoise by SigmaShadow.slang (hdr += S * vis_denoised).
+    // frame_sun_shadowed is the SHADOWED direct-sun contribution actually
+    // folded into frame_radiance at the primary hit; it is SUBTRACTED from
+    // the denoiser input so SVGF never sees -- and so never spatially
+    // bleeds -- the hard sun-shadow edge. frame_radiance itself (and thus
+    // accum_hdr / auto-exposure / the denoiser-off display path) is left
+    // bit-identical to the pre-fix code. See the demodulation write below.
+    float3 frame_sun_direct   = float3(0.0);
+    float3 frame_sun_shadowed = float3(0.0);
     // Celestials composite gate (issue #46). When set, the b==0
     // primary-miss code below subtracts starsOnly + sunDisc + moonDisc
     // from the sky term so denoise_color reaches the denoiser without
@@ -5709,6 +5731,15 @@ void main(uint2 tid : SV_DispatchThreadID) {
 
         float3 throughput = float3(1.0);
         float3 radiance   = float3(0.0);
+        // SIGMA demod per-sample captures (issue #115, B10). Populated at
+        // the primary hit (b==0) inside the Lambert sun-NEE block, then
+        // carried through the same multiplicative post-loop scalings
+        // `radiance` gets (trans_atm_surf, trans_eye_c) so they stay
+        // consistent with the sun term inside `radiance`. Zero for
+        // non-Lambert primary hits, sky pixels, sun below horizon, and
+        // whenever write_shadow_vis == 0.
+        float3 sample_sun_direct   = float3(0.0);   // unshadowed sun S
+        float3 sample_sun_shadowed = float3(0.0);   // shadowed sun in radiance
         // After a Lambert bounce we did NEE for direct env-map lighting,
         // so the next BRDF-bounce ray's miss contribution is already
         // counted -- skip on miss to avoid double counting. With MIS
@@ -6418,36 +6449,66 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         ? transmittance(hit_pt + nf * 1e-3, sun_jit, 1e30,
                                         shutter_t01, in_water)
                         : float3(0.0);
+                    // Atmospheric attenuation: optical depth times
+                    // air mass. Air mass = 1/sin(elev) (thin-slab
+                    // approximation, accurate down to ~5 deg). The
+                    // exp(-tau*am) curve matches real sunset
+                    // behaviour: brightness drops off a cliff once
+                    // elev < 5 deg, but stays bright through midday.
+                    //
+                    // HOISTED out of the any(trans>0) visibility gate for
+                    // the B10 SIGMA-demod capture below: sun_rad depends
+                    // only on sun elevation (not on the shadow ray), so
+                    // computing it for a fully-shadowed pixel is a few
+                    // wasted ALU ops, never a different radiance value.
+                    // Every expression here is byte-identical to the
+                    // pre-fix code; only the scope changed, so the
+                    // `radiance +=` below is bit-for-bit unchanged.
+                    float am  = 1.0 / max(sun_elev, 0.04);
+                    float tau = 0.30;             // tunable haze
+                    float trans_atm = exp(-tau * am);
+                    // Wavelength-dependent attenuation: blue
+                    // scatters more, so colour reddens with air
+                    // mass. Wavelength weights mimic Rayleigh
+                    // (~1/lambda^4) without doing a full spectral
+                    // walk -- enough to read as "warm at sunset".
+                    float warmth = saturate((am - 1.0) * 0.18);
+                    float3 sun_col = lerp(float3(1.00, 0.97, 0.92),
+                                          float3(1.55, 0.55, 0.20),
+                                          warmth);
+                    // I0 in tonemap-relative units. 80 is tuned so
+                    // a noon sun on a Lambert white wall reads
+                    // ~1.0 after exposure*ACES at typical exposure.
+                    float strength = 80.0 * trans_atm;
+                    float3 sun_rad = sun_col * strength;
+                    float3 brdf    = h.albedo / 3.14159265358979;
                     if (n_dot_l > 0.0 && any(trans > float3(0.0))) {
-                        // Atmospheric attenuation: optical depth times
-                        // air mass. Air mass = 1/sin(elev) (thin-slab
-                        // approximation, accurate down to ~5 deg). The
-                        // exp(-tau*am) curve matches real sunset
-                        // behaviour: brightness drops off a cliff once
-                        // elev < 5 deg, but stays bright through midday.
-                        float am  = 1.0 / max(sun_elev, 0.04);
-                        float tau = 0.30;             // tunable haze
-                        float trans_atm = exp(-tau * am);
-                        // Wavelength-dependent attenuation: blue
-                        // scatters more, so colour reddens with air
-                        // mass. Wavelength weights mimic Rayleigh
-                        // (~1/lambda^4) without doing a full spectral
-                        // walk -- enough to read as "warm at sunset".
-                        float warmth = saturate((am - 1.0) * 0.18);
-                        float3 sun_col = lerp(float3(1.00, 0.97, 0.92),
-                                              float3(1.55, 0.55, 0.20),
-                                              warmth);
-                        // I0 in tonemap-relative units. 80 is tuned so
-                        // a noon sun on a Lambert white wall reads
-                        // ~1.0 after exposure*ACES at typical exposure.
-                        float strength = 80.0 * trans_atm;
-                        float3 sun_rad = sun_col * strength;
-                        float3 brdf    = h.albedo / 3.14159265358979;
                         // Multiply by per-channel transmittance through
                         // any dielectrics on the shadow ray, so glass
                         // tint / diamond focal lensing modulate the
                         // direct light correctly.
-                        radiance += throughput * sun_rad * trans * brdf * n_dot_l;
+                        float3 sun_contrib =
+                            throughput * sun_rad * trans * brdf * n_dot_l;
+                        radiance += sun_contrib;
+                        // B10 SIGMA demod: record the SHADOWED direct-sun
+                        // value actually folded into radiance at the
+                        // primary hit -- subtracted from the denoiser
+                        // input at frame end so SVGF never blurs the hard
+                        // sun-shadow edge. Same value bit-for-bit as the
+                        // `radiance +=` above.
+                        if (b == 0u && write_shadow_vis != 0u) {
+                            sample_sun_shadowed = sun_contrib;
+                        }
+                    }
+                    // B10 SIGMA demod: record the UNSHADOWED direct-sun
+                    // radiance S (independent of the shadow ray) so the
+                    // post-denoise composite can re-modulate it by the
+                    // separately-denoised visibility. Captured whenever the
+                    // sun is up and front-facing, even when fully shadowed
+                    // this sample (so a penumbra pixel still has a valid S
+                    // for the bilateral re-modulation).
+                    if (b == 0u && write_shadow_vis != 0u && n_dot_l > 0.0) {
+                        sample_sun_direct = throughput * sun_rad * brdf * n_dot_l;
                     }
                 }
                 // Moon NEE for the procedural-sky path (see env_map
@@ -6733,6 +6794,12 @@ void main(uint2 tid : SV_DispatchThreadID) {
             float3 trans_atm_surf = atmosphericTransmittance(
                 primary_ro, primary_rd, primary_t);
             radiance *= trans_atm_surf;
+            // B10 SIGMA demod: the captured direct-sun terms are part of
+            // `radiance`, so apply the same aerial-perspective attenuation
+            // to keep the demod subtraction / re-modulation consistent.
+            // No-op (zero) unless this pixel captured sun above.
+            sample_sun_shadowed *= trans_atm_surf;
+            sample_sun_direct   *= trans_atm_surf;
             // HDRI-sourced haze additive. The atmospheric in-scatter
             // march below is gated off in HDRI mode to avoid double-
             // counting the HDRI's already-baked Rayleigh tint, but
@@ -7451,6 +7518,11 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     // re-rendered (#179).
                     if (smoke_params.w > 0.5) {
                         radiance *= trans_eye_c;
+                        // B10 SIGMA demod: mirror the Beer-Lambert cloud
+                        // attenuation onto the captured direct-sun terms so
+                        // they track `radiance` (no-op unless sun captured).
+                        sample_sun_shadowed *= trans_eye_c;
+                        sample_sun_direct   *= trans_eye_c;
                     }
                     radiance += v_color_c * vol_int;
                     // G-buffer write source for cloud_trans_tex. Only
@@ -7474,12 +7546,21 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // accumulator at 1 spp) reconstructs the dispersed colour image.
         if (hero_lambda >= 0.0) {
             frame_radiance += radiance * spectral_weight;
+            // B10 SIGMA demod: weight the captured sun terms by the same
+            // hero-wavelength CIE response so the spp-average matches the
+            // sun contribution folded into frame_radiance.
+            frame_sun_shadowed += sample_sun_shadowed * spectral_weight;
+            frame_sun_direct   += sample_sun_direct   * spectral_weight;
         } else {
             frame_radiance += radiance;
+            frame_sun_shadowed += sample_sun_shadowed;
+            frame_sun_direct   += sample_sun_direct;
         }
         // --- end ---
     }
     frame_radiance /= float(sample_count);
+    frame_sun_shadowed /= float(sample_count);
+    frame_sun_direct   /= float(sample_count);
 
     // Sanitize: replace NaN / Inf / negative channels with 0 before the
     // running-mean update below. Without this, a single rare bad sample
@@ -7600,6 +7681,25 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // negative colour. No-op for non-spectral (already >= 0).
         float3 hdr_src = max((denoiser_enabled != 0u) ? frame_radiance : avg,
                              float3(0.0));
+        // B10 SIGMA sun-shadow demodulation (issue #115). Remove the
+        // primary-hit direct-sun contribution from the DENOISER INPUT so
+        // SVGF never sees -- and so never spatially bleeds -- the hard
+        // sun-shadow edge on flat ground. SigmaShadow.slang re-adds the
+        // unshadowed sun S post-denoise, modulated by the separately
+        // bilateral-denoised visibility, giving a crisp shadow line while
+        // leaving point / spot / area lights and indirect GI in the umbra
+        // untouched (the old `hdr *= vis` composite multiplied ALL of them
+        // by the sun visibility, blacking out shadow interiors -- the bug
+        // this fixes). Gated on write_shadow_vis (Metal SIGMA path only;
+        // requires the HDR pipeline + procedural sun) and the HDR-pipeline
+        // branch below, so the LDR pipeline and every non-Metal / demod-off
+        // path keep frame_radiance verbatim. accum_hdr (auto-exposure
+        // metering + denoiser-off display) is NOT demodulated -- it always
+        // carries the correctly-shadowed sun.
+        if (denoiser_enabled != 0u && write_shadow_vis != 0u &&
+            w2j_row0.w > 0.5) {
+            hdr_src = max(hdr_src - frame_sun_shadowed, float3(0.0));
+        }
         if (w2j_row0.w > 0.5) {
             denoise_color[tid] = float4(hdr_src, 1.0);
         } else {
@@ -7638,6 +7738,15 @@ void main(uint2 tid : SV_DispatchThreadID) {
     // with sky pixels + sun-below-horizon samples contributing 1.0).
     // Average back to [0, 1] before writing so the downstream
     // SigmaShadow kernel reads a true visibility, not a count.
+    //
+    // B10 packed layout (issue #115): the buffer holds FOUR floats per
+    // pixel now, not one -- [4i+0] = visibility, [4i+1..3] = the
+    // unshadowed direct-sun radiance S (RGB). SigmaShadow.slang bilateral-
+    // filters the visibility and composites `hdr += S * vis_denoised`, so
+    // only the direct-sun term is re-modulated by the sharp visibility;
+    // everything else (point/spot/area lights, indirect GI) is left
+    // exactly as the radiance denoiser resolved it. The engine sizes
+    // shadow_vis_buf at width*height*4 floats to match.
     if (write_shadow_vis != 0u) {
         float vis_mean = frame_shadow_vis / float(sample_count);
         // Sanitize like the radiance path does. The transmittance call
@@ -7649,8 +7758,16 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // composite multiplies by NaN".
         if (isnan(vis_mean) || isinf(vis_mean)) vis_mean = 1.0;
         vis_mean = saturate(vis_mean);
+        // Sanitize S the same way: a NaN/Inf here would be added straight
+        // into the post-denoise HDR. Clamp negatives to 0 (S is radiance).
+        float3 sun_s = frame_sun_direct;
+        bool3 sbad = isnan(sun_s) || isinf(sun_s);
+        sun_s = select(sbad, float3(0.0), max(sun_s, float3(0.0)));
         uint idx = tid.y * dim.x + tid.x;
-        shadow_vis_buf[idx] = vis_mean;
+        shadow_vis_buf[4u * idx + 0u] = vis_mean;
+        shadow_vis_buf[4u * idx + 1u] = sun_s.r;
+        shadow_vis_buf[4u * idx + 2u] = sun_s.g;
+        shadow_vis_buf[4u * idx + 3u] = sun_s.b;
     }
 
     // Swapchain write. Apply the OETF on the SPIR-V path so the OS's

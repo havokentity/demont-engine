@@ -23,27 +23,36 @@
 // SIGMA-style implementation here. This is conceptually the same
 // algorithm NVIDIA ships -- our own tuning, our own Slang code.
 //
-// MVP architecture (issue #115)
-// -----------------------------
-// 1. PathTrace.slang writes per-primary-hit sun-NEE shadow-ray
-//    transmittance into `shadow_vis_buf` (R32F storage buffer, one
-//    float per pixel, row-major). 1.0 = unoccluded; 0.0 = fully
-//    shadowed. Sky pixels (no primary hit) write 1.0 so they remain
-//    untouched here.
-// 2. This kernel runs POST-radiance-denoise, BEFORE StarsComposite +
-//    bloom + tonemap. It bilateral-filters `shadow_vis_buf` with a
-//    5x5 kernel, using depth + normal edge-stops to avoid leaking
-//    across geometry seams, then multiplies the denoised visibility
-//    into the post-denoise HDR.
-// 3. Because the input HDR already had its shadow boundary smudged by
-//    the radiance denoiser, multiplying by the SHARP visibility
-//    re-imposes a crisp shadow line on top of the smudged radiance.
-//    This is the "simpler MVP" composite the issue calls out -- the
-//    full demod path (PathTrace divides direct light out, we
-//    multiply it back) is a follow-up. The MVP cost is a slight
-//    over-darkening near the boundary's lit side where the denoiser
-//    bled a little shadow brightness; users still see "sharp shadow
-//    edge", which is the acceptance criterion.
+// Architecture (issue #115, B10 -- the real demod path)
+// ------------------------------------------------------
+// 1. PathTrace.slang writes a packed per-primary-hit G-buffer into
+//    `shadow_vis_buf` (storage buffer, FOUR floats per pixel, row-major
+//    stride 4): [+0] sun-NEE shadow-ray visibility (1.0 = unoccluded,
+//    0.0 = fully shadowed), [+1..3] the UNSHADOWED direct-sun radiance S
+//    (RGB). Sky / non-Lambert / sun-below-horizon pixels write vis = 1.0
+//    and S = 0 so they remain untouched here.
+// 2. Crucially, PathTrace ALSO SUBTRACTS the shadowed direct-sun term
+//    from the DENOISER INPUT (denoise_color) -- so the radiance denoiser
+//    (SVGF a-trous / MetalFX) never sees, and so never spatially bleeds,
+//    the hard sun-shadow edge. The denoiser resolves only the "rest":
+//    point / spot / area lights, sky ambient, and indirect GI. The
+//    correctly-shadowed sun stays in accum_hdr (so auto-exposure meters
+//    it) but is absent from what the denoiser blurs.
+// 3. This kernel runs POST-radiance-denoise, BEFORE StarsComposite +
+//    bloom + tonemap. It bilateral-filters the visibility channel with a
+//    5x5 depth + normal kernel (avoiding leaks across geometry seams),
+//    then RE-ADDS the demodulated sun: `hdr += S * vis_denoised`. Because
+//    the visibility is denoised separately from the radiance and stays
+//    sharp across the flat-ground shadow boundary, the recomposed sun
+//    shadow is crisp -- while the umbra keeps every other light and GI
+//    bounce the denoiser resolved.
+//
+// This replaces the earlier MVP composite (`hdr *= vis_denoised`), which
+// multiplied the ENTIRE post-denoise HDR -- all lights and indirect
+// bounces, not just the sun -- by the sun visibility. A point light or
+// GI fill inside a sun umbra was multiplied by ~0 and the shadow
+// interior rendered pure black. The demod above touches only the direct
+// sun, which is the physically correct thing to re-shadow.
 //
 // Bilateral kernel design
 // -----------------------
@@ -61,31 +70,30 @@
 //                    that's exactly what we don't want stopping us;
 //                    visibility has its own much-cleaner signal)
 //
-// Sky pixels write 1.0 into the buffer (no occlusion) so blending into
-// the sky just biases vis slightly upward -- harmless. Sky pixels on
-// the OUTPUT side are not multiplied: the per-thread sky-pixel gate
-// (depth >= 1e9) skips the in-place HDR write so the procedural sky
-// stays untouched and StarsComposite still gets a clean sky pass.
+// Sky pixels write 1.0 (vis) + 0 (S) into the buffer so the bilateral
+// average is harmless there. Sky pixels on the OUTPUT side are skipped
+// entirely: the per-thread sky-pixel gate (depth >= 1e9) short-circuits
+// the in-place HDR write so the procedural sky stays untouched and
+// StarsComposite still gets a clean sky pass.
 //
-// Why post-denoise (not in front of the denoiser)
-// -----------------------------------------------
+// Filter + composite in one kernel
+// --------------------------------
 // Issue #115 specifies "between PathTrace and Denoise()" for the
-// denoise-the-visibility pass. The MVP composite ("hdr *
-// shadow_vis_denoised post-denoise") combines them into one shader
-// for engineering simplicity: a single kernel that filters visibility
-// AND multiplies it into HDR, dispatched once after the radiance
-// denoiser. Splitting filter + composite into two kernels is a
-// follow-up if/when we want the full demod path (PathTrace divides
-// direct light out, composite multiplies back -- requires PathTrace
-// surgery and a separate "direct light only" buffer).
+// denoise-the-visibility pass. We keep filter + composite in ONE shader
+// dispatched once after the radiance denoiser: it bilateral-filters the
+// packed visibility channel AND re-adds `S * vis_denoised` into the HDR.
+// The demodulation half of the SIGMA path (subtracting the shadowed sun
+// from the denoiser input, packing the unshadowed sun S) lives in
+// PathTrace.slang -- see the shadow_vis_buf write there.
 //
 // Bindings (Slang's MSL backend assigns texture(N) and buffer(N) in
 // declaration order; the engine's BindStorageTexture / BindBuffer
 // slots in Engine.cpp match these positions):
-//   texture(0)  hdr_inout       -- post-denoise HDR; we multiply in place
+//   texture(0)  hdr_inout       -- post-denoise HDR; we add sun in place
 //   texture(1)  depth_tex       -- linear camera-space Z (PathTrace G-buffer)
 //   texture(2)  normal_tex      -- world-space normal (PathTrace G-buffer)
-//   buffer(0)   shadow_vis_buf  -- R32F per-pixel sun-visibility (PathTrace G-buf)
+//   buffer(0)   shadow_vis_buf  -- packed [vis, S.rgb] x4 floats/pixel
+//                                  (PathTrace G-buffer)
 //
 // Storage buffer (not texture) for shadow_vis is deliberate: Metal's
 // compute kernel cap of 8 read_write textures was already saturated
@@ -231,16 +239,20 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 }
             }
 
-            // Read this neighbour's noisy visibility. Buffer is
-            // row-major width*height floats; PathTrace.slang writes
-            // [yy * width + xx] in the G-buffer pass.
+            // Read this neighbour's noisy visibility. Buffer is packed
+            // 4 floats per pixel (visibility + unshadowed sun RGB); the
+            // visibility lives at stride offset +0. PathTrace.slang writes
+            // [4*(yy*width+xx) + 0] in the G-buffer pass.
             uint idx = uint(yy) * width + uint(xx);
-            float vis_n = shadow_vis_buf[idx];
+            float vis_n = shadow_vis_buf[4u * idx + 0u];
 
             sum_w   += w;
             sum_vis += w * vis_n;
         }
     }
+
+    // Centre pixel index into the packed 4-float-per-pixel buffer.
+    uint idx_c = uint(px.y) * width + uint(px.x);
 
     // Numerical fallback: if every neighbour got downweighted to zero
     // (catastrophic depth or normal discontinuities all around -- can
@@ -250,26 +262,37 @@ void main(uint3 tid : SV_DispatchThreadID) {
     if (sum_w > 1e-6) {
         vis_denoised = sum_vis / sum_w;
     } else {
-        uint idx_c = uint(px.y) * width + uint(px.x);
-        vis_denoised = shadow_vis_buf[idx_c];
+        vis_denoised = shadow_vis_buf[4u * idx_c + 0u];
     }
     // Clamp to [0, 1] -- visibility is by definition in that range; a
     // slight numerical excursion outside (e.g. -1e-7 from a
-    // sum-of-positives that rounded under) would otherwise show as
-    // negative HDR multiply.
+    // sum-of-positives that rounded under) would otherwise show as a
+    // negative HDR contribution.
     vis_denoised = saturate(vis_denoised);
 
-    // Composite: multiply the post-denoise HDR by the denoised
-    // visibility, in place. Alpha kept at 1.0 (the radiance denoiser
-    // wrote 1.0 there; the StarsComposite kernel that runs after us
-    // also writes 1.0). This is the MVP composite the issue calls
-    // out: the input HDR already had its shadow boundary smudged by
-    // the radiance denoiser, so multiplying by SHARP visibility
-    // re-imposes a crisp edge over the smudged radiance. Cost is a
-    // slight over-darkening near the boundary's lit side, accepted
-    // for MVP scope.
+    // Unshadowed primary-hit direct-sun radiance S, packed by
+    // PathTrace.slang at stride offsets +1..3. Zero for non-Lambert
+    // primary hits, sky pixels, and sun-below-horizon pixels, so the
+    // composite below is a no-op there.
+    float3 sun_direct = float3(shadow_vis_buf[4u * idx_c + 1u],
+                               shadow_vis_buf[4u * idx_c + 2u],
+                               shadow_vis_buf[4u * idx_c + 3u]);
+
+    // Composite: RE-ADD the demodulated direct sun, modulated by the
+    // bilateral-denoised visibility, in place. This is the true SIGMA
+    // demod path. PathTrace already SUBTRACTED the shadowed direct-sun
+    // term from the denoiser input, so SVGF / MetalFX never blurred the
+    // hard sun-shadow edge, and point / spot / area lights + indirect GI
+    // survived untouched in the umbra. Adding S * vis_denoised here
+    // re-imposes a crisp shadow line using the separately-denoised
+    // visibility. (Replaces the earlier MVP `hdr *= vis_denoised`
+    // composite, which multiplied the WHOLE image -- every light and GI
+    // bounce -- by the sun visibility and blacked out shadow interiors
+    // that contained other light. That was the bug this fixes.) Alpha
+    // kept at 1.0 (the radiance denoiser wrote 1.0; the StarsComposite
+    // kernel that runs after us also writes 1.0).
     float3 hdr = hdr_inout[tid.xy].rgb;
-    hdr *= vis_denoised;
+    hdr += sun_direct * vis_denoised;
 
     // Sanitize: a NaN in the visibility buffer (extreme corner case --
     // PathTrace clamps writes, but the buffer is shared memory and
