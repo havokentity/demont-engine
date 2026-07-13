@@ -38,6 +38,38 @@ namespace pt::rhi::mtl {
 
 class MetalDevice;
 
+// A compiled compute pipeline plus the Metal resource layout Slang
+// assigned it, parsed from the emitted MSL at build time (see build_pso).
+// This makes the shader's own output the single source of truth for where
+// Dispatch binds each resource, rather than the RHI assuming a fixed
+// convention (AS@buffer0, push@(max_ssbo+1), and every engine slot == its
+// Metal index). Those assumptions only held when the acceleration
+// structure was the first-declared buffer resource: PathTrace declares it
+// first (AS@0, push@18), but RestirFinal declares it AFTER its SSBOs
+// (AS@3, push@4), so the old code bound the AS over the reservoir SSBO and
+// the push where the shader read the AS -- a silent clobber.
+//
+// Fields:
+//   - `accel_buf_index` / `push_buf_index` : the buffer() index Slang gave
+//     the acceleration structure / the [[vk::push_constant]] block, or -1
+//     if the kernel declares none.
+//   - `ssbo_buf_mask` : bit i set => buffer(i) is an ordinary `device*`
+//     SSBO the kernel actually declares. Dispatch binds an engine buffer
+//     slot only if its bit is set, so a bind can never land on the AS/push
+//     index (the clobber class) or on a declaration Slang dead-code
+//     eliminated (harmless, but now skipped rather than blindly issued).
+//   - `tex_mask` : bit i set => texture(i) is declared. Same guard for the
+//     texture namespace.
+// Buffer/texture indices in these kernels are well under 32, so a uint32
+// mask covers every slot (bound_buf_ is 24 wide, bound_tex_ 20).
+struct MetalPipeline {
+    MTL::ComputePipelineState* pso             = nullptr;
+    std::int32_t               accel_buf_index = -1;
+    std::int32_t               push_buf_index  = -1;
+    std::uint32_t              ssbo_buf_mask    = 0;
+    std::uint32_t              tex_mask         = 0;
+};
+
 class MetalCommandBuffer : public CommandBuffer {
 public:
     explicit MetalCommandBuffer(MetalDevice* d) : device_(d) {}
@@ -223,7 +255,9 @@ public:
     bool ReadbackBuffer (BufferHandle  h, void* dst, std::size_t bytes) override;
 
     // ---- Internal lookup ------------------------------------------------
-    MTL::ComputePipelineState* LookupPipeline(PipelineHandle h);
+    // Returns the pipeline plus its parsed binding indices, or nullptr if
+    // the handle is unknown. Dispatch needs the indices, not just the PSO.
+    const MetalPipeline*       LookupPipeline(PipelineHandle h);
     MTL::Texture*              LookupTexture(TextureHandle h);
     MTL::Buffer*               LookupBuffer(BufferHandle h);
     MTL::AccelerationStructure* LookupAccelStruct(AccelStructHandle h);
@@ -254,7 +288,7 @@ private:
 
     std::mutex                                         resource_mutex_;
     std::uint64_t                                      next_id_ = kSwapchainTextureId + 1;
-    std::unordered_map<std::uint64_t, MTL::ComputePipelineState*>  pipelines_;
+    std::unordered_map<std::uint64_t, MetalPipeline>              pipelines_;
     std::unordered_map<std::uint64_t, MTL::Texture*>               textures_;
     std::unordered_map<std::uint64_t, MTL::Buffer*>                buffers_;
     std::unordered_map<std::uint64_t, MTL::AccelerationStructure*> accels_;
