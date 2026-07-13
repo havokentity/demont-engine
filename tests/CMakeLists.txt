@@ -1153,6 +1153,31 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
         MAX_DELTA 48 MEAN_DELTA 6 FAIL_PERCENT 4)
     # --- end Wave 8 spectral dispersion -----------------------------------
 
+    # --- Env double-count through dielectrics (2026-07-13 audit, B9) -------
+    # env_glass_furnace: a Lambert floor + two furnace-reference spheres
+    # under an INFINITE dielectric slab, lit by a uniform white-furnace IBL
+    # (assets/hdri/uniform_gray.hdr). Pins the fix for the env-map NEE / MIS
+    # double count: with caustics on, a Lambert vertex's env-NEE shadow ray
+    # refracts through the slab (transmittance() tint != 0) AND its BSDF
+    # bounce refracts through the same slab to the sky -- the MAT_DIELECTRIC
+    # branch used to reset skip_sky_on_miss / prev_was_lambert_nee after the
+    # first refraction, so the sky-on-miss was added at full weight on top of
+    # the NEE. The under-slab floor converged ~1.5x (uniform env; up to ~2x
+    # under a concentrated HDRI) brighter than energy conservation allows.
+    # The fix persists those flags across the refraction chain (reset only on
+    # reflection/TIR, the lobe transmittance() never follows).
+    #
+    # Energy-conservation witness: under the fix the under-slab floor is
+    # ~0.98x the no-slab floor (Fresnel loss dims it slightly, as glass must)
+    # instead of >1.0x. The scene is bit-deterministic (analytic prims only,
+    # 0 BVH nodes), and reintroducing the bug moves ~99% of pixels by a mean
+    # ~23 L2 -- far past the default 16/2/1 tolerances, so this is a tight
+    # regression pin. Metal-only: the CPU SoftwareTracer is a single-bounce
+    # direct-lighting renderer with no env-NEE / MIS / refractive shadow rays,
+    # so it can neither exhibit nor guard this bug.
+    pt_add_golden_cell(SCENE env_glass_furnace BACKEND metal DENOISER off)
+    # --- end env double-count through dielectrics -------------------------
+
     # --- Wave 8 thin-lens depth of field (#27) ----------------------------
     # Row of emissive spheres receding from the camera; only the middle
     # sphere sits on the focus plane (sharp), the rest blur into bokeh

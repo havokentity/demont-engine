@@ -6626,12 +6626,34 @@ void main(uint2 tid : SV_DispatchThreadID) {
             if (tir || randf(seed) < fr) {
                 rd = reflected;
                 ro = hit_pt + nf * 1e-3;
+                // Fresnel REFLECTION (incl. TIR) off the glass. A Lambert
+                // env-NEE's shadow ray follows ONLY the transmitted lobe
+                // (transmittance() keeps refraction, never the reflected
+                // lobe), so this reflected path is a higher-order term no
+                // prior NEE sampled -- its eventual sky-on-miss is genuinely
+                // new light. Clear the specular-suffix suppression so the
+                // miss is added at full weight.
+                skip_sky_on_miss = false;
+                prev_was_lambert_nee = false;
             } else {
                 rd = normalize(refracted);
                 ro = hit_pt - nf * 1e-3;
+                // REFRACTION (transmission). If a preceding Lambert env-NEE
+                // already accounted for the sky arriving through this same
+                // dielectric (its shadow ray refracts through it via
+                // transmittance(), returning a non-zero tint), then adding
+                // the sky-on-miss down this transmitted lobe would DOUBLE-
+                // COUNT that light -- the very bug this branch used to have,
+                // because it reset the flags unconditionally and the single-
+                // segment MIS/skip bookkeeping was lost after one bounce.
+                // PERSIST skip_sky_on_miss / prev_was_lambert_nee unchanged
+                // so the eventual miss is suppressed (MIS off) or balance-
+                // weighted (MIS on) exactly as the single-segment case does,
+                // now carried across the whole refraction chain. When no
+                // Lambert NEE preceded (e.g. a camera ray hitting a bare
+                // glass body), both flags are already false, so refracting
+                // the sky still shows it -- this branch is a no-op there.
             }
-            skip_sky_on_miss = false;   // dielectric didn't NEE either
-            prev_was_lambert_nee = false;   // specular/refraction: MIS doesn't apply
         }
 #if PT_WATER_ENABLED
         else if (h.mat == MAT_WATER) {  // (#134)
@@ -6732,6 +6754,12 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 // ray is still underwater.
                 rd = reflected;
                 ro = hit_pt + nf_s * 1e-3;
+                // Reflected lobe: transmittance()-based NEE only follows
+                // the transmitted lobe through water, so a reflected
+                // sky-on-miss is genuinely new light (mirrors the
+                // MAT_DIELECTRIC reflect branch). Clear the suppression.
+                skip_sky_on_miss = false;
+                prev_was_lambert_nee = false;
             } else {
                 // Refraction: the ray crosses the water interface.
                 // ndi_s < 0 means the shading normal pointed away from
@@ -6753,9 +6781,17 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 }
                 rd = normalize(refracted);
                 ro = hit_pt - nf_s * 1e-3;
+                // Transmitted lobe: PERSIST skip_sky_on_miss /
+                // prev_was_lambert_nee across the interface. Water is on
+                // transmittance()'s transmissive-blocker list, so a
+                // preceding Lambert env-NEE already accounted for the sky
+                // arriving through this same water; the eventual sky-on-
+                // miss down this chain must not be re-counted. See the
+                // MAT_DIELECTRIC refract branch for the full rationale.
+                // (Underwater misses hit the deep-water override above and
+                // never reach the sky term, so this only matters once the
+                // ray has refracted back out into air.)
             }
-            skip_sky_on_miss = false;
-            prev_was_lambert_nee = false;
         }
 #endif  // PT_WATER_ENABLED
 
