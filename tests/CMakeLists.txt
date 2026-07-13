@@ -1210,10 +1210,24 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # software cell (label golden_software). The committed flat-color
     # goldens (cornell_csg, sky, smoke, water) are UNAFFECTED -- materials
     # with no texture index render bit-for-bit as before.
+    #
+    # Goldens: software + metal committed 2026-07-14 (audit A7 follow-up --
+    # the software backend now samples the atlas in SoftwareTracer.cpp, so
+    # both the CI-run software cell and the metal cell pin real textured
+    # frames instead of the previous missing-golden WILL_FAIL placeholders).
+    # VULKAN GOLDEN DEFERRED: not captured here because macOS registers no
+    # Vulkan cell (this is the wave-8 dev host) and Mac-Vulkan pixel-
+    # correctness is still unverified (#71). On a Vulkan CI host the cell
+    # below stays a missing-golden placeholder until #71 validates the
+    # MoltenVK/RTX path and pbr_textured__vulkan__off.png is captured +
+    # committed from that host. See project_full_audit_paused.md (feature
+    # "material-editor-and-textures").
     pt_add_golden_cell(SCENE pbr_textured BACKEND software DENOISER off
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     pt_add_golden_cell(SCENE pbr_textured BACKEND metal    DENOISER off
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+    # Vulkan cell: golden deferred to #71 (Mac-Vulkan pixel correctness) --
+    # registers on Vulkan hosts, no-op on macOS. See the note above.
     pt_add_golden_cell(SCENE pbr_textured BACKEND vulkan   DENOISER off
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     # --- end Wave 8 PBR fixture -------------------------------------------

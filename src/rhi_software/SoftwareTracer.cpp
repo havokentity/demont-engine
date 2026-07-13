@@ -112,16 +112,27 @@ constexpr std::size_t kHosekParamsOffset = 1184;
 //   v4.xyz = emission (W/sr per channel, #181 polish); v4.w = pad
 //   v5.xyzw = orient quaternion (rotation gizmo, #206)
 //   v6.xyzw = PBR texture tile indices (albedo/normal/rough/metallic,
-//             Wave 8 #26; ignored here -- the SW fallback doesn't sample
-//             textures, so textured prims render with their flat v1
-//             albedo on this path)
+//             Wave 8 #26). uint reinterpreted as float; kPbrNoTexTile
+//             (0xFFFFFFFF) on a channel means "no map, use the flat v1
+//             value". Sampled by ApplyPbrTextures against the material
+//             atlas bound at engine texture slot 16 -- see that helper.
 // 7 float4 per prim = 28 floats = 112 bytes. The stride MUST stay in
 // sync with Engine.cpp's kFloatsPerPrim (28) and PathTrace.slang's
 // testAnalyticPrim (reads at idx*7 stride; Wave 8 #26 bumped 6->7).
 constexpr std::uint32_t kPrimSphere = 0u;
 constexpr std::uint32_t kPrimPlane  = 1u;
 constexpr std::uint32_t kMatLambert = 0u;
+constexpr std::uint32_t kMatMetal   = 1u;   // MAT_METAL in PathTrace.slang
 constexpr std::uint32_t kFloatsPerPrim = 28u;
+
+// Wave 8 PBR (#26) material texture atlas geometry. MUST match Engine.h's
+// kPbrTileSize / kPbrAtlasTiles and PathTrace.slang's copies: the atlas is
+// a vertical strip of kPbrTileSize-square tiles (kPbrTileSize wide,
+// kPbrAtlasTiles * kPbrTileSize tall). A per-map tile index selects the
+// vertical band; kPbrNoTexTile marks an unassigned map.
+constexpr std::uint32_t kPbrTileSize   = 256u;
+constexpr std::uint32_t kPbrAtlasTiles = 16u;
+constexpr std::uint32_t kPbrNoTexTile  = 0xFFFFFFFFu;
 
 struct HitInfo {
     bool      hit = false;
@@ -134,6 +145,16 @@ struct HitInfo {
     // BRDF eval, same as the GPU shader path. Mesh / non-analytic hits
     // overwrite to zero so a previous prim's emission doesn't leak.
     glm::vec3 emission{0.0f};
+    // Wave 8 PBR (#26): base roughness + procedural surface UV + the four
+    // per-map atlas tile indices, populated on analytic-prim hits so
+    // ApplyPbrTextures can sample the material maps. tex_tiles default to
+    // kPbrNoTexTile so an untextured hit (and every mesh hit) short-
+    // circuits the sampler to a no-op, keeping flat-material renders
+    // bit-identical.
+    float         roughness = 1.0f;
+    glm::vec2     uv{0.0f};
+    std::uint32_t tex_tiles[4] = {kPbrNoTexTile, kPbrNoTexTile,
+                                  kPbrNoTexTile, kPbrNoTexTile};
 };
 
 // Ray-sphere intersection (closest positive root). Returns hit-t in t
@@ -306,6 +327,138 @@ inline glm::vec3 TonemapDispatch(glm::vec3 c, std::uint32_t op) {
 }
 // --- end Wave 9 tonemap ----------------------------------------------------
 
+// --- Wave 8 PBR (#26) -- material texture atlas sampling -------------------
+// CPU mirror of PathTrace.slang's samplePbrTileLinear / samplePbrTileSrgb /
+// applyNormalMap / applyPbrTextures. The atlas is a vertical strip of
+// kPbrTileSize-square tiles stored RGBA8 on the GPU; on this backend
+// SoftwareDevice::WriteTexture normalises those bytes to [0,1] in the
+// BackedTexture float backing, so sampling here reads the exact same values
+// the GPU's rgba8 fetch returns. Filtering is manual bilinear over integer
+// texel fetches with a per-tile frac() wrap so tiling maps repeat
+// seamlessly. The sRGB EOTF is applied ONLY to albedo (SamplePbrTileSrgb);
+// normal / roughness / metallic are linear data read raw -- so we never
+// double-decode.
+
+// sRGB (IEC 61966-2-1) EOTF: encoded -> linear. Matches PathTrace.slang's
+// srgbToLinear exactly (the inverse of the OETF the present blit applies).
+inline glm::vec3 SrgbToLinear(glm::vec3 c) {
+    auto dec = [](float x) {
+        return (x <= 0.04045f)
+                 ? (x / 12.92f)
+                 : std::pow(std::max((x + 0.055f) / 1.055f, 0.0f), 2.4f);
+    };
+    return glm::vec3{dec(c.r), dec(c.g), dec(c.b)};
+}
+
+// Fetch one atlas texel (row-major RGBA32F backing). Callers pass already-
+// wrapped, in-range integer coordinates.
+inline glm::vec4 AtlasTexel(const BackedTexture* atlas, int x, int y) {
+    const std::size_t idx =
+        (std::size_t(y) * atlas->width + std::size_t(x)) * 4u;
+    return glm::vec4{atlas->data[idx + 0], atlas->data[idx + 1],
+                     atlas->data[idx + 2], atlas->data[idx + 3]};
+}
+
+// Bilinear-fetch one atlas tile at the (wrapped) tile-local UV. Returns the
+// raw RGBA (no colour-space conversion). `tile` MUST be valid (caller gates
+// on kPbrNoTexTile). Mirrors samplePbrTileLinear including the modulo wrap
+// on the +1 tap so the tile edge samples its opposite edge (seamless tile).
+inline glm::vec4 SamplePbrTileLinear(const BackedTexture* atlas,
+                                     std::uint32_t tile, glm::vec2 uv) {
+    const glm::vec2 fuv = glm::fract(uv);   // wrap into [0,1); handles < 0
+    const int W = static_cast<int>(kPbrTileSize);
+    const float fx  = fuv.x * static_cast<float>(kPbrTileSize) - 0.5f;
+    const float fy  = fuv.y * static_cast<float>(kPbrTileSize) - 0.5f;
+    const float fx0 = std::floor(fx);
+    const float fy0 = std::floor(fy);
+    const float tx  = fx - fx0;
+    const float ty  = fy - fy0;
+    int ix0 = static_cast<int>(fx0);
+    int iy0 = static_cast<int>(fy0);
+    int ix1 = ((ix0 + 1) % W + W) % W;
+    int iy1 = ((iy0 + 1) % W + W) % W;
+    ix0 = (ix0 % W + W) % W;
+    iy0 = (iy0 % W + W) % W;
+    const int row_base = static_cast<int>(tile) * static_cast<int>(kPbrTileSize);
+    const glm::vec4 c00 = AtlasTexel(atlas, ix0, row_base + iy0);
+    const glm::vec4 c10 = AtlasTexel(atlas, ix1, row_base + iy0);
+    const glm::vec4 c01 = AtlasTexel(atlas, ix0, row_base + iy1);
+    const glm::vec4 c11 = AtlasTexel(atlas, ix1, row_base + iy1);
+    const glm::vec4 cx0 = glm::mix(c00, c10, tx);
+    const glm::vec4 cx1 = glm::mix(c01, c11, tx);
+    return glm::mix(cx0, cx1, ty);
+}
+
+// Albedo sample: bilinear fetch + sRGB->linear decode.
+inline glm::vec3 SamplePbrTileSrgb(const BackedTexture* atlas,
+                                   std::uint32_t tile, glm::vec2 uv) {
+    return SrgbToLinear(glm::vec3(SamplePbrTileLinear(atlas, tile, uv)));
+}
+
+// Duff et al. 2017 branchless orthonormal basis: perturb the geometric
+// normal by a tangent-space normal-map sample in [-1,1]. Mirrors
+// applyNormalMap (the analytic-prim path has no per-vertex tangents, so
+// this arbitrary-but-stable frame stands in, same as the GPU).
+inline glm::vec3 ApplyNormalMap(glm::vec3 n, glm::vec3 ts) {
+    const float s = (n.z >= 0.0f) ? 1.0f : -1.0f;
+    const float a = -1.0f / (s + n.z);
+    const float b = n.x * n.y * a;
+    const glm::vec3 t {1.0f + s * n.x * n.x * a, s * b,               -s * n.x};
+    const glm::vec3 bt{b,                        s + n.y * n.y * a,   -n.y};
+    const glm::vec3 perturbed = ts.x * t + ts.y * bt + ts.z * n;
+    return glm::normalize(perturbed);
+}
+
+// Apply a hit's PBR material maps in place, mirroring
+// PathTrace.slang::applyPbrTextures. Albedo is sRGB-decoded and multiplies
+// the flat tint; roughness / metallic are linear. The SW tracer's Lambert
+// shading consumes albedo + the (perturbed) shading normal -- so those two
+// maps drive this backend's textured render -- while roughness and the
+// metallic->metal switch are sampled + stored for parity with the GPU
+// HitInfo but do not alter the diffuse output today (the same parity gap
+// as the SW tracer treating mesh "gold metal" as bright Lambert). No-op
+// when the atlas is unbound or every tile is kPbrNoTexTile, so untextured
+// hits stay bit-identical.
+inline void ApplyPbrTextures(HitInfo& h, const BackedTexture* atlas) {
+    if (atlas == nullptr || atlas->data.empty() ||
+        atlas->width != kPbrTileSize ||
+        atlas->height < kPbrTileSize) {
+        return;
+    }
+    // Number of whole tiles that fit the bound atlas. A per-channel gate of
+    // `tile < n_tiles` both skips the kPbrNoTexTile sentinel (0xFFFFFFFF is
+    // never < n_tiles) and clamps any out-of-range index -- the GPU fetch
+    // wraps/clamps in hardware, but a raw CPU index would walk off the
+    // atlas backing, so we must bound it here. For valid host data (tiles
+    // 0..kPbrAtlasTiles-1) this is identical to the shader's != gate.
+    const std::uint32_t n_tiles = atlas->height / kPbrTileSize;
+    // Albedo (sRGB -> linear, multiplies the flat tint so a white flat
+    // albedo passes the texture through unchanged).
+    if (h.tex_tiles[0] < n_tiles) {
+        h.albedo *= SamplePbrTileSrgb(atlas, h.tex_tiles[0], h.uv);
+    }
+    // Roughness (linear; .r scales the flat roughness).
+    if (h.tex_tiles[2] < n_tiles) {
+        const float r = SamplePbrTileLinear(atlas, h.tex_tiles[2], h.uv).r;
+        h.roughness = glm::clamp(h.roughness * r, 0.0f, 1.0f);
+    }
+    // Metallic (linear; .r > 0.5 flips a Lambert material to metal, parity
+    // with the GPU path -- inert for the SW diffuse shading today).
+    if (h.tex_tiles[3] < n_tiles) {
+        const float m = SamplePbrTileLinear(atlas, h.tex_tiles[3], h.uv).r;
+        if (m > 0.5f && h.mat == kMatLambert) h.mat = kMatMetal;
+    }
+    // Normal map LAST (tangent-space [0,1] -> [-1,1]). Perturb after the
+    // metallic / roughness reads so those used the geometric-normal UV (the
+    // UV is normal-independent anyway).
+    if (h.tex_tiles[1] < n_tiles) {
+        const glm::vec3 ts =
+            glm::vec3(SamplePbrTileLinear(atlas, h.tex_tiles[1], h.uv)) * 2.0f - 1.0f;
+        h.normal = ApplyNormalMap(h.normal, ts);
+    }
+}
+// --- end Wave 8 PBR --------------------------------------------------------
+
 // Single hit test against analytic prims + (optional) Embree TLAS.
 // Closest-hit semantics.
 void TraceScene(const glm::vec3& ro, const glm::vec3& rd,
@@ -321,7 +474,16 @@ void TraceScene(const glm::vec3& ro, const glm::vec3& rd,
     // per-prim emission (#181 polish). v5 carries the orientation
     // quaternion (#206); spheres ignore it, planes use it to rotate
     // the stored normal at intersect time. v6 carries PBR texture tile
-    // indices (Wave 8 #26); the SW fallback doesn't sample textures.
+    // indices (Wave 8 #26), read below and sampled by ApplyPbrTextures.
+    //
+    // uint tile index recovered from its float-bit pattern (the host packs
+    // it via memcpy in EnsurePrimitivesUploaded; the shader recovers it via
+    // asuint()). kPbrNoTexTile (0xFFFFFFFF) on a channel means "no map".
+    auto f2u = [](float f) {
+        std::uint32_t u;
+        std::memcpy(&u, &f, sizeof(u));
+        return u;
+    };
     for (std::uint32_t i = 0; i < prim_count; ++i) {
         const float* v0 = prim_data + i * kFloatsPerPrim + 0u;
         const float* v1 = prim_data + i * kFloatsPerPrim + 4u;
@@ -330,6 +492,7 @@ void TraceScene(const glm::vec3& ro, const glm::vec3& rd,
         // tracer always samples at the current frame's position.
         const float* v4 = prim_data + i * kFloatsPerPrim + 16u;
         const float* v5 = prim_data + i * kFloatsPerPrim + 20u;
+        const float* v6 = prim_data + i * kFloatsPerPrim + 24u;
         std::uint32_t type = static_cast<std::uint32_t>(v2[0]);
         glm::vec3 albedo{v1[0], v1[1], v1[2]};
         glm::vec3 emission{v4[0], v4[1], v4[2]};
@@ -346,6 +509,18 @@ void TraceScene(const glm::vec3& ro, const glm::vec3& rd,
                 out.albedo = albedo;
                 out.mat = mat;
                 out.emission = emission;
+                out.roughness = v1[3];
+                // Wave 8 PBR (#26): procedural equirectangular lat/long UV
+                // (u from atan2, seam at -x; v from asin, 0 south -> 1
+                // north), matching testAnalyticPrim's sphere mapping.
+                const glm::vec3 sn = out.normal;
+                out.uv = glm::vec2(
+                    0.5f + std::atan2(sn.z, sn.x) * (0.5f / glm::pi<float>()),
+                    0.5f - std::asin(glm::clamp(sn.y, -1.0f, 1.0f)) / glm::pi<float>());
+                out.tex_tiles[0] = f2u(v6[0]);
+                out.tex_tiles[1] = f2u(v6[1]);
+                out.tex_tiles[2] = f2u(v6[2]);
+                out.tex_tiles[3] = f2u(v6[3]);
             }
         } else if (type == kPrimPlane) {
             // Rotate the stored normal by the orientation quaternion.
@@ -362,6 +537,22 @@ void TraceScene(const glm::vec3& ro, const glm::vec3& rd,
                 out.albedo = albedo;
                 out.mat = mat;
                 out.emission = emission;
+                out.roughness = v1[3];
+                // Wave 8 PBR (#26): procedural planar UV from the world hit
+                // point, projected onto the two axes most orthogonal to the
+                // plane normal (1 UV unit = 1 metre; the atlas frac()-wraps
+                // per tile). Matches testAnalyticPrim; +y floor -> (x, z).
+                const glm::vec3 hp = ro + rd * t;
+                const glm::vec3 an = glm::abs(n);
+                glm::vec2 puv;
+                if (an.y >= an.x && an.y >= an.z)  puv = glm::vec2(hp.x, hp.z);
+                else if (an.x >= an.z)             puv = glm::vec2(hp.z, hp.y);
+                else                               puv = glm::vec2(hp.x, hp.y);
+                out.uv = puv;
+                out.tex_tiles[0] = f2u(v6[0]);
+                out.tex_tiles[1] = f2u(v6[1]);
+                out.tex_tiles[2] = f2u(v6[2]);
+                out.tex_tiles[3] = f2u(v6[3]);
             }
         }
     }
@@ -399,6 +590,14 @@ void TraceScene(const glm::vec3& ro, const glm::vec3& rd,
             // this mesh hit is closer. Mirrors the GPU testAnalyticPrim
             // -> mesh-hit chain in PathTrace.slang.
             out.emission = glm::vec3{0.0f};
+            // No per-triangle material maps on the SW mesh path -- clear
+            // the PBR tile indices / UV / roughness so a nearer mesh hit
+            // doesn't inherit a previously-tested analytic prim's texture
+            // state (ApplyPbrTextures then no-ops on this hit).
+            out.roughness = 1.0f;
+            out.uv        = glm::vec2(0.0f);
+            out.tex_tiles[0] = out.tex_tiles[1] =
+            out.tex_tiles[2] = out.tex_tiles[3] = kPbrNoTexTile;
         }
     }
 }
@@ -499,6 +698,15 @@ void RunPathTraceKernel(SoftwareDevice& device,
         BackedAccel* a = device.GetAccel(AccelStructHandle{cmd.binds.accel_structs[2]});
         if (a != nullptr && a->is_tlas) tlas_scene = a->scene;
     }
+
+    // Wave 8 PBR (#26): the material texture atlas, bound by the engine at
+    // texture slot 16 (BindStorageTexture(16, pbr_atlas)) only once the
+    // scene loads a texture. Null until then; ApplyPbrTextures no-ops when
+    // it's unbound or a hit carries no tile indices, so untextured scenes
+    // are unaffected. Read-only during the render -- worker threads sample
+    // it concurrently.
+    const BackedTexture* pbr_atlas =
+        device.GetTexture(TextureHandle{cmd.binds.textures[16]});
 
     // Match the GPU paths' exposure handling. The engine writes the
     // current exposure scalar to exposure_state[0] (seeded by
@@ -603,6 +811,14 @@ void RunPathTraceKernel(SoftwareDevice& device,
                 if (!h0.hit) {
                     col = sky_radiance(rd);
                 } else {
+                    // Wave 8 PBR (#26): apply the hit's material texture
+                    // maps (albedo sRGB-decode + normal-map perturbation
+                    // drive this diffuse backend) before shading, so all
+                    // lighting below sees the textured albedo / normal.
+                    // No-op for untextured hits and when the atlas is
+                    // unbound. Primary hit only -- shadow rays need just
+                    // occlusion, so they skip this like the GPU path.
+                    ApplyPbrTextures(h0, pbr_atlas);
                     // Lambert direct lighting from the procedural sun.
                     // Shadow test: trace from a slightly-offset hit
                     // point along sun_dir against the same scene
