@@ -1215,6 +1215,11 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # the software backend now samples the atlas in SoftwareTracer.cpp, so
     # both the CI-run software cell and the metal cell pin real textured
     # frames instead of the previous missing-golden WILL_FAIL placeholders).
+    # REGENERATED 2026-07-14 (mipmapping follow-up): the atlas now carries a
+    # box-filtered mip chain and both backends select a ray-cone LOD, so the
+    # receding-checkerboard horizon resolves to the averaged tile colour
+    # instead of aliasing into noise. This cell is the visual regression pin
+    # for that fix -- the far field should stay smooth, not sparkle.
     # VULKAN GOLDEN DEFERRED: not captured here because macOS registers no
     # Vulkan cell (this is the wave-8 dev host) and Mac-Vulkan pixel-
     # correctness is still unverified (#71). On a Vulkan CI host the cell

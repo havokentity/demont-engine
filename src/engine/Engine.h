@@ -1563,6 +1563,22 @@ private:
     static constexpr std::uint32_t              kPbrTileSize   = 256u;
     static constexpr std::uint32_t              kPbrAtlasTiles = 16u;
     static constexpr std::uint32_t              kPbrNoTexTile  = 0xFFFFFFFFu;
+    // Mip pyramid (fixes horizon aliasing when a tile minifies). Each tile
+    // band carries a box-filtered mip chain: level 0 is the base tile at
+    // atlas x=[0, kPbrTileSize); levels 1..kPbrMaxLod are packed into the
+    // right column x=[kPbrTileSize, kPbrAtlasWidth) stacked vertically inside
+    // the SAME kPbrTileSize-row band (128+64+...+1 = 255 <= kPbrTileSize rows).
+    // The atlas is thus kPbrAtlasWidth wide (was kPbrTileSize); band height +
+    // total atlas height are unchanged. MUST match PathTrace.slang's
+    // kPbrAtlasWidth / kPbrMaxLod and SoftwareTracer.cpp's copies. kPbrTileSize
+    // is a power of two, so kPbrMaxLod = log2(kPbrTileSize).
+    static constexpr std::uint32_t              kPbrMaxLod     = 8u;   // log2(256)
+    static constexpr std::uint32_t              kPbrAtlasWidth =
+        kPbrTileSize + kPbrTileSize / 2u;   // 384
+    static_assert((kPbrTileSize & (kPbrTileSize - 1u)) == 0u,
+                  "kPbrTileSize must be a power of two for the mip chain");
+    static_assert((1u << kPbrMaxLod) == kPbrTileSize,
+                  "kPbrMaxLod must equal log2(kPbrTileSize)");
     std::uint64_t                               pbr_atlas_tex_id_      = 0;
     // CPU-side staging copy of the whole atlas (RGBA8). Edits write a tile
     // here then re-upload the whole atlas (atlases are small: 256 x 4096 x
@@ -1613,15 +1629,22 @@ private:
     // stale path-cache entry. Returns kPbrNoTexTile only when all 15
     // usable tiles are genuinely live. Tile 0 (flat white) stays pinned.
     std::uint32_t AcquirePbrTile();
-    // Copy one kPbrTileSize^2 RGBA8 tile into `tile`'s slot in the staging
-    // atlas and re-upload the whole atlas (WaitIdle first so we don't stomp
-    // a tile an in-flight dispatch is still sampling). Moves pixels only --
-    // the caller owns cache / lifetime bookkeeping.
+    // Copy one kPbrTileSize^2 RGBA8 tile -- PLUS its box-filtered mip chain
+    // (see BuildPbrTileMips) -- into `tile`'s slot in the staging atlas and
+    // re-upload the whole atlas (WaitIdle first so we don't stomp a tile an
+    // in-flight dispatch is still sampling). Moves pixels only -- the caller
+    // owns cache / lifetime bookkeeping.
     void WritePbrTilePixels(std::uint32_t tile, const std::uint8_t* rgba);
     // Erase the (single, de-duped) path-cache entry mapping to `tile`, so a
     // future load of that path re-imports it instead of aliasing a slot we
     // just recycled for a different texture. No-op if nothing maps to it.
     void ErasePbrTilePathForTile(std::uint32_t tile);
+    // Write a base kPbrTileSize^2 RGBA8 tile PLUS its box-filtered mip chain
+    // into pbr_atlas_staging_ at the given tile band. Level 0 goes into the
+    // band's left region; levels 1..kPbrMaxLod are box-downsampled (2x2 mean
+    // in the stored byte space) into the right-column stack. MUST mirror
+    // PathTrace.slang's pbrMipRegion. Called by WritePbrTilePixels.
+    void BuildPbrTileMips(std::uint32_t tile, const std::uint8_t* rgba);
     // Deferred texture-load queue. The console / fixture texture commands
     // run during Init BEFORE the RHI device is created (the device boots
     // after both the early and late smoke-exec passes), so loading an

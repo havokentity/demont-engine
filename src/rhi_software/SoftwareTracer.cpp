@@ -126,15 +126,20 @@ constexpr std::uint32_t kMatMetal   = 1u;   // MAT_METAL in PathTrace.slang
 constexpr std::uint32_t kFloatsPerPrim = 28u;
 
 // Wave 8 PBR (#26) material texture atlas geometry. kPbrTileSize MUST match
-// Engine.h's kPbrTileSize and PathTrace.slang's copy: the atlas is a
-// vertical strip of kPbrTileSize-square tiles (kPbrTileSize wide, a whole
-// number of tiles tall). A per-map tile index selects the vertical band;
-// kPbrNoTexTile marks an unassigned map. The tile *count* is derived from
-// the bound atlas' height at sample time (see ApplyPbrTextures) rather than
-// hard-coded, so it tracks whatever the host allocated (Engine's
-// kPbrAtlasTiles).
+// Engine.h's kPbrTileSize and PathTrace.slang's copy: the atlas is a vertical
+// strip of kPbrTileSize-square tiles, kPbrAtlasWidth wide (base column + the
+// mip right-column) and a whole number of tiles tall. A per-map tile index
+// selects the vertical band; kPbrNoTexTile marks an unassigned map. The tile
+// *count* is derived from the bound atlas' height at sample time (see
+// ApplyPbrTextures) rather than hard-coded, so it tracks whatever the host
+// allocated (Engine's kPbrAtlasTiles).
 constexpr std::uint32_t kPbrTileSize  = 256u;
 constexpr std::uint32_t kPbrNoTexTile = 0xFFFFFFFFu;
+// Mip pyramid (mirrors Engine.h + PathTrace.slang). Each band carries a
+// box-filtered mip chain: level 0 at x=[0,kPbrTileSize); levels 1..kPbrMaxLod
+// in the right column x=[kPbrTileSize, kPbrAtlasWidth) stacked vertically.
+constexpr std::uint32_t kPbrMaxLod     = 8u;   // log2(256)
+constexpr std::uint32_t kPbrAtlasWidth = kPbrTileSize + kPbrTileSize / 2u;  // 384
 
 struct HitInfo {
     bool      hit = false;
@@ -157,6 +162,13 @@ struct HitInfo {
     glm::vec2     uv{0.0f};
     std::uint32_t tex_tiles[4] = {kPbrNoTexTile, kPbrNoTexTile,
                                   kPbrNoTexTile, kPbrNoTexTile};
+    // Ray-cone mip LOD (mirrors PathTrace.slang's HitInfo). uv_scale is the
+    // surface UV-units-per-metre density (1 for planes, lat/long density for
+    // spheres; 0 = mesh/unmapped -> base level); tex_lod is the fractional
+    // mip level computed at the hit site from the cone footprint and consumed
+    // by ApplyPbrTextures. Both 0 by default so untextured hits are unaffected.
+    float         uv_scale = 0.0f;
+    float         tex_lod  = 0.0f;
 };
 
 // Ray-sphere intersection (closest positive root). Returns hit-t in t
@@ -361,40 +373,88 @@ inline glm::vec4 AtlasTexel(const BackedTexture* atlas, int x, int y) {
                      atlas->data[idx + 2], atlas->data[idx + 3]};
 }
 
-// Bilinear-fetch one atlas tile at the (wrapped) tile-local UV. Returns the
-// raw RGBA (no colour-space conversion). `tile` MUST be valid (caller gates
-// on kPbrNoTexTile). Mirrors samplePbrTileLinear including the modulo wrap
-// on the +1 tap so the tile edge samples its opposite edge (seamless tile).
-inline glm::vec4 SamplePbrTileLinear(const BackedTexture* atlas,
-                                     std::uint32_t tile, glm::vec2 uv) {
+// Atlas origin (x0,y0) + square dimension of mip `level` for a tile band.
+// Level 0 is the base image at the band's left; levels 1..kPbrMaxLod are the
+// right-column stack. MUST mirror PathTrace.slang's pbrMipRegion and
+// Engine::BuildPbrTileMips.
+inline void PbrMipRegion(std::uint32_t tile, std::uint32_t level,
+                         int& x0, int& y0, int& dim) {
+    const int row_base = static_cast<int>(tile) * static_cast<int>(kPbrTileSize);
+    if (level == 0u) {
+        x0 = 0; y0 = row_base; dim = static_cast<int>(kPbrTileSize);
+    } else {
+        dim = static_cast<int>(kPbrTileSize >> level);        // 128,64,...,1
+        x0  = static_cast<int>(kPbrTileSize);                 // right column
+        y0  = row_base + (static_cast<int>(kPbrTileSize) - 2 * dim);
+    }
+}
+
+// Bilinear-fetch one mip `level` of a tile at the (wrapped) tile-local UV.
+// Returns raw RGBA (no colour conversion). Mirrors samplePbrTileLevel: the
+// modulo wrap on the +1 tap is at the LEVEL resolution so tiling maps repeat
+// at every mip.
+inline glm::vec4 SamplePbrTileLevel(const BackedTexture* atlas,
+                                    std::uint32_t tile, glm::vec2 uv,
+                                    std::uint32_t level) {
+    int x0, y0, D;
+    PbrMipRegion(tile, level, x0, y0, D);
     const glm::vec2 fuv = glm::fract(uv);   // wrap into [0,1); handles < 0
-    const int W = static_cast<int>(kPbrTileSize);
-    const float fx  = fuv.x * static_cast<float>(kPbrTileSize) - 0.5f;
-    const float fy  = fuv.y * static_cast<float>(kPbrTileSize) - 0.5f;
+    const float fx  = fuv.x * static_cast<float>(D) - 0.5f;
+    const float fy  = fuv.y * static_cast<float>(D) - 0.5f;
     const float fx0 = std::floor(fx);
     const float fy0 = std::floor(fy);
     const float tx  = fx - fx0;
     const float ty  = fy - fy0;
     int ix0 = static_cast<int>(fx0);
     int iy0 = static_cast<int>(fy0);
-    int ix1 = ((ix0 + 1) % W + W) % W;
-    int iy1 = ((iy0 + 1) % W + W) % W;
-    ix0 = (ix0 % W + W) % W;
-    iy0 = (iy0 % W + W) % W;
-    const int row_base = static_cast<int>(tile) * static_cast<int>(kPbrTileSize);
-    const glm::vec4 c00 = AtlasTexel(atlas, ix0, row_base + iy0);
-    const glm::vec4 c10 = AtlasTexel(atlas, ix1, row_base + iy0);
-    const glm::vec4 c01 = AtlasTexel(atlas, ix0, row_base + iy1);
-    const glm::vec4 c11 = AtlasTexel(atlas, ix1, row_base + iy1);
+    int ix1 = ((ix0 + 1) % D + D) % D;
+    int iy1 = ((iy0 + 1) % D + D) % D;
+    ix0 = (ix0 % D + D) % D;
+    iy0 = (iy0 % D + D) % D;
+    const glm::vec4 c00 = AtlasTexel(atlas, x0 + ix0, y0 + iy0);
+    const glm::vec4 c10 = AtlasTexel(atlas, x0 + ix1, y0 + iy0);
+    const glm::vec4 c01 = AtlasTexel(atlas, x0 + ix0, y0 + iy1);
+    const glm::vec4 c11 = AtlasTexel(atlas, x0 + ix1, y0 + iy1);
     const glm::vec4 cx0 = glm::mix(c00, c10, tx);
     const glm::vec4 cx1 = glm::mix(c01, c11, tx);
     return glm::mix(cx0, cx1, ty);
 }
 
-// Albedo sample: bilinear fetch + sRGB->linear decode.
+// Trilinear-fetch a tile at fractional LOD: bilinear within the two bracketing
+// mip levels, then linear blend between them. lod <= 0 reads level 0 verbatim
+// (bit-identical to the pre-mip bilinear fetch). Mirrors samplePbrTileLinear.
+inline glm::vec4 SamplePbrTileLinear(const BackedTexture* atlas,
+                                     std::uint32_t tile, glm::vec2 uv,
+                                     float lod) {
+    const float l  = glm::clamp(lod, 0.0f, static_cast<float>(kPbrMaxLod));
+    const std::uint32_t l0 = static_cast<std::uint32_t>(std::floor(l));
+    const std::uint32_t l1 = std::min(l0 + 1u, kPbrMaxLod);
+    const float f = l - static_cast<float>(l0);
+    const glm::vec4 a = SamplePbrTileLevel(atlas, tile, uv, l0);
+    if (f <= 0.0f) return a;
+    const glm::vec4 b = SamplePbrTileLevel(atlas, tile, uv, l1);
+    return glm::mix(a, b, f);
+}
+
+// Albedo sample: trilinear fetch + sRGB->linear decode (decode applied AFTER
+// the trilinear blend, matching PathTrace.slang's samplePbrTileSrgb).
 inline glm::vec3 SamplePbrTileSrgb(const BackedTexture* atlas,
-                                   std::uint32_t tile, glm::vec2 uv) {
-    return SrgbToLinear(glm::vec3(SamplePbrTileLinear(atlas, tile, uv)));
+                                   std::uint32_t tile, glm::vec2 uv, float lod) {
+    return SrgbToLinear(glm::vec3(SamplePbrTileLinear(atlas, tile, uv, lod)));
+}
+
+// Ray-cone texture LOD (RT Gems 2019 ch. 20), mirroring pbrConeTexLod. The
+// software tracer is a single-bounce primary-visibility renderer, so the cone
+// width is just pixel_spread * primary_t; the 1/|cos| grazing stretch is what
+// removes the horizon aliasing. uv_scale <= 0 (mesh / unmapped) -> level 0.
+inline float PbrConeTexLod(float cone_width, glm::vec3 rd, glm::vec3 n,
+                           float uv_scale) {
+    if (uv_scale <= 0.0f) return 0.0f;
+    const float cos_i  = std::max(std::abs(glm::dot(rd, n)), 1e-3f);
+    const float texels = (cone_width / cos_i) * uv_scale
+                       * static_cast<float>(kPbrTileSize);
+    return glm::clamp(std::log2(std::max(texels, 1.0f)), 0.0f,
+                      static_cast<float>(kPbrMaxLod));
 }
 
 // Duff et al. 2017 branchless orthonormal basis: perturb the geometric
@@ -423,10 +483,13 @@ inline glm::vec3 ApplyNormalMap(glm::vec3 n, glm::vec3 ts) {
 // hits stay bit-identical.
 inline void ApplyPbrTextures(HitInfo& h, const BackedTexture* atlas) {
     if (atlas == nullptr || atlas->data.empty() ||
-        atlas->width != kPbrTileSize ||
+        atlas->width != kPbrAtlasWidth ||
         atlas->height < kPbrTileSize) {
         return;
     }
+    // Trilinear LOD from the ray-cone footprint, set at the hit site. All
+    // four maps share the same UV + footprint -> same level.
+    const float lod = h.tex_lod;
     // Number of whole tiles that fit the bound atlas. A per-channel gate of
     // `tile < n_tiles` both skips the kPbrNoTexTile sentinel (0xFFFFFFFF is
     // never < n_tiles) and clamps any out-of-range index -- the GPU fetch
@@ -438,17 +501,17 @@ inline void ApplyPbrTextures(HitInfo& h, const BackedTexture* atlas) {
     // Albedo (sRGB -> linear, multiplies the flat tint so a white flat
     // albedo passes the texture through unchanged).
     if (h.tex_tiles[0] < n_tiles) {
-        h.albedo *= SamplePbrTileSrgb(atlas, h.tex_tiles[0], h.uv);
+        h.albedo *= SamplePbrTileSrgb(atlas, h.tex_tiles[0], h.uv, lod);
     }
     // Roughness (linear; .r scales the flat roughness).
     if (h.tex_tiles[2] < n_tiles) {
-        const float r = SamplePbrTileLinear(atlas, h.tex_tiles[2], h.uv).r;
+        const float r = SamplePbrTileLinear(atlas, h.tex_tiles[2], h.uv, lod).r;
         h.roughness = glm::clamp(h.roughness * r, 0.0f, 1.0f);
     }
     // Metallic (linear; .r > 0.5 flips a Lambert material to metal, parity
     // with the GPU path -- inert for the SW diffuse shading today).
     if (h.tex_tiles[3] < n_tiles) {
-        const float m = SamplePbrTileLinear(atlas, h.tex_tiles[3], h.uv).r;
+        const float m = SamplePbrTileLinear(atlas, h.tex_tiles[3], h.uv, lod).r;
         if (m > 0.5f && h.mat == kMatLambert) h.mat = kMatMetal;
     }
     // Normal map LAST (tangent-space [0,1] -> [-1,1]). Perturb after the
@@ -456,7 +519,7 @@ inline void ApplyPbrTextures(HitInfo& h, const BackedTexture* atlas) {
     // UV is normal-independent anyway).
     if (h.tex_tiles[1] < n_tiles) {
         const glm::vec3 ts =
-            glm::vec3(SamplePbrTileLinear(atlas, h.tex_tiles[1], h.uv)) * 2.0f - 1.0f;
+            glm::vec3(SamplePbrTileLinear(atlas, h.tex_tiles[1], h.uv, lod)) * 2.0f - 1.0f;
         h.normal = ApplyNormalMap(h.normal, ts);
     }
 }
@@ -520,6 +583,15 @@ void TraceScene(const glm::vec3& ro, const glm::vec3& rd,
                 out.uv = glm::vec2(
                     0.5f + std::atan2(sn.z, sn.x) * (0.5f / glm::pi<float>()),
                     0.5f - std::asin(glm::clamp(sn.y, -1.0f, 1.0f)) / glm::pi<float>());
+                // Ray-cone LOD density: max of latitude (1/(pi*R)) and the
+                // pole-clamped longitude (1/(2*pi*R*cos(lat))). Mirrors
+                // testAnalyticPrim's sphere uv_scale.
+                {
+                    const float R  = std::max(r, 1e-4f);
+                    const float cl = std::max(std::sqrt(sn.x * sn.x + sn.z * sn.z), 0.05f);
+                    out.uv_scale = std::max(1.0f / (glm::pi<float>() * R),
+                                            1.0f / (2.0f * glm::pi<float>() * R * cl));
+                }
                 out.tex_tiles[0] = f2u(v6[0]);
                 out.tex_tiles[1] = f2u(v6[1]);
                 out.tex_tiles[2] = f2u(v6[2]);
@@ -552,6 +624,8 @@ void TraceScene(const glm::vec3& ro, const glm::vec3& rd,
                 else if (an.x >= an.z)             puv = glm::vec2(hp.z, hp.y);
                 else                               puv = glm::vec2(hp.x, hp.y);
                 out.uv = puv;
+                // Planar UV is isometric (1 UV unit = 1 metre) -> unit density.
+                out.uv_scale = 1.0f;
                 out.tex_tiles[0] = f2u(v6[0]);
                 out.tex_tiles[1] = f2u(v6[1]);
                 out.tex_tiles[2] = f2u(v6[2]);
@@ -821,6 +895,15 @@ void RunPathTraceKernel(SoftwareDevice& device,
                     // No-op for untextured hits and when the atlas is
                     // unbound. Primary hit only -- shadow rays need just
                     // occlusion, so they skip this like the GPU path.
+                    //
+                    // Ray-cone mip LOD: this is a single-bounce primary tracer,
+                    // so the cone diameter at the hit = pixel_spread * t. The
+                    // 1/|cos| grazing stretch inside PbrConeTexLod is what
+                    // removes the receding-checkerboard aliasing at the horizon.
+                    const float cone_spread = (2.0f * fov_tan)
+                                            / static_cast<float>(std::max(h, 1u));
+                    h0.tex_lod = PbrConeTexLod(cone_spread * h0.t, rd,
+                                               h0.normal, h0.uv_scale);
                     ApplyPbrTextures(h0, pbr_atlas);
                     // Lambert direct lighting from the procedural sun.
                     // Shadow test: trace from a slightly-offset hit

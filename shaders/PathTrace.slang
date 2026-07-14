@@ -315,6 +315,18 @@ Texture2D<float4> pbr_atlas;
 static const uint kPbrTileSize   = 256u;
 static const uint kPbrAtlasTiles = 16u;
 static const uint kPbrNoTexTile  = 0xFFFFFFFFu;
+// Mip pyramid (fixes horizon aliasing when a tile minifies into the far
+// field). Every tile band now carries a full box-filtered mip chain:
+//   level 0     : the base kPbrTileSize-square image at x=[0, kPbrTileSize)
+//   levels 1..8 : packed into the right column x=[kPbrTileSize, 3/2*kPbrTileSize)
+//                 stacked vertically inside the SAME 256-row band
+//                 (128+64+...+1 = 255 rows <= kPbrTileSize).
+// The atlas is therefore kPbrTileSize*3/2 wide (was kPbrTileSize); the band
+// height (and kPbrAtlasTiles*kPbrTileSize atlas height) is unchanged. LOD is
+// picked per hit from a ray cone (no ddx/ddy on analytic prims). Engine.h's
+// kPbrAtlasWidth / kPbrMipLevels build + upload the pyramid; these MUST match.
+static const uint kPbrAtlasWidth = kPbrTileSize + kPbrTileSize / 2u;  // 384
+static const uint kPbrMaxLod     = 8u;   // log2(kPbrTileSize=256)
 // --- end Wave 8 PBR -------------------------------------------------------
 
 // GPU-resident exposure scalar. Updated each frame by AutoExposure.slang
@@ -1437,43 +1449,95 @@ float3 srgbToLinear(float3 c) {
     return select(c <= 0.04045, lo, hi);
 }
 
-// Bilinear-fetch one atlas tile at the (wrapped) tile-local UV. Returns
-// the raw RGBA (no colour-space conversion). `tile` MUST be a valid
-// (non-kPbrNoTexTile) index; callers gate on that before calling.
-float4 samplePbrTileLinear(uint tile, float2 uv) {
+// Atlas origin (x0,y0) + square dimension of mip `level` for a tile band.
+// Level 0 is the base image at the band's left; levels 1..kPbrMaxLod are the
+// right-column stack. y0 = row_base + (kPbrTileSize - 2*dim) packs each level
+// directly below the previous one (128 rows, then 64, ...). MUST mirror
+// Engine::WritePbrTileWithMips in Engine.cpp.
+void pbrMipRegion(uint tile, uint level, out uint x0, out uint y0, out uint dim) {
+    uint row_base = tile * kPbrTileSize;
+    if (level == 0u) {
+        x0 = 0u; y0 = row_base; dim = kPbrTileSize;
+    } else {
+        dim = kPbrTileSize >> level;                 // 128,64,...,1
+        x0  = kPbrTileSize;                           // right column
+        y0  = row_base + (kPbrTileSize - 2u * dim);   // vertical stack
+    }
+}
+
+// Bilinear-fetch one mip `level` of a tile at the (wrapped) tile-local UV.
+// Returns the raw RGBA (no colour-space conversion). `tile` MUST be a valid
+// (non-kPbrNoTexTile) index; callers gate on that before calling. The in-tile
+// wrap is at the LEVEL's resolution so tiling textures repeat seamlessly at
+// every mip.
+float4 samplePbrTileLevel(uint tile, float2 uv, uint level) {
+    uint x0, y0, dim;
+    pbrMipRegion(tile, level, x0, y0, dim);
     // Wrap into [0,1) so tiling textures repeat; frac handles negatives.
     float2 fuv = frac(uv);
-    // Tile-local pixel coordinate (continuous), then split into the
-    // four surrounding texels for the bilinear blend.
-    float fx = fuv.x * float(kPbrTileSize) - 0.5;
-    float fy = fuv.y * float(kPbrTileSize) - 0.5;
+    // Level-local pixel coordinate (continuous), then split into the four
+    // surrounding texels for the bilinear blend.
+    float fx = fuv.x * float(dim) - 0.5;
+    float fy = fuv.y * float(dim) - 0.5;
     float fx0 = floor(fx);
     float fy0 = floor(fy);
     float tx = fx - fx0;
     float ty = fy - fy0;
+    int   D   = int(dim);
     int   ix0 = int(fx0);
     int   iy0 = int(fy0);
-    // Clamp within the tile (wrap the in-tile coordinate so the bilinear
-    // tap at the tile edge samples the opposite edge -- seamless tiling).
-    int W = int(kPbrTileSize);
-    int ix1 = ((ix0 + 1) % W + W) % W;
-    int iy1 = ((iy0 + 1) % W + W) % W;
-    ix0 = (ix0 % W + W) % W;
-    iy0 = (iy0 % W + W) % W;
-    // Vertical-strip atlas: row offset = tile * kPbrTileSize.
-    uint row_base = tile * kPbrTileSize;
-    float4 c00 = pbr_atlas[uint2(uint(ix0), row_base + uint(iy0))];
-    float4 c10 = pbr_atlas[uint2(uint(ix1), row_base + uint(iy0))];
-    float4 c01 = pbr_atlas[uint2(uint(ix0), row_base + uint(iy1))];
-    float4 c11 = pbr_atlas[uint2(uint(ix1), row_base + uint(iy1))];
+    // Wrap the in-level coordinate so the +1 tap at the level edge samples
+    // the opposite edge (seamless tiling at every mip).
+    int ix1 = ((ix0 + 1) % D + D) % D;
+    int iy1 = ((iy0 + 1) % D + D) % D;
+    ix0 = (ix0 % D + D) % D;
+    iy0 = (iy0 % D + D) % D;
+    float4 c00 = pbr_atlas[uint2(x0 + uint(ix0), y0 + uint(iy0))];
+    float4 c10 = pbr_atlas[uint2(x0 + uint(ix1), y0 + uint(iy0))];
+    float4 c01 = pbr_atlas[uint2(x0 + uint(ix0), y0 + uint(iy1))];
+    float4 c11 = pbr_atlas[uint2(x0 + uint(ix1), y0 + uint(iy1))];
     float4 cx0 = lerp(c00, c10, tx);
     float4 cx1 = lerp(c01, c11, tx);
     return lerp(cx0, cx1, ty);
 }
 
-// Albedo sample: bilinear fetch + sRGB->linear decode.
-float3 samplePbrTileSrgb(uint tile, float2 uv) {
-    return srgbToLinear(samplePbrTileLinear(tile, uv).rgb);
+// Trilinear-fetch a tile at fractional LOD `lod`: bilinear within the two
+// bracketing mip levels, then linear blend between them. lod <= 0 reads
+// level 0 verbatim (bit-identical to the pre-mip bilinear fetch), so
+// magnified surfaces are unchanged. Returns raw RGBA (no colour conversion).
+float4 samplePbrTileLinear(uint tile, float2 uv, float lod) {
+    float l  = clamp(lod, 0.0, float(kPbrMaxLod));
+    uint  l0 = uint(floor(l));
+    uint  l1 = min(l0 + 1u, kPbrMaxLod);
+    float f  = l - float(l0);
+    float4 a = samplePbrTileLevel(tile, uv, l0);
+    if (f <= 0.0) return a;
+    float4 b = samplePbrTileLevel(tile, uv, l1);
+    return lerp(a, b, f);
+}
+
+// Albedo sample: trilinear fetch + sRGB->linear decode. The mip chain is
+// box-filtered in the stored (sRGB-encoded) byte space, which is the self-
+// consistent choice here because the decode is applied AFTER the trilinear
+// blend of raw texels (the same order the level-0 path already used).
+float3 samplePbrTileSrgb(uint tile, float2 uv, float lod) {
+    return srgbToLinear(samplePbrTileLinear(tile, uv, lod).rgb);
+}
+
+// Ray-cone texture LOD (Akenine-Moller et al., "Texture Level of Detail
+// Strategies for Real-Time Ray Tracing", Ray Tracing Gems 2019, ch. 20).
+// Analytic prims have no automatic ddx/ddy, so we grow a cone of angular
+// width `cone_width` (diameter at the hit, = pixel spread * path length) and
+// project it onto the surface. The 1/|cos| stretch at grazing angles is what
+// kills the horizon aliasing: a receding checkerboard is both far (large
+// cone_width) and grazing (small cos), so the footprint -> coarse mip.
+// uv_scale is the surface's UV-units-per-metre density (1 for the planar
+// map, higher on a sphere); uv_scale <= 0 (meshes / unmapped) -> level 0.
+float pbrConeTexLod(float cone_width, float3 rd, float3 n, float uv_scale) {
+    if (uv_scale <= 0.0) return 0.0;
+    float cos_i  = max(abs(dot(rd, n)), 1e-3);
+    float texels = (cone_width / cos_i) * uv_scale * float(kPbrTileSize);
+    return clamp(log2(max(texels, 1.0)), 0.0, float(kPbrMaxLod));
 }
 
 // Build a tangent-space basis from a geometric normal + the surface UV
@@ -1502,15 +1566,19 @@ float3 applyNormalMap(float3 n, float3 ts_normal) {
 // right before the BSDF dispatch, so ALL material branches (Lambert /
 // metal / dielectric) see the textured values for free.
 void applyPbrTextures(inout HitInfo h) {
+    // Trilinear LOD for every map (mip-filtered by the ray-cone footprint in
+    // h.tex_lod, set at the hit site). All four maps share the same UV +
+    // footprint, so they select the same LOD.
+    float lod = h.tex_lod;
     // Albedo (sRGB-decoded, multiplies the flat tint so a white flat
     // albedo passes the texture through unchanged).
     if (h.tex_tiles.x != kPbrNoTexTile) {
-        h.albedo *= samplePbrTileSrgb(h.tex_tiles.x, h.uv);
+        h.albedo *= samplePbrTileSrgb(h.tex_tiles.x, h.uv, lod);
     }
     // Roughness (linear; .r scales the flat roughness, so a flat 1.0
     // roughness with a gradient map yields the map directly).
     if (h.tex_tiles.z != kPbrNoTexTile) {
-        float r = samplePbrTileLinear(h.tex_tiles.z, h.uv).r;
+        float r = samplePbrTileLinear(h.tex_tiles.z, h.uv, lod).r;
         h.roughness = saturate(h.roughness * r);
     }
     // Metallic (linear; .r drives a Lambert->metal switch above 0.5).
@@ -1518,14 +1586,14 @@ void applyPbrTextures(inout HitInfo h) {
     // metallic map lets a Lambert-typed material turn metal where the
     // map is white (parity with glTF metalness; modest scope).
     if (h.tex_tiles.w != kPbrNoTexTile) {
-        float m = samplePbrTileLinear(h.tex_tiles.w, h.uv).r;
+        float m = samplePbrTileLinear(h.tex_tiles.w, h.uv, lod).r;
         if (m > 0.5 && h.mat == MAT_LAMBERT) h.mat = MAT_METAL;
     }
     // Normal map (tangent-space, [0,1]->[-1,1]). Perturb the shading
     // normal LAST so the metallic/roughness reads above used the
     // geometric normal's UV (the UV is independent of the normal anyway).
     if (h.tex_tiles.y != kPbrNoTexTile) {
-        float3 ts = samplePbrTileLinear(h.tex_tiles.y, h.uv).rgb * 2.0 - 1.0;
+        float3 ts = samplePbrTileLinear(h.tex_tiles.y, h.uv, lod).rgb * 2.0 - 1.0;
         h.normal = applyNormalMap(h.normal, ts);
     }
 }
@@ -1574,6 +1642,14 @@ struct HitInfo {
     // w=metallic. All default to kPbrNoTexTile so non-textured hits skip
     // the sample entirely and render bit-identically to the flat path.
     uint4 tex_tiles;
+    // Ray-cone mip LOD support. uv_scale is the surface's UV-units-per-metre
+    // density, set by the analytic-prim hit paths (1 for planes, lat/long
+    // density for spheres); 0 on mesh / SDF / miss paths -> base level. tex_lod
+    // is the fractional mip level, computed at the hit site from the cone
+    // footprint (pbrConeTexLod) and consumed by applyPbrTextures. Both default
+    // to 0 so untextured hits are unaffected.
+    float uv_scale;
+    float tex_lod;
     // --- end Wave 8 PBR -------------------------------------------------
     // --- Wave 9 advanced materials --------------------------------------
     // BSDF lobe extension flags + params for this hit, resolved from the
@@ -2034,6 +2110,15 @@ void testAnalyticPrim(uint idx, float3 ro, float3 rd, float shutter_t01, inout H
             h.uv = float2(0.5 + atan2(sn.z, sn.x) / (2.0 * kPI),
                           0.5 - asin(clamp(sn.y, -1.0, 1.0)) / kPI);
             h.tex_tiles = tex_tiles;
+            // Ray-cone LOD density (UV units per metre along the surface).
+            // Latitude is uniform: dv/ds = 1/(pi*R). Longitude is denser near
+            // the poles: du/ds = 1/(2*pi*R*cos(lat)); clamp cos(lat) so the
+            // pole singularity can't force an absurd LOD. Take the max axis so
+            // the coarser-needed direction wins (conservative vs aliasing).
+            float sphere_R = max(v0.w, 1e-4);
+            float cos_lat  = max(length(sn.xz), 0.05);
+            h.uv_scale = max(1.0 / (kPI * sphere_R),
+                             1.0 / (2.0 * kPI * sphere_R * cos_lat));
         }
     } else if (type == PRIM_PLANE) {
         // Rotate the stored normal by the orientation quaternion. With
@@ -2067,6 +2152,10 @@ void testAnalyticPrim(uint idx, float3 ro, float3 rd, float shutter_t01, inout H
             }
             h.uv = puv;
             h.tex_tiles = tex_tiles;
+            // Planar UV is isometric (1 UV unit = 1 metre) regardless of the
+            // plane's orientation, so the texel density is exactly one UV unit
+            // per metre. This is the surface that aliases at the horizon.
+            h.uv_scale = 1.0;
         }
     }
 }
@@ -2265,6 +2354,11 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01) {
     // render with their flat albedo exactly as before.
     h.uv = float2(0.0, 0.0);
     h.tex_tiles = uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
+    // Ray-cone mip LOD: default to base level (uv_scale 0 -> no LOD). The
+    // analytic sphere / plane branches set uv_scale; the trace loop fills
+    // tex_lod from the cone footprint before applyPbrTextures.
+    h.uv_scale = 0.0;
+    h.tex_lod  = 0.0;
     // Wave 9 advanced materials: default to no extension lobe. resolveMatExt
     // (called once at the hit site, after applyPbrTextures) fills these from
     // the push-constant mat_overrides array when the hit's prim id matches
@@ -5816,6 +5910,14 @@ void main(uint2 tid : SV_DispatchThreadID) {
         bool   primary_t_recorded = false;
         bool   primary_hit = false;
 
+        // Ray-cone texture LOD state (RT Gems 2019, ch. 20). cone_spread is
+        // the angular size of one pixel (isometric for square pixels:
+        // 2*tan(fovY/2)/height); cone_width is the cone diameter at the
+        // current ray origin, grown by spread*segment each hit so deeper
+        // bounces read progressively coarser mips. Reset per camera sample.
+        float cone_spread = (2.0 * pos_fovtan.w) / float(max(dim.y, 1u));
+        float cone_width  = 0.0;
+
         for (uint b = 0u; b < max_bounces; ++b) {
         HitInfo h = traceScene(ro, rd, shutter_t01);
         // --- Wave 8 ocean (#25) -- displace the analytic water plane --------
@@ -6051,6 +6153,14 @@ void main(uint2 tid : SV_DispatchThreadID) {
         }
 
         float3 hit_pt = ro + rd * h.t;
+
+        // Ray-cone mip LOD (#26 follow-up): widen the cone by this segment's
+        // length, then project onto the surface for a fractional mip level.
+        // Must run BEFORE applyPbrTextures so the trilinear fetch is filtered.
+        // Grazing/far hits (the receding checkerboard horizon) get a coarse
+        // LOD, which is what removes the far-field texture aliasing.
+        cone_width += cone_spread * h.t;
+        h.tex_lod = pbrConeTexLod(cone_width, rd, h.normal, h.uv_scale);
 
         // Wave 8 PBR (#26): apply the hit material's texture maps in place
         // BEFORE deriving the front-facing normal (so a normal map feeds
