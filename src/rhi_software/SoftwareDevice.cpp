@@ -495,9 +495,7 @@ bool SoftwareDevice::WriteTexture(TextureHandle h, const void* src, std::size_t 
     // [0,1] values -- exactly what the GPU gets from an rgba8 texture read
     // -- so expand each byte to byte/255 here instead of memcpy-
     // reinterpreting the byte stream as floats (which would decode four
-    // texels' bytes as one garbage float). Only the exact width*height*4-
-    // byte upload is converted; a short / oversized write falls through to
-    // the raw-copy path below so a malformed upload can't walk off the end.
+    // texels' bytes as one garbage float).
     if (t->format == TextureFormat::RGBA8_UNORM) {
         // One entry per channel (width*height*4). The RGBA8 source holds one
         // byte per channel and the float backing one float per channel, so
@@ -507,13 +505,19 @@ bool SoftwareDevice::WriteTexture(TextureHandle h, const void* src, std::size_t 
         // their own units, they are not conflated.
         const std::size_t channel_count =
             std::size_t(t->width) * t->height * 4u;
-        if (size == channel_count && t->data.size() >= channel_count) {
-            const std::uint8_t* b = static_cast<const std::uint8_t*>(src);
-            for (std::size_t i = 0; i < channel_count; ++i) {
-                t->data[i] = static_cast<float>(b[i]) * (1.0f / 255.0f);
-            }
-            return true;
+        // A mismatched RGBA8 upload is malformed: per Device::WriteTexture's
+        // contract, return false rather than falling through to the generic
+        // raw-copy path below. That path reinterprets the byte stream as
+        // floats (garbage for RGBA8) and returns true, which would silently
+        // leave the atlas the CPU tracer samples partially updated / garbled.
+        if (size != channel_count || t->data.size() < channel_count) {
+            return false;
         }
+        const std::uint8_t* b = static_cast<const std::uint8_t*>(src);
+        for (std::size_t i = 0; i < channel_count; ++i) {
+            t->data[i] = static_cast<float>(b[i]) * (1.0f / 255.0f);
+        }
+        return true;
     }
     // The internal storage is always RGBA32F (4 floats per pixel).
     // The engine may upload in other formats (RGBA16F for star/moon
