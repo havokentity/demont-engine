@@ -371,8 +371,8 @@ public:
     // (e.g. a procedural test tile). O(N) over the (small) atlas map.
     std::string PbrTilePath(std::uint32_t tile) const {
         if (tile == kPbrNoTexTile) return {};
-        for (const auto& [path, idx] : pbr_tile_by_path_) {
-            if (idx == tile) return path;
+        for (const auto& [path, entry] : pbr_tile_by_path_) {
+            if (entry.tile == tile) return path;
         }
         return {};
     }
@@ -905,6 +905,16 @@ private:
         std::map<std::uint32_t, pt::renderer::SdfPrim> sdf;
         SelectionKind                                  sel_kind = SelectionKind::None;
         std::uint32_t                                  sel_id   = 0;
+        // Per-prim PBR texture source paths ([albedo, normal, roughness,
+        // metallic]), captured alongside the raw AnalyticPrim tile indices
+        // above. The atlas is now a reclaimable cache (AcquirePbrTile), so a
+        // raw tile index saved here can point at an UNRELATED texture by the
+        // time a later scene_undo/redo restores it. ApplySceneSnapshot
+        // re-resolves these paths back into live tiles on restore (mirrors
+        // the scene_load re-resolution). Only prims with at least one
+        // path-backed map get an entry; an empty path leaves the restored
+        // raw index untouched (e.g. procedural tiles with no source file).
+        std::map<std::uint32_t, std::array<std::string, 4>> prim_tex_paths;
     };
     std::deque<SceneSnapshot>                   scene_undo_stack_;
     std::deque<SceneSnapshot>                   scene_redo_stack_;
@@ -1556,26 +1566,62 @@ private:
     std::uint64_t                               pbr_atlas_tex_id_      = 0;
     // CPU-side staging copy of the whole atlas (RGBA8). Edits write a tile
     // here then re-upload the whole atlas (atlases are small: 256 x 4096 x
-    // 4B = 4 MiB at the defaults). next_pbr_tile_ is the bump allocator
-    // for fresh tiles.
+    // 4B = 4 MiB at the defaults). next_pbr_tile_ is the bump-allocator
+    // high-water mark: it climbs to kPbrAtlasTiles and never rewinds. Once
+    // it saturates, AcquirePbrTile reclaims tiles no prim / mesh slot
+    // references anymore (see there) so a long editing session that swaps
+    // textures many times doesn't permanently exhaust the 15 usable slots.
     std::vector<std::uint8_t>                   pbr_atlas_staging_;
     std::uint32_t                               next_pbr_tile_         = 1u;  // tile 0 reserved (flat white)
-    // Maps an absolute texture path -> tile index so re-loading the same
-    // image is a no-op and multiple materials can share one tile.
-    std::unordered_map<std::string, std::uint32_t> pbr_tile_by_path_;
+    // Per-cached-texture record: which atlas tile a source path was
+    // imported into, plus the file's last-write time (raw file_clock
+    // ticks; 0 = unknown) captured at import. De-dupes so the same path
+    // maps to one tile and multiple materials can share it. The mtime lets
+    // a later load of the same path re-read the file and overwrite the tile
+    // in place when the file changed on disk, instead of serving the stale
+    // pixels -- see LoadPbrTextureTile.
+    struct PbrTileCache {
+        std::uint32_t tile  = kPbrNoTexTile;
+        std::int64_t  mtime = 0;
+    };
+    std::unordered_map<std::string, PbrTileCache> pbr_tile_by_path_;
     // Lazily allocate + zero the atlas (tile 0 = flat white). Returns
     // false if the device texture allocation fails. Safe to call every
     // frame -- no-op once allocated.
     bool EnsurePbrAtlas();
-    // Load an image file (PNG / JPG via stb_image) into a fresh atlas
-    // tile, scaled to kPbrTileSize. `srgb` is informational only (the
-    // atlas is linear-storage; the shader decodes per-material). Returns
-    // the tile index, or kPbrNoTexTile on failure. De-dupes by path.
-    std::uint32_t LoadPbrTextureTile(const std::string& path);
-    // Write a procedurally-generated kPbrTileSize^2 RGBA8 tile (used by
-    // the built-in test patterns + as a fallback when an image is
-    // missing). Returns the tile index.
+    // Load an image file (PNG / JPG via stb_image) into an atlas tile,
+    // scaled to kPbrTileSize. De-dupes by path: a cached path serves its
+    // existing tile UNLESS `force_reload` is set or the file's on-disk
+    // mtime advanced since import, in which case the file is re-read and
+    // the SAME tile is overwritten in place (every prim already pointing
+    // at it updates without re-pointing). Returns the tile index, or
+    // kPbrNoTexTile on failure -- including a failed reload, which reports
+    // failure but leaves the existing tile's pixels untouched so a prim
+    // already pointing at it keeps rendering the prior image.
+    std::uint32_t LoadPbrTextureTile(const std::string& path,
+                                     bool force_reload = false);
+    // Write a kPbrTileSize^2 RGBA8 tile into a freshly-acquired atlas slot
+    // (procedural test patterns / image tiles). Records `key`->tile in the
+    // path cache when non-empty. Returns the tile index, or kPbrNoTexTile
+    // when every usable tile is still referenced.
     std::uint32_t AddPbrTileFromPixels(const std::uint8_t* rgba, const std::string& key);
+    // Hand out an atlas tile for a fresh import. Extends the bump range
+    // while slots remain; once saturated, reclaims a tile that no prim /
+    // mesh slot still references (the atlas is a pure cache, so a tile
+    // nothing points at carries no visible state and recycling it is
+    // loss-free -- no LRU ordering needed). Drops the reclaimed tile's
+    // stale path-cache entry. Returns kPbrNoTexTile only when all 15
+    // usable tiles are genuinely live. Tile 0 (flat white) stays pinned.
+    std::uint32_t AcquirePbrTile();
+    // Copy one kPbrTileSize^2 RGBA8 tile into `tile`'s slot in the staging
+    // atlas and re-upload the whole atlas (WaitIdle first so we don't stomp
+    // a tile an in-flight dispatch is still sampling). Moves pixels only --
+    // the caller owns cache / lifetime bookkeeping.
+    void WritePbrTilePixels(std::uint32_t tile, const std::uint8_t* rgba);
+    // Erase the (single, de-duped) path-cache entry mapping to `tile`, so a
+    // future load of that path re-imports it instead of aliasing a slot we
+    // just recycled for a different texture. No-op if nothing maps to it.
+    void ErasePbrTilePathForTile(std::uint32_t tile);
     // Deferred texture-load queue. The console / fixture texture commands
     // run during Init BEFORE the RHI device is created (the device boots
     // after both the early and late smoke-exec passes), so loading an
