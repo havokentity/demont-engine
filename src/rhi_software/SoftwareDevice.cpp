@@ -499,11 +499,17 @@ bool SoftwareDevice::WriteTexture(TextureHandle h, const void* src, std::size_t 
     // byte upload is converted; a short / oversized write falls through to
     // the raw-copy path below so a malformed upload can't walk off the end.
     if (t->format == TextureFormat::RGBA8_UNORM) {
-        const std::size_t texel_bytes =
+        // One entry per channel (width*height*4). The RGBA8 source holds one
+        // byte per channel and the float backing one float per channel, so
+        // this single count is simultaneously the expected source *byte*
+        // count (`size`, in bytes) and the destination *float* count
+        // (`t->data.size()`, in floats) -- the two comparisons below read in
+        // their own units, they are not conflated.
+        const std::size_t channel_count =
             std::size_t(t->width) * t->height * 4u;
-        if (size == texel_bytes && t->data.size() >= texel_bytes) {
+        if (size == channel_count && t->data.size() >= channel_count) {
             const std::uint8_t* b = static_cast<const std::uint8_t*>(src);
-            for (std::size_t i = 0; i < texel_bytes; ++i) {
+            for (std::size_t i = 0; i < channel_count; ++i) {
                 t->data[i] = static_cast<float>(b[i]) * (1.0f / 255.0f);
             }
             return true;

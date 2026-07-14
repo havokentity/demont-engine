@@ -125,14 +125,16 @@ constexpr std::uint32_t kMatLambert = 0u;
 constexpr std::uint32_t kMatMetal   = 1u;   // MAT_METAL in PathTrace.slang
 constexpr std::uint32_t kFloatsPerPrim = 28u;
 
-// Wave 8 PBR (#26) material texture atlas geometry. MUST match Engine.h's
-// kPbrTileSize / kPbrAtlasTiles and PathTrace.slang's copies: the atlas is
-// a vertical strip of kPbrTileSize-square tiles (kPbrTileSize wide,
-// kPbrAtlasTiles * kPbrTileSize tall). A per-map tile index selects the
-// vertical band; kPbrNoTexTile marks an unassigned map.
-constexpr std::uint32_t kPbrTileSize   = 256u;
-constexpr std::uint32_t kPbrAtlasTiles = 16u;
-constexpr std::uint32_t kPbrNoTexTile  = 0xFFFFFFFFu;
+// Wave 8 PBR (#26) material texture atlas geometry. kPbrTileSize MUST match
+// Engine.h's kPbrTileSize and PathTrace.slang's copy: the atlas is a
+// vertical strip of kPbrTileSize-square tiles (kPbrTileSize wide, a whole
+// number of tiles tall). A per-map tile index selects the vertical band;
+// kPbrNoTexTile marks an unassigned map. The tile *count* is derived from
+// the bound atlas' height at sample time (see ApplyPbrTextures) rather than
+// hard-coded, so it tracks whatever the host allocated (Engine's
+// kPbrAtlasTiles).
+constexpr std::uint32_t kPbrTileSize  = 256u;
+constexpr std::uint32_t kPbrNoTexTile = 0xFFFFFFFFu;
 
 struct HitInfo {
     bool      hit = false;
@@ -429,8 +431,9 @@ inline void ApplyPbrTextures(HitInfo& h, const BackedTexture* atlas) {
     // `tile < n_tiles` both skips the kPbrNoTexTile sentinel (0xFFFFFFFF is
     // never < n_tiles) and clamps any out-of-range index -- the GPU fetch
     // wraps/clamps in hardware, but a raw CPU index would walk off the
-    // atlas backing, so we must bound it here. For valid host data (tiles
-    // 0..kPbrAtlasTiles-1) this is identical to the shader's != gate.
+    // atlas backing, so we must bound it here. For valid host data (every
+    // assigned tile within the allocated atlas) this is identical to the
+    // shader's `!= kPbrNoTexTile` gate.
     const std::uint32_t n_tiles = atlas->height / kPbrTileSize;
     // Albedo (sRGB -> linear, multiplies the flat tint so a white flat
     // albedo passes the texture through unchanged).
