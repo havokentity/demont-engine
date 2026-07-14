@@ -70,6 +70,13 @@ struct BackedTexture {
     std::vector<float> data;       // width * height * 4 floats
     std::uint32_t      width  = 0;
     std::uint32_t      height = 0;
+    // The GPU-side format the engine requested at CreateTexture. Stored so
+    // WriteTexture can normalise byte-encoded uploads (the RGBA8_UNORM PBR
+    // material atlas) into the RGBA32F backing the tracer samples, instead
+    // of memcpy-reinterpreting bytes as floats (which would decode four
+    // texels' bytes as one garbage float). RGBA16F / RGBA32F sources keep
+    // the raw-copy path -- the tracer treats them as float data already.
+    TextureFormat      format = TextureFormat::RGBA8_UNORM;
     std::string        debug_name;
 };
 

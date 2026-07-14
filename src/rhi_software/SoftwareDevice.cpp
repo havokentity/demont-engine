@@ -314,6 +314,7 @@ TextureHandle SoftwareDevice::CreateTexture(const TextureDesc& d) {
     auto t = std::make_unique<BackedTexture>();
     t->width      = d.width;
     t->height     = d.height;
+    t->format     = d.format;
     t->debug_name = d.debug_name;
     t->data.assign(static_cast<std::size_t>(d.width) * d.height * 4, 0.0f);
     auto bytes = t->data.size() * sizeof(float);
@@ -489,6 +490,31 @@ bool SoftwareDevice::WriteTexture(TextureHandle h, const void* src, std::size_t 
         if (it != textures_.end()) t = it->second.get();
     }
     if (t == nullptr || src == nullptr) return false;
+    // RGBA8_UNORM sources (the Wave 8 PBR material atlas) upload one byte
+    // per channel. The tracer samples the float backing as normalised
+    // [0,1] values -- exactly what the GPU gets from an rgba8 texture read
+    // -- so expand each byte to byte/255 here instead of memcpy-
+    // reinterpreting the byte stream as floats (which would decode four
+    // texels' bytes as one garbage float). Only the exact width*height*4-
+    // byte upload is converted; a short / oversized write falls through to
+    // the raw-copy path below so a malformed upload can't walk off the end.
+    if (t->format == TextureFormat::RGBA8_UNORM) {
+        // One entry per channel (width*height*4). The RGBA8 source holds one
+        // byte per channel and the float backing one float per channel, so
+        // this single count is simultaneously the expected source *byte*
+        // count (`size`, in bytes) and the destination *float* count
+        // (`t->data.size()`, in floats) -- the two comparisons below read in
+        // their own units, they are not conflated.
+        const std::size_t channel_count =
+            std::size_t(t->width) * t->height * 4u;
+        if (size == channel_count && t->data.size() >= channel_count) {
+            const std::uint8_t* b = static_cast<const std::uint8_t*>(src);
+            for (std::size_t i = 0; i < channel_count; ++i) {
+                t->data[i] = static_cast<float>(b[i]) * (1.0f / 255.0f);
+            }
+            return true;
+        }
+    }
     // The internal storage is always RGBA32F (4 floats per pixel).
     // The engine may upload in other formats (RGBA16F for star/moon
     // maps, raw RGBA32F for env_map), but the v1 path tracer doesn't
