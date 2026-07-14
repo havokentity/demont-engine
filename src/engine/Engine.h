@@ -905,6 +905,16 @@ private:
         std::map<std::uint32_t, pt::renderer::SdfPrim> sdf;
         SelectionKind                                  sel_kind = SelectionKind::None;
         std::uint32_t                                  sel_id   = 0;
+        // Per-prim PBR texture source paths ([albedo, normal, roughness,
+        // metallic]), captured alongside the raw AnalyticPrim tile indices
+        // above. The atlas is now a reclaimable cache (AcquirePbrTile), so a
+        // raw tile index saved here can point at an UNRELATED texture by the
+        // time a later scene_undo/redo restores it. ApplySceneSnapshot
+        // re-resolves these paths back into live tiles on restore (mirrors
+        // the scene_load re-resolution). Only prims with at least one
+        // path-backed map get an entry; an empty path leaves the restored
+        // raw index untouched (e.g. procedural tiles with no source file).
+        std::map<std::uint32_t, std::array<std::string, 4>> prim_tex_paths;
     };
     std::deque<SceneSnapshot>                   scene_undo_stack_;
     std::deque<SceneSnapshot>                   scene_redo_stack_;
@@ -1585,7 +1595,9 @@ private:
     // mtime advanced since import, in which case the file is re-read and
     // the SAME tile is overwritten in place (every prim already pointing
     // at it updates without re-pointing). Returns the tile index, or
-    // kPbrNoTexTile on failure (a failed reload keeps the prior tile).
+    // kPbrNoTexTile on failure -- including a failed reload, which reports
+    // failure but leaves the existing tile's pixels untouched so a prim
+    // already pointing at it keeps rendering the prior image.
     std::uint32_t LoadPbrTextureTile(const std::string& path,
                                      bool force_reload = false);
     // Write a kPbrTileSize^2 RGBA8 tile into a freshly-acquired atlas slot

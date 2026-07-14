@@ -4107,9 +4107,14 @@ std::uint32_t Engine::LoadPbrTextureTile(const std::string& path,
     // pointing at it picks up the edit with no re-pointing.
     std::uint32_t reuse_tile = kPbrNoTexTile;
     if (auto it = pbr_tile_by_path_.find(path); it != pbr_tile_by_path_.end()) {
+        // Reload when forced, or when we can read a disk mtime that differs
+        // from the one we imported at. A stored mtime of 0 (the stat failed
+        // at import) is treated as "differs" the moment a real disk mtime
+        // becomes available, so the entry re-reads once and graduates to a
+        // tracked mtime instead of serving the stale tile forever. A disk
+        // mtime of 0 (file unstattable now) never forces a reload.
         const bool changed = force_reload ||
-            (disk_mtime != 0 && it->second.mtime != 0 &&
-             disk_mtime != it->second.mtime);
+            (disk_mtime != 0 && disk_mtime != it->second.mtime);
         if (!changed) return it->second.tile;
         reuse_tile = it->second.tile;
     }
@@ -4121,9 +4126,14 @@ std::uint32_t Engine::LoadPbrTextureTile(const std::string& path,
         LOG_WARN("pbr texture load '{}' (resolved '{}') failed: {}", path, resolved,
                  stbi_failure_reason() ? stbi_failure_reason() : "unknown");
         if (px) stbi_image_free(px);
-        // A failed reload keeps the existing tile (stale pixels beat a
-        // vanished texture); a failed first import has nothing to keep.
-        return reuse_tile;
+        // Report failure (kPbrNoTexTile), even for a forced reload of a
+        // cached tile. Nothing on screen changes: we never overwrote the
+        // tile's pixels, AssignOrQueuePbrTex early-returns on kPbrNoTexTile
+        // without touching the prim slot, and pbr_reload_tex doesn't
+        // reassign slots -- so the prim keeps rendering the prior tile.
+        // Returning reuse_tile here would make pbr_reload_tex falsely count
+        // a no-op as a successful reload.
+        return kPbrNoTexTile;
     }
     // Nearest-neighbour resample to the fixed tile size. Keeps the loader
     // dependency-free (no stb_image_resize) and is adequate for the
@@ -12261,6 +12271,23 @@ Engine::SceneSnapshot Engine::CaptureSceneSnapshot() const {
     s.sdf      = sdf_prims_;
     s.sel_kind = selected_kind_;
     s.sel_id   = selected_prim_id_;
+    // Record each prim's PBR texture PATHS next to its raw tile indices.
+    // Tiles are a reclaimable cache (AcquirePbrTile), so a raw index saved
+    // here can alias an unrelated texture by the time scene_undo/redo
+    // restores it -- ApplySceneSnapshot re-resolves these paths back into
+    // live tiles. Only path-backed tiles are recorded (PbrTilePath returns
+    // "" for kPbrNoTexTile / procedural tiles), and prims with no textured
+    // map are skipped entirely to keep snapshots lean.
+    for (const auto& [pid, p] : primitives_) {
+        std::array<std::string, 4> paths{
+            PbrTilePath(p.albedo_tex),    PbrTilePath(p.normal_tex),
+            PbrTilePath(p.roughness_tex), PbrTilePath(p.metallic_tex),
+        };
+        if (!paths[0].empty() || !paths[1].empty() ||
+            !paths[2].empty() || !paths[3].empty()) {
+            s.prim_tex_paths.emplace(pid, std::move(paths));
+        }
+    }
     return s;
 }
 
@@ -12274,6 +12301,27 @@ void Engine::ApplySceneSnapshot(const SceneSnapshot& s) {
     sdf_prims_        = s.sdf;
     selected_kind_    = s.sel_kind;
     selected_prim_id_ = s.sel_id;
+    // Re-resolve the captured PBR texture paths into live atlas tiles. The
+    // raw indices restored above are stale hints -- the tile cache reclaims
+    // and overwrites slots, so a saved index may now point at an unrelated
+    // texture. Reloading by path lands each map on a valid current tile (or
+    // flat if the file is gone). Requires the device (undo/redo is always
+    // interactive / post-boot); the map is empty for scene_load's manually
+    // built snapshot, which re-resolves from the file's own path table.
+    if (device_ != nullptr) {
+        for (const auto& [pid, paths] : s.prim_tex_paths) {
+            auto it = primitives_.find(pid);
+            if (it == primitives_.end()) continue;
+            std::uint32_t* slots[4] = {
+                &it->second.albedo_tex,    &it->second.normal_tex,
+                &it->second.roughness_tex, &it->second.metallic_tex,
+            };
+            for (int ch = 0; ch < 4; ++ch) {
+                if (paths[ch].empty()) continue;
+                *slots[ch] = LoadPbrTextureTile(paths[ch]);  // kPbrNoTexTile -> flat
+            }
+        }
+    }
     primitives_dirty_  = true;
     light_prims_dirty_ = true;
     sdf_prims_dirty_   = true;
