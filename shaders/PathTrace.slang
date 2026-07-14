@@ -324,7 +324,7 @@ static const uint kPbrNoTexTile  = 0xFFFFFFFFu;
 // The atlas is therefore kPbrTileSize*3/2 wide (was kPbrTileSize); the band
 // height (and kPbrAtlasTiles*kPbrTileSize atlas height) is unchanged. LOD is
 // picked per hit from a ray cone (no ddx/ddy on analytic prims). Engine.h's
-// kPbrAtlasWidth / kPbrMipLevels build + upload the pyramid; these MUST match.
+// kPbrAtlasWidth / kPbrMaxLod build + upload the pyramid; these MUST match.
 static const uint kPbrAtlasWidth = kPbrTileSize + kPbrTileSize / 2u;  // 384
 static const uint kPbrMaxLod     = 8u;   // log2(kPbrTileSize=256)
 // --- end Wave 8 PBR -------------------------------------------------------
@@ -1453,7 +1453,7 @@ float3 srgbToLinear(float3 c) {
 // Level 0 is the base image at the band's left; levels 1..kPbrMaxLod are the
 // right-column stack. y0 = row_base + (kPbrTileSize - 2*dim) packs each level
 // directly below the previous one (128 rows, then 64, ...). MUST mirror
-// Engine::WritePbrTileWithMips in Engine.cpp.
+// Engine::BuildPbrTileMips in Engine.cpp.
 void pbrMipRegion(uint tile, uint level, out uint x0, out uint y0, out uint dim) {
     uint row_base = tile * kPbrTileSize;
     if (level == 0u) {

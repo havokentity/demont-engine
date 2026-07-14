@@ -1581,8 +1581,9 @@ private:
                   "kPbrMaxLod must equal log2(kPbrTileSize)");
     std::uint64_t                               pbr_atlas_tex_id_      = 0;
     // CPU-side staging copy of the whole atlas (RGBA8). Edits write a tile
-    // here then re-upload the whole atlas (atlases are small: 256 x 4096 x
-    // 4B = 4 MiB at the defaults). next_pbr_tile_ is the bump-allocator
+    // (base level + its mip chain) here then re-upload the whole atlas
+    // (atlases are small: kPbrAtlasWidth x 4096 x 4B = ~6 MiB at the
+    // defaults). next_pbr_tile_ is the bump-allocator
     // high-water mark: it climbs to kPbrAtlasTiles and never rewinds. Once
     // it saturates, AcquirePbrTile reclaims tiles no prim / mesh slot
     // references anymore (see there) so a long editing session that swaps
