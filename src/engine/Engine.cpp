@@ -3984,7 +3984,9 @@ void Engine::UploadMeshUvs(const std::vector<float>& uvs,
 bool Engine::EnsurePbrAtlas() {
     if (!device_) return false;
     if (pbr_atlas_tex_id_ != 0) return true;   // already allocated
-    const std::uint32_t w = kPbrTileSize;
+    // Atlas is kPbrAtlasWidth wide (base tile column + the mip right-column);
+    // height is one kPbrTileSize-row band per tile (mips ride inside the band).
+    const std::uint32_t w = kPbrAtlasWidth;
     const std::uint32_t h = kPbrTileSize * kPbrAtlasTiles;
     auto tex = device_->CreateTexture({
         .width  = w,
@@ -4004,10 +4006,12 @@ bool Engine::EnsurePbrAtlas() {
     pbr_atlas_tex_id_ = tex.id;
     // Staging copy: whole atlas RGBA8, zero-cleared except tile 0 = flat
     // white (1,1,1,1) so an albedo material that points at the reserved
-    // tile multiplies through to its flat tint unchanged.
+    // tile multiplies through to its flat tint unchanged. Filling tile 0's
+    // ENTIRE band (all kPbrTileSize rows, full kPbrAtlasWidth) makes every
+    // mip level of tile 0 white too, so a tile-0 fetch at any LOD stays white.
     pbr_atlas_staging_.assign(std::size_t(w) * h * 4u, 0u);
     for (std::size_t i = 0; i < std::size_t(w) * kPbrTileSize * 4u; ++i) {
-        pbr_atlas_staging_[i] = 255u;   // tile 0 rows: opaque white
+        pbr_atlas_staging_[i] = 255u;   // tile 0 band (incl. mips): opaque white
     }
     next_pbr_tile_ = 1u;
     pbr_tile_by_path_.clear();
@@ -4053,11 +4057,12 @@ std::uint32_t Engine::AcquirePbrTile() {
 }
 
 void Engine::WritePbrTilePixels(std::uint32_t tile, const std::uint8_t* rgba) {
-    const std::size_t row_stride = std::size_t(kPbrTileSize) * 4u;
-    const std::size_t tile_off   = std::size_t(tile) * kPbrTileSize * row_stride;
-    std::memcpy(pbr_atlas_staging_.data() + tile_off, rgba,
-                std::size_t(kPbrTileSize) * row_stride);
-    // Re-upload the whole atlas (4 MiB at defaults). WaitIdle so we don't
+    // Write the base level + its full box-filtered mip chain into the band.
+    // The atlas is kPbrAtlasWidth-wide, so the base level is copied row by row
+    // and the mip pyramid packed into the right column (see BuildPbrTileMips)
+    // rather than one contiguous memcpy.
+    BuildPbrTileMips(tile, rgba);
+    // Re-upload the whole atlas (~6 MiB at defaults). WaitIdle so we don't
     // race an in-flight dispatch reading the atlas.
     device_->WaitIdle();
     device_->WriteTexture(pt::rhi::TextureHandle{pbr_atlas_tex_id_},
@@ -4079,6 +4084,65 @@ std::uint32_t Engine::AddPbrTileFromPixels(const std::uint8_t* rgba,
     WritePbrTilePixels(tile, rgba);
     if (!key.empty()) pbr_tile_by_path_[key].tile = tile;
     return tile;
+}
+
+void Engine::BuildPbrTileMips(std::uint32_t tile, const std::uint8_t* rgba) {
+    // Row stride of the (now kPbrAtlasWidth-wide) atlas, in bytes.
+    const std::size_t atlas_stride = std::size_t(kPbrAtlasWidth) * 4u;
+    // First row of this tile's band.
+    const std::size_t band_row = std::size_t(tile) * kPbrTileSize;
+
+    // Level 0: copy the source kPbrTileSize^2 tile (tightly packed, 4 B/texel)
+    // into the band's left region (x=[0,kPbrTileSize)) row by row -- the atlas
+    // stride is wider now, so a single memcpy of the whole tile is wrong. Keep
+    // a working copy of the current level for the downsample below.
+    std::vector<std::uint8_t> level(std::size_t(kPbrTileSize) * kPbrTileSize * 4u);
+    for (std::uint32_t y = 0; y < kPbrTileSize; ++y) {
+        const std::uint8_t* src = rgba + std::size_t(y) * kPbrTileSize * 4u;
+        std::uint8_t* dst = pbr_atlas_staging_.data()
+                          + (band_row + y) * atlas_stride;   // x0 = 0
+        std::memcpy(dst, src, std::size_t(kPbrTileSize) * 4u);
+        std::memcpy(level.data() + std::size_t(y) * kPbrTileSize * 4u, src,
+                    std::size_t(kPbrTileSize) * 4u);
+    }
+
+    // Levels 1..kPbrMaxLod: 2x2 box-filter (rounded mean) downsample of the
+    // previous level, packed into the right column (x0 = kPbrTileSize). The
+    // per-level vertical offset kPbrTileSize - 2*dim stacks them 128,64,...,1
+    // rows below the band top, mirroring PathTrace.slang's pbrMipRegion.
+    // Averaging is done in the STORED byte space (sRGB for albedo, linear for
+    // data maps) because the shader applies any sRGB decode AFTER the
+    // trilinear blend -- so encoded-space mips are the self-consistent choice.
+    std::uint32_t dim = kPbrTileSize;
+    for (std::uint32_t lvl = 1; lvl <= kPbrMaxLod; ++lvl) {
+        const std::uint32_t ndim = dim >> 1;   // 128, 64, ..., 1
+        std::vector<std::uint8_t> next(std::size_t(ndim) * ndim * 4u);
+        for (std::uint32_t y = 0; y < ndim; ++y) {
+            for (std::uint32_t x = 0; x < ndim; ++x) {
+                for (std::uint32_t c = 0; c < 4u; ++c) {
+                    const std::size_t r0 = std::size_t(2u * y)     * dim;
+                    const std::size_t r1 = std::size_t(2u * y + 1u) * dim;
+                    const std::uint32_t sum =
+                        std::uint32_t(level[(r0 + 2u * x)      * 4u + c]) +
+                        std::uint32_t(level[(r0 + 2u * x + 1u) * 4u + c]) +
+                        std::uint32_t(level[(r1 + 2u * x)      * 4u + c]) +
+                        std::uint32_t(level[(r1 + 2u * x + 1u) * 4u + c]);
+                    next[(std::size_t(y) * ndim + x) * 4u + c] =
+                        static_cast<std::uint8_t>((sum + 2u) >> 2);   // rounded /4
+                }
+            }
+        }
+        const std::size_t y_off = std::size_t(kPbrTileSize) - 2u * ndim;
+        for (std::uint32_t y = 0; y < ndim; ++y) {
+            std::uint8_t* dst = pbr_atlas_staging_.data()
+                              + (band_row + y_off + y) * atlas_stride
+                              + std::size_t(kPbrTileSize) * 4u;   // x0 = right column
+            std::memcpy(dst, next.data() + std::size_t(y) * ndim * 4u,
+                        std::size_t(ndim) * 4u);
+        }
+        level.swap(next);
+        dim = ndim;
+    }
 }
 
 std::uint32_t Engine::LoadPbrTextureTile(const std::string& path,
