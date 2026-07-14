@@ -4017,15 +4017,42 @@ bool Engine::EnsurePbrAtlas() {
     return true;
 }
 
-std::uint32_t Engine::AddPbrTileFromPixels(const std::uint8_t* rgba,
-                                           const std::string& key) {
-    if (!EnsurePbrAtlas()) return kPbrNoTexTile;
-    if (next_pbr_tile_ >= kPbrAtlasTiles) {
-        LOG_WARN("AddPbrTileFromPixels: atlas full ({} tiles); reusing tile 0",
-                 kPbrAtlasTiles);
-        return kPbrNoTexTile;
+void Engine::ErasePbrTilePathForTile(std::uint32_t tile) {
+    for (auto it = pbr_tile_by_path_.begin(); it != pbr_tile_by_path_.end();
+         ++it) {
+        if (it->second.tile == tile) { pbr_tile_by_path_.erase(it); return; }
     }
-    const std::uint32_t tile = next_pbr_tile_++;
+}
+
+std::uint32_t Engine::AcquirePbrTile() {
+    // Bump allocator still has an untouched slot below the high-water mark.
+    if (next_pbr_tile_ < kPbrAtlasTiles) return next_pbr_tile_++;
+    // Atlas saturated: mark every tile still referenced by a live prim /
+    // mesh material slot, then reclaim the first one nothing points at.
+    // The scan is O(prims) but only runs on an allocation once the 15
+    // usable slots are full, and needs no per-mutation refcount plumbing
+    // (undo/redo, scene load, prim_clear_tex all just change the slot
+    // values this reads). Tile 0 is the pinned flat-white tile.
+    std::array<bool, kPbrAtlasTiles> live{};
+    live[0] = true;
+    auto mark = [&](std::uint32_t t) { if (t < kPbrAtlasTiles) live[t] = true; };
+    for (const auto& [id, p] : primitives_) {
+        (void)id;
+        mark(p.albedo_tex);    mark(p.normal_tex);
+        mark(p.roughness_tex); mark(p.metallic_tex);
+    }
+    mark(mesh_albedo_tex_);    mark(mesh_normal_tex_);
+    mark(mesh_roughness_tex_); mark(mesh_metallic_tex_);
+    for (std::uint32_t t = 1; t < kPbrAtlasTiles; ++t) {
+        if (!live[t]) {
+            ErasePbrTilePathForTile(t);   // drop the now-dead path -> tile map
+            return t;
+        }
+    }
+    return kPbrNoTexTile;   // every usable tile is genuinely in use
+}
+
+void Engine::WritePbrTilePixels(std::uint32_t tile, const std::uint8_t* rgba) {
     const std::size_t row_stride = std::size_t(kPbrTileSize) * 4u;
     const std::size_t tile_off   = std::size_t(tile) * kPbrTileSize * row_stride;
     std::memcpy(pbr_atlas_staging_.data() + tile_off, rgba,
@@ -4036,23 +4063,56 @@ std::uint32_t Engine::AddPbrTileFromPixels(const std::uint8_t* rgba,
     device_->WriteTexture(pt::rhi::TextureHandle{pbr_atlas_tex_id_},
                           pbr_atlas_staging_.data(),
                           pbr_atlas_staging_.size());
-    if (!key.empty()) pbr_tile_by_path_[key] = tile;
     accum_dirty_ = true;
+}
+
+std::uint32_t Engine::AddPbrTileFromPixels(const std::uint8_t* rgba,
+                                           const std::string& key) {
+    if (!EnsurePbrAtlas()) return kPbrNoTexTile;
+    const std::uint32_t tile = AcquirePbrTile();
+    if (tile == kPbrNoTexTile) {
+        LOG_WARN("AddPbrTileFromPixels: atlas full ({} usable tiles, all "
+                 "still referenced); '{}' renders flat", kPbrAtlasTiles - 1u,
+                 key.empty() ? "<procedural>" : key.c_str());
+        return kPbrNoTexTile;
+    }
+    WritePbrTilePixels(tile, rgba);
+    if (!key.empty()) pbr_tile_by_path_[key].tile = tile;
     return tile;
 }
 
-std::uint32_t Engine::LoadPbrTextureTile(const std::string& path) {
+std::uint32_t Engine::LoadPbrTextureTile(const std::string& path,
+                                         bool force_reload) {
     if (!device_) return kPbrNoTexTile;
-    // De-dupe by the user-supplied path (before resolution) so the same
-    // string maps to one tile regardless of CWD.
-    if (auto it = pbr_tile_by_path_.find(path); it != pbr_tile_by_path_.end()) {
-        return it->second;
-    }
     if (!EnsurePbrAtlas()) return kPbrNoTexTile;
     // Resolve repo-relative asset paths (e.g. "assets/textures/foo.png")
     // the same way the HDRI / BSC loaders do, so the golden harness can
     // run the fixture from any CWD.
     const std::string resolved = pt::ResolveAssetPath(path.c_str());
+    // On-disk last-write time (raw file_clock ticks; 0 if the file is
+    // missing or the query fails -- treated as "unknown", never triggers a
+    // spurious reload). Drives the stale-tile check below.
+    std::int64_t disk_mtime = 0;
+    {
+        std::error_code ec;
+        const auto ft = std::filesystem::last_write_time(resolved, ec);
+        if (!ec) disk_mtime =
+                     static_cast<std::int64_t>(ft.time_since_epoch().count());
+    }
+    // De-dupe by the user-supplied path (before resolution) so the same
+    // string maps to one tile regardless of CWD. A cache hit serves the
+    // existing tile UNLESS the caller forced a reload or the file changed
+    // on disk since import -- then we fall through, re-read the file, and
+    // overwrite the SAME tile in place (reuse_tile) so every prim already
+    // pointing at it picks up the edit with no re-pointing.
+    std::uint32_t reuse_tile = kPbrNoTexTile;
+    if (auto it = pbr_tile_by_path_.find(path); it != pbr_tile_by_path_.end()) {
+        const bool changed = force_reload ||
+            (disk_mtime != 0 && it->second.mtime != 0 &&
+             disk_mtime != it->second.mtime);
+        if (!changed) return it->second.tile;
+        reuse_tile = it->second.tile;
+    }
     int w = 0, h = 0, comp = 0;
     // Force RGBA8 (4 components). stb returns top-left-origin rows, the
     // same convention the shader's texel-fetch sampling + glTF UVs use.
@@ -4061,7 +4121,9 @@ std::uint32_t Engine::LoadPbrTextureTile(const std::string& path) {
         LOG_WARN("pbr texture load '{}' (resolved '{}') failed: {}", path, resolved,
                  stbi_failure_reason() ? stbi_failure_reason() : "unknown");
         if (px) stbi_image_free(px);
-        return kPbrNoTexTile;
+        // A failed reload keeps the existing tile (stale pixels beat a
+        // vanished texture); a failed first import has nothing to keep.
+        return reuse_tile;
     }
     // Nearest-neighbour resample to the fixed tile size. Keeps the loader
     // dependency-free (no stb_image_resize) and is adequate for the
@@ -4083,10 +4145,23 @@ std::uint32_t Engine::LoadPbrTextureTile(const std::string& path) {
         }
     }
     stbi_image_free(px);
-    const std::uint32_t idx = AddPbrTileFromPixels(tile.data(), path);
+    std::uint32_t idx;
+    if (reuse_tile != kPbrNoTexTile) {
+        // Stale cache entry: overwrite the existing tile in place and keep
+        // its index so referencing prims need no re-pointing.
+        WritePbrTilePixels(reuse_tile, tile.data());
+        idx = reuse_tile;
+    } else {
+        idx = AddPbrTileFromPixels(tile.data(), path);
+    }
     if (idx != kPbrNoTexTile) {
-        LOG_INFO("pbr texture '{}' -> atlas tile {} ({}x{} resampled to {}^2)",
-                 path, idx, w, h, kPbrTileSize);
+        // Stamp the mtime we imported at so the next load can detect a
+        // fresh on-disk edit (operator[] updates the entry AddPbrTile...
+        // just created, or the reused one).
+        pbr_tile_by_path_[path].mtime = disk_mtime;
+        LOG_INFO("pbr texture '{}' -> atlas tile {} ({}x{} resampled to {}^2){}",
+                 path, idx, w, h, kPbrTileSize,
+                 reuse_tile != kPbrNoTexTile ? " [reloaded in place]" : "");
     }
     return idx;
 }
@@ -17088,6 +17163,58 @@ void Engine::RegisterPrimCommands() {
             accum_dirty_      = true;
             broadcast_scene_dirty();
             out.FormatLine("prim_clear_tex: id {} -> flat", id);
+        });
+    C.RegisterCommand("pbr_reload_tex",
+        "pbr_reload_tex [path]: re-read PBR texture(s) from disk, overwriting "
+        "the atlas tile in place so prims pick up on-disk edits without "
+        "re-assigning. No arg (or '*') reloads every cached texture.",
+        [this](auto args, pt::console::Output& out) {
+            if (args.size() > 1) {
+                out.PrintLine("usage: pbr_reload_tex [path]");
+                return;
+            }
+            if (device_ == nullptr) {
+                out.PrintLine("pbr_reload_tex: device not ready yet");
+                return;
+            }
+            const bool all = args.empty() ||
+                             args[0] == "*" || args[0] == "all";
+            if (all) {
+                // Snapshot the keys first: an in-place reload rewrites the
+                // map's mtime entries, and a missing-file reload leaves the
+                // entry as-is, so iterating a live map is fine -- but the
+                // snapshot keeps the loop obviously safe against rehash.
+                std::vector<std::string> paths;
+                paths.reserve(pbr_tile_by_path_.size());
+                for (const auto& [p, e] : pbr_tile_by_path_) {
+                    (void)e;
+                    paths.push_back(p);
+                }
+                std::uint32_t n = 0;
+                for (const auto& p : paths) {
+                    if (LoadPbrTextureTile(p, /*force_reload=*/true) !=
+                        kPbrNoTexTile) {
+                        ++n;
+                    }
+                }
+                accum_dirty_ = true;
+                out.FormatLine("pbr_reload_tex: reloaded {}/{} texture(s)",
+                               n, static_cast<std::uint32_t>(paths.size()));
+            } else {
+                const std::string p(args[0]);
+                if (pbr_tile_by_path_.find(p) == pbr_tile_by_path_.end()) {
+                    out.FormatLine("pbr_reload_tex: '{}' not loaded", p);
+                    return;
+                }
+                const std::uint32_t t =
+                    LoadPbrTextureTile(p, /*force_reload=*/true);
+                accum_dirty_ = true;
+                if (t != kPbrNoTexTile) {
+                    out.FormatLine("pbr_reload_tex: '{}' -> tile {}", p, t);
+                } else {
+                    out.FormatLine("pbr_reload_tex: '{}' reload failed", p);
+                }
+            }
         });
 
     // --- mesh material textures (mesh_load_gltf supplies the UVs) ----------
