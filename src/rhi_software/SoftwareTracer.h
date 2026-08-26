@@ -40,4 +40,20 @@ class SoftwareCommandBuffer;
 void RunPathTraceKernel(SoftwareDevice& device,
                         const SoftwareCommandBuffer& cmd);
 
+// CPU mirror of shaders/AccelProbe.slang (issue #254 P0 / issue #251).
+// Called from SoftwareCommandBuffer::Dispatch when the bound pipeline
+// is named "accel_probe". Traces one ray per element against the TLAS
+// bound at accel slot 2 and writes two uints per ray -- hit flag and
+// the instance id Embree's RTCHit::instID resolves to -- into the
+// storage buffer bound at buffer slot 1, matching the Slang kernel's
+// binding numbers and output layout exactly so the cross-backend test
+// can compare like for like.
+//
+// This is the CPU backend's answer to "what does the shader see", the
+// same way RunPathTraceKernel is the CPU backend's answer to
+// PathTrace.slang. It exists only for the RHI acceleration-structure
+// tests; the engine never dispatches it.
+void RunAccelProbeKernel(SoftwareDevice& device,
+                         const SoftwareCommandBuffer& cmd);
+
 }  // namespace pt::rhi::sw

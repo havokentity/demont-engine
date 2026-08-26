@@ -184,5 +184,15 @@ pt_compile_slang(
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/DenoiseFinalize.slang
     STAGE compute ENTRY main TARGETS spirv)
+# --- Acceleration-structure probe (issue #254 P0 / issue #251) -------------
+# Test-only ray-query kernel used by tests/rhi_accel_update_test.cpp to
+# read CommittedInstanceID() back out of a multi-instance TLAS. Declares
+# only bindings 2 (TLAS) and 3 (storage buffer), both already in the
+# shared descriptor-set layout, so no layout entry is added. The pipeline
+# is registered at runtime only when the driver reports ray query.
+pt_compile_slang(
+    TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/AccelProbe.slang
+    STAGE compute ENTRY main TARGETS spirv)
+# --- end acceleration-structure probe --------------------------------------
 
 pt_set_compiler_options(pt_rhi_vulkan)

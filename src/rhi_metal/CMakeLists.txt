@@ -286,6 +286,21 @@ pt_compile_slang(
     ENTRY   main
     TARGETS metal
 )
+# --- Acceleration-structure probe (issue #254 P0 / issue #251) -------------
+# Test-only ray-query kernel: one ray per thread against the bound TLAS,
+# reporting hit + CommittedInstanceID(). Compiled into the backend
+# because MetalDevice builds every pipeline in its constructor and has
+# no lazy path; the MSL is ~2 KB. Only tests/rhi_accel_update_test.cpp
+# ever creates it (by kernel name "accel_probe") -- no engine dispatch
+# site, no render permutation.
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/AccelProbe.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+)
+# --- end acceleration-structure probe --------------------------------------
 
 pt_set_compiler_options(pt_rhi_metal)
 

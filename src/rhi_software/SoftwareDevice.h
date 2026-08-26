@@ -95,7 +95,28 @@ struct BackedAccel {
     // without invalidating the Embree BVH.
     std::vector<float>         vertices;   // tightly packed float3 per vertex
     std::vector<std::uint32_t> indices;
-    std::uint32_t              instance_id = 0;
+
+    // --- TLAS-only, issue #254 P0 ------------------------------------
+    // Build policy this structure was created with. AllowUpdate puts the
+    // Embree scene into RTC_SCENE_FLAG_DYNAMIC so a re-commit after a
+    // transform poke refits the BVH instead of rebuilding it.
+    AccelBuildFlags flags = AccelBuildFlags::PreferFastTrace;
+    // The instance geometries, retained (not released back to the scene)
+    // so UpdateTLASInstances can rtcSetGeometryTransform them in place.
+    // Parallel to `instance_ids` / `instance_blas`, indexed by the
+    // geometry id Embree handed back from rtcAttachGeometry -- which is
+    // also what RTCHit::instID[0] reports, so the probe kernel can map a
+    // hit straight back to the caller's TLASInstance::instance_id.
+    //
+    // Typed as void* rather than RTCGeometry so this header keeps its
+    // "no Embree types beyond the two forward-declared scene handles"
+    // property; SoftwareDevice.cpp casts back.
+    std::vector<void*>         instance_geoms;
+    std::vector<std::uint32_t> instance_ids;
+    std::vector<std::uint64_t> instance_blas;   // AccelStructHandle::id per instance
+    // Instance count at create time. UpdateTLASInstances accepts any
+    // count in [1, capacity]; a bigger array needs a new TLAS.
+    std::uint32_t              instance_capacity = 0;
 };
 
 class SoftwareDevice;
@@ -162,6 +183,8 @@ public:
     PipelineHandle    CreateComputePipeline(const ComputePipelineDesc&) override;
     AccelStructHandle CreateBLAS(const BLASDesc&) override;
     AccelStructHandle CreateTLAS(const TLASDesc&) override;
+    bool UpdateTLASInstances(AccelStructHandle h,
+                             std::span<const TLASInstance> instances) override;
 
     void DestroyBuffer(BufferHandle h) override;
     void DestroyTexture(TextureHandle h) override;
@@ -173,6 +196,11 @@ public:
     bool WriteTexture(TextureHandle h, const void* src, std::size_t size) override;
     bool ReadbackTexture(TextureHandle h, void* dst, std::size_t dst_size,
                           std::uint32_t* out_w, std::uint32_t* out_h) override;
+    // Buffer readback is a plain memcpy here -- the "device" memory IS
+    // host memory and Dispatch already ran the kernel synchronously, so
+    // there is nothing to drain. Mirrors the Metal/Vulkan contract so
+    // callers (the RHI acceleration-structure tests) are backend-agnostic.
+    bool ReadbackBuffer(BufferHandle h, void* dst, std::size_t bytes) override;
 
     FrameContext   BeginFrame() override;
     void           EndFrame(CommandBuffer*) override;

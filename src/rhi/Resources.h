@@ -35,6 +35,56 @@ struct ComputePipelineDesc {
     std::string_view debug_name;
 };
 
+// Acceleration-structure build hints (issue #254 P0). One field covers
+// the three build policies the engine needs, mapped per backend:
+//
+//   PreferFastTrace  Vulkan VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR
+//                    Metal  (default usage -- Metal has no explicit
+//                           "fast trace" bit; it is the absence of
+//                           PreferFastBuild)
+//                    SW     Embree RTC_BUILD_QUALITY_MEDIUM
+//                    For geometry built once and traced for minutes:
+//                    the static CSG mesh. This is the default so every
+//                    existing call site keeps byte-identical behaviour.
+//
+//   PreferFastBuild  Vulkan ..._PREFER_FAST_BUILD_BIT_KHR
+//                    Metal  MTL::AccelerationStructureUsagePreferFastBuild
+//                    SW     Embree RTC_BUILD_QUALITY_LOW
+//                    For geometry that churns: streaming terrain chunks
+//                    that are built once and traced for a second or two.
+//
+//   AllowUpdate      Vulkan ..._ALLOW_UPDATE_BIT_KHR (a prerequisite for
+//                           VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR)
+//                    Metal  MTL::AccelerationStructureUsageRefit
+//                    SW     Embree RTC_SCENE_FLAG_DYNAMIC
+//                    Required before Device::UpdateTLASInstances can take
+//                    the cheap refit path on a TLAS. Costs a slightly
+//                    larger / slower initial build and (on the GPU
+//                    backends) a retained scratch allocation, so it is
+//                    opt-in rather than the default.
+//
+// PreferFastTrace and PreferFastBuild are mutually exclusive; if both are
+// set the backends prefer fast build (matching Vulkan's own rule that a
+// driver picks one).
+enum class AccelBuildFlags : std::uint32_t {
+    None            = 0u,
+    PreferFastTrace = 1u << 0,
+    PreferFastBuild = 1u << 1,
+    AllowUpdate     = 1u << 2,
+};
+
+constexpr AccelBuildFlags operator|(AccelBuildFlags a, AccelBuildFlags b) {
+    return static_cast<AccelBuildFlags>(static_cast<std::uint32_t>(a) |
+                                        static_cast<std::uint32_t>(b));
+}
+constexpr AccelBuildFlags operator&(AccelBuildFlags a, AccelBuildFlags b) {
+    return static_cast<AccelBuildFlags>(static_cast<std::uint32_t>(a) &
+                                        static_cast<std::uint32_t>(b));
+}
+constexpr bool HasAccelFlag(AccelBuildFlags v, AccelBuildFlags f) {
+    return (static_cast<std::uint32_t>(v) & static_cast<std::uint32_t>(f)) != 0u;
+}
+
 // Acceleration-structure descriptors.
 //
 // BLAS: a single triangle geometry built from CPU-provided arrays. The
@@ -46,6 +96,12 @@ struct BLASDesc {
     std::uint32_t vertex_count    = 0;
     const std::uint32_t* indices  = nullptr;  // 3 per triangle
     std::uint32_t index_count     = 0;
+    // Build policy. AllowUpdate makes the structure refit-capable on
+    // every backend; the verb that feeds it new vertices is skeletal
+    // animation's (#81) and does not exist yet, so setting it today
+    // only pays the build cost. PreferFastBuild / PreferFastTrace are
+    // live now.
+    AccelBuildFlags flags = AccelBuildFlags::PreferFastTrace;
     std::string_view debug_name;
 };
 
@@ -61,6 +117,12 @@ struct TLASInstance {
 
 struct TLASDesc {
     std::span<const TLASInstance> instances;
+    // The instance count given here is also the TLAS's *capacity*:
+    // Device::UpdateTLASInstances accepts any count in [1, capacity]
+    // but never grows the structure (growing means new storage, which
+    // means a new handle). Add AllowUpdate to get the cheap refit path
+    // for same-count / same-BLAS-set updates.
+    AccelBuildFlags flags = AccelBuildFlags::PreferFastTrace;
     std::string_view debug_name;
 };
 

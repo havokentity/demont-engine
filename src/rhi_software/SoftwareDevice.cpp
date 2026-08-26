@@ -119,6 +119,13 @@ void SoftwareCommandBuffer::Dispatch(std::uint32_t /*gx*/, std::uint32_t /*gy*/,
         RunPathTraceKernel(*device_, *this);
         return;
     }
+    if (name == "accel_probe") {
+        // Acceleration-structure probe (issue #254 P0 / #251). CPU
+        // mirror of shaders/AccelProbe.slang -- test-only; the engine
+        // never creates this pipeline.
+        RunAccelProbeKernel(*device_, *this);
+        return;
+    }
     if (name == "editor_overlay") {
         // 3D-transform gizmo overlay (issue: editor 3D gizmos). CPU
         // port of shaders/EditorOverlay.slang -- projects world-space
@@ -334,6 +341,22 @@ PipelineHandle SoftwareDevice::CreateComputePipeline(const ComputePipelineDesc& 
     return PipelineHandle{ id };
 }
 
+// Map the RHI's build policy onto Embree's BVH build quality (issue
+// #254 P0). MEDIUM is Embree's balanced default and is what every
+// acceleration structure in the tree used before the flag existed, so
+// PreferFastTrace -- the default -- reproduces the previous BVH
+// bit-for-bit and no golden moves. LOW is Embree's cheap-build tier,
+// the natural home for PreferFastBuild and for anything that will be
+// refit (a dynamic scene re-commit refits an existing LOW-quality BVH
+// rather than rebuilding it).
+static RTCBuildQuality EmbreeBuildQuality(AccelBuildFlags flags) {
+    if (HasAccelFlag(flags, AccelBuildFlags::PreferFastBuild) ||
+        HasAccelFlag(flags, AccelBuildFlags::AllowUpdate)) {
+        return RTC_BUILD_QUALITY_LOW;
+    }
+    return RTC_BUILD_QUALITY_MEDIUM;
+}
+
 AccelStructHandle SoftwareDevice::CreateBLAS(const BLASDesc& d) {
     if (embree_device_ == nullptr || d.vertex_count == 0 || d.index_count == 0) {
         LOG_WARN("Software CreateBLAS: empty mesh or Embree device missing");
@@ -351,7 +374,7 @@ AccelStructHandle SoftwareDevice::CreateBLAS(const BLASDesc& d) {
 
     RTCScene scene = rtcNewScene(embree_device_);
     rtcSetSceneFlags(scene, RTC_SCENE_FLAG_NONE);
-    rtcSetSceneBuildQuality(scene, RTC_BUILD_QUALITY_MEDIUM);
+    rtcSetSceneBuildQuality(scene, EmbreeBuildQuality(d.flags));
 
     RTCGeometry geom = rtcNewGeometry(embree_device_, RTC_GEOMETRY_TYPE_TRIANGLE);
     rtcSetSharedGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX, 0,
@@ -381,10 +404,19 @@ AccelStructHandle SoftwareDevice::CreateTLAS(const TLASDesc& d) {
 
     auto a = std::make_unique<BackedAccel>();
     a->is_tlas = true;
+    a->flags   = d.flags;
 
     RTCScene scene = rtcNewScene(embree_device_);
-    rtcSetSceneFlags(scene, RTC_SCENE_FLAG_NONE);
-    rtcSetSceneBuildQuality(scene, RTC_BUILD_QUALITY_MEDIUM);
+    // A refit-capable TLAS is a dynamic scene: rtcCommitScene on a
+    // DYNAMIC scene refits the existing BVH after a transform poke
+    // instead of rebuilding it from scratch. Without the flag Embree
+    // is free to (and does) rebuild, which is exactly the cost
+    // UpdateTLASInstances exists to avoid.
+    rtcSetSceneFlags(scene,
+                     HasAccelFlag(d.flags, AccelBuildFlags::AllowUpdate)
+                         ? RTC_SCENE_FLAG_DYNAMIC
+                         : RTC_SCENE_FLAG_NONE);
+    rtcSetSceneBuildQuality(scene, EmbreeBuildQuality(d.flags));
 
     for (const auto& inst : d.instances) {
         BackedAccel* blas = nullptr;
@@ -407,17 +439,138 @@ AccelStructHandle SoftwareDevice::CreateTLAS(const TLASDesc& d) {
                                 inst.transform);
         rtcSetGeometryTimeStepCount(inst_geom, 1);
         rtcCommitGeometry(inst_geom);
-        rtcAttachGeometry(scene, inst_geom);
-        rtcReleaseGeometry(inst_geom);
+        // Keep our own reference: the scene takes one on attach, but
+        // UpdateTLASInstances needs the handle to poke the transform,
+        // so we deliberately do NOT rtcReleaseGeometry here (the
+        // release moves to DestroyAccelStruct). The attach return
+        // value is the geometry id, which is also what RTCHit::instID
+        // reports -- index the id / blas tables by it so a hit maps
+        // straight back to TLASInstance::instance_id.
+        const unsigned geom_id = rtcAttachGeometry(scene, inst_geom);
+        if (a->instance_geoms.size() <= geom_id) {
+            a->instance_geoms.resize(geom_id + 1u, nullptr);
+            a->instance_ids.resize(geom_id + 1u, 0u);
+            a->instance_blas.resize(geom_id + 1u, 0u);
+        }
+        a->instance_geoms[geom_id] = inst_geom;
+        a->instance_ids[geom_id]   = inst.instance_id;
+        a->instance_blas[geom_id]  = inst.blas.id;
     }
     rtcCommitScene(scene);
 
-    a->scene = scene;
+    a->scene             = scene;
+    a->instance_capacity = static_cast<std::uint32_t>(a->instance_geoms.size());
     std::lock_guard lock(resource_mutex_);
     auto id = next_id_++;
     LOG_INFO("Software CreateTLAS: id={} instances={}", id, d.instances.size());
     accels_.emplace(id, std::move(a));
     return AccelStructHandle{ id };
+}
+
+bool SoftwareDevice::UpdateTLASInstances(AccelStructHandle h,
+                                         std::span<const TLASInstance> instances) {
+    if (embree_device_ == nullptr || h.id == 0 || instances.empty()) return false;
+
+    BackedAccel* a = nullptr;
+    {
+        std::lock_guard lock(resource_mutex_);
+        auto it = accels_.find(h.id);
+        if (it != accels_.end()) a = it->second.get();
+    }
+    if (a == nullptr || !a->is_tlas || a->scene == nullptr) {
+        LOG_WARN("Software UpdateTLASInstances: id={} is not a live TLAS", h.id);
+        return false;
+    }
+    if (instances.size() > a->instance_capacity) {
+        LOG_WARN("Software UpdateTLASInstances: {} instances exceeds capacity {}",
+                 instances.size(), a->instance_capacity);
+        return false;
+    }
+
+    // Topology check, matching the Metal / Vulkan backends: an update
+    // that keeps the count AND the referenced BLAS set is a transform /
+    // id poke and can go through the cheap in-place path. Anything else
+    // has to detach + re-attach the instance geometries, which is a
+    // rebuild of the top level (still cheap -- the BLASes themselves
+    // never move).
+    bool same_topology = (instances.size() == a->instance_geoms.size());
+    if (same_topology) {
+        for (std::size_t i = 0; i < instances.size(); ++i) {
+            if (a->instance_blas[i] != instances[i].blas.id ||
+                a->instance_geoms[i] == nullptr) {
+                same_topology = false;
+                break;
+            }
+        }
+    }
+
+    if (same_topology) {
+        // In-place: poke the transform + id of every retained instance
+        // geometry and re-commit. On a DYNAMIC scene (AllowUpdate) that
+        // re-commit is a BVH refit; on a static one Embree rebuilds the
+        // top level, which is still only N instances' worth of work and
+        // touches no BLAS.
+        for (std::size_t i = 0; i < instances.size(); ++i) {
+            auto geom = static_cast<RTCGeometry>(a->instance_geoms[i]);
+            rtcSetGeometryTransform(geom, 0, RTC_FORMAT_FLOAT3X4_ROW_MAJOR,
+                                    instances[i].transform);
+            rtcCommitGeometry(geom);
+            a->instance_ids[i] = instances[i].instance_id;
+        }
+        rtcCommitScene(a->scene);
+        return true;
+    }
+
+    // Topology changed (count and/or the referenced BLAS set): detach
+    // every instance geometry, drop our references, and re-attach
+    // against the new array. The scene object -- and therefore the
+    // handle -- survives.
+    for (std::size_t i = 0; i < a->instance_geoms.size(); ++i) {
+        if (a->instance_geoms[i] == nullptr) continue;
+        rtcDetachGeometry(a->scene, static_cast<unsigned>(i));
+        rtcReleaseGeometry(static_cast<RTCGeometry>(a->instance_geoms[i]));
+        a->instance_geoms[i] = nullptr;
+    }
+    a->instance_geoms.clear();
+    a->instance_ids.clear();
+    a->instance_blas.clear();
+
+    for (const auto& inst : instances) {
+        BackedAccel* blas = nullptr;
+        {
+            std::lock_guard lock(resource_mutex_);
+            auto it = accels_.find(inst.blas.id);
+            if (it != accels_.end()) blas = it->second.get();
+        }
+        if (blas == nullptr || blas->scene == nullptr) {
+            LOG_WARN("Software UpdateTLASInstances: instance references unknown "
+                     "BLAS id={}", inst.blas.id);
+            continue;
+        }
+        RTCGeometry inst_geom = rtcNewGeometry(embree_device_, RTC_GEOMETRY_TYPE_INSTANCE);
+        rtcSetGeometryInstancedScene(inst_geom, blas->scene);
+        rtcSetGeometryTransform(inst_geom, 0, RTC_FORMAT_FLOAT3X4_ROW_MAJOR,
+                                inst.transform);
+        rtcSetGeometryTimeStepCount(inst_geom, 1);
+        rtcCommitGeometry(inst_geom);
+        const unsigned geom_id = rtcAttachGeometry(a->scene, inst_geom);
+        if (a->instance_geoms.size() <= geom_id) {
+            a->instance_geoms.resize(geom_id + 1u, nullptr);
+            a->instance_ids.resize(geom_id + 1u, 0u);
+            a->instance_blas.resize(geom_id + 1u, 0u);
+        }
+        a->instance_geoms[geom_id] = inst_geom;
+        a->instance_ids[geom_id]   = inst.instance_id;
+        a->instance_blas[geom_id]  = inst.blas.id;
+    }
+    if (a->instance_geoms.empty()) {
+        LOG_WARN("Software UpdateTLASInstances: no valid instances survived; "
+                 "TLAS id={} is now empty", h.id);
+        rtcCommitScene(a->scene);
+        return false;
+    }
+    rtcCommitScene(a->scene);
+    return true;
 }
 
 void SoftwareDevice::DestroyBuffer(BufferHandle h) {
@@ -447,9 +600,18 @@ void SoftwareDevice::DestroyPipeline(PipelineHandle h) {
 void SoftwareDevice::DestroyAccelStruct(AccelStructHandle h) {
     std::lock_guard lock(resource_mutex_);
     if (auto it = accels_.find(h.id); it != accels_.end()) {
-        if (it->second && it->second->scene) {
-            rtcReleaseScene(it->second->scene);
-            it->second->scene = nullptr;
+        if (it->second) {
+            // Release the instance-geometry references CreateTLAS /
+            // UpdateTLASInstances deliberately kept (they hold one ref
+            // each on top of the scene's own) before dropping the scene.
+            for (void* g : it->second->instance_geoms) {
+                if (g != nullptr) rtcReleaseGeometry(static_cast<RTCGeometry>(g));
+            }
+            it->second->instance_geoms.clear();
+            if (it->second->scene) {
+                rtcReleaseScene(it->second->scene);
+                it->second->scene = nullptr;
+            }
         }
         accels_.erase(it);
     }
@@ -479,6 +641,16 @@ bool SoftwareDevice::ReadbackTexture(TextureHandle h, void* dst, std::size_t dst
     const std::size_t src_size = t->data.size() * sizeof(float);
     if (dst_size < src_size) return false;
     std::memcpy(dst, t->data.data(), src_size);
+    return true;
+}
+
+bool SoftwareDevice::ReadbackBuffer(BufferHandle h, void* dst, std::size_t bytes) {
+    if (dst == nullptr || bytes == 0) return false;
+    std::lock_guard lock(resource_mutex_);
+    auto it = buffers_.find(h.id);
+    if (it == buffers_.end() || it->second == nullptr) return false;
+    if (it->second->data.size() < bytes) return false;
+    std::memcpy(dst, it->second->data.data(), bytes);
     return true;
 }
 

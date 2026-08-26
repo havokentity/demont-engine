@@ -132,6 +132,11 @@ public:
     PipelineHandle    CreateComputePipeline(const ComputePipelineDesc&) override;
     AccelStructHandle CreateBLAS(const BLASDesc&) override;
     AccelStructHandle CreateTLAS(const TLASDesc&) override;
+    bool UpdateTLASInstances(AccelStructHandle h,
+                             std::span<const TLASInstance> instances) override;
+    std::uint64_t AccelGpuStallCount() const override {
+        return accel_gpu_stalls_.load(std::memory_order_relaxed);
+    }
 
     void DestroyBuffer(BufferHandle h) override;
     void DestroyTexture(TextureHandle h) override;
@@ -597,8 +602,57 @@ private:
         VkBuffer                   buffer         = VK_NULL_HANDLE;
         VkDeviceMemory             memory         = VK_NULL_HANDLE;
         VkDeviceAddress            device_address = 0;
+        // --- issue #254 P0: everything the update verb needs ----------
+        VkDeviceSize    storage_size = 0;   // bytes the AS object owns
+        bool            is_tlas      = false;
+        AccelBuildFlags flags        = AccelBuildFlags::PreferFastTrace;
+        // Instance count at create time -- the TLAS's capacity.
+        std::uint32_t   instance_capacity = 0;
+        // The BLAS handle ids the current instance array points at, in
+        // order. Same topology (count + set + order) means the update
+        // can take MODE_UPDATE_KHR; anything else falls back to a
+        // MODE_BUILD_KHR into the same storage.
+        std::vector<std::uint64_t> instance_blas;
+        // Scratch retained across updates, and ONLY for AllowUpdate
+        // structures. Its device address is pre-aligned to
+        // minAccelerationStructureScratchOffsetAlignment (see
+        // scratch_align_) -- the previous code passed a raw buffer
+        // address, which is a spec violation the validation layers
+        // catch as VUID-...-scratchData-03710 and which real drivers
+        // are entitled to mis-handle.
+        BufferEntry     scratch{};
+        VkDeviceAddress scratch_address = 0;   // aligned address into `scratch`
+        VkDeviceSize    scratch_usable  = 0;   // bytes available at that address
+
+        // Update ring. Each slot owns a host-visible instance buffer, a
+        // command buffer and a fence. Rotating slots is what removes the
+        // stall: the CPU writes slot (n mod kRing) while the GPU may
+        // still be consuming slot (n-1 mod kRing), and we only ever wait
+        // on a slot's own fence -- never on the queue or the device.
+        static constexpr std::uint32_t kRing = 2;   // == kFramesInFlight
+        struct UpdateSlot {
+            BufferEntry     inst_buf{};
+            VkCommandBuffer cmd       = VK_NULL_HANDLE;
+            VkFence         fence     = VK_NULL_HANDLE;
+            bool            submitted = false;
+        };
+        UpdateSlot    ring[kRing]{};
+        std::uint32_t ring_cursor = 0;
     };
     std::unordered_map<std::uint64_t, AccelEntry> accels_;
+
+    // VkPhysicalDeviceAccelerationStructurePropertiesKHR::
+    // minAccelerationStructureScratchOffsetAlignment, queried once at
+    // init. Every scratch device address handed to a build must be a
+    // multiple of it. 256 is the conservative fallback when the
+    // property query is unavailable (no RT support -- in which case
+    // nothing reads it anyway).
+    VkDeviceSize scratch_align_ = 256;
+
+    // See Device::AccelGpuStallCount. Incremented by the two blocking
+    // waits that remain on the create path; UpdateTLASInstances must
+    // never touch it.
+    std::atomic<std::uint64_t> accel_gpu_stalls_{0};
 
     // Per-frame UBO holding the spilled tail of the engine PtPush.
     // Persistently host-visible so VulkanCommandBuffer::Dispatch can
@@ -631,6 +685,25 @@ private:
                                     VkAccelerationStructureTypeKHR type,
                                     VkDeviceSize as_size,
                                     VkDeviceSize scratch_size);
+    // Translate the RHI build policy into VkBuildAccelerationStructureFlagsKHR.
+    static VkBuildAccelerationStructureFlagsKHR VkAccelFlags(AccelBuildFlags flags);
+    // Allocate a scratch buffer whose USABLE device address is aligned
+    // to scratch_align_. Over-allocates by (align - 1) and reports the
+    // rounded-up address so the build never violates
+    // VUID-vkCmdBuildAccelerationStructuresKHR-pInfos-03710.
+    bool CreateScratchBuffer(VkDeviceSize bytes, BufferEntry& out,
+                             VkDeviceAddress& out_address,
+                             VkDeviceSize& out_usable);
+    // Release every resource an AccelEntry owns. Callers must have
+    // already established that nothing is still reading them.
+    void DestroyAccelEntry(AccelEntry& e);
+    // Translate an RHI instance array into Vulkan instance descriptors,
+    // recording the referenced BLAS handles in order. Shared by
+    // CreateTLAS and UpdateTLASInstances so the two can never disagree
+    // about the descriptor layout (the class of bug #251 is).
+    bool BuildVkInstances(std::span<const TLASInstance> instances,
+                          std::vector<VkAccelerationStructureInstanceKHR>& out,
+                          std::vector<std::uint64_t>& blas_ids);
 
 public:
     VkImageView         LookupImageView(TextureHandle h);
