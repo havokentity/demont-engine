@@ -189,10 +189,177 @@ public float3 spectralWeightSRGB(float lambda_nm) {
 }
 // --- end -------------------------------------------------------------------
 
+// --- Planet-scale ray-sphere intersection (issue #254) ---------------------
+//
+// `dot(oc, oc) - rad * rad` and `-b - sqrt(b*b - k)` both subtract two
+// nearly-equal large quantities whenever the ray origin sits near a large
+// sphere's surface, and BOTH lose the same ~eps*rad of altitude.  At the
+// Earth's radius one float32 ULP of |oc|^2 is 4.8e6 m^2, so an eye at
+// h = 1.7 m -- where the true k = h(2R + h) = 2.2e7 m^2 -- keeps only
+// three significant digits, and t comes back with ~0.38 m of noise.
+// Rebasing the camera does not help: the cancellation is between |oc|^2
+// and rad^2, and both are inherently large when the *sphere* is.
+//
+// Fixing only one of the two subtractions buys nothing -- each contributes
+// ~eps*rad on its own -- so the substitution k = h(2R + h) that the
+// planetary literature quotes is not a fix either: recovering h as
+// length(oc) - rad is itself a cancelling subtraction that reintroduces
+// exactly the error it was meant to remove.  The information is present
+// in the float32 inputs (ro, c and rad are exact); extracting it needs
+// arithmetic wider than float32, not a rearrangement of it.
+//
+// So: accumulate the cancelling sums in a two-word int32 fixed-point
+// accumulator (~47 bits, enough for the 46-bit products), then take the
+// root that does not cancel and get its partner from the product of roots
+// (Vieta).  Integers are the load-bearing choice, not an implementation
+// detail -- see ptFixedAdd.
+//
+// Small spheres take the historic expression verbatim.  Every sphere the
+// renderer has ever traced is metres across, where the naive form is
+// already good to a micron, so gating keeps every existing golden
+// bit-identical instead of trading pixels for precision nobody uses.
+
+// Radius above which the naive expression loses more than a millimetre of
+// altitude.  Its radial error is ~eps*rad with eps = 2^-24, so 1 mm is
+// reached at rad = 1e-3 * 2^24 = 16777 m; the constant is the power of
+// two just below that, so the crossover is conservative and exact.
+static const float kPtStableSphereRadius = 16384.0;
+
+// Unbiased exponent of |v|.  Zero and denormals report -127, which the
+// callers below treat as "too small to matter", the correct answer here.
+int ptFloatExp(float v) { return int((asuint(v) >> 23) & 0xFFu) - 127; }
+
+// 2^n, exactly.  Built from the exponent field rather than exp2() so it is
+// exact and so no fast-math approximation of exp2 can perturb the scale.
+// Requires n in [-126, 127]; the intersectSphere gate guarantees that.
+float ptPow2(int n) { return asfloat(uint(n + 127) << 23); }
+
+// Two-word fixed-point accumulator for a sum whose terms are individually
+// ~2^e but whose total is many orders of magnitude smaller.
+//
+// The words are int32 ON PURPOSE.  Every float-only compensated-summation
+// scheme (Knuth's two-sum, Dekker's two-product, Kahan) is defined by an
+// expression that is algebraically zero, so a compiler licensed to
+// reassociate is licensed to fold it away -- and Metal compiles this
+// module with its default (fast) math mode, which does exactly that:
+// measured on an M4 Max, a Dekker/two-sum implementation of the code
+// below returns the *naive* answer.  Integer addition has no such
+// licence, so the cancellation survives every math mode intact.
+//
+// hi counts units of 2^(e-23), lo units of 2^(e-47).  Terms are bounded by
+// 2^(e+1), so each contributes at most 2^24 to hi and 2^24 to lo, and the
+// four-term sums stay far inside int32.  Residue below 2^(e-47) is dropped,
+// which bounds the total error at a fraction of one ULP of the result.
+struct PtFixedSum {
+    int   hi;
+    int   lo;
+    float up_hi, up_lo;   // 2^(e-23), 2^(e-47)
+    float dn_hi, dn_lo;   // reciprocals of the above
+};
+
+PtFixedSum ptFixedBegin(int e) {
+    int sh = e - 23;
+    int sl = e - 47;
+    PtFixedSum a;
+    a.hi = 0;
+    a.lo = 0;
+    a.up_hi = ptPow2(sh);  a.dn_hi = ptPow2(-sh);
+    a.up_lo = ptPow2(sl);  a.dn_lo = ptPow2(-sl);
+    return a;
+}
+
+// `ih` is exact (|x| <= 2^(e+1) so |ih| <= 2^24, and int <-> float is
+// exact there); the remainder is a Sterbenz-exact subtraction of two
+// nearly-equal floats.  Neither feeds a float add chain, so there is
+// nothing for reassociation to get hold of.
+void ptFixedAdd(inout PtFixedSum a, float x) {
+    int   ih = int(x * a.dn_hi);
+    float r  = x - float(ih) * a.up_hi;
+    a.hi += ih;
+    a.lo += int(r * a.dn_lo);
+}
+
+// Accumulate sgn * x * y with the 46-bit product formed EXACTLY.  Masking
+// the low 12 mantissa bits splits each operand into halves of <= 12
+// significant bits, so all four partial products fit a float32 mantissa
+// with nothing to round away.  The mask is an integer op, so this split
+// also survives fast math (verified on device).
+void ptFixedAddProduct(inout PtFixedSum a, float x, float y, float sgn) {
+    float xh = asfloat(asuint(x) & 0xFFFFF000u), xl = x - xh;
+    float yh = asfloat(asuint(y) & 0xFFFFF000u), yl = y - yh;
+    ptFixedAdd(a, sgn * (xh * yh));
+    ptFixedAdd(a, sgn * (xh * yl));
+    ptFixedAdd(a, sgn * (xl * yh));
+    ptFixedAdd(a, sgn * (xl * yl));
+}
+
+float ptFixedTotal(PtFixedSum a) {
+    return float(a.hi) * a.up_hi + float(a.lo) * a.up_lo;
+}
+
+// |oc|^2 - rad^2 -- the power of the point with respect to the sphere, and
+// the quantity the naive form destroys.  Correctly rounded in practice:
+// the accumulator resolves ~24 bits below the float32 result's own ULP.
+float ptPowerOfPoint(float3 oc, float rad) {
+    float m = max(max(abs(oc.x), abs(oc.y)), max(abs(oc.z), rad));
+    PtFixedSum a = ptFixedBegin(2 * ptFloatExp(m) + 1);
+    ptFixedAddProduct(a, oc.x, oc.x,  1.0);
+    ptFixedAddProduct(a, oc.y, oc.y,  1.0);
+    ptFixedAddProduct(a, oc.z, oc.z,  1.0);
+    ptFixedAddProduct(a, rad,  rad,  -1.0);
+    return ptFixedTotal(a);
+}
+
+// dot(a, b) without the cancellation.  A grazing ray at planetary radius
+// sums three ~R terms down to a few kilometres, so the plain dot product
+// carries ~eps*R = 0.4 m of absolute error -- which lands directly on t
+// for horizon rays, the exact case sub-metre terrain cares about.
+float ptDotExact(float3 a, float3 b) {
+    float m = max(max(abs(a.x), abs(a.y)), abs(a.z))
+            * max(max(abs(b.x), abs(b.y)), abs(b.z));
+    if (!(m > 0.0)) { return 0.0; }
+    PtFixedSum s = ptFixedBegin(ptFloatExp(m) + 1);
+    ptFixedAddProduct(s, a.x, b.x, 1.0);
+    ptFixedAddProduct(s, a.y, b.y, 1.0);
+    ptFixedAddProduct(s, a.z, b.z, 1.0);
+    return ptFixedTotal(s);
+}
+
+bool ptIntersectSphereLarge(float3 oc, float3 rd, float rad, out float t) {
+    float b = ptDotExact(oc, rd);
+    float k = ptPowerOfPoint(oc, rad);
+    // fma rounds once, on the *result*, so the discriminant keeps full
+    // relative precision even where b*b and k nearly cancel (grazing).
+    float h = fma(b, b, -k);
+    if (h < 0.0) { t = 0.0; return false; }
+    h = sqrt(h);
+    // Vieta / "citardauq": -b -/+ h subtracts two ~rad quantities for a
+    // near-radial ray and throws away everything the accumulator just
+    // bought.  Evaluate the root whose terms reinforce, then recover its
+    // partner from the product of roots (= k).  This is the same
+    // rearrangement Ray Tracing Gems ch. 7 uses; the accumulated k above
+    // is what makes it worth having, since t = k/q inherits k's error
+    // directly and RTG leaves k in its naive form.
+    float q  = (b >= 0.0) ? -(b + h) : (h - b);
+    float ta = q;
+    float tb = (q != 0.0) ? k / q : 0.0;
+    float t0 = min(ta, tb), t1 = max(ta, tb);
+    t = (t0 > 1e-3) ? t0 : t1;
+    return t > 1e-3;
+}
+
 // Ray-sphere intersection. Returns the nearer non-self-intersection t
 // (>1e-3 epsilon to avoid stuck rays grazing their own surface).
 public bool intersectSphere(float3 ro, float3 rd, float3 c, float rad, out float t) {
     float3 oc = ro - c;
+    // Above kPtStableSphereRadius the naive expression below is worse than
+    // a millimetre; take the accumulated path instead.  The upper bound is
+    // the accumulator's domain: it needs 2^(2e-46) to stay a normal float,
+    // which caps the exponent of the largest operand at 74 (~1.9e22 m).
+    int ext_exp = ptFloatExp(max(max(abs(oc.x), abs(oc.y)), max(abs(oc.z), rad)));
+    if (rad > kPtStableSphereRadius && ext_exp <= 74) {
+        return ptIntersectSphereLarge(oc, rd, rad, t);
+    }
     float b   = dot(oc, rd);
     float k   = dot(oc, oc) - rad * rad;
     float h   = b * b - k;
@@ -206,6 +373,14 @@ public bool intersectSphere(float3 ro, float3 rd, float3 c, float rad, out float
 // Ray-plane intersection.  `n` is the plane normal, `d` the signed
 // distance from origin (plane: n . p + d = 0).  Returns false for
 // nearly-parallel rays (no near-zero division).
+//
+// This has the same shape of cancellation as intersectSphere -- dot(ro, n)
+// tends to -d as the origin approaches the plane -- but not the same
+// severity: the subtraction itself is Sterbenz-exact, so the error is just
+// dot()'s own ~eps*|ro|, and it only bites for a plane whose |d| is large
+// enough to make that a real distance.  Every plane the renderer has is a
+// floor near the origin, so it is left alone deliberately; a planet-scale
+// plane would need ptDotExact above.
 public bool intersectPlane(float3 ro, float3 rd, float3 n, float d, out float t) {
     float denom = dot(rd, n);
     if (abs(denom) < 1e-4) { t = 0.0; return false; }
