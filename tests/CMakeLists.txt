@@ -468,6 +468,25 @@ pt_add_test(scene_serialize
 # pipeline -- so the same file is correct on Mac (metal + software),
 # Windows (adds vulkan when a headless VkDevice comes up) and Linux.
 #
+# Backend availability is a RUNTIME device capability, not a
+# configure-time one, so this cell cannot use the golden matrix's
+# label-based opt-out (`-L golden_software`): that convention exists
+# because a golden cell's backend is fixed when CMake runs, whereas one
+# unit-test binary here sweeps every backend the build contains and has
+# to decide per-device. Instead the suite queries the device
+# (`SupportsHardwareRT()`, now backed by MTLDevice.supportsRaytracing)
+# and skips that backend with a recorded reason.
+#
+# SKIP_RETURN_CODE 125 keeps the skip HONEST: if NO backend could host
+# an acceleration structure -- a GH-hosted macos-26 runner with a
+# paravirtualised GPU, for instance -- the binary exits 125 and ctest
+# prints `***Skipped` instead of a green tick over zero coverage. That
+# is the #252 failure mode (a lane "passing" while comparing nothing)
+# and it is worth spending a return code to avoid. When at least one
+# backend does run, the binary exits 0 and prints a per-backend ledger
+# saying which ran and which did not, including an explicit note when
+# Metal -- the only backend that can reproduce #251 -- was skipped.
+#
 # 120s timeout rather than the 60s default: the Metal backend compiles
 # every MSL kernel in its constructor (PathTrace.slang is the long pole)
 # and a cold CI runner with a paravirtualised GPU is a lot slower at it
@@ -475,7 +494,9 @@ pt_add_test(scene_serialize
 pt_add_test(rhi_accel_update
     rhi_accel_update_test.cpp
     LINK_TARGETS pt_rhi)
-set_tests_properties(rhi_accel_update PROPERTIES TIMEOUT 120)
+set_tests_properties(rhi_accel_update PROPERTIES
+    TIMEOUT          120
+    SKIP_RETURN_CODE 125)
 
 # ============================================================================
 # Golden-image regression matrix (issue #45)

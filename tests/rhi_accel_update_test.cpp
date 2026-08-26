@@ -38,13 +38,14 @@
 // and software. Vulkan is opt-in and skipped by default -- see the
 // Vulkan TEST_CASE at the bottom for why (VulkanDevice has no headless
 // path today; it needs a window surface to construct).
-#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#define DOCTEST_CONFIG_IMPLEMENT
 #include <doctest/doctest.h>
 
 #include "rhi/Device.h"
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -154,6 +155,32 @@ std::vector<ProbeHit> ProbeInstances(Device& dev, PipelineHandle pipe,
     return Probe(dev, pipe, tlas, out_buf, origin, stride, count);
 }
 
+// --- Backend coverage bookkeeping ----------------------------------------
+// A test that silently passes when it did not actually run is the #252
+// failure mode (the Windows golden lane "passing" by comparing nothing).
+// So the suite records, per backend, whether it executed the full body
+// or bailed and why -- and main() below prints that ledger unconditionally
+// and turns "nothing ran anywhere" into a real ctest SKIP rather than a
+// green tick.
+struct BackendOutcome {
+    std::string backend;
+    bool        ran = false;
+    std::string reason;      // why it did not run, when ran == false
+};
+std::vector<BackendOutcome> g_outcomes;
+
+void RecordSkip(BackendType b, const std::string& why) {
+    // std::string, not the raw const char* -- doctest stringifies a
+    // bare char pointer as a POINTER, so `MESSAGE(... << BackendName(b))`
+    // prints 0x1010534f7 instead of "metal".
+    const std::string name = BackendName(b);
+    g_outcomes.push_back({name, false, why});
+    MESSAGE("SKIPPED " << name << ": " << why);
+}
+void RecordRan(BackendType b) {
+    g_outcomes.push_back({BackendName(b), true, {}});
+}
+
 // The whole contract, run against one backend. Split out of the
 // TEST_CASEs so both backends assert exactly the same things -- if the
 // two suites could drift, a cross-backend divergence could hide in the
@@ -172,11 +199,21 @@ void RunAccelSuite(BackendType backend) {
 
     auto dev = Device::Create(backend, window);
     if (!dev) {
-        MESSAGE("skipping " << label << ": backend not built or device creation failed");
+        RecordSkip(backend, "backend not built into this binary, or device "
+                            "creation failed on this host");
         return;
     }
+    // The capability gate. MetalDevice::SupportsHardwareRT() now reports
+    // MTLDevice.supportsRaytracing rather than an unconditional true, so
+    // a GPU that cannot build acceleration structures (a paravirtualised
+    // GH-hosted macos-26 runner, a VM, a pre-RT discrete GPU) lands here
+    // instead of aborting inside the first AS encode. This is the same
+    // environmental limitation that keeps the Metal golden cells out of
+    // CI -- see the "Golden-image regression matrix" step in
+    // .github/workflows/build.yml.
     if (!dev->SupportsHardwareRT()) {
-        MESSAGE("skipping " << label << ": no acceleration-structure support");
+        RecordSkip(backend, "GPU reports no hardware ray-tracing support "
+                            "(acceleration structures unavailable)");
         return;
     }
     ComputePipelineDesc pdesc{};
@@ -184,7 +221,8 @@ void RunAccelSuite(BackendType backend) {
     pdesc.debug_name  = "accel_probe";
     auto pipe = dev->CreateComputePipeline(pdesc);
     if (!pipe) {
-        MESSAGE("skipping " << label << ": accel_probe pipeline unavailable");
+        RecordSkip(backend, "accel_probe pipeline unavailable (ray-query "
+                            "shader failed to compile on this device)");
         return;
     }
 
@@ -442,6 +480,9 @@ void RunAccelSuite(BackendType backend) {
     dev->DestroyBuffer(out_buf);
     dev->DestroyAccelStruct(tlas);
     dev->DestroyAccelStruct(blas);
+
+    // Reached only when every assertion above actually executed.
+    RecordRan(backend);
 }
 
 }  // namespace
@@ -474,9 +515,66 @@ TEST_CASE("rhi accel: multi-instance TLAS + update verb (vulkan)") {
     // here, not a new test.
     const char* opt_in = std::getenv("PT_TEST_VULKAN_ACCEL");
     if (opt_in == nullptr || opt_in[0] == '0' || opt_in[0] == '\0') {
-        MESSAGE("skipping vulkan: VulkanDevice has no headless path "
-                "(set PT_TEST_VULKAN_ACCEL=1 to force)");
+        RecordSkip(BackendType::Vulkan,
+                   "VulkanDevice has no headless path "
+                   "(set PT_TEST_VULKAN_ACCEL=1 to force)");
         return;
     }
     RunAccelSuite(BackendType::Vulkan);
+}
+
+// Exit code ctest is told to read as "skipped" (see SKIP_RETURN_CODE in
+// tests/CMakeLists.txt). 125 is the conventional value -- outside the
+// range doctest returns for assertion failures, and clear of 126/127
+// which the shell reserves for "not executable" / "not found".
+constexpr int kCtestSkipExitCode = 125;
+
+int main(int argc, char** argv) {
+    doctest::Context ctx;
+    ctx.applyCommandLine(argc, argv);
+    const int res = ctx.run();
+    if (ctx.shouldExit()) return res;
+
+    // Print the coverage ledger unconditionally -- on success as well as
+    // on failure. ctest only surfaces a test's stdout with
+    // --output-on-failure, but the value of this block is precisely that
+    // someone reading a GREEN run can see which backends were actually
+    // exercised. A reviewer who cannot tell "the instance-id round-trip
+    // passed on Metal" from "Metal was skipped" has no reason to trust
+    // the tick.
+    std::printf("\n--- rhi_accel_update backend coverage ---\n");
+    int ran = 0;
+    for (const auto& o : g_outcomes) {
+        if (o.ran) {
+            ++ran;
+            std::printf("  %-9s EXERCISED (full suite)\n", o.backend.c_str());
+        } else {
+            std::printf("  %-9s skipped: %s\n", o.backend.c_str(), o.reason.c_str());
+        }
+    }
+    if (res != 0) return res;
+
+    if (ran == 0) {
+        // Nothing anywhere ran the body. Reporting that as a pass would
+        // be a green tick over zero coverage, so hand ctest its skip
+        // code and let the summary line say so.
+        std::printf("  => NO backend could host an acceleration structure; "
+                    "reporting SKIP, not pass.\n");
+        return kCtestSkipExitCode;
+    }
+    // Metal is the backend #251 is about -- the software backend cannot
+    // reproduce that bug because it never touches a Metal instance
+    // descriptor. Say so out loud when Metal did not run, so a green CI
+    // tick is never mistaken for cross-backend coverage.
+    bool metal_ran = false;
+    for (const auto& o : g_outcomes) {
+        if (o.ran && o.backend == "metal") metal_ran = true;
+    }
+    if (!metal_ran) {
+        std::printf("  => NOTE: the #251 instance-id guard is Metal-specific "
+                    "and did NOT run here. Software coverage alone does not "
+                    "prove the Metal fix.\n");
+    }
+    std::printf("  => %d backend(s) exercised.\n", ran);
+    return res;
 }

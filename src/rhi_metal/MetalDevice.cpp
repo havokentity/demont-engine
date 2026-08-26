@@ -424,6 +424,25 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
     }
     LOG_INFO("Metal device: {}", device_name_);
 
+    // Hardware ray-tracing capability. This used to be assumed:
+    // SupportsHardwareRT() returned an unconditional `true`, so
+    // Engine::EnsureMeshUpdated() took the BLAS/TLAS path on EVERY Mac.
+    // On a GPU that cannot build acceleration structures -- a
+    // paravirtualised GH-hosted `macos-26` runner, a VM, an old
+    // pre-RT discrete GPU -- newAccelerationStructure hands back a stub
+    // object and the first encode against it aborts the process with
+    // `-[IOGPUMetalAccelerationStructure serializerResourceRef]:
+    // unrecognized selector`. Querying the capability turns that abort
+    // into the software triangle-BVH fallback the engine already has
+    // and the shader's `tlas_present` gate already handles.
+    rt_supported_ = device_->supportsRaytracing();
+    LOG_INFO("  hardware ray tracing: {}", rt_supported_ ? "yes" : "no");
+    if (!rt_supported_) {
+        LOG_WARN("Metal device reports no ray-tracing support; acceleration "
+                 "structures are disabled and the renderer falls back to the "
+                 "software triangle-BVH mesh path.");
+    }
+
     queue_ = device_->newCommandQueue();
     if (queue_ == nullptr) {
         LOG_ERROR("newCommandQueue failed");
@@ -998,6 +1017,11 @@ void PackTransform(const float* src, MTL::PackedFloat4x3& dst) {
 
 AccelStructHandle MetalDevice::CreateBLAS(const BLASDesc& d) {
     if (device_ == nullptr || d.vertex_count == 0 || d.index_count == 0) return {0};
+    if (!rt_supported_) {
+        LOG_WARN("Metal CreateBLAS: device has no ray-tracing support; "
+                 "refusing to build (caller falls back to the software mesh path)");
+        return {0};
+    }
     PT_ZONE_SCOPED_N("MetalDevice::CreateBLAS");
     pt::mem::TagScope scope(pt::MemTag::GpuBuffers);
     auto* pool = NS::AutoreleasePool::alloc()->init();
@@ -1022,13 +1046,43 @@ AccelStructHandle MetalDevice::CreateBLAS(const BLASDesc& d) {
     desc->setGeometryDescriptors(geoms);
     desc->setUsage(MetalAccelUsage(d.flags));
 
+    // Every one of these can fail, and the failure has to be caught
+    // BEFORE the encode, not after. The original code encoded
+    // `buildAccelerationStructure(as, ...)` first and only tested
+    // `as == nullptr` after the commit + wait -- so a device that
+    // could not produce an acceleration structure took the abort
+    // rather than the null return. A zero accelerationStructureSize is
+    // the same signal one step earlier: the driver is telling us it
+    // cannot size this build at all.
     auto sizes = device_->accelerationStructureSizes(desc);
+    if (sizes.accelerationStructureSize == 0) {
+        LOG_ERROR("Metal CreateBLAS: driver reported a zero-byte acceleration "
+                  "structure for {} triangles; aborting the build",
+                  d.index_count / 3);
+        vbuf->release();
+        ibuf->release();
+        pool->release();
+        return {0};
+    }
     auto* as = device_->newAccelerationStructure(sizes.accelerationStructureSize);
     auto* scratch = device_->newBuffer(sizes.buildScratchBufferSize,
                                         MTL::ResourceStorageModePrivate);
+    auto* cb  = queue_->commandBuffer();
+    auto* enc = (cb != nullptr) ? cb->accelerationStructureCommandEncoder() : nullptr;
+    if (as == nullptr || scratch == nullptr || enc == nullptr) {
+        LOG_ERROR("Metal CreateBLAS: acceleration-structure setup failed "
+                  "(as={} scratch={} encoder={})",
+                  static_cast<const void*>(as),
+                  static_cast<const void*>(scratch),
+                  static_cast<const void*>(enc));
+        if (as)      as->release();
+        if (scratch) scratch->release();
+        vbuf->release();
+        ibuf->release();
+        pool->release();
+        return {0};
+    }
 
-    auto* cb = queue_->commandBuffer();
-    auto* enc = cb->accelerationStructureCommandEncoder();
     enc->buildAccelerationStructure(as, desc, scratch, 0);
     enc->endEncoding();
     cb->commit();
@@ -1045,7 +1099,6 @@ AccelStructHandle MetalDevice::CreateBLAS(const BLASDesc& d) {
     scratch->release();
     pool->release();
 
-    if (as == nullptr) return {0};
     std::lock_guard lock(resource_mutex_);
     auto id = next_id_++;
     MetalAccel entry{};
@@ -1132,6 +1185,11 @@ bool BuildInstanceDescriptors(
 
 AccelStructHandle MetalDevice::CreateTLAS(const TLASDesc& d) {
     if (device_ == nullptr || d.instances.empty()) return {0};
+    if (!rt_supported_) {
+        LOG_WARN("Metal CreateTLAS: device has no ray-tracing support; "
+                 "refusing to build (caller falls back to the software mesh path)");
+        return {0};
+    }
     PT_ZONE_SCOPED_N("MetalDevice::CreateTLAS");
     pt::mem::TagScope scope(pt::MemTag::GpuBuffers);
     auto* pool = NS::AutoreleasePool::alloc()->init();
@@ -1193,8 +1251,14 @@ AccelStructHandle MetalDevice::CreateTLAS(const TLASDesc& d) {
     desc->setUsage(MetalAccelUsage(d.flags));
 
     auto sizes = device_->accelerationStructureSizes(desc);
-    auto* tlas = device_->newAccelerationStructure(sizes.accelerationStructureSize);
+    auto* tlas = (sizes.accelerationStructureSize > 0)
+                     ? device_->newAccelerationStructure(sizes.accelerationStructureSize)
+                     : nullptr;
     if (tlas == nullptr) {
+        LOG_ERROR("Metal CreateTLAS: acceleration-structure allocation failed "
+                  "({} instances, driver-reported size {})",
+                  instance_buf.size(),
+                  static_cast<std::size_t>(sizes.accelerationStructureSize));
         for (std::uint32_t i = 0; i < ring_used; ++i) entry.ring[i]->release();
         pool->release();
         return {0};
@@ -1211,9 +1275,19 @@ AccelStructHandle MetalDevice::CreateTLAS(const TLASDesc& d) {
     entry.scratch = device_->newBuffer(std::max<std::size_t>(entry.scratch_size, 1u),
                                        MTL::ResourceStorageModePrivate);
 
-    auto* cb = queue_->commandBuffer();
+    auto* cb  = queue_->commandBuffer();
+    auto* enc = (cb != nullptr) ? cb->accelerationStructureCommandEncoder() : nullptr;
+    if (entry.scratch == nullptr || enc == nullptr) {
+        LOG_ERROR("Metal CreateTLAS: build setup failed (scratch={} encoder={})",
+                  static_cast<const void*>(entry.scratch),
+                  static_cast<const void*>(enc));
+        if (entry.scratch) entry.scratch->release();
+        tlas->release();
+        for (std::uint32_t i = 0; i < ring_used; ++i) entry.ring[i]->release();
+        pool->release();
+        return {0};
+    }
     cb->retain();
-    auto* enc = cb->accelerationStructureCommandEncoder();
     for (auto* b : blas_array) enc->useResource(b, MTL::ResourceUsageRead);
     enc->buildAccelerationStructure(tlas, desc, entry.scratch, 0);
     enc->endEncoding();
@@ -1241,6 +1315,10 @@ AccelStructHandle MetalDevice::CreateTLAS(const TLASDesc& d) {
 bool MetalDevice::UpdateTLASInstances(AccelStructHandle h,
                                       std::span<const TLASInstance> instances) {
     if (device_ == nullptr || h.id == 0 || instances.empty()) return false;
+    // Unreachable in practice -- with no RT support there is no TLAS to
+    // update, because CreateTLAS refused. Kept so every AS entry point
+    // carries the same guard rather than relying on that reasoning.
+    if (!rt_supported_) return false;
     PT_ZONE_SCOPED_N("MetalDevice::UpdateTLASInstances");
     pt::mem::TagScope scope(pt::MemTag::GpuBuffers);
 
@@ -1345,9 +1423,16 @@ bool MetalDevice::UpdateTLASInstances(AccelStructHandle h,
     }
     MTL::Buffer* scratch = grown_scratch ? grown_scratch : entry.scratch;
 
-    auto* cb = queue_->commandBuffer();
+    auto* cb  = queue_->commandBuffer();
+    auto* enc = (cb != nullptr) ? cb->accelerationStructureCommandEncoder() : nullptr;
+    if (enc == nullptr) {
+        LOG_ERROR("Metal UpdateTLASInstances: could not open an "
+                  "acceleration-structure encoder");
+        if (grown_scratch) grown_scratch->release();
+        pool->release();
+        return false;
+    }
     cb->retain();
-    auto* enc = cb->accelerationStructureCommandEncoder();
     for (auto* b : blas_array) enc->useResource(b, MTL::ResourceUsageRead);
     if (refit_allowed) {
         // In-place refit: source and destination are the same

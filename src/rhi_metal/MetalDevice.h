@@ -296,7 +296,11 @@ public:
 
     // ---- Introspection --------------------------------------------------
     BackendType  Type()             const override { return BackendType::Metal; }
-    bool         SupportsHardwareRT() const override { return true; }
+    // Real capability, not an assumption. See the constructor: a Mac
+    // whose GPU cannot build acceleration structures (paravirtualised
+    // CI runner, VM, pre-RT discrete GPU) used to be told "yes" here
+    // and then aborted inside the first AS encode.
+    bool         SupportsHardwareRT() const override { return rt_supported_; }
     const char*  DeviceName()       const override { return device_name_.c_str(); }
     std::size_t  CurrentAllocatedBytes() const override;
 
@@ -333,6 +337,11 @@ private:
     int   height_ = 0;
     std::uint32_t frame_index_ = 0;
     std::string device_name_ = "Metal Device";
+    // MTLDevice.supportsRaytracing, latched at construction. Gates every
+    // acceleration-structure entry point; false means CreateBLAS /
+    // CreateTLAS / UpdateTLASInstances refuse cleanly instead of
+    // encoding against a stub AS object and aborting.
+    bool rt_supported_ = false;
 
     MTL::Device*        device_  = nullptr;
     MTL::CommandQueue*  queue_   = nullptr;
