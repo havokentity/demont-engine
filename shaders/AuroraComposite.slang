@@ -92,13 +92,25 @@ cbuffer Push {
     float4 pos_fovtan;     // .xyz = camera origin, .w = fovYTan
     float4 fwd_aspect;     // .xyz = forward, .w = aspect ratio (W/H)
     float4 right_xyz;
+    // .xyz camera up. .w = sin(solar elevation) at the CAMERA, i.e.
+    // dot(localUp(camera), sun_dir) -- planetary P0 (#254). The day gate
+    // below is an observer-relative query, so the scalar is the whole of
+    // what per-point local up means here. Riding a lane the camera basis
+    // was already zero-padding also keeps this push at exactly 112 B =
+    // VulkanDevice::kPushSplitOffset: one more vec4 would spill the tail
+    // into a Frame UBO this kernel does not declare. Planar frame ->
+    // sun_and_mode.y bit-for-bit.
     float4 up_xyz;
 
     // .xyz = unit vector toward sun, .w = sky mode (0=gradient,
-    // 1=hdri, 2=procedural). The day/night gate inside the shader
-    // is conditioned on sun.y -- aurora fades to zero when the sun
+    // 1=hdri, 2=procedural). The day/night gate inside the shader is
+    // conditioned on the sun's elevation above the observer's LOCAL
+    // horizon (up_xyz.w, see above) -- aurora fades to zero when the sun
     // is well above the horizon and is fully visible only below the
-    // civil-twilight line. Same convention as StarsComposite.
+    // civil-twilight line. Same convention as StarsComposite. The
+    // direction itself is unused today; kept for layout symmetry with
+    // the other composites and for the sun-angle work a real auroral
+    // oval will need.
     float4 sun_and_mode;
 
     // Aurora cvars packed:
@@ -356,8 +368,11 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // fade: sun elevation below -0.10 = full night; above +0.20 =
     // full day; in-between is twilight. The aurora intensity scales
     // by (1 - day) so it fades smoothly in / out at twilight.
-    float3 sun = sun_and_mode.xyz;
-    float sun_elev = sun.y;
+    // Solar elevation above the observer's LOCAL horizon (#254). The
+    // magnetic-pole direction built below is still expressed against
+    // world +Y -- turning the auroral oval into a real geomagnetic frame
+    // is a later phase, not P0 plumbing.
+    float sun_elev = up_xyz.w;
     float day = smoothstep(-0.10, 0.20, sun_elev);
     float night = 1.0 - day;
     if (night <= 0.001) return;

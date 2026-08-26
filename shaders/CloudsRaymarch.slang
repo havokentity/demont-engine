@@ -92,8 +92,8 @@ import PathTraceCloud;
 // shared pipeline layout reserves the first 112B for hw push constants
 // (VulkanDevice::kPushSplitOffset), with the remainder spilling into
 // a per-frame Frame UBO. The host CloudsRaymarchPush struct is
-// contiguous 240B; VulkanCommandBuffer::Dispatch byte-splits it:
-// bytes [0..112) -> vkCmdPushConstants, bytes [112..240) -> Frame UBO.
+// contiguous 288B; VulkanCommandBuffer::Dispatch byte-splits it:
+// bytes [0..112) -> vkCmdPushConstants, bytes [112..288) -> Frame UBO.
 [[vk::push_constant]]
 cbuffer Push {
     // Camera basis (matches PathTrace.slang's leading fields so the
@@ -138,6 +138,13 @@ cbuffer Frame {
     uint   composite_active;  // 0 -> kernel writes pass-through (alpha 0)
     uint   _pad0;
     uint   _pad1;
+    // --- Planetary P0 (#254) ---
+    // .xyz planet centre (world), .w radius; .w <= 0 == planar frame, in
+    // which localUp() is world +Y and altitude is p.y. Mirrors PtPush's
+    // field so this pre-pass and the inline path-traced march agree on
+    // where "up" is -- the two r_clouds_mode paths have to.
+    float4 planet_center_radius;
+    // --- end Planetary P0 ---
 };
 
 #else // !PT_TARGET_SPIRV -- Metal MSL path
@@ -145,7 +152,7 @@ cbuffer Frame {
 // Metal lowers vk::push_constant to setBytes with no hw size cap, so we
 // keep the full struct contiguous; field order must match the SPIR-V
 // Push + Frame declarations above byte-for-byte (the host pushes one
-// contiguous 240B blob).
+// contiguous 288B blob).
 [[vk::push_constant]]
 cbuffer Push {
     float4 pos_fovtan;
@@ -168,9 +175,30 @@ cbuffer Push {
     uint   composite_active;
     uint   _pad0;
     uint   _pad1;
+    // --- Planetary P0 (#254) --- mirrors the SPIR-V Frame field above.
+    float4 planet_center_radius;
+    // --- end Planetary P0 ---
 };
 
 #endif // PT_TARGET_SPIRV
+
+// Planetary P0 (#254). Mirrors PathTrace.slang's localUp() /
+// planetAltitude(): world +Y and p.y in the planar frame (the default),
+// the radial direction and length(p - centre) - R in the spherical one.
+// The cloud pre-pass marches through kilometres of atmosphere, so its
+// per-sample sun gate and altitude boost are genuine per-point queries
+// -- they are what makes a cloud on the lit limb bright and the same
+// cloud past the terminator dark. Planar frame -> sun_dir.y / sp.y
+// bit-for-bit, so the pre-pass is unchanged on every existing scene.
+float3 localUp(float3 p) {
+    if (planet_center_radius.w <= 0.0) return float3(0.0, 1.0, 0.0);
+    return normalize(p - planet_center_radius.xyz);
+}
+
+float planetAltitude(float3 p) {
+    if (planet_center_radius.w <= 0.0) return p.y;
+    return length(p - planet_center_radius.xyz) - planet_center_radius.w;
+}
 
 // Per-pixel deterministic hash for jitter; mirrors PathTrace.slang's
 // pcgHash so two invocations on the same pixel produce identical noise.
@@ -450,11 +478,15 @@ void main(uint3 tid : SV_DispatchThreadID) {
             // the sunward side (looking toward the sun through cloud),
             // which dot(rd, -sun_dir) had inverted to the anti-solar side.
             float c_sun = dot(rd, sun_dir);
-            float T_sun = (sun_dir.y > 0.0)
+            // Per-sample "is the sun / moon up HERE" (#254), measured
+            // against the local up at this cloud sample rather than
+            // against world +Y for the whole frame.
+            float3 sp_up = localUp(sp);
+            float T_sun = (dot(sp_up, sun_dir) > 0.0)
                 ? lightMarch(sp, sun_dir, clouds_p1, clouds_p2, clouds_p3, clouds_p4, vol_dscale, light_steps)
                 : 0.0;
             float c_moon = dot(rd, moon_dir);
-            float T_moon = (moon_dir_phase.y > 0.0)
+            float T_moon = (dot(sp_up, moon_dir) > 0.0)
                 ? lightMarch(sp, moon_dir, clouds_p1, clouds_p2, clouds_p3, clouds_p4, vol_dscale, light_steps)
                 : 0.0;
             // Multi-octave multiple-scattering (Wave 8 #28). Single-scatter
@@ -468,7 +500,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
             // the absorbing atmosphere and catch brighter, less-reddened
             // light than the ground. Matches the inline march's
             // exp(0.30 * sun_am * h_norm) over an 8 km reference height.
-            float h_norm = saturate(max(sp.y, 0.0) / 8000.0);
+            float h_norm = saturate(max(planetAltitude(sp), 0.0) / 8000.0);
             float boost  = (sun_am > 0.0) ? exp(0.30 * sun_am * h_norm) : 1.0;
             float3 sun_at = sun_rad * boost;
             // Powder term: dark-bottom approximation per Schneider 2015.
