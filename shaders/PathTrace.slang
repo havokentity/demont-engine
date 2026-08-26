@@ -3873,6 +3873,14 @@ float3 uniformSphereDirection(float2 xi) {
 #if PT_LIGHT_TREE_ENABLED
 static const uint kLightTreeNodeStrideFloat4 = 4u;
 
+// randf() (PathTraceMath.slang) returns float(seed & 0x00FFFFFF) / 2^24,
+// i.e. a uniform draw from a 2^24-step lattice on [0, 1). The tree's
+// per-level split probability is quantised onto that same lattice so the
+// pdf the estimator divides by is the probability the sampler can
+// actually realise -- see pickLightFromTree.
+static const float kPickLattice = 16777216.0;          // 2^24
+static const float kPickStep    = 1.0 / 16777216.0;    // 2^-24 (exact)
+
 struct LightTreeNodeR {
     float3 aabb_min;
     uint   left_first;   // internal: left child index; leaf: light id
@@ -3911,21 +3919,35 @@ LightTreeNodeR loadLightTreeNode(uint idx) {
 //                       half the cluster AABB diagonal -- bounds the
 //                       inverse-square term so we don't blow up when
 //                       the shade point is inside the cluster.
-//   orientation_term  = max(0, dot(cone_axis, dir_from_cluster)) when
-//                       the cluster has a bounded cone, scaled by the
-//                       cone half-angle so spot lights pointing away
-//                       receive proportionally lower weight; 1 for
-//                       fully spherical clusters (cos_half = -1).
-//   receiver_cosine   = max(0, dot(n_surface, dir_to_cluster)) -- the
-//                       Lambert term at the receiver. Folds in
-//                       back-faces (no contribution from lights behind
-//                       the surface).
+//   orientation_term  = cos(max(0, theta - theta_o - theta_u)) -- how far
+//                       the direction cluster->shade_point sits outside
+//                       the cluster's emission cone, widened by the angle
+//                       the cluster subtends.
+//   receiver_cosine   = cos(max(0, theta_i - theta_u)) -- the Lambert
+//                       term at the receiver, widened the same way.
 //
-// Returning a strictly-positive epsilon when ALL terms are zero so a
-// child branch never becomes deselectable; the traversal would then
-// have to fall back to the unfavoured sibling, biasing toward the
-// well-lit half of the scene. The epsilon keeps the estimator
-// unbiased.
+// #250: BOTH angular terms are BOUNDS OVER THE WHOLE CLUSTER, not point
+// evaluations at the cluster centre.  theta_u is the half-angle the
+// cluster's bounding sphere subtends from the shade point
+// (sin theta_u = min(1, r / d)); subtracting it is what makes the
+// estimate conservative, and it is the step Conty Estevez & Kulla spell
+// out that the original port dropped.  The previous code tested the
+// receiver cosine and the emission cone on the centre direction alone,
+// so a cluster STRADDLING the receiver's tangent plane -- half its
+// emitters above it, half below -- scored zero even while holding the
+// brightest light in the scene, and a whole subtree's energy vanished
+// from the image.
+//
+// Because the terms are now bounds, a return value of EXACTLY 0 is a
+// proof rather than a heuristic: every emitter in the cluster is either
+// behind the receiver's tangent plane or aimed away from it, so
+// sampleAnalyticLight would reject each of them on `n_dot_l > 0` (or on
+// the spot cutoff / quad one-sidedness) anyway.  Skipping such a subtree
+// loses no energy -- which is why the old `max(..., 1e-8)` floor is gone.
+// An ABSOLUTE floor sitting 8+ orders of magnitude under a live sibling
+// is exactly what let float32 round the conditional split to 1.0 in
+// pickLightFromTree below; a relative floor is unnecessary once zero
+// means zero.
 float lightTreeImportance(LightTreeNodeR node, float3 hit_pt,
                            float3 n_face) {
     float3 centre = 0.5 * (node.aabb_min + node.aabb_max);
@@ -3944,33 +3966,61 @@ float lightTreeImportance(LightTreeNodeR node, float3 hit_pt,
     // singular.
     float falloff = 1.0 / max(d2, rad2);
 
-    // Orientation term. Cluster emits toward the shade point in
-    // direction (-dir_to) (from cluster's perspective). For a one-sided
-    // cluster (cos_half >= 0) we want the cluster's cone to overlap
-    // -dir_to; for a fully spherical cluster (cos_half = -1) always 1.
-    float orient = 1.0;
-    if (node.cone_cos_half > -0.999) {
-        float cos_emit = -dot(node.cone_axis, dir_to);
-        // Smoothstep the cone window: 1 inside cos_half, 0 fully
-        // outside (cos = cos_half - 0.2). This is the same falloff
-        // shape Conty Estevez & Kulla use to keep the picker unbiased
-        // even when the cluster is just outside its declared cone.
-        float t = (cos_emit - (node.cone_cos_half - 0.2)) / 0.2;
-        orient = saturate(t);
+    // theta_u: half-angle subtended by the cluster's bounding sphere.
+    // d <= r (shade point inside the sphere) saturates to pi/2, which
+    // makes both angular terms fully permissive -- correct, because the
+    // cluster then surrounds the receiver.
+    float sin_u = min(1.0, sqrt(rad2) / d);
+    float cos_u = sqrt(saturate(1.0 - sin_u * sin_u));
+
+    // Orientation term. The cluster emits toward the shade point along
+    // (-dir_to) from its own perspective, so theta is the angle between
+    // the cone axis and that direction. The cone is widened by theta_u
+    // before the test: alpha = theta_o + theta_u, evaluated through the
+    // angle-sum identities so no inverse trig is needed.
+    //   cos alpha = cos theta_o cos theta_u - sin theta_o sin theta_u
+    //   sin alpha = sin theta_o cos theta_u + cos theta_o sin theta_u
+    // sin alpha < 0 means alpha > pi, i.e. the widened cone covers every
+    // direction -- which is also how the fully spherical sentinel
+    // (cos_half = -1 -> theta_o = pi) falls out with no special case.
+    float cos_emit = -dot(node.cone_axis, dir_to);
+    float cos_o    = node.cone_cos_half;
+    float sin_o    = sqrt(saturate(1.0 - cos_o * cos_o));
+    float cos_a    = cos_o * cos_u - sin_o * sin_u;
+    float sin_a    = sin_o * cos_u + cos_o * sin_u;
+    float orient;
+    if (sin_a < 0.0 || cos_emit >= cos_a) {
+        orient = 1.0;               // inside the widened cone
+    } else {
+        float sin_emit = sqrt(saturate(1.0 - cos_emit * cos_emit));
+        orient = max(0.0, cos_emit * cos_a + sin_emit * sin_a);
     }
 
-    // Receiver-side Lambert at the shade point.
-    float recv = max(0.0, dot(n_face, dir_to));
+    // Receiver-side Lambert bound: cos(max(0, theta_i - theta_u)).
+    float cos_i = dot(n_face, dir_to);
+    float recv;
+    if (cos_i >= cos_u) {
+        recv = 1.0;                 // the cluster spans the surface normal
+    } else {
+        float sin_i = sqrt(saturate(1.0 - cos_i * cos_i));
+        recv = max(0.0, cos_i * cos_u + sin_i * sin_u);
+    }
 
-    return max(node.intensity * falloff * orient * recv, 1e-8);
+    return node.intensity * falloff * orient * recv;
 }
 
 // Top-down 2-way tree traversal.  At each internal node, computes the
 // importance of each child and draws a uniform variate to pick one.
 // Returns the leaf light id AND accumulates the selection PDF along
-// the path (sigma_i p_i where p_i is the conditional pick probability
+// the path (prod_i p_i where p_i is the conditional pick probability
 // at each level). The shading-side PDF is `pick_pdf * solid_angle_pdf`
 // just like the naive uniform pick -- only the selection PMF changes.
+//
+// The invariant that matters for correctness (#250): every light whose
+// n_dot_l is positive at `hit_pt` must leave this walk with a STRICTLY
+// POSITIVE pick_pdf. `radiance += Le * brdf * n_dot_l / ls.pdf` is an
+// importance-sampling estimator -- a light handed probability zero is
+// not down-weighted, it is deleted from the image.
 struct LightPick {
     uint  light_id;
     float pick_pdf;
@@ -3999,11 +4049,43 @@ LightPick pickLightFromTree(float3 hit_pt, float3 n_face, inout uint seed) {
         LightTreeNodeR cr = loadLightTreeNode(right);
         float il = lightTreeImportance(cl, hit_pt, n_face);
         float ir = lightTreeImportance(cr, hit_pt, n_face);
-        float total = il + ir;
-        // Defensive: degenerate clusters (zero importance both sides)
-        // get 50/50 split. Shouldn't happen given the epsilon in
-        // lightTreeImportance, but keep the divide safe.
-        float p_l = (total > 1e-30) ? (il / total) : 0.5;
+        float p_l;
+        if (il > 0.0 && ir > 0.0) {
+            // BOTH children hold emitters that can reach the shade
+            // point, so NEITHER may be handed probability zero -- the
+            // estimator divides by pick_pdf, and a zero-probability
+            // subtree is energy deleted, not energy resampled (#250).
+            // float32 does exactly that on its own: il / (il + ir)
+            // rounds to 1.0 as soon as ir drops below 2^-24 of il, and
+            // `1.0 - p_l` is then exactly 0.
+            //
+            // Quantise the split onto randf()'s own lattice instead of
+            // clamping with an invented epsilon. randf() returns
+            // k * 2^-24 for k uniform in [0, 2^24), so the probability
+            // the sampler can ACTUALLY realise for `u < p` is
+            // ceil(p * 2^24) * 2^-24. Rounding p onto that lattice and
+            // dividing by the rounded value makes pick_pdf the exact
+            // probability of the branch we took -- the un-rounded form
+            // was already biased whenever p fell below one lattice step
+            // -- while ceil plus the [1, 2^24-1] clamp guarantee every
+            // live subtree keeps at least one step of it.
+            // Both m * kPickStep and randf()'s k * kPickStep are exact
+            // in float32 (2^-24 is a power of two and m < 2^24), so
+            // `u < p_l` is exactly `k < m`, with no rounding slack.
+            float m = clamp(ceil((il / (il + ir)) * kPickLattice),
+                            1.0, kPickLattice - 1.0);
+            p_l = m * kPickStep;
+        } else if (il > 0.0) {
+            p_l = 1.0;              // right subtree provably contributes nothing
+        } else if (ir > 0.0) {
+            p_l = 0.0;              // left subtree provably contributes nothing
+        } else {
+            // Neither side can reach the shade point. Any split is
+            // correct (every sample gets rejected on n_dot_l / the
+            // emitter's own cutoff); 50/50 keeps the walk well defined
+            // and the divide safe.
+            p_l = 0.5;
+        }
         float u   = randf(seed);
         if (u < p_l) {
             idx = left;
