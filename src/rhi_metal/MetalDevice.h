@@ -9,9 +9,11 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 // Forward declares for metal-cpp pointer types so this header doesn't drag
 // the full Metal SDK into every consumer. The real impl uses MTL:: etc.
@@ -211,6 +213,53 @@ private:
     std::size_t   push_size_ = 0;
 };
 
+// Everything the backend retains for one acceleration structure
+// (issue #254 P0). Before the update verb existed this was a bare
+// `MTL::AccelerationStructure*`; a TLAS that can be refit has to keep
+// its build inputs alive instead of destroying them the instant the
+// build was drained.
+struct MetalAccel {
+    MTL::AccelerationStructure* as = nullptr;
+    // Byte size the structure was allocated with. An in-place rebuild
+    // for a smaller instance count must still fit inside it, so the
+    // update path checks the recomputed size against this rather than
+    // assuming monotonicity in the instance count.
+    std::size_t     as_size = 0;
+    bool            is_tlas = false;
+    AccelBuildFlags flags   = AccelBuildFlags::PreferFastTrace;
+
+    // --- TLAS only -----------------------------------------------------
+    // Scratch retained for the lifetime of the structure, but ONLY for
+    // AllowUpdate structures: a one-shot build still frees its scratch
+    // the moment the build lands, so the static CSG mesh's memory
+    // profile is unchanged. Sized to max(build, refit) scratch and
+    // grown in place if a later update needs more.
+    MTL::Buffer*    scratch      = nullptr;
+    std::size_t     scratch_size = 0;
+
+    // Ring of host-writable instance-descriptor buffers. The build /
+    // refit reads one of these on the GPU, so the CPU must not
+    // overwrite the slot a still-running command buffer is reading --
+    // which is precisely what the old `waitUntilCompleted` bought.
+    // A ring of kAccelUpdateRing rotates the write away from anything
+    // in flight; `ring_cb[i]` is the last command buffer that read
+    // slot i, retained so its completion status is queryable.
+    static constexpr std::uint32_t kRing = 3;
+    MTL::Buffer*        ring[kRing]    {};
+    MTL::CommandBuffer* ring_cb[kRing] {};
+    std::uint32_t       ring_cursor    = 0;
+    std::size_t         ring_capacity_bytes = 0;
+
+    // Instance count at create time -- the TLAS's capacity. Updates
+    // accept [1, capacity].
+    std::uint32_t instance_capacity = 0;
+    // The BLAS handles the current instance array points at, in order.
+    // Used to decide refit (unchanged) vs in-place rebuild (changed),
+    // and to rebuild the MTLAccelerationStructure array a Metal
+    // instance descriptor indexes into.
+    std::vector<std::uint64_t> instance_blas;
+};
+
 class MetalDevice : public Device {
 public:
     explicit MetalDevice(const NativeWindowHandle& window);
@@ -222,6 +271,11 @@ public:
     PipelineHandle    CreateComputePipeline(const ComputePipelineDesc&) override;
     AccelStructHandle CreateBLAS(const BLASDesc&) override;
     AccelStructHandle CreateTLAS(const TLASDesc&) override;
+    bool UpdateTLASInstances(AccelStructHandle h,
+                             std::span<const TLASInstance> instances) override;
+    std::uint64_t AccelGpuStallCount() const override {
+        return accel_gpu_stalls_.load(std::memory_order_relaxed);
+    }
 
     void DestroyBuffer(BufferHandle h) override;
     void DestroyTexture(TextureHandle h) override;
@@ -291,7 +345,12 @@ private:
     std::unordered_map<std::uint64_t, MetalPipeline>              pipelines_;
     std::unordered_map<std::uint64_t, MTL::Texture*>               textures_;
     std::unordered_map<std::uint64_t, MTL::Buffer*>                buffers_;
-    std::unordered_map<std::uint64_t, MTL::AccelerationStructure*> accels_;
+    std::unordered_map<std::uint64_t, MetalAccel>                  accels_;
+
+    // Count of blocking GPU waits taken on an acceleration-structure
+    // path (see Device::AccelGpuStallCount). CreateBLAS / CreateTLAS
+    // each take one; UpdateTLASInstances is required never to.
+    std::atomic<std::uint64_t> accel_gpu_stalls_{0};
     // Built-in pipelines indexed by Slang kernel name.  P3+ shaders are
     // pre-compiled at device construction; CreateComputePipeline looks up
     // by name.

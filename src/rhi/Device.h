@@ -9,7 +9,9 @@
 #include "Types.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <span>
 
 namespace pt::rhi {
 
@@ -36,6 +38,50 @@ public:
     virtual PipelineHandle    CreateComputePipeline(const ComputePipelineDesc&) = 0;
     virtual AccelStructHandle CreateBLAS(const BLASDesc&)                 = 0;
     virtual AccelStructHandle CreateTLAS(const TLASDesc&)                 = 0;
+
+    // Re-point an existing TLAS at a new instance array WITHOUT a device
+    // or queue drain (issue #254 P0; the verb #81 and the planetary
+    // terrain streaming both block on).
+    //
+    // Contract:
+    //   * `instances` must be non-empty and no longer than the count the
+    //     TLAS was created with (its capacity). Growing past that needs
+    //     new storage, i.e. a new CreateTLAS + handle; the call returns
+    //     false rather than silently truncating.
+    //   * When the TLAS carries AccelBuildFlags::AllowUpdate AND the
+    //     instance count and the set of referenced BLASes are both
+    //     unchanged, the backend takes its refit path (Vulkan
+    //     MODE_UPDATE_KHR, Metal refitAccelerationStructure, Embree
+    //     dynamic-scene re-commit). Otherwise it does a full rebuild
+    //     into the SAME storage. Either way the handle stays valid and
+    //     any command buffer that has already been submitted keeps
+    //     tracing the topology it was submitted against.
+    //   * The call is ordered against subsequent submissions on the
+    //     device's own queue: work recorded after this returns observes
+    //     the new instances, work already submitted observes the old
+    //     ones. It does NOT block on the GPU -- see AccelGpuStallCount().
+    //
+    // Returns false on an unknown handle, a BLAS-less instance array, a
+    // capacity overflow, or a backend that has no acceleration
+    // structures at all (the default below).
+    virtual bool UpdateTLASInstances(AccelStructHandle,
+                                     std::span<const TLASInstance>) {
+        return false;
+    }
+
+    // Diagnostics counter: how many times an acceleration-structure code
+    // path has blocked the CALLING THREAD on the GPU -- a queue/device
+    // drain (`vkQueueWaitIdle` / `vkDeviceWaitIdle` / Metal
+    // `waitUntilCompleted`) or a targeted wait on one in-flight command
+    // buffer. Monotonic for the device's lifetime.
+    //
+    // This exists so tests can assert the *absence* of a stall rather
+    // than infer it from wall-clock timing (which is noise-prone on a
+    // shared CI runner): CreateBLAS / CreateTLAS still block once each
+    // at startup, UpdateTLASInstances must never move the counter.
+    // Backends with no GPU (software/Embree) leave it at 0 forever,
+    // which is the truth for them.
+    virtual std::uint64_t AccelGpuStallCount() const { return 0; }
 
     virtual void DestroyBuffer(BufferHandle)             = 0;
     virtual void DestroyTexture(TextureHandle)           = 0;

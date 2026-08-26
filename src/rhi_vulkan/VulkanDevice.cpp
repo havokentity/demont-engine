@@ -96,6 +96,12 @@ extern const unsigned char shader_CloudsRaymarch_spirv_data[];
 extern const unsigned long shader_CloudsRaymarch_spirv_size;
 extern const unsigned char shader_CloudsComposite_spirv_data[];
 extern const unsigned long shader_CloudsComposite_spirv_size;
+// Acceleration-structure probe (issue #254 P0 / #251). Test-only
+// ray-query kernel; the engine has no dispatch site. Declares only
+// binding 2 (the TLAS) and binding 3 (a storage buffer), both already
+// in the shared descriptor-set layout, so it needs no layout change.
+extern const unsigned char shader_AccelProbe_spirv_data[];
+extern const unsigned long shader_AccelProbe_spirv_size;
 }
 
 namespace pt::rhi::vk {
@@ -1054,6 +1060,27 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
             rt_supported_ = false;
         }
     }
+    if (rt_supported_) {
+        // minAccelerationStructureScratchOffsetAlignment (issue #254 P0).
+        // Every scratchData.deviceAddress handed to a build MUST be a
+        // multiple of this; the pre-#254 code passed a raw
+        // vkGetBufferDeviceAddress result, which happens to be
+        // sufficiently aligned on the drivers we shipped against but is
+        // a spec violation the validation layers flag and that a driver
+        // is entitled to mishandle. CreateScratchBuffer now rounds up.
+        VkPhysicalDeviceAccelerationStructurePropertiesKHR as_props{};
+        as_props.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR;
+        VkPhysicalDeviceProperties2 props2{};
+        props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        props2.pNext = &as_props;
+        vkGetPhysicalDeviceProperties2(phys_device_, &props2);
+        if (as_props.minAccelerationStructureScratchOffsetAlignment != 0) {
+            scratch_align_ = as_props.minAccelerationStructureScratchOffsetAlignment;
+        }
+        LOG_INFO("  minAccelerationStructureScratchOffsetAlignment: {}",
+                 static_cast<std::uint64_t>(scratch_align_));
+    }
     if (!rt_supported_) {
         LOG_WARN("Vulkan: hardware ray tracing unavailable on this driver");
     }
@@ -1586,6 +1613,18 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         build_pipeline("clouds_composite",
                        shader_CloudsComposite_spirv_data,
                        shader_CloudsComposite_spirv_size);
+        // Acceleration-structure probe (issue #254 P0 / #251). Only
+        // built when the driver actually has ray query -- the SPIR-V
+        // module declares the RayQueryKHR capability, so
+        // vkCreateComputePipelines would (correctly) reject it on a
+        // no-RT device. Registration failure is benign: the RHI test
+        // suite treats a missing "accel_probe" pipeline as "this
+        // backend cannot host the probe" and skips.
+        if (rt_supported_) {
+            build_pipeline("accel_probe",
+                           shader_AccelProbe_spirv_data,
+                           shader_AccelProbe_spirv_size);
+        }
         pipelines_ready_.store(true, std::memory_order_release);
 
         // Skip the per-pipeline timing-string construction below tier 2.
@@ -1706,7 +1745,14 @@ void VulkanDevice::DestroyDevice() {
             if (s) vkDestroySemaphore(device_, s, nullptr);
         }
         sem_render_done_.clear();
-        if (cmd_pool_ != VK_NULL_HANDLE) vkDestroyCommandPool(device_, cmd_pool_, nullptr);
+        if (cmd_pool_ != VK_NULL_HANDLE) {
+            // Null the handle: destroying the pool already frees every
+            // command buffer allocated from it, and DestroyAccelEntry
+            // (called a few lines below for the update ring) must not
+            // then hand a dead pool to vkFreeCommandBuffers.
+            vkDestroyCommandPool(device_, cmd_pool_, nullptr);
+            cmd_pool_ = VK_NULL_HANDLE;
+        }
 
         {
             std::lock_guard lock(resource_mutex_);
@@ -1723,13 +1769,12 @@ void VulkanDevice::DestroyDevice() {
             images_.clear();
             for (auto& [id, b] : buffers_) DestroyBufferImpl(b);
             buffers_.clear();
-            for (auto& [id, a] : accels_) {
-                if (a.accel != VK_NULL_HANDLE && pfn_DestroyAccelStruct_) {
-                    pfn_DestroyAccelStruct_(device_, a.accel, nullptr);
-                }
-                if (a.buffer) vkDestroyBuffer(device_, a.buffer, nullptr);
-                if (a.memory) vkFreeMemory(device_, a.memory, nullptr);
-            }
+            // DestroyAccelEntry also drops the retained scratch and the
+            // per-slot instance buffers / command buffers / fences the
+            // update ring owns (issue #254 P0). The vkDeviceWaitIdle
+            // above this block has already drained everything, so the
+            // fences are all signalled.
+            for (auto& [id, a] : accels_) DestroyAccelEntry(a);
             accels_.clear();
         }
         if (shared_pipe_layout_ != VK_NULL_HANDLE)
@@ -3079,6 +3124,78 @@ void VulkanDevice::EnsurePipelineWarmed(const char* kernel_name) {
 
 // ---- Acceleration structures --------------------------------------------
 
+// Map the RHI build policy onto Vulkan's build flags (issue #254 P0).
+// PreferFastTrace -- the default -- reproduces the single hardcoded
+// PREFER_FAST_TRACE_BIT_KHR every build used before the flag existed,
+// so no existing call site changes behaviour.
+VkBuildAccelerationStructureFlagsKHR VulkanDevice::VkAccelFlags(AccelBuildFlags flags) {
+    VkBuildAccelerationStructureFlagsKHR out = 0;
+    // Vulkan treats PREFER_FAST_TRACE and PREFER_FAST_BUILD as mutually
+    // exclusive (VUID-VkAccelerationStructureBuildGeometryInfoKHR-flags-03796),
+    // so pick one -- fast build wins if a caller sets both, matching the
+    // documented rule on AccelBuildFlags.
+    if (HasAccelFlag(flags, AccelBuildFlags::PreferFastBuild)) {
+        out |= VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+    } else if (HasAccelFlag(flags, AccelBuildFlags::PreferFastTrace)) {
+        out |= VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    }
+    if (HasAccelFlag(flags, AccelBuildFlags::AllowUpdate)) {
+        out |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+    }
+    return out;
+}
+
+bool VulkanDevice::CreateScratchBuffer(VkDeviceSize bytes, BufferEntry& out,
+                                       VkDeviceAddress& out_address,
+                                       VkDeviceSize& out_usable) {
+    const VkDeviceSize align = (scratch_align_ == 0) ? 1 : scratch_align_;
+    // Over-allocate so the rounded-up address still has `bytes` behind
+    // it. `bytes` can legitimately be 0 (a driver reporting no scratch
+    // need for a tiny structure); clamp to 1 so the allocation succeeds.
+    const VkDeviceSize alloc = std::max<VkDeviceSize>(bytes, 1) + (align - 1);
+    if (!CreateBufferImpl(alloc,
+                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                            | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                          out,
+                          /*persistent_map=*/false)) {
+        return false;
+    }
+    const VkDeviceAddress base    = out.device_address;
+    const VkDeviceAddress aligned = (base + align - 1) & ~(align - 1);
+    out_address = aligned;
+    out_usable  = alloc - (aligned - base);
+    return true;
+}
+
+void VulkanDevice::DestroyAccelEntry(AccelEntry& e) {
+    for (auto& slot : e.ring) {
+        if (slot.fence != VK_NULL_HANDLE) {
+            vkDestroyFence(device_, slot.fence, nullptr);
+            slot.fence = VK_NULL_HANDLE;
+        }
+        if (slot.cmd != VK_NULL_HANDLE) {
+            // A destroyed pool has already freed its command buffers;
+            // DestroyDevice nulls cmd_pool_ for exactly this reason.
+            if (cmd_pool_ != VK_NULL_HANDLE) {
+                vkFreeCommandBuffers(device_, cmd_pool_, 1, &slot.cmd);
+            }
+            slot.cmd = VK_NULL_HANDLE;
+        }
+        DestroyBufferImpl(slot.inst_buf);
+        slot.submitted = false;
+    }
+    DestroyBufferImpl(e.scratch);
+    e.scratch_address = 0;
+    e.scratch_usable  = 0;
+    if (e.accel != VK_NULL_HANDLE && pfn_DestroyAccelStruct_) {
+        pfn_DestroyAccelStruct_(device_, e.accel, nullptr);
+        e.accel = VK_NULL_HANDLE;
+    }
+    if (e.buffer) { vkDestroyBuffer(device_, e.buffer, nullptr); e.buffer = VK_NULL_HANDLE; }
+    if (e.memory) { vkFreeMemory(device_, e.memory, nullptr);    e.memory = VK_NULL_HANDLE; }
+}
+
 bool VulkanDevice::BuildAccelerationStructure(
     VkAccelerationStructureBuildGeometryInfoKHR& build_info,
     const VkAccelerationStructureBuildRangeInfoKHR* range,
@@ -3110,23 +3227,28 @@ bool VulkanDevice::BuildAccelerationStructure(
         return false;
     }
 
-    // 2. Scratch buffer for the build itself (transient).
-    BufferEntry scratch{};
-    if (!CreateBufferImpl(scratch_size,
-                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
-                            | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                          scratch,
-                          /*persistent_map=*/false)) {
+    // 2. Scratch buffer for the build itself. Transient for a one-shot
+    //    build; retained on the entry when the structure carries
+    //    AllowUpdate, so the update path never allocates (issue #254 P0).
+    //    The address is aligned to minAccelerationStructureScratchOffset-
+    //    Alignment either way, which the previous raw-address version
+    //    was not.
+    BufferEntry     scratch{};
+    VkDeviceAddress scratch_addr   = 0;
+    VkDeviceSize    scratch_usable = 0;
+    if (!CreateScratchBuffer(scratch_size, scratch, scratch_addr, scratch_usable)) {
         pfn_DestroyAccelStruct_(device_, entry.accel, nullptr);
         DestroyBufferImpl(storage);
         return false;
     }
 
     build_info.dstAccelerationStructure  = entry.accel;
-    build_info.scratchData.deviceAddress = scratch.device_address;
+    build_info.scratchData.deviceAddress = scratch_addr;
 
-    // 3. One-shot command buffer for the build.
+    // 3. One-shot command buffer for the build, plus a fence so the wait
+    //    below is scoped to THIS submission instead of draining the
+    //    whole queue (which is what vkQueueWaitIdle did, stalling any
+    //    unrelated frame work that happened to be in flight).
     VkCommandBufferAllocateInfo cbai{};
     cbai.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cbai.commandPool        = cmd_pool_;
@@ -3141,13 +3263,17 @@ bool VulkanDevice::BuildAccelerationStructure(
     const VkAccelerationStructureBuildRangeInfoKHR* ranges[1] = { range };
     pfn_CmdBuildAccelStructs_(once, 1, &build_info, ranges);
     vkEndCommandBuffer(once);
+    VkFenceCreateInfo fci{};
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    VkFence build_fence = VK_NULL_HANDLE;
+    vkCreateFence(device_, &fci, nullptr, &build_fence);
     VkSubmitInfo si{};
     si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers    = &once;
     bool as_build_ok = true;
     {
-        const VkResult sr = vkQueueSubmit(graphics_queue_, 1, &si, VK_NULL_HANDLE);
+        const VkResult sr = vkQueueSubmit(graphics_queue_, 1, &si, build_fence);
         if (sr != VK_SUCCESS) {
             if (sr == VK_ERROR_DEVICE_LOST) device_lost_ = true;
             LOG_ERROR("VulkanDevice::BuildAccelerationStructure: vkQueueSubmit "
@@ -3155,16 +3281,24 @@ bool VulkanDevice::BuildAccelerationStructure(
                       static_cast<int>(sr), VkResultToString(sr));
             as_build_ok = false;
         } else {
-            const VkResult wr = vkQueueWaitIdle(graphics_queue_);
+            // One blocking wait, deliberately kept: CreateBLAS's inputs
+            // are engine-owned CPU arrays that must not outlive the
+            // call, and the caller expects a traceable structure back.
+            // UpdateTLASInstances is the path that must never block --
+            // see AccelGpuStallCount.
+            const VkResult wr =
+                vkWaitForFences(device_, 1, &build_fence, VK_TRUE, UINT64_MAX);
+            accel_gpu_stalls_.fetch_add(1, std::memory_order_relaxed);
             if (wr != VK_SUCCESS) {
                 if (wr == VK_ERROR_DEVICE_LOST) device_lost_ = true;
                 LOG_ERROR("VulkanDevice::BuildAccelerationStructure: "
-                          "vkQueueWaitIdle failed: {} ({}). AS may be partial.",
+                          "vkWaitForFences failed: {} ({}). AS may be partial.",
                           static_cast<int>(wr), VkResultToString(wr));
                 as_build_ok = false;
             }
         }
     }
+    vkDestroyFence(device_, build_fence, nullptr);
     vkFreeCommandBuffers(device_, cmd_pool_, 1, &once);
 
     if (!as_build_ok) {
@@ -3180,10 +3314,19 @@ bool VulkanDevice::BuildAccelerationStructure(
         return false;
     }
 
-    // 4. Free scratch (no longer needed); keep storage with the entry.
-    DestroyBufferImpl(scratch);
-    entry.buffer = storage.buffer;
-    entry.memory = storage.memory;
+    // 4. Keep storage with the entry. Scratch stays too when the
+    //    structure is updatable; otherwise it goes now, exactly as
+    //    before, so the static CSG mesh's memory profile is unchanged.
+    if (HasAccelFlag(entry.flags, AccelBuildFlags::AllowUpdate)) {
+        entry.scratch         = scratch;
+        entry.scratch_address = scratch_addr;
+        entry.scratch_usable  = scratch_usable;
+    } else {
+        DestroyBufferImpl(scratch);
+    }
+    entry.buffer       = storage.buffer;
+    entry.memory       = storage.memory;
+    entry.storage_size = as_size;
 
     VkAccelerationStructureDeviceAddressInfoKHR adi{};
     adi.sType                 = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
@@ -3232,7 +3375,7 @@ AccelStructHandle VulkanDevice::CreateBLAS(const BLASDesc& d) {
     VkAccelerationStructureBuildGeometryInfoKHR build_info{};
     build_info.sType         = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
     build_info.type          = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-    build_info.flags         = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    build_info.flags         = VkAccelFlags(d.flags);
     build_info.mode          = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
     build_info.geometryCount = 1;
     build_info.pGeometries   = &geom;
@@ -3245,6 +3388,8 @@ AccelStructHandle VulkanDevice::CreateBLAS(const BLASDesc& d) {
         &build_info, &prim_count, &sizes);
 
     AccelEntry entry{};
+    entry.is_tlas = false;
+    entry.flags   = d.flags;
     VkAccelerationStructureBuildRangeInfoKHR range{};
     range.primitiveCount = prim_count;
     if (!BuildAccelerationStructure(build_info, &range, entry,
@@ -3265,17 +3410,25 @@ AccelStructHandle VulkanDevice::CreateBLAS(const BLASDesc& d) {
     return AccelStructHandle{ id };
 }
 
-AccelStructHandle VulkanDevice::CreateTLAS(const TLASDesc& d) {
-    if (!rt_supported_ || d.instances.empty()) return {0};
-    PT_ZONE_SCOPED_N("VulkanDevice::CreateTLAS");
-    pt::mem::TagScope scope(pt::MemTag::GpuBuffers);
-
-    // Build the instance buffer.
-    std::vector<VkAccelerationStructureInstanceKHR> instances;
-    instances.reserve(d.instances.size());
-    for (const auto& inst : d.instances) {
+// Translate an RHI instance array into Vulkan instance descriptors.
+// Returns false when nothing resolved (every instance pointed at a
+// BLAS that is gone). `blas_ids` records the referenced BLAS handles in
+// order so the update path can tell a transform poke (same topology ->
+// MODE_UPDATE_KHR) from a re-point (-> MODE_BUILD_KHR).
+bool VulkanDevice::BuildVkInstances(
+        std::span<const TLASInstance> instances,
+        std::vector<VkAccelerationStructureInstanceKHR>& out,
+        std::vector<std::uint64_t>& blas_ids) {
+    out.clear();
+    blas_ids.clear();
+    out.reserve(instances.size());
+    blas_ids.reserve(instances.size());
+    for (const auto& inst : instances) {
         VkAccelerationStructureKHR blas = LookupAccel(inst.blas);
-        if (blas == VK_NULL_HANDLE) continue;
+        if (blas == VK_NULL_HANDLE) {
+            LOG_WARN("Vulkan TLAS: instance references unknown BLAS id={}", inst.blas.id);
+            continue;
+        }
         VkAccelerationStructureDeviceAddressInfoKHR adi{};
         adi.sType                 = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
         adi.accelerationStructure = blas;
@@ -3290,35 +3443,68 @@ AccelStructHandle VulkanDevice::CreateTLAS(const TLASDesc& d) {
         vi.instanceShaderBindingTableRecordOffset = 0;
         vi.flags                                  = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
         vi.accelerationStructureReference         = blas_addr;
-        instances.push_back(vi);
+        out.push_back(vi);
+        blas_ids.push_back(inst.blas.id);
     }
-    if (instances.empty()) return {0};
+    return !out.empty();
+}
+
+AccelStructHandle VulkanDevice::CreateTLAS(const TLASDesc& d) {
+    if (!rt_supported_ || d.instances.empty()) return {0};
+    PT_ZONE_SCOPED_N("VulkanDevice::CreateTLAS");
+    pt::mem::TagScope scope(pt::MemTag::GpuBuffers);
+
+    // Build the instance descriptors.
+    std::vector<VkAccelerationStructureInstanceKHR> instances;
+    std::vector<std::uint64_t>                      blas_ids;
+    if (!BuildVkInstances(d.instances, instances, blas_ids)) return {0};
     VkDeviceSize ibytes = sizeof(VkAccelerationStructureInstanceKHR) * instances.size();
 
-    BufferEntry inst_buf{};
-    if (!CreateBufferImpl(ibytes,
-                          VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
-                            | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
-                            | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
-                            | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                          inst_buf,
-                          /*persistent_map=*/true)) {
-        LOG_ERROR("Vulkan CreateTLAS: instance buffer alloc failed");
-        return {0};
+    AccelEntry entry{};
+    entry.is_tlas           = true;
+    entry.flags             = d.flags;
+    entry.instance_capacity = static_cast<std::uint32_t>(instances.size());
+    entry.instance_blas     = blas_ids;
+
+    // Instance-buffer ring (issue #254 P0). The build reads slot 0. An
+    // updatable TLAS also allocates the remaining slots so a later
+    // UpdateTLASInstances can write descriptors the GPU is not
+    // concurrently reading -- that, plus the per-slot fence, is what
+    // replaces the old "build, drain, free the instance buffer"
+    // sequence. A non-updatable TLAS allocates slot 0 only, and the
+    // buffer is destroyed with the structure rather than immediately
+    // after the build (the drain that made an immediate free safe is
+    // gone from the update path; keeping the two paths symmetrical is
+    // cheaper than reasoning about them separately, and one instance
+    // buffer per TLAS is a rounding error next to the AS storage).
+    const std::uint32_t ring_used =
+        HasAccelFlag(d.flags, AccelBuildFlags::AllowUpdate) ? AccelEntry::kRing : 1u;
+    constexpr VkBufferUsageFlags kInstUsage =
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
+        | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+        | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    constexpr VkMemoryPropertyFlags kInstProps =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (std::uint32_t i = 0; i < ring_used; ++i) {
+        if (!CreateBufferImpl(ibytes, kInstUsage, kInstProps,
+                              entry.ring[i].inst_buf, /*persistent_map=*/true)) {
+            LOG_ERROR("Vulkan CreateTLAS: instance buffer alloc failed");
+            for (std::uint32_t j = 0; j < i; ++j) DestroyBufferImpl(entry.ring[j].inst_buf);
+            return {0};
+        }
     }
-    std::memcpy(inst_buf.mapped, instances.data(), ibytes);
+    std::memcpy(entry.ring[0].inst_buf.mapped, instances.data(), ibytes);
 
     VkAccelerationStructureGeometryKHR geom{};
     geom.sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
     geom.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
     geom.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
-    geom.geometry.instances.data.deviceAddress = inst_buf.device_address;
+    geom.geometry.instances.data.deviceAddress = entry.ring[0].inst_buf.device_address;
 
     VkAccelerationStructureBuildGeometryInfoKHR build_info{};
     build_info.sType         = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
     build_info.type          = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
-    build_info.flags         = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    build_info.flags         = VkAccelFlags(d.flags);
     build_info.mode          = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
     build_info.geometryCount = 1;
     build_info.pGeometries   = &geom;
@@ -3330,22 +3516,227 @@ AccelStructHandle VulkanDevice::CreateTLAS(const TLASDesc& d) {
         VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
         &build_info, &prim_count, &sizes);
 
-    AccelEntry entry{};
     VkAccelerationStructureBuildRangeInfoKHR range{};
     range.primitiveCount = prim_count;
+    // Scratch is sized to cover a later MODE_UPDATE too, so the update
+    // path never reallocates on a same-topology refit.
+    const VkDeviceSize scratch_bytes =
+        HasAccelFlag(d.flags, AccelBuildFlags::AllowUpdate)
+            ? std::max(sizes.buildScratchSize, sizes.updateScratchSize)
+            : sizes.buildScratchSize;
     if (!BuildAccelerationStructure(build_info, &range, entry,
                                     VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR,
                                     sizes.accelerationStructureSize,
-                                    sizes.buildScratchSize)) {
-        DestroyBufferImpl(inst_buf);
+                                    scratch_bytes)) {
+        for (std::uint32_t i = 0; i < ring_used; ++i) DestroyBufferImpl(entry.ring[i].inst_buf);
         return {0};
     }
-    DestroyBufferImpl(inst_buf);
 
     std::lock_guard lock(resource_mutex_);
     auto id = next_id_++;
     accels_.emplace(id, entry);
     return AccelStructHandle{ id };
+}
+
+bool VulkanDevice::UpdateTLASInstances(AccelStructHandle h,
+                                       std::span<const TLASInstance> instances) {
+    if (!rt_supported_ || h.id == 0 || device_ == VK_NULL_HANDLE ||
+        instances.empty()) {
+        return false;
+    }
+    PT_ZONE_SCOPED_N("VulkanDevice::UpdateTLASInstances");
+    pt::mem::TagScope scope(pt::MemTag::GpuBuffers);
+
+    std::vector<VkAccelerationStructureInstanceKHR> vk_instances;
+    std::vector<std::uint64_t>                      blas_ids;
+    if (!BuildVkInstances(instances, vk_instances, blas_ids)) return false;
+
+    std::lock_guard lock(resource_mutex_);
+    auto it = accels_.find(h.id);
+    if (it == accels_.end() || !it->second.is_tlas ||
+        it->second.accel == VK_NULL_HANDLE) {
+        LOG_WARN("Vulkan UpdateTLASInstances: id={} is not a live TLAS", h.id);
+        return false;
+    }
+    AccelEntry& e = it->second;
+    if (vk_instances.size() > e.instance_capacity) {
+        LOG_WARN("Vulkan UpdateTLASInstances: {} instances exceeds capacity {}",
+                 vk_instances.size(), e.instance_capacity);
+        return false;
+    }
+
+    // MODE_UPDATE_KHR requires the structure to have been built with
+    // ALLOW_UPDATE and requires the primitive count to match the build
+    // exactly (VUID-vkCmdBuildAccelerationStructuresKHR-pInfos-03407).
+    // We additionally require the referenced BLAS set to be unchanged so
+    // the refit / rebuild rule reads the same on all three backends.
+    const bool can_update =
+        HasAccelFlag(e.flags, AccelBuildFlags::AllowUpdate) &&
+        blas_ids == e.instance_blas;
+
+    const std::uint32_t ring_used =
+        HasAccelFlag(e.flags, AccelBuildFlags::AllowUpdate) ? AccelEntry::kRing : 1u;
+    AccelEntry::UpdateSlot& slot = e.ring[e.ring_cursor % ring_used];
+
+    // Wait on THIS SLOT's own fence only -- never the queue, never the
+    // device. At kRing == kFramesInFlight with at most one update per
+    // frame this is already signalled; if a caller updates faster than
+    // the GPU consumes, it throttles to the depth of the ring rather
+    // than to the depth of the pipeline.
+    if (slot.submitted && slot.fence != VK_NULL_HANDLE) {
+        // Only count a stall when we ACTUALLY block. An already-signalled
+        // fence costs nothing and must not inflate the counter the tests
+        // assert on -- and, symmetrically, a real wait must always be
+        // counted even though it is bounded and rare.
+        if (vkGetFenceStatus(device_, slot.fence) == VK_NOT_READY) {
+            const VkResult wr =
+                vkWaitForFences(device_, 1, &slot.fence, VK_TRUE, UINT64_MAX);
+            accel_gpu_stalls_.fetch_add(1, std::memory_order_relaxed);
+            if (wr != VK_SUCCESS) {
+                if (wr == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+                LOG_ERROR("VulkanDevice::UpdateTLASInstances: vkWaitForFences "
+                          "failed: {} ({}).",
+                          static_cast<int>(wr), VkResultToString(wr));
+                return false;
+            }
+        }
+        vkResetFences(device_, 1, &slot.fence);
+        slot.submitted = false;
+    }
+    if (slot.inst_buf.mapped == nullptr) return false;
+    const VkDeviceSize ibytes =
+        sizeof(VkAccelerationStructureInstanceKHR) * vk_instances.size();
+    if (ibytes > slot.inst_buf.size) return false;
+    std::memcpy(slot.inst_buf.mapped, vk_instances.data(), ibytes);
+
+    VkAccelerationStructureGeometryKHR geom{};
+    geom.sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+    geom.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    geom.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+    geom.geometry.instances.data.deviceAddress = slot.inst_buf.device_address;
+
+    VkAccelerationStructureBuildGeometryInfoKHR bi{};
+    bi.sType         = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+    bi.type          = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    bi.flags         = VkAccelFlags(e.flags);
+    bi.mode          = can_update ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR
+                                  : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    // srcAccelerationStructure == dst is the in-place update the spec
+    // explicitly allows (VUID-...-pInfos-03403 only forbids a src that
+    // is a DIFFERENT structure whose memory overlaps dst).
+    bi.srcAccelerationStructure = can_update ? e.accel : VK_NULL_HANDLE;
+    bi.dstAccelerationStructure = e.accel;
+    bi.geometryCount = 1;
+    bi.pGeometries   = &geom;
+
+    std::uint32_t prim_count = static_cast<std::uint32_t>(vk_instances.size());
+    VkAccelerationStructureBuildSizesInfoKHR sizes{};
+    sizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+    pfn_GetAccelStructBuildSizes_(device_,
+        VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+        &bi, &prim_count, &sizes);
+    if (sizes.accelerationStructureSize > e.storage_size) {
+        LOG_WARN("Vulkan UpdateTLASInstances: {} instances need {} bytes of AS "
+                 "storage but the structure owns {}; rebuild required",
+                 vk_instances.size(),
+                 static_cast<std::uint64_t>(sizes.accelerationStructureSize),
+                 static_cast<std::uint64_t>(e.storage_size));
+        return false;
+    }
+    const VkDeviceSize need_scratch =
+        can_update ? sizes.updateScratchSize : sizes.buildScratchSize;
+    if (e.scratch.buffer == VK_NULL_HANDLE || need_scratch > e.scratch_usable) {
+        // Grow. The old scratch may still be read by an in-flight
+        // update, so hand it to the slot whose fence guards it -- which
+        // is the slot we just waited on -- and destroy it only after
+        // that wait. Simplest correct form: every other slot's fence is
+        // also signalled or unsubmitted at this point for a ring of 2,
+        // so a wait-all across the ring is bounded and rare (it happens
+        // once, when a caller updates with a larger instance count than
+        // the create-time one).
+        for (std::uint32_t i = 0; i < ring_used; ++i) {
+            auto& s = e.ring[i];
+            if (!s.submitted || s.fence == VK_NULL_HANDLE) continue;
+            if (vkGetFenceStatus(device_, s.fence) == VK_NOT_READY) {
+                vkWaitForFences(device_, 1, &s.fence, VK_TRUE, UINT64_MAX);
+                accel_gpu_stalls_.fetch_add(1, std::memory_order_relaxed);
+            }
+            vkResetFences(device_, 1, &s.fence);
+            s.submitted = false;
+        }
+        DestroyBufferImpl(e.scratch);
+        if (!CreateScratchBuffer(need_scratch, e.scratch, e.scratch_address,
+                                 e.scratch_usable)) {
+            LOG_ERROR("Vulkan UpdateTLASInstances: scratch alloc failed ({} bytes)",
+                      static_cast<std::uint64_t>(need_scratch));
+            return false;
+        }
+    }
+    bi.scratchData.deviceAddress = e.scratch_address;
+
+    // Lazily allocate this slot's command buffer + fence on first use.
+    if (slot.cmd == VK_NULL_HANDLE) {
+        VkCommandBufferAllocateInfo cbai{};
+        cbai.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cbai.commandPool        = cmd_pool_;
+        cbai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbai.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(device_, &cbai, &slot.cmd) != VK_SUCCESS) {
+            return false;
+        }
+    }
+    if (slot.fence == VK_NULL_HANDLE) {
+        VkFenceCreateInfo fci{};
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (vkCreateFence(device_, &fci, nullptr, &slot.fence) != VK_SUCCESS) {
+            return false;
+        }
+    }
+
+    vkResetCommandBuffer(slot.cmd, 0);
+    VkCommandBufferBeginInfo cbbi{};
+    cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(slot.cmd, &cbbi);
+    VkAccelerationStructureBuildRangeInfoKHR range{};
+    range.primitiveCount = prim_count;
+    const VkAccelerationStructureBuildRangeInfoKHR* ranges[1] = { &range };
+    pfn_CmdBuildAccelStructs_(slot.cmd, 1, &bi, ranges);
+    // Execution + memory dependency from the AS write to every later
+    // ray-query read on this queue. Vulkan orders submissions on one
+    // queue but does NOT order their execution, so without this barrier
+    // a frame submitted after us could start tracing before the update
+    // landed. A pipeline barrier recorded here applies to all commands
+    // that come later in queue submission order, including in other
+    // command buffers -- which is exactly the guarantee that lets this
+    // function return without waiting for anything.
+    VkMemoryBarrier mb{};
+    mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    mb.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+                     | VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(slot.cmd,
+                         VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &mb, 0, nullptr, 0, nullptr);
+    vkEndCommandBuffer(slot.cmd);
+
+    VkSubmitInfo si{};
+    si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers    = &slot.cmd;
+    const VkResult sr = vkQueueSubmit(graphics_queue_, 1, &si, slot.fence);
+    if (sr != VK_SUCCESS) {
+        if (sr == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+        LOG_ERROR("VulkanDevice::UpdateTLASInstances: vkQueueSubmit failed: "
+                  "{} ({}).", static_cast<int>(sr), VkResultToString(sr));
+        return false;
+    }
+    // Submitted, not waited on. This is the whole point.
+    slot.submitted  = true;
+    e.ring_cursor   = (e.ring_cursor + 1u) % ring_used;
+    e.instance_blas = blas_ids;
+    return true;
 }
 
 void VulkanDevice::DestroyAccelStruct(AccelStructHandle h) {
@@ -3354,7 +3745,19 @@ void VulkanDevice::DestroyAccelStruct(AccelStructHandle h) {
     auto it = accels_.find(h.id);
     if (it == accels_.end()) return;
     {
+        // Still a device-wide wait, deliberately. Unlike Metal, Vulkan
+        // command buffers do not retain the resources they reference, so
+        // destroying an acceleration structure that an in-flight frame
+        // still traces IS a use-after-free. The fix is a frames-in-
+        // flight deferred-deletion queue -- but DestroyBuffer and
+        // DestroyTexture have exactly the same problem and exactly the
+        // same vkDeviceWaitIdle, so that belongs in one change covering
+        // all three resource kinds rather than leaving the AS path
+        // subtly different from its neighbours. Destruction is not on
+        // the per-frame path; UpdateTLASInstances, which is, does not
+        // come through here.
         const VkResult r = vkDeviceWaitIdle(device_);
+        accel_gpu_stalls_.fetch_add(1, std::memory_order_relaxed);
         if (r != VK_SUCCESS) {
             if (r == VK_ERROR_DEVICE_LOST) device_lost_ = true;
             LOG_ERROR("VulkanDevice::DestroyAccelStruct: vkDeviceWaitIdle "
@@ -3362,11 +3765,7 @@ void VulkanDevice::DestroyAccelStruct(AccelStructHandle h) {
                       static_cast<int>(r), VkResultToString(r));
         }
     }
-    if (it->second.accel != VK_NULL_HANDLE && pfn_DestroyAccelStruct_) {
-        pfn_DestroyAccelStruct_(device_, it->second.accel, nullptr);
-    }
-    if (it->second.buffer) vkDestroyBuffer(device_, it->second.buffer, nullptr);
-    if (it->second.memory) vkFreeMemory(device_, it->second.memory, nullptr);
+    DestroyAccelEntry(it->second);
     accels_.erase(it);
 }
 

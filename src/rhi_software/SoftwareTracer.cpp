@@ -1014,4 +1014,83 @@ void RunPathTraceKernel(SoftwareDevice& device,
     for (auto& t : threads) t.join();
 }
 
+// --- Acceleration-structure probe (issue #254 P0 / issue #251) -------------
+
+void RunAccelProbeKernel(SoftwareDevice& device,
+                         const SoftwareCommandBuffer& cmd) {
+    // Push layout mirrors shaders/AccelProbe.slang's ProbePush exactly:
+    // three float4s -- origin+count, dir+tmax, stride+row.
+    struct ProbePush {
+        float origin_and_count[4];
+        float dir_and_tmax[4];
+        float stride_and_row[4];
+    };
+    if (cmd.push_constants_size < sizeof(ProbePush)) {
+        LOG_WARN("Software accel_probe: push size {} < expected {}",
+                 cmd.push_constants_size, sizeof(ProbePush));
+        return;
+    }
+    const auto* push = reinterpret_cast<const ProbePush*>(cmd.push_constants_buf);
+
+    BackedAccel* tlas = device.GetAccel(AccelStructHandle{cmd.binds.accel_structs[2]});
+    if (tlas == nullptr || tlas->scene == nullptr) {
+        LOG_WARN("Software accel_probe: no TLAS bound at accel slot 2");
+        return;
+    }
+    BackedBuffer* out = device.GetBuffer(BufferHandle{cmd.binds.buffers[1]});
+    if (out == nullptr) {
+        LOG_WARN("Software accel_probe: no output buffer bound at slot 1");
+        return;
+    }
+
+    const std::uint32_t count = static_cast<std::uint32_t>(push->origin_and_count[3]);
+    if (count == 0) return;
+    if (out->data.size() < std::size_t(count) * 2u * sizeof(std::uint32_t)) {
+        LOG_WARN("Software accel_probe: output buffer holds {} bytes, need {}",
+                 out->data.size(), std::size_t(count) * 2u * sizeof(std::uint32_t));
+        return;
+    }
+    auto* dst = reinterpret_cast<std::uint32_t*>(out->data.data());
+
+    const glm::vec3 origin{push->origin_and_count[0], push->origin_and_count[1],
+                           push->origin_and_count[2]};
+    const glm::vec3 dir{push->dir_and_tmax[0], push->dir_and_tmax[1],
+                        push->dir_and_tmax[2]};
+    const glm::vec3 stride{push->stride_and_row[0], push->stride_and_row[1],
+                           push->stride_and_row[2]};
+
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const glm::vec3 ro = origin + stride * static_cast<float>(i);
+        RTCRayHit rh{};
+        rh.ray.org_x = ro.x; rh.ray.org_y = ro.y; rh.ray.org_z = ro.z;
+        rh.ray.dir_x = dir.x; rh.ray.dir_y = dir.y; rh.ray.dir_z = dir.z;
+        rh.ray.tnear = 1e-4f;
+        rh.ray.tfar  = push->dir_and_tmax[3];
+        rh.ray.mask  = 0xFFFFFFFFu;
+        rh.ray.flags = 0;
+        rh.hit.geomID    = RTC_INVALID_GEOMETRY_ID;
+        rh.hit.primID    = RTC_INVALID_GEOMETRY_ID;
+        rh.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
+        RTCIntersectArguments args;
+        rtcInitIntersectArguments(&args);
+        rtcIntersect1(tlas->scene, &rh, &args);
+
+        std::uint32_t hit = 0u;
+        std::uint32_t id  = 0u;
+        if (rh.hit.geomID != RTC_INVALID_GEOMETRY_ID) {
+            hit = 1u;
+            // instID[0] is the TLAS-level geometry id of the instance
+            // that was hit, which is exactly the index CreateTLAS /
+            // UpdateTLASInstances key `instance_ids` by. This is the
+            // software backend's equivalent of the GPU's
+            // CommittedInstanceID() -- Embree has no per-instance user
+            // field, so the RHI carries the mapping itself.
+            const std::uint32_t geom = rh.hit.instID[0];
+            if (geom < tlas->instance_ids.size()) id = tlas->instance_ids[geom];
+        }
+        dst[i * 2u + 0u] = hit;
+        dst[i * 2u + 1u] = id;
+    }
+}
+
 }  // namespace pt::rhi::sw

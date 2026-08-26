@@ -77,6 +77,13 @@ extern const unsigned char shader_RestirSpatial_metal_data[];
 extern const unsigned long shader_RestirSpatial_metal_size;
 extern const unsigned char shader_RestirFinal_metal_data[];
 extern const unsigned long shader_RestirFinal_metal_size;
+// Acceleration-structure probe (issue #254 P0 / #251). Test-only:
+// tests/rhi_accel_update_test.cpp is the sole dispatcher. Built here
+// with every other kernel because the Metal backend has no lazy
+// pipeline path -- the MSL is ~2 KB and the PSO build is noise next to
+// PathTrace's.
+extern const unsigned char shader_AccelProbe_metal_data[];
+extern const unsigned long shader_AccelProbe_metal_size;
 }
 
 // MetalFXDenoiser.mm: ObjC++ shim around MTLFXTemporalDenoisedScaler.
@@ -572,6 +579,12 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
     build_pso("restir_final",
               shader_RestirFinal_metal_data,
               shader_RestirFinal_metal_size);
+    // Acceleration-structure probe (issue #254 P0 / #251). Not part of
+    // any render path; the RHI test suite creates it by name to read
+    // CommittedInstanceID() back out of a multi-instance TLAS.
+    build_pso("accel_probe",
+              shader_AccelProbe_metal_data,
+              shader_AccelProbe_metal_size);
 
     cmd_ = std::make_unique<MetalCommandBuffer>(this);
 }
@@ -594,7 +607,12 @@ MetalDevice::~MetalDevice() {
         for (auto& [_, p] : pipelines_) if (p.pso) p.pso->release();
         for (auto& [_, t] : textures_)  if (t) t->release();
         for (auto& [_, b] : buffers_)   if (b) b->release();
-        for (auto& [_, a] : accels_)    if (a) a->release();
+        for (auto& [_, a] : accels_) {
+            if (a.as)      a.as->release();
+            if (a.scratch) a.scratch->release();
+            for (auto* r : a.ring)    if (r) r->release();
+            for (auto* c : a.ring_cb) if (c) c->release();
+        }
         pipelines_.clear();
         textures_.clear();
         buffers_.clear();
@@ -944,6 +962,40 @@ void MetalDevice::DestroyPipeline(PipelineHandle h) {
 
 // ---- Acceleration structures ---------------------------------------------
 
+namespace {
+
+// Map the RHI build policy onto MTLAccelerationStructureUsage.
+// Metal has no "prefer fast trace" bit -- fast trace is the DEFAULT
+// (usage None), and PreferFastBuild is the opt-out. So the historical
+// behaviour (no setUsage call at all) is exactly UsageNone, and the
+// default flag value reproduces it bit-for-bit.
+MTL::AccelerationStructureUsage MetalAccelUsage(AccelBuildFlags flags) {
+    NS::UInteger usage = MTL::AccelerationStructureUsageNone;
+    if (HasAccelFlag(flags, AccelBuildFlags::PreferFastBuild)) {
+        usage |= MTL::AccelerationStructureUsagePreferFastBuild;
+    }
+    if (HasAccelFlag(flags, AccelBuildFlags::AllowUpdate)) {
+        usage |= MTL::AccelerationStructureUsageRefit;
+    }
+    return static_cast<MTL::AccelerationStructureUsage>(usage);
+}
+
+// Transpose the RHI's row-major 3x4 into Metal's MTLPackedFloat4x3
+// (four columns of float3, i.e. column-major). A flat memcpy produces
+// a singular 3x3 with the translation in the wrong slot and every ray
+// misses -- this was already the case before the user-ID switch and
+// the reason the original code transposed by hand.
+void PackTransform(const float* src, MTL::PackedFloat4x3& dst) {
+    float* out = reinterpret_cast<float*>(&dst);
+    for (int c = 0; c < 4; ++c) {
+        for (int r = 0; r < 3; ++r) {
+            out[c * 3 + r] = src[r * 4 + c];
+        }
+    }
+}
+
+}  // namespace
+
 AccelStructHandle MetalDevice::CreateBLAS(const BLASDesc& d) {
     if (device_ == nullptr || d.vertex_count == 0 || d.index_count == 0) return {0};
     PT_ZONE_SCOPED_N("MetalDevice::CreateBLAS");
@@ -968,6 +1020,7 @@ AccelStructHandle MetalDevice::CreateBLAS(const BLASDesc& d) {
     NS::Array* geoms = NS::Array::array(descs, 1);
     auto* desc = MTL::PrimitiveAccelerationStructureDescriptor::descriptor();
     desc->setGeometryDescriptors(geoms);
+    desc->setUsage(MetalAccelUsage(d.flags));
 
     auto sizes = device_->accelerationStructureSizes(desc);
     auto* as = device_->newAccelerationStructure(sizes.accelerationStructureSize);
@@ -979,7 +1032,13 @@ AccelStructHandle MetalDevice::CreateBLAS(const BLASDesc& d) {
     enc->buildAccelerationStructure(as, desc, scratch, 0);
     enc->endEncoding();
     cb->commit();
+    // The initial build still blocks: it happens off the frame loop
+    // (Engine::RebuildMeshResources) and CreateBLAS's inputs -- vbuf /
+    // ibuf, owned by the engine's baked mesh -- must not outlive this
+    // call. The verb this change is really about, UpdateTLASInstances,
+    // is the one that must never stall; see AccelGpuStallCount.
     cb->waitUntilCompleted();
+    accel_gpu_stalls_.fetch_add(1, std::memory_order_relaxed);
 
     vbuf->release();
     ibuf->release();
@@ -989,9 +1048,87 @@ AccelStructHandle MetalDevice::CreateBLAS(const BLASDesc& d) {
     if (as == nullptr) return {0};
     std::lock_guard lock(resource_mutex_);
     auto id = next_id_++;
-    accels_[id] = as;
+    MetalAccel entry{};
+    entry.as      = as;
+    entry.as_size = sizes.accelerationStructureSize;
+    entry.is_tlas = false;
+    entry.flags   = d.flags;
+    accels_[id]   = entry;
     return AccelStructHandle{id};
 }
+
+namespace {
+
+// Fill `out` with Metal user-ID instance descriptors for `instances`,
+// and `blas_array` with the deduplicated MTLAccelerationStructure list
+// each descriptor's accelerationStructureIndex points into. Returns
+// false when nothing resolved (every instance referenced a dead BLAS).
+//
+// issue #251: the descriptor type is
+// MTLAccelerationStructureUserIDInstanceDescriptor, NOT the hand-rolled
+// InstDesc this used to build. The hand-rolled struct was a byte-exact
+// copy of MTLAccelerationStructureInstanceDescriptor, which has no
+// user-ID field at all, so TLASInstance::instance_id -- honoured by
+// Vulkan as instanceCustomIndex -- was silently dropped and every
+// shader read of CommittedInstanceID() came back 0 on Metal. Slang
+// lowers CommittedInstanceID() to MSL's
+// intersection_query::get_committed_user_instance_id(), which reads the
+// userID field this descriptor carries, so the fix is the descriptor
+// type plus the matching setInstanceDescriptorType on the TLAS
+// descriptor (both below).
+bool BuildInstanceDescriptors(
+        MetalDevice& dev,
+        std::span<const TLASInstance> instances,
+        std::vector<MTL::AccelerationStructureUserIDInstanceDescriptor>& out,
+        std::vector<MTL::AccelerationStructure*>& blas_array,
+        std::vector<std::uint64_t>& blas_ids) {
+    out.clear();
+    blas_array.clear();
+    blas_ids.clear();
+    out.reserve(instances.size());
+    blas_array.reserve(instances.size());
+    blas_ids.reserve(instances.size());
+
+    for (const auto& inst : instances) {
+        auto* as = dev.LookupAccelStruct(inst.blas);
+        if (as == nullptr) {
+            LOG_WARN("Metal TLAS: instance references unknown BLAS id={}", inst.blas.id);
+            continue;
+        }
+        // Deduplicate: two instances of the same mesh must index the
+        // same entry of instancedAccelerationStructures, not append a
+        // second copy. (At N=1 this was unobservable.)
+        std::uint32_t as_index = 0;
+        bool          found    = false;
+        for (std::uint32_t i = 0; i < blas_array.size(); ++i) {
+            if (blas_array[i] == as) { as_index = i; found = true; break; }
+        }
+        if (!found) {
+            as_index = static_cast<std::uint32_t>(blas_array.size());
+            blas_array.push_back(as);
+        }
+
+        MTL::AccelerationStructureUserIDInstanceDescriptor id{};
+        PackTransform(inst.transform, id.transformationMatrix);
+        id.options                         = MTL::AccelerationStructureInstanceOptionOpaque;
+        id.mask                            = inst.mask;
+        id.intersectionFunctionTableOffset = 0;
+        id.accelerationStructureIndex      = as_index;
+        // The value #251 is about. Vulkan masks to 24 bits because
+        // VkAccelerationStructureInstanceKHR::instanceCustomIndex is a
+        // 24-bit bitfield; Metal's userID is a full uint32. Mask here
+        // too so the two backends agree on what a shader reads back for
+        // an id above 0xFFFFFF instead of diverging at the top end --
+        // the exact class of silent cross-backend difference this
+        // change exists to close.
+        id.userID                          = inst.instance_id & 0xFFFFFFu;
+        out.push_back(id);
+        blas_ids.push_back(inst.blas.id);
+    }
+    return !out.empty();
+}
+
+}  // namespace
 
 AccelStructHandle MetalDevice::CreateTLAS(const TLASDesc& d) {
     if (device_ == nullptr || d.instances.empty()) return {0};
@@ -999,47 +1136,177 @@ AccelStructHandle MetalDevice::CreateTLAS(const TLASDesc& d) {
     pt::mem::TagScope scope(pt::MemTag::GpuBuffers);
     auto* pool = NS::AutoreleasePool::alloc()->init();
 
+    using InstDesc = MTL::AccelerationStructureUserIDInstanceDescriptor;
+    std::vector<InstDesc>                    instance_buf;
     std::vector<MTL::AccelerationStructure*> blas_array;
-    blas_array.reserve(d.instances.size());
-
-    struct InstDesc {
-        MTL::PackedFloat4x3 transform;
-        MTL::AccelerationStructureInstanceOptions options;
-        std::uint32_t mask;
-        std::uint32_t intersection_function_table_offset;
-        std::uint32_t accel_struct_index;
-    };
-    std::vector<InstDesc> instance_buf;
-    instance_buf.reserve(d.instances.size());
-
-    for (std::uint32_t i = 0; i < d.instances.size(); ++i) {
-        auto* as = LookupAccelStruct(d.instances[i].blas);
-        if (as == nullptr) continue;
-        blas_array.push_back(as);
-        InstDesc id{};
-        // The public TLASInstance.transform is row-major 3x4 (column 3 is
-        // translation), but MTLPackedFloat4x3 stores 4 columns of float3
-        // -- column-major. Flat memcpy garbles the matrix (it produces a
-        // singular 3x3 with translation in the wrong slot), so every ray
-        // misses. Transpose explicitly here.
-        const float* src = d.instances[i].transform;
-        float*       dst = reinterpret_cast<float*>(&id.transform);
-        for (int c = 0; c < 4; ++c) {
-            for (int r = 0; r < 3; ++r) {
-                dst[c * 3 + r] = src[r * 4 + c];
-            }
-        }
-        id.options = MTL::AccelerationStructureInstanceOptionOpaque;
-        id.mask    = d.instances[i].mask;
-        id.intersection_function_table_offset = 0;
-        id.accel_struct_index                  = static_cast<std::uint32_t>(blas_array.size() - 1);
-        instance_buf.push_back(id);
+    std::vector<std::uint64_t>               blas_ids;
+    if (!BuildInstanceDescriptors(*this, d.instances, instance_buf, blas_array, blas_ids)) {
+        pool->release();
+        return {0};
     }
-    if (instance_buf.empty()) { pool->release(); return {0}; }
 
-    auto* ibuf = device_->newBuffer(instance_buf.data(),
-                                    instance_buf.size() * sizeof(InstDesc),
-                                    MTL::ResourceStorageModeShared);
+    MetalAccel entry{};
+    entry.is_tlas           = true;
+    entry.flags             = d.flags;
+    entry.instance_capacity = static_cast<std::uint32_t>(instance_buf.size());
+    entry.instance_blas     = blas_ids;
+
+    // Instance-descriptor ring. Slot 0 carries the initial build; the
+    // remaining slots exist so a later UpdateTLASInstances can write
+    // fresh descriptors without racing a refit that is still reading
+    // the previous ones. A non-updatable TLAS only ever needs slot 0,
+    // so it only allocates that one -- the static CSG mesh pays
+    // nothing for a feature it does not use. (The buffer itself is
+    // retained either way, replacing the old build-then-release: with
+    // the drain gone there is no safe moment to free it early.)
+    const std::size_t ring_bytes = instance_buf.size() * sizeof(InstDesc);
+    const std::uint32_t ring_used =
+        HasAccelFlag(d.flags, AccelBuildFlags::AllowUpdate) ? MetalAccel::kRing : 1u;
+    for (std::uint32_t i = 0; i < ring_used; ++i) {
+        entry.ring[i] = device_->newBuffer(ring_bytes, MTL::ResourceStorageModeShared);
+        if (entry.ring[i] == nullptr) {
+            for (std::uint32_t j = 0; j < i; ++j) entry.ring[j]->release();
+            pool->release();
+            LOG_ERROR("Metal CreateTLAS: instance-descriptor buffer alloc failed "
+                      "({} bytes)", ring_bytes);
+            return {0};
+        }
+    }
+    entry.ring_capacity_bytes = ring_bytes;
+    std::memcpy(entry.ring[0]->contents(), instance_buf.data(), ring_bytes);
+
+    NS::Array* nsBlasArr = NS::Array::array(
+        reinterpret_cast<const NS::Object* const*>(blas_array.data()),
+        blas_array.size());
+
+    auto* desc = MTL::InstanceAccelerationStructureDescriptor::descriptor();
+    desc->setInstanceCount(static_cast<NS::UInteger>(instance_buf.size()));
+    desc->setInstanceDescriptorBuffer(entry.ring[0]);
+    desc->setInstanceDescriptorStride(sizeof(InstDesc));
+    // issue #251: without this the driver reads the buffer as plain
+    // MTLAccelerationStructureInstanceDescriptors -- 4 bytes shorter --
+    // so both the userID AND every descriptor past the first would be
+    // misparsed. The type and the struct have to move together.
+    desc->setInstanceDescriptorType(
+        MTL::AccelerationStructureInstanceDescriptorTypeUserID);
+    desc->setInstancedAccelerationStructures(nsBlasArr);
+    desc->setUsage(MetalAccelUsage(d.flags));
+
+    auto sizes = device_->accelerationStructureSizes(desc);
+    auto* tlas = device_->newAccelerationStructure(sizes.accelerationStructureSize);
+    if (tlas == nullptr) {
+        for (std::uint32_t i = 0; i < ring_used; ++i) entry.ring[i]->release();
+        pool->release();
+        return {0};
+    }
+    entry.as      = tlas;
+    entry.as_size = sizes.accelerationStructureSize;
+
+    // Scratch: retained for the structure's lifetime only when it can
+    // be updated, sized to cover both a rebuild and a refit so the
+    // update path never allocates. One-shot TLASes free it below,
+    // exactly as before.
+    entry.scratch_size = std::max<std::size_t>(sizes.buildScratchBufferSize,
+                                               sizes.refitScratchBufferSize);
+    entry.scratch = device_->newBuffer(std::max<std::size_t>(entry.scratch_size, 1u),
+                                       MTL::ResourceStorageModePrivate);
+
+    auto* cb = queue_->commandBuffer();
+    cb->retain();
+    auto* enc = cb->accelerationStructureCommandEncoder();
+    for (auto* b : blas_array) enc->useResource(b, MTL::ResourceUsageRead);
+    enc->buildAccelerationStructure(tlas, desc, entry.scratch, 0);
+    enc->endEncoding();
+    cb->commit();
+    // Same reasoning as CreateBLAS: the create path is allowed one
+    // blocking wait (it runs off the frame loop and the caller expects
+    // a traceable structure back). UpdateTLASInstances is not.
+    cb->waitUntilCompleted();
+    accel_gpu_stalls_.fetch_add(1, std::memory_order_relaxed);
+    cb->release();
+
+    if (!HasAccelFlag(d.flags, AccelBuildFlags::AllowUpdate)) {
+        entry.scratch->release();
+        entry.scratch      = nullptr;
+        entry.scratch_size = 0;
+    }
+    pool->release();
+
+    std::lock_guard lock(resource_mutex_);
+    auto id = next_id_++;
+    accels_[id] = entry;
+    return AccelStructHandle{id};
+}
+
+bool MetalDevice::UpdateTLASInstances(AccelStructHandle h,
+                                      std::span<const TLASInstance> instances) {
+    if (device_ == nullptr || h.id == 0 || instances.empty()) return false;
+    PT_ZONE_SCOPED_N("MetalDevice::UpdateTLASInstances");
+    pt::mem::TagScope scope(pt::MemTag::GpuBuffers);
+
+    using InstDesc = MTL::AccelerationStructureUserIDInstanceDescriptor;
+    std::vector<InstDesc>                    instance_buf;
+    std::vector<MTL::AccelerationStructure*> blas_array;
+    std::vector<std::uint64_t>               blas_ids;
+    if (!BuildInstanceDescriptors(*this, instances, instance_buf, blas_array, blas_ids)) {
+        return false;
+    }
+
+    // BuildInstanceDescriptors above takes resource_mutex_ (through
+    // LookupAccelStruct), so it has to run BEFORE this lock -- it is
+    // not a recursive mutex. Everything after it is done holding the
+    // lock and operating on the map entry by reference, so a concurrent
+    // update or destroy of the same handle can't interleave and lose a
+    // ring slot (which would leak a retained command buffer).
+    std::lock_guard lock(resource_mutex_);
+    auto it = accels_.find(h.id);
+    if (it == accels_.end() || !it->second.is_tlas || it->second.as == nullptr) {
+        LOG_WARN("Metal UpdateTLASInstances: id={} is not a live TLAS", h.id);
+        return false;
+    }
+    MetalAccel& entry = it->second;
+    if (instance_buf.size() > entry.instance_capacity) {
+        LOG_WARN("Metal UpdateTLASInstances: {} instances exceeds capacity {}",
+                 instance_buf.size(), entry.instance_capacity);
+        return false;
+    }
+
+    // Refit is only legal when the topology is unchanged: same instance
+    // count and the same BLAS set in the same order. Anything else --
+    // an instance re-pointed at a different mesh, or a shorter array --
+    // goes through a rebuild into the SAME storage, which is still
+    // drain-free and still keeps the handle valid.
+    const bool refit_allowed =
+        HasAccelFlag(entry.flags, AccelBuildFlags::AllowUpdate) &&
+        blas_ids == entry.instance_blas;
+
+    auto* pool = NS::AutoreleasePool::alloc()->init();
+
+    // Pick the next ring slot and make sure nothing is still reading it.
+    // At kRing = 3 with at most one update per frame the wait below is
+    // unreachable in practice; when it does fire it is a wait on ONE
+    // command buffer that is two updates old, not a queue drain -- but
+    // it still counts as a stall, because a counter that only counts
+    // the stalls we like is not a counter.
+    const std::uint32_t ring_used =
+        HasAccelFlag(entry.flags, AccelBuildFlags::AllowUpdate) ? MetalAccel::kRing : 1u;
+    const std::uint32_t slot = entry.ring_cursor % ring_used;
+    if (entry.ring_cb[slot] != nullptr) {
+        auto* prev = entry.ring_cb[slot];
+        if (prev->status() != MTL::CommandBufferStatusCompleted &&
+            prev->status() != MTL::CommandBufferStatusError) {
+            prev->waitUntilCompleted();
+            accel_gpu_stalls_.fetch_add(1, std::memory_order_relaxed);
+        }
+        prev->release();
+        entry.ring_cb[slot] = nullptr;
+    }
+    MTL::Buffer* ibuf = entry.ring[slot];
+    if (ibuf == nullptr) { pool->release(); return false; }
+
+    const std::size_t bytes = instance_buf.size() * sizeof(InstDesc);
+    if (bytes > entry.ring_capacity_bytes) { pool->release(); return false; }
+    std::memcpy(ibuf->contents(), instance_buf.data(), bytes);
 
     NS::Array* nsBlasArr = NS::Array::array(
         reinterpret_cast<const NS::Object* const*>(blas_array.data()),
@@ -1049,51 +1316,106 @@ AccelStructHandle MetalDevice::CreateTLAS(const TLASDesc& d) {
     desc->setInstanceCount(static_cast<NS::UInteger>(instance_buf.size()));
     desc->setInstanceDescriptorBuffer(ibuf);
     desc->setInstanceDescriptorStride(sizeof(InstDesc));
+    desc->setInstanceDescriptorType(
+        MTL::AccelerationStructureInstanceDescriptorTypeUserID);
     desc->setInstancedAccelerationStructures(nsBlasArr);
+    desc->setUsage(MetalAccelUsage(entry.flags));
 
+    // Re-query sizes for the actual descriptor rather than assuming the
+    // create-time numbers bound a smaller instance count. If the driver
+    // wants more storage than we own we cannot proceed in place; the
+    // caller has to build a new TLAS.
     auto sizes = device_->accelerationStructureSizes(desc);
-    auto* tlas = device_->newAccelerationStructure(sizes.accelerationStructureSize);
-    auto* scratch = device_->newBuffer(sizes.buildScratchBufferSize,
-                                        MTL::ResourceStorageModePrivate);
+    if (sizes.accelerationStructureSize > entry.as_size) {
+        LOG_WARN("Metal UpdateTLASInstances: {} instances need {} bytes of AS "
+                 "storage but the structure owns {}; rebuild required",
+                 instance_buf.size(),
+                 static_cast<std::size_t>(sizes.accelerationStructureSize),
+                 entry.as_size);
+        pool->release();
+        return false;
+    }
+    const std::size_t need_scratch =
+        refit_allowed ? sizes.refitScratchBufferSize : sizes.buildScratchBufferSize;
+    MTL::Buffer* grown_scratch = nullptr;
+    if (entry.scratch == nullptr || need_scratch > entry.scratch_size) {
+        grown_scratch = device_->newBuffer(std::max<std::size_t>(need_scratch, 1u),
+                                           MTL::ResourceStorageModePrivate);
+        if (grown_scratch == nullptr) { pool->release(); return false; }
+    }
+    MTL::Buffer* scratch = grown_scratch ? grown_scratch : entry.scratch;
 
     auto* cb = queue_->commandBuffer();
+    cb->retain();
     auto* enc = cb->accelerationStructureCommandEncoder();
     for (auto* b : blas_array) enc->useResource(b, MTL::ResourceUsageRead);
-    enc->buildAccelerationStructure(tlas, desc, scratch, 0);
+    if (refit_allowed) {
+        // In-place refit: source and destination are the same
+        // structure, so no second allocation and no copy.
+        enc->refitAccelerationStructure(entry.as, desc, entry.as, scratch, 0);
+    } else {
+        enc->buildAccelerationStructure(entry.as, desc, scratch, 0);
+    }
     enc->endEncoding();
+    // Commit and walk away. Metal executes command buffers on one queue
+    // in commit order, and the engine's frame command buffers come from
+    // this same queue_, so any dispatch recorded after this call
+    // observes the new instances and any dispatch already submitted
+    // keeps tracing the old ones. That ordering is the whole reason
+    // there is no waitUntilCompleted here -- and why the AS build does
+    // NOT get its own queue: a second queue would need an MTLEvent to
+    // re-establish exactly the ordering the shared queue gives free.
     cb->commit();
-    cb->waitUntilCompleted();
 
-    ibuf->release();
-    scratch->release();
+    // Lifetime: the retained cb keeps the descriptor buffer and scratch
+    // alive on the Metal side (queue_->commandBuffer() retains its
+    // references), so nothing here can be freed under the GPU. We keep
+    // our own reference purely so the next trip round the ring can ask
+    // whether this one finished.
+    entry.ring_cb[slot] = cb;
+    entry.ring_cursor   = (entry.ring_cursor + 1u) % ring_used;
+    entry.instance_blas = blas_ids;
+    if (grown_scratch != nullptr) {
+        // Safe to release the old scratch immediately: any command
+        // buffer still reading it retained it itself when it encoded
+        // against it, so this only drops OUR reference.
+        if (entry.scratch != nullptr) entry.scratch->release();
+        entry.scratch      = grown_scratch;
+        entry.scratch_size = need_scratch;
+    }
     pool->release();
-
-    if (tlas == nullptr) return {0};
-    std::lock_guard lock(resource_mutex_);
-    auto id = next_id_++;
-    accels_[id] = tlas;
-    return AccelStructHandle{id};
+    return true;
 }
 
 void MetalDevice::DestroyAccelStruct(AccelStructHandle h) {
     std::lock_guard lock(resource_mutex_);
     auto it = accels_.find(h.id);
     if (it == accels_.end()) return;
-    if (it->second) it->second->release();
+    MetalAccel& a = it->second;
+    // No drain here, deliberately. MTLCommandBuffers created through
+    // queue_->commandBuffer() hold retained references to every
+    // resource they encode against, so a release while a build / refit
+    // / dispatch is still in flight decrements OUR reference and the
+    // object survives until the GPU is done with it. This is the Metal
+    // equivalent of a deferred-destruction queue, provided by the API.
+    if (a.as) a.as->release();
+    if (a.scratch) a.scratch->release();
+    for (auto*& b : a.ring)     { if (b) { b->release(); b = nullptr; } }
+    for (auto*& c : a.ring_cb)  { if (c) { c->release(); c = nullptr; } }
     accels_.erase(it);
 }
 
 MTL::AccelerationStructure* MetalDevice::LookupAccelStruct(AccelStructHandle h) {
     std::lock_guard lock(resource_mutex_);
     auto it = accels_.find(h.id);
-    return (it == accels_.end()) ? nullptr : it->second;
+    return (it == accels_.end()) ? nullptr : it->second.as;
 }
 
 void MetalDevice::UseAllAccelStructs(MTL::ComputeCommandEncoder* enc) {
     if (enc == nullptr) return;
     std::lock_guard lock(resource_mutex_);
     for (auto& [_, a] : accels_) {
-        if (a != nullptr) enc->useResource(a, MTL::ResourceUsageRead);
+        if (a.as != nullptr) enc->useResource(a.as, MTL::ResourceUsageRead);
     }
 }
 

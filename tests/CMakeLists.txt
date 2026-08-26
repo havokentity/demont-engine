@@ -446,6 +446,37 @@ pt_add_test(scene_serialize
     scene_serialize_test.cpp
     LINK_TARGETS pt_editor)
 
+# --- RHI acceleration-structure contract (issue #254 P0 / issue #251) ------
+# The only test in the tree that drives a real RHI Device: it creates a
+# headless device per backend, builds a BLAS + an N>1 TLAS, and
+# dispatches shaders/AccelProbe.slang (or its CPU mirror) to read
+# CommittedInstanceID() back per instance. Two things it pins that
+# nothing else can:
+#   - TLASInstance::instance_id survives the round trip on EVERY
+#     backend. Vulkan always honoured it; Metal silently dropped it
+#     (#251) and no test could see that, because the engine has only
+#     ever built one instance so the id was always 0 and the backends
+#     agreed by coincidence.
+#   - Device::UpdateTLASInstances re-points a live TLAS and the change
+#     is observed by the next dispatch, with the handle unchanged and
+#     AccelGpuStallCount() unmoved -- i.e. no waitUntilCompleted /
+#     vkQueueWaitIdle / vkDeviceWaitIdle on the update path.
+# Links pt_rhi, which brings in whichever backends this build compiled
+# (PT_HAS_*_BACKEND are PUBLIC defines on that target). The suite body
+# is backend-agnostic and skips itself when a backend is absent, has no
+# acceleration-structure support, or cannot produce the accel_probe
+# pipeline -- so the same file is correct on Mac (metal + software),
+# Windows (adds vulkan when a headless VkDevice comes up) and Linux.
+#
+# 120s timeout rather than the 60s default: the Metal backend compiles
+# every MSL kernel in its constructor (PathTrace.slang is the long pole)
+# and a cold CI runner with a paravirtualised GPU is a lot slower at it
+# than an M4 Max.
+pt_add_test(rhi_accel_update
+    rhi_accel_update_test.cpp
+    LINK_TARGETS pt_rhi)
+set_tests_properties(rhi_accel_update PROPERTIES TIMEOUT 120)
+
 # ============================================================================
 # Golden-image regression matrix (issue #45)
 # ============================================================================
