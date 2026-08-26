@@ -256,6 +256,39 @@ pt_add_test(pt_math_transforms
     pt_math_transforms_test.cpp
     LINK_TARGETS glm::glm)
 
+# --- pt_math_sphere (issue #254) -------------------------------------------
+# Ray-sphere intersection at planetary radius. Mirrors the Slang in
+# shaders/PathTraceMath.slang (no host entry point exists to call), pins
+# the pre-#254 catastrophic cancellation it repairs, and sweeps radii
+# from 1 m to 6371 km at nadir / grazing / inside / on-surface.
+#
+# Two non-default bits of wiring, both load-bearing:
+#
+#  * PT_SHADER_MATH_PATH lets the "shader mirror is still faithful" case
+#    re-read the .slang and pin the literals the transcription depends
+#    on, so the mirror cannot silently drift away from the shader.
+#
+#  * -ffast-math in Release is DELIBERATE, and the only test target that
+#    asks for it. Metal compiles PathTraceMath with its default (fast)
+#    math mode, which reassociates float add chains -- that is precisely
+#    why the fix accumulates in int32 rather than using a Dekker /
+#    Kahan style float compensation, which a reassociating compiler is
+#    entitled to fold to zero (and does). Building the host mirror the
+#    same way keeps the test honest about what the GPU actually runs;
+#    without it the mirror would pass under arithmetic the shader never
+#    sees. Note this does NOT come from pt_set_compiler_options -- test
+#    binaries deliberately opt out of the library-level policy -- so it
+#    is applied here explicitly.
+pt_add_test(pt_math_sphere
+    pt_math_sphere_test.cpp)
+target_compile_definitions(pt_math_sphere PRIVATE
+    PT_SHADER_MATH_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTraceMath.slang")
+if(NOT MSVC)
+    target_compile_options(pt_math_sphere PRIVATE $<$<CONFIG:Release>:-ffast-math>)
+else()
+    target_compile_options(pt_math_sphere PRIVATE $<$<CONFIG:Release>:/fp:fast>)
+endif()
+
 # --- pt_physics unit tests (issue #132) ------------------------------------
 # Phase 1 Verlet physics: handle invalidation (Remove+Add generation
 # bump; 24-bit gen wraparound guard), free-fall trajectory matches
