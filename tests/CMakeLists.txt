@@ -468,35 +468,86 @@ pt_add_test(scene_serialize
 # pipeline -- so the same file is correct on Mac (metal + software),
 # Windows (adds vulkan when a headless VkDevice comes up) and Linux.
 #
-# Backend availability is a RUNTIME device capability, not a
-# configure-time one, so this cell cannot use the golden matrix's
-# label-based opt-out (`-L golden_software`): that convention exists
-# because a golden cell's backend is fixed when CMake runs, whereas one
-# unit-test binary here sweeps every backend the build contains and has
-# to decide per-device. Instead the suite queries the device
+# Whether a backend can actually host an acceleration structure is a
+# RUNTIME device capability, so the suite queries the device
 # (`SupportsHardwareRT()`, now backed by MTLDevice.supportsRaytracing)
-# and skips that backend with a recorded reason.
+# rather than assuming it, and records a per-backend reason when it
+# cannot. The binary also prints that ledger, including an explicit
+# note when Metal -- the only backend that can reproduce #251 -- was
+# skipped.
 #
-# SKIP_RETURN_CODE 125 keeps the skip HONEST: if NO backend could host
-# an acceleration structure -- a GH-hosted macos-26 runner with a
-# paravirtualised GPU, for instance -- the binary exits 125 and ctest
-# prints `***Skipped` instead of a green tick over zero coverage. That
-# is the #252 failure mode (a lane "passing" while comparing nothing)
-# and it is worth spending a return code to avoid. When at least one
-# backend does run, the binary exits 0 and prints a per-backend ledger
-# saying which ran and which did not, including an explicit note when
-# Metal -- the only backend that can reproduce #251 -- was skipped.
+# The executable is built once; ctest then gets ONE CELL PER BACKEND,
+# mirroring pt_add_golden_cell's `golden_<scene>__<backend>__<denoiser>`
+# shape and its `LABELS "golden;golden_${BACKEND}"`. Each cell runs the
+# same binary filtered to that backend's doctest case (`-tc=`), so a
+# backend that cannot run says so on its OWN ctest line:
+#
+#     rhi_accel_software .... Passed
+#     rhi_accel_metal ....... ***Skipped
+#
+# That visibility is the entire point. A single aggregate cell would
+# print `Passed` on a GH-hosted macOS runner -- true, because the
+# software backend really did run the full suite -- while saying nothing
+# about Metal having been skipped, and ctest suppresses a passing test's
+# stdout so the in-binary coverage ledger never reaches the log. One
+# cell per backend puts the skip where a reader cannot miss it.
+#
+# Registration follows pt_add_golden_cell's configure-time gating
+# exactly: a cell is only registered where its backend is compiled in
+# (metal => APPLE, software => APPLE OR WIN32, vulkan =>
+# PT_ENABLE_VULKAN_BACKEND), so no host carries a cell that could only
+# ever skip.
+#
+# SKIP_RETURN_CODE 125: the binary exits 125 when the backend it was
+# filtered to could not run -- no device, no hardware ray tracing, or no
+# accel_probe pipeline -- and ctest reports `***Skipped` rather than a
+# green tick over zero coverage. That is the #252 failure mode and it is
+# worth a return code to avoid. Verified in CI: the Linux lane, which
+# builds neither Metal nor the software backend, correctly reports
+# Skipped instead of passing.
 #
 # 120s timeout rather than the 60s default: the Metal backend compiles
 # every MSL kernel in its constructor (PathTrace.slang is the long pole)
 # and a cold CI runner with a paravirtualised GPU is a lot slower at it
 # than an M4 Max.
-pt_add_test(rhi_accel_update
-    rhi_accel_update_test.cpp
-    LINK_TARGETS pt_rhi)
-set_tests_properties(rhi_accel_update PROPERTIES
-    TIMEOUT          120
-    SKIP_RETURN_CODE 125)
+add_executable(rhi_accel_update rhi_accel_update_test.cpp)
+target_link_libraries(rhi_accel_update PRIVATE doctest::doctest pt_rhi)
+if(COMMAND pt_target_warnings)
+    pt_target_warnings(rhi_accel_update)
+endif()
+
+# _backend: doctest case suffix + ctest cell name + label.
+function(pt_add_accel_cell _backend)
+    set(_cell rhi_accel_${_backend})
+    # The filter MUST be quoted. Unquoted, CMake treats the parentheses
+    # as argument separators and expands `--test-case=*(metal)*` into
+    # five arguments -- `--test-case=*`, `(`, `metal`, `)`, `*` -- so
+    # doctest sees a match-everything filter and every cell silently
+    # runs every backend. That reproduces exactly the failure this
+    # per-backend split exists to prevent, with all cells reporting the
+    # same thing.
+    add_test(
+        NAME    ${_cell}
+        COMMAND rhi_accel_update "--test-case=*(${_backend})*"
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    )
+    set_tests_properties(${_cell} PROPERTIES
+        TIMEOUT          120
+        SKIP_RETURN_CODE 125
+        LABELS           "rhi_accel;rhi_accel_${_backend}")
+endfunction()
+
+if(APPLE OR WIN32)
+    pt_add_accel_cell(software)
+endif()
+if(APPLE)
+    pt_add_accel_cell(metal)
+endif()
+if(PT_ENABLE_VULKAN_BACKEND)
+    # Skips by default even here -- VulkanDevice has no headless path.
+    # See the Vulkan TEST_CASE in rhi_accel_update_test.cpp.
+    pt_add_accel_cell(vulkan)
+endif()
 
 # ============================================================================
 # Golden-image regression matrix (issue #45)
