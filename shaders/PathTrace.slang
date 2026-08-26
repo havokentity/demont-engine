@@ -1205,6 +1205,17 @@ cbuffer Push {
     float4 hosek_cfg[9];
     float4 hosek_radiance;
     // --- end Wave 9 hosek-sky cooked coefficients -----------------------------
+    // --- Planetary P0 (#254): per-point local up ------------------------------
+    // .xyz = planet centre in WORLD space, .w = planet radius in metres.
+    // .w <= 0 selects the PLANAR frame -- localUp() is world +Y everywhere
+    // and planetAltitude(p) is p.y, i.e. exactly what this shader hard-coded
+    // before #254. .w > 0 selects the SPHERICAL frame, where local up is the
+    // radial direction from the centre and solar elevation stops being a
+    // single global scalar. See localUp() below. 16 B appended at the very
+    // tail so every existing field offset is untouched. Mirrored in the
+    // SPIR-V Frame block below + Engine.cpp PtPush.
+    float4 planet_center_radius;
+    // --- end Planetary P0 -----------------------------------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -1353,6 +1364,9 @@ cbuffer Frame {
     // appended at the tail. Bytes [tail] of the host PtPush.
     float4 hosek_cfg[9];
     float4 hosek_radiance;
+    // See `planet_center_radius` in the Metal Push cbuffer above
+    // (Planetary P0, #254). Layout-equivalent: one vec4 appended at the tail.
+    float4 planet_center_radius;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -1392,6 +1406,65 @@ import SdfFractals;
 // final kernels that also import this module.
 import RestirReservoir;
 // --- end ReSTIR DI Phase A ------------------------------------------------
+
+// --- Planetary P0 (#254): per-point local up --------------------------------
+//
+// "Up" is not a world constant on a planet, and neither is the sun's
+// elevation. Everything in this shader's sky / lighting chain used to
+// read the single global scalar `sun_and_mode.y` for sin(solar
+// elevation) and world +Y for the zenith, which makes time-of-day a
+// property of the FRAME rather than of the point being shaded. The
+// consequence is not a small error: with one global sun elevation the
+// entire world is lit (or unlit) together, so a planet cannot have a lit
+// limb and a dark side at the same time -- no terminator is
+// representable at all. That is the blocker #51 never named, and it
+// gates every later planetary phase.
+//
+// The fix is mechanical: every such site becomes
+// `dot(localUp(P), sun_dir)` for the point P it is actually shading.
+//
+// PLANAR frame (planet_center_radius.w <= 0, the default): localUp() is
+// world +Y and planetAltitude() is p.y, so every rewritten site collapses
+// to the exact float it read before. dot(v, float3(0,1,0)) is v.y
+// bit-for-bit in IEEE-754 -- 0*v.x and 0*v.z are exactly zero for finite
+// inputs and adding them changes nothing -- so this refactor is a
+// verified no-op on every existing scene.
+//
+// SPHERICAL frame: the engine pushes the centre at (0, -R, 0) so the
+// y = 0 ground plane stays tangent to the sphere at the world origin --
+// the convention atmosphericTransmittance has used for its shell
+// integral since #51. Ground geometry, collision and the cloud slab are
+// still planar; the curved ground, LUTs and ozone are a later phase.
+
+// Local up at world point p: the outward radial direction from the
+// planet centre, or world +Y in the planar frame.
+float3 localUp(float3 p) {
+    if (planet_center_radius.w <= 0.0) return float3(0.0, 1.0, 0.0);
+    return normalize(p - planet_center_radius.xyz);
+}
+
+// Altitude of world point p above the surface (metres, can be negative).
+// Planar frame: p.y, the engine's ground-plane-at-y=0 convention.
+//
+// NOTE: the spherical branch is the naive `length(p - c) - R` form, which
+// suffers the same catastrophic cancellation at planetary radius that
+// PathTraceMath's intersectSphere does (one fp32 ULP at |p - c| ~ 6.4e6 m
+// is ~0.5 m). It is fine at the metre-scale accuracy the scattering
+// integrals need -- Mie / Rayleigh scale heights are 1.5 km / 8 km -- but
+// it is NOT the expression sub-metre terrain will want. #254's stable
+// intersect work owns that; this call site moves to it in lockstep.
+float planetAltitude(float3 p) {
+    if (planet_center_radius.w <= 0.0) return p.y;
+    return length(p - planet_center_radius.xyz) - planet_center_radius.w;
+}
+
+// sin(elevation of `dir` above the local horizon at world point p).
+// `dir` must be unit length. This is the per-point replacement for the
+// old global `sun_and_mode.y` / `moon_dir_phase.y` scalars.
+float elevationAt(float3 p, float3 dir) {
+    return dot(localUp(p), dir);
+}
+// --- end Planetary P0 -------------------------------------------------------
 
 static const uint MAT_LAMBERT    = 0u;
 static const uint MAT_METAL      = 1u;
@@ -2715,8 +2788,13 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01) {
 // secondary-bounce paths, so stars still contribute to indirect
 // lighting in the scene.
 float3 starsOnly(float3 rd, float3 sun) {
-    float cosTheta = clamp(rd.y, -1.0, 1.0);
-    float sun_elev = sun.y;
+    // Planetary P0 (#254): the observer's local up, not world +Y. Sky-dome
+    // helpers are evaluated in the CAMERA's frame -- see procSky()'s
+    // precondition note for why the secondary-bounce approximation is
+    // acceptable. Planar frame -> exactly rd.y / sun.y, bit-for-bit.
+    float3 up      = localUp(pos_fovtan.xyz);
+    float cosTheta = clamp(dot(rd, up), -1.0, 1.0);
+    float sun_elev = dot(up, sun);
     float day      = smoothstep(-0.10, 0.20, sun_elev);
     // BSC starmap (real Yale Bright Star Catalog, J2000 frame). Sampled
     // additively whenever the host has uploaded the texture and we're
@@ -2859,7 +2937,9 @@ float3 starsAtPrimaryMiss(float3 rd) {
 // composite-on / composite-off A/B).
 float3 procSkyInlineSunDiscAndHalo(float3 rd, float3 sun) {
     float cosGamma = clamp(dot(rd, sun), -1.0, 1.0);
-    float sun_elev = sun.y;
+    // Planetary P0 (#254): solar elevation at the observer, not the
+    // global sun.y. Planar frame -> sun.y bit-for-bit.
+    float sun_elev = dot(localUp(pos_fovtan.xyz), sun);
     float day      = smoothstep(-0.10, 0.20, sun_elev);
     float disk     = smoothstep(0.99996, 0.99999, cosGamma);
     float3 sun_color_high = float3(1.00, 0.95, 0.85);
@@ -2921,8 +3001,13 @@ float3 hosekChi(float3 g, float cos_gamma) {
 // bounces), so the path tracer's ambient term is consistent with what
 // the camera sees.
 float3 hosekSky(float3 rd, float3 sun) {
-    // theta = angle from zenith, gamma = angle from the sun.
-    float cos_theta = clamp(rd.y, 0.0, 1.0);      // below-horizon rays clamp to horizon
+    // theta = angle from zenith, gamma = angle from the sun. Planetary P0
+    // (#254): zenith is the observer's LOCAL up, so the Hosek dome tilts
+    // with the surface normal of the planet instead of staying pinned to
+    // world +Y. Planar frame -> exactly rd.y, bit-for-bit.
+    float3 up       = localUp(pos_fovtan.xyz);
+    float cos_up    = dot(rd, up);
+    float cos_theta = clamp(cos_up, 0.0, 1.0);    // below-horizon rays clamp to horizon
     float cos_gamma = clamp(dot(rd, sun), -1.0, 1.0);
     float gamma     = acos(cos_gamma);
 
@@ -2952,7 +3037,7 @@ float3 hosekSky(float3 rd, float3 sun) {
     // Below the horizon the analytic F can ring negative or blow up;
     // fade the model out smoothly just under the horizon so reflective
     // surfaces and downward bounces don't pick up garbage.
-    float horizon_fade = smoothstep(-0.05, 0.02, rd.y);
+    float horizon_fade = smoothstep(-0.05, 0.02, cos_up);
 
     float3 sky = max(F, float3(0.0)) * radZ * horizon_fade;
 
@@ -2960,7 +3045,7 @@ float3 hosekSky(float3 rd, float3 sun) {
     // daylight; fall to a deep navy and let stars carry the sky. Reuse
     // the procedural day-blend band so the hosek/procedural night look
     // matches and the celestial overlays read identically.
-    float day = smoothstep(-0.10, 0.20, sun.y);
+    float day = smoothstep(-0.10, 0.20, dot(up, sun));
     float3 night = float3(0.005, 0.010, 0.030);
     sky = lerp(night, sky, day);
 
@@ -2988,9 +3073,14 @@ float3 hosekSky(float3 rd, float3 sun) {
 // is essentially a procedural-mode debug visual. If/when we move the
 // sky to a per-hit transmittance LUT, this approximation goes away.
 float3 procSky(float3 rd, float3 sun) {
-    float cosTheta_raw = clamp(rd.y, -1.0, 1.0);  // 1=zenith, 0=mathematical-horizon, -1=nadir
+    // Planetary P0 (#254): zenith and solar elevation are measured
+    // against the observer's LOCAL up, not world +Y. In the planar frame
+    // localUp() is exactly float3(0,1,0), so cosTheta_raw / sun_elev are
+    // rd.y / sun.y bit-for-bit and this function is unchanged.
+    float3 up = localUp(pos_fovtan.xyz);
+    float cosTheta_raw = clamp(dot(rd, up), -1.0, 1.0);  // 1=zenith, 0=mathematical-horizon, -1=nadir
     float cosGamma = clamp(dot(rd, sun), -1.0, 1.0);
-    float sun_elev = sun.y;                     // sin(elevation)
+    float sun_elev = dot(up, sun);              // sin(elevation)
 
     // Curved-Earth visible-horizon dip (issue #51). On a flat Earth the
     // geometric horizon sits at rd.y = 0. On a spherical Earth of radius
@@ -3023,19 +3113,22 @@ float3 procSky(float3 rd, float3 sun) {
     // dipping is a no-op so the change is invisible.
     //
     // Below: shift the gradient so cosTheta=0 hits the dipped horizon
-    // line. cam_pos.y is at pos_fovtan.y in the push constants.
-    float cam_h = max(pos_fovtan.y, 0.0);
+    // line. The camera's altitude comes from planetAltitude(), which is
+    // pos_fovtan.y in the planar frame (#254).
+    float cam_h = max(planetAltitude(pos_fovtan.xyz), 0.0);
     float planet_R = sun_extra.w;
     float horizon_dip_sin = 0.0;
     if (planet_R > 0.0 && cam_h > 0.0) {
         float ratio = cam_h / planet_R;
-        horizon_dip_sin = sqrt(2.0 * ratio + ratio * ratio);
-        // The dip can in principle grow without bound for huge altitudes,
-        // but the formula stays well-defined to ~1.0 (sphere swallows the
-        // entire downward hemisphere) at h ≈ R, ~6378 km. Cap at 0.5
-        // (i.e. ~30 deg) so degenerate space-tourist cameras don't fold
-        // the gradient onto itself.
-        horizon_dip_sin = min(horizon_dip_sin, 0.5);
+        // sin(dip) = sqrt(2h/R + (h/R)^2). Well-defined and monotonic all
+        // the way to h = R (the sphere subtends a full hemisphere), and
+        // the clamp below keeps the result a legal sine. #254 removed an
+        // earlier min(..., 0.5) cap here: it pinned the dip at ~30 deg,
+        // but the true dip at a 400 km orbit is 70.2 deg, so the cap
+        // painted a flat-Earth horizon band across every orbital view.
+        // It never fired below ~797 km of altitude, so no existing scene
+        // is affected.
+        horizon_dip_sin = min(sqrt(2.0 * ratio + ratio * ratio), 1.0);
     }
     // Shift cosTheta upward by the dip so the painted horizon line moves
     // down on screen to match the visible horizon. Clamp to [-1,1] so
@@ -3054,8 +3147,14 @@ float3 procSky(float3 rd, float3 sun) {
     float3 zenith_day  = float3(0.32, 0.55, 0.92);
     float3 horizon_day = float3(0.78, 0.88, 1.00);
     // Sunset palette pulls toward orange/red on the side of the sun.
-    float side_factor  = smoothstep(0.0, 0.7, dot(normalize(float3(rd.x, 0, rd.z)),
-                                                  normalize(float3(sun.x, 0, sun.z))));
+    // The "horizontal" projection is onto the LOCAL horizon plane (#254),
+    // i.e. the component perpendicular to local up. In the planar frame
+    // `v - up*dot(v,up)` is exactly float3(v.x, 0, v.z), so the two
+    // normalize() arguments are the same floats as before.
+    float3 rd_h        = rd  - up * dot(rd,  up);
+    float3 sun_h       = sun - up * dot(sun, up);
+    float side_factor  = smoothstep(0.0, 0.7, dot(normalize(rd_h),
+                                                  normalize(sun_h)));
     float3 horizon_sunset = lerp(float3(0.95, 0.45, 0.20),
                                  float3(1.00, 0.65, 0.30), side_factor);
     float3 horizon_col    = lerp(horizon_day, horizon_sunset, sunset);
@@ -3110,7 +3209,13 @@ float3 procSky(float3 rd, float3 sun) {
 // a tight halo at zenith). This matches real photos: sunset sun
 // SEEMS bigger because the bright halo reads as part of the disc.
 float3 sunDisc(float3 rd, float3 sun_dir) {
-    if (sun_dir.y < -0.10) return float3(0.0);
+    // Planetary P0 (#254): every "how high is the sun" term below is
+    // measured against the observer's local up rather than world +Y.
+    // Planar frame -> world_up is exactly float3(0,1,0) and sun_elev is
+    // exactly sun_dir.y, so the disc is unchanged bit-for-bit.
+    float3 world_up = localUp(pos_fovtan.xyz);
+    float  sun_elev = dot(world_up, sun_dir);
+    if (sun_elev < -0.10) return float3(0.0);
     float ang = dot(rd, sun_dir);
     // r_sun_size * astronomical-distance ratio. perihelion ~1.017
     // (sun looks bigger), aphelion ~0.984. Half-angle scales linearly.
@@ -3120,7 +3225,7 @@ float3 sunDisc(float3 rd, float3 sun_dir) {
     // Halo extent grows from cos(2deg) at zenith to cos(8deg) near
     // horizon. The horizon halo is what you see as the "bigger" sun
     // at sunset -- it's atmospheric scattering, not the disc itself.
-    float halo_deg   = lerp(2.0, 8.0, saturate(1.0 - sun_dir.y));
+    float halo_deg   = lerp(2.0, 8.0, saturate(1.0 - sun_elev));
     float halo_rad   = halo_deg * 0.0174533;
     float kCosHalo   = cos(halo_rad);
     if (ang <= kCosHalo) return float3(0.0);
@@ -3149,7 +3254,6 @@ float3 sunDisc(float3 rd, float3 sun_dir) {
             // Build sun-local horizon frame. Safe at non-zenith sun
             // (vflat < 0.999 only fires below ~6deg elev, far from
             // zenith singularity).
-            float3 world_up    = float3(0.0, 1.0, 0.0);
             float3 local_right = normalize(cross(world_up, sun_dir));
             float3 local_up    = cross(sun_dir, local_right);
             float3 delta       = rd - sun_dir * ang;            // perp to sun
@@ -3164,7 +3268,7 @@ float3 sunDisc(float3 rd, float3 sun_dir) {
     }
 
     // Atmospheric attenuation + warmth, matching sun_rad in NEE.
-    float am  = 1.0 / max(sun_dir.y, 0.04);
+    float am  = 1.0 / max(sun_elev, 0.04);
     float atm = exp(-0.30 * am);
     float warmth = saturate((am - 1.0) * 0.18);
     float3 col = lerp(float3(1.00, 0.98, 0.94),
@@ -3175,7 +3279,7 @@ float3 sunDisc(float3 rd, float3 sun_dir) {
     if (ang > kCosHalo) {
         float t_h = (ang - kCosHalo) / (1.0 - kCosHalo);
         // Steeper falloff at zenith (tight halo), wider at horizon.
-        float falloff = lerp(8.0, 3.0, saturate(1.0 - sun_dir.y));
+        float falloff = lerp(8.0, 3.0, saturate(1.0 - sun_elev));
         halo = pow(t_h, falloff);
     }
 
@@ -3210,8 +3314,14 @@ float3 sunDisc(float3 rd, float3 sun_dir) {
 //   - subtle halo: soft ring extending to ~1.5deg, simulating
 //     atmospheric scattering around the moon.
 float3 moonDisc(float3 rd, float4 mph, float3 sun_dir_world) {
-    if (mph.y < -0.10) return float3(0.0);
     float3 m_dir = mph.xyz;
+    // Planetary P0 (#254): lunar elevation at the observer, not the
+    // global mph.y. Planar frame -> mph.y bit-for-bit. (The tangent
+    // frame below picks an arbitrary basis axis off m_dir.y -- that is a
+    // parameterisation choice, not an up-vector, and must NOT move or
+    // the moon texture rotates.)
+    float moon_elev = dot(localUp(pos_fovtan.xyz), m_dir);
+    if (moon_elev < -0.10) return float3(0.0);
     float ang = dot(rd, m_dir);
     // Real lunar angular radius is 0.27 deg; we render at 0.55 deg
     // (~2x real) for visibility at typical 60-FOV 1080p, then scale
@@ -3228,7 +3338,7 @@ float3 moonDisc(float3 rd, float4 mph, float3 sun_dir_world) {
     float3 col_tint = float3(0.92, 0.94, 1.00);
 
     // Atmospheric attenuation matching sun_rad.
-    float moon_am   = 1.0 / max(mph.y, 0.04);
+    float moon_am   = 1.0 / max(moon_elev, 0.04);
     float moon_atm  = exp(-0.30 * moon_am);
     float warmth_m  = saturate((moon_am - 1.0) * 0.18);
     float3 col_atm  = lerp(float3(1.00, 1.00, 1.00),
@@ -5004,11 +5114,14 @@ float cloud_optical_depth_stratified(float3 ro, float3 rd, float t_max,
 //
 // Spherical-Earth path (issue #51): when sun_extra.w > 0 we treat the
 // atmosphere as a thin exponentially-decaying shell around a sphere of
-// radius `R = sun_extra.w` centred at (0, -R, 0) so the path-tracer's
-// flat y=0 ground plane sits tangent to the planet at the world origin.
+// radius `R = sun_extra.w`. The centre comes from planet_center_radius
+// when the spherical world frame is active (#254) and otherwise defaults
+// to (0, -R, 0), so the path-tracer's flat y=0 ground plane sits tangent
+// to the planet at the world origin -- the two coincide by construction.
 // Altitude at parameter t along the ray is then
 //     h(t) = length(C - (ro + rd*t)) - R
-// where C = (0, -R, 0). For real-Earth R = 6.378e6 m and the cloud /
+// where C is that centre. For real-Earth R = 6.371e6 m (the IUGG mean
+// radius, r_planet_radius's default) and the cloud /
 // scattering scale heights (~1.5 km Mie, ~8 km Rayleigh) the spherical
 // chord differs from the flat ro.y + rd.y*t by hundreds of metres at
 // horizon ranges, which is the entire point of #51 -- horizontal rays
@@ -5044,7 +5157,8 @@ float cloud_optical_depth_stratified(float3 ro, float3 rd, float t_max,
 // reciprocal-scaled or world-space-difference vector MUST normalize
 // first.
 //
-// Planet centre offset assumption: world y=0 is the ground plane.
+// Planet centre offset assumption (planar frame): world y=0 is the
+// ground plane, i.e. planetAltitude(p) == p.y.
 // Cameras at y=1.7 sit ~1.7 m above the surface; cameras at y=10000
 // sit 10 km above. This matches the engine's existing convention (the
 // path-tracer's flat ground plane lives at y=0; volumetric cloud_p1.x
@@ -5086,8 +5200,20 @@ float3 atmosphericTransmittance(float3 ro, float3 rd, float t) {
     }
 
     // ---- Spherical-Earth path (issue #51) --------------------------
+    // Shell centre (planetary P0, #254). The planar world frame has no
+    // planet centre, so the shell integral keeps #51's convention: put
+    // it at (0, -R, 0), which makes the engine's y = 0 ground plane
+    // tangent to the sphere at the world origin. The spherical frame
+    // pushes the real centre, and the engine places it at exactly that
+    // same point, so the two agree by construction -- but reading it
+    // from the push means this integral and localUp() can never drift
+    // into different frames. `p.y - pc.y` with pc.y = -R is `p.y + R`
+    // bit-for-bit (IEEE negation is exact), and `p.x - 0` is `p.x`, so
+    // the planar path is numerically identical to the pre-#254 form.
+    float3 pc = (planet_center_radius.w > 0.0) ? planet_center_radius.xyz
+                                               : float3(0.0, -planet_R, 0.0);
     // Composite Simpson's rule with 8 subintervals (9 sample points).
-    // Per-point altitude comes from sqrt((ro+rd*s).xz^2 + (ro.y+rd.y*s+R)^2) - R.
+    // Per-point altitude comes from sqrt((ro+rd*s - pc).xz^2 + (ro.y+rd.y*s - pc.y)^2) - R.
     // Pull the sphere-centre offset into a local form to avoid the
     // y-add-then-subtract roundtrip:
     //     h(s) = sqrt(rx^2 + ry^2 + rz^2 + 2*R*ry + R^2) - R
@@ -5097,7 +5223,7 @@ float3 atmosphericTransmittance(float3 ro, float3 rd, float t) {
     // sqrt is well-conditioned -- numerically equivalent to
     //   h = sqrt((p.y + R)^2 + p.xz^2) - R
     // which is the natural altitude-above-sphere formula. fp32 retains
-    // ~3 digits of precision at R = 6.378e6 m given p.y in metres,
+    // ~3 digits of precision at R = 6.371e6 m given p.y in metres,
     // which is enough -- Mie/Rayleigh scale heights are 1.5e3 / 8e3 m
     // so a meter-scale rounding error in h shifts the optical depth
     // by ~0.1% per step.
@@ -5122,7 +5248,9 @@ float3 atmosphericTransmittance(float3 ro, float3 rd, float t) {
         // iteration 0 can reuse them as its left boundary instead of
         // recomputing the s=0 exp() inside the loop.
         float3 p = ro;
-        h_prev = sqrt(p.x * p.x + (p.y + planet_R) * (p.y + planet_R) + p.z * p.z) - planet_R;
+        h_prev = sqrt((p.x - pc.x) * (p.x - pc.x)
+                    + (p.y - pc.y) * (p.y - pc.y)
+                    + (p.z - pc.z) * (p.z - pc.z)) - planet_R;
         h_prev = max(h_prev, 0.0);
         if (any_mie) sm_prev = sigma_mie0           * exp(-h_prev / kHmie);
         if (any_ray) sr_prev = kSigmaR * rayleigh_i * exp(-h_prev / kHrayleigh);
@@ -5132,13 +5260,13 @@ float3 atmosphericTransmittance(float3 ro, float3 rd, float t) {
         float s_right = (float(i) + 1.0) * dt;
         float3 p_mid   = ro + rd * s_mid;
         float3 p_right = ro + rd * s_right;
-        float h_mid = sqrt(p_mid.x * p_mid.x
-                         + (p_mid.y + planet_R) * (p_mid.y + planet_R)
-                         + p_mid.z * p_mid.z) - planet_R;
+        float h_mid = sqrt((p_mid.x - pc.x) * (p_mid.x - pc.x)
+                         + (p_mid.y - pc.y) * (p_mid.y - pc.y)
+                         + (p_mid.z - pc.z) * (p_mid.z - pc.z)) - planet_R;
         h_mid = max(h_mid, 0.0);
-        float h_right = sqrt(p_right.x * p_right.x
-                           + (p_right.y + planet_R) * (p_right.y + planet_R)
-                           + p_right.z * p_right.z) - planet_R;
+        float h_right = sqrt((p_right.x - pc.x) * (p_right.x - pc.x)
+                           + (p_right.y - pc.y) * (p_right.y - pc.y)
+                           + (p_right.z - pc.z) * (p_right.z - pc.z)) - planet_R;
         h_right = max(h_right, 0.0);
         if (any_mie) {
             float sm_l = sm_prev;
@@ -5573,17 +5701,48 @@ void main(uint2 tid : SV_DispatchThreadID) {
         }
 #endif
 
-        float3 hit_world;
         float3 hit_normal;
         float3 hit_albedo;   // linear RGB at primary hit; sky writes float3(0)
         float  depth_view;   // linear camera-space Z (world units along forward)
+        // Homogeneous world position fed to the reprojection below. A
+        // surface hit is a finite point (w = 1); the sky is a point at
+        // INFINITY along the primary ray, which in homogeneous
+        // coordinates is exactly float4(rd0, 0) -- see the else branch.
+        float4 reproj_h;
         if (h0.hit) {
-            hit_world  = ro0 + rd0 * h0.t;
+            float3 hit_world = ro0 + rd0 * h0.t;
+            reproj_h   = float4(hit_world, 1.0);
             hit_normal = h0.normal;
             hit_albedo = h0.albedo;
             depth_view = h0.t * dot(rd0, normalize(fwd_aspect.xyz));
         } else {
-            hit_world  = ro0 + rd0 * 1000.0;   // far point so sky still gets motion
+            // Sky / stars motion vector (#254). This used to reproject a
+            // proxy point 1 km down the primary ray, which manufactures
+            // parallax the sky does not have: the sky is at infinity, so
+            // its only apparent motion is camera ROTATION. Feeding a
+            // finite proxy through a translating camera makes SVGF's
+            // temporal pass and MetalFX's upsampler reproject every sky
+            // pixel to the wrong place, and they then either ghost or
+            // reject history wholesale. At a 400 km circular orbit
+            // (v = 7 672 m/s, mu = 3.986004418e14 m^3/s^2, r = 6.771e6 m)
+            // the camera translates 128 m per 60 fps frame, which against
+            // a 1 km proxy is ~7 deg of false parallax EVERY frame; a
+            // fast ground camera hits a milder version of the same bug.
+            //
+            // The fix is exact and free: reproject the direction with
+            // w = 0. Both view-projection matrices then contribute only
+            // their rotational part (the translation column multiplies
+            // w), so the motion vector carries rotation-only parallax.
+            // The CURRENT-frame pixel position is unchanged by this --
+            // the camera origin maps to the view-space origin, so a point
+            // at t along the ray and the ray direction itself project to
+            // the same NDC xy for every t > 0; only the homogeneous
+            // scale differs, and that divides out.
+            //
+            // The depth sentinel below was already raised from 1000 to
+            // 1e10 for the related reason; the motion proxy was simply
+            // left behind.
+            reproj_h   = float4(rd0, 0.0);
             hit_normal = float3(0.0, 0.0, 0.0); // sentinel: sky / no surface
             hit_albedo = float3(0.0, 0.0, 0.0); // sky has no surface albedo
             // Sky sentinel: a value impossibly large for real geometry so
@@ -5606,8 +5765,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // Pixel-space motion via reprojection. We still need the
         // perspective matrices for this even though depth itself goes
         // to MetalFX in linear units.
-        float4 pc = mul(curr_view_proj, float4(hit_world, 1.0));
-        float4 pp = mul(prev_view_proj, float4(hit_world, 1.0));
+        float4 pc = mul(curr_view_proj, reproj_h);
+        float4 pp = mul(prev_view_proj, reproj_h);
         float2 cur_pix = (float2( pc.x, -pc.y) / max(pc.w, 1e-6) * 0.5 + 0.5) * float2(dim);
         float2 pre_pix = (float2( pp.x, -pp.y) / max(pp.w, 1e-6) * 0.5 + 0.5) * float2(dim);
         float2 motion  = pre_pix - cur_pix;
@@ -6062,8 +6221,12 @@ void main(uint2 tid : SV_DispatchThreadID) {
             if (write_shadow_vis != 0u) {
                 if (h.hit) {
                     float3 sun_dir = sun_and_mode.xyz;
-                    if (sun_dir.y > 0.0) {
-                        float3 hp = ro + rd * h.t;
+                    float3 hp      = ro + rd * h.t;
+                    // Planetary P0 (#254): "is the sun up" is asked at the
+                    // SHADED POINT, not of the frame. Planar frame ->
+                    // sun_dir.y bit-for-bit; `hp` was already computed on
+                    // this branch, only its scope moved.
+                    if (elevationAt(hp, sun_dir) > 0.0) {
                         float ndi_0 = dot(h.normal, rd);
                         float3 nf_0 = (ndi_0 < 0.0) ? h.normal : -h.normal;
                         // sampleSunDisc jitters within the sun's
@@ -6632,7 +6795,13 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 // (so it goes dark at night) and a small diffuse term
                 // emulates skylight so unlit faces aren't pure black.
                 float3 sun_dir  = sun_and_mode.xyz;
-                float  sun_elev = sun_dir.y;            // sin(elevation)
+                // Planetary P0 (#254): sin(solar elevation) AT THE HIT
+                // POINT. This is the site that makes a terminator
+                // possible -- once the frame is spherical, two surfaces a
+                // quarter-planet apart get different sun elevations and
+                // one of them is in night. Planar frame -> sun_dir.y
+                // bit-for-bit.
+                float  sun_elev = elevationAt(hit_pt, sun_dir);
 
                 if (sun_elev > 0.0) {
                     float n_dot_l = max(0.0, dot(nf, sun_dir));
@@ -7098,7 +7267,15 @@ void main(uint2 tid : SV_DispatchThreadID) {
             float  vol_int   = vol_params.z;
             int    N         = max(1, int(vol_params.w));
             float3 sun_dir   = sun_and_mode.xyz;
-            float  sun_elev  = sun_dir.y;
+            // Planetary P0 (#254): solar elevation at the ray origin (the
+            // camera). Deliberately hoisted, like sun_rad below -- the
+            // march's per-sample points span at most 60 km, over which the
+            // local-up direction turns by ~0.5 deg, and the hoist is what
+            // keeps sun_rad a loop invariant for the B10 SIGMA demod.
+            // The per-sample gates inside the march use planetAltitude()
+            // for altitude, which IS per-point. Planar frame ->
+            // sun_dir.y bit-for-bit.
+            float  sun_elev  = elevationAt(primary_ro, sun_dir);
             // Sun radiance at this elevation (matches Lambert sun
             // colour so beams + lit surfaces agree on tint). Warmth
             // saturates more aggressively (0.30 instead of 0.18) and
@@ -7189,7 +7366,9 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     float t = (float(vi) + jitter) * dt;
                     if (t >= t_far) break;
                     float3 sp = primary_ro + primary_rd * t;
-                    float h = max(sp.y, 0.0);
+                    // Per-point altitude above the surface (#254). Planar
+                    // frame -> sp.y bit-for-bit.
+                    float h = max(planetAltitude(sp), 0.0);
                     float  sigma_mie = march_mie ? sigma_0 * exp(-h / kHmie) : 0.0;
                     float3 sigma_ray = march_ray
                         ? kSigmaR * rayleigh_int * exp(-h / kHrayleigh)
@@ -7622,7 +7801,9 @@ void main(uint2 tid : SV_DispatchThreadID) {
                             // stratified cloud OD that god rays need to
                             // silhouette through cloud gaps.
                             if (sun_elev > 0.0) {
-                                float h_alt   = max(sp.y, 0.0);
+                                // Per-point altitude above the surface
+                                // (#254). Planar frame -> sp.y bit-for-bit.
+                                float h_alt   = max(planetAltitude(sp), 0.0);
                                 float h_norm  = saturate(h_alt / 8000.0);
                                 float boost   = exp(0.30 * sun_am * h_norm);
                                 float3 sun_at = sun_rad * boost;

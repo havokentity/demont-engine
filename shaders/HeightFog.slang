@@ -103,7 +103,13 @@ cbuffer Push {
     float4 pos_fovtan;     // .xyz = camera origin (m), .w = fovYTan
     float4 fwd_aspect;     // .xyz = forward (unit), .w = aspect ratio (W/H)
     float4 right_xyz;      // .xyz = camera right (unit)
-    float4 up_xyz;         // .xyz = camera up (unit)
+    // .xyz = camera up (unit). .w = sin(solar elevation) at the CAMERA,
+    // i.e. dot(localUp(camera), sun_dir) -- planetary P0 (#254). This
+    // pass evaluates the sun only at the observer, so that scalar is the
+    // whole of what per-point local up means here, and riding a lane the
+    // camera basis was already padding with zero keeps the push at 128 B.
+    // In the planar frame it is exactly sun_and_mode.y.
+    float4 up_xyz;
 
     // .xyz = unit vector toward the sun. .w = sky mode (unused here;
     // carried for layout symmetry with the other composites).
@@ -243,9 +249,11 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float3 sun = sun_and_mode.xyz;
     float cos_theta = dot(rd, sun);
     // Day gate: fog should not pick up a sun lobe when the sun is below
-    // the horizon (night). Smooth ramp matches the celestial-composite
-    // day fade so the sun glow fades out at twilight rather than popping.
-    float sun_above = smoothstep(-0.10, 0.05, sun.y);
+    // the LOCAL horizon (night). Smooth ramp matches the celestial-
+    // composite day fade so the sun glow fades out at twilight rather
+    // than popping. up_xyz.w is the observer's sin(solar elevation)
+    // (#254); in the planar frame it is sun.y bit-for-bit.
+    float sun_above = smoothstep(-0.10, 0.05, up_xyz.w);
     float phase = hgPhase(cos_theta, g);
     // Phase is normalised to integrate to 1 over the sphere (peak ~ a few
     // for g~0.7); multiply by 4*pi so the forward lobe reads as a

@@ -1772,7 +1772,34 @@ namespace cvar {
             "Only consulted when r_motion_blur == 1.", CVAR_ARCHIVE);
     // --- end Motion blur ------------------------------------------------------
     PT_CVAR(r_rayleigh,              "30.0",     "Atmospheric Rayleigh scattering scale on the per-channel sea-level sigma (R 5.8e-6, G 13.5e-6, B 33.1e-6 per metre). 1.0 = real Earth atmosphere -- but our typical r_volumetric_density (Mie haze) is ~30x stronger than real-Earth haze, so bumping this to 30 keeps the sky visibly blue at typical haze settings. Drop to 1.0 if you also drop r_volumetric_density to 0.0001-0.0005 (real haze). 0 disables Rayleigh.", CVAR_ARCHIVE);
-    PT_CVAR(r_planet_radius,         "6378137.0", "Planet radius in metres for spherical-Earth atmospheric scattering (issue #51). Default 6,378,137 m = WGS-84 equatorial Earth radius. The path tracer's `atmosphericTransmittance` numerically integrates Mie + Rayleigh optical depth along a chord through a thin shell around a sphere of this radius (centre at world origin + offset so y=0 sits on the surface). Set to 0 to fall back to the legacy planar exponential integral (1/sin(elev) airmass) -- useful as a debug A/B or for tiny-scene tests where curvature is invisible. Real values for other bodies: Moon 1,737,400, Mars 3,389,500, Venus 6,051,800. Affects only the atmosphere integral, not collision / shadow geometry.", CVAR_ARCHIVE);
+    PT_CVAR(r_planet_radius,         "6371008.8", "Planet radius in metres for spherical-Earth atmospheric scattering (issue #51). Default 6,371,008.8 m = the IUGG mean Earth radius R_1 = (2a + b)/3 from the WGS-84 ellipsoid (a = 6,378,137, b = 6,356,752.314245). The mean radius is the right constant here: the scattering model treats the atmosphere as concentric SPHERICAL shells, so the sphere that best represents the whole body is what the optical-depth integral wants -- the WGS-84 equatorial radius is a geodetic reference for an ellipsoid, and using it inflates the shell by 7.1 km everywhere off the equator. The path tracer's `atmosphericTransmittance` numerically integrates Mie + Rayleigh optical depth along a chord through a thin shell around a sphere of this radius (centre at world origin + offset so y=0 sits on the surface). Set to 0 to fall back to the legacy planar exponential integral (1/sin(elev) airmass) -- useful as a debug A/B or for tiny-scene tests where curvature is invisible. Real values for other bodies (mean radii): Moon 1,737,400, Mars 3,389,500, Venus 6,051,800. Affects only the atmosphere integral, not collision / shadow geometry.", CVAR_ARCHIVE);
+    // Planetary P0 (#254). The sky chain historically hard-coded "up" to
+    // world +Y and read the sun's elevation off the single global scalar
+    // sun_and_mode.y, which makes solar elevation a property of the FRAME
+    // rather than of the point being shaded -- so the whole world shares
+    // one time of day and no terminator can exist. The refactor replaces
+    // every such site with dot(localUp(P), sun_dir); this cvar selects
+    // which localUp() the shaders evaluate.
+    PT_CVAR(r_planet_spherical_frame, "0",
+            "Spherical world frame for the sky/lighting chain (planetary "
+            "P0, issue #254). 0 = planar frame: local up is world +Y at "
+            "every point and local altitude is simply p.y -- the "
+            "historical behaviour every existing scene is authored "
+            "against, and bit-for-bit identical to pre-#254. 1 = "
+            "spherical frame: local up is the normalised radial "
+            "direction from the planet centre, which the engine places "
+            "at (0, -r_planet_radius, 0) so the y=0 ground plane stays "
+            "tangent to the sphere at the world origin (the same "
+            "convention atmosphericTransmittance already uses for its "
+            "shell integral). Solar elevation then becomes "
+            "dot(localUp(P), sun_dir) and therefore varies across the "
+            "world, which is what makes a day/night terminator -- a lit "
+            "limb and a dark side in the same frame -- representable at "
+            "all. Ground geometry, collision and the cloud slab are "
+            "still planar: the curved ground, LUTs and ozone land in a "
+            "later phase. Independent of r_planet_radius, which sets "
+            "the ATMOSPHERE shell radius; this cvar sets whether the "
+            "world frame itself is curved.", CVAR_ARCHIVE);
     PT_CVAR(r_moon_size,             "1.0",      "Moon angular-size multiplier. 1.0 = our default 0.55deg half-angle (already 2x the real 0.27deg, for visibility at typical 60-FOV 1080p). 5+ = dramatic 'big moon' shots; 0.5 = real lunar size (very small). Astronomical distance variation (perigee/apogee) is also applied on top -- supermoons render ~14% bigger than micro-moons.", CVAR_ARCHIVE);
     PT_CVAR(r_sun_size,              "1.0",      "Sun angular-size multiplier. 1.0 = real ~0.55deg half-angle. Astronomical Earth-Sun distance (perihelion/aphelion) modulates this ~3.4% across the year. Bump for cinematic shots.", CVAR_ARCHIVE);
     PT_CVAR(r_sun_horizon_flatten,   "1",        "Atmospheric refraction differentially lifts the sun's lower limb more than its upper limb, vertically squishing the disc into an oval as it nears the horizon (Saemundsson 1986). 1 = physical flatten enabled (vertical-scale ~0.78 at elev=0 / ~21% squish, ~0.87 at 1deg, ~0.97 at 5deg, ~0.99 at 10deg); 0 = render a perfect circle regardless of elevation. Horizontal radius is unchanged either way; r_sun_size stacks on top.", CVAR_ARCHIVE);
@@ -7817,6 +7844,24 @@ void Engine::RenderFrame() {
         float hosek_cfg[9][4];
         float hosek_radiance[4];
         // --- end Wave 9 hosek-sky cooked coefficients --------------------
+        // --- Planetary P0 (#254): per-point local up ---------------------
+        // .xyz = planet centre in WORLD space, .w = planet radius in
+        // metres. .w <= 0 selects the planar frame, in which the shader's
+        // localUp() returns world +Y and planetAltitude() returns p.y --
+        // exactly the pre-#254 hard-coded behaviour, bit-for-bit. .w > 0
+        // selects the spherical frame (r_planet_spherical_frame 1), where
+        // localUp(p) = normalize(p - centre) and solar elevation becomes a
+        // per-point quantity instead of the single global sun_and_mode.y
+        // scalar. Pure tail append so every existing field offset -- and
+        // therefore every raw byte offset SoftwareTracer.cpp reads -- is
+        // untouched.
+        //
+        // The centre is pushed in world space because shader positions are
+        // world space today. P1's camera-relative double-precision rebase
+        // moves BOTH in lockstep; pushing a camera-relative centre against
+        // world-space positions would just be a bug.
+        float planet_center_radius[4];
+        // --- end Planetary P0 --------------------------------------------
     } push{};
     push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
     push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
@@ -8477,7 +8522,7 @@ void Engine::RenderFrame() {
         // optical depth along the curved chord when this is > 0;
         // 0 falls back to the legacy planar exponential integral
         // (1/sin(elev) airmass divergence at horizon).
-        float planet_radius_m = 6378137.0f;
+        float planet_radius_m = 6371008.8f;   // IUGG mean Earth radius
         if (auto* v = C.FindCVar("r_planet_radius")) planet_radius_m = v->GetFloat();
         // Negative values are nonsense -- clamp to 0 to mean "disable
         // curved-Earth, use planar". Anything between 0 and ~Earth radius
@@ -8487,6 +8532,67 @@ void Engine::RenderFrame() {
         // pass realistic radii.
         if (planet_radius_m < 0.0f) planet_radius_m = 0.0f;
         push.sun_extra[3] = planet_radius_m;
+
+        // --- Planetary P0 (#254): per-point local up --------------------
+        // Everything in the sky chain that used to read the single global
+        // scalar sun_and_mode.y now reads dot(localUp(P), sun_dir). This
+        // field is what localUp() is built from.
+        //
+        // Planar frame (default): w = 0, and the shaders' localUp()
+        // returns world +Y unconditionally, so every rewritten site
+        // collapses back to the exact float it read before -- dot(rd,
+        // float3(0,1,0)) is rd.y bit-for-bit, and p.y - (-0) is p.y.
+        //
+        // Spherical frame: the centre sits directly below the world
+        // origin at (0, -R, 0) so the engine's y=0 ground plane is
+        // tangent to the sphere at the origin, matching the convention
+        // atmosphericTransmittance has used for its shell integral since
+        // issue #51. Computed in double so the 6.4e6-metre offset doesn't
+        // lose the scene-scale term before it is narrowed to float.
+        bool spherical_frame = false;
+        if (auto* v = C.FindCVar("r_planet_spherical_frame")) {
+            spherical_frame = v->GetBool();
+        }
+        // A zero radius has no centre and no radial direction, so it
+        // degenerates to the planar frame regardless of the cvar.
+        spherical_frame = spherical_frame && planet_radius_m > 0.0f;
+        const double planet_R_d = static_cast<double>(planet_radius_m);
+        push.planet_center_radius[0] = 0.0f;
+        push.planet_center_radius[1] =
+            spherical_frame ? static_cast<float>(-planet_R_d) : 0.0f;
+        push.planet_center_radius[2] = 0.0f;
+        push.planet_center_radius[3] =
+            spherical_frame ? static_cast<float>(planet_R_d) : 0.0f;
+
+        // up_xyz.w carries sin(solar elevation) AT THE CAMERA, i.e.
+        // dot(localUp(camera), sun_dir). The screen-space sky passes
+        // (HeightFog / GodRays / AuroraComposite) evaluate the sun only
+        // at the observer, so the scalar is the whole of what per-point
+        // local up means for them -- and it costs them no push-constant
+        // growth, which matters because AuroraCompositePush is exactly
+        // kPushSplitOffset (112 B) and one more vec4 would spill it into
+        // the Vulkan Frame UBO those three kernels don't declare.
+        // right_xyz.w / up_xyz.w were pure zero padding; the other passes
+        // inherit this lane through the camera-basis memcpy they already
+        // do. In the planar frame this is exactly push.sun_and_mode[1],
+        // so those kernels stay bit-identical.
+        if (spherical_frame) {
+            const double cx = static_cast<double>(push.pos_fovtan[0]) - 0.0;
+            const double cy = static_cast<double>(push.pos_fovtan[1]) + planet_R_d;
+            const double cz = static_cast<double>(push.pos_fovtan[2]) - 0.0;
+            const double len = std::sqrt(cx * cx + cy * cy + cz * cz);
+            if (len > 0.0) {
+                const double e = (cx * static_cast<double>(push.sun_and_mode[0])
+                                + cy * static_cast<double>(push.sun_and_mode[1])
+                                + cz * static_cast<double>(push.sun_and_mode[2])) / len;
+                push.up_xyz[3] = static_cast<float>(e);
+            } else {
+                push.up_xyz[3] = push.sun_and_mode[1];
+            }
+        } else {
+            push.up_xyz[3] = push.sun_and_mode[1];
+        }
+        // --- end Planetary P0 -------------------------------------------
     }
     {
         // Sun disc brightness (r_sun_disc_brightness) -- daytime mirror of the
@@ -9385,6 +9491,12 @@ void Engine::RenderFrame() {
     //                              A..I + radiance L_M per RGB channel, cooked
     //                              per frame from the real ArHosekSkyModel RGB
     //                              dataset (replaces the old fabricated tables).
+    //   +16 Planetary P0 (#254) — planet_center_radius vec4 (planet centre
+    //                              xyz in world space, radius in .w; .w <= 0
+    //                              means the planar frame, where localUp()
+    //                              is world +Y). Pure tail append so the
+    //                              SoftwareTracer.cpp byte offsets below
+    //                              stay valid.
     static_assert(sizeof(PtPush) == 272 + 48 + 16 + 16 + 48 + 16 + 16 + 16 + 16 + 128 + 128 + 20 + 12 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 32 + 16
                   + 16 /* Wave 8 spectral (#27): spectral_params */
                   + 32 /* Wave 8 ocean (#25): ocean_params0 + ocean_params1 */
@@ -9396,7 +9508,8 @@ void Engine::RenderFrame() {
                   + 16 /* Wave 9 tonemap (#27 follow-up): tonemap_params */
                   + 16 /* Wave 10 bloom/bokeh: dof_bokeh_params */
                   + 16 /* Sun disc brightness (r_sun_disc_brightness): sun_extra2 */
-                  + 160 /* Wave 9 hosek-sky cooked coeffs: hosek_cfg[9] + hosek_radiance */);
+                  + 160 /* Wave 9 hosek-sky cooked coeffs: hosek_cfg[9] + hosek_radiance */
+                  + 16 /* Planetary P0 (#254): planet_center_radius */);
     // Raw-byte offsets the SOFTWARE tracer mirrors (SoftwareTracer.cpp:
     // kSunAndModeOffset / kAccumParamsOffset / kTonemapParamsOffset).
     // The CPU backend decodes these fields straight out of the pushed
@@ -9437,7 +9550,8 @@ void Engine::RenderFrame() {
     // backend header, so they're mirrored with this cross-reference instead.
     // Wave 10 bloom/bokeh adds dof_bokeh_params (+16): tail was 1504 B.
     // Wave 9 hosek-sky cooked coeffs add +160 (hosek_cfg[9] + hosek_radiance):
-    // tail is now 1664 B, still ~384 B under the 2048 budget.
+    // tail was 1664 B. Planetary P0 (#254) adds +16 (planet_center_radius):
+    // tail is now 1680 B, still ~368 B under the 2048 budget.
     static_assert(sizeof(PtPush) - 112 <= 2048,
                   "PtPush spilled tail (sizeof - 112) exceeds the Vulkan "
                   "kFrameUboSize budget (2048 B). Bump kFrameUboSize in "
@@ -9574,6 +9688,13 @@ void Engine::RenderFrame() {
     static_assert(offsetof(PtPush, hosek_params) % 16 == 0,
                   "PtPush::hosek_params must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
+    // Planetary P0 (#254): planet_center_radius is the new trailing vec4.
+    // Its predecessor (hosek_radiance) is vec4-sized so it lands aligned,
+    // but pin it -- localUp() reading a 12-byte-shifted centre would put
+    // the whole sky chain in a subtly wrong frame rather than failing loudly.
+    static_assert(offsetof(PtPush, planet_center_radius) % 16 == 0,
+                  "PtPush::planet_center_radius must be 16-byte aligned to "
+                  "match std140 / MSL cbuffer layout in PathTrace.slang");
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
 
@@ -9664,8 +9785,15 @@ void Engine::RenderFrame() {
         // Cloud lighting therefore stays independent of both cvars here.
         const float kPi = 3.14159265358979f;
         // Sun radiance: matches the inline march's sun_rad. sun_elev_v is
-        // sin(elevation) == sun_dir.y (the same `sun_elev` the shader uses).
-        const float sun_elev_v = push.sun_and_mode[1];   // y of sun_dir
+        // sin(elevation) == dot(localUp(camera), sun_dir) -- the same
+        // `sun_elev` the inline march hoists out of its own loop. Planetary
+        // P0 (#254) moved this off the global sun_dir.y scalar and onto
+        // up_xyz.w, which the host computes against the camera's local up;
+        // in the planar frame the two are the same float, so this is
+        // bit-identical. Like the inline march's hoist, this is a
+        // per-frame constant evaluated at the observer -- P4 pushes it
+        // per-sample once terrain spans enough of the globe to matter.
+        const float sun_elev_v = push.up_xyz[3];
         float sun_rad_r = 0.0f, sun_rad_g = 0.0f, sun_rad_b = 0.0f;
         float sun_am = 0.0f;
         if (sun_elev_v > 0.0f) {
@@ -9702,9 +9830,17 @@ void Engine::RenderFrame() {
             std::uint32_t composite_active;
             std::uint32_t _pad0;
             std::uint32_t _pad1;
+            // Planetary P0 (#254). Same semantics as PtPush's field:
+            // .xyz planet centre (world), .w radius, .w <= 0 = planar
+            // frame. The cloud pre-pass marches through the atmosphere,
+            // so its per-sample sun gate and altitude have to use the
+            // same local up the inline march does or the two
+            // r_clouds_mode paths would disagree about where "up" is.
+            float planet_center_radius[4];
         } cp{};
-        // 16 float4 fields (256 B) + 4 uint32 trailing (16 B) = 272 B.
-        static_assert(sizeof(CloudsRaymarchPush) == 272,
+        // 16 float4 fields (256 B) + 4 uint32 (16 B) + planet_center_radius
+        // (16 B) = 288 B.
+        static_assert(sizeof(CloudsRaymarchPush) == 288,
                       "CloudsRaymarchPush layout must match CloudsRaymarch.slang");
         std::memcpy(cp.pos_fovtan,     push.pos_fovtan,     sizeof(cp.pos_fovtan));
         std::memcpy(cp.fwd_aspect,     push.fwd_aspect,     sizeof(cp.fwd_aspect));
@@ -9713,6 +9849,8 @@ void Engine::RenderFrame() {
         std::memcpy(cp.sun_and_mode,   push.sun_and_mode,   sizeof(cp.sun_and_mode));
         std::memcpy(cp.moon_dir_phase, push.moon_dir_phase, sizeof(cp.moon_dir_phase));
         std::memcpy(cp.sun_extra,      push.sun_extra,      sizeof(cp.sun_extra));
+        std::memcpy(cp.planet_center_radius, push.planet_center_radius,
+                    sizeof(cp.planet_center_radius));
         // Clouds parameters come straight from the PathTrace push that
         // was just dispatched, so the two modes interpret the same cvar
         // set identically (modulo the cloud_dens skip inside the path
@@ -10630,8 +10768,15 @@ void Engine::RenderFrame() {
                 std::uint32_t ap_samples;
                 std::uint32_t composite_active;
                 std::uint32_t _pad0;
+                // Planetary P0 (#254). Same semantics as PtPush's field.
+                // The composite carries verbatim copies of starsOnly /
+                // sunDisc / moonDisc, so it needs the same local-up frame
+                // the path tracer used at the primary miss -- otherwise
+                // the subtract-then-re-add pair would disagree about the
+                // horizon and leave a brightness seam.
+                float planet_center_radius[4];
             } sc{};
-            static_assert(sizeof(StarsCompositePush) == 240,
+            static_assert(sizeof(StarsCompositePush) == 256,
                           "StarsCompositePush layout must match StarsComposite.slang");
             std::memcpy(sc.pos_fovtan,     push.pos_fovtan,     sizeof(sc.pos_fovtan));
             std::memcpy(sc.fwd_aspect,     push.fwd_aspect,     sizeof(sc.fwd_aspect));
@@ -10646,6 +10791,8 @@ void Engine::RenderFrame() {
             std::memcpy(sc.moon_extra,     push.moon_extra,     sizeof(sc.moon_extra));
             std::memcpy(sc.sun_extra,      push.sun_extra,      sizeof(sc.sun_extra));
             std::memcpy(sc.dof_params,     push.dof_params,     sizeof(sc.dof_params));
+            std::memcpy(sc.planet_center_radius, push.planet_center_radius,
+                        sizeof(sc.planet_center_radius));
             // --- Wave 10 bloom/bokeh --- carry cat's-eye strength (+ the
             // reserved lanes) so the sun/moon bokeh matches the path
             // tracer's polygonal-iris + cat's-eye sampler.
@@ -15680,6 +15827,14 @@ void Engine::RegisterCommands() {
     // sunset_altitude_planar fixture explicitly does) blends pre- and
     // post-change samples in the temporal mean until the camera moves.
     if (auto* v = C.FindCVar("r_planet_radius")) {
+        v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+    }
+    // r_planet_spherical_frame (#254) swaps localUp() between world +Y
+    // and the radial direction, which moves the painted horizon, the
+    // day/night blend and every sun-elevation gate at once. Same accum
+    // reset rationale as r_planet_radius above.
+    if (auto* v = C.FindCVar("r_planet_spherical_frame")) {
+        v->allowed_values = {"0", "1"};
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
     if (auto* v = C.FindCVar("r_exposure")) {

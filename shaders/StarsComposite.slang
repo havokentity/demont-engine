@@ -162,9 +162,9 @@
 // shared pipeline layout reserves only the first 112B for hw push
 // constants (VulkanDevice::kPushSplitOffset), with the remainder
 // spilling into a per-frame Frame UBO at vk::binding(14, 0). The host
-// StarsCompositePush struct is contiguous 240B; VulkanCommandBuffer::
+// StarsCompositePush struct is contiguous 256B; VulkanCommandBuffer::
 // Dispatch byte-splits it: bytes [0..112) -> vkCmdPushConstants, bytes
-// [112..240) -> the Frame UBO ring buffer. PathTrace.slang already uses
+// [112..256) -> the Frame UBO ring buffer. PathTrace.slang already uses
 // this split for its 832B PtPush; StarsComposite follows the same
 // convention so both shaders coexist in the shared layout.
 [[vk::push_constant]]
@@ -204,14 +204,21 @@ cbuffer Frame {
     uint   ap_samples;
     uint   composite_active;
     uint   _pad0;
+    // --- Planetary P0 (#254) ---
+    // .xyz planet centre (world), .w radius; .w <= 0 == planar frame, in
+    // which localUp() is world +Y. Mirrors PtPush's field so this kernel's
+    // verbatim celestial copies stay in the same frame the path tracer
+    // used when it SUBTRACTED them at the primary miss.
+    float4 planet_center_radius;
+    // --- end Planetary P0 ---
 };
 
 #else  // !PT_TARGET_SPIRV -- Metal MSL path
 
 // Metal lowers [[vk::push_constant]] to a regular setBytes buffer slot
-// with no hw size cap, so we keep the full 240B struct contiguous and
+// with no hw size cap, so we keep the full 256B struct contiguous and
 // avoid the split. Field order MUST match the SPIR-V Push + Frame
-// declarations above (Engine.cpp pushes one contiguous 240B blob).
+// declarations above (Engine.cpp pushes one contiguous 256B blob).
 [[vk::push_constant]]
 cbuffer Push {
     float4 pos_fovtan;
@@ -234,6 +241,9 @@ cbuffer Push {
     uint ap_samples;
     uint composite_active;
     uint _pad0;
+    // --- Planetary P0 (#254) --- mirrors the SPIR-V Frame field above.
+    float4 planet_center_radius;
+    // --- end Planetary P0 ---
 };
 
 #endif  // PT_TARGET_SPIRV
@@ -258,9 +268,23 @@ uint pcgHash(uint v) {
     return (word >> 22u) ^ word;
 }
 
+// Planetary P0 (#254). Verbatim mirror of PathTrace.slang's localUp():
+// world +Y in the planar frame (planet_center_radius.w <= 0, the
+// default), the outward radial direction from the planet centre in the
+// spherical frame. Every "how high is the sun / the moon / this ray"
+// term in the celestial copies below is measured against it instead of
+// against world +Y, so the composite's re-add lands in exactly the frame
+// the path tracer's subtract used. In the planar frame dot(v, +Y) is
+// v.y bit-for-bit, so the composite is unchanged.
+float3 localUp(float3 p) {
+    if (planet_center_radius.w <= 0.0) return float3(0.0, 1.0, 0.0);
+    return normalize(p - planet_center_radius.xyz);
+}
+
 float3 starsOnly(float3 rd, float3 sun) {
-    float cosTheta = clamp(rd.y, -1.0, 1.0);
-    float sun_elev = sun.y;
+    float3 up      = localUp(pos_fovtan.xyz);
+    float cosTheta = clamp(dot(rd, up), -1.0, 1.0);
+    float sun_elev = dot(up, sun);
     float day      = smoothstep(-0.10, 0.20, sun_elev);
     if (cosTheta > -0.05 && exposure_pad.z > 0.5 && day < 0.6) {
         float3 j;
@@ -332,12 +356,14 @@ float3 starsOnly(float3 rd, float3 sun) {
 }
 
 float3 sunDisc(float3 rd, float3 sun_dir) {
-    if (sun_dir.y < -0.10) return float3(0.0);
+    float3 world_up = localUp(pos_fovtan.xyz);
+    float  sun_elev = dot(world_up, sun_dir);
+    if (sun_elev < -0.10) return float3(0.0);
     float ang = dot(rd, sun_dir);
     float sun_mult = max(sun_extra.x * sun_extra.y, 0.1);
     float r_deg    = 0.55 * sun_mult;
     float kCosR    = cos(r_deg * 0.0174533);
-    float halo_deg = lerp(2.0, 8.0, saturate(1.0 - sun_dir.y));
+    float halo_deg = lerp(2.0, 8.0, saturate(1.0 - sun_elev));
     float halo_rad = halo_deg * 0.0174533;
     float kCosHalo = cos(halo_rad);
     if (ang <= kCosHalo) return float3(0.0);
@@ -349,7 +375,6 @@ float3 sunDisc(float3 rd, float3 sun_dir) {
         if (!oval) {
             inside_disc = true;
         } else {
-            float3 world_up    = float3(0.0, 1.0, 0.0);
             float3 local_right = normalize(cross(world_up, sun_dir));
             float3 local_up    = cross(sun_dir, local_right);
             float3 delta       = rd - sun_dir * ang;
@@ -363,7 +388,7 @@ float3 sunDisc(float3 rd, float3 sun_dir) {
         }
     }
 
-    float am  = 1.0 / max(sun_dir.y, 0.04);
+    float am  = 1.0 / max(sun_elev, 0.04);
     float atm = exp(-0.30 * am);
     float warmth = saturate((am - 1.0) * 0.18);
     float3 col = lerp(float3(1.00, 0.98, 0.94),
@@ -372,7 +397,7 @@ float3 sunDisc(float3 rd, float3 sun_dir) {
     float halo = 0.0;
     if (ang > kCosHalo) {
         float t_h = (ang - kCosHalo) / (1.0 - kCosHalo);
-        float falloff = lerp(8.0, 3.0, saturate(1.0 - sun_dir.y));
+        float falloff = lerp(8.0, 3.0, saturate(1.0 - sun_elev));
         halo = pow(t_h, falloff);
     }
     // r_sun_disc_brightness (moon_extra.w on this kernel's push --
@@ -397,7 +422,7 @@ float3 sunDisc(float3 rd, float3 sun_dir) {
 // composite-on / composite-off paths will diverge in sun brightness.
 float3 procSkyInlineSunDiscAndHalo(float3 rd, float3 sun) {
     float cosGamma = clamp(dot(rd, sun), -1.0, 1.0);
-    float sun_elev = sun.y;
+    float sun_elev = dot(localUp(pos_fovtan.xyz), sun);
     float day      = smoothstep(-0.10, 0.20, sun_elev);
     float disk     = smoothstep(0.99996, 0.99999, cosGamma);
     float3 sun_color_high = float3(1.00, 0.95, 0.85);
@@ -410,8 +435,12 @@ float3 procSkyInlineSunDiscAndHalo(float3 rd, float3 sun) {
 }
 
 float3 moonDisc(float3 rd, float4 mph, float3 sun_dir_world) {
-    if (mph.y < -0.10) return float3(0.0);
     float3 m_dir = mph.xyz;
+    // Lunar elevation at the observer (#254). The `ax` basis pick below
+    // is a parameterisation choice off m_dir.y, NOT an up-vector -- it
+    // must not move or the moon texture rotates.
+    float moon_elev = dot(localUp(pos_fovtan.xyz), m_dir);
+    if (moon_elev < -0.10) return float3(0.0);
     float ang = dot(rd, m_dir);
     float size_mult = max(moon_extra.x * moon_extra.y, 0.1);
     float r_deg     = 0.55 * size_mult;
@@ -421,7 +450,7 @@ float3 moonDisc(float3 rd, float4 mph, float3 sun_dir_world) {
     if (ang <= kCosHalo) return float3(0.0);
 
     float3 col_tint = float3(0.92, 0.94, 1.00);
-    float moon_am   = 1.0 / max(mph.y, 0.04);
+    float moon_am   = 1.0 / max(moon_elev, 0.04);
     float moon_atm  = exp(-0.30 * moon_am);
     float warmth_m  = saturate((moon_am - 1.0) * 0.18);
     float3 col_atm  = lerp(float3(1.00, 1.00, 1.00),

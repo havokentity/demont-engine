@@ -86,6 +86,11 @@ cbuffer Push {
     float4 pos_fovtan;
     float4 fwd_aspect;
     float4 right_xyz;
+    // .xyz camera up. .w = sin(solar elevation) at the CAMERA, i.e.
+    // dot(localUp(camera), sun_dir) -- planetary P0 (#254). Shafts are a
+    // screen-space effect evaluated at the observer, so the scalar is
+    // all the local-up frame this kernel needs, and it costs no push
+    // growth. Planar frame -> sun_and_mode.y bit-for-bit.
     float4 up_xyz;
     float4 sun_and_mode;
     float4 sun_uv_px;
@@ -99,7 +104,9 @@ cbuffer Push {
 // the horizon). Shafts at a low sun read warm-orange; a high sun stays
 // near-white. Cheap closed form so pass 1 can call it once per pixel.
 float3 sunTint(float3 sun_dir) {
-    float am  = 1.0 / max(sun_dir.y, 0.04);
+    // Air mass from the sun's elevation above the observer's LOCAL
+    // horizon (#254), not its world-+Y component.
+    float am  = 1.0 / max(up_xyz.w, 0.04);
     float warmth = saturate((am - 1.0) * 0.18);
     return lerp(float3(1.00, 0.97, 0.92), float3(1.45, 0.55, 0.22), warmth);
 }
