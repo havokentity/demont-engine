@@ -89,8 +89,17 @@ endfunction()
 # so we don't need Apple's separate Metal Toolchain installed; Metal does
 # the source -> library compile at runtime via newLibrary().
 
+# MODULE_DEPS (planetary P3, #257): a module may now import another
+# module -- PathTraceCloud imports PathTraceMath for the cancellation-free
+# altitude kernel its spherical layer gate needs. Without this, slangc
+# resolves the inner `import` by finding the DEPENDENCY'S SOURCE next to
+# the importer and recompiling it inline, so the same symbols end up
+# both embedded in the outer module and present in the standalone one
+# the entry point links. Passing -I <out_dir> plus an ordering DEPENDS
+# makes slangc pick up the already-built .slang-module instead, which is
+# the same resolution the entry-point compiles have always used.
 function(pt_compile_slang_module)
-    cmake_parse_arguments(M "" "SOURCE" "EXTRA_DEFINES" ${ARGN})
+    cmake_parse_arguments(M "" "SOURCE" "EXTRA_DEFINES;MODULE_DEPS" ${ARGN})
     if(NOT M_SOURCE)
         message(FATAL_ERROR "pt_compile_slang_module needs SOURCE")
     endif()
@@ -107,6 +116,10 @@ function(pt_compile_slang_module)
     # cache options are auto-appended so both rhi_metal + rhi_vulkan
     # module compiles stay in sync without per-backend CMakeLists edits.
     _pt_sdf_defines(_sdf_defs)
+    set(dep_outputs "")
+    foreach(d ${M_MODULE_DEPS})
+        list(APPEND dep_outputs "${out_dir}/${d}.slang-module")
+    endforeach()
     if(NOT TARGET slang_module_${name})
         add_custom_command(
             OUTPUT  "${out}"
@@ -115,9 +128,10 @@ function(pt_compile_slang_module)
                     -emit-ir
                     ${_sdf_defs}
                     ${M_EXTRA_DEFINES}
+                    -I       "${out_dir}"
                     -Wno-40100
                     -o       "${out}"
-            DEPENDS "${full}" "${PT_SLANGC_BIN}"
+            DEPENDS "${full}" "${PT_SLANGC_BIN}" ${dep_outputs}
             VERBATIM
             COMMENT "slangc module ${name}.slang -> .slang-module"
         )

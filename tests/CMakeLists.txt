@@ -312,13 +312,54 @@ endif()
 # the kernel would pass with the sites left naive.
 pt_add_test(pt_math_altitude
     pt_math_altitude_test.cpp)
+#
+# It re-reads CloudsRaymarch.slang too (issue #276). #271 was scoped to
+# PathTrace.slang and left the pre-pass's own copy of planetAltitude on
+# the naive form, so the engine carried two definitions of one function
+# that disagreed -- and this target's substring pin could not see it,
+# because it was only ever pointed at one of the two files. The added
+# case COUNTS occurrences across both.
 target_compile_definitions(pt_math_altitude PRIVATE
     PT_SHADER_MATH_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTraceMath.slang"
-    PT_SHADER_PATHTRACE_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang")
+    PT_SHADER_PATHTRACE_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang"
+    PT_SHADER_CLOUDSRAYMARCH_PATH="${CMAKE_SOURCE_DIR}/shaders/CloudsRaymarch.slang")
 if(NOT MSVC)
     target_compile_options(pt_math_altitude PRIVATE $<$<CONFIG:Release>:-ffast-math>)
 else()
     target_compile_options(pt_math_altitude PRIVATE $<$<CONFIG:Release>:/fp:fast>)
+endif()
+
+# --- pt_atmosphere (issue #257, planetary P3) ------------------------------
+# The physical atmosphere model: three species, a body struct instead of
+# Earth baked into four files, and the ray-versus-spherical-shell that
+# replaced the cloud layer's flat slab.
+#
+# This target exists because two of P3's acceptance criteria are visual
+# claims that a golden PNG cannot actually settle. "The twilight zenith
+# reads blue, not brown" is a statement about a per-channel transmittance
+# ratio along a grazing path, and "distant clouds merge with the horizon"
+# is a statement about a chord length being finite. Both are computed and
+# asserted here; the goldens then show that the same numbers reached the
+# screen.
+#
+# Same wiring and the same two reasons as pt_math_sphere / pt_math_altitude
+# / pt_math_epsilon: the mirror re-reads the shaders so it cannot drift,
+# and -ffast-math holds the host mirror to the reassociation Metal applies.
+# It re-reads FOUR shaders, because the model was extracted OUT of three of
+# them and a test that pinned only the new module would pass with a stale
+# private copy left behind in any of the others -- which is precisely how
+# #276 stayed green for a cycle.
+pt_add_test(pt_atmosphere
+    pt_atmosphere_test.cpp)
+target_compile_definitions(pt_atmosphere PRIVATE
+    PT_SHADER_MATH_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTraceMath.slang"
+    PT_SHADER_PATHTRACE_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang"
+    PT_SHADER_CLOUDSRAYMARCH_PATH="${CMAKE_SOURCE_DIR}/shaders/CloudsRaymarch.slang"
+    PT_SHADER_PATHTRACECLOUD_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTraceCloud.slang")
+if(NOT MSVC)
+    target_compile_options(pt_atmosphere PRIVATE $<$<CONFIG:Release>:-ffast-math>)
+else()
+    target_compile_options(pt_atmosphere PRIVATE $<$<CONFIG:Release>:/fp:fast>)
 endif()
 
 # --- pt_math_epsilon (issue #256, planetary P2) ----------------------------
@@ -1079,6 +1120,137 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     endforeach()
     # --- end #112 sky/sun/stars/moon matrix --------------------------------
 
+    # --- Curved-Earth sunset fixtures (#51) --------------------------------
+    # These three .cfg files have existed since the #51 spherical-Earth
+    # work landed and were NEVER registered: the fixtures sat in
+    # tests/goldens/scenes/ with no cell and no PNG, so #51's own
+    # acceptance criteria -- "sunset / sunrise renders show realistic
+    # horizon falloff at altitude" and the spherical-vs-planar A/B --
+    # have never been tested by anything. Registered here, and pinned on
+    # unmodified main BEFORE the P3 (#257) atmosphere work starts, so
+    # that phase's change to them is a measurable delta rather than an
+    # unverifiable assertion.
+    #
+    #   sunset_horizon          ground camera (y=1.7) at a 2 deg sun --
+    #                           the longest sea-level slant path the
+    #                           model supports, where curved vs. flat
+    #                           airmass differs most.
+    #   sunset_altitude         the same sun from 10 km (airliner
+    #                           altitude), where the visible horizon dips
+    #                           ~3.2 deg below the mathematical one.
+    #   sunset_altitude_planar  identical to sunset_altitude except
+    #                           `r_planet_radius 0`, which routes
+    #                           atmosphericTransmittance through the
+    #                           legacy planar-exponential integral and
+    #                           disables procSky's horizon dip. This is
+    #                           the A/B half: the pair only means
+    #                           something if BOTH sides are pinned.
+    #
+    # Backends: software (the CI-exercised deterministic lane, label
+    # golden_software) and metal. Both are meaningful here for a reason
+    # specific to this phase -- SoftwareTracer.cpp is a hand-written CPU
+    # tracer, not a Slang-to-CPU emit, and carries its own procSky mirror
+    # with NO atmospheric transmittance at all. So a shader-only change
+    # must move the metal cells and leave the software cells alone; a
+    # software cell that moves is evidence the diff leaked into host code.
+    # Pinning both is what makes that inference available.
+    #
+    # Measured at pin time, and worth recording because it bounds what
+    # the A/B pair can prove: on METAL the spherical and planar halves
+    # differ by mean 6.41 / max 21.2 L2 across 48.6% of the frame, so the
+    # pair does demonstrate the spherical model doing something. On
+    # SOFTWARE the two halves are BIT-IDENTICAL (max_delta 0) -- the CPU
+    # tracer never consults r_planet_radius, so its half of the A/B
+    # carries no spherical-vs-planar signal at all. The software cells
+    # are pinned anyway, as the control: they are the cells that must NOT
+    # move when a shader changes.
+    #
+    # Tolerances match the #112 sky cells for the same reason: bright HDR
+    # sky pixels exaggerate cross-backend FP roundoff. Measured on the dev
+    # M4 Max at pin time, run-to-run over three renders: max_delta 0 on
+    # every one of the six cells (no meshes -> no TLAS build entropy, no
+    # sim -> no dt integration), so the headroom below is entirely for
+    # cross-host / cross-driver variance and none of it is masking noise.
+    set(_sunset_scenes sunset_horizon sunset_altitude sunset_altitude_planar)
+    foreach(_scene IN LISTS _sunset_scenes)
+        pt_add_golden_cell(SCENE ${_scene} BACKEND software DENOISER off
+            MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+        pt_add_golden_cell(SCENE ${_scene} BACKEND metal    DENOISER off
+            MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+    endforeach()
+    # --- end curved-Earth sunset fixtures ----------------------------------
+
+    # --- Planetary P3 (#257): the spherical cloud shell --------------------
+    # The phase's headline acceptance criterion, and #51's founding one:
+    # "distant clouds visually merge with the horizon at ground-level
+    # camera positions". A ground camera looks dead level at a low
+    # stratocumulus deck with the analytic planet body on.
+    #
+    #   planet_horizon_clouds         spherical frame + planet body. The
+    #                                 cloud layer is a SHELL, the ground
+    #                                 curves away beneath it, and the deck
+    #                                 runs continuously down to the body's
+    #                                 limb -- clouds touch the horizon.
+    #   planet_horizon_clouds_planar  the same scene with the frame planar
+    #                                 and the body off, so the layer is a
+    #                                 pair of infinite planes a horizontal
+    #                                 ray can never reach. This is the half
+    #                                 that shows the defect.
+    #
+    # Pinning both is the point. A single golden of the fixed behaviour
+    # says the renderer produces some image; the pair says the spherical
+    # path produces a DIFFERENT one, and shows which difference.
+    #
+    # Metal only. The software backend's tracer is hand-written C++, not a
+    # Slang-to-CPU emit: it has no cloud march at all and does not read
+    # planet_ground, so a software cell here would pin an empty sky and
+    # pass forever. That is the same reason clouds_raymarched has no
+    # software cell.
+    #
+    # Tolerances match the other cloud cells (32/4/3): the march is a
+    # stochastic estimator and its 2-spp noise floor over 64 accumulated
+    # frames is wider than the analytic-geometry baseline.
+    pt_add_golden_cell(SCENE planet_horizon_clouds        BACKEND metal DENOISER off
+        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
+    pt_add_golden_cell(SCENE planet_horizon_clouds_planar BACKEND metal DENOISER off
+        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
+    # --- Planetary P3 (#257): ozone at civil twilight ----------------------
+    # The phase's other acceptance criterion: the twilight sky must read
+    # BLUE, not brown, and that is what ozone buys.
+    #
+    #   civil_twilight            sun 4 degrees below the horizon, ozone
+    #                             at 1.0x the US Standard Atmosphere 1976
+    #                             column, and r_sun_physical_transmittance
+    #                             on so sunlight's colour comes from the
+    #                             real slant path.
+    #   civil_twilight_no_ozone   the same frame with ozone removed and
+    #                             nothing else changed.
+    #
+    # r_sun_physical_transmittance is mandatory here and the reason is
+    # geometric: ozone lives at 25 km, and a camera-to-surface ray at eye
+    # height tops out around 200 m over its whole 50 km, so aerial
+    # perspective can never see the layer. SUNLIGHT crosses it at a
+    # grazing angle for a very long way at twilight. Without the physical
+    # sun path the two halves of this pair would be identical, and the
+    # cell would pin nothing.
+    #
+    # Metal only: the software tracer has no atmospheric transmittance at
+    # all, so both halves would render its own procSky mirror and the
+    # pair would carry no signal (the same reason the sunset_altitude
+    # software A/B is bit-identical -- see the note on those cells).
+    #
+    # Measured on the dev M4 Max: blue-to-green 1.34 with ozone against
+    # 1.23 without, blue-to-red 1.56 against 1.47. Ozone removes green
+    # and red and leaves blue alone, which is the Chappuis band's
+    # spectral shape. tests/pt_atmosphere_test.cpp asserts the same
+    # mechanism on the numbers directly, including the ordering that
+    # would catch the triple being entered in the wrong wavelength order.
+    pt_add_golden_cell(SCENE civil_twilight          BACKEND metal DENOISER off
+        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
+    pt_add_golden_cell(SCENE civil_twilight_no_ozone BACKEND metal DENOISER off
+        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
+    # --- end Planetary P3 --------------------------------------------------
+
     # --- Wave 9 hosek-sky --------------------------------------------------
     # Hosek-Wilkie physically-based sky (r_sky_mode hosek). Daytime sun
     # at +50 deg, camera yawed toward the sun azimuth so the frame shows
@@ -1149,6 +1321,32 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # the cloud march + radial-blur accumulation involve many fbm /
     # texture taps so cross-backend FP-order variance is wider than the
     # analytic-geometry cornell baseline.
+    #
+    # REGENERATED 2026-08-27 (planetary P3, #257). This fixture sets
+    # `r_volumetric_density 0.008` -- a deliberately heavy god-ray haze,
+    # 4x the (already unphysical) 0.002 default and roughly 16-80x the
+    # real-Earth sea-level aerosol range of 1e-4 to 5e-4. P3 gives the
+    # aerosol its real ABSORBING half, which the engine did not model at
+    # all before (an implied single-scattering albedo of 1), so extinction
+    # in this fixture roughly doubles and the frame moved by mean 4.153
+    # against the MEAN_DELTA 4 registered here. That threshold was
+    # calibrated against physics this phase deliberately changes, so the
+    # correct response is a regeneration, not a widened tolerance -- the
+    # same call #269 made for the July correctness fixes.
+    #
+    # The alternative reading was measured, not assumed: treating
+    # r_volumetric_density as EXTINCTION rather than as scattering would
+    # have preserved this fixture's aerial perspective exactly, but it
+    # halves every haze glow and moves this same cell by mean 25.1 --
+    # six times worse. So the fixture is not fine-with-a-broken-
+    # implementation; both readings move it, and the one that moves it
+    # least is also the one that keeps a user's authored haze level
+    # meaning what they set. The reasoning is recorded at ptAtmoScale in
+    # shaders/PathTraceMath.slang.
+    #
+    # The new capture is bit-identical across three consecutive renders
+    # on the dev M4 Max (max_delta 0), so the 32/4/3 thresholds remain
+    # pure cross-host headroom.
     pt_add_golden_cell(SCENE clouds_godrays BACKEND metal DENOISER svgf_atrous
         EXTRA "r_godrays 1"
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)

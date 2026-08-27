@@ -32,7 +32,11 @@ include(${CMAKE_SOURCE_DIR}/cmake/Slang.cmake)
 # files link into the Metal target as the SPIR-V target). Calls are
 # idempotent across rhi_vulkan + rhi_metal trees.
 pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTraceMath.slang)
-pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTraceCloud.slang)
+# PathTraceCloud imports PathTraceMath since #257 (the spherical
+# cloud-layer gate needs ptAltitudeAboveSphere), so the math module
+# has to be built first and reachable on the include path.
+pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTraceCloud.slang
+                        MODULE_DEPS PathTraceMath)
 # --- SDF Phase 1 (#97) -----------------------------------------------------
 # Analytic SDF library (sphere/box/torus/capsule/rounded box + smooth-CSG
 # ops + sphere-trace). Same target-agnostic module pattern as
@@ -173,7 +177,7 @@ pt_compile_slang(
     STAGE   compute
     ENTRY   main
     TARGETS metal
-    MODULE_DEPS PathTraceCloud
+    MODULE_DEPS PathTraceCloud PathTraceMath
 )
 pt_compile_slang(
     TARGET  pt_rhi_metal

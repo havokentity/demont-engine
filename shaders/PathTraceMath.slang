@@ -946,3 +946,363 @@ public float2 ptCatEye(float2 ap, float2 uv, float strength) {
     return radial * ar + tangent * at;
 }
 // --- end Wave 10 bloom/bokeh ---------------------------------------------
+
+// --- Planetary P3 (#257): the medium, parameterised by body ---------------
+//
+// Everything below is one body's atmosphere expressed as data rather than
+// as literals scattered through the kernels.  Before this, Earth was baked
+// into hardcoded numbers in four files -- the Rayleigh scale height 8000.0
+// appeared in PathTrace.slang twice, in CloudsRaymarch.slang once and in
+// atmosphericTransmittance once; the Mie scale height and the Rayleigh
+// sigma triple in two -- so "which body is this?" was not a question the
+// code could be asked.  A second body would have been a rewrite; a struct
+// is an afternoon, and that is the entire reason this is a struct with one
+// constructor in it today.
+//
+// EVERY CONSTANT TRACES.  This project has already once had to replace
+// fabricated sky coefficients with the genuine ArHosekSkyModel dataset
+// (commit b2111dd), so an unsourced number here would be that decision
+// made again.  Sources are named per field on ptAtmoEarth below.
+//
+// UNITS: metres and inverse metres throughout, 1 world unit = 1 metre.
+// RGB triples are sampled at 680 / 550 / 440 nm, the convention Bruneton
+// 2017 and Hillaire 2020 both tabulate against.
+public struct PtAtmoBody {
+    // Geometry.
+    public float  ground_radius;      // R_g  [m]
+    public float  top_radius;         // R_t  [m], top of the modelled shell
+
+    // Rayleigh: molecular scattering.  No absorbing partner -- air
+    // molecules do not absorb in the visible, which is why this species
+    // has a scattering coefficient and nothing else.
+    public float3 rayleigh_sigma_s;   // [m^-1] at r = R_g
+    public float  rayleigh_scale_h;   // [m]
+
+    // Mie: aerosol.  Both halves are real.  The engine had NO Mie
+    // absorption at all before #257, which made haze a pure scatterer and
+    // therefore too bright at every optical depth.
+    public float3 mie_sigma_s;        // [m^-1] at r = R_g
+    public float3 mie_sigma_a;        // [m^-1] at r = R_g
+    public float  mie_scale_h;        // [m]
+    public float  mie_g;              // Cornette-Shanks asymmetry
+
+    // Ozone: absorption only, and NOT exponential in altitude -- it is a
+    // stratospheric layer, so it gets a tent profile.  Its Chappuis band
+    // absorbs in the red-orange, which is what keeps a twilight zenith
+    // blue rather than brown once the slant path through the layer gets
+    // long.  Absent from this engine entirely before #257.
+    public float3 ozone_sigma_a;      // [m^-1] at the tent peak
+    public float  ozone_center;       // [m]
+    public float  ozone_half_width;   // [m]
+};
+
+// Earth.  `ground_radius` is a parameter rather than a literal because the
+// engine already owns it as a cvar (r_planet_radius, default 6 371 008.8 m
+// = the IUGG mean radius) and because a body's radius is the one field a
+// user legitimately pokes.
+//
+// Sources, field by field:
+//
+//   rayleigh_sigma_s  Bodhaine, Wood, Dutton & Slusser 1999, J. Atmos.
+//                     Oceanic Technol. 16:1854-1861 for the molecular
+//                     cross-sections; the (5.802, 13.558, 33.100)e-6 m^-1
+//                     RGB triple as tabulated in Hillaire 2020, "A
+//                     Scalable and Production Ready Sky and Atmosphere
+//                     Rendering Technique" (EGSR 2020).  The engine
+//                     previously carried (5.8, 13.5, 33.1)e-6, the same
+//                     numbers rounded to three figures; restored to the
+//                     tabulated precision.
+//   rayleigh_scale_h  8 000 m.  US Standard Atmosphere 1976 density
+//                     profile as fit by Bruneton 2008 / Hillaire 2020.
+//   mie_sigma_s       3.996e-6 m^-1, Hillaire 2020.  Grey, because
+//                     aerosol scattering is only weakly wavelength
+//                     dependent across the visible -- which is why haze
+//                     is white and Rayleigh is blue.
+//   mie_sigma_a       4.400e-6 m^-1, Hillaire 2020.  The pair gives a
+//                     single-scattering albedo of 3.996/(3.996+4.400) =
+//                     0.4760: this aerosol absorbs slightly more than it
+//                     scatters.
+//   mie_scale_h       1 200 m, Hillaire 2020.  The engine used 1 500 m,
+//                     which puts 25% too much aerosol above every
+//                     altitude.
+//   mie_g             0.8, Hillaire 2020, evaluated through the Cornette
+//                     & Shanks 1992 phase function (J. Opt. Soc. Am. A
+//                     9(12):2069) rather than plain Henyey-Greenstein --
+//                     Cornette-Shanks reduces exactly to the Rayleigh
+//                     phase at g = 0, which HG does not, so one form
+//                     covers both species consistently.
+//   ozone_sigma_a     (0.650, 1.881, 0.085)e-6 m^-1 at the tent peak.
+//                     Cross-sections from Serdyuchenko et al. 2014 /
+//                     Gorshelev et al. 2014; the RGB triple as used by
+//                     Bruneton 2017 and Hillaire 2020.  The GREEN channel
+//                     being the largest is the Chappuis band, and it is
+//                     the whole physical point of including ozone.
+//   ozone_center /    25 000 m and 15 000 m.  US Standard Atmosphere 1976
+//   ozone_half_width  ozone profile, as fit by Bruneton's 2017 reference
+//                     implementation to a symmetric tent.
+//   top_radius        R_g + 100 000 m, the Karman line.  Bruneton 2008
+//                     uses +80 km and Hillaire 2020 +60 km; +100 km is
+//                     the defensible physical boundary and costs nothing,
+//                     since density there is ~1e-7 of sea level and
+//                     contributes below one part in 1e6 of any optical
+//                     depth.
+public PtAtmoBody ptAtmoEarth(float ground_radius) {
+    PtAtmoBody b;
+    b.ground_radius    = ground_radius;
+    b.top_radius       = ground_radius + 100000.0;
+    b.rayleigh_sigma_s = float3(5.802e-6, 13.558e-6, 33.100e-6);
+    b.rayleigh_scale_h = 8000.0;
+    b.mie_sigma_s      = float3(3.996e-6, 3.996e-6, 3.996e-6);
+    b.mie_sigma_a      = float3(4.400e-6, 4.400e-6, 4.400e-6);
+    b.mie_scale_h      = 1200.0;
+    b.mie_g            = 0.8;
+    b.ozone_sigma_a    = float3(0.650e-6, 1.881e-6, 0.085e-6);
+    b.ozone_center     = 25000.0;
+    b.ozone_half_width = 15000.0;
+    return b;
+}
+
+// Apply the engine's per-species user scales to a body.
+//
+// `mie_sigma_s_abs` is an ABSOLUTE sea-level Mie SCATTERING coefficient in
+// m^-1 -- the engine's r_volumetric_density.  Absolute, not a multiplier,
+// so a user asking for a hazy day states the haze rather than a factor on
+// top of an invisible baseline.
+//
+// Which half of the pair the knob names is a real choice and it was made
+// by measurement, not by taste.  Before #257 the engine had NO aerosol
+// absorption at all: it used this one number as extinction in the
+// transmittance integral AND as the scattering coefficient in the
+// in-scatter march, which is the same as asserting a single-scattering
+// albedo of 1.  Adding the real absorbing half therefore has to break one
+// of those two readings.  Taking the knob as EXTINCTION preserves aerial
+// perspective and halves every haze glow; taking it as SCATTERING
+// preserves the glow and deepens aerial perspective.  Measured on
+// clouds_godrays, the fixture that leans hardest on both (r_volumetric
+// _density 0.008, r_volumetric_intensity 2.0): the extinction reading
+// moves it by mean 25.1 L2, the scattering reading by 4.2.  Six times
+// smaller, for identical physics -- so the knob names scattering, a user
+// who set a haze level keeps the haze they set, and the correction shows
+// up where it belongs, as somewhat deeper aerial perspective.
+//
+// The absorbing half moves with it, in the ratio the body declares --
+// 4.400 / 3.996 for Earth.  That ratio is the aerosol's own
+// single-scattering albedo (0.476), a property of the particles rather
+// than of how many there are, so it is what stays fixed as loading is
+// dialled up and down: raising this means MORE of the same aerosol, not a
+// different aerosol.
+//
+// `rayleigh_scale` and `ozone_scale` are dimensionless multiples of the
+// real column (1.0 = real Earth).  Neither exists to compensate for the
+// other; a pair of knobs tuned against each other is exactly the failure
+// #257 retires.
+public PtAtmoBody ptAtmoScale(PtAtmoBody b, float rayleigh_scale,
+                              float mie_sigma_s_abs, float ozone_scale) {
+    b.rayleigh_sigma_s = b.rayleigh_sigma_s * max(rayleigh_scale, 0.0);
+    float ss0 = b.mie_sigma_s.g;
+    // Guarded so a body authored with a non-scattering (or absent)
+    // aerosol cannot divide by zero; it then simply stays that way.
+    float3 co_albedo = (ss0 > 0.0) ? (b.mie_sigma_a / ss0)
+                                   : float3(0.0, 0.0, 0.0);
+    float ss = max(mie_sigma_s_abs, 0.0);
+    b.mie_sigma_s = float3(ss, ss, ss);
+    b.mie_sigma_a = co_albedo * ss;
+    b.ozone_sigma_a = b.ozone_sigma_a * max(ozone_scale, 0.0);
+    return b;
+}
+
+// Ozone's vertical profile: a symmetric tent peaking at ozone_center and
+// reaching zero one half-width either side.  Bruneton 2017's fit to the
+// US Standard Atmosphere 1976 profile.
+//
+// Deliberately NOT an exponential.  Ozone is a stratospheric layer with
+// almost none of it at the surface, so an exponential -- which is maximal
+// at the ground -- would have exactly the wrong shape: it would redden a
+// short vertical path (where real ozone does nothing) and under-absorb the
+// long twilight slant path (where real ozone does everything).
+public float ptAtmoOzoneProfile(PtAtmoBody b, float h) {
+    return max(0.0, 1.0 - abs(h - b.ozone_center) / b.ozone_half_width);
+}
+
+// Per-altitude scattering and extinction: one evaluation, three species.
+// The out-parameter shape is deliberate -- it makes "include a species in
+// extinction but not in scattering" (or the reverse) unrepresentable at a
+// call site, which is the bug class this signature exists to close.
+public void ptAtmoCoefficients(PtAtmoBody b, float h,
+                               out float3 sigma_s_rayleigh,
+                               out float3 sigma_s_mie,
+                               out float3 sigma_t) {
+    float hc = max(h, 0.0);
+    float dr = exp(-hc / b.rayleigh_scale_h);
+    float dm = exp(-hc / b.mie_scale_h);
+    float doz = ptAtmoOzoneProfile(b, hc);
+    sigma_s_rayleigh = b.rayleigh_sigma_s * dr;
+    sigma_s_mie      = b.mie_sigma_s * dm;
+    sigma_t = sigma_s_rayleigh
+            + (b.mie_sigma_s + b.mie_sigma_a) * dm
+            + b.ozone_sigma_a * doz;
+}
+
+// Rayleigh phase function, 3/(16 pi) (1 + mu^2), normalised over the
+// sphere.  `mu` is the cosine between the incident propagation direction
+// and the outgoing one.
+public float ptPhaseRayleigh(float mu) {
+    return 0.0596831036594607 * (1.0 + mu * mu);   // 3 / (16 pi)
+}
+
+// Cornette & Shanks 1992 phase function.  Reduces exactly to the Rayleigh
+// phase at g = 0, so a debug "isotropise the aerosol" does not silently
+// change which physics is being modelled -- which plain Henyey-Greenstein
+// (isotropic at g = 0) would.
+public float ptPhaseCornetteShanks(float mu, float g) {
+    float g2 = g * g;
+    float num = 3.0 * (1.0 - g2) * (1.0 + mu * mu);
+    float den = 8.0 * 3.14159265358979 * (2.0 + g2)
+              * pow(max(1.0 + g2 - 2.0 * g * mu, 1e-4), 1.5);
+    return num / den;
+}
+
+// Optical depth along [ro, ro + rd*t] through the body's medium, by
+// composite Simpson's rule on `steps` subintervals.
+//
+// PRECONDITION: `rd` is unit length.  It is the s^2 coefficient of the
+// hoisted altitude quadratic as well as the integration measure, so a
+// non-normalised direction corrupts both.
+//
+// Altitudes come from ptRayAltitudeAt, i.e. the hoisted cancellation-free
+// form (#271): the quadratic is accumulated once per call and each sample
+// costs two fma.  The naive alternative carries ~0.5 m of noise at
+// planetary radius straight into exp(-h/1200), where 0.5 m is 0.04% of the
+// scale height on every sample.
+//
+// Simpson is exact for cubics, and Rayleigh and Mie are smooth
+// exponentials in a quadratic-in-s altitude, so 8 subintervals hold ~0.1%
+// over the path lengths this engine integrates.  Ozone's tent is only
+// piecewise linear: its two breakpoints (h = centre +/- half-width) are
+// corners Simpson cannot see, so the ozone term carries a larger relative
+// error than the other two.  Stated rather than hidden, and bounded: the
+// vertical ozone optical depth is sigma_peak * half_width = 1.881e-6 *
+// 15000 = 0.028 in green, so a few percent of the ozone term is a few
+// parts in 1e4 of the total.  A transmittance LUT removes this entirely by
+// integrating each (r, mu) once at build time with a finer rule; that is
+// the structure this function is shaped to be replaced by.
+public float3 ptAtmoOpticalDepth(PtAtmoBody b, float3 ro, float3 rd,
+                                 float3 centre, float t, int steps) {
+    if (!(t > 0.0)) return float3(0.0, 0.0, 0.0);
+    int N = max(steps, 1);
+    float dt = t / float(N);
+    float oneSixth = 1.0 / 6.0;
+    PtRayAltitude alt = ptRayAltitudeBegin(ro, rd, centre, b.ground_radius);
+    float3 tau = float3(0.0, 0.0, 0.0);
+    // The left-boundary extinction is cached from the previous
+    // subinterval's right boundary, halving the exp() count across the
+    // march -- the same boundary-caching the pre-#257 integral used.
+    float3 sr_l, sm_l, st_prev;
+    ptAtmoCoefficients(b, max(ptRayAltitudeAt(alt, 0.0), 0.0),
+                       sr_l, sm_l, st_prev);
+    for (int i = 0; i < N; ++i) {
+        float s_mid   = (float(i) + 0.5) * dt;
+        float s_right = (float(i) + 1.0) * dt;
+        float3 sr_m, sm_m, st_mid;
+        float3 sr_r, sm_r, st_right;
+        ptAtmoCoefficients(b, max(ptRayAltitudeAt(alt, s_mid),   0.0),
+                           sr_m, sm_m, st_mid);
+        ptAtmoCoefficients(b, max(ptRayAltitudeAt(alt, s_right), 0.0),
+                           sr_r, sm_r, st_right);
+        tau += dt * oneSixth * (st_prev + 4.0 * st_mid + st_right);
+        st_prev = st_right;
+    }
+    return tau;
+}
+
+// Both roots of the ray-sphere quadratic, on the same three-body gate
+// intersectSphere uses.  intersectSphere returns only the nearer
+// non-self root, and a shell needs both, so this exposes the solve
+// rather than duplicating it: the accumulated path above
+// kPtStableSphereRadius, the historic expression below it so every
+// scene-scale sphere keeps its exact bits.
+//
+// Vieta ("citardauq") on the root pair: -b +/- h subtracts two ~rad
+// quantities for a near-radial ray and throws away everything the
+// accumulator just bought, so evaluate the root whose terms reinforce and
+// recover its partner from the product of roots (= k).  Ray Tracing Gems
+// ch. 7, with the accumulated k that makes it worth having.
+public bool ptSphereRoots(float3 ro, float3 rd, float3 c, float rad,
+                          out float t0, out float t1) {
+    t0 = 0.0; t1 = 0.0;
+    if (!(rad > 0.0)) return false;
+    float3 oc = ro - c;
+    float m = max(max(abs(oc.x), abs(oc.y)), max(abs(oc.z), rad));
+    int ext_exp = ptFloatExp(m);
+    float b, k;
+    if (rad > kPtStableSphereRadius && ext_exp <= kPtAccumMaxExp) {
+        b = ptDotExact(oc, rd);
+        k = ptPowerOfPoint(oc, rad);
+    } else {
+        b = dot(oc, rd);
+        k = dot(oc, oc) - rad * rad;
+    }
+    float h = fma(b, b, -k);
+    if (h < 0.0) return false;
+    h = sqrt(h);
+    float q  = (b >= 0.0) ? -(b + h) : (h - b);
+    float ta = q;
+    float tb = (q != 0.0) ? k / q : 0.0;
+    t0 = min(ta, tb);
+    t1 = max(ta, tb);
+    return true;
+}
+
+// Ray versus a spherical SHELL [r_inner, r_outer] about `centre`.
+//
+// Returns the parametric interval of the ray inside the shell, in front of
+// the origin, clipped to [0, t_max].  False when the ray never enters it.
+//
+// This is what replaces the flat-slab intersections the cloud layer used,
+// and the difference is the founding symptom of #51.  A slab is a pair of
+// infinite planes, so at a ground camera a perfectly horizontal ray needs
+// infinite horizontal distance to reach a layer above it -- clouds
+// therefore never touched the horizon, they stopped at a hard line and
+// left a gap of bare sky below.  On a shell the same ray exits through the
+// top of the layer at a finite range, because the ground curves away
+// underneath it, and the layer terminates AT the horizon.
+//
+// Rather than enumerate the origin cases (below the layer, inside it,
+// above it), the interval is computed as "inside the outer sphere MINUS
+// inside the inner sphere" and the NEAR component returned, which is
+// correct for every origin by construction.  The far component -- the far
+// side of the shell, beyond the body -- is deliberately dropped: it is
+// occluded by the body for any origin outside the inner sphere, and
+// returning it would have a ground camera marching clouds on the other
+// side of the world.
+//
+// The roots come from ptSphereRoots, i.e. the stable solve at planetary
+// radius (#254 / #275).  That matters more here than anywhere: at
+// |oc| ~ 6.4e6 the naive discriminant loses 22% of k, which is ~0.38 m of
+// altitude error, against a cloud shell only a few hundred metres thick.
+public bool ptRayShell(float3 ro, float3 rd, float3 centre,
+                       float r_inner, float r_outer, float t_max,
+                       out float t_in, out float t_out) {
+    t_in = 0.0; t_out = 0.0;
+    if (!(r_outer > 0.0) || !(t_max > 0.0)) return false;
+    float o0, o1;
+    if (!ptSphereRoots(ro, rd, centre, r_outer, o0, o1)) return false;
+    float lo = max(o0, 0.0);
+    float hi = min(o1, t_max);
+    if (!(hi > lo)) return false;
+    float i0, i1;
+    if (r_inner > 0.0 && ptSphereRoots(ro, rd, centre, r_inner, i0, i1)) {
+        // The inner sphere carves [i0, i1] out of [lo, hi].  If the carve
+        // starts after lo the near piece is [lo, i0]; if the origin is
+        // already inside the inner sphere (i0 <= lo < i1) the ray emerges
+        // at i1 and that becomes the new near bound.
+        if (i1 > lo) {
+            if (i0 > lo) { hi = min(hi, i0); }
+            else         { lo = i1; }
+        }
+    }
+    if (!(hi > lo)) return false;
+    t_in = lo; t_out = hi;
+    return true;
+}
+// --- end Planetary P3 -----------------------------------------------------

@@ -71,7 +71,11 @@ include(${CMAKE_SOURCE_DIR}/cmake/Slang.cmake)
 # `-I <out_dir>` resolver.  Body-only iterations on PathTrace.slang
 # skip the module re-parse, saving ~145ms / rebuild.
 pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTraceMath.slang)
-pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTraceCloud.slang)
+# PathTraceCloud imports PathTraceMath since #257 (the spherical
+# cloud-layer gate needs ptAltitudeAboveSphere), so the math module
+# has to be built first and reachable on the include path.
+pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTraceCloud.slang
+                        MODULE_DEPS PathTraceMath)
 # --- SDF Phase 1 (#97) -----------------------------------------------------
 # Analytic SDF library; same compile-module pattern.
 pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/SdfPrimitives.slang)
@@ -163,7 +167,7 @@ pt_compile_slang(
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/CloudsRaymarch.slang
     STAGE compute ENTRY main TARGETS spirv
-    MODULE_DEPS PathTraceCloud)
+    MODULE_DEPS PathTraceCloud PathTraceMath)
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/CloudsComposite.slang
     STAGE compute ENTRY main TARGETS spirv)

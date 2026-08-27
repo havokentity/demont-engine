@@ -79,6 +79,14 @@
 // transmittance scalar) -- same format StarsComposite expects.
 
 import PathTraceCloud;
+// PathTraceMath supplies ptAltitudeAboveSphere (issue #271), the
+// cancellation-free "how far above the surface" kernel this kernel's
+// planetAltitude() delegates to. Added for #276: before it, this file
+// carried its own naive `length(p - c) - R`, so the raymarched cloud
+// pre-pass and the main path tracer disagreed about where a given point
+// sat relative to the surface by ~0.5 m at Earth radius -- an error that
+// lands in exp(-h/8000) rather than staying geometric.
+import PathTraceMath;
 
 [[vk::binding(0, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> clouds_color_tex;
 [[vk::binding(1, 0), vk::image_format("r32f")]]    RWTexture2D<float>  cloud_trans_tex;
@@ -195,9 +203,26 @@ float3 localUp(float3 p) {
     return normalize(p - planet_center_radius.xyz);
 }
 
+// Issue #276. This used to be `length(p - c) - R`, the naive form that
+// #271 (e1dcf9c) removed from PathTrace.slang's copy of this same
+// function -- so the engine shipped two definitions of one function that
+// disagreed, with the cloud pre-pass holding the defective one.
+//
+// At Earth radius the naive form differences two nearly-equal ~6.371e6
+// values, and float32 keeps ~0.5 m of the result. That value is not used
+// geometrically: it feeds the scale-height exponential exp(-h/8000) and
+// the cloud layer's own band tests, so the error lands directly in
+// density and extinction. ptAltitudeAboveSphere forms |p - c|^2 - R^2
+// through the fixed-point accumulator and divides by |p - c| + R, which
+// never differences the two large quantities; measured accuracy is
+// 3.3e-7 m at 1 m altitude, 1-3 ULP of the returned float32 at every
+// scale tested (#271).
+//
+// The planar branch is untouched and stays exactly `p.y`.
 float planetAltitude(float3 p) {
     if (planet_center_radius.w <= 0.0) return p.y;
-    return length(p - planet_center_radius.xyz) - planet_center_radius.w;
+    return ptAltitudeAboveSphere(p, planet_center_radius.xyz,
+                                 planet_center_radius.w);
 }
 
 // Per-pixel deterministic hash for jitter; mirrors PathTrace.slang's
@@ -266,7 +291,8 @@ float lightMarch(float3 pos, float3 light_dir,
         // and Beer-Lambert exp(-OD) is forgiving to fbm aliasing.
         // Matches the same trade-off the inline cloud_optical_depth
         // path in PathTrace.slang makes (3 octaves on the shadow ray).
-        float dens = cloud_density_at(sp, cp1, cp2, cp3, cp4, 3) * vol_dscale;
+        float dens = cloud_density_at(sp, cp1, cp2, cp3, cp4, 3,
+                                      planet_center_radius) * vol_dscale;
         od += max(dens, 0.0) * dt;
         t  += dt;
         dt *= gr;
@@ -342,20 +368,45 @@ float3 msScatter(float c_view, float g, float T_sun, int n_oct) {
     return acc;
 }
 
-// Slab intersection: cloud layer is [base_y, top_y].
-// Returns (t_in, t_out); when ray misses the slab, t_out < t_in.
-float2 slabIntersect(float3 ro, float3 rd, float base_y, float top_y) {
+// Ray versus the cloud layer, in whichever frame the scene is in
+// (planetary P3, #257).
+//
+// PLANAR frame (planet_center_radius.w <= 0, every scene authored
+// before this phase): `base` / `top` are world-Y planes and this is the
+// slab intersection that has always been here, expression for
+// expression -- so the planar path is bit-for-bit unchanged.
+//
+// SPHERICAL frame: `base` / `top` are ALTITUDES above the surface and
+// the layer is a shell of radii R+base .. R+top about the planet centre.
+// That is the fix for #51's founding symptom. A slab is a pair of
+// infinite planes, so a perfectly horizontal ray from a ground camera
+// needs infinite horizontal distance to reach a layer above it: clouds
+// stopped at a hard line with a strip of bare sky underneath, and could
+// never touch the horizon. On a shell the same ray leaves through the
+// top of the layer at a finite range, because the ground curves away
+// beneath it, and the layer terminates exactly at the horizon.
+//
+// Returns false when the ray never enters the layer.
+bool cloudLayerInterval(float3 ro, float3 rd, float base, float top,
+                        float t_max, out float t_in, out float t_out) {
+    if (planet_center_radius.w > 0.0) {
+        float R = planet_center_radius.w;
+        return ptRayShell(ro, rd, planet_center_radius.xyz,
+                          R + base, R + top, t_max, t_in, t_out);
+    }
     float ry = rd.y;
     if (abs(ry) > 1e-6) {
-        float t_b = (base_y - ro.y) / ry;
-        float t_t = (top_y  - ro.y) / ry;
-        float t_in  = max(0.0, min(t_b, t_t));
-        float t_out = max(t_b, t_t);
-        return float2(t_in, t_out);
-    } else if (ro.y >= base_y && ro.y <= top_y) {
-        return float2(0.0, 100000.0);
+        float t_b = (base - ro.y) / ry;
+        float t_t = (top  - ro.y) / ry;
+        t_in  = max(0.0, min(t_b, t_t));
+        t_out = min(max(t_b, t_t), t_max);
+    } else if (ro.y >= base && ro.y <= top) {
+        t_in = 0.0; t_out = t_max;
+    } else {
+        t_in = 1.0; t_out = 0.0;
+        return false;
     }
-    return float2(1.0, 0.0);  // miss
+    return t_out > t_in;
 }
 
 [shader("compute")]
@@ -421,17 +472,25 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // Slab intersect against the cloud layer.
     float base_y = clouds_p1.x;
     float top_y  = clouds_p1.y;
-    float2 t_io  = slabIntersect(ro, rd, base_y, top_y);
-    float t_in   = t_io.x;
-    float t_out  = t_io.y;
-    if (t_out <= t_in) {
-        // Ray misses the cloud slab entirely.
+    // 1e5 m is the historical "no ray-length limit" cap this pre-pass
+    // used for a camera inside the slab; keeping it as the t_max keeps
+    // that case identical in the planar frame.
+    float t_in, t_out;
+    if (!cloudLayerInterval(ro, rd, base_y, top_y, 100000.0, t_in, t_out)) {
+        // Ray misses the cloud layer entirely.
         clouds_color_tex[tid.xy] = float4(0.0, 0.0, 0.0, 0.0);
         cloud_trans_tex[tid.xy]  = 1.0;
         return;
     }
-    // Cap march span at 30km, matching PathTrace.slang's inline march.
-    if (t_out - t_in > 30000.0) t_in = t_out - 30000.0;
+    // The 30 km span clamp that used to sit here advanced the NEAR
+    // bound -- `t_in = t_out - 30000` -- keeping the last 30 km before
+    // exit. On a slab seen from a ground camera that is a defensible
+    // "march the far tail" heuristic. On a shell it is wrong: t_out is
+    // on the far side of the layer, so the clamp would discard the
+    // clouds actually in front of the observer and march the ones
+    // behind the horizon. It is replaced by the transmittance early-out
+    // already in the march below (`if (trans_cam < 0.003) break;`),
+    // which is what a march wants anyway and is altitude-agnostic.
 
     // March parameters.
     float vol_dscale = max(raymarch_params.x, 1e-3);
@@ -450,6 +509,14 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // are decorrelated -- prevents grid aliasing on the cloud field.
     float jit = randf(pix_seed) * dt;
 
+    // Planetary P3 (#257): the body whose air this cloud layer sits in.
+    // Only the Rayleigh scale height is consumed here, but taking it from
+    // the shared constructor is what stops this file re-acquiring a
+    // private copy of Earth -- which is exactly how #276 happened.
+    PtAtmoBody atm_body = ptAtmoEarth((planet_center_radius.w > 0.0)
+                                      ? planet_center_radius.w
+                                      : ((sun_extra.w > 0.0) ? sun_extra.w
+                                                             : 6371008.8));
     float3 sun_dir = sun_and_mode.xyz;
     float3 sun_rad = sun_radiance.xyz;
     float  sun_am  = sun_radiance.w;   // 1/sin(elev) for altitude boost
@@ -466,7 +533,8 @@ void main(uint3 tid : SV_DispatchThreadID) {
         float t_mid = t + 0.5 * dt + jit;
         if (t_mid > t_out) break;
         float3 sp = ro + rd * t_mid;
-        float dens = cloud_density_at(sp, clouds_p1, clouds_p2, clouds_p3, clouds_p4, 6)
+        float dens = cloud_density_at(sp, clouds_p1, clouds_p2, clouds_p3, clouds_p4, 6,
+                                      planet_center_radius)
                    * vol_dscale;
         if (dens > 0.0) {
             // Light-march toward sun (and moon if active).
@@ -500,7 +568,13 @@ void main(uint3 tid : SV_DispatchThreadID) {
             // the absorbing atmosphere and catch brighter, less-reddened
             // light than the ground. Matches the inline march's
             // exp(0.30 * sun_am * h_norm) over an 8 km reference height.
-            float h_norm = saturate(max(planetAltitude(sp), 0.0) / 8000.0);
+            // Reference height for the high-cloud sun boost is the
+            // Rayleigh scale height. It used to be a bare 8000.0 here --
+            // one of four independent copies of that number across the
+            // shaders -- and now comes from the body (#257), so the
+            // pre-pass and the inline march cannot drift apart.
+            float h_norm = saturate(max(planetAltitude(sp), 0.0)
+                                    / atm_body.rayleigh_scale_h);
             float boost  = (sun_am > 0.0) ? exp(0.30 * sun_am * h_norm) : 1.0;
             float3 sun_at = sun_rad * boost;
             // Powder term: dark-bottom approximation per Schneider 2015.
