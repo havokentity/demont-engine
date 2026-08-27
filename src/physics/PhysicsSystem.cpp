@@ -185,6 +185,14 @@ void PhysicsSystem::ForEach(IterFn fn, void* user) const {
 
 void PhysicsSystem::Step(float frame_dt, int substeps,
                          float gravity_y, float damping_per_substep) {
+    GravityField g{};
+    g.planar = glm::vec3(0.0f, gravity_y, 0.0f);
+    g.radial = false;
+    Step(frame_dt, substeps, g, damping_per_substep);
+}
+
+void PhysicsSystem::Step(float frame_dt, int substeps,
+                         const GravityField& gravity, float damping_per_substep) {
     // Both pools are independently empty -> nothing to integrate.
     if (alive_count_ == 0 && rb_alive_count_ == 0) return;
     if (frame_dt <= 0.0f)  return;
@@ -199,7 +207,6 @@ void PhysicsSystem::Step(float frame_dt, int substeps,
     // velocity (curr - prev, a per-substep displacement) can convert
     // it to real m/s -- see LastSubstepDt().
     last_substep_dt_ = sdt;
-    const glm::vec3 accel{0.0f, gravity_y, 0.0f};
 
     // Sanitize damping. < 0 or > 1 would blow energy up; we cap at
     // [0.5, 1.0] -- below 0.5 anything moving collapses to zero in
@@ -216,12 +223,12 @@ void PhysicsSystem::Step(float frame_dt, int substeps,
     const float ang_damping = damping;
 
     for (int step = 0; step < substeps; ++step) {
-        if (alive_count_ > 0)    Substep(sdt, accel, damping);
-        if (rb_alive_count_ > 0) SubstepRigidBodies(sdt, accel, damping, ang_damping);
+        if (alive_count_ > 0)    Substep(sdt, gravity, damping);
+        if (rb_alive_count_ > 0) SubstepRigidBodies(sdt, gravity, damping, ang_damping);
     }
 }
 
-void PhysicsSystem::Substep(float sdt, const glm::vec3& accel, float damping) {
+void PhysicsSystem::Substep(float sdt, const GravityField& gravity, float damping) {
     // Reciprocal of the substep dt, used by step 5 to convert the
     // constraint solver's position correction back into a velocity
     // correction. sdt is strictly positive here: Step() early-outs on
@@ -310,6 +317,10 @@ void PhysicsSystem::Substep(float sdt, const glm::vec3& accel, float damping) {
             s.p.velocity = glm::vec3{0.0f};
             continue;
         }
+        // Planetary P4 (#258): the acceleration is now evaluated AT THE
+        // BODY. In the planar field this is a load of a constant and the
+        // arithmetic below is bit-identical to what it was.
+        const glm::vec3 accel = gravity.At(s.p.curr_pos);
         s.p.velocity = s.p.velocity * damping + accel * sdt;
         s.p.prev_pos = s.p.curr_pos;
         s.p.curr_pos = s.p.curr_pos + s.p.velocity * sdt;
@@ -608,7 +619,7 @@ void PhysicsSystem::ForEachRigidBody(RbIterFn fn, void* user) const {
     }
 }
 
-void PhysicsSystem::SubstepRigidBodies(float sdt, const glm::vec3& accel,
+void PhysicsSystem::SubstepRigidBodies(float sdt, const GravityField& gravity,
                                        float linear_damping,
                                        float angular_damping) {
     // See Substep(): sdt is strictly positive by the time we get here.
@@ -636,6 +647,8 @@ void PhysicsSystem::SubstepRigidBodies(float sdt, const glm::vec3& accel,
         // accel * sdt into a velocity rather than accel * sdt^2 into
         // a position -- so sphere-to-sphere pair contacts behave the
         // same whether the pair is two rigid bodies or two particles.
+        // Planetary P4 (#258): evaluated at the body, as above.
+        const glm::vec3 accel = gravity.At(b.curr_pos);
         b.velocity = b.velocity * linear_damping + accel * sdt;
         b.prev_pos = b.curr_pos;
         b.curr_pos = b.curr_pos + b.velocity * sdt;
