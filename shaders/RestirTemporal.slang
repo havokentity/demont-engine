@@ -85,6 +85,26 @@ cbuffer Push {
     uint   restir_enabled;  // master ON/OFF (mirrors r_restir)
     uint   temporal_enabled;
     uint   _pad0;
+    // Planetary P1 (#255) — the render frame's anchor delta,
+    // (anchor_prev - anchor) in metres. Reservoirs persist across
+    // frames and store ONE frame-dependent quantity, light_pos; when
+    // the host re-anchors the render frame, last frame's reservoirs are
+    // expressed in the old anchor. Adding this delta at the load below
+    // moves them into the current one.
+    //
+    // It is exact: the anchor lattice is a power of two, so the
+    // difference of two anchors is exactly representable in float32 and
+    // the corrected light_pos is bit-identical to what a non-rebased
+    // frame would have held. Zero whenever the anchor did not move,
+    // which is every frame in every existing scene.
+    float4 anchor_delta;
+    // This block is now EXACTLY 112 bytes -- VulkanDevice::
+    // kPushSplitOffset. Vulkan splits any push above that into a real
+    // push constant plus a Frame-UBO tail at binding 14, and this shader
+    // declares no Frame block, so a spilled tail would vanish silently
+    // on SPIR-V and nowhere else. There is no room for another field
+    // without adding that block. The host mirrors this with a
+    // static_assert on RestirTemporalPush.
 };
 
 // Disocclusion tolerances. Matches the SVGF temporal pass for visual
@@ -305,6 +325,10 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // Load and cap prev reservoir.
     uint prev_idx = uint(prev_px.y) * width + uint(prev_px.x);
     Reservoir prev = loadReservoir(reservoir_prev_in, prev_idx);
+    // Rebase the survivor's sample point into THIS frame's anchor
+    // (#255). One vector add inside an existing load, no new pass, and a
+    // no-op whenever anchor_delta is zero.
+    prev.light_pos += anchor_delta.xyz;
     if (prev.M > kRestirTemporalMaxM) {
         // Scale w_sum to preserve W: W = w_sum / (M * p_hat); cap M
         // and scale w_sum together so W stays unchanged.

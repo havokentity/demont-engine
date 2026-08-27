@@ -4,6 +4,7 @@
 
 #include "../app/Window.h"
 #include "../core/Jobs/JobSystem.h"
+#include "../core/WorldFrame.h"
 #include "../renderer/AnalyticBvh.h"
 #include "../renderer/EditorOverlay.h"
 #include "../renderer/TriangleBvh.h"
@@ -187,8 +188,23 @@ public:
         enum Material : std::uint8_t { Lambert = 0, Metal = 1, Dielectric = 2, Water = 3 };
         Type     type      = Sphere;
         Material material  = Lambert;
-        float    pos_or_n[3] {0, 0, 0};   // sphere center / plane normal
-        float    radius_or_d = 0.5f;      // sphere radius / plane d
+        // Planetary P1 (#255): CANONICAL WORLD metres, double precision.
+        // For a sphere this is an absolute position, which is exactly the
+        // quantity float32 cannot hold at planetary radius (0.5 m ULP,
+        // larger than the default 0.3 m collision radius and every ray
+        // epsilon in the tracer). For a plane, pos_or_n is a unit normal
+        // -- scale-free, and it is only double so the array type stays
+        // uniform across both prim kinds.
+        //
+        // radius_or_d is a sphere radius (scale-free) OR a plane offset
+        // `d` in `dot(n, p) + d = 0`, which IS an absolute distance from
+        // the world origin: the ground plane under a camera at ECEF
+        // altitude carries d = -6.4e6. Double for the plane's sake.
+        //
+        // Narrowed to the render frame ONLY inside the pack functions
+        // listed in Engine.cpp's CONVERSION BOUNDARY banner.
+        double   pos_or_n[3] {0, 0, 0};   // sphere center / plane normal
+        double   radius_or_d = 0.5;       // sphere radius / plane d
         float    albedo[3]   {1, 1, 1};
         float    roughness   = 0.0f;
         float    ior         = 1.5f;
@@ -199,7 +215,7 @@ public:
         // motion-blur-off path). The engine snapshots curr → prev once
         // per frame in StepPhysics before writing the new curr_pos.
         // Unused for plane primitives (infinite extent never moves).
-        float    prev_pos_or_n[3] {0, 0, 0};
+        double   prev_pos_or_n[3] {0, 0, 0};
         // Per-prim radiant emission (#181 polish). Units: W/sr per channel,
         // consistent with AnalyticLight::intensity for point/spot lights
         // (PR #185 photometric work). Default (0,0,0) -- non-emissive,
@@ -303,7 +319,10 @@ public:
     struct AnalyticLight {
         enum Type : std::uint8_t { Point = 0, Spot = 1, Sphere = 2, Quad = 3 };
         Type      type        = Point;
-        float     pos[3]      {0, 0, 0};
+        // Planetary P1 (#255): canonical world metres, double. Same
+        // argument as AnalyticPrim::pos_or_n -- an absolute position.
+        // dir / u_vec / orient stay float: directions are scale-free.
+        double    pos[3]      {0, 0, 0};
         float     radius      = 0.0f;       // sphere radius (m); 0 for point/spot/quad
         float     intensity[3]{1, 1, 1};    // W/sr (point/spot) or W/m^2/sr (area)
         float     dir[3]      {0,-1, 0};    // spot axis / quad normal (unit vec)
@@ -338,7 +357,10 @@ public:
     // the per-frame cost without recompiling. GPU buffer is always sized
     // to kMaxSmokeEmitters so a re-upload doesn't reallocate.
     struct SmokeEmitter {
-        float pos[3]      {0, 1, 0};      // base position in world space (m)
+        // Planetary P1 (#255): canonical world metres, double. The
+        // shader's drift is base + velocity * t, so only the base is an
+        // absolute position; velocity stays float.
+        double pos[3]     {0, 1, 0};      // base position in world space (m)
         float radius      = 1.0f;         // Gaussian falloff radius (m, sigma-equivalent)
         float density     = 1.0f;         // peak sigma_t contribution (per metre)
         float velocity[3] {0, 0.2f, 0};   // parametric drift velocity (m/s)
@@ -719,6 +741,12 @@ private:
     // BLAS, TLAS) with one built from `baked`. Called from EnsureMesh*
     // on the main thread once a worker bake has completed.
     void RebuildMeshResources(const pt::csg::BakedMesh& baked);
+    // Planetary P1 (#255): recompute the render frame's anchor from the
+    // camera. Called at the very top of RenderFrame -- before every
+    // Ensure*Uploaded pack and before the PtPush fill, because all of
+    // them emit render-frame floats and a split-anchor frame renders
+    // half the scene in the wrong place.
+    void UpdateWorldFrame();
     // Wave 8 PBR (#26): upload per-vertex mesh UVs (2 floats per vertex,
     // parallel to mesh_positions) into mesh_uv_buf_id_. Call AFTER
     // RebuildMeshResources (which destroys the previous UV buffer). A
@@ -956,6 +984,16 @@ private:
     // push-slot stability; same convention as the rest of the slot-13
     // path documented in Engine.cpp's bind-site block).
     bool                                        light_tree_first_built_     = false;
+    // Planetary P1 (#255). The tree's node AABBs are float32 in the
+    // RENDER frame -- they are built from the anchor-relative light
+    // positions the snapshot produces. A rebase therefore invalidates
+    // the published tree wholesale. Take the SAME synchronous path the
+    // first-ever build takes rather than the async one, so the rebase
+    // frame renders against a tree in its own frame instead of one that
+    // is a full lattice step (>= 1024 m) out of place. A rebuild is
+    // <1 ms for 1000 lights and a rebase happens at most once per
+    // lattice step of travel, so this is affordable.
+    bool                                        light_tree_force_sync_      = false;
     // Async builder owning the worker thread + double-buffered CPU
     // result slots. unique_ptr-of-pimpl so Engine.h doesn't have to
     // include LightTree.h (the renderer header pulls in <thread>,
@@ -1322,8 +1360,14 @@ private:
     // headline use case (a rigid mesh slid across a frame) and the
     // acceptance bar (streaked-mesh consistent with streaked-sphere
     // in the analytic-prim path).
-    float                                       mesh_curr_translation_[3] = {0.0f, 0.0f, 0.0f};
-    float                                       mesh_prev_translation_[3] = {0.0f, 0.0f, 0.0f};
+    //
+    // Planetary P1 (#255): canonical world metres, double. `mesh_step`
+    // ACCUMULATES into mesh_curr_translation_, which is the other place
+    // besides the camera where the engine integrates absolute position
+    // over time. This pair is also the template for P4's per-chunk
+    // instance transform.
+    double                                      mesh_curr_translation_[3] = {0.0, 0.0, 0.0};
+    double                                      mesh_prev_translation_[3] = {0.0, 0.0, 0.0};
 
     // P10 denoiser G-buffer textures. Allocated lazily when r_denoiser
     // moves off "off" and freed on backend teardown / when denoiser is
@@ -1672,8 +1716,40 @@ private:
     void AssignOrQueuePbrTex(bool is_mesh, std::uint32_t prim_id, int slot,
                              const std::string& path);
     // --- end Wave 8 PBR -------------------------------------------------
-    glm::mat4                                   prev_view_proj_        { 1.0f };  // identity
-    bool                                        prev_view_proj_valid_  = false;
+    // --- Planetary P1 (#255): motion vectors from a POSE, not a matrix ---
+    // The previous frame's view-projection used to be cached here as a
+    // glm::mat4. That matrix is expressed in LAST frame's anchor, so the
+    // instant the anchor moves it is meaningless against this frame's
+    // anchor-relative hit positions -- the classic rebase smear. Cache
+    // the previous camera POSE in the canonical f64 frame instead and
+    // rebuild prev_view_proj in the CURRENT anchor every frame: both
+    // matrices and the hit point then live in one frame. Because the
+    // lattice is a power of two, `prev_cam_pos_w_ - anchor` is exact, so
+    // the reconstruction introduces no rounding and motion vectors are
+    // continuous across a rebase BY CONSTRUCTION -- no reset_history, no
+    // smear, no visible event. Cost is one extra lookAtRH +
+    // perspectiveRH_ZO per frame on the CPU.
+    //
+    // prev_cam_up_ is not stored: the projection is built with the world
+    // up vector (0,1,0), matching the curr_view_proj construction, and
+    // the pitch clamp keeps forward away from it.
+    // --- Planetary P1 (#255): the render frame ---------------------------
+    // Refreshed once per frame at the top of RenderFrame, BEFORE any pack
+    // runs, as a pure function of the camera position (see
+    // pt::core::ComputeAnchor). Every host->GPU position conversion goes
+    // through world_frame_.ToRender(); see the CONVERSION BOUNDARY banner
+    // in Engine.cpp for the complete, closed list of call sites.
+    pt::core::WorldFrame                        world_frame_           {};
+    glm::dvec3                                  prev_cam_pos_w_        { 0.0 };
+    glm::vec3                                   prev_cam_fwd_          { 0.0f, 0.0f, -1.0f };
+    float                                       prev_cam_fov_deg_      = 60.0f;
+    float                                       prev_cam_aspect_       = 1.0f;
+    // Renamed from prev_frame_valid_ -- it never meant "the cached
+    // matrix is usable", it meant "temporal history is usable". Under the
+    // pose scheme the matrix is always reconstructible; only history
+    // invalidation (first frame, resize, backend / denoiser switch,
+    // teleport) still clears this.
+    bool                                        prev_frame_valid_      = false;
     bool                                        denoiser_active_       = false;
     // Issue #119 -- previous-frame SVGF albedo-demod effective state.
     // Tracks what we actually told the backend last frame (i.e. cvar
@@ -1683,7 +1759,7 @@ private:
     // stores full radiance), so we have to fire reset_history before
     // the temporal blend lerps stale history against the new
     // input. Initially false so the first-frame "valid history"
-    // check (prev_view_proj_valid_) drives reset, not this gate.
+    // check (prev_frame_valid_) drives reset, not this gate.
     bool                                        prev_svgf_albedo_demod_active_ = false;
     // One-shot state-transition latch for the Vulkan + SVGF/NRD bloom
     // path (built in PR for feature/vulkan-bloom-svgf-nrd). True from
@@ -1845,8 +1921,11 @@ private:
     bool                                        cam_tween_active_      = false;
     double                                      cam_tween_t_seconds_   = 0.0;
     double                                      cam_tween_duration_    = 0.0;
-    float                                       cam_tween_start_pos_[3]    {0, 0, 0};
-    float                                       cam_tween_target_pos_[3]   {0, 0, 0};
+    // Canonical world metres (#255): the tween interpolates absolute
+    // camera positions, so at planetary coordinates a float endpoint
+    // would quantise the destination to 0.5 m before the ease even runs.
+    double                                      cam_tween_start_pos_[3]    {0, 0, 0};
+    double                                      cam_tween_target_pos_[3]   {0, 0, 0};
     float                                       cam_tween_start_yaw_       = 0.0f;
     float                                       cam_tween_target_yaw_      = 0.0f;
     float                                       cam_tween_start_pitch_     = 0.0f;
@@ -1880,8 +1959,18 @@ private:
     bool                                        device_lost_observed_  = false;
 
     // Snapshot of last camera state, used to detect movement and reset
-    // accumulation. (vec4 to keep it trivially copyable.)
-    float                                       last_cam_pos_[3]   { 0, 0, 0 };
+    // accumulation. Canonical world metres in double (#255): at ECEF
+    // radius a float snapshot cannot resolve a frame of walking, so the
+    // exact-equality "did the camera move" test would read false while
+    // the camera crawled, and the teleport delta below would be pure
+    // cancellation noise.
+    glm::dvec3                                  last_cam_pos_      { 0.0 };
+    // Magnitude of last frame's camera step, metres. Feeds the
+    // velocity-relative teleport gate (#255): a fixed 5 m threshold
+    // fires EVERY frame at orbital velocity (7.66 km/s is 128 m per
+    // frame at 60 fps), which would permanently disable temporal
+    // denoising for anything that actually leaves the planet.
+    double                                      last_cam_step_m_   = 0.0;
     float                                       last_cam_yaw_      = 0.0f;
     float                                       last_cam_pitch_    = 0.0f;
     float                                       last_cam_fov_      = 0.0f;

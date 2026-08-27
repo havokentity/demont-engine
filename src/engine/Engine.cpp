@@ -102,6 +102,28 @@ namespace {
 
 Engine* g_instance = nullptr;
 
+// --- Planetary P1 (#255) small helpers -------------------------------------
+// Read a canonical world triple out of one of the widened host structs.
+inline glm::dvec3 WorldPos(const double v[3]) noexcept {
+    return glm::dvec3(v[0], v[1], v[2]);
+}
+
+// A copy of the camera whose position has been narrowed into the current
+// render frame. Host-side geometric queries -- editor picking, gizmo
+// projection and dragging, DOF auto-focus -- must run in the SAME frame
+// the GPU rendered, or their answers disagree with the pixels the user
+// clicked on. Every one of them is fixed for free by working here rather
+// than in canonical space: the differences they take (`world_p - eye`,
+// the Gram determinant in ClosestPointOnLineToRay) become differences of
+// small numbers, which is the whole point of the anchor.
+inline pt::renderer::Camera RenderFrameCamera(const pt::renderer::Camera& cam,
+                                              const pt::core::WorldFrame& wf) {
+    pt::renderer::Camera c = cam;
+    c.pos_w = glm::dvec3(wf.ToRender(cam.pos_w));
+    return c;
+}
+// --- end Planetary P1 helpers ----------------------------------------------
+
 // --- Wave 9 tonemap (#27 follow-up) ---
 // r_tonemap_op string -> operator enum lives in pt::engine::capture
 // (CaptureEncoder.h) as the single source of truth shared with the capture
@@ -1289,6 +1311,28 @@ namespace cvar {
             "of bleeding stale pre-jump color into post-jump frames. "
             "Default 5 = ~33x typical WASD per-frame movement at "
             "cam_speed=3, 60fps. 0 = disabled.",
+            CVAR_ARCHIVE);
+    // --- Planetary P1 (#255): the camera-anchored render frame -----------
+    PT_CVAR(r_origin_rebase_radius, "65536",
+            "Distance from the world origin (metres) past which the "
+            "renderer re-anchors its float32 render frame on the camera. "
+            "Inside this radius the anchor is pinned to (0,0,0) and every "
+            "GPU-facing position is exactly the value it was before "
+            "issue 255 -- the legacy path, bit-for-bit. Outside it, the "
+            "anchor snaps to a power-of-two lattice near the camera and "
+            "every buffer, push constant and matrix is packed relative to "
+            "it, which is what keeps 1 unit = 1 metre usable out to "
+            "planetary radius: absolute float32 coordinates quantise to "
+            "0.5 m at 6.4e6 m, coarser than every ray epsilon in the "
+            "tracer, while camera-relative float32 holds 5.6e-5 of a "
+            "pixel at EVERY distance simultaneously. The lattice is a "
+            "power of two so the frame-to-frame anchor delta is exactly "
+            "representable and rebasing introduces no rounding, no "
+            "motion-vector discontinuity and no denoiser history reset. "
+            "Set to 0 to disable rebasing entirely (permanent legacy "
+            "path) -- useful as an A/B when a render is suspected of "
+            "depending on absolute coordinates. Default 65536 m clears "
+            "every golden fixture (max |cam_pos| = 10000) by 6.5x.",
             CVAR_ARCHIVE);
     // Depth-of-field (thin-lens camera). Each primary ray originates
     // at a random sample on the aperture and aims through the focal-
@@ -2514,15 +2558,19 @@ bool Engine::Init() {
     if (auto* v = C.FindCVar("cam_pos")) {
         std::string_view sv = v->value;
         std::size_t i = 0;
-        glm::vec3 p = camera_->pos;
+        // strtod, not strtof (#255): cam_pos is the entry point every
+        // fixture and every archived session uses to place the camera,
+        // and a float parse throws away 0.5 m at ECEF radius before the
+        // engine has even started.
+        glm::dvec3 p = camera_->pos_w;
         for (int k = 0; k < 3; ++k) {
             while (i < sv.size() && sv[i] == ' ') ++i;
             char* end = nullptr;
-            p[k] = std::strtof(sv.data() + i, &end);
+            p[k] = std::strtod(sv.data() + i, &end);
             if (!end || end == sv.data() + i) break;
             i = static_cast<std::size_t>(end - sv.data());
         }
-        camera_->pos = p;
+        camera_->pos_w = p;
     }
     if (auto* v = C.FindCVar("cam_yaw"))   camera_->yaw   = glm::radians(v->GetFloat());
     if (auto* v = C.FindCVar("cam_pitch")) camera_->pitch = glm::radians(v->GetFloat());
@@ -3059,7 +3107,7 @@ void Engine::TearDownDevice() {
     exposure_state_id_      = 0;
     placeholder_storage_id_ = 0;
     denoiser_active_      = false;
-    prev_view_proj_valid_ = false;
+    prev_frame_valid_ = false;
     primitives_dirty_     = true;        // re-upload on next device
 
     if (device_) {
@@ -3926,6 +3974,38 @@ void Engine::RebuildMeshResources(const pt::csg::BakedMesh& baked) {
 
         // Single instance, identity transform -- the CSG bake already places
         // geometry in world space.
+        //
+        // PLANETARY P1 (#255) -- WHY THE ANCHOR IS *NOT* HERE.
+        //
+        // The obvious move is to put the render frame's anchor in this
+        // translation column: chunk-local BLAS vertices plus a
+        // camera-relative instance transform means a rebase is one
+        // Device::UpdateTLASInstances and touches no BLAS, which is
+        // precisely what P4's streaming terrain wants. That reasoning is
+        // correct -- but it depends on the "chunk-local" half, and this
+        // BLAS is not chunk-local: CsgScene bakes its primitives
+        // straight into absolute world coordinates (see the .Translate()
+        // calls in CsgScene.cpp, and CsgScene.h's note that there is no
+        // node transform to hoist).
+        //
+        // With a world-space bake, splitting the mesh's placement
+        // between the instance transform and the shader's existing
+        // ray-origin shift makes BOTH halves planetary while their sum
+        // is small -- the ray reaches the traversal at ~|anchor| and the
+        // geometry sits at ~|anchor|, so the acceleration structure does
+        // the cancellation the whole phase exists to remove. Measured,
+        // not assumed: doing it that way fails the worldframe
+        // equivalence cell at 2.2% bad pixels / max L2 80, while the
+        // same scene with everything in the ray shift is bit-identical.
+        //
+        // So P1 keeps the placement in ONE place -- the mesh_motion push
+        // below, which the shader already applies to the ray origin on
+        // both the hardware and the software-BVH paths -- and leaves
+        // this transform identity. The instance-transform route becomes
+        // right, and becomes the only sane option, once the CSG bake
+        // moves into local space and the mesh gains a real per-instance
+        // transform; that is P4's work and the verb it needs
+        // (UpdateTLASInstances, #254 P0) is already there waiting.
         pt::rhi::TLASInstance inst{};
         inst.blas = blas;
         inst.transform[0] = 1; inst.transform[1] = 0; inst.transform[2] = 0; inst.transform[3]  = 0.0f;
@@ -4313,7 +4393,7 @@ void Engine::SeedDefaultPrimitives() {
     auto rgb = [](float r, float g, float b) {
         return std::array<float, 3>{r, g, b};
     };
-    auto add_sphere = [&](std::uint32_t id, float x, float y, float z, float r,
+    auto add_sphere = [&](std::uint32_t id, double x, double y, double z, float r,
                           AnalyticPrim::Material mat,
                           std::array<float, 3> color, float roughness, float ior) {
         AnalyticPrim p{};
@@ -4904,24 +4984,37 @@ void Engine::EnsurePrimitivesUploaded() {
         for (std::uint32_t i = 0; i < finite_prims.size(); ++i) {
             const AnalyticPrim& p = *finite_prims[i].p;
             pt::renderer::BvhPrim bp{};
-            float cx = p.pos_or_n[0];
-            float cy = p.pos_or_n[1];
-            float cz = p.pos_or_n[2];
+            // CONVERSION BOUNDARY (#255). BvhNode AABBs and BvhPrim
+            // centroids are float32 and stay float32 -- they are built
+            // over RENDER-frame centroids, so the tree lives in the same
+            // frame the shader traverses it in. A rebase invalidates the
+            // tree wholesale, which is why RenderFrame sets
+            // primitives_dirty_ on the rebase frame and the whole thing
+            // is rebuilt here rather than shifted. The midpoint and the
+            // displacement are taken in f64 first: at ECEF radius a
+            // frame of motion is far below one float32 ULP of the
+            // position, so a float subtraction would report zero motion
+            // and cull the swept volume the streak needs.
+            const glm::vec3 c_rel = world_frame_.ToRender(WorldPos(p.pos_or_n));
+            float cx = c_rel.x;
+            float cy = c_rel.y;
+            float cz = c_rel.z;
             float radius_inflate = 0.0f;
             if (motion_blur_active) {
-                const float dx = p.pos_or_n[0] - p.prev_pos_or_n[0];
-                const float dy = p.pos_or_n[1] - p.prev_pos_or_n[1];
-                const float dz = p.pos_or_n[2] - p.prev_pos_or_n[2];
-                const float disp = std::sqrt(dx * dx + dy * dy + dz * dz);
-                if (disp > 0.0f) {
+                const glm::dvec3 disp_v =
+                    WorldPos(p.pos_or_n) - WorldPos(p.prev_pos_or_n);
+                const double disp = glm::length(disp_v);
+                if (disp > 0.0) {
                     // Midpoint between prev and curr; inflate radius by
                     // half the displacement so the AABB contains BOTH
                     // sphere positions (and every interpolated position
                     // in between, since the lerp travels a straight line).
-                    cx = 0.5f * (p.pos_or_n[0] + p.prev_pos_or_n[0]);
-                    cy = 0.5f * (p.pos_or_n[1] + p.prev_pos_or_n[1]);
-                    cz = 0.5f * (p.pos_or_n[2] + p.prev_pos_or_n[2]);
-                    radius_inflate = 0.5f * disp;
+                    const glm::vec3 mid = world_frame_.ToRender(
+                        0.5 * (WorldPos(p.pos_or_n) + WorldPos(p.prev_pos_or_n)));
+                    cx = mid.x;
+                    cy = mid.y;
+                    cz = mid.z;
+                    radius_inflate = 0.5f * static_cast<float>(disp);
                 }
             }
             bp.center[0] = cx;
@@ -4931,7 +5024,7 @@ void Engine::EnsurePrimitivesUploaded() {
             // motion blur is active. Future finite types (box, disk,
             // cylinder) should compute a bounding-sphere radius here
             // from their extent.
-            bp.radius    = p.radius_or_d + radius_inflate;
+            bp.radius    = static_cast<float>(p.radius_or_d) + radius_inflate;
             bp.prim_id   = i;
             bvh_input.push_back(bp);
         }
@@ -4953,10 +5046,31 @@ void Engine::EnsurePrimitivesUploaded() {
                          std::uint32_t user_id) {
         std::size_t off = out_idx * kFloatsPerPrim;
         // v0 -- xyz: center / normal,  w: radius / d
-        packed[off + 0]  = p.pos_or_n[0];
-        packed[off + 1]  = p.pos_or_n[1];
-        packed[off + 2]  = p.pos_or_n[2];
-        packed[off + 3]  = p.radius_or_d;
+        //
+        // CONVERSION BOUNDARY (#255). A sphere centre is an absolute
+        // position and becomes anchor-relative. A plane is
+        // `dot(n, p) + d = 0` in canonical space; substituting
+        // p = p_render + A gives dot(n, p_render) + (d + dot(n, A)) = 0,
+        // so the normal is unchanged (scale-free) and the offset picks up
+        // dot(n, A) -- taken in f64, because for a ground plane under a
+        // camera at ECEF altitude both terms are ~6.4e6 and their sum is
+        // the small number that actually matters. With the anchor at zero
+        // both branches are the identity and pack today's floats
+        // bit-for-bit.
+        if (p.type == kPrimPlane) {
+            const glm::dvec3 n = WorldPos(p.pos_or_n);
+            packed[off + 0]  = static_cast<float>(n.x);
+            packed[off + 1]  = static_cast<float>(n.y);
+            packed[off + 2]  = static_cast<float>(n.z);
+            packed[off + 3]  = static_cast<float>(
+                p.radius_or_d + glm::dot(n, world_frame_.anchor));
+        } else {
+            const glm::vec3 c_rel = world_frame_.ToRender(WorldPos(p.pos_or_n));
+            packed[off + 0]  = c_rel.x;
+            packed[off + 1]  = c_rel.y;
+            packed[off + 2]  = c_rel.z;
+            packed[off + 3]  = static_cast<float>(p.radius_or_d);
+        }
         // v1 -- rgb: albedo, a: roughness
         packed[off + 4]  = p.albedo[0];
         packed[off + 5]  = p.albedo[1];
@@ -4980,9 +5094,19 @@ void Engine::EnsurePrimitivesUploaded() {
         // reads this when r_motion_blur != 0 to lerp the sphere center
         // at the ray's shutter time. Layout collapses to a no-op when
         // motion blur is off (load happens, lerp factor forced to 1.0).
-        packed[off + 12] = p.prev_pos_or_n[0];
-        packed[off + 13] = p.prev_pos_or_n[1];
-        packed[off + 14] = p.prev_pos_or_n[2];
+        if (p.type == kPrimPlane) {
+            // Planes mirror pos_or_n into prev by convention, so this
+            // lane holds a normal, not a position -- pack it unconverted
+            // exactly as v0 does above.
+            packed[off + 12] = static_cast<float>(p.prev_pos_or_n[0]);
+            packed[off + 13] = static_cast<float>(p.prev_pos_or_n[1]);
+            packed[off + 14] = static_cast<float>(p.prev_pos_or_n[2]);
+        } else {
+            const glm::vec3 pv = world_frame_.ToRender(WorldPos(p.prev_pos_or_n));
+            packed[off + 12] = pv.x;
+            packed[off + 13] = pv.y;
+            packed[off + 14] = pv.z;
+        }
         packed[off + 15] = 0.0f;
         // v4 -- xyz: emission (W/sr per channel, #181 polish), w: pad.
         // Default zero; PathTrace.slang's hit handler adds throughput *
@@ -5161,17 +5285,31 @@ void Engine::EnsureSdfPrimsUploaded() {
     // sdf_cluster_count are the only thing that matters.
     std::vector<float> packed(std::size_t(sdf_cluster_capacity_) * 4u * kClusterFloat4s, 0.0f);
 
+    // CONVERSION BOUNDARY (#255). SdfPrim keeps its float32 host
+    // authority -- it is a direct mirror of the GPU cluster layout, and
+    // its 448-byte static_assert plus SdfPrimitives.slang's
+    // loadSdfCluster pin it -- so the cluster AABBs and the per-node
+    // local origins are shifted here rather than being canonical
+    // upstream. That is a real (if narrow) limitation: an SDF cluster
+    // authored at planetary coordinates carries the float32 host
+    // quantisation of its own position before this ever runs. Widening
+    // SdfPrim is left to whichever phase needs planetary SDFs, and
+    // recorded in the PR. With the anchor at zero this is the identity.
+    const glm::dvec3 anchor = world_frame_.anchor;
+    auto shift = [&](const float v[3], int i) {
+        return static_cast<float>(static_cast<double>(v[i]) - anchor[i]);
+    };
     auto pack_cluster = [&](std::size_t idx, const pt::renderer::SdfPrim& p) {
         const std::size_t base = idx * std::size_t(4u * kClusterFloat4s);
         // hdr0
-        packed[base + 0]  = p.aabb_min[0];
-        packed[base + 1]  = p.aabb_min[1];
-        packed[base + 2]  = p.aabb_min[2];
+        packed[base + 0]  = shift(p.aabb_min, 0);
+        packed[base + 1]  = shift(p.aabb_min, 1);
+        packed[base + 2]  = shift(p.aabb_min, 2);
         std::memcpy(&packed[base + 3], &p.node_count, sizeof(float));
         // hdr1
-        packed[base + 4]  = p.aabb_max[0];
-        packed[base + 5]  = p.aabb_max[1];
-        packed[base + 6]  = p.aabb_max[2];
+        packed[base + 4]  = shift(p.aabb_max, 0);
+        packed[base + 5]  = shift(p.aabb_max, 1);
+        packed[base + 6]  = shift(p.aabb_max, 2);
         std::memcpy(&packed[base + 7], &p.material, sizeof(float));
         // hdr2
         packed[base + 8]  = p.albedo[0];
@@ -5190,15 +5328,27 @@ void Engine::EnsureSdfPrimsUploaded() {
             std::memcpy(&packed[nb + 1], &n.shape,   sizeof(float));
             std::memcpy(&packed[nb + 2], &n.child_a, sizeof(float));
             std::memcpy(&packed[nb + 3], &n.child_b, sizeof(float));
-            // n1 (params)
+            // n1 (params). Everything here is an extent or a
+            // smoothing radius -- scale-free -- with ONE exception: a
+            // LEAF PLANE stores its unit normal in params[0..2] and its
+            // offset d in params[3], and d is an absolute distance from
+            // the world origin. It transforms exactly like an analytic
+            // plane's radius_or_d: d_render = d + dot(n, anchor).
             packed[nb + 4] = n.params[0];
             packed[nb + 5] = n.params[1];
             packed[nb + 6] = n.params[2];
-            packed[nb + 7] = n.params[3];
-            // n2 (center)
-            packed[nb + 8]  = n.center[0];
-            packed[nb + 9]  = n.center[1];
-            packed[nb + 10] = n.center[2];
+            if (n.op == pt::renderer::SDF_OP_LEAF &&
+                n.shape == pt::renderer::SDF_SHAPE_PLANE) {
+                const glm::dvec3 pn(n.params[0], n.params[1], n.params[2]);
+                packed[nb + 7] = static_cast<float>(
+                    static_cast<double>(n.params[3]) + glm::dot(pn, anchor));
+            } else {
+                packed[nb + 7] = n.params[3];
+            }
+            // n2 (centre) -- the leaf's local origin, an absolute position
+            packed[nb + 8]  = shift(n.center, 0);
+            packed[nb + 9]  = shift(n.center, 1);
+            packed[nb + 10] = shift(n.center, 2);
             // pad at +11 already zero
         }
     };
@@ -5305,9 +5455,11 @@ void Engine::EnsureLightsUploaded() {
     for (const auto& [id, L] : light_prims_) {
         const std::size_t off = idx * kFloatsPerLight;
         // v0: position + sphere radius
-        packed[off + 0]  = L.pos[0];
-        packed[off + 1]  = L.pos[1];
-        packed[off + 2]  = L.pos[2];
+        // CONVERSION BOUNDARY (#255): absolute position -> render frame.
+        const glm::vec3 lp = world_frame_.ToRender(WorldPos(L.pos));
+        packed[off + 0]  = lp.x;
+        packed[off + 1]  = lp.y;
+        packed[off + 2]  = lp.z;
         packed[off + 3]  = L.radius;
         // v1: intensity + type
         packed[off + 4]  = L.intensity[0];
@@ -5523,8 +5675,16 @@ void Engine::EnsureLightTreeUploaded() {
             };
             float dir_rot[3];   rotate(L.dir,   dir_rot);
             float u_vec_rot[3]; rotate(L.u_vec, u_vec_rot);
+            // CONVERSION BOUNDARY (#255). LightInput::pos, and the
+            // LightTreeNode AABBs built from it, are float32 in the
+            // RENDER frame -- the shader's cluster-importance bound is
+            // evaluated against anchor-relative hit points, so the tree
+            // has to live in the same frame. Snapshot order must keep
+            // mirroring EnsureLightsUploaded's packing order, and it
+            // does: both walk light_prims_ id-sorted.
+            const glm::vec3 li_pos = world_frame_.ToRender(WorldPos(L.pos));
             for (int i = 0; i < 3; ++i) {
-                li.pos[i]       = L.pos[i];
+                li.pos[i]       = li_pos[i];
                 li.intensity[i] = L.intensity[i];
                 li.dir[i]       = dir_rot[i];
                 li.u_vec[i]     = u_vec_rot[i];
@@ -5552,7 +5712,7 @@ void Engine::EnsureLightTreeUploaded() {
     // scene, expects the very next frame to reflect it -- we trade ~3ms
     // on that ONE frame for correct first-frame variance. Steady-state
     // (subsequent dirty edges) takes the async path below.
-    if (light_prims_dirty_ && !light_tree_first_built_) {
+    if (light_prims_dirty_ && (!light_tree_first_built_ || light_tree_force_sync_)) {
         auto inputs = snapshot_inputs();
         pt::renderer::LightTree sync_tree;
         pt::renderer::BuildLightTree(inputs, sync_tree);
@@ -5564,7 +5724,8 @@ void Engine::EnsureLightTreeUploaded() {
         // updated inputs and the worker will overwrite the inactive
         // slot's host-side tree -- that's fine.
         light_tree_builder_->SubmitInputs(std::move(inputs));
-        LOG_INFO("[light_tree] first-frame sync build -- {} lights, {} nodes",
+        light_tree_force_sync_ = false;
+        LOG_INFO("[light_tree] sync build -- {} lights, {} nodes",
                  sync_tree.light_count,
                  static_cast<std::uint32_t>(sync_tree.nodes.size()));
         // Don't return: still drop through to the TryAcquireResult /
@@ -5900,7 +6061,7 @@ void Engine::RegisterCameraBookmarkCommands() {
     const auto fmt_cam_state = [](const pt::renderer::Camera& c) -> std::string {
         constexpr float kRadToDeg = 57.29577951308232f;
         return fmt::format("{:.6f} {:.6f} {:.6f} {:.4f} {:.4f} {:.3f}",
-                           c.pos.x, c.pos.y, c.pos.z,
+                           c.pos_w.x, c.pos_w.y, c.pos_w.z,
                            c.yaw   * kRadToDeg,
                            c.pitch * kRadToDeg,
                            c.fov_deg);
@@ -5908,9 +6069,10 @@ void Engine::RegisterCameraBookmarkCommands() {
     const auto parse_cam_state = [](std::string_view s, pt::renderer::Camera& out) -> bool {
         constexpr float kDegToRad = 0.017453292519943295f;
         std::istringstream iss{std::string(s)};
-        float x, y, z, yaw_d, pitch_d, fov_d;
+        double x, y, z;
+        float yaw_d, pitch_d, fov_d;
         if (!(iss >> x >> y >> z >> yaw_d >> pitch_d >> fov_d)) return false;
-        out.pos     = glm::vec3(x, y, z);
+        out.pos_w   = glm::dvec3(x, y, z);
         out.yaw     = yaw_d   * kDegToRad;
         out.pitch   = pitch_d * kDegToRad;
         out.fov_deg = fov_d;
@@ -5986,7 +6148,7 @@ void Engine::RegisterCameraBookmarkCommands() {
                                name, it->second);
                 return;
             }
-            prev_view_proj_valid_ = false;  // active denoiser reset_history (SVGF/NRD/MetalFX/OptiX-temporal)
+            prev_frame_valid_ = false;  // active denoiser reset_history (SVGF/NRD/MetalFX/OptiX-temporal)
             out.FormatLine("cam_load_named: '{}' = {}", name, it->second);
         });
 
@@ -6076,8 +6238,127 @@ void Engine::PrewarmPipelines() {
     warm("clouds_composite");
 }
 
+
+// Planetary P1 (#255). Recompute the render frame's anchor for this
+// frame. MUST run before any Ensure*Uploaded pack and before the PtPush
+// fill -- see the call site at the top of RenderFrame.
+void Engine::UpdateWorldFrame() {
+    // ========================================================================
+    // PLANETARY P1 (#255) -- THE CONVERSION BOUNDARY
+    // ========================================================================
+    // Canonical world position lives on the host in glm::dvec3. The GPU
+    // only ever sees float32 positions relative to `world_frame_.anchor`.
+    // The functions below are the COMPLETE, CLOSED list of places allowed
+    // to cross that line by calling world_frame_.ToRender() (or, for a
+    // host-side geometric query that must agree with what the GPU drew,
+    // RenderFrameCamera()). If you find yourself adding a conversion
+    // anywhere else, the position you are converting probably wants to be
+    // canonical all the way to one of these instead.
+    //
+    //   pack -> GPU buffer
+    //     Engine::EnsurePrimitivesUploaded    analytic prim centres, plane
+    //                                         offsets, prev centres, and the
+    //                                         AnalyticBvh centroids/AABBs
+    //     Engine::EnsureSdfPrimsUploaded      cluster AABBs + node centres
+    //     Engine::EnsureLightsUploaded        light positions
+    //     Engine::EnsureLightTreeUploaded     the tree's snapshot inputs
+    //     Engine::RebuildMeshResources        the mesh TLAS instance transform
+    //     Engine::EnsureSmokeEmittersUploaded emitter bases
+    //     Engine::EnsureSmokeSphUploaded      SPH particle positions
+    //     the particle-composite pack         billboard positions
+    //     the editor-overlay segment pack     gizmo segment endpoints
+    //
+    //   fill -> push constant
+    //     PtPush::pos_fovtan                  the eye
+    //     PtPush::curr_view_proj / prev_view_proj (via `view` below)
+    //     PtPush::planet_center_radius        the reference sphere's centre
+    //     PtPush::mesh_motion_prev / _curr    the mesh's placement
+    //     PtPush::clouds_p1.xy                 the cloud slab's two Y planes
+    //     HeightFogPush::fog_params.y          the fog base altitude
+    //     RestirTemporalPush::anchor_delta    last frame's anchor, minus this
+    //     EditorOverlayPush::pos_fovtan       the eye, again
+    //
+    // The nine per-pass `memcpy(x.pos_fovtan, push.pos_fovtan, ...)` sites
+    // inherit the conversion from the single PtPush source and need no
+    // change -- a good sign the boundary is in the right place. So do
+    // EditorOverlay's ProjectToScreen / ClosestPointOnLineToRay /
+    // ScreenToWorldRay, which are fixed for free.
+    //
+    // The anchor is refreshed HERE, at the top of the frame, before any
+    // pack runs, as a pure function of the camera position. Nothing may
+    // move it again mid-frame -- a pack that ran against a different
+    // anchor than the push constants would put half the scene in the
+    // wrong frame.
+    // ========================================================================
+    {
+        // Read as a float because it is a THRESHOLD, not a coordinate:
+        // it decides which side of the gate the camera is on and never
+        // enters the render frame, so its own quantisation (1 m at 1e7)
+        // cannot reach a pixel.
+        double rebase_radius = 65536.0;
+        if (auto* v = pt::console::Console::Get().FindCVar("r_origin_rebase_radius")) {
+            rebase_radius = static_cast<double>(v->GetFloat());
+        }
+        // scale_m = 0 pins the lattice to its 1024 m floor; see
+        // pt::core::ComputeAnchor for why P1 does not derive it from
+        // altitude yet.
+        const glm::dvec3 next_anchor =
+            pt::core::ComputeAnchor(camera_->pos_w, rebase_radius, 0.0);
+        world_frame_.anchor_prev = world_frame_.anchor;
+        world_frame_.anchor      = next_anchor;
+        if (world_frame_.AnchorMoved()) {
+            // Every packed GPU buffer holds render-frame floats, so all of
+            // them are stale in exactly the same way: by the anchor delta.
+            // Re-pack rather than patch -- the packs are cheap, they run
+            // at most once per lattice step of camera travel, and a repack
+            // is the only thing that keeps the AnalyticBvh / light-tree
+            // AABBs (which are float32 and rebuilt, not shifted) honest.
+            //
+            // Note what is NOT invalidated: temporal history. Motion
+            // vectors are rebuilt from the f64 previous pose in the
+            // CURRENT anchor a few hundred lines below, so they stay
+            // continuous across this event by construction, and the
+            // ReSTIR reservoirs are shifted in place by the exact anchor
+            // delta. A rebase is not a teleport.
+            primitives_dirty_       = true;
+            sdf_prims_dirty_        = true;
+            light_prims_dirty_      = true;
+            light_tree_force_sync_  = true;
+            accum_dirty_            = true;
+            // The mesh needs nothing here: its placement is recomputed
+            // from mesh_curr_translation_ minus the anchor in the
+            // PtPush fill every frame, and its BLAS never moves. See
+            // RebuildMeshResources for why the anchor is not in the
+            // TLAS instance transform.
+            // The smoke emitters, the SPH particles, the ocean surface
+            // and the particle billboards have no dirty flag -- they
+            // re-upload unconditionally every frame, so they land in the
+            // new anchor on their own.
+            LOG_INFO("[worldframe] rebased anchor ({:.1f}, {:.1f}, {:.1f}) -> "
+                     "({:.1f}, {:.1f}, {:.1f}); delta ({:.1f}, {:.1f}, {:.1f}) m "
+                     "is exact in float32",
+                     world_frame_.anchor_prev.x, world_frame_.anchor_prev.y,
+                     world_frame_.anchor_prev.z,
+                     world_frame_.anchor.x, world_frame_.anchor.y,
+                     world_frame_.anchor.z,
+                     world_frame_.anchor_prev.x - world_frame_.anchor.x,
+                     world_frame_.anchor_prev.y - world_frame_.anchor.y,
+                     world_frame_.anchor_prev.z - world_frame_.anchor.z);
+        }
+    }
+    // --- end conversion boundary preamble -----------------------------------
+}
+
 void Engine::RenderFrame() {
     PT_ZONE_SCOPED_N("Engine::RenderFrame");
+    // The render frame is refreshed FIRST, before EnsureMeshUpdated and
+    // the Ensure*Uploaded packs below, because every one of them writes
+    // render-frame floats. Refreshing it afterwards would leave a rebase
+    // frame with its buffers packed in the old anchor and its push
+    // constants filled in the new one -- half the scene in the wrong
+    // frame for exactly one frame, which at 32 accumulated frames is
+    // still 22% of the image.
+    if (camera_) UpdateWorldFrame();
     // Pipelines may still be building on the Vulkan backend's async
     // worker; re-resolve cached ids each frame until each flips
     // non-zero. Once all are cached the resolves are no-ops.
@@ -6217,7 +6498,7 @@ void Engine::RenderFrame() {
         // and force a history reset on the next allocation.
         denoiser_active_      = want_denoiser;
         denoiser_kind_        = want_kind;
-        prev_view_proj_valid_ = false;
+        prev_frame_valid_ = false;
         // One-time log on transitions so the user sees which path
         // they're on (especially for the nrd-as-svgf-placeholder case).
         if (want_kind == DenoiserKind::Nrd) {
@@ -6335,11 +6616,13 @@ void Engine::RenderFrame() {
         fc = device_->BeginFrame();
     }
 
-    // Camera-movement detection -> reset accumulation.
     auto& cam = *camera_;
-    bool cam_moved = (cam.pos.x != last_cam_pos_[0]) ||
-                     (cam.pos.y != last_cam_pos_[1]) ||
-                     (cam.pos.z != last_cam_pos_[2]) ||
+
+    // Camera-movement detection -> reset accumulation. Compared in f64:
+    // at ECEF radius a float32 comparison cannot see a frame of walking.
+    bool cam_moved = (cam.pos_w.x != last_cam_pos_.x) ||
+                     (cam.pos_w.y != last_cam_pos_.y) ||
+                     (cam.pos_w.z != last_cam_pos_.z) ||
                      (cam.yaw   != last_cam_yaw_)    ||
                      (cam.pitch != last_cam_pitch_)  ||
                      (cam.fov_deg != last_cam_fov_);
@@ -6352,26 +6635,41 @@ void Engine::RenderFrame() {
     // inside is black. Without this auto-detection, post-teleport
     // frames blend with the pre-teleport temporal history, visibly
     // bleeding stale color forward (the v0.3.4 inside-sphere
-    // symptom). prev_view_proj_valid_ already gets cleared on
+    // symptom). prev_frame_valid_ already gets cleared on
     // backend toggle / denoiser kind switch / first frame, so the
     // check is naturally a no-op on those paths. Only fires when the
     // engine's *been* rendering normally and the camera then jumps.
-    if (prev_view_proj_valid_) {
-        const float dx = cam.pos.x - last_cam_pos_[0];
-        const float dy = cam.pos.y - last_cam_pos_[1];
-        const float dz = cam.pos.z - last_cam_pos_[2];
-        const float dist2 = dx * dx + dy * dy + dz * dz;
-        float thresh = 5.0f;
+    //
+    // Planetary P1 (#255): computed in f64, and the threshold is now
+    // VELOCITY-RELATIVE. A fixed 5 m gate is a sensible "the user typed
+    // a coordinate" detector at walking pace and complete nonsense in
+    // flight -- at 400 km orbital velocity the camera legitimately moves
+    // 128 m every frame, which would trip the gate on every single frame
+    // and leave the denoiser permanently reset. Comparing against
+    // 4x last frame's actual step keeps the original meaning ("this jump
+    // is far bigger than how this camera has been moving") at any speed,
+    // and collapses to exactly the old 5 m constant whenever the camera
+    // is moving slower than 1.25 m/frame -- which is every golden
+    // fixture, all of which hold the camera still.
+    if (prev_frame_valid_) {
+        const glm::dvec3 step = cam.pos_w - last_cam_pos_;
+        const double dist2 = glm::dot(step, step);
+        double thresh = 5.0;
         if (auto* v = pt::console::Console::Get().FindCVar("cam_teleport_threshold")) {
-            thresh = v->GetFloat();
+            thresh = static_cast<double>(v->GetFloat());
         }
-        if (thresh > 0.0f && dist2 > thresh * thresh) {
-            prev_view_proj_valid_ = false;
-            LOG_INFO("engine: camera teleport detected ({:.2f}u > threshold {:.2f}u); "
-                     "firing denoiser reset_history", std::sqrt(dist2), thresh);
+        const double effective = std::max(thresh, last_cam_step_m_ * 4.0);
+        if (thresh > 0.0 && dist2 > effective * effective) {
+            prev_frame_valid_ = false;
+            LOG_INFO("engine: camera teleport detected ({:.2f}u > threshold {:.2f}u, "
+                     "base {:.2f}u); firing denoiser reset_history",
+                     std::sqrt(dist2), effective, thresh);
         }
+        last_cam_step_m_ = std::sqrt(dist2);
+    } else {
+        last_cam_step_m_ = 0.0;
     }
-    last_cam_pos_[0] = cam.pos.x; last_cam_pos_[1] = cam.pos.y; last_cam_pos_[2] = cam.pos.z;
+    last_cam_pos_   = cam.pos_w;
     last_cam_yaw_   = cam.yaw;   last_cam_pitch_  = cam.pitch;  last_cam_fov_  = cam.fov_deg;
 
     // Lazily (re)create the HDR accumulation texture; reallocate if the
@@ -6828,7 +7126,7 @@ void Engine::RenderFrame() {
                 specular_hit_distance_tex_id_ = 0;
             }
         }
-        prev_view_proj_valid_ = false;        // history is invalid after resize
+        prev_frame_valid_ = false;        // history is invalid after resize
         if (denoise_color_tex_id_ == 0) {
             LOG_ERROR("denoise_color allocation failed at {}x{}", fc.width, fc.height);
             // Both paths need denoise_color, so fall back to the
@@ -7263,9 +7561,26 @@ void Engine::RenderFrame() {
     // to reproject hit world positions into both current and previous
     // screen space (motion vectors). Identity prev_view_proj on the
     // first frame yields zero motion, which the denoiser tolerates.
-    glm::mat4 view = glm::lookAtRH(cam.pos, cam.pos + fwd, glm::vec3(0,1,0));
-    glm::mat4 proj = glm::perspectiveRH_ZO(glm::radians(cam.fov_deg), aspect, 0.05f, 500.0f);
-    glm::mat4 curr_view_proj = proj * view;
+    //
+    // CONVERSION BOUNDARY (#255). `view` is built on the RENDER-frame
+    // eye, not the canonical one. lookAtRH's translation column is
+    // -R*eye, and the shader multiplies these matrices against
+    // anchor-relative hit positions -- so feeding it a 6.4e6-magnitude
+    // eye would compute view-space position as a difference of two
+    // ~6.4e6 float32 quantities and hand the denoiser ~0.5 m of noise,
+    // i.e. hundreds of pixels of motion-vector jitter at close range.
+    // That bug fires before any rebase does. With the anchor at zero
+    // cam_rel is exactly cam.pos_w narrowed, so this is bit-identical
+    // to the pre-#255 matrix.
+    const glm::vec3 cam_rel = world_frame_.ToRender(cam.pos_w);
+    // One call, three matrices: the product for the shader's motion
+    // vectors, and its two factors for MetalFX (which is handed
+    // worldToView and viewToClip separately, see the DenoiseDesc fill).
+    const pt::renderer::CameraMatrices cam_m =
+        pt::renderer::BuildCameraMatrices(cam_rel, fwd, cam.fov_deg, aspect);
+    const glm::mat4& view = cam_m.view;
+    const glm::mat4& proj = cam_m.proj;
+    glm::mat4 curr_view_proj = cam_m.view_proj;
 
     struct PtPush {
         float pos_fovtan[4];
@@ -7863,8 +8178,11 @@ void Engine::RenderFrame() {
         float planet_center_radius[4];
         // --- end Planetary P0 --------------------------------------------
     } push{};
-    push.pos_fovtan[0] = cam.pos.x; push.pos_fovtan[1] = cam.pos.y;
-    push.pos_fovtan[2] = cam.pos.z; push.pos_fovtan[3] = cam.FovYTan();
+    // CONVERSION BOUNDARY (#255). The single source for the eye position
+    // every shader sees; the nine per-pass memcpy(x.pos_fovtan, ...)
+    // sites downstream inherit it unchanged.
+    push.pos_fovtan[0] = cam_rel.x; push.pos_fovtan[1] = cam_rel.y;
+    push.pos_fovtan[2] = cam_rel.z; push.pos_fovtan[3] = cam.FovYTan();
     push.fwd_aspect[0] = fwd.x; push.fwd_aspect[1] = fwd.y;
     push.fwd_aspect[2] = fwd.z; push.fwd_aspect[3] = aspect;
     push.right_xyz[0]  = right.x; push.right_xyz[1] = right.y;
@@ -8299,7 +8617,32 @@ void Engine::RenderFrame() {
     last_jitter_y_ = push.halton_jitter[1];
 
     // pad3 already 0.0f from value-init
-    const glm::mat4 prev_vp = prev_view_proj_valid_ ? prev_view_proj_ : curr_view_proj;
+    //
+    // Planetary P1 (#255): REBUILD the previous view-projection in THIS
+    // frame's anchor from the cached f64 pose, instead of reusing a
+    // matrix that was built in last frame's anchor. Both matrices and
+    // the shader's `hit_world` then live in a single frame, which is the
+    // entire reason a rebase does not smear: a motion vector is a
+    // screen-space quantity and screen space does not care where the
+    // world origin is, provided both endpoints share one frame. Because
+    // the lattice is a power of two, `prev_cam_pos_w_ - anchor` is
+    // exactly representable, so the reconstruction is exact and no
+    // history reset is required.
+    //
+    // When the anchor has not moved this reproduces the previously
+    // cached matrix bit-for-bit: the pose fields are copies of the exact
+    // inputs last frame's lookAtRH / perspectiveRH_ZO saw, and the same
+    // two calls in the same order on the same inputs give the same
+    // floats. That is what keeps every golden unchanged.
+    glm::mat4 prev_vp = curr_view_proj;
+    if (prev_frame_valid_) {
+        // The previous pose, expressed in THIS frame's anchor. Same
+        // out-of-line body the current matrices came from, so with an
+        // unmoved anchor this reproduces last frame's matrix bit for bit.
+        prev_vp = pt::renderer::BuildCameraMatrices(
+            world_frame_.ToRender(prev_cam_pos_w_), prev_cam_fwd_,
+            prev_cam_fov_deg_, prev_cam_aspect_).view_proj;
+    }
     std::memcpy(push.curr_view_proj, glm::value_ptr(curr_view_proj), sizeof(push.curr_view_proj));
     std::memcpy(push.prev_view_proj, glm::value_ptr(prev_vp),        sizeof(push.prev_view_proj));
 
@@ -8557,10 +8900,20 @@ void Engine::RenderFrame() {
         // degenerates to the planar frame regardless of the cvar.
         spherical_frame = spherical_frame && planet_radius_m > 0.0f;
         const double planet_R_d = static_cast<double>(planet_radius_m);
-        push.planet_center_radius[0] = 0.0f;
-        push.planet_center_radius[1] =
-            spherical_frame ? static_cast<float>(-planet_R_d) : 0.0f;
-        push.planet_center_radius[2] = 0.0f;
+        // CONVERSION BOUNDARY (#255). The centre is a canonical world
+        // position -- (0, -R, 0), i.e. directly below the world origin so
+        // the engine's y = 0 ground plane is tangent to the sphere there.
+        // Shader positions are anchor-relative, so the centre has to be
+        // too: P0's own note here said the two "move in lockstep" and that
+        // pushing a camera-relative centre against world-space positions
+        // would be a bug. This is the lockstep. With the anchor at zero
+        // the expression collapses to the pre-#255 constants exactly.
+        const glm::vec3 planet_c_rel = spherical_frame
+            ? world_frame_.ToRender(glm::dvec3(0.0, -planet_R_d, 0.0))
+            : glm::vec3(0.0f);
+        push.planet_center_radius[0] = planet_c_rel.x;
+        push.planet_center_radius[1] = planet_c_rel.y;
+        push.planet_center_radius[2] = planet_c_rel.z;
         push.planet_center_radius[3] =
             spherical_frame ? static_cast<float>(planet_R_d) : 0.0f;
 
@@ -8935,8 +9288,14 @@ void Engine::RenderFrame() {
         constexpr std::uint64_t kCloudPeriodFrames = 86400ull * 60ull;
         const float t_seconds = float(frame_index_ % kCloudPeriodFrames)
                               * (1.0f / 60.0f);
-        push.clouds_p1[0] = base_y;
-        push.clouds_p1[1] = top_y;
+        // CONVERSION BOUNDARY (#255). The cloud slab is a pair of
+        // world-space Y planes and the shader tests them against
+        // render-frame sample positions, so both edges come off the
+        // anchor. The cvars stay in canonical metres -- real meteorology
+        // (cumulus at 200-500 m) is a statement about height above the
+        // ground, not about the renderer's frame. Identity at anchor 0.
+        push.clouds_p1[0] = static_cast<float>(double(base_y) - world_frame_.anchor.y);
+        push.clouds_p1[1] = static_cast<float>(double(top_y)  - world_frame_.anchor.y);
         push.clouds_p1[2] = clouds_on ? coverage : 0.0f;
         push.clouds_p1[3] = clouds_on ? density  : 0.0f;
         push.clouds_p2[0] = wind_x;
@@ -9162,15 +9521,35 @@ void Engine::RenderFrame() {
         // mesh is rendered every frame at curr) prev == curr but
         // translated is true -- we still need the shift to render
         // the mesh at curr instead of at the baked origin.
+        // CONVERSION BOUNDARY (#255). These two lanes ARE the mesh's
+        // placement in the render frame, so the anchor comes off here --
+        // once, for every path. The shader forms
+        // `mesh_shift = lerp(prev, curr, t01)` and subtracts it from the
+        // ray origin before both the hardware ray query and the
+        // software-BVH fallback, so a single host-side subtraction puts
+        // the ray, the bake-frame BLAS and the render frame all in
+        // agreement with no shader change at all.
+        //
+        // The anchor deliberately does NOT go in the TLAS instance
+        // transform -- see the long note in RebuildMeshResources for
+        // why splitting it across the two is measurably wrong while the
+        // CSG bake is still world-space.
+        //
+        // `anchored` joins the gate because a non-zero anchor makes the
+        // shift load-bearing even for a mesh that has never been moved.
+        // With the anchor at zero all three terms are the pre-#255
+        // values and the packed floats are bit-identical.
+        const glm::dvec3 anchor = world_frame_.anchor;
+        const bool anchored = !world_frame_.AtOrigin();
         const bool active =
-            (motion_blur_active_for_mesh && moved) || translated;
-        push.mesh_motion_prev[0] = mesh_prev_translation_[0];
-        push.mesh_motion_prev[1] = mesh_prev_translation_[1];
-        push.mesh_motion_prev[2] = mesh_prev_translation_[2];
+            (motion_blur_active_for_mesh && moved) || translated || anchored;
+        push.mesh_motion_prev[0] = static_cast<float>(mesh_prev_translation_[0] - anchor.x);
+        push.mesh_motion_prev[1] = static_cast<float>(mesh_prev_translation_[1] - anchor.y);
+        push.mesh_motion_prev[2] = static_cast<float>(mesh_prev_translation_[2] - anchor.z);
         push.mesh_motion_prev[3] = active ? 1.0f : 0.0f;
-        push.mesh_motion_curr[0] = mesh_curr_translation_[0];
-        push.mesh_motion_curr[1] = mesh_curr_translation_[1];
-        push.mesh_motion_curr[2] = mesh_curr_translation_[2];
+        push.mesh_motion_curr[0] = static_cast<float>(mesh_curr_translation_[0] - anchor.x);
+        push.mesh_motion_curr[1] = static_cast<float>(mesh_curr_translation_[1] - anchor.y);
+        push.mesh_motion_curr[2] = static_cast<float>(mesh_curr_translation_[2] - anchor.z);
         push.mesh_motion_curr[3] = 0.0f;
     }
     // --- end Mesh motion blur ----------------------------------------------
@@ -9351,10 +9730,15 @@ void Engine::RenderFrame() {
             const float    qw = p.orient[3];
             const glm::vec3 n =
                 n_raw + 2.0f * glm::cross(u, glm::cross(u, n_raw) + qw * n_raw);
-            const float d  = p.radius_or_d;
-            const float signed_dist =
-                n.x * cam.pos.x + n.y * cam.pos.y + n.z * cam.pos.z + d;
-            if (signed_dist <= 0.0f) { cam_in_water = true; break; }
+            // Evaluated in f64 against the canonical plane (#255): at
+            // ECEF altitude `d` is -6.4e6 and dot(n, cam) is +6.4e6, so
+            // the float32 form was a textbook cancellation deciding a
+            // boolean. The half-space test itself is unchanged.
+            const double d  = p.radius_or_d;
+            const double signed_dist =
+                double(n.x) * cam.pos_w.x + double(n.y) * cam.pos_w.y +
+                double(n.z) * cam.pos_w.z + d;
+            if (signed_dist <= 0.0) { cam_in_water = true; break; }
         }
         float deep_r = 0.0f, deep_g = 0.0f, deep_b = 0.0f;
         if (auto* v = C.FindCVar("r_water_deep_color_r")) deep_r = v->GetFloat();
@@ -10034,9 +10418,46 @@ void Engine::RenderFrame() {
                 std::uint32_t restir_enabled;
                 std::uint32_t temporal_enabled;
                 std::uint32_t _pad0;
+                // Planetary P1 (#255). anchor_prev - anchor, EXACTLY
+                // representable in float32 because the lattice is a
+                // power of two. Reservoir::light_pos is the only
+                // frame-dependent field a reservoir carries (light_n,
+                // dist, Le, p_hat, w_sum, W, pdf_solid and M are all
+                // invariant), so one vector add at the prev-reservoir
+                // load is the complete rebase fix. Zero on every frame
+                // the anchor holds still, and bit-identical to what a
+                // non-rebased frame would have held when it does not --
+                // which is why the reservoirs are NOT cleared: at
+                // 1920x1080 that is ~127 MB per buffer and a visible
+                // noise pulse every lattice step of travel.
+                float anchor_delta[4];
             } rt{};
             static_assert(sizeof(RestirTemporalPush) % 16 == 0,
                           "RestirTemporalPush must be 16-byte aligned");
+            // VULKAN PUSH-SPLIT BOUNDARY -- READ BEFORE ADDING A FIELD.
+            // VulkanCommandBuffer::Dispatch splits any push larger than
+            // VulkanDevice::kPushSplitOffset (112 B): the first 112 bytes
+            // go through vkCmdPushConstants and the REMAINDER is copied
+            // into the Frame UBO at binding 14, where the shader is
+            // expected to pick it up from a matching `cbuffer Frame`
+            // block. RestirTemporal.slang declares no such block -- it
+            // has never needed one -- so a push that spills would lose
+            // its tail silently on Vulkan and nowhere else.
+            //
+            // #255's anchor_delta took this struct from 96 B to exactly
+            // 112 B, i.e. precisely full. `> kPushSplitOffset` is false
+            // at 112, so the whole thing still travels as a real push
+            // constant and Vulkan's own 128 B minimum guarantee covers
+            // it. The next field does not fit. If you need one, either
+            // add the Frame cbuffer to RestirTemporal.slang and mirror
+            // the split, or repack -- do not just let this assert be
+            // raised, because the failure mode on the far side is a
+            // silently zeroed field on one backend only.
+            static_assert(sizeof(RestirTemporalPush) <= 112,
+                          "RestirTemporalPush exceeds VulkanDevice::"
+                          "kPushSplitOffset (112 B) -- the tail would "
+                          "spill into a Frame UBO that RestirTemporal."
+                          "slang does not declare");
             rt.width            = fc.width;
             rt.height           = fc.height;
             rt.frame_index      = push.frame_index;
@@ -10049,6 +10470,13 @@ void Engine::RenderFrame() {
             rt.restir_enabled   = 1u;
             rt.temporal_enabled = temporal_on;
             rt._pad0            = 0u;
+            {
+                const glm::vec3 ad = world_frame_.AnchorDelta();
+                rt.anchor_delta[0] = ad.x;
+                rt.anchor_delta[1] = ad.y;
+                rt.anchor_delta[2] = ad.z;
+                rt.anchor_delta[3] = 0.0f;
+            }
             cb->PushConstants(&rt, sizeof(rt));
             cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
 
@@ -10375,7 +10803,7 @@ void Engine::RenderFrame() {
         dd.exposure_state  = pt::rhi::BufferHandle{exposure_state_id_};
         dd.jitter_x      = last_jitter_x_;
         dd.jitter_y      = last_jitter_y_;
-        dd.reset_history = !prev_view_proj_valid_;
+        dd.reset_history = !prev_frame_valid_;
         // Map the engine's denoiser kind to the RHI quality tier. Nrd
         // and the various Atrous variants all run the full a-trous
         // chain; only SvgfBasic / SvgfBasicMetalFx skip the spatial
@@ -11127,7 +11555,11 @@ void Engine::RenderFrame() {
             float fog_g = 0.6f;
             if (auto* v = C.FindCVar("r_fog_sun_anisotropy")) fog_g = v->GetFloat();
             fp.fog_params[0] = fog_density;
-            fp.fog_params[1] = fog_base_y;
+            // CONVERSION BOUNDARY (#255): r_fog_base_y is a world-space
+            // altitude and the shader measures ray height against it in
+            // the render frame. Identity at anchor 0.
+            fp.fog_params[1] =
+                static_cast<float>(double(fog_base_y) - world_frame_.anchor.y);
             fp.fog_params[2] = fog_scale_h;
             fp.fog_params[3] = fog_g;
             float fog_r = 0.55f, fog_gc = 0.62f, fog_b = 0.72f;
@@ -11439,11 +11871,18 @@ void Engine::RenderFrame() {
                 const glm::vec3 cam_fwd  = glm::vec3(push.fwd_aspect[0],
                                                     push.fwd_aspect[1],
                                                     push.fwd_aspect[2]);
+                // CONVERSION BOUNDARY (#255). ParticleSystem is another
+                // float32 near-origin subsystem; its billboards are
+                // shifted into the render frame here. `cam_pos` above was
+                // read back out of push.pos_fovtan, so it is ALREADY
+                // anchor-relative and the z_eye dot product below stays
+                // a difference of small numbers.
+                const glm::vec3 anchor_f = glm::vec3(world_frame_.anchor);
                 for (std::uint32_t i = 0; i < pcount; ++i) {
                     const auto& p = live[i];
-                    packed[i].pos_size[0] = p.pos.x;
-                    packed[i].pos_size[1] = p.pos.y;
-                    packed[i].pos_size[2] = p.pos.z;
+                    packed[i].pos_size[0] = p.pos.x - anchor_f.x;
+                    packed[i].pos_size[1] = p.pos.y - anchor_f.y;
+                    packed[i].pos_size[2] = p.pos.z - anchor_f.z;
                     packed[i].pos_size[3] = p.size;
                     packed[i].color_alpha[0] = p.color.r;
                     packed[i].color_alpha[1] = p.color.g;
@@ -11454,7 +11893,8 @@ void Engine::RenderFrame() {
                     packed[i].pad_zeye[2] = 0.0f;
                     // z_eye = dot(p.pos - cam_pos, cam_fwd). cam_fwd is
                     // already unit length (Camera::Forward()).
-                    packed[i].pad_zeye[3] = glm::dot(p.pos - cam_pos, cam_fwd);
+                    packed[i].pad_zeye[3] =
+                        glm::dot((p.pos - anchor_f) - cam_pos, cam_fwd);
                 }
                 device_->WriteBuffer(pt::rhi::BufferHandle{particles_storage_id_},
                                      packed,
@@ -11979,16 +12419,20 @@ void Engine::RenderFrame() {
         static_assert(sizeof(EditorOverlayPush) == 80,
                       "EditorOverlayPush must match shaders/EditorOverlay.slang");
 
-        const auto& C2 = *camera_;
+        // CONVERSION BOUNDARY (#255). The gizmo segments in
+        // editor_overlay_segs_buf_ were appended in the render frame
+        // (see BuildLightIcons / BuildSelectionGizmo), so the eye this
+        // pass raymarches from has to be too.
+        const pt::renderer::Camera C2 = RenderFrameCamera(*camera_, world_frame_);
         const glm::vec3 fwd_v   = C2.Forward();
         const glm::vec3 right_v = C2.Right();
         const glm::vec3 up_v    = C2.Up();
         const float aspect_ratio = (fc.height > 0)
                                       ? float(fc.width) / float(fc.height)
                                       : 1.0f;
-        ep.pos_fovtan[0] = C2.pos.x;
-        ep.pos_fovtan[1] = C2.pos.y;
-        ep.pos_fovtan[2] = C2.pos.z;
+        ep.pos_fovtan[0] = static_cast<float>(C2.pos_w.x);
+        ep.pos_fovtan[1] = static_cast<float>(C2.pos_w.y);
+        ep.pos_fovtan[2] = static_cast<float>(C2.pos_w.z);
         ep.pos_fovtan[3] = C2.FovYTan();
         ep.fwd_aspect[0] = fwd_v.x;
         ep.fwd_aspect[1] = fwd_v.y;
@@ -12244,8 +12688,16 @@ void Engine::RenderFrame() {
         }
     }
 
-    prev_view_proj_       = curr_view_proj;
-    prev_view_proj_valid_ = true;
+    // Cache the POSE, not the matrix (#255). These are the exact inputs
+    // the `view` / `proj` construction above consumed this frame, so
+    // next frame's reconstruction reproduces this frame's matrix
+    // bit-for-bit whenever the anchor holds still -- and reproduces the
+    // correct matrix in the NEW anchor when it does not.
+    prev_cam_pos_w_   = cam.pos_w;
+    prev_cam_fwd_     = fwd;
+    prev_cam_fov_deg_ = cam.fov_deg;
+    prev_cam_aspect_  = aspect;
+    prev_frame_valid_ = true;
 
     // Auto-exposure was a per-frame CPU readback of accum_hdr,
     // which on dGPU stalls the GPU queue (vkQueueWaitIdle every 8
@@ -12278,10 +12730,10 @@ void Engine::UpdateCamera(double dt) {
         // Smoothstep s = 3t^2 - 2t^3.
         const float t = static_cast<float>(tf);
         const float s = t * t * (3.0f - 2.0f * t);
-        camera_->pos = glm::vec3(
-            cam_tween_start_pos_[0] + (cam_tween_target_pos_[0] - cam_tween_start_pos_[0]) * s,
-            cam_tween_start_pos_[1] + (cam_tween_target_pos_[1] - cam_tween_start_pos_[1]) * s,
-            cam_tween_start_pos_[2] + (cam_tween_target_pos_[2] - cam_tween_start_pos_[2]) * s);
+        camera_->pos_w = glm::dvec3(
+            cam_tween_start_pos_[0] + (cam_tween_target_pos_[0] - cam_tween_start_pos_[0]) * double(s),
+            cam_tween_start_pos_[1] + (cam_tween_target_pos_[1] - cam_tween_start_pos_[1]) * double(s),
+            cam_tween_start_pos_[2] + (cam_tween_target_pos_[2] - cam_tween_start_pos_[2]) * double(s));
         camera_->yaw   = cam_tween_start_yaw_   + (cam_tween_target_yaw_   - cam_tween_start_yaw_)   * s;
         camera_->pitch = cam_tween_start_pitch_ + (cam_tween_target_pitch_ - cam_tween_start_pitch_) * s;
         camera_->ClampPitch();
@@ -12382,7 +12834,10 @@ void Engine::UpdateCamera(double dt) {
     if (window_->IsKeyDown(32))  wm += glm::vec3(0,1,0);  // Space
     if (window_->IsKeyDown(341)) wm -= glm::vec3(0,1,0);  // L Ctrl
     if (glm::dot(wm, wm) > 0.0f) {
-        camera_->pos += glm::normalize(wm) * (speed * static_cast<float>(dt));
+        // #255: accumulate in f64. This is THE integration of absolute
+        // position -- at ECEF radius a float32 `+=` of a walking step is
+        // entirely below one ULP and the camera simply stops moving.
+        camera_->pos_w += glm::dvec3(glm::normalize(wm)) * (double(speed) * dt);
         // WASD input takes manual control -- abort any in-flight tween.
         cam_tween_active_ = false;
     }
@@ -12396,7 +12851,7 @@ void Engine::UpdateCamera(double dt) {
     if (pad.connected && (pad.left_x != 0.0f || pad.left_y != 0.0f)) {
         glm::vec3 pad_move = right * pad.left_x + fwd * pad.left_y;
         // Don't re-normalise -- stick magnitude IS the intent.
-        camera_->pos += pad_move * (speed * static_cast<float>(dt));
+        camera_->pos_w += glm::dvec3(pad_move) * (double(speed) * dt);
     }
 
     // Gamepad look: right stick maps to (yaw, pitch). Sign convention
@@ -12701,7 +13156,12 @@ void Engine::HandleMouseInput() {
     const glm::vec3 fwd   = camera_->Forward();
     const glm::vec3 right = camera_->Right();
     const glm::vec3 up    = camera_->Up();
-    const glm::vec3 ro    = camera_->pos;
+    // CONVERSION BOUNDARY (#255). Picking runs entirely in the render
+    // frame so it agrees with the pixels the user actually clicked;
+    // every prim / light position below is narrowed the same way, and
+    // anything written back to the scene goes through ToWorld().
+    const pt::renderer::Camera cam_r = RenderFrameCamera(*camera_, world_frame_);
+    const glm::vec3 ro    = glm::vec3(cam_r.pos_w);
     const glm::vec3 rd    = glm::normalize(
         fwd + right * (u * aspect * tan_half_fov) + up * (v * tan_half_fov));
 
@@ -12743,14 +13203,17 @@ void Engine::HandleMouseInput() {
                             // ungrabbable after the first rotation.
                             const glm::vec3 n = QuatRotateXyzw(
                                 p.orient,
-                                glm::vec3{p.pos_or_n[0], p.pos_or_n[1], p.pos_or_n[2]});
-                            gizmo_origin = n * (-p.radius_or_d);
+                                glm::vec3(WorldPos(p.pos_or_n)));
+                            gizmo_origin = n * static_cast<float>(
+                                -(p.radius_or_d +
+                                  glm::dot(glm::dvec3(n), world_frame_.anchor)));
                             gizmo_size = 1.5f;
                             can_hit_gizmo = true;
                         }
                     } else {
-                        gizmo_origin = glm::vec3{p.pos_or_n[0], p.pos_or_n[1], p.pos_or_n[2]};
-                        gizmo_size = std::max(0.5f, p.radius_or_d * 1.5f);
+                        gizmo_origin = world_frame_.ToRender(WorldPos(p.pos_or_n));
+                        gizmo_size = std::max(
+                            0.5f, static_cast<float>(p.radius_or_d) * 1.5f);
                         can_hit_gizmo = true;
                     }
                 }
@@ -12761,7 +13224,7 @@ void Engine::HandleMouseInput() {
                     if (editor_gizmo_.GetMode() != pt::renderer::EditorOverlay::Mode::Scale ||
                         L.type == AnalyticLight::Sphere ||
                         L.type == AnalyticLight::Quad) {
-                        gizmo_origin = glm::vec3{L.pos[0], L.pos[1], L.pos[2]};
+                        gizmo_origin = world_frame_.ToRender(WorldPos(L.pos));
                         if (L.type == AnalyticLight::Sphere) {
                             gizmo_size = std::max(0.5f, L.radius * 1.5f);
                         } else if (L.type == AnalyticLight::Quad) {
@@ -12782,7 +13245,7 @@ void Engine::HandleMouseInput() {
             const float hit_aspect = (hit_h > 0) ? float(hit_w) / float(hit_h) : aspect;
             if (can_hit_gizmo &&
                 editor_gizmo_.HitTest(gizmo_origin, gizmo_size,
-                                      *camera_, hit_aspect, hit_w, hit_h,
+                                      cam_r, hit_aspect, hit_w, hit_h,
                                       cx, cy, /*hit_radius_px=*/10.0f) !=
                     pt::renderer::EditorOverlay::Axis::None) {
                 return;
@@ -12802,7 +13265,7 @@ void Engine::HandleMouseInput() {
     for (const auto& [id, p] : primitives_) {
         float t = 0.0f;
         if (p.type == AnalyticPrim::Sphere) {
-            const glm::vec3 c{p.pos_or_n[0], p.pos_or_n[1], p.pos_or_n[2]};
+            const glm::vec3 c = world_frame_.ToRender(WorldPos(p.pos_or_n));
             const glm::vec3 oc = ro - c;
             const float bb = glm::dot(oc, rd);
             const float cc = glm::dot(oc, oc) - p.radius_or_d * p.radius_or_d;
@@ -12821,10 +13284,14 @@ void Engine::HandleMouseInput() {
             // here so clicking the RENDERED rotated plane selects it.
             const glm::vec3 n = QuatRotateXyzw(
                 p.orient,
-                glm::vec3{p.pos_or_n[0], p.pos_or_n[1], p.pos_or_n[2]});
+                glm::vec3(WorldPos(p.pos_or_n)));
             const float denom = glm::dot(n, rd);
             if (std::fabs(denom) < 1e-6f) continue;
-            const float th = -(glm::dot(n, ro) + p.radius_or_d) / denom;
+            // The plane's render-frame offset, same identity the pack
+            // uses: d_render = d + dot(n, anchor), taken in f64 (#255).
+            const float d_rel = static_cast<float>(
+                p.radius_or_d + glm::dot(glm::dvec3(n), world_frame_.anchor));
+            const float th = -(glm::dot(n, ro) + d_rel) / denom;
             if (th <= 1e-4f) continue;
             t = th;
         }
@@ -12851,7 +13318,7 @@ void Engine::HandleMouseInput() {
         constexpr float kPickAngularSize = 0.045f;
         constexpr float kMinPickRadius   = 0.12f;   // metres
         for (const auto& [id, L] : light_prims_) {
-            const glm::vec3 c{L.pos[0], L.pos[1], L.pos[2]};
+            const glm::vec3 c = world_frame_.ToRender(WorldPos(L.pos));
             const float dist = glm::length(c - ro);
             const float r_pick = std::max(kMinPickRadius, dist * kPickAngularSize);
             const glm::vec3 oc = ro - c;
@@ -12954,7 +13421,11 @@ void Engine::Tick(double dt) {
     // viewer correctly. No-op when audio_system_ is null or its
     // device init failed -- the AudioSystem guards itself.
     if (audio_system_ && camera_) {
-        audio_system_->Tick(camera_->pos, camera_->Forward());
+        // Audio is an emitter-local subsystem: voices are placed in the
+        // same float32 world the emitters were spawned in, so the
+        // listener is narrowed to match. Planetary-scale audio is out of
+        // scope for #255 (a voice 6.4e6 m away is inaudible anyway).
+        audio_system_->Tick(glm::vec3(camera_->pos_w), camera_->Forward());
     }
 
     // Golden-capture determinism: while the engine is still painting
@@ -13519,6 +13990,7 @@ namespace {
 // duplicating a parse-float lambda. The definition lives in the
 // later block below.
 bool ParseFloat(std::string_view s, float& out);
+bool ParseFloat(std::string_view s, double& out);   // #255 canonical coords
 }  // namespace
 
 void Engine::RegisterCommands() {
@@ -13545,7 +14017,7 @@ void Engine::RegisterCommands() {
     // engineering default (read-only, hardcoded inside cam_reset).
     // Slots 1..9 are user-savable, persisted across runs via the
     // cam_slot_N CVAR_ARCHIVE cvars registered above. cam_load and
-    // cam_reset both fire prev_view_proj_valid_ = false so the next
+    // cam_reset both fire prev_frame_valid_ = false so the next
     // frame's dd.reset_history clears the ACTIVE temporal denoiser's
     // history -- consumed by SVGF/NRD's temporal accumulation,
     // MetalFX's history-state reset, and the OptiX temporal
@@ -13562,7 +14034,7 @@ void Engine::RegisterCommands() {
     const auto fmt_cam_state = [](const pt::renderer::Camera& c) -> std::string {
         constexpr float kRadToDeg = 57.29577951308232f;
         return fmt::format("{:.6f} {:.6f} {:.6f} {:.4f} {:.4f} {:.3f}",
-                           c.pos.x, c.pos.y, c.pos.z,
+                           c.pos_w.x, c.pos_w.y, c.pos_w.z,
                            c.yaw   * kRadToDeg,
                            c.pitch * kRadToDeg,
                            c.fov_deg);
@@ -13570,9 +14042,10 @@ void Engine::RegisterCommands() {
     const auto parse_cam_state = [](std::string_view s, pt::renderer::Camera& out) -> bool {
         constexpr float kDegToRad = 0.017453292519943295f;
         std::istringstream iss{std::string(s)};
-        float x, y, z, yaw_d, pitch_d, fov_d;
+        double x, y, z;
+        float yaw_d, pitch_d, fov_d;
         if (!(iss >> x >> y >> z >> yaw_d >> pitch_d >> fov_d)) return false;
-        out.pos     = glm::vec3(x, y, z);
+        out.pos_w   = glm::dvec3(x, y, z);
         out.yaw     = yaw_d   * kDegToRad;
         out.pitch   = pitch_d * kDegToRad;
         out.fov_deg = fov_d;
@@ -13648,7 +14121,7 @@ void Engine::RegisterCommands() {
                                slot, v->value);
                 return;
             }
-            prev_view_proj_valid_ = false;  // active denoiser reset_history (SVGF/NRD/MetalFX/OptiX-temporal)
+            prev_frame_valid_ = false;  // active denoiser reset_history (SVGF/NRD/MetalFX/OptiX-temporal)
             out.FormatLine("cam_load: slot {} = {}", slot, v->value);
         });
 
@@ -13664,11 +14137,11 @@ void Engine::RegisterCommands() {
             // fov=60). NOT read from cam_pos / cam_yaw / etc. cvars
             // because those are CVAR_ARCHIVE -- they hold the user's
             // last-quit state, not the engine default.
-            camera_->pos     = glm::vec3(0.0f, 1.5f, 4.0f);
+            camera_->pos_w   = glm::dvec3(0.0, 1.5, 4.0);
             camera_->yaw     = 0.0f;
             camera_->pitch   = -0.20f;
             camera_->fov_deg = 60.0f;
-            prev_view_proj_valid_ = false;
+            prev_frame_valid_ = false;
             out.PrintLine("cam_reset: pos=(0, 1.5, 4) yaw=0 pitch=-11.46 fov=60");
         });
 
@@ -13727,11 +14200,11 @@ void Engine::RegisterCommands() {
                 pitch = std::asin(dir.y / len);
                 yaw   = std::atan2(dir.x, -dir.z);
             }
-            camera_->pos   = new_pos;
+            camera_->pos_w = glm::dvec3(new_pos);
             camera_->yaw   = yaw;
             camera_->pitch = pitch;
             camera_->ClampPitch();
-            prev_view_proj_valid_ = false;
+            prev_frame_valid_ = false;
             out.FormatLine("cam_focus: target=({:.3f}, {:.3f}, {:.3f}) "
                            "pos=({:.3f}, {:.3f}, {:.3f})",
                            tx, ty, tz, new_pos.x, new_pos.y, new_pos.z);
@@ -14874,7 +15347,10 @@ void Engine::RegisterCommands() {
             (void)args;
             if (!camera_) { out.PrintLine("no camera"); return; }
             const auto& cam = *camera_;
-            const glm::vec3 ro = cam.pos;
+            // Render frame (#255): the whole query is a set of
+            // differences against the eye, so it runs where those
+            // differences are small.
+            const glm::vec3 ro = world_frame_.ToRender(cam.pos_w);
             const glm::vec3 rd = cam.Forward();   // already unit length
 
             float best_t = 1e30f;
@@ -14882,10 +15358,11 @@ void Engine::RegisterCommands() {
                 float t = best_t;
                 if (p.type == AnalyticPrim::Sphere) {
                     // Standard ray-sphere intersection.
-                    glm::vec3 c{p.pos_or_n[0], p.pos_or_n[1], p.pos_or_n[2]};
+                    glm::vec3 c = world_frame_.ToRender(WorldPos(p.pos_or_n));
                     glm::vec3 oc = ro - c;
                     float b = glm::dot(oc, rd);
-                    float disc = b * b - (glm::dot(oc, oc) - p.radius_or_d * p.radius_or_d);
+                    const float pr = static_cast<float>(p.radius_or_d);
+                    float disc = b * b - (glm::dot(oc, oc) - pr * pr);
                     if (disc < 0.0f) continue;
                     float sq = std::sqrt(disc);
                     float t0 = -b - sq;
@@ -16184,7 +16661,7 @@ void Engine::RegisterCommands() {
                 out.FormatLine("audio_play: failed to load '{}'", path);
                 return;
             }
-            auto voice = audio_system_->PlaySound(sound, camera_->pos, 1.0f);
+            auto voice = audio_system_->PlaySound(sound, glm::vec3(camera_->pos_w), 1.0f);
             if (voice == pt::audio::kInvalidVoice) {
                 out.PrintLine("audio_play: voice pool full or play failed");
                 return;
@@ -16518,6 +16995,26 @@ bool ParseFloat(std::string_view s, float& out) {
     return true;
 }
 
+// Planetary P1 (#255): the same parser at double width, selected by
+// overload resolution wherever the destination is a canonical world
+// coordinate (a position, or a plane offset). Whole-string and
+// finite-only, exactly like the float form -- the ONLY difference is
+// that `prim_sphere 0 0 6371001.3 0 1` lands where the user asked
+// instead of 0.25 m away, because strtof would have quantised the
+// argument before the engine ever saw it. Radii, colours, angles,
+// intensities and direction components stay on the float overload:
+// they are scale-free.
+bool ParseFloat(std::string_view s, double& out) {
+    if (s.empty()) return false;
+    char* end = nullptr;
+    std::string buf(s);
+    double v = std::strtod(buf.c_str(), &end);
+    if (end != buf.c_str() + buf.size()) return false;
+    if (!std::isfinite(v)) return false;
+    out = v;
+    return true;
+}
+
 // Signed integer parser. Used by SDF Phase 2 (#98) `sdf_repeat_limited`
 // for the half-extent triple -- semantically a non-negative cell count
 // but accepting a signed type lets the host reject negative inputs at
@@ -16783,7 +17280,9 @@ void Engine::RegisterCsgCommands() {
                 out.PrintLine("usage: mesh_step <dx> <dy> <dz>");
                 return;
             }
-            float dx = 0.0f, dy = 0.0f, dz = 0.0f;
+            // Canonical world metres (#255): mesh_curr_translation_
+            // ACCUMULATES this, and it is the mesh's absolute placement.
+            double dx = 0.0, dy = 0.0, dz = 0.0;
             if (!ParseFloat(args[0], dx) ||
                 !ParseFloat(args[1], dy) ||
                 !ParseFloat(args[2], dz)) {
@@ -16943,7 +17442,8 @@ void Engine::RegisterPrimCommands() {
                 return;
             }
             std::uint32_t id;
-            float x, y, z, radius, r, g, b;
+            double x, y, z;                 // canonical world metres (#255)
+            float radius, r, g, b;
             float roughness = 0.0f, ior = 1.5f;
             if (!ParseUint(args[0], id) ||
                 !ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z) ||
@@ -16994,7 +17494,8 @@ void Engine::RegisterPrimCommands() {
                 return;
             }
             std::uint32_t id;
-            float nx, ny, nz, d, r, g, b;
+            float nx, ny, nz, r, g, b;
+            double d;                       // plane offset: absolute (#255)
             if (!ParseUint(args[0], id) ||
                 !ParseFloat(args[1], nx) || !ParseFloat(args[2], ny) || !ParseFloat(args[3], nz) ||
                 !ParseFloat(args[4], d) ||
@@ -17077,7 +17578,7 @@ void Engine::RegisterPrimCommands() {
             }
             std::uint32_t id; AnalyticPrim* p = nullptr;
             if (!find_prim(args[0], out, id, p)) return;
-            float x, y, z;
+            double x, y, z;                 // canonical world metres (#255)
             if (!ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z)) {
                 out.PrintLine("prim_set_pos: float parse failed");
                 return;
@@ -18005,11 +18506,11 @@ void Engine::RegisterEditorGizmoCommands() {
             // arbitrary -- just place the camera somewhere it can see
             // the plane normal end-on).
             float dist = (p.type == AnalyticPrim::Sphere)
-                       ? std::max(p.radius_or_d * 4.0f, 2.0f)
+                       ? std::max(static_cast<float>(p.radius_or_d) * 4.0f, 2.0f)
                        : 4.0f;
-            camera_->pos = glm::vec3(p.pos_or_n[0],
-                                     p.pos_or_n[1] + dist * 0.25f,
-                                     p.pos_or_n[2] + dist);
+            camera_->pos_w = glm::dvec3(p.pos_or_n[0],
+                                        p.pos_or_n[1] + double(dist) * 0.25,
+                                        p.pos_or_n[2] + double(dist));
             camera_->yaw      = 0.0f;
             camera_->pitch    = glm::radians(-15.0f);
             camera_->ClampPitch();
@@ -18036,7 +18537,7 @@ void Engine::RegisterEditorGizmoCommands() {
                 out.PrintLine("usage: cam_warp <x> <y> <z> [yaw_deg pitch_deg | look_at lx ly lz]");
                 return;
             }
-            float x, y, z;
+            double x, y, z;                 // canonical world metres (#255)
             if (!ParseFloat(args[0], x) || !ParseFloat(args[1], y) || !ParseFloat(args[2], z)) {
                 out.PrintLine("cam_warp: position parse failed");
                 return;
@@ -18074,7 +18575,7 @@ void Engine::RegisterEditorGizmoCommands() {
                     new_yaw   = std::atan2(dir.x, -dir.z);
                 }
             }
-            camera_->pos      = glm::vec3(x, y, z);
+            camera_->pos_w    = glm::dvec3(x, y, z);
             camera_->yaw      = new_yaw;
             camera_->pitch    = new_pitch;
             camera_->ClampPitch();
@@ -18145,9 +18646,9 @@ void Engine::RegisterEditorGizmoCommands() {
             // Stash start state. Lerp angles via shortest-path: if the
             // target yaw differs from start by more than pi, wrap it
             // around so the camera spins the short way.
-            cam_tween_start_pos_[0] = camera_->pos.x;
-            cam_tween_start_pos_[1] = camera_->pos.y;
-            cam_tween_start_pos_[2] = camera_->pos.z;
+            cam_tween_start_pos_[0] = camera_->pos_w.x;
+            cam_tween_start_pos_[1] = camera_->pos_w.y;
+            cam_tween_start_pos_[2] = camera_->pos_w.z;
             cam_tween_target_pos_[0] = x;
             cam_tween_target_pos_[1] = y;
             cam_tween_target_pos_[2] = z;
@@ -18317,11 +18818,15 @@ void Engine::AppendLightIconsForViewport() {
     constexpr float kIconAngularSize = 0.055f;   // tan(half-angle) ~3.1 deg
     constexpr float kMinIconSize     = 0.15f;    // metres
 
-    const glm::vec3 cam_pos = camera_->pos;
+    // CONVERSION BOUNDARY (#255). Every segment appended to
+    // editor_gizmo_ ends up in a GPU buffer, so the icons are built in
+    // the render frame -- as is the camera the angular sizing measures
+    // distance against.
+    const glm::vec3 cam_pos = world_frame_.ToRender(camera_->pos_w);
     std::uint32_t drawn = 0;
     for (const auto& [id, L] : light_prims_) {
         if (drawn >= max_icons) break;
-        const glm::vec3 o{L.pos[0], L.pos[1], L.pos[2]};
+        const glm::vec3 o = world_frame_.ToRender(WorldPos(L.pos));
         const float dist = glm::length(o - cam_pos);
         const float size = std::max(kMinIconSize, dist * kIconAngularSize);
         // Chromaticity = intensity normalised to its peak channel; a
@@ -18405,10 +18910,12 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
             // plane nearest the world origin).
             const glm::vec3 n = QuatRotateXyzw(
                 prim_it->second.orient,
-                glm::vec3{prim_it->second.pos_or_n[0],
-                          prim_it->second.pos_or_n[1],
-                          prim_it->second.pos_or_n[2]});
-            const float d = prim_it->second.radius_or_d;
+                glm::vec3(WorldPos(prim_it->second.pos_or_n)));
+            // Render-frame plane offset (#255), the same
+            // d + dot(n, anchor) identity the pack and the picker use.
+            const float d = static_cast<float>(
+                prim_it->second.radius_or_d +
+                glm::dot(glm::dvec3(n), world_frame_.anchor));
             // Foot of the ORIENT-rotated plane, matching the drawn
             // geometry (build_origin below) and the pre-hit-test.
             origin     = n * (-d);
@@ -18416,10 +18923,14 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
         } else {
             // Sphere path: gizmo anchored at the sphere center, sized
             // relative to the radius like the existing translate gizmo.
-            origin = glm::vec3{prim_it->second.pos_or_n[0],
-                               prim_it->second.pos_or_n[1],
-                               prim_it->second.pos_or_n[2]};
-            gizmo_size = std::max(0.5f, prim_it->second.radius_or_d * 1.5f);
+            // CONVERSION BOUNDARY (#255): the gizmo is drawn into a GPU
+            // segment buffer and hit-tested against the rendered image,
+            // so it lives in the render frame end to end. UpdateDrag's
+            // result goes back through ToWorld() before it is dispatched
+            // as a prim_set_pos / light_set_pos.
+            origin = world_frame_.ToRender(WorldPos(prim_it->second.pos_or_n));
+            gizmo_size = std::max(
+                0.5f, static_cast<float>(prim_it->second.radius_or_d) * 1.5f);
         }
     } else {
         // Light path: anchored at L.pos. Sphere lights use their radius;
@@ -18433,7 +18944,7 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
             if (editor_gizmo_.IsDragging()) editor_gizmo_.EndDrag();
             return;
         }
-        origin = glm::vec3{L.pos[0], L.pos[1], L.pos[2]};
+        origin = world_frame_.ToRender(WorldPos(L.pos));
         if (L.type == AnalyticLight::Sphere) {
             gizmo_size = std::max(0.5f, L.radius * 1.5f);
         } else if (L.type == AnalyticLight::Quad) {
@@ -18448,6 +18959,9 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
     const float aspect = (accum_h_ > 0)
                            ? float(accum_w_) / float(accum_h_)
                            : 1.0f;
+    // The render-frame camera every projection / hit-test / drag below
+    // works against (#255).
+    const pt::renderer::Camera cam_r = RenderFrameCamera(*camera_, world_frame_);
 
     // Cursor + LMB state.
     double mx = 0.0, my = 0.0;
@@ -18462,7 +18976,7 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
         pt::renderer::EditorOverlay::Axis::None;
     if (!mouse_look) {
         hovered = editor_gizmo_.HitTest(origin, gizmo_size,
-                                        *camera_, aspect,
+                                        cam_r, aspect,
                                         accum_w_, accum_h_,
                                         mx, my, /*radius_px=*/10.0f);
     }
@@ -18563,7 +19077,7 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
                 // ignores calls made during the drag itself).
                 PushSceneSnapshot();
                 editor_gizmo_.BeginDrag(hovered, origin,
-                                        *camera_, aspect,
+                                        cam_r, aspect,
                                         accum_w_, accum_h_,
                                         mx, my);
             }
@@ -18580,7 +19094,7 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
                 // axis lives in world space (not in the prim's local
                 // frame), matching user expectation.
                 const float angle = editor_gizmo_.UpdateRotateDrag(
-                    *camera_, aspect, accum_w_, accum_h_, mx, my);
+                    cam_r, aspect, accum_w_, accum_h_, mx, my);
                 // Sub-half-degree threshold cuts Execute() churn when
                 // the mouse is roughly still.
                 constexpr float kAngleEps = 1.0e-3f;
@@ -18618,7 +19132,7 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
                 }
             } else if (editor_gizmo_.DragMode() == pt::renderer::EditorOverlay::Mode::Scale) {
                 const glm::vec3 new_pos =
-                    editor_gizmo_.UpdateDrag(*camera_, aspect,
+                    editor_gizmo_.UpdateDrag(cam_r, aspect,
                                              accum_w_, accum_h_, mx, my);
                 const glm::vec3 delta = new_pos - editor_drag_pre_pos_;
                 const glm::vec3 ax = [&]() {
@@ -18666,15 +19180,23 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
                 // engine's accum_dirty / dirty-flag handling + future
                 // undo machinery route uniformly.
                 const glm::vec3 new_pos =
-                    editor_gizmo_.UpdateDrag(*camera_, aspect,
+                    editor_gizmo_.UpdateDrag(cam_r, aspect,
                                              accum_w_, accum_h_, mx, my);
                 // Skip the dispatch if the delta is sub-millimetre; cuts
                 // the ~60 Hz Execute() churn when the mouse is still.
                 if (glm::distance(new_pos, origin) > 1e-4f) {
-                    auto cmd = fmt::format("{} {} {} {} {}",
+                    // Back across the CONVERSION BOUNDARY (#255): the
+                    // drag produced a render-frame point, and
+                    // prim_set_pos / light_set_pos take canonical world
+                    // metres. 17 significant digits so the round trip
+                    // through the console's text arguments does not
+                    // become the precision floor that widening the
+                    // fields just removed.
+                    const glm::dvec3 world_pos = world_frame_.ToWorld(new_pos);
+                    auto cmd = fmt::format("{} {} {:.17g} {:.17g} {:.17g}",
                                            set_pos_cmd,
                                            selected_prim_id_,
-                                           new_pos.x, new_pos.y, new_pos.z);
+                                           world_pos.x, world_pos.y, world_pos.z);
                     pt::console::Console::Get().Execute(cmd);
                 }
             }
@@ -18701,14 +19223,13 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
                 // intersect time, so for the gizmo we apply it here too.
                 const glm::vec3 n = QuatRotateXyzw(
                     fresh->second.orient,
-                    glm::vec3{fresh->second.pos_or_n[0],
-                              fresh->second.pos_or_n[1],
-                              fresh->second.pos_or_n[2]});
-                build_origin = n * (-fresh->second.radius_or_d);
+                    glm::vec3(WorldPos(fresh->second.pos_or_n)));
+                build_origin = n * static_cast<float>(
+                    -(fresh->second.radius_or_d +
+                      glm::dot(glm::dvec3(n), world_frame_.anchor)));
             } else {
-                build_origin = glm::vec3{fresh->second.pos_or_n[0],
-                                         fresh->second.pos_or_n[1],
-                                         fresh->second.pos_or_n[2]};
+                build_origin =
+                    world_frame_.ToRender(WorldPos(fresh->second.pos_or_n));
             }
         }
     } else {
@@ -19568,7 +20089,8 @@ void Engine::RegisterPhysicsCommands() {
                 out.PrintLine("usage: phys_drop <x> <y> <z> [radius=0.3]");
                 return;
             }
-            float x, y, z, radius = 0.3f;
+            double x, y, z;                 // canonical world metres (#255)
+            float radius = 0.3f;
             if (!ParseFloat(args[0], x) || !ParseFloat(args[1], y) || !ParseFloat(args[2], z)) {
                 out.PrintLine("phys_drop: arg parse failed");
                 return;
@@ -19642,7 +20164,8 @@ void Engine::RegisterPhysicsCommands() {
                 out.PrintLine("usage: phys_drop_sphere <x> <y> <z> [radius=0.3] [mass=1.0] [r g b] [emit_r emit_g emit_b]");
                 return;
             }
-            float x, y, z, radius = 0.3f, mass = 1.0f;
+            double x, y, z;                 // canonical world metres (#255)
+            float radius = 0.3f, mass = 1.0f;
             // Default warm-grey tint -- matches the pre-#181 hard-coded
             // appearance so phys_drop_sphere with no color args renders
             // bit-for-bit identical to integration HEAD.
@@ -19751,7 +20274,8 @@ void Engine::RegisterPhysicsCommands() {
                 out.PrintLine("usage: phys_drop_box <x> <y> <z> <hx> <hy> <hz> [mass=1.0] [r g b] [emit_r emit_g emit_b]");
                 return;
             }
-            float x, y, z, hx, hy, hz, mass = 1.0f;
+            double x, y, z;                 // canonical world metres (#255)
+            float hx, hy, hz, mass = 1.0f;
             // Default cool-blue tint -- matches pre-#181 hard-coded
             // appearance for `phys_drop_box` with no color args.
             float r_col = 0.60f, g_col = 0.65f, b_col = 0.85f;
@@ -20468,7 +20992,8 @@ void Engine::RegisterLightCommands() {
                 return;
             }
             std::uint32_t id;
-            float x, y, z, r, g, b;
+            double x, y, z;                 // canonical world metres (#255)
+            float r, g, b;
             if (!ParseUint(args[0], id) ||
                 !ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z) ||
                 !ParseFloat(args[4], r) || !ParseFloat(args[5], g) || !ParseFloat(args[6], b)) {
@@ -20494,7 +21019,8 @@ void Engine::RegisterLightCommands() {
                 return;
             }
             std::uint32_t id;
-            float x, y, z, dx, dy, dz, outer_deg, inner_deg, r, g, b;
+            double x, y, z;                 // canonical world metres (#255)
+            float dx, dy, dz, outer_deg, inner_deg, r, g, b;
             if (!ParseUint(args[0], id) ||
                 !ParseFloat(args[1], x)  || !ParseFloat(args[2], y)  || !ParseFloat(args[3], z) ||
                 !ParseFloat(args[4], dx) || !ParseFloat(args[5], dy) || !ParseFloat(args[6], dz) ||
@@ -20534,7 +21060,8 @@ void Engine::RegisterLightCommands() {
                 return;
             }
             std::uint32_t id;
-            float x, y, z, radius, r, g, b;
+            double x, y, z;                 // canonical world metres (#255)
+            float radius, r, g, b;
             if (!ParseUint(args[0], id) ||
                 !ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z) ||
                 !ParseFloat(args[4], radius) ||
@@ -20563,7 +21090,8 @@ void Engine::RegisterLightCommands() {
                 return;
             }
             std::uint32_t id;
-            float x, y, z, nx, ny, nz, ux, uy, uz, uh, vh, r, g, b;
+            double x, y, z;                 // canonical world metres (#255)
+            float nx, ny, nz, ux, uy, uz, uh, vh, r, g, b;
             if (!ParseUint(args[0], id) ||
                 !ParseFloat(args[1], x)  || !ParseFloat(args[2], y)  || !ParseFloat(args[3], z) ||
                 !ParseFloat(args[4], nx) || !ParseFloat(args[5], ny) || !ParseFloat(args[6], nz) ||
@@ -20630,7 +21158,8 @@ void Engine::RegisterLightCommands() {
                 return;
             }
             std::uint32_t id;
-            float x, y, z, r, g, b, intens;
+            double x, y, z;                 // canonical world metres (#255)
+            float r, g, b, intens;
             if (!ParseUint(args[0], id) ||
                 !ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z) ||
                 !ParseFloat(args[4], r) || !ParseFloat(args[5], g) || !ParseFloat(args[6], b) ||
@@ -20664,7 +21193,8 @@ void Engine::RegisterLightCommands() {
                 return;
             }
             std::uint32_t id;
-            float x, y, z, r, g, b, cd;
+            double x, y, z;                 // canonical world metres (#255)
+            float r, g, b, cd;
             if (!ParseUint(args[0], id) ||
                 !ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z) ||
                 !ParseFloat(args[4], r) || !ParseFloat(args[5], g) || !ParseFloat(args[6], b) ||
@@ -20700,7 +21230,8 @@ void Engine::RegisterLightCommands() {
                 return;
             }
             std::uint32_t id;
-            float x, y, z, r, g, b, lm;
+            double x, y, z;                 // canonical world metres (#255)
+            float r, g, b, lm;
             if (!ParseUint(args[0], id) ||
                 !ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z) ||
                 !ParseFloat(args[4], r) || !ParseFloat(args[5], g) || !ParseFloat(args[6], b) ||
@@ -20736,7 +21267,8 @@ void Engine::RegisterLightCommands() {
                 return;
             }
             std::uint32_t id;
-            float x, y, z, r, g, b, intens, ev;
+            double x, y, z;                 // canonical world metres (#255)
+            float r, g, b, intens, ev;
             if (!ParseUint(args[0], id) ||
                 !ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z) ||
                 !ParseFloat(args[4], r) || !ParseFloat(args[5], g) || !ParseFloat(args[6], b) ||
@@ -20765,7 +21297,7 @@ void Engine::RegisterLightCommands() {
     // per-variant conversion factor applied to the scalar input before
     // multiplying by color.
     auto spotAddCommon = [this](std::uint32_t id,
-                                float x, float y, float z,
+                                double x, double y, double z,   // canonical (#255)
                                 float dx, float dy, float dz,
                                 float outer_deg, float inner_deg,
                                 float r, float g, float b,
@@ -20808,7 +21340,8 @@ void Engine::RegisterLightCommands() {
                 return;
             }
             std::uint32_t id;
-            float x, y, z, dx, dy, dz, outer_deg, inner_deg, r, g, b, intens;
+            double x, y, z;                 // canonical world metres (#255)
+            float dx, dy, dz, outer_deg, inner_deg, r, g, b, intens;
             if (!ParseUint(args[0], id) ||
                 !ParseFloat(args[1], x)  || !ParseFloat(args[2], y)  || !ParseFloat(args[3], z) ||
                 !ParseFloat(args[4], dx) || !ParseFloat(args[5], dy) || !ParseFloat(args[6], dz) ||
@@ -20832,7 +21365,8 @@ void Engine::RegisterLightCommands() {
                 return;
             }
             std::uint32_t id;
-            float x, y, z, dx, dy, dz, outer_deg, inner_deg, r, g, b, cd;
+            double x, y, z;                 // canonical world metres (#255)
+            float dx, dy, dz, outer_deg, inner_deg, r, g, b, cd;
             if (!ParseUint(args[0], id) ||
                 !ParseFloat(args[1], x)  || !ParseFloat(args[2], y)  || !ParseFloat(args[3], z) ||
                 !ParseFloat(args[4], dx) || !ParseFloat(args[5], dy) || !ParseFloat(args[6], dz) ||
@@ -20860,7 +21394,8 @@ void Engine::RegisterLightCommands() {
                 return;
             }
             std::uint32_t id;
-            float x, y, z, dx, dy, dz, outer_deg, inner_deg, r, g, b, lm;
+            double x, y, z;                 // canonical world metres (#255)
+            float dx, dy, dz, outer_deg, inner_deg, r, g, b, lm;
             if (!ParseUint(args[0], id) ||
                 !ParseFloat(args[1], x)  || !ParseFloat(args[2], y)  || !ParseFloat(args[3], z) ||
                 !ParseFloat(args[4], dx) || !ParseFloat(args[5], dy) || !ParseFloat(args[6], dz) ||
@@ -20879,7 +21414,7 @@ void Engine::RegisterLightCommands() {
     // per-variant conversion factor that turns the scalar input into
     // W/m^2/sr radiance.
     auto sphereAddCommon = [this](std::uint32_t id,
-                                  float x, float y, float z,
+                                  double x, double y, double z, // canonical (#255)
                                   float radius,
                                   float r, float g, float b,
                                   float radiance,
@@ -20913,7 +21448,8 @@ void Engine::RegisterLightCommands() {
                 return;
             }
             std::uint32_t id;
-            float x, y, z, radius, r, g, b, rad;
+            double x, y, z;                 // canonical world metres (#255)
+            float radius, r, g, b, rad;
             if (!ParseUint(args[0], id) ||
                 !ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z) ||
                 !ParseFloat(args[4], radius) ||
@@ -20936,7 +21472,8 @@ void Engine::RegisterLightCommands() {
                 return;
             }
             std::uint32_t id;
-            float x, y, z, radius, r, g, b, nits;
+            double x, y, z;                 // canonical world metres (#255)
+            float radius, r, g, b, nits;
             if (!ParseUint(args[0], id) ||
                 !ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z) ||
                 !ParseFloat(args[4], radius) ||
@@ -20954,7 +21491,7 @@ void Engine::RegisterLightCommands() {
     // per-variant conversion factor that turns the scalar input into
     // W/m^2/sr radiance.
     auto quadAddCommon = [this](std::uint32_t id,
-                                float x, float y, float z,
+                                double x, double y, double z,   // canonical (#255)
                                 float nx, float ny, float nz,
                                 float ux, float uy, float uz,
                                 float uh, float vh,
@@ -21005,7 +21542,8 @@ void Engine::RegisterLightCommands() {
                 return;
             }
             std::uint32_t id;
-            float x, y, z, nx, ny, nz, ux, uy, uz, uh, vh, r, g, b, rad;
+            double x, y, z;                 // canonical world metres (#255)
+            float nx, ny, nz, ux, uy, uz, uh, vh, r, g, b, rad;
             if (!ParseUint(args[0], id) ||
                 !ParseFloat(args[1], x)  || !ParseFloat(args[2], y)  || !ParseFloat(args[3], z) ||
                 !ParseFloat(args[4], nx) || !ParseFloat(args[5], ny) || !ParseFloat(args[6], nz) ||
@@ -21032,7 +21570,8 @@ void Engine::RegisterLightCommands() {
                 return;
             }
             std::uint32_t id;
-            float x, y, z, nx, ny, nz, ux, uy, uz, uh, vh, r, g, b, nits;
+            double x, y, z;                 // canonical world metres (#255)
+            float nx, ny, nz, ux, uy, uz, uh, vh, r, g, b, nits;
             if (!ParseUint(args[0], id) ||
                 !ParseFloat(args[1], x)  || !ParseFloat(args[2], y)  || !ParseFloat(args[3], z) ||
                 !ParseFloat(args[4], nx) || !ParseFloat(args[5], ny) || !ParseFloat(args[6], nz) ||
@@ -21058,7 +21597,8 @@ void Engine::RegisterLightCommands() {
                 return;
             }
             std::uint32_t id;
-            float x, y, z, nx, ny, nz, ux, uy, uz, uh, vh, r, g, b, rad, ev;
+            double x, y, z;                 // canonical world metres (#255)
+            float nx, ny, nz, ux, uy, uz, uh, vh, r, g, b, rad, ev;
             if (!ParseUint(args[0], id) ||
                 !ParseFloat(args[1], x)  || !ParseFloat(args[2], y)  || !ParseFloat(args[3], z) ||
                 !ParseFloat(args[4], nx) || !ParseFloat(args[5], ny) || !ParseFloat(args[6], nz) ||
@@ -21087,7 +21627,8 @@ void Engine::RegisterLightCommands() {
         "light_set_pos <id> <x> <y> <z>: move any analytic light (point/spot/sphere/quad).",
         [this](auto args, pt::console::Output& out) {
             if (args.size() != 4) { out.PrintLine("usage: light_set_pos <id> <x> <y> <z>"); return; }
-            std::uint32_t id; float x, y, z;
+            std::uint32_t id;
+            double x, y, z;                 // canonical world metres (#255)
             if (!ParseUint(args[0], id) ||
                 !ParseFloat(args[1], x) || !ParseFloat(args[2], y) || !ParseFloat(args[3], z)) {
                 out.PrintLine("light_set_pos: arg parse failed"); return;
@@ -21428,9 +21969,13 @@ void Engine::EnsureSmokeEmittersUploaded() {
         const auto& E = smoke_emitters_[i];
         const std::size_t off = std::size_t(i) * kFloatsPerEmitter;
         // v0: position + radius
-        packed[off + 0]  = E.pos[0];
-        packed[off + 1]  = E.pos[1];
-        packed[off + 2]  = E.pos[2];
+        // CONVERSION BOUNDARY (#255): the emitter base is absolute; the
+        // shader's parametric drift (base + velocity * t) is a
+        // displacement and needs no conversion.
+        const glm::vec3 ep = world_frame_.ToRender(WorldPos(E.pos));
+        packed[off + 0]  = ep.x;
+        packed[off + 1]  = ep.y;
+        packed[off + 2]  = ep.z;
         packed[off + 3]  = E.radius;
         // v1: velocity + density
         packed[off + 4]  = E.velocity[0];
@@ -21465,7 +22010,7 @@ void Engine::RegisterSmokeCommands() {
                 out.PrintLine("usage: smoke_emit <x> <y> <z> [radius] [density] [vx vy vz]");
                 return;
             }
-            float x, y, z;
+            double x, y, z;                 // canonical world metres (#255)
             float radius  = 1.0f;
             float density = 1.0f;
             // Default drift: slight upward bias so plumes look "rising
@@ -21730,6 +22275,22 @@ void Engine::EnsureSmokeSphUploaded() {
     std::vector<float> packed(std::size_t(sph_particle_capacity_) * kFloatsPerParticle, 0.0f);
     const std::uint32_t n = smoke_sph_->PackForGpu(packed.data(),
         static_cast<std::uint32_t>(packed.size()), rad_scale, dens_scale);
+    // CONVERSION BOUNDARY (#255). The solver is a float32 near-origin
+    // subsystem by design -- its kill box, its spatial hash and its curl
+    // noise all assume small absolute coordinates -- so the shift lands
+    // here, on the packed output, rather than in the solver. That keeps
+    // smoke rendering in the right place under a non-zero anchor without
+    // pretending SPH works at planetary coordinates; making the solver
+    // genuinely emitter-local is filed separately and lives in
+    // src/physics. v0.xyz is the position; v0.w is a radius; v1 is
+    // density / tint and carries nothing positional.
+    if (!world_frame_.AtOrigin()) {
+        const glm::vec3 a = glm::vec3(world_frame_.anchor);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            float* o = packed.data() + std::size_t(i) * kFloatsPerParticle;
+            o[0] -= a.x; o[1] -= a.y; o[2] -= a.z;
+        }
+    }
     device_->WriteBuffer(pt::rhi::BufferHandle{sph_particle_buffer_id_},
                          packed.data(), packed.size() * sizeof(float));
     sph_particle_count_uploaded_ = n;
@@ -21989,8 +22550,16 @@ bool Engine::VoxelizeSourceObject(std::uint32_t source_id, float voxel_size,
             return false;
         }
         const auto mat = MaterialFromAnalyticPrim(p);
-        const float center[3] = { p.pos_or_n[0], p.pos_or_n[1], p.pos_or_n[2] };
-        if (!pt::destruction::VoxelizeSphere(source_id, center, p.radius_or_d,
+        // The voxel grid keeps float32 world AABBs (VoxelGridHeader);
+        // widening it is out of scope for #255 and recorded in the PR --
+        // voxelisation at planetary coordinates collapses regardless of
+        // the render frame, because the grid walk adds voxel_size to an
+        // absolute float32 corner.
+        const float center[3] = { static_cast<float>(p.pos_or_n[0]),
+                                  static_cast<float>(p.pos_or_n[1]),
+                                  static_cast<float>(p.pos_or_n[2]) };
+        if (!pt::destruction::VoxelizeSphere(source_id, center,
+                                             static_cast<float>(p.radius_or_d),
                                              voxel_size, mat, *grid)) {
             const std::string msg = fmt::format(
                 "voxelize_object: sphere id={} produced 0 voxels", source_id);

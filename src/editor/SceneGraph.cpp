@@ -326,18 +326,32 @@ std::uint32_t SdfOpFromName(std::string_view s) {
 //
 // Read an N-element float array from `node[key]`; leaves `dst` untouched
 // if the field is absent / wrong-shaped (so the struct default stands).
-template <std::size_t N>
-void ReadFloatN(const json& node, const char* key, float (&dst)[N]) {
+// Planetary P1 (#255): templated on the element type as well as the
+// length, so a canonical world position (now double[3]) round-trips at
+// full width while colours, normals and quaternions keep reading as
+// float. The FILE FORMAT does not change: nlohmann already promotes
+// float to double on output, so every committed scene JSON was already
+// carrying more digits than the old float readers could take back in.
+template <typename T, std::size_t N>
+void ReadFloatN(const json& node, const char* key, T (&dst)[N]) {
     auto it = node.find(key);
     if (it == node.end() || !it->is_array() || it->size() != N) return;
     for (std::size_t i = 0; i < N; ++i) {
-        if ((*it)[i].is_number()) dst[i] = (*it)[i].get<float>();
+        if ((*it)[i].is_number()) dst[i] = (*it)[i].get<T>();
     }
 }
 
 float ReadFloat(const json& node, const char* key, float fallback) {
     auto it = node.find(key);
     if (it != node.end() && it->is_number()) return it->get<float>();
+    return fallback;
+}
+
+// Double-width sibling for scalars that are absolute coordinates -- a
+// plane's `d` is the only one today (#255).
+double ReadDouble(const json& node, const char* key, double fallback) {
+    auto it = node.find(key);
+    if (it != node.end() && it->is_number()) return it->get<double>();
     return fallback;
 }
 
@@ -371,7 +385,7 @@ nlohmann::json SceneToJson(const SceneData& scene) {
     if (scene.has_camera) {
         const auto& c = scene.camera;
         out["camera"] = {
-            {"pos",   {c.pos.x, c.pos.y, c.pos.z}},
+            {"pos",   {c.pos_w.x, c.pos_w.y, c.pos_w.z}},
             {"yaw",   glm::degrees(c.yaw)},
             {"pitch", glm::degrees(c.pitch)},
             {"fov",   c.fov_deg},
@@ -515,9 +529,9 @@ bool SceneFromJson(const nlohmann::json& doc, SceneData& out, std::string& err) 
         const json& c = *it;
         out.has_camera = true;
         if (auto p = c.find("pos"); p != c.end() && p->is_array() && p->size() == 3) {
-            out.camera.pos = glm::vec3((*p)[0].get<float>(),
-                                       (*p)[1].get<float>(),
-                                       (*p)[2].get<float>());
+            out.camera.pos_w = glm::dvec3((*p)[0].get<double>(),
+                                          (*p)[1].get<double>(),
+                                          (*p)[2].get<double>());
         }
         out.camera.yaw     = glm::radians(ReadFloat(c, "yaw",   0.0f));
         out.camera.pitch   = glm::radians(ReadFloat(c, "pitch", 0.0f));
@@ -535,10 +549,12 @@ bool SceneFromJson(const nlohmann::json& doc, SceneData& out, std::string& err) 
             p.type = (type == "plane") ? AnalyticPrim::Plane : AnalyticPrim::Sphere;
             if (p.type == AnalyticPrim::Sphere) {
                 ReadFloatN(j, "pos", p.pos_or_n);
-                p.radius_or_d = ReadFloat(j, "radius", 0.5f);
+                p.radius_or_d = ReadFloat(j, "radius", 0.5f);   // scale-free
             } else {
                 ReadFloatN(j, "normal", p.pos_or_n);
-                p.radius_or_d = ReadFloat(j, "d", 0.0f);
+                // Absolute distance from the world origin -- read at
+                // double width (#255).
+                p.radius_or_d = ReadDouble(j, "d", 0.0);
             }
             // Seed prev == curr so a freshly loaded prim doesn't streak
             // from the origin on its first motion-blur frame (#85).

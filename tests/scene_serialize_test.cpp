@@ -25,9 +25,19 @@
 //   - a malformed (non-object) document is rejected
 //
 // Float comparisons are bit-exact (==) on purpose: JSON serializes
-// the full float value and nlohmann round-trips it losslessly, so a
-// load must reproduce the saved bits. Using a tolerance here would let
-// a real precision-loss regression slip through.
+// the full value and nlohmann round-trips it losslessly, so a load must
+// reproduce the saved bits. Using a tolerance here would let a real
+// precision-loss regression slip through.
+//
+// Planetary P1 (#255) kept that bit-exactness and moved it up to
+// double for the fields that are canonical world coordinates -- the
+// camera position, prim centres / plane offsets, light positions. The
+// FILE FORMAT is unchanged: nlohmann already promoted float to double
+// on output, so every scene ever written was already lossless and only
+// the readers were throwing precision away. The ECEF-scale case below
+// is the regression test for that: a coordinate at planetary radius
+// with sub-metre detail cannot survive a float32 round trip, so it
+// fails loudly if a reader is ever narrowed back.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -54,7 +64,7 @@ SceneData MakeRichScene() {
     // Camera. Use a non-default yaw/pitch/fov so a "left at default"
     // bug can't pass. pitch within the +/-85 deg clamp.
     s.has_camera   = true;
-    s.camera.pos   = glm::vec3(1.25f, 2.5f, -3.75f);
+    s.camera.pos_w = glm::dvec3(1.25, 2.5, -3.75);
     s.camera.yaw   = 0.6f;     // radians
     s.camera.pitch = -0.3f;    // radians (within clamp)
     s.camera.fov_deg = 55.0f;
@@ -272,9 +282,9 @@ TEST_CASE("scene round-trips through SceneToJson / SceneFromJson") {
 
     // --- Camera ----------------------------------------------------------
     REQUIRE(loaded.has_camera);
-    REQUIRE(loaded.camera.pos.x == orig.camera.pos.x);
-    REQUIRE(loaded.camera.pos.y == orig.camera.pos.y);
-    REQUIRE(loaded.camera.pos.z == orig.camera.pos.z);
+    REQUIRE(loaded.camera.pos_w.x == orig.camera.pos_w.x);
+    REQUIRE(loaded.camera.pos_w.y == orig.camera.pos_w.y);
+    REQUIRE(loaded.camera.pos_w.z == orig.camera.pos_w.z);
     REQUIRE(loaded.camera.fov_deg == orig.camera.fov_deg);
     // yaw/pitch persisted as degrees and converted back to radians.
     // The deg<->rad round-trip is not bit-exact, so allow a tight eps.

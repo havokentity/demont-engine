@@ -30,6 +30,10 @@ build_win.bat
 # scene data, per-workspace scratch, not committed. (Legacy *.toml
 # scenes from the pre-JSON scene_save are also ignored.)
 scenes/
+# ...but the golden-matrix scene fixtures ARE committed source. Without
+# this negation `scenes/` above swallows them and a new fixture silently
+# never reaches the tree (every existing one had to be added with -f).
+!tests/goldens/scenes/
 *.toml
 !CMakePresets.json
 demont_console.state

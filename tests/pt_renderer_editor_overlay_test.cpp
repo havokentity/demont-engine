@@ -50,7 +50,7 @@ Camera MakeCamera(glm::vec3 pos = {0.0f, 0.0f, 3.0f},
                   float fov = 60.0f)
 {
     Camera c;
-    c.pos     = pos;
+    c.pos_w   = glm::dvec3(pos);
     c.yaw     = yaw;
     c.pitch   = pitch;
     c.fov_deg = fov;
@@ -62,7 +62,7 @@ Camera MakeCamera(glm::vec3 pos = {0.0f, 0.0f, 3.0f},
 TEST_CASE("ProjectToScreen round-trips via ScreenToWorldRay") {
     Camera cam = MakeCamera();
     // Point one unit in front of the camera (since fwd = -Z when
-    // yaw=pitch=0, the world-Z direction is -1 from cam.pos.z=3).
+    // yaw=pitch=0, the world-Z direction is -1 from cam.pos_w.z=3).
     const glm::vec3 wp{0.0f, 0.0f, 0.0f};   // origin, 3 m in front of cam
     glm::vec2 px;
     REQUIRE(ProjectToScreen(wp, cam, kAspect, kFbW, kFbH, px));
@@ -73,10 +73,10 @@ TEST_CASE("ProjectToScreen round-trips via ScreenToWorldRay") {
 
     glm::vec3 ro{0.0f}, rd{0.0f};
     REQUIRE(ScreenToWorldRay(cam, kAspect, kFbW, kFbH, px.x, px.y, ro, rd));
-    CHECK(ro.x == doctest::Approx(cam.pos.x).epsilon(kEps));
-    CHECK(ro.y == doctest::Approx(cam.pos.y).epsilon(kEps));
-    CHECK(ro.z == doctest::Approx(cam.pos.z).epsilon(kEps));
-    // Ray should head toward (0,0,0) from cam.pos: direction = -z.
+    CHECK(ro.x == doctest::Approx(cam.pos_w.x).epsilon(kEps));
+    CHECK(ro.y == doctest::Approx(cam.pos_w.y).epsilon(kEps));
+    CHECK(ro.z == doctest::Approx(cam.pos_w.z).epsilon(kEps));
+    // Ray should head toward (0,0,0) from cam.pos_w: direction = -z.
     CHECK(rd.z == doctest::Approx(-1.0f).epsilon(kEps));
 }
 

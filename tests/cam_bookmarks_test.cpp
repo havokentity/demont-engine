@@ -78,7 +78,7 @@ struct CamBookmarksTestAccess {
         // default (matches Camera.h inline initialiser). Tests below
         // mutate this BEFORE cam_save_named to verify the snapshot
         // captured the modified pose.
-        engine_.camera_->pos     = glm::vec3(0.0f, 1.5f, 4.0f);
+        engine_.camera_->pos_w   = glm::dvec3(0.0, 1.5, 4.0);
         engine_.camera_->yaw     = 0.0f;
         engine_.camera_->pitch   = -0.20f;
         engine_.camera_->fov_deg = 60.0f;
@@ -140,7 +140,7 @@ TEST_CASE("cam_save_named: stores current camera state under given name") {
 
     // Mutate camera into a non-default pose so we can tell the
     // snapshot apart from the default-reset state below.
-    acc.Camera().pos     = glm::vec3(10.0f, 20.0f, -5.5f);
+    acc.Camera().pos_w     = glm::dvec3(10.0f, 20.0f, -5.5f);
     acc.Camera().yaw     = 1.0f;        // radians
     acc.Camera().pitch   = -0.5f;       // radians
     acc.Camera().fov_deg = 45.0f;
@@ -166,14 +166,14 @@ TEST_CASE("cam_load_named: restores camera to saved pose") {
     auto& C = pt::console::Console::Get();
 
     // Save an aerial pose.
-    acc.Camera().pos     = glm::vec3(0.0f, 50.0f, 0.0f);
+    acc.Camera().pos_w     = glm::dvec3(0.0f, 50.0f, 0.0f);
     acc.Camera().yaw     = 0.5f;
     acc.Camera().pitch   = -1.2f;  // looking nearly straight down
     acc.Camera().fov_deg = 90.0f;
     CHECK(C.Execute("cam_save_named aerial").ok);
 
     // Move the camera elsewhere.
-    acc.Camera().pos     = glm::vec3(-3.0f, 0.5f, 12.0f);
+    acc.Camera().pos_w     = glm::dvec3(-3.0f, 0.5f, 12.0f);
     acc.Camera().yaw     = -1.0f;
     acc.Camera().pitch   = 0.0f;
     acc.Camera().fov_deg = 30.0f;
@@ -185,9 +185,9 @@ TEST_CASE("cam_load_named: restores camera to saved pose") {
 
     // ClampPitch is applied on load; -1.2 rad ~ -68.75 deg, well
     // within the +/- 85 deg clamp limit, so the round-trip preserves it.
-    CHECK(approx(acc.Camera().pos.x, 0.0f));
-    CHECK(approx(acc.Camera().pos.y, 50.0f));
-    CHECK(approx(acc.Camera().pos.z, 0.0f));
+    CHECK(approx(acc.Camera().pos_w.x, 0.0f));
+    CHECK(approx(acc.Camera().pos_w.y, 50.0f));
+    CHECK(approx(acc.Camera().pos_w.z, 0.0f));
     CHECK(approx(acc.Camera().yaw, 0.5f, 1e-2f));
     CHECK(approx(acc.Camera().pitch, -1.2f, 1e-2f));
     CHECK(approx(acc.Camera().fov_deg, 90.0f));
@@ -198,14 +198,14 @@ TEST_CASE("cam_save_named: overwriting existing bookmark mentions 'replaced'") {
     acc.ResetState();
     auto& C = pt::console::Console::Get();
 
-    acc.Camera().pos = glm::vec3(1.0f, 2.0f, 3.0f);
+    acc.Camera().pos_w = glm::dvec3(1.0f, 2.0f, 3.0f);
     auto r1 = C.Execute("cam_save_named spot");
     CHECK(r1.ok);
     CHECK(contains(r1.output, "saved 'spot'"));
 
     // Re-save under the same name; output should mention "replaced",
     // not "saved", so the user knows they overwrote a prior entry.
-    acc.Camera().pos = glm::vec3(4.0f, 5.0f, 6.0f);
+    acc.Camera().pos_w = glm::dvec3(4.0f, 5.0f, 6.0f);
     auto r2 = C.Execute("cam_save_named spot");
     CHECK(r2.ok);
     CHECK(contains(r2.output, "replaced 'spot'"));
@@ -213,9 +213,9 @@ TEST_CASE("cam_save_named: overwriting existing bookmark mentions 'replaced'") {
 
     // The stored state reflects the LAST save, not the first.
     CHECK(C.Execute("cam_load_named spot").ok);
-    CHECK(approx(acc.Camera().pos.x, 4.0f));
-    CHECK(approx(acc.Camera().pos.y, 5.0f));
-    CHECK(approx(acc.Camera().pos.z, 6.0f));
+    CHECK(approx(acc.Camera().pos_w.x, 4.0f));
+    CHECK(approx(acc.Camera().pos_w.y, 5.0f));
+    CHECK(approx(acc.Camera().pos_w.z, 6.0f));
 }
 
 // =============================================================================
@@ -262,15 +262,15 @@ TEST_CASE("cam_load_named: missing bookmark prints helpful error, no crash") {
     auto& C = pt::console::Console::Get();
 
     // Snapshot camera pos so we can verify it wasn't mutated.
-    const glm::vec3 before = acc.Camera().pos;
+    const glm::dvec3 before = acc.Camera().pos_w;
 
     auto r = C.Execute("cam_load_named does_not_exist");
     CHECK(r.ok);  // command found; soft error in output
     CHECK(contains(r.output, "no bookmark named 'does_not_exist'"));
     // Camera unchanged.
-    CHECK(approx(acc.Camera().pos.x, before.x));
-    CHECK(approx(acc.Camera().pos.y, before.y));
-    CHECK(approx(acc.Camera().pos.z, before.z));
+    CHECK(approx(acc.Camera().pos_w.x, before.x));
+    CHECK(approx(acc.Camera().pos_w.y, before.y));
+    CHECK(approx(acc.Camera().pos_w.z, before.z));
 }
 
 // =============================================================================
@@ -348,9 +348,9 @@ TEST_CASE("cam bookmarks persist to camera_bookmarks.cfg across save+load") {
     auto& C = pt::console::Console::Get();
 
     // Save two distinct poses.
-    acc.Camera().pos = glm::vec3(7.0f, 8.0f, 9.0f);
+    acc.Camera().pos_w = glm::dvec3(7.0f, 8.0f, 9.0f);
     CHECK(C.Execute("cam_save_named first").ok);
-    acc.Camera().pos = glm::vec3(-1.0f, 2.0f, -3.0f);
+    acc.Camera().pos_w = glm::dvec3(-1.0f, 2.0f, -3.0f);
     acc.Camera().fov_deg = 75.0f;
     CHECK(C.Execute("cam_save_named second").ok);
 
