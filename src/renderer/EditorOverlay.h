@@ -222,7 +222,15 @@ bool ProjectToScreen(const glm::vec3& world_p,
 // Compute the world-space ray emitted from screen-space pixel
 // (mouse_x, mouse_y) through the camera. Returns false if the
 // camera has degenerate dimensions; otherwise sets `out_origin`
-// (always == cam.pos) and `out_dir` (unit vector).
+// (always == cam.pos_w) and `out_dir` (unit vector).
+//
+// Planetary P1 (#255): every entry point in this header works in the
+// RENDER frame. Pass a camera whose pos_w has been narrowed into the
+// current anchor and world points expressed in that same frame -- see
+// Engine::RenderFrameCamera. Nothing here may see canonical planetary
+// coordinates; that is what keeps the projection and the Gram
+// determinant in ClosestPointOnLineToRay out of catastrophic
+// cancellation at ECEF radius.
 bool ScreenToWorldRay(const Camera& cam, float aspect,
                       int fb_w, int fb_h,
                       double mouse_x, double mouse_y,

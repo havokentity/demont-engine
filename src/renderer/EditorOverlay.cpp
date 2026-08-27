@@ -39,7 +39,14 @@ bool ProjectToScreen(const glm::vec3& world_p,
                      int fb_w, int fb_h,
                      glm::vec2& out_px)
 {
-    const glm::vec3 to_p   = world_p - cam.pos;
+    // Planetary P1 (#255): EditorOverlay is a pure RENDER-FRAME helper.
+    // Callers hand it a camera whose pos_w has already been narrowed
+    // into the current anchor (Engine::RenderFrameCamera) together with
+    // world_p in that same frame, so this subtraction is a difference of
+    // small numbers no matter where the scene sits in canonical space.
+    // Without that, `world_p - cam.pos` at ECEF radius is the textbook
+    // cancellation and gizmo dragging becomes non-deterministic.
+    const glm::vec3 to_p   = world_p - glm::vec3(cam.pos_w);
     const glm::vec3 fwd    = cam.Forward();
     const glm::vec3 right  = cam.Right();
     const glm::vec3 up     = cam.Up();
@@ -74,7 +81,7 @@ bool ScreenToWorldRay(const Camera& cam, float aspect,
     glm::vec3 d = fwd + right * (u * ft * aspect) + up * (v * ft);
     const float L = glm::length(d);
     if (L < 1e-6f) return false;
-    out_origin = cam.pos;
+    out_origin = glm::vec3(cam.pos_w);   // already render-frame; see ProjectToScreen
     out_dir    = d / L;
     return true;
 }

@@ -256,6 +256,18 @@ pt_add_test(pt_math_transforms
     pt_math_transforms_test.cpp
     LINK_TARGETS glm::glm)
 
+# --- pt_core_world_frame (issue #255) --------------------------------------
+# The camera-anchored render frame: lattice, anchor, exactness, and the
+# motion-vector reconstruction that makes a rebase invisible. Pure host
+# arithmetic -- no device, no window -- so it runs everywhere in
+# milliseconds. Links glm only; src/core/WorldFrame.h and
+# src/renderer/Camera.h are both header-only for the parts under test,
+# and the test deliberately calls the SHIPPED ViewProjRH_ZO rather than a
+# copy of it so the two cannot drift apart.
+pt_add_test(pt_core_world_frame
+    pt_core_world_frame_test.cpp
+    LINK_TARGETS glm::glm)
+
 # --- pt_math_sphere (issue #254) -------------------------------------------
 # Ray-sphere intersection at planetary radius. Mirrors the Slang in
 # shaders/PathTraceMath.slang (no host entry point exists to call), pins
@@ -1533,6 +1545,166 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     pt_add_golden_cell(SCENE shadow_umbra_point BACKEND metal DENOISER svgf_atrous
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     # --- end SIGMA sun-shadow demod ---------------------------------------
+
+    # --- Planetary P1 (#255): camera-anchored render frame ----------------
+    # These cells are SELF-VALIDATING: they diff one render against
+    # another render, not against a committed golden. That is deliberate
+    # and it is what makes them meaningful.
+    #
+    # The claim under test is an INVARIANCE -- "the renderer's output does
+    # not depend on where in canonical space the scene sits" -- and an
+    # invariance is naturally stated as an equality between two runs. A
+    # committed PNG could only ever pin one of the two sides, would need
+    # regenerating whenever anything else in the tracer legitimately
+    # moved, and would say nothing about the other side agreeing with it.
+    # Diffing the pair says exactly the thing the phase promises, needs no
+    # new binary in the tree, and cannot silently rot.
+    #
+    # Three fixtures, one arrangement of geometry:
+    #   worldframe_origin         at the world origin  (anchor == 0, the
+    #                             legacy path)
+    #   worldframe_ecef           offset +6,370,304 m in y -- Earth radius
+    #                             to within 705 m, and exactly 6221 anchor
+    #                             lattice steps, so the anchor equals the
+    #                             offset and the render frame coincides
+    #                             with the origin fixture's
+    #   worldframe_ecef_rebased   one further lattice step out (+1024 m),
+    #                             so it computes a DIFFERENT anchor -- the
+    #                             state a camera lands in the instant it
+    #                             crosses a lattice boundary in flight
+    #
+    # equivalence: origin vs ecef        -- the phase's headline.
+    # rebase:      ecef   vs ecef_rebased -- anchor-cell invariance, i.e.
+    #              nothing was packed in one anchor and read in another.
+    #
+    # --max-delta 0 on the software backend: the CPU reference tracer is
+    # deterministic, both sides consume the same pinned PRNG stream, and
+    # with the anchor equal to the offset the two render frames are
+    # bit-for-bit identical inputs -- so anything other than an exactly
+    # equal image is a real leak. Metal gets the same pair at a small
+    # tolerance rather than zero: its cells are known to move by ULP-scale
+    # amounts from codegen alone (#263), and these fixtures carry a CSG
+    # mesh whose hardware BLAS build is not bit-reproducible run to run.
+    #
+    # The mesh is in the picture on purpose. It is the only thing in the
+    # engine that reaches the GPU through a TLAS instance transform, which
+    # is where the anchor rides -- so these cells also cover the claim
+    # that a rebase is one instance rewrite and touches no BLAS.
+    #
+    # _worldframe_pair(<name> <backend> <scene_a> <scene_b> <max_delta>)
+    function(pt_add_worldframe_pair _name _backend _scene_a _scene_b _max_delta)
+        if(_backend STREQUAL "metal" AND NOT APPLE)
+            return()
+        endif()
+        if(_backend STREQUAL "software" AND NOT (APPLE OR WIN32))
+            return()
+        endif()
+        set(_cell worldframe_${_name}__${_backend})
+        set(_scenes ${CMAKE_SOURCE_DIR}/tests/goldens/scenes)
+        foreach(_half a b)
+            if(_half STREQUAL "a")
+                set(_scene ${_scene_a})
+            else()
+                set(_scene ${_scene_b})
+            endif()
+            set(_png ${CMAKE_BINARY_DIR}/golden_actual/${_cell}__${_half}.png)
+            set(_wd  ${CMAKE_BINARY_DIR}/golden_workdir/${_cell}__${_half})
+            file(MAKE_DIRECTORY ${_wd})
+            set(_args
+                --scene    ${_scenes}/${_scene}.cfg
+                --backend  ${_backend}
+                --denoiser off
+                --frames   32
+                --out      ${_png})
+            # The ECEF halves move the CSG mesh with a mesh_step, which
+            # only exists after RegisterCsgCommands -- hence the late-exec
+            # file, with an absolute path because each cell renders in its
+            # own workdir. Mirrors the motion_blur_mesh wiring.
+            if(EXISTS ${_scenes}/${_scene}_late.cfg)
+                list(APPEND _args --extra
+                     "pt_smoke_late_exec ${_scenes}/${_scene}_late.cfg")
+            endif()
+            add_test(NAME ${_cell}_render_${_half}
+                COMMAND $<TARGET_FILE:pt_render_one_frame> ${_args}
+                WORKING_DIRECTORY ${_wd})
+            set_tests_properties(${_cell}_render_${_half} PROPERTIES
+                TIMEOUT 300
+                LABELS  "golden;golden_${_backend};worldframe")
+        endforeach()
+        add_test(NAME ${_cell}_diff
+            COMMAND $<TARGET_FILE:imgdiff>
+                ${CMAKE_BINARY_DIR}/golden_actual/${_cell}__a.png
+                ${CMAKE_BINARY_DIR}/golden_actual/${_cell}__b.png
+                --max-delta    ${_max_delta}
+                --mean-delta   0
+                --fail-percent 0
+                --diff         ${CMAKE_BINARY_DIR}/golden_diff/${_cell}.png
+            WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+        set_tests_properties(${_cell}_diff PROPERTIES
+            TIMEOUT 30
+            DEPENDS "${_cell}_render_a;${_cell}_render_b"
+            LABELS  "golden;golden_${_backend};worldframe")
+    endfunction()
+
+    pt_add_worldframe_pair(equivalence software
+        worldframe_origin worldframe_ecef 0)
+    pt_add_worldframe_pair(rebase software
+        worldframe_ecef   worldframe_ecef_rebased 0)
+    # Metal measures 0 bad pixels on both pairs on an M4 Max, and the
+    # fixture is bit-reproducible run-to-run there (verified: same
+    # fixture rendered twice, max L2 0.0). The registered bar is
+    # --max-delta 2 rather than 0 purely so a stray ULP on a CI runner's
+    # paravirtualised GPU cannot flake the cell; --fail-percent 0 keeps
+    # it strict, since a real coordinate leak shows up as hundreds of L2
+    # across a fifth of the frame, not as a 2/255 wobble.
+    pt_add_worldframe_pair(equivalence metal
+        worldframe_origin worldframe_ecef 2)
+    pt_add_worldframe_pair(rebase metal
+        worldframe_ecef   worldframe_ecef_rebased 2)
+
+    # A/B the disable switch. r_origin_rebase_radius 0 pins the anchor to
+    # the origin forever -- the permanent legacy path -- so on a scene
+    # that never leaves the origin anyway it must produce the SAME IMAGE
+    # as the default radius, bit for bit. That is the whole claim: the
+    # cvar is an A/B switch and not a second renderer.
+    #
+    # Diffed against the untagged cell's own actual, not against the
+    # committed golden. Both sides are then rendered by this build on
+    # this host in this run, so the cell measures exactly the cvar and
+    # nothing else; comparing to the committed PNG would fold in
+    # whatever host-to-host drift already separates this machine from
+    # the one the golden was captured on (measured: 2 pixels at L2 1 on
+    # an M4 Max, present on main too), and that has nothing to do with
+    # the switch under test. The committed-golden comparison is still
+    # made -- by golden_cornell_csg__software__off_diff, which is the
+    # cell that owns it.
+    if(APPLE OR WIN32)
+        set(_rb_png ${CMAKE_BINARY_DIR}/golden_actual/cornell_csg__software__off__rebaseoff.png)
+        set(_rb_wd  ${CMAKE_BINARY_DIR}/golden_workdir/golden_cornell_csg__software__off__rebaseoff)
+        file(MAKE_DIRECTORY ${_rb_wd})
+        add_test(NAME golden_cornell_csg__software__off__rebaseoff_render
+            COMMAND $<TARGET_FILE:pt_render_one_frame>
+                --scene    ${CMAKE_SOURCE_DIR}/tests/goldens/scenes/cornell_csg.cfg
+                --backend  software
+                --denoiser off
+                --frames   64
+                --out      ${_rb_png}
+                --extra    "r_origin_rebase_radius 0"
+            WORKING_DIRECTORY ${_rb_wd})
+        set_tests_properties(golden_cornell_csg__software__off__rebaseoff_render
+            PROPERTIES TIMEOUT 300 LABELS "golden;golden_software;worldframe")
+        add_test(NAME golden_cornell_csg__software__off__rebaseoff_diff
+            COMMAND $<TARGET_FILE:imgdiff>
+                ${_rb_png}
+                ${CMAKE_BINARY_DIR}/golden_actual/cornell_csg__software__off.png
+                --max-delta 0 --mean-delta 0 --fail-percent 0
+            WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+        set_tests_properties(golden_cornell_csg__software__off__rebaseoff_diff
+            PROPERTIES TIMEOUT 30
+            DEPENDS "golden_cornell_csg__software__off__rebaseoff_render;golden_cornell_csg__software__off_render"
+            LABELS  "golden;golden_software;worldframe")
+    endif()
+    # --- end Planetary P1 -------------------------------------------------
 else()
     message(STATUS
         "tests: golden-image matrix skipped -- pt_render_one_frame and/or "
