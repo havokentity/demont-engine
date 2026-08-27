@@ -496,6 +496,50 @@ pt_add_test(pt_renderer_astronomy
     pt_renderer_astronomy_test.cpp
     LINK_TARGETS pt_renderer)
 
+# --- Planetarium unit tests (issue #281) ----------------------------------
+# Planet positions are host-side, closed-form and deterministic, so this is
+# where the planetarium is actually verified -- the golden cell downstream is
+# only a smoke check that the compositing dispatch runs.
+#
+# Coverage:
+#   - JPL approximate-element table integrity, checked structurally rather
+#     than by re-reading the table: perihelion/aphelion envelopes and
+#     sidereal periods against the NASA fact sheets, and the geometric
+#     elongation ceilings for Mercury (27.8 deg) and Venus (47.3 deg) that
+#     no mistyped element can survive
+#   - geocentric astrometric RA/Dec for all seven bodies against JPL
+#     HORIZONS at 2026-01-01, with per-body tolerances taken from JPL's own
+#     published error table for this element set (15" Mercury .. 600" Saturn)
+#   - both ends of the 1800-2050 validity window (1900 Jupiter, 2049
+#     Venus + Mars), where a wrong rate column would show and a J2000-adjacent
+#     epoch would not
+#   - the 2020 Jupiter-Saturn great conjunction: a two-body test that only
+#     passes if both element rows are right at once
+#   - MOTION, not just position: Mars's 2020 retrograde loop sample-for-sample
+#     against HORIZONS (sign pattern + 13-degree amplitude), and its two
+#     stationary points landing on the published 2020-09-09 / 2020-11-14
+#   - light-time correction present, correctly signed (lag, not lead)
+#   - Mallama et al. 2017 photometry against HORIZONS APmag, plus the
+#     Saturn ring-opening term that is worth a whole magnitude
+#   - the shared point-source scale: a rasterised catalogue star's peak texel
+#     must equal MagnitudeToFlux() of its magnitude, i.e. a planet and a star
+#     of the same magnitude are the same brightness by construction
+#   - B-V -> tint hue-only (unit luminance) and monotone in colour index
+#   - a StarsComposite.slang mirror pin that COUNTS occurrences, so a change
+#     touching only one of the kernel's two push declarations fails
+#
+# Built with -ffast-math in Release like the rest of the project, so the
+# finiteness assertions go through the volatile-barrier finiteBits() pattern
+# from pt_math_altitude_test.cpp -- std::isfinite folds to constant true
+# under __FINITE_MATH_ONLY__ and would make those checks vacuous.
+#
+# Links pt_renderer (Astronomy + BscCatalog both live there).
+pt_add_test(pt_renderer_planets
+    pt_renderer_planets_test.cpp
+    LINK_TARGETS pt_renderer)
+target_compile_definitions(pt_renderer_planets PRIVATE
+    PT_SHADER_STARSCOMPOSITE_PATH="${CMAKE_SOURCE_DIR}/shaders/StarsComposite.slang")
+
 # --- pt_renderer/LightTree unit tests (issue #129 + #177) -----------------
 # Pins the hierarchical-light-tree builder against the GPU's
 # (right = left + 1) reachability invariant.  Pre-fix (PR #177) the
@@ -1119,6 +1163,50 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
             MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     endforeach()
     # --- end #112 sky/sun/stars/moon matrix --------------------------------
+
+    # --- Planetarium (#281) ------------------------------------------------
+    # Jupiter (V = -2.67) in Gemini, a few degrees from Castor and Pollux,
+    # at a pinned date/observer. The cell pins the whole host-to-shader
+    # hand-off: planetPosition -> equatorialToHorizon -> world direction ->
+    # the two float4[7] push arrays -> planetSplat()'s Gaussian, AND it pins
+    # the planet's brightness RELATIVE to two catalogue stars in the same
+    # frame, which is the acceptance criterion issue #281 actually states.
+    #
+    # METAL ONLY, ON PURPOSE. The planets live exclusively in
+    # StarsComposite.slang; SoftwareTracer.cpp does not run it (it is
+    # hand-written C++, explicitly "not a Slang-to-CPU emit" -- see #263), so
+    # a `software off` cell here would pin a planet-free image and pass
+    # forever. That is precisely the trap the three unregistered sunset_*
+    # fixtures fell into before #257. Vulkan is not built on macOS, so the
+    # SPIR-V half of the push-constant change is unexercised by CI on this
+    # host and is flagged as such in the PR.
+    #
+    # TOLERANCES ARE MEASURED, NOT COPIED FROM THE NEIGHBOURS. The sibling
+    # night cells run 32 / 4 / 2, and at 2% of 196608 pixels this cell would
+    # be VACUOUS: a planet is a sub-pixel point source, so deleting the
+    # entire feature moves only a handful of pixels and a 2% threshold would
+    # sail past it. A golden that cannot fail is worse than no golden.
+    #
+    # Measured on the dev M4 Max with `pt_render_one_frame` + `imgdiff`:
+    #   this fixture rendered twice, Metal vs Metal:
+    #       bad = 0    mean_delta = 0.000000   max_delta = 0.0000
+    #   this fixture vs. the same fixture with `r_planets 0`:
+    #       bad = 11   mean_delta = 0.010300   max_delta = 395.7714
+    # The scene is pure sky -- no geometry, so no path-traced stochastic
+    # term -- which is why the repeat floor is exactly zero rather than
+    # merely small. MEAN_DELTA 0.004 and FAIL_PERCENT 0.0025 (~4.9 px) each
+    # sit about 2.5x below the planets-off signal and infinitely above the
+    # floor, so BOTH of imgdiff's fail criteria trip if the planets stop
+    # arriving. MAX_DELTA stays at the house 32: it only classifies which
+    # pixels count as bad, and a bright point source clears it by 12x.
+    #
+    # Sanity check when touching this: `ctest -N | grep planetarium` must
+    # list golden_planetarium_jupiter__metal__svgf_atrous_render and _diff.
+    # A fixture with no registered cell tests nothing -- three sunset_*
+    # fixtures sat in this repo in exactly that state until #257.
+    pt_add_golden_cell(SCENE planetarium_jupiter BACKEND metal DENOISER svgf_atrous
+        MAX_DELTA 32 MEAN_DELTA 0.004 FAIL_PERCENT 0.0025)
+    # --- end Planetarium ---------------------------------------------------
 
     # --- Curved-Earth sunset fixtures (#51) --------------------------------
     # These three .cfg files have existed since the #51 spherical-Earth
