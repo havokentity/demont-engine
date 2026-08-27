@@ -1377,23 +1377,99 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # leaving the shell, which is what the roadmap says and what P6 owns.
     # planet_aerial.cfg goes as high as the atmosphere is currently valid.
     #
-    # DETERMINISM. Each fixture sets r_planet_lod_freeze 1 and
-    # pt_planet_settle, which hold the capture until the selector has
-    # measured every leaf it wants and every desired chunk is resident --
-    # exactly like a loading frame, and for the same reason.
+    # DETERMINISM, VERIFIED RATHER THAN ASSUMED. Each fixture sets
+    # r_planet_lod_freeze 1 and pt_planet_settle, which hold the capture
+    # until the selector reaches a fixed point -- and "fixed point" is a
+    # stronger statement than it first looks. Three separate bugs stood
+    # between "the freeze cvar is set" and "two runs render the same
+    # pixels", and each was found by rendering twice and comparing rather
+    # than by reading the code:
+    #
+    #   * settle frames accumulated into the same buffer while residency
+    #     was still growing, and the settle FRAME COUNT is wall-clock
+    #     dependent -- so the capture averaged a run-specific number of
+    #     run-specific intermediate geometries. 22% bad pixels between two
+    #     identical runs. Settle frames now discard the accumulator.
+    #   * the LOD hysteresis consults the previous frame's leaf set, so the
+    #     converged set depended on the order chunks arrived in, which is
+    #     the order a worker pool finished them in. Hysteresis is suppressed
+    #     under freeze; interactive sessions keep it.
+    #   * PlanetTerrain::Update selected BEFORE draining finished bakes, so
+    #     the desired set was always one drain stale and convergence could
+    #     be declared on a set chosen without the metrics that had just
+    #     landed. Two runs settled on genuinely different 1128- and
+    #     1074-chunk sets. Draining first fixed it; requiring the residency
+    #     DIGEST to match the previous frame's, with the baker idle, makes
+    #     it airtight.
+    #
+    # The digest is why that last one was findable at all: a chunk COUNT
+    # cannot distinguish two different sets of the same size, and 1128 vs
+    # 1128 looked like success. Three runs of each cell now agree on the
+    # digest exactly -- 3f4f417f3e74165d, a4a1525ddd40b4ab and
+    # cbd64b5c7c757227 -- and the settle frame count still varies, which is
+    # the point: the ANSWER is stable even though the path to it is not.
+    #
+    # Each fixture also keeps its residency clear of r_planet_chunk_budget.
+    # At the cap the selector raises tau by bisection to make the set fit,
+    # and the bisection's trial sizes depend on which metrics happen to be
+    # measured when it runs -- a determinism hole that has not been closed,
+    # only avoided here. Noted in r_planet_chunk_budget's docstring.
     #
     # FRAMES 32 rather than the default 64: the settle frames come on top
-    # of the budget and each of these fixtures takes 50-60 of them, so 64
+    # of the budget and each of these takes 55-85 of them, so 64
     # accumulation frames on top runs the cell close to its timeout on a
-    # loaded machine. With r_planet_lod_freeze the geometry is identical
-    # across every accumulated frame, so the noise floor at 32 is the
+    # loaded machine. With the geometry frozen, the floor at 32 is the
     # ordinary path-tracer one.
+    #
+    # ---- TOLERANCES ARE MEASURED, NOT COPIED FROM A NEIGHBOUR ----------
+    #
+    # A cell whose thresholds sit above its own signal reports PASS while
+    # comparing nothing, which is #252. Both numbers were measured on this
+    # host at these exact settings, with each render in an isolated working
+    # directory so archived cvars cannot leak between runs:
+    #
+    #   RUN-TO-RUN NOISE (two identical runs), once the settle no longer
+    #   advances the sample sequence:
+    #     planet_surface   mean 0.000005  bad 0.000%   (max_delta 1.00)
+    #     planet_aerial    mean 0.000273  bad 0.000%   (max_delta 2.24)
+    #     planet_lod_seam  mean 0.000000  bad 0.000%   (max_delta 0.00)
+    #
+    #   SIGNAL, feature deleted (r_planet_terrain 0):
+    #     planet_surface   mean  96.4     bad  99.6%
+    #     planet_aerial    mean 280.1     bad 100.0%
+    #     planet_lod_seam  mean 263.1     bad 100.0%
+    #
+    #   SIGNAL, real Earth deleted (r_planet_dem pointed at nothing, so the
+    #   fractal fallback stands in). This is the tighter and more specific
+    #   claim, because these goldens are pinned against ETOPO 2022 and not
+    #   merely against "some terrain":
+    #     planet_surface   mean 185.6     bad  99.9%
+    #     planet_aerial    mean 176.6     bad  99.5%
+    #     planet_lod_seam  mean  82.8     bad  98.3%
+    #
+    # So the thresholds are the MATRIX DEFAULTS (16 / 2 / 1), passed
+    # explicitly rather than inherited so a reader can see they were chosen
+    # against a measurement. The largest run-to-run per-pixel delta is
+    # 2.24, which is below MAX_DELTA 16 and therefore classifies NO pixel
+    # as bad -- so FAIL_PERCENT 1 has the whole of its range as headroom,
+    # against a weakest signal of 98.3% bad. MEAN_DELTA 2 sits four orders
+    # of magnitude above the worst observed mean (0.000273) and 41x below
+    # the weakest signal (82.8).
+    #
+    # The earlier, looser 6 / 3 pair was sized against a noise floor that
+    # turned out to be a bug rather than a floor; tightening to the
+    # defaults is what the fixed engine earns.
+    #
+    # All six feature-deleted renders FAIL these thresholds and all
+    # identical-run renders PASS them, checked against the committed PNGs.
+    # Re-measure if a fixture's camera, resolution, exposure or frame count
+    # changes: the margins are the point, not the numbers.
     pt_add_golden_cell(SCENE planet_surface  BACKEND metal DENOISER off
-                       FRAMES 32)
+                       FRAMES 32 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
     pt_add_golden_cell(SCENE planet_aerial   BACKEND metal DENOISER off
-                       FRAMES 32)
+                       FRAMES 32 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
     pt_add_golden_cell(SCENE planet_lod_seam BACKEND metal DENOISER off
-                       FRAMES 32)
+                       FRAMES 32 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
     # --- end Planetary P4 -------------------------------------------------
     pt_add_golden_cell(SCENE planet_horizon_clouds        BACKEND metal DENOISER off
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
