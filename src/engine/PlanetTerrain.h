@@ -109,6 +109,10 @@ struct TerrainStats {
     std::uint64_t evictions     = 0;   // cumulative
     double        last_build_ms = 0.0;
     bool          converged     = false;
+    // Order-independent digest of the desired leaf set; see
+    // TerrainQuadtree::DesiredDigest. Two runs of a frozen capture must
+    // agree on this, and a chunk count is not evidence that they do.
+    std::uint64_t desired_digest = 0;
 };
 
 class PlanetTerrain {
@@ -216,6 +220,9 @@ private:
     std::vector<float>                 descriptors_;
     TerrainStats                       stats_{};
     glm::dvec3                         last_anchor_{0.0};
+    // Previous frame's residency digest; convergence requires two
+    // consecutive frames to agree. See the note at the convergence test.
+    std::uint64_t                      prev_digest_ = 0;
     bool                               first_update_ = true;
 
     // One-entry cache for AltitudeAboveTerrain. `mutable` because the query

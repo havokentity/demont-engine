@@ -1984,10 +1984,22 @@ namespace cvar {
             "67.6 KB of shader-visible vertex data plus its BLAS, so "
             "~100-170 KB resident. At 1024 that is ~170 MB, unremarkable on "
             "unified memory. The cap is SOFT at the boundary: over budget "
-            "the selector merges the lowest-priority (smallest e_L/d) "
-            "sibling groups and then re-balances, and the 2:1 restriction "
-            "wins the tie because breaking it produces cracks. Changing "
-            "this restarts the terrain streamer.", CVAR_ARCHIVE);
+            "the selector raises tau by bisection until the balanced set "
+            "fits, which is the same rule everywhere and therefore stays "
+            "balanced -- merging the lowest-priority sibling groups instead "
+            "does NOT converge, because a merged parent violates the 2:1 "
+            "restriction and the re-balance splits it straight back. "
+            "Changing this restarts the terrain streamer.\n"
+            "KNOWN LIMIT: a capture that sits ON the cap is not guaranteed "
+            "reproducible. The bisection's trial set sizes depend on which "
+            "chunk metrics happen to have been measured when it runs, and "
+            "chunks are baked asynchronously, so two runs can settle at "
+            "different effective tau. r_planet_lod_freeze pins the set once "
+            "converged but cannot make the convergence itself unique. The "
+            "planet golden fixtures avoid this by keeping their residency "
+            "clear of the cap; a fix would have to make the bisection "
+            "refuse a tau whose trial set contains unmeasured nodes.",
+            CVAR_ARCHIVE);
     PT_CVAR(r_planet_blas_budget_ms, "2.0",
             "Per-frame wall-clock budget for terrain acceleration-structure "
             "builds, in milliseconds. P0 (#254) made TLAS instance updates "
@@ -2687,11 +2699,20 @@ bool Engine::Init() {
     if (auto* v = C.FindCVar("r_scene_default")) scene_default = v->value;
     // Returns true when the seed actually wrote -- i.e. the scene had no
     // opinion. Callers that need to know include the stand-on-the-surface
-    // request: a fixture that placed its own camera (planet_orbit.cfg puts
-    // it at 3.0e7 m) must not have it snapped back to eye height.
+    // request: a fixture that placed its own camera (planet_aerial.cfg puts
+    // it at 4 km) must not have it snapped back to eye height.
+    //
+    // The test is CVar::assigned, not `value == default_value`. The latter
+    // cannot tell "untouched" from "explicitly set to the default value",
+    // and that difference is load-bearing here: r_planet_terrain's default
+    // IS 0, so a fixture or an --extra turning terrain OFF in an
+    // r_scene_default=earth scene had its choice silently overwritten by
+    // this seed. Measuring the "feature deleted" signal for the golden
+    // tolerances is what surfaced it -- terrain-off came out pixel-identical
+    // to terrain-on, because terrain had never actually been turned off.
     auto seed_cvar = [&C](const char* name, const char* value) {
         if (auto* v = C.FindCVar(name)) {
-            if (v->value == v->default_value) { v->value = value; return true; }
+            if (!v->assigned) { v->value = value; return true; }
         }
         return false;
     };
@@ -6802,6 +6823,20 @@ void Engine::UpdatePlanetTerrain() {
         planet_settle_frames_ < static_cast<std::uint32_t>(settle_budget)) {
         ++planet_settle_frames_;
         planet_settling_ = true;
+        // Throw away the accumulator on every settle frame, so the capture
+        // that follows starts from a clean slate against the FINAL frozen
+        // geometry.
+        //
+        // Without this the settle frames accumulate into the same buffer
+        // while the residency set is still growing, and the number of
+        // settle frames is itself wall-clock dependent (55, 57 and 58 on
+        // three consecutive runs of planet_surface) -- so the captured
+        // image was a blend of a run-specific number of run-specific
+        // intermediate geometries. Two identical runs differed by 22% bad
+        // pixels on planet_aerial. This is the other half of the freeze
+        // gate: pinning the residency set is worthless if the frames
+        // rendered on the way to it are still in the average.
+        accum_dirty_ = true;
         if (planet_settle_frames_ == static_cast<std::uint32_t>(settle_budget)) {
             // Report rather than hang: a scene that cannot converge inside
             // its budget produces a capture that is NOT deterministic, and
@@ -6817,8 +6852,9 @@ void Engine::UpdatePlanetTerrain() {
     } else {
         if (planet_settling_) {
             LOG_INFO("planet: residency converged after {} settle frame(s) "
-                     "({} chunks resident, {} BLAS builds)",
+                     "({} chunks resident, digest {:016x}, {} BLAS builds)",
                      planet_settle_frames_, planet_terrain_->Stats().resident,
+                     planet_terrain_->Stats().desired_digest,
                      planet_terrain_->Stats().blas_builds);
         }
         planet_settling_ = false;
@@ -8999,7 +9035,21 @@ void Engine::RenderFrame() {
     push.right_xyz[2]  = right.z; push.right_xyz[3] = 0.0f;
     push.up_xyz[0]     = up.x; push.up_xyz[1] = up.y;
     push.up_xyz[2]     = up.z; push.up_xyz[3] = 0.0f;
-    push.frame_index   = frame_index_++;
+    // Planetary P4 (#258): a settle frame does not advance the sample
+    // sequence. frame_index_ seeds PathTrace's pcgHash, so it decides WHICH
+    // Monte Carlo samples the capture draws -- and the number of settle
+    // frames is wall-clock dependent (47 to 66 across runs of the same
+    // cell, and it moves again under a loaded GPU). Letting the counter run
+    // during the settle means two runs with identical GEOMETRY still start
+    // their capture on different samples: measured 8.4% bad pixels between
+    // runs whose residency digests matched exactly.
+    //
+    // Freezing it here is the sample-sequence half of the same idea as
+    // discarding the accumulator on settle frames. Together they make the
+    // capture a pure function of the converged scene rather than of how
+    // long the machine took to get there. Outside smoke mode
+    // planet_settling_ is never true and this is the unchanged expression.
+    push.frame_index   = planet_settling_ ? frame_index_ : frame_index_++;
     // When the denoiser is on it does its own temporal reuse, so we feed
     // it FRESH (un-accumulated) per-frame radiance every dispatch. The
     // shader still writes accum_hdr (so toggling denoiser off picks back

@@ -270,21 +270,28 @@ bool PlanetTerrain::Update(const pt::planet::LodParams& lod,
     if (!Ready()) return false;
     FlushRetired(false);
 
-    // --- 1. Selector ------------------------------------------------------
-    // The selector target IS the arena size: EnforceBudget raises tau until
-    // the balanced set fits, so the cap is hard on both sides.
-    pt::planet::LodParams sel = lod;
-    sel.chunk_budget = static_cast<int>(chunk_budget_);
-    tree_.Select(sel);
-    const auto& desired = tree_.Desired();
-
-    // --- 2. Drain finished bakes -----------------------------------------
+    // --- 1. Drain finished bakes FIRST ------------------------------------
+    // Before the selector, not after. Selecting first means the desired set
+    // is always computed from a metric map one drain out of date -- and on
+    // the frame the last bakes land, the convergence test would then pass
+    // against a set that was chosen WITHOUT those metrics. Two runs of a
+    // frozen capture converged on genuinely different 1128- and
+    // 1074-chunk sets that way, which a chunk count nearly hid and the
+    // residency digest made obvious.
     std::vector<TerrainChunkData> fresh;
     baker_.Drain(fresh, 64);
     for (auto& d : fresh) {
         tree_.NoteChunk(d);
         baked_[d.key] = std::move(d);
     }
+
+    // --- 2. Selector ------------------------------------------------------
+    // The selector target IS the arena size: EnforceBudget raises tau until
+    // the balanced set fits, so the cap is hard on both sides.
+    pt::planet::LodParams sel = lod;
+    sel.chunk_budget = static_cast<int>(chunk_budget_);
+    tree_.Select(sel);
+    const auto& desired = tree_.Desired();
 
     // --- 3. Diff residency ------------------------------------------------
     bool dirty = fresh.empty() ? false : true;
@@ -413,8 +420,17 @@ bool PlanetTerrain::Update(const pt::planet::LodParams& lod,
                            static_cast<std::size_t>(baker_.InFlight());
     // "Converged" for the capture gate: the selector has measured every
     // leaf it wants, nothing is baking, and every desired chunk is resident.
+    const std::uint64_t digest = tree_.DesiredDigest();
+    // CONVERGED means "the answer stopped changing", not "the answer
+    // happens to reference only measured nodes right now". With the baker
+    // idle and the queue empty the metric map cannot grow, so a digest that
+    // matches the previous frame's is a genuine fixed point -- and that is
+    // the only statement strong enough to pin a golden against.
     stats_.converged = tree_.Converged() && baker_.Idle() &&
-                       resident_.size() == desired.size() && requested_.empty();
+                       resident_.size() == desired.size() &&
+                       requested_.empty() && digest == prev_digest_;
+    prev_digest_ = digest;
+    stats_.desired_digest = digest;
     return dirty;
 }
 

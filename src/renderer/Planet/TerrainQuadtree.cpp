@@ -93,10 +93,25 @@ void TerrainQuadtree::Descend(const ChunkKey& k, const LodParams& p,
     // catch nodes that did not exist last frame (their parent was the leaf),
     // and loosening the threshold for those would let a chunk skip straight
     // past its own split distance on the frame it first appears.
+    //
+    // HYSTERESIS IS SUPPRESSED UNDER `freeze`, and that is a determinism
+    // requirement rather than a tidiness one. The rule consults
+    // prev_desired_, so the set it converges to depends on the ORDER chunks
+    // arrived in -- and chunks are baked asynchronously, so that order is a
+    // function of wall clock. Two runs of the same capture settled on
+    // different residency sets and therefore different pixels. Without the
+    // hysteresis term the descent is a pure function of (camera, metrics),
+    // and metrics are pure functions of the key, so the converged set is
+    // unique. Interactive sessions keep the hysteresis -- it is what stops
+    // a chunk issuing a BLAS build and destroy every frame.
     bool was_split = true;
-    for (ChunkKey a = k;; a = a.Parent()) {
-        if (prev_desired_.find(a) != prev_desired_.end()) { was_split = false; break; }
-        if (a.level == 0) break;
+    if (p.freeze) {
+        was_split = false;
+    } else {
+        for (ChunkKey a = k;; a = a.Parent()) {
+            if (prev_desired_.find(a) != prev_desired_.end()) { was_split = false; break; }
+            if (a.level == 0) break;
+        }
     }
     const double threshold = was_split ? d_split * std::max(p.hysteresis, 1.0)
                                        : d_split;
@@ -254,6 +269,26 @@ void TerrainQuadtree::Select(const LodParams& p) {
               });
     wanted_.erase(std::unique(wanted_.begin(), wanted_.end()), wanted_.end());
     if (wanted_.empty()) converged_once_ = true;
+}
+
+std::uint64_t TerrainQuadtree::DesiredDigest() const noexcept {
+    // FNV-1a over the ordered key stream. desired_ is a std::set, so the
+    // walk is sorted and the digest depends on the SET, not on insertion
+    // order -- which is the point.
+    std::uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](std::uint64_t v) {
+        for (int b = 0; b < 8; ++b) {
+            h ^= (v >> (b * 8)) & 0xFFull;
+            h *= 1099511628211ull;
+        }
+    };
+    for (const ChunkKey& k : desired_) {
+        mix(k.face);
+        mix(k.level);
+        mix(k.i);
+        mix(k.j);
+    }
+    return h;
 }
 
 std::uint32_t TerrainQuadtree::StitchMask(const ChunkKey& k) const {

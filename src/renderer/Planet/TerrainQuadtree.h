@@ -145,6 +145,13 @@ public:
 
     std::size_t MetricCount() const noexcept { return metrics_.size(); }
 
+    // Order-independent 64-bit digest of the desired leaf set. The whole
+    // determinism claim for a frozen capture is "two runs converge on the
+    // SAME set", and a chunk COUNT cannot say that -- two different sets of
+    // 1128 chunks compare equal on size. Logged at convergence so the claim
+    // is checkable from a run's output.
+    std::uint64_t DesiredDigest() const noexcept;
+
     // Priority of a node: e_L / d, the same quantity the split rule uses.
     // Larger means "more badly needed". Exposed for the eviction order.
     double Priority(const ChunkKey& k, const LodParams& p) const;
