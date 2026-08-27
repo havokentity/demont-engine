@@ -1079,6 +1079,66 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     endforeach()
     # --- end #112 sky/sun/stars/moon matrix --------------------------------
 
+    # --- Curved-Earth sunset fixtures (#51) --------------------------------
+    # These three .cfg files have existed since the #51 spherical-Earth
+    # work landed and were NEVER registered: the fixtures sat in
+    # tests/goldens/scenes/ with no cell and no PNG, so #51's own
+    # acceptance criteria -- "sunset / sunrise renders show realistic
+    # horizon falloff at altitude" and the spherical-vs-planar A/B --
+    # have never been tested by anything. Registered here, and pinned on
+    # unmodified main BEFORE the P3 (#257) atmosphere work starts, so
+    # that phase's change to them is a measurable delta rather than an
+    # unverifiable assertion.
+    #
+    #   sunset_horizon          ground camera (y=1.7) at a 2 deg sun --
+    #                           the longest sea-level slant path the
+    #                           model supports, where curved vs. flat
+    #                           airmass differs most.
+    #   sunset_altitude         the same sun from 10 km (airliner
+    #                           altitude), where the visible horizon dips
+    #                           ~3.2 deg below the mathematical one.
+    #   sunset_altitude_planar  identical to sunset_altitude except
+    #                           `r_planet_radius 0`, which routes
+    #                           atmosphericTransmittance through the
+    #                           legacy planar-exponential integral and
+    #                           disables procSky's horizon dip. This is
+    #                           the A/B half: the pair only means
+    #                           something if BOTH sides are pinned.
+    #
+    # Backends: software (the CI-exercised deterministic lane, label
+    # golden_software) and metal. Both are meaningful here for a reason
+    # specific to this phase -- SoftwareTracer.cpp is a hand-written CPU
+    # tracer, not a Slang-to-CPU emit, and carries its own procSky mirror
+    # with NO atmospheric transmittance at all. So a shader-only change
+    # must move the metal cells and leave the software cells alone; a
+    # software cell that moves is evidence the diff leaked into host code.
+    # Pinning both is what makes that inference available.
+    #
+    # Measured at pin time, and worth recording because it bounds what
+    # the A/B pair can prove: on METAL the spherical and planar halves
+    # differ by mean 6.41 / max 21.2 L2 across 48.6% of the frame, so the
+    # pair does demonstrate the spherical model doing something. On
+    # SOFTWARE the two halves are BIT-IDENTICAL (max_delta 0) -- the CPU
+    # tracer never consults r_planet_radius, so its half of the A/B
+    # carries no spherical-vs-planar signal at all. The software cells
+    # are pinned anyway, as the control: they are the cells that must NOT
+    # move when a shader changes.
+    #
+    # Tolerances match the #112 sky cells for the same reason: bright HDR
+    # sky pixels exaggerate cross-backend FP roundoff. Measured on the dev
+    # M4 Max at pin time, run-to-run over three renders: max_delta 0 on
+    # every one of the six cells (no meshes -> no TLAS build entropy, no
+    # sim -> no dt integration), so the headroom below is entirely for
+    # cross-host / cross-driver variance and none of it is masking noise.
+    set(_sunset_scenes sunset_horizon sunset_altitude sunset_altitude_planar)
+    foreach(_scene IN LISTS _sunset_scenes)
+        pt_add_golden_cell(SCENE ${_scene} BACKEND software DENOISER off
+            MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+        pt_add_golden_cell(SCENE ${_scene} BACKEND metal    DENOISER off
+            MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+    endforeach()
+    # --- end curved-Earth sunset fixtures ----------------------------------
+
     # --- Wave 9 hosek-sky --------------------------------------------------
     # Hosek-Wilkie physically-based sky (r_sky_mode hosek). Daytime sun
     # at +50 deg, camera yawed toward the sun azimuth so the frame shows
