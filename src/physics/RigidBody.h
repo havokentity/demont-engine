@@ -49,13 +49,24 @@ enum class Shape : std::uint8_t {
 };
 
 struct RigidBody {
-    // Translational state (mirrors Particle: prev/curr pair for the
-    // implicit-velocity Verlet style, plus inv_mass and a collision
+    // Translational state (mirrors Particle: prev/curr position pair
+    // plus an EXPLICIT linear velocity, inv_mass, and a collision
     // radius). For boxes, `radius` is the bounding-sphere radius used
     // by Phase 2a's sphere-only collision; the geometric shape itself
     // is described by `shape` + `half_extents`.
+    //
+    // `velocity` exists for the same reason as Particle::velocity
+    // (#270): the original position-Verlet form injected gravity as
+    // `accel * sdt^2`, an absolute increment that disappears into the
+    // float32 ULP of the position above ~1 km, so a rigid body simply
+    // stopped falling. Rigid bodies already carried `omega` for the
+    // rotational half of the state for the analogous reason (external
+    // impulses need somewhere to land); this makes the translational
+    // half symmetric. Same invariant as Particle: at substep end
+    // curr_pos - prev_pos == velocity * LastSubstepDt().
     glm::vec3 prev_pos    {0.0f, 0.0f, 0.0f};
     glm::vec3 curr_pos    {0.0f, 0.0f, 0.0f};
+    glm::vec3 velocity    {0.0f, 0.0f, 0.0f};   // m/s, world frame (#270)
     float     inv_mass    = 1.0f;          // 1 / kg; 0 = kinematic
     float     radius      = 0.3f;          // metres (bounding sphere)
 

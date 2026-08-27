@@ -140,3 +140,45 @@ function(pt_set_compiler_options target)
         )
     endif()
 endfunction()
+
+# --- Strict IEEE float opt-out (issue #270) --------------------------------
+# Undo the Release -ffast-math / /fp:fast above for a single target whose
+# correctness depends on IEEE-754 semantics being what the source says.
+#
+# Call this AFTER pt_set_compiler_options(<target>) -- target_compile_options
+# appends in call order, and for both toolchains the LAST float-model flag on
+# the command line wins, so ordering is what makes the opt-out effective
+# rather than merely present.
+#
+# Why any target would want this:
+#   * -ffast-math licenses reassociation, so two spellings of the same
+#     expression are no longer guaranteed to produce the same bits. pt_physics'
+#     integrator predicts a position and then re-derives that same predicted
+#     position to measure how far the constraint solver moved the body; if the
+#     two evaluations disagree by an ULP, every free-falling body picks up a
+#     spurious velocity correction on every substep (see #270, and #263 / #267
+#     for the same hazard biting the shader side).
+#   * It also makes Release and Debug non-identical, so a physics bug found in
+#     a shipped build need not reproduce in the build you can step through.
+#   * -ffp-contract=off is applied on top because -fno-fast-math resets the
+#     contraction mode to `on` rather than `off`; without it clang still folds
+#     a*b+c into an FMA and the "same expression, same bits" property that the
+#     predict/correct pair depends on is only true by luck.
+#
+# Scope note: this is deliberately a whole-target opt-out rather than a
+# per-source one. Everything in pt_physics is simulation code where
+# reproducibility is worth more than the last few percent of autovectorisation
+# -- including SmokeSPH and OceanFFT, which get determinism they did not
+# previously have. Nothing outside the target it is called on is affected.
+function(pt_set_strict_fp target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE
+            $<$<CONFIG:Release>:/fp:precise>
+        )
+    else()
+        target_compile_options(${target} PRIVATE
+            -fno-fast-math
+            -ffp-contract=off
+        )
+    endif()
+endfunction()
