@@ -312,9 +312,17 @@ endif()
 # the kernel would pass with the sites left naive.
 pt_add_test(pt_math_altitude
     pt_math_altitude_test.cpp)
+#
+# It re-reads CloudsRaymarch.slang too (issue #276). #271 was scoped to
+# PathTrace.slang and left the pre-pass's own copy of planetAltitude on
+# the naive form, so the engine carried two definitions of one function
+# that disagreed -- and this target's substring pin could not see it,
+# because it was only ever pointed at one of the two files. The added
+# case COUNTS occurrences across both.
 target_compile_definitions(pt_math_altitude PRIVATE
     PT_SHADER_MATH_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTraceMath.slang"
-    PT_SHADER_PATHTRACE_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang")
+    PT_SHADER_PATHTRACE_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang"
+    PT_SHADER_CLOUDSRAYMARCH_PATH="${CMAKE_SOURCE_DIR}/shaders/CloudsRaymarch.slang")
 if(NOT MSVC)
     target_compile_options(pt_math_altitude PRIVATE $<$<CONFIG:Release>:-ffast-math>)
 else()

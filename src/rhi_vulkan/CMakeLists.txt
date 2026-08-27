@@ -163,7 +163,7 @@ pt_compile_slang(
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/CloudsRaymarch.slang
     STAGE compute ENTRY main TARGETS spirv
-    MODULE_DEPS PathTraceCloud)
+    MODULE_DEPS PathTraceCloud PathTraceMath)
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/CloudsComposite.slang
     STAGE compute ENTRY main TARGETS spirv)

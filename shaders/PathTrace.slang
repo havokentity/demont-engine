@@ -5784,11 +5784,20 @@ void main(uint2 tid : SV_DispatchThreadID) {
             // at hundreds of meters of camera-space Z (a grazing ray
             // skims the ground for a long distance before hitting), and
             // anything > 1000 m of legitimate geometry tripped the
-            // composite's gate. 1e10 (~10 billion m, beyond Pluto) is
-            // comfortably outside any plausible engine scene scale
-            // (1 unit = 1 metre) and small enough that downstream
-            // numeric ops (depth deltas, edge-stop exponentials) stay
-            // in safe float32 range.
+            // composite's gate. 1e10 m is comfortably outside any
+            // plausible engine scene scale (1 unit = 1 metre) and small
+            // enough that downstream numeric ops (depth deltas,
+            // edge-stop exponentials) stay in safe float32 range.
+            //
+            // This comment used to justify 1e10 by claiming it was past
+            // the outer planets (issue #276). It is not: 1e10 m is
+            // 0.067 AU, INSIDE Mercury's orbit (0.39 AU), and roughly
+            // 590x short of the 39 AU that claim named. The sentinel
+            // value itself is fine for its purpose -- the yardstick that
+            // justified it was not, and the true ceiling is worth
+            // recording because it is a real one: geometry at 1.5e11 m
+            // (1 AU) would collide with this sentinel, a landmine for
+            // anyone later adding a body you can fly to.
             depth_view = 1.0e10;
         }
 

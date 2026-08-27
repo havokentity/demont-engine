@@ -1022,3 +1022,94 @@ TEST_CASE("shader mirror is still faithful") {
     CHECK(pt.find("length(p-planet_center_radius.xyz)-planet_center_radius.w")
           == std::string::npos);
 }
+
+TEST_CASE("every planetAltitude copy uses the accumulated kernel (#276)") {
+    // #271 fixed PathTrace.slang's planetAltitude and stopped there,
+    // because another agent held the rest of the tree that cycle.
+    // CloudsRaymarch.slang kept its own copy, still naive -- so the engine
+    // shipped two definitions of one function that disagreed, with the
+    // raymarched cloud pre-pass holding the defective one.  That is not a
+    // cosmetic duplication: the value feeds exp(-h/8000), so ~0.5 m of
+    // altitude noise lands in density and extinction rather than staying
+    // geometric, and the two r_clouds_mode paths therefore disagreed
+    // numerically at one body.
+    //
+    // The previous test pins PathTrace.slang's copy by SUBSTRING, which is
+    // the weaker instrument: `find() != npos` still matches when a second,
+    // unfixed copy exists somewhere else in the same file, and it matched
+    // happily for the whole time #276 was live because it was only ever
+    // pointed at one of the two files.  This case COUNTS instead, across
+    // every shader that declares the function, so "one of them is right"
+    // cannot pass for "all of them are right".
+    auto tighten = [](const char* path) {
+        std::ifstream f(path);
+        CAPTURE(path);
+        REQUIRE(f.good());
+        std::stringstream ss;
+        ss << f.rdbuf();
+        std::string src = ss.str();
+        std::string tight;
+        tight.reserve(src.size());
+        for (char ch : src) {
+            if (!std::isspace(static_cast<unsigned char>(ch))) tight.push_back(ch);
+        }
+        return tight;
+    };
+    auto count = [](const std::string& hay, const std::string& needle) {
+        std::size_t n = 0, at = 0;
+        while ((at = hay.find(needle, at)) != std::string::npos) { ++n; ++at; }
+        return n;
+    };
+
+    const std::string pt = tighten(PT_SHADER_PATHTRACE_PATH);
+    const std::string cr = tighten(PT_SHADER_CLOUDSRAYMARCH_PATH);
+
+    // Exactly one definition per file, and both spherical branches route
+    // through the accumulated kernel.  Counting is what makes this a real
+    // pin: if a third copy is ever pasted into either file, the count
+    // moves off 1 and this fails, whereas a find() would not notice.
+    const std::string decl = "floatplanetAltitude(float3p){";
+    CHECK(count(pt, decl) == 1u);
+    CHECK(count(cr, decl) == 1u);
+
+    const std::string fixed =
+        "returnptAltitudeAboveSphere(p,planet_center_radius.xyz,"
+        "planet_center_radius.w);";
+    CHECK(count(pt, fixed) == 1u);
+    CHECK(count(cr, fixed) == 1u);
+
+    // The planar branch is byte-identical in both, so a planar-frame scene
+    // (every fixture that exists today) is unaffected by this change.
+    const std::string planar = "if(planet_center_radius.w<=0.0)returnp.y;";
+    CHECK(count(pt, planar) == 1u);
+    CHECK(count(cr, planar) == 1u);
+
+    // The naive form is gone from BOTH files, not just from the one #271
+    // was scoped to.  Zero, counted, in each.
+    const std::string naive =
+        "length(p-planet_center_radius.xyz)-planet_center_radius.w";
+    CHECK(count(pt, naive) == 0u);
+    CHECK(count(cr, naive) == 0u);
+
+    // CloudsRaymarch can only call the kernel if it imports the module.
+    // Without this the file compiles today only because the substitution
+    // above happens to be there; the import is the load-bearing half.
+    CHECK(count(cr, "importPathTraceMath;") == 1u);
+}
+
+TEST_CASE("the 1e10 depth sentinel is not described as beyond Pluto (#276)") {
+    // 1e10 m is 0.067 AU -- inside Mercury's orbit (0.39 AU).  Pluto's mean
+    // distance is ~39 AU = 5.9e12 m, so the old comment was wrong by ~590x.
+    // The sentinel value is fine; only its stated justification was not,
+    // and a wrong yardstick in a comment is the kind of thing someone
+    // reasons FROM later.  Pinned because prose has no other guard.
+    std::ifstream f(PT_SHADER_PATHTRACE_PATH);
+    REQUIRE(f.good());
+    std::stringstream ss;
+    ss << f.rdbuf();
+    const std::string src = ss.str();
+    CHECK(src.find("beyond Pluto") == std::string::npos);
+    // The sentinel itself must still be there -- this test must not be
+    // satisfiable by deleting the whole comment block and the code with it.
+    CHECK(src.find("depth_view = 1.0e10;") != std::string::npos);
+}

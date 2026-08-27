@@ -173,7 +173,7 @@ pt_compile_slang(
     STAGE   compute
     ENTRY   main
     TARGETS metal
-    MODULE_DEPS PathTraceCloud
+    MODULE_DEPS PathTraceCloud PathTraceMath
 )
 pt_compile_slang(
     TARGET  pt_rhi_metal

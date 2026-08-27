@@ -79,6 +79,14 @@
 // transmittance scalar) -- same format StarsComposite expects.
 
 import PathTraceCloud;
+// PathTraceMath supplies ptAltitudeAboveSphere (issue #271), the
+// cancellation-free "how far above the surface" kernel this kernel's
+// planetAltitude() delegates to. Added for #276: before it, this file
+// carried its own naive `length(p - c) - R`, so the raymarched cloud
+// pre-pass and the main path tracer disagreed about where a given point
+// sat relative to the surface by ~0.5 m at Earth radius -- an error that
+// lands in exp(-h/8000) rather than staying geometric.
+import PathTraceMath;
 
 [[vk::binding(0, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> clouds_color_tex;
 [[vk::binding(1, 0), vk::image_format("r32f")]]    RWTexture2D<float>  cloud_trans_tex;
@@ -195,9 +203,26 @@ float3 localUp(float3 p) {
     return normalize(p - planet_center_radius.xyz);
 }
 
+// Issue #276. This used to be `length(p - c) - R`, the naive form that
+// #271 (e1dcf9c) removed from PathTrace.slang's copy of this same
+// function -- so the engine shipped two definitions of one function that
+// disagreed, with the cloud pre-pass holding the defective one.
+//
+// At Earth radius the naive form differences two nearly-equal ~6.371e6
+// values, and float32 keeps ~0.5 m of the result. That value is not used
+// geometrically: it feeds the scale-height exponential exp(-h/8000) and
+// the cloud layer's own band tests, so the error lands directly in
+// density and extinction. ptAltitudeAboveSphere forms |p - c|^2 - R^2
+// through the fixed-point accumulator and divides by |p - c| + R, which
+// never differences the two large quantities; measured accuracy is
+// 3.3e-7 m at 1 m altitude, 1-3 ULP of the returned float32 at every
+// scale tested (#271).
+//
+// The planar branch is untouched and stays exactly `p.y`.
 float planetAltitude(float3 p) {
     if (planet_center_radius.w <= 0.0) return p.y;
-    return length(p - planet_center_radius.xyz) - planet_center_radius.w;
+    return ptAltitudeAboveSphere(p, planet_center_radius.xyz,
+                                 planet_center_radius.w);
 }
 
 // Per-pixel deterministic hash for jitter; mirrors PathTrace.slang's
