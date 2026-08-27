@@ -229,16 +229,16 @@ float largestOperand(F3 p, F3 c, float rad) {
     return std::max(maxc(p), std::max(maxc(c), rad));
 }
 
-constexpr int kPtAltitudeMaxExp = 60;
+constexpr int kPtAccumMaxExp = 60;
 
 bool ptAltitudeStable(F3 p, F3 c, float rad) {
     if (!(rad > kPtStableSphereRadius)) { return false; }
-    return ptFloatExp(largestOperand(p, c, rad)) <= kPtAltitudeMaxExp;
+    return ptFloatExp(largestOperand(p, c, rad)) <= kPtAccumMaxExp;
 }
 
 PT_MIRROR float ptAltitudeNaive(F3 oc, float rad) {
     int e = ptFloatExp(maxc(oc));
-    if (e > kPtAltitudeMaxExp && e <= 127) {
+    if (e > kPtAccumMaxExp && e <= 127) {
         float m = maxc(oc);
         return m * len(F3{oc.x / m, oc.y / m, oc.z / m}) - rad;
     }
@@ -289,7 +289,7 @@ PT_MIRROR PtRayAltitude ptRayAltitudeBegin(F3 ro, F3 rd, F3 c, float rad) {
 }
 
 PT_MIRROR float ptRayAltitudeAt(const PtRayAltitude& a, float s) {
-    if (!a.stable || ptFloatExp(s) > kPtAltitudeMaxExp) {
+    if (!a.stable || ptFloatExp(s) > kPtAccumMaxExp) {
         return ptAltitudeNaive(sub(mad(a.ro, a.rd, s), a.c), a.rad);
     }
     float k = std::fma(s, s, std::fma(2.0f * a.b0, s, a.k0));
@@ -973,16 +973,18 @@ TEST_CASE("shader mirror is still faithful") {
     // The two kernels this issue promoted out of module scope.
     CHECK(math.find("publicfloatptPowerOfPoint(float3oc,floatrad)") != std::string::npos);
     CHECK(math.find("publicfloatptDotExact(float3a,float3b)") != std::string::npos);
-    // The gate: shared with intersectSphere, one exponent lower because
-    // the seed is 2e+2 rather than 2e+1.
+    // The gate.  Since #275 the upper bound is genuinely ONE constant
+    // shared with intersectSphere rather than a copy of it, and it is
+    // bounded on the range of the accumulated result -- the looser of the
+    // two accumulators (this one, 13 m^2) is what sets it.
     CHECK(math.find("kPtStableSphereRadius=16384.0") != std::string::npos);
     CHECK(math.find("!(rad>kPtStableSphereRadius)") != std::string::npos);
-    CHECK(math.find("kPtAltitudeMaxExp=60") != std::string::npos);
-    CHECK(math.find("ptFloatExp(m)<=kPtAltitudeMaxExp") != std::string::npos);
+    CHECK(math.find("kPtAccumMaxExp=60") != std::string::npos);
+    CHECK(math.find("ptFloatExp(m)<=kPtAccumMaxExp") != std::string::npos);
     // The overflow-safe naive form and the per-sample s bound.
-    CHECK(math.find("e>kPtAltitudeMaxExp&&e<=127") != std::string::npos);
+    CHECK(math.find("e>kPtAccumMaxExp&&e<=127") != std::string::npos);
     CHECK(math.find("returnm*length(oc/m)-rad;") != std::string::npos);
-    CHECK(math.find("ptFloatExp(s)>kPtAltitudeMaxExp") != std::string::npos);
+    CHECK(math.find("ptFloatExp(s)>kPtAccumMaxExp") != std::string::npos);
     // The accumulator seed and the doubled cross terms that force it.
     CHECK(math.find("ptFixedBegin(2*ptFloatExp(m)+2)") != std::string::npos);
     CHECK(math.find("ptFixedAddProduct(a,p.x,c.x,-2.0)") != std::string::npos);

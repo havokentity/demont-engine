@@ -225,6 +225,31 @@ public float3 spectralWeightSRGB(float lambda_nm) {
 // two just below that, so the crossover is conservative and exact.
 static const float kPtStableSphereRadius = 16384.0;
 
+// Largest-operand exponent at which the fixed-point accumulators below
+// still reach a FINITE float32 result.  One constant, shared by the
+// ray-sphere and the altitude kernels, because they accumulate the same
+// shape of sum and the copy is what went wrong (issue #275).
+//
+// The bound is on the RANGE OF THE TOTAL, not on the exponent field
+// ptPow2 has to construct.  Confusing the two is the whole of #275 and it
+// is worth a decade of exponents.  With m the largest operand and
+// E = ptFloatExp(m), so m < 2^(E+1):
+//
+//   ptPowerOfPoint    |oc|^2 - rad^2       <= 3m^2 + m^2            =  4m^2
+//   ptPowerOfPointAt  |p|^2 - 2 p.c + |c|^2 - rad^2
+//                                          <= 3m^2 + 6m^2 + 3m^2 + m^2
+//                                                                   = 13m^2
+//
+// The looser of the two is 13m^2 < 2^(2E+6), so finiteness needs
+// 2E + 6 <= 128, i.e. E <= 61.  The constant sits one below that: the
+// same E rides the accumulator's up_hi scale as well as the terms, and
+// 2^60 m is 122 light-years, so there is nothing to buy by shaving it.
+//
+// The read doubles as a finiteness test at no cost: an infinity or a NaN
+// among the operands reports exponent 128 and so routes to the naive
+// forms rather than into the accumulator's integer arithmetic.
+static const int kPtAccumMaxExp = 60;
+
 // Unbiased exponent of |v|.  Zero and denormals report -127, which the
 // callers below treat as "too small to matter", the correct answer here.
 int ptFloatExp(float v) { return int((asuint(v) >> 23) & 0xFFu) - 127; }
@@ -354,28 +379,85 @@ bool ptIntersectSphereLarge(float3 oc, float3 rd, float rad, out float t) {
     return t > 1e-3;
 }
 
+// The historic expression with the geometry shifted down by a power of
+// two first, so that nothing it squares can leave float32 range.
+//
+// The quadratic |oc + t rd|^2 = rad^2 is homogeneous of degree one in t,
+// so solving it for (oc*2^-s, rad*2^-s) and shifting the root back up by
+// 2^s returns the SAME root.  Shifting by a power of two is exact -- every
+// operand keeps its mantissa, so each product, sum and sqrt rounds exactly
+// where it would have rounded unscaled -- which makes this line for line
+// the answer the naive expression would give if float32 had unlimited
+// exponent range, and not an approximation of it.
+//
+// After the shift |oc| <= 2 sqrt(3) and rad <= 2, so the sum of squares is
+// at most 16 however large the geometry was.  (The factor of two is the
+// ext_exp = 127 case, where 2^-127 is not a normal float and the shift
+// has to stop one short.)
+//
+// It buys FINITENESS, not accuracy: the cancellation #254 is about is
+// still there, so t carries the historic ~eps*rad error.  Accuracy above
+// kPtAccumMaxExp is not on the table anyway -- 2^60 m is 122 light-years,
+// where a float32 t cannot resolve a kilometre.
+//
+// The shift back up can itself overflow, when the true t is not a
+// representable float32.  An infinity is the honest answer there, and the
+// property that matters is that it is an infinity and not a NaN.
+bool ptIntersectSphereScaled(float3 oc, float3 rd, float rad, int ext_exp, out float t) {
+    int   s  = min(ext_exp, 126);
+    float dn = ptPow2(-s), up = ptPow2(s);
+    float3 o = oc * dn;
+    float  r = rad * dn;
+    float b  = dot(o, rd);
+    float k  = dot(o, o) - r * r;
+    float h  = b * b - k;
+    if (h < 0.0) { t = 0.0; return false; }
+    h = sqrt(h);
+    float t0 = (-b - h) * up, t1 = (-b + h) * up;
+    t = (t0 > 1e-3) ? t0 : t1;
+    return t > 1e-3;
+}
+
 // Ray-sphere intersection. Returns the nearer non-self-intersection t
 // (>1e-3 epsilon to avoid stuck rays grazing their own surface).
 //
-// KNOWN GAP, not fixed here (issue #271 review).  `ext_exp <= 74` bounds
-// the exponent field ptPow2 has to build, but NOT the range of the
-// accumulated result: |oc|^2 - rad^2 leaves float32 at ext_exp ~ 63, so
-// radii in (2^63, 2^74] take the accumulated path, overflow k to an
-// infinity and return a non-finite t.  Measured, general orientation:
-// non-finite for every ext_exp in [64, 74].  The altitude gate below is
-// bounded on the RESULT instead (kPtAltitudeMaxExp) for exactly this
-// reason.  Left alone deliberately -- the fix is a one-constant change
-// but the literal is pinned by tests/pt_math_sphere_test.cpp, which
-// belongs to #254's change, and no scene traces a 9e18-metre sphere.
+// FINITE IN, FINITE OUT (issue #275), with no range carve-out: this runs
+// per bounce and a NaN t poisons a whole path, not one sample.  Three
+// bodies, chosen by one exponent read:
+//
+//   rad > kPtStableSphereRadius, ext_exp <= kPtAccumMaxExp
+//       the accumulated solve, sub-millimetre at planetary radius --
+//       what #254 was about.
+//   ext_exp > kPtAccumMaxExp
+//       the historic expression, shifted so it cannot overflow.
+//   otherwise
+//       the historic expression verbatim, so every sphere the renderer
+//       actually traces keeps its exact bits and every golden stays put.
+//
+// The gate used to read `ext_exp <= 74`, which bounds the exponent field
+// ptPow2 has to CONSTRUCT and not the range of the accumulated result --
+// and |oc|^2 - rad^2 leaves float32 an entire decade of exponents earlier.
+// Measured on that code in a general orientation: every ext_exp in
+// [64, 74] took the accumulated path, overflowed k to an infinity and
+// returned a non-finite t out of the k/q root, while everything above 74
+// fell through to a naive expression that overflowed on its own.  Both
+// windows are closed here, and the constant that closes the first is now
+// the one the altitude kernels already used rather than a second copy.
 public bool intersectSphere(float3 ro, float3 rd, float3 c, float rad, out float t) {
     float3 oc = ro - c;
     // Above kPtStableSphereRadius the naive expression below is worse than
-    // a millimetre; take the accumulated path instead.  The upper bound is
-    // the accumulator's domain: it needs 2^(2e-46) to stay a normal float,
-    // which caps the exponent of the largest operand at 74 (~1.9e22 m).
-    int ext_exp = ptFloatExp(max(max(abs(oc.x), abs(oc.y)), max(abs(oc.z), rad)));
-    if (rad > kPtStableSphereRadius && ext_exp <= 74) {
+    // a millimetre; take the accumulated path instead.
+    float m = max(max(abs(oc.x), abs(oc.y)), max(abs(oc.z), rad));
+    int ext_exp = ptFloatExp(m);
+    if (rad > kPtStableSphereRadius && ext_exp <= kPtAccumMaxExp) {
         return ptIntersectSphereLarge(oc, rd, rad, t);
+    }
+    // ext_exp == 128 is an infinity or a NaN in oc or rad: not in the
+    // domain, and the shift cannot help it, so it goes to the historic
+    // line where it yields the same kind of garbage it always did rather
+    // than the 0 * inf the shift would make of it.
+    if (ext_exp > kPtAccumMaxExp && ext_exp <= 127) {
+        return ptIntersectSphereScaled(oc, rd, rad, ext_exp, t);
     }
     float b   = dot(oc, rd);
     float k   = dot(oc, oc) - rad * rad;
@@ -447,32 +529,21 @@ public bool intersectPlane(float3 ro, float3 rd, float3 n, float d, out float t)
 // at or below it keep the historic expression and every existing scene
 // renders unchanged.
 //
-// The UPPER bound is not intersectSphere's.  That one (ext_exp <= 74)
-// bounds only the exponent field ptPow2 has to build; it does not bound
-// the RANGE of the accumulated result, and |p - c|^2 leaves float32 an
-// entire decade of exponents earlier.  The accumulated total is at most
-// |p|^2 + 2|p||c| + |c|^2 + rad^2 <= 4m^2 < 2^(2E+4) for E = ptFloatExp(m),
-// so finiteness needs 2E + 4 <= 128, i.e. E <= 62.  The constant sits two
-// exponents below that: the same E rides the accumulator's up_hi scale as
-// well as the terms, and 2^60 m is 122 light-years, so there is nothing to
-// buy by shaving it.
+// The UPPER bound is kPtAccumMaxExp, derived at its definition above: it
+// bounds the RANGE of the accumulated result rather than the exponent
+// field ptPow2 has to build, which is a decade of exponents lower.
 //
 // Measured on the pre-fix code (issue #271 review): E in [64, 74] took the
 // accumulated path, overflowed k to an infinity and returned a NaN out of
 // k/d -- worse than the naive form it was replacing, and NaN in a march
-// poisons a whole pixel.  intersectSphere's gate has the SAME window and
-// still does; see the note above it.
-//
-// The read doubles as a finiteness test at no cost: an infinity or a NaN
-// in p, c or rad reports exponent 128 and so routes to the naive form
-// rather than into the accumulator's integer arithmetic.
-static const int kPtAltitudeMaxExp = 60;
+// poisons a whole pixel.  intersectSphere carried the same window until
+// #275; it now reads the same constant.
 
 bool ptAltitudeStable(float3 p, float3 c, float rad) {
     if (!(rad > kPtStableSphereRadius)) { return false; }
     float m = max(max(max(abs(p.x), abs(p.y)), abs(p.z)),
                   max(max(abs(c.x), abs(c.y)), max(abs(c.z), rad)));
-    return ptFloatExp(m) <= kPtAltitudeMaxExp;
+    return ptFloatExp(m) <= kPtAccumMaxExp;
 }
 
 // |oc| - rad, evaluated so that |oc|^2 cannot leave float32 range.
@@ -491,7 +562,7 @@ bool ptAltitudeStable(float3 p, float3 c, float rad) {
 // in stays the same kind of garbage out instead of getting worse.
 float ptAltitudeNaive(float3 oc, float rad) {
     int e = ptFloatExp(max(max(abs(oc.x), abs(oc.y)), abs(oc.z)));
-    if (e > kPtAltitudeMaxExp && e <= 127) {
+    if (e > kPtAccumMaxExp && e <= 127) {
         float m = max(max(abs(oc.x), abs(oc.y)), abs(oc.z));
         return m * length(oc / m) - rad;
     }
@@ -506,7 +577,7 @@ float ptAltitudeNaive(float3 oc, float rad) {
 // of altitude, still a third of the float32 ULP of a one-metre altitude
 // and so not the term that limits the answer.
 //
-// PRECONDITION: ptFloatExp(largest operand) <= kPtAltitudeMaxExp, i.e.
+// PRECONDITION: ptFloatExp(largest operand) <= kPtAccumMaxExp, i.e.
 // what ptAltitudeStable tests.  Beyond it the result is not a finite
 // float32 and the accumulator hands back an infinity.
 public float ptPowerOfPointAt(float3 p, float3 c, float rad) {
@@ -534,7 +605,7 @@ public float ptPowerOfPointAt(float3 p, float3 c, float rad) {
 //
 // PRECONDITION: k finite.  An infinite k makes d infinite too and k/d is
 // then a NaN.  There is deliberately no guard for it: both callers gate
-// their inputs to kPtAltitudeMaxExp, which bounds k well inside float32,
+// their inputs to kPtAccumMaxExp, which bounds k well inside float32,
 // and the tests assert that domain exhaustively.  A guard here would have
 // to invent a return value for an input whose true altitude is not
 // representable, which would hide a future caller's mistake instead of
@@ -618,7 +689,7 @@ public PtRayAltitude ptRayAltitudeBegin(float3 ro, float3 rd, float3 c, float ra
 // this function returned NaN from s = 1e20 upward.  The exponent read is
 // the same one the gate uses, so an infinite or NaN s routes out too.
 public float ptRayAltitudeAt(PtRayAltitude a, float s) {
-    if (!a.stable || ptFloatExp(s) > kPtAltitudeMaxExp) {
+    if (!a.stable || ptFloatExp(s) > kPtAccumMaxExp) {
         return ptAltitudeNaive(a.ro + a.rd * s - a.c, a.rad);
     }
     // Nested so each fma rounds once on its OWN result: the error is then
