@@ -15,12 +15,30 @@ namespace pt::physics {
 
 // PhysicsSystem -- Phase 1 of the physics roadmap (#131, #132).
 //
-// Owns a flat pool of point-mass Verlet particles, integrates them
-// against constant gravity, and resolves sphere-plane (y=0) and
-// pairwise sphere-sphere contacts with positional correction. Pure
-// CPU, single-threaded, no broadphase. Architecturally a leaf
-// subsystem: depends only on glm + std; the engine drives it via
+// Owns a flat pool of point-mass particles, integrates them against
+// constant gravity, and resolves sphere-plane (y=0) and pairwise
+// sphere-sphere contacts with positional correction. Pure CPU,
+// single-threaded, no broadphase. Architecturally a leaf subsystem:
+// depends only on glm + std; the engine drives it via
 // Init/Step/Shutdown and the per-frame writeback hook.
+//
+// Integration is position-based dynamics with an EXPLICIT velocity:
+// predict from velocity, project positions to satisfy constraints,
+// then fold the projection back into velocity. Phase 1 shipped the
+// position-Verlet variant that left velocity implicit in
+// (curr_pos - prev_pos); #270 retired that because its `accel*sdt^2`
+// gravity term is an absolute increment that vanishes into the
+// float32 ULP of the position above ~1 km -- and shrank
+// quadratically with `phys_substeps`, so the accuracy knob was what
+// killed gravity. The recurrence, the damping semantics and the
+// contact reflection are all preserved exactly; see the derivation in
+// PhysicsSystem::Substep.
+//
+// pt_physics is compiled WITHOUT fast-math (pt_set_strict_fp in
+// cmake/CompilerWarnings.cmake, enforced by an #error guard in
+// PhysicsSystem.cpp). The integrator's predict/correct pair relies on
+// two spellings of the same expression producing identical bits,
+// which reassociation and FMA contraction are free to break.
 //
 // Phase 1 deliberate non-goals (per issue #132 MVP discipline):
 //   - No friction (Phase 5)
@@ -160,9 +178,11 @@ public:
     std::uint32_t RbCapacity()   const { return kMaxRigidBodies; }
     // --- end Phase 2a rigid bodies ----------------------------------
 
-    // Substep dt (s) of the most recent Step() call. The Verlet pools
-    // store implicit velocity as a per-substep displacement
-    // (curr - prev); dividing by this converts it to real m/s.
+    // Substep dt (s) of the most recent Step() call. Both pools now
+    // carry a real m/s `velocity` field, so new code should read that
+    // directly; this remains for callers that derive velocity the
+    // Phase 1 way from the per-substep displacement (curr - prev),
+    // which still equals velocity * LastSubstepDt() at substep end.
     // 0 until the first Step() -- callers must guard.
     float LastSubstepDt() const { return last_substep_dt_; }
 
@@ -185,9 +205,13 @@ private:
 
     // Inner-substep workhorse, called `substeps` times per Step. Each
     // call:
-    //   1. Predict next position from Verlet (curr + (curr - prev) * damping + accel*sdt*sdt)
-    //   2. Resolve sphere-plane (y=0) and sphere-sphere overlaps
-    //   3. Shift the pos history forward (prev = old curr, curr = new pos)
+    //   1. Damp + advance the explicit velocity (vel = vel * damping
+    //      + accel * sdt), shift the pos history forward (prev = old
+    //      curr) and predict curr = prev + vel * sdt
+    //   2. Resolve sphere-plane (y=0) and sphere-sphere overlaps by
+    //      moving curr only
+    //   3. Fold the resulting position correction back into vel, which
+    //      reproduces the Phase 1 implicit-velocity reflection exactly
     void Substep(float sdt, const glm::vec3& accel, float damping);
 
     // --- Phase 2a rigid bodies (#138) -------------------------------

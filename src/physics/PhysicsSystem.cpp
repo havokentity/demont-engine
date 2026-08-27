@@ -7,6 +7,29 @@
 
 #include <glm/gtc/quaternion.hpp>
 
+// Build-time proof that the fast-math exemption actually reached this
+// translation unit (#270, and the same hazard as #263 / #267). The
+// integrator below leans on two properties a reassociating compiler is
+// free to break:
+//
+//   * `prev_pos + velocity * sdt` re-evaluates to the exact bits the
+//     predictor stored in curr_pos, so the constraint-correction term
+//     in step 5 is exactly zero for a particle that touched nothing.
+//     Under -ffast-math the two spellings of the same expression may
+//     be contracted differently (FMA vs mul+add) and no longer tie,
+//     which would inject a spurious velocity correction on every
+//     substep of every free-falling body.
+//   * Debug and Release agree bit-for-bit, so a physics bug reproduces
+//     in the build you can step through.
+//
+// cmake/CompilerWarnings.cmake's pt_set_strict_fp() is what turns the
+// project-wide Release -ffast-math back off for pt_physics. If someone
+// drops that call, this fires at compile time instead of silently
+// handing the integrator back to the optimiser.
+#if defined(__FAST_MATH__) || defined(_M_FP_FAST)
+#error "pt_physics must be built WITHOUT fast-math: call pt_set_strict_fp(pt_physics) -- see cmake/CompilerWarnings.cmake and issue #270"
+#endif
+
 namespace pt::physics {
 
 namespace {
@@ -84,6 +107,11 @@ PhysicsSystem::Handle PhysicsSystem::AddParticle(const glm::vec3& pos,
         if (s.alive) continue;
         s.p.prev_pos = pos;     // zero implied velocity on spawn
         s.p.curr_pos = pos;
+        // ...and zero explicit velocity to match. Remove/Clear already
+        // reset the slot to a default-constructed Particle, so this is
+        // belt-and-braces against a future partial-reset path leaving
+        // a dead body's momentum attached to a fresh spawn.
+        s.p.velocity = glm::vec3{0.0f};
         s.p.radius   = (radius > 0.0f) ? radius : 0.3f;
         s.p.inv_mass = (inv_mass >= 0.0f) ? inv_mass : 1.0f;
         s.alive      = 1;
@@ -194,28 +222,97 @@ void PhysicsSystem::Step(float frame_dt, int substeps,
 }
 
 void PhysicsSystem::Substep(float sdt, const glm::vec3& accel, float damping) {
-    // 1. Predict next positions via velocity-Verlet with damping on
-    //    the implicit velocity term (curr - prev). damping = 1 means
+    // Reciprocal of the substep dt, used by step 5 to convert the
+    // constraint solver's position correction back into a velocity
+    // correction. sdt is strictly positive here: Step() early-outs on
+    // frame_dt <= 0 and clamps substeps into [1, 32].
+    const float inv_sdt = 1.0f / sdt;
+
+    // 1. Predict next positions by integrating the explicit velocity,
+    //    with damping applied to the velocity term. damping = 1 means
     //    "energy-conserving"; the default 0.99 bleeds 1% of velocity
     //    per substep. At 8 substeps/frame, 60 fps (480 substeps/sec)
     //    the residual velocity after one second is 0.99^480 ~= 0.008
     //    -- aggressive enough to settle a tossed pile into a loose
     //    heap in about a second of wall time without Phase 5's
     //    contact-persistence sleeper. See phys_damping cvar docs.
-    const float sdt2 = sdt * sdt;
+    //
+    //    WHY VELOCITY IS EXPLICIT NOW (#270). Phase 1 shipped this as
+    //    position-Verlet, with the velocity left implicit in the
+    //    position pair:
+    //
+    //        disp = (curr - prev) * damping
+    //        curr = curr + disp + accel * sdt^2
+    //
+    //    which is algebraically correct and numerically fatal. The
+    //    gravity term `accel * sdt^2` is an ABSOLUTE increment: at the
+    //    default phys_substeps 8 of a 1/60 s frame it is
+    //    9.81 * (1/480)^2 = 4.26e-5 m. float32 carries a 24-bit
+    //    mantissa, so the spacing of representable values near a
+    //    position y is y * 2^-23, and round-to-nearest swallows the
+    //    increment whole once y * 2^-24 exceeds it -- above roughly
+    //    1024 m. Past that altitude `curr + accel * sdt^2 == curr`
+    //    bit for bit: the add is a complete no-op, the body coasts in
+    //    uniform motion, and nothing anywhere reports that gravity has
+    //    stopped existing.
+    //
+    //    The perverse part is that sdt^2 shrinks QUADRATICALLY in the
+    //    substep count while the position magnitude does not, so
+    //    raising phys_substeps -- the *accuracy* knob -- made the bug
+    //    dramatically worse. Measured, float32 exact: gravity died
+    //    above 65 km at 1 substep, above 1024 m at the default 8, and
+    //    above 64 m at the cvar maximum of 32, where it was already
+    //    7.5% wrong at ten metres.
+    //
+    //    Carrying velocity in m/s fixes that at the root, because the
+    //    quantity we accumulate now scales with the MOTION instead of
+    //    with the square of the timestep:
+    //
+    //        vel  = vel * damping + accel * sdt
+    //        curr = curr + vel * sdt
+    //
+    //    `accel * sdt` at 32 substeps is 5.1e-3 m/s landing in a
+    //    free-fall speed that climbs into the hundreds of m/s -- and
+    //    critically, the ratio of increment to accumulator no longer
+    //    depends on where the body is in the world, only on how long
+    //    it has been falling (g*sdt / v = sdt / t). The substep
+    //    inversion is gone with it: more substeps is once again
+    //    strictly more accurate.
+    //
+    //    This preserves the Phase 1 damping semantics EXACTLY, not
+    //    approximately. Write d_n = curr_n - prev_n for the old
+    //    per-substep displacement and v_n = d_n / sdt. Then
+    //
+    //        d_{n+1} = damping * d_n + accel * sdt^2
+    //                = sdt * (damping * v_n + accel * sdt)
+    //                = sdt * v_{n+1}
+    //
+    //    -- literally the same recurrence divided through by sdt.
+    //    `damping` is still a per-substep multiplier, 0.99 still
+    //    bleeds 1% of velocity per substep, and the closed-form
+    //    undamped free-fall drop after N substeps is still
+    //    N*(N+1)/2 * accel * sdt^2. The single behavioural difference
+    //    is what happens when sdt CHANGES between frames: the old
+    //    form froze the per-substep displacement (so a frame-rate
+    //    change silently rescaled the body's real velocity), the new
+    //    one freezes the velocity, which is the physically correct
+    //    choice. Smoke mode pins dt to 1/60 and the engine clamps it
+    //    to <= 1/30 otherwise, so this only bites under a frame-time
+    //    change, and then only in the direction of being right.
     for (std::uint32_t i = 0; i < kMaxParticles; ++i) {
         auto& s = slots_[i];
         if (!s.alive) continue;
         if (s.p.inv_mass <= 0.0f) {
             // Kinematic -- skip integration. prev_pos pinned to
-            // curr_pos so the implicit velocity stays 0.
+            // curr_pos and velocity pinned to 0 so both the stored
+            // and the derived velocity read as motionless.
             s.p.prev_pos = s.p.curr_pos;
+            s.p.velocity = glm::vec3{0.0f};
             continue;
         }
-        const glm::vec3 old_curr = s.p.curr_pos;
-        const glm::vec3 disp     = (s.p.curr_pos - s.p.prev_pos) * damping;
-        s.p.curr_pos             = old_curr + disp + accel * sdt2;
-        s.p.prev_pos             = old_curr;
+        s.p.velocity = s.p.velocity * damping + accel * sdt;
+        s.p.prev_pos = s.p.curr_pos;
+        s.p.curr_pos = s.p.curr_pos + s.p.velocity * sdt;
     }
 
     // 2. Resolve sphere-plane contact with the static y=0 ground.
@@ -224,12 +321,16 @@ void PhysicsSystem::Substep(float sdt, const glm::vec3& accel, float damping) {
     //    (kinematic plane: 100% of correction goes to the particle).
     //
     //    Phase 5 will introduce a non-zero restitution coefficient
-    //    here; for Phase 1, the only "bounce" comes from Verlet's
-    //    implicit-velocity reflection: pushing the centre up while
+    //    here; for Phase 1, the only "bounce" comes from the
+    //    position-correction reflection: pushing the centre up while
     //    leaving prev_pos below the original y reflects the downward
     //    velocity component over the contact normal, giving a 100%
     //    elastic bounce by construction. Damping (above) bleeds that
-    //    away to settle the particle eventually.
+    //    away to settle the particle eventually. This step, like
+    //    steps 3 and 4, moves curr_pos only -- step 5 folds whatever
+    //    the three of them did back into `velocity`, which is what
+    //    keeps that reflection working now that velocity is stored
+    //    rather than inferred.
     for (std::uint32_t i = 0; i < kMaxParticles; ++i) {
         auto& s = slots_[i];
         if (!s.alive) continue;
@@ -303,6 +404,47 @@ void PhysicsSystem::Substep(float sdt, const glm::vec3& accel, float damping) {
             s.p.curr_pos.y += penetration;
         }
     }
+
+    // 5. Fold the constraint solver's position corrections back into
+    //    velocity -- the position-based-dynamics velocity update
+    //    (Mueller 2007 section 3.4).
+    //
+    //    Steps 2-4 moved curr_pos without touching `velocity`. Left
+    //    like that, contacts would stop affecting motion entirely: the
+    //    Phase 1 integrator got its "bounce by construction" for free
+    //    precisely BECAUSE velocity was the position difference, so
+    //    projecting a particle out of an overlap reflected it
+    //    (Jakobsen 2001). We reproduce that exactly by measuring how
+    //    far the solver moved the particle away from where step 1
+    //    predicted it would be, and adding that displacement over sdt
+    //    to the velocity. Substituting the predictor back in,
+    //
+    //        v_new = v_pred + (pos_solved - pos_pred) / sdt
+    //              = (pos_solved - prev_pos) / sdt
+    //
+    //    which is the old implicit velocity to the letter -- the same
+    //    100% elastic reflection off the ground plane, the same
+    //    contact-normal damping when a stack compresses.
+    //
+    //    `predicted` is recomputed here rather than cached in a
+    //    scratch array because `prev_pos` is exactly the pre-predict
+    //    position and `velocity` has not been touched since, so
+    //    `prev_pos + velocity * sdt` re-evaluates to the very bits
+    //    step 1 stored. That in turn makes the correction EXACTLY
+    //    zero -- not merely small -- for every particle that hit no
+    //    constraint, which is the property that keeps a free-falling
+    //    body's velocity from being nibbled at by a spurious
+    //    correction each substep. It holds only because pt_physics is
+    //    compiled without fast-math (see the #error guard at the top
+    //    of this file); a reassociating compiler could contract one
+    //    copy of the expression into an FMA and not the other.
+    for (std::uint32_t i = 0; i < kMaxParticles; ++i) {
+        auto& s = slots_[i];
+        if (!s.alive) continue;
+        if (s.p.inv_mass <= 0.0f) continue;
+        const glm::vec3 predicted = s.p.prev_pos + s.p.velocity * sdt;
+        s.p.velocity += (s.p.curr_pos - predicted) * inv_sdt;
+    }
 }
 
 // --- Phase 2a rigid bodies (#138) ------------------------------------------
@@ -310,7 +452,13 @@ void PhysicsSystem::Substep(float sdt, const glm::vec3& accel, float damping) {
 // Pool management mirrors the Particle pool above (linear free-slot
 // scan, generation-tagged 32-bit handles). Integration uses the XPBD
 // scheme from Mueller 2020:
-//   1. Predict next pos via implicit-velocity Verlet.
+//   1. Predict next pos from the body's explicit linear velocity
+//      (`pos += vel * sdt` after `vel = vel * damping + accel * sdt`).
+//      This used to be implicit-velocity Verlet with an `accel*sdt^2`
+//      increment; see the long #270 note in Substep above for why an
+//      absolute per-substep increment cannot survive float32 at
+//      altitude, and why the explicit form is the same recurrence
+//      divided through by sdt.
 //   2. Predict next orientation via the quaternion derivative q' =
 //      0.5 * omega_quat * q, integrated by sdt.
 //   3. Apply position-correction constraints (sphere-plane + pairwise
@@ -320,11 +468,12 @@ void PhysicsSystem::Substep(float sdt, const glm::vec3& accel, float damping) {
 //      normal aligns with the centre of mass), and for the conservative
 //      box bounding sphere we explicitly accept that boxes won't get
 //      angular impulses from contacts until Phase 2b lands SAT.
-//   4. Finite-difference both linear AND angular velocity from the
-//      constrained pos+orientation pair, so any position correction
-//      automatically damps the velocity along the contact normal --
-//      the Verlet trick that keeps stacks from exploding without an
-//      explicit restitution model.
+//   4. Fold the position correction back into the linear velocity and
+//      finite-difference the angular velocity from the constrained
+//      orientation pair, so any position correction automatically
+//      damps the velocity along the contact normal -- the trick that
+//      keeps stacks from exploding without an explicit restitution
+//      model.
 
 PhysicsSystem::RbHandle PhysicsSystem::AddRigidSphere(const glm::vec3& pos,
                                                      float radius,
@@ -462,31 +611,34 @@ void PhysicsSystem::ForEachRigidBody(RbIterFn fn, void* user) const {
 void PhysicsSystem::SubstepRigidBodies(float sdt, const glm::vec3& accel,
                                        float linear_damping,
                                        float angular_damping) {
-    const float sdt2 = sdt * sdt;
+    // See Substep(): sdt is strictly positive by the time we get here.
+    const float inv_sdt = 1.0f / sdt;
 
     // 1. Predict next pos + orientation. Saves prev_pos / prev_orient
-    //    so step 4 can finite-difference omega + linear velocity.
+    //    so step 4 can refresh the linear velocity + omega.
     for (std::uint32_t i = 0; i < kMaxRigidBodies; ++i) {
         auto& s = rb_slots_[i];
         if (!s.alive) continue;
         auto& b = s.body;
         if (b.inv_mass <= 0.0f) {
-            // Kinematic body: pin pos + orientation, pin omega = 0
-            // (well, leave omega untouched -- the user might script
-            // a kinematic spin in a later phase; for Phase 2a no
-            // external API writes omega, so it stays 0).
+            // Kinematic body: pin pos + orientation, pin the linear
+            // velocity to 0, and leave omega untouched -- the user
+            // might script a kinematic spin in a later phase; for
+            // Phase 2a no external API writes omega, so it stays 0.
             b.prev_pos          = b.curr_pos;
+            b.velocity          = glm::vec3{0.0f};
             b.prev_orientation  = b.orientation;
             continue;
         }
-        // Linear: implicit-velocity Verlet with the same damping the
-        // particle pool uses. Identical to Particle::Substep so
-        // sphere-to-sphere pair contacts behave the same whether the
-        // pair is two rigid bodies or two particles.
-        const glm::vec3 old_curr = b.curr_pos;
-        const glm::vec3 disp     = (b.curr_pos - b.prev_pos) * linear_damping;
-        b.curr_pos               = old_curr + disp + accel * sdt2;
-        b.prev_pos               = old_curr;
+        // Linear: explicit-velocity integration with the same damping
+        // the particle pool uses. Identical to Particle::Substep --
+        // including the #270 reasoning for why the gravity term is
+        // accel * sdt into a velocity rather than accel * sdt^2 into
+        // a position -- so sphere-to-sphere pair contacts behave the
+        // same whether the pair is two rigid bodies or two particles.
+        b.velocity = b.velocity * linear_damping + accel * sdt;
+        b.prev_pos = b.curr_pos;
+        b.curr_pos = b.curr_pos + b.velocity * sdt;
 
         // Angular: damp omega then integrate the orientation by the
         // damped omega over sdt. Mueller 2020 Equation 12.
@@ -546,21 +698,35 @@ void PhysicsSystem::SubstepRigidBodies(float sdt, const glm::vec3& accel,
         }
     }
 
-    // 4. Finite-difference omega from (prev_orientation, orientation).
-    //    Linear velocity stays implicit in (curr_pos - prev_pos);
-    //    omega we materialise so external impulses (Phase 2b+) and
-    //    the next substep's orientation integrator both have access
-    //    to the up-to-date value. Phase 2a doesn't actually change
-    //    orientation in steps 2-3 (sphere contacts don't generate
-    //    torque), so this currently just preserves the freely-spinning
-    //    omega; the round-trip is a no-op for spheres. Boxes don't
-    //    pick up rotational impulses until Phase 2b lands either way.
+    // 4. Refresh both velocities from what the constraint solver did.
+    //
+    //    Linear: same position-based-dynamics velocity update as
+    //    Particle::Substep step 5 -- add the solver's displacement
+    //    away from the predicted position, over sdt, to the stored
+    //    velocity. Substituting the predictor back in gives
+    //    (curr_pos - prev_pos) / sdt, i.e. exactly the implicit
+    //    velocity the Phase 2a form used, so a body bouncing off the
+    //    ground plane reflects exactly as it did before. The
+    //    correction is bit-exact zero for a body that touched nothing
+    //    (see the fast-math note in Substep).
+    //
+    //    Angular: finite-difference omega from (prev_orientation,
+    //    orientation). We materialise omega so external impulses
+    //    (Phase 2b+) and the next substep's orientation integrator
+    //    both have access to the up-to-date value. Phase 2a doesn't
+    //    actually change orientation in steps 2-3 (sphere contacts
+    //    don't generate torque), so this currently just preserves the
+    //    freely-spinning omega; the round-trip is a no-op for spheres.
+    //    Boxes don't pick up rotational impulses until Phase 2b lands
+    //    either way.
     for (std::uint32_t i = 0; i < kMaxRigidBodies; ++i) {
         auto& s = rb_slots_[i];
         if (!s.alive) continue;
-        if (s.body.inv_mass <= 0.0f) continue;
-        s.body.omega = OrientationDiffOmega(s.body.prev_orientation,
-                                            s.body.orientation, sdt);
+        auto& b = s.body;
+        if (b.inv_mass <= 0.0f) continue;
+        const glm::vec3 predicted = b.prev_pos + b.velocity * sdt;
+        b.velocity += (b.curr_pos - predicted) * inv_sdt;
+        b.omega = OrientationDiffOmega(b.prev_orientation, b.orientation, sdt);
     }
 }
 // --- end Phase 2a rigid bodies ---------------------------------------------

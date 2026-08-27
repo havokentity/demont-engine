@@ -27,3 +27,17 @@ target_link_libraries(pt_physics
 )
 
 pt_set_compiler_options(pt_physics)
+
+# Physics runs on strict IEEE-754, not the project-wide Release
+# -ffast-math (#270). The integrator predicts a position and then
+# re-derives that same prediction to measure the constraint solver's
+# correction; under reassociation / FMA contraction the two evaluations
+# can differ by an ULP and inject a spurious velocity correction into
+# every free-falling body. It also keeps Debug and Release bit-identical
+# for the sim, which is what makes a physics repro reproducible.
+#
+# MUST stay after pt_set_compiler_options above -- last float-model flag
+# on the command line wins. PhysicsSystem.cpp carries an #error guard on
+# __FAST_MATH__ / _M_FP_FAST so deleting this line fails the build loudly
+# instead of quietly handing the integrator back to the optimiser.
+pt_set_strict_fp(pt_physics)
