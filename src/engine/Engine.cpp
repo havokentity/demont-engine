@@ -1901,6 +1901,50 @@ namespace cvar {
     PT_CVAR(r_moon_disc_brightness,       "0.7",      "Moon disc brightness multiplier. 1.0 = the post-ACES-tuned default; 0.7 reads as a softer night-sky moon where surface texture stays under the ACES knee. Drop further for a darker moon, raise toward 1.5+ for an artificial bright-moon look. Scales ONLY the rendered moon disc + halo -- the moonlight the moon casts on clouds/surfaces (single-scatter NEE) is independent of this knob.", CVAR_ARCHIVE);
     PT_CVAR(r_sun_disc_brightness,        "1.0",      "Sun disc brightness multiplier, the daytime counterpart to r_moon_disc_brightness. 1.0 = the historical hardcoded disc intensity (post-ACES-tuned default). Scales ONLY the rendered sun disc + halo, NOT the sunlight the sun casts on clouds/atmosphere/surfaces, so it stays a pure look knob regardless of r_clouds_mode. Raise toward 1.5+ for a hotter cinematic disc, drop for a softer sun, 0 hides the disc (scene lighting unchanged).", CVAR_ARCHIVE);
 
+    // ======================= BEGIN PLANETARIUM CVARS (#281) ================
+    // Self-contained block; nothing outside it changed in this cvar table.
+    // Kept contiguous and fenced so a concurrent branch adding its own
+    // PT_CVAR lines here rebases with a single-hunk resolution.
+    PT_CVAR(r_planets,               "1",
+            "Render the planets (Mercury..Neptune, Earth excepted) as real "
+            "moving point sources against the Bright Star Catalog. Positions "
+            "come from the JPL approximate Keplerian element set (Standish, "
+            "ssd.jpl.nasa.gov/planets/approx_pos.html, valid 1800-2050) and "
+            "magnitudes from Mallama et al. 2017 -- same ~1 to 10 arcminute "
+            "accuracy tier the astronomical sun and moon already ship at. "
+            "Requires r_sky_use_astronomical 1 (a planet position is "
+            "meaningless without a real date and observer) AND the "
+            "post-denoise celestial composite, i.e. r_star_split 1 on a GPU "
+            "backend: every planet is sub-pixel (Jupiter at opposition is "
+            "0.41 px at 1080p / 60 deg FOV), so they ride the star splat "
+            "path rather than the sun/moon disc path, and the software "
+            "tracer -- which does not run StarsComposite.slang -- shows no "
+            "planets.", CVAR_ARCHIVE);
+    PT_CVAR(r_planets_mag_limit,     "6.5",
+            "Faintest planet apparent V magnitude to render. 6.5 is the "
+            "conventional naked-eye limit under a dark sky, which includes "
+            "Uranus (V ~5.7 at opposition) and excludes Neptune (V ~7.8, "
+            "telescope-only). Raise to 8 for a 'binocular sky' with Neptune "
+            "in it; drop to 2 to leave only the classical bright five. "
+            "Ignored when r_planets = 0.", CVAR_ARCHIVE);
+    PT_CVAR(r_planets_brightness,    "1.0",
+            "Planet brightness multiplier, the planetary counterpart to "
+            "r_sun_disc_brightness / r_moon_disc_brightness. 1.0 = the "
+            "physical magnitude straight through the same magnitude-to-flux "
+            "curve every Bright Star Catalog star uses, so Venus, Jupiter "
+            "and Sirius are on one honest scale. Clamped to [0, 5]; 0 hides "
+            "the planets without disabling the solver. Independent of "
+            "r_show_stars: planets are their own objects, so 'planets over "
+            "an empty sky' is a configuration you can ask for.", CVAR_ARCHIVE);
+    PT_CVAR(r_planets_size,          "1.0",
+            "Planet splat angular-size multiplier, the planetary counterpart "
+            "to r_sun_size / r_moon_size. 1.0 = the same 2.6-4.8 arcminute "
+            "Gaussian sigma the starmap rasteriser gives a star of the same "
+            "magnitude (real planetary discs are 4-60 arcSECONDS, far below "
+            "one pixel, so a physical size would be invisible). Raise for a "
+            "stylised 'fat planet' look. Clamped to [0.1, 50].", CVAR_ARCHIVE);
+    // ======================= END PLANETARIUM CVARS (#281) ==================
+
     PT_CVAR(dev_cheats,        "0",    "Gate for CHEAT-flagged cvars",   0);
     PT_CVAR(dev_log_level,     "info", "error|warn|info|debug",          0);
     PT_CVAR(r_diagnostic_level, "1",
@@ -8751,11 +8795,23 @@ void Engine::RenderFrame() {
             yr, mo, dy, 0, 0, 0.0);
         return jd_midnight + double(hour_utc) / 24.0;
     };
+    // --- Canonical frame clock (#281) -------------------------------------
+    // ONE Julian date per frame, evaluated once here and shared by every
+    // celestial consumer below: the sun, the moon (position, phase, distance),
+    // the sun's distance ratio, the world->J2000 starmap rotation, and the
+    // planets. Before #281 each of those called compute_jd() again, which was
+    // correct only because no cvar can change between the calls -- a fragile
+    // invariant to leave standing once a fifth and sixth consumer arrive.
+    // The value is bit-identical to what each separate call produced (the
+    // lambda is a pure function of cvars that do not move mid-frame), so
+    // every committed golden stays byte-for-byte.
+    const double frame_jd = compute_jd();
+    // --- end canonical frame clock ----------------------------------------
     if (astro_on) {
         double lat = 13.0827, lon = 80.2707;
         if (auto* v = C.FindCVar("r_sky_lat")) lat = v->GetFloat();
         if (auto* v = C.FindCVar("r_sky_lon")) lon = v->GetFloat();
-        const double jd = compute_jd();
+        const double jd = frame_jd;
         auto sun_eq = pt::astro::sunPosition(jd);
         auto sun_h  = pt::astro::equatorialToHorizon(sun_eq, lat, lon, jd);
         sun_elev_deg = static_cast<float>(sun_h.altitude_deg);
@@ -8784,7 +8840,7 @@ void Engine::RenderFrame() {
         double lat = 13.0827, lon = 80.2707;
         if (auto* v = C.FindCVar("r_sky_lat")) lat = v->GetFloat();
         if (auto* v = C.FindCVar("r_sky_lon")) lon = v->GetFloat();
-        const double jd_moon = compute_jd();
+        const double jd_moon = frame_jd;
         auto moon_eq = pt::astro::moonPosition(jd_moon);
         auto moon_h  = pt::astro::equatorialToHorizon(moon_eq, lat, lon, jd_moon);
         const float me_r = glm::radians(static_cast<float>(moon_h.altitude_deg));
@@ -8813,7 +8869,7 @@ void Engine::RenderFrame() {
         // compute from Meeus radial-distance series.
         float moon_dist_ratio = 1.0f;
         if (astro_on) {
-            const double jd_d = compute_jd();
+            const double jd_d = frame_jd;
             double dkm = pt::astro::moonDistanceKm(jd_d);
             if (dkm > 1.0) {
                 moon_dist_ratio = static_cast<float>(
@@ -8842,7 +8898,7 @@ void Engine::RenderFrame() {
         if (sun_size > 50.0f) sun_size = 50.0f;
         push.sun_extra[0] = sun_size;
         // Sun distance ratio. Always astronomical (cheap to compute).
-        const double jd_s = compute_jd();
+        const double jd_s = frame_jd;
         double dau = pt::astro::sunDistanceAu(jd_s);
         float sun_dist_ratio = 1.0f;
         if (dau > 1e-3) {
@@ -9058,6 +9114,76 @@ void Engine::RenderFrame() {
         push.sun_extra2[3] = 0.0f;
     }
 
+    // --- Planetarium (#281) ------------------------------------------------
+    // Seven renderable planets, solved host-side once per frame off the
+    // canonical frame_jd and handed to StarsComposite.slang as two float4[7]
+    // push arrays. Nothing here touches PtPush: the path tracer has no planet
+    // term (see StarsComposite.slang's planetSplat comment), so this data
+    // lives in locals that the composite dispatch's [&] lambda picks up
+    // ~2000 lines below rather than in the shared PtPush struct.
+    //
+    // Astronomical mode is required, for the same reason the moon requires
+    // it: a planet position is meaningless without a real date and observer.
+    // With r_sky_use_astronomical 0 the count stays zero and the shader's
+    // early-out costs nothing.
+    float         planet_dir_flux[pt::astro::kPlanetCount][4]   = {};
+    float         planet_tint_sigma[pt::astro::kPlanetCount][4] = {};
+    std::uint32_t planet_slot_count = 0u;
+    {
+        bool planets_on = true;
+        if (auto* v = C.FindCVar("r_planets")) planets_on = v->GetBool();
+        float mag_limit = 6.5f;
+        if (auto* v = C.FindCVar("r_planets_mag_limit")) mag_limit = v->GetFloat();
+        float brightness = 1.0f;
+        if (auto* v = C.FindCVar("r_planets_brightness")) brightness = v->GetFloat();
+        brightness = std::clamp(brightness, 0.0f, 5.0f);
+        float size_mult = 1.0f;
+        if (auto* v = C.FindCVar("r_planets_size")) size_mult = v->GetFloat();
+        size_mult = std::clamp(size_mult, 0.1f, 50.0f);
+
+        if (planets_on && astro_on && brightness > 0.0f) {
+            double lat = 13.0827, lon = 80.2707;
+            if (auto* v = C.FindCVar("r_sky_lat")) lat = v->GetFloat();
+            if (auto* v = C.FindCVar("r_sky_lon")) lon = v->GetFloat();
+            for (int i = 0; i < pt::astro::kPlanetCount; ++i) {
+                const auto p  = static_cast<pt::astro::Planet>(i);
+                const auto pp = pt::astro::planetPosition(p, frame_jd);
+                if (!(pp.vmag <= double(mag_limit))) continue;   // also drops NaN
+                const auto h = pt::astro::equatorialToHorizon(pp.eq, lat, lon,
+                                                              frame_jd);
+                // Below the horizon: drop the slot entirely rather than
+                // pushing a zero-flux entry, so the shader loop is as short
+                // as the sky actually is. No refraction lift -- the sun and
+                // moon don't get one either, and 34' at the horizon is
+                // inside this module's stated tier.
+                if (h.altitude_deg <= 0.0) continue;
+
+                // Horizon -> world, identical convention to the sun and moon
+                // blocks above: +X east, +Y up, +Z south, azimuth 0 = north.
+                const float e_r = glm::radians(static_cast<float>(h.altitude_deg));
+                const float a_r = glm::radians(static_cast<float>(h.azimuth_deg));
+                const float ce_p = std::cos(e_r), se_p = std::sin(e_r);
+                const auto  slot = planet_slot_count;
+                planet_dir_flux[slot][0] =  ce_p * std::sin(a_r);
+                planet_dir_flux[slot][1] =  se_p;
+                planet_dir_flux[slot][2] = -ce_p * std::cos(a_r);
+                // THE shared photometric scale. Same two functions every
+                // Bright Star Catalog entry goes through -- a planet at
+                // V = -2.7 must paint what a star at V = -2.7 paints.
+                const float vmag = static_cast<float>(pp.vmag);
+                planet_dir_flux[slot][3] =
+                    pt::stars::MagnitudeToFlux(vmag) * brightness;
+                pt::stars::BvToLinearSrgbTint(
+                    static_cast<float>(pt::astro::planetBvColorIndex(p)),
+                    planet_tint_sigma[slot]);
+                planet_tint_sigma[slot][3] =
+                    pt::stars::SplatAngularRadiusRad(vmag) * size_mult;
+                ++planet_slot_count;
+            }
+        }
+    }
+    // --- end Planetarium ---------------------------------------------------
+
     // HDRI multi-light array (computed at HDRI load in ReloadEnvMap).
     // Each entry is a directional light extracted from a bright cluster
     // in the env map; the shader's stochastic NEE picks one per sample
@@ -9196,7 +9322,7 @@ void Engine::RenderFrame() {
         double lat = 13.0827, lon = 80.2707;
         if (auto* v = C.FindCVar("r_sky_lat")) lat = v->GetFloat();
         if (auto* v = C.FindCVar("r_sky_lon")) lon = v->GetFloat();
-        const double jd = compute_jd();
+        const double jd = frame_jd;
         float m[9];
         pt::astro::worldToJ2000Matrix(lat, lon, jd, m);
         push.w2j_row0[0] = m[0]; push.w2j_row0[1] = m[1]; push.w2j_row0[2] = m[2];
@@ -11325,7 +11451,9 @@ void Engine::RenderFrame() {
                 std::uint32_t frame_index;
                 std::uint32_t ap_samples;
                 std::uint32_t composite_active;
-                std::uint32_t _pad0;
+                // Planetarium (#281). Number of populated planet slots
+                // (0..kPlanetCount); this lane was the reserved _pad0.
+                std::uint32_t planet_count;
                 // Planetary P0 (#254). Same semantics as PtPush's field.
                 // The composite carries verbatim copies of starsOnly /
                 // sunDisc / moonDisc, so it needs the same local-up frame
@@ -11333,8 +11461,18 @@ void Engine::RenderFrame() {
                 // the subtract-then-re-add pair would disagree about the
                 // horizon and leave a brightness seam.
                 float planet_center_radius[4];
+                // --- Planetarium (#281) ---
+                // Mirrors StarsComposite.slang's float4[PT_PLANET_SLOTS]
+                // pair. See the shader for the per-lane semantics.
+                float planet_dir_flux[pt::astro::kPlanetCount][4];
+                float planet_tint_sigma[pt::astro::kPlanetCount][4];
+                // --- end Planetarium ---
             } sc{};
-            static_assert(sizeof(StarsCompositePush) == 256,
+            // 14 float4 (224) + 4 uint (16) + planet_center_radius (16)
+            // + 2 * float4[7] (224) = 480. On Vulkan the tail past
+            // kPushSplitOffset grows 144 -> 368 B, still well inside
+            // VulkanDevice::kFrameUboSize.
+            static_assert(sizeof(StarsCompositePush) == 480,
                           "StarsCompositePush layout must match StarsComposite.slang");
             std::memcpy(sc.pos_fovtan,     push.pos_fovtan,     sizeof(sc.pos_fovtan));
             std::memcpy(sc.fwd_aspect,     push.fwd_aspect,     sizeof(sc.fwd_aspect));
@@ -11366,7 +11504,16 @@ void Engine::RenderFrame() {
             if (ap_n < 1)  ap_n = 1;
             if (ap_n > 64) ap_n = 64;
             sc.ap_samples = static_cast<std::uint32_t>(ap_n);
-            sc._pad0 = 0u;
+            // --- Planetarium (#281) --- filled in the astronomy block; the
+            // arrays are already zeroed by the `sc{}` aggregate init, so an
+            // unfilled slot is an all-zero entry the shader skips on its
+            // sigma <= 0 guard even if planet_count were ever wrong.
+            sc.planet_count = planet_slot_count;
+            std::memcpy(sc.planet_dir_flux,   planet_dir_flux,
+                        sizeof(sc.planet_dir_flux));
+            std::memcpy(sc.planet_tint_sigma, planet_tint_sigma,
+                        sizeof(sc.planet_tint_sigma));
+            // --- end Planetarium ---
             cb->PushConstants(&sc, sizeof(sc));
             cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
 
@@ -15469,6 +15616,81 @@ void Engine::RegisterCommands() {
             out.PrintLine("the issue is in scene/exposure, not astronomical math.");
         });
 
+    // --- Planetarium (#281) ------------------------------------------------
+    C.RegisterCommand("dump_planet_pos",
+        "Print every planet's computed position (RA/Dec, alt/az), apparent "
+        "magnitude, phase angle and elongation at the engine's current "
+        "effective date. This is the aiming tool: point cam_yaw / cam_pitch "
+        "at the printed az / alt to frame a planet.",
+        [](auto, pt::console::Output& out) {
+            auto& C2 = pt::console::Console::Get();
+            bool astro_on = false;
+            if (auto* v = C2.FindCVar("r_sky_use_astronomical")) astro_on = v->GetBool();
+            if (!astro_on) {
+                out.PrintLine("r_sky_use_astronomical = 0 -> planets disabled.");
+                out.PrintLine("Set r_sky_use_astronomical 1 to enable.");
+                return;
+            }
+            // Same effective-JD derivation the render path uses.
+            // Transcribed rather than shared because RenderFrame's
+            // compute_jd is a function-local lambda capturing that
+            // frame's state, and this command runs outside a frame --
+            // exactly as dump_moon_pos above does it.
+            float hour = 12.0f;
+            if (auto* v = C2.FindCVar("r_sky_hour")) hour = v->GetFloat();
+            bool local = true;
+            if (auto* v = C2.FindCVar("r_sky_hour_local")) local = v->GetBool();
+            float tz = 0.0f;
+            if (local) {
+                if (auto* v = C2.FindCVar("r_sky_tz_offset_hours")) tz = v->GetFloat();
+            }
+            int yr = 0, mo = 0, dy = 0;
+            if (auto* v = C2.FindCVar("r_sky_year"))  yr = v->GetInt();
+            if (auto* v = C2.FindCVar("r_sky_month")) mo = v->GetInt();
+            if (auto* v = C2.FindCVar("r_sky_day"))   dy = v->GetInt();
+            if (yr == 0 || mo == 0 || dy == 0) {
+                const std::time_t now = std::time(nullptr);
+                std::tm gm = *std::gmtime(&now);
+                if (yr == 0) yr = gm.tm_year + 1900;
+                if (mo == 0) mo = gm.tm_mon + 1;
+                if (dy == 0) dy = gm.tm_mday;
+            }
+            const float hour_utc = hour - tz;
+            const double jd = pt::astro::julianDateFromUtc(yr, mo, dy, 0, 0, 0.0)
+                            + double(hour_utc) / 24.0;
+            double lat = 13.0827, lon = 80.2707;
+            if (auto* v = C2.FindCVar("r_sky_lat")) lat = v->GetFloat();
+            if (auto* v = C2.FindCVar("r_sky_lon")) lon = v->GetFloat();
+            float mag_limit = 6.5f;
+            if (auto* v = C2.FindCVar("r_planets_mag_limit")) {
+                mag_limit = v->GetFloat();
+            }
+            out.FormatLine("Date {}-{:02}-{:02} {:.2f}h local (UTC {:.2f}h), "
+                           "JD {:.6f}", yr, mo, dy, hour, hour_utc, jd);
+            out.FormatLine("Observer {:.4f} N, {:.4f} E; mag limit {:.2f}",
+                           lat, lon, mag_limit);
+            out.PrintLine("body      RA(deg)  Dec(deg)   az(deg) alt(deg)"
+                          "   Vmag  phase  elong  d(au)");
+            for (int i = 0; i < pt::astro::kPlanetCount; ++i) {
+                const auto p  = static_cast<pt::astro::Planet>(i);
+                const auto pp = pt::astro::planetPosition(p, jd);
+                const auto h  = pt::astro::equatorialToHorizon(pp.eq, lat, lon, jd);
+                const char* state =
+                    (h.altitude_deg <= 0.0)      ? " (below horizon)"
+                  : (pp.vmag > double(mag_limit)) ? " (below mag limit)"
+                                                  : " RENDERED";
+                out.FormatLine("{:<9} {:8.3f} {:9.3f}  {:8.3f} {:8.3f} "
+                               "{:6.2f} {:6.2f} {:6.2f} {:6.3f}{}",
+                               pt::astro::planetName(p),
+                               pp.eq.ra_deg, pp.eq.dec_deg,
+                               h.azimuth_deg, h.altitude_deg,
+                               pp.vmag, pp.phase_angle_deg,
+                               pp.elongation_deg, pp.geocentric_dist_au,
+                               state);
+            }
+        });
+    // --- end Planetarium ---------------------------------------------------
+
     C.RegisterCommand("dof_focus_here",
         "Auto-focus DOF on whatever's at the centre of the screen. "
         "Writes the hit distance into r_dof_focus_distance_m and turns "
@@ -16547,6 +16769,24 @@ void Engine::RegisterCommands() {
         v->on_change = astro_handler_no_dirty("r_sky_animate");
     }
     if (auto* v = C.FindCVar("r_sky_animate_rate")) v->on_change = astro_handler_no_dirty("r_sky_animate_rate");
+    // --- Planetarium (#281) --- astronomy-only, same warn-in-manual-mode
+    // contract as the r_sky_* family: without a real date and observer a
+    // planet position means nothing, so the engine says so once instead of
+    // silently rendering an empty sky.
+    if (auto* v = C.FindCVar("r_planets")) {
+        v->allowed_values = {"0", "1"};
+        v->on_change = astro_handler("r_planets");
+    }
+    if (auto* v = C.FindCVar("r_planets_mag_limit")) {
+        v->on_change = astro_handler("r_planets_mag_limit");
+    }
+    if (auto* v = C.FindCVar("r_planets_brightness")) {
+        v->on_change = astro_handler("r_planets_brightness");
+    }
+    if (auto* v = C.FindCVar("r_planets_size")) {
+        v->on_change = astro_handler("r_planets_size");
+    }
+    // --- end Planetarium ---
     if (auto* v = C.FindCVar("r_show_stars")) {
         v->allowed_values = {"0", "1"};
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
@@ -16743,6 +16983,11 @@ void Engine::RegisterCommands() {
     set_slider("r_sun_size",               0.5f,  20.0f,  0.1f);
     set_slider("r_moon_disc_brightness",   0.0f,   3.0f,  0.05f);
     set_slider("r_sun_disc_brightness",    0.0f,   3.0f,  0.05f);
+    // --- Planetarium (#281) ---
+    set_slider("r_planets_mag_limit",     -2.0f,  10.0f,  0.1f);
+    set_slider("r_planets_brightness",     0.0f,   5.0f,  0.05f);
+    set_slider("r_planets_size",           0.1f,  20.0f,  0.1f);
+    // --- end Planetarium ---
     set_slider("r_clouds_coverage",         0.0f,    1.0f,   0.01f);
     set_slider("r_clouds_base_height",      0.0f, 12000.0f, 25.0f);
     set_slider("r_clouds_top_height",      50.0f, 14000.0f, 25.0f);

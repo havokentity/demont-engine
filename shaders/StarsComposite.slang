@@ -156,6 +156,18 @@
 //                       only path that observes the early-out is the
 //                       narrow window between gate evaluation in the
 //                       engine and the GPU-side guard here.
+//   planet_count    -- number of populated planet slots (0..7); was the
+//                       reserved _pad0 lane before #281.
+//   planet_dir_flux / planet_tint_sigma -- see the planetSplat() block.
+
+// Planetarium (#281). Slot count for the two per-planet push arrays. HARD
+// CONTRACT with pt::astro::kPlanetCount (src/renderer/Astronomy.h) and with
+// Engine.cpp's StarsCompositePush -- Engine.cpp static_asserts the struct
+// size, which is what actually catches a drift. Eight major planets minus
+// Earth = seven renderable bodies; the array is fixed-size because push
+// constants cannot be variable-length, and planet_count says how many of
+// the slots the host actually filled this frame.
+#define PT_PLANET_SLOTS 7
 
 #ifdef PT_TARGET_SPIRV
 // Vulkan path. NVIDIA's maxPushConstantsSize is 256B and the engine's
@@ -203,7 +215,7 @@ cbuffer Frame {
     uint   frame_index;
     uint   ap_samples;
     uint   composite_active;
-    uint   _pad0;
+    uint   planet_count;
     // --- Planetary P0 (#254) ---
     // .xyz planet centre (world), .w radius; .w <= 0 == planar frame, in
     // which localUp() is world +Y. Mirrors PtPush's field so this kernel's
@@ -211,6 +223,17 @@ cbuffer Frame {
     // used when it SUBTRACTED them at the primary miss.
     float4 planet_center_radius;
     // --- end Planetary P0 ---
+    // --- Planetarium (#281) ---
+    // Per-slot: .xyz unit world-space direction to the planet, .w linear
+    // flux (already through pt::stars::MagnitudeToFlux and the
+    // r_planets_brightness multiplier host-side) / .rgb linear Rec.709
+    // tint at unit luminance, .w Gaussian angular sigma in radians.
+    // Both arrays are std140 float4[7] = 112 B each; the tail this kernel
+    // spills into the shared Frame UBO grows from 144 B to 368 B, still
+    // far inside VulkanDevice::kFrameUboSize.
+    float4 planet_dir_flux[PT_PLANET_SLOTS];
+    float4 planet_tint_sigma[PT_PLANET_SLOTS];
+    // --- end Planetarium ---
 };
 
 #else  // !PT_TARGET_SPIRV -- Metal MSL path
@@ -240,10 +263,14 @@ cbuffer Push {
     uint frame_index;
     uint ap_samples;
     uint composite_active;
-    uint _pad0;
+    uint planet_count;
     // --- Planetary P0 (#254) --- mirrors the SPIR-V Frame field above.
     float4 planet_center_radius;
     // --- end Planetary P0 ---
+    // --- Planetarium (#281) --- mirrors the SPIR-V Frame fields above.
+    float4 planet_dir_flux[PT_PLANET_SLOTS];
+    float4 planet_tint_sigma[PT_PLANET_SLOTS];
+    // --- end Planetarium ---
 };
 
 #endif  // PT_TARGET_SPIRV
@@ -353,6 +380,72 @@ float3 starsOnly(float3 rd, float3 sun) {
         }
     }
     return float3(0.0);
+}
+
+// Planetarium (#281). Every planet is a sub-pixel point source -- Jupiter
+// at opposition subtends 45.9", against a 112.5" pixel at 1080p / 60 deg
+// FOV, so 0.41 px. Nothing is ever resolved, which is why the planets ride
+// the STAR path and not the sunDisc / moonDisc path: they are a
+// compositing problem, not a geometry problem.
+//
+// The splat is deliberately the SAME Gaussian the Bright Star Catalog
+// rasteriser writes into the starmap texture (BscCatalog.cpp's inner loop):
+//
+//     ang2  = 2 (1 - cos(angle))          small-angle form of angle^2
+//     gauss = exp(-ang2 / sigma^2)        note: no 1/2, matching the map
+//     cut   = ang2 > sigma^2 * K^2, K = 4
+//
+// with sigma from pt::stars::SplatAngularRadiusRad(vmag) and the peak from
+// pt::stars::MagnitudeToFlux(vmag) -- both host-side, both the identical
+// functions the catalogue stars go through. A planet at V = -2.7 therefore
+// paints exactly what a catalogue star at V = -2.7 paints. That shared
+// scale is the whole point; if the two ever diverge, Jupiter stops being
+// comparable to Sirius and the sky is lying.
+//
+// Bodies below the observer's horizon and bodies fainter than
+// r_planets_mag_limit never reach the push constant -- the host drops them
+// and shrinks planet_count -- so there is no per-body visibility test here.
+//
+// Day fade mirrors starsOnly() exactly (same smoothstep, same 0.6 cutoff,
+// same 1-day scale) so planets and stars wash out of the dawn sky together
+// instead of the planets hanging on as pinpricks over a blue sky. It does
+// NOT check exposure_pad.z / .y (the r_show_stars + r_stars_mode gates):
+// r_planets is its own switch, so "planets over an empty sky" is a
+// configuration a user can ask for.
+//
+// COST. This runs inside the ap_samples aperture loop, so the worst case is
+// 7 * ap_samples iterations per sky pixel. Each rejected planet costs a
+// uniform load, a dot product and a compare before the `continue`, and
+// rejection is the overwhelmingly common case (a planet covers ~0.3 deg of
+// a whole hemisphere). The two early-outs above skip the loop entirely
+// whenever no planet is up or the sun is high, which is most of the time.
+//
+// NOTE ON THE COMPOSITE-ONLY PATH: unlike stars / sun / moon, PathTrace
+// .slang does NOT subtract a planet term at the primary miss, because it
+// never added one -- planets exist only in this kernel. There is therefore
+// no double-count to worry about, and equally no planets when the star
+// split is off (r_star_split 0) or on the software backend. That is the
+// documented scope of #281: the planets are a post-denoise composite.
+float3 planetSplat(float3 rd, float3 sun) {
+    if (planet_count == 0u) return float3(0.0);
+    float sun_elev = dot(localUp(pos_fovtan.xyz), sun);
+    float day      = smoothstep(-0.10, 0.20, sun_elev);
+    if (day >= 0.6) return float3(0.0);
+
+    float3 acc = float3(0.0);
+    uint n = min(planet_count, uint(PT_PLANET_SLOTS));
+    for (uint i = 0u; i < n; ++i) {
+        float4 df = planet_dir_flux[i];
+        float4 ts = planet_tint_sigma[i];
+        float sigma = ts.w;
+        if (sigma <= 0.0 || df.w <= 0.0) continue;
+        float c    = clamp(dot(rd, df.xyz), -1.0, 1.0);
+        float ang2 = 2.0 * (1.0 - c);
+        float s2   = sigma * sigma;
+        if (ang2 > s2 * 16.0) continue;          // K = 4 sigma, as the map
+        acc += ts.rgb * (df.w * exp(-ang2 / s2));
+    }
+    return acc * (1.0 - day);
 }
 
 float3 sunDisc(float3 rd, float3 sun_dir) {
@@ -718,7 +811,15 @@ void main(uint3 tid : SV_DispatchThreadID) {
         // procSkyInlineSunDiscAndHalo). The aperture loop averages
         // these so DOF naturally resolves the sun / moon bokeh in a
         // single frame, no temporal accumulation required.
+        //
+        // planetSplat is the fifth term and the one exception to the
+        // mirror: PathTrace has no planet term to subtract (see the
+        // planetSplat comment). It joins the same aperture average so
+        // planets get the same sub-pixel jitter integration the stars do
+        // -- without it a slowly panning camera makes Jupiter snap
+        // on/off as it crosses pixel boundaries.
         float3 sample_contrib = starsOnly(rd, sun)
+                              + planetSplat(rd, sun)
                               + sunDisc(rd, sun)
                               + moonDisc(rd, moon_dir_phase, sun)
                               + procSkyInlineSunDiscAndHalo(rd, sun);

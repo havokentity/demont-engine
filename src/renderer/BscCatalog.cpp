@@ -106,53 +106,118 @@ std::vector<Star> LoadBsc5(const std::string& path, std::string* err) {
     return stars;
 }
 
+// Magnitude -> linear flux. Vega (mag 0) is 1.0; dimmer stars fall
+// off by 2.512^(-mag). We multiply by an overall gain so naked-eye
+// stars punch through ACES tonemapping at typical exposure.
+//
+// 4.0 picked so naked-eye limit (vmag=6) lands at ~0.06 per-texel,
+// which after exposure*1.5 and ACES tonemap reads as ~50/255 --
+// visibly speckled against a deep night sky. Bright stars saturate
+// ACES regardless, so this scale doesn't blow them out further.
+float MagnitudeToFlux(float vmag) {
+    constexpr float kVegaFlux  = 1.0f;
+    constexpr float kFluxScale = 4.0f;
+    constexpr float kPogson    = 2.51188643f; // 10^(0.4)
+    return kVegaFlux * std::pow(kPogson, -vmag) * kFluxScale;
+}
+
+// Angular Gaussian sigma (radians) per star. Most stars get a
+// sub-arcmin sigma so they read as crisp single-texel points;
+// only the very brightest get any visible halo. Earlier values
+// (~6-20 arcmin for bright stars) made Sirius / Vega look like
+// small moons -- which is way bigger than what you see by eye
+// or in a long-exposure photo. The full moon is 30 arcmin
+// across; the human eye's optical PSF for a star is 1-2 arcmin.
+//
+// 1 arcmin = 2.909e-4 rad. Texel pitch at 4096x2048 is ~5.3 arcmin
+// (1.53e-3 rad), so anything below ~1 texel sigma is sub-pixel
+// and reads as a hot point. Per-texel peak brightness comes from
+// the magnitude-driven flux, which is independent of sigma --
+// shrinking sigma here doesn't dim the dim stars.
+// Sigma must be >= the texel pitch (~5.3 arcmin / 1.54e-3 rad at
+// 4Kx2K) for sub-texel-positioned stars to reliably write their
+// peak flux into at least one texel; below ~half-texel-pitch the
+// Gaussian's mass falls between texels and dim stars lose 90%+
+// of their amplitude. Brighter tiers get a wider halo on top.
+//
+// Tuned for 8192x4096 (~2.6 arcmin/texel). Earlier 4Kx2K
+// values were ~2x too wide at the bumped resolution and made
+// stars read as soft Gaussian smudges. These keep dim stars
+// at ~half-texel sigma (crisp 1-px points) and only let
+// brightest stars bloom across 2-3 texels for a visible halo.
+float SplatAngularRadiusRad(float vmag) {
+    if (vmag < -1.0f) return 1.4e-3f;  // ~4.8 arcmin -- Sirius/Canopus halo
+    if (vmag <  1.0f) return 1.0e-3f;  // ~3.4 arcmin -- top stars, gentle bloom
+    if (vmag <  3.0f) return 0.75e-3f; // ~2.6 arcmin -- 1 texel sharp
+    return                  0.75e-3f;  // ~2.6 arcmin -- 1 texel sharp
+}
+
+void BvToLinearSrgbTint(float bv, float out_rgb[3]) {
+    // Step 1: B-V -> blackbody colour temperature.
+    //   Ballesteros, F. J. (2012), "New insights into black bodies",
+    //   Europhysics Letters 97, 34008, eq. (14):
+    //     T = 4600 K * ( 1/(0.92 (B-V) + 1.7) + 1/(0.92 (B-V) + 0.62) )
+    // Sanity anchor: the Sun's B-V = 0.65 returns 5779 K against its
+    // true 5772 K effective temperature.
+    //
+    // Clamp the input to the range over which the relation was fitted
+    // for main-sequence stars; outside it the second denominator can
+    // reach zero and the expression diverges. -0.4 is bluer than any
+    // O-type star, +2.0 redder than any planet or M-type giant.
+    const double x  = 0.92 * double(std::clamp(bv, -0.4f, 2.0f));
+    const double T  = 4600.0 * (1.0 / (x + 1.7) + 1.0 / (x + 0.62));
+    // Step 2: T -> CIE 1931 chromaticity on the Planckian locus.
+    //   Kim, Y., Moon, B.-C. and Kim, D.-S. (2002), "Design of advanced
+    //   color temperature control system for HDTV applications",
+    //   J. Korean Phys. Soc. 41(6), 865-871 -- the cubic approximations
+    //   reproduced in CIE 15:2004 practice and in Wikipedia's
+    //   "Planckian locus" article. Valid 1667 K .. 25000 K.
+    const double Tc = std::clamp(T, 1667.0, 25000.0);
+    const double t1 = 1.0e3 / Tc;
+    const double t2 = t1 * t1;
+    const double t3 = t2 * t1;
+    double cx;
+    if (Tc < 4000.0) {
+        cx = -0.2661239 * t3 - 0.2343589 * t2 + 0.8776956 * t1 + 0.179910;
+    } else {
+        cx = -3.0258469 * t3 + 2.1070379 * t2 + 0.2226347 * t1 + 0.240390;
+    }
+    const double x2 = cx * cx;
+    const double x3 = x2 * cx;
+    double cy;
+    if (Tc < 2222.0) {
+        cy = -1.1063814 * x3 - 1.34811020 * x2 + 2.18555832 * cx - 0.20219683;
+    } else if (Tc < 4000.0) {
+        cy = -0.9549476 * x3 - 1.37418593 * x2 + 2.09137015 * cx - 0.16748867;
+    } else {
+        cy =  3.0817580 * x3 - 5.87338670 * x2 + 3.75112997 * cx - 0.37001483;
+    }
+    // xyY (Y = 1) -> XYZ -> linear sRGB / Rec.709 (IEC 61966-2-1 matrix,
+    // D65 white). Negative components mean the Planckian chromaticity fell
+    // outside the sRGB gamut; clamp rather than desaturate, the excursion
+    // is fractions of a percent over the temperature range planets span.
+    const double Y = 1.0;
+    const double X = (cx / std::max(cy, 1e-6)) * Y;
+    const double Z = ((1.0 - cx - cy) / std::max(cy, 1e-6)) * Y;
+    double r =  3.2404542 * X - 1.5371385 * Y - 0.4985314 * Z;
+    double g = -0.9692660 * X + 1.8760108 * Y + 0.0415560 * Z;
+    double b =  0.0556434 * X - 0.2040259 * Y + 1.0572252 * Z;
+    r = std::max(r, 0.0); g = std::max(g, 0.0); b = std::max(b, 0.0);
+    // Normalise to unit Rec.709 luminance so the tint carries hue only --
+    // MagnitudeToFlux owns brightness, and a caller multiplying the two
+    // must get back exactly the magnitude it asked for.
+    const double lum = std::max(0.2126 * r + 0.7152 * g + 0.0722 * b, 1e-6);
+    out_rgb[0] = float(r / lum);
+    out_rgb[1] = float(g / lum);
+    out_rgb[2] = float(b / lum);
+}
+
 void RasteriseJ2000Map(const std::vector<Star>& stars,
                        std::uint32_t W, std::uint32_t H,
                        std::vector<float>& out) {
     PT_ZONE_SCOPED_N("stars::RasteriseJ2000Map");
     out.assign(std::size_t(W) * H * 4, 0.0f);
     if (stars.empty() || W == 0 || H == 0) return;
-
-    // Magnitude -> linear flux. Vega (mag 0) is 1.0; dimmer stars fall
-    // off by 2.512^(-mag). We multiply by an overall gain so naked-eye
-    // stars punch through ACES tonemapping at typical exposure.
-    constexpr float kVegaFlux  = 1.0f;
-    // 4.0 picked so naked-eye limit (vmag=6) lands at ~0.06 per-texel,
-    // which after exposure*1.5 and ACES tonemap reads as ~50/255 --
-    // visibly speckled against a deep night sky. Bright stars saturate
-    // ACES regardless, so this scale doesn't blow them out further.
-    constexpr float kFluxScale = 4.0f;
-    constexpr float kPogson    = 2.51188643f; // 10^(0.4)
-
-    // Angular Gaussian sigma (radians) per star. Most stars get a
-    // sub-arcmin sigma so they read as crisp single-texel points;
-    // only the very brightest get any visible halo. Earlier values
-    // (~6-20 arcmin for bright stars) made Sirius / Vega look like
-    // small moons -- which is way bigger than what you see by eye
-    // or in a long-exposure photo. The full moon is 30 arcmin
-    // across; the human eye's optical PSF for a star is 1-2 arcmin.
-    //
-    // 1 arcmin = 2.909e-4 rad. Texel pitch at 4096x2048 is ~5.3 arcmin
-    // (1.53e-3 rad), so anything below ~1 texel sigma is sub-pixel
-    // and reads as a hot point. Per-texel peak brightness comes from
-    // the magnitude-driven flux, which is independent of sigma --
-    // shrinking sigma here doesn't dim the dim stars.
-    // Sigma must be >= the texel pitch (~5.3 arcmin / 1.54e-3 rad at
-    // 4Kx2K) for sub-texel-positioned stars to reliably write their
-    // peak flux into at least one texel; below ~half-texel-pitch the
-    // Gaussian's mass falls between texels and dim stars lose 90%+
-    // of their amplitude. Brighter tiers get a wider halo on top.
-    auto angular_radius = [](float vmag) {
-        // Tuned for 8192x4096 (~2.6 arcmin/texel). Earlier 4Kx2K
-        // values were ~2x too wide at the bumped resolution and made
-        // stars read as soft Gaussian smudges. These keep dim stars
-        // at ~half-texel sigma (crisp 1-px points) and only let
-        // brightest stars bloom across 2-3 texels for a visible halo.
-        if (vmag < -1.0f) return 1.4e-3f;  // ~4.8 arcmin -- Sirius/Canopus halo
-        if (vmag <  1.0f) return 1.0e-3f;  // ~3.4 arcmin -- top stars, gentle bloom
-        if (vmag <  3.0f) return 0.75e-3f; // ~2.6 arcmin -- 1 texel sharp
-        return                  0.75e-3f;  // ~2.6 arcmin -- 1 texel sharp
-    };
 
     auto color_for_index = [](std::uint32_t i) {
         const float palette[3][3] = {
@@ -173,7 +238,7 @@ void RasteriseJ2000Map(const std::vector<Star>& stars,
 
     for (std::size_t i = 0; i < stars.size(); ++i) {
         const Star& s = stars[i];
-        const float flux = kVegaFlux * std::pow(kPogson, -s.vmag) * kFluxScale;
+        const float flux = MagnitudeToFlux(s.vmag);
 
         // Star direction in J2000: same convention as the shader looks
         // up later (atan2(j.y, j.x) -> RA, asin(j.z) -> dec).
@@ -192,7 +257,7 @@ void RasteriseJ2000Map(const std::vector<Star>& stars,
         const float fy = v * float(H);
 
         const auto [r_tint, g_tint, b_tint] = color_for_index(std::uint32_t(i));
-        const float r_ang  = angular_radius(s.vmag);
+        const float r_ang  = SplatAngularRadiusRad(s.vmag);
         const float r_ang2 = r_ang * r_ang;
         const int   K      = 4;     // truncate Gaussian past 4-sigma
 
