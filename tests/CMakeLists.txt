@@ -362,6 +362,62 @@ else()
     target_compile_options(pt_atmosphere PRIVATE $<$<CONFIG:Release>:/fp:fast>)
 endif()
 
+# --- pt_planet_terrain (issue #258, planetary P4) --------------------------
+# The cubed-ellipsoid quadtree, the elevation field, chunk baking and the
+# residency selector.
+#
+# Three of P4's acceptance criteria are claims a golden PNG cannot settle,
+# because a PNG only shows that one camera saw no crack:
+#   * watertightness is an equality between two chunks at DIFFERENT levels
+#     over the WHOLE domain, including all 12 cube seams;
+#   * "golden determinism" is a statement that an asynchronously baked chunk
+#     is byte-identical to a synchronously baked one;
+#   * the LOD rule's sub-pixel property and its hysteresis are numbers.
+# All three are asserted here; the goldens then show the same surface
+# reached the screen.
+#
+# -ffast-math in Release like the other numeric targets, and the finiteness
+# checks use the volatile-barrier finiteBits() pattern rather than
+# std::isfinite -- under __FINITE_MATH_ONLY__ the latter folds to `true`
+# and an assertion goes quietly vacuous, which is exactly how PR #273
+# shipped a check that could not fail.
+pt_add_test(pt_planet_terrain
+    pt_planet_terrain_test.cpp
+    LINK_TARGETS pt_renderer)
+if(NOT MSVC)
+    target_compile_options(pt_planet_terrain PRIVATE $<$<CONFIG:Release>:-ffast-math>)
+else()
+    target_compile_options(pt_planet_terrain PRIVATE $<$<CONFIG:Release>:/fp:fast>)
+endif()
+# The chunk-bake cases walk a level-19 chunk's full subdivision hierarchy,
+# which is ~22 000 field evaluations per chunk; the default 60 s backstop is
+# tight for that on a loaded machine.
+set_tests_properties(pt_planet_terrain PROPERTIES TIMEOUT 180)
+
+# --- pt_planet_shader (issue #258, planetary P4) ---------------------------
+# The host mirror of the shader-side terrain contract: the instance
+# descriptor's wire format, the three terrain bindings across Slang AND the
+# Vulkan slot table / layout / pool, the cone_spread equality, and the
+# roughness fold.
+#
+# It re-reads THREE files, and that breadth is the point: the phase is
+# tested on Metal, so the Vulkan half of the binding contract has no
+# runtime check at all on this machine, and a shader binding the descriptor
+# layout does not declare is a hard vkCreateComputePipelines failure.
+#
+# Every assertion COUNTS occurrences rather than testing for presence. A
+# `find() != npos` pin passes as soon as one site matches, which is exactly
+# how a mirror keeps passing after the shader grows a second copy of the
+# mirrored thing -- how #276 shipped a stale duplicate of planetAltitude
+# while pt_math_altitude stayed green.
+pt_add_test(pt_planet_shader
+    pt_planet_shader_test.cpp
+    LINK_TARGETS pt_renderer)
+target_compile_definitions(pt_planet_shader PRIVATE
+    PT_SHADER_PATHTRACE_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang"
+    PT_VULKAN_DEVICE_PATH="${CMAKE_SOURCE_DIR}/src/rhi_vulkan/VulkanDevice.cpp"
+    PT_ENGINE_CPP_PATH="${CMAKE_SOURCE_DIR}/src/engine/Engine.cpp")
+
 # --- pt_math_epsilon (issue #256, planetary P2) ----------------------------
 # Scale-relative ray epsilons: the Wachter-Binder representational offset
 # and the ray-cone footprint term that replaced the absolute 1e-3 m every
@@ -1298,6 +1354,47 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # Tolerances match the other cloud cells (32/4/3): the march is a
     # stochastic estimator and its 2-spp noise floor over 64 accumulated
     # frames is wider than the analytic-geometry baseline.
+    # --- Planetary P4 (#258): streamed terrain ---------------------------
+    #
+    # Three cells, all metal-only and all denoiser-off.
+    #
+    # WHY NO SOFTWARE CELL. The terrain rides the hardware ray query, and
+    # while the software backend's Embree TLAS would carry the geometry,
+    # SoftwareTracer.cpp is a hand-written CPU renderer rather than a
+    # Slang-to-CPU emit -- it never reads the per-instance descriptor SSBO,
+    # so every terrain hit would shade as the legacy gold mesh material. A
+    # software golden would pin that placeholder, not the phase. Registering
+    # the cell is cheap once the tracer reads descriptors; until then the
+    # absence is the honest state. (#45's known-limited matrix cell.)
+    #
+    # WHY NO ORBIT CELL. "Fly to orbit and see a coherent globe" is P4
+    # acceptance and the GEOMETRY half works -- at 3.0e7 m the streamer
+    # serves the six roots, the anchor engages, the limb is clean. The
+    # SHADING half does not, and not because of this phase: the P3 analytic
+    # planet body renders as a black disc from outside the atmosphere on
+    # UNMODIFIED main too (cam_pos 0 30000000 0, r_planet_ground 1). The
+    # sky-view path is a function of the camera and does not survive
+    # leaving the shell, which is what the roadmap says and what P6 owns.
+    # planet_aerial.cfg goes as high as the atmosphere is currently valid.
+    #
+    # DETERMINISM. Each fixture sets r_planet_lod_freeze 1 and
+    # pt_planet_settle, which hold the capture until the selector has
+    # measured every leaf it wants and every desired chunk is resident --
+    # exactly like a loading frame, and for the same reason.
+    #
+    # FRAMES 32 rather than the default 64: the settle frames come on top
+    # of the budget and each of these fixtures takes 50-60 of them, so 64
+    # accumulation frames on top runs the cell close to its timeout on a
+    # loaded machine. With r_planet_lod_freeze the geometry is identical
+    # across every accumulated frame, so the noise floor at 32 is the
+    # ordinary path-tracer one.
+    pt_add_golden_cell(SCENE planet_surface  BACKEND metal DENOISER off
+                       FRAMES 32)
+    pt_add_golden_cell(SCENE planet_aerial   BACKEND metal DENOISER off
+                       FRAMES 32)
+    pt_add_golden_cell(SCENE planet_lod_seam BACKEND metal DENOISER off
+                       FRAMES 32)
+    # --- end Planetary P4 -------------------------------------------------
     pt_add_golden_cell(SCENE planet_horizon_clouds        BACKEND metal DENOISER off
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
     pt_add_golden_cell(SCENE planet_horizon_clouds_planar BACKEND metal DENOISER off
