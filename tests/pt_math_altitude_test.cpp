@@ -313,47 +313,43 @@ PT_MIRROR float altitudeViaMaterialisedOc(F3 p, F3 c, float rad) {
     return ptPowerOfPoint(oc, rad) / (len(oc) + rad);
 }
 
-// --- exact reference ------------------------------------------------------
+// --- reference ------------------------------------------------------------
 //
 // float * float is EXACT in double (24 + 24 = 48 mantissa bits against
-// double's 53), so every term of |p|^2 - 2 p.c + |c|^2 - rad^2 is exact;
-// only their sum would round.  Accumulating them in __int128 fixed point
-// removes even that, so the numerator below is the mathematically exact
-// value the float32 inputs determine -- which is the whole claim under
-// test.  2^-60 resolution over terms bounded by ~2^90 stays far inside
-// 127 bits.
+// double's 53), so every term of |p|^2 - 2 p.c + |c|^2 - rad^2 is exact
+// and only their sum rounds.  Ten additions, each at most half an ULP of
+// a running total bounded by 4m^2, put the numerator within
+// 10 * 0.5 * ULP(4m^2) of the value the float32 inputs determine -- at
+// Earth radius, 0.08 m^2, which is 6e-9 m of altitude once divided by
+// |oc| + rad.  Every error asserted in this file is at least fifty times
+// that, so the reference is not the limiting term anywhere.
+//
+// An earlier revision accumulated these terms in __int128 fixed point to
+// remove even that rounding.  It was over-engineering, and it did not
+// compile on MSVC (`__int128` is unsupported there), which is what
+// Copilot caught on this PR.  Note that a compensated float sum -- Kahan,
+// two-sum -- is NOT an option in its place: this target is built
+// -ffast-math, and #267 measured such schemes being folded away by
+// exactly that.  Plain double summation has no identity to fold, and the
+// derived bound above is comfortable, so it is what the reference uses.
+//
+// The expansion is deliberate: like ptPowerOfPointAt, the reference never
+// forms p - c, so it cannot inherit the quantisation that is the subject
+// of the measurement.  (In double it would not, but keeping the two in
+// the same form makes the comparison exact in intent as well as value.)
 double exactPower(F3 p, F3 c, float rad) {
-    __int128 acc = 0;
-    constexpr int kShift = -60;
-    auto add = [&](float x, float y, int sgn) {
-        double pr = double(x) * double(y);
-        if (pr == 0.0) return;
-        int e = 0;
-        double m   = std::frexp(pr, &e);
-        long long mi = static_cast<long long>(std::ldexp(m, 53));
-        int d = (e - 53) - kShift;
-        __int128 v = static_cast<__int128>(mi);
-        if (d >= 0) v <<= d; else v >>= (-d);
-        acc += static_cast<__int128>(sgn) * v;
-    };
-    add(p.x, p.x, 1);  add(p.y, p.y, 1);  add(p.z, p.z, 1);
-    add(p.x, c.x, -2); add(p.y, c.y, -2); add(p.z, c.z, -2);
-    add(c.x, c.x, 1);  add(c.y, c.y, 1);  add(c.z, c.z, 1);
-    add(rad, rad, -1);
-    bool neg = acc < 0;
-    __int128 a = neg ? -acc : acc;
-    auto lo64 = static_cast<unsigned long long>(
-        a & static_cast<__int128>(0xFFFFFFFFFFFFFFFFull));
-    auto hi64 = static_cast<unsigned long long>(a >> 64);
-    double v = (static_cast<double>(hi64) * std::ldexp(1.0, 64)
-                + static_cast<double>(lo64)) * std::ldexp(1.0, kShift);
-    return neg ? -v : v;
+    const double px = p.x, py = p.y, pz = p.z;
+    const double cx = c.x, cy = c.y, cz = c.z, r = rad;
+    return px * px + py * py + pz * pz
+         - 2.0 * (px * cx + py * cy + pz * cz)
+         + cx * cx + cy * cy + cz * cz
+         - r * r;
 }
 
 // Exact altitude of the point p, in double.  The denominator needs only
 // relative accuracy (an error there scales h, it does not offset it), and
-// double delivers 1e-16 of it, so this reference is ~1e-9 m even at
-// planetary scale -- three orders finer than anything asserted below.
+// double delivers 1e-16 of it, so the denominator contributes nothing;
+// the numerator's bound is derived above.
 double referenceAltitude(F3 p, F3 c, float rad) {
     double ox = double(p.x) - double(c.x);
     double oy = double(p.y) - double(c.y);
