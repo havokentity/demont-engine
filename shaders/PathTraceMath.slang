@@ -300,7 +300,10 @@ float ptFixedTotal(PtFixedSum a) {
 // |oc|^2 - rad^2 -- the power of the point with respect to the sphere, and
 // the quantity the naive form destroys.  Correctly rounded in practice:
 // the accumulator resolves ~24 bits below the float32 result's own ULP.
-float ptPowerOfPoint(float3 oc, float rad) {
+//
+// Public because altitude wants it too (issue #271): every "how far above
+// the surface" query in the shader is this quantity divided by |oc| + rad.
+public float ptPowerOfPoint(float3 oc, float rad) {
     float m = max(max(abs(oc.x), abs(oc.y)), max(abs(oc.z), rad));
     PtFixedSum a = ptFixedBegin(2 * ptFloatExp(m) + 1);
     ptFixedAddProduct(a, oc.x, oc.x,  1.0);
@@ -314,7 +317,10 @@ float ptPowerOfPoint(float3 oc, float rad) {
 // sums three ~R terms down to a few kilometres, so the plain dot product
 // carries ~eps*R = 0.4 m of absolute error -- which lands directly on t
 // for horizon rays, the exact case sub-metre terrain cares about.
-float ptDotExact(float3 a, float3 b) {
+//
+// Public for the same reason as ptPowerOfPoint (issue #271): the hoisted
+// ray-march altitude below needs (ro - c) . rd at full precision.
+public float ptDotExact(float3 a, float3 b) {
     float m = max(max(abs(a.x), abs(a.y)), abs(a.z))
             * max(max(abs(b.x), abs(b.y)), abs(b.z));
     if (!(m > 0.0)) { return 0.0; }
@@ -387,6 +393,159 @@ public bool intersectPlane(float3 ro, float3 rd, float3 n, float d, out float t)
     t = -(dot(ro, n) + d) / denom;
     return t > 1e-3;
 }
+
+// --- Altitude above a sphere at planetary radius (issue #271) --------------
+//
+// `length(p - c) - rad` is the intersectSphere defect in its smallest
+// form.  At the Earth's radius it differences two values that agree to
+// seven digits and keeps ~0.5 m of noise -- measured below -- on a
+// quantity that then goes into exp(-h / 1500) (Mie) and exp(-h / 8000)
+// (Rayleigh), and that the altitude-indexed LUTs of #257 and the terrain
+// LOD of #258 will read directly.
+//
+// Run the identity |oc|^2 - rad^2 = (|oc| - rad)(|oc| + rad) in the
+// direction that AVOIDS the subtraction instead of creating it:
+//
+//     h = (|oc|^2 - rad^2) / (|oc| + rad)
+//
+// -- an exact numerator over a denominator that is a sum of two
+// non-negative quantities and so cannot cancel at all.  The denominator
+// only ever needs relative accuracy: an error there scales h instead of
+// offsetting it, which is why ~2R can sit in it harmlessly.
+//
+// THE SUBSTITUTION IS NOT ENOUGH ON ITS OWN.  `oc = p - c` must never be
+// formed: with the planet centre at (0, -R, 0), `p.y - c.y` is `p.y + R`,
+// an addition into a magnitude whose ULP is 0.5 m, so materialising oc
+// quantises the altitude to +/- 0.25 m BEFORE any of the above runs.
+// Measured over a 100 km ground sweep at R = 6.371e6: naive 0.50 m,
+// exact-k-over-|oc|+R on a materialised oc 0.25 m -- half the defect,
+// still nowhere near what p carries.  ptPowerOfPointAt therefore
+// accumulates
+//
+//     |p - c|^2 - rad^2  =  |p|^2 - 2 p.c + |c|^2 - rad^2
+//
+// from p, c and rad directly, so no float32 subtraction happens anywhere
+// and the answer lands within a few ULPs of the returned altitude itself
+// (3.3e-7 m at h = 1 m).  Same information argument as #254: p, c and rad
+// are exact floats, so the altitude they determine is exact too; it just
+// needs wider-than-float32 arithmetic to get at.
+
+// Whether the accumulated path is both worth taking and inside the
+// accumulator's domain.  Same crossover as intersectSphere -- the naive
+// form's ~eps*rad error reaches a millimetre at 1e-3 * 2^24 -- so bodies
+// at or below it keep the historic expression and every existing scene
+// renders unchanged.  The exponent ceiling is one lower than
+// intersectSphere's 74 because ptPowerOfPointAt seeds the accumulator at
+// 2e+2 rather than 2e+1 (see there), and 2^(e-23) must stay normal.
+bool ptAltitudeStable(float3 p, float3 c, float rad) {
+    if (!(rad > kPtStableSphereRadius)) { return false; }
+    float m = max(max(max(abs(p.x), abs(p.y)), abs(p.z)),
+                  max(max(abs(c.x), abs(c.y)), max(abs(c.z), rad)));
+    return ptFloatExp(m) <= 73;
+}
+
+// |p - c|^2 - rad^2 with p - c never formed.  Ten exact products instead
+// of ptPowerOfPoint's four; the cross terms carry a factor of two, so the
+// accumulator is seeded one binade higher (2e+2, not 2e+1) to keep every
+// term inside ptFixedAdd's 2^(e+1) bound.  That costs a factor of two in
+// absolute resolution: 2^(e-47) is 0.5 m^2 at Earth radius, i.e. 4e-8 m
+// of altitude, still a third of the float32 ULP of a one-metre altitude
+// and so not the term that limits the answer.
+public float ptPowerOfPointAt(float3 p, float3 c, float rad) {
+    float m = max(max(max(abs(p.x), abs(p.y)), abs(p.z)),
+                  max(max(abs(c.x), abs(c.y)), max(abs(c.z), rad)));
+    PtFixedSum a = ptFixedBegin(2 * ptFloatExp(m) + 2);
+    ptFixedAddProduct(a, p.x, p.x,  1.0);
+    ptFixedAddProduct(a, p.y, p.y,  1.0);
+    ptFixedAddProduct(a, p.z, p.z,  1.0);
+    ptFixedAddProduct(a, p.x, c.x, -2.0);
+    ptFixedAddProduct(a, p.y, c.y, -2.0);
+    ptFixedAddProduct(a, p.z, c.z, -2.0);
+    ptFixedAddProduct(a, c.x, c.x,  1.0);
+    ptFixedAddProduct(a, c.y, c.y,  1.0);
+    ptFixedAddProduct(a, c.z, c.z,  1.0);
+    ptFixedAddProduct(a, rad, rad, -1.0);
+    return ptFixedTotal(a);
+}
+
+// h = k / (rad + |oc|) given k = |oc|^2 - rad^2.  |oc| comes back out of k
+// rather than out of a vector we would have to difference: |oc|^2 is
+// exactly rad^2 + k, and fma rounds that once, on the result.  The max()
+// only catches the accumulator's own sub-ULP residue at |oc| = 0 (p at the
+// centre, where k = -rad^2 and the fma should land on exactly zero).
+public float ptAltitudeFromPower(float k, float rad) {
+    float d = rad + sqrt(max(fma(rad, rad, k), 0.0));
+    return (d > 0.0) ? (k / d) : 0.0;
+}
+
+// Signed altitude of p above the sphere (c, rad); negative below the
+// surface, -rad at the centre, both by construction rather than by a
+// branch -- k is negative there and the denominator stays positive.
+public float ptAltitudeAboveSphere(float3 p, float3 c, float rad) {
+    if (!ptAltitudeStable(p, c, rad)) { return length(p - c) - rad; }
+    return ptAltitudeFromPower(ptPowerOfPointAt(p, c, rad), rad);
+}
+
+// Altitude along a ray, hoisted.  For a unit rd the power of the point at
+// p(s) = ro + rd*s is a quadratic in s,
+//
+//     |p(s) - c|^2 - rad^2 = k0 + 2 s b0 + s^2
+//
+// with k0 and b0 constant along the ray, so a march pays the accumulator
+// once and two fma per step -- no more per-step work than the length()
+// it replaces.
+//
+// Hoisting is not just the cheap option, it is the ACCURATE one, because
+// p(s) is then never materialised.  A march that forms ro + rd*s and takes
+// its altitude is capped by the float32 resolution of that position, which
+// is ULP(|p|) -- 0.5 m in any frame whose origin is not near the surface.
+// Measured over a +/-90 degree elevation sweep, 300 km rays, altitudes
+// clipped to the 0-20 km band the optical depth actually integrates:
+//
+//   frame                             naive     hoisted   per-step exact
+//   world origin on the surface       0.87 m    7.1e-3 m    2.7e-3 m
+//   world origin at the centre        0.66 m    6.8e-3 m    2.7e-1 m
+//
+// The second row is the one that decides it: the per-step form collapses
+// to the naive form's error the moment the frame moves, and the frame is
+// exactly what P1 (#255) is changing.
+public struct PtRayAltitude {
+    float3 ro, rd, c;
+    float  rad;
+    float  k0;        // |ro - c|^2 - rad^2, accumulated
+    float  b0;        // (ro - c) . rd, accumulated
+    bool   stable;
+};
+
+// `rd` MUST be unit length -- the s^2 coefficient above is |rd|^2.  Every
+// caller in this engine already guarantees that for other reasons.
+//
+// b0 is taken from a materialised ro - c, and that is deliberate: its
+// 0.25 m quantisation enters h as s*delta/rad ~ 4e-8*s, below the eps*s
+// the ray parameterisation itself carries, so removing it would buy
+// nothing.  The dot product still goes through the accumulator, because
+// on a horizon ray three ~rad terms cancel down to kilometres and a plain
+// dot() keeps only eps*rad of that -- worth 1.8x on the measured sweep
+// once the planet frame stops being axis-aligned.
+public PtRayAltitude ptRayAltitudeBegin(float3 ro, float3 rd, float3 c, float rad) {
+    PtRayAltitude a;
+    a.ro = ro; a.rd = rd; a.c = c; a.rad = rad;
+    a.stable = ptAltitudeStable(ro, c, rad);
+    a.k0 = a.stable ? ptPowerOfPointAt(ro, c, rad) : 0.0;
+    a.b0 = a.stable ? ptDotExact(ro - c, rd)       : 0.0;
+    return a;
+}
+
+public float ptRayAltitudeAt(PtRayAltitude a, float s) {
+    if (!a.stable) { return length(a.ro + a.rd * s - a.c) - a.rad; }
+    // Nested so each fma rounds once on its OWN result: the error is then
+    // an ULP of the value being formed, not of the largest term.  That is
+    // what keeps a ray descending back to the surface -- where k0, 2 s b0
+    // and s^2 cancel by two orders -- as accurate as one going straight up.
+    float k = fma(s, s, fma(2.0 * a.b0, s, a.k0));
+    return ptAltitudeFromPower(k, a.rad);
+}
+// --- end altitude above a sphere -------------------------------------------
 
 // --- Wave 10 bloom/bokeh: thin-lens aperture sampling --------------------
 // Shirley-Chiu concentric-disk mapping: square (u1,u2) in [0,1]^2 -> a
