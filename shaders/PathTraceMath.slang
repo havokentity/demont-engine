@@ -189,6 +189,149 @@ public float3 spectralWeightSRGB(float lambda_nm) {
 }
 // --- end -------------------------------------------------------------------
 
+// --- Scale-relative ray epsilons (issue #256, planetary P2) ----------------
+//
+// Every ray epsilon in this engine used to be the absolute constant 1e-3 m
+// -- a 1 mm normal offset on 17 secondary-ray origins, a 1 mm `TMin` on
+// the mesh query, a 1 mm near-root cut inside the intersectors below.  A
+// single constant is wrong in BOTH directions the moment the scene stops
+// being room-sized, and both ends bite on a planet:
+//
+//   TOO SMALL AT RANGE.  The hit point is ro + rd*t and its representation
+//   error is ~2^-24 * max(|ro|, t).  At the horizon from ISS altitude
+//   (t = 2.2e6 m) that is 0.13 m -- 130x the offset -- so every distant
+//   surface shadow-acnes.
+//
+//   TOO LARGE UP CLOSE.  At t = 0.05 m the numerical error is 3 nm and a
+//   1 mm offset visibly detaches the contact shadow.
+//
+// The replacement is two terms with different jobs, so both are needed:
+//
+// TERM 1 -- REPRESENTATIONAL, ptOffsetRay.  Wachter & Binder, Ray Tracing
+// Gems ch. 6.  Offsets the position by a fixed number of ULPs OF ITS OWN
+// COORDINATE, done as integer arithmetic on the exponent+mantissa field,
+// so the step is exactly one representable neighbourhood at whatever
+// magnitude the coordinate happens to have.  Nothing to tune and nothing
+// that scales wrongly: it is the same offset in ULPs at 1 m and at 1e5 m.
+//
+//   Its published constants (256 ULPs; 1/65536 m near the origin, where
+//   ULPs become smaller than any geometry) are calibrated for coordinates
+//   of roughly [1e-2, 1e5] m.  THAT RANGE IS NOT AN ASSUMPTION HERE, IT IS
+//   A GUARANTEE: planetary P1 (#255) packs every GPU-facing coordinate
+//   relative to the camera anchor, and `r_origin_rebase_radius` (default
+//   65536 m) bounds how far the anchor may lag the eye.  Shader-frame
+//   coordinates are therefore bounded by that radius plus the trace
+//   distance, which is exactly the band Wachter-Binder is valid over.
+//   This is why P2 depends on P1 rather than merely following it: the
+//   coordinate scheme is what makes this offset correct.
+//
+// TERM 2 -- GEOMETRIC, ptConeEps.  ptOffsetRay cannot fix acne whose cause
+// is that the SHADED surface is not the TRACED surface: a normal map's
+// shading normal diverging from the geometric one, or a displaced surface
+// (oceanRayMarch) whose shaded height is not the height that was hit.
+// That error is bounded by the sub-pixel geometry the ray never resolved,
+// i.e. by the ray-cone footprint -- which #248 already carries: cone_width
+// at a hit IS the pixel footprint there, in metres, in the same units as
+// the offset.  A quarter of it is sub-pixel BY CONSTRUCTION at every scale,
+// which is the invariant an absolute constant cannot have: the shadow can
+// never visibly detach from its caster, because the detachment is smaller
+// than the pixel that would show it.
+//
+// The two are combined by displacing along the normal, which is a max in
+// everything but syntax -- they differ by orders of magnitude and only one
+// is ever the active term.  Near the camera the cone is sub-millimetre and
+// ptOffsetRay dominates; at range the cone dominates and the ULP step is
+// noise beside it.
+
+// Ray-cone state (RT Gems 2019 ch. 20), carried alongside a ray so every
+// function that needs a scale has one.  `w` is the footprint DIAMETER at
+// the ray's own origin and `spread` its growth per metre, so the footprint
+// at distance t along the ray is w + spread*t.  A camera ray starts at
+// w = 0 with spread = 2*tan(fovY/2)/height -- one pixel per unit distance.
+public struct PtRayCone {
+    float w;
+    float spread;
+};
+
+public PtRayCone ptConeMake(float w, float spread) {
+    PtRayCone c; c.w = w; c.spread = spread; return c;
+}
+
+// The cone advanced to distance t: the same beam, re-anchored.
+public PtRayCone ptConeAdvance(PtRayCone c, float t) {
+    return ptConeMake(c.w + c.spread * max(t, 0.0), c.spread);
+}
+
+// Wachter & Binder, "A Fast and Robust Method for Avoiding
+// Self-Intersection" (Ray Tracing Gems ch. 6), verbatim.
+//
+// The integer add walks `int_scale` representable floats along +n, so the
+// displacement is the coordinate's own ULP times a constant rather than a
+// fixed distance.  The sign flip is because float32 is sign-magnitude:
+// making a negative coordinate more negative means ADDING to its magnitude
+// bits, so the integer offset has to be negated there.
+//
+// Below `origin` the ULP is smaller than any geometry this renderer can
+// resolve, so a fixed `float_scale` step takes over -- that branch is the
+// only absolute constant left, and it is 1/65536 m at coordinates under
+// 1/32 m, i.e. still four orders below the smallest feature.
+public float3 ptOffsetRay(float3 p, float3 n) {
+    const float kOrigin     = 1.0 / 32.0;
+    const float kFloatScale = 1.0 / 65536.0;
+    const float kIntScale   = 256.0;
+    int3   of_i = int3(kIntScale * n);
+    float3 p_i  = asfloat(asint(p) + select(p < float3(0.0), -of_i, of_i));
+    return select(abs(p) < float3(kOrigin), p + kFloatScale * n, p_i);
+}
+
+// The geometric term, in metres: a quarter of the footprint, widened as
+// the outgoing ray lies down toward the surface.
+//
+// 0.25 is the sub-pixel budget -- a quarter of a pixel of detachment is
+// under the reconstruction filter at every scale, which is the whole
+// point of measuring the offset in footprints rather than in metres.
+//
+// The grazing widening is bounded rather than open, and the bound is
+// derived from the same invariant: an offset d along the normal displaces
+// the contact shadow by d*cot(phi) for a light phi above the surface, so
+// an UNBOUNDED 1/cos would trade acne for peter-panning one-for-one and
+// lose the invariant it was protecting.  Requiring the offset itself to
+// stay within one whole footprint, 0.25*w/c <= w, gives c >= 0.25 exactly.
+// So the widening runs from 1x at normal incidence to 4x at 76 degrees off
+// the normal and stops there.
+public float ptConeEps(float cone_w, float cos_theta) {
+    return 0.25 * cone_w / max(cos_theta, 0.25);
+}
+
+// A secondary ray's origin: the representational step, then the geometric
+// one along the same normal.  `dir` is where the ray is going, which is
+// what sets the grazing widening.
+public float3 ptRayOrigin(float3 p, float3 n, PtRayCone cone, float3 dir) {
+    return ptOffsetRay(p, n) + n * ptConeEps(cone.w, abs(dot(n, dir)));
+}
+
+// The near cut, in metres along the ray -- what `1e-3` used to be at
+// `r.TMin`, at the mesh triangle test, and inside the intersectors below.
+//
+// Two terms max'd, for the same reasons the origin offset has two.  The
+// cone term is the same quarter-footprint budget: a hit closer than a
+// quarter pixel cannot be distinguished from the origin's own surface.
+// The representational term is ptOffsetRay's displacement expressed as a
+// distance -- kIntScale ULPs of the largest origin coordinate, 256*2^-24
+// relative -- so a ray whose origin was NOT offset (the camera ray, or an
+// origin carried through a refraction) still cannot re-hit the surface it
+// left through pure rounding.
+//
+// Both are zero-at-zero and scale-free.  A camera ray one metre from the
+// anchor gets 1.5e-5 m; the same ray 2.2e6 m out gets 0.034 m, which is
+// what the 1 mm constant could not do.
+public float ptRayTMin(float3 ro, PtRayCone cone) {
+    const float kIntScaleRel = 256.0 / 16777216.0;      // 256 ULPs, relative
+    float m = max(max(abs(ro.x), abs(ro.y)), abs(ro.z));
+    return max(0.25 * cone.w, kIntScaleRel * m);
+}
+// --- end scale-relative ray epsilons ---------------------------------------
+
 // --- Planet-scale ray-sphere intersection (issue #254) ---------------------
 //
 // `dot(oc, oc) - rad * rad` and `-b - sqrt(b*b - k)` both subtract two
@@ -356,7 +499,8 @@ public float ptDotExact(float3 a, float3 b) {
     return ptFixedTotal(s);
 }
 
-bool ptIntersectSphereLarge(float3 oc, float3 rd, float rad, out float t) {
+bool ptIntersectSphereLarge(float3 oc, float3 rd, float rad, float t_min,
+                            out float t) {
     float b = ptDotExact(oc, rd);
     float k = ptPowerOfPoint(oc, rad);
     // fma rounds once, on the *result*, so the discriminant keeps full
@@ -375,8 +519,8 @@ bool ptIntersectSphereLarge(float3 oc, float3 rd, float rad, out float t) {
     float ta = q;
     float tb = (q != 0.0) ? k / q : 0.0;
     float t0 = min(ta, tb), t1 = max(ta, tb);
-    t = (t0 > 1e-3) ? t0 : t1;
-    return t > 1e-3;
+    t = (t0 > t_min) ? t0 : t1;
+    return t > t_min;
 }
 
 // The historic expression with the geometry shifted down by a power of
@@ -403,7 +547,8 @@ bool ptIntersectSphereLarge(float3 oc, float3 rd, float rad, out float t) {
 // The shift back up can itself overflow, when the true t is not a
 // representable float32.  An infinity is the honest answer there, and the
 // property that matters is that it is an infinity and not a NaN.
-bool ptIntersectSphereScaled(float3 oc, float3 rd, float rad, int ext_exp, out float t) {
+bool ptIntersectSphereScaled(float3 oc, float3 rd, float rad, int ext_exp,
+                             float t_min, out float t) {
     int   s  = min(ext_exp, 126);
     float dn = ptPow2(-s), up = ptPow2(s);
     float3 o = oc * dn;
@@ -414,12 +559,13 @@ bool ptIntersectSphereScaled(float3 oc, float3 rd, float rad, int ext_exp, out f
     if (h < 0.0) { t = 0.0; return false; }
     h = sqrt(h);
     float t0 = (-b - h) * up, t1 = (-b + h) * up;
-    t = (t0 > 1e-3) ? t0 : t1;
-    return t > 1e-3;
+    t = (t0 > t_min) ? t0 : t1;
+    return t > t_min;
 }
 
-// Ray-sphere intersection. Returns the nearer non-self-intersection t
-// (>1e-3 epsilon to avoid stuck rays grazing their own surface).
+// Ray-sphere intersection. Returns the nearer non-self-intersection t,
+// where "self" is anything nearer than `t_min` -- ptRayTMin above, no
+// longer the absolute 1e-3 this used to bake in (issue #256).
 //
 // FINITE IN, FINITE OUT (issue #275), with no range carve-out: this runs
 // per bounce and a NaN t poisons a whole path, not one sample.  Three
@@ -443,21 +589,22 @@ bool ptIntersectSphereScaled(float3 oc, float3 rd, float rad, int ext_exp, out f
 // fell through to a naive expression that overflowed on its own.  Both
 // windows are closed here, and the constant that closes the first is now
 // the one the altitude kernels already used rather than a second copy.
-public bool intersectSphere(float3 ro, float3 rd, float3 c, float rad, out float t) {
+public bool intersectSphere(float3 ro, float3 rd, float3 c, float rad,
+                            float t_min, out float t) {
     float3 oc = ro - c;
     // Above kPtStableSphereRadius the naive expression below is worse than
     // a millimetre; take the accumulated path instead.
     float m = max(max(abs(oc.x), abs(oc.y)), max(abs(oc.z), rad));
     int ext_exp = ptFloatExp(m);
     if (rad > kPtStableSphereRadius && ext_exp <= kPtAccumMaxExp) {
-        return ptIntersectSphereLarge(oc, rd, rad, t);
+        return ptIntersectSphereLarge(oc, rd, rad, t_min, t);
     }
     // ext_exp == 128 is an infinity or a NaN in oc or rad: not in the
     // domain, and the shift cannot help it, so it goes to the historic
     // line where it yields the same kind of garbage it always did rather
     // than the 0 * inf the shift would make of it.
     if (ext_exp > kPtAccumMaxExp && ext_exp <= 127) {
-        return ptIntersectSphereScaled(oc, rd, rad, ext_exp, t);
+        return ptIntersectSphereScaled(oc, rd, rad, ext_exp, t_min, t);
     }
     float b   = dot(oc, rd);
     float k   = dot(oc, oc) - rad * rad;
@@ -465,13 +612,14 @@ public bool intersectSphere(float3 ro, float3 rd, float3 c, float rad, out float
     if (h < 0.0) { t = 0.0; return false; }
     h = sqrt(h);
     float t0 = -b - h, t1 = -b + h;
-    t = (t0 > 1e-3) ? t0 : t1;
-    return t > 1e-3;
+    t = (t0 > t_min) ? t0 : t1;
+    return t > t_min;
 }
 
 // Ray-plane intersection.  `n` is the plane normal, `d` the signed
 // distance from origin (plane: n . p + d = 0).  Returns false for
-// nearly-parallel rays (no near-zero division).
+// nearly-parallel rays (no near-zero division), and for hits nearer than
+// `t_min` (issue #256; this too used to bake in an absolute 1e-3).
 //
 // This has the same shape of cancellation as intersectSphere -- dot(ro, n)
 // tends to -d as the origin approaches the plane -- but not the same
@@ -480,11 +628,12 @@ public bool intersectSphere(float3 ro, float3 rd, float3 c, float rad, out float
 // enough to make that a real distance.  Every plane the renderer has is a
 // floor near the origin, so it is left alone deliberately; a planet-scale
 // plane would need ptDotExact above.
-public bool intersectPlane(float3 ro, float3 rd, float3 n, float d, out float t) {
+public bool intersectPlane(float3 ro, float3 rd, float3 n, float d,
+                           float t_min, out float t) {
     float denom = dot(rd, n);
     if (abs(denom) < 1e-4) { t = 0.0; return false; }
     t = -(dot(ro, n) + d) / denom;
-    return t > 1e-3;
+    return t > t_min;
 }
 
 // --- Altitude above a sphere at planetary radius (issue #271) --------------

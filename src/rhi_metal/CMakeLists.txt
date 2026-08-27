@@ -235,7 +235,11 @@ pt_compile_slang(
     STAGE   compute
     ENTRY   main
     TARGETS metal
-    MODULE_DEPS RestirReservoir
+    # PathTraceMath joins RestirReservoir for planetary P2 (#256): the
+    # shadow ray's origin offset and near cut come from the SAME
+    # ptOffsetRay / ptRayTMin the path tracer uses, rather than this pass
+    # carrying its own (differently-valued) absolute epsilons.
+    MODULE_DEPS RestirReservoir PathTraceMath
 )
 # --- end ReSTIR DI Phase A ------------------------------------------------
 # Screen-space particle composite (#82 MVP). Dispatched AFTER

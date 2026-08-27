@@ -1746,7 +1746,7 @@ struct HitInfo {
 // Forward declaration: the subsurface random walk (below) re-traces the
 // scene to find the medium boundary, but traceScene is defined further
 // down. Declare it here so the SSS helper links.
-HitInfo traceScene(float3 ro, float3 rd, float shutter_t01);
+HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone);
 
 // --- Wave 9 advanced materials: per-hit extension lookup ------------------
 // Resolve the BSDF lobe extension for a hit by scanning the push-constant
@@ -2034,7 +2034,7 @@ struct SssWalk {
 };
 SssWalk subsurfaceRandomWalk(float3 entry_pt, float3 in_dir, float3 normal,
                              float mfp, float3 albedo, float shutter_t01,
-                             inout uint seed) {
+                             PtRayCone cone, inout uint seed) {
     SssWalk w;
     w.tint = float3(1.0);
     w.escaped = false;
@@ -2042,7 +2042,9 @@ SssWalk subsurfaceRandomWalk(float3 entry_pt, float3 in_dir, float3 normal,
     // IOR transmission -- the translucent diffusion look doesn't need the
     // refractive bend, and skipping it avoids TIR trapping the walk).
     float3 nf = (dot(normal, in_dir) < 0.0) ? normal : -normal;
-    float3 ro = entry_pt - nf * 1e-3;
+    // Step just INSIDE the surface: the same scale-relative offset every
+    // other origin gets (#256), taken along -nf instead of +nf.
+    float3 ro = ptRayOrigin(entry_pt, -nf, cone, in_dir);
     float3 rd = in_dir;
     // Scattering coefficient (1/m). Guard a tiny mfp so sigma stays finite.
     float sigma_s = 1.0 / max(mfp, 1e-4);
@@ -2058,7 +2060,7 @@ SssWalk subsurfaceRandomWalk(float3 entry_pt, float3 in_dir, float3 normal,
         float d = -log(max(1e-6, 1.0 - u)) / sigma_s;
         // Distance to the medium boundary along rd (re-trace the scene;
         // from inside a convex prim this is the far-wall exit).
-        HitInfo bh = traceScene(ro, rd, shutter_t01);
+        HitInfo bh = traceScene(ro, rd, shutter_t01, cone);
         float t_exit = bh.hit ? bh.t : 1e30;
         if (d < t_exit) {
             // Scatter event inside the medium. Lose energy to the single-
@@ -2084,7 +2086,7 @@ SssWalk subsurfaceRandomWalk(float3 entry_pt, float3 in_dir, float3 normal,
             // Nudge outside along the OUTWARD normal at the exit (the exit
             // normal points along the wall; pick the side the ray leaves).
             float3 eo = (dot(exit_n, rd) > 0.0) ? exit_n : -exit_n;
-            w.ro = exit_pt + eo * 1e-3;
+            w.ro = ptRayOrigin(exit_pt, eo, ptConeAdvance(cone, t_exit), rd);
             w.rd = rd;
             w.escaped = true;
             return w;
@@ -2140,7 +2142,8 @@ float3 quatRotate(float4 q, float3 v) {
 // plane equation becomes (rotated_normal . p + d == 0). The default
 // identity quat (0,0,0,1) is a no-op in quatRotate so existing planes
 // render bit-identically.
-void testAnalyticPrim(uint idx, float3 ro, float3 rd, float shutter_t01, inout HitInfo h) {
+void testAnalyticPrim(uint idx, float3 ro, float3 rd, float shutter_t01,
+                      float t_min, inout HitInfo h) {
     float4 v0 = primitives[idx * 7u + 0u];
     float4 v1 = primitives[idx * 7u + 1u];
     float4 v2 = primitives[idx * 7u + 2u];
@@ -2168,7 +2171,7 @@ void testAnalyticPrim(uint idx, float3 ro, float3 rd, float shutter_t01, inout H
         // per StepPhysics tick so the per-frame displacement is encoded
         // in (v0.xyz - v3.xyz).
         float3 sphere_center = lerp(v3.xyz, v0.xyz, shutter_t01);
-        if (intersectSphere(ro, rd, sphere_center, v0.w, t) && t < h.t) {
+        if (intersectSphere(ro, rd, sphere_center, v0.w, t_min, t) && t < h.t) {
             h.hit = true; h.t = t;
             float3 sn = normalize(ro + rd * t - sphere_center);
             h.normal = sn;
@@ -2202,7 +2205,7 @@ void testAnalyticPrim(uint idx, float3 ro, float3 rd, float shutter_t01, inout H
         // the default identity orient (0,0,0,1) the cross-product form
         // collapses to v0.xyz so untouched planes are bit-identical.
         float3 plane_n = quatRotate(v5, v0.xyz);
-        if (intersectPlane(ro, rd, plane_n, v0.w, t) && t < h.t) {
+        if (intersectPlane(ro, rd, plane_n, v0.w, t_min, t) && t < h.t) {
             h.hit = true; h.t = t;
             h.normal = plane_n;
             h.mat = uint(v2.y);
@@ -2297,7 +2300,7 @@ SdfCluster loadSdfCluster(uint cluster_idx) {
 // dispatcher only handles single-leaf fractal clusters; mixed
 // fractal/analytic CSG compositions are scope-out for Phase 3 and
 // the host's `combine` helper rejects them at parse time.
-void traceSdfClusters(float3 ro, float3 rd, inout HitInfo h) {
+void traceSdfClusters(float3 ro, float3 rd, float t_min, inout HitInfo h) {
     uint count = sdf_params.x;
     if (count == 0u) return;
     uint  iter_budget = sdf_params.y;
@@ -2341,7 +2344,7 @@ void traceSdfClusters(float3 ro, float3 rd, inout HitInfo h) {
             // AABB straight through.
             if (traceSdfFractal(root.shape, root.params, root.center,
                                 c.aabb_min, c.aabb_max,
-                                ro, rd, 1e-3, h.t,
+                                ro, rd, t_min, h.t,
                                 iter_budget, epsilon, fractal_de_eps_s,
                                 fractal_power, fractal_iters,
                                 t, n)) {
@@ -2368,10 +2371,19 @@ void traceSdfClusters(float3 ro, float3 rd, inout HitInfo h) {
             continue;
         }
         // --- end SDF Phase 3 -----------------------------------------------
-        // t_min = 1e-3 keeps the start past the camera plane;
-        // t_max = h.t bounds the trace to the current closest hit so
-        // an SDF cluster behind an existing closer hit short-circuits.
-        if (sdfClusterTrace(c, ro, rd, 1e-3, h.t, iter_budget, epsilon,
+        // t_min is the caller's scale-relative near cut (#256; it used to
+        // be an absolute 1e-3 here). t_max = h.t bounds the trace to the
+        // current closest hit so an SDF cluster behind an existing closer
+        // hit short-circuits.
+        //
+        // `epsilon` (r_sdf_epsilon) stays ABSOLUTE and is deliberately not
+        // converted to footprint units in this PR: it is the sphere-trace
+        // SURFACE TERMINATOR, not a self-intersection epsilon, and making
+        // it footprint-indexed means evaluating the cone at the current t
+        // INSIDE sdfClusterTrace's loop -- a change to SdfPrimitives.slang,
+        // which this change does not own.  #253 already names that as a
+        // standalone SDF fix rather than part of this phase.
+        if (sdfClusterTrace(c, ro, rd, t_min, h.t, iter_budget, epsilon,
                             normal_mode, t, n)) {
             if (t < h.t) {
                 h.hit       = true;
@@ -2405,7 +2417,13 @@ bool intersectAabb(float3 ro, float3 rd_inv, float3 mn, float3 mx, float t_max) 
     return tmax >= max(tmin, 0.0) && tmin <= t_max;
 }
 
-HitInfo traceScene(float3 ro, float3 rd, float shutter_t01) {
+// `cone` is the ray cone at THIS ray's origin (issue #256).  It is the
+// only new input: the near cut every intersector needs is a pure function
+// of it and of the origin, so traceScene derives `t_min` once here rather
+// than making every caller carry a second parameter that could drift out
+// of step with the first.
+HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
+    float t_min = ptRayTMin(ro, cone);
     HitInfo h;
     h.hit = false; h.t = 1e30;
     h.normal = float3(0,1,0); h.mat = MAT_LAMBERT;
@@ -2474,12 +2492,12 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01) {
     uint bvh_node_count    = bvh_params.y;
     // Linear pass over the infinite-extent segment first.
     for (uint i = 0u; i < linear_prim_count && i < prim_count; ++i) {
-        testAnalyticPrim(i, ro, rd, shutter_t01, h);
+        testAnalyticPrim(i, ro, rd, shutter_t01, t_min, h);
     }
     if (bvh_node_count == 0u) {
         // BVH inactive: linear-scan the rest of the buffer too.
         for (uint i = linear_prim_count; i < prim_count; ++i) {
-            testAnalyticPrim(i, ro, rd, shutter_t01, h);
+            testAnalyticPrim(i, ro, rd, shutter_t01, t_min, h);
         }
     } else {
         // Iterative BVH traversal with a small local stack. Depth is
@@ -2498,7 +2516,7 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01) {
                 // Leaf: test the contiguous prim range.
                 uint base = node.left_first + linear_prim_count;
                 for (uint k = 0u; k < node.count; ++k) {
-                    testAnalyticPrim(base + k, ro, rd, shutter_t01, h);
+                    testAnalyticPrim(base + k, ro, rd, shutter_t01, t_min, h);
                 }
             } else {
                 // Internal: push both children. Stack-depth guard.
@@ -2520,7 +2538,7 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01) {
     // tight world-space AABB before launching the sphere-trace, so
     // the heavy work is only paid when the ray actually enters a
     // cluster's footprint.
-    traceSdfClusters(ro, rd, h);
+    traceSdfClusters(ro, rd, t_min, h);
     // --- end SDF Phase 1 -----------------------------------------------
 
     // Triangle meshes. Two paths exist:
@@ -2566,7 +2584,7 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01) {
         RayDesc r;
         r.Origin    = ro_mesh;
         r.Direction = rd;
-        r.TMin      = 1e-3;
+        r.TMin      = t_min;
         r.TMax      = h.t;     // limit search to current closest
 
         RayQuery<RAY_FLAG_NONE> q;
@@ -2699,7 +2717,7 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01) {
                         float v = dot(rd, qv) * inv_det;
                         if (v < 0.0 || u + v > 1.0) continue;
                         float t_tri = dot(e2, qv) * inv_det;
-                        if (t_tri > 1e-3 && t_tri < t_mesh) {
+                        if (t_tri > t_min && t_tri < t_mesh) {
                             found    = true;
                             t_mesh   = t_tri;
                             prim_hit = tri;
@@ -5292,8 +5310,12 @@ float3 atmosphericTransmittance(float3 ro, float3 rd, float t) {
 // to the shadow-ray scene query keeps the shadow consistent with the
 // rendered surface -- a sphere that primary-hit at the prev-frame end
 // of its swept volume should cast a shadow against that same position.
+// `cone` is the ray cone at `ro` (issue #256). It travels with the ray
+// through the refraction chain below -- each segment re-anchors it at the
+// new origin -- so the near cut stays correct after the ray has crossed a
+// dielectric and moved a long way from where it started.
 float3 transmittance(float3 ro, float3 rd, float t_max, float shutter_t01,
-                     int start_in_water = 0) {
+                     PtRayCone cone, int start_in_water = 0) {
     // Cloud optical depth along the original (un-refracted) ray. Real
     // clouds live in a layer high above the scene -- approximating the
     // shadow as the straight-line cloud path is fine because no glass
@@ -5307,6 +5329,7 @@ float3 transmittance(float3 ro, float3 rd, float t_max, float shutter_t01,
     float3 t = float3(1.0);
     float3 o = ro;
     float3 d = rd;
+    PtRayCone c = cone;
 #if PT_WATER_ENABLED
     // Per-segment Beer's-law bookkeeping. Callers whose shadow ray
     // starts underwater (Lambert NEE from submerged geometry) pass
@@ -5320,7 +5343,7 @@ float3 transmittance(float3 ro, float3 rd, float t_max, float shutter_t01,
     int sr_in_water = start_in_water;
 #endif
     for (int i = 0; i <= kMaxRefract; ++i) {
-        HitInfo h = traceScene(o, d, shutter_t01);
+        HitInfo h = traceScene(o, d, shutter_t01, c);
 #if PT_WATER_ENABLED
         // Absorb along however much of this segment lies in water --
         // up to the hit, or up to t_max on the final unoccluded leg.
@@ -5393,9 +5416,15 @@ float3 transmittance(float3 ro, float3 rd, float t_max, float shutter_t01,
         t *= (1.0 - fr) * h.albedo;
 #endif
         // Step past the interface, continue in the refracted direction.
-        float advance = h.t + 1e-3;
+        // The step past is the near cut AT THE INTERFACE, not an absolute
+        // millimetre (#256): the ray has to clear the surface it just
+        // crossed by the same distance that counts as "the same point"
+        // there, which is a footprint at range and a few ULPs up close.
+        PtRayCone c_hit = ptConeAdvance(c, h.t);
+        float advance = h.t + ptRayTMin(o + d * h.t, c_hit);
         o = o + d * advance;
         d = normalize(refracted);
+        c = ptConeAdvance(c, advance);
         t_max = max(t_max - advance, 0.0);
     }
     return float3(0.0);
@@ -5405,8 +5434,9 @@ float3 transmittance(float3 ro, float3 rd, float t_max, float shutter_t01,
 // dielectric branches that just want the legacy boolean answer.
 // Motion blur (#85): forwards shutter_t01 to keep shadow geometry
 // consistent with the primary ray that originated the test.
-bool occluded(float3 ro, float3 rd, float t_max, float shutter_t01) {
-    return all(transmittance(ro, rd, t_max, shutter_t01) <= float3(0.0));
+bool occluded(float3 ro, float3 rd, float t_max, float shutter_t01,
+              PtRayCone cone) {
+    return all(transmittance(ro, rd, t_max, shutter_t01, cone) <= float3(0.0));
 }
 
 // --- Water Phase 1 (#134) --------------------------------------------------
@@ -5681,7 +5711,11 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // a mismatched depth and the reprojection would smear. The
         // visible motion-blur streak is produced by the SHADING pass
         // (per-sample shutter_t01 inside the spp loop below).
-        HitInfo h0 = traceScene(ro0, rd0, 1.0);
+        // Same camera cone as the shading pass below (#256): one pixel
+        // of spread per unit distance, zero width at the eye.
+        PtRayCone cone0 = ptConeMake(0.0,
+                                     (2.0 * pos_fovtan.w) / float(max(dim.y, 1u)));
+        HitInfo h0 = traceScene(ro0, rd0, 1.0, cone0);
         // Wave 8 ocean (#25): displace the G-buffer's water-plane hit too so
         // the denoiser's depth + normal match the shaded displaced surface
         // (otherwise the SVGF/MetalFX reprojection would see a flat plane
@@ -6156,7 +6190,12 @@ void main(uint2 tid : SV_DispatchThreadID) {
         float cone_width  = 0.0;
 
         for (uint b = 0u; b < max_bounces; ++b) {
-        HitInfo h = traceScene(ro, rd, shutter_t01);
+        // Issue #256: the same cone that drives texture LOD is what sets
+        // every ray epsilon on this segment. cone_width is the footprint
+        // at THIS ray's origin (0 at the eye, grown by the accumulate a
+        // few lines below each time the path bounces).
+        PtRayCone cone = ptConeMake(cone_width, cone_spread);
+        HitInfo h = traceScene(ro, rd, shutter_t01, cone);
         // --- Wave 8 ocean (#25) -- displace the analytic water plane --------
         // When the FFT ocean is on (ocean_params0.x != 0) and the ray hit a
         // MAT_WATER analytic plane, ray-march the displaced FFT heightfield
@@ -6210,10 +6249,13 @@ void main(uint2 tid : SV_DispatchThreadID) {
             //     compose is a per-channel-equal multiply by design,
             //     full chromatic shadows are a follow-up).
             //
-            // Origin is offset by the normal-aligned bias `nf * 1e-3`
-            // to dodge self-intersection (same constant the NEE branch
-            // below uses). For the b==0 hit we don't yet have the
-            // "flipped" normal nf, so recompute it inline.
+            // Origin is offset by ptRayOrigin (#256) -- the same
+            // scale-relative offset the NEE branch below uses, not the
+            // absolute millimetre this used to carry. cone_width has not
+            // been accumulated for this segment yet at this point in the
+            // loop, so the footprint at the hit is spread * h.t. For the
+            // b==0 hit we don't yet have the "flipped" normal nf, so
+            // recompute it inline.
             if (write_shadow_vis != 0u) {
                 if (h.hit) {
                     float3 sun_dir = sun_and_mode.xyz;
@@ -6233,8 +6275,11 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         // both signals converge to the same noiseless
                         // mean.
                         float3 sun_jit = sampleSunDisc(sun_dir, seed);
-                        float3 t_vis = transmittance(hp + nf_0 * 1e-3,
-                                                     sun_jit, 1e30, shutter_t01);
+                        PtRayCone cone_h = ptConeMake(cone_spread * h.t,
+                                                      cone_spread);
+                        float3 t_vis = transmittance(
+                            ptRayOrigin(hp, nf_0, cone_h, sun_jit),
+                            sun_jit, 1e30, shutter_t01, cone_h);
                         // Rec.709 luminance flattens RGB transmittance
                         // to one scalar. For pure shadow (no glass
                         // between hit and sun), R==G==B so the choice
@@ -6318,10 +6363,11 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     // BRDF strategy and the NEE strategy estimate
                     // different integrands, biasing cloudy bounce
                     // directions bright. ro is already the post-Lambert
-                    // origin (offset by nf*1e-3 from the surface).
+                    // origin (offset by ptRayOrigin from the surface).
                     float pdf_env = pdfEnvMapDir(rd);
                     float w_brdf  = misBalance(prev_lambert_brdf_pdf, pdf_env);
-                    float3 trans  = transmittance(ro, rd, 1e30, shutter_t01);
+                    float3 trans  = transmittance(ro, rd, 1e30, shutter_t01,
+                                                  cone);
                     radiance += clampIndirect(throughput * skyColor(rd) * trans * w_brdf);
                 }
             } else if (!skip_sky_on_miss) {
@@ -6402,6 +6448,12 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // LOD, which is what removes the far-field texture aliasing.
         cone_width += cone_spread * h.t;
         h.tex_lod = pbrConeTexLod(cone_width, rd, h.normal, h.uv_scale);
+        // ...and the same footprint is what every secondary ray leaving
+        // this hit uses for its epsilons (#256). One object, two consumers:
+        // the mip level the texture is read at, and the distance a ray has
+        // to clear the surface by. They agree by construction, which is the
+        // property an absolute 1e-3 could not have.
+        PtRayCone cone_hit = ptConeMake(cone_width, cone_spread);
 
         // Wave 8 PBR (#26): apply the hit material's texture maps in place
         // BEFORE deriving the front-facing normal (so a normal map feeds
@@ -6491,7 +6543,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 CoatSample cs = sampleClearcoat(nf, -rd, h.clearcoat_rough, seed);
                 if (!cs.valid) { break; }
                 throughput *= cs.weight;
-                ro = hit_pt + nf * 1e-3;
+                ro = ptRayOrigin(hit_pt, nf, cone_hit, cs.dir);
                 rd = cs.dir;
                 skip_sky_on_miss = false;
                 prev_was_lambert_nee = false;
@@ -6526,7 +6578,9 @@ void main(uint2 tid : SV_DispatchThreadID) {
             SssWalk sw = subsurfaceRandomWalk(hit_pt, rd, h.normal,
                                               h.subsurface_radius,
                                               h.subsurface_color,
-                                              shutter_t01, seed);
+                                              shutter_t01,
+                                              ptConeMake(cone_width, cone_spread),
+                                              seed);
             throughput *= sw.tint;
             if (!sw.escaped) { break; }   // absorbed deep in the medium
             ro = sw.ro;
@@ -6586,10 +6640,15 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     // Shadow ray: surface to sampled point on the
                     // light. Stop t_max just before the light so the
                     // light's own surface doesn't self-block.
-                    float t_max = max(ls.dist - 1e-3, 0.0);
-                    float3 trans = transmittance(hit_pt + nf * 1e-3,
+                    // Stop t_max one near-cut short of the light, for the
+                    // same reason the origin is offset by one (#256): the
+                    // light's own surface must not self-block, and "its own
+                    // surface" is a scale-relative distance, not a mm.
+                    float3 sro = ptRayOrigin(hit_pt, nf, cone_hit, ls.dir);
+                    float t_max = max(ls.dist - ptRayTMin(sro, cone_hit), 0.0);
+                    float3 trans = transmittance(sro,
                                                  ls.dir, t_max, shutter_t01,
-                                                 in_water);
+                                                 cone_hit, in_water);
                     if (any(trans > float3(0.0))) {
                         float3 brdf = h.albedo / 3.14159265358979;
                         float3 c = throughput * ls.Le * trans * brdf *
@@ -6712,7 +6771,9 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     // between this hit and the light -- 1.0 free path,
                     // 0.0 fully blocked, in-between for refraction
                     // through glass / diamond meshes (caustics).
-                    float3 trans = transmittance(hit_pt + nf * 1e-3, env.dir, 1e30, shutter_t01, in_water);
+                    float3 trans = transmittance(ptRayOrigin(hit_pt, nf, cone_hit, env.dir),
+                                                 env.dir, 1e30, shutter_t01,
+                                                 cone_hit, in_water);
                     if (any(trans > float3(0.0))) {
                         float3 brdf = h.albedo / 3.14159265358979;
                         float pdf_brdf_at_env = n_dot_l * (1.0 / 3.14159265358979);
@@ -6745,7 +6806,9 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     HdriLightSample hl = sampleHdriLight(seed);
                     float n_dot_l = dot(nf, hl.dir);
                     if (n_dot_l > 0.0 && hl.pdf > 0.0) {
-                        float3 t_s = transmittance(hit_pt + nf * 1e-3, hl.dir, 1e30, shutter_t01, in_water);
+                        float3 t_s = transmittance(ptRayOrigin(hit_pt, nf, cone_hit, hl.dir),
+                                                   hl.dir, 1e30, shutter_t01,
+                                                   cone_hit, in_water);
                         if (any(t_s > float3(0.0))) {
                             float3 brdf = h.albedo / 3.14159265358979;
                             float3 c = throughput * hl.color * t_s *
@@ -6803,8 +6866,9 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     float n_dot_l = max(0.0, dot(nf, sun_dir));
                     float3 sun_jit = sampleSunDisc(sun_dir, seed);
                     float3 trans  = (n_dot_l > 0.0)
-                        ? transmittance(hit_pt + nf * 1e-3, sun_jit, 1e30,
-                                        shutter_t01, in_water)
+                        ? transmittance(ptRayOrigin(hit_pt, nf, cone_hit, sun_jit),
+                                        sun_jit, 1e30,
+                                        shutter_t01, cone_hit, in_water)
                         : float3(0.0);
                     // Atmospheric attenuation: optical depth times
                     // air mass. Air mass = 1/sin(elev) (thin-slab
@@ -6876,7 +6940,9 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         float3 moon_jit = sampleSunDisc(moon_dir_phase.xyz, seed);
                         float ndl = max(0.0, dot(nf, moon_jit));
                         if (ndl > 0.0) {
-                            float3 t_m = transmittance(hit_pt + nf * 1e-3, moon_jit, 1e30, shutter_t01, in_water);
+                            float3 t_m = transmittance(ptRayOrigin(hit_pt, nf, cone_hit, moon_jit),
+                                                       moon_jit, 1e30, shutter_t01,
+                                                       cone_hit, in_water);
                             if (any(t_m > float3(0.0))) {
                                 // Atmospheric attenuation + warmth at low
                                 // moon altitude, mirroring sun radiance.
@@ -6913,8 +6979,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 skip_sky_on_miss = true;
             }
             throughput *= h.albedo;
-            ro = hit_pt + nf * 1e-3;
             rd = sampleCosineHemisphere(nf, seed);
+            ro = ptRayOrigin(hit_pt, nf, cone_hit, rd);
             // For MIS: record the cosine-hemisphere PDF of the bounce
             // direction we just sampled, so the next iteration's
             // sky-miss branch can balance-heuristic-weight it against
@@ -6941,13 +7007,13 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                                   h.aniso_rotation, seed);
                 if (!asmp.valid) { break; }   // sampled below the horizon
                 throughput *= asmp.weight;
-                ro = hit_pt + nf * 1e-3;
+                ro = ptRayOrigin(hit_pt, nf, cone_hit, asmp.dir);
                 rd = asmp.dir;
             } else {
                 float3 r = reflect(rd, nf);
                 r = normalize(r + h.roughness * (sampleCosineHemisphere(nf, seed) - nf));
                 throughput *= h.albedo;
-                ro = hit_pt + nf * 1e-3;
+                ro = ptRayOrigin(hit_pt, nf, cone_hit, r);
                 rd = r;
             }
             skip_sky_on_miss = false;   // metal didn't NEE; sky on miss is real
@@ -6982,7 +7048,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
             bool tir = (length(refracted) < 1e-3);
             if (tir || randf(seed) < fr) {
                 rd = reflected;
-                ro = hit_pt + nf * 1e-3;
+                ro = ptRayOrigin(hit_pt, nf, cone_hit, rd);
                 // Fresnel REFLECTION (incl. TIR) off the glass. A Lambert
                 // env-NEE's shadow ray follows ONLY the transmitted lobe
                 // (transmittance() keeps refraction, never the reflected
@@ -6994,7 +7060,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 prev_was_lambert_nee = false;
             } else {
                 rd = normalize(refracted);
-                ro = hit_pt - nf * 1e-3;
+                ro = ptRayOrigin(hit_pt, -nf, cone_hit, rd);
                 // REFRACTION (transmission). If a preceding Lambert env-NEE
                 // already accounted for the sky arriving through this same
                 // dielectric (its shadow ray refracts through it via
@@ -7074,7 +7140,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 // a self-shadowing matte-white surface (no specular highlight,
                 // unlike the clean water it overrides).
                 rd = sampleCosineHemisphere(nf_foam, seed);
-                ro = hit_pt + nf_foam * 1e-3;
+                ro = ptRayOrigin(hit_pt, nf_foam, cone_hit, rd);
                 skip_sky_on_miss = false;
                 prev_was_lambert_nee = false;
                 if (b >= 2u) {
@@ -7110,7 +7176,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 // iteration will apply per-segment Beer's law if the
                 // ray is still underwater.
                 rd = reflected;
-                ro = hit_pt + nf_s * 1e-3;
+                ro = ptRayOrigin(hit_pt, nf_s, cone_hit, rd);
                 // Reflected lobe: transmittance()-based NEE only follows
                 // the transmitted lobe through water, so a reflected
                 // sky-on-miss is genuinely new light (mirrors the
@@ -7137,7 +7203,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     in_water = 0;
                 }
                 rd = normalize(refracted);
-                ro = hit_pt - nf_s * 1e-3;
+                ro = ptRayOrigin(hit_pt, -nf_s, cone_hit, rd);
                 // Transmitted lobe: PERSIST skip_sky_on_miss /
                 // prev_was_lambert_nee across the interface. Water is on
                 // transmittance()'s transmissive-blocker list, so a
@@ -7358,10 +7424,15 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 float3 v_color = float3(0.0);
                 float phase_mie_v = phase;   // HG, computed earlier
                 float phase_ray_v = (3.0 / (16.0 * kPi)) * (1.0 + cos_theta * cos_theta);
+                // Issue #256: a march sample sits in open air, so its only
+                // scale is the primary cone -- exactly the footprint the
+                // pixel is integrating over at that distance.
+                float cone_spread_v = (2.0 * pos_fovtan.w) / float(max(dim.y, 1u));
                 for (int vi = 0; vi < N; ++vi) {
                     float t = (float(vi) + jitter) * dt;
                     if (t >= t_far) break;
                     float3 sp = primary_ro + primary_rd * t;
+                    PtRayCone cone_v = ptConeMake(cone_spread_v * t, cone_spread_v);
                     // Per-point altitude above the surface (#254). Planar
                     // frame -> sp.y bit-for-bit.
                     float h = max(planetAltitude(sp), 0.0);
@@ -7372,7 +7443,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     float3 sigma_total = sigma_ray + float3(sigma_mie);
                     if (sun_elev > 0.0) {
                         float3 sun_jit = sampleSunDisc(sun_dir, seed);
-                        float3 trans_sun = transmittance(sp, sun_jit, 1e30, shutter_t01);
+                        float3 trans_sun = transmittance(sp, sun_jit, 1e30,
+                                                         shutter_t01, cone_v);
                         if (any(trans_sun > float3(0.0))) {
                             float3 in_scatter =
                                   float3(sigma_mie) * phase_mie_v
