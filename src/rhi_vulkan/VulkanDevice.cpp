@@ -254,9 +254,12 @@ constexpr std::uint32_t kSlotToBufBinding[24] = {
     // binding 35. Read only on a mesh hit when mesh_tex_indices has a
     // non-kPbrNoTexTile channel.
     35, // engine slot 17 -> shader binding 35 (mesh_uvs)
-    0,  // engine slot 18 unused
-    0,  // engine slot 19 unused
-    0,  // engine slot 20 unused
+    // Planetary P4 (#258). Binding 36 was the last free number below 37;
+    // 37 is GodRays' mask TEXTURE (bindings share one number space with
+    // images in set 0), so the other two continue at 38/39.
+    36, // engine slot 18 -> shader binding 36 (terrain_verts)
+    38, // engine slot 19 -> shader binding 38 (terrain_indices)
+    39, // engine slot 20 -> shader binding 39 (instance_desc)
     0,  // engine slot 21 unused
     0,  // engine slot 22 unused
     0,  // engine slot 23 unused
@@ -1160,7 +1163,10 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // alongside the Wave 8 ocean bindings (the #22 PR added only the
     // engine slot-table mapping) -- plus mesh_uvs (binding 35, #26 PBR).
     // +8 slack retained for future additions.
-    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 17 + 8 });
+    // Planetary P4 (#258) adds three more: terrain_verts (36),
+    // terrain_indices (38) and instance_desc (39). 17 -> 20; the +8 slack
+    // is retained rather than spent.
+    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 20 + 8 });
     psizes.push_back({ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,          kTotalSets * 1 + 1 });
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -1368,6 +1374,23 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // declared in its own PR; not touched here.
         add_binding(37, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
         // --- end Wave 9 god rays -----------------------------------
+        // --- Planetary P4 (#258) -----------------------------------
+        // Bindings 36 / 38 / 39: terrain_verts, terrain_indices and the
+        // per-instance descriptor SSBO. Declared UNCONDITIONALLY, i.e.
+        // even in a PT_PLANET_ENABLED=OFF build where PathTrace.slang
+        // does not declare them.
+        //
+        // That asymmetry is deliberate and only safe in this direction:
+        // a layout that is a strict superset of what a shader declares
+        // is legal (the extra descriptors go unused), whereas a shader
+        // declaring a binding the layout lacks is a hard
+        // vkCreateComputePipelines failure even under PARTIALLY_BOUND.
+        // Keeping the layout identical across both gate states also
+        // means the descriptor-pool sizing below does not fork.
+        add_binding(36, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        add_binding(38, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        add_binding(39, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        // --- end Planetary P4 --------------------------------------
 
         // UPDATE_AFTER_BIND for every binding so we can rewrite the
         // shared descriptor set between dispatches in the same cmd

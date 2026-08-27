@@ -108,11 +108,16 @@ if(PT_LIGHT_TREE)
 else()
     set(_pt_light_tree_def "-DPT_LIGHT_TREE_ENABLED=0")
 endif()
+if(PT_PLANET_ENABLED)
+    set(_pt_planet_def "-DPT_PLANET_ENABLED=1")
+else()
+    set(_pt_planet_def "-DPT_PLANET_ENABLED=0")
+endif()
 # --- end Megakernel feature gates -----------------------------------------
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
     STAGE compute ENTRY main TARGETS spirv
-    EXTRA_DEFINES ${_pt_water_def} ${_pt_light_tree_def}
+    EXTRA_DEFINES ${_pt_water_def} ${_pt_light_tree_def} ${_pt_planet_def}
     MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals RestirReservoir)
 # Second PathTrace SPIR-V variant without RayQuery, for Vulkan drivers that
 # don't expose VK_KHR_ray_query.
@@ -124,7 +129,7 @@ pt_compile_slang(
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
     STAGE compute ENTRY main TARGETS spirv
-    VARIANT norq EXTRA_DEFINES -DPT_SPIRV_NO_RAYQUERY ${_pt_water_def} ${_pt_light_tree_def}
+    VARIANT norq EXTRA_DEFINES -DPT_SPIRV_NO_RAYQUERY ${_pt_water_def} ${_pt_light_tree_def} ${_pt_planet_def}
     MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals RestirReservoir)
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/Tonemap.slang

@@ -593,6 +593,153 @@ static const uint kPbrMaxLod     = 8u;   // log2(kPbrTileSize=256)
 [[vk::binding(35, 0)]] StructuredBuffer<float>  mesh_uvs;
 // --- end Wave 8 PBR -------------------------------------------------------
 
+// --- Planetary P4 (#258): per-instance descriptors + the terrain arenas ---
+//
+// Three buffers, declared AFTER mesh_uvs so on Metal they land at MSL
+// buffer slots 18/19/20 (one past mesh_uvs' 17) without shifting any
+// existing assignment; the push block then moves to slot 21, which
+// MetalPipeline reads out of the emitted MSL rather than assuming.
+// On Vulkan the explicit vk::binding is what matters: 0..35 were taken and
+// 37 belongs to GodRays' mask texture (bindings share one number space
+// with textures in set 0), so these take 36, 38, 39.
+//
+// WHY A DESCRIPTOR BUFFER AT ALL
+//
+// The hardware mesh hit has never read CommittedInstanceID() -- the engine
+// has only ever built one BLAS with one identity instance, and the shader
+// hard-coded `h.mat = MAT_METAL; h.albedo = MESH_ALBEDO; h.roughness =
+// 0.05`. One uvec4 of texture tiles in the push struct cannot express a
+// planet's biomes, and one hard-coded material cannot express per-face CSG
+// materials either (#53). Indirecting through the instance id fixes both.
+//
+// Instance 0 is reserved for the CSG / glTF mesh and the engine fills its
+// descriptor with exactly the constants the shader used to inline, so a
+// build with PT_PLANET_ENABLED=1 and no planet in the scene renders
+// bit-for-bit as before.
+#if PT_PLANET_ENABLED
+// Per-vertex terrain payload, one float4 per vertex, chunk arenas packed
+// end to end:
+//   xyz = outward unit normal. The instance transform is a pure
+//         TRANSLATION (chunk_origin - anchor), so a normal needs no
+//         transform -- this is why the terrain instance transform is
+//         deliberately never given a rotation.
+//   w   = the vertex's ellipsoidal height in metres, which drives the
+//         biome and, from P5, tells the shader it is on seabed.
+[[vk::binding(36, 0)]] StructuredBuffer<float4> terrain_verts;
+// The shared 16-variant stitched index arena. Chunk topology is identical
+// for every chunk, so this is uploaded once (~1.6 MB) and every chunk
+// indexes into it at the offset its stitch variant needs.
+[[vk::binding(38, 0)]] StructuredBuffer<uint>   terrain_indices;
+// kInstDescFloat4s float4 per TLAS instance. See InstanceDesc below.
+[[vk::binding(39, 0)]] StructuredBuffer<float4> instance_desc;
+
+static const uint kInstDescFloat4s = 6u;
+// Descriptor kinds. 0 keeps the legacy single-mesh geometry (positions and
+// indices in mesh_positions / mesh_indices); 1 is a terrain chunk.
+static const uint kInstKindMesh    = 0u;
+static const uint kInstKindTerrain = 1u;
+
+struct InstanceDesc {
+    uint   kind;
+    uint   vertex_base;     // in vertices, into terrain_verts
+    uint   index_base;      // in uints, into terrain_indices
+    float  uv_scale;        // UV units per metre; feeds pbrConeTexLod
+    float3 albedo;
+    float  roughness;
+    uint   mat;
+    float  vertex_spacing;  // metres between adjacent chunk vertices
+    float  ior;
+    uint4  tex_tiles;
+    // Mean-square slope of the detail a footprint of 2^m vertex spacings
+    // removes. Folded into roughness so a mountain range seen from orbit
+    // goes ROUGH rather than smooth -- which is what satellite imagery
+    // shows, and what an averaged normal alone gets wrong by deleting
+    // specular energy instead of broadening the lobe.
+    float  sigma2[8];
+};
+
+InstanceDesc loadInstanceDesc(uint id) {
+    uint b = id * kInstDescFloat4s;
+    float4 d0 = instance_desc[b + 0u];
+    float4 d1 = instance_desc[b + 1u];
+    float4 d2 = instance_desc[b + 2u];
+    float4 d3 = instance_desc[b + 3u];
+    float4 d4 = instance_desc[b + 4u];
+    float4 d5 = instance_desc[b + 5u];
+    InstanceDesc r;
+    r.kind        = asuint(d0.x);
+    r.vertex_base = asuint(d0.y);
+    r.index_base  = asuint(d0.z);
+    r.uv_scale    = d0.w;
+    r.albedo      = d1.xyz;
+    r.roughness   = d1.w;
+    r.mat         = asuint(d2.x);
+    r.vertex_spacing = d2.y;
+    r.ior         = d2.z;
+    r.tex_tiles   = uint4(asuint(d3.x), asuint(d3.y), asuint(d3.z), asuint(d3.w));
+    r.sigma2[0] = d4.x; r.sigma2[1] = d4.y; r.sigma2[2] = d4.z; r.sigma2[3] = d4.w;
+    r.sigma2[4] = d5.x; r.sigma2[5] = d5.y; r.sigma2[6] = d5.z; r.sigma2[7] = d5.w;
+    return r;
+}
+
+// Bruneton, Neyret & Holzschuch (2010): fold the sub-footprint slope
+// distribution into the microfacet roughness instead of letting an
+// averaged normal remove specular energy.
+//
+//     alpha^2_effective = alpha^2_material + 2 * sigma^2_slope(footprint)
+//
+// The footprint is the ray cone's width at the hit, and the mip it selects
+// is log2(cone_width / vertex_spacing) -- the number of vertex spacings the
+// cone covers. Below one spacing the geometry still resolves the slope and
+// nothing is added; sigma2[0] is 0 by construction for that reason.
+float terrainRoughnessFold(float base_roughness, float cone_width,
+                           InstanceDesc d) {
+    if (d.vertex_spacing <= 0.0) return base_roughness;
+    float mip = log2(max(cone_width / d.vertex_spacing, 1.0));
+    mip = clamp(mip, 0.0, 7.0);
+    uint  m0 = uint(floor(mip));
+    uint  m1 = min(m0 + 1u, 7u);
+    float f  = mip - float(m0);
+    float s2 = lerp(d.sigma2[m0], d.sigma2[m1], f);
+    float a  = base_roughness * base_roughness;
+    return sqrt(saturate(a + 2.0 * s2));
+}
+
+// Terrain albedo from the vertex's own ellipsoidal height and the surface
+// slope. These are measured hemispherical reflectances, not picked
+// colours: open ocean floor / deep sediment ~0.06-0.10, dry sand 0.40,
+// grassland 0.16-0.20, bare rock 0.20-0.30, fresh snow 0.80-0.90 (Budyko
+// 1974, "Climate and Life"; Ahrens, "Meteorology Today" 11th ed. table
+// 2.2). Earth's mean land albedo of 0.15 (Trenberth, Fasullo & Kiehl
+// 2009) falls out of the mixture.
+//
+// This is a SHADING heuristic sitting on top of measured reflectances, and
+// it is labelled as one: the snowline and the vegetation limit are cvars
+// with a cited anchor, not a physical model. It costs nothing to replace
+// with real land-cover data (MODIS MCD12Q1) when the atlas has the tiles
+// for it, and it never touches geometry.
+float3 terrainBiomeAlbedo(float height_m, float slope01, float snowline_m) {
+    float3 seabed = float3(0.055, 0.060, 0.070);
+    float3 sand   = float3(0.40, 0.36, 0.28);
+    float3 grass  = float3(0.13, 0.17, 0.09);
+    float3 rock   = float3(0.26, 0.24, 0.22);
+    float3 snow   = float3(0.85, 0.87, 0.90);
+    // Below sea level: seabed, with a sand shelf in the last 30 m. 30 m is
+    // not arbitrary -- it is roughly the 1/e depth of the green channel
+    // times two (Pope & Fry 1997 give a_g(550) = 0.0565 /m, i.e. 17.7 m),
+    // so it is where a seabed stops being lit at all.
+    float3 c = lerp(sand, seabed, saturate(-height_m / 30.0));
+    // Above sea level: sand -> grass over the first 40 m of a beach ridge,
+    // then rock as the slope steepens past the ~30 deg threshold hillslope
+    // (Burbank et al. 1996), then snow above the snowline.
+    float3 land = lerp(sand, grass, saturate(height_m / 40.0));
+    land = lerp(land, rock, saturate((slope01 - 0.5) * 2.5));
+    land = lerp(land, snow, saturate((height_m - snowline_m) / 400.0));
+    return (height_m >= 0.0) ? land : c;
+}
+#endif  // PT_PLANET_ENABLED
+// --- end Planetary P4 -----------------------------------------------------
+
 struct BvhNode {
     float3 aabb_min;
     uint   left_first;
@@ -1229,6 +1376,20 @@ cbuffer Push {
     // untouched. Mirrored in the SPIR-V Frame block below + Engine.cpp PtPush.
     float4 planet_ground;
     // --- end Planetary P3 -----------------------------------------------------
+    // --- Planetary P4 (#258): terrain runtime state ---------------------------
+    // .x = snowline altitude in metres at this scene's reference site. A
+    //      SHADING parameter, not a physical model: the regional snowline is
+    //      ~4 900 m in the tropics (Kaser & Osmaston, "Tropical Glaciers",
+    //      2002) and drops toward sea level at high latitude, and the engine
+    //      scales that anchor by cos(site latitude). Never touches geometry.
+    // .y = number of live TLAS instances (informational / debug overlay).
+    // .z = 1 when terrain streaming is active this frame, 0 otherwise.
+    // .w = reserved.
+    //
+    // 16 B appended at the very tail so every existing field offset is
+    // untouched. Mirrored in the SPIR-V Frame block below + Engine.cpp PtPush.
+    float4 planet_terrain;
+    // --- end Planetary P4 -----------------------------------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -1383,6 +1544,9 @@ cbuffer Frame {
     // See `planet_ground` in the Metal Push cbuffer above (Planetary P3,
     // #257). Layout-equivalent: one more vec4 appended at the tail.
     float4 planet_ground;
+    // See `planet_terrain` in the Metal Push cbuffer above (Planetary P4,
+    // #258). Layout-equivalent: one more vec4 appended at the tail.
+    float4 planet_terrain;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -2675,7 +2839,64 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
         if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
             float t_mesh = q.CommittedRayT();
             if (t_mesh < h.t) {
-                uint prim = q.CommittedPrimitiveIndex();
+                uint   prim = q.CommittedPrimitiveIndex();
+                float2 bary = q.CommittedTriangleBarycentrics();
+#if PT_PLANET_ENABLED
+                // --- Planetary P4 (#258): per-instance geometry + material -
+                // The first read of CommittedInstanceID() in this engine.
+                // Instance 0 is the legacy CSG / glTF mesh and the engine
+                // fills its descriptor with exactly the constants this block
+                // used to inline (MAT_METAL, MESH_ALBEDO, roughness 0.05,
+                // ior 1, push.mesh_tex_indices), so a scene with no planet in
+                // it renders bit-for-bit as it did before this phase.
+                uint inst = q.CommittedInstanceID();
+                InstanceDesc idesc = loadInstanceDesc(inst);
+                if (idesc.kind == kInstKindTerrain) {
+                    uint i0 = terrain_indices[idesc.index_base + prim * 3 + 0];
+                    uint i1 = terrain_indices[idesc.index_base + prim * 3 + 1];
+                    uint i2 = terrain_indices[idesc.index_base + prim * 3 + 2];
+                    float4 a0 = terrain_verts[idesc.vertex_base + i0];
+                    float4 a1 = terrain_verts[idesc.vertex_base + i1];
+                    float4 a2 = terrain_verts[idesc.vertex_base + i2];
+                    float w0 = 1.0 - bary.x - bary.y;
+                    // Smooth-shaded normal, used UNTRANSFORMED. The terrain
+                    // instance transform is a pure translation
+                    // (chunk_origin - anchor) and the streamer never gives a
+                    // chunk a rotation, precisely so this stays true.
+                    float3 n = normalize(a0.xyz * w0 + a1.xyz * bary.x
+                                                     + a2.xyz * bary.y);
+                    float  height = a0.w * w0 + a1.w * bary.x + a2.w * bary.y;
+                    h.hit = true; h.t = t_mesh;
+                    h.normal = n;
+                    h.mat = idesc.mat;
+                    // slope01 = 1 - |cos(tilt from local up)|. localUp() is
+                    // P0's per-point up, so this is the real geodetic slope
+                    // rather than a tilt from world +Y.
+                    float3 up = localUp(ro_mesh + rd * t_mesh);
+                    float  slope01 = saturate(1.0 - abs(dot(n, up)));
+                    h.albedo = terrainBiomeAlbedo(height, slope01,
+                                                  planet_terrain.x);
+                    // Sub-footprint slope variance -> roughness. The cone
+                    // width at the hit is the same accumulation the bounce
+                    // loop performs, evaluated one segment early because
+                    // the fold has to happen where the descriptor is.
+                    float cw = ptConeWidthAt(cone, t_mesh);
+                    h.roughness = terrainRoughnessFold(idesc.roughness, cw, idesc);
+                    h.ior = idesc.ior;
+                    h.emission = float3(0.0);
+                    h.prim_id = 0u;
+                    // uv_scale is known analytically from the chunk's own
+                    // texel density. Setting it closes the gap #248 left on
+                    // mesh hits: with uv_scale at 0 pbrConeTexLod
+                    // short-circuits to mip 0, which is exactly the horizon
+                    // aliasing #248 set out to kill -- on the primitive that
+                    // occupies most of a planet's screen area.
+                    h.uv = float2(0.0, 0.0);
+                    h.uv_scale = idesc.uv_scale;
+                    h.tex_tiles = idesc.tex_tiles;
+                } else
+#endif
+                {
                 uint i0 = mesh_indices[prim * 3 + 0];
                 uint i1 = mesh_indices[prim * 3 + 1];
                 uint i2 = mesh_indices[prim * 3 + 2];
@@ -2692,10 +2913,21 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
                 float3x3 wfm = (float3x3)q.CommittedObjectToWorld4x3();
                 h.hit = true; h.t = t_mesh;
                 h.normal = normalize(mul(wfm, obj_n));
+#if PT_PLANET_ENABLED
+                // From the descriptor rather than hard-coded. This is what
+                // unblocks per-face materials on CSG meshes (#53): the
+                // material stopped being a property of "the mesh path" and
+                // became a property of an instance.
+                h.mat = idesc.mat;
+                h.albedo = idesc.albedo;
+                h.roughness = idesc.roughness;
+                h.ior = idesc.ior;
+#else
                 h.mat = MAT_METAL;
                 h.albedo = MESH_ALBEDO;
                 h.roughness = 0.05;
                 h.ior = 1.0;
+#endif
                 // Mesh path doesn't source emission -- clear so a prior
                 // analytic-prim hit's emission doesn't leak through when
                 // this mesh hit is closer.
@@ -2710,14 +2942,18 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
                 // UVs (mesh_uvs parallel to mesh_positions) and carry the
                 // mesh's material texture tiles. Bary from the HW query is
                 // (b1, b2) for v1/v2; v0 weight = 1 - b1 - b2. When the
-                // mesh has no UV buffer the host forces mesh_tex_indices
+                // mesh has no UV buffer the host forces the tile indices
                 // to kPbrNoTexTile so the sample is skipped (h.uv stays 0).
-                float2 bary = q.CommittedTriangleBarycentrics();
                 float2 uv0 = float2(mesh_uvs[i0 * 2 + 0], mesh_uvs[i0 * 2 + 1]);
                 float2 uv1 = float2(mesh_uvs[i1 * 2 + 0], mesh_uvs[i1 * 2 + 1]);
                 float2 uv2 = float2(mesh_uvs[i2 * 2 + 0], mesh_uvs[i2 * 2 + 1]);
                 h.uv = uv0 * (1.0 - bary.x - bary.y) + uv1 * bary.x + uv2 * bary.y;
+#if PT_PLANET_ENABLED
+                h.tex_tiles = idesc.tex_tiles;
+#else
                 h.tex_tiles = mesh_tex_indices;
+#endif
+                }
             }
         }
     } else
