@@ -78,6 +78,29 @@
 
 namespace {
 
+// The mirror must be OPAQUE to the host optimiser.
+//
+// These functions model a GPU kernel; the exact reference and the
+// double-precision input construction next to them do not.  With
+// everything inlined into one loop body, clang -ffast-math fuses across
+// that boundary and the float32 rounding under measurement stops
+// happening -- measured here as the naive form's error collapsing from
+// 0.50 m to 8e-5 m at one altitude and not others, i.e. the defect
+// disappearing from a test whose whole job is to pin it.  Which way it
+// goes depends on surrounding code, so it is not a stable state to
+// leave the file in: the numbers this file reports would be a property
+// of the inliner rather than of the arithmetic.
+//
+// noinline restores the boundary.  It does NOT change the operations
+// inside each function -- ptFixedAdd still inlines into the accumulator,
+// exactly as it does on the GPU -- it only stops the harness from being
+// folded into the thing it is measuring.
+#if defined(_MSC_VER)
+#  define PT_MIRROR __declspec(noinline)
+#else
+#  define PT_MIRROR __attribute__((noinline))
+#endif
+
 // --- shader mirror: shaders/PathTraceMath.slang ---------------------------
 // Line-for-line.  F3 rather than glm::vec3 so no vector library gets a
 // chance to reassociate a dot product on our behalf.
@@ -97,6 +120,32 @@ inline float asfloat(std::uint32_t u) {
     return f;
 }
 inline F3 sub(F3 a, F3 b) { return F3{a.x - b.x, a.y - b.y, a.z - b.z}; }
+
+// --- finiteness, under -ffast-math ----------------------------------------
+//
+// std::isfinite() IS UNUSABLE IN THIS FILE, and so is a plain bit test.
+// -ffast-math defines __FINITE_MATH_ONLY__, under which (a) isfinite() is
+// a builtin the compiler folds to `true`, and (b) LLVM propagates the
+// ninf/nnan flags of the producing FP op through a bitcast, so even
+// reading the exponent field of the result folds to "finite" as well.
+// Both were measured on Apple clang 17, and that is exactly how PR #273
+// shipped an assertion that was vacuous on Mac and red on all three CI
+// toolchains: the function really did return +inf, and the check said
+// otherwise.
+//
+// A volatile round-trip breaks the chain -- the load carries no fast-math
+// flags, so its result has no known FP class -- and the exponent read is
+// then honest.  isFiniteHarnessWorks() below asserts that this is still
+// true on whatever compiler is running, so the harness can never go
+// quietly vacuous again the way std::isfinite did.
+inline bool finiteBits(float v) {
+    volatile float t = v;
+    float u = t;
+    std::uint32_t b;
+    std::memcpy(&b, &u, 4);
+    return ((b >> 23) & 0xFFu) != 0xFFu;
+}
+
 inline F3 mad(F3 a, F3 d, float s) {
     return F3{a.x + d.x * s, a.y + d.y * s, a.z + d.z * s};
 }
@@ -155,7 +204,7 @@ float ptFixedTotal(const PtFixedSum& a) {
          + static_cast<float>(a.lo) * a.up_lo;
 }
 
-float ptPowerOfPoint(F3 oc, float rad) {
+PT_MIRROR float ptPowerOfPoint(F3 oc, float rad) {
     float m = std::max(std::max(std::fabs(oc.x), std::fabs(oc.y)),
                        std::max(std::fabs(oc.z), rad));
     PtFixedSum a = ptFixedBegin(2 * ptFloatExp(m) + 1);
@@ -166,7 +215,7 @@ float ptPowerOfPoint(F3 oc, float rad) {
     return ptFixedTotal(a);
 }
 
-float ptDotExact(F3 a, F3 b) {
+PT_MIRROR float ptDotExact(F3 a, F3 b) {
     float m = maxc(a) * maxc(b);
     if (!(m > 0.0f)) { return 0.0f; }
     PtFixedSum s = ptFixedBegin(ptFloatExp(m) + 1);
@@ -180,12 +229,23 @@ float largestOperand(F3 p, F3 c, float rad) {
     return std::max(maxc(p), std::max(maxc(c), rad));
 }
 
+constexpr int kPtAltitudeMaxExp = 60;
+
 bool ptAltitudeStable(F3 p, F3 c, float rad) {
     if (!(rad > kPtStableSphereRadius)) { return false; }
-    return ptFloatExp(largestOperand(p, c, rad)) <= 73;
+    return ptFloatExp(largestOperand(p, c, rad)) <= kPtAltitudeMaxExp;
 }
 
-float ptPowerOfPointAt(F3 p, F3 c, float rad) {
+PT_MIRROR float ptAltitudeNaive(F3 oc, float rad) {
+    int e = ptFloatExp(maxc(oc));
+    if (e > kPtAltitudeMaxExp && e <= 127) {
+        float m = maxc(oc);
+        return m * len(F3{oc.x / m, oc.y / m, oc.z / m}) - rad;
+    }
+    return len(oc) - rad;
+}
+
+PT_MIRROR float ptPowerOfPointAt(F3 p, F3 c, float rad) {
     float m = largestOperand(p, c, rad);
     PtFixedSum a = ptFixedBegin(2 * ptFloatExp(m) + 2);
     ptFixedAddProduct(a, p.x, p.x, 1.0f);
@@ -201,13 +261,13 @@ float ptPowerOfPointAt(F3 p, F3 c, float rad) {
     return ptFixedTotal(a);
 }
 
-float ptAltitudeFromPower(float k, float rad) {
+PT_MIRROR float ptAltitudeFromPower(float k, float rad) {
     float d = rad + std::sqrt(std::max(std::fma(rad, rad, k), 0.0f));
     return (d > 0.0f) ? (k / d) : 0.0f;
 }
 
-float ptAltitudeAboveSphere(F3 p, F3 c, float rad) {
-    if (!ptAltitudeStable(p, c, rad)) { return len(sub(p, c)) - rad; }
+PT_MIRROR float ptAltitudeAboveSphere(F3 p, F3 c, float rad) {
+    if (!ptAltitudeStable(p, c, rad)) { return ptAltitudeNaive(sub(p, c), rad); }
     return ptAltitudeFromPower(ptPowerOfPointAt(p, c, rad), rad);
 }
 
@@ -219,7 +279,7 @@ struct PtRayAltitude {
     bool stable;
 };
 
-PtRayAltitude ptRayAltitudeBegin(F3 ro, F3 rd, F3 c, float rad) {
+PT_MIRROR PtRayAltitude ptRayAltitudeBegin(F3 ro, F3 rd, F3 c, float rad) {
     PtRayAltitude a{};
     a.ro = ro; a.rd = rd; a.c = c; a.rad = rad;
     a.stable = ptAltitudeStable(ro, c, rad);
@@ -228,8 +288,10 @@ PtRayAltitude ptRayAltitudeBegin(F3 ro, F3 rd, F3 c, float rad) {
     return a;
 }
 
-float ptRayAltitudeAt(const PtRayAltitude& a, float s) {
-    if (!a.stable) { return len(sub(mad(a.ro, a.rd, s), a.c)) - a.rad; }
+PT_MIRROR float ptRayAltitudeAt(const PtRayAltitude& a, float s) {
+    if (!a.stable || ptFloatExp(s) > kPtAltitudeMaxExp) {
+        return ptAltitudeNaive(sub(mad(a.ro, a.rd, s), a.c), a.rad);
+    }
     float k = std::fma(s, s, std::fma(2.0f * a.b0, s, a.k0));
     return ptAltitudeFromPower(k, a.rad);
 }
@@ -238,7 +300,7 @@ float ptRayAltitudeAt(const PtRayAltitude& a, float s) {
 // The pre-#271 bodies, kept so the tests pin the defect they repair rather
 // than only asserting that the new numbers look nice.  Both are the
 // expression that was in PathTrace.slang, transcribed unchanged.
-float planetAltitudeNaive(F3 p, F3 c, float rad) {
+PT_MIRROR float planetAltitudeNaive(F3 p, F3 c, float rad) {
     float ox = p.x - c.x, oy = p.y - c.y, oz = p.z - c.z;
     return std::sqrt(ox * ox + oy * oy + oz * oz) - rad;
 }
@@ -246,7 +308,7 @@ float planetAltitudeNaive(F3 p, F3 c, float rad) {
 // And the literal substitution issue #271 proposed, on a materialised oc.
 // It is a real improvement over the naive form and still not a fix; see
 // the header and the test case that pins it.
-float altitudeViaMaterialisedOc(F3 p, F3 c, float rad) {
+PT_MIRROR float altitudeViaMaterialisedOc(F3 p, F3 c, float rad) {
     F3 oc = sub(p, c);
     return ptPowerOfPoint(oc, rad) / (len(oc) + rad);
 }
@@ -540,16 +602,30 @@ TEST_CASE("at the surface, below it, and at the centre") {
     // from ~2R to R, and it must not divide by zero.
     {
         float h = ptAltitudeAboveSphere(kEngineCentre, kEngineCentre, kEarthRadius);
-        CHECK(std::isfinite(h));
+        CHECK(finiteBits(h));
         CHECK(h == -kEarthRadius);
     }
 }
 
-TEST_CASE("small radii keep the historic expression bit for bit") {
+TEST_CASE("small radii keep the historic expression") {
     // The gate exists so a miniature-planet scene (r_planet_radius is a
     // cvar, and the engine documents sub-Earth values as legal) renders
-    // exactly as it did.  Below kPtStableSphereRadius the new function and
-    // the pre-#271 one must agree to the bit -- not approximately.
+    // exactly as it did.
+    //
+    // Two claims, and they are not the same strength.
+    //
+    // EXACT: below the threshold the accumulated path is not taken.  That
+    // is what actually guarantees the shader keeps its bits, because in
+    // Slang both sides then inline to the identical source expression
+    // `length(p - c) - rad`, which the mirror-faithfulness case pins.
+    //
+    // APPROXIMATE: the two HOST spellings -- length(oc) here, the three
+    // squares written out longhand in the pre-#271 transcription -- may
+    // contract into fma differently under -ffast-math, so they can differ
+    // by one rounding of |p - c|.  That is an ULP of rad + h and not of
+    // h, because rad + h is the magnitude the sqrt actually produced.
+    // Asserting bit-identity across two spellings would be asserting a
+    // property of the host inliner, not of the shader.
     for (float rad : {1.0f, 100.0f, 1000.0f, 8192.0f, kPtStableSphereRadius}) {
         for (double alt : {0.0, 0.25, 3.0, 400.0, -12.0}) {
             for (double horiz : {0.0, 1.0, 130.0}) {
@@ -562,21 +638,17 @@ TEST_CASE("small radii keep the historic expression bit for bit") {
                 F3 p{static_cast<float>(r * std::sin(ang) * 0.6),
                      static_cast<float>(r * std::cos(ang) - double(rad)),
                      static_cast<float>(r * std::sin(ang) * 0.8)};
-                CHECK(asuint(ptAltitudeAboveSphere(p, c, rad))
-                      == asuint(planetAltitudeNaive(p, c, rad)));
-                // The march's fallback is the same formula but a
-                // different SPELLING of it -- length(p - c) where the
-                // pre-#271 march wrote the three squares out longhand --
-                // so it is held to a rounding, not to the bit.  The two
-                // spellings can differ by one rounding of |p - c| itself,
-                // which is an ULP of rad + h and not of h, because that
-                // is the magnitude the sqrt actually produced; under fast
-                // math the contraction of the sum of squares is free to
-                // differ between them.  Nothing depends on more than
-                // that: r_planet_radius is either 0, which takes the
-                // planar branch entirely, or a real body, which is four
-                // orders above the gate, so no scene has ever reached
-                // this path.
+                // The exact claim: no accumulated path, ever.
+                CHECK_FALSE(ptAltitudeStable(p, c, rad));
+                {
+                    double want = double(planetAltitudeNaive(p, c, rad));
+                    CHECK(std::fabs(double(ptAltitudeAboveSphere(p, c, rad)) - want)
+                          <= 2.0 * ulpOf(double(rad) + std::fabs(want)));
+                }
+                // Nothing depends on more than that: r_planet_radius is
+                // either 0, which takes the planar branch entirely, or a
+                // real body, which is four orders above the gate, so no
+                // scene has ever reached this path.
                 F3 rd{0.0f, 1.0f, 0.0f};
                 PtRayAltitude a = ptRayAltitudeBegin(p, rd, c, rad);
                 CHECK_FALSE(a.stable);
@@ -713,36 +785,114 @@ TEST_CASE("ray march: hoisting is required, not merely cheaper") {
     }
 }
 
+TEST_CASE("the finiteness harness is not vacuous") {
+    // Guard the guard.  If a future compiler folds finiteBits() the way it
+    // folds std::isfinite(), every "stays finite" assertion below would
+    // pass without testing anything -- which is precisely what happened to
+    // PR #273 on Apple clang.  Build an infinity by arithmetic that the
+    // compiler cannot see through, and require the harness to catch it.
+    float big = kEarthRadius;
+    for (int i = 0; i < 8; ++i) big = big * big;      // overflows to +inf
+    REQUIRE_FALSE(finiteBits(big));
+    REQUIRE(finiteBits(1.0f));
+    REQUIRE(finiteBits(0.0f));
+    // ... and that std::isfinite is the broken one, not our expectations.
+    // Not asserted -- it is compiler-dependent by design -- but captured so
+    // a failure elsewhere in this file has the context next to it.
+    CAPTURE(std::isfinite(big));
+}
+
 TEST_CASE("degenerate inputs stay finite") {
-    // Zero radius: the spherical branches never call this way (both gate
-    // on rad > 0), but the kernel must not produce a NaN if they ever do.
+    // THE CONTRACT: finite in, finite out.  Every input below is finite and
+    // has a representable altitude, so every result must be finite -- there
+    // is no input range carve-out here, because this function is called per
+    // sample inside a march and one NaN poisons a whole pixel.
+    //
+    // Zero radius: the spherical branches never call this way (both gate on
+    // rad > 0), but the kernel must not produce a NaN if they ever do.
     {
         float h = ptAltitudeAboveSphere(F3{1.0f, 2.0f, 2.0f}, F3{0, 0, 0}, 0.0f);
-        CHECK(std::isfinite(h));
+        CHECK(finiteBits(h));
         CHECK(double(h) == doctest::Approx(3.0));
     }
     // Everything zero: 0/0 is the one input that would produce a NaN, and
     // ptAltitudeFromPower's guard is what stops it.
     {
         CHECK(ptAltitudeFromPower(0.0f, 0.0f) == 0.0f);
-        CHECK(std::isfinite(ptAltitudeAboveSphere(F3{0, 0, 0}, F3{0, 0, 0}, 0.0f)));
+        CHECK(finiteBits(ptAltitudeAboveSphere(F3{0, 0, 0}, F3{0, 0, 0}, 0.0f)));
     }
-    // Above the accumulator's domain the gate must send the call to the
-    // historic expression rather than build a denormal scale factor.
-    {
-        const float huge = std::ldexp(1.0f, 80);      // exponent 80 > 73
-        F3 p{huge, 0.0f, 0.0f};
-        CHECK_FALSE(ptAltitudeStable(p, F3{0, 0, 0}, kEarthRadius));
-        CHECK(std::isfinite(ptAltitudeAboveSphere(p, F3{0, 0, 0}, kEarthRadius)));
+    // Every exponent from a millimetre to the top of float32, in a general
+    // orientation.  Axis-aligned probes miss this: with two components
+    // zero, fast math rewrites sqrt(x*x) to |x| and the overflow that the
+    // naive path would otherwise hit never happens -- the same degeneracy
+    // that hid the original cancellation in #267, now hiding an overflow.
+    //
+    // Pre-fix measurement (PR #273 as first pushed): NaN for every largest-
+    // operand exponent in [64, 74] via the accumulated path, and +inf for
+    // everything above it via the naive path.
+    for (int E = -10; E <= 126; ++E) {
+        CAPTURE(E);
+        float u = std::ldexp(1.0f, E);
+        F3 p{u * 0.6f, u * 0.5f, u * 0.7f};
+        for (float rad : {kEarthRadius, 1.0f, 1.0e18f}) {
+            CAPTURE(rad);
+            float h = ptAltitudeAboveSphere(p, F3{0, 0, 0}, rad);
+            CHECK(finiteBits(h));
+        }
     }
-    // A ray whose parameter runs past the sphere entirely stays finite.
+    // The same sweep with a non-zero centre, so p - c is a real subtraction
+    // and the gate sees two large operands rather than one.
+    for (int E = 0; E <= 120; ++E) {
+        CAPTURE(E);
+        float u = std::ldexp(1.0f, E);
+        F3 p{u * 0.6f, u * 0.5f, u * 0.7f};
+        F3 c{-u * 0.3f, u * 0.9f, -u * 0.2f};
+        float h = ptAltitudeAboveSphere(p, c, kEarthRadius);
+        CHECK(finiteBits(h));
+    }
+    // Ray parameters across the whole float32 range, including the 1e30
+    // "no limit" sentinel this engine passes as a ray length elsewhere.
+    // Pre-fix: NaN from s = 1e20 upward.
     {
         F3 ro{0.0f, 1.7f, 0.0f};
-        F3 rd{0.0f, 1.0f, 0.0f};
-        PtRayAltitude a = ptRayAltitudeBegin(ro, rd, kEngineCentre, kEarthRadius);
-        for (float s : {0.0f, 1.0e6f, 1.0e9f}) {
-            CHECK(std::isfinite(ptRayAltitudeAt(a, s)));
+        for (F3 rd : {F3{0.0f, 1.0f, 0.0f},
+                      F3{0.6f, 0.5f, 0.62449980f},      // general, unit
+                      F3{0.0f, -1.0f, 0.0f}}) {
+            PtRayAltitude a = ptRayAltitudeBegin(ro, rd, kEngineCentre, kEarthRadius);
+            for (int E = -10; E <= 126; ++E) {
+                CAPTURE(E);
+                CHECK(finiteBits(ptRayAltitudeAt(a, std::ldexp(1.0f, E))));
+            }
+            for (float s : {0.0f, 1.0e6f, 1.0e9f, 1.0e20f, 1.0e30f, 1.0e38f}) {
+                CAPTURE(s);
+                CHECK(finiteBits(ptRayAltitudeAt(a, s)));
+            }
         }
+    }
+    // Above the gate the answer is not just finite, it is still RIGHT to
+    // the precision the naive form can offer -- the scaled branch must not
+    // quietly return nonsense.  At |p| = 2^80 the altitude is |p| to
+    // within a rounding, since rad is 73 orders smaller.
+    {
+        float u = std::ldexp(1.0f, 80);
+        F3 p{u * 0.6f, u * 0.5f, u * 0.7f};
+        double want = std::sqrt(0.6 * 0.6 + 0.5 * 0.5 + 0.7 * 0.7) * std::ldexp(1.0, 80);
+        double got  = double(ptAltitudeAboveSphere(p, F3{0, 0, 0}, kEarthRadius));
+        CAPTURE(want);
+        CAPTURE(got);
+        CHECK_FALSE(ptAltitudeStable(p, F3{0, 0, 0}, kEarthRadius));
+        CHECK(std::fabs(got - want) <= 4.0 * ulpOf(want));
+    }
+    // An infinity or a NaN on the way in is NOT in the domain, but it must
+    // not get worse: the gate routes it to the naive form, so an infinite
+    // input yields an infinity rather than the NaN that inf/inf would give.
+    {
+        const float inf = asfloat(0x7F800000u);
+        float h = ptAltitudeAboveSphere(F3{inf, 0.0f, 0.0f}, F3{0, 0, 0}, kEarthRadius);
+        CHECK_FALSE(ptAltitudeStable(F3{inf, 0, 0}, F3{0, 0, 0}, kEarthRadius));
+        CHECK_FALSE(finiteBits(h));          // documented, not repaired
+        std::uint32_t b = asuint(h);
+        CHECK((b & 0x7FFFFFu) == 0u);        // an infinity, not a NaN
     }
 }
 
@@ -808,7 +958,12 @@ TEST_CASE("shader mirror is still faithful") {
     // the seed is 2e+2 rather than 2e+1.
     CHECK(math.find("kPtStableSphereRadius=16384.0") != std::string::npos);
     CHECK(math.find("!(rad>kPtStableSphereRadius)") != std::string::npos);
-    CHECK(math.find("ptFloatExp(m)<=73") != std::string::npos);
+    CHECK(math.find("kPtAltitudeMaxExp=60") != std::string::npos);
+    CHECK(math.find("ptFloatExp(m)<=kPtAltitudeMaxExp") != std::string::npos);
+    // The overflow-safe naive form and the per-sample s bound.
+    CHECK(math.find("e>kPtAltitudeMaxExp&&e<=127") != std::string::npos);
+    CHECK(math.find("returnm*length(oc/m)-rad;") != std::string::npos);
+    CHECK(math.find("ptFloatExp(s)>kPtAltitudeMaxExp") != std::string::npos);
     // The accumulator seed and the doubled cross terms that force it.
     CHECK(math.find("ptFixedBegin(2*ptFloatExp(m)+2)") != std::string::npos);
     CHECK(math.find("ptFixedAddProduct(a,p.x,c.x,-2.0)") != std::string::npos);
@@ -823,8 +978,9 @@ TEST_CASE("shader mirror is still faithful") {
     CHECK(math.find("floatk=fma(s,s,fma(2.0*a.b0,s,a.k0))") != std::string::npos);
     CHECK(math.find("a.b0=a.stable?ptDotExact(ro-c,rd)") != std::string::npos);
     // The historic expressions behind the gate, unchanged.
-    CHECK(math.find("returnlength(p-c)-rad;") != std::string::npos);
-    CHECK(math.find("returnlength(a.ro+a.rd*s-a.c)-a.rad;") != std::string::npos);
+    CHECK(math.find("returnlength(oc)-rad;") != std::string::npos);
+    CHECK(math.find("returnptAltitudeNaive(a.ro+a.rd*s-a.c,a.rad);") != std::string::npos);
+    CHECK(math.find("returnptAltitudeNaive(p-c,rad);") != std::string::npos);
 
     const std::string pt = tighten(PT_SHADER_PATHTRACE_PATH);
     // planetAltitude's spherical branch, and the planar one it must not

@@ -356,6 +356,17 @@ bool ptIntersectSphereLarge(float3 oc, float3 rd, float rad, out float t) {
 
 // Ray-sphere intersection. Returns the nearer non-self-intersection t
 // (>1e-3 epsilon to avoid stuck rays grazing their own surface).
+//
+// KNOWN GAP, not fixed here (issue #271 review).  `ext_exp <= 74` bounds
+// the exponent field ptPow2 has to build, but NOT the range of the
+// accumulated result: |oc|^2 - rad^2 leaves float32 at ext_exp ~ 63, so
+// radii in (2^63, 2^74] take the accumulated path, overflow k to an
+// infinity and return a non-finite t.  Measured, general orientation:
+// non-finite for every ext_exp in [64, 74].  The altitude gate below is
+// bounded on the RESULT instead (kPtAltitudeMaxExp) for exactly this
+// reason.  Left alone deliberately -- the fix is a one-constant change
+// but the literal is pinned by tests/pt_math_sphere_test.cpp, which
+// belongs to #254's change, and no scene traces a 9e18-metre sphere.
 public bool intersectSphere(float3 ro, float3 rd, float3 c, float rad, out float t) {
     float3 oc = ro - c;
     // Above kPtStableSphereRadius the naive expression below is worse than
@@ -434,14 +445,57 @@ public bool intersectPlane(float3 ro, float3 rd, float3 n, float d, out float t)
 // accumulator's domain.  Same crossover as intersectSphere -- the naive
 // form's ~eps*rad error reaches a millimetre at 1e-3 * 2^24 -- so bodies
 // at or below it keep the historic expression and every existing scene
-// renders unchanged.  The exponent ceiling is one lower than
-// intersectSphere's 74 because ptPowerOfPointAt seeds the accumulator at
-// 2e+2 rather than 2e+1 (see there), and 2^(e-23) must stay normal.
+// renders unchanged.
+//
+// The UPPER bound is not intersectSphere's.  That one (ext_exp <= 74)
+// bounds only the exponent field ptPow2 has to build; it does not bound
+// the RANGE of the accumulated result, and |p - c|^2 leaves float32 an
+// entire decade of exponents earlier.  The accumulated total is at most
+// |p|^2 + 2|p||c| + |c|^2 + rad^2 <= 4m^2 < 2^(2E+4) for E = ptFloatExp(m),
+// so finiteness needs 2E + 4 <= 128, i.e. E <= 62.  The constant sits two
+// exponents below that: the same E rides the accumulator's up_hi scale as
+// well as the terms, and 2^60 m is 122 light-years, so there is nothing to
+// buy by shaving it.
+//
+// Measured on the pre-fix code (issue #271 review): E in [64, 74] took the
+// accumulated path, overflowed k to an infinity and returned a NaN out of
+// k/d -- worse than the naive form it was replacing, and NaN in a march
+// poisons a whole pixel.  intersectSphere's gate has the SAME window and
+// still does; see the note above it.
+//
+// The read doubles as a finiteness test at no cost: an infinity or a NaN
+// in p, c or rad reports exponent 128 and so routes to the naive form
+// rather than into the accumulator's integer arithmetic.
+static const int kPtAltitudeMaxExp = 60;
+
 bool ptAltitudeStable(float3 p, float3 c, float rad) {
     if (!(rad > kPtStableSphereRadius)) { return false; }
     float m = max(max(max(abs(p.x), abs(p.y)), abs(p.z)),
                   max(max(abs(c.x), abs(c.y)), max(abs(c.z), rad)));
-    return ptFloatExp(m) <= 73;
+    return ptFloatExp(m) <= kPtAltitudeMaxExp;
+}
+
+// |oc| - rad, evaluated so that |oc|^2 cannot leave float32 range.
+//
+// Below the guard this is the historic expression, character for
+// character, so every body at or below kPtStableSphereRadius -- which is
+// every scene that has ever run -- keeps its exact bits.  Above it the
+// vector is scaled by its largest component first: |oc/m| is at most
+// sqrt(3), so the sum of squares cannot overflow however large oc is.
+// That costs a divide on a path no real scene reaches, and buys a finite
+// answer everywhere one exists.
+//
+// The upper half of the test (e <= 127, i.e. m itself finite) keeps an
+// infinite oc on the historic line, where it yields an infinity rather
+// than the NaN that inf/inf would produce in the scaled branch.  Garbage
+// in stays the same kind of garbage out instead of getting worse.
+float ptAltitudeNaive(float3 oc, float rad) {
+    int e = ptFloatExp(max(max(abs(oc.x), abs(oc.y)), abs(oc.z)));
+    if (e > kPtAltitudeMaxExp && e <= 127) {
+        float m = max(max(abs(oc.x), abs(oc.y)), abs(oc.z));
+        return m * length(oc / m) - rad;
+    }
+    return length(oc) - rad;
 }
 
 // |p - c|^2 - rad^2 with p - c never formed.  Ten exact products instead
@@ -451,6 +505,10 @@ bool ptAltitudeStable(float3 p, float3 c, float rad) {
 // absolute resolution: 2^(e-47) is 0.5 m^2 at Earth radius, i.e. 4e-8 m
 // of altitude, still a third of the float32 ULP of a one-metre altitude
 // and so not the term that limits the answer.
+//
+// PRECONDITION: ptFloatExp(largest operand) <= kPtAltitudeMaxExp, i.e.
+// what ptAltitudeStable tests.  Beyond it the result is not a finite
+// float32 and the accumulator hands back an infinity.
 public float ptPowerOfPointAt(float3 p, float3 c, float rad) {
     float m = max(max(max(abs(p.x), abs(p.y)), abs(p.z)),
                   max(max(abs(c.x), abs(c.y)), max(abs(c.z), rad)));
@@ -473,6 +531,15 @@ public float ptPowerOfPointAt(float3 p, float3 c, float rad) {
 // exactly rad^2 + k, and fma rounds that once, on the result.  The max()
 // only catches the accumulator's own sub-ULP residue at |oc| = 0 (p at the
 // centre, where k = -rad^2 and the fma should land on exactly zero).
+//
+// PRECONDITION: k finite.  An infinite k makes d infinite too and k/d is
+// then a NaN.  There is deliberately no guard for it: both callers gate
+// their inputs to kPtAltitudeMaxExp, which bounds k well inside float32,
+// and the tests assert that domain exhaustively.  A guard here would have
+// to invent a return value for an input whose true altitude is not
+// representable, which would hide a future caller's mistake instead of
+// surfacing it -- and this is the per-sample function in a march, so it
+// is the one place where a branch is not free.
 public float ptAltitudeFromPower(float k, float rad) {
     float d = rad + sqrt(max(fma(rad, rad, k), 0.0));
     return (d > 0.0) ? (k / d) : 0.0;
@@ -481,8 +548,13 @@ public float ptAltitudeFromPower(float k, float rad) {
 // Signed altitude of p above the sphere (c, rad); negative below the
 // surface, -rad at the centre, both by construction rather than by a
 // branch -- k is negative there and the denominator stays positive.
+//
+// FINITE for every finite p, c and rad whose difference p - c is itself
+// finite.  Above the gate that is ptAltitudeNaive's scaling; below it,
+// the accumulator's domain bound.  (If p - c overflows, no finite
+// altitude exists to return.)
 public float ptAltitudeAboveSphere(float3 p, float3 c, float rad) {
-    if (!ptAltitudeStable(p, c, rad)) { return length(p - c) - rad; }
+    if (!ptAltitudeStable(p, c, rad)) { return ptAltitudeNaive(p - c, rad); }
     return ptAltitudeFromPower(ptPowerOfPointAt(p, c, rad), rad);
 }
 
@@ -536,8 +608,19 @@ public PtRayAltitude ptRayAltitudeBegin(float3 ro, float3 rd, float3 c, float ra
     return a;
 }
 
+// FINITE for every finite s for which ro + rd*s is finite.
+//
+// `s` is bounded HERE rather than at Begin because it is the one input
+// that varies along the march, and s^2 leaves float32 above 2^64 -- which
+// is not academic: this engine passes 1e30 as a "no limit" ray length in
+// the cloud shadow march a few hundred lines away, and 1e30 squared is an
+// infinity that k/d would turn into a NaN.  Measured on the pre-fix code,
+// this function returned NaN from s = 1e20 upward.  The exponent read is
+// the same one the gate uses, so an infinite or NaN s routes out too.
 public float ptRayAltitudeAt(PtRayAltitude a, float s) {
-    if (!a.stable) { return length(a.ro + a.rd * s - a.c) - a.rad; }
+    if (!a.stable || ptFloatExp(s) > kPtAltitudeMaxExp) {
+        return ptAltitudeNaive(a.ro + a.rd * s - a.c, a.rad);
+    }
     // Nested so each fma rounds once on its OWN result: the error is then
     // an ULP of the value being formed, not of the largest term.  That is
     // what keeps a ray descending back to the surface -- where k0, 2 s b0
