@@ -63,6 +63,29 @@
 
 namespace {
 
+// The mirror must be OPAQUE to the host optimiser.
+//
+// These functions model a GPU kernel; the exact reference and the
+// double-precision input construction next to them do not.  With
+// everything inlined into one loop body, clang -ffast-math fuses across
+// that boundary and the float32 rounding under measurement stops
+// happening -- so the numbers this file reports would be a property of
+// the inliner rather than of the arithmetic.  Measured here (issue #275
+// section 3): with intersectSphere and intersectSphereNaive both inlined,
+// clang contracted `b*b - k` into an fma in one and not the other, and
+// the "small spheres keep byte-identical arithmetic" case went red on a
+// change that did not touch the small-sphere path at all.
+//
+// noinline restores the boundary.  It does NOT change the operations
+// inside each function -- ptFixedAdd still inlines into the accumulator,
+// exactly as it does on the GPU -- it only stops the harness from being
+// folded into the thing it is measuring.
+#if defined(_MSC_VER)
+#  define PT_MIRROR __declspec(noinline)
+#else
+#  define PT_MIRROR __attribute__((noinline))
+#endif
+
 // --- shader mirror: shaders/PathTraceMath.slang ---------------------------
 // Everything in this block is a line-for-line transcription.  Slang's
 // float3 is modelled by F3 rather than glm::vec3 so that no vector
@@ -83,7 +106,39 @@ inline float asfloat(std::uint32_t u) {
     return f;
 }
 
+// --- finiteness, under -ffast-math ----------------------------------------
+//
+// std::isfinite() IS UNUSABLE IN THIS FILE, and so is a plain bit test.
+// -ffast-math defines __FINITE_MATH_ONLY__, under which (a) isfinite() is
+// a builtin the compiler folds to `true`, and (b) LLVM propagates the
+// ninf/nnan flags of the producing FP op through a bitcast, so even
+// reading the exponent field of the result folds to "finite" as well.
+// Both measured on Apple clang 17 (issue #275 section 2).  This file
+// shipped three `CHECK(std::isfinite(t))` assertions in #267 that were
+// therefore vacuous on the dev machine and real only on CI -- the same
+// shape of defect as #252 and #268: a check that reports success without
+// exercising what it names.
+//
+// A volatile round-trip breaks the chain -- the load carries no fast-math
+// flags, so its result has no known FP class -- and the exponent read is
+// then honest.  TEST_CASE("the finiteness harness is not vacuous") below
+// asserts that this is still true on whatever compiler is running, so the
+// harness can never go quietly vacuous again the way std::isfinite did.
+// Same helper, same guard, as tests/pt_math_altitude_test.cpp.
+inline bool finiteBits(float v) {
+    volatile float t = v;
+    float u = t;
+    std::uint32_t b;
+    std::memcpy(&b, &u, 4);
+    return ((b >> 23) & 0xFFu) != 0xFFu;
+}
+
 constexpr float kPtStableSphereRadius = 16384.0f;
+
+// Largest-operand exponent above which the fixed-point accumulators can no
+// longer reach a finite float32 RESULT.  Shared with the altitude kernels;
+// the derivation lives at its definition in the shader.
+constexpr int kPtAccumMaxExp = 60;
 
 int ptFloatExp(float v) {
     return static_cast<int>((asuint(v) >> 23) & 0xFFu) - 127;
@@ -133,7 +188,7 @@ float ptFixedTotal(const PtFixedSum& a) {
          + static_cast<float>(a.lo) * a.up_lo;
 }
 
-float ptPowerOfPoint(F3 oc, float rad) {
+PT_MIRROR float ptPowerOfPoint(F3 oc, float rad) {
     float m = std::max(std::max(std::fabs(oc.x), std::fabs(oc.y)),
                        std::max(std::fabs(oc.z), rad));
     PtFixedSum a = ptFixedBegin(2 * ptFloatExp(m) + 1);
@@ -144,7 +199,7 @@ float ptPowerOfPoint(F3 oc, float rad) {
     return ptFixedTotal(a);
 }
 
-float ptDotExact(F3 a, F3 b) {
+PT_MIRROR float ptDotExact(F3 a, F3 b) {
     float m = std::max(std::max(std::fabs(a.x), std::fabs(a.y)), std::fabs(a.z))
             * std::max(std::max(std::fabs(b.x), std::fabs(b.y)), std::fabs(b.z));
     if (!(m > 0.0f)) { return 0.0f; }
@@ -155,7 +210,7 @@ float ptDotExact(F3 a, F3 b) {
     return ptFixedTotal(s);
 }
 
-bool ptIntersectSphereLarge(F3 oc, F3 rd, float rad, float& t) {
+PT_MIRROR bool ptIntersectSphereLarge(F3 oc, F3 rd, float rad, float& t) {
     float b = ptDotExact(oc, rd);
     float k = ptPowerOfPoint(oc, rad);
     float h = std::fma(b, b, -k);
@@ -169,12 +224,31 @@ bool ptIntersectSphereLarge(F3 oc, F3 rd, float rad, float& t) {
     return t > 1e-3f;
 }
 
-bool intersectSphere(F3 ro, F3 rd, F3 c, float rad, float& t) {
+PT_MIRROR bool ptIntersectSphereScaled(F3 oc, F3 rd, float rad, int ext_exp, float& t) {
+    int s = std::min(ext_exp, 126);
+    float dn = ptPow2(-s), up = ptPow2(s);
+    F3 o{oc.x * dn, oc.y * dn, oc.z * dn};
+    float r = rad * dn;
+    float b = o.x * rd.x + o.y * rd.y + o.z * rd.z;
+    float k = (o.x * o.x + o.y * o.y + o.z * o.z) - r * r;
+    float h = b * b - k;
+    if (h < 0.0f) { t = 0.0f; return false; }
+    h = std::sqrt(h);
+    float t0 = (-b - h) * up, t1 = (-b + h) * up;
+    t = (t0 > 1e-3f) ? t0 : t1;
+    return t > 1e-3f;
+}
+
+PT_MIRROR bool intersectSphere(F3 ro, F3 rd, F3 c, float rad, float& t) {
     F3 oc{ro.x - c.x, ro.y - c.y, ro.z - c.z};
-    int ext_exp = ptFloatExp(std::max(std::max(std::fabs(oc.x), std::fabs(oc.y)),
-                                      std::max(std::fabs(oc.z), rad)));
-    if (rad > kPtStableSphereRadius && ext_exp <= 74) {
+    float m = std::max(std::max(std::fabs(oc.x), std::fabs(oc.y)),
+                       std::max(std::fabs(oc.z), rad));
+    int ext_exp = ptFloatExp(m);
+    if (rad > kPtStableSphereRadius && ext_exp <= kPtAccumMaxExp) {
         return ptIntersectSphereLarge(oc, rd, rad, t);
+    }
+    if (ext_exp > kPtAccumMaxExp && ext_exp <= 127) {
+        return ptIntersectSphereScaled(oc, rd, rad, ext_exp, t);
     }
     float b = oc.x * rd.x + oc.y * rd.y + oc.z * rd.z;
     float k = (oc.x * oc.x + oc.y * oc.y + oc.z * oc.z) - rad * rad;
@@ -188,7 +262,7 @@ bool intersectSphere(F3 ro, F3 rd, F3 c, float rad, float& t) {
 
 // The pre-#254 body, kept so the tests can pin the defect they repair
 // rather than just asserting the new numbers look nice.
-bool intersectSphereNaive(F3 ro, F3 rd, F3 c, float rad, float& t) {
+PT_MIRROR bool intersectSphereNaive(F3 ro, F3 rd, F3 c, float rad, float& t) {
     F3 oc{ro.x - c.x, ro.y - c.y, ro.z - c.z};
     float b = oc.x * rd.x + oc.y * rd.y + oc.z * rd.z;
     float k = (oc.x * oc.x + oc.y * oc.y + oc.z * oc.z) - rad * rad;
@@ -292,12 +366,15 @@ struct Ray {
     F3 ro, rd;
 };
 
-// Origin at altitude `alt` above a sphere of radius `rad` centred on the
-// world origin, looking `tilt_deg` away from straight down.  tilt 0 is
-// nadir; the horizon sits just under 90 degrees.
-Ray rayAtAltitude(float rad, double alt, double tilt_deg) {
-    double r = double(rad) + alt;
-    F3 ro{float(kUx * r), float(kUy * r), float(kUz * r)};
+// Origin `dist` metres from the world origin along the general up, aimed
+// `tilt_deg` away from straight down.  tilt 0 is nadir, 180 is straight
+// out; for a sphere centred on the origin the horizon sits just under 90.
+//
+// Parameterised by absolute distance rather than by altitude so that the
+// finiteness sweeps below can walk the whole float32 exponent range, where
+// "radius plus altitude" stops being expressible.
+Ray rayAtDistance(double dist, double tilt_deg) {
+    F3 ro{float(kUx * dist), float(kUy * dist), float(kUz * dist)};
     // Any unit vector orthogonal to up, to tilt within.
     double ex = -kUy, ey = kUx, ez = 0.0;
     double en = std::sqrt(ex * ex + ey * ey + ez * ez);
@@ -308,6 +385,12 @@ Ray rayAtAltitude(float rad, double alt, double tilt_deg) {
     double dz = -kUz * std::cos(a) + ez * std::sin(a);
     double dn = std::sqrt(dx * dx + dy * dy + dz * dz);
     return Ray{ro, F3{float(dx / dn), float(dy / dn), float(dz / dn)}};
+}
+
+// Origin at altitude `alt` above a sphere of radius `rad` centred on the
+// world origin, looking `tilt_deg` away from straight down.
+Ray rayAtAltitude(float rad, double alt, double tilt_deg) {
+    return rayAtDistance(double(rad) + alt, tilt_deg);
 }
 
 // Straight down the +z axis from a known altitude.  With rad and
@@ -332,12 +415,24 @@ TEST_CASE("planetary radius: exact nadir hit is recovered exactly") {
     //
     // This case is also a warning about how the defect hid for so long.
     // Axis-aligned, two components of oc are zero, so dot(oc, oc) and b*b
-    // are literally the SAME rounding of oc.z*oc.z; they cancel exactly in
-    // h = b*b - k and the naive form returns the right t anyway.  Its k is
-    // still wrong by ~1.2% -- pinned below -- and the moment the geometry
-    // stops being axis-aligned (the next test case) that error surfaces in
-    // t.  Any test written on axis-aligned rays would have called the old
-    // code correct.
+    // are the SAME rounding of oc.z*oc.z and cancel in h = b*b - k, which
+    // is enough to hide the ~1.2% error k still carries -- pinned below --
+    // and the moment the geometry stops being axis-aligned (the next test
+    // case) that error surfaces in t.  Any test written on axis-aligned
+    // rays would have called the old code correct.
+    //
+    // "Would have", not "does": that cancellation only survives while the
+    // multiply is NOT fused.  Fuse it and b*b is the exact (R+alt)^2
+    // rather than the same rounding of it that k carries, half an ULP of
+    // R^2 is left behind, and the near root either drifts by ~0.5 m or
+    // drops under the 1e-3 epsilon so the function returns the FAR wall of
+    // the planet, 12 742 km away.  Both outcomes were measured in this
+    // file on unchanged source, either side of an inlining decision
+    // (issue #275 section 3, which is why the mirror is PT_MIRROR now).
+    // Neither Metal's default math mode nor the generated SPIR-V
+    // constrains contraction, so both are things the pre-#254 shader could
+    // do on a real device, and the assertion below pins the disjunction
+    // rather than whichever arm this compiler happens to pick.
     for (float alt : {0.5f, 2.0f, 100.0f, 1024.0f}) {
         CAPTURE(alt);
         Ray r = exactNadirRay(kEarthRadius, alt);
@@ -347,10 +442,18 @@ TEST_CASE("planetary radius: exact nadir hit is recovered exactly") {
         // Exact: not "within a millimetre", bit-for-bit the right answer.
         CHECK(t_new == alt);
 
-        // The naive t survives the degeneracy; the naive k does not.
+        // The naive k does not survive the degeneracy at all (pinned
+        // below).  The naive t survives it only unfused: either it lands
+        // within the ~eps*R the cancellation leaves, or it misses the near
+        // root entirely and reports the far wall.  eps = 2^-24, doubled
+        // for the two subtractions, doubled again for margin.
         float t_old = 0.0f;
         REQUIRE(intersectSphereNaive(r.ro, r.rd, kOrigin, kEarthRadius, t_old));
-        CHECK(t_old == alt);
+        CAPTURE(t_old);
+        const double err_old = std::fabs(double(t_old) - double(alt));
+        CAPTURE(err_old);
+        CHECK((err_old <= 4.0 * double(kEarthRadius) / 16777216.0
+               || double(t_old) > 1.0e6));
 
         F3 oc{0.0f, 0.0f, kEarthRadius + alt};
         double k_want = double(alt) * (2.0 * double(kEarthRadius) + double(alt));
@@ -596,7 +699,7 @@ TEST_CASE("degenerate inputs stay finite") {
     {
         float t = 0.0f;
         REQUIRE(intersectSphere(kOrigin, F3{0, 0, -1}, kOrigin, kEarthRadius, t));
-        CHECK(std::isfinite(t));
+        CHECK(finiteBits(t));
         CHECK(std::fabs(double(t) - double(kEarthRadius)) <= ulpOf(kEarthRadius));
     }
     // Clean miss: aimed away from a planet-sized sphere.
@@ -605,15 +708,141 @@ TEST_CASE("degenerate inputs stay finite") {
         F3 up{-r.rd.x, -r.rd.y, -r.rd.z};   // straight out, away from it
         float t = 0.0f;
         CHECK_FALSE(intersectSphere(r.ro, up, kOrigin, kEarthRadius, t));
-        CHECK(std::isfinite(t));
+        CHECK(finiteBits(t));
     }
     // Tangent-ish ray that misses by a hair still reports a miss, finitely.
     {
         Ray r = rayAtAltitude(kEarthRadius, 1000.0, 89.5);
         float t = 0.0f;
         bool hit = intersectSphere(r.ro, r.rd, kOrigin, kEarthRadius, t);
-        CHECK(std::isfinite(t));
+        CHECK(finiteBits(t));
         if (hit) CHECK(double(t) > 0.0);
+    }
+}
+
+TEST_CASE("the finiteness harness is not vacuous") {
+    // Guard the guard (issue #275 section 2).  If a future compiler folds
+    // finiteBits() the way -ffast-math folds std::isfinite(), every "stays
+    // finite" assertion in this file would pass without testing anything --
+    // which is exactly what the three std::isfinite() calls this file
+    // shipped with did on Apple clang.  Build an infinity by arithmetic the
+    // compiler cannot see through and require the harness to catch it.
+    float big = kEarthRadius;
+    for (int i = 0; i < 8; ++i) big = big * big;      // overflows to +inf
+    REQUIRE_FALSE(finiteBits(big));
+    REQUIRE(finiteBits(1.0f));
+    REQUIRE(finiteBits(0.0f));
+    // ... and that std::isfinite is the broken one, not our expectations.
+    // Not asserted -- it is compiler-dependent by design -- but captured so
+    // a failure elsewhere in this file has the context next to it.
+    CAPTURE(std::isfinite(big));
+}
+
+TEST_CASE("finite in, finite out over the whole float32 range") {
+    // THE CONTRACT (issue #275 section 1), the same one #271 gave the
+    // altitude kernels: every finite (ro, rd, c, rad) yields a finite t.
+    // There is no range carve-out, because intersectSphere is called per
+    // bounce and a NaN t poisons the whole path, not one sample.
+    //
+    // Pre-fix measurement, general orientation, on the code this replaces:
+    // the gate read `ext_exp <= 74`, which bounds the exponent field
+    // ptPow2 has to CONSTRUCT and not the range of the accumulated result.
+    // |oc|^2 - rad^2 leaves float32 an entire decade of exponents earlier,
+    // so exponents in [61, 74] took the accumulated path and overflowed k
+    // to an infinity (-inf for an origin inside the sphere, +inf outside),
+    // and everything above 74 fell through to a naive expression whose sum
+    // of squares overflowed on its own.  The sweeps below walk every one of
+    // those exponents; the assertion counts in the failure output are what
+    // pinned the bands.
+    //
+    // General orientation throughout, and that is load-bearing: with two
+    // components of oc equal to zero the dot products stop cancelling AND
+    // fast math rewrites sqrt(x*x) to |x|, so the overflow never happens --
+    // the same degeneracy that hid the original cancellation in #254, here
+    // hiding an overflow.
+
+    // (a) Origin exponent swept from a millimetre to the top of float32,
+    //     against a metre-sized, an Earth-sized and a 1e18 m sphere.
+    for (int E = -10; E <= 126; ++E) {
+        CAPTURE(E);
+        double dist = std::ldexp(1.0, E);
+        for (float rad : {1.0f, kEarthRadius, 1.0e18f}) {
+            CAPTURE(rad);
+            for (double tilt : {0.0, 45.0, 89.9, 180.0}) {
+                CAPTURE(tilt);
+                Ray r = rayAtDistance(dist, tilt);
+                float t = 0.0f;
+                intersectSphere(r.ro, r.rd, kOrigin, rad, t);
+                CHECK(finiteBits(t));
+            }
+        }
+    }
+
+    // (b) Radius exponent swept, with the origin deep inside, on the
+    //     surface and outside.  Inside is the case that matters: k is then
+    //     ~ -rad^2, so the accumulator overflows NEGATIVE, the discriminant
+    //     comes out +inf instead of being rejected, and t = k/q is the
+    //     inf/inf the issue names.
+    for (int E = 15; E <= 126; ++E) {
+        CAPTURE(E);
+        float rad = std::ldexp(1.0f, E);
+        for (double frac : {0.1, 1.0, 1.5}) {
+            CAPTURE(frac);
+            for (double tilt : {0.0, 45.0, 89.9}) {
+                CAPTURE(tilt);
+                Ray r = rayAtDistance(double(rad) * frac, tilt);
+                float t = 0.0f;
+                intersectSphere(r.ro, r.rd, kOrigin, rad, t);
+                CHECK(finiteBits(t));
+            }
+        }
+    }
+
+    // (c) A non-zero centre, so oc = ro - c is a real subtraction and the
+    //     gate sees two large operands rather than one.
+    for (int E = 0; E <= 120; ++E) {
+        CAPTURE(E);
+        float u = std::ldexp(1.0f, E);
+        F3 ro{u * 0.6f, u * 0.5f, u * 0.7f};
+        F3 c{-u * 0.3f, u * 0.9f, -u * 0.2f};
+        for (double tilt : {0.0, 45.0, 89.9}) {
+            CAPTURE(tilt);
+            F3 rd = rayAtDistance(1.0, tilt).rd;
+            for (float rad : {kEarthRadius, 1.0e18f}) {
+                CAPTURE(rad);
+                float t = 0.0f;
+                intersectSphere(ro, rd, c, rad, t);
+                CHECK(finiteBits(t));
+            }
+        }
+    }
+
+    // (d) Above the gate the answer must not merely be finite, it must
+    //     still be RIGHT to the precision the historic expression can
+    //     offer -- the rescale must not quietly return nonsense.
+    //
+    //     Tolerance derived, not tuned.  Above the gate the arithmetic IS
+    //     the historic expression, so its ~2 eps*rad cancellation error
+    //     stands; the rescale adds three roundings (oc/m, rad/m, and the
+    //     final t*m), each <= 0.5 eps relative on a t of ~0.5 rad.  Call it
+    //     8 eps*rad, which is the same 4x margin toleranceFor() carries
+    //     below the gate.
+    {
+        constexpr double kFloatEps = 1.0 / 16777216.0;      // 2^-24
+        for (int E = 62; E <= 100; E += 2) {
+            CAPTURE(E);
+            float rad = std::ldexp(1.0f, E);
+            Ray r = rayAtDistance(double(rad) * 1.5, 0.0);
+            double t_ref = 0.0;
+            referenceSolve(r.ro, r.rd, kOrigin, rad, t_ref);
+            REQUIRE(t_ref > 0.0);
+            float t = 0.0f;
+            REQUIRE(intersectSphere(r.ro, r.rd, kOrigin, rad, t));
+            double err = std::fabs(double(t) - t_ref);
+            CAPTURE(t_ref);
+            CAPTURE(err);
+            CHECK(err <= 8.0 * kFloatEps * double(rad));
+        }
     }
 }
 
@@ -632,9 +861,19 @@ TEST_CASE("shader mirror is still faithful") {
         if (!std::isspace(static_cast<unsigned char>(ch))) tight.push_back(ch);
     }
 
-    // The gate, and the direction of the comparison.
+    // The gate, and the direction of the comparison.  The upper bound is
+    // on the RANGE of the accumulated result, not on the exponent field
+    // ptPow2 has to construct (issue #275) -- pin the constant it now
+    // shares with the altitude kernels, and the rescaled fallback that
+    // covers everything above it.
     CHECK(tight.find("kPtStableSphereRadius=16384.0") != std::string::npos);
-    CHECK(tight.find("rad>kPtStableSphereRadius&&ext_exp<=74") != std::string::npos);
+    CHECK(tight.find("kPtAccumMaxExp=60") != std::string::npos);
+    CHECK(tight.find("rad>kPtStableSphereRadius&&ext_exp<=kPtAccumMaxExp")
+          != std::string::npos);
+    CHECK(tight.find("ext_exp>kPtAccumMaxExp&&ext_exp<=127") != std::string::npos);
+    CHECK(tight.find("ints=min(ext_exp,126)") != std::string::npos);
+    CHECK(tight.find("floatdn=ptPow2(-s),up=ptPow2(s)") != std::string::npos);
+    CHECK(tight.find("floatt0=(-b-h)*up,t1=(-b+h)*up") != std::string::npos);
     // The 12-bit split that makes each partial product exact.
     CHECK(tight.find("asuint(x)&0xFFFFF000u") != std::string::npos);
     CHECK(tight.find("asuint(y)&0xFFFFF000u") != std::string::npos);
