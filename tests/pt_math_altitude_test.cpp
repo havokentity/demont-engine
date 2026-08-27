@@ -1011,13 +1011,21 @@ TEST_CASE("shader mirror is still faithful") {
                   "planet_center_radius.w);") != std::string::npos);
     // The transmittance march: one hoist, three samples, and the clamp to
     // zero that keeps the optical depth from going negative below ground.
-    CHECK(pt.find("PtRayAltituderay_alt=ptRayAltitudeBegin(ro,rd,pc,planet_R);")
+    //
+    // These moved out of PathTrace.slang and into PathTraceMath.slang's
+    // ptAtmoOpticalDepth in #257, when the medium became a body struct
+    // instead of four scattered copies of Earth. The pins move with them:
+    // what #271 is protecting is that the march hoists the quadratic ONCE
+    // and never materialises p(s), and that is a property of wherever the
+    // march lives, not of which file it lives in.
+    CHECK(math.find("PtRayAltitudealt=ptRayAltitudeBegin(ro,rd,centre,b.ground_radius);")
           != std::string::npos);
-    CHECK(pt.find("h_prev=max(ptRayAltitudeAt(ray_alt,0.0),0.0);") != std::string::npos);
-    CHECK(pt.find("floath_mid=max(ptRayAltitudeAt(ray_alt,s_mid),0.0);")
-          != std::string::npos);
-    CHECK(pt.find("floath_right=max(ptRayAltitudeAt(ray_alt,s_right),0.0);")
-          != std::string::npos);
+    CHECK(math.find("max(ptRayAltitudeAt(alt,0.0),0.0)") != std::string::npos);
+    CHECK(math.find("max(ptRayAltitudeAt(alt,s_mid),0.0)") != std::string::npos);
+    CHECK(math.find("max(ptRayAltitudeAt(alt,s_right),0.0)") != std::string::npos);
+    // And that PathTrace.slang no longer carries a second march of its
+    // own -- the whole point of the move.
+    CHECK(pt.find("ptRayAltitudeBegin(") == std::string::npos);
     // And that no naive altitude survived at either site.
     CHECK(pt.find("length(p-planet_center_radius.xyz)-planet_center_radius.w")
           == std::string::npos);

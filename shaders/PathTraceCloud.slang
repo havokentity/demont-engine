@@ -158,6 +158,10 @@ public float3 cloud_curl_noise(float3 p, float scale) {
                   dPy_dx - dPx_dy);
 }
 
+// ptAltitudeAboveSphere (issue #271) -- the cancellation-free
+// altitude kernel the spherical layer gate below needs.
+import PathTraceMath;
+
 // Density at a world-space point. Returns 0 outside the cloud layer
 // or where the noise threshold isn't met. The volumetric march
 // multiplies this by sigma_t to vary extinction along the ray.
@@ -180,15 +184,40 @@ public float3 cloud_curl_noise(float3 p, float scale) {
 //      term on top of the existing cp3.z detail noise; eats away
 //      soft cloud margins into wisps without hollowing dense cores.
 //      0 = identical to cp3.z-only behaviour on main.
+// `planet_cr` is (centre.xyz, radius) -- the shared planetary frame
+// (#254). When .w > 0 the layer is a SPHERICAL SHELL and cp1.x / cp1.y
+// are altitudes above the surface; when .w <= 0 they are world-Y planes
+// and this reduces to `pos.y` bit for bit, so every planar-frame scene
+// is unchanged (planetary P3, #257).
+//
+// Passed explicitly rather than defaulted: slangc raises an internal
+// error ("Generic type/value shouldn't be handled here!") at every
+// call site when a module-boundary function carries a default
+// argument, on both the Metal and SPIR-V targets.
+//
+// This gate matters more than it looks. If the cloud GEOMETRY goes
+// spherical while the DENSITY FUNCTION keeps a flat height test, the two
+// disagree about where "5 km" is by hundreds of metres at horizon
+// ranges -- reintroducing through the density field exactly the error
+// the shell intersection removes from the geometry. The two must be
+// gated on the same field, and they are.
 public float cloud_density_at(float3 pos,
                               float4 cp1, float4 cp2, float4 cp3,
                               float4 cp4,
-                              int octaves) {
+                              int octaves,
+                              float4 planet_cr) {
     if (cp1.w <= 0.0) return 0.0;
     float base_y = cp1.x;
     float top_y  = cp1.y;
-    if (pos.y < base_y || pos.y > top_y) return 0.0;
-    float h_norm = (pos.y - base_y) / max(top_y - base_y, 1e-3);
+    // Altitude in the layer's own frame. ptAltitudeAboveSphere is the
+    // cancellation-free kernel (#271): at Earth radius the naive
+    // length(p - c) - R keeps ~0.5 m, and the band tests just below
+    // compare against a layer only a few hundred metres thick.
+    float alt = (planet_cr.w > 0.0)
+              ? ptAltitudeAboveSphere(pos, planet_cr.xyz, planet_cr.w)
+              : pos.y;
+    if (alt < base_y || alt > top_y) return 0.0;
+    float h_norm = (alt - base_y) / max(top_y - base_y, 1e-3);
     // Height profile: ramp up from the bottom, fall off before the top.
     // Peaks around h_norm = 0.4 -- biases toward dense lower volumes,
     // wispy upper volumes (cumulus shape).

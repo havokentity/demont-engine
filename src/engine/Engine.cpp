@@ -1389,7 +1389,7 @@ namespace cvar {
     // toward sun at each sample. Atmospheric haze + god rays through
     // gaps in geometry (sun shafts).
     PT_CVAR(r_volumetric,           "0",    "Volumetric single-scatter (atmospheric haze + sun shafts). 0 disables; otherwise march r_volumetric_samples points along each primary ray and NEE-shadow-test toward the sun at each.", CVAR_ARCHIVE);
-    PT_CVAR(r_volumetric_density,   "0.002", "Mie extinction coefficient (per metre). Real Earth aerosol haze is 1e-4 to 5e-4 at sea level; 0.002 gives visible god rays paired with r_rayleigh=30 for blue sky. 0.005 = thick haze (visible god rays, partial blue-sky tint loss). 0.05 = fog (sky goes white). Use Rayleigh (r_rayleigh) for the blue sky -- this is the haze layer on top.", CVAR_ARCHIVE);
+    PT_CVAR(r_volumetric_density,   "0.002", "Sea-level Mie (aerosol) SCATTERING coefficient in m^-1. Absolute, not a multiplier. Since #257 the aerosol also ABSORBS -- the absorbing half moves with this value so the particles keep their single-scattering albedo of 0.476 (Hillaire 2020), i.e. raising this means MORE of the same aerosol, not a different aerosol. Before #257 the engine had no aerosol absorption at all, an implied albedo of 1, so a given setting now attenuates about 2.1x as much as it used to while scattering exactly as much. PHYSICAL REFERENCE POINTS: 3.996e-6 = Hillaire 2020 clear sky, aerosol optical depth 0.010 at 550 nm. 2.1e-5 = Bruneton 2008, a hazier clear day. 1e-4 to 5e-4 = boundary-layer haze, meteorological range roughly 40 km down to 8 km, where god rays read strongly. 2e-3 and up = fog. THE DEFAULT OF 0.002 IS NOT PHYSICAL and is retained deliberately: it is about 500x the clear-sky value, and r_rayleigh 30 exists to cancel the blue it washes out. #257 measured what retiring the pair costs and left the flip to its own change -- see r_rayleigh for the numbers and the blocker. Set 3.996e-6 here together with r_rayleigh 1.0 for the physical medium.", CVAR_ARCHIVE);
     PT_CVAR(r_volumetric_anisotropy,"0.7",  "Henyey-Greenstein phase g in [-0.95, 0.95]. +0.7 = forward-peaked atmosphere, 0 = isotropic fog, negative = back-scattering. Higher g makes the sun's halo much brighter when the camera looks near it.", CVAR_ARCHIVE);
     PT_CVAR(r_volumetric_intensity, "1.0",  "Linear scale on the volumetric contribution. Useful to dial god rays up/down without changing the underlying density.", CVAR_ARCHIVE);
     PT_CVAR(r_volumetric_samples,   "16",   "March sample count per primary ray (4..64). More = smoother shafts at proportional GPU cost. 16 is a comfortable default with the denoiser on.", CVAR_ARCHIVE);
@@ -1815,7 +1815,8 @@ namespace cvar {
             "matching that on a 60 fps render means 1/120 s = 0.0083 s. "
             "Only consulted when r_motion_blur == 1.", CVAR_ARCHIVE);
     // --- end Motion blur ------------------------------------------------------
-    PT_CVAR(r_rayleigh,              "30.0",     "Atmospheric Rayleigh scattering scale on the per-channel sea-level sigma (R 5.8e-6, G 13.5e-6, B 33.1e-6 per metre). 1.0 = real Earth atmosphere -- but our typical r_volumetric_density (Mie haze) is ~30x stronger than real-Earth haze, so bumping this to 30 keeps the sky visibly blue at typical haze settings. Drop to 1.0 if you also drop r_volumetric_density to 0.0001-0.0005 (real haze). 0 disables Rayleigh.", CVAR_ARCHIVE);
+    PT_CVAR(r_rayleigh,              "30.0",     "Multiple of the real Rayleigh molecular-scattering column. 1.0 = real Earth: per-channel sea-level sigma (5.802, 13.558, 33.100)e-6 m^-1 at 680/550/440 nm (Bodhaine, Wood, Dutton & Slusser 1999, as tabulated in Hillaire 2020) over an 8 km scale height. 0 disables Rayleigh. THE DEFAULT OF 30.0 IS NOT PHYSICAL. It exists to cancel r_volumetric_density, which is about 500x real clear-sky aerosol -- two fudge factors tuned against each other. #257 made the MODEL physical (ozone, aerosol absorption, a corrected Mie scale height, real cross-sections) and deliberately did NOT flip this pair, because measurement showed the flip is not self-contained: procSky is a painted gradient whose literals are topped up by the in-scatter march, and the fixtures' own r_exposure 0.05 was chosen against the inflated result, so retiring the pair alone drops the noon zenith about 7x below a physically consistent sky and needs the unit rebase plus a multiple-scattering term to land right. Set 1.0 here with r_volumetric_density 3.996e-6 for the real medium and expect a darker, more saturated, single-scattering sky.", CVAR_ARCHIVE);
+    PT_CVAR(r_ozone,                 "1.0",      "Multiple of the real stratospheric ozone column, and unlike r_rayleigh / r_volumetric_density this one DOES default to its physical value, because nothing was ever tuned against its absence. 1.0 = the US Standard Atmosphere 1976 profile, fit as a tent peaking at 25 km with a 15 km half-width (Bruneton 2017), with peak absorption (0.650, 1.881, 0.085)e-6 m^-1 at 680/550/440 nm from the Serdyuchenko et al. 2014 / Gorshelev et al. 2014 cross-sections. 0 removes ozone entirely, which is what this engine did before #257 -- set it to 0 and watch a post-sunset zenith turn brown, because ozone's Chappuis band absorbing red-orange along the long twilight slant path is the ONLY reason the blue hour is blue. Ozone absorbs and does not scatter, so it never brightens anything; it only removes the part of the spectrum that would otherwise dominate at grazing sun angles.", CVAR_ARCHIVE);
     PT_CVAR(r_planet_radius,         "6371008.8", "Planet radius in metres for spherical-Earth atmospheric scattering (issue #51). Default 6,371,008.8 m = the IUGG mean Earth radius R_1 = (2a + b)/3 from the WGS-84 ellipsoid (a = 6,378,137, b = 6,356,752.314245). The mean radius is the right constant here: the scattering model treats the atmosphere as concentric SPHERICAL shells, so the sphere that best represents the whole body is what the optical-depth integral wants -- the WGS-84 equatorial radius is a geodetic reference for an ellipsoid, and using it inflates the shell by 7.1 km everywhere off the equator. The path tracer's `atmosphericTransmittance` numerically integrates Mie + Rayleigh optical depth along a chord through a thin shell around a sphere of this radius (centre at world origin + offset so y=0 sits on the surface). Set to 0 to fall back to the legacy planar exponential integral (1/sin(elev) airmass) -- useful as a debug A/B or for tiny-scene tests where curvature is invisible. Real values for other bodies (mean radii): Moon 1,737,400, Mars 3,389,500, Venus 6,051,800. Affects only the atmosphere integral, not collision / shadow geometry.", CVAR_ARCHIVE);
     // Planetary P0 (#254). The sky chain historically hard-coded "up" to
     // world +Y and read the sun's elevation off the single global scalar
@@ -1844,6 +1845,56 @@ namespace cvar {
             "later phase. Independent of r_planet_radius, which sets "
             "the ATMOSPHERE shell radius; this cvar sets whether the "
             "world frame itself is curved.", CVAR_ARCHIVE);
+    PT_CVAR(r_sun_physical_transmittance, "0",
+            "Compute sunlight's colour and brightness from the real "
+            "atmospheric slant path instead of from a tuned curve "
+            "(planetary P3, issue #257). 0 = the historical behaviour, "
+            "bit-for-bit: a grey exp(-0.30 / sin(elevation)) times a "
+            "hand-authored lerp between two invented RGB endpoints -- "
+            "four fabricated constants, and two copies of them that had "
+            "already drifted apart between the surface-NEE site and the "
+            "volumetric march. 1 = integrate the actual optical depth "
+            "from the shading point to the top of the atmosphere through "
+            "Rayleigh, aerosol and ozone, so the reddening at sunset is "
+            "the real column doing it. THIS IS THE ONLY PATH ON WHICH "
+            "OZONE IS VISIBLE: a camera-to-surface ray never climbs "
+            "anywhere near the 25 km ozone layer, so aerial perspective "
+            "cannot see it, while sunlight crosses the layer at a "
+            "grazing angle every twilight -- which is precisely why the "
+            "blue hour is blue. Off by default because switching "
+            "sunlight from a tuned curve to a physical one changes the "
+            "brightness of every lit surface in every scene (measured at "
+            "60 degrees elevation: the physical sun is about 30% brighter "
+            "and differently tinted), so the flip belongs with the "
+            "radiometric unit rebase rather than being smuggled in "
+            "underneath it.", CVAR_ARCHIVE);
+    PT_CVAR(r_planet_ground,         "0",
+            "Render the planet itself as an analytic body (planetary P3, "
+            "issue #257). 0 = off, which is every scene authored before "
+            "this phase -- the ground is the flat infinite plane at y = 0. "
+            "1 = a sphere of radius r_planet_radius centred where the "
+            "atmosphere shell is centred, so a ground camera gets a "
+            "geometrically real curved horizon: the sky ends where the "
+            "body occludes it rather than where a painted gradient says "
+            "it does, and the cloud shell terminates against the same "
+            "horizon. Requires r_planet_spherical_frame 1, since a planar "
+            "frame has no planet centre to put a body at. Note the flat "
+            "ground plane, if the scene has one, sits ABOVE this body "
+            "everywhere except the tangent point and will win every hit; "
+            "author the scene without it to see the body. This is the "
+            "backstop the terrain track (#258) streams chunks in front "
+            "of -- it is deliberately a SPHERE of the IUGG mean radius, "
+            "not the WGS-84 ellipsoid: see the phase notes for why the "
+            "ellipsoid needs the polar-axis orientation that only terrain "
+            "introduces, and its own numerics work.", CVAR_ARCHIVE);
+    PT_CVAR(r_planet_ground_albedo,  "0.18",
+            "Lambertian albedo of the r_planet_ground body. 0.18 is the "
+            "standard mid-grey photographic reference and sits between "
+            "Earth's ocean (~0.06) and its land average (~0.25); the "
+            "planet's Bond albedo of 0.306 (NASA Earth Fact Sheet) is a "
+            "whole-disc figure including clouds, which this body does not "
+            "carry. Clamped to [0, 1]. A real surface map belongs to the "
+            "terrain track (#258), not here.", CVAR_ARCHIVE);
     PT_CVAR(r_moon_size,             "1.0",      "Moon angular-size multiplier. 1.0 = our default 0.55deg half-angle (already 2x the real 0.27deg, for visibility at typical 60-FOV 1080p). 5+ = dramatic 'big moon' shots; 0.5 = real lunar size (very small). Astronomical distance variation (perigee/apogee) is also applied on top -- supermoons render ~14% bigger than micro-moons.", CVAR_ARCHIVE);
     PT_CVAR(r_sun_size,              "1.0",      "Sun angular-size multiplier. 1.0 = real ~0.55deg half-angle. Astronomical Earth-Sun distance (perihelion/aphelion) modulates this ~3.4% across the year. Bump for cinematic shots.", CVAR_ARCHIVE);
     PT_CVAR(r_sun_horizon_flatten,   "1",        "Atmospheric refraction differentially lifts the sun's lower limb more than its upper limb, vertically squishing the disc into an oval as it nears the horizon (Saemundsson 1986). 1 = physical flatten enabled (vertical-scale ~0.78 at elev=0 / ~21% squish, ~0.87 at 1deg, ~0.97 at 5deg, ~0.99 at 10deg); 0 = render a perfect circle regardless of elevation. Horizontal radius is unchanged either way; r_sun_size stacks on top.", CVAR_ARCHIVE);
@@ -8177,6 +8228,17 @@ void Engine::RenderFrame() {
         // world-space positions would just be a bug.
         float planet_center_radius[4];
         // --- end Planetary P0 --------------------------------------------
+        // --- Planetary P3 (#257): the analytic planet body ---------------
+        // .xyz = ground albedo, .w = the body's radius in metres, 0 = off.
+        // Its own lane rather than folded into planet_center_radius,
+        // whose .w is the ATMOSPHERE shell radius and is what every
+        // altitude query is measured against: a scene may legitimately
+        // have air and no ground body (every fixture today does), and
+        // conflating them would make "is the ground on?" and "is the
+        // frame spherical?" the same question. Pure tail append, so the
+        // SoftwareTracer.cpp byte offsets stay valid.
+        float planet_ground[4];
+        // --- end Planetary P3 --------------------------------------------
     } push{};
     // CONVERSION BOUNDARY (#255). The single source for the eye position
     // every shader sees; the nine per-pass memcpy(x.pos_fovtan, ...)
@@ -8917,6 +8979,32 @@ void Engine::RenderFrame() {
         push.planet_center_radius[3] =
             spherical_frame ? static_cast<float>(planet_R_d) : 0.0f;
 
+        // --- Planetary P3 (#257): the analytic planet body --------------
+        // A single sphere of the SAME radius and centre the atmosphere
+        // shell uses. That sharing is the point, not a convenience: the
+        // roadmap's hardest interface (#253 R-D) is that the air and the
+        // ground must agree on one planet centre and radius, or they
+        // disagree about where the horizon is by hundreds of kilometres.
+        // Reading both out of one field makes disagreement unrepresentable
+        // rather than merely discouraged.
+        //
+        // Gated on the spherical frame as well as on its own cvar: with a
+        // planar frame there is no centre to put it at.
+        bool planet_ground_on = false;
+        if (auto* v = C.FindCVar("r_planet_ground")) planet_ground_on = v->GetBool();
+        planet_ground_on = planet_ground_on && spherical_frame;
+        float ground_albedo = 0.18f;
+        if (auto* v = C.FindCVar("r_planet_ground_albedo")) {
+            ground_albedo = v->GetFloat();
+        }
+        ground_albedo = std::clamp(ground_albedo, 0.0f, 1.0f);
+        push.planet_ground[0] = ground_albedo;
+        push.planet_ground[1] = ground_albedo;
+        push.planet_ground[2] = ground_albedo;
+        push.planet_ground[3] =
+            planet_ground_on ? static_cast<float>(planet_R_d) : 0.0f;
+        // --- end Planetary P3 -------------------------------------------
+
         // up_xyz.w carries sin(solar elevation) AT THE CAMERA, i.e.
         // dot(localUp(camera), sun_dir). The screen-space sky passes
         // (HeightFog / GodRays / AuroraComposite) evaluate the sun only
@@ -8958,7 +9046,14 @@ void Engine::RenderFrame() {
         if (sun_bright < 0.0f) sun_bright = 0.0f;
         if (sun_bright > 5.0f) sun_bright = 5.0f;
         push.sun_extra2[0] = sun_bright;
-        push.sun_extra2[1] = 0.0f;
+        // sun_extra2.y: r_sun_physical_transmittance (planetary P3,
+        // #257). Off by default -- see the cvar help for why the flip is
+        // its own change.
+        bool sun_phys_t = false;
+        if (auto* v = C.FindCVar("r_sun_physical_transmittance")) {
+            sun_phys_t = v->GetBool();
+        }
+        push.sun_extra2[1] = sun_phys_t ? 1.0f : 0.0f;
         push.sun_extra2[2] = 0.0f;
         push.sun_extra2[3] = 0.0f;
     }
@@ -9288,14 +9383,36 @@ void Engine::RenderFrame() {
         constexpr std::uint64_t kCloudPeriodFrames = 86400ull * 60ull;
         const float t_seconds = float(frame_index_ % kCloudPeriodFrames)
                               * (1.0f / 60.0f);
-        // CONVERSION BOUNDARY (#255). The cloud slab is a pair of
-        // world-space Y planes and the shader tests them against
-        // render-frame sample positions, so both edges come off the
-        // anchor. The cvars stay in canonical metres -- real meteorology
-        // (cumulus at 200-500 m) is a statement about height above the
-        // ground, not about the renderer's frame. Identity at anchor 0.
-        push.clouds_p1[0] = static_cast<float>(double(base_y) - world_frame_.anchor.y);
-        push.clouds_p1[1] = static_cast<float>(double(top_y)  - world_frame_.anchor.y);
+        // CONVERSION BOUNDARY (#255) / cloud SHELL (#257).
+        //
+        // Planar frame: the cloud layer is a pair of world-space Y planes
+        // and the shader tests them against render-frame sample
+        // positions, so both edges come off the anchor. Identity at
+        // anchor 0.
+        //
+        // Spherical frame: the layer is a shell and the shader tests
+        // ALTITUDE above the surface, which is anchor-invariant by
+        // construction -- the anchor moves the coordinate system, not the
+        // ground. Subtracting it here would put the deck kilometres
+        // underground the moment the camera rebased. So the two frames
+        // want genuinely different numbers in the same lane, and the
+        // shader distinguishes them on the same field it uses for
+        // everything else planetary (planet_center_radius.w > 0).
+        //
+        // The cvars stay in canonical metres either way -- real
+        // meteorology (cumulus at 200-500 m) is a statement about height
+        // above the ground, not about the renderer's frame.
+        const bool clouds_spherical =
+            [&]() {
+                bool sf = false;
+                if (auto* v = C.FindCVar("r_planet_spherical_frame")) sf = v->GetBool();
+                float pr = 0.0f;
+                if (auto* v = C.FindCVar("r_planet_radius")) pr = v->GetFloat();
+                return sf && pr > 0.0f;
+            }();
+        const double cloud_datum = clouds_spherical ? 0.0 : world_frame_.anchor.y;
+        push.clouds_p1[0] = static_cast<float>(double(base_y) - cloud_datum);
+        push.clouds_p1[1] = static_cast<float>(double(top_y)  - cloud_datum);
         push.clouds_p1[2] = clouds_on ? coverage : 0.0f;
         push.clouds_p1[3] = clouds_on ? density  : 0.0f;
         push.clouds_p2[0] = wind_x;
@@ -9318,7 +9435,19 @@ void Engine::RenderFrame() {
         push.clouds_p4[0] = clouds_on ? curl_amt   : 0.0f;
         push.clouds_p4[1] = curl_scale;
         push.clouds_p4[2] = clouds_on ? erosion    : 0.0f;
-        push.clouds_p4[3] = 0.0f;   // reserved
+        // clouds_p4.w carries r_ozone (planetary P3, #257) -- the third
+        // atmospheric species' column multiple. This lane was the
+        // block's only reserved float, which is why ozone landed here
+        // rather than growing PtPush: AuroraCompositePush is already
+        // exactly at the Vulkan push/UBO split offset and every vec4
+        // added to the shared prefix costs all six composite kernels.
+        // Unlike clouds_p4.x/.z this is NOT gated on clouds_on: ozone is
+        // a property of the atmosphere, not of the cloud layer, and
+        // atmosphericTransmittance reads it with r_clouds 0.
+        float ozone_scale = 1.0f;
+        if (auto* v = C.FindCVar("r_ozone")) ozone_scale = v->GetFloat();
+        if (ozone_scale < 0.0f) ozone_scale = 0.0f;
+        push.clouds_p4[3] = ozone_scale;
     }
 
     // --- Water Phase 1 (#134) ----------------------------------------------
@@ -9893,7 +10022,8 @@ void Engine::RenderFrame() {
                   + 16 /* Wave 10 bloom/bokeh: dof_bokeh_params */
                   + 16 /* Sun disc brightness (r_sun_disc_brightness): sun_extra2 */
                   + 160 /* Wave 9 hosek-sky cooked coeffs: hosek_cfg[9] + hosek_radiance */
-                  + 16 /* Planetary P0 (#254): planet_center_radius */);
+                  + 16 /* Planetary P0 (#254): planet_center_radius */
+                  + 16 /* Planetary P3 (#257): planet_ground */);
     // Raw-byte offsets the SOFTWARE tracer mirrors (SoftwareTracer.cpp:
     // kSunAndModeOffset / kAccumParamsOffset / kTonemapParamsOffset).
     // The CPU backend decodes these fields straight out of the pushed
@@ -15920,8 +16050,21 @@ void Engine::RegisterCommands() {
         v->allowed_values = {"0", "1"};
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
+    // The planet body changes what rays hit, so a mid-run toggle must not
+    // blend new samples into a mean taken against the old geometry.
+    for (const char* n : {"r_planet_ground", "r_planet_ground_albedo",
+                          "r_sun_physical_transmittance"}) {
+        if (auto* v = C.FindCVar(n)) {
+            v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
+        }
+    }
+    // r_ozone joins this list for the same reason the others are on it:
+    // it changes the medium the accumulator's existing samples were drawn
+    // through, so blending new samples into old ones would smear two
+    // different atmospheres together (planetary P3, #257).
     for (const char* n : {"r_volumetric_density", "r_volumetric_anisotropy",
-                          "r_volumetric_intensity", "r_volumetric_samples"}) {
+                          "r_volumetric_intensity", "r_volumetric_samples",
+                          "r_ozone"}) {
         if (auto* v = C.FindCVar(n)) {
             v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
         }
@@ -16580,11 +16723,22 @@ void Engine::RegisterCommands() {
     set_slider("r_dof_aperture",        0.0f,   1.0f,  0.001f);
     set_slider("r_dof_focal_distance",  0.0f, 100.0f,  0.1f);
     set_slider("r_dof_blades",          0.0f,  16.0f,  1.0f);
-    set_slider("r_volumetric_density",     0.0f,  0.20f, 0.001f);
+    // Range reworked for #257: the default is now 3.996e-6 (a real
+    // sea-level Mie scattering coefficient), so a 0..0.20 slider with a
+    // 0.001 step could not express it -- every drag would have snapped
+    // the atmosphere to ~250x the clear-sky value. The upper bound is
+    // 5e-3 (fog) and the step 1e-6, which resolves the clear-sky-to-
+    // hazy-day band the cvar actually lives in.
+    set_slider("r_volumetric_density",     0.0f,  5.0e-3f, 1.0e-6f);
     set_slider("r_volumetric_anisotropy", -0.95f, 0.95f, 0.01f);
     set_slider("r_volumetric_intensity",   0.0f,  4.0f,  0.05f);
     set_slider("r_volumetric_samples",     4.0f, 64.0f,  1.0f);
-    set_slider("r_rayleigh",               0.0f, 100.0f,  0.5f);
+    // 0..100 with a 0.5 step existed to reach the old default of 30.
+    // The default is 1.0 (real Earth) since #257; 0..4 at 0.01 keeps the
+    // physical value near the middle of the travel and still allows an
+    // artistic exaggeration.
+    set_slider("r_rayleigh",               0.0f,   4.0f,  0.01f);
+    set_slider("r_ozone",                  0.0f,   4.0f,  0.01f);
     set_slider("r_moon_size",              0.5f,  20.0f,  0.1f);
     set_slider("r_sun_size",               0.5f,  20.0f,  0.1f);
     set_slider("r_moon_disc_brightness",   0.0f,   3.0f,  0.05f);

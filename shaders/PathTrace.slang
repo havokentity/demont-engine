@@ -1216,6 +1216,19 @@ cbuffer Push {
     // SPIR-V Frame block below + Engine.cpp PtPush.
     float4 planet_center_radius;
     // --- end Planetary P0 -----------------------------------------------------
+    // --- Planetary P3 (#257): the analytic planet body ------------------------
+    // .xyz = ground albedo, .w = the body's radius in metres, or 0 when the
+    // body is off. Kept as its own lane rather than folded into
+    // planet_center_radius because that field's .w is the ATMOSPHERE shell's
+    // radius and is what every altitude query in the shader is measured
+    // against -- a scene may legitimately have air and no ground body (every
+    // fixture that exists today does), and conflating the two would make
+    // "is the ground on?" and "is the frame spherical?" the same question.
+    //
+    // 16 B appended at the very tail so every existing field offset is
+    // untouched. Mirrored in the SPIR-V Frame block below + Engine.cpp PtPush.
+    float4 planet_ground;
+    // --- end Planetary P3 -----------------------------------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -1367,6 +1380,9 @@ cbuffer Frame {
     // See `planet_center_radius` in the Metal Push cbuffer above
     // (Planetary P0, #254). Layout-equivalent: one vec4 appended at the tail.
     float4 planet_center_radius;
+    // See `planet_ground` in the Metal Push cbuffer above (Planetary P3,
+    // #257). Layout-equivalent: one more vec4 appended at the tail.
+    float4 planet_ground;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -2494,6 +2510,72 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
     for (uint i = 0u; i < linear_prim_count && i < prim_count; ++i) {
         testAnalyticPrim(i, ro, rd, shutter_t01, t_min, h);
     }
+
+    // --- Planetary P3 (#257): the analytic planet body ------------------
+    // One sphere, at the SAME centre and radius as the atmosphere shell.
+    // That sharing is the roadmap's hardest interface (#253 R-D): if the
+    // air and the ground ever hold separate copies of the planet they
+    // disagree about where the horizon is by hundreds of kilometres.
+    // Reading both out of planet_center_radius / planet_ground.w -- which
+    // the host fills from one radius -- makes the disagreement
+    // unrepresentable rather than merely discouraged.
+    //
+    // Tested here, in the infinite-extent tier, and NOT as a scene
+    // primitive: it has no finite AABB worth building (a 6371 km box
+    // around every leaf would ruin the analytic BVH), it is a singleton
+    // rather than content, and it must never be pickable or editable.
+    //
+    // Off (planet_ground.w == 0) in every scene authored before this
+    // phase, and the branch is uniform across the dispatch, so the cost
+    // on those scenes is one scalar compare.
+    //
+    // WHY A SPHERE AND NOT THE WGS-84 ELLIPSOID. Two reasons, both
+    // load-bearing, and neither of them "we ran out of time":
+    //
+    //   1. The world frame carries no polar-axis orientation. P0 places
+    //      the centre at (0, -R, 0) with the world origin tangent to the
+    //      surface and says nothing about which way the pole points, so
+    //      an oblate body's SHAPE IN WORLD SPACE is not determined by
+    //      anything the renderer currently knows. Picking an axis here
+    //      would be inventing a constant, which is the decision commit
+    //      b2111dd exists to have reversed. P4's cubed-sphere is what
+    //      introduces a real orientation.
+    //   2. A ray-ellipsoid solve done the obvious way -- scale space so
+    //      the body becomes a unit sphere, intersect, scale back --
+    //      reintroduces exactly the cancellation #254 and #275 spent two
+    //      changes removing. After the scaling |o'| is about 1.0000003
+    //      and the quadratic's constant term is |o'|^2 - 1, so float32
+    //      keeps almost none of it. The ellipsoid needs its own
+    //      numerics, and its own mirror test, not a coordinate change.
+    //
+    // The bulge is a - b = 21 385 m, 2.4x Everest, so this is a real
+    // approximation and not a rounding -- but it is invisible to every
+    // camera the current fixtures place, and the mean radius is the
+    // right sphere for a body the atmosphere is already modelling as
+    // spherical shells.
+    if (planet_ground.w > 0.0) {
+        float t_p;
+        if (intersectSphere(ro, rd, planet_center_radius.xyz,
+                            planet_ground.w, t_min, t_p) && t_p < h.t) {
+            h.hit = true;
+            h.t = t_p;
+            // Outward normal. localUp() is the same expression and is
+            // what every other planetary site uses, so the surface
+            // normal and the local vertical cannot drift apart.
+            h.normal = localUp(ro + rd * t_p);
+            h.mat = MAT_LAMBERT;
+            h.albedo = planet_ground.xyz;
+            h.roughness = 1.0;
+            h.ior = 1.0;
+            h.emission = float3(0.0);
+            h.prim_id = 0u;
+            h.uv = float2(0.0, 0.0);
+            h.tex_tiles = uint4(kPbrNoTexTile, kPbrNoTexTile,
+                                kPbrNoTexTile, kPbrNoTexTile);
+            h.uv_scale = 0.0;
+        }
+    }
+    // --- end Planetary P3 -----------------------------------------------
     if (bvh_node_count == 0u) {
         // BVH inactive: linear-scan the rest of the buffer too.
         for (uint i = linear_prim_count; i < prim_count; ++i) {
@@ -4953,6 +5035,47 @@ float smoke_sph_density_add_tinted(float3 pos, out float3 out_tint) {
 }
 // --- end Fluid Phase 3 -----------------------------------------------------
 
+// Ray versus the cloud layer, in whichever frame the scene is in
+// (planetary P3, #257).
+//
+// PLANAR frame (planet_center_radius.w <= 0, every scene authored
+// before this phase): `base` / `top` are world-Y planes and this is the
+// slab intersection that has always been here, expression for
+// expression -- so the planar path is bit-for-bit unchanged.
+//
+// SPHERICAL frame: `base` / `top` are ALTITUDES above the surface and
+// the layer is a shell of radii R+base .. R+top about the planet centre.
+// That is the fix for #51's founding symptom. A slab is a pair of
+// infinite planes, so a perfectly horizontal ray from a ground camera
+// needs infinite horizontal distance to reach a layer above it: clouds
+// stopped at a hard line with a strip of bare sky underneath, and could
+// never touch the horizon. On a shell the same ray leaves through the
+// top of the layer at a finite range, because the ground curves away
+// beneath it, and the layer terminates exactly at the horizon.
+//
+// Returns false when the ray never enters the layer.
+bool cloudLayerInterval(float3 ro, float3 rd, float base, float top,
+                        float t_max, out float t_in, out float t_out) {
+    if (planet_center_radius.w > 0.0) {
+        float R = planet_center_radius.w;
+        return ptRayShell(ro, rd, planet_center_radius.xyz,
+                          R + base, R + top, t_max, t_in, t_out);
+    }
+    float ry = rd.y;
+    if (abs(ry) > 1e-6) {
+        float t_b = (base - ro.y) / ry;
+        float t_t = (top  - ro.y) / ry;
+        t_in  = max(0.0, min(t_b, t_t));
+        t_out = min(max(t_b, t_t), t_max);
+    } else if (ro.y >= base && ro.y <= top) {
+        t_in = 0.0; t_out = t_max;
+    } else {
+        t_in = 1.0; t_out = 0.0;
+        return false;
+    }
+    return t_out > t_in;
+}
+
 // Optical depth through the cloud layer along [ro, ro + rd*t_max].
 // Returns 0 when clouds are off or the ray misses the layer; otherwise
 // integrates cloud_density_at across the ray-slab intersection. Used
@@ -4978,28 +5101,17 @@ float cloud_optical_depth(float3 ro, float3 rd, float t_max) {
         base_y = 0.0;
         top_y  = 2000.0;
     }
-    float ry = rd.y;
     float t_in, t_out;
-    if (abs(ry) > 1e-6) {
-        float t_b = (base_y - ro.y) / ry;
-        float t_t = (top_y  - ro.y) / ry;
-        t_in  = max(0.0, min(t_b, t_t));
-        t_out = max(t_b, t_t);
-    } else {
-        if (ro.y >= base_y && ro.y <= top_y) {
-            t_in  = 0.0;
-            t_out = t_max;
-        } else {
-            return 0.0;
-        }
+    if (!cloudLayerInterval(ro, rd, base_y, top_y, t_max, t_in, t_out)) {
+        return 0.0;
     }
-    t_out = min(t_out, t_max);
     // Cap shadow march distance: a near-horizon ray crossing the cloud
     // layer at very shallow elevation can span hundreds of kilometres,
     // far more than the cloud field's coherence length. 20km is plenty
     // to capture the shadow of any reasonable cloud bank in front of
-    // the sun, and limits the sample budget.
-    if (t_out - t_in > 20000.0) t_out = t_in + 20000.0;  // keep the NEAR window (t_in is the entry nearest the ray origin)
+    // the sun, and limits the sample budget. The NEAR window is kept --
+    // t_in is the entry nearest the ray origin.
+    if (t_out - t_in > 20000.0) t_out = t_in + 20000.0;
     if (t_out <= t_in) return 0.0;
     // 4 coarse samples + 3 fbm octaves for the shadow ray. Beer-Lambert
     // exp(-OD) only needs a rough density estimate to look right.
@@ -5010,7 +5122,7 @@ float cloud_optical_depth(float3 ro, float3 rd, float t_max) {
         float t = t_in + (float(i) + 0.5) * dt;
         float3 sp = ro + rd * t;
         float dens = cloud_density_at(sp, clouds_p1, clouds_p2, clouds_p3,
-                                       clouds_p4, 3);
+                                       clouds_p4, 3, planet_center_radius);
         // Fluid Phase 1 (#136): smoke shows up as additive density on
         // the shadow path so a sun-NEE ray hitting a plume gets the
         // correct Beer-Lambert dimming.
@@ -5072,21 +5184,12 @@ float cloud_optical_depth_stratified(float3 ro, float3 rd, float t_max,
         base_y = 0.0;
         top_y  = 2000.0;
     }
-    float ry = rd.y;
     float t_in, t_out;
-    if (abs(ry) > 1e-6) {
-        float t_b = (base_y - ro.y) / ry;
-        float t_t = (top_y  - ro.y) / ry;
-        t_in  = max(0.0, min(t_b, t_t));
-        t_out = max(t_b, t_t);
-    } else if (ro.y >= base_y && ro.y <= top_y) {
-        t_in  = 0.0;
-        t_out = t_max;
-    } else {
+    if (!cloudLayerInterval(ro, rd, base_y, top_y, t_max, t_in, t_out)) {
         return 0.0;
     }
-    t_out = min(t_out, t_max);
-    if (t_out - t_in > 20000.0) t_out = t_in + 20000.0;  // keep the NEAR window (t_in is the entry nearest the ray origin)
+    // Keep the NEAR window -- t_in is the entry nearest the ray origin.
+    if (t_out - t_in > 20000.0) t_out = t_in + 20000.0;
     if (t_out <= t_in) return 0.0;
     const int Ns = 12;
     float dt = (t_out - t_in) / float(Ns);
@@ -5099,7 +5202,8 @@ float cloud_optical_depth_stratified(float3 ro, float3 rd, float t_max,
         float xi = randf(seed);
         float t  = t_in + (float(i) + xi) * dt;
         float3 sp = ro + rd * t;
-        float dens = cloud_density_at(sp, clouds_p1, clouds_p2, clouds_p3, clouds_p4, 4);
+        float dens = cloud_density_at(sp, clouds_p1, clouds_p2, clouds_p3, clouds_p4, 4,
+                                      planet_center_radius);
         // Fluid Phase 1 (#136): smoke contributions ride the same
         // shadow-ray transmittance so plumes self-shadow at sunset.
         dens += smoke_density_add(sp);
@@ -5111,194 +5215,247 @@ float cloud_optical_depth_stratified(float3 ro, float3 rd, float t_max,
     return od * dscale;
 }
 
-// Analytical atmospheric transmittance (Mie + Rayleigh) along the
-// straight ray segment [ro, ro + rd*t]. Used to give cloud-march
-// samples and (in future) primary-ray surface hits aerial-perspective
-// fade with distance, regardless of sky mode -- the HDRI is the
-// canonical sky source but doesn't model the air mass between the
-// camera and a far cloud, so distant clouds need this attenuation
-// applied on top.
+// Atmospheric transmittance along the straight ray segment
+// [ro, ro + rd*t]. Gives cloud-march samples and primary-ray surface
+// hits their aerial-perspective fade with distance regardless of sky
+// mode -- an HDRI is the canonical sky source but does not model the air
+// mass between the camera and a far cloud.
 //
-// Both Mie and Rayleigh have an exponential altitude profile:
-//     sigma(h) = sigma0 * exp(-h / H_scale)
-// On a straight slanted ray h(s) = ro.y + rd.y * s, so the optical
-// depth ∫[0,t] sigma(h(s)) ds is closed-form:
-//     rd.y != 0:  H/rd.y * (exp(-ro.y/H) - exp(-(ro.y + rd.y*t)/H))
-//     rd.y == 0:  t * exp(-ro.y/H)   (horizontal ray at constant alt)
-// Multiplied by sigma0 for each species.  Returns the per-channel
-// transmittance exp(-tau).
+// THREE species since planetary P3 (#257), not two:
 //
-// vol_params.x is the user-controlled Mie sigma at sea level; if it's
-// 0 the user has disabled Mie haze and we return Rayleigh-only.
-// clouds_p3.w is the Rayleigh intensity multiplier (0 = no Rayleigh,
-// 1 = real-Earth sigma).  Both gates honoured so a debug "no
-// atmosphere" mode still works.
+//   Rayleigh   molecular scattering, exponential in altitude, H = 8 km.
+//              Wavelength^-4, so blue scatters ~5.7x more than red --
+//              this is why the sky is blue and why a long slant path
+//              turns the sun red.
+//   Mie        aerosol, exponential, H = 1.2 km, near-grey. Scattering
+//              AND absorption: the engine modelled no aerosol
+//              absorption at all before #257, which made haze a pure
+//              scatterer and so too bright at every optical depth.
+//   Ozone      absorption only, and a stratospheric TENT peaking at
+//              25 km, not an exponential. Completely absent before
+//              #257. Its Chappuis band absorbs red-orange, so on the
+//              long twilight slant path it removes exactly the part of
+//              the spectrum that would otherwise make a post-sunset
+//              zenith brown, and leaves it blue. That single term is
+//              the cheapest real-physics win in the whole atmosphere
+//              chain, and its omission was the largest error in it.
 //
-// Spherical-Earth path (issue #51): when sun_extra.w > 0 we treat the
-// atmosphere as a thin exponentially-decaying shell around a sphere of
-// radius `R = sun_extra.w`. The centre comes from planet_center_radius
-// when the spherical world frame is active (#254) and otherwise defaults
-// to (0, -R, 0), so the path-tracer's flat y=0 ground plane sits tangent
-// to the planet at the world origin -- the two coincide by construction.
-// Altitude at parameter t along the ray is then
-//     h(t) = length(C - (ro + rd*t)) - R
-// where C is that centre. For real-Earth R = 6.371e6 m (the IUGG mean
-// radius, r_planet_radius's default) and the cloud /
-// scattering scale heights (~1.5 km Mie, ~8 km Rayleigh) the spherical
-// chord differs from the flat ro.y + rd.y*t by hundreds of metres at
-// horizon ranges, which is the entire point of #51 -- horizontal rays
-// at sea level travel through ~38 air masses spherical vs. infinite
-// planar, and rays at altitude curve up below the horizon.
+// The medium itself -- every coefficient, every scale height, every
+// citation -- lives in PathTraceMath.slang's PtAtmoBody / ptAtmoEarth,
+// parameterised by body. Nothing about Earth is spelled out in this
+// file any more. That is deliberate and is the one structural decision
+// in #257 whose cost multiplies if deferred: a second body is a second
+// constructor rather than a search-and-replace across the four files
+// that used to carry copies of the Rayleigh scale height.
 //
-// Integration: 8-step composite Simpson's rule on the natural ray
-// parameter, computing per-channel optical depth tau_total =
-// integral_0^t (sigma_mie(h) + sigma_ray(h)) ds. Simpson's is exact
-// for cubic polynomials; the integrand (exp(-h/H) with h quadratic in
-// s on near-horizon rays) is well-approximated to ~0.1% error at 8
-// steps over typical 1-100 km ray lengths.
+// User scales, all real quantities with no compensating partner (that
+// pairing is exactly what #257 retires):
+//   vol_params.x  r_volumetric_density -- ABSOLUTE sea-level Mie
+//                 scattering coefficient, m^-1.
+//   clouds_p3.w   r_rayleigh -- multiple of the real Rayleigh column,
+//                 1.0 = real Earth.
+//   clouds_p4.w   r_ozone -- multiple of the real ozone column,
+//                 1.0 = the US Standard Atmosphere 1976 column.
+// All three at zero is a vacuum and is early-outed.
 //
-// Cost (N=8): 17 sqrt() (1 initial boundary + 8 midpoints + 8 right
-// boundaries; left boundaries are cached from the previous iteration's
-// right boundary), 17 scalar exp() for Mie when enabled (likewise
-// cached -- 1 + 8 + 8) and 17 vector exp() for Rayleigh when enabled
-// (same cache). The previous planar path was 6 exp() + 8 muls per
-// channel; this spherical path is ~3x more expensive on both exp and
-// sqrt but the exp() arguments are altitude/scale-height (already
-// small magnitudes), so register pressure and divergence are similar
-// in practice. Boundary caching (h_prev / sm_prev / sr_prev) halves
-// the exp() count vs. the naive 3-exp-per-iteration formulation.
+// GEOMETRY. When sun_extra.w > 0 the air is a shell around a sphere of
+// that radius; the centre comes from planet_center_radius when the
+// spherical world frame is active (#254) and otherwise defaults to
+// (0, -R, 0), so the path tracer's flat y = 0 ground plane sits tangent
+// to the body at the world origin -- the two coincide by construction.
+// Altitude along the ray is the hoisted cancellation-free quadratic
+// (#271), never a materialised position: at planetary radius the naive
+// form carries ~0.5 m of noise into exp(-h/1200), which is 0.04% of the
+// Mie scale height on every sample.
 //
-// PRECONDITION: `rd` must be unit-length. The integrand `dt = t / N`
-// is treated as a step in metres along the ray when computing
-// altitudes via `p = ro + rd*s`, so a non-normalized direction would
-// corrupt BOTH the per-sample altitude AND the integration measure.
-// All three current call sites (PathTrace.slang:2595, 2832 and the
-// cloud-shadow march -- all pass primary_rd which is normalized at
-// generation in genPrimaryRay) satisfy this. The function does NOT
-// renormalize defensively; future callers that pass an inverse-
-// reciprocal-scaled or world-space-difference vector MUST normalize
-// first.
+// The horizontal ray at sea level is the case that makes the shell
+// worth its cost: spherical geometry gives it ~38 air masses, planar
+// geometry gives it infinity.
 //
-// Planet centre offset assumption (planar frame): world y=0 is the
-// ground plane, i.e. planetAltitude(p) == p.y.
-// Cameras at y=1.7 sit ~1.7 m above the surface; cameras at y=10000
-// sit 10 km above. This matches the engine's existing convention (the
-// path-tracer's flat ground plane lives at y=0; volumetric cloud_p1.x
-// uses y as altitude). We do not require ro.y to be non-negative --
-// the integral handles below-surface ro gracefully (clamps h to 0 so
-// the optical depth doesn't go negative).
+// INTEGRATION. 8-step composite Simpson on the ray parameter, one rule
+// for both geometries. Simpson is exact for cubics and both exponential
+// species are smooth in a quadratic-in-s altitude, so 8 steps hold
+// ~0.1%; ozone's tent has two corners Simpson cannot see and so carries
+// a larger relative error, bounded and discussed at ptAtmoOpticalDepth.
+//
+// PRECONDITION: `rd` must be unit length. `dt = t / N` is treated as a
+// step in metres, so a non-normalised direction corrupts BOTH the
+// per-sample altitude and the integration measure. Every current call
+// site passes a normalised direction. The function does NOT renormalise
+// defensively; a future caller passing a world-space difference vector
+// MUST normalise first.
+//
+// Below-surface origins are handled: altitudes clamp to 0 so the
+// optical depth cannot go negative.
+// The body this scene's air belongs to, with the engine's per-species
+// user scales applied (planetary P3, #257). Earth's constants and their
+// citations live in PathTraceMath.slang's ptAtmoEarth; nothing about
+// Earth is spelled out here any more, which is the point -- the four
+// hardcoded copies of the Rayleigh scale height and the two of the
+// sigma triple are gone, and a second body is a second constructor
+// rather than a search-and-replace across four files.
+//
+//   vol_params.x  r_volumetric_density -- ABSOLUTE sea-level Mie
+//                 scattering coefficient in m^-1.
+//   clouds_p3.w   r_rayleigh  -- multiple of the real Rayleigh column.
+//   clouds_p4.w   r_ozone     -- multiple of the real ozone column.
+PtAtmoBody atmosphereBody() {
+    float planet_R = sun_extra.w;
+    // The planar A/B (r_planet_radius 0) still needs a medium; only its
+    // ALTITUDE function differs. Feed the constructor the real mean
+    // radius there so the two halves of the A/B differ in exactly one
+    // thing -- how h(s) is computed -- and not in what the air is made
+    // of, which is what makes the pair a controlled comparison.
+    float R = (planet_R > 0.0) ? planet_R : 6371008.8;
+    return ptAtmoScale(ptAtmoEarth(R), clouds_p3.w, vol_params.x,
+                       clouds_p4.w);
+}
+
 float3 atmosphericTransmittance(float3 ro, float3 rd, float t) {
     if (t <= 0.0) return float3(1.0);
-    const float kHmie      = 1500.0;
-    const float kHrayleigh = 8000.0;
-    const float3 kSigmaR   = float3(5.8e-6, 13.5e-6, 33.1e-6);
-    float  sigma_mie0 = vol_params.x;
-    float  rayleigh_i = clouds_p3.w;
-    bool   any_mie    = sigma_mie0 > 0.0;
-    bool   any_ray    = rayleigh_i > 0.0;
-    if (!any_mie && !any_ray) return float3(1.0);
+    PtAtmoBody body = atmosphereBody();
+    // "No atmosphere" debug states stay reachable: all three scales at
+    // zero means vacuum, and the early-out keeps that free rather than
+    // integrating a zero.
+    bool any_medium = (vol_params.x > 0.0) || (clouds_p3.w > 0.0)
+                   || (clouds_p4.w > 0.0);
+    if (!any_medium) return float3(1.0);
 
     float planet_R = sun_extra.w;
     if (planet_R <= 0.0) {
-        // ---- Legacy planar path (sun_extra.w == 0) -----------------
-        // Vertical path-length factor (analytical altitude integral).
-        // Kept for r_planet_radius=0 debug A/B and for tiny-scene tests
-        // where curvature is invisible.
-        float gv_mie, gv_ray;
-        if (abs(rd.y) > 1e-6) {
-            float a_m = exp(-ro.y / kHmie);
-            float b_m = exp(-(ro.y + rd.y * t) / kHmie);
-            gv_mie = (a_m - b_m) * (kHmie / rd.y);
-            float a_r = exp(-ro.y / kHrayleigh);
-            float b_r = exp(-(ro.y + rd.y * t) / kHrayleigh);
-            gv_ray = (a_r - b_r) * (kHrayleigh / rd.y);
-        } else {
-            gv_mie = t * exp(-max(ro.y, 0.0) / kHmie);
-            gv_ray = t * exp(-max(ro.y, 0.0) / kHrayleigh);
+        // ---- Legacy planar path (r_planet_radius 0) ------------------
+        // Kept as the A/B against the spherical shell, and for tiny-scene
+        // tests where curvature is invisible.
+        //
+        // This used to be an ANALYTIC exponential integral, which was
+        // possible because the medium was two exponentials. It is not
+        // possible now: ozone is a tent, not an exponential, so no
+        // closed form covers all three species. Rather than integrate
+        // two species analytically and bolt the third on numerically --
+        // which would make the planar and spherical halves of the A/B
+        // differ in their QUADRATURE as well as in their geometry, and
+        // so stop being a controlled comparison -- both halves now run
+        // the same composite Simpson rule over the same medium, and
+        // differ in exactly one line: how h(s) is computed.
+        const int N = 8;
+        float dt = t / float(N);
+        float oneSixth = 1.0 / 6.0;
+        float3 tau = float3(0.0);
+        float3 sr_l, sm_l, st_prev;
+        ptAtmoCoefficients(body, max(ro.y, 0.0), sr_l, sm_l, st_prev);
+        for (int i = 0; i < N; ++i) {
+            float s_mid   = (float(i) + 0.5) * dt;
+            float s_right = (float(i) + 1.0) * dt;
+            float3 sr_m, sm_m, st_mid;
+            float3 sr_r, sm_r, st_right;
+            ptAtmoCoefficients(body, max(ro.y + rd.y * s_mid,   0.0),
+                               sr_m, sm_m, st_mid);
+            ptAtmoCoefficients(body, max(ro.y + rd.y * s_right, 0.0),
+                               sr_r, sm_r, st_right);
+            tau += dt * oneSixth * (st_prev + 4.0 * st_mid + st_right);
+            st_prev = st_right;
         }
-        float  tau_mie = any_mie ? sigma_mie0 * gv_mie : 0.0;
-        float3 tau_ray = any_ray ? kSigmaR * rayleigh_i * gv_ray : float3(0.0);
-        return exp(-(tau_ray + float3(tau_mie)));
+        return exp(-tau);
     }
 
-    // ---- Spherical-Earth path (issue #51) --------------------------
-    // Shell centre (planetary P0, #254). The planar world frame has no
-    // planet centre, so the shell integral keeps #51's convention: put
-    // it at (0, -R, 0), which makes the engine's y = 0 ground plane
-    // tangent to the sphere at the world origin. The spherical frame
-    // pushes the real centre, and the engine places it at exactly that
-    // same point, so the two agree by construction -- but reading it
-    // from the push means this integral and localUp() can never drift
-    // into different frames. `p.y - pc.y` with pc.y = -R is `p.y + R`
-    // bit-for-bit (IEEE negation is exact), and `p.x - 0` is `p.x`, so
-    // the planar path is numerically identical to the pre-#254 form.
+    // ---- Spherical shell (issue #51, three species since #257) -------
+    // Shell centre. The planar world frame has no planet centre, so the
+    // integral keeps #51's convention: put it at (0, -R, 0), which makes
+    // the engine's y = 0 ground plane tangent to the sphere at the world
+    // origin. The spherical frame pushes the real centre and the engine
+    // places it at exactly that same point, so the two agree by
+    // construction -- but reading it from the push means this integral
+    // and localUp() can never drift into different frames. `p.y - pc.y`
+    // with pc.y = -R is `p.y + R` bit-for-bit (IEEE negation is exact),
+    // and `p.x - 0` is `p.x`.
     float3 pc = (planet_center_radius.w > 0.0) ? planet_center_radius.xyz
                                                : float3(0.0, -planet_R, 0.0);
-    // Composite Simpson's rule with 8 subintervals (9 sample points).
-    // Per-point altitude used to be sqrt(|p - pc|^2) - R evaluated fresh
-    // at each sample, which is the naive form and carried ~0.5 m of noise
-    // into a scale-height exponential (issue #271). It is now hoisted:
-    // for a unit rd the power of the point is a quadratic in s,
-    //     |p(s) - pc|^2 - R^2 = k0 + 2*s*b0 + s^2,
-    // so ptRayAltitudeBegin accumulates k0 and b0 exactly once per call
-    // and each sample costs two fma plus the cancellation-free divide --
-    // no more per-step work than the length() it replaces, and it never
-    // materialises p(s), whose float32 resolution is what caps the naive
-    // form. Measured over a +/-90 deg elevation sweep on 300 km rays,
-    // altitudes clipped to the 0-20 km band this integral cares about:
-    // 0.87 m worst case before, 7.1e-3 m after. The derivation and the
-    // frame-dependence argument live above ptRayAltitudeBegin.
-    //
-    // PRECONDITION (unchanged, now load-bearing twice over): `rd` is unit
-    // length -- it is the s^2 coefficient of the quadratic as well as the
-    // integration measure.
-    const int N = 8;
-    float dt = t / float(N);
-    float oneSixth = 1.0 / 6.0;
-    float tau_mie_total = 0.0;
-    float3 tau_ray_total = float3(0.0);
+    return exp(-ptAtmoOpticalDepth(body, ro, rd, pc, t, 8));
+}
 
-    // Sample altitudes at the 9 grid points + the 8 midpoints. Combine
-    // via Simpson: integral ≈ dt/6 * sum_i (f_left + 4*f_mid + f_right).
-    // Compute sigma_mie + sigma_ray inline per sample so we only loop
-    // once over the parameter range. We cache the per-channel sigma at
-    // each right boundary so the next iteration's left-boundary sigma
-    // is a lookup instead of a fresh exp() -- halves the exp() count
-    // across the 8 subintervals (see cost note in the header comment).
-    PtRayAltitude ray_alt = ptRayAltitudeBegin(ro, rd, pc, planet_R);
-    float h_prev;
-    float  sm_prev = 0.0;
-    float3 sr_prev = float3(0.0);
-    {
-        // s = 0 boundary: seed h_prev and the cached sigma values so
-        // iteration 0 can reuse them as its left boundary instead of
-        // recomputing the s=0 exp() inside the loop.
-        h_prev = max(ptRayAltitudeAt(ray_alt, 0.0), 0.0);
-        if (any_mie) sm_prev = sigma_mie0           * exp(-h_prev / kHmie);
-        if (any_ray) sr_prev = kSigmaR * rayleigh_i * exp(-h_prev / kHrayleigh);
+// Transmittance of the atmosphere along the SUN ray from `p` -- the
+// colour and brightness sunlight actually has by the time it arrives
+// (planetary P3, #257).
+//
+// WHAT THIS REPLACES. The engine reddens sunlight with
+//     am    = 1 / max(sin(elev), 0.04)
+//     trans = exp(-0.30 * am)
+//     col   = lerp((1.00, 0.97, 0.92), (1.55, 0.55, 0.20),
+//                  saturate((am - 1) * 0.18))
+// -- a grey exponential in a thin-slab airmass, times a hand-authored
+// lerp between two invented RGB endpoints. Four fabricated constants
+// standing in for a quantity the engine can now compute: the real
+// slant-path optical depth through Rayleigh, aerosol AND ozone. This is
+// the single largest remaining unsourced constant in the sky chain, and
+// it is also the ONLY path on which ozone is visible in a rendered
+// frame -- a camera-to-surface ray never climbs anywhere near 25 km, so
+// the aerial-perspective integral cannot see the layer, while the
+// SUNLIGHT crosses it at a grazing angle every twilight.
+//
+// OFF BY DEFAULT (sun_extra2.y). Switching sunlight from a tuned curve
+// to a physical one changes the brightness of every lit surface in
+// every scene -- measured at noon, the physical sun is about 30%
+// brighter and differently tinted than exp(-0.30*am) -- so it is a
+// deliberate opt-in exactly like r_planet_spherical_frame, and the
+// default flip belongs with the radiometric unit rebase that the rest
+// of #257's parallel-golden machinery is for. What lands here is the
+// capability and its proof, not the flip.
+//
+// GEOMETRY. Clip the ray to the top of the shell and integrate. A sun
+// below the local horizon is occluded by the body itself and returns
+// zero -- which is the physically correct statement of "night" and
+// needs no elevation threshold. In the planar A/B (r_planet_radius 0)
+// there is no body to occlude and no shell to clip to, so the path
+// length is the slant column of a 100 km slab, 1/sin(elev), which
+// diverges at the horizon: that divergence IS the planar model's
+// defect and the A/B exists to show it.
+float3 sunSlantTransmittance(float3 p, float3 sun_dir) {
+    PtAtmoBody body = atmosphereBody();
+    float planet_R = sun_extra.w;
+    if (planet_R <= 0.0) {
+        float sy = max(sun_dir.y, 1e-3);
+        float t = (100000.0 - p.y) / sy;
+        if (!(t > 0.0)) return float3(1.0);
+        return atmosphericTransmittance(p, sun_dir, t);
     }
-    for (int i = 0; i < N; ++i) {
-        float s_mid   = (float(i) + 0.5) * dt;
-        float s_right = (float(i) + 1.0) * dt;
-        float h_mid   = max(ptRayAltitudeAt(ray_alt, s_mid),   0.0);
-        float h_right = max(ptRayAltitudeAt(ray_alt, s_right), 0.0);
-        if (any_mie) {
-            float sm_l = sm_prev;
-            float sm_m = sigma_mie0 * exp(-h_mid   / kHmie);
-            float sm_r = sigma_mie0 * exp(-h_right / kHmie);
-            tau_mie_total += dt * oneSixth * (sm_l + 4.0 * sm_m + sm_r);
-            sm_prev = sm_r;
-        }
-        if (any_ray) {
-            float3 sr_l = sr_prev;
-            float3 sr_m = kSigmaR * rayleigh_i * exp(-h_mid   / kHrayleigh);
-            float3 sr_r = kSigmaR * rayleigh_i * exp(-h_right / kHrayleigh);
-            tau_ray_total += dt * oneSixth * (sr_l + 4.0 * sr_m + sr_r);
-            sr_prev = sr_r;
-        }
-        h_prev = h_right;
+    float3 pc = (planet_center_radius.w > 0.0) ? planet_center_radius.xyz
+                                               : float3(0.0, -planet_R, 0.0);
+    // Occluded by the body: the ray leaves p, descends, and re-enters
+    // the surface before it can reach space.
+    float g0, g1;
+    if (ptSphereRoots(p, sun_dir, pc, planet_R, g0, g1) && g0 > 0.0) {
+        return float3(0.0);
     }
-    return exp(-(tau_ray_total + float3(tau_mie_total)));
+    float s0, s1;
+    if (!ptSphereRoots(p, sun_dir, pc, body.top_radius, s0, s1)) {
+        return float3(1.0);          // already outside the shell
+    }
+    float t = max(s1, 0.0);
+    if (!(t > 0.0)) return float3(1.0);
+    return exp(-ptAtmoOpticalDepth(body, p, sun_dir, pc, t, 8));
+}
+
+// Sun radiance arriving at `p`, in the engine's tonemap-relative units
+// where 80 is the unattenuated solar constant (the value tuned so a noon
+// sun on a Lambert white wall reads ~1.0). `sun_elev` is sin(elevation)
+// at p, used only by the legacy curve.
+//
+// The two branches are the SAME quantity computed two ways, so every
+// site that needs sunlight can call this and none of them can drift.
+// Before #257 the expression was copied at four sites with three
+// slightly different tunings between them.
+float3 sunRadianceAt(float3 p, float3 sun_dir, float sun_elev) {
+    if (sun_extra2.y > 0.0) {
+        return float3(80.0) * sunSlantTransmittance(p, sun_dir);
+    }
+    float am  = 1.0 / max(sun_elev, 0.04);
+    float tau = 0.30;             // tunable haze
+    float trans_atm = exp(-tau * am);
+    float warmth = saturate((am - 1.0) * 0.18);
+    float3 sun_col = lerp(float3(1.00, 0.97, 0.92),
+                          float3(1.55, 0.55, 0.20),
+                          warmth);
+    return sun_col * (80.0 * trans_atm);
 }
 
 // Up to kMaxRefract dielectric bounces; beyond that the ray gives up
@@ -6894,23 +7051,14 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     // Every expression here is byte-identical to the
                     // pre-fix code; only the scope changed, so the
                     // `radiance +=` below is bit-for-bit unchanged.
-                    float am  = 1.0 / max(sun_elev, 0.04);
-                    float tau = 0.30;             // tunable haze
-                    float trans_atm = exp(-tau * am);
-                    // Wavelength-dependent attenuation: blue
-                    // scatters more, so colour reddens with air
-                    // mass. Wavelength weights mimic Rayleigh
-                    // (~1/lambda^4) without doing a full spectral
-                    // walk -- enough to read as "warm at sunset".
-                    float warmth = saturate((am - 1.0) * 0.18);
-                    float3 sun_col = lerp(float3(1.00, 0.97, 0.92),
-                                          float3(1.55, 0.55, 0.20),
-                                          warmth);
-                    // I0 in tonemap-relative units. 80 is tuned so
-                    // a noon sun on a Lambert white wall reads
-                    // ~1.0 after exposure*ACES at typical exposure.
-                    float strength = 80.0 * trans_atm;
-                    float3 sun_rad = sun_col * strength;
+                    // Sunlight arriving at the hit point. With
+                    // r_sun_physical_transmittance off (the default)
+                    // this is byte-identical to the pre-#257 tuned
+                    // curve; with it on, the reddening comes from the
+                    // real slant-path optical depth through Rayleigh,
+                    // aerosol and ozone instead of from four
+                    // hand-authored constants. See sunRadianceAt.
+                    float3 sun_rad = sunRadianceAt(hit_pt, sun_dir, sun_elev);
                     float3 brdf    = h.albedo / 3.14159265358979;
                     if (n_dot_l > 0.0 && any(trans > float3(0.0))) {
                         // Multiply by per-channel transmittance through
@@ -7359,12 +7507,26 @@ void main(uint2 tid : SV_DispatchThreadID) {
             float  sun_am  = 0.0;
             if (sun_elev > 0.0) {
                 sun_am = 1.0 / max(sun_elev, 0.04);
-                float tau = 0.30;
-                float t_atm = exp(-tau * sun_am);
-                float warmth = saturate((sun_am - 1.0) * 0.30);
-                sun_rad = lerp(float3(1.00, 0.97, 0.92),
-                               float3(1.55, 0.40, 0.12), warmth)
-                        * (80.0 * t_atm);
+                if (sun_extra2.y > 0.0) {
+                    // Physical: the same slant-path integral the NEE
+                    // site uses, so the light the clouds are lit by and
+                    // the light the ground is lit by cannot disagree.
+                    sun_rad = float3(80.0)
+                            * sunSlantTransmittance(primary_ro, sun_dir);
+                } else {
+                    // Legacy tuned curve, byte-identical to pre-#257.
+                    // Note it uses 0.30 for the warmth ramp where the
+                    // NEE site uses 0.18 and a different warm endpoint:
+                    // two copies of one physical quantity that had
+                    // already drifted apart, which is its own argument
+                    // for computing it instead of authoring it.
+                    float tau = 0.30;
+                    float t_atm = exp(-tau * sun_am);
+                    float warmth = saturate((sun_am - 1.0) * 0.30);
+                    sun_rad = lerp(float3(1.00, 0.97, 0.92),
+                                   float3(1.55, 0.40, 0.12), warmth)
+                            * (80.0 * t_atm);
+                }
             }
             // HG in-scatter cosine: incident light propagates as -sun_dir
             // (sun_dir points toward the sun), outgoing toward camera is
@@ -7397,10 +7559,13 @@ void main(uint2 tid : SV_DispatchThreadID) {
             // Bounded at 60km because Rayleigh's 8km scale height means
             // most of its contribution lives in the bottom ~25km, and
             // 60km is plenty of headroom while keeping dt manageable.
-            const float3 kSigmaR = float3(5.8e-6, 13.5e-6, 33.1e-6);
-            const float kHmie = 1500.0;
-            const float kHrayleigh = 8000.0;
-            const float kPi = 3.14159265358979;
+            // Planetary P3 (#257): the medium comes from the body, not
+            // from literals. This block used to carry its own copy of
+            // the Rayleigh sigma triple and BOTH scale heights, so the
+            // in-scatter march and atmosphericTransmittance could --
+            // and did -- disagree about what the air was made of the
+            // moment one was edited. One constructor now feeds both.
+            PtAtmoBody atm_body = atmosphereBody();
             float rayleigh_int = clouds_p3.w;   // 0 disables, 1 = real
             // Atmospheric in-scatter march (Mie + Rayleigh). Runs in
             // procedural and gradient sky modes -- the engine sun is
@@ -7417,7 +7582,6 @@ void main(uint2 tid : SV_DispatchThreadID) {
             bool march_mie = (vol_params.x > 0.0) && (env_map_present == 0u);
             bool march_ray = (rayleigh_int > 0.0) && (env_map_present == 0u);
             if (march_mie || march_ray) {
-                float  sigma_0 = vol_params.x;
                 float  t_far   = min(primary_t, 60000.0);
                 float  dt      = t_far / float(N);
                 // Stratified jitter IN [0, 1) of a cell -- combined with
@@ -7432,7 +7596,10 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 float3 trans_eye = float3(1.0);
                 float3 v_color = float3(0.0);
                 float phase_mie_v = phase;   // HG, computed earlier
-                float phase_ray_v = (3.0 / (16.0 * kPi)) * (1.0 + cos_theta * cos_theta);
+                // Identical math to the (3/(16 pi))(1 + mu^2) literal this
+                // replaces; routed through the shared helper so the sky
+                // modes and the haze march cannot drift apart.
+                float phase_ray_v = ptPhaseRayleigh(cos_theta);
                 // Issue #256: a march sample sits in open air, so its only
                 // scale is the primary cone -- exactly the footprint the
                 // pixel is integrating over at that distance.
@@ -7445,12 +7612,47 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     // Per-point altitude above the surface (#254). Planar
                     // frame -> sp.y bit-for-bit.
                     float h = max(planetAltitude(sp), 0.0);
-                    float  sigma_mie = march_mie ? sigma_0 * exp(-h / kHmie) : 0.0;
-                    float3 sigma_ray = march_ray
-                        ? kSigmaR * rayleigh_int * exp(-h / kHrayleigh)
-                        : float3(0.0);
-                    float3 sigma_total = sigma_ray + float3(sigma_mie);
-                    if (sun_elev > 0.0) {
+                    // Three species (#257). sigma_s_* are what SCATTERS
+                    // into the eye; sigma_t is what ATTENUATES along it,
+                    // and the two are no longer the same quantity -- Mie
+                    // absorption and ozone are extinction with no
+                    // scattering partner. Before this the march used
+                    // scattering as extinction, so the haze column
+                    // transmitted more light than it physically could.
+                    float3 sigma_s_ray, sigma_s_mie3, sigma_total;
+                    ptAtmoCoefficients(atm_body, h,
+                                       sigma_s_ray, sigma_s_mie3,
+                                       sigma_total);
+                    float  sigma_mie = march_mie ? sigma_s_mie3.g : 0.0;
+                    float3 sigma_ray = march_ray ? sigma_s_ray : float3(0.0);
+                    // Sunlight AT THIS SAMPLE.
+                    //
+                    // The legacy path uses the hoisted camera-elevation
+                    // value and gates the whole march on the sun being up
+                    // at the CAMERA. That is why twilight has no
+                    // in-scatter at all today: at -4 degrees the gate is
+                    // false and the march contributes nothing, however
+                    // much sunlit air is overhead.
+                    //
+                    // The physical path evaluates the slant-path
+                    // transmittance at the sample, and needs no elevation
+                    // gate -- a sample whose sun ray runs into the body
+                    // gets exactly zero, which is what "in shadow" means.
+                    // That per-sample geometry IS twilight: the observer
+                    // is inside the planet's shadow while the air 20 km
+                    // above is still lit. It is also the only arrangement
+                    // in which ozone can colour anything, because it is
+                    // the only one where the light reaching the eye has
+                    // crossed the layer.
+                    float3 sun_at_sample;
+                    if (sun_extra2.y > 0.0) {
+                        sun_at_sample = float3(80.0)
+                                      * sunSlantTransmittance(sp, sun_dir);
+                    } else {
+                        sun_at_sample = (sun_elev > 0.0) ? sun_rad
+                                                         : float3(0.0);
+                    }
+                    if (any(sun_at_sample > float3(0.0))) {
                         float3 sun_jit = sampleSunDisc(sun_dir, seed);
                         float3 trans_sun = transmittance(sp, sun_jit, 1e30,
                                                          shutter_t01, cone_v);
@@ -7458,7 +7660,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                             float3 in_scatter =
                                   float3(sigma_mie) * phase_mie_v
                                 + sigma_ray         * phase_ray_v;
-                            v_color += sun_rad * trans_sun * in_scatter
+                            v_color += sun_at_sample * trans_sun * in_scatter
                                      * dt * trans_eye;
                         }
                     }
@@ -7568,19 +7770,12 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     // top; just lower the floor so the march spans both.
                     base_y = min(base_y, 0.0);
                 }
-                float ry = primary_rd.y;
                 float t_in, t_out;
-                if (abs(ry) > 1e-6) {
-                    float t_b = (base_y - primary_ro.y) / ry;
-                    float t_t = (top_y  - primary_ro.y) / ry;
-                    t_in  = max(0.0, min(t_b, t_t));
-                    t_out = max(t_b, t_t);
-                } else if (primary_ro.y >= base_y && primary_ro.y <= top_y) {
-                    t_in = 0.0; t_out = primary_t;
-                } else {
+                if (!cloudLayerInterval(primary_ro, primary_rd,
+                                        base_y, top_y, primary_t,
+                                        t_in, t_out)) {
                     t_in = 1.0; t_out = 0.0;   // miss
                 }
-                t_out = min(t_out, primary_t);
                 // Cap the cloud march span at 30km. For low-elevation
                 // rays the layer can span hundreds of km; uniform
                 // sampling that range produces samples spaced wider
@@ -7593,7 +7788,23 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 // the marched span. The old t_in = t_out - 30000 kept the
                 // farthest 30 km and silently dropped the near field (its
                 // own comment says it marches "the closer 30km").
-                if (t_out - t_in > 30000.0) t_out = t_in + 30000.0;
+                //
+                // PLANAR FRAME ONLY (planetary P3, #257). On a shell the
+                // cap would defeat the whole point of the shell: a
+                // ground camera's horizon-grazing chord through a
+                // 200-500 m layer is 50-80 km long, so truncating at
+                // 30 km ends the cloud deck in mid-air well before the
+                // horizon -- reintroducing #51's founding symptom by a
+                // different route. The shell interval is already finite
+                // and already terminates at the horizon, so the cap has
+                // nothing left to protect against; the sample budget is
+                // held instead by the transmittance early-out further
+                // down (`if (trans_eye_c < 0.003) break;`), which is
+                // what a march wants anyway and is altitude-agnostic.
+                if (planet_center_radius.w <= 0.0
+                    && t_out - t_in > 30000.0) {
+                    t_out = t_in + 30000.0;
+                }
                 if (t_out > t_in) {
                     // Wave-6: when smoke is active (especially smoke-only
                     // scenes where the cloud field is off), the per-pixel
@@ -7709,7 +7920,9 @@ void main(uint2 tid : SV_DispatchThreadID) {
                             ? 0.0
                             : cloud_density_at(sp, clouds_p1,
                                                clouds_p2, clouds_p3,
-                                               clouds_p4, 6) * vol_density_scale;
+                                               clouds_p4, 6,
+                                               planet_center_radius)
+                              * vol_density_scale;
                         // Fluid Phase 1 (#136): add density-injection
                         // smoke contributions on top of the procedural
                         // cloud field. Smoke shares the cloud march's
@@ -7881,7 +8094,11 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                 // Per-point altitude above the surface
                                 // (#254). Planar frame -> sp.y bit-for-bit.
                                 float h_alt   = max(planetAltitude(sp), 0.0);
-                                float h_norm  = saturate(h_alt / 8000.0);
+                                // Reference height for the high-cloud sun
+                                // boost is the Rayleigh scale height, which
+                                // now comes from the body rather than from a
+                                // literal that happened to equal it (#257).
+                                float h_norm  = saturate(h_alt / atm_body.rayleigh_scale_h);
                                 float boost   = exp(0.30 * sun_am * h_norm);
                                 float3 sun_at = sun_rad * boost;
                                 float3 sun_jit = sampleSunDisc(sun_dir, seed);
