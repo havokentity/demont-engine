@@ -1321,6 +1321,32 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # the cloud march + radial-blur accumulation involve many fbm /
     # texture taps so cross-backend FP-order variance is wider than the
     # analytic-geometry cornell baseline.
+    #
+    # REGENERATED 2026-08-27 (planetary P3, #257). This fixture sets
+    # `r_volumetric_density 0.008` -- a deliberately heavy god-ray haze,
+    # 4x the (already unphysical) 0.002 default and roughly 16-80x the
+    # real-Earth sea-level aerosol range of 1e-4 to 5e-4. P3 gives the
+    # aerosol its real ABSORBING half, which the engine did not model at
+    # all before (an implied single-scattering albedo of 1), so extinction
+    # in this fixture roughly doubles and the frame moved by mean 4.153
+    # against the MEAN_DELTA 4 registered here. That threshold was
+    # calibrated against physics this phase deliberately changes, so the
+    # correct response is a regeneration, not a widened tolerance -- the
+    # same call #269 made for the July correctness fixes.
+    #
+    # The alternative reading was measured, not assumed: treating
+    # r_volumetric_density as EXTINCTION rather than as scattering would
+    # have preserved this fixture's aerial perspective exactly, but it
+    # halves every haze glow and moves this same cell by mean 25.1 --
+    # six times worse. So the fixture is not fine-with-a-broken-
+    # implementation; both readings move it, and the one that moves it
+    # least is also the one that keeps a user's authored haze level
+    # meaning what they set. The reasoning is recorded at ptAtmoScale in
+    # shaders/PathTraceMath.slang.
+    #
+    # The new capture is bit-identical across three consecutive renders
+    # on the dev M4 Max (max_delta 0), so the 32/4/3 thresholds remain
+    # pure cross-host headroom.
     pt_add_golden_cell(SCENE clouds_godrays BACKEND metal DENOISER svgf_atrous
         EXTRA "r_godrays 1"
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
