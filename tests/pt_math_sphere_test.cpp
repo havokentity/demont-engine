@@ -210,7 +210,8 @@ PT_MIRROR float ptDotExact(F3 a, F3 b) {
     return ptFixedTotal(s);
 }
 
-PT_MIRROR bool ptIntersectSphereLarge(F3 oc, F3 rd, float rad, float& t) {
+PT_MIRROR bool ptIntersectSphereLarge(F3 oc, F3 rd, float rad, float t_min,
+                                      float& t) {
     float b = ptDotExact(oc, rd);
     float k = ptPowerOfPoint(oc, rad);
     float h = std::fma(b, b, -k);
@@ -220,11 +221,12 @@ PT_MIRROR bool ptIntersectSphereLarge(F3 oc, F3 rd, float rad, float& t) {
     float ta = q;
     float tb = (q != 0.0f) ? k / q : 0.0f;
     float t0 = std::min(ta, tb), t1 = std::max(ta, tb);
-    t = (t0 > 1e-3f) ? t0 : t1;
-    return t > 1e-3f;
+    t = (t0 > t_min) ? t0 : t1;
+    return t > t_min;
 }
 
-PT_MIRROR bool ptIntersectSphereScaled(F3 oc, F3 rd, float rad, int ext_exp, float& t) {
+PT_MIRROR bool ptIntersectSphereScaled(F3 oc, F3 rd, float rad, int ext_exp,
+                                       float t_min, float& t) {
     int s = std::min(ext_exp, 126);
     float dn = ptPow2(-s), up = ptPow2(s);
     F3 o{oc.x * dn, oc.y * dn, oc.z * dn};
@@ -235,20 +237,21 @@ PT_MIRROR bool ptIntersectSphereScaled(F3 oc, F3 rd, float rad, int ext_exp, flo
     if (h < 0.0f) { t = 0.0f; return false; }
     h = std::sqrt(h);
     float t0 = (-b - h) * up, t1 = (-b + h) * up;
-    t = (t0 > 1e-3f) ? t0 : t1;
-    return t > 1e-3f;
+    t = (t0 > t_min) ? t0 : t1;
+    return t > t_min;
 }
 
-PT_MIRROR bool intersectSphere(F3 ro, F3 rd, F3 c, float rad, float& t) {
+PT_MIRROR bool intersectSphere(F3 ro, F3 rd, F3 c, float rad, float t_min,
+                               float& t) {
     F3 oc{ro.x - c.x, ro.y - c.y, ro.z - c.z};
     float m = std::max(std::max(std::fabs(oc.x), std::fabs(oc.y)),
                        std::max(std::fabs(oc.z), rad));
     int ext_exp = ptFloatExp(m);
     if (rad > kPtStableSphereRadius && ext_exp <= kPtAccumMaxExp) {
-        return ptIntersectSphereLarge(oc, rd, rad, t);
+        return ptIntersectSphereLarge(oc, rd, rad, t_min, t);
     }
     if (ext_exp > kPtAccumMaxExp && ext_exp <= 127) {
-        return ptIntersectSphereScaled(oc, rd, rad, ext_exp, t);
+        return ptIntersectSphereScaled(oc, rd, rad, ext_exp, t_min, t);
     }
     float b = oc.x * rd.x + oc.y * rd.y + oc.z * rd.z;
     float k = (oc.x * oc.x + oc.y * oc.y + oc.z * oc.z) - rad * rad;
@@ -256,8 +259,8 @@ PT_MIRROR bool intersectSphere(F3 ro, F3 rd, F3 c, float rad, float& t) {
     if (h < 0.0f) { t = 0.0f; return false; }
     h = std::sqrt(h);
     float t0 = -b - h, t1 = -b + h;
-    t = (t0 > 1e-3f) ? t0 : t1;
-    return t > 1e-3f;
+    t = (t0 > t_min) ? t0 : t1;
+    return t > t_min;
 }
 
 // The pre-#254 body, kept so the tests can pin the defect they repair
@@ -402,7 +405,33 @@ Ray exactNadirRay(float rad, float alt) {
 
 const F3 kOrigin{0.0f, 0.0f, 0.0f};
 
+// Count occurrences, don't just find one.
+//
+// A `find(...) != npos` pin asserts "at least one site still says this",
+// which is not what these pins mean. Measured while writing #256: reverting
+// intersectSphere's historic root selection back to the absolute 1e-3 left
+// the other two bodies' `t_min` in place, so every existence pin still
+// matched and BOTH mirror tests went green against a shader the mirror no
+// longer described. Counting is the fix.
+std::size_t countOf(const std::string& hay, const char* needle) {
+    std::size_t n = 0, pos = 0;
+    const std::size_t len = std::strlen(needle);
+    while ((pos = hay.find(needle, pos)) != std::string::npos) { ++n; pos += len; }
+    return n;
+}
+
 constexpr float kEarthRadius = 6371000.0f;   // metres, 1 unit = 1 metre
+
+// The near cut intersectSphere baked in before #256 made it a parameter.
+//
+// Every case in this file is about the ARITHMETIC of the #254 kernel --
+// how much of |oc|^2 - rad^2 survives, which root gets taken, whether the
+// accumulated total stays finite -- and none of that depends on where the
+// near cut sits. Holding it at the historic value keeps each assertion
+// comparing exactly what it compared before #256, so a change to the
+// epsilon scheme cannot silently move a #254 tolerance. The near cut's own
+// behaviour is tested in tests/pt_math_epsilon_test.cpp.
+constexpr float kHistoricTMin = 1e-3f;
 
 }  // namespace
 
@@ -438,7 +467,7 @@ TEST_CASE("planetary radius: exact nadir hit is recovered exactly") {
         Ray r = exactNadirRay(kEarthRadius, alt);
 
         float t_new = 0.0f;
-        REQUIRE(intersectSphere(r.ro, r.rd, kOrigin, kEarthRadius, t_new));
+        REQUIRE(intersectSphere(r.ro, r.rd, kOrigin, kEarthRadius, kHistoricTMin, t_new));
         // Exact: not "within a millimetre", bit-for-bit the right answer.
         CHECK(t_new == alt);
 
@@ -482,7 +511,7 @@ TEST_CASE("planetary radius: sub-millimetre at a known small altitude") {
         REQUIRE(t_ref > 0.0);
 
         float t_new = 0.0f;
-        REQUIRE(intersectSphere(r.ro, r.rd, kOrigin, kEarthRadius, t_new));
+        REQUIRE(intersectSphere(r.ro, r.rd, kOrigin, kEarthRadius, kHistoricTMin, t_new));
         double err_new = std::fabs(double(t_new) - t_ref);
         CAPTURE(err_new);
         CHECK(err_new <= kStableUlps * ulpOf(t_ref));
@@ -513,7 +542,7 @@ TEST_CASE("planetary radius: origin exactly on the surface") {
     referenceSolve(r.ro, r.rd, kOrigin, kEarthRadius, t_ref);
 
     float t_new = 0.0f;
-    REQUIRE(intersectSphere(r.ro, r.rd, kOrigin, kEarthRadius, t_new));
+    REQUIRE(intersectSphere(r.ro, r.rd, kOrigin, kEarthRadius, kHistoricTMin, t_new));
     CHECK(std::fabs(double(t_new) - t_ref) <= kStableUlps * ulpOf(t_ref));
     // Whatever the sub-ULP quantisation of the origin, the hit is on this
     // side of the planet, not the far one.
@@ -538,7 +567,7 @@ TEST_CASE("planetary radius: grazing incidence") {
             if (!(t_ref > 0.0)) continue;    // below the horizon, no hit
 
             float t_new = 0.0f;
-            REQUIRE(intersectSphere(r.ro, r.rd, kOrigin, kEarthRadius, t_new));
+            REQUIRE(intersectSphere(r.ro, r.rd, kOrigin, kEarthRadius, kHistoricTMin, t_new));
             double amp = grazingAmplification(r.ro, r.rd, kOrigin, kEarthRadius);
             CAPTURE(amp);
             double err = std::fabs(double(t_new) - t_ref);
@@ -561,7 +590,7 @@ TEST_CASE("planetary radius: origin inside the sphere") {
         REQUIRE(t_ref > 0.0);
 
         float t_new = 0.0f;
-        REQUIRE(intersectSphere(r.ro, r.rd, kOrigin, kEarthRadius, t_new));
+        REQUIRE(intersectSphere(r.ro, r.rd, kOrigin, kEarthRadius, kHistoricTMin, t_new));
         double err = std::fabs(double(t_new) - t_ref);
         CAPTURE(err);
         CHECK(err <= kStableUlps * ulpOf(t_ref));
@@ -596,7 +625,7 @@ TEST_CASE("scale sweep: 1 m to 6371 km, nadir and grazing") {
             if (!(t_ref > 0.0)) continue;
 
             float t_new = 0.0f;
-            REQUIRE(intersectSphere(r.ro, r.rd, kOrigin, s.rad, t_new));
+            REQUIRE(intersectSphere(r.ro, r.rd, kOrigin, s.rad, kHistoricTMin, t_new));
             double amp = grazingAmplification(r.ro, r.rd, kOrigin, s.rad);
             double err = std::fabs(double(t_new) - t_ref);
             CAPTURE(amp);
@@ -622,7 +651,7 @@ TEST_CASE("small spheres take the historic path unchanged") {
                 CAPTURE(tilt);
                 Ray r = rayAtAltitude(rad, alt, tilt);
                 float t_new = 0.0f, t_old = 0.0f;
-                bool h_new = intersectSphere(r.ro, r.rd, kOrigin, rad, t_new);
+                bool h_new = intersectSphere(r.ro, r.rd, kOrigin, rad, kHistoricTMin, t_new);
                 bool h_old = intersectSphereNaive(r.ro, r.rd, kOrigin, rad, t_old);
                 CHECK(h_new == h_old);
                 CHECK(asuint(t_new) == asuint(t_old));
@@ -633,7 +662,7 @@ TEST_CASE("small spheres take the historic path unchanged") {
     // so the gate is where the comment says it is.
     Ray r = rayAtAltitude(kPtStableSphereRadius * 2.0f, 1.0, 0.0);
     float t_new = 0.0f, t_old = 0.0f;
-    intersectSphere(r.ro, r.rd, kOrigin, kPtStableSphereRadius * 2.0f, t_new);
+    intersectSphere(r.ro, r.rd, kOrigin, kPtStableSphereRadius * 2.0f, kHistoricTMin, t_new);
     intersectSphereNaive(r.ro, r.rd, kOrigin, kPtStableSphereRadius * 2.0f, t_old);
     CHECK(asuint(t_new) != asuint(t_old));
 }
@@ -698,7 +727,7 @@ TEST_CASE("degenerate inputs stay finite") {
     // Ray origin at the centre: k = -rad^2, b = 0, one root each side.
     {
         float t = 0.0f;
-        REQUIRE(intersectSphere(kOrigin, F3{0, 0, -1}, kOrigin, kEarthRadius, t));
+        REQUIRE(intersectSphere(kOrigin, F3{0, 0, -1}, kOrigin, kEarthRadius, kHistoricTMin, t));
         CHECK(finiteBits(t));
         CHECK(std::fabs(double(t) - double(kEarthRadius)) <= ulpOf(kEarthRadius));
     }
@@ -707,14 +736,14 @@ TEST_CASE("degenerate inputs stay finite") {
         Ray r = rayAtAltitude(kEarthRadius, 1000.0, 0.0);
         F3 up{-r.rd.x, -r.rd.y, -r.rd.z};   // straight out, away from it
         float t = 0.0f;
-        CHECK_FALSE(intersectSphere(r.ro, up, kOrigin, kEarthRadius, t));
+        CHECK_FALSE(intersectSphere(r.ro, up, kOrigin, kEarthRadius, kHistoricTMin, t));
         CHECK(finiteBits(t));
     }
     // Tangent-ish ray that misses by a hair still reports a miss, finitely.
     {
         Ray r = rayAtAltitude(kEarthRadius, 1000.0, 89.5);
         float t = 0.0f;
-        bool hit = intersectSphere(r.ro, r.rd, kOrigin, kEarthRadius, t);
+        bool hit = intersectSphere(r.ro, r.rd, kOrigin, kEarthRadius, kHistoricTMin, t);
         CHECK(finiteBits(t));
         if (hit) CHECK(double(t) > 0.0);
     }
@@ -772,7 +801,7 @@ TEST_CASE("finite in, finite out over the whole float32 range") {
                 CAPTURE(tilt);
                 Ray r = rayAtDistance(dist, tilt);
                 float t = 0.0f;
-                intersectSphere(r.ro, r.rd, kOrigin, rad, t);
+                intersectSphere(r.ro, r.rd, kOrigin, rad, kHistoricTMin, t);
                 CHECK(finiteBits(t));
             }
         }
@@ -792,7 +821,7 @@ TEST_CASE("finite in, finite out over the whole float32 range") {
                 CAPTURE(tilt);
                 Ray r = rayAtDistance(double(rad) * frac, tilt);
                 float t = 0.0f;
-                intersectSphere(r.ro, r.rd, kOrigin, rad, t);
+                intersectSphere(r.ro, r.rd, kOrigin, rad, kHistoricTMin, t);
                 CHECK(finiteBits(t));
             }
         }
@@ -811,7 +840,7 @@ TEST_CASE("finite in, finite out over the whole float32 range") {
             for (float rad : {kEarthRadius, 1.0e18f}) {
                 CAPTURE(rad);
                 float t = 0.0f;
-                intersectSphere(ro, rd, c, rad, t);
+                intersectSphere(ro, rd, c, rad, kHistoricTMin, t);
                 CHECK(finiteBits(t));
             }
         }
@@ -837,7 +866,7 @@ TEST_CASE("finite in, finite out over the whole float32 range") {
             referenceSolve(r.ro, r.rd, kOrigin, rad, t_ref);
             REQUIRE(t_ref > 0.0);
             float t = 0.0f;
-            REQUIRE(intersectSphere(r.ro, r.rd, kOrigin, rad, t));
+            REQUIRE(intersectSphere(r.ro, r.rd, kOrigin, rad, kHistoricTMin, t));
             double err = std::fabs(double(t) - t_ref);
             CAPTURE(t_ref);
             CAPTURE(err);
@@ -874,6 +903,26 @@ TEST_CASE("shader mirror is still faithful") {
     CHECK(tight.find("ints=min(ext_exp,126)") != std::string::npos);
     CHECK(tight.find("floatdn=ptPow2(-s),up=ptPow2(s)") != std::string::npos);
     CHECK(tight.find("floatt0=(-b-h)*up,t1=(-b+h)*up") != std::string::npos);
+    // The near cut is a PARAMETER since #256, not a baked 1e-3. Pin the
+    // signatures and every root-selection line that reads it, so a mirror
+    // still carrying the old constant cannot pass this file -- which is
+    // exactly what happened when #256 first changed the shader: none of
+    // the literals above moved, so nothing here noticed.
+    CHECK(tight.find("publicboolintersectSphere(float3ro,float3rd,float3c,floatrad,"
+                     "floatt_min,outfloatt)") != std::string::npos);
+    CHECK(tight.find("publicboolintersectPlane(float3ro,float3rd,float3n,floatd,"
+                     "floatt_min,outfloatt)") != std::string::npos);
+    // Counted, not merely found: THREE bodies select their root against
+    // t_min (accumulated, rescaled, historic) and intersectPlane tests it
+    // directly, so an existence pin passes with two of the three reverted.
+    CHECK(countOf(tight, "t=(t0>t_min)?t0:t1;returnt>t_min;") == 3u);
+    // Four functions end on the near cut: the three above plus
+    // intersectPlane, which tests it directly rather than selecting.
+    CHECK(countOf(tight, "returnt>t_min;}") == 4u);
+    // ... and no executable near cut anywhere in the module still reads
+    // the absolute constant.
+    CHECK(countOf(tight, ">1e-3)?t0:t1") == 0u);
+    CHECK(countOf(tight, "returnt>1e-3;") == 0u);
     // The 12-bit split that makes each partial product exact.
     CHECK(tight.find("asuint(x)&0xFFFFF000u") != std::string::npos);
     CHECK(tight.find("asuint(y)&0xFFFFF000u") != std::string::npos);

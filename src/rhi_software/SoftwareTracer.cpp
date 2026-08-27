@@ -171,10 +171,70 @@ struct HitInfo {
     float         tex_lod  = 0.0f;
 };
 
+// --- Scale-relative ray epsilons (issue #256, planetary P2) ---------------
+//
+// Hand mirror of shaders/PathTraceMath.slang's ptOffsetRay / ptConeEps /
+// ptRayTMin. This file is NOT a Slang-to-CPU emit (see the header note), so
+// every epsilon has to move by hand and the two can only be kept in step by
+// reading them side by side. The derivations live in the .slang; only the
+// mechanics are repeated here.
+inline float SwAsFloat(std::int32_t i) {
+    float f;
+    std::memcpy(&f, &i, sizeof(f));
+    return f;
+}
+inline std::int32_t SwAsInt(float f) {
+    std::int32_t i;
+    std::memcpy(&i, &f, sizeof(i));
+    return i;
+}
+
+// Wachter & Binder, Ray Tracing Gems ch. 6.
+inline glm::vec3 PtOffsetRay(const glm::vec3& p, const glm::vec3& n) {
+    constexpr float kOrigin     = 1.0f / 32.0f;
+    constexpr float kFloatScale = 1.0f / 65536.0f;
+    constexpr float kIntScale   = 256.0f;
+    glm::vec3 out{};
+    for (int k = 0; k < 3; ++k) {
+        const std::int32_t of_i =
+            static_cast<std::int32_t>(kIntScale * n[k]);
+        const float p_i =
+            SwAsFloat(SwAsInt(p[k]) + (p[k] < 0.0f ? -of_i : of_i));
+        out[k] = (std::fabs(p[k]) < kOrigin) ? p[k] + kFloatScale * n[k] : p_i;
+    }
+    return out;
+}
+
+// A quarter of the pixel footprint, bounded at 4x for grazing directions
+// so the offset itself never exceeds one whole footprint.
+inline float PtConeEps(float cone_w, float cos_theta) {
+    return 0.25f * cone_w / std::max(cos_theta, 0.25f);
+}
+
+inline glm::vec3 PtRayOrigin(const glm::vec3& p, const glm::vec3& n,
+                             float cone_w, const glm::vec3& dir) {
+    return PtOffsetRay(p, n)
+         + n * PtConeEps(cone_w, std::fabs(glm::dot(n, dir)));
+}
+
+// The near cut: a quarter footprint, or kIntScale ULPs of the largest
+// origin coordinate, whichever is larger.
+inline float PtRayTMin(const glm::vec3& ro, float cone_w) {
+    constexpr float kIntScaleRel = 256.0f / 16777216.0f;
+    const float m = std::max(std::max(std::fabs(ro.x), std::fabs(ro.y)),
+                             std::fabs(ro.z));
+    return std::max(0.25f * cone_w, kIntScaleRel * m);
+}
+// --- end scale-relative ray epsilons ---------------------------------------
+
 // Ray-sphere intersection (closest positive root). Returns hit-t in t
 // and true if hit. Matches the GPU `intersectSphere` semantics.
+//
+// `t_min` was an absolute 1e-4 f here until #256 (the GPU's was 1e-3 --
+// the two never agreed, which is its own argument for deriving it).
 inline bool IntersectSphere(const glm::vec3& ro, const glm::vec3& rd,
-                            const glm::vec3& center, float radius, float& t) {
+                            const glm::vec3& center, float radius,
+                            float t_min, float& t) {
     glm::vec3 oc = ro - center;
     float b = glm::dot(oc, rd);
     float c = glm::dot(oc, oc) - radius * radius;
@@ -183,18 +243,19 @@ inline bool IntersectSphere(const glm::vec3& ro, const glm::vec3& rd,
     h = std::sqrt(h);
     float t0 = -b - h;
     float t1 = -b + h;
-    if (t0 > 1e-4f) { t = t0; return true; }
-    if (t1 > 1e-4f) { t = t1; return true; }
+    if (t0 > t_min) { t = t0; return true; }
+    if (t1 > t_min) { t = t1; return true; }
     return false;
 }
 
 // Ray-plane (n.p + d = 0).
 inline bool IntersectPlane(const glm::vec3& ro, const glm::vec3& rd,
-                           const glm::vec3& n, float d, float& t) {
+                           const glm::vec3& n, float d,
+                           float t_min, float& t) {
     float denom = glm::dot(n, rd);
     if (std::fabs(denom) < 1e-6f) return false;
     float t_ = -(glm::dot(n, ro) + d) / denom;
-    if (t_ > 1e-4f) { t = t_; return true; }
+    if (t_ > t_min) { t = t_; return true; }
     return false;
 }
 
@@ -527,10 +588,15 @@ inline void ApplyPbrTextures(HitInfo& h, const BackedTexture* atlas) {
 
 // Single hit test against analytic prims + (optional) Embree TLAS.
 // Closest-hit semantics.
+// `cone_w` is the ray-cone footprint at THIS ray's origin (#256). The near
+// cut every intersector below needs is derived from it once, here, so the
+// caller carries one quantity rather than two that could drift apart --
+// same shape as the GPU traceScene.
 void TraceScene(const glm::vec3& ro, const glm::vec3& rd,
                 const float* prim_data, std::uint32_t prim_count,
-                RTCScene tlas_scene,
+                RTCScene tlas_scene, float cone_w,
                 HitInfo& out) {
+    const float t_min = PtRayTMin(ro, cone_w);
     out.hit = false;
     out.t   = 1e30f;
 
@@ -567,7 +633,7 @@ void TraceScene(const glm::vec3& ro, const glm::vec3& rd,
         if (type == kPrimSphere) {
             glm::vec3 center{v0[0], v0[1], v0[2]};
             float r = v0[3];
-            if (IntersectSphere(ro, rd, center, r, t) && t < out.t) {
+            if (IntersectSphere(ro, rd, center, r, t_min, t) && t < out.t) {
                 out.hit = true;
                 out.t = t;
                 glm::vec3 hit_pt = ro + rd * t;
@@ -605,7 +671,7 @@ void TraceScene(const glm::vec3& ro, const glm::vec3& rd,
             glm::vec3 n_raw{v0[0], v0[1], v0[2]};
             glm::vec3 n = QuatRotateVec(v5, n_raw);
             float d = v0[3];
-            if (IntersectPlane(ro, rd, n, d, t) && t < out.t) {
+            if (IntersectPlane(ro, rd, n, d, t_min, t) && t < out.t) {
                 out.hit = true;
                 out.t = t;
                 out.normal = n;
@@ -639,7 +705,7 @@ void TraceScene(const glm::vec3& ro, const glm::vec3& rd,
         RTCRayHit rh{};
         rh.ray.org_x = ro.x; rh.ray.org_y = ro.y; rh.ray.org_z = ro.z;
         rh.ray.dir_x = rd.x; rh.ray.dir_y = rd.y; rh.ray.dir_z = rd.z;
-        rh.ray.tnear = 1e-4f;
+        rh.ray.tnear = t_min;
         rh.ray.tfar  = out.t;
         rh.ray.mask  = 0xFFFFFFFFu;
         rh.ray.flags = 0;
@@ -882,7 +948,12 @@ void RunPathTraceKernel(SoftwareDevice& device,
                 glm::vec3 ro = cam_pos;
 
                 HitInfo h0;
-                TraceScene(ro, rd, prim_data, prim_count, tlas_scene, h0);
+                // Camera ray: the cone has zero width at the eye, so
+                // the near cut is purely representational (#256).
+                const float cone_spread_px = (2.0f * fov_tan)
+                    / static_cast<float>(std::max(h, 1u));
+                TraceScene(ro, rd, prim_data, prim_count, tlas_scene,
+                           0.0f, h0);
 
                 glm::vec3 col{0.0f};
                 if (!h0.hit) {
@@ -900,9 +971,8 @@ void RunPathTraceKernel(SoftwareDevice& device,
                     // so the cone diameter at the hit = pixel_spread * t. The
                     // 1/|cos| grazing stretch inside PbrConeTexLod is what
                     // removes the receding-checkerboard aliasing at the horizon.
-                    const float cone_spread = (2.0f * fov_tan)
-                                            / static_cast<float>(std::max(h, 1u));
-                    h0.tex_lod = PbrConeTexLod(cone_spread * h0.t, rd,
+                    const float cone_w_hit = cone_spread_px * h0.t;
+                    h0.tex_lod = PbrConeTexLod(cone_w_hit, rd,
                                                h0.normal, h0.uv_scale);
                     ApplyPbrTextures(h0, pbr_atlas);
                     // Lambert direct lighting from the procedural sun.
@@ -920,8 +990,13 @@ void RunPathTraceKernel(SoftwareDevice& device,
                     glm::vec3 lit{0.0f};
                     if (n_dot_l > 0.0f) {
                         HitInfo shadow;
-                        TraceScene(hit_pt + nf * 1e-3f, sun_dir,
-                                    prim_data, prim_count, tlas_scene, shadow);
+                        // Same footprint that set the mip level above is
+                        // what lifts the shadow ray off the surface (#256).
+                        const glm::vec3 sro =
+                            PtRayOrigin(hit_pt, nf, cone_w_hit, sun_dir);
+                        TraceScene(sro, sun_dir,
+                                    prim_data, prim_count, tlas_scene,
+                                    cone_w_hit, shadow);
                         if (!shadow.hit) {
                             glm::vec3 sun_rad{2.4f, 2.2f, 1.9f};
                             lit = h0.albedo * sun_rad * n_dot_l;

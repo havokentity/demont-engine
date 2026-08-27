@@ -321,6 +321,38 @@ else()
     target_compile_options(pt_math_altitude PRIVATE $<$<CONFIG:Release>:/fp:fast>)
 endif()
 
+# --- pt_math_epsilon (issue #256, planetary P2) ----------------------------
+# Scale-relative ray epsilons: the Wachter-Binder representational offset
+# and the ray-cone footprint term that replaced the absolute 1e-3 m every
+# secondary ray used to carry. Mirrors shaders/PathTraceMath.slang the same
+# way pt_math_sphere and pt_math_altitude do -- there is no host entry point
+# to call -- and re-reads THREE shaders, because unlike #254 the repair is
+# as much at the seventeen call sites as it is in the kernel, and a test
+# that pinned only the kernel would pass with every site left at 1e-3.
+#
+# It also re-reads src/engine/Engine.cpp to pin r_origin_rebase_radius.
+# That is not decoration: Wachter-Binder's constants are calibrated for
+# coordinates in roughly [1e-2, 1e5] m, and P1's anchor is what bounds them
+# to that band. If the rebase radius ever moves by orders of magnitude the
+# offset scheme has to be re-derived, so the dependency is pinned rather
+# than asserted in prose.
+#
+# -ffast-math in Release for the same reason the other two math targets ask
+# for it: Metal compiles these modules with its default (fast) math mode,
+# and the host mirror should face the same reassociation the GPU applies.
+pt_add_test(pt_math_epsilon
+    pt_math_epsilon_test.cpp)
+target_compile_definitions(pt_math_epsilon PRIVATE
+    PT_SHADER_MATH_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTraceMath.slang"
+    PT_SHADER_PATHTRACE_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang"
+    PT_SHADER_RESTIRFINAL_PATH="${CMAKE_SOURCE_DIR}/shaders/RestirFinal.slang"
+    PT_ENGINE_CPP_PATH="${CMAKE_SOURCE_DIR}/src/engine/Engine.cpp")
+if(NOT MSVC)
+    target_compile_options(pt_math_epsilon PRIVATE $<$<CONFIG:Release>:-ffast-math>)
+else()
+    target_compile_options(pt_math_epsilon PRIVATE $<$<CONFIG:Release>:/fp:fast>)
+endif()
+
 # --- pt_physics unit tests (issue #132) ------------------------------------
 # Phase 1 Verlet physics: handle invalidation (Remove+Add generation
 # bump; 24-bit gen wraparound guard), free-fall trajectory matches

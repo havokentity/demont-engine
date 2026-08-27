@@ -59,6 +59,7 @@
 #endif
 
 import RestirReservoir;
+import PathTraceMath;
 
 [[vk::push_constant]]
 cbuffer Push {
@@ -84,7 +85,12 @@ static const uint PRIM_PLANE  = 1u;
 
 // Sphere intersection. Returns true on a hit + the entry t. Equivalent
 // to PathTrace's intersectSphere helper.
-bool intersectSphere(float3 ro, float3 rd, float3 c, float r, out float t) {
+//
+// Issue #256: the near cut was an absolute 1e-4 m here (and 1e-3 in
+// PathTrace, which is its own inconsistency). It is now the caller's
+// scale-relative t_min, same as everywhere else.
+bool intersectSphere(float3 ro, float3 rd, float3 c, float r,
+                     float t_min, out float t) {
     float3 oc = ro - c;
     float b = dot(oc, rd);
     float d = b*b - dot(oc, oc) + r*r;
@@ -92,8 +98,8 @@ bool intersectSphere(float3 ro, float3 rd, float3 c, float r, out float t) {
     float s = sqrt(d);
     float t0 = -b - s;
     float t1 = -b + s;
-    t = (t0 > 1e-4) ? t0 : t1;
-    return t > 1e-4;
+    t = (t0 > t_min) ? t0 : t1;
+    return t > t_min;
 }
 
 // Shadow visibility: 1.0 = unoccluded, 0.0 = blocked. Conservative
@@ -102,7 +108,8 @@ bool intersectSphere(float3 ro, float3 rd, float3 c, float r, out float t) {
 // scope-out the caustic-refractive-shadow path; PathTrace.slang's
 // shadow ray already supports it, but porting that code triples this
 // kernel's size for marginal Phase A win).
-float shadowVis(float3 ro, float3 rd, float t_max) {
+float shadowVis(float3 ro, float3 rd, float t_max, PtRayCone cone) {
+    float t_min = ptRayTMin(ro, cone);
     // Analytic primitives: linear scan (the host has a BVH for prim
     // counts > r_analytic_bvh_threshold, but the linear loop is fine
     // for shadow rays at MVP scale and avoids the BVH traversal code
@@ -121,7 +128,7 @@ float shadowVis(float3 ro, float3 rd, float t_max) {
         uint type = uint(v2.x);
         float t;
         if (type == PRIM_SPHERE) {
-            if (intersectSphere(ro, rd, v0.xyz, v0.w, t) && t < t_max) {
+            if (intersectSphere(ro, rd, v0.xyz, v0.w, t_min, t) && t < t_max) {
                 return 0.0;
             }
         }
@@ -137,7 +144,7 @@ float shadowVis(float3 ro, float3 rd, float t_max) {
         RayDesc desc;
         desc.Origin    = ro;
         desc.Direction = rd;
-        desc.TMin      = 1e-3;
+        desc.TMin      = t_min;
         desc.TMax      = t_max;
         q.TraceRayInline(scene_tlas, RAY_FLAG_NONE, 0xFFu, desc);
         q.Proceed();
@@ -199,12 +206,18 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float  n_dot_l  = dot(n_c, wi);
     if (n_dot_l <= 0.0) return;
 
-    // Shadow ray. Origin offset by the normal so we don't self-occlude.
-    float3 sro = hit_pt + n_c * 1e-3;
+    // Shadow ray. Origin offset along the normal so we don't self-occlude
+    // -- scale-relative since #256, and derived from the same ray cone the
+    // path tracer uses. This is a screen-space pass at the PRIMARY hit, so
+    // the footprint there is one pixel of spread times the view distance.
+    float  cone_spread = (2.0 * pos_fovtan.w) / float(max(height, 1u));
+    float  view_dist   = length(hit_pt - pos_fovtan.xyz);
+    PtRayCone cone     = ptConeMake(cone_spread * view_dist, cone_spread);
+    float3 sro = ptRayOrigin(hit_pt, n_c, cone, wi);
     // Stop t_max just shy of the sample point so the light's own
     // surface doesn't block its visibility (mirrors PathTrace's NEE).
-    float  t_max = max(dist - 1e-3, 0.0);
-    float vis = shadowVis(sro, wi, t_max);
+    float  t_max = max(dist - ptRayTMin(sro, cone), 0.0);
+    float vis = shadowVis(sro, wi, t_max, cone);
     if (vis <= 0.0) return;
 
     // Estimator F = throughput * Le_pre * brdf * cos * W * vis.
