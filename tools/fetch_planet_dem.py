@@ -42,8 +42,17 @@ USAGE
     python3 tools/fetch_planet_dem.py --width 8192    # a finer local grid
     python3 tools/fetch_planet_dem.py --source my.nc  # bake from a local file
 
-Requires: numpy. netCDF4 (or xarray, or GDAL) for the .nc source; if none is
-installed the tool says which one to install rather than failing obscurely.
+Requires: numpy, plus one of netCDF4 / xarray / GDAL to read the .nc source.
+The reader is checked BEFORE the download starts, so a missing dependency
+costs you a one-line error rather than 478 MB and then an ImportError.
+
+The download verifies its own completed length against ETOPO_SIZE_BYTES and
+retries with exponential backoff. Both guards are there because both
+failures happened on the first real run: NCEI answered HTTP 504 while cold,
+and a separate attempt truncated at 143,997,480 of 478,290,125 bytes while
+exiting 0 -- `file` still called it valid HDF5, because the header was
+intact. A truncated grid bakes into a plausible-looking planet, and this
+project has shipped enough silently-wrong data for one arc.
 
 OUTPUT FORMAT (mirrored by src/renderer/Planet/ElevationField.h -- the two
 are a wire format and there is no generated header between them):
@@ -78,6 +87,8 @@ import argparse
 import os
 import struct
 import sys
+import time
+import urllib.error
 import urllib.request
 
 # NCEI's public distribution point for the ETOPO 2022 ice-surface global
@@ -86,6 +97,15 @@ import urllib.request
 ETOPO_URL = ("https://www.ngdc.noaa.gov/thredds/fileServer/global/"
              "ETOPO2022/60s/60s_surface_elev_netcdf/"
              "ETOPO_2022_v1_60s_N90W180_surface.nc")
+
+# Size of the file at ETOPO_URL, in bytes, as served by NCEI and as
+# verified by the run that produced the committed assets/planet/
+# earth_lite.ptdem. Pinned rather than trusted from Content-Length alone,
+# so a server that reports a short length cannot talk the tool into
+# accepting a short file. If NCEI ever republishes the grid this constant
+# is the thing to update -- and the mismatch it produces is a loud failure
+# rather than a quiet half-planet.
+ETOPO_SIZE_BYTES = 478_290_125
 
 DEM_MAGIC   = b"PTDEM001"
 DEM_SCALE_M = 0.303
@@ -96,27 +116,123 @@ EARTH_MIN_M = -10935.0
 EARTH_MAX_M = 8848.86
 
 
-def download(url, dest):
+def check_reader_available():
+    """Fail BEFORE downloading 478 MB, not after.
+
+    The first version of this tool downloaded the whole grid and only then
+    discovered that none of netCDF4 / xarray / GDAL was installed. That is
+    somebody's afternoon and half a gigabyte of their bandwidth spent to
+    reach an ImportError.
+    """
+    for mod in ("netCDF4", "xarray", "osgeo.gdal"):
+        try:
+            __import__(mod)
+            return mod
+        except ImportError:
+            continue
+    sys.exit("[fetch] no netCDF reader installed, and the download is 478 MB.\n"
+             "        Install one FIRST:  pip install netCDF4\n"
+             "        (xarray or GDAL also work.)")
+
+
+def download(url, dest, expect_bytes=None, retries=5):
+    """Download `url` to `dest`, VERIFYING the completed length.
+
+    Two defects this guards, both observed against the real endpoint:
+
+    1. TRUNCATION THAT LOOKS LIKE SUCCESS. A download that stopped at
+       143,997,480 of 478,290,125 bytes exited 0, and `file` still reported
+       valid HDF5 because the header was intact -- only h5py's stored_eof
+       check noticed. A truncated grid bakes into a plausible-looking
+       planet, which is exactly the silent-failure class this codebase keeps
+       producing. So: compare the finished size against Content-Length, and
+       refuse to hand a short file to the baker.
+
+    2. A COLD ENDPOINT RETURNING 504. NOAA's THREDDS server answered HTTP
+       504 on first contact and 200 once warm. Dying outright on that is a
+       bad first experience for something that otherwise works. Retry with
+       exponential backoff, resuming with a Range request where the server
+       supports it so a retry does not restart 478 MB from zero.
+    """
     if os.path.exists(dest):
-        print(f"[fetch] {dest} already present ({os.path.getsize(dest)/1e6:.0f} MB)")
-        return dest
-    print(f"[fetch] downloading {url}")
-    print("[fetch] this is ~450 MB and NCEI is not always fast")
+        have = os.path.getsize(dest)
+        if expect_bytes is None or have == expect_bytes:
+            print(f"[fetch] {dest} already present ({have/1e6:.0f} MB)")
+            return dest
+        print(f"[fetch] {dest} is {have/1e6:.0f} MB, expected "
+              f"{expect_bytes/1e6:.0f} MB -- resuming")
+
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
-    with urllib.request.urlopen(url) as r, open(dest, "wb") as f:
-        total = int(r.headers.get("Content-Length", 0))
-        done = 0
-        while True:
-            chunk = r.read(1 << 20)
-            if not chunk:
-                break
-            f.write(chunk)
-            done += len(chunk)
-            if total:
-                sys.stdout.write(f"\r[fetch] {done/1e6:7.0f} / {total/1e6:.0f} MB")
-                sys.stdout.flush()
-    print()
-    return dest
+    print(f"[fetch] downloading {url}")
+    print("[fetch] this is ~478 MB and NCEI is not always fast")
+
+    delay = 2.0
+    last_err = None
+    for attempt in range(1, retries + 1):
+        have = os.path.getsize(dest) if os.path.exists(dest) else 0
+        req = urllib.request.Request(url)
+        mode = "wb"
+        if have > 0:
+            req.add_header("Range", f"bytes={have}-")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                # If the server ignores Range it answers 200, and appending
+                # would concatenate the whole file onto a partial one. Only
+                # a genuine 206 licenses the append.
+                if have > 0 and getattr(r, "status", 200) == 206:
+                    mode = "ab"
+                    total = have + int(r.headers.get("Content-Length", 0))
+                else:
+                    have = 0
+                    total = int(r.headers.get("Content-Length", 0))
+                if expect_bytes is None and total:
+                    expect_bytes = total
+                done = have
+                with open(dest, mode) as f:
+                    while True:
+                        chunk = r.read(1 << 20)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        done += len(chunk)
+                        if total:
+                            sys.stdout.write(
+                                f"\r[fetch] {done/1e6:7.0f} / {total/1e6:.0f} MB")
+                            sys.stdout.flush()
+            print()
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError) as e:
+            last_err = e
+            code = getattr(e, "code", None)
+            print(f"\n[fetch] attempt {attempt}/{retries} failed"
+                  f"{f' (HTTP {code})' if code else ''}: {e}")
+            if attempt < retries:
+                print(f"[fetch] retrying in {delay:.0f}s")
+                time.sleep(delay)
+                delay *= 2.0
+                continue
+            break
+
+        # --- Length verification: the whole point of this function. -----
+        got = os.path.getsize(dest)
+        if expect_bytes is not None and got != expect_bytes:
+            print(f"[fetch] TRUNCATED: {got} of {expect_bytes} bytes "
+                  f"({100.0 * got / expect_bytes:.1f}%)")
+            if attempt < retries:
+                print(f"[fetch] retrying in {delay:.0f}s")
+                time.sleep(delay)
+                delay *= 2.0
+                continue
+            sys.exit("[fetch] giving up. Refusing to bake a truncated grid: "
+                     "it would produce a plausible-looking planet that is "
+                     "silently wrong.")
+        print(f"[fetch] complete and verified: {got} bytes")
+        if expect_bytes is None:
+            print("[fetch] NOTE: the server sent no Content-Length, so the "
+                  "length could NOT be verified. Check the file before "
+                  "trusting the bake.")
+        return dest
+
+    sys.exit(f"[fetch] all {retries} attempts failed: {last_err}")
 
 
 def read_grid(path):
@@ -229,7 +345,13 @@ def main():
                     help="output columns (height is width/2)")
     args = ap.parse_args()
 
-    src = args.source or download(ETOPO_URL, args.cache)
+    # Check the reader BEFORE spending 478 MB of somebody's bandwidth.
+    if not args.source:
+        reader = check_reader_available()
+        print(f"[fetch] netCDF reader: {reader}")
+        src = download(ETOPO_URL, args.cache, expect_bytes=ETOPO_SIZE_BYTES)
+    else:
+        src = args.source
     arr = read_grid(src)
     out_w = args.width
     out_h = args.width // 2
