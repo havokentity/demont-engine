@@ -301,6 +301,26 @@ else()
     target_compile_options(pt_math_sphere PRIVATE $<$<CONFIG:Release>:/fp:fast>)
 endif()
 
+# --- pt_math_altitude (issue #271) -----------------------------------------
+# The other half of the same kernel: altitude above a sphere, which
+# planetAltitude() and the spherical optical-depth march both computed as
+# the naive `length(p - c) - R`. Same wiring as pt_math_sphere above and
+# for the same two reasons -- the mirror re-reads the shaders so it cannot
+# drift, and -ffast-math holds the host mirror to the reassociation Metal
+# actually applies. This one re-reads PathTrace.slang as well, because
+# unlike #254 the repair is at the CALL SITES, and a test that only pinned
+# the kernel would pass with the sites left naive.
+pt_add_test(pt_math_altitude
+    pt_math_altitude_test.cpp)
+target_compile_definitions(pt_math_altitude PRIVATE
+    PT_SHADER_MATH_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTraceMath.slang"
+    PT_SHADER_PATHTRACE_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang")
+if(NOT MSVC)
+    target_compile_options(pt_math_altitude PRIVATE $<$<CONFIG:Release>:-ffast-math>)
+else()
+    target_compile_options(pt_math_altitude PRIVATE $<$<CONFIG:Release>:/fp:fast>)
+endif()
+
 # --- pt_physics unit tests (issue #132) ------------------------------------
 # Phase 1 Verlet physics: handle invalidation (Remove+Add generation
 # bump; 24-bit gen wraparound guard), free-fall trajectory matches

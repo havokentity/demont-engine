@@ -1446,16 +1446,20 @@ float3 localUp(float3 p) {
 // Altitude of world point p above the surface (metres, can be negative).
 // Planar frame: p.y, the engine's ground-plane-at-y=0 convention.
 //
-// NOTE: the spherical branch is the naive `length(p - c) - R` form, which
+// The spherical branch used to be the naive `length(p - c) - R`, which
 // suffers the same catastrophic cancellation at planetary radius that
-// PathTraceMath's intersectSphere does (one fp32 ULP at |p - c| ~ 6.4e6 m
-// is ~0.5 m). It is fine at the metre-scale accuracy the scattering
-// integrals need -- Mie / Rayleigh scale heights are 1.5 km / 8 km -- but
-// it is NOT the expression sub-metre terrain will want. #254's stable
-// intersect work owns that; this call site moves to it in lockstep.
+// PathTraceMath's intersectSphere did -- measured at 0.50 m worst case
+// over a 100 km ground sweep at R = 6.371e6. Issue #271 moved it onto
+// ptAltitudeAboveSphere, which forms the exact |p - c|^2 - R^2 without
+// ever differencing p and c and divides by |p - c| + R, a sum that cannot
+// cancel: 3.3e-7 m at 1 m altitude, i.e. a few ULPs of the altitude it
+// returns. Sign convention is unchanged (negative below the surface),
+// and below PathTraceMath's radius gate the historic expression still
+// runs verbatim, so a miniature-planet scene renders bit-for-bit as before.
 float planetAltitude(float3 p) {
     if (planet_center_radius.w <= 0.0) return p.y;
-    return length(p - planet_center_radius.xyz) - planet_center_radius.w;
+    return ptAltitudeAboveSphere(p, planet_center_radius.xyz,
+                                 planet_center_radius.w);
 }
 
 // sin(elevation of `dir` above the local horizon at world point p).
@@ -5213,20 +5217,23 @@ float3 atmosphericTransmittance(float3 ro, float3 rd, float t) {
     float3 pc = (planet_center_radius.w > 0.0) ? planet_center_radius.xyz
                                                : float3(0.0, -planet_R, 0.0);
     // Composite Simpson's rule with 8 subintervals (9 sample points).
-    // Per-point altitude comes from sqrt((ro+rd*s - pc).xz^2 + (ro.y+rd.y*s - pc.y)^2) - R.
-    // Pull the sphere-centre offset into a local form to avoid the
-    // y-add-then-subtract roundtrip:
-    //     h(s) = sqrt(rx^2 + ry^2 + rz^2 + 2*R*ry + R^2) - R
-    //          = sqrt(|p|^2 + 2*R*p.y + R^2) - R
-    // where p = ro + rd*s. For |p| << R (we're always within a few km
-    // of the surface at the scales this renderer cares about), the
-    // sqrt is well-conditioned -- numerically equivalent to
-    //   h = sqrt((p.y + R)^2 + p.xz^2) - R
-    // which is the natural altitude-above-sphere formula. fp32 retains
-    // ~3 digits of precision at R = 6.371e6 m given p.y in metres,
-    // which is enough -- Mie/Rayleigh scale heights are 1.5e3 / 8e3 m
-    // so a meter-scale rounding error in h shifts the optical depth
-    // by ~0.1% per step.
+    // Per-point altitude used to be sqrt(|p - pc|^2) - R evaluated fresh
+    // at each sample, which is the naive form and carried ~0.5 m of noise
+    // into a scale-height exponential (issue #271). It is now hoisted:
+    // for a unit rd the power of the point is a quadratic in s,
+    //     |p(s) - pc|^2 - R^2 = k0 + 2*s*b0 + s^2,
+    // so ptRayAltitudeBegin accumulates k0 and b0 exactly once per call
+    // and each sample costs two fma plus the cancellation-free divide --
+    // no more per-step work than the length() it replaces, and it never
+    // materialises p(s), whose float32 resolution is what caps the naive
+    // form. Measured over a +/-90 deg elevation sweep on 300 km rays,
+    // altitudes clipped to the 0-20 km band this integral cares about:
+    // 0.87 m worst case before, 7.1e-3 m after. The derivation and the
+    // frame-dependence argument live above ptRayAltitudeBegin.
+    //
+    // PRECONDITION (unchanged, now load-bearing twice over): `rd` is unit
+    // length -- it is the s^2 coefficient of the quadratic as well as the
+    // integration measure.
     const int N = 8;
     float dt = t / float(N);
     float oneSixth = 1.0 / 6.0;
@@ -5240,6 +5247,7 @@ float3 atmosphericTransmittance(float3 ro, float3 rd, float t) {
     // each right boundary so the next iteration's left-boundary sigma
     // is a lookup instead of a fresh exp() -- halves the exp() count
     // across the 8 subintervals (see cost note in the header comment).
+    PtRayAltitude ray_alt = ptRayAltitudeBegin(ro, rd, pc, planet_R);
     float h_prev;
     float  sm_prev = 0.0;
     float3 sr_prev = float3(0.0);
@@ -5247,27 +5255,15 @@ float3 atmosphericTransmittance(float3 ro, float3 rd, float t) {
         // s = 0 boundary: seed h_prev and the cached sigma values so
         // iteration 0 can reuse them as its left boundary instead of
         // recomputing the s=0 exp() inside the loop.
-        float3 p = ro;
-        h_prev = sqrt((p.x - pc.x) * (p.x - pc.x)
-                    + (p.y - pc.y) * (p.y - pc.y)
-                    + (p.z - pc.z) * (p.z - pc.z)) - planet_R;
-        h_prev = max(h_prev, 0.0);
+        h_prev = max(ptRayAltitudeAt(ray_alt, 0.0), 0.0);
         if (any_mie) sm_prev = sigma_mie0           * exp(-h_prev / kHmie);
         if (any_ray) sr_prev = kSigmaR * rayleigh_i * exp(-h_prev / kHrayleigh);
     }
     for (int i = 0; i < N; ++i) {
         float s_mid   = (float(i) + 0.5) * dt;
         float s_right = (float(i) + 1.0) * dt;
-        float3 p_mid   = ro + rd * s_mid;
-        float3 p_right = ro + rd * s_right;
-        float h_mid = sqrt((p_mid.x - pc.x) * (p_mid.x - pc.x)
-                         + (p_mid.y - pc.y) * (p_mid.y - pc.y)
-                         + (p_mid.z - pc.z) * (p_mid.z - pc.z)) - planet_R;
-        h_mid = max(h_mid, 0.0);
-        float h_right = sqrt((p_right.x - pc.x) * (p_right.x - pc.x)
-                           + (p_right.y - pc.y) * (p_right.y - pc.y)
-                           + (p_right.z - pc.z) * (p_right.z - pc.z)) - planet_R;
-        h_right = max(h_right, 0.0);
+        float h_mid   = max(ptRayAltitudeAt(ray_alt, s_mid),   0.0);
+        float h_right = max(ptRayAltitudeAt(ray_alt, s_right), 0.0);
         if (any_mie) {
             float sm_l = sm_prev;
             float sm_m = sigma_mie0 * exp(-h_mid   / kHmie);
