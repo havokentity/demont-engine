@@ -865,6 +865,29 @@ TEST_CASE("degenerate inputs stay finite") {
             }
         }
     }
+    // The ray entry point over BOTH of its free magnitudes.  The sweep
+    // above pins the ray parameter with the origin at eye height; a large
+    // origin takes ptRayAltitudeBegin down the ungated branch instead, and
+    // the composition of the two is what the march actually is.  Safe by
+    // construction -- a large origin makes `stable` false, which routes
+    // every sample to the naive form the point sweep already covers -- but
+    // an untested composition is exactly what produced the CI failure this
+    // case exists for, so it is swept rather than argued.
+    for (int Eo = -10; Eo <= 126; Eo += 4) {
+        CAPTURE(Eo);
+        float u = std::ldexp(1.0f, Eo);
+        F3 ro{u * 0.6f, u * 0.5f, u * 0.7f};
+        for (F3 rd : {F3{0.0f, 1.0f, 0.0f},
+                      F3{0.6f, 0.5f, 0.62449980f},
+                      F3{0.0f, -1.0f, 0.0f}}) {
+            PtRayAltitude a = ptRayAltitudeBegin(ro, rd, kEngineCentre, kEarthRadius);
+            for (int Es = -10; Es <= 126; Es += 4) {
+                CAPTURE(Es);
+                CHECK(finiteBits(ptRayAltitudeAt(a, std::ldexp(1.0f, Es))));
+            }
+            CHECK(finiteBits(ptRayAltitudeAt(a, 1.0e30f)));
+        }
+    }
     // Above the gate the answer is not just finite, it is still RIGHT to
     // the precision the naive form can offer -- the scaled branch must not
     // quietly return nonsense.  At |p| = 2^80 the altitude is |p| to
