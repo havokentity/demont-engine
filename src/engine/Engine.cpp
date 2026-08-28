@@ -912,7 +912,7 @@ namespace cvar {
     // "procedural". The sun position drives both the sky colour gradient
     // and the disk; positive elevation = above horizon (day), negative =
     // below (night); azimuth in degrees, 0 = -Z (north), 90 = +X (east).
-    PT_CVAR(r_sky_mode,        "hdri", "Sky rendering: gradient (cheap fallback) | hdri (sample r_env_map) | procedural (analytic with sun position) | hosek (Hosek-Wilkie physically-based analytic sky-dome, driven by r_sky_turbidity + r_sky_ground_albedo + sun position). Defaults to hdri so the bundled sunset.hdr is visible out of the box.", CVAR_ARCHIVE);
+    PT_CVAR(r_sky_mode,        "hdri", "Sky rendering: gradient (cheap fallback) | hdri (sample r_env_map) | procedural (analytic with sun position) | hosek (Hosek-Wilkie physically-based analytic sky-dome, driven by r_sky_turbidity + r_sky_ground_albedo + sun position) | physical (single-scattering integral marched along the view ray -- the only mode with an unlimited altitude range). Defaults to hdri so the bundled sunset.hdr is visible out of the box. ALTITUDE RANGE, which is the difference that matters once a scene has a planet in it: gradient, hdri, procedural and hosek are sky DOMES -- functions of view direction with the observer implicitly at ground level. procedural returns the same zenith colour at eye height and at 400 km, and hosek clamps its zenith cosine to [0,1] and fades its own horizon, so neither has any representation for an observer outside the air. They are correct and cheap up to a few tens of km and are the right choice for every non-planetary scene. physical (planetary P6, issue #260) integrates Rayleigh + Mie single scattering through the real atmosphere shell (issue #257's three-species body, including ozone) between the camera and space: at eye height the chord is 100 km of dense air and the sky is blue, at 400 km looking up the chord is empty and the sky is black, and the terminator, the lit limb and orbital sunrise all fall out of the same integral with no fade and no altitude threshold. It costs a per-pixel march, needs r_planet_radius > 0 (it falls back to procedural with a one-shot warning otherwise), and implies r_sun_physical_transmittance so the air and the ground agree about what colour the sunlight is. It is single-scatter only, so a clear daytime zenith reads darker than reality -- see r_volumetric_samples for the step budget.", CVAR_ARCHIVE);
     PT_CVAR(r_sun_elevation,   "30.0", "Sun elevation in degrees above horizon (-90..90). Drives day/sunset/night blend in procedural sky. Overridden when r_sky_use_astronomical = 1.", CVAR_ARCHIVE);
     PT_CVAR(r_sun_azimuth,     "135.0","Sun azimuth in degrees (0=north, 90=east, 180=south, 270=west). Overridden when r_sky_use_astronomical = 1.", CVAR_ARCHIVE);
     // --- Wave 9 hosek-sky ---
@@ -10044,9 +10044,45 @@ void Engine::RenderFrame() {
     // the Hosek dome -- env lighting and the visible sky stay consistent.
     else if (sky_mode_str == "hosek")      sky_mode_id = 3;
     // --- end Wave 9 hosek-sky ---
+    // --- Planetary P6 (#260) ---
+    // mode 4 = physical. The sky is integrated along the view ray instead
+    // of painted, which is what makes it survive the camera leaving the
+    // atmosphere. It is a statement about a BODY: without a planet radius
+    // there is no shell to integrate through and no horizon to occlude
+    // the sun, so it falls back to procedural rather than rendering a
+    // black frame. A rename-over-warning would not help here -- the mode
+    // is right, the scene is simply not planetary -- so this logs once
+    // and says which cvar to set.
+    else if (sky_mode_str == "physical") {
+        float pr = 0.0f;
+        if (auto* v = C.FindCVar("r_planet_radius")) pr = v->GetFloat();
+        if (pr > 0.0f) {
+            sky_mode_id = 4;
+        } else {
+            sky_mode_id = 2;
+            static bool warned_physical_no_body = false;
+            if (!warned_physical_no_body) {
+                warned_physical_no_body = true;
+                LOG_WARN("r_sky_mode physical needs a planet: "
+                         "r_planet_radius is 0, so there is no atmosphere "
+                         "shell to integrate. Falling back to procedural.");
+            }
+        }
+    }
+    // --- end Planetary P6 ---
     else /* procedural (default) */        sky_mode_id = 2;
     push.sun_and_mode[3] = float(sky_mode_id);
     push.env_map_present = (sky_mode_id == 1u) ? 1u : 0u;
+    // The physical sky and a tuned sun curve cannot coexist: skyPhysical
+    // lights every march sample with sunSlantTransmittance, so if the
+    // NEE site and the cloud march were still using
+    // exp(-0.30 / max(sun_elev, 0.04)) the air and the ground would
+    // disagree about what colour the sunlight is, and the sun would keep
+    // lighting the night side because that curve has no notion of a body
+    // in the way. Mode 4 therefore implies r_sun_physical_transmittance
+    // rather than leaving the pair to be set consistently by hand.
+    // Modes 0-3 keep the cvar's own value, so P3's A/B is untouched.
+    if (sky_mode_id == 4u) push.sun_extra2[1] = 1.0f;
     // --- Wave 9 hosek-sky ---
     // Fill the Hosek-Wilkie parameters. Read by the shader only in mode
     // 3, but always populated (cheap) so a mid-render r_sky_mode switch
@@ -17504,7 +17540,8 @@ void Engine::RegisterCommands() {
     }
     // Sky cvars: changing any of them invalidates accumulation.
     if (auto* v = C.FindCVar("r_sky_mode")) {
-        v->allowed_values = {"gradient", "hdri", "procedural", "hosek"};
+        v->allowed_values = {"gradient", "hdri", "procedural", "hosek",
+                             "physical"};
         v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };
     }
     if (auto* v = C.FindCVar("r_sun_elevation")) {
@@ -18105,12 +18142,14 @@ void Engine::RegisterCommands() {
         const char* hint;
     };
     // True for sky modes that consume the manual sun-position cvars:
-    // procedural and hosek (Wave 9). Both derive the sun direction from
-    // r_sun_elevation / r_sun_azimuth (or the astronomical override), so
-    // those cvars are NOT inert in either mode.
+    // procedural, hosek (Wave 9) and physical (planetary P6, #260). All
+    // three derive the sun direction from r_sun_elevation /
+    // r_sun_azimuth (or the astronomical override), so those cvars are
+    // NOT inert in any of them.
     auto sky_proc = []() {
         auto* m = pt::console::Console::Get().FindCVar("r_sky_mode");
-        return m != nullptr && (m->value == "procedural" || m->value == "hosek");
+        return m != nullptr && (m->value == "procedural" || m->value == "hosek"
+                             || m->value == "physical");
     };
     auto clouds_on = []() {
         auto* c = pt::console::Console::Get().FindCVar("r_clouds");

@@ -968,6 +968,14 @@ TEST_CASE("shader mirror is still faithful") {
         }
         return tight;
     };
+    // Occurrences, not presence.  A substring pin is satisfied by one
+    // correct copy however many wrong ones exist elsewhere, which is how
+    // #276 stayed live for a cycle under a passing test.
+    auto countOf = [](const std::string& hay, const std::string& needle) {
+        std::size_t n = 0, at = 0;
+        while ((at = hay.find(needle, at)) != std::string::npos) { ++n; ++at; }
+        return n;
+    };
 
     const std::string math = tighten(PT_SHADER_MATH_PATH);
     // The two kernels this issue promoted out of module scope.
@@ -1020,12 +1028,48 @@ TEST_CASE("shader mirror is still faithful") {
     // march lives, not of which file it lives in.
     CHECK(math.find("PtRayAltitudealt=ptRayAltitudeBegin(ro,rd,centre,b.ground_radius);")
           != std::string::npos);
-    CHECK(math.find("max(ptRayAltitudeAt(alt,0.0),0.0)") != std::string::npos);
+    // The left boundary moved from a literal 0.0 to `lo`, the shell-clip
+    // entry, in #260 -- the same hoisted quadratic, evaluated at the
+    // start of the clipped interval instead of at the ray origin.  Pinned
+    // on `lo` so a revert to the unclipped form fails here as well as in
+    // pt_atmosphere_test's black-disc case.
+    CHECK(math.find("max(ptRayAltitudeAt(alt,lo),0.0)") != std::string::npos);
     CHECK(math.find("max(ptRayAltitudeAt(alt,s_mid),0.0)") != std::string::npos);
     CHECK(math.find("max(ptRayAltitudeAt(alt,s_right),0.0)") != std::string::npos);
-    // And that PathTrace.slang no longer carries a second march of its
-    // own -- the whole point of the move.
-    CHECK(pt.find("ptRayAltitudeBegin(") == std::string::npos);
+    // And that PathTrace.slang carries no second march of the OPTICAL
+    // DEPTH -- the whole point of the #257 move.
+    //
+    // #260 narrowed this from "no ptRayAltitudeBegin at all" to "exactly
+    // one, and it is the in-scatter march". skyPhysical integrates
+    // RADIANCE along the view ray, which is a different integral from
+    // the optical depth ptAtmoOpticalDepth owns; what it must not do is
+    // materialise p(s) and take a length, because at |p| ~ 6.4e6 that
+    // costs ~0.5 m of altitude noise on every sample and the sample is
+    // then fed to exp(-h/1200). So it hoists the same quadratic through
+    // the same kernel, which is the behaviour #271 exists to enforce and
+    // is what this pin should have been asserting all along.
+    //
+    // Counted, and located: an occurrence anywhere OTHER than inside
+    // skyPhysical would be the duplicate march this pin is for.
+    CHECK(countOf(pt, "ptRayAltitudeBegin(") == 1u);
+    {
+        const std::size_t at = pt.find("float3skyPhysical(");
+        const std::size_t use = pt.find("ptRayAltitudeBegin(");
+        const std::size_t end = pt.find("float3sunDiscPhysical(");
+        REQUIRE(at != std::string::npos);
+        REQUIRE(end != std::string::npos);
+        CHECK(use > at);
+        CHECK(use < end);
+    }
+    // ...and that it did not bring a Simpson optical-depth rule with it.
+    // Exactly ONE composite-Simpson weight survives in this file, and it
+    // is the legacy PLANAR branch of atmosphericTransmittance -- the
+    // r_planet_radius 0 A/B, which #257 deliberately kept inline so that
+    // the planar and spherical halves differ in exactly one line (how
+    // h(s) is computed) and stay a controlled comparison. A second one
+    // appearing would be the duplicate march this pin is for.
+    CHECK(countOf(pt, "floatoneSixth=1.0/6.0;") == 1u);
+    CHECK(pt.find("floatoneSixth=1.0/6.0;") < pt.find("float3skyPhysical("));
     // And that no naive altitude survived at either site.
     CHECK(pt.find("length(p-planet_center_radius.xyz)-planet_center_radius.w")
           == std::string::npos);

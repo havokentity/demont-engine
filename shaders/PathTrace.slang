@@ -3136,12 +3136,37 @@ float3 starsOnly(float3 rd, float3 sun) {
     float cosTheta = clamp(dot(rd, up), -1.0, 1.0);
     float sun_elev = dot(up, sun);
     float day      = smoothstep(-0.10, 0.20, sun_elev);
+    // Planetary P6 (#260): WHERE THE STARS STOP.
+    //
+    // `cosTheta > -0.05` is a flat-Earth statement -- "anything more than
+    // 2.9 degrees below the observer's horizontal is ground". At eye
+    // height that is nearly true (the visible horizon dips 3.7 arcmin)
+    // and the 2.9 degrees is slack. From 400 km the hard limb sits 19.8
+    // degrees below local horizontal, so the band from 2.9 to 19.8
+    // degrees down is genuine black sky full of stars, and the gate
+    // paints a hard horizontal line across the frame with stars above it
+    // and nothing below -- a discontinuity that opens up as the camera
+    // climbs, which is exactly what this phase exists to close.
+    //
+    // The physically correct criterion is whether the body is in the way,
+    // and it needs no threshold at all. Only available when there IS a
+    // body: without one there is no sphere to test and the 2.9-degree
+    // slack stays, so every pre-#260 fixture is bit-stable (none of them
+    // sets a planetary frame and stars together).
+    bool star_visible = (cosTheta > -0.05);
+    if (planet_center_radius.w > 0.0) {
+        float b0, b1;
+        star_visible = !(ptSphereRoots(pos_fovtan.xyz, rd,
+                                       planet_center_radius.xyz,
+                                       planet_center_radius.w, b0, b1)
+                         && b0 > 0.0);
+    }
     // BSC starmap (real Yale Bright Star Catalog, J2000 frame). Sampled
     // additively whenever the host has uploaded the texture and we're
     // looking above the horizon. Falls back to the procedural cell-hash
     // scatter below when the starmap isn't available -- the host gates
     // exposure_pad.z (BSC) and .y (procedural) to be mutually exclusive.
-    if (cosTheta > -0.05 && exposure_pad.z > 0.5 && day < 0.6) {
+    if (star_visible && exposure_pad.z > 0.5 && day < 0.6) {
         // World ray -> J2000 unit vector via the per-frame rotation.
         float3 j;
         j.x = dot(w2j_row0.xyz, rd);
@@ -3209,7 +3234,7 @@ float3 starsOnly(float3 rd, float3 sun) {
         }
         // Fade with day so stars vanish at sunrise.
         return stars * (1.0 - day);
-    } else if (cosTheta > -0.05 && exposure_pad.y > 0.5 && day < 0.6) {
+    } else if (star_visible && exposure_pad.y > 0.5 && day < 0.6) {
         // Cells sized so each one is ~3-5 pixels wide on a 1080p frame
         // -- smaller cells make stars sub-pixel and they vanish.
         float2 ll = float2(atan2(rd.z, rd.x) * (1.0 / 6.28318530718) + 0.5,
@@ -3253,6 +3278,10 @@ float3 starsAtPrimaryMiss(float3 rd) {
     // issue acceptance criterion "bloom halos proportional to
     // brightness" implies a real threshold to know what counts as
     // a "star"). All other modes return 0 here.
+    // Mode 4 (physical, #260) composites its celestials inside skyColor
+    // and the engine leaves the post-denoise composite off for it, so
+    // this helper -- which exists only to let the composite SUBTRACT the
+    // inline stars -- must not claim mode 4's stars.
     if (mode == 2u) {
         return starsOnly(rd, sun_and_mode.xyz);
     }
@@ -3820,98 +3849,6 @@ float3 clampIndirect(float3 c) {
     return (m > w2j_row2.w) ? c * (w2j_row2.w / m) : c;
 }
 
-float3 skyColor(float3 rd) {
-    float3 base;
-    uint mode = uint(sun_and_mode.w);
-    // --- Wave 9 hosek-sky ---
-    // mode == 3 -> Hosek-Wilkie physically-based sky. Routed like the
-    // procedural path (mode 2): the analytic dome drives both the
-    // visible sky AND the diffuse-skylight ambient sampled at secondary
-    // bounces (skyColor(nf) in the Lambert NEE block), and the same
-    // sun/moon disc overlays + stars are composited on top.
-    if (mode == 3u) {
-        base = hosekSky(rd, sun_and_mode.xyz);
-        return base + moonDisc(rd, moon_dir_phase, sun_and_mode.xyz)
-             + sunDisc(rd, sun_and_mode.xyz);
-    }
-    // --- end Wave 9 hosek-sky ---
-    if (mode == 2u) {
-        base = procSky(rd, sun_and_mode.xyz);
-    } else if (env_map_present != 0u) {
-        // Original env_map path follows.
-        base = float3(0.0);   // filled below
-    } else {
-        float t = clamp(0.5 * (rd.y + 1.0), 0.0, 1.0);
-        base = lerp(float3(0.50, 0.55, 0.62), float3(1.0, 1.0, 1.0), t);
-    }
-    if (mode == 2u) {
-        return base + moonDisc(rd, moon_dir_phase, sun_and_mode.xyz)
-             + sunDisc(rd, sun_and_mode.xyz);
-    }
-    if (env_map_present != 0u) {
-        // Lat-long lookup: u from atan2 of horizontal plane, v from
-        // arccos of vertical component. (u, v) in [0,1].
-        uint2 dim;
-        env_map.GetDimensions(dim.x, dim.y);
-        float u = atan2(rd.z, rd.x) * (1.0 / 6.28318530718) + 0.5;
-        float v = acos(clamp(rd.y, -1.0, 1.0)) * (1.0 / 3.14159265359);
-        // Bilinear by hand: nearest-neighbour gives visible quantisation
-        // around the sun where the env-map is brightest.
-        float2 fpix = float2(u * float(dim.x), v * float(dim.y)) - 0.5;
-        int2  ipix = int2(floor(fpix));
-        float2 f   = fpix - float2(ipix);
-        int x0 = (ipix.x % int(dim.x) + int(dim.x)) % int(dim.x);
-        int x1 = (x0 + 1) % int(dim.x);
-        int y0 = clamp(ipix.y, 0, int(dim.y) - 1);
-        int y1 = clamp(ipix.y + 1, 0, int(dim.y) - 1);
-        float3 c00 = env_map[uint2(x0, y0)].rgb;
-        float3 c10 = env_map[uint2(x1, y0)].rgb;
-        float3 c01 = env_map[uint2(x0, y1)].rgb;
-        float3 c11 = env_map[uint2(x1, y1)].rgb;
-        float3 sky = lerp(lerp(c00, c10, f.x), lerp(c01, c11, f.x), f.y);
-        // P12: HDRI mode is the canonical "all info from the HDRI"
-        // path. The HDRI texture itself contains the sun, moon, stars
-        // and any other celestial bodies baked in. We deliberately do
-        // NOT add a procedural sunDisc / moonDisc overlay -- the user's
-        // expectation is that the rendered sky matches the HDRI source.
-        // Crisp directional shadows come from the stochastic NEE over
-        // hdri_lights[] (extracted bright clusters) in the path
-        // tracer's Lambert hit handling.
-        return sky * env_intensity;
-    }
-    return base + moonDisc(rd, moon_dir_phase, sun_and_mode.xyz)
-             + sunDisc(rd, sun_and_mode.xyz);
-}
-
-// Sky WITHOUT the sun/moon disc + halo overlays. The diffuse-ambient
-// estimator in the Lambert NEE block must not see the celestial discs:
-// sun and moon direct light are integrated by their own NEE blocks
-// (with real shadow rays), so an ambient tap that includes disc/halo
-// radiance double-counts them with NO visibility test -- sun-facing
-// slopes at sunset read visibly too bright and receive unshadowed
-// "ambient" sun. Mirrors the composite-subtraction at the primary-miss
-// branch, which is the single source of truth for which terms count as
-// celestial overlays.
-float3 skyColorBase(float3 rd) {
-    uint mode = uint(sun_and_mode.w);
-    if (mode == 3u) {
-        // Hosek-Wilkie dome radiance carries no inline disc; skyColor
-        // adds sunDisc/moonDisc on top, which is exactly what we skip.
-        return hosekSky(rd, sun_and_mode.xyz);
-    }
-    if (mode == 2u) {
-        // procSky bakes its own inline sun disc + halo -- subtract it
-        // with the same helper the celestial composite uses.
-        return procSky(rd, sun_and_mode.xyz)
-             - procSkyInlineSunDiscAndHalo(rd, sun_and_mode.xyz);
-    }
-    if (env_map_present != 0u) {
-        // HDRI path adds no procedural overlays; the map IS the base.
-        return skyColor(rd);
-    }
-    float t = clamp(0.5 * (rd.y + 1.0), 0.0, 1.0);
-    return lerp(float3(0.50, 0.55, 0.62), float3(1.0, 1.0, 1.0), t);
-}
 
 float3 acesTonemap(float3 c) {
     const float a = 2.51, b = 0.03, d = 2.43, e = 0.59, f = 0.14;
@@ -5694,6 +5631,350 @@ float3 sunRadianceAt(float3 p, float3 sun_dir, float sun_elev) {
     return sun_col * (80.0 * trans_atm);
 }
 
+// --- Planetary P6 (#260): the sky that survives leaving ---------------------
+//
+// r_sky_mode physical.  Sky radiance is INTEGRATED along the view ray
+// rather than painted, and that single property is what makes the climb
+// from the surface to orbit continuous.
+//
+// WHY A FIFTH MODE AND NOT A FIX TO procSky
+//
+// procSky and hosekSky are analytic sky DOMES: functions of view
+// direction with the observer implicitly on the ground.  They are
+// accelerators for a ground observer, and good ones -- hosek in
+// particular is the genuine ArHosekSkyModel dataset.  Neither can leave.
+// procSky's zenith is the literal float3(0.32, 0.55, 0.92) at eye height
+// and the same literal at 400 km; hosek clamps cos_theta to [0, 1] and
+// fades its horizon, so it has no representation for "most of the sphere
+// is vacuum" at all.  Attempts to rescue them are all the same shape --
+// fade the painted dome out on altitude -- and a fade is a tuned
+// constant standing exactly where the discontinuity is.
+//
+// The physical mode has no accelerator to swap out, so there is no
+// crossover to hide.  At 1.7 m the chord through the shell is 100 km of
+// dense air and the integral is blue; at 400 km looking up the chord is
+// empty and the integral is zero, so the sky is black.  No fade, no
+// threshold, no cvar: it falls out of the geometry.  The roadmap
+// specifies a sky-view LUT gated on camera-inside-shell with a 10 km
+// cross-fade; direct evaluation everywhere is the same design with the
+// accelerator (and therefore the cross-fade, and therefore the tuning)
+// removed, which this engine can afford because it never rasterizes and
+// already marches per pixel.
+//
+// THE SAMPLE DISTRIBUTION IS ALTITUDE-INDEPENDENT, WHICH IS THE WHOLE
+// CONTINUITY ARGUMENT
+//
+// Uniform-in-distance stepping over [0, t] is catastrophic from orbit --
+// a nadir ray from 400 km is 400 km long and 90% of its optical depth is
+// in the last 20 km.  Stepping over the SHELL-CLIPPED interval instead
+// removes that failure without any stratification at all, because the
+// clipped interval always spans the same air whatever the camera's
+// altitude: a ground camera looking up and an orbital camera looking
+// down integrate the same 100 km column with the same N samples in the
+// same places.  The quadrature error is therefore a function of the
+// geometry of the ray and not of where the camera is, and an error that
+// does not move as the camera climbs cannot produce a pop.
+//
+// Samples are jittered (`(i + xi) * dt`), which makes this an unbiased
+// estimator of the integral rather than a fixed-point rule, so the
+// accumulator converges the residual quadrature error away over frames
+// instead of baking it in.
+//
+// WHAT IS IN THE INTEGRAL
+//
+//   L = integral over the shell chord of
+//         T(camera -> s) * [ sigma_s_R(h) P_R(mu) + sigma_s_M(h) P_CS(mu, g) ]
+//                        * L_sun * T(s -> sun)
+//
+// Three species from the body (#257), both real phase functions, and the
+// sun term is the same sunSlantTransmittance the NEE site and the cloud
+// march use -- so the light the sky is made of and the light the ground
+// is lit by cannot disagree.  T(s -> sun) returning zero when the body
+// occludes the sun IS the night side, and the terminator is the graded
+// region where it is partial: no elevation threshold anywhere.
+//
+// WHAT IS NOT IN IT, STATED RATHER THAN HIDDEN
+//
+//   * MULTIPLE SCATTERING.  Single-scatter only, so the sky is darker
+//     than reality -- most visibly at the zenith on a clear day and
+//     through twilight, where second-order Rayleigh is a large fraction
+//     of the total.  The fix is Hillaire's 32x32 (r, mu_s) multi-scatter
+//     LUT, which needs the LUT infrastructure this engine does not have
+//     yet.  Named in #253; deliberately not built here.
+//   * GROUND-REFLECTED LIGHT.  The planet's own albedo does not light
+//     the air above it.
+//   * SCENE OCCLUSION of the sky column.  Terrain and clouds do not
+//     shadow this march; the analytic BODY does, via
+//     sunSlantTransmittance, and at planetary scale that is the term
+//     that matters.  The primary-HIT aerial-perspective march still uses
+//     transmittance(), so god rays through cloud gaps are unaffected.
+//
+// PRECONDITION: `rd` is unit length.  It is both the integration measure
+// and the s^2 coefficient of the hoisted altitude quadratic.
+float3 skyPhysical(float3 ro, float3 rd, float t_max, int steps,
+                   inout uint seed) {
+    float planet_R = sun_extra.w;
+    // The physical sky is a statement about a body.  Without one there is
+    // no shell to clip to and no horizon to occlude the sun, so the mode
+    // has nothing to integrate; the host refuses to select it in that
+    // state and this is the shader-side guard for the same condition.
+    if (planet_R <= 0.0) return float3(0.0);
+    PtAtmoBody body = atmosphereBody();
+    float3 pc = (planet_center_radius.w > 0.0) ? planet_center_radius.xyz
+                                               : float3(0.0, -planet_R, 0.0);
+    float t_in, t_out;
+    // r_inner = 0 so this is the near piece of the ray inside top_radius,
+    // correct for an origin below, inside or above the shell alike.
+    if (!ptRayShell(ro, rd, pc, 0.0, body.top_radius, t_max, t_in, t_out)) {
+        return float3(0.0);        // the ray never touches air -- space
+    }
+    // The body is opaque: stop the column where the ground starts.
+    float g0, g1;
+    if (ptSphereRoots(ro, rd, pc, planet_R, g0, g1) && g0 > 0.0) {
+        t_out = min(t_out, g0);
+    }
+    if (!(t_out > t_in)) return float3(0.0);
+
+    float3 sun_dir = sun_and_mode.xyz;
+    // Scattering angle.  Incident light propagates along -sun_dir and
+    // leaves toward -rd, so the phase cosine is dot(rd, sun_dir) -- the
+    // same convention the in-scatter march uses.
+    float mu   = dot(rd, sun_dir);
+    float ph_r = ptPhaseRayleigh(mu);
+    // The aerosol asymmetry comes from r_volumetric_anisotropy
+    // (vol_params.y, default 0.7) and NOT from the body's own mie_g, which
+    // ptAtmoEarth sets to the Cornette-Shanks 0.8.  Deliberate: the
+    // aerial-perspective march next door reads the same cvar, and the two
+    // meet at the limb, so a disagreement here would be a seam.  Honouring
+    // the user's knob in both is worth more than honouring the body's
+    // constant in one of them.  Unifying them is a change to the AP march
+    // as well, which moves clouds_godrays, so it belongs with that
+    // regeneration and not here.
+    float ph_m = ptPhaseCornetteShanks(mu, vol_params.y);
+
+    int   N  = max(steps, 1);
+    float dt = (t_out - t_in) / float(N);
+    float xi = randf(seed);
+    // Hoisted cancellation-free altitude (#271): the quadratic is
+    // accumulated once and each sample costs two fma, instead of
+    // materialising p(s) and subtracting two ~6.4e6 quantities.
+    PtRayAltitude alt = ptRayAltitudeBegin(ro, rd, pc, body.ground_radius);
+    float3 trans = float3(1.0);
+    float3 acc   = float3(0.0);
+    for (int i = 0; i < N; ++i) {
+        float s = t_in + (float(i) + xi) * dt;
+        if (s >= t_out) break;
+        float h = max(ptRayAltitudeAt(alt, s), 0.0);
+        float3 sigma_s_ray, sigma_s_mie, sigma_t;
+        ptAtmoCoefficients(body, h, sigma_s_ray, sigma_s_mie, sigma_t);
+        // Sunlight AT THIS SAMPLE.  Zero when the body is between the
+        // sample and the sun, which is what "night" means and needs no
+        // elevation gate; reddened by the real slant path, which is what
+        // the terminator and orbital sunrise are made of.
+        float3 sp     = ro + rd * s;
+        float3 sun_at = float3(80.0) * sunSlantTransmittance(sp, sun_dir);
+        if (any(sun_at > float3(0.0))) {
+            acc += trans * (sigma_s_ray * ph_r + sigma_s_mie * ph_m)
+                 * sun_at * dt;
+        }
+        trans *= exp(-sigma_t * dt);
+    }
+    // r_volumetric_intensity, the same artistic gain the in-scatter march
+    // applies, so the sky and the aerial perspective under it move
+    // together instead of drifting apart when a user turns it.
+    return acc * vol_params.z;
+}
+
+// The sun's own disc in the physical mode.
+//
+// Two things change from sunDisc().  The `sun_elev < -0.10` cutoff goes:
+// whether the sun is visible is whether the BODY is in the way, which
+// sunSlantTransmittance already answers exactly, and from outside the
+// atmosphere there is no elevation at which the sun should vanish.  And
+// the exp(-0.30 / max(sun_elev, 0.04)) attenuation with its hand-authored
+// warm/cool endpoint lerp goes: the disc's colour is the slant-path
+// transmittance, so the sun reddens through a real air mass on the way
+// down and is pure white from orbit, and orbital sunrise -- the sun
+// climbing out from behind the limb through a real grazing column --
+// costs nothing extra because it is the same expression.
+//
+// The halo goes too, and that is a deletion rather than a loss: the
+// bright bloom around a low sun is forward Mie scattering, which
+// skyPhysical now computes properly through the Cornette-Shanks phase at
+// g = 0.8.  Drawing the painted halo as well would double-count it.
+//
+// DISC RADIANCE IS DERIVED, NOT TUNED.  sunRadianceAt returns 80 * T as
+// the solar irradiance in the engine's tonemap-relative units.  A disc of
+// solid angle Omega carrying irradiance E has radiance E / Omega, so the
+// rendered disc is 80 * T / Omega with Omega = 2 pi (1 - cos r) for the
+// rendered half-angle r.  Taking Omega from the RENDERED radius rather
+// than from the sun's true 0.2666 deg makes r_sun_size energy-conserving:
+// a bigger disc is proportionally dimmer and puts the same flux on the
+// scene, which is the property that stops the disc size from being a
+// brightness knob in disguise.
+float3 sunDiscPhysical(float3 ro, float3 rd, float3 sun_dir) {
+    float3 T = sunSlantTransmittance(ro, sun_dir);
+    if (!any(T > float3(0.0))) return float3(0.0);   // body in the way
+    float ang = dot(rd, sun_dir);
+    // Same angular geometry as sunDisc: r_sun_size times the
+    // perihelion/aphelion ratio from the ephemeris (sun_extra.y).
+    float sun_mult = max(sun_extra.x * sun_extra.y, 0.1);
+    float r_deg    = 0.55 * sun_mult;
+    float r_rad    = r_deg * 0.0174533;
+    float kCosR    = cos(r_rad);
+    if (ang <= kCosR) return float3(0.0);
+
+    // Saemundsson horizon flatten (r_sun_horizon_flatten, sun_extra.z).
+    // Real refraction, kept -- but its trigger is the APPARENT elevation
+    // at the camera, which the host now derives from the camera's own
+    // local up rather than from the global sun.y.
+    float vflat = sun_extra.z;
+    if (vflat < 0.999) {
+        float3 world_up    = localUp(ro);
+        float3 local_right = normalize(cross(world_up, sun_dir));
+        float3 local_up    = cross(sun_dir, local_right);
+        float3 delta       = rd - sun_dir * ang;
+        float  h_off       = dot(delta, local_right);
+        float  v_off       = dot(delta, local_up);
+        float  r_v         = r_rad * vflat;
+        float  ellipse     = (h_off * h_off) / (r_rad * r_rad)
+                           + (v_off * v_off) / (r_v * r_v);
+        if (ellipse > 1.0) return float3(0.0);
+    }
+
+    float omega = 6.28318530718 * (1.0 - kCosR);   // sr, rendered disc
+    float bright = max(sun_extra2.x, 0.0);         // r_sun_disc_brightness
+    return T * (80.0 / max(omega, 1.0e-12)) * bright;
+}
+// --- end Planetary P6 physical sky ------------------------------------------
+
+// `ro` is the ray's ORIGIN, and it is load-bearing only in mode 4
+// (planetary P6, #260).  procSky documents an approximation it has always
+// carried: it reads the CAMERA's altitude out of pos_fovtan even when a
+// secondary bounce called it, so a puddle at ground level under a 10 km
+// camera sees a 10 km horizon.  From orbit that error is 400 km.  The
+// physical mode takes the origin per call, so the approximation is simply
+// absent there -- every call site already has the right origin in scope
+// (the bounce's `ro`, or the surface point), it was never plumbed.  Modes
+// 0-3 ignore the parameter and are unchanged.
+float3 skyColor(float3 ro, float3 rd, inout uint seed) {
+    float3 base;
+    uint mode = uint(sun_and_mode.w);
+    // --- Planetary P6 (#260): mode == 4 -> physical, marched sky --------
+    // The only mode that survives leaving the atmosphere.  There is no
+    // painted base at all: the integral IS the sky, so it goes black
+    // outside the shell without a fade.  Celestials ride on top exactly
+    // as they do in the procedural and hosek modes, except that the sun
+    // disc is the physical one.
+    if (mode == 4u) {
+        return skyPhysical(ro, rd, 1.0e30, int(max(vol_params.w, 1.0)), seed)
+             + starsOnly(rd, sun_and_mode.xyz)
+             + moonDisc(rd, moon_dir_phase, sun_and_mode.xyz)
+             + sunDiscPhysical(ro, rd, sun_and_mode.xyz);
+    }
+    // --- Wave 9 hosek-sky ---
+    // mode == 3 -> Hosek-Wilkie physically-based sky. Routed like the
+    // procedural path (mode 2): the analytic dome drives both the
+    // visible sky AND the diffuse-skylight ambient sampled at secondary
+    // bounces (skyColorBase(hit_pt, nf, seed) in the Lambert NEE block),
+    // and the same
+    // sun/moon disc overlays + stars are composited on top.
+    if (mode == 3u) {
+        base = hosekSky(rd, sun_and_mode.xyz);
+        return base + moonDisc(rd, moon_dir_phase, sun_and_mode.xyz)
+             + sunDisc(rd, sun_and_mode.xyz);
+    }
+    // --- end Wave 9 hosek-sky ---
+    if (mode == 2u) {
+        base = procSky(rd, sun_and_mode.xyz);
+    } else if (env_map_present != 0u) {
+        // Original env_map path follows.
+        base = float3(0.0);   // filled below
+    } else {
+        float t = clamp(0.5 * (rd.y + 1.0), 0.0, 1.0);
+        base = lerp(float3(0.50, 0.55, 0.62), float3(1.0, 1.0, 1.0), t);
+    }
+    if (mode == 2u) {
+        return base + moonDisc(rd, moon_dir_phase, sun_and_mode.xyz)
+             + sunDisc(rd, sun_and_mode.xyz);
+    }
+    if (env_map_present != 0u) {
+        // Lat-long lookup: u from atan2 of horizontal plane, v from
+        // arccos of vertical component. (u, v) in [0,1].
+        uint2 dim;
+        env_map.GetDimensions(dim.x, dim.y);
+        float u = atan2(rd.z, rd.x) * (1.0 / 6.28318530718) + 0.5;
+        float v = acos(clamp(rd.y, -1.0, 1.0)) * (1.0 / 3.14159265359);
+        // Bilinear by hand: nearest-neighbour gives visible quantisation
+        // around the sun where the env-map is brightest.
+        float2 fpix = float2(u * float(dim.x), v * float(dim.y)) - 0.5;
+        int2  ipix = int2(floor(fpix));
+        float2 f   = fpix - float2(ipix);
+        int x0 = (ipix.x % int(dim.x) + int(dim.x)) % int(dim.x);
+        int x1 = (x0 + 1) % int(dim.x);
+        int y0 = clamp(ipix.y, 0, int(dim.y) - 1);
+        int y1 = clamp(ipix.y + 1, 0, int(dim.y) - 1);
+        float3 c00 = env_map[uint2(x0, y0)].rgb;
+        float3 c10 = env_map[uint2(x1, y0)].rgb;
+        float3 c01 = env_map[uint2(x0, y1)].rgb;
+        float3 c11 = env_map[uint2(x1, y1)].rgb;
+        float3 sky = lerp(lerp(c00, c10, f.x), lerp(c01, c11, f.x), f.y);
+        // P12: HDRI mode is the canonical "all info from the HDRI"
+        // path. The HDRI texture itself contains the sun, moon, stars
+        // and any other celestial bodies baked in. We deliberately do
+        // NOT add a procedural sunDisc / moonDisc overlay -- the user's
+        // expectation is that the rendered sky matches the HDRI source.
+        // Crisp directional shadows come from the stochastic NEE over
+        // hdri_lights[] (extracted bright clusters) in the path
+        // tracer's Lambert hit handling.
+        return sky * env_intensity;
+    }
+    return base + moonDisc(rd, moon_dir_phase, sun_and_mode.xyz)
+             + sunDisc(rd, sun_and_mode.xyz);
+}
+
+// Sky WITHOUT the sun/moon disc + halo overlays. The diffuse-ambient
+// estimator in the Lambert NEE block must not see the celestial discs:
+// sun and moon direct light are integrated by their own NEE blocks
+// (with real shadow rays), so an ambient tap that includes disc/halo
+// radiance double-counts them with NO visibility test -- sun-facing
+// slopes at sunset read visibly too bright and receive unshadowed
+// "ambient" sun. Mirrors the composite-subtraction at the primary-miss
+// branch, which is the single source of truth for which terms count as
+// celestial overlays.
+float3 skyColorBase(float3 ro, float3 rd, inout uint seed) {
+    uint mode = uint(sun_and_mode.w);
+    if (mode == 4u) {
+        // Physical mode (#260) carries no inline celestial term at all,
+        // so the base IS the march.  It runs at a QUARTER of the primary
+        // budget with a floor of 4: this tap is one sample of a diffuse
+        // hemispherical integral that the path tracer is already
+        // estimating stochastically, so its own quadrature error is
+        // averaged over the same accumulation the ambient term is -- the
+        // visible sky, which is not averaged over directions, is what
+        // needs the full budget.  A cost choice, stated as one.
+        return skyPhysical(ro, rd, 1.0e30,
+                           max(int(vol_params.w) / 4, 4), seed);
+    }
+    if (mode == 3u) {
+        // Hosek-Wilkie dome radiance carries no inline disc; skyColor
+        // adds sunDisc/moonDisc on top, which is exactly what we skip.
+        return hosekSky(rd, sun_and_mode.xyz);
+    }
+    if (mode == 2u) {
+        // procSky bakes its own inline sun disc + halo -- subtract it
+        // with the same helper the celestial composite uses.
+        return procSky(rd, sun_and_mode.xyz)
+             - procSkyInlineSunDiscAndHalo(rd, sun_and_mode.xyz);
+    }
+    if (env_map_present != 0u) {
+        // HDRI path adds no procedural overlays; the map IS the base.
+        return skyColor(ro, rd, seed);
+    }
+    float t = clamp(0.5 * (rd.y + 1.0), 0.0, 1.0);
+    return lerp(float3(0.50, 0.55, 0.62), float3(1.0, 1.0, 1.0), t);
+}
+
 // Up to kMaxRefract dielectric bounces; beyond that the ray gives up
 // (returns 0) so a pathological all-glass scene can't loop forever.
 // TIR also returns 0 (light can't pass that interface).
@@ -6530,7 +6811,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
         //     1.5m entry-side estimate with the exact distance the ray
         //     travelled before hitting the next surface)
         //   * sky-on-miss returns water_state.yzw (deep-water tint) instead
-        //     of skyColor(rd), so TIR rays from underwater don't escape to
+        //     of skyColor(ro, rd, seed), so TIR rays from underwater do not
+        //     escape to
         //     the bright horizon when the scene runs out of geometry below
         //     the water plane.
         //
@@ -6723,7 +7005,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
 #if PT_WATER_ENABLED
             // --- Underwater sky-miss override (Phase 4, #134) ---------------
             // Ray escaped to infinity while inside the water medium. We do
-            // NOT call skyColor(rd) here -- a TIR-reflected underwater ray
+            // NOT call skyColor(ro, rd, seed) here -- a TIR-reflected
+            // underwater ray
             // looking back down at empty space should die to deep-water
             // void, not pick up bright sky-blue from the procedural sky
             // model. water_state.yzw is the tunable deep-water tint
@@ -6770,7 +7053,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     float w_brdf  = misBalance(prev_lambert_brdf_pdf, pdf_env);
                     float3 trans  = transmittance(ro, rd, 1e30, shutter_t01,
                                                   cone);
-                    radiance += clampIndirect(throughput * skyColor(rd) * trans * w_brdf);
+                    radiance += clampIndirect(throughput * skyColor(ro, rd, seed) * trans * w_brdf);
                 }
             } else if (!skip_sky_on_miss) {
                 // b == 0 is the camera ray hitting the sky directly --
@@ -6808,7 +7091,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     // hdri_lights[] / sun_rad NEE paths (not skyColor
                     // sampling). So secondary illumination from stars,
                     // moon and sun is preserved.
-                    float3 sky_full = skyColor(rd);
+                    float3 sky_full = skyColor(ro, rd, seed);
                     if (composite_celestials_active) {
                         // Subtract every celestial term skyColor()
                         // injects in mode==2:
@@ -6835,7 +7118,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         radiance += throughput * sky_full;
                     }
                 } else {
-                    radiance += clampIndirect(throughput * skyColor(rd));
+                    radiance += clampIndirect(throughput * skyColor(ro, rd, seed));
                 }
             }
             break;
@@ -7368,7 +7651,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 // disc, and a normal pointing near a celestial body
                 // would receive its direct radiance as unshadowed
                 // "ambient" ON TOP of the explicit sun/moon NEE above.
-                radiance += throughput * h.albedo * skyColorBase(nf);
+                radiance += throughput * h.albedo * skyColorBase(hit_pt, nf, seed);
                 skip_sky_on_miss = true;
             }
             throughput *= h.albedo;
@@ -7664,7 +7947,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
             // Approximation: treat (1 - trans_atm_surf) as the
             // fraction of the path's radiance that the air absorbed,
             // and replace it with the sky color in the camera's view
-            // direction. skyColor(primary_rd) samples env_map for
+            // direction. skyColor(primary_ro, primary_rd, seed) samples
+            // env_map for
             // HDRI mode (the actual sunset / clear-sky / etc. tint
             // visible behind the surface). Clamp-wrapped to bound
             // the magnitude when the view ray points toward a bright
@@ -7677,7 +7961,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
             // there to avoid double-counting.
             if (env_map_present != 0u) {
                 radiance += clampIndirect(
-                    skyColor(primary_rd) * (float3(1.0) - trans_atm_surf));
+                    skyColor(primary_ro, primary_rd, seed) * (float3(1.0) - trans_atm_surf));
             }
         }
         // Volumetric single-scatter along the primary ray. Two
@@ -7817,9 +8101,52 @@ void main(uint2 tid : SV_DispatchThreadID) {
             // HDRI mode via the analytical transmittance helper.
             bool march_mie = (vol_params.x > 0.0) && (env_map_present == 0u);
             bool march_ray = (rayleigh_int > 0.0) && (env_map_present == 0u);
-            if (march_mie || march_ray) {
-                float  t_far   = min(primary_t, 60000.0);
-                float  dt      = t_far / float(N);
+            // --- Planetary P6 (#260): the span, and who owns it ------------
+            //
+            // In the physical sky mode a primary MISS has already had its
+            // entire column integrated by skyPhysical at the miss site, so
+            // marching it again here would double-count it. A primary HIT
+            // has not: nothing else integrates camera-to-surface air, and
+            // this march is where aerial perspective comes from.
+            //
+            // For a hit, the 60 km cap has to go. It was a sensible bound
+            // for a ground camera -- Rayleigh's 8 km scale height puts
+            // almost everything in the bottom 25 km -- but from 400 km
+            // looking down, the FIRST 60 km of the ray is vacuum and the
+            // air is in the last 100. Capping there gives the surface
+            // extinction with no in-scatter at all, so the planet reads as
+            // a dark body with no haze over it: the same failure as the
+            // black disc, one term further along.
+            //
+            // The replacement is not a bigger number. It is the shell clip
+            // (ptRayShell against the body's own top_radius), which spends
+            // the same N samples on the air wherever the camera is -- the
+            // property that makes the in-scatter continuous across the
+            // climb for exactly the reason skyPhysical's own march is.
+            //
+            // The legacy modes keep min(primary_t, 60000) bit-for-bit.
+            uint sky_mode_v = uint(sun_and_mode.w);
+            bool physical_sky_v = (sky_mode_v == 4u);
+            float t_near_v = 0.0;
+            float t_far_v  = min(primary_t, 60000.0);
+            bool span_ok_v = true;
+            if (physical_sky_v) {
+                if (primary_hit) {
+                    float planet_R_v = sun_extra.w;
+                    float3 pc_v = (planet_center_radius.w > 0.0)
+                                ? planet_center_radius.xyz
+                                : float3(0.0, -planet_R_v, 0.0);
+                    span_ok_v = (planet_R_v > 0.0)
+                             && ptRayShell(primary_ro, primary_rd, pc_v, 0.0,
+                                           ptAtmoEarth(planet_R_v).top_radius,
+                                           primary_t, t_near_v, t_far_v);
+                } else {
+                    span_ok_v = false;   // skyPhysical already did this ray
+                }
+            }
+            if ((march_mie || march_ray) && span_ok_v) {
+                float  t_far   = t_far_v;
+                float  dt      = (t_far - t_near_v) / float(N);
                 // Stratified jitter IN [0, 1) of a cell -- combined with
                 // the plain (vi + jit) offset below this covers
                 // [0, t_far) exactly. The old mid-cell + full-cell-
@@ -7831,7 +8158,20 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 float  jitter  = randf(seed);
                 float3 trans_eye = float3(1.0);
                 float3 v_color = float3(0.0);
-                float phase_mie_v = phase;   // HG, computed earlier
+                // Aerosol phase. The legacy modes keep plain
+                // Henyey-Greenstein, bit-for-bit. The physical mode uses
+                // Cornette-Shanks -- the same helper skyPhysical uses --
+                // because the two marches meet at the horizon: one pixel
+                // hits the body and gets its in-scatter from here, the
+                // pixel above it misses and gets it from skyPhysical, and
+                // if they disagreed about the phase function there would
+                // be a seam along the limb. The two differ by up to 2x
+                // (CS/HG = 3(1 + mu^2) / (2(2 + g^2)), which is 0.60 at
+                // mu = 0 and 1.20 at mu = 1 for g = 0.7), so the seam
+                // would be plainly visible.
+                float phase_mie_v = physical_sky_v
+                                  ? ptPhaseCornetteShanks(cos_theta, g)
+                                  : phase;
                 // Identical math to the (3/(16 pi))(1 + mu^2) literal this
                 // replaces; routed through the shared helper so the sky
                 // modes and the haze march cannot drift apart.
@@ -7841,7 +8181,9 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 // pixel is integrating over at that distance.
                 float cone_spread_v = (2.0 * pos_fovtan.w) / float(max(dim.y, 1u));
                 for (int vi = 0; vi < N; ++vi) {
-                    float t = (float(vi) + jitter) * dt;
+                    // `t_near_v + x` with t_near_v == 0.0 is x bit-for-bit,
+                    // which is what keeps the legacy modes unchanged.
+                    float t = t_near_v + (float(vi) + jitter) * dt;
                     if (t >= t_far) break;
                     float3 sp = primary_ro + primary_rd * t;
                     PtRayCone cone_v = ptConeMake(cone_spread_v * t, cone_spread_v);

@@ -355,7 +355,9 @@ target_compile_definitions(pt_atmosphere PRIVATE
     PT_SHADER_MATH_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTraceMath.slang"
     PT_SHADER_PATHTRACE_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang"
     PT_SHADER_CLOUDSRAYMARCH_PATH="${CMAKE_SOURCE_DIR}/shaders/CloudsRaymarch.slang"
-    PT_SHADER_PATHTRACECLOUD_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTraceCloud.slang")
+    PT_SHADER_PATHTRACECLOUD_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTraceCloud.slang"
+    PT_SHADER_STARSCOMPOSITE_PATH="${CMAKE_SOURCE_DIR}/shaders/StarsComposite.slang"
+    PT_ENGINE_CPP_PATH="${CMAKE_SOURCE_DIR}/src/engine/Engine.cpp")
 if(NOT MSVC)
     target_compile_options(pt_atmosphere PRIVATE $<$<CONFIG:Release>:-ffast-math>)
 else()
@@ -2255,6 +2257,151 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
             LABELS  "golden;golden_software;worldframe")
     endif()
     # --- end Planetary P1 -------------------------------------------------
+
+    # --- Planetary P6 (#260): leaving the planet ---------------------------
+    #
+    # The phase's headline is that one camera path runs from the surface to
+    # 400 km with nothing switching over on the way. That is a claim about a
+    # SEQUENCE, and the comment at the top of this file about what a golden
+    # PNG can and cannot settle applies to it in full: three stored frames
+    # cannot show that the frames BETWEEN them are continuous. So the cells
+    # below are split by what they can each actually establish.
+    #
+    #   orbital_limb            what the frame that used to be a black disc
+    #   orbital_terminator      looks like now, and that a lit limb and a
+    #   sky_physical_ground     dark side coexist, and that the same code
+    #                           with no altitude branch in it still makes a
+    #                           daytime sky from eye height. Stored PNGs,
+    #                           because "what it looks like" is what a
+    #                           golden is for.
+    #
+    #   sky_continuity_shell    that the ONE altitude where the code changes
+    #                           behaviour is not a step. Not a stored PNG --
+    #                           an A/B against a control, see below.
+    #
+    # The rigorous global continuity proof is neither: it is
+    # pt_atmosphere's "the sky is continuous in altitude from the ground to
+    # orbit", which refines a 256-rung altitude ladder to 512 and 1024 and
+    # requires the largest adjacent step to halve each time. A Lipschitz
+    # function does that; a function with a jump plateaus instead. No
+    # tolerance has to be chosen to tell them apart, which is why that
+    # claim lives in a unit test and not here.
+    #
+    # ALL THREE GOLDEN CELLS ARE METAL-ONLY, DELIBERATELY.
+    # src/rhi_software/SoftwareTracer.cpp is a hand-written preview tracer,
+    # not a Slang-to-CPU emit -- it carries its own simple ProcSky gradient
+    # with no atmospheric transmittance at all, and knows nothing about
+    # r_sky_mode physical. A software cell here would pin the software
+    # tracer's painted sky and would say nothing whatever about the shader
+    # this phase changed. Vulkan is unregistered for the reason recorded in
+    # the risks: no part of this arc has ever executed on SPIR-V, and the
+    # first *__vulkan__off_render cell already sits at ~115 s against a
+    # 120 s budget on a cold MoltenVK pipeline cache.
+    pt_add_golden_cell(SCENE orbital_limb       BACKEND metal DENOISER off
+        FRAMES 32 MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
+    pt_add_golden_cell(SCENE orbital_terminator BACKEND metal DENOISER off
+        FRAMES 32 MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
+    pt_add_golden_cell(SCENE sky_physical_ground BACKEND metal DENOISER off
+        FRAMES 32 MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
+
+    # The shell crossing, as an A/B with its own control.
+    #
+    # A discontinuity is a change that survives refinement, so if the image
+    # is a continuous function of altitude then two frames one metre apart
+    # are the same frame -- at every altitude, however the renderer is put
+    # together. R_top = r_planet_radius + 100 km is the single altitude in
+    # the whole climb where the code does something different (below it the
+    # shell clip returns [0, t], above it a proper sub-interval), so that is
+    # where the pair is placed.
+    #
+    # A pair on its own would only measure "small", and small compared to
+    # what is the whole question. So an identically-sized pair is rendered
+    # at 90 km, two metres apart, entirely inside the shell and crossing
+    # nothing, and both pairs are diffed at the SAME threshold. The control
+    # is the calibration; the crossing has to be no worse than a move that
+    # crosses nothing.
+    #
+    # Measured on an M4 Max, 320x240, 32 accumulation frames, all at
+    # --max-delta 0 so every differing pixel counts:
+    #
+    #                                  max L2   mean L2    bad px
+    #   same fixture rendered twice    0.0000   0.000000    0.000%
+    #   10 km,  2 m apart              1.4142   0.018772    1.866%
+    #   90 km,  2 m apart (CONTROL)    1.4142   0.001727    0.171%
+    #   100 km, 2 m apart (CROSSING)   1.4142   0.001488    0.147%
+    #   100 km, 20 m apart (crossing)  1.7321   0.014758    1.427%
+    #   100 km vs 110 km               98.112   4.622206   41.514%
+    #
+    # Three things to read off it. The noise floor is exactly zero, so
+    # every number below it is signal. The crossing is indistinguishable
+    # from the control -- marginally SMALLER, in fact, because 100 km is
+    # slightly further from the ground than 90 km is and the air the two
+    # frames disagree about is correspondingly thinner. And refining the
+    # separation tenfold shrinks the difference by 9.9x: linear, which is
+    # what a Lipschitz function does and what a jump does not.
+    #
+    # The last row is the scale: a REAL 10 km move produces 3100x the mean
+    # and 280x the bad-pixel count of the crossing. Anything that looked
+    # like a step at the boundary would land somewhere in that range, not
+    # in the fourth decimal place.
+    #
+    # No pixel differs by more than 1.7321 L2 = sqrt(3), i.e. one 8-bit
+    # level in each of three channels, so the registered max-delta of 8 is
+    # 4.6x clear of the observed maximum while still being 12x tighter
+    # than the 98 a genuine step produces. The mean bar of 0.02 is 13x
+    # clear of the crossing and 231x tighter than the step; the 1.0%
+    # bad-pixel bar is 6.8x clear and 42x tighter. The headroom exists
+    # because CI runners use a paravirtualised GPU -- the same reason the
+    # worldframe A/B cells register max-delta 2 instead of 0.
+    #
+    # DESIGN RULE, HONOURED BY CONSTRUCTION: no planetary state transition
+    # may require a history reset (#260, and #164 for the class of bug).
+    # Nothing here is an engine-side mode change -- the shell clip is a
+    # shader-side branch on a pushed uniform -- so crossing never sets
+    # accum_dirty_ and a live fly-through does not flash.
+    if(APPLE)
+        set(_sc_scene ${CMAKE_SOURCE_DIR}/tests/goldens/scenes/shell_crossing.cfg)
+        # name -> cam_pos altitude in metres
+        set(_sc_names   below   above    ctl_lo  ctl_hi)
+        set(_sc_alts    99999   100001   89999   90001)
+        foreach(_i RANGE 3)
+            list(GET _sc_names ${_i} _n)
+            list(GET _sc_alts  ${_i} _a)
+            set(_sc_png ${CMAKE_BINARY_DIR}/golden_actual/sky_continuity_shell__${_n}.png)
+            set(_sc_wd  ${CMAKE_BINARY_DIR}/golden_workdir/sky_continuity_shell__${_n})
+            file(MAKE_DIRECTORY ${_sc_wd})
+            add_test(NAME sky_continuity_shell_render_${_n}
+                COMMAND $<TARGET_FILE:pt_render_one_frame>
+                    --scene    ${_sc_scene}
+                    --backend  metal
+                    --denoiser off
+                    --frames   32
+                    --extra    "cam_pos 0 ${_a} 0"
+                    --out      ${_sc_png}
+                WORKING_DIRECTORY ${_sc_wd})
+            set_tests_properties(sky_continuity_shell_render_${_n} PROPERTIES
+                TIMEOUT 300 LABELS "golden;golden_metal;planetary")
+        endforeach()
+        # The crossing, and its control, at one and the same bar.
+        foreach(_pair cross:below:above control:ctl_lo:ctl_hi)
+            string(REPLACE ":" ";" _pl ${_pair})
+            list(GET _pl 0 _tag)
+            list(GET _pl 1 _lo)
+            list(GET _pl 2 _hi)
+            add_test(NAME sky_continuity_shell_${_tag}
+                COMMAND $<TARGET_FILE:imgdiff>
+                    ${CMAKE_BINARY_DIR}/golden_actual/sky_continuity_shell__${_lo}.png
+                    ${CMAKE_BINARY_DIR}/golden_actual/sky_continuity_shell__${_hi}.png
+                    --max-delta 8 --mean-delta 0.02 --fail-percent 1.0
+                    --diff ${CMAKE_BINARY_DIR}/golden_diff/sky_continuity_shell__${_tag}.png
+                WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+            set_tests_properties(sky_continuity_shell_${_tag} PROPERTIES
+                TIMEOUT 30
+                DEPENDS "sky_continuity_shell_render_${_lo};sky_continuity_shell_render_${_hi}"
+                LABELS  "golden;golden_metal;planetary")
+        endforeach()
+    endif()
+    # --- end Planetary P6 -------------------------------------------------
 else()
     message(STATUS
         "tests: golden-image matrix skipped -- pt_render_one_frame and/or "

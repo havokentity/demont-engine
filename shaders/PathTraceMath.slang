@@ -1154,6 +1154,44 @@ public void ptAtmoCoefficients(PtAtmoBody b, float h,
             + b.ozone_sigma_a * doz;
 }
 
+// Both roots of the ray-sphere quadratic, on the same three-body gate
+// intersectSphere uses.  intersectSphere returns only the nearer
+// non-self root, and a shell needs both, so this exposes the solve
+// rather than duplicating it: the accumulated path above
+// kPtStableSphereRadius, the historic expression below it so every
+// scene-scale sphere keeps its exact bits.
+//
+// Vieta ("citardauq") on the root pair: -b +/- h subtracts two ~rad
+// quantities for a near-radial ray and throws away everything the
+// accumulator just bought, so evaluate the root whose terms reinforce and
+// recover its partner from the product of roots (= k).  Ray Tracing Gems
+// ch. 7, with the accumulated k that makes it worth having.
+public bool ptSphereRoots(float3 ro, float3 rd, float3 c, float rad,
+                          out float t0, out float t1) {
+    t0 = 0.0; t1 = 0.0;
+    if (!(rad > 0.0)) return false;
+    float3 oc = ro - c;
+    float m = max(max(abs(oc.x), abs(oc.y)), max(abs(oc.z), rad));
+    int ext_exp = ptFloatExp(m);
+    float b, k;
+    if (rad > kPtStableSphereRadius && ext_exp <= kPtAccumMaxExp) {
+        b = ptDotExact(oc, rd);
+        k = ptPowerOfPoint(oc, rad);
+    } else {
+        b = dot(oc, rd);
+        k = dot(oc, oc) - rad * rad;
+    }
+    float h = fma(b, b, -k);
+    if (h < 0.0) return false;
+    h = sqrt(h);
+    float q  = (b >= 0.0) ? -(b + h) : (h - b);
+    float ta = q;
+    float tb = (q != 0.0) ? k / q : 0.0;
+    t0 = min(ta, tb);
+    t1 = max(ta, tb);
+    return true;
+}
+
 // Rayleigh phase function, 3/(16 pi) (1 + mu^2), normalised over the
 // sphere.  `mu` is the cosine between the incident propagation direction
 // and the outgoing one.
@@ -1197,11 +1235,59 @@ public float ptPhaseCornetteShanks(float mu, float g) {
 // parts in 1e4 of the total.  A transmittance LUT removes this entirely by
 // integrating each (r, mu) once at build time with a finer rule; that is
 // the structure this function is shaped to be replaced by.
+//
+// THE INTERVAL IS CLIPPED TO THE MEDIUM FIRST (planetary P6, #260).  This
+// is the whole reason a planet renders as a black disc from orbit today,
+// and it is a quadrature failure, not a physics one.  Spend the N steps on
+// [0, t] and a 400 km nadir ray puts seven of its eight Simpson intervals
+// in vacuum; the eighth is 50 km long and has SEA-LEVEL extinction at its
+// right endpoint, so the rule charges a 50 km interval at ground density.
+// Measured against a 4e5-step reference on the green channel:
+//
+//     camera altitude   tau_ref    tau_8 unclipped   tau_8 clipped
+//     400 km  nadir     0.14675    0.26598 (+81%)    0.15529 (+5.8%)
+//      30 Mm  nadir     0.14675   13.72125 (+9250%)  0.15529 (+5.8%)
+//      30 Mm  limb      1.89988    7.06228 (+272%)   1.90025 (+0.02%)
+//
+// exp(-13.72) = 1.1e-6.  That is the black disc, exactly.
+//
+// Clipping is not a tolerance and carries no tuned constant: outside
+// `b.top_radius` there is, by the body's own definition, no medium.  What
+// it discards is the tail the exponential profiles still have above the
+// declared boundary, and that tail is bounded in closed form.  The worst
+// case is the ray tangent to the top of the shell, which this function now
+// returns exactly zero for while the true integral is at most
+//
+//     sigma_t(R_top) * sqrt(2 pi R_top H_R)
+//   = 5.05e-11 m^-1 * 5.70e5 m = 2.9e-5
+//
+// -- the Chapman/Gaussian chord over which an exponential of scale height
+// H_R stays within e of its tangent-point value.  2.9e-5 of optical depth
+// is 2.9e-5 of transmittance, one part in 34 000, which is an order of
+// magnitude below one 8-bit quantum.  Pinned as a test rather than
+// asserted.
+//
+// Every ray that begins inside the shell and ends inside it -- which is
+// every camera in every fixture that existed before this phase, the
+// highest being 10 km -- gets lo = 0.0 and hi = t exactly, so the loop
+// below runs on identical floats and those goldens are bit-stable.  That
+// is the property that makes this a safe change to a function on the hot
+// path of every atmospheric term in the engine.
 public float3 ptAtmoOpticalDepth(PtAtmoBody b, float3 ro, float3 rd,
                                  float3 centre, float t, int steps) {
     if (!(t > 0.0)) return float3(0.0, 0.0, 0.0);
+    // Clip [0, t] to the modelled medium.  ptSphereRoots, not a local
+    // solve: at |oc| ~ 6.4e6 the naive discriminant loses 22% of k, and
+    // the shell entry point is exactly where that error would land.
+    float u0, u1;
+    if (!ptSphereRoots(ro, rd, centre, b.top_radius, u0, u1)) {
+        return float3(0.0, 0.0, 0.0);      // ray never enters the medium
+    }
+    float lo = max(u0, 0.0);
+    float hi = min(u1, t);
+    if (!(hi > lo)) return float3(0.0, 0.0, 0.0);
     int N = max(steps, 1);
-    float dt = t / float(N);
+    float dt = (hi - lo) / float(N);
     float oneSixth = 1.0 / 6.0;
     PtRayAltitude alt = ptRayAltitudeBegin(ro, rd, centre, b.ground_radius);
     float3 tau = float3(0.0, 0.0, 0.0);
@@ -1209,11 +1295,14 @@ public float3 ptAtmoOpticalDepth(PtAtmoBody b, float3 ro, float3 rd,
     // subinterval's right boundary, halving the exp() count across the
     // march -- the same boundary-caching the pre-#257 integral used.
     float3 sr_l, sm_l, st_prev;
-    ptAtmoCoefficients(b, max(ptRayAltitudeAt(alt, 0.0), 0.0),
+    ptAtmoCoefficients(b, max(ptRayAltitudeAt(alt, lo), 0.0),
                        sr_l, sm_l, st_prev);
     for (int i = 0; i < N; ++i) {
-        float s_mid   = (float(i) + 0.5) * dt;
-        float s_right = (float(i) + 1.0) * dt;
+        // `lo + x` with lo == 0.0 is x bit-for-bit in IEEE-754 for every
+        // finite positive x, which is what keeps the pre-#260 fixtures
+        // (all of them inside the shell) on identical floats.
+        float s_mid   = lo + (float(i) + 0.5) * dt;
+        float s_right = lo + (float(i) + 1.0) * dt;
         float3 sr_m, sm_m, st_mid;
         float3 sr_r, sm_r, st_right;
         ptAtmoCoefficients(b, max(ptRayAltitudeAt(alt, s_mid),   0.0),
@@ -1226,43 +1315,6 @@ public float3 ptAtmoOpticalDepth(PtAtmoBody b, float3 ro, float3 rd,
     return tau;
 }
 
-// Both roots of the ray-sphere quadratic, on the same three-body gate
-// intersectSphere uses.  intersectSphere returns only the nearer
-// non-self root, and a shell needs both, so this exposes the solve
-// rather than duplicating it: the accumulated path above
-// kPtStableSphereRadius, the historic expression below it so every
-// scene-scale sphere keeps its exact bits.
-//
-// Vieta ("citardauq") on the root pair: -b +/- h subtracts two ~rad
-// quantities for a near-radial ray and throws away everything the
-// accumulator just bought, so evaluate the root whose terms reinforce and
-// recover its partner from the product of roots (= k).  Ray Tracing Gems
-// ch. 7, with the accumulated k that makes it worth having.
-public bool ptSphereRoots(float3 ro, float3 rd, float3 c, float rad,
-                          out float t0, out float t1) {
-    t0 = 0.0; t1 = 0.0;
-    if (!(rad > 0.0)) return false;
-    float3 oc = ro - c;
-    float m = max(max(abs(oc.x), abs(oc.y)), max(abs(oc.z), rad));
-    int ext_exp = ptFloatExp(m);
-    float b, k;
-    if (rad > kPtStableSphereRadius && ext_exp <= kPtAccumMaxExp) {
-        b = ptDotExact(oc, rd);
-        k = ptPowerOfPoint(oc, rad);
-    } else {
-        b = dot(oc, rd);
-        k = dot(oc, oc) - rad * rad;
-    }
-    float h = fma(b, b, -k);
-    if (h < 0.0) return false;
-    h = sqrt(h);
-    float q  = (b >= 0.0) ? -(b + h) : (h - b);
-    float ta = q;
-    float tb = (q != 0.0) ? k / q : 0.0;
-    t0 = min(ta, tb);
-    t1 = max(ta, tb);
-    return true;
-}
 
 // Ray versus a spherical SHELL [r_inner, r_outer] about `centre`.
 //

@@ -308,12 +308,43 @@ float3 localUp(float3 p) {
     return normalize(p - planet_center_radius.xyz);
 }
 
+// Planetary P6 (#260). Verbatim mirror of the body-occlusion half of
+// PathTrace.slang's starsOnly gate. This kernel imports no modules -- the
+// localUp() above is a hand-copied mirror for the same reason -- so the
+// root solve is written out here rather than pulled from PathTraceMath.
+// It is the SIMPLE quadratic, not ptSphereRoots' accumulated form: the
+// only thing asked of it is the SIGN of the near root (is the body in
+// front of this ray at all), and 22% of cancellation error in k moves
+// that answer only within ~0.4 m of the limb, which is 4e-4 of a pixel
+// at any altitude this composite runs at. The path tracer's copy uses
+// the accumulated solve because it also needs the distance.
+bool starRayHitsBody(float3 rd) {
+    if (planet_center_radius.w <= 0.0) return false;
+    float3 oc = pos_fovtan.xyz - planet_center_radius.xyz;
+    float b = dot(oc, rd);
+    float k = dot(oc, oc) - planet_center_radius.w * planet_center_radius.w;
+    float h = b * b - k;
+    if (h < 0.0) return false;
+    h = sqrt(h);
+    float q  = (b >= 0.0) ? -(b + h) : (h - b);
+    float t0 = min(q, (q != 0.0) ? k / q : 0.0);
+    return t0 > 0.0;
+}
+
 float3 starsOnly(float3 rd, float3 sun) {
     float3 up      = localUp(pos_fovtan.xyz);
     float cosTheta = clamp(dot(rd, up), -1.0, 1.0);
     float sun_elev = dot(up, sun);
     float day      = smoothstep(-0.10, 0.20, sun_elev);
-    if (cosTheta > -0.05 && exposure_pad.z > 0.5 && day < 0.6) {
+    // Where the stars stop: the body, not a 2.9-degree slack below the
+    // observer's horizontal. From 400 km the hard limb is 19.8 degrees
+    // down, so the old gate cut a horizontal line across a frame that
+    // should be full of stars all the way to the limb. Planar frame (no
+    // body) keeps the historic gate bit-for-bit.
+    bool star_visible = (planet_center_radius.w > 0.0)
+                      ? !starRayHitsBody(rd)
+                      : (cosTheta > -0.05);
+    if (star_visible && exposure_pad.z > 0.5 && day < 0.6) {
         float3 j;
         j.x = dot(w2j_row0.xyz, rd);
         j.y = dot(w2j_row1.xyz, rd);
@@ -356,7 +387,7 @@ float3 starsOnly(float3 rd, float3 sun) {
             stars *= w;
         }
         return stars * (1.0 - day);
-    } else if (cosTheta > -0.05 && exposure_pad.y > 0.5 && day < 0.6) {
+    } else if (star_visible && exposure_pad.y > 0.5 && day < 0.6) {
         float2 ll = float2(atan2(rd.z, rd.x) * (1.0 / 6.28318530718) + 0.5,
                            acos(clamp(rd.y, -1.0, 1.0)) * (1.0 / 3.14159265359));
         ll *= float2(700.0, 350.0);
