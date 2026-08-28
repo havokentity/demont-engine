@@ -3,6 +3,32 @@
 //
 // Aurora borealis / australis procedural overlay (issue #116).
 //
+// DOMAIN OF VALIDITY, AND WHERE THE PLANETARY VERSION LIVES (#285).
+//
+// This kernel is a GROUND-OBSERVER overlay and planetary P6 (#260)
+// deliberately left it alone rather than half-converting it. It is a pure
+// function of view direction: `sin_elev <= 0.02` returns zero (so the
+// aurora vanishes for every downward ray -- exactly when it should become
+// a ring on the night side beneath an orbital camera), `aurora_dir` is
+// built in the camera's local horizon frame from a scalar latitude cvar
+// rather than pointing at a real geomagnetic pole on a real globe, and a
+// view-direction overlay cannot limb-brighten, which is where the bright
+// green rope in ISS footage actually comes from.
+//
+// The re-siting -- an emissive species inside skyPhysical's shell march in
+// PathTrace.slang, with the three real emission lines at their real
+// altitudes, plus airglow for one more constant -- is #285. The FBM
+// curtain field below is the bulk of this file and survives that move
+// verbatim; what changes is where it is evaluated (the sample point's
+// geomagnetic coordinates, not the view direction).
+//
+// The interim fix suggested in the research -- delete the elevation
+// early-out and rebuild aurora_dir in world space so the overlay does not
+// disappear from orbit -- was NOT applied, on purpose. Without limb
+// brightening or self-occlusion it paints a flat wash across the planet
+// disc, which reads as a bug rather than as a missing feature. Absent is
+// the more honest state until #285 lands.
+//
 // Stateless additive composite mirroring the StarsComposite (#46 / PR
 // #114) pattern: runs once per frame on Metal between Denoise() and
 // dispatch_bloom_pyramid, so post-denoise HDR receives an FBM-noise-
