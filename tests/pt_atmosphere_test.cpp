@@ -1430,6 +1430,27 @@ TEST_CASE("shader mirror is still faithful") {
         CHECK(countOf(body, "smoothstep") == 0u);
         CHECK(countOf(body, "sun_and_mode.y") == 0u);
     }
+    // Aerial perspective: the 60 km cap is legacy-only, and the physical
+    // mode clips to the shell instead.  From 400 km the FIRST 60 km of a
+    // nadir ray is vacuum and all the air is in the last 100, so capping
+    // there gives the surface extinction with no in-scatter -- the black
+    // disc's failure one term further along.  Both branches pinned, so
+    // neither can be deleted or have the other's behaviour.
+    CHECK(countOf(pt, "floatt_far_v=min(primary_t,60000.0);") == 1u);
+    CHECK(countOf(pt, "span_ok_v=(planet_R_v>0.0)&&ptRayShell(primary_ro,"
+                      "primary_rd,pc_v,0.0,ptAtmoEarth(planet_R_v).top_radius,"
+                      "primary_t,t_near_v,t_far_v);") == 1u);
+    CHECK(countOf(pt, "span_ok_v=false;//skyPhysicalalreadydidthisray") == 1u);
+    // The two marches meet at the limb -- one pixel hits the body and gets
+    // its in-scatter from the AP march, the pixel above it misses and gets
+    // it from skyPhysical -- so they must agree about the aerosol phase
+    // function or there is a seam along the limb.  Legacy keeps plain HG
+    // bit-for-bit; the physical mode uses the same Cornette-Shanks helper
+    // skyPhysical does.
+    CHECK(countOf(pt, "floatphase_mie_v=physical_sky_v?ptPhaseCornetteShanks"
+                      "(cos_theta,g):phase;") == 1u);
+    CHECK(countOf(pt, "ptPhaseCornetteShanks(") == 2u);   // skyPhysical + the AP march
+
     // The disc radiance is E / Omega, derived, with Omega taken from the
     // RENDERED half-angle so r_sun_size stays energy-conserving.
     CHECK(countOf(pt, "floatomega=6.28318530718*(1.0-kCosR);") == 1u);

@@ -8088,9 +8088,52 @@ void main(uint2 tid : SV_DispatchThreadID) {
             // HDRI mode via the analytical transmittance helper.
             bool march_mie = (vol_params.x > 0.0) && (env_map_present == 0u);
             bool march_ray = (rayleigh_int > 0.0) && (env_map_present == 0u);
-            if (march_mie || march_ray) {
-                float  t_far   = min(primary_t, 60000.0);
-                float  dt      = t_far / float(N);
+            // --- Planetary P6 (#260): the span, and who owns it ------------
+            //
+            // In the physical sky mode a primary MISS has already had its
+            // entire column integrated by skyPhysical at the miss site, so
+            // marching it again here would double-count it. A primary HIT
+            // has not: nothing else integrates camera-to-surface air, and
+            // this march is where aerial perspective comes from.
+            //
+            // For a hit, the 60 km cap has to go. It was a sensible bound
+            // for a ground camera -- Rayleigh's 8 km scale height puts
+            // almost everything in the bottom 25 km -- but from 400 km
+            // looking down, the FIRST 60 km of the ray is vacuum and the
+            // air is in the last 100. Capping there gives the surface
+            // extinction with no in-scatter at all, so the planet reads as
+            // a dark body with no haze over it: the same failure as the
+            // black disc, one term further along.
+            //
+            // The replacement is not a bigger number. It is the shell clip
+            // (ptRayShell against the body's own top_radius), which spends
+            // the same N samples on the air wherever the camera is -- the
+            // property that makes the in-scatter continuous across the
+            // climb for exactly the reason skyPhysical's own march is.
+            //
+            // The legacy modes keep min(primary_t, 60000) bit-for-bit.
+            uint sky_mode_v = uint(sun_and_mode.w);
+            bool physical_sky_v = (sky_mode_v == 4u);
+            float t_near_v = 0.0;
+            float t_far_v  = min(primary_t, 60000.0);
+            bool span_ok_v = true;
+            if (physical_sky_v) {
+                if (primary_hit) {
+                    float planet_R_v = sun_extra.w;
+                    float3 pc_v = (planet_center_radius.w > 0.0)
+                                ? planet_center_radius.xyz
+                                : float3(0.0, -planet_R_v, 0.0);
+                    span_ok_v = (planet_R_v > 0.0)
+                             && ptRayShell(primary_ro, primary_rd, pc_v, 0.0,
+                                           ptAtmoEarth(planet_R_v).top_radius,
+                                           primary_t, t_near_v, t_far_v);
+                } else {
+                    span_ok_v = false;   // skyPhysical already did this ray
+                }
+            }
+            if ((march_mie || march_ray) && span_ok_v) {
+                float  t_far   = t_far_v;
+                float  dt      = (t_far - t_near_v) / float(N);
                 // Stratified jitter IN [0, 1) of a cell -- combined with
                 // the plain (vi + jit) offset below this covers
                 // [0, t_far) exactly. The old mid-cell + full-cell-
@@ -8102,7 +8145,20 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 float  jitter  = randf(seed);
                 float3 trans_eye = float3(1.0);
                 float3 v_color = float3(0.0);
-                float phase_mie_v = phase;   // HG, computed earlier
+                // Aerosol phase. The legacy modes keep plain
+                // Henyey-Greenstein, bit-for-bit. The physical mode uses
+                // Cornette-Shanks -- the same helper skyPhysical uses --
+                // because the two marches meet at the horizon: one pixel
+                // hits the body and gets its in-scatter from here, the
+                // pixel above it misses and gets it from skyPhysical, and
+                // if they disagreed about the phase function there would
+                // be a seam along the limb. The two differ by up to 2x
+                // (CS/HG = 3(1 + mu^2) / (2(2 + g^2)), which is 0.60 at
+                // mu = 0 and 1.20 at mu = 1 for g = 0.7), so the seam
+                // would be plainly visible.
+                float phase_mie_v = physical_sky_v
+                                  ? ptPhaseCornetteShanks(cos_theta, g)
+                                  : phase;
                 // Identical math to the (3/(16 pi))(1 + mu^2) literal this
                 // replaces; routed through the shared helper so the sky
                 // modes and the haze march cannot drift apart.
@@ -8112,7 +8168,9 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 // pixel is integrating over at that distance.
                 float cone_spread_v = (2.0 * pos_fovtan.w) / float(max(dim.y, 1u));
                 for (int vi = 0; vi < N; ++vi) {
-                    float t = (float(vi) + jitter) * dt;
+                    // `t_near_v + x` with t_near_v == 0.0 is x bit-for-bit,
+                    // which is what keeps the legacy modes unchanged.
+                    float t = t_near_v + (float(vi) + jitter) * dt;
                     if (t >= t_far) break;
                     float3 sp = primary_ro + primary_rd * t;
                     PtRayCone cone_v = ptConeMake(cone_spread_v * t, cone_spread_v);
