@@ -323,6 +323,81 @@ std::size_t countOf(const std::string& hay, const std::string& needle) {
     return n;
 }
 
+// --- shader mirror: sunSlantTransmittance / skyPhysical (P6, #260) ---------
+// The two functions the ground-to-orbit claim is actually about.  The
+// jitter is an explicit parameter here rather than randf(seed), so the
+// sequence below is a deterministic function of altitude -- which is
+// exactly what a continuity claim needs.
+PT_MIRROR F3 sunSlantTransmittance(const AtmoBody& b, F3 p, F3 sun_dir,
+                                   F3 centre) {
+    float g0, g1;
+    // Occluded by the body: the ray leaves p, descends, and re-enters the
+    // surface before it can reach space.  This is night, stated as
+    // geometry.
+    if (ptSphereRoots(p, sun_dir, centre, b.ground_radius, g0, g1) && g0 > 0.0f) {
+        return F3{0.0f, 0.0f, 0.0f};
+    }
+    float s0, s1;
+    if (!ptSphereRoots(p, sun_dir, centre, b.top_radius, s0, s1)) {
+        return F3{1.0f, 1.0f, 1.0f};      // already outside the shell
+    }
+    float t = std::max(s1, 0.0f);
+    if (!(t > 0.0f)) return F3{1.0f, 1.0f, 1.0f};
+    F3 tau = ptAtmoOpticalDepth(b, p, sun_dir, centre, t, 8);
+    return F3{std::exp(-tau.x), std::exp(-tau.y), std::exp(-tau.z)};
+}
+
+float phaseRayleigh(float mu) { return 0.0596831036594607f * (1.0f + mu * mu); }
+float phaseCornetteShanks(float mu, float g) {
+    float g2 = g * g;
+    float num = 3.0f * (1.0f - g2) * (1.0f + mu * mu);
+    float den = 8.0f * 3.14159265358979f * (2.0f + g2)
+              * std::pow(std::max(1.0f + g2 - 2.0f * g * mu, 1e-4f), 1.5f);
+    return num / den;
+}
+
+PT_MIRROR F3 skyPhysical(const AtmoBody& b, F3 ro, F3 rd, F3 centre,
+                         F3 sun_dir, float g_mie, float t_max, int steps,
+                         float xi) {
+    float t_in, t_out;
+    if (!ptRayShell(ro, rd, centre, 0.0f, b.top_radius, t_max, t_in, t_out)) {
+        return F3{0.0f, 0.0f, 0.0f};
+    }
+    float g0, g1;
+    if (ptSphereRoots(ro, rd, centre, b.ground_radius, g0, g1) && g0 > 0.0f) {
+        t_out = std::min(t_out, g0);
+    }
+    if (!(t_out > t_in)) return F3{0.0f, 0.0f, 0.0f};
+
+    float mu = dot(rd, sun_dir);
+    float ph_r = phaseRayleigh(mu);
+    float ph_m = phaseCornetteShanks(mu, g_mie);
+    int N = std::max(steps, 1);
+    float dt = (t_out - t_in) / float(N);
+    RayAlt alt = rayAltBegin(ro, rd, centre, b.ground_radius);
+    F3 trans{1.0f, 1.0f, 1.0f};
+    F3 acc{0.0f, 0.0f, 0.0f};
+    for (int i = 0; i < N; ++i) {
+        float s = t_in + (float(i) + xi) * dt;
+        if (s >= t_out) break;
+        float h = float(std::max(rayAltAt(alt, s), 0.0));
+        F3 sr, sm, st;
+        ptAtmoCoefficients(b, h, sr, sm, st);
+        F3 sp{ro.x + rd.x * s, ro.y + rd.y * s, ro.z + rd.z * s};
+        F3 T = sunSlantTransmittance(b, sp, sun_dir, centre);
+        F3 sun_at{80.0f * T.x, 80.0f * T.y, 80.0f * T.z};
+        if (sun_at.x > 0.0f || sun_at.y > 0.0f || sun_at.z > 0.0f) {
+            acc.x += trans.x * (sr.x * ph_r + sm.x * ph_m) * sun_at.x * dt;
+            acc.y += trans.y * (sr.y * ph_r + sm.y * ph_m) * sun_at.y * dt;
+            acc.z += trans.z * (sr.z * ph_r + sm.z * ph_m) * sun_at.z * dt;
+        }
+        trans.x *= std::exp(-st.x * dt);
+        trans.y *= std::exp(-st.y * dt);
+        trans.z *= std::exp(-st.z * dt);
+    }
+    return acc;
+}
+
 }  // namespace
 
 TEST_CASE("the finiteness harness is not vacuous under -ffast-math") {
@@ -972,6 +1047,256 @@ TEST_CASE("the shell interval is correct from every origin") {
     }
 }
 
+// The sun 30 degrees above the horizon at the sub-camera point, in the
+// plane of the view rays below, so every case here has a lit sky and a
+// terminator somewhere on the body.
+const F3 kSun = norm(F3{std::cos(0.5236f), std::sin(0.5236f), 0.0f});
+
+// Sky radiance looking along `rd` from altitude `a` on the local
+// vertical.  kCentre is (0, -R, 0), so world y IS altitude.
+double skyLumAt(const AtmoBody& b, double a, F3 rd, int steps) {
+    const F3 ro{0.0f, float(a), 0.0f};
+    // xi = 0.5 -- the midpoint rule.  The shader jitters instead, which
+    // makes it an unbiased estimator that the accumulator converges; for
+    // a continuity claim we want the deterministic sibling, because
+    // otherwise every "jump" measured would be sampling noise.
+    const F3 L = skyPhysical(b, ro, rd, kCentre, kSun, b.mie_g, 1.0e30f,
+                             steps, 0.5f);
+    return 0.2126 * L.x + 0.7152 * L.y + 0.0722 * L.z;
+}
+
+TEST_CASE("the sky is continuous in altitude from the ground to orbit") {
+    // #260's acceptance criterion is a claim about a SEQUENCE, not about
+    // any frame: a climb from 1.7 m to 400 km with no discontinuity in
+    // sky colour.  A golden PNG cannot settle that, and neither can a
+    // threshold on adjacent frames -- adjacent frames are SUPPOSED to
+    // differ, because the sky really is changing.
+    //
+    // Continuity has an exact definition that needs no tolerance at all:
+    // refine the sampling and the largest step must shrink with it.  For
+    // a Lipschitz function sampled at spacing h the largest adjacent
+    // difference is bounded by K*h, so halving h halves it; for a
+    // function with a jump of size J the largest difference is at least J
+    // however fine the sampling gets.  The two behaviours are
+    // qualitatively different and no constant has to be chosen to tell
+    // them apart.
+    //
+    // The bar below is 0.6 rather than the ideal 0.5 only because the
+    // location of the maximum moves between refinements, so the halved
+    // ladder does not sample the same worst point.  A genuine
+    // discontinuity gives a ratio of 1.0.
+    const AtmoBody b = ptAtmoEarth(kR);
+
+    struct Dir { F3 rd; const char* what; };
+    const Dir dirs[5] = {
+        {F3{0.0f, 1.0f, 0.0f},                          "straight up"},
+        {norm(F3{0.7071f, 0.7071f, 0.0f}),              "45 deg up, toward the sun"},
+        {norm(F3{-0.7071f, 0.7071f, 0.0f}),             "45 deg up, away from the sun"},
+        {F3{1.0f, 0.0f, 0.0f},                          "horizontal"},
+        {norm(F3{0.9848f, -0.1736f, 0.0f}),             "10 deg below horizontal -- the limb from orbit"},
+    };
+
+    auto worstStep = [&](const Dir& d, int rungs) {
+        // Geometric ladder from 1 m to 500 km.  Geometric rather than
+        // linear because the atmosphere's own structure is exponential:
+        // a linear ladder that resolves the 1.2 km Mie scale height would
+        // need 400 000 rungs to reach orbit.
+        double worst = 0.0;
+        double prev = skyLumAt(b, 1.0, d.rd, 64);
+        for (int i = 1; i <= rungs; ++i) {
+            const double f = double(i) / double(rungs);
+            const double a = 1.0 * std::pow(500000.0 / 1.0, f);
+            const double cur = skyLumAt(b, a, d.rd, 64);
+            worst = std::max(worst, std::fabs(cur - prev));
+            prev = cur;
+        }
+        return worst;
+    };
+
+    for (int di = 0; di < 5; ++di) {
+        CAPTURE(dirs[di].what);
+        const double w1 = worstStep(dirs[di], 256);
+        const double w2 = worstStep(dirs[di], 512);
+        const double w3 = worstStep(dirs[di], 1024);
+        CAPTURE(w1);
+        CAPTURE(w2);
+        CAPTURE(w3);
+        // Refining halves the worst step, twice over.  A jump would
+        // plateau instead.
+        CHECK(w2 < 0.6 * w1);
+        CHECK(w3 < 0.6 * w2);
+    }
+}
+
+TEST_CASE("the sky resolves to black on the way out, and does it smoothly") {
+    // The other half of the acceptance criterion, and the one the
+    // painted modes cannot meet at all.  procSky returns a lerp of
+    // float3(0.32, 0.55, 0.92) and float3(0.78, 0.88, 1.00) at every
+    // altitude, so its zenith at 400 km is its zenith at eye height.
+    // Measured on a rendered climb it plateaus at 56.3/255 of luminance
+    // from 200 km upward and the black-space fraction of the frame stays
+    // at exactly 0.000 all the way to 400 km -- a frozen value, which is
+    // worse than a jump because it never resolves.
+    //
+    // The physical sky has nothing to freeze: at 400 km looking up the
+    // chord through the shell is empty, so the integral is over an empty
+    // interval, so it is zero.  No fade, no threshold, no cvar.
+    const AtmoBody b = ptAtmoEarth(kR);
+    const F3 up{0.0f, 1.0f, 0.0f};
+
+    const double ground = skyLumAt(b, 1.7, up, 64);
+    CHECK(ground > 0.0);
+
+    // Monotone all the way out: every rung is dimmer than the one below
+    // it.  (Strictly: the remaining column above the camera shrinks
+    // monotonically, and single-scattered radiance is monotone in it.)
+    double prev = ground;
+    for (int i = 1; i <= 200; ++i) {
+        const double a = 1.7 * std::pow(500000.0 / 1.7, double(i) / 200.0);
+        const double cur = skyLumAt(b, a, up, 64);
+        CAPTURE(a);
+        CHECK(cur <= prev * (1.0 + 1e-6));
+        prev = cur;
+    }
+
+    // Above the shell, looking away from the body, the interval really
+    // is empty and the answer is EXACTLY zero rather than small.
+    CHECK(skyLumAt(b, double(b.top_radius - kR) + 1.0, up, 64) == 0.0);
+    CHECK(skyLumAt(b, 400000.0, up, 64) == 0.0);
+    // ...while at the same altitude the limb still has a chord through
+    // it and is the brightest thing in the frame, so "black" is a
+    // statement about direction and not about the mode having died.
+    //
+    // The band is narrow and worth stating in numbers, because it is the
+    // reason the sky-view LUT the roadmap started from could not survive
+    // this: from r = 6 771 km the top of the shell is at
+    // asin(6471/6771) = 72.94 deg from nadir, i.e. 17.06 deg below local
+    // horizontal, and the hard limb is at asin(6371/6771) = 70.15 deg,
+    // i.e. 19.85 deg below.  The WHOLE atmosphere is those 2.8 degrees.
+    //
+    // Directions are built from the tangent altitude they are aiming at
+    // rather than written as angles, because the angles are what the
+    // reader would have to re-derive: sin(theta from nadir) =
+    // (R + h_tangent) / r_camera.
+    const double r_cam = double(kR) + 400000.0;
+    auto aimAtTangent = [&](double h_t) {
+        const double sth = std::min((double(kR) + h_t) / r_cam, 1.0);
+        const double cth = std::sqrt(std::max(1.0 - sth * sth, 0.0));
+        return norm(F3{float(sth), float(-cth), 0.0f});   // nadir rotated by theta
+    };
+    // 150 km grazes above the top of the shell: no chord, exactly zero.
+    CHECK(skyLumAt(b, 400000.0, aimAtTangent(150000.0), 64) == 0.0);
+    // 12 km grazes through the bright part: a chord of
+    // 2*sqrt(r_top^2 - (R+12km)^2) = 2*sqrt(6471^2 - 6383^2) = 2 128 km.
+    const F3 limb = aimAtTangent(12000.0);
+    CHECK(skyLumAt(b, 400000.0, limb, 64) > 0.0);
+    // And the limb is far brighter than the zenith was at the SURFACE:
+    // a grazing chord crosses hundreds of km of the densest air, which
+    // is why the limb reads as a bright rim in every orbital photograph.
+    CHECK(skyLumAt(b, 400000.0, limb, 64) > ground);
+}
+
+TEST_CASE("the night side is dark because the body is in the way") {
+    // The terminator, as geometry rather than as a threshold.  There is
+    // no elevation cutoff anywhere in the physical path: a sample whose
+    // sun ray runs into the body gets exactly zero, and the graded region
+    // between "sun ray clears the limb through 40 air masses" and "sun
+    // ray hits rock" IS the terminator.
+    const AtmoBody b = ptAtmoEarth(kR);
+    // A point 30 km up, and a sun direction that puts it on the far side
+    // of the body: sun_dir pointing steeply DOWN through the planet.
+    const F3 p{0.0f, 30000.0f, 0.0f};
+    const F3 sun_down{0.0f, -1.0f, 0.0f};
+    const F3 T_night = sunSlantTransmittance(b, p, sun_down, kCentre);
+    CHECK(T_night.x == 0.0f);
+    CHECK(T_night.y == 0.0f);
+    CHECK(T_night.z == 0.0f);
+
+    // Straight up, no body in the way, and the vertical column above
+    // 30 km is thin -- so nearly all of the sunlight arrives.
+    const F3 sun_up{0.0f, 1.0f, 0.0f};
+    const F3 T_noon = sunSlantTransmittance(b, p, sun_up, kCentre);
+    CHECK(T_noon.y > 0.98f);
+
+    // And the terminator is GRADED, not a step: sweep the sun through
+    // the local horizon and the transmittance falls smoothly, reddening
+    // as it goes, before the body cuts it off.  Blue dies first --
+    // Rayleigh scatters it ~6x harder -- which is why a sunset is red.
+    double prev_g = 1.0;
+    bool saw_partial = false, saw_red = false;
+    for (int i = 0; i <= 60; ++i) {
+        const double e = (10.0 - 20.0 * (i / 60.0)) * 3.14159265358979 / 180.0;
+        const F3 sd = norm(F3{float(std::cos(e)), float(std::sin(e)), 0.0f});
+        const F3 T = sunSlantTransmittance(b, p, sd, kCentre);
+        CHECK(double(T.y) <= prev_g + 1e-6);      // monotone
+        if (T.y > 0.0f && T.y < 0.99f) saw_partial = true;
+        if (T.y > 0.0f && T.x > T.z * 1.5f) saw_red = true;
+        prev_g = T.y;
+    }
+    CHECK(saw_partial);
+    CHECK(saw_red);
+    // ...and it does reach zero, so the night side exists.
+    CHECK(prev_g == 0.0);
+}
+
+TEST_CASE("stars stop at the body, not 2.9 degrees below the horizontal") {
+    // The star gate was `cosTheta > -0.05` in both copies of starsOnly --
+    // a flat-Earth statement that everything more than 2.87 degrees below
+    // the observer's horizontal is ground.  At eye height the visible
+    // horizon dips 3.7 arcmin, so the 2.87 degrees is slack nobody
+    // noticed.  From 400 km the hard limb is 19.85 degrees down, so the
+    // gate cuts a horizontal line across the frame with stars above it
+    // and nothing below, and the band it wrongly blanks widens as the
+    // camera climbs -- the discontinuity in star visibility named in this
+    // phase's acceptance.
+    const AtmoBody b = ptAtmoEarth(kR);
+    const F3 eye{0.0f, 400000.0f, 0.0f};
+    const double r_cam = double(kR) + 400000.0;
+    // The hard limb, from the geometry rather than from a constant.
+    const double limb_deg = 90.0 - std::asin(double(kR) / r_cam)
+                                     * 180.0 / 3.14159265358979;
+    CHECK(limb_deg == doctest::Approx(19.79).epsilon(1e-3));
+
+    auto hitsBody = [&](double below_deg) {
+        const double e = -below_deg * 3.14159265358979 / 180.0;
+        const F3 rd = norm(F3{float(std::cos(e)), float(std::sin(e)), 0.0f});
+        float t0, t1;
+        return ptSphereRoots(eye, rd, kCentre, b.ground_radius, t0, t1)
+               && t0 > 0.0f;
+    };
+
+    // Everything shallower than the limb is open sky and must show stars.
+    CHECK_FALSE(hitsBody(0.0));
+    CHECK_FALSE(hitsBody(5.0));
+    CHECK_FALSE(hitsBody(10.0));
+    CHECK_FALSE(hitsBody(19.0));
+    // Everything past it is planet.
+    CHECK(hitsBody(21.0));
+    CHECK(hitsBody(45.0));
+    CHECK(hitsBody(90.0));
+    // The old gate would have blanked 16.9 of those 19.79 degrees: at
+    // 320x240 over a 55 degree vertical FOV that is 74 rows of the frame,
+    // roughly a third of it, on the night side where the stars are the
+    // only thing in it.
+    CHECK(limb_deg - 2.87 > 16.9);
+    CHECK((limb_deg - 2.87) / 55.0 * 240.0 > 73.0);
+
+    // At eye height the two criteria agree to within the horizon dip,
+    // which is why every pre-#260 fixture is unaffected: 3.7 arcmin is
+    // 0.062 degrees, far inside the 2.87 the old gate allowed.
+    const F3 ground_eye{0.0f, 1.7f, 0.0f};
+    const double dip_deg = std::acos(double(kR) / (double(kR) + 1.7))
+                             * 180.0 / 3.14159265358979;
+    CHECK(dip_deg < 0.07);
+    {
+        const double e = -0.5 * 3.14159265358979 / 180.0;   // 0.5 deg down
+        const F3 rd = norm(F3{float(std::cos(e)), float(std::sin(e)), 0.0f});
+        float t0, t1;
+        CHECK(ptSphereRoots(ground_eye, rd, kCentre, b.ground_radius, t0, t1));
+        CHECK(t0 > 0.0f);        // ground, under both criteria
+    }
+}
+
 TEST_CASE("shader mirror is still faithful") {
     const std::string math = tighten(PT_SHADER_MATH_PATH);
     REQUIRE_FALSE(math.empty());
@@ -1068,6 +1393,78 @@ TEST_CASE("shader mirror is still faithful") {
     CHECK(countOf(cr, "boolcloudLayerInterval(") == 1u);
     CHECK(countOf(pt, "cloudLayerInterval(") == 4u);   // 1 definition + 3 uses
     CHECK(countOf(cr, "cloudLayerInterval(") == 2u);   // 1 definition + 1 use
+
+    // --- Planetary P6 (#260): the physical sky ------------------------
+    // The mirror above transcribes skyPhysical and sunSlantTransmittance
+    // and the ground-to-orbit continuity claim rests entirely on that
+    // transcription, so every line the mirror depends on is counted here.
+    CHECK(countOf(pt, "float3skyPhysical(float3ro,float3rd,floatt_max,"
+                      "intsteps,inoutuintseed){") == 1u);
+    // Clip to the shell with r_inner = 0 (the NEAR piece, correct for an
+    // origin below, inside or above), then stop at the body.  Both halves
+    // are load-bearing: without the first the mode integrates vacuum from
+    // orbit, without the second it integrates through the planet.
+    CHECK(countOf(pt, "if(!ptRayShell(ro,rd,pc,0.0,body.top_radius,"
+                      "t_max,t_in,t_out)){") == 1u);
+    CHECK(countOf(pt, "if(ptSphereRoots(ro,rd,pc,planet_R,g0,g1)&&g0>0.0)"
+                      "{t_out=min(t_out,g0);}") == 1u);
+    // The sun term is the SAME slant-path integral the NEE site and the
+    // cloud march use, which is what makes the terminator geometry rather
+    // than a threshold -- and there must be exactly one of it.
+    CHECK(countOf(pt, "float3sun_at=float3(80.0)*sunSlantTransmittance(sp,"
+                      "sun_dir);") == 1u);
+    CHECK(countOf(pt, "acc+=trans*(sigma_s_ray*ph_r+sigma_s_mie*ph_m)"
+                      "*sun_at*dt;") == 1u);
+    // No elevation gate anywhere in the physical path.  procSky, hosek,
+    // sunDisc and starsOnly all fade on a scalar sun elevation; the whole
+    // point of mode 4 is that it does not, so a smoothstep on sun
+    // elevation appearing inside skyPhysical would be a regression that
+    // no image test would obviously catch.
+    {
+        const std::size_t at = pt.find("float3skyPhysical(");
+        const std::size_t end = pt.find("float3sunDiscPhysical(");
+        REQUIRE(at != std::string::npos);
+        REQUIRE(end != std::string::npos);
+        REQUIRE(end > at);
+        const std::string body = pt.substr(at, end - at);
+        CHECK(countOf(body, "smoothstep") == 0u);
+        CHECK(countOf(body, "sun_and_mode.y") == 0u);
+    }
+    // The disc radiance is E / Omega, derived, with Omega taken from the
+    // RENDERED half-angle so r_sun_size stays energy-conserving.
+    CHECK(countOf(pt, "floatomega=6.28318530718*(1.0-kCosR);") == 1u);
+    CHECK(countOf(pt, "returnT*(80.0/max(omega,1.0e-12))*bright;") == 1u);
+
+    // ...and the host half of the same contract.  Mode 4 IMPLIES the
+    // physical sun transmittance: skyPhysical lights every sample with
+    // sunSlantTransmittance, so if the NEE site were still on
+    // exp(-0.30 / max(sun_elev, 0.04)) the air and the ground would
+    // disagree about the colour of sunlight and the sun would keep
+    // lighting the night side.  A scene that set r_sky_mode physical and
+    // forgot r_sun_physical_transmittance would look subtly wrong in a
+    // way that is very hard to attribute, so it is not settable wrong.
+    const std::string eng = tighten(PT_ENGINE_CPP_PATH);
+    REQUIRE_FALSE(eng.empty());
+    CHECK(countOf(eng, "if(sky_mode_id==4u)push.sun_extra2[1]=1.0f;") == 1u);
+    CHECK(countOf(eng, "elseif(sky_mode_str==\"physical\"){") == 1u);
+    CHECK(countOf(eng, "\"physical\"};") == 1u);   // the allowed_values list
+
+    // The star gate, in BOTH copies.  StarsComposite.slang imports no
+    // modules and carries a hand-written mirror of localUp() for that
+    // reason, so it carries a hand-written mirror of the body test too --
+    // and two copies of one gate is exactly the drift hazard this file
+    // exists to catch, so both are counted and the flat-Earth form is
+    // asserted GONE from each rather than merely outnumbered.
+    CHECK(countOf(pt, "boolstar_visible=(cosTheta>-0.05);") == 1u);
+    CHECK(countOf(pt, "if(star_visible&&exposure_pad.z>0.5&&day<0.6){") == 1u);
+    CHECK(countOf(pt, "}elseif(star_visible&&exposure_pad.y>0.5&&day<0.6){") == 1u);
+    CHECK(countOf(pt, "cosTheta>-0.05&&exposure_pad") == 0u);
+    const std::string sc = tighten(PT_SHADER_STARSCOMPOSITE_PATH);
+    REQUIRE_FALSE(sc.empty());
+    CHECK(countOf(sc, "boolstarRayHitsBody(float3rd){") == 1u);
+    CHECK(countOf(sc, "if(star_visible&&exposure_pad.z>0.5&&day<0.6){") == 1u);
+    CHECK(countOf(sc, "}elseif(star_visible&&exposure_pad.y>0.5&&day<0.6){") == 1u);
+    CHECK(countOf(sc, "cosTheta>-0.05&&exposure_pad") == 0u);
 
     const std::string pc = tighten(PT_SHADER_PATHTRACECLOUD_PATH);
     REQUIRE_FALSE(pc.empty());
