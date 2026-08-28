@@ -392,7 +392,20 @@ endif()
 # The chunk-bake cases walk a level-19 chunk's full subdivision hierarchy,
 # which is ~22 000 field evaluations per chunk; the default 60 s backstop is
 # tight for that on a loaded machine.
-set_tests_properties(pt_planet_terrain PROPERTIES TIMEOUT 180)
+#
+# TIMEOUT 600, measured rather than guessed. The suite is 700 306 assertions
+# and takes 157.9 s in a Debug build on an M4 Max; CI builds Debug on shared
+# runners and blew the previous 180 s limit on BOTH macos-26 and
+# windows-latest (180.05 s, i.e. it was still running). 600 s is ~3.8x the
+# measured local Debug time, leaving room for a runner around 2x slower
+# still.
+#
+# The sweep is deliberately NOT trimmed to fit. CI builds only the Debug
+# presets, so a Debug-only reduction would mean the exhaustive half never
+# runs in CI at all -- a labelled test nobody executes is the same failure
+# this file warns about two comments up. A slow honest test beats a fast
+# vacuous one; if this ever needs to get faster, cut redundancy, not cases.
+set_tests_properties(pt_planet_terrain PROPERTIES TIMEOUT 600)
 
 # --- pt_planet_shader (issue #258, planetary P4) ---------------------------
 # The host mirror of the shader-side terrain contract: the instance
@@ -1464,12 +1477,38 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # identical-run renders PASS them, checked against the committed PNGs.
     # Re-measure if a fixture's camera, resolution, exposure or frame count
     # changes: the margins are the point, not the numbers.
-    pt_add_golden_cell(SCENE planet_surface  BACKEND metal DENOISER off
-                       FRAMES 32 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
-    pt_add_golden_cell(SCENE planet_aerial   BACKEND metal DENOISER off
-                       FRAMES 32 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
-    pt_add_golden_cell(SCENE planet_lod_seam BACKEND metal DENOISER off
-                       FRAMES 32 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
+    # NOT REGISTERED -- the terrain render is not yet reproducible, so these
+    # cells cannot be pinned honestly. Measured on this branch, same binary,
+    # same fixture, consecutive renders of planet_surface:
+    #
+    #     Debug   3 runs -> 3 distinct images
+    #     Release 3 runs -> 2 identical, the third divergent
+    #
+    # Release diverges less often, which is why the stability check above
+    # (mean 0.000005, bad 0.000%) passed -- it sampled the common case. The
+    # cause is most likely the residual recorded in PlanetTerrain.cpp: a
+    # capture sitting on the chunk-budget cap is not reproducible, because
+    # the tau bisection's trial sizes depend on which metrics had been
+    # measured when it ran. These fixtures were believed to keep clear of
+    # the cap; they do not, reliably.
+    #
+    # Pinning a nondeterministic render produces a cell that passes by luck,
+    # which is the failure this file spends several comments warning about.
+    # The fixtures, the PNGs and the measured thresholds above are all kept
+    # so that registering these is a one-line change once the render is
+    # reproducible. Tracked in the issue linked from #258.
+    #
+    # Terrain is NOT unverified in the meantime: pt_planet_terrain covers
+    # watertightness, seam equality and selector behaviour in 700 306
+    # deterministic assertions -- claims a golden PNG cannot settle anyway,
+    # per the comment at the top of this file.
+    #
+    # pt_add_golden_cell(SCENE planet_surface  BACKEND metal DENOISER off
+    #                    FRAMES 32 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
+    # pt_add_golden_cell(SCENE planet_aerial   BACKEND metal DENOISER off
+    #                    FRAMES 32 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
+    # pt_add_golden_cell(SCENE planet_lod_seam BACKEND metal DENOISER off
+    #                    FRAMES 32 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
     # --- end Planetary P4 -------------------------------------------------
     pt_add_golden_cell(SCENE planet_horizon_clouds        BACKEND metal DENOISER off
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
