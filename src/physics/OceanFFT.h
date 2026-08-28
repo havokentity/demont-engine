@@ -11,6 +11,159 @@
 
 namespace pt::ocean {
 
+// --- Planetary P5 (#259): Cox & Munk, and what "roughness" means here -----
+//
+// Cox, C. & Munk, W. (1954), "Measurement of the roughness of the sea
+// surface from photographs of the sun's glitter", J. Opt. Soc. Am. 44(11)
+// 838-850. Their table 1 clean-surface fit, in the paper's own notation,
+// is the TOTAL mean-square slope (the sum of the up-wind and cross-wind
+// components):
+//
+//     sigma^2 = 0.003 + 0.00512 * U        U in m/s, measured at 12.5 m
+//
+// That is a MEASURED oceanographic constant, not a dial, and it is the
+// number a planetary ocean seen from orbit has to converge to.
+//
+// TURNING IT INTO A MICROFACET ROUGHNESS. The Beckmann NDF with roughness
+// alpha has the slope distribution
+//
+//     P22(s) = exp(-(sx^2 + sy^2) / alpha^2) / (pi * alpha^2)
+//
+// i.e. a 2-D Gaussian with variance alpha^2 / 2 PER AXIS, so its TOTAL
+// mean-square slope is exactly alpha^2. Matching the measured total to the
+// distribution therefore gives
+//
+//     alpha = sigma = sqrt(0.003 + 0.00512 * U)
+//
+// and at the engine's default r_ocean_wind_speed 12 that is alpha =
+// sqrt(0.0645) = 0.25397 -- a glitter half-angle of atan(0.254) = 14.3
+// degrees, which is the width Cox & Munk photographed.
+//
+// THE ENGINE'S ROUGHNESS IS NOT ALPHA. PathTrace.slang's anisoAlpha()
+// squares it: `float alpha = r * r`. So the value that goes in a material's
+// roughness field to produce alpha is sqrt(alpha), and the far-field ocean
+// roughness at 12 m/s is sqrt(0.25397) = 0.50396.
+//
+// This is deliberately NOT the 0.18 that issue #259 quotes. 0.18 is
+// sqrt(sigma^2 / 2) -- the PER-AXIS slope RMS -- which would be the answer
+// if `roughness` were alpha directly AND alpha^2 were the per-axis variance.
+// Under this engine's alpha = roughness^2 convention neither holds, and the
+// two mistakes do not cancel: 0.18 renders a glitter path a factor sqrt(2)
+// x sqrt(2) too tight. The derivation above is what the code and the tests
+// use; see tests/pt_ocean_fft_test.cpp, which pins every step of it.
+double CoxMunkMeanSquareSlope(double wind_mps) noexcept;
+// The Beckmann/GGX alpha with that total mean-square slope.
+double CoxMunkAlpha(double wind_mps) noexcept;
+// The engine-facing perceptual roughness r for which anisoAlpha gives that
+// alpha, i.e. sqrt(alpha).
+double CoxMunkRoughness(double wind_mps) noexcept;
+
+// --- The band the measured slope lives in ---------------------------------
+//
+// Cox & Munk photographed the WHOLE sea surface, capillary ripples included,
+// so their sigma^2 is the integral over every wavelength the ocean carries.
+// A finite grid carries a window of that, and to split the constant between
+// geometry and BRDF the split has to be a number rather than a guess.
+//
+// Phillips 1958 (J. Fluid Mech. 4(4) 426-434) gives the equilibrium range as
+// k^-4, so the slope-variance integrand is k^2 * k^-4 * k dk = dk/k =
+// d(ln k): MEAN-SQUARE SLOPE IS UNIFORM IN LOG WAVELENGTH. The fraction of
+// sigma^2 inside a window is then the window's log-length over the whole
+// range's, and the whole range has two ends with real names:
+//
+//   TOP -- the spectral peak. Pierson & Moskowitz 1964 (JGR 69(24)
+//   5181-5190) put a fully developed sea's peak at omega_p = 0.877 g / U, so
+//   lambda_p = 2 pi U^2 / (0.877^2 g): 120 m at 12 m/s. Above the peak the
+//   spectrum rolls off and carries essentially no slope.
+//
+//   BOTTOM -- the gravity-capillary transition, the wavelength of MINIMUM
+//   phase speed, lambda_m = 2 pi sqrt(sigma / (rho g)) with the air-water
+//   surface tension sigma = 0.0728 N/m at 20 C: 1.712 cm. (Lamb,
+//   "Hydrodynamics" 6th ed. 1932, section 267; Phillips, "The Dynamics of
+//   the Upper Ocean" 2nd ed. 1977, section 3.2.) Below it capillarity, not
+//   gravity, restores the surface and the deep-water dispersion this solver
+//   uses stops being the right one anyway.
+double GravityCapillaryWavelengthM() noexcept;
+double PiersonMoskowitzPeakWavelengthM(double wind_mps) noexcept;
+
+// The fraction of Cox & Munk's mean-square slope that lives in the
+// wavelength window [lo, hi], under the log-uniform law above. Clamped to
+// [0, 1]; the window is intersected with [lambda_m, lambda_p] first, since
+// outside that the law does not hold and the spectrum has nothing anyway.
+double SlopeVarianceFractionInBand(double lo_m, double hi_m,
+                                   double wind_mps) noexcept;
+
+// --- Planetary P5 (#259): the camera-anchored, quantised tangent frame ----
+//
+// THE PROBLEM. The FFT tile is planar and the ocean is not. Projecting the
+// world into the East/North basis at ONE anchor point on the shell costs
+// (d/R)^2 of arc-length distortion -- 2.5e-4 at 100 km, i.e. 25 m over
+// 100 km, on a field whose finest cascade tiles every 23 m and whose crests
+// are sub-pixel past ~2.8 km. Every alternative is worse: cubed-sphere face
+// UV rotates discontinuously across the 12 cube seams and stretches the
+// field by the tangent warp's +/-13%.
+//
+// WHY THE ANCHOR MUST BE QUANTISED, AND WHY THE QUANTISATION IS EXACT. An
+// anchor that slides with the camera drags the whole wave field along with
+// it: parallax dies and the sea looks painted on the screen. So the anchor
+// snaps to a lattice -- and the spacing is exactly cascade 0's period, which
+// makes the snap a NO-OP for the lookup rather than something to smooth over.
+//
+//   * Northing is quantised in ARC LENGTH along the meridian:
+//     i = round(R * lat / P0). Adjacent lattice rows are exactly P0 apart.
+//   * Easting is quantised in arc length along the SNAPPED parallel:
+//     j = round(R * cos(lat_a) * lon / P0). Adjacent lattice columns in one
+//     row are exactly P0 apart, because the parallel's radius is fixed by
+//     the snapped latitude and not by the camera's own.
+//
+// Moving the anchor one cell therefore translates every world point's
+// tangent coordinate by exactly P0, and cascade 0's uv -- that coordinate
+// over P0 -- does not move at all. Cascades 1 and 2 pick up
+// frac(j * P0 / P_c), computed here in f64 from the INTEGER lattice indices,
+// so it is exact and is a pure function of camera position: no hysteresis,
+// no path dependence, which is what the golden matrix requires and what a
+// "re-anchor once you have drifted half a cell" scheme could not give.
+//
+// WHAT IS LEFT, stated rather than hidden. Two second-order residuals:
+//   * ORIENTATION. Adjacent anchors P0 apart differ in basis orientation by
+//     P0/R = 2.8e-4 rad, so a point d away sees its tangent coordinate move
+//     by d * P0 / R: 0.28 m at 1 km, 2.8 m at 10 km. On a 30 m wave that is
+//     a 3% phase error at 1 km.
+//   * MERIDIAN CONVERGENCE. Crossing a latitude row changes cos(lat_a), so a
+//     point Dlon east of the anchor shifts by Dlon * sin(lat) * P0 -- 1.6 m
+//     for a point 5 km east at 45 degrees latitude.
+// Both are the tangent plane not being the sphere, i.e. the same (d/R)^2 the
+// parameterisation already accepts.
+inline constexpr int kOceanMaxCascades = 3;
+
+struct OceanTangentFrame {
+    bool       valid = false;
+    // All three in the frame the caller passed its pole and prime meridian
+    // in. `origin` is RELATIVE TO THE SPHERE CENTRE; the caller adds the
+    // centre, because that addition is a conversion-boundary decision.
+    glm::dvec3 origin{0.0};
+    glm::dvec3 east{1.0, 0.0, 0.0};
+    glm::dvec3 north{0.0, 0.0, 1.0};
+    // Tile-space phase per cascade. Cascade 0's is exactly 0 by
+    // construction: the lattice spacing IS cascade 0's period.
+    double     phase[kOceanMaxCascades][2] = {{0.0, 0.0}, {0.0, 0.0},
+                                              {0.0, 0.0}};
+    // The lattice cell. Exposed so a test can assert that crossing a
+    // boundary really is a whole-cell step and not a fraction of one.
+    double     lattice_i = 0.0;   // northing index
+    double     lattice_j = 0.0;   // easting index
+};
+
+// `cam_rel_centre` is the camera position relative to the sphere centre;
+// `pole` and `prime` are an orthonormal pair fixing the lattice's latitude
+// axis and its zero meridian. `period_m[0]` is the lattice spacing.
+OceanTangentFrame OceanTangentAnchor(const glm::dvec3& cam_rel_centre,
+                                     double radius_m,
+                                     const glm::dvec3& pole,
+                                     const glm::dvec3& prime,
+                                     const double period_m[kOceanMaxCascades],
+                                     int cascades) noexcept;
+
 // OceanFFT -- Wave 8 (#25): Tessendorf-style FFT ocean surface.
 //
 // Statistical-spectrum ocean simulation following Tessendorf 2001
@@ -127,6 +280,32 @@ public:
         // config produces a deterministic base spectrum (the animation
         // is then a pure function of sim time).
         std::uint32_t seed = 1337u;
+
+        // --- Planetary P5 (#259): spectral band limits ------------------
+        // Wavelength window, in metres, that this solver's spectrum is
+        // restricted to. A bin is kept when
+        //     band_lo_m <= lambda <= band_hi_m,  lambda = 2*pi / |k|.
+        // Both 0 means "no window" -- the Wave 8 behaviour, bit-for-bit,
+        // which is what the single-cascade legacy ocean still uses.
+        //
+        // WHY A WINDOW AND NOT JUST DIFFERENT TILE SIZES. A planetary
+        // ocean needs several cascades at mutually non-commensurate
+        // periods so no tile grid or beat pattern is visible across
+        // thousands of km. Running the SAME Phillips spectrum at three
+        // tile sizes triple-counts every wavelength the three grids can
+        // all resolve: the 23 m and the 1793 m tiles both carry the 20 m
+        // waves, so the sea comes out sqrt(3) times steeper than the
+        // spectrum says and Cox-Munk stops being reachable. Windowing
+        // each cascade to the band its own grid resolves makes the three
+        // a PARTITION of one spectrum instead of three copies of it, so
+        // the cascade set's mean-square slope is the spectrum's.
+        //
+        // The window is sharp rather than tapered on purpose. This is
+        // spectral SYNTHESIS from random phases, not filtering of a
+        // signal, so a sharp edge produces no ringing -- it just decides
+        // which cascade owns which wavenumber.
+        float band_lo_m = 0.0f;
+        float band_hi_m = 0.0f;
     };
 
     OceanFFT()  = default;
@@ -171,6 +350,42 @@ public:
     // seed / grid-size change the engine can't detect via the float
     // config deltas alone).
     void Invalidate() { dirty_ = true; }
+
+    // --- Planetary P5 (#259): mean-square slope from the spectrum -------
+    //
+    // The TOTAL mean-square slope (both axes summed) this cascade's
+    // surface carries, restricted to the bins whose wavelength is at
+    // least `min_wavelength_m`. Pass 0 for the whole spectrum.
+    //
+    // Derived, not sampled. The packed height field is
+    //     h(x) = sum_k h~(k,t) exp(i k.x)
+    // (Ifft2D's un-normalised inverse DFT), so its gradient is
+    //     grad h = sum_k (i k) h~(k,t) exp(i k.x)
+    // and Parseval for that convention gives
+    //     mean_x |grad h|^2 = sum_k |k|^2 |h~(k,t)|^2.
+    // h~ = H0(k) exp(i w t) + conj(H0(-k)) exp(-i w t), whose expected
+    // square modulus is |H0(k)|^2 + |H0(-k)|^2 -- independent of t, which
+    // is what makes this a property of the SPECTRUM rather than of the
+    // frame, and therefore something the shader can be handed once per
+    // rebuild instead of once per frame.
+    //
+    // Averaging the packed gx/gz grid instead would be one realisation of
+    // the same random variable, would move every frame, and could not be
+    // band-restricted without a second FFT.
+    double SlopeVarianceAbove(double min_wavelength_m) const noexcept;
+
+    // Grid spacing in metres: patch_size_m / grid_size. The finest
+    // wavelength this cascade can carry is twice this (Nyquist).
+    double GridSpacingM() const noexcept {
+        return static_cast<double>(cfg_.patch_size_m) /
+               static_cast<double>(cfg_.grid_size ? cfg_.grid_size : 1u);
+    }
+
+    // Build (or rebuild) the base spectrum if the config moved, WITHOUT
+    // running the per-frame inverse FFTs. SlopeVarianceAbove reads H0, so
+    // the amplitude a cascade needs can be solved for at a fraction of the
+    // cost of a full Update().
+    void EnsureSpectrum();
 
 private:
     void RebuildBaseSpectrum();
@@ -228,6 +443,8 @@ private:
     float         built_amplitude_ = 0.0f;
     float         built_gravity_   = 0.0f;
     std::uint32_t built_seed_      = 0u;
+    float         built_band_lo_   = 0.0f;
+    float         built_band_hi_   = 0.0f;
 };
 
 }  // namespace pt::ocean

@@ -529,7 +529,17 @@ namespace cvar {
             "height scale. Dimensionless. At the 50 m default tile + 12 m/s "
             "wind, 0.0002 gives roughly +/-1.5 m peak crests (a moderate "
             "sea); scales linearly. 0 = dead-calm flat water (no "
-            "displacement).",
+            "displacement).\n"
+            "  IGNORED BY r_planet_ocean 1, and that is deliberate. This "
+            "dial is not scale-invariant -- the solver's H0 omits the "
+            "k-space cell area (2*pi/L)^2, so the same A that gives +/-1.5 m "
+            "crests on the 50 m tile gives 383 m crests on the 1793 m one, "
+            "measured -- and a planetary ocean runs three tile sizes at "
+            "once. The planetary cascades take their amplitude from Cox & "
+            "Munk's measured 1954 sea-slope variance at r_ocean_wind_speed "
+            "instead, through the Phillips equilibrium range. A dial is "
+            "replaced by a measurement, which is also what makes the "
+            "geometry-to-BRDF handover conserve anything.",
             CVAR_ARCHIVE);
     PT_CVAR(r_ocean_choppiness, "1.0",
             "Ocean choppiness lambda in [0, 1.5] (#25). 0 = round "
@@ -591,6 +601,28 @@ namespace cvar {
             "missed thin crests at grazing angles, at GPU cost.",
             CVAR_ARCHIVE);
     // --- end Wave 8 ocean ----------------------------------------------------
+    // --- Planetary P5 (#259): the planetary ocean ----------------------------
+    PT_CVAR(r_planet_ocean, "0",
+            "Planetary ocean (#259). 1 = a MAT_WATER shell at sea level on "
+            "the SAME body r_planet_radius / r_planet_ground already define, "
+            "so land is above it and seabed below it by construction rather "
+            "than by agreement between two numbers. Requires "
+            "r_planet_spherical_frame 1 (a planar frame has no centre to put "
+            "a shell around) and is ignored without it. 0 leaves every "
+            "MAT_WATER surface the infinite analytic plane it has always "
+            "been, bit for bit.\n"
+            "  Terrain above sea level occludes the shell with no special "
+            "case at all: traceScene keeps the closest hit.\n"
+            "  WITH r_ocean 0 the shell is a smooth Fresnel sphere whose "
+            "roughness is Cox & Munk's measured slope variance for "
+            "r_ocean_wind_speed -- which is exactly what a wave field seen "
+            "from far enough away IS, and is therefore the A/B control the "
+            "geometry-to-BRDF handover is measured against. WITH r_ocean 1 "
+            "three band-limited FFT cascades carry the slope the ray cone "
+            "still resolves and the roughness carries the rest, summing to "
+            "the same constant at every distance.",
+            CVAR_ARCHIVE);
+    // --- end Planetary P5 ----------------------------------------------------
     PT_CVAR(r_denoiser,        "off",
             "Denoiser. off = noisy 1-spp, accumulating image only. "
             "metalfx = Mac MetalFX TemporalDenoisedScaler (Apple Silicon "
@@ -3366,8 +3398,12 @@ void Engine::TearDownDevice() {
         }
         // --- end Fluid Phase 3 -----------------------------------------------
         // --- Wave 8 ocean (#25) ----------------------------------------------
-        if (ocean_disp_tex_id_   != 0) device_->DestroyTexture(pt::rhi::TextureHandle{ocean_disp_tex_id_});
-        if (ocean_normal_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{ocean_normal_tex_id_});
+        for (int i = 0; i < kOceanUploadRing; ++i) {
+            if (ocean_disp_tex_id_[i] != 0)
+                device_->DestroyTexture(pt::rhi::TextureHandle{ocean_disp_tex_id_[i]});
+            if (ocean_normal_tex_id_[i] != 0)
+                device_->DestroyTexture(pt::rhi::TextureHandle{ocean_normal_tex_id_[i]});
+        }
         // --- end Wave 8 ocean ------------------------------------------------
         if (denoise_color_tex_id_    != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
         if (depth_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
@@ -3465,9 +3501,16 @@ void Engine::TearDownDevice() {
     // next device. The CPU solver (ocean_) survives -- it owns no GPU
     // resources -- and ocean_time_ persists so the animation is
     // continuous across a device recreate.
-    ocean_disp_tex_id_   = 0;
-    ocean_normal_tex_id_ = 0;
+    for (int i = 0; i < kOceanUploadRing; ++i) {
+        ocean_disp_tex_id_[i]   = 0;
+        ocean_normal_tex_id_[i] = 0;
+    }
+    ocean_tex_slot_      = 0;
     ocean_tex_grid_      = 0;
+    // Planetary P5 (#259): the cascade count is part of the atlas's shape,
+    // so it has to be forgotten with the handles or EnsureOceanUploaded
+    // would think a fresh device already had the right texture.
+    ocean_tex_cascades_  = 0;
     // --- end Wave 8 ocean -------------------------------------------------
     denoise_color_tex_id_    = 0;
     depth_tex_id_            = 0;
@@ -8388,11 +8431,17 @@ void Engine::RenderFrame() {
     // the shader samples them only when ocean_params0.x != 0, so on the
     // off path the slots stay unbound (PARTIALLY_BOUND on Vulkan covers
     // it). On Metal, slots above a kernel's texture count are dropped.
-    if (ocean_disp_tex_id_ != 0) {
-        cb->BindStorageTexture(14, pt::rhi::TextureHandle{ocean_disp_tex_id_});
+    // Planetary P5 (#259): bind the ring slot this frame's field was
+    // uploaded into. EnsureOceanUploaded advanced it before this point, so
+    // the slot the GPU reads is the one the CPU has finished writing and no
+    // earlier frame is still reading.
+    if (ocean_disp_tex_id_[ocean_tex_slot_] != 0) {
+        cb->BindStorageTexture(
+            14, pt::rhi::TextureHandle{ocean_disp_tex_id_[ocean_tex_slot_]});
     }
-    if (ocean_normal_tex_id_ != 0) {
-        cb->BindStorageTexture(15, pt::rhi::TextureHandle{ocean_normal_tex_id_});
+    if (ocean_normal_tex_id_[ocean_tex_slot_] != 0) {
+        cb->BindStorageTexture(
+            15, pt::rhi::TextureHandle{ocean_normal_tex_id_[ocean_tex_slot_]});
     }
     // --- end Wave 8 ocean --------------------------------------------------
     // --- Wave 8 PBR (#26) -- material texture atlas ------------------------
@@ -9069,6 +9118,28 @@ void Engine::RenderFrame() {
         //      SoftwareTracer.cpp byte offsets stay valid.
         float planet_terrain[4];
         // --- end Planetary P4 --------------------------------------------
+        // --- Planetary P5 (#259): the planetary ocean ---------------------
+        // Six vec4 appended at the tail, so the SoftwareTracer.cpp byte
+        // offsets below stay valid. Field-by-field semantics live on the
+        // matching `planet_ocean` .. `ocean_slope` block in
+        // PathTrace.slang's Push (Metal) + Frame (Vulkan) declarations --
+        // one description, two mirrors of it, as every other lane here.
+        //
+        //   planet_ocean.x = sea-level radius, m (0 = no planetary ocean)
+        //              .y  = cascade count in the ocean texture atlas
+        //              .z  = Cox & Munk 1954 total mean-square slope
+        //   ocean_tan_e/n/o.xyz = tangent frame East / North / origin
+        //   ocean_tan_e/n/o.w   = cascade 0 / 1 / 2 tile period, m
+        //   ocean_phase.xy/.zw  = cascade 1 / 2 tile-space phase
+        //   ocean_slope.xyz     = per-cascade mean-square slope
+        //              .w       = the water microsurface's own alpha^2
+        float planet_ocean[4];
+        float ocean_tan_e[4];
+        float ocean_tan_n[4];
+        float ocean_tan_o[4];
+        float ocean_phase[4];
+        float ocean_slope[4];
+        // --- end Planetary P5 --------------------------------------------
     } push{};
     // CONVERSION BOUNDARY (#255). The single source for the eye position
     // every shader sees; the nine per-pass memcpy(x.pos_fovtan, ...)
@@ -9925,6 +9996,90 @@ void Engine::RenderFrame() {
             push.planet_terrain[3] = 0.0f;
         }
         // --- end Planetary P4 -------------------------------------------
+        // --- Planetary P5 (#259): the planetary ocean -------------------
+        // ONE RADIUS, NOT A SECOND SOURCE OF TRUTH. The sea-level radius
+        // is planet_R_d -- the same scalar that placed planet_center_radius
+        // and, with terrain on, the site's geocentric radius, which is the
+        // radius of the sphere TANGENT TO THE WGS-84 ELLIPSOID at the site.
+        // So near the site "sea level" and "the terrain's zero elevation"
+        // are the same surface and the coastline falls where the DEM's own
+        // sign change is, with nothing to agree about.
+        //
+        // AND WHAT THAT COSTS AWAY FROM THE SITE. The terrain is on the
+        // ellipsoid; this is a sphere tangent to it. The two separate as
+        // (d^2 / 2) * (1/R_sphere - 1/R_curvature), which for the WGS-84
+        // prime-vertical radius at 45 deg (6 388 838 m) against the mean
+        // 6 371 009 m is 4.4e-10 per metre: 5 mm at the 4.7 km horizon from
+        // eye height, 2.2 cm at 10 km, and 2.2 m at 100 km. Against a
+        // pixel footprint of 107 m at 100 km that is 2% of a pixel of
+        // coastline displacement. It is a real approximation and not a
+        // rounding, and closing it needs a stable ray-ELLIPSOID solve --
+        // which P3 (#257) deliberately deferred, for reasons that have not
+        // changed: the obvious scale-to-a-unit-sphere solve reintroduces
+        // exactly the cancellation #254 and #275 removed.
+        {
+            bool ocean_on = false;
+            if (auto* v = C.FindCVar("r_planet_ocean")) ocean_on = v->GetBool();
+            // A planar frame has no centre to put a shell around.
+            ocean_on = ocean_on && spherical_frame;
+
+            const std::uint32_t cascades =
+                static_cast<std::uint32_t>(ocean_cascades_.size());
+            // Cox & Munk is a pure function of the wind and is read
+            // STRAIGHT FROM THE CVAR here, not from anything the solver
+            // left behind. That placement is the whole A/B: with r_ocean 0
+            // the solver never runs, and if this came out of it the shell
+            // would fall back to a mirror -- which is what the first run of
+            // this code did, and it renders a pinpoint sun reflection where
+            // an ocean from 400 km has a 15-degree glitter patch. The
+            // control has to be the SAME surface with its waves moved into
+            // the BRDF, not a different material.
+            float ocean_wind = 12.0f;
+            if (auto* v = C.FindCVar("r_ocean_wind_speed")) {
+                ocean_wind = v->GetFloat();
+            }
+            ocean_cox_munk_sigma2_ = pt::ocean::CoxMunkMeanSquareSlope(
+                static_cast<double>(ocean_wind));
+            push.planet_ocean[0] =
+                ocean_on ? static_cast<float>(planet_R_d) : 0.0f;
+            push.planet_ocean[1] = static_cast<float>(std::max(cascades, 1u));
+            push.planet_ocean[2] =
+                static_cast<float>(ocean_cox_munk_sigma2_);
+            push.planet_ocean[3] = 0.0f;
+
+            const OceanTangentFrame tf =
+                ComputeOceanTangentFrame(cam.pos_w, planet_R_d);
+            // CONVERSION BOUNDARY (#255): the anchor is a canonical world
+            // position and every shader position is anchor-relative, so it
+            // crosses here and nowhere else. The two basis vectors are
+            // DIRECTIONS and do not rebase.
+            const glm::vec3 o_rel = world_frame_.ToRender(tf.origin_w);
+            push.ocean_tan_e[0] = static_cast<float>(tf.east_w.x);
+            push.ocean_tan_e[1] = static_cast<float>(tf.east_w.y);
+            push.ocean_tan_e[2] = static_cast<float>(tf.east_w.z);
+            push.ocean_tan_e[3] = static_cast<float>(kOceanCascadePeriodM[0]);
+            push.ocean_tan_n[0] = static_cast<float>(tf.north_w.x);
+            push.ocean_tan_n[1] = static_cast<float>(tf.north_w.y);
+            push.ocean_tan_n[2] = static_cast<float>(tf.north_w.z);
+            push.ocean_tan_n[3] = static_cast<float>(kOceanCascadePeriodM[1]);
+            push.ocean_tan_o[0] = o_rel.x;
+            push.ocean_tan_o[1] = o_rel.y;
+            push.ocean_tan_o[2] = o_rel.z;
+            push.ocean_tan_o[3] = static_cast<float>(kOceanCascadePeriodM[2]);
+            push.ocean_phase[0] = static_cast<float>(tf.phase[1][0]);
+            push.ocean_phase[1] = static_cast<float>(tf.phase[1][1]);
+            push.ocean_phase[2] = static_cast<float>(tf.phase[2][0]);
+            push.ocean_phase[3] = static_cast<float>(tf.phase[2][1]);
+            push.ocean_slope[0] = static_cast<float>(ocean_cascade_sigma2_[0]);
+            push.ocean_slope[1] = static_cast<float>(ocean_cascade_sigma2_[1]);
+            push.ocean_slope[2] = static_cast<float>(ocean_cascade_sigma2_[2]);
+            // Clean water has no microsurface roughness of its own -- every
+            // bit of it is wave slope, and the wave slope is accounted for
+            // above. A non-zero value here would be an artistic dial in the
+            // middle of a conservation law.
+            push.ocean_slope[3] = 0.0f;
+        }
+        // --- end Planetary P5 -------------------------------------------
 
         // up_xyz.w carries sin(solar elevation) AT THE CAMERA, i.e.
         // dot(localUp(camera), sun_dir). The screen-space sky passes
@@ -10720,8 +10875,8 @@ void Engine::RenderFrame() {
         int ocean_gate = 0;
         if (auto* v = C.FindCVar("r_ocean")) ocean_gate = v->GetInt();
         const bool ocean_on =
-            (ocean_gate != 0) && (ocean_disp_tex_id_ != 0) &&
-            (ocean_normal_tex_id_ != 0);
+            (ocean_gate != 0) && (ocean_disp_tex_id_[ocean_tex_slot_] != 0) &&
+            (ocean_normal_tex_id_[ocean_tex_slot_] != 0);
 
         float tile = 50.0f;
         if (auto* v = C.FindCVar("r_ocean_tile_size")) tile = v->GetFloat();
@@ -10896,6 +11051,38 @@ void Engine::RenderFrame() {
                 double(n.z) * cam.pos_w.z + d;
             if (signed_dist <= 0.0) { cam_in_water = true; break; }
         }
+        // --- Planetary P5 (#259): the shell has no plane to scan ----------
+        // With a planetary ocean the same question -- "is the eye inside a
+        // MAT_WATER body" -- is a geodetic altitude test rather than a
+        // half-space test against a list of planes. Same one-line output.
+        //
+        // Evaluated in f64 against the canonical camera position, for the
+        // same reason the plane scan above is: at ECEF altitude both
+        // |cam - centre| and the radius are ~6.4e6 and their difference is
+        // metres, so a float32 form would be a textbook cancellation
+        // deciding a boolean.
+        if (!cam_in_water) {
+            bool planet_ocean_on = false;
+            if (auto* v = C.FindCVar("r_planet_ocean")) {
+                planet_ocean_on = v->GetBool();
+            }
+            bool spherical = false;
+            if (auto* v = C.FindCVar("r_planet_spherical_frame")) {
+                spherical = v->GetBool();
+            }
+            double R = 0.0;
+            if (auto* v = C.FindCVar("r_planet_radius")) R = v->GetFloat();
+#if PT_PLANET_ENABLED
+            if (planet_terrain_ && planet_terrain_->Ready()) {
+                spherical = true;
+                R = planet_terrain_->Site().site_radius_m;
+            }
+#endif
+            if (planet_ocean_on && spherical && R > 0.0) {
+                const glm::dvec3 centre(0.0, -R, 0.0);
+                if (glm::length(cam.pos_w - centre) < R) cam_in_water = true;
+            }
+        }
         float deep_r = 0.0f, deep_g = 0.0f, deep_b = 0.0f;
         if (auto* v = C.FindCVar("r_water_deep_color_r")) deep_r = v->GetFloat();
         if (auto* v = C.FindCVar("r_water_deep_color_g")) deep_g = v->GetFloat();
@@ -11051,7 +11238,10 @@ void Engine::RenderFrame() {
                   + 160 /* Wave 9 hosek-sky cooked coeffs: hosek_cfg[9] + hosek_radiance */
                   + 16 /* Planetary P0 (#254): planet_center_radius */
                   + 16 /* Planetary P3 (#257): planet_ground */
-                  + 16 /* Planetary P4 (#258): planet_terrain */);
+                  + 16 /* Planetary P4 (#258): planet_terrain */
+                  + 96 /* Planetary P5 (#259): planet_ocean + ocean_tan_e +
+                          ocean_tan_n + ocean_tan_o + ocean_phase +
+                          ocean_slope */);
     // Raw-byte offsets the SOFTWARE tracer mirrors (SoftwareTracer.cpp:
     // kSunAndModeOffset / kAccumParamsOffset / kTonemapParamsOffset).
     // The CPU backend decodes these fields straight out of the pushed
@@ -11094,7 +11284,9 @@ void Engine::RenderFrame() {
     // Wave 9 hosek-sky cooked coeffs add +160 (hosek_cfg[9] + hosek_radiance):
     // tail was 1664 B. Planetary P0 (#254) adds +16 (planet_center_radius),
     // P3 (#257) +16 (planet_ground) and P4 (#258) +16 (planet_terrain):
-    // tail is now 1712 B, still ~336 B under the 2048 budget.
+    // tail was 1712 B. Planetary P5 (#259) adds +96 (the six ocean lanes):
+    // tail is now 1808 B, 240 B under the 2048 budget. The NEXT phase that
+    // wants six lanes does not fit -- bump kFrameUboSize when it comes.
     static_assert(sizeof(PtPush) - 112 <= 2048,
                   "PtPush spilled tail (sizeof - 112) exceeds the Vulkan "
                   "kFrameUboSize budget (2048 B). Bump kFrameUboSize in "
@@ -23822,10 +24014,210 @@ void Engine::StepOcean(float dt) {
     // the golden fixture's fixed frame count warm the sim to a known
     // (within FP tolerance) state.
     ocean_time_ += static_cast<double>(dt);
-    ocean_->Update(ocean_time_);
-    ocean_max_disp_y_ = ocean_->MaxDisplacementY();
 
+    // --- Planetary P5 (#259): cascades instead of one tile -----------------
+    // With r_planet_ocean on the ocean is a shell, not a plane, and one
+    // 50 m tile over 361 million square kilometres is a visible grid. The
+    // cascade solvers replace the single tile entirely (they write the same
+    // two textures, stacked) rather than running alongside it.
+    bool planetary_ocean = false;
+    if (auto* v = C.FindCVar("r_planet_ocean")) planetary_ocean = v->GetBool();
+    if (planetary_ocean) {
+        bool spherical = false;
+        if (auto* v = C.FindCVar("r_planet_spherical_frame")) {
+            spherical = v->GetBool();
+        }
+#if PT_PLANET_ENABLED
+        // Terrain streaming implies the spherical frame -- see the push
+        // fill, where the same implication is enforced.
+        if (planet_terrain_ && planet_terrain_->Ready()) spherical = true;
+#endif
+        float radius = 0.0f;
+        if (auto* v = C.FindCVar("r_planet_radius")) radius = v->GetFloat();
+        planetary_ocean = spherical && radius > 0.0f;
+    }
+    if (planetary_ocean) {
+        StepOceanCascades(ocean_time_, cfg.grid_size);
+    } else {
+        ocean_cascades_.clear();
+        ocean_cascade_sigma2_[0] = 0.0;
+        ocean_cascade_sigma2_[1] = 0.0;
+        ocean_cascade_sigma2_[2] = 0.0;
+        ocean_->Update(ocean_time_);
+        ocean_max_disp_y_ = ocean_->MaxDisplacementY();
+    }
     EnsureOceanUploaded();
+}
+
+// --- Planetary P5 (#259): where the tangent frame is PLACED ---------------
+//
+// The lattice mathematics is pt::ocean::OceanTangentAnchor -- a free
+// function over glm, so tests/pt_ocean_fft_test.cpp exercises the real code
+// rather than a transcription of it. What lives here is the part that is
+// about this engine: which triad the lattice is measured against, and where
+// the canonical-to-render conversion boundary is.
+Engine::OceanTangentFrame Engine::ComputeOceanTangentFrame(
+    const glm::dvec3& cam_w, double sea_radius_m) const {
+    OceanTangentFrame f;
+    if (!(sea_radius_m > 0.0)) return f;
+
+    // The reference triad. With terrain the ellipsoid's own ECEF frame is
+    // available, so the lattice's latitude and longitude are the real ones
+    // and the wave field is geographically stable; without it any fixed
+    // orthonormal triad does, and the identity one is the obvious choice --
+    // it puts the pole on world +Z, orthogonal to the local vertical at the
+    // world origin, so the frame is non-degenerate where scenes are.
+    glm::dmat3 e2w(1.0);
+#if PT_PLANET_ENABLED
+    if (planet_terrain_ && planet_terrain_->Ready()) {
+        e2w = planet_terrain_->Site().ecef_to_world;
+    }
+#endif
+    const glm::dvec3 pole  = glm::normalize(e2w * glm::dvec3(0.0, 0.0, 1.0));
+    const glm::dvec3 prime = glm::normalize(e2w * glm::dvec3(1.0, 0.0, 0.0));
+    const glm::dvec3 centre(0.0, -sea_radius_m, 0.0);
+
+    const pt::ocean::OceanTangentFrame t = pt::ocean::OceanTangentAnchor(
+        cam_w - centre, sea_radius_m, pole, prime, kOceanCascadePeriodM,
+        kOceanCascades);
+    if (!t.valid) return f;
+    f.valid    = true;
+    f.origin_w = centre + t.origin;
+    f.east_w   = t.east;
+    f.north_w  = t.north;
+    for (int c = 0; c < kOceanCascades; ++c) {
+        f.phase[c][0] = t.phase[c][0];
+        f.phase[c][1] = t.phase[c][1];
+    }
+    return f;
+}
+
+// --- Planetary P5 (#259): the cascade solvers -----------------------------
+//
+// Three independent band-limited Phillips solvers whose summed field is one
+// spectrum, not three copies of it. Every parameter except the tile size,
+// the spectral window and the PRNG seed is shared with the legacy solver, so
+// wind / amplitude / choppiness / foam still mean exactly what their cvars
+// say.
+//
+// WHY EACH CASCADE NEEDS ITS OWN SEED. The Gaussian H0 amplitudes are drawn
+// from the seed; three solvers sharing one seed would draw the SAME sequence
+// and, because the bands are disjoint, the correlation would not cancel --
+// the three fields would share a phase structure and the sum would show it as
+// a repeating envelope. Offsetting by a large prime per cascade makes them
+// independent realisations of the same sea.
+void Engine::StepOceanCascades(double t_seconds, std::uint32_t grid) {
+    if (!ocean_) return;
+    if (ocean_cascades_.size() != static_cast<std::size_t>(kOceanCascades)) {
+        ocean_cascades_.clear();
+        for (int c = 0; c < kOceanCascades; ++c) {
+            ocean_cascades_.emplace_back(
+                std::make_unique<pt::ocean::OceanFFT>());
+        }
+    }
+    const pt::ocean::OceanFFT::Config base = ocean_->GetConfig();
+    for (int c = 0; c < kOceanCascades; ++c) {
+        auto& cfg = ocean_cascades_[static_cast<std::size_t>(c)]->MutableConfig();
+        cfg = base;
+        cfg.grid_size    = grid;
+        cfg.patch_size_m = static_cast<float>(kOceanCascadePeriodM[c]);
+        cfg.band_hi_m    = static_cast<float>(OceanBandHiM(c));
+        cfg.band_lo_m    = static_cast<float>(OceanBandLoM(c, grid));
+        // Cascade 0 is unbounded above; see OceanBandHiM's note.
+        if (c == 0) cfg.band_hi_m = 0.0f;
+        cfg.seed         = base.seed + 7919u * static_cast<std::uint32_t>(c);
+    }
+
+    // --- THE AMPLITUDE IS A MEASUREMENT, NOT A DIAL ------------------------
+    //
+    // r_ocean_amplitude does not survive contact with three tile sizes, and
+    // that is not a scaling inconvenience -- it is a latent bug the cascades
+    // exposed. Tessendorf's H0 should be sqrt(S(k) * dkx * dky), and this
+    // solver omits the k-space cell area (2*pi/L)^2, so the synthesised
+    // height scales with the tile size: the same r_ocean_amplitude that
+    // gives +/-1.5 m crests at L = 50 m gives 383 m crests at L = 1793 m,
+    // measured. (The legacy single-tile path keeps the historic expression
+    // and its one tile size, so nothing that exists today moves.)
+    //
+    // The fix here is not to put the missing factor back and re-tune a
+    // dimensionless dial. It is to delete the dial: the amplitude follows
+    // from the wind through a measured constant, exactly as the sky's Hosek
+    // coefficients stopped being fabricated in b2111dd.
+    //
+    //   * Cox & Munk give the whole sea's mean-square slope at this wind.
+    //   * The Phillips equilibrium range makes slope variance uniform in log
+    //     wavelength, so the share of it the cascade set's window
+    //     [2 * finest spacing, coarsest period] holds is a ratio of logs.
+    //   * Scaling the spectrum by A scales sigma^2 by A exactly (H0 goes as
+    //     sqrt(A)), so ONE evaluation of the un-normalised spectrum solves
+    //     for the amplitude in closed form. No iteration, no search.
+    //
+    // Whatever is left of Cox & Munk's constant after that -- the band below
+    // the finest grid spacing, i.e. the short gravity and capillary ripples
+    // -- is precisely what oceanBrdfAlpha2 puts into the BRDF at ZERO cone
+    // width. The two halves are complementary by construction rather than by
+    // agreement, and that is the whole handover.
+    const double lambda_bot = OceanBandLoM(kOceanCascades - 1, grid);
+    const double lambda_top = kOceanCascadePeriodM[0];
+    const double resolved_fraction = pt::ocean::SlopeVarianceFractionInBand(
+        lambda_bot, lambda_top, static_cast<double>(base.wind_speed));
+    const double target_sigma2 =
+        pt::ocean::CoxMunkMeanSquareSlope(static_cast<double>(base.wind_speed)) *
+        resolved_fraction;
+    double raw_sigma2 = 0.0;
+    for (int c = 0; c < kOceanCascades; ++c) {
+        auto& s = ocean_cascades_[static_cast<std::size_t>(c)];
+        s->MutableConfig().amplitude = 1.0f;
+        s->EnsureSpectrum();
+        raw_sigma2 += s->SlopeVarianceAbove(0.0);
+    }
+    const float amp = (raw_sigma2 > 0.0)
+                          ? static_cast<float>(target_sigma2 / raw_sigma2)
+                          : 0.0f;
+
+    double max_h = 0.0;
+    for (int c = 0; c < kOceanCascades; ++c) {
+        auto& s = ocean_cascades_[static_cast<std::size_t>(c)];
+        s->MutableConfig().amplitude = amp;
+        s->Update(t_seconds);
+        ocean_cascade_sigma2_[c] = s->SlopeVarianceAbove(0.0);
+        max_h += static_cast<double>(s->MaxDisplacementY());
+    }
+    // The band the ray-march brackets has to clear the SUM of the cascades'
+    // crests, not any one of them -- they are independent fields and their
+    // peaks can coincide.
+    ocean_max_disp_y_ = static_cast<float>(max_h);
+
+    // THE SLOPE BUDGET, reported rather than assumed. The handover splits a
+    // measured constant between geometry and BRDF, so the one thing worth
+    // saying out loud is how much of it the synthesised sea actually took:
+    //   geometry <= Cox-Munk  ->  the BRDF carries the sub-grid remainder,
+    //                             which is the capillary band and is real;
+    //   geometry >  Cox-Munk  ->  r_ocean_amplitude has been dialled past
+    //                             the sea Cox & Munk photographed, the
+    //                             remainder clamps to zero, and the near
+    //                             field is steeper than the far field
+    //                             converges to. Not an error -- an
+    //                             amplitude choice -- but it should not be
+    //                             silent.
+    if (base.wind_speed != ocean_logged_wind_) {
+        ocean_logged_wind_ = base.wind_speed;
+        const double cm = pt::ocean::CoxMunkMeanSquareSlope(
+            static_cast<double>(base.wind_speed));
+        const double geom = ocean_cascade_sigma2_[0] + ocean_cascade_sigma2_[1] +
+                            ocean_cascade_sigma2_[2];
+        LOG_INFO("ocean: cascades {:.0f}/{:.0f}/{:.0f} m, peak |h| {:.2f} m, "
+                 "mean-square slope {:.5f}/{:.5f}/{:.5f} = {:.5f} geometry "
+                 "vs Cox-Munk {:.5f} at {:.1f} m/s ({:.0f}% resolved; "
+                 "far-field roughness {:.4f})",
+                 kOceanCascadePeriodM[0], kOceanCascadePeriodM[1],
+                 kOceanCascadePeriodM[2], max_h,
+                 ocean_cascade_sigma2_[0], ocean_cascade_sigma2_[1],
+                 ocean_cascade_sigma2_[2], geom, cm, base.wind_speed,
+                 (cm > 0.0 ? 100.0 * std::min(geom / cm, 1.0) : 0.0),
+                 pt::ocean::CoxMunkRoughness(
+                     static_cast<double>(base.wind_speed)));
+    }
 }
 
 void Engine::EnsureOceanUploaded() {
@@ -23833,52 +24225,114 @@ void Engine::EnsureOceanUploaded() {
     const std::uint32_t grid = ocean_->GridSize();
     if (grid == 0u) return;
 
-    // (Re)allocate the displacement + normal textures on first use or
-    // when the grid size changed. RGBA32F (not 16F) so the negative,
-    // wide-range displacement + slope values survive without the f16
-    // precision loss that would shimmer the heightfield ray-march at
-    // grazing angles. Two N^2 RGBA32F textures = 2 MB at N=256.
-    if (ocean_disp_tex_id_ == 0 || ocean_normal_tex_id_ == 0 ||
-        ocean_tex_grid_ != grid) {
-        if (ocean_disp_tex_id_ != 0) {
-            device_->DestroyTexture(pt::rhi::TextureHandle{ocean_disp_tex_id_});
-            ocean_disp_tex_id_ = 0;
+    // --- Planetary P5 (#259): the stacked cascade atlas --------------------
+    // One cascade is the Wave 8 layout unchanged: a grid x grid texture pair.
+    // Three cascades stack into a grid x (3*grid) atlas, cascade c owning
+    // rows [c*grid, (c+1)*grid). Stacked rather than three texture pairs
+    // because texture slots are the scarce resource -- PathTrace already
+    // saturates Apple Silicon's 8-read_write compute cap, and pbr_atlas is
+    // deliberately declared last so it lands at MSL index 16 without moving
+    // anything. Six textures would need four more slots and would move it.
+    const std::uint32_t cascades =
+        static_cast<std::uint32_t>(ocean_cascades_.size());
+    const std::uint32_t tex_h = grid * std::max(cascades, 1u);
+
+    // Advance the upload ring FIRST, so everything below -- allocation, the
+    // write, and the bind BuildAndDispatch does later this frame -- refers
+    // to one slot. See kOceanUploadRing for why there is a ring at all.
+    ocean_tex_slot_ = (ocean_tex_slot_ + 1) % kOceanUploadRing;
+    const int slot = ocean_tex_slot_;
+
+    // (Re)allocate the displacement + normal textures on first use or when
+    // the grid size (or cascade count) changed. RGBA32F (not 16F) so the
+    // negative, wide-range displacement + slope values survive without the
+    // f16 precision loss that would shimmer the heightfield ray-march at
+    // grazing angles. Two N^2 RGBA32F textures = 2 MB per slot at N=256,
+    // 6 MB per slot with three cascades.
+    const bool shape_changed =
+        (ocean_tex_grid_ != grid || ocean_tex_cascades_ != cascades);
+    if (shape_changed || ocean_disp_tex_id_[slot] == 0 ||
+        ocean_normal_tex_id_[slot] == 0) {
+        // A shape change invalidates EVERY slot, not just this one: the
+        // others still hold the old geometry and would be bound on the next
+        // two frames.
+        if (shape_changed) {
+            for (int i = 0; i < kOceanUploadRing; ++i) {
+                if (ocean_disp_tex_id_[i] != 0) {
+                    device_->DestroyTexture(
+                        pt::rhi::TextureHandle{ocean_disp_tex_id_[i]});
+                    ocean_disp_tex_id_[i] = 0;
+                }
+                if (ocean_normal_tex_id_[i] != 0) {
+                    device_->DestroyTexture(
+                        pt::rhi::TextureHandle{ocean_normal_tex_id_[i]});
+                    ocean_normal_tex_id_[i] = 0;
+                }
+            }
         }
-        if (ocean_normal_tex_id_ != 0) {
-            device_->DestroyTexture(pt::rhi::TextureHandle{ocean_normal_tex_id_});
-            ocean_normal_tex_id_ = 0;
+        for (int i = 0; i < kOceanUploadRing; ++i) {
+            if (ocean_disp_tex_id_[i] != 0 && ocean_normal_tex_id_[i] != 0) {
+                continue;
+            }
+            auto disp = device_->CreateTexture({
+                .width = grid, .height = tex_h,
+                .format = pt::rhi::TextureFormat::RGBA32F,
+                .usage  = pt::rhi::TextureUsage::Storage,
+                .debug_name = "ocean_displacement",
+            });
+            auto nrm = device_->CreateTexture({
+                .width = grid, .height = tex_h,
+                .format = pt::rhi::TextureFormat::RGBA32F,
+                .usage  = pt::rhi::TextureUsage::Storage,
+                .debug_name = "ocean_normal",
+            });
+            if (disp.id == 0 || nrm.id == 0) {
+                LOG_ERROR("ocean: displacement/normal texture allocation failed");
+                if (disp.id != 0) device_->DestroyTexture(disp);
+                if (nrm.id  != 0) device_->DestroyTexture(nrm);
+                return;
+            }
+            ocean_disp_tex_id_[i]   = disp.id;
+            ocean_normal_tex_id_[i] = nrm.id;
         }
-        auto disp = device_->CreateTexture({
-            .width = grid, .height = grid,
-            .format = pt::rhi::TextureFormat::RGBA32F,
-            .usage  = pt::rhi::TextureUsage::Storage,
-            .debug_name = "ocean_displacement",
-        });
-        auto nrm = device_->CreateTexture({
-            .width = grid, .height = grid,
-            .format = pt::rhi::TextureFormat::RGBA32F,
-            .usage  = pt::rhi::TextureUsage::Storage,
-            .debug_name = "ocean_normal",
-        });
-        if (disp.id == 0 || nrm.id == 0) {
-            LOG_ERROR("ocean: displacement/normal texture allocation failed");
-            if (disp.id != 0) device_->DestroyTexture(disp);
-            if (nrm.id  != 0) device_->DestroyTexture(nrm);
-            return;
-        }
-        ocean_disp_tex_id_   = disp.id;
-        ocean_normal_tex_id_ = nrm.id;
         ocean_tex_grid_      = grid;
-        LOG_INFO("ocean: FFT displacement + normal textures {}x{} RGBA32F",
-                 grid, grid);
+        ocean_tex_cascades_  = cascades;
+        LOG_INFO("ocean: FFT displacement + normal textures {}x{} RGBA32F"
+                 " ({} cascade{}, {} upload slots)",
+                 grid, tex_h, std::max(cascades, 1u),
+                 std::max(cascades, 1u) == 1u ? "" : "s", kOceanUploadRing);
     }
 
-    const auto& disp_rgba = ocean_->DisplacementRGBA();
-    const auto& nrm_rgba  = ocean_->NormalRGBA();
-    device_->WriteTexture(pt::rhi::TextureHandle{ocean_disp_tex_id_},
-                          disp_rgba.data(), disp_rgba.size() * sizeof(float));
-    device_->WriteTexture(pt::rhi::TextureHandle{ocean_normal_tex_id_},
-                          nrm_rgba.data(), nrm_rgba.size() * sizeof(float));
+    if (cascades == 0u) {
+        const auto& disp_rgba = ocean_->DisplacementRGBA();
+        const auto& nrm_rgba  = ocean_->NormalRGBA();
+        device_->WriteTexture(pt::rhi::TextureHandle{ocean_disp_tex_id_[slot]},
+                              disp_rgba.data(),
+                              disp_rgba.size() * sizeof(float));
+        device_->WriteTexture(pt::rhi::TextureHandle{ocean_normal_tex_id_[slot]},
+                              nrm_rgba.data(), nrm_rgba.size() * sizeof(float));
+        return;
+    }
+
+    // Repack the cascades into the stacked atlas. Both source fields are
+    // row-major grid x grid RGBA, so "stack along rows" is a concatenation
+    // and the scratch vectors keep it allocation-free after the first frame.
+    const std::size_t per = static_cast<std::size_t>(grid) * grid * 4u;
+    ocean_atlas_disp_.resize(per * cascades);
+    ocean_atlas_nrm_.resize(per * cascades);
+    for (std::uint32_t c = 0u; c < cascades; ++c) {
+        const auto& d = ocean_cascades_[c]->DisplacementRGBA();
+        const auto& n = ocean_cascades_[c]->NormalRGBA();
+        if (d.size() != per || n.size() != per) continue;
+        std::copy(d.begin(), d.end(), ocean_atlas_disp_.begin() + per * c);
+        std::copy(n.begin(), n.end(), ocean_atlas_nrm_.begin() + per * c);
+    }
+    device_->WriteTexture(pt::rhi::TextureHandle{ocean_disp_tex_id_[slot]},
+                          ocean_atlas_disp_.data(),
+                          ocean_atlas_disp_.size() * sizeof(float));
+    device_->WriteTexture(pt::rhi::TextureHandle{ocean_normal_tex_id_[slot]},
+                          ocean_atlas_nrm_.data(),
+                          ocean_atlas_nrm_.size() * sizeof(float));
 }
 // --- end Wave 8 ocean ------------------------------------------------------
 

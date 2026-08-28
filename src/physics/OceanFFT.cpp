@@ -27,6 +27,140 @@ inline std::uint32_t Log2u(std::uint32_t n) {
 }
 }  // namespace
 
+// --- Planetary P5 (#259): Cox & Munk 1954 ---------------------------------
+// See the derivation in OceanFFT.h. These three are one constant expressed
+// in three units, kept as functions so the engine, the shader push and the
+// unit tests cannot each carry their own copy of it.
+double CoxMunkMeanSquareSlope(double wind_mps) noexcept {
+    // Cox & Munk 1954, JOSA 44(11) table 1, clean surface:
+    //   sigma^2_up    = 0.000 + 3.16e-3 U
+    //   sigma^2_cross = 0.003 + 1.92e-3 U
+    //   sigma^2_total = 0.003 + 5.12e-3 U
+    // Negative wind is not a physical input; clamp rather than return a
+    // negative variance that would later sqrt to a NaN.
+    const double u = (wind_mps > 0.0) ? wind_mps : 0.0;
+    return 0.003 + 0.00512 * u;
+}
+
+double CoxMunkAlpha(double wind_mps) noexcept {
+    // Beckmann slope variance is alpha^2 per the header's derivation.
+    return std::sqrt(CoxMunkMeanSquareSlope(wind_mps));
+}
+
+double CoxMunkRoughness(double wind_mps) noexcept {
+    // PathTrace.slang's anisoAlpha(): alpha = roughness * roughness.
+    return std::sqrt(CoxMunkAlpha(wind_mps));
+}
+
+double GravityCapillaryWavelengthM() noexcept {
+    // lambda_m = 2 pi sqrt(sigma / (rho g)). Air-water surface tension at
+    // 20 C, fresh water density, standard gravity -- all three are the same
+    // constants the rest of this solver uses (g = 9.81 by Config default).
+    constexpr double kSurfaceTension = 0.0728;   // N/m
+    constexpr double kWaterDensity   = 1000.0;   // kg/m^3
+    constexpr double kG              = 9.81;     // m/s^2
+    return 2.0 * 3.14159265358979323846 *
+           std::sqrt(kSurfaceTension / (kWaterDensity * kG));
+}
+
+double PiersonMoskowitzPeakWavelengthM(double wind_mps) noexcept {
+    // omega_p = 0.877 g / U  ->  lambda_p = 2 pi g / omega_p^2
+    //                                     = 2 pi U^2 / (0.877^2 g).
+    const double u = (wind_mps > 0.0) ? wind_mps : 0.0;
+    constexpr double kAlphaPm = 0.877;
+    constexpr double kG       = 9.81;
+    return 2.0 * 3.14159265358979323846 * u * u / (kAlphaPm * kAlphaPm * kG);
+}
+
+double SlopeVarianceFractionInBand(double lo_m, double hi_m,
+                                   double wind_mps) noexcept {
+    const double band_lo = GravityCapillaryWavelengthM();
+    const double band_hi = PiersonMoskowitzPeakWavelengthM(wind_mps);
+    if (!(band_hi > band_lo)) return 0.0;
+    const double lo = std::max(lo_m, band_lo);
+    const double hi = std::min(hi_m, band_hi);
+    if (!(hi > lo)) return 0.0;
+    return std::log(hi / lo) / std::log(band_hi / band_lo);
+}
+
+OceanTangentFrame OceanTangentAnchor(const glm::dvec3& cam_rel_centre,
+                                     double radius_m,
+                                     const glm::dvec3& pole,
+                                     const glm::dvec3& prime,
+                                     const double period_m[kOceanMaxCascades],
+                                     int cascades) noexcept {
+    OceanTangentFrame f;
+    if (!(radius_m > 0.0) || cascades <= 0) return f;
+    const double P0 = period_m[0];
+    if (!(P0 > 0.0)) return f;
+
+    const double len = glm::length(cam_rel_centre);
+    if (!(len > 0.0)) return f;
+    const glm::dvec3 up = cam_rel_centre / len;
+    const glm::dvec3 b1 = glm::normalize(prime);
+    const glm::dvec3 a  = glm::normalize(pole);
+    const glm::dvec3 b2 = glm::cross(a, b1);
+
+    constexpr double kHalfPi = 1.5707963267948966;
+    double c = glm::dot(up, a);
+    c = (c < -1.0) ? -1.0 : ((c > 1.0) ? 1.0 : c);
+    const double lat = std::asin(c);
+    const double lon = std::atan2(glm::dot(up, b2), glm::dot(up, b1));
+
+    const double i_d = std::nearbyint(lat * radius_m / P0);
+    double lat_a = i_d * P0 / radius_m;
+    // Rounding can push the snapped latitude a half cell past the pole,
+    // where the cosine goes negative and flips the basis. Clamp; the
+    // lattice row is still unique.
+    lat_a = (lat_a < -kHalfPi) ? -kHalfPi : ((lat_a > kHalfPi) ? kHalfPi : lat_a);
+    const double cos_a = std::cos(lat_a);
+    const double sin_a = std::sin(lat_a);
+
+    // Near the poles the parallel shrinks below one lattice cell and there
+    // is no easting lattice left to snap to, so the column collapses to 0
+    // and the frame is the pole's own. That band is P0 / (2 pi R) of the
+    // sphere -- 285 m across for P0 = 1793 m on Earth -- and the collapse
+    // is on a closed set, so it is continuous.
+    const double parallel_m = 2.0 * 3.14159265358979323846 * radius_m * cos_a;
+    double j_d = 0.0;
+    double lon_a = lon;
+    if (parallel_m > P0) {
+        j_d   = std::nearbyint(lon * radius_m * cos_a / P0);
+        lon_a = j_d * P0 / (radius_m * cos_a);
+    }
+
+    const glm::dvec3 meridian = std::cos(lon_a) * b1 + std::sin(lon_a) * b2;
+    f.origin = radius_m * (cos_a * meridian + sin_a * a);
+    // ENU, right-handed: East x North = Up.
+    f.east  = -std::sin(lon_a) * b1 + std::cos(lon_a) * b2;
+    f.north = -sin_a * meridian + cos_a * a;
+    for (int cc = 0; cc < cascades && cc < kOceanMaxCascades; ++cc) {
+        const double ratio = P0 / period_m[cc];
+        const double e = j_d * ratio;
+        const double n = i_d * ratio;
+        f.phase[cc][0] = e - std::floor(e);
+        f.phase[cc][1] = n - std::floor(n);
+    }
+    f.lattice_i = i_d;
+    f.lattice_j = j_d;
+    f.valid = true;
+    return f;
+}
+
+void OceanFFT::EnsureSpectrum() {
+    if (dirty_ || built_grid_ != cfg_.grid_size ||
+        built_patch_ != cfg_.patch_size_m ||
+        built_wind_ != cfg_.wind_speed ||
+        built_wind_dir_ != cfg_.wind_dir_rad ||
+        built_amplitude_ != cfg_.amplitude ||
+        built_gravity_ != cfg_.gravity ||
+        built_seed_ != cfg_.seed ||
+        built_band_lo_ != cfg_.band_lo_m ||
+        built_band_hi_ != cfg_.band_hi_m) {
+        RebuildBaseSpectrum();
+    }
+}
+
 // In-place radix-2 inverse FFT over a strided 1D slice. The "inverse"
 // here uses the +i sign convention and does NOT apply the 1/n
 // normalisation -- the caller (Ifft2D) folds the single 1/N^2 scale in
@@ -139,6 +273,50 @@ void OceanFFT::RebuildBaseSpectrum() {
             // Small-wave suppression: multiply by exp(-k^2 * l^2).
             ph *= std::exp(-k2 * l_small * l_small);
             if (ph < 0.0f) ph = 0.0f;
+            // --- Planetary P5 (#259): the cascade's spectral window -----
+            // Sharp band limit in WAVELENGTH. Outside its own band a
+            // cascade contributes nothing, so the cascades partition one
+            // spectrum instead of triplicating it. Both bounds 0 (the
+            // legacy single-cascade path) leaves this loop untouched.
+            if (cfg_.band_lo_m > 0.0f || cfg_.band_hi_m > 0.0f) {
+                // HALF-OPEN, [lo, hi), and that is not fastidiousness. Two
+                // adjacent cascades share a boundary wavelength, and on a
+                // square lattice a whole RING of modes can land exactly on
+                // it -- at L = 200 m and N = 64 the boundary 20 m is
+                // 200/sqrt(n^2+m^2) for n^2+m^2 = 100, which is twelve
+                // modes, and they are low-k modes carrying 0.7% of the
+                // slope variance. Closed intervals on both sides would
+                // count them twice and the partition would stop being one.
+                const float lambda = kTwoPi / k;
+                if (cfg_.band_lo_m > 0.0f && lambda < cfg_.band_lo_m) ph = 0.0f;
+                if (cfg_.band_hi_m > 0.0f && lambda >= cfg_.band_hi_m) ph = 0.0f;
+                // THE K-SPACE CELL AREA, which the Wave 8 synthesis omits.
+                //
+                // Tessendorf's H0 is sqrt(S(k) * dkx * dky) -- the spectral
+                // DENSITY times the area of the lattice cell it stands for.
+                // Dropping (2*pi/L)^2 makes the synthesised height scale
+                // with L: the same amplitude that gives +/-1.5 m crests on
+                // a 50 m tile gives 383 m crests on a 1793 m one, measured.
+                //
+                // With ONE tile size that is invisible -- it is absorbed
+                // into whatever value r_ocean_amplitude was tuned to -- so
+                // the legacy path keeps the historic expression verbatim and
+                // nothing that exists today moves. With THREE tile sizes it
+                // is fatal in a way no amplitude can fix: the cascades'
+                // relative weights come out wrong by (L_0 / L_2)^2 = 6076,
+                // so the 1793 m tile carries 97% of the slope variance and
+                // the field is one coarse swell with nothing on it. Putting
+                // the factor back is what makes the three cascades a
+                // spectrum rather than three unrelated fields.
+                //
+                // Scoped to the windowed path, and that is a deliberate
+                // boundary rather than a shortcut: the legacy path has the
+                // same latent scale dependence, and correcting it there is a
+                // regeneration of ocean_fft / ocean_foam / water_pool for a
+                // reason that is not this phase's. Noted, not spent.
+                const float dk = kTwoPi / L_patch;
+                ph *= dk * dk;
+            }
 
             const float amp = std::sqrt(ph * 0.5f);
             // Gaussian complex amplitude (xi_r + i*xi_i) * sqrt(Ph/2).
@@ -167,20 +345,47 @@ void OceanFFT::RebuildBaseSpectrum() {
     built_amplitude_ = cfg_.amplitude;
     built_gravity_   = cfg_.gravity;
     built_seed_      = cfg_.seed;
+    built_band_lo_   = cfg_.band_lo_m;
+    built_band_hi_   = cfg_.band_hi_m;
     dirty_           = false;
+}
+
+double OceanFFT::SlopeVarianceAbove(double min_wavelength_m) const noexcept {
+    // Requires a built spectrum; an un-Update()d solver has none and the
+    // honest answer is zero rather than a stale one.
+    if (h0_.empty() || h0_conj_.empty()) return 0.0;
+    const std::uint32_t N = built_grid_ ? built_grid_ : cfg_.grid_size;
+    if (N == 0u) return 0.0;
+    const double L = static_cast<double>(built_patch_ > 0.0f ? built_patch_
+                                                             : cfg_.patch_size_m);
+    if (!(L > 0.0)) return 0.0;
+    const double two_pi = 6.283185307179586476925286766559;
+    const int half = static_cast<int>(N) / 2;
+    double acc = 0.0;
+    for (std::uint32_t iy = 0u; iy < N; ++iy) {
+        const int m = static_cast<int>(iy) - half;
+        const double kz = two_pi * static_cast<double>(m) / L;
+        for (std::uint32_t ix = 0u; ix < N; ++ix) {
+            const int n = static_cast<int>(ix) - half;
+            const double kx = two_pi * static_cast<double>(n) / L;
+            const double k2 = kx * kx + kz * kz;
+            if (k2 <= 0.0) continue;
+            if (min_wavelength_m > 0.0) {
+                const double lambda = two_pi / std::sqrt(k2);
+                if (lambda < min_wavelength_m) continue;
+            }
+            const std::size_t idx = static_cast<std::size_t>(iy) * N + ix;
+            const double a = static_cast<double>(std::norm(h0_[idx]));
+            const double b = static_cast<double>(std::norm(h0_conj_[idx]));
+            acc += k2 * (a + b);
+        }
+    }
+    return acc;
 }
 
 void OceanFFT::Update(double t_seconds) {
     // Rebuild the base spectrum if any spectrum-affecting field moved.
-    if (dirty_ || built_grid_ != cfg_.grid_size ||
-        built_patch_ != cfg_.patch_size_m ||
-        built_wind_ != cfg_.wind_speed ||
-        built_wind_dir_ != cfg_.wind_dir_rad ||
-        built_amplitude_ != cfg_.amplitude ||
-        built_gravity_ != cfg_.gravity ||
-        built_seed_ != cfg_.seed) {
-        RebuildBaseSpectrum();
-    }
+    EnsureSpectrum();
 
     const std::uint32_t N = cfg_.grid_size;
     const std::size_t   cells = static_cast<std::size_t>(N) * N;
