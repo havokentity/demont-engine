@@ -497,6 +497,25 @@ pt_add_test(pt_ocean_fft
     LINK_TARGETS pt_physics)
 # --- end FFT ocean surface -------------------------------------------------
 
+# --- pt_planet_ocean (issue #259, planetary P5) ----------------------------
+# The planetary ocean: the Cox & Munk endpoint, the geometry-to-BRDF
+# conservation identity, the boat-to-orbit continuity refinement (with a
+# hard-switch control that plateaus), the cascade band partition, the
+# lattice-quantised tangent anchor, and the below-to-above crossing test
+# that has been one-sided since #25.
+#
+# Links pt_physics for the solver + the Cox-Munk kernels and pt_renderer for
+# PlanetSite / the WGS-84 ellipsoid, so the sea-level-versus-bathymetry case
+# measures the real ellipsoid rather than a transcription of it.
+pt_add_test(pt_planet_ocean
+    pt_planet_ocean_test.cpp
+    LINK_TARGETS pt_physics pt_renderer)
+target_compile_definitions(pt_planet_ocean PRIVATE
+    PT_SHADER_PATHTRACE_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang"
+    PT_ENGINE_H_PATH="${CMAKE_SOURCE_DIR}/src/engine/Engine.h"
+    PT_ENGINE_CPP_PATH="${CMAKE_SOURCE_DIR}/src/engine/Engine.cpp")
+# --- end planetary ocean ---------------------------------------------------
+
 # --- phys_drop_* RGB arg shapes (PR #189 / issue #181 follow-up) -----------
 # Pins the arg-shape contract for `phys_drop_sphere` (3, 4, 5, or 8 args)
 # and `phys_drop_box` (6, 7, or 10 args) plus the rejection rules
@@ -1770,7 +1789,23 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # the surface phase at capture IS deterministic -- run-to-run diffs on
     # the dev M4 Max measure bit-identical (max_delta 0.0). What the
     # thresholds still have to absorb is cross-host / cross-build GPU
-    # FP-ordering, which is unmeasured here. The cell catches gross
+    # FP-ordering, which is unmeasured here.
+    #
+    # #259 FOUND THE REST OF IT. The residual run-to-run wobble that put
+    # this cell and ocean_foam on the known-nondeterministic list was not
+    # FP ordering at all: MetalDevice::WriteTexture is a CPU replaceRegion
+    # and MetalDevice::Submit does not wait, so the ocean field for frame N
+    # was written over the one the GPU was still reading for frame N-1 --
+    # a plain write-after-read race, reproduced on planet_ocean_boat as
+    # three distinct images out of six identical renders with ocean_time_
+    # logged identical across all of them. Engine::EnsureOceanUploaded now
+    # writes into a 3-deep ring (kOceanUploadRing) and the three P5 cells
+    # measure ten consecutive byte-identical renders in Release AND Debug.
+    # These two cells still pass unchanged against their committed PNGs,
+    # which is why nothing here moved -- but they have NOT been
+    # re-characterised under their own svgf_atrous configuration, so their
+    # thresholds and their place on that list are left where they are for
+    # someone to re-measure deliberately rather than as a side effect. The cell catches gross
     # regressions: the ocean gate failing to engage (flat plane), the
     # textures not binding (black / sky-through water), or the ray-march
     # dropping rays through the surface. Metal-only at first; software
@@ -1802,6 +1837,165 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
         FRAMES 120
         MAX_DELTA 64 MEAN_DELTA 16 FAIL_PERCENT 10)
     # --- end Ocean foam + whitecaps ---------------------------------------
+
+    # --- Planetary P5 (#259): the planetary ocean -------------------------
+    #
+    # THE PAIR OF CELLS IS THE PHASE. planet_ocean_boat and
+    # planet_ocean_orbit are the two ends of the headline claim -- "reads as
+    # water from a boat AND as a smooth specular sphere from orbit, with no
+    # visible transition between them" -- rendered by the SAME code with
+    # nothing different but the camera altitude. planet_ocean_snell is the
+    # third camera the phase makes possible at all: one under the water,
+    # which no fixture in this repo has ever had, and which is where the
+    # Wave 8 above-to-below-only crossing test has been wrong since #25.
+    #
+    # WHAT A GOLDEN CANNOT DO HERE, AND WHAT DOES IT INSTEAD. Two committed
+    # PNGs at the ends of a climb say nothing about the middle; they can both
+    # be right while everything between them jumps.
+    # tests/pt_planet_ocean_test.cpp carries that claim as numbers -- the
+    # conservation identity sigma^2_geometry(w) + alpha^2_brdf(w) ==
+    # sigma^2_CoxMunk at every footprint, and #260's refinement ladder with a
+    # hard-switch control that plateaus. These cells pin that the numbers
+    # reach the screen.
+    #
+    # NO TERRAIN, AND THEREFORE NO SETTLE BARRIER. All three fixtures set
+    # r_planet_terrain 0 and r_planet_ground 0: the planet IS the ocean.
+    # That isolates the phase (with the analytic backstop on it would sit at
+    # the SAME radius as the shell and fight it for every pixel) and it means
+    # none of #284's residency machinery is in the loop, so these cells are
+    # reproducible without r_planet_lod_freeze or pt_planet_settle_rounds.
+    #
+    # DETERMINISM, MEASURED RATHER THAN ASSUMED -- and it did not start out
+    # true. The first six identical renders of planet_ocean_boat produced
+    # THREE distinct images, differing by up to 48.7 L2 on 10 111 of 196 608
+    # pixels, with ocean_time_ and frame_index_ logged identical across all
+    # six. The cause is a plain write-after-read race:
+    # MetalDevice::WriteTexture is a CPU replaceRegion and
+    # MetalDevice::Submit does not wait, so the ocean field for frame N was
+    # being written over the one the GPU was still reading for frame N-1.
+    # That is also the real reason ocean_fft and ocean_foam are on the
+    # known-nondeterministic list -- the note on those cells blames
+    # "cross-host GPU FP ordering", which is not what it is.
+    # Engine::EnsureOceanUploaded now writes into a 3-deep ring
+    # (kOceanUploadRing) and all three cells render byte-identical, ten
+    # consecutive times, in Release AND in Debug.
+    #
+    # THRESHOLDS, MEASURED. Run-to-run on the dev M4 Max is 0.0000 max /
+    # 0.000000 mean on all three -- bit-identical -- so these are the MATRIX
+    # DEFAULTS (16 / 2 / 1) passed explicitly rather than inherited, kept
+    # loose for a different driver's rounding and fma ordering exactly as
+    # every other Metal cell in this file. The margins against the weakest
+    # feature-deleted signal, all of which FAIL these thresholds:
+    #
+    #   planet_ocean_boat    r_ocean 0            mean  37.8  bad 53.9%
+    #                        r_planet_ocean 0     mean  85.3  bad 61.1%
+    #                        r_ocean_wind_speed 4 mean  32.3  bad 48.4%
+    #   planet_ocean_orbit   r_planet_ocean 0     mean  66.7  bad 100.0%
+    #                        r_ocean_wind_speed 4 mean  15.6  bad 28.2%
+    #   planet_ocean_snell   r_ocean 0            mean  86.5  bad 87.7%
+    #                        r_planet_ocean 0     mean 211.9  bad 99.9%
+    #
+    # The weakest of those is 7.8x above MEAN_DELTA 2 and 28x above
+    # FAIL_PERCENT 1, against a noise floor of exactly zero. Re-measure if a
+    # fixture's camera, resolution, exposure or frame count changes: the
+    # margins are the point, not the numbers.
+    #
+    # AND NOT ONE OF THOSE ABLATIONS IS A BLACK FRAME. r_planet_ocean 0
+    # leaves the sky and the sun where they were, r_ocean 0 leaves the shell
+    # and its Cox-Munk roughness -- deleting the feature changes the image
+    # by changing content, not by removing it, which is the trap P4 nearly
+    # committed two goldens into.
+    #
+    # FRAMES 48 rather than the 120 the Wave 8 ocean cells use: those needed
+    # a long warm-up because the surface had to evolve into a developed sea
+    # from t = 0, and the cascades here are spectrally normalised to Cox &
+    # Munk from the first frame rather than growing into an amplitude.
+    pt_add_golden_cell(SCENE planet_ocean_boat  BACKEND metal DENOISER off
+                       FRAMES 48 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
+    pt_add_golden_cell(SCENE planet_ocean_orbit BACKEND metal DENOISER off
+                       FRAMES 48 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
+    pt_add_golden_cell(SCENE planet_ocean_snell BACKEND metal DENOISER off
+                       FRAMES 48 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
+
+    # --- The Cox-Munk test (#259's stated acceptance criterion) -----------
+    #
+    # Render the ocean from 400 km with the FFT on, and again with the FFT
+    # replaced by a fixed roughness, and the two must agree. That is the
+    # criterion the issue writes down, and it is a real test rather than a
+    # restatement because the two frames come from DIFFERENT machinery: one
+    # synthesises three band-limited wave fields, ray-marches them, and folds
+    # the sub-footprint remainder into the BRDF; the other has no height
+    # field at all and carries the whole of Cox & Munk's measured slope
+    # variance in the microfacet lobe. They agree only if the handover
+    # conserves what it claims to.
+    #
+    # THE FIXED ROUGHNESS IS NOT A NUMBER SOMEONE TYPED. #259 quotes 0.18;
+    # this build converges to 0.5038, and the difference is derived rather
+    # than tuned -- Beckmann's slope distribution has TOTAL mean-square slope
+    # alpha^2, so alpha = sigma = sqrt(0.003 + 0.00512 * 12) = 0.2539, and
+    # PathTrace.slang's anisoAlpha squares the material roughness to get
+    # alpha, so the roughness is sqrt(0.2539). 0.18 is sqrt(sigma^2 / 2),
+    # the per-axis slope RMS, which is the right answer to a different
+    # question. See src/physics/OceanFFT.h and the first case in
+    # tests/pt_planet_ocean_test.cpp, which pins every step of it.
+    #
+    # There is no roughness cvar involved: r_ocean 0 turns the solver off,
+    # the cascades then resolve nothing, and oceanBrdfAlpha2's conservation
+    # law hands the BRDF the whole constant on its own. The control is the
+    # SAME surface with its waves moved into the lobe, which is the only
+    # form of this test that means anything.
+    #
+    # MEASURED: max 5.1962, mean 0.384632, 0.000% bad at MAX_DELTA 16 -- on
+    # a frame whose own glitter patch spans 156 levels. The registered bar
+    # is the matrix default, which the pair clears by 3.1x on max and 5.2x
+    # on mean. The same pair with the roughness fold removed (the version of
+    # this code that read Cox-Munk out of the solver instead of out of the
+    # cvar, so r_ocean 0 fell back to a MIRROR) measured max 156.7 and mean
+    # 63.0 -- 31x the threshold. The test has signal.
+    #
+    # The vacuity guard is that planet_ocean_orbit is ALSO pinned against a
+    # committed PNG above: two black frames would agree too, so "they match"
+    # and "they show an ocean" are separate assertions and neither stands in
+    # for the other.
+    if(APPLE)
+        set(_p5_scenes ${CMAKE_SOURCE_DIR}/tests/goldens/scenes)
+        set(_p5_cell planet_ocean_coxmunk__metal)
+        foreach(_half a b)
+            if(_half STREQUAL "a")
+                set(_p5_scene planet_ocean_orbit)
+            else()
+                set(_p5_scene planet_ocean_orbit_smooth)
+            endif()
+            set(_p5_png ${CMAKE_BINARY_DIR}/golden_actual/${_p5_cell}__${_half}.png)
+            set(_p5_wd  ${CMAKE_BINARY_DIR}/golden_workdir/${_p5_cell}__${_half})
+            file(MAKE_DIRECTORY ${_p5_wd})
+            add_test(NAME ${_p5_cell}_render_${_half}
+                COMMAND $<TARGET_FILE:pt_render_one_frame>
+                    --scene    ${_p5_scenes}/${_p5_scene}.cfg
+                    --backend  metal
+                    --denoiser off
+                    --frames   48
+                    --out      ${_p5_png}
+                WORKING_DIRECTORY ${_p5_wd})
+            set_tests_properties(${_p5_cell}_render_${_half} PROPERTIES
+                TIMEOUT 300
+                LABELS  "golden;golden_metal;planetary")
+        endforeach()
+        add_test(NAME ${_p5_cell}_diff
+            COMMAND $<TARGET_FILE:imgdiff>
+                ${CMAKE_BINARY_DIR}/golden_actual/${_p5_cell}__a.png
+                ${CMAKE_BINARY_DIR}/golden_actual/${_p5_cell}__b.png
+                --max-delta    16
+                --mean-delta   2
+                --fail-percent 1
+                --diff         ${CMAKE_BINARY_DIR}/golden_diff/${_p5_cell}.png
+            WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+        set_tests_properties(${_p5_cell}_diff PROPERTIES
+            TIMEOUT 30
+            DEPENDS "${_p5_cell}_render_a;${_p5_cell}_render_b"
+            LABELS  "golden;golden_metal;planetary")
+    endif()
+    # --- end Planetary P5 -------------------------------------------------
 
     # --- Physics Phase 2a rigid-body fixtures (#138, #181) ----------------
     # Pins the rigid-body fixture output against a committed PNG so any

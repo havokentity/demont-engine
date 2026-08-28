@@ -1049,9 +1049,18 @@ TEST_CASE("shader mirror is still faithful") {
     // the same kernel, which is the behaviour #271 exists to enforce and
     // is what this pin should have been asserting all along.
     //
-    // Counted, and located: an occurrence anywhere OTHER than inside
-    // skyPhysical would be the duplicate march this pin is for.
-    CHECK(countOf(pt, "ptRayAltitudeBegin(") == 1u);
+    // Counted, and located: an occurrence anywhere OTHER than inside the
+    // two marches named below would be the duplicate this pin is for.
+    //
+    // #259 widened this from one to TWO. The second is the planetary
+    // ocean's heightfield march, which needs the ray point's altitude above
+    // the sea shell at every step to decide which side of the wave surface
+    // it is on. That is a third distinct integrand -- not optical depth, not
+    // radiance -- and it has the same reason to hoist as the other two, and
+    // a sharper one: materialising ro + rd*s and taking its altitude costs
+    // ULP(|p|) ~ 0.5 m at |p| ~ 6.4e6, against a wave 1.5 m tall. A march
+    // that did that would not resolve the ocean at all.
+    CHECK(countOf(pt, "ptRayAltitudeBegin(") == 2u);
     {
         const std::size_t at = pt.find("float3skyPhysical(");
         const std::size_t use = pt.find("ptRayAltitudeBegin(");
@@ -1059,6 +1068,18 @@ TEST_CASE("shader mirror is still faithful") {
         REQUIRE(at != std::string::npos);
         REQUIRE(end != std::string::npos);
         CHECK(use > at);
+        CHECK(use < end);
+    }
+    {
+        // The ocean one, between oceanRayMarchShell's signature and the
+        // compute entry point that follows it.
+        const std::size_t at =
+            pt.find("OceanHitoceanRayMarchShell(float3ro,float3rd,");
+        const std::size_t end = pt.find("voidmain(uint2tid");
+        REQUIRE(at != std::string::npos);
+        REQUIRE(end != std::string::npos);
+        const std::size_t use = pt.find("ptRayAltitudeBegin(", at);
+        REQUIRE(use != std::string::npos);
         CHECK(use < end);
     }
     // ...and that it did not bring a Simpson optical-depth rule with it.

@@ -1081,9 +1081,38 @@ private:
     // wall-clock dt so the spectrum evolution H0*exp(i*w*t) is frame-rate
     // independent. Pimpl-style unique_ptr keeps OceanFFT.h's <complex> +
     // glm include cost out of every Engine.h consumer.
+    // --- Planetary P5 (#259): why these are a RING -------------------------
+    //
+    // MetalDevice::WriteTexture is a CPU replaceRegion into a shared texture
+    // and MetalDevice::Submit does not wait, so writing the ocean field for
+    // frame N while the GPU is still reading it for frame N-1 is a plain
+    // write-after-read race. It renders as a frame built from a MIX of two
+    // wave fields, and it is the actual reason ocean_fft and ocean_foam are
+    // on the known-nondeterministic list -- the comment on those cells
+    // attributes it to "cross-host GPU FP ordering", which is not what it is.
+    //
+    // MEASURED before the ring: six identical renders of
+    // planet_ocean_boat.cfg produced three distinct images, differing by up
+    // to 48.7 L2 on 10 111 of 196 608 pixels, with ocean_time_ and
+    // frame_index_ logged identical across all six. After it: ten
+    // consecutive renders byte-identical, in Release AND Debug.
+    //
+    // Three slots because that is the depth kRetireFrames already uses for
+    // the same reason ("three covers the deepest frames-in-flight either
+    // backend runs"), and the two want to stay the same number: a write to
+    // slot f mod 3 can only meet a read issued three frames earlier.
+    //
+    // The RIGHT fix is a GPU-timeline upload -- a staging buffer blitted
+    // into the texture inside the frame's own command buffer -- which needs
+    // a CommandBuffer::CopyBufferToTexture verb the RHI does not have. That
+    // is a three-backend change and this is a one-file one; noted, not spent.
+    static constexpr int kOceanUploadRing = 3;
+
     std::unique_ptr<pt::ocean::OceanFFT>        ocean_;
-    std::uint64_t                               ocean_disp_tex_id_   = 0;
-    std::uint64_t                               ocean_normal_tex_id_ = 0;
+    std::uint64_t ocean_disp_tex_id_[kOceanUploadRing]   = {0, 0, 0};
+    std::uint64_t ocean_normal_tex_id_[kOceanUploadRing] = {0, 0, 0};
+    // The slot written (and bound) this frame.
+    int                                         ocean_tex_slot_      = 0;
     std::uint32_t                               ocean_tex_grid_      = 0;  // grid size of the live textures
     double                                      ocean_time_          = 0.0;  // accumulated sim seconds
     float                                       ocean_max_disp_y_    = 0.0f; // peak |height| this frame (m)
@@ -1094,6 +1123,105 @@ private:
     // the solver's current fields. Reallocates on grid-size change.
     void EnsureOceanUploaded();
     // --- end Wave 8 ocean --------------------------------------------------
+
+    // --- Planetary P5 (#259): the planetary ocean --------------------------
+    //
+    // CASCADE PERIODS. Three tile sizes whose prime factorisations share
+    // nothing: 1793 = 11 * 163, 211 prime, 23 prime. The summed field
+    // therefore repeats only at their least common multiple, which is their
+    // product:
+    //
+    //     1793 * 211 * 23 = 8 701 429 m = 8 701 km,
+    //
+    // against a horizon of 4 654 m from eye height, 357 km from 10 km and
+    // 2 294 km from 400 km. The pattern cannot repeat inside the visible
+    // world at any altitude where the waves are still resolved, which is
+    // what "no obvious repetition across thousands of km" has to mean. A
+    // single 50 m tile over 361 million square kilometres is a visible grid
+    // in the first frame.
+    //
+    // They also partition the spectrum: cascade c carries wavelengths from
+    // the next finer cascade's period up to its own, and the finest bottoms
+    // out at its own Nyquist. Running the same Phillips spectrum at three
+    // tile sizes without that window would triple-count every wavelength
+    // all three grids resolve.
+    static constexpr int    kOceanCascades          = 3;
+    static constexpr double kOceanCascadePeriodM[3] = {1793.0, 211.0, 23.0};
+
+    // How many periods of its LONGEST wave a cascade's tile must hold.
+    //
+    // A tile of period P represents only wavenumbers that are integer
+    // multiples of 2*pi/P, so a band whose longest wave is P/n sits on a
+    // ring of radius n in the lattice -- about 2*pi*n independent Fourier
+    // modes. At n = 8 that ring carries ~50 modes and the field reads as
+    // stochastic; at n = 2 it carries 12 and the tile reads as a pattern.
+    // This is the one SHAPING choice in the cascade layout and it is
+    // labelled as one; everything else here is spectrum or geometry.
+    //
+    // It also keeps the partition contiguous for free, because the periods
+    // are ~8.5x apart: cascade c's band top P_c/8 lands on cascade
+    // (c-1)'s band bottom.
+    //
+    // MIRRORED in PathTrace.slang as kOceanBandDivisor; the two are a wire
+    // format, and tests/pt_ocean_fft_test.cpp counts the occurrences.
+    static constexpr double kOceanBandDivisor = 8.0;
+    // Cascade c's band, in wavelength metres. Cascade 0 is unbounded above
+    // -- its own tile period is the longest wave the grid can carry anyway,
+    // and capping it would throw away the spectral peak at high wind
+    // (Pierson-Moskowitz puts it at 2*pi*U^2 / (0.877^2 * g): 120 m at
+    // 12 m/s, but 520 m at 25 m/s).
+    static double OceanBandHiM(int c) {
+        return (c == 0) ? kOceanCascadePeriodM[0]
+                        : kOceanCascadePeriodM[c] / kOceanBandDivisor;
+    }
+    static double OceanBandLoM(int c, std::uint32_t grid) {
+        return (c + 1 < kOceanCascades)
+                   ? kOceanCascadePeriodM[c + 1] / kOceanBandDivisor
+                   // The finest cascade bottoms out at its own Nyquist.
+                   : 2.0 * kOceanCascadePeriodM[c] /
+                         static_cast<double>(grid ? grid : 1u);
+    }
+
+    // The cascade solvers. ocean_ above stays the legacy single-tile solver
+    // and keeps driving the flat MAT_WATER planes, bit for bit; these run
+    // only when r_planet_ocean is on.
+    std::vector<std::unique_ptr<pt::ocean::OceanFFT>> ocean_cascades_;
+    // Live cascade count in the atlas (0 = the legacy single-tile layout).
+    std::uint32_t ocean_tex_cascades_ = 0;
+    // Each cascade's total mean-square slope, from its own spectrum. See
+    // OceanFFT::SlopeVarianceAbove -- derived from H0, not sampled off the
+    // packed grid, so it is a property of the spectrum rather than of the
+    // frame and does not jitter.
+    double ocean_cascade_sigma2_[3] = {0.0, 0.0, 0.0};
+    // Cox & Munk 1954 total mean-square slope at the configured wind. The
+    // constant the BRDF converges to as the ray cone outgrows every cascade.
+    double ocean_cox_munk_sigma2_ = 0.0;
+    // Wind speed the cascade budget line was last logged for. The budget is
+    // the one number that says whether the sea the FFT actually synthesised
+    // is steeper or gentler than the measured ocean, so it is reported
+    // rather than left to be inferred -- once per spectrum, not per frame.
+    float ocean_logged_wind_ = -1.0f;
+    // Scratch for the stacked atlas upload; kept resident so a 3 x 256^2
+    // RGBA32F repack does not allocate 6 MB every frame.
+    std::vector<float> ocean_atlas_disp_;
+    std::vector<float> ocean_atlas_nrm_;
+    // The camera-anchored, lattice-quantised tangent frame the cascades are
+    // laid out in. A pure function of the camera position -- no hysteresis,
+    // which the golden matrix requires. See ComputeOceanTangentFrame.
+    struct OceanTangentFrame {
+        bool       valid = false;
+        glm::dvec3 origin_w{0.0};   // canonical world, on the sea shell
+        glm::dvec3 east_w{1.0, 0.0, 0.0};
+        glm::dvec3 north_w{0.0, 0.0, 1.0};
+        // Tile-space phase per cascade. Cascade 0's is exactly 0 because
+        // the lattice spacing IS cascade 0's period.
+        double     phase[3][2] = {{0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}};
+    };
+    OceanTangentFrame ComputeOceanTangentFrame(const glm::dvec3& cam_w,
+                                               double sea_radius_m) const;
+    // Step the cascade solvers and repack + upload the stacked atlas.
+    void StepOceanCascades(double t_seconds, std::uint32_t grid);
+    // --- end Planetary P5 --------------------------------------------------
 
     // --- Voxel destruction Phase 1 (#140) ----------------------------------
     // VoxelGrids produced by `voxelize_object`, keyed by source object

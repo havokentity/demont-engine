@@ -1390,6 +1390,42 @@ cbuffer Push {
     // untouched. Mirrored in the SPIR-V Frame block below + Engine.cpp PtPush.
     float4 planet_terrain;
     // --- end Planetary P4 -----------------------------------------------------
+    // --- Planetary P5 (#259): the planetary ocean -----------------------------
+    // Six vec4s appended at the tail so every existing field offset is
+    // untouched. Mirrored in the SPIR-V Frame block below + Engine.cpp PtPush.
+    //
+    //   planet_ocean.x = SEA-LEVEL RADIUS in metres, 0 = no planetary ocean.
+    //                    The host fills it from the SAME radius that fills
+    //                    planet_center_radius.w, for the reason P3 gives
+    //                    about the air and the ground: two copies of "where
+    //                    is sea level" disagree, and a disagreement between
+    //                    the ocean and the terrain is a coastline in the
+    //                    wrong place.
+    //   planet_ocean.y = number of FFT cascades stacked in the ocean texture
+    //                    atlas (1 = the legacy single-tile layout).
+    //   planet_ocean.z = Cox & Munk 1954 total mean-square slope for this
+    //                    wind speed. The value the BRDF must converge to as
+    //                    the ray-cone footprint outgrows every cascade.
+    //   planet_ocean.w = reserved.
+    //
+    //   ocean_tan_e.xyz = tangent-frame EAST basis (unit, render space)
+    //   ocean_tan_n.xyz = tangent-frame NORTH basis (unit, render space)
+    //   ocean_tan_o.xyz = tangent-frame ORIGIN, render-relative, on the shell
+    //   ocean_tan_{e,n,o}.w = cascade 0 / 1 / 2 tile period in metres
+    //   ocean_phase.xy  = cascade 1 tile-space phase, .zw = cascade 2's.
+    //                     Cascade 0's is 0 by construction -- the anchor
+    //                     lattice IS cascade 0's period.
+    //   ocean_slope.xyz = each cascade's own total mean-square slope
+    //   ocean_slope.w   = alpha^2 of the water microsurface below every
+    //                     cascade (0: clean water has no roughness of its
+    //                     own, all of it is wave slope).
+    float4 planet_ocean;
+    float4 ocean_tan_e;
+    float4 ocean_tan_n;
+    float4 ocean_tan_o;
+    float4 ocean_phase;
+    float4 ocean_slope;
+    // --- end Planetary P5 -----------------------------------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -1547,6 +1583,14 @@ cbuffer Frame {
     // See `planet_terrain` in the Metal Push cbuffer above (Planetary P4,
     // #258). Layout-equivalent: one more vec4 appended at the tail.
     float4 planet_terrain;
+    // See `planet_ocean` .. `ocean_slope` in the Metal Push cbuffer above
+    // (Planetary P5, #259). Layout-equivalent: six more vec4 at the tail.
+    float4 planet_ocean;
+    float4 ocean_tan_e;
+    float4 ocean_tan_n;
+    float4 ocean_tan_o;
+    float4 ocean_phase;
+    float4 ocean_slope;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -2740,6 +2784,56 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
         }
     }
     // --- end Planetary P3 -----------------------------------------------
+#if PT_WATER_ENABLED
+    // --- Planetary P5 (#259): the sea-level shell -----------------------
+    // The ocean is one more infinite-extent body at the SAME centre as the
+    // atmosphere, the analytic backstop and (tangentially, at the site) the
+    // terrain ellipsoid. Its radius is pushed from the same host scalar, so
+    // "where is sea level" is a single number rather than a value the
+    // ocean and the terrain each hold a copy of.
+    //
+    // WHY NOTHING HIDES IT UNDER THE CONTINENTS. traceScene keeps the
+    // closest hit and the terrain chunks sit ABOVE this radius wherever
+    // the DEM is positive, so land occludes the shell with no test at all.
+    // Below sea level the shell is nearer than the seabed and the water
+    // wins. The one case that needs care is a ray that starts BELOW the
+    // surface: intersectSphere returns the first root past t_min, which
+    // for a submerged origin is the upward exit -- which is exactly the
+    // surface a submerged camera should see, and is the geometry the
+    // crossing-test fix in oceanRayMarchShell then resolves.
+    //
+    // Not a scene primitive, for P3's reasons: no finite AABB worth
+    // building, a singleton rather than content, never pickable.
+    if (planet_ocean.x > 0.0) {
+        float t_w;
+        if (intersectSphere(ro, rd, planet_center_radius.xyz,
+                            planet_ocean.x, t_min, t_w) && t_w < h.t) {
+            h.hit = true;
+            h.t = t_w;
+            // localUp() at the hit, i.e. the same expression the sky, the
+            // ground body and the terrain normals use.
+            h.normal = localUp(ro + rd * t_w);
+            h.mat = MAT_WATER;
+            // The water BRDF takes its colour from water_params0's
+            // absorption, not from albedo; neutral, matching how the
+            // MAT_WATER planes in the existing fixtures are authored.
+            h.albedo = float3(1.0, 1.0, 1.0);
+            // A perfect Fresnel interface at the macro scale. Every bit of
+            // roughness this surface has is wave slope, and it is added at
+            // shading time from the ray cone -- see oceanBrdfAlpha2.
+            h.roughness = 0.0;
+            // 0 => the shading branch takes r_water_ior.
+            h.ior = 0.0;
+            h.emission = float3(0.0);
+            h.prim_id = 0u;
+            h.uv = float2(0.0, 0.0);
+            h.tex_tiles = uint4(kPbrNoTexTile, kPbrNoTexTile,
+                                kPbrNoTexTile, kPbrNoTexTile);
+            h.uv_scale = 0.0;
+        }
+    }
+    // --- end Planetary P5 -----------------------------------------------
+#endif  // PT_WATER_ENABLED
     if (bvh_node_count == 0u) {
         // BVH inactive: linear-scan the rest of the buffer too.
         for (uint i = linear_prim_count; i < prim_count; ++i) {
@@ -5975,6 +6069,37 @@ float3 skyColorBase(float3 ro, float3 rd, inout uint seed) {
     return lerp(float3(0.50, 0.55, 0.62), float3(1.0, 1.0, 1.0), t);
 }
 
+// --- Planetary P5 (#259): the sky a lobe that already NEE'd the sun sees ---
+//
+// Full sky budget, minus exactly the sun DISC that skyColor injects for the
+// current mode. Not skyColorBase: that also drops the moon, the stars and
+// (in physical mode) three quarters of the march budget, and a water
+// reflection is the one place the sky is the subject rather than an ambient
+// tap.
+//
+// WHY IT IS EXACT IN PHYSICAL MODE. sunDiscPhysical returns
+// T * 80 / omega and sunRadianceAt returns 80 * T, so the disc's radiance
+// times its solid angle IS the irradiance the NEE integrates -- the two
+// estimators partition the same light with no seam and no scale factor to
+// agree on. In procedural and Hosek modes sunDisc bundles a 2-8 degree
+// atmospheric HALO with the disc, so subtracting it also removes the
+// reflected halo: a small under-count in those modes, in the conservative
+// direction, and the alternative is a disc-only variant of a function three
+// other call sites share.
+float3 skyColorNoSunDisc(float3 ro, float3 rd, inout uint seed) {
+    uint mode = uint(sun_and_mode.w);
+    float3 s = skyColor(ro, rd, seed);
+    if (mode == 4u) {
+        s -= sunDiscPhysical(ro, rd, sun_and_mode.xyz);
+    } else if (mode == 3u) {
+        s -= sunDisc(rd, sun_and_mode.xyz);
+    } else if (mode == 2u) {
+        s -= sunDisc(rd, sun_and_mode.xyz)
+           + procSkyInlineSunDiscAndHalo(rd, sun_and_mode.xyz);
+    }
+    return max(s, float3(0.0));
+}
+
 // Up to kMaxRefract dielectric bounces; beyond that the ray gives up
 // (returns 0) so a pathological all-glass scene can't loop forever.
 // TIR also returns 0 (light can't pass that interface).
@@ -6216,6 +6341,124 @@ OceanTexel oceanBilinearTexels(float2 uv, uint grid) {
     o.c11 = uint2(x1u, y1u);
     return o;
 }
+// --- Planetary P5 (#259): the cascade atlas --------------------------------
+// With more than one cascade the two ocean textures become an ATLAS: grid
+// wide, grid * cascade_count tall, cascade c occupying rows
+// [c*grid, (c+1)*grid). Wrapping stays WITHIN the cascade's band, which is
+// what oceanBilinearTexels' modulo already gives -- the row offset is added
+// afterwards so a v-wrap can never bleed into the neighbouring cascade.
+//
+// A single stacked atlas rather than one texture pair per cascade because
+// texture slots are the scarce resource here: PathTrace already saturates
+// Apple Silicon's 8-read_write compute cap and pbr_atlas is deliberately
+// declared last so it lands at MSL index 16 without moving anything. Three
+// cascades as six textures would need four more slots and would move that
+// assignment; as an atlas it needs none.
+OceanTexel oceanBilinearTexelsC(float2 uv, uint grid, uint c) {
+    OceanTexel o = oceanBilinearTexels(uv, grid);
+    uint row = c * grid;
+    o.c00.y += row; o.c10.y += row; o.c01.y += row; o.c11.y += row;
+    return o;
+}
+float4 oceanFetchDispC(float2 uv, uint grid, uint c) {
+    OceanTexel o = oceanBilinearTexelsC(uv, grid, c);
+    float4 c00 = ocean_displacement[o.c00];
+    float4 c10 = ocean_displacement[o.c10];
+    float4 c01 = ocean_displacement[o.c01];
+    float4 c11 = ocean_displacement[o.c11];
+    return lerp(lerp(c00, c10, o.tx), lerp(c01, c11, o.tx), o.ty);
+}
+float4 oceanFetchNormalC(float2 uv, uint grid, uint c) {
+    OceanTexel o = oceanBilinearTexelsC(uv, grid, c);
+    float4 c00 = ocean_normal[o.c00];
+    float4 c10 = ocean_normal[o.c10];
+    float4 c01 = ocean_normal[o.c01];
+    float4 c11 = ocean_normal[o.c11];
+    return lerp(lerp(c00, c10, o.tx), lerp(c01, c11, o.tx), o.ty);
+}
+
+// Cascade c's tile period in metres. Packed into the .w lanes of the three
+// tangent-frame vectors rather than a fourth vec4 of its own.
+float oceanCascadePeriod(uint c) {
+    return (c == 0u) ? ocean_tan_e.w : ((c == 1u) ? ocean_tan_n.w
+                                                  : ocean_tan_o.w);
+}
+// Cascade c's tile-space phase. Cascade 0's is exactly zero: the anchor
+// lattice IS cascade 0's period, so the snap moves cascade 0 by a whole
+// number of tiles and its lookup is invariant by construction.
+float2 oceanCascadePhase(uint c) {
+    return (c == 0u) ? float2(0.0, 0.0)
+                     : ((c == 1u) ? ocean_phase.xy : ocean_phase.zw);
+}
+
+// --- Geometry-to-BRDF handover, Bruneton/Neyret/Holzschuch 2010 ------------
+//
+// How much of cascade c's slope variance a footprint of width `w` still
+// RESOLVES, in [0, 1]. Not a smoothstep: it is the Phillips equilibrium
+// range's own answer.
+//
+// In the equilibrium subrange the omnidirectional height spectrum goes as
+// k^-4 (Phillips 1958, "The equilibrium range in the spectrum of
+// wind-generated waves", J. Fluid Mech. 4(4) 426-434 -- and it is exactly
+// the k^-4 that OceanFFT's Phillips P(k) carries). The slope variance
+// integrand is then
+//
+//     k^2 * P(k) * k dk  ~  k^2 * k^-4 * k dk  =  dk / k  =  d(ln k),
+//
+// i.e. MEAN-SQUARE SLOPE IS UNIFORMLY DISTRIBUTED IN LOG WAVELENGTH. So
+// the fraction of a band [lo, hi] that survives a footprint w is just the
+// log-length of the part of the band above w:
+//
+//     g_c(w) = ln(hi / clamp(w, lo, hi)) / ln(hi / lo).
+//
+// One log per cascade, no tuned constant, and it is 1 at w <= lo and 0 at
+// w >= hi exactly rather than asymptotically.
+//
+// The band edges are the partition the host built the cascades on: cascade
+// c owns wavelengths from the NEXT finer cascade's period up to its own,
+// and the finest cascade bottoms out at its own Nyquist (2 * grid spacing).
+// kOceanBandDivisor MIRRORS Engine.h's constant of the same name: how many
+// periods of its longest wave a cascade's tile holds. Cascade 0 is
+// unbounded above, so its band top is its own tile period.
+static const float kOceanBandDivisor = 8.0;
+float oceanCascadeResolved(uint c, uint count, uint grid, float w) {
+    float P  = oceanCascadePeriod(c);
+    float hi = (c == 0u) ? P : (P / kOceanBandDivisor);
+    float lo = (c + 1u < count)
+                   ? (oceanCascadePeriod(c + 1u) / kOceanBandDivisor)
+                   : (2.0 * P / float(max(grid, 1u)));
+    if (!(hi > lo)) return 1.0;
+    float wc = clamp(w, lo, hi);
+    return log(hi / wc) / log(hi / lo);
+}
+// The three weights at once. Computed ONCE per ray, not per march step --
+// the ray cone is constant over a hit.
+float3 oceanCascadeResolvedAll(uint count, uint grid, float w) {
+    float3 g = float3(0.0, 0.0, 0.0);
+    if (count > 0u) g.x = oceanCascadeResolved(0u, count, grid, w);
+    if (count > 1u) g.y = oceanCascadeResolved(1u, count, grid, w);
+    if (count > 2u) g.z = oceanCascadeResolved(2u, count, grid, w);
+    return g;
+}
+
+// The microfacet alpha^2 the water surface needs at this footprint.
+//
+// The whole handover is one conservation statement:
+//
+//     sigma^2_geometry(w) + alpha^2_brdf(w) = sigma^2_CoxMunk    for all w
+//
+// Geometry carries what the cascades still resolve; the BRDF carries the
+// rest. Nothing fades, nothing is tuned, and the total is a MEASURED
+// oceanographic constant (Cox & Munk 1954; see src/physics/OceanFFT.h for
+// the alpha^2 = mean-square-slope derivation). At the boat the cascades
+// carry almost all of it and the surface is a near-mirror; from orbit they
+// carry none and alpha^2 is exactly Cox-Munk's sigma^2. There is no
+// altitude anywhere in the expression -- only the cone.
+float oceanBrdfAlpha2(float3 resolved) {
+    float geom = dot(resolved, ocean_slope.xyz);
+    return max(ocean_slope.w + planet_ocean.z - geom, 0.0);
+}
+
 float4 oceanFetchDisp(float2 uv, uint grid) {
     OceanTexel o = oceanBilinearTexels(uv, grid);
     float4 c00 = ocean_displacement[o.c00];
@@ -6244,6 +6487,34 @@ float oceanHeightAt(float3 world_p, float plane_y) {
     return plane_y + d.y;
 }
 
+// --- Planetary P5 (#259): the crossing test, both ways --------------------
+//
+// `diff` is the signed height of the ray point above the displaced surface.
+// The Wave 8 test was `diff_prev > 0.0 && diff_cur <= 0.0` -- above to below
+// ONLY. A ray originating below the surface and travelling up starts with
+// diff_prev < 0 and can never register a crossing, so it silently falls
+// through to the analytic surface: Snell's window seen from underwater has
+// been geometrically wrong since #25, before any planetary work.
+//
+// The fix is strictly additive. The first disjunct is the historic test
+// character for character, so every ray that used to find a crossing finds
+// the SAME crossing at the same step with the same secant weight; the second
+// only fires where the first found nothing. diff_prev == 0 fires neither, as
+// before.
+bool oceanCrossed(float diff_prev, float diff_cur) {
+    return (diff_prev > 0.0 && diff_cur <= 0.0) ||
+           (diff_prev < 0.0 && diff_cur >= 0.0);
+}
+// Secant denominator, guarded away from zero on the side the sign of the
+// crossing puts it. Above-to-below has diff_prev - diff_cur >= diff_prev > 0
+// and takes max(den, 1e-5) -- the historic expression, unchanged. The new
+// below-to-above case has den <= 0 and needs the guard mirrored, or the
+// weight comes out negative-infinite instead of in [0, 1].
+float oceanSecantDenom(float diff_prev, float diff_cur) {
+    float den = diff_prev - diff_cur;
+    return (den >= 0.0) ? max(den, 1e-5) : min(den, -1e-5);
+}
+
 // Result of the ocean heightfield ray-march.
 struct OceanHit {
     bool   hit;
@@ -6251,6 +6522,86 @@ struct OceanHit {
     float3 normal;     // FFT surface normal at the hit
     float  foam;       // foam coverage [0,1] at the hit
 };
+
+// --- Planetary P5 (#259): the camera-anchored tangent frame ---------------
+//
+// The FFT tile is intrinsically planar; the ocean is not. The parameterisation
+// is an orthographic projection into the East/North basis at ONE anchor point
+// on the shell, which the host recomputes each frame:
+//
+//     (e, n) = ( dot(p - O, East), dot(p - O, North) ),   metres.
+//
+// Distortion is second order in (d/R)^2 -- at d = 100 km that is 2.5e-4, i.e.
+// 25 m of arc-length error over 100 km, on a field whose finest cascade tiles
+// every 23 m and whose crests are sub-pixel past ~1.4 km anyway.
+//
+// WHY THE ANCHOR IS QUANTISED. A tangent origin that slides with the camera
+// drags the wave field along with it and deletes parallax -- the sea would
+// look painted on. The host snaps the anchor to a lattice whose spacing is
+// exactly cascade 0's period, so the snap translates the field by a whole
+// number of cascade-0 tiles and cascade 0's lookup does not move at all.
+// Cascades 1 and 2 pick up a phase, which the host computes in f64 from the
+// integer lattice indices and pushes -- a pure function of camera position,
+// with no hysteresis, which is what the golden matrix requires.
+//
+// WHY THIS FIXES THE ABSOLUTE-XZ BUG TOO. The Wave 8 UV was
+// `float2(world_p.x, world_p.z) / tile`; at an ECEF x of 6.4e6 over a 50 m
+// tile that is 128 000, and frac() of it retains almost no sub-tile
+// precision. Here the projection is taken against an anchor a few hundred km
+// away at worst, and the integer tile offset travels separately in
+// ocean_phase, so the mantissa is spent on the fractional part.
+float2 oceanTangentEN(float3 p) {
+    float3 d = p - ocean_tan_o.xyz;
+    return float2(dot(d, ocean_tan_e.xyz), dot(d, ocean_tan_n.xyz));
+}
+
+// The summed cascade field at a point. `amp` is sqrt of each cascade's
+// resolved-variance weight: scaling a cascade's amplitude by a scales its
+// slope variance by a^2, so sqrt is what makes the variance bookkeeping in
+// oceanBrdfAlpha2 exact rather than approximate.
+struct OceanCascadeSample {
+    float  height;     // summed vertical displacement, metres
+    float2 slope;      // summed (dh/dEast, dh/dNorth)
+    float  foam;
+};
+OceanCascadeSample oceanSampleCascades(float2 en, uint count, uint grid,
+                                       float3 amp) {
+    OceanCascadeSample s;
+    s.height = 0.0; s.slope = float2(0.0, 0.0); s.foam = 0.0;
+    [unroll]
+    for (uint c = 0u; c < 3u; ++c) {
+        if (c >= count) break;
+        float a = (c == 0u) ? amp.x : ((c == 1u) ? amp.y : amp.z);
+        if (a <= 0.0) continue;
+        float2 uv = en / max(oceanCascadePeriod(c), 1e-3) + oceanCascadePhase(c);
+        float4 d = oceanFetchDispC(uv, grid, c);
+        float4 n = oceanFetchNormalC(uv, grid, c);
+        s.height += a * d.y;
+        // Recover the slope the packed unit normal encodes. The solver
+        // builds it as normalize(-dh/dx, 1, -dh/dz), so the inverse is
+        // exact. Slopes ADD across cascades; unit normals do not, which is
+        // why the sum happens here and the normalise happens once at the
+        // end.
+        float ny = max(n.y, 1e-4);
+        s.slope += a * float2(-n.x / ny, -n.z / ny);
+        s.foam = max(s.foam, a * d.w);
+    }
+    return s;
+}
+
+// Height of the displaced sea surface above the shell, at a point, in
+// metres. The band the march brackets is +/- ocean_params0.w about
+// planet_ocean.x.
+float oceanShellHeightAt(float3 p, uint count, uint grid, float3 amp) {
+    return oceanSampleCascades(oceanTangentEN(p), count, grid, amp).height;
+}
+
+// World-space surface normal from the summed cascade slopes. `up`, `east`
+// and `north` are the tangent frame; the slopes are expressed in it.
+float3 oceanShellNormal(float2 slope, float3 up) {
+    float3 n = up - slope.x * ocean_tan_e.xyz - slope.y * ocean_tan_n.xyz;
+    return normalize(n);
+}
 
 // Ray-march the FFT ocean heightfield starting from (and bounded by) the
 // analytic water-plane intersection. Standard relief-mapping linear search +
@@ -6324,11 +6675,11 @@ OceanHit oceanRayMarch(float3 ro, float3 rd, float3 plane_n,
         float t_cur = t_enter + dt * float(i);
         float3 p_cur = ro + rd * t_cur;
         float diff_cur = p_cur.y - oceanHeightAt(p_cur, plane_y);
-        if (diff_prev > 0.0 && diff_cur <= 0.0) {
+        if (oceanCrossed(diff_prev, diff_cur)) {
             // Crossing in [t_prev, t_cur]. One linear bisection on diff
             // gives a sub-step-accurate intersection (relief-mapping
             // secant step).
-            float w = diff_prev / max(diff_prev - diff_cur, 1e-5);
+            float w = diff_prev / oceanSecantDenom(diff_prev, diff_cur);
             t_hit = lerp(t_prev, t_cur, w);
             found = true;
             break;
@@ -6350,6 +6701,120 @@ OceanHit oceanRayMarch(float3 ro, float3 rd, float3 plane_n,
     float2 uvh = float2(ph.x, ph.z) / max(tile, 1e-3);
     oh.normal = normalize(oceanFetchNormal(uvh, grid).xyz);
     oh.foam   = oceanFetchDisp(uvh, grid).w;
+    oh.t      = t_hit;
+    oh.hit    = true;
+    return oh;
+}
+
+// --- Planetary P5 (#259): the radial march --------------------------------
+//
+// The same relief march, with "above the plane" replaced by "outside the
+// shell". Three things change and one thing deliberately does not.
+//
+//  * The band is two SHELL intersections at R_sea +/- h_max rather than two
+//    y-plane solves, via ptRayShell -- which carves the inner sphere out of
+//    the outer one, so the returned interval is the near band crossing for a
+//    ray coming down AND the upward band crossing for a submerged ray, with
+//    no case analysis here.
+//  * `p.y` becomes ptRayAltitudeAt: the cancellation-free altitude above the
+//    shell, HOISTED along the ray. Materialising ro + rd*s and taking its
+//    altitude would cap the march at ULP(|p|) ~ 0.5 m in any frame whose
+//    origin is not near the surface -- against a 1.5 m wave.
+//  * The crossing test is oceanCrossed, so a submerged ray looking up finds
+//    the surface.
+//
+// AND THE GRAZING BAILOUT STAYS, and matters more here, not less: on a
+// planet every horizon ray is grazing. Its criterion is now derived rather
+// than an absolute 1e-3 on rd.y -- march the crests only while the band is
+// wider than the pixel. 2*h_max <= cone_width is exactly the study's
+// "displacement is sub-pixel beyond 1.4 km" bound written as the comparison
+// it actually is (2 * 1.5 m / 1.07e-3 rad = 2.8 km at 60 deg / 1080p), and
+// it degrades correctly at every resolution and field of view instead of at
+// the one they were measured on. Past it the analytic shell IS the surface
+// and only oceanBrdfAlpha2's roughness matters.
+OceanHit oceanRayMarchShell(float3 ro, float3 rd, float3 shell_n,
+                            float shell_t, float cone_w, int max_steps,
+                            float3 resolved) {
+    OceanHit oh;
+    oh.hit = false; oh.t = shell_t;
+    oh.normal = shell_n; oh.foam = 0.0;
+
+    float R     = planet_ocean.x;
+    float3 pc   = planet_center_radius.xyz;
+    float h_max = max(ocean_params0.w, 0.01);
+    uint  grid  = uint(max(ocean_params1.y, 1.0));
+    uint  count = uint(max(planet_ocean.y, 1.0));
+    float3 amp  = sqrt(max(resolved, float3(0.0, 0.0, 0.0)));
+
+    // Sub-pixel crests: take the shell, fetch the cascade normal there.
+    // Note this is the FULL-amplitude normal at that point -- the roughness
+    // fold has already removed the unresolved part from `amp`.
+    if (2.0 * h_max <= cone_w) {
+        float3 pp = ro + rd * shell_t;
+        OceanCascadeSample s = oceanSampleCascades(oceanTangentEN(pp), count,
+                                                   grid, amp);
+        oh.normal = oceanShellNormal(s.slope, shell_n);
+        oh.foam   = s.foam;
+        oh.t      = shell_t;
+        oh.hit    = true;
+        return oh;
+    }
+
+    float t_in, t_out;
+    if (!ptRayShell(ro, rd, pc, R - h_max, R + h_max, shell_t + h_max * 4.0,
+                    t_in, t_out) || !(t_out > t_in)) {
+        // Degenerate band (a ray that only clips the shell tangentially, or
+        // one whose whole band lies behind it): take the analytic shell.
+        float3 pp = ro + rd * shell_t;
+        OceanCascadeSample s = oceanSampleCascades(oceanTangentEN(pp), count,
+                                                   grid, amp);
+        oh.normal = oceanShellNormal(s.slope, shell_n);
+        oh.foam   = s.foam;
+        oh.t      = shell_t;
+        oh.hit    = true;
+        return oh;
+    }
+
+    int steps = clamp(max_steps, 8, 256);
+    float dt  = (t_out - t_in) / float(steps);
+
+    // Hoisted altitude: |p(s) - c|^2 - R^2 is a quadratic in s whose two
+    // coefficients are constant along the ray, so the accumulator is paid
+    // once and each step costs two fma. See ptRayAltitudeBegin.
+    PtRayAltitude alt = ptRayAltitudeBegin(ro, rd, pc, R);
+
+    float t_prev = t_in;
+    float3 p_prev = ro + rd * t_prev;
+    // diff > 0 means the ray point is OUTSIDE the displaced surface.
+    float diff_prev = ptRayAltitudeAt(alt, t_prev)
+                    - oceanShellHeightAt(p_prev, count, grid, amp);
+
+    bool found = false;
+    float t_hit = shell_t;
+    [loop]
+    for (int i = 1; i <= steps; ++i) {
+        float t_cur = t_in + dt * float(i);
+        float3 p_cur = ro + rd * t_cur;
+        float diff_cur = ptRayAltitudeAt(alt, t_cur)
+                       - oceanShellHeightAt(p_cur, count, grid, amp);
+        if (oceanCrossed(diff_prev, diff_cur)) {
+            float w = diff_prev / oceanSecantDenom(diff_prev, diff_cur);
+            t_hit = lerp(t_prev, t_cur, w);
+            found = true;
+            break;
+        }
+        t_prev = t_cur;
+        diff_prev = diff_cur;
+    }
+    if (!found) t_hit = shell_t;
+
+    float3 ph = ro + rd * t_hit;
+    OceanCascadeSample s = oceanSampleCascades(oceanTangentEN(ph), count,
+                                               grid, amp);
+    // The macro normal is the local vertical AT THE HIT, not at the shell
+    // entry: over a several-km band traverse those differ by the arc.
+    oh.normal = oceanShellNormal(s.slope, localUp(ph));
+    oh.foam   = s.foam;
     oh.t      = t_hit;
     oh.hit    = true;
     return oh;
@@ -6396,12 +6861,27 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // where the shading pass renders waves). Same gate + march as the
         // shading pass above.
 #if PT_WATER_ENABLED
+        // Planetary P5 (#259): the "is this surface horizontal enough for a
+        // heightfield march" gate is dot(n, localUp) rather than n.y. In the
+        // planar frame localUp() is float3(0,1,0) and the dot IS n.y bit for
+        // bit, so every pre-P5 scene takes the identical branch.
         if (ocean_params0.x != 0.0 && h0.hit && h0.mat == MAT_WATER &&
-            abs(h0.normal.y) > 0.5) {
-            float plane_y0 = (ro0 + rd0 * h0.t).y;
-            OceanHit oo0 = oceanRayMarch(ro0, rd0, h0.normal, plane_y0, h0.t,
-                                         int(ocean_params1.x));
-            if (oo0.hit) { h0.t = oo0.t; h0.normal = oo0.normal; }
+            abs(dot(h0.normal, localUp(ro0 + rd0 * h0.t))) > 0.5) {
+            if (planet_ocean.x > 0.0) {
+                float3 res0 = oceanCascadeResolvedAll(
+                    uint(max(planet_ocean.y, 1.0)),
+                    uint(max(ocean_params1.y, 1.0)),
+                    ptConeWidthAt(cone0, h0.t));
+                OceanHit oo0 = oceanRayMarchShell(ro0, rd0, h0.normal, h0.t,
+                                                  ptConeWidthAt(cone0, h0.t),
+                                                  int(ocean_params1.x), res0);
+                if (oo0.hit) { h0.t = oo0.t; h0.normal = oo0.normal; }
+            } else {
+                float plane_y0 = (ro0 + rd0 * h0.t).y;
+                OceanHit oo0 = oceanRayMarch(ro0, rd0, h0.normal, plane_y0, h0.t,
+                                             int(ocean_params1.x));
+                if (oo0.hit) { h0.t = oo0.t; h0.normal = oo0.normal; }
+            }
         }
 #endif
 
@@ -6798,6 +7278,13 @@ void main(uint2 tid : SV_DispatchThreadID) {
         bool   skip_sky_on_miss   = false;
         bool   prev_was_lambert_nee = false;   // previous bounce was Lambert with env-map NEE
         float  prev_lambert_brdf_pdf = 0.0;    // cosine-hemisphere PDF of the bounce dir sampled there
+        // Planetary P5 (#259): the previous bounce was a planetary-ocean
+        // specular hit that integrated the sun by NEE, so the sun DISC must
+        // come out of this segment's sky or it is counted twice. Exactly one
+        // segment of scope -- snapshotted and cleared at the top of the loop
+        // body -- because the suppression belongs to the ray the water
+        // launched and to nothing after it.
+        bool   ocean_sun_nee = false;
         // --- Underwater medium tracking (Phase 4, #134) ----------------------
         // Per-ray "is this segment travelling through a water medium?" flag.
         // Initialised from water_state.x (host scans analytic primitives at
@@ -6879,6 +7366,11 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // at THIS ray's origin (0 at the eye, grown by the accumulate a
         // few lines below each time the path bounces).
         PtRayCone cone = ptConeMake(cone_width, cone_spread);
+        // Planetary P5 (#259): consume the previous segment's sun-disc
+        // suppression and clear it in the same breath, so it can never
+        // outlive the ray it belongs to.
+        bool ocean_sun_nee_prev = ocean_sun_nee;
+        ocean_sun_nee = false;
         HitInfo h = traceScene(ro, rd, shutter_t01, cone);
         // --- Wave 8 ocean (#25) -- displace the analytic water plane --------
         // When the FFT ocean is on (ocean_params0.x != 0) and the ray hit a
@@ -6890,9 +7382,42 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // perspective, Beer's-law segment, and shading uniformly. h.albedo's
         // alpha carries the per-hit foam coverage for the BRDF branch.
         float ocean_foam_here = 0.0;
+        // Planetary P5 (#259): the microfacet alpha^2 the sub-footprint wave
+        // slope contributes at THIS hit. Zero everywhere except a planetary
+        // ocean hit, and the water BRDF's rough branch is gated on it being
+        // positive, so every pre-P5 water surface keeps its mirror path.
+        float ocean_alpha2_here = 0.0;
 #if PT_WATER_ENABLED
-        if (ocean_params0.x != 0.0 && h.hit && h.mat == MAT_WATER &&
-            abs(h.normal.y) > 0.5) {
+        if (planet_ocean.x > 0.0 && h.hit && h.mat == MAT_WATER) {
+            // Planetary P5 (#259). The roughness fold is NOT gated on the
+            // FFT being on, and that is what makes the acceptance test
+            // possible rather than merely plausible: with r_ocean 0 the
+            // cascades resolve nothing, so alpha^2 is Cox & Munk's sigma^2
+            // at every distance and the shell is the smooth glitter sphere a
+            // wave field seen from far enough away IS. Turning r_ocean on
+            // must not change what the frame looks like from 400 km -- the
+            // two halves of the same conservation law.
+            float ocean_cone_w = ptConeWidthAt(cone, h.t);
+            float3 res = float3(0.0, 0.0, 0.0);
+            if (ocean_params0.x != 0.0) {
+                res = oceanCascadeResolvedAll(uint(max(planet_ocean.y, 1.0)),
+                                              uint(max(ocean_params1.y, 1.0)),
+                                              ocean_cone_w);
+            }
+            ocean_alpha2_here = oceanBrdfAlpha2(res);
+            if (ocean_params0.x != 0.0 &&
+                abs(dot(h.normal, localUp(ro + rd * h.t))) > 0.5) {
+                OceanHit oo = oceanRayMarchShell(ro, rd, h.normal, h.t,
+                                                 ocean_cone_w,
+                                                 int(ocean_params1.x), res);
+                if (oo.hit) {
+                    h.t = oo.t;
+                    h.normal = oo.normal;
+                    ocean_foam_here = oo.foam;
+                }
+            }
+        } else if (ocean_params0.x != 0.0 && h.hit && h.mat == MAT_WATER &&
+                   abs(dot(h.normal, localUp(ro + rd * h.t))) > 0.5) {
             float plane_y = (ro + rd * h.t).y;   // analytic plane height
             OceanHit oo = oceanRayMarch(ro, rd, h.normal, plane_y, h.t,
                                         int(ocean_params1.x));
@@ -7118,7 +7643,13 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         radiance += throughput * sky_full;
                     }
                 } else {
-                    radiance += clampIndirect(throughput * skyColor(ro, rd, seed));
+                    // Planetary P5 (#259): a bounce ray launched by a
+                    // planetary-ocean specular hit sees the sky WITHOUT its
+                    // sun disc -- that lobe already integrated the sun with
+                    // a shadow ray. Every other bounce is unchanged.
+                    radiance += clampIndirect(throughput *
+                        (ocean_sun_nee_prev ? skyColorNoSunDisc(ro, rd, seed)
+                                            : skyColor(ro, rd, seed)));
                 }
             }
             break;
@@ -7777,7 +8308,13 @@ void main(uint2 tid : SV_DispatchThreadID) {
             // use it directly instead of re-perturbing with the Phase 1
             // value-noise wave normal (which would double-bump the
             // surface). Off -> the Phase 1 analytic wave normal as before.
-            float3 shading_n = (ocean_params0.x != 0.0)
+            // Planetary P5 (#259) adds the second disjunct: the Phase 1
+            // wave normal is a value-noise field in world XZ, which on a
+            // sphere is a horizontal-plane pattern wrapped round a globe.
+            // A planetary shell takes its macro normal even when the FFT is
+            // off -- that is the smooth Cox-Munk sphere the handover is
+            // measured against, and it must not have ripples painted on it.
+            float3 shading_n = (ocean_params0.x != 0.0 || planet_ocean.x > 0.0)
                                    ? h.normal
                                    : waterShadingNormal(hit_pt, h.normal);
             // --- Wave 9 ocean-foam ------------------------------------------
@@ -7831,10 +8368,128 @@ void main(uint2 tid : SV_DispatchThreadID) {
             float ndi_s = dot(shading_n, rd);
             float3 nf_s = (ndi_s < 0.0) ? shading_n : -shading_n;
 
+            // --- Planetary P5 (#259): sun glitter, by NEE not by luck -----
+            //
+            // "Sun glitter off a wave field is the single most recognisable
+            // feature of an ocean in a satellite photo" is the reason this
+            // phase exists, and it is exactly the thing a purely stochastic
+            // specular estimator cannot deliver. The sun disc subtends
+            // 0.0093 rad; at the far-field alpha of 0.254 the chance that a
+            // VNDF sample lands on it is (0.00465 / 0.254)^2 = 3.4e-4, so at
+            // 192 samples per pixel a from-orbit frame gets 0.065 hits --
+            // and r_firefly_clamp then bites the few that land. MEASURED:
+            // the ocean from 400 km renders with no glint at all.
+            //
+            // So integrate the sun directly: one shadow ray, the GGX BRDF
+            // evaluated toward a jittered point on the disc, and the disc
+            // taken out of the bounce ray's sky (see skyColorNoSunDisc,
+            // where the two estimators are shown to partition the same
+            // light exactly in physical-sky mode).
+            //
+            // Planetary water only. The flat MAT_WATER planes keep the Wave
+            // 8 estimator untouched, and MAT_METAL keeps its own -- widening
+            // this to every specular surface is a real improvement and a
+            // different change.
+            bool did_ocean_sun_nee = false;
+            if (planet_ocean.x > 0.0 && in_water == 0 &&
+                uint(sun_and_mode.w) >= 2u) {
+                float3 sun_dir  = sun_and_mode.xyz;
+                float  sun_elev = elevationAt(hit_pt, sun_dir);
+                float  ndv      = dot(nf_s, -rd);
+                if (sun_elev > 0.0 && ndv > 0.0) {
+                    // A perfectly smooth interface has a delta lobe and no
+                    // NEE to do; the floor keeps D finite there and is the
+                    // same 0.02 roughness floor anisoAlpha already clamps to
+                    // (0.02^2 = 4e-4).
+                    float a  = max(sqrt(ocean_alpha2_here), 4.0e-4);
+                    float3 l = sampleSunDisc(sun_dir, seed);
+                    float ndl = dot(nf_s, l);
+                    float3 hv = normalize(l - rd);
+                    float ndh = dot(nf_s, hv);
+                    if (ndl > 0.0 && ndh > 0.0) {
+                        // Trowbridge-Reitz D, and the same height-correlated
+                        // Smith G2 the sampled lobe uses, so the NEE and the
+                        // BSDF sample are the same BRDF.
+                        float a2 = a * a;
+                        float dd = ndh * ndh * (a2 - 1.0) + 1.0;
+                        float D  = a2 / (3.14159265358979 * dd * dd);
+                        float3 t1, t2;
+                        anisoTangentFrame(nf_s, 0.0, t1, t2);
+                        float3 vl = float3(dot(-rd, t1), dot(-rd, t2), ndv);
+                        float3 ll = float3(dot(l, t1),  dot(l, t2),  ndl);
+                        float G2 = ggxG2Aniso(ll, vl, a, a);
+                        float F  = fresnelSchlick(max(dot(hv, l), 0.0), 0.02);
+                        float fr_spec = D * G2 * F / (4.0 * ndv * ndl);
+                        float3 trans = transmittance(
+                            ptRayOrigin(hit_pt, nf_s, cone_hit, l), l, 1e30,
+                            shutter_t01, cone_hit, in_water);
+                        if (any(trans > float3(0.0))) {
+                            float3 sun_rad =
+                                sunRadianceAt(hit_pt, sun_dir, sun_elev);
+                            float3 contrib =
+                                throughput * sun_rad * trans * fr_spec * ndl;
+                            radiance += (b == 0u) ? contrib
+                                                  : clampIndirect(contrib);
+                        }
+                        did_ocean_sun_nee = true;
+                    }
+                }
+            }
+            // --- Planetary P5 (#259): the other half of the handover ------
+            //
+            // Everything above this line is geometry. This is where the
+            // slope variance the geometry no longer carries comes back as a
+            // BRDF: a GGX visible-normal sample about the macro normal with
+            // alpha^2 = sigma^2_CoxMunk - sigma^2_resolved(cone). At the
+            // boat that alpha is the sub-grid capillary band and the lobe is
+            // a near-mirror; from orbit it is the whole Cox-Munk variance
+            // and the planet has the broad sun glitter every satellite photo
+            // of an ocean shows. No fade, no altitude, no cvar -- only the
+            // ray cone, and a conservation law that makes the two halves sum
+            // to the same measured constant at every point of the climb.
+            //
+            // The MEDIUM decision stays on the macro normal. A microfacet
+            // normal can point to the other side of the interface, and
+            // letting it decide "am I entering or leaving the water" would
+            // corrupt in_water for the rest of the path -- the medium is a
+            // property of the surface, not of the microfacet.
+            //
+            // nf_m == nf_s exactly when alpha^2 is 0, which is every
+            // non-planetary water surface, so the legacy path is untouched.
+            float3 nf_m = nf_s;
+            if (ocean_alpha2_here > 0.0) {
+                float a_ggx = sqrt(ocean_alpha2_here);
+                float3 tt, tb;
+                anisoTangentFrame(nf_s, 0.0, tt, tb);
+                float3 vl = float3(dot(-rd, tt), dot(-rd, tb), dot(-rd, nf_s));
+                if (vl.z > 0.0) {
+                    float3 hl = sampleGgxVndfLocal(vl, a_ggx, a_ggx,
+                                                   randf(seed), randf(seed));
+                    float3 ll = reflect(-vl, hl);
+                    // Reject a microfacet whose reflected direction lands
+                    // below the MACRO horizon. Such a sample is shadowed by
+                    // the surface it came from, and taking it would launch
+                    // a ray into the water while the medium bookkeeping
+                    // still says air. Falling back to the macro normal is
+                    // the conservative answer and it costs nothing at the
+                    // small alphas where it almost never fires.
+                    if (ll.z > 0.0 && hl.z > 0.0) {
+                        nf_m = normalize(hl.x * tt + hl.y * tb + hl.z * nf_s);
+                        // VNDF importance sampling leaves the masking ratio
+                        // G2/G1 as the surviving weight (Heitz 2018) --
+                        // exactly as sampleClearcoat and the anisotropic
+                        // metal lobe already do it here.
+                        throughput *= ggxG2Aniso(ll, vl, a_ggx, a_ggx) *
+                                      (1.0 + ggxLambdaAniso(vl, a_ggx, a_ggx));
+                    }
+                }
+            }
+            // --- end Planetary P5 -----------------------------------------
+
             float ior_a = (ndi_s < 0.0) ? 1.0       : water_ior;
             float ior_b = (ndi_s < 0.0) ? water_ior : 1.0;
             float eta = ior_a / ior_b;
-            float cos_i = abs(dot(nf_s, -rd));
+            float cos_i = abs(dot(nf_m, -rd));
             // Schlick F0 for water (1.33 vs air = 0.02041).  Hard-coded
             // here so the cvar can dial ior without the Fresnel split
             // ratio drifting -- F0=0.02 is the perceptually-correct value
@@ -7842,8 +8497,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
             // perturbed.  fresnelSchlick gives the reflected fraction.
             const float F0_water = 0.02;
             float fr = fresnelSchlick(cos_i, F0_water);
-            float3 reflected = reflect(rd, nf_s);
-            float3 refracted = refract(rd, nf_s, eta);
+            float3 reflected = reflect(rd, nf_m);
+            float3 refracted = refract(rd, nf_m, eta);
             bool tir = (length(refracted) < 1e-3);
             if (tir || randf(seed) < fr) {
                 // Reflection (incl. TIR): surface acts like a coated
@@ -7859,6 +8514,11 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 // MAT_DIELECTRIC reflect branch). Clear the suppression.
                 skip_sky_on_miss = false;
                 prev_was_lambert_nee = false;
+                // Planetary P5 (#259): ...except for the sun DISC, which
+                // this lobe just integrated by NEE. Set on the REFLECTED
+                // lobe only: a transmitted ray leaves through the interface
+                // and whatever it eventually sees is a different integral.
+                ocean_sun_nee = did_ocean_sun_nee;
             } else {
                 // Refraction: the ray crosses the water interface.
                 // ndi_s < 0 means the shading normal pointed away from
