@@ -1211,6 +1211,40 @@ public float ptPhaseCornetteShanks(float mu, float g) {
     return num / den;
 }
 
+// --- Planetary P7 (#261): the two seawater phase functions ----------------
+//
+// Seawater scatters by two populations with two completely different
+// angular signatures, and collapsing them into one lobe is what makes
+// rendered water look like tinted glass.
+//
+// MOLECULAR. Rayleigh scattering with a depolarisation ratio d, which for
+// seawater is 0.09 (Morel 1974; see src/physics/WaterOptics.h). The
+// unnormalised form is beta(theta) = beta(90) [1 + k mu^2] with
+// k = (1-d)/(1+d), and integrating it over the sphere gives
+// 4 pi (1 + k/3), so dividing one by the other is a phase function that
+// integrates to 1 BY CONSTRUCTION -- no normalisation constant to get
+// wrong, and no separate literal to drift from the depolarisation ratio.
+// It reduces to ptPhaseRayleigh exactly at d = 0 (k = 1, denominator
+// 16 pi / 3).
+public float ptPhaseRayleighDepol(float mu, float d) {
+    float k = (1.0 - d) / (1.0 + d);
+    return (1.0 + k * mu * mu) / (4.0 * 3.14159265358979 * (1.0 + k / 3.0));
+}
+
+// PARTICULATE. Henyey-Greenstein, which is what the Petzold "average
+// particle" measurements are summarised by at g = 0.924. Deliberately
+// plain HG and not Cornette-Shanks: CS is a Rayleigh-reducing form chosen
+// for the ATMOSPHERE so that isotropising the aerosol does not change
+// which physics is modelled, and here the Rayleigh half is a separate
+// species with its own exact phase function above. Using CS for the
+// particles would double-count the Rayleigh angular shape.
+public float ptPhaseHenyeyGreenstein(float mu, float g) {
+    float g2 = g * g;
+    return (1.0 - g2)
+         / (4.0 * 3.14159265358979
+            * pow(max(1.0 + g2 - 2.0 * g * mu, 1e-4), 1.5));
+}
+
 // Optical depth along [ro, ro + rd*t] through the body's medium, by
 // composite Simpson's rule on `steps` subintervals.
 //
