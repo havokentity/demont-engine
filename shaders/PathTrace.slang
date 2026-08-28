@@ -5741,6 +5741,15 @@ float3 skyPhysical(float3 ro, float3 rd, float t_max, int steps,
     // same convention the in-scatter march uses.
     float mu   = dot(rd, sun_dir);
     float ph_r = ptPhaseRayleigh(mu);
+    // The aerosol asymmetry comes from r_volumetric_anisotropy
+    // (vol_params.y, default 0.7) and NOT from the body's own mie_g, which
+    // ptAtmoEarth sets to the Cornette-Shanks 0.8.  Deliberate: the
+    // aerial-perspective march next door reads the same cvar, and the two
+    // meet at the limb, so a disagreement here would be a seam.  Honouring
+    // the user's knob in both is worth more than honouring the body's
+    // constant in one of them.  Unifying them is a change to the AP march
+    // as well, which moves clouds_godrays, so it belongs with that
+    // regeneration and not here.
     float ph_m = ptPhaseCornetteShanks(mu, vol_params.y);
 
     int   N  = max(steps, 1);
