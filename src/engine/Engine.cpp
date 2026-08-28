@@ -10023,6 +10023,34 @@ void Engine::RenderFrame() {
             // A planar frame has no centre to put a shell around.
             ocean_on = ocean_on && spherical_frame;
 
+            // THE ONE CONFIGURATION THAT SILENTLY SHOWS NO OCEAN. Without
+            // terrain, the P3 analytic body sits at planet_R_d -- the SAME
+            // radius as this shell. Both branches solve the same sphere and
+            // return the same t, the shell's `t_w < h.t` is strictly less,
+            // so the ground wins every pixel and the sea is invisible with
+            // nothing in the log to say why. With terrain on there is no
+            // conflict: the body drops to the semi-minor axis minus 11 km
+            // and becomes the streaming backstop it is meant to be.
+            //
+            // A one-shot warning rather than a silent nudge to the body's
+            // radius: moving it would change what every P3 and P6 fixture
+            // renders to fix a scene-authoring mistake.
+            if (ocean_on && planet_ground_on &&
+                ground_body_R == planet_R_d) {
+                static bool s_warned_ocean_ground = false;
+                if (!s_warned_ocean_ground) {
+                    s_warned_ocean_ground = true;
+                    LOG_WARN("engine: r_planet_ocean 1 and r_planet_ground 1 "
+                             "without terrain put a water shell and an opaque "
+                             "body at the SAME radius ({:.1f} m), and the "
+                             "opaque one wins every pixel -- the ocean will "
+                             "not be visible. Set r_planet_ground 0 (the "
+                             "planet IS the ocean) or r_planet_terrain 1 "
+                             "(the body drops to the seabed backstop).",
+                             planet_R_d);
+                }
+            }
+
             const std::uint32_t cascades =
                 static_cast<std::uint32_t>(ocean_cascades_.size());
             // Cox & Munk is a pure function of the wind and is read
