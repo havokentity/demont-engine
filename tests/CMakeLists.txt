@@ -2324,27 +2324,35 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # Measured on an M4 Max, 320x240, 32 accumulation frames, all at
     # --max-delta 0 so every differing pixel counts:
     #
-    #   same fixture rendered twice   bad = 0        mean = 0          (the
-    #                                                                  noise
-    #                                                                  floor
-    #                                                                  is
-    #                                                                  zero)
-    #   90 km,  2 m apart             bad = 0.165%   mean = 0.00199
-    #   100 km, 2 m apart, CROSSING   bad = 0.163%   mean = 0.00223
-    #   100 km, 20 m apart, crossing  bad = 1.609%   mean = 0.02165
-    #   100 km vs 110 km              bad = 38.23%   mean = 7.17
+    #                                  max L2   mean L2    bad px
+    #   same fixture rendered twice    0.0000   0.000000    0.000%
+    #   10 km,  2 m apart              1.4142   0.018772    1.866%
+    #   90 km,  2 m apart (CONTROL)    1.4142   0.001727    0.171%
+    #   100 km, 2 m apart (CROSSING)   1.4142   0.001488    0.147%
+    #   100 km, 20 m apart (crossing)  1.7321   0.014758    1.427%
+    #   100 km vs 110 km               98.112   4.622206   41.514%
     #
-    # The crossing is indistinguishable from the control, and refining the
-    # separation tenfold shrinks the difference by 9.7x -- linear, which is
-    # what a Lipschitz function does and what a jump does not. The last row
-    # is what a real discontinuity would look like: 143x the mean and 38x
-    # the bad-pixel count of the bar below.
+    # Three things to read off it. The noise floor is exactly zero, so
+    # every number below it is signal. The crossing is indistinguishable
+    # from the control -- marginally SMALLER, in fact, because 100 km is
+    # slightly further from the ground than 90 km is and the air the two
+    # frames disagree about is correspondingly thinner. And refining the
+    # separation tenfold shrinks the difference by 9.9x: linear, which is
+    # what a Lipschitz function does and what a jump does not.
     #
-    # The registered bar (32 / 0.05 / 1.0) sits between them with 22x of
-    # margin in mean against flake and 143x of margin against the failure
-    # it is watching for. max-delta 32 accommodates the handful of limb
-    # pixels where a sub-pixel geometric shift crosses a very steep edge --
-    # 125 pixels of 76 800, and the control produces the same population.
+    # The last row is the scale: a REAL 10 km move produces 3100x the mean
+    # and 280x the bad-pixel count of the crossing. Anything that looked
+    # like a step at the boundary would land somewhere in that range, not
+    # in the fourth decimal place.
+    #
+    # No pixel differs by more than 1.7321 L2 = sqrt(3), i.e. one 8-bit
+    # level in each of three channels, so the registered max-delta of 8 is
+    # 4.6x clear of the observed maximum while still being 12x tighter
+    # than the 98 a genuine step produces. The mean bar of 0.02 is 13x
+    # clear of the crossing and 231x tighter than the step; the 1.0%
+    # bad-pixel bar is 6.8x clear and 42x tighter. The headroom exists
+    # because CI runners use a paravirtualised GPU -- the same reason the
+    # worldframe A/B cells register max-delta 2 instead of 0.
     #
     # DESIGN RULE, HONOURED BY CONSTRUCTION: no planetary state transition
     # may require a history reset (#260, and #164 for the class of bug).
@@ -2384,7 +2392,7 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
                 COMMAND $<TARGET_FILE:imgdiff>
                     ${CMAKE_BINARY_DIR}/golden_actual/sky_continuity_shell__${_lo}.png
                     ${CMAKE_BINARY_DIR}/golden_actual/sky_continuity_shell__${_hi}.png
-                    --max-delta 32 --mean-delta 0.05 --fail-percent 1.0
+                    --max-delta 8 --mean-delta 0.02 --fail-percent 1.0
                     --diff ${CMAKE_BINARY_DIR}/golden_diff/sky_continuity_shell__${_tag}.png
                 WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
             set_tests_properties(sky_continuity_shell_${_tag} PROPERTIES
