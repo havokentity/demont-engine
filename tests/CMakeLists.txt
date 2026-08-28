@@ -514,6 +514,58 @@ target_compile_definitions(pt_planet_ocean PRIVATE
     PT_SHADER_PATHTRACE_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang"
     PT_ENGINE_H_PATH="${CMAKE_SOURCE_DIR}/src/engine/Engine.h"
     PT_ENGINE_CPP_PATH="${CMAKE_SOURCE_DIR}/src/engine/Engine.cpp")
+
+# --- pt_ocean_gpu (#259 planetary P5 / #133 water roadmap Phase 2) ---------
+#
+# THE ACCEPTANCE TEST FOR THE GPU CASCADE SOLVER. Runs both solvers on the
+# same seeded Phillips base spectrum -- the CPU pt::ocean::OceanFFT and the
+# shaders/OceanCascades.slang compute pre-pass -- and compares the packed
+# fields texel by texel against a bound DERIVED from float32 radix-2 FFT
+# arithmetic (see the header of pt_ocean_gpu_test.cpp; ~4.0e-4 relative
+# 2-norm at grid 256, and ~96% of it is the host's recurrence twiddle, not
+# the kernel's). Also asserts the GPU field is bit-identical across eight
+# consecutive runs, which is what the three P5 golden cells depend on.
+#
+# Needs a REAL Metal device: it creates one headlessly the way
+# rhi_accel_update_test.cpp does, builds the "ocean_cascades" pipeline,
+# dispatches, and reads the atlas back. Links pt_rhi (for the device) and
+# pt_physics (for the reference solver + the Cox-Munk kernels); the push
+# layout and the five-pass sequence come from
+# src/physics/OceanCascadeDispatch.h, shared verbatim with
+# Engine::DispatchOceanCascades so there is one transcription of the
+# shader's wire format and not two.
+#
+# Apple-only and SKIP_RETURN_CODE 125: there is no Vulkan pipeline for this
+# kernel yet (VulkanDevice's shared descriptor-set layout stops at binding
+# 39 and the kernel declares 40..45) and the software backend has no
+# compute pipelines at all, so on those the engine takes the CPU solver and
+# there is nothing to compare. A host without a usable Metal device reads
+# as SKIPPED, never as green -- the #252 failure mode.
+#
+# 300s timeout: MetalDevice compiles every MSL kernel in its constructor
+# and the test constructs one per TEST_CASE.
+if(APPLE)
+    add_executable(pt_ocean_gpu pt_ocean_gpu_test.cpp)
+    # pt_physics is listed explicitly even though pt_rhi already drags it
+    # in four hops down (pt_rhi -> pt_rhi_metal -> pt_app_window ->
+    # pt_console -> pt_editor -> pt_physics). Apple's ld64 then prints one
+    # `ignoring duplicate libraries` note, because CMake emits the archive
+    # at both depths; it is informational and the link is correct. The
+    # alternative -- depending on that six-target chain to keep supplying
+    # pt::ocean::OceanFFT -- is a worse trade than one linker note.
+    target_link_libraries(pt_ocean_gpu PRIVATE doctest::doctest pt_rhi pt_physics)
+    target_compile_definitions(pt_ocean_gpu PRIVATE
+        PT_ENGINE_H_PATH="${CMAKE_SOURCE_DIR}/src/engine/Engine.h")
+    if(COMMAND pt_target_warnings)
+        pt_target_warnings(pt_ocean_gpu)
+    endif()
+    add_test(NAME pt_ocean_gpu COMMAND pt_ocean_gpu
+             WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+    set_tests_properties(pt_ocean_gpu PROPERTIES
+        TIMEOUT          300
+        SKIP_RETURN_CODE 125
+        LABELS           "ocean;planetary;metal")
+endif()
 # --- end planetary ocean ---------------------------------------------------
 
 # --- phys_drop_* RGB arg shapes (PR #189 / issue #181 follow-up) -----------

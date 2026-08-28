@@ -6360,6 +6360,24 @@ OceanTexel oceanBilinearTexelsC(float2 uv, uint grid, uint c) {
     o.c00.y += row; o.c10.y += row; o.c01.y += row; o.c11.y += row;
     return o;
 }
+// --- #259 / #133 Phase 2: the march bracket, out of the atlas -------------
+//
+// oceanRayMarchShell brackets the wave band at R_sea +/- h_max, where
+// h_max is the SUM of the cascades' peak crests plus the host's slack.
+// It used to arrive as ocean_params0.w, which worked only while the host
+// solved the field: with shaders/OceanCascades.slang doing it the peak
+// exists only after the reduce pass, and pushing last frame's number would
+// put the bracket behind the field it brackets.
+//
+// So it travels in the displacement atlas, one row past the last cascade.
+// That row is unreachable by any sample: oceanBilinearTexelsC wraps modulo
+// `grid` INSIDE the cascade's band and only then adds c*grid, so the
+// largest y any fetch can form is (count-1)*grid + grid-1. Both solvers
+// write the identical float into the identical texel, so the shader reads
+// one number from one place whoever produced the field.
+float oceanShellHMax(uint count, uint grid) {
+    return ocean_displacement[uint2(0u, count * grid)].x;
+}
 float4 oceanFetchDispC(float2 uv, uint grid, uint c) {
     OceanTexel o = oceanBilinearTexelsC(uv, grid, c);
     float4 c00 = ocean_displacement[o.c00];
@@ -6741,9 +6759,9 @@ OceanHit oceanRayMarchShell(float3 ro, float3 rd, float3 shell_n,
 
     float R     = planet_ocean.x;
     float3 pc   = planet_center_radius.xyz;
-    float h_max = max(ocean_params0.w, 0.01);
     uint  grid  = uint(max(ocean_params1.y, 1.0));
     uint  count = uint(max(planet_ocean.y, 1.0));
+    float h_max = max(oceanShellHMax(count, grid), 0.01);
     float3 amp  = sqrt(max(resolved, float3(0.0, 0.0, 0.0)));
 
     // Sub-pixel crests: take the shell, fetch the cascade normal there.

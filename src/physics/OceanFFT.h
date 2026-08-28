@@ -387,6 +387,25 @@ public:
     // cost of a full Update().
     void EnsureSpectrum();
 
+    // --- The GPU cascade solver's view of this one (#259 / #133 P2) ------
+    //
+    // The compute pre-pass in shaders/OceanCascades.slang does the
+    // per-frame work -- the time evolution, the five spectra, the fifteen
+    // inverse FFTs, the pack and the foam -- but NOT the static base
+    // spectrum. H0's Gaussian amplitudes come from a seeded std::mt19937
+    // and "the same Gaussians" is not something a GPU can promise, so the
+    // host stays the single source of the spectrum and uploads it once per
+    // rebuild. These three accessors are that hand-off.
+    //
+    // `SpectrumRevision` increments on every RebuildBaseSpectrum, so a
+    // caller can tell "the spectrum I uploaded is still the spectrum this
+    // solver holds" without comparing every config field itself.
+    std::uint64_t SpectrumRevision() const noexcept { return spectrum_rev_; }
+    // H0(k) and its conjugate mirror conj(H0(-k)), both N x N row-major.
+    // Empty until the first EnsureSpectrum() / Update().
+    const std::vector<std::complex<float>>& H0()     const { return h0_; }
+    const std::vector<std::complex<float>>& H0Conj() const { return h0_conj_; }
+
 private:
     void RebuildBaseSpectrum();
 
@@ -445,6 +464,10 @@ private:
     std::uint32_t built_seed_      = 0u;
     float         built_band_lo_   = 0.0f;
     float         built_band_hi_   = 0.0f;
+    // Bumped by every RebuildBaseSpectrum. 0 means "never built", which is
+    // a value no rebuilt spectrum can have, so a caller's "have I uploaded
+    // this one?" comparison starts out false without a separate flag.
+    std::uint64_t spectrum_rev_    = 0u;
 };
 
 }  // namespace pt::ocean
