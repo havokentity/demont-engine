@@ -113,6 +113,18 @@ struct TerrainStats {
     // TerrainQuadtree::DesiredDigest. Two runs of a frozen capture must
     // agree on this, and a chunk count is not evidence that they do.
     std::uint64_t desired_digest = 0;
+    // Order-independent digest of the PUBLISHED SCENE -- the chunk-to-arena
+    // -slot map, the stitch masks, the instance transforms and the
+    // descriptor floats. Refreshed by Settle(); see PublishedSceneDigest.
+    //
+    // desired_digest is not strong enough on its own, and #284 is the
+    // proof. Three consecutive Release captures agreed on it exactly
+    // (3f4f417f3e74165d, 1128 chunks) and still produced three different
+    // PNGs, because the arena slots each chunk received depended on the
+    // order the bake pool happened to finish in. The desired set says WHAT
+    // is on screen; this says HOW IT WAS LAID OUT, and a golden depends on
+    // both.
+    std::uint64_t scene_digest = 0;
 };
 
 class PlanetTerrain {
@@ -135,6 +147,53 @@ public:
     // a TLAS update that touches no BLAS. Returns true when the instance
     // array or the descriptors changed and the caller must re-publish.
     bool Update(const pt::planet::LodParams& lod, const glm::dvec3& anchor);
+
+    // --- SETTLING IS A BARRIER, NOT A BUDGET (#284) -----------------------
+    //
+    // Run the selector to its fixed point and return true when it got
+    // there. `max_rounds` bounds a pathological scene; it is a safety net
+    // and not a schedule, because the round count is a property of the
+    // TREE and not of the machine.
+    //
+    // What this replaces, and why the replacement is structural rather
+    // than a bigger number. The capture used to render ordinary frames and
+    // hope the bake pool finished inside pt_planet_settle of them. That is
+    // a race between two unrelated rates -- frames per second and chunks
+    // per second -- and when the frame budget ran out first the engine
+    // captured whatever partial residency existed at that instant and said
+    // so in a warning nobody was reading. Debug lost the race every time
+    // (400 frames, 149 / 220 / 155 chunks resident on three consecutive
+    // runs) and a loaded Release machine lost it occasionally, which is
+    // precisely the profile of a golden that passes by luck.
+    //
+    // The barrier removes the race instead of widening it. Each round is
+    //
+    //     wait for every requested bake to land   (AsyncChunkBaker::WaitIdle)
+    //     drain ALL of them, select, build, publish
+    //
+    // so a round consumes exactly one level of the quadtree's descent --
+    // the tree cannot descend past a node whose e_L is unmeasured, which is
+    // the invariant TerrainQuadtree::Descend is built on. The round count
+    // is therefore bounded by the depth (max_level + 1) plus the drain
+    // batching, and the ANSWER no longer depends on how fast anything ran.
+    // Every input to the next round is a pure function of the last one:
+    // the drain is total rather than a 64-chunk prefix of an arrival order,
+    // the residency diff walks std::map and std::set in key order, and the
+    // build pass is unpaced, so no wall-clock quantity reaches a decision.
+    //
+    // That last clause is what also fixes arena slot assignment. Slots come
+    // off a free list in the order chunks are added, so a partial drain
+    // used to hand the same chunk a different slot in every run -- the
+    // geometry digest matched while the descriptor digest did not, and the
+    // resulting difference in BLAS creation order flipped the occasional
+    // exactly-tied hit on a shared chunk edge. With the drain total, the
+    // add pass sees the whole round at once and the slot map falls out of
+    // the key order, deterministically.
+    bool Settle(const pt::planet::LodParams& lod, const glm::dvec3& anchor,
+                int max_rounds);
+
+    // Rounds the last Settle() consumed. Diagnostic only.
+    int SettleRounds() const noexcept { return settle_rounds_; }
 
     // The TLAS instances for terrain. instance_id is already the
     // descriptor index (1 + ordinal); slot 0 belongs to the CSG mesh.
@@ -189,6 +248,7 @@ private:
         int                        frames = 0;
     };
 
+    std::uint64_t PublishedSceneDigest() const;
     bool BuildChunkBlas(Resident& r);
     void RetireChunk(Resident& r);
     void FlushRetired(bool force);
@@ -224,6 +284,11 @@ private:
     // consecutive frames to agree. See the note at the convergence test.
     std::uint64_t                      prev_digest_ = 0;
     bool                               first_update_ = true;
+    // True only inside Settle(). Makes Update() drain the bake pool
+    // completely and build without pacing, so nothing in a settling round
+    // is decided by a clock. See the Settle() note above.
+    bool                               settling_ = false;
+    int                                settle_rounds_ = 0;
 
     // One-entry cache for AltitudeAboveTerrain. `mutable` because the query
     // is logically const; guarded by nothing, so it is main-thread only --

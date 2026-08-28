@@ -45,6 +45,7 @@
 #include <cstdint>
 #include <cstring>
 #include <set>
+#include <utility>
 #include <thread>
 #include <vector>
 
@@ -824,4 +825,294 @@ TEST_CASE("the async baker returns exactly what was requested") {
         CHECK(std::memcmp(ref.positions.data(), d.positions.data(),
                           d.positions.size() * sizeof(float)) == 0);
     }
+}
+
+// --- The settle barrier (#284) ---------------------------------------------
+//
+// The bug these pin was not in the selector, which the cases above already
+// show is a pure function of (camera, metrics). It was in how the ENGINE
+// reached the selector's fixed point: a golden capture rendered ordinary
+// frames and checked `converged` after each one, giving up after a budget of
+// them. Rendering a frame does not make a chunk bake, so that was a race
+// between the frame rate and the bake rate. A Debug build lost it on every
+// run -- 400 frames spent, 149 / 220 / 155 chunks resident on three
+// consecutive captures of the same fixture, three different images.
+//
+// PlanetTerrain::Settle replaces the race with a barrier, and
+// AsyncChunkBaker::WaitIdle is the primitive that barrier stands on. These
+// cases pin the primitive, because a WaitIdle that returns one bake early
+// puts the whole race straight back.
+
+TEST_CASE("WaitIdle returns only once every requested bake has landed") {
+    ElevationField field = MakeProceduralField();
+    const PlanetSite site = PlanetSite::FromGeodetic(0.0, 0.0);
+    AsyncChunkBaker baker;
+    baker.Start(4);
+    baker.SetSources(&field, site);
+
+    // Spread across all six faces so the pool has genuinely concurrent work
+    // rather than one straggler.
+    std::vector<ChunkKey> want;
+    for (int f = 0; f < 6; ++f) {
+        for (std::uint32_t i = 0; i < 4; ++i) {
+            want.push_back(ChunkKey{static_cast<std::uint8_t>(f), 3, i, i});
+        }
+    }
+    baker.Request(want);
+    baker.WaitIdle();
+
+    // THE CLAIM: after WaitIdle, ONE unbounded drain yields everything. No
+    // spin loop, no sleep, no second pass. That is what makes a settle round
+    // a computation instead of a poll -- and it is the difference between
+    // draining a whole round and draining a wall-clock-determined prefix of
+    // it, which is where the arena slot map picked up its run-to-run
+    // dependence.
+    CHECK(baker.InFlight() == 0);
+    // Idle() means NOTHING LEFT TO DELIVER, not merely "no worker is busy",
+    // so it is FALSE here: the whole round is sitting in done_ waiting to be
+    // drained. That distinction is load-bearing -- PlanetTerrain::Update
+    // feeds Idle() straight into `stats_.converged`, and reading it as "the
+    // pool is quiet" let a capture declare convergence against a metric map
+    // that was still hundreds of measurements short.
+    CHECK_FALSE(baker.Idle());
+    std::vector<TerrainChunkData> got;
+    baker.Drain(got, 1 << 20);
+    CHECK(got.size() == want.size());
+    CHECK(baker.Idle());
+
+    std::set<ChunkKey> seen;
+    for (const auto& d : got) seen.insert(d.key);
+    for (const auto& k : want) CHECK(seen.count(k) == 1u);
+    baker.Stop();
+}
+
+TEST_CASE("Idle is never true while a claimed bake is outstanding") {
+    // The claim (`in_flight_`) used to be taken AFTER releasing the queue
+    // mutex, so there was a window in which a key had left the queue but had
+    // not yet been counted: queue empty, count zero, "idle" -- with a bake
+    // about to start. Frame-paced streaming never noticed, because it re-asks
+    // every frame. A barrier does notice: it returns early exactly once and
+    // the capture pins a planet that is one chunk short.
+    //
+    // Many small rounds rather than one big one, because the window this
+    // targets is the handful of instructions between the pop and the claim,
+    // and each round re-opens it once per worker.
+    ElevationField field = MakeProceduralField();
+    const PlanetSite site = PlanetSite::FromGeodetic(0.0, 0.0);
+    AsyncChunkBaker baker;
+    baker.Start(8);
+    baker.SetSources(&field, site);
+
+    for (std::uint32_t round = 0; round < 64; ++round) {
+        std::vector<ChunkKey> want;
+        for (int f = 0; f < 6; ++f) {
+            want.push_back(ChunkKey{static_cast<std::uint8_t>(f), 4,
+                                    round % 16u, (round * 7u) % 16u});
+        }
+        baker.Request(want);
+        baker.WaitIdle();
+        std::vector<TerrainChunkData> got;
+        baker.Drain(got, 1 << 20);
+        REQUIRE(got.size() == want.size());
+    }
+    baker.Stop();
+}
+
+TEST_CASE("the barrier reaches the same fixed point at any worker count") {
+    // The engine's settle loop is: wait for the round to land, drain all of
+    // it, re-select. This asserts the ANSWER that loop reaches does not move
+    // with the width of the pool -- 1 worker and 8 workers complete a round
+    // in wildly different orders, and the converged set must not care.
+    //
+    // Level 7 and a 4096-chunk budget keep this to a few seconds while still
+    // forcing several levels of descent under the camera.
+    ElevationField field = MakeProceduralField();
+    const PlanetSite site = PlanetSite::FromGeodetic(0.0, 0.0);
+
+    auto settle = [&](int workers) {
+        AsyncChunkBaker baker;
+        baker.Start(workers);
+        baker.SetSources(&field, site);
+        TerrainQuadtree tree;
+        LodParams p;
+        p.cone_spread  = 2.0 * std::tan(0.5 * 55.0 * kPi / 180.0) / 384.0;
+        p.camera_w     = glm::dvec3(0.0, 1.7, 0.0);
+        p.max_level    = 7;
+        p.chunk_budget = 4096;
+        for (int r = 0; r < 64; ++r) {
+            baker.WaitIdle();
+            std::vector<TerrainChunkData> fresh;
+            baker.Drain(fresh, 1 << 20);
+            for (const auto& d : fresh) tree.NoteChunk(d);
+            tree.Select(p);
+            if (tree.Wanted().empty()) break;
+            baker.Request(tree.Wanted());
+        }
+        baker.Stop();
+        return std::make_pair(tree.DesiredDigest(), tree.Desired().size());
+    };
+
+    const auto one   = settle(1);
+    const auto eight = settle(8);
+    // A non-trivial answer, so the equality below is not two empty sets
+    // agreeing. Six would mean the descent never left the cube roots.
+    CHECK(one.second > 6u);
+    CHECK(one.second == eight.second);
+    CHECK(one.first == eight.first);
+}
+
+
+// --- The converged set is a FIXED POINT, not just a stopping place --------
+//
+// #284's last and deepest layer, and the one that says this subsystem's
+// convergence was being DETECTED rather than GUARANTEED.
+//
+// Balance splits a leaf when the 2:1 restriction demands it, and it used to
+// insert the four children as leaves. Nobody then asked whether a child was
+// itself within tau of the camera. A child whose metric arrived rounds
+// earlier is MEASURED, so it never appeared in Wanted() -- and Wanted()
+// being empty is the entire convergence signal, the thing
+// r_planet_lod_freeze latches on and the capture stops for. So the selector
+// could stop on a set that still wanted to split, and WHICH such set it
+// stopped on depended on how ragged the tree happened to be when Balance
+// ran: on the order an asynchronous worker pool finished in.
+//
+// Measured in the engine, on the planet_surface fixture, before the fix:
+// one camera, one binary, metrics agreeing on all 1 214 common keys to the
+// last bit, settling to 1 128 chunks under one bake schedule and 912 under
+// another. Node (2, 11, 1088, 1657) sat at d = 22 690 m against its own
+// split distance of 24 684 m -- a split by the rule, computed from the
+// rule's own numbers -- and stayed a leaf in the second, because Balance had
+// put it there and nothing revisited it.
+
+namespace {
+
+// Drive the selector to convergence while measuring an ARBITRARY subset each
+// round. The subset matters: a worker pool does not finish in priority
+// order, and a schedule that always measures the most-wanted chunks first is
+// too tidy to expose anything -- it was tried, and the whole grid of
+// (level, tau, batch) it was run over came out identical with the bug still
+// in place. Shuffling is what reproduces what the pool actually does.
+//
+// `per_round` <= 0 measures everything each round: the smooth schedule, and
+// the reference answer the ragged ones must agree with.
+std::pair<std::uint64_t, std::size_t> SettleWithArrivalOrder(
+        const ElevationField& field, const PlanetSite& site,
+        const LodParams& params, int per_round, std::uint64_t seed) {
+    TerrainQuadtree tree;
+    LodParams p = params;
+    // Knuth LCG, so the shuffle is reproducible and the test is not itself a
+    // source of the nondeterminism it is measuring.
+    std::uint64_t rng = seed * 6364136223846793005ull + 1442695040888963407ull;
+    for (int r = 0; r < 100000; ++r) {
+        tree.Select(p);
+        if (tree.Wanted().empty()) break;
+        std::vector<ChunkKey> want = tree.Wanted();
+        if (per_round > 0 && want.size() > static_cast<std::size_t>(per_round)) {
+            for (std::size_t i = want.size(); i > 1; --i) {
+                rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+                std::swap(want[i - 1], want[static_cast<std::size_t>(rng >> 33) % i]);
+            }
+            want.resize(static_cast<std::size_t>(per_round));
+        }
+        for (const ChunkKey& k : want) {
+            TerrainChunkData d;
+            BuildTerrainChunk(k, field, site, d);
+            tree.NoteChunk(d);
+        }
+    }
+    return {tree.DesiredDigest(), tree.Desired().size()};
+}
+
+// The capture configuration in miniature. Level 9 and tau 1.5 give ~615
+// chunks -- enough level spread for the 2:1 rule to do real work, few enough
+// to bake several times inside the Debug budget. The budget is far above the
+// set so the tau bisection never runs and this measures Balance alone.
+// Hysteresis is a deliberate path dependence and is suppressed under freeze,
+// which is also what the golden fixtures set.
+LodParams FixedPointParams() {
+    LodParams p;
+    p.cone_spread  = 2.0 * std::tan(0.5 * 55.0 * kPi / 180.0) / 384.0;
+    p.camera_w     = glm::dvec3(0.0, 1.7, 0.0);
+    p.max_level    = 9;
+    p.tau_px       = 1.5;
+    p.chunk_budget = 1000000;
+    p.freeze       = true;
+    return p;
+}
+
+}  // namespace
+
+TEST_CASE("the converged set does not depend on the bake schedule") {
+    ElevationField field = MakeProceduralField(1500.0, 20000.0);
+    const PlanetSite site = PlanetSite::FromGeodetic(0.0, 0.0);
+    const LodParams p = FixedPointParams();
+
+    const auto reference = SettleWithArrivalOrder(field, site, p, 0, 1);
+    // A real descent, not six cube roots agreeing with six cube roots.
+    CHECK(reference.second > 6u);
+
+    for (int per_round : {4, 16, 64}) {
+        for (std::uint64_t seed : {1ull, 7ull, 99ull}) {
+            const auto got = SettleWithArrivalOrder(field, site, p, per_round, seed);
+            INFO("per_round=" << per_round << " seed=" << seed
+                 << " got=" << got.second << " want=" << reference.second);
+            CHECK(got.second == reference.second);
+            // The count is not the claim -- two different sets of the same
+            // size compare equal on size, which is why DesiredDigest exists.
+            CHECK(got.first == reference.first);
+        }
+    }
+}
+
+TEST_CASE("no converged leaf still wants to split") {
+    // The same property stated as a rule rather than as a comparison, so it
+    // survives a change to the camera or to tau that would move the
+    // reference set. Every leaf below max_level must be at or beyond its own
+    // split distance -- that is what "fixed point of the split rule" means,
+    // and it is the invariant Converged() has always been read as asserting.
+    ElevationField field = MakeProceduralField(1500.0, 20000.0);
+    const PlanetSite site = PlanetSite::FromGeodetic(0.0, 0.0);
+    LodParams p = FixedPointParams();
+
+    // Rebuild the converged tree here rather than returning one from the
+    // helper, because the leaves have to be re-baked below anyway to get at
+    // e_L without reaching into the selector's private metric map.
+    TerrainQuadtree tree;
+    std::uint64_t rng = 12345ull;
+    for (int r = 0; r < 100000; ++r) {
+        tree.Select(p);
+        if (tree.Wanted().empty()) break;
+        std::vector<ChunkKey> want = tree.Wanted();
+        for (std::size_t i = want.size(); i > 1; --i) {
+            rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+            std::swap(want[i - 1], want[static_cast<std::size_t>(rng >> 33) % i]);
+        }
+        if (want.size() > 16u) want.resize(16u);
+        for (const ChunkKey& k : want) {
+            TerrainChunkData d;
+            BuildTerrainChunk(k, field, site, d);
+            tree.NoteChunk(d);
+        }
+    }
+    REQUIRE(tree.Converged());
+    REQUIRE(tree.Desired().size() > 6u);
+
+    std::size_t checked = 0;
+    std::size_t wants_to_split = 0;
+    for (const ChunkKey& leaf : tree.Desired()) {
+        // A max_level leaf cannot split, so the rule says nothing about it.
+        if (static_cast<int>(leaf.level) >= p.max_level) continue;
+        TerrainChunkData d;
+        BuildTerrainChunk(leaf, field, site, d);
+        const double dist = std::max(
+            glm::length(p.camera_w - d.bound_center_w) - d.bound_radius_m,
+            ChunkVertexSpacing(p.max_level));
+        const double d_split = d.e_l_m / (p.tau_px * p.cone_spread);
+        ++checked;
+        if (dist < d_split) ++wants_to_split;
+    }
+    // Not vacuous: there ARE sub-max-level leaves to have an opinion about.
+    CHECK(checked > 0u);
+    CHECK(wants_to_split == 0u);
 }

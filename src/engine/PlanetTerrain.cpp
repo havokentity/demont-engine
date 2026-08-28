@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace pt::engine {
 
@@ -279,7 +280,14 @@ bool PlanetTerrain::Update(const pt::planet::LodParams& lod,
     // 1074-chunk sets that way, which a chunk count nearly hid and the
     // residency digest made obvious.
     std::vector<TerrainChunkData> fresh;
-    baker_.Drain(fresh, 64);
+    // 64 per frame paces an interactive session, where a thousand-chunk
+    // drain in one frame would be a visible hitch. A settling round drains
+    // EVERYTHING instead, and that is a determinism requirement rather than
+    // a throughput one: a 64-chunk prefix of the pool's completion order is
+    // a wall-clock quantity, and every decision downstream of it -- which
+    // chunks become resident this round, and therefore which arena slot
+    // each one gets -- inherits that. See Settle() in the header.
+    baker_.Drain(fresh, settling_ ? std::numeric_limits<int>::max() : 64);
     for (auto& d : fresh) {
         tree_.NoteChunk(d);
         baked_[d.key] = std::move(d);
@@ -313,7 +321,12 @@ bool PlanetTerrain::Update(const pt::planet::LodParams& lod,
     // not eat the AS budget it is not responsible for.
     using clk = std::chrono::steady_clock;
     const auto t0 = clk::now();
-    const double budget_ms = std::max(cfg_.blas_budget_ms, 0.0);
+    // Unpaced while settling. Pacing decides how much of a round's work
+    // lands this round by consulting a clock, which would put wall time
+    // back into the residency answer through the same door the drain cap
+    // used. A settle is not rendering anything anyone is looking at, so
+    // there is no frame to protect.
+    const double budget_ms = settling_ ? 0.0 : std::max(cfg_.blas_budget_ms, 0.0);
     auto over_budget = [&]() {
         if (budget_ms <= 0.0) return false;
         const double ms = std::chrono::duration<double, std::milli>(
@@ -432,6 +445,69 @@ bool PlanetTerrain::Update(const pt::planet::LodParams& lod,
     prev_digest_ = digest;
     stats_.desired_digest = digest;
     return dirty;
+}
+
+std::uint64_t PlanetTerrain::PublishedSceneDigest() const {
+    // FNV-1a over the published scene in KEY order. resident_ is a
+    // std::map and instances_ / descriptors_ are built from it in that same
+    // walk, so the digest depends on the scene and not on the order it was
+    // assembled -- which is exactly the property under test.
+    //
+    // The raw vertex arena is deliberately NOT hashed. Chunk geometry is a
+    // pure function of the key and the elevation field, both of which are
+    // fixed for a session, so hashing 4 225 vertices per chunk would cost
+    // millions of mixes to restate what the key set already fixes. The slot
+    // is hashed instead, because the slot is where the arrival-order
+    // dependence actually lived.
+    auto mix = [](std::uint64_t h, std::uint64_t v) {
+        for (int b = 0; b < 8; ++b) {
+            h ^= (v >> (b * 8)) & 0xFFull;
+            h *= 1099511628211ull;
+        }
+        return h;
+    };
+    auto mix_f = [&mix](std::uint64_t h, float f) {
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &f, sizeof(bits));
+        return mix(h, bits);
+    };
+    std::uint64_t h = 1469598103934665603ull;
+    for (const auto& [key, r] : resident_) {
+        h = mix(h, key.face); h = mix(h, key.level);
+        h = mix(h, key.i);    h = mix(h, key.j);
+        h = mix(h, r.slot);   h = mix(h, r.mask);
+    }
+    for (const auto& inst : instances_) {
+        for (int t = 0; t < 12; ++t) h = mix_f(h, inst.transform[t]);
+        h = mix(h, inst.instance_id);
+    }
+    for (float f : descriptors_) h = mix_f(h, f);
+    return h;
+}
+
+bool PlanetTerrain::Settle(const pt::planet::LodParams& lod,
+                           const glm::dvec3& anchor, int max_rounds) {
+    settle_rounds_ = 0;
+    if (!Ready()) return true;
+    // Re-entrancy would nest two barriers on one bake pool and the inner
+    // one would clear `settling_` on the way out, quietly returning the
+    // outer rounds to paced, partially-drained behaviour.
+    if (settling_) return stats_.converged;
+
+    settling_ = true;
+    bool converged = false;
+    for (int r = 0; r < max_rounds; ++r) {
+        // Wait for the round the LAST Update requested. On the first
+        // iteration nothing has been asked for yet and this returns at
+        // once, which is correct: an empty request set is a settled one.
+        baker_.WaitIdle();
+        Update(lod, anchor);
+        settle_rounds_ = r + 1;
+        if (stats_.converged) { converged = true; break; }
+    }
+    settling_ = false;
+    stats_.scene_digest = PublishedSceneDigest();
+    return converged;
 }
 
 double PlanetTerrain::SurfaceHeight(const glm::dvec3& p_world, int level) const {

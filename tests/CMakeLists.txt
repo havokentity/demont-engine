@@ -1393,18 +1393,21 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # planet_aerial.cfg goes as high as the atmosphere is currently valid.
     #
     # DETERMINISM, VERIFIED RATHER THAN ASSUMED. Each fixture sets
-    # r_planet_lod_freeze 1 and pt_planet_settle, which hold the capture
-    # until the selector reaches a fixed point -- and "fixed point" is a
-    # stronger statement than it first looks. Three separate bugs stood
-    # between "the freeze cvar is set" and "two runs render the same
-    # pixels", and each was found by rendering twice and comparing rather
-    # than by reading the code:
+    # r_planet_lod_freeze 1 and pt_planet_settle_rounds, which drive the
+    # selector to its residency fixed point BEFORE the capture starts. Five
+    # separate bugs stood between "the freeze cvar is set" and "two runs
+    # render the same pixels", and every one was found by rendering twice
+    # and comparing rather than by reading the code. P4 (#258) found the
+    # first four:
     #
     #   * settle frames accumulated into the same buffer while residency
     #     was still growing, and the settle FRAME COUNT is wall-clock
     #     dependent -- so the capture averaged a run-specific number of
     #     run-specific intermediate geometries. 22% bad pixels between two
     #     identical runs. Settle frames now discard the accumulator.
+    #   * the settle advanced frame_index_, which seeds the sample
+    #     sequence, so two runs with identical geometry still started their
+    #     capture on different Monte Carlo samples. 8.4% bad pixels.
     #   * the LOD hysteresis consults the previous frame's leaf set, so the
     #     converged set depended on the order chunks arrived in, which is
     #     the order a worker pool finished them in. Hysteresis is suppressed
@@ -1413,104 +1416,154 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     #     the desired set was always one drain stale and convergence could
     #     be declared on a set chosen without the metrics that had just
     #     landed. Two runs settled on genuinely different 1128- and
-    #     1074-chunk sets. Draining first fixed it; requiring the residency
-    #     DIGEST to match the previous frame's, with the baker idle, makes
-    #     it airtight.
+    #     1074-chunk sets.
     #
-    # The digest is why that last one was findable at all: a chunk COUNT
-    # cannot distinguish two different sets of the same size, and 1128 vs
-    # 1128 looked like success. Three runs of each cell now agree on the
-    # digest exactly -- 3f4f417f3e74165d, a4a1525ddd40b4ab and
-    # cbd64b5c7c757227 -- and the settle frame count still varies, which is
-    # the point: the ANSWER is stable even though the path to it is not.
+    # #284 found the fifth, which was FOUR faults with one shape: the
+    # subsystem DETECTED convergence instead of GUARANTEEING it. Each was
+    # a place where an answer the capture depends on was allowed to be a
+    # function of how fast the machine ran, and then checked afterwards
+    # rather than made impossible.
     #
-    # Each fixture also keeps its residency clear of r_planet_chunk_budget.
-    # At the cap the selector raises tau by bisection to make the set fit,
-    # and the bisection's trial sizes depend on which metrics happen to be
-    # measured when it runs -- a determinism hole that has not been closed,
-    # only avoided here. Noted in r_planet_chunk_budget's docstring.
+    #   * the settle was a FRAME BUDGET raced against an asynchronous bake
+    #     pool. Rendering a frame does not make a chunk bake, so "wait up to
+    #     N frames" is a race between the frame rate and the bake rate. A
+    #     Debug build lost it on every single run -- 400 frames spent, 149 /
+    #     220 / 155 chunks resident on three consecutive captures, three
+    #     different images -- and a loaded Release machine lost it
+    #     occasionally, which is exactly the profile of a golden that passes
+    #     by luck. It is now a BARRIER: PlanetTerrain::Settle runs one bake
+    #     round per iteration, each round waiting for every requested chunk
+    #     to land, so the round count is a property of the quadtree and not
+    #     of the machine. These three cells converge in 14, 12 and 16
+    #     rounds, against a bound of 256.
+    #   * arena slots came off a free list in bake-arrival order, so the
+    #     same chunk got a different slot in every run. The desired digest
+    #     matched while the descriptor buffer did not, and the resulting
+    #     difference in BLAS creation order flipped the occasional
+    #     exactly-tied hit on a shared chunk edge. Draining a round
+    #     completely rather than 64 at a time makes the slot map fall out of
+    #     the key order.
+    #   * TerrainQuadtree::Balance inserted the children of a 2:1 split as
+    #     LEAVES without re-applying the split rule to them. A child whose
+    #     metric had arrived earlier is measured, so it never appeared in
+    #     Wanted() -- and Wanted() being empty is the whole convergence
+    #     signal. The selector could therefore stop on a set that still
+    #     wanted to split, and which one depended on how ragged the tree was
+    #     when Balance ran. Measured: one camera, one binary, metrics
+    #     agreeing on all 1214 common keys to the last bit, settling to 1128
+    #     chunks under one bake schedule and 912 under another. Balance now
+    #     descends into the children, so the converged set is closed under
+    #     the split rule -- which is what Converged() has always been read
+    #     as asserting. Asserted directly in pt_planet_terrain.
+    #   * whether the BARRIER FRAME ITSELF contributed a sample was a race.
+    #     UpdatePlanetTerrain runs before RenderFrame's loading-frame gate,
+    #     so with the async pipeline build or a CSG bake still in flight
+    #     that frame returns before the path-trace dispatch and contributes
+    #     nothing -- and otherwise it dispatches one sample at the held
+    #     frame_index_, which is then in the accumulator when the capture
+    #     starts. Both take a second or two, so which wins is wall clock.
+    #     This one survived the first 35 renders and appeared on the 36th,
+    #     as a mean delta of 1.21 spread evenly over every lit pixel and
+    #     zero in the sky -- a sample-count difference wearing the costume
+    #     of noise. Reproduced on demand by holding the barrier until the
+    #     pipelines were ready. The accumulator is now discarded again on
+    #     the first frame that COUNTS, so the capture is exactly the counted
+    #     frames whichever way the race goes.
     #
-    # FRAMES 32 rather than the default 64: the settle frames come on top
-    # of the budget and each of these takes 55-85 of them, so 64
-    # accumulation frames on top runs the cell close to its timeout on a
-    # loaded machine. With the geometry frozen, the floor at 32 is the
-    # ordinary path-tracer one.
+    # Two digests are logged at convergence, and the pair is the point. The
+    # DESIRED digest says two runs picked the same chunks; the SCENE digest
+    # (slot map, stitch masks, instance transforms, descriptor floats) says
+    # they also laid them out the same way. #284 was invisible to the first
+    # alone: three Release captures agreed on 3f4f417f3e74165d exactly and
+    # still produced three different PNGs.
+    #
+    #   planet_surface   desired 3f4f417f3e74165d  scene a3b3352959e2bf78
+    #   planet_aerial    desired a4a1525ddd40b4ab  scene 21c595c6dd7e60e8
+    #   planet_lod_seam  desired cbd64b5c7c757227  scene e0b3a025008e4f33
+    #
+    # The three desired digests are UNCHANGED from P4's, which is worth
+    # recording: the fixes removed the ways the selector could land
+    # somewhere else, they did not move where it lands.
+    #
+    # Residency stays clear of r_planet_chunk_budget 2048 -- 1128, 1806 and
+    # 1008 chunks. EnforceBudget was instrumented and observed never to run
+    # on any of the three, so the tau bisection plays no part in these
+    # cells. (P4 suspected it did; it does not. See r_planet_chunk_budget.)
+    #
+    # FRAMES 32 rather than the default 64: with the geometry frozen and the
+    # sample sequence pinned, the accumulator is a deterministic function of
+    # the frame count, so 32 is the ordinary path-tracer floor rather than a
+    # noise compromise. It also keeps three ~1500-chunk captures comfortably
+    # inside the cell timeout.
     #
     # ---- TOLERANCES ARE MEASURED, NOT COPIED FROM A NEIGHBOUR ----------
     #
     # A cell whose thresholds sit above its own signal reports PASS while
-    # comparing nothing, which is #252. Both numbers were measured on this
-    # host at these exact settings, with each render in an isolated working
-    # directory so archived cvars cannot leak between runs:
+    # comparing nothing, which is #252. Every number below was re-measured
+    # on this host after #284, with each render in an isolated working
+    # directory so archived cvars cannot leak between runs.
     #
-    #   RUN-TO-RUN NOISE (two identical runs), once the settle no longer
-    #   advances the sample sequence:
-    #     planet_surface   mean 0.000005  bad 0.000%   (max_delta 1.00)
-    #     planet_aerial    mean 0.000273  bad 0.000%   (max_delta 2.24)
-    #     planet_lod_seam  mean 0.000000  bad 0.000%   (max_delta 0.00)
+    #   RUN-TO-RUN NOISE: ZERO. Ten consecutive renders of each cell are
+    #   BYTE-IDENTICAL, in Debug and again in Release -- 60 renders, three
+    #   distinct MD5s. Also byte-identical across three trials of `ctest -j
+    #   4` with all 16 cores saturated by spinners, which is the condition
+    #   the old frame-budget settle lost under. There is no longer a noise
+    #   floor to size against on this host, which is why the
+    #   cross-configuration number below is doing the work instead.
     #
-    #   SIGNAL, feature deleted (r_planet_terrain 0):
+    #   DEBUG vs RELEASE, same host (the only same-host difference left):
+    #     planet_surface   max 0.0000  mean 0.000000   (pixel-identical)
+    #     planet_aerial    max 0.0000  mean 0.000000   (pixel-identical)
+    #     planet_lod_seam  max 1.7321  mean 0.000290
+    #   1.7321 is sqrt(3): one LSB on all three channels of one pixel.
+    #
+    #   SIGNAL, feature deleted (r_planet_terrain 0 -- confirmed to take
+    #   effect by the ABSENCE of "terrain online" in the run log, because
+    #   `--extra` silently losing to the fixture is a trap this file has
+    #   already been caught by once):
     #     planet_surface   mean  96.4     bad  99.6%
     #     planet_aerial    mean 280.1     bad 100.0%
     #     planet_lod_seam  mean 263.1     bad 100.0%
     #
     #   SIGNAL, real Earth deleted (r_planet_dem pointed at nothing, so the
-    #   fractal fallback stands in). This is the tighter and more specific
-    #   claim, because these goldens are pinned against ETOPO 2022 and not
-    #   merely against "some terrain":
+    #   fractal fallback stands in -- confirmed by "rendering a PROCEDURAL
+    #   body" in the log with "terrain online" still present). This is the
+    #   tighter and more specific claim, because these goldens are pinned
+    #   against ETOPO 2022 and not merely against "some terrain":
     #     planet_surface   mean 185.6     bad  99.9%
-    #     planet_aerial    mean 176.6     bad  99.5%
-    #     planet_lod_seam  mean  82.8     bad  98.3%
+    #     planet_aerial    mean 179.5     bad  99.5%
+    #     planet_lod_seam  mean  85.9     bad  98.5%
+    #
+    #   The goldens are not blank, so "deleting a feature changes it" is not
+    #   vacuous: mean luminance 133.6 / 164.5 / 179.9 over 0..255, minimum
+    #   49 / 53 / 70, and 149-184 distinct luminance levels each.
     #
     # So the thresholds are the MATRIX DEFAULTS (16 / 2 / 1), passed
     # explicitly rather than inherited so a reader can see they were chosen
-    # against a measurement. The largest run-to-run per-pixel delta is
-    # 2.24, which is below MAX_DELTA 16 and therefore classifies NO pixel
-    # as bad -- so FAIL_PERCENT 1 has the whole of its range as headroom,
-    # against a weakest signal of 98.3% bad. MEAN_DELTA 2 sits four orders
-    # of magnitude above the worst observed mean (0.000273) and 41x below
-    # the weakest signal (82.8).
+    # against a measurement:
     #
-    # The earlier, looser 6 / 3 pair was sized against a noise floor that
-    # turned out to be a bug rather than a floor; tightening to the
-    # defaults is what the fixed engine earns.
+    #   MAX_DELTA 16 is 9.2x the largest same-host per-pixel delta (1.7321).
+    #   It is NOT tightened towards that measurement on purpose: the only
+    #   GPU available here is one M4 Max, and the headroom exists for a
+    #   different driver's rounding and fma ordering -- the same reason
+    #   every other Metal cell in this file uses 16. Tightening against a
+    #   single-GPU sample would be less justified, not more.
+    #   FAIL_PERCENT 1 then has its whole range as headroom, because at
+    #   MAX_DELTA 16 no observed noise pixel is classified bad at all
+    #   (0.000%), against a weakest signal of 98.5% bad.
+    #   MEAN_DELTA 2 sits 6900x above the worst observed mean (0.000290)
+    #   and 43x below the weakest signal (85.9).
     #
-    # All six feature-deleted renders FAIL these thresholds and all
+    # All six feature-deleted renders FAIL these thresholds and all sixty
     # identical-run renders PASS them, checked against the committed PNGs.
     # Re-measure if a fixture's camera, resolution, exposure or frame count
     # changes: the margins are the point, not the numbers.
-    # NOT REGISTERED -- the terrain render is not yet reproducible, so these
-    # cells cannot be pinned honestly. Measured on this branch, same binary,
-    # same fixture, consecutive renders of planet_surface:
-    #
-    #     Debug   3 runs -> 3 distinct images
-    #     Release 3 runs -> 2 identical, the third divergent
-    #
-    # Release diverges less often, which is why the stability check above
-    # (mean 0.000005, bad 0.000%) passed -- it sampled the common case. The
-    # cause is most likely the residual recorded in PlanetTerrain.cpp: a
-    # capture sitting on the chunk-budget cap is not reproducible, because
-    # the tau bisection's trial sizes depend on which metrics had been
-    # measured when it ran. These fixtures were believed to keep clear of
-    # the cap; they do not, reliably.
-    #
-    # Pinning a nondeterministic render produces a cell that passes by luck,
-    # which is the failure this file spends several comments warning about.
-    # The fixtures, the PNGs and the measured thresholds above are all kept
-    # so that registering these is a one-line change once the render is
-    # reproducible. Tracked in the issue linked from #258.
-    #
-    # Terrain is NOT unverified in the meantime: pt_planet_terrain covers
-    # watertightness, seam equality and selector behaviour in 700 306
-    # deterministic assertions -- claims a golden PNG cannot settle anyway,
-    # per the comment at the top of this file.
-    #
-    # pt_add_golden_cell(SCENE planet_surface  BACKEND metal DENOISER off
-    #                    FRAMES 32 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
-    # pt_add_golden_cell(SCENE planet_aerial   BACKEND metal DENOISER off
-    #                    FRAMES 32 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
-    # pt_add_golden_cell(SCENE planet_lod_seam BACKEND metal DENOISER off
-    #                    FRAMES 32 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
+    pt_add_golden_cell(SCENE planet_surface  BACKEND metal DENOISER off
+                       FRAMES 32 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
+    pt_add_golden_cell(SCENE planet_aerial   BACKEND metal DENOISER off
+                       FRAMES 32 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
+    pt_add_golden_cell(SCENE planet_lod_seam BACKEND metal DENOISER off
+                       FRAMES 32 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
     # --- end Planetary P4 -------------------------------------------------
     pt_add_golden_cell(SCENE planet_horizon_clouds        BACKEND metal DENOISER off
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)

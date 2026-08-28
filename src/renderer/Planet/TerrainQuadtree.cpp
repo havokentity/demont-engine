@@ -158,12 +158,33 @@ void TerrainQuadtree::Balance(const LodParams& p) {
         if (to_split.empty()) return;
         for (const ChunkKey& k : to_split) {
             if (desired_.erase(k) == 0) continue;
-            for (int q = 0; q < 4; ++q) {
-                const ChunkKey c = k.Child(q);
-                desired_.insert(c);
-                const auto it = metrics_.find(c);
-                if (it == metrics_.end() || !it->second.known) wanted_.push_back(c);
-            }
+            // DESCEND into the children, do not merely insert them.
+            //
+            // Inserting them as leaves is what #284 finally came down to.
+            // A child produced here is a leaf only because the 2:1 rule
+            // needed its PARENT split -- nobody has asked whether the child
+            // itself is within tau of the camera. If it is not, the set that
+            // comes out is not a fixed point of the split rule, and
+            // `wanted_` cannot say so: wanted_ collects UNMEASURED leaves,
+            // and a child whose metric arrived rounds ago is measured. So
+            // Converged() returned true on a set that still wanted to split,
+            // and WHICH such set depended on how ragged the tree happened to
+            // be when Balance ran -- i.e. on the order the bake pool
+            // finished in.
+            //
+            // Measured on planet_surface: the same camera, the same
+            // bit-identical metrics (1 214 of 1 214 keys agreeing to the
+            // last bit), settling to 1 128 chunks under one drain schedule
+            // and 912 under another. Node (2, 11, 1088, 1657) sat at
+            // d = 22 690 m against d_split = 24 684 m -- a clear split by
+            // the rule -- and stayed a leaf in the second, because Balance
+            // had put it there and nothing revisited it.
+            //
+            // Descend re-applies the rule the whole way down, so the set
+            // after Balance is closed under splitting. That makes
+            // "wanted_ is empty" mean what the capture gate has always
+            // assumed it meant.
+            for (int q = 0; q < 4; ++q) Descend(k.Child(q), p, true);
         }
     }
 }
@@ -322,6 +343,12 @@ void AsyncChunkBaker::Stop() {
     if (workers_.empty()) return;
     stop_.store(true, std::memory_order_release);
     cv_.notify_all();
+    // WaitIdle's predicate short-circuits on stop_, but only if something
+    // wakes it to re-evaluate. Both callers happen to be the render thread
+    // today, so no barrier can actually be in flight here -- notifying
+    // anyway costs nothing and keeps the shutdown correct if that stops
+    // being true.
+    idle_cv_.notify_all();
     for (auto& t : workers_) if (t.joinable()) t.join();
     workers_.clear();
     {
@@ -347,6 +374,9 @@ void AsyncChunkBaker::SetSources(const ElevationField* field, const PlanetSite& 
         std::lock_guard lk(out_mu_);
         done_.clear();
     }
+    // Emptying the queue can satisfy a waiting barrier's predicate, and a
+    // condition variable only re-checks when someone signals it.
+    idle_cv_.notify_all();
 }
 
 void AsyncChunkBaker::Request(const std::vector<ChunkKey>& keys) {
@@ -371,9 +401,26 @@ int AsyncChunkBaker::Drain(std::vector<TerrainChunkData>& out, int max) {
 }
 
 bool AsyncChunkBaker::Idle() const {
-    if (in_flight_.load(std::memory_order_acquire) != 0) return false;
+    // "Idle" has to mean NOTHING LEFT TO DELIVER, not merely "no worker is
+    // busy". Results sit in done_ until someone drains them, so a pool that
+    // has finished a 1 128-chunk round and handed back only the first 64 is
+    // quiet but very far from settled -- and PlanetTerrain::Update feeds
+    // this straight into `stats_.converged`, which is what a golden capture
+    // stops on. Omitting done_ let convergence be declared against a metric
+    // map that was still hundreds of measurements short: measured 912
+    // chunks and desired digest 6d5043b793ee8da6, against the true fixed
+    // point's 1 128 and 3f4f417f3e74165d.
+    //
+    // Queue and claim under mu_ for the reason in WorkerLoop: sampling
+    // in_flight_ outside it can observe a state the pool was never in, a
+    // worker having popped the last key but not yet claimed it reading as
+    // empty-and-zero. Lock order is mu_ then out_mu_, and nothing in this
+    // class ever takes them the other way round.
     std::lock_guard lk(mu_);
-    return queue_.empty();
+    if (!queue_.empty()) return false;
+    if (in_flight_.load(std::memory_order_acquire) != 0) return false;
+    std::lock_guard out_lk(out_mu_);
+    return done_.empty();
 }
 
 void AsyncChunkBaker::WorkerLoop() {
@@ -393,17 +440,43 @@ void AsyncChunkBaker::WorkerLoop() {
             field = field_;
             site  = site_;
             gen   = generation_.load(std::memory_order_acquire);
+            // CLAIM THE JOB UNDER THE LOCK. Incrementing after releasing mu_
+            // leaves a window in which the key has left queue_ but has not
+            // yet been counted in flight, so a concurrent Idle() sees an
+            // empty queue and a zero count and reports "nothing pending"
+            // while a bake is about to start. Frame-paced streaming never
+            // noticed -- it re-asks every frame -- but WaitIdle() is a
+            // barrier and would return one bake early, which is exactly the
+            // kind of "converged" that is detected rather than guaranteed.
+            in_flight_.fetch_add(1, std::memory_order_acq_rel);
         }
-        if (field == nullptr) continue;
-        in_flight_.fetch_add(1, std::memory_order_acq_rel);
-        TerrainChunkData data;
-        BuildTerrainChunk(key, *field, site, data);
-        if (generation_.load(std::memory_order_acquire) == gen) {
-            std::lock_guard lk(out_mu_);
-            done_.push_back(std::move(data));
+        if (field != nullptr) {
+            TerrainChunkData data;
+            BuildTerrainChunk(key, *field, site, data);
+            if (generation_.load(std::memory_order_acquire) == gen) {
+                std::lock_guard lk(out_mu_);
+                done_.push_back(std::move(data));
+            }
         }
-        in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+        // Retire the claim and wake any barrier. The decrement happens under
+        // mu_ so a waiter cannot evaluate its predicate between the
+        // decrement and the notify and then sleep through the wake-up.
+        {
+            std::lock_guard lk(mu_);
+            in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        idle_cv_.notify_all();
     }
+}
+
+void AsyncChunkBaker::WaitIdle() {
+    if (workers_.empty()) return;
+    std::unique_lock lk(mu_);
+    idle_cv_.wait(lk, [this] {
+        return stop_.load(std::memory_order_acquire) ||
+               (queue_.empty() &&
+                in_flight_.load(std::memory_order_acquire) == 0);
+    });
 }
 
 }  // namespace pt::planet

@@ -246,20 +246,26 @@ namespace cvar {
             "after first frame have no effect. NOT CVAR_ARCHIVE -- "
             "per-invocation.",
             CVAR_NONE);
-    PT_CVAR(pt_planet_settle, "600",
-            "Maximum frames a smoke capture waits for streamed terrain to "
-            "converge on a residency set before it starts counting frames "
-            "against pt_smoke_frames. Terrain chunks are baked "
-            "asynchronously and the quadtree descends one level per "
-            "completed bake round, so without this the residency at frame N "
-            "is a function of wall clock and no planet golden could ever "
-            "reproduce. Settle frames are held exactly like loading frames: "
-            "the world does not advance and the frame does not count. 0 "
-            "disables the wait (useful to SEE the nondeterminism). If the "
-            "budget runs out the engine logs a warning saying the capture is "
-            "not deterministic rather than failing silently. No effect "
-            "outside smoke mode -- an interactive session never stops "
-            "counting frames.",
+    PT_CVAR(pt_planet_settle_rounds, "256",
+            "Maximum SELECTOR ROUNDS a smoke capture spends driving streamed "
+            "terrain to its residency fixed point before it starts counting "
+            "frames against pt_smoke_frames. One round is: wait for every "
+            "requested bake to land, drain all of them, re-select, build, "
+            "publish. Because the quadtree cannot descend past a node whose "
+            "e_L is unmeasured, a round consumes exactly one level of the "
+            "descent -- so the count is bounded by r_planet_lod_max_level "
+            "plus the drain batching, and is a property of the TREE rather "
+            "than of the machine. 0 disables the wait (useful to SEE the "
+            "nondeterminism). If the bound is hit the engine logs a warning "
+            "saying the capture is not deterministic rather than failing "
+            "silently. No effect outside smoke mode -- an interactive "
+            "session never blocks on a bake. RENAMED from pt_planet_settle "
+            "(#284), which counted RENDERED FRAMES and so was a race "
+            "between the frame rate and the bake rate rather than a bound "
+            "on anything: a Debug build exhausted 400 of them every run and "
+            "captured a partial planet. Rounds and frames are not "
+            "interchangeable units, so the name had to move with the "
+            "meaning.",
             CVAR_NONE);
     PT_CVAR(pt_smoke_skip_prim_seed, "0",
             "1 = skip the default 3-sphere + ground-plane analytic-prim "
@@ -1990,15 +1996,19 @@ namespace cvar {
             "does NOT converge, because a merged parent violates the 2:1 "
             "restriction and the re-balance splits it straight back. "
             "Changing this restarts the terrain streamer.\n"
-            "KNOWN LIMIT: a capture that sits ON the cap is not guaranteed "
-            "reproducible. The bisection's trial set sizes depend on which "
-            "chunk metrics happen to have been measured when it runs, and "
-            "chunks are baked asynchronously, so two runs can settle at "
-            "different effective tau. r_planet_lod_freeze pins the set once "
-            "converged but cannot make the convergence itself unique. The "
-            "planet golden fixtures avoid this by keeping their residency "
-            "clear of the cap; a fix would have to make the bisection "
-            "refuse a tau whose trial set contains unmeasured nodes.",
+            "ON THE CAP, the effective tau is a function of the measurement "
+            "frontier as well as of the camera: the bisection's trial sets "
+            "treat an unmeasured node as a leaf, so a trial run early in the "
+            "descent under-counts. Under the capture settle barrier (#284) "
+            "that frontier is itself deterministic -- rounds advance by "
+            "completed bake rounds, not by elapsed frames -- so the tau two "
+            "runs pick is the same tau, which is what a golden needs. It is "
+            "still not the tau a fully-informed bisection would pick, and "
+            "that remains worth closing if a fixture ever needs to sit on "
+            "the cap. None currently does: r_planet_chunk_budget 2048 "
+            "against measured sets of 1 128, 1 806 and 1 008, and "
+            "EnforceBudget was instrumented and observed never to run on any "
+            "of the three.",
             CVAR_ARCHIVE);
     PT_CVAR(r_planet_blas_budget_ms, "2.0",
             "Per-frame wall-clock budget for terrain acceleration-structure "
@@ -2019,7 +2029,7 @@ namespace cvar {
             "depends on wall clock and no golden would ever reproduce. "
             "Mirrors the freeze_sims_for_capture gate the physics / ocean / "
             "SPH subsystems already use. Pair it with the settle wait "
-            "(pt_planet_settle) so the freeze happens on a CONVERGED set "
+            "(pt_planet_settle_rounds) so the freeze happens on a CONVERGED set "
             "rather than on whatever had streamed in by then.",
             CVAR_ARCHIVE);
     PT_CVAR(r_planet_workers,        "4",
@@ -6758,6 +6768,12 @@ void Engine::UpdatePlanetTerrain() {
         } else {
             planet_terrain_.reset();
         }
+        // A fresh streamer has an empty quadtree, so the capture barrier
+        // has to run again. Without this a mid-run r_planet_terrain toggle
+        // would capture whatever the new streamer managed on its first
+        // frame -- the exact failure the barrier exists to remove.
+        planet_settled_ = false;
+        planet_settle_flush_ = false;
         accum_dirty_ = true;
     }
     if (!planet_terrain_ || !planet_terrain_->Ready()) return;
@@ -6813,49 +6829,79 @@ void Engine::UpdatePlanetTerrain() {
         PublishSceneTlas();
     }
 
-    // Capture settle gate. Only ever engages in smoke mode; an
-    // interactive session must never stop counting frames waiting for a
-    // planet to finish streaming.
-    int settle_budget = 0;
-    if (auto* v = C.FindCVar("pt_planet_settle")) settle_budget = v->GetInt();
-    const bool want_settle = smoke_fixed_dt_active_ && settle_budget > 0;
-    if (want_settle && !planet_terrain_->Stats().converged &&
-        planet_settle_frames_ < static_cast<std::uint32_t>(settle_budget)) {
-        ++planet_settle_frames_;
+    // --- Capture settle barrier (#284) ------------------------------------
+    //
+    // Only ever engages in smoke mode; an interactive session must never
+    // stop to wait for a planet to finish streaming.
+    //
+    // This used to be a gate rather than a barrier: the engine rendered
+    // ordinary frames, checked `converged` after each one, and gave up
+    // after pt_planet_settle of them. Rendering frames does not MAKE chunks
+    // bake, so that was a race between the frame rate and the bake rate,
+    // and the loser was whoever the machine happened to be. Debug lost it
+    // on every run -- 400 frames spent, 149 / 220 / 155 chunks resident on
+    // three consecutive captures of planet_surface, three different images
+    // -- and Release lost it occasionally. Both cases ended in a warning
+    // that the capture was not deterministic, and then captured anyway.
+    //
+    // PlanetTerrain::Settle drives the selector to its fixed point instead,
+    // one bake round per iteration, and the round count is a property of
+    // the quadtree rather than of the clock. The budget below is now a
+    // bound on ROUNDS -- a safety net against a scene that genuinely cannot
+    // converge, not a schedule that a slow machine can exhaust.
+    int settle_rounds = 0;
+    if (auto* v = C.FindCVar("pt_planet_settle_rounds")) settle_rounds = v->GetInt();
+    const bool want_settle = smoke_fixed_dt_active_ && settle_rounds > 0;
+    if (want_settle && !planet_settled_) {
+        const bool ok = planet_terrain_->Settle(lod, world_frame_.anchor,
+                                                settle_rounds);
+        planet_settled_ = true;
+        // The frame the barrier ran in does not count against the smoke
+        // budget and does not advance the sample sequence: it observed the
+        // world mid-settle, and `frame_index_` seeds the path tracer's
+        // sample hash. Same contract as a loading frame.
         planet_settling_ = true;
-        // Throw away the accumulator on every settle frame, so the capture
-        // that follows starts from a clean slate against the FINAL frozen
-        // geometry.
-        //
-        // Without this the settle frames accumulate into the same buffer
-        // while the residency set is still growing, and the number of
-        // settle frames is itself wall-clock dependent (55, 57 and 58 on
-        // three consecutive runs of planet_surface) -- so the captured
-        // image was a blend of a run-specific number of run-specific
-        // intermediate geometries. Two identical runs differed by 22% bad
-        // pixels on planet_aerial. This is the other half of the freeze
-        // gate: pinning the residency set is worthless if the frames
-        // rendered on the way to it are still in the average.
+        // Discard the accumulator so the capture starts clean against the
+        // FINAL frozen geometry rather than blending the intermediate one
+        // this frame began with. The flush flag repeats the discard on the
+        // first frame that COUNTS, because this frame may or may not have
+        // reached the dispatch -- see planet_settle_flush_ in Engine.h.
         accum_dirty_ = true;
-        if (planet_settle_frames_ == static_cast<std::uint32_t>(settle_budget)) {
-            // Report rather than hang: a scene that cannot converge inside
-            // its budget produces a capture that is NOT deterministic, and
-            // that has to be visible in the log rather than inferred from a
-            // flaky diff later.
+        planet_settle_flush_ = true;
+        PublishSceneTlas();
+        if (ok) {
+            // BOTH digests, because neither alone is the claim. The desired
+            // digest says two runs picked the same chunks; the scene digest
+            // says they also laid them out the same way in the arena, which
+            // is what #284 turned out to hinge on.
+            LOG_INFO("planet: residency converged after {} settle round(s) "
+                     "({} chunks resident, desired {:016x}, scene {:016x}, "
+                     "{} BLAS builds)",
+                     planet_terrain_->SettleRounds(),
+                     planet_terrain_->Stats().resident,
+                     planet_terrain_->Stats().desired_digest,
+                     planet_terrain_->Stats().scene_digest,
+                     planet_terrain_->Stats().blas_builds);
+        } else {
+            // Report rather than hang. Unlike the old frame budget this
+            // should be unreachable for a well-formed scene: a round
+            // consumes a level of the descent, so the count is bounded by
+            // r_planet_lod_max_level and the drain batching, neither of
+            // which moves with machine speed.
             LOG_WARN("planet: residency did not converge within "
-                     "pt_planet_settle={} frames ({} resident / {} desired, "
+                     "pt_planet_settle_rounds={} ({} resident / {} desired, "
                      "{} pending) -- this capture is NOT deterministic",
-                     settle_budget, planet_terrain_->Stats().resident,
+                     settle_rounds, planet_terrain_->Stats().resident,
                      planet_terrain_->Stats().desired,
                      planet_terrain_->Stats().pending_bakes);
         }
     } else {
-        if (planet_settling_) {
-            LOG_INFO("planet: residency converged after {} settle frame(s) "
-                     "({} chunks resident, digest {:016x}, {} BLAS builds)",
-                     planet_settle_frames_, planet_terrain_->Stats().resident,
-                     planet_terrain_->Stats().desired_digest,
-                     planet_terrain_->Stats().blas_builds);
+        if (planet_settle_flush_) {
+            // First frame after the barrier, and the first one that counts.
+            // Throw away whatever the barrier frame did or did not leave in
+            // the accumulator, so the capture is exactly the counted frames.
+            accum_dirty_ = true;
+            planet_settle_flush_ = false;
         }
         planet_settling_ = false;
     }
