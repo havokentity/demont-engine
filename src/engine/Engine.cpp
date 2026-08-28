@@ -38,6 +38,9 @@
 #include "../physics/PhysicsSystem.h"
 #include "../physics/SmokeSPH.h"
 #include "../physics/OceanFFT.h"   // Wave 8 (#25) FFT ocean surface
+// #259 / #133 Phase 2: the push layout + five-pass sequence for
+// shaders/OceanCascades.slang, shared with tests/pt_ocean_gpu_test.cpp.
+#include "../physics/OceanCascadeDispatch.h"
 #include "../rhi/CommandBuffer.h"
 #include "../rhi/Device.h"
 
@@ -510,6 +513,24 @@ namespace cvar {
             "displaced heightfield off any MAT_WATER plane. Metal + Vulkan "
             "only -- the Software backend's hand-written CPU tracer ignores "
             "the ocean textures and renders the flat analytic water plane.",
+            CVAR_ARCHIVE);
+    // --- #259 / #133 Phase 2: the cascades on the GPU ---------------------
+    PT_CVAR(r_ocean_gpu, "1",
+            "Solve the PLANETARY ocean cascades (r_planet_ocean 1) in the "
+            "shaders/OceanCascades.slang compute pre-pass instead of on the "
+            "CPU (#259, #133 Phase 2). 1 = GPU when the backend can host "
+            "the pipeline, 0 = the pt::ocean::OceanFFT host solver. The "
+            "host solver stays the reference implementation either way -- "
+            "it builds the seeded Phillips base spectrum the GPU pass "
+            "consumes, it is what tests/pt_ocean_fft_test.cpp pins, and it "
+            "is the automatic fallback on Software (no compute pipelines) "
+            "and Vulkan (the shared descriptor-set layout does not declare "
+            "this kernel's bindings yet). Measured on an M4 Max at "
+            "r_ocean_grid_size 256, the CPU path costs 15.6 ms/frame of "
+            "single-threaded solve + 6 MB of upload; see "
+            "tests/pt_ocean_gpu_test.cpp for the CPU-vs-GPU agreement "
+            "bound. Has NO effect on the single-tile MAT_WATER plane ocean "
+            "(r_planet_ocean 0), which is CPU-solved either way.",
             CVAR_ARCHIVE);
     PT_CVAR(r_ocean_wind_speed, "12.0",
             "Ocean wind speed in m/s (#25). Drives the Phillips "
@@ -3404,6 +3425,15 @@ void Engine::TearDownDevice() {
             if (ocean_normal_tex_id_[i] != 0)
                 device_->DestroyTexture(pt::rhi::TextureHandle{ocean_normal_tex_id_[i]});
         }
+        // --- #259 / #133 Phase 2: the GPU cascade solver's buffers ---------
+        if (ocean_gpu_h0_buf_id_ != 0)
+            device_->DestroyBuffer(pt::rhi::BufferHandle{ocean_gpu_h0_buf_id_});
+        if (ocean_gpu_scratch_buf_id_ != 0)
+            device_->DestroyBuffer(pt::rhi::BufferHandle{ocean_gpu_scratch_buf_id_});
+        if (ocean_gpu_foam_buf_id_ != 0)
+            device_->DestroyBuffer(pt::rhi::BufferHandle{ocean_gpu_foam_buf_id_});
+        if (ocean_gpu_reduce_buf_id_ != 0)
+            device_->DestroyBuffer(pt::rhi::BufferHandle{ocean_gpu_reduce_buf_id_});
         // --- end Wave 8 ocean ------------------------------------------------
         if (denoise_color_tex_id_    != 0) device_->DestroyTexture(pt::rhi::TextureHandle{denoise_color_tex_id_});
         if (depth_tex_id_            != 0) device_->DestroyTexture(pt::rhi::TextureHandle{depth_tex_id_});
@@ -3511,6 +3541,25 @@ void Engine::TearDownDevice() {
     // so it has to be forgotten with the handles or EnsureOceanUploaded
     // would think a fresh device already had the right texture.
     ocean_tex_cascades_  = 0;
+    ocean_tex_ring_      = 0;
+    // --- #259 / #133 Phase 2 -----------------------------------------------
+    // The GPU solver's buffers and its pipeline belong to the device that
+    // is going away. Forgetting the buffer shape and the uploaded spectrum
+    // revisions is what makes EnsureOceanGpuResources rebuild on the next
+    // device instead of binding handles that no longer exist; the foam
+    // accumulator restarts from zero, which is the same thing a grid-size
+    // change does and is the honest state for a fresh device.
+    ocean_gpu_pipeline_id_    = 0;
+    ocean_gpu_h0_buf_id_      = 0;
+    ocean_gpu_scratch_buf_id_ = 0;
+    ocean_gpu_foam_buf_id_    = 0;
+    ocean_gpu_reduce_buf_id_  = 0;
+    ocean_gpu_buf_grid_       = 0;
+    ocean_gpu_buf_cascades_   = 0;
+    for (int i = 0; i < 3; ++i) ocean_gpu_spectrum_rev_[i] = 0u;
+    ocean_gpu_pending_        = false;
+    ocean_gpu_owns_field_     = false;
+    ocean_gpu_last_t_         = -1.0;
     // --- end Wave 8 ocean -------------------------------------------------
     denoise_color_tex_id_    = 0;
     depth_tex_id_            = 0;
@@ -6287,6 +6336,13 @@ void Engine::EnsurePipelineHandles() {
     // run compute pipelines anyway.
     resolve(clouds_raymarch_pipeline_id_,  "clouds_raymarch");
     resolve(clouds_composite_pipeline_id_, "clouds_composite");
+    // Planetary P5 (#259) / #133 Phase 2: the ocean cascade FFT pre-pass.
+    // Metal-only at this scope -- VulkanDevice's shared descriptor-set
+    // layout does not declare bindings 40..45, and adding them is a change
+    // no Vulkan device in this arc has ever executed (#290). Software
+    // returns a non-zero id for any name, so OceanGpuAvailable() gates on
+    // the BACKEND as well as on this id.
+    resolve(ocean_gpu_pipeline_id_, "ocean_cascades");
     // SIGMA shadow denoiser (issue #115). Metal-only at MVP scope;
     // r_shadow_demod gate collapses to "no SIGMA" on Vulkan.
     resolve(sigma_shadow_pipeline_id_, "sigma_shadow");
@@ -8080,6 +8136,15 @@ void Engine::RenderFrame() {
     }
 
     auto* cb = device_->AcquireCommandBuffer();
+    // --- #259 / #133 Phase 2: the ocean cascade pre-pass -------------------
+    // FIRST in the frame's command buffer, before PathTrace's pipeline is
+    // bound. Two reasons it cannot go anywhere else: BindComputePipeline
+    // clears every staged resource bind on Metal, so slipping another
+    // pipeline in after PathTrace's binds would wipe them; and PathTrace
+    // READS the field this pass writes, so it has to be behind it on the
+    // GPU timeline. Elided entirely (one bool test) unless
+    // StepOceanCascades armed it this frame.
+    DispatchOceanCascades(cb);
     cb->BindComputePipeline(pt::rhi::PipelineHandle{pathtrace_pipeline_id_});
     cb->BindStorageTexture(0, fc.swapchain_image);
     cb->BindStorageTexture(1, pt::rhi::TextureHandle{accum_texture_id_});
@@ -24071,6 +24136,13 @@ void Engine::StepOcean(float dt) {
         ocean_cascade_sigma2_[0] = 0.0;
         ocean_cascade_sigma2_[1] = 0.0;
         ocean_cascade_sigma2_[2] = 0.0;
+        // The legacy single-tile MAT_WATER ocean is CPU-solved, full stop.
+        // r_ocean_gpu is about the planetary cascades: the flat-plane path
+        // has one tile, no atlas and no metadata row, and moving it would
+        // regenerate ocean_fft / ocean_foam / water_pool for no gain.
+        ocean_gpu_owns_field_ = false;
+        ocean_gpu_pending_    = false;
+        ocean_gpu_last_t_     = -1.0;
         ocean_->Update(ocean_time_);
         ocean_max_disp_y_ = ocean_->MaxDisplacementY();
     }
@@ -24185,36 +24257,131 @@ void Engine::StepOceanCascades(double t_seconds, std::uint32_t grid) {
     // -- is precisely what oceanBrdfAlpha2 puts into the BRDF at ZERO cone
     // width. The two halves are complementary by construction rather than by
     // agreement, and that is the whole handover.
-    const double lambda_bot = OceanBandLoM(kOceanCascades - 1, grid);
-    const double lambda_top = kOceanCascadePeriodM[0];
-    const double resolved_fraction = pt::ocean::SlopeVarianceFractionInBand(
-        lambda_bot, lambda_top, static_cast<double>(base.wind_speed));
-    const double target_sigma2 =
-        pt::ocean::CoxMunkMeanSquareSlope(static_cast<double>(base.wind_speed)) *
-        resolved_fraction;
-    double raw_sigma2 = 0.0;
-    for (int c = 0; c < kOceanCascades; ++c) {
-        auto& s = ocean_cascades_[static_cast<std::size_t>(c)];
-        s->MutableConfig().amplitude = 1.0f;
-        s->EnsureSpectrum();
-        raw_sigma2 += s->SlopeVarianceAbove(0.0);
+    // ...AND IT IS SOLVED ONCE PER SPECTRUM, NOT ONCE PER FRAME. The answer
+    // depends on {grid, wind, wind direction, gravity, seed} and on nothing
+    // else -- every other input to a cascade's spectrum (its tile period,
+    // its band edges) is derived from the grid through the partition above.
+    // Re-deriving it every frame meant SIX seeded mt19937 sweeps over grid^2
+    // cells per frame (one at A = 1 and one at the solved A, per cascade)
+    // for a number that cannot have moved. The cache is bit-exact rather
+    // than approximately equal, because H0 is a deterministic function of
+    // the config: the spectrum the cache leaves in place IS the spectrum the
+    // rebuild would have produced, from the same seed, in the same order.
+    const OceanAmpKey key{grid, base.wind_speed, base.wind_dir_rad,
+                          base.gravity, base.seed};
+    if (!ocean_amp_valid_ || !(key == ocean_amp_key_)) {
+        const double lambda_bot = OceanBandLoM(kOceanCascades - 1, grid);
+        const double lambda_top = kOceanCascadePeriodM[0];
+        const double resolved_fraction = pt::ocean::SlopeVarianceFractionInBand(
+            lambda_bot, lambda_top, static_cast<double>(base.wind_speed));
+        const double target_sigma2 =
+            pt::ocean::CoxMunkMeanSquareSlope(
+                static_cast<double>(base.wind_speed)) * resolved_fraction;
+        double raw_sigma2 = 0.0;
+        for (int c = 0; c < kOceanCascades; ++c) {
+            auto& s = ocean_cascades_[static_cast<std::size_t>(c)];
+            s->MutableConfig().amplitude = 1.0f;
+            s->EnsureSpectrum();
+            raw_sigma2 += s->SlopeVarianceAbove(0.0);
+        }
+        ocean_amp_ = (raw_sigma2 > 0.0)
+                         ? static_cast<float>(target_sigma2 / raw_sigma2)
+                         : 0.0f;
+        for (int c = 0; c < kOceanCascades; ++c) {
+            auto& s = ocean_cascades_[static_cast<std::size_t>(c)];
+            s->MutableConfig().amplitude = ocean_amp_;
+            s->EnsureSpectrum();
+            ocean_amp_sigma2_[c] = s->SlopeVarianceAbove(0.0);
+        }
+        ocean_amp_key_   = key;
+        ocean_amp_valid_ = true;
+    } else {
+        // Belt and braces: the amplitude is cached, but EnsureSpectrum is
+        // still called so a config field the key does not carry cannot
+        // leave a stale spectrum behind. It is a comparison, not a rebuild,
+        // whenever the key really was complete.
+        for (int c = 0; c < kOceanCascades; ++c) {
+            auto& s = ocean_cascades_[static_cast<std::size_t>(c)];
+            s->MutableConfig().amplitude = ocean_amp_;
+            s->EnsureSpectrum();
+        }
     }
-    const float amp = (raw_sigma2 > 0.0)
-                          ? static_cast<float>(target_sigma2 / raw_sigma2)
-                          : 0.0f;
-
+    for (int c = 0; c < kOceanCascades; ++c) {
+        ocean_cascade_sigma2_[c] = ocean_amp_sigma2_[c];
+    }
+    // --- WHO RUNS THE PER-FRAME WORK ---------------------------------------
+    // Everything above is the spectrum, and the spectrum is the host's.
+    // What follows -- the time evolution, the five spectra per cascade, the
+    // fifteen inverse FFTs, the pack, the normals and the foam -- is the
+    // 15.6 ms, and it goes to the GPU when there is a GPU that can take it.
+    const bool gpu = OceanGpuAvailable() &&
+                     EnsureOceanGpuResources(grid,
+                         static_cast<std::uint32_t>(kOceanCascades));
     double max_h = 0.0;
-    for (int c = 0; c < kOceanCascades; ++c) {
-        auto& s = ocean_cascades_[static_cast<std::size_t>(c)];
-        s->MutableConfig().amplitude = amp;
-        s->Update(t_seconds);
-        ocean_cascade_sigma2_[c] = s->SlopeVarianceAbove(0.0);
-        max_h += static_cast<double>(s->MaxDisplacementY());
+    if (gpu) {
+        UploadOceanGpuSpectrum(grid,
+                               static_cast<std::uint32_t>(kOceanCascades));
+        // The two scalars the foam model needs that are transcendental
+        // functions of frame state rather than of the field. Evaluating
+        // them here rather than in the kernel keeps std::pow and the
+        // smoothstep out of the CPU-vs-GPU difference entirely, so the
+        // measured disagreement is the FFT's and only the FFT's.
+        float dt = (ocean_gpu_last_t_ >= 0.0)
+                       ? static_cast<float>(t_seconds - ocean_gpu_last_t_)
+                       : 0.0f;
+        if (dt < 0.0f) dt = 0.0f;
+        ocean_gpu_last_t_ = t_seconds;
+        const float persistence = std::clamp(base.foam_persistence, 0.0f, 0.999f);
+        ocean_gpu_decay_ = (persistence > 0.0f)
+                               ? std::pow(persistence, dt * 60.0f)
+                               : 0.0f;
+        constexpr float kWhitecapOnsetMps = 7.0f;
+        constexpr float kWhitecapWidthMps = 5.0f;
+        float wind_cov = (base.wind_speed -
+                          (kWhitecapOnsetMps - kWhitecapWidthMps)) /
+                         (2.0f * kWhitecapWidthMps);
+        wind_cov = std::clamp(wind_cov, 0.0f, 1.0f);
+        wind_cov = wind_cov * wind_cov * (3.0f - 2.0f * wind_cov);
+        wind_cov *= std::max(base.foam_coverage, 0.0f);
+        ocean_gpu_wind_cov_ = std::clamp(wind_cov, 0.0f, 1.0f);
+
+        ocean_gpu_t_        = t_seconds;
+        ocean_gpu_lambda_   = std::max(base.choppiness, 0.0f);
+        ocean_gpu_foam_thr_ = base.foam_threshold;
+        ocean_gpu_foam_amt_ = std::max(base.foam_amount, 0.0f);
+        ocean_gpu_gravity_  = base.gravity;
+        ocean_gpu_pending_    = true;
+        ocean_gpu_owns_field_ = true;
+        // ocean_max_disp_y_ is deliberately NOT set here. On this path the
+        // peak crest only exists after the reduce pass has run, and it
+        // reaches the shader through the atlas metadata row instead of
+        // through ocean_params0.w -- see DispatchOceanCascades. The stale
+        // ocean_params0.w that leaves behind is unreachable: it feeds only
+        // oceanRayMarch, the FLAT-plane march, and PathTrace takes that
+        // branch only when planet_ocean.x == 0, which is exactly when this
+        // code did not run.
+    } else {
+        ocean_gpu_owns_field_ = false;
+        ocean_gpu_pending_    = false;
+        // A later switch back to the GPU solver must re-seed its dt the way
+        // a first frame does, or the foam trail would decay by however long
+        // the CPU path ran. (Flipping r_ocean_gpu at runtime does leave one
+        // transient either way: whichever solver was idle has a stale
+        // last-frame time and a stale foam accumulator, so the whitecap
+        // trail restarts. It is a debug switch, the transient is one frame,
+        // and the alternative is keeping both solvers warm -- which is the
+        // 15.6 ms this phase exists to stop paying.)
+        ocean_gpu_last_t_     = -1.0;
+        for (int c = 0; c < kOceanCascades; ++c) {
+            auto& s = ocean_cascades_[static_cast<std::size_t>(c)];
+            s->Update(t_seconds);
+            max_h += static_cast<double>(s->MaxDisplacementY());
+        }
+        // The band the ray-march brackets has to clear the SUM of the
+        // cascades' crests, not any one of them -- they are independent
+        // fields and their peaks can coincide.
+        ocean_max_disp_y_ = static_cast<float>(max_h);
     }
-    // The band the ray-march brackets has to clear the SUM of the cascades'
-    // crests, not any one of them -- they are independent fields and their
-    // peaks can coincide.
-    ocean_max_disp_y_ = static_cast<float>(max_h);
 
     // THE SLOPE BUDGET, reported rather than assumed. The handover splits a
     // measured constant between geometry and BRDF, so the one thing worth
@@ -24234,18 +24401,218 @@ void Engine::StepOceanCascades(double t_seconds, std::uint32_t grid) {
             static_cast<double>(base.wind_speed));
         const double geom = ocean_cascade_sigma2_[0] + ocean_cascade_sigma2_[1] +
                             ocean_cascade_sigma2_[2];
-        LOG_INFO("ocean: cascades {:.0f}/{:.0f}/{:.0f} m, peak |h| {:.2f} m, "
+        // The peak crest is a property of the FRAME, not of the spectrum,
+        // and on the GPU path it never comes back to the host at all -- it
+        // is reduced on the GPU and travels to the shader in the atlas's
+        // metadata row. Reporting it as "gpu" rather than as a stale or
+        // zeroed float is the honest form: this line is the SPECTRUM's
+        // budget and the rest of it is unchanged either way.
+        const std::string peak =
+            gpu ? std::string("gpu-resident")
+                : fmt::format("{:.2f} m", max_h);
+        LOG_INFO("ocean: cascades {:.0f}/{:.0f}/{:.0f} m, peak |h| {}, "
                  "mean-square slope {:.5f}/{:.5f}/{:.5f} = {:.5f} geometry "
                  "vs Cox-Munk {:.5f} at {:.1f} m/s ({:.0f}% resolved; "
-                 "far-field roughness {:.4f})",
+                 "far-field roughness {:.4f}, solver {})",
                  kOceanCascadePeriodM[0], kOceanCascadePeriodM[1],
-                 kOceanCascadePeriodM[2], max_h,
+                 kOceanCascadePeriodM[2], peak,
                  ocean_cascade_sigma2_[0], ocean_cascade_sigma2_[1],
                  ocean_cascade_sigma2_[2], geom, cm, base.wind_speed,
                  (cm > 0.0 ? 100.0 * std::min(geom / cm, 1.0) : 0.0),
                  pt::ocean::CoxMunkRoughness(
-                     static_cast<double>(base.wind_speed)));
+                     static_cast<double>(base.wind_speed)),
+                 gpu ? "gpu" : "cpu");
     }
+}
+
+// --- #259 / #133 Phase 2: the compute pre-pass driver ----------------------
+
+bool Engine::OceanGpuAvailable() const {
+    if (ocean_gpu_pipeline_id_ == 0) return false;
+    // SoftwareDevice::CreateComputePipeline hands back a non-zero id for
+    // ANY kernel name -- it is a bookkeeping stub, not a claim that the
+    // kernel exists -- so the pipeline id alone would silently disable the
+    // ocean on the software backend rather than falling back to the CPU
+    // solver. Vulkan builds the SPIR-V but registers no pipeline (its
+    // shared descriptor-set layout does not declare bindings 40..45), so
+    // its id is 0 and it takes the CPU path through the test above; the
+    // backend test here is what makes Software's stub honest.
+    if (current_backend_ != BackendType::Metal) return false;
+    auto& C = pt::console::Console::Get();
+    if (auto* v = C.FindCVar("r_ocean_gpu")) {
+        if (v->GetInt() == 0) return false;
+    }
+    return true;
+}
+
+bool Engine::EnsureOceanGpuResources(std::uint32_t grid,
+                                     std::uint32_t cascades) {
+    if (!device_ || grid == 0u || cascades == 0u) return false;
+    if (ocean_gpu_buf_grid_ == grid && ocean_gpu_buf_cascades_ == cascades &&
+        ocean_gpu_h0_buf_id_ != 0 && ocean_gpu_scratch_buf_id_ != 0 &&
+        ocean_gpu_foam_buf_id_ != 0 && ocean_gpu_reduce_buf_id_ != 0) {
+        return true;
+    }
+
+    auto drop = [&](std::uint64_t& id) {
+        if (id != 0) {
+            device_->DestroyBuffer(pt::rhi::BufferHandle{id});
+            id = 0;
+        }
+    };
+    drop(ocean_gpu_h0_buf_id_);
+    drop(ocean_gpu_scratch_buf_id_);
+    drop(ocean_gpu_foam_buf_id_);
+    drop(ocean_gpu_reduce_buf_id_);
+
+    const std::size_t cells = static_cast<std::size_t>(grid) * grid * cascades;
+    // H0 packs both halves of the static spectrum per cell:
+    // .xy = H0(k), .zw = conj(H0(-k)). 3.0 MiB at grid 256 / 3 cascades,
+    // 12.0 MiB at 512, written only when a spectrum is rebuilt.
+    const std::size_t h0_bytes      = cells * 4u * sizeof(float);
+    // Complex scratch for the five spectra between the row and column
+    // passes: 7.5 MiB at grid 256, 30.0 MiB at 512.
+    const std::size_t scratch_bytes =
+        cells * pt::ocean::kGpuFields * 2u * sizeof(float);
+    const std::size_t foam_bytes    = cells * sizeof(float);
+    // Per-threadgroup peak |height| from the pack pass, then the
+    // per-cascade peak the reduce pass appends.
+    const std::size_t tiles_x       = (grid + 7u) / 8u;
+    const std::size_t reduce_bytes  =
+        (tiles_x * tiles_x * cascades + cascades) * sizeof(float);
+
+    auto make = [&](std::size_t bytes, const char* name) -> std::uint64_t {
+        auto h = device_->CreateBuffer({
+            .size = bytes,
+            .usage = pt::rhi::BufferUsage::Storage,
+            .debug_name = name,
+        });
+        return h.id;
+    };
+    ocean_gpu_h0_buf_id_      = make(h0_bytes,      "ocean_h0");
+    ocean_gpu_scratch_buf_id_ = make(scratch_bytes, "ocean_fft_scratch");
+    ocean_gpu_foam_buf_id_    = make(foam_bytes,    "ocean_foam_accum");
+    ocean_gpu_reduce_buf_id_  = make(reduce_bytes,  "ocean_reduce");
+    if (ocean_gpu_h0_buf_id_ == 0 || ocean_gpu_scratch_buf_id_ == 0 ||
+        ocean_gpu_foam_buf_id_ == 0 || ocean_gpu_reduce_buf_id_ == 0) {
+        LOG_ERROR("ocean: GPU cascade buffer allocation failed at grid {} x "
+                  "{} cascades -- falling back to the CPU solver", grid,
+                  cascades);
+        drop(ocean_gpu_h0_buf_id_);
+        drop(ocean_gpu_scratch_buf_id_);
+        drop(ocean_gpu_foam_buf_id_);
+        drop(ocean_gpu_reduce_buf_id_);
+        return false;
+    }
+
+    // Zero the foam accumulator explicitly. A fresh MTLBuffer's contents
+    // are unspecified, and the CPU solver's equivalent is an explicit
+    // `foam_accum_.assign(cells, 0.0f)` on a grid-size change -- foam is
+    // the one piece of state that survives a frame, so starting it from
+    // whatever the allocator left there would make the first seconds of a
+    // resized ocean nondeterministic.
+    {
+        std::vector<float> zeros(cells, 0.0f);
+        device_->WriteBuffer(pt::rhi::BufferHandle{ocean_gpu_foam_buf_id_},
+                             zeros.data(), zeros.size() * sizeof(float));
+    }
+    // Force a spectrum re-upload: the buffer that held it is gone.
+    for (int c = 0; c < 3; ++c) ocean_gpu_spectrum_rev_[c] = 0u;
+
+    ocean_gpu_buf_grid_     = grid;
+    ocean_gpu_buf_cascades_ = cascades;
+    LOG_INFO("ocean: GPU cascade solver buffers -- H0 {:.1f} MB, FFT scratch "
+             "{:.1f} MB, foam {:.1f} MB (grid {}, {} cascades)",
+             double(h0_bytes) / 1048576.0, double(scratch_bytes) / 1048576.0,
+             double(foam_bytes) / 1048576.0, grid, cascades);
+    return true;
+}
+
+void Engine::UploadOceanGpuSpectrum(std::uint32_t grid,
+                                    std::uint32_t cascades) {
+    if (!device_ || ocean_gpu_h0_buf_id_ == 0) return;
+    bool any = false;
+    for (std::uint32_t c = 0u; c < cascades; ++c) {
+        if (c >= ocean_cascades_.size()) return;
+        if (ocean_cascades_[c]->SpectrumRevision() !=
+            ocean_gpu_spectrum_rev_[c]) {
+            any = true;
+        }
+    }
+    if (!any) return;
+
+    // One whole-buffer write rather than three offset writes: this runs
+    // only when a spectrum was rebuilt (a wind / grid / tile / amplitude /
+    // seed / band change), which for a running scene is the first frame and
+    // then never.
+    const std::size_t per   = static_cast<std::size_t>(grid) * grid;
+    const std::size_t total = per * cascades * 4u;
+    ocean_gpu_h0_staging_.assign(total, 0.0f);
+    for (std::uint32_t c = 0u; c < cascades; ++c) {
+        const auto& h0 = ocean_cascades_[c]->H0();
+        const auto& hc = ocean_cascades_[c]->H0Conj();
+        if (h0.size() != per || hc.size() != per) {
+            LOG_ERROR("ocean: cascade {} spectrum is {}x{} cells, expected {} "
+                      "-- GPU upload skipped", c, h0.size(), hc.size(), per);
+            return;
+        }
+        float* dst = ocean_gpu_h0_staging_.data() + per * c * 4u;
+        for (std::size_t i = 0; i < per; ++i) {
+            dst[i * 4u + 0u] = h0[i].real();
+            dst[i * 4u + 1u] = h0[i].imag();
+            dst[i * 4u + 2u] = hc[i].real();
+            dst[i * 4u + 3u] = hc[i].imag();
+        }
+        ocean_gpu_spectrum_rev_[c] = ocean_cascades_[c]->SpectrumRevision();
+    }
+    device_->WriteBuffer(pt::rhi::BufferHandle{ocean_gpu_h0_buf_id_},
+                         ocean_gpu_h0_staging_.data(),
+                         ocean_gpu_h0_staging_.size() * sizeof(float));
+}
+
+void Engine::DispatchOceanCascades(pt::rhi::CommandBuffer* cb) {
+    if (cb == nullptr || !ocean_gpu_pending_) return;
+    ocean_gpu_pending_ = false;
+    const std::uint32_t grid     = ocean_gpu_buf_grid_;
+    const std::uint32_t cascades = ocean_gpu_buf_cascades_;
+    if (grid == 0u || cascades == 0u) return;
+    const int slot = ocean_tex_slot_;
+    if (ocean_disp_tex_id_[slot] == 0 || ocean_normal_tex_id_[slot] == 0) {
+        return;
+    }
+
+    // The push layout and the five-pass sequence live in
+    // src/physics/OceanCascadeDispatch.h, shared verbatim with
+    // tests/pt_ocean_gpu_test.cpp. A wire format with two call sites is a
+    // wire format with two transcriptions, and #248's lesson was that the
+    // second one rots quietly.
+    pt::ocean::GpuCascadeDispatch d;
+    d.pipeline    = ocean_gpu_pipeline_id_;
+    d.h0_buf      = ocean_gpu_h0_buf_id_;
+    d.scratch_buf = ocean_gpu_scratch_buf_id_;
+    d.foam_buf    = ocean_gpu_foam_buf_id_;
+    d.reduce_buf  = ocean_gpu_reduce_buf_id_;
+    d.disp_tex    = ocean_disp_tex_id_[slot];
+    d.normal_tex  = ocean_normal_tex_id_[slot];
+    d.grid        = grid;
+    d.cascades    = cascades;
+    d.t_seconds     = ocean_gpu_t_;
+    d.choppiness    = ocean_gpu_lambda_;
+    d.foam_threshold = ocean_gpu_foam_thr_;
+    d.foam_amount   = ocean_gpu_foam_amt_;
+    d.foam_decay    = ocean_gpu_decay_;
+    d.wind_coverage = ocean_gpu_wind_cov_;
+    // The march bracket carries the SAME slack the CPU path puts on
+    // ocean_params0.w: 25% over the summed peak crest so the upper bound
+    // clears the tallest wave even mid-bilinear-interpolation, plus 5 cm so
+    // a dead-calm sea still has a band to march.
+    d.bracket_scale = 1.25f;
+    d.bracket_bias  = 0.05f;
+    d.gravity       = ocean_gpu_gravity_;
+    d.period_m[0]   = kOceanCascadePeriodM[0];
+    d.period_m[1]   = kOceanCascadePeriodM[1];
+    d.period_m[2]   = kOceanCascadePeriodM[2];
+    pt::ocean::RecordOceanCascades(cb, d);
 }
 
 void Engine::EnsureOceanUploaded() {
@@ -24263,12 +24630,28 @@ void Engine::EnsureOceanUploaded() {
     // anything. Six textures would need four more slots and would move it.
     const std::uint32_t cascades =
         static_cast<std::uint32_t>(ocean_cascades_.size());
-    const std::uint32_t tex_h = grid * std::max(cascades, 1u);
+    // --- #259 / #133 Phase 2: the metadata row ----------------------------
+    // With cascades the DISPLACEMENT atlas carries one row past the last
+    // cascade holding the ray-march bracket (see DispatchOceanCascades for
+    // why it travels in the texture at all). oceanBilinearTexelsC wraps
+    // modulo `grid` INSIDE a cascade's own band and then adds c*grid, so no
+    // sample can reach row cascades*grid -- the row is addressable only by
+    // the explicit fetch in oceanRayMarchShell. The NORMAL atlas has no
+    // metadata and stays exactly as tall as the cascades themselves.
+    const std::uint32_t tex_h  = grid * std::max(cascades, 1u);
+    const std::uint32_t disp_h = tex_h + (cascades > 0u ? 1u : 0u);
+
+    // How deep the upload ring has to be. With the GPU solver the field is
+    // written by a compute pass inside the frame's own command buffer, so
+    // there is no host write to race a GPU read and one slot is correct --
+    // 6 MB/frame of upload and 2/3 of the residency, both recovered. With
+    // the CPU solver the race is real and the ring is the fix.
+    const int ring = OceanUploadRingFor(ocean_gpu_owns_field_);
 
     // Advance the upload ring FIRST, so everything below -- allocation, the
     // write, and the bind BuildAndDispatch does later this frame -- refers
     // to one slot. See kOceanUploadRing for why there is a ring at all.
-    ocean_tex_slot_ = (ocean_tex_slot_ + 1) % kOceanUploadRing;
+    ocean_tex_slot_ = (ocean_tex_slot_ + 1) % ring;
     const int slot = ocean_tex_slot_;
 
     // (Re)allocate the displacement + normal textures on first use or when
@@ -24278,7 +24661,8 @@ void Engine::EnsureOceanUploaded() {
     // grazing angles. Two N^2 RGBA32F textures = 2 MB per slot at N=256,
     // 6 MB per slot with three cascades.
     const bool shape_changed =
-        (ocean_tex_grid_ != grid || ocean_tex_cascades_ != cascades);
+        (ocean_tex_grid_ != grid || ocean_tex_cascades_ != cascades ||
+         ocean_tex_ring_ != ring);
     if (shape_changed || ocean_disp_tex_id_[slot] == 0 ||
         ocean_normal_tex_id_[slot] == 0) {
         // A shape change invalidates EVERY slot, not just this one: the
@@ -24298,12 +24682,12 @@ void Engine::EnsureOceanUploaded() {
                 }
             }
         }
-        for (int i = 0; i < kOceanUploadRing; ++i) {
+        for (int i = 0; i < ring; ++i) {
             if (ocean_disp_tex_id_[i] != 0 && ocean_normal_tex_id_[i] != 0) {
                 continue;
             }
             auto disp = device_->CreateTexture({
-                .width = grid, .height = tex_h,
+                .width = grid, .height = disp_h,
                 .format = pt::rhi::TextureFormat::RGBA32F,
                 .usage  = pt::rhi::TextureUsage::Storage,
                 .debug_name = "ocean_displacement",
@@ -24325,11 +24709,19 @@ void Engine::EnsureOceanUploaded() {
         }
         ocean_tex_grid_      = grid;
         ocean_tex_cascades_  = cascades;
-        LOG_INFO("ocean: FFT displacement + normal textures {}x{} RGBA32F"
-                 " ({} cascade{}, {} upload slots)",
-                 grid, tex_h, std::max(cascades, 1u),
-                 std::max(cascades, 1u) == 1u ? "" : "s", kOceanUploadRing);
+        ocean_tex_ring_      = ring;
+        LOG_INFO("ocean: FFT displacement {}x{} + normal {}x{} RGBA32F"
+                 " ({} cascade{}, {} upload slot{}, {} solver)",
+                 grid, disp_h, grid, tex_h, std::max(cascades, 1u),
+                 std::max(cascades, 1u) == 1u ? "" : "s", ring,
+                 ring == 1 ? "" : "s",
+                 ocean_gpu_owns_field_ ? "gpu" : "cpu");
     }
+
+    // The GPU solver writes both atlases itself, in the frame's own command
+    // buffer, immediately before the dispatch that reads them. Nothing to
+    // repack and nothing to upload.
+    if (ocean_gpu_owns_field_) return;
 
     if (cascades == 0u) {
         const auto& disp_rgba = ocean_->DisplacementRGBA();
@@ -24346,7 +24738,8 @@ void Engine::EnsureOceanUploaded() {
     // row-major grid x grid RGBA, so "stack along rows" is a concatenation
     // and the scratch vectors keep it allocation-free after the first frame.
     const std::size_t per = static_cast<std::size_t>(grid) * grid * 4u;
-    ocean_atlas_disp_.resize(per * cascades);
+    const std::size_t meta_row = static_cast<std::size_t>(grid) * 4u;
+    ocean_atlas_disp_.resize(per * cascades + meta_row);
     ocean_atlas_nrm_.resize(per * cascades);
     for (std::uint32_t c = 0u; c < cascades; ++c) {
         const auto& d = ocean_cascades_[c]->DisplacementRGBA();
@@ -24354,6 +24747,24 @@ void Engine::EnsureOceanUploaded() {
         if (d.size() != per || n.size() != per) continue;
         std::copy(d.begin(), d.end(), ocean_atlas_disp_.begin() + per * c);
         std::copy(n.begin(), n.end(), ocean_atlas_nrm_.begin() + per * c);
+    }
+    // --- The metadata row, written by BOTH solvers ------------------------
+    // oceanRayMarchShell reads its band bracket from ocean_displacement
+    // [uint2(0, cascades*grid)].x. The GPU path has to put it there because
+    // the peak crest only exists after its reduce pass; this path puts the
+    // IDENTICAL float there -- ocean_max_disp_y_ through exactly the
+    // expression that used to reach the shader as ocean_params0.w -- so the
+    // shader reads one number from one place whoever solved the field, and
+    // no committed golden moved when the fetch changed.
+    {
+        const float bracket = ocean_max_disp_y_ * 1.25f + 0.05f;
+        for (std::uint32_t x = 0u; x < grid; ++x) {
+            float* t = ocean_atlas_disp_.data() + per * cascades + x * 4u;
+            t[0] = bracket;
+            t[1] = (cascades > 0u) ? ocean_cascades_[0]->MaxDisplacementY() : 0.0f;
+            t[2] = (cascades > 1u) ? ocean_cascades_[1]->MaxDisplacementY() : 0.0f;
+            t[3] = (cascades > 2u) ? ocean_cascades_[2]->MaxDisplacementY() : 0.0f;
+        }
     }
     device_->WriteTexture(pt::rhi::TextureHandle{ocean_disp_tex_id_[slot]},
                           ocean_atlas_disp_.data(),

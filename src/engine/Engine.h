@@ -31,7 +31,7 @@ namespace pt::app      { class Window; class ConsoleOverlay; class PerfOverlay; 
 namespace pt::audio    { class AudioSystem; }
 namespace pt::jobs     { class JobSystem; }
 namespace pt::console  { class ConsoleServer; }
-namespace pt::rhi      { class Device; struct PipelineHandle; }
+namespace pt::rhi      { class Device; class CommandBuffer; struct PipelineHandle; }
 namespace pt::renderer { struct Camera; class AsyncLightTreeBuilder; }
 namespace pt::csg      { class CsgScene; struct BakedMesh; }
 namespace pt::effects  { class ParticleSystem; }
@@ -1134,12 +1134,56 @@ private:
                   "ocean upload ring is shallower than the frames the CPU "
                   "may have in flight -- a slot would be rewritten under a "
                   "live read");
+    // --- #133 PHASE 2 CLOSED THE OTHER HALF OF THIS ----------------------
+    //
+    // Read the contract above carefully and it is about ONE thing: a HOST
+    // write landing outside the GPU timeline. That is the whole reason D
+    // has to clear kMaxFramesInFlight -- replaceRegion is not ordered
+    // against a dispatch that is already executing, so the ring buys the
+    // ordering by not reusing a slot until every frame that could still be
+    // reading it has retired.
+    //
+    // When shaders/OceanCascades.slang solves the cascades there is no host
+    // write at all. The field is produced by a compute dispatch inside
+    // frame F's OWN command buffer, immediately before the PathTrace
+    // dispatch that reads it, and both atlases are device-allocated (so
+    // MTLHazardTrackingModeTracked): Metal orders frame F's write against
+    // frame F-1's read on the same queue for us, exactly as it does for
+    // accum_hdr and denoise_color, which are single-buffered for the same
+    // reason. The premise of the D >= kMaxFramesInFlight + 1 requirement is
+    // simply absent, so the depth is 1 -- 6 MB/frame of upload and two
+    // thirds of the residency recovered.
+    //
+    // kOceanUploadRing itself is UNCHANGED at 3 and still carries the
+    // assertion above, because the CPU fallback still writes from the host:
+    // the software backend, Vulkan (whose shared descriptor-set layout does
+    // not declare this kernel's bindings), and r_ocean_gpu 0 on Metal all
+    // take it, and for them the race and its fix are exactly as #295 left
+    // them.
+    static constexpr int OceanUploadRingFor(bool gpu_solved) {
+        return gpu_solved ? 1 : kOceanUploadRing;
+    }
+    // Both arms, pinned. The CPU arm has to keep clearing the frames-in-
+    // flight bound; the GPU arm has to stay at 1, because a value above 1
+    // there would mean the field was being staggered against a hazard the
+    // GPU timeline already covers -- i.e. that someone reintroduced a host
+    // write without noticing.
+    static_assert(OceanUploadRingFor(false) >= pt::rhi::kMaxFramesInFlight + 1,
+                  "the CPU-solved ocean ring must still clear the "
+                  "frames-in-flight bound");
+    static_assert(OceanUploadRingFor(true) == 1,
+                  "the GPU-solved ocean field is written on the GPU timeline "
+                  "and needs exactly one slot");
 
     std::unique_ptr<pt::ocean::OceanFFT>        ocean_;
     std::uint64_t ocean_disp_tex_id_[kOceanUploadRing]   = {0, 0, 0};
     std::uint64_t ocean_normal_tex_id_[kOceanUploadRing] = {0, 0, 0};
     // The slot written (and bound) this frame.
     int                                         ocean_tex_slot_      = 0;
+    // How many slots the live allocation has. Part of the shape, so a
+    // solver switch (which changes the ring depth AND the atlas height)
+    // reallocates rather than binding a slot that was never made.
+    int                                         ocean_tex_ring_      = 0;
     std::uint32_t                               ocean_tex_grid_      = 0;  // grid size of the live textures
     double                                      ocean_time_          = 0.0;  // accumulated sim seconds
     float                                       ocean_max_disp_y_    = 0.0f; // peak |height| this frame (m)
@@ -1248,6 +1292,124 @@ private:
                                                double sea_radius_m) const;
     // Step the cascade solvers and repack + upload the stacked atlas.
     void StepOceanCascades(double t_seconds, std::uint32_t grid);
+
+    // --- #259 / #133 Phase 2: the cascades as a compute pre-pass ----------
+    //
+    // WHAT THIS REMOVED. The CPU cascade solver ran fifteen inverse 2-D
+    // FFTs, three packs, three foam folds, a 6 MB repack and a 6 MB upload
+    // every frame on one thread. Measured on an M4 Max, 120 frames of
+    // tests/goldens/scenes/planet_ocean_boat.cfg at r_ocean_grid_size 256:
+    // 6.39 s with the cascades against 4.52 s at r_ocean 0, i.e. 15.6 ms
+    // per frame -- a 64 fps ceiling before the path tracer does anything.
+    //
+    // WHAT STAYED ON THE HOST, AND WHY. The static base spectrum H0(k).
+    // Its Gaussian amplitudes come from a seeded std::mt19937 and a GPU
+    // cannot promise the same draws, so pt::ocean::OceanFFT remains the
+    // one place the spectrum is built -- which is also what keeps
+    // tests/pt_ocean_fft_test.cpp meaningful and what lets
+    // tests/pt_ocean_gpu_test.cpp compare the two solvers on an identical
+    // input. H0 is uploaded ONCE PER REBUILD (wind / grid / tile /
+    // amplitude / seed / band change), not per frame.
+    //
+    // WHERE THE MARCH BRACKET WENT. oceanRayMarchShell brackets the wave
+    // band at R_sea +/- h_max, and h_max is the summed peak crest, which
+    // now only exists after the pre-pass has run. Rather than stall on a
+    // readback or push last frame's number, the reduce pass writes it into
+    // a metadata row of the displacement atlas one row past the last
+    // cascade -- a row oceanBilinearTexelsC cannot address, because its
+    // wrap is modulo `grid` inside the cascade's own band. The CPU
+    // fallback writes the identical float into the identical texel, so
+    // both paths feed the shader one number from one place and no golden
+    // moved.
+    //
+    // THE FALLBACK IS NOT A CONSOLATION PRIZE. Software has no compute
+    // pipelines at all and its CPU tracer ignores the ocean textures;
+    // Vulkan's shared descriptor-set layout does not declare this kernel's
+    // bindings yet and no Vulkan device has executed any of this arc
+    // (#290). Both take the CPU solver, unchanged, and so does r_ocean_gpu
+    // 0 on Metal -- which is what makes the A/B in the equivalence test a
+    // runtime switch rather than a rebuild.
+    // The pass indices, the field count, the push layout and the dispatch
+    // shapes all live in src/physics/OceanCascadeDispatch.h -- shared
+    // verbatim between this driver and tests/pt_ocean_gpu_test.cpp so
+    // there is exactly one transcription of the shader's wire format.
+    std::uint64_t ocean_gpu_pipeline_id_ = 0;
+    std::uint64_t ocean_gpu_h0_buf_id_      = 0;
+    std::uint64_t ocean_gpu_scratch_buf_id_ = 0;
+    std::uint64_t ocean_gpu_foam_buf_id_    = 0;
+    std::uint64_t ocean_gpu_reduce_buf_id_  = 0;
+    // Shape the GPU buffers were allocated for. A change reallocates and
+    // re-zeroes the foam accumulator, mirroring the CPU solver's
+    // `foam_accum_.assign(cells, 0)` on a grid-size change.
+    std::uint32_t ocean_gpu_buf_grid_     = 0;
+    std::uint32_t ocean_gpu_buf_cascades_ = 0;
+    // Spectrum revision last uploaded, per cascade. 0 = nothing uploaded.
+    std::uint64_t ocean_gpu_spectrum_rev_[3] = {0, 0, 0};
+    // Staging for the H0 upload. Resident so a rebuild does not allocate
+    // 12 MB; touched only on a spectrum change.
+    std::vector<float> ocean_gpu_h0_staging_;
+    // Set by StepOceanCascades when the GPU solver owns this frame's
+    // field; consumed (and cleared) by DispatchOceanCascades.
+    bool   ocean_gpu_pending_   = false;
+    // The per-frame scalars the pre-pass needs. Computed host-side -- the
+    // persistence decay is a std::pow and the whitecap ramp a smoothstep,
+    // and evaluating them here rather than in the kernel removes two
+    // transcendental implementations from the CPU-vs-GPU difference.
+    double ocean_gpu_t_         = 0.0;
+    float  ocean_gpu_decay_     = 0.0f;
+    float  ocean_gpu_wind_cov_  = 0.0f;
+    float  ocean_gpu_lambda_    = 0.0f;
+    float  ocean_gpu_foam_thr_  = 0.5f;
+    float  ocean_gpu_foam_amt_  = 1.0f;
+    float  ocean_gpu_gravity_   = 9.81f;
+    // Absolute sim time of the previous GPU step, for the persistence
+    // decay's dt. Negative = no previous frame (OceanFFT::last_t_'s rule).
+    double ocean_gpu_last_t_    = -1.0;
+    // True while the GPU solver owns the field, so EnsureOceanUploaded
+    // skips the repack + WriteTexture and the ring collapses to one slot.
+    bool   ocean_gpu_owns_field_ = false;
+
+    // Is the compute pre-pass usable this frame? Metal + a built pipeline
+    // + r_ocean_gpu != 0. Software returns a non-zero pipeline id for ANY
+    // kernel name (SoftwareDevice::CreateComputePipeline is a bookkeeping
+    // stub), so the backend test is load-bearing and not belt-and-braces.
+    bool OceanGpuAvailable() const;
+    // (Re)allocate the pre-pass buffers for this shape. Returns false if
+    // anything failed, which drops the frame back to the CPU solver.
+    bool EnsureOceanGpuResources(std::uint32_t grid, std::uint32_t cascades);
+    // Upload any cascade whose spectrum was rebuilt since the last call.
+    void UploadOceanGpuSpectrum(std::uint32_t grid, std::uint32_t cascades);
+    // Record the five passes. No-op unless StepOceanCascades armed it.
+    void DispatchOceanCascades(pt::rhi::CommandBuffer* cb);
+
+    // --- The amplitude solve, cached on the spectrum's own key -----------
+    //
+    // The Cox-Munk amplitude is a pure function of {grid, wind, wind
+    // direction, gravity, seed} -- everything else about a cascade's
+    // spectrum is derived from those through the band partition. Solving
+    // it re-ran RebuildBaseSpectrum TWICE per cascade per frame (once at
+    // A = 1 to measure the raw slope variance, once at the solved A), i.e.
+    // six seeded mt19937 sweeps over grid^2 cells every frame for an
+    // answer that cannot change until one of those five numbers does.
+    //
+    // Caching it is bit-exact rather than approximately equal: H0 is a
+    // deterministic function of the config, so the spectrum the cache
+    // leaves in place IS the spectrum the rebuild would have produced.
+    struct OceanAmpKey {
+        std::uint32_t grid     = 0;
+        float         wind     = 0.0f;
+        float         wind_dir = 0.0f;
+        float         gravity  = 0.0f;
+        std::uint32_t seed     = 0;
+        bool operator==(const OceanAmpKey&) const = default;
+    };
+    OceanAmpKey ocean_amp_key_{};
+    bool        ocean_amp_valid_ = false;
+    float       ocean_amp_       = 0.0f;
+    // Each cascade's mean-square slope at the solved amplitude. Same
+    // argument as the amplitude: a pure function of the spectrum, so it is
+    // recomputed only when the spectrum is.
+    double      ocean_amp_sigma2_[3] = {0.0, 0.0, 0.0};
     // --- end Planetary P5 --------------------------------------------------
 
     // --- Voxel destruction Phase 1 (#140) ----------------------------------

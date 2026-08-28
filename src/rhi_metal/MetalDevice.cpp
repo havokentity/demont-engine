@@ -57,6 +57,14 @@ extern const unsigned char shader_CloudsRaymarch_metal_data[];
 extern const unsigned long shader_CloudsRaymarch_metal_size;
 extern const unsigned char shader_CloudsComposite_metal_data[];
 extern const unsigned long shader_CloudsComposite_metal_size;
+// Planetary P5 (#259) / water roadmap #133 Phase 2: the ocean cascade FFT
+// pre-pass. Five passes behind one entry point, dispatched by
+// Engine::DispatchOceanCascades immediately before PathTrace so the field
+// it writes is the field PathTrace reads, on the GPU timeline. Built
+// unconditionally; the engine elides every dispatch unless
+// r_planet_ocean + r_ocean + r_ocean_gpu are all on.
+extern const unsigned char shader_OceanCascades_metal_data[];
+extern const unsigned long shader_OceanCascades_metal_size;
 // Volumetric height fog (wave-9). Stateless analytic exponential-height
 // fog composite. Built unconditionally; dispatched only when r_fog != 0.
 extern const unsigned char shader_HeightFog_metal_data[];
@@ -567,6 +575,12 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
     build_pso("clouds_composite",
               shader_CloudsComposite_metal_data,
               shader_CloudsComposite_metal_size);
+    // Planetary P5 (#259) / #133 Phase 2. Registered unconditionally; the
+    // engine dispatches it only when the planetary ocean cascades are on
+    // AND r_ocean_gpu != 0, so the PSO build is the only cost otherwise.
+    build_pso("ocean_cascades",
+              shader_OceanCascades_metal_data,
+              shader_OceanCascades_metal_size);
     // Volumetric height fog (wave-9). Registered unconditionally; the
     // engine elides the dispatch when r_fog == 0 (default), so the PSO
     // build is the only cost on the legacy path.

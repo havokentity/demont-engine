@@ -348,6 +348,7 @@ void OceanFFT::RebuildBaseSpectrum() {
     built_band_lo_   = cfg_.band_lo_m;
     built_band_hi_   = cfg_.band_hi_m;
     dirty_           = false;
+    ++spectrum_rev_;
 }
 
 double OceanFFT::SlopeVarianceAbove(double min_wavelength_m) const noexcept {

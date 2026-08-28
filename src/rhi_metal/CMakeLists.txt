@@ -191,6 +191,21 @@ pt_compile_slang(
     ENTRY   main
     TARGETS metal
 )
+# Planetary P5 (#259) / water roadmap #133 Phase 2 -- the ocean cascade FFT
+# solver as a compute pre-pass. One entry point dispatched five times (rows,
+# columns, pack, reduce, foam) with the pass index in the push block, the
+# same shape GodRays.slang uses. Imports nothing: the kernel is a closed
+# radix-2 inverse FFT over a spectrum the host uploads once per rebuild.
+# Built unconditionally; Engine::DispatchOceanCascades elides every dispatch
+# unless the planetary cascades are on and r_ocean_gpu != 0, so the legacy
+# single-tile MAT_WATER ocean and every non-planetary scene pay nothing.
+pt_compile_slang(
+    TARGET  pt_rhi_metal
+    SOURCE  ${CMAKE_SOURCE_DIR}/shaders/OceanCascades.slang
+    STAGE   compute
+    ENTRY   main
+    TARGETS metal
+)
 # Volumetric height fog (wave-9). Dedicated stateless composite that
 # integrates the closed-form exponential-height-falloff atmospheric fog
 # along the camera ray (eye -> primary-hit depth) and Beer-Lambert blends
