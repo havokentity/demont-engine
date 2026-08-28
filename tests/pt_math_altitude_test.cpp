@@ -1020,7 +1020,12 @@ TEST_CASE("shader mirror is still faithful") {
     // march lives, not of which file it lives in.
     CHECK(math.find("PtRayAltitudealt=ptRayAltitudeBegin(ro,rd,centre,b.ground_radius);")
           != std::string::npos);
-    CHECK(math.find("max(ptRayAltitudeAt(alt,0.0),0.0)") != std::string::npos);
+    // The left boundary moved from a literal 0.0 to `lo`, the shell-clip
+    // entry, in #260 -- the same hoisted quadratic, evaluated at the
+    // start of the clipped interval instead of at the ray origin.  Pinned
+    // on `lo` so a revert to the unclipped form fails here as well as in
+    // pt_atmosphere_test's black-disc case.
+    CHECK(math.find("max(ptRayAltitudeAt(alt,lo),0.0)") != std::string::npos);
     CHECK(math.find("max(ptRayAltitudeAt(alt,s_mid),0.0)") != std::string::npos);
     CHECK(math.find("max(ptRayAltitudeAt(alt,s_right),0.0)") != std::string::npos);
     // And that PathTrace.slang no longer carries a second march of its

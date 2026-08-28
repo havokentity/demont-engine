@@ -219,19 +219,31 @@ double rayAltAt(const RayAlt& a, double s) {
     return (d > 0.0) ? k / d : 0.0;
 }
 
+bool ptSphereRoots(F3 ro, F3 rd, F3 c, float rad, float& t0, float& t1);
+
 PT_MIRROR F3 ptAtmoOpticalDepth(const AtmoBody& b, F3 ro, F3 rd, F3 centre,
                                 float t, int steps) {
     if (!(t > 0.0f)) return F3{0.0f, 0.0f, 0.0f};
+    // Planetary P6 (#260): clip the interval to the medium before
+    // spending the step budget on it.  See the derivation above the
+    // shader function -- this is the black-disc fix.
+    float u0, u1;
+    if (!ptSphereRoots(ro, rd, centre, b.top_radius, u0, u1)) {
+        return F3{0.0f, 0.0f, 0.0f};
+    }
+    float lo = std::max(u0, 0.0f);
+    float hi = std::min(u1, t);
+    if (!(hi > lo)) return F3{0.0f, 0.0f, 0.0f};
     int N = std::max(steps, 1);
-    float dt = t / float(N);
+    float dt = (hi - lo) / float(N);
     float oneSixth = 1.0f / 6.0f;
     RayAlt alt = rayAltBegin(ro, rd, centre, b.ground_radius);
     F3 tau{0.0f, 0.0f, 0.0f};
     F3 sr_l, sm_l, st_prev;
-    ptAtmoCoefficients(b, float(std::max(rayAltAt(alt, 0.0), 0.0)), sr_l, sm_l, st_prev);
+    ptAtmoCoefficients(b, float(std::max(rayAltAt(alt, lo), 0.0)), sr_l, sm_l, st_prev);
     for (int i = 0; i < N; ++i) {
-        float s_mid   = (float(i) + 0.5f) * dt;
-        float s_right = (float(i) + 1.0f) * dt;
+        float s_mid   = lo + (float(i) + 0.5f) * dt;
+        float s_right = lo + (float(i) + 1.0f) * dt;
         F3 sr_m, sm_m, st_mid;
         F3 sr_r, sm_r, st_right;
         ptAtmoCoefficients(b, float(std::max(rayAltAt(alt, s_mid), 0.0)),
@@ -637,6 +649,221 @@ TEST_CASE("8-step Simpson tracks a 4096-step reference") {
     CHECK(worst_prod < worst_full);
 }
 
+// The pre-#260 rule, verbatim: N uniform Simpson subintervals over the
+// WHOLE of [0, t], with no clip to the medium.  Kept as a live function
+// rather than as prose so the black-disc case below can assert what the
+// engine actually did, instead of asserting that today differs from a
+// version nobody can run.
+double unclippedOpticalDepthChannel(const AtmoBody& b, F3 ro, F3 rd, F3 centre,
+                                    float t, int channel, int steps) {
+    if (!(t > 0.0f)) return 0.0;
+    int N = std::max(steps, 1);
+    float dt = t / float(N);
+    RayAlt alt = rayAltBegin(ro, rd, centre, b.ground_radius);
+    auto st_at = [&](double s) {
+        F3 sr, sm, st;
+        ptAtmoCoefficients(b, float(std::max(rayAltAt(alt, s), 0.0)), sr, sm, st);
+        return double(channel == 0 ? st.x : channel == 1 ? st.y : st.z);
+    };
+    double tau = 0.0, st_prev = st_at(0.0);
+    for (int i = 0; i < N; ++i) {
+        const double m = (i + 0.5) * double(dt), r = (i + 1.0) * double(dt);
+        const double st_mid = st_at(m), st_right = st_at(r);
+        tau += double(dt) / 6.0 * (st_prev + 4.0 * st_mid + st_right);
+        st_prev = st_right;
+    }
+    return tau;
+}
+
+TEST_CASE("the planet is not a black disc from orbit") {
+    // #260's founding symptom, as a number.
+    //
+    // Point a camera at the planet from above the atmosphere and the
+    // surface renders BLACK on main -- reproduced at cam_pos 0 30000000 0
+    // with r_planet_ground 1, and noted in planet_aerial.cfg's header as
+    // the reason that fixture stops at 4 km rather than going to orbit.
+    //
+    // It is not a shading bug and it is not the sky model.  It is the
+    // aerial-perspective transmittance, and specifically its QUADRATURE.
+    // Eight uniform Simpson subintervals over [0, t] with t = 30 000 km
+    // put seven of them in hard vacuum; the eighth is 3 750 km long and
+    // its RIGHT endpoint is on the ground, where extinction is at its
+    // sea-level maximum.  Simpson then charges 3 750 km of path at
+    // (roughly) sea-level density.  The air the ray really crosses is
+    // one vertical column -- optical depth 0.15 in green, transmittance
+    // 0.86.
+    const AtmoBody b = ptAtmoEarth(kR);
+    const F3 down{0.0f, -1.0f, 0.0f};
+
+    struct Case { float alt; const char* what; };
+    const Case cases[2] = {{400000.0f, "400 km, ISS"},
+                           {30000000.0f, "30 000 km, the repro in the P4 header"}};
+
+    for (const Case& c : cases) {
+        CAPTURE(c.what);
+        // Camera on the local vertical above the surface, looking down.
+        // kCentre is (0, -R, 0), so world y IS altitude here.
+        const F3 ro{0.0f, c.alt, 0.0f};
+        const float t = c.alt;
+
+        for (int ch = 0; ch < 3; ++ch) {
+            CAPTURE(ch);
+            // The truth: a nadir column, whatever the camera's altitude.
+            // It cannot depend on how far above the air the observer is,
+            // because that distance is vacuum.
+            const double tau_ref =
+                refOpticalDepthChannel(b, ro, down, kCentre, t, ch, 200000);
+            const double T_ref = std::exp(-tau_ref);
+            CHECK(T_ref > 0.75);      // 0.936 / 0.864 / 0.759 R / G / B
+
+            // RED: what the engine did before this phase.
+            const double tau_old =
+                unclippedOpticalDepthChannel(b, ro, down, kCentre, t, ch, 8);
+            const double T_old = std::exp(-tau_old);
+
+            // GREEN: what it does now.
+            const F3 tau_new_v = ptAtmoOpticalDepth(b, ro, down, kCentre, t, 8);
+            const double tau_new =
+                double(ch == 0 ? tau_new_v.x : ch == 1 ? tau_new_v.y : tau_new_v.z);
+            const double T_new = std::exp(-tau_new);
+
+            // The claim is about CONTENT, not merely about difference:
+            // the surface has to survive the air column with most of its
+            // light, and that has to hold at both altitudes with the
+            // same number, because the physics is the same integral.
+            CHECK(T_new > 0.70);
+            CHECK(std::fabs(T_new - T_ref) < 0.02);
+
+            if (c.alt > 1.0e7f) {
+                // ...and at 30 Mm the old rule really did produce black,
+                // so the fixture header's "the shading gives black" is
+                // this line and not a shading path at all.
+                CHECK(T_old < 1.0e-3);
+            } else {
+                // At 400 km it is not black, but aerial perspective is
+                // already ~10 points of transmittance too dark -- which
+                // is why the acceptance altitude is not a place the old
+                // rule was quietly fine either.
+                CHECK(T_old < T_ref - 0.05);
+            }
+        }
+    }
+}
+
+TEST_CASE("clipping to the medium discards a bounded, negligible tail") {
+    // The clip is exact only if the medium really stops at top_radius.
+    // It does not: the Rayleigh and Mie profiles are exponentials and
+    // the tent is the only species that is genuinely zero up there.  So
+    // the clip DOES throw something away, and the honest thing is to
+    // bound it rather than to call the boundary exact.
+    //
+    // The worst case is the ray that grazes the top of the shell: this
+    // function now returns exactly zero for it, while the true integral
+    // is the Chapman chord of an exponential of scale height H_R about
+    // its tangent point,
+    //
+    //     tau_true <= sigma_t(R_top) * sqrt(2 pi R_top H_R)
+    //
+    // with sigma_t(R_top) in green = 13.558e-6 * exp(-100/8)
+    //                              +  8.396e-6 * exp(-100/1.2)
+    //                              = 5.05e-11 m^-1,
+    // and sqrt(2 pi * 6.471e6 * 8000) = 5.70e5 m, so tau_true <= 2.9e-5.
+    //
+    // Optical depth converts to transmittance one-for-one at this size
+    // (1 - exp(-x) ~ x), so the discarded term is under one part in
+    // 34 000 -- an order of magnitude below a single 8-bit quantum
+    // (1/255 = 3.9e-3).  Measured here against the unclipped reference
+    // rather than trusted from the algebra.
+    const AtmoBody b = ptAtmoEarth(kR);
+
+    // A ray tangent to the top of the shell, integrated over four
+    // Chapman chords either side of the tangent point -- far enough out
+    // that the exponential has fallen by e^-16 and the remainder is
+    // below the printing precision of the bound.
+    const double chapman = std::sqrt(2.0 * 3.14159265358979
+                                     * double(b.top_radius) * double(b.rayleigh_scale_h));
+    const double reach = 4.0 * chapman;
+    const F3 ro{float(-reach), float(double(b.top_radius) - double(kR)), 0.0f};
+    const F3 rd{1.0f, 0.0f, 0.0f};
+    const float t = float(2.0 * reach);
+
+    for (int ch = 0; ch < 3; ++ch) {
+        CAPTURE(ch);
+        const double discarded =
+            refOpticalDepthChannel(b, ro, rd, kCentre, t, ch, 200000);
+        CAPTURE(discarded);
+        CHECK(discarded < 1.0e-4);
+        CHECK(discarded < 1.0 / 255.0);
+        // And the clipped rule really does return zero for it, so the
+        // number above is the WHOLE of what the clip costs, not a part.
+        const F3 got = ptAtmoOpticalDepth(b, ro, rd, kCentre, t, 8);
+        const double g = double(ch == 0 ? got.x : ch == 1 ? got.y : got.z);
+        CHECK(g == 0.0);
+    }
+}
+
+TEST_CASE("the clip is a no-op for every ray that starts inside the shell") {
+    // Why the pre-#260 goldens are bit-stable and not merely close.
+    //
+    // For an origin inside top_radius the near root is negative, so
+    // lo = max(u0, 0) is +0.0 EXACTLY, and hi = min(u1, t) is t exactly
+    // whenever t is the shorter.  IEEE-754 addition of +0.0 is the
+    // identity on every finite value, so `lo + x` is `x` bit-for-bit and
+    // the Simpson loop evaluates the same floats it did before.  The
+    // highest camera in the pre-#260 fixture set is sunset_altitude at
+    // 10 km, so this covers all of them.
+    const AtmoBody b = ptAtmoEarth(kR);
+    // 10 km is sunset_altitude, the highest camera that existed before
+    // this phase; 80 m is clouds_raymarched; 1.7 m is the ground scenes.
+    // 99 km is deliberately NOT in this list: a 30 km ray upward from
+    // there leaves the shell after 1 km, so the clip fires and the
+    // integral legitimately differs.  That case is covered by the
+    // sub-case below rather than papered over here.
+    const float alts[3] = {1.7f, 80.0f, 10000.0f};
+    for (int ai = 0; ai < 3; ++ai) {
+        CAPTURE(alts[ai]);
+        const F3 ro{0.0f, alts[ai], 0.0f};
+        for (int ei = 0; ei <= 16; ++ei) {
+            const double e = (-90.0 + 180.0 * (ei / 16.0)) * 3.14159265358979 / 180.0;
+            const F3 rd = norm(F3{float(std::cos(e)), float(std::sin(e)), 0.0f});
+            // A t that stays inside the shell: the ground is at most
+            // `alt` away straight down, and 30 km of reach from 10 km up
+            // cannot escape a 100 km shell in any direction.
+            const float t = 30000.0f;
+            const F3 clipped = ptAtmoOpticalDepth(b, ro, rd, kCentre, t, 8);
+            const double u0 = unclippedOpticalDepthChannel(b, ro, rd, kCentre, t, 0, 8);
+            const double u1 = unclippedOpticalDepthChannel(b, ro, rd, kCentre, t, 1, 8);
+            const double u2 = unclippedOpticalDepthChannel(b, ro, rd, kCentre, t, 2, 8);
+            // The unclipped reference accumulates in double, so it is
+            // not bit-comparable; equality to within a float ULP of the
+            // value is what "the same floats went in" looks like from
+            // outside.
+            CHECK(double(clipped.x) == doctest::Approx(u0).epsilon(1e-6));
+            CHECK(double(clipped.y) == doctest::Approx(u1).epsilon(1e-6));
+            CHECK(double(clipped.z) == doctest::Approx(u2).epsilon(1e-6));
+        }
+    }
+
+    // ...and the boundary, so "no-op" is bounded rather than believed.
+    // From 99 km, straight up, 30 km of requested path: the shell ends
+    // 1 km along, so the clip removes 29 km of near-vacuum that the old
+    // rule spread its whole step budget across.  The clipped answer is
+    // SMALLER (the removed span had nonzero, if tiny, extinction) and it
+    // is the one that concentrates all eight subintervals on the 1 km
+    // that has any air in it.
+    {
+        const F3 ro{0.0f, 99000.0f, 0.0f};
+        const F3 rd{0.0f, 1.0f, 0.0f};
+        const F3 clipped = ptAtmoOpticalDepth(b, ro, rd, kCentre, 30000.0f, 8);
+        const double unclipped =
+            unclippedOpticalDepthChannel(b, ro, rd, kCentre, 30000.0f, 2, 8);
+        CHECK(double(clipped.z) < unclipped);
+        // Both are utterly negligible -- which is the point: the clip
+        // only ever removes air that could not have mattered.
+        CHECK(unclipped < 1.0e-4);
+    }
+}
+
 TEST_CASE("a horizontal ray reaches the cloud layer at a FINITE range") {
     // #51's founding symptom, as geometry.
     //
@@ -780,6 +1007,29 @@ TEST_CASE("shader mirror is still faithful") {
     // get subtly wrong, so both branches are pinned.
     CHECK(countOf(math, "if(i0>lo){hi=min(hi,i0);}") == 1u);
     CHECK(countOf(math, "else{lo=i1;}") == 1u);
+
+    // Planetary P6 (#260): the optical-depth integral clips to the
+    // medium before spending its step budget.  Pinned on the whole
+    // clause and COUNTED, because the mirror above transcribes it and a
+    // mirror that has drifted is worthless -- and because the black-disc
+    // case is the only other thing standing between this repo and a
+    // planet that renders as a hole in the sky.  Deleting the clause
+    // from the shader while leaving `lo` in the loop would still satisfy
+    // pt_math_altitude_test's hoist pins, which is exactly the
+    // find()-shaped hole #276 lived in.
+    CHECK(countOf(math,
+        "if(!ptSphereRoots(ro,rd,centre,b.top_radius,u0,u1)){"
+        "returnfloat3(0.0,0.0,0.0);//rayneverentersthemedium}") == 1u);
+    CHECK(countOf(math, "floatlo=max(u0,0.0);floathi=min(u1,t);") == 1u);
+    CHECK(countOf(math, "floatdt=(hi-lo)/float(N);") == 1u);
+    // And that the pre-#260 form is gone rather than merely shadowed.
+    CHECK(countOf(math, "floatdt=t/float(N);") == 0u);
+    // ptSphereRoots must be DEFINED before the integral that calls it --
+    // Slang has no forward declaration here, so a later edit that moves
+    // it back below would fail to compile; pinning the order makes the
+    // reason visible rather than leaving it as a compile mystery.
+    CHECK(math.find("publicboolptSphereRoots(")
+          < math.find("publicfloat3ptAtmoOpticalDepth("));
 
     // Earth must be ASSIGNED once, in the constructor -- the point of
     // the struct.  Before #257 the Rayleigh scale height was a literal
