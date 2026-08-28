@@ -364,6 +364,30 @@ else()
     target_compile_options(pt_atmosphere PRIVATE $<$<CONFIG:Release>:/fp:fast>)
 endif()
 
+# --- pt_sky_units (issue #280) ---------------------------------------------
+# The radiometric unit rebase, Hillaire 2020's multiple-scattering table,
+# and the retirement of the compensating r_rayleigh / aerosol pair.
+#
+# It links pt_renderer because #280's physics has a HOST implementation --
+# src/renderer/Atmosphere.cpp -- rather than only a shader one. That is the
+# whole point of building the table on the CPU: the builder is also the
+# software backend's mirror and the sky cook, so there is one implementation
+# to test rather than a shader plus a transcription of it. This target
+# therefore tests the real code, and re-reads the .slang only to pin that
+# the GPU side still carries the same constants and the same
+# parameterisation.
+#
+# The pins COUNT occurrences rather than testing find() != npos: a substring
+# pin is satisfied by one correct copy however many stale ones survive,
+# which is how #276 stayed green for a cycle.
+pt_add_test(pt_sky_units
+    pt_sky_units_test.cpp
+    LINK_TARGETS pt_renderer)
+target_compile_definitions(pt_sky_units PRIVATE
+    PT_SHADER_MATH_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTraceMath.slang"
+    PT_SHADER_PATHTRACE_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang"
+    PT_ENGINE_CPP_PATH="${CMAKE_SOURCE_DIR}/src/engine/Engine.cpp")
+
 # --- pt_planet_terrain (issue #258, planetary P4) --------------------------
 # The cubed-ellipsoid quadtree, the elevation field, chunk baking and the
 # residency selector.

@@ -750,6 +750,13 @@ private:
     // half the scene in the wrong place.
     void UpdateWorldFrame();
 
+    // #280: (re)build and upload Hillaire 2020's multiple-scattering table
+    // when the medium changed. A no-op on every frame that did not change
+    // one of the five cvars the table is a function of, which is almost
+    // all of them -- the build is ~25 ms on twelve threads and must never
+    // sit on the per-frame path.
+    void EnsureAtmosphereMultiScatterLut();
+
     // --- Planetary P4 (#258) ---------------------------------------------
     // Per-frame terrain streaming: reads the cvars, (re)starts the streamer
     // when a structural one changed, runs one selector/bake/build round and
@@ -1622,6 +1629,25 @@ private:
     // planet-free scene bit-identical; 1..N are terrain chunks.
     std::uint64_t                               instance_desc_id_      = 0;
     std::uint32_t                               instance_desc_capacity_ = 0;
+    // --- #280: Hillaire 2020 multiple-scattering table ---------------------
+    // 32 x 32 float4, engine buffer slot 21 -> vk::binding 40. Built on the
+    // CPU (src/renderer/Atmosphere.cpp) rather than by a compute pass, per
+    // #257's recommendation: the builder is also the software backend's
+    // mirror, so the physics has one implementation, and the engine's
+    // pipeline count does not move against the cold-cache MoltenVK budget.
+    //
+    // Rebuilt only when the medium actually changes. `atmo_ms_key_` is the
+    // five cvars the table is a function of; comparing it is what keeps a
+    // ~25 ms build off the per-frame path without a dirty flag anyone can
+    // forget to set.
+    std::uint64_t                               atmo_ms_lut_id_        = 0;
+    std::vector<float>                          atmo_ms_lut_data_;
+    struct AtmoMsKey {
+        float radius = -1.0f, rayleigh = -1.0f, density = -1.0f;
+        float ozone  = -1.0f, ground_albedo = -1.0f;
+        bool operator==(const AtmoMsKey&) const = default;
+    };
+    AtmoMsKey                                   atmo_ms_key_{};
     // Capacity the scene TLAS was created with. Device::UpdateTLASInstances
     // never grows a structure, so a change here means destroy + recreate.
     std::uint32_t                               scene_tlas_capacity_   = 0;

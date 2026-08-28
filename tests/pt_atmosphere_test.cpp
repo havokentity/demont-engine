@@ -1411,8 +1411,13 @@ TEST_CASE("shader mirror is still faithful") {
     // The sun term is the SAME slant-path integral the NEE site and the
     // cloud march use, which is what makes the terminator geometry rather
     // than a threshold -- and there must be exactly one of it.
-    CHECK(countOf(pt, "float3sun_at=float3(80.0)*sunSlantTransmittance(sp,"
+    // #280 rebased the literal 80 to the real solar irradiance -- see
+    // src/renderer/Atmosphere.h section 1 for why the 80 was an IRRADIANCE
+    // and not a radiance. The pin moves with it in lockstep, which is the
+    // point of pinning the expression rather than the number.
+    CHECK(countOf(pt, "float3sun_at=kPtSolarIrradiance*sunSlantTransmittance(sp,"
                       "sun_dir);") == 1u);
+    CHECK(countOf(pt, "float3(80.0)") == 0u);   // the old anchor, fully retired
     CHECK(countOf(pt, "acc+=trans*(sigma_s_ray*ph_r+sigma_s_mie*ph_m)"
                       "*sun_at*dt;") == 1u);
     // No elevation gate anywhere in the physical path.  procSky, hosek,
@@ -1454,7 +1459,8 @@ TEST_CASE("shader mirror is still faithful") {
     // The disc radiance is E / Omega, derived, with Omega taken from the
     // RENDERED half-angle so r_sun_size stays energy-conserving.
     CHECK(countOf(pt, "floatomega=6.28318530718*(1.0-kCosR);") == 1u);
-    CHECK(countOf(pt, "returnT*(80.0/max(omega,1.0e-12))*bright;") == 1u);
+    CHECK(countOf(pt, "returnT*(kPtSolarIrradiance/max(omega,1.0e-12))"
+                      "*bright;") == 1u);
 
     // ...and the host half of the same contract.  Mode 4 IMPLIES the
     // physical sun transmittance: skyPhysical lights every sample with

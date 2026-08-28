@@ -633,6 +633,37 @@ static const uint kPbrMaxLod     = 8u;   // log2(kPbrTileSize=256)
 // kInstDescFloat4s float4 per TLAS instance. See InstanceDesc below.
 [[vk::binding(39, 0)]] StructuredBuffer<float4> instance_desc;
 
+// --- Multiple scattering (#280) --------------------------------------------
+//
+// Hillaire 2020 section 4's Psi_ms, 32 x 32 over (radius, sun-zenith
+// cosine), one float4 per texel: rgb is the isotropic second-and-higher-
+// order in-scattered radiance WITH the solar irradiance already folded in,
+// w is 1.0 on every texel the host wrote.  A zero-filled placeholder
+// therefore reads w == 0, which is what `ptMsLutReady` below tests -- a
+// buffer that was never built contributes nothing rather than silently
+// contributing a table of zeroes that looks like "multiple scattering is
+// negligible".
+//
+// BUILT ON THE HOST (src/renderer/Atmosphere.cpp), not by a compute pass.
+// #257's recommendation: the builder doubles as the software backend's
+// mirror, so the physics has one implementation, and the pipeline count
+// stays where it is against the cold-cache MoltenVK budget.
+// BINDING 46, NOT 40. shaders/OceanCascades.slang (#293) already declares
+// 40..45 and its header records why they are not in VulkanDevice's shared
+// layout yet: no Vulkan pipeline is built from that module, and adding a
+// binding the layout lacks is a hard vkCreateComputePipelines failure even
+// under PARTIALLY_BOUND. Those six numbers are therefore RESERVED rather
+// than free, and set 0 is one number space shared by buffers and images --
+// which is the same trap that put terrain_indices at 38 rather than 37
+// (GodRays' mask texture). #280 starts after them.
+[[vk::binding(46, 0)]] StructuredBuffer<float4> atmo_ms_lut;
+
+bool ptMsLutReady() { return atmo_ms_lut[0].w > 0.5; }
+// The bilinear fetch itself is `ptAtmoMultiScatter`, next to
+// atmosphereBody() further down -- it needs PtAtmoBody, which arrives with
+// the PathTraceMath import below this declaration block.
+// --- end multiple scattering ------------------------------------------------
+
 static const uint kInstDescFloat4s = 6u;
 // Descriptor kinds. 0 keeps the legacy single-mesh geometry (positions and
 // indices in mesh_positions / mesh_indices); 1 is a terrain chunk.
@@ -1454,6 +1485,27 @@ cbuffer Push {
     //               .w = seawater depolarisation ratio (0.09).
     float4 water_scatter2;
     // --- end Planetary P7 --------------------------------------------------
+    // --- #280: the cooked sky palette -----------------------------------------
+    // procSky's day palette, INTEGRATED on the host once per frame through
+    // this scene's own medium rather than authored as literals. Three
+    // radiances in W/m^2/sr: the sky at the zenith, and at the horizon in
+    // the sun's azimuth and in the anti-solar one.  See
+    // src/renderer/Atmosphere.cpp CookSky for what is in them (Rayleigh +
+    // ozone + Hillaire 2020 multiple scattering, deliberately NOT the
+    // aerosol -- the march owns that lobe).
+    //
+    //   .w of sky_cook_zenith = 1 when the host cooked this frame, 0 when
+    //   it did not (no planet radius, or the sky mode does not need it).
+    //   The shader does not branch on it today; it exists so a black sky
+    //   can be told apart from an unwritten one.
+    //
+    // Three vec4 appended at the very tail so every existing field offset
+    // is untouched.  Mirrored in the SPIR-V Frame block below +
+    // Engine.cpp PtPush.
+    float4 sky_cook_zenith;
+    float4 sky_cook_horizon_sun;
+    float4 sky_cook_horizon_anti;
+    // --- end #280 -------------------------------------------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -1623,6 +1675,14 @@ cbuffer Frame {
     // above (Planetary P7, #261).
     float4 water_scatter;
     float4 water_scatter2;
+    // See `sky_cook_zenith` .. `sky_cook_horizon_anti` in the Metal Push
+    // cbuffer above (#280). Layout-equivalent: three more vec4 at the tail,
+    // AFTER P7's pair -- the Frame UBO is byte-equivalent to the host
+    // struct, so the two tail appends have to be in the same order on both
+    // sides and P7's landed first.
+    float4 sky_cook_zenith;
+    float4 sky_cook_horizon_sun;
+    float4 sky_cook_horizon_anti;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -3699,8 +3759,12 @@ float3 procSky(float3 rd, float3 sun) {
     // rd.y / sun.y bit-for-bit and this function is unchanged.
     float3 up = localUp(pos_fovtan.xyz);
     float cosTheta_raw = clamp(dot(rd, up), -1.0, 1.0);  // 1=zenith, 0=mathematical-horizon, -1=nadir
-    float cosGamma = clamp(dot(rd, sun), -1.0, 1.0);
-    float sun_elev = dot(up, sun);              // sin(elevation)
+    // (#280 removed `cosGamma` and `sun_elev` from this scope: every term
+    // that read them -- the day/night blend, the sunset cross-fade and the
+    // painted wide forward-scatter lobe -- is now either integrated by the
+    // host cook or marched as real aerosol.  The solar geometry the sky
+    // still needs is inside the cook, where it is a ray direction rather
+    // than a smoothstep edge.)
 
     // Curved-Earth visible-horizon dip (issue #51). On a flat Earth the
     // geometric horizon sits at rd.y = 0. On a spherical Earth of radius
@@ -3755,40 +3819,51 @@ float3 procSky(float3 rd, float3 sun) {
     // the smoothsteps below stay bounded.
     float cosTheta = clamp(cosTheta_raw + horizon_dip_sin, -1.0, 1.0);
 
-    // Day vs night blend: smoothstep on sun elevation across the
-    // civil-twilight band.
-    float day = smoothstep(-0.10, 0.20, sun_elev);
-
-    // Sunset glow: peaks when sun is just at the horizon.
-    float sunset = smoothstep(0.30, -0.05, sun_elev) *
-                   smoothstep(-0.20, 0.05, sun_elev);
-
-    // Day sky palette.
-    float3 zenith_day  = float3(0.32, 0.55, 0.92);
-    float3 horizon_day = float3(0.78, 0.88, 1.00);
-    // Sunset palette pulls toward orange/red on the side of the sun.
-    // The "horizontal" projection is onto the LOCAL horizon plane (#254),
-    // i.e. the component perpendicular to local up. In the planar frame
-    // `v - up*dot(v,up)` is exactly float3(v.x, 0, v.z), so the two
-    // normalize() arguments are the same floats as before.
+    // --- #280: the palette is integrated, not painted ---------------------
+    //
+    // Until #280 the three lines below were six hand-authored literals --
+    // zenith_day (0.32, 0.55, 0.92), horizon_day (0.78, 0.88, 1.00), a
+    // sunset pair, and a `sunset` smoothstep to cross-fade between them --
+    // in units where the sun was 80.  They are now three RADIANCES that the
+    // host integrates once per frame through this scene's actual medium
+    // (src/renderer/Atmosphere.cpp CookSky): Rayleigh single scattering,
+    // ozone absorption on the sun's slant path, and Hillaire 2020's
+    // multiple-scattering term, at the zenith and at the horizon in the
+    // sun's azimuth and the anti-solar one.
+    //
+    // What survives from the painted version is the SHAPE -- the
+    // smoothstep in cosTheta below, and side_factor -- and that is exactly
+    // what `procedural` is for: a cheap dome interpolating a physical
+    // palette, against `physical` which marches every pixel.  The sunset
+    // cross-fade is gone because the physics does it: at 2 deg solar
+    // elevation the cooked sun-side horizon is (10.10, 6.22, 2.57) W/m^2/sr
+    // -- orange, from the medium, with nothing authored.
+    //
+    // side_factor's "horizontal" projection is onto the LOCAL horizon plane
+    // (#254), i.e. the component perpendicular to local up.
     float3 rd_h        = rd  - up * dot(rd,  up);
     float3 sun_h       = sun - up * dot(sun, up);
     float side_factor  = smoothstep(0.0, 0.7, dot(normalize(rd_h),
                                                   normalize(sun_h)));
-    float3 horizon_sunset = lerp(float3(0.95, 0.45, 0.20),
-                                 float3(1.00, 0.65, 0.30), side_factor);
-    float3 horizon_col    = lerp(horizon_day, horizon_sunset, sunset);
-    float3 zenith_col     = lerp(zenith_day,  float3(0.18, 0.18, 0.30), sunset * 0.6);
+    float3 horizon_col = lerp(sky_cook_horizon_anti.rgb,
+                              sky_cook_horizon_sun.rgb, side_factor);
+    float3 zenith_col  = sky_cook_zenith.rgb;
 
     // Vertical gradient from horizon to zenith.
     float t = smoothstep(0.0, 0.40, cosTheta);
     float3 sky = lerp(horizon_col, zenith_col, t);
 
-    // Apply day/night brightness curve. Night is a deep navy with
-    // a faint horizon line, no sun.
-    float3 night = float3(0.005, 0.010, 0.030) +
-                   smoothstep(0.0, 0.05, abs(cosTheta - 0.0)) * 0.0;
-    sky = lerp(night, sky, day);
+    // Night floor, ADDED rather than cross-faded (#280).  The cooked
+    // palette goes to zero on its own when the sun is far enough below the
+    // horizon -- that is what the integral does -- so the `day` smoothstep
+    // that used to blend to night has nothing left to do and is gone.
+    // What remains is a floor standing in for airglow and integrated
+    // starlight, which this engine does not model and which really is
+    // additive: at noon it is 0.028 against a zenith of ~15, and at
+    // midnight it is the whole sky.  Carried across the unit rebase by the
+    // one documented factor, so its brightness relative to the physical
+    // sky is where its author put it.
+    sky += float3(0.005, 0.010, 0.030) * kPtLegacySkyScale;
 
     // Star contribution. Routed through starsOnly() so the same logic
     // is reusable from the primary-miss celestials-composite path
@@ -3803,17 +3878,18 @@ float3 procSky(float3 rd, float3 sun) {
     // exact terms when removing the inline sun from denoise_color.
     sky += procSkyInlineSunDiscAndHalo(rd, sun);
 
-    // Wider, dimmer secondary scatter (Rayleigh-tinted) extends the
-    // sunset orange across more of the sky. NOT included in the
-    // celestials-composite subtraction -- this is an atmospheric
-    // gradient that should stay in denoise_color and ride through
-    // the denoiser like the rest of the sky color.
-    float3 sun_color_high = float3(1.00, 0.95, 0.85);
-    float3 sun_color_low  = float3(1.00, 0.55, 0.20);
-    float3 sun_col = lerp(sun_color_low, sun_color_high, day);
-    float wide = pow(max(0.0, cosGamma), 6.0);
-    sky += wide * sun_col * sunset * 0.50;
-
+    // #280 REMOVED a "wider, dimmer secondary scatter" term here:
+    //
+    //     sky += pow(max(0, cosGamma), 6) * sun_col * sunset * 0.50;
+    //
+    // a painted forward-scattering lobe that spread sunset orange across
+    // the sky, driven by the same `sunset` smoothstep the palette above no
+    // longer has.  It is a deletion rather than a loss, and for the same
+    // reason #260 deleted the painted sun halo from mode 4: that broad
+    // glow around a low sun IS forward Mie scattering, and the aerosol
+    // half of the in-scatter march computes it through Cornette-Shanks at
+    // the real aerosol loading.  Painting it as well would double-count
+    // it, which is the pattern this whole issue exists to remove.
     return max(sky, float3(0.0));
 }
 
@@ -5735,6 +5811,39 @@ PtAtmoBody atmosphereBody() {
                        clouds_p4.w);
 }
 
+// Bilinear fetch of Hillaire 2020's multiple-scattering table (#280),
+// mirrored by pt::atmo::SampleMultiScatter on the host and pinned against
+// it in tests/pt_atmosphere_test.cpp.  Written out here rather than in
+// PathTraceMath because passing a StructuredBuffer across a Slang module
+// boundary is a construct this codebase has never lowered to SPIR-V, and
+// #257 already spent a day on what module boundaries do to this compiler
+// (its risk list, items 1 and 3).  The PARAMETERISATION does live in the
+// module, as ptAtmoMsLutUv -- that half is model and belongs with the
+// model.
+//
+// Returns radiance directly, WITH the solar irradiance already folded in
+// by the builder, so the caller multiplies it by a scattering coefficient
+// and by nothing else.
+float3 ptAtmoMultiScatter(PtAtmoBody body, float r, float mu_s) {
+    if (!ptMsLutReady()) return float3(0.0);
+    float2 uv = ptAtmoMsLutUv(body, r, mu_s);
+    float fx = uv.x * float(kPtMsLutWidth)  - 0.5;
+    float fy = uv.y * float(kPtMsLutHeight) - 0.5;
+    int x0 = int(floor(fx));
+    int y0 = int(floor(fy));
+    float tx = fx - float(x0);
+    float ty = fy - float(y0);
+    int xa = clamp(x0,     0, kPtMsLutWidth  - 1);
+    int xb = clamp(x0 + 1, 0, kPtMsLutWidth  - 1);
+    int ya = clamp(y0,     0, kPtMsLutHeight - 1);
+    int yb = clamp(y0 + 1, 0, kPtMsLutHeight - 1);
+    float3 c00 = atmo_ms_lut[uint(ya * kPtMsLutWidth + xa)].rgb;
+    float3 c10 = atmo_ms_lut[uint(ya * kPtMsLutWidth + xb)].rgb;
+    float3 c01 = atmo_ms_lut[uint(yb * kPtMsLutWidth + xa)].rgb;
+    float3 c11 = atmo_ms_lut[uint(yb * kPtMsLutWidth + xb)].rgb;
+    return lerp(lerp(c00, c10, tx), lerp(c01, c11, tx), ty);
+}
+
 float3 atmosphericTransmittance(float3 ro, float3 rd, float t) {
     if (t <= 0.0) return float3(1.0);
     PtAtmoBody body = atmosphereBody();
@@ -5859,19 +5968,43 @@ float3 sunSlantTransmittance(float3 p, float3 sun_dir) {
     return exp(-ptAtmoOpticalDepth(body, p, sun_dir, pc, t, 8));
 }
 
-// Sun radiance arriving at `p`, in the engine's tonemap-relative units
-// where 80 is the unattenuated solar constant (the value tuned so a noon
-// sun on a Lambert white wall reads ~1.0). `sun_elev` is sin(elevation)
-// at p, used only by the legacy curve.
+// Solar IRRADIANCE arriving at `p`, in W/m^2, on a surface facing the sun.
+// `sun_elev` is sin(elevation) at p, used only by the legacy curve.
+//
+// THE NAME IS THE POINT (#280).  This function was called sunRadianceAt
+// and its comment said "80 is the unattenuated solar constant" -- but the
+// solar constant is an IRRADIANCE and solar radiance is 14 700x larger, so
+// the name and the comment named different quantities and the caller could
+// not tell which the code meant.  The arithmetic was never ambiguous: every
+// call site multiplies this by a BRDF and a cosine with no solid angle
+// anywhere, which closes dimensionally only for an irradiance, and
+// sunDiscPhysical divides it by Omega to recover a radiance.  So the code
+// was right and the label was wrong.  The audit, with all three proofs, is
+// in src/renderer/Atmosphere.h section 1.
+//
+// The 80 is now kPtSolarIrradiance -- 1360.8 W/m^2 (Kopp & Lean 2011) split
+// R:G:B by the solar spectrum at this model's own three sampling
+// wavelengths (Bruneton 2017).  See PathTraceMath.slang.
 //
 // The two branches are the SAME quantity computed two ways, so every
 // site that needs sunlight can call this and none of them can drift.
 // Before #257 the expression was copied at four sites with three
 // slightly different tunings between them.
-float3 sunRadianceAt(float3 p, float3 sun_dir, float sun_elev) {
+float3 sunIrradianceAt(float3 p, float3 sun_dir, float sun_elev) {
     if (sun_extra2.y > 0.0) {
-        return float3(80.0) * sunSlantTransmittance(p, sun_dir);
+        return kPtSolarIrradiance * sunSlantTransmittance(p, sun_dir);
     }
+    // Legacy tuned curve (r_sun_physical_transmittance 0), kept as the A/B
+    // against the real slant path.  #280 flipped the DEFAULT to the
+    // physical branch -- #257 measured that flip as ~30% brighter and
+    // differently tinted at 60 deg and explicitly handed it to the unit
+    // rebase, which is this change.
+    //
+    // Its scale is the GREY mean of the irradiance rather than the triple,
+    // because this branch carries its own hand-authored colour ramp and
+    // multiplying a painted tint by a physical tint would tint twice.  One
+    // number, kPtLegacySkyScale * 80, so the curve keeps exactly the shape
+    // its author gave it at the new absolute level.
     float am  = 1.0 / max(sun_elev, 0.04);
     float tau = 0.30;             // tunable haze
     float trans_atm = exp(-tau * am);
@@ -5879,7 +6012,7 @@ float3 sunRadianceAt(float3 p, float3 sun_dir, float sun_elev) {
     float3 sun_col = lerp(float3(1.00, 0.97, 0.92),
                           float3(1.55, 0.55, 0.20),
                           warmth);
-    return sun_col * (80.0 * trans_atm);
+    return sun_col * (80.0 * kPtLegacySkyScale * trans_atm);
 }
 
 // --- Planetary P6 (#260): the sky that survives leaving ---------------------
@@ -5946,14 +6079,20 @@ float3 sunRadianceAt(float3 p, float3 sun_dir, float sun_elev) {
 //
 // WHAT IS NOT IN IT, STATED RATHER THAN HIDDEN
 //
-//   * MULTIPLE SCATTERING.  Single-scatter only, so the sky is darker
-//     than reality -- most visibly at the zenith on a clear day and
-//     through twilight, where second-order Rayleigh is a large fraction
-//     of the total.  The fix is Hillaire's 32x32 (r, mu_s) multi-scatter
-//     LUT, which needs the LUT infrastructure this engine does not have
-//     yet.  Named in #253; deliberately not built here.
-//   * GROUND-REFLECTED LIGHT.  The planet's own albedo does not light
-//     the air above it.
+//   * (RESOLVED in #280) MULTIPLE SCATTERING.  Was single-scatter only,
+//     which made the sky darker than reality -- most visibly at the
+//     zenith on a clear day and through twilight, where second-order
+//     Rayleigh is a large fraction of the total, and which is exactly
+//     what the retired r_rayleigh = 30 was standing in for.  Hillaire
+//     2020 section 4's 32x32 (r, mu_s) table now supplies it, built on
+//     the host into atmo_ms_lut.  Measured contribution at the zenith:
+//     +27% at noon, +63% at 4 degrees below the horizon.
+//   * (RESOLVED in #280) GROUND-REFLECTED LIGHT.  The multi-scatter
+//     table's build carries the planet-albedo bounce (r_sky_ground_albedo)
+//     into the isotropic term, so the ground does light the air above it
+//     -- at the order the table models, which is second and above.  The
+//     FIRST-order ground bounce along this particular view ray is still
+//     absent.
 //   * SCENE OCCLUSION of the sky column.  Terrain and clouds do not
 //     shadow this march; the analytic BODY does, via
 //     sunSlantTransmittance, and at planetary scale that is the term
@@ -6023,11 +6162,22 @@ float3 skyPhysical(float3 ro, float3 rd, float t_max, int steps,
         // elevation gate; reddened by the real slant path, which is what
         // the terminator and orbital sunrise are made of.
         float3 sp     = ro + rd * s;
-        float3 sun_at = float3(80.0) * sunSlantTransmittance(sp, sun_dir);
+        float3 sun_at = kPtSolarIrradiance * sunSlantTransmittance(sp, sun_dir);
         if (any(sun_at > float3(0.0))) {
             acc += trans * (sigma_s_ray * ph_r + sigma_s_mie * ph_m)
                  * sun_at * dt;
         }
+        // Second and higher orders (#280).  Isotropic, so it carries no
+        // phase function; the table already holds radiance with the solar
+        // irradiance folded in, so it multiplies the scattering
+        // coefficient and nothing else.  It is NOT inside the
+        // `any(sun_at > 0)` gate: a sample in the planet's shadow at
+        // twilight still receives multiply-scattered light from the lit
+        // air around it, and that is what the blue hour is made of.
+        float3 up_at   = normalize(sp - pc);
+        float3 ms_here = ptAtmoMultiScatter(body, length(sp - pc),
+                                            dot(up_at, sun_dir));
+        acc += trans * (sigma_s_ray + sigma_s_mie) * ms_here * dt;
         trans *= exp(-sigma_t * dt);
     }
     // r_volumetric_intensity, the same artistic gain the in-scatter march
@@ -6054,10 +6204,10 @@ float3 skyPhysical(float3 ro, float3 rd, float t_max, int steps,
 // skyPhysical now computes properly through the Cornette-Shanks phase at
 // g = 0.8.  Drawing the painted halo as well would double-count it.
 //
-// DISC RADIANCE IS DERIVED, NOT TUNED.  sunRadianceAt returns 80 * T as
-// the solar irradiance in the engine's tonemap-relative units.  A disc of
+// DISC RADIANCE IS DERIVED, NOT TUNED.  sunIrradianceAt returns E * T as
+// the solar irradiance, now in real W/m^2 (#280).  A disc of
 // solid angle Omega carrying irradiance E has radiance E / Omega, so the
-// rendered disc is 80 * T / Omega with Omega = 2 pi (1 - cos r) for the
+// rendered disc is E * T / Omega with Omega = 2 pi (1 - cos r) for the
 // rendered half-angle r.  Taking Omega from the RENDERED radius rather
 // than from the sun's true 0.2666 deg makes r_sun_size energy-conserving:
 // a bigger disc is proportionally dimmer and puts the same flux on the
@@ -6095,7 +6245,7 @@ float3 sunDiscPhysical(float3 ro, float3 rd, float3 sun_dir) {
 
     float omega = 6.28318530718 * (1.0 - kCosR);   // sr, rendered disc
     float bright = max(sun_extra2.x, 0.0);         // r_sun_disc_brightness
-    return T * (80.0 / max(omega, 1.0e-12)) * bright;
+    return T * (kPtSolarIrradiance / max(omega, 1.0e-12)) * bright;
 }
 // --- end Planetary P6 physical sky ------------------------------------------
 
@@ -6235,7 +6385,7 @@ float3 skyColorBase(float3 ro, float3 rd, inout uint seed) {
 // tap.
 //
 // WHY IT IS EXACT IN PHYSICAL MODE. sunDiscPhysical returns
-// T * 80 / omega and sunRadianceAt returns 80 * T, so the disc's radiance
+// T * E / omega and sunIrradianceAt returns E * T, so the disc's radiance
 // times its solid angle IS the irradiance the NEE integrates -- the two
 // estimators partition the same light with no seam and no scale factor to
 // agree on. In procedural and Hosek modes sunDisc bundles a 2-8 degree
@@ -8309,8 +8459,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     // curve; with it on, the reddening comes from the
                     // real slant-path optical depth through Rayleigh,
                     // aerosol and ozone instead of from four
-                    // hand-authored constants. See sunRadianceAt.
-                    float3 sun_rad = sunRadianceAt(hit_pt, sun_dir, sun_elev);
+                    // hand-authored constants. See sunIrradianceAt.
+                    float3 sun_rad = sunIrradianceAt(hit_pt, sun_dir, sun_elev);
                     float3 brdf    = h.albedo / 3.14159265358979;
                     if (n_dot_l > 0.0 && any(trans > float3(0.0))) {
                         // Multiply by per-channel transmittance through
@@ -8682,7 +8832,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                             shutter_t01, cone_hit, medium);
                         if (any(trans > float3(0.0))) {
                             float3 sun_rad =
-                                sunRadianceAt(hit_pt, sun_dir, sun_elev);
+                                sunIrradianceAt(hit_pt, sun_dir, sun_elev);
                             float3 contrib =
                                 throughput * sun_rad * trans * fr_spec * ndl;
                             radiance += (b == 0u) ? contrib
@@ -8982,7 +9132,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     // Physical: the same slant-path integral the NEE
                     // site uses, so the light the clouds are lit by and
                     // the light the ground is lit by cannot disagree.
-                    sun_rad = float3(80.0)
+                    sun_rad = kPtSolarIrradiance
                             * sunSlantTransmittance(primary_ro, sun_dir);
                 } else {
                     // Legacy tuned curve, byte-identical to pre-#257.
@@ -8994,9 +9144,15 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     float tau = 0.30;
                     float t_atm = exp(-tau * sun_am);
                     float warmth = saturate((sun_am - 1.0) * 0.30);
+                    // #280: one documented scale, kPtLegacySkyScale, on
+                    // the grey level -- this branch paints its own tint
+                    // and multiplying a painted tint by the physical
+                    // triple would tint twice.  Same treatment as
+                    // sunIrradianceAt's legacy branch, which this is the
+                    // drifted second copy of.
                     sun_rad = lerp(float3(1.00, 0.97, 0.92),
                                    float3(1.55, 0.40, 0.12), warmth)
-                            * (80.0 * t_atm);
+                            * (80.0 * kPtLegacySkyScale * t_atm);
                 }
             }
             // HG in-scatter cosine: incident light propagates as -sun_dir
@@ -9037,6 +9193,15 @@ void main(uint2 tid : SV_DispatchThreadID) {
             // and did -- disagree about what the air was made of the
             // moment one was edited. One constructor now feeds both.
             PtAtmoBody atm_body = atmosphereBody();
+            // The body's centre, for the per-sample multiple-scattering
+            // lookup (#280).  Read out of the SAME pushed field the
+            // atmosphere shell and the ground body read, which is #253's
+            // rule: two copies of "where is the planet" is a horizon in
+            // two places.
+            float  planet_R_ms = sun_extra.w;
+            float3 pc_v_ms = (planet_center_radius.w > 0.0)
+                           ? planet_center_radius.xyz
+                           : float3(0.0, -max(planet_R_ms, 6371008.8), 0.0);
             float rayleigh_int = clouds_p3.w;   // 0 disables, 1 = real
             // Atmospheric in-scatter march (Mie + Rayleigh). Runs in
             // procedural and gradient sky modes -- the engine sun is
@@ -9052,6 +9217,28 @@ void main(uint2 tid : SV_DispatchThreadID) {
             // HDRI mode via the analytical transmittance helper.
             bool march_mie = (vol_params.x > 0.0) && (env_map_present == 0u);
             bool march_ray = (rayleigh_int > 0.0) && (env_map_present == 0u);
+            // --- #280: who owns the sky's molecular term -------------------
+            //
+            // procSky's palette is no longer painted -- the host integrates
+            // the Rayleigh + ozone + multiple-scattering sky at three
+            // anchor directions each frame and procSky interpolates them
+            // (sky_cook_*).  So on a primary MISS in procedural mode the
+            // molecular half of this march is now the SECOND estimator of
+            // the same light, and before #280 that double count was the
+            // sky's dominant term: r_rayleigh 30 made the march about 13x
+            // the painted base it was supposed to be topping up.
+            //
+            // The aerosol half stays.  It is the sharp forward lobe around
+            // the sun -- god rays, the sunset haze glow -- which a
+            // three-anchor interpolation cannot represent and which the
+            // cook therefore deliberately excludes.  The split is by
+            // frequency content: smooth term cooked, peaked term marched,
+            // neither counted twice.
+            //
+            // A primary HIT is untouched: nothing else integrates
+            // camera-to-surface air, and that is where aerial perspective
+            // comes from.
+            if (uint(sun_and_mode.w) == 2u && !primary_hit) march_ray = false;
             // --- Planetary P6 (#260): the span, and who owns it ------------
             //
             // In the physical sky mode a primary MISS has already had its
@@ -9175,7 +9362,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     // crossed the layer.
                     float3 sun_at_sample;
                     if (sun_extra2.y > 0.0) {
-                        sun_at_sample = float3(80.0)
+                        sun_at_sample = kPtSolarIrradiance
                                       * sunSlantTransmittance(sp, sun_dir);
                     } else {
                         sun_at_sample = (sun_elev > 0.0) ? sun_rad
@@ -9192,6 +9379,22 @@ void main(uint2 tid : SV_DispatchThreadID) {
                             v_color += sun_at_sample * trans_sun * in_scatter
                                      * dt * trans_eye;
                         }
+                    }
+                    // Second and higher orders (#280), the same table the
+                    // sky march reads.  Isotropic, so no phase and no sun
+                    // visibility gate: aerial perspective at twilight is
+                    // mostly this term, and gating it on the sun being
+                    // visible FROM THE SAMPLE is what left the pre-#280
+                    // twilight haze black.  Off in the legacy in-scatter
+                    // A/B for the same reason the legacy sun curve is: the
+                    // two halves of an A/B have to differ in one thing.
+                    if (sun_extra2.y > 0.0) {
+                        float3 up_s = normalize(sp - pc_v_ms);
+                        float3 ms_s = ptAtmoMultiScatter(
+                            atm_body, length(sp - pc_v_ms),
+                            dot(up_s, sun_dir));
+                        v_color += (sigma_ray + float3(sigma_mie)) * ms_s
+                                 * dt * trans_eye;
                     }
                     trans_eye *= exp(-sigma_total * dt);
                 }

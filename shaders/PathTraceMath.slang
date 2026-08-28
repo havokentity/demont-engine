@@ -86,6 +86,46 @@ public float fresnelSchlick(float cos_theta, float r0) {
 public static const float kSpectralLambdaMin = 380.0;
 public static const float kSpectralLambdaMax = 730.0;
 
+// --- The radiometric anchor (#280) -----------------------------------------
+//
+// Solar irradiance at 1 AU, per channel, in W/m^2.  This is the number that
+// replaced the literal `float3(80.0)` this engine carried at five sites,
+// and it is an IRRADIANCE -- the audit that settled radiance-versus-
+// irradiance, the three arithmetic proofs it rests on, and the RGB
+// partition that turns one measured total into three channels all live in
+// src/renderer/Atmosphere.h, section 1 and 2.  Short version:
+//
+//   * Every site multiplies this by a BRDF and a cosine with no solid
+//     angle anywhere, which only closes dimensionally for an irradiance.
+//   * Total solar irradiance 1360.8 W/m^2 -- Kopp & Lean 2011, Geophys.
+//     Res. Lett. 38, L01706.
+//   * Split R:G:B by the solar spectral irradiance at 680 / 550 / 440 nm,
+//     (1.474, 1.8504, 1.91198) W/m^2/nm, Bruneton 2017's reference
+//     implementation -- the same three wavelengths this file's Rayleigh,
+//     aerosol and ozone cross sections are tabulated at.
+//   * The three channels PARTITION the spectrum, so R + G + B == 1360.8
+//     and a white Lambertian surface facing the sun reflects the measured
+//     total.
+//
+// tests/pt_atmosphere_test.cpp pins these against the host constants in
+// src/renderer/Atmosphere.h, so the two copies cannot drift.
+public static const float3 kPtSolarIrradiance =
+    float3(383.0546, 480.8712, 496.8742);          // W/m^2, sums to 1360.8
+
+// The single documented factor that carries a PAINTED celestial term from
+// the pre-#280 units (where the sun was 80) into physical ones.  It is
+// mean(kPtSolarIrradiance) / 80 = 5.67.
+//
+// #280 rebases units; it does not re-author paintings.  The sun disc's
+// 250, the moon disc, the star field and procSky's night floor are all
+// hand-authored approximations of things the engine does not integrate,
+// and multiplying each by exactly this one number leaves their brightness
+// RELATIVE to the physical sky precisely where their authors put it.  A
+// per-term retune would be a second set of tuned constants, which is the
+// pattern this issue exists to remove.
+public static const float kPtLegacySkyScale = 5.67;
+// --- end radiometric anchor -------------------------------------------------
+
 // Stratified hero-wavelength sample for path sample index `s` of `n` total.
 // Returns lambda in nanometres in [380, 730]. Stratification across the
 // pixel's spp samples gives fast spectral convergence: instead of n random
@@ -1152,6 +1192,35 @@ public void ptAtmoCoefficients(PtAtmoBody b, float h,
     sigma_t = sigma_s_rayleigh
             + (b.mie_sigma_s + b.mie_sigma_a) * dm
             + b.ozone_sigma_a * doz;
+}
+
+// --- Multiple-scattering table coordinates (#280) --------------------------
+//
+// Hillaire 2020 section 4's Psi_ms table is 32 x 32 over (radius,
+// sun-zenith cosine) and is BUILT ON THE HOST, into a storage buffer
+// (src/renderer/Atmosphere.cpp).  #257 recommended that over a compute
+// pass and it buys two things: the builder is also the software backend's
+// mirror, so there is one implementation of the physics rather than two,
+// and the engine's compute-pipeline count does not move -- which matters
+// against the ~115 s cold-cache MoltenVK pipeline budget.
+//
+// This helper is the shared PARAMETERISATION.  The fetch itself lives at
+// the buffer's declaration in PathTrace.slang; only the mapping from
+// (r, mu_s) to texel space is model, and model belongs here where the host
+// mirror can be pinned against it.
+//
+// The radius axis is linear in altitude rather than Bruneton's rho-remap.
+// That remap exists to condition GRAZING RAYS in a transmittance table;
+// this table has no ray direction on either axis, and its integrand is
+// smooth in altitude, so the remap would buy nothing and cost an inverse.
+public static const int kPtMsLutWidth  = 32;
+public static const int kPtMsLutHeight = 32;
+
+public float2 ptAtmoMsLutUv(PtAtmoBody b, float r, float mu_s) {
+    float span = max(b.top_radius - b.ground_radius, 1.0);
+    float v = saturate((r - b.ground_radius) / span);
+    float u = (clamp(mu_s, -1.0, 1.0) + 1.0) * 0.5;
+    return float2(u, v);
 }
 
 // Both roots of the ray-sphere quadratic, on the same three-body gate

@@ -3,6 +3,7 @@
 add_library(pt_renderer STATIC
     AnalyticBvh.cpp
     Astronomy.cpp
+    Atmosphere.cpp
     BscCatalog.cpp
     Csg/CsgScene.cpp
     EditorOverlay.cpp

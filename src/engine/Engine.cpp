@@ -26,6 +26,7 @@
 #include "../editor/EditorRoutes.h"
 #include "../editor/SceneGraph.h"
 #include "../renderer/Astronomy.h"
+#include "../renderer/Atmosphere.h"   // #280: physical sky units + multi-scatter LUT
 #include "../renderer/BscCatalog.h"
 #include "../renderer/MoonTexture.h"
 #include "../renderer/RestirReservoir.h"
@@ -1027,7 +1028,7 @@ namespace cvar {
     // total to molecular optical thickness) and ground albedo is the
     // hemispherical reflectance of the terrain the sky-dome sits over.
     PT_CVAR(r_sky_turbidity,      "3.0",  "Atmospheric turbidity for the Hosek-Wilkie sky (r_sky_mode = hosek). Real range ~1 (pure pristine air, deep saturated blue) .. 10 (heavy haze/dust, washed-out white horizon). 2-4 = clear day, 6-10 = hazy/urban. Clamped to [1,10]. Ignored unless r_sky_mode = hosek.", CVAR_ARCHIVE);
-    PT_CVAR(r_sky_ground_albedo,  "0.10", "Ground hemispherical albedo fed into the Hosek-Wilkie sky coefficient fit (r_sky_mode = hosek). 0 = black ground (no upwelling skylight boost), ~0.1 = typical soil/vegetation, ~0.3 = sand, ~0.8 = fresh snow (brightens the lower sky). Clamped to [0,1]. Ignored unless r_sky_mode = hosek.", CVAR_ARCHIVE);
+    PT_CVAR(r_sky_ground_albedo,  "0.10", "Ground hemispherical albedo. Feeds TWO things: the Hosek-Wilkie sky coefficient fit (r_sky_mode = hosek), and -- since #280 -- the ground-bounce term in Hillaire 2020 multiple-scattering table, which is what lets the planet's own albedo light the air above it. 0 = black ground (no upwelling skylight boost), ~0.1 = typical soil/vegetation, ~0.3 = sand, ~0.8 = fresh snow (brightens the lower sky). Clamped to [0,1]. Changing it rebuilds the multiple-scattering table (~25 ms), so it is not a per-frame knob.", CVAR_ARCHIVE);
     // --- end Wave 9 hosek-sky ---
 
     // Astronomical sky parameters. r_sky_use_astronomical=1 overrides
@@ -1509,7 +1510,7 @@ namespace cvar {
     // toward sun at each sample. Atmospheric haze + god rays through
     // gaps in geometry (sun shafts).
     PT_CVAR(r_volumetric,           "0",    "Volumetric single-scatter (atmospheric haze + sun shafts). 0 disables; otherwise march r_volumetric_samples points along each primary ray and NEE-shadow-test toward the sun at each.", CVAR_ARCHIVE);
-    PT_CVAR(r_volumetric_density,   "0.002", "Sea-level Mie (aerosol) SCATTERING coefficient in m^-1. Absolute, not a multiplier. Since #257 the aerosol also ABSORBS -- the absorbing half moves with this value so the particles keep their single-scattering albedo of 0.476 (Hillaire 2020), i.e. raising this means MORE of the same aerosol, not a different aerosol. Before #257 the engine had no aerosol absorption at all, an implied albedo of 1, so a given setting now attenuates about 2.1x as much as it used to while scattering exactly as much. PHYSICAL REFERENCE POINTS: 3.996e-6 = Hillaire 2020 clear sky, aerosol optical depth 0.010 at 550 nm. 2.1e-5 = Bruneton 2008, a hazier clear day. 1e-4 to 5e-4 = boundary-layer haze, meteorological range roughly 40 km down to 8 km, where god rays read strongly. 2e-3 and up = fog. THE DEFAULT OF 0.002 IS NOT PHYSICAL and is retained deliberately: it is about 500x the clear-sky value, and r_rayleigh 30 exists to cancel the blue it washes out. #257 measured what retiring the pair costs and left the flip to its own change -- see r_rayleigh for the numbers and the blocker. Set 3.996e-6 here together with r_rayleigh 1.0 for the physical medium.", CVAR_ARCHIVE);
+    PT_CVAR(r_volumetric_density,   "3.996e-6", "Sea-level Mie (aerosol) SCATTERING coefficient in m^-1. Absolute, not a multiplier. The aerosol also ABSORBS (#257) -- the absorbing half moves with this value so the particles keep their single-scattering albedo of 0.476 (Hillaire 2020), i.e. raising this means MORE of the same aerosol, not a different aerosol. PHYSICAL REFERENCE POINTS: 3.996e-6 = Hillaire 2020 clear sky, aerosol optical depth 0.010 at 550 nm, AND IS THE DEFAULT as of #280. 2.1e-5 = Bruneton 2008, a hazier clear day. 1e-4 to 5e-4 = boundary-layer haze, meteorological range roughly 40 km down to 8 km, where god rays read strongly. 2e-3 and up = fog. THIS USED TO DEFAULT TO 0.002 -- about 500x the clear-sky value, with r_rayleigh 30 existing to cancel the blue it washed out. See r_rayleigh for why the pair could not be retired until the unit rebase and multiple scattering landed with it.", CVAR_ARCHIVE);
     PT_CVAR(r_volumetric_anisotropy,"0.7",  "Henyey-Greenstein phase g in [-0.95, 0.95]. +0.7 = forward-peaked atmosphere, 0 = isotropic fog, negative = back-scattering. Higher g makes the sun's halo much brighter when the camera looks near it.", CVAR_ARCHIVE);
     PT_CVAR(r_volumetric_intensity, "1.0",  "Linear scale on the volumetric contribution. Useful to dial god rays up/down without changing the underlying density.", CVAR_ARCHIVE);
     PT_CVAR(r_volumetric_samples,   "16",   "March sample count per primary ray (4..64). More = smoother shafts at proportional GPU cost. 16 is a comfortable default with the denoiser on.", CVAR_ARCHIVE);
@@ -1935,7 +1936,7 @@ namespace cvar {
             "matching that on a 60 fps render means 1/120 s = 0.0083 s. "
             "Only consulted when r_motion_blur == 1.", CVAR_ARCHIVE);
     // --- end Motion blur ------------------------------------------------------
-    PT_CVAR(r_rayleigh,              "30.0",     "Multiple of the real Rayleigh molecular-scattering column. 1.0 = real Earth: per-channel sea-level sigma (5.802, 13.558, 33.100)e-6 m^-1 at 680/550/440 nm (Bodhaine, Wood, Dutton & Slusser 1999, as tabulated in Hillaire 2020) over an 8 km scale height. 0 disables Rayleigh. THE DEFAULT OF 30.0 IS NOT PHYSICAL. It exists to cancel r_volumetric_density, which is about 500x real clear-sky aerosol -- two fudge factors tuned against each other. #257 made the MODEL physical (ozone, aerosol absorption, a corrected Mie scale height, real cross-sections) and deliberately did NOT flip this pair, because measurement showed the flip is not self-contained: procSky is a painted gradient whose literals are topped up by the in-scatter march, and the fixtures' own r_exposure 0.05 was chosen against the inflated result, so retiring the pair alone drops the noon zenith about 7x below a physically consistent sky and needs the unit rebase plus a multiple-scattering term to land right. Set 1.0 here with r_volumetric_density 3.996e-6 for the real medium and expect a darker, more saturated, single-scattering sky.", CVAR_ARCHIVE);
+    PT_CVAR(r_rayleigh,              "1.0",      "Multiple of the real Rayleigh molecular-scattering column. 1.0 = real Earth and IS THE DEFAULT as of #280: per-channel sea-level sigma (5.802, 13.558, 33.100)e-6 m^-1 at 680/550/440 nm (Bodhaine, Wood, Dutton & Slusser 1999, as tabulated in Hillaire 2020) over an 8 km scale height. 0 disables Rayleigh, which now means a genuinely dark daytime sky rather than a slightly duller painted one -- the sky is the integral, so removing the species that makes it blue removes the sky. THIS USED TO DEFAULT TO 30.0, WHICH WAS NOT PHYSICAL. It existed to cancel r_volumetric_density, which was about 500x real clear-sky aerosol: two fudge factors tuned against each other. #257 made the MODEL physical (ozone, aerosol absorption, a corrected Mie scale height, real cross sections) and measured that retiring the pair alone drops the noon zenith about 7x below a physically consistent sky, because procSky was a painted gradient the inflated march was topping up and the fixtures' own exposures had been chosen against the inflated result. #280 supplied the three things that were missing -- physical radiometric units (the sun is 1360.8 W/m^2, Kopp & Lean 2011, not 80), Hillaire 2020 multiple scattering, and an integrated rather than painted procSky palette -- and retired the pair.", CVAR_ARCHIVE);
     PT_CVAR(r_ozone,                 "1.0",      "Multiple of the real stratospheric ozone column, and unlike r_rayleigh / r_volumetric_density this one DOES default to its physical value, because nothing was ever tuned against its absence. 1.0 = the US Standard Atmosphere 1976 profile, fit as a tent peaking at 25 km with a 15 km half-width (Bruneton 2017), with peak absorption (0.650, 1.881, 0.085)e-6 m^-1 at 680/550/440 nm from the Serdyuchenko et al. 2014 / Gorshelev et al. 2014 cross-sections. 0 removes ozone entirely, which is what this engine did before #257 -- set it to 0 and watch a post-sunset zenith turn brown, because ozone's Chappuis band absorbing red-orange along the long twilight slant path is the ONLY reason the blue hour is blue. Ozone absorbs and does not scatter, so it never brightens anything; it only removes the part of the spectrum that would otherwise dominate at grazing sun angles.", CVAR_ARCHIVE);
     PT_CVAR(r_planet_radius,         "6371008.8", "Planet radius in metres for spherical-Earth atmospheric scattering (issue #51). Default 6,371,008.8 m = the IUGG mean Earth radius R_1 = (2a + b)/3 from the WGS-84 ellipsoid (a = 6,378,137, b = 6,356,752.314245). The mean radius is the right constant here: the scattering model treats the atmosphere as concentric SPHERICAL shells, so the sphere that best represents the whole body is what the optical-depth integral wants -- the WGS-84 equatorial radius is a geodetic reference for an ellipsoid, and using it inflates the shell by 7.1 km everywhere off the equator. The path tracer's `atmosphericTransmittance` numerically integrates Mie + Rayleigh optical depth along a chord through a thin shell around a sphere of this radius (centre at world origin + offset so y=0 sits on the surface). Set to 0 to fall back to the legacy planar exponential integral (1/sin(elev) airmass) -- useful as a debug A/B or for tiny-scene tests where curvature is invisible. Real values for other bodies (mean radii): Moon 1,737,400, Mars 3,389,500, Venus 6,051,800. Affects only the atmosphere integral, not collision / shadow geometry.", CVAR_ARCHIVE);
     // Planetary P0 (#254). The sky chain historically hard-coded "up" to
@@ -1965,7 +1966,7 @@ namespace cvar {
             "later phase. Independent of r_planet_radius, which sets "
             "the ATMOSPHERE shell radius; this cvar sets whether the "
             "world frame itself is curved.", CVAR_ARCHIVE);
-    PT_CVAR(r_sun_physical_transmittance, "0",
+    PT_CVAR(r_sun_physical_transmittance, "1",
             "Compute sunlight's colour and brightness from the real "
             "atmospheric slant path instead of from a tuned curve "
             "(planetary P3, issue #257). 0 = the historical behaviour, "
@@ -1985,9 +1986,13 @@ namespace cvar {
             "sunlight from a tuned curve to a physical one changes the "
             "brightness of every lit surface in every scene (measured at "
             "60 degrees elevation: the physical sun is about 30% brighter "
-            "and differently tinted), so the flip belongs with the "
-            "radiometric unit rebase rather than being smuggled in "
-            "underneath it.", CVAR_ARCHIVE);
+            "and differently tinted), so #257 left the flip to the "
+            "radiometric unit rebase rather than smuggling it in "
+            "underneath. THAT REBASE IS #280, AND IT FLIPPED THIS TO 1. "
+            "0 remains as the A/B against the tuned curve, and the curve "
+            "is carried across the unit change by one documented factor "
+            "(kPtLegacySkyScale) so the comparison is still like for "
+            "like.", CVAR_ARCHIVE);
     PT_CVAR(r_planet_ground,         "0",
             "Render the planet itself as an analytic body (planetary P3, "
             "issue #257). 0 = off, which is every scene authored before "
@@ -7199,6 +7204,87 @@ void Engine::EnsureInstanceDescriptors() {
 #endif  // PT_PLANET_ENABLED
 }
 
+// --- #280: the multiple-scattering table --------------------------------
+//
+// Hillaire 2020 section 4's Psi_ms(r, mu_s), 32 x 32, built on the CPU into
+// a storage buffer.  #257 recommended CPU-into-a-buffer over a compute pass
+// and both of its reasons hold: the builder in src/renderer/Atmosphere.cpp
+// is also what the software backend and the host sky cook evaluate, so the
+// physics has ONE implementation rather than a shader and a mirror that can
+// drift; and the engine's compute-pipeline count does not move, which
+// matters against the ~115 s cold-cache MoltenVK pipeline budget the first
+// Vulkan golden cell already sits inside.
+//
+// The table is a function of exactly five cvars.  Rebuilding it costs ~25 ms
+// on twelve threads, so this compares them and returns immediately when
+// nothing moved -- which is every frame except the one after a slider drag.
+// A cached key rather than a dirty flag, because a dirty flag is a thing a
+// future cvar can forget to set, and the failure mode of forgetting is a
+// sky that silently keeps the old medium's multiple scattering.
+void Engine::EnsureAtmosphereMultiScatterLut() {
+    if (device_ == nullptr) return;
+    auto& C = pt::console::Console::Get();
+    AtmoMsKey key;
+    key.radius   = 6371008.8f;
+    key.rayleigh = 1.0f;
+    key.density  = 3.996e-6f;
+    key.ozone    = 1.0f;
+    key.ground_albedo = 0.10f;
+    if (auto* v = C.FindCVar("r_planet_radius"))       key.radius   = v->GetFloat();
+    if (auto* v = C.FindCVar("r_rayleigh"))            key.rayleigh = v->GetFloat();
+    if (auto* v = C.FindCVar("r_volumetric_density"))  key.density  = v->GetFloat();
+    if (auto* v = C.FindCVar("r_ozone"))               key.ozone    = v->GetFloat();
+    if (auto* v = C.FindCVar("r_sky_ground_albedo"))   key.ground_albedo = v->GetFloat();
+    // The planar A/B (r_planet_radius 0) still has a medium -- only its
+    // altitude function differs -- so feed the table the real mean radius
+    // there, exactly as atmosphereBody() does on the GPU.  The two halves
+    // of that A/B must differ in one thing.
+    if (!(key.radius > 0.0f)) key.radius = 6371008.8f;
+    if (key.ground_albedo < 0.0f) key.ground_albedo = 0.0f;
+    if (key.ground_albedo > 1.0f) key.ground_albedo = 1.0f;
+
+    const bool have_buffer = (atmo_ms_lut_id_ != 0);
+    if (have_buffer && key == atmo_ms_key_) return;
+
+    if (atmo_ms_lut_data_.size() != static_cast<std::size_t>(pt::atmo::kMsLutFloats)) {
+        atmo_ms_lut_data_.assign(static_cast<std::size_t>(pt::atmo::kMsLutFloats), 0.0f);
+    }
+    pt::atmo::Body body = pt::atmo::Scale(
+        pt::atmo::Earth(static_cast<double>(key.radius)),
+        static_cast<double>(key.rayleigh),
+        static_cast<double>(key.density),
+        static_cast<double>(key.ozone));
+    pt::atmo::MsLutParams mp;
+    mp.ground_albedo = static_cast<double>(key.ground_albedo);
+    const auto t0 = std::chrono::steady_clock::now();
+    pt::atmo::BuildMultiScatterLut(body, mp, atmo_ms_lut_data_.data());
+    const auto t1 = std::chrono::steady_clock::now();
+
+    if (!have_buffer) {
+        auto buf = device_->CreateBuffer({
+            .size = atmo_ms_lut_data_.size() * sizeof(float),
+            .usage = pt::rhi::BufferUsage::Storage,
+            .debug_name = "atmo_ms_lut",
+        });
+        if (buf.id == 0) {
+            LOG_ERROR("sky: multiple-scattering LUT buffer allocation failed");
+            return;
+        }
+        atmo_ms_lut_id_ = buf.id;
+    }
+    device_->WriteBuffer(pt::rhi::BufferHandle{atmo_ms_lut_id_},
+                         atmo_ms_lut_data_.data(),
+                         atmo_ms_lut_data_.size() * sizeof(float));
+    atmo_ms_key_ = key;
+    LOG_INFO("sky: multiple-scattering LUT rebuilt in {:.1f} ms "
+             "(rayleigh {:g}, aerosol {:g} m^-1, ozone {:g}, albedo {:g})",
+             std::chrono::duration<double, std::milli>(t1 - t0).count(),
+             static_cast<double>(key.rayleigh),
+             static_cast<double>(key.density),
+             static_cast<double>(key.ozone),
+             static_cast<double>(key.ground_albedo));
+}
+
 void Engine::UpdateWorldFrame() {
     // ========================================================================
     // PLANETARY P1 (#255) -- THE CONVERSION BOUNDARY
@@ -8501,6 +8587,19 @@ void Engine::RenderFrame() {
     if (slot20.id != 0) cb->BindBuffer(20, slot20, 0);
     // --- end Planetary P4 --------------------------------------------------
 #endif
+    // --- #280: multiple-scattering table (engine slot 21 -> vk::binding 46) --
+    // ALWAYS bind something, for the reason slots 18..20 already carry: this
+    // is now the last buffer slot, so a Metal dispatch that left it unbound
+    // would shift what the parsed layout expects. The placeholder is
+    // zero-filled and the shader's ptMsLutReady() reads texel 0's w, which
+    // the zero fill cannot set -- so an unbuilt table contributes exactly
+    // nothing rather than a table of zeroes that would read as "multiple
+    // scattering is negligible here".
+    EnsureAtmosphereMultiScatterLut();
+    pt::rhi::BufferHandle slot21 = (atmo_ms_lut_id_ != 0)
+        ? pt::rhi::BufferHandle{atmo_ms_lut_id_}
+        : pt::rhi::BufferHandle{placeholder_storage_id_};
+    if (slot21.id != 0) cb->BindBuffer(21, slot21, 0);
     // Engine slots 11/12/13 -> vk::bindings 24/25/26: the MetalFX
     // specular-guidance trio (issue #118). Path tracer writes them
     // alongside the existing G-buffers when the write_specular_*_gbuffer
@@ -9267,6 +9366,18 @@ void Engine::RenderFrame() {
         float water_scatter[4];
         float water_scatter2[4];
         // --- end Planetary P7 ---------------------------------------------
+        // --- #280: the cooked sky palette --------------------------------
+        // procSky's day palette, integrated on the host once per frame
+        // through this scene's own medium instead of authored as
+        // literals. Three radiances in W/m^2/sr -- zenith, horizon toward
+        // the sun, horizon away from it -- plus a "was this cooked?" flag
+        // in sky_cook_zenith[3]. Field semantics live on the matching
+        // block in PathTrace.slang's Push / Frame declarations. Pure tail
+        // append, so the SoftwareTracer.cpp byte offsets stay valid.
+        float sky_cook_zenith[4];
+        float sky_cook_horizon_sun[4];
+        float sky_cook_horizon_anti[4];
+        // --- end #280 ----------------------------------------------------
     } push{};
     // CONVERSION BOUNDARY (#255). The single source for the eye position
     // every shader sees; the nine per-pass memcpy(x.pos_fovtan, ...)
@@ -11433,7 +11544,10 @@ void Engine::RenderFrame() {
                           ocean_tan_n + ocean_tan_o + ocean_phase +
                           ocean_slope */
                   + 32 /* Planetary P7 (#261): water_scatter +
-                          water_scatter2 */);
+                          water_scatter2 */
+                  + 48 /* #280: sky_cook_zenith + sky_cook_horizon_sun +
+                          sky_cook_horizon_anti -- procSky's palette,
+                          integrated on the host instead of authored */);
     // Raw-byte offsets the SOFTWARE tracer mirrors (SoftwareTracer.cpp:
     // kSunAndModeOffset / kAccumParamsOffset / kTonemapParamsOffset).
     // The CPU backend decodes these fields straight out of the pushed
@@ -11640,6 +11754,72 @@ void Engine::RenderFrame() {
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     static_assert(offsetof(PtPush, planet_terrain) % 16 == 0,
                   "PtPush::planet_terrain must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    // --- #280: cook procSky's palette ------------------------------------
+    //
+    // procSky used to interpolate six hand-authored literals. It now
+    // interpolates three RADIANCES integrated here, once per frame, through
+    // the same medium the shader marches: the sky at the zenith and at the
+    // horizon in the sun's azimuth and in the anti-solar one, carrying
+    // Rayleigh single scattering, ozone on the sun's slant path, and
+    // Hillaire 2020's multiple-scattering term.
+    //
+    // Deliberately NOT the aerosol. A three-anchor interpolation cannot
+    // represent the sharp forward lobe an aerosol has around the sun, and
+    // the primary-ray in-scatter march computes exactly that lobe -- so the
+    // split is by frequency content, smooth term cooked and peaked term
+    // marched, and neither is counted twice. At the real sea-level loading
+    // the excluded term is small anyway: vertical Rayleigh optical depth in
+    // blue is 0.265 against the aerosol's 0.0048.
+    //
+    // 0.14 ms measured. It is skipped entirely outside procedural mode --
+    // mode 4 marches every pixel and modes 0/1/3 never read the lane.
+    {
+        const bool cook_needed = (sky_mode_id == 2u);
+        if (cook_needed) {
+            pt::atmo::Body body = pt::atmo::Scale(
+                pt::atmo::Earth(static_cast<double>(atmo_ms_key_.radius)),
+                static_cast<double>(atmo_ms_key_.rayleigh),
+                static_cast<double>(atmo_ms_key_.density),
+                static_cast<double>(atmo_ms_key_.ozone));
+            // Observer altitude above the ground radius. Read out of the
+            // SAME pushed field the shell and the ground body read (#253's
+            // rule); in the planar frame that field is zero and the camera
+            // height is its y, exactly as planetAltitude() resolves it on
+            // the GPU.
+            double alt = static_cast<double>(push.pos_fovtan[1]);
+            if (push.planet_center_radius[3] > 0.0f) {
+                const double dx = static_cast<double>(push.pos_fovtan[0])
+                                - static_cast<double>(push.planet_center_radius[0]);
+                const double dy = static_cast<double>(push.pos_fovtan[1])
+                                - static_cast<double>(push.planet_center_radius[1]);
+                const double dz = static_cast<double>(push.pos_fovtan[2])
+                                - static_cast<double>(push.planet_center_radius[2]);
+                alt = std::sqrt(dx * dx + dy * dy + dz * dz)
+                    - static_cast<double>(push.planet_center_radius[3]);
+            }
+            pt::atmo::SkyCookParams cp;
+            // up_xyz.w is sin(solar elevation) AT THE CAMERA -- the local-up
+            // form P0 introduced, so a camera on the far side of the planet
+            // cooks a night sky rather than the sub-solar one.
+            cp.sun_elev_sin = static_cast<double>(push.up_xyz[3]);
+            cp.observer_alt = alt;
+            const float* lut = atmo_ms_lut_data_.empty()
+                             ? nullptr : atmo_ms_lut_data_.data();
+            const pt::atmo::SkyCook ck = pt::atmo::CookSky(body, lut, cp);
+            for (int c = 0; c < 3; ++c) {
+                push.sky_cook_zenith[c]       = ck.zenith[c];
+                push.sky_cook_horizon_sun[c]  = ck.horizon_sun[c];
+                push.sky_cook_horizon_anti[c] = ck.horizon_anti[c];
+            }
+            push.sky_cook_zenith[3] = 1.0f;   // "the host cooked this frame"
+        }
+    }
+    // #280: three vec4 appended at the tail of PtPush. Same pin as every
+    // lane before them -- a 12-byte-shifted palette would recolour the sky
+    // rather than fail loudly.
+    static_assert(offsetof(PtPush, sky_cook_zenith) % 16 == 0,
+                  "PtPush::sky_cook_zenith must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
