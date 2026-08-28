@@ -1120,10 +1120,14 @@ private:
     // -- and asserted against this depth below, so the ring is a mechanism
     // rather than a hope.
     //
-    // The RIGHT fix is still a GPU-timeline upload -- a staging buffer
-    // blitted into the texture inside the frame's own command buffer --
-    // which needs a CommandBuffer::CopyBufferToTexture verb the RHI does not
-    // have. That is a three-backend change and this is not; noted, not spent.
+    // The RIGHT fix for a HOST-produced field is still a GPU-timeline
+    // upload -- a staging buffer blitted into the texture inside the
+    // frame's own command buffer. (Both #259 and #295 wrote here that this
+    // "needs a CommandBuffer::CopyBufferToTexture verb the RHI does not
+    // have". The RHI has had that verb since P2, src/rhi/CommandBuffer.h.
+    // Correcting the claim rather than acting on it, because for the
+    // planetary cascades the field is no longer host-produced at all --
+    // see below -- so there is nothing left to copy.)
     static constexpr int kOceanUploadRing = 3;
     // The write for frame F happens in Tick, BEFORE BeginFrame for the same
     // frame, so the frames that can still be executing when it lands are

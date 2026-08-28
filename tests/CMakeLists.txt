@@ -546,6 +546,13 @@ target_compile_definitions(pt_planet_ocean PRIVATE
 # and the test constructs one per TEST_CASE.
 if(APPLE)
     add_executable(pt_ocean_gpu pt_ocean_gpu_test.cpp)
+    # pt_physics is listed explicitly even though pt_rhi already drags it
+    # in four hops down (pt_rhi -> pt_rhi_metal -> pt_app_window ->
+    # pt_console -> pt_editor -> pt_physics). Apple's ld64 then prints one
+    # `ignoring duplicate libraries` note, because CMake emits the archive
+    # at both depths; it is informational and the link is correct. The
+    # alternative -- depending on that six-target chain to keep supplying
+    # pt::ocean::OceanFFT -- is a worse trade than one linker note.
     target_link_libraries(pt_ocean_gpu PRIVATE doctest::doctest pt_rhi pt_physics)
     target_compile_definitions(pt_ocean_gpu PRIVATE
         PT_ENGINE_H_PATH="${CMAKE_SOURCE_DIR}/src/engine/Engine.h")
