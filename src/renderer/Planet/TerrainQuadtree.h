@@ -208,6 +208,18 @@ public:
     int  InFlight() const noexcept { return in_flight_.load(std::memory_order_acquire); }
     bool Idle() const;
 
+    // Block until every requested bake has landed in `done_` -- i.e. the
+    // queue is empty AND no worker is mid-bake. This is the barrier that
+    // turns terrain settling from a race into a computation: see the
+    // "SETTLING IS A BARRIER" note in PlanetTerrain.h. Returns immediately
+    // when the pool is already idle or stopped, so it is safe to call
+    // before anything has been requested.
+    //
+    // NOT for the render thread outside a capture. An interactive frame
+    // must never block on a bake -- that is the whole reason the pool is
+    // asynchronous.
+    void WaitIdle();
+
 private:
     void WorkerLoop();
 
@@ -218,11 +230,17 @@ private:
 
     mutable std::mutex            mu_;
     std::condition_variable       cv_;
+    // Signalled whenever a worker finishes a bake, so WaitIdle can observe
+    // the queue draining. Separate from cv_ because cv_ wakes WORKERS and a
+    // notify_all on it would spin every thread in the pool.
+    std::condition_variable       idle_cv_;
     std::vector<ChunkKey>         queue_;         // back() is next
     const ElevationField*         field_ = nullptr;
     PlanetSite                    site_{};
 
-    std::mutex                    out_mu_;
+    // Guards done_. Lock order is mu_ then out_mu_ (see Idle); never the
+    // reverse. `mutable` so Idle() can be const.
+    mutable std::mutex            out_mu_;
     std::vector<TerrainChunkData> done_;
 };
 

@@ -1917,14 +1917,14 @@ private:
     // "pipelines ready" message on exit -- avoids a per-frame log
     // spam during the 1-3s build window.
     bool                                        loading_frame_active_  = false;
-    // --- Planetary P4 (#258): the capture settle gate --------------------
-    // True while streamed terrain has not converged on a residency set for
-    // the current camera. Treated exactly like a loading frame: the world
-    // does not advance (freeze_sims_for_capture) and the frame does not
-    // count against the smoke budget, so a golden capture starts from a
-    // settled planet rather than from whatever had streamed in by then.
-    // Bounded by pt_planet_settle so a misconfigured scene cannot hang the
-    // smoke test forever.
+    // --- Planetary P4 (#258): the capture settle barrier -----------------
+    // True for the single frame in which PlanetTerrain::Settle ran the
+    // selector to its fixed point. Treated exactly like a loading frame:
+    // the world does not advance (freeze_sims_for_capture) and the frame
+    // does not count against the smoke budget, so a golden capture starts
+    // from a settled planet rather than from whatever had streamed in by
+    // then. Bounded by pt_planet_settle_rounds so a misconfigured scene
+    // cannot hang the smoke test forever.
     bool                                        planet_settling_       = false;
     // Set by the `earth` scene seed and by the `planet_stand` command:
     // snap the camera onto the terrain surface once the streamer exists.
@@ -1932,7 +1932,28 @@ private:
     // request pending".
     double                                      planet_stand_eye_m_    = -1.0;
     bool                                        planet_stand_done_     = false;
-    std::uint32_t                               planet_settle_frames_  = 0;
+    // The settle barrier runs once per streamer lifetime. Cleared when
+    // r_planet_terrain re-inits the streamer, so toggling terrain off and
+    // on inside one smoke run re-settles rather than capturing whatever
+    // the fresh streamer had managed on its first frame.
+    bool                                        planet_settled_        = false;
+    // Set on the barrier frame, consumed on the first frame that actually
+    // counts, where it forces one more accumulator reset.
+    //
+    // Whether the barrier frame DISPATCHES is a race the capture must not
+    // inherit. UpdatePlanetTerrain runs before RenderFrame's loading-frame
+    // gate, so if the async pipeline build is still in flight the barrier
+    // frame returns before the path-trace dispatch and contributes nothing;
+    // if the build has already landed, the same frame dispatches one sample
+    // at the held frame_index_ and that sample is in the accumulator when
+    // the capture starts. The pipeline build and the terrain settle both
+    // take a second or two, so which one wins is wall clock: measured once
+    // in 36 renders of planet_surface, as a mean delta of 1.21 spread
+    // evenly over every lit pixel and zero in the sky -- the signature of a
+    // sample-count difference rather than a geometry one. Discarding the
+    // accumulator on the first counted frame makes the capture exactly the
+    // frames that were counted, either way.
+    bool                                        planet_settle_flush_   = false;
     // --- end Planetary P4 -------------------------------------------------
     // True while Run() is executing with a smoke-frame budget
     // (pt_smoke_frames > 0). Tick reads it to freeze dt-integrating
