@@ -292,9 +292,13 @@ TEST_CASE("the ocean converges to Cox-Munk from orbit and to a near-mirror at th
     // whole measured constant. 2 460 m is the pixel footprint at 400 km on
     // a 1080p 60-degree camera (400e3 * 1.07e-3 * ... -- the number that
     // matters is that it is far past cascade 0's 1793 m period).
-    const double far = oceanBrdfAlpha2(sigma2, cm, 0.0, grid, 1.0e5);
-    CHECK(far == doctest::Approx(cm).epsilon(1e-12));
-    CHECK(std::sqrt(std::sqrt(far)) ==
+    // NOT named `far`: <minwindef.h> defines `far` and `near` as empty
+    // macros (the 16-bit segment keywords), so `const double far = ...`
+    // preprocesses to `const double = ...` and MSVC reports C2513. clang
+    // never sees it, so this only breaks the Windows lane.
+    const double alpha2_far = oceanBrdfAlpha2(sigma2, cm, 0.0, grid, 1.0e5);
+    CHECK(alpha2_far == doctest::Approx(cm).epsilon(1e-12));
+    CHECK(std::sqrt(std::sqrt(alpha2_far)) ==
           doctest::Approx(CoxMunkRoughness(kDefaultWind)).epsilon(1e-9));
 
     // At the bow the cascades carry everything they can and what is left is
