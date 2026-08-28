@@ -262,6 +262,17 @@ public PtRayCone ptConeAdvance(PtRayCone c, float t) {
     return ptConeMake(c.w + c.spread * max(t, 0.0), c.spread);
 }
 
+// The footprint DIAMETER at distance t along the ray -- the same
+// arithmetic as ptConeAdvance's width lane, exposed as a scalar because
+// PtRayCone's fields are module-private and a caller outside this module
+// cannot read them. Planetary P4 (#258) needs it at the terrain hit, where
+// the sub-footprint slope variance is folded into microfacet roughness and
+// the fold has to know the footprint before the bounce loop advances the
+// cone.
+public float ptConeWidthAt(PtRayCone c, float t) {
+    return c.w + c.spread * max(t, 0.0);
+}
+
 // Wachter & Binder, "A Fast and Robust Method for Avoiding
 // Self-Intersection" (Ray Tracing Gems ch. 6), verbatim.
 //

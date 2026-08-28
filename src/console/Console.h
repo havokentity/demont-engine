@@ -92,6 +92,20 @@ struct CVar {
 
     std::function<void(const CVar&)> on_change;
 
+    // True once anything has ASSIGNED this cvar -- a console line, a cfg
+    // file, a --extra override, a CLI flag. False means "still whatever it
+    // was registered with, and nobody has expressed an opinion".
+    //
+    // Added for planetary P4 (#258)'s scene seed, which needs to write a
+    // default only where the scene was silent. The obvious test,
+    // `value == default_value`, cannot tell "untouched" from "explicitly
+    // set to the default value" -- and that difference is load-bearing:
+    // `r_planet_terrain 0` IS the default, so a fixture turning terrain off
+    // in an r_scene_default=earth scene had its choice silently overwritten
+    // by the seed. It took a measurement that came out suspiciously
+    // identical to notice.
+    bool assigned = false;
+
     // Coerced accessors.  All values are stored as strings; these parse on
     // demand and gracefully return defaults on parse failure.
     int   GetInt()   const;

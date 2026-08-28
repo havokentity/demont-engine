@@ -11,6 +11,10 @@ add_library(pt_renderer STATIC
     HdrImage.cpp
     LightTree.cpp
     MoonTexture.cpp
+    Planet/CubedSphere.cpp
+    Planet/ElevationField.cpp
+    Planet/TerrainChunk.cpp
+    Planet/TerrainQuadtree.cpp
     TriangleBvh.cpp
 )
 target_include_directories(pt_renderer PUBLIC ${CMAKE_SOURCE_DIR}/src)

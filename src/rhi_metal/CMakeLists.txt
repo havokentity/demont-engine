@@ -73,6 +73,11 @@ if(PT_LIGHT_TREE)
 else()
     set(_pt_light_tree_def "-DPT_LIGHT_TREE_ENABLED=0")
 endif()
+if(PT_PLANET_ENABLED)
+    set(_pt_planet_def "-DPT_PLANET_ENABLED=1")
+else()
+    set(_pt_planet_def "-DPT_PLANET_ENABLED=0")
+endif()
 # --- end Megakernel feature gates -----------------------------------------
 pt_compile_slang(
     TARGET  pt_rhi_metal
@@ -81,7 +86,7 @@ pt_compile_slang(
     ENTRY   main
     TARGETS metal
     MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals RestirReservoir
-    EXTRA_DEFINES ${_pt_water_def} ${_pt_light_tree_def}
+    EXTRA_DEFINES ${_pt_water_def} ${_pt_light_tree_def} ${_pt_planet_def}
 )
 pt_compile_slang(
     TARGET  pt_rhi_metal

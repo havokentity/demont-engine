@@ -5,6 +5,7 @@
 #include "Particle.h"
 #include "RigidBody.h"
 
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -107,6 +108,49 @@ public:
     // Forces in Phase 1: constant gravity on Y (m/s^2, signed --
     // pass -9.81 for Earth pointing down).
     void Step(float frame_dt, int substeps, float gravity_y, float damping_per_substep);
+
+    // --- Planetary P4 (#258): radial gravity -----------------------------
+    //
+    // A planet's gravity points at its centre, not at world -Y. Once the
+    // ground is an ellipsoid, "down" is a function of where you are stood,
+    // and a constant (0, -9.81, 0) is only correct within a few hundred
+    // metres of the reference site.
+    //
+    // The constant is real and cited: WGS-84's standard gravitational
+    // parameter GM = 3.986004418e14 m^3/s^2 (NIMA TR8350.2, 3rd ed.),
+    // which includes the atmosphere. At the mean radius it gives
+    // GM/R^2 = 9.820 m/s^2 -- the true geocentric value; the familiar
+    // 9.81 is the SURFACE value at ~45 deg latitude, which additionally
+    // carries the centrifugal term of Earth's rotation and the ellipsoid's
+    // own flattening. Neither is modelled here, and neither matters at
+    // 0.2%: what matters is that the direction is now right.
+    //
+    // FLOAT32 IS ENOUGH FOR AN ACCELERATION, even with a centre 6.37e6 m
+    // away. |p - c| carries a 0.5 m ULP at that magnitude, which is 8e-8
+    // of a radian in direction and 1e-7 in |d|^2 -- a 1e-6 m/s^2 error on
+    // 9.8. Positions themselves stay near the origin (P1's anchored
+    // frame), so nothing here forms a planetary-magnitude POSITION.
+    struct GravityField {
+        // Planar (the default, and bit-identical to the scalar overload):
+        // a = (0, gravity_y, 0) everywhere.
+        glm::vec3 planar{0.0f, -9.81f, 0.0f};
+        // Radial: a = -mu * d / |d|^3 with d = p - centre.
+        bool      radial = false;
+        glm::vec3 centre{0.0f};
+        float     mu     = 0.0f;   // m^3 / s^2
+
+        glm::vec3 At(const glm::vec3& p) const {
+            if (!radial) return planar;
+            const glm::vec3 d = p - centre;
+            const float r2 = glm::dot(d, d);
+            if (!(r2 > 0.0f)) return planar;
+            const float r = std::sqrt(r2);
+            return d * (-mu / (r2 * r));
+        }
+    };
+    void Step(float frame_dt, int substeps, const GravityField& gravity,
+              float damping_per_substep);
+    // --- end Planetary P4 -------------------------------------------------
 
     // Iteration helpers for the engine's per-frame writeback to the
     // analytic-primitive buffer. The engine indexes by particle id
@@ -212,7 +256,7 @@ private:
     //      moving curr only
     //   3. Fold the resulting position correction back into vel, which
     //      reproduces the Phase 1 implicit-velocity reflection exactly
-    void Substep(float sdt, const glm::vec3& accel, float damping);
+    void Substep(float sdt, const GravityField& gravity, float damping);
 
     // --- Phase 2a rigid bodies (#138) -------------------------------
     // generation is uint32_t for the same reason as Slot::generation
@@ -238,7 +282,7 @@ private:
     // rigid bodies do NOT interact across pools -- they're separate
     // worlds for now; if a user needs them to talk, Phase 2b's
     // unified solver lands that.
-    void SubstepRigidBodies(float sdt, const glm::vec3& accel,
+    void SubstepRigidBodies(float sdt, const GravityField& gravity,
                             float linear_damping, float angular_damping);
 
     std::vector<RbSlot> rb_slots_{kMaxRigidBodies};

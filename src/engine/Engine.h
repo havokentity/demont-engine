@@ -11,6 +11,7 @@
 #include "../rhi/Types.h"
 #include "CaptureFormat.h"
 #include "LensFlare.h"
+#include "PlanetTerrain.h"
 
 #include <glm/glm.hpp>
 
@@ -747,6 +748,28 @@ private:
     // them emit render-frame floats and a split-anchor frame renders
     // half the scene in the wrong place.
     void UpdateWorldFrame();
+
+    // --- Planetary P4 (#258) ---------------------------------------------
+    // Per-frame terrain streaming: reads the cvars, (re)starts the streamer
+    // when a structural one changed, runs one selector/bake/build round and
+    // republishes the TLAS. Called from RenderFrame BEFORE the dispatch
+    // fills tlas_present. Deliberately does NOT touch bake_phase_ -- the
+    // loading-frame gate that blanks the screen for a CSG bake must never
+    // fire for terrain streaming.
+    void UpdatePlanetTerrain();
+    // Rebuild or repoint the scene TLAS from the current instance set
+    // (mesh at instance_id 0, terrain at 1..N). Takes the drain-free
+    // Device::UpdateTLASInstances path whenever the capacity is unchanged,
+    // and only falls back to destroy+CreateTLAS when it is not.
+    void PublishSceneTlas();
+    // Upload the per-instance descriptor SSBO. Index 0 carries the mesh's
+    // material so PathTrace.slang can stop hard-coding it (#53).
+    void EnsureInstanceDescriptors();
+    // Geodetic altitude above the terrain at a canonical world position,
+    // or the planar y when there is no terrain. Feeds the world frame's
+    // lattice choice, the camera-speed scaler and physics ground contact.
+    double TerrainAltitude(const glm::dvec3& p_world) const;
+    // --- end Planetary P4 -------------------------------------------------
     // Wave 8 PBR (#26): upload per-vertex mesh UVs (2 floats per vertex,
     // parallel to mesh_positions) into mesh_uv_buf_id_. Call AFTER
     // RebuildMeshResources (which destroys the previous UV buffer). A
@@ -1268,6 +1291,33 @@ private:
     std::uint64_t                               scene_tlas_id_         = 0;
     std::uint64_t                               box_vbuf_id_           = 0;
     std::uint64_t                               box_ibuf_id_           = 0;
+    // --- Planetary P4 (#258): streamed terrain ---------------------------
+    // Owns the chunk arena, the shared index arena, the per-chunk BLASes
+    // and the TLAS instance array. Non-null only while r_planet_terrain is
+    // on AND the backend has hardware ray tracing. See PlanetTerrain.h for
+    // the four-stage pipeline and for what still stalls.
+    std::unique_ptr<pt::engine::PlanetTerrain>  planet_terrain_;
+    // Per-instance descriptor SSBO (engine buffer slot 20 -> vk::binding
+    // 39). Index 0 is the CSG / glTF mesh and carries exactly the
+    // constants PathTrace.slang used to hard-code, which is what keeps a
+    // planet-free scene bit-identical; 1..N are terrain chunks.
+    std::uint64_t                               instance_desc_id_      = 0;
+    std::uint32_t                               instance_desc_capacity_ = 0;
+    // Capacity the scene TLAS was created with. Device::UpdateTLASInstances
+    // never grows a structure, so a change here means destroy + recreate.
+    std::uint32_t                               scene_tlas_capacity_   = 0;
+    // Stall counter snapshot from the frame the terrain last published, so
+    // `planet_stats` can report the DELTA rather than a lifetime total --
+    // the claim being tested is "a paced update moves it by zero".
+    std::uint64_t                               planet_stall_baseline_ = 0;
+    // Cumulative evidence for the phase's central streaming claim. Every
+    // drain-free republish should add ZERO to Device::AccelGpuStallCount;
+    // the totals are logged at shutdown so the claim is measured rather
+    // than asserted. P0 (#254) added the counter for exactly this.
+    std::uint64_t                               planet_tlas_publishes_ = 0;
+    std::uint64_t                               planet_tlas_stalls_    = 0;
+    std::uint64_t                               planet_tlas_rebuilds_  = 0;
+    // --- end Planetary P4 ------------------------------------------------
     // --- Wave 8 PBR (#26) -- per-vertex mesh UVs ------------------------
     // Parallel to box_vbuf_id_ (mesh_positions): 2 floats (u, v) per
     // vertex, uploaded from the glTF TEXCOORD_0 attribute in
@@ -1867,6 +1917,23 @@ private:
     // "pipelines ready" message on exit -- avoids a per-frame log
     // spam during the 1-3s build window.
     bool                                        loading_frame_active_  = false;
+    // --- Planetary P4 (#258): the capture settle gate --------------------
+    // True while streamed terrain has not converged on a residency set for
+    // the current camera. Treated exactly like a loading frame: the world
+    // does not advance (freeze_sims_for_capture) and the frame does not
+    // count against the smoke budget, so a golden capture starts from a
+    // settled planet rather than from whatever had streamed in by then.
+    // Bounded by pt_planet_settle so a misconfigured scene cannot hang the
+    // smoke test forever.
+    bool                                        planet_settling_       = false;
+    // Set by the `earth` scene seed and by the `planet_stand` command:
+    // snap the camera onto the terrain surface once the streamer exists.
+    // Carries the requested eye height in metres; negative means "no
+    // request pending".
+    double                                      planet_stand_eye_m_    = -1.0;
+    bool                                        planet_stand_done_     = false;
+    std::uint32_t                               planet_settle_frames_  = 0;
+    // --- end Planetary P4 -------------------------------------------------
     // True while Run() is executing with a smoke-frame budget
     // (pt_smoke_frames > 0). Tick reads it to freeze dt-integrating
     // subsystems during un-counted loading frames so golden captures
