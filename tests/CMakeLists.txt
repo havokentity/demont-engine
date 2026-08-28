@@ -1874,55 +1874,74 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     #            GPU): ALL 34 BYTE-IDENTICAL, one md5
     #   Debug    10 renders: ALL 10 BYTE-IDENTICAL
     #
-    # So mean_delta against the golden is now a single fixed number --
-    # 7.494339 Release, 7.494695 Debug, the run-to-run band collapsed to
-    # a point -- and the floor these thresholds sit on is the same exact
-    # zero the three planet_ocean_* cells have. The Release/Debug gap that
-    # remains is optimisation level, not nondeterminism.
+    # So the floor these thresholds sit on is the same exact zero the three
+    # planet_ocean_* cells have. The Release/Debug gap that remains is
+    # optimisation level, not nondeterminism.
     #
-    # THRESHOLDS, MEASURED -- AND THE OLD ONES MADE THIS CELL VACUOUS.
-    # At 64 / 16 / 10 EVERY ocean ablation still passed: deleting the FFT
-    # ocean outright scored mean 11.90 / bad 2.68% against MEAN_DELTA 16
-    # and FAIL_PERCENT 10 and sailed through. A golden that cannot fail is
-    # worse than no golden. Measured against the committed PNG, Release
-    # and Debug (the two agree to four decimals; Debug is the sensitive
-    # one and is the number quoted):
+    # THE PNG WAS THEN REGENERATED (#263), AND THAT IS WHY THESE NUMBERS
+    # ARE NOT #294's. #294 measured this cell against a golden carrying a
+    # mean 7.4947 standing drift -- dating to the July 2026 correctness
+    # fixes (b2111dd Hosek, 7c237bc SIGMA demod, 875ff1d env-map NEE) plus
+    # P3's aerosol absorption, the #269 category -- and every threshold it
+    # could choose had to clear that drift first. The capture is re-pinned
+    # at 586f926, so the drift is gone and the registered config now
+    # measures EXACTLY ZERO against its own golden. Everything below is
+    # re-measured against the new PNG; nothing is carried over.
     #
-    #   registered config           mean  7.4947   bad@64  0.090027 %
-    #   r_ocean 0                   mean 11.8988   bad@64  2.683512 %
-    #   r_ocean_amplitude 0         mean 12.0842   bad@64  4.012553 %
-    #   r_ocean_march_steps 8       mean 11.2295   bad@64  0.919596 %
-    #   r_ocean_wind_speed 4        mean  6.1280   bad@64  0.044250 %
+    # THRESHOLDS, MEASURED. Both criteria now discriminate, which is new.
+    # Release and Debug, at the registered MAX_DELTA 16 (Debug is the
+    # sensitive config and is the number quoted second):
     #
-    # FAIL_PERCENT 0.5 IS THE CRITERION THAT CARRIES THE SIGNAL. The
-    # registered config sits 5.6x below it and the weakest feature
-    # DELETION (r_ocean 0) 5.4x above it; r_ocean_amplitude 0 is 8.0x
-    # above, and even the partial degradation r_ocean_march_steps 8 trips
-    # it at 1.8x. MAX_DELTA stays at the house 64 because that is where the
-    # separation lives -- at 64 the ocean-off ablation is 30x the
-    # registered config's bad-pixel count, at 32 only 3.2x and at 16 only
-    # 1.5x.
+    #   config                     mean R / D       bad@16 R / D
+    #   registered config        0.0000 /  0.0388   0.0000 /  0.0148 %
+    #   r_ocean 0               11.6420 / 11.6588  27.6738 / 27.6738 %
+    #   r_ocean_amplitude 0     11.8072 / 11.8241  26.7324 / 26.7324 %
+    #   r_ocean_march_steps 8    6.0787 /  6.0958  12.7416 / 12.7406 %
+    #   r_ocean_wind_speed 4     6.5308 /  6.5473  14.6942 / 14.6907 %
     #
-    # MEAN_DELTA 12.5 IS A BACKSTOP AND CANNOT DISCRIMINATE HERE, WHICH IS
-    # THE COMMITTED PNG'S FAULT, NOT THE CELL'S. The golden's own standing
-    # drift is already 7.4947 -- 63% of the whole-feature-deleted mean of
-    # 11.90 -- so no value both clears the drift with safe headroom and
-    # sits under the deletions. 12.5 is deliberately ABOVE both deletion
-    # means (11.90, 12.08): it is a tripwire for a global shift (exposure,
-    # tonemap) only, tightened from 16 as far as the 1.67x headroom over
-    # the standing drift allows, and it is NOT what makes this cell fail
-    # when the ocean goes away.
+    # THE VALUES ARE THE MATRIX DEFAULTS 16 / 2 / 1, passed explicitly
+    # rather than inherited, for exactly the reason the planet_ocean_*
+    # block gives: the within-host floor is zero, so what is left to
+    # absorb is another Apple-silicon Mac's rounding and fma ordering,
+    # which is unmeasured. These cells are Metal-only and the CI matrix
+    # runs `-L golden_software`, so no runner ever renders them -- the
+    # only host that does is a developer's.
     #
-    # AND ONE ABLATION IS STILL NOT CAUGHT, DELIBERATELY RECORDED RATHER
-    # THAN HIDDEN: r_ocean_wind_speed 4 renders CLOSER to the golden
-    # (mean 6.128) than the registered 12 m/s does (7.4947). The wrong sea
-    # state beats the right one. That is a direct measurement of how stale
-    # the committed PNG is, and no threshold can fix it -- only a
-    # regeneration can. See the note at the end of the ocean_foam block.
+    #   * BOTH criteria trip on every ablation. Weakest margin over
+    #     MEAN_DELTA 2 is r_ocean_march_steps 8 at 3.0x; weakest over
+    #     FAIL_PERCENT 1 is the same ablation at 12.7x. The registered
+    #     config clears MEAN_DELTA by 51x and FAIL_PERCENT by 68x in
+    #     Debug, and by infinity in Release.
+    #   * MEAN_DELTA IS NO LONGER A BACKSTOP. #294 had to document it as
+    #     "a backstop that cannot discriminate", because the golden's own
+    #     drift was 63% of the whole-feature-deleted mean and no value fit
+    #     between them. With the drift at zero the gap is 0.0388 to 6.08 in
+    #     Debug -- 157x -- and 2 sits in the middle of it.
+    #   * MAX_DELTA 64 -> 16. The 64 existed to buy separation against a
+    #     drifted golden ("at 16 only 1.5x"). Against a golden the
+    #     registered config matches exactly, the separation is infinite at
+    #     every MAX_DELTA, so the choice reverts to the house default,
+    #     which is also the more sensitive one: it takes the weakest
+    #     ablation's bad-pixel margin from 1.8x to 12.7x.
     #
-    # NONE OF THESE ABLATIONS IS A BLACK FRAME -- mean luminance 25.6..29.5
-    # of 255 against the registered config's 26.3, and 66-78% of pixels
-    # above black in every one. They change content, not remove it.
+    # r_ocean_wind_speed 4 IS NOW CAUGHT, AND THAT IS THE MEASUREMENT THAT
+    # JUSTIFIES THE REGENERATION. Against the stale PNG the WRONG sea state
+    # scored mean 6.128 and the CORRECT 12 m/s scored 7.4947 -- the wrong
+    # wind rendered closer to the golden than the right one, and no
+    # threshold can recover from an inversion like that. Against the new
+    # PNG the correct wind is 0.000000 and the wrong wind is 6.5308, which
+    # is 3.3x over MEAN_DELTA and 14.7x over FAIL_PERCENT. The ordering is
+    # restored and the ablation trips both criteria.
+    #
+    # NONE OF THESE ABLATIONS IS A BLACK FRAME -- mean luminance 25.4..29.6
+    # of 255 against the registered config's 26.1, and 97.9-99.4% of pixels
+    # above black in every one. They change content, not remove it. And
+    # each --extra landed: the archived cvar state written on exit carries
+    # the overridden value in every run (r_ocean drops OUT of demont.cfg on
+    # the ablation, because 0 is its registered default and the fixture's
+    # `r_ocean 1` is what put it there), a misspelled cvar name aborts Init
+    # with exit 3 rather than rendering the baseline silently, and every
+    # ablation image differs from the registered render.
     #
     # The cell catches gross regressions: the ocean gate failing to engage
     # (flat plane), the textures not binding (black / sky-through water),
@@ -1932,7 +1951,7 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # committed.
     pt_add_golden_cell(SCENE ocean_fft BACKEND metal DENOISER svgf_atrous
         FRAMES 120
-        MAX_DELTA 64 MEAN_DELTA 12.5 FAIL_PERCENT 0.5)
+        MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
     # --- end FFT ocean surface --------------------------------------------
 
     # --- Ocean foam + whitecaps (Wave 9) ----------------------------------
@@ -1968,59 +1987,70 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     #            GPU): ALL 34 BYTE-IDENTICAL, one md5
     #   Debug    10 renders: ALL 10 BYTE-IDENTICAL
     #
-    # bad_percent against the golden is now a fixed 5.225627 Release /
-    # 5.228170 Debug and mean_delta a fixed 11.370385 / 11.373840 -- the
-    # same numbers #294 recorded, with the fifth-decimal band gone. That
-    # holds under the 12-way GPU contention #263 reported this cell
+    # That holds under the 12-way GPU contention #263 reported this cell
     # failing under, which is where the 24 concurrent renders came from.
     #
-    # THE THRESHOLDS CANNOT BE TIGHTENED, AND THE REASON IS THE COMMITTED
-    # PNG. Measured against it, Release and Debug (Debug is the sensitive
-    # config and is the number quoted):
+    # THE PNG WAS THEN REGENERATED (#263), AND MOST OF WHAT IT REMOVES
+    # ARRIVED WITH #291. At 3db2c8c this cell rendered mean 4.109 / bad
+    # 0.668% from its golden; at 586f926 it rendered 11.374 / 5.228,
+    # because the upload ring changed WHICH ocean field a frame reads and
+    # the old PNG encoded the RACED phase of the wave animation. #294
+    # measured against that PNG and had 1.41x mean headroom and 1.53x
+    # bad-pixel headroom left -- thresholds sized around a capture of a
+    # bug. The capture is re-pinned at 586f926, so the registered config
+    # now measures EXACTLY ZERO against its own golden and everything
+    # below is re-measured; nothing is carried over.
     #
-    #   registered config             mean 11.3738   bad@64  5.228170 %
-    #   r_ocean_foam_persistence 0    mean 20.4883   bad@64  9.797160 %
-    #   r_ocean_foam_amount 0         mean 50.0909   bad@64 27.405802 %
-    #   r_ocean 0                     mean 62.9440   bad@64 38.219198 %
-    #   r_ocean_foam_coverage 0       mean 11.4986   bad@64  5.305990 %
+    # THRESHOLDS, MEASURED. Release and Debug, at the registered
+    # MAX_DELTA 16 (Debug is the sensitive config and is quoted second):
     #
-    # MEAN_DELTA 16 carries the signal and stays: the weakest deletion
-    # that the cell does catch (persistence off) is 1.28x above it, foam
-    # off is 3.13x above, ocean off 3.93x. It cannot go lower -- the
-    # registered config already sits at 11.37, only 1.41x under it.
+    #   config                        mean R / D       bad@16 R / D
+    #   registered config            0.0000 /  0.0725   0.0000 /  0.0519 %
+    #   r_ocean_foam_persistence 0  14.9881 / 14.9898  27.0569 / 27.0615 %
+    #   r_ocean_foam_amount 0       46.4664 / 46.4661  44.0186 / 44.0216 %
+    #   r_ocean 0                   61.3510 / 61.3511  56.4265 / 56.4265 %
+    #   r_ocean_foam_coverage 0      0.7603 /  0.7939   1.0223 /  1.0462 %
     #
-    # FAIL_PERCENT 10 -> 8 IS THE ONE TIGHTENING THIS CELL HAD IN IT. At
-    # 10 the bad-pixel criterion MISSED r_ocean_foam_persistence 0 (9.80%
-    # against a 10% gate -- 0.98x, a miss by two hundredths of a percent),
-    # so only the mean was holding that claim up. At 8 both criteria trip
-    # on it (1.22x) while the registered config keeps 1.53x headroom.
+    # THE VALUES ARE THE MATRIX DEFAULTS 16 / 2 / 1, for the same reason
+    # given in the ocean_fft block: a within-host floor of exactly zero
+    # leaves only another Apple-silicon Mac's rounding to absorb, and these
+    # Metal cells never run on a CI runner (`-L golden_software`).
     #
-    # r_ocean_foam_coverage 0 IS NOT CAUGHT BY EITHER CRITERION and the
-    # bullet list above has been corrected to stop claiming it is. At
-    # foam_amount 1.2 and 16 m/s the crest-fold Jacobian foam saturates
-    # the crests, so removing the wind-coverage ramp moves the frame by
-    # mean 0.12 -- 1% of the standing drift. Pinning _coverage needs a
-    # fixture at a wind speed where the ramp is the thing doing the work.
+    #   * BOTH criteria trip on all three ablations the cell claims.
+    #     Weakest margin over MEAN_DELTA 2 is persistence-off at 7.5x;
+    #     weakest over FAIL_PERCENT 1 is persistence-off at 27.1x. The
+    #     registered config clears MEAN_DELTA by 27.6x and FAIL_PERCENT by
+    #     19.3x in Debug, and by infinity in Release.
+    #   * FAIL_PERCENT 8 -> 1 and MEAN_DELTA 16 -> 2 are both consequences
+    #     of the drift going away, not independent tightenings. #294 could
+    #     not go below 16 on the mean because the registered config already
+    #     sat at 11.37; it now sits at 0.07.
     #
-    # NO ABLATION IS A BLACK FRAME: mean luminance 134..157 of 255 against
-    # the registered config's 158, >99.9% of pixels above black in each.
+    # r_ocean_foam_coverage 0 IS STILL NOT A CLAIM THIS CELL MAKES. It
+    # lands at 1.02x (Release) / 1.05x (Debug) of the bad-pixel gate --
+    # nominally over the line, but by four hundredths of a percent, which
+    # is a coin flip on another host and not a margin. The mean criterion
+    # does not catch it at all (0.76, i.e. 0.38x). The reason is unchanged
+    # and is the fixture's, not the threshold's: at foam_amount 1.2 and
+    # 16 m/s the crest-fold Jacobian foam saturates the crests, so removing
+    # the wind-coverage ramp barely moves the frame. Pinning _coverage
+    # needs a fixture at a wind speed where the ramp does the work, which
+    # is why the bullet list above still excludes it.
     #
-    # THE COMMITTED PNG IS STALE, AND MOST OF IT ARRIVED WITH #291. At
-    # 3db2c8c this cell rendered mean 4.109 / bad 0.668% from its golden;
-    # at 586f926 it renders 11.374 / 5.228. The race fix moved it by mean
-    # 9.649 on 4.63% of pixels, because the ring changed WHICH ocean field
-    # a frame reads -- the golden encodes the raced phase. It still
-    # passes, so nothing has been regenerated here, but that leaves this
-    # cell with 1.41x mean headroom and 1.53x bad-pixel headroom over a
-    # drift that a single PR just added 9.6 to. Regenerating both ocean
-    # PNGs is tracked on #263 with these numbers; it is a deliberate
-    # decision for the maintainer, not a side effect of this measurement.
+    # NO ABLATION IS A BLACK FRAME: mean luminance 131.9..155.1 of 255
+    # against the registered config's 155.3, and 100.00% of pixels above
+    # black in every one. And each --extra landed: the archived cvar state
+    # written on exit carries the overridden value in every run (r_ocean
+    # drops OUT of demont.cfg on the ablation because 0 is its registered
+    # default), a misspelled cvar name aborts Init with exit 3 rather than
+    # rendering the baseline silently, and every ablation image differs
+    # from the registered render.
     #
     # Metal-only (software gates the ocean off; a Vulkan cell can land once
     # a Vulkan PNG is committed).
     pt_add_golden_cell(SCENE ocean_foam BACKEND metal DENOISER svgf_atrous
         FRAMES 120
-        MAX_DELTA 64 MEAN_DELTA 16 FAIL_PERCENT 8)
+        MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
     # --- end Ocean foam + whitecaps ---------------------------------------
 
     # --- Planetary P5 (#259): the planetary ocean -------------------------
