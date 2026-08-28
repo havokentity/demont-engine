@@ -1258,25 +1258,53 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # entire feature moves only a handful of pixels and a 2% threshold would
     # sail past it. A golden that cannot fail is worse than no golden.
     #
-    # Measured on the dev M4 Max with `pt_render_one_frame` + `imgdiff`:
-    #   this fixture rendered twice, Metal vs Metal:
-    #       bad = 0    mean_delta = 0.000000   max_delta = 0.0000
-    #   this fixture vs. the same fixture with `r_planets 0`:
-    #       bad = 11   mean_delta = 0.010300   max_delta = 395.7714
+    # Measured on the dev M4 Max with `pt_render_one_frame` + `imgdiff`,
+    # in BOTH build configurations (the first cut measured Release only,
+    # and the cell then failed in Debug -- see the paragraph below):
+    #
+    #                        bad   bad%      mean_delta   max_delta
+    #   repeat, Debug          0   0.000000  0.000000     0.0000
+    #   repeat, Release        0   0.000000  0.000000     0.0000
+    #   vs golden, Release     0   0.000000  0.000000     0.0000
+    #   vs golden, Debug       0   0.000000  0.005341     1.0000
+    #   `r_planets 0`, Debug  11   0.005595  0.010300   395.7714
+    #   `r_planets 0`, Rel.   11   0.005595  0.010300   395.7714
+    #
     # The scene is pure sky -- no geometry, so no path-traced stochastic
-    # term -- which is why the repeat floor is exactly zero rather than
-    # merely small. MEAN_DELTA 0.004 and FAIL_PERCENT 0.0025 (~4.9 px) each
-    # sit about 2.5x below the planets-off signal and infinitely above the
-    # floor, so BOTH of imgdiff's fail criteria trip if the planets stop
-    # arriving. MAX_DELTA stays at the house 32: it only classifies which
-    # pixels count as bad, and a bright point source clears it by 12x.
+    # term -- which is why the repeat floor is exactly zero in both configs.
+    #
+    # BAD-PIXEL COUNT IS THIS CELL'S SIGNAL; THE MEAN IS A BACKSTOP. A
+    # planet is a sub-pixel point source, so deleting it moves 11 pixels a
+    # long way (max_delta 395) and the global mean barely at all. The
+    # Debug/Release codegen difference is the exact opposite shape: one LSB
+    # on many pixels, which moves the mean to 0.005341 while classifying
+    # ZERO pixels as bad. FAIL_PERCENT therefore separates the two cases
+    # perfectly -- 0.005595% when the planets vanish against 0.000000% for
+    # a build-config change -- and 0.0025 (~4.9 px) sits 2.24x below the
+    # signal with an infinite margin above the floor.
+    #
+    # MEAN_DELTA 0.0074 is the geometric midpoint of the two bounds it must
+    # separate: 1.39x above the Debug/Release delta (0.005341) and 1.39x
+    # below the planets-off signal (0.010300). Symmetric by construction
+    # rather than picked. The planets-off signal is IDENTICAL in both
+    # configs, so only the baseline moves with build type, not the thing
+    # being detected.
+    #
+    # It was 0.004, measured in Release alone, which made the cell fail in
+    # Debug at 1.34x overshoot on a max_delta of 1.0 with zero bad pixels.
+    # Widened rather than made Release-only: a cell that skips half the
+    # builds is most of the way to a cell that tests nothing, which is the
+    # failure this file spends several comments warning about.
+    #
+    # MAX_DELTA stays at the house 32: it only classifies which pixels
+    # count as bad, and a bright point source clears it by 12x.
     #
     # Sanity check when touching this: `ctest -N | grep planetarium` must
     # list golden_planetarium_jupiter__metal__svgf_atrous_render and _diff.
     # A fixture with no registered cell tests nothing -- three sunset_*
     # fixtures sat in this repo in exactly that state until #257.
     pt_add_golden_cell(SCENE planetarium_jupiter BACKEND metal DENOISER svgf_atrous
-        MAX_DELTA 32 MEAN_DELTA 0.004 FAIL_PERCENT 0.0025)
+        MAX_DELTA 32 MEAN_DELTA 0.0074 FAIL_PERCENT 0.0025)
     # --- end Planetarium ---------------------------------------------------
 
     # --- Curved-Earth sunset fixtures (#51) --------------------------------
