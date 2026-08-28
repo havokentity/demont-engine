@@ -1778,43 +1778,95 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # (vk::binding 32/33), the MAT_WATER branch ray-marches the displaced
     # heightfield, and choppy crests + foam render at a low sunset sun.
     #
-    # FRAMES 120: the ocean animation advances by the per-frame wall-clock
-    # dt (ocean_time_ accumulates), so the surface needs a stretch of
-    # frames to evolve from the t=0 spectrum into a developed sea before
-    # the capture. 120 frames warms it well past the dominant-wave period.
+    # FRAMES 120: the ocean animation advances by the per-frame dt
+    # (ocean_time_ accumulates), so the surface needs a stretch of frames
+    # to evolve from the t=0 spectrum into a developed sea before the
+    # capture. 120 frames warms it well past the dominant-wave period.
     #
-    # Tolerances remain generous, but NOT for the reason this comment used
-    # to give: smoke-mode dt is pinned to 1/60 (commit 5d57b29) and the
-    # dt-integrating sims are frozen during un-counted loading frames, so
-    # the surface phase at capture IS deterministic -- run-to-run diffs on
-    # the dev M4 Max measure bit-identical (max_delta 0.0). What the
-    # thresholds still have to absorb is cross-host / cross-build GPU
-    # FP-ordering, which is unmeasured here.
+    # THE CAUSE WAS NAMED WRONG FOR MONTHS. This comment used to say the
+    # tolerances had to absorb "cross-host / cross-build GPU FP-ordering".
+    # That is not what it was. MetalDevice::WriteTexture is a CPU
+    # replaceRegion and MetalDevice::Submit does not wait, so
+    # Engine::EnsureOceanUploaded wrote the ocean field for frame N over
+    # the one the GPU was still reading for frame N-1 -- a plain
+    # write-after-read race. #259 closed it with a 3-deep texture ring
+    # (Engine::kOceanUploadRing).
     #
-    # #259 FOUND THE REST OF IT. The residual run-to-run wobble that put
-    # this cell and ocean_foam on the known-nondeterministic list was not
-    # FP ordering at all: MetalDevice::WriteTexture is a CPU replaceRegion
-    # and MetalDevice::Submit does not wait, so the ocean field for frame N
-    # was written over the one the GPU was still reading for frame N-1 --
-    # a plain write-after-read race, reproduced on planet_ocean_boat as
-    # three distinct images out of six identical renders with ocean_time_
-    # logged identical across all of them. Engine::EnsureOceanUploaded now
-    # writes into a 3-deep ring (kOceanUploadRing) and the three P5 cells
-    # measure ten consecutive byte-identical renders in Release AND Debug.
-    # These two cells still pass unchanged against their committed PNGs,
-    # which is why nothing here moved -- but they have NOT been
-    # re-characterised under their own svgf_atrous configuration, so their
-    # thresholds and their place on that list are left where they are for
-    # someone to re-measure deliberately rather than as a side effect. The cell catches gross
-    # regressions: the ocean gate failing to engage (flat plane), the
-    # textures not binding (black / sky-through water), or the ray-march
-    # dropping rays through the surface. Metal-only at first; software
-    # gates the ocean off (its CPU tracer ignores the textures) so no
-    # software cell, and a Vulkan cell can land once the Metal PNG is
-    # committed. Tighten once cross-host variance is actually measured.
+    # REPRODUCED AND CLOSED IN THIS CELL'S OWN CONFIGURATION, not inferred
+    # from the P5 fixtures. Six consecutive renders of THIS cell at
+    # 3db2c8c -- the commit before #291 merged -- gave FIVE DISTINCT
+    # IMAGES, and six of ocean_foam gave five. Post-fix, on the dev M4 Max:
+    #
+    #   Release  39 renders (serial + 12-way concurrent on one GPU):
+    #            35 byte-identical, 4 outliers at max 1.4142 L2 /
+    #            mean <= 7.6e-3 -- one 8-bit LSB on a few dozen of
+    #            196 608 pixels
+    #   Debug    16 renders (same mix): 14 byte-identical, 2 outliers,
+    #            max 1.4142 L2 / mean 3.3e-4
+    #
+    # What that floor does to the number the cell actually gates on:
+    # mean_delta against the golden moves in the FIFTH decimal
+    # (7.494321 .. 7.494550 Release, 7.494645 .. 7.494695 Debug) and
+    # bad_percent is identical to six decimals in every single run,
+    # concurrent ones included. The floor is ~1/30 000 of MEAN_DELTA.
+    # It is not exactly zero the way the three planet_ocean_* cells are --
+    # a one-LSB residue survives, appearing in roughly one render in ten
+    # with no correlation to load, and its source is not identified here
+    # because it cannot reach a threshold digit from four orders down.
+    #
+    # THRESHOLDS, MEASURED -- AND THE OLD ONES MADE THIS CELL VACUOUS.
+    # At 64 / 16 / 10 EVERY ocean ablation still passed: deleting the FFT
+    # ocean outright scored mean 11.90 / bad 2.68% against MEAN_DELTA 16
+    # and FAIL_PERCENT 10 and sailed through. A golden that cannot fail is
+    # worse than no golden. Measured against the committed PNG, Release
+    # and Debug (the two agree to four decimals; Debug is the sensitive
+    # one and is the number quoted):
+    #
+    #   registered config           mean  7.4947   bad@64  0.090027 %
+    #   r_ocean 0                   mean 11.8988   bad@64  2.683512 %
+    #   r_ocean_amplitude 0         mean 12.0842   bad@64  4.012553 %
+    #   r_ocean_march_steps 8       mean 11.2295   bad@64  0.919596 %
+    #   r_ocean_wind_speed 4        mean  6.1280   bad@64  0.044250 %
+    #
+    # FAIL_PERCENT 0.5 IS THE CRITERION THAT CARRIES THE SIGNAL. The
+    # registered config sits 5.6x below it and the weakest feature
+    # DELETION (r_ocean 0) 5.4x above it; r_ocean_amplitude 0 is 8.0x
+    # above, and even the partial degradation r_ocean_march_steps 8 trips
+    # it at 1.8x. MAX_DELTA stays at the house 64 because that is where the
+    # separation lives -- at 64 the ocean-off ablation is 30x the
+    # registered config's bad-pixel count, at 32 only 3.2x and at 16 only
+    # 1.5x.
+    #
+    # MEAN_DELTA 12.5 IS A BACKSTOP AND CANNOT DISCRIMINATE HERE, WHICH IS
+    # THE COMMITTED PNG'S FAULT, NOT THE CELL'S. The golden's own standing
+    # drift is already 7.4947 -- 63% of the whole-feature-deleted mean of
+    # 11.90 -- so no value both clears the drift with safe headroom and
+    # sits under the deletions. 12.5 is deliberately ABOVE both deletion
+    # means (11.90, 12.08): it is a tripwire for a global shift (exposure,
+    # tonemap) only, tightened from 16 as far as the 1.67x headroom over
+    # the standing drift allows, and it is NOT what makes this cell fail
+    # when the ocean goes away.
+    #
+    # AND ONE ABLATION IS STILL NOT CAUGHT, DELIBERATELY RECORDED RATHER
+    # THAN HIDDEN: r_ocean_wind_speed 4 renders CLOSER to the golden
+    # (mean 6.128) than the registered 12 m/s does (7.4947). The wrong sea
+    # state beats the right one. That is a direct measurement of how stale
+    # the committed PNG is, and no threshold can fix it -- only a
+    # regeneration can. See the note at the end of the ocean_foam block.
+    #
+    # NONE OF THESE ABLATIONS IS A BLACK FRAME -- mean luminance 25.6..29.5
+    # of 255 against the registered config's 26.3, and 66-78% of pixels
+    # above black in every one. They change content, not remove it.
+    #
+    # The cell catches gross regressions: the ocean gate failing to engage
+    # (flat plane), the textures not binding (black / sky-through water),
+    # or the ray-march dropping rays through the surface. Metal-only;
+    # software gates the ocean off (its CPU tracer ignores the textures)
+    # so no software cell, and a Vulkan cell can land once a Vulkan PNG is
+    # committed.
     pt_add_golden_cell(SCENE ocean_fft BACKEND metal DENOISER svgf_atrous
         FRAMES 120
-        MAX_DELTA 64 MEAN_DELTA 16 FAIL_PERCENT 10)
+        MAX_DELTA 64 MEAN_DELTA 12.5 FAIL_PERCENT 0.5)
     # --- end FFT ocean surface --------------------------------------------
 
     # --- Ocean foam + whitecaps (Wave 9) ----------------------------------
@@ -1828,14 +1880,73 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     #     + temporal persistence packed into ocean_displacement.w)
     #   * the MAT_WATER foam BRDF blend (threshold/smoothstep -> bright
     #     diffuse whitecap override of the specular water surface)
-    #   * r_ocean_foam_amount / _persistence / _coverage plumbing
-    # FRAMES 120 + generous tolerances for the same wall-clock-dt /
-    # foam-fleck-flicker reasons documented on the ocean_fft cell above.
+    #   * r_ocean_foam_amount and _persistence -- but NOT _coverage, see
+    #     the ablation table below, where the old comment over-claimed
+    #
+    # SAME CAUSE, SAME FIX, MEASURED SEPARATELY. This cell shared
+    # ocean_fft's write-after-read race on the ocean upload (read that
+    # block for the mechanism) and shared its wrong explanation. Six
+    # consecutive renders at 3db2c8c, the commit before #291 merged, gave
+    # FIVE DISTINCT IMAGES. Post-fix, on the dev M4 Max:
+    #
+    #   Release  16 renders (serial + 12-way concurrent on one GPU):
+    #            11 byte-identical, 5 outliers at max 1.4142 L2 /
+    #            mean <= 3.4e-4
+    #   Debug    16 renders (same mix): 14 byte-identical, 2 outliers,
+    #            max 1.0 L2 / mean 9.7e-5
+    #
+    # bad_percent against the golden is IDENTICAL to six decimals in all
+    # 32 runs -- 5.225627 Release, 5.228170 Debug -- and mean_delta moves
+    # only in the fifth decimal. That holds under the 12-way GPU
+    # contention #263 reported this cell failing under.
+    #
+    # THE THRESHOLDS CANNOT BE TIGHTENED, AND THE REASON IS THE COMMITTED
+    # PNG. Measured against it, Release and Debug (Debug is the sensitive
+    # config and is the number quoted):
+    #
+    #   registered config             mean 11.3738   bad@64  5.228170 %
+    #   r_ocean_foam_persistence 0    mean 20.4883   bad@64  9.797160 %
+    #   r_ocean_foam_amount 0         mean 50.0909   bad@64 27.405802 %
+    #   r_ocean 0                     mean 62.9440   bad@64 38.219198 %
+    #   r_ocean_foam_coverage 0       mean 11.4986   bad@64  5.305990 %
+    #
+    # MEAN_DELTA 16 carries the signal and stays: the weakest deletion
+    # that the cell does catch (persistence off) is 1.28x above it, foam
+    # off is 3.13x above, ocean off 3.93x. It cannot go lower -- the
+    # registered config already sits at 11.37, only 1.41x under it.
+    #
+    # FAIL_PERCENT 10 -> 8 IS THE ONE TIGHTENING THIS CELL HAD IN IT. At
+    # 10 the bad-pixel criterion MISSED r_ocean_foam_persistence 0 (9.80%
+    # against a 10% gate -- 0.98x, a miss by two hundredths of a percent),
+    # so only the mean was holding that claim up. At 8 both criteria trip
+    # on it (1.22x) while the registered config keeps 1.53x headroom.
+    #
+    # r_ocean_foam_coverage 0 IS NOT CAUGHT BY EITHER CRITERION and the
+    # bullet list above has been corrected to stop claiming it is. At
+    # foam_amount 1.2 and 16 m/s the crest-fold Jacobian foam saturates
+    # the crests, so removing the wind-coverage ramp moves the frame by
+    # mean 0.12 -- 1% of the standing drift. Pinning _coverage needs a
+    # fixture at a wind speed where the ramp is the thing doing the work.
+    #
+    # NO ABLATION IS A BLACK FRAME: mean luminance 134..157 of 255 against
+    # the registered config's 158, >99.9% of pixels above black in each.
+    #
+    # THE COMMITTED PNG IS STALE, AND MOST OF IT ARRIVED WITH #291. At
+    # 3db2c8c this cell rendered mean 4.109 / bad 0.668% from its golden;
+    # at 586f926 it renders 11.374 / 5.228. The race fix moved it by mean
+    # 9.649 on 4.63% of pixels, because the ring changed WHICH ocean field
+    # a frame reads -- the golden encodes the raced phase. It still
+    # passes, so nothing has been regenerated here, but that leaves this
+    # cell with 1.41x mean headroom and 1.53x bad-pixel headroom over a
+    # drift that a single PR just added 9.6 to. Regenerating both ocean
+    # PNGs is tracked on #263 with these numbers; it is a deliberate
+    # decision for the maintainer, not a side effect of this measurement.
+    #
     # Metal-only (software gates the ocean off; a Vulkan cell can land once
-    # this Metal PNG is committed).
+    # a Vulkan PNG is committed).
     pt_add_golden_cell(SCENE ocean_foam BACKEND metal DENOISER svgf_atrous
         FRAMES 120
-        MAX_DELTA 64 MEAN_DELTA 16 FAIL_PERCENT 10)
+        MAX_DELTA 64 MEAN_DELTA 16 FAIL_PERCENT 8)
     # --- end Ocean foam + whitecaps ---------------------------------------
 
     # --- Planetary P5 (#259): the planetary ocean -------------------------
@@ -1873,9 +1984,14 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # MetalDevice::WriteTexture is a CPU replaceRegion and
     # MetalDevice::Submit does not wait, so the ocean field for frame N was
     # being written over the one the GPU was still reading for frame N-1.
-    # That is also the real reason ocean_fft and ocean_foam are on the
-    # known-nondeterministic list -- the note on those cells blames
-    # "cross-host GPU FP ordering", which is not what it is.
+    # That was also the real reason ocean_fft and ocean_foam were on the
+    # known-nondeterministic list, and it has since been confirmed IN
+    # THEIR OWN CONFIGURATION rather than inferred from here: six renders
+    # of each at 3db2c8c gave five distinct images apiece, and post-fix
+    # they are byte-identical bar a 1-LSB residue. Both cells have been
+    # re-characterised in place -- see their blocks above. What has NOT
+    # been re-measured is smoke_phase3_wind: it stays on that list, with
+    # its cause still unknown, and nothing here touches it.
     # Engine::EnsureOceanUploaded now writes into a 3-deep ring
     # (kOceanUploadRing) and all three cells render byte-identical, ten
     # consecutive times, in Release AND in Debug.
