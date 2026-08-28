@@ -1790,29 +1790,43 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # Engine::EnsureOceanUploaded wrote the ocean field for frame N over
     # the one the GPU was still reading for frame N-1 -- a plain
     # write-after-read race. #259 closed it with a 3-deep texture ring
-    # (Engine::kOceanUploadRing).
+    # (Engine::kOceanUploadRing), and #295 then found that the ring's own
+    # premise -- "the GPU is at most two frames behind the CPU" -- was
+    # unenforced on Metal, which has no fence and whose headless captures
+    # take no drawable to throttle on. Read the ring and the frame-pacing
+    # bound (pt::rhi::kMaxFramesInFlight) as one fix; the measurement that
+    # separated them is in the planet_ocean_* block below.
     #
     # REPRODUCED AND CLOSED IN THIS CELL'S OWN CONFIGURATION, not inferred
     # from the P5 fixtures. Six consecutive renders of THIS cell at
     # 3db2c8c -- the commit before #291 merged -- gave FIVE DISTINCT
-    # IMAGES, and six of ocean_foam gave five. Post-fix, on the dev M4 Max:
+    # IMAGES, and six of ocean_foam gave five.
     #
-    #   Release  39 renders (serial + 12-way concurrent on one GPU):
-    #            35 byte-identical, 4 outliers at max 1.4142 L2 /
-    #            mean <= 7.6e-3 -- one 8-bit LSB on a few dozen of
-    #            196 608 pixels
-    #   Debug    16 renders (same mix): 14 byte-identical, 2 outliers,
-    #            max 1.4142 L2 / mean 3.3e-4
+    # AFTER THE RING ALONE (#294, at 586f926) the floor was very low but
+    # NOT zero: 39 Release renders gave 35 byte-identical and 4 outliers
+    # at max 1.4142 L2 / mean <= 7.6e-3, 16 Debug renders gave 14 and 2 --
+    # a one-LSB residue on a few dozen of 196 608 pixels, appearing in
+    # roughly one render in ten, source unidentified because it could not
+    # reach a threshold digit from four orders down.
     #
-    # What that floor does to the number the cell actually gates on:
-    # mean_delta against the golden moves in the FIFTH decimal
-    # (7.494321 .. 7.494550 Release, 7.494645 .. 7.494695 Debug) and
-    # bad_percent is identical to six decimals in every single run,
-    # concurrent ones included. The floor is ~1/30 000 of MEAN_DELTA.
-    # It is not exactly zero the way the three planet_ocean_* cells are --
-    # a one-LSB residue survives, appearing in roughly one render in ten
-    # with no correlation to load, and its source is not identified here
-    # because it cannot reach a threshold digit from four orders down.
+    # IT IS NOW EXACTLY ZERO, AND THE SOURCE WAS THE SAME RACE (#295).
+    # The ring assumed a frames-in-flight bound Metal did not enforce, so
+    # on the rare frame the CPU got four command buffers ahead the ring
+    # wrapped onto a slot a live dispatch was still reading. One LSB here
+    # rather than a torn frame because svgf_atrous averages 120 of them.
+    # With MetalDevice::BeginFrame holding the CPU to
+    # pt::rhi::kMaxFramesInFlight (the measurement is in the
+    # planet_ocean_* block below), on the dev M4 Max:
+    #
+    #   Release  34 renders (10 serial + 24 at 12-way concurrency on one
+    #            GPU): ALL 34 BYTE-IDENTICAL, one md5
+    #   Debug    10 renders: ALL 10 BYTE-IDENTICAL
+    #
+    # So mean_delta against the golden is now a single fixed number --
+    # 7.494339 Release, 7.494695 Debug, the run-to-run band collapsed to
+    # a point -- and the floor these thresholds sit on is the same exact
+    # zero the three planet_ocean_* cells have. The Release/Debug gap that
+    # remains is optimisation level, not nondeterminism.
     #
     # THRESHOLDS, MEASURED -- AND THE OLD ONES MADE THIS CELL VACUOUS.
     # At 64 / 16 / 10 EVERY ocean ablation still passed: deleting the FFT
@@ -1887,18 +1901,26 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # ocean_fft's write-after-read race on the ocean upload (read that
     # block for the mechanism) and shared its wrong explanation. Six
     # consecutive renders at 3db2c8c, the commit before #291 merged, gave
-    # FIVE DISTINCT IMAGES. Post-fix, on the dev M4 Max:
+    # FIVE DISTINCT IMAGES.
     #
-    #   Release  16 renders (serial + 12-way concurrent on one GPU):
-    #            11 byte-identical, 5 outliers at max 1.4142 L2 /
-    #            mean <= 3.4e-4
-    #   Debug    16 renders (same mix): 14 byte-identical, 2 outliers,
-    #            max 1.0 L2 / mean 9.7e-5
+    # After the ring alone (#294, at 586f926) this cell had the same
+    # one-LSB residue ocean_fft had: 16 Release renders gave 11
+    # byte-identical and 5 outliers at max 1.4142 L2 / mean <= 3.4e-4,
+    # 16 Debug renders gave 14 and 2 at max 1.0 L2 / mean 9.7e-5.
     #
-    # bad_percent against the golden is IDENTICAL to six decimals in all
-    # 32 runs -- 5.225627 Release, 5.228170 Debug -- and mean_delta moves
-    # only in the fifth decimal. That holds under the 12-way GPU
-    # contention #263 reported this cell failing under.
+    # #295 CLOSED THE RESIDUE TOO -- it was the ring's frames-in-flight
+    # premise going unenforced on Metal, one layer under the ring itself.
+    # With the bound in place, on the dev M4 Max:
+    #
+    #   Release  34 renders (10 serial + 24 at 12-way concurrency on one
+    #            GPU): ALL 34 BYTE-IDENTICAL, one md5
+    #   Debug    10 renders: ALL 10 BYTE-IDENTICAL
+    #
+    # bad_percent against the golden is now a fixed 5.225627 Release /
+    # 5.228170 Debug and mean_delta a fixed 11.370385 / 11.373840 -- the
+    # same numbers #294 recorded, with the fifth-decimal band gone. That
+    # holds under the 12-way GPU contention #263 reported this cell
+    # failing under, which is where the 24 concurrent renders came from.
     #
     # THE THRESHOLDS CANNOT BE TIGHTENED, AND THE REASON IS THE COMMITTED
     # PNG. Measured against it, Release and Debug (Debug is the sensitive
@@ -1984,17 +2006,56 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # MetalDevice::WriteTexture is a CPU replaceRegion and
     # MetalDevice::Submit does not wait, so the ocean field for frame N was
     # being written over the one the GPU was still reading for frame N-1.
+    # Engine::EnsureOceanUploaded now writes into a 3-deep ring
+    # (kOceanUploadRing).
+    #
     # That was also the real reason ocean_fft and ocean_foam were on the
     # known-nondeterministic list, and it has since been confirmed IN
     # THEIR OWN CONFIGURATION rather than inferred from here: six renders
-    # of each at 3db2c8c gave five distinct images apiece, and post-fix
-    # they are byte-identical bar a 1-LSB residue. Both cells have been
-    # re-characterised in place -- see their blocks above. What has NOT
-    # been re-measured is smoke_phase3_wind: it stays on that list, with
-    # its cause still unknown, and nothing here touches it.
-    # Engine::EnsureOceanUploaded now writes into a 3-deep ring
-    # (kOceanUploadRing) and all three cells render byte-identical, ten
-    # consecutive times, in Release AND in Debug.
+    # of each at 3db2c8c gave five distinct images apiece. Both cells have
+    # been re-characterised in place -- see their blocks above, including
+    # what the #295 pacing bound below did to the 1-LSB residue #294
+    # measured. What has NOT been re-measured is smoke_phase3_wind: it
+    # stays on that list, with its cause still unknown, and nothing here
+    # touches it.
+    #
+    # THAT RING WAS NECESSARY AND IT WAS NOT SUFFICIENT (#295). This comment
+    # used to end "and all three cells render byte-identical, ten consecutive
+    # times, in Release AND in Debug". That was measured, and on `main` it
+    # was still false: planet_ocean_snell rendered a DIFFERENT image in 1-2
+    # runs out of every 8-10, off by max 81.8 / mean 1.68 on 2.8% of pixels
+    # against its own committed PNG, and worse under `ctest -j 4`.
+    #
+    # What a 3-deep ring assumes is that the GPU is at most two frames
+    # behind the CPU. Vulkan enforces exactly that with a fence ring;
+    # METAL ENFORCED NOTHING. Submit() does not wait, and a headless capture
+    # -- which is what every cell in this file is -- takes no drawable, so
+    # nextDrawable()'s implicit throttle never fired either. The CPU ran as
+    # far ahead as it liked.
+    #
+    # Instrumented rather than argued. Over ten renders of _snell the
+    # per-frame FNV-1a of the uploaded cascade atlas was IDENTICAL on all
+    # ten (same ocean_time_, same ring slot, same bytes), so the solver was
+    # exonerated; the two runs that produced the outlier image were exactly
+    # the two in which the Metal backend reached FOUR command buffers in
+    # flight, one more than the ring has slots. Perfect correlation, 10/10.
+    # _snell is the fixture that catches it because it is the submerged one:
+    # every pixel is a ray-march through the field and then a refraction
+    # through the surface normal, so a stale slot lands on the whole frame
+    # rather than on a glitter patch.
+    #
+    # The fix is the missing bound, not a deeper ring:
+    # MetalDevice::BeginFrame now waits on the command buffer from
+    # pt::rhi::kMaxFramesInFlight frames ago, the same contract
+    # VulkanDevice::BeginFrame has always had, and the ring depths are
+    # static_assert'd against it. AFTER IT, on the dev M4 Max: ten
+    # consecutive byte-identical renders of all three cells in Release AND
+    # ten in Debug, plus a clean `ctest -j 4`. Release matches the committed
+    # PNG exactly (max_delta 0.0000 on all three); Debug is a different
+    # optimisation level and lands where it always has -- boat 0.003% bad,
+    # snell 0.032%, orbit bit-identical -- comfortably inside FAIL_PERCENT 1
+    # and unchanged by this fix. Red-then-green: reverting just the
+    # BeginFrame wait brings the outlier straight back.
     #
     # THRESHOLDS, MEASURED. Run-to-run on the dev M4 Max is 0.0000 max /
     # 0.000000 mean on all three -- bit-identical -- so these are the MATRIX

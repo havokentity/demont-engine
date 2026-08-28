@@ -447,8 +447,11 @@ private:
     // record and read can't desync the staging-vs-caller byte count.
     VkExtent2D                  swap_capture_extent_ { 0, 0 };
 
-    // Per-frame in flight: 2-deep
-    static constexpr int kFramesInFlight = 2;
+    // Per-frame in flight: 2-deep. The number is not local to this backend
+    // (#295) -- it is the bound every CPU-written / GPU-read resource ring
+    // in the engine is sized against, so it lives in the RHI header and
+    // both backends enforce the same one. Value unchanged.
+    static constexpr int kFramesInFlight = pt::rhi::kMaxFramesInFlight;
     int                       current_frame_ = 0;
     std::uint32_t             current_swap_index_ = 0;
     VkCommandPool             cmd_pool_ = VK_NULL_HANDLE;

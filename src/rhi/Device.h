@@ -15,6 +15,36 @@
 
 namespace pt::rhi {
 
+// --- How far the CPU may run ahead of the GPU (#295) ----------------------
+//
+// Every backend must guarantee that when Device::BeginFrame() returns for
+// frame F, frame F - kMaxFramesInFlight has FINISHED executing. It is not a
+// pacing preference: it is the precondition every CPU-written / GPU-read
+// resource ring in this engine is sized against.
+//
+// The rings write shared (CPU-visible) storage with a plain memcpy --
+// MetalDevice::WriteTexture is an MTLTexture replaceRegion, VulkanDevice's
+// is a mapped-memory copy -- and neither is ordered against a dispatch that
+// is already executing. A ring of depth D makes that safe only because the
+// slot the CPU writes at frame F was last READ at frame F - D, so the write
+// is safe iff frame F - D has completed. With the write happening in the
+// engine's Tick, i.e. BEFORE BeginFrame() for the same frame, the frames
+// that can still be executing at the write are F-1 ... F-kMaxFramesInFlight,
+// so the requirement is
+//
+//     D >= kMaxFramesInFlight + 1.
+//
+// Engine::kOceanUploadRing (3) and PlanetTerrain::kRetireFrames (3) are both
+// D = 3, so kMaxFramesInFlight = 2 -- which is the depth VulkanDevice has
+// enforced with its fence ring since it was written. MEASURED consequence of
+// Metal NOT enforcing it (#295): golden_planet_ocean_snell rendered a
+// different image in 2 runs out of 10, and the outlier correlated one-for-one
+// with the frame at which the Metal backend had FOUR command buffers still
+// in flight -- one more than the ocean ring's three slots can absorb.
+//
+// Raising this constant requires raising every ring above with it.
+inline constexpr int kMaxFramesInFlight = 2;
+
 // Opaque platform handle passed to Device::Create.  On macOS this wraps an
 // NSWindow* (or its content view); on Windows it'd hold an HWND.
 struct NativeWindowHandle {
@@ -82,6 +112,16 @@ public:
     // Backends with no GPU (software/Embree) leave it at 0 forever,
     // which is the truth for them.
     virtual std::uint64_t AccelGpuStallCount() const { return 0; }
+
+    // Blocking waits taken by the frame-pacing bound (#295): how many
+    // times BeginFrame() had to hold the CPU because frame
+    // F - kMaxFramesInFlight had not finished. Unlike the accel counter
+    // above, a NON-zero value here is correct behaviour -- it is the
+    // count of times the engine was about to violate the precondition
+    // every CPU-written / GPU-read ring is sized against. It is exposed
+    // so "is the CPU outrunning the GPU?" is a number rather than a
+    // guess. Backends with no GPU timeline leave it at 0.
+    virtual std::uint64_t FramePacingStallCount() const { return 0; }
 
     virtual void DestroyBuffer(BufferHandle)             = 0;
     virtual void DestroyTexture(TextureHandle)           = 0;

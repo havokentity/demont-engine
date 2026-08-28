@@ -276,6 +276,9 @@ public:
     std::uint64_t AccelGpuStallCount() const override {
         return accel_gpu_stalls_.load(std::memory_order_relaxed);
     }
+    std::uint64_t FramePacingStallCount() const override {
+        return frame_gpu_stalls_.load(std::memory_order_relaxed);
+    }
 
     void DestroyBuffer(BufferHandle h) override;
     void DestroyTexture(TextureHandle h) override;
@@ -331,6 +334,21 @@ public:
 
     static constexpr std::uint64_t kSwapchainTextureId = 1;
 
+    // Depth of the frame-pacing ring, i.e. how many frames of GPU work the
+    // CPU is allowed to have outstanding. Named separately from
+    // pt::rhi::kMaxFramesInFlight only so the array declaration reads as a
+    // ring size; they are the same number by construction.
+    static constexpr int kFramePacingRing = pt::rhi::kMaxFramesInFlight;
+    // frame_index_ is a uint32 that is allowed to wrap, and the slot is
+    // frame_index_ % kFramePacingRing. That sequence is only continuous
+    // across the wrap if the ring divides 2^32 -- at a ring of 3, 2^32 % 3
+    // == 1 and the wrap would skip a slot, waiting on a frame one older
+    // than intended exactly once. A power of two makes it a non-question.
+    static_assert(kFramePacingRing > 0 &&
+                      (kFramePacingRing & (kFramePacingRing - 1)) == 0,
+                  "frame-pacing ring must be a power of two so the slot "
+                  "sequence stays continuous across the frame-index wrap");
+
 private:
     void* ns_window_ = nullptr;     // NSWindow*
     int   width_  = 0;
@@ -360,6 +378,30 @@ private:
     // path (see Device::AccelGpuStallCount). CreateBLAS / CreateTLAS
     // each take one; UpdateTLASInstances is required never to.
     std::atomic<std::uint64_t> accel_gpu_stalls_{0};
+
+    // --- Frame pacing (#295) ---------------------------------------------
+    //
+    // Metal has no fence object and Submit() does not wait, so before this
+    // ring there was NOTHING bounding how far the CPU could run ahead of the
+    // GPU: nextDrawable() throttles a windowed session at the swapchain's
+    // depth, but a headless capture (pt_render_one_frame, the whole golden
+    // matrix) has no layer, takes no drawable, and therefore had no throttle
+    // at all. VulkanDevice bounds it with vkWaitForFences on a
+    // kFramesInFlight-deep fence ring; this is the same ring with the last
+    // command buffer of each frame standing in for the fence, and it exists
+    // for the reason spelled out at pt::rhi::kMaxFramesInFlight.
+    //
+    // frame_cb_[F % kMaxFramesInFlight] holds the last command buffer
+    // committed during frame F. BeginFrame() for frame F therefore finds
+    // frame F - kMaxFramesInFlight's command buffer in that slot and waits
+    // on it -- exactly the frame whose fence VulkanDevice::BeginFrame waits
+    // on. Command buffers on one MTLCommandQueue complete in commit order,
+    // so waiting on a frame's LAST one implies all of its earlier ones.
+    MTL::CommandBuffer* frame_cb_[kFramePacingRing] {};
+    // Blocking waits actually taken on that ring. Zero on a GPU-bound run
+    // (the frame is long finished); non-zero means the CPU outran the GPU
+    // and was held, which is the case this ring exists to make safe.
+    std::atomic<std::uint64_t> frame_gpu_stalls_{0};
     // Built-in pipelines indexed by Slang kernel name.  P3+ shaders are
     // pre-compiled at device construction; CreateComputePipeline looks up
     // by name.
