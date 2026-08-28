@@ -81,6 +81,15 @@ inline constexpr std::uint32_t kInstKindTerrain = 1u;
 // Frames a retired arena slot / BLAS waits before reuse. Three covers the
 // deepest frames-in-flight either backend runs.
 inline constexpr int kRetireFrames = 3;
+// ...and "covers" is now a checked statement rather than a description
+// (#295). The slot recycled at frame F was last read at frame
+// F - kRetireFrames, and the recycle happens in the engine's Tick -- before
+// BeginFrame for the same frame -- so the frames that can still be executing
+// are F-1 ... F-kMaxFramesInFlight. See pt::rhi::kMaxFramesInFlight for the
+// derivation and for what it cost when a backend did not enforce it.
+static_assert(kRetireFrames >= pt::rhi::kMaxFramesInFlight + 1,
+              "retire ring is shallower than the frames the CPU may have "
+              "in flight -- a slot would be recycled under a live read");
 
 // Retirement slot sentinel: this retirement owns a BLAS but no arena slot.
 // A stitch-mask rebuild produces exactly that -- the chunk's vertices are

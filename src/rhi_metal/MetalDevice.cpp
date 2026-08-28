@@ -609,6 +609,18 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
 }
 
 MetalDevice::~MetalDevice() {
+    // Frame pacing (#295): drain and drop the retained per-frame command
+    // buffers before anything they reference is released.
+    for (auto*& c : frame_cb_) {
+        if (c == nullptr) continue;
+        const auto st = c->status();
+        if (st != MTL::CommandBufferStatusCompleted &&
+            st != MTL::CommandBufferStatusError) {
+            c->waitUntilCompleted();
+        }
+        c->release();
+        c = nullptr;
+    }
     cmd_.reset();
     // Tear down the SVGF denoiser BEFORE we release device_ / queue_ /
     // pipelines_ -- its textures + pipelines were allocated against
@@ -1507,6 +1519,32 @@ void MetalDevice::UseAllAccelStructs(MTL::ComputeCommandEncoder* enc) {
 // ---- Frame ---------------------------------------------------------------
 
 FrameContext MetalDevice::BeginFrame() {
+    // --- Frame pacing (#295) ----------------------------------------------
+    // Frame F may not start until frame F - kFramePacingRing has finished on
+    // the GPU. The slot holds that frame's last command buffer (see the
+    // declaration); waiting on it here is the exact analogue of
+    // VulkanDevice::BeginFrame's vkWaitForFences, and it is what makes every
+    // CPU-written / GPU-read ring in the engine -- Engine::kOceanUploadRing
+    // first among them -- a correctness mechanism rather than a hope.
+    //
+    // The wait is BEFORE the drawable is acquired so a windowed session
+    // blocks on the GPU rather than on the swapchain, and it is the only
+    // throttle a headless capture has at all.
+    {
+        const int pace_slot =
+            static_cast<int>(frame_index_ % kFramePacingRing);
+        if (auto* prev = frame_cb_[pace_slot]) {
+            const auto st = prev->status();
+            if (st != MTL::CommandBufferStatusCompleted &&
+                st != MTL::CommandBufferStatusError) {
+                prev->waitUntilCompleted();
+                frame_gpu_stalls_.fetch_add(1, std::memory_order_relaxed);
+            }
+            prev->release();
+            frame_cb_[pace_slot] = nullptr;
+        }
+    }
+
     if (frame_pool_) frame_pool_->release();
     frame_pool_ = NS::AutoreleasePool::alloc()->init();
 
@@ -1553,6 +1591,20 @@ void MetalDevice::Submit(CommandBuffer* cb) {
         mtl_cb->presentDrawable(current_drawable_);
     }
     mtl_cb->commit();
+    // --- Frame pacing (#295) ----------------------------------------------
+    // Record this frame's LATEST command buffer as the thing frame
+    // (F + kFramePacingRing)'s BeginFrame will wait on. Retained because
+    // MTLCommandQueue::commandBuffer() hands back an autoreleased object and
+    // the frame's autorelease pool is drained at EndFrame; a frame that
+    // commits several buffers keeps only the last, which is sufficient
+    // because a queue completes its buffers in commit order.
+    {
+        const int pace_slot =
+            static_cast<int>(frame_index_ % kFramePacingRing);
+        if (frame_cb_[pace_slot] != nullptr) frame_cb_[pace_slot]->release();
+        mtl_cb->retain();
+        frame_cb_[pace_slot] = mtl_cb;
+    }
     mcb->Reset(nullptr);
 }
 

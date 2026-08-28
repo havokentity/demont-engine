@@ -8,6 +8,7 @@
 #include "../renderer/AnalyticBvh.h"
 #include "../renderer/EditorOverlay.h"
 #include "../renderer/TriangleBvh.h"
+#include "../rhi/Device.h"
 #include "../rhi/Types.h"
 #include "CaptureFormat.h"
 #include "LensFlare.h"
@@ -1102,11 +1103,37 @@ private:
     // backend runs"), and the two want to stay the same number: a write to
     // slot f mod 3 can only meet a read issued three frames earlier.
     //
-    // The RIGHT fix is a GPU-timeline upload -- a staging buffer blitted
-    // into the texture inside the frame's own command buffer -- which needs
-    // a CommandBuffer::CopyBufferToTexture verb the RHI does not have. That
-    // is a three-backend change and this is a one-file one; noted, not spent.
+    // --- #295: the ring is only as good as the frames-in-flight bound ----
+    //
+    // That last sentence is a THEOREM, not an axiom, and its premise --
+    // "the GPU is at most two frames behind" -- was false on Metal, which
+    // had no frame pacing at all. In a headless capture there is not even a
+    // drawable to throttle on, so the CPU ran as far ahead as it liked;
+    // MEASURED at four command buffers in flight, one more than this ring
+    // has slots, on 2 runs in 10 of golden_planet_ocean_snell, and the
+    // over-run correlated one-for-one with the outlier image. The ocean
+    // FIELD was bit-identical on every one of those runs (per-frame FNV of
+    // the uploaded atlas), which is what says the corruption is the GPU
+    // reading a slot the CPU had already overwritten and not the solver.
+    //
+    // The bound is now enforced by the backend -- pt::rhi::kMaxFramesInFlight
+    // -- and asserted against this depth below, so the ring is a mechanism
+    // rather than a hope.
+    //
+    // The RIGHT fix is still a GPU-timeline upload -- a staging buffer
+    // blitted into the texture inside the frame's own command buffer --
+    // which needs a CommandBuffer::CopyBufferToTexture verb the RHI does not
+    // have. That is a three-backend change and this is not; noted, not spent.
     static constexpr int kOceanUploadRing = 3;
+    // The write for frame F happens in Tick, BEFORE BeginFrame for the same
+    // frame, so the frames that can still be executing when it lands are
+    // F-1 ... F-kMaxFramesInFlight, and the slot it lands in was last read
+    // at frame F-kOceanUploadRing. Safe iff the ring is one deeper than the
+    // in-flight bound.
+    static_assert(kOceanUploadRing >= pt::rhi::kMaxFramesInFlight + 1,
+                  "ocean upload ring is shallower than the frames the CPU "
+                  "may have in flight -- a slot would be rewritten under a "
+                  "live read");
 
     std::unique_ptr<pt::ocean::OceanFFT>        ocean_;
     std::uint64_t ocean_disp_tex_id_[kOceanUploadRing]   = {0, 0, 0};
