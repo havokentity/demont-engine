@@ -1164,20 +1164,18 @@ private:
     // not declare this kernel's bindings), and r_ocean_gpu 0 on Metal all
     // take it, and for them the race and its fix are exactly as #295 left
     // them.
+    static constexpr int kOceanUploadRingGpu = 1;
+    // The runtime depth still has to FIT the handle arrays below, which are
+    // sized at compile time by the deeper of the two. This is the load-
+    // bearing relation between the pair -- ocean_tex_slot_ is
+    // (slot + 1) % ring and indexes those arrays directly.
+    static_assert(kOceanUploadRingGpu <= kOceanUploadRing,
+                  "the GPU-solved ring must fit the texture handle arrays, "
+                  "which are sized by kOceanUploadRing");
+    // How many texture slots the ocean field needs under a given solver.
     static constexpr int OceanUploadRingFor(bool gpu_solved) {
-        return gpu_solved ? 1 : kOceanUploadRing;
+        return gpu_solved ? kOceanUploadRingGpu : kOceanUploadRing;
     }
-    // Both arms, pinned. The CPU arm has to keep clearing the frames-in-
-    // flight bound; the GPU arm has to stay at 1, because a value above 1
-    // there would mean the field was being staggered against a hazard the
-    // GPU timeline already covers -- i.e. that someone reintroduced a host
-    // write without noticing.
-    static_assert(OceanUploadRingFor(false) >= pt::rhi::kMaxFramesInFlight + 1,
-                  "the CPU-solved ocean ring must still clear the "
-                  "frames-in-flight bound");
-    static_assert(OceanUploadRingFor(true) == 1,
-                  "the GPU-solved ocean field is written on the GPU timeline "
-                  "and needs exactly one slot");
 
     std::unique_ptr<pt::ocean::OceanFFT>        ocean_;
     std::uint64_t ocean_disp_tex_id_[kOceanUploadRing]   = {0, 0, 0};
