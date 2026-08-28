@@ -5876,7 +5876,8 @@ float3 skyColor(float3 ro, float3 rd, inout uint seed) {
     // mode == 3 -> Hosek-Wilkie physically-based sky. Routed like the
     // procedural path (mode 2): the analytic dome drives both the
     // visible sky AND the diffuse-skylight ambient sampled at secondary
-    // bounces (skyColor(nf) in the Lambert NEE block), and the same
+    // bounces (skyColorBase(hit_pt, nf, seed) in the Lambert NEE block),
+    // and the same
     // sun/moon disc overlays + stars are composited on top.
     if (mode == 3u) {
         base = hosekSky(rd, sun_and_mode.xyz);
@@ -6810,7 +6811,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
         //     1.5m entry-side estimate with the exact distance the ray
         //     travelled before hitting the next surface)
         //   * sky-on-miss returns water_state.yzw (deep-water tint) instead
-        //     of skyColor(rd), so TIR rays from underwater don't escape to
+        //     of skyColor(ro, rd, seed), so TIR rays from underwater do not
+        //     escape to
         //     the bright horizon when the scene runs out of geometry below
         //     the water plane.
         //
@@ -7003,7 +7005,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
 #if PT_WATER_ENABLED
             // --- Underwater sky-miss override (Phase 4, #134) ---------------
             // Ray escaped to infinity while inside the water medium. We do
-            // NOT call skyColor(rd) here -- a TIR-reflected underwater ray
+            // NOT call skyColor(ro, rd, seed) here -- a TIR-reflected
+            // underwater ray
             // looking back down at empty space should die to deep-water
             // void, not pick up bright sky-blue from the procedural sky
             // model. water_state.yzw is the tunable deep-water tint
@@ -7944,7 +7947,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
             // Approximation: treat (1 - trans_atm_surf) as the
             // fraction of the path's radiance that the air absorbed,
             // and replace it with the sky color in the camera's view
-            // direction. skyColor(primary_rd) samples env_map for
+            // direction. skyColor(primary_ro, primary_rd, seed) samples
+            // env_map for
             // HDRI mode (the actual sunset / clear-sky / etc. tint
             // visible behind the surface). Clamp-wrapped to bound
             // the magnitude when the view ray points toward a bright
