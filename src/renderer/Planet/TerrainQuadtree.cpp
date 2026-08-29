@@ -3,6 +3,8 @@
 
 #include "TerrainQuadtree.h"
 
+#include "TerrainResidency.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -123,12 +125,13 @@ void TerrainQuadtree::Descend(const ChunkKey& k, const LodParams& p,
 }
 
 int TerrainQuadtree::LeafLevelAt(const ChunkKey& probe) const {
-    ChunkKey k = probe;
-    for (;;) {
-        if (desired_.find(k) != desired_.end()) return static_cast<int>(k.level);
-        if (k.level == 0) return -1;
-        k = k.Parent();
-    }
+    // One implementation, evaluated on two different leaf sets. The selector
+    // asks about the DESIRED set; the streamer asks about the PUBLISHED set,
+    // which during a split or merge transition is not the same thing -- see
+    // TerrainResidency.h. Keeping them as one function is what makes
+    // "the mask is computed against the set the rays actually see" a
+    // substitution rather than a second transcription of the rule.
+    return LeafLevelIn(desired_, probe);
 }
 
 void TerrainQuadtree::Balance(const LodParams& p) {
@@ -313,18 +316,7 @@ std::uint64_t TerrainQuadtree::DesiredDigest() const noexcept {
 }
 
 std::uint32_t TerrainQuadtree::StitchMask(const ChunkKey& k) const {
-    std::uint32_t mask = 0;
-    for (int e = 0; e < 4; ++e) {
-        ChunkKey nb{};
-        if (!NeighborChunk(k, static_cast<ChunkEdge>(e), nb)) continue;
-        const int nl = LeafLevelAt(nb);
-        // Only a COARSER neighbour makes this chunk stitch: it drops its odd
-        // vertices along that edge so its boundary polyline becomes exactly
-        // the coarse neighbour's. A finer neighbour does its own stitching
-        // in the other direction.
-        if (nl >= 0 && nl < static_cast<int>(k.level)) mask |= (1u << e);
-    }
-    return mask;
+    return StitchMaskFor(k, desired_);
 }
 
 // --- AsyncChunkBaker ------------------------------------------------------

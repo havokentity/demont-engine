@@ -40,11 +40,13 @@
 #include "renderer/Planet/ElevationField.h"
 #include "renderer/Planet/TerrainChunk.h"
 #include "renderer/Planet/TerrainQuadtree.h"
+#include "renderer/Planet/TerrainResidency.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <set>
 #include <utility>
 #include <thread>
@@ -1283,4 +1285,346 @@ TEST_CASE("no converged leaf still wants to split") {
     // Not vacuous: there ARE sub-max-level leaves to have an opinion about.
     CHECK(checked > 0u);
     CHECK(wants_to_split == 0u);
+}
+
+// ===========================================================================
+// Chunk residency: the published cover and the retirement rule
+// ===========================================================================
+//
+// The streamer used to retire every chunk the selector stopped wanting in one
+// unconditional step while the replacements were paced over tens of frames,
+// so the terrain holed out along the LOD boundary on every camera motion.
+// pt::planet::ComputeResidencyCover is the fix's decision procedure, and it
+// is pure -- two key sets in, a cover and a retirement list out -- precisely
+// so that the claims below are equalities over the whole domain rather than
+// impressions of a picture.
+//
+// The end-to-end statement (tick PlanetTerrain::Update at a realistic
+// blas_budget_ms and watch coverage hold every frame) lives in
+// pt_planet_residency, which needs an RHI device. What is here is the policy
+// itself, which needs nothing, plus the paced-stream contrast that proves
+// the coverage assertion is capable of failing.
+
+namespace {
+
+// A complete, 2:1-balanced leaf partition of the sphere at one uniform level.
+std::set<ChunkKey> UniformLeaves(int level) {
+    std::set<ChunkKey> out;
+    const std::uint32_t span = 1u << level;
+    for (int f = 0; f < 6; ++f) {
+        for (std::uint32_t i = 0; i < span; ++i) {
+            for (std::uint32_t j = 0; j < span; ++j) {
+                out.insert(ChunkKey{static_cast<std::uint8_t>(f),
+                                    static_cast<std::uint8_t>(level), i, j});
+            }
+        }
+    }
+    return out;
+}
+
+// Replace `k` by its four children. The result stays 2:1 balanced when the
+// input was uniform, because a one-level island is exactly the step the
+// restriction permits.
+std::set<ChunkKey> SplitOne(std::set<ChunkKey> leaves, const ChunkKey& k) {
+    REQUIRE(leaves.erase(k) == 1u);
+    for (int q = 0; q < 4; ++q) leaves.insert(k.Child(q));
+    return leaves;
+}
+
+bool IsAntichainSet(const std::set<ChunkKey>& s) {
+    for (const ChunkKey& k : s) {
+        ChunkKey a = k;
+        while (a.level > 0) {
+            a = a.Parent();
+            if (s.find(a) != s.end()) return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+TEST_CASE("a split holds the parent until all four children are resident") {
+    const std::set<ChunkKey> before = UniformLeaves(1);
+    const ChunkKey parent{2, 1, 1, 0};
+    const std::set<ChunkKey> after = SplitOne(before, parent);
+    REQUIRE(IsEdgeBalanced(before));
+    REQUIRE(IsEdgeBalanced(after));
+
+    // The selector has split `parent`; residency has not caught up at all.
+    std::set<ChunkKey> resident = before;
+    for (int landed = 0; landed <= 4; ++landed) {
+        for (int q = 0; q < landed; ++q) resident.insert(parent.Child(q));
+        const auto cover = ComputeResidencyCover(after, resident);
+
+        CHECK(IsAntichainSet(cover.published));       // no coincident surfaces
+        CHECK(IsEdgeBalanced(cover.published));       // no crack
+        // Every desired leaf's ground is still drawn, at every stage.
+        CHECK(CoversAll(cover.published, after));
+
+        if (landed < 4) {
+            // The parent is still standing in, so it is NOT retirable and it
+            // IS what is on screen -- the children that have landed are held
+            // back rather than drawn through it.
+            CHECK(cover.published.find(parent) != cover.published.end());
+            CHECK(std::find(cover.retirable.begin(), cover.retirable.end(),
+                            parent) == cover.retirable.end());
+            for (int q = 0; q < landed; ++q) {
+                CHECK(cover.published.find(parent.Child(q)) ==
+                      cover.published.end());
+            }
+        } else {
+            // Fourth child in: the children take over and the parent becomes
+            // retirable IN THE SAME PASS, so no frame ever publishes both.
+            CHECK(cover.published.find(parent) == cover.published.end());
+            for (int q = 0; q < 4; ++q) {
+                CHECK(cover.published.find(parent.Child(q)) !=
+                      cover.published.end());
+            }
+            CHECK(std::find(cover.retirable.begin(), cover.retirable.end(),
+                            parent) != cover.retirable.end());
+        }
+        resident = before;
+    }
+}
+
+TEST_CASE("a merge holds the children until the parent is resident") {
+    const ChunkKey parent{4, 1, 0, 1};
+    const std::set<ChunkKey> before = SplitOne(UniformLeaves(1), parent);
+    const std::set<ChunkKey> after  = UniformLeaves(1);
+
+    // Everything the fine set wanted is resident; the selector has merged.
+    std::set<ChunkKey> resident = before;
+    auto cover = ComputeResidencyCover(after, resident);
+    CHECK(IsAntichainSet(cover.published));
+    CHECK(IsEdgeBalanced(cover.published));
+    CHECK(CoversAll(cover.published, after));
+    for (int q = 0; q < 4; ++q) {
+        CHECK(cover.published.find(parent.Child(q)) != cover.published.end());
+        CHECK(std::find(cover.retirable.begin(), cover.retirable.end(),
+                        parent.Child(q)) == cover.retirable.end());
+    }
+
+    // Three of four children retired early would be a hole; the rule does not
+    // permit it, so check the partial-arrival state instead: the parent
+    // lands, and now all four children go at once.
+    resident.insert(parent);
+    cover = ComputeResidencyCover(after, resident);
+    CHECK(cover.published.find(parent) != cover.published.end());
+    for (int q = 0; q < 4; ++q) {
+        CHECK(cover.published.find(parent.Child(q)) == cover.published.end());
+        CHECK(std::find(cover.retirable.begin(), cover.retirable.end(),
+                        parent.Child(q)) != cover.retirable.end());
+    }
+    CHECK(IsAntichainSet(cover.published));
+    CHECK(CoversAll(cover.published, after));
+}
+
+TEST_CASE("retiring what the cover leaves out takes nothing off the screen") {
+    // The retirement rule is "a chunk may go once its ground is covered
+    // without it". Stated as an equality: removing the whole retirement list
+    // from residency must produce the SAME published cover. Anything else
+    // means the list contained a chunk that was still doing work.
+    const ChunkKey a{0, 1, 0, 0};
+    const ChunkKey b{3, 1, 1, 1};
+    const std::set<ChunkKey> fine = SplitOne(SplitOne(UniformLeaves(1), a), b);
+    const std::set<ChunkKey> coarse = UniformLeaves(1);
+
+    // Both split parents held past their children landing.
+    std::set<ChunkKey> fine_plus_parents = fine;
+    fine_plus_parents.insert(a);
+    fine_plus_parents.insert(b);
+    // Merged children held past their parent landing.
+    std::set<ChunkKey> coarse_plus_children = coarse;
+    for (int q = 0; q < 4; ++q) coarse_plus_children.insert(a.Child(q));
+
+    // A pile of awkward mixtures: mid-split, mid-merge, both at once, and
+    // the two COMPLETED transitions -- which are the states that actually
+    // have something to retire.
+    const std::vector<std::pair<std::set<ChunkKey>, std::set<ChunkKey>>> cases = {
+        {fine,   coarse},
+        {coarse, fine},
+        {fine,   fine},
+        {coarse, coarse},
+        {SplitOne(UniformLeaves(1), a), fine},
+        {fine,   SplitOne(UniformLeaves(1), b)},
+        {fine,   fine_plus_parents},
+        {coarse, coarse_plus_children},
+    };
+    std::size_t exercised = 0;
+    for (const auto& [desired, resident] : cases) {
+        const auto cover = ComputeResidencyCover(desired, resident);
+        std::set<ChunkKey> kept = resident;
+        for (const ChunkKey& r : cover.retirable) kept.erase(r);
+        const auto after = ComputeResidencyCover(desired, kept);
+        CHECK(after.published == cover.published);
+        if (!cover.retirable.empty()) ++exercised;
+    }
+    // Not vacuous: some of those cases really did have something to retire.
+    CHECK(exercised >= 2u);
+}
+
+TEST_CASE("the published cover never overlaps itself and never breaks 2:1") {
+    // Sweep every single-chunk split against every partially-arrived
+    // residency state, on all six faces. The two properties are what make a
+    // transition safe in a path tracer: overlapping instances double-shade
+    // with no depth buffer to arbitrate, and a two-level step is a crack the
+    // 16-variant index arena cannot stitch.
+    std::uint64_t rng = 0x9E3779B97F4A7C15ull;
+    auto next = [&rng]() {
+        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng;
+    };
+    const std::set<ChunkKey> base = UniformLeaves(2);
+    std::size_t states = 0;
+    std::size_t with_substitutions = 0;
+    for (int f = 0; f < 6; ++f) {
+        for (int rep = 0; rep < 12; ++rep) {
+            const ChunkKey k{static_cast<std::uint8_t>(f), 2,
+                             static_cast<std::uint32_t>(next() % 4u),
+                             static_cast<std::uint32_t>(next() % 4u)};
+            const std::set<ChunkKey> desired = SplitOne(base, k);
+            REQUIRE(IsEdgeBalanced(desired));
+            // Residency: the pre-split set, plus a random subset of the new
+            // children, minus a random handful of unrelated chunks (the
+            // streamer is always somewhere behind).
+            std::set<ChunkKey> resident = base;
+            for (int q = 0; q < 4; ++q) {
+                if (next() & 1ull) resident.insert(k.Child(q));
+            }
+            for (int drop = 0; drop < 3; ++drop) {
+                auto it = resident.begin();
+                std::advance(it, static_cast<long>(next() % resident.size()));
+                resident.erase(it);
+            }
+            const auto cover = ComputeResidencyCover(desired, resident);
+            CHECK(IsAntichainSet(cover.published));
+            CHECK(IsEdgeBalanced(cover.published));
+            for (const ChunkKey& p : cover.published) {
+                CHECK(resident.find(p) != resident.end());
+            }
+            ++states;
+            if (cover.substitutions > 0) ++with_substitutions;
+        }
+    }
+    CHECK(states == 72u);
+    // Non-vacuous: the sweep really did produce covers that differ from the
+    // desired set, which is the only case the two properties can fail in.
+    CHECK(with_substitutions > 0u);
+}
+
+TEST_CASE("a paced stream keeps its coverage; immediate eviction does not") {
+    // THE CONTRAST THAT MAKES THE COVERAGE ASSERTION MEAN SOMETHING.
+    //
+    // "Coverage never regresses" is trivially true of a stream that never
+    // changes, and every planet golden settles to a fixed point before it
+    // captures, so nothing in the suite could previously fail on this. Here
+    // the same camera flight is run twice over the same real selector, once
+    // under the coverage rule and once under the old rule of retiring
+    // whatever the selector stopped wanting -- and the second one is required
+    // to LOSE ground, which is the user-visible bug reproduced as a number.
+    //
+    // Both runs admit at most kAdmit chunks per tick, which is what pacing
+    // against r_planet_blas_budget_ms does without putting a clock in the
+    // test. The end-to-end version, against the real Update() and the real
+    // millisecond budget, is pt_planet_residency.
+    ElevationParams ep{};
+    ElevationField field;
+    field.SetParams(ep);
+    const PlanetSite site = PlanetSite::FromGeodetic(0.4886921905584123,
+                                                     1.5171188644967204);
+
+    LodParams p{};
+    p.tau_px       = 0.5;
+    p.hysteresis   = 1.4;
+    p.min_level    = 0;
+    p.max_level    = 6;
+    p.chunk_budget = 8192;                 // no budget pressure in this test
+    p.cone_spread  = 2.0 * 0.5773502691896257 / 1080.0;
+
+    constexpr int    kTicks = 40;
+    constexpr int    kAdmit = 6;
+    constexpr double kAltTop_m    = 400000.0;   // low Earth orbit
+    constexpr double kAltBottom_m = 40000.0;
+
+    auto altitude = [&](int tick) {
+        const double t = static_cast<double>(tick) / (kTicks - 1);
+        return kAltTop_m + (kAltBottom_m - kAltTop_m) * t;
+    };
+
+    // `coverage_policy = false` is the old rule, verbatim.
+    auto fly = [&](bool coverage_policy) {
+        TerrainQuadtree tree;
+        std::set<ChunkKey> resident;
+        std::set<ChunkKey> prev_published;
+        int lost = 0;
+        std::size_t max_desired = 0;
+        int held_ticks = 0;
+        for (int tick = 0; tick < kTicks; ++tick) {
+            p.camera_w = glm::dvec3(0.0, altitude(tick), 0.0);
+            // Measure whatever the selector asks for. The tree descends one
+            // level per completed bake round by construction, so this is the
+            // same staircase a real bake pool walks, minus the threads.
+            for (int round = 0; round < 4; ++round) {
+                tree.Select(p);
+                if (tree.Wanted().empty()) break;
+                for (const ChunkKey& k : tree.Wanted()) {
+                    TerrainChunkData d;
+                    BuildTerrainChunk(k, field, site, d);
+                    tree.NoteChunk(d);
+                }
+            }
+            tree.Select(p);
+            const std::set<ChunkKey>& desired = tree.Desired();
+            max_desired = std::max(max_desired, desired.size());
+
+            std::set<ChunkKey> published;
+            if (coverage_policy) {
+                // Add first, then let the cover decide what is redundant.
+                int admitted = 0;
+                for (const ChunkKey& k : desired) {
+                    if (resident.find(k) != resident.end()) continue;
+                    resident.insert(k);
+                    if (++admitted >= kAdmit) break;
+                }
+                const auto cover = ComputeResidencyCover(desired, resident);
+                for (const ChunkKey& r : cover.retirable) resident.erase(r);
+                published = cover.published;
+                if (cover.substitutions > 0) ++held_ticks;
+            } else {
+                // The old rule: evict everything unwanted, then add what fits.
+                for (auto it = resident.begin(); it != resident.end();) {
+                    if (desired.find(*it) == desired.end()) it = resident.erase(it);
+                    else ++it;
+                }
+                int admitted = 0;
+                for (const ChunkKey& k : desired) {
+                    if (resident.find(k) != resident.end()) continue;
+                    resident.insert(k);
+                    if (++admitted >= kAdmit) break;
+                }
+                published = resident;
+            }
+            if (!prev_published.empty() && !CoversAll(published, prev_published)) {
+                ++lost;
+            }
+            CHECK(IsAntichainSet(published));
+            CHECK(IsEdgeBalanced(published));
+            prev_published = published;
+        }
+        struct R { int lost; std::size_t max_desired; int held_ticks; };
+        return R{lost, max_desired, held_ticks};
+    };
+
+    const auto with_policy = fly(true);
+    const auto without     = fly(false);
+
+    // The camera really did move the LOD boundary, and the stream really did
+    // have to hold chunks -- otherwise both runs would be green for nothing.
+    CHECK(with_policy.max_desired > 24u);
+    CHECK(with_policy.held_ticks > 0);
+
+    // The bug, reproduced.
+    CHECK(without.lost > 0);
+    // The fix.
+    CHECK(with_policy.lost == 0);
 }

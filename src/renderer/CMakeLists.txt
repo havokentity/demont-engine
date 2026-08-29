@@ -17,6 +17,7 @@ add_library(pt_renderer STATIC
     Planet/SurfaceAlbedo.cpp
     Planet/TerrainChunk.cpp
     Planet/TerrainQuadtree.cpp
+    Planet/TerrainResidency.cpp
     TriangleBvh.cpp
 )
 target_include_directories(pt_renderer PUBLIC ${CMAKE_SOURCE_DIR}/src)

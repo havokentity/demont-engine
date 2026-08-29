@@ -433,6 +433,40 @@ endif()
 # vacuous one; if this ever needs to get faster, cut redundancy, not cases.
 set_tests_properties(pt_planet_terrain PROPERTIES TIMEOUT 600)
 
+# --- pt_planet_residency (paced terrain streaming) -------------------------
+# Chunk residency on the PACED streaming path.
+#
+# Separate from pt_planet_terrain because it needs a real RHI device: the
+# claim under test is about PlanetTerrain::Update, which owns the arena, the
+# BLAS builds and the wall-clock pacing, and none of those exist in
+# pt_renderer. Links pt_engine (for PlanetTerrain) and pt_rhi (for the
+# device).
+#
+# WHY IT CANNOT BE FOLDED INTO A GOLDEN. Every planet fixture calls
+# PlanetTerrain::Settle(), which is a barrier and runs UNPACED -- a settled
+# capture is a fully-resident one by construction, so a golden cannot
+# observe a streaming transient at all. Asserting "no holes" after a settle
+# would be a check that passes without testing anything, which is the exact
+# shape this repo keeps rediscovering. This test never calls Settle().
+#
+# Software backend only, and honestly SKIPPED (125) rather than green when
+# no device comes up. The residency policy is backend-independent -- it is
+# CPU set arithmetic over quadtree keys -- so a second backend would
+# re-measure the same thing at the cost of a GPU-contended CI cell.
+#
+# TIMEOUT 300: the flight is 180 ticks with a 4 ms frame emulation and a
+# software BLAS build per admitted chunk; measured well under a minute on an
+# M4 Max, and CI runners are slower at BVH builds by a wide margin.
+if(APPLE OR WIN32)
+    pt_add_test(pt_planet_residency
+        pt_planet_residency_test.cpp
+        LINK_TARGETS pt_engine pt_rhi)
+    set_tests_properties(pt_planet_residency PROPERTIES
+        TIMEOUT          300
+        SKIP_RETURN_CODE 125
+        LABELS           "planetary;residency")
+endif()
+
 # --- pt_planet_shader (issue #258, planetary P4) ---------------------------
 # The host mirror of the shader-side terrain contract: the instance
 # descriptor's wire format, the three terrain bindings across Slang AND the

@@ -136,6 +136,7 @@ void PlanetTerrain::Shutdown() {
         if (index_buf_.id != 0) device_->DestroyBuffer(index_buf_);
     }
     resident_.clear();
+    published_.clear();
     baked_.clear();
     requested_.clear();
     retired_.clear();
@@ -199,13 +200,25 @@ void PlanetTerrain::FlushRetired(bool force) {
 
 void PlanetTerrain::RebuildInstanceArray(const glm::dvec3& anchor) {
     instances_.clear();
-    instances_.reserve(resident_.size());
-    descriptors_.assign(static_cast<std::size_t>(resident_.size()) *
+    instances_.reserve(published_.size());
+    descriptors_.assign(static_cast<std::size_t>(published_.size()) *
                             kInstDescFloat4s * 4u,
                         0.0f);
 
+    // The PUBLISHED cover, not every resident chunk. A chunk held through a
+    // split and the incoming children underneath it are both resident, and
+    // putting both in the TLAS would place two surfaces on the same ground:
+    // no depth buffer arbitrates that in a path tracer, so the ray takes
+    // whichever the BVH reports first and the shading flickers between two
+    // legitimate answers. published_ is a disjoint cover by construction --
+    // see pt::planet::ComputeResidencyCover. Still walked in KEY order, so
+    // the instance and descriptor layout stays a function of the set rather
+    // than of the order it was assembled.
     std::uint32_t ordinal = 0;
-    for (auto& [key, r] : resident_) {
+    for (const auto& key : published_) {
+        const auto rit = resident_.find(key);
+        if (rit == resident_.end()) continue;   // cover members are resident
+        const Resident& r = rit->second;
         // Descriptor index 0 is the engine's mesh, so terrain starts at 1.
         const std::uint32_t desc_index = ordinal + 1u;
         const glm::vec3 t(r.origin_w - anchor);
@@ -266,6 +279,140 @@ void PlanetTerrain::RebuildInstanceArray(const glm::dvec3& anchor) {
     }
 }
 
+std::vector<ChunkKey> PlanetTerrain::ResidentKeys() const {
+    std::vector<ChunkKey> out;
+    out.reserve(resident_.size());
+    for (const auto& [k, r] : resident_) { (void)r; out.push_back(k); }
+    return out;
+}
+
+void PlanetTerrain::RetireUncovered(const std::set<ChunkKey>& desired) {
+    // The pre-coverage rule: everything the selector stopped wanting goes,
+    // right now, whether or not anything covers the ground it stood on.
+    // Still what the settling barrier uses -- see the note at its call site.
+    for (auto it = resident_.begin(); it != resident_.end();) {
+        if (desired.find(it->first) == desired.end()) {
+            RetireChunk(it->second);
+            baked_.erase(it->first);
+            it = resident_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void PlanetTerrain::ChooseCover(const std::set<ChunkKey>& desired,
+                                const pt::planet::LodParams& lod) {
+    std::set<ChunkKey> res_keys;
+    for (const auto& [k, r] : resident_) { (void)r; res_keys.insert(k); }
+
+    auto cover = pt::planet::ComputeResidencyCover(desired, res_keys);
+
+    // --- The arena gets no headroom, so the hold is what gives -----------
+    //
+    // Holding an outgoing chunk while its replacements stream in costs a
+    // slot the steady state does not need, and there is nowhere to take it
+    // from. The selector's target IS the arena size and lowering it would
+    // change the converged residency set that every planet golden is pinned
+    // against -- a fix that moves the goldens is not a fix.
+    //
+    // So the holds are released ON DEMAND, against the demand that is
+    // actually blocked: chunks the selector wants, whose geometry is
+    // already baked, that have no arena slot to go into. Exactly that many
+    // stand-ins go, lowest error-per-distance first.
+    //
+    // The measure is (blocked demand - free slots), and both halves matter.
+    // A standing reserve of `chunk_budget_ - |desired|` was the first
+    // version and it reads a paced stream as having no slack at all -- the
+    // selector runs far ahead of the bake pool, measured 1 023 desired
+    // against 158 resident on the descent this is tested against -- so it
+    // refused every hold while 863 arena slots sat empty. Netting against
+    // the FREE LIST instead of against the budget is what makes the
+    // difference: the release fires when the arena is genuinely full and
+    // stays silent when it is not, and "genuinely full" is a fact rather
+    // than a forecast.
+    //
+    // It also has to be measured here and not in the add pass. Counting the
+    // chunks the add loop turned away conflates "no slot" with "no build
+    // budget": the loop breaks out on the millisecond budget, so on a slow
+    // host it stops looking long before it has seen the demand, and the
+    // deficit comes out near zero exactly when the arena is most clogged.
+    // Measured on a Debug build: 5 turned away against 121 stand-ins
+    // squatting a 128-slot arena, and the release never fired.
+    //
+    // Releasing on demand makes the starvation deadlock impossible rather
+    // than improbable, which is the point: that bug is self-sustaining --
+    // the hold occupies the slot its own replacement needs, so the
+    // replacement never arrives and the hold is never retired. Here,
+    // wanting the slot is what frees it.
+    //
+    // What the caller sees when this fires is the old behaviour: the chunk
+    // goes and the ground holes out until its replacement lands. That is
+    // the right way round to fail. A hole is ugly; an arena overrun hands
+    // the TLAS more instances than it has capacity for.
+    std::vector<ChunkKey> stand_ins;
+    for (const ChunkKey& k : cover.published) {
+        if (desired.find(k) == desired.end()) stand_ins.push_back(k);
+    }
+    std::set<ChunkKey> released;
+    // Demand the arena is blocking: desired, baked, and homeless.
+    std::size_t blocked = 0;
+    for (const ChunkKey& k : desired) {
+        if (resident_.find(k) != resident_.end()) continue;
+        if (baked_.find(k) != baked_.end()) ++blocked;
+    }
+    const std::size_t starved =
+        (blocked > free_slots_.size()) ? (blocked - free_slots_.size()) : 0u;
+    // Releases already in flight. A retired slot does not rejoin the free
+    // list for kRetireFrames, so the deficit this pass sees is the same one
+    // the last two passes saw; without netting off its own outstanding
+    // releases it would spend the deficit three times and punch three times
+    // the holes. See Retired::hold_release for why ORDINARY retirements are
+    // deliberately not netted off as well.
+    std::size_t releases_in_flight = 0;
+    for (const Retired& rt : retired_) {
+        if (rt.hold_release) ++releases_in_flight;
+    }
+    const std::size_t deficit =
+        (starved > releases_in_flight) ? (starved - releases_in_flight) : 0u;
+    const std::size_t cap =
+        (deficit >= stand_ins.size()) ? 0u : (stand_ins.size() - deficit);
+    if (stand_ins.size() > cap) {
+        // Lowest error-per-distance goes first: the same ordering the
+        // selector evicts by, so the stand-in that survives is the one whose
+        // absence would be most visible. Tie-broken on the key, so two runs
+        // of the same state drop the same chunks.
+        std::sort(stand_ins.begin(), stand_ins.end(),
+                  [&](const ChunkKey& a, const ChunkKey& b) {
+                      const double pa = tree_.Priority(a, lod);
+                      const double pb = tree_.Priority(b, lod);
+                      if (pa != pb) return pa < pb;
+                      return a < b;
+                  });
+        const std::size_t drop = stand_ins.size() - cap;
+        for (std::size_t i = 0; i < drop; ++i) {
+            cover.published.erase(stand_ins[i]);
+            cover.retirable.push_back(stand_ins[i]);
+            released.insert(stand_ins[i]);
+        }
+        stats_.holds_dropped += static_cast<std::uint64_t>(drop);
+    }
+
+    published_ = std::move(cover.published);
+    stats_.holds_refused += static_cast<std::uint64_t>(cover.refused);
+    stats_.held = std::min(stand_ins.size(), cap);
+    stats_.starved = starved;
+
+    for (const ChunkKey& k : cover.retirable) {
+        auto it = resident_.find(k);
+        if (it == resident_.end()) continue;
+        RetireChunk(it->second);
+        if (released.find(k) != released.end()) retired_.back().hold_release = true;
+        baked_.erase(k);
+        resident_.erase(it);
+    }
+}
+
 bool PlanetTerrain::Update(const pt::planet::LodParams& lod,
                            const glm::dvec3& anchor) {
     if (!Ready()) return false;
@@ -303,18 +450,27 @@ bool PlanetTerrain::Update(const pt::planet::LodParams& lod,
 
     // --- 3. Diff residency ------------------------------------------------
     bool dirty = fresh.empty() ? false : true;
+    const std::size_t resident_before = resident_.size();
 
-    // 3a. Evict.
-    for (auto it = resident_.begin(); it != resident_.end();) {
-        if (desired.find(it->first) == desired.end()) {
-            RetireChunk(it->second);
-            baked_.erase(it->first);
-            it = resident_.erase(it);
-            dirty = true;
-        } else {
-            ++it;
-        }
-    }
+    // 3a. Evict -- ONLY while settling.
+    //
+    // Immediate, unconditional eviction is what made the terrain hole out
+    // on camera motion: the chunks the selector dropped went away in
+    // one step while their replacements were paced over tens of frames. The
+    // paced path now retires by coverage instead, in 3c, once the add pass
+    // has had its chance to land the replacements.
+    //
+    // Settling keeps the old rule verbatim, and that is a determinism
+    // decision rather than an oversight. A settling round is a barrier with
+    // no observer -- Settle() runs to a fixed point before anything is
+    // captured -- so there is no transient to smooth. What there IS is a
+    // golden matrix pinned to the settled scene down to the arena slot each
+    // chunk holds (see PublishedSceneDigest and the #284 note in the
+    // header), and slots come off a free list whose order is a function of
+    // when each chunk was retired. Holding a chunk two rounds longer would
+    // renumber the arena and reorder the BLAS builds for a transient
+    // nobody sees.
+    if (settling_) RetireUncovered(desired);
 
     // 3b. Add / restitch, paced against the build budget. The clock starts
     // here rather than at the top of Update so the selector's own cost does
@@ -346,9 +502,20 @@ bool PlanetTerrain::Update(const pt::planet::LodParams& lod,
     });
 
     for (const ChunkKey& key : order) {
+        // PROVISIONAL stitch mask, from the desired set. It is the right
+        // answer whenever the published cover equals the desired set, which
+        // is every frame that is not mid-transition; where it is wrong --
+        // a chunk added next to a stand-in that is one level coarser than
+        // the selector thinks -- 3d corrects it against the cover, at the
+        // cost of one extra BLAS build for that chunk.
         const std::uint32_t mask = tree_.StitchMask(key);
         auto rit = resident_.find(key);
         if (rit != resident_.end()) {
+            // Restitching a chunk that is already resident belongs to the
+            // cover pass in the paced path -- doing it here as well, against
+            // a different leaf set, would have the two passes rebuild the
+            // same BLAS in opposite directions every frame.
+            if (!settling_) continue;
             if (rit->second.mask == mask) continue;
             if (over_budget()) break;
             // The stitch variant changed, so the index set changed and the
@@ -369,7 +536,7 @@ bool PlanetTerrain::Update(const pt::planet::LodParams& lod,
         }
         const auto bit = baked_.find(key);
         if (bit == baked_.end()) continue;      // still baking
-        if (free_slots_.empty()) continue;      // arena full; budget guards this
+        if (free_slots_.empty()) continue;   // arena full; 3c frees it
         if (over_budget()) break;
 
         Resident r;
@@ -392,6 +559,85 @@ bool PlanetTerrain::Update(const pt::planet::LodParams& lod,
         resident_.emplace(key, std::move(r));
         dirty = true;
     }
+
+    // --- 3c. Choose the published cover and retire what it makes redundant.
+    //
+    // The dirty flag is driven off a DIGEST of the cover, not off its size.
+    // A transition can swap one published chunk for another at unchanged
+    // count -- a stand-in shifting as the selector's frontier moves -- and
+    // a size comparison reports that as "nothing happened", leaving the
+    // TLAS holding an instance array for a cover that no longer exists.
+    auto cover_digest = [this]() {
+        std::uint64_t h = 1469598103934665603ull;
+        for (const ChunkKey& k : published_) {
+            const std::uint64_t v = (static_cast<std::uint64_t>(k.face)  << 45) |
+                                    (static_cast<std::uint64_t>(k.level) << 40) |
+                                    (static_cast<std::uint64_t>(k.i)     << 20) |
+                                    static_cast<std::uint64_t>(k.j);
+            for (int b = 0; b < 8; ++b) {
+                h ^= (v >> (b * 8)) & 0xFFull;
+                h *= 1099511628211ull;
+            }
+        }
+        return h;
+    };
+    const std::uint64_t published_before = cover_digest();
+    if (settling_) {
+        // Immediate eviction already ran, so resident_ is a subset of the
+        // desired set and the cover is trivially all of it. Stating that
+        // rather than computing it keeps the settling path bit-identical to
+        // the pre-coverage one: same instances, same descriptors, same digest.
+        published_.clear();
+        for (const auto& [k, r] : resident_) { (void)r; published_.insert(k); }
+        stats_.held    = 0;
+        stats_.starved = 0;
+    } else {
+        ChooseCover(desired, lod);
+    }
+    if (cover_digest() != published_before) dirty = true;
+
+    // --- 3d. Reconcile stitch masks against the PUBLISHED cover ----------
+    // The mask is what makes the surface watertight without skirts, and it
+    // is only meaningful against the set the rays actually intersect. A
+    // stand-in held through a split is one level coarser than the desired
+    // leaves beside it, so its neighbours have to keep the stitch bit they
+    // would otherwise have dropped the moment the selector split it --
+    // computing masks from `desired` here would crack the surface exactly
+    // where this policy is holding it together.
+    //
+    // Same budget clock as the add pass. A deferred mask is a crack rather
+    // than a hole, which is the one place this change can look worse than
+    // what it replaced; it is also the pre-existing exposure of the
+    // restitch pass above, not a new one.
+    if (!settling_) {
+        std::vector<ChunkKey> pub_order(published_.begin(), published_.end());
+        std::sort(pub_order.begin(), pub_order.end(),
+                  [&](const ChunkKey& a, const ChunkKey& b) {
+                      const double pa = tree_.Priority(a, lod);
+                      const double pb = tree_.Priority(b, lod);
+                      if (pa != pb) return pa > pb;
+                      return a < b;
+                  });
+        for (const ChunkKey& key : pub_order) {
+            auto rit = resident_.find(key);
+            if (rit == resident_.end()) continue;
+            const std::uint32_t want = pt::planet::StitchMaskFor(key, published_);
+            if (rit->second.mask == want) continue;
+            if (over_budget()) break;
+            const auto old_blas = rit->second.blas;
+            rit->second.mask = want;
+            if (BuildChunkBlas(rit->second)) {
+                Retired rt; rt.slot = kNoSlot; rt.blas = old_blas;
+                rt.frames = kRetireFrames;
+                retired_.push_back(rt);
+                dirty = true;
+            } else {
+                rit->second.blas = old_blas;   // keep the old geometry
+            }
+        }
+    }
+
+    if (resident_.size() != resident_before) dirty = true;
 
     // Drop baked data for chunks that are neither resident nor desired, so
     // the CPU cache does not grow without bound as the camera moves.
@@ -428,6 +674,8 @@ bool PlanetTerrain::Update(const pt::planet::LodParams& lod,
     }
 
     stats_.resident      = resident_.size();
+    stats_.resident_peak = std::max(stats_.resident_peak, stats_.resident);
+    stats_.published     = published_.size();
     stats_.desired       = desired.size();
     stats_.pending_bakes = requested_.size() +
                            static_cast<std::size_t>(baker_.InFlight());

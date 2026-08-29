@@ -3406,6 +3406,23 @@ void Engine::Shutdown() {
                  planet_tlas_stalls_,
                  device_ ? device_->AccelGpuStallCount()
                          : static_cast<std::uint64_t>(0));
+        // The residency policy's own ledger. `peak` against
+        // r_planet_chunk_budget is the statement that holding an outgoing
+        // chunk alongside its replacement never overran the arena; the two
+        // fallback counters are the times the streamer chose a hole over a
+        // crack or over an overrun, and a session that reports many of
+        // either is a session whose budget is too tight for its camera.
+        LOG_INFO("planet: residency -- peak {} of {} chunks resident, "
+                 "{} stand-ins released under arena pressure, "
+                 "{} refused to avoid a two-level step",
+                 planet_terrain_->Stats().resident_peak,
+                 // TlasCapacity() is the arena plus the reserved mesh slot;
+                 // the arena itself is what the peak has to fit inside. The
+                 // block is only reached with an initialised streamer, where
+                 // the capacity is chunk_budget_ + 1 and at least 9.
+                 planet_terrain_->TlasCapacity() - 1u,
+                 planet_terrain_->Stats().holds_dropped,
+                 planet_terrain_->Stats().holds_refused);
         planet_terrain_->Shutdown();
         planet_terrain_.reset();
     }
