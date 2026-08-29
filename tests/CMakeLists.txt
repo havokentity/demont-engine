@@ -2543,6 +2543,99 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     pt_add_golden_cell(SCENE planet_ocean_snell BACKEND metal DENOISER off
                        FRAMES 48 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
 
+    # --- #305: WATER-LEAVING RADIANCE. THE FULL GOLDEN DECOMPOSITION -------
+    #
+    # NOT REGENERATED. #305 moves every water cell in the matrix, and the
+    # regeneration is the user's call -- three other branches were in flight
+    # over the same planet cells when this was measured. What is recorded
+    # here instead is the decomposition, so whoever does regenerate can tell
+    # signal from drift without re-deriving it.
+    #
+    # THE NOISE FLOOR IS EXACTLY ZERO. main rendered twice, per cell, same
+    # frame count: max L2 0.00, mean L2 0.0000, on all eight water cells.
+    # These renders are bit-deterministic on this host, so every number
+    # below is signal and none of it is run-to-run variance.
+    #
+    #                          mine vs main      of which, with the
+    #   cell                   max/mean/bad%     in-scatter gate OFF
+    #   ---------------------  ----------------  -------------------
+    #   ocean_fft                2.45/ 0.09/0.0   0.00/0.0000  (exact)
+    #   planet_ocean_boat        1.73/ 0.13/0.0   0.00/0.0000  (exact)
+    #   planet_ocean_orbit       3.00/ 1.65/0.0   0.00/0.0000  (exact)
+    #   planet_underwater_col   48.01/ 1.11/0.4   0.00/0.0000  (exact)
+    #   water_pool              19.44/ 1.44/0.0   1.73/0.2424
+    #   ocean_foam             161.50/ 3.86/7.2   0.00/0.0000  (exact)
+    #   planet_ocean_snell      39.56/ 2.18/0.8   0.00/0.0000  (exact)
+    #   water_pool_submerged    82.46/12.59/23.7  4.12/1.1258
+    #
+    # THE SECOND COLUMN IS THE ISOLATION PROOF. With r_water_inscatter 0 --
+    # which is now the master gate for BOTH the submerged march and the new
+    # water-leaving term -- this branch reproduces main EXACTLY on six of
+    # the eight cells. The two that do not are the only two with a lit
+    # surface UNDER the water, and they move because the one part of #305
+    # that is deliberately not gated is transmittance(): a shadow ray
+    # carrying illumination through water now attenuates with c_eff = a +
+    # b_b instead of with the bare absorption. 4.12 L2 worst case.
+    #
+    # WHICH CELLS ACTUALLY FAIL, AND WHY EACH ONE MOVES:
+    #
+    #   ocean_foam            max 161.50 mean 3.86 bad 7.22% (thr 16/2/1)
+    #     A camera 3 m over a flat MAT_WATER plane at 3.3x the planetary
+    #     cells' exposure. The whole delta is below the horizon and is a
+    #     strict BRIGHTENING in blue: the worst pixel goes from (1, 3, 10)
+    #     to (10, 67, 158). That is water that used to render as near-black
+    #     because nothing put a source term in it.
+    #
+    #   planet_ocean_snell    max  39.56 mean 2.18 bad 0.75% (thr 16/2/1)
+    #     Submerged camera, so the water-leaving term never fires here at
+    #     all. This cell moves for the two corrections to the march: the
+    #     mu_a/mu_s refraction Jacobian (a dimming, 0.93 at this fixture's
+    #     60-degree sun) and c_eff (a brightening). Note the whole
+    #     in-scatter term on this cell is 74.74/10.09/21.6%, so the change
+    #     is under a third of what the feature it corrects contributes.
+    #
+    #   water_pool_submerged  max  82.46 mean 12.59 bad 23.7% (thr 16/2/1)
+    #     The largest move in the matrix, and the fixture explains it: it
+    #     is the only cell that sets r_water_scatter_particulate (0.15),
+    #     and particulates are exactly where the old a + b extinction was
+    #     worst. Petzold scattering is 98.3% forward, so charging the glow
+    #     for all of it made this column roughly four times too dark. The
+    #     brightening is the correction.
+    #
+    # AND WHICH PASS DESPITE MOVING -- worth knowing before someone reads a
+    # green matrix as "nothing changed": planet_ocean_orbit (mean 1.65
+    # against a threshold of 2.0) is the cell #305 was RAISED on, and it
+    # moves in the direction the issue asks for. Measured on that frame
+    # with the atmosphere removed and the tonemap linear, the off-glitter
+    # water goes from (1.51, 1.90, 1.96) B/R 1.30 -- the near-black neutral
+    # the issue reports -- to (1.54, 2.11, 2.96) B/R 1.92, and the ADDED
+    # radiance alone is (0.027, 0.217, 0.994), i.e. 37:8:1 blue-to-red.
+    # water_pool (1.44 against 4.0), planet_underwater_column (1.11 against
+    # 2.0), planet_ocean_boat and ocean_fft also move and stay inside.
+    #
+    # VARIANCE, MEASURED RATHER THAN ASSUMED. The water-leaving term rides
+    # the MAT_WATER interface's existing Fresnel roulette, so the obvious
+    # worry is that it adds noise at grazing angles where the reflected
+    # branch is taken most. It does not: on ocean_foam at the golden's own
+    # 120 frames, spp 2 against spp 8 is mean L2 6.85 on this branch and
+    # 7.36 on main -- this branch's residual noise is LOWER than main's.
+    # (The same pair at 120 vs 240 FRAMES differs by mean 64 on main too:
+    # the cascades are animated and the cell is pinned at a sea state, not
+    # at a converged image. That comparison measures nothing.)
+    #
+    # COST, on the dev M4 Max at 512x384, measured as the slope between a
+    # 200-frame and a 1200-frame run so process startup cancels:
+    #   planet_ocean_orbit (400 km, ocean is most of the frame)
+    #     main 18.03 ms/frame, this branch 17.99 ms/frame -- no measurable
+    #     cost, because the term reuses the shadow ray the ocean sun NEE
+    #     has already fired at that point.
+    #   ocean_foam (flat plane, no planetary NEE, so the term fires its own)
+    #     main 16.08, gate off 15.98, gate on 16.12 ms/frame -- +0.14 ms,
+    #     0.9%, for one shadow ray per water pixel.
+    # The submerged march this replaces above the surface costs 16 shadow
+    # rays per pixel, which is the whole reason the closed form exists.
+    # --- end #305 ---------------------------------------------------------
+
     # PLANETARY P7 (#261) REGENERATED planet_ocean_snell, AND ONLY IT OF THE
     # THREE. That cell is the matrix's only submerged camera before this
     # phase, so it is the only one the underwater in-scatter march and the

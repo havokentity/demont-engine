@@ -517,6 +517,19 @@ namespace cvar {
     // What IS tunable is everything a scene can actually differ in: how much
     // suspended matter the water carries, and how finely the column is
     // integrated.
+    // #305 note: this coefficient is now consequential ABOVE the surface
+    // too. The engine derives the backscattering coefficient from it
+    // through the Petzold phase function's own closed-form backscatter
+    // fraction (0.016989 at g = 0.924), and b_b is what sets the
+    // water-leaving reflectance. There is deliberately NO chlorophyll
+    // cvar: the three planet_ocean_* fixtures author r_water_absorption_*
+    // explicitly, so a Case 1 bio-optical parameter would have to either
+    // override them or be overridden by them, and resolving that is a
+    // fixture re-characterisation with a golden regeneration attached.
+    // The model itself is implemented and tested --
+    // pt::water::Case1FromChlorophyll, Morel & Maritorena 2001 with
+    // Bricaud et al. 1998 -- so wiring it is a cvar and a push lane, not
+    // a physics problem.
     PT_CVAR(r_water_scatter_particulate, "0.0",
             "Particulate scattering coefficient b_p (1/m) for MAT_WATER, "
             "grey, ADDED to the pure-seawater molecular scattering the "
@@ -528,11 +541,16 @@ namespace cvar {
             "shafts in the water, where the molecular term mostly puts blue.",
             CVAR_ARCHIVE);
     PT_CVAR(r_water_inscatter, "1",
-            "Master gate for the underwater single-scatter march (1 = on). "
-            "0 reverts a submerged frame to pure exponential darkening -- "
-            "absorption with no scattering -- which is what every build "
-            "before Planetary P7 (#261) did, and which reads as tinted "
-            "glass rather than as water. Metal / Vulkan only.",
+            "Master gate for water in-scatter (1 = on), BOTH halves of it. "
+            "#305 widened this from the submerged march alone to the "
+            "water-leaving radiance a camera OUTSIDE the medium sees, "
+            "which is the same single-scattering integral evaluated in "
+            "closed form at the interface instead of marched. 0 reverts "
+            "water to pure exponential darkening -- absorption with no "
+            "source -- which is what every build before Planetary P7 "
+            "(#261) did below the surface and every build before #305 did "
+            "above it: tinted glass rather than water, and an ocean whose "
+            "only blue is the atmosphere's. Metal / Vulkan only.",
             CVAR_ARCHIVE);
     PT_CVAR(r_water_inscatter_samples, "16",
             "Stratified sample count for the underwater in-scatter march. "

@@ -166,6 +166,17 @@ double phaseHG(double mu, double g) {
 glm::dvec3 sigmaA() { return PureWaterAbsorptionRgb(); }
 glm::dvec3 sigmaS() { return PureSeawaterScatteringRgb(); }
 glm::dvec3 sigmaT() { return sigmaA() + sigmaS(); }
+// #305: the attenuation the DIFFUSE terms use -- c_eff = a + b_b, the
+// quasi-single-scattering approximation (Gordon 1973). sigmaT() above is
+// the full beam attenuation, which is what removes light from an
+// image-forming path and is NOT what governs a reflectance. Every march
+// mirror below moved onto this one when the shader did; the two differ by
+// the FORWARD scattering, which is 0 for the molecular species by symmetry
+// and 98.3% of the particulate one.
+glm::dvec3 sigmaEff() {
+    return EffectiveAttenuation(sigmaA(), sigmaS(), 0.0,
+                                kSeawaterDepolarisation, kPetzoldAsymmetry);
+}
 
 // --- shader mirror: the in-scatter march ----------------------------------
 //
@@ -453,11 +464,18 @@ TEST_CASE("pure seawater's single-scatter albedo is why the ocean is blue") {
 
 TEST_CASE("the optical-black depth is derived from whatever water is in force") {
     // Pure seawater: absorption plus BOTH scattering species.
-    const double d_pure = OpticalBlackDepth(sigmaT());
+    const double d_pure = OpticalBlackDepth(sigmaEff());
     CAPTURE(d_pure);
-    CHECK(d_pure == doctest::Approx(404.3).epsilon(1e-3));
+    // #305 MOVED THIS, AND THE MOVE IS THE POINT. The span is derived from
+    // whatever attenuation the march actually uses, and that is now
+    // c_eff = a + b_b (Gordon 1973) rather than the full a + b -- so the
+    // depth at which the least-attenuated channel falls under one 8-bit
+    // level is 483 m rather than 404 m. Nothing about the water changed;
+    // what changed is which of its two attenuation coefficients governs a
+    // diffuse field, and this number moving is the audit trail for that.
+    CHECK(d_pure == doctest::Approx(483.40).epsilon(1e-3));
     // ...and it really is one 8-bit level at that depth, in every channel.
-    const glm::dvec3 t = glm::exp(-sigmaT() * d_pure);
+    const glm::dvec3 t = glm::exp(-sigmaEff() * d_pure);
     CHECK(std::max(t.x, std::max(t.y, t.z)) ==
           doctest::Approx(1.0 / 255.0).epsilon(1e-9));
 
@@ -470,7 +488,9 @@ TEST_CASE("the optical-black depth is derived from whatever water is in force") 
     // Turbid water goes black sooner, monotonically, with no special case.
     double prev = 1e30;
     for (double bp : {0.0, 0.05, 0.1, 0.3, 0.5}) {
-        const double d = OpticalBlackDepth(sigmaT() + glm::dvec3(bp));
+        const double d = OpticalBlackDepth(
+            EffectiveAttenuation(sigmaA(), sigmaS(), bp,
+                                 kSeawaterDepolarisation, kPetzoldAsymmetry));
         CAPTURE(bp);
         CHECK(d < prev);
         prev = d;
@@ -540,7 +560,7 @@ TEST_CASE("the descent to 200 m is continuous, by refinement") {
     // The bar is 0.6 rather than the ideal 0.5 for #260's reason: the
     // location of the maximum moves between refinements, so the halved
     // ladder does not sample the same worst point.
-    const glm::dvec3 st = sigmaT();
+    const glm::dvec3 st = sigmaEff();
     const glm::dvec3 ss = sigmaS();
     // Sun 60 degrees up, refracted into the water: 30 degrees from the
     // zenith in air becomes asin(sin 30 / 1.33) = 22.08 degrees below.
@@ -620,7 +640,16 @@ TEST_CASE("the descent to 200 m is continuous, by refinement") {
 }
 
 TEST_CASE("the descent darkens, and the in-scatter is what keeps it water") {
-    const glm::dvec3 st = sigmaT();
+    // TWO ATTENUATIONS, AND #305 IS WHY THEY ARE SPELLED SEPARATELY HERE.
+    // The TRANSMITTED half -- the sky seen through the column, an
+    // image-forming path -- loses every photon that scatters out of the
+    // line of sight, so it attenuates with the full beam coefficient
+    // c = a + b. The IN-SCATTERED half is a diffuse field, and a photon
+    // scattered forward is still in it, so it attenuates with
+    // c_eff = a + b_b. Before #305 both used c, which is what made a
+    // particle-laden column render four times too dark.
+    const glm::dvec3 st = sigmaT();       // transmitted: the full beam
+    const glm::dvec3 se = sigmaEff();     // in-scattered: a + b_b
     const glm::dvec3 ss = sigmaS();
     const double cos_w = std::cos(std::asin(std::sin(30.0 * kPi / 180.0) / 1.33));
     const double phase = RayleighDepolarisedPhase(cos_w, kSeawaterDepolarisation);
@@ -630,7 +659,7 @@ TEST_CASE("the descent darkens, and the in-scatter is what keeps it water") {
         for (int c = 0; c < 3; ++c) {
             out[c] = 1.0 * std::exp(-st[c] * depth);
             if (with_inscatter) {
-                out[c] += 80.0 * marchClosedForm(ss[c] * phase, st[c], depth,
+                out[c] += 80.0 * marchClosedForm(ss[c] * phase, se[c], depth,
                                                  cos_w, depth);
             }
         }
@@ -657,24 +686,24 @@ TEST_CASE("the descent darkens, and the in-scatter is what keeps it water") {
     // in-scatter out, which is the state #261 is fixing.
     glm::dvec3 peak_depth(0.0);
     for (int c = 0; c < 3; ++c) {
-        peak_depth[c] = std::log(1.0 / cos_w) / (st[c] * (1.0 / cos_w - 1.0));
+        peak_depth[c] = std::log(1.0 / cos_w) / (se[c] * (1.0 / cos_w - 1.0));
     }
     CAPTURE(peak_depth.x); CAPTURE(peak_depth.y); CAPTURE(peak_depth.z);
     // And the separation between the three peaks is "red first, blue last"
     // said a second way: red's glow is over by 3.5 m, blue's peaks at 70.
     CHECK(peak_depth.x == doctest::Approx(3.48).epsilon(1e-2));
-    CHECK(peak_depth.y == doctest::Approx(16.5).epsilon(1e-2));
-    CHECK(peak_depth.z == doctest::Approx(70.2).epsilon(1e-2));
+    CHECK(peak_depth.y == doctest::Approx(16.75).epsilon(1e-2));
+    CHECK(peak_depth.z == doctest::Approx(83.96).epsilon(1e-2));
     CHECK(peak_depth.z / peak_depth.x > 19.0);
 
     // Verify the derived peak against the function itself: each channel's
     // in-scatter really does turn over there, to within the sampling.
     for (int c = 0; c < 3; ++c) {
         const double dpk = peak_depth[c];
-        const double at   = marchClosedForm(ss[c] * phase, st[c], dpk, cos_w, dpk);
-        const double before = marchClosedForm(ss[c] * phase, st[c], dpk * 0.9,
+        const double at   = marchClosedForm(ss[c] * phase, se[c], dpk, cos_w, dpk);
+        const double before = marchClosedForm(ss[c] * phase, se[c], dpk * 0.9,
                                               cos_w, dpk * 0.9);
-        const double after  = marchClosedForm(ss[c] * phase, st[c], dpk * 1.1,
+        const double after  = marchClosedForm(ss[c] * phase, se[c], dpk * 1.1,
                                               cos_w, dpk * 1.1);
         CAPTURE(c);
         CHECK(at > before);
@@ -723,6 +752,9 @@ TEST_CASE("the descent darkens, and the in-scatter is what keeps it water") {
     // Where it IS over, for this water: the derived optical-black depth.
     CHECK(observed(OpticalBlackDepth(st), false).z <=
           doctest::Approx(1.0 / 255.0));
+    // ...and the DIFFUSE field survives deeper than the image-forming one,
+    // by exactly the forward-scattering the reflectance does not lose.
+    CHECK(OpticalBlackDepth(se) > OpticalBlackDepth(st));
 
     // THE ABLATION, ASSERTED ON CONTENT AND NOT ON "IT CHANGED". An
     // underwater frame is already dark, so "the picture differs with the
@@ -772,7 +804,7 @@ TEST_CASE("the in-scatter march converges to the closed form, second order") {
     // second order, and the error QUARTERS per doubling. A first-order rule
     // would only halve, so this ladder distinguishes the two without any
     // threshold being chosen.
-    const glm::dvec3 st = sigmaT();
+    const glm::dvec3 st = sigmaEff();
     const glm::dvec3 ss = sigmaS();
     const double cos_w = std::cos(std::asin(std::sin(30.0 * kPi / 180.0) / 1.33));
     const double phase = RayleighDepolarisedPhase(cos_w, kSeawaterDepolarisation);
@@ -824,7 +856,7 @@ TEST_CASE("the quadrature is not what sets the sample count, and that is measure
     // is a ratio of two numbers around e^-120 -- meaningless, and it is
     // what a naive relative bound would spend the whole sample budget
     // chasing.
-    const glm::dvec3 st = sigmaT();
+    const glm::dvec3 st = sigmaEff();
     const glm::dvec3 ss = sigmaS();
     const double cos_w = std::cos(std::asin(std::sin(30.0 * kPi / 180.0) / 1.33));
     const double phase = RayleighDepolarisedPhase(cos_w, kSeawaterDepolarisation);
@@ -1116,6 +1148,553 @@ TEST_CASE("the underwater sun is not where the air sun is") {
 // 7. THE MIRRORS ARE STILL FAITHFUL.
 // ===========================================================================
 
+// ===========================================================================
+// 5. WATER-LEAVING RADIANCE (#305). THE TRANSPORT FOR A CAMERA OUTSIDE.
+// ===========================================================================
+//
+// #305 measured the ocean from orbit with the atmosphere removed at
+// (1.23, 1.45, 1.64), B/R 1.33 -- near-black and NEUTRAL. Every in-scatter
+// term in the shader was gated on the camera being submerged, so a ray
+// refracting in from outside got Beer's law and no source at all, and all
+// of the rendered ocean's blue was atmospheric Rayleigh.
+//
+// The cases below check the transport that fills that hole, against
+// published ocean-colour radiometry rather than against a look. The
+// engine's answer is a REMOTE-SENSING REFLECTANCE, which is the quantity
+// every ocean-colour satellite retrieves, so there is a literature to be
+// wrong against.
+
+namespace {
+
+// The geometry ocean-colour radiometry is quoted at: nadir-viewing sensor,
+// sun in the principal plane behind the viewer.
+SingleScatterGeometry nadirGeometry(double sun_zenith_deg, double n) {
+    return RefractSunAndView(sun_zenith_deg * kPi / 180.0, 0.0, kPi, n);
+}
+
+// The engine's own water index, from the r_water_ior default.
+constexpr double kEngineIor = 1.33;
+
+// Schlick with F0 = 0.02, EXACTLY as shaders/PathTrace.slang spells the
+// MAT_WATER Fresnel -- both for the reflect/refract roulette and for the
+// sun's own crossing in the #305 source block.
+double schlickWaterF(double cos_i) {
+    const double m = 1.0 - std::clamp(cos_i, 0.0, 1.0);
+    return 0.02 + 0.98 * m * m * m * m * m;
+}
+
+}  // namespace
+
+TEST_CASE("the interface factor is Lee 2002's 0.52, and n^2 is why") {
+    // THE CLASSIC WAY TO BE WRONG HERE is to note that radiance across an
+    // interface scales as L_w = L_a (1 - F) n^2 and that the solid angle
+    // compresses, decide the two cancel, and end up with a plausible number
+    // that is n^2 = 1.77 too big. Lee, Carder and Arnone 2002 eq. (8)
+    // defines the very same product -- T = t^- t^+ / n^2 -- and fits it to
+    // HYDROLIGHT at 0.52. So the engine's three first-principles factors
+    // have a published number to land on.
+    for (double sz : {0.0, 20.0, 40.0}) {
+        const auto g = nadirGeometry(sz, kEngineIor);
+        const double t_down = 1.0 - FresnelUnpolarised(g.mu_sun_air, 1.0,
+                                                       kEngineIor);
+        const double t_up   = 1.0 - FresnelUnpolarised(g.mu_view_water,
+                                                       kEngineIor, 1.0);
+        const double T = t_down * t_up / (kEngineIor * kEngineIor);
+        CAPTURE(sz);
+        CAPTURE(T);
+        // MEASURED MARGIN: 0.5443 at the zenith down to 0.5310 at 40 deg,
+        // against Lee's 0.52 -- 4.7% and 2.1%. The tolerance is 6%, which
+        // is the measured spread plus room, and it is nowhere near loose
+        // enough to admit the n^2-free answer.
+        CHECK(T == doctest::Approx(kLee2002T).epsilon(0.06));
+
+        // ...and the mistake this case exists to catch would be 1.77x out,
+        // i.e. 30 standard tolerances away. Asserted so the bound above is
+        // known to bite.
+        const double no_n2 = t_down * t_up;
+        CHECK(no_n2 > 1.7 * T);
+        CHECK(std::fabs(no_n2 - kLee2002T) > 0.4);
+    }
+
+    // The shader uses Schlick at F0 = 0.02 rather than the exact Fresnel
+    // equations, so every R_rs reported for this engine is the engine's
+    // only to the extent those two agree. MEASURED on the transmittance
+    // product: 0.97% worst case for a sun anywhere from the zenith to 60
+    // degrees, which is the range every ocean-colour number in this file
+    // is quoted at, and where the Schlick-vs-exact difference is far
+    // smaller than the transport's own 15% agreement with the literature.
+    double worst_60 = 0.0, worst_all = 0.0;
+    for (int i = 0; i <= 900; ++i) {
+        const double sz = 89.9 * static_cast<double>(i) / 900.0;
+        const auto g = nadirGeometry(sz, kEngineIor);
+        const double exact = (1.0 - FresnelUnpolarised(g.mu_sun_air, 1.0,
+                                                       kEngineIor)) *
+                             (1.0 - FresnelUnpolarised(g.mu_view_water,
+                                                       kEngineIor, 1.0));
+        const double slick = (1.0 - schlickWaterF(g.mu_sun_air)) *
+                             (1.0 - schlickWaterF(g.mu_view_water));
+        const double e = std::fabs(slick - exact) / exact;
+        if (sz <= 60.0) worst_60 = std::max(worst_60, e);
+        worst_all = std::max(worst_all, e);
+    }
+    CAPTURE(worst_60);
+    CAPTURE(worst_all);
+    CHECK(worst_60 < 0.011);
+    // AND WHERE IT STOPS BEING SMALL, stated rather than left to be
+    // discovered: at a sun 89 degrees from the zenith Schlick is 22% off,
+    // because F0 = 0.02 pins the normal-incidence value and the fifth
+    // power then has to carry the whole grazing rise on its own. A sun
+    // that low contributes almost no downwelling irradiance, so it does
+    // not matter for the reflectance -- but it is not zero, and pretending
+    // the bound above holds everywhere would be the vacuous version of
+    // this check.
+    CHECK(worst_all > 0.15);
+}
+
+TEST_CASE("total internal reflection cannot bite a camera in air") {
+    // The upward crossing is the one that has a critical angle, and the
+    // reason it never fires is geometric rather than lucky: the in-water
+    // direction is obtained by refracting a real air-side ray, so it is
+    // inside Snell's window by construction. Swept to grazing.
+    const double crit = std::asin(1.0 / kEngineIor);
+    for (int i = 0; i <= 200; ++i) {
+        const double vz = 89.9 * static_cast<double>(i) / 200.0;
+        const auto g = nadirGeometry(30.0, kEngineIor);
+        const auto gv = RefractSunAndView(30.0 * kPi / 180.0,
+                                          vz * kPi / 180.0, kPi, kEngineIor);
+        (void)g;
+        const double theta_w = std::acos(gv.mu_view_water);
+        CAPTURE(vz);
+        CHECK(theta_w < crit);
+        // ...so the upward Fresnel is a transmittance and not a 1.
+        CHECK(FresnelUnpolarised(gv.mu_view_water, kEngineIor, 1.0) < 1.0);
+    }
+    // And the converse, which is what the SUBMERGED path has to handle:
+    // just past the critical angle nothing leaves at all.
+    CHECK(FresnelUnpolarised(std::cos(crit * 1.001), kEngineIor, 1.0) ==
+          doctest::Approx(1.0));
+}
+
+TEST_CASE("the closed form IS the march, not an approximation of it") {
+    // The brief for #305 asks the analytic solution's error to be bounded
+    // against the full march. The bound is machine precision, because the
+    // closed form is the exact integral the march is a quadrature OF -- so
+    // the honest statement is the other way round: the march is the
+    // approximation, and this case measures its convergence onto the
+    // closed form rather than the closed form's error against it.
+    const glm::dvec3 a = sigmaA();
+    const glm::dvec3 b = sigmaS();
+    const auto g = nadirGeometry(30.0, kEngineIor);
+    const glm::dvec3 deep = SubsurfaceRrsDeep(a, b, 0.0, g,
+                                              kSeawaterDepolarisation,
+                                              kPetzoldAsymmetry);
+    const glm::dvec3 rate = SubsurfaceRrsSaturationRate(a, b, 0.0, g,
+                                                        kSeawaterDepolarisation,
+                                                        kPetzoldAsymmetry);
+    REQUIRE(deep.z > 0.0);
+    REQUIRE(rate.z > 0.0);
+
+    // 1. TRUNCATION IS EXACT. A finite column of path length T returns
+    //    deep * (1 - exp(-rate T)) -- and that is what a very fine march
+    //    over the same T converges to, to 1e-9 relative, at every depth
+    //    from a swimming pool to the open ocean. This is the property that
+    //    makes shallow water and deep water ONE expression with no regime
+    //    switch, so there is no transition for the two to disagree at.
+    for (double T : {0.5, 1.0, 10.0, 100.0, 1000.0}) {
+        const glm::dvec3 marched =
+            SubsurfaceRrsMarched(a, b, 0.0, g, kSeawaterDepolarisation,
+                                 kPetzoldAsymmetry, T, 400000);
+        const glm::dvec3 closed = deep * (glm::dvec3(1.0) - glm::exp(-rate * T));
+        CAPTURE(T);
+        for (int c = 0; c < 3; ++c) {
+            REQUIRE(closed[c] > 0.0);
+            // MEASURED at 8.6e-8 worst case over these five path lengths,
+            // which is the midpoint rule's own O(dt^2) at 400 000 steps
+            // over 1 km and not a disagreement about the integrand.
+            CHECK(std::fabs(marched[c] - closed[c]) / closed[c] < 1e-6);
+        }
+    }
+
+    // 2. AND THE DEEP LIMIT IS THE DEEP LIMIT. Marching 3 km of pure
+    //    seawater -- seven times its own optical-black depth -- lands on
+    //    the semi-infinite answer.
+    const glm::dvec3 deep_3km =
+        SubsurfaceRrsMarched(a, b, 0.0, g, kSeawaterDepolarisation,
+                             kPetzoldAsymmetry, 3000.0, 400000);
+    for (int c = 0; c < 3; ++c) {
+        CHECK(deep_3km[c] == doctest::Approx(deep[c]).epsilon(1e-6));
+    }
+
+    // 3. WHAT THE MARCH WOULD HAVE COST. The shader's default is 16
+    //    samples; at 16 samples over this column the march is 52% low in
+    //    the blue, and it does not reach 1% until 256. So the closed form
+    //    is not merely cheaper than the march -- at the march's own budget
+    //    it is also far more accurate, which is the whole argument for
+    //    using it on a frame where the ocean is every pixel.
+    const auto err = [&](int n) {
+        const glm::dvec3 m =
+            SubsurfaceRrsMarched(a, b, 0.0, g, kSeawaterDepolarisation,
+                                 kPetzoldAsymmetry, 3000.0, n);
+        return std::fabs(m.z - deep.z) / deep.z;
+    };
+    CAPTURE(err(16));
+    CAPTURE(err(64));
+    CAPTURE(err(256));
+    CHECK(err(16)  > 0.40);
+    CHECK(err(64)  > 0.02);
+    CHECK(err(256) < 0.01);
+    CHECK(err(4096) < 1e-4);
+}
+
+TEST_CASE("R_rs reproduces Gordon et al. 1988, and c_eff is why") {
+    // THE ACCEPTANCE CHECK. Gordon et al. 1988's r_rs = 0.0949 X +
+    // 0.0794 X^2 is a fit to full Monte-Carlo radiative transfer for
+    // nadir-viewed oceanic Case 1 water, so it carries the multiple
+    // scattering the engine's single-backscattering form does not -- and
+    // the ratio between them IS the size of that omission, measured rather
+    // than asserted.
+    const glm::dvec3 a  = sigmaA();          // Pope & Fry pure water
+    const glm::dvec3 bm = sigmaS();          // Morel pure seawater
+    const glm::dvec3 bb = BackscatteringCoefficient(bm, 0.0,
+                                                    kSeawaterDepolarisation,
+                                                    kPetzoldAsymmetry);
+
+    // The engine's DEFAULT water, at three sun angles.
+    for (double sz : {0.0, 30.0, 60.0}) {
+        const auto g = nadirGeometry(sz, kEngineIor);
+        const glm::dvec3 r_sub =
+            SubsurfaceRrsDeep(a, bm, 0.0, g, kSeawaterDepolarisation,
+                              kPetzoldAsymmetry);
+        CAPTURE(sz);
+        CAPTURE(r_sub.z);
+        // BLUE, where the water is optically brightest and the check has
+        // teeth: within 5% at every sun angle, measured at 3.4% / 0.5% /
+        // 4.9% for 0 / 30 / 60 degrees.
+        const double gordon_b = GordonSubsurfaceRrs(bb.z / (a.z + bb.z));
+        CHECK(r_sub.z == doctest::Approx(gordon_b).epsilon(0.05));
+        // GREEN and RED are 10-21% high, and that is the angular
+        // resolution rather than an error: Gordon's coefficient is an
+        // angle-AVERAGE over a multiply-scattered field, while this form
+        // evaluates the volume scattering function at the actual
+        // backscattering angle, where the depolarised Rayleigh lobe is at
+        // its maximum. Bounded, not waved at.
+        const double gordon_g = GordonSubsurfaceRrs(bb.y / (a.y + bb.y));
+        const double gordon_r = GordonSubsurfaceRrs(bb.x / (a.x + bb.x));
+        CHECK(r_sub.y / gordon_g > 1.05);
+        CHECK(r_sub.y / gordon_g < 1.25);
+        CHECK(r_sub.x / gordon_r > 1.05);
+        CHECK(r_sub.x / gordon_r < 1.25);
+    }
+
+    // AND THE CONTROL THAT MAKES c_eff A MEASUREMENT. Rerun the blue
+    // channel with the FULL beam attenuation a + b in place of a + b_b and
+    // the agreement collapses -- 14% low for pure seawater, and a factor
+    // of four low once an open-ocean particle load is present, because
+    // c = a + b charges the reflectance for every forward-scattered photon
+    // as if it were lost. This is the red half of red-then-green for the
+    // attenuation choice.
+    const auto g30 = nadirGeometry(30.0, kEngineIor);
+    for (double bp : {0.0, 0.03}) {
+        const glm::dvec3 bbp = BackscatteringCoefficient(
+            bm, bp, kSeawaterDepolarisation, kPetzoldAsymmetry);
+        const glm::dvec3 beta = VolumeScatteringFunction(
+            bm, bp, g30.cos_scatter, kSeawaterDepolarisation,
+            kPetzoldAsymmetry);
+        const double m = g30.mu_sun_water + g30.mu_view_water;
+        const glm::dvec3 c_full = a + bm + glm::dvec3(bp);
+        const double wrong = beta.z / (c_full.z * m);
+        const double right =
+            SubsurfaceRrsDeep(a, bm, bp, g30, kSeawaterDepolarisation,
+                              kPetzoldAsymmetry).z;
+        const double gordon = GordonSubsurfaceRrs(bbp.z / (a.z + bbp.z));
+        CAPTURE(bp);
+        CAPTURE(wrong / gordon);
+        CAPTURE(right / gordon);
+        CHECK(right == doctest::Approx(gordon).epsilon(0.15));
+        CHECK(wrong / gordon < 0.90);
+        if (bp > 0.0) CHECK(wrong / gordon < 0.30);   // the factor of four
+    }
+}
+
+TEST_CASE("the engine's R_rs lands on measured open-ocean spectra") {
+    // Against MEASUREMENTS this time, not against a model. The medians
+    // below are the NOMAD v2 in-situ archive binned exactly as Werdell, P.
+    // J., and S. W. Bailey, "An improved in-situ bio-optical data set for
+    // ocean color algorithm development and satellite data product
+    // validation", Remote Sens. Environ. 98(1), 122-140 (2005), figure 9
+    // bins it -- R_rs = L_w / E_s, 4459 records, the two bins quoted here
+    // holding 31 and 483 of them.
+    //
+    // NOMAD is at seabass.gsfc.nasa.gov/wiki/NOMAD; the figure tabulates
+    // nothing, so these are medians computed from the public data file and
+    // are recorded as such rather than as a quotation.
+    struct NomadBin { double chl, rrs443, rrs489, rrs555; };
+    const NomadBin bins[] = {
+        {0.026, 0.01106, 0.00676, 0.00142},   // Chl bin 0.012-0.04, N = 31
+        {0.240, 0.00520, 0.00470, 0.00169},   // Chl bin 0.16-0.32,  N = 483
+    };
+    const double lambdas[3] = {443.0, 489.0, 555.0};
+    const double b_hg = HenyeyGreensteinBackscatterFraction(kPetzoldAsymmetry);
+
+    for (const auto& bin : bins) {
+        const double meas[3] = {bin.rrs443, bin.rrs489, bin.rrs555};
+        for (int i = 0; i < 3; ++i) {
+            const Case1Iops io = Case1FromChlorophyll(lambdas[i], bin.chl);
+            // Drive the engine's transport at MM01's published b_b by
+            // choosing the particulate scattering so the engine's own
+            // Henyey-Greenstein backscatter fraction reproduces b_bp. This
+            // isolates the TRANSPORT -- what #305 changed -- from the
+            // bio-optical model that supplies its inputs.
+            const double b_par = io.bbp / b_hg;
+            const auto g = nadirGeometry(30.0, kEngineIor);
+            const glm::dvec3 engine = RemoteSensingReflectance(
+                glm::dvec3(io.a), glm::dvec3(io.bw), b_par, g,
+                kSeawaterDepolarisation, kPetzoldAsymmetry, kEngineIor);
+            // The published semi-analytic answer for the SAME IOPs, as the
+            // control: if the engine and Gordon/Lee sit together and both
+            // sit below the measurement, the residual is the bio-optical
+            // model and not the transport.
+            const double published =
+                LeeAboveWaterRrs(GordonSubsurfaceRrs(io.bb / (io.a + io.bb)));
+            CAPTURE(bin.chl);
+            CAPTURE(lambdas[i]);
+            CAPTURE(engine.x);
+            CAPTURE(meas[i]);
+            CAPTURE(published);
+
+            // 1. THE TRANSPORT. Engine against the published relation on
+            //    identical inputs: measured at 0.90 to 1.06 over both
+            //    chlorophylls and all three bands. The bound is 15%.
+            CHECK(engine.x == doctest::Approx(published).epsilon(0.15));
+
+            // 2. THE MEASUREMENT. Engine against NOMAD: 0.70 to 0.95, i.e.
+            //    low. So is Gordon/Lee on the same inputs (0.83 to 1.05),
+            //    and MM01 says why in its own text -- its reflectances are
+            //    "underestimated by about 8-10% (for very clear waters)
+            //    within the blue-green spectral domain ... and even more
+            //    (15%) in the long-wavelength range" because the model
+            //    omits Raman scattering and chlorophyll fluorescence,
+            //    neither of which this engine has either. Within a factor
+            //    of 1.5, and never ABOVE the measurement, which is the
+            //    direction every omitted term pushes.
+            CHECK(engine.x > 0.60 * meas[i]);
+            CHECK(engine.x < 1.10 * meas[i]);
+        }
+    }
+
+    // THE HEADLINE, AND THE VACUITY GUARD. The engine's DEFAULT water --
+    // Pope & Fry absorption, Morel scattering, no particulates -- is the
+    // clearest water there is, so its R_rs must sit just ABOVE the median
+    // of NOMAD's clearest natural bin, and it must be overwhelmingly blue.
+    // A zero transport passes neither.
+    const auto g = nadirGeometry(30.0, kEngineIor);
+    const glm::dvec3 def = RemoteSensingReflectance(
+        sigmaA(), sigmaS(), 0.0, g, kSeawaterDepolarisation,
+        kPetzoldAsymmetry, kEngineIor);
+    CAPTURE(def.x); CAPTURE(def.y); CAPTURE(def.z);
+    // 0.01158 /sr at 450 nm against the clearest bin's 0.01106 at 443.
+    CHECK(def.z == doctest::Approx(0.011578).epsilon(1e-3));
+    CHECK(def.z > 0.01106);
+    CHECK(def.z < 1.3 * 0.01106);
+    // BLUE, not grey. #305's whole symptom was B/R 1.33 -- a neutral
+    // water body. Pure seawater's water-leaving radiance has B/R 96.
+    CHECK(def.z / def.x > 50.0);
+    CHECK(def.z / def.y > 10.0);
+}
+
+TEST_CASE("above and below the surface disagree by exactly the interface") {
+    // "A camera just above and just below the surface must not disagree
+    // discontinuously." What crossing the interface DOES change is
+    // physical and unavoidable: radiance is not continuous across a
+    // refractive boundary, L/n^2 is. So the observable ratio has to be
+    // exactly (1 - F)/n^2 and nothing else -- no extra factor, no missing
+    // one -- and the underlying subsurface radiance the two paths compute
+    // has to be one number.
+    const glm::dvec3 a = sigmaA();
+    const glm::dvec3 b = sigmaS();
+    for (double sz : {0.0, 30.0, 60.0}) {
+        const auto g = nadirGeometry(sz, kEngineIor);
+        // BELOW: what the submerged march integrates, at the surface.
+        const glm::dvec3 below =
+            SubsurfaceRrsMarched(a, b, 0.0, g, kSeawaterDepolarisation,
+                                 kPetzoldAsymmetry, 3000.0, 400000);
+        // ABOVE: the water-leaving closed form, which is the same integral
+        // with the interface applied.
+        const glm::dvec3 above =
+            RemoteSensingReflectance(a, b, 0.0, g, kSeawaterDepolarisation,
+                                     kPetzoldAsymmetry, kEngineIor);
+        const double t_down = 1.0 - FresnelUnpolarised(g.mu_sun_air, 1.0,
+                                                       kEngineIor);
+        const double t_up   = 1.0 - FresnelUnpolarised(g.mu_view_water,
+                                                       kEngineIor, 1.0);
+        // R_rs is normalised by E_d(0+) and the marched value by E_d(0-),
+        // so the ratio carries the downward transmittance as well.
+        const double expect = t_down * t_up / (kEngineIor * kEngineIor);
+        CAPTURE(sz);
+        for (int c = 0; c < 3; ++c) {
+            REQUIRE(below[c] > 0.0);
+            CHECK(above[c] / below[c] == doctest::Approx(expect).epsilon(1e-6));
+        }
+        // The jump is a DIMMING of about a factor of two -- Snell's window
+        // really is brighter from below -- and it is not a factor of n^2
+        // either way, which is the error this pins against.
+        CHECK(expect > 0.50);
+        CHECK(expect < 0.56);
+    }
+}
+
+TEST_CASE("the multiple-internal-reflection term is small, and bounded") {
+    // What the single-scatter treatment drops at the interface: light that
+    // total-internally-reflects back down and escapes on a later attempt.
+    // Classically that is a gain of 1/(1 - r_bar R) with r_bar = 0.48. R
+    // is the irradiance reflectance, r_rs times Q, and Q is 3-6 sr for the
+    // remote-sensing geometry (Lee et al. 2002 section 3.B).
+    const auto g = nadirGeometry(30.0, kEngineIor);
+    const glm::dvec3 r_sub =
+        SubsurfaceRrsDeep(sigmaA(), sigmaS(), 0.0, g, kSeawaterDepolarisation,
+                          kPetzoldAsymmetry);
+    // Pure seawater in the blue is the WORST case -- the brightest water
+    // this engine can have -- so bounding it there bounds it everywhere.
+    for (double Q : {3.0, 6.0}) {
+        const double R = r_sub.z * Q;
+        const double gain = MultipleInternalReflectionGain(R);
+        CAPTURE(Q); CAPTURE(R); CAPTURE(gain);
+        CHECK(gain > 1.0);
+        CHECK(gain < 1.08);
+    }
+    // ...and it is a GAIN, so the omission makes the engine darker, never
+    // brighter -- the same direction as every other term left out.
+    CHECK(MultipleInternalReflectionGain(0.0) == doctest::Approx(1.0));
+}
+
+TEST_CASE("the backscatter fractions are derived, not tabulated") {
+    // b_b is the difference between a reflectance that matches the
+    // literature and one that is four times low, so where its two
+    // fractions come from matters.
+    //
+    // MOLECULAR: exactly 1/2, for every depolarisation ratio, because the
+    // depolarised Rayleigh phase function is even in cos(theta). Not a fit
+    // -- a symmetry. Smith & Baker 1981 state it as "the backscattering
+    // coefficient is calculated as one-half the molecular scattering for
+    // seawater", and Morel & Maritorena 2001 equation (11) hard-codes the
+    // same 1/2.
+    for (double d : {0.0, 0.039, 0.09, 0.5, 1.0}) {
+        CAPTURE(d);
+        CHECK(RayleighDepolarisedBackscatterFraction(d) ==
+              doctest::Approx(0.5).epsilon(1e-12));
+    }
+    // Verified against the phase function itself by quadrature, so the
+    // closed form cannot be right for the wrong reason.
+    for (double d : {0.0, 0.09, 0.5}) {
+        const int    N = 200000;
+        double       back = 0.0, total = 0.0;
+        for (int i = 0; i < N; ++i) {
+            const double mu = -1.0 + 2.0 * (static_cast<double>(i) + 0.5) /
+                                          static_cast<double>(N);
+            const double w = 2.0 * kPi * RayleighDepolarisedPhase(mu, d) *
+                             (2.0 / static_cast<double>(N));
+            total += w;
+            if (mu < 0.0) back += w;    // mu < 0 is the BACK hemisphere
+        }
+        CAPTURE(d);
+        CHECK(total == doctest::Approx(1.0).epsilon(1e-9));
+        CHECK(back / total == doctest::Approx(0.5).epsilon(1e-9));
+    }
+
+    // PARTICULATE: Henyey-Greenstein's closed-form backscatter fraction,
+    // which at Petzold's g = 0.924 is 0.016989 -- against the ~0.018 that
+    // Petzold's own measured average-particle volume scattering function
+    // integrates to (Mobley, Light and Water, table 3.10). Agreeing to 6%
+    // is a check that the HG summary of Petzold is a summary of Petzold.
+    const double B = HenyeyGreensteinBackscatterFraction(kPetzoldAsymmetry);
+    CAPTURE(B);
+    CHECK(B == doctest::Approx(0.016989).epsilon(1e-4));
+    CHECK(std::fabs(B - 0.018) / 0.018 < 0.07);
+    // Isotropic reduces to 1/2, and the limit is taken rather than divided
+    // by zero.
+    CHECK(HenyeyGreensteinBackscatterFraction(0.0) ==
+          doctest::Approx(0.5).epsilon(1e-12));
+    CHECK(HenyeyGreensteinBackscatterFraction(1e-9) ==
+          doctest::Approx(0.5).epsilon(1e-6));
+    // Quadrature control, same shape as the molecular one.
+    {
+        const int N = 400000;
+        double back = 0.0, total = 0.0;
+        for (int i = 0; i < N; ++i) {
+            const double mu = -1.0 + 2.0 * (static_cast<double>(i) + 0.5) /
+                                          static_cast<double>(N);
+            const double g2 = kPetzoldAsymmetry * kPetzoldAsymmetry;
+            const double den = std::pow(1.0 + g2 -
+                                            2.0 * kPetzoldAsymmetry * mu, 1.5);
+            const double p = (1.0 - g2) / (4.0 * kPi * den);
+            const double w = 2.0 * kPi * p * (2.0 / static_cast<double>(N));
+            total += w;
+            if (mu < 0.0) back += w;
+        }
+        CAPTURE(total);
+        CHECK(total == doctest::Approx(1.0).epsilon(1e-4));
+        CHECK(back / total == doctest::Approx(B).epsilon(1e-3));
+    }
+}
+
+TEST_CASE("the Case 1 model is Morel & Maritorena's, not the version they corrected") {
+    // MM01's Appendix B exists because the absorption model was
+    // "mistakenly expressed through only two equations" for a decade. The
+    // correct form makes a_y 20% of the water-plus-algal absorption AT
+    // 440 nm and then propagates it spectrally -- so it does NOT reduce to
+    // pure water at zero chlorophyll, and the paper says so explicitly.
+    // That property is the cheapest way to tell the two forms apart.
+    const Case1Iops zero = Case1FromChlorophyll(440.0, 0.0);
+    const double a_w440 = PureWaterAbsorption(440.0);
+    CAPTURE(zero.a); CAPTURE(a_w440);
+    CHECK(zero.a > a_w440);
+    CHECK(zero.a == doctest::Approx(1.2 * a_w440).epsilon(1e-9));
+
+    // The particle scattering coefficient at 550 nm is eq. (12) exactly.
+    for (double chl : {0.03, 0.3, 1.0}) {
+        const Case1Iops io = Case1FromChlorophyll(550.0, chl);
+        CAPTURE(chl);
+        CHECK(io.bp == doctest::Approx(0.416 * std::pow(chl, 0.766))
+                           .epsilon(1e-9));
+    }
+
+    // The backscattering efficiency is capped at 1%, not 2% -- eq. (13)
+    // against the superseded eq. (10). Using the old pair doubles the
+    // particle backscatter, so this bound is the guard against it.
+    for (double chl : {0.02, 0.19, 2.0}) {
+        const Case1Iops io = Case1FromChlorophyll(550.0, chl);
+        const double eff = io.bbp / (0.416 * std::pow(chl, 0.766));
+        CAPTURE(chl); CAPTURE(eff);
+        CHECK(eff > 0.002);          // the floor in (13)
+        CHECK(eff < 0.014);          // 0.002 + 0.01 * (0.5 + 0.25*1.7) ...
+    }
+
+    // And b_b is eq. (11): half the molecular plus the particle term.
+    const Case1Iops io = Case1FromChlorophyll(443.0, 0.19);
+    CHECK(io.bb == doctest::Approx(0.5 * io.bw + io.bbp).epsilon(1e-12));
+    CHECK(io.bw == doctest::Approx(PureSeawaterScattering(443.0,
+                                                          kOceanSalinityPpt))
+                       .epsilon(1e-12));
+
+    // The global mean chlorophyll this engine would default to is inside
+    // the Case 1 range the MM01 spectral-slope equation (14) is stated for.
+    CHECK(kGlobalMeanChlorophyllMgM3 > 0.02);
+    CHECK(kGlobalMeanChlorophyllMgM3 < 2.0);
+
+    // CROSS-CHECK THAT BRICAUD 1998 IS STANDING IN FOR MM01's UNTABULATED
+    // A_chl AND NOT REPLACING IT. MM01's own algal term at 440 nm is
+    // 0.06 Chl^0.65 (its A_chl(440) is unity by definition); Bricaud's is
+    // 0.0520 Chl^0.635. Over the whole Case 1 range they agree to 12%.
+    for (double chl : {0.03, 0.19, 1.0, 2.0}) {
+        const double mm01 = 0.06 * std::pow(chl, 0.65);
+        const double bric = BricaudParticleAbsorption(440.0, chl);
+        CAPTURE(chl); CAPTURE(mm01); CAPTURE(bric);
+        // MEASURED: 3.6% at Chl 0.03 rising to 14.2% at Chl 2, i.e. the
+        // two models agree best exactly where the open ocean lives.
+        CHECK(std::fabs(bric - mm01) / mm01 < 0.15);
+    }
+}
+
 TEST_CASE("shader and engine mirrors are still faithful") {
     // Every transcription above is only as good as the code it copies, so
     // re-read the sources and pin what the copies depend on. Whitespace is
@@ -1191,8 +1770,11 @@ TEST_CASE("shader and engine mirrors are still faithful") {
     CHECK(countOf(pt, "float3sun_jit=sampleSunDisc(sun_w,seed);") == 1u);
     // Extinction is absorption PLUS both scattering species.
     CHECK(countOf(pt,
-                  "float3sigma_t=max(water_params0.xyz,float3(0.0))+sigma_s;")
-          == 1u);
+                  "float3sigma_t=ptWaterEffAtten();") == 1u);
+    // ...and the pre-#305 spelling, which added BOTH scattering species to
+    // the extinction, must not survive anywhere.
+    CHECK(countOf(pt, "float3sigma_t=max(water_params0.xyz,float3(0.0))+sigma_s;")
+          == 0u);
 
     // --- the ambient gate ------------------------------------------------
     // skyColorBase must be attenuated when the stack says water, and the
@@ -1226,6 +1808,73 @@ TEST_CASE("shader and engine mirrors are still faithful") {
     // Both new push lanes are 16-byte aligned, asserted at compile time.
     CHECK(countOf(ec, "static_assert(offsetof(PtPush,water_scatter)%16==0,") == 1u);
     CHECK(countOf(ec, "static_assert(offsetof(PtPush,water_scatter2)%16==0,") == 1u);
+
+    // --- #305: the water-leaving transport, counted not merely present ---
+    //
+    // There is no host entry point for the megakernel, so the closed form
+    // in src/physics/WaterOptics.cpp is a TRANSCRIPTION of what Slang
+    // evaluates. These pins are what stop the two drifting, and they COUNT
+    // rather than test for presence -- a second copy of any of these
+    // expressions is exactly how a mirror keeps passing while the shader
+    // has grown a duplicate that nothing checks.
+
+    // ONE attenuation law, defined once and used at exactly three sites:
+    // the illumination leg in transmittance(), the submerged march, and
+    // the water-leaving source. Four occurrences = 1 definition + 3 uses.
+    CHECK(countOf(pt, "ptWaterEffAtten()") == 4u);
+    CHECK(countOf(pt, "t*=exp(-ptWaterEffAtten()*max(seg,0.0));") == 1u);
+    CHECK(countOf(pt, "float3sigma_t=ptWaterEffAtten();") == 1u);
+    // The molecular backscatter fraction is the literal 1/2 the symmetry
+    // gives, and the HG one is the closed form -- neither is a table.
+    CHECK(countOf(pt, "returnmax(b_mol,float3(0.0))*0.5") == 1u);
+    CHECK(countOf(pt, "*((1.0+g)/sqrt(1.0+g*g)-1.0);") == 1u);
+
+    // The closed form, term by term. beta / (c_eff (mu_s + mu_v) n^2), and
+    // the saturation rate c_eff (mu_s + mu_v) / mu_s.
+    CHECK(countOf(pt, "float3den=sig_t*msmv;") == 1u);
+    CHECK(countOf(pt, "floatmsmv=mu_s+mu_v;") == 1u);
+    CHECK(countOf(pt, "wl_amp=e_d*beta/(den*n2);") == 1u);
+    CHECK(countOf(pt, "wl_rate=den/mu_s;") == 1u);
+    // THE n^2, WHICH IS THE ONE FACTOR #305 CALLS OUT AS THE CLASSIC WAY
+    // TO BE WRONG. Present exactly once, and as a DIVIDE.
+    CHECK(countOf(pt, "floatn2=water_ior*water_ior;") == 1u);
+    // ...and the (1 - F) of the upward crossing is NOT in the amplitude --
+    // the Fresnel roulette supplies it as a branch probability, and
+    // writing it here as well would square it.
+    CHECK(countOf(pt, "wl_amp=e_d*beta*(1.0-fr)") == 0u);
+
+    // The downward interface: E_d(0-) = E_perp,a * mu_a * (1 - F), with
+    // the sun's own Fresnel taken on the MACRO vertical.
+    CHECK(countOf(pt, "*sun_t*mu_a*(1.0-fr_sun);") == 1u);
+    CHECK(countOf(pt, "floatfr_sun=fresnelSchlick(mu_a,F0_water);") == 1u);
+    // Both cosines are against the local vertical, because the medium is
+    // stratified in DEPTH and not in wave slope.
+    CHECK(countOf(pt, "floatmu_v=-dot(up_w,rd);") == 1u);
+    CHECK(countOf(pt, "floatmu_s=-dot(up_w,into);") == 1u);
+    // The scattering angle in the submerged march's orientation:
+    // cos psi = dot(view propagation, direction toward the sun).
+    CHECK(countOf(pt, "floatmu_sc=dot(rd,-into);") == 1u);
+
+    // THE REFRACTION JACOBIAN. mu_a / mu_s on the march's beam
+    // irradiance -- the factor the "the n^2 cancels" argument dropped, and
+    // the one that makes the march and the closed form the same physics.
+    CHECK(countOf(pt, "*(sun_elev/max(mu_s_w,1e-4));") == 1u);
+    CHECK(countOf(pt, "floatmu_s_w=dot(up_w,sun_w);") == 1u);
+
+    // The depth truncation: armed at the interface, spent once the trace
+    // has measured the column, and cleared so it cannot fire twice.
+    CHECK(countOf(pt,
+                  "float3sat=h.hit?(float3(1.0)-exp(-wl_rate*max(h.t,0.0))):float3(1.0);")
+          == 1u);
+    // Two occurrences and no more: the declaration, and the single clear
+    // after the term is spent. A third would be a second cash site.
+    CHECK(countOf(pt, "wl_pending=false;") == 2u);
+    CHECK(countOf(pt, "boolwl_pending=false;") == 1u);
+    CHECK(countOf(pt, "wl_pending=any(wl_amp>float3(0.0));") == 1u);
+    CHECK(countOf(pt, "radiance+=wl_primary?wl_c:clampIndirect(wl_c);") == 1u);
+    // Armed ONLY when entering from outside -- a ray leaving the water
+    // must not arm it, or a submerged camera would double-count.
+    CHECK(countOf(pt, "if(ndi_s<0.0&&water_scatter2.z>0.0&&") == 1u);
 
     // --- the Pope & Fry table is where the header says it is -------------
     const std::string wo = stripSpace(readAll(PT_WATER_OPTICS_CPP_PATH));
