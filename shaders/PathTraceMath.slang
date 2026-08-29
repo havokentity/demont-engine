@@ -1314,6 +1314,59 @@ public float ptPhaseHenyeyGreenstein(float mu, float g) {
             * pow(max(1.0 + g2 - 2.0 * g * mu, 1e-4), 1.5));
 }
 
+// Ray versus a spherical SHELL [r_inner, r_outer] about `centre`.
+//
+// Returns the parametric interval of the ray inside the shell, in front of
+// the origin, clipped to [0, t_max].  False when the ray never enters it.
+//
+// This is what replaces the flat-slab intersections the cloud layer used,
+// and the difference is the founding symptom of #51.  A slab is a pair of
+// infinite planes, so at a ground camera a perfectly horizontal ray needs
+// infinite horizontal distance to reach a layer above it -- clouds
+// therefore never touched the horizon, they stopped at a hard line and
+// left a gap of bare sky below.  On a shell the same ray exits through the
+// top of the layer at a finite range, because the ground curves away
+// underneath it, and the layer terminates AT the horizon.
+//
+// Rather than enumerate the origin cases (below the layer, inside it,
+// above it), the interval is computed as "inside the outer sphere MINUS
+// inside the inner sphere" and the NEAR component returned, which is
+// correct for every origin by construction.  The far component -- the far
+// side of the shell, beyond the body -- is deliberately dropped: it is
+// occluded by the body for any origin outside the inner sphere, and
+// returning it would have a ground camera marching clouds on the other
+// side of the world.
+//
+// The roots come from ptSphereRoots, i.e. the stable solve at planetary
+// radius (#254 / #275).  That matters more here than anywhere: at
+// |oc| ~ 6.4e6 the naive discriminant loses 22% of k, which is ~0.38 m of
+// altitude error, against a cloud shell only a few hundred metres thick.
+public bool ptRayShell(float3 ro, float3 rd, float3 centre,
+                       float r_inner, float r_outer, float t_max,
+                       out float t_in, out float t_out) {
+    t_in = 0.0; t_out = 0.0;
+    if (!(r_outer > 0.0) || !(t_max > 0.0)) return false;
+    float o0, o1;
+    if (!ptSphereRoots(ro, rd, centre, r_outer, o0, o1)) return false;
+    float lo = max(o0, 0.0);
+    float hi = min(o1, t_max);
+    if (!(hi > lo)) return false;
+    float i0, i1;
+    if (r_inner > 0.0 && ptSphereRoots(ro, rd, centre, r_inner, i0, i1)) {
+        // The inner sphere carves [i0, i1] out of [lo, hi].  If the carve
+        // starts after lo the near piece is [lo, i0]; if the origin is
+        // already inside the inner sphere (i0 <= lo < i1) the ray emerges
+        // at i1 and that becomes the new near bound.
+        if (i1 > lo) {
+            if (i0 > lo) { hi = min(hi, i0); }
+            else         { lo = i1; }
+        }
+    }
+    if (!(hi > lo)) return false;
+    t_in = lo; t_out = hi;
+    return true;
+}
+
 // Optical depth along [ro, ro + rd*t] through the body's medium, by
 // composite Simpson's rule on `steps` subintervals.
 //
@@ -1370,25 +1423,58 @@ public float ptPhaseHenyeyGreenstein(float mu, float g) {
 // magnitude below one 8-bit quantum.  Pinned as a test rather than
 // asserted.
 //
+// THE MEDIUM HAS A FLOOR AS WELL AS A CEILING (#300 follow-up).  #260
+// clipped the interval to `top_radius` and stopped there, leaving the
+// altitude clamp `max(h, 0)` as the only thing standing between this
+// integral and a ray that ends BELOW the datum.  That clamp is not a
+// bound: it charges every sub-datum metre at SEA-LEVEL extinction, so the
+// error grows linearly with depth and without limit.
+//
+// It is not a hypothetical.  With streamed terrain the atmosphere's datum
+// is the SITE's geocentric radius while P3's analytic backstop sits at
+// WGS-84 b - 10 935 - 65 m, and those two are chosen on different bases:
+// at the 27.99 N reference site the backstop is 27.7 km BELOW the datum.
+// From orbit the backstop IS the visible planet, so every disc pixel was
+// integrating 27.7 km of air that the model does not contain.  Measured
+// at nadir, against this function's own reference:
+//
+//     tau_true (100 km column)   0.0662  0.1468  0.2761
+//     tau_with sub-datum tail    0.4608  0.7597  1.4338    (x7.0 x5.2 x5.2)
+//
+// Five times the optical depth is a five-times-too-dark planet, and
+// because the excess is Rayleigh -- lambda^-4 -- it is 10.8x redder in
+// R/B as well.  That is the dim, yellow-brown disc, both symptoms from
+// one term.
+//
+// The fix is the medium's own definition, not a tolerance: `b` declares
+// air on [ground_radius, top_radius] and this integrates the part of the
+// ray inside it, via the same ptRayShell every other shell consumer uses.
+// What it discards is the air over genuinely sub-datum GROUND, and unlike
+// the tail it replaces that is bounded in closed form: the deepest
+// exposed land on Earth is the Dead Sea shore at -430 m, so the worst
+// case is sigma_t(0) * 430 m = 0.0094 of optical depth in green, 0.9% of
+// transmittance -- against an error that was previously unbounded.
+//
 // Every ray that begins inside the shell and ends inside it -- which is
-// every camera in every fixture that existed before this phase, the
-// highest being 10 km -- gets lo = 0.0 and hi = t exactly, so the loop
-// below runs on identical floats and those goldens are bit-stable.  That
-// is the property that makes this a safe change to a function on the hot
-// path of every atmospheric term in the engine.
+// every camera in every fixture that existed before #260, the highest
+// being 10 km -- gets lo = 0.0 and hi = t exactly, because ptRayShell's
+// inner carve is inactive when the ray never reaches ground_radius.  The
+// loop below therefore runs on identical floats and those goldens stay
+// bit-stable, which is the property that makes this safe to change on a
+// function in the hot path of every atmospheric term in the engine.
 public float3 ptAtmoOpticalDepth(PtAtmoBody b, float3 ro, float3 rd,
                                  float3 centre, float t, int steps) {
     if (!(t > 0.0)) return float3(0.0, 0.0, 0.0);
-    // Clip [0, t] to the modelled medium.  ptSphereRoots, not a local
-    // solve: at |oc| ~ 6.4e6 the naive discriminant loses 22% of k, and
-    // the shell entry point is exactly where that error would land.
-    float u0, u1;
-    if (!ptSphereRoots(ro, rd, centre, b.top_radius, u0, u1)) {
+    // Clip [0, t] to the modelled medium -- BOTH boundaries.  ptRayShell,
+    // not a local solve: it is built on ptSphereRoots (at |oc| ~ 6.4e6 the
+    // naive discriminant loses 22% of k, and the shell entry point is
+    // exactly where that error would land) and it is the one definition of
+    // "the part of this ray inside a shell" the engine has.
+    float lo, hi;
+    if (!ptRayShell(ro, rd, centre, b.ground_radius, b.top_radius, t,
+                    lo, hi)) {
         return float3(0.0, 0.0, 0.0);      // ray never enters the medium
     }
-    float lo = max(u0, 0.0);
-    float hi = min(u1, t);
-    if (!(hi > lo)) return float3(0.0, 0.0, 0.0);
     int N = max(steps, 1);
     float dt = (hi - lo) / float(N);
     float oneSixth = 1.0 / 6.0;
@@ -1416,59 +1502,5 @@ public float3 ptAtmoOpticalDepth(PtAtmoBody b, float3 ro, float3 rd,
         st_prev = st_right;
     }
     return tau;
-}
-
-
-// Ray versus a spherical SHELL [r_inner, r_outer] about `centre`.
-//
-// Returns the parametric interval of the ray inside the shell, in front of
-// the origin, clipped to [0, t_max].  False when the ray never enters it.
-//
-// This is what replaces the flat-slab intersections the cloud layer used,
-// and the difference is the founding symptom of #51.  A slab is a pair of
-// infinite planes, so at a ground camera a perfectly horizontal ray needs
-// infinite horizontal distance to reach a layer above it -- clouds
-// therefore never touched the horizon, they stopped at a hard line and
-// left a gap of bare sky below.  On a shell the same ray exits through the
-// top of the layer at a finite range, because the ground curves away
-// underneath it, and the layer terminates AT the horizon.
-//
-// Rather than enumerate the origin cases (below the layer, inside it,
-// above it), the interval is computed as "inside the outer sphere MINUS
-// inside the inner sphere" and the NEAR component returned, which is
-// correct for every origin by construction.  The far component -- the far
-// side of the shell, beyond the body -- is deliberately dropped: it is
-// occluded by the body for any origin outside the inner sphere, and
-// returning it would have a ground camera marching clouds on the other
-// side of the world.
-//
-// The roots come from ptSphereRoots, i.e. the stable solve at planetary
-// radius (#254 / #275).  That matters more here than anywhere: at
-// |oc| ~ 6.4e6 the naive discriminant loses 22% of k, which is ~0.38 m of
-// altitude error, against a cloud shell only a few hundred metres thick.
-public bool ptRayShell(float3 ro, float3 rd, float3 centre,
-                       float r_inner, float r_outer, float t_max,
-                       out float t_in, out float t_out) {
-    t_in = 0.0; t_out = 0.0;
-    if (!(r_outer > 0.0) || !(t_max > 0.0)) return false;
-    float o0, o1;
-    if (!ptSphereRoots(ro, rd, centre, r_outer, o0, o1)) return false;
-    float lo = max(o0, 0.0);
-    float hi = min(o1, t_max);
-    if (!(hi > lo)) return false;
-    float i0, i1;
-    if (r_inner > 0.0 && ptSphereRoots(ro, rd, centre, r_inner, i0, i1)) {
-        // The inner sphere carves [i0, i1] out of [lo, hi].  If the carve
-        // starts after lo the near piece is [lo, i0]; if the origin is
-        // already inside the inner sphere (i0 <= lo < i1) the ray emerges
-        // at i1 and that becomes the new near bound.
-        if (i1 > lo) {
-            if (i0 > lo) { hi = min(hi, i0); }
-            else         { lo = i1; }
-        }
-    }
-    if (!(hi > lo)) return false;
-    t_in = lo; t_out = hi;
-    return true;
 }
 // --- end Planetary P3 -----------------------------------------------------

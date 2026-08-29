@@ -664,6 +664,38 @@ bool ptMsLutReady() { return atmo_ms_lut[0].w > 0.5; }
 // the PathTraceMath import below this declaration block.
 // --- end multiple scattering ------------------------------------------------
 
+// --- Land cover (#300): the surface albedo raster ---------------------------
+//
+// An equirectangular RGBA8 grid, one uint per texel, row 0 at the north
+// pole, registered on exactly the DEM's pixel-centre convention. Baked by
+// tools/fetch_planet_albedo.py, loaded by
+// src/renderer/Planet/SurfaceAlbedo.{h,cpp}, whose SampleAt() is this
+// fetch's mirror -- one algorithm, two implementations, no generated code
+// between them, so tests/pt_planet_albedo_test.cpp pins one against the
+// other.
+//
+// BINDING 47, ENGINE SLOT 22, and both numbers are the last ones available.
+// 37 is GodRays' mask texture (set 0 is one number space for buffers and
+// images), 40..45 are RESERVED by shaders/OceanCascades.slang (#293) even
+// though no Vulkan pipeline is built from that module, and 46 is #280's
+// multiple-scattering LUT. Slot 22 is the last entry in kSlotToBufBinding
+// and in every backend's bound_buf_[24]; a second new buffer after this one
+// has to resize all four arrays.
+//
+// A STORAGE BUFFER RATHER THAN A TEXTURE, deliberately. It costs one
+// descriptor and no pipelines; it does not touch kNumTexSlots or the
+// storage-image pool; and it stays clear of the MoltenVK descriptor-wiring
+// quirk recorded above pbr_atlas, which makes sampled atlas texels read
+// zero. The price is hand-written filtering, which this needs anyway --
+// see ptLandAlbedoSample on why plain bilinear is not good enough here.
+[[vk::binding(47, 0)]] StructuredBuffer<uint> land_albedo;
+
+// The gate. land_basis_e.w is the raster width and the host writes 0 when
+// no raster is loaded, so a build with the placeholder storage buffer bound
+// at slot 22 never indexes land_albedo at all.
+bool ptLandAlbedoReady() { return land_basis_e.w >= 1.0; }
+// --- end land cover ---------------------------------------------------------
+
 static const uint kInstDescFloat4s = 6u;
 // Descriptor kinds. 0 keeps the legacy single-mesh geometry (positions and
 // indices in mesh_positions / mesh_indices); 1 is a terrain chunk.
@@ -736,37 +768,239 @@ float terrainRoughnessFold(float base_roughness, float cone_width,
     return sqrt(saturate(a + 2.0 * s2));
 }
 
-// Terrain albedo from the vertex's own ellipsoidal height and the surface
-// slope. These are measured hemispherical reflectances, not picked
-// colours: open ocean floor / deep sediment ~0.06-0.10, dry sand 0.40,
+// --- Measured hemispherical reflectances ------------------------------------
+//
+// Mirrored by kAlbedoSnow .. kAlbedoSeabed in
+// src/renderer/Planet/SurfaceAlbedo.h. These are MEASUREMENTS, not picked
+// colours: open ocean floor / deep sediment ~0.06-0.10, dry sand 0.30-0.40,
 // grassland 0.16-0.20, bare rock 0.20-0.30, fresh snow 0.80-0.90 (Budyko
 // 1974, "Climate and Life"; Ahrens, "Meteorology Today" 11th ed. table
-// 2.2). Earth's mean land albedo of 0.15 (Trenberth, Fasullo & Kiehl
-// 2009) falls out of the mixture.
+// 2.2). Earth's mean land albedo of 0.15 (Trenberth, Fasullo & Kiehl 2009,
+// BAMS 90:311) falls out of the mixture rather than being imposed on it.
+// WGS-84 (NIMA TR8350.2, 3rd ed., 1997), mirroring kWgs84A / kWgs84B in
+// src/renderer/Planet/CubedSphere.h. Only their RATIO matters below, and
+// float carries it to ~6e-8, i.e. under a metre of latitude error -- three
+// orders below this raster's 19.5 km texel.
+static const float kWgs84SemiMajorM = 6378137.0;
+static const float kWgs84SemiMinorM = 6356752.314245;
+static const float kPiF             = 3.14159265358979;
+
+static const float3 kTerrSeabed = float3(0.055, 0.060, 0.070);
+static const float3 kTerrSand   = float3(0.40, 0.36, 0.28);
+static const float3 kTerrGrass  = float3(0.13, 0.17, 0.09);
+static const float3 kTerrRock   = float3(0.26, 0.24, 0.22);
+static const float3 kTerrSnow   = float3(0.85, 0.87, 0.90);
+
+// --- Geodetic coordinates of a world-space point ----------------------------
 //
-// This is a SHADING heuristic sitting on top of measured reflectances, and
-// it is labelled as one: the snowline and the vegetation limit are cvars
-// with a cited anchor, not a physical model. It costs nothing to replace
-// with real land-cover data (MODIS MCD12Q1) when the atlas has the tiles
-// for it, and it never touches geometry.
-float3 terrainBiomeAlbedo(float height_m, float slope01, float snowline_m) {
-    float3 seabed = float3(0.055, 0.060, 0.070);
-    float3 sand   = float3(0.40, 0.36, 0.28);
-    float3 grass  = float3(0.13, 0.17, 0.09);
-    float3 rock   = float3(0.26, 0.24, 0.22);
-    float3 snow   = float3(0.85, 0.87, 0.90);
+// The exact expression src/renderer/Planet/ElevationField.cpp's
+// DirectionToGeodetic uses, so the albedo raster and the DEM index the same
+// grid cell for the same point -- a coastline and the colour on either side
+// of it cannot disagree if they are computed the same way.
+//
+//   lat = atan2(a * dz, b * hypot(dx, dy))     GEODETIC, via the ellipsoid
+//   lon = atan2(dy, dx)                        normal, not geocentric
+//
+// The geodetic/geocentric difference is up to 11.5 arcmin, which at this
+// raster's 0.176 deg row pitch is a full texel of misregistration at
+// mid-latitude. Getting it wrong would shift every biome band ~20 km north
+// or south of its coastline.
+float2 ptGeodeticFromWorld(float3 p_world) {
+    float3 w = p_world - planet_center_radius.xyz;
+    float3 e = land_basis_e.xyz * w.x
+             + land_basis_u.xyz * w.y
+             + land_basis_s.xyz * w.z;
+    float  n = length(e);
+    if (n <= 0.0) return float2(0.0, 0.0);
+    e /= n;
+    float  p = sqrt(max(e.x * e.x + e.y * e.y, 0.0));
+    float  lat = atan2(kWgs84SemiMajorM * e.z, kWgs84SemiMinorM * p);
+    float  lon = atan2(e.y, e.x);
+    return float2(lat, lon);
+}
+
+// --- The raster fetch -------------------------------------------------------
+//
+// Mirrored by SurfaceAlbedoMap::SampleAt. Returns linear RGB reflectance in
+// .rgb and COVERAGE in .a -- 1 where the bake had real land data, 0 over
+// ocean and over anything the source never saw. Coverage is what lets a
+// single texel fall back to the procedural classification instead of the
+// fallback being all-or-nothing.
+//
+// SMOOTHSTEP-WEIGHTED, NOT PLAIN BILINEAR. Plain bilinear is only C0: its
+// derivative jumps at every texel edge, and magnified 20x -- which is what
+// a 19.5 km texel is from orbit -- that jump reads as a diamond lattice
+// laid over every continent. That is precisely the banding this phase is
+// not allowed to have, and it costs two multiplies per axis to remove.
+float4 ptLandAlbedoSample(float lat_rad, float lon_rad) {
+    float W = land_basis_e.w;
+    float H = land_basis_u.w;
+    if (W < 1.0 || H < 1.0) return float4(0.0, 0.0, 0.0, 0.0);
+    int iw = int(W);
+    int ih = int(H);
+    // Pixel-centre registration, the DEM's expression:
+    //   lon = -pi + (x + 0.5) * 2pi / W,  lat = +pi/2 - (y + 0.5) * pi / H
+    float fx = (lon_rad + kPiF) / (2.0 * kPiF) * W - 0.5;
+    float fy = (kPiF * 0.5 - lat_rad) / kPiF * H - 0.5;
+    float x0f = floor(fx);
+    float y0f = floor(fy);
+    int   x0  = int(x0f);
+    int   y0  = int(y0f);
+    float tx  = smoothstep(0.0, 1.0, fx - x0f);
+    float ty  = smoothstep(0.0, 1.0, fy - y0f);
+
+    float4 c[4];
+    for (int k = 0; k < 4; ++k) {
+        // Longitude WRAPS, latitude CLAMPS -- the DEM's boundary rule, so
+        // the two grids behave identically at the antimeridian and the caps.
+        int x = x0 + (k & 1);
+        int y = y0 + (k >> 1);
+        x = ((x % iw) + iw) % iw;
+        y = clamp(y, 0, ih - 1);
+        uint v = land_albedo[uint(y) * uint(iw) + uint(x)];
+        float inv = 1.0 / 255.0;
+        float r = float((v >> 0)  & 0xFFu) * inv;
+        float g = float((v >> 8)  & 0xFFu) * inv;
+        float b = float((v >> 16) & 0xFFu) * inv;
+        float a = float((v >> 24) & 0xFFu) * inv;
+        // gamma-2.0 decode -- one multiply. A LINEAR byte would put its
+        // 1/255 step against closed-canopy forest's ~0.018 reflectance,
+        // i.e. a 22% quantisation error on the darkest land there is.
+        c[k] = float4(r * r, g * g, b * b, a);
+    }
+    float4 top = lerp(c[0], c[1], tx);
+    float4 bot = lerp(c[2], c[3], tx);
+    return lerp(top, bot, ty);
+}
+
+// --- The snowline, derived rather than dialled ------------------------------
+//
+// Mirrors SnowlineAltitudeM in src/renderer/Planet/SurfaceAlbedo.h, where
+// the derivation, the citations and the validation table live. In short:
+// a snowline is the freezing level of the WARM-SEASON air column, so it is
+// the zonal-mean temperature (North, Cahalan & Coakley 1981, Rev. Geophys.
+// 19:91, eq. 2 -- a second Legendre polynomial in sin(latitude)) plus half
+// the annual range, divided by the environmental lapse rate (6.5 K/km,
+// ICAO / ISO 2533), anchored so the equator reproduces r_planet_snowline's
+// measured tropical value (Kaser & Osmaston 2002).
+//
+// This replaces `snowline * cos(site latitude)`, which was a shape rather
+// than a mechanism AND was evaluated at the SITE, so an entire planet had
+// one snowline. Against published equilibrium-line altitudes at 0/45/60/80
+// degrees this halves the mean error, and unlike the cos law it varies
+// across a globe seen from orbit.
+float ptSnowlineAt(float lat_rad, float tropical_anchor_m) {
+    float s2 = sin(lat_rad) * sin(lat_rad);
+    float p2 = 0.5 * (3.0 * s2 - 1.0);
+    float t_here = (15.0 - 28.0 * p2) + (2.0 + 18.0 * s2);
+    float t_eq   = (15.0 + 28.0 * 0.5) + 2.0;
+    if (t_eq <= 0.0) return max(tropical_anchor_m, 0.0);
+    return max(t_here * (tropical_anchor_m / t_eq), 0.0);
+}
+
+// --- Threshold-hillslope rock exposure --------------------------------------
+//
+// Slope drives rock exposure because a steep enough face sheds soil, snow
+// and vegetation -- which a 19.5 km texel cannot know. The two angles are
+// measured: hillslopes in actively uplifting terrain steepen only to a
+// landsliding threshold of ~30 deg (Burbank et al. 1996, Nature 379:505),
+// and dry granular material stands at its ~34 deg angle of repose
+// (Al-Hashemi & Al-Amoudi 2018, Powder Technology 330:397). Bedrock cliffs
+// exceed both, so this ramps from the threshold hillslope to 45 deg rather
+// than switching at one angle.
+//
+// slope01 = 1 - |cos(tilt)|, so the bounds are 1 - cos(30 deg) = 0.1340 and
+// 1 - cos(45 deg) = 0.2929.
+//
+// THIS IS THE BUG THAT MADE THE HIMALAYAS UNIFORM WHITE. The ramp here used
+// to be saturate((slope01 - 0.5) * 2.5): zero until slope01 = 0.5 and not
+// saturating until 0.9, which are tilts of 60 and 84.3 degrees. It exposed
+// no rock below a sixty-degree face, and terrain that steep barely exists
+// at a 38 m vertex spacing -- so in practice rock was never exposed at all
+// and every surface above the snowline was snow and nothing else.
+float ptSlopeRockFraction(float slope01) {
+    return smoothstep(0.1340, 0.2929, slope01);
+}
+
+// The procedural classification: the path for a body with NO DATA.
+//
+// Kept, and kept in its proper place. r_planet_radius documents Moon, Mars
+// and Venus values, and pointing the engine at the Moon must degrade to
+// rock and regolith rather than growing forests -- which is what this does,
+// because with no raster there is no vegetation term that can fire on a
+// body whose height field has no sea level to measure a beach ridge from.
+//
+// It is a SHADING heuristic on top of measured reflectances and is labelled
+// as one. What is NOT here is a Köppen-style classification driven by
+// latitude and a moisture proxy; see the issue for what that would add.
+float3 terrainProceduralAlbedo(float height_m, float slope01, float snowline_m) {
     // Below sea level: seabed, with a sand shelf in the last 30 m. 30 m is
     // not arbitrary -- it is roughly the 1/e depth of the green channel
     // times two (Pope & Fry 1997 give a_g(550) = 0.0565 /m, i.e. 17.7 m),
     // so it is where a seabed stops being lit at all.
-    float3 c = lerp(sand, seabed, saturate(-height_m / 30.0));
+    float3 c = lerp(kTerrSand, kTerrSeabed, saturate(-height_m / 30.0));
     // Above sea level: sand -> grass over the first 40 m of a beach ridge,
-    // then rock as the slope steepens past the ~30 deg threshold hillslope
-    // (Burbank et al. 1996), then snow above the snowline.
-    float3 land = lerp(sand, grass, saturate(height_m / 40.0));
-    land = lerp(land, rock, saturate((slope01 - 0.5) * 2.5));
-    land = lerp(land, snow, saturate((height_m - snowline_m) / 400.0));
+    // then rock as the slope passes the threshold hillslope, then snow
+    // above the snowline.
+    float3 land = lerp(kTerrSand, kTerrGrass, saturate(height_m / 40.0));
+    land = lerp(land, kTerrRock, ptSlopeRockFraction(slope01));
+    land = lerp(land, kTerrSnow, saturate((height_m - snowline_m) / 400.0));
     return (height_m >= 0.0) ? land : c;
+}
+
+// --- The composite: a measured raster, modulated by the DEM -----------------
+//
+// The raster is not the whole answer and was never meant to be. At 19.5
+// km/texel it cannot know that a 40 deg face sheds its soil, and it is one
+// summer's composite so it cannot know where the snowline is on a body
+// whose orbit or radius the user has changed. What it DOES know -- which
+// nothing derivable from elevation can -- is that the Sahara is tan, the
+// Congo is green and the Tibetan Plateau is neither.
+//
+// So: raster for the base colour, DEM for everything below its resolution.
+//
+//   1. Coverage and r_planet_land_albedo blend it against the procedural
+//      classification, so a no-data body and a no-data texel both degrade
+//      to rock rather than to forest.
+//   2. Slope exposes rock over it, from the threshold hillslope to 45 deg.
+//   3. Snow goes over BOTH, above a latitude-derived snowline -- but not on
+//      a face past the angle of repose, because such a face sheds it.
+//   4. Below sea level the raster is ignored entirely: the seabed is not
+//      something a nadir-viewing satellite measured the reflectance of.
+float3 terrainSurfaceAlbedo(float height_m, float slope01, float3 p_world,
+                            float snowline_anchor_m) {
+    float2 ll = ptGeodeticFromWorld(p_world);
+    float  snowline_m = ptSnowlineAt(ll.x, snowline_anchor_m);
+    float3 proc = terrainProceduralAlbedo(height_m, slope01, snowline_m);
+    if (!ptLandAlbedoReady() || height_m < 0.0) return proc;
+
+    float4 s = ptLandAlbedoSample(ll.x, ll.y);
+    // .a is coverage; land_basis_s.w is r_planet_land_albedo. Both are
+    // multiplicative gates, so either one at zero gives back the procedural
+    // classification EXACTLY -- which is what makes the A/B ablation a
+    // clean one.
+    float  w = saturate(s.a) * saturate(land_basis_s.w);
+    float3 base = lerp(proc, s.rgb, w);
+
+    // Rock over the raster too. A satellite sees a mountain range from
+    // nadir and averages its faces; the face itself is bare.
+    base = lerp(base, kTerrRock, ptSlopeRockFraction(slope01));
+    // Snow last, and a face sheds it over the SAME threshold-hillslope band
+    // that exposes the rock. One angle governs both because it is one
+    // mechanism: past the threshold hillslope a slope does not hold
+    // unconsolidated material, and snow is unconsolidated material.
+    // Using the 34 deg angle of repose for snow and 30 deg for soil would
+    // be two cited constants doing one job, and would leave a 4 deg band
+    // where the rock is exposed but the snow has not let go of it.
+    //
+    // This is what makes a mountain read as rock AND snow rather than as a
+    // white cone: above the snowline the low-slope faces stay white and the
+    // steep ones go to bare rock, which is what a photograph of a range
+    // above its snowline actually shows.
+    float shed = 1.0 - ptSlopeRockFraction(slope01);
+    base = lerp(base, kTerrSnow,
+                saturate((height_m - snowline_m) / 400.0) * shed);
+    return base;
 }
 #endif  // PT_PLANET_ENABLED
 // --- end Planetary P4 -----------------------------------------------------
@@ -1506,6 +1740,43 @@ cbuffer Push {
     float4 sky_cook_horizon_sun;
     float4 sky_cook_horizon_anti;
     // --- end #280 -------------------------------------------------------------
+    // --- Land cover (#300): the site's ECEF basis + the raster's shape --------
+    //
+    // WHY A BASIS AND NOT A LATITUDE. A raster indexed by geodetic
+    // (lat, lon) needs the SHADED POINT's coordinates, and the engine's
+    // world frame is a local East / Up / South frame pinned at the scene's
+    // site (PlanetSite::ecef_to_world, src/renderer/Planet/TerrainChunk.h).
+    // Handing the shader the site's latitude -- which is what
+    // planet_terrain.x used to carry, folded into a cos() -- gives one
+    // number for the whole planet, so a globe seen from orbit had one
+    // snowline and could not have had a raster at all. These three rows are
+    // the rotation that turns a world-space radial direction back into ECEF,
+    // where latitude and longitude exist.
+    //
+    //   land_basis_e.xyz = the East  row of PlanetSite::ecef_to_world
+    //   land_basis_u.xyz = the Up    row  (geocentric, not geodetic -- see
+    //                                     TerrainChunk.h on why the centre
+    //                                     is geocentric)
+    //   land_basis_s.xyz = the South row
+    //
+    // so ecef = E*w.x + U*w.y + S*w.z for a world-space vector w, which is
+    // transpose(ecef_to_world) * w written out.
+    //
+    //   land_basis_e.w = raster width  in texels, 0 = NO RASTER BOUND. The
+    //                    single gate: with 0 here the terrain falls to
+    //                    terrainProceduralAlbedo() and land_albedo is never
+    //                    read, which is what makes the placeholder binding
+    //                    safe.
+    //   land_basis_u.w = raster height in texels.
+    //   land_basis_s.w = r_planet_land_albedo, the master blend from the
+    //                    procedural classification (0) to the raster (1).
+    //
+    // Three vec4 appended at the very tail so every existing field offset is
+    // untouched. Mirrored in the SPIR-V Frame block below + Engine.cpp PtPush.
+    float4 land_basis_e;
+    float4 land_basis_u;
+    float4 land_basis_s;
+    // --- end land cover -------------------------------------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -1683,6 +1954,13 @@ cbuffer Frame {
     float4 sky_cook_zenith;
     float4 sky_cook_horizon_sun;
     float4 sky_cook_horizon_anti;
+    // See `land_basis_e` .. `land_basis_s` in the Metal Push cbuffer above
+    // (land cover, #300). Layout-equivalent: three more vec4 at the tail,
+    // AFTER #280's three -- the Frame UBO is byte-equivalent to the host
+    // struct, so tail appends have to be in the same order on both sides.
+    float4 land_basis_e;
+    float4 land_basis_u;
+    float4 land_basis_s;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -2990,6 +3268,36 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
             h.normal = localUp(ro + rd * t_p);
             h.mat = MAT_LAMBERT;
             h.albedo = planet_ground.xyz;
+#if PT_PLANET_ENABLED
+            // Land cover (#300) on the ANALYTIC body, not only on streamed
+            // terrain -- and this is the path that actually matters for
+            // "Earth from orbit is recognisable".
+            //
+            // WHY IT IS NEEDED HERE AT ALL. From 400 km the LOD selector
+            // converges to level 2, a 39 km vertex spacing over the whole
+            // globe, and what the ray meets is this sphere rather than the
+            // chunks. Measured: at that altitude r_planet_ground_albedo
+            // moves the frame and r_planet_albedo_map does not, which is
+            // the definition of the raster never reaching the pixels the
+            // acceptance criterion is about.
+            //
+            // WHAT IS DELIBERATELY NOT DONE HERE. No slope and no snowline.
+            // This is a SPHERE: its slope is zero everywhere by
+            // construction, and its radius is the backstop (below the
+            // deepest ocean) rather than the terrain's, so it has no
+            // height to hand a freezing-level model. Applying either would
+            // be inventing a value, not modulating one. Where the raster
+            // has no coverage -- ocean, and the two polar caps the source
+            // mosaic cannot reach -- the analytic body keeps
+            // r_planet_ground_albedo, which is exactly what it had before
+            // this phase.
+            if (ptLandAlbedoReady()) {
+                float2 ll_p = ptGeodeticFromWorld(ro + rd * t_p);
+                float4 s_p = ptLandAlbedoSample(ll_p.x, ll_p.y);
+                float w_p = saturate(s_p.a) * saturate(land_basis_s.w);
+                h.albedo = lerp(planet_ground.xyz, s_p.rgb, w_p);
+            }
+#endif
             h.roughness = 1.0;
             h.ior = 1.0;
             h.emission = float3(0.0);
@@ -3183,10 +3491,17 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
                     // slope01 = 1 - |cos(tilt from local up)|. localUp() is
                     // P0's per-point up, so this is the real geodetic slope
                     // rather than a tilt from world +Y.
-                    float3 up = localUp(ro_mesh + rd * t_mesh);
+                    float3 p_hit   = ro_mesh + rd * t_mesh;
+                    float3 up = localUp(p_hit);
                     float  slope01 = saturate(1.0 - abs(dot(n, up)));
-                    h.albedo = terrainBiomeAlbedo(height, slope01,
-                                                  planet_terrain.x);
+                    // Land cover (#300). The hit POSITION, not just its
+                    // height: the raster and the snowline are both
+                    // functions of where on the planet this is, and
+                    // planet_terrain.x now carries the tropical snowline
+                    // anchor rather than a value pre-scaled by the site's
+                    // own latitude.
+                    h.albedo = terrainSurfaceAlbedo(height, slope01, p_hit,
+                                                    planet_terrain.x);
                     // Sub-footprint slope variance -> roughness. The cone
                     // width at the hit is the same accumulation the bounce
                     // loop performs, evaluated one segment early because
@@ -9278,6 +9593,49 @@ void main(uint2 tid : SV_DispatchThreadID) {
                              && ptRayShell(primary_ro, primary_rd, pc_v, 0.0,
                                            ptAtmoEarth(planet_R_v).top_radius,
                                            primary_t, t_near_v, t_far_v);
+                    // AND STOP THE COLUMN AT THE GROUND (#300 follow-up).
+                    // skyPhysical has carried this clamp since #260 -- see
+                    // "The body is opaque" next to its own ptRayShell call
+                    // -- and this march did not, which made the two
+                    // disagree about where the air ends for exactly the
+                    // rays that hit the body.
+                    //
+                    // It bites whenever the primary hit is BELOW the
+                    // atmosphere's datum, and with streamed terrain that is
+                    // every pixel of the disc: the datum is the site's
+                    // geocentric radius while P3's analytic backstop is
+                    // WGS-84 b - 10 935 - 65 m, 27.7 km lower at the 27.99 N
+                    // site. Those 27.7 km were marched with the altitude
+                    // clamped to 0, i.e. as a slab of SEA-LEVEL air, and
+                    // being in-scatter it ADDED light rather than removing
+                    // it. Measured at nadir, sub-solar: the slab contributes
+                    // sigma_s(0) * 27.7 km * P_R(-1) * E = (7.4, 21.6, 54.4)
+                    // W/m^2/sr against a true column in-scatter of
+                    // (2.1, 6.2, 15.7) -- four times the real atmosphere,
+                    // which is what washed the land cover off the disc.
+                    //
+                    // Same defect as the one ptAtmoOpticalDepth carries on
+                    // the extinction side, and the same fix: the medium has
+                    // a floor.
+                    //
+                    // WHY NO IMAGE GOLDEN MOVES, AND WHY THAT IS THE
+                    // POINT. Every fixture with r_sky_mode physical has
+                    // r_planet_terrain 0, and without terrain the analytic
+                    // body sits AT the datum (Engine.cpp only lowers it to
+                    // the backstop when terrain is on), so this clamp is a
+                    // no-op on all nine of them -- verified: the whole
+                    // matrix is bit-stable across this change. That is
+                    // exactly the gap the defect lived in. Until a cell
+                    // combines the two, the guard is the source pin in
+                    // tests/pt_atmosphere_test.cpp, not a picture.
+                    float g0_v, g1_v;
+                    if (span_ok_v
+                        && ptSphereRoots(primary_ro, primary_rd, pc_v,
+                                         planet_R_v, g0_v, g1_v)
+                        && g0_v > 0.0) {
+                        t_far_v = min(t_far_v, g0_v);
+                        span_ok_v = (t_far_v > t_near_v);
+                    }
                 } else {
                     span_ok_v = false;   // skyPhysical already did this ray
                 }

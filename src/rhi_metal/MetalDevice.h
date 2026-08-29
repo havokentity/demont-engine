@@ -202,14 +202,15 @@ private:
     // a black-frame regression on cloud-bearing scenes (#24) plus a
     // mesh-motion-blur-silently-failing regression (#21). 2048 leaves
     // room for several more 16-byte blocks before another resize.
-    // PushConstants() silently truncates beyond this size, so when
-    // adding push fields make sure the buffer is still big enough --
-    // a too-small buffer manifests as the last fields being all-zero
-    // (or pre-existing garbage) at runtime (e.g. DOF appearing to do
-    // nothing, mesh motion blur silently failing, clouds going black).
-    // Metal's setBytes accepts up to 4KB so bump as needed; check the
-    // C++ static_assert on sizeof(PtPush) and grow this in lockstep.
-    std::uint8_t  push_buf_[2048] {};
+    // The size is now pt::rhi::kMaxPushConstantBytes, shared with the
+    // Vulkan backend and static_asserted against sizeof(PtPush) in
+    // Engine.cpp -- because "remember to grow this in lockstep" is exactly
+    // what nobody did for #21, #24 and #300, each of which shipped a
+    // silently truncated tail (mesh motion blur failing, clouds black,
+    // terrain ignoring its albedo raster). PushConstants() now also logs
+    // when it has to truncate, so a build that somehow gets past the
+    // static_assert still cannot fail quietly.
+    std::uint8_t  push_buf_[pt::rhi::kMaxPushConstantBytes] {};
     std::size_t   push_size_ = 0;
 };
 

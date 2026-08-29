@@ -457,6 +457,39 @@ target_compile_definitions(pt_planet_shader PRIVATE
     PT_VULKAN_DEVICE_PATH="${CMAKE_SOURCE_DIR}/src/rhi_vulkan/VulkanDevice.cpp"
     PT_ENGINE_CPP_PATH="${CMAKE_SOURCE_DIR}/src/engine/Engine.cpp")
 
+# --- pt_planet_albedo (issue #300, land cover) -----------------------------
+# The surface albedo raster, the two physical models that modulate it, and
+# the wire formats between the CPU sampler and the shader's.
+#
+# WHY IT IS NOT A GOLDEN. Three reasons, all recorded at the top of the
+# source file, but the first is the one that decided it: `planet_surface`
+# stands at 27.99 N with a 4.7 km horizon and the raster's texel is 19.5 km,
+# so the raster contributes ONE COLOUR to that entire frame. No
+# surface-level golden can tell a correct raster from a wrong one -- only
+# from an absent one. And "Earth from orbit is recognisable" is a claim
+# about SPECTRAL SHAPE (green where chlorophyll absorbs red and blue, tan
+# where iron oxide absorbs blue), which a pixel comparison passes just as
+# happily if both images are grey.
+#
+# It reads FIVE source files, and that breadth is deliberate: this phase
+# added a Vulkan descriptor binding and grew PtPush past both backends'
+# push-constant staging buffers, and neither has a runtime check on a Mac.
+# The push overflow in particular shipped silently on Metal AND Vulkan at
+# once -- the terrain simply ignored its new raster with no error anywhere
+# -- so the pins cover the shared constant, both backends' use of it, and
+# the compile-time guard that now catches the next one.
+pt_add_test(pt_planet_albedo
+    pt_planet_albedo_test.cpp
+    LINK_TARGETS pt_renderer)
+target_compile_definitions(pt_planet_albedo PRIVATE
+    PT_PLANET_ALBEDO_PATH="${CMAKE_SOURCE_DIR}/assets/planet/earth_lite.ptalb"
+    PT_SHADER_PATHTRACE_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang"
+    PT_VULKAN_DEVICE_PATH="${CMAKE_SOURCE_DIR}/src/rhi_vulkan/VulkanDevice.cpp"
+    PT_VULKAN_DEVICE_H_PATH="${CMAKE_SOURCE_DIR}/src/rhi_vulkan/VulkanDevice.h"
+    PT_METAL_DEVICE_PATH="${CMAKE_SOURCE_DIR}/src/rhi_metal/MetalDevice.h"
+    PT_RHI_TYPES_PATH="${CMAKE_SOURCE_DIR}/src/rhi/Types.h"
+    PT_ENGINE_CPP_PATH="${CMAKE_SOURCE_DIR}/src/engine/Engine.cpp")
+
 # --- pt_math_epsilon (issue #256, planetary P2) ----------------------------
 # Scale-relative ray epsilons: the Wachter-Binder representational offset
 # and the ray-cone footprint term that replaced the absolute 1e-3 m every
@@ -1834,6 +1867,51 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # 4.6x and 4.3x while sitting ~13x above the largest measured
     # cross-host codegen drift.
     pt_add_golden_cell(SCENE planet_surface  BACKEND metal DENOISER off
+                       FRAMES 32 MAX_DELTA 16 MEAN_DELTA 0.8 FAIL_PERCENT 1)
+    # --- Land cover (#300) --------------------------------------------
+    # The planet from full-disc range, which is the ONLY scale at which
+    # "Earth is recognisable" is a claim a golden can hold.
+    #
+    # WHY planet_surface DOES NOT COVER IT. That cell stands at 27.99 N
+    # with a 4.7 km horizon and the albedo raster's texel is 19.5 km, so
+    # the raster contributes ONE COLOUR to the whole frame there. It can
+    # tell an absent raster from a present one and nothing else. The
+    # fixture's own header carries the rest of the reasoning.
+    #
+    # THRESHOLDS, MEASURED.
+    #   Same-host repeat: this fixture is BIT-IDENTICAL run to run
+    #   (mean 0.000000, max 0.0000, 0 bad pixels over 196 608). Terrain
+    #   settling is a barrier rather than a race, so there is no scheduling
+    #   noise to absorb.
+    #   Signal: the r_planet_land_albedo 0 ablation -- which returns the
+    #   surface to exactly the procedural classification -- moves it by
+    #   mean 5.011 with 6.91% of pixels bad and a max delta of 275.5.
+    #   The disc covers ~14% of the frame, so that mean is concentrated
+    #   where the planet is. Unloading the raster entirely
+    #   (r_planet_albedo_map "") gives the identical figures, which is
+    #   what "the ablation really removes the feature" looks like.
+    #
+    #   MEAN_DELTA 0.8 therefore sits 6.3x below the weakest signal and
+    #   infinitely above the observed noise. FAIL_PERCENT 1 sits 6.9x
+    #   below the ablation's 6.91%. MAX_DELTA 16 is the matrix default and
+    #   is NOT tightened toward the measured 0.0000 on purpose, for the
+    #   reason the block above gives: one M4 Max is not a sample, and the
+    #   headroom is for another driver's fma ordering.
+    #
+    #   RE-MEASURED after the sub-datum air-column fix, which moved this
+    #   golden by mean 23.28 with 14.19% of pixels bad -- 4.6x the
+    #   feature's own ablation, i.e. the atmosphere bug was a larger
+    #   effect on this frame than the land cover it was supposed to be
+    #   showing. The numbers above are that re-measurement, not the
+    #   pre-fix ones; the margins moved by ~20% and the thresholds
+    #   therefore did not need to.
+    #
+    # NOT VACUOUS: the golden is not blank and not uniform. It is an
+    # illuminated disc on black -- so the assertions that matter are made
+    # in tests/pt_planet_albedo_test.cpp, which measures the raster's
+    # SPECTRAL SHAPE (green where chlorophyll absorbs, red-over-green-over-
+    # blue where iron oxide does) rather than its pixels.
+    pt_add_golden_cell(SCENE planet_land_orbit BACKEND metal DENOISER off
                        FRAMES 32 MAX_DELTA 16 MEAN_DELTA 0.8 FAIL_PERCENT 1)
     pt_add_golden_cell(SCENE planet_aerial   BACKEND metal DENOISER off
                        FRAMES 32 MAX_DELTA 16 MEAN_DELTA 0.8 FAIL_PERCENT 1)

@@ -7,6 +7,7 @@
 #include "../core/WorldFrame.h"
 #include "../renderer/AnalyticBvh.h"
 #include "../renderer/EditorOverlay.h"
+#include "../renderer/Planet/SurfaceAlbedo.h"   // #300: land-cover raster
 #include "../renderer/TriangleBvh.h"
 #include "../rhi/Device.h"
 #include "../rhi/Types.h"
@@ -756,6 +757,10 @@ private:
     // all of them -- the build is ~25 ms on twelve threads and must never
     // sit on the per-frame path.
     void EnsureAtmosphereMultiScatterLut();
+    // Land cover (#300). Loads r_planet_albedo_map and uploads it to the
+    // storage buffer at engine slot 22. Keyed on the path, so it is a no-op
+    // after the first call.
+    void EnsureLandAlbedoRaster();
 
     // --- Planetary P4 (#258) ---------------------------------------------
     // Per-frame terrain streaming: reads the cvars, (re)starts the streamer
@@ -1648,6 +1653,15 @@ private:
         bool operator==(const AtmoMsKey&) const = default;
     };
     AtmoMsKey                                   atmo_ms_key_{};
+    // --- Land cover (#300): the surface albedo raster --------------------
+    // Immutable data, so unlike the multiple-scattering LUT there is
+    // nothing to rebuild -- the key is just the path, and `loaded_` is what
+    // distinguishes "never tried" from "tried and the file was missing", so
+    // a failed load logs once instead of once a frame.
+    pt::planet::SurfaceAlbedoMap                land_albedo_map_{};
+    std::uint64_t                               land_albedo_buf_id_    = 0;
+    std::string                                 land_albedo_key_;
+    bool                                        land_albedo_loaded_    = false;
     // Capacity the scene TLAS was created with. Device::UpdateTLASInstances
     // never grows a structure, so a change here means destroy + recreate.
     std::uint32_t                               scene_tlas_capacity_   = 0;

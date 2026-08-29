@@ -266,7 +266,12 @@ constexpr std::uint32_t kSlotToBufBinding[24] = {
     // Vulkan pipeline yet, so those six are reserved for the layout entries
     // it will need rather than free to take.
     46, // engine slot 21 -> shader binding 46 (atmo_ms_lut)
-    0,  // engine slot 22 unused
+    // Land cover (#300): the surface albedo raster, an equirectangular
+    // RGBA8 grid packed one texel per uint. Slot 22 is the LAST entry this
+    // table has; a further buffer needs kSlotToBufBinding, VulkanDevice's
+    // bound_buf_[24], MetalDevice's bound_buf_[24] and SoftwareDevice's
+    // buffers[24] all resized together.
+    47, // engine slot 22 -> shader binding 47 (land_albedo)
     0,  // engine slot 23 unused
 };
 // Scene TLAS lives at engine accel-slot 2 -> shader binding 2.
@@ -410,7 +415,23 @@ void VulkanCommandBuffer::BindAccelStruct(std::uint32_t slot, AccelStructHandle 
 }
 
 void VulkanCommandBuffer::PushConstants(const void* data, std::size_t size) {
-    if (size > sizeof(push_buf_)) size = sizeof(push_buf_);
+    if (size > sizeof(push_buf_)) {
+        // See the matching note in MetalCommandBuffer::PushConstants. The
+        // tail check further down compares against kFrameUboSize and would
+        // NOT have caught this: a truncated push_size_ makes the tail look
+        // smaller, so the overflow hides itself from the very guard meant
+        // to find it.
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LOG_ERROR("Vulkan: push constants are {} bytes but the staging "
+                      "buffer is {} -- the last {} bytes will NOT reach the "
+                      "GPU and those fields will read zero. Bump "
+                      "pt::rhi::kMaxPushConstantBytes.",
+                      size, sizeof(push_buf_), size - sizeof(push_buf_));
+        }
+        size = sizeof(push_buf_);
+    }
     std::memcpy(push_buf_, data, size);
     push_size_ = size;
 }
@@ -1172,7 +1193,8 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // terrain_indices (38) and instance_desc (39). 17 -> 20; the +8 slack
     // is retained rather than spent.
     // #280 adds atmo_ms_lut (40). 20 -> 21; the +8 slack still retained.
-    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 21 + 8 });
+    // Land cover (#300) adds land_albedo (47). 21 -> 22; slack retained.
+    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 22 + 8 });
     psizes.push_back({ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,          kTotalSets * 1 + 1 });
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -1204,7 +1226,8 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // coordination -- this PR leaves it as a gap).
     {
         std::vector<VkDescriptorSetLayoutBinding> b;
-        b.reserve(32);   // Wave 8 #26 added bindings 31/32/33; #280 added 40
+        b.reserve(33);   // Wave 8 #26 added bindings 31/32/33; #280 added 46;
+                         // land cover (#300) added 47
         auto add_binding = [&](std::uint32_t binding, VkDescriptorType type) {
             VkDescriptorSetLayoutBinding lb{};
             lb.binding         = binding;
@@ -1402,6 +1425,11 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // which has no Vulkan pipeline yet and will need all six added here
         // when it gets one.
         add_binding(46, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        // Land cover (#300): binding 47, the surface albedo raster. Same
+        // shape as 46 -- a storage buffer the host fills, so it costs one
+        // descriptor and no pipeline -- and declared unconditionally for
+        // the same superset reason as 36/38/39 above.
+        add_binding(47, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
         // --- end Planetary P4 --------------------------------------
 
         // UPDATE_AFTER_BIND for every binding so we can rewrite the

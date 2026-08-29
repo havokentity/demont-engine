@@ -14,6 +14,7 @@ add_library(pt_renderer STATIC
     MoonTexture.cpp
     Planet/CubedSphere.cpp
     Planet/ElevationField.cpp
+    Planet/SurfaceAlbedo.cpp
     Planet/TerrainChunk.cpp
     Planet/TerrainQuadtree.cpp
     TriangleBvh.cpp

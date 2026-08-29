@@ -108,12 +108,16 @@ private:
     // contiguous blob across backends. On SPIR-V, Dispatch byte-splits:
     // first kPushConstantSize bytes -> vkCmdPushConstants (within hw
     // limit), remainder -> per-frame Frame UBO at vk::binding(14, 0).
-    // PushConstants() silently truncates beyond this size, so when
-    // adding push fields make sure the buffer is still big enough --
-    // a too-small buffer manifests as the last fields being all-zero
-    // (or pre-existing garbage) at runtime. Mirrors the Metal-side
-    // push_buf_ sizing rationale in MetalDevice.h.
-    std::uint8_t   push_buf_[2048] {};
+    // Sized by pt::rhi::kMaxPushConstantBytes, shared with the Metal
+    // backend and static_asserted against sizeof(PtPush) in Engine.cpp.
+    // See the rationale on that constant: this array and Metal's were two
+    // independent 2048s, and #300 overflowed both at once with no error on
+    // either. PushConstants() also logs when it truncates now.
+    //
+    // NOTE this is a different budget from kFrameUboSize below. This one
+    // caps the WHOLE PtPush; kFrameUboSize caps only the spilled tail
+    // (sizeof - 112). Both have to be big enough.
+    std::uint8_t   push_buf_[pt::rhi::kMaxPushConstantBytes] {};
     std::size_t    push_size_ = 0;
 };
 

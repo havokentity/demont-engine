@@ -269,7 +269,22 @@ void MetalCommandBuffer::BindAccelStruct(std::uint32_t slot, AccelStructHandle a
     if (slot < std::size(bound_accel_)) bound_accel_[slot] = a;
 }
 void MetalCommandBuffer::PushConstants(const void* data, std::size_t size) {
-    if (size > sizeof(push_buf_)) size = sizeof(push_buf_);
+    if (size > sizeof(push_buf_)) {
+        // ONCE, not every dispatch -- but never silently. Engine.cpp's
+        // static_assert should make this unreachable; it is here because
+        // the previous version of this line dropped the tail without a
+        // word and that shipped three times (#21, #24, #300).
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LOG_ERROR("Metal: push constants are {} bytes but the staging "
+                      "buffer is {} -- the last {} bytes will NOT reach the "
+                      "GPU and those fields will read zero. Bump "
+                      "pt::rhi::kMaxPushConstantBytes.",
+                      size, sizeof(push_buf_), size - sizeof(push_buf_));
+        }
+        size = sizeof(push_buf_);
+    }
     std::memcpy(push_buf_, data, size);
     push_size_ = size;
 }
