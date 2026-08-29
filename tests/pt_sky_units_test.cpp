@@ -675,3 +675,268 @@ TEST_CASE("procSky reads the cooked palette rather than authored literals") {
     CHECK(CountOccurrences(pt,
         "if (uint(sun_and_mode.w) == 2u && !primary_hit) march_ray = false;") == 1);
 }
+
+// ===========================================================================
+// 5.  THE SKY FROM ORBIT (#306)
+// ===========================================================================
+//
+// #306's acceptance asks for three things a picture cannot check, and one it
+// can check only by being wrong in a way that looks right:
+//
+//   * space is black,
+//   * the disc carries aerial perspective and a limb,
+//   * and the from-orbit multiple-scattering magnitude is CHARACTERISED
+//     against published whole-disc Earth radiance rather than adjusted until
+//     the frame looks plausible.
+//
+// The last one is the reason these live here rather than in a golden. #306
+// records the from-orbit multi-scatter term as 3.9x / 2.5x / 1.6x over
+// single scattering in R/G/B. Measured below on the host mirror of
+// skyPhysical it is 1.195 / 1.250 / 1.415 -- a third the size, and ordered
+// the OTHER WAY (rising with wavelength, not falling). Both facts are
+// asserted, because a term that is merely "large" is consistent with the
+// reported figure and with the measured one, and only the ordering
+// separates them.
+//
+// The ordering is the physics: the second order goes as sigma_s squared
+// against the first order's sigma_s, so the enhancement tracks optical
+// depth, and the vertical column optical depth measured here is
+// (0.066, 0.147, 0.276) -- monotonically increasing to the blue. A term
+// that fell from red to blue would be a term that is not multiple
+// scattering.
+
+namespace {
+
+// The sub-solar nadir geometry: observer straight above the sub-solar
+// point looking straight down, sun at the zenith behind them. Phase angle
+// zero -- which is also, to within a few degrees, how DSCOVR/EPIC sees the
+// whole disc from L1.
+void NadirColumn(const pt::atmo::Body& b, const float* lut, double obs_alt,
+                 int steps, double out[3]) {
+    const double centre[3] = {0.0, 0.0, 0.0};
+    const double ro[3]     = {0.0, b.ground_radius + obs_alt, 0.0};
+    const double rd[3]     = {0.0, -1.0, 0.0};
+    const double sun[3]    = {0.0, 1.0, 0.0};
+    pt::atmo::SkyRadiance(b, lut, ro, rd, centre, sun, steps, b.mie_g, true,
+                          out, 1.0);
+}
+
+// A ray from orbit tilted `frac` of the way to the body's angular radius.
+// frac > 1 misses the body entirely: that is space.
+void OrbitRay(const pt::atmo::Body& b, const float* lut, double obs_alt,
+              double frac, int steps, double out[3]) {
+    const double centre[3] = {0.0, 0.0, 0.0};
+    const double r         = b.ground_radius + obs_alt;
+    const double ro[3]     = {0.0, r, 0.0};
+    const double ang       = std::asin(b.ground_radius / r);
+    const double th        = ang * frac;
+    const double rd[3]     = {std::sin(th), -std::cos(th), 0.0};
+    const double sun[3]    = {0.0, 1.0, 0.0};
+    pt::atmo::SkyRadiance(b, lut, ro, rd, centre, sun, steps, b.mie_g, true,
+                          out, 1.0);
+}
+
+constexpr double kLeoAlt   = 400000.0;      // orbital_limb's altitude
+constexpr double kHighAlt  = 30000000.0;    // planet_land_orbit's altitude
+
+}  // namespace
+
+TEST_CASE("space is black, and the limb is not") {
+    const pt::atmo::Body b = RefBody();
+    const std::vector<float> lut = BuildLut(b);
+
+    // BEYOND THE LIMB THERE IS NOTHING. Not "small" -- the march has no
+    // shell to integrate, so the result is an exact zero. #306's symptom
+    // was a ground-observer DOME being evaluated from 30 000 km, which
+    // paints its zenith colour over every direction including the ones
+    // pointing away from the planet, so this is the assertion that
+    // separates "an integral that ran out of medium" from "a function of
+    // view direction that does not know where the observer is".
+    for (double frac : {1.02, 1.10, 2.0, 5.0}) {
+        double space[3];
+        OrbitRay(b, lut.data(), kHighAlt, frac, 512, space);
+        INFO("frac = ", frac);
+        CHECK(space[0] == 0.0);
+        CHECK(space[1] == 0.0);
+        CHECK(space[2] == 0.0);
+    }
+
+    // AND THERE IS A LIMB. A ray grazing the body traverses a far longer
+    // chord of air than one going straight down, so it must be brighter --
+    // and brighter in every channel, because the extra path is scattering,
+    // not a tint. Measured: nadir (2.38, 6.63, 17.20) against tangent
+    // (27.5, 33.6, 56.0), i.e. 11.5x / 5.1x / 3.3x.
+    double nadir[3], graze[3];
+    NadirColumn(b, lut.data(), kHighAlt, 512, nadir);
+    OrbitRay(b, lut.data(), kHighAlt, 1.0, 512, graze);
+    for (int i = 0; i < 3; ++i) {
+        INFO("channel ", i, " nadir ", nadir[i], " graze ", graze[i]);
+        CHECK(graze[i] > nadir[i] * 2.0);
+    }
+    // The limb REDDENS relative to the disc: the long grazing chord has
+    // enough optical depth to extinguish blue preferentially, which is the
+    // same physics as a sunset and the opposite of the disc's own colour.
+    // A limb that stayed bluer than the disc would mean the extinction
+    // half of the integral was missing.
+    CHECK(graze[0] / nadir[0] > graze[2] / nadir[2]);
+}
+
+TEST_CASE("the column is the same air from 400 km and from 30,000 km") {
+    // #306's OTHER half: the transition from the surface to orbit has to be
+    // continuous, with no altitude at which anything switches. The march is
+    // clipped to the atmosphere shell rather than to a fixed distance, so
+    // it spends its samples on the SAME air wherever the camera is -- and
+    // that is checkable as an equality rather than as an absence of
+    // popping.
+    //
+    // This is the property the 60 km cap destroyed for the dome modes: from
+    // 30 000 km the first 60 km of the ray is vacuum, so the capped march
+    // integrated nothing at all. Two altitudes 75x apart agreeing to a part
+    // in 10^4 is that cap being gone.
+    const pt::atmo::Body b = RefBody();
+    const std::vector<float> lut = BuildLut(b);
+
+    double leo[3], high[3];
+    NadirColumn(b, lut.data(), kLeoAlt,  512, leo);
+    NadirColumn(b, lut.data(), kHighAlt, 512, high);
+    for (int i = 0; i < 3; ++i) {
+        REQUIRE(leo[i] > 0.0);
+        const double rel = std::fabs(high[i] - leo[i]) / leo[i];
+        INFO("channel ", i, " LEO ", leo[i], " high ", high[i], " rel ", rel);
+        CHECK(rel < 1.0e-4);
+    }
+}
+
+TEST_CASE("the from-orbit multi-scatter term is characterised, not tuned") {
+    const pt::atmo::Body b = RefBody();
+    const std::vector<float> lut = BuildLut(b);
+
+    double with[3], without[3];
+    NadirColumn(b, lut.data(), kHighAlt, 512, with);
+    NadirColumn(b, nullptr,    kHighAlt, 512, without);
+
+    double ratio[3];
+    for (int i = 0; i < 3; ++i) {
+        REQUIRE(without[i] > 0.0);
+        ratio[i] = with[i] / without[i];
+        INFO("channel ", i, " MS/SS = ", ratio[i]);
+    }
+
+    // BAND, NOT A FLOOR -- same discipline as the ground-level case above.
+    // 1.0 is the feature deleted. Measured 1.195 / 1.250 / 1.415; the band
+    // is generous enough to survive quadrature changes and tight enough to
+    // exclude #306's reported 3.9 / 2.5 / 1.6 in every channel.
+    CHECK(ratio[0] > 1.05);  CHECK(ratio[0] < 1.45);
+    CHECK(ratio[1] > 1.10);  CHECK(ratio[1] < 1.55);
+    CHECK(ratio[2] > 1.20);  CHECK(ratio[2] < 1.75);
+
+    // THE ORDERING IS THE CLAIM. Multiple scattering tracks optical depth,
+    // which rises to the blue, so the enhancement must rise to the blue
+    // too. #306 reports it FALLING (3.9 red down to 1.6 blue); that shape
+    // is what a procedural-dome-to-physical MODE SWITCH looks like -- the
+    // painted dome is very blue, so replacing it lifts red far more than
+    // blue -- and it is not what the multiple-scattering term does.
+    // Asserted as a strict ordering because it is the one test the
+    // reported figure fails on sign rather than on size.
+    CHECK(ratio[0] < ratio[1]);
+    CHECK(ratio[1] < ratio[2]);
+}
+
+TEST_CASE("the ground bounce is most of the red multi-scatter term") {
+    // #306 infers from an r_sky_ground_albedo 0 ablation moving "only 3-7%"
+    // that the from-orbit magnitude is "the multi-scatter term proper, not
+    // the ground bounce". That inference does not survive being measured
+    // against the TERM instead of against the whole frame: 3-7% of a frame
+    // whose disc is dominated by directly-reflected sunlight is a large
+    // fraction of the comparatively small in-scatter it sits on.
+    //
+    // Measured share of the multi-scatter term attributable to the ground
+    // bounce, at 30 000 km nadir: 67.9% / 48.2% / 26.1% in R/G/B. So in the
+    // red channel -- the one #306 reports as most inflated -- the ground
+    // bounce is the MAJORITY of the term.
+    const pt::atmo::Body b = RefBody();
+    const std::vector<float> lut_a = BuildLut(b, 0.10);   // r_sky_ground_albedo default
+    const std::vector<float> lut_0 = BuildLut(b, 0.00);   // the ablation
+
+    double with[3], black_ground[3], no_ms[3];
+    NadirColumn(b, lut_a.data(), kHighAlt, 512, with);
+    NadirColumn(b, lut_0.data(), kHighAlt, 512, black_ground);
+    NadirColumn(b, nullptr,      kHighAlt, 512, no_ms);
+
+    for (int i = 0; i < 3; ++i) {
+        const double term  = with[i] - no_ms[i];
+        REQUIRE(term > 0.0);
+        const double share = (with[i] - black_ground[i]) / term;
+        INFO("channel ", i, " ground-bounce share of MS term = ", share);
+        CHECK(share > 0.15);
+        CHECK(share < 0.80);
+    }
+    // And it matters MOST in the red, because that is the channel with the
+    // least molecular scattering of its own to rescatter.
+    const double share_r = (with[0] - black_ground[0]) / (with[0] - no_ms[0]);
+    const double share_b = (with[2] - black_ground[2]) / (with[2] - no_ms[2]);
+    CHECK(share_r > share_b);
+}
+
+TEST_CASE("from-orbit clear-sky reflectance matches the published atmosphere") {
+    // THE CHARACTERISATION #306 ASKS FOR.
+    //
+    // The engine's from-orbit radiance is turned into a REFLECTANCE, which
+    // is the quantity the published measurements report and the only one
+    // that can be compared without adopting the engine's own exposure.
+    //
+    //   rho = pi * L / E
+    //
+    // Anchors, both from CERES EBAF Ed4.x as summarised by NCAR's Climate
+    // Data Guide: Earth intercepts a global-mean 340.2 W/m^2 and reflects
+    // 99 W/m^2, an all-sky planetary (Bond) albedo of 0.291.
+    //
+    // What is modelled here is NOT that number, and the test refuses to
+    // pretend otherwise. This is a CLEAR-SKY, BLACK-GROUND column: no
+    // clouds, and no surface term at all, because SkyRadiance returns only
+    // the atmosphere's own in-scatter. Roughly two thirds of Earth's albedo
+    // is cloud, so the right comparison is against the atmospheric path
+    // reflectance over a dark surface -- the Rayleigh contribution alone,
+    // which for a sub-solar nadir view is a few per cent broadband.
+    //
+    // Measured: 0.0605 broadband (0.0449 single-scatter only), per-channel
+    // (0.0195, 0.0433, 0.1088). The band below brackets that against the
+    // published clear-sky Rayleigh path reflectance and, as a hard ceiling,
+    // against CERES's all-sky 0.291 -- a cloud-free Rayleigh atmosphere
+    // over a black ground that reflected as much as the real cloudy planet
+    // would be unphysical by construction.
+    const pt::atmo::Body b = RefBody();
+    const std::vector<float> lut = BuildLut(b);
+
+    double L[3];
+    NadirColumn(b, lut.data(), kHighAlt, 512, L);
+
+    const double E[3] = {pt::atmo::kSolarIrradianceR,
+                         pt::atmo::kSolarIrradianceG,
+                         pt::atmo::kSolarIrradianceB};
+    double sumL = 0.0, sumE = 0.0;
+    for (int i = 0; i < 3; ++i) { sumL += L[i]; sumE += E[i]; }
+    const double rho_broadband = 3.14159265358979 * sumL / sumE;
+    INFO("broadband clear-sky nadir reflectance = ", rho_broadband);
+
+    // The published clear-sky Rayleigh path reflectance at this geometry is
+    // a few per cent. Below 2% would mean the column had been largely
+    // deleted; above 12% would mean it was scattering like a cloud deck.
+    CHECK(rho_broadband > 0.02);
+    CHECK(rho_broadband < 0.12);
+
+    // Hard ceiling: far below the real planet's all-sky 0.291, because the
+    // clouds and the ocean's water-leaving radiance that make up most of it
+    // are not in this column. (The latter is #305, still open at the time
+    // this was written -- so a future rise here toward 0.291 is expected
+    // and is NOT a regression of this case.)
+    CHECK(rho_broadband < 0.291);
+
+    // Per-channel, the reflectance must RISE to the blue, and by roughly
+    // the ratio the column optical depths do -- (0.066, 0.147, 0.276).
+    // A grey result would mean the wavelength dependence had been lost.
+    const double rho_r = 3.14159265358979 * L[0] / E[0];
+    const double rho_b = 3.14159265358979 * L[2] / E[2];
+    CHECK(rho_b > rho_r * 3.0);
+    CHECK(rho_b < rho_r * 9.0);
+}
