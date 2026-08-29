@@ -280,6 +280,72 @@ double OpticalBlackDepth(const glm::dvec3& extinction) noexcept;
 //     against the local vertical, not the wave normal, because the medium
 //     is stratified in depth. The refraction itself uses the wave normal.
 
+// --- 5.4 THE ATTENUATION THAT GOVERNS A REFLECTANCE ------------------------
+//
+// Equation (1) is written with a beam attenuation. WHICH one is the single
+// most consequential choice in the whole transport, and getting it wrong is
+// not a small error: measured against Gordon et al. (1988)'s Monte-Carlo-
+// fitted semi-analytic model, using the full c = a + b puts the engine a
+// factor of FOUR below the published reflectance as soon as any particulate
+// load is present, because it charges the reflectance for every
+// forward-scattered photon as if that photon were lost.
+//
+// It is not lost. A photon scattered 10 degrees off a downward beam is
+// still going down; a photon scattered 10 degrees off an upwelling ray
+// still reaches the sensor. What removes a photon from the reflectance is
+// BACKSCATTERING, and the attenuation that governs the diffuse field is
+// therefore
+//
+//     c_eff = a + b_b                                                   (3)
+//
+// This is the quasi-single-scattering approximation -- H. R. Gordon,
+// "Simple calculation of the diffuse reflectance of the ocean", Applied
+// Optics 12(12), 2803-2804 (1973) -- and it is why ocean optics quotes
+// K_d ~ (a + b_b)/mu rather than c/mu. Substituting (3) into (1) brings
+// the engine to within 0.5% of Gordon's published relation for pure
+// seawater in the blue; the strict single-scattering form is 14% low there
+// and 4x low at an open-ocean particle load. Measured in
+// tests/pt_water_optics_test.cpp, both ways, so the choice is a
+// measurement and not an assertion.
+//
+// THE SAME c_eff GOES INTO THE SUBMERGED MARCH. It has to: a camera just
+// above and just below the surface would otherwise disagree by 31% in the
+// blue across an interface where the only physical discontinuity is the
+// (1 - F)/n^2 of the interface itself.
+//
+// b_b IS DERIVED FROM THE PHASE FUNCTIONS ALREADY IN USE, not tabulated.
+// The Rayleigh-with-depolarisation phase function is even in cos(theta),
+// so its backscatter fraction is EXACTLY 1/2 for every depolarisation
+// ratio. Henyey-Greenstein integrates in closed form to
+//
+//     B(g) = (1 - g) / (2 g) * [ (1 + g)/sqrt(1 + g^2) - 1 ]            (4)
+//
+// which at the Petzold asymmetry g = 0.924 is 0.016989 -- against the
+// 0.018 that Petzold's measured "average particle" volume scattering
+// function actually integrates to (Mobley, Light and Water, table 3.10),
+// a 6% agreement that is a check on the HG summary rather than a
+// coincidence.
+
+// Backscatter fraction of the depolarised Rayleigh phase function.
+// Exactly 1/2, for every depolarisation ratio, because the phase function
+// is even in cos(theta). Returned as a function rather than a constant so
+// the property is stated where it is used.
+double RayleighDepolarisedBackscatterFraction(double depolarisation) noexcept;
+// Backscatter fraction of Henyey-Greenstein, equation (4).
+double HenyeyGreensteinBackscatterFraction(double g) noexcept;
+// b_b, 1/m: the backscattering coefficient of the engine's two-species
+// medium.
+glm::dvec3 BackscatteringCoefficient(const glm::dvec3& b_molecular,
+                                     double b_particulate,
+                                     double depolarisation,
+                                     double petzold_g) noexcept;
+// c_eff = a + b_b, equation (3), 1/m.
+glm::dvec3 EffectiveAttenuation(const glm::dvec3& absorption,
+                                const glm::dvec3& b_molecular,
+                                double b_particulate,
+                                double depolarisation,
+                                double petzold_g) noexcept;
+
 // The refraction geometry a single-scatter evaluation needs, all cosines
 // against the local vertical, all angles in radians.
 struct SingleScatterGeometry {
@@ -326,7 +392,9 @@ glm::dvec3 SubsurfaceRrsDeep(const glm::dvec3& absorption,
 glm::dvec3 SubsurfaceRrsSaturationRate(const glm::dvec3& absorption,
                                        const glm::dvec3& b_molecular,
                                        double b_particulate,
-                                       const SingleScatterGeometry& g) noexcept;
+                                       const SingleScatterGeometry& g,
+                                       double depolarisation,
+                                       double petzold_g) noexcept;
 
 // The same integral done the slow way: N stratified steps of the submerged
 // march's integrand along a viewing path of `path_length_m`. This is the

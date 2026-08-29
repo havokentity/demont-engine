@@ -166,6 +166,17 @@ double phaseHG(double mu, double g) {
 glm::dvec3 sigmaA() { return PureWaterAbsorptionRgb(); }
 glm::dvec3 sigmaS() { return PureSeawaterScatteringRgb(); }
 glm::dvec3 sigmaT() { return sigmaA() + sigmaS(); }
+// #305: the attenuation the DIFFUSE terms use -- c_eff = a + b_b, the
+// quasi-single-scattering approximation (Gordon 1973). sigmaT() above is
+// the full beam attenuation, which is what removes light from an
+// image-forming path and is NOT what governs a reflectance. Every march
+// mirror below moved onto this one when the shader did; the two differ by
+// the FORWARD scattering, which is 0 for the molecular species by symmetry
+// and 98.3% of the particulate one.
+glm::dvec3 sigmaEff() {
+    return EffectiveAttenuation(sigmaA(), sigmaS(), 0.0,
+                                kSeawaterDepolarisation, kPetzoldAsymmetry);
+}
 
 // --- shader mirror: the in-scatter march ----------------------------------
 //
@@ -453,11 +464,18 @@ TEST_CASE("pure seawater's single-scatter albedo is why the ocean is blue") {
 
 TEST_CASE("the optical-black depth is derived from whatever water is in force") {
     // Pure seawater: absorption plus BOTH scattering species.
-    const double d_pure = OpticalBlackDepth(sigmaT());
+    const double d_pure = OpticalBlackDepth(sigmaEff());
     CAPTURE(d_pure);
-    CHECK(d_pure == doctest::Approx(404.3).epsilon(1e-3));
+    // #305 MOVED THIS, AND THE MOVE IS THE POINT. The span is derived from
+    // whatever attenuation the march actually uses, and that is now
+    // c_eff = a + b_b (Gordon 1973) rather than the full a + b -- so the
+    // depth at which the least-attenuated channel falls under one 8-bit
+    // level is 483 m rather than 404 m. Nothing about the water changed;
+    // what changed is which of its two attenuation coefficients governs a
+    // diffuse field, and this number moving is the audit trail for that.
+    CHECK(d_pure == doctest::Approx(483.40).epsilon(1e-3));
     // ...and it really is one 8-bit level at that depth, in every channel.
-    const glm::dvec3 t = glm::exp(-sigmaT() * d_pure);
+    const glm::dvec3 t = glm::exp(-sigmaEff() * d_pure);
     CHECK(std::max(t.x, std::max(t.y, t.z)) ==
           doctest::Approx(1.0 / 255.0).epsilon(1e-9));
 
@@ -470,7 +488,9 @@ TEST_CASE("the optical-black depth is derived from whatever water is in force") 
     // Turbid water goes black sooner, monotonically, with no special case.
     double prev = 1e30;
     for (double bp : {0.0, 0.05, 0.1, 0.3, 0.5}) {
-        const double d = OpticalBlackDepth(sigmaT() + glm::dvec3(bp));
+        const double d = OpticalBlackDepth(
+            EffectiveAttenuation(sigmaA(), sigmaS(), bp,
+                                 kSeawaterDepolarisation, kPetzoldAsymmetry));
         CAPTURE(bp);
         CHECK(d < prev);
         prev = d;
@@ -540,7 +560,7 @@ TEST_CASE("the descent to 200 m is continuous, by refinement") {
     // The bar is 0.6 rather than the ideal 0.5 for #260's reason: the
     // location of the maximum moves between refinements, so the halved
     // ladder does not sample the same worst point.
-    const glm::dvec3 st = sigmaT();
+    const glm::dvec3 st = sigmaEff();
     const glm::dvec3 ss = sigmaS();
     // Sun 60 degrees up, refracted into the water: 30 degrees from the
     // zenith in air becomes asin(sin 30 / 1.33) = 22.08 degrees below.
@@ -620,7 +640,16 @@ TEST_CASE("the descent to 200 m is continuous, by refinement") {
 }
 
 TEST_CASE("the descent darkens, and the in-scatter is what keeps it water") {
-    const glm::dvec3 st = sigmaT();
+    // TWO ATTENUATIONS, AND #305 IS WHY THEY ARE SPELLED SEPARATELY HERE.
+    // The TRANSMITTED half -- the sky seen through the column, an
+    // image-forming path -- loses every photon that scatters out of the
+    // line of sight, so it attenuates with the full beam coefficient
+    // c = a + b. The IN-SCATTERED half is a diffuse field, and a photon
+    // scattered forward is still in it, so it attenuates with
+    // c_eff = a + b_b. Before #305 both used c, which is what made a
+    // particle-laden column render four times too dark.
+    const glm::dvec3 st = sigmaT();       // transmitted: the full beam
+    const glm::dvec3 se = sigmaEff();     // in-scattered: a + b_b
     const glm::dvec3 ss = sigmaS();
     const double cos_w = std::cos(std::asin(std::sin(30.0 * kPi / 180.0) / 1.33));
     const double phase = RayleighDepolarisedPhase(cos_w, kSeawaterDepolarisation);
@@ -630,7 +659,7 @@ TEST_CASE("the descent darkens, and the in-scatter is what keeps it water") {
         for (int c = 0; c < 3; ++c) {
             out[c] = 1.0 * std::exp(-st[c] * depth);
             if (with_inscatter) {
-                out[c] += 80.0 * marchClosedForm(ss[c] * phase, st[c], depth,
+                out[c] += 80.0 * marchClosedForm(ss[c] * phase, se[c], depth,
                                                  cos_w, depth);
             }
         }
@@ -657,24 +686,24 @@ TEST_CASE("the descent darkens, and the in-scatter is what keeps it water") {
     // in-scatter out, which is the state #261 is fixing.
     glm::dvec3 peak_depth(0.0);
     for (int c = 0; c < 3; ++c) {
-        peak_depth[c] = std::log(1.0 / cos_w) / (st[c] * (1.0 / cos_w - 1.0));
+        peak_depth[c] = std::log(1.0 / cos_w) / (se[c] * (1.0 / cos_w - 1.0));
     }
     CAPTURE(peak_depth.x); CAPTURE(peak_depth.y); CAPTURE(peak_depth.z);
     // And the separation between the three peaks is "red first, blue last"
     // said a second way: red's glow is over by 3.5 m, blue's peaks at 70.
     CHECK(peak_depth.x == doctest::Approx(3.48).epsilon(1e-2));
-    CHECK(peak_depth.y == doctest::Approx(16.5).epsilon(1e-2));
-    CHECK(peak_depth.z == doctest::Approx(70.2).epsilon(1e-2));
+    CHECK(peak_depth.y == doctest::Approx(16.75).epsilon(1e-2));
+    CHECK(peak_depth.z == doctest::Approx(83.96).epsilon(1e-2));
     CHECK(peak_depth.z / peak_depth.x > 19.0);
 
     // Verify the derived peak against the function itself: each channel's
     // in-scatter really does turn over there, to within the sampling.
     for (int c = 0; c < 3; ++c) {
         const double dpk = peak_depth[c];
-        const double at   = marchClosedForm(ss[c] * phase, st[c], dpk, cos_w, dpk);
-        const double before = marchClosedForm(ss[c] * phase, st[c], dpk * 0.9,
+        const double at   = marchClosedForm(ss[c] * phase, se[c], dpk, cos_w, dpk);
+        const double before = marchClosedForm(ss[c] * phase, se[c], dpk * 0.9,
                                               cos_w, dpk * 0.9);
-        const double after  = marchClosedForm(ss[c] * phase, st[c], dpk * 1.1,
+        const double after  = marchClosedForm(ss[c] * phase, se[c], dpk * 1.1,
                                               cos_w, dpk * 1.1);
         CAPTURE(c);
         CHECK(at > before);
@@ -723,6 +752,9 @@ TEST_CASE("the descent darkens, and the in-scatter is what keeps it water") {
     // Where it IS over, for this water: the derived optical-black depth.
     CHECK(observed(OpticalBlackDepth(st), false).z <=
           doctest::Approx(1.0 / 255.0));
+    // ...and the DIFFUSE field survives deeper than the image-forming one,
+    // by exactly the forward-scattering the reflectance does not lose.
+    CHECK(OpticalBlackDepth(se) > OpticalBlackDepth(st));
 
     // THE ABLATION, ASSERTED ON CONTENT AND NOT ON "IT CHANGED". An
     // underwater frame is already dark, so "the picture differs with the
@@ -772,7 +804,7 @@ TEST_CASE("the in-scatter march converges to the closed form, second order") {
     // second order, and the error QUARTERS per doubling. A first-order rule
     // would only halve, so this ladder distinguishes the two without any
     // threshold being chosen.
-    const glm::dvec3 st = sigmaT();
+    const glm::dvec3 st = sigmaEff();
     const glm::dvec3 ss = sigmaS();
     const double cos_w = std::cos(std::asin(std::sin(30.0 * kPi / 180.0) / 1.33));
     const double phase = RayleighDepolarisedPhase(cos_w, kSeawaterDepolarisation);
@@ -824,7 +856,7 @@ TEST_CASE("the quadrature is not what sets the sample count, and that is measure
     // is a ratio of two numbers around e^-120 -- meaningless, and it is
     // what a naive relative bound would spend the whole sample budget
     // chasing.
-    const glm::dvec3 st = sigmaT();
+    const glm::dvec3 st = sigmaEff();
     const glm::dvec3 ss = sigmaS();
     const double cos_w = std::cos(std::asin(std::sin(30.0 * kPi / 180.0) / 1.33));
     const double phase = RayleighDepolarisedPhase(cos_w, kSeawaterDepolarisation);
@@ -1191,8 +1223,11 @@ TEST_CASE("shader and engine mirrors are still faithful") {
     CHECK(countOf(pt, "float3sun_jit=sampleSunDisc(sun_w,seed);") == 1u);
     // Extinction is absorption PLUS both scattering species.
     CHECK(countOf(pt,
-                  "float3sigma_t=max(water_params0.xyz,float3(0.0))+sigma_s;")
-          == 1u);
+                  "float3sigma_t=ptWaterEffAtten();") == 1u);
+    // ...and the pre-#305 spelling, which added BOTH scattering species to
+    // the extinction, must not survive anywhere.
+    CHECK(countOf(pt, "float3sigma_t=max(water_params0.xyz,float3(0.0))+sigma_s;")
+          == 0u);
 
     // --- the ambient gate ------------------------------------------------
     // skyColorBase must be attenuated when the stack says water, and the

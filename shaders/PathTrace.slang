@@ -2189,6 +2189,63 @@ uint ptMediumCross(uint s, uint id) {
     return (ptMediumTop(s) == id) ? ptMediumPop(s) : ptMediumEnter(s, id);
 }
 
+// --- #305: the attenuation that governs a REFLECTANCE ----------------------
+//
+// Which attenuation coefficient a water term uses is the single most
+// consequential choice in this medium, and the engine has three different
+// answers to it living in three places. This function is the one the
+// DIFFUSE terms share.
+//
+// The full beam attenuation c = a + b is what removes light from an
+// IMAGE-FORMING path: a photon scattered out of the line of sight no longer
+// contributes to the sea floor's silhouette, which is why water is hazy.
+// It is NOT what removes light from a reflectance. A photon scattered 10
+// degrees off a downward beam is still going down; one scattered 10 degrees
+// off an upwelling ray still reaches the sensor. What removes a photon from
+// the upwelling stream is BACKSCATTERING, so the attenuation that governs
+// the in-scattered field is
+//
+//     c_eff = a + b_b
+//
+// the quasi-single-scattering approximation (H. R. Gordon, "Simple
+// calculation of the diffuse reflectance of the ocean", Applied Optics
+// 12(12), 2803-2804, 1973), and it is why ocean optics writes K_d ~
+// (a + b_b)/mu rather than c/mu. MEASURED, in
+// tests/pt_water_optics_test.cpp: against Gordon et al. 1988's published
+// r_rs = 0.0949 X + 0.0794 X^2, c_eff puts the engine within 0.5% in the
+// blue for pure seawater, where the full c is 14% low -- and at an
+// open-ocean particle load the full c is FOUR TIMES low, because it
+// charges the reflectance for every forward-scattered photon as if that
+// photon were lost.
+//
+// b_b IS DERIVED FROM THE PHASE FUNCTIONS ALREADY IN USE. The Rayleigh-
+// with-depolarisation phase function is even in cos(theta), so its
+// backscatter fraction is EXACTLY 1/2 whatever the depolarisation ratio --
+// which is the same 1/2 that Smith & Baker 1981 and Morel & Maritorena
+// 2001 eq. (11) hard-code for pure seawater. Henyey-Greenstein integrates
+// in closed form to B(g) = (1-g)/(2g) [(1+g)/sqrt(1+g^2) - 1], which at
+// the Petzold asymmetry 0.924 is 0.016989 against the 0.018 the measured
+// Petzold volume scattering function itself integrates to.
+//
+// Mirrored by pt::water::EffectiveAttenuation in src/physics/WaterOptics.h.
+float3 ptWaterBackscatter(float3 b_mol, float b_par, float g) {
+    float B_hg = (abs(g) < 1e-6)
+                     ? 0.5
+                     : (1.0 - g) / (2.0 * g)
+                           * ((1.0 + g) / sqrt(1.0 + g * g) - 1.0);
+    return max(b_mol, float3(0.0)) * 0.5
+         + float3(max(b_par, 0.0) * B_hg);
+}
+
+// c_eff for whatever water is in force this frame. Reads the push fields
+// directly so no call site can pass a stale triple.
+float3 ptWaterEffAtten() {
+    return max(water_params0.xyz, float3(0.0))
+         + ptWaterBackscatter(water_scatter.xyz, water_scatter.w,
+                              clamp(water_scatter2.x, -0.99, 0.99));
+}
+// --- end #305 --------------------------------------------------------------
+
 // NO ptMediumIor HERE, DELIBERATELY. The obvious companion to this stack is
 // a lookup that returns the refractive index of whatever medium is on top,
 // so the refract branches can stop assuming the far side of an interface is
@@ -6775,7 +6832,19 @@ float3 transmittance(float3 ro, float3 rd, float t_max, float shutter_t01,
         // up to the hit, or up to t_max on the final unoccluded leg.
         if (ptMediumIsWater(sr_medium)) {
             float seg = h.hit ? min(h.t, t_max) : t_max;
-            t *= exp(-water_params0.xyz * max(seg, 0.0));
+            // #305: c_eff, not the bare absorption. This function carries
+            // ILLUMINATION through the water -- the sun to a sea floor, the
+            // sun to an in-scatter sample -- and the coefficient that
+            // attenuates a diffuse downwelling stream is a + b_b, not a
+            // alone (which loses the backscattered light entirely) and not
+            // a + b (which loses the forward-scattered light that is still
+            // travelling downward). Absorption alone was the pre-#305
+            // spelling; it is a + b_b now, which is the same law the
+            // in-scatter march and the water-leaving closed form use, and
+            // that shared law is what makes a camera just above and just
+            // below the surface agree instead of disagreeing by 11% in the
+            // blue. See ptWaterEffAtten.
+            t *= exp(-ptWaterEffAtten() * max(seg, 0.0));
         }
 #endif
         if (!h.hit || h.t >= t_max) return t * cloud_t;     // unoccluded
@@ -9464,9 +9533,10 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                 float3 s_mol = max(water_scatter.xyz,
                                                    float3(0.0));
                                 float  s_par = max(water_scatter.w, 0.0);
-                                float3 sig_t = max(water_params0.xyz,
-                                                   float3(0.0))
-                                             + s_mol + float3(s_par);
+                                // c_eff = a + b_b (Gordon 1973), the same
+                                // law transmittance() and the submerged
+                                // march use. See ptWaterEffAtten.
+                                float3 sig_t = ptWaterEffAtten();
                                 float  g_p   = clamp(water_scatter2.x,
                                                      -0.99, 0.99);
                                 float  dpol  = clamp(water_scatter2.w,
@@ -10604,7 +10674,14 @@ void main(uint2 tid : SV_DispatchThreadID) {
             // air march learned this the hard way (#257): using scattering
             // as extinction lets the column transmit more light than it
             // physically can.
-            float3 sigma_t = max(water_params0.xyz, float3(0.0)) + sigma_s;
+            // #305: the attenuation of the in-scattered field is c_eff =
+            // a + b_b, not a + b. The pre-#305 line added BOTH scattering
+            // species to the extinction, which charges the glow for every
+            // forward-scattered photon -- and Petzold particulates are
+            // 98.3% forward, so a coastal column went four times too dark.
+            // Same law as transmittance() above and as the water-leaving
+            // closed form at the MAT_WATER interface, which is the point.
+            float3 sigma_t = ptWaterEffAtten();
             float  sigma_t_lo = min(sigma_t.r, min(sigma_t.g, sigma_t.b));
             if (any(sigma_s > float3(0.0)) && sigma_t_lo > 0.0) {
                 // ln(255): one 8-bit level. Mirrors

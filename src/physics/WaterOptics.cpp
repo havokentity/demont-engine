@@ -183,15 +183,44 @@ glm::dvec3 VolumeScatteringFunction(const glm::dvec3& b_molecular,
     return b_molecular * p_mol + glm::dvec3(std::max(b_particulate, 0.0) * p_par);
 }
 
-namespace {
-glm::dvec3 Extinction(const glm::dvec3& absorption,
-                      const glm::dvec3& b_molecular,
-                      double b_particulate) noexcept {
-    return glm::max(absorption, glm::dvec3(0.0))
-         + glm::max(b_molecular, glm::dvec3(0.0))
-         + glm::dvec3(std::max(b_particulate, 0.0));
+double RayleighDepolarisedBackscatterFraction(double depolarisation) noexcept {
+    // int_{-1}^{0} 2 pi p(mu) dmu with p = (1 + k mu^2) / (4 pi (1 + k/3)).
+    // The mu integral gives (1 + k/3)/2, which cancels the normaliser
+    // exactly -- so this is 1/2 for every k, i.e. for every depolarisation
+    // ratio. Written as the ratio of the two so the cancellation is code
+    // and not a comment.
+    const double k = (1.0 - depolarisation) / (1.0 + depolarisation);
+    return (0.5 * (1.0 + k / 3.0)) / (1.0 + k / 3.0);
 }
-}  // namespace
+
+double HenyeyGreensteinBackscatterFraction(double g) noexcept {
+    // Equation (4). The g -> 0 limit is 1/2 (isotropic), taken explicitly
+    // because the closed form divides by g.
+    const double a = std::fabs(g);
+    if (a < 1e-6) return 0.5;
+    return (1.0 - g) / (2.0 * g) *
+           ((1.0 + g) / std::sqrt(1.0 + g * g) - 1.0);
+}
+
+glm::dvec3 BackscatteringCoefficient(const glm::dvec3& b_molecular,
+                                     double b_particulate,
+                                     double depolarisation,
+                                     double petzold_g) noexcept {
+    return glm::max(b_molecular, glm::dvec3(0.0)) *
+               RayleighDepolarisedBackscatterFraction(depolarisation) +
+           glm::dvec3(std::max(b_particulate, 0.0) *
+                      HenyeyGreensteinBackscatterFraction(petzold_g));
+}
+
+glm::dvec3 EffectiveAttenuation(const glm::dvec3& absorption,
+                                const glm::dvec3& b_molecular,
+                                double b_particulate,
+                                double depolarisation,
+                                double petzold_g) noexcept {
+    return glm::max(absorption, glm::dvec3(0.0)) +
+           BackscatteringCoefficient(b_molecular, b_particulate,
+                                     depolarisation, petzold_g);
+}
 
 glm::dvec3 SubsurfaceRrsDeep(const glm::dvec3& absorption,
                              const glm::dvec3& b_molecular,
@@ -201,7 +230,9 @@ glm::dvec3 SubsurfaceRrsDeep(const glm::dvec3& absorption,
                              double petzold_g) noexcept {
     const glm::dvec3 beta = VolumeScatteringFunction(
         b_molecular, b_particulate, g.cos_scatter, depolarisation, petzold_g);
-    const glm::dvec3 c = Extinction(absorption, b_molecular, b_particulate);
+    const glm::dvec3 c = EffectiveAttenuation(absorption, b_molecular,
+                                              b_particulate, depolarisation,
+                                              petzold_g);
     const double     m = g.mu_sun_water + g.mu_view_water;
     if (!(m > 0.0)) return glm::dvec3(0.0);
     return {c.x > 0.0 ? beta.x / (c.x * m) : 0.0,
@@ -212,8 +243,12 @@ glm::dvec3 SubsurfaceRrsDeep(const glm::dvec3& absorption,
 glm::dvec3 SubsurfaceRrsSaturationRate(const glm::dvec3& absorption,
                                        const glm::dvec3& b_molecular,
                                        double b_particulate,
-                                       const SingleScatterGeometry& g) noexcept {
-    const glm::dvec3 c = Extinction(absorption, b_molecular, b_particulate);
+                                       const SingleScatterGeometry& g,
+                                       double depolarisation,
+                                       double petzold_g) noexcept {
+    const glm::dvec3 c = EffectiveAttenuation(absorption, b_molecular,
+                                              b_particulate, depolarisation,
+                                              petzold_g);
     const double     m = g.mu_sun_water + g.mu_view_water;
     if (!(g.mu_sun_water > 0.0)) return glm::dvec3(0.0);
     return c * (m / g.mu_sun_water);
@@ -236,7 +271,9 @@ glm::dvec3 SubsurfaceRrsMarched(const glm::dvec3& absorption,
     if (!(g.mu_sun_water > 0.0)) return glm::dvec3(0.0);
     const glm::dvec3 beta = VolumeScatteringFunction(
         b_molecular, b_particulate, g.cos_scatter, depolarisation, petzold_g);
-    const glm::dvec3 c  = Extinction(absorption, b_molecular, b_particulate);
+    const glm::dvec3 c  = EffectiveAttenuation(absorption, b_molecular,
+                                               b_particulate, depolarisation,
+                                               petzold_g);
     const double     dt = path_length_m / static_cast<double>(samples);
     glm::dvec3 sum(0.0);
     for (int i = 0; i < samples; ++i) {
