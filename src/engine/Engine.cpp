@@ -2188,12 +2188,42 @@ namespace cvar {
             "where the continuation reads the real local relief per point.",
             CVAR_ARCHIVE);
     PT_CVAR(r_planet_snowline,       "4900",
-            "Snowline altitude in metres at the equator, scaled by "
-            "cos(site latitude). A SHADING parameter, not a physical model: "
-            "the regional snowline is ~4 900 m in the tropics (Kaser & "
-            "Osmaston, Tropical Glaciers, 2002) and falls toward sea level "
-            "at high latitude. It selects an albedo and never touches "
-            "geometry; real land cover belongs to a later phase.",
+            "Snowline altitude in metres AT THE EQUATOR -- the anchor for "
+            "the latitude model, not the snowline itself. 4 900 m is the "
+            "measured tropical equilibrium-line altitude (Kaser & Osmaston, "
+            "Tropical Glaciers, CUP 2002). Land cover (#300) replaced the "
+            "old `anchor * cos(site latitude)` with a freezing-level model: "
+            "the zonal-mean surface temperature (North, Cahalan & Coakley "
+            "1981, Rev. Geophys. 19:91) plus half the annual range, divided "
+            "by the 6.5 K/km environmental lapse rate (ICAO / ISO 2533). "
+            "That halves the mean error against published equilibrium-line "
+            "altitudes at 45/60/80 degrees, and -- the part that matters "
+            "for a planet -- it is evaluated at the SHADED POINT rather "
+            "than at the site, so a globe seen from orbit no longer has one "
+            "snowline everywhere. See src/renderer/Planet/SurfaceAlbedo.h "
+            "for the derivation and the validation table. It selects an "
+            "albedo and never touches geometry.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_planet_albedo_map,     "assets/planet/earth_lite.ptalb",
+            "Path to the surface albedo raster (#300). Empty, or a file "
+            "that will not load, drops the terrain to the PROCEDURAL "
+            "classification and says so once -- which is a body with rock "
+            "and regolith, not Earth. Bake one with "
+            "tools/fetch_planet_albedo.py; the source, its licence and what "
+            "it is NOT are recorded in assets/planet/PROVENANCE.md. "
+            "Deliberately a path and not a bool, because pointing it at a "
+            "different body is how a non-Earth planet gets real land cover "
+            "if a dataset for one ever exists.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_planet_land_albedo,    "1",
+            "Blend from the procedural biome classification (0) to the "
+            "measured albedo raster (1). This is the A/B for #300, not a "
+            "look knob: at 0 the terrain shades exactly as it does with no "
+            "raster loaded, which is what makes the ablation clean. It does "
+            "NOT disable the slope-driven rock exposure or the "
+            "latitude-derived snowline -- those are DEM-driven and apply to "
+            "both paths, because a raster at any resolution cannot know "
+            "that a 40-degree face sheds its soil.",
             CVAR_ARCHIVE);
     PT_CVAR(r_planet_stand_eye,      "-1",
             "Eye height in metres above the TERRAIN at which to place the "
@@ -7285,6 +7315,80 @@ void Engine::EnsureAtmosphereMultiScatterLut() {
              static_cast<double>(key.ground_albedo));
 }
 
+// --- Land cover (#300): the surface albedo raster ---------------------------
+//
+// Load once, upload once, and key the reload on the PATH rather than on a
+// dirty flag anyone can forget to set. The raster is immutable data, so
+// unlike the multiple-scattering LUT there is nothing to rebuild per frame
+// -- the whole function is a no-op after the first call unless
+// r_planet_albedo_map changes.
+void Engine::EnsureLandAlbedoRaster() {
+    if (device_ == nullptr) return;
+    auto& C = pt::console::Console::Get();
+    std::string path;
+    if (auto* v = C.FindCVar("r_planet_albedo_map")) path = v->value;
+
+    if (path == land_albedo_key_ && land_albedo_loaded_) return;
+    land_albedo_key_    = path;
+    land_albedo_loaded_ = true;
+    land_albedo_map_    = pt::planet::SurfaceAlbedoMap{};
+
+    if (path.empty()) {
+        LOG_INFO("planet: no land-cover raster (r_planet_albedo_map is "
+                 "empty) -- terrain uses the procedural classification");
+        return;
+    }
+    // RESOLVE, do not trust the literal. r_planet_albedo_map's default is a
+    // repo-relative path, and the golden matrix runs every cell in its own
+    // working directory (golden_workdir/golden_<stem>/) so that cells cannot
+    // scribble on each other. A relative open therefore fails there and
+    // ONLY there -- the raster silently does not load, the terrain falls to
+    // the procedural classification, and the cell renders exactly the
+    // r_planet_land_albedo 0 ablation while every manual render from the
+    // repo root looks right. That is precisely how this was found: the
+    // golden diff came back bit-for-bit equal to the ablation image.
+    // r_planet_dem has gone through ResolveAssetPath since #258 for the
+    // same reason.
+    const std::string resolved = pt::ResolveAssetPath(path.c_str());
+    std::string err;
+    if (!land_albedo_map_.Load(resolved, err)) {
+        // ONE LOUD LINE, not a silent substitution. The DEM path already
+        // took this position and it is the same argument: a render that
+        // quietly falls back to a procedural body is a render nobody can
+        // tell apart from the real one until they compare coastlines.
+        LOG_WARN("planet: land-cover raster not loaded ({}) -- terrain falls "
+                 "back to the PROCEDURAL classification, so this is not "
+                 "Earth's land cover. Bake it with "
+                 "tools/fetch_planet_albedo.py.", err);
+        return;
+    }
+    const auto& packed = land_albedo_map_.Packed();
+    const std::size_t bytes = packed.size() * sizeof(std::uint32_t);
+    if (land_albedo_buf_id_ == 0) {
+        auto buf = device_->CreateBuffer({
+            .size = bytes,
+            .usage = pt::rhi::BufferUsage::Storage,
+            .debug_name = "land_albedo",
+        });
+        if (buf.id == 0) {
+            LOG_ERROR("planet: land-cover raster buffer allocation failed "
+                      "({} MB)", bytes / (1024.0 * 1024.0));
+            land_albedo_map_ = pt::planet::SurfaceAlbedoMap{};
+            return;
+        }
+        land_albedo_buf_id_ = buf.id;
+    }
+    device_->WriteBuffer(pt::rhi::BufferHandle{land_albedo_buf_id_},
+                         packed.data(), bytes);
+    LOG_INFO("planet: land-cover raster {} -- {}x{}, {:.2f} MB, {}",
+             resolved, land_albedo_map_.Width(), land_albedo_map_.Height(),
+             bytes / (1024.0 * 1024.0),
+             land_albedo_map_.IsMeasuredAlbedo()
+                 ? "MEASURED albedo (MODIS MCD43 per-band)"
+                 : "radiance-derived (see assets/planet/PROVENANCE.md for "
+                   "what that costs)");
+}
+
 void Engine::UpdateWorldFrame() {
     // ========================================================================
     // PLANETARY P1 (#255) -- THE CONVERSION BOUNDARY
@@ -8600,6 +8704,20 @@ void Engine::RenderFrame() {
         ? pt::rhi::BufferHandle{atmo_ms_lut_id_}
         : pt::rhi::BufferHandle{placeholder_storage_id_};
     if (slot21.id != 0) cb->BindBuffer(21, slot21, 0);
+    // --- Land cover (#300): albedo raster (engine slot 22 -> binding 47) ----
+    // ALWAYS bind something, for the reason slots 18..21 already carry: this
+    // is now the last buffer slot AND the last one the backends' 24-entry
+    // tables have room for, so a Metal dispatch that left it unbound would
+    // shift the push-constant slot the parsed layout computes as max+1.
+    //
+    // Unlike slot 21 the placeholder needs no readiness convention of its
+    // own: land_basis_e.w carries the raster width and the host writes 0
+    // when nothing loaded, so the shader never indexes this buffer at all.
+    EnsureLandAlbedoRaster();
+    pt::rhi::BufferHandle slot22 = (land_albedo_buf_id_ != 0)
+        ? pt::rhi::BufferHandle{land_albedo_buf_id_}
+        : pt::rhi::BufferHandle{placeholder_storage_id_};
+    if (slot22.id != 0) cb->BindBuffer(22, slot22, 0);
     // Engine slots 11/12/13 -> vk::bindings 24/25/26: the MetalFX
     // specular-guidance trio (issue #118). Path tracer writes them
     // alongside the existing G-buffers when the write_specular_*_gbuffer
@@ -9378,6 +9496,33 @@ void Engine::RenderFrame() {
         float sky_cook_horizon_sun[4];
         float sky_cook_horizon_anti[4];
         // --- end #280 ----------------------------------------------------
+        // --- Land cover (#300): the site's ECEF basis + raster shape ------
+        // The rotation that turns a world-space radial direction back into
+        // ECEF, where latitude and longitude exist. Rows of
+        // PlanetSite::ecef_to_world -- East, geocentric Up, South -- so the
+        // shader computes ecef = E*w.x + U*w.y + S*w.z, which is
+        // transpose(ecef_to_world) * w written out.
+        //
+        // WITHOUT THIS the shader has no latitude for the point it is
+        // shading, only the SITE's, which is what planet_terrain.x used to
+        // carry folded into a cos(). One number for a whole planet is a
+        // snowline that cannot vary and a raster that cannot be indexed.
+        //
+        //   land_basis_e.w = raster width in texels, 0 = NO RASTER. The
+        //                    single gate; the shader never touches
+        //                    land_albedo when this is 0, which is what
+        //                    makes the placeholder binding safe.
+        //   land_basis_u.w = raster height in texels.
+        //   land_basis_s.w = r_planet_land_albedo, procedural (0) to
+        //                    raster (1).
+        //
+        // Field semantics live on the matching block in PathTrace.slang's
+        // Push / Frame declarations. Pure tail append, so the
+        // SoftwareTracer.cpp byte offsets stay valid.
+        float land_basis_e[4];
+        float land_basis_u[4];
+        float land_basis_s[4];
+        // --- end land cover -----------------------------------------------
     } push{};
     // CONVERSION BOUNDARY (#255). The single source for the eye position
     // every shader sees; the nine per-pass memcpy(x.pos_fovtan, ...)
@@ -10217,23 +10362,66 @@ void Engine::RenderFrame() {
         {
             double snowline = 4900.0;
             if (auto* v = C.FindCVar("r_planet_snowline")) snowline = v->GetFloat();
-            double lat = 0.0;
             std::size_t live = 0;
             bool on = false;
 #if PT_PLANET_ENABLED
             if (terrain_on) {
-                lat  = planet_terrain_->Site().lat_rad;
                 live = planet_terrain_->Stats().resident;
                 on   = true;
             }
 #endif
-            push.planet_terrain[0] =
-                static_cast<float>(snowline * std::max(std::cos(lat), 0.05));
+            // LAND COVER (#300) CHANGES WHAT THIS FIELD MEANS. It used to
+            // be `snowline * cos(site latitude)` -- the site's own latitude,
+            // folded in here on the host, so an entire planet had ONE
+            // snowline and a globe seen from orbit could not have had a
+            // latitude-varying one at all. It now carries the TROPICAL
+            // ANCHOR unscaled, and the shader's ptSnowlineAt() derives the
+            // local value from the SHADED POINT's latitude through the
+            // freezing-level model in src/renderer/Planet/SurfaceAlbedo.h.
+            //
+            // The cvar's docstring did not say "cos", so its name still
+            // describes it; what changed is that the latitude dependence
+            // moved from a shape on the host to a model on the GPU.
+            push.planet_terrain[0] = static_cast<float>(snowline);
             push.planet_terrain[1] = static_cast<float>(live);
             push.planet_terrain[2] = on ? 1.0f : 0.0f;
             push.planet_terrain[3] = 0.0f;
         }
         // --- end Planetary P4 -------------------------------------------
+        // --- Land cover (#300): the site's ECEF basis + raster shape -----
+        // Identity when there is no terrain site: with no planet placed,
+        // world space IS the ellipsoid frame as far as anything here is
+        // concerned, and the raster width of 0 gates the shader off anyway.
+        {
+            glm::dmat3 e2w(1.0);
+#if PT_PLANET_ENABLED
+            if (terrain_on) e2w = planet_terrain_->Site().ecef_to_world;
+#endif
+            // Rows are (East, geocentric Up, South) in ECEF. The shader
+            // computes ecef = E*w.x + U*w.y + S*w.z, i.e.
+            // transpose(ecef_to_world) * w -- so what it needs is the rows,
+            // and glm is column-major, so row r is e2w[c][r].
+            for (int r = 0; r < 3; ++r) {
+                float* dst = (r == 0) ? push.land_basis_e
+                           : (r == 1) ? push.land_basis_u
+                                      : push.land_basis_s;
+                for (int c = 0; c < 3; ++c) {
+                    dst[c] = static_cast<float>(e2w[c][r]);
+                }
+            }
+            float land_gain = 1.0f;
+            if (auto* v = C.FindCVar("r_planet_land_albedo")) {
+                land_gain = std::clamp(v->GetFloat(), 0.0f, 1.0f);
+            }
+            const bool raster_ok =
+                land_albedo_buf_id_ != 0 && !land_albedo_map_.Empty();
+            push.land_basis_e[3] =
+                raster_ok ? static_cast<float>(land_albedo_map_.Width()) : 0.0f;
+            push.land_basis_u[3] =
+                raster_ok ? static_cast<float>(land_albedo_map_.Height()) : 0.0f;
+            push.land_basis_s[3] = land_gain;
+        }
+        // --- end land cover ----------------------------------------------
         // --- Planetary P5 (#259): the planetary ocean -------------------
         // ONE RADIUS, NOT A SECOND SOURCE OF TRUTH. The sea-level radius
         // is planet_R_d -- the same scalar that placed planet_center_radius
@@ -11547,7 +11735,32 @@ void Engine::RenderFrame() {
                           water_scatter2 */
                   + 48 /* #280: sky_cook_zenith + sky_cook_horizon_sun +
                           sky_cook_horizon_anti -- procSky's palette,
-                          integrated on the host instead of authored */);
+                          integrated on the host instead of authored */
+                  + 48 /* Land cover (#300): land_basis_e + land_basis_u +
+                          land_basis_s -- the site's ECEF basis, so the
+                          shader can index a raster and a snowline by the
+                          SHADED POINT's latitude instead of the site's */);
+    // THE WHOLE-STRUCT BUDGET, as opposed to the spilled-tail one below.
+    // Every backend's CommandBuffer::PushConstants copies into a staging
+    // array of pt::rhi::kMaxPushConstantBytes and TRUNCATES past it, so a
+    // PtPush larger than that loses its last fields on every backend at
+    // once -- they read zero, nothing errors, and the feature that added
+    // them simply does not happen. That shipped three times before this
+    // assert existed: mesh motion blur silently failing (#21), clouds
+    // going black (#24), and terrain ignoring its land-cover raster
+    // (#300, which is what finally bought the assert). sizeof(PtPush)
+    // crossed the old 2048 by exactly 16 bytes -- one vec4.
+    //
+    // Note the Vulkan tail check CANNOT catch this: it measures
+    // push_size_ - 112, and a truncated push_size_ makes the tail look
+    // smaller, so the overflow hides from the guard meant to find it.
+    static_assert(sizeof(PtPush) <= pt::rhi::kMaxPushConstantBytes,
+                  "PtPush exceeds pt::rhi::kMaxPushConstantBytes -- every "
+                  "backend's PushConstants() will silently drop the tail and "
+                  "the trailing fields will read zero on the GPU. Bump "
+                  "kMaxPushConstantBytes in src/rhi/Types.h (Metal's setBytes "
+                  "ceiling is 4 KB; past that the push block must become a "
+                  "real buffer).");
     // Raw-byte offsets the SOFTWARE tracer mirrors (SoftwareTracer.cpp:
     // kSunAndModeOffset / kAccumParamsOffset / kTonemapParamsOffset).
     // The CPU backend decodes these fields straight out of the pushed
@@ -11592,12 +11805,14 @@ void Engine::RenderFrame() {
     // P3 (#257) +16 (planet_ground) and P4 (#258) +16 (planet_terrain):
     // tail was 1712 B. Planetary P5 (#259) adds +96 (the six ocean lanes):
     // tail was 1824 B. Planetary P7 (#261) adds +32 (water_scatter +
-    // water_scatter2): tail is now 1856 B, 192 B under the 2048 budget --
-    // room for TWELVE more vec4 lanes and no more. A phase that wants six
-    // still fits; two such phases do not. Bump kFrameUboSize when it comes,
-    // and note that this number is not derivable by reading the comment
-    // history -- it was computed by evaluating the sum in the static_assert
-    // above, which is the only place that cannot drift.
+    // water_scatter2): tail was 1856 B, 192 B under the 2048 budget --
+    // room for TWELVE more vec4 lanes and no more. #280 took three
+    // (sky_cook_*) and land cover (#300) took three more (land_basis_*):
+    // the tail is now 1952 B, 96 B under the budget, i.e. SIX vec4 lanes
+    // left. The next phase that wants more than six must bump
+    // kFrameUboSize, and note that this number is not derivable by reading
+    // the comment history -- it was computed by evaluating the sum in the
+    // static_assert above, which is the only place that cannot drift.
     static_assert(sizeof(PtPush) - 112 <= 2048,
                   "PtPush spilled tail (sizeof - 112) exceeds the Vulkan "
                   "kFrameUboSize budget (2048 B). Bump kFrameUboSize in "

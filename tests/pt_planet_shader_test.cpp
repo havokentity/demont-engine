@@ -157,10 +157,17 @@ TEST_CASE("the terrain bindings agree across Slang and the Vulkan tables") {
     CHECK(CountOccurrences(vk, "add_binding(39, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);") == 1);
 
     // The descriptor pool has to be sized for them. 17 storage buffers
-    // before this phase, 20 after -- and 21 since #280 added the
-    // multiple-scattering table at binding 40, which is a storage buffer
-    // precisely so that it costs a descriptor and NOT a compute pipeline.
-    CHECK(CountOccurrences(vk, "kTotalSets * 21 + 8") == 1);
+    // before this phase, 20 after; 21 since #280 added the
+    // multiple-scattering table at binding 46, and 22 since land cover
+    // (#300) added the albedo raster at 47 -- both storage buffers
+    // precisely so they cost a descriptor and NOT a compute pipeline.
+    //
+    // Every superseded count is pinned ABSENT as well as the current one
+    // present, because a pool sized for one fewer descriptor than the
+    // layout declares fails only on Vulkan, which this Mac-tested phase
+    // cannot otherwise catch.
+    CHECK(CountOccurrences(vk, "kTotalSets * 22 + 8") == 1);
+    CHECK(CountOccurrences(vk, "kTotalSets * 21 + 8") == 0);
     CHECK(CountOccurrences(vk, "kTotalSets * 20 + 8") == 0);
     CHECK(CountOccurrences(vk, "kTotalSets * 17 + 8") == 0);
     // #280's own binding, on both sides of the same contract.
