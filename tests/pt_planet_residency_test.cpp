@@ -166,6 +166,17 @@ struct FlightResult {
     bool        final_cover_complete = false;
     // Ticks whose cover spanned the whole desired set.
     int         ticks_complete = 0;
+    // --- Recovery phase (settle_first + teleport plans only) -------------
+    // Did the streamer catch the selector -- resident == published ==
+    // desired, nothing held?
+    bool        converged        = false;
+    int         recovery_ticks   = 0;
+    // How the recovery loop ended. Exactly one of these is true when the
+    // run did not converge, and which one is the diagnosis: quiescence
+    // means "no work left and still behind", i.e. WEDGED; the cap means
+    // "still working when we ran out of patience", i.e. slow.
+    bool        ended_on_cap     = false;
+    bool        ended_quiescent  = false;
 };
 
 struct FlightPlan {
@@ -197,6 +208,19 @@ struct FlightPlan {
     // claim under test is about what happens AFTER, on the paced path.
     bool   settle_first  = false;
     double tau_px        = 1.5;
+    // Run the post-teleport phase until the streamer has CAUGHT UP rather
+    // than for a fixed number of ticks, and stop early if it demonstrably
+    // stops working. See the loop for why the stopping rule is work
+    // remaining and not ticks elapsed.
+    bool   recover_until_converged = false;
+    // Runaway guard, not a schedule. Only reached by a host that is still
+    // making progress and is slower than anything measured.
+    int    recovery_cap    = 4000;
+    // Consecutive ticks with no bake queued, none in flight and no BLAS
+    // built. That is "there is no work left to do", and if the streamer is
+    // still behind at that point it is stuck rather than slow. 60 ticks is
+    // ~15x the longest gap measured between two builds on a Debug host.
+    int    quiescent_limit = 60;
 };
 
 FlightResult FlyThePacedPath(pt::rhi::BackendType backend,
@@ -269,10 +293,12 @@ FlightResult FlyThePacedPath(pt::rhi::BackendType backend,
     std::uint64_t prev_refused = 0;
     std::uint64_t prev_dropped = 0;
 
+    // Zeroed for the recovery phase; see the loop.
+    double lon_step = lon_rate;
     auto tick = [&](double altitude_m) {
         pt::planet::LodParams lod = cfg.lod;
         lod.camera_w = camera_at(lat_rad, lon_rad, altitude_m);
-        lon_rad += lon_rate;
+        lon_rad += lon_step;
 
         terrain.Update(lod, glm::dvec3(0.0));
 
@@ -343,16 +369,63 @@ FlightResult FlyThePacedPath(pt::rhi::BackendType backend,
         // incoming set has 128 slots' worth of nowhere to go.
         lon_rad += 3.14159265358979323846 * 0.5;
     }
-    for (int i = 0; i < plan.climb_ticks; ++i) {
-        if (plan.settle_first) {
-            // Hold the altitude. The teleport alone is the disturbance; a
-            // climb on top of it would confound "the arena was overrun" with
-            // "the selector wanted less anyway".
+    if (plan.recover_until_converged) {
+        // --- RECOVERY, BOUNDED BY WORK AND NOT BY TIME -------------------
+        //
+        // The paced path consults r_planet_blas_budget_ms, so how much
+        // lands per tick is a property of the host. A fixed tick count
+        // therefore asserts "this machine is fast enough", which is not the
+        // property under test -- and it is not a threshold that can be
+        // tuned safe, because the race just gets a longer fuse. Measured:
+        // 150 ticks is ample on an M4 Max Release and leaves a Windows
+        // Debug CI runner 51 chunks of 210 into the same recovery.
+        //
+        // So the loop runs until the streamer has CAUGHT UP, and the
+        // failure it is really looking for -- a stand-in wedged onto the
+        // slot its own replacement needs -- has a signature that does not
+        // involve a clock at all:
+        //
+        //     no bake queued, none in flight, no BLAS built for
+        //     `quiescent_limit` consecutive ticks, and still behind.
+        //
+        // That is "there is nothing left to do and we are not done", which
+        // is what stuck means. A merely slow host always has work
+        // outstanding, so it never trips it; it converges, later. Measured
+        // on a Debug build with this exact 224-slot arena: converged at
+        // tick ~200 (resident == published == desired == 219, pending 0,
+        // held 0) and stayed there for the following 1 300 ticks.
+        //
+        // The camera is frozen for the recovery. The teleport is the
+        // disturbance; continuing to fly would keep the target moving and
+        // turn "did it catch up" into a question about the ratio of two
+        // rates rather than a fixed point.
+        lon_step = 0.0;
+        std::uint64_t last_builds = terrain.Stats().blas_builds;
+        int quiescent = 0;
+        for (int i = 0; i < plan.recovery_cap; ++i) {
             tick(kAltBottom_m);
-            continue;
+            fr.recovery_ticks = i + 1;
+            const auto& st = terrain.Stats();
+            if (st.held == 0 && st.resident == st.desired &&
+                st.published == st.desired) {
+                fr.converged = true;
+                break;
+            }
+            const bool working =
+                st.pending_bakes > 0 || st.blas_builds != last_builds;
+            last_builds = st.blas_builds;
+            quiescent = working ? 0 : (quiescent + 1);
+            if (quiescent >= plan.quiescent_limit) {
+                fr.ended_quiescent = true;
+                break;
+            }
+            if (i + 1 == plan.recovery_cap) fr.ended_on_cap = true;
         }
-        const double t = static_cast<double>(i) / (plan.climb_ticks - 1);
-        tick(kAltBottom_m + (kAltStart_m - kAltBottom_m) * t);
+    } else {
+        for (int i = 0; i < plan.climb_ticks; ++i) {
+            const double t = static_cast<double>(i) / (plan.climb_ticks - 1);
+            tick(kAltBottom_m + (kAltStart_m - kAltBottom_m) * t);
+        }
     }
 
     fr.resident_peak = terrain.Stats().resident_peak;
@@ -460,14 +533,13 @@ TEST_CASE("paced residency: a teleport into a tight arena never overruns it") {
     plan.max_level     = 8;
     plan.settle_first  = true;    // fill the arena on every host, not just fast ones
     plan.descent_ticks = 0;
-    plan.climb_ticks   = 150;
     plan.teleport      = true;
+    plan.recover_until_converged = true;
     // 8 ms rather than the interactive 2. What this case is about is the
-    // arena, and the recovery has 213 chunks to build; at the interactive
-    // budget a Debug host would still be halfway through when the ticks ran
-    // out, and "did not finish" is not the same claim as "did not deadlock".
+    // arena, and the recovery has ~210 chunks to build; the interactive
+    // budget would make the run several times longer for no extra signal.
     plan.blas_budget_ms = 8.0;
-    plan.frame_sleep_ms = 8;
+    plan.frame_sleep_ms = 4;
     const FlightResult f = FlyThePacedPath(pt::rhi::BackendType::Software, plan);
     if (!f.ran) {
         MESSAGE("SKIPPED: " << f.skip_reason);
@@ -486,26 +558,36 @@ TEST_CASE("paced residency: a teleport into a tight arena never overruns it") {
     CHECK(f.overlap_failures   == 0);
     CHECK(f.imbalance_failures == 0);
     CHECK(f.orphan_failures    == 0);
-    // NO DEADLOCK. The failure this shape of policy invites is a stand-in
-    // squatting the slot its own replacement needs, so that the arena stays
-    // full of ground nobody is looking at and the new region trickles in a
-    // slot at a time. Two statements rule it out, and neither asks how fast
-    // the host is:
+    // NO DEADLOCK, and this is the one claim in the file that is NOT
+    // asserted per tick, because it cannot honestly be. The failure this
+    // shape of policy invites is a stand-in squatting the slot its own
+    // replacement needs, so the arena stays full of ground nobody is
+    // looking at; ruling that out means watching the streamer finish, and
+    // how long finishing takes is a property of the host.
     //
-    //   * the arena is no longer dominated by the abandoned region -- most
-    //     of the 189 stand-ins the jump created are gone;
-    //   * and the streamer is drawing at least as much as it was before the
-    //     jump, so the slots they were holding went to the new region
-    //     rather than nowhere.
+    // So the two claims are split deliberately, and the split is the point:
     //
-    // Deliberately NOT "resident == desired" or "the cover is complete".
-    // Whether a 224-slot arena finishes refining 213 chunks inside the tick
-    // budget is a question about how fast this host bakes and builds -- a
-    // Debug runner is still 50 stand-ins short at the end -- and being
-    // behind is not the same thing as being stuck. Both numbers are printed
-    // below so a reader can see which it was.
-    CHECK(f.final_held * 2 <= f.settled_resident);
-    CHECK(f.final_published >= f.settled_resident);
+    //   COVERAGE, OVERLAP, 2:1 AND THE ARENA are asserted STRICTLY, on
+    //   every single tick, above. They are the fix, and they do not get to
+    //   be conditional on anything.
+    //
+    //   CONVERGENCE is bounded by WORK REMAINING instead. The loop ran
+    //   until resident == published == desired with nothing held, or until
+    //   the streamer went quiescent -- no bake queued, none in flight, no
+    //   BLAS built for 60 consecutive ticks -- while still behind. The
+    //   second is what stuck looks like and it involves no clock.
+    //
+    // An earlier version asserted "published >= what was resident before
+    // the jump" after a fixed 150 ticks, which is the same claim with a
+    // stopwatch in it: green on an M4 Max, red on a Windows Debug runner
+    // that was 51 chunks of 210 into a perfectly healthy recovery. The
+    // per-tick invariants held on that run -- zero coverage regressions,
+    // high water 201 inside a 224-slot arena -- which is exactly why the
+    // stopping rule and not the invariant was the thing that was wrong.
+    CHECK(f.converged);
+    CHECK_FALSE(f.ended_quiescent);   // no work left and still behind = wedged
+    CHECK_FALSE(f.ended_on_cap);      // ran out of patience, not out of work
+    CHECK(f.final_held == 0u);
     // Non-vacuous, on any host. The barrier really did fill the arena
     // before the jump -- Settle() is machine-independent, which is the
     // whole reason it is used here -- and the jump really did turn that
@@ -525,6 +607,12 @@ TEST_CASE("paced residency: a teleport into a tight arena never overruns it") {
     std::printf("  peak starved / held      %zu / %zu\n", peak_starved, peak_held);
     std::printf("  final held               %zu   (settled %zu)\n",
                 f.final_held, f.settled_resident);
+    std::printf("  recovery                 %s after %d ticks%s\n",
+                f.converged ? "CONVERGED" : "DID NOT CONVERGE",
+                f.recovery_ticks,
+                f.ended_quiescent ? "  (WEDGED: no work left, still behind)"
+                                  : (f.ended_on_cap ? "  (hit the runaway cap)"
+                                                    : ""));
     std::printf("  cover complete           %s   (%d of %zu ticks)\n",
                 f.final_cover_complete ? "yes" : "still catching up",
                 f.ticks_complete, f.ticks.size());
