@@ -195,6 +195,7 @@
 
 #include <glm/glm.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -353,10 +354,43 @@ double RelativeStructureFunction(double lag_m, double floor_m, double break_m,
 // GenerateChunkHeights from several JobSystem workers at once.
 class ElevationField {
 public:
-    void SetDem(const DigitalElevationModel* dem) noexcept { dem_ = dem; }
-    void SetParams(const ElevationParams& p) noexcept { params_ = p; }
+    void SetDem(const DigitalElevationModel* dem) noexcept {
+        dem_ = dem;
+        generation_ = NextGeneration();
+    }
+    void SetParams(const ElevationParams& p) noexcept {
+        params_ = p;
+        generation_ = NextGeneration();
+    }
     const ElevationParams& Params() const noexcept { return params_; }
     bool HasData() const noexcept { return dem_ != nullptr && !dem_->Empty(); }
+
+    // Moved by every mutator, to a value NO OTHER FIELD IN THE PROCESS HAS
+    // EVER HELD. A caller that MEMOISES a result of this field --
+    // TerrainChunk.cpp caches the shared level-11 reference grid, which
+    // sixteen level-13 chunks otherwise regenerate identically -- holds
+    // this alongside the memo and discards it when the number moves.
+    //
+    // PROCESS-UNIQUE, AND UNIQUE FROM CONSTRUCTION. Every ElevationField
+    // that has ever existed in this process has held a different value, so
+    // this ALONE identifies both which field a memo came from and which
+    // configuration it was in. A per-object counter would not: a destroyed
+    // field and a freshly constructed one at the same address with the
+    // same number of mutations would look identical to a cache keyed on
+    // (pointer, generation), and they are not identical if they were
+    // handed different DEMs. Drawing from one monotonic source makes that
+    // collision impossible rather than improbable -- and lets the memo drop
+    // the address from its key entirely, which is better than carrying a
+    // term that can never differ.
+    //
+    // It is still only a NECESSARY condition for a memo to be valid, not a
+    // sufficient one, because DigitalElevationModel::Load rewrites a DEM IN
+    // PLACE: the pointer can be unchanged while the data is not.
+    // PlanetTerrain::Configure calls SetDem after every successful Load,
+    // which moves this; a FAILED Load leaves the model empty, which
+    // HasData() reports. A memo key should therefore carry HasData() and
+    // the params as well, and TerrainChunk.cpp's does.
+    std::uint64_t Generation() const noexcept { return generation_; }
 
     // The DEM-only base height at a unit ellipsoid-frame direction, metres
     // of ellipsoidal height. A pure function of the direction, so two
@@ -407,8 +441,24 @@ public:
     double HeightAtDirection(const glm::dvec3& dir_unit, int level) const;
 
 private:
+    // Monotonic across the process. Relaxed ordering is enough: the value
+    // only has to be UNIQUE, and every consumer reads it through the same
+    // happens-before the field's own configuration already establishes
+    // (SetDem/SetParams run before the workers that bake against them).
+    static std::uint64_t NextGeneration() noexcept {
+        static std::atomic<std::uint64_t> counter{1};
+        return counter.fetch_add(1, std::memory_order_relaxed);
+    }
+
     const DigitalElevationModel* dem_ = nullptr;
     ElevationParams params_{};
+    // Stamped AT CONSTRUCTION, not left at zero, so that the stamp is a
+    // complete identity for the field as well as for its configuration
+    // state. Two never-configured fields would otherwise share a stamp --
+    // harmless in itself, since they behave identically, but it would mean
+    // a memo keyed on this had to carry the object's address too, and an
+    // address is exactly the thing that gets recycled.
+    std::uint64_t   generation_ = NextGeneration();
 };
 
 }  // namespace pt::planet

@@ -169,13 +169,72 @@ struct PlanetSite {
 //   contains 3-arcsecond roughness for exactly the same reason. What #307
 //   decouples is the TESSELLATION, not the terrain model.
 //
-// THE COST, measured on an M4 Max over the real earth_lite grid: a chunk
-// bake goes 1.69 -> 2.32 ms at levels 11 and finer (one extra
-// GenerateChunkHeights at level 11 over a 69x69 window, which is ~5x
-// cheaper than the level+1 fine grid the bake already builds), and
-// 1.78 -> 2.66..3.00 ms at levels 10 and coarser, where the area-mean
-// integral runs per vertex instead. Bakes happen on the JobSystem workers,
-// off the frame.
+// THE COST, and what it took to get it down. Chunk bake, milliseconds,
+// median of three runs of 256 chunks over the real earth_lite grid on an
+// M4 Max, Release:
+//
+//     level    main    this, first cut   this, as shipped
+//      8       1.530       2.554  +67%       2.253  +47%
+//     10       1.536       2.495  +62%       2.170  +41%
+//     11       1.529       2.147  +40%       1.960  +28%
+//     13       1.522       2.141  +41%       1.689  +11%
+//     15       1.566       2.141  +37%       1.684   +8%
+//     17       1.532       2.141  +40%       1.677   +9%
+//
+// The first cut was too expensive to ship, and it is worth being precise
+// about WHY, because the obvious reason is the wrong one. A bake does not
+// spend the frame's r_planet_blas_budget_ms: that budget paces the
+// admission of chunks that are ALREADY baked (PlanetTerrain's "still
+// baking" continue). Bakes run on AsyncChunkBaker's own fixed pool of
+// r_planet_workers threads, and a chunk cannot enter the cover until its
+// bake lands. So per-chunk cost is a THROUGHPUT limit on that pool: N newly
+// requested chunks take N * bake_ms / workers to become admissible, and
+// +40% per bake is +40% on how long a terrain hole stays open while the
+// camera moves it into view. It also put pt_planet_terrain's Debug run over
+// the CI budget on the Windows lane. Three changes brought it back, all of
+// them PURE COMMON-SUBEXPRESSION REMOVAL rather than approximation, which
+// is why the goldens did not move by a single bit:
+//
+//   1. The five reference samples per vertex are a PRODUCT of two small
+//      axis sets, so TangentWarp runs 390 times per chunk instead of
+//      42 250. See ReferenceSlope01.
+//   2. The level-11 ancestor grid is SHARED by every descendant -- 16
+//      chunks at level 13, 256 at level 15 -- and is now memoised per
+//      worker thread instead of regenerated identically per chunk. This is
+//      the one that closes the gap at the fine levels, and it is also why
+//      level 11 is still +28%: a level-11 chunk is its own ancestor and
+//      has nobody to share with.
+//   3. The area-mean integral's ramp factor depends only on the abscissa,
+//      and the abscissae are fixed; its Rayleigh tail underflows to
+//      exactly zero over gentle ground, and skipping terms that are
+//      exactly zero changes no sum. See RockFractionFromRmsSlope.
+//
+// The coarse branch keeps the largest residual because 65 exponentials per
+// vertex is what the closed-form area fraction costs and there is no
+// bit-exact way to have fewer.
+//
+// HOW MUCH THAT MATTERS DEPENDS ON THE MIX, SO THE MIX WAS COUNTED rather
+// than assumed. Bakes per level over a full settle of the shipped fixtures:
+//
+//     fixture                  bakes   level <= 10   level >= 11
+//     planet_surface             858    454  52.9%    404  47.1%
+//     planet_lod_seam            622    374  60.1%    248  39.9%
+//     planet_hillslope_rock    1 414    478  33.8%    936  66.2%
+//     planet_land_orbit              6      6 100%        0    0%
+//
+// So the coarse branch is a THIRD TO TWO THIRDS of a cold settle, not a
+// rounding error, and the honest end-to-end figure for one is the mix and
+// not the +8..11% of the fine rows alone. (planet_land_orbit bakes six
+// chunks, all at level 0 -- at 30 000 km the cover never descends, which is
+// also why that golden did not move.)
+//
+// The fine-row figure is the one that governs the case a USER feels:
+// a settled scene with the camera moving requests chunks near the camera,
+// which are level 13-15, while the coarse skirt is already resident. A cold
+// start or a teleport pays the mix instead. The integrated number for the
+// residency sweeps is in tests/CMakeLists.txt next to pt_planet_terrain's
+// TIMEOUT: 308.5 s on main, 389.5 s before this optimisation, 326.7 s
+// after.
 inline constexpr int    kRefSlopeLevel     = 11;
 inline constexpr double kRefSlopeHalfLagM  = 90.0;
 

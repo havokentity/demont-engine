@@ -1970,3 +1970,154 @@ TEST_CASE("the reference operator is the one the threshold was measured "
     const double gain = sigma / (900.0 * S / (2.0 * kRefSlopeHalfLagM));
     CHECK(gain == doctest::Approx(1.4689).epsilon(1e-3));
 }
+
+TEST_CASE("the reference-grid memo answers for the field it was filled from") {
+    // #307's bake evaluates the reference slope on the chunk's level-11
+    // ANCESTOR, which sixteen level-13 chunks share -- so the ancestor grid
+    // is memoised per worker thread rather than regenerated sixteen times.
+    // That memo is the one piece of state in an otherwise pure bake, and a
+    // cache that answers from the wrong field is precisely the defect class
+    // this file keeps catching. Three ways it could be wrong, all pinned.
+    const PlanetSite site = PlanetSite::FromGeodetic(0.4, 1.1);
+    const ChunkKey key{2, 13, 4936u, 9380u};      // a level-13 descendant
+
+    // (1) A MUTATED FIELD MUST NOT BE SERVED THE OLD GRID.
+    // The same ElevationField OBJECT, reconfigured in place -- which is what
+    // PlanetTerrain::Configure does when a cvar moves. The address is
+    // unchanged, so only the generation stamp can distinguish the two.
+    ElevationField mutating = MakeProceduralField(800.0, 20000.0);
+    TerrainChunkData before;
+    BuildTerrainChunk(key, mutating, site, before);
+
+    ElevationParams gentler = mutating.Params();
+    gentler.procedural_relief_m = 120.0;
+    const std::uint64_t gen_before = mutating.Generation();
+    mutating.SetParams(gentler);
+    CHECK(mutating.Generation() != gen_before);
+    TerrainChunkData after;
+    BuildTerrainChunk(key, mutating, site, after);
+
+    // The value a COLD cache produces. The memo is thread_local, so a
+    // freshly spawned thread has an empty one by construction -- there is
+    // no entry there to be served, stale or otherwise, and the comparison
+    // is therefore against the uncached path rather than against another
+    // possibly-stale hit. (Computing it on THIS thread would not do: a
+    // memo keyed on the chunk alone serves the same wrong grid to both
+    // sides and the equality passes while testing nothing. That is not
+    // hypothetical -- it is what this check did before the thread was
+    // added, and the reproduction is in the commit that added it.)
+    ElevationField fresh = MakeProceduralField(120.0, 20000.0);
+    TerrainChunkData reference;
+    {
+        std::thread cold([&] { BuildTerrainChunk(key, fresh, site, reference); });
+        cold.join();
+    }
+
+    std::size_t compared = 0, moved = 0, engaged_before = 0;
+    for (int y = 0; y <= kChunkQuads; ++y) {
+        for (int x = 0; x <= kChunkQuads; ++x) {
+            const double a = VertRock(before, x, y);
+            const double b = VertRock(after, x, y);
+            const double c = VertRock(reference, x, y);
+            CHECK(b == c);
+            if (a != b) ++moved;
+            if (a > 0.0 && a < 1.0) ++engaged_before;
+            ++compared;
+        }
+    }
+    // NOT VACUOUS. `b == c` over a field where the two params happen to
+    // agree proves nothing, so insist the reconfiguration actually moved
+    // the answer on a large fraction of the chunk AND that the pre-change
+    // value was in the ramp's transition band rather than pinned at an end.
+    // Without these, a memo that ignored the generation entirely would
+    // still pass every equality above.
+    CHECK(compared == static_cast<std::size_t>(kChunkVertexCount));
+    CHECK(moved > compared / 2u);
+    CHECK(engaged_before > compared / 20u);
+
+    // (2) TWO LIVE FIELDS MUST NOT SHARE AN ENTRY.
+    // Interleaved so that each bake finds the other's entry already in the
+    // cache; a memo keyed on the chunk alone would serve it.
+    ElevationField steep  = MakeProceduralField(800.0, 20000.0);
+    ElevationField shallow = MakeProceduralField(120.0, 20000.0);
+    TerrainChunkData s1, h1, s2, h2;
+    BuildTerrainChunk(key, steep,   site, s1);
+    BuildTerrainChunk(key, shallow, site, h1);
+    BuildTerrainChunk(key, steep,   site, s2);
+    BuildTerrainChunk(key, shallow, site, h2);
+    std::size_t differ = 0;
+    for (int y = 0; y <= kChunkQuads; ++y) {
+        for (int x = 0; x <= kChunkQuads; ++x) {
+            CHECK(VertRock(s1, x, y) == VertRock(s2, x, y));
+            CHECK(VertRock(h1, x, y) == VertRock(h2, x, y));
+            if (VertRock(s1, x, y) != VertRock(h1, x, y)) ++differ;
+        }
+    }
+    CHECK(differ > static_cast<std::size_t>(kChunkVertexCount) / 2u);
+
+    // (3) THE MEMO IS SMALLER THAN THE WORKING SET, SO IT MUST EVICT
+    // CORRECTLY. Sixteen distinct level-11 ancestors against a four-entry
+    // cache: every bake after the first four is a miss on a full cache, and
+    // a wrong eviction would hand back a NEIGHBOUR's grid rather than
+    // nothing.
+    //
+    // Each chunk is compared against the same chunk baked on its OWN fresh
+    // thread. The memo is thread_local, so that thread's cache is empty and
+    // its bake is provably a miss -- the uncached answer, by construction.
+    //
+    // THE OBVIOUS CHEAPER TEST DOES NOT WORK, and this file should say so
+    // because the trap is subtle. Baking the sixteen forwards and then
+    // backwards on ONE thread and comparing the two orders passes even when
+    // the ancestor coordinates are dropped from the cache key entirely:
+    // the first entry stays valid across both passes, so both orders read
+    // the SAME wrong grid and agree with each other. Two runs that are
+    // wrong in the same way are not a check. Measured: with the ancestor
+    // coordinates removed, order-vs-order gives 0 mismatches out of 16 and
+    // 15 of 16 chunks still differ from the first, so even the
+    // non-vacuity guard on that form is satisfied. The comparison has to be
+    // against a cache that cannot hold the wrong answer, not against
+    // another consultation of the one that does.
+    ElevationField field = MakeProceduralField(800.0, 20000.0);
+    std::size_t distinct_chunks = 0, engaged_total = 0;
+    std::vector<double> first_chunk;
+    for (int n = 0; n < 16; ++n) {
+        // BOTH halves of the ancestor key have to be separable, and the
+        // sequence is built so that each one is. The face alternates, so a
+        // same-(i, j) different-face pair is live in the cache at once; the
+        // coordinates advance every other chunk, so a same-face
+        // different-(i, j) pair is live too, and only two apart in a
+        // four-entry cache. A sweep that varied only one of the two would
+        // leave the other term untestable -- which is how the first draft
+        // of this case managed to pass with the coordinates removed from
+        // the key entirely.
+        const ChunkKey k{static_cast<std::uint8_t>(n % 2), 13,
+                         4936u + static_cast<std::uint32_t>(n / 2) * 4u,
+                         9380u + static_cast<std::uint32_t>(n / 2) * 4u};
+        // Warm: this thread, whose cache is already full of other
+        // ancestors from the bakes above and from earlier iterations.
+        TerrainChunkData warm;
+        BuildTerrainChunk(k, field, site, warm);
+        // Cold: a thread that has never baked anything.
+        TerrainChunkData cold;
+        {
+            std::thread t([&] { BuildTerrainChunk(k, field, site, cold); });
+            t.join();
+        }
+        std::vector<double> w, c;
+        for (int i = 0; i < kChunkVertexCount; ++i) {
+            const auto o = static_cast<std::size_t>(i) * kVertexPayloadFloats + 4;
+            w.push_back(warm.shader_verts[o]);
+            c.push_back(cold.shader_verts[o]);
+        }
+        CHECK(w == c);
+        if (n == 0) first_chunk = w;
+        else if (w != first_chunk) ++distinct_chunks;
+        for (double v : w) if (v > 0.0 && v < 1.0) ++engaged_total;
+    }
+    // Not vacuous: the sixteen chunks must actually differ from each other
+    // -- otherwise "the cache returned the right grid" is a statement about
+    // one grid -- and the ramp must be in its transition band somewhere, or
+    // an all-zero field would satisfy every equality above.
+    CHECK(distinct_chunks >= 14u);
+    CHECK(engaged_total > 1000u);
+}

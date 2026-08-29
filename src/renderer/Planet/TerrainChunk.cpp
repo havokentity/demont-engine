@@ -6,6 +6,7 @@
 #include "SurfaceAlbedo.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 
 namespace pt::planet {
@@ -99,8 +100,93 @@ void ReferenceSlope01(const ChunkKey& key,
     // where the bit-exact level consistency comes from.
     const ChunkKey anc{key.face, static_cast<std::uint8_t>(kRefSlopeLevel),
                        key.i >> drop, key.j >> drop};
-    std::vector<double> rg;
-    field.GenerateChunkHeights(anc, kRefSlopeLevel, kRefHalo, rg);
+
+    // ...and "the same grid" is a statement about COST as well as about
+    // correctness. Sixteen level-13 chunks share one level-11 ancestor;
+    // 256 level-15 chunks do. Regenerating that 69x69 grid per chunk was
+    // 0.27 ms of the 0.43 ms this function cost -- the single largest term
+    // in #307's bake regression, and every one of those regenerations
+    // produced byte-identical output by construction.
+    //
+    // So it is memoised. This is not an approximation and cannot become
+    // one: a hit returns the bytes a miss would have computed, which is
+    // what makes the LOD-independence equality survive it unchanged.
+    //
+    // THREAD-LOCAL rather than shared-with-a-mutex. Bakes run on several
+    // JobSystem workers at once; a global cache would need a lock on the
+    // hot path and would serialise them. Per-worker costs 4 x 37.2 KB --
+    // 149 KB a thread, 0.7 MB at the default four workers plus the main
+    // one, against the 83 MB vertex arena -- and it still hits, because
+    // the streamer hands each worker spatially adjacent chunks. It also
+    // keeps BuildTerrainChunk a pure function of its arguments from every
+    // caller's point of view -- there is no cross-thread state to reason
+    // about.
+    //
+    // THE KEY IS THE FIELD'S IDENTITY, NOT JUST THE CHUNK'S. Three terms,
+    // and every one of them is REACHABLE -- a key term that cannot ever
+    // differ is not caution, it is decoration, and the test below is what
+    // established which is which:
+    //
+    //   generation -- ElevationField stamps every object at construction
+    //                and again on every SetDem/SetParams from ONE
+    //                process-wide counter, so this single term separates a
+    //                reconfigured field from its earlier self, one live
+    //                field from another, and a recycled address from
+    //                whatever used to live there. The object's ADDRESS was
+    //                in this key until the red-then-green pass showed no
+    //                way to make it matter; it is gone rather than kept as
+    //                reassurance.
+    //   anc face/i/j -- which patch of ground the grid covers. NOT
+    //                anc.level: that is kRefSlopeLevel for every entry by
+    //                construction, so comparing it is a term that cannot
+    //                differ, and the red-then-green pass confirmed no
+    //                mutation of the test can make it differ. Left out
+    //                rather than carried.
+    //   has_data  -- the one mutation the stamp does NOT see.
+    //                DigitalElevationModel::Load empties the model at its
+    //                first statement, so a FAILED reload leaves the field
+    //                pointing at an emptied DEM with no SetDem to stamp
+    //                it. (The test below cannot construct that case: it
+    //                needs a real .ptdem on disk, which the unit suite
+    //                deliberately does not depend on. Recorded here so the
+    //                term is not mistaken for covered.)
+    //
+    // A cache that answers from the wrong field is exactly the class of
+    // defect this project keeps finding, which is why the test below
+    // reproduces each reachable way of getting it wrong before asserting
+    // that this one does not.
+    struct RefGridEntry {
+        std::uint64_t         generation = 0;
+        bool                  has_data = false;
+        ChunkKey              anc{};
+        bool                  valid = false;
+        std::vector<double>   grid;
+    };
+    constexpr int kRefGridCacheSize = 4;
+    thread_local std::array<RefGridEntry, kRefGridCacheSize> cache{};
+    thread_local int cache_next = 0;
+
+    const RefGridEntry* hit = nullptr;
+    for (const RefGridEntry& e : cache) {
+        if (e.valid && e.generation == field.Generation()
+            && e.has_data == field.HasData()
+            && e.anc.face == anc.face
+            && e.anc.i == anc.i && e.anc.j == anc.j) {
+            hit = &e;
+            break;
+        }
+    }
+    if (hit == nullptr) {
+        RefGridEntry& e = cache[static_cast<std::size_t>(cache_next)];
+        cache_next = (cache_next + 1) % kRefGridCacheSize;
+        field.GenerateChunkHeights(anc, kRefSlopeLevel, kRefHalo, e.grid);
+        e.generation = field.Generation();
+        e.has_data   = field.HasData();
+        e.anc        = anc;
+        e.valid      = true;
+        hit = &e;
+    }
+    const std::vector<double>& rg = hit->grid;
 
     const std::int64_t Gr =
         static_cast<std::int64_t>(kChunkQuads) << kRefSlopeLevel;
@@ -121,20 +207,6 @@ void ReferenceSlope01(const ChunkKey& key,
         return (at(x0, y0)     * (1.0 - ax) + at(x0 + 1, y0)     * ax) * (1.0 - ay)
              + (at(x0, y0 + 1) * (1.0 - ax) + at(x0 + 1, y0 + 1) * ax) * ay;
     };
-    // World position at a fractional reference-grid coordinate. The same
-    // construction as fine_world in BuildTerrainChunk, one lattice coarser,
-    // so the reference slope is a TRUE 3D slope and not a height difference
-    // over a nominal spacing -- the cubed sphere's metric is not uniform and
-    // the two differ by up to 8% here.
-    auto ref_world = [&](double fx, double fy) -> glm::dvec3 {
-        const double s = -1.0 + 2.0 * ((rbase_x + fx) / static_cast<double>(Gr));
-        const double t = -1.0 + 2.0 * ((rbase_y + fy) / static_cast<double>(Gr));
-        const glm::dvec3 dir  = FaceParamToDirection(key.face, s, t);
-        const glm::dvec3 surf = EllipsoidSurface(dir);
-        const glm::dvec3 nn   = GeodeticNormal(surf);
-        return site.EcefToWorld(surf + ref_h(fx, fy) * nn);
-    };
-
     // The published operator: one 3-arcsecond cell either side.
     const double d_cells = kRefSlopeHalfLagM / ChunkVertexSpacing(kRefSlopeLevel);
     // Reference-lattice coordinates per level-key.level cell. A negative
@@ -142,23 +214,88 @@ void ReferenceSlope01(const ChunkKey& key,
     // over the same ground land on the same fractional coordinate.
     const double per_cell = 1.0 / static_cast<double>(std::int64_t{1} << drop);
 
+    // --- The five samples per vertex share their axes -----------------------
+    //
+    // Each vertex needs ref_world at (fx +- d, fy), (fx, fy +- d) and
+    // (fx, fy) -- five points, 21 125 per chunk. The naive form evaluated
+    // FaceParamToDirection at every one of them, i.e. 42 250 calls to
+    // std::tan per chunk, which was over half of this function's cost.
+    //
+    // But the sample set is a PRODUCT of two small axis sets: the x
+    // coordinate only ever takes one of {fx-d, fx, fx+d} for the 65 chunk
+    // columns (195 distinct values) and likewise for y. TangentWarp and the
+    // face-basis scaling depend on one axis each, so both are computed 195
+    // times instead of 21 125 -- a 108x reduction in transcendental calls.
+    //
+    // BIT-EXACT, and it has to be: the whole point of #307 is that two
+    // chunk levels over the same ground produce IDENTICAL rock exposure,
+    // and that property is asserted as `a == b`. Every `s` below is formed
+    // by the same expression the per-sample version used, on the same
+    // inputs, so each cached TangentWarp is the same double the inline call
+    // returned. The test that pins the equality is the check on this.
+    const glm::dvec3 face_n = FaceNormal(key.face);
+    const glm::dvec3 face_r = FaceRight(key.face);
+    const glm::dvec3 face_u = FaceUp(key.face);
+
+    // Axis tables, three entries per chunk vertex index: [0] = -d_cells,
+    // [1] = the vertex itself, [2] = +d_cells.
+    constexpr int kOff = 3;
+    std::vector<double>     ax_f(static_cast<std::size_t>(kChunkVerts) * kOff);
+    std::vector<double>     ay_f(static_cast<std::size_t>(kChunkVerts) * kOff);
+    std::vector<glm::dvec3> ax_pr(static_cast<std::size_t>(kChunkVerts) * kOff);
+    std::vector<glm::dvec3> ay_qu(static_cast<std::size_t>(kChunkVerts) * kOff);
+    for (int x = 0; x <= kChunkQuads; ++x) {
+        const double gx = static_cast<double>(
+            static_cast<std::int64_t>(key.i) * kChunkQuads + x) * per_cell;
+        const double fxc = gx - rbase_x;
+        const double fv[kOff] = {fxc - d_cells, fxc, fxc + d_cells};
+        for (int k = 0; k < kOff; ++k) {
+            const std::size_t o = static_cast<std::size_t>(x) * kOff + k;
+            ax_f[o] = fv[k];
+            const double s =
+                -1.0 + 2.0 * ((rbase_x + fv[k]) / static_cast<double>(Gr));
+            ax_pr[o] = TangentWarp(s) * face_r;
+        }
+    }
     for (int y = 0; y <= kChunkQuads; ++y) {
+        const double gy = static_cast<double>(
+            static_cast<std::int64_t>(key.j) * kChunkQuads + y) * per_cell;
+        const double fyc = gy - rbase_y;
+        const double fv[kOff] = {fyc - d_cells, fyc, fyc + d_cells};
+        for (int k = 0; k < kOff; ++k) {
+            const std::size_t o = static_cast<std::size_t>(y) * kOff + k;
+            ay_f[o] = fv[k];
+            const double t =
+                -1.0 + 2.0 * ((rbase_y + fv[k]) / static_cast<double>(Gr));
+            ay_qu[o] = TangentWarp(t) * face_u;
+        }
+    }
+
+    // World position from a pair of cached axis contributions. The same
+    // construction as fine_world in BuildTerrainChunk, one lattice coarser,
+    // so the reference slope is a TRUE 3D slope and not a height difference
+    // over a nominal spacing -- the cubed sphere's metric is not uniform and
+    // the two differ by up to 8% here.
+    auto ref_world = [&](std::size_t ox, std::size_t oy) -> glm::dvec3 {
+        const glm::dvec3 dir  = glm::normalize(face_n + ax_pr[ox] + ay_qu[oy]);
+        const glm::dvec3 surf = EllipsoidSurface(dir);
+        const glm::dvec3 nn   = GeodeticNormal(surf);
+        return site.EcefToWorld(surf + ref_h(ax_f[ox], ay_f[oy]) * nn);
+    };
+
+    for (int y = 0; y <= kChunkQuads; ++y) {
+        const std::size_t yb = static_cast<std::size_t>(y) * kOff;
         for (int x = 0; x <= kChunkQuads; ++x) {
-            const double gx = static_cast<double>(
-                static_cast<std::int64_t>(key.i) * kChunkQuads + x) * per_cell;
-            const double gy = static_cast<double>(
-                static_cast<std::int64_t>(key.j) * kChunkQuads + y) * per_cell;
-            const double fx = gx - rbase_x;
-            const double fy = gy - rbase_y;
-            const glm::dvec3 dxr = ref_world(fx + d_cells, fy)
-                                 - ref_world(fx - d_cells, fy);
-            const glm::dvec3 dyr = ref_world(fx, fy + d_cells)
-                                 - ref_world(fx, fy - d_cells);
+            const std::size_t xb = static_cast<std::size_t>(x) * kOff;
+            const glm::dvec3 dxr = ref_world(xb + 2, yb + 1)
+                                 - ref_world(xb + 0, yb + 1);
+            const glm::dvec3 dyr = ref_world(xb + 1, yb + 2)
+                                 - ref_world(xb + 1, yb + 0);
             glm::dvec3 nr = glm::cross(dxr, dyr);
             const double nl = glm::length(nr);
             if (!(nl > 0.0)) continue;
             nr /= nl;
-            const glm::dvec3 up = site.WorldUp(ref_world(fx, fy));
+            const glm::dvec3 up = site.WorldUp(ref_world(xb + 1, yb + 1));
             // Outward, by the same guard BuildTerrainChunk uses on the mesh
             // normal: the face bases are right-handed so cross(du, dv)
             // already points away from the centre, and the dot makes the
@@ -170,17 +307,51 @@ void ReferenceSlope01(const ChunkKey& key,
     }
 }
 
-double ReferenceRmsSlopePerAxis(const ElevationField& field,
-                                const glm::dvec3& dir_unit) noexcept {
+namespace {
+
+// The part of ReferenceRmsSlopePerAxis that does not depend on POSITION.
+//
+// `S`, the lag, the two Hurst exponents, the break and the detail gain are
+// all properties of the FIELD, so on a coarse chunk's 4 225-vertex sweep
+// they were being recomputed 4 225 times to produce one number -- including
+// RelativeStructureFunction, which is two calls to std::pow. Splitting them
+// out lets the per-vertex path be a multiply and a divide.
+//
+// The factorisation keeps the ORIGINAL EVALUATION ORDER exactly:
+//   gain * detail_gain * Relief * S / lag
+// associates left, so `(gain * detail_gain)` is a subexpression of it and
+// hoisting that pair changes no rounding. Everything downstream still
+// multiplies by Relief, then by S, then divides by lag, in that order.
+struct RefRmsSlopeConstants {
+    double gain_detail;   // kRefSlopeRmsGain * max(detail_gain, 0)
+    double S;
+    double lag;
+};
+
+RefRmsSlopeConstants RefRmsSlopeConstantsFor(const ElevationField& field) noexcept {
     const ElevationParams& p = field.Params();
     const double floor_m = field.DataFloorMetres();
     const double H  = std::clamp(p.hurst, 0.05, 1.0);
     const double Hf = std::clamp(p.hurst_fine, H, 2.0);
     const double brk = std::max(p.hillslope_break_m, 0.0);
     const double lag = 2.0 * kRefSlopeHalfLagM;
-    const double S = RelativeStructureFunction(lag, floor_m, brk, H, Hf);
-    return kRefSlopeRmsGain * std::max(p.detail_gain, 0.0)
-         * field.Relief(dir_unit) * S / lag;
+    return RefRmsSlopeConstants{
+        kRefSlopeRmsGain * std::max(p.detail_gain, 0.0),
+        RelativeStructureFunction(lag, floor_m, brk, H, Hf),
+        lag};
+}
+
+inline double RefRmsSlopeAt(const RefRmsSlopeConstants& c,
+                            const ElevationField& field,
+                            const glm::dvec3& dir_unit) noexcept {
+    return c.gain_detail * field.Relief(dir_unit) * c.S / c.lag;
+}
+
+}  // namespace
+
+double ReferenceRmsSlopePerAxis(const ElevationField& field,
+                                const glm::dvec3& dir_unit) noexcept {
+    return RefRmsSlopeAt(RefRmsSlopeConstantsFor(field), field, dir_unit);
 }
 
 void BuildTerrainChunk(const ChunkKey& key,
@@ -244,14 +415,34 @@ void BuildTerrainChunk(const ChunkKey& key,
         const std::int64_t Gc = static_cast<std::int64_t>(kChunkQuads) << key.level;
         const std::int64_t cbase_x = static_cast<std::int64_t>(key.i) * kChunkQuads;
         const std::int64_t cbase_y = static_cast<std::int64_t>(key.j) * kChunkQuads;
+        // Same two hoists as ReferenceSlope01's: the field constants come
+        // out of the 4 225-vertex sweep, and TangentWarp is a function of
+        // ONE axis so it is evaluated 65 times per axis rather than 4 225
+        // times per axis. Both are pure common-subexpression removal -- the
+        // per-vertex arithmetic below is the identical expression on the
+        // identical doubles.
+        const RefRmsSlopeConstants rc = RefRmsSlopeConstantsFor(field);
+        const glm::dvec3 face_n = FaceNormal(key.face);
+        const glm::dvec3 face_r = FaceRight(key.face);
+        const glm::dvec3 face_u = FaceUp(key.face);
+        std::vector<glm::dvec3> cx(static_cast<std::size_t>(kChunkVerts));
+        std::vector<glm::dvec3> cy(static_cast<std::size_t>(kChunkVerts));
+        for (int x = 0; x <= kChunkQuads; ++x) {
+            cx[static_cast<std::size_t>(x)] =
+                TangentWarp(GridParam(cbase_x + x, Gc)) * face_r;
+        }
+        for (int y = 0; y <= kChunkQuads; ++y) {
+            cy[static_cast<std::size_t>(y)] =
+                TangentWarp(GridParam(cbase_y + y, Gc)) * face_u;
+        }
         for (int y = 0; y <= kChunkQuads; ++y) {
             for (int x = 0; x <= kChunkQuads; ++x) {
-                const double s = GridParam(cbase_x + x, Gc);
-                const double t = GridParam(cbase_y + y, Gc);
-                const glm::dvec3 dir = FaceParamToDirection(key.face, s, t);
+                const glm::dvec3 dir = glm::normalize(
+                    face_n + cx[static_cast<std::size_t>(x)]
+                           + cy[static_cast<std::size_t>(y)]);
                 rock01[static_cast<std::size_t>(y) * kChunkVerts + x] =
                     static_cast<float>(RockFractionFromRmsSlope(
-                        ReferenceRmsSlopePerAxis(field, dir)));
+                        RefRmsSlopeAt(rc, field, dir)));
             }
         }
     }
