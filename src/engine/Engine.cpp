@@ -2895,6 +2895,48 @@ bool Engine::Init() {
         seed_cvar("r_planet_terrain", "1");
         seed_cvar("r_planet_spherical_frame", "1");
         seed_cvar("r_planet_ground", "1");
+        seed_cvar("r_planet_ocean", "1");
+        // --- The sky half of "a real planet" (#306) --------------------
+        //
+        // Until now the earth seed built a planet and then hung the
+        // bundled sunset.hdr behind it: r_sky_mode's default is `hdri`,
+        // so the default scene was a real globe inside a painted studio
+        // backdrop, with no clouds and no aerial perspective.
+        //
+        // physical is the ONLY mode with an unlimited altitude range --
+        // the other four are domes, functions of view direction with the
+        // observer implicitly at ground level, and they return the same
+        // zenith colour at eye height and at 400 km. A default scene
+        // whose whole point is that you can fly off it cannot be built
+        // on one. Choosing it here also settles #306's "no mode switch
+        // the user can see": there is no altitude at which anything
+        // switches, because there is only ever one mode.
+        //
+        // It also makes the skybox question moot rather than answered
+        // twice -- push.env_map_present is (sky_mode_id == 1u), i.e. the
+        // env map is sampled ONLY in hdri mode, so selecting physical
+        // already guarantees no env-map backdrop and no env NEE. That is
+        // why r_env_map itself is deliberately NOT seeded: forcing it
+        // empty would take the HDRI away from a user who later asks for
+        // `cvar set r_sky_mode hdri`, and would buy nothing here.
+        seed_cvar("r_sky_mode", "physical");
+        // Aerial perspective over the disc and haze at the surface: the
+        // camera-to-surface air is integrated by the volumetric march,
+        // not by skyPhysical (which only owns primary MISSES). Without
+        // this the ground is extinguished but never in-scattered into,
+        // which is the "dark body with no haze over it" failure.
+        seed_cvar("r_volumetric", "1");
+        // Clouds resolve to a spherical shell whenever a planet is
+        // present (cloudLayerInterval -> ptRayShell against R + base /
+        // R + top), so the default cumulus deck is geometrically valid
+        // from eye height and from orbit alike.
+        seed_cvar("r_clouds", "1");
+        // Already the registered default (1); stated so the earth seed
+        // is a complete description of the scene rather than a partial
+        // one that silently depends on another cvar's default not
+        // moving. Verified a no-op: seed_cvar only writes when the cvar
+        // is unassigned, and it writes the value it already holds.
+        seed_cvar("r_show_stars", "1");
         // The planet IS the scene; the historical grey plane at y = 0
         // would sit above the ellipsoid everywhere except the tangent
         // point and paint a flat-Earth horizon over it -- the same reason
