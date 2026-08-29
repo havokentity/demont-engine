@@ -10123,8 +10123,15 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                         + float3(sigma_s_par)
                                             * ptPhaseHenyeyGreenstein(mu_w,
                                                                       g_par);
+                                    // #280 renamed this: the value is an
+                                    // IRRADIANCE, and the multiply below is
+                                    // by a scattering coefficient and a
+                                    // phase with no solid angle, which is
+                                    // the same dimensional argument the air
+                                    // march and the surface NEE make. See
+                                    // src/renderer/Atmosphere.h section 1.
                                     float3 sun_rad_w =
-                                        sunRadianceAt(sp, sun_dir_w, sun_elev);
+                                        sunIrradianceAt(sp, sun_dir_w, sun_elev);
                                     v_color_w += sun_rad_w * trans_w
                                                * in_scatter_w * dt_w
                                                * trans_eye_w;
