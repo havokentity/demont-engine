@@ -1838,18 +1838,31 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # alone: three Release captures agreed on 3f4f417f3e74165d exactly and
     # still produced three different PNGs.
     #
-    #   planet_surface   desired 3f4f417f3e74165d  scene a3b3352959e2bf78
-    #   planet_aerial    desired a4a1525ddd40b4ab  scene 21c595c6dd7e60e8
-    #   planet_lod_seam  desired cbd64b5c7c757227  scene e0b3a025008e4f33
+    #                    rounds  chunks  desired            scene
+    #   planet_surface       14     645  3958231c97fa53bd   6416c3a04da11c28
+    #   planet_aerial        12    1419  d661b1fe2bb862ef   6fda81e4463ec7d6
+    #   planet_lod_seam      16     468  2efaddfa21781929   924882c81d83b01b
     #
-    # The three desired digests are UNCHANGED from P4's, which is worth
-    # recording: the fixes removed the ways the selector could land
-    # somewhere else, they did not move where it lands.
+    # THESE ARE THE POST-#304 VALUES, and they replace a block that recorded
+    # P4's (3f4f417f3e74165d / a3b3352959e2bf78 and the two beside it).
+    # #304 broke the terrain power law at the hillslope scale, which lowers
+    # small-scale relief, which drops e_L, so the selector stops descending
+    # as deep: 1128 -> 645, 1806 -> 1419, 1008 -> 468 chunks. The PNGs were
+    # regenerated at the time and this measurement was not, so the block
+    # documented a chunk set that no longer existed -- #315, which also asks
+    # the better question of whether a recorded digest nothing verifies
+    # ought to be an assertion instead. Re-measured here on 6f88475 and
+    # again on the #319 branch; all four columns agree on both, which is how
+    # #319 shows that retaining the whole cut leaves steady-state
+    # PUBLICATION alone.
     #
-    # Residency stays clear of r_planet_chunk_budget 2048 -- 1128, 1806 and
-    # 1008 chunks. EnforceBudget was instrumented and observed never to run
-    # on any of the three, so the tau bisection plays no part in these
-    # cells. (P4 suspected it did; it does not. See r_planet_chunk_budget.)
+    # Residency stays clear of r_planet_chunk_budget 2048, and note that
+    # since #319 that cvar is the LEAF budget: the arena is WholeCutSlots of
+    # it (2728 slots at 2048) because residency is the whole cut and not its
+    # frontier. The counts above are leaf counts and are unchanged.
+    # EnforceBudget was instrumented and observed never to run on any of the
+    # three, so the tau bisection plays no part in these cells. (P4
+    # suspected it did; it does not. See r_planet_chunk_budget.)
     #
     # FRAMES 32 rather than the default 64: with the geometry frozen and the
     # sample sequence pinned, the accumulator is a deterministic function of

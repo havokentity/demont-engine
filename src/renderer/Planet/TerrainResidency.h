@@ -107,9 +107,74 @@ std::uint32_t StitchMaskFor(const ChunkKey& k,
 // the restriction the 16 index variants are built for.
 bool IsEdgeBalanced(const std::set<ChunkKey>& leaves) noexcept;
 
+// How many repair rounds the 2:1 balance loop gets before it gives up and
+// refuses every substitution at once. Each round refuses at least one
+// substitution and refusals never un-refuse, so the loop is already finite;
+// this bounds the WORK rather than the recursion. Eight is far above
+// anything measured (transitions repair in zero or one round) and the
+// backstop is exact, not approximate: with every substitution refused the
+// published set is a subset of the desired set, and a subset of a balanced
+// leaf set is balanced.
+//
+// Exposed so a caller can tell an ordinary repair from the backstop. The
+// backstop is not a slow frame -- it publishes nothing but desired leaves
+// that happen to be resident, so it holes out the whole transient.
+inline constexpr int kMaxRepairRounds = 8;
+
 // True when every leaf of `reference` has its area covered by `cover`.
 bool CoversAll(const std::set<ChunkKey>& cover,
                const std::set<ChunkKey>& reference) noexcept;
+
+// --- RETAINING THE WHOLE CUT, NOT JUST ITS LEAVES (#319) ------------------
+//
+// The retirement rule above protects a chunk that is CURRENTLY RESIDENT.
+// It cannot protect one that was thrown away rounds ago, and the selector
+// throws ancestors away by construction: TerrainQuadtree::Descend records a
+// key only where the descent STOPS, so `desired` is the leaf frontier and
+// every interior node of the cut is, to the streamer, an unwanted chunk.
+//
+// Descending is safe -- the parent is resident when its children are asked
+// for, and the rule holds it until they land. ASCENDING is not. On a merge
+// the selector asks for a node that was evicted several levels ago, and
+// what is resident in its place is the fine tiling underneath it. That
+// tiling covers the ground, but it is more than one level below whatever is
+// published across the merge boundary, so the 2:1 repair refuses it and
+// leaves a hole -- and the hole lasts until the coarse chunk has been baked
+// (~2 ms) and built, paced against r_planet_blas_budget_ms. Over a cut of
+// several hundred chunks that is hundreds of frames: the seconds of holes a
+// zoom-out shows.
+//
+// The fix is to keep the WHOLE cut resident rather than its frontier: every
+// strict ancestor of every desired leaf stays in the arena, unpublished,
+// as the standing answer to "what covers this ground one level coarser".
+// Ascending then degrades to briefly-coarser detail instead of a hole.
+//
+// WHAT IT COSTS, EXACTLY
+//
+// Not "about a third" -- exactly a third, and the identity is what lets the
+// arena be sized for it instead of made to compete for it. Every interior
+// node of a quadtree cut has exactly four children, so a forest of six
+// cube-face roots with I interior nodes has 6 + 4I nodes in total, of which
+// L = 6 + 4I - I = 6 + 3I are leaves. Hence
+//
+//     I = (L - 6) / 3          exactly, for any cut BuildSet can produce
+//
+// and the arena that must hold a cut of at most `leaf_budget` leaves is
+// leaf_budget + (leaf_budget - 6) / 3 slots. WholeCutSlots is that number.
+// The selector's target stays the LEAF budget, so the converged desired set
+// -- which every planet golden is pinned against -- is untouched.
+
+// Every strict ancestor of every leaf in `leaves`: the interior nodes of
+// the cut whose frontier is `leaves`. A pure function of the leaf set, with
+// no clock and no arrival order in it, so retaining them keeps residency a
+// function of (camera, metrics, params).
+std::set<ChunkKey> CutAncestors(const std::set<ChunkKey>& leaves);
+
+// Arena slots the whole cut of a `leaf_budget`-leaf frontier can occupy:
+// leaf_budget + (leaf_budget - 6) / 3, from the identity above. Exact
+// rather than a fudge factor -- an arena sized to this can never be made to
+// choose between a desired leaf and a retained ancestor at steady state.
+std::size_t WholeCutSlots(std::size_t leaf_budget) noexcept;
 
 struct ResidencyCover {
     // The disjoint cover to hand the TLAS. Every member is resident.
@@ -126,7 +191,9 @@ struct ResidencyCover {
     // two-level step. Diagnostic; a non-zero value means a hole was
     // preferred to a crack.
     std::size_t           refused = 0;
-    // Repair rounds consumed. Diagnostic.
+    // Repair rounds consumed. Diagnostic. Reaching kMaxRepairRounds means
+    // the backstop fired and every substitution was refused, which is a
+    // published set with holes wherever the desired set is not resident.
     int                   repair_rounds = 0;
     // True when every desired leaf's area is covered. False during the cold
     // start (nothing resident yet) and wherever a substitution was refused.

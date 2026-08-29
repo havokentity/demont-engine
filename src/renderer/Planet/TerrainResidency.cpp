@@ -179,16 +179,6 @@ private:
     std::vector<ChunkKey>     out_;
 };
 
-// How many repair rounds the balance loop gets before it gives up and
-// refuses every substitution at once. Each round refuses at least one
-// substitution and refusals never un-refuse, so the loop is already finite;
-// this bounds the WORK rather than the recursion. Eight is far above
-// anything measured (transitions repair in zero or one round) and the
-// backstop below is exact, not approximate: with every substitution refused
-// the published set is a subset of the desired set, and a subset of a
-// balanced leaf set is balanced.
-constexpr int kMaxRepairRounds = 8;
-
 }  // namespace
 
 int LeafLevelIn(const std::set<ChunkKey>& leaves, const ChunkKey& probe,
@@ -258,6 +248,33 @@ bool CoversAll(const std::set<ChunkKey>& cover,
         }
     }
     return true;
+}
+
+std::set<ChunkKey> CutAncestors(const std::set<ChunkKey>& leaves) {
+    std::set<ChunkKey> out;
+    for (const ChunkKey& k : leaves) {
+        ChunkKey a = k;
+        while (a.level > 0) {
+            a = a.Parent();
+            // Once a node is in, its whole chain to the root is in --
+            // recorded by whichever leaf reached it first. Stopping there
+            // turns the naive O(|leaves| * depth) walk into one probe per
+            // leaf plus one insert per ancestor, which matters because this
+            // runs every frame beside the cover walk.
+            if (!out.insert(a).second) break;
+        }
+    }
+    return out;
+}
+
+std::size_t WholeCutSlots(std::size_t leaf_budget) noexcept {
+    // I = (L - 6) / 3, and L is congruent to 0 mod 3 for any cut (L = 6 +
+    // 3I), so integer division is exact at the largest admissible L rather
+    // than a floor that loses a slot: the biggest cut inside a budget of B
+    // is the largest multiple of 3 not exceeding B, whose interior count is
+    // (B - 6) / 3 truncated. Six roots and no interior nodes is the floor.
+    if (leaf_budget <= 6) return leaf_budget;
+    return leaf_budget + (leaf_budget - 6) / 3;
 }
 
 ResidencyCover ComputeResidencyCover(const std::set<ChunkKey>& desired,

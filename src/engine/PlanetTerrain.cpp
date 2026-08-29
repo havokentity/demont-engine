@@ -73,17 +73,24 @@ bool PlanetTerrain::Init(pt::rhi::Device* device, const TerrainConfig& cfg) {
     field_.SetParams(cfg_.field);
 
     // --- Arenas -----------------------------------------------------------
-    // r_planet_chunk_budget is the HARD resource cap -- the arena is sized
-    // for exactly this many chunks and the TLAS for one more. The selector
-    // is given a lower target (see Update) because its own budget
-    // enforcement is soft at the boundary: merging under pressure can
-    // violate the 2:1 restriction, and the re-balance that repairs it can
-    // push the set back over. The 2:1 invariant has to win that tie --
-    // breaking it produces cracks -- so the arena carries the margin
-    // instead. Measured overshoot on the planet_surface fixture was 14%;
-    // the target leaves 20%.
-    chunk_budget_ = static_cast<std::uint32_t>(
+    // r_planet_chunk_budget is the LEAF cap: the frontier the selector may
+    // ask for, and the number EnforceBudget raises tau until the balanced
+    // set fits inside. The arena has to hold more than the frontier,
+    // because residency is the whole cut (#319) -- every desired leaf plus
+    // every interior node above it, kept so a merge has something one level
+    // coarser to publish instead of a hole.
+    //
+    // That surcharge is exact rather than estimated. A quadtree cut with L
+    // leaves has exactly (L - 6) / 3 interior nodes, so the arena is
+    // WholeCutSlots(leaf budget) and the TLAS one more. Sizing it this way
+    // rather than lowering the selector target is what keeps the converged
+    // desired set -- and therefore every planet golden -- exactly where it
+    // was: Select() is handed the same number it was handed before
+    // retention existed.
+    leaf_budget_  = static_cast<std::uint32_t>(
         std::clamp(cfg_.lod.chunk_budget, 8, 8192));
+    chunk_budget_ = static_cast<std::uint32_t>(
+        pt::planet::WholeCutSlots(static_cast<std::size_t>(leaf_budget_)));
     const std::size_t vert_bytes =
         static_cast<std::size_t>(chunk_budget_) *
         static_cast<std::size_t>(pt::planet::kChunkVertexCount) *
@@ -118,10 +125,12 @@ bool PlanetTerrain::Init(pt::rhi::Device* device, const TerrainConfig& cfg) {
     baker_.Start(std::clamp(cfg_.worker_count, 1, 16));
     baker_.SetSources(&field_, site_);
 
-    LOG_INFO("planet: terrain online -- site {:.4f}N {:.4f}E, budget {} chunks "
+    LOG_INFO("planet: terrain online -- site {:.4f}N {:.4f}E, budget {} leaves "
+             "+ {} retained ancestors = {} arena slots "
              "({:.0f} MB vertex arena + {:.1f} MB index arena), levels {}..{}, "
              "tau {:.2f} px",
              cfg_.site_lat_rad * 180.0 / kPi, cfg_.site_lon_rad * 180.0 / kPi,
+             leaf_budget_, chunk_budget_ - leaf_budget_,
              chunk_budget_, static_cast<double>(vert_bytes) / (1024.0 * 1024.0),
              static_cast<double>(index_arena_.ByteSize()) / (1024.0 * 1024.0),
              cfg_.lod.min_level, cfg_.lod.max_level, cfg_.lod.tau_px);
@@ -140,6 +149,7 @@ void PlanetTerrain::Shutdown() {
     }
     resident_.clear();
     published_.clear();
+    retained_.clear();
     baked_.clear();
     requested_.clear();
     retired_.clear();
@@ -357,8 +367,23 @@ void PlanetTerrain::ChooseCover(const std::set<ChunkKey>& desired,
     for (const ChunkKey& k : cover.published) {
         if (desired.find(k) == desired.end()) stand_ins.push_back(k);
     }
+    // The zoom-out reserve (#319): interior nodes of the desired cut that
+    // hold a slot without drawing anything. Disjoint from `stand_ins` by
+    // construction -- a retained ancestor the cover DID publish is standing
+    // in for ground its children cannot cover, so it is already earning its
+    // slot and is counted there instead.
+    std::vector<ChunkKey> reserve;
+    for (const ChunkKey& k : retained_) {
+        if (resident_.find(k) == resident_.end()) continue;
+        if (cover.published.find(k) != cover.published.end()) continue;
+        reserve.push_back(k);
+    }
     std::set<ChunkKey> released;
-    // Demand the arena is blocking: desired, baked, and homeless.
+    // Demand the arena is blocking: desired, baked, and homeless. Retained
+    // ancestors are deliberately NOT counted here. The deficit is what
+    // authorises a release, and releasing a chunk that is drawing ground to
+    // make room for one that is not would invert the whole policy: leaves
+    // first, always.
     std::size_t blocked = 0;
     for (const ChunkKey& k : desired) {
         if (resident_.find(k) != resident_.end()) continue;
@@ -376,8 +401,45 @@ void PlanetTerrain::ChooseCover(const std::set<ChunkKey>& desired,
     for (const Retired& rt : retired_) {
         if (rt.hold_release) ++releases_in_flight;
     }
-    const std::size_t deficit =
+    std::size_t deficit =
         (starved > releases_in_flight) ? (starved - releases_in_flight) : 0u;
+
+    // --- The reserve yields before the stand-ins -------------------------
+    //
+    // Both are slots the steady state does not need, so both are candidates
+    // when the arena is genuinely full, but they are not worth the same. A
+    // stand-in is DRAWING GROUND this frame; dropping it punches a hole
+    // now. A retained ancestor is drawing nothing; dropping it spends
+    // insurance against a zoom-out that may not come, and if it does come
+    // the cover falls back to the fine tiling underneath -- which is where
+    // this policy started. So the reserve goes first and in full before any
+    // stand-in is touched.
+    //
+    // Lowest error-per-distance first within the reserve, which for a chain
+    // of ancestors means the FINEST goes first. That is the right end to
+    // give up: a missing immediate parent is covered from below by its own
+    // four children at a one-level step, which the index arena has a stitch
+    // variant for, while a missing grandparent is the two-level step that
+    // gets refused and becomes a hole.
+    if (deficit > 0 && !reserve.empty()) {
+        std::sort(reserve.begin(), reserve.end(),
+                  [&](const ChunkKey& a, const ChunkKey& b) {
+                      const double pa = tree_.Priority(a, lod);
+                      const double pb = tree_.Priority(b, lod);
+                      if (pa != pb) return pa < pb;
+                      return a < b;
+                  });
+        const std::size_t drop = std::min(deficit, reserve.size());
+        for (std::size_t i = 0; i < drop; ++i) {
+            cover.retirable.push_back(reserve[i]);
+            released.insert(reserve[i]);
+        }
+        stats_.retained_dropped += static_cast<std::uint64_t>(drop);
+        deficit -= drop;
+        reserve.erase(reserve.begin(),
+                      reserve.begin() + static_cast<std::ptrdiff_t>(drop));
+    }
+
     const std::size_t cap =
         (deficit >= stand_ins.size()) ? 0u : (stand_ins.size() - deficit);
     if (stand_ins.size() > cap) {
@@ -403,10 +465,23 @@ void PlanetTerrain::ChooseCover(const std::set<ChunkKey>& desired,
 
     published_ = std::move(cover.published);
     stats_.holds_refused += static_cast<std::uint64_t>(cover.refused);
+    stats_.repair_rounds = cover.repair_rounds;
+    stats_.repair_rounds_peak =
+        std::max(stats_.repair_rounds_peak, cover.repair_rounds);
     stats_.held = std::min(stand_ins.size(), cap);
     stats_.starved = starved;
+    stats_.retained = reserve.size();
 
     for (const ChunkKey& k : cover.retirable) {
+        // A retained ancestor this pass did NOT release keeps its slot.
+        // ComputeResidencyCover reports it as retirable because it is
+        // neither desired nor published, which was the whole rule before
+        // #319 -- and is exactly the rule that threw the coarse chunks away
+        // on the way down and left nothing to publish on the way back up.
+        if (released.find(k) == released.end() &&
+            retained_.find(k) != retained_.end()) {
+            continue;
+        }
         auto it = resident_.find(k);
         if (it == resident_.end()) continue;
         RetireChunk(it->second);
@@ -444,12 +519,28 @@ bool PlanetTerrain::Update(const pt::planet::LodParams& lod,
     }
 
     // --- 2. Selector ------------------------------------------------------
-    // The selector target IS the arena size: EnforceBudget raises tau until
-    // the balanced set fits, so the cap is hard on both sides.
+    // The selector target is the LEAF budget, not the arena. EnforceBudget
+    // raises tau until the balanced leaf set fits inside it, and the arena
+    // is sized at WholeCutSlots(leaf budget) so the ancestors that leaf set
+    // implies are already paid for. Handing Select() the arena size instead
+    // would let the frontier grow into the slots its own ancestors need.
     pt::planet::LodParams sel = lod;
-    sel.chunk_budget = static_cast<int>(chunk_budget_);
+    sel.chunk_budget = static_cast<int>(leaf_budget_);
     tree_.Select(sel);
     const auto& desired = tree_.Desired();
+
+    // The whole cut: the frontier plus every interior node above it. Held
+    // resident, unpublished, so a merge has something one level coarser to
+    // publish instead of a hole (#319).
+    //
+    // EMPTY WHILE SETTLING, and for the same reason step 3a keeps the
+    // pre-coverage eviction there: a settle is a barrier with no observer,
+    // so there is no ascent to insure against, and putting |desired| / 3
+    // extra chunks through the free list would renumber the arena and
+    // reorder the BLAS builds that the golden matrix is pinned to.
+    retained_ = settling_ ? std::set<ChunkKey>{}
+                          : pt::planet::CutAncestors(desired);
+    stats_.cut = desired.size() + retained_.size();
 
     // --- 3. Diff residency ------------------------------------------------
     bool dirty = fresh.empty() ? false : true;
@@ -475,9 +566,67 @@ bool PlanetTerrain::Update(const pt::planet::LodParams& lod,
     // nobody sees.
     if (settling_) RetireUncovered(desired);
 
-    // 3b. Add / restitch, paced against the build budget. The clock starts
-    // here rather than at the top of Update so the selector's own cost does
-    // not eat the AS budget it is not responsible for.
+    // 3b. Add / restitch, paced against the build budget.
+    //
+    // EVERYTHING THE BUDGET IS NOT RESPONSIBLE FOR HAPPENS BEFORE THE CLOCK
+    // STARTS. r_planet_blas_budget_ms exists because Device::CreateBLAS
+    // ends in waitUntilCompleted / vkQueueWaitIdle, so what it is bounding
+    // is time spent inside the RHI -- and charging the priority sorts to it
+    // does not slow the frame down, it just stops the frame doing any work.
+    // Both sorts run a comparator that does two map lookups, so on a Debug
+    // host a 700-leaf set costs several milliseconds to ORDER: measured
+    // there, the first over_budget() check after the sort was already true
+    // and the retained-ancestor pass below admitted nothing, ever. The
+    // arena held 699 of a 930-chunk cut for the whole run and the zoom-out
+    // it is insurance against holed out exactly as it did before the fix.
+    // Release never saw it, which is the shape of a threshold bug.
+    //
+    // Process in the selector's own priority order so a budgeted frame
+    // spends its slots where the geometric error is largest.
+    std::vector<ChunkKey> order(desired.begin(), desired.end());
+    std::sort(order.begin(), order.end(), [&](const ChunkKey& a, const ChunkKey& b) {
+        const double pa = tree_.Priority(a, lod);
+        const double pb = tree_.Priority(b, lod);
+        if (pa != pb) return pa > pb;
+        return a < b;
+    });
+
+    // Retained ancestors that are baked and homeless, coarsest-needed
+    // first, and the leaf demand the arena is blocking right now. Both are
+    // measured against residency AS IT STANDS AT THE TOP OF THE FRAME. The
+    // add loop below can only make `blocked` smaller and can only add
+    // DESIRED chunks, which are disjoint from the retained set, so a
+    // start-of-frame reading is conservative in the safe direction: it can
+    // under-admit ancestors, never over-admit them.
+    std::size_t blocked_leaves = 0;
+    std::vector<ChunkKey> anc_order;
+    if (!settling_ && !retained_.empty()) {
+        for (const ChunkKey& k : desired) {
+            if (resident_.find(k) != resident_.end()) continue;
+            if (baked_.find(k) != baked_.end()) ++blocked_leaves;
+        }
+        anc_order.reserve(retained_.size());
+        for (const ChunkKey& k : retained_) {
+            if (resident_.find(k) != resident_.end()) continue;
+            if (baked_.find(k) == baked_.end()) continue;
+            anc_order.push_back(k);
+        }
+        // Priority is e_L / d and e_L grows with the chunk's span, so
+        // highest-first admits the ancestors FURTHEST above the frontier
+        // first. That is the right end: a missing immediate parent is
+        // covered from below by its own four children at a one-level step
+        // the index arena has a stitch variant for, while a missing
+        // grandparent is the two-level step that gets refused and becomes
+        // the hole.
+        std::sort(anc_order.begin(), anc_order.end(),
+                  [&](const ChunkKey& a, const ChunkKey& b) {
+                      const double pa = tree_.Priority(a, lod);
+                      const double pb = tree_.Priority(b, lod);
+                      if (pa != pb) return pa > pb;
+                      return a < b;
+                  });
+    }
+
     using clk = std::chrono::steady_clock;
     const auto t0 = clk::now();
     // Unpaced while settling. Pacing decides how much of a round's work
@@ -494,17 +643,17 @@ bool PlanetTerrain::Update(const pt::planet::LodParams& lod,
         return ms >= budget_ms;
     };
 
-    // Process in the selector's own priority order so a budgeted frame
-    // spends its slots where the geometric error is largest.
-    std::vector<ChunkKey> order(desired.begin(), desired.end());
-    std::sort(order.begin(), order.end(), [&](const ChunkKey& a, const ChunkKey& b) {
-        const double pa = tree_.Priority(a, lod);
-        const double pb = tree_.Priority(b, lod);
-        if (pa != pb) return pa > pb;
-        return a < b;
-    });
-
     for (const ChunkKey& key : order) {
+        auto rit = resident_.find(key);
+        // Restitching a chunk that is already resident belongs to the cover
+        // pass in the paced path -- doing it here as well, against a
+        // different leaf set, would have the two passes rebuild the same
+        // BLAS in opposite directions every frame. Leave before computing
+        // the mask, not after: StitchMask is four neighbour walks, and at
+        // steady state this branch is taken for EVERY leaf, so computing a
+        // mask nobody reads was several milliseconds of the build budget
+        // per frame on a Debug host.
+        if (rit != resident_.end() && !settling_) continue;
         // PROVISIONAL stitch mask, from the desired set. It is the right
         // answer whenever the published cover equals the desired set, which
         // is every frame that is not mid-transition; where it is wrong --
@@ -512,13 +661,7 @@ bool PlanetTerrain::Update(const pt::planet::LodParams& lod,
         // the selector thinks -- 3d corrects it against the cover, at the
         // cost of one extra BLAS build for that chunk.
         const std::uint32_t mask = tree_.StitchMask(key);
-        auto rit = resident_.find(key);
         if (rit != resident_.end()) {
-            // Restitching a chunk that is already resident belongs to the
-            // cover pass in the paced path -- doing it here as well, against
-            // a different leaf set, would have the two passes rebuild the
-            // same BLAS in opposite directions every frame.
-            if (!settling_) continue;
             if (rit->second.mask == mask) continue;
             if (over_budget()) break;
             // The stitch variant changed, so the index set changed and the
@@ -563,6 +706,78 @@ bool PlanetTerrain::Update(const pt::planet::LodParams& lod,
         dirty = true;
     }
 
+    // --- 3b-bis. Admit retained ancestors, strictly behind the leaves ----
+    //
+    // Refusing to RETIRE an ancestor is enough while the camera is
+    // descending, because the ancestor was a leaf a moment ago and is
+    // already resident. It is not enough anywhere the descent skipped a
+    // level: TerrainQuadtree::Descend splits as soon as a node's e_L is
+    // known, and metrics_ outlives residency, so a camera returning to
+    // ground it has already measured goes straight from the root to the
+    // deep frontier and never makes the levels between it resident. A
+    // Settle() barrier leaves exactly the same gap -- it retires everything
+    // outside the frontier by design. Those cuts would still hole out on
+    // the way back up, so the missing interior nodes are baked and admitted
+    // here.
+    //
+    // WHAT KEEPS THEM FROM COMPETING WITH THE LEAVES. Three things, in
+    // order of how much they matter:
+    //
+    //   * the arena is sized for both (WholeCutSlots), so at steady state
+    //     there is no competition to arbitrate;
+    //   * this loop runs AFTER the desired loop and shares its millisecond
+    //     budget, so a frame that spent its budget on leaves has none left
+    //     to spend here;
+    //   * and it will not touch the free slots that this frame's blocked
+    //     leaf demand needs. `blocked_leaves` is measured, not forecast --
+    //     desired, baked, and homeless at the top of the frame -- which is
+    //     the same quantity ChooseCover releases against and for the same
+    //     reason: #308 recorded two standing reserves that forecast the
+    //     arena's slack and both refused every hold while hundreds of slots
+    //     sat empty.
+    //
+    // The candidate list and its ordering were built before the budget
+    // clock started; see the note at 3b for what happened on a Debug host
+    // when they were not.
+    {
+        std::size_t spare = (free_slots_.size() > blocked_leaves)
+                                ? (free_slots_.size() - blocked_leaves) : 0u;
+        for (const ChunkKey& key : anc_order) {
+            if (spare == 0 || free_slots_.empty()) break;
+            if (over_budget()) break;
+            const auto bit = baked_.find(key);
+            if (bit == baked_.end()) continue;
+
+            Resident r;
+            r.key      = key;
+            // Provisional, and almost always 0: an ancestor's neighbours in
+            // the DESIRED set are finer than it is, and StitchMaskFor only
+            // sets a bit for a COARSER neighbour. 3d recomputes it against
+            // the published cover on the frame this chunk is actually
+            // published, which is the only frame the mask means anything.
+            r.mask     = tree_.StitchMask(key);
+            r.origin_w = bit->second.origin_w;
+            r.positions = bit->second.positions;
+            r.slot     = free_slots_.back();
+            free_slots_.pop_back();
+
+            const std::size_t stride =
+                static_cast<std::size_t>(pt::planet::kChunkVertexCount) * kVertFloats;
+            device_->WriteBuffer(vert_buf_, bit->second.shader_verts.data(),
+                                 stride * sizeof(float),
+                                 static_cast<std::size_t>(r.slot) * stride * sizeof(float));
+            if (!BuildChunkBlas(r)) {
+                free_slots_.push_back(r.slot);
+                continue;
+            }
+            resident_.emplace(key, std::move(r));
+            --spare;
+            // NOT `dirty`. A retained ancestor is not published, so nothing
+            // about the instance array or the descriptors changed; 3c's
+            // cover digest is what notices if it does get published.
+        }
+    }
+
     // --- 3c. Choose the published cover and retire what it makes redundant.
     //
     // The dirty flag is driven off a DIGEST of the cover, not off its size.
@@ -592,8 +807,10 @@ bool PlanetTerrain::Update(const pt::planet::LodParams& lod,
         // the pre-coverage one: same instances, same descriptors, same digest.
         published_.clear();
         for (const auto& [k, r] : resident_) { (void)r; published_.insert(k); }
-        stats_.held    = 0;
-        stats_.starved = 0;
+        stats_.held          = 0;
+        stats_.starved       = 0;
+        stats_.retained      = 0;
+        stats_.repair_rounds = 0;
     } else {
         ChooseCover(desired, lod);
     }
@@ -642,11 +859,16 @@ bool PlanetTerrain::Update(const pt::planet::LodParams& lod,
 
     if (resident_.size() != resident_before) dirty = true;
 
-    // Drop baked data for chunks that are neither resident nor desired, so
-    // the CPU cache does not grow without bound as the camera moves.
+    // Drop baked data for chunks that are neither resident nor desired nor
+    // retained, so the CPU cache does not grow without bound as the camera
+    // moves. Retained ancestors have to survive this: dropping a bake that
+    // has not found an arena slot yet would have step 4 request it again
+    // next frame, and the pair would cycle for as long as the arena stayed
+    // full.
     for (auto it = baked_.begin(); it != baked_.end();) {
         if (desired.find(it->first) == desired.end() &&
-            resident_.find(it->first) == resident_.end()) {
+            resident_.find(it->first) == resident_.end() &&
+            retained_.find(it->first) == retained_.end()) {
             it = baked_.erase(it);
         } else {
             ++it;
@@ -666,6 +888,25 @@ bool PlanetTerrain::Update(const pt::planet::LodParams& lod,
         if (std::find(requested_.begin(), requested_.end(), k) != requested_.end()) continue;
         requested_.push_back(k);
     }
+    // Retained ancestors LAST. AsyncChunkBaker::Request stores the list
+    // reversed and the workers pop the back, so position in this vector is
+    // priority -- putting the ancestors at the tail means the pool bakes
+    // them only once every leaf it has been asked for is either done or in
+    // flight. Same rule as the arena: leaves first.
+    if (!retained_.empty()) {
+        std::vector<ChunkKey> anc(retained_.begin(), retained_.end());
+        std::sort(anc.begin(), anc.end(), [&](const ChunkKey& a, const ChunkKey& b) {
+            const double pa = tree_.Priority(a, lod);
+            const double pb = tree_.Priority(b, lod);
+            if (pa != pb) return pa > pb;
+            return a < b;
+        });
+        for (const ChunkKey& k : anc) {
+            if (resident_.find(k) != resident_.end()) continue;
+            if (baked_.find(k) != baked_.end()) continue;
+            requested_.push_back(k);
+        }
+    }
     baker_.Request(requested_);
 
     // --- 5. Publish -------------------------------------------------------
@@ -680,6 +921,18 @@ bool PlanetTerrain::Update(const pt::planet::LodParams& lod,
     stats_.resident_peak = std::max(stats_.resident_peak, stats_.resident);
     stats_.published     = published_.size();
     stats_.desired       = desired.size();
+    // How much of the whole cut is actually in the arena. Members of the
+    // cut, not merely a count of residents: a stale chunk from the previous
+    // camera is resident too, and it insures nothing.
+    std::size_t desired_resident = 0;
+    for (const ChunkKey& k : desired) {
+        if (resident_.find(k) != resident_.end()) ++desired_resident;
+    }
+    std::size_t retained_resident = 0;
+    for (const ChunkKey& k : retained_) {
+        if (resident_.find(k) != resident_.end()) ++retained_resident;
+    }
+    stats_.cut_resident = desired_resident + retained_resident;
     stats_.pending_bakes = requested_.size() +
                            static_cast<std::size_t>(baker_.InFlight());
     // "Converged" for the capture gate: the selector has measured every
@@ -690,8 +943,15 @@ bool PlanetTerrain::Update(const pt::planet::LodParams& lod,
     // idle and the queue empty the metric map cannot grow, so a digest that
     // matches the previous frame's is a genuine fixed point -- and that is
     // the only statement strong enough to pin a golden against.
+    // `resident_.size() == desired.size()` was the pre-#319 form and it now
+    // says the wrong thing on the paced path, where residency is the whole
+    // cut and legitimately exceeds the frontier. The claim the capture gate
+    // wants is "every chunk the selector asked for is in the arena", so
+    // that is what is asserted. On the settling path the two are the same
+    // statement -- RetireUncovered has already made resident_ a subset of
+    // desired -- so the barrier stops exactly where it stopped before.
     stats_.converged = tree_.Converged() && baker_.Idle() &&
-                       resident_.size() == desired.size() &&
+                       desired_resident == desired.size() &&
                        requested_.empty() && digest == prev_digest_;
     prev_digest_ = digest;
     stats_.desired_digest = digest;
