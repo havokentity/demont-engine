@@ -43,6 +43,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -51,12 +52,54 @@
 
 namespace {
 
+// Strip CR so every pattern below is matched against canonical LF text.
+//
+// THIS IS NOT COSMETIC. Git checks text files out with CRLF on Windows by
+// default, so on that runner the .slang source carries \r\n and any pattern
+// containing an embedded \n silently never matches -- the pin reports
+// "0 occurrences" for a declaration that is right there in the file. That
+// is a pin failing OPEN on one platform only, which is the worst shape a
+// verification bug can have, and it is exactly what happened: #280's
+// kPtSolarIrradiance pin passed on macOS and Linux and failed on Windows
+// while 1156 of 1157 assertions in this file passed.
+//
+// Normalising here rather than at each pattern is deliberate: it fixes
+// every FUTURE pin in this file too, and it does it without weakening any
+// of them. The tempting alternative -- drop the newline and match
+// "kPtSolarIrradiance" alone -- would turn a pin on the declaration's exact
+// form into a pin on a symbol name appearing anywhere, which is most of the
+// way back to the find() != npos problem this repo has already been bitten
+// by (#276).
+//
+// The two neighbouring test files reach the same place by two other routes,
+// and both are worth knowing: pt_atmosphere_test.cpp strips ALL whitespace
+// from source and pattern alike (its tighten()), and
+// pt_planet_shader_test.cpp reads raw but happens to carry no pattern with
+// an embedded newline. Only the third route -- raw read plus a multi-line
+// pattern -- is broken, and this file was the first to take it.
+std::string NormaliseNewlines(std::string s) {
+    s.erase(std::remove(s.begin(), s.end(), '\r'), s.end());
+    return s;
+}
+
 std::string ReadFile(const char* path) {
     std::ifstream f(path, std::ios::binary);
     REQUIRE_MESSAGE(f.is_open(), "cannot open ", path);
     std::ostringstream ss;
     ss << f.rdbuf();
-    return ss.str();
+    return NormaliseNewlines(ss.str());
+}
+
+// The inverse, for the CRLF case at the bottom of this file: turn canonical
+// LF text into what Git hands a Windows checkout.
+std::string ToCrlf(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + s.size() / 16);
+    for (char c : s) {
+        if (c == '\n') out.push_back('\r');
+        out.push_back(c);
+    }
+    return out;
 }
 
 // COUNT, never find() != npos.  A substring pin is satisfied by one correct
@@ -155,10 +198,11 @@ TEST_CASE("the unit rebase is one derived factor, not a tuned one") {
           == doctest::Approx(pt::atmo::kUnitRebaseScale).epsilon(1e-3));
 }
 
-TEST_CASE("the shader carries the same anchor, and the old literal is gone") {
-    const std::string math = ReadFile(PT_SHADER_MATH_PATH);
-    const std::string pt   = ReadFile(PT_SHADER_PATHTRACE_PATH);
-
+// Every pin that depends on line structure, in one place, so the CRLF case
+// below can run the identical assertions against CRLF input instead of a
+// paraphrase of them. A second hand-written copy would be free to drift and
+// would then be verifying nothing.
+void CheckAnchorPins(const std::string& math, const std::string& pt) {
     // The triple is declared exactly once, in the module, at the values the
     // host computes.  Formatting the expectation from the host constants is
     // what makes this a MIRROR pin rather than a second hand-typed copy.
@@ -190,6 +234,48 @@ TEST_CASE("the shader carries the same anchor, and the old literal is gone") {
     // recorded that this expression had ALREADY drifted into two copies
     // with different warmth ramps, so a pin of one would leave the other.
     CHECK(CountOccurrences(pt, "80.0 * kPtLegacySkyScale") == 2);
+}
+
+TEST_CASE("the shader carries the same anchor, and the old literal is gone") {
+    CheckAnchorPins(ReadFile(PT_SHADER_MATH_PATH),
+                    ReadFile(PT_SHADER_PATHTRACE_PATH));
+}
+
+TEST_CASE("the source pins survive a CRLF checkout") {
+    // VERIFIED BY CONSTRUCTION, because no MSVC runner is reachable from
+    // where this was written. Feed the same assertions the bytes Git hands
+    // a Windows checkout -- every LF becomes CRLF -- and require them to
+    // hold. A pin that passes on LF and fails on CRLF is a pin that fails
+    // open on one platform, and this file already shipped one.
+    const std::string math_lf = ReadFile(PT_SHADER_MATH_PATH);
+    const std::string pt_lf   = ReadFile(PT_SHADER_PATHTRACE_PATH);
+
+    // The harness must actually be doing something, or this case passes by
+    // being a second copy of the one above. ToCrlf has to change the text,
+    // and NormaliseNewlines has to change it back exactly.
+    const std::string math_crlf = ToCrlf(math_lf);
+    const std::string pt_crlf   = ToCrlf(pt_lf);
+    REQUIRE(math_crlf.size() > math_lf.size());
+    REQUIRE(pt_crlf.size()   > pt_lf.size());
+    CHECK(NormaliseNewlines(math_crlf) == math_lf);
+    CHECK(NormaliseNewlines(pt_crlf)   == pt_lf);
+
+    // And the failure this reproduces, pinned as a failure: the multi-line
+    // pattern must NOT match raw CRLF text. If this ever starts matching,
+    // the bug it stands for has changed shape and the guard below is no
+    // longer testing what it claims.
+    char decl[160];
+    std::snprintf(decl, sizeof(decl), "float3(%.4f, %.4f, %.4f)",
+                  static_cast<double>(pt::atmo::kSolarIrradianceR),
+                  static_cast<double>(pt::atmo::kSolarIrradianceG),
+                  static_cast<double>(pt::atmo::kSolarIrradianceB));
+    const std::string multiline = std::string("kPtSolarIrradiance =\n    ") + decl;
+    CHECK(CountOccurrences(math_lf, multiline) == 1);
+    CHECK(CountOccurrences(math_crlf, multiline) == 0);   // the Windows bug
+
+    // Now the real bar: normalised CRLF input passes every pin the LF input
+    // passes, running the same code.
+    CheckAnchorPins(NormaliseNewlines(math_crlf), NormaliseNewlines(pt_crlf));
 }
 
 TEST_CASE("the sun disc and the sun NEE partition one light source") {
