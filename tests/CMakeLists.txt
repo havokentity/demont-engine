@@ -568,6 +568,32 @@ if(APPLE)
 endif()
 # --- end planetary ocean ---------------------------------------------------
 
+# --- pt_water_optics (issue #261, planetary P7) ----------------------------
+# Underwater: the Pope & Fry 1997 absorption table and the Morel 1974
+# scattering fit as published measurements rather than as a tint, the
+# descent-to-200 m sequence verified four ways (measured coefficients, an
+# ordering that holds at every depth with no tolerance, a Lipschitz
+# refinement ladder with a hard-switch control that plateaus, and the
+# march's own second-order convergence against the closed form the
+# homogeneous column has), the medium stack that replaces a bit which
+# could not represent nesting, and Snell's window with the refracted sun
+# direction that makes it shade rather than merely sit in the right place.
+#
+# Links pt_physics only -- pt::water is a leaf module over glm with no RHI
+# or engine dependency, so the tests exercise the real code rather than a
+# transcription of it. The shader kernels ARE transcribed (there is no host
+# entry point for them), and the last case re-reads all four sources to pin
+# what the transcriptions depend on.
+pt_add_test(pt_water_optics
+    pt_water_optics_test.cpp
+    LINK_TARGETS pt_physics)
+target_compile_definitions(pt_water_optics PRIVATE
+    PT_SHADER_PATHTRACE_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang"
+    PT_SHADER_PATHTRACEMATH_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTraceMath.slang"
+    PT_ENGINE_CPP_PATH="${CMAKE_SOURCE_DIR}/src/engine/Engine.cpp"
+    PT_WATER_OPTICS_CPP_PATH="${CMAKE_SOURCE_DIR}/src/physics/WaterOptics.cpp")
+# --- end underwater --------------------------------------------------------
+
 # --- phys_drop_* RGB arg shapes (PR #189 / issue #181 follow-up) -----------
 # Pins the arg-shape contract for `phys_drop_sphere` (3, 4, 5, or 8 args)
 # and `phys_drop_box` (6, 7, or 10 args) plus the rejection rules
@@ -2174,6 +2200,131 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     pt_add_golden_cell(SCENE planet_ocean_orbit BACKEND metal DENOISER off
                        FRAMES 48 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
     pt_add_golden_cell(SCENE planet_ocean_snell BACKEND metal DENOISER off
+                       FRAMES 48 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
+
+    # PLANETARY P7 (#261) REGENERATED planet_ocean_snell, AND ONLY IT OF THE
+    # THREE. That cell is the matrix's only submerged camera before this
+    # phase, so it is the only one the underwater in-scatter march and the
+    # refracted sun NEE can reach. MEASURED against the P5 golden it
+    # replaces, on the pre-rebase build where both were reproducible:
+    # mean-delta 20.72 over 50.27% of pixels, max 140.44. The window gains
+    # an in-scattered blue column and a sun that is now integrated at its
+    # REFRACTED direction -- before P7 the sun could only be found by a BSDF
+    # sample happening to land on a 0.53-degree disc after crossing the
+    # interface, so the window was lit but had no sun in it. planet_ocean
+    # _boat and planet_ocean_orbit are byte-identical and were not touched:
+    # both cameras are in air, and every P7 code path is gated on the
+    # medium stack saying otherwise.
+    #
+    # --- Planetary P7 (#261): underwater -------------------------------
+    #
+    # Two cells, and they are deliberately not one. #261 changes two things
+    # that would be inseparable in a single fixture: it adds the in-scatter
+    # march, and it reparameterises r_water_absorption_* onto Pope & Fry
+    # 1997's measured pure-water coefficients. A cell that moved for both
+    # reasons could attribute neither.
+    #
+    #   planet_underwater_column  states NO absorption at all, so it renders
+    #                             on the new defaults. It is the cell that
+    #                             fails if the measurement stops reaching
+    #                             the screen. Pure seawater: molecular
+    #                             scattering only, near-symmetric
+    #                             depolarised-Rayleigh phase.
+    #   water_pool_submerged      states water_pool's own (0.45, 0.15, 0.05)
+    #                             verbatim, so the defaults cannot move it.
+    #                             It is the only cell in the matrix with the
+    #                             CAMERA inside the medium and real geometry
+    #                             occluding the sun, and the only one that
+    #                             turns the Petzold particulate species on.
+    #
+    # THE VACUITY TRAP IS UNUSUALLY LIVE HERE AND IS HANDLED EXPLICITLY. An
+    # underwater frame is already dark, so "the image changed when I deleted
+    # the feature" is a test a black frame passes. Both fixtures therefore
+    # set an exposure that puts the water column in the MIDDLE of the range
+    # (0.30 and 0.20, the latter two stops over water_pool's own 0.05), and
+    # every ablation below is checked to be a change in CONTENT: none of
+    # them blanks the frame. r_water_inscatter 0 leaves the transmitted sky,
+    # Snell's window and every surface exactly where they were and removes
+    # only the scattered light; r_water_scatter_particulate 0 leaves the
+    # molecular species behind it.
+    #
+    # DETERMINISM, MEASURED BOTH WAYS, BECAUSE SERIAL IS NOT EVIDENCE. Both
+    # cells render byte-identical over twelve consecutive runs AND over
+    # twelve run 12-WAY CONCURRENTLY, in Release and in Debug -- 48 renders
+    # apiece, one hash each. (Release and Debug agree with each other on
+    # planet_underwater_column and not on water_pool_submerged, which is
+    # just -ffast-math, and is why goldens carry thresholds rather than
+    # being compared as hashes.)
+    #
+    # THE CONCURRENT HALF IS NOT A FORMALITY, AND THIS PHASE IS THE PROOF.
+    # Before rebasing onto #296, planet_underwater_column was 23-of-24
+    # identical SERIALLY and gave TEN DISTINCT IMAGES IN TWELVE under 12-way
+    # contention, worst pair mean-delta 23.24 over 42.56% of pixels. #261
+    # did not create that -- #295 did -- but it is what made it fire
+    # reliably, because the in-scatter march is 16 extra shadow rays per
+    # pixel and a slower frame lets the CPU run further ahead of the upload
+    # ring. planet_ocean_snell went the same way, from 42-of-43 stable to
+    # eight distinct images in eight. Post-#296 all three are one hash.
+    #
+    # THRESHOLDS, MEASURED. Run-to-run on the dev M4 Max is 0.0000 max /
+    # 0.000000 mean / 0 bad pixels on both -- bit-identical, twice over --
+    # so these are the MATRIX DEFAULTS (16 / 2 / 1) passed explicitly rather
+    # than inherited, kept loose for another driver's rounding exactly as
+    # every other Metal cell in this file. The feature-deleted margins:
+    #
+    #   planet_underwater_column
+    #     r_water_inscatter 0                    mean   9.33  bad 19.81%
+    #     r_water_inscatter_samples 1            mean   9.33  bad 19.83%
+    #     legacy (0.45, 0.15, 0.05) absorption   mean  86.13  bad 96.84%
+    #     absorption 0 0 0                       mean 145.40  bad 99.98%
+    #   water_pool_submerged
+    #     r_water_inscatter 0                    mean  17.12  bad 44.07%
+    #     r_water_scatter_particulate 0          mean   8.24  bad 17.40%
+    #     ambient gate deleted in the shader     mean   5.44  bad  0.75%
+    #     r_water_inscatter_samples 1            mean   2.01  bad  0.36%
+    #
+    # The weakest FAILING row is 2.7x above MEAN_DELTA 2, against a noise
+    # floor of exactly zero (ref-vs-ref, twice, on both cells: 0 bad
+    # pixels). Re-measure if a fixture's camera, resolution,
+    # exposure or frame count changes: the margins are the point, not the
+    # numbers.
+    #
+    # THE AMBIENT-GATE ROW IS CAUGHT BY ONE CRITERION AND NOT THE OTHER,
+    # and that is worth saying plainly rather than leaving to be discovered.
+    # Deleting the gate raises the whole seabed by a little rather than a
+    # few pixels by a lot, so mean-delta 5.44 is 2.7x over MEAN_DELTA while
+    # bad-percent 0.75 is UNDER FAIL_PERCENT 1: this cell fails on the mean
+    # and would pass on the per-pixel count alone. It also has no cvar --
+    # the gate is a correctness fix, not a feature, and putting it behind a
+    # switch would invite leaving it off -- so that row was measured by
+    # editing the shader, not by --extra, and cannot be re-run from the
+    # matrix. It is the reason this fixture's floor sits at 7 m and its
+    # camera looks down at it; see the cfg header for that derivation.
+    #
+    # TWO ROWS ARE CONTROLS AND NOT ABLATIONS. Passing a cvar the fixture
+    # already sets to that value -- `r_water_ior 1.33` on the column,
+    # `r_water_scatter_particulate 0.15` on the pool -- reproduces the
+    # reference BIT-IDENTICALLY, 0 bad pixels. And every ablation row above
+    # that DOES move the image is itself the evidence that --extra reached
+    # the cvar it named: a silently-dropped override would have given zero
+    # there too.
+    #
+    # WHY samples_1 IS A FAILING ROW ON ONE CELL AND A PASSING ONE ON THE
+    # OTHER, since it looks like an inconsistency and is not. The march's
+    # QUADRATURE bias is negligible at any sample count -- two midpoint
+    # samples hold the smooth integral inside one 8-bit level over the whole
+    # 404 m black depth, measured in tests/pt_water_optics_test.cpp. What
+    # the sample count buys is VARIANCE, and variance scales with how far
+    # the sun's slant transmittance swings across the span. In the 2 m pool
+    # it barely swings and N = 1 lands at mean 2.01 / 0.36% bad, only just
+    # over MEAN_DELTA; over the column's 30 m it swings by orders of
+    # magnitude in red and N = 1 is as far from the reference as deleting the
+    # march altogether. That is the honest reason the default is 16 and not
+    # 2.
+    pt_add_golden_cell(SCENE planet_underwater_column BACKEND metal
+                       DENOISER off
+                       FRAMES 48 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
+    pt_add_golden_cell(SCENE water_pool_submerged BACKEND metal DENOISER off
                        FRAMES 48 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
 
     # --- The Cox-Munk test (#259's stated acceptance criterion) -----------

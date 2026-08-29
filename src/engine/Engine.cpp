@@ -41,6 +41,7 @@
 // #259 / #133 Phase 2: the push layout + five-pass sequence for
 // shaders/OceanCascades.slang, shared with tests/pt_ocean_gpu_test.cpp.
 #include "../physics/OceanCascadeDispatch.h"
+#include "../physics/WaterOptics.h"  // Planetary P7 (#261) seawater optics
 #include "../rhi/CommandBuffer.h"
 #include "../rhi/Device.h"
 
@@ -429,20 +430,31 @@ namespace cvar {
     // r_water_* cvars feed PathTrace.slang's MAT_WATER BRDF branch via the
     // water_params0 / water_params1 push fields.  All CVAR_ARCHIVE so a
     // user's tuning persists across sessions.
-    PT_CVAR(r_water_absorption_r, "0.45",
-            "Per-channel Beer's-law absorption coefficient (1/m) on the RED "
-            "channel for MAT_WATER. Higher = red attenuates faster with "
-            "depth (more teal water). Default 0.45 matches the classic "
-            "Caribbean tint when combined with the green/blue defaults.",
+    // Planetary P7 (#261): the defaults are now Pope & Fry 1997's measured
+    // pure-water absorption at 620 / 550 / 450 nm, taken from the table in
+    // src/physics/WaterOptics.h rather than authored. The previous
+    // (0.45, 0.15, 0.05) was 2-5x the pure-water values -- fairly turbid
+    // coastal water dressed as a default. Pure water is the FLOOR of what
+    // these can physically be; raising them models CDOM, chlorophyll and
+    // suspended sediment, which is exactly what a Jerlov type is.
+    PT_CVAR(r_water_absorption_r, "0.2755",
+            "Total Beer's-law absorption coefficient (1/m) on the RED "
+            "channel for MAT_WATER. Default 0.2755 is Pope & Fry 1997's "
+            "measured pure-water value at 620 nm (1/e depth 3.63 m), the "
+            "physical floor. Raise for turbid / coastal water: a Jerlov "
+            "type 3C coast is roughly 0.45. Higher = red attenuates faster "
+            "with depth.",
             CVAR_ARCHIVE);
-    PT_CVAR(r_water_absorption_g, "0.15",
-            "Per-channel Beer's-law absorption coefficient (1/m) on the "
-            "GREEN channel for MAT_WATER. Default 0.15.",
+    PT_CVAR(r_water_absorption_g, "0.0565",
+            "Total Beer's-law absorption coefficient (1/m) on the GREEN "
+            "channel for MAT_WATER. Default 0.0565 is Pope & Fry 1997 at "
+            "550 nm (1/e depth 17.7 m).",
             CVAR_ARCHIVE);
-    PT_CVAR(r_water_absorption_b, "0.05",
-            "Per-channel Beer's-law absorption coefficient (1/m) on the "
-            "BLUE channel for MAT_WATER. Default 0.05 -- blue survives "
-            "longest, giving the deep-water blue tint.",
+    PT_CVAR(r_water_absorption_b, "0.00922",
+            "Total Beer's-law absorption coefficient (1/m) on the BLUE "
+            "channel for MAT_WATER. Default 0.00922 is Pope & Fry 1997 at "
+            "450 nm (1/e depth 108 m) -- blue survives longest, which is "
+            "why deep clear water is blue.",
             CVAR_ARCHIVE);
     PT_CVAR(r_water_ior, "1.33",
             "Refractive index of water for MAT_WATER. Default 1.33 (real "
@@ -497,6 +509,40 @@ namespace cvar {
             "r_water_deep_color_r for full semantics. Default 0.0.",
             CVAR_ARCHIVE);
     // --- end Water Phase 4 ---------------------------------------------------
+    // --- Planetary P7 (#261): underwater in-scatter --------------------------
+    // The MOLECULAR scattering coefficient is not a cvar. It is Morel 1974's
+    // measurement of pure seawater, derived in src/physics/WaterOptics.h and
+    // pushed as water_scatter.xyz -- a property of water, not of a scene.
+    // What IS tunable is everything a scene can actually differ in: how much
+    // suspended matter the water carries, and how finely the column is
+    // integrated.
+    PT_CVAR(r_water_scatter_particulate, "0.0",
+            "Particulate scattering coefficient b_p (1/m) for MAT_WATER, "
+            "grey, ADDED to the pure-seawater molecular scattering the "
+            "engine always applies. Default 0.0 = optically pure seawater. "
+            "Real values by Jerlov water type: open ocean type I ~0.03-0.05, "
+            "coastal type 1C-3C ~0.1-0.3, turbid harbour ~0.5+. Scattered "
+            "with the Petzold average-particle phase function (g = 0.924), "
+            "which is strongly forward -- this is what puts visible haze and "
+            "shafts in the water, where the molecular term mostly puts blue.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_water_inscatter, "1",
+            "Master gate for the underwater single-scatter march (1 = on). "
+            "0 reverts a submerged frame to pure exponential darkening -- "
+            "absorption with no scattering -- which is what every build "
+            "before Planetary P7 (#261) did, and which reads as tinted "
+            "glass rather than as water. Metal / Vulkan only.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_water_inscatter_samples, "16",
+            "Stratified sample count for the underwater in-scatter march. "
+            "Clamped to [1, 256] in the shader. The march span is DERIVED "
+            "-- ln(255) / min(sigma_t), the depth below which the least "
+            "attenuated channel transmits under one 8-bit level -- so this "
+            "is a step density, not a distance: 16 samples over pure "
+            "seawater's 401 m black depth is a 25 m step, and over a turbid "
+            "column's 60 m it is 3.8 m.",
+            CVAR_ARCHIVE);
+    // --- end Planetary P7 ----------------------------------------------------
     // --- Wave 8 ocean (#25) -- FFT Tessendorf ocean surface ------------------
     // Master gate + tunables for the CPU FFT ocean (pt::ocean::OceanFFT).
     // When r_ocean is 0 the engine skips the solver step + texture upload
@@ -9205,6 +9251,22 @@ void Engine::RenderFrame() {
         float ocean_phase[4];
         float ocean_slope[4];
         // --- end Planetary P5 --------------------------------------------
+        // --- Planetary P7 (#261): underwater in-scatter -------------------
+        // water_scatter.xyz = pure-seawater MOLECULAR scattering b_w(lambda)
+        //                     at 620/550/450 nm, 1/m. Morel 1974 through
+        //                     the Rayleigh-with-depolarisation sphere
+        //                     integral; see src/physics/WaterOptics.h. Not
+        //                     a cvar -- it is a property of seawater.
+        //              .w   = r_water_scatter_particulate, the grey
+        //                     particulate b_p, 1/m. This is the Jerlov
+        //                     turbidity knob.
+        // water_scatter2.x  = Petzold average-particle asymmetry g (0.924)
+        //               .y  = r_water_inscatter_samples
+        //               .z  = r_water_inscatter master gate
+        //               .w  = seawater depolarisation ratio (0.09)
+        float water_scatter[4];
+        float water_scatter2[4];
+        // --- end Planetary P7 ---------------------------------------------
     } push{};
     // CONVERSION BOUNDARY (#255). The single source for the eye position
     // every shader sees; the nine per-pass memcpy(x.pos_fovtan, ...)
@@ -11190,6 +11252,41 @@ void Engine::RenderFrame() {
         push.water_state[1] = deep_r;
         push.water_state[2] = deep_g;
         push.water_state[3] = deep_b;
+        // --- Planetary P7 (#261): the in-scatter coefficients ---------------
+        //
+        // The molecular half is Morel 1974 evaluated by pt::water, not read
+        // from a cvar and not written down here. That is deliberate: it is a
+        // property of seawater, and the one thing the Hosek episode
+        // (b2111dd) and the ETOPO decision (#258) both settled is that a
+        // measured quantity belongs in a module that cites its source, with
+        // the engine calling it. If it were three literals here, the next
+        // person to touch this line would have no way to check them.
+        const glm::dvec3 b_mol = pt::water::PureSeawaterScatteringRgb();
+        float b_par = 0.0f;
+        if (auto* v = C.FindCVar("r_water_scatter_particulate")) {
+            b_par = v->GetFloat();
+        }
+        if (b_par < 0.0f) b_par = 0.0f;
+        push.water_scatter[0] = static_cast<float>(b_mol.x);
+        push.water_scatter[1] = static_cast<float>(b_mol.y);
+        push.water_scatter[2] = static_cast<float>(b_mol.z);
+        push.water_scatter[3] = b_par;
+        int inscatter_on = 1;
+        int inscatter_n  = 16;
+        if (auto* v = C.FindCVar("r_water_inscatter")) {
+            inscatter_on = v->GetBool() ? 1 : 0;
+        }
+        if (auto* v = C.FindCVar("r_water_inscatter_samples")) {
+            inscatter_n = v->GetInt();
+        }
+        inscatter_n = std::clamp(inscatter_n, 1, 256);
+        push.water_scatter2[0] =
+            static_cast<float>(pt::water::kPetzoldAsymmetry);
+        push.water_scatter2[1] = static_cast<float>(inscatter_n);
+        push.water_scatter2[2] = static_cast<float>(inscatter_on);
+        push.water_scatter2[3] =
+            static_cast<float>(pt::water::kSeawaterDepolarisation);
+        // --- end Planetary P7 -----------------------------------------------
     }
     // --- end Underwater medium tracking ------------------------------------
 
@@ -11334,7 +11431,9 @@ void Engine::RenderFrame() {
                   + 16 /* Planetary P4 (#258): planet_terrain */
                   + 96 /* Planetary P5 (#259): planet_ocean + ocean_tan_e +
                           ocean_tan_n + ocean_tan_o + ocean_phase +
-                          ocean_slope */);
+                          ocean_slope */
+                  + 32 /* Planetary P7 (#261): water_scatter +
+                          water_scatter2 */);
     // Raw-byte offsets the SOFTWARE tracer mirrors (SoftwareTracer.cpp:
     // kSunAndModeOffset / kAccumParamsOffset / kTonemapParamsOffset).
     // The CPU backend decodes these fields straight out of the pushed
@@ -11378,8 +11477,13 @@ void Engine::RenderFrame() {
     // tail was 1664 B. Planetary P0 (#254) adds +16 (planet_center_radius),
     // P3 (#257) +16 (planet_ground) and P4 (#258) +16 (planet_terrain):
     // tail was 1712 B. Planetary P5 (#259) adds +96 (the six ocean lanes):
-    // tail is now 1808 B, 240 B under the 2048 budget. The NEXT phase that
-    // wants six lanes does not fit -- bump kFrameUboSize when it comes.
+    // tail was 1824 B. Planetary P7 (#261) adds +32 (water_scatter +
+    // water_scatter2): tail is now 1856 B, 192 B under the 2048 budget --
+    // room for TWELVE more vec4 lanes and no more. A phase that wants six
+    // still fits; two such phases do not. Bump kFrameUboSize when it comes,
+    // and note that this number is not derivable by reading the comment
+    // history -- it was computed by evaluating the sum in the static_assert
+    // above, which is the only place that cannot drift.
     static_assert(sizeof(PtPush) - 112 <= 2048,
                   "PtPush spilled tail (sizeof - 112) exceeds the Vulkan "
                   "kFrameUboSize budget (2048 B). Bump kFrameUboSize in "
@@ -11490,6 +11594,13 @@ void Engine::RenderFrame() {
     // Water Phase 4 underwater medium tracking (#134).
     static_assert(offsetof(PtPush, water_state) % 16 == 0,
                   "PtPush::water_state must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    // Planetary P7 (#261) underwater in-scatter.
+    static_assert(offsetof(PtPush, water_scatter) % 16 == 0,
+                  "PtPush::water_scatter must be 16-byte aligned to match "
+                  "std140 / MSL cbuffer layout in PathTrace.slang");
+    static_assert(offsetof(PtPush, water_scatter2) % 16 == 0,
+                  "PtPush::water_scatter2 must be 16-byte aligned to match "
                   "std140 / MSL cbuffer layout in PathTrace.slang");
     // Editor backend block (agent-19 / PR #201, host wired in #210).
     static_assert(offsetof(PtPush, editor_params) % 16 == 0,
@@ -17592,7 +17703,12 @@ void Engine::RegisterCommands() {
                           "r_water_wave_scale",   "r_water_wave_amplitude",
                           "r_water_wave_speed",
                           "r_water_deep_color_r", "r_water_deep_color_g",
-                          "r_water_deep_color_b"}) {
+                          "r_water_deep_color_b",
+                          // Planetary P7 (#261). Same list for the same
+                          // reason: these feed water_scatter / water_scatter2,
+                          // which the same PT_WATER_ENABLED gate compiles out.
+                          "r_water_scatter_particulate", "r_water_inscatter",
+                          "r_water_inscatter_samples"}) {
         if (auto* v = C.FindCVar(n)) {
 #if PT_WATER_ENABLED
             v->on_change = [this](const pt::console::CVar&) { accum_dirty_ = true; };

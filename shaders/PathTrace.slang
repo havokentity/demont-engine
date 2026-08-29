@@ -1426,6 +1426,34 @@ cbuffer Push {
     float4 ocean_phase;
     float4 ocean_slope;
     // --- end Planetary P5 -----------------------------------------------------
+    // --- Planetary P7 (#261): underwater in-scatter ------------------------
+    //
+    // water_scatter.xyz = the MOLECULAR scattering coefficient of pure
+    //                     seawater, 1/m, per RGB channel. Morel 1974's
+    //                     beta_w(90 deg) fit through the
+    //                     Rayleigh-with-depolarisation sphere integral --
+    //                     see src/physics/WaterOptics.h, which derives
+    //                     every constant rather than quoting a triple.
+    //             .w    = the PARTICULATE scattering coefficient, 1/m,
+    //                     grey. Zero is pure seawater, which is the
+    //                     default; a Jerlov coastal type is 0.05-0.5.
+    //
+    // The two are separate because their PHASE FUNCTIONS are separate:
+    // molecular scatter is near-symmetric (Rayleigh, depolarisation .w
+    // below) and particulate scatter is violently forward (Petzold, g in
+    // .x below). Folding them into one lobe is what makes clear water
+    // render as tinted glass instead of as water -- pure water's
+    // near-isotropic blue scatter is exactly why a clear ocean is blue
+    // rather than merely dark.
+    float4 water_scatter;
+    // water_scatter2.x = Petzold "average particle" asymmetry g (0.924).
+    //               .y = in-scatter march sample count.
+    //               .z = master gate (0 = no march at all; the frame is
+    //                    then pure exponential darkening, which is what
+    //                    every build before this one did).
+    //               .w = seawater depolarisation ratio (0.09).
+    float4 water_scatter2;
+    // --- end Planetary P7 --------------------------------------------------
 #endif  // !PT_TARGET_SPIRV
 };
 
@@ -1591,6 +1619,10 @@ cbuffer Frame {
     float4 ocean_tan_o;
     float4 ocean_phase;
     float4 ocean_slope;
+    // See `water_scatter` / `water_scatter2` in the Metal Push cbuffer
+    // above (Planetary P7, #261).
+    float4 water_scatter;
+    float4 water_scatter2;
 };
 #endif  // PT_TARGET_SPIRV
 
@@ -1702,6 +1734,131 @@ static const uint MAT_DIELECTRIC = 2u;
 // by water_params0 / water_params1 push fields.  Behaves like a
 // dielectric for visibility/transmittance but with its own BRDF.
 static const uint MAT_WATER      = 3u;
+
+// --- Planetary P7 (#261): the medium stack --------------------------------
+//
+// WHAT IT REPLACES. `int in_water`, a single bit, set at ray-gen from
+// water_state.x and toggled by the MAT_WATER refract branch. MAT_DIELECTRIC
+// was deliberately left OUT of that toggle (see the bounce-loop docstring),
+// which means a glass body submerged in water kept attenuating with water
+// absorption for the whole segment INSIDE the glass. One bit cannot say
+// "in water, inside a bubble" -- it can only say water or not-water.
+//
+// THE REPRESENTATION. Eight two-bit entries in the low 16 bits, the entry
+// count in bits 16-19. A uint, so it costs one register and no memory, and
+// every operation is a shift and a mask -- this sits in the megakernel's
+// hottest loop and in transmittance(), which is why it is not an array.
+//
+//   bits  0-15 : entries, entry k at bits 2k..2k+1
+//   bits 16-19 : depth, 0..8
+//   bits 20-31 : reserved, always zero
+//
+// THE TWO EDGE CASES ARE DEFINED, NOT UNDEFINED. Pushing onto a full stack
+// is a no-op that keeps the current top (a ray that has crossed eight
+// nested interfaces without leaving one is a pathological scene, and
+// saturating is the conservative answer -- it never invents a medium).
+// Popping an empty stack yields air. Both are asserted exhaustively in
+// tests/pt_water_optics_test.cpp, because a stack that corrupts under
+// over/underflow would corrupt the whole path, not just one segment.
+//
+// BIT-EXACT ABOVE WATER. With the camera in air the stack starts empty, a
+// glass entry pushes MEDIUM_DIELECTRIC and its exit pops it, and
+// ptMediumIsWater() is false throughout -- the same answer the old
+// `in_water == 0` gave, on every branch that reads it.
+static const uint MEDIUM_AIR        = 0u;
+static const uint MEDIUM_WATER      = 1u;
+static const uint MEDIUM_DIELECTRIC = 2u;
+static const uint kMediumStackMax   = 8u;
+
+uint ptMediumDepth(uint s) { return (s >> 16) & 0xFu; }
+
+uint ptMediumTop(uint s) {
+    uint d = ptMediumDepth(s);
+    return (d == 0u) ? MEDIUM_AIR : ((s >> ((d - 1u) * 2u)) & 3u);
+}
+
+uint ptMediumPush(uint s, uint id) {
+    uint d = ptMediumDepth(s);
+    if (d >= kMediumStackMax) return s;         // saturate, never corrupt
+    uint entries = (s & 0xFFFFu) & ~(3u << (d * 2u));
+    entries |= (id & 3u) << (d * 2u);
+    return entries | ((d + 1u) << 16);
+}
+
+uint ptMediumPop(uint s) {
+    uint d = ptMediumDepth(s);
+    if (d == 0u) return s;                      // underflow -> stay in air
+    // CLEAR the entry as well as lowering the depth, so the encoding is
+    // CANONICAL: one bit pattern per (depth, contents). Leaving the popped
+    // entry behind costs nothing to read -- ptMediumTop ignores it -- but it
+    // means two stacks that mean the same thing compare unequal, and this
+    // value is carried across bounces and into transmittance() where
+    // equality is the cheapest way to reason about it.
+    uint entries = (s & 0xFFFFu) & ~(3u << ((d - 1u) * 2u));
+    return entries | ((d - 1u) << 16);
+}
+
+bool ptMediumIsWater(uint s) { return ptMediumTop(s) == MEDIUM_WATER; }
+
+// Enter a medium, IDEMPOTENTLY.
+//
+// The two notions in play answer different questions. `ndi < 0` is
+// GEOMETRIC -- which side of this facet is the ray on -- and the stack is
+// TOPOLOGICAL -- which media has it entered and not left. On a displaced
+// wave field they disagree occasionally: a ray already inside the water
+// that grazes a crest can read "entering", because the crest's shading
+// normal faces it. A bare push would take the stack to water-inside-water,
+// and the matching exit would pop back to water instead of to air, so the
+// ray would keep absorbing as water after it had physically left.
+//
+// Refusing to re-enter the medium already on top makes the stack agree with
+// the geometric sign at every step for a single-medium scene, which is what
+// the old one-bit `in_water = 1` did -- and genuine nesting still works,
+// because glass inside water has a DIFFERENT id on top and pushes normally.
+//
+// MEASURED, and small: on golden_water_pool__metal__off, which is the one
+// fixture with a wavy surface and submerged bodies, a bare push instead of
+// this gives mean-delta 14.313049 where this gives 14.312847 -- two pixels'
+// worth, against the same reference. Recorded as the honest size of it
+// rather than claimed as a fix: the case is rare, it is a correctness
+// property rather than a visible one, and the expensive lesson in this
+// phase was in ptMediumCross below, not here.
+uint ptMediumEnter(uint s, uint id) {
+    return (ptMediumTop(s) == id) ? s : ptMediumPush(s, id);
+}
+
+// Cross an interface WITHOUT being told which way. transmittance() has no
+// reliable side test -- it computed `ndi` only to orient a normal, and the
+// medium bit it kept was flipped unconditionally, `sr_in_water = 1 -
+// sr_in_water`, on every MAT_WATER crossing. That is a toggle, and a toggle
+// is what a shadow ray needs: it alternates in and out of the body as it
+// chains through interfaces, and its FIRST crossing's direction is already
+// encoded in the medium the caller handed it.
+//
+// Re-deriving the direction from `ndi` instead was tried and MEASURED:
+// golden_water_pool__metal__off moved by mean-delta 13.41 over 6.95% of
+// pixels, concentrated in the far-field wave band -- the shadow rays that
+// serve submerged geometry stopped alternating correctly and the pool floor
+// near the horizon came back sunlit. The bit's toggle was load-bearing and
+// this is its stack form: if the top is already this medium we are leaving
+// it, otherwise we are entering.
+//
+// The camera path does NOT use this. There the sign is real -- ndi_s is
+// taken against a shading normal the branch has explicitly oriented -- so
+// the refract branches push and pop directionally, exactly as the bit set
+// and cleared.
+uint ptMediumCross(uint s, uint id) {
+    return (ptMediumTop(s) == id) ? ptMediumPop(s) : ptMediumEnter(s, id);
+}
+
+// NO ptMediumIor HERE, DELIBERATELY. The obvious companion to this stack is
+// a lookup that returns the refractive index of whatever medium is on top,
+// so the refract branches can stop assuming the far side of an interface is
+// air. It was written, wired in, MEASURED and removed -- see the note in
+// the MAT_WATER branch for the measurement and for what would have to
+// change before it is worth having. An unused helper sitting here would
+// read as an oversight rather than as a decision.
+// --- end Planetary P7 medium stack ----------------------------------------
 
 // --- Wave 9 advanced materials --------------------------------------------
 // Optional BSDF lobe extension flags (bitmask). Mirrors Engine.h's
@@ -6114,7 +6271,7 @@ float3 skyColorNoSunDisc(float3 ro, float3 rd, inout uint seed) {
 // new origin -- so the near cut stays correct after the ray has crossed a
 // dielectric and moved a long way from where it started.
 float3 transmittance(float3 ro, float3 rd, float t_max, float shutter_t01,
-                     PtRayCone cone, int start_in_water = 0) {
+                     PtRayCone cone, uint start_medium = 0u) {
     // Cloud optical depth along the original (un-refracted) ray. Real
     // clouds live in a layer high above the scene -- approximating the
     // shadow as the straight-line cloud path is fine because no glass
@@ -6131,22 +6288,27 @@ float3 transmittance(float3 ro, float3 rd, float t_max, float shutter_t01,
     PtRayCone c = cone;
 #if PT_WATER_ENABLED
     // Per-segment Beer's-law bookkeeping. Callers whose shadow ray
-    // starts underwater (Lambert NEE from submerged geometry) pass
-    // start_in_water = 1; each MAT_WATER refraction below flips the
-    // state. The camera/bounce path applies EXACT per-segment
-    // absorption, and the old fixed "nominal 1.5 m per crossing"
-    // shortcut here let direct sun light reach a 10 m sea floor at
-    // near-full strength while the viewing path was dimmed by the
-    // true exp(-absorb * depth) -- deep water looked sun-lit from
+    // starts underwater (Lambert NEE from submerged geometry) pass the
+    // caller's own medium stack; each transmissive crossing below
+    // pushes or pops it. The camera/bounce path applies EXACT
+    // per-segment absorption, and the old fixed "nominal 1.5 m per
+    // crossing" shortcut here let direct sun light reach a 10 m sea
+    // floor at near-full strength while the viewing path was dimmed by
+    // the true exp(-absorb * depth) -- deep water looked sun-lit from
     // above but murky to the eye.
-    int sr_in_water = start_in_water;
+    //
+    // Planetary P7 (#261): this used to be a single water/not-water bit
+    // that flipped only for MAT_WATER. It is now the full stack, so a
+    // shadow ray that crosses glass on its way up through water stops
+    // attenuating with water absorption while it is inside the glass.
+    uint sr_medium = start_medium;
 #endif
     for (int i = 0; i <= kMaxRefract; ++i) {
         HitInfo h = traceScene(o, d, shutter_t01, c);
 #if PT_WATER_ENABLED
         // Absorb along however much of this segment lies in water --
         // up to the hit, or up to t_max on the final unoccluded leg.
-        if (sr_in_water == 1) {
+        if (ptMediumIsWater(sr_medium)) {
             float seg = h.hit ? min(h.t, t_max) : t_max;
             t *= exp(-water_params0.xyz * max(seg, 0.0));
         }
@@ -6183,6 +6345,11 @@ float3 transmittance(float3 ro, float3 rd, float t_max, float shutter_t01,
 #else
         float interface_ior = h.ior;
 #endif
+        // Planetary P7 (#261) DELIBERATELY LEAVES THIS AT 1.0. Reading the
+        // outside index off the medium stack -- which the stack now makes
+        // possible -- was implemented, MEASURED and reverted, and the
+        // measurement is the reason. See the matching note in the MAT_WATER
+        // branch below.
         float ior_a = (ndi < 0.0) ? 1.0           : interface_ior;
         float ior_b = (ndi < 0.0) ? interface_ior : 1.0;
         float eta   = ior_a / ior_b;
@@ -6207,9 +6374,15 @@ float3 transmittance(float3 ro, float3 rd, float t_max, float shutter_t01,
             // Beer's law the camera path uses), so crossing the
             // interface just flips which side of the surface we're on.
             t *= (1.0 - fr);
-            sr_in_water = 1 - sr_in_water;
+            sr_medium = ptMediumCross(sr_medium, MEDIUM_WATER);
         } else {
             t *= (1.0 - fr) * h.albedo;
+            // Planetary P7 (#261): glass now pushes and pops too, so a
+            // shadow ray inside a submerged bubble stops picking up water
+            // absorption. Above water this only ever moves the stack
+            // between "empty" and "one dielectric", and nothing reads the
+            // stack in that case.
+            sr_medium = ptMediumCross(sr_medium, MEDIUM_DIELECTRIC);
         }
 #else
         t *= (1.0 - fr) * h.albedo;
@@ -7303,14 +7476,15 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // body -- because the suppression belongs to the ray the water
         // launched and to nothing after it.
         bool   ocean_sun_nee = false;
-        // --- Underwater medium tracking (Phase 4, #134) ----------------------
-        // Per-ray "is this segment travelling through a water medium?" flag.
+        // --- Underwater medium tracking (Phase 4, #134; P7 #261) -------------
+        // Per-ray "which medium is this segment travelling through?" stack.
         // Initialised from water_state.x (host scans analytic primitives at
         // push setup time and sets 1.0 when the camera position is below
-        // any MAT_WATER plane). Flipped only by the MAT_WATER refract path
+        // any MAT_WATER plane, or inside the planetary sea-level shell).
+        // Pushed / popped by the MAT_WATER and MAT_DIELECTRIC refract paths
         // in the bounce loop below.
         //
-        // When in_water == 1 the per-bounce step:
+        // When the stack's top is water the per-bounce step:
         //   * applies exp(-water_params0.xyz * segment_length) to throughput
         //     over the segment just traversed (replaces the old nominal
         //     1.5m entry-side estimate with the exact distance the ray
@@ -7321,15 +7495,19 @@ void main(uint2 tid : SV_DispatchThreadID) {
         //     the bright horizon when the scene runs out of geometry below
         //     the water plane.
         //
-        // TIR at MAT_WATER keeps in_water unchanged (the ray stays in the
-        // same medium); only the refract branch toggles. MAT_DIELECTRIC is
-        // intentionally left out of the flip -- a glass body submerged in
-        // water is rare enough that the simplification (continue
-        // attenuating with water absorption for the short segment inside
-        // the glass) is preferable to a per-bounce stack of medium
-        // identifiers. Documented as a Phase 4 simplification; a proper
-        // multi-medium stack lands in Phase 5 SSS work.
-        int in_water = (water_state.x > 0.5) ? 1 : 0;
+        // TIR at MAT_WATER leaves the stack alone (the ray stays in the same
+        // medium); only the refract branches move it.
+        //
+        // Planetary P7 (#261) REPLACES the Phase 4 one-bit `in_water`. That
+        // bit's own docstring called MAT_DIELECTRIC's exclusion "a Phase 4
+        // simplification" and said a proper stack would land later; this is
+        // later. The bit could not express "in water, inside a bubble", so a
+        // submerged glass body kept attenuating with water absorption over
+        // the segment INSIDE the glass, and every interface assumed the far
+        // side was air. See ptMediumPush / ptMediumPop near MAT_WATER.
+        uint medium = (water_state.x > 0.5)
+                          ? ptMediumPush(0u, MEDIUM_WATER)
+                          : 0u;
         // Whether the camera primary ray was underwater at ray-gen.
         // Latched once so the post-bounce atmospheric / volumetric march
         // can skip the surface aerial perspective + Mie/Rayleigh in-
@@ -7347,9 +7525,15 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // strip aerial perspective / volumetric in-scatter from
         // unrelated scenes that happen to mention `water` in a cfg.
 #if PT_WATER_ENABLED
-        bool primary_in_water = (in_water == 1);
+        bool primary_in_water = ptMediumIsWater(medium);
+        // The stack AS AT RAY-GEN. `medium` is mutated by every refraction
+        // in the bounce loop below, and the post-loop in-scatter march
+        // needs the medium the PRIMARY segment ran through, not whatever
+        // the last bounce left behind.
+        uint primary_medium = medium;
 #else
         bool primary_in_water = false;
+        uint primary_medium = 0u;
 #endif
         // --- end Underwater medium tracking ---------------------------------
 
@@ -7538,7 +7722,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
         //
         // Misses (h.hit == false) skip this: in_water + miss is caught
         // by the deep-water tint fallback below.
-        if (in_water == 1 && h.hit) {
+        if (ptMediumIsWater(medium) && h.hit) {
             float3 absorb = water_params0.xyz;
             throughput *= exp(-absorb * h.t);
         }
@@ -7557,7 +7741,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
             // by throughput so segment absorption + Fresnel attenuations
             // along the way also dim the deep tint -- a TIR ray with a
             // long underwater path before escaping fades to black.
-            if (in_water == 1) {
+            if (ptMediumIsWater(medium)) {
                 if (b == 0u) {
                     radiance += throughput * water_state.yzw;
                 } else {
@@ -7882,7 +8066,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     float t_max = max(ls.dist - ptRayTMin(sro, cone_hit), 0.0);
                     float3 trans = transmittance(sro,
                                                  ls.dir, t_max, shutter_t01,
-                                                 cone_hit, in_water);
+                                                 cone_hit, medium);
                     if (any(trans > float3(0.0))) {
                         float3 brdf = h.albedo / 3.14159265358979;
                         float3 c = throughput * ls.Le * trans * brdf *
@@ -8007,7 +8191,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     // through glass / diamond meshes (caustics).
                     float3 trans = transmittance(ptRayOrigin(hit_pt, nf, cone_hit, env.dir),
                                                  env.dir, 1e30, shutter_t01,
-                                                 cone_hit, in_water);
+                                                 cone_hit, medium);
                     if (any(trans > float3(0.0))) {
                         float3 brdf = h.albedo / 3.14159265358979;
                         float pdf_brdf_at_env = n_dot_l * (1.0 / 3.14159265358979);
@@ -8042,7 +8226,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     if (n_dot_l > 0.0 && hl.pdf > 0.0) {
                         float3 t_s = transmittance(ptRayOrigin(hit_pt, nf, cone_hit, hl.dir),
                                                    hl.dir, 1e30, shutter_t01,
-                                                   cone_hit, in_water);
+                                                   cone_hit, medium);
                         if (any(t_s > float3(0.0))) {
                             float3 brdf = h.albedo / 3.14159265358979;
                             float3 c = throughput * hl.color * t_s *
@@ -8102,7 +8286,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                     float3 trans  = (n_dot_l > 0.0)
                         ? transmittance(ptRayOrigin(hit_pt, nf, cone_hit, sun_jit),
                                         sun_jit, 1e30,
-                                        shutter_t01, cone_hit, in_water)
+                                        shutter_t01, cone_hit, medium)
                         : float3(0.0);
                     // Atmospheric attenuation: optical depth times
                     // air mass. Air mass = 1/sin(elev) (thin-slab
@@ -8167,7 +8351,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         if (ndl > 0.0) {
                             float3 t_m = transmittance(ptRayOrigin(hit_pt, nf, cone_hit, moon_jit),
                                                        moon_jit, 1e30, shutter_t01,
-                                                       cone_hit, in_water);
+                                                       cone_hit, medium);
                             if (any(t_m > float3(0.0))) {
                                 // Atmospheric attenuation + warmth at low
                                 // moon altitude, mirroring sun radiance.
@@ -8200,7 +8384,49 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 // disc, and a normal pointing near a celestial body
                 // would receive its direct radiance as unshadowed
                 // "ambient" ON TOP of the explicit sun/moon NEE above.
-                radiance += throughput * h.albedo * skyColorBase(hit_pt, nf, seed);
+                float3 ambient = skyColorBase(hit_pt, nf, seed);
+#if PT_WATER_ENABLED
+                // --- Planetary P7 (#261): the glowing sea floor ------------
+                //
+                // THE BUG. This term was never gated on the medium, so a
+                // submerged Lambert surface received the FULL above-water
+                // sky dome -- no Beer-Lambert for the column above it, no
+                // Fresnel loss at the interface, no shadow ray at all. A
+                // seabed at 100 m was lit exactly as brightly as a beach.
+                // It is the first thing anyone notices underwater and it
+                // was named as such in #259 and #261 both.
+                //
+                // THE FIX IS NOT A FUDGE FACTOR. transmittance() already
+                // computes precisely the quantity that is missing: it
+                // marches the medium stack, applies exp(-a * segment) over
+                // every water leg, folds (1 - F) in at the interface, and
+                // returns zero on total internal reflection. So the
+                // ambient becomes the skylight that ACTUALLY REACHED this
+                // point, by the same estimator every other NEE site here
+                // uses, rather than the skylight that would have reached it
+                // in air.
+                //
+                // WHAT IS STILL AN APPROXIMATION, stated rather than
+                // hidden: the DIRECTION stays nf. This is a
+                // single-direction hemispherical-ambient approximation --
+                // it was one before this change too -- so the sky is
+                // sampled along the unrefracted normal while the
+                // MAGNITUDE now follows the refracted path. Making the
+                // direction right as well needs transmittance() to hand
+                // back its exit direction, which changes a signature six
+                // call sites share. The magnitude is what "no glowing sea
+                // floor" is about.
+                //
+                // Costs nothing above water: the branch is one predicate on
+                // a register the loop already carries.
+                if (ptMediumIsWater(medium)) {
+                    ambient *= transmittance(
+                        ptRayOrigin(hit_pt, nf, cone_hit, nf), nf, 1e30,
+                        shutter_t01, cone_hit, medium);
+                }
+                // --- end Planetary P7 ---------------------------------------
+#endif
+                radiance += throughput * h.albedo * ambient;
                 skip_sky_on_miss = true;
             }
             throughput *= h.albedo;
@@ -8261,6 +8487,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 mat_ior = cauchyIOR(h.ior, spectral_params.y, hero_lambda);
             }
             // --- end ---
+            // Planetary P7 (#261) leaves this at 1.0 -- see the MAT_WATER
+            // branch below for the measurement that decided it.
             float ior_a = (ndi < 0.0) ? 1.0     : mat_ior;
             float ior_b = (ndi < 0.0) ? mat_ior : 1.0;
             float eta = ior_a / ior_b;
@@ -8286,6 +8514,17 @@ void main(uint2 tid : SV_DispatchThreadID) {
             } else {
                 rd = normalize(refracted);
                 ro = ptRayOrigin(hit_pt, -nf, cone_hit, rd);
+#if PT_WATER_ENABLED
+                // Planetary P7 (#261): glass joins the medium stack. It was
+                // deliberately excluded from the old one-bit flip, which is
+                // why a glass body submerged in water kept accumulating
+                // WATER absorption over the segment inside the glass. Above
+                // water this only moves the stack between "empty" and "one
+                // dielectric" and nothing reads it in that state.
+                medium = (ndi < 0.0)
+                             ? ptMediumEnter(medium, MEDIUM_DIELECTRIC)
+                             : ptMediumPop(medium);
+#endif
                 // REFRACTION (transmission). If a preceding Lambert env-NEE
                 // already accounted for the sky arriving through this same
                 // dielectric (its shadow ray refracts through it via
@@ -8409,7 +8648,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
             // this to every specular surface is a real improvement and a
             // different change.
             bool did_ocean_sun_nee = false;
-            if (planet_ocean.x > 0.0 && in_water == 0 &&
+            if (planet_ocean.x > 0.0 && !ptMediumIsWater(medium) &&
                 uint(sun_and_mode.w) >= 2u) {
                 float3 sun_dir  = sun_and_mode.xyz;
                 float  sun_elev = elevationAt(hit_pt, sun_dir);
@@ -8440,7 +8679,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         float fr_spec = D * G2 * F / (4.0 * ndv * ndl);
                         float3 trans = transmittance(
                             ptRayOrigin(hit_pt, nf_s, cone_hit, l), l, 1e30,
-                            shutter_t01, cone_hit, in_water);
+                            shutter_t01, cone_hit, medium);
                         if (any(trans > float3(0.0))) {
                             float3 sun_rad =
                                 sunRadianceAt(hit_pt, sun_dir, sun_elev);
@@ -8504,6 +8743,38 @@ void main(uint2 tid : SV_DispatchThreadID) {
             }
             // --- end Planetary P5 -----------------------------------------
 
+            // --- Planetary P7 (#261): why the outside index is still 1.0 ---
+            //
+            // The medium stack makes it POSSIBLE to read the far side of
+            // this interface off the stack instead of assuming air, and
+            // that is the obviously-correct-looking next step. It was
+            // implemented, MEASURED, and reverted, so the reasoning is here
+            // rather than lost.
+            //
+            // The measurement first: on the golden matrix it changed
+            // NOTHING. golden_water_pool__metal__off -- the one fixture
+            // with a submerged body under a wavy surface -- rendered
+            // mean-delta 14.313049 against the committed golden both with
+            // the stack-derived index and with this literal 1.0, byte for
+            // byte the same number. Every other cell was untouched by
+            // either. So the change buys no accuracy anything in this repo
+            // can see, and it is not free: it makes the refraction depend
+            // on the stack, which is topological, where the SIGN of the
+            // interface is geometric. Those two disagree on a displaced
+            // wave field -- see ptMediumEnter above for the case and for
+            // what it cost when the stack update had the same flaw.
+            //
+            // Doing it properly needs the two notions reconciled: an
+            // interface has to know which medium is on each of its sides
+            // independently of which way a particular ray met it. That is a
+            // change to how the ocean surface reports hits, not a change to
+            // this expression, and it is the same problem #133 phase 3's
+            // coastal-ribbon water has to solve.
+            //
+            // So: air outside, exactly as before, and the stack keeps to
+            // what it was built for -- what the medium ABSORBS as, and
+            // which shadow rays are attenuated -- because that reads the
+            // stack alone and never has to agree with a facet normal.
             float ior_a = (ndi_s < 0.0) ? 1.0       : water_ior;
             float ior_b = (ndi_s < 0.0) ? water_ior : 1.0;
             float eta = ior_a / ior_b;
@@ -8542,8 +8813,13 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 // ndi_s < 0 means the shading normal pointed away from
                 // the incoming ray -- we were OUTSIDE the water body
                 // and are entering. ndi_s > 0 means we were INSIDE and
-                // are exiting back into air. Flip the per-ray medium
-                // state accordingly.
+                // are exiting back into whatever we were in before.
+                //
+                // Planetary P7 (#261): push / pop instead of set / clear.
+                // "Exiting" used to mean "the medium is now air", which is
+                // only true when the water body is not itself inside
+                // something. Popping returns to whatever the ray was in,
+                // and for the camera-in-air case that is air, identically.
                 //
                 // Per-segment Beer's law happens at the top of the next
                 // bounce iteration via the segment-absorption block.
@@ -8551,11 +8827,8 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 // previous nominal 1.5m entry estimate (and the b == 0
                 // exit-side hack from b2690ac) are subsumed by the new
                 // generic per-bounce attenuation.
-                if (ndi_s < 0.0) {
-                    in_water = 1;
-                } else {
-                    in_water = 0;
-                }
+                medium = (ndi_s < 0.0) ? ptMediumEnter(medium, MEDIUM_WATER)
+                                       : ptMediumPop(medium);
                 rd = normalize(refracted);
                 ro = ptRayOrigin(hit_pt, -nf_s, cone_hit, rd);
                 // Transmitted lobe: PERSIST skip_sky_on_miss /
@@ -9495,6 +9768,173 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 }
             }
         }
+
+#if PT_WATER_ENABLED
+        // --- Planetary P7 (#261): the underwater in-scatter march ----------
+        //
+        // WHAT WAS MISSING. All three air marches above are gated off by
+        // !primary_in_water and NOTHING replaced them, so a submerged frame
+        // was pure exponential darkening: absorption without scattering, no
+        // colour build-up with distance, no shafts. That is the difference
+        // between water and tinted glass, and it is why the sea floor and
+        // the open water read as the same material at different depths.
+        //
+        // THIS IS THE SAME MARCH, ONE MEDIUM OVER. Deliberately the same
+        // shape as the Mie/Rayleigh march above -- stratified samples with
+        // one jitter, per-sample sun NEE through transmittance(), running
+        // eye transmittance -- so the two can be read against each other
+        // and neither can quietly acquire a different sampling bias. Three
+        // things differ, and all three are physics:
+        //
+        //  1. TWO SPECIES, TWO PHASE FUNCTIONS. Molecular scattering is
+        //     Rayleigh-like and near-symmetric; particulate scattering is
+        //     violently forward (Petzold g = 0.924). #261 proposes a single
+        //     HG lobe at g = 0.92 for both, which would make PURE water
+        //     forward-scattering -- and pure water's near-isotropic blue
+        //     scatter is precisely why a clear ocean is blue rather than
+        //     merely dark. See src/physics/WaterOptics.h.
+        //
+        //  2. THE SUN IS NOT WHERE IT IS IN AIR. Sunlight entering water
+        //     bends TOWARD the vertical, so from below the sun sits at
+        //     asin(sin(theta_air) / n) from the zenith, never further than
+        //     the critical angle. NEE toward the air direction would trace
+        //     a ray that exits at the wrong angle entirely -- and beyond
+        //     48.6 degrees would total-internal-reflect and return black
+        //     for a sun that is plainly visible. Refracting the sun into
+        //     the water first is what makes Snell's window SHADE correctly
+        //     rather than merely be in the right place, which is all P5's
+        //     geometric fix could do.
+        //
+        //     The radiometry works out with no extra factor. Radiance
+        //     across the interface scales as L_w = L_a (1 - F) n^2 while
+        //     the sun's solid angle compresses as Omega_w = Omega_a / n^2,
+        //     so the product -- the irradiance, which is what the
+        //     in-scatter integral wants -- is L_a Omega_a (1 - F). The n^2
+        //     cancels exactly. transmittance() already applies the (1 - F)
+        //     when the shadow ray crosses MAT_WATER, so the estimator is
+        //     just sunRadianceAt * transmittance, unchanged from the air
+        //     march. (sampleSunDisc still jitters over the AIR angular
+        //     radius rather than the compressed one: it spreads the same
+        //     energy over a cone 1.33x too wide, i.e. 0.53 deg instead of
+        //     0.40 deg. Stated, not hidden.)
+        //
+        //  3. THE SPAN IS DERIVED, NOT CAPPED AT A ROUND NUMBER. Marching
+        //     past the depth where the least-attenuated channel transmits
+        //     under one 8-bit level spends samples on black. ln(255) /
+        //     min(sigma_t) is 401 m in pure seawater and 185 m at #261's
+        //     coastal c_B = 0.03 -- the engine computes it from whatever
+        //     coefficients are actually in force, so it is a consequence of
+        //     the water rather than a constant about it.
+        //
+        // GOD RAYS COME FREE AND CAUSTICS DO NOT. The per-sample shadow ray
+        // is occluded by real geometry, so a submerged camera looking up
+        // past a hull or a rock gets shafts out of this loop with no extra
+        // term. Wave-DAPPLED shafts do not: transmittance() resolves the
+        // ocean as its analytic shell (traceScene's MAT_WATER hit), not as
+        // the displaced FFT surface, so the interface a shadow ray crosses
+        // is smooth. And true caustics are a specular-diffuse-specular
+        // path that neither BSDF sampling nor NEE can find at all -- that
+        // is #86's MNEE, and #261 scopes it out explicitly.
+        if (primary_in_water && primary_t_recorded
+            && water_scatter2.z > 0.0) {
+            float3 sigma_s_mol = max(water_scatter.xyz, float3(0.0));
+            float  sigma_s_par = max(water_scatter.w, 0.0);
+            float3 sigma_s     = sigma_s_mol + float3(sigma_s_par);
+            // Extinction is absorption plus BOTH scattering species. The
+            // air march learned this the hard way (#257): using scattering
+            // as extinction lets the column transmit more light than it
+            // physically can.
+            float3 sigma_t = max(water_params0.xyz, float3(0.0)) + sigma_s;
+            float  sigma_t_lo = min(sigma_t.r, min(sigma_t.g, sigma_t.b));
+            if (any(sigma_s > float3(0.0)) && sigma_t_lo > 0.0) {
+                // ln(255): one 8-bit level. Mirrors
+                // pt::water::OpticalBlackDepth exactly.
+                float t_black = 5.5412635451584 / sigma_t_lo;
+                float t_far_w = min(primary_t, t_black);
+                int   N_w = clamp(int(water_scatter2.y), 1, 256);
+                if (t_far_w > 0.0) {
+                    float  dt_w   = t_far_w / float(N_w);
+                    // Same stratified form as the air march: (vi + jitter)
+                    // covers [0, t_far) exactly, where mid-cell + full-cell
+                    // jitter would never sample the first half step -- the
+                    // water right in front of the lens, which is the
+                    // brightest part of the column.
+                    float  jit_w  = randf(seed);
+                    float3 v_color_w   = float3(0.0);
+                    float  water_n = clamp(water_params0.w, 1.0, 2.4);
+                    float  eta_in  = 1.0 / water_n;
+                    float3 sun_dir_w = sun_and_mode.xyz;
+                    float  g_par   = clamp(water_scatter2.x, -0.99, 0.99);
+                    float  depol   = clamp(water_scatter2.w, 0.0, 1.0);
+                    float  cone_spread_w =
+                        (2.0 * pos_fovtan.w) / float(max(dim.y, 1u));
+                    for (int wi = 0; wi < N_w; ++wi) {
+                        float t = (float(wi) + jit_w) * dt_w;
+                        if (t >= t_far_w) break;
+                        float3 sp = primary_ro + primary_rd * t;
+                        // Eye transmittance AT THE SAMPLE, in closed form,
+                        // rather than as the running product the air march
+                        // uses. Not a style difference: the running product
+                        // evaluates transmittance at the CELL START while the
+                        // sample sits at (wi + jitter) dt, which is an O(dt)
+                        // bias no amount of accumulation converges away. The
+                        // air march has to accumulate because its sigma
+                        // varies with altitude along the ray; water's is
+                        // constant, so the exact answer is available for the
+                        // same one exp() per step, and the quadrature becomes
+                        // second-order in dt instead of first. Pinned by the
+                        // convergence ladder in tests/pt_water_optics_test.cpp.
+                        float3 trans_eye_w = exp(-sigma_t * t);
+                        PtRayCone cone_w =
+                            ptConeMake(cone_spread_w * t, cone_spread_w);
+                        float sun_elev = elevationAt(sp, sun_dir_w);
+                        if (sun_elev > 0.0) {
+                            // Snell, into the water. Light propagates along
+                            // -sun_dir; refract it through the local
+                            // horizontal and negate to get the direction a
+                            // submerged point must LOOK to see the sun.
+                            // Entering the denser medium cannot TIR, so the
+                            // only zero-length result would come from a sun
+                            // exactly on the horizon, which sun_elev > 0
+                            // has already excluded.
+                            float3 up_w = localUp(sp);
+                            float3 into = refract(-sun_dir_w, up_w, eta_in);
+                            if (dot(into, into) > 1e-6) {
+                                float3 sun_w   = normalize(-into);
+                                float3 sun_jit = sampleSunDisc(sun_w, seed);
+                                float3 trans_w = transmittance(
+                                    sp, sun_jit, 1e30, shutter_t01, cone_w,
+                                    primary_medium);
+                                if (any(trans_w > float3(0.0))) {
+                                    // Incident light propagates along
+                                    // -sun_jit and leaves toward
+                                    // -primary_rd, so the phase cosine is
+                                    // dot(primary_rd, sun_jit) -- the same
+                                    // orientation the air march derives
+                                    // above, and forward scatter therefore
+                                    // peaks looking toward the sun.
+                                    float mu_w = dot(primary_rd, sun_jit);
+                                    float3 in_scatter_w =
+                                          sigma_s_mol
+                                            * ptPhaseRayleighDepol(mu_w, depol)
+                                        + float3(sigma_s_par)
+                                            * ptPhaseHenyeyGreenstein(mu_w,
+                                                                      g_par);
+                                    float3 sun_rad_w =
+                                        sunRadianceAt(sp, sun_dir_w, sun_elev);
+                                    v_color_w += sun_rad_w * trans_w
+                                               * in_scatter_w * dt_w
+                                               * trans_eye_w;
+                                }
+                            }
+                        }
+                    }
+                    radiance += v_color_w;
+                }
+            }
+        }
+        // --- end Planetary P7 underwater in-scatter -------------------------
+#endif  // PT_WATER_ENABLED
 
         // --- Wave 8 spectral (#27) ---
         // Fold this path's hero-wavelength radiance into the frame estimate.

@@ -18,6 +18,7 @@ add_library(pt_physics STATIC
     RigidBody.cpp
     SmokeSPH.cpp
     OceanFFT.cpp
+    WaterOptics.cpp
 )
 
 target_include_directories(pt_physics PUBLIC ${CMAKE_SOURCE_DIR}/src)
