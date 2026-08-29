@@ -1318,11 +1318,11 @@ TEST_CASE("the closed form IS the march, not an approximation of it") {
     // 2. AND THE DEEP LIMIT IS THE DEEP LIMIT. Marching 3 km of pure
     //    seawater -- seven times its own optical-black depth -- lands on
     //    the semi-infinite answer.
-    const glm::dvec3 far =
+    const glm::dvec3 deep_3km =
         SubsurfaceRrsMarched(a, b, 0.0, g, kSeawaterDepolarisation,
                              kPetzoldAsymmetry, 3000.0, 400000);
     for (int c = 0; c < 3; ++c) {
-        CHECK(far[c] == doctest::Approx(deep[c]).epsilon(1e-6));
+        CHECK(deep_3km[c] == doctest::Approx(deep[c]).epsilon(1e-6));
     }
 
     // 3. WHAT THE MARCH WOULD HAVE COST. The shader's default is 16
