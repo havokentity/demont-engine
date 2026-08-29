@@ -41,6 +41,7 @@
 #include "renderer/Planet/TerrainChunk.h"
 #include "renderer/Planet/TerrainQuadtree.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -371,8 +372,15 @@ TEST_CASE("the elevation field is consistent across subdivision levels") {
     // children must produce BIT-IDENTICAL heights at every vertex they
     // share. Not "within a tolerance" -- identical, because anything else
     // is a crack whose width is the difference.
+    //
+    // The level range deliberately STRADDLES the hillslope scale break
+    // (#304). With a 20 km data floor the break at 106 m falls between
+    // level 10 (152.7 m spacing) and level 11 (76.4 m), and the amplitude
+    // law changes shape there; consistency across the break is exactly the
+    // property a two-regime law could plausibly lose, so the loop runs to
+    // level 13 (19.1 m) rather than stopping short of it.
     ElevationField field = MakeProceduralField(1200.0, 20000.0);
-    for (int level = 2; level <= 6; ++level) {
+    for (int level = 2; level <= 13; ++level) {
         const ChunkKey parent{2, static_cast<std::uint8_t>(level), 1u, 1u};
         std::vector<double> pg;
         field.GenerateChunkHeights(parent, level, 0, pg);
@@ -469,6 +477,11 @@ TEST_CASE("procedural detail scales with the measured Hurst exponent") {
     // sigma(l) = sigma(L) * (l/L)^H with H = 0.5 means the RMS height
     // difference over a lag halves-by-sqrt(2) per level. Measure the
     // level-to-level RMS of the added detail and check the ratio.
+    //
+    // This covers the ABOVE-break regime only: with a 20 km data floor,
+    // levels 3..7 span 19.5 km down to 1.2 km, two decades clear of the
+    // 106 m hillslope break, so the local exponent is H to within 8%. The
+    // below-break regime is the subject of the next test.
     ElevationField field = MakeProceduralField(1000.0, 20000.0);
     const int first = field.FirstDetailLevel();
     CHECK(first >= 1);
@@ -501,6 +514,161 @@ TEST_CASE("procedural detail scales with the measured Hurst exponent") {
         prev_rms = rms;
     }
     CHECK(ratios >= 3);
+}
+
+// --- The hillslope scale break (#304) --------------------------------------
+
+TEST_CASE("the structure function is a broken power law with the documented break") {
+    // A direct test of the physics rather than of its consequences. S(l)
+    // must (a) be EXACTLY 1 at the data floor, so the continuation joins
+    // the DEM without a step at the seam between measurement and model;
+    // (b) tend to the fluvial exponent H_coarse well above the break;
+    // (c) tend to the diffusive exponent H_fine well below it; and (d)
+    // have local log-log slope exactly (H_coarse + H_fine)/2 AT the break
+    // -- which is what makes L_b "the break length" by definition instead
+    // of by fitting. Perron, Kirchner & Dietrich 2008, JGR 113:F04003.
+    const double L  = 19546.0;   // earth_lite's data floor, metres
+    const double Lb = 106.0;     // the break, see ElevationParams
+    const double Hc = 0.5, Hf = 1.0;
+
+    CHECK(RelativeStructureFunction(L, L, Lb, Hc, Hf) == 1.0);   // exact
+
+    // Centred log-log derivative. The 1e-4 step is well inside the smooth
+    // region of a C-infinity function and well outside double's noise.
+    auto local_exponent = [&](double l) {
+        const double e = 1e-4;
+        return (std::log(RelativeStructureFunction(l * (1.0 + e), L, Lb, Hc, Hf)) -
+                std::log(RelativeStructureFunction(l * (1.0 - e), L, Lb, Hc, Hf))) /
+               std::log((1.0 + e) / (1.0 - e));
+    };
+    CHECK(local_exponent(Lb) == doctest::Approx(0.5 * (Hc + Hf)).epsilon(1e-6));
+    // Two decades either side puts the local exponent within 1% of the
+    // asymptote; the 2% band records a 2x margin on that.
+    CHECK(local_exponent(Lb * 100.0) == doctest::Approx(Hc).epsilon(0.02));
+    CHECK(local_exponent(Lb * 0.01)  == doctest::Approx(Hf).epsilon(0.02));
+
+    // Monotone: refining the hierarchy never raises the RMS increment.
+    double prev = RelativeStructureFunction(L, L, Lb, Hc, Hf);
+    for (double l = L * 0.5; l > 0.1; l *= 0.5) {
+        const double s = RelativeStructureFunction(l, L, Lb, Hc, Hf);
+        CHECK(s < prev);
+        CHECK(finiteBits(s));
+        prev = s;
+    }
+
+    // break_m = 0 must reproduce the pre-#304 single power law bit-exactly,
+    // so the A/B cvar really is an A/B and not an approximation of one.
+    for (double l : {1.0, 10.0, 100.0, 1000.0}) {
+        CHECK(RelativeStructureFunction(l, L, 0.0, Hc, Hf) == std::pow(l / L, Hc));
+    }
+}
+
+// The RMS of the displacement this level ADDED, read straight out of a
+// baked chunk. At an odd-x, even-y vertex the interpolation stencil is
+// exactly the mean of the two even-x neighbours in the same row, and with
+// a procedural (zero) base height nothing else contributes -- so the
+// residual against that mean IS the displacement, to the last bit.
+struct LevelResidual {
+    double rms = 0.0;
+    double clamped_fraction = 0.0;
+};
+
+LevelResidual MeasureLevelResidual(const ElevationField& field, int level) {
+    const ChunkKey k{0, static_cast<std::uint8_t>(level), 0u, 0u};
+    std::vector<double> g;
+    field.GenerateChunkHeights(k, level, 0, g);
+    const double cap = field.Params().max_slope * ChunkVertexSpacing(level);
+    double acc = 0.0;
+    long n = 0, clamped = 0;
+    for (int y = 0; y <= kChunkQuads; y += 2) {
+        for (int x = 1; x < kChunkQuads; x += 2) {
+            const double mid =
+                0.5 * (g[static_cast<std::size_t>(y) * kChunkVerts + x - 1] +
+                       g[static_cast<std::size_t>(y) * kChunkVerts + x + 1]);
+            const double d = g[static_cast<std::size_t>(y) * kChunkVerts + x] - mid;
+            acc += d * d;
+            ++n;
+            // The clamp saturates the residual at exactly +-cap, so an
+            // engagement is detectable from the output alone.
+            if (std::abs(d) >= cap * (1.0 - 1e-9)) ++clamped;
+        }
+    }
+    LevelResidual r;
+    r.rms = std::sqrt(acc / static_cast<double>(std::max<long>(n, 1)));
+    r.clamped_fraction = static_cast<double>(clamped) / static_cast<double>(std::max<long>(n, 1));
+    return r;
+}
+
+TEST_CASE("the continuation's added slope stops growing below the hillslope break") {
+    // THE #304 regression. A single self-affine law with H = 0.5 makes the
+    // added slope sigma(l)/l grow as l^-0.5, i.e. by sqrt(2) EVERY level,
+    // without bound -- 16 octaves of that is why the default build looked
+    // like noise. Below the hillslope break the exponent goes to 1 and the
+    // added slope becomes scale-invariant instead.
+    //
+    // Relief is 112 m: earth_lite's own area-weighted mean inter-texel RMS
+    // relief, so this is a measurement of what the shipping planet does on
+    // typical ground, not of a chosen number.
+    ElevationField field = MakeProceduralField(112.0, 20000.0);
+    const int first = field.FirstDetailLevel();
+    REQUIRE(first >= 1);
+
+    auto added_slope = [&](int level) {
+        return MeasureLevelResidual(field, level).rms / ChunkVertexSpacing(level);
+    };
+
+    // Above the break (level 10 is 152.7 m, the break is 106 m) the slope
+    // still grows by 2^(1-H) = sqrt(2) per level: the fluvial regime is
+    // untouched, which is the point of breaking the law rather than
+    // replacing it. 12% band covers both the hash's sampling noise over
+    // ~1 000 vertices and the crossover's pull on the local exponent.
+    for (int level = first + 1; level <= 9; ++level) {
+        const double ratio = added_slope(level) / added_slope(level - 1);
+        CHECK(ratio > std::sqrt(2.0) * 0.88);
+        CHECK(ratio < std::sqrt(2.0) * 1.12);
+    }
+
+    // Below it, flat. Level 13 is 19.1 m, level 18 is 0.60 m -- five
+    // octaves, over which the unbroken law would multiply the slope by
+    // 2^2.5 = 5.66.
+    for (int level = 14; level <= 18; ++level) {
+        const double ratio = added_slope(level) / added_slope(level - 1);
+        CHECK(ratio > 0.90);
+        CHECK(ratio < 1.10);
+    }
+    CHECK(added_slope(18) / added_slope(13) < 1.25);
+
+    // And the absolute number, which is the user-visible claim: on typical
+    // continental ground the continuation adds a few degrees at walking
+    // scale, not a vertical wall. The unbroken law gives 45 deg here (it
+    // is pinned by the clamp); measured after the break, 4.4 deg.
+    const double deg = std::atan(added_slope(18)) * 180.0 / kPi;
+    CHECK(deg > 1.0);      // not vacuous: there IS still detail
+    CHECK(deg < 8.0);      // measured 4.4 deg, so ~1.8x margin
+}
+
+TEST_CASE("the max_slope clamp is a backstop, not the thing holding the field up") {
+    // Before #304 the clamp was load-bearing: area-weighted over
+    // earth_lite it fired on 31.6% of level-19 midpoints, and that
+    // fraction GREW with every level because truncating a divergence is
+    // all it can do. Those vertices were not fractal, they were pinned at
+    // a uniform 45 deg -- the "noise" in the bug report.
+    //
+    // On typical ground it must now never fire, at any level.
+    ElevationField typical = MakeProceduralField(112.0, 20000.0);
+    for (int level = typical.FirstDetailLevel(); level <= 18; ++level) {
+        const LevelResidual r = MeasureLevelResidual(typical, level);
+        CHECK(r.clamped_fraction == 0.0);
+    }
+
+    // Not vacuous: the backstop is still wired, and still fires where real
+    // physics says it should. 2 600 m of relief per 19.5 km texel is the
+    // top of earth_lite's range (max 2 662.7 m) -- the Karakoram front and
+    // the trench walls -- where a threshold-hillslope cap is the correct
+    // model rather than a patch.
+    ElevationField extreme = MakeProceduralField(2600.0, 20000.0);
+    const LevelResidual e = MeasureLevelResidual(extreme, 18);
+    CHECK(e.clamped_fraction > 0.1);
 }
 
 // --- Chunk baking ----------------------------------------------------------

@@ -2153,13 +2153,41 @@ namespace cvar {
             "ArHosekSkyModel dataset instead of plausible substitutes. "
             "Empty disables the DEM entirely.", CVAR_ARCHIVE);
     PT_CVAR(r_planet_hurst,          "0.5",
-            "Hurst exponent of the fractal continuation below the data "
-            "floor. 0.5 is MEASURED, not chosen: continental topography has "
+            "Hurst exponent of the fractal continuation ABOVE the hillslope "
+            "break. 0.5 is MEASURED, not chosen: continental topography has "
             "a power spectrum with beta ~ 2, i.e. a surface fractal "
             "dimension D ~ 2.5, and D = 3 - H (Turcotte, Fractals and Chaos "
             "in Geology and Geophysics, 2nd ed. 1997, ch. 7). Raise toward "
             "1 for a smoother body, lower toward 0 for a rougher one; both "
             "are departures from Earth.", CVAR_ARCHIVE);
+    PT_CVAR(r_planet_hurst_fine,     "1.0",
+            "Hurst exponent BELOW the hillslope break, where diffusive "
+            "sediment transport smooths the surface faster than channel "
+            "incision roughens it. Perron, Kirchner & Dietrich 2008 (JGR "
+            "113:F04003) measure sub-break spectral slopes beta = 4.5-5.2, "
+            "i.e. H = 1.25-1.6, which would erase every sub-metre feature; "
+            "Shepard et al. 2001 (JGR Planets 106:32777) fit 60 natural "
+            "surfaces and find H near 0.5, so real ground is still rough "
+            "at sub-metre lags rather than locally planar. 1.0 is the "
+            "conservative value between them and "
+            "the marginal case: RMS slope becomes scale-invariant instead "
+            "of diverging. Clamped to be at least r_planet_hurst.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_planet_hillslope_break, "106",
+            "Lag in metres at which topography stops being fluvially "
+            "dissected and starts being diffusively smoothed -- the scale "
+            "break the continuation crosses over at. MEASURED: Perron, "
+            "Kirchner & Dietrich 2008 (JGR 113:F04003) put the spectral "
+            "roll-off at 180 m wavelength at Gabilan Mesa and 250 m at the "
+            "South Fork Eel River; a spectral feature at wavelength L shows "
+            "up in a structure function at lag L/2, giving 90 m and 125 m, "
+            "whose geometric mean is 106 m. NOT relief-dependent: the "
+            "hillslope length is set by the diffusion/incision efficiency "
+            "ratio (Perron, Dietrich & Kirchner 2008, JGR 113:F04016), a "
+            "climate and lithology property. 0 removes the break and "
+            "restores the single unbroken power law, whose slope diverges "
+            "as the LOD refines -- the pre-#304 bug, kept only for A/B.",
+            CVAR_ARCHIVE);
     PT_CVAR(r_planet_detail_gain,    "1.0",
             "Multiplier on the fractal continuation's amplitude. 1.0 is the "
             "measured continuation from the DEM's own local relief. Exists "
@@ -6897,6 +6925,8 @@ void Engine::UpdatePlanetTerrain() {
     cfg.blas_budget_ms = fget("r_planet_blas_budget_ms", 2.0);
     if (auto* v = C.FindCVar("r_planet_dem")) cfg.dem_path = v->value;
     cfg.field.hurst               = fget("r_planet_hurst", 0.5);
+    cfg.field.hurst_fine          = fget("r_planet_hurst_fine", 1.0);
+    cfg.field.hillslope_break_m   = fget("r_planet_hillslope_break", 106.0);
     cfg.field.detail_gain         = fget("r_planet_detail_gain", 1.0);
     cfg.field.max_slope           = fget("r_planet_max_slope", 1.0);
     cfg.field.procedural_relief_m = fget("r_planet_procedural_relief", 900.0);
@@ -6918,6 +6948,10 @@ void Engine::UpdatePlanetTerrain() {
             restart = true;
         }
         if (std::abs(planet_terrain_->Field().Params().hurst - cfg.field.hurst) > 1e-12 ||
+            std::abs(planet_terrain_->Field().Params().hurst_fine -
+                     cfg.field.hurst_fine) > 1e-12 ||
+            std::abs(planet_terrain_->Field().Params().hillslope_break_m -
+                     cfg.field.hillslope_break_m) > 1e-9 ||
             std::abs(planet_terrain_->Field().Params().detail_gain - cfg.field.detail_gain) > 1e-12 ||
             std::abs(planet_terrain_->Field().Params().max_slope - cfg.field.max_slope) > 1e-12 ||
             std::abs(planet_terrain_->Field().Params().procedural_relief_m -

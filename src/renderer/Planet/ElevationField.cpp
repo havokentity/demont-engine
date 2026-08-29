@@ -185,6 +185,22 @@ double DigitalElevationModel::TexelAngularSize() const noexcept {
     return 2.0 * kPi / static_cast<double>(width_);
 }
 
+// --- The broken power law -------------------------------------------------
+
+double RelativeStructureFunction(double lag_m, double floor_m, double break_m,
+                                 double h_coarse, double h_fine) noexcept {
+    if (!(lag_m > 0.0) || !(floor_m > 0.0)) return 0.0;
+    if (!(break_m > 0.0)) {
+        // No break: the single self-affine power law. Divergent below the
+        // hillslope scale; kept only so the A/B is one cvar away.
+        return std::pow(lag_m / floor_m, h_coarse);
+    }
+    // pow(1, x) is exactly 1 in IEEE-754, so S(floor_m) == 1.0 exactly and
+    // the continuation joins the DEM without a step.
+    return std::pow(lag_m / floor_m, h_fine) *
+           std::pow((lag_m + break_m) / (floor_m + break_m), h_coarse - h_fine);
+}
+
 // --- ElevationField -------------------------------------------------------
 
 void ElevationField::SampleBaseAndRelief(const glm::dvec3& dir_unit,
@@ -262,6 +278,12 @@ void ElevationField::GenerateChunkHeights(const ChunkKey& key, int level, int ha
     const int l0 = std::min(FirstDetailLevel() - 1, target);
     const double floor_m = DataFloorMetres();
     const double H = std::clamp(params_.hurst, 0.05, 1.0);
+    // H_fine >= H_coarse: the surface may only get smoother as it refines.
+    // The upper bound of 2 admits Perron et al.'s measured sub-break
+    // exponents (H ~ 1.25-1.6) for anyone who wants the fully diffusive
+    // landscape; the default 1.0 is the marginal, slope-invariant case.
+    const double Hf = std::clamp(params_.hurst_fine, H, 2.0);
+    const double break_m = std::max(params_.hillslope_break_m, 0.0);
 
     std::vector<double> prev, cur;
     std::int64_t plo_x = 0, phi_x = 0, plo_y = 0, phi_y = 0;
@@ -282,9 +304,14 @@ void ElevationField::GenerateChunkHeights(const ChunkKey& key, int level, int ha
         const std::int64_t G  = grid_cells(l);
         const std::int64_t Gh = G / 2;
         const double spacing = ChunkVertexSpacing(l);
+        // A pure function of (level, params, DEM): the level-consistency
+        // guarantee needs the amplitude to be identical for a parent and a
+        // child evaluating the same level, and it is -- nothing here reads
+        // the chunk key or the vertex.
         const double amp_scale =
             (spacing < floor_m && floor_m > 0.0)
-                ? params_.detail_gain * kUniformRmsScale * std::pow(spacing / floor_m, H)
+                ? params_.detail_gain * kUniformRmsScale *
+                      RelativeStructureFunction(spacing, floor_m, break_m, H, Hf)
                 : 0.0;
         // The displacement at this level acts over one level-l spacing, so
         // capping it at max_slope * spacing caps the slope it can add.

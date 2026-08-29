@@ -1866,6 +1866,29 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # too loose to be a clean signal and too tight to be safe. 0.8 restores
     # 4.6x and 4.3x while sitting ~13x above the largest measured
     # cross-host codegen drift.
+    # #304 (the hillslope scale break) MOVES ALL THREE OF THESE CELLS. The
+    # committed PNGs are still the pre-#304 ones, pending the maintainer's
+    # sign-off on a regen, so these three cells are EXPECTED RED on this
+    # branch. Measured on this host, branch vs the committed goldens, with
+    # a main-vs-main noise floor of exactly zero (both run-to-run and
+    # rebuild-to-rebuild are byte-identical, as the section above records):
+    #     planet_surface   mean 40.49  rms 74.45  max 327.7  bad 34.9%
+    #     planet_aerial    mean 12.77  rms 27.09  max 292.9  bad 21.5%
+    #     planet_lod_seam  mean 19.47  rms 34.89  max 313.3  bad 36.9%
+    # All three are 100% signal: with a zero noise floor there is no noise
+    # term to subtract. For scale, deleting the real DEM entirely moves the
+    # same cells by mean 185.6 / 179.5 / 85.9, so #304 is a fifth to a
+    # quarter of "this is not Earth any more" -- consistent with a change
+    # that rewrites the sub-hundred-metre octaves and leaves the DEM's own
+    # kilometre-scale form untouched.
+    #
+    # PR #303 (feat/300-land-cover) also regenerates planet_surface,
+    # planet_aerial and planet_lod_seam, and additionally edits
+    # planet_surface.cfg and adds planet_land_orbit. Whichever lands
+    # second must re-render rather than take the other's PNGs: #303
+    # modulates land cover BY SLOPE, and #304 changes the slope
+    # distribution below 106 m by an order of magnitude, so the two
+    # interact physically and not merely textually.
     pt_add_golden_cell(SCENE planet_surface  BACKEND metal DENOISER off
                        FRAMES 32 MAX_DELTA 16 MEAN_DELTA 0.8 FAIL_PERCENT 1)
     # --- Land cover (#300) --------------------------------------------
