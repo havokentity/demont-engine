@@ -54,11 +54,49 @@
 // is only rewritten once no in-flight frame can still be tracing the TLAS
 // that referenced it. That is the deferred-destruction queue the RHI does
 // not have, implemented at the one call site that needs it.
+//
+// RESIDENCY IS NOT PUBLICATION
+//
+// Leaving the desired set is also not, on its own, a reason to stop
+// DRAWING a chunk. Eviction used to be immediate and unconditional while
+// the replacements were paced against blas_budget_ms, so the frame the
+// camera moved, every chunk the LOD boundary swept past vanished and came
+// back tens of frames later -- the terrain visibly holed out along the
+// boundary on every camera motion.
+//
+// A chunk is now retired only once its ground is covered without it, which
+// means the streamer has to hold chunks the selector no longer wants. Since
+// a path tracer has no depth buffer to arbitrate two coincident surfaces,
+// the held chunk and its incoming replacements cannot both go into the
+// TLAS. So the two ideas are separated:
+//
+//   resident   has an arena slot and a BLAS. May be more than the selector
+//              asked for: outgoing chunks waiting for their replacements,
+//              and incoming chunks waiting for their siblings.
+//   published  the DISJOINT COVER handed to the TLAS, chosen each frame by
+//              pt::planet::ComputeResidencyCover. Never overlapping, so no
+//              double-shading and no coincident-surface artefact.
+//
+// The arena is still the hard cap and it gets no extra headroom, because
+// the selector target is the arena size and lowering it would move the
+// steady-state residency set that every planet golden is pinned against.
+// Instead the HOLD is what gives: stand-ins are kept only in the slack the
+// desired set leaves (`chunk_budget_ - |desired|`), and beyond that they
+// are dropped lowest-priority-first. Under arena pressure the terrain
+// therefore degrades to exactly the old behaviour -- a hole -- which is the
+// right way round: correctness first, smoothness second.
+//
+// None of this runs inside Settle(). A settling round is a barrier with no
+// observer, so there is no transient to protect, and its residency answer
+// (down to which arena slot each chunk gets, and therefore the BLAS build
+// order) is what the golden matrix is pinned to. See the `settling_` gate
+// in Update().
 
 #include "../renderer/Planet/CubedSphere.h"
 #include "../renderer/Planet/ElevationField.h"
 #include "../renderer/Planet/TerrainChunk.h"
 #include "../renderer/Planet/TerrainQuadtree.h"
+#include "../renderer/Planet/TerrainResidency.h"
 #include "../rhi/Device.h"
 #include "../rhi/Resources.h"
 
@@ -134,6 +172,29 @@ struct TerrainStats {
     // is on screen; this says HOW IT WAS LAID OUT, and a golden depends on
     // both.
     std::uint64_t scene_digest = 0;
+    // Chunks actually handed to the TLAS. Equals `resident` at steady state
+    // and is smaller mid-transition, when a held stand-in suppresses the
+    // incoming chunks underneath it (or vice versa).
+    std::size_t   published     = 0;
+    // Resident chunks the selector no longer wants, kept because nothing
+    // else covers their ground yet. The transient this whole policy exists
+    // to buy; zero at steady state.
+    std::size_t   held          = 0;
+    // Cumulative count of stand-ins dropped because the arena had no slack
+    // for them, and of substitutions refused because publishing them would
+    // have opened a two-level step. Both are "a hole was preferred to the
+    // alternative" and both should be rare; a rising figure is the signal
+    // that r_planet_chunk_budget is too tight for the camera.
+    std::uint64_t holds_dropped = 0;
+    std::uint64_t holds_refused = 0;
+    // Chunks the selector wants, whose geometry is baked, that have no
+    // arena slot to go into. Non-zero means the arena is the binding
+    // constraint and stand-ins are being released to serve it.
+    std::size_t   starved       = 0;
+    // High-water mark of `resident` over the session, in chunks. Compared
+    // against r_planet_chunk_budget this is the direct statement that the
+    // transient never overflowed the arena.
+    std::size_t   resident_peak = 0;
 };
 
 class PlanetTerrain {
@@ -218,6 +279,22 @@ public:
     pt::rhi::BufferHandle VertexBuffer() const noexcept { return vert_buf_; }
     pt::rhi::BufferHandle IndexBuffer()  const noexcept { return index_buf_; }
 
+    // The disjoint cover currently in the TLAS. Every member is resident;
+    // resident chunks NOT in here are held stand-ins or suppressed
+    // incomers, and are deliberately not drawn.
+    const std::set<pt::planet::ChunkKey>& Published() const noexcept {
+        return published_;
+    }
+    // Every chunk with an arena slot and a BLAS, published or not.
+    std::vector<pt::planet::ChunkKey> ResidentKeys() const;
+    // What the selector asked for on the last Update: a complete,
+    // 2:1-balanced leaf partition of the sphere. Exposed so a test can state
+    // "the published cover covers all of this" rather than infer it from a
+    // chunk count.
+    const std::set<pt::planet::ChunkKey>& Desired() const noexcept {
+        return tree_.Desired();
+    }
+
     const TerrainStats& Stats() const noexcept { return stats_; }
     const pt::planet::PlanetSite& Site() const noexcept { return site_; }
     const pt::planet::ElevationField& Field() const noexcept { return field_; }
@@ -255,6 +332,23 @@ private:
         std::uint32_t              slot = 0;
         pt::rhi::AccelStructHandle blas{};
         int                        frames = 0;
+        // True when this retirement was a stand-in RELEASED to serve a
+        // starved incoming chunk, rather than an ordinary retirement. The
+        // release is sized against the deficit, and a retired slot does not
+        // rejoin the free list for kRetireFrames, so without a way to see
+        // its own releases still in flight the pass would issue the same
+        // deficit three times over and punch three times the holes.
+        //
+        // Only its OWN releases count. Netting ordinary retirements off the
+        // deficit as well was the first version and it deadlocks in slow
+        // motion: after a camera teleport the arena is full of stand-ins,
+        // the incoming set starves, and the churn of ordinary retirements
+        // is comfortably larger than the starvation every frame -- so the
+        // release never fires, the arena stays clogged with ground nobody
+        // is looking at, and the new region streams in five slots at a
+        // time. Measured: 126 chunks held against a 128-slot arena for the
+        // whole of a 90-tick recovery, publishing 12.
+        bool                       hold_release = false;
     };
 
     std::uint64_t PublishedSceneDigest() const;
@@ -281,7 +375,17 @@ private:
     std::vector<std::uint32_t> free_slots_;
     std::vector<Retired>       retired_;
 
+    // Retire every resident chunk the selector no longer wants, whatever
+    // covers it. The pre-coverage rule, kept for the settling path and for the
+    // red half of the regression test.
+    void RetireUncovered(const std::set<pt::planet::ChunkKey>& desired);
+    // The coverage-aware pass: choose the published cover, retire what it
+    // makes redundant, and drop stand-ins the arena has no slack for.
+    void ChooseCover(const std::set<pt::planet::ChunkKey>& desired,
+                     const pt::planet::LodParams& lod);
+
     std::map<pt::planet::ChunkKey, Resident>                  resident_;
+    std::set<pt::planet::ChunkKey>                            published_;
     std::map<pt::planet::ChunkKey, pt::planet::TerrainChunkData> baked_;
     std::vector<pt::planet::ChunkKey>                          requested_;
 
