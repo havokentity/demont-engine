@@ -220,20 +220,21 @@ double rayAltAt(const RayAlt& a, double s) {
 }
 
 bool ptSphereRoots(F3 ro, F3 rd, F3 c, float rad, float& t0, float& t1);
+bool ptRayShell(F3 ro, F3 rd, F3 centre, float r_inner, float r_outer,
+                float t_max, float& t_in, float& t_out);
 
 PT_MIRROR F3 ptAtmoOpticalDepth(const AtmoBody& b, F3 ro, F3 rd, F3 centre,
                                 float t, int steps) {
     if (!(t > 0.0f)) return F3{0.0f, 0.0f, 0.0f};
-    // Planetary P6 (#260): clip the interval to the medium before
-    // spending the step budget on it.  See the derivation above the
-    // shader function -- this is the black-disc fix.
-    float u0, u1;
-    if (!ptSphereRoots(ro, rd, centre, b.top_radius, u0, u1)) {
+    // Planetary P6 (#260) clipped the interval to top_radius; the #300
+    // follow-up clips it to the FLOOR as well, because `max(h, 0)` below
+    // is not a bound -- it charges every sub-datum metre at sea-level
+    // extinction.  See the derivation above the shader function.
+    float lo, hi;
+    if (!ptRayShell(ro, rd, centre, b.ground_radius, b.top_radius, t,
+                    lo, hi)) {
         return F3{0.0f, 0.0f, 0.0f};
     }
-    float lo = std::max(u0, 0.0f);
-    float hi = std::min(u1, t);
-    if (!(hi > lo)) return F3{0.0f, 0.0f, 0.0f};
     int N = std::max(steps, 1);
     float dt = (hi - lo) / float(N);
     float oneSixth = 1.0f / 6.0f;
@@ -825,6 +826,149 @@ TEST_CASE("the planet is not a black disc from orbit") {
     }
 }
 
+// The pre-#300 rule, verbatim: clipped to the TOP of the shell and to
+// nothing else, with `max(h, 0)` left as the only thing standing between
+// the integral and a path that runs below the datum.  Kept live, like
+// unclippedOpticalDepthChannel above, so the case below asserts what the
+// engine actually did rather than asserting that today differs from a
+// version nobody can run.
+double topClippedOpticalDepthChannel(const AtmoBody& b, F3 ro, F3 rd, F3 centre,
+                                     float t, int channel, int steps) {
+    if (!(t > 0.0f)) return 0.0;
+    float u0, u1;
+    if (!ptSphereRoots(ro, rd, centre, b.top_radius, u0, u1)) return 0.0;
+    const float lo = std::max(u0, 0.0f);
+    const float hi = std::min(u1, t);
+    if (!(hi > lo)) return 0.0;
+    const int N = std::max(steps, 1);
+    const float dt = (hi - lo) / float(N);
+    RayAlt alt = rayAltBegin(ro, rd, centre, b.ground_radius);
+    auto st_at = [&](double s) {
+        F3 sr, sm, st;
+        ptAtmoCoefficients(b, float(std::max(rayAltAt(alt, s), 0.0)), sr, sm, st);
+        return double(channel == 0 ? st.x : channel == 1 ? st.y : st.z);
+    };
+    double tau = 0.0, st_prev = st_at(lo);
+    for (int i = 0; i < N; ++i) {
+        const double m = lo + (i + 0.5) * double(dt);
+        const double r = lo + (i + 1.0) * double(dt);
+        const double st_mid = st_at(m), st_right = st_at(r);
+        tau += double(dt) / 6.0 * (st_prev + 4.0 * st_mid + st_right);
+        st_prev = st_right;
+    }
+    return tau;
+}
+
+TEST_CASE("the air column ends at the datum, not at the surface it hits") {
+    // #300's dim, yellow-brown Earth, as a number.
+    //
+    // #260 gave the integral a CEILING and left `max(h, 0)` as its only
+    // floor.  That clamp is not a floor: it charges every metre below the
+    // datum at SEA-LEVEL extinction, so the error grows linearly with
+    // depth and has no bound at all.  Nothing exercised it until terrain
+    // streaming, because before that the ground WAS the datum.
+    //
+    // THE TWO RADII ARE CHOSEN ON DIFFERENT BASES, AND THAT IS THE BUG.
+    // With terrain on, the atmosphere's ground_radius becomes the SITE's
+    // geocentric radius (Engine.cpp: `planet_radius_m = ...Site()
+    // .site_radius_m`) while P3's analytic backstop is
+    // `kWgs84B + kEarthMinElevation - 65`, a constant chosen to sit
+    // inside every terrain chunk everywhere.  At planet_land_orbit's
+    // 27.9881 N reference site those are
+    //
+    //     site geocentric radius   6 373 458.18 m   (WGS-84, h = 0)
+    //     analytic backstop        6 345 752.31 m
+    //     ------------------------------------------------
+    //     backstop below the datum    27 705.87 m
+    //
+    // -- and from orbit the backstop IS the visible planet, every pixel
+    // of it.  So every disc pixel integrated 27.7 km of air the model
+    // does not contain, on top of a real column whose scale height is
+    // 8 km.  Measured out of the Metal kernel at the sub-solar nadir
+    // pixel of that fixture, by writing atmosphericTransmittance()
+    // straight to the framebuffer under r_tonemap_op linear:
+    //
+    //     tau  R 0.4608   G 0.7597   B 1.4338      (shader)
+    //     tau  R 0.4632   G 0.7575   B 1.4260      (this rule, below)
+    //
+    // against a true column of 0.0662 / 0.1468 / 0.2761.  Five times the
+    // optical depth, and because the excess is Rayleigh -- lambda^-4 --
+    // the transmittance R/B ratio goes from 1.23 to 2.62.  Dim AND warm,
+    // both from one term.
+    const AtmoBody b = ptAtmoEarth(kR);
+    const F3 down{0.0f, -1.0f, 0.0f};
+    const float kAlt = 30000000.0f;          // planet_land_orbit's camera
+    const F3 ro{0.0f, kAlt, 0.0f};
+
+    // Depths swept from "a real terrain hollow" to "the engine's own
+    // backstop" and past it.  The last two are the ones that matter; the
+    // first two are there so the claim is a trend and not a single point.
+    const double depths[5] = {500.0, 5000.0, 10935.0, 27705.87, 60000.0};
+
+    // THE TRUTH, and it is a constant: the air over a nadir point does
+    // not depend on how far BELOW the datum the thing you can see
+    // happens to be.  A hole in the ground does not add atmosphere.
+    // Computed once, at the datum, with the independent reference rule.
+    double T_ref[3];
+    for (int ch = 0; ch < 3; ++ch) {
+        T_ref[ch] = std::exp(
+            -refOpticalDepthChannel(b, ro, down, kCentre, kAlt, ch, 200000));
+    }
+    CHECK(T_ref[0] == doctest::Approx(0.9359).epsilon(0.002));
+    CHECK(T_ref[1] == doctest::Approx(0.8635).epsilon(0.002));
+    CHECK(T_ref[2] == doctest::Approx(0.7587).epsilon(0.002));
+
+    for (double d : depths) {
+        CAPTURE(d);
+        // A surface `d` metres below the datum, i.e. what the primary ray
+        // reports as its hit distance.
+        const float t = float(double(kAlt) + d);
+
+        double T_old[3], T_new[3];
+        for (int ch = 0; ch < 3; ++ch) {
+            CAPTURE(ch);
+            T_old[ch] = std::exp(
+                -topClippedOpticalDepthChannel(b, ro, down, kCentre, t, ch, 8));
+            const F3 tau_new = ptAtmoOpticalDepth(b, ro, down, kCentre, t, 8);
+            T_new[ch] = std::exp(-double(ch == 0 ? tau_new.x
+                                       : ch == 1 ? tau_new.y : tau_new.z));
+
+            // GREEN, and it is the whole claim: the transmittance is the
+            // air column and nothing else, at EVERY depth.  1% is the bar
+            // the quadrature sweep above sets, and it is under half an
+            // 8-bit step at any exposure that is not clipping.
+            CHECK(std::fabs(T_new[ch] - T_ref[ch]) < 0.01);
+        }
+
+        // RED.  Stated on CONTENT, not on "the two differ": at the
+        // engine's own backstop depth the old rule loses three quarters
+        // of the blue, and it reddens as it dims.  A vacuity check would
+        // pass on any change at all -- these two will not.
+        if (d > 20000.0) {
+            CHECK(T_old[2] < 0.30);                       // 0.240 measured
+            CHECK(T_old[0] / T_old[2] > 2.0);             // 2.62 measured
+            CHECK(T_new[0] / T_new[2] < 1.40);            // 1.23, the truth
+        }
+        // ...and it is monotone in depth, which is what "not a bound"
+        // means: there is no depth at which the old rule stops getting
+        // worse.
+        CHECK(T_old[2] < T_ref[2]);
+    }
+
+    // The two constants this case is about have to stay the ones the
+    // engine actually pushes, or the 27.7 km above is a story about a
+    // build that no longer exists.  Read out of Engine.cpp rather than
+    // linked, because this target deliberately has no dependencies.
+    const std::string eng = tighten(PT_ENGINE_CPP_PATH);
+    REQUIRE_FALSE(eng.empty());
+    CHECK(countOf(eng,
+        "ground_body_R=pt::planet::kWgs84B+pt::planet::kEarthMinElevation-65.0;")
+          == 1u);
+    CHECK(countOf(eng,
+        "planet_radius_m=static_cast<float>(planet_terrain_->Site().site_radius_m);")
+          == 1u);
+}
+
 TEST_CASE("clipping to the medium discards a bounded, negligible tail") {
     // The clip is exact only if the medium really stops at top_radius.
     // It does not: the Rayleigh and Mie profiles are exponentials and
@@ -901,10 +1045,23 @@ TEST_CASE("the clip is a no-op for every ray that starts inside the shell") {
         for (int ei = 0; ei <= 16; ++ei) {
             const double e = (-90.0 + 180.0 * (ei / 16.0)) * 3.14159265358979 / 180.0;
             const F3 rd = norm(F3{float(std::cos(e)), float(std::sin(e)), 0.0f});
-            // A t that stays inside the shell: the ground is at most
-            // `alt` away straight down, and 30 km of reach from 10 km up
-            // cannot escape a 100 km shell in any direction.
-            const float t = 30000.0f;
+            // A t that stays inside the shell.  30 km of reach from 10 km
+            // up cannot escape a 100 km shell upward -- but it goes clean
+            // through the FLOOR on any downward ray, so the ground
+            // crossing caps it (#300 follow-up).  That is not a weakening
+            // of the claim: a primary ray STOPS at the surface, so a
+            // downward t past the datum is not a state any fixture
+            // reaches.  What the old rule did with such a t -- charge the
+            // sub-datum span at sea-level extinction -- is the subject of
+            // "the air column ends at the datum" above, and pinning it
+            // here as a no-op is what let it survive to #300.
+            float t = 30000.0f;
+            float gt0, gt1;
+            if (ptSphereRoots(ro, rd, kCentre, b.ground_radius, gt0, gt1)
+                && gt0 > 0.0f) {
+                t = std::min(t, gt0);
+            }
+            if (!(t > 0.0f)) continue;
             const F3 clipped = ptAtmoOpticalDepth(b, ro, rd, kCentre, t, 8);
             const double u0 = unclippedOpticalDepthChannel(b, ro, rd, kCentre, t, 0, 8);
             const double u1 = unclippedOpticalDepthChannel(b, ro, rd, kCentre, t, 1, 8);
@@ -936,6 +1093,28 @@ TEST_CASE("the clip is a no-op for every ray that starts inside the shell") {
         // Both are utterly negligible -- which is the point: the clip
         // only ever removes air that could not have mattered.
         CHECK(unclipped < 1.0e-4);
+    }
+
+    // ...and the OTHER boundary, which is the one that could not be said
+    // before #300's follow-up.  From 10 km, straight down, 30 km of
+    // requested path: the ground is 10 km along and the remaining 20 km
+    // is inside the body.  The clip removes it; the old rule charged it
+    // at sea-level extinction, and unlike the top-boundary tail above
+    // this one is NOT negligible -- it is three times the whole vertical
+    // column.  Same shape of test, opposite sign of consequence, which
+    // is exactly why the floor is a different claim from the ceiling.
+    {
+        const F3 ro{0.0f, 10000.0f, 0.0f};
+        const F3 rd{0.0f, -1.0f, 0.0f};
+        const F3 clipped = ptAtmoOpticalDepth(b, ro, rd, kCentre, 30000.0f, 8);
+        const double unclipped =
+            topClippedOpticalDepthChannel(b, ro, rd, kCentre, 30000.0f, 2, 8);
+        CHECK(double(clipped.z) < unclipped);
+        // The air really over that point, integrated independently.
+        const double truth =
+            refOpticalDepthChannel(b, ro, rd, kCentre, 10000.0f, 2, 200000);
+        CHECK(double(clipped.z) == doctest::Approx(truth).epsilon(0.05));
+        CHECK(unclipped > 3.0 * truth);
     }
 }
 
@@ -1342,18 +1521,30 @@ TEST_CASE("shader mirror is still faithful") {
     // from the shader while leaving `lo` in the loop would still satisfy
     // pt_math_altitude_test's hoist pins, which is exactly the
     // find()-shaped hole #276 lived in.
+    // The #300 follow-up widened it to BOTH boundaries: the clip is now
+    // ptRayShell against [ground_radius, top_radius], because the
+    // altitude clamp `max(h, 0)` is not a floor -- it charges sub-datum
+    // path at sea-level extinction, unbounded in depth.  Pinned on the
+    // whole clause, and pinned NEGATIVELY on the top-only form, so
+    // reverting half of it is a red test rather than a silent regression.
     CHECK(countOf(math,
-        "if(!ptSphereRoots(ro,rd,centre,b.top_radius,u0,u1)){"
+        "if(!ptRayShell(ro,rd,centre,b.ground_radius,b.top_radius,t,lo,hi)){"
         "returnfloat3(0.0,0.0,0.0);//rayneverentersthemedium}") == 1u);
-    CHECK(countOf(math, "floatlo=max(u0,0.0);floathi=min(u1,t);") == 1u);
+    CHECK(countOf(math, "floatlo=max(u0,0.0);floathi=min(u1,t);") == 0u);
     CHECK(countOf(math, "floatdt=(hi-lo)/float(N);") == 1u);
     // And that the pre-#260 form is gone rather than merely shadowed.
     CHECK(countOf(math, "floatdt=t/float(N);") == 0u);
-    // ptSphereRoots must be DEFINED before the integral that calls it --
-    // Slang has no forward declaration here, so a later edit that moves
-    // it back below would fail to compile; pinning the order makes the
-    // reason visible rather than leaving it as a compile mystery.
+    // ptSphereRoots and ptRayShell must both be DEFINED before the
+    // integral that calls them -- Slang has no forward declaration here,
+    // so a later edit that moves either back below would fail to compile;
+    // pinning the order makes the reason visible rather than leaving it
+    // as a compile mystery.  ptRayShell moved above ptAtmoOpticalDepth in
+    // the #300 follow-up for exactly this reason, and the Metal path
+    // cannot be the thing that proves it: Vulkan is not built on macOS
+    // (#290), so the ordering has to be a test rather than a build.
     CHECK(math.find("publicboolptSphereRoots(")
+          < math.find("publicboolptRayShell("));
+    CHECK(math.find("publicboolptRayShell(")
           < math.find("publicfloat3ptAtmoOpticalDepth("));
 
     // Earth must be ASSIGNED once, in the constructor -- the point of
@@ -1408,6 +1599,18 @@ TEST_CASE("shader mirror is still faithful") {
                       "t_max,t_in,t_out)){") == 1u);
     CHECK(countOf(pt, "if(ptSphereRoots(ro,rd,pc,planet_R,g0,g1)&&g0>0.0)"
                       "{t_out=min(t_out,g0);}") == 1u);
+    // The AERIAL-PERSPECTIVE march has to carry the same clamp (#300
+    // follow-up).  skyPhysical has had it since #260 and the primary-hit
+    // march did not, so the two disagreed about where the air ends for
+    // exactly the rays that hit the body -- and with terrain streaming
+    // that hit is 27.7 km BELOW the datum, marched as a slab of
+    // sea-level air that ADDED in-scatter.  Measured at nadir, sub-solar:
+    // sigma_s(0) * 27.7 km * P_R(-1) * E = (7.4, 21.6, 54.4) W/m^2/sr,
+    // against a true column in-scatter of (2.1, 6.2, 15.7).
+    CHECK(countOf(pt, "if(span_ok_v&&ptSphereRoots(primary_ro,primary_rd,pc_v,"
+                      "planet_R_v,g0_v,g1_v)&&g0_v>0.0){"
+                      "t_far_v=min(t_far_v,g0_v);"
+                      "span_ok_v=(t_far_v>t_near_v);}") == 1u);
     // The sun term is the SAME slant-path integral the NEE site and the
     // cloud march use, which is what makes the terminator geometry rather
     // than a threshold -- and there must be exactly one of it.

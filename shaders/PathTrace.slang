@@ -9593,6 +9593,49 @@ void main(uint2 tid : SV_DispatchThreadID) {
                              && ptRayShell(primary_ro, primary_rd, pc_v, 0.0,
                                            ptAtmoEarth(planet_R_v).top_radius,
                                            primary_t, t_near_v, t_far_v);
+                    // AND STOP THE COLUMN AT THE GROUND (#300 follow-up).
+                    // skyPhysical has carried this clamp since #260 -- see
+                    // "The body is opaque" next to its own ptRayShell call
+                    // -- and this march did not, which made the two
+                    // disagree about where the air ends for exactly the
+                    // rays that hit the body.
+                    //
+                    // It bites whenever the primary hit is BELOW the
+                    // atmosphere's datum, and with streamed terrain that is
+                    // every pixel of the disc: the datum is the site's
+                    // geocentric radius while P3's analytic backstop is
+                    // WGS-84 b - 10 935 - 65 m, 27.7 km lower at the 27.99 N
+                    // site. Those 27.7 km were marched with the altitude
+                    // clamped to 0, i.e. as a slab of SEA-LEVEL air, and
+                    // being in-scatter it ADDED light rather than removing
+                    // it. Measured at nadir, sub-solar: the slab contributes
+                    // sigma_s(0) * 27.7 km * P_R(-1) * E = (7.4, 21.6, 54.4)
+                    // W/m^2/sr against a true column in-scatter of
+                    // (2.1, 6.2, 15.7) -- four times the real atmosphere,
+                    // which is what washed the land cover off the disc.
+                    //
+                    // Same defect as the one ptAtmoOpticalDepth carries on
+                    // the extinction side, and the same fix: the medium has
+                    // a floor.
+                    //
+                    // WHY NO IMAGE GOLDEN MOVES, AND WHY THAT IS THE
+                    // POINT. Every fixture with r_sky_mode physical has
+                    // r_planet_terrain 0, and without terrain the analytic
+                    // body sits AT the datum (Engine.cpp only lowers it to
+                    // the backstop when terrain is on), so this clamp is a
+                    // no-op on all nine of them -- verified: the whole
+                    // matrix is bit-stable across this change. That is
+                    // exactly the gap the defect lived in. Until a cell
+                    // combines the two, the guard is the source pin in
+                    // tests/pt_atmosphere_test.cpp, not a picture.
+                    float g0_v, g1_v;
+                    if (span_ok_v
+                        && ptSphereRoots(primary_ro, primary_rd, pc_v,
+                                         planet_R_v, g0_v, g1_v)
+                        && g0_v > 0.0) {
+                        t_far_v = min(t_far_v, g0_v);
+                        span_ok_v = (t_far_v > t_near_v);
+                    }
                 } else {
                     span_ok_v = false;   // skyPhysical already did this ray
                 }

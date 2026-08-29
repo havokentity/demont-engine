@@ -1885,16 +1885,26 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     #   noise to absorb.
     #   Signal: the r_planet_land_albedo 0 ablation -- which returns the
     #   surface to exactly the procedural classification -- moves it by
-    #   mean 4.170 with 5.69% of pixels bad and a max delta of 182.7.
+    #   mean 5.011 with 6.91% of pixels bad and a max delta of 275.5.
     #   The disc covers ~14% of the frame, so that mean is concentrated
-    #   where the planet is.
+    #   where the planet is. Unloading the raster entirely
+    #   (r_planet_albedo_map "") gives the identical figures, which is
+    #   what "the ablation really removes the feature" looks like.
     #
-    #   MEAN_DELTA 0.8 therefore sits 5.2x below the weakest signal and
-    #   infinitely above the observed noise. FAIL_PERCENT 1 sits 5.7x
-    #   below the ablation's 5.69%. MAX_DELTA 16 is the matrix default and
+    #   MEAN_DELTA 0.8 therefore sits 6.3x below the weakest signal and
+    #   infinitely above the observed noise. FAIL_PERCENT 1 sits 6.9x
+    #   below the ablation's 6.91%. MAX_DELTA 16 is the matrix default and
     #   is NOT tightened toward the measured 0.0000 on purpose, for the
     #   reason the block above gives: one M4 Max is not a sample, and the
     #   headroom is for another driver's fma ordering.
+    #
+    #   RE-MEASURED after the sub-datum air-column fix, which moved this
+    #   golden by mean 23.28 with 14.19% of pixels bad -- 4.6x the
+    #   feature's own ablation, i.e. the atmosphere bug was a larger
+    #   effect on this frame than the land cover it was supposed to be
+    #   showing. The numbers above are that re-measurement, not the
+    #   pre-fix ones; the margins moved by ~20% and the thresholds
+    #   therefore did not need to.
     #
     # NOT VACUOUS: the golden is not blank and not uniform. It is an
     # illuminated disc on black -- so the assertions that matter are made
