@@ -322,4 +322,100 @@ double MultipleInternalReflectionGain(double irradiance_reflectance) noexcept {
     return d > 0.0 ? 1.0 / d : 0.0;
 }
 
+// --- 6. The published relations the engine is checked against (#305) -------
+
+double GordonSubsurfaceRrs(double bb_over_a_plus_bb) noexcept {
+    const double x = std::clamp(bb_over_a_plus_bb, 0.0, 1.0);
+    return kGordon1988G1 * x + kGordon1988G2 * x * x;
+}
+
+double LeeAboveWaterRrs(double subsurface_rrs) noexcept {
+    const double d = 1.0 - kLee2002GamQ * subsurface_rrs;
+    return d > 0.0 ? kLee2002T * subsurface_rrs / d : 0.0;
+}
+
+namespace {
+
+// Bricaud et al. 1998 A(lambda) / E(lambda), from the tabulation the Ocean
+// Optics Web Book redistributes (2 nm grid; this is that grid decimated to
+// the wavelengths this engine and the ocean-colour satellites actually use,
+// with 443 and 555 linearly interpolated between the neighbouring 2 nm
+// entries and marked as such).
+//
+//   440 / 450 / 490 / 550 / 620 are table entries verbatim.
+//   443 is between 442 (0.0514, 0.6298) and 444 (0.0505, 0.6232).
+//   555 is between 554 (0.0110, 0.8419) and 556 (0.0107, 0.8438).
+struct BricaudRow { double lambda_nm, A, E; };
+constexpr BricaudRow kBricaud[] = {
+    {412.0, 0.0473,  0.6862},
+    {440.0, 0.0520,  0.6350},
+    {443.0, 0.05095, 0.6265},   // interpolated 442 <-> 444
+    {450.0, 0.0479,  0.6151},
+    {490.0, 0.0341,  0.6200},
+    {510.0, 0.0232,  0.7060},
+    {550.0, 0.0118,  0.8385},
+    {555.0, 0.01085, 0.84285},  // interpolated 554 <-> 556
+    {620.0, 0.0090,  0.8438},
+    {670.0, 0.0199,  0.8177},
+};
+constexpr std::size_t kBricaudCount = sizeof(kBricaud) / sizeof(kBricaud[0]);
+
+// Linear in lambda between table rows, clamped at both ends. The table is
+// coarse away from the satellite bands, which is why this is only ever
+// evaluated AT them.
+void BricaudAE(double lambda_nm, double& A, double& E) noexcept {
+    if (lambda_nm <= kBricaud[0].lambda_nm) {
+        A = kBricaud[0].A; E = kBricaud[0].E; return;
+    }
+    for (std::size_t i = 1; i < kBricaudCount; ++i) {
+        if (lambda_nm <= kBricaud[i].lambda_nm) {
+            const double t = (lambda_nm - kBricaud[i - 1].lambda_nm) /
+                             (kBricaud[i].lambda_nm - kBricaud[i - 1].lambda_nm);
+            A = kBricaud[i - 1].A + t * (kBricaud[i].A - kBricaud[i - 1].A);
+            E = kBricaud[i - 1].E + t * (kBricaud[i].E - kBricaud[i - 1].E);
+            return;
+        }
+    }
+    A = kBricaud[kBricaudCount - 1].A;
+    E = kBricaud[kBricaudCount - 1].E;
+}
+
+}  // namespace
+
+double BricaudParticleAbsorption(double lambda_nm, double chl_mg_m3) noexcept {
+    if (!(chl_mg_m3 > 0.0)) return 0.0;
+    double A = 0.0, E = 0.0;
+    BricaudAE(lambda_nm, A, E);
+    return A * std::pow(chl_mg_m3, E);
+}
+
+Case1Iops Case1FromChlorophyll(double lambda_nm, double chl_mg_m3) noexcept {
+    Case1Iops out;
+    const double chl = std::max(chl_mg_m3, 0.0);
+    // --- absorption, MM01 (16) with Bricaud 1998 standing in for the
+    //     untabulated A_chl, and the yellow-substance term as the THREE
+    //     equations Appendix B insists on rather than the bracket.
+    const double a_w    = PureWaterAbsorption(lambda_nm);
+    const double a_p    = BricaudParticleAbsorption(lambda_nm, chl);
+    const double a_w440 = PureWaterAbsorption(440.0);
+    const double a_p440 = BricaudParticleAbsorption(440.0, chl);
+    const double a_y440 = 0.2 * (a_w440 + a_p440);                    // (18)
+    const double a_y    = a_y440 * std::exp(-0.014 * (lambda_nm - 440.0)); // (17)
+    out.a = a_w + a_p + a_y;                                          // (16)
+    // --- scattering, MM01 (12) with the lambda^-1 slope the paper states
+    const double bp550 = 0.416 * std::pow(std::max(chl, 1e-12), 0.766); // (12)
+    out.bp = bp550 * (550.0 / std::max(lambda_nm, 1.0));
+    // --- particle BACKscattering, MM01 (13)/(14). Note 0.01 and
+    //     (lambda/550)^v -- see the header on why the 0.02 / (550/lambda)
+    //     pair is the superseded equation (10) and doubles this.
+    const double log_chl = std::log10(std::max(chl, 1e-12));
+    const double v = (chl > 2.0) ? 0.0 : 0.5 * (log_chl - 0.3);        // (14)
+    const double eff = 0.002 + 0.01 * (0.5 - 0.25 * log_chl) *
+                                   std::pow(lambda_nm / 550.0, v);
+    out.bbp = std::max(eff, 0.0) * bp550;                              // (13)
+    out.bw  = PureSeawaterScattering(lambda_nm, kOceanSalinityPpt);
+    out.bb  = 0.5 * out.bw + out.bbp;                                  // (11)
+    return out;
+}
+
 }  // namespace pt::water

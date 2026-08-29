@@ -435,4 +435,127 @@ double FresnelUnpolarised(double cos_i, double n_i, double n_t) noexcept;
 inline constexpr double kInternalReflectanceRBar = 0.48;
 double MultipleInternalReflectionGain(double irradiance_reflectance) noexcept;
 
+// --- 6. THE PUBLISHED RELATIONS THE ENGINE IS CHECKED AGAINST (#305) -------
+//
+// These are NOT part of the renderer. They are the literature's own answers
+// to the same question, kept here so the acceptance check in
+// tests/pt_water_optics_test.cpp compares against a published model rather
+// than against a number somebody liked.
+//
+// 6.1 GORDON ET AL. 1988. H. R. Gordon, O. B. Brown, R. H. Evans, J. W.
+// Brown, R. C. Smith, K. S. Baker and D. K. Clark, "A semianalytic radiance
+// model of ocean color", J. Geophys. Res. 93(D9), 10909-10924 (1988). The
+// SUBSURFACE remote-sensing reflectance r_rs = L_u(0-)/E_d(0-), in 1/sr,
+// as a quadratic in X = b_b/(a + b_b):
+//
+//     r_rs = 0.0949 X + 0.0794 X^2
+//
+// The coefficients are quoted here from IOCCG Report 5, "Remote Sensing of
+// Inherent Optical Properties: Fundamentals, Tests of Algorithms, and
+// Applications" (ed. Z.-P. Lee, 2006), equation (8.1), and from Lee, Carder
+// and Arnone 2002 p. 5757, because the 1988 paper itself is not openly
+// accessible and quoting an equation number in it would be quoting
+// something unread. STATED CONDITIONS: nadir-viewed radiance, oceanic Case
+// 1 water, and the fit is over a RANGE of solar zenith angles rather than
+// one geometry (Park and Ruddick, Applied Optics 44(7), 1236-1249, 2005,
+// section 1) -- so this is the right thing to compare an engine to at
+// several sun angles, and the wrong thing to compare it to at one and call
+// exact. It is a fit to full Monte-Carlo radiative transfer, so it carries
+// the multiple scattering the engine's single-backscattering form does not,
+// and the ratio between them is the size of that omission.
+inline constexpr double kGordon1988G1 = 0.0949;   // 1/sr
+inline constexpr double kGordon1988G2 = 0.0794;   // 1/sr
+double GordonSubsurfaceRrs(double bb_over_a_plus_bb) noexcept;
+
+// 6.2 LEE ET AL. 2002. Z. P. Lee, K. L. Carder and R. A. Arnone,
+// "Deriving inherent optical properties from water color: a multiband
+// quasi-analytical algorithm for optically deep waters", Applied Optics
+// 41(27), 5755-5772 (2002), equation (8), rearranged:
+//
+//     r_rs = R_rs / (T + gamma Q R_rs)   ->   R_rs = T r_rs / (1 - gamma Q r_rs)
+//     T ~ 0.52        gamma Q ~ 1.7
+//
+// WHAT THE TWO CONSTANTS ARE, because both are routinely misdescribed.
+// T is NOT one transmittance: the paper defines it as t^- t^+ / n^2, an
+// upward RADIANCE transmittance times a downward IRRADIANCE transmittance
+// over n^2 -- which is exactly the three-factor product this engine
+// computes from Fresnel at the interface, and 0.98^2/1.34^2 = 0.535 is the
+// sanity check the paper's own 0.52 is measured against. gamma Q is NOT
+// the internal reflection coefficient alone: gamma is ~0.48 and Q, the
+// upwelling irradiance-to-radiance ratio below the surface, is 3-6. Both
+// numbers are empirical HYDROLIGHT fits for OPTICALLY DEEP water and a
+// NADIR-VIEWING sensor.
+inline constexpr double kLee2002T     = 0.52;
+inline constexpr double kLee2002GamQ  = 1.7;
+double LeeAboveWaterRrs(double subsurface_rrs) noexcept;
+
+// 6.3 CASE 1 WATER FROM CHLOROPHYLL. Morel, A., and S. Maritorena,
+// "Bio-optical properties of oceanic waters: A reappraisal", J. Geophys.
+// Res. 106(C4), 7163-7180 (2001).
+//
+//   a(lambda)   = a_w + a_p + a_y                                  (16)
+//   a_y(440)    = 0.2 [ a_w(440) + a_p(440) ]                      (18)
+//   a_y(lambda) = a_y(440) exp[-0.014 (lambda - 440)]              (17)
+//   b_p(550)    = 0.416 Chl^0.766                                  (12)
+//   b_bp(lambda)= { 0.002 + 0.01 [0.5 - 0.25 log10 Chl]
+//                              (lambda/550)^v } b_p(550)           (13)
+//   v           = 0.5 (log10 Chl - 0.3),  0.02 < Chl < 2           (14)
+//                 0,                      Chl > 2
+//   b_b(lambda) = 0.5 b_w(lambda) + b_bp(lambda)                   (11)
+//
+// THREE THINGS THAT ARE EASY TO GET WRONG HERE, and MM01's own Appendix B
+// exists because the first of them was got wrong in the literature for a
+// decade:
+//
+//  1. THE YELLOW-SUBSTANCE TERM IS THREE EQUATIONS, NOT A BRACKET. The
+//     widely-copied form a = [a_w + 0.06 A_c C^0.65][1 + 0.2 exp(-0.014
+//     (lambda - 440))] is the one MM01 Appendix B calls "mistakenly
+//     expressed through only two equations". a_y is 20% of the water plus
+//     algal absorption AT 440 nm, then propagated spectrally by (17) --
+//     not 20% of the local value at every wavelength. A consequence MM01
+//     states explicitly: this does not reduce to pure water at Chl = 0, a
+//     background remains.
+//  2. THE BACKSCATTER COEFFICIENT IN (13) IS 0.01, NOT 0.02, and the
+//     spectral factor is (lambda/550)^v, not (550/lambda). The 0.02 form
+//     is MM01's own SUPERSEDED equation (10); the paper resets the maximal
+//     backscattering efficiency to 1% in the text. Using the old pair
+//     doubles the particle backscatter.
+//  3. A_chl(lambda) IS NOT TABULATED ANYWHERE ACCESSIBLE. MM01 gives only
+//     A_chl(440) = 1 and inherits the spectrum from Prieur and
+//     Sathyendranath 1981, which is paywalled with no repository copy. So
+//     the algal absorption here is taken from the model that SUPERSEDED
+//     it and IS tabulated -- Bricaud, A., A. Morel, M. Babin, K. Allali
+//     and H. Claustre, "Variations of light absorption by suspended
+//     particles with chlorophyll a concentration in oceanic (case 1)
+//     waters", J. Geophys. Res. 103(C13), 31033-31044 (1998), in the form
+//     a_p(lambda) = A(lambda) Chl^E(lambda), with A and E read from the
+//     dataset the Ocean Optics Web Book redistributes. The two agree to
+//     10% at 440 nm over the Case 1 range (MM01's 0.06 C^0.65 against
+//     Bricaud's 0.0520 C^0.635), which is the cross-check that the
+//     substitution is a substitution and not a different model.
+
+// Bricaud et al. 1998 algal particle absorption, 1/m.
+double BricaudParticleAbsorption(double lambda_nm, double chl_mg_m3) noexcept;
+
+// The IOPs a Case 1 water of this chlorophyll concentration has.
+struct Case1Iops {
+    double a  = 0.0;   // total absorption, 1/m
+    double bp = 0.0;   // particle scattering, 1/m
+    double bbp= 0.0;   // particle BACKscattering, 1/m (MM01 eq. 13)
+    double bw = 0.0;   // pure seawater molecular scattering, 1/m
+    double bb = 0.0;   // total backscattering, 1/m  (MM01 eq. 11)
+};
+Case1Iops Case1FromChlorophyll(double lambda_nm, double chl_mg_m3) noexcept;
+
+// Global mean open-ocean surface chlorophyll, mg/m^3. Antoine, D., J.-M.
+// Andre and A. Morel, "Oceanic primary production: 2. Estimation at global
+// scale from satellite (Coastal Zone Color Scanner) chlorophyll", Global
+// Biogeochem. Cycles 10(1), 57-69 (1996) -- quoted at second hand from
+// Werdell and Bailey, Remote Sens. Environ. 98(1), 122-140 (2005) section
+// 3.2, "the global ocean mean of 0.19 mg m-3 reported in Antoine and
+// co-authors (1996)", because the 1996 paper is closed access. FLAGGED as
+// a secondary citation: whether it is an arithmetic or geometric mean, and
+// whether it is area-weighted, could not be verified at the primary source.
+inline constexpr double kGlobalMeanChlorophyllMgM3 = 0.19;
+
 }  // namespace pt::water
