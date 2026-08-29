@@ -8002,6 +8002,66 @@ void main(uint2 tid : SV_DispatchThreadID) {
 #endif
         // --- end Underwater medium tracking ---------------------------------
 
+#if PT_WATER_ENABLED
+        // --- #305: water-leaving radiance, for a camera OUTSIDE the medium --
+        //
+        // THE HOLE THIS FILLS. Every in-scatter term above is gated on
+        // primary_in_water, so a ray that refracts in from OUTSIDE got
+        // Beer's law and nothing else: absorption with no source. Ocean
+        // colour is not a tint on the transmitted background, it IS the
+        // source term -- light enters, red is gone within metres (Pope &
+        // Fry 1997), blue scatters back out (Morel 1974). With no source
+        // the sea from orbit is whatever the sky reflects off it, which
+        // is why #305 measured the water body contributing NO blue at all.
+        //
+        // WHY THREE FLOATS AND NOT A MARCH. The submerged march below
+        // spends N shadow rays per pixel, which is affordable when the
+        // camera is in the water and the water is a few pixels of the
+        // frame -- and is not affordable when the ocean IS the frame, as
+        // it is from orbit. For a HOMOGENEOUS column the single-scatter
+        // integral the march evaluates numerically has a closed form, so
+        // this path evaluates it exactly instead, in O(1) plus at most one
+        // shadow ray. Derivation and the error bound against the march are
+        // in src/physics/WaterOptics.h section 5; the identity is asserted
+        // to 8 significant figures in tests/pt_water_optics_test.cpp.
+        //
+        //   wl_amp  = the radiance that leaves an INFINITELY deep column,
+        //             already divided by n^2 (the radiance-scaling factor
+        //             for water -> air) but NOT multiplied by the upward
+        //             Fresnel transmittance -- see below for why.
+        //   wl_rate = the per-metre-of-PATH rate at which the depth
+        //             integral saturates, so a finite column of path
+        //             length T contributes wl_amp * (1 - exp(-wl_rate T)).
+        //             This is what makes a swimming pool shallow and the
+        //             open ocean deep with one expression and no regime
+        //             switch.
+        //
+        // WHY THE FRESNEL FACTOR IS ABSENT FROM wl_amp. The MAT_WATER
+        // interface already picks reflect-vs-refract by Russian roulette
+        // on the Fresnel reflectance with NO compensating weight, which is
+        // the unbiased estimator for the (F, 1-F) pair. Adding this term
+        // on the REFRACT branch therefore already carries its (1 - F)
+        // factor as a branch probability; writing (1 - F) into wl_amp as
+        // well would square it. Fresnel is reciprocal, so the F the split
+        // used for the downward crossing is the same F the upwelling
+        // radiance meets on the way out -- one number, used once.
+        //
+        // TOTAL INTERNAL REFLECTION cannot bite here and that is a
+        // property of the geometry, not an omission: the in-water
+        // direction is obtained by refracting a real air-side view ray, so
+        // it is inside Snell's window by construction (asin(1/1.34) =
+        // 48.3 deg) and always has a transmitted lobe. What IS dropped is
+        // the light that TIRs back DOWN off the underside of the surface
+        // and scatters out on a later attempt -- the multiple-internal-
+        // reflection factor 1/(1 - r_bar * R) of the classical treatment.
+        // At the open ocean's irradiance reflectance that factor is under
+        // 1.02; it is bounded in WaterOptics.h rather than waved at.
+        bool   wl_pending = false;
+        bool   wl_primary = false;
+        float3 wl_amp     = float3(0.0);
+        float3 wl_rate    = float3(0.0);
+#endif
+
         // Save primary-ray params for the volumetric march (single
         // scatter along the camera ray, evaluated after the bounce
         // loop). primary_t is the depth at which the camera ray hits
@@ -8187,6 +8247,26 @@ void main(uint2 tid : SV_DispatchThreadID) {
         //
         // Misses (h.hit == false) skip this: in_water + miss is caught
         // by the deep-water tint fallback below.
+        // --- #305: cash the water-leaving term now that the column has a
+        // LENGTH. The source is set at the interface (see the MAT_WATER
+        // refract branch), where the geometry is known but the depth is
+        // not; it is spent here, where the trace has just measured how
+        // much water the ray actually crossed. A bottom hit truncates the
+        // integral at exactly the right place, so shallow water over sand
+        // and open ocean are the same expression -- there is no deep-water
+        // branch to disagree with a shallow one at the transition.
+        //
+        // BEFORE the segment Beer's law, deliberately: wl_amp already
+        // carries the eye-transmittance exp(-sigma_t t) inside its own
+        // depth integral, so the throughput this multiplies is the one at
+        // the interface, not the one at the far end of the column.
+        if (wl_pending && ptMediumIsWater(medium)) {
+            float3 sat = h.hit ? (float3(1.0) - exp(-wl_rate * max(h.t, 0.0)))
+                               : float3(1.0);
+            float3 wl_c = throughput * wl_amp * sat;
+            radiance += wl_primary ? wl_c : clampIndirect(wl_c);
+            wl_pending = false;
+        }
         if (ptMediumIsWater(medium) && h.hit) {
             float3 absorb = water_params0.xyz;
             throughput *= exp(-absorb * h.t);
@@ -9113,6 +9193,14 @@ void main(uint2 tid : SV_DispatchThreadID) {
             // this to every specular surface is a real improvement and a
             // different change.
             bool did_ocean_sun_nee = false;
+            // #305: the sun's visibility from this very point, cached. The
+            // water-leaving term below needs exactly the occlusion this
+            // block is about to measure, and a second shadow ray toward a
+            // direction 0.53 deg away would buy nothing at the price of
+            // doubling the ray count on a frame that is mostly ocean.
+            // Negative = not measured (the NEE block did not run), which
+            // is the signal to fire one.
+            float3 ocean_sun_trans = float3(-1.0);
             if (planet_ocean.x > 0.0 && !ptMediumIsWater(medium) &&
                 uint(sun_and_mode.w) >= 2u) {
                 float3 sun_dir  = sun_and_mode.xyz;
@@ -9145,6 +9233,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                         float3 trans = transmittance(
                             ptRayOrigin(hit_pt, nf_s, cone_hit, l), l, 1e30,
                             shutter_t01, cone_hit, medium);
+                        ocean_sun_trans = trans;   // #305 reuses this
                         if (any(trans > float3(0.0))) {
                             float3 sun_rad =
                                 sunIrradianceAt(hit_pt, sun_dir, sun_elev);
@@ -9292,10 +9381,120 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 // previous nominal 1.5m entry estimate (and the b == 0
                 // exit-side hack from b2690ac) are subsumed by the new
                 // generic per-bounce attenuation.
+                // #305 needs the stack AS IT WAS on the far side of this
+                // interface: its sun shadow ray starts just OUTSIDE the
+                // water and must not pick up the water absorption the
+                // updated stack would apply along its whole length.
+                uint medium_before_cross = medium;
                 medium = (ndi_s < 0.0) ? ptMediumEnter(medium, MEDIUM_WATER)
                                        : ptMediumPop(medium);
                 rd = normalize(refracted);
                 ro = ptRayOrigin(hit_pt, -nf_s, cone_hit, rd);
+                // --- #305: arm the water-leaving source -------------------
+                //
+                // We have just crossed INTO water from outside, which is
+                // the case every in-scatter term in this shader skipped.
+                // Everything the closed form needs is known here except
+                // the column's length, so compute the amplitude and the
+                // saturation rate now and spend them at the top of the
+                // next iteration, where the trace supplies the length.
+                //
+                // THE CLOSED FORM. For a homogeneous column lit by a
+                // collimated beam, the single-scattered radiance reaching
+                // the interface from path length T, travelling back along
+                // -rd, is
+                //
+                //   L = E_d(0-) beta(psi) [1 - exp(-k T)]
+                //                       / (sigma_t (mu_s + mu_v))
+                //   k = sigma_t (mu_s + mu_v) / mu_s
+                //
+                // with mu_s / mu_v the cosines of the REFRACTED sun and
+                // view directions against the local vertical, beta the
+                // volume scattering function at the in-water scattering
+                // angle, and sigma_t = a + b the beam attenuation. It is
+                // the integral the submerged march evaluates numerically,
+                // done exactly; WaterOptics.h derives it and the test
+                // pins the two against each other.
+                //
+                // WHY mu_a / mu_s ON THE IRRADIANCE. Refraction bends the
+                // beam toward the vertical, so the same power crosses a
+                // LARGER in-water cross-section: E_perp,w = E_perp,a
+                // (1 - F) mu_a / mu_s. Equivalently the downwelling
+                // irradiance on the horizontal obeys the textbook
+                // E_d(0-) = E_d(0+) (1 - F), which is what this reduces
+                // to. The n^2 of the radiance transform and the 1/n^2 of
+                // the solid-angle compression do NOT simply cancel -- the
+                // Jacobian is mu_a / (n^2 mu_s), not 1 / n^2 -- and the
+                // submerged march below carried the cancelled version.
+                // Both now use one factor, spelled out once each.
+                if (ndi_s < 0.0 && water_scatter2.z > 0.0 &&
+                    uint(sun_and_mode.w) >= 2u) {
+                    float3 up_w    = localUp(hit_pt);
+                    float3 sun_dir = sun_and_mode.xyz;
+                    float  mu_a    = dot(up_w, sun_dir);
+                    float  mu_v    = -dot(up_w, rd);   // rd points DOWN
+                    if (mu_a > 0.0 && mu_v > 0.0) {
+                        float3 into = refract(-sun_dir, up_w,
+                                              1.0 / water_ior);
+                        if (dot(into, into) > 1e-6) {
+                            into = normalize(into);
+                            float mu_s = -dot(up_w, into);
+                            // The sun's own crossing of the interface,
+                            // taken on the MACRO vertical because the
+                            // stratification is in depth, not in wave
+                            // slope. Same Schlick F0 as the split above.
+                            float fr_sun = fresnelSchlick(mu_a, F0_water);
+                            float3 sun_t = ocean_sun_trans;
+                            if (sun_t.r < 0.0) {
+                                sun_t = transmittance(
+                                    ptRayOrigin(hit_pt, nf_s, cone_hit,
+                                                sun_dir),
+                                    sun_dir, 1e30, shutter_t01, cone_hit,
+                                    medium_before_cross);
+                            }
+                            if (mu_s > 0.0 && any(sun_t > float3(0.0))) {
+                                // E_d just below the surface, W/m^2.
+                                float3 e_d = sunIrradianceAt(hit_pt, sun_dir,
+                                                             mu_a)
+                                           * sun_t * mu_a * (1.0 - fr_sun);
+                                // The in-water scattering angle, in the
+                                // same orientation the submerged march
+                                // uses: cos psi = dot(view_prop, to_sun).
+                                float  mu_sc = dot(rd, -into);
+                                float3 s_mol = max(water_scatter.xyz,
+                                                   float3(0.0));
+                                float  s_par = max(water_scatter.w, 0.0);
+                                float3 sig_t = max(water_params0.xyz,
+                                                   float3(0.0))
+                                             + s_mol + float3(s_par);
+                                float  g_p   = clamp(water_scatter2.x,
+                                                     -0.99, 0.99);
+                                float  dpol  = clamp(water_scatter2.w,
+                                                     0.0, 1.0);
+                                float3 beta  =
+                                      s_mol * ptPhaseRayleighDepol(mu_sc,
+                                                                   dpol)
+                                    + float3(s_par)
+                                        * ptPhaseHenyeyGreenstein(mu_sc, g_p);
+                                float  msmv  = mu_s + mu_v;
+                                float3 den   = sig_t * msmv;
+                                if (all(den > float3(0.0))) {
+                                    // n^2: radiance leaving water for air
+                                    // scales by 1/n^2. The (1 - F) of the
+                                    // upward crossing is NOT here -- the
+                                    // Fresnel roulette that put us on this
+                                    // branch already is it.
+                                    float n2 = water_ior * water_ior;
+                                    wl_amp   = e_d * beta / (den * n2);
+                                    wl_rate  = den / mu_s;
+                                    wl_pending = any(wl_amp > float3(0.0));
+                                    wl_primary = (b == 0u);
+                                }
+                            }
+                        }
+                    }
+                }
+                // --- end #305 ---------------------------------------------
                 // Transmitted lobe: PERSIST skip_sky_on_miss /
                 // prev_was_lambert_nee across the interface. Water is on
                 // transmittance()'s transmissive-blocker list, so a
@@ -10488,8 +10687,32 @@ void main(uint2 tid : SV_DispatchThreadID) {
                                     // the same dimensional argument the air
                                     // march and the surface NEE make. See
                                     // src/renderer/Atmosphere.h section 1.
+                                    // #305 CORRECTS THE REFRACTION
+                                    // JACOBIAN. The comment above claimed
+                                    // "the n^2 cancels exactly" from
+                                    // L_w = L_a (1-F) n^2 against
+                                    // Omega_w = Omega_a / n^2. The second
+                                    // half is wrong: differentiating
+                                    // Snell gives
+                                    // Omega_w / Omega_a = mu_a / (n^2 mu_s),
+                                    // not 1 / n^2, so the beam irradiance
+                                    // in water is
+                                    //   E_perp,w = E_perp,a (1-F) mu_a/mu_s
+                                    // and the missing factor is mu_a/mu_s.
+                                    // It is a pure dimming, 1 at the zenith
+                                    // and 0.66 at a grazing sun, and it is
+                                    // exactly what makes the horizontal
+                                    // downwelling irradiance obey the
+                                    // textbook E_d(0-) = E_d(0+) (1 - F).
+                                    // Same factor, same spelling, in the
+                                    // #305 water-leaving source at the
+                                    // MAT_WATER interface -- which is what
+                                    // lets a camera just above and just
+                                    // below the surface agree.
+                                    float  mu_s_w = dot(up_w, sun_w);
                                     float3 sun_rad_w =
-                                        sunIrradianceAt(sp, sun_dir_w, sun_elev);
+                                        sunIrradianceAt(sp, sun_dir_w, sun_elev)
+                                        * (sun_elev / max(mu_s_w, 1e-4));
                                     v_color_w += sun_rad_w * trans_w
                                                * in_scatter_w * dt_w
                                                * trans_eye_w;
