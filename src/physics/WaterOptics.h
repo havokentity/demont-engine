@@ -193,4 +193,178 @@ glm::dvec3 AttenuationLengths(const glm::dvec3& extinction) noexcept;
 // the water column is optically black. ln(255) / min(extinction).
 double OpticalBlackDepth(const glm::dvec3& extinction) noexcept;
 
+// --- 5. WATER-LEAVING RADIANCE (#305) -------------------------------------
+//
+// Everything above describes what a column of water DOES to light. None of
+// it describes what a camera OUTSIDE the water sees, and that omission is
+// what #305 measured: with every in-scatter term in the megakernel gated on
+// the camera being submerged, a ray refracting in from outside got Beer's
+// law and no source, so the water body contributed no colour at all and
+// every bit of blue in the rendered ocean was atmospheric Rayleigh.
+//
+// Ocean colour IS a source term. It is the upwelling radiance that leaves
+// the surface after light has entered, been absorbed, and been scattered
+// back out -- "water-leaving radiance" L_w, and normalised by the
+// downwelling irradiance it is the remote-sensing reflectance R_rs, the
+// quantity every ocean-colour satellite retrieves and the quantity this
+// engine can therefore be checked against instead of eyeballed.
+//
+//
+// 5.1 THE TRANSPORT, DERIVED
+//
+// Take a horizontally homogeneous, semi-infinite column with absorption a,
+// scattering b, beam attenuation c = a + b, and volume scattering function
+// beta(psi) [1/m/sr]. Light enters as a collimated beam refracted to nadir
+// cosine mu_s; the camera looks along an in-water direction of nadir cosine
+// mu_v. Writing the beam's irradiance on a plane PERPENDICULAR to itself as
+// E_perp(z) = E_perp(0) exp(-c z / mu_s), the source function toward the
+// viewer is beta(psi) E_perp(z), and integrating it up the viewing path
+// (path length t, depth z = t mu_v, eye transmittance exp(-c t)) gives
+//
+//     L_u(0-) = E_perp(0) beta(psi) INT_0^T exp(-c t (1 + mu_v/mu_s)) dt
+//             = E_d(0-) beta(psi) [1 - exp(-k T)] / (c (mu_s + mu_v))
+//     k       = c (mu_s + mu_v) / mu_s                                  (1)
+//
+// with E_d(0-) = E_perp(0) mu_s the downwelling irradiance just below the
+// surface. T -> infinity is the optically deep limit; finite T is a bottom,
+// and it is the SAME expression, which is why the engine has no shallow /
+// deep regime switch and therefore no transition for the two to disagree
+// at. Equation (1) is exactly the integral the submerged in-scatter march
+// in PathTrace.slang evaluates numerically, so the two agree by
+// construction and the ladder in tests/pt_water_optics_test.cpp measures
+// how fast.
+//
+//
+// 5.2 THE TWO INTERFACE FACTORS THAT ARE EASY TO GET WRONG
+//
+// DOWNWARD. Radiance across an interface obeys L_w = L_a (1 - F) n^2, and
+// the solid angle compresses. But the compression is NOT 1/n^2:
+// differentiating Snell's law n_a sin th_a = n_w sin th_w gives
+//
+//     dOmega_w / dOmega_a = mu_a / (n^2 mu_w)                           (2)
+//
+// so the beam irradiance in water is E_perp,w = E_perp,a (1 - F) mu_a/mu_s
+// -- there is a surviving mu_a/mu_s that the naive "the n^2 cancels"
+// argument drops. Equivalently, and as the textbook states it, the
+// horizontal downwelling irradiance obeys E_d(0-) = E_d(0+) (1 - F): the
+// beam bends toward the vertical, so the same power crosses a larger
+// in-water cross-section but lands on the same horizontal area. The
+// engine's submerged march carried the cancelled version until #305; the
+// factor is 1 at the zenith and 0.66 at a grazing sun.
+//
+// UPWARD. Radiance leaving water for air scales by 1/n^2, and beyond the
+// critical angle asin(1/n) = 48.3 deg it does not leave at all. TIR cannot
+// bite a camera in air -- the in-water direction is obtained by refracting
+// a real air-side ray, so it is inside Snell's window by construction --
+// but the light that DOES total-internally-reflect and eventually escapes
+// on a later attempt is dropped by this single-scattering treatment. That
+// is the classical multiple-internal-reflection factor 1/(1 - r_bar R),
+// with r_bar ~ 0.48 the internal Fresnel reflectance of the upwelling
+// field; see MultipleInternalReflectionGain() below, which bounds it.
+//
+//
+// 5.3 WHAT IS APPROXIMATED, AND BY HOW MUCH
+//
+//   * SINGLE SCATTERING ONLY. Photons scattered twice are not counted.
+//     The error scales with the single-scattering albedo b/c, which for
+//     pure seawater in the blue is 0.33 and in the red 0.004. The check
+//     against the published Gordon et al. 1988 semi-analytic model (which
+//     is a fit to full Monte-Carlo radiative transfer) is what bounds
+//     this, and it is asserted, not asserted-about.
+//   * DIRECT SUN ONLY. Sky radiance entering the water and scattering back
+//     out is not part of this term. Measured against the diffuse fraction
+//     of E_d, this is the dominant remaining gap at low sun.
+//   * HORIZONTALLY HOMOGENEOUS. No chlorophyll gradient with depth, no
+//     deep chlorophyll maximum.
+//   * A FLAT INTERFACE FOR THE STRATIFICATION. mu_s and mu_v are taken
+//     against the local vertical, not the wave normal, because the medium
+//     is stratified in depth. The refraction itself uses the wave normal.
+
+// The refraction geometry a single-scatter evaluation needs, all cosines
+// against the local vertical, all angles in radians.
+struct SingleScatterGeometry {
+    double mu_sun_air   = 1.0;  // cos of the solar zenith angle, in air
+    double mu_sun_water = 1.0;  // ...of the refracted beam, in water
+    double mu_view_air  = 1.0;  // cos of the view nadir angle, in air
+    double mu_view_water= 1.0;  // ...of the refracted view ray, in water
+    double cos_scatter  = -1.0; // cos of the in-water scattering angle
+};
+
+// Refract a (sun, view) pair through a flat interface of index `n`.
+// `delta_azimuth_rad` is the azimuth between the solar and viewing planes;
+// 0 puts the viewer looking toward the sun's azimuth (forward scatter),
+// pi puts the sun behind the viewer, which is the geometry ocean-colour
+// radiometry is quoted at.
+SingleScatterGeometry RefractSunAndView(double sun_zenith_rad,
+                                        double view_zenith_rad,
+                                        double delta_azimuth_rad,
+                                        double n) noexcept;
+
+// beta(psi), 1/m/sr: the volume scattering function of the two-species
+// medium the shader carries -- molecular (Rayleigh with depolarisation,
+// per channel) plus particulate (Henyey-Greenstein at the Petzold
+// asymmetry, grey).
+glm::dvec3 VolumeScatteringFunction(const glm::dvec3& b_molecular,
+                                    double b_particulate,
+                                    double cos_scatter,
+                                    double depolarisation,
+                                    double petzold_g) noexcept;
+
+// Equation (1)'s bracket-free amplitude, divided by E_d(0-): the
+// subsurface remote-sensing reflectance r_rs = L_u(0-) / E_d(0-), 1/sr,
+// for an optically DEEP column.
+glm::dvec3 SubsurfaceRrsDeep(const glm::dvec3& absorption,
+                             const glm::dvec3& b_molecular,
+                             double b_particulate,
+                             const SingleScatterGeometry& g,
+                             double depolarisation,
+                             double petzold_g) noexcept;
+
+// Equation (1)'s saturation rate k, 1/m of PATH (not of depth). A column
+// whose viewing path is T metres long returns
+// SubsurfaceRrsDeep * (1 - exp(-k T)).
+glm::dvec3 SubsurfaceRrsSaturationRate(const glm::dvec3& absorption,
+                                       const glm::dvec3& b_molecular,
+                                       double b_particulate,
+                                       const SingleScatterGeometry& g) noexcept;
+
+// The same integral done the slow way: N stratified steps of the submerged
+// march's integrand along a viewing path of `path_length_m`. This is the
+// reference the closed form is bounded against, and it is the SHAPE of
+// the loop PathTrace.slang runs for a submerged camera.
+glm::dvec3 SubsurfaceRrsMarched(const glm::dvec3& absorption,
+                                const glm::dvec3& b_molecular,
+                                double b_particulate,
+                                const SingleScatterGeometry& g,
+                                double depolarisation,
+                                double petzold_g,
+                                double path_length_m,
+                                int    samples) noexcept;
+
+// Above-water remote-sensing reflectance R_rs = L_w(0+) / E_d(0+), 1/sr.
+// Applies the downward interface loss (1 - F(th_a)), the upward one
+// (1 - F(th_w)) and the 1/n^2 radiance scaling -- the three factors the
+// shader spells out at the MAT_WATER interface.
+glm::dvec3 RemoteSensingReflectance(const glm::dvec3& absorption,
+                                    const glm::dvec3& b_molecular,
+                                    double b_particulate,
+                                    const SingleScatterGeometry& g,
+                                    double depolarisation,
+                                    double petzold_g,
+                                    double n) noexcept;
+
+// Unpolarised Fresnel reflectance at a dielectric interface, exact
+// (Fresnel's equations, not Schlick). cos_i is measured in the medium of
+// index n_i.
+double FresnelUnpolarised(double cos_i, double n_i, double n_t) noexcept;
+
+// The gain the neglected multiple internal reflections would add:
+// 1 / (1 - r_bar * R), with R the irradiance reflectance just below the
+// surface and r_bar the mean internal Fresnel reflectance of the upwelling
+// field. Austin (1974) / Morel & Prieur (1977) quote r_bar = 0.48 for a
+// flat surface; this is the term's SIZE, computed so the omission is
+// bounded rather than hand-waved.
+inline constexpr double kInternalReflectanceRBar = 0.48;
+double MultipleInternalReflectionGain(double irradiance_reflectance) noexcept;
+
 }  // namespace pt::water

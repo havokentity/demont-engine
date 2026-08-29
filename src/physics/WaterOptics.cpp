@@ -132,4 +132,157 @@ double OpticalBlackDepth(const glm::dvec3& extinction) noexcept {
     return std::log(255.0) / lo;
 }
 
+// --- 5. Water-leaving radiance (#305) -------------------------------------
+
+namespace {
+constexpr double kPi = 3.14159265358979323846;
+
+// Henyey-Greenstein, normalised to 1 over the sphere. The exact mirror of
+// ptPhaseHenyeyGreenstein in shaders/PathTraceMath.slang.
+double HenyeyGreenstein(double cos_theta, double g) noexcept {
+    const double g2 = g * g;
+    const double d  = std::max(1.0 + g2 - 2.0 * g * cos_theta, 1e-4);
+    return (1.0 - g2) / (4.0 * kPi * std::pow(d, 1.5));
+}
+}  // namespace
+
+SingleScatterGeometry RefractSunAndView(double sun_zenith_rad,
+                                        double view_zenith_rad,
+                                        double delta_azimuth_rad,
+                                        double n) noexcept {
+    SingleScatterGeometry g;
+    const double sin_s_a = std::sin(sun_zenith_rad);
+    const double sin_v_a = std::sin(view_zenith_rad);
+    g.mu_sun_air  = std::cos(sun_zenith_rad);
+    g.mu_view_air = std::cos(view_zenith_rad);
+    // Snell. Entering the denser medium never total-internal-reflects, so
+    // both roots exist for every real air-side angle.
+    const double sin_s_w = std::clamp(sin_s_a / n, -1.0, 1.0);
+    const double sin_v_w = std::clamp(sin_v_a / n, -1.0, 1.0);
+    g.mu_sun_water  = std::sqrt(std::max(0.0, 1.0 - sin_s_w * sin_s_w));
+    g.mu_view_water = std::sqrt(std::max(0.0, 1.0 - sin_v_w * sin_v_w));
+    // The scattering angle between the DOWNWARD beam's propagation
+    // direction and the UPWARD direction the scattered light leaves in.
+    // Put the sun's azimuth at 0 and the viewer's at delta_azimuth:
+    //   beam propagation  d_s = ( sin_s_w, 0, -mu_sun_water )
+    //   scattered leaving d_v = ( sin_v_w cos dphi, sin_v_w sin dphi,
+    //                             +mu_view_water )
+    // cos psi = dot(d_s, d_v).
+    g.cos_scatter = sin_s_w * sin_v_w * std::cos(delta_azimuth_rad)
+                  - g.mu_sun_water * g.mu_view_water;
+    return g;
+}
+
+glm::dvec3 VolumeScatteringFunction(const glm::dvec3& b_molecular,
+                                    double b_particulate,
+                                    double cos_scatter,
+                                    double depolarisation,
+                                    double petzold_g) noexcept {
+    const double p_mol = RayleighDepolarisedPhase(cos_scatter, depolarisation);
+    const double p_par = HenyeyGreenstein(cos_scatter, petzold_g);
+    return b_molecular * p_mol + glm::dvec3(std::max(b_particulate, 0.0) * p_par);
+}
+
+namespace {
+glm::dvec3 Extinction(const glm::dvec3& absorption,
+                      const glm::dvec3& b_molecular,
+                      double b_particulate) noexcept {
+    return glm::max(absorption, glm::dvec3(0.0))
+         + glm::max(b_molecular, glm::dvec3(0.0))
+         + glm::dvec3(std::max(b_particulate, 0.0));
+}
+}  // namespace
+
+glm::dvec3 SubsurfaceRrsDeep(const glm::dvec3& absorption,
+                             const glm::dvec3& b_molecular,
+                             double b_particulate,
+                             const SingleScatterGeometry& g,
+                             double depolarisation,
+                             double petzold_g) noexcept {
+    const glm::dvec3 beta = VolumeScatteringFunction(
+        b_molecular, b_particulate, g.cos_scatter, depolarisation, petzold_g);
+    const glm::dvec3 c = Extinction(absorption, b_molecular, b_particulate);
+    const double     m = g.mu_sun_water + g.mu_view_water;
+    if (!(m > 0.0)) return glm::dvec3(0.0);
+    return {c.x > 0.0 ? beta.x / (c.x * m) : 0.0,
+            c.y > 0.0 ? beta.y / (c.y * m) : 0.0,
+            c.z > 0.0 ? beta.z / (c.z * m) : 0.0};
+}
+
+glm::dvec3 SubsurfaceRrsSaturationRate(const glm::dvec3& absorption,
+                                       const glm::dvec3& b_molecular,
+                                       double b_particulate,
+                                       const SingleScatterGeometry& g) noexcept {
+    const glm::dvec3 c = Extinction(absorption, b_molecular, b_particulate);
+    const double     m = g.mu_sun_water + g.mu_view_water;
+    if (!(g.mu_sun_water > 0.0)) return glm::dvec3(0.0);
+    return c * (m / g.mu_sun_water);
+}
+
+glm::dvec3 SubsurfaceRrsMarched(const glm::dvec3& absorption,
+                                const glm::dvec3& b_molecular,
+                                double b_particulate,
+                                const SingleScatterGeometry& g,
+                                double depolarisation,
+                                double petzold_g,
+                                double path_length_m,
+                                int    samples) noexcept {
+    // The submerged march's loop, verbatim in shape: stratified midpoint
+    // samples over [0, T), the eye transmittance evaluated exactly AT the
+    // sample (not at the cell start -- see the note in PathTrace.slang on
+    // why that is second order rather than first), and the beam's own
+    // attenuation from the surface down to the sample's DEPTH.
+    if (samples < 1 || !(path_length_m > 0.0)) return glm::dvec3(0.0);
+    if (!(g.mu_sun_water > 0.0)) return glm::dvec3(0.0);
+    const glm::dvec3 beta = VolumeScatteringFunction(
+        b_molecular, b_particulate, g.cos_scatter, depolarisation, petzold_g);
+    const glm::dvec3 c  = Extinction(absorption, b_molecular, b_particulate);
+    const double     dt = path_length_m / static_cast<double>(samples);
+    glm::dvec3 sum(0.0);
+    for (int i = 0; i < samples; ++i) {
+        const double t = (static_cast<double>(i) + 0.5) * dt;
+        const double z = t * g.mu_view_water;          // depth of the sample
+        // E_perp(z) / E_d(0-) = exp(-c z / mu_s) / mu_s.
+        const glm::dvec3 beam = glm::exp(-c * (z / g.mu_sun_water))
+                              / g.mu_sun_water;
+        const glm::dvec3 eye  = glm::exp(-c * t);
+        sum += beta * beam * eye * dt;
+    }
+    return sum;
+}
+
+double FresnelUnpolarised(double cos_i, double n_i, double n_t) noexcept {
+    const double ci = std::clamp(cos_i, 0.0, 1.0);
+    const double si = std::sqrt(std::max(0.0, 1.0 - ci * ci));
+    const double st = n_i * si / n_t;
+    if (st >= 1.0) return 1.0;                       // total internal reflection
+    const double ct = std::sqrt(std::max(0.0, 1.0 - st * st));
+    const double rs = (n_i * ci - n_t * ct) / (n_i * ci + n_t * ct);
+    const double rp = (n_i * ct - n_t * ci) / (n_i * ct + n_t * ci);
+    return 0.5 * (rs * rs + rp * rp);
+}
+
+glm::dvec3 RemoteSensingReflectance(const glm::dvec3& absorption,
+                                    const glm::dvec3& b_molecular,
+                                    double b_particulate,
+                                    const SingleScatterGeometry& g,
+                                    double depolarisation,
+                                    double petzold_g,
+                                    double n) noexcept {
+    const glm::dvec3 r_rs = SubsurfaceRrsDeep(
+        absorption, b_molecular, b_particulate, g, depolarisation, petzold_g);
+    // Downward: E_d(0-) = E_d(0+) (1 - F(th_a)). Upward: the radiance
+    // scaling 1/n^2 and the transmittance (1 - F(th_w)) of the SAME
+    // interface, which by reciprocity is F evaluated at either conjugate.
+    const double t_down = 1.0 - FresnelUnpolarised(g.mu_sun_air, 1.0, n);
+    const double t_up   = 1.0 - FresnelUnpolarised(g.mu_view_water, n, 1.0);
+    return r_rs * (t_down * t_up / (n * n));
+}
+
+double MultipleInternalReflectionGain(double irradiance_reflectance) noexcept {
+    const double d = 1.0 - kInternalReflectanceRBar *
+                               std::clamp(irradiance_reflectance, 0.0, 0.99);
+    return d > 0.0 ? 1.0 / d : 0.0;
+}
+
 }  // namespace pt::water
