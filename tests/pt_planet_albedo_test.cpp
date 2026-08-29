@@ -686,13 +686,26 @@ TEST_CASE("the shader mirrors the CPU sampler, and says so once each") {
     // header. If someone edits one side only, this fails.
     CHECK(CountOccurrences(src, "(15.0 - 28.0 * p2) + (2.0 + 18.0 * s2)") == 1);
 
-    // The threshold-hillslope band, and the ABSENCE of the ramp it
-    // replaced. Pinning the removal matters as much as pinning the
-    // addition: a stale second copy is exactly the #276 failure.
-    CHECK(CountOccurrences(src, "smoothstep(0.1340, 0.2929, slope01)") == 1);
+    // The threshold-hillslope ramp is NO LONGER IN THE SHADER (#307), and
+    // its absence is pinned for the same reason its presence was: a stale
+    // second copy is exactly the #276 failure. The ramp now runs on the
+    // host, on a slope measured at a fixed physical baseline, because the
+    // mesh normal the shader used to derive slope from has a baseline that
+    // is a function of the LOD -- so the same ground read a different angle
+    // at every level. See SlopeRockFraction in SurfaceAlbedo.cpp and
+    // kRefSlopeLevel in TerrainChunk.h.
+    CHECK_MESSAGE(CountOccurrences(src, "smoothstep(0.1340, 0.2929, slope01)") == 0,
+                  "the rock ramp is back in the shader, evaluated on a "
+                  "LOD-dependent slope -- that is #307");
+    CHECK_MESSAGE(CountOccurrences(src, "ptSlopeRockFraction") == 0,
+                  "a shader-side rock ramp survives");
     CHECK_MESSAGE(CountOccurrences(src, "(slope01 - 0.5) * 2.5") == 0,
                   "the 60-degree rock ramp that made the Himalayas white is "
                   "still in the shader");
+    // What replaced it: the baked channel, consumed once and interpolated
+    // as a material fraction.
+    CHECK(CountOccurrences(src, "v.rock01   = terrain_verts[b + 4u];") == 1);
+    CHECK(CountOccurrences(src, "float3 terrainSurfaceAlbedo(float height_m, float rock01,") == 1);
 
     // The old entry point must be GONE, not merely shadowed.
     CHECK(CountOccurrences(src, "terrainBiomeAlbedo") == 0);

@@ -3,6 +3,8 @@
 
 #include "TerrainChunk.h"
 
+#include "SurfaceAlbedo.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -25,6 +27,39 @@ inline int FineIdx(int fx, int fy) { return fy * kFineDim + fx; }
 
 // Chunk vertex (x, y) lives at fine grid (2x + halo, 2y + halo).
 inline int FineOfChunk(int x) { return 2 * x + kFineHalo; }
+
+// The reference-lattice grid: a level-kRefSlopeLevel chunk with the same
+// two-vertex halo. TWO IS THE MAXIMUM the interpolatory recursion can
+// deliver exactly: GenerateChunkHeights pads coarser levels by one cell,
+// and the parent-in-range condition lo(l)/2 >= lo(l-1) reduces to
+// halo <= 2. It is also exactly what is needed here -- the difference
+// samples sit kRefSlopeHalfLagM / ChunkVertexSpacing(kRefSlopeLevel) =
+// 1.179 cells outside the chunk at worst.
+constexpr int kRefHalo = 2;
+constexpr int kRefDim  = kChunkQuads + 1 + 2 * kRefHalo;   // 69
+
+// The one calibration in the coarse (area-mean) branch, and it is a
+// MEASURED ratio rather than a derived one.
+//
+// The continuation is built so that the RMS displacement added at level l
+// is exactly relief * S(spacing(l)) -- amp_scale folds in the sqrt(3) that
+// turns U(-1,1) into unit RMS. What that does NOT give in closed form is
+// the RMS of a finite DIFFERENCE over a baseline L, because every level
+// contributes: levels far coarser than L through their gradient, levels
+// near L at nearly full amplitude, and levels far finer than L at their
+// own (small) amplitude. The sum has no tidy form.
+//
+// So it is measured. kRefSlopeRmsGain is
+//
+//     RMS(per-axis reference slope from the POINTWISE branch)
+//     -------------------------------------------------------
+//              relief * S(2 * kRefSlopeHalfLagM) / (2 * kRefSlopeHalfLagM)
+//
+// evaluated over the pointwise branch itself, so the coarse branch is
+// calibrated against the fine one rather than against a hope.
+// tests/pt_planet_terrain_test.cpp re-measures it and fails if it drifts,
+// which is what stops this from being a number nobody can re-derive.
+constexpr double kRefSlopeRmsGain = 1.4689;
 
 }  // namespace
 
@@ -49,6 +84,103 @@ PlanetSite PlanetSite::FromGeodetic(double lat_rad, double lon_rad) noexcept {
     // dot(south, v)) -- world (X = East, Y = Up, Z = South).
     s.ecef_to_world = glm::transpose(glm::dmat3(east, up, south));
     return s;
+}
+
+void ReferenceSlope01(const ChunkKey& key,
+                      const ElevationField& field,
+                      const PlanetSite& site,
+                      std::vector<double>& out) {
+    out.assign(static_cast<std::size_t>(kChunkVertexCount), 0.0);
+    const int drop = static_cast<int>(key.level) - kRefSlopeLevel;
+    if (drop < 0) return;
+
+    // The reference lattice is the chunk's ancestor at kRefSlopeLevel, so
+    // every descendant of that ancestor reads the SAME grid -- which is
+    // where the bit-exact level consistency comes from.
+    const ChunkKey anc{key.face, static_cast<std::uint8_t>(kRefSlopeLevel),
+                       key.i >> drop, key.j >> drop};
+    std::vector<double> rg;
+    field.GenerateChunkHeights(anc, kRefSlopeLevel, kRefHalo, rg);
+
+    const std::int64_t Gr =
+        static_cast<std::int64_t>(kChunkQuads) << kRefSlopeLevel;
+    const double rbase_x = static_cast<double>(
+        static_cast<std::int64_t>(anc.i) * kChunkQuads - kRefHalo);
+    const double rbase_y = static_cast<double>(
+        static_cast<std::int64_t>(anc.j) * kChunkQuads - kRefHalo);
+
+    // Bilinear height at a fractional coordinate in the reference grid.
+    auto ref_h = [&](double fx, double fy) -> double {
+        const int x0 = std::clamp(static_cast<int>(std::floor(fx)), 0, kRefDim - 2);
+        const int y0 = std::clamp(static_cast<int>(std::floor(fy)), 0, kRefDim - 2);
+        const double ax = fx - static_cast<double>(x0);
+        const double ay = fy - static_cast<double>(y0);
+        auto at = [&](int x, int y) {
+            return rg[static_cast<std::size_t>(y) * kRefDim + x];
+        };
+        return (at(x0, y0)     * (1.0 - ax) + at(x0 + 1, y0)     * ax) * (1.0 - ay)
+             + (at(x0, y0 + 1) * (1.0 - ax) + at(x0 + 1, y0 + 1) * ax) * ay;
+    };
+    // World position at a fractional reference-grid coordinate. The same
+    // construction as fine_world in BuildTerrainChunk, one lattice coarser,
+    // so the reference slope is a TRUE 3D slope and not a height difference
+    // over a nominal spacing -- the cubed sphere's metric is not uniform and
+    // the two differ by up to 8% here.
+    auto ref_world = [&](double fx, double fy) -> glm::dvec3 {
+        const double s = -1.0 + 2.0 * ((rbase_x + fx) / static_cast<double>(Gr));
+        const double t = -1.0 + 2.0 * ((rbase_y + fy) / static_cast<double>(Gr));
+        const glm::dvec3 dir  = FaceParamToDirection(key.face, s, t);
+        const glm::dvec3 surf = EllipsoidSurface(dir);
+        const glm::dvec3 nn   = GeodeticNormal(surf);
+        return site.EcefToWorld(surf + ref_h(fx, fy) * nn);
+    };
+
+    // The published operator: one 3-arcsecond cell either side.
+    const double d_cells = kRefSlopeHalfLagM / ChunkVertexSpacing(kRefSlopeLevel);
+    // Reference-lattice coordinates per level-key.level cell. A negative
+    // power of two, so every product below is EXACT and two chunk levels
+    // over the same ground land on the same fractional coordinate.
+    const double per_cell = 1.0 / static_cast<double>(std::int64_t{1} << drop);
+
+    for (int y = 0; y <= kChunkQuads; ++y) {
+        for (int x = 0; x <= kChunkQuads; ++x) {
+            const double gx = static_cast<double>(
+                static_cast<std::int64_t>(key.i) * kChunkQuads + x) * per_cell;
+            const double gy = static_cast<double>(
+                static_cast<std::int64_t>(key.j) * kChunkQuads + y) * per_cell;
+            const double fx = gx - rbase_x;
+            const double fy = gy - rbase_y;
+            const glm::dvec3 dxr = ref_world(fx + d_cells, fy)
+                                 - ref_world(fx - d_cells, fy);
+            const glm::dvec3 dyr = ref_world(fx, fy + d_cells)
+                                 - ref_world(fx, fy - d_cells);
+            glm::dvec3 nr = glm::cross(dxr, dyr);
+            const double nl = glm::length(nr);
+            if (!(nl > 0.0)) continue;
+            nr /= nl;
+            const glm::dvec3 up = site.WorldUp(ref_world(fx, fy));
+            // Outward, by the same guard BuildTerrainChunk uses on the mesh
+            // normal: the face bases are right-handed so cross(du, dv)
+            // already points away from the centre, and the dot makes the
+            // assumption checkable instead of assumed.
+            if (glm::dot(nr, up) < 0.0) nr = -nr;
+            out[static_cast<std::size_t>(y) * kChunkVerts + x] =
+                std::clamp(1.0 - std::abs(glm::dot(nr, up)), 0.0, 1.0);
+        }
+    }
+}
+
+double ReferenceRmsSlopePerAxis(const ElevationField& field,
+                                const glm::dvec3& dir_unit) noexcept {
+    const ElevationParams& p = field.Params();
+    const double floor_m = field.DataFloorMetres();
+    const double H  = std::clamp(p.hurst, 0.05, 1.0);
+    const double Hf = std::clamp(p.hurst_fine, H, 2.0);
+    const double brk = std::max(p.hillslope_break_m, 0.0);
+    const double lag = 2.0 * kRefSlopeHalfLagM;
+    const double S = RelativeStructureFunction(lag, floor_m, brk, H, Hf);
+    return kRefSlopeRmsGain * std::max(p.detail_gain, 0.0)
+         * field.Relief(dir_unit) * S / lag;
 }
 
 void BuildTerrainChunk(const ChunkKey& key,
@@ -88,9 +220,46 @@ void BuildTerrainChunk(const ChunkKey& key,
                                            FineOfChunk(kChunkQuads / 2));
     out.origin_w = origin_w;
 
+    // --- Reference-scale rock exposure (#307) ------------------------------
+    //
+    // A pure function of position, evaluated on the level-kRefSlopeLevel
+    // lattice over a kRefSlopeHalfLagM baseline. See the header for why
+    // that operator and not the mesh's own.
+    //
+    // Two branches, and they are the two halves of one mip chain rather
+    // than two models: POINTWISE where the mesh can carry a 180 m signal
+    // (vertex spacing <= kRefSlopeHalfLagM, i.e. level >= kRefSlopeLevel),
+    // and the AREA MEAN of the same ramp where it cannot. The crossover is
+    // at the Nyquist of the reference baseline, not at a level someone
+    // picked, and the two agree in the mean there by measurement -- see
+    // kRefSlopeRmsGain and tests/pt_planet_terrain_test.cpp.
+    std::vector<float> rock01(static_cast<std::size_t>(kChunkVertexCount), 0.0f);
+    if (static_cast<int>(key.level) >= kRefSlopeLevel) {
+        std::vector<double> slope_ref;
+        ReferenceSlope01(key, field, site, slope_ref);
+        for (std::size_t i = 0; i < rock01.size(); ++i) {
+            rock01[i] = static_cast<float>(SlopeRockFraction(slope_ref[i]));
+        }
+    } else {
+        const std::int64_t Gc = static_cast<std::int64_t>(kChunkQuads) << key.level;
+        const std::int64_t cbase_x = static_cast<std::int64_t>(key.i) * kChunkQuads;
+        const std::int64_t cbase_y = static_cast<std::int64_t>(key.j) * kChunkQuads;
+        for (int y = 0; y <= kChunkQuads; ++y) {
+            for (int x = 0; x <= kChunkQuads; ++x) {
+                const double s = GridParam(cbase_x + x, Gc);
+                const double t = GridParam(cbase_y + y, Gc);
+                const glm::dvec3 dir = FaceParamToDirection(key.face, s, t);
+                rock01[static_cast<std::size_t>(y) * kChunkVerts + x] =
+                    static_cast<float>(RockFractionFromRmsSlope(
+                        ReferenceRmsSlopePerAxis(field, dir)));
+            }
+        }
+    }
+
     // --- Vertices, normals, elevation extent ------------------------------
     out.positions.assign(static_cast<std::size_t>(kChunkVertexCount) * 3u, 0.0f);
-    out.shader_verts.assign(static_cast<std::size_t>(kChunkVertexCount) * 4u, 0.0f);
+    out.shader_verts.assign(
+        static_cast<std::size_t>(kChunkVertexCount) * kVertexPayloadFloats, 0.0f);
     double h_min =  1e30, h_max = -1e30;
     glm::dvec3 lo( 1e30), hi(-1e30);
 
@@ -124,10 +293,12 @@ void BuildTerrainChunk(const ChunkKey& key,
             if (glm::dot(n, site.WorldUp(p)) < 0.0) n = -n;
 
             const double h = fine[static_cast<std::size_t>(FineIdx(fx, fy))];
-            out.shader_verts[vi * 4 + 0] = static_cast<float>(n.x);
-            out.shader_verts[vi * 4 + 1] = static_cast<float>(n.y);
-            out.shader_verts[vi * 4 + 2] = static_cast<float>(n.z);
-            out.shader_verts[vi * 4 + 3] = static_cast<float>(h);
+            const std::size_t so = vi * static_cast<std::size_t>(kVertexPayloadFloats);
+            out.shader_verts[so + 0] = static_cast<float>(n.x);
+            out.shader_verts[so + 1] = static_cast<float>(n.y);
+            out.shader_verts[so + 2] = static_cast<float>(n.z);
+            out.shader_verts[so + 3] = static_cast<float>(h);
+            out.shader_verts[so + 4] = rock01[vi];
 
             h_min = std::min(h_min, h);
             h_max = std::max(h_max, h);

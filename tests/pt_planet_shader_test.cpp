@@ -132,8 +132,20 @@ TEST_CASE("the terrain bindings agree across Slang and the Vulkan tables") {
     const std::string vk    = Slurp(PT_VULKAN_DEVICE_PATH);
 
     // Slang declares each exactly once.
+    // #307 widened the per-vertex payload from float4 to a five-float
+    // stride, so the declared ELEMENT TYPE moved from float4 to float. The
+    // binding number, the set and the descriptor type are all unchanged --
+    // a storage buffer is typeless to the layout -- which is exactly why
+    // the Vulkan-side pins below still read as they did.
     CHECK(CountOccurrences(
-        slang, "[[vk::binding(36, 0)]] StructuredBuffer<float4> terrain_verts;") == 1);
+        slang, "[[vk::binding(36, 0)]] StructuredBuffer<float>  terrain_verts;") == 1);
+    // The stride the shader indexes with, and the host constant it must
+    // equal. Two numbers in two languages with no generated code between
+    // them: if either moves alone, every terrain hit reads the wrong
+    // vertex and the planet turns to noise.
+    CHECK(CountOccurrences(slang, "static const uint kTerrainVertFloats = 5u;") == 1);
+    CHECK(CountOccurrences(Slurp(PT_PLANET_TERRAINCHUNK_H_PATH),
+                           "inline constexpr int kVertexPayloadFloats = 5;") == 1);
     CHECK(CountOccurrences(
         slang, "[[vk::binding(38, 0)]] StructuredBuffer<uint>   terrain_indices;") == 1);
     CHECK(CountOccurrences(

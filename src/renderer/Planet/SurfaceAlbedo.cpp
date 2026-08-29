@@ -23,6 +23,16 @@ double Smoothstep01(double t) noexcept {
 // the observed zonal-mean temperature with.
 double LegendreP2(double x) noexcept { return 0.5 * (3.0 * x * x - 1.0); }
 
+// The ramp's endpoints, in the shader's slope01 = 1 - cos(tilt) measure and
+// in tangent. Evaluated once at static-init rather than per call: the area
+// integral below evaluates the ramp tens of times per vertex, and two
+// cosines of a compile-time constant inside that loop was measurably most
+// of a coarse chunk's bake.
+const double kRockRampLo01  = 1.0 - std::cos(kThresholdHillslopeDeg * kPi / 180.0);
+const double kRockRampHi01  = 1.0 - std::cos(kRockFullExposureDeg   * kPi / 180.0);
+const double kRockRampLoTan = std::tan(kThresholdHillslopeDeg * kPi / 180.0);
+const double kRockRampHiTan = std::tan(kRockFullExposureDeg   * kPi / 180.0);
+
 }  // namespace
 
 // --- The snowline ----------------------------------------------------------
@@ -56,10 +66,44 @@ double SnowlineAltitudeM(double lat_rad, double tropical_anchor_m) noexcept {
 // --- Threshold hillslope ---------------------------------------------------
 
 double SlopeRockFraction(double slope01) noexcept {
-    const double lo = 1.0 - std::cos(kThresholdHillslopeDeg * kPi / 180.0);
-    const double hi = 1.0 - std::cos(kRockFullExposureDeg   * kPi / 180.0);
-    if (!(hi > lo)) return 0.0;
-    return Smoothstep01((slope01 - lo) / (hi - lo));
+    if (!(kRockRampHi01 > kRockRampLo01)) return 0.0;
+    return Smoothstep01((slope01 - kRockRampLo01)
+                        / (kRockRampHi01 - kRockRampLo01));
+}
+
+double RockFractionFromRmsSlope(double rms_slope_tan_per_axis) noexcept {
+    const double s = rms_slope_tan_per_axis;
+    if (!(s > 0.0)) return 0.0;
+    if (!(kRockRampHiTan > kRockRampLoTan)) return 0.0;
+    const double inv2s2 = 0.5 / (s * s);
+
+    // The Rayleigh SURVIVAL function, exp(-t^2 / 2 sigma^2), is elementary,
+    // and the ramp is exactly 1 above tan(45 deg) -- so the whole upper
+    // tail is closed form and only the ramp's own 0.5774..1.0 band has to
+    // be integrated. That is a FIXED, FINITE interval: the quadrature cost
+    // does not grow with sigma, the tail is exact rather than truncated,
+    // and the integrand is smooth across it.
+    const double tail = std::exp(-kRockRampHiTan * kRockRampHiTan * inv2s2);
+
+    // Composite Simpson over [tan 30, tan 45], a 0.4226-wide interval. 64
+    // intervals put the abscissae 6.6e-3 apart against a smoothstep whose
+    // full width is the interval itself, so the quadrature error is far
+    // below the 2e-3 the terrain test compares it against.
+    constexpr int kSteps = 64;                 // even, for Simpson
+    const double dt = (kRockRampHiTan - kRockRampLoTan) / kSteps;
+    auto f = [&](double t) -> double {
+        // slope01 = 1 - cos(atan t) = 1 - 1/sqrt(1 + t^2), formed without
+        // the trig round trip.
+        const double slope01 = 1.0 - 1.0 / std::sqrt(1.0 + t * t);
+        const double pdf = t * (2.0 * inv2s2) * std::exp(-t * t * inv2s2);
+        return SlopeRockFraction(slope01) * pdf;
+    };
+    double acc = f(kRockRampLoTan) + f(kRockRampHiTan);
+    for (int i = 1; i < kSteps; ++i) {
+        acc += ((i & 1) ? 4.0 : 2.0)
+             * f(kRockRampLoTan + static_cast<double>(i) * dt);
+    }
+    return std::clamp(tail + acc * dt / 3.0, 0.0, 1.0);
 }
 
 // --- The raster ------------------------------------------------------------

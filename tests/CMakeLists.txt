@@ -495,6 +495,7 @@ pt_add_test(pt_planet_shader
 target_compile_definitions(pt_planet_shader PRIVATE
     PT_SHADER_PATHTRACE_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang"
     PT_VULKAN_DEVICE_PATH="${CMAKE_SOURCE_DIR}/src/rhi_vulkan/VulkanDevice.cpp"
+    PT_PLANET_TERRAINCHUNK_H_PATH="${CMAKE_SOURCE_DIR}/src/renderer/Planet/TerrainChunk.h"
     PT_ENGINE_CPP_PATH="${CMAKE_SOURCE_DIR}/src/engine/Engine.cpp")
 
 # --- pt_planet_albedo (issue #300, land cover) -----------------------------
@@ -2032,6 +2033,19 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
                        FRAMES 32 MAX_DELTA 16 MEAN_DELTA 0.8 FAIL_PERCENT 1)
     pt_add_golden_cell(SCENE planet_lod_seam BACKEND metal DENOISER off
                        FRAMES 32 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
+    # --- #307: the cell where the ROCK RAMP is the variable under test -----
+    #
+    # planet_surface cannot be that cell, and the reason is measured rather
+    # than asserted: it stands 2.2 km above the derived snowline on ground
+    # whose slope at the ramp's own 180 m measurement baseline has a median
+    # of 12.04 deg against a 30 deg threshold. Rock exposure there is
+    # 0.0007 and correctly so. This cell stands in the Annapurna Himal --
+    # the study area of the paper the 30 deg comes from -- where earth_lite
+    # carries 1 341 m of relief, the reference-scale slope has a median of
+    # 42.96 deg, and the frame crosses the snowline so it holds rock, snow
+    # and snow-shedding rock at once. See the fixture's header.
+    pt_add_golden_cell(SCENE planet_hillslope_rock BACKEND metal DENOISER off
+                       FRAMES 32 MAX_DELTA 16 MEAN_DELTA 0.8 FAIL_PERCENT 1)
     # --- end Planetary P4 -------------------------------------------------
     pt_add_golden_cell(SCENE planet_horizon_clouds        BACKEND metal DENOISER off
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
