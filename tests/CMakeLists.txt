@@ -364,6 +364,30 @@ else()
     target_compile_options(pt_atmosphere PRIVATE $<$<CONFIG:Release>:/fp:fast>)
 endif()
 
+# --- pt_sky_units (issue #280) ---------------------------------------------
+# The radiometric unit rebase, Hillaire 2020's multiple-scattering table,
+# and the retirement of the compensating r_rayleigh / aerosol pair.
+#
+# It links pt_renderer because #280's physics has a HOST implementation --
+# src/renderer/Atmosphere.cpp -- rather than only a shader one. That is the
+# whole point of building the table on the CPU: the builder is also the
+# software backend's mirror and the sky cook, so there is one implementation
+# to test rather than a shader plus a transcription of it. This target
+# therefore tests the real code, and re-reads the .slang only to pin that
+# the GPU side still carries the same constants and the same
+# parameterisation.
+#
+# The pins COUNT occurrences rather than testing find() != npos: a substring
+# pin is satisfied by one correct copy however many stale ones survive,
+# which is how #276 stayed green for a cycle.
+pt_add_test(pt_sky_units
+    pt_sky_units_test.cpp
+    LINK_TARGETS pt_renderer)
+target_compile_definitions(pt_sky_units PRIVATE
+    PT_SHADER_MATH_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTraceMath.slang"
+    PT_SHADER_PATHTRACE_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang"
+    PT_ENGINE_CPP_PATH="${CMAKE_SOURCE_DIR}/src/engine/Engine.cpp")
+
 # --- pt_planet_terrain (issue #258, planetary P4) --------------------------
 # The cubed-ellipsoid quadtree, the elevation field, chunk baking and the
 # residency selector.
@@ -1232,6 +1256,31 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # the fixture body and so beat the fixture's own `r_denoiser
     # svgf_atrous` line. That file is deleted; this cell captures the
     # feature the fixture documents (measured: 5.08% green-dominant).
+    # ------------------------------------------------------------------
+    # #280 HOLD -- THIS CELL IS EXPECTED TO FAIL, AND WAS NOT REGENERATED.
+    #
+    # #280 put the sky in physical radiometric units (the sun is 1360.8
+    # W/m^2, Kopp & Lean 2011, not the literal 80) and every day and
+    # twilight cell was re-pinned against it. This one was not, because
+    # NIGHT is the part of the chain the rebase did not reach:
+    #
+    #   * procSky's night floor (0.005, 0.010, 0.030) is still a painted
+    #     stand-in carried across by one uniform factor. The real number is
+    #     computable and cited -- 250 R of O I 557.7 nm nightglow is
+    #     7.09e-8 W/m^2/sr, five orders of magnitude below where the floor
+    #     now sits -- but adopting it blacks out every night frame.
+    #   * moonDisc, starsOnly and the 0.3 x phase moonlight term are all
+    #     painted, with no physical anchor. Full-moon illuminance is
+    #     4.8e-6 of solar (Kieffer & Stone 2005), which is the anchor they
+    #     need and do not have.
+    #   * sunDisc in modes 2/3 is painted at 250 x atm; only
+    #     sunDiscPhysical is derived as E / Omega.
+    #
+    # Re-pinning now would encode a half-migrated state that has to be
+    # re-pinned again the moment the night radiometry lands, so the cell is
+    # left red on purpose. Regenerate it with that phase, not before.
+    # See PR #301 and its remainder list.
+    # ------------------------------------------------------------------
     pt_add_golden_cell(SCENE aurora_smoke       BACKEND metal DENOISER svgf_atrous
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     # ReSTIR DI final-shading coverage (issue #78). light_primitives_mixed
@@ -1314,22 +1363,92 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # held in early bring-up; if any cell flakes on cross-host runs the
     # MAX_DELTA / MEAN_DELTA can be widened per-cell here without
     # touching the harness.
-    set(_sky_scenes
-        procedural_noon
-        procedural_evening
-        procedural_dawn
+    #
+    # #280 SPLIT THIS LOOP. One MEAN_DELTA for six scenes was hiding a
+    # vacuous cell: measured against a real ablation, deleting OZONE moves
+    # procedural_noon by mean 2.06, and the loop's MEAN_DELTA of 4 is
+    # larger than that -- so that cell could not fail when the feature it
+    # is meant to cover was removed. That is the failure mode ocean_fft sat
+    # in for months. Every day cell below now carries a threshold measured
+    # against its own smallest real signal, recorded per cell.
+    #
+    # The METHOD, once, since it is the same for every cell #280 re-pinned:
+    #   * reproducibility on this host is EXACTLY ZERO -- two full matrix
+    #     renders of this branch are bit-identical on 86 of 87 cells
+    #     (smoke_phase3_wind is the one documented exception), so the
+    #     threshold is pure cross-host headroom and not run-to-run noise;
+    #   * the SIGNAL is the smaller of two ablations actually performed --
+    #     ozone off (r_ozone 0) and multiple scattering off (the shader's
+    #     readiness gate plus the host builder, so it is off everywhere);
+    #   * MEAN_DELTA is set at roughly a quarter of that signal, which
+    #     leaves it ~8x above the largest cross-host codegen drift this
+    #     project has measured (#279: mean <= 0.06 across 30 cells).
+    # ------------------------------------------------------------------
+    # #280 HOLD -- bsc_night_clouds__metal IS EXPECTED TO FAIL, AND WAS NOT REGENERATED.
+    #
+    # #280 put the sky in physical radiometric units (the sun is 1360.8
+    # W/m^2, Kopp & Lean 2011, not the literal 80) and every day and
+    # twilight cell was re-pinned against it. This one was not, because
+    # NIGHT is the part of the chain the rebase did not reach:
+    #
+    #   * procSky's night floor (0.005, 0.010, 0.030) is still a painted
+    #     stand-in carried across by one uniform factor. The real number is
+    #     computable and cited -- 250 R of O I 557.7 nm nightglow is
+    #     7.09e-8 W/m^2/sr, five orders of magnitude below where the floor
+    #     now sits -- but adopting it blacks out every night frame.
+    #   * moonDisc, starsOnly and the 0.3 x phase moonlight term are all
+    #     painted, with no physical anchor. Full-moon illuminance is
+    #     4.8e-6 of solar (Kieffer & Stone 2005), which is the anchor they
+    #     need and do not have.
+    #   * sunDisc in modes 2/3 is painted at 250 x atm; only
+    #     sunDiscPhysical is derived as E / Omega.
+    #
+    # Re-pinning now would encode a half-migrated state that has to be
+    # re-pinned again the moment the night radiometry lands, so the cell is
+    # left red on purpose. Regenerate it with that phase, not before.
+    # See PR #301 and its remainder list.
+    # ------------------------------------------------------------------
+    set(_sky_scenes_night
         bsc_night
         lunar_night
         bsc_night_clouds)
-    foreach(_scene IN LISTS _sky_scenes)
-        # Software backend / no denoiser -- this is the CI-exercised
-        # cell. Tolerance kept at defaults so a real regression surfaces.
+    foreach(_scene IN LISTS _sky_scenes_night)
+        # NIGHT. Deliberately NOT re-pinned by #280 and deliberately not
+        # re-measured: the airglow floor procSky adds is still a painted
+        # stand-in (the real figure is 7.09e-8 W/m^2/sr of O I 557.7 nm
+        # nightglow, five orders of magnitude below where the floor sits),
+        # and the moon and star paths are painted with no physical anchor
+        # at all. Thresholds measured against those would be measured
+        # against a half-migrated state. See the hold note on
+        # bsc_night_clouds below.
         pt_add_golden_cell(SCENE ${_scene} BACKEND software DENOISER off)
-        # Metal backend + SVGF a-trous -- the user's primary dev combo
-        # on M-series. Wider tolerance to absorb GPU FP-order variance.
         pt_add_golden_cell(SCENE ${_scene} BACKEND metal    DENOISER svgf_atrous
             MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     endforeach()
+
+    # DAY. Software cells keep the defaults (16 / 2 / 1) and keep their
+    # ROLE, which is not what it looks like: the software tracer paints its
+    # own sky and implements no atmospheric physics, so a software cell
+    # cannot detect a sky regression at all (#257 recorded this). It is the
+    # control that says a change did not leak into host code -- and under
+    # #280's unit rebase alone every software cell moved by at most one
+    # 8-bit level, which is what that control is for.
+    foreach(_scene IN ITEMS procedural_noon procedural_evening procedural_dawn)
+        pt_add_golden_cell(SCENE ${_scene} BACKEND software DENOISER off)
+    endforeach()
+    # Metal + SVGF a-trous, thresholds measured per cell (#280).
+    #   procedural_noon    smallest signal 2.06 (ozone off) -> 4.1x clear
+    #   procedural_evening smallest signal 15.70 (ozone off) -> 5.2x clear
+    #   procedural_dawn    smallest signal 33.75 (ozone off) -> 8.4x clear
+    # noon is the tight one because its sun sits at 60 degrees, where the
+    # slant path through the ozone layer is at its shortest -- the same
+    # geometry that makes ozone invisible at noon and decisive at twilight.
+    pt_add_golden_cell(SCENE procedural_noon    BACKEND metal DENOISER svgf_atrous
+        MAX_DELTA 32 MEAN_DELTA 0.5 FAIL_PERCENT 2)
+    pt_add_golden_cell(SCENE procedural_evening BACKEND metal DENOISER svgf_atrous
+        MAX_DELTA 32 MEAN_DELTA 3 FAIL_PERCENT 2)
+    pt_add_golden_cell(SCENE procedural_dawn    BACKEND metal DENOISER svgf_atrous
+        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     # --- end #112 sky/sun/stars/moon matrix --------------------------------
 
     # --- Planetarium (#281) ------------------------------------------------
@@ -1400,6 +1519,31 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # list golden_planetarium_jupiter__metal__svgf_atrous_render and _diff.
     # A fixture with no registered cell tests nothing -- three sunset_*
     # fixtures sat in this repo in exactly that state until #257.
+    # ------------------------------------------------------------------
+    # #280 HOLD -- THIS CELL IS EXPECTED TO FAIL, AND WAS NOT REGENERATED.
+    #
+    # #280 put the sky in physical radiometric units (the sun is 1360.8
+    # W/m^2, Kopp & Lean 2011, not the literal 80) and every day and
+    # twilight cell was re-pinned against it. This one was not, because
+    # NIGHT is the part of the chain the rebase did not reach:
+    #
+    #   * procSky's night floor (0.005, 0.010, 0.030) is still a painted
+    #     stand-in carried across by one uniform factor. The real number is
+    #     computable and cited -- 250 R of O I 557.7 nm nightglow is
+    #     7.09e-8 W/m^2/sr, five orders of magnitude below where the floor
+    #     now sits -- but adopting it blacks out every night frame.
+    #   * moonDisc, starsOnly and the 0.3 x phase moonlight term are all
+    #     painted, with no physical anchor. Full-moon illuminance is
+    #     4.8e-6 of solar (Kieffer & Stone 2005), which is the anchor they
+    #     need and do not have.
+    #   * sunDisc in modes 2/3 is painted at 250 x atm; only
+    #     sunDiscPhysical is derived as E / Omega.
+    #
+    # Re-pinning now would encode a half-migrated state that has to be
+    # re-pinned again the moment the night radiometry lands, so the cell is
+    # left red on purpose. Regenerate it with that phase, not before.
+    # See PR #301 and its remainder list.
+    # ------------------------------------------------------------------
     pt_add_golden_cell(SCENE planetarium_jupiter BACKEND metal DENOISER svgf_atrous
         MAX_DELTA 32 MEAN_DELTA 0.0074 FAIL_PERCENT 0.0025)
     # --- end Planetarium ---------------------------------------------------
@@ -1683,10 +1827,16 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # identical-run renders PASS them, checked against the committed PNGs.
     # Re-measure if a fixture's camera, resolution, exposure or frame count
     # changes: the margins are the point, not the numbers.
+    # #280 re-measured these two against ozone-off: 3.65 and 3.43 mean.
+    # MEAN_DELTA 2 left only 1.8x and 1.7x of margin, which is inside the
+    # range a cross-host run could plausibly reach, so the pair was both
+    # too loose to be a clean signal and too tight to be safe. 0.8 restores
+    # 4.6x and 4.3x while sitting ~13x above the largest measured
+    # cross-host codegen drift.
     pt_add_golden_cell(SCENE planet_surface  BACKEND metal DENOISER off
-                       FRAMES 32 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
+                       FRAMES 32 MAX_DELTA 16 MEAN_DELTA 0.8 FAIL_PERCENT 1)
     pt_add_golden_cell(SCENE planet_aerial   BACKEND metal DENOISER off
-                       FRAMES 32 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
+                       FRAMES 32 MAX_DELTA 16 MEAN_DELTA 0.8 FAIL_PERCENT 1)
     pt_add_golden_cell(SCENE planet_lod_seam BACKEND metal DENOISER off
                        FRAMES 32 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
     # --- end Planetary P4 -------------------------------------------------
@@ -1781,8 +1931,11 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # gate-off path and the cell would just match the pathtraced
     # software golden (no signal). Metal + denoised is the canonical
     # raymarched-clouds capture.
+    # #280: smallest signal 7.19 (ozone off; multiple scattering off moves
+    # this cell by 249, because a cloud deck lit through the atmosphere is
+    # mostly higher-order light). MEAN_DELTA 1.5 -> 4.8x clear.
     pt_add_golden_cell(SCENE clouds_raymarched BACKEND metal DENOISER svgf_atrous
-        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
+        MAX_DELTA 32 MEAN_DELTA 1.5 FAIL_PERCENT 3)
     # --- end Wave 7 (#24) -------------------------------------------------
 
     # --- Wave 9 -- god rays / crepuscular light shafts --------------------
@@ -1827,9 +1980,10 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # The new capture is bit-identical across three consecutive renders
     # on the dev M4 Max (max_delta 0), so the 32/4/3 thresholds remain
     # pure cross-host headroom.
+    # #280: smallest signal 7.19 (ozone off) -> MEAN_DELTA 1.5, 4.8x clear.
     pt_add_golden_cell(SCENE clouds_godrays BACKEND metal DENOISER svgf_atrous
         EXTRA "r_godrays 1"
-        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
+        MAX_DELTA 32 MEAN_DELTA 1.5 FAIL_PERCENT 3)
     # --- end Wave 9 -------------------------------------------------------
 
     # --- Fluid Phase 3 (#22) -- SPH smoke wind fixture ---------------------
@@ -2982,12 +3136,20 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # the risks: no part of this arc has ever executed on SPIR-V, and the
     # first *__vulkan__off_render cell already sits at ~115 s against a
     # 120 s budget on a cold MoltenVK pipeline cache.
+    # #280 measured the three against their own smallest ablation and
+    # tightened all of them. orbital_limb is the notable one: only 31% of
+    # its frame is not vacuum, so a mean over the WHOLE frame divides any
+    # real signal by three before the threshold ever sees it -- 3.46 for
+    # ozone off, against a MEAN_DELTA of 4 that could not have failed.
+    #   orbital_limb        smallest signal 3.46 (ozone off) -> 4.3x clear
+    #   orbital_terminator  smallest signal 15.25 (ozone off) -> 5.1x clear
+    #   sky_physical_ground smallest signal 4.92 (ozone off) -> 4.1x clear
     pt_add_golden_cell(SCENE orbital_limb       BACKEND metal DENOISER off
-        FRAMES 32 MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
+        FRAMES 32 MAX_DELTA 32 MEAN_DELTA 0.8 FAIL_PERCENT 3)
     pt_add_golden_cell(SCENE orbital_terminator BACKEND metal DENOISER off
-        FRAMES 32 MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
+        FRAMES 32 MAX_DELTA 32 MEAN_DELTA 3 FAIL_PERCENT 3)
     pt_add_golden_cell(SCENE sky_physical_ground BACKEND metal DENOISER off
-        FRAMES 32 MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
+        FRAMES 32 MAX_DELTA 32 MEAN_DELTA 1.2 FAIL_PERCENT 3)
 
     # The shell crossing, as an A/B with its own control.
     #

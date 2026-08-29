@@ -13,6 +13,7 @@
 
 #include "../core/Log.h"
 #include "engine/HosekSkyModel.h"   // Wave 9 hosek-sky: real ArHosekSkyModel cook
+#include "renderer/Atmosphere.h"    // #280: the one documented unit-rebase factor
 
 #include <embree4/rtcore.h>
 #include <glm/glm.hpp>
@@ -285,7 +286,19 @@ inline glm::vec3 ProcSky(const glm::vec3& dir, const glm::vec3& sun_dir) {
     float halo = std::pow(cos_sun, 6.0f) * 0.5f;
     float disc = (cos_sun > 0.9998f) ? 2.5f : 0.0f;
     glm::vec3 sun_col{1.0f, 0.92f, 0.78f};
-    return sky + sun_col * (halo + disc);
+    // #280: carried across the unit rebase by the ONE documented factor.
+    //
+    // This gradient is NOT the shader's procSky -- it is a separate painted
+    // approximation with its own literals, which is why #257 recorded that a
+    // software golden cannot validate a shader change.  #280 did not make it
+    // physical (the shader's procSky now interpolates an integrated palette;
+    // this still interpolates two authored colours), and that is stated
+    // rather than papered over.  What it DOES do is move by exactly the same
+    // factor every painted celestial term moved by, so that dividing each
+    // fixture's r_exposure by that same factor leaves every software cell
+    // where it was -- which is what keeps the software cells usable as the
+    // "did this land in host code?" control for the rest of the change.
+    return (sky + sun_col * (halo + disc)) * pt::atmo::kLegacySkyScale;
 }
 
 // Hosek-Wilkie physically-based sky dome (r_sky_mode = hosek). The CPU
@@ -314,7 +327,13 @@ inline glm::vec3 HosekSky(const glm::vec3& dir, const glm::vec3& sun_dir,
     sky *= glm::smoothstep(-0.05f, 0.02f, dir.y);
     const float day = glm::smoothstep(-0.10f, 0.20f, sun_dir.y);
     sky = glm::mix(glm::vec3{0.005f, 0.010f, 0.030f}, sky, day);
-    return glm::max(sky, glm::vec3(0.0f));
+    // #280: same one documented factor as ProcSky above. Hosek-Wilkie IS a
+    // physical model, but the engine feeds it through kHosekRadianceScale --
+    // an engine-units conversion, not an SI one -- so rebasing it properly
+    // means re-deriving that scale against the new anchor. Left as remaining
+    // work; carried by the uniform factor here so the fixture's exposure
+    // division leaves it where it was.
+    return glm::max(sky, glm::vec3(0.0f)) * pt::atmo::kLegacySkyScale;
 }
 
 // ACES Narkowicz approximation, well-matched to the engine's
@@ -998,7 +1017,12 @@ void RunPathTraceKernel(SoftwareDevice& device,
                                     prim_data, prim_count, tlas_scene,
                                     cone_w_hit, shadow);
                         if (!shadow.hit) {
-                            glm::vec3 sun_rad{2.4f, 2.2f, 1.9f};
+                            // #280: painted sun irradiance, carried across
+                            // the unit rebase by the same documented factor
+                            // as the painted sky above.
+                            glm::vec3 sun_rad =
+                                glm::vec3{2.4f, 2.2f, 1.9f}
+                                * pt::atmo::kLegacySkyScale;
                             lit = h0.albedo * sun_rad * n_dot_l;
                         }
                     }

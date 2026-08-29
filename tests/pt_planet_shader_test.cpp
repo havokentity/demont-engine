@@ -40,6 +40,7 @@
 #include "engine/PlanetTerrain.h"
 #include "renderer/Planet/CubedSphere.h"
 
+#include <cstdio>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -156,9 +157,24 @@ TEST_CASE("the terrain bindings agree across Slang and the Vulkan tables") {
     CHECK(CountOccurrences(vk, "add_binding(39, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);") == 1);
 
     // The descriptor pool has to be sized for them. 17 storage buffers
-    // before this phase, 20 after.
-    CHECK(CountOccurrences(vk, "kTotalSets * 20 + 8") == 1);
+    // before this phase, 20 after -- and 21 since #280 added the
+    // multiple-scattering table at binding 40, which is a storage buffer
+    // precisely so that it costs a descriptor and NOT a compute pipeline.
+    CHECK(CountOccurrences(vk, "kTotalSets * 21 + 8") == 1);
+    CHECK(CountOccurrences(vk, "kTotalSets * 20 + 8") == 0);
     CHECK(CountOccurrences(vk, "kTotalSets * 17 + 8") == 0);
+    // #280's own binding, on both sides of the same contract.
+    CHECK(CountOccurrences(vk, "46, // engine slot 21 -> shader binding 46 (atmo_ms_lut)") == 1);
+    CHECK(CountOccurrences(vk, "add_binding(46, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);") == 1);
+    // 40..45 are OceanCascades' (#293) reserved numbers and must stay out of
+    // the shared layout until that module gets a Vulkan pipeline and adds all
+    // six at once. Pinned so a later binding cannot quietly land on one.
+    for (int b = 40; b <= 45; ++b) {
+        char decl[80];
+        std::snprintf(decl, sizeof(decl),
+                      "add_binding(%d, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);", b);
+        CHECK(CountOccurrences(vk, decl) == 0);
+    }
 }
 
 TEST_CASE("host and shader compute the same cone_spread") {

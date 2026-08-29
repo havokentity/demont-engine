@@ -1035,9 +1035,16 @@ TEST_CASE("shader and engine mirrors are still faithful") {
     CHECK(countOf(pt, "boolocean_sun_nee_prev=ocean_sun_nee;ocean_sun_nee=false;") == 1u);
     CHECK(countOf(pt, "ocean_sun_nee_prev?skyColorNoSunDisc(ro,rd,seed)") == 1u);
     // ...and that the NEE integrates the SAME radiance the disc carries.
-    // sunDiscPhysical returns T*80/omega, sunRadianceAt returns 80*T, so
-    // the disc's radiance times its solid angle IS the NEE's irradiance.
+    // sunDiscPhysical returns T*E/omega and sunIrradianceAt returns E*T, so
+    // the disc's radiance times its solid angle IS the NEE's irradiance --
+    // the partition property that survives #280 unchanged, because #280
+    // only replaced the symbol E stood for. It was the literal 80 and is
+    // now kPtSolarIrradiance, 1360.8 W/m^2 split across three channels
+    // (Kopp & Lean 2011 / Bruneton 2017); the audit for why that 80 was an
+    // irradiance rather than a radiance is in src/renderer/Atmosphere.h.
     CHECK(countOf(pt, "s-=sunDiscPhysical(ro,rd,sun_and_mode.xyz);") == 1u);
-    CHECK(countOf(pt, "returnfloat3(80.0)*sunSlantTransmittance(p,sun_dir);") == 1u);
-    CHECK(countOf(pt, "returnT*(80.0/max(omega,1.0e-12))*bright;") == 1u);
+    CHECK(countOf(pt, "returnkPtSolarIrradiance*sunSlantTransmittance"
+                      "(p,sun_dir);") == 1u);
+    CHECK(countOf(pt, "returnT*(kPtSolarIrradiance/max(omega,1.0e-12))"
+                      "*bright;") == 1u);
 }
