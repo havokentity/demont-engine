@@ -247,8 +247,10 @@ double SnowlineAltitudeM(double lat_rad, double tropical_anchor_m) noexcept;
 // same authors. Feeding this ramp a slope measured over some other baseline
 // is a units error, and it was one: the shader fed it the MESH normal,
 // whose baseline is two chunk cells and therefore changes with the LOD. The
-// baseline the ramp is now evaluated at is kRefSlopeHalfLagM /
-// kRefSlopeLevel in TerrainChunk.h.
+// baseline the ramp is now evaluated at is 2 * kRefSlopeHalfLagM -- 180 m,
+// a PHYSICAL DISTANCE -- sampled on the level-kRefSlopeLevel lattice. Both
+// constants are in TerrainChunk.h; the second says which grid carries the
+// operator, not what the baseline is divided by.
 inline constexpr double kThresholdHillslopeDeg = 30.0;
 inline constexpr double kRockFullExposureDeg   = 45.0;
 double SlopeRockFraction(double slope01) noexcept;

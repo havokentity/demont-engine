@@ -354,6 +354,41 @@ double RelativeStructureFunction(double lag_m, double floor_m, double break_m,
 // GenerateChunkHeights from several JobSystem workers at once.
 class ElevationField {
 public:
+    ElevationField() = default;
+
+    // COPIES AND MOVES GET A FRESH STAMP, because the alternative makes
+    // Generation()'s guarantee false in a way a memo cannot see. The
+    // implicit copy constructor would duplicate generation_, so two live
+    // objects would answer the same number -- and TerrainChunk.cpp's
+    // reference-grid memo keys on that number ALONE, having dropped the
+    // object's address once the generation stamp was shown to subsume it.
+    //
+    // Copies are not hypothetical: MakeProceduralField in
+    // tests/pt_planet_terrain_test.cpp returns one by value, and every
+    // planet test starts with one.
+    //
+    // A shared stamp would in fact still serve the right grid today, since
+    // a copy has the same dem_ and params_ and therefore generates the same
+    // heights. That argument is exactly the kind that stops being true
+    // quietly -- add one mutable member and it fails with no compiler
+    // anywhere to notice -- so the invariant is made real rather than
+    // reasoned about.
+    ElevationField(const ElevationField& o) noexcept
+        : dem_(o.dem_), params_(o.params_) {}
+    ElevationField(ElevationField&& o) noexcept
+        : dem_(o.dem_), params_(o.params_) {}
+    ElevationField& operator=(const ElevationField& o) noexcept {
+        if (this != &o) {
+            dem_ = o.dem_;
+            params_ = o.params_;
+            generation_ = NextGeneration();
+        }
+        return *this;
+    }
+    ElevationField& operator=(ElevationField&& o) noexcept {
+        return *this = static_cast<const ElevationField&>(o);
+    }
+
     void SetDem(const DigitalElevationModel* dem) noexcept {
         dem_ = dem;
         generation_ = NextGeneration();
@@ -371,10 +406,11 @@ public:
     // sixteen level-13 chunks otherwise regenerate identically -- holds
     // this alongside the memo and discards it when the number moves.
     //
-    // PROCESS-UNIQUE, AND UNIQUE FROM CONSTRUCTION. Every ElevationField
-    // that has ever existed in this process has held a different value, so
-    // this ALONE identifies both which field a memo came from and which
-    // configuration it was in. A per-object counter would not: a destroyed
+    // PROCESS-UNIQUE, AND UNIQUE FROM CONSTRUCTION -- INCLUDING COPY
+    // CONSTRUCTION, which is why the copy and move members above exist at
+    // all. Every ElevationField that has ever existed in this process has
+    // held a different value, so this ALONE identifies both which field a
+    // memo came from and which configuration it was in. A per-object counter would not: a destroyed
     // field and a freshly constructed one at the same address with the
     // same number of mutations would look identical to a cache keyed on
     // (pointer, generation), and they are not identical if they were

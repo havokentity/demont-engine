@@ -2035,6 +2035,38 @@ TEST_CASE("the reference-grid memo answers for the field it was filled from") {
     CHECK(moved > compared / 2u);
     CHECK(engaged_before > compared / 20u);
 
+    // (1b) A COPY IS A DIFFERENT FIELD, AND MUST STAMP AS ONE.
+    // ElevationField is copied by value all over this file --
+    // MakeProceduralField returns one -- and the memo keys on the
+    // generation stamp ALONE, having dropped the object's address once the
+    // stamp was shown to subsume it. An implicit copy constructor would
+    // duplicate the stamp and hand two live objects the same identity.
+    // Asserted rather than left to the reasoning that a copy would serve
+    // the right grid anyway: that reasoning holds today and would fail
+    // silently the moment the class gained a mutable member.
+    ElevationField original = MakeProceduralField(800.0, 20000.0);
+    ElevationField copied(original);
+    ElevationField assigned = MakeProceduralField(120.0, 20000.0);
+    assigned = original;
+    CHECK(copied.Generation() != original.Generation());
+    CHECK(assigned.Generation() != original.Generation());
+    CHECK(assigned.Generation() != copied.Generation());
+    // ...and the copy still describes the same field, so it must bake the
+    // same chunk. A stamp that differs is only correct if the CONTENT
+    // agrees; without this the check above would pass on a copy
+    // constructor that dropped the params on the floor.
+    TerrainChunkData od, cd2;
+    BuildTerrainChunk(key, original, site, od);
+    BuildTerrainChunk(key, copied,   site, cd2);
+    std::size_t copy_engaged = 0;
+    for (int y = 0; y <= kChunkQuads; ++y) {
+        for (int x = 0; x <= kChunkQuads; ++x) {
+            CHECK(VertRock(od, x, y) == VertRock(cd2, x, y));
+            if (VertRock(od, x, y) > 0.0 && VertRock(od, x, y) < 1.0) ++copy_engaged;
+        }
+    }
+    CHECK(copy_engaged > static_cast<std::size_t>(kChunkVertexCount) / 20u);
+
     // (2) TWO LIVE FIELDS MUST NOT SHARE AN ENTRY.
     // Interleaved so that each bake finds the other's entry already in the
     // cache; a memo keyed on the chunk alone would serve it.
