@@ -1813,38 +1813,64 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     #   floor to size against on this host, which is why the
     #   cross-configuration number below is doing the work instead.
     #
-    #   DEBUG vs RELEASE, same host (the only same-host difference left):
+    #   DEBUG vs RELEASE, same host (the only same-host difference left).
+    #   RE-MEASURED by #304 against the regenerated PNGs, which are
+    #   Release-generated -- the previous figures described the previous
+    #   PNGs and are not carried forward:
     #     planet_surface   max 0.0000  mean 0.000000   (pixel-identical)
     #     planet_aerial    max 0.0000  mean 0.000000   (pixel-identical)
-    #     planet_lod_seam  max 1.7321  mean 0.000290
-    #   1.7321 is sqrt(3): one LSB on all three channels of one pixel.
+    #     planet_lod_seam  max 3.1623  mean 0.000157
+    #   3.1623 is sqrt(10): one pixel differing by one LSB on one channel
+    #   and three on another. It was sqrt(3) (one LSB on all three
+    #   channels) before the regen, so this term grew slightly while the
+    #   mean fell; both are still a single pixel out of 196 608.
+    #
+    #   ALL THREE SIGNAL BLOCKS BELOW WERE RE-MEASURED against the goldens
+    #   #304 regenerated. They describe the COMMITTED PNGs, so regenerating
+    #   the PNGs invalidates them; the previous figures are not carried
+    #   forward.
     #
     #   SIGNAL, feature deleted (r_planet_terrain 0 -- confirmed to take
     #   effect by the ABSENCE of "terrain online" in the run log, because
     #   `--extra` silently losing to the fixture is a trap this file has
     #   already been caught by once):
-    #     planet_surface   mean  96.4     bad  99.6%
-    #     planet_aerial    mean 280.1     bad 100.0%
-    #     planet_lod_seam  mean 263.1     bad 100.0%
+    #     planet_surface   mean 118.3     bad  91.3%
+    #     planet_aerial    mean 130.3     bad  99.3%
+    #     planet_lod_seam  mean 173.8     bad  86.3%
     #
     #   SIGNAL, real Earth deleted (r_planet_dem pointed at nothing, so the
-    #   fractal fallback stands in -- confirmed by "rendering a PROCEDURAL
-    #   body" in the log with "terrain online" still present). This is the
-    #   tighter and more specific claim, because these goldens are pinned
-    #   against ETOPO 2022 and not merely against "some terrain":
-    #     planet_surface   mean 185.6     bad  99.9%
-    #     planet_aerial    mean 179.5     bad  99.5%
-    #     planet_lod_seam  mean  85.9     bad  98.5%
+    #   fractal fallback stands in). This is the tighter and more specific
+    #   claim, because these goldens are pinned against ETOPO 2022 and not
+    #   merely against "some terrain":
+    #     planet_surface   mean 147.7     bad  99.6%
+    #     planet_aerial    mean 147.2     bad  98.8%
+    #     planet_lod_seam  mean 133.9     bad  99.4%
+    #   CONFIRMED BY the ABSENCE of "planet: loaded DEM" while "planet:
+    #   terrain online" is still PRESENT. The wording here used to ask for
+    #   "rendering a PROCEDURAL body" in the log; NO SUCH LINE IS EMITTED,
+    #   so that recipe could not be run as written -- the same vacuous-
+    #   confirmation trap the paragraph above warns about, one paragraph
+    #   later. Grepping the log for "procedural" alone does not work
+    #   either: it matches two SDF startup notices and the moon-map line
+    #   on every run, ablated or not.
+    #
+    #   SIGNAL, this feature's own A/B (r_planet_hillslope_break 0, which
+    #   restores the pre-#304 unbroken power law bit-exactly). This is the
+    #   most specific ablation these cells have AND the weakest of the
+    #   three, so it is the one the thresholds are sized against:
+    #     planet_surface   mean  64.49    bad  57.4%
+    #     planet_aerial    mean  15.81    bad  27.0%
+    #     planet_lod_seam  mean  66.71    bad  61.6%
     #
     #   The goldens are not blank, so "deleting a feature changes it" is not
-    #   vacuous: mean luminance 133.6 / 164.5 / 179.9 over 0..255, minimum
-    #   49 / 53 / 70, and 149-184 distinct luminance levels each.
+    #   vacuous: mean luminance 106.2 / 203.5 / 205.7 over 0..255, minimum
+    #   7.2 / 41.8 / 98.4, and 135-196 distinct luminance levels each.
     #
     # So the thresholds are the MATRIX DEFAULTS (16 / 2 / 1), passed
     # explicitly rather than inherited so a reader can see they were chosen
     # against a measurement:
     #
-    #   MAX_DELTA 16 is 9.2x the largest same-host per-pixel delta (1.7321).
+    #   MAX_DELTA 16 is 5.1x the largest same-host per-pixel delta (3.1623).
     #   It is NOT tightened towards that measurement on purpose: the only
     #   GPU available here is one M4 Max, and the headroom exists for a
     #   different driver's rounding and fma ordering -- the same reason
@@ -1852,12 +1878,22 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     #   single-GPU sample would be less justified, not more.
     #   FAIL_PERCENT 1 then has its whole range as headroom, because at
     #   MAX_DELTA 16 no observed noise pixel is classified bad at all
-    #   (0.000%), against a weakest signal of 98.5% bad.
-    #   MEAN_DELTA 2 sits 6900x above the worst observed mean (0.000290)
-    #   and 43x below the weakest signal (85.9).
+    #   (0.000%), against a weakest signal of 27.0% bad -- 27x.
+    #   MEAN_DELTA is unchanged at 0.8 / 0.8 / 2 and re-justified against
+    #   the regenerated goldens rather than carried over. Run-to-run the
+    #   branch is BIT-IDENTICAL (three renders per cell, one MD5 each), so
+    #   that term is exactly zero; the cross-configuration term is the
+    #   0.000157 mean above, which 0.8 sits 5 100x clear of. Downward, the
+    #   margin to the weakest signal is now 80x (64.49 / 0.8), 20x
+    #   (15.81 / 0.8) and 33x (66.71 / 2), against the 4.6x and 4.3x #280
+    #   was working with -- so there is no case for moving them in either
+    #   direction.
     #
-    # All six feature-deleted renders FAIL these thresholds and all sixty
-    # identical-run renders PASS them, checked against the committed PNGs.
+    # When #284 pinned these cells, all six feature-deleted renders FAILED
+    # these thresholds and all sixty identical-run renders PASSED them
+    # against the PNGs committed at the time. #304 regenerated those PNGs
+    # and re-ran the ablations against the new ones; the figures above are
+    # that re-measurement.
     # Re-measure if a fixture's camera, resolution, exposure or frame count
     # changes: the margins are the point, not the numbers.
     # #280 re-measured these two against ozone-off: 3.65 and 3.43 mean.
@@ -1866,6 +1902,45 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # too loose to be a clean signal and too tight to be safe. 0.8 restores
     # 4.6x and 4.3x while sitting ~13x above the largest measured
     # cross-host codegen drift.
+    # #304 (the hillslope scale break) MOVED ALL THREE OF THESE CELLS and
+    # the PNGs above were REGENERATED for it, with the maintainer's
+    # sign-off covering exactly these three cells. The decomposition below
+    # is the one measured AFTER the rebase onto #303; the pre-rebase
+    # figures were discarded rather than carried forward, because the two
+    # changes interact physically and not merely textually.
+    #
+    # NOISE FLOOR, re-established rather than assumed: a fresh worktree at
+    # main, configured and built from scratch, renders all three cells
+    # BYTE-IDENTICAL to the PNGs #303 committed (equal MD5s; imgdiff at
+    # zero thresholds gives bad=0, max 0.0000, mean 0.000000). Three
+    # consecutive renders agree likewise. So the floor is still exactly
+    # zero after #303, and every number below is 100% signal with no noise
+    # term to subtract.
+    #
+    # BRANCH vs MAIN (equivalently vs the pre-regen goldens, since those
+    # were byte-identical to main's render):
+    #     planet_surface   mean 64.49  rms 101.79  max 283.78  bad 57.4%
+    #     planet_aerial    mean 15.81  rms  31.37  max 292.85  bad 27.0%
+    #     planet_lod_seam  mean 66.71  rms  98.37  max 361.28  bad 61.6%
+    #
+    # For scale, "real Earth deleted" on post-#303 main moves the same
+    # cells by mean 99.58 / 141.43 / 93.11 -- RE-MEASURED, because #303's
+    # raster now supplies most of the surface colour and the old recorded
+    # 185.6 / 179.5 / 85.9 no longer describes these cells. So #304 is
+    # 0.65 / 0.11 / 0.72 of "this is not Earth any more".
+    #
+    # THAT IS MUCH LARGER THAN THE SAME CHANGE MEASURED AGAINST PRE-#303
+    # MAIN (mean 40.49 / 12.77 / 19.47, i.e. a fifth to a quarter), and the
+    # reason is the interaction: #303 makes surface albedo a function of
+    # SLOPE, and #304 changes the slope distribution below the 106 m break
+    # by up to an order of magnitude. Post-#303 a slope change therefore
+    # moves COLOUR as well as shading. Anyone re-deriving either of those
+    # two models has to re-render, not re-use. Issue #307 records the
+    # consequence: #303's slope -> rock ramp was calibrated against a
+    # slope field #304 has since shown to be an artefact, and at
+    # planet_surface's own resident level its median rock fraction has
+    # gone 0.918 -> 0.000. Re-deriving that ramp is deliberately NOT part
+    # of #304 and will move these three cells again.
     pt_add_golden_cell(SCENE planet_surface  BACKEND metal DENOISER off
                        FRAMES 32 MAX_DELTA 16 MEAN_DELTA 0.8 FAIL_PERCENT 1)
     # --- Land cover (#300) --------------------------------------------

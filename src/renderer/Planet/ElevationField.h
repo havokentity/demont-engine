@@ -53,17 +53,109 @@
 // Below the data floor the field continues with Fournier, Fussell &
 // Carpenter (1982) midpoint displacement -- "Computer rendering of
 // stochastic models", CACM 25(6) -- on the cubed-sphere vertex hierarchy.
-// The Hurst exponent is a measured constant, not a dial: continental
-// topography has a power spectrum with beta ~ 2, i.e. fractal dimension
-// D ~ 2.5 for the surface, and D = 3 - H gives H = 0.5 (Turcotte,
-// "Fractals and Chaos in Geology and Geophysics", 2nd ed. 1997, ch. 7).
-// The RMS height difference over lag l therefore scales as
+// The RMS height difference over lag l scales as
 //
-//     sigma(l) = sigma(L_dem) * (l / L_dem)^H
+//     sigma(l) = sigma(L_dem) * S(l)
 //
 // and sigma(L_dem) is *measured from the DEM itself* at each point (the
 // local RMS inter-texel height difference), so the Andes get sharp octaves
-// and the abyssal plains stay flat without anyone tuning anything.
+// and the abyssal plains stay flat without anyone tuning anything. S is
+// the normalised structure function, S(L_dem) = 1, and the shape of S is
+// the subject of the next section.
+//
+// THE SCALE BREAK -- WHY S IS NOT ONE POWER LAW (#304)
+// ---------------------------------------------------
+// Continental topography has a power spectrum with beta ~ 2, i.e. fractal
+// dimension D ~ 2.5 for the surface, and D = 3 - H gives H = 0.5
+// (Turcotte, "Fractals and Chaos in Geology and Geophysics", 2nd ed. 1997,
+// ch. 7). That exponent is real, but it was measured in the band where
+// fluvial dissection and tectonics set the form -- kilometres to a few
+// hundred metres. Taking S(l) = (l / L_dem)^0.5 all the way to level 19's
+// 0.30 m extrapolates it ~16 octaves past its own evidence, and because
+// H < 1 the SLOPE it implies,
+//
+//     sigma(l) / l = sigma(L) * l^(H-1) * L^-H,
+//
+// diverges as l -> 0. That is not a subtle error. Measured over
+// earth_lite's own relief, area-weighted, the single power law adds a
+// MEDIAN of 34.8 deg RMS slope at level 19's 0.30 m spacing, 74.6 deg at
+// the 90th percentile; over Kansas (13.5 m of relief per 19.5 km texel) it
+// adds 10.0 deg where real farmland is a degree or so. Terrain that steep
+// everywhere does not read as rock; it reads as noise, which is exactly
+// what it is.
+//
+// Landscapes are not self-affine at all scales. Perron, Kirchner &
+// Dietrich (2008), "Spectral signatures of characteristic spatial scales
+// and nonfractal structure in landscapes", JGR Earth Surface 113:F04003
+// (doi:10.1029/2007JF000866), show that topographic power spectra carry a
+// distinct roll-off rather than one scaling regime: above the roll-off the
+// spectrum is shallow (beta = 2.8 at Gabilan Mesa, 3.1 at the South Fork
+// Eel River, on the 2D convention beta = 2H + 2, so H = 0.4 and 0.55 --
+// Turcotte's continental value); below it the spectrum steepens sharply
+// (beta = 5.2 and 4.5, i.e. H = 1.6 and 1.25) because diffusive hillslope
+// sediment transport smooths the surface faster than channel incision
+// roughens it. The break is the fluvial-to-hillslope transition.
+//
+// So S gets two regimes and one crossover:
+//
+//     S(l) = (l / L)^H_fine * ((l + L_b) / (L + L_b))^(H_coarse - H_fine)
+//
+// which is exactly 1 at l = L, tends to (l/L)^H_coarse for l >> L_b, tends
+// to const * l^H_fine for l << L_b, is smooth everywhere in between, and
+// has local log-log slope exactly (H_coarse + H_fine)/2 at l = L_b -- so
+// L_b is the break, by definition rather than by fitting.
+//
+// L_b -- THE BREAK LENGTH, 106 m
+// ------------------------------
+// Perron et al. (2008) measure the spectral roll-off at 5.6e-3 m^-1
+// (wavelength 180 m) at Gabilan Mesa and 4.0e-3 m^-1 (250 m) at the South
+// Fork Eel River. A spectral feature at wavelength lambda appears in a
+// structure function at lag lambda/2: sigma^2(l) = 2 * integral of
+// P(k) (1 - cos(2 pi k l)) dk, whose kernel peaks at k l = 1/2. The two
+// sites therefore break at lags of 90 m and 125 m, and their geometric
+// mean, 106 m, is the constant used here.
+//
+// It is deliberately NOT a function of local relief. The hillslope length
+// is set by the ratio of diffusive to advective transport efficiency --
+// Perron, Dietrich & Kirchner (2008), "Controls on the spacing of
+// first-order valleys", JGR 113:F04016 (doi:10.1029/2007JF000977), show
+// valley spacing collapses onto a dimensionless Peclet number built from
+// D and K, which are climate and lithology properties -- so tying L_b to
+// relief would be a fit dressed as physics. The crossover is smooth over
+// roughly a decade in l either way, so the field is insensitive to L_b
+// anywhere in the 90-125 m the two sites bracket; r_planet_hillslope_break
+// exists to A/B that, not to tune a screenshot.
+//
+// H_fine -- WHY 1.0 AND NOT THE MEASURED 1.6
+// ------------------------------------------
+// H = 1 is the marginal exponent: sigma(l)/l is then scale-invariant, so
+// slope neither diverges nor decays as the hierarchy refines. Perron's
+// sub-break spectra actually give H ~ 1.25-1.6, which would make the
+// surface locally planar and erase every sub-metre feature. That is right
+// for a soil-mantled hillslope at 10 m and wrong at 0.30 m, because a
+// third regime -- clast, tussock and rill roughness -- reappears below
+// about a metre. Shepard et al. (2001), "The roughness of natural terrain:
+// A planetary and remote sensing perspective", JGR Planets 106(E12):32777
+// (doi:10.1029/2000JE001429), fit 60 natural surfaces over centimetre-to-
+// hundred-metre baselines and find H clustering near 0.5: at sub-metre
+// lags real ground is still self-affine and rough, decidedly not the
+// locally planar surface H > 1 implies. H_fine = 1.0 is the conservative
+// choice between the two regimes -- rougher than pure diffusion, and the
+// largest exponent for which the slope does not run away.
+//
+// The consequence is that ElevationParams::max_slope stops being
+// load-bearing. It used to truncate a divergence, and the truncation was
+// most of the surface: area-weighted over earth_lite, 31.6% of level-19
+// midpoints hit the clamp (4.4% at level 14, 11.5% at level 16 -- growing
+// without bound as the LOD refines, because that is what a divergence
+// does). Those vertices were not fractal at all, they were pinned at a
+// uniform 45 deg, which is precisely what read as noise rather than as
+// rock. With the break in place the added slope below L_b no longer
+// depends on l, so the engagement rate stops growing with level: 0.19% at
+// level 14, 0.22% at 16, 0.23% at 19. What is left is the 1.2% of Earth
+// whose DEM relief exceeds ~830 m per texel -- the Karakoram front, the
+// Andean scarp, the trench walls -- where a threshold-hillslope cap is
+// exactly the right physics rather than a patch over a bad extrapolation.
 //
 // The choice of an INTERPOLATORY subdivision -- displacement is added only
 // at vertices that are new at that level, and is exactly zero at every
@@ -191,25 +283,43 @@ struct ElevationParams {
     double procedural_relief_m = 900.0;
     // Notional data-floor lag when no DEM is loaded, metres.
     double procedural_floor_m  = 20000.0;
-    // Hurst exponent. 0.5 is the measured continental value; exposed so a
-    // user can render a smoother (H -> 1) or rougher (H -> 0) body.
+    // Hurst exponent ABOVE the hillslope break. 0.5 is the measured
+    // continental value; exposed so a user can render a smoother (H -> 1)
+    // or rougher (H -> 0) body.
     double hurst = 0.5;
+    // Hurst exponent BELOW the hillslope break, where diffusive sediment
+    // transport dominates. 1.0 makes RMS slope scale-invariant there; see
+    // the "H_fine" section of this file's header comment. Clamped to be at
+    // least `hurst`, so the surface can only get smoother as it refines,
+    // never rougher.
+    double hurst_fine = 1.0;
+    // The fluvial-to-hillslope break lag, metres. 106 m is the geometric
+    // mean of the half-wavelengths of the two spectral roll-offs measured
+    // by Perron, Kirchner & Dietrich (2008); see the "L_b" section of the
+    // header comment. Zero disables the break entirely and restores the
+    // single unbroken power law -- which is the pre-#304 behaviour and
+    // diverges, so it exists for A/B only.
+    double hillslope_break_m = 106.0;
     // Multiplier on the continuation amplitude. 1.0 = the measured
     // continuation; the cvar exists for A/B, not for tuning the look.
     double detail_gain = 1.0;
     // Threshold-hillslope cap on the slope the continuation may ADD at any
-    // one level, as a tangent. A self-affine surface with H < 1 is nowhere
-    // differentiable -- sigma(l)/l = sigma(L) * l^(H-1) * L^-H diverges as
-    // l -> 0 -- so continuing it unbounded to level 19 produces vertical
-    // walls and, at 0.30 m spacing, overhangs a heightfield cannot even
-    // represent. Real terrain has a lower cutoff: hillslopes steepen only
-    // to a threshold set by landsliding, measured at ~30 deg modal slope in
-    // the actively uplifting northwest Himalaya (Burbank et al. 1996,
-    // Nature 379:505), and granular material stands at its angle of repose,
-    // ~34 deg for dry sand (Al-Hashemi & Al-Amoudi 2018, Powder Technology
-    // 330:397). Bedrock cliffs exceed both locally, so the default is
-    // tan(45 deg) = 1.0 rather than tan(34 deg): a cap that admits real
-    // cliffs while refusing the mathematically unbounded ones.
+    // one level, as a tangent. Real terrain has an upper cutoff on slope:
+    // hillslopes steepen only to a threshold set by landsliding, measured
+    // at ~30 deg modal slope in the actively uplifting northwest Himalaya
+    // (Burbank et al. 1996, Nature 379:505), and granular material stands
+    // at its angle of repose, ~34 deg for dry sand (Al-Hashemi &
+    // Al-Amoudi 2018, Powder Technology 330:397). Bedrock cliffs exceed
+    // both locally, so the default is tan(45 deg) = 1.0 rather than
+    // tan(34 deg): a cap that admits real cliffs.
+    //
+    // This is a BACKSTOP, not the fix for a divergence. It used to be the
+    // latter, and it did not work: an unbroken H = 0.5 continuation drove
+    // 31.6% of Earth's level-19 midpoints into the clamp, which does not
+    // remove a divergence -- it truncates one and leaves a constant 45 deg
+    // behind. `hillslope_break_m` is what bounds the slope now; with it in
+    // place the clamp engages on 0.23% of the surface and, decisively,
+    // that number stops growing as the LOD refines.
     //
     // The clamp is a pure function of the vertex (amplitude, relief, hash
     // and spacing all are), so it does not disturb the level-consistency
@@ -218,6 +328,23 @@ struct ElevationParams {
     // Deterministic seed folded into the vertex hash.
     std::uint32_t seed = 0x5eed1234u;
 };
+
+// The normalised structure function S(l): the RMS height difference the
+// continuation puts at lag `lag_m`, as a multiple of the relief measured at
+// the data floor `floor_m`. S(floor_m) == 1.0 exactly.
+//
+//     S(l) = (l/L)^H_fine * ((l + L_b) / (L + L_b))^(H_coarse - H_fine)
+//
+// A broken power law with a smooth crossover at L_b = `break_m`: exponent
+// H_coarse (fluvial) well above the break, H_fine (diffusive hillslope)
+// well below it, and exactly their mean at l = L_b. `break_m` <= 0 gives
+// the unbroken single power law. See this file's header comment for the
+// derivation and the citations.
+//
+// Exposed rather than kept private because it is the whole physics of the
+// continuation, and the terrain tests measure it directly.
+double RelativeStructureFunction(double lag_m, double floor_m, double break_m,
+                                 double h_coarse, double h_fine) noexcept;
 
 // The elevation field: DEM base plus the interpolatory fractal hierarchy.
 //
