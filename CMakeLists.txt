@@ -207,6 +207,23 @@ option(PT_PLANET_ENABLED
 include(cmake/CompilerWarnings.cmake)
 include(cmake/EmbedResource.cmake)
 
+# --- Drop MSVC's /RTC1 from Debug ------------------------------------------
+# The compute-bound terrain-field TUs are compiled at /O2 even in Debug (see
+# src/renderer/CMakeLists.txt) so pt_planet_terrain stays inside its CI time
+# budget. MSVC's default Debug flags carry /RTC1 (stack + uninitialised-use
+# runtime checks), and /RTC1 is a HARD error combined with /O2 (D8016), not a
+# warning -- so it has to go for those files to compile. There is no per-file
+# way to strip a flag that arrives from CMAKE_CXX_FLAGS_DEBUG, so drop it
+# project-wide: the Linux clang ASan/UBSan lane already exercises the same
+# class of bug (uninitialised reads, stack corruption) far more thoroughly
+# than /RTC1, so on Windows it is redundant rather than load-bearing. Debug
+# still builds unoptimised everywhere else (the /Od in pt_set_compiler_options
+# is untouched); only /RTC1 leaves.
+if(MSVC)
+    string(REGEX REPLACE "/RTC[1csu]+" "" CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
+    string(REGEX REPLACE "/RTC[1csu]+" "" CMAKE_C_FLAGS_DEBUG   "${CMAKE_C_FLAGS_DEBUG}")
+endif()
+
 # --- Vulkan (native Windows/Linux only) ------------------------------------
 if(PT_ENABLE_VULKAN_BACKEND)
     find_package(Vulkan REQUIRED)

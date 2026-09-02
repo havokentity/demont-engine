@@ -419,18 +419,24 @@ endif()
 # which is ~22 000 field evaluations per chunk; the default 60 s backstop is
 # tight for that on a loaded machine.
 #
-# TIMEOUT 600, measured rather than guessed. The suite is 700 306 assertions
-# and takes 157.9 s in a Debug build on an M4 Max; CI builds Debug on shared
-# runners and blew the previous 180 s limit on BOTH macos-26 and
-# windows-latest (180.05 s, i.e. it was still running). 600 s is ~3.8x the
-# measured local Debug time, leaving room for a runner around 2x slower
-# still.
+# TIMEOUT 600, measured rather than guessed, and now carrying deliberate
+# slack. History: the 700 306-assertion suite took 157.9 s at -O0 on an M4
+# Max, and 600 s (~3.8x) was meant to leave room for a ~2x-slower runner.
+# The shared macos-26 and windows-latest runners turned out to be ~3.7x
+# slower than that M4 Max, so at -O0 the test crept to ~585 s -- inside the
+# budget by a hair, and every planetary change tipped a lane over 600.
 #
-# The sweep is deliberately NOT trimmed to fit. CI builds only the Debug
-# presets, so a Debug-only reduction would mean the exhaustive half never
-# runs in CI at all -- a labelled test nobody executes is the same failure
-# this file warns about two comments up. A slow honest test beats a fast
-# vacuous one; if this ever needs to get faster, cut redundancy, not cases.
+# The fix was NOT to trim the sweep (CI builds only Debug, so a Debug-only
+# reduction would mean the exhaustive half never runs in CI at all -- a
+# labelled test nobody executes, the failure this file warns about two
+# comments up) and NOT to raise the timeout (which hides the next
+# regression). Instead the compute-bound field TUs -- CubedSphere,
+# ElevationField, TerrainChunk -- are compiled at -O2 even in Debug (see
+# src/renderer/CMakeLists.txt), which keeps every case and assertion and
+# removes only the -O0 penalty on the numeric grind. Measured after:
+# 19.8 s on the M4 Max, ~8x faster, projecting to well under 100 s on the
+# CI runners. 600 s now leaves real headroom rather than none; a slow
+# honest test stayed honest and got fast.
 set_tests_properties(pt_planet_terrain PROPERTIES TIMEOUT 600)
 
 # --- pt_planet_residency (paced terrain streaming) -------------------------
