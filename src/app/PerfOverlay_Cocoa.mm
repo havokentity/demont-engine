@@ -73,6 +73,10 @@ int LinesForLevel(int level) {
         case 1:  return 2;
         case 2:  return 8;
         case 3:  return 8;
+        // Tier 4 (#320): 2 tier-1 lines + a header row. The variable number
+        // of per-pass rows is added on top in -layoutToParent from the
+        // view's live pass count -- LinesForLevel can't see it.
+        case 4:  return 3;
         default: return 0;
     }
 }
@@ -86,6 +90,10 @@ int LinesForLevel(int level) {
 @property (assign) Theme theme;
 @property (assign) pt::app::PerfStats stats;
 @property (strong) NSMutableArray<NSNumber*>* history;
+// Tier-4 per-pass GPU timing rows, preformatted in -applyStats (the span
+// in `stats` points at engine-owned temporaries and must NOT be read from
+// the async -drawRect:). Count drives the panel height in -layoutToParent.
+@property (strong) NSMutableArray<NSString*>* passLines;
 // Weak back-reference so a scale change inside drawRect: can ping the
 // owning panel to recompute its frame (panel width / row count
 // derive from the scale, same as Win32 WinPerf::Reposition()).
@@ -137,6 +145,7 @@ int LinesForLevel(int level) {
     self.layer.cornerRadius = 6.0;
     self.layer.masksToBounds = YES;
     self.history = [NSMutableArray array];
+    self.passLines = [NSMutableArray array];
     self.theme = PaletteFor("hardcore");
     _scale = 1.0f;
     _font  = [NSFont monospacedSystemFontOfSize:kFontPt
@@ -188,6 +197,29 @@ int LinesForLevel(int level) {
     [self.history removeAllObjects];
     for (float v : s.frame_ms_history) {
         [self.history addObject:@(v)];
+    }
+    // Tier-4 per-pass GPU timing (#320): copy the breakdown into owned
+    // NSStrings HERE (synchronously) -- s.gpu_passes points at engine-owned
+    // temporaries that are gone by the time the async -drawRect: runs.
+    const NSUInteger prevCount = self.passLines.count;
+    [self.passLines removeAllObjects];
+    if (self.level >= 4) {
+        if (!s.gpu_timing_available) {
+            [self.passLines addObject:@"(gpu timing unavailable)"];
+        } else if (s.gpu_passes.empty()) {
+            [self.passLines addObject:@"(waiting for gpu timings)"];
+        } else {
+            for (const auto& p : s.gpu_passes) {
+                [self.passLines addObject:
+                    [NSString stringWithFormat:@"%-16s %6.2f",
+                     p.name ? p.name : "", p.ms]];
+            }
+        }
+    }
+    // The panel height derives from the pass count; if it changed, resize
+    // before this paint so rows aren't clipped or the panel over-tall.
+    if (self.level >= 4 && self.passLines.count != prevCount && self.panel != nil) {
+        [self.panel layoutToParent];
     }
     [self setNeedsDisplay:YES];
 }
@@ -242,6 +274,17 @@ int LinesForLevel(int level) {
                           s.frame_ms_avg, s.frame_ms_min, s.frame_ms_max];
     drawRow(t.accent, fps_line);
     drawRow(t.text,   ms_line);
+
+    // Tier 4 (#320): per-pass GPU-time breakdown. Focused -- it replaces
+    // the tier-2 detail block and tier-3 sparkline rather than stacking on
+    // top of them, so the whole panel is fps/ms + the pass list.
+    if (self.level >= 4) {
+        drawRow(t.accent, @"GPU pass          ms");
+        for (NSString* line in self.passLines) {
+            drawRow(t.text, line);
+        }
+        return;
+    }
 
     if (self.level >= 2) {
         double mem_mb = (double)s.gpu_bytes / (1024.0 * 1024.0);
@@ -373,11 +416,16 @@ int LinesForLevel(int level) {
     NSRect pf = parent.frame;
     int level = self.view.level;
     int lines = LinesForLevel(level);
+    // Tier 4 (#320): the per-pass rows are dynamic, so add the live count on
+    // top of LinesForLevel's fixed 3 (2 tier-1 lines + header).
+    if (level >= 4) lines += (int)self.view.passLines.count;
     const int line_h = [self.view scaledLineHeight];
     const int padY   = [self.view scaledPaddingY];
     const int panelW = [self.view scaledPanelW];
     CGFloat h = padY * 2 + lines * line_h;
-    if (level >= 3) h += [self.view scaledGraphH] + padY;
+    // The tier-3 sparkline is only drawn at level 3 (tier 4 replaces it with
+    // the pass list), so reserve its height only there.
+    if (level == 3) h += [self.view scaledGraphH] + padY;
     NSRect f = NSMakeRect(pf.origin.x + pf.size.width - panelW - kPanelMargin,
                           pf.origin.y + pf.size.height - h - kPanelMargin,
                           panelW, h);
@@ -388,7 +436,7 @@ int LinesForLevel(int level) {
 
 - (void)setOverlayTier:(int)tier {
     if (tier < 0) tier = 0;
-    if (tier > 3) tier = 3;
+    if (tier > 4) tier = 4;   // tier 4 = per-pass GPU timing (#320)
     self.view.level = tier;
     if (tier == 0) {
         [self orderOut:nil];

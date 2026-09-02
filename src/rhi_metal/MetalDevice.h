@@ -27,6 +27,8 @@ class Library;
 class Texture;
 class Buffer;
 class AccelerationStructure;
+class CounterSampleBuffer;   // #320 per-pass GPU timestamps
+class CounterSet;            // #320
 }
 namespace CA {
 class MetalLayer;
@@ -89,6 +91,10 @@ public:
     void ClearStorageTexture(TextureHandle, const float[4]) override {}
     void Barrier(const BarrierDesc&) override {}
 
+    // --- Per-pass GPU timestamps (#320) ----------------------------------
+    void BeginGpuPass(std::uint32_t slot) override;
+    void EndGpuPass() override;
+
     void Reset(MTL::CommandBuffer* cb);
     MTL::CommandBuffer* RawCmdBuf() const { return mtl_cb_; }
 
@@ -97,6 +103,15 @@ public:
     // to the same MTLCommandBuffer.
     void FlushEncoder();
 
+    // Per-pass GPU timestamps (#320): arm/disarm timestamp capture for the
+    // command buffer that was just Reset. `sb` is the device's counter
+    // sample buffer for the current frame (nullptr => timing off this
+    // frame); `capacity` is the pass count the sample buffer is sized for
+    // (2*capacity samples). Set by MetalDevice::AcquireCommandBuffer.
+    void SetTimingSampleBuffer(MTL::CounterSampleBuffer* sb, std::uint32_t capacity);
+    bool          TimingActive()   const { return timing_sb_ != nullptr; }
+    std::uint32_t TimedPassCount() const { return timed_pass_count_; }
+
 private:
     void EnsureEncoder();
     void EndEncoderIfActive();
@@ -104,6 +119,22 @@ private:
     MetalDevice*               device_      = nullptr;
     MTL::CommandBuffer*        mtl_cb_      = nullptr;
     MTL::ComputeCommandEncoder* encoder_    = nullptr;
+
+    // --- Per-pass GPU timestamps (#320) ----------------------------------
+    // Sentinel for "no timed pass pending" (a full uint32).
+    static constexpr std::uint32_t kNoTimedSlot = ~0u;
+    // Device's counter sample buffer for the current frame, or nullptr when
+    // timestamps are disabled. When non-null, BeginGpuPass opens a fresh
+    // encoder per pass that samples this buffer at its start/end boundary.
+    MTL::CounterSampleBuffer*  timing_sb_        = nullptr;
+    std::uint32_t              timing_capacity_  = 0;   // passes
+    // Slot the NEXT lazily-created encoder should sample into, or
+    // kNoTimedSlot. Deferred to the first Dispatch (EnsureEncoder) so a
+    // BeginGpuPass immediately followed by FlushEncoder records nothing.
+    std::uint32_t              pending_ts_slot_  = kNoTimedSlot;
+    // Highest (slot+1) opened this frame -- the pass count the device
+    // resolves. Reset each Reset().
+    std::uint32_t              timed_pass_count_ = 0;
 
     PipelineHandle             bound_pso_{0};
     // Texture slot map: 14 slots covering every kernel's max engine
@@ -316,6 +347,19 @@ public:
                          std::uint32_t* out_w, std::uint32_t* out_h) override;
     bool ReadbackBuffer (BufferHandle  h, void* dst, std::size_t bytes) override;
 
+    // ---- Per-pass GPU timestamps (#320) ---------------------------------
+    bool          SupportsGpuTimestamps() const override { return gpu_ts_supported_; }
+    double        GpuTimestampPeriodNs()  const override { return gpu_ts_ns_per_tick_; }
+    void          SetGpuTimestampsEnabled(bool on, std::uint32_t pass_capacity) override;
+    std::uint32_t ResolveGpuTimestamps(double* out_ms, std::uint32_t capacity,
+                                       std::uint64_t* out_frame_index) override;
+
+    // Counter sample buffer the current frame's timed encoders sample into,
+    // or nullptr when timestamps are disabled. Read by the command buffer in
+    // AcquireCommandBuffer. Frame slot = frame_index_ % kGpuTsRing.
+    MTL::CounterSampleBuffer* CurrentTimestampSampleBuffer() const;
+    std::uint32_t             GpuTimestampCapacity() const { return gpu_ts_capacity_; }
+
     // ---- Internal lookup ------------------------------------------------
     // Returns the pipeline plus its parsed binding indices, or nullptr if
     // the handle is unknown. Dispatch needs the indices, not just the PSO.
@@ -403,6 +447,37 @@ private:
     // (the frame is long finished); non-zero means the CPU outran the GPU
     // and was held, which is the case this ring exists to make safe.
     std::atomic<std::uint64_t> frame_gpu_stalls_{0};
+
+    // --- Per-pass GPU timestamps (#320) ----------------------------------
+    // Capability latched at construction: a timestamp counter set + support
+    // for stage-boundary counter sampling. Apple silicon supports ONLY
+    // MTLCounterSamplingPointAtStageBoundary (not dispatch/draw boundary),
+    // which is why each timed pass is its own encoder rather than a mid-
+    // encoder sampleCountersInBuffer call.
+    bool             gpu_ts_supported_   = false;
+    // Nanoseconds per GPU tick, from an MTLDevice sampleTimestamps
+    // correlation over a short interval. ~1.0 on Apple silicon (the GPU and
+    // CPU share one nanosecond clock, so a tick already IS a nanosecond),
+    // but derived rather than assumed so the conversion is defensible.
+    double           gpu_ts_ns_per_tick_ = 0.0;
+    bool             gpu_ts_enabled_     = false;
+    std::uint32_t    gpu_ts_capacity_    = 0;   // passes; 2*capacity samples
+    MTL::CounterSet* gpu_ts_counter_set_ = nullptr;  // retained
+
+    // Ring of counter sample buffers, one drawn per in-flight frame, sized
+    // one deeper than the frame-pacing ring so the frame being RESOLVED is
+    // never the frame currently being WRITTEN.
+    static constexpr int kGpuTsRing = pt::rhi::kMaxFramesInFlight + 1;   // 3
+    struct GpuTsFrame {
+        MTL::CounterSampleBuffer* sb          = nullptr;  // retained
+        MTL::CommandBuffer*       cb          = nullptr;  // retained; status() gates resolve
+        std::uint64_t             frame_index = 0;
+        std::uint32_t             pass_count  = 0;
+        bool                      valid       = false;
+    };
+    GpuTsFrame       gpu_ts_ring_[kGpuTsRing] {};
+    // Frees every retained sample buffer / command buffer in the ring.
+    void ReleaseGpuTsRing();
     // Built-in pipelines indexed by Slang kernel name.  P3+ shaders are
     // pre-compiled at device construction; CreateComputePipeline looks up
     // by name.

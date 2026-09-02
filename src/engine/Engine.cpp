@@ -307,8 +307,14 @@ namespace cvar {
     PT_CVAR(r_perf_overlay,    "0",
             "Tiered in-game performance overlay. 0 = off, 1 = fps + frame_ms, "
             "2 = + backend / resolution / GPU memory / spp / bounces / primitives, "
-            "3 = + frame-time sparkline. (Tier 4 reserved for per-pass GPU "
-            "timestamps once VkQueryPool / MTLCounterSampleBuffer is wired.)",
+            "3 = + frame-time sparkline, 4 = + per-pass GPU timing (#320). Tier 4 "
+            "turns on GPU timestamp queries (MTLCounterSampleBuffer on Metal, "
+            "VK_QUERY_TYPE_TIMESTAMP on Vulkan) and lists the real GPU time of "
+            "each render pass -- PathTrace, the sky/cloud march, the composites, "
+            "tonemap. The queries have a real cost (each timed pass is its own "
+            "encoder on Metal), so it is off by default and zero-overhead below "
+            "tier 4. Degrades to '(gpu timing unavailable)' on a backend/queue "
+            "that cannot timestamp rather than printing a wrong number.",
             CVAR_ARCHIVE);
     PT_CVAR(r_perf_overlay_scale, "1.0",
             "Perf overlay scale. 1.0 = baseline (13 logical-unit "
@@ -7649,6 +7655,40 @@ void Engine::UpdateWorldFrame() {
     // --- end conversion boundary preamble -----------------------------------
 }
 
+// --- Per-pass GPU timestamps (#320) --------------------------------------
+
+void Engine::GpuPassMark(pt::rhi::CommandBuffer* cb, const char* name) {
+    if (!gpu_timing_active_ || cb == nullptr || gpu_pass_labels_cur_ == nullptr) return;
+    if (gpu_pass_next_slot_ >= kGpuTimingPassCap) return;   // pool is sized for cap
+    gpu_pass_labels_cur_->emplace_back(name);
+    cb->BeginGpuPass(gpu_pass_next_slot_);
+    ++gpu_pass_next_slot_;
+}
+
+void Engine::ResolveGpuPassTimings() {
+    if (!gpu_timing_active_ || device_ == nullptr) {
+        gpu_pass_timings_.clear();
+        return;
+    }
+    double ms[kGpuTimingPassCap] = {};
+    std::uint64_t resolved_frame = 0;
+    const std::uint32_t n =
+        device_->ResolveGpuTimestamps(ms, kGpuTimingPassCap, &resolved_frame);
+    if (n == 0) return;   // nothing completed yet -- keep the last breakdown
+
+    const auto& labels = gpu_pass_label_ring_[resolved_frame % kGpuTimingLabelRing];
+    gpu_pass_timings_.clear();
+    gpu_pass_timings_.reserve(n);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        // The label ring is deeper than the resolve lag, so labels[i] is the
+        // name THIS resolved frame recorded for slot i. Guard anyway: a
+        // pass-set change between record and resolve falls back to a slot id.
+        std::string name = (i < labels.size()) ? labels[i]
+                                                : ("pass" + std::to_string(i));
+        gpu_pass_timings_.emplace_back(std::move(name), ms[i]);
+    }
+}
+
 void Engine::RenderFrame() {
     PT_ZONE_SCOPED_N("Engine::RenderFrame");
     // The render frame is refreshed FIRST, before EnsureMeshUpdated and
@@ -7716,6 +7756,25 @@ void Engine::RenderFrame() {
     if (loading_frame_active_) {
         LOG_INFO("engine: pipelines ready, normal rendering resumed");
         loading_frame_active_ = false;
+    }
+
+    // --- Per-pass GPU timestamps (#320) -----------------------------------
+    // The instrument is live this frame iff the perf overlay is at tier 4
+    // AND the active backend/queue can actually timestamp. SetGpuTimestamps
+    // Enabled early-outs on both backends when off-and-already-off (and on
+    // the on-state/capacity edge otherwise), so calling it every frame only
+    // does work on the toggle edge -- crucially it must NOT re-tear-down each
+    // frame at the default tier, which on Vulkan would be a per-frame
+    // vkDeviceWaitIdle. `want` folds in SupportsGpuTimestamps() so an
+    // unsupported device stays permanently off.
+    {
+        int overlay_level = 0;
+        if (auto* lv = pt::console::Console::Get().FindCVar("r_perf_overlay")) {
+            overlay_level = lv->GetInt();
+        }
+        const bool want = overlay_level >= 4 && device_->SupportsGpuTimestamps();
+        device_->SetGpuTimestampsEnabled(want, kGpuTimingPassCap);
+        gpu_timing_active_ = want;
     }
 
     // EnsureMeshUpdated() now runs earlier (above the loading-screen check)
@@ -8515,6 +8574,19 @@ void Engine::RenderFrame() {
     // GPU timeline. Elided entirely (one bool test) unless
     // StepOceanCascades armed it this frame.
     DispatchOceanCascades(cb);
+    // --- Per-pass GPU timestamps (#320): start this frame's label list -----
+    // Ring-keyed by device frame index so the (lagged) resolve pairs each
+    // pass duration with the label recorded for THAT frame. The ocean
+    // cascade pre-pass above is deliberately left untimed -- it runs before
+    // the first mark, so it shows up as the gap between the pass sum and the
+    // CPU frame time rather than mislabelled onto PathTrace.
+    gpu_pass_labels_cur_ = nullptr;
+    gpu_pass_next_slot_  = 0;
+    if (gpu_timing_active_) {
+        gpu_pass_labels_cur_ = &gpu_pass_label_ring_[fc.frame_index % kGpuTimingLabelRing];
+        gpu_pass_labels_cur_->clear();
+    }
+    GpuPassMark(cb, "PathTrace");
     cb->BindComputePipeline(pt::rhi::PipelineHandle{pathtrace_pipeline_id_});
     cb->BindStorageTexture(0, fc.swapchain_image);
     cb->BindStorageTexture(1, pt::rhi::TextureHandle{accum_texture_id_});
@@ -12204,6 +12276,7 @@ void Engine::RenderFrame() {
         cloud_trans_tex_id_ != 0 &&
         denoiser_active_;
     if (raymarched_clouds_dispatch) {
+        GpuPassMark(cb, "CloudsRaymarch");
         // RAW barrier: PathTrace.slang wrote (or skipped) cloud_trans_tex;
         // we're about to overwrite it.
         cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
@@ -12461,6 +12534,7 @@ void Engine::RenderFrame() {
 
         // --- RestirTemporal -------------------------------------------------
         if (restir_temporal_pipeline_id_ != 0) {
+            GpuPassMark(cb, "RestirTemporal");
             cb->BindComputePipeline(
                 pt::rhi::PipelineHandle{restir_temporal_pipeline_id_});
             // Texture slot 0: depth_tex (camera-space Z).
@@ -12579,6 +12653,7 @@ void Engine::RenderFrame() {
 
         // --- RestirSpatial --------------------------------------------------
         if (restir_spatial_pipeline_id_ != 0) {
+            GpuPassMark(cb, "RestirSpatial");
             cb->BindComputePipeline(
                 pt::rhi::PipelineHandle{restir_spatial_pipeline_id_});
             cb->BindStorageTexture(0, pt::rhi::TextureHandle{depth_tex_id_});
@@ -12633,6 +12708,7 @@ void Engine::RenderFrame() {
 
         // --- RestirFinal ----------------------------------------------------
         if (restir_final_pipeline_id_ != 0 && albedo_tex_id_ != 0) {
+            GpuPassMark(cb, "RestirFinal");
             cb->BindComputePipeline(
                 pt::rhi::PipelineHandle{restir_final_pipeline_id_});
             cb->BindStorageTexture(0, pt::rhi::TextureHandle{depth_tex_id_});
@@ -12711,6 +12787,7 @@ void Engine::RenderFrame() {
     // forced a vkQueueWaitIdle and tanked fps to ~18.
     if (auto_exp && autoexpose_pipeline_id_ != 0 && exposure_state_id_ != 0
         && accum_texture_id_ != 0) {
+        GpuPassMark(cb, "AutoExpose");
         struct AePush {
             std::uint32_t width;
             std::uint32_t height;
@@ -13024,6 +13101,11 @@ void Engine::RenderFrame() {
         // upsample-add.
         auto dispatch_bloom_pyramid = [&](std::uint64_t source_tex_id) {
             PT_ZONE_SCOPED_N("Engine::dispatch_bloom_pyramid");
+            // One GPU-timed region for the whole pyramid (#320): the down /
+            // up loops re-bind the same two pipelines per mip, so a mark
+            // per BindComputePipeline would fragment bloom into a dozen
+            // slots. This keeps it a single "Bloom" line.
+            GpuPassMark(cb, "Bloom");
             // Downsample: source_tex -> mip0 (with threshold), then
             // mip0 -> mip1 -> ... -> mip[N-1]. Each step's read of
             // mip[i-1] is the previous step's write -- explicit
@@ -13256,6 +13338,7 @@ void Engine::RenderFrame() {
                 composite_star_map_id == 0) {
                 return;
             }
+            GpuPassMark(cb, "StarsComposite");
             cb->BindComputePipeline(pt::rhi::PipelineHandle{stars_composite_pipeline_id_});
             cb->BindStorageTexture(0, pt::rhi::TextureHandle{target_tex_id});
             cb->BindStorageTexture(1, pt::rhi::TextureHandle{composite_star_map_id});
@@ -13523,6 +13606,7 @@ void Engine::RenderFrame() {
             sigma_shadow_pipeline_id_ != 0 &&
             shadow_vis_buf_id_ != 0 &&
             depth_tex_id_ != 0) {
+            GpuPassMark(cb, "SigmaShadow");
             cb->BindComputePipeline(pt::rhi::PipelineHandle{sigma_shadow_pipeline_id_});
             // SigmaShadow texture bindings in declaration order:
             //   slot 0 hdr_inout       -- post-radiance-denoise HDR
@@ -13624,6 +13708,7 @@ void Engine::RenderFrame() {
                      height_fog_pipeline_id_ != 0 &&
                      depth_tex_id_ != 0;
         if (fog_active) {
+            GpuPassMark(cb, "HeightFog");
             cb->BindComputePipeline(pt::rhi::PipelineHandle{height_fog_pipeline_id_});
             // HeightFog texture bindings in declaration order:
             //   slot 0 hdr_inout  -- post-radiance-denoise HDR (RW blend)
@@ -13745,6 +13830,7 @@ void Engine::RenderFrame() {
         if (raymarched_clouds_dispatch &&
             clouds_composite_pipeline_id_ != 0 &&
             depth_tex_id_ != 0) {
+            GpuPassMark(cb, "CloudsComposite");
             cb->BindComputePipeline(pt::rhi::PipelineHandle{clouds_composite_pipeline_id_});
             cb->BindStorageTexture(0, pt::rhi::TextureHandle{tonemap_hdr_source_id});
             // clouds_color_active_ was swapped after the pre-pass
@@ -13805,6 +13891,7 @@ void Engine::RenderFrame() {
                 cloud_trans_tex_id_ != 0;
         }
         if (aurora_active) {
+            GpuPassMark(cb, "Aurora");
             cb->BindComputePipeline(pt::rhi::PipelineHandle{aurora_composite_pipeline_id_});
             cb->BindStorageTexture(0, pt::rhi::TextureHandle{tonemap_hdr_source_id});
             // depth_tex at engine slot 1 -> Metal MSL texture(1) by
@@ -14012,6 +14099,7 @@ void Engine::RenderFrame() {
                                      packed,
                                      sizeof(GpuParticle) * pcount, 0);
 
+                GpuPassMark(cb, "ParticleComposite");
                 cb->BindComputePipeline(pt::rhi::PipelineHandle{particle_composite_pipeline_id_});
                 cb->BindStorageTexture(0, pt::rhi::TextureHandle{tonemap_hdr_source_id});
                 cb->BindStorageTexture(1, pt::rhi::TextureHandle{depth_tex_id_});
@@ -14180,6 +14268,7 @@ void Engine::RenderFrame() {
             // slot-18 bind. BindComputePipeline clears prior bindings, so
             // each dispatch re-binds; max_bound_buf_slot = -1 puts the
             // push at MSL buf(0).
+            GpuPassMark(cb, "GodRays");
             cb->BindComputePipeline(pt::rhi::PipelineHandle{godrays_pipeline_id_});
             cb->BindStorageTexture(0, pt::rhi::TextureHandle{tonemap_hdr_source_id});
             cb->BindStorageTexture(1, pt::rhi::TextureHandle{godrays_mask_tex_id_});
@@ -14213,6 +14302,7 @@ void Engine::RenderFrame() {
         // Post-denoise tonemap: linear HDR -> exposure -> ACES -> sRGB
         // swapchain (gamma encode is implicit on store of the BGRA8_sRGB
         // surface).
+        GpuPassMark(cb, "Tonemap");
         cb->BindComputePipeline(pt::rhi::PipelineHandle{tonemap_pipeline_id_});
         cb->BindStorageTexture(0, pt::rhi::TextureHandle{tonemap_hdr_source_id});
         cb->BindStorageTexture(1, fc.swapchain_image);
@@ -14511,6 +14601,7 @@ void Engine::RenderFrame() {
         // writes it.
         cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
                      pt::rhi::BarrierDesc::Stage::ComputeWrite});
+        GpuPassMark(cb, "EditorOverlay");
         cb->BindComputePipeline(pt::rhi::PipelineHandle{editor_overlay_pipeline_id_});
         cb->BindStorageTexture(0, fc.swapchain_image);
         cb->BindBuffer(1, pt::rhi::BufferHandle{editor_overlay_segs_buf_id_}, 0);
@@ -14719,6 +14810,7 @@ void Engine::RenderFrame() {
             static_assert(sizeof(PerfPush) % 16 == 0,
                           "PerfPush must be 16-byte aligned (cbuffer rule)");
 
+            GpuPassMark(cb, "PerfOverlay");
             cb->BindComputePipeline(pt::rhi::PipelineHandle{perfoverlay_pipeline_id_});
             cb->BindStorageTexture(0, fc.swapchain_image);
             // Engine buffer slot 1 -> kSlotToBufBinding[1] = vk::binding(3)
@@ -14736,6 +14828,10 @@ void Engine::RenderFrame() {
         }
     }
 
+    // Per-pass GPU timestamps (#320): close the last timed pass so its end
+    // boundary is sampled before the command buffer is committed.
+    if (gpu_timing_active_ && cb) cb->EndGpuPass();
+
     {
         PT_ZONE_SCOPED_N("Device::Submit");
         device_->Submit(cb);
@@ -14744,6 +14840,10 @@ void Engine::RenderFrame() {
         PT_ZONE_SCOPED_N("Device::EndFrame (present)");
         device_->EndFrame(cb);
     }
+
+    // Per-pass GPU timestamps (#320): pull the newest completed frame's
+    // per-pass GPU times into gpu_pass_timings_ for the overlay + JSON.
+    ResolveGpuPassTimings();
 
     // Post-present frame-capture hook. Driven by r_capture_frame_at /
     // r_capture_seq / r_capture_seed -- the cvars' on_change handlers
@@ -15744,10 +15844,25 @@ void Engine::Tick(double dt) {
         int h = window_ ? window_->Height() : 0;
 
         if (server_) {
+            // Per-pass GPU timing (#320): append a "gpu_passes" object with
+            // {name: ms} for each timed render pass, present only when the
+            // tier-4 instrument produced a breakdown this window. Names are
+            // fixed identifiers (no escaping needed).
+            std::string gpu_passes_json;
+            if (!gpu_pass_timings_.empty()) {
+                gpu_passes_json = R"(,"gpu_passes":{)";
+                bool first = true;
+                for (const auto& [name, ms] : gpu_pass_timings_) {
+                    gpu_passes_json += fmt::format("{}\"{}\":{:.3f}",
+                                                   first ? "" : ",", name, ms);
+                    first = false;
+                }
+                gpu_passes_json += "}";
+            }
             auto data = fmt::format(
-                R"({{"fps":{:.1f},"frame_ms":{:.3f},"trace_ms":{:.3f},"backend":"{}","resolution":[{},{}]}})",
+                R"({{"fps":{:.1f},"frame_ms":{:.3f},"trace_ms":{:.3f},"backend":"{}","resolution":[{},{}]{}}})",
                 fps, avg_render, avg_render,
-                pt::rhi::BackendName(current_backend_), w, h);
+                pt::rhi::BackendName(current_backend_), w, h, gpu_passes_json);
             server_->BroadcastEvent("frame_stats", data);
         }
 
@@ -15772,7 +15887,42 @@ void Engine::Tick(double dt) {
             if (auto* mv = Cn.FindCVar("r_max_bounces")) st.max_bounces = mv->GetInt();
             st.primitives   = primitives_.size();
             st.frame_ms_history = std::span<const float>(linear.data(), linear.size());
+            // Per-pass GPU timing (#320): hand the overlay the current
+            // breakdown. The PassTiming names point into gpu_pass_timings_
+            // (a member, stable across this Update call); the overlay copies
+            // what it renders synchronously.
+            std::vector<pt::app::PerfStats::PassTiming> pass_view;
+            pass_view.reserve(gpu_pass_timings_.size());
+            for (const auto& [name, ms] : gpu_pass_timings_) {
+                pass_view.push_back({name.c_str(), ms});
+            }
+            st.gpu_passes = std::span<const pt::app::PerfStats::PassTiming>(
+                pass_view.data(), pass_view.size());
+            st.gpu_timing_available = device_ && device_->SupportsGpuTimestamps();
             perf_overlay_->Update(st);
+        }
+
+        // Per-pass GPU timing (#320): a once-a-second log of the breakdown
+        // when the tier-4 instrument is live. This is the headless-profiling
+        // readout -- a smoke/orbit capture has no visible overlay, and the
+        // whole point of the tier is to say where a frame's GPU time goes.
+        // Throttled to ~1 Hz so a 240-fps session doesn't flood the log.
+        if (gpu_timing_active_ && !gpu_pass_timings_.empty()) {
+            static double ts_log_accum = 0.0;
+            ts_log_accum += 0.1;   // this block runs at the 10 Hz cadence
+            if (ts_log_accum >= 1.0) {
+                ts_log_accum = 0.0;
+                std::string line;
+                double sum = 0.0;
+                for (const auto& [name, ms] : gpu_pass_timings_) {
+                    line += fmt::format("{} {:.3f}ms  ", name, ms);
+                    sum  += ms;
+                }
+                LOG_INFO("gpu-pass timing [{}] frame {:.2f}ms | passes sum "
+                         "{:.3f}ms | {}",
+                         pt::rhi::BackendName(current_backend_),
+                         avg_render, sum, line);
+            }
         }
 
         accum_s         = 0.0;
@@ -17663,7 +17813,7 @@ void Engine::RegisterCommands() {
 
     // r_perf_overlay: validate + push level changes to the overlay.
     if (auto* v = C.FindCVar("r_perf_overlay")) {
-        v->allowed_values = {"0", "1", "2", "3"};
+        v->allowed_values = {"0", "1", "2", "3", "4"};
         v->on_change = [this](const pt::console::CVar& cv) {
             if (perf_overlay_) {
                 int lv = std::atoi(cv.value.c_str());

@@ -63,6 +63,9 @@ int LinesForLevel(int level) {
         case 1:  return 2;     // FPS, frame_ms
         case 2:  return 8;     // + backend, res, mem, spp, bounces, prims, gpu name
         case 3:  return 8;     // same text rows + graph
+        // Tier 4 (#320): 2 tier-1 lines + header. Per-pass rows added on top
+        // in CurrentPanelHeight from the live pass count.
+        case 4:  return 3;
         default: return 0;
     }
 }
@@ -120,9 +123,13 @@ private:
     int   panel_w_     = kPanelW;
     int   graph_h_     = kGraphH;
 
-    std::mutex     stats_mutex_;
+    mutable std::mutex stats_mutex_;       // locked from const CurrentPanelHeight
     PerfStats      stats_;                 // history span owned by caller
     std::vector<float> history_copy_;      // own-it copy for safe paint
+    // Tier-4 per-pass GPU timing rows (#320), preformatted under the lock in
+    // Update -- stats_.gpu_passes points at engine temporaries. UNVERIFIED at
+    // runtime: no Windows host in this workstream (mirrors the Cocoa impl).
+    std::vector<std::string> pass_lines_;
 };
 
 LRESULT CALLBACK WinPerf::WndProcThunk(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -319,8 +326,14 @@ void WinPerf::EnsureScale() {
 int WinPerf::CurrentPanelHeight() const {
     int level = level_.load(std::memory_order_relaxed);
     int lines = LinesForLevel(level);
+    // Tier 4 (#320): add the live per-pass row count on top of the fixed 3.
+    if (level >= 4) {
+        std::lock_guard lk(stats_mutex_);
+        lines += (int)pass_lines_.size();
+    }
     int h = kPaddingY * 2 + lines * line_height_;
-    if (level >= 3) h += graph_h_ + kPaddingY;
+    // The sparkline is drawn only at level 3 (tier 4 replaces it).
+    if (level == 3) h += graph_h_ + kPaddingY;
     return h;
 }
 
@@ -346,7 +359,7 @@ void WinPerf::UpdateVisibility() {
 
 void WinPerf::SetLevel(int level) {
     if (level < 0) level = 0;
-    if (level > 3) level = 3;
+    if (level > 4) level = 4;   // tier 4 = per-pass GPU timing (#320)
     level_.store(level, std::memory_order_relaxed);
     UpdateVisibility();
 }
@@ -360,6 +373,21 @@ void WinPerf::Update(const PerfStats& stats) {
         // without racing the engine's ring buffer.
         history_copy_.assign(stats.frame_ms_history.begin(),
                              stats.frame_ms_history.end());
+        // Tier-4 per-pass GPU timing (#320): copy the breakdown into owned
+        // strings now -- stats.gpu_passes points at engine temporaries.
+        pass_lines_.clear();
+        if (Level() >= 4) {
+            if (!stats.gpu_timing_available) {
+                pass_lines_.emplace_back("(gpu timing unavailable)");
+            } else if (stats.gpu_passes.empty()) {
+                pass_lines_.emplace_back("(waiting for gpu timings)");
+            } else {
+                for (const auto& p : stats.gpu_passes) {
+                    pass_lines_.push_back(fmt::format("{:<16} {:>6.2f}",
+                                          p.name ? p.name : "", p.ms));
+                }
+            }
+        }
     }
     // Aggressive repaint pump.  Layered children over a Vulkan
     // swapchain don't reliably pick up sibling z-order shuffles or
@@ -372,6 +400,9 @@ void WinPerf::Update(const PerfStats& stats) {
     //   3. RedrawWindow(... RDW_INVALIDATE | RDW_UPDATENOW):
     //      schedule WM_PAINT *and* synchronously dispatch it now so
     //      DWM has fresh pixels in the layered surface.
+    // Tier 4 (#320): the panel height tracks the per-pass row count, so
+    // resize before the repaint when that count can change.
+    if (Level() >= 4) Reposition();
     ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
     SetWindowPos(hwnd_, HWND_TOP, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -437,10 +468,12 @@ void WinPerf::Paint(HDC dc) {
     // Snapshot stats under the lock.
     PerfStats s;
     std::vector<float> hist;
+    std::vector<std::string> passc;
     {
         std::lock_guard lk(stats_mutex_);
-        s    = stats_;
-        hist = history_copy_;
+        s     = stats_;
+        hist  = history_copy_;
+        passc = pass_lines_;      // tier-4 per-pass GPU timing (#320)
     }
 
     int y = kPaddingY;
@@ -465,6 +498,18 @@ void WinPerf::Paint(HDC dc) {
     }
 
     int level = Level();
+    // Tier 4 (#320): per-pass GPU-time breakdown. Focused -- replaces the
+    // tier-2 detail block and tier-3 sparkline rather than stacking them.
+    if (level >= 4) {
+        draw_row(theme_.accent, "GPU pass          ms");
+        for (const auto& line : passc) draw_row(theme_.text, line);
+        SelectObject(mdc, old_font);
+        BitBlt(dc, 0, 0, W, H, mdc, 0, 0, SRCCOPY);
+        SelectObject(mdc, old_bmp);
+        DeleteObject(bmp);
+        DeleteDC(mdc);
+        return;
+    }
     if (level >= 2) {
         std::string be   = fmt::format("backend     {}",      s.backend ? s.backend : "");
         std::string res  = fmt::format("resolution  {}x{}",   s.width, s.height);

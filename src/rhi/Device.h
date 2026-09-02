@@ -517,6 +517,58 @@ public:
     //     "Metal-only today, Vulkan follow-up" pattern Engine uses
     //     for stars_composite / sigma_shadow / restir_*.
     virtual void EnsurePipelineWarmed(const char* /*kernel_name*/) {}
+
+    // --- Per-pass GPU timestamps (#320) -----------------------------------
+    //
+    // A cheap, toggleable instrument that answers "where does the frame go?"
+    // with real GPU time per render pass rather than a single trace_ms. The
+    // engine gates it on the perf-overlay cvar (tier 4) and drives it with
+    // CommandBuffer::BeginGpuPass / EndGpuPass around each pass; the device
+    // owns the backend query objects and the tick->millisecond conversion.
+    //
+    // Honesty contract: a backend/queue that cannot produce trustworthy
+    // timestamps reports SupportsGpuTimestamps() == false and never fills a
+    // number in. A timestamp is only meaningful with correct period scaling
+    // (Vulkan: VkPhysicalDeviceLimits::timestampPeriod, masked to
+    // timestampValidBits; Metal: an MTLDevice sampleTimestamps correlation),
+    // so a device that can't establish that scale degrades to "unavailable"
+    // rather than printing ticks as if they were milliseconds.
+
+    // True iff this backend + its render queue can timestamp GPU work.
+    virtual bool SupportsGpuTimestamps() const { return false; }
+
+    // Nanoseconds represented by one native GPU timestamp tick, for
+    // reporting / diagnostics only (the resolve path already returns
+    // milliseconds). 0.0 when unsupported.
+    virtual double GpuTimestampPeriodNs() const { return 0.0; }
+
+    // Enable or disable per-pass timestamp capture for subsequent frames.
+    // `pass_capacity` is the maximum number of passes the engine will time
+    // in one frame; the backend sizes its query pool / counter sample
+    // buffers for 2 * pass_capacity samples. Cheap no-op when the requested
+    // (on, capacity) already matches the current state. Turning it off frees
+    // the backend query objects so the instrument is zero-overhead when off.
+    virtual void SetGpuTimestampsEnabled(bool /*on*/, std::uint32_t /*pass_capacity*/) {}
+
+    // Resolve the most-recently-completed frame's per-pass timings.
+    //   out_ms          -- receives up to `capacity` pass durations in
+    //                      MILLISECONDS; out_ms[slot] is the GPU time of the
+    //                      pass the engine assigned to that slot. Untimed /
+    //                      unopened slots are left at 0.
+    //   capacity        -- length of out_ms (the engine's pass_capacity).
+    //   out_frame_index -- if non-null, receives the frame index the timings
+    //                      belong to (resolve lags the live frame by up to
+    //                      kMaxFramesInFlight), so the caller can line the
+    //                      durations up with the pass labels it recorded for
+    //                      that frame.
+    // Returns the number of slots that carried a valid, non-negative timing
+    // (i.e. how many passes that frame actually recorded), or 0 when no
+    // completed frame's timings are ready or the instrument is disabled.
+    virtual std::uint32_t ResolveGpuTimestamps(double* /*out_ms*/,
+                                               std::uint32_t /*capacity*/,
+                                               std::uint64_t* /*out_frame_index*/ = nullptr) {
+        return 0;
+    }
 };
 
 }  // namespace pt::rhi
