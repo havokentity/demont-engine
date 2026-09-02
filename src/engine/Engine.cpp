@@ -2108,10 +2108,22 @@ namespace cvar {
             "further away than geometry means anything at all. Lower it to "
             "cap memory and bake cost on a slower machine.", CVAR_ARCHIVE);
     PT_CVAR(r_planet_chunk_budget,   "1024",
-            "Resident terrain chunk cap. Each chunk is 4 225 vertices: "
-            "67.6 KB of shader-visible vertex data plus its BLAS, so "
-            "~100-170 KB resident. At 1024 that is ~170 MB, unremarkable on "
-            "unified memory. The cap is SOFT at the boundary: over budget "
+            "Terrain LEAF cap: the size of the frontier the selector may "
+            "ask for. The ARENA is larger, and by an exact amount rather "
+            "than a margin -- residency is the whole cut (#319), and a "
+            "quadtree cut with L leaves has exactly (L - 6) / 3 interior "
+            "nodes, so the arena is L + (L - 6) / 3 slots: 1363 at the "
+            "default 1024. Those ancestors are kept resident and "
+            "UNPUBLISHED so that zooming out has something one level "
+            "coarser to draw instead of a hole while the coarse chunk "
+            "bakes; sizing the arena for them rather than lowering this cap "
+            "is what keeps the converged desired set -- and every planet "
+            "golden -- exactly where it was.\n"
+            "Each chunk is 4 225 vertices: 67.6 KB of shader-visible vertex "
+            "data plus its BLAS, so ~100-170 KB resident. At 1024 leaves "
+            "the arena is 1363 chunks, ~135-230 MB, unremarkable on unified "
+            "memory.\n"
+            "The cap is SOFT at the boundary: over budget "
             "the selector raises tau by bisection until the balanced set "
             "fits, which is the same rule everywhere and therefore stays "
             "balanced -- merging the lowest-priority sibling groups instead "
@@ -2127,10 +2139,15 @@ namespace cvar {
             "runs pick is the same tau, which is what a golden needs. It is "
             "still not the tau a fully-informed bisection would pick, and "
             "that remains worth closing if a fixture ever needs to sit on "
-            "the cap. None currently does: r_planet_chunk_budget 2048 "
-            "against measured sets of 1 128, 1 806 and 1 008, and "
-            "EnforceBudget was instrumented and observed never to run on any "
-            "of the three.",
+            "the cap. No golden fixture currently does: "
+            "r_planet_chunk_budget 2048 against measured leaf sets of 645, "
+            "1 419 and 468 (the post-#304 figures; the 1 128 / 1 806 / "
+            "1 008 recorded here before were P4's), and EnforceBudget was "
+            "instrumented and observed never to run on any of the three. "
+            "pt_planet_residency's teleport case does sit on the cap, "
+            "deliberately -- it is the only way left to squeeze the arena "
+            "now that the arena carries the ancestor allowance, and it "
+            "asserts invariants rather than which set the selector picked.",
             CVAR_ARCHIVE);
     PT_CVAR(r_planet_blas_budget_ms, "2.0",
             "Per-frame wall-clock budget for terrain acceleration-structure "
@@ -3472,16 +3489,17 @@ void Engine::Shutdown() {
         // fallback counters are the times the streamer chose a hole over a
         // crack or over an overrun, and a session that reports many of
         // either is a session whose budget is too tight for its camera.
-        LOG_INFO("planet: residency -- peak {} of {} chunks resident, "
+        LOG_INFO("planet: residency -- peak {} of {} arena slots resident "
+                 "({} leaves + {} retained ancestors), "
                  "{} stand-ins released under arena pressure, "
+                 "{} retained ancestors released, "
                  "{} refused to avoid a two-level step",
                  planet_terrain_->Stats().resident_peak,
-                 // TlasCapacity() is the arena plus the reserved mesh slot;
-                 // the arena itself is what the peak has to fit inside. The
-                 // block is only reached with an initialised streamer, where
-                 // the capacity is chunk_budget_ + 1 and at least 9.
-                 planet_terrain_->TlasCapacity() - 1u,
+                 planet_terrain_->ArenaSlots(),
+                 planet_terrain_->LeafBudget(),
+                 planet_terrain_->ArenaSlots() - planet_terrain_->LeafBudget(),
                  planet_terrain_->Stats().holds_dropped,
+                 planet_terrain_->Stats().retained_dropped,
                  planet_terrain_->Stats().holds_refused);
         planet_terrain_->Shutdown();
         planet_terrain_.reset();
@@ -7020,8 +7038,13 @@ void Engine::UpdatePlanetTerrain() {
         const auto& s = planet_terrain_->Site();
         if (std::abs(s.lat_rad - cfg.site_lat_rad) > 1e-12 ||
             std::abs(s.lon_rad - cfg.site_lon_rad) > 1e-12) restart = true;
-        if (planet_terrain_->TlasCapacity() !=
-            static_cast<std::uint32_t>(std::clamp(cfg.lod.chunk_budget, 6, 8192)) + 1u) {
+        // r_planet_chunk_budget is the LEAF cap; the arena that follows
+        // from it is WholeCutSlots of that, because residency is the whole
+        // cut and not its frontier (#319). Comparing the cvar against the
+        // TLAS capacity directly would report a mismatch on every frame and
+        // restart the streamer forever.
+        if (planet_terrain_->LeafBudget() !=
+            static_cast<std::uint32_t>(std::clamp(cfg.lod.chunk_budget, 8, 8192))) {
             restart = true;
         }
         if (std::abs(planet_terrain_->Field().Params().hurst - cfg.field.hurst) > 1e-12 ||

@@ -1428,6 +1428,95 @@ TEST_CASE("a merge holds the children until the parent is resident") {
     CHECK(CoversAll(cover.published, after));
 }
 
+// --- #319: the whole cut, and what it costs ------------------------------
+TEST_CASE("the interior of a cut is exactly (L - 6) / 3 nodes") {
+    // The arena is sized from this identity rather than from a margin, so
+    // it is worth stating as an arithmetic fact and then checking against a
+    // set the SELECTOR actually produced -- the identity holds for a proper
+    // quadtree cut and says nothing about an arbitrary key set, and
+    // "TerrainQuadtree::BuildSet produces a proper cut" is the part that
+    // could regress.
+    //
+    // Six cube-face roots, every interior node with exactly four children:
+    // a forest of I interior nodes has 6 + 4I nodes in all, of which
+    // L = 6 + 4I - I = 6 + 3I are leaves. So I = (L - 6) / 3, exactly.
+    for (int level = 0; level <= 4; ++level) {
+        const std::set<ChunkKey> leaves = UniformLeaves(level);
+        const std::set<ChunkKey> anc = CutAncestors(leaves);
+        CHECK(anc.size() == (leaves.size() - 6) / 3);
+        // Ancestors are interior nodes: never leaves themselves, so the
+        // reserve never competes with the frontier for the same key.
+        for (const ChunkKey& a : anc) CHECK(leaves.find(a) == leaves.end());
+        // And the set is closed upward, which is what makes it a COVER of
+        // every intermediate level a merge can ask for rather than a
+        // sample of them.
+        for (const ChunkKey& a : anc) {
+            if (a.level == 0) continue;
+            CHECK(anc.find(a.Parent()) != anc.end());
+        }
+    }
+
+    // A ragged cut, so the identity is not just a statement about uniform
+    // grids: two chunks split, on different faces and at different levels.
+    const ChunkKey a{0, 1, 0, 0};
+    const ChunkKey b{3, 2, 3, 3};
+    const std::set<ChunkKey> ragged =
+        SplitOne(SplitOne(SplitOne(UniformLeaves(1), a), ChunkKey{3, 1, 1, 1}), b);
+    CHECK(CutAncestors(ragged).size() == (ragged.size() - 6) / 3);
+
+    // The selector's own answer, converged. This is the one that matters:
+    // it is the set PlanetTerrain derives `retained_` from every frame.
+    ElevationField field = MakeProceduralField(1500.0, 20000.0);
+    const PlanetSite site = PlanetSite::FromGeodetic(0.0, 0.0);
+    LodParams p = FixedPointParams();
+    TerrainQuadtree tree;
+    for (int r = 0; r < 64; ++r) {
+        tree.Select(p);
+        if (tree.Wanted().empty()) break;
+        for (const ChunkKey& k : tree.Wanted()) {
+            TerrainChunkData d;
+            BuildTerrainChunk(k, field, site, d);
+            tree.NoteChunk(d);
+        }
+    }
+    REQUIRE(tree.Converged());
+    REQUIRE(tree.Desired().size() > 100u);
+    const std::set<ChunkKey> anc = CutAncestors(tree.Desired());
+    CHECK(anc.size() == (tree.Desired().size() - 6) / 3);
+    // Which is what the arena is sized to hold.
+    CHECK(tree.Desired().size() + anc.size() <=
+          WholeCutSlots(tree.Desired().size()));
+}
+
+TEST_CASE("the arena holds the whole cut of any set inside its leaf budget") {
+    // WholeCutSlots(B) has to bound |D| + |CutAncestors(D)| for EVERY cut D
+    // the selector can produce inside a budget of B, because that bound is
+    // the entire reason retained ancestors do not have to compete with
+    // desired leaves for slots. Checked exhaustively over the admissible
+    // leaf counts rather than argued: a cut has L = 6 + 3I leaves, so the
+    // worst case at budget B is the largest such L not exceeding B.
+    for (std::size_t budget : {std::size_t{8}, std::size_t{64},
+                               std::size_t{150}, std::size_t{224},
+                               std::size_t{1024}, std::size_t{2048},
+                               std::size_t{8192}}) {
+        const std::size_t slots = WholeCutSlots(budget);
+        CHECK(slots >= budget);
+        for (std::size_t leaves = 6; leaves <= budget; leaves += 3) {
+            CHECK(leaves + (leaves - 6) / 3 <= slots);
+        }
+        // Tight to within the budget's own rounding, not merely
+        // sufficient. A cut has 6 + 3I leaves, so a budget that is not
+        // itself of that form cannot be reached exactly; the slack is
+        // exactly how far the budget sits above the largest cut that fits,
+        // which is at most two slots and never a proportional margin.
+        const std::size_t worst = budget - ((budget - 6) % 3);
+        CHECK(budget - worst <= 2u);
+        CHECK(slots - (worst + (worst - 6) / 3) == budget - worst);
+    }
+    // Degenerate floor: six roots and nothing below them need no surcharge.
+    CHECK(WholeCutSlots(6) == 6u);
+}
+
 TEST_CASE("retiring what the cover leaves out takes nothing off the screen") {
     // The retirement rule is "a chunk may go once its ground is covered
     // without it". Stated as an equality: removing the whole retirement list

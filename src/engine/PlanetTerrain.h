@@ -77,20 +77,52 @@
 //              pt::planet::ComputeResidencyCover. Never overlapping, so no
 //              double-shading and no coincident-surface artefact.
 //
-// The arena is still the hard cap and it gets no extra headroom, because
-// the selector target is the arena size and lowering it would move the
-// steady-state residency set that every planet golden is pinned against.
-// Instead the HOLD is what gives: stand-ins are kept only in the slack the
-// desired set leaves (`chunk_budget_ - |desired|`), and beyond that they
-// are dropped lowest-priority-first. Under arena pressure the terrain
-// therefore degrades to exactly the old behaviour -- a hole -- which is the
-// right way round: correctness first, smoothness second.
+// The arena is still the hard cap. Stand-ins get no standing reserve out of
+// it: they are released ON DEMAND, against demand that is actually blocked,
+// so under arena pressure the terrain degrades to exactly the old behaviour
+// -- a hole -- which is the right way round: correctness first, smoothness
+// second. See ChooseCover for the three formulations that were tried first
+// and what each of them measured.
+//
+// RESIDENCY IS THE WHOLE CUT, NOT ITS LEAVES (#319)
+//
+// Coverage-aware retirement protects a chunk that is resident. It cannot
+// protect one that was evicted rounds ago, and the selector evicts every
+// ancestor of a visible leaf by construction: `desired` is the leaf
+// frontier, and step 3a used to drop everything outside it. Descending is
+// safe (the parent is resident and held until its children land); ASCENDING
+// is not, because the coarse chunk the merge asks for went away on the way
+// down. That asymmetry is what a zoom-out shows as seconds of holes.
+//
+// So the streamer keeps the whole cut resident: every strict ancestor of a
+// desired leaf holds an arena slot and a BLAS, unpublished, as the standing
+// one-level-coarser answer for its ground. `retained_` is that set, and it
+// is a pure function of `desired` -- see pt::planet::CutAncestors.
+//
+// THE BUDGET ACCOUNTS FOR THEM RATHER THAN MAKING THEM COMPETE
+//
+// A cut with L leaves has exactly (L - 6) / 3 interior nodes (six roots,
+// four children each; the derivation is in TerrainResidency.h), so the
+// arena is sized at WholeCutSlots(leaf_budget) = leaf_budget + (leaf_budget
+// - 6) / 3 and the SELECTOR target stays the leaf budget. Two consequences,
+// both load-bearing:
+//
+//   * the converged desired set is bit-identical to what it was before
+//     retention existed -- EnforceBudget sees the same number it always
+//     saw -- so no golden moves;
+//   * at steady state a retained ancestor never displaces a desired leaf,
+//     because the arena provably holds both. Retention competes only in the
+//     transient, where it yields first (ChooseCover releases ancestors
+//     before stand-ins: a stand-in is drawing ground now, an ancestor is
+//     insurance against a zoom-out that has not happened).
 //
 // None of this runs inside Settle(). A settling round is a barrier with no
-// observer, so there is no transient to protect, and its residency answer
-// (down to which arena slot each chunk gets, and therefore the BLAS build
-// order) is what the golden matrix is pinned to. See the `settling_` gate
-// in Update().
+// observer, so there is no transient to protect and nothing to insure
+// against, and its residency answer (down to which arena slot each chunk
+// gets, and therefore the BLAS build order) is what the golden matrix is
+// pinned to. Retaining ancestors there would put ~L/3 extra chunks through
+// the free list and renumber the arena for a transient nobody sees. See the
+// `settling_` gate in Update().
 
 #include "../renderer/Planet/CubedSphere.h"
 #include "../renderer/Planet/ElevationField.h"
@@ -182,15 +214,51 @@ struct TerrainStats {
     std::size_t   held          = 0;
     // Cumulative count of stand-ins dropped because the arena had no slack
     // for them, and of substitutions refused because publishing them would
-    // have opened a two-level step. Both are "a hole was preferred to the
-    // alternative" and both should be rare; a rising figure is the signal
+    // have opened a two-level step. A rising holds_dropped is the signal
     // that r_planet_chunk_budget is too tight for the camera.
+    //
+    // holds_refused NO LONGER IMPLIES A HOLE, and that changed at #319.
+    // With the whole cut resident the cover walk has coarse candidates it
+    // never used to have -- every interior node of the desired tree -- and
+    // offering one that turns out to be two levels from its neighbour is
+    // counted here even though declining it simply leaves the finer cover
+    // that was already published. Measured on the 180-tick paced flight
+    // over five Release runs: 30-212 refusals with retention against 1
+    // without, with the real coverage regressions unchanged at 0 and the
+    // deliberate ones at 2-3. Read it as "the walk
+    // reached for a coarse stand-in and the 2:1 rule said no", and read
+    // repair_rounds_peak below for whether that escalated.
     std::uint64_t holds_dropped = 0;
     std::uint64_t holds_refused = 0;
     // Chunks the selector wants, whose geometry is baked, that have no
     // arena slot to go into. Non-zero means the arena is the binding
     // constraint and stand-ins are being released to serve it.
     std::size_t   starved       = 0;
+    // Interior nodes of the desired cut that are resident but not
+    // published: the zoom-out insurance (#319). About |desired| / 3 once
+    // the cut is fully in the arena, and 0 while settling.
+    std::size_t   retained      = 0;
+    // Size of the whole cut -- |desired| + |CutAncestors(desired)|. What
+    // the arena has to hold, as opposed to what is on screen.
+    std::size_t   cut           = 0;
+    // Members of the whole cut that are actually resident. Equals `cut`
+    // once the streamer has caught up, which is the clock-free statement of
+    // "the zoom-out insurance is in place".
+    std::size_t   cut_resident  = 0;
+    // Cumulative count of retained ancestors released because the arena had
+    // no slot for a chunk the selector wanted. Costs no pixels today; it
+    // spends the insurance against a later zoom-out, and is released BEFORE
+    // any stand-in for exactly that reason.
+    std::uint64_t retained_dropped = 0;
+    // Repair rounds the last cover walk consumed, and the most any walk has
+    // consumed this session. The 2:1 repair refuses at least one
+    // substitution per round and gives up at
+    // pt::planet::kMaxRepairRounds by refusing ALL of them, which publishes
+    // a subset of the desired set and holes out everything the transient
+    // was covering. A peak that reaches the backstop is therefore not a
+    // slow frame, it is a blacked-out one.
+    int           repair_rounds      = 0;
+    int           repair_rounds_peak = 0;
     // High-water mark of `resident` over the session, in chunks. Compared
     // against r_planet_chunk_budget this is the direct statement that the
     // transient never overflowed the arena.
@@ -294,6 +362,18 @@ public:
     const std::set<pt::planet::ChunkKey>& Desired() const noexcept {
         return tree_.Desired();
     }
+    // The interior nodes of the desired cut that this pass is holding an
+    // arena slot for. Never published while the leaves below them are
+    // covered; see the #319 note above.
+    const std::set<pt::planet::ChunkKey>& Retained() const noexcept {
+        return retained_;
+    }
+    // Arena slots this instance owns, which is WholeCutSlots(leaf budget)
+    // and NOT r_planet_chunk_budget. The cvar names the leaf frontier the
+    // selector may ask for; the arena also has to hold that frontier's
+    // ancestors.
+    std::uint32_t ArenaSlots() const noexcept { return chunk_budget_; }
+    std::uint32_t LeafBudget() const noexcept { return leaf_budget_; }
 
     const TerrainStats& Stats() const noexcept { return stats_; }
     const pt::planet::PlanetSite& Site() const noexcept { return site_; }
@@ -370,6 +450,12 @@ private:
     pt::rhi::BufferHandle vert_buf_{};
     pt::rhi::BufferHandle index_buf_{};
 
+    // chunk_budget_ is the ARENA -- WholeCutSlots(leaf_budget_) -- and
+    // leaf_budget_ is what the selector is given. They were the same number
+    // before #319 and the distinction is the whole of the budget change:
+    // the selector still targets the leaf count every golden is pinned
+    // against, and the ancestors it implies are paid for separately.
+    std::uint32_t              leaf_budget_   = 0;
     std::uint32_t              chunk_budget_  = 0;
     std::uint32_t              tlas_capacity_ = 0;
     std::vector<std::uint32_t> free_slots_;
@@ -386,6 +472,11 @@ private:
 
     std::map<pt::planet::ChunkKey, Resident>                  resident_;
     std::set<pt::planet::ChunkKey>                            published_;
+    // Interior nodes of the desired cut, kept resident so a merge has
+    // something one level coarser to publish instead of a hole. Empty while
+    // settling. Recomputed from `desired` every paced Update, so it carries
+    // no history of its own.
+    std::set<pt::planet::ChunkKey>                            retained_;
     std::map<pt::planet::ChunkKey, pt::planet::TerrainChunkData> baked_;
     std::vector<pt::planet::ChunkKey>                          requested_;
 
