@@ -58,16 +58,38 @@ OUTPUT FORMAT (mirrored by src/renderer/Planet/ElevationField.h -- the two
 are a wire format and there is no generated header between them):
 
     offset  size  field
-    0       8     magic "PTDEM001"
+    0       8     magic "PTDEM002"
     8       4     uint32 width          (columns, west to east)
     12      4     uint32 height         (rows, north to south)
     16      8     float64 scale_m
     24      8     float64 offset_m
-    32      4     uint32 flags          (0)
+    32      4     uint32 flags          (bit 0: relief plane present)
     36      4     uint32 reserved
-    40      ...   width*height little-endian uint16, row-major
+    40      ...   width*height little-endian uint16, elevation, row-major
+    ...     ...   width*height little-endian uint16, relief, row-major
 
     height_m = value * scale_m + offset_m
+    relief_m = relief_value * scale_m           (relief offset is 0)
+
+THE RELIEF PLANE, AND WHY IT IS SEPARATE (#318)
+-----------------------------------------------
+The engine's fractal continuation is anchored on `relief` -- sigma(L_dem),
+the local RMS inter-texel height difference at the DEM's data floor. Every
+metre of sub-texel terrain is relief times a scale factor, so if relief is
+suppressed, ALL terrain everywhere is too smooth.
+
+Area-averaging the source grid down to 2048x1024 (below) preserves each
+output texel's MEAN -- which is why the heights validate: land fraction,
+mean ocean depth, Everest and the Marianas all land correctly. But an area
+average is a low-pass filter, so it destroys the SECOND MOMENT, the very
+inter-texel variance relief measures. Deriving relief from the decimated
+grid afterwards cannot recover it. So relief is measured HERE, on the
+full-resolution grid, before decimation, and carried in its own plane. The
+loader reads it verbatim; the averaging never touches it.
+
+PTDEM001 (v1) had no relief plane and the loader derived relief from the
+decimated grid -- the suppressed path. v1 files still load (with that
+fallback and a loud log line); this tool only ever writes v2.
 
 THE AFFINE, DERIVED
 -------------------
@@ -107,9 +129,21 @@ ETOPO_URL = ("https://www.ngdc.noaa.gov/thredds/fileServer/global/"
 # rather than a quiet half-planet.
 ETOPO_SIZE_BYTES = 478_290_125
 
-DEM_MAGIC   = b"PTDEM001"
+DEM_MAGIC   = b"PTDEM002"
 DEM_SCALE_M = 0.303
 DEM_OFFSET_M = -11000.0
+
+# The relief plane reuses the height quantisation step, offset 0 (relief is
+# a non-negative height difference). Top of range 65535*0.303 = 19 857 m
+# clears the largest possible height difference on Earth (19 784 m), so it
+# provably never clamps -- a silent clamp would reintroduce the very
+# second-moment suppression the plane exists to fix. Mirrored by
+# kDemReliefScaleM / kDemReliefOffsetM in ElevationField.h.
+DEM_RELIEF_SCALE_M  = DEM_SCALE_M
+DEM_RELIEF_OFFSET_M = 0.0
+
+# Header flags bit 0: a relief plane follows the elevation plane.
+DEM_FLAG_RELIEF_PLANE = 1 << 0
 
 # Real bounds, for the sanity check below.
 EARTH_MIN_M = -10935.0
@@ -275,14 +309,27 @@ def read_grid(path):
              "(pip install netCDF4)")
 
 
+def _block_bounds(n_src, n_out):
+    """Index-map block boundaries: source row/col `k` belongs to output
+    block `k * n_out // n_src`. Returns the (n_out + 1) inclusive edges."""
+    import numpy as np
+    return (np.arange(n_out + 1) * n_src) // n_out
+
+
 def resample(arr, out_w, out_h):
-    """Area-average down to (out_h, out_w).
+    """Area-average the ELEVATION down to (out_h, out_w).
 
     AREA average, not point sampling. The engine's fractal continuation
     extrapolates from the local RMS inter-texel relief, so a point-sampled
     downsample would hand it aliased noise and it would faithfully continue
     the aliasing. Averaging is also the physically right decimation of a
     height field: the mean elevation of a cell is a real quantity.
+
+    But averaging is a low-pass filter, so it preserves each cell's MEAN and
+    DESTROYS its inter-texel variance -- the second moment the continuation
+    is anchored on (#318). That is why relief is NOT derived from this
+    output: compute_relief() measures it on the full-resolution `arr` first,
+    and it travels in its own plane. See the module docstring.
     """
     import numpy as np
     h, w = arr.shape
@@ -300,7 +347,65 @@ def resample(arr, out_w, out_h):
     return out
 
 
-def bake(arr, dest):
+def compute_relief(arr, out_w, out_h):
+    """Per-output-texel relief sigma(L_dem), measured on the FULL-resolution
+    grid (#318) so the area average below never gets a chance to suppress it.
+
+    relief is the local RMS inter-texel height difference at the output-texel
+    lag. It mirrors DigitalElevationModel::BuildReliefMap's per-texel formula
+        g = sqrt(0.5 * (gE^2 + gN^2)),   gE, gN central differences,
+    but evaluated over EVERY full-resolution cell in an output texel's
+    footprint and RMS-aggregated -- so it captures the sub-texel variance the
+    average is about to destroy, rather than the difference of block means the
+    decimated grid would show. The central-difference stencil spans +-one
+    output texel (round(w / out_w) full-resolution cells), the same lag the
+    loader sees between adjacent output texels; longitude wraps and latitude
+    clamps, matching Fetch().
+    """
+    import numpy as np
+    h, w = arr.shape
+    a = np.nan_to_num(arr.astype(np.float64, copy=False), nan=0.0)
+    d_lon = max(1, int(round(w / out_w)))
+    d_lat = max(1, int(round(h / out_h)))
+    # East-west central difference over +-d_lon cells; longitude wraps, so
+    # np.roll is exactly right at the +-180 seam.
+    gE = 0.5 * (np.roll(a, -d_lon, axis=1) - np.roll(a, d_lon, axis=1))
+    # North-south over +-d_lat rows; latitude CLAMPS at the poles (np.roll
+    # would fold the pole into the opposite hemisphere and invent a cliff).
+    idx_s = np.clip(np.arange(h) + d_lat, 0, h - 1)
+    idx_n = np.clip(np.arange(h) - d_lat, 0, h - 1)
+    gN = 0.5 * (a[idx_s, :] - a[idx_n, :])
+    g2 = 0.5 * (gE * gE + gN * gN)            # per-cell mean-square relief
+    del gE, gN
+    # RMS-aggregate g2 over each output texel's footprint. reduceat sums over
+    # the same index-map blocks resample() averages the elevation over.
+    ys = _block_bounds(h, out_h)
+    xs = _block_bounds(w, out_w)
+    rows = np.add.reduceat(g2, ys[:-1], axis=0)          # (out_h, w)
+    block_sum = np.add.reduceat(rows, xs[:-1], axis=1)   # (out_h, out_w)
+    counts = np.outer(np.diff(ys), np.diff(xs)).astype(np.float64)
+    return np.sqrt(block_sum / np.maximum(counts, 1.0))
+
+
+def area_weighted_percentiles(field, mask, qs):
+    """Percentiles of `field` over the texels in `mask`, weighted by texel
+    area (cos of the texel-centre latitude). `field` and `mask` are
+    (out_h, out_w). Returns one value per q in `qs`."""
+    import numpy as np
+    out_h, out_w = field.shape
+    j = np.arange(out_h)
+    lat = 0.5 * 3.141592653589793 - (j + 0.5) * 3.141592653589793 / out_h
+    w2d = np.repeat(np.cos(lat)[:, None], out_w, axis=1)
+    v = field[mask].ravel()
+    w = w2d[mask].ravel()
+    order = np.argsort(v, kind="stable")
+    v = v[order]
+    cw = np.cumsum(w[order])
+    cw /= cw[-1]
+    return [float(v[min(np.searchsorted(cw, q), v.size - 1)]) for q in qs]
+
+
+def bake(arr, relief, dest):
     import numpy as np
     h, w = arr.shape
     lo, hi = float(np.nanmin(arr)), float(np.nanmax(arr))
@@ -313,23 +418,44 @@ def bake(arr, dest):
     q = np.nan_to_num(q, nan=(0.0 - DEM_OFFSET_M) / DEM_SCALE_M)
     q = q.astype("<u2")
 
+    # Relief plane: same quantisation step, zero offset. It provably never
+    # clamps, but assert it -- a future source that broke the invariant must
+    # fail loudly rather than silently flatten its own peaks, which is the
+    # whole failure class #318 is about.
+    rmax = float(np.nanmax(relief))
+    ceil_m = 65535 * DEM_RELIEF_SCALE_M
+    if rmax > ceil_m:
+        sys.exit(f"[bake] relief max {rmax:.1f} m exceeds the plane ceiling "
+                 f"{ceil_m:.1f} m -- refusing to clamp the second moment")
+    qr = np.clip((relief - DEM_RELIEF_OFFSET_M) / DEM_RELIEF_SCALE_M, 0, 65535)
+    qr = np.nan_to_num(qr, nan=0.0).astype("<u2")
+
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
     with open(dest, "wb") as f:
         f.write(DEM_MAGIC)
         f.write(struct.pack("<II", w, h))
         f.write(struct.pack("<dd", DEM_SCALE_M, DEM_OFFSET_M))
-        f.write(struct.pack("<II", 0, 0))
+        f.write(struct.pack("<II", DEM_FLAG_RELIEF_PLANE, 0))
         f.write(q.tobytes())
+        f.write(qr.tobytes())
     size = os.path.getsize(dest)
     km_per_texel = 2 * 3.14159265358979 * 6371008.8 / w / 1000.0
     print(f"[bake] wrote {dest} -- {size/1e6:.2f} MB, "
-          f"{km_per_texel:.1f} km/texel at the equator")
+          f"{km_per_texel:.1f} km/texel at the equator (2 planes)")
     # Round-trip check: the quantised grid must still contain a real Earth.
     back = q.astype(np.float64) * DEM_SCALE_M + DEM_OFFSET_M
     err = float(np.nanmax(np.abs(back - np.clip(arr, DEM_OFFSET_M,
                                                 DEM_OFFSET_M + 65535 * DEM_SCALE_M))))
     print(f"[bake] max quantisation error {err*100:.1f} cm "
           f"(the affine's own step is {DEM_SCALE_M*100:.1f} cm)")
+    # The statistic #318 is about: area-weighted land relief. This is the
+    # thing the old area-averaged pipeline suppressed, so print it here so a
+    # bake reports whether the second moment survived.
+    land = np.nan_to_num(arr) > 0.0
+    if land.any():
+        p50, p90, p99 = area_weighted_percentiles(relief, land, (0.50, 0.90, 0.99))
+        print(f"[bake] land relief (area-weighted)  p50={p50:.1f}  "
+              f"p90={p90:.1f}  p99={p99:.1f} m  (max {float(relief[land].max()):.1f} m)")
 
 
 def main():
@@ -355,10 +481,16 @@ def main():
     arr = read_grid(src)
     out_w = args.width
     out_h = args.width // 2
+    # Relief is measured on the FULL-resolution grid FIRST (#318), before the
+    # area average has a chance to low-pass the variance away. Only then is
+    # the elevation decimated.
+    print(f"[bake] measuring relief on the full-resolution "
+          f"{arr.shape[1]}x{arr.shape[0]} grid (before decimation)")
+    relief = compute_relief(arr, out_w, out_h)
     print(f"[bake] resampling {arr.shape[1]}x{arr.shape[0]} -> {out_w}x{out_h} "
           f"(area average)")
     arr = resample(arr, out_w, out_h)
-    bake(arr, args.out)
+    bake(arr, relief, args.out)
     print()
     print("Done. The engine picks it up via r_planet_dem; provenance and the")
     print("processing steps are recorded in assets/planet/PROVENANCE.md.")
