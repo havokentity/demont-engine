@@ -34,6 +34,72 @@ double DistanceToChunk(const ChunkMetric& m, const glm::dvec3& cam,
 
 }  // namespace
 
+// --- FROM-ORBIT CULL (#326) -----------------------------------------------
+//
+// WHY THE SILHOUETTE, NOT THE HEAD-ON PROJECTED SIZE. The naive test -- cull
+// when the terrain's height above the backstop, gap, projects below a pixel
+// at the chunk's own distance (gap / d < cone) -- is WRONG, and wrong in a
+// way that only a surface view exposes. That is a per-CHUNK size, and the
+// far, grazing chunks along a ground-level horizon have a small gap/d too --
+// they are distant -- yet they are the visible horizon. Measured: at
+// gap/d < 3 px it culled ~25 chunks out of a 850-chunk surface cover and
+// tore a 68%-bad hole across planet_surface. The head-on size cannot tell
+// "far but on the horizon in front of me" from "far below a pixel from
+// orbit".
+//
+// What actually distinguishes the two is the CAMERA'S ALTITUDE, and the one
+// place a chunk's height over the backstop is visible from orbit is the
+// disc's SILHOUETTE at the limb. The lit disc's edge sits at angular radius
+// asin(R / D) from the nadir, D the camera's geocentric distance; drawing
+// the terrain (radius R_t) instead of the backstop (R_b) shifts that edge by
+//
+//     dtheta = asin(R_t/D) - asin(R_b/D) ~= gap / sqrt(D^2 - R_b^2)
+//
+// to first order in gap. sqrt(D^2 - R_b^2) is the tangent length from the eye
+// to the backstop's limb -- the distance at which the gap is seen edge-on.
+// This is a per-VIEW gate, exactly as it should be: at the surface D -> R_b,
+// the tangent length -> 0 and dtheta -> infinity, so every chunk is kept
+// however far along the horizon it lies; from orbit D >> R_b and dtheta -> 0,
+// so every chunk goes. It never culls the horizon a ground camera can see.
+//
+// THE THRESHOLD. dtheta is compared against the pixel footprint cone_spread,
+// times kCullLimbPx (in the header). A silhouette shift smaller than the
+// sampling footprint is antialiased away -- it moves no sample's coverage far
+// enough to change a quantised byte -- and the #326 verification measures that
+// invisible band directly rather than resting on the argument: at the orbital
+// fixture (30 000 km, 1080p, r_sky_mode procedural -- a HARD limb, so this is
+// the antialiasing alone with no atmospheric haze softening it) the tallest
+// chunk shifts the limb ~1.5 px and the frame is byte-identical whether that
+// chunk is traced or dropped, and the whole descent from 30 000 km stays
+// byte-identical to an always-traced build. kCullLimbPx = 3 sits at 2x that
+// measured-invisible shift, headroom so a change in modelled relief cannot
+// push a genuinely visible limb under it, and still ~2x clear of the ~7 px a
+// ground-level horizon chunk shifts (which keeps every surface cover intact).
+// It is a pixel count read off the disc geometry, not a tuned epsilon, and it
+// is kept separate from LodParams::tau_px: tau_px is how finely to tessellate
+// a chunk that IS drawn, this is whether to draw it at all.
+//
+// The boundary and the degenerate guards below are pinned directly by the
+// "#326: the from-orbit cull predicate ..." case in pt_planet_terrain_test --
+// a CI-visible unit test, because the Metal goldens whose limb shifts are all
+// ~0.6 px never reach the 3 px boundary and CI does not run them anyway.
+bool BackstopGapSubPixel(const ChunkMetric& m, const LodParams& p) noexcept {
+    // No backstop -> a cull would open a hole to the sky, so never cull.
+    if (!(p.backstop_radius_m > 0.0)) return false;
+    const double gap = m.surface_r_max_m - p.backstop_radius_m;
+    // A surface at or below the backstop is not a bump the backstop fails to
+    // represent; leave it in and let ordinary occlusion sort it out.
+    if (!(gap > 0.0)) return false;
+    // Tangent length from the eye to the backstop's limb, sqrt(D^2 - R_b^2).
+    const double D = glm::length(p.camera_w - p.planet_center_w);
+    const double limb2 = D * D - p.backstop_radius_m * p.backstop_radius_m;
+    // Camera at or below the backstop surface: the limb is not ahead of the
+    // eye, so this test does not apply -- keep the chunk.
+    if (!(limb2 > 0.0)) return false;
+    const double edge_shift = gap / std::sqrt(limb2);   // radians
+    return edge_shift <= kCullLimbPx * p.cone_spread;
+}
+
 // --- TerrainQuadtree ------------------------------------------------------
 
 void TerrainQuadtree::Clear() {
@@ -46,10 +112,11 @@ void TerrainQuadtree::Clear() {
 
 void TerrainQuadtree::NoteChunk(const TerrainChunkData& d) {
     ChunkMetric m;
-    m.e_l_m    = d.e_l_m;
-    m.center_w = d.bound_center_w;
-    m.radius_m = d.bound_radius_m;
-    m.known    = true;
+    m.e_l_m           = d.e_l_m;
+    m.center_w        = d.bound_center_w;
+    m.radius_m        = d.bound_radius_m;
+    m.surface_r_max_m = d.surface_r_max_m;
+    m.known           = true;
     metrics_[d.key] = m;
 }
 
@@ -64,7 +131,19 @@ double TerrainQuadtree::Priority(const ChunkKey& k, const LodParams& p) const {
 void TerrainQuadtree::Descend(const ChunkKey& k, const LodParams& p,
                               bool parent_was_split) {
     (void)parent_was_split;
-    if (k.level >= p.max_level) { desired_.insert(k); return; }
+    if (k.level >= p.max_level) {
+        // Even the finest leaf is dropped when its terrain stands sub-pixel
+        // above the backstop (#326) -- unreachable from orbit, where the
+        // descent stops at level 0, but kept here so the cull is a property
+        // of the leaf frontier and not of one entry point into it.
+        const auto mit = metrics_.find(k);
+        if (mit != metrics_.end() && mit->second.known &&
+            BackstopGapSubPixel(mit->second, p)) {
+            return;
+        }
+        desired_.insert(k);
+        return;
+    }
 
     const auto it = metrics_.find(k);
     if (it == metrics_.end() || !it->second.known) {
@@ -120,7 +199,14 @@ void TerrainQuadtree::Descend(const ChunkKey& k, const LodParams& p,
     if (d < threshold) {
         for (int q = 0; q < 4; ++q) Descend(k.Child(q), p, true);
     } else {
-        desired_.insert(k);
+        // A leaf by the split rule (its own error is sub-tau-pixel). Publish
+        // it only if it also stands more than a pixel above the analytic
+        // backstop (#326); otherwise the backstop is a pixel-identical
+        // stand-in and the chunk is pure BLAS-traversal cost. gap >> e_L, so
+        // a chunk the split rule wanted to REFINE (d < threshold above) is
+        // never reached here, and the cull can only ever drop a genuine
+        // leaf.
+        if (!BackstopGapSubPixel(m, p)) desired_.insert(k);
     }
 }
 

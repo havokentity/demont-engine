@@ -453,6 +453,11 @@ void BuildTerrainChunk(const ChunkKey& key,
         static_cast<std::size_t>(kChunkVertexCount) * kVertexPayloadFloats, 0.0f);
     double h_min =  1e30, h_max = -1e30;
     glm::dvec3 lo( 1e30), hi(-1e30);
+    // Greatest surface radius from the planet centre, for the from-orbit cull
+    // (#326). Measured off the same world-space vertices the bounding box is,
+    // so it costs one length per vertex and no second pass.
+    const glm::dvec3 planet_centre_w = site.CenterWorld();
+    double r_surface_max = 0.0;
 
     for (int y = 0; y <= kChunkQuads; ++y) {
         for (int x = 0; x <= kChunkQuads; ++x) {
@@ -460,6 +465,8 @@ void BuildTerrainChunk(const ChunkKey& key,
             const int fy = FineOfChunk(y);
             const glm::dvec3 p = fine_world(fx, fy);
             const glm::vec3 local(p - origin_w);
+            r_surface_max = std::max(r_surface_max,
+                                     glm::length(p - planet_centre_w));
             const std::size_t vi = static_cast<std::size_t>(y) * kChunkVerts + x;
             out.positions[vi * 3 + 0] = local.x;
             out.positions[vi * 3 + 1] = local.y;
@@ -499,6 +506,7 @@ void BuildTerrainChunk(const ChunkKey& key,
     }
     out.h_min_m = h_min;
     out.h_max_m = h_max;
+    out.surface_r_max_m = r_surface_max;
     out.bound_center_w = 0.5 * (lo + hi);
     out.bound_radius_m = 0.5 * glm::length(hi - lo);
 

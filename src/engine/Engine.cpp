@@ -7138,6 +7138,16 @@ void Engine::UpdatePlanetTerrain() {
     const auto h = static_cast<double>(std::max(1, window_ ? window_->Height() : 1080));
     lod.cone_spread = 2.0 * static_cast<double>(camera_->FovYTan()) / h;
     if (auto* v = C.FindCVar("r_planet_lod_freeze")) lod.freeze = v->GetBool();
+    // The analytic backstop the from-orbit cull (#326) measures against. It
+    // is unconditionally present while terrain streams (the branch above that
+    // fills planet_ground.w forces planet_ground_on when terrain is on), so
+    // the selector can always fall a sub-pixel chunk back onto it. The one
+    // radius, from pt::planet::kBackstopRadius, so the cull and the shader
+    // agree on where the backstop is. The body centre goes with it so the
+    // cull can measure the camera's geocentric distance in the same canonical
+    // frame camera_w lives in.
+    lod.backstop_radius_m = pt::planet::kBackstopRadius;
+    lod.planet_center_w   = planet_terrain_->Site().CenterWorld();
 
     const bool changed = planet_terrain_->Update(lod, world_frame_.anchor);
     // A CSG rebake destroys the scene TLAS and recreates it at capacity 1
@@ -10556,8 +10566,7 @@ void Engine::RenderFrame() {
             //
             // It is also always on when terrain is: a hole in the world is
             // worse than a sphere you never see.
-            ground_body_R = pt::planet::kWgs84B + pt::planet::kEarthMinElevation
-                            - 65.0;
+            ground_body_R = pt::planet::kBackstopRadius;
             planet_ground_on = true;
         }
 #endif

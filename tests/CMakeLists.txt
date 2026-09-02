@@ -351,6 +351,13 @@ endif()
 # #276 stayed green for a cycle.
 pt_add_test(pt_atmosphere
     pt_atmosphere_test.cpp)
+# #326: reach pt::planet::kBackstopRadius for the compile-time value pin at the
+# end of the sub-datum air-column case. glm::glm is header-only (INTERFACE), so
+# this adds a header include path -- NOT a build dependency on the engine, which
+# the case still reads as TEXT. src/ is on the path so the CubedSphere.h include
+# resolves the same way the renderer's own TUs spell it.
+target_include_directories(pt_atmosphere PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(pt_atmosphere PRIVATE glm::glm)
 target_compile_definitions(pt_atmosphere PRIVATE
     PT_SHADER_MATH_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTraceMath.slang"
     PT_SHADER_PATHTRACE_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang"
