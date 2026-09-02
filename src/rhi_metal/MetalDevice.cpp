@@ -1799,6 +1799,12 @@ void MetalDevice::SetGpuTimestampsEnabled(bool on, std::uint32_t pass_capacity) 
     // a fabricated zero.
     if (!gpu_ts_supported_ || device_ == nullptr) { on = false; }
     if (on && pass_capacity == 0) on = false;
+    // Off-and-already-off is a no-op regardless of pass_capacity: the engine
+    // passes the tier-4 pass cap every frame, so comparing capacity when off
+    // would re-run the teardown below every frame at the default tier. Benign
+    // here (ReleaseGpuTsRing is a 3-element null check) but a per-frame
+    // vkDeviceWaitIdle on Vulkan, so both backends early-out identically.
+    if (!on && !gpu_ts_enabled_) return;
     if (on == gpu_ts_enabled_ && pass_capacity == gpu_ts_capacity_) return;
 
     // Any change tears down the existing ring first (frees the sample
@@ -1870,7 +1876,6 @@ std::uint32_t MetalDevice::ResolveGpuTimestamps(double* out_ms,
     const std::size_t got = data->length() / sizeof(MTL::CounterResultTimestamp);
 
     constexpr std::uint64_t kErr = ~0ull;   // MTLCounterErrorValue
-    std::uint32_t valid = 0;
     for (std::uint32_t p = 0; p < passes; ++p) {
         double ms = 0.0;
         const std::size_t si = 2u * p, ei = 2u * p + 1u;
@@ -1879,7 +1884,6 @@ std::uint32_t MetalDevice::ResolveGpuTimestamps(double* out_ms,
             const std::uint64_t en = ts[ei].timestamp;
             if (s != 0 && en != 0 && s != kErr && en != kErr && en >= s) {
                 ms = static_cast<double>(en - s) * gpu_ts_ns_per_tick_ * 1e-6;
-                ++valid;
             }
         }
         if (p < capacity) out_ms[p] = ms;

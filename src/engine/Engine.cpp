@@ -7761,8 +7761,12 @@ void Engine::RenderFrame() {
     // --- Per-pass GPU timestamps (#320) -----------------------------------
     // The instrument is live this frame iff the perf overlay is at tier 4
     // AND the active backend/queue can actually timestamp. SetGpuTimestamps
-    // Enabled is idempotent, so calling it every frame only does work on the
-    // toggle edge; when off it frees the query objects (zero overhead).
+    // Enabled early-outs on both backends when off-and-already-off (and on
+    // the on-state/capacity edge otherwise), so calling it every frame only
+    // does work on the toggle edge -- crucially it must NOT re-tear-down each
+    // frame at the default tier, which on Vulkan would be a per-frame
+    // vkDeviceWaitIdle. `want` folds in SupportsGpuTimestamps() so an
+    // unsupported device stays permanently off.
     {
         int overlay_level = 0;
         if (auto* lv = pt::console::Console::Get().FindCVar("r_perf_overlay")) {

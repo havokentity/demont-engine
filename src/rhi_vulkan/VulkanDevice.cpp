@@ -4384,6 +4384,14 @@ void VulkanDevice::SetGpuTimestampsEnabled(bool on, std::uint32_t pass_capacity)
     if (!gpu_ts_supported_ || device_ == VK_NULL_HANDLE) on = false;
     if (on && pass_capacity == 0) on = false;
     if (on && pass_capacity > kGpuTsMaxCapacity) pass_capacity = kGpuTsMaxCapacity;
+    // Off-and-already-off is a no-op REGARDLESS of pass_capacity. The engine
+    // calls this every frame with the tier-4 pass cap (24), while the disabled
+    // steady state holds gpu_ts_capacity_ == 0 -- so the combined check below
+    // would be (false==false && 24==0) == false and fall through to
+    // vkDeviceWaitIdle EVERY FRAME below tier 4, a full per-frame pipeline
+    // stall in the default configuration. When off, only the enabled-state
+    // matters; capacity is meaningless.
+    if (!on && !gpu_ts_enabled_) return;
     if (on == gpu_ts_enabled_ && pass_capacity == gpu_ts_capacity_) return;
 
     // Pools may still be referenced by in-flight command buffers; drain
