@@ -9,18 +9,18 @@
 //   2 = detailed: + backend / resolution / GPU memory / spp / bounces /
 //                   primitive count.
 //   3 = graph   : + sparkline of recent frame_ms history.
+//   4 = gpu pass: fps + frame_ms + a per-pass GPU-time breakdown (#320),
+//                 the real GPU milliseconds of each render pass. Tier 4 is
+//                 focused: it drops the tier-2 detail block and the tier-3
+//                 sparkline in favour of the pass list, which is the point
+//                 of the tier. Backed by GPU timestamp queries the engine
+//                 turns on only at this tier.
 //
 // Implemented as a sibling child window to the engine's GLFW HWND
 // (Win32) or floating NSPanel (Mac), painted with the OS's native text
 // stack (GDI on Win, NSAttributedString on Mac).  Same architectural
 // shape as ConsoleOverlay -- the rule against bundled GUI libraries
 // (Dear ImGui / Qt / etc.) holds; we use only what the OS ships.
-//
-// GPU per-pass timing is intentionally NOT in tier 1-3.  Wiring
-// VkQueryPool / MTLCounterSampleBuffer through every dispatch is a
-// separate piece of work; once it lands it'll slot in as tier 4
-// without changing the cvar's allowed_values shape used by the
-// existing 0..3 levels.
 
 #include <cstddef>
 #include <span>
@@ -42,6 +42,21 @@ struct PerfStats {
     std::size_t primitives   = 0;
     // Recent frame_ms samples, oldest-first.  Used by tier-3 sparkline.
     std::span<const float> frame_ms_history;
+
+    // --- Per-pass GPU timing (#320), tier 4 ------------------------------
+    // One entry per render pass, in GPU execution order, with the pass's
+    // real GPU time in milliseconds. `name` points at engine-owned storage
+    // that outlives the Update() call; the overlay copies what it needs
+    // synchronously inside Update (same contract as frame_ms_history).
+    struct PassTiming {
+        const char* name = "";
+        double      ms   = 0.0;
+    };
+    std::span<const PassTiming> gpu_passes;
+    // Whether the active backend/queue can produce GPU timestamps at all.
+    // When false, tier 4 prints "(gpu timing unavailable)" rather than an
+    // empty or misleading list.
+    bool gpu_timing_available = false;
 };
 
 class PerfOverlay {

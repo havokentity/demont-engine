@@ -26,6 +26,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace pt::app      { class Window; class ConsoleOverlay; class PerfOverlay; }
@@ -812,6 +813,33 @@ private:
     // typical viewport DPI; oldest sample evicted on push.
     std::vector<float>                          perf_history_;
     std::size_t                                 perf_history_pos_ = 0;
+
+    // --- Per-pass GPU timestamps (#320) ----------------------------------
+    // Instrument (perf-overlay tier 4). True this frame iff the cvar asks
+    // for it AND the active backend/queue can actually timestamp. When it is
+    // false the whole path is a couple of branch tests -- zero GPU work.
+    bool                                        gpu_timing_active_ = false;
+    // Max passes the RHI query pool / counter sample buffers are sized for.
+    static constexpr std::uint32_t              kGpuTimingPassCap = 24;
+    // Labels recorded for each timed pass, ring-keyed by device frame index.
+    // The resolve lags the live frame (frame pacing), so the ring lets a
+    // resolved frame's durations be paired with the labels THAT frame
+    // recorded. Ring depth comfortably exceeds the resolve lag.
+    static constexpr std::size_t                kGpuTimingLabelRing = 4;
+    std::array<std::vector<std::string>, kGpuTimingLabelRing> gpu_pass_label_ring_;
+    std::vector<std::string>*                   gpu_pass_labels_cur_ = nullptr;
+    std::uint32_t                               gpu_pass_next_slot_  = 0;
+    // Latest resolved breakdown: (pass name, GPU ms). Consumed by the perf
+    // overlay (tier 4) and the JSON frame_stats line. Empty when the
+    // instrument is off or no frame has resolved yet.
+    std::vector<std::pair<std::string, double>> gpu_pass_timings_;
+    // Open a GPU-timed pass named `name` on `cb`. No-op unless
+    // gpu_timing_active_. Assigns the next slot and records the label.
+    void GpuPassMark(pt::rhi::CommandBuffer* cb, const char* name);
+    // Resolve the most-recent completed frame's per-pass GPU times into
+    // gpu_pass_timings_. Called once per frame at the end of RenderFrame.
+    void ResolveGpuPassTimings();
+
     std::unique_ptr<pt::jobs::JobSystem>        jobs_;
     std::unique_ptr<pt::console::ConsoleServer> server_;
     // Editor scaffold (agent-20): tracks the OS pids of Chrome --app
