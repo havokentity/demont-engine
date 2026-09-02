@@ -787,6 +787,115 @@ TEST_CASE("the structure function is a broken power law with the documented brea
     }
 }
 
+TEST_CASE("the threshold-hillslope transfer saturates slope at S_c (#330)") {
+    // SaturateHillslopeSlope passes a level's displacement through the steady
+    // state of the nonlinear flux law q = K S / (1 - (S/S_c)^2) (Roering,
+    // Kirchner & Dietrich 1999, WRR 35:853), so a hillslope's angle saturates
+    // at the landsliding threshold instead of rising linearly with relief.
+    // Six properties fix it; the physics is in the ElevationField header.
+    const double sp = 10.0;         // an arbitrary level spacing, metres
+    const double Sc = 0.67451;      // tan(34 deg), the asymptote slope
+    const double cap = Sc * sp;     // the displacement asymptote
+
+    // (a) EXACT identity at 0, and identity (disabled) for threshold <= 0 --
+    // this is the A/B that reproduces the pre-#330 linear law bit-for-bit.
+    CHECK(SaturateHillslopeSlope(0.0, sp, Sc) == 0.0);
+    for (double d : {-3.0, 0.5, 42.0}) {
+        CHECK(SaturateHillslopeSlope(d, sp, 0.0) == d);
+        CHECK(SaturateHillslopeSlope(d, sp, -1.0) == d);
+    }
+
+    // (b) Identity to a fraction of a percent for sub-threshold ground -- what
+    // keeps Kansas, the Sahara and the abyssal plains bit-unchanged. At a
+    // tenth of S_c the deviation is the leading (S_lin/S_c)^2 term, ~1%.
+    {
+        const double d = 0.1 * cap;
+        CHECK(SaturateHillslopeSlope(d, sp, Sc) == doctest::Approx(d).epsilon(0.02));
+    }
+
+    // (c) Odd: sign in, sign out, magnitude symmetric.
+    for (double d : {0.3, 5.0, 500.0}) {
+        CHECK(SaturateHillslopeSlope(-d, sp, Sc) ==
+              -SaturateHillslopeSlope(d, sp, Sc));
+    }
+
+    // (d) Monotone, (e) concave for d > 0, and bounded strictly below the
+    // asymptote. Concavity on uniform steps = forward differences that do not
+    // increase; monotone + concave + soft cap is exactly "compress, do not
+    // clip", so steeper ground stays ordered-steeper and nothing runs away.
+    const double h = 0.5;
+    double prev = SaturateHillslopeSlope(0.0, sp, Sc);
+    double prev_diff = 1e30;
+    for (double d = h; d < 400.0; d += h) {
+        const double s = SaturateHillslopeSlope(d, sp, Sc);
+        CHECK(s > prev);                         // monotone
+        CHECK(s < cap);                          // bounded by the asymptote
+        CHECK(finiteBits(s));
+        const double diff = s - prev;
+        CHECK(diff <= prev_diff + 1e-12);        // concave
+        prev = s; prev_diff = diff;
+    }
+
+    // (f) Asymptotes AT S_c*spacing -- a huge input lands within a whisker of
+    // the cap and never past it (it reaches it only in the sense that the
+    // (S_c/S_lin)^n correction underflows the mantissa), so cliffs above the
+    // threshold form by ACCUMULATION across levels, not from one increment.
+    const double big = SaturateHillslopeSlope(1e6, sp, Sc);
+    CHECK(big <= cap);
+    CHECK(big > 0.999 * cap);
+    // ...and at a large-but-finite input the correction is still resolvable,
+    // so it is strictly below the cap: the asymptote is approached, not met.
+    CHECK(SaturateHillslopeSlope(50.0 * cap, sp, Sc) < cap);
+}
+
+TEST_CASE("the saturation draws steep terrain to the threshold and leaves "
+          "gentle terrain alone (#330)") {
+    // The acceptance, on procedural fields so it needs no DEM: the transfer
+    // must pull an overshooting high-relief reference slope down to the
+    // threshold while leaving sub-threshold ground essentially untouched.
+    const PlanetSite site = PlanetSite::FromGeodetic(0.3, 1.1);
+    const ChunkKey key{3, 13, 4321u, 5678u};
+    const double Sc = 0.67451;      // tan(34 deg)
+
+    auto ref_rms_tan = [&](double relief, double threshold) {
+        ElevationField f;
+        ElevationParams p;
+        p.procedural_relief_m = relief;
+        p.procedural_floor_m  = 20000.0;
+        p.hillslope_threshold_slope = threshold;
+        f.SetParams(p);
+        std::vector<double> sl;
+        ReferenceSlope01(key, f, site, sl);
+        double acc = 0.0;
+        for (double s01 : sl) {
+            const double c = std::clamp(1.0 - s01, 1e-9, 1.0);
+            const double t = std::sqrt(std::max(0.0, 1.0 - c * c)) / c;
+            acc += t * t;
+        }
+        return std::sqrt(acc / static_cast<double>(sl.size()));
+    };
+
+    // Gentle ground (100 m relief) is far below S_c, so ON and OFF agree to a
+    // fraction of a percent -- the low-relief terrain classes do not move.
+    const double g_on  = ref_rms_tan(100.0, Sc);
+    const double g_off = ref_rms_tan(100.0, 0.0);
+    CHECK(g_off > 0.02);                               // not vacuous: real slope
+    CHECK(g_on == doctest::Approx(g_off).epsilon(0.03));
+
+    // Steep ground (1500 m relief) overshoots the threshold under the linear
+    // law; the saturation draws it DOWN toward S_c -- a one-way reduction that
+    // shrinks the excess above the threshold, without collapsing to zero (the
+    // ground is genuinely steep, so it stays above S_c). Measured on this
+    // chunk: RMS slope 1.76 S_c -> 1.46 S_c, the above-threshold excess
+    // 0.76 S_c -> 0.46 S_c.
+    const double s_off = ref_rms_tan(1500.0, 0.0);
+    const double s_on  = ref_rms_tan(1500.0, Sc);
+    CHECK(s_off > 1.2 * Sc);                           // the linear law overshoots
+    CHECK(s_on  < 0.85 * s_off);                       // saturation pulls it down
+    CHECK(s_on  > Sc);                                 // steep terrain stays steep
+    CHECK((s_on - Sc) < 0.75 * (s_off - Sc));          // the excess is drawn toward S_c
+}
+
 // The RMS of the displacement this level ADDED, read straight out of a
 // baked chunk. At an odd-x, even-y vertex the interpolation stencil is
 // exactly the mean of the two even-x neighbours in the same row, and with
@@ -885,14 +994,30 @@ TEST_CASE("the max_slope clamp is a backstop, not the thing holding the field up
         CHECK(r.clamped_fraction == 0.0);
     }
 
-    // Not vacuous: the backstop is still wired, and still fires where real
-    // physics says it should. 2 600 m of relief per 19.5 km texel is the
-    // top of earth_lite's range (max 2 662.7 m) -- the Karakoram front and
-    // the trench walls -- where a threshold-hillslope cap is the correct
-    // model rather than a patch.
+    // Not vacuous: at extreme relief the field IS bounded near the
+    // threshold, but as of #330 it is the SATURATION that bounds it, not the
+    // clamp. 2 600 m of relief per 19.5 km texel is the top of earth_lite's
+    // range (max 2 662.7 m) -- the Karakoram front and the trench walls --
+    // where the threshold-hillslope transfer draws every increment toward
+    // S_c = tan(34 deg). The residual therefore sits just under that
+    // asymptote, and the tan(45 deg) clamp above it never fires.
     ElevationField extreme = MakeProceduralField(2600.0, 20000.0);
     const LevelResidual e = MeasureLevelResidual(extreme, 18);
-    CHECK(e.clamped_fraction > 0.1);
+    const double asymptote =
+        extreme.Params().hillslope_threshold_slope * ChunkVertexSpacing(18);
+    CHECK(e.clamped_fraction == 0.0);   // the clamp is idle even here
+    CHECK(e.rms < asymptote);           // the saturation is what bounds it
+    CHECK(e.rms > 0.4 * asymptote);     // non-vacuous: the ground really is steep
+
+    // The A/B that proves the transfer, not the clamp, is doing the bounding:
+    // disable the saturation and the old hard clamp is back to firing on this
+    // very same ground -- so the bound moved from truncation to physics.
+    ElevationField extreme_lin = MakeProceduralField(2600.0, 20000.0);
+    { ElevationParams p = extreme_lin.Params();
+      p.hillslope_threshold_slope = 0.0;
+      extreme_lin.SetParams(p); }
+    const LevelResidual el = MeasureLevelResidual(extreme_lin, 18);
+    CHECK(el.clamped_fraction > 0.1);
 }
 
 // --- Chunk baking ----------------------------------------------------------
@@ -2072,7 +2197,17 @@ TEST_CASE("rock exposure is bit-identical across LOD levels, and the mesh "
     // this defect before #304 -- 0.986 at level 13 and 1.000 at level 15 on
     // the pre-#304 continuation. A saturated pair proves nothing either
     // way, so the reproduction runs where the ramp has room to move.
+    // #330's threshold-hillslope saturation trims moderate slopes, which
+    // would pull this 250 m-relief reproduction's parent ramp below the
+    // non-vacuity floor -- but the LOD drift this case exists to catch is a
+    // property of the MESH-NORMAL ramp, orthogonal to the saturation. Disable
+    // the saturation here so the reproduction tests exactly the #307
+    // phenomenon on the same numbers it always did, rather than a number the
+    // saturation happens to move.
     ElevationField gentle = MakeProceduralField(250.0, 20000.0);
+    { ElevationParams gpar = gentle.Params();
+      gpar.hillslope_threshold_slope = 0.0;
+      gentle.SetParams(gpar); }
     const ChunkKey gp{2, 12, 1234u, 2345u};
     const ChunkKey gc{gp.face, 14, gp.i * 4, gp.j * 4};
     TerrainChunkData gpd, gcd;
@@ -2194,12 +2329,18 @@ TEST_CASE("the coarse area-mean branch tracks the pointwise branch it "
         // zero would count as agreeing.
         CHECK(fine_mean > 0.02);
         CHECK(fine_mean < 0.98);
-        // 0.06 is the measured envelope, not a round number: over the 40
-        // highest-relief land sites in earth_lite the coarse branch runs
-        // 0.035 below the pointwise mean on average with a p90 of 0.081.
-        // See kRefSlopeRmsGain -- the residual is the field's excess
-        // kurtosis against the Gaussian the Rayleigh model assumes, and it
-        // is recorded rather than tuned away.
+        // 0.09 is the measured envelope, not a round number. It bounds two
+        // residuals now. The first is the pre-#330 one: the field's excess
+        // kurtosis against the Gaussian the Rayleigh model assumes (see
+        // kRefSlopeRmsGain). The second is #330's: the coarse branch applies
+        // the threshold-hillslope reduction analytically (saturating the
+        // scale slope at the reference lag), while the pointwise branch gets
+        // it per-vertex from the baked field, and the two agree only to the
+        // extent the Rayleigh model represents the saturated distribution.
+        // Re-measured through the shipped saturation, coarse runs below fine
+        // by 0.004 / 0.030 / 0.065 at relief 800 / 1200 / 1800 -- the gap
+        // widens with relief as the saturated tail departs from Rayleigh, and
+        // 1800 m is the top of earth_lite's range, so 0.09 is a ~1.4x margin.
         CHECK(std::abs(coarse_mean - fine_mean) < 0.09);
     }
 }
