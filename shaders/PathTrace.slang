@@ -912,9 +912,13 @@ float4 ptLandAlbedoSample(float lat_rad, float lon_rad) {
 // above sea level here" signal on the GPU is the land-cover raster's
 // COVERAGE byte, baked (fetch_planet_albedo.py: dem_land_mask) from the same
 // DEM the terrain meshes: 255 where DEM >= 0, area-averaged and thresholded
-// at 0.5. So coverage >= 0.5 IS the coastline, the identical curve the body
-// paints its albedo split on -- returning false there removes the shell and
-// lets the land-bearing body (or a terrain chunk) behind it win.
+// at 0.5. So coverage >= 0.5 is the DEM/geoid-zero land mask, the identical
+// curve the body paints its albedo split on -- returning false there removes
+// the shell and lets the land-bearing body (or a terrain chunk) behind it
+// win. It is a geoid-zero mask and NOT a true coastline: dry land below sea
+// level (the Qattara Depression, the Dead Sea shore) is on the ocean side of
+// it and renders as sea, and inland water bodies are inconsistent -- tracked
+// as #327, and the from-orbit land/sea split does not depend on it.
 //
 // With no raster loaded the mask is unavailable, so this returns true (the
 // shell stays). Scenes that have a raster but no solid body to reveal are
@@ -3454,10 +3458,12 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
     // the land-cover raster's COVERAGE byte, which fetch_planet_albedo.py
     // bakes from the engine's own DEM (dem_land_mask: 255 where DEM >= 0,
     // area-averaged and thresholded at 0.5). Coverage >= 0.5 is therefore
-    // the SAME coastline the raster's colour flips on and the SAME curve
-    // the terrain would mesh a shoreline at -- not a tuned number, and by
-    // construction it cannot disagree with the land the body paints one
-    // texel away.
+    // the SAME DEM/geoid-zero land mask the raster's colour flips on -- not
+    // a tuned number, and by construction it cannot disagree with the land
+    // the body paints one texel away. It is a geoid-zero mask and not a true
+    // coastline (sub-sea-level dry land renders as sea, inland lakes are
+    // inconsistent -- #327), which the from-orbit land/sea split does not
+    // depend on.
     //
     // GATED ON THE BACKSTOP BODY BEING PRESENT (planet_ground.w > 0). A pure
     // ocean world -- the P5 fixtures, ground and terrain both off -- still
