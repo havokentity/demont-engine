@@ -17,7 +17,10 @@
 #include "../core/Tracy.h"
 
 #include <fmt/format.h>
+#include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <thread>
 
 // Embedded shader (the unified PathTrace kernel: analytic primitives +
 // triangle meshes via TLAS + materials + accumulation, all in one).
@@ -224,12 +227,34 @@ void MetalCommandBuffer::Reset(MTL::CommandBuffer* cb) {
     for (auto& t : bound_tex_)   t = TextureHandle{0};
     for (auto& b : bound_buf_)   b = BufferHandle{0};
     for (auto& a : bound_accel_) a = AccelStructHandle{0};
+    // Timestamps are re-armed per frame by AcquireCommandBuffer AFTER this
+    // Reset; clear the per-frame state here so a frame that does NOT arm
+    // them (Submit's own Reset(nullptr), the loading-frame path) is inert.
+    timing_sb_        = nullptr;
+    timing_capacity_  = 0;
+    pending_ts_slot_  = kNoTimedSlot;
+    timed_pass_count_ = 0;
 }
 
 void MetalCommandBuffer::EnsureEncoder() {
-    if (encoder_ == nullptr && mtl_cb_ != nullptr) {
-        encoder_ = mtl_cb_->computeCommandEncoder();
+    if (encoder_ != nullptr || mtl_cb_ == nullptr) return;
+    // --- Per-pass GPU timestamps (#320) ----------------------------------
+    // A timed pass is pending: create this encoder from a compute pass
+    // descriptor that samples the GPU timestamp counter set at the encoder's
+    // start and end stage boundaries (the ONLY sampling point Apple silicon
+    // supports). Slot s -> samples 2*s (start) and 2*s+1 (end).
+    if (timing_sb_ != nullptr && pending_ts_slot_ != kNoTimedSlot &&
+        pending_ts_slot_ < timing_capacity_) {
+        MTL::ComputePassDescriptor* pd = MTL::ComputePassDescriptor::computePassDescriptor();
+        auto* att = pd->sampleBufferAttachments()->object(0);
+        att->setSampleBuffer(timing_sb_);
+        att->setStartOfEncoderSampleIndex(2u * pending_ts_slot_);
+        att->setEndOfEncoderSampleIndex(2u * pending_ts_slot_ + 1u);
+        encoder_ = mtl_cb_->computeCommandEncoder(pd);
+        pending_ts_slot_ = kNoTimedSlot;
+        return;
     }
+    encoder_ = mtl_cb_->computeCommandEncoder();
 }
 
 void MetalCommandBuffer::EndEncoderIfActive() {
@@ -239,7 +264,40 @@ void MetalCommandBuffer::EndEncoderIfActive() {
     }
 }
 
-void MetalCommandBuffer::FlushEncoder() { EndEncoderIfActive(); }
+void MetalCommandBuffer::FlushEncoder() {
+    EndEncoderIfActive();
+    // A pending timed slot that was never turned into an encoder (e.g. a
+    // BeginGpuPass immediately before the denoiser's FlushEncoder) is
+    // abandoned rather than leaking onto the next, unrelated encoder.
+    pending_ts_slot_ = kNoTimedSlot;
+}
+
+// --- Per-pass GPU timestamps (#320) --------------------------------------
+
+void MetalCommandBuffer::SetTimingSampleBuffer(MTL::CounterSampleBuffer* sb,
+                                               std::uint32_t capacity) {
+    timing_sb_        = sb;
+    timing_capacity_  = capacity;
+    pending_ts_slot_  = kNoTimedSlot;
+    timed_pass_count_ = 0;
+}
+
+void MetalCommandBuffer::BeginGpuPass(std::uint32_t slot) {
+    if (timing_sb_ == nullptr) return;             // instrument off this frame
+    if (slot >= timing_capacity_) return;          // out of the sized range
+    // Close the previous timed encoder (its end boundary is sampled on
+    // endEncoding) and arm the NEXT encoder -- created lazily by the first
+    // Dispatch of this pass -- to sample into `slot`.
+    EndEncoderIfActive();
+    pending_ts_slot_ = slot;
+    if (slot + 1u > timed_pass_count_) timed_pass_count_ = slot + 1u;
+}
+
+void MetalCommandBuffer::EndGpuPass() {
+    if (timing_sb_ == nullptr) return;
+    EndEncoderIfActive();                          // sample the last pass's end
+    pending_ts_slot_ = kNoTimedSlot;
+}
 
 void MetalCommandBuffer::BindComputePipeline(PipelineHandle p) {
     bound_pso_ = p;
@@ -472,6 +530,53 @@ MetalDevice::MetalDevice(const NativeWindowHandle& window) {
         return;
     }
 
+    // --- Per-pass GPU timestamps capability (#320) ------------------------
+    // Two requirements: a timestamp counter set, and support for sampling it
+    // at a stage boundary (the only sampling point Apple silicon offers --
+    // dispatch/draw/blit boundary sampling returns false on M-series, which
+    // is why the timing path splits each pass into its own encoder rather
+    // than a mid-encoder sampleCountersInBuffer call). If either is missing
+    // the device honestly reports "unavailable" and the instrument stays
+    // dark rather than printing ticks it cannot convert.
+    {
+        const bool stage_ok =
+            device_->supportsCounterSampling(MTL::CounterSamplingPointAtStageBoundary);
+        MTL::CounterSet* ts_set = nullptr;
+        if (auto* sets = device_->counterSets()) {
+            for (NS::UInteger i = 0, n = sets->count(); i < n; ++i) {
+                auto* cs = static_cast<MTL::CounterSet*>(sets->object(i));
+                if (cs && cs->name() &&
+                    cs->name()->isEqualToString(MTL::CommonCounterSetTimestamp)) {
+                    ts_set = cs;
+                    break;
+                }
+            }
+        }
+        if (stage_ok && ts_set != nullptr) {
+            gpu_ts_counter_set_ = ts_set->retain();
+            // Derive ns-per-GPU-tick from an MTLDevice CPU/GPU correlation
+            // over a short real interval. On Apple silicon the GPU and CPU
+            // share one nanosecond clock so this lands at ~1.0, but deriving
+            // it (rather than hardcoding 1.0) is what makes the reported
+            // milliseconds defensible on any future part where the clocks
+            // differ.
+            MTL::Timestamp cpu0 = 0, gpu0 = 0, cpu1 = 0, gpu1 = 0;
+            device_->sampleTimestamps(&cpu0, &gpu0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            device_->sampleTimestamps(&cpu1, &gpu1);
+            const double gpu_d = static_cast<double>(gpu1 - gpu0);
+            const double cpu_d = static_cast<double>(cpu1 - cpu0);  // ns
+            gpu_ts_ns_per_tick_ = (gpu_d > 0.0) ? (cpu_d / gpu_d) : 1.0;
+            gpu_ts_supported_   = true;
+            LOG_INFO("  GPU timestamps: available (timestamp counter set, "
+                     "stage-boundary sampling, {:.4f} ns/tick)",
+                     gpu_ts_ns_per_tick_);
+        } else {
+            LOG_INFO("  GPU timestamps: unavailable (stage_sampling={}, "
+                     "timestamp_counter_set={})", stage_ok, ts_set != nullptr);
+        }
+    }
+
     // Create the CAMetalLayer and attach it to the NSWindow content view.
     layer_ = CA::MetalLayer::layer();
     layer_->retain();   // CA::MetalLayer::layer() returns autoreleased
@@ -651,6 +756,12 @@ MetalDevice::~MetalDevice() {
         c = nullptr;
     }
     cmd_.reset();
+    // Per-pass GPU timestamps (#320): release the counter sample buffers +
+    // retained command buffers and the counter set. The frame_cb_ drain
+    // above already waited on any command buffer still in flight, so the
+    // sample buffers are no longer being written.
+    ReleaseGpuTsRing();
+    if (gpu_ts_counter_set_) { gpu_ts_counter_set_->release(); gpu_ts_counter_set_ = nullptr; }
     // Tear down the SVGF denoiser BEFORE we release device_ / queue_ /
     // pipelines_ -- its textures + pipelines were allocated against
     // device_ and need to release while it's still valid.
@@ -1607,6 +1718,13 @@ CommandBuffer* MetalDevice::AcquireCommandBuffer() {
     if (queue_ == nullptr) return nullptr;
     auto* mtl_cb = queue_->commandBuffer();
     cmd_->Reset(mtl_cb);
+    // --- Per-pass GPU timestamps (#320) -----------------------------------
+    // Arm this frame's command buffer with the ring's current counter sample
+    // buffer so BeginGpuPass can open timed encoders against it. No-op (nil)
+    // when the instrument is disabled -- Reset already left timing inert.
+    if (gpu_ts_enabled_) {
+        cmd_->SetTimingSampleBuffer(CurrentTimestampSampleBuffer(), gpu_ts_capacity_);
+    }
     return cmd_.get();
 }
 
@@ -1614,6 +1732,13 @@ void MetalDevice::Submit(CommandBuffer* cb) {
     PT_ZONE_SCOPED_N("MetalDevice::Submit");
     auto* mcb = static_cast<MetalCommandBuffer*>(cb);
     if (mcb == nullptr || mcb->RawCmdBuf() == nullptr) return;
+    // --- Per-pass GPU timestamps (#320) -----------------------------------
+    // Snapshot the frame's timing bookkeeping BEFORE Reset() wipes it. The
+    // Reset below also ends any still-open timed encoder (its end boundary
+    // is sampled on endEncoding), so a caller that forgot EndGpuPass still
+    // gets the last pass's closing sample.
+    const bool          ts_active = mcb->TimingActive();
+    const std::uint32_t ts_passes = mcb->TimedPassCount();
     mcb->Reset(mcb->RawCmdBuf());  // ends encoder if open
     auto* mtl_cb = mcb->RawCmdBuf();
     if (current_drawable_ != nullptr) {
@@ -1634,7 +1759,133 @@ void MetalDevice::Submit(CommandBuffer* cb) {
         mtl_cb->retain();
         frame_cb_[pace_slot] = mtl_cb;
     }
+    // --- Per-pass GPU timestamps (#320) -----------------------------------
+    // Record this frame's timestamp bookkeeping. The sample buffer the timed
+    // encoders wrote is this frame's ring slot; retain the command buffer so
+    // ResolveGpuTimestamps can gate on its completion status.
+    if (gpu_ts_enabled_ && ts_active && ts_passes > 0) {
+        const int ts_slot = static_cast<int>(frame_index_ % kGpuTsRing);
+        GpuTsFrame& e = gpu_ts_ring_[ts_slot];
+        if (e.cb != nullptr) e.cb->release();
+        mtl_cb->retain();
+        e.cb          = mtl_cb;
+        e.frame_index = frame_index_;
+        e.pass_count  = ts_passes;
+        e.valid       = true;
+    }
     mcb->Reset(nullptr);
+}
+
+// --- Per-pass GPU timestamps (#320) --------------------------------------
+
+MTL::CounterSampleBuffer* MetalDevice::CurrentTimestampSampleBuffer() const {
+    if (!gpu_ts_enabled_) return nullptr;
+    return gpu_ts_ring_[frame_index_ % kGpuTsRing].sb;
+}
+
+void MetalDevice::ReleaseGpuTsRing() {
+    for (auto& e : gpu_ts_ring_) {
+        if (e.sb != nullptr) { e.sb->release(); e.sb = nullptr; }
+        if (e.cb != nullptr) { e.cb->release(); e.cb = nullptr; }
+        e.frame_index = 0;
+        e.pass_count  = 0;
+        e.valid       = false;
+    }
+}
+
+void MetalDevice::SetGpuTimestampsEnabled(bool on, std::uint32_t pass_capacity) {
+    // Honest degrade: a device that can't timestamp never turns the
+    // instrument on, so callers see SupportsGpuTimestamps()==false and never
+    // a fabricated zero.
+    if (!gpu_ts_supported_ || device_ == nullptr) { on = false; }
+    if (on && pass_capacity == 0) on = false;
+    if (on == gpu_ts_enabled_ && pass_capacity == gpu_ts_capacity_) return;
+
+    // Any change tears down the existing ring first (frees the sample
+    // buffers / retained command buffers) so the pass_capacity resize is a
+    // clean reallocation and the "off" path is genuinely zero-resource.
+    ReleaseGpuTsRing();
+    gpu_ts_enabled_  = false;
+    gpu_ts_capacity_ = 0;
+    if (!on) return;
+
+    const NS::UInteger sample_count = 2u * pass_capacity;   // start+end per pass
+    bool ok = true;
+    for (auto& e : gpu_ts_ring_) {
+        auto* desc = MTL::CounterSampleBufferDescriptor::alloc()->init();
+        desc->setCounterSet(gpu_ts_counter_set_);
+        desc->setStorageMode(MTL::StorageModeShared);
+        desc->setSampleCount(sample_count);
+        NS::Error* err = nullptr;
+        e.sb = device_->newCounterSampleBuffer(desc, &err);
+        desc->release();
+        if (e.sb == nullptr) {
+            LOG_ERROR("GPU timestamps: newCounterSampleBuffer failed: {}",
+                      err ? err->localizedDescription()->utf8String() : "?");
+            ok = false;
+            break;
+        }
+    }
+    if (!ok) { ReleaseGpuTsRing(); return; }
+    gpu_ts_enabled_  = true;
+    gpu_ts_capacity_ = pass_capacity;
+    LOG_INFO("GPU timestamps: enabled ({} passes, {} samples/frame, {} frames)",
+             pass_capacity, static_cast<std::uint32_t>(sample_count), kGpuTsRing);
+}
+
+std::uint32_t MetalDevice::ResolveGpuTimestamps(double* out_ms,
+                                                std::uint32_t capacity,
+                                                std::uint64_t* out_frame_index) {
+    if (!gpu_ts_enabled_ || out_ms == nullptr || capacity == 0) return 0;
+
+    // Pick the newest ring entry whose command buffer has actually finished
+    // -- resolving a buffer the GPU is still writing would read torn/zero
+    // samples. Frame pacing guarantees frame (F - kMaxFramesInFlight) is
+    // complete, and the ring is one deeper than the pacing ring, so a
+    // completed entry always exists once the instrument has been on a few
+    // frames.
+    int best = -1;
+    std::uint64_t best_fi = 0;
+    for (int i = 0; i < kGpuTsRing; ++i) {
+        GpuTsFrame& e = gpu_ts_ring_[i];
+        if (!e.valid || e.sb == nullptr || e.cb == nullptr) continue;
+        const auto st = e.cb->status();
+        if (st != MTL::CommandBufferStatusCompleted &&
+            st != MTL::CommandBufferStatusError) continue;
+        if (best < 0 || e.frame_index >= best_fi) { best = i; best_fi = e.frame_index; }
+    }
+    if (best < 0) return 0;
+
+    GpuTsFrame& e = gpu_ts_ring_[best];
+    const std::uint32_t passes = std::min(e.pass_count, capacity);
+    if (passes == 0) return 0;
+
+    // resolveCounterRange returns a tight array of MTL::CounterResultTimestamp
+    // (one uint64 tick each) for samples [0, 2*passes). Metal writes
+    // MTLCounterErrorValue (all-ones) into any sample it could not capture;
+    // such a pass reports 0 rather than a wild number.
+    NS::Data* data = e.sb->resolveCounterRange(NS::Range::Make(0, 2u * passes));
+    if (data == nullptr) return 0;
+    const auto* ts = static_cast<const MTL::CounterResultTimestamp*>(data->mutableBytes());
+    const std::size_t got = data->length() / sizeof(MTL::CounterResultTimestamp);
+
+    constexpr std::uint64_t kErr = ~0ull;   // MTLCounterErrorValue
+    std::uint32_t valid = 0;
+    for (std::uint32_t p = 0; p < passes; ++p) {
+        double ms = 0.0;
+        const std::size_t si = 2u * p, ei = 2u * p + 1u;
+        if (ei < got) {
+            const std::uint64_t s = ts[si].timestamp;
+            const std::uint64_t en = ts[ei].timestamp;
+            if (s != 0 && en != 0 && s != kErr && en != kErr && en >= s) {
+                ms = static_cast<double>(en - s) * gpu_ts_ns_per_tick_ * 1e-6;
+                ++valid;
+            }
+        }
+        if (p < capacity) out_ms[p] = ms;
+    }
+    if (out_frame_index) *out_frame_index = e.frame_index;
+    return passes;
 }
 
 bool MetalDevice::ReadbackTexture(TextureHandle h, void* dst, std::size_t dst_size,

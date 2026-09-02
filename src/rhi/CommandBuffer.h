@@ -41,6 +41,35 @@ public:
     virtual void ClearStorageTexture(TextureHandle t, const float rgba[4]) = 0;
 
     virtual void Barrier(const BarrierDesc& d) = 0;
+
+    // --- Per-pass GPU timestamps (#320) ----------------------------------
+    // Open a GPU-timed pass. Closes the previously-open timed pass (if any)
+    // and marks `slot` as the region the backend samples the GPU clock
+    // across. The engine assigns slots 0..N-1 in record order and holds the
+    // matching human-readable labels; `slot` must be < the capacity passed
+    // to Device::SetGpuTimestampsEnabled.
+    //
+    // Backend mapping:
+    //   * Metal (Apple silicon supports ONLY stage-boundary counter
+    //     sampling) -- each timed pass gets its own MTLComputeCommandEncoder
+    //     created from an MTLComputePassDescriptor that samples the
+    //     timestamp counter set at the encoder's start and end boundaries.
+    //     Encoder creation is deferred to the pass's first Dispatch, so a
+    //     mark that is immediately followed by a FlushEncoder (the denoiser
+    //     path) records no empty encoder.
+    //   * Vulkan -- vkCmdWriteTimestamp(BOTTOM_OF_PIPE) into a
+    //     VK_QUERY_TYPE_TIMESTAMP pool at the pass's start, and again at its
+    //     end when the next BeginGpuPass / EndGpuPass closes it.
+    //
+    // No-op unless the device has timestamps enabled for the current frame
+    // (Device::SetGpuTimestampsEnabled). Default no-op so backends without
+    // a timestamp implementation (software) ignore it.
+    virtual void BeginGpuPass(std::uint32_t /*slot*/) {}
+
+    // Close the final timed pass of the frame. Called once, right before
+    // Device::Submit, so the last pass's end boundary is sampled. No-op
+    // when timestamps are disabled or no pass is open.
+    virtual void EndGpuPass() {}
 };
 
 }  // namespace pt::rhi

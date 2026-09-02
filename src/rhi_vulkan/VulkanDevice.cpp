@@ -363,6 +363,46 @@ void VulkanCommandBuffer::Reset(VkCommandBuffer cb) {
     for (auto& b : bound_buf_)   b = BufferHandle{0};
     for (auto& o : bound_buf_off_) o = 0;
     for (auto& a : bound_accel_) a = AccelStructHandle{0};
+    // Per-pass GPU timestamps (#320): re-armed per frame by
+    // AcquireCommandBuffer AFTER this Reset, so clear it inert here.
+    ts_pool_       = VK_NULL_HANDLE;
+    ts_capacity_   = 0;
+    ts_open_slot_  = kNoTimedSlot;
+    ts_pass_count_ = 0;
+}
+
+// --- Per-pass GPU timestamps (#320) --------------------------------------
+
+void VulkanCommandBuffer::SetTimingPool(VkQueryPool pool, std::uint32_t capacity) {
+    ts_pool_       = pool;
+    ts_capacity_   = capacity;
+    ts_open_slot_  = kNoTimedSlot;
+    ts_pass_count_ = 0;
+}
+
+void VulkanCommandBuffer::BeginGpuPass(std::uint32_t slot) {
+    if (ts_pool_ == VK_NULL_HANDLE || cb_ == VK_NULL_HANDLE) return;
+    if (slot >= ts_capacity_) return;
+    // Close the previously-open pass, then open this one. Both boundaries
+    // latch at BOTTOM_OF_PIPE (after all prior commands finish), so pass i's
+    // duration = ts[2i+1] - ts[2i] covers exactly the work recorded between
+    // its BeginGpuPass and the next boundary.
+    if (ts_open_slot_ != kNoTimedSlot) {
+        vkCmdWriteTimestamp(cb_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            ts_pool_, 2u * ts_open_slot_ + 1u);
+    }
+    ts_open_slot_ = slot;
+    if (slot + 1u > ts_pass_count_) ts_pass_count_ = slot + 1u;
+    vkCmdWriteTimestamp(cb_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                        ts_pool_, 2u * slot);
+}
+
+void VulkanCommandBuffer::EndGpuPass() {
+    if (ts_pool_ == VK_NULL_HANDLE || cb_ == VK_NULL_HANDLE) return;
+    if (ts_open_slot_ == kNoTimedSlot) return;
+    vkCmdWriteTimestamp(cb_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                        ts_pool_, 2u * ts_open_slot_ + 1u);
+    ts_open_slot_ = kNoTimedSlot;
 }
 
 void VulkanCommandBuffer::BindComputePipeline(PipelineHandle p) {
@@ -848,6 +888,17 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     LOG_INFO("Vulkan device: {}", device_name_);
     LOG_INFO("  maxPushConstantsSize: {}", max_push_constant_size_);
 
+    // --- Per-pass GPU timestamps capability (#320) ------------------------
+    // timestampComputeAndGraphics guarantees every compute/graphics queue
+    // family reports a non-zero timestampValidBits; we still read the chosen
+    // family's bits below (after queue selection) and require both. The
+    // period is nanoseconds-per-tick and must be > 0 to convert to ms.
+    // NOTE: this whole path is UNVERIFIED at runtime -- Vulkan does not build
+    // on the Apple host this was written on (#290) -- and is coded to spec.
+    gpu_ts_period_ns_ = static_cast<double>(props.limits.timestampPeriod);
+    const bool ts_compute_and_graphics =
+        (props.limits.timestampComputeAndGraphics == VK_TRUE);
+
     // ---- Queue family ------------------------------------------------
     std::uint32_t qf_count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(phys_device_, &qf_count, nullptr);
@@ -860,9 +911,20 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         if ((qfs[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && present) {
             graphics_qfi_ = i;
             found_qf = true;
+            // Per-pass GPU timestamps (#320): the render queue's timestamp
+            // resolution in bits. 0 means this queue cannot timestamp at all,
+            // regardless of the device-wide limit above.
+            gpu_ts_valid_bits_ = qfs[i].timestampValidBits;
             break;
         }
     }
+    // Finalise timestamp support now the render queue family is chosen.
+    gpu_ts_supported_ =
+        ts_compute_and_graphics && gpu_ts_valid_bits_ > 0 && gpu_ts_period_ns_ > 0.0;
+    LOG_INFO("  GPU timestamps: {} (computeAndGraphics={}, validBits={}, "
+             "period={:.4f} ns/tick)",
+             gpu_ts_supported_ ? "available" : "unavailable",
+             ts_compute_and_graphics, gpu_ts_valid_bits_, gpu_ts_period_ns_);
     if (!found_qf) {
         LOG_ERROR("No suitable Vulkan queue family (compute + present)");
         return;
@@ -1791,6 +1853,10 @@ void VulkanDevice::DestroyDevice() {
         // (correctly) flags the underlying VK objects as leaked.
         optix_denoiser_.reset();
 #endif
+        // Per-pass GPU timestamps (#320): destroy the query pools while the
+        // device is still live (vkDeviceWaitIdle above already drained any
+        // command buffer that referenced them).
+        DestroyTimestampPools();
         for (auto v : swap_views_) if (v) vkDestroyImageView(device_, v, nullptr);
         swap_views_.clear();
         if (swapchain_ != VK_NULL_HANDLE) vkDestroySwapchainKHR(device_, swapchain_, nullptr);
@@ -3897,6 +3963,16 @@ FrameContext VulkanDevice::BeginFrame() {
         return {};
     }
 
+    // --- Per-pass GPU timestamps (#320) -----------------------------------
+    // The fence wait above guarantees this frame slot's PREVIOUS use has
+    // fully executed on the GPU, so its query pool is now readable. This is
+    // the one point where that is true AND the pool has not yet been reset
+    // (the reset happens in AcquireCommandBuffer, just below). Pull the
+    // results into the CPU cache here; ResolveGpuTimestamps copies them out.
+    if (gpu_ts_enabled_) {
+        ResolveTimestampsForSlot(current_frame_);
+    }
+
     vkResetFences(device_, 1, &fence_in_flight_[current_frame_]);
     vkResetCommandBuffer(cmds_[current_frame_], 0);
 
@@ -3939,6 +4015,16 @@ CommandBuffer* VulkanDevice::AcquireCommandBuffer() {
         0, 0, nullptr, 0, nullptr, 1, &toGen);
 
     wrapped_cb_->Reset(cb);
+
+    // --- Per-pass GPU timestamps (#320) -----------------------------------
+    // A timestamp query pool must be reset on the queue (via a command
+    // buffer) before it is written. Reset this frame slot's pool at the top
+    // of its command buffer, then arm the wrapper so BeginGpuPass writes into
+    // it. No-op when the instrument is off.
+    if (gpu_ts_enabled_ && gpu_ts_pools_[current_frame_] != VK_NULL_HANDLE) {
+        vkCmdResetQueryPool(cb, gpu_ts_pools_[current_frame_], 0, 2u * gpu_ts_capacity_);
+        wrapped_cb_->SetTimingPool(gpu_ts_pools_[current_frame_], gpu_ts_capacity_);
+    }
     return wrapped_cb_.get();
 }
 
@@ -4063,6 +4149,16 @@ void VulkanDevice::Submit(CommandBuffer* cb) {
         // (after a hypothetical recovery) can claim it. With device_lost_
         // = true the engine should be exiting anyway.
         return;
+    }
+
+    // --- Per-pass GPU timestamps (#320) -----------------------------------
+    // Record how many passes this frame timed and which frame index the
+    // pool's results will belong to, so BeginFrame can read them back once
+    // this slot's fence signals (kFramesInFlight frames from now).
+    if (gpu_ts_enabled_ && gpu_ts_pools_[current_frame_] != VK_NULL_HANDLE) {
+        gpu_ts_pass_count_[current_frame_]   = wrapped_cb_->TimedPassCount();
+        gpu_ts_frame_idx_[current_frame_]    = frame_index_;
+        gpu_ts_slot_written_[current_frame_] = (wrapped_cb_->TimedPassCount() > 0);
     }
 
     // ReadbackSwapchain consume publish: AFTER vkQueueSubmit. By the
@@ -4266,6 +4362,103 @@ void VulkanDevice::EncodeDenoiseFinalize(VkCommandBuffer cb,
 void VulkanDevice::EndFrame(CommandBuffer*) {
     current_frame_ = (current_frame_ + 1) % kFramesInFlight;
     ++frame_index_;
+}
+
+// --- Per-pass GPU timestamps (#320) --------------------------------------
+
+void VulkanDevice::DestroyTimestampPools() {
+    for (int i = 0; i < kFramesInFlight; ++i) {
+        if (gpu_ts_pools_[i] != VK_NULL_HANDLE) {
+            vkDestroyQueryPool(device_, gpu_ts_pools_[i], nullptr);
+            gpu_ts_pools_[i] = VK_NULL_HANDLE;
+        }
+        gpu_ts_pass_count_[i]   = 0;
+        gpu_ts_frame_idx_[i]    = 0;
+        gpu_ts_slot_written_[i] = false;
+    }
+    gpu_ts_cache_valid_ = false;
+    gpu_ts_cache_count_ = 0;
+}
+
+void VulkanDevice::SetGpuTimestampsEnabled(bool on, std::uint32_t pass_capacity) {
+    if (!gpu_ts_supported_ || device_ == VK_NULL_HANDLE) on = false;
+    if (on && pass_capacity == 0) on = false;
+    if (on && pass_capacity > kGpuTsMaxCapacity) pass_capacity = kGpuTsMaxCapacity;
+    if (on == gpu_ts_enabled_ && pass_capacity == gpu_ts_capacity_) return;
+
+    // Pools may still be referenced by in-flight command buffers; drain
+    // before destroying. SetGpuTimestampsEnabled is a rare (cvar-driven)
+    // toggle, so the one-time idle is acceptable.
+    vkDeviceWaitIdle(device_);
+    DestroyTimestampPools();
+    gpu_ts_enabled_  = false;
+    gpu_ts_capacity_ = 0;
+    if (!on) return;
+
+    bool ok = true;
+    for (int i = 0; i < kFramesInFlight; ++i) {
+        VkQueryPoolCreateInfo qi{};
+        qi.sType      = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        qi.queryType  = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = 2u * pass_capacity;   // start+end per pass
+        const VkResult r = vkCreateQueryPool(device_, &qi, nullptr, &gpu_ts_pools_[i]);
+        if (r != VK_SUCCESS) {
+            LOG_ERROR("GPU timestamps: vkCreateQueryPool failed: {} ({})",
+                      static_cast<int>(r), VkResultToString(r));
+            ok = false;
+            break;
+        }
+    }
+    if (!ok) { DestroyTimestampPools(); return; }
+    gpu_ts_enabled_  = true;
+    gpu_ts_capacity_ = pass_capacity;
+    LOG_INFO("GPU timestamps: enabled ({} passes, {} queries/pool, {} pools)",
+             pass_capacity, 2u * pass_capacity, kFramesInFlight);
+}
+
+void VulkanDevice::ResolveTimestampsForSlot(int slot) {
+    // Precondition: caller established this slot's fence has signalled, so
+    // every timestamp write in its pool has completed.
+    if (!gpu_ts_slot_written_[slot] || gpu_ts_pools_[slot] == VK_NULL_HANDLE) return;
+    const std::uint32_t passes = gpu_ts_pass_count_[slot];
+    if (passes == 0) return;
+
+    std::uint64_t raw[2 * kGpuTsMaxCapacity] {};
+    const std::uint32_t query_count = 2u * passes;
+    const VkResult r = vkGetQueryPoolResults(
+        device_, gpu_ts_pools_[slot], 0, query_count,
+        query_count * sizeof(std::uint64_t), raw, sizeof(std::uint64_t),
+        VK_QUERY_RESULT_64_BIT);
+    // VK_SUCCESS: all results present. VK_NOT_READY should not happen (the
+    // fence guarantees completion); bail rather than report torn values.
+    if (r != VK_SUCCESS) return;
+
+    const std::uint64_t mask = (gpu_ts_valid_bits_ >= 64)
+                                   ? ~0ull
+                                   : ((1ull << gpu_ts_valid_bits_) - 1ull);
+    std::uint32_t count = std::min(passes, kGpuTsMaxCapacity);
+    for (std::uint32_t p = 0; p < count; ++p) {
+        const std::uint64_t s  = raw[2u * p]     & mask;
+        const std::uint64_t en = raw[2u * p + 1] & mask;
+        double ms = 0.0;
+        if (en >= s) ms = static_cast<double>(en - s) * gpu_ts_period_ns_ * 1e-6;
+        gpu_ts_cache_ms_[p] = ms;
+    }
+    gpu_ts_cache_count_ = count;
+    gpu_ts_cache_frame_ = gpu_ts_frame_idx_[slot];
+    gpu_ts_cache_valid_ = true;
+}
+
+std::uint32_t VulkanDevice::ResolveGpuTimestamps(double* out_ms,
+                                                 std::uint32_t capacity,
+                                                 std::uint64_t* out_frame_index) {
+    if (!gpu_ts_enabled_ || !gpu_ts_cache_valid_ || out_ms == nullptr || capacity == 0) {
+        return 0;
+    }
+    const std::uint32_t n = std::min(gpu_ts_cache_count_, capacity);
+    for (std::uint32_t i = 0; i < n; ++i) out_ms[i] = gpu_ts_cache_ms_[i];
+    if (out_frame_index) *out_frame_index = gpu_ts_cache_frame_;
+    return n;
 }
 
 void VulkanDevice::WaitIdle() {

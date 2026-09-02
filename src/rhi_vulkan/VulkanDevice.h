@@ -41,13 +41,32 @@ public:
     void ClearStorageTexture(TextureHandle t, const float rgba[4]) override;
     void Barrier(const BarrierDesc& d) override;
 
+    // --- Per-pass GPU timestamps (#320) ----------------------------------
+    void BeginGpuPass(std::uint32_t slot) override;
+    void EndGpuPass() override;
+
     void Reset(VkCommandBuffer cb);
     VkCommandBuffer Raw() const { return cb_; }
+
+    // Per-pass GPU timestamps (#320): arm/disarm timestamp writes for the
+    // command buffer just Reset. `pool` is this frame's query pool
+    // (VK_NULL_HANDLE => timing off); `capacity` is the pass count the pool
+    // is sized for (2*capacity queries). Set by AcquireCommandBuffer after
+    // the pool has been reset on the same command buffer.
+    void SetTimingPool(VkQueryPool pool, std::uint32_t capacity);
+    std::uint32_t TimedPassCount() const { return ts_pass_count_; }
 
 private:
     VulkanDevice*  device_ = nullptr;
     VkCommandBuffer cb_     = VK_NULL_HANDLE;
     PipelineHandle bound_pipeline_{0};
+
+    // --- Per-pass GPU timestamps (#320) ----------------------------------
+    static constexpr std::uint32_t kNoTimedSlot = ~0u;
+    VkQueryPool   ts_pool_       = VK_NULL_HANDLE;  // this frame's pool, or null
+    std::uint32_t ts_capacity_   = 0;               // passes
+    std::uint32_t ts_open_slot_  = kNoTimedSlot;    // currently-open pass
+    std::uint32_t ts_pass_count_ = 0;               // highest slot+1 this frame
     // 14 texture slots: slots 0..7 are output / accum / denoise_color /
     // depth / motion / env_map / star_map / moon_map; slot 8 is
     // normal_tex (SVGF/NRD + OptiX-AOV + MetalFX), slot 9 is albedo_tex
@@ -208,6 +227,13 @@ public:
     // clean queue-on-demand entry point without each pipeline owner
     // touching the device construction sequence.
     void EnsurePipelineWarmed(const char* kernel_name) override;
+
+    // ---- Per-pass GPU timestamps (#320) ---------------------------------
+    bool          SupportsGpuTimestamps() const override { return gpu_ts_supported_; }
+    double        GpuTimestampPeriodNs()  const override { return gpu_ts_period_ns_; }
+    void          SetGpuTimestampsEnabled(bool on, std::uint32_t pass_capacity) override;
+    std::uint32_t ResolveGpuTimestamps(double* out_ms, std::uint32_t capacity,
+                                       std::uint64_t* out_frame_index) override;
 
     // Internal accessors used by the command buffer.
     VkDevice         RawDevice()     const { return device_; }
@@ -470,6 +496,35 @@ private:
     std::vector<VkSemaphore>  sem_render_done_;
 
     std::unique_ptr<VulkanCommandBuffer> wrapped_cb_;
+
+    // --- Per-pass GPU timestamps (#320) ----------------------------------
+    // Capability latched at construction from VkPhysicalDeviceLimits and the
+    // render queue family. UNVERIFIED AT RUNTIME on this macOS host (Vulkan
+    // is unbuildable here -- see #290); written against the spec.
+    bool          gpu_ts_supported_  = false;
+    double        gpu_ts_period_ns_  = 0.0;   // limits.timestampPeriod (ns/tick)
+    std::uint32_t gpu_ts_valid_bits_ = 0;     // queue family timestampValidBits
+    bool          gpu_ts_enabled_    = false;
+    std::uint32_t gpu_ts_capacity_   = 0;     // passes; 2*capacity queries/pool
+    // One timestamp query pool per in-flight frame slot. Reset at the top of
+    // that slot's command buffer, written by BeginGpuPass / EndGpuPass, read
+    // back in BeginFrame after the slot's fence has signalled.
+    VkQueryPool   gpu_ts_pools_[kFramesInFlight]     {};
+    std::uint32_t gpu_ts_pass_count_[kFramesInFlight] {};  // passes recorded
+    std::uint64_t gpu_ts_frame_idx_[kFramesInFlight]  {};  // frame the results are for
+    bool          gpu_ts_slot_written_[kFramesInFlight] {}; // slot ever submitted?
+    // CPU-side cache filled in BeginFrame (the only point the just-completed
+    // frame's pool is guaranteed readable AND not yet reset) and copied out
+    // by ResolveGpuTimestamps. Sized to the max capacity the engine uses.
+    static constexpr std::uint32_t kGpuTsMaxCapacity = 32;
+    double        gpu_ts_cache_ms_[kGpuTsMaxCapacity] {};
+    std::uint32_t gpu_ts_cache_count_ = 0;
+    std::uint64_t gpu_ts_cache_frame_ = 0;
+    bool          gpu_ts_cache_valid_ = false;
+    // Read the just-completed frame slot's pool into the CPU cache. Called
+    // from BeginFrame after vkWaitForFences on that slot.
+    void ResolveTimestampsForSlot(int slot);
+    void DestroyTimestampPools();
 
     // Pipelines
     struct PipelineEntry {
