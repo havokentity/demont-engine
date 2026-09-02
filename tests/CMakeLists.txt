@@ -2070,6 +2070,66 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     #     break-0 numbers above are the proof of that in miniature -- the
     #     identical ablation reads mean 46.25 on planet_surface today and
     #     read 64.49 before #307.
+    #
+    # ---- #318: THE RELIEF SECOND MOMENT, RESTORED ---------------------
+    #
+    # #318 is the FOURTH change to act on the slope field, and the same rule
+    # applies: it RE-RENDERED and RE-ABLATED rather than inheriting. The
+    # baker was area-averaging ETOPO to 2048x1024, which preserves each
+    # texel's mean (the heights validate) and low-passes away its inter-texel
+    # VARIANCE -- sigma(L_dem), the relief the continuation is anchored on.
+    # relief is now measured on the full-resolution grid and carried in a
+    # second .ptdem plane, so the terrain is as rough as the real data, not
+    # as rough as its 19.5 km-block means. The ELEVATION plane is byte-
+    # identical to before, so the DEM base heights did not move; only the
+    # continuation amplitude did.
+    #
+    # WHAT MOVED, measured against clean main at 18ce5b3 (whose renders are
+    # bit-identical to the pre-#318 goldens -- section (B) below):
+    #     planet_surface        mean 45.92  rms 78.98  max 285.3  bad 98.43%
+    #     planet_aerial         mean 43.02  rms 69.11  max 317.6  bad 99.19%
+    #     planet_lod_seam       mean 17.44  rms 33.19  max 285.9  bad 97.64%
+    #     planet_hillslope_rock mean 16.16  rms 35.15  max 252.7  bad 79.21%
+    #   All four PNGs were REGENERATED and the maintainer's sign-off covers
+    #   exactly these four. This is a whole-terrain change -- the default
+    #   site stops being a smooth snowfield and reads as a rock-and-snow
+    #   mountain -- which is the visible half of the #318 defect.
+    #
+    # WHAT DID NOT MOVE, and was NOT regenerated:
+    #     planet_land_orbit     bad 0, max 0.0000, mean 0.000000 -- IDENTICAL
+    #   At 30 000 km the ray meets the analytic body, not the chunks (the
+    #   fixture's own header records this), so a sub-20 km continuation
+    #   change cannot reach it. planet_horizon_clouds and _planar are also
+    #   bit-identical branch-vs-main (they set r_planet_terrain to its
+    #   default 0 -- no streamed terrain, no relief). The ocean cells set
+    #   r_planet_terrain 0 as well. The DEM is read only by streamed
+    #   terrain, so those five terrain cells are the whole blast radius; the
+    #   git diff touches exactly the four PNGs above.
+    #
+    # NOISE FLOOR, re-established on 18ce5b3 (mac-release, this host):
+    #   (A) run-to-run: a fresh main build renders all five planet cells
+    #       BYTE-IDENTICALLY twice over -- imgdiff at 0/0/0 gives bad 0,
+    #       max 0.0000, mean 0.000000 on every one. Terrain settling is a
+    #       barrier, not a race, so there is no scheduling term to subtract.
+    #   (B) main vs the committed (pre-#318) goldens: bad 0 on all five, so
+    #       the goldens were current and every delta above is 100% signal.
+    #
+    # TOLERANCES: UNCHANGED (matrix defaults, seam keeps MEAN 2), and still
+    # sized against the weakest ablation, RE-MEASURED against the #318
+    # goldens. break-0 (r_planet_hillslope_break 0, the pre-#304 unbroken
+    # power law) vs the new goldens:
+    #     planet_surface        mean 50.22  bad 72.63%   62.8x / 72.6x
+    #     planet_aerial         mean 27.81  bad 87.41%   34.8x / 87.4x
+    #     planet_lod_seam       mean 39.47  bad 78.98%   19.7x / 79.0x
+    #     planet_hillslope_rock mean 16.69  bad 69.72%   20.9x / 69.7x
+    #   (margins are mean/MEAN_DELTA and bad%/FAIL_PERCENT.) The tightest,
+    #   planet_lod_seam at 19.7x on mean, is still ~4x wider than the 4.6x
+    #   #280 worked with, so no threshold moves. As with #304/#307 the
+    #   break-0 mean rose (planet_surface 46.25 -> 50.22): un-suppressing
+    #   relief gives the break more to tame, so deleting it costs more.
+    #   CONFIRMED by a control -- r_planet_hillslope_break 106 (the default,
+    #   restated through --extra) renders planet_surface BYTE-IDENTICALLY to
+    #   the new golden, so the deltas are the value and not the channel.
     pt_add_golden_cell(SCENE planet_surface  BACKEND metal DENOISER off
                        FRAMES 32 MAX_DELTA 16 MEAN_DELTA 0.8 FAIL_PERCENT 1)
     # --- Land cover (#300) --------------------------------------------
